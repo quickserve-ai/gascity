@@ -85,7 +85,7 @@ tcp_check_port() {
     local host
     host=$(connect_host)
     if command -v nc >/dev/null 2>&1; then
-        nc -z -w2 "$host" "$port" 2>/dev/null
+        nc -z -w 2 "$host" "$port" 2>/dev/null
     elif command -v bash >/dev/null 2>&1; then
         bash -c "echo >/dev/tcp/$host/$port" 2>/dev/null
     else
@@ -257,6 +257,17 @@ database_exists() {
     fi
 
     server_sql "USE \`$db\`" >/dev/null 2>&1
+}
+
+database_has_beads_schema() {
+    local db="$1"
+    [ -n "$db" ] || return 1
+
+    if ! valid_sql_name "$db"; then
+        return 1
+    fi
+
+    server_sql "SELECT 1 FROM \`$db\`.issues LIMIT 1" >/dev/null 2>&1
 }
 
 read_existing_dolt_database() {
@@ -640,6 +651,63 @@ has_deleted_data_inodes() {
     fi
 
     if command -v lsof >/dev/null 2>&1; then
+        if run_lsof -a -p "$pid" +L1 -Fnk 2>/dev/null | awk -v data_dir="$DATA_DIR" '
+            function normalize(path) {
+                gsub(/^[ \t\r\n]+|[ \t\r\n]+$/, "", path)
+                if (path == "/private/tmp") {
+                    return "/tmp"
+                }
+                if (substr(path, 1, 13) == "/private/tmp/") {
+                    return "/tmp/" substr(path, 14)
+                }
+                if (path == "/private/var") {
+                    return "/var"
+                }
+                if (substr(path, 1, 13) == "/private/var/") {
+                    return "/var/" substr(path, 14)
+                }
+                return path
+            }
+            function within(path, root) {
+                path = normalize(path)
+                root = normalize(root)
+                return path == root || substr(path, 1, length(root) + 1) == root "/"
+            }
+            function flush() {
+                if (name != "" && deleted && within(name, data_dir)) {
+                    found = 1
+                }
+                name = ""
+                deleted = 0
+            }
+            substr($0, 1, 1) == "f" {
+                flush()
+                next
+            }
+            substr($0, 1, 1) == "k" {
+                if (substr($0, 2) == "0") {
+                    deleted = 1
+                }
+                next
+            }
+            substr($0, 1, 1) == "n" {
+                if (name != "") {
+                    flush()
+                }
+                name = substr($0, 2)
+                if (name ~ / \(deleted\)$/) {
+                    deleted = 1
+                    sub(/ \(deleted\)$/, "", name)
+                }
+                next
+            }
+            END {
+                flush()
+                exit(found ? 0 : 1)
+            }
+        '; then
+            return 0
+        fi
         if run_lsof -p "$pid" 2>/dev/null | grep ' (deleted)' | grep -F -- "$DATA_DIR" >/dev/null 2>&1; then
             return 0
         fi
@@ -913,11 +981,11 @@ wait_for_managed_pid_ready() {
         if ! kill -0 "$pid" 2>/dev/null; then
             return 1
         fi
-        if [ "$check_deleted" = "true" ] && wait_deleted_data_inodes "$pid"; then
+        if [ "$check_deleted" = "true" ] && has_deleted_data_inodes "$pid"; then
             return 1
         fi
         if tcp_check_port "$port" && do_query_probe; then
-            if [ "$check_deleted" = "true" ] && wait_deleted_data_inodes "$pid"; then
+            if [ "$check_deleted" = "true" ] && has_deleted_data_inodes "$pid"; then
                 return 1
             fi
             return 0
@@ -1736,11 +1804,12 @@ op_init() {
     # beads with that type — must match doctor.RequiredCustomTypes.
     local custom_types="${GC_BEADS_CUSTOM_TYPES:-molecule,convoy,message,event,gate,merge-request,agent,role,rig,session,spec,convergence}"
 
-    # If already initialized on disk, ensure the database is also registered
-    # with the running server. This covers the case where bd init created the
-    # directory but the server was restarted (or the database was quarantined).
+    # If already initialized on disk and the server has a bd schema, ensure the
+    # database is also registered with the running server. Local metadata can be
+    # written before bd init seeds tables, so require the server-side schema
+    # before taking the fast path.
     if [ -f "$dir/.beads/metadata.json" ]; then
-        if ensure_database_registered "$dolt_database"; then
+        if ensure_database_registered "$dolt_database" && database_has_beads_schema "$dolt_database"; then
             # GC owns canonical metadata/config normalization after this backend
             # bridge returns. Keep the backend focused on database registration
             # and bd-specific bootstrap only.
@@ -1751,8 +1820,8 @@ op_init() {
             backfill_project_id_if_missing "$dir"
             exit 0
         fi
-        # Database registration failed — fall through to full init.
-        echo "warning: database '$dolt_database' not registered; re-initializing" >&2
+        # Missing registration or schema — fall through to full init.
+        echo "warning: database '$dolt_database' missing bd schema or registration; re-initializing" >&2
     fi
 
     local host
@@ -1774,8 +1843,34 @@ op_init() {
         init_prefix="$dolt_database"
     fi
 
+    local metadata_backup="" config_backup=""
+    if [ -f "$metadata_path" ]; then
+        metadata_backup="$metadata_path.gc-init-backup.$$"
+        cp -f "$metadata_path" "$metadata_backup" || die "failed to back up $metadata_path"
+        rm -f "$metadata_path" || die "failed to clear pre-init $metadata_path"
+    fi
+    if [ -f "$dir/.beads/config.yaml" ]; then
+        config_backup="$dir/.beads/config.yaml.gc-init-backup.$$"
+        cp -f "$dir/.beads/config.yaml" "$config_backup" || die "failed to back up $dir/.beads/config.yaml"
+        rm -f "$dir/.beads/config.yaml" || die "failed to clear pre-init $dir/.beads/config.yaml"
+    fi
+
     # Run bd init in server mode.
-    (cd "$dir" && bd init --quiet --server -p "$init_prefix" --skip-hooks --skip-agents         --server-host "$host" --server-port "$DOLT_PORT"         "$dir") || die "bd init failed for $dir"
+    if ! (cd "$dir" && bd init --quiet --server -p "$init_prefix" --skip-hooks --skip-agents         --server-host "$host" --server-port "$DOLT_PORT"         "$dir"); then
+        if [ -n "$metadata_backup" ] && [ -f "$metadata_backup" ]; then
+            mv -f "$metadata_backup" "$metadata_path" || true
+        fi
+        if [ -n "$config_backup" ] && [ -f "$config_backup" ]; then
+            mv -f "$config_backup" "$dir/.beads/config.yaml" || true
+        fi
+        die "bd init failed for $dir"
+    fi
+    if [ -n "$metadata_backup" ]; then
+        rm -f "$metadata_backup"
+    fi
+    if [ -n "$config_backup" ]; then
+        rm -f "$config_backup"
+    fi
 
     # Drop orphan database created by bd init (upstream gt-sv1h).
     # bd init --prefix creates beads_<prefix> on the Dolt server, but we
