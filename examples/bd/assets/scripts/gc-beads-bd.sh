@@ -1705,6 +1705,19 @@ run_bd_pinned() {
     )
 }
 
+ensure_bd_runtime_config() {
+    local dir="$1" prefix="$2" custom_types="$3" attempt=0
+    while [ "$attempt" -lt 60 ]; do
+        if run_bd_pinned "$dir" config set issue_prefix "$prefix" >/dev/null 2>&1 &&
+           run_bd_pinned "$dir" config set types.custom "$custom_types" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.5 2>/dev/null || sleep 1
+        attempt=$((attempt + 1))
+    done
+    die "failed to set issue_prefix for $dir"
+}
+
 ensure_beads_dir_permissions() {
     local dir="$1"
     local beads_dir="$dir/.beads"
@@ -1815,8 +1828,7 @@ op_init() {
             # and bd-specific bootstrap only.
             ensure_beads_dir_permissions "$dir"
             normalize_scope_after_init "$dir" "$prefix" "$dolt_database"
-            run_bd_pinned "$dir" config set issue_prefix "$prefix" 2>/dev/null || true
-            run_bd_pinned "$dir" config set types.custom "$custom_types" 2>/dev/null || true
+            ensure_bd_runtime_config "$dir" "$prefix" "$custom_types"
             backfill_project_id_if_missing "$dir"
             exit 0
         fi
@@ -1886,10 +1898,7 @@ op_init() {
 
     # Keep bd's runtime config in sync with GC's canonical prefix. This is
     # compatibility state for raw bd operations, not a second GC authority.
-    run_bd_pinned "$dir" config set issue_prefix "$prefix" 2>/dev/null || true
-
-    # Configure custom bead types (required since beads v0.46.0).
-    run_bd_pinned "$dir" config set types.custom "$custom_types" 2>/dev/null || true
+    ensure_bd_runtime_config "$dir" "$prefix" "$custom_types"
 
     # Ensure database has repository fingerprint (upstream GH #25).
     # Fresh bd init already writes project_id on current upstream; only pay the
