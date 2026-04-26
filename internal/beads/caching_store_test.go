@@ -313,7 +313,7 @@ func TestCachingStoreParentListRefreshesCachedChildren(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create(parent): %v", err)
 	}
-	child, err := mem.Create(beads.Bead{Title: "child", Labels: []string{"mc-live-contract"}})
+	child, err := mem.Create(beads.Bead{Title: "child", Labels: []string{"real-world-app-contract"}})
 	if err != nil {
 		t.Fatalf("Create(child): %v", err)
 	}
@@ -333,7 +333,7 @@ func TestCachingStoreParentListRefreshesCachedChildren(t *testing.T) {
 		t.Fatalf("children = %#v, want refreshed parent %s", children, parent.ID)
 	}
 
-	labeled, err := cs.List(beads.ListQuery{Label: "mc-live-contract"})
+	labeled, err := cs.List(beads.ListQuery{Label: "real-world-app-contract"})
 	if err != nil {
 		t.Fatalf("List(label): %v", err)
 	}
@@ -352,7 +352,7 @@ func TestCachingStoreParentListRefreshesReparentedChildren(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create(new parent): %v", err)
 	}
-	child, err := mem.Create(beads.Bead{Title: "child", ParentID: oldParent.ID, Labels: []string{"mc-live-contract"}})
+	child, err := mem.Create(beads.Bead{Title: "child", ParentID: oldParent.ID, Labels: []string{"real-world-app-contract"}})
 	if err != nil {
 		t.Fatalf("Create(child): %v", err)
 	}
@@ -373,7 +373,7 @@ func TestCachingStoreParentListRefreshesReparentedChildren(t *testing.T) {
 		t.Fatalf("old parent children = %#v, want empty after reparent", children)
 	}
 
-	labeled, err := cs.List(beads.ListQuery{Label: "mc-live-contract"})
+	labeled, err := cs.List(beads.ListQuery{Label: "real-world-app-contract"})
 	if err != nil {
 		t.Fatalf("List(label): %v", err)
 	}
@@ -574,7 +574,7 @@ func TestCachingStoreUpdateReflectsWriteIntentWhenImmediateReadIsStale(t *testin
 	original, err := mem.Create(beads.Bead{
 		Title:    "root",
 		Labels:   []string{"root", "needs-update"},
-		Metadata: map[string]string{"mc.contract.run_id": "r1"},
+		Metadata: map[string]string{"real_world_app.contract.run_id": "r1"},
 	})
 	if err != nil {
 		t.Fatalf("Create: %v", err)
@@ -594,7 +594,7 @@ func TestCachingStoreUpdateReflectsWriteIntentWhenImmediateReadIsStale(t *testin
 		Labels:       []string{"verified"},
 		RemoveLabels: []string{"needs-update"},
 		Metadata: map[string]string{
-			"mc.contract.metadata_update": "true",
+			"real_world_app.contract.metadata_update": "true",
 		},
 	}); err != nil {
 		t.Fatalf("Update: %v", err)
@@ -607,7 +607,7 @@ func TestCachingStoreUpdateReflectsWriteIntentWhenImmediateReadIsStale(t *testin
 	if got.Status != "in_progress" {
 		t.Fatalf("status = %q, want in_progress", got.Status)
 	}
-	if got.Metadata["mc.contract.metadata_update"] != "true" || got.Metadata["mc.contract.run_id"] != "r1" {
+	if got.Metadata["real_world_app.contract.metadata_update"] != "true" || got.Metadata["real_world_app.contract.run_id"] != "r1" {
 		t.Fatalf("metadata = %#v, want original plus update", got.Metadata)
 	}
 	if !containsString(got.Labels, "verified") || containsString(got.Labels, "needs-update") {
@@ -1136,7 +1136,7 @@ func TestCachingStoreApplyEventRefreshesPartialHookPayload(t *testing.T) {
 	child, err := mem.Create(beads.Bead{
 		Title:    "child",
 		ParentID: parent.ID,
-		Labels:   []string{"mc-live-contract"},
+		Labels:   []string{"real-world-app-contract"},
 	})
 	if err != nil {
 		t.Fatalf("Create child: %v", err)
@@ -1170,7 +1170,7 @@ func TestCachingStoreApplyEventRefreshesPartialHookPayload(t *testing.T) {
 		t.Fatalf("ProblemCount = %d, want 0 (last problem: %s)", stats.ProblemCount, stats.LastProblem)
 	}
 
-	labeled, err := cs.List(beads.ListQuery{Label: "mc-live-contract"})
+	labeled, err := cs.List(beads.ListQuery{Label: "real-world-app-contract"})
 	if err != nil {
 		t.Fatalf("List(label): %v", err)
 	}
