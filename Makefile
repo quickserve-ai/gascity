@@ -167,7 +167,7 @@ TEST_ENV = env -i \
 ## `make test-cmd-gc-process` locally and the CI `cmd/gc process suite` job.
 ## Wrapped in $(TEST_ENV) — see comment above for why.
 test: test-fsys-darwin-compile
-	$(TEST_ENV) GC_FAST_UNIT=1 go test ./...
+	$(TEST_ENV) GC_FAST_UNIT=1 scripts/go-test-observable test -- ./...
 
 ## test-fsys-darwin-compile: cross-compile internal/fsys for macOS so
 ## unix.Stat_t field-type regressions fail in the default fast test path.
@@ -179,7 +179,7 @@ test-fsys-darwin-compile:
 ## test-cmd-gc-process: run the full non-short cmd/gc suite, including the
 ## process-backed lifecycle coverage routed out of the default fast loop
 test-cmd-gc-process:
-	$(TEST_ENV) GC_FAST_UNIT=0 go test -count=1 -timeout 20m ./cmd/gc
+	$(TEST_ENV) GC_FAST_UNIT=0 scripts/go-test-observable test-cmd-gc-process -- ./cmd/gc
 
 ## test-worker-core: run deterministic worker transcript and continuation conformance
 test-worker-core:
