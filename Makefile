@@ -179,7 +179,7 @@ test-fsys-darwin-compile:
 ## test-cmd-gc-process: run the full non-short cmd/gc suite, including the
 ## process-backed lifecycle coverage routed out of the default fast loop
 test-cmd-gc-process:
-	$(TEST_ENV) GC_FAST_UNIT=0 scripts/go-test-observable test-cmd-gc-process -- ./cmd/gc
+	$(TEST_ENV) GC_FAST_UNIT=0 scripts/go-test-observable test-cmd-gc-process -- -timeout 25m ./cmd/gc
 
 ## test-worker-core: run deterministic worker transcript and continuation conformance
 test-worker-core:
