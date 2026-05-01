@@ -11,6 +11,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/agent"
 	"github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/clock"
@@ -180,7 +181,7 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach bool,
 	if alias != "" && found.SupportsMultipleSessions() {
 		alias = workdirutil.SessionQualifiedName(cityPath, found, cfg.Rigs, requestedAlias, "")
 	}
-	explicitName, err := sessionExplicitNameForNewSession(&found, alias)
+	explicitName, err := sessionExplicitNameForNewSession(&found, alias, cfg.EffectiveCityName(), cfg.Workspace.SessionTemplate)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session new: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -1644,11 +1645,35 @@ func resolveWorkDirForQualifiedName(cityPath string, cfg *config.City, agent *co
 	return resolveConfiguredWorkDir(cityPath, cityName, qualifiedName, agent, rigs)
 }
 
-func sessionExplicitNameForNewSession(agent *config.Agent, alias string) (string, error) {
-	if agent == nil || !agent.SupportsMultipleSessions() || strings.TrimSpace(alias) != "" {
+// sessionExplicitNameForNewSession returns the explicit session_name to stamp
+// on a new session bead from `gc session new` (and the equivalent template
+// materialization path).
+//
+// The shape mirrors how the rig reconciler names canonical sessions: derive
+// from agent.SessionNameFor over the qualified-name primitive ("/"→"--",
+// "."→"__"). Three branches:
+//
+//  1. An alias was given → return "" so the manager uses the alias-driven
+//     path (alias becomes the runtime session name).
+//  2. The template supports multiple concurrent sessions and no alias was
+//     given → generate "<base>-adhoc-<hex>" so each ad-hoc materialization
+//     gets a unique tmux-safe identity.
+//  3. Singleton template (max_active_sessions=1, no namepool) → derive the
+//     canonical primitive name (e.g. "qcore/syl" → "qcore--syl",
+//     "gastown.mayor" → "gastown__mayor"). This matches what `gc rig restart`
+//     produces via providers.go, so manual `gc session new <rig>/<agent>` and
+//     reconciler-driven materialization agree on the runtime tmux name.
+//     Without this branch, singletons fall through the manager's empty-name
+//     path and end up with the legacy "s-<beadID>" form, which is unfindable
+//     by canonical name.
+func sessionExplicitNameForNewSession(agentCfg *config.Agent, alias, cityName, sessionTemplate string) (string, error) {
+	if agentCfg == nil || strings.TrimSpace(alias) != "" {
 		return "", nil
 	}
-	return session.GenerateAdhocExplicitName(agent.Name)
+	if !agentCfg.SupportsMultipleSessions() {
+		return agent.SessionNameFor(cityName, agentCfg.QualifiedName(), sessionTemplate), nil
+	}
+	return session.GenerateAdhocExplicitName(agentCfg.Name)
 }
 
 func shouldAttachNewSession(noAttach bool, transport string) bool {
