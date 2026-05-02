@@ -8,6 +8,7 @@ import (
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/convoy"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
 )
 
@@ -203,19 +204,24 @@ func (s *Server) humaHandleConvoyCreate(_ context.Context, input *ConvoyCreateIn
 		return nil, huma.Error400BadRequest("rig is required when multiple rigs are configured")
 	}
 
-	// Pre-validate all items exist AND capture their current parent so
-	// a mid-link failure can roll each one back, not just delete the
-	// new convoy and leave items pointing at a deleted ID.
+	// Pre-validate all items exist, capture their current parent (so a
+	// mid-link failure can roll each one back), and reject epic/container
+	// types up front. Without the type check, a single epic in the items
+	// list would otherwise leave a half-built convoy bead behind and
+	// trigger the gc-867q bug surface.
 	prevParent := make(map[string]string, len(input.Body.Items))
 	for _, itemID := range input.Body.Items {
 		item, err := store.Get(itemID)
 		if err != nil {
 			return nil, storeError(err)
 		}
+		if rejectErr := convoy.RejectNonLeafChild(item); rejectErr != nil {
+			return nil, huma.Error400BadRequest(rejectErr.Error())
+		}
 		prevParent[itemID] = item.ParentID
 	}
 
-	convoy, err := store.Create(beads.Bead{
+	created, err := store.Create(beads.Bead{
 		Title: input.Body.Title,
 		Type:  "convoy",
 	})
@@ -231,11 +237,11 @@ func (s *Server) humaHandleConvoyCreate(_ context.Context, input *ConvoyCreateIn
 	// convoy ID — a worse state than half-populated.
 	applied := make([]string, 0, len(input.Body.Items))
 	for _, itemID := range input.Body.Items {
-		pid := convoy.ID
+		pid := created.ID
 		if err := store.Update(itemID, beads.UpdateOpts{ParentID: &pid}); err != nil {
 			rollbackConvoyMembership(store, applied, prevParent, "convoy.create")
-			if delErr := store.Delete(convoy.ID); delErr != nil {
-				log.Printf("gc api: convoy create rollback: delete %s after link failure: %v", convoy.ID, delErr)
+			if delErr := store.Delete(created.ID); delErr != nil {
+				log.Printf("gc api: convoy create rollback: delete %s after link failure: %v", created.ID, delErr)
 			}
 			return nil, huma.Error500InternalServerError("failed to link item " + itemID + ": " + err.Error())
 		}
@@ -244,7 +250,7 @@ func (s *Server) humaHandleConvoyCreate(_ context.Context, input *ConvoyCreateIn
 
 	return &IndexOutput[beads.Bead]{
 		Index: s.latestIndex(),
-		Body:  convoy,
+		Body:  created,
 	}, nil
 }
 
@@ -266,13 +272,18 @@ func (s *Server) humaHandleConvoyAdd(_ context.Context, input *ConvoyAddInput) (
 		if b.Type != "convoy" {
 			return nil, huma.Error400BadRequest("bead " + id + " is not a convoy")
 		}
-		// Pre-validate all items exist and capture their previous parent
-		// so rollback can restore it if one of the Updates later fails.
+		// Pre-validate all items exist, capture their previous parent (so
+		// rollback can restore it if one of the Updates later fails), and
+		// reject epic/container types so 'gc convoy add' can't reproduce
+		// the gc-867q bug surface that 'gc convoy create' already guards.
 		prevParent := make(map[string]string, len(input.Body.Items))
 		for _, itemID := range input.Body.Items {
 			item, err := store.Get(itemID)
 			if err != nil {
 				return nil, storeError(err)
+			}
+			if rejectErr := convoy.RejectNonLeafChild(item); rejectErr != nil {
+				return nil, huma.Error400BadRequest(rejectErr.Error())
 			}
 			prevParent[itemID] = item.ParentID
 		}

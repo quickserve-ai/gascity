@@ -12,6 +12,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/convoy"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/spf13/cobra"
@@ -176,6 +177,37 @@ func doConvoyCreateWithOptions(store beads.Store, cfg *config.City, cityPath str
 		return 1
 	}
 
+	// Pre-validate every child before mutating any state. This resolves the
+	// per-child store (cross-rig support) once and rejects epic/container
+	// children up front so a half-built convoy can't be left behind. See
+	// gc-867q for the failure mode this prevents.
+	type convoyChild struct {
+		id    string
+		store beads.Store
+		bead  beads.Bead
+	}
+	children := make([]convoyChild, 0, len(issueIDs))
+	for _, id := range issueIDs {
+		childStore := store
+		if cfg != nil {
+			if rd := rigDirForBead(cfg, id); rd != "" {
+				if rs, err := openStoreAtForCity(rd, cityPath); err == nil {
+					childStore = rs
+				}
+			}
+		}
+		bead, err := childStore.Get(id)
+		if err != nil {
+			fmt.Fprintf(stderr, "gc convoy create: issue %s: %v\n", id, err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		if rejectErr := convoy.RejectNonLeafChild(bead); rejectErr != nil {
+			fmt.Fprintf(stderr, "gc convoy create: %v\n", rejectErr) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		children = append(children, convoyChild{id: id, store: childStore, bead: bead})
+	}
+
 	b := beads.Bead{Title: name, Type: "convoy"}
 	if opts.Owned {
 		b.Labels = []string{"owned"}
@@ -196,25 +228,10 @@ func doConvoyCreateWithOptions(store beads.Store, cfg *config.City, cityPath str
 		// Non-fatal: convoy already created and event will be emitted.
 	}
 
-	for _, id := range issueIDs {
-		// Resolve the correct store for this child bead. Children may
-		// live in a rig store (different from the city root store where
-		// the convoy was created).
-		childStore := store
-		if cfg != nil {
-			if rd := rigDirForBead(cfg, id); rd != "" {
-				if rs, err := openStoreAtForCity(rd, cityPath); err == nil {
-					childStore = rs
-				}
-			}
-		}
-		if _, err := childStore.Get(id); err != nil {
-			fmt.Fprintf(stderr, "gc convoy create: issue %s: %v\n", id, err) //nolint:errcheck // best-effort stderr
-			return 1
-		}
+	for _, c := range children {
 		parentID := convoy.ID
-		if err := childStore.Update(id, beads.UpdateOpts{ParentID: &parentID}); err != nil {
-			fmt.Fprintf(stderr, "gc convoy create: setting parent on %s: %v\n", id, err) //nolint:errcheck // best-effort stderr
+		if err := c.store.Update(c.id, beads.UpdateOpts{ParentID: &parentID}); err != nil {
+			fmt.Fprintf(stderr, "gc convoy create: setting parent on %s: %v\n", c.id, err) //nolint:errcheck // best-effort stderr
 			return 1
 		}
 	}
@@ -694,18 +711,23 @@ func doConvoyAdd(store beads.Store, args []string, stdout, stderr io.Writer) int
 	convoyID := args[0]
 	issueID := args[1]
 
-	convoy, err := store.Get(convoyID)
+	convoyBead, err := store.Get(convoyID)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc convoy add: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	if convoy.Type != "convoy" {
+	if convoyBead.Type != "convoy" {
 		fmt.Fprintf(stderr, "gc convoy add: bead %s is not a convoy\n", convoyID) //nolint:errcheck // best-effort stderr
 		return 1
 	}
 
-	if _, err := store.Get(issueID); err != nil {
+	issue, err := store.Get(issueID)
+	if err != nil {
 		fmt.Fprintf(stderr, "gc convoy add: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	if rejectErr := convoy.RejectNonLeafChild(issue); rejectErr != nil {
+		fmt.Fprintf(stderr, "gc convoy add: %v\n", rejectErr) //nolint:errcheck // best-effort stderr
 		return 1
 	}
 
