@@ -94,6 +94,95 @@ func TestConvoyCreateBadIssueID(t *testing.T) {
 	}
 }
 
+// TestConvoyCreateRejectsEpicChild asserts that 'gc convoy create <name> <epic-id>'
+// refuses to make an epic the direct child of a convoy. Pattern A (convoy → epic
+// → tasks) breaks 'gc sling' expansion: sling expands one level, hits the epic,
+// then errors. The fix shape is to catch this at convoy-create time with a
+// helpful message pointing to Pattern B (epic → convoy → tasks). See gc-867q.
+func TestConvoyCreateRejectsEpicChild(t *testing.T) {
+	store := beads.NewMemStore()
+	epic, _ := store.Create(beads.Bead{Title: "i18n epic", Type: "epic"})
+
+	var stderr bytes.Buffer
+	code := doConvoyCreate(store, events.Discard, []string{"i18n", epic.ID}, &bytes.Buffer{}, &stderr)
+	if code != 1 {
+		t.Errorf("doConvoyCreate = %d, want 1", code)
+	}
+	msg := stderr.String()
+	if !strings.Contains(msg, "epic") {
+		t.Errorf("stderr = %q, want mention of 'epic'", msg)
+	}
+	if !strings.Contains(msg, "Pattern B") {
+		t.Errorf("stderr = %q, want guidance referencing 'Pattern B'", msg)
+	}
+
+	// Epic should be untouched — no parent assigned, no convoy attempted.
+	got, err := store.Get(epic.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ParentID != "" {
+		t.Errorf("epic ParentID = %q, want empty (epic must not be reparented)", got.ParentID)
+	}
+}
+
+// TestConvoyCreateRejectsConvoyChild asserts that 'gc convoy create <name> <convoy-id>'
+// refuses to nest a convoy inside another convoy. Same family as the epic-child
+// rejection — convoys are container beads, not work units. See gc-867q.
+func TestConvoyCreateRejectsConvoyChild(t *testing.T) {
+	store := beads.NewMemStore()
+	inner, _ := store.Create(beads.Bead{Title: "inner convoy", Type: "convoy"})
+
+	var stderr bytes.Buffer
+	code := doConvoyCreate(store, events.Discard, []string{"outer", inner.ID}, &bytes.Buffer{}, &stderr)
+	if code != 1 {
+		t.Errorf("doConvoyCreate = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "convoy") {
+		t.Errorf("stderr = %q, want mention of 'convoy'", stderr.String())
+	}
+
+	got, err := store.Get(inner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ParentID != "" {
+		t.Errorf("inner convoy ParentID = %q, want empty", got.ParentID)
+	}
+}
+
+// TestConvoyCreateRejectsBeforeAnyChildMutation asserts that the convoy-create
+// rejection is "all-or-nothing": when one child is an epic, no other child
+// gets reparented. This prevents the half-applied state where some tasks are
+// under the new convoy and others aren't. See gc-867q.
+func TestConvoyCreateRejectsBeforeAnyChildMutation(t *testing.T) {
+	store := beads.NewMemStore()
+	task, _ := store.Create(beads.Bead{Title: "real task"})
+	epic, _ := store.Create(beads.Bead{Title: "narrative epic", Type: "epic"})
+
+	var stderr bytes.Buffer
+	code := doConvoyCreate(store, events.Discard, []string{"mixed", task.ID, epic.ID}, &bytes.Buffer{}, &stderr)
+	if code != 1 {
+		t.Errorf("doConvoyCreate = %d, want 1", code)
+	}
+
+	// The plain task must not have been reparented either.
+	gotTask, err := store.Get(task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotTask.ParentID != "" {
+		t.Errorf("task ParentID = %q, want empty (no partial application)", gotTask.ParentID)
+	}
+	gotEpic, err := store.Get(epic.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotEpic.ParentID != "" {
+		t.Errorf("epic ParentID = %q, want empty", gotEpic.ParentID)
+	}
+}
+
 func TestConvoyCreateMultiRig(t *testing.T) {
 	// Simulate cross-rig convoy: convoy in city store, children in rig store.
 	cityStore := beads.NewMemStore()
@@ -569,6 +658,61 @@ func TestConvoyAddMissingArgs(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "usage:") {
 		t.Errorf("stderr = %q, want usage message", stderr.String())
+	}
+}
+
+// TestConvoyAddRejectsEpicChild asserts that 'gc convoy add <convoy> <epic-id>'
+// refuses to make an epic a child of a convoy. Same rationale as
+// TestConvoyCreateRejectsEpicChild — Pattern A is broken. See gc-867q.
+func TestConvoyAddRejectsEpicChild(t *testing.T) {
+	store := beads.NewMemStore()
+	convoy, _ := store.Create(beads.Bead{Title: "deploy", Type: "convoy"})
+	epic, _ := store.Create(beads.Bead{Title: "narrative epic", Type: "epic"})
+
+	var stderr bytes.Buffer
+	code := doConvoyAdd(store, []string{convoy.ID, epic.ID}, &bytes.Buffer{}, &stderr)
+	if code != 1 {
+		t.Errorf("doConvoyAdd = %d, want 1", code)
+	}
+	msg := stderr.String()
+	if !strings.Contains(msg, "epic") {
+		t.Errorf("stderr = %q, want mention of 'epic'", msg)
+	}
+	if !strings.Contains(msg, "Pattern B") {
+		t.Errorf("stderr = %q, want guidance referencing 'Pattern B'", msg)
+	}
+
+	got, err := store.Get(epic.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ParentID != "" {
+		t.Errorf("epic ParentID = %q, want empty", got.ParentID)
+	}
+}
+
+// TestConvoyAddRejectsConvoyChild asserts that 'gc convoy add <convoy> <convoy-id>'
+// refuses to nest one convoy inside another. See gc-867q.
+func TestConvoyAddRejectsConvoyChild(t *testing.T) {
+	store := beads.NewMemStore()
+	outer, _ := store.Create(beads.Bead{Title: "outer", Type: "convoy"})
+	inner, _ := store.Create(beads.Bead{Title: "inner", Type: "convoy"})
+
+	var stderr bytes.Buffer
+	code := doConvoyAdd(store, []string{outer.ID, inner.ID}, &bytes.Buffer{}, &stderr)
+	if code != 1 {
+		t.Errorf("doConvoyAdd = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "convoy") {
+		t.Errorf("stderr = %q, want mention of 'convoy'", stderr.String())
+	}
+
+	got, err := store.Get(inner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ParentID != "" {
+		t.Errorf("inner convoy ParentID = %q, want empty", got.ParentID)
 	}
 }
 
