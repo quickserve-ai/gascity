@@ -59,6 +59,69 @@ func TestConvoyCreateInvalidItem(t *testing.T) {
 	}
 }
 
+// TestConvoyCreateRejectsEpicItem asserts the HTTP API refuses to attach an
+// epic as a direct child of a convoy and does NOT leave a half-built convoy
+// behind. Mirrors the CLI guard so the dashboard cannot reproduce the gc-867q
+// bug surface that bit qcore/qc-rz96.
+func TestConvoyCreateRejectsEpicItem(t *testing.T) {
+	state := newFakeMutatorState(t)
+	h := newTestCityHandler(t, state)
+
+	store := state.stores["myrig"]
+	epic, _ := store.Create(beads.Bead{Title: "narrative", Type: "epic"})
+
+	body := `{"rig":"myrig","title":"deploy","items":["` + epic.ID + `"]}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, newPostRequest(cityURL(state, "/convoys"), strings.NewReader(body)))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Pattern B") {
+		t.Errorf("body = %q, want guidance referencing 'Pattern B'", rec.Body.String())
+	}
+
+	// The epic must not have been reparented and no convoy bead should exist.
+	gotEpic, _ := store.Get(epic.ID)
+	if gotEpic.ParentID != "" {
+		t.Errorf("epic ParentID = %q, want empty", gotEpic.ParentID)
+	}
+	convoys, err := store.List(beads.ListQuery{Type: "convoy", IncludeClosed: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(convoys) != 0 {
+		t.Errorf("found %d convoy beads, want 0 (rejection must not leave a half-built convoy)", len(convoys))
+	}
+}
+
+// TestConvoyAddRejectsEpicItem asserts that POST /convoy/{id}/add refuses to
+// attach an epic as a direct child of a convoy.
+func TestConvoyAddRejectsEpicItem(t *testing.T) {
+	state := newFakeMutatorState(t)
+	h := newTestCityHandler(t, state)
+
+	store := state.stores["myrig"]
+	convoy, _ := store.Create(beads.Bead{Title: "deploy", Type: "convoy"})
+	epic, _ := store.Create(beads.Bead{Title: "narrative", Type: "epic"})
+
+	body := `{"items":["` + epic.ID + `"]}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, newPostRequest(cityURL(state, "/convoy/")+convoy.ID+"/add", strings.NewReader(body)))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "Pattern B") {
+		t.Errorf("body = %q, want guidance referencing 'Pattern B'", rec.Body.String())
+	}
+
+	gotEpic, _ := store.Get(epic.ID)
+	if gotEpic.ParentID != "" {
+		t.Errorf("epic ParentID = %q, want empty", gotEpic.ParentID)
+	}
+}
+
 func TestConvoyAddItems(t *testing.T) {
 	state := newFakeMutatorState(t)
 	h := newTestCityHandler(t, state)

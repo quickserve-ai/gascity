@@ -38,9 +38,38 @@ type ConvoyProgressResult struct {
 	Complete bool
 }
 
+// RejectNonLeafChild reports an error when bead is an epic or a container
+// type, both of which break sling expansion if placed as a direct child of a
+// convoy. The shared rule keeps Pattern A (convoy → epic → tasks) out of every
+// code path that links items into a convoy: CLI ('gc convoy create',
+// 'gc convoy add'), the HTTP API, and the convoy package itself. See gc-867q
+// and the prep-convoy skill for the failure mode this prevents.
+func RejectNonLeafChild(bead beads.Bead) error {
+	if bead.Type == "epic" {
+		return fmt.Errorf("bead %s is an epic; epics must wrap convoys, not the other way around (Pattern B). Create the convoy first, then run 'gc bd update <convoy-id> --parent %s' to put the convoy under the epic", bead.ID, bead.ID)
+	}
+	if beads.IsContainerType(bead.Type) {
+		return fmt.Errorf("bead %s is a %s; convoys cannot contain other %s beads", bead.ID, bead.Type, bead.Type)
+	}
+	return nil
+}
+
 // ConvoyCreate creates a convoy bead, applies metadata, links child items,
 // and emits a ConvoyCreated event.
 func ConvoyCreate(deps ConvoyDeps, store beads.Store, input ConvoyCreateInput) (ConvoyCreateResult, error) {
+	// Pre-validate every item's type before creating the convoy. Without
+	// this, a single epic in the items list would leave a half-built
+	// convoy bead behind once the linking loop hit the offending item.
+	for _, itemID := range input.Items {
+		item, err := store.Get(itemID)
+		if err != nil {
+			return ConvoyCreateResult{}, fmt.Errorf("getting item %s: %w", itemID, err)
+		}
+		if rejectErr := RejectNonLeafChild(item); rejectErr != nil {
+			return ConvoyCreateResult{}, rejectErr
+		}
+	}
+
 	b := beads.Bead{
 		Title:  input.Title,
 		Type:   "convoy",
@@ -116,6 +145,19 @@ func ConvoyAddItems(_ ConvoyDeps, store beads.Store, convoyID string, items []st
 	}
 	if b.Type != "convoy" {
 		return fmt.Errorf("bead %s is not a convoy (type: %s)", convoyID, b.Type)
+	}
+
+	// Pre-validate every item's type before mutating any state, mirroring
+	// ConvoyCreate. A mid-loop rejection would otherwise leave earlier
+	// items already reparented.
+	for _, itemID := range items {
+		item, err := store.Get(itemID)
+		if err != nil {
+			return fmt.Errorf("getting item %s: %w", itemID, err)
+		}
+		if rejectErr := RejectNonLeafChild(item); rejectErr != nil {
+			return rejectErr
+		}
 	}
 
 	for _, itemID := range items {
