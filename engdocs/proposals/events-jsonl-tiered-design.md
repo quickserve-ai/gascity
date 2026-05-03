@@ -1,9 +1,32 @@
-# events.jsonl: tiered compaction + rotation
+# events.jsonl: retention strategy (pack-level chosen; upstream tiers deferred)
 
-**Status**: Proposal
+**Status**: **Decided 2026-05-03 — pack-level retention. Upstream-implementation tiers deferred for at least 1 week.** This document preserves both options for posterity.
 **Filed**: 2026-05-03
-**Resolves**: gastownhall/gascity#1118 (events.jsonl unbounded growth)
 **Companion full design**: `engdocs/proposals/events-jsonl-rotation-design.md` (582-line research-grade survey)
+**Related upstream**: gastownhall/gascity#1118 (events.jsonl unbounded growth — the original ask)
+
+---
+
+## Decision summary (read this first)
+
+**The chosen near-term fix is a pack-level truncate order in `packs/maintenance/`** that runs every 30min, checks if `events.jsonl` exceeds 500MB, and if so keeps only the last 50k lines. Crude, simple, sufficient.
+
+**Why pack-level over an upstream SDK fix**:
+
+1. **Retention is fundamentally a pack/operator concern.** Different packs emit events at different rates (a pack with no patrol orders barely writes; one with many patrols writes a lot). The "right" retention policy is therefore inherently pack-specific. Pushing the mechanism into the SDK introduces config surface that each pack would just override anyway.
+2. **The bead store is the durable record**, not the events log. Beads + git history capture the system's authoritative state. The events log is operational telemetry — useful for live debugging, not for long-term audit. ~1 day of recent events is plenty.
+3. **The upstream tiered design is over-engineered for the actual need.** T1 (drop noise) is appealing because the 67% cache-reconcile finding is dramatic, but if we just truncate the file periodically, the noise is bounded by retention not by emit-time filtering. Same operational outcome, less SDK surface area.
+4. **Upstream isn't pulling for this.** Issue #1118 has been open since 2026-04-22 with two community comments (both ours/jwp23) and no maintainer engagement. The design proposals (T1/T2/T3) would be net-new SDK surface to land + maintain. Not worth the friction unless community pressure builds.
+5. **Pack-level fix is reversible.** If we later decide an upstream mechanism is the right shape, we revert the pack order and ship the SDK change. Pack-level imposes zero lock-in.
+
+**What got built (local pack)**:
+- `packs/maintenance/orders/events-truncate.toml` — cooldown order, 30min interval
+- `packs/maintenance/assets/scripts/events-truncate.sh` — `tail -n KEEP_LINES > tmp; cat tmp > events.jsonl` pattern (preserves inode for the controller's open `O_APPEND` fd)
+- Configurable via env: `MAX_SIZE_MB` (default 500), `KEEP_LINES` (default 50000)
+
+**What's deferred (upstream tiers)** — preserved below for reference. Re-evaluate in ~1 week if community engagement on #1118 changes.
+
+---
 
 ---
 
