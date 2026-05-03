@@ -26,27 +26,71 @@ The cache-reconcile events: 100% have empty `message`, 72.4% are byte-identical 
 
 A single-mechanism design (rotation alone, per the polecat's F2 in the companion doc) bounds the file size but doesn't address that 67% of what we're rotating is information-free noise. A tiered design composes deterministic noise filtering with rotation; each tier is independently shippable and pays for itself.
 
-### Tier 1 — Drop `cache-reconcile` events at write time
+### Tier 1 — Configurable actor-filter mechanism (drop bookkeeping events at write time)
+
+**Mechanism (in SDK)**: `FileRecorder` consults a TOML-configured list of actors whose events are filtered before append.
 
 ```go
 // internal/events/recorder.go
 func (r *FileRecorder) Record(e Event) {
-    if e.Actor == "cache-reconcile" {
-        return  // bookkeeping, not domain event
+    if r.shouldDrop(e) {
+        return
     }
     // ... existing append path ...
 }
+
+func (r *FileRecorder) shouldDrop(e Event) bool {
+    return slices.Contains(r.dropActors, e.Actor)
+}
 ```
 
-**Why**: deterministic, single-actor filter, no judgment. The cache-reconcile actor is internal bookkeeping; its events embed full bead payloads (~1.1KB) but are byte-equivalent to a `bd show`. They serve no consumer. Dropping them at write time recovers ~67% of file growth on the qlandia install. Passes ZFC (no role-name reasoning, just metadata filter). Passes Bitter Lesson (it's a definition: "this actor's events are not domain events", not "decide which events are noise"). One-line change + one test.
+**TOML schema (in SDK)**:
+```toml
+[events]
+drop_actors = []   # default: empty (opt-in). Operators/packs add actors.
+```
 
-**Risk**: any consumer that relies on cache-reconcile events for triggering would break. Audit before merge — none expected (the cache layer maintains its own state from beads, doesn't subscribe to its own events).
+**Smart default (in vendored gastown pack at `examples/gastown/city.toml`)**:
+```toml
+[events]
+drop_actors = ["cache-reconcile"]   # SDK's own bead-cache bookkeeping actor
+```
 
-### Tier 2 — Collapse paired patrol-order events
+**Why this shape (not hardcoded actor name)**: ZFC compliance. The SDK provides the *mechanism* (filter events by actor); the *policy* (which actors are noise) lives in operator config. Other packs that emit their own bookkeeping actors can use the same mechanism without an SDK change. The bundled gastown pack ships with `cache-reconcile` as a smart default because that's the SDK's own internal cache-layer actor and dropping it is essentially universal — but the SDK code never names it.
 
-`order.fired` + `order.completed` for recurring patrol orders (`gate-sweep`, `cross-rig-deps`, `orphan-sweep`, `spawn-storm-detect`) appear ~21,000 times in our window, perfectly paired. Each pair is informationally equivalent to "patrol X ran, succeeded" — useful in aggregate (frequency, failure-rate), useless individually.
+**Why ~67% recovery**: cache-reconcile events embed full bead payloads (~1.1KB avg) but are byte-equivalent to a `bd show`. They serve no consumer (the cache layer maintains state from beads, not from its own events).
 
-Collapse window-N pairs to one summary event: `order.batch_completed{name: "gate-sweep", count: 2699, success: 2698, last_ts: ...}`. Recovers ~7% additional, and improves the signal-to-noise of the file even more dramatically (real anomalies like `session.idle_killed` become much easier to find by eye/grep).
+**Risk**: any consumer subscribing to a filtered actor would lose events. Audit before merge for the default (cache-reconcile) — none expected. New entries to the list need similar audit.
+
+### Tier 2 — Configurable paired-order collapse mechanism
+
+**Mechanism (in SDK)**: `FileRecorder` consults a TOML-configured list of order names. When an `order.completed` event matches a configured name AND the most-recent `order.fired` for that name is in the same window, replace the pair with a single `order.batch_completed` summary carrying aggregate counts.
+
+**TOML schema (in SDK)**:
+```toml
+[events.dedup]
+collapse_paired_orders = []   # default: empty (opt-in)
+collapse_window = "5m"        # window for batching identical patrol-order pairs
+```
+
+**Smart default (in vendored gastown pack `examples/gastown/city.toml`)**:
+```toml
+[events.dedup]
+collapse_paired_orders = [
+    "gate-sweep",          # maintenance pack
+    "orphan-sweep",        # maintenance pack
+    "cross-rig-deps",      # maintenance pack
+    "spawn-storm-detect",  # maintenance pack
+    "wisp-compact",        # maintenance pack
+    "mol-dog-reaper",      # maintenance pack
+    "prune-branches",      # maintenance pack
+    "digest-generate",     # gastown pack
+]
+```
+
+**Why config-driven (not hardcoded)**: order names are pack content. A pack with a different patrol set has different names. The SDK ships only the collapse *mechanism*; each pack contributes its patrol-order names to the bundled city.toml that ships with `gc init --from <pack>`. **No order name appears in Go.**
+
+`order.fired` + `order.completed` events for recurring patrols appear ~21,000 times in our 4-day window, perfectly paired. Each pair is informationally equivalent to "patrol X ran, succeeded" — useful in aggregate, useless individually. Collapsing recovers ~7% additional, and improves signal-to-noise dramatically (anomalies like `session.idle_killed` become greppable instead of swimming in patrol noise).
 
 Less urgent than Tier 1; ship after T1 is in.
 
@@ -55,6 +99,20 @@ Less urgent than Tier 1; ship after T1 is in.
 `RotatingFileRecorder` wrapping `FileRecorder`, size-only, default-OFF, atomic rename to `events.jsonl.<timestamp>`. Plus `gc events rotate` CLI for manual + maintenance-pack callers. Full design in the companion doc; precedent in-tree at `cmd/gc/session_reconciler_trace_store.go:rotateSegment`.
 
 After Tiers 1+2, rotation triggers ~3-4× less often. Still needed as the absolute file-size cap (Tier 1+2 reduce growth rate; rotation bounds peak size).
+
+## Smart defaults — where each pack ships its policy
+
+The SDK provides the *mechanism* with empty-default lists. **Smart defaults live in each pack's bundled `city.toml` template** (the file `gc init --from <pack>` materializes as the operator's starting config).
+
+| Pack | File | Sets defaults for |
+|---|---|---|
+| **`examples/gastown/`** (vendored gastown — what `gc init --from gastown` ships) | `examples/gastown/city.toml` | `[events] drop_actors = ["cache-reconcile"]` (SDK's own bookkeeping actor) and `[events.dedup] collapse_paired_orders = [<gastown+maintenance pack patrols>]` |
+| **`examples/swarm/`**, **`examples/hyperscale/`**, **`examples/lifecycle/`** | each pack's `city.toml` | Their own respective patrol-order lists if they ship recurring patrols; otherwise leave empty |
+| Custom downstream packs (e.g. `qlandia/packs/qlandia-crew/`) | operator's local `city.toml` | Add to the list (e.g. `xtm-sync` for our local pack) |
+
+**Why this shape**: each pack KNOWS its own patrol orders (and any of its own internal-bookkeeping actors). The SDK doesn't enumerate them; the pack ships its self-aware default. New packs get the mechanism for free; their authors decide what to filter.
+
+**Operator override path**: city.toml is operator-owned post-init. Operators can extend or redact the defaults at any time without re-init. Pack updates don't override operator edits.
 
 ## Sequencing
 
@@ -72,6 +130,7 @@ T2 can ship before T3 if it's easier; the order is preference not dependency.
 - Does not address `bead.updated` payload bloat from named actors (separate angle: `gc-zykvg` proposes delta-only payloads).
 - Does not fix `/v0/city/{name}/events` HTTP timeouts (separate root cause in multiplexer fan-out — see #1487).
 - Does not introduce content-aware compaction with judgment ("which event is noise"). Both T1 and T2 are pattern-matching on metadata, not semantic filtering.
+- Does not name any specific actor or order in Go code. T1 and T2 mechanisms are config-driven (TOML lists); SDK code is policy-free.
 
 ## Open questions
 

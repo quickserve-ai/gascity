@@ -36,6 +36,42 @@ shutdown_timeout = "5s"
 # molecule_id attachment semantics even when their own revision is version >= 2.
 formula_v2 = true
 
+# Events log filtering (see engdocs/proposals/events-jsonl-tiered-design.md).
+# The SDK provides the mechanism with empty defaults; each pack ships its
+# own smart defaults here in the bundled city.toml template.
+[events]
+# Drop events emitted by these actors at write time. The SDK's bead-cache
+# layer emits 'cache-reconcile' events that are byte-equivalent to a
+# `bd show` and serve no consumer — pure bookkeeping noise (~67% of file
+# growth observed on multi-rig installs). Operators may add pack-specific
+# bookkeeping actors here.
+drop_actors = ["cache-reconcile"]
+
+# Collapse paired patrol-order events (order.fired + order.completed) into
+# a single order.batch_completed summary per collapse_window. Useful for
+# recurring deterministic patrols that would otherwise dominate the events
+# log. Order names listed here come from the maintenance + gastown packs;
+# downstream packs add their own patrol orders.
+[events.dedup]
+collapse_paired_orders = [
+    "gate-sweep",          # maintenance pack
+    "orphan-sweep",        # maintenance pack
+    "cross-rig-deps",      # maintenance pack
+    "spawn-storm-detect",  # maintenance pack
+    "wisp-compact",        # maintenance pack
+    "mol-dog-reaper",      # maintenance pack
+    "prune-branches",      # maintenance pack
+    "digest-generate",     # gastown pack
+]
+collapse_window = "5m"
+
+# Rotation of events.jsonl. Default-OFF in v1 — operators opt in by setting
+# rotation_max_size. Once field-validated, future SDK versions may promote
+# to default-ON.
+# [events.rotation]
+# max_size = "100MB"
+# keep_n = 5
+
 # Register a rig to activate per-rig agents (witness, refinery, polecat):
 # [[rigs]]
 # name = "myproject"
