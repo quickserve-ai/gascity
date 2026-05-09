@@ -54,6 +54,44 @@ func bdStoreForRig(rigDir, cityPath string, cfg *config.City, knownPrefix ...str
 	return beads.NewBdStoreWithPrefix(rigDir, bdCommandRunnerForRig(cityPath, cfg, rigDir), prefix)
 }
 
+func controlBdStoreForCity(dir, cityPath string, cfg *config.City) *beads.BdStore {
+	return beads.NewBdStoreWithPrefix(dir, controlBdCommandRunnerForCity(cityPath), issuePrefixForScope(dir, cityPath, cfg))
+}
+
+func controlBdStoreForRig(rigDir, cityPath string, cfg *config.City, knownPrefix ...string) *beads.BdStore {
+	prefix := issuePrefixForScope(rigDir, cityPath, cfg)
+	if prefix == "" {
+		for _, candidate := range knownPrefix {
+			if strings.TrimSpace(candidate) != "" {
+				prefix = candidate
+				break
+			}
+		}
+	}
+	return beads.NewBdStoreWithPrefix(rigDir, controlBdCommandRunnerForRig(cityPath, cfg, rigDir), prefix)
+}
+
+func controlBdCommandRunnerForCity(cityPath string) beads.CommandRunner {
+	return bdCommandRunnerWithManagedRetry(cityPath, func(dir string) map[string]string {
+		env := bdRuntimeEnv(cityPath)
+		env["BEADS_DIR"] = filepath.Join(dir, ".beads")
+		applyControlBdEnv(env)
+		return env
+	})
+}
+
+func controlBdCommandRunnerForRig(cityPath string, cfg *config.City, rigDir string) beads.CommandRunner {
+	return bdCommandRunnerWithManagedRetry(cityPath, func(_ string) map[string]string {
+		env := bdRuntimeEnvForRig(cityPath, cfg, rigDir)
+		applyControlBdEnv(env)
+		return env
+	})
+}
+
+func applyControlBdEnv(env map[string]string) {
+	env["BD_EXPORT_AUTO"] = "false"
+}
+
 func issuePrefixForScope(scopeRoot, cityPath string, cfg *config.City) string {
 	if prefix := readScopeIssuePrefix(scopeRoot); prefix != "" {
 		return prefix
@@ -198,7 +236,7 @@ var beadsExecCommandRunnerWithEnv = beads.ExecCommandRunnerWithEnv
 
 var recoverManagedBDCommand = func(cityPath string) error {
 	script := gcBeadsBdScriptPath(cityPath)
-	overrides := citylayout.CityRuntimeEnvMap(cityPath)
+	overrides := cityRuntimeEnvMapForCity(cityPath)
 	setProjectedDoltEnvEmpty(overrides)
 	environ := mergeRuntimeEnv(os.Environ(), overrides)
 	environ = append(environ, providerLifecycleDoltPathEnv(cityPath)...)
@@ -472,29 +510,12 @@ func bdRuntimeEnv(cityPath string) map[string]string {
 }
 
 func cityRuntimeEnvMapForCity(cityPath string) map[string]string {
-	env := citylayout.CityRuntimeEnvMap(cityPath)
-	if runtimeDir := trustedAmbientCityRuntimeDir(cityPath); runtimeDir != "" {
-		env["GC_CITY_RUNTIME_DIR"] = runtimeDir
-	}
-	return env
-}
-
-func trustedAmbientCityRuntimeDir(cityPath string) string {
-	runtimeDir := strings.TrimSpace(os.Getenv("GC_CITY_RUNTIME_DIR"))
-	if runtimeDir == "" {
-		return ""
-	}
-	for _, key := range []string{"GC_CITY_PATH", "GC_CITY"} {
-		if samePath(strings.TrimSpace(os.Getenv(key)), cityPath) {
-			return normalizePathForCompare(runtimeDir)
-		}
-	}
-	return ""
+	return citylayout.CityRuntimeEnvMapForRuntimeDir(cityPath, citylayout.TrustedAmbientCityRuntimeDir(cityPath))
 }
 
 func cityRuntimeProcessEnv(cityPath string) []string {
 	cityPath = normalizePathForCompare(cityPath)
-	overrides := citylayout.CityRuntimeEnvMap(cityPath)
+	overrides := cityRuntimeEnvMapForCity(cityPath)
 	if cityUsesBdStoreContract(cityPath) {
 		source := map[string]string{"BEADS_DOLT_AUTO_START": "0"}
 		if err := applyResolvedCityDoltEnv(source, cityPath, false); err != nil {
