@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -518,11 +519,86 @@ func externalDoltEnvOverrideTarget() (contract.DoltConnectionTarget, bool) {
 	}, true
 }
 
+// currentResolvableManagedDoltPort returns a live managed Dolt port from the
+// published runtime state, or from provider state when publication has not
+// caught up yet. Provider fallback uses validDoltRuntimeState instead of the
+// contract package's lighter published-state validation because callers may
+// mirror or publish this value into user-visible runtime files.
+func currentResolvableManagedDoltPort(cityPath string) string {
+	if port := currentManagedDoltPort(cityPath); port != "" {
+		return port
+	}
+	state, ok := readValidProviderManagedDoltState(cityPath)
+	if !ok {
+		return ""
+	}
+	return strconv.Itoa(state.Port)
+}
+
+func readValidProviderManagedDoltState(cityPath string) (doltRuntimeState, bool) {
+	state, err := readDoltRuntimeStateFile(providerManagedDoltStatePath(cityPath))
+	if err != nil {
+		return doltRuntimeState{}, false
+	}
+	if !validDoltRuntimeState(state, cityPath) {
+		return doltRuntimeState{}, false
+	}
+	return state, true
+}
+
+func currentPublishedOrRecoveredManagedDoltPort(cityPath string, allowRecovery bool) (string, error) {
+	if port := currentManagedDoltPort(cityPath); port != "" {
+		return port, nil
+	}
+	if !allowRecovery {
+		return "", nil
+	}
+	state, ok := readValidProviderManagedDoltState(cityPath)
+	if !ok {
+		return "", nil
+	}
+	published, err := publishManagedDoltRuntimeStateIfOwnedResultFromState(cityPath, state)
+	if err != nil {
+		return "", fmt.Errorf("publish managed dolt runtime state from provider state: %w", err)
+	}
+	port := currentManagedDoltPort(cityPath)
+	if port == "" {
+		if !published {
+			return "", fmt.Errorf("publish managed dolt runtime state from provider state: managed dolt lifecycle is not owned and published state is absent")
+		}
+		return "", fmt.Errorf("publish managed dolt runtime state from provider state: published state is not valid")
+	}
+	return port, nil
+}
+
 func resolvedRuntimeCityDoltTarget(cityPath string, allowRecovery bool) (contract.DoltConnectionTarget, bool, error) {
 	var managedRuntimeErr error
+	var recoveryErr error
+	recoveryChecked := false
+	recoveryPort := ""
+	recoveredManagedDoltPort := func() string {
+		if recoveryChecked {
+			return recoveryPort
+		}
+		recoveryChecked = true
+		port, err := currentPublishedOrRecoveredManagedDoltPort(cityPath, allowRecovery)
+		if err != nil {
+			recoveryErr = err
+			return ""
+		}
+		recoveryPort = port
+		return port
+	}
+	resetRecoveryCache := func() {
+		recoveryChecked = false
+		recoveryPort = ""
+	}
 	if target, ok, err := canonicalScopeDoltTarget(cityPath, cityPath); err != nil {
 		if !allowRecovery || !contract.IsManagedRuntimeUnavailable(err) {
 			return contract.DoltConnectionTarget{}, false, err
+		}
+		if port := recoveredManagedDoltPort(); port != "" {
+			return contract.DoltConnectionTarget{Host: defaultManagedDoltHost, Port: port}, true, nil
 		}
 		managedRuntimeErr = err
 	} else if ok {
@@ -538,15 +614,19 @@ func resolvedRuntimeCityDoltTarget(cityPath string, allowRecovery bool) (contrac
 		return target, true, nil
 	}
 
-	if port := currentManagedDoltPort(cityPath); port != "" {
+	if port := recoveredManagedDoltPort(); port != "" {
 		return contract.DoltConnectionTarget{Host: defaultManagedDoltHost, Port: port}, true, nil
 	}
 	if allowRecovery {
 		if err := healthBeadsProvider(cityPath); err == nil {
-			if port := currentManagedDoltPort(cityPath); port != "" {
+			resetRecoveryCache()
+			if port := recoveredManagedDoltPort(); port != "" {
 				return contract.DoltConnectionTarget{Host: defaultManagedDoltHost, Port: port}, true, nil
 			}
 		}
+	}
+	if recoveryErr != nil {
+		return contract.DoltConnectionTarget{}, false, recoveryErr
 	}
 	if managedRuntimeErr != nil {
 		return contract.DoltConnectionTarget{}, false, managedRuntimeErr

@@ -717,6 +717,65 @@ func TestNewCityRuntimePreflightsManagedDoltPublicationBeforeStartupStoreWork(t 
 	}
 }
 
+func TestNewCityRuntimePreflightUsesResolvableProviderStateByDefault(t *testing.T) {
+	t.Setenv("GC_BEADS", "bd")
+
+	healthCalls := 0
+	cityPath := t.TempDir()
+	writeReachableProviderManagedDoltState(t, cityPath)
+	sp := runtime.NewFake()
+	_ = newCityRuntime(CityRuntimeParams{
+		CityPath: cityPath,
+		CityName: "test-city",
+		Cfg:      &config.City{},
+		SP:       sp,
+		ManagedDoltHealth: func(string) error {
+			healthCalls++
+			return nil
+		},
+		ManagedDoltOwned: func(string) (bool, error) {
+			return true, nil
+		},
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		Dops:   newDrainOps(sp),
+		Rec:    events.Discard,
+		Stdout: io.Discard,
+		Stderr: io.Discard,
+	})
+
+	if healthCalls != 0 {
+		t.Fatalf("healthCalls = %d, want 0 when provider state is already resolvable", healthCalls)
+	}
+}
+
+func TestCityRuntimeTickPreflightUsesResolvableProviderStateByDefault(t *testing.T) {
+	t.Setenv("GC_BEADS", "bd")
+
+	healthCalls := 0
+	cityPath := t.TempDir()
+	writeReachableProviderManagedDoltState(t, cityPath)
+	cr := &CityRuntime{
+		cityPath:  cityPath,
+		logPrefix: "gc test",
+		stderr:    io.Discard,
+		managedDoltHealth: func(string) error {
+			healthCalls++
+			return nil
+		},
+		managedDoltOwned: func(string) (bool, error) {
+			return true, nil
+		},
+	}
+
+	cr.ensureManagedDoltPublishedForTick()
+
+	if healthCalls != 0 {
+		t.Fatalf("healthCalls = %d, want 0 when provider state is already resolvable", healthCalls)
+	}
+}
+
 func TestCityRuntimeDemandSnapshotRetainsOnlyPoolScaleCheckPartials(t *testing.T) {
 	sessionBeads := newSessionBeadSnapshot([]beads.Bead{{
 		ID:     "session-worker",

@@ -434,7 +434,7 @@ func initAndHookDir(cityPath, dir, prefix string) error {
 	if err := normalizeCanonicalBdScopeFilesForInit(cityPath, dir, prefix, doltDatabase); err != nil {
 		return err
 	}
-	if cityUsesBdStoreContract(cityPath) && currentManagedDoltPort(cityPath) != "" {
+	if cityUsesBdStoreContract(cityPath) && currentResolvableManagedDoltPort(cityPath) != "" {
 		if err := syncManagedDoltPortMirrors(cityPath); err != nil {
 			return fmt.Errorf("sync managed dolt port mirrors after init: %w", err)
 		}
@@ -521,14 +521,14 @@ func allowLegacyDoltMetadataRepair(fs fsys.FS, path string, err error) bool {
 // the database is found, or an actionable error otherwise.
 //
 // The function is a no-op (returns nil) when the city does not use the bd
-// store contract or when no managed Dolt port is published — the caller
+// store contract or when no managed Dolt port is resolvable — the caller
 // already gates on those conditions, but we double-check defensively so
 // the helper is safe to call from new sites without re-checking.
 var verifyManagedDoltDatabaseExistsAfterInit = func(cityPath, dir, dbName string) error {
 	if !cityUsesBdStoreContract(cityPath) {
 		return nil
 	}
-	port := currentManagedDoltPort(cityPath)
+	port := currentResolvableManagedDoltPort(cityPath)
 	if port == "" {
 		return nil
 	}
@@ -1052,11 +1052,13 @@ type doltRuntimeState struct {
 }
 
 // currentDoltPort returns the controller-managed Dolt port for the city.
-// The only managed-local authority is .gc/runtime/packs/dolt/dolt-state.json.
+// Published runtime state is preferred; valid provider state is accepted while
+// publication catches up so the raw-bd compatibility mirror does not get
+// removed during a live managed-Dolt window.
 // .beads/dolt-server.port is a compatibility mirror for raw bd, not a GC
 // control-plane input.
 func currentDoltPort(cityPath string) string {
-	if port := currentManagedDoltPort(cityPath); port != "" {
+	if port := currentResolvableManagedDoltPort(cityPath); port != "" {
 		writeDoltPortFile(cityPath, port, "", io.Discard)
 		return port
 	}

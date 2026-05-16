@@ -205,7 +205,7 @@ func newCityRuntime(p CityRuntimeParams) *CityRuntime {
 	}
 	managedDoltPort := p.ManagedDoltPort
 	if managedDoltPort == nil {
-		managedDoltPort = currentManagedDoltPort
+		managedDoltPort = currentResolvableManagedDoltPort
 	}
 
 	logPrefix := p.LogPrefix
@@ -2010,7 +2010,7 @@ func (cr *CityRuntime) ensureManagedDoltPublishedForTick() {
 	}
 	portFn := cr.managedDoltPort
 	if portFn == nil {
-		portFn = currentManagedDoltPort
+		portFn = currentResolvableManagedDoltPort
 	}
 	ensureManagedDoltPublishedForRuntime(cr.cityPath, cr.stderr, cr.logPrefix, healthFn, ownedFn, portFn)
 }

@@ -303,7 +303,7 @@ func stopCityManagedBeadsProvider(cityPath string) (bool, error) {
 	if rawBeadsProvider(cityPath) != "bd" {
 		return false, nil
 	}
-	if currentManagedDoltPort(cityPath) == "" {
+	if currentResolvableManagedDoltPort(cityPath) == "" {
 		return false, nil
 	}
 	return true, shutdownBeadsProviderForStop(cityPath)
