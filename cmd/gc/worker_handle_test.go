@@ -705,6 +705,87 @@ func TestResolvedWorkerRuntimeWithConfigFallsBackToStoredCommandWhenTemplateOver
 	}
 }
 
+// TestResolvedWorkerSessionConfigPropagatesAgentSessionLive ensures the
+// create-side helper threads agent-level session_live commands through to
+// the resolved session config. Without it, sessions created via the
+// session-create path produce runtime.Config{} hints with no SessionLive
+// and runSessionLive becomes a silent no-op at startup.
+func TestResolvedWorkerSessionConfigPropagatesAgentSessionLive(t *testing.T) {
+	cfg, err := resolvedWorkerSessionConfigWithConfig(
+		"/bin/echo",
+		"stub",
+		"/tmp/work",
+		"worker",
+		"",
+		"worker",
+		"Worker",
+		"",
+		&config.ResolvedProvider{Name: "stub", Command: "/bin/echo"},
+		map[string]string{"session_origin": "test"},
+		nil,
+		[]string{"tmux set -t {{.Session}} mouse on"},
+	)
+	if err != nil {
+		t.Fatalf("resolvedWorkerSessionConfigWithConfig: %v", err)
+	}
+	if got, want := len(cfg.Runtime.Hints.SessionLive), 1; got != want {
+		t.Fatalf("len(Hints.SessionLive) = %d, want %d (got %#v)", got, want, cfg.Runtime.Hints.SessionLive)
+	}
+	if got, want := cfg.Runtime.Hints.SessionLive[0], "tmux set -t {{.Session}} mouse on"; got != want {
+		t.Errorf("Hints.SessionLive[0] = %q, want %q", got, want)
+	}
+}
+
+// TestResolvedWorkerRuntimeWithConfigPopulatesSessionLive is a regression
+// test for the bug where `gc session attach` paths produce a runtime.Config
+// with empty SessionLive, causing runSessionLive at adapter.go to short-
+// circuit on its `len(cfg.SessionLive) == 0` guard and skip tmux theming /
+// keybindings hooks. The reconciler's templateParamsToConfig path
+// correctly carries SessionLive from the agent config; the worker handle's
+// resolved-runtime path must do the same so both create paths produce
+// identical effective Hints.
+func TestResolvedWorkerRuntimeWithConfigPopulatesSessionLive(t *testing.T) {
+	cityDir := t.TempDir()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:     "worker",
+			Provider: "stub",
+			SessionLive: []string{
+				"tmux set -t {{.Session}} mouse on",
+				"tmux set -t {{.Session}} status-style bg=green",
+			},
+		}},
+		Providers: map[string]config.ProviderSpec{
+			"stub": {
+				Command:   "/bin/echo",
+				PathCheck: "true",
+			},
+		},
+	}
+
+	resolved, err := resolvedWorkerRuntimeWithConfigAndMetadata(cityDir, cfg, session.Info{
+		Template: "worker",
+		Command:  "/bin/echo",
+		WorkDir:  cityDir,
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("resolvedWorkerRuntimeWithConfigAndMetadata: %v", err)
+	}
+	if resolved == nil {
+		t.Fatal("resolvedWorkerRuntimeWithConfigAndMetadata() = nil")
+	}
+	if got, want := len(resolved.Hints.SessionLive), 2; got != want {
+		t.Fatalf("len(Hints.SessionLive) = %d, want %d (got %#v)", got, want, resolved.Hints.SessionLive)
+	}
+	if got, want := resolved.Hints.SessionLive[0], "tmux set -t {{.Session}} mouse on"; got != want {
+		t.Errorf("Hints.SessionLive[0] = %q, want %q", got, want)
+	}
+	if got, want := resolved.Hints.SessionLive[1], "tmux set -t {{.Session}} status-style bg=green"; got != want {
+		t.Errorf("Hints.SessionLive[1] = %q, want %q", got, want)
+	}
+}
+
 func TestWorkerHandleForSessionWithConfigUsesResolvedProviderOnResume(t *testing.T) {
 	skipSlowCmdGCTest(t, "waits through stale session-key detection; run make test-cmd-gc-process for full coverage")
 	cityDir := t.TempDir()
@@ -1045,6 +1126,7 @@ func TestResolvedWorkerSessionConfigWithConfigFallsBackToResolvedProviderNameFor
 		},
 		map[string]string{"session_origin": "test"},
 		nil,
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("resolvedWorkerSessionConfigWithConfig: %v", err)
@@ -1068,6 +1150,7 @@ func TestResolvedWorkerSessionConfigWithConfigFallsBackToProviderArgForCommand(t
 		"Worker",
 		"",
 		&config.ResolvedProvider{},
+		nil,
 		nil,
 		nil,
 	)
@@ -1105,6 +1188,7 @@ func TestResolvedWorkerSessionConfigWithConfigPersistsStoredMCPMetadata(t *testi
 			Command:   "/bin/mcp",
 			Args:      []string{"--stdio"},
 		}},
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("resolvedWorkerSessionConfigWithConfig: %v", err)
@@ -1134,6 +1218,7 @@ func TestResolvedWorkerSessionConfigWithConfigSkipsStoredMCPMetadataForTmuxTrans
 			"session_origin": "test",
 			"agent_name":     "myrig/worker-adhoc-123",
 		},
+		nil,
 		nil,
 	)
 	if err != nil {

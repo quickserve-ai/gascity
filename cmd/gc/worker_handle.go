@@ -211,6 +211,10 @@ func newWorkerSessionHandleForResolvedRuntimeWithConfig(
 	if err != nil {
 		return nil, err
 	}
+	var agentSessionLive []string
+	if agentCfg := findAgentByTemplate(cfg, template); agentCfg != nil {
+		agentSessionLive = append([]string(nil), agentCfg.SessionLive...)
+	}
 	sessionCfg, err := resolvedWorkerSessionConfigWithConfig(
 		command,
 		provider,
@@ -223,6 +227,7 @@ func newWorkerSessionHandleForResolvedRuntimeWithConfig(
 		resolved,
 		metadata,
 		mcpServers,
+		agentSessionLive,
 	)
 	if err != nil {
 		return nil, err
@@ -242,6 +247,7 @@ func resolvedWorkerSessionConfigWithConfig(
 	resolved *config.ResolvedProvider,
 	metadata map[string]string,
 	mcpServers []runtime.MCPServerConfig,
+	agentSessionLive []string,
 ) (worker.ResolvedSessionConfig, error) {
 	if resolved == nil {
 		return worker.ResolvedSessionConfig{}, fmt.Errorf("resolved provider is required")
@@ -293,6 +299,15 @@ func resolvedWorkerSessionConfigWithConfig(
 			Hints: func() runtime.Config {
 				hints := workerSessionCreateHints(resolved)
 				hints.MCPServers = mcpServers
+				// Agent-level startup fields (session_live, etc.) live on
+				// config.Agent and are not carried by ResolvedProvider. Without
+				// threading them in, doStartSession's runSessionLive short-
+				// circuits on its empty-SessionLive guard and tmux theming /
+				// keybindings never apply to sessions created through this
+				// path.
+				if len(agentSessionLive) > 0 {
+					hints.SessionLive = append([]string(nil), agentSessionLive...)
+				}
 				return hints
 			}(),
 		},
@@ -485,20 +500,30 @@ func resolvedWorkerRuntimeWithConfigAndMetadata(cityPath string, cfg *config.Cit
 	if err != nil {
 		return nil, err
 	}
+	hints := runtime.Config{
+		WorkDir:                workDir,
+		ReadyPromptPrefix:      resolved.ReadyPromptPrefix,
+		ReadyDelayMs:           resolved.ReadyDelayMs,
+		ProcessNames:           resolved.ProcessNames,
+		EmitsPermissionWarning: resolved.EmitsPermissionWarning,
+		AcceptStartupDialogs:   resolved.AcceptStartupDialogs,
+		MCPServers:             mcpServers,
+	}
+	// Agent-level startup fields (session_live, etc.) live on config.Agent,
+	// not on ResolvedProvider. The reconciler's templateParamsToConfig path
+	// carries them via StartupHints; the worker-handle resume path must do
+	// the same. Without this, doStartSession's runSessionLive short-circuits
+	// on its `len(cfg.SessionLive) == 0` guard and tmux theming/keybindings
+	// never apply when a session is brought up via `gc session attach`.
+	if agentCfg := findAgentByTemplate(cfg, info.Template); agentCfg != nil {
+		hints.SessionLive = append([]string(nil), agentCfg.SessionLive...)
+	}
 	return &worker.ResolvedRuntime{
 		Command:    command,
 		WorkDir:    workDir,
 		Provider:   firstNonEmptyGCString(info.Provider, resolved.Name),
 		SessionEnv: resolved.Env,
-		Hints: runtime.Config{
-			WorkDir:                workDir,
-			ReadyPromptPrefix:      resolved.ReadyPromptPrefix,
-			ReadyDelayMs:           resolved.ReadyDelayMs,
-			ProcessNames:           resolved.ProcessNames,
-			EmitsPermissionWarning: resolved.EmitsPermissionWarning,
-			AcceptStartupDialogs:   resolved.AcceptStartupDialogs,
-			MCPServers:             mcpServers,
-		},
+		Hints:      hints,
 		Resume: session.ProviderResume{
 			ResumeFlag:    firstNonEmptyGCString(resolved.ResumeFlag, info.ResumeFlag),
 			ResumeStyle:   firstNonEmptyGCString(resolved.ResumeStyle, info.ResumeStyle),
