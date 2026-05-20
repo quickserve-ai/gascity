@@ -2058,6 +2058,9 @@
             "$ref": "#/components/schemas/SupervisorFSPressureSkippedTickPayload"
           },
           {
+            "$ref": "#/components/schemas/SupervisorShutdownPayload"
+          },
+          {
             "$ref": "#/components/schemas/UnboundEventPayload"
           },
           {
@@ -6838,6 +6841,40 @@
         ],
         "type": "object"
       },
+      "SupervisorShutdownPayload": {
+        "additionalProperties": false,
+        "properties": {
+          "client_addr": {
+            "description": "For source=socket_stop, the address reported by the connecting client. Typically empty for unix-socket peers.",
+            "type": "string"
+          },
+          "mode": {
+            "description": "Resulting shutdown mode.",
+            "enum": [
+              "destructive",
+              "preserve_sessions"
+            ],
+            "type": "string"
+          },
+          "signal": {
+            "description": "For source=signal, the human-readable signal name (e.g. \"terminated\", \"interrupt\"). Empty for socket_stop.",
+            "type": "string"
+          },
+          "source": {
+            "description": "Which path triggered the shutdown.",
+            "enum": [
+              "signal",
+              "socket_stop"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "mode"
+        ],
+        "type": "object"
+      },
       "SupervisorStartup": {
         "additionalProperties": false,
         "properties": {
@@ -6976,6 +7013,7 @@
             "session.updated": "#/components/schemas/TypedEventStreamEnvelopeSessionUpdated",
             "session.woke": "#/components/schemas/TypedEventStreamEnvelopeSessionWoke",
             "supervisor.fs_pressure.skipped_tick": "#/components/schemas/TypedEventStreamEnvelopeSupervisorFsPressureSkippedTick",
+            "supervisor.shutdown_requested": "#/components/schemas/TypedEventStreamEnvelopeSupervisorShutdownRequested",
             "worker.operation": "#/components/schemas/TypedEventStreamEnvelopeWorkerOperation"
           },
           "propertyName": "type"
@@ -7124,6 +7162,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeSupervisorFsPressureSkippedTick"
+          },
+          {
+            "$ref": "#/components/schemas/TypedEventStreamEnvelopeSupervisorShutdownRequested"
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeWorkerOperation"
@@ -7662,6 +7703,7 @@
                 "worker.operation",
                 "project.identity.stamped",
                 "supervisor.fs_pressure.skipped_tick",
+                "supervisor.shutdown_requested",
                 "extmsg.bound",
                 "extmsg.unbound",
                 "extmsg.group_created",
@@ -9242,6 +9284,48 @@
         "title": "TypedEventStreamEnvelope supervisor.fs_pressure.skipped_tick",
         "type": "object"
       },
+      "TypedEventStreamEnvelopeSupervisorShutdownRequested": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/SupervisorShutdownPayload"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "supervisor.shutdown_requested",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload"
+        ],
+        "title": "TypedEventStreamEnvelope supervisor.shutdown_requested",
+        "type": "object"
+      },
       "TypedEventStreamEnvelopeWorkerOperation": {
         "additionalProperties": false,
         "properties": {
@@ -9336,6 +9420,7 @@
             "session.updated": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionUpdated",
             "session.woke": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionWoke",
             "supervisor.fs_pressure.skipped_tick": "#/components/schemas/TypedTaggedEventStreamEnvelopeSupervisorFsPressureSkippedTick",
+            "supervisor.shutdown_requested": "#/components/schemas/TypedTaggedEventStreamEnvelopeSupervisorShutdownRequested",
             "worker.operation": "#/components/schemas/TypedTaggedEventStreamEnvelopeWorkerOperation"
           },
           "propertyName": "type"
@@ -9484,6 +9569,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSupervisorFsPressureSkippedTick"
+          },
+          {
+            "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSupervisorShutdownRequested"
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeWorkerOperation"
@@ -10069,6 +10157,7 @@
                 "worker.operation",
                 "project.identity.stamped",
                 "supervisor.fs_pressure.skipped_tick",
+                "supervisor.shutdown_requested",
                 "extmsg.bound",
                 "extmsg.unbound",
                 "extmsg.group_created",
@@ -11796,6 +11885,52 @@
           "city"
         ],
         "title": "TypedTaggedEventStreamEnvelope supervisor.fs_pressure.skipped_tick",
+        "type": "object"
+      },
+      "TypedTaggedEventStreamEnvelopeSupervisorShutdownRequested": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/SupervisorShutdownPayload"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "supervisor.shutdown_requested",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload",
+          "city"
+        ],
+        "title": "TypedTaggedEventStreamEnvelope supervisor.shutdown_requested",
         "type": "object"
       },
       "TypedTaggedEventStreamEnvelopeWorkerOperation": {
