@@ -65,7 +65,6 @@ function appendSystemPrompt(systemPrompt: string[], additions: string[]): string
   }
   return [...systemPrompt, extras.join("\n\n")];
 }
-
 export default function gascityOmpExtension(pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     run(["prime", "--hook"], ctx.cwd, providerSessionEnv(ctx));
