@@ -491,8 +491,54 @@ module.exports = {
 	}
 }
 
+func TestMaterializeBuiltinPacksOmpHookPublishesProviderSessionID(t *testing.T) {
+	dir := t.TempDir()
+
+	if err := MaterializeBuiltinPacks(dir); err != nil {
+		t.Fatalf("MaterializeBuiltinPacks() error: %v", err)
+	}
+
+	data := readMaterializedOmpHook(t, dir)
+	for _, want := range []string{
+		`import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent"`,
+		`export default function gascityOmpExtension(pi: ExtensionAPI)`,
+		`pi.on("session_start"`,
+		`pi.on("session_compact"`,
+		`GC_PROVIDER_SESSION_ID`,
+		`getSessionId`,
+	} {
+		if !strings.Contains(data, want) {
+			t.Errorf("materialized OMP hook missing provider-session marker %q:\n%s", want, data)
+		}
+	}
+	for _, legacy := range []string{
+		"export default {",
+		`"session.created"`,
+		`"session.compacted"`,
+		`"experimental.chat.system.transform"`,
+	} {
+		if strings.Contains(data, legacy) {
+			t.Errorf("materialized OMP hook still contains legacy API marker %q:\n%s", legacy, data)
+		}
+	}
+}
+
 func materializedPiHookPath(dir string) string {
 	return filepath.Join(dir, citylayout.SystemPacksRoot, "core", "overlay", "per-provider", "pi", ".pi", "extensions", "gc-hooks.js")
+}
+
+func materializedOmpHookPath(dir string) string {
+	return filepath.Join(dir, citylayout.SystemPacksRoot, "core", "overlay", "per-provider", "omp", ".omp", "hooks", "gc-hook.ts")
+}
+
+func readMaterializedOmpHook(t *testing.T, dir string) string {
+	t.Helper()
+	path := materializedOmpHookPath(dir)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", path, err)
+	}
+	return string(data)
 }
 
 func readMaterializedPiHook(t *testing.T, dir string) string {

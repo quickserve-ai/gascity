@@ -526,7 +526,10 @@ func persistPrimeHookSessionID(sessionID string) {
 
 func persistPrimeHookProviderSessionKey() {
 	gcSessionID := strings.TrimSpace(os.Getenv("GC_SESSION_ID"))
-	providerSessionID := strings.TrimSpace(os.Getenv("GEMINI_SESSION_ID"))
+	providerSessionID := strings.TrimSpace(os.Getenv("GC_PROVIDER_SESSION_ID"))
+	if providerSessionID == "" {
+		providerSessionID = strings.TrimSpace(os.Getenv("GEMINI_SESSION_ID"))
+	}
 	if gcSessionID == "" || providerSessionID == "" || gcSessionID == providerSessionID {
 		return
 	}
