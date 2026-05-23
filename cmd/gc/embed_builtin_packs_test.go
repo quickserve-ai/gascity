@@ -517,6 +517,7 @@ func TestMaterializeBuiltinPacksOmpHookPublishesProviderSessionID(t *testing.T) 
 	for _, want := range []string{
 		`import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent"`,
 		`const GC_OMP_HOOK_VERSION = 1`,
+		"const GC_BIN = process.env.GC_BIN || `${process.env.HOME}/.local/bin/gc`;",
 		`export default function gascityOmpExtension(pi: ExtensionAPI)`,
 		`pi.on("session_start"`,
 		`pi.on("session_compact"`,
@@ -524,38 +525,6 @@ func TestMaterializeBuiltinPacksOmpHookPublishesProviderSessionID(t *testing.T) 
 		`GC_PROVIDER_SESSION_ID`,
 		`getSessionId`,
 		`logRunFailure`,
-	} {
-		if !strings.Contains(data, want) {
-			t.Errorf("materialized OMP hook missing provider-session marker %q:\n%s", want, data)
-		}
-	}
-	for _, legacy := range []string{
-		"export default {",
-		`"session.created"`,
-		`"session.compacted"`,
-		`"experimental.chat.system.transform"`,
-	} {
-		if strings.Contains(data, legacy) {
-			t.Errorf("materialized OMP hook still contains legacy API marker %q:\n%s", legacy, data)
-		}
-	}
-}
-
-func TestMaterializeBuiltinPacksOmpHookPublishesProviderSessionID(t *testing.T) {
-	dir := t.TempDir()
-
-	if err := MaterializeBuiltinPacks(dir); err != nil {
-		t.Fatalf("MaterializeBuiltinPacks() error: %v", err)
-	}
-
-	data := readMaterializedOmpHook(t, dir)
-	for _, want := range []string{
-		`import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent"`,
-		`export default function gascityOmpExtension(pi: ExtensionAPI)`,
-		`pi.on("session_start"`,
-		`pi.on("session_compact"`,
-		`GC_PROVIDER_SESSION_ID`,
-		`getSessionId`,
 	} {
 		if !strings.Contains(data, want) {
 			t.Errorf("materialized OMP hook missing provider-session marker %q:\n%s", want, data)

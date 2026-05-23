@@ -12,12 +12,13 @@ import { execFileSync } from "node:child_process";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
 const GC_OMP_HOOK_VERSION = 1;
+const GC_BIN = process.env.GC_BIN || `${process.env.HOME}/.local/bin/gc`;
 const PATH_PREFIX =
-  `/opt/homebrew/bin:/usr/local/bin:${process.env.HOME}/go/bin:${process.env.HOME}/.local/bin:`;
+  `${process.env.HOME}/go/bin:${process.env.HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:`;
 
 function run(args: string[], cwd?: string, extraEnv: Record<string, string> = {}): string {
   try {
-    return execFileSync("gc", args, {
+    return execFileSync(GC_BIN, args, {
       cwd: cwd || process.cwd(),
       encoding: "utf-8",
       timeout: 30000,
