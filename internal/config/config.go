@@ -1181,6 +1181,16 @@ type BeadsConfig struct {
 	// Backend selects the bd storage engine when Provider is "bd".
 	// Empty defaults to "dolt"; T3Code uses "doltlite" for local dev stores.
 	Backend string `toml:"backend,omitempty"`
+	// EventHooks controls installation of the bead event-forwarding hooks
+	// (.beads/hooks/on_create,on_update,on_close) that shell out to
+	// `gc event emit` on every bead write. Defaults to true. Set to false
+	// once the controller's native cache-events already observe bead changes
+	// (the bd_hooks doctor gate): the hooks are then pure per-write churn —
+	// each bead change forks a full `gc` subprocess — and their mere presence
+	// keeps the in-process native store gated off. Disabling removes the
+	// event hooks (leaving any git hooks untouched) instead of reinstalling
+	// them on every lifecycle pass.
+	EventHooks *bool `toml:"event_hooks,omitempty" jsonschema:"default=true"`
 }
 
 // SessionConfig holds session provider settings.
