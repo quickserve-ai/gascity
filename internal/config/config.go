@@ -1289,6 +1289,12 @@ type SessionConfig struct {
 	// StartupTimeout is how long to wait for each agent's Start() call before
 	// treating it as failed. Duration string (e.g., "60s", "2m"). Defaults to "60s".
 	StartupTimeout string `toml:"startup_timeout,omitempty" jsonschema:"default=60s"`
+	// ProgressStallTimeout, when set, enables progress-aware session recycling:
+	// a desired, alive, claim-less session on a healthy provider whose last
+	// progress is older than this duration is restarted fresh. Such a session
+	// has likely parked (e.g. its turn ended on a provider auth error) and will
+	// not self-recover. Duration string (e.g. "30m"). Unset/zero disables it.
+	ProgressStallTimeout string `toml:"progress_stall_timeout,omitempty"`
 	// Socket specifies the tmux socket name for per-city isolation.
 	// When set, all tmux commands use "tmux -L <socket>" to connect to
 	// a dedicated server. When empty, defaults to the city name
@@ -1363,6 +1369,21 @@ func (s *SessionConfig) StartupTimeoutDuration() time.Duration {
 	d, err := time.ParseDuration(s.StartupTimeout)
 	if err != nil {
 		return 60 * time.Second
+	}
+	return d
+}
+
+// ProgressStallTimeoutDuration returns the progress-stall recycle timeout, or 0
+// when unset or unparseable. Zero disables progress-aware recycling (the
+// default): only a city that explicitly opts in by setting a duration above its
+// agents' longest legitimate quiet period gets the behavior.
+func (s *SessionConfig) ProgressStallTimeoutDuration() time.Duration {
+	if s.ProgressStallTimeout == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(s.ProgressStallTimeout)
+	if err != nil {
+		return 0
 	}
 	return d
 }

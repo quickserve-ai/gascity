@@ -1497,6 +1497,68 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			}
 		}
 
+		// Progress-aware recycle (ADR-0013 Amendment A1, move 3b): a desired,
+		// alive session that has stopped progressing has likely parked (e.g. its
+		// turn ended on a provider auth error) and will not self-recover. Opt-in
+		// via [session] progress_stall_timeout; disabled (zero) by default, so
+		// this is a no-op unless a city sets a threshold above its agents'
+		// longest legitimate quiet period. The cheap time check gates the
+		// store/health queries so they run only for the rare already-stalled
+		// session. Set the restart_requested marker and let the block below do
+		// the actual circuit-breaker-aware restart.
+		if threshold := cfg.Session.ProgressStallTimeoutDuration(); threshold > 0 && alive {
+			lastActivity, lastActivityErr := sp.GetLastActivity(name)
+			if lastActivityErr != nil {
+				fmt.Fprintf(stderr, "session reconciler: reading last activity before progress-stall recycle for %s: %v\n", name, lastActivityErr) //nolint:errcheck
+			}
+			if lastActivityErr == nil && !lastActivity.IsZero() && clk.Now().Sub(lastActivity) > threshold {
+				exempt := pendingInteractionKeepsAwake(*session, sp, name, clk)
+				if !exempt {
+					attached, attachErr := sessionAttachedForConfigDrift(*session, sp, cityPath, store, cfg, name)
+					if attachErr != nil {
+						// Fail safe: an unreadable attachment check must not recycle a
+						// session a human may be attached to. Mirrors the claim-check
+						// guard below — skip the destructive action on error rather
+						// than assume the session is unattended.
+						fmt.Fprintf(stderr, "session reconciler: checking attachment before progress-stall recycle for %s: %v\n", name, attachErr) //nolint:errcheck
+						exempt = true
+					} else if attached {
+						exempt = true
+					}
+				}
+				holdsClaim := false
+				if !exempt {
+					has, err := sessionHasOpenAssignedWorkForConfig(store, rigStores, *session, cfg)
+					if err != nil {
+						// Fail safe: an unreadable claim check must not recycle a
+						// session that may hold in-progress work. Mirrors the drain
+						// guards elsewhere (they skip the destructive action on a
+						// claim-check error rather than assume the session is idle).
+						fmt.Fprintf(stderr, "session reconciler: checking assigned work before progress-stall recycle for %s: %v\n", name, err) //nolint:errcheck
+						holdsClaim = true
+					} else {
+						holdsClaim = has
+					}
+				}
+				providerHealthy := true
+				if !exempt && !holdsClaim && tp.ResolvedProvider != nil {
+					// Reuse the per-tick provider-health snapshot (#2962). Gate 1
+					// (provider RED) takes precedence: never recycle a session whose
+					// provider is red. Fail-open — absent/stale registry → healthy.
+					if h, present := phSnap.check(tp.ResolvedProvider.Name); present {
+						providerHealthy = h
+					}
+				}
+				if sessionProgressStalled(threshold, holdsClaim, providerHealthy, exempt, lastActivity, clk.Now()) {
+					if session.Metadata == nil {
+						session.Metadata = map[string]string{}
+					}
+					session.Metadata["restart_requested"] = "true"
+					fmt.Fprintf(stderr, "session reconciler: %s progress-stalled (no progress for >%s, no open claim, provider healthy); requesting fresh restart\n", name, threshold) //nolint:errcheck
+				}
+			}
+		}
+
 		// Restart-requested: agent asked for a fresh session
 		// (gc runtime request-restart / gc handoff). This runs after
 		// drain-ack handling, but before autonomous rate-limit,

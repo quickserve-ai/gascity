@@ -2575,6 +2575,10 @@
           "description": "StartupTimeout is how long to wait for each agent's Start() call before\ntreating it as failed. Duration string (e.g., \"60s\", \"2m\"). Defaults to \"60s\".",
           "default": "60s"
         },
+        "progress_stall_timeout": {
+          "type": "string",
+          "description": "ProgressStallTimeout, when set, enables progress-aware session recycling:\na desired, alive, claim-less session on a healthy provider whose last\nprogress is older than this duration is restarted fresh. Such a session\nhas likely parked (e.g. its turn ended on a provider auth error) and will\nnot self-recover. Duration string (e.g. \"30m\"). Unset/zero disables it."
+        },
         "socket": {
           "type": "string",
           "description": "Socket specifies the tmux socket name for per-city isolation.\nWhen set, all tmux commands use \"tmux -L \u003csocket\u003e\" to connect to\na dedicated server. When empty, defaults to the city name\n(workspace.name) — giving every city its own tmux server\nautomatically. Set explicitly to override."
