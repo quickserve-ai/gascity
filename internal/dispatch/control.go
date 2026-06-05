@@ -61,7 +61,10 @@ func processRetryControl(store beads.Store, bead beads.Bead, opts ProcessOptions
 	}
 
 	attemptNum, _ := strconv.Atoi(attempt.Metadata["gc.attempt"])
-	result := classifyRetryAttempt(attempt)
+	result, err := classifyRetryAttemptWithPostconditions(store, attempt, opts)
+	if err != nil {
+		return ControlResult{}, fmt.Errorf("%s: evaluating retry postconditions for %s: %w", bead.ID, attempt.ID, err)
+	}
 	attemptLog, err := appendAttemptLogValue(bead.Metadata["gc.attempt_log"], attemptNum, result.Outcome, result.Reason)
 	if err != nil {
 		return ControlResult{}, fmt.Errorf("%s: recording attempt log: %w", bead.ID, err)
@@ -329,6 +332,15 @@ func isPartialAttemptAttachError(err error) bool {
 	return errors.As(err, &partial)
 }
 
+var errTransientControllerBoundary = errors.New("transient controller boundary error")
+
+func markTransientControllerBoundaryError(err error) error {
+	if err == nil || errors.Is(err, errTransientControllerBoundary) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", errTransientControllerBoundary, err)
+}
+
 // IsTransientControllerError is the dispatch/store transient classifier for
 // control spawn and spawn-state update boundaries. Prefer typed checks when
 // callers expose them; the string fallback covers wrapped Dolt/MySQL/tmux
@@ -338,6 +350,9 @@ func IsTransientControllerError(err error) bool {
 		return false
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	if errors.Is(err, errTransientControllerBoundary) {
 		return true
 	}
 	msg := strings.ToLower(err.Error())
@@ -353,6 +368,9 @@ func IsTransientControllerError(err error) bool {
 		"too many connections",
 		"lock wait timeout",
 		"deadlock found",
+		"database is locked",
+		"database table is locked",
+		"sqlite_busy",
 	}
 	for _, needle := range transientNeedles {
 		if strings.Contains(msg, needle) {
@@ -563,12 +581,15 @@ func buildAttemptRecipe(step *formula.Step, control beads.Bead, attemptNum int) 
 	if step.Ralph != nil && len(step.Children) > 0 {
 		rootKind = "scope"
 	}
-	rootMeta := map[string]string{
-		"gc.kind":     rootKind,
-		"gc.attempt":  strconv.Itoa(attemptNum),
-		"gc.step_id":  stepID,
-		"gc.step_ref": attemptPrefix,
+	rootMeta := make(map[string]string, len(step.Metadata))
+	// Preserve formula-specified retry metadata such as required artifacts.
+	for k, v := range step.Metadata {
+		rootMeta[k] = v
 	}
+	rootMeta["gc.kind"] = rootKind
+	rootMeta["gc.attempt"] = strconv.Itoa(attemptNum)
+	rootMeta["gc.step_id"] = stepID
+	rootMeta["gc.step_ref"] = attemptPrefix
 	if step.OnComplete != nil {
 		rootMeta["gc.output_json_required"] = "true"
 	}

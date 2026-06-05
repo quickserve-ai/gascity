@@ -227,6 +227,54 @@ schema = 2
 	}
 }
 
+func TestLoadCityConfigFSToleratesMissingNamedSessionTemplate(t *testing.T) {
+	fs := fsys.NewFake()
+	fs.Dirs["/city/pk"] = true
+	fs.Files["/city/pk/pack.toml"] = []byte(`[pack]
+name = "pk"
+schema = 1
+
+[[agent]]
+name = "mayor"
+scope = "city"
+`)
+	fs.Files["/city/city.toml"] = []byte(`[workspace]
+name = "test-city"
+
+[imports.pk]
+source = "pk"
+
+[[named_session]]
+template = "pk.mayor"
+
+[[named_session]]
+name = "rizato"
+template = "pk.ghost"
+`)
+	fs.Files["/city/pack.toml"] = []byte(`[pack]
+name = "test-city"
+schema = 2
+`)
+
+	var stderr bytes.Buffer
+	cfg, err := loadCityConfigFS(fs, "/city/city.toml", &stderr)
+	if err != nil {
+		t.Fatalf("loadCityConfigFS: %v; a single broken named session must not brick config load", err)
+	}
+	if cfg == nil {
+		t.Fatal("loadCityConfigFS returned nil config")
+	}
+	// The valid sibling still resolves.
+	if config.FindNamedSession(cfg, "pk.mayor") == nil {
+		t.Fatal("FindNamedSession(pk.mayor) = nil, want the valid session to survive")
+	}
+	// The broken one is reported as a non-fatal warning on stderr.
+	if !strings.Contains(stderr.String(), `"rizato"`) ||
+		!strings.Contains(stderr.String(), "named session disabled until its template resolves") {
+		t.Fatalf("expected disabled-named-session warning on stderr, got %q", stderr.String())
+	}
+}
+
 func TestLoadCityConfigFSEmitsMigrationWarningsAcrossCalls(t *testing.T) {
 	fs := fsys.NewFake()
 	fs.Files["/city/city.toml"] = []byte(`[workspace]
@@ -322,7 +370,7 @@ func TestEmitLoadCityConfigWarningsFiltersNonMigrationWarnings(t *testing.T) {
 			`workspace.name redefined by "/city/defaults.toml"`,
 			`/city/pack.toml: [agents] is a deprecated compatibility alias for [agent_defaults]; rewrite the table name to [agent_defaults]`,
 			`/city/pack.toml: both [agent_defaults] and [agents] are present; [agent_defaults] wins on overlapping keys and [agents] only fills gaps`,
-			`/city/city.toml: workspace.provider is deprecated: Set provider per agent in agents/<name>/agent.toml.`,
+			`/city/city.toml: workspace.global_fragments is deprecated: Use [agent_defaults] append_fragments or explicit template includes instead.`,
 			`gc: warning: attachment-list fields (` + "`skills`, `mcp`, `skills_append`, `mcp_append`, `shared_skills`" + `) are deprecated as of v0.15.1 and ignored.`,
 		},
 	})
@@ -337,7 +385,7 @@ func TestEmitLoadCityConfigWarningsFiltersNonMigrationWarnings(t *testing.T) {
 	if !strings.Contains(output, `both [agent_defaults] and [agents] are present`) {
 		t.Fatalf("expected mixed-table warning, got %q", output)
 	}
-	if strings.Contains(output, `workspace.provider is deprecated`) {
+	if strings.Contains(output, `workspace.global_fragments is deprecated`) {
 		t.Fatalf("legacy workspace warnings should stay out of generic command stderr, got %q", output)
 	}
 	if !strings.Contains(output, "attachment-list fields") {
@@ -526,7 +574,6 @@ func TestStrictFatalLoadConfigWarningsKeepsMixedTableWarningsFatal(t *testing.T)
 	warnings := []string{
 		`/city/pack.toml: [agents] is a deprecated compatibility alias for [agent_defaults]; rewrite the table name to [agent_defaults]`,
 		`/city/pack.toml: both [agent_defaults] and [agents] are present; [agent_defaults] wins on overlapping keys and [agents] only fills gaps`,
-		`/city/city.toml: workspace.provider is deprecated: Set provider per agent in agents/<name>/agent.toml.`,
 		`workspace.name redefined by "/city/defaults.toml"`,
 	}
 
@@ -575,7 +622,12 @@ func TestNonTestLoadCityConfigCallersPassWarningWriter(t *testing.T) {
 func v2CityWithPack(t *testing.T) *fsys.Fake {
 	t.Helper()
 	fs := fsys.NewFake()
-	fs.Files["/city/city.toml"] = []byte("")
+	fs.Files["/city/city.toml"] = []byte(`[providers.claude]
+base = "builtin:claude"
+
+[providers.codex]
+base = "builtin:codex"
+`)
 	fs.Files["/city/pack.toml"] = []byte(`[pack]
 name = "test-city"
 schema = 2
@@ -852,6 +904,9 @@ func TestDoAgentAddAllowsCityLocalNameSharedWithImportedAgent(t *testing.T) {
 	fs := v2CityWithPack(t)
 	fs.Files["/city/city.toml"] = []byte(`[imports.helper]
 source = "../helper"
+
+[providers.claude]
+base = "builtin:claude"
 `)
 	fs.Files["/helper/pack.toml"] = []byte(`[pack]
 name = "helper"
@@ -1051,6 +1106,9 @@ name = "test-city"
 	fs.Files["/city/pack.toml"] = []byte(`[pack]
 name = "test-city"
 schema = 2
+
+[providers.claude]
+base = "builtin:claude"
 
 [[agent]]
 name = "worker"

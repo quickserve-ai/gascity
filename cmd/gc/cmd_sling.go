@@ -647,6 +647,9 @@ func printSlingWarnings(result sling.SlingResult, stderr io.Writer) {
 	for _, w := range result.BeadWarnings {
 		fmt.Fprintln(stderr, w) //nolint:errcheck
 	}
+	for _, d := range result.Deprecations {
+		fmt.Fprintf(stderr, "warning: %s\n", d) //nolint:errcheck
+	}
 	for _, id := range result.AutoBurned {
 		fmt.Fprintf(stderr, "Auto-burned stale molecule %s\n", id) //nolint:errcheck
 	}
@@ -706,6 +709,9 @@ func printBatchSlingResult(result sling.SlingResult, stdout, stderr io.Writer) {
 	// Warnings.
 	for _, w := range result.BeadWarnings {
 		fmt.Fprintln(stderr, w) //nolint:errcheck
+	}
+	for _, d := range result.Deprecations {
+		fmt.Fprintf(stderr, "warning: %s\n", d) //nolint:errcheck
 	}
 	for _, id := range result.AutoBurned {
 		fmt.Fprintf(stderr, "Auto-burned stale molecule %s\n", id) //nolint:errcheck
@@ -1000,6 +1006,7 @@ func slingJSONWarnings(result sling.SlingResult) []string {
 		warnings = append(warnings, "pool_empty")
 	}
 	warnings = append(warnings, result.BeadWarnings...)
+	warnings = append(warnings, result.Deprecations...)
 	warnings = append(warnings, result.MetadataErrors...)
 	return warnings
 }
@@ -1669,7 +1676,7 @@ func dryRunSingle(opts slingOpts, deps slingDeps, querier BeadQuerier, stdout, s
 		w("  wisp (ephemeral molecule) — a tree of step beads that guide the")
 		w("  agent through the workflow.")
 		w("")
-		cookCmd := fmt.Sprintf("bd mol cook --formula=%s", opts.BeadOrFormula)
+		cookCmd := fmt.Sprintf("gc formula cook %s", opts.BeadOrFormula)
 		if opts.Title != "" {
 			cookCmd += fmt.Sprintf(" --title=%s", opts.Title)
 		}
@@ -1726,7 +1733,7 @@ func dryRunSingle(opts slingOpts, deps slingDeps, querier BeadQuerier, stdout, s
 			w("  bead. The agent receives the original bead with the workflow")
 			w("  attached, rather than a standalone wisp.")
 			w("")
-			cookCmd := fmt.Sprintf("bd mol cook --formula=%s --on=%s", opts.OnFormula, previewBeadID)
+			cookCmd := fmt.Sprintf("gc formula cook %s --attach %s", opts.OnFormula, previewBeadID)
 			if opts.Title != "" {
 				cookCmd += fmt.Sprintf(" --title=%s", opts.Title)
 			}
@@ -1746,7 +1753,7 @@ func dryRunSingle(opts slingOpts, deps slingDeps, querier BeadQuerier, stdout, s
 			w("  Target " + a.QualifiedName() + " has a default_sling_formula configured.")
 			w("  A wisp will be attached automatically (use --no-formula to suppress).")
 			w("")
-			cookCmd := fmt.Sprintf("bd mol cook --formula=%s --on=%s", a.EffectiveDefaultSlingFormula(), previewBeadID)
+			cookCmd := fmt.Sprintf("gc formula cook %s --attach %s", a.EffectiveDefaultSlingFormula(), previewBeadID)
 			if opts.Title != "" {
 				cookCmd += fmt.Sprintf(" --title=%s", opts.Title)
 			}
@@ -1835,7 +1842,7 @@ func dryRunBatch(opts slingOpts, deps slingDeps, stdout, _ io.Writer,
 		w("Attach formula (per open child):")
 		w("  Would run:")
 		for _, c := range open {
-			w("    bd mol cook --formula=" + opts.OnFormula + " --on=" + c.ID)
+			w("    gc formula cook " + opts.OnFormula + " --attach " + c.ID)
 		}
 		w("")
 	} else if !opts.NoFormula && a.EffectiveDefaultSlingFormula() != "" {
@@ -1843,7 +1850,7 @@ func dryRunBatch(opts slingOpts, deps slingDeps, stdout, _ io.Writer,
 		w("  Formula: " + a.EffectiveDefaultSlingFormula())
 		w("  Would run:")
 		for _, c := range open {
-			w("    bd mol cook --formula=" + a.EffectiveDefaultSlingFormula() + " --on=" + c.ID)
+			w("    gc formula cook " + a.EffectiveDefaultSlingFormula() + " --attach " + c.ID)
 		}
 		w("")
 	}

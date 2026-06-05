@@ -20,6 +20,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	convoycore "github.com/gastownhall/gascity/internal/convoy"
+	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/pgauth"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/shellquote"
@@ -1063,7 +1064,8 @@ func TestDoSlingNudgePoolMemberUsesBeadDerivedSessionName(t *testing.T) {
 	sp.Calls = nil
 
 	cfg := &config.City{
-		Workspace: config.Workspace{Name: "test-city"},
+		Workspace: config.Workspace{Name: "test-city", Provider: "claude"},
+		Providers: builtinProviderAliasesForTest("claude"),
 		Agents: []config.Agent{{
 			Name: "polecat",
 			Dir:  "hw",
@@ -1654,16 +1656,52 @@ max_active_sessions = 1
 		t.Fatalf("session bead count = %d, want 0 after sling; sessions=%#v", len(sessions), sessions)
 	}
 
-	counts, _, errs := defaultScaleCheckCounts([]defaultScaleCheckTarget{{
-		template: "worker",
-		storeKey: "city",
-		store:    store,
-	}})
-	if len(errs) != 0 {
-		t.Fatalf("defaultScaleCheckCounts errs = %v", errs)
+	// mol-do-work is a graph.v2 formula (#2941): the default-formula sling
+	// creates a one-item input convoy plus a workflow root instead of
+	// routing the bare work bead.
+	all, err := store.List(beads.ListQuery{AllowScan: true, TierMode: beads.TierBoth})
+	if err != nil {
+		t.Fatalf("store.List: %v", err)
 	}
-	if got := counts["worker"]; got != 1 {
-		t.Fatalf("defaultScaleCheckCounts[worker] = %d, want 1 routed work bead demand", got)
+	var root *beads.Bead
+	for i := range all {
+		if all[i].Metadata["gc.kind"] == "workflow" {
+			root = &all[i]
+			break
+		}
+	}
+	if root == nil {
+		t.Fatalf("no graph.v2 workflow root created; beads=%#v", all)
+	}
+	inputConvoyID := root.Metadata["gc.input_convoy_id"]
+	if inputConvoyID == "" {
+		t.Fatalf("workflow root %s missing gc.input_convoy_id: %v", root.ID, root.Metadata)
+	}
+	members, err := convoycore.Members(store, inputConvoyID, true)
+	if err != nil {
+		t.Fatalf("convoycore.Members(%s): %v", inputConvoyID, err)
+	}
+	if len(members) != 1 || members[0].Title != "ship feature" {
+		t.Fatalf("input convoy members = %#v, want the slung work bead", members)
+	}
+
+	// Demand surfaces through the assigned-work path: the routed graph step
+	// bead makes the reconciler desire a worker session even though sling
+	// itself materialized nothing.
+	cfg, _, err := config.LoadWithIncludes(fsys.OSFS{}, filepath.Join(cityDir, "city.toml"))
+	if err != nil {
+		t.Fatalf("LoadWithIncludes: %v", err)
+	}
+	var dsErr bytes.Buffer
+	ds := buildDesiredState("demo", cityDir, time.Now().UTC(), cfg, runtime.NewFake(), store, &dsErr)
+	desiredWorkers := 0
+	for name := range ds.State {
+		if strings.HasPrefix(name, "worker-") {
+			desiredWorkers++
+		}
+	}
+	if desiredWorkers != 1 {
+		t.Fatalf("desired worker sessions = %d, want 1 from routed graph step demand; state=%v stderr=%s", desiredWorkers, ds.State, dsErr.String())
 	}
 }
 
@@ -1785,6 +1823,8 @@ func installCaptureBdRunner(t *testing.T) *[]bdInvocation {
 			case len(args) >= 2 && args[0] == "show" && args[1] == "--json":
 				return nil, fmt.Errorf("issue not found")
 			case len(args) >= 2 && args[0] == "list" && args[1] == "--json":
+				return []byte(`[]`), nil
+			case len(args) >= 2 && args[0] == "query" && args[1] == "--json":
 				return []byte(`[]`), nil
 			default:
 				t.Errorf("unexpected bd subcommand args=%v — fake must be extended if sling now invokes this", args)
@@ -3541,7 +3581,6 @@ func TestCheckBeadStateForceSkipsCheck(t *testing.T) {
 
 func TestCheckBeadStateFormulaChecksResolvedBead(t *testing.T) {
 	runner := newFakeRunner()
-	runner.on("bd mol cook", "WP-99\n", nil)
 	sp := runtime.NewFake()
 	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
 	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
@@ -3727,7 +3766,6 @@ func TestDoSlingBatchRegularBeadPassthrough(t *testing.T) {
 
 func TestDoSlingBatchFormulaPassthrough(t *testing.T) {
 	runner := newFakeRunner()
-	runner.on("bd mol cook", "WP-1\n", nil)
 	sp := runtime.NewFake()
 	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
 	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
@@ -5272,7 +5310,6 @@ func TestOnFormulaCleanBead(t *testing.T) {
 
 func TestOnFormulaNilQuerier(t *testing.T) {
 	runner := newFakeRunner()
-	runner.on("bd mol cook", "WP-1\n", nil)
 	sp := runtime.NewFake()
 	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
 	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
@@ -5762,7 +5799,6 @@ func TestBatchOnPartialCookFailure(t *testing.T) {
 
 func TestBatchOnNudgeOnce(t *testing.T) {
 	runner := newFakeRunner()
-	runner.on("bd mol cook", "WP-1\n", nil)
 	sp := runtime.NewFake()
 	_ = sp.Start(context.Background(), "mayor", runtime.Config{})
 	sp.Calls = nil
@@ -5943,7 +5979,7 @@ func TestDryRunFormula(t *testing.T) {
 	if !strings.Contains(out, "Name: code-review") {
 		t.Errorf("stdout missing formula name: %s", out)
 	}
-	if !strings.Contains(out, "Would run: bd mol cook --formula=code-review") {
+	if !strings.Contains(out, "Would run: gc formula cook code-review") {
 		t.Errorf("stdout missing cook command: %s", out)
 	}
 	if !strings.Contains(out, "'<wisp-root>'") {
@@ -5977,7 +6013,7 @@ func TestDryRunOnFormula(t *testing.T) {
 	if !strings.Contains(out, "Attach formula:") {
 		t.Errorf("stdout missing attach section: %s", out)
 	}
-	if !strings.Contains(out, "Would run: bd mol cook --formula=code-review --on=BL-42") {
+	if !strings.Contains(out, "Would run: gc formula cook code-review --attach BL-42") {
 		t.Errorf("stdout missing cook command: %s", out)
 	}
 	if !strings.Contains(out, "Pre-check: BL-42 has no existing molecule/wisp children") {
@@ -6187,7 +6223,7 @@ func TestDryRunLeafTaskViaBatchDispatchOnFormula(t *testing.T) {
 	if !strings.Contains(out, "Attach formula:") {
 		t.Errorf("stdout missing single-bead attach section: %s", out)
 	}
-	if !strings.Contains(out, "Would run: bd mol cook --formula=code-review --on=BL-42") {
+	if !strings.Contains(out, "Would run: gc formula cook code-review --attach BL-42") {
 		t.Errorf("stdout missing cook command: %s", out)
 	}
 	if !strings.Contains(out, "bd update 'BL-42' --set-metadata gc.routed_to=hw/polecat") {
@@ -6226,13 +6262,13 @@ func TestDryRunBatchOnFormula(t *testing.T) {
 	}
 	out := stdout.String()
 	// Per-child cook commands.
-	if !strings.Contains(out, "bd mol cook --formula=code-review --on=BL-1") {
+	if !strings.Contains(out, "gc formula cook code-review --attach BL-1") {
 		t.Errorf("stdout missing BL-1 cook command: %s", out)
 	}
-	if !strings.Contains(out, "bd mol cook --formula=code-review --on=BL-3") {
+	if !strings.Contains(out, "gc formula cook code-review --attach BL-3") {
 		t.Errorf("stdout missing BL-3 cook command: %s", out)
 	}
-	if strings.Contains(out, "bd mol cook --formula=code-review --on=BL-2") {
+	if strings.Contains(out, "gc formula cook code-review --attach BL-2") {
 		t.Errorf("stdout should not cook for closed BL-2: %s", out)
 	}
 	// Route commands.
@@ -6768,7 +6804,6 @@ func TestDoSlingIdempotentForceOverrides(t *testing.T) {
 
 func TestDoSlingIdempotentWithOnFormula(t *testing.T) {
 	runner := newFakeRunner()
-	runner.on("bd mol cook", "WP-1\n", nil)
 	sp := runtime.NewFake()
 	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
 	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
@@ -7188,7 +7223,6 @@ func TestDryRunBatchCrossRigSection(t *testing.T) {
 
 func TestDoSlingCrossRigFormulaExempt(t *testing.T) {
 	runner := newFakeRunner()
-	runner.on("bd mol cook", "WP-1\n", nil)
 	sp := runtime.NewFake()
 	cfg := &config.City{
 		Workspace: config.Workspace{Name: "test-city"},
@@ -7270,7 +7304,6 @@ func TestDoSlingOnFormulaCrossRigBlocked(t *testing.T) {
 
 func TestDoSlingOnFormulaCrossRigForceOverrides(t *testing.T) {
 	runner := newFakeRunner()
-	runner.on("bd mol cook", "WP-1\n", nil)
 	sp := runtime.NewFake()
 	cfg := &config.City{
 		Workspace: config.Workspace{Name: "test-city"},

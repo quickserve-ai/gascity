@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# reaper — close stale wisps with closed parents, purge old closed data, auto-close stale issues.
+# reaper — close stale wisps with closed parents, purge old closed data, auto-close stale and TTL-expired issues.
 #
 # Replaces mol-dog-reaper formula. All operations are deterministic:
 # SQL queries with age thresholds, bd close/update commands, count
@@ -83,7 +83,7 @@ PY
 
 is_user_database() {
     case "$1" in
-        information_schema|mysql|dolt_cluster|performance_schema|sys|__gc_probe|benchdb|testdb_*|beads_pt*|beads_vr*|doctest_*|doctortest_*)
+        information_schema|mysql|dolt_cluster|performance_schema|sys|__gc_probe|benchdb|testdb_*|beads_pt*|beads_vr*|beads_test_bench_*|doctest_*|doctortest_*)
             return 1
             ;;
         beads_t*)
@@ -102,8 +102,8 @@ is_user_database() {
 # Discover databases from Dolt server. Exclude Dolt/MySQL system schemas,
 # Gas City's internal health-probe database, and test-fixture scratch
 # databases (benchdb, testdb_*, lowercase beads_t[0-9a-f]{8,}, beads_pt*,
-# beads_vr*, doctest_*, doctortest_* — matching the Go cleanup planner
-# contract); the remainder are bead stores.
+# beads_vr*, beads_test_bench_*, doctest_*, doctortest_* — matching the Go
+# cleanup planner contract); the remainder are bead stores.
 DATABASES=$(
     while IFS= read -r db; do
         if is_user_database "$db"; then
@@ -120,10 +120,14 @@ fi
 
 TOTAL_STALE_WISPS=0
 TOTAL_CLOSED_WISPS=0
+TOTAL_WOULD_CLOSE_WISPS=0
+TOTAL_WOULD_EXPIRE=0
 TOTAL_PURGED=0
 TOTAL_MAIL_WISPS=0
 TOTAL_ISSUES_CLOSED=0
 TOTAL_STALE_ISSUES_SKIPPED=0
+TOTAL_EXPIRED_ISSUES_CLOSED=0
+TOTAL_EXPIRED_ISSUES_SKIPPED=0
 TOTAL_SESSIONS_PRUNED=0
 SESSION_PRUNE_ATTEMPTED=0
 ANOMALIES=""
@@ -255,13 +259,14 @@ get_sql_rows() {
     SQL_ROWS_RESULT=$(printf '%s\n' "$output" | tail -n +2 | tr -d '\r')
 }
 
-has_split_dependency_target_columns() {
+has_dependency_target_column() {
     local db="$1"
+    local table="$2"
     local output
     local fields
 
-    if ! output=$(dolt_sql -r csv -q "SHOW COLUMNS FROM \`$db\`.dependencies" 2>/dev/null); then
-        return 0
+    if ! output=$(dolt_sql -r csv -q "SHOW COLUMNS FROM \`$db\`.$table" 2>/dev/null); then
+        return 1
     fi
 
     fields=$(printf '%s\n' "$output" | tail -n +2 | cut -d, -f1 | tr -d '\r')
@@ -269,8 +274,8 @@ has_split_dependency_target_columns() {
         return 0
     fi
 
-    printf '%s\n' "$fields" | grep -qx 'depends_on_issue_id' || return 1
-    printf '%s\n' "$fields" | grep -qx 'depends_on_wisp_id' || return 1
+    printf '%s\n' "$fields" | grep -qx 'issue_id' || return 1
+    printf '%s\n' "$fields" | grep -qx 'depends_on_id' || return 1
 }
 
 SQL_CHANGE_ROWS_RESULT=0
@@ -303,7 +308,13 @@ run_sql_change() {
         record_anomaly "$db" "$label failed for $db: could not create stderr capture file"
         return 1
     fi
+    # DML (DELETE/UPDATE) against a database-qualified table still needs an
+    # active database selected, or Dolt can reject it with "no database
+    # selected" (Error 1105) even though the target is fully qualified —
+    # reads (get_sql_count/get_sql_rows) do not. USE the target db first,
+    # mirroring the DOLT_COMMIT block below.
     if ! output=$(dolt_sql -r csv -q "
+USE \`$db\`;
 $query;
 SELECT ROW_COUNT();
     " 2>"$stderr_file"); then
@@ -337,10 +348,10 @@ while IFS= read -r DB; do
         # server into noise. See gastownhall/gascity#1816.
         continue
     fi
-    if ! has_split_dependency_target_columns "$DB"; then
-        # Legacy dependency schema (pre-#2399). Skip silently like the
-        # has_wisps_table gate above; the only fix is the schema migration,
-        # which the reaper cannot perform. See gastownhall/gascity#2456.
+    if ! has_dependency_target_column "$DB" "dependencies" || ! has_dependency_target_column "$DB" "wisp_dependencies"; then
+        # Older or incompatible dependency schema. Skip silently like the
+        # has_wisps_table gate above; the only fix is a bead-store schema
+        # migration, which the reaper cannot perform.
         continue
     fi
 
@@ -366,11 +377,11 @@ while IFS= read -r DB; do
     while [ "$STALE_WISP_COUNT" -gt 0 ] && [ "$CLOSE_WISP_COUNT" -lt "$STALE_WISP_COUNT" ]; do
         get_sql_count "$DB" "schema-safe stale wisp" "
             SELECT COUNT(DISTINCT w.id) FROM \`$DB\`.wisps w
-            INNER JOIN \`$DB\`.dependencies d
+            INNER JOIN \`$DB\`.wisp_dependencies d
                 ON d.issue_id = w.id
                 AND d.type = 'parent-child'
-            LEFT JOIN \`$DB\`.wisps parent_wisp ON d.depends_on_wisp_id = parent_wisp.id
-            LEFT JOIN \`$DB\`.issues parent_issue ON d.depends_on_issue_id = parent_issue.id
+            LEFT JOIN \`$DB\`.wisps parent_wisp ON d.depends_on_id = parent_wisp.id
+            LEFT JOIN \`$DB\`.issues parent_issue ON d.depends_on_id = parent_issue.id
             WHERE w.status IN ('open', 'hooked', 'in_progress')
             AND w.created_at < DATE_SUB(NOW(), INTERVAL $MAX_AGE_H HOUR)
             AND (
@@ -379,7 +390,11 @@ while IFS= read -r DB; do
             )
         "
         CLOSE_WISP_BATCH=$SQL_COUNT_RESULT
-        if [ "$CLOSE_WISP_BATCH" -eq 0 ] || [ -n "$DRY_RUN" ]; then
+        if [ "$CLOSE_WISP_BATCH" -eq 0 ]; then
+            break
+        fi
+        if [ -n "$DRY_RUN" ]; then
+            TOTAL_WOULD_CLOSE_WISPS=$((TOTAL_WOULD_CLOSE_WISPS + CLOSE_WISP_BATCH))
             break
         fi
 
@@ -390,11 +405,11 @@ while IFS= read -r DB; do
             AND id IN (
                 SELECT id FROM (
                     SELECT w.id FROM \`$DB\`.wisps w
-                    INNER JOIN \`$DB\`.dependencies d
+                    INNER JOIN \`$DB\`.wisp_dependencies d
                         ON d.issue_id = w.id
                         AND d.type = 'parent-child'
-                    LEFT JOIN \`$DB\`.wisps parent_wisp ON d.depends_on_wisp_id = parent_wisp.id
-                    LEFT JOIN \`$DB\`.issues parent_issue ON d.depends_on_issue_id = parent_issue.id
+                    LEFT JOIN \`$DB\`.wisps parent_wisp ON d.depends_on_id = parent_wisp.id
+                    LEFT JOIN \`$DB\`.issues parent_issue ON d.depends_on_id = parent_issue.id
                     WHERE w.status IN ('open', 'hooked', 'in_progress')
                     AND w.created_at < DATE_SUB(NOW(), INTERVAL $MAX_AGE_H HOUR)
                     AND (
@@ -423,10 +438,9 @@ while IFS= read -r DB; do
         WHERE status = 'closed'
         AND closed_at < DATE_SUB(NOW(), INTERVAL $PURGE_AGE_H HOUR)
         AND id NOT IN (
-            SELECT DISTINCT d.depends_on_wisp_id FROM \`$DB\`.dependencies d
+            SELECT DISTINCT d.depends_on_id FROM \`$DB\`.wisp_dependencies d
             INNER JOIN \`$DB\`.wisps child_wisp ON d.issue_id = child_wisp.id
             WHERE d.type = 'parent-child'
-            AND d.depends_on_wisp_id IS NOT NULL
             AND child_wisp.status IN ('open', 'hooked', 'in_progress')
         )
     "
@@ -438,10 +452,9 @@ while IFS= read -r DB; do
             WHERE status = 'closed'
             AND closed_at < DATE_SUB(NOW(), INTERVAL $PURGE_AGE_H HOUR)
             AND id NOT IN (
-                SELECT DISTINCT d.depends_on_wisp_id FROM \`$DB\`.dependencies d
+                SELECT DISTINCT d.depends_on_id FROM \`$DB\`.wisp_dependencies d
                 INNER JOIN \`$DB\`.wisps child_wisp ON d.issue_id = child_wisp.id
                 WHERE d.type = 'parent-child'
-                AND d.depends_on_wisp_id IS NOT NULL
                 AND child_wisp.status IN ('open', 'hooked', 'in_progress')
             )
         "; then
@@ -449,6 +462,80 @@ while IFS= read -r DB; do
             DB_PURGED=$((DB_PURGED + PURGED_ROWS))
             TOTAL_PURGED=$((TOTAL_PURGED + PURGED_ROWS))
             DB_MUTATIONS=$((DB_MUTATIONS + PURGED_ROWS))
+        fi
+    fi
+
+    # Step 3: Close nudge beads whose metadata.expires_at is in the past.
+    # Only beads labelled gc:nudge are candidates — other bead types that stamp
+    # expires_at (e.g. gc:extmsg-binding session bindings) must not be closed
+    # here.  The COALESCE handles whole-second RFC3339+Z, microsecond-width
+    # RFC3339 (MySQL %f tops out at 6 fractional digits), and full
+    # RFC3339Nano (7-9 fractional digits) by truncating the fractional part to
+    # whole seconds for parsing — sub-second precision is immaterial for TTL
+    # expiry.  Rows where every pattern fails STR_TO_DATE return NULL and are
+    # recorded as anomalies rather than silently skipped.
+    DB_EXPIRED_ISSUES_CLOSED=0
+    get_sql_rows "$DB" "expired nudge bead with parse anomaly" "
+        SELECT i.id
+        FROM \`$DB\`.issues i
+        INNER JOIN \`$DB\`.labels lbl ON lbl.issue_id = i.id AND lbl.label = 'gc:nudge'
+        WHERE i.status IN ('open', 'in_progress')
+        AND JSON_UNQUOTE(JSON_EXTRACT(i.metadata, '$.expires_at')) IS NOT NULL
+        AND JSON_UNQUOTE(JSON_EXTRACT(i.metadata, '$.expires_at')) != ''
+        AND COALESCE(
+            STR_TO_DATE(JSON_UNQUOTE(JSON_EXTRACT(i.metadata, '$.expires_at')), '%Y-%m-%dT%H:%i:%s.%fZ'),
+            STR_TO_DATE(JSON_UNQUOTE(JSON_EXTRACT(i.metadata, '$.expires_at')), '%Y-%m-%dT%H:%i:%sZ'),
+            STR_TO_DATE(CONCAT(SUBSTRING_INDEX(JSON_UNQUOTE(JSON_EXTRACT(i.metadata, '$.expires_at')), '.', 1), 'Z'), '%Y-%m-%dT%H:%i:%sZ')
+        ) IS NULL
+    "
+    if [ -n "$SQL_ROWS_RESULT" ]; then
+        while IFS= read -r bad_id; do
+            [ -z "$bad_id" ] && continue
+            record_anomaly "$DB" "nudge bead $bad_id in $DB has unparseable expires_at; skipped by TTL reaper"
+        done <<< "$SQL_ROWS_RESULT"
+    fi
+
+    get_sql_rows "$DB" "expired nudge bead" "
+        SELECT i.id
+        FROM \`$DB\`.issues i
+        INNER JOIN \`$DB\`.labels lbl ON lbl.issue_id = i.id AND lbl.label = 'gc:nudge'
+        WHERE i.status IN ('open', 'in_progress')
+        AND JSON_UNQUOTE(JSON_EXTRACT(i.metadata, '$.expires_at')) IS NOT NULL
+        AND JSON_UNQUOTE(JSON_EXTRACT(i.metadata, '$.expires_at')) != ''
+        AND COALESCE(
+            STR_TO_DATE(JSON_UNQUOTE(JSON_EXTRACT(i.metadata, '$.expires_at')), '%Y-%m-%dT%H:%i:%s.%fZ'),
+            STR_TO_DATE(JSON_UNQUOTE(JSON_EXTRACT(i.metadata, '$.expires_at')), '%Y-%m-%dT%H:%i:%sZ'),
+            STR_TO_DATE(CONCAT(SUBSTRING_INDEX(JSON_UNQUOTE(JSON_EXTRACT(i.metadata, '$.expires_at')), '.', 1), 'Z'), '%Y-%m-%dT%H:%i:%sZ')
+        ) < UTC_TIMESTAMP()
+    "
+    EXPIRED_IDS=$SQL_ROWS_RESULT
+    if [ -n "$EXPIRED_IDS" ]; then
+        WOULD_EXPIRE_COUNT=$(printf '%s\n' "$EXPIRED_IDS" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')
+        TOTAL_WOULD_EXPIRE=$((TOTAL_WOULD_EXPIRE + WOULD_EXPIRE_COUNT))
+    fi
+
+    if [ -n "$EXPIRED_IDS" ] && [ -z "$DRY_RUN" ]; then
+        if [ -z "$CITY_DB" ]; then
+            if [ "$CITY_DB_ANOMALY_RECORDED" -eq 0 ]; then
+                record_anomaly "city" "city database could not be determined from GC_REAPER_CITY_DATABASE or $CITY/.beads/metadata.json; expired nudge close disabled"
+                CITY_DB_ANOMALY_RECORDED=1
+            fi
+            SKIPPED_COUNT=$(printf '%s\n' "$EXPIRED_IDS" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')
+            TOTAL_EXPIRED_ISSUES_SKIPPED=$((TOTAL_EXPIRED_ISSUES_SKIPPED + SKIPPED_COUNT))
+        elif [ "$DB" != "$CITY_DB" ]; then
+            SKIPPED_COUNT=$(printf '%s\n' "$EXPIRED_IDS" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')
+            TOTAL_EXPIRED_ISSUES_SKIPPED=$((TOTAL_EXPIRED_ISSUES_SKIPPED + SKIPPED_COUNT))
+        else
+            while IFS= read -r issue_id; do
+                [ -z "$issue_id" ] && continue
+                if CLOSE_OUTPUT=$(close_city_issue "$issue_id" "ttl:expired by reaper" 2>&1); then
+                    DB_EXPIRED_ISSUES_CLOSED=$((DB_EXPIRED_ISSUES_CLOSED + 1))
+                    TOTAL_EXPIRED_ISSUES_CLOSED=$((TOTAL_EXPIRED_ISSUES_CLOSED + 1))
+                    DB_MUTATIONS=$((DB_MUTATIONS + 1))
+                else
+                    record_anomaly "$DB" "closing expired nudge bead $issue_id failed for $DB: $(sanitize_output "$CLOSE_OUTPUT")"
+                fi
+            done <<< "$EXPIRED_IDS"
         fi
     fi
 
@@ -460,15 +547,18 @@ while IFS= read -r DB; do
         AND updated_at < DATE_SUB(NOW(), INTERVAL $STALE_AGE_H HOUR)
         AND priority > 1
         AND issue_type != 'epic'
+        AND (
+            JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.expires_at')) IS NULL
+            OR JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.expires_at')) = ''
+        )
         AND id NOT IN (
             SELECT DISTINCT d.issue_id FROM \`$DB\`.dependencies d
-            INNER JOIN \`$DB\`.issues i ON d.depends_on_issue_id = i.id
+            INNER JOIN \`$DB\`.issues i ON d.depends_on_id = i.id
             WHERE i.status IN ('open', 'in_progress')
             UNION
-            SELECT DISTINCT d.depends_on_issue_id FROM \`$DB\`.dependencies d
+            SELECT DISTINCT d.depends_on_id FROM \`$DB\`.dependencies d
             INNER JOIN \`$DB\`.issues i ON d.issue_id = i.id
             WHERE i.status IN ('open', 'in_progress')
-            AND d.depends_on_issue_id IS NOT NULL
         )
     "
     STALE_IDS=$SQL_ROWS_RESULT
@@ -498,16 +588,19 @@ while IFS= read -r DB; do
         fi
     fi
 
-    # Step 5a: Anomaly check — reapable open wisp count.
-    get_sql_count "$DB" "reapable open wisp" "
+    # Step 5a: Anomaly check — stale open wisp count. Fresh workflow load can
+    # legitimately exceed the threshold on busy cities; only old non-message
+    # rows indicate a reaper leak.
+    get_sql_count "$DB" "stale open wisp anomaly" "
         SELECT COUNT(*) FROM \`$DB\`.wisps
         WHERE status IN ('open', 'hooked', 'in_progress')
         AND issue_type NOT IN ('message')
+        AND created_at < DATE_SUB(NOW(), INTERVAL $MAX_AGE_H HOUR)
     "
     REAPABLE_WISPS=$SQL_COUNT_RESULT
 
     if [ "$REAPABLE_WISPS" -gt "$ALERT_THRESHOLD" ]; then
-        ANOMALIES="${ANOMALIES}$DB: $REAPABLE_WISPS open wisps (threshold: $ALERT_THRESHOLD)\n"
+        ANOMALIES="${ANOMALIES}$DB: $REAPABLE_WISPS stale open wisps (threshold: $ALERT_THRESHOLD, age: ${MAX_AGE})\n"
     fi
 
     # Step 5b: Mail-wisp backlog count, observed separately from reapable wisps.
@@ -530,7 +623,7 @@ while IFS= read -r DB; do
     if [ -z "$DRY_RUN" ] && [ "$DB_MUTATIONS" -gt 0 ]; then
         if ! COMMIT_OUTPUT=$(dolt_sql -q "
             USE \`$DB\`;
-            CALL DOLT_COMMIT('-Am', 'reaper: stale_wisps=$STALE_WISP_COUNT closed_wisps=$DB_CLOSED_WISPS purged=$DB_PURGED stale_issues=$DB_ISSUES_CLOSED', '--author', 'reaper <reaper@gastown.local>')
+            CALL DOLT_COMMIT('-Am', 'reaper: stale_wisps=$STALE_WISP_COUNT closed_wisps=$DB_CLOSED_WISPS purged=$DB_PURGED stale_issues=$DB_ISSUES_CLOSED expired_issues=$DB_EXPIRED_ISSUES_CLOSED', '--author', 'reaper <reaper@gastown.local>')
         " 2>&1); then
             case "$COMMIT_OUTPUT" in
                 *"nothing to commit"*|*"Nothing to commit"*)
@@ -598,9 +691,9 @@ if [ -n "$ANOMALIES" ]; then
         -m "$ANOMALIES" 2>/dev/null || true
 fi
 
-SUMMARY="reaper — stale_wisps:$TOTAL_STALE_WISPS, closed_wisps:$TOTAL_CLOSED_WISPS, purged:$TOTAL_PURGED, sessions-pruned:$TOTAL_SESSIONS_PRUNED, closed:$TOTAL_ISSUES_CLOSED, skipped_non_city_issues:$TOTAL_STALE_ISSUES_SKIPPED, mail_wisps:$TOTAL_MAIL_WISPS"
+SUMMARY="reaper — stale_wisps:$TOTAL_STALE_WISPS, closed_wisps:$TOTAL_CLOSED_WISPS, purged:$TOTAL_PURGED, sessions-pruned:$TOTAL_SESSIONS_PRUNED, closed:$TOTAL_ISSUES_CLOSED, expired:$TOTAL_EXPIRED_ISSUES_CLOSED, expired_skipped:$TOTAL_EXPIRED_ISSUES_SKIPPED, skipped_non_city_issues:$TOTAL_STALE_ISSUES_SKIPPED, mail_wisps:$TOTAL_MAIL_WISPS"
 if [ -n "$DRY_RUN" ]; then
-    SUMMARY="$SUMMARY (dry run)"
+    SUMMARY="$SUMMARY, would_close_wisps:$TOTAL_WOULD_CLOSE_WISPS, would_expire:$TOTAL_WOULD_EXPIRE (dry run)"
 fi
 
 gc session nudge deacon/ "DOG_DONE: $SUMMARY" 2>/dev/null || true
