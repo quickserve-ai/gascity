@@ -95,8 +95,11 @@ func TestSyncLockUsesBundledFallbackForPublicGastownWhenRemoteUnavailable(t *tes
 	if _, err := os.Stat(filepath.Join(cacheDir, "gastown", "pack.toml")); err != nil {
 		t.Fatalf("public gastown synthetic cache missing pack.toml: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(cacheDir, "maintenance", "pack.toml")); err != nil {
-		t.Fatalf("public maintenance synthetic cache missing pack.toml: %v", err)
+	if _, err := os.Stat(filepath.Join(cacheDir, "gastown", "agents", "dog", "agent.toml")); err != nil {
+		t.Fatalf("public gastown synthetic cache missing dog agent: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cacheDir, "gastown", "formulas", "mol-shutdown-dance.toml")); err != nil {
+		t.Fatalf("public gastown synthetic cache missing shutdown formula: %v", err)
 	}
 }
 
@@ -121,7 +124,7 @@ func TestCheckInstalledAcceptsBundledSyntheticCache(t *testing.T) {
 	home := t.TempDir()
 	city := t.TempDir()
 	t.Setenv("HOME", home)
-	source := builtinpacks.MustSource("maintenance")
+	source := builtinpacks.MustSource("gastown")
 	commit := "abc123def456"
 	writeTestLockfile(t, city, map[string]LockedPack{
 		source: {Version: "sha:" + commit, Commit: commit},
@@ -135,7 +138,7 @@ func TestCheckInstalledAcceptsBundledSyntheticCache(t *testing.T) {
 	}
 
 	report, err := CheckInstalled(city, map[string]config.Import{
-		"pack:maintenance": {Source: source, Version: "sha:" + commit},
+		"pack:gastown": {Source: source, Version: "sha:" + commit},
 	})
 	if err != nil {
 		t.Fatalf("CheckInstalled: %v", err)
@@ -191,7 +194,7 @@ func TestCheckInstalledReportsInvalidSyntheticCache(t *testing.T) {
 	city := t.TempDir()
 	t.Setenv("HOME", home)
 
-	source := builtinpacks.MustSource("maintenance")
+	source := builtinpacks.MustSource("gastown")
 	commit := "abc123def456"
 	writeTestLockfile(t, city, map[string]LockedPack{
 		source: {Version: "sha:" + commit, Commit: commit},
@@ -203,12 +206,12 @@ func TestCheckInstalledReportsInvalidSyntheticCache(t *testing.T) {
 	if err := builtinpacks.MaterializeSyntheticRepo(cachePath, commit); err != nil {
 		t.Fatalf("MaterializeSyntheticRepo: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(cachePath, "examples", "gastown", "packs", "maintenance", "pack.toml"), []byte("tampered"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(cachePath, "examples", "gastown", "packs", "gastown", "pack.toml"), []byte("tampered"), 0o644); err != nil {
 		t.Fatalf("WriteFile(tampered pack.toml): %v", err)
 	}
 
 	report, err := CheckInstalled(city, map[string]config.Import{
-		"pack:maintenance": {Source: source, Version: "sha:" + commit},
+		"pack:gastown": {Source: source, Version: "sha:" + commit},
 	})
 	if err != nil {
 		t.Fatalf("CheckInstalled: %v", err)
@@ -221,7 +224,7 @@ func TestCheckInstalledTreatsBundledGitENOTDIRAsInvalidSyntheticCache(t *testing
 	city := t.TempDir()
 	t.Setenv("HOME", home)
 
-	source := builtinpacks.MustSource("maintenance")
+	source := builtinpacks.MustSource("gastown")
 	commit := "abc123def456"
 	writeTestLockfile(t, city, map[string]LockedPack{
 		source: {Version: "sha:" + commit, Commit: commit},
@@ -238,7 +241,7 @@ func TestCheckInstalledTreatsBundledGitENOTDIRAsInvalidSyntheticCache(t *testing
 	}
 
 	report, err := CheckInstalled(city, map[string]config.Import{
-		"pack:maintenance": {Source: source, Version: "sha:" + commit},
+		"pack:gastown": {Source: source, Version: "sha:" + commit},
 	})
 	if err != nil {
 		t.Fatalf("CheckInstalled: %v", err)
