@@ -172,6 +172,7 @@ func (f compactScriptFixture) run(t *testing.T, mode string, extraEnv ...string)
 		"GC_DOLT_COMPACT_ONLY_DBS",
 		"GC_DOLT_COMPACT_REMOTE",
 		"GC_DOLT_COMPACT_BARE_GC",
+		"GC_DOLT_RIG_LIST_TIMEOUT_SECS",
 		"GC_FAKE_DOLT_COMPACT_MODE",
 		"GC_FAKE_DOLT_COUNT_FILE",
 		"GC_FAKE_DOLT_STATE_FILE",
@@ -873,6 +874,30 @@ func TestCompactScriptDefaultThresholdIs2000(t *testing.T) {
 	}
 	if strings.Contains(string(data), "DOLT_RESET") || strings.Contains(string(data), "DOLT_COMMIT") {
 		t.Fatalf("default-threshold compact must not flatten a 600-commit db:\n%s", data)
+	}
+}
+
+func TestCompactScriptToleratesSlowRigListDiscovery(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	// `gc rig list --json` regularly takes longer than the old 5s discovery
+	// bound on busy hosts. When the bound expires the script silently falls
+	// back to a city-only filesystem scan that misses external rig
+	// databases, so they are never compacted (gascity#2740). Answer after
+	// 7s and require discovery to still use the rig list.
+	writeExecutable(t, filepath.Join(fixture.binDir, "gc"), `#!/bin/sh
+if [ "${1:-}" = "rig" ] && [ "${2:-}" = "list" ]; then
+  sleep 7
+  printf '{"rigs":[]}\n'
+  exit 0
+fi
+exit 0
+`)
+	out, err := fixture.run(t, "success")
+	if err != nil {
+		t.Fatalf("compact failed: %v\n%s", err, out)
+	}
+	if strings.Contains(out, "falling back to local filesystem metadata scan") {
+		t.Fatalf("rig list answering within 30s must not trigger the filesystem fallback:\n%s", out)
 	}
 }
 
