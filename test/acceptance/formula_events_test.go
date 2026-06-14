@@ -86,7 +86,7 @@ func TestFormulaCommands(t *testing.T) {
 
 func TestEventCommands(t *testing.T) {
 	c := helpers.NewCity(t, testEnv)
-	c.InitNoStart("claude")
+	c.Init("claude")
 
 	t.Run("Emit_ThenList_ShowsEvent", func(t *testing.T) {
 		// Emit a custom event.
