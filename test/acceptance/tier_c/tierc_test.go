@@ -190,6 +190,8 @@ func TestSwarm_SlingWorkCoderCommits(t *testing.T) {
 	c := helpers.NewCity(t, testEnvC)
 	c.InitFrom(filepath.Join(helpers.ExamplesDir(), "swarm"))
 	applyTierCAcceptanceConfig(t, c)
+	unregisterOut, unregisterErr := c.GC("unregister", c.Dir)
+	require.NoError(t, unregisterErr, "gc unregister after init: %s", unregisterOut)
 
 	// Add the rig via gc rig add (initializes beads, hooks, routes).
 	c.RigAdd(rigDir, "packs/swarm")
