@@ -68,10 +68,11 @@ Exit code 2 is the forward-compatibility mechanism: when Gas City adds an
 operation, an older script returns exit 2 and the provider treats it as a
 no-op success, so scripts only implement the operations they care about.
 
-The one exception is `ready --include-ephemeral` (see below): there, exit 2 is
-surfaced as an error rather than a silent success, so runnable ephemeral beads
-are never quietly hidden from the orchestrator. A script that cannot serve
-ephemeral-aware ready queries should exit 1 with a stderr message instead.
+The one exception is `ready` invoked with contract arguments (such as
+`--include-ephemeral`): there, exit 2 is surfaced as an error rather than a
+silent success, so runnable ephemeral beads are never quietly hidden from the
+orchestrator. A script that cannot serve those ready queries should exit 1 with
+a stderr message instead.
 
 ## Operations
 
@@ -88,7 +89,7 @@ These are the subcommands a backend implements. Bead reads return a JSON array
 | `delete` | `script delete --force <id>` | — | — |
 | `list` | `script list [--status=S] [--assignee=A] [--type=T] [--limit=N]` | — | bead JSON array |
 | `children` | `script children <parent-id>` | — | bead JSON array |
-| `list-by-label` | `script list-by-label <label> <limit>` | — | bead JSON array |
+| `list-by-label` | `script list-by-label <label> 0` | — | bead JSON array |
 | `ready` | `script ready [--include-ephemeral]` | — | bead JSON array |
 | `set-metadata` | `script set-metadata <id> <key>` | value (raw bytes) | — |
 | `dep-add` | `script dep-add <id> <depends-on-id> <type>` | — | — |
@@ -140,8 +141,9 @@ Beads are exchanged as JSON matching the `bd --json` shape:
 ```
 
 The script assigns `id`, `status`, `created_at`, and `updated_at` on `create`.
-A missing or empty `status` is normalized to `open`; a missing `type` defaults
-to `task`. `metadata` values may be any JSON type but are coerced to strings.
+On `create` the provider defaults a missing `type` to `task` before calling the
+script; on every read it normalizes a missing or empty `status` to `open`.
+`metadata` values may be any JSON type but are coerced to strings.
 Preserve `ephemeral` and `defer_until` on every read path so the provider can
 keep run beads out of normal work queries.
 
@@ -164,7 +166,8 @@ replaces. `dep-list` returns objects of `{ "issue_id", "depends_on_id", "type" }
   batch and transaction operations are not atomic.
 - **Return supersets** — `list`, `children`, and `list-by-label` should return
   every matching bead the script can see, including ephemeral ones; the provider
-  applies the caller's tier and query filters after parsing.
+  applies the caller's tier, query filters, and result limit after parsing (it
+  always passes `list-by-label` a limit of `0`).
 - **Three-state status** — the store vocabulary is `open`, `in_progress`, and
   `closed`. A backend with a richer status set maps the extras onto these three.
 
