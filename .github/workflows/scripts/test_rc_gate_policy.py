@@ -28,7 +28,7 @@ class RCGatePolicyTests(unittest.TestCase):
 
         acceptance_c = _job_block(workflow, "ubuntu_acceptance_c")
         self.assertIn("needs: ubuntu_acceptance_a", acceptance_c)
-        self.assertIn("max-parallel: 1", acceptance_c)
+        self.assertIn("max-parallel: 2", acceptance_c)
 
         integration = _job_block(workflow, "ubuntu_integration_shards")
         self.assertIn("needs: ubuntu_acceptance_c", integration)
@@ -36,7 +36,7 @@ class RCGatePolicyTests(unittest.TestCase):
 
         tutorial = _job_block(workflow, "ubuntu_tutorial")
         self.assertIn("needs: ubuntu_integration_shards", tutorial)
-        self.assertIn("max-parallel: 1", tutorial)
+        self.assertIn("max-parallel: 2", tutorial)
 
     def test_rc_gate_runs_full_mac_regression_workflow(self) -> None:
         workflow = WORKFLOW.read_text()

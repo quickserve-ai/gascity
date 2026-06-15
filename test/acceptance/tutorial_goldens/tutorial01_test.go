@@ -112,12 +112,14 @@ func TestTutorial01Cities(t *testing.T) {
 			}
 			for _, want := range []string{
 				`provider = "claude"`,
-				`includes = [".gc/system/packs/core", ".gc/system/packs/bd"]`,
 				`formula_v2 = true`,
 			} {
 				if !strings.Contains(out, want) {
 					t.Fatalf("city.toml missing %q:\n%s", want, out)
 				}
+			}
+			if strings.Contains(out, `includes = [".gc/system/packs/core"`) {
+				t.Fatalf("city.toml should not carry legacy builtin includes:\n%s", out)
 			}
 		})
 
@@ -129,6 +131,9 @@ func TestTutorial01Cities(t *testing.T) {
 			for _, want := range []string{
 				`name = "my-city"`,
 				`schema = 2`,
+				`[imports.core]`,
+				`[imports.bd]`,
+				`[imports.gascity]`,
 				`[[named_session]]`,
 				`template = "mayor"`,
 				`mode = "always"`,
@@ -144,7 +149,7 @@ func TestTutorial01Cities(t *testing.T) {
 			if err != nil {
 				t.Fatalf("gc status: %v\n%s", err, out)
 			}
-			for _, want := range []string{"my-city", "Controller:", "Named sessions:", "mayor", "dolt.dog", "control-dispatcher"} {
+			for _, want := range []string{"my-city", "Controller:", "Named sessions:", "mayor", "bd.dog", "control-dispatcher"} {
 				if !strings.Contains(out, want) {
 					t.Fatalf("gc status missing %q:\n%s", want, out)
 				}

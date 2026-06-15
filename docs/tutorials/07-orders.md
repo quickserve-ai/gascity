@@ -50,7 +50,7 @@ pool = "worker"
 
 The `pool` field tells the controller where to send the work. A _pool_ is a
 named group of one or more agents that share a work queue — you glimpsed one
-in Tutorial 01, where `gc status` showed the bundled `dolt.dog` pool. A single
+in Tutorial 01, where `gc status` showed the bundled `bd.dog` pool. A single
 agent's name works as a pool target too; the examples here route to the
 `worker` agent from Tutorial 05. When an order fires, the controller creates a
 wisp from the formula and routes it to the named pool. Any agent in that pool

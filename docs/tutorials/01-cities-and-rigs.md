@@ -207,9 +207,9 @@ my-city  /Users/csells/my-city
   Suspended:  no
 
 Agents:
-  dolt.dog                scaled (min=0, max=2)
-    dolt.dog-1            stopped
-    dolt.dog-2            stopped
+  bd.dog                  scaled (min=0, max=2)
+    bd.dog-1              stopped
+    bd.dog-2              stopped
   control-dispatcher      stopped
 
 0/3 agents running
@@ -223,9 +223,7 @@ A named session shows `reserved-unmaterialized` until the controller
 materializes it; once the mayor session is up, its state reads `awake` (or
 `active` — the two are equivalent).
 
-The `dolt.dog` pool is a background utility agent from the bundled `dolt` pack
-(pulled in transitively through the explicit `bd` import you saw in
-`pack.toml` — the `dolt.` prefix is the import binding it arrived through).
+The `bd.dog` pool is a background utility agent from the bundled `bd` pack.
 It handles Dolt database housekeeping for the beads backend. `control-dispatcher` is SDK
 infrastructure: the controller uses it to advance formula workflows. You don't
 need to interact with either — ignore them for now.
