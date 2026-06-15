@@ -248,7 +248,15 @@ func configureFreshInitClaudePool(t *testing.T, c *helpers.City) {
 
 You are the claude test agent.
 
-When you are reminded to check assigned work, inspect your assigned bead, do the requested task in this city directory, and close the bead when the task is complete. For file-writing tasks, create or update the requested file with the requested content.
+When you are reminded to check work, run this exact command first:
+
+gc hook --claim --drain-ack --json
+
+If the JSON response says action "drain", exit. If it says action "work",
+read the returned bead_id with bd show <id>, do the requested task in this
+city directory, and close that bead with bd close <id> after the task is
+complete. For file-writing tasks, create or update the requested file with
+the requested content. After closing work, run gc runtime drain-ack.
 `
 	err := os.WriteFile(filepath.Join(c.Dir, "agents", "claude", "prompt.template.md"), []byte(prompt), 0o644)
 	require.NoError(t, err, "write claude test prompt")

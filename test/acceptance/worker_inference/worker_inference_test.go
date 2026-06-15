@@ -1778,7 +1778,18 @@ max_active_sessions = 2
 	if err := os.MkdirAll(filepath.Dir(agentPath), 0o755); err != nil {
 		return err
 	}
-	prompt := "You are a pool worker for {{.City.Name}}. Work whatever is on your hook.\n"
+	prompt := `# Default Pool Inference Worker
+
+You are a pool worker for {{.City.Name}}.
+
+When started or nudged, run this exact command first:
+
+gc hook --claim --drain-ack --json
+
+If the JSON response says action "drain", exit. If it says action "work",
+read the returned bead_id with bd show <id>, do the requested task, and close
+that bead with bd close <id>. After closing work, run gc runtime drain-ack.
+`
 	if err := os.WriteFile(filepath.Join(filepath.Dir(agentPath), "prompt.template.md"), []byte(prompt), 0o644); err != nil {
 		return err
 	}
@@ -2733,7 +2744,7 @@ func runFreshInitSlingWorkForTarget(t *testing.T, provider, slingTarget, prompt,
 		"--delivery",
 		hookNudgeDelivery,
 		spawnedSession.SessionName,
-		"Check your hook for work assignments, complete the assigned work, and close the work bead.",
+		"Run gc hook --claim --drain-ack --json, complete the claimed work, close the work bead, and acknowledge drain.",
 	)
 	var lastWorkBead beadJSON
 	completed := false
