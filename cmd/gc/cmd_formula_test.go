@@ -734,7 +734,7 @@ provider = "claude"
 
 [daemon]
 formula_v2 = true
-`, "claude")), 0o644); err != nil {
+`, "claude")+testControlDispatcherAgentTOML("")), 0o644); err != nil {
 		t.Fatalf("write city.toml: %v", err)
 	}
 	formulaDir := filepath.Join(cityDir, "formulas")
@@ -831,7 +831,7 @@ provider = "claude"
 
 [daemon]
 formula_v2 = true
-`, "claude")), 0o644); err != nil {
+`, "claude")+testControlDispatcherAgentTOML("")), 0o644); err != nil {
 		t.Fatalf("write city.toml: %v", err)
 	}
 	formulaDir := filepath.Join(cityDir, "formulas")
@@ -900,7 +900,7 @@ provider = "claude"
 
 [daemon]
 formula_v2 = true
-`, "claude")), 0o644); err != nil {
+`, "claude")+testControlDispatcherAgentTOML("")), 0o644); err != nil {
 		t.Fatalf("write city.toml: %v", err)
 	}
 	formulaDir := filepath.Join(cityDir, "formulas")

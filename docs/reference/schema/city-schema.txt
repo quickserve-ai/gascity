@@ -1182,7 +1182,7 @@
       "properties": {
         "formula_v2": {
           "type": "boolean",
-          "description": "FormulaV2 enables formula compiler v2 workflow infrastructure: the\ncontrol-dispatcher implicit agent and on-demand named session,\ncompiler-v2 workflow compilation, and batch graph-apply bead creation.\nThe implicit dispatcher follows normal session idle-sleep policy.\nRequires bd with --graph support. Default: true. Set false only for cities\npinned to formula compiler v1.",
+          "description": "FormulaV2 enables formula compiler v2 workflow infrastructure:\ncompiler-v2 workflow compilation, batch graph-apply bead creation, and\nrouting to the core pack's control-dispatcher worker.\nRequires bd with --graph support. Default: true. Set false only for cities\npinned to formula compiler v1.",
           "default": true
         },
         "graph_workflows": {

@@ -200,10 +200,11 @@ func TestCombinedPackParses(t *testing.T) {
 
 func TestCityAgentsFilter(t *testing.T) {
 	// Swarm's own city-scoped agents plus the dolt maintenance dog that the
-	// composed builtin packs contribute (bd imports dolt transitively).
+	// composed builtin packs contribute (bd imports dolt transitively), plus
+	// the visible core control dispatcher.
 	cfg := loadExpanded(t)
 
-	cityAgents := map[string]bool{"mayor": true, "deacon": true, "dog": true}
+	cityAgents := map[string]bool{"mayor": true, "deacon": true, "dog": true, "control-dispatcher": true}
 	var explicit int
 	for _, a := range cfg.Agents {
 		if a.Implicit {
@@ -220,8 +221,8 @@ func TestCityAgentsFilter(t *testing.T) {
 			t.Errorf("dog agent binding = %q, want bd (city-level imports stamp the city binding)", a.BindingName)
 		}
 	}
-	if explicit != 3 {
-		t.Errorf("got %d explicit agents, want mayor + deacon + dolt dog", explicit)
+	if explicit != 4 {
+		t.Errorf("got %d explicit agents, want mayor + deacon + dolt dog + control-dispatcher", explicit)
 	}
 }
 

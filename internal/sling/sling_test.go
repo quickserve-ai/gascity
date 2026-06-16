@@ -2566,9 +2566,18 @@ func graphV2SlingTestConfig(t *testing.T, formulaDir string) *config.City {
 		FormulaLayers: config.FormulaLayers{
 			City: []string{formulaDir},
 		},
+		Agents: []config.Agent{slingControlDispatcherAgent()},
 	}
-	config.InjectImplicitAgents(cfg)
 	return cfg
+}
+
+func slingControlDispatcherAgent() config.Agent {
+	return config.Agent{
+		Name:              config.ControlDispatcherAgentName,
+		StartCommand:      config.ControlDispatcherStartCommandFor("{{.Agent}}"),
+		ProcessNames:      []string{"gc"},
+		MaxActiveSessions: intPtr(1),
+	}
 }
 
 func TestSlingAttachGraphFormulaRejectsExistingLiveRoot(t *testing.T) {
@@ -2591,9 +2600,9 @@ title = "Do work"
 		FormulaLayers: config.FormulaLayers{
 			City: []string{formulaDir},
 		},
+		Agents: []config.Agent{slingControlDispatcherAgent()},
 	}
 	formulatest.EnableV2ForTest(t)
-	config.InjectImplicitAgents(cfg)
 	deps := testDeps(cfg, runtime.NewFake(), newFakeRunner().run)
 	source, err := deps.Store.Create(beads.Bead{ID: "BL-42", Title: "work", Type: "task", Status: "open"})
 	if err != nil {

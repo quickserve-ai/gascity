@@ -1810,12 +1810,15 @@ func TestResolveInstallHooksNilWorkspace(t *testing.T) {
 	}
 }
 
-func TestResolveInstallHooksImplicitControlDispatcherIgnoresWorkspaceHooks(t *testing.T) {
-	agent := &Agent{Name: ControlDispatcherAgentName, Implicit: true}
+func TestResolveInstallHooksControlDispatcherIgnoresWorkspaceHooks(t *testing.T) {
+	agent := &Agent{
+		Name:         ControlDispatcherAgentName,
+		StartCommand: ControlDispatcherStartCommandFor("{{.Agent}}"),
+	}
 	ws := &Workspace{InstallAgentHooks: []string{"gemini"}}
 	got := ResolveInstallHooks(agent, ws)
 	if len(got) != 0 {
-		t.Fatalf("ResolveInstallHooks implicit control-dispatcher = %v, want none", got)
+		t.Fatalf("ResolveInstallHooks control-dispatcher = %v, want none", got)
 	}
 }
 

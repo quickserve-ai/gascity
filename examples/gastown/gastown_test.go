@@ -3721,11 +3721,12 @@ func TestCityAgentsFilter(t *testing.T) {
 	// Verify config.LoadWithIncludes with both packs produces
 	// only city-scoped agents when no rigs are registered:
 	// mayor/deacon/boot + the gastown dog pool + the dolt maintenance dog
-	// contributed by the composed builtin bd pack = 5. The two dogs keep
-	// distinct binding-qualified identities (gastown.dog vs bd.dog).
+	// contributed by the composed builtin bd pack + the core control dispatcher
+	// = 6. The two dogs keep distinct binding-qualified identities
+	// (gastown.dog vs bd.dog).
 	cfg := loadExpanded(t)
 
-	cityAgents := map[string]bool{"mayor": true, "deacon": true, "boot": true, "dog": true}
+	cityAgents := map[string]bool{"mayor": true, "deacon": true, "boot": true, "dog": true, "control-dispatcher": true}
 	var explicit int
 	for _, a := range cfg.Agents {
 		if a.Implicit {
@@ -3739,8 +3740,8 @@ func TestCityAgentsFilter(t *testing.T) {
 			t.Errorf("city agent %q: dir = %q, want empty", a.Name, a.Dir)
 		}
 	}
-	if explicit != 5 {
-		t.Errorf("got %d explicit agents, want 5 city-scoped agents (incl. both dogs)", explicit)
+	if explicit != 6 {
+		t.Errorf("got %d explicit agents, want 6 city-scoped agents (incl. both dogs and control-dispatcher)", explicit)
 	}
 }
 

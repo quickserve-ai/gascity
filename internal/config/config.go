@@ -81,6 +81,16 @@ func ControlDispatcherStartCommandFor(qualifiedName string) string {
 	return `sh -c '` + controlDispatcherTraceInit + `; ` + controlDispatcherTraceDirInit + `; exec "${GC_BIN:-gc}" convoy control --serve --follow ` + qualifiedName + `'`
 }
 
+// IsDeterministicControlDispatcher reports whether an agent is the providerless
+// control-dispatcher worker that runs the deterministic control loop.
+func IsDeterministicControlDispatcher(agent *Agent) bool {
+	return agent != nil &&
+		agent.Name == ControlDispatcherAgentName &&
+		strings.TrimSpace(agent.StartCommand) != "" &&
+		strings.TrimSpace(agent.Provider) == "" &&
+		strings.Contains(agent.StartCommand, "convoy control --serve")
+}
+
 // BindingQualifiedName returns the binding-qualified agent identity without a
 // rig prefix. Examples: "polecat", "gastown.polecat", or "gastown.mayor".
 func (a *Agent) BindingQualifiedName() string {
@@ -2218,10 +2228,9 @@ type DaemonConfig struct {
 	// formula_v2=false, so the TOML encoder preserves that operator choice.
 	formulaV2Set bool `toml:"-" json:"-" jsonschema:"-"`
 
-	// FormulaV2 enables formula compiler v2 workflow infrastructure: the
-	// control-dispatcher implicit agent and on-demand named session,
-	// compiler-v2 workflow compilation, and batch graph-apply bead creation.
-	// The implicit dispatcher follows normal session idle-sleep policy.
+	// FormulaV2 enables formula compiler v2 workflow infrastructure:
+	// compiler-v2 workflow compilation, batch graph-apply bead creation, and
+	// routing to the core pack's control-dispatcher worker.
 	// Requires bd with --graph support. Default: true. Set false only for cities
 	// pinned to formula compiler v1.
 	FormulaV2 bool `toml:"formula_v2" jsonschema:"default=true"`
@@ -4039,7 +4048,6 @@ func InjectImplicitAgents(cfg *City) {
 
 	configured := configuredProviders(cfg)
 	if len(configured) == 0 {
-		injectControlDispatcherAgents(cfg, existing)
 		return
 	}
 
@@ -4091,8 +4099,6 @@ func InjectImplicitAgents(cfg *City) {
 			})
 		}
 	}
-
-	injectControlDispatcherAgents(cfg, existing)
 }
 
 // ApplyAgentDefaults applies [agent_defaults] values to all agents that
@@ -4280,62 +4286,6 @@ func mergeAgentDefaults(dst *AgentDefaults, src AgentDefaults, label string, pro
 	if len(src.MCP) > 0 {
 		dst.MCP = appendUnique(dst.MCP, src.MCP...)
 	}
-}
-
-// injectControlDispatcherAgents adds city-scoped and rig-scoped control-dispatcher
-// agents and named sessions when formula_v2 is enabled and no explicit
-// entry exists. Using named sessions ensures the reconciler reopens the
-// existing session bead on restart instead of creating a new one (which
-// would conflict on the session alias).
-func injectControlDispatcherAgents(cfg *City, existing map[agentKey]bool) {
-	if !cfg.Daemon.FormulaV2 {
-		return
-	}
-	existingNS := make(map[string]bool, len(cfg.NamedSessions))
-	for _, ns := range cfg.NamedSessions {
-		existingNS[ns.QualifiedName()] = true
-	}
-	if !existing[agentKey{"", ControlDispatcherAgentName}] {
-		cfg.Agents = append(cfg.Agents, newControlDispatcherAgent(""))
-		if !existingNS[ControlDispatcherAgentName] {
-			cfg.NamedSessions = append(cfg.NamedSessions, NamedSession{
-				Template: ControlDispatcherAgentName,
-				Mode:     "on_demand",
-			})
-		}
-	}
-	for _, rig := range cfg.Rigs {
-		if !existing[agentKey{rig.Name, ControlDispatcherAgentName}] {
-			cfg.Agents = append(cfg.Agents, newControlDispatcherAgent(rig.Name))
-			qn := rig.Name + "/" + ControlDispatcherAgentName
-			if !existingNS[qn] {
-				cfg.NamedSessions = append(cfg.NamedSessions, NamedSession{
-					Template: ControlDispatcherAgentName,
-					Dir:      rig.Name,
-					Mode:     "on_demand",
-				})
-			}
-		}
-	}
-}
-
-// newControlDispatcherAgent creates a control-dispatcher agent for the given scope.
-func newControlDispatcherAgent(dir string) Agent {
-	qualifiedName := ControlDispatcherAgentName
-	if dir != "" {
-		qualifiedName = dir + "/" + ControlDispatcherAgentName
-	}
-	one := 1
-	a := Agent{
-		Name:              ControlDispatcherAgentName,
-		Dir:               dir,
-		Description:       "Built-in deterministic compiler-v2 workflow control worker",
-		StartCommand:      ControlDispatcherStartCommandFor(qualifiedName),
-		ProcessNames:      []string{"gc"},
-		MaxActiveSessions: &one,
-		Implicit:          true,
-	}
-	return a
 }
 
 // configuredProviders returns the providers that are explicitly configured in

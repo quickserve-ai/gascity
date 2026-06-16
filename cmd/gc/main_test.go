@@ -3959,11 +3959,11 @@ scale_check = "echo 3"
 	if cfg.ResolvedWorkspaceName != "bright-lights" {
 		t.Errorf("ResolvedWorkspaceName = %q, want %q (should be overridden)", cfg.ResolvedWorkspaceName, "bright-lights")
 	}
-	// The builtin core pack ships no agents (the former maintenance
-	// fallback dog is gone), so only the two authored agents are explicit.
+	// The builtin core pack contributes the visible control-dispatcher agent;
+	// the former maintenance fallback dog remains gone.
 	explicit := explicitAgents(cfg.Agents)
-	if len(explicit) != 2 {
-		t.Fatalf("len(explicitAgents) = %d, want 2", len(explicit))
+	if len(explicit) != 3 {
+		t.Fatalf("len(explicitAgents) = %d, want 3", len(explicit))
 	}
 	explicitByName := make(map[string]config.Agent, len(explicit))
 	for _, agent := range explicit {
@@ -3976,6 +3976,9 @@ scale_check = "echo 3"
 	worker, ok := explicitByName["worker"]
 	if !ok {
 		t.Fatalf("explicitAgents missing worker: %+v", explicit)
+	}
+	if _, ok := explicitByName[config.ControlDispatcherAgentName]; !ok {
+		t.Fatalf("explicitAgents missing control-dispatcher: %+v", explicit)
 	}
 	if worker.MaxActiveSessions == nil {
 		t.Fatal("worker.MaxActiveSessions is nil, want non-nil")

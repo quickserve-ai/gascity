@@ -27,6 +27,7 @@ func TestDecorateGraphWorkflowRecipeSubstitutesRouteTargetsWithinRigContext(t *t
 		},
 	}
 	config.InjectImplicitAgents(cfg)
+	addTestControlDispatcherAgents(cfg, "", "frontend")
 
 	defaultTarget := "codex"
 	recipe := &formula.Recipe{
@@ -175,6 +176,7 @@ type = "task"
 		},
 	}
 	config.InjectImplicitAgents(cfg)
+	addTestControlDispatcherAgents(cfg, "", "frontend")
 
 	deps := slingDeps{
 		CityName: "test-city",

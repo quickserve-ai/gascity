@@ -559,10 +559,9 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 	nudge := cfgAgent.Nudge
 	acceptStartupDialogs := resolved.AcceptStartupDialogs
 	if suppressStartupPrompt {
-		// Implicit start-command infrastructure agents are deterministic
-		// subprocesses, not interactive model providers. Keep ProcessNames for
-		// liveness without routing startup through prompt, nudge, or
-		// trust-dialog handling.
+		// Deterministic control-dispatcher workers are subprocesses, not
+		// interactive model providers. Keep ProcessNames for liveness without
+		// routing startup through prompt, nudge, or trust-dialog handling.
 		nudge = ""
 		accept := false
 		acceptStartupDialogs = &accept
@@ -647,10 +646,7 @@ func appendKimiHookConfigArg(command string) string {
 }
 
 func suppressStartupPromptForAgent(cfgAgent *config.Agent) bool {
-	return cfgAgent != nil &&
-		cfgAgent.Implicit &&
-		strings.TrimSpace(cfgAgent.StartCommand) != "" &&
-		strings.TrimSpace(cfgAgent.Provider) == ""
+	return config.IsDeterministicControlDispatcher(cfgAgent)
 }
 
 func sessionBackendEnvWithError(cityPath, rigRoot string, rigs []config.Rig) (map[string]string, error) {

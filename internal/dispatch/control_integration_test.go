@@ -1034,9 +1034,10 @@ func TestResolveAttemptRouteBinding_NamedSessionTargetWithoutCanonicalBeadUsesSe
 	}
 }
 
-func TestApplyAttemptControlStepRoute_ImplicitControlDispatcherUsesMetadataRoute(t *testing.T) {
+func TestApplyAttemptControlStepRoute_ConfiguredControlDispatcherUsesMetadataRoute(t *testing.T) {
 	t.Parallel()
 
+	maxActive := 1
 	cfg := &config.City{
 		Workspace: config.Workspace{Name: "maintainer-city"},
 		Daemon:    config.DaemonConfig{FormulaV2: true},
@@ -1047,9 +1048,14 @@ func TestApplyAttemptControlStepRoute_ImplicitControlDispatcherUsesMetadataRoute
 		Agents: []config.Agent{{
 			Name: "claude",
 			Dir:  "gascity",
+		}, {
+			Name:              config.ControlDispatcherAgentName,
+			Dir:               "gascity",
+			StartCommand:      config.ControlDispatcherStartCommandFor("{{.Agent}}"),
+			ProcessNames:      []string{"gc"},
+			MaxActiveSessions: &maxActive,
 		}},
 	}
-	config.InjectImplicitAgents(cfg)
 
 	step := &formula.RecipeStep{
 		Metadata: map[string]string{
@@ -1168,7 +1174,7 @@ max_active_sessions = 1
 	}
 }
 
-func TestApplyAttemptControlStepRoute_ConfiguredControlDispatcherUsesMetadataRoute(t *testing.T) {
+func TestApplyAttemptControlStepRoute_MinimalRigScopedDispatcherUsesMetadataRoute(t *testing.T) {
 	t.Parallel()
 
 	cfg := &config.City{
@@ -1242,13 +1248,17 @@ func TestApplyAttemptControlStepRoute_KeepsControlBeadsOnDispatcherForNamedExecu
 		Agents: []config.Agent{{
 			Name:              "worker",
 			MaxActiveSessions: &maxActive,
+		}, {
+			Name:              config.ControlDispatcherAgentName,
+			StartCommand:      config.ControlDispatcherStartCommandFor("{{.Agent}}"),
+			ProcessNames:      []string{"gc"},
+			MaxActiveSessions: &maxActive,
 		}},
 		NamedSessions: []config.NamedSession{{
 			Template: "worker",
 			Mode:     "always",
 		}},
 	}
-	config.InjectImplicitAgents(cfg)
 
 	step := &formula.RecipeStep{
 		ID:       "review-scope-check",

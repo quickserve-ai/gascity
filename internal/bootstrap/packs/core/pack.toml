@@ -7,11 +7,8 @@
 # use Gas City, default worker prompts, core formulas such as mol-do-work
 # and mol-scoped-work, mechanical housekeeping orders (gate/orphan/wisp
 # sweeps, branch pruning, nudge relays, beads health), the check-binaries
-# doctor check, and per-provider hook overlays.
-#
-# It deliberately ships no agents: packs that need long-lived utility
-# workers (for example gastown's dog pool or the dolt pack's dog) define
-# their own.
+# doctor check, per-provider hook overlays, and the singleton
+# control-dispatcher pool that handles formula-v2 control beads.
 #
 # Inspect this directory after `gc init` or `gc start` to see the exact
 # behavior your city received from the bundled core pack.
@@ -19,4 +16,4 @@
 name = "core"
 version = "0.1.0"
 schema = 2
-description = "Bundled Gas City core behavior: gc workflow skills, default prompts, core formulas, housekeeping orders, doctor checks, and provider hook overlays."
+description = "Bundled Gas City core behavior: gc workflow skills, default prompts, core formulas, housekeeping orders, doctor checks, provider hook overlays, and the formula-v2 control dispatcher."

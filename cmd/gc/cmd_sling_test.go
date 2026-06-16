@@ -4353,6 +4353,7 @@ title = "Do work"
 		{ID: "BL-42", Title: "Work", Type: "task", Status: "open"},
 	}, nil)
 	config.InjectImplicitAgents(cfg)
+	addTestControlDispatcherAgents(cfg, "", "frontend")
 	opts := testOpts(a, "BL-42")
 	opts.OnFormula = "graph-work"
 	opts.ScopeKind = "city"
@@ -4516,6 +4517,7 @@ title = "Do work"
 		},
 	}, nil)
 	config.InjectImplicitAgents(cfg)
+	addTestControlDispatcherAgents(cfg, "", "frontend")
 	opts := testOpts(a, "BL-42")
 	opts.OnFormula = "graph-work"
 	code := doSling(opts, deps, nil, stdout, stderr)
@@ -4561,6 +4563,7 @@ title = "Do work"
 		{ID: "BL-1", Title: "Child", Type: "task", Status: "open"},
 	}, nil)
 	config.InjectImplicitAgents(cfg)
+	addTestControlDispatcherAgents(cfg, "", "frontend")
 	opts := testOpts(a, "CVY-1")
 	opts.OnFormula = "graph-work"
 	opts.ScopeKind = "city"
@@ -4640,6 +4643,7 @@ title = "Do work"
 		},
 	}, nil)
 	config.InjectImplicitAgents(cfg)
+	addTestControlDispatcherAgents(cfg, "", "frontend")
 	opts := testOpts(a, "CVY-1")
 	opts.OnFormula = "graph-work"
 	code := doSlingBatch(opts, deps, q, stdout, stderr)
@@ -4933,6 +4937,7 @@ func TestOnFormulaGraphWorkflowPokesOnce(t *testing.T) {
 	applyFeatureFlags(cfg)
 	t.Cleanup(func() { applyFeatureFlags(&config.City{}) })
 	config.InjectImplicitAgents(cfg)
+	addTestControlDispatcherAgents(cfg, "", "frontend")
 	cfg.FormulaLayers.City = []string{testFormulaDir(t)}
 	a := config.Agent{Name: "mayor", MaxActiveSessions: intPtr(1)}
 

@@ -102,8 +102,9 @@ func EnsureBuiltinRuntimeAssets(cityPath string, warningWriter io.Writer) error 
 // configuration needs, keyed by pack name.
 //
 // Core is always required: it ships the role prompts referenced by
-// implicit agents, the gc-* skills, mechanical housekeeping orders, and
-// the per-provider hook overlays. When the beads provider is "bd" (the
+// implicit agents, the gc-* skills, mechanical housekeeping orders, the
+// control-dispatcher worker, and the per-provider hook overlays. When
+// the beads provider is "bd" (the
 // default), bd is required and its own pack imports pull in dolt
 // transitively. Gastown and gascity are never required — they need an
 // explicit import.
