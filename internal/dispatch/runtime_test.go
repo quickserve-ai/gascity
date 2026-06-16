@@ -5262,11 +5262,11 @@ on_exhausted = "hard_fail"
 	if logical.Metadata["gc.kind"] != "retry" {
 		t.Fatalf("logical gc.kind = %q, want retry", logical.Metadata["gc.kind"])
 	}
-	if got := logical.Assignee; got != "gascity--control-dispatcher" {
-		t.Fatalf("logical retry assignee = %q, want gascity--control-dispatcher", got)
+	if got := logical.Assignee; got != "" {
+		t.Fatalf("logical retry assignee = %q, want empty routed control-dispatcher queue", got)
 	}
-	if got := logical.Metadata["gc.routed_to"]; got != "" {
-		t.Fatalf("logical retry gc.routed_to = %q, want empty direct dispatcher assignee", got)
+	if got := logical.Metadata["gc.routed_to"]; got != "gascity/control-dispatcher" {
+		t.Fatalf("logical retry gc.routed_to = %q, want gascity/control-dispatcher", got)
 	}
 	if got := logical.Metadata["gc.execution_routed_to"]; got != "gascity/reviewer" {
 		t.Fatalf("logical retry gc.execution_routed_to = %q, want gascity/reviewer", got)
@@ -5556,8 +5556,8 @@ on_exhausted = "hard_fail"
 					continue
 				case "scope-check", "workflow-finalize", "fanout", "check", "retry-eval":
 					step.Metadata["gc.execution_routed_to"] = "gascity/reviewer"
-					delete(step.Metadata, "gc.routed_to")
-					step.Assignee = "gascity--control-dispatcher"
+					step.Metadata["gc.routed_to"] = "gascity/control-dispatcher"
+					step.Assignee = ""
 				default:
 					step.Metadata["gc.routed_to"] = "gascity/reviewer"
 					delete(step.Metadata, "gc.execution_routed_to")
@@ -5581,8 +5581,11 @@ on_exhausted = "hard_fail"
 	if retryControl.Metadata["gc.kind"] != "retry" {
 		t.Fatalf("retry control gc.kind = %q, want retry", retryControl.Metadata["gc.kind"])
 	}
-	if got := retryControl.Assignee; got != "gascity--control-dispatcher" {
-		t.Fatalf("retry control assignee = %q, want gascity--control-dispatcher", got)
+	if got := retryControl.Assignee; got != "" {
+		t.Fatalf("retry control assignee = %q, want empty routed control-dispatcher queue", got)
+	}
+	if got := retryControl.Metadata["gc.routed_to"]; got != "gascity/control-dispatcher" {
+		t.Fatalf("retry control gc.routed_to = %q, want gascity/control-dispatcher", got)
 	}
 	if got := retryControl.Metadata["gc.execution_routed_to"]; got != "gascity/reviewer" {
 		t.Fatalf("retry control gc.execution_routed_to = %q, want gascity/reviewer", got)
@@ -5595,11 +5598,11 @@ on_exhausted = "hard_fail"
 	if scopeCheck.Metadata["gc.kind"] != "scope-check" {
 		t.Fatalf("scope-check gc.kind = %q, want scope-check", scopeCheck.Metadata["gc.kind"])
 	}
-	if got := scopeCheck.Assignee; got != "gascity--control-dispatcher" {
-		t.Fatalf("scope-check assignee = %q, want gascity--control-dispatcher", got)
+	if got := scopeCheck.Assignee; got != "" {
+		t.Fatalf("scope-check assignee = %q, want empty routed control-dispatcher queue", got)
 	}
-	if got := scopeCheck.Metadata["gc.routed_to"]; got != "" {
-		t.Fatalf("scope-check gc.routed_to = %q, want empty direct dispatcher assignee", got)
+	if got := scopeCheck.Metadata["gc.routed_to"]; got != "gascity/control-dispatcher" {
+		t.Fatalf("scope-check gc.routed_to = %q, want gascity/control-dispatcher", got)
 	}
 	if got := scopeCheck.Metadata["gc.execution_routed_to"]; got != "gascity/reviewer" {
 		t.Fatalf("scope-check gc.execution_routed_to = %q, want gascity/reviewer", got)

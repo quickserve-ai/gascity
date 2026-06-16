@@ -991,13 +991,11 @@ func applyAttemptControlStepRoute(step *formula.RecipeStep, executionTarget stri
 	step.Labels = removeAttemptPoolLabels(step.Labels)
 
 	controlTarget := controlDispatcherTargetForExecutionTarget(resolvedExecutionTarget)
-	if assignee, ok := resolveAttemptControlAssignee(controlTarget, cfg, store); ok {
+	if controlTarget != "" {
+		step.Metadata[beadmeta.RoutedToMetadataKey] = controlTarget
+	} else {
 		delete(step.Metadata, beadmeta.RoutedToMetadataKey)
-		step.Assignee = assignee
-		return
 	}
-
-	step.Metadata[beadmeta.RoutedToMetadataKey] = controlTarget
 	step.Assignee = ""
 }
 
@@ -1007,34 +1005,6 @@ func controlDispatcherTargetForExecutionTarget(executionTarget string) string {
 		return executionTarget[:slash] + "/" + config.ControlDispatcherAgentName
 	}
 	return config.ControlDispatcherAgentName
-}
-
-func resolveAttemptControlAssignee(target string, cfg *config.City, store beads.Store) (string, bool) {
-	target = strings.TrimSpace(target)
-	if target == "" {
-		return "", false
-	}
-	if binding, ok := resolveAttemptRouteBinding(target, cfg, store); ok {
-		if binding.directSessionID != "" {
-			return binding.directSessionID, true
-		}
-		if binding.sessionName != "" {
-			return binding.sessionName, true
-		}
-	}
-	if cfg != nil {
-		if named := config.FindNamedSession(cfg, target); named != nil {
-			if spec, ok := session.FindNamedSessionSpec(cfg, cfg.EffectiveCityName(), named.QualifiedName()); ok && spec.SessionName != "" {
-				return spec.SessionName, true
-			}
-		}
-		if agentCfg := config.FindAgent(cfg, target); agentCfg != nil {
-			if sessionName := config.NamedSessionRuntimeName(cfg.EffectiveCityName(), cfg.Workspace, agentCfg.QualifiedName()); sessionName != "" {
-				return sessionName, true
-			}
-		}
-	}
-	return "", false
 }
 
 func isAttemptControlKind(kind string) bool {

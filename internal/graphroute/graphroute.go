@@ -195,28 +195,19 @@ func ApplyGraphRouteBinding(step *formula.RecipeStep, binding GraphRouteBinding)
 	step.Assignee = binding.SessionName
 }
 
-// ApplyGraphControlRouteBinding routes control steps directly to the
-// control-dispatcher session when possible. gc.routed_to intentionally means
-// "work for this config queue"; using it for a named dispatcher would create
-// config-routed work instead of delivering to the known dispatcher session.
+// ApplyGraphControlRouteBinding routes control steps to the singleton
+// control-dispatcher config queue. Direct session assignment is reserved for
+// already-existing concrete session owners, not future on-demand sessions.
 func ApplyGraphControlRouteBinding(step *formula.RecipeStep, binding GraphRouteBinding) {
 	// Clear any prior session back-references so the metadata matches the
 	// current binding when a control step is re-decorated (#2843).
 	delete(step.Metadata, beadmeta.SessionNameMetadataKey)
 	delete(step.Metadata, beadmeta.SessionIDMetadataKey)
-	if binding.DirectSessionID != "" {
+	if binding.QualifiedName != "" {
+		step.Metadata[beadmeta.RoutedToMetadataKey] = binding.QualifiedName
+	} else {
 		delete(step.Metadata, beadmeta.RoutedToMetadataKey)
-		step.Metadata[beadmeta.SessionIDMetadataKey] = binding.DirectSessionID
-		step.Assignee = binding.DirectSessionID
-		return
 	}
-	if binding.SessionName != "" {
-		delete(step.Metadata, beadmeta.RoutedToMetadataKey)
-		step.Metadata[beadmeta.SessionNameMetadataKey] = binding.SessionName
-		step.Assignee = binding.SessionName
-		return
-	}
-	delete(step.Metadata, beadmeta.RoutedToMetadataKey)
 	step.Assignee = ""
 }
 
@@ -263,7 +254,7 @@ func WorkflowExecutionRoute(bead beads.Bead) string {
 
 // ControlDispatcherBinding resolves the graph routing binding for the
 // control dispatcher agent.
-func ControlDispatcherBinding(store beads.Store, cityName string, cfg *config.City, rigContext string, deps Deps) (GraphRouteBinding, error) {
+func ControlDispatcherBinding(_ beads.Store, _ string, cfg *config.City, rigContext string, deps Deps) (GraphRouteBinding, error) {
 	if cfg == nil {
 		return GraphRouteBinding{}, fmt.Errorf("control-dispatcher route requires config")
 	}
@@ -274,13 +265,7 @@ func ControlDispatcherBinding(store beads.Store, cityName string, cfg *config.Ci
 	if !ok {
 		return GraphRouteBinding{}, fmt.Errorf("control-dispatcher agent %q not found", config.ControlDispatcherAgentName)
 	}
-	binding := GraphRouteBinding{QualifiedName: agentCfg.QualifiedName()}
-	sn := agentutil.LookupSessionName(store, cityName, agentCfg.QualifiedName(), cfg.Workspace.SessionTemplate)
-	if sn == "" {
-		return GraphRouteBinding{}, fmt.Errorf("could not resolve session name for %q", agentCfg.QualifiedName())
-	}
-	binding.SessionName = sn
-	return binding, nil
+	return GraphRouteBinding{QualifiedName: agentCfg.QualifiedName(), MetadataOnly: true}, nil
 }
 
 // ResolveGraphStepBinding resolves the routing binding for a graph step

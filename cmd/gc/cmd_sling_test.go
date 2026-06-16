@@ -4449,11 +4449,11 @@ title = "Do work"
 				t.Fatalf("latch bead %s assignee = %q, want empty", bead.ID, bead.Assignee)
 			}
 		case "workflow-finalize":
-			if bead.Assignee != config.ControlDispatcherAgentName {
-				t.Fatalf("workflow-finalize assignee = %q, want %q", bead.Assignee, config.ControlDispatcherAgentName)
+			if bead.Assignee != "" {
+				t.Fatalf("workflow-finalize assignee = %q, want empty routed control-dispatcher queue", bead.Assignee)
 			}
-			if got := bead.Metadata["gc.routed_to"]; got != "" {
-				t.Fatalf("workflow-finalize gc.routed_to = %q, want empty direct dispatcher assignee", got)
+			if got := bead.Metadata["gc.routed_to"]; got != config.ControlDispatcherAgentName {
+				t.Fatalf("workflow-finalize gc.routed_to = %q, want %q", got, config.ControlDispatcherAgentName)
 			}
 			if bead.Metadata[graphroute.GraphExecutionRouteMetaKey] != "mayor" {
 				t.Fatalf("workflow-finalize execution route = %q, want mayor", bead.Metadata[graphroute.GraphExecutionRouteMetaKey])

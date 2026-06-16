@@ -2171,11 +2171,11 @@ title = "Do work"
 			}
 			foundWorker = true
 		case "Finalize workflow":
-			if bead.Assignee != config.ControlDispatcherAgentName {
-				t.Fatalf("finalizer assignee = %q, want %q", bead.Assignee, config.ControlDispatcherAgentName)
+			if bead.Assignee != "" {
+				t.Fatalf("finalizer assignee = %q, want empty routed control-dispatcher queue", bead.Assignee)
 			}
-			if bead.Metadata["gc.routed_to"] != "" {
-				t.Fatalf("finalizer gc.routed_to = %q, want empty for concrete control dispatcher assignee", bead.Metadata["gc.routed_to"])
+			if bead.Metadata["gc.routed_to"] != config.ControlDispatcherAgentName {
+				t.Fatalf("finalizer gc.routed_to = %q, want %q", bead.Metadata["gc.routed_to"], config.ControlDispatcherAgentName)
 			}
 			if bead.Metadata[graphroute.GraphExecutionRouteMetaKey] != "quinn" {
 				t.Fatalf("finalizer execution route = %q, want quinn", bead.Metadata[graphroute.GraphExecutionRouteMetaKey])

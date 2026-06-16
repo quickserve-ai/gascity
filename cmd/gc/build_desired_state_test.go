@@ -2081,7 +2081,7 @@ func TestReadyAssignedWorkAssigneesExcludeBroadIdentities(t *testing.T) {
 	}
 }
 
-func TestCollectAssignedWorkBeads_ReadyProbeIncludesNamedSessionRuntimeAssignee(t *testing.T) {
+func TestCollectAssignedWorkBeads_ReadyProbeExcludesFutureNamedSessionRuntimeAssignee(t *testing.T) {
 	cityStore := &readyQueryRecordingStore{MemStore: beads.NewMemStore()}
 	rigStore := &readyQueryRecordingStore{MemStore: beads.NewMemStore()}
 	cfg := &config.City{
@@ -2096,13 +2096,12 @@ func TestCollectAssignedWorkBeads_ReadyProbeIncludesNamedSessionRuntimeAssignee(
 	}
 	identity := cfg.NamedSessions[0].QualifiedName()
 	runtimeName := config.NamedSessionRuntimeName(cfg.EffectiveCityName(), cfg.Workspace, identity)
-	work, err := rigStore.Create(beads.Bead{
+	if _, err := rigStore.Create(beads.Bead{
 		Title:    "ready control work",
 		Type:     "task",
 		Status:   "open",
 		Assignee: runtimeName,
-	})
-	if err != nil {
+	}); err != nil {
 		t.Fatalf("create ready work bead: %v", err)
 	}
 
@@ -2116,21 +2115,24 @@ func TestCollectAssignedWorkBeads_ReadyProbeIncludesNamedSessionRuntimeAssignee(
 	if partial {
 		t.Fatal("collectAssignedWorkBeadsWithStores reported partial results")
 	}
-	if len(got) != 1 || got[0].ID != work.ID {
-		t.Fatalf("got = %#v, want ready named-session work %s", got, work.ID)
+	if len(got) != 0 {
+		t.Fatalf("got = %#v, want no future-runtime-assigned named-session work", got)
 	}
-	if len(stores) != 1 || stores[0] != rigStore {
-		t.Fatalf("stores = %#v, want rig store", stores)
+	if len(stores) != 0 {
+		t.Fatalf("stores = %#v, want none", stores)
 	}
-	if len(storeRefs) != 1 || storeRefs[0] != "repo" {
-		t.Fatalf("storeRefs = %#v, want repo", storeRefs)
+	if len(storeRefs) != 0 {
+		t.Fatalf("storeRefs = %#v, want none", storeRefs)
 	}
 	queried := make(map[string]bool)
 	for _, query := range rigStore.readyQueries {
 		queried[query.Assignee] = true
 	}
-	if !queried[runtimeName] {
-		t.Fatalf("rig Ready queries = %#v, want runtime assignee %q", rigStore.readyQueries, runtimeName)
+	if queried[runtimeName] {
+		t.Fatalf("rig Ready queries = %#v, must not include future runtime assignee %q", rigStore.readyQueries, runtimeName)
+	}
+	if !queried[identity] {
+		t.Fatalf("rig Ready queries = %#v, want canonical named-session assignee %q", rigStore.readyQueries, identity)
 	}
 }
 
@@ -5595,7 +5597,7 @@ func TestBuildDesiredState_OnDemandNamedSession_DirectAssigneeMaterializes(t *te
 	}
 }
 
-func TestBuildDesiredState_OnDemandNamedSession_RuntimeAssigneeMaterializes(t *testing.T) {
+func TestBuildDesiredState_OnDemandNamedSession_RuntimeAssigneeDoesNotMaterialize(t *testing.T) {
 	cityPath := t.TempDir()
 	rigPath := filepath.Join(cityPath, "fixture")
 	if err := os.MkdirAll(rigPath, 0o755); err != nil {
@@ -5635,8 +5637,8 @@ func TestBuildDesiredState_OnDemandNamedSession_RuntimeAssigneeMaterializes(t *t
 		runtime.NewFake(), cityStore, map[string]beads.Store{"fixture": rigStore}, nil, nil, io.Discard,
 	)
 
-	if !dsResult.NamedSessionDemand[identity] {
-		t.Fatalf("NamedSessionDemand[%s] = false for runtime assignee %q", identity, runtimeName)
+	if dsResult.NamedSessionDemand[identity] {
+		t.Fatalf("NamedSessionDemand[%s] = true for future runtime assignee %q", identity, runtimeName)
 	}
 	found := false
 	for _, tp := range dsResult.State {
@@ -5645,8 +5647,8 @@ func TestBuildDesiredState_OnDemandNamedSession_RuntimeAssigneeMaterializes(t *t
 			break
 		}
 	}
-	if !found {
-		t.Fatalf("runtime assignee %q should materialize on-demand named session %q", runtimeName, identity)
+	if found {
+		t.Fatalf("future runtime assignee %q should not materialize on-demand named session %q", runtimeName, identity)
 	}
 }
 

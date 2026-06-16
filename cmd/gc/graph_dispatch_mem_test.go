@@ -480,11 +480,11 @@ func TestGraphWorkflowInMemoryRouteUsesControlDispatcherForControlBeads(t *testi
 			continue
 		}
 		foundControl = true
-		if bead.Assignee != config.ControlDispatcherAgentName {
-			t.Fatalf("control bead %s assignee = %q, want %q", bead.ID, bead.Assignee, config.ControlDispatcherAgentName)
+		if bead.Assignee != "" {
+			t.Fatalf("control bead %s assignee = %q, want empty routed control-dispatcher queue", bead.ID, bead.Assignee)
 		}
-		if got := bead.Metadata["gc.routed_to"]; got != "" {
-			t.Fatalf("control bead %s gc.routed_to = %q, want empty direct dispatcher assignee", bead.ID, got)
+		if got := bead.Metadata["gc.routed_to"]; got != config.ControlDispatcherAgentName {
+			t.Fatalf("control bead %s gc.routed_to = %q, want %q", bead.ID, got, config.ControlDispatcherAgentName)
 		}
 	}
 	if !foundControl {

@@ -392,11 +392,11 @@ func TestDecorateDynamicFragmentRecipeSupportsExplicitPerStepAgents(t *testing.T
 	}
 
 	control := steps["expansion-review.review-scope-check"]
-	if control.Assignee != config.ControlDispatcherAgentName {
-		t.Fatalf("review scope-check assignee = %q, want %q", control.Assignee, config.ControlDispatcherAgentName)
+	if control.Assignee != "" {
+		t.Fatalf("review scope-check assignee = %q, want empty routed control-dispatcher queue", control.Assignee)
 	}
-	if got := control.Metadata["gc.routed_to"]; got != "" {
-		t.Fatalf("review scope-check gc.routed_to = %q, want empty direct dispatcher assignee", got)
+	if got := control.Metadata["gc.routed_to"]; got != config.ControlDispatcherAgentName {
+		t.Fatalf("review scope-check gc.routed_to = %q, want %q", got, config.ControlDispatcherAgentName)
 	}
 	if control.Metadata[graphroute.GraphExecutionRouteMetaKey] != "reviewer" {
 		t.Fatalf("review scope-check execution route = %q, want reviewer", control.Metadata[graphroute.GraphExecutionRouteMetaKey])
@@ -1415,6 +1415,7 @@ func TestDecorateDynamicFragmentRecipePreservesPoolFallbackAndScopeMetadata(t *t
 	cfg := &config.City{
 		Workspace: config.Workspace{Name: "test-city"},
 		Daemon:    config.DaemonConfig{FormulaV2: true},
+		Rigs:      []config.Rig{{Name: "frontend", Path: "frontend"}},
 		Agents: []config.Agent{
 			{Name: "reviewer", Dir: "frontend", MinActiveSessions: intPtr(1), MaxActiveSessions: intPtr(3)},
 		},
@@ -1489,11 +1490,11 @@ func TestDecorateDynamicFragmentRecipePreservesPoolFallbackAndScopeMetadata(t *t
 	if control.Metadata["gc.scope_role"] != "control" {
 		t.Fatalf("control gc.scope_role = %q, want control", control.Metadata["gc.scope_role"])
 	}
-	if control.Assignee != config.ControlDispatcherAgentName {
-		t.Fatalf("control assignee = %q, want %q", control.Assignee, config.ControlDispatcherAgentName)
+	if control.Assignee != "" {
+		t.Fatalf("control assignee = %q, want empty routed control-dispatcher queue", control.Assignee)
 	}
-	if got := control.Metadata["gc.routed_to"]; got != "" {
-		t.Fatalf("control gc.routed_to = %q, want empty direct dispatcher assignee", got)
+	if got := control.Metadata["gc.routed_to"]; got != "frontend/control-dispatcher" {
+		t.Fatalf("control gc.routed_to = %q, want frontend/control-dispatcher", got)
 	}
 	if control.Metadata[graphroute.GraphExecutionRouteMetaKey] != "frontend/reviewer" {
 		t.Fatalf("control execution route = %q, want frontend/reviewer", control.Metadata[graphroute.GraphExecutionRouteMetaKey])
@@ -1517,6 +1518,7 @@ func TestDecorateDynamicFragmentRecipeUsesDirectExecutionRoute(t *testing.T) {
 	cfg := &config.City{
 		Workspace: config.Workspace{Name: "test-city"},
 		Daemon:    config.DaemonConfig{FormulaV2: true},
+		Rigs:      []config.Rig{{Name: "frontend", Path: "frontend"}},
 	}
 	config.InjectImplicitAgents(cfg)
 	source := beads.Bead{
@@ -1568,8 +1570,11 @@ func TestDecorateDynamicFragmentRecipeUsesDirectExecutionRoute(t *testing.T) {
 	if !ok {
 		t.Fatal("missing expansion-review.check")
 	}
-	if check.Assignee != config.ControlDispatcherAgentName {
-		t.Fatalf("check assignee = %q, want %q", check.Assignee, config.ControlDispatcherAgentName)
+	if check.Assignee != "" {
+		t.Fatalf("check assignee = %q, want empty routed control-dispatcher queue", check.Assignee)
+	}
+	if got := check.Metadata["gc.routed_to"]; got != "frontend/control-dispatcher" {
+		t.Fatalf("check gc.routed_to = %q, want frontend/control-dispatcher", got)
 	}
 	if got := check.Metadata[graphroute.GraphExecutionRouteMetaKey]; got != direct.ID {
 		t.Fatalf("check execution route = %q, want direct session %s", got, direct.ID)
@@ -2940,6 +2945,25 @@ case "$*" in
 esac
 `)
 	assertJSONEqual(t, out, `[{"id":"ga-pending","metadata":{"gc.kind":"retry"}},{"id":"ga-ready","metadata":{"gc.kind":"scope-check"}}]`)
+}
+
+func TestWorkflowServeControlReadyQueryIncludesCanonicalRoutedControlWork(t *testing.T) {
+	query := workflowServeControlReadyQuery(config.Agent{Name: config.ControlDispatcherAgentName, Dir: "gascity"})
+	out := runWorkflowServeShellQueryForTest(t, query, map[string]string{
+		"GC_SESSION_NAME": "gascity--control-dispatcher",
+		"GC_ALIAS":        "gascity/control-dispatcher",
+	}, `#!/bin/sh
+set -eu
+case "$*" in
+  "--readonly --sandbox ready --metadata-field gc.routed_to=gascity/control-dispatcher --unassigned --exclude-type=epic --json --sort oldest --limit=20")
+    printf '[{"id":"ga-control-routed","metadata":{"gc.routed_to":"gascity/control-dispatcher","gc.kind":"workflow-finalize"}}]'
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`)
+	assertJSONEqual(t, out, `[{"id":"ga-control-routed","metadata":{"gc.routed_to":"gascity/control-dispatcher","gc.kind":"workflow-finalize"}}]`)
 }
 
 func TestWorkflowServeControlReadyQuerySkipsInstantiatingBeads(t *testing.T) {
@@ -4962,11 +4986,11 @@ func TestDecorateDynamicFragmentRecipeSynthesizesInheritedScopeChecks(t *testing
 	if control.Metadata["gc.scope_ref"] != "body" {
 		t.Fatalf("review scope-check gc.scope_ref = %q, want body", control.Metadata["gc.scope_ref"])
 	}
-	if control.Assignee != config.ControlDispatcherAgentName {
-		t.Fatalf("review scope-check assignee = %q, want %q", control.Assignee, config.ControlDispatcherAgentName)
+	if control.Assignee != "" {
+		t.Fatalf("review scope-check assignee = %q, want empty routed control-dispatcher queue", control.Assignee)
 	}
-	if got := control.Metadata["gc.routed_to"]; got != "" {
-		t.Fatalf("review scope-check gc.routed_to = %q, want empty direct dispatcher assignee", got)
+	if got := control.Metadata["gc.routed_to"]; got != config.ControlDispatcherAgentName {
+		t.Fatalf("review scope-check gc.routed_to = %q, want %q", got, config.ControlDispatcherAgentName)
 	}
 	if control.Metadata[graphroute.GraphExecutionRouteMetaKey] != "reviewer" {
 		t.Fatalf("review scope-check execution route = %q, want reviewer", control.Metadata[graphroute.GraphExecutionRouteMetaKey])

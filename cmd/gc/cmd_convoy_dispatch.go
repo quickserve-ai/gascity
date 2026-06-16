@@ -558,9 +558,18 @@ func decorateDynamicFragmentRecipe(fragment *formula.FragmentRecipe, source bead
 	if routingRigContext == "" {
 		routingRigContext = graphRouteRigContext(defaultRoute.QualifiedName)
 	}
-	controlRoute, err := controlDispatcherBinding(store, cityName, cfg, routingRigContext)
-	if err != nil {
-		return err
+	controlRoutes := map[string]graphRouteBinding{}
+	controlRouteFor := func(rigContext string) (graphRouteBinding, error) {
+		rigContext = strings.TrimSpace(rigContext)
+		if binding, ok := controlRoutes[rigContext]; ok {
+			return binding, nil
+		}
+		binding, err := controlDispatcherBinding(store, cityName, cfg, rigContext)
+		if err != nil {
+			return graphRouteBinding{}, err
+		}
+		controlRoutes[rigContext] = binding
+		return binding, nil
 	}
 
 	for i := range fragment.Steps {
@@ -603,12 +612,27 @@ func decorateDynamicFragmentRecipe(fragment *formula.FragmentRecipe, source bead
 			return err
 		}
 		if graphroute.IsControlDispatcherKind(step.Metadata[beadmeta.KindMetadataKey]) {
+			controlRigContext := graphRouteBindingRigContext(binding)
+			if controlRigContext == "" {
+				controlRigContext = routingRigContext
+			}
+			controlRoute, err := controlRouteFor(controlRigContext)
+			if err != nil {
+				return err
+			}
 			graphroute.AssignGraphStepRoute(step, binding, &controlRoute)
 			continue
 		}
 		graphroute.AssignGraphStepRoute(step, binding, nil)
 	}
 	return nil
+}
+
+func graphRouteBindingRigContext(binding graphRouteBinding) string {
+	if rigContext := strings.TrimSpace(binding.RigContext); rigContext != "" {
+		return rigContext
+	}
+	return graphRouteRigContext(binding.QualifiedName)
 }
 
 func decorateDrainItemRecipe(recipe *formula.Recipe, source beads.Bead, store beads.Store, storeRef, cityName, cityPath string, cfg *config.City) error {
