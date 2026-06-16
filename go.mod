@@ -7,7 +7,7 @@ require (
 	github.com/Masterminds/semver/v3 v3.4.0
 	github.com/danielgtaylor/huma/v2 v2.37.3
 	github.com/fsnotify/fsnotify v1.9.0
-	github.com/gastownhall/gascity-packs v0.3.1-0.20260616192436-39f07fed3524
+	github.com/gastownhall/gascity-packs v0.3.1-0.20260616205415-7aedf80cfa39
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674
