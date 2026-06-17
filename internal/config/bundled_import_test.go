@@ -494,6 +494,39 @@ func TestResolveInstalledRemoteImportNonBundledStillRequiresLock(t *testing.T) {
 	}
 }
 
+// TestResolveInstalledRemoteImportLockedBundledSelfHealsWhenCacheAbsent pins
+// the fresh/upgraded-binary fix: a LOCKED bundled source at its canonical pin
+// whose synthetic cache dir is ABSENT must rebuild offline from the binary's
+// embedded packs instead of hard-failing with "gc import install". A freshly
+// installed binary resolves a new content-hash cache dir (RepoCacheKey folds
+// the embedded-content hash), so the locked import's cache legitimately does
+// not exist yet — and the embedded content is always available offline, just
+// like the no-lock fallback. Guards the tutorial-blocking gc-fatal a fresh
+// rc binary hit on "gc start".
+func TestResolveInstalledRemoteImportLockedBundledSelfHealsWhenCacheAbsent(t *testing.T) {
+	home, cityDir := setupBundledImportTest(t)
+	source := bundledPackSource()
+	commit := canonicalBundledCommit(source)
+	writeBundledImportLock(t, cityDir, source, commit)
+	cacheDir := bundledRepoCacheDir(home, source, commit)
+	// Intentionally DO NOT materialize the cache: simulate the fresh-binary
+	// content-hash cache dir that does not exist yet.
+	if _, err := os.Stat(cacheDir); !os.IsNotExist(err) {
+		t.Fatalf("precondition: cache dir should be absent, stat err = %v", err)
+	}
+
+	got, err := resolveInstalledRemoteImport(source, "", cityDir)
+	if err != nil {
+		t.Fatalf("resolveInstalledRemoteImport locked+absent bundled cache: %v", err)
+	}
+	if got != cacheDir {
+		t.Fatalf("cacheDir = %q, want %q", got, cacheDir)
+	}
+	if err := builtinpacks.ValidateSyntheticRepo(got, commit); err != nil {
+		t.Fatalf("self-heal did not produce a valid synthetic cache: %v", err)
+	}
+}
+
 // TestResolveInstalledRemoteImportRejectsDeclaredNonCanonicalPinWithoutLock
 // pins the declared-version gate: a bundled source declared at a
 // non-canonical pin with no lock entry must NOT silently fall back to the
