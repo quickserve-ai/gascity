@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Pin the `beads` dependency to the stable v1.0.4.** v1.3.0 built against
+  `beads v1.0.5`, which was subsequently withdrawn (demoted to a pre-release;
+  `v1.0.4` is the current stable release). v1.3.1 repins the `beads` Go module
+  and the CI `bd` toolchain (`BD_VERSION`) to `v1.0.4`. No behavior change is
+  expected — Gas City already defaults to `bd_compatibility = "bd-1.0.4"`
+  semantics, and the config still accepts both `bd-1.0.4` and `bd-1.0.5`.
+
 ## [1.3.0] - 2026-06-18
 
 ### Upgrading Notes
