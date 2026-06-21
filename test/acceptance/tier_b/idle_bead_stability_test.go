@@ -28,10 +28,12 @@ func TestGastownIdleOpenBeadCountsStayBounded(t *testing.T) {
 	c.InitFrom(filepath.Join(helpers.ExamplesDir(), "gastown"))
 
 	// gc init --from starts a controller for the copied city. Restart under the
-	// isolated supervisor after installing the fast idle orders below. gc stop
-	// also unregisters the city, so no explicit unregister is needed.
+	// isolated supervisor after installing the fast idle orders below.
 	if out, err := c.GC("stop", c.Dir); err != nil {
 		t.Logf("gc stop after init-from: %v\n%s", err, out)
+	}
+	if out, err := c.GC("unregister", c.Dir); err != nil {
+		t.Logf("gc unregister after init-from: %v\n%s", err, out)
 	}
 
 	rewriteGastownPatrolInterval(t, c.Dir, "1s")

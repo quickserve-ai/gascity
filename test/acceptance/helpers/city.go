@@ -18,12 +18,13 @@ import (
 // isolated environment, providing high-level methods that shell out to
 // the real gc binary.
 type City struct {
-	t       *testing.T
-	Dir     string
-	Env     *Env
-	started bool
-	cmd     *exec.Cmd
-	logFile *os.File
+	t              *testing.T
+	Dir            string
+	Env            *Env
+	started        bool
+	usedSupervisor bool
+	cmd            *exec.Cmd
+	logFile        *os.File
 }
 
 // NewCity creates a temp directory for a city and returns the DSL handle.
@@ -228,10 +229,12 @@ func (c *City) Stop() {
 		return
 	}
 	c.started = false
-	// Best-effort stop — don't fail the test on cleanup errors. gc stop also
-	// unregisters a supervisor-registered city, so no explicit unregister is
-	// needed here.
+	// Best-effort stop — don't fail the test on cleanup errors.
 	RunGC(c.Env, c.Dir, "stop", c.Dir) //nolint:errcheck
+	if c.usedSupervisor {
+		RunGC(c.Env, c.Dir, "unregister", c.Dir) //nolint:errcheck
+		c.usedSupervisor = false
+	}
 	if c.cmd != nil {
 		done := make(chan struct{})
 		go func() {
@@ -256,10 +259,11 @@ func (c *City) Stop() {
 
 func (c *City) cleanupRuntime() {
 	c.t.Helper()
-	// gc stop unregisters a supervisor-registered city, so a follow-up gc
-	// unregister would now fail loudly on the already-cleared registry.
 	if out, err := RunGC(c.Env, c.Dir, "stop", c.Dir); err != nil {
 		c.t.Logf("cleanup: gc stop %s: %v\n%s", c.Dir, err, out)
+	}
+	if out, err := RunGC(c.Env, c.Dir, "unregister", c.Dir); err != nil {
+		c.t.Logf("cleanup: gc unregister %s: %v\n%s", c.Dir, err, out)
 	}
 	if out, err := RunGC(c.Env, "", "supervisor", "stop", "--wait"); err != nil {
 		c.t.Logf("cleanup: gc supervisor stop --wait: %v\n%s", err, out)
@@ -268,11 +272,11 @@ func (c *City) cleanupRuntime() {
 
 func (c *City) cleanupScaffoldOnly() {
 	c.t.Helper()
-	// gc stop unregisters the city when it is registered, so an explicit gc
-	// unregister is unnecessary and would now fail loudly on an unregistered
-	// scaffold-only city.
 	if out, err := RunGC(c.Env, c.Dir, "stop", c.Dir); err != nil {
 		c.t.Logf("cleanup: gc stop %s: %v\n%s", c.Dir, err, out)
+	}
+	if out, err := RunGC(c.Env, c.Dir, "unregister", c.Dir); err != nil {
+		c.t.Logf("cleanup: gc unregister %s: %v\n%s", c.Dir, err, out)
 	}
 }
 
