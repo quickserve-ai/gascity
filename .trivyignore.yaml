@@ -84,3 +84,19 @@ vulnerabilities:
       - "usr/local/bin/dolt"
     expired_at: 2026-07-07
     statement: Latest Dolt 1.88.0 still embeds github.com/apache/thrift v0.13.1; remove after a Dolt release includes thrift 0.23.0 or later.
+  # HIGH severity, fixed upstream. Both CVEs below are present ONLY via the
+  # deliberate steveyegge/beads v1.0.4 repin (v1.0.5 has data corruption) in the
+  # bundled bd CLI binary. bd is a local CLI: the affected apache/thrift and
+  # go-jose/go-jose/v4 code paths are non-network in this usage (no thrift RPC
+  # server, no JWE handling). Waiver expires when gascity moves off bd 1.0.4
+  # (tracking: move gascity off bd v1.0.4). Do not bump bd here.
+  - id: CVE-2026-41602
+    paths:
+      - "usr/local/bin/bd"
+    expired_at: 2026-07-07
+    statement: "HIGH, fixed upstream (apache/thrift). Present only via the deliberate steveyegge/beads v1.0.4 repin (v1.0.5 has data corruption), in the bundled bd CLI binary on non-network thrift paths. Remove when gascity moves off bd 1.0.4 (tracking: move gascity off bd v1.0.4)."
+  - id: CVE-2026-34986
+    paths:
+      - "usr/local/bin/bd"
+    expired_at: 2026-07-07
+    statement: "HIGH, fixed upstream (go-jose/go-jose/v4). Present only via the deliberate steveyegge/beads v1.0.4 repin (v1.0.5 has data corruption), in the bundled bd CLI binary on non-network JWE paths. Remove when gascity moves off bd 1.0.4 (tracking: move gascity off bd v1.0.4)."
