@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.2] - 2026-06-22
+
+### Fixed
+
+- **Install Codex skills into `.agents/skills`.** Skill materialization now uses
+  Codex's actual skill sink instead of the stale `.codex/skills` path.
+- **Materialize rig skills during `gc rig add`.** Adding a rig now writes its
+  skills immediately, including for rigs sourced from outside the city tree.
+
 ## [1.3.1] - 2026-06-19
 
 ### Fixed
