@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -120,5 +121,121 @@ func TestSkillInstallDirsPerProviderAcrossScopes(t *testing.T) {
 
 	if stderr.Len() > 0 {
 		t.Logf("stderr:\n%s", stderr.String())
+	}
+}
+
+// TestMaterializeSkillsForCityCoversOutOfTreeRig is a focused unit test of the
+// materializeSkillsForCity helper (the pass `gc rig add` runs). It feeds the
+// real on-disk state a successful add leaves behind — a city-as-pack plus an
+// out-of-tree rig bound via .gc/site.toml — through the real
+// load+compose+materialize path and asserts the rig's own co-located sinks are
+// written (codex's .agents/skills, claude's .claude/skills). The end-to-end
+// wiring from the `gc rig add` command (both output modes) is guarded
+// separately by TestRigAddCommandMaterializesSkills.
+func TestMaterializeSkillsForCityCoversOutOfTreeRig(t *testing.T) {
+	clearGCEnv(t)
+	cityPath := t.TempDir()
+	t.Setenv("GC_CITY", cityPath)
+	t.Setenv("GC_HOME", t.TempDir())
+
+	// Out-of-tree rig: a sibling temp dir, not under cityPath.
+	outOfTreeRig := filepath.Join(t.TempDir(), "temp-rig")
+	if err := os.MkdirAll(outOfTreeRig, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Minimal city-as-pack: a shared "mayor" skill, claude+codex providers
+	// (so InjectImplicitAgents creates per-rig agents), and the out-of-tree
+	// rig registered — the on-disk state `gc rig add` leaves behind (the rig
+	// path is a .gc/site.toml binding, not a city.toml rig.path).
+	cityTOML := "[workspace]\nname = \"test-city\"\n\n" +
+		"[beads]\nprovider = \"file\"\n\n" +
+		"[session]\nprovider = \"tmux\"\n\n" +
+		"[providers.claude]\ncommand = \"claude\"\n\n" +
+		"[providers.codex]\ncommand = \"codex\"\n\n" +
+		"[[rigs]]\nname = \"temp-rig\"\n"
+	writeMaterializeTestCityFile(t, cityPath, "city.toml", cityTOML)
+	writeMaterializeTestCityFile(t, cityPath, "pack.toml", "[pack]\nname = \"test\"\nversion = \"0.1.0\"\nschema = 2\n")
+	writeBuiltinImportsFixture(t, cityPath, "core")
+	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeMaterializeTestCityFile(t, filepath.Join(cityPath, ".gc"), "site.toml",
+		fmt.Sprintf("[[rig]]\nname = \"temp-rig\"\npath = %q\n", outOfTreeRig))
+	writeSkillSource(t, filepath.Join(cityPath, "skills", "mayor"))
+
+	// The behavior under test: gc rig add materializes synchronously.
+	var stderr bytes.Buffer
+	materializeSkillsForCity(cityPath, &stderr)
+
+	for _, sink := range []string{".agents/skills", ".claude/skills"} {
+		link := filepath.Join(outOfTreeRig, filepath.FromSlash(sink), "mayor")
+		if _, err := os.Lstat(link); err != nil {
+			t.Errorf("out-of-tree rig missing skill right after add: %s (%v)", link, err)
+		}
+	}
+	if t.Failed() {
+		t.Logf("stderr:\n%s", stderr.String())
+	}
+}
+
+// TestRigAddCommandMaterializesSkills is the end-to-end wiring guard for issue
+// #3643: it drives the real `gc rig add` command (via run) for an out-of-tree
+// rig and asserts the codex sink (.agents/skills) lands immediately — for BOTH
+// the human and --json output modes. The --json path is a distinct code branch
+// in newRigAddCmd that bypasses cmdRigAdd, so without its own materialize call
+// `gc rig add <out-of-tree> --json` silently reproduces the #3643 symptom; this
+// test fails if either branch loses the materialization step.
+func TestRigAddCommandMaterializesSkills(t *testing.T) {
+	clearGCEnv(t)
+	cityPath := t.TempDir()
+	t.Setenv("GC_CITY", cityPath)
+	t.Setenv("GC_HOME", t.TempDir())
+	// doRigAdd beads init: file-backed, no dolt — matches TestDoRigAdd_Basic.
+	t.Setenv("GC_DOLT", "skip")
+	t.Setenv("GC_BEADS", "bd")
+
+	// City-as-pack with claude+codex providers and a shared "mayor" skill.
+	cityTOML := "[workspace]\nname = \"test-city\"\n\n" +
+		"[session]\nprovider = \"tmux\"\n\n" +
+		"[providers.claude]\ncommand = \"claude\"\n\n" +
+		"[providers.codex]\ncommand = \"codex\"\n"
+	writeMaterializeTestCityFile(t, cityPath, "city.toml", cityTOML)
+	writeMaterializeTestCityFile(t, cityPath, "pack.toml", "[pack]\nname = \"test-city\"\nschema = 2\n")
+	writeBuiltinImportsFixture(t, cityPath, "core")
+	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeMaterializeTestCityFile(t, filepath.Join(cityPath, ".gc"), "site.toml", "workspace_name = \"test-city\"\n")
+	writeSkillSource(t, filepath.Join(cityPath, "skills", "mayor"))
+
+	for _, tc := range []struct {
+		name string
+		json bool
+	}{
+		{"human", false},
+		{"json", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Out-of-tree rig: a sibling temp dir, not under cityPath.
+			outRig := filepath.Join(t.TempDir(), "rig-"+tc.name)
+			if err := os.MkdirAll(outRig, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			args := []string{"rig", "add", outRig, "--name", "rig-" + tc.name}
+			if tc.json {
+				args = append(args, "--json")
+			}
+			var stdout, stderr bytes.Buffer
+			if code := run(args, &stdout, &stderr); code != 0 {
+				t.Fatalf("run %v = %d\nstderr:\n%s", args, code, stderr.String())
+			}
+			// codex's sink must exist in the rig's own dir right after add.
+			link := filepath.Join(outRig, ".agents", "skills", "mayor")
+			if _, err := os.Lstat(link); err != nil {
+				t.Errorf("%s mode: codex skill not materialized at %s: %v\nstderr:\n%s",
+					tc.name, link, err, stderr.String())
+			}
+		})
 	}
 }
