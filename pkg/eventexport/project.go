@@ -131,6 +131,7 @@ type Envelope struct {
 	Ref       string `json:"ref,omitempty"`        // id-regex-gated reference (opaque id/slug only)
 	RunID     string `json:"run_id,omitempty"`     // opaque run-root correlation id (safeRef-gated)
 	SessionID string `json:"session_id,omitempty"` // opaque session correlation id (safeRef-gated)
+	StepID    string `json:"step_id,omitempty"`    // opaque acting-work-bead (run step) id (safeRef-gated)
 }
 
 // Batch is one POST body: the events for a single city. CityHash is a salted,
@@ -220,6 +221,9 @@ func ProjectEvent(te TaggedEvent, opt Options) (Envelope, bool) {
 		if s := safeRef(te.SessionID); s != "" {
 			env.SessionID = s
 		}
+		if st := safeRef(te.StepID); st != "" {
+			env.StepID = st
+		}
 	}
 	return env, true
 }
@@ -241,7 +245,7 @@ func ValidateEnvelope(env Envelope) error {
 		return fmt.Errorf("eventexport: invalid ts %q", env.TS)
 	}
 	if mailReduced[env.Type] {
-		if env.ActorHash != "" || env.Ref != "" || env.RunID != "" || env.SessionID != "" {
+		if env.ActorHash != "" || env.Ref != "" || env.RunID != "" || env.SessionID != "" || env.StepID != "" {
 			return fmt.Errorf("eventexport: %q must carry only {seq,type,ts}", env.Type)
 		}
 		return nil
@@ -262,6 +266,9 @@ func ValidateEnvelope(env Envelope) error {
 	}
 	if env.SessionID != "" && !IsOpaqueRef(env.SessionID) {
 		return fmt.Errorf("eventexport: session_id %q is not an opaque id", env.SessionID)
+	}
+	if env.StepID != "" && !IsOpaqueRef(env.StepID) {
+		return fmt.Errorf("eventexport: step_id %q is not an opaque id", env.StepID)
 	}
 	return nil
 }

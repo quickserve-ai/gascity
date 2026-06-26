@@ -670,7 +670,11 @@ func (c *CachingStore) notifyChange(eventType string, b Bead) {
 	// safeRef-gated again at the export boundary.
 	runID := beadmeta.ResolveRunID(b.Metadata, b.ID, "")
 	sessionID := b.Metadata[beadmeta.SessionIDMetadataKey]
-	c.onChange(eventType, b.ID, runID, sessionID, payload)
+	// step_id is the acting work bead the lifecycle event is about: a work/dispatch
+	// bead carries its own gc.step_id, so a bead.created/closed on one stamps that
+	// step. Non-work beads (sessions, mail, …) carry none → empty, omitted at export.
+	stepID := b.Metadata[beadmeta.StepIDMetadataKey]
+	c.onChange(eventType, b.ID, runID, sessionID, stepID, payload)
 }
 
 type cacheNotification struct {

@@ -124,6 +124,37 @@ func TestProjectEvent_RunSessionGating(t *testing.T) {
 	}
 }
 
+// step_id (the acting work bead) is gated exactly like run/session: EmitCorrelation
+// fail-closed, safeRef-opaque-only, never on mail-reduced types, empty when the
+// subject bead carries no gc.step_id.
+func TestProjectEvent_StepIDGating(t *testing.T) {
+	te := func(step string) TaggedEvent {
+		return TaggedEvent{Seq: 1, Type: "bead.closed", Ts: fixedTS, Actor: "gc", Subject: "mc-1", RunID: "wf-root-abc", SessionID: "sess-9f2a", StepID: step}
+	}
+	off := Options{Salt: testSalt, ExportRef: true}
+	if g, _ := ProjectEvent(te("mc-step-7"), off); g.StepID != "" {
+		t.Fatalf("EmitCorrelation=false must drop step_id, got %q", g.StepID)
+	}
+	on := Options{Salt: testSalt, ExportRef: true, EmitCorrelation: true}
+	if g, ok := ProjectEvent(te("mc-step-7"), on); !ok || g.StepID != "mc-step-7" {
+		t.Fatalf("opaque step_id must round-trip when emitted, got %q ok=%v", g.StepID, ok)
+	}
+	for _, bad := range []string{"gascity/codex", "user@host", "Up Per", "a b"} {
+		if g, _ := ProjectEvent(te(bad), on); g.StepID != "" {
+			t.Fatalf("non-opaque step_id %q must drop to empty, got %q", bad, g.StepID)
+		}
+	}
+	mail := te("mc-step-7")
+	mail.Type = "mail.sent"
+	if g, _ := ProjectEvent(mail, on); g.StepID != "" {
+		t.Fatalf("mail.sent must not carry step_id, got %q", g.StepID)
+	}
+	// A non-work bead carries no gc.step_id → empty, omitted cleanly (no error).
+	if g, ok := ProjectEvent(te(""), on); !ok || g.StepID != "" {
+		t.Fatalf("empty step_id must be omitted cleanly, got %q ok=%v", g.StepID, ok)
+	}
+}
+
 // TestProject_NoLeak feeds the projection a corpus carrying the sensitive markers
 // the raw stream holds — in the primitive fields the projection actually receives
 // — and proves none survive into the marshaled batch. The adapter-level

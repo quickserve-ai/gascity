@@ -27,6 +27,7 @@ type TaggedEvent struct {
 	Subject   string
 	RunID     string
 	SessionID string
+	StepID    string
 	_         struct{} // force keyed literals; blocks positional field transposition
 }
 

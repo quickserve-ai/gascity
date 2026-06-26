@@ -34,9 +34,9 @@ func TestGoldenWireBytes(t *testing.T) {
 			want: `{"seq":60,"type":"mail.sent","ts":"2026-06-21T10:03:27Z"}`,
 		},
 		{
-			name: "populated run_id/session_id appear after actor_hash/ref",
-			env:  Envelope{Seq: 2, Type: "bead.created", TS: "2026-06-21T10:03:27Z", ActorHash: "0123456789abcdef", Ref: "mc-2", RunID: "wf-root-abc", SessionID: "sess-9f2a"},
-			want: `{"seq":2,"type":"bead.created","ts":"2026-06-21T10:03:27Z","actor_hash":"0123456789abcdef","ref":"mc-2","run_id":"wf-root-abc","session_id":"sess-9f2a"}`,
+			name: "populated run_id/session_id/step_id appear after actor_hash/ref",
+			env:  Envelope{Seq: 2, Type: "bead.created", TS: "2026-06-21T10:03:27Z", ActorHash: "0123456789abcdef", Ref: "mc-2", RunID: "wf-root-abc", SessionID: "sess-9f2a", StepID: "mc-step-7"},
+			want: `{"seq":2,"type":"bead.created","ts":"2026-06-21T10:03:27Z","actor_hash":"0123456789abcdef","ref":"mc-2","run_id":"wf-root-abc","session_id":"sess-9f2a","step_id":"mc-step-7"}`,
 		},
 	}
 	for _, tc := range cases {

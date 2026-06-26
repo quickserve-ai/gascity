@@ -246,6 +246,7 @@ type Event struct {
 	Payload   json.RawMessage `json:"payload,omitempty"`
 	RunID     string          `json:"run_id,omitempty"`
 	SessionID string          `json:"session_id,omitempty"`
+	StepID    string          `json:"step_id,omitempty"`
 }
 
 // Recorder records events. Safe for concurrent use. Best-effort.

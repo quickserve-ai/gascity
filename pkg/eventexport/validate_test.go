@@ -47,7 +47,9 @@ func TestValidateEnvelope_Rejects(t *testing.T) {
 		"non-opaque ref":      {Seq: 1, Type: "bead.closed", TS: rfc(t), Ref: "a/b"},
 		"non-opaque run_id":   {Seq: 1, Type: "bead.closed", TS: rfc(t), RunID: "a/b"},
 		"non-opaque session":  {Seq: 1, Type: "bead.closed", TS: rfc(t), SessionID: "A@b"},
+		"non-opaque step_id":  {Seq: 1, Type: "bead.closed", TS: rfc(t), StepID: "a/b"},
 		"mail with extras":    {Seq: 1, Type: "mail.sent", TS: rfc(t), ActorHash: "0123456789abcdef"},
+		"mail with step_id":   {Seq: 1, Type: "mail.sent", TS: rfc(t), StepID: "mc-step-1"},
 	}
 	for name, env := range cases {
 		if err := ValidateEnvelope(env); err == nil {
@@ -151,7 +153,10 @@ func TestProfileZeroValue(t *testing.T) {
 // author to gate it in ProjectEvent + ValidateEnvelope (and bump SchemaVersion if
 // the wire changes) rather than letting it ship ungated.
 func TestEnvelopeFieldCount(t *testing.T) {
-	if n := reflect.TypeOf(Envelope{}).NumField(); n != 7 {
+	// 8 = the original 7 + step_id, added as a version-NEUTRAL optional correlation
+	// field (gated in ProjectEvent + ValidateEnvelope exactly like run_id/session_id),
+	// so SchemaVersion is unchanged — a pinned receiver still accepts a populated batch.
+	if n := reflect.TypeOf(Envelope{}).NumField(); n != 8 {
 		t.Fatalf("Envelope has %d fields; a field changed — gate it in ProjectEvent and ValidateEnvelope, then update this guard (and bump SchemaVersion if the wire changes)", n)
 	}
 }
