@@ -1429,6 +1429,21 @@ func (m *Manager) GetWithBead(id string) (Info, beads.Bead, error) {
 	return m.infoFromBead(b), b, nil
 }
 
+// GetWithPersistedResponse returns the runtime-enriched session Info plus the
+// persisted-response projection (status + metadata) in a single store fetch.
+// It is the domain-typed read the API response path routes through: the caller
+// gets session.Info for the scalar/runtime fields and session.PersistedResponse
+// for the status/metadata-derived fields, without a raw *beads.Bead crossing the
+// boundary or a redundant second store.Get beside Get. Bead serialization stays
+// confined here via PersistedResponseFromBead.
+func (m *Manager) GetWithPersistedResponse(id string) (Info, PersistedResponse, error) {
+	info, b, err := m.GetWithBead(id)
+	if err != nil {
+		return Info{}, PersistedResponse{}, err
+	}
+	return info, PersistedResponseFromBead(b), nil
+}
+
 // SessionInfoFromBead converts an already-loaded session bead to Info,
 // applying the same enrichment as Get. Callers that have just resolved
 // the bead can use this to avoid a second store.Get.
@@ -1544,55 +1559,30 @@ func (m *Manager) Peek(id string, lines int) (string, error) {
 	return m.sp.Peek(sessName, lines)
 }
 
-// infoFromBead converts a bead to an Info struct, enriching with runtime state.
+// infoFromBead converts a bead to an Info struct, enriching the persisted
+// projection (InfoFromPersistedBead) with live runtime state. The persisted
+// fields come from the shared codec so the manager and the Info-typed domain
+// store agree on the storage projection; only the runtime overlay (transport
+// detection, ACP routing, stale-state downgrade, attachment/last-active) lives
+// here, where the runtime provider is available.
 func (m *Manager) infoFromBead(b beads.Bead) Info {
-	sessName := b.Metadata["session_name"]
-	if sessName == "" {
-		sessName = sessionNameFor(b.ID)
-	}
-	closed := b.Status == "closed"
-	transport := transportFromMetadata(b)
-	if !closed {
-		transport, _ = m.transportForBead(b, sessName)
-		_ = m.routeACPIfNeeded(b.Metadata["provider"], transport, sessName)
-	}
+	info := InfoFromPersistedBead(b)
+	sessName := info.SessionName
 
-	state := normalizeInfoState(State(b.Metadata["state"]))
-	if closed {
-		state = "" // closed beads have no runtime state
-	} else if m.sp != nil && state == StateActive && !m.sp.IsRunning(sessName) {
+	if !info.Closed {
+		transport, _ := m.transportForBead(b, sessName)
+		info.Transport = transport
+		_ = m.routeACPIfNeeded(b.Metadata["provider"], transport, sessName)
+
 		// Surface stale "awake" / "active" beads as dormant immediately.
 		// The controller also heals metadata on the next tick.
-		state = StateAsleep
-	}
-
-	info := Info{
-		ID:            b.ID,
-		Template:      b.Metadata["template"],
-		State:         state,
-		Closed:        closed,
-		Title:         b.Title,
-		Alias:         b.Metadata["alias"],
-		AgentName:     b.Metadata["agent_name"],
-		Provider:      b.Metadata["provider"],
-		Transport:     transport,
-		Command:       b.Metadata["command"],
-		WorkDir:       b.Metadata["work_dir"],
-		SessionName:   sessName,
-		SessionKey:    b.Metadata["session_key"],
-		ResumeFlag:    b.Metadata["resume_flag"],
-		ResumeStyle:   b.Metadata["resume_style"],
-		ResumeCommand: b.Metadata["resume_command"],
-		CreatedAt:     b.CreatedAt,
-	}
-	if raw := strings.TrimSpace(b.Metadata[MetadataLastNudgeDeliveredAt]); raw != "" {
-		if parsed, err := time.Parse(time.RFC3339, raw); err == nil {
-			info.LastNudgeDeliveredAt = parsed
+		if m.sp != nil && info.State == StateActive && !m.sp.IsRunning(sessName) {
+			info.State = StateAsleep
 		}
 	}
 
 	// Enrich with live runtime state if active.
-	if state == StateActive && m.sp != nil {
+	if info.State == StateActive && m.sp != nil {
 		info.Attached = m.sp.IsAttached(sessName)
 		if t, err := m.sp.GetLastActivity(sessName); err == nil && !t.IsZero() {
 			info.LastActive = t

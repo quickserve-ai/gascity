@@ -145,7 +145,7 @@ func newControllerState(
 		store := opened.Store
 		cs.cityBeadStore = wrapWithCachingStore(ctx, store, ep, true)
 		cs.cityBeadsDiagnostic = diagnosticPtr(opened.Diagnostic)
-		cs.cityMailProv = newMailProvider(cs.cityBeadStore)
+		cs.cityMailProv = newCityMailProvider(cs.cityBeadStore, cfg, cityPath, ep)
 		svc := extmsg.NewServices(cs.cityBeadStore)
 		cs.extmsgSvc = &svc
 	}
@@ -514,10 +514,16 @@ func (cs *controllerState) runBeadCloseAutoclose(beadID string, store beads.Stor
 	if cs.eventProv != nil {
 		rec = cs.eventProv
 	}
+	// The just-closed bead is read from its owning store (store), but its
+	// molecule and wisp GRAPH parents live in the graph-class store, so the
+	// graph-root walks resolve through graphBeadStore() rather than assuming
+	// co-residence with the closed bead. On a single-store city GraphBeadStore()
+	// returns the same store, so this is identity today.
+	graphStore := cs.GraphBeadStore()
 	beadCloseAutocloseDispatch(func() {
 		doConvoyAutocloseWith(store, rec, beadID, os.Stderr, os.Stderr)
-		doWispAutocloseWith(store, beadID, os.Stderr)
-		doMoleculeAutocloseWith(store, storeRef, rec, beadID, os.Stderr)
+		doWispAutocloseWith(store, beadID, os.Stderr, graphStore.Store)
+		doMoleculeAutocloseWith(store, storeRef, rec, beadID, os.Stderr, graphStore.Store)
 	})
 }
 
@@ -542,6 +548,25 @@ func (cs *controllerState) beadEventStoresLocked(evt events.Event) []beads.Store
 }
 
 func (cs *controllerState) beadEventConfiguredStoreLocked(id string) (beads.Store, bool) {
+	// A configured prefix owns the id even when its store is not loaded: the
+	// caller treats a (nil, true) result as "owned but absent here" and skips
+	// the all-stores fallback, so nil stores are passed in as candidates.
+	//
+	// The candidate set is class-tagged: the city store under the HQ prefix is
+	// the graph/sessions/mail/nudge/order class store, and each rig store under
+	// its rig prefix is that rig's work-class store. On a single-store city these
+	// all collapse to the same value, so the resolution is identical today; the
+	// tagging marks where a future per-class backend would diverge. These read
+	// the raw cs fields rather than the class accessors (graphBeadStore /
+	// workBeadStores) because this runs under cs.mu and those accessors take the
+	// same lock.
+	//
+	// The scan is a longest-prefix, namespace-only ("prefix-") match over the
+	// configured prefixes, returning known=true when a configured prefix owns id
+	// even if that prefix's store is not loaded (matchedStore stays nil). That
+	// owned-but-unloaded signal is the call-site contract — the caller suppresses
+	// the all-stores fallback on known — so the scan resolves against the
+	// configured prefixes inline rather than each store's own IDPrefix.
 	var matchedStore beads.Store
 	matchedLen := -1
 	match := func(prefix string, store beads.Store) {
@@ -596,7 +621,7 @@ func (cs *controllerState) update(cfg *config.City, sp runtime.Provider) {
 	var extSvc *extmsg.Services
 	if cityStore != nil {
 		cityStore = wrapWithCachingStore(cs.cacheCtx, cityStore, cs.eventProv, true)
-		cityMailProv = newMailProvider(cityStore)
+		cityMailProv = newCityMailProvider(cityStore, cfg, cs.cityPath, cs.eventProv)
 		svc := extmsg.NewServices(cityStore)
 		extSvc = &svc
 	}
@@ -1100,6 +1125,49 @@ func (cs *controllerState) CityBeadStore() beads.Store {
 	cs.mu.RLock()
 	defer cs.mu.RUnlock()
 	return cs.cityBeadStore
+}
+
+// NudgesBeadStore returns the store backing the nudge-queue shadow beads. At the
+// default backend resolveNudgesStore returns cityBeadStore, so this is byte-identical
+// to CityBeadStore; when [beads.classes.nudges] is relocated it returns the per-class
+// store. cs.eventProv is the recorder (an events.Recorder), matching how the city mail
+// store is wired (newCityMailProvider), so relocated writes through this store emit
+// bead.* exactly like the controller's own nudge writes. The result is wrapped in the
+// strongly-typed beads.NudgesStore so the nudges class is statically visible to callers;
+// the wrapper carries the same underlying store value, so runtime behavior is unchanged.
+func (cs *controllerState) NudgesBeadStore() beads.NudgesStore {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	return beads.NudgesStore{Store: resolveNudgesStore(cs.cityBeadStore, cs.cfg, cs.cityPath, cs.eventProv)}
+}
+
+// SessionsBeadStore returns the store backing session-class beads. At the default
+// backend resolveSessionStore returns cityBeadStore, so this is byte-identical to
+// CityBeadStore; when [beads.classes.sessions] is relocated it returns the per-class
+// store. cs.eventProv is the recorder, matching the nudges/mail wiring, so relocated
+// session writes emit bead.* exactly like the controller's own session writes. The
+// result is wrapped in the strongly-typed beads.SessionStore so the session class is
+// statically visible to callers; the wrapper carries the same underlying store value,
+// so runtime behavior is unchanged.
+func (cs *controllerState) SessionsBeadStore() beads.SessionStore {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	return beads.SessionStore{Store: resolveSessionStore(cs.cityBeadStore, cs.cfg, cs.cityPath, cs.eventProv)}
+}
+
+// GraphBeadStore returns the store backing graph-class beads. At the default backend
+// resolveGraphStore returns cityBeadStore, so this is byte-identical to CityBeadStore;
+// when [beads.classes.graph] is relocated it returns the dedicated graph store at the
+// legacy .gc/beads.sqlite location (or the gcg Postgres schema). cs.eventProv is
+// passed for signature parity with the other accessors but is ignored by
+// resolveGraphStore: the graph store stays event-silent, matching the prior Router
+// graph leg. The result is wrapped in the strongly-typed beads.GraphStore so the
+// graph class is statically visible to callers; the wrapper carries the same
+// underlying store value, so runtime behavior is unchanged.
+func (cs *controllerState) GraphBeadStore() beads.GraphStore {
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	return beads.GraphStore{Store: resolveGraphStore(cs.cityBeadStore, cs.cfg, cs.cityPath, cs.eventProv)}
 }
 
 // CityBeadsDiagnostic returns the city-level bead store selection diagnostic.

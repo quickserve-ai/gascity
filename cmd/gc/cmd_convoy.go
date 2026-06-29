@@ -532,16 +532,29 @@ func resolveConvoyStore(convoyID string, cfg *config.City, cityPath string, open
 // candidate rooted at cityPath. It returns an error when beadID resolves in
 // more than one store (ambiguous) and beads.ErrNotFound when no candidate
 // holds it.
+//
+// The candidate set is the convoy class-store ordering (the graph store the
+// convoy bead lives in, plus the per-rig work stores its members may live in).
+// The scan does not stop at the first hit: it probes every candidate so a bead
+// present in more than one store is rejected rather than silently resolved to
+// one, enforcing the "resolution requires a uniquely addressable bead id"
+// contract. A candidate's not-found probe is skipped; any other error is
+// returned immediately. The returned directory maps back to the owning
+// candidate.
 func resolveOwningStoreDir(beadID string, cfg *config.City, cityPath string, openStore func(string) (beads.Store, error)) (beads.Store, string, error) {
-	stores, err := openConvoyStores(cfg, cityPath, beadID, openStore)
+	candidates, err := openConvoyStores(cfg, cityPath, beadID, openStore)
 	if err != nil {
 		return nil, "", err
 	}
-	var foundStore beads.Store
-	foundDir := ""
-	for _, candidate := range stores {
-		store := candidate.store
-		if _, err := store.Get(beadID); err != nil {
+	var (
+		foundStore beads.Store
+		foundDir   string
+	)
+	for _, candidate := range candidates {
+		if candidate.store == nil {
+			continue
+		}
+		if _, err := candidate.store.Get(beadID); err != nil {
 			if errors.Is(err, beads.ErrNotFound) {
 				continue
 			}
@@ -550,13 +563,13 @@ func resolveOwningStoreDir(beadID string, cfg *config.City, cityPath string, ope
 		if foundStore != nil {
 			return nil, "", fmt.Errorf("bead %s exists in multiple stores (%s and %s); resolution requires a uniquely addressable bead id", beadID, foundDir, candidate.path)
 		}
-		foundStore = store
+		foundStore = candidate.store
 		foundDir = candidate.path
 	}
-	if foundStore != nil {
-		return foundStore, foundDir, nil
+	if foundStore == nil {
+		return nil, "", beads.ErrNotFound
 	}
-	return nil, "", beads.ErrNotFound
+	return foundStore, foundDir, nil
 }
 
 func openAllConvoyStores(stderr io.Writer, cmdName string) ([]convoyStoreView, int) {

@@ -35,6 +35,9 @@ import (
 )
 
 const (
+	// labelOrderTracking is the label applied to order-dispatch tracking beads.
+	// coordclass mirrors this string privately (as labelOrderTracking) for store
+	// routing; the two must stay in sync.
 	labelOrderTracking    = "order-tracking"
 	labelTriggerEnvFailed = "trigger-env-failed"
 

@@ -1135,6 +1135,18 @@ func (r *Rig) EffectivePrefix() string {
 	return DeriveBeadsPrefix(r.Name)
 }
 
+// Coordination class names, mirroring coordclass.Class.String(). They are part of
+// the [beads.classes.<name>] config contract and must not change without a
+// migration.
+const (
+	BeadClassWork      = "work"
+	BeadClassGraph     = "graph"
+	BeadClassMessaging = "messaging"
+	BeadClassSessions  = "sessions"
+	BeadClassOrders    = "orders"
+	BeadClassNudges    = "nudges"
+)
+
 // EffectiveDefaultBranch returns the rig's recorded default branch, or the
 // empty string if none is set. Callers should fall back to a runtime probe
 // (e.g., git symbolic-ref) when this returns "".
@@ -4781,6 +4793,16 @@ func validateDependsOn(agents []Agent) error {
 // ValidateRigs checks rig configurations for errors. It returns an error if
 // any rig is missing required fields, has duplicate names, or has colliding
 // prefixes. The hqPrefix is the city's HQ prefix for collision checks.
+//
+// Reserved coordination-class id-prefixes (gcg/gcm/gcs/gco/gcn) are not rejected
+// here. On a default city the relocated SQLite class stores are an identity
+// seam — every class store resolves to the work store and the by-id class-prefix
+// routing arm never fires — so a work prefix that shadows one is harmless until
+// the multi-backend fork makes per-class stores independently routable. Making
+// the prefix fatal would break gc start and config reload for an existing city
+// that already uses one, so ReservedPrefixWarnings surfaces it as a non-fatal
+// advisory instead. Promote it back into a hard error here once per-class
+// routing activates.
 func ValidateRigs(rigs []Rig, hqPrefix string) error {
 	seenNames := make(map[string]bool, len(rigs))
 	seenPrefixes := make(map[string]string) // lowercase prefix → rig name (for error messages)
@@ -4813,6 +4835,29 @@ func ValidateRigs(rigs []Rig, hqPrefix string) error {
 		seenPrefixes[prefix] = r.Name
 	}
 	return nil
+}
+
+// ReservedPrefixWarnings returns advisory warnings for any effective HQ or rig
+// work-store prefix that shadows a reserved coordination-class id-prefix
+// (gcg/gcm/gcs/gco/gcn). The relocated SQLite class stores that mint these
+// prefixes are an identity seam on a default city, so such a prefix is allowed
+// today (see ValidateRigs) and only becomes ambiguous once the multi-backend
+// fork activates per-class routing. Callers should surface these as non-fatal
+// operator warnings so an existing city or rig that already uses one keeps
+// starting and reloading while it still has time to rename. The hqPrefix must
+// already be site-bound resolved (e.g. via EffectiveHQPrefix).
+func ReservedPrefixWarnings(rigs []Rig, hqPrefix string) []string {
+	var warnings []string
+	if IsReservedClassPrefix(hqPrefix) {
+		warnings = append(warnings, fmt.Sprintf("HQ prefix %q is a reserved coordination-class id-prefix (%s); it is allowed today because class-store relocation is inert, but rename it before per-class stores activate or class ids will be ambiguous", strings.ToLower(strings.TrimSpace(hqPrefix)), reservedClassPrefixListText()))
+	}
+	for _, r := range rigs {
+		prefix := strings.ToLower(r.EffectivePrefix())
+		if IsReservedClassPrefix(prefix) {
+			warnings = append(warnings, fmt.Sprintf("rig %q prefix %q is a reserved coordination-class id-prefix (%s); it is allowed today because class-store relocation is inert, but rename it before per-class stores activate or class ids will be ambiguous", r.Name, prefix, reservedClassPrefixListText()))
+		}
+	}
+	return warnings
 }
 
 // DefaultCity returns a City with the given name and a single default

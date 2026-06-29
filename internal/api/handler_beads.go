@@ -112,6 +112,12 @@ func (s *Server) findStore(rig string) beads.Store {
 // beadStoresForID resolves the authoritative store for a bead ID using its
 // prefix/routes mapping when possible. If there is no routed match, it falls
 // back to the legacy store scan order.
+//
+// The result is the per-class by-id candidate set: a successful prefix/route
+// match returns the single store that owns the ID's namespace (which is already
+// the bead's class+rig store), and the unrouted fallback leads with the
+// city/HQ store ahead of the per-rig work stores. A graph-relocated city adds a
+// class-prefix arm so graph-class ids reach the dedicated graph store.
 func (s *Server) beadStoresForID(id string) []beads.Store {
 	id = strings.TrimSpace(id)
 	if store := s.resolveStoreByConfiguredIDPrefix(id); store != nil {
@@ -120,6 +126,26 @@ func (s *Server) beadStoresForID(id string) []beads.Store {
 	if prefix := beadPrefix(id); prefix != "" {
 		if store := s.resolveStoreByPrefix(prefix); store != nil {
 			return []beads.Store{store}
+		}
+	}
+
+	// Class-prefix arm: a graph-relocated city keeps graph-class beads (reserved
+	// id-prefix "gcg") in a dedicated graph store that is NOT reachable via a
+	// rig/HQ prefix or a routes.jsonl entry, so a graph-class id would otherwise
+	// fall through to the candidate scan and miss. Return [graph, work] —
+	// graph-first (prefix-owner first) — so the per-store Get-then-mutate loop in
+	// the by-id handlers federates the graph store ahead of work and pins it on
+	// the first probe. Skipped for a default (non-relocated) city, where
+	// GraphBeadStore() == CityBeadStore(): the arm never fires and this path stays
+	// byte-identical.
+	if graph := s.state.GraphBeadStore().Store; graph != nil {
+		if city := s.state.CityBeadStore(); graph != city {
+			if prefix, ok := config.ReservedClassPrefix(config.BeadClassGraph); ok && beadIDHasConfiguredPrefix(id, prefix) {
+				if city != nil {
+					return []beads.Store{graph, city}
+				}
+				return []beads.Store{graph}
+			}
 		}
 	}
 
@@ -144,6 +170,15 @@ func (s *Server) resolveStoreByConfiguredIDPrefix(id string) beads.Store {
 		return nil
 	}
 
+	// Only stores that are actually loaded are candidates: a configured prefix
+	// whose store is missing must not win the slot, so a shorter loaded prefix
+	// can still own the id (and otherwise the id is left to the legacy scan).
+	//
+	// This caller routes on the configured (rig/HQ) prefixes with a
+	// longest-prefix, exact-or-hyphen match (beadIDHasConfiguredPrefix). It
+	// resolves against the configured prefixes (not each store's own IDPrefix)
+	// and requires the longest configured prefix to win, so it keeps the scan
+	// inline rather than using the namespace-only, first-match by-id resolver.
 	var bestStore beads.Store
 	bestLen := -1
 	if prefix := strings.TrimSpace(config.EffectiveHQPrefix(cfg)); beadIDHasConfiguredPrefix(id, prefix) {
@@ -167,6 +202,9 @@ func (s *Server) resolveStoreByConfiguredIDPrefix(id string) beads.Store {
 	return bestStore
 }
 
+// beadIDHasConfiguredPrefix reports whether id falls under prefix, matching a
+// bare id == prefix exactly or the "prefix-" namespace. This is the
+// exact-or-hyphen match the configured-prefix resolver uses.
 func beadIDHasConfiguredPrefix(id, prefix string) bool {
 	if prefix == "" {
 		return false
