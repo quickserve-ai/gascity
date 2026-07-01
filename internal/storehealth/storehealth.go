@@ -11,9 +11,12 @@ package storehealth
 import (
 	"io/fs"
 	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beads/contract"
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/fsys"
 )
 
 // DefaultThresholdMB is the MB-per-row threshold above which maintenance
@@ -39,6 +42,12 @@ type Health struct {
 // StorePath returns the canonical on-disk location of the Dolt store
 // for a city rooted at cityPath.
 func StorePath(cityPath string) string {
+	metaPath := filepath.Join(cityPath, ".beads", "metadata.json")
+	if state, ok, err := contract.LoadMetadataState(fsys.OSFS{}, metaPath); err == nil && ok {
+		if strings.EqualFold(strings.TrimSpace(state.Backend), "doltlite") {
+			return filepath.Join(cityPath, ".beads", "doltlite")
+		}
+	}
 	return filepath.Join(cityPath, ".beads", "dolt")
 }
 

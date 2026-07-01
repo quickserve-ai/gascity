@@ -18,6 +18,23 @@ func TestStorePath(t *testing.T) {
 	}
 }
 
+func TestStorePath_DoltliteMetadata(t *testing.T) {
+	cityPath := t.TempDir()
+	beadsDir := filepath.Join(cityPath, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(`{"backend":"doltlite","database":"doltlite","dolt_database":"hq"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := StorePath(cityPath)
+	want := filepath.Join(cityPath, ".beads", "doltlite")
+	if got != want {
+		t.Fatalf("StorePath = %q, want %q", got, want)
+	}
+}
+
 func TestComputeWarningHighRatio(t *testing.T) {
 	// 11.2 GB (decimal) / 221 rows = ~50.68 MB/row, warning.
 	const size = 11_200_000_000

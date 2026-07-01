@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -147,6 +149,31 @@ func TestComputeStoreHealthServerIntegration(t *testing.T) {
 	}
 	if got.LastGCAt != "2026-04-08T00:00:00Z" {
 		t.Errorf("LastGCAt = %q, want 2026-04-08T00:00:00Z", got.LastGCAt)
+	}
+}
+
+func TestComputeStoreHealthUsesDoltlitePathFromMetadata(t *testing.T) {
+	cityPath := t.TempDir()
+	beadsDir := filepath.Join(cityPath, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(`{"backend":"doltlite","database":"doltlite","dolt_database":"hq"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	state := &fakeState{
+		cityPath:      cityPath,
+		eventProv:     events.NewFake(),
+		cityBeadStore: beads.NewMemStore(),
+	}
+	s := &Server{state: state}
+	got := s.computeStoreHealth()
+	if got == nil {
+		t.Fatal("computeStoreHealth returned nil")
+	}
+	if !strings.HasSuffix(got.Path, "/.beads/doltlite") {
+		t.Fatalf("Path = %q, want .beads/doltlite suffix", got.Path)
 	}
 }
 

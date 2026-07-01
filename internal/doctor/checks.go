@@ -250,6 +250,11 @@ func (c *BuiltinPackFamilyCheck) Run(_ *CheckContext) *CheckResult {
 	if v := os.Getenv("GC_BEADS"); v != "" {
 		provider = v
 	}
+	if strings.EqualFold(strings.TrimSpace(c.cfg.Beads.Backend), "doltlite") {
+		r.Status = StatusOK
+		r.Message = "builtin bd/dolt pack family not required for doltlite backend"
+		return r
+	}
 	if !providerUsesBDDoltStore(provider) {
 		r.Status = StatusOK
 		r.Message = "builtin bd/dolt pack family not required"

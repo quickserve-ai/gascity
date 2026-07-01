@@ -617,6 +617,32 @@ schema = 1
 	}
 }
 
+func TestBuiltinPackFamilyCheck_DoltliteBackendSkipsRequirement(t *testing.T) {
+	dir := t.TempDir()
+	doltDir := filepath.Join(dir, "packs", "dolt")
+	if err := os.MkdirAll(doltDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(doltDir, "pack.toml"), []byte(`[pack]
+name = "dolt"
+schema = 1
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	c := NewBuiltinPackFamilyCheck(&config.City{
+		Beads:    config.BeadsConfig{Provider: "bd", Backend: "doltlite"},
+		PackDirs: []string{doltDir},
+	}, dir)
+	r := c.Run(&CheckContext{})
+	if r.Status != StatusOK {
+		t.Fatalf("status = %d, want OK; msg = %s", r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, "doltlite backend") {
+		t.Fatalf("message = %q, want doltlite skip message", r.Message)
+	}
+}
+
 func TestBuiltinPackFamilyCheck_ExecGcBeadsBdOverrideStillRequiresFamily(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("GC_BEADS", "exec:/tmp/gc-beads-bd")
