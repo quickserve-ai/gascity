@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Prevent managed Claude sessions from crash-looping on project MCP trust
+  prompts.** Headless tmux sessions now pre-approve project-scoped MCP servers
+  in their generated settings and can also dismiss Claude Code's interactive
+  “New MCP server found in this project” prompt. This lets agents whose working
+  directory contains `.mcp.json` finish startup instead of repeatedly failing
+  before session creation completes.
+
 ## [1.3.3] - 2026-07-02
 
 ### Fixed
@@ -666,7 +675,8 @@ community contributors. See the GitHub release page for the full narrative.
   semantics, watchdog reconciliation cadence, dirty-cache fallback reads.
 - Long tail of session lifecycle, wake-budget, and pool identity fixes.
 
-[Unreleased]: https://github.com/gastownhall/gascity/compare/v1.3.3...HEAD
+[Unreleased]: https://github.com/gastownhall/gascity/compare/v1.3.4...HEAD
+[1.3.4]: https://github.com/gastownhall/gascity/compare/v1.3.3...v1.3.4
 [1.3.3]: https://github.com/gastownhall/gascity/compare/v1.3.2...v1.3.3
 [1.3.2]: https://github.com/gastownhall/gascity/compare/v1.3.1...v1.3.2
 [1.3.1]: https://github.com/gastownhall/gascity/compare/v1.3.0...v1.3.1
