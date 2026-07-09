@@ -1016,6 +1016,15 @@
           ],
           "description": "BDCompatibility selects the bd CLI semantics Gas City may rely on.\nEmpty defaults to \"bd-1.0.4\", which keeps claimable work history-backed\nand avoids bd ready/list flags that are unavailable or incomplete in bd\n1.0.4."
         },
+        "conditional_writes": {
+          "type": "string",
+          "enum": [
+            "off",
+            "auto",
+            "require"
+          ],
+          "description": "ConditionalWrites selects the bead-write discipline (the rollout gate keyed\n\"beads.conditional_writes\"; see internal/rollout): \"off\" (legacy,\nbyte-identical), \"auto\" (compare-and-swap where the store is capable, loud\ndegrade otherwise), or \"require\" (CAS or a typed refusal). Empty defaults to\n\"off\". The string is validated and mapped to a rollout.Mode in\ninternal/rollout — never here, which would be an import cycle."
+        },
         "policies": {
           "additionalProperties": {
             "$ref": "#/$defs/BeadPolicyConfig"
