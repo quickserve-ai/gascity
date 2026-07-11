@@ -415,6 +415,17 @@ jobs:
         run: make dashboard-ci
       - name: OpenAPI spec + client drift check
         run: make spec-ci
+      # On drift this fails the job and leaves the exact regen patch, which
+      # the Docs Autofix workflow (docs-autofix.yml) applies to the PR branch.
+      - name: Generated reference docs drift check
+        run: ./scripts/check-generated-docs-drift.sh
+      - name: Upload generated-docs freshness patch
+        if: failure() && hashFiles('generated-docs-freshness.patch') != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: generated-docs-freshness-patch
+          path: generated-docs-freshness.patch
+          retention-days: 7
 
   # Historical fan-in name and the branch-protection-enforced required status.
   # Branch protection requires `Check`, so the cross-version contract matrix
