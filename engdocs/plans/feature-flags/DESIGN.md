@@ -920,13 +920,38 @@ write-back; where it contradicts §6.3/§6.4/§7.3/§12.2 above, this section wi
    enforcement-lowering-only gaps by construction; the stage-3 sweep must
    revisit exec if a Require deployment ever runs an exec provider.
 
-Stage-3 pickup hazards recorded by the red-team: the cmd/gc `beadPolicyStore`
-wrapper embeds the Store interface, so the carrier does not promote through
-it — consumers must resolve the unwrapped store (as `ConditionalWriterFor`
-already documents) or the wrapper must forward the carrier; and eight
-production store constructions bypass the factory today (hook-claim, scoped
-reads, bd-store-bridge, control-plane stores, t3bridge watcher, libstore,
-one-shot MemStore) and therefore resolve as unset→legacy until swept.
+Stage 3 as built (same change series):
+
+- **Wrappers declare resolution targets** instead of forwarding the carrier:
+  the exported `ConditionalWritesResolveTargeter` lets an interface-embedding
+  wrapper (the typed class wrappers, the cmd/gc policy store) point the seam
+  at its inner store; the seam follows targets bounded and cycle-safe, and
+  CachingStore's forwarding follows its backing's target too (the production
+  sandwich is cache → policy wrapper → stamped store). The mode stays
+  unforgeable — a wrapper can redirect resolution, never supply a mode.
+- **Threading is the shared open helper, not the §6.1 loader arity change:**
+  `openStoreResultAtForCity` (behind every CLI/runtime open and the
+  controller's city store) resolves per-process from the config it already
+  loads; `openRigStore` threads the controller's boot latch; the control
+  dispatcher's bd stores route through the factory (no preflight checker →
+  bd fallback by construction, never native). The remaining out-of-factory
+  constructions are read-only/diagnostic paths, safe as unset→legacy.
+- **C6 and C4 are live** per §9.1/§9.2 with the ambiguity contract (§9.3):
+  drain claim/release value-CAS with self-win re-reads; Attach's CAS-last
+  epoch fence with the loser feeding the existing partial-attach recovery
+  (`findExistingAttach` now prefers a live root over a fence loser's
+  neutralized one under the same key); `syncControlEpochToAttempt` and
+  `advanceAttachEpochIfNeeded` fenced with benign-loss semantics, all
+  bounded to one re-issue (never unbounded retry).
+- **The degraded event is emitted**, latched once per store: the factory
+  callback reaches the controller's event provider on rig stores and a
+  lazily-constructed city event-log recorder on the shared CLI/control
+  paths (built inside the once-latched callback, so routine opens pay
+  nothing).
+- **The sqlite graph store (S2-T9) does not exist on this lineage** — the
+  provider was removed on mainline (#3151) and hard-errors at config load;
+  the graph class resolves to the primary store, which is covered. The §10
+  sqlite deliverable applies only to branches that still carry that store.
 
 ### 6.5 What each layer holds
 
