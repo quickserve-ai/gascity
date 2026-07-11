@@ -873,6 +873,61 @@ func ResolveConditionalWriter(store Store) (ConditionalWriter, *BeadsDiagnostic,
 
 Return contract (semantics detailed in section 7): `Off` → `(nil, nil, nil)`, caller takes the byte-identical legacy path; `Auto`∧capable → writer; `Auto`∧incapable → `(nil, diagnostic, nil)` with the once-latched degrade event; `Require`∧incapable → typed error, fail closed. The stamp is read through an unexported interface implemented by every store type (compile-asserted with `var _`); wrappers forward it. Because the interface is unexported, only `internal/beads` can implement it — no consumer can synthesize a differently-moded store.
 
+#### 6.4.1 As-built amendments (2026-07-11, PR-S2b — S2-T10/T11/T12)
+
+The build surfaced one hard compiler fact and four deliberate deviations, all
+settled in the PR-S2b bounded design pass and red-teams. This section is the
+write-back; where it contradicts §6.3/§6.4/§7.3/§12.2 above, this section wins.
+
+1. **`internal/beads` cannot import `internal/rollout` — the mode type lives
+   in `internal/rollout/gate`.** rollout imports config, and config
+   transitively reaches beads (config → orders → beads), so §6.3's
+   `ConditionalWrites rollout.Mode` is an import cycle as written. The
+   consumer-facing half (Mode, ParseMode, Capability, Decision,
+   ResolveCapability) moved to the stdlib-only leaf package
+   `internal/rollout/gate`; rollout re-exports it all via type/const aliases,
+   so `rollout.Mode` and `gate.Mode` are one identical type and everything in
+   §5 is unchanged. `TestRolloutImportBoundary` allowlists the subpackage and
+   holds `gate/` itself to stdlib-only.
+2. **The stamp is one embedded struct with its own mutex, and the stamp write
+   reports whether it landed.** Every package-beads store type embeds
+   `condWritesStamp` (mode + defaulted marker + degrade-once latch, one
+   mutex); FileStore inherits through `*MemStore`, DoltliteReadStore through
+   `*BdStore` (with a prober shadow — F2), CachingStore carries nothing and
+   delegates carrier + prober to its backing, reporting `landed=false` when
+   the backing cannot carry a mode so the factory logs the drop instead of
+   believing it took. §12.2's "same mutex as the capability latch" wording
+   assumed only BdStore; the generalized stamp owns its own mutex (Mem/File/
+   doltlite have no capability mutex), disjoint from `condWriteMu`, no
+   nesting. The at-most-once emission guarantee is unchanged.
+3. **The seam returns the degrade diagnostic on EVERY call**; the once-latch
+   (`noteConditionalDegradeOnce`) ships tested but unwired, for the stage-3
+   emitter only. First-call-only diagnostics would make resolution
+   order-dependent hidden state.
+4. **The factory's unset→Off default is logged at debug, not recorded on
+   `BeadsDiagnostic`** — that struct is on the HTTP wire (`StatusResponse`),
+   and in the inert stage every open is unthreaded, so §6.3's diagnostic
+   record would stamp a transitional condition onto every `gc status`
+   fleet-wide as permanent wire vocabulary. Wire visibility for per-store
+   verdicts lands with §12.5. The SEAM's returned diagnostic reuses the
+   existing PreflightGate/PreflightReason fields on a fresh value and never
+   rides the status wire.
+5. **exec.Store stays unstamped** (separate package cannot implement the
+   unexported carrier; it implements no conditional writes either way), and
+   **`beadstest.WithStampedMode`/`OpenMem` (§7.3's idiom) is deferred** to the
+   first external consumer (sqlite S2-T9 or stage-3 entry-point tests) — S2b
+   seam tests live in package beads and stamp directly. Both are
+   enforcement-lowering-only gaps by construction; the stage-3 sweep must
+   revisit exec if a Require deployment ever runs an exec provider.
+
+Stage-3 pickup hazards recorded by the red-team: the cmd/gc `beadPolicyStore`
+wrapper embeds the Store interface, so the carrier does not promote through
+it — consumers must resolve the unwrapped store (as `ConditionalWriterFor`
+already documents) or the wrapper must forward the carrier; and eight
+production store constructions bypass the factory today (hook-claim, scoped
+reads, bd-store-bridge, control-plane stores, t3bridge watcher, libstore,
+one-shot MemStore) and therefore resolve as unset→legacy until swept.
+
 ### 6.5 What each layer holds
 
 | Layer | Holds | Never holds |
