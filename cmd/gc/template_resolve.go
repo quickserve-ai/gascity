@@ -418,6 +418,31 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 	prependGCBinDirToPATH(env, env["GC_BIN"])
 	env = convergence.ScrubTokenEnv(env)
 
+	// Interactive tmux TUI agents render monochrome even with a clean color
+	// env. The ga-od2 ~/.tmux.conf band-aid scrubs the NO_COLOR=1 / TERM=dumb
+	// the supervisor leaks into the tmux server, which restores color for
+	// tools that honor no-color.org (oh-my-posh, codex) — but Claude Code has a
+	// second-order quirk: under the managed tmux server it will not confirm
+	// color support even with COLORTERM=truecolor, a real tty, and NO_COLOR
+	// absent (verified: a fresh pane's claude process has clean env yet emits
+	// zero SGR sequences; FORCE_COLOR=3 restores full color). Default
+	// FORCE_COLOR=3 (truecolor) for interactive tmux sessions so the agent TUI
+	// is colored regardless of the detection path. Scope is deliberately narrow:
+	// only the tmux runtime (subprocess/ACP/k8s providers and deterministic
+	// control-dispatchers emit machine-parsed output that must stay uncolored).
+	// Overridable — set only when neither FORCE_COLOR nor NO_COLOR is already
+	// present, so workspace/provider/agent config can opt out.
+	if rt := effectiveSessionProvider(cfgAgent.Session, p.sessionProvider); (rt == "" || rt == "tmux") && !suppressStartupPrompt {
+		if env == nil {
+			env = map[string]string{}
+		}
+		_, hasForceColor := env["FORCE_COLOR"]
+		_, hasNoColor := env["NO_COLOR"]
+		if !hasForceColor && !hasNoColor {
+			env["FORCE_COLOR"] = "3"
+		}
+	}
+
 	// Step 11: Expand session setup templates.
 	configDir := p.cityPath
 	if cfgAgent.SourceDir != "" {
