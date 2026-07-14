@@ -12,6 +12,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/git"
 	"github.com/gastownhall/gascity/internal/pathutil"
+	"github.com/gastownhall/gascity/internal/runtime"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 )
 
@@ -43,6 +44,12 @@ var newGitProbe = func(workDir string) gitProbe { return git.New(workDir) }
 //
 // No-op when:
 //   - cfg.Daemon.AutoPruneWorkerDir is false
+//   - the session bead is a configured named session (a named home is not a
+//     disposable pool worktree, even if it transiently carries pool metadata
+//     while being re-minted — ga-1xiv)
+//   - the session's runtime is still running per a direct sp.IsRunning probe
+//     (the caller's cached liveness can be transiently false during
+//     supervisor re-adoption — ga-1xiv)
 //   - the session bead has no worker_dir metadata
 //   - the worker_dir does not live under cityPath/.gc/worktrees/
 //   - the worker_dir is missing on disk or has no .git pointer
@@ -52,8 +59,16 @@ var newGitProbe = func(workDir string) gitProbe { return git.New(workDir) }
 // Removal failures are logged but never surfaced — an orphaned worktree
 // still shows up via `gc doctor` later, which is the operator's existing
 // reclaim path.
-func pruneAgentHomeWorktreeIfSafe(session beads.Bead, cityPath string, cfg *config.City, stderr io.Writer) bool {
+func pruneAgentHomeWorktreeIfSafe(session beads.Bead, cityPath string, cfg *config.City, sp runtime.Provider, stderr io.Writer) bool {
 	if cfg == nil || !cfg.Daemon.AutoPruneWorkerDirEnabled() {
+		return false
+	}
+	if isNamedSessionBead(session) {
+		fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir for %s: named session home is never auto-pruned\n", session.Metadata["session_name"]) //nolint:errcheck
+		return false
+	}
+	if sessionName := strings.TrimSpace(session.Metadata["session_name"]); sp != nil && sessionName != "" && sp.IsRunning(sessionName) {
+		fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir for %s: runtime session is live\n", sessionName) //nolint:errcheck
 		return false
 	}
 	workerDir := strings.TrimSpace(contract.WorkerDirFromMetadata(session.Metadata))
@@ -125,8 +140,16 @@ func pruneAgentHomeWorktreeIfSafe(session beads.Bead, cityPath string, cfg *conf
 // lookupRigRootForSessionInfo, and the log line reads Info.SessionNameMetadata —
 // every safety gate and the removal itself are unchanged. Byte-identical to the
 // raw form, which survives for its test callers.
-func pruneAgentHomeWorktreeIfSafeInfo(info sessionpkg.Info, cityPath string, cfg *config.City, stderr io.Writer) {
+func pruneAgentHomeWorktreeIfSafeInfo(info sessionpkg.Info, cityPath string, cfg *config.City, sp runtime.Provider, stderr io.Writer) {
 	if cfg == nil || !cfg.Daemon.AutoPruneWorkerDirEnabled() {
+		return
+	}
+	if sessionpkg.IsNamedSessionInfo(info) {
+		fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir for %s: named session home is never auto-pruned\n", info.SessionNameMetadata) //nolint:errcheck
+		return
+	}
+	if sessionName := strings.TrimSpace(info.SessionNameMetadata); sp != nil && sessionName != "" && sp.IsRunning(sessionName) {
+		fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir for %s: runtime session is live\n", sessionName) //nolint:errcheck
 		return
 	}
 	workerDir := strings.TrimSpace(sessionpkg.WorkerDirFromInfo(info))

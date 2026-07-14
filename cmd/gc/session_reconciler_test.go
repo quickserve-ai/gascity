@@ -11274,3 +11274,60 @@ func TestReconcileSessionBeads_ClosesOrphanedFailedCreateAndFreesSlot(t *testing
 // Regression: poolDesired derived from desiredState counts ALL session beads
 // (including discovered ones), inflating the desired count. This test verifies
 // that derivePoolDesired only counts pool sessions, not all discovered beads.
+
+// TestReconcileSessionBeads_DrainAckStampsHeartbeatCooldown covers ga-kaei:
+// an always-mode named session with wake_mode=fresh (the gastown.boot
+// heartbeat shape) must come out of a clean drain-ack holding a future
+// held_until, so the named-always wake pass does not re-select it at its own
+// runtime cadence. A session without the always-named marker must NOT be held.
+func TestReconcileSessionBeads_DrainAckStampsHeartbeatCooldown(t *testing.T) {
+	run := func(t *testing.T, named bool) (beads.Bead, time.Time) {
+		env := newReconcilerTestEnv()
+		env.cfg = &config.City{
+			Agents: []config.Agent{{Name: "worker", SleepAfterIdle: config.SessionSleepOff}},
+		}
+		env.addDesired("worker", "worker", true)
+		session := env.createSessionBead("worker", "worker")
+		env.markSessionActive(&session)
+		meta := map[string]string{"wake_mode": "fresh"}
+		if named {
+			meta["configured_named_mode"] = "always"
+		}
+		env.setSessionMetadata(&session, meta)
+		if err := env.sp.SetMeta("worker", "GC_SESSION_ID", session.ID); err != nil {
+			t.Fatalf("SetMeta(GC_SESSION_ID): %v", err)
+		}
+		dops := newFakeDrainOps()
+		if err := dops.setDrainAck("worker"); err != nil {
+			t.Fatalf("setDrainAck: %v", err)
+		}
+		reconcileSessionBeads(
+			context.Background(), []beads.Bead{session}, env.desiredState,
+			map[string]bool{"worker": true}, env.cfg, env.sp, env.store, dops,
+			nil, nil, env.dt, nil, false, nil, "",
+			nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr,
+		)
+		return env.reconcileStopPendingToTerminal(t, env.sp, session, dops, map[string]bool{"worker": true}), env.clk.Now()
+	}
+
+	t.Run("always-named fresh gets cooldown", func(t *testing.T) {
+		got, now := run(t, true)
+		held := strings.TrimSpace(got.Metadata["held_until"])
+		if held == "" {
+			t.Fatalf("held_until empty after drain-ack; metadata=%v", got.Metadata)
+		}
+		ts, err := time.Parse(time.RFC3339, held)
+		if err != nil {
+			t.Fatalf("held_until %q not RFC3339: %v", held, err)
+		}
+		if !ts.After(now) || ts.After(now.Add(freshWakeHeartbeatCooldown)) {
+			t.Errorf("held_until %v not within (now, now+cooldown]; now=%v", ts, now)
+		}
+	})
+	t.Run("plain fresh session not held", func(t *testing.T) {
+		got, _ := run(t, false)
+		if held := strings.TrimSpace(got.Metadata["held_until"]); held != "" {
+			t.Fatalf("held_until = %q, want empty for non-named session", held)
+		}
+	})
+}
