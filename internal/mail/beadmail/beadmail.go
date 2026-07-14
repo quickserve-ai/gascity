@@ -238,10 +238,20 @@ func (p *Provider) MarkRead(id string) error {
 	})
 }
 
-// MarkUnread marks a message as unread (removes "read" label).
+// MarkUnread marks a message as unread (removes "read" label). A closed
+// message bead (e.g. one closed by the mail retention sweep) is reopened
+// first: mark-unread exists to resurface a message, and a closed bead is
+// invisible to every inbox surface, so removing the label alone would
+// silently change nothing (ga-1kor).
 func (p *Provider) MarkUnread(id string) error {
-	if _, err := p.store.Get(id); err != nil {
+	b, err := p.store.Get(id)
+	if err != nil {
 		return fmt.Errorf("beadmail mark-unread: %w", err)
+	}
+	if b.Status == "closed" {
+		if err := p.store.Reopen(id); err != nil {
+			return fmt.Errorf("beadmail mark-unread: reopening closed message: %w", err)
+		}
 	}
 	return p.store.Update(id, beads.UpdateOpts{
 		RemoveLabels: []string{"read"},

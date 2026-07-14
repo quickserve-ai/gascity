@@ -2507,3 +2507,43 @@ func TestProviderCached_ExpiredRefreshConcurrentAccessScansOnce(t *testing.T) {
 // --- Compile-time interface check ---
 
 var _ mail.Provider = (*Provider)(nil)
+
+func TestMarkUnreadReopensClosedMessage(t *testing.T) {
+	store := beads.NewMemStore()
+	p := New(store)
+
+	b, err := store.Create(beads.Bead{
+		Title:    "HANDOFF: test",
+		Type:     "message",
+		Assignee: "cheryl",
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := p.MarkRead(b.ID); err != nil {
+		t.Fatalf("mark read: %v", err)
+	}
+	if err := store.Close(b.ID); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	if err := p.MarkUnread(b.ID); err != nil {
+		t.Fatalf("mark unread: %v", err)
+	}
+
+	got, err := store.Get(b.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status != "open" {
+		t.Errorf("status = %q, want open (mark-unread must reopen a swept/closed message)", got.Status)
+	}
+	for _, l := range got.Labels {
+		if l == "read" {
+			t.Error("read label still present after mark-unread")
+		}
+	}
+	if got.Metadata["mail.read"] != "false" {
+		t.Errorf("mail.read = %q, want false", got.Metadata["mail.read"])
+	}
+}

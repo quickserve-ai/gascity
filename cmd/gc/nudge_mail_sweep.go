@@ -7,12 +7,18 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/mail"
 	"github.com/gastownhall/gascity/internal/nudgequeue"
 )
 
 const (
-	nudgeMailSweepDefaultNudgeTTL     = 10 * time.Minute
-	nudgeMailSweepDefaultMailTTL      = 60 * time.Minute
+	nudgeMailSweepDefaultNudgeTTL = 10 * time.Minute
+	nudgeMailSweepDefaultMailTTL  = 60 * time.Minute
+	// nudgeMailSweepHandoffMailTTL is the retention window for read handoff
+	// mail (label mail.HandoffLabel). Handoff mail bridges restart/compaction
+	// gaps: a continuation that compacts hours after consuming its handoff
+	// may need to re-read it, so it far outlives ordinary read mail (ga-1kor).
+	nudgeMailSweepHandoffMailTTL      = 24 * time.Hour
 	nudgeMailSweepCloseBudget         = 50
 	nudgeMailSweepWatchdogInterval    = 5 * time.Minute
 	nudgeMailSweepWatchdogCloseBudget = 50
@@ -121,6 +127,9 @@ func sweepStaleNudgeMail(store beads.Store, nudgeState *nudgequeue.State, now ti
 			if b.Status != "open" {
 				continue
 			}
+			if hasLabel(b.Labels, mail.HandoffLabel) && b.CreatedAt.After(now.Add(-nudgeMailSweepHandoffMailTTL)) {
+				continue
+			}
 			if err := store.SetMetadata(b.ID, "close_reason", nudgeMailSweepMailCloseReason); err != nil {
 				beadErrs = append(beadErrs, fmt.Errorf("mail %s: set close_reason: %w", b.ID, err))
 				continue
@@ -197,6 +206,9 @@ func countStaleNudgeMail(store beads.Store, nudgeState *nudgequeue.State, now ti
 				break
 			}
 			if b.Status != "open" {
+				continue
+			}
+			if hasLabel(b.Labels, mail.HandoffLabel) && b.CreatedAt.After(now.Add(-nudgeMailSweepHandoffMailTTL)) {
 				continue
 			}
 			result.MailClosed++

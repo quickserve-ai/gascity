@@ -18,6 +18,10 @@ var ErrAlreadyArchived = errors.New("already archived")
 var ErrNotFound = errors.New("message not found")
 
 const (
+	// HandoffLabel marks all mail created by gc handoff. Handoff mail bridges
+	// a restart/compaction gap, so the retention sweep gives it a much longer
+	// TTL than ordinary read mail (see cmd/gc nudge_mail_sweep).
+	HandoffLabel = "gc:handoff"
 	// AutoHandoffLabel marks mail created by gc handoff --auto for provider
 	// context-cycle delivery.
 	AutoHandoffLabel = "gc:auto-handoff"

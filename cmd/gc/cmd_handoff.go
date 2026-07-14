@@ -303,7 +303,7 @@ func createHandoffMail(store beads.Store, rec events.Recorder, senderAddress, re
 	}
 	senderDisplay := mailSenderDisplayFromMetadata(senderAddress, metadata)
 
-	labels := []string{"thread:" + handoffThreadID()}
+	labels := []string{mail.HandoffLabel, "thread:" + handoffThreadID()}
 	labels = append(labels, extraLabels...)
 	b, err := store.Create(beads.Bead{
 		Title:       subject,
