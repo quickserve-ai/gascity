@@ -11,8 +11,13 @@ import (
 )
 
 const (
-	nudgeMailSweepDefaultNudgeTTL     = 10 * time.Minute
-	nudgeMailSweepDefaultMailTTL      = 60 * time.Minute
+	nudgeMailSweepDefaultNudgeTTL = 10 * time.Minute
+	nudgeMailSweepDefaultMailTTL  = 60 * time.Minute
+	// nudgeMailSweepHandoffMailTTL is the retention window for read handoff
+	// mail (label mail.HandoffLabel). Handoff mail bridges restart/compaction
+	// gaps: a continuation that compacts hours after consuming its handoff
+	// may need to re-read it, so it far outlives ordinary read mail (ga-1kor).
+	nudgeMailSweepHandoffMailTTL      = 24 * time.Hour
 	nudgeMailSweepCloseBudget         = 50
 	nudgeMailSweepWatchdogInterval    = 5 * time.Minute
 	nudgeMailSweepWatchdogCloseBudget = 500
@@ -93,7 +98,7 @@ func sweepStaleNudgeMail(nudgeStore beads.NudgesStore, mailStore beads.MailStore
 		if limit == 0 {
 			mailBudget = 0
 		}
-		mailClosed, mailCloseErrs, mailListErr := beadmail.SweepReadMessagesBefore(mailStore, mailCutoff, mailBudget, nudgeMailSweepMailCloseReason)
+		mailClosed, mailCloseErrs, mailListErr := beadmail.SweepReadMessagesBefore(mailStore, mailCutoff, now.Add(-nudgeMailSweepHandoffMailTTL), mailBudget, nudgeMailSweepMailCloseReason)
 		if mailListErr != nil {
 			return result, fmt.Errorf("nudge-mail-sweep: listing read mail beads: %w", mailListErr)
 		}
@@ -138,7 +143,7 @@ func countStaleNudgeMail(nudgeStore beads.NudgesStore, mailStore beads.MailStore
 		if limit == 0 {
 			mailBudget = 0
 		}
-		mailCount, err := beadmail.CountReadMessagesBefore(mailStore, mailCutoff, mailBudget)
+		mailCount, err := beadmail.CountReadMessagesBefore(mailStore, mailCutoff, now.Add(-nudgeMailSweepHandoffMailTTL), mailBudget)
 		if err != nil {
 			return result, fmt.Errorf("nudge-mail-sweep (dry-run): listing read mail beads: %w", err)
 		}
