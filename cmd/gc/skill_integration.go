@@ -258,12 +258,15 @@ func effectiveSkillsForAgent(city *materialize.CityCatalog, agent *config.Agent,
 
 // mergeSkillFingerprintEntries adds one "skills:<name>" → content-hash
 // entry to fpExtra for each desired skill, hashed with
-// runtime.HashPathContent. The entries are NextStart
-// (runtime.FingerprintExtraChangePolicy): the core and provision
-// fingerprints leave them out, so a skill edit reaches the next start
-// without draining a running session. The diagnostic drift breakdown still
-// hashes every key, and the v6 recomputation that migrates a session
-// started before the policy hashes them too
+// runtime.HashSkillSourceContent: any byte-level change to a skill's source
+// directory changes its entry, except git-ignored artifacts and known
+// build/runtime turds, which a skill executing its own scripts may write
+// into its source dir and which must never self-trigger drift (ga-rpf2).
+// The entries are NextStart (runtime.FingerprintExtraChangePolicy): the
+// core and provision fingerprints leave them out, so a skill edit reaches
+// the next start without draining a running session. The diagnostic drift
+// breakdown still hashes every key, and the v6 recomputation that migrates
+// a session started before the policy hashes them too
 // (runtime.PrePolicyCoreFingerprint). Adding an agent's first skill or
 // removing its last can still drain it, through the stage-2
 // materialize-skills PreStart entry (resolveTemplate).
@@ -280,7 +283,7 @@ func mergeSkillFingerprintEntries(fpExtra map[string]string, desired []materiali
 		fpExtra = make(map[string]string, len(desired))
 	}
 	for _, e := range desired {
-		fpExtra["skills:"+e.Name] = runtime.HashPathContent(e.Source)
+		fpExtra["skills:"+e.Name] = runtime.HashSkillSourceContent(e.Source)
 	}
 	return fpExtra
 }
