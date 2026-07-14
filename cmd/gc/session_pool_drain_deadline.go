@@ -62,7 +62,7 @@ const drainFinalizeDeadline = "deadline"
 // retired seat would leak its worktree.
 var poolSlotRetireWorktreePrune = pruneAgentHomeWorktreeIfSafeInfo
 
-func swapWorktreePruneForTest(fn func(sessionpkg.Info, string, *config.City, io.Writer)) func() {
+func swapWorktreePruneForTest(fn func(sessionpkg.Info, string, *config.City, runtime.Provider, io.Writer)) func() {
 	prev := poolSlotRetireWorktreePrune
 	poolSlotRetireWorktreePrune = fn
 	return func() { poolSlotRetireWorktreePrune = prev }
@@ -466,7 +466,7 @@ func retirePoolSlotAtDrainDeadline(
 
 	// Pool worktrees are transient by design; the deadline path preempts the
 	// pool-freeable close, which is the only other site that reclaims them.
-	poolSlotRetireWorktreePrune(info, cityPath, cfg, stderr)
+	poolSlotRetireWorktreePrune(info, cityPath, cfg, sp, stderr)
 
 	fmt.Fprintf(stderr, "session reconciler: retired pool slot %s at the drain deadline after %s in an unfinalized drain; its runtime name is free again\n", name, drainAge.Round(time.Second)) //nolint:errcheck
 	if rec != nil {
