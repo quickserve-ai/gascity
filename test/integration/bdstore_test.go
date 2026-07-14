@@ -36,17 +36,6 @@ const (
 // Requires: Dolt and bd binaries configured via PATH or the integration
 // override env vars.
 func TestBdStoreConformance(t *testing.T) {
-	// release/v1.3.0 ONLY — do not port to main (ga-e7z613).
-	// This branch pins bd 1.0.4 to avoid bd 1.0.5's corruption bug. bd 1.0.4
-	// lacks the #3691 empty-DB-guard fix (it was tagged ~6.5h before #3691
-	// merged), so it silently auto-imports into an empty on-disk DB, which trips
-	// gascity's ErrBDSilentFallback guard (#2080). This is NOT a v1.3.x
-	// regression: gascity 1.2.1 shipped on bd 1.0.4 with identical bd behavior;
-	// the only change since is the loud-fallback detection added after 1.2.1
-	// (#1930/#2080/#2079). Skip the conformance check on this release branch
-	// until gascity moves to a clean bd (#3691 + the corruption fix); remove
-	// this skip then. See ga-e7z613.
-	t.Skip("release/v1.3.0: bd 1.0.4 trips the silent-fallback guard (pre-existing, non-regression; pinned to avoid 1.0.5 corruption) — ga-e7z613")
 	requireDoltIntegration(t)
 	env := newIsolatedToolEnv(t, true)
 
