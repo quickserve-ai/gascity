@@ -250,8 +250,11 @@ func effectiveSkillsForAgent(city *materialize.CityCatalog, agent *config.Agent,
 
 // mergeSkillFingerprintEntries adds one "skills:<name>" → content-hash
 // entry to fpExtra for each desired skill. Hashes use
-// runtime.HashPathContent so any byte-level change to a skill's source
-// directory triggers a config-fingerprint drift and drains the agent.
+// runtime.HashSkillSourceContent so any byte-level change to a skill's
+// source directory triggers a config-fingerprint drift and drains the
+// agent — except git-ignored artifacts and known build/runtime turds,
+// which a skill executing its own scripts may write into its source dir
+// and which must never self-trigger drift (ga-rpf2).
 //
 // Nil-map safe: allocates fpExtra if the caller passed nil. Returns
 // the (possibly new) map. The "skills:" prefix partitions the key
@@ -265,7 +268,7 @@ func mergeSkillFingerprintEntries(fpExtra map[string]string, desired []materiali
 		fpExtra = make(map[string]string, len(desired))
 	}
 	for _, e := range desired {
-		fpExtra["skills:"+e.Name] = runtime.HashPathContent(e.Source)
+		fpExtra["skills:"+e.Name] = runtime.HashSkillSourceContent(e.Source)
 	}
 	return fpExtra
 }

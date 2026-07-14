@@ -370,8 +370,10 @@ type CopyEntry struct {
 // HashPathContent returns a hex-encoded SHA-256 of the content at path.
 // For a regular file, hashes the file content. For a directory, hashes
 // a sorted manifest of relative paths and their contents while ignoring
-// runtime-generated Python cache and editor backup artifacts. Returns empty
-// string on any error (caller should treat as "unknown").
+// runtime-generated Python cache, editor backup, and Finder (.DS_Store)
+// artifacts. Returns empty string on any error (caller should treat as
+// "unknown"). For skill source directories use HashSkillSourceContent,
+// which additionally excludes git-ignored files.
 func HashPathContent(path string) string {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -438,6 +440,9 @@ func hashPathContentSkipEntry(d fs.DirEntry) bool {
 		default:
 			return false
 		}
+	}
+	if base == ".DS_Store" {
+		return true
 	}
 	switch filepath.Ext(base) {
 	case ".pyc", ".pyo":

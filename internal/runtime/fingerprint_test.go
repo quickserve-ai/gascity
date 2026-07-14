@@ -594,6 +594,15 @@ func TestHashPathContentDirectoryIgnoresRuntimeGeneratedArtifacts(t *testing.T) 
 			},
 		},
 		{
+			name: ".DS_Store",
+			write: func(t *testing.T, dir string) {
+				t.Helper()
+				if err := os.WriteFile(filepath.Join(dir, ".DS_Store"), []byte("finder"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
 			name: ".pyc file",
 			write: func(t *testing.T, dir string) {
 				t.Helper()
