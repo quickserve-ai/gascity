@@ -217,7 +217,12 @@ func legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady bool) strin
 }
 
 func ephemeralAssignedInProgressProbeScript(shellVar string, includeEphemeralReady bool) string {
-	_ = includeEphemeralReady
+	if includeEphemeralReady {
+		// bd 1.0.5+ query language filters assignee server-side, keeping this
+		// probe bounded instead of scanning every ephemeral issue through jq.
+		return `r=$(bd query --json "ephemeral=true AND status=in_progress AND assignee=\"$` + shellVar + `\"" --limit=1 2>/dev/null); ` +
+			`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
+	}
 	return `r=$(` + bdQueryEphemeralStatusQuietShell("in_progress") + ` | ` +
 		`jq --arg id "$` + shellVar + `" '[.[] | select((.assignee // "") == $id)] | .[:1]' 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
