@@ -871,6 +871,8 @@ func TestDoltStateAllocatePortCmdSkipsOccupiedSeedPort(t *testing.T) {
 
 func TestDoltStateAllocatePortCmdIgnoresInvalidProviderState(t *testing.T) {
 	cityPath := t.TempDir()
+	const fallbackPort = "4406"
+	t.Setenv("GC_DOLT_PORT", fallbackPort)
 	cases := []struct {
 		name  string
 		state doltRuntimeState
@@ -917,8 +919,8 @@ func TestDoltStateAllocatePortCmdIgnoresInvalidProviderState(t *testing.T) {
 			if code != 0 {
 				t.Fatalf("run() = %d, stderr = %s", code, stderr.String())
 			}
-			if got := strings.TrimSpace(stdout.String()); got == strconv.Itoa(tc.state.Port) {
-				t.Fatalf("allocate-port reused invalid provider-state port %d", tc.state.Port)
+			if got := strings.TrimSpace(stdout.String()); got != fallbackPort {
+				t.Fatalf("allocate-port = %q, want environment fallback %s after rejecting invalid provider state port %d", got, fallbackPort, tc.state.Port)
 			}
 		})
 	}
