@@ -735,18 +735,17 @@ func hookQueryEnv(cityPath string, cfg *config.City, a *config.Agent) (map[strin
 // dir sets the command's working directory.
 type WorkQueryRunner func(command, dir string) (string, error)
 
-// hookWorkQueryTimeout caps the work-query subprocess that `gc hook` and the
-// workflow serve loop run via shellWorkQueryWithEnv. The default work-probe
-// issues ~6 sequential bd/store round-trips before the pool-demand tier that
-// finds routed work; on a multi-rig dolt city under concurrent load the probe
-// intermittently exceeded the prior 30s cap, so shellWorkQueryWithEnv killed it
-// and pool operators were starved of routed work. Raised to 60s to cover the
-// realistic loaded cost. This is independent of defaultHookRunTimeout, which
-// bounds the `gc hook run` managed-hook wrapper (around nudge drain / mail
-// check) and does not enclose this work query. The package-level var lets us
-// lower it again once the probe's round-trip count is reduced and the slow
-// per-rig `bd ready`/`gc ready` paths are optimized.
-var hookWorkQueryTimeout = 60 * time.Second
+// hookWorkQueryTimeout caps the work-query subprocess. Raised 30s->90s
+// (ga-kl6, 2026-07-13 incident): the claim work-query chains 6+ `bd ready`
+// calls, and each `bd ready --metadata-field gc.routed_to=...` scans the
+// issues-table metadata JSON un-indexed at 10-23s under concurrent load,
+// so the chain blows a 30s deadline and strands EVERY pool worker in a
+// drain/respawn crash-loop. 90s clears the ~53s observed worst-case chain
+// with headroom while still bounding a genuinely wedged data plane. This
+// is a mitigation; the durable fix is the metadata index (ga-kl6) so
+// `bd ready` drops back under a second. The package-level var lets us
+// lower it again after that lands.
+var hookWorkQueryTimeout = 90 * time.Second
 
 // shellWorkQueryWithEnv runs a work query command via sh -c and returns
 // stdout. If env is non-nil it is used as the subprocess environment
