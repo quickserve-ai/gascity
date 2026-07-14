@@ -39,6 +39,38 @@ import (
 
 const maxIdleSleepProbesPerTick = 3
 
+// freshWakeHeartbeatCooldown is how long a self-draining always-mode
+// fresh-wake named session (heartbeat shape, e.g. gastown.boot) is held
+// asleep after a clean drain-ack with no assigned work. Without it the
+// named-always wake pass re-selects the session immediately and each
+// cycle launches a full provider process with a fresh transcript
+// (ga-kaei: ~1,570/day at boot's ~50s natural cadence). Follow-up: make
+// this a per-agent heartbeat_interval config field.
+const freshWakeHeartbeatCooldown = 5 * time.Minute
+
+// applyDrainAckWithHeartbeatCooldown writes a bare drain-ack's lifecycle patch
+// together with a cooldown hold until until (ga-kaei): one disposition move
+// (EvHeartbeat) on a fresh read, with the patch's lifecycle keys beside it. It
+// returns what ApplyLifecycle would: the patch written, nil with no error when
+// the row is closed, and an error when every CAS attempt lost.
+func applyDrainAckWithHeartbeatCooldown(store beads.Store, id string, patch sessionpkg.MetadataPatch, until, now time.Time) (sessionpkg.MetadataPatch, error) {
+	life := sessionpkg.LifecycleOnly(patch)
+	w, err := sessionFrontDoor(store).ApplyDispositionFresh(id, sessionpkg.ActorController,
+		sessionpkg.DispEvent{Kind: sessionpkg.EvHeartbeat, Until: until},
+		func(_, _ sessionpkg.Disposition, _ sessionpkg.Info) sessionpkg.MetadataPatch { return life }, now)
+	switch {
+	case err != nil:
+		return nil, err
+	case w.Result == sessionpkg.CommitClosed:
+		return nil, nil
+	case w.Result != sessionpkg.CommitLanded:
+		return nil, fmt.Errorf("writing session %q: lost to concurrent writes; retry", id)
+	case w.Wrote == nil:
+		return sessionpkg.MetadataPatch{}, nil
+	}
+	return w.Wrote, nil
+}
+
 type wakeTarget struct {
 	// info is the typed session.Info the wake evaluation + start-candidate stage
 	// carries, captured from the coherent post-fold infoByID snapshot at the append
@@ -1066,6 +1098,24 @@ func finalizeDrainAckStoppedSession(
 	write := sessionFrontDoor(store).ApplyLifecycle
 	if choice.AsSleep {
 		write = sessionFrontDoor(store).ApplySleep
+	}
+	// An always-mode named session with wake_mode=fresh re-qualifies for wake
+	// the moment its drain-ack lands: ComputeAwakeSet's named-always branch has
+	// no drained-exclusion, and drain-ack pokes an immediate reconcile. A
+	// self-draining heartbeat (gastown.boot) therefore re-wakes at its own
+	// runtime cadence (~50s), minting a fresh provider transcript every cycle
+	// (ga-kaei). Stamp a cooldown hold with the bare drain-ack: the
+	// disposition's heartbeat cell (EvHeartbeat), written with the drain-ack's
+	// lifecycle in one fenced write, since held_until is a cell key
+	// ApplyLifecycle refuses. A live heartbeat hold refuses PreWake, so the
+	// seat stays down for the cooldown; an operator's wake clears it.
+	if !hasAssignedWork &&
+		info.WakeMode == "fresh" &&
+		strings.TrimSpace(info.ConfiguredNamedMode) == "always" {
+		cooldownUntil := clk.Now().Add(freshWakeHeartbeatCooldown).UTC()
+		write = func(id string, patch sessionpkg.MetadataPatch) (sessionpkg.MetadataPatch, error) {
+			return applyDrainAckWithHeartbeatCooldown(store, id, patch, cooldownUntil, clk.Now())
+		}
 	}
 	written, err := write(info.ID, batch)
 	if err == nil && written == nil {
@@ -5316,7 +5366,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			if !storeQueryPartial &&
 				repairStrandedPoolWorkerBead(sw, store, infoByID[target.info.ID], clk, stderr) {
 				tick.markClosed(target.info.ID)
-				pruneAgentHomeWorktreeIfSafeInfo(infoByID[target.info.ID], cityPath, cfg, stderr)
+				pruneAgentHomeWorktreeIfSafeInfo(infoByID[target.info.ID], cityPath, cfg, sp, stderr)
 			}
 		}
 		if poolFreeable && !hasAssignedWork {
@@ -5340,7 +5390,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 				// when the session bead is retired. Skipped under safety
 				// gates (uncommitted, unpushed, stashed) and overridable
 				// via cfg.Daemon.AutoPruneWorkerDir.
-				pruneAgentHomeWorktreeIfSafeInfo(infoByID[target.info.ID], cityPath, cfg, stderr)
+				pruneAgentHomeWorktreeIfSafeInfo(infoByID[target.info.ID], cityPath, cfg, sp, stderr)
 			}
 		}
 	}
