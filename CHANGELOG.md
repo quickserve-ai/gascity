@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.5] - 2026-07-14
+
 ### Fixed
 
 - **Bump the `bd`/`beads` dependency from v1.0.4 to v1.1.0.** Homebrew now
@@ -699,7 +701,8 @@ community contributors. See the GitHub release page for the full narrative.
   semantics, watchdog reconciliation cadence, dirty-cache fallback reads.
 - Long tail of session lifecycle, wake-budget, and pool identity fixes.
 
-[Unreleased]: https://github.com/gastownhall/gascity/compare/v1.3.4...HEAD
+[Unreleased]: https://github.com/gastownhall/gascity/compare/v1.3.5...HEAD
+[1.3.5]: https://github.com/gastownhall/gascity/releases/tag/v1.3.5
 [1.3.4]: https://github.com/gastownhall/gascity/releases/tag/v1.3.4
 [1.3.3]: https://github.com/gastownhall/gascity/compare/v1.3.2...v1.3.3
 [1.3.2]: https://github.com/gastownhall/gascity/compare/v1.3.1...v1.3.2
