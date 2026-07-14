@@ -32,6 +32,15 @@ import (
 
 const maxIdleSleepProbesPerTick = 3
 
+// freshWakeHeartbeatCooldown is how long a self-draining always-mode
+// fresh-wake named session (heartbeat shape, e.g. gastown.boot) is held
+// asleep after a clean drain-ack with no assigned work. Without it the
+// named-always wake pass re-selects the session immediately and each
+// cycle launches a full provider process with a fresh transcript
+// (ga-kaei: ~1,570/day at boot's ~50s natural cadence). Follow-up: make
+// this a per-agent heartbeat_interval config field.
+const freshWakeHeartbeatCooldown = 5 * time.Minute
+
 type wakeTarget struct {
 	session *beads.Bead
 	tp      TemplateParams
@@ -350,6 +359,19 @@ func finalizeDrainAckStoppedSession(
 	batch := sessionpkg.AcknowledgeDrainPatch(session.Metadata["wake_mode"] == "fresh")
 	if hasAssignedWork {
 		batch = sessionpkg.CompleteDrainPatch(clk.Now().UTC(), "idle", session.Metadata["wake_mode"] == "fresh")
+	}
+	// An always-mode named session with wake_mode=fresh re-qualifies for wake
+	// the moment its drain-ack lands: ComputeAwakeSet's named-always branch has
+	// no drained-exclusion, and drain-ack pokes an immediate reconcile. A
+	// self-draining heartbeat (gastown.boot) therefore re-wakes at its own
+	// runtime cadence (~50s), minting a fresh provider transcript every cycle
+	// (ga-kaei). Stamp a cooldown hold — held_until is already honored as a
+	// hard wake blocker and an explicit wake request (nudge/attach) clears it,
+	// so urgent demand still wakes the session immediately.
+	if !hasAssignedWork &&
+		session.Metadata["wake_mode"] == "fresh" &&
+		strings.TrimSpace(session.Metadata[sessionpkg.NamedSessionModeMetadata]) == "always" {
+		batch["held_until"] = clk.Now().Add(freshWakeHeartbeatCooldown).UTC().Format(time.RFC3339)
 	}
 	// A drain-ack that completes a restart-request cycle (gc session reset →
 	// agent drain-ack) must also consume restart_requested. The drain-ack
@@ -2508,7 +2530,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 				// when the session bead is retired. Skipped under safety
 				// gates (uncommitted, unpushed, stashed) and overridable
 				// via cfg.Daemon.AutoPruneWorkerDir.
-				pruneAgentHomeWorktreeIfSafe(*target.session, cityPath, cfg, stderr)
+				pruneAgentHomeWorktreeIfSafe(*target.session, cityPath, cfg, sp, stderr)
 			}
 		}
 	}
