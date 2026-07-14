@@ -3528,7 +3528,16 @@ func legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady bool) strin
 }
 
 func ephemeralAssignedInProgressProbeScript(shellVar string, includeEphemeralReady bool) string {
-	_ = includeEphemeralReady
+	if includeEphemeralReady {
+		// bd 1.0.5+ query language filters assignee server-side (value quoted:
+		// aliases contain '/'), so the probe is a bounded indexed lookup
+		// instead of an unbounded ephemeral scan piped through jq. Under Dolt
+		// latency each legacy scan runs 7-9s and the claim chain fires up to
+		// six of them serially inside one deadline, which is the ga-2s6k
+		// pool-wide claim-timeout cascade.
+		return `r=$(bd query --json "ephemeral=true AND status=in_progress AND assignee=\"$` + shellVar + `\"" --limit=1 2>/dev/null); ` +
+			`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
+	}
 	return `r=$(` + bdQueryEphemeralStatusQuietShell("in_progress") + ` | ` +
 		`jq --arg id "$` + shellVar + `" '[.[] | select((.assignee // "") == $id)] | .[:1]' 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
