@@ -30,7 +30,7 @@ func TestPruneAgentHomeWorktreeIfSafeInfo_DisabledByConfig(t *testing.T) {
 	fx.cfg.Daemon.AutoPruneWorkerDir = &off
 
 	var stderr bytes.Buffer
-	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, &stderr)
+	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, nil, &stderr)
 	if rigProbe := fx.probesByWD[fx.rigRoot]; rigProbe != nil && rigProbe.removeInvoked {
 		t.Fatal("WorktreeRemove called while config disabled prune")
 	}
@@ -42,7 +42,7 @@ func TestPruneAgentHomeWorktreeIfSafeInfo_NoWorkerDir(t *testing.T) {
 	info.WorkerDir = ""
 
 	var stderr bytes.Buffer
-	pruneAgentHomeWorktreeIfSafeInfo(info, fx.cityPath, fx.cfg, &stderr)
+	pruneAgentHomeWorktreeIfSafeInfo(info, fx.cityPath, fx.cfg, nil, &stderr)
 	if rigProbe := fx.probesByWD[fx.rigRoot]; rigProbe != nil && rigProbe.removeInvoked {
 		t.Fatal("WorktreeRemove called with no worker_dir")
 	}
@@ -60,7 +60,7 @@ func TestPruneAgentHomeWorktreeIfSafeInfo_LegacyWorkDirKey(t *testing.T) {
 	fx.setProbe(fx.rigRoot, rigProbe)
 
 	var stderr bytes.Buffer
-	pruneAgentHomeWorktreeIfSafeInfo(info, fx.cityPath, fx.cfg, &stderr)
+	pruneAgentHomeWorktreeIfSafeInfo(info, fx.cityPath, fx.cfg, nil, &stderr)
 	if !rigProbe.removeInvoked || rigProbe.removedPath != fx.workerDir || !rigProbe.removedForce {
 		t.Fatalf("expected WorktreeRemove(%q, true) on rig root; got invoked=%v path=%q force=%v",
 			fx.workerDir, rigProbe.removeInvoked, rigProbe.removedPath, rigProbe.removedForce)
@@ -81,7 +81,7 @@ func TestPruneAgentHomeWorktreeIfSafeInfo_OutsideWorktreesTree(t *testing.T) {
 	info.WorkerDir = outside
 
 	var stderr bytes.Buffer
-	pruneAgentHomeWorktreeIfSafeInfo(info, fx.cityPath, fx.cfg, &stderr)
+	pruneAgentHomeWorktreeIfSafeInfo(info, fx.cityPath, fx.cfg, nil, &stderr)
 	if rigProbe := fx.probesByWD[fx.rigRoot]; rigProbe != nil && rigProbe.removeInvoked {
 		t.Fatal("WorktreeRemove called for path outside .gc/worktrees")
 	}
@@ -97,7 +97,7 @@ func TestPruneAgentHomeWorktreeIfSafeInfo_RejectsWorktreesRoot(t *testing.T) {
 	info.WorkerDir = wtRoot
 
 	var stderr bytes.Buffer
-	pruneAgentHomeWorktreeIfSafeInfo(info, fx.cityPath, fx.cfg, &stderr)
+	pruneAgentHomeWorktreeIfSafeInfo(info, fx.cityPath, fx.cfg, nil, &stderr)
 	if rigProbe := fx.probesByWD[fx.rigRoot]; rigProbe != nil && rigProbe.removeInvoked {
 		t.Fatal("WorktreeRemove called for .gc/worktrees root itself")
 	}
@@ -109,7 +109,7 @@ func TestPruneAgentHomeWorktreeIfSafeInfo_RelativeWorkerDir(t *testing.T) {
 	info.WorkerDir = "relative/path"
 
 	var stderr bytes.Buffer
-	pruneAgentHomeWorktreeIfSafeInfo(info, fx.cityPath, fx.cfg, &stderr)
+	pruneAgentHomeWorktreeIfSafeInfo(info, fx.cityPath, fx.cfg, nil, &stderr)
 	if rigProbe := fx.probesByWD[fx.rigRoot]; rigProbe != nil && rigProbe.removeInvoked {
 		t.Fatal("WorktreeRemove called for relative worker_dir")
 	}
@@ -122,7 +122,7 @@ func TestPruneAgentHomeWorktreeIfSafeInfo_MissingDotGit(t *testing.T) {
 	}
 
 	var stderr bytes.Buffer
-	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, &stderr)
+	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, nil, &stderr)
 	if rigProbe := fx.probesByWD[fx.rigRoot]; rigProbe != nil && rigProbe.removeInvoked {
 		t.Fatal("WorktreeRemove called with missing .git pointer")
 	}
@@ -133,7 +133,7 @@ func TestPruneAgentHomeWorktreeIfSafeInfo_NotARepo(t *testing.T) {
 	fx.setProbe(fx.workerDir, &fakeGitProbe{isRepo: false})
 
 	var stderr bytes.Buffer
-	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, &stderr)
+	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, nil, &stderr)
 	assertNoWorktreeStaleMarker(t, fx.workerDir)
 }
 
@@ -142,7 +142,7 @@ func TestPruneAgentHomeWorktreeIfSafeInfo_HasUncommitted(t *testing.T) {
 	fx.setProbe(fx.workerDir, &fakeGitProbe{isRepo: true, hasUncommitted: true, currentBranch: "builder/ga-abc123"})
 
 	var stderr bytes.Buffer
-	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, &stderr)
+	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, nil, &stderr)
 	if !strings.Contains(stderr.String(), "uncommitted changes") {
 		t.Errorf("expected uncommitted-reason log; got %q", stderr.String())
 	}
@@ -154,7 +154,7 @@ func TestPruneAgentHomeWorktreeIfSafeInfo_HasUnpushed(t *testing.T) {
 	fx.setProbe(fx.workerDir, &fakeGitProbe{isRepo: true, hasUnpushed: true, currentBranch: "builder/ga-def456"})
 
 	var stderr bytes.Buffer
-	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, &stderr)
+	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, nil, &stderr)
 	if !strings.Contains(stderr.String(), "unpushed commits") {
 		t.Errorf("expected unpushed-reason log; got %q", stderr.String())
 	}
@@ -166,7 +166,7 @@ func TestPruneAgentHomeWorktreeIfSafeInfo_UnpushedProbeError(t *testing.T) {
 	fx.setProbe(fx.workerDir, &fakeGitProbe{isRepo: true, unpushedErr: errors.New("boom")})
 
 	var stderr bytes.Buffer
-	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, &stderr)
+	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, nil, &stderr)
 	if !strings.Contains(stderr.String(), "unpushed probe failed") {
 		t.Errorf("expected unpushed-error log; got %q", stderr.String())
 	}
@@ -178,7 +178,7 @@ func TestPruneAgentHomeWorktreeIfSafeInfo_HasStashes(t *testing.T) {
 	fx.setProbe(fx.workerDir, &fakeGitProbe{isRepo: true, hasStashes: true, currentBranch: "builder/ga-ghi789"})
 
 	var stderr bytes.Buffer
-	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, &stderr)
+	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, nil, &stderr)
 	if !strings.Contains(stderr.String(), "stashed work") {
 		t.Errorf("expected stashes-reason log; got %q", stderr.String())
 	}
@@ -190,7 +190,7 @@ func TestPruneAgentHomeWorktreeIfSafeInfo_StashProbeError(t *testing.T) {
 	fx.setProbe(fx.workerDir, &fakeGitProbe{isRepo: true, stashesErr: errors.New("boom")})
 
 	var stderr bytes.Buffer
-	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, &stderr)
+	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, nil, &stderr)
 	if !strings.Contains(stderr.String(), "stash probe failed") {
 		t.Errorf("expected stash-error log; got %q", stderr.String())
 	}
@@ -203,7 +203,7 @@ func TestPruneAgentHomeWorktreeIfSafeInfo_RigPathUnresolved(t *testing.T) {
 	fx.setProbe(fx.workerDir, &fakeGitProbe{isRepo: true})
 
 	var stderr bytes.Buffer
-	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, &stderr)
+	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, nil, &stderr)
 	if !strings.Contains(stderr.String(), "rig path unresolved") {
 		t.Errorf("expected rig-unresolved log; got %q", stderr.String())
 	}
@@ -219,7 +219,7 @@ func TestPruneAgentHomeWorktreeIfSafeInfo_RemoveFails(t *testing.T) {
 	})
 
 	var stderr bytes.Buffer
-	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, &stderr)
+	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, nil, &stderr)
 	if !strings.Contains(stderr.String(), "pruning worker_dir") || !strings.Contains(stderr.String(), "locked") {
 		t.Errorf("expected removal-error log; got %q", stderr.String())
 	}
@@ -234,7 +234,7 @@ func TestPruneAgentHomeWorktreeIfSafeInfo_HappyPath(t *testing.T) {
 	fx.setProbe(fx.rigRoot, rigProbe)
 
 	var stderr bytes.Buffer
-	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, &stderr)
+	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, nil, &stderr)
 	if wdProbe.removeInvoked {
 		t.Error("WorktreeRemove invoked on worker_dir; should be invoked on rig root only")
 	}
@@ -256,7 +256,7 @@ func TestPruneAgentHomeWorktreeIfSafeInfo_HappyPath(t *testing.T) {
 func TestPruneAgentHomeWorktreeIfSafeInfo_NilConfig(t *testing.T) {
 	fx := newPruneFixture(t)
 	var stderr bytes.Buffer
-	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, nil, &stderr)
+	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, nil, nil, &stderr)
 }
 
 func TestLookupRigRootForSessionInfo(t *testing.T) {
