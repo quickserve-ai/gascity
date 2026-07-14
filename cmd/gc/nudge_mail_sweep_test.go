@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/mail"
 	"github.com/gastownhall/gascity/internal/nudgequeue"
 )
 
@@ -708,5 +709,59 @@ func TestCountStaleNudgeMail_MatchesSweepCounts(t *testing.T) {
 	}
 	if counts.MailClosed != 1 {
 		t.Errorf("count: MailClosed = %d, want 1", counts.MailClosed)
+	}
+}
+
+// handoffMailSeed builds a seed Bead representing a read handoff mail bead.
+func handoffMailSeed(id string, createdAt time.Time) beads.Bead {
+	b := mailSeed(id, createdAt)
+	b.Labels = append(b.Labels, mail.HandoffLabel)
+	return b
+}
+
+func TestSweepStaleNudgeMail_HandoffMailLongTTL(t *testing.T) {
+	// Read handoff mail (label mail.HandoffLabel) must survive the ordinary
+	// read-mail TTL and only sweep past nudgeMailSweepHandoffMailTTL (ga-1kor).
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	mailTTL := nudgeMailSweepDefaultMailTTL
+
+	seed := []beads.Bead{
+		handoffMailSeed("handoff-young", now.Add(-2*time.Hour)),                              // past mail TTL, within handoff TTL: keep
+		handoffMailSeed("handoff-ancient", now.Add(-nudgeMailSweepHandoffMailTTL-time.Hour)), // past handoff TTL: sweep
+		mailSeed("plain-old", now.Add(-2*time.Hour)),                                         // ordinary read mail past TTL: sweep
+	}
+	store := beads.NewMemStoreFrom(100, seed, nil)
+
+	counts, err := countStaleNudgeMail(store, nil, now, nudgeMailSweepDefaultNudgeTTL, mailTTL, 0)
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if counts.MailClosed != 2 {
+		t.Errorf("count: MailClosed = %d, want 2", counts.MailClosed)
+	}
+
+	result, err := sweepStaleNudgeMail(store, nil, now, nudgeMailSweepDefaultNudgeTTL, mailTTL, 0)
+	if err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+	if result.MailClosed != 2 {
+		t.Errorf("sweep: MailClosed = %d, want 2", result.MailClosed)
+	}
+
+	young, err := store.Get("handoff-young")
+	if err != nil {
+		t.Fatalf("get handoff-young: %v", err)
+	}
+	if young.Status != "open" {
+		t.Errorf("handoff-young status = %q, want open (handoff TTL exemption)", young.Status)
+	}
+	for _, id := range []string{"handoff-ancient", "plain-old"} {
+		b, err := store.Get(id)
+		if err != nil {
+			t.Fatalf("get %s: %v", id, err)
+		}
+		if b.Status != "closed" {
+			t.Errorf("%s status = %q, want closed", id, b.Status)
+		}
 	}
 }

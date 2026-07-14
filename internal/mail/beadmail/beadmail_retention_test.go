@@ -93,7 +93,7 @@ func TestSweepReadMessagesBefore_ClosesAgedReadMailWithReason(t *testing.T) {
 	mailStore := beads.MailStore{Store: store}
 
 	const reason = "mail gc-swept: test retention reason padded to length"
-	closed, closeErrs, listErr := SweepReadMessagesBefore(mailStore, cutoff, 0, reason)
+	closed, closeErrs, listErr := SweepReadMessagesBefore(mailStore, cutoff, time.Time{}, 0, reason)
 	if listErr != nil {
 		t.Fatalf("unexpected list error: %v", listErr)
 	}
@@ -143,7 +143,7 @@ func TestSweepReadMessagesBefore_LimitCapsCloses(t *testing.T) {
 	store := beads.NewMemStoreFrom(100, seed, nil)
 	mailStore := beads.MailStore{Store: store}
 
-	closed, closeErrs, listErr := SweepReadMessagesBefore(mailStore, now, 2, "reason padded to twenty plus characters")
+	closed, closeErrs, listErr := SweepReadMessagesBefore(mailStore, now, time.Time{}, 2, "reason padded to twenty plus characters")
 	if listErr != nil || len(closeErrs) != 0 {
 		t.Fatalf("unexpected errors: list=%v perBead=%v", listErr, closeErrs)
 	}
@@ -179,7 +179,7 @@ func TestSweepReadMessagesBefore_PerBeadCloseErrorIsCollected(t *testing.T) {
 	store := closeErrStore{MemStore: base, failClose: map[string]error{"bad": errors.New("close boom")}}
 	mailStore := beads.MailStore{Store: store}
 
-	closed, closeErrs, listErr := SweepReadMessagesBefore(mailStore, now, 0, "reason padded to twenty plus characters")
+	closed, closeErrs, listErr := SweepReadMessagesBefore(mailStore, now, time.Time{}, 0, "reason padded to twenty plus characters")
 	if listErr != nil {
 		t.Fatalf("unexpected list error: %v", listErr)
 	}
@@ -199,7 +199,7 @@ func TestSweepReadMessagesBefore_ListErrorIsFatal(t *testing.T) {
 	store := listErrStore{MemStore: beads.NewMemStore(), err: errors.New("store down")}
 	mailStore := beads.MailStore{Store: store}
 
-	closed, closeErrs, listErr := SweepReadMessagesBefore(mailStore, now, 0, "reason padded to twenty plus characters")
+	closed, closeErrs, listErr := SweepReadMessagesBefore(mailStore, now, time.Time{}, 0, "reason padded to twenty plus characters")
 	if listErr == nil {
 		t.Fatal("expected fatal list error")
 	}
@@ -222,7 +222,7 @@ func TestCountReadMessagesBefore_CountsWithoutMutating(t *testing.T) {
 	store := beads.NewMemStoreFrom(100, seed, nil)
 	mailStore := beads.MailStore{Store: store}
 
-	count, err := CountReadMessagesBefore(mailStore, now, 0)
+	count, err := CountReadMessagesBefore(mailStore, now, time.Time{}, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -253,7 +253,7 @@ func TestCountReadMessagesBefore_LimitCapsCount(t *testing.T) {
 	store := beads.NewMemStoreFrom(100, seed, nil)
 	mailStore := beads.MailStore{Store: store}
 
-	count, err := CountReadMessagesBefore(mailStore, now, 2)
+	count, err := CountReadMessagesBefore(mailStore, now, time.Time{}, 2)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -389,8 +389,7 @@ func TestRetentionSweptReadMailStaysAddressableUntilPurge(t *testing.T) {
 
 	// The retention sweep closes the aged read mail with the canonical reason,
 	// exactly as the production nudge-mail watchdog does.
-	closed, closeErrs, listErr := SweepReadMessagesBefore(
-		beads.MailStore{Store: store}, time.Now().Add(time.Hour), 0, RetentionSweepCloseReason)
+	closed, closeErrs, listErr := SweepReadMessagesBefore(beads.MailStore{Store: store}, time.Now().Add(time.Hour), time.Time{}, 0, RetentionSweepCloseReason)
 	if listErr != nil {
 		t.Fatalf("sweep list error: %v", listErr)
 	}

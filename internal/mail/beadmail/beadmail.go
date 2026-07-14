@@ -180,8 +180,8 @@ func (p *Provider) SendHandoff(intent mail.HandoffIntent) (mail.Message, error) 
 	if err != nil {
 		return mail.Message{}, fmt.Errorf("beadmail handoff: %w", err)
 	}
-	labels := make([]string, 0, 1+len(intent.ExtraLabels))
-	labels = append(labels, "thread:"+intent.ThreadID)
+	labels := make([]string, 0, 2+len(intent.ExtraLabels))
+	labels = append(labels, mail.HandoffLabel, "thread:"+intent.ThreadID)
 	labels = append(labels, intent.ExtraLabels...)
 
 	b, err := p.createMessageBead(intent.Subject, intent.Body, from, intent.To, labels, metadata)
@@ -314,7 +314,11 @@ func (p *Provider) MarkRead(id string) error {
 	})
 }
 
-// MarkUnread marks a message as unread (removes "read" label).
+// MarkUnread marks a message as unread (removes "read" label). A closed
+// message bead (e.g. one closed by the mail retention sweep) is reopened
+// first: mark-unread exists to resurface a message, and a closed bead is
+// invisible to every inbox surface, so removing the label alone would
+// silently change nothing (ga-1kor).
 func (p *Provider) MarkUnread(id string) error {
 	b, err := p.store.Get(id)
 	if err != nil {
@@ -322,6 +326,11 @@ func (p *Provider) MarkUnread(id string) error {
 	}
 	if isRemovedMessageBead(b) {
 		return beadmailError("mark-unread", beads.ErrNotFound)
+	}
+	if b.Status == "closed" {
+		if err := p.store.Reopen(id); err != nil {
+			return fmt.Errorf("beadmail mark-unread: reopening closed message: %w", err)
+		}
 	}
 	return p.store.Update(id, beads.UpdateOpts{
 		RemoveLabels: []string{"read"},
@@ -838,7 +847,7 @@ const RetentionSweepCloseReason = "mail gc-swept: read mail bead past gc retenti
 // handling: listErr is the fatal candidate-listing failure (no beads were
 // swept), while closeErrs holds the per-bead metadata/close failures that do not
 // abort the sweep. Returns the number of beads closed.
-func SweepReadMessagesBefore(store beads.MailStore, cutoff time.Time, limit int, closeReason string) (closed int, closeErrs []error, listErr error) {
+func SweepReadMessagesBefore(store beads.MailStore, cutoff, handoffCutoff time.Time, limit int, closeReason string) (closed int, closeErrs []error, listErr error) {
 	candidates, err := readMessagesBefore(store.Store, cutoff, limit)
 	if err != nil {
 		return 0, nil, err
@@ -848,6 +857,9 @@ func SweepReadMessagesBefore(store beads.MailStore, cutoff time.Time, limit int,
 			break
 		}
 		if b.Status != "open" {
+			continue
+		}
+		if hasLabel(b.Labels, mail.HandoffLabel) && b.CreatedAt.After(handoffCutoff) {
 			continue
 		}
 		if err := store.SetMetadata(b.ID, "close_reason", closeReason); err != nil {
@@ -867,7 +879,7 @@ func SweepReadMessagesBefore(store beads.MailStore, cutoff time.Time, limit int,
 // would close for the same cutoff and limit, without mutating any bead. It is the
 // dry-run twin of the sweep and shares its candidate query and limit semantics so
 // the two stay in lockstep.
-func CountReadMessagesBefore(store beads.MailStore, cutoff time.Time, limit int) (int, error) {
+func CountReadMessagesBefore(store beads.MailStore, cutoff, handoffCutoff time.Time, limit int) (int, error) {
 	candidates, err := readMessagesBefore(store.Store, cutoff, limit)
 	if err != nil {
 		return 0, err
@@ -878,6 +890,9 @@ func CountReadMessagesBefore(store beads.MailStore, cutoff time.Time, limit int)
 			break
 		}
 		if b.Status != "open" {
+			continue
+		}
+		if hasLabel(b.Labels, mail.HandoffLabel) && b.CreatedAt.After(handoffCutoff) {
 			continue
 		}
 		count++
