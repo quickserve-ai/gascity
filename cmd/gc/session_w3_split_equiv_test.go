@@ -167,10 +167,9 @@ func TestSessionBeadHasAssignedWorkInfo(t *testing.T) {
 }
 
 // rawPoolTriggerBindingPatchRef is an independent reimplementation of the
-// trigger/pack/workspace/work-dir key-diff that bindPoolSessionTriggerBead
-// computed inline against sessionBead.Metadata, kept in the test as the ground
-// truth computePoolTriggerBindingPatch must match. It reads the RAW bead
-// metadata directly so the oracle proves the Info projection is byte-identical.
+// trigger/pack/workspace/work-dir key-diff against raw bead metadata. It is the
+// ground truth computePoolTriggerBindingPatch must match, proving the typed
+// Info projection preserves both ordinary rebinds and live retry continuations.
 func rawPoolTriggerBindingPatchRef(sb beads.Bead, request SessionRequest, workDir string) session.MetadataPatch {
 	workBeadID := strings.TrimSpace(request.WorkBeadID)
 	metadata := session.MetadataPatch{}
@@ -207,11 +206,34 @@ func rawPoolTriggerBindingPatchRef(sb beads.Bead, request SessionRequest, workDi
 		metadata[beadmeta.PackWorkspaceMetadataKey] = workspace
 	}
 	if workDir != "" {
-		if strings.TrimSpace(sb.Metadata[beadmeta.WorkDirMetadataKey]) != workDir {
-			metadata[beadmeta.WorkDirMetadataKey] = workDir
+		targetWorkDir := workDir
+		existingWorkDir := strings.TrimSpace(sb.Metadata[beadmeta.WorkDirMetadataKey])
+		if existingWorkDir == "" {
+			existingWorkDir = strings.TrimSpace(sb.Metadata[beadmeta.LegacyWorkDirMetadataKey])
 		}
-		if strings.TrimSpace(sb.Metadata[beadmeta.LegacyWorkDirMetadataKey]) != workDir {
-			metadata[beadmeta.LegacyWorkDirMetadataKey] = workDir
+		currentWorkBeadID := strings.TrimSpace(sb.Metadata[session.CurrentBeadIDKey])
+		rawState := session.State(sb.Metadata["state"])
+		if rawState == session.StateAwake {
+			rawState = session.StateActive
+		}
+		if sb.Status == "closed" {
+			rawState = session.StateNone
+		}
+		liveResumeContinuation := oldWorkBeadID != workBeadID &&
+			request.Tier == "resume" &&
+			request.SessionBeadID == sb.ID &&
+			rawState == session.StateActive &&
+			sb.Metadata["wake_mode"] != "fresh" &&
+			currentWorkBeadID != "" &&
+			(currentWorkBeadID == oldWorkBeadID || currentWorkBeadID == workBeadID)
+		if existingWorkDir != "" && (oldWorkBeadID == workBeadID || liveResumeContinuation) {
+			targetWorkDir = existingWorkDir
+		}
+		if strings.TrimSpace(sb.Metadata[beadmeta.WorkDirMetadataKey]) != targetWorkDir {
+			metadata[beadmeta.WorkDirMetadataKey] = targetWorkDir
+		}
+		if strings.TrimSpace(sb.Metadata[beadmeta.LegacyWorkDirMetadataKey]) != targetWorkDir {
+			metadata[beadmeta.LegacyWorkDirMetadataKey] = targetWorkDir
 		}
 	}
 	return metadata
@@ -233,6 +255,17 @@ func TestComputePoolTriggerBindingPatchMatchesRaw(t *testing.T) {
 			beadmeta.WorkDirMetadataKey:             "/gc/old",
 			beadmeta.LegacyWorkDirMetadataKey:       "/old",
 		}},
+		"live-retry": {ID: "s-live", Type: session.BeadType, Status: "open", Labels: []string{session.LabelSession}, Metadata: map[string]string{
+			"state":                                 string(session.StateAwake),
+			session.CurrentBeadIDKey:                "wb-old",
+			beadmeta.TriggerBeadIDMetadataKey:       "wb-old",
+			beadmeta.TriggerBeadStoreRefMetadataKey: "rig-old",
+			beadmeta.BrainParentSIDMetadataKey:      "brain-old",
+			beadmeta.PackMetadataKey:                "pack-old",
+			beadmeta.PackWorkspaceMetadataKey:       "ws-old",
+			beadmeta.WorkDirMetadataKey:             "/gc/old-with-title",
+			beadmeta.LegacyWorkDirMetadataKey:       "/gc/old-with-title",
+		}},
 	}
 	requests := map[string]SessionRequest{
 		"clear":             {WorkBeadID: ""},
@@ -242,6 +275,7 @@ func TestComputePoolTriggerBindingPatchMatchesRaw(t *testing.T) {
 		"store-ref":         {WorkBeadID: "wb-new", WorkStoreRef: "rig-new"},
 		"pack":              {WorkBeadID: "wb-new", WorkPack: "pack-new"},
 		"workspace":         {WorkBeadID: "wb-new", WorkPack: "pack-new", WorkWorkspace: "ws-new"},
+		"live-retry":        {Tier: "resume", SessionBeadID: "s-live", WorkBeadID: "wb-new"},
 	}
 	workDirs := []string{"", "/gc/old", "/gc/new"}
 	for bn, sb := range bases {
@@ -255,5 +289,214 @@ func TestComputePoolTriggerBindingPatchMatchesRaw(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestComputePoolTriggerBindingPatchPreservesRecordedWorkDirForSameTrigger(t *testing.T) {
+	tests := []struct {
+		name      string
+		metadata  map[string]string
+		request   SessionRequest
+		derived   string
+		wantPatch map[string]string
+	}{
+		{
+			name: "canonical path heals missing legacy twin",
+			metadata: map[string]string{
+				beadmeta.TriggerBeadIDMetadataKey: "wb-same",
+				beadmeta.WorkDirMetadataKey:       "/work/wb-same-with-title",
+			},
+			request: SessionRequest{WorkBeadID: "wb-same"},
+			derived: "/work/wb-same",
+			wantPatch: map[string]string{
+				beadmeta.LegacyWorkDirMetadataKey: "/work/wb-same-with-title",
+			},
+		},
+		{
+			name: "legacy path heals missing canonical twin",
+			metadata: map[string]string{
+				beadmeta.TriggerBeadIDMetadataKey: "wb-same",
+				beadmeta.LegacyWorkDirMetadataKey: "/work/wb-same-with-title",
+			},
+			request: SessionRequest{WorkBeadID: "wb-same"},
+			derived: "/work/wb-same",
+			wantPatch: map[string]string{
+				beadmeta.WorkDirMetadataKey: "/work/wb-same-with-title",
+			},
+		},
+		{
+			name: "canonical path wins over divergent legacy twin",
+			metadata: map[string]string{
+				beadmeta.TriggerBeadIDMetadataKey: "wb-same",
+				beadmeta.WorkDirMetadataKey:       "/work/wb-same-with-title",
+				beadmeta.LegacyWorkDirMetadataKey: "/work/wb-same",
+			},
+			request: SessionRequest{WorkBeadID: "wb-same"},
+			derived: "/work/wb-same",
+			wantPatch: map[string]string{
+				beadmeta.LegacyWorkDirMetadataKey: "/work/wb-same-with-title",
+			},
+		},
+		{
+			name: "different trigger receives newly derived path",
+			metadata: map[string]string{
+				beadmeta.TriggerBeadIDMetadataKey: "wb-old",
+				beadmeta.WorkDirMetadataKey:       "/work/wb-old-with-title",
+				beadmeta.LegacyWorkDirMetadataKey: "/work/wb-old-with-title",
+			},
+			request: SessionRequest{WorkBeadID: "wb-new"},
+			derived: "/work/wb-new-with-title",
+			wantPatch: map[string]string{
+				beadmeta.TriggerBeadIDMetadataKey: "wb-new",
+				beadmeta.WorkDirMetadataKey:       "/work/wb-new-with-title",
+				beadmeta.LegacyWorkDirMetadataKey: "/work/wb-new-with-title",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			info := sessiontest.SeedBead(t, beads.Bead{
+				ID:       "session-1",
+				Type:     session.BeadType,
+				Status:   "open",
+				Labels:   []string{session.LabelSession},
+				Metadata: tt.metadata,
+			})
+			got := computePoolTriggerBindingPatch(info, tt.request, tt.derived)
+			if !reflect.DeepEqual(map[string]string(got), tt.wantPatch) {
+				t.Fatalf("patch = %#v, want %#v", got, tt.wantPatch)
+			}
+		})
+	}
+}
+
+func TestComputePoolTriggerBindingPatchPreservesLiveRetryWorkDir(t *testing.T) {
+	type testCase struct {
+		name      string
+		state     session.State
+		wakeMode  string
+		currentID string
+		request   SessionRequest
+		wantDir   string
+	}
+	tests := []testCase{
+		{
+			name:      "awake retry with prior-attempt marker",
+			state:     session.StateAwake,
+			currentID: "wb-old",
+			request:   SessionRequest{Tier: "resume", SessionBeadID: "session-1", WorkBeadID: "wb-new"},
+			wantDir:   "/work/wb-old-with-title",
+		},
+		{
+			name:      "active retry with new-attempt marker",
+			state:     session.StateActive,
+			currentID: "wb-new",
+			request:   SessionRequest{Tier: "resume", SessionBeadID: "session-1", WorkBeadID: "wb-new"},
+			wantDir:   "/work/wb-old-with-title",
+		},
+		{
+			name:    "missing current-bead marker derives",
+			state:   session.StateActive,
+			request: SessionRequest{Tier: "resume", SessionBeadID: "session-1", WorkBeadID: "wb-new"},
+			wantDir: "/work/wb-new-with-title",
+		},
+		{
+			name:      "unrelated current-bead marker derives",
+			state:     session.StateActive,
+			currentID: "wb-unrelated",
+			request:   SessionRequest{Tier: "resume", SessionBeadID: "session-1", WorkBeadID: "wb-new"},
+			wantDir:   "/work/wb-new-with-title",
+		},
+		{
+			name:      "anonymous resume request derives",
+			state:     session.StateActive,
+			currentID: "wb-old",
+			request:   SessionRequest{Tier: "resume", WorkBeadID: "wb-new"},
+			wantDir:   "/work/wb-new-with-title",
+		},
+		{
+			name:      "resume request for another session derives",
+			state:     session.StateActive,
+			currentID: "wb-old",
+			request:   SessionRequest{Tier: "resume", SessionBeadID: "session-2", WorkBeadID: "wb-new"},
+			wantDir:   "/work/wb-new-with-title",
+		},
+		{
+			name:      "new tier derives",
+			state:     session.StateActive,
+			currentID: "wb-old",
+			request:   SessionRequest{Tier: "new", SessionBeadID: "session-1", WorkBeadID: "wb-new"},
+			wantDir:   "/work/wb-new-with-title",
+		},
+		{
+			name:      "wake-known-identity tier derives",
+			state:     session.StateActive,
+			currentID: "wb-old",
+			request:   SessionRequest{Tier: "wake-known-identity", SessionBeadID: "session-1", WorkBeadID: "wb-new"},
+			wantDir:   "/work/wb-new-with-title",
+		},
+		{
+			name:      "fresh wake mode derives",
+			state:     session.StateActive,
+			wakeMode:  "fresh",
+			currentID: "wb-old",
+			request:   SessionRequest{Tier: "resume", SessionBeadID: "session-1", WorkBeadID: "wb-new"},
+			wantDir:   "/work/wb-new-with-title",
+		},
+		{
+			name:      "noncanonical wake mode follows resume lifecycle",
+			state:     session.StateActive,
+			wakeMode:  " fresh ",
+			currentID: "wb-old",
+			request:   SessionRequest{Tier: "resume", SessionBeadID: "session-1", WorkBeadID: "wb-new"},
+			wantDir:   "/work/wb-old-with-title",
+		},
+	}
+
+	for _, dormantState := range []session.State{
+		session.StateAsleep,
+		session.StateStartPending,
+		session.StateCreating,
+		session.StateDraining,
+		session.StateDrained,
+		session.StateSuspended,
+		session.StateArchived,
+		session.StateQuarantined,
+	} {
+		tests = append(tests, testCase{
+			name:      string(dormantState) + " session derives before restart",
+			state:     dormantState,
+			currentID: "wb-old",
+			request:   SessionRequest{Tier: "resume", SessionBeadID: "session-1", WorkBeadID: "wb-new"},
+			wantDir:   "/work/wb-new-with-title",
+		})
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			info := sessiontest.SeedBead(t, beads.Bead{
+				ID:     "session-1",
+				Type:   session.BeadType,
+				Status: "open",
+				Labels: []string{session.LabelSession},
+				Metadata: map[string]string{
+					"state":                           string(tt.state),
+					"wake_mode":                       tt.wakeMode,
+					session.CurrentBeadIDKey:          tt.currentID,
+					beadmeta.TriggerBeadIDMetadataKey: "wb-old",
+					beadmeta.WorkDirMetadataKey:       "/work/wb-old-with-title",
+					beadmeta.LegacyWorkDirMetadataKey: "/work/wb-old-with-title",
+				},
+			})
+			got := computePoolTriggerBindingPatch(info, tt.request, "/work/wb-new-with-title")
+			updated := info.ApplyPatch(got)
+			if updated.WorkDirCanonical != tt.wantDir {
+				t.Fatalf("gc.work_dir = %q, want %q; patch=%#v", updated.WorkDirCanonical, tt.wantDir, got)
+			}
+			if updated.WorkDir != tt.wantDir {
+				t.Fatalf("work_dir = %q, want %q; patch=%#v", updated.WorkDir, tt.wantDir, got)
+			}
+		})
 	}
 }
