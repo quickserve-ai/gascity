@@ -947,7 +947,7 @@ func TestReconcileSessionBeads_DrainDeadlineRetirePrunesTheWorktree(t *testing.T
 	seat := stuckDrainedPoolSeat(t, env, "drained", poolSlotDrainRetireDeadline+time.Minute)
 
 	var pruned []string
-	restore := swapWorktreePruneForTest(func(info sessionpkg.Info, _ string, _ *config.City, _ io.Writer) {
+	restore := swapWorktreePruneForTest(func(info sessionpkg.Info, _ string, _ *config.City, _ runtime.Provider, _ io.Writer) {
 		pruned = append(pruned, info.ID)
 	})
 	defer restore()
