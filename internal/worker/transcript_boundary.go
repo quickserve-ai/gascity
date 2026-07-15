@@ -58,6 +58,29 @@ func DefaultSearchPaths() []string {
 	return sessionlog.DefaultSearchPaths()
 }
 
+// SessionHistoryEntry aliases one discovered transcript-history row.
+type SessionHistoryEntry = sessionlog.SessionHistoryEntry
+
+// TranscriptSummary aliases the cheap transcript head/tail summary.
+type TranscriptSummary = sessionlog.TranscriptSummary
+
+// ListClaudeSessionHistory lists every claude-family transcript recorded for
+// workDir across live and archive roots, newest first.
+func ListClaudeSessionHistory(searchPaths, archiveRoots []string, workDir string) []SessionHistoryEntry {
+	return sessionlog.ListClaudeSessionHistory(searchPaths, archiveRoots, workDir)
+}
+
+// ReadClaudeTranscriptSummary scans a transcript for its title, agent name,
+// first user message, and first timestamp.
+func ReadClaudeTranscriptSummary(path string) TranscriptSummary {
+	return sessionlog.ReadClaudeTranscriptSummary(path)
+}
+
+// DefaultTranscriptArchiveRoots returns the transcript-reaper archive roots.
+func DefaultTranscriptArchiveRoots() []string {
+	return sessionlog.DefaultTranscriptArchiveRoots()
+}
+
 // MergeSearchPaths normalizes and deduplicates transcript search roots.
 func MergeSearchPaths(paths []string) []string {
 	return sessionlog.MergeSearchPaths(paths)
