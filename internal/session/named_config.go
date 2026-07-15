@@ -76,6 +76,32 @@ func NamedSessionBackingTemplate(spec NamedSessionSpec) string {
 	return ""
 }
 
+// FindNamedSessionSpecsByBackingTemplate returns every configured named
+// session whose resolved backing agent template equals the qualified template
+// name. Manual session-creation paths use this to detect that a raw template
+// target would shadow a configured named session identity (ga-e4jb): such a
+// session runs the same agent in the same work dir as the named session but
+// carries none of its metadata, so the named-session dedup machinery cannot
+// see it.
+func FindNamedSessionSpecsByBackingTemplate(cfg *config.City, cityName, templateQualifiedName string) []NamedSessionSpec {
+	templateQualifiedName = NormalizeNamedSessionTarget(templateQualifiedName)
+	if cfg == nil || templateQualifiedName == "" {
+		return nil
+	}
+	var specs []NamedSessionSpec
+	for i := range cfg.NamedSessions {
+		identity := cfg.NamedSessions[i].QualifiedName()
+		spec, ok := FindNamedSessionSpec(cfg, cityName, identity)
+		if !ok {
+			continue
+		}
+		if NamedSessionBackingTemplate(spec) == templateQualifiedName {
+			specs = append(specs, spec)
+		}
+	}
+	return specs
+}
+
 // ResolveNamedSessionSpecForConfigTarget resolves a config-facing token to a named session spec when possible.
 func ResolveNamedSessionSpecForConfigTarget(cfg *config.City, cityName, target, rigContext string) (NamedSessionSpec, bool, error) {
 	target = NormalizeNamedSessionTarget(target)
