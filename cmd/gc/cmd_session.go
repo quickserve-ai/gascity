@@ -193,6 +193,27 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach, json
 		alias = workdirutil.SessionQualifiedName(cityPath, found, cfg.Rigs, requestedAlias, "")
 	}
 	cityName := loadedCityName(cfg, cityPath)
+	// ga-e4jb: an alias-less session created from a SINGLE-session template
+	// that backs a configured named session duplicates that identity — it
+	// claims the raw template qualified name as its alias and shares the
+	// named session's work dir, while carrying no named-session metadata, so
+	// the dedup machinery never sees it (the "two lanas" incident). Point
+	// the caller at the named identity; an explicit --alias remains the
+	// escape hatch for a deliberate parallel session under its own identity.
+	// Multi-session templates are exempt: factory creates there mint
+	// distinct instance identities with an empty alias and are sanctioned
+	// (see TestPhase0CmdSessionNew_FactoryTargetDoesNotMaterializeNamedIdentity).
+	if requestedAlias == "" && !found.SupportsMultipleSessions() {
+		if specs := findNamedSessionSpecsByBackingTemplate(cfg, cityName, found.QualifiedName()); len(specs) > 0 {
+			identities := make([]string, len(specs))
+			for i, s := range specs {
+				identities[i] = s.Identity
+			}
+			fmt.Fprintf(stderr, "gc session new: template %q backs configured named session %s — target it directly (e.g. \"gc nudge %s\"), or pass --alias to create a separate session under its own identity\n",
+				found.QualifiedName(), strings.Join(identities, ", "), identities[0]) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+	}
 	explicitName, err := sessionExplicitNameForNewSession(cityPath, cityName, cfg.Rigs, &found, alias)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session new: %v\n", err) //nolint:errcheck // best-effort stderr

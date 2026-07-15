@@ -3227,3 +3227,66 @@ func TestRouteSessionPeek_StaleBannerOver30s(t *testing.T) {
 		t.Errorf("stale banner missing from human output:\n%s", stdout.String())
 	}
 }
+
+// ga-e4jb: `gc session new <template>` where a SINGLE-session template backs
+// a configured named session must refuse (pointing at the named identity)
+// unless an explicit --alias forks a deliberate parallel session.
+// Multi-session templates keep sanctioned factory semantics — covered by
+// TestPhase0CmdSessionNew_FactoryTargetDoesNotMaterializeNamedIdentity.
+func TestCmdSessionNew_RefusesRawTemplateBackingNamedSession(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_SESSION", "fake")
+
+	cityDir := t.TempDir()
+	t.Setenv("GC_CITY", cityDir)
+	if err := os.MkdirAll(filepath.Join(cityDir, ".gc"), 0o755); err != nil {
+		t.Fatalf("MkdirAll(.gc): %v", err)
+	}
+	rigRoot := filepath.Join(cityDir, "repos", "demo")
+	if err := os.MkdirAll(rigRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll(rig root): %v", err)
+	}
+	data := []byte(fmt.Sprintf(`[workspace]
+name = "test-city"
+
+[beads]
+provider = "file"
+
+[providers.codex]
+base = "builtin:codex"
+
+[[rigs]]
+name = "demo"
+path = %q
+
+[[agent]]
+name = "helper"
+dir = "demo"
+provider = "codex"
+start_command = "echo"
+max_active_sessions = 1
+
+[[named_session]]
+name = "lana"
+template = "helper"
+dir = "demo"
+mode = "always"
+`, rigRoot))
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), data, 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdSessionNew([]string{"demo/helper"}, "", "", "", true, false, &stdout, &stderr); code != 1 {
+		t.Fatalf("cmdSessionNew(raw template) = %d, want 1; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "demo/lana") {
+		t.Fatalf("refusal must name the configured named session identity; stderr=%s", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := cmdSessionNew([]string{"demo/helper"}, "demo/sky", "", "", true, false, &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdSessionNew(raw template, --alias) = %d, want 0; stderr=%s", code, stderr.String())
+	}
+}

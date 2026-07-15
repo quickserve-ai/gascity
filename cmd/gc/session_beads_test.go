@@ -8199,3 +8199,207 @@ func TestPendingPoolSessionName_SanitizesDottedTemplate(t *testing.T) {
 		})
 	}
 }
+
+// ga-e4jb: a manual session created from a named session's raw backing
+// template (no distinct alias, no named-session metadata) must be retired
+// once a live canonical named bead exists — while deliberately-aliased
+// manual sessions and pool-managed ephemerals from the same template
+// survive untouched.
+func TestRetireDuplicateConfiguredNamedSessionBeads_RetiresTemplateShadow(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{
+			{Name: "helper", StartCommand: "true"},
+		},
+		NamedSessions: []config.NamedSession{
+			{Name: "lana", Template: "helper", Mode: "always"},
+		},
+	}
+	canonicalSessionName := config.NamedSessionRuntimeName(cfg.Workspace.Name, cfg.Workspace, "lana")
+	for _, sn := range []string{canonicalSessionName, "s-shadow", "s-sky", "s-pool"} {
+		if err := sp.Start(context.Background(), sn, runtime.Config{}); err != nil {
+			t.Fatalf("start session %s: %v", sn, err)
+		}
+	}
+	canonical, err := store.Create(beads.Bead{
+		Title:  "lana",
+		Type:   sessionBeadType,
+		Status: "open",
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name":               canonicalSessionName,
+			"template":                   "helper",
+			"agent_name":                 "lana",
+			"alias":                      "lana",
+			"state":                      "awake",
+			namedSessionMetadataKey:      "true",
+			namedSessionIdentityMetadata: "lana",
+			namedSessionModeMetadata:     "always",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create canonical: %v", err)
+	}
+	shadow, err := store.Create(beads.Bead{
+		Title:  "helper",
+		Type:   sessionBeadType,
+		Status: "open",
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name":   "s-shadow",
+			"template":       "helper",
+			"agent_name":     "helper",
+			"alias":          "helper",
+			"session_origin": "manual",
+			"state":          "awake",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create shadow: %v", err)
+	}
+	aliased, err := store.Create(beads.Bead{
+		Title:  "sky",
+		Type:   sessionBeadType,
+		Status: "open",
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name":   "s-sky",
+			"template":       "helper",
+			"agent_name":     "sky",
+			"alias":          "sky",
+			"session_origin": "manual",
+			"state":          "awake",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create aliased: %v", err)
+	}
+	pooled, err := store.Create(beads.Bead{
+		Title:  "helper-2",
+		Type:   sessionBeadType,
+		Status: "open",
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name": "s-pool",
+			"template":     "helper",
+			"agent_name":   "helper-2",
+			"pool_slot":    "2",
+			"state":        "awake",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create pooled: %v", err)
+	}
+	work, err := store.Create(beads.Bead{
+		Title:    "shadow work",
+		Type:     "task",
+		Status:   "open",
+		Assignee: shadow.ID,
+	})
+	if err != nil {
+		t.Fatalf("create shadow-assigned work: %v", err)
+	}
+
+	openBeads := []beads.Bead{canonical, shadow, aliased, pooled}
+	bySessionName := map[string]beads.Bead{
+		canonicalSessionName: canonical,
+		"s-shadow":           shadow,
+		"s-sky":              aliased,
+		"s-pool":             pooled,
+	}
+	indexBySessionName := map[string]int{
+		canonicalSessionName: 0,
+		"s-shadow":           1,
+		"s-sky":              2,
+		"s-pool":             3,
+	}
+
+	retired := retireDuplicateConfiguredNamedSessionBeads(
+		store, nil, sp, cfg, "test-city", openBeads, bySessionName, indexBySessionName, time.Now().UTC(), io.Discard,
+	)
+
+	if retired[1].Metadata["state"] != "archived" {
+		t.Fatalf("shadow state = %q, want archived", retired[1].Metadata["state"])
+	}
+	if retired[1].Metadata["retired_named_identity"] != "lana" {
+		t.Fatalf("shadow retired_named_identity = %q, want lana", retired[1].Metadata["retired_named_identity"])
+	}
+	if sp.IsRunning("s-shadow") {
+		t.Fatal("shadow runtime session still running, want stopped")
+	}
+	if !sp.IsRunning(canonicalSessionName) {
+		t.Fatal("canonical runtime session stopped, want running")
+	}
+	if retired[0].Metadata["state"] != "awake" {
+		t.Fatalf("canonical state = %q, want awake", retired[0].Metadata["state"])
+	}
+	if retired[2].Metadata["state"] != "awake" || !sp.IsRunning("s-sky") {
+		t.Fatal("deliberately-aliased session was touched, want untouched")
+	}
+	if retired[3].Metadata["state"] != "awake" || !sp.IsRunning("s-pool") {
+		t.Fatal("pool-managed session was touched, want untouched")
+	}
+	if _, ok := bySessionName["s-shadow"]; ok {
+		t.Fatal("shadow session_name still indexed after retirement")
+	}
+	updatedWork, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("get shadow-assigned work: %v", err)
+	}
+	if updatedWork.Assignee != canonical.ID {
+		t.Fatalf("shadow-assigned work assignee = %q, want canonical %q", updatedWork.Assignee, canonical.ID)
+	}
+}
+
+// ga-e4jb: without a live canonical bead the shadow must be left alone —
+// creation-time guards stop new shadows; the sweep only collapses a
+// duplicate pair, it never takes down the last live session for an agent.
+func TestRetireDuplicateConfiguredNamedSessionBeads_KeepsShadowWithoutCanonical(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{
+			{Name: "helper", StartCommand: "true"},
+		},
+		NamedSessions: []config.NamedSession{
+			{Name: "lana", Template: "helper", Mode: "always"},
+		},
+	}
+	if err := sp.Start(context.Background(), "s-shadow", runtime.Config{}); err != nil {
+		t.Fatalf("start shadow session: %v", err)
+	}
+	shadow, err := store.Create(beads.Bead{
+		Title:  "helper",
+		Type:   sessionBeadType,
+		Status: "open",
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name":   "s-shadow",
+			"template":       "helper",
+			"agent_name":     "helper",
+			"alias":          "helper",
+			"session_origin": "manual",
+			"state":          "awake",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create shadow: %v", err)
+	}
+
+	openBeads := []beads.Bead{shadow}
+	retired := retireDuplicateConfiguredNamedSessionBeads(
+		store, nil, sp, cfg, "test-city", openBeads,
+		map[string]beads.Bead{"s-shadow": shadow}, map[string]int{"s-shadow": 0},
+		time.Now().UTC(), io.Discard,
+	)
+
+	if retired[0].Metadata["state"] != "awake" {
+		t.Fatalf("shadow state = %q, want awake (untouched without canonical)", retired[0].Metadata["state"])
+	}
+	if !sp.IsRunning("s-shadow") {
+		t.Fatal("shadow runtime session stopped, want running")
+	}
+}

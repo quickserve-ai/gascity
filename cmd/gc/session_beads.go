@@ -481,6 +481,77 @@ func retireDuplicateConfiguredNamedSessionBeads(
 			indexBySessionName[sn] = winner
 		}
 	}
+
+	// ga-e4jb: a manual session created from a named session's raw backing
+	// SINGLE-session template (e.g. `gc session new qcore/cherub-law.lana`
+	// with no --alias) claims the template qualified name as its alias and
+	// carries no configured_named_session metadata, so the identity dedup
+	// above never sees it — yet it runs the same agent in the same work dir
+	// as the configured named session, and the desired-state overlay keeps
+	// respawning it after every kill. When a live canonical bead exists,
+	// retire such shadow beads. alias == backing template is the shadow
+	// signature: factory/pool sessions keep an EMPTY alias (sanctioned, see
+	// the phase-0 factory spec) and deliberately-aliased sessions are their
+	// own identity — both spared, as are pool-managed ephemerals.
+	for i := range cfg.NamedSessions {
+		identity := cfg.NamedSessions[i].QualifiedName()
+		spec, ok := findNamedSessionSpec(cfg, cityName, identity)
+		if !ok {
+			continue
+		}
+		canonical, hasCanonical := session.FindCanonicalNamedSessionBead(openBeads, spec)
+		if !hasCanonical {
+			continue
+		}
+		backing := namedSessionBackingTemplate(spec)
+		if backing == "" {
+			continue
+		}
+		for idx := range openBeads {
+			b := openBeads[idx]
+			if b.ID == canonical.ID || b.Status == "closed" {
+				continue
+			}
+			if isNamedSessionBead(b) || isPoolManagedSessionBead(b) {
+				continue
+			}
+			template := strings.TrimSpace(b.Metadata["template"])
+			agentName := strings.TrimSpace(b.Metadata["agent_name"])
+			if template != backing && agentName != backing {
+				continue
+			}
+			if strings.TrimSpace(b.Metadata["alias"]) != backing {
+				continue
+			}
+			oldSessionName := strings.TrimSpace(b.Metadata["session_name"])
+			if !stopRuntimeBeforeSessionBeadMutation(store, sp, cfg, b, "shadows configured named session", stderr) {
+				continue
+			}
+			batch := session.RetireNamedSessionPatch(now, "duplicate-repair", spec.Identity)
+			if setMetaBatch(store, b.ID, batch, stderr) != nil {
+				continue
+			}
+			status := "open"
+			if err := store.Update(b.ID, beads.UpdateOpts{Status: &status}); err != nil {
+				fmt.Fprintf(stderr, "session beads: archiving shadow of named session %s: %v\n", spec.Identity, err) //nolint:errcheck
+				continue
+			}
+			reassignWorkAssignedToRetiredSessionBead(store, rigStores, b, canonical.ID, stderr)
+			reassignStateAssignedToRetiredSessionBead(store, b.ID, canonical.ID, now, stderr)
+			if b.Metadata == nil {
+				b.Metadata = make(map[string]string, len(batch))
+			}
+			for k, v := range batch {
+				b.Metadata[k] = v
+			}
+			b.Status = status
+			openBeads[idx] = b
+			if oldSessionName != "" {
+				delete(bySessionName, oldSessionName)
+				delete(indexBySessionName, oldSessionName)
+			}
+		}
+	}
 	return openBeads
 }
 
