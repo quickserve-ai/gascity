@@ -83,6 +83,10 @@ func findNamedSessionSpecForAssignee(cfg *config.City, cityName, assignee string
 	return namedSessionSpec{}, false
 }
 
+func findNamedSessionSpecsByBackingTemplate(cfg *config.City, cityName, templateQualifiedName string) []namedSessionSpec {
+	return session.FindNamedSessionSpecsByBackingTemplate(cfg, cityName, templateQualifiedName)
+}
+
 func resolveNamedSessionSpecForConfigTarget(cfg *config.City, cityName, target, rigContext string) (namedSessionSpec, bool, error) {
 	return session.ResolveNamedSessionSpecForConfigTarget(cfg, cityName, target, rigContext)
 }
