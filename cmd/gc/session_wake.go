@@ -80,7 +80,9 @@ func preWakeCommit(
 		sleepReason = string(sessions.SleepReasonIdleTimeout)
 	}
 
-	freshWake := info.WakeMode == "fresh" || pendingContinuationResetNeedsFreshStart(info)
+	// A seeded resume pins the session key to a prior conversation.
+	freshWake := (info.WakeMode == "fresh" || pendingContinuationResetNeedsFreshStart(info)) &&
+		!sessions.IsResumeSeededInfo(info)
 	batch := sessions.PreWakePatch(sessions.PreWakePatchInput{
 		Generation:        newGen,
 		InstanceToken:     token,
@@ -92,6 +94,7 @@ func preWakeCommit(
 		// stale-create bound must keep measuring from the episode start.
 		EpisodePendingCreateStartedAt: pendingCreateEpisodeStartedAt(info),
 	})
+	sessions.StampPriorSessionKeyInfo(batch, info)
 	if writeErr := sessFront.ApplyPatch(info.ID, batch); writeErr != nil {
 		return 0, "", nil, fmt.Errorf("pre-wake metadata commit: %w", writeErr)
 	}
@@ -1000,18 +1003,13 @@ func advanceSessionDrainsWithSessionsTraced(
 	}
 }
 
-// completeDrain writes drain-complete metadata to the store for the drained
-// session. It reads only the typed Info (id + raw wake_mode); the raw-bead
-// mirror the reconciler used to keep is dropped. Nothing reads a drained
-// session's metadata later in the tick — the awake scan runs before
-// advanceSessionDrainsWithSessionsTraced, and completeDrain is always followed by dt.remove +
-// continue — so the store write is the sole observable effect (all completeDrain
-// tests assert on store.Get). With no store there is nothing to persist.
+// completeDrain writes drain-complete metadata to the typed session store.
 func completeDrain(info sessions.Info, sessFront *sessions.Store, ds *drainState, clk clock.Clock) {
 	if sessFront == nil {
 		return
 	}
 	batch := sessions.CompleteDrainPatch(clk.Now(), ds.reason, info.WakeMode == "fresh")
+	sessions.StampPriorSessionKeyInfo(batch, info)
 	_ = sessFront.ApplyPatch(info.ID, batch)
 }
 
