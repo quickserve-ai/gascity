@@ -707,6 +707,7 @@ func recordWakeFailure(info sessionpkg.Info, sessFront *sessionpkg.Store, clk cl
 	if info.SessionKey != "" || info.StartedConfigHash != "" {
 		if !wakeFailureKeepsConversation(info) {
 			reset := sessionpkg.ConversationResetPatch(true)
+			sessionpkg.StampPriorSessionKeyInfo(reset, info)
 			_ = sessFront.ApplyPatch(info.ID, reset)
 			info = info.ApplyPatch(reset)
 		}
@@ -803,6 +804,7 @@ func recordChurn(info sessionpkg.Info, sessFront *sessionpkg.Store, clk clock.Cl
 	// before) with an unconditional Info fold.
 	if info.SessionKey != "" {
 		reset := sessionpkg.ConversationResetPatch(false)
+		sessionpkg.StampPriorSessionKeyInfo(reset, info)
 		_ = sessFront.ApplyPatch(info.ID, reset)
 		info = info.ApplyPatch(reset)
 	}

@@ -283,6 +283,7 @@ func TestConversationResetPatch(t *testing.T) {
 	assertPatch(t, ConversationResetPatch(true), MetadataPatch{
 		"session_key":                "",
 		"started_config_hash":        "",
+		"resume_seeded":              "",
 		"continuation_reset_pending": "true",
 		// Priming markers share started_config_hash's lifetime (S19 Stage 2).
 		"primed_at":            "",
@@ -291,6 +292,7 @@ func TestConversationResetPatch(t *testing.T) {
 	})
 	assertPatch(t, ConversationResetPatch(false), MetadataPatch{
 		"session_key":                "",
+		"resume_seeded":              "",
 		"continuation_reset_pending": "true",
 	})
 }
