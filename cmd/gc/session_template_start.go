@@ -89,6 +89,29 @@ func materializeSessionForTemplateWithOptions(
 			if resolvedSpec, foundNamed := findNamedSessionSpec(cfg, cityName, found.QualifiedName()); foundNamed {
 				spec = resolvedSpec
 				hasNamed = true
+			} else if !found.SupportsMultipleSessions() {
+				// ga-e4jb: the lookup above matches only named sessions whose
+				// identity equals the agent's qualified name, which a
+				// [[named_session]] with a distinct name= never satisfies —
+				// so a raw backing-template target used to fall through to
+				// materializeSessionForAgentConfig and mint a manual session
+				// that shadowed the named identity. Collapse into the named
+				// session when exactly one backs this single-session
+				// template. Multi-session templates keep factory semantics:
+				// a raw-template target there mints sanctioned ephemeral
+				// capacity, never the named identity (phase-0 factory spec).
+				switch specs := findNamedSessionSpecsByBackingTemplate(cfg, cityName, found.QualifiedName()); len(specs) {
+				case 0:
+				case 1:
+					spec = specs[0]
+					hasNamed = true
+				default:
+					identities := make([]string, len(specs))
+					for i, s := range specs {
+						identities[i] = s.Identity
+					}
+					return "", fmt.Errorf("template %q backs multiple configured named sessions (%s) — target one named identity", found.QualifiedName(), strings.Join(identities, ", "))
+				}
 			}
 		}
 	}

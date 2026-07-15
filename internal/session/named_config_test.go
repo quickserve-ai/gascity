@@ -714,3 +714,42 @@ func TestNamedSessionResolutionCandidates_NilStore(t *testing.T) {
 		t.Fatalf("got %v, want nil for nil store", got)
 	}
 }
+
+func TestFindNamedSessionSpecsByBackingTemplate(t *testing.T) {
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{
+			{Name: "helper"},
+			{Name: "solo"},
+		},
+		NamedSessions: []config.NamedSession{
+			{Name: "lana", Template: "helper", Mode: "always"},
+			{Name: "pam", Template: "helper", Mode: "on_demand"},
+			{Name: "ray", Template: "solo"},
+		},
+	}
+
+	specs := FindNamedSessionSpecsByBackingTemplate(cfg, "test-city", "helper")
+	if len(specs) != 2 {
+		t.Fatalf("specs for helper = %d, want 2", len(specs))
+	}
+	got := map[string]bool{}
+	for _, s := range specs {
+		got[s.Identity] = true
+	}
+	if !got["lana"] || !got["pam"] {
+		t.Fatalf("specs identities = %v, want lana and pam", got)
+	}
+
+	specs = FindNamedSessionSpecsByBackingTemplate(cfg, "test-city", "solo")
+	if len(specs) != 1 || specs[0].Identity != "ray" {
+		t.Fatalf("specs for solo = %#v, want single ray", specs)
+	}
+
+	if specs := FindNamedSessionSpecsByBackingTemplate(cfg, "test-city", "unbacked"); len(specs) != 0 {
+		t.Fatalf("specs for unbacked template = %d, want 0", len(specs))
+	}
+	if specs := FindNamedSessionSpecsByBackingTemplate(nil, "test-city", "helper"); specs != nil {
+		t.Fatalf("specs for nil cfg = %#v, want nil", specs)
+	}
+}
