@@ -859,13 +859,17 @@ func buildPreparedStartWithWorkDirResolver(
 		}
 		session.Metadata["session_key"] = sessionKey
 	}
+	// A seeded resume (gc session resume) must take the resume branch even
+	// when started_config_hash is empty (normally first start) or wake_mode
+	// is fresh — the seed IS the requested conversation.
+	seededResume := sessionpkg.IsResumeSeeded(session.Metadata)
 	if sk := session.Metadata["session_key"]; sk != "" && tp.ResolvedProvider != nil && !tp.IsACP {
-		firstStart := session.Metadata["started_config_hash"] == ""
-		forceFresh := session.Metadata["wake_mode"] == "fresh"
+		firstStart := session.Metadata["started_config_hash"] == "" && !seededResume
+		forceFresh := session.Metadata["wake_mode"] == "fresh" && !seededResume
 		agentCfg.Command = resolveSessionCommand(agentCfg.Command, sk, tp.ResolvedProvider, firstStart, forceFresh)
 	}
-	firstStart := session.Metadata["started_config_hash"] == ""
-	forceFresh := session.Metadata["wake_mode"] == "fresh"
+	firstStart := session.Metadata["started_config_hash"] == "" && !seededResume
+	forceFresh := session.Metadata["wake_mode"] == "fresh" && !seededResume
 	hasResumeKey := strings.TrimSpace(session.Metadata["session_key"]) != ""
 	if !firstStart && !forceFresh && hasResumeKey {
 		agentCfg.PromptSuffix = ""
@@ -888,8 +892,8 @@ func buildPreparedStartWithWorkDirResolver(
 	if raw := session.Metadata["template_overrides"]; raw != "" {
 		var overrides map[string]string
 		if err := json.Unmarshal([]byte(raw), &overrides); err == nil {
-			firstStart := session.Metadata["started_config_hash"] == ""
-			forceFresh := session.Metadata["wake_mode"] == "fresh"
+			firstStart := session.Metadata["started_config_hash"] == "" && !seededResume
+			forceFresh := session.Metadata["wake_mode"] == "fresh" && !seededResume
 			if msg, ok := overrides["initial_message"]; ok && msg != "" && (firstStart || forceFresh) {
 				if tp.ResolvedProvider != nil && tp.ResolvedProvider.PromptMode == "none" {
 					agentCfg.Nudge = appendInitialMessageToStartupNudge(agentCfg.Nudge, msg)
@@ -1667,8 +1671,10 @@ func clearStaleResumeKeyMetadata(session *beads.Bead, store beads.Store) {
 	patch := map[string]string{
 		"session_key":                "",
 		"started_config_hash":        "",
+		sessionpkg.ResumeSeededKey(): "",
 		"continuation_reset_pending": "true",
 	}
+	sessionpkg.StampPriorSessionKey(patch, session.Metadata)
 	if store != nil && strings.TrimSpace(session.ID) != "" {
 		_ = store.SetMetadataBatch(session.ID, patch)
 	}

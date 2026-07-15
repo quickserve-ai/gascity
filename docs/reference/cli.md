@@ -3225,6 +3225,7 @@ gc session
 |------------|-------------|
 | [gc session attach](#gc-session-attach) | Attach to (or resume) a chat session |
 | [gc session close](#gc-session-close) | Close a session permanently |
+| [gc session history](#gc-session-history) | List an agent's past conversations |
 | [gc session kill](#gc-session-kill) | Force-kill session runtime (reconciler restarts) |
 | [gc session list](#gc-session-list) | List chat sessions |
 | [gc session logs](#gc-session-logs) | Show session logs for a session |
@@ -3235,6 +3236,7 @@ gc session
 | [gc session prune](#gc-session-prune) | Close old dormant sessions |
 | [gc session rename](#gc-session-rename) | Rename a session |
 | [gc session reset](#gc-session-reset) | Restart a session fresh while preserving the bead |
+| [gc session resume](#gc-session-resume) | Resume one of an agent's past conversations |
 | [gc session submit](#gc-session-submit) | Submit a message with semantic delivery intent |
 | [gc session suspend](#gc-session-suspend) | Suspend a session (save state, free resources) |
 | [gc session unpin](#gc-session-unpin) | Remove a session awake pin |
@@ -3268,6 +3270,36 @@ gc session close <session-id-or-alias> [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--json` | bool |  | emit JSONL |
+
+## gc session history
+
+List the past provider conversations recorded for an agent, newest first.
+
+The filesystem is the authoritative index: claude-family providers write one
+transcript per conversation under &lt;config-dir&gt;/projects/&lt;workdir-slug&gt;/, so
+every conversation an agent ever had in its work directory is listed — including
+conversations whose session beads were closed long ago, and transcripts moved
+into ~/.claude-transcript-archive/ by the transcript reaper (marked "archived").
+
+The session id shown for each row is what "gc session resume" takes.
+
+```
+gc session history <agent> [flags]
+```
+
+**Example:**
+
+```
+gc session history lana
+gc session history qcore/lana --limit 50
+gc session history mayor --json
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--archive-root` | string |  | transcript archive root to search (default ~/.claude-transcript-archive) |
+| `--json` | bool |  | JSON output |
+| `--limit` | int | `20` | maximum conversations to list (0 = all) |
 
 ## gc session kill
 
@@ -3480,6 +3512,44 @@ gc session reset <session-id-or-alias> [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--json` | bool |  | emit JSONL |
+
+## gc session resume
+
+Put an agent back into a past conversation listed by "gc session history".
+
+By default this seeds the agent's session bead with the chosen conversation id
+and requests a wake, so the reconciler's normal resume path reopens that exact
+conversation — including for wake_mode=fresh agents that never auto-resume, and
+for on-demand crew whose context is normally lost on idle-close. The agent must
+not be running (attach to a running agent instead, or use --print).
+
+--print skips all state changes and prints the provider command for an attended
+dive in your own terminal.
+
+Transcripts that the reaper moved into the archive are restored into the live
+projects directory first, so the provider can find them again.
+
+session-id may be any unambiguous prefix of an id from "gc session history".
+Note: "gc session pin" (pin_awake) prevents the idle-close that loses context
+in the first place — resume is the after-the-fact escape hatch.
+
+```
+gc session resume <agent> [session-id] [flags]
+```
+
+**Example:**
+
+```
+gc session resume lana --last
+gc session resume lana 8dc18f31
+gc session resume mayor 9e82b97a --print
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--archive-root` | string |  | transcript archive root to search (default ~/.claude-transcript-archive) |
+| `--last` | bool |  | resume the most recent conversation |
+| `--print` | bool |  | print the provider resume command instead of seeding the session bead |
 
 ## gc session submit
 

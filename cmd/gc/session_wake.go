@@ -56,7 +56,11 @@ func preWakeCommit(
 		sleepReason = "idle-timeout"
 	}
 
-	freshWake := session.Metadata["wake_mode"] == "fresh" || pendingContinuationResetNeedsFreshStart(session.Metadata)
+	// A seeded resume (gc session resume) pins the session_key to a prior
+	// conversation; honoring fresh-wake semantics here would clear the seed
+	// before the start it was created for.
+	freshWake := (session.Metadata["wake_mode"] == "fresh" || pendingContinuationResetNeedsFreshStart(session.Metadata)) &&
+		!sessions.IsResumeSeeded(session.Metadata)
 	batch := sessions.PreWakePatch(sessions.PreWakePatchInput{
 		Generation:        newGen,
 		InstanceToken:     token,
@@ -65,6 +69,7 @@ func preWakeCommit(
 		SleepReason:       sleepReason,
 		FreshWake:         freshWake,
 	})
+	sessions.StampPriorSessionKey(batch, session.Metadata)
 	if writeErr := store.SetMetadataBatch(session.ID, batch); writeErr != nil {
 		return 0, "", fmt.Errorf("pre-wake metadata commit: %w", writeErr)
 	}
@@ -607,6 +612,7 @@ func advanceSessionDrainsWithSessionsTraced(
 // completeDrain writes drain-complete metadata to the bead.
 func completeDrain(session *beads.Bead, store beads.Store, ds *drainState, clk clock.Clock) {
 	batch := sessions.CompleteDrainPatch(clk.Now(), ds.reason, session.Metadata["wake_mode"] == "fresh")
+	sessions.StampPriorSessionKey(batch, session.Metadata)
 	if store != nil {
 		if err := store.SetMetadataBatch(session.ID, batch); err != nil {
 			return

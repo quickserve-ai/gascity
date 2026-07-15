@@ -282,10 +282,12 @@ func TestConversationResetPatch(t *testing.T) {
 	assertPatch(t, ConversationResetPatch(true), MetadataPatch{
 		"session_key":                "",
 		"started_config_hash":        "",
+		"resume_seeded":              "",
 		"continuation_reset_pending": "true",
 	})
 	assertPatch(t, ConversationResetPatch(false), MetadataPatch{
 		"session_key":                "",
+		"resume_seeded":              "",
 		"continuation_reset_pending": "true",
 	})
 }

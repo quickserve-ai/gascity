@@ -703,6 +703,7 @@ func recordWakeFailure(session *beads.Bead, store beads.Store, clk clock.Clock) 
 	// left behind by older builds.
 	if session.Metadata["session_key"] != "" || session.Metadata["started_config_hash"] != "" {
 		reset := sessionpkg.ConversationResetPatch(true)
+		sessionpkg.StampPriorSessionKey(reset, session.Metadata)
 		_ = store.SetMetadataBatch(session.ID, reset)
 		for k, v := range reset {
 			session.Metadata[k] = v
@@ -790,6 +791,7 @@ func recordChurn(session *beads.Bead, store beads.Store, clk clock.Clock) {
 	// re-hitting the same wall.
 	if session.Metadata["session_key"] != "" {
 		reset := sessionpkg.ConversationResetPatch(false)
+		sessionpkg.StampPriorSessionKey(reset, session.Metadata)
 		_ = store.SetMetadataBatch(session.ID, reset)
 		for k, v := range reset {
 			session.Metadata[k] = v

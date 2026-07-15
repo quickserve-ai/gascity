@@ -2,6 +2,7 @@ package session
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -10,7 +11,51 @@ var freshWakeConversationResetKeys = []string{
 	"started_config_hash",
 	"started_live_hash",
 	"live_hash",
+	resumeSeededKey,
 	startupDialogVerifiedKey,
+}
+
+// ResumeSeededKey marks a session whose session_key was seeded by
+// `gc session resume` to point at a prior conversation. The next start must
+// build a resume command even when started_config_hash is empty (which
+// normally means first start) or wake_mode is fresh; the flag is consumed by
+// CommitStartedPatch once that start durably lands, and cleared by every
+// path that clears or rotates session_key so a stale seed can never force a
+// resume of a conversation that was already reset away.
+const resumeSeededKey = "resume_seeded"
+
+// ResumeSeededKey exposes the seeded-resume metadata key to the CLI layer.
+func ResumeSeededKey() string { return resumeSeededKey }
+
+// IsResumeSeeded reports whether meta carries a pending seeded resume.
+func IsResumeSeeded(meta map[string]string) bool {
+	return meta != nil && meta[resumeSeededKey] == "true"
+}
+
+// PriorSessionKeyMetadata records the last conversation identity a lifecycle
+// transition cleared or replaced. Read-side only (gc session history), never
+// consumed by lifecycle logic.
+const PriorSessionKeyMetadata = "prior_session_key"
+
+// StampPriorSessionKey preserves the conversation identity that patch is
+// about to destroy: when meta carries a non-empty session_key and patch sets
+// session_key to empty or to a different value, the old key is copied to
+// prior_session_key so the bead retains a pointer to the transcript it used
+// to own instead of severing the mapping (ga-oe8h).
+func StampPriorSessionKey(patch MetadataPatch, meta map[string]string) MetadataPatch {
+	if patch == nil || meta == nil {
+		return patch
+	}
+	newKey, changing := patch["session_key"]
+	if !changing {
+		return patch
+	}
+	old := strings.TrimSpace(meta["session_key"])
+	if old == "" || old == newKey {
+		return patch
+	}
+	patch[PriorSessionKeyMetadata] = old
+	return patch
 }
 
 // ResetCommittedAtKey records when a restart handoff durably committed.
@@ -48,6 +93,7 @@ func applyFreshWakeConversationReset(patch MetadataPatch) {
 	patch["started_config_hash"] = ""
 	patch["started_live_hash"] = ""
 	patch["live_hash"] = ""
+	patch[resumeSeededKey] = ""
 	patch[startupDialogVerifiedKey] = ""
 }
 
@@ -230,6 +276,7 @@ func CommitStartedPatch(input CommitStartedPatchInput) MetadataPatch {
 		"live_hash":                  input.LiveHash,
 		"started_live_hash":          input.LiveHash,
 		"continuation_reset_pending": "",
+		resumeSeededKey:              "",
 	}
 	if input.CoreBreakdown != "" {
 		patch["core_hash_breakdown"] = input.CoreBreakdown
@@ -340,6 +387,7 @@ func RestartRequestPatch(sessionKey string, now time.Time) MetadataPatch {
 	patch := MetadataPatch{
 		"restart_requested":          "",
 		"started_config_hash":        "",
+		resumeSeededKey:              "",
 		"continuation_reset_pending": "true",
 		ResetCommittedAtKey:          now.UTC().Format(time.RFC3339),
 		"last_woke_at":               "",
