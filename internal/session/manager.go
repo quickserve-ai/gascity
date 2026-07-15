@@ -325,6 +325,8 @@ type Info struct {
 	// exactly as the drift path relies on. Additive, internal-only (absent from
 	// the HTTP wire).
 	StartedConfigHash string // started_config_hash (raw)
+	// ResumeSeeded is the RAW resume_seeded marker set by `gc session resume`.
+	ResumeSeeded string // resume_seeded (raw)
 	// PinAwake is the RAW pin_awake metadata, verbatim. The reconciler's wake
 	// pass suppresses config-driven wake only when it is != "true", an exact
 	// string compare, so the mirror keeps the raw value. Additive, internal-only

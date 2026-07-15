@@ -221,6 +221,7 @@ func TestLifecycleTransitionPatchesSetCompleteMetadata(t *testing.T) {
 			want: MetadataPatch{
 				"restart_requested":          "",
 				"started_config_hash":        "",
+				"resume_seeded":              "",
 				"continuation_reset_pending": "true",
 				ResetCommittedAtKey:          resetNow.UTC().Format(time.RFC3339),
 				"last_woke_at":               "",
@@ -240,6 +241,7 @@ func TestLifecycleTransitionPatchesSetCompleteMetadata(t *testing.T) {
 			want: MetadataPatch{
 				"restart_requested":          "",
 				"started_config_hash":        "",
+				"resume_seeded":              "",
 				"continuation_reset_pending": "true",
 				ResetCommittedAtKey:          resetNow.UTC().Format(time.RFC3339),
 				"last_woke_at":               "",

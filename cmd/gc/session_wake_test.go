@@ -248,6 +248,45 @@ func TestPreWakeCommit_FreshModeClearsPreviousConversationMetadata(t *testing.T)
 	if got.Metadata["continuation_reset_pending"] != "" {
 		t.Fatalf("continuation_reset_pending = %q, want consumed", got.Metadata["continuation_reset_pending"])
 	}
+	if got.Metadata[sessionpkg.PriorSessionKeyMetadata] != "old-provider-conversation" {
+		t.Fatalf("prior_session_key = %q, want the cleared conversation preserved", got.Metadata[sessionpkg.PriorSessionKeyMetadata])
+	}
+}
+
+// A seeded resume (gc session resume) must survive the pre-wake commit even
+// on wake_mode=fresh sessions — the seed IS the requested conversation, and
+// honoring fresh semantics here would clear it before the start it was
+// created for.
+func TestPreWakeCommit_SeededResumeSurvivesFreshMode(t *testing.T) {
+	now := time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC)
+	clk := &clock.Fake{Time: now}
+	store := beads.NewMemStore()
+
+	b, err := store.Create(beads.Bead{
+		Title: "seeded-session",
+		Metadata: map[string]string{
+			"session_name":  "seeded-worker",
+			"template":      "worker",
+			"generation":    "2",
+			"wake_mode":     "fresh",
+			"session_key":   "seeded-conversation-uuid",
+			"resume_seeded": "true",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := preWakeCommit(&b, store, clk); err != nil {
+		t.Fatalf("preWakeCommit: %v", err)
+	}
+	got, _ := store.Get(b.ID)
+	if got.Metadata["session_key"] != "seeded-conversation-uuid" {
+		t.Fatalf("session_key = %q, want seeded key preserved through fresh-mode wake", got.Metadata["session_key"])
+	}
+	if got.Metadata["resume_seeded"] != "true" {
+		t.Fatalf("resume_seeded = %q, want still pending until the start commits", got.Metadata["resume_seeded"])
+	}
 }
 
 func TestPreWakeCommit_ResumeModePreservesPreviousConversationMetadata(t *testing.T) {
@@ -324,6 +363,7 @@ func TestPreWakeCommit_FreshModeTraceLogsClearedProviderMetadata(t *testing.T) {
 			"started_config_hash":     "old-core-hash",
 			"started_live_hash":       "old-live-hash",
 			"live_hash":               "old-live-hash",
+			"resume_seeded":           "stale-not-true",
 			"startup_dialog_verified": "true",
 			// Priming markers share the fresh-wake reset (S19 Stage 2); set them
 			// so the trace log lists them among the cleared keys.
@@ -379,6 +419,7 @@ func TestPreWakeCommit_FreshModeTraceSilentWhenTraceDisabled(t *testing.T) {
 			"started_config_hash":     "old-core-hash",
 			"started_live_hash":       "old-live-hash",
 			"live_hash":               "old-live-hash",
+			"resume_seeded":           "stale-not-true",
 			"startup_dialog_verified": "true",
 		},
 	})
@@ -509,6 +550,7 @@ func TestPreWakeCommit_FreshModeTraceSilentOnStoreFailure(t *testing.T) {
 			"started_config_hash":     "old-core-hash",
 			"started_live_hash":       "old-live-hash",
 			"live_hash":               "old-live-hash",
+			"resume_seeded":           "stale-not-true",
 			"startup_dialog_verified": "true",
 		},
 	})

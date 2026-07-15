@@ -1061,22 +1061,14 @@ func buildPreparedStartWithWorkDirResolver(
 			return nil, candidate.info, err
 		}
 	}
+	seededResume := sessionpkg.IsResumeSeededInfo(candidate.info)
+	firstStart = firstStart && !seededResume
+	forceFresh = forceFresh && !seededResume
 	if sk := candidate.info.SessionKey; sk != "" && tp.ResolvedProvider != nil && !tp.IsACP {
 		agentCfg.Command = resolveSessionCommand(agentCfg.Command, sk, parentSID, tp.ResolvedProvider, firstStart, forceFresh)
 	}
 	hasResumeKey := strings.TrimSpace(candidate.info.SessionKey) != ""
-	// S19 priming confirmation (write-only in Stage 2): a marker is stamped only
-	// when the pure delivery decision holds AND this incarnation is a fresh
-	// launch — the exact complement of the resume override below, which swaps in
-	// restartPromptNudge and delivers nothing. Reading the env marker instead
-	// would mis-stamp every resume (it is re-set to "1" for hook consumption).
 	promptDelivered := delivery.Delivered && (firstStart || forceFresh || !hasResumeKey)
-	// prompt_hash is the sha256 of the rendered startup TEMPLATE prompt (tp.Prompt)
-	// only, computed here BEFORE the one-shot initial_message is appended to the
-	// delivered payload below. The hash exists so a template/config change re-primes
-	// the session (S19 Stage 4); a fresh re-launch re-renders tp.Prompt but never
-	// replays the transient initial_message, so hashing the delivered bytes would
-	// make the stored hash never match the re-derivation and re-prime forever.
 	promptHash := sessionpkg.PromptHash(tp.Prompt)
 	if !firstStart && !forceFresh && hasResumeKey {
 		agentCfg.PromptSuffix = ""
@@ -1972,6 +1964,7 @@ func clearStaleResumeKeyMetadata(handle string, sessFront *sessionpkg.Store) map
 	patch := map[string]string{
 		"session_key":                "",
 		"started_config_hash":        "",
+		sessionpkg.ResumeSeededKey(): "",
 		"continuation_reset_pending": "true",
 		// Priming markers share started_config_hash's lifetime (S19 Stage 2):
 		// this stale-resume clear forces a first start, so they reset with it.
@@ -1980,9 +1973,10 @@ func clearStaleResumeKeyMetadata(handle string, sessFront *sessionpkg.Store) map
 		sessionpkg.PromptHashMetadataKey:         "",
 	}
 	if sessFront != nil && strings.TrimSpace(handle) != "" {
+		if info, err := sessFront.Get(handle); err == nil {
+			sessionpkg.StampPriorSessionKeyInfo(patch, info)
+		}
 		_ = sessFront.ApplyPatch(handle, patch)
-		// S19 Stage 3 shadow: record the legacy priming-marker clears (no-op
-		// unless the shadow harness is enabled).
 		recordLegacyCompareWrites(handle, "clearStaleResumeKeyMetadata", patch)
 	}
 	return patch
