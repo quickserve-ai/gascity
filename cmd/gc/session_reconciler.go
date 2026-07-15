@@ -1034,6 +1034,7 @@ func finalizeDrainAckStoppedSession(
 	if choice.AsSleep {
 		write = sessionFrontDoor(store).ApplySleep
 	}
+	sessionpkg.StampPriorSessionKey(batch, session.Metadata)
 	// An always-mode named session with wake_mode=fresh re-qualifies for wake
 	// the moment its drain-ack lands: ComputeAwakeSet's named-always branch has
 	// no drained-exclusion, and drain-ack pokes an immediate reconcile. A
@@ -3740,6 +3741,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					// is still awake. See ga-2fpf9z.
 					batch["state"] = string(sessionpkg.StateAsleep)
 				}
+				sessionpkg.StampPriorSessionKeyInfo(batch, infoByID[id])
 				if err := sessionFrontDoor(store).ApplyPatch(id, batch); err != nil {
 					fmt.Fprintf(stderr, "session reconciler: recording restart handoff for %s: %v\n", name, err) //nolint:errcheck
 					continue
@@ -6871,6 +6873,7 @@ func resetConfiguredNamedSessionForConfigDriftInfo(
 	if preserveResume {
 		batch["started_config_hash"] = priorStartedConfigHash
 	}
+	sessionpkg.StampPriorSessionKey(batch, session.Metadata)
 	batch[namedSessionConfigDriftDeferredAtMetadata] = ""
 	batch[namedSessionConfigDriftDeferredKeyMetadata] = ""
 	batch[sessionAttachedConfigDriftDeferredAtMetadata] = ""

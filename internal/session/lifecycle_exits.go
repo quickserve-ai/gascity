@@ -230,6 +230,7 @@ func exitAccrual(counterKey string, next, threshold int, sleepReason string, unt
 func ConversationResetPatch(clearStartedConfigHash bool) MetadataPatch {
 	patch := MetadataPatch{
 		"session_key":                "",
+		resumeSeededKey:              "",
 		"continuation_reset_pending": "true",
 	}
 	ClearResumeRun(patch) // a new conversation's run starts anew (mc-bm1af)

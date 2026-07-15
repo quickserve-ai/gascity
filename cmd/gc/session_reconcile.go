@@ -906,6 +906,7 @@ func recordWakeFailure(info sessionpkg.Info, transcriptRoots []string, sessFront
 			}
 			patch = sessionpkg.ConversationResetPatch(true)
 			maps.Copy(patch, resumeFailuresPatch(info, 0))
+			sessionpkg.StampPriorSessionKeyInfo(patch, info)
 		}
 		if len(patch) > 0 {
 			_ = sessFront.ApplyPatch(info.ID, patch)
@@ -1023,6 +1024,7 @@ func recordChurn(info sessionpkg.Info, sessFront *sessionpkg.Store, clk clock.Cl
 	// with an unconditional Info fold.
 	if info.SessionKey != "" && !sessionpkg.HasStartedManualConversation(info) {
 		reset := sessionpkg.ConversationResetPatch(false)
+		sessionpkg.StampPriorSessionKeyInfo(reset, info)
 		_ = sessFront.ApplyPatch(info.ID, reset)
 		info = info.ApplyPatch(reset)
 	}
