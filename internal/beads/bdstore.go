@@ -84,10 +84,11 @@ func execCommandRunnerWithEnv(parent context.Context, env map[string]string) Com
 		ctx, cancel := context.WithTimeout(parent, timeout)
 		defer cancel()
 
+		var slowTimer *time.Timer
 		if name == "bd" {
 			bdArgs := append([]string(nil), args...)
 			agentID := bdTelemetryAgentID(env)
-			slowTimer := time.AfterFunc(bdSlowTelemetryThreshold, func() {
+			slowTimer = time.AfterFunc(bdSlowTelemetryThreshold, func() {
 				telemetry.RecordBDSlow(ctx, bdArgs, dir, agentID)
 			})
 			defer slowTimer.Stop()
@@ -104,6 +105,9 @@ func execCommandRunnerWithEnv(parent context.Context, env map[string]string) Com
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		out, err := cmd.Output()
+		if slowTimer != nil {
+			slowTimer.Stop()
+		}
 
 		recordBDExecTelemetry(name, dir, args, start, out, stderr.String(), err)
 
