@@ -590,6 +590,13 @@ type Rig struct {
 	// Captured by `gc rig add` from the rig's git config; set manually for
 	// rigs whose mainline isn't reachable via origin/HEAD.
 	DefaultBranch string `toml:"default_branch,omitempty"`
+	// DefaultMergeStrategy is the merge_strategy metadata written to a
+	// bead slung to this rig's agents when --merge is not passed (e.g.
+	// "pr" for rigs whose mainline only accepts changes through pull
+	// requests). Empty writes no metadata, so downstream formulas apply
+	// their own default — the gastown refinery assumes "direct", which
+	// a protected mainline rejects at push time.
+	DefaultMergeStrategy string `toml:"default_merge_strategy,omitempty"`
 	// Suspended is the deprecated pre-runtime-state suspension flag.
 	// Parsed for backwards compatibility and treated as an alias for
 	// SuspendedOnStart by [Rig.EffectiveSuspendedOnStart], so existing

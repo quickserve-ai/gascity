@@ -49,7 +49,7 @@ type SlingOpts struct {
 	SkipPoke      bool
 	Title         string
 	Vars          []string
-	Merge         string // "", "direct", "mr", "local"
+	Merge         string // "", "direct", "pr", "mr", "local"
 	NoConvoy      bool
 	Owned         bool
 	Nudge         bool
@@ -236,7 +236,7 @@ func New(deps SlingDeps) (*Sling, error) {
 
 // RouteOpts holds options for plain bead routing.
 type RouteOpts struct {
-	Merge    string // "", "direct", "mr", "local"
+	Merge    string // "", "direct", "pr", "mr", "local"
 	NoConvoy bool
 	Owned    bool
 	// Reassign clears any existing human assignee on the bead before routing,
@@ -946,6 +946,25 @@ func SlingFormulaSearchPaths(deps SlingDeps, a config.Agent) []string {
 	}
 	rigName := rigNameForAgent(deps.Cfg, a)
 	return deps.Cfg.FormulaLayers.SearchPaths(rigName)
+}
+
+// rigDefaultMergeStrategy returns the configured default_merge_strategy
+// of the target agent's rig, or "" for city-scoped targets and rigs
+// without one.
+func rigDefaultMergeStrategy(cfg *config.City, a config.Agent) string {
+	if cfg == nil {
+		return ""
+	}
+	name := rigNameForAgent(cfg, a)
+	if name == "" {
+		return ""
+	}
+	for i := range cfg.Rigs {
+		if cfg.Rigs[i].Name == name {
+			return cfg.Rigs[i].DefaultMergeStrategy
+		}
+	}
+	return ""
 }
 
 // rigNameForAgent returns the rig name for an agent. Handles both

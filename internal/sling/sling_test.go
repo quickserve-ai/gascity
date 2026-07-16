@@ -4197,3 +4197,74 @@ func TestSlingFormulaTargetBranch_FallsBackToProbeWhenUnset(t *testing.T) {
 		t.Errorf("SlingFormulaTargetBranch = %q, want %q (fallback to live probe)", got, "trunk")
 	}
 }
+
+func TestDoSlingRigDefaultMergeStrategy(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Rigs:      []config.Rig{{Name: "qcore", DefaultMergeStrategy: "pr"}},
+	}
+	a := config.Agent{Name: "polecat", Dir: "qcore", MaxActiveSessions: intPtr(1)}
+
+	deps := testDeps(cfg, sp, runner.run)
+	deps.Store = seededStore("qc-42")
+	if _, err := DoSling(testOpts(a, "qc-42"), deps, nil); err != nil {
+		t.Fatalf("DoSling error: %v", err)
+	}
+	b, err := deps.Store.Get("qc-42")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got := b.Metadata["merge_strategy"]; got != "pr" {
+		t.Errorf("merge_strategy = %q, want pr (rig default)", got)
+	}
+}
+
+func TestDoSlingExplicitMergeOverridesRigDefault(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Rigs:      []config.Rig{{Name: "qcore", DefaultMergeStrategy: "pr"}},
+	}
+	a := config.Agent{Name: "polecat", Dir: "qcore", MaxActiveSessions: intPtr(1)}
+
+	deps := testDeps(cfg, sp, runner.run)
+	deps.Store = seededStore("qc-42")
+	opts := testOpts(a, "qc-42")
+	opts.Merge = "direct"
+	if _, err := DoSling(opts, deps, nil); err != nil {
+		t.Fatalf("DoSling error: %v", err)
+	}
+	b, err := deps.Store.Get("qc-42")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got := b.Metadata["merge_strategy"]; got != "direct" {
+		t.Errorf("merge_strategy = %q, want direct (explicit --merge wins)", got)
+	}
+}
+
+func TestDoSlingNoMergeStrategyWithoutRigDefault(t *testing.T) {
+	runner := newFakeRunner()
+	sp := runtime.NewFake()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Rigs:      []config.Rig{{Name: "qcore"}},
+	}
+	a := config.Agent{Name: "polecat", Dir: "qcore", MaxActiveSessions: intPtr(1)}
+
+	deps := testDeps(cfg, sp, runner.run)
+	deps.Store = seededStore("qc-42")
+	if _, err := DoSling(testOpts(a, "qc-42"), deps, nil); err != nil {
+		t.Fatalf("DoSling error: %v", err)
+	}
+	b, err := deps.Store.Get("qc-42")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got, ok := b.Metadata["merge_strategy"]; ok {
+		t.Errorf("merge_strategy = %q, want no metadata written", got)
+	}
+}
