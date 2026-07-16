@@ -189,10 +189,19 @@ func TestExecCommandRunnerStopsBDSlowTimerForFastBDCommand(t *testing.T) {
 
 	exp := installBeadsRecordingLogExporter(t)
 	binDir := t.TempDir()
-	writeExecutable(t, filepath.Join(binDir, "bd"), `#!/bin/sh
+	bdPath := filepath.Join(binDir, "bd")
+	writeExecutable(t, bdPath, `#!/bin/sh
 printf '[]\n'
 `)
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	// First exec of a freshly written script pays a ~150ms validation
+	// tax on macOS (see TestKillCommandTreeKillsProcessGroup), enough to
+	// legitimately cross a millisecond threshold. Warm the file so the
+	// measured run only times the script itself.
+	if err := exec.Command(bdPath).Run(); err != nil {
+		t.Fatalf("warm bd script: %v", err)
+	}
 
 	if _, err := ExecCommandRunner()(t.TempDir(), "bd", "list"); err != nil {
 		t.Fatalf("ExecCommandRunner bd: %v", err)
