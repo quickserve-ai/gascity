@@ -51,7 +51,7 @@ type SlingOpts struct {
 	SkipPoke      bool
 	Title         string
 	Vars          []string
-	Merge         string // "", "direct", "mr", "local"
+	Merge         string // "", "direct", "pr", "mr", "local"
 	NoConvoy      bool
 	Owned         bool
 	Nudge         bool
@@ -255,7 +255,7 @@ func New(deps SlingDeps) (*Sling, error) {
 
 // RouteOpts holds options for plain bead routing.
 type RouteOpts struct {
-	Merge    string // "", "direct", "mr", "local"
+	Merge    string // "", "direct", "pr", "mr", "local"
 	NoConvoy bool
 	Owned    bool
 	// Reassign clears any existing human assignee on the bead before routing,
