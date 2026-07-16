@@ -124,6 +124,10 @@ func (p *Provider) Mint(ctx context.Context, request Request) (Credential, error
 	if err != nil {
 		return Credential{}, err
 	}
+	return p.mintValidated(ctx, request, scopes, minimalEnvironment(p.environ()))
+}
+
+func (p *Provider) mintValidated(ctx context.Context, request Request, scopes []string, environment []string) (Credential, error) {
 	payload, err := json.Marshal(wireRequest{
 		Version:        ProtocolVersion,
 		Audience:       request.Audience,
@@ -138,7 +142,7 @@ func (p *Provider) Mint(ctx context.Context, request Request) (Credential, error
 
 	runCtx, cancel := context.WithTimeout(ctx, helperTimeout)
 	defer cancel()
-	output, runErr := p.run(runCtx, append([]string(nil), p.argv...), payload, minimalEnvironment(p.environ()))
+	output, runErr := p.run(runCtx, append([]string(nil), p.argv...), payload, append([]string(nil), environment...))
 	if err := ctx.Err(); err != nil {
 		return Credential{}, err
 	}
