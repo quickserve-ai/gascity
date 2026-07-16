@@ -532,9 +532,14 @@ func finalize(opts SlingOpts, deps SlingDeps, beadID, method string, result Slin
 	}
 	telemetry.RecordSling(context.Background(), a.QualifiedName(), TargetType(&a), method, nil)
 
-	// Merge strategy metadata.
-	if opts.Merge != "" && deps.Store != nil {
-		if err := deps.Store.SetMetadata(beadID, "merge_strategy", opts.Merge); err != nil {
+	// Merge strategy metadata. An explicit --merge wins; otherwise the
+	// target rig's default_merge_strategy applies.
+	merge := opts.Merge
+	if merge == "" {
+		merge = rigDefaultMergeStrategy(deps.Cfg, a)
+	}
+	if merge != "" && deps.Store != nil {
+		if err := deps.Store.SetMetadata(beadID, "merge_strategy", merge); err != nil {
 			result.MetadataErrors = append(result.MetadataErrors,
 				fmt.Sprintf("setting merge strategy: %v", err))
 		}

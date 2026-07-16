@@ -119,8 +119,8 @@ Examples:
 			if owned && noConvoy {
 				return argError("gc sling: --owned requires a convoy (cannot use with --no-convoy)")
 			}
-			if merge != "" && merge != "direct" && merge != "mr" && merge != "local" {
-				return argError("gc sling: --merge must be direct, mr, or local")
+			if merge != "" && merge != "direct" && merge != "pr" && merge != "mr" && merge != "local" {
+				return argError("gc sling: --merge must be direct, pr, mr, or local")
 			}
 			if (strings.TrimSpace(scopeKind) == "") != (strings.TrimSpace(scopeRef) == "") {
 				return argError("gc sling: --scope-kind and --scope-ref must be provided together")
@@ -142,7 +142,7 @@ Examples:
 	cmd.Flags().BoolVar(&force, "force", false, "suppress warnings, allow cross-rig routing, allow formulas v2 workflow replacement, and for direct bead routes dispatch even if the bead does not resolve in the local store")
 	cmd.Flags().StringVarP(&title, "title", "t", "", "wisp root bead title (with --formula or --on)")
 	cmd.Flags().StringArrayVar(&vars, "var", nil, "variable substitution for formula (key=value, repeatable)")
-	cmd.Flags().StringVar(&merge, "merge", "", "merge strategy: direct, mr, or local")
+	cmd.Flags().StringVar(&merge, "merge", "", "merge strategy: direct, pr, mr, or local")
 	cmd.Flags().BoolVar(&noConvoy, "no-convoy", false, "skip auto-convoy creation")
 	cmd.Flags().BoolVar(&owned, "owned", false, "mark auto-convoy as owned (skip auto-close)")
 	cmd.Flags().BoolVar(&reassign, "reassign", false, "clear any existing human assignee before routing (for human→pool handoff)")
