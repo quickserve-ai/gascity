@@ -113,6 +113,13 @@ func ExecCommandRunnerWithEnv(env map[string]string) CommandRunner {
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		out, err := cmd.Output()
+		if slowTimer != nil {
+			// Stop now, not at the deferred Stop: the trace/telemetry
+			// block below runs first, and a threshold elapsing in that
+			// window would record a bd.slow for a command that already
+			// completed under it.
+			slowTimer.Stop()
+		}
 		if name == "bd" {
 			// Structured JSONL trace — independent of the legacy line-format
 			// trace above (gated by GC_BD_TRACE_JSON, not GC_BD_TRACE).
