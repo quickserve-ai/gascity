@@ -188,12 +188,24 @@ var testTempRootAliveSentinel *os.File
 var tmuxSocketAliveSentinel *os.File
 
 type cleanupTestingM struct {
-	m     testscript.TestingM
-	paths []string
+	m testscript.TestingM
+	// tmuxSocketRoots are TMUX_TMPDIR roots whose servers must be killed
+	// after the run. Deleting the socket directory alone orphans the tmux
+	// server processes (ga-utvl), so servers are reaped before paths are
+	// removed.
+	tmuxSocketRoots []string
+	paths           []string
 }
 
 func (m cleanupTestingM) Run() int {
 	code := m.m.Run()
+	// Reap before removing: once a socket directory is gone, a server still
+	// bound to it is beyond every socket-addressed sweep (ga-3qlrnv). The
+	// tmuxtest reaper escalates a server that outlives kill-server to an
+	// identity-fenced SIGKILL and names every outcome on stderr.
+	for _, root := range m.tmuxSocketRoots {
+		tmuxtest.KillTmuxServersUnder(root, os.Stderr)
+	}
 	for _, path := range m.paths {
 		if path != "" {
 			_ = os.RemoveAll(path)
@@ -304,8 +316,13 @@ func TestMain(m *testing.M) {
 	// per-run socket root still exists (dip-73cr05 — city-name sockets like
 	// -L test-city have exit-empty off and outlive their sessions forever).
 	testRunner = newTmuxLeakGuardedTestingM(testRunner, tmuxSocketRoot)
-	if tmuxSocketCleanupRoot != "" {
-		testRunner = cleanupTestingM{m: testRunner, paths: []string{tmuxSocketCleanupRoot}}
+	// cleanupTestingM wraps unconditionally: the leak guard above is a
+	// passthrough off Linux, so this is the only end-of-run reaper there, and
+	// it must run even when no socket parent is removed here (ga-utvl).
+	testRunner = cleanupTestingM{
+		m:               testRunner,
+		tmuxSocketRoots: []string{tmuxSocketRoot},
+		paths:           []string{tmuxSocketCleanupRoot},
 	}
 	testscript.Main(testRunner, map[string]func(){
 		"gc": func() {
@@ -7991,6 +8008,7 @@ func TestDoPrimeStrictMissingFragmentFails(t *testing.T) {
 	t.Setenv("GC_RIG", "")
 
 	dir := t.TempDir()
+	t.Setenv("GC_CITY", dir)
 	if err := os.MkdirAll(filepath.Join(dir, ".gc"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -8047,6 +8065,7 @@ func TestDoPrimeStrictRawFragmentResolves(t *testing.T) {
 	t.Setenv("GC_RIG", "")
 
 	dir := t.TempDir()
+	t.Setenv("GC_CITY", dir)
 	if err := os.MkdirAll(filepath.Join(dir, ".gc"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -8099,13 +8118,14 @@ func TestDoPrimeStrictUnknownTemplateVariableFails(t *testing.T) {
 	t.Setenv("GC_RIG", "")
 
 	dir := t.TempDir()
+	t.Setenv("GC_CITY", dir)
 	if err := os.MkdirAll(filepath.Join(dir, ".gc"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Join(dir, "prompts"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "prompts", "mayor.template.md"), []byte("Rig: {{ .Rig }}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "prompts", "mayor.template.md"), []byte("Rig: {{ .Rgi }}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	toml := `[workspace]
@@ -8130,7 +8150,7 @@ prompt_template = "prompts/mayor.template.md"
 	if code == 0 {
 		t.Fatalf("doPrimeWithMode(strict, unknown var) = 0, want non-zero; stderr: %s", stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "unknown template variable {{ .Rig }}") {
+	if !strings.Contains(stderr.String(), "unknown template variable {{ .Rgi }}") {
 		t.Errorf("stderr = %q, want unknown-variable error", stderr.String())
 	}
 

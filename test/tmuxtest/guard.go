@@ -16,6 +16,7 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -197,6 +198,23 @@ func killTmuxServerAtSocket(socketPath string) error {
 		return fmt.Errorf("tmux -S %s kill-server: %w", socketPath, ctxErr)
 	}
 	return fmt.Errorf("tmux -S %s kill-server: %w (%s)", socketPath, err, strings.TrimSpace(string(out)))
+}
+
+// KillTmuxServersUnder reaps the tmux server behind every socket file under
+// dir, with the orphan sweep's escalation: a bounded kill-server, a wait for
+// the process to exit, then an identity-fenced SIGKILL for a server that
+// outlived it. A caller about to delete a socket root runs this first: once
+// the socket directory is gone, a surviving server is beyond every
+// socket-addressed sweep in this package (ga-utvl, ga-3qlrnv). Outcomes are
+// described on diagnostics; nil discards them.
+func KillTmuxServersUnder(dir string, diagnostics io.Writer) {
+	if strings.TrimSpace(dir) == "" {
+		return
+	}
+	if diagnostics == nil {
+		diagnostics = io.Discard
+	}
+	killTmuxServersUnder(dir, diagnostics)
 }
 
 // listTestSocketPaths returns tmux socket paths for orphaned gctest cities.
