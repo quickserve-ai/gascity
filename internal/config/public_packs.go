@@ -41,8 +41,9 @@ const (
 	// v1.3.5-platform fork, not a gastownhall/gascity commit — the fork IS
 	// the distribution for this machine's cities, and the binary serves the
 	// pinned content from its embedded FS, so the network fetch path is
-	// never taken here. Carries the qc-lu207 backup-freshness fix.
-	BundledPackImportVersion = "sha:f4128e404f6e8329fabb6343f8825f6db753e01b"
+	// never taken here. Carries the qc-lu207 backup-freshness fix and the
+	// qc-nxq5q OMP hook-v3 PATH fix.
+	BundledPackImportVersion = "sha:997b8a563e6d460e6716ecf466b8905049f64139"
 )
 
 // SupersededBundledPackImportVersions lists previous canonical pins for the
@@ -63,6 +64,9 @@ var SupersededBundledPackImportVersions = []string{
 	// cities from this to the current fork pin so they pick up the
 	// backup-freshness fix from the binary's embedded content.
 	"sha:f895c0ff47d6ee9334ed282a416387eb5b084d24",
+	// qc-lu207-only fork pin, superseded before it ever deployed (the
+	// window binary was rebuilt to add the OMP hook-v3 fix).
+	"sha:f4128e404f6e8329fabb6343f8825f6db753e01b",
 }
 
 // SupersededPublicGastownPackVersions lists previous canonical pins for the
