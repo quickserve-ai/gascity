@@ -62,7 +62,7 @@ func doHookClaim(workQuery, dir string, opts hookClaimOptions, ops hookClaimOps,
 	opts.IdentityCandidates = hookClaimIdentityCandidates(append([]string{opts.Assignee}, opts.IdentityCandidates...)...)
 	opts.RouteTargets = hookClaimRouteTargets(opts.RouteTargets...)
 	if opts.Assignee == "" {
-		fmt.Fprintln(stderr, "gc hook --claim: assignee not specified (set $GC_SESSION_NAME or $GC_SESSION_ID)") //nolint:errcheck
+		fmt.Fprintln(stderr, "gc hook --claim: assignee not specified (set $GC_ALIAS, $GC_AGENT, or $GC_SESSION_NAME)") //nolint:errcheck
 		return 1
 	}
 	if ops.Runner == nil {
