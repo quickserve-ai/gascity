@@ -1403,6 +1403,82 @@ esac
 	}
 }
 
+// A claim must write the alias/agent identity, not the runtime session name:
+// read paths (the agent's own ready query, assigned-work scope filters on
+// GC_AGENT) never match the session-name form, so a session-name assignee
+// makes every self-claimed bead invisible to its own claimer (ga-i44k).
+func TestHookCommandClaimWritesAliasNotSessionName(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	cityDir := t.TempDir()
+	fakeBin := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "bd.log")
+	if err := os.MkdirAll(filepath.Join(cityDir, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cityToml := `[workspace]
+name = "test-city"
+
+[[agent]]
+name = "worker"
+`
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(cityToml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fakeBD := filepath.Join(fakeBin, "bd")
+	script := fmt.Sprintf(`#!/bin/sh
+printf 'actor=%%s args=%%s\n' "${BEADS_ACTOR:-}" "$*" >> %q
+case "$*" in
+  *"update hw-claim --claim --json"*)
+    printf '[{"id":"hw-claim","status":"in_progress","assignee":"%%s","metadata":{"gc.routed_to":"worker"}}]' "${BEADS_ACTOR:-}"
+    ;;
+  *"query --json ephemeral=true AND status=open --limit 0"*)
+    printf '[]'
+    ;;
+  *"gc.routed_to=worker"*)
+    printf '[{"id":"hw-claim","status":"open","metadata":{"gc.routed_to":"worker"}}]'
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`, logPath)
+	if err := os.WriteFile(fakeBD, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("GC_CITY", cityDir)
+	t.Setenv("GC_TEMPLATE", "worker")
+	t.Setenv("GC_ALIAS", "worker")
+	t.Setenv("GC_SESSION_ID", "session-id-1")
+	t.Setenv("GC_SESSION_NAME", "test-city--worker-1")
+	t.Setenv("GC_SESSION_ORIGIN", "ephemeral")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdHookWithOptions(nil, hookCommandOptions{Claim: true, JSON: true}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdHookWithOptions(--claim) = %d, want 0; stdout=%q stderr=%s", code, stdout.String(), stderr.String())
+	}
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("stdout is not JSON: %v\nraw: %s", err, stdout.String())
+	}
+	if result.BeadID != "hw-claim" || result.Reason != "claimed" {
+		t.Fatalf("unexpected claim result: %+v", result)
+	}
+	if result.Assignee != "worker" {
+		t.Fatalf("claim assignee = %q, want alias form \"worker\" (session-name form self-strands the bead, ga-i44k)", result.Assignee)
+	}
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", logPath, err)
+	}
+	if !strings.Contains(string(logData), "actor=worker args=update hw-claim --claim --json") {
+		t.Fatalf("bd claim did not run with alias BEADS_ACTOR=worker; log:\n%s", logData)
+	}
+}
+
 func TestCmdHookSessionTemplateContextDoesNotScanSessionsForName(t *testing.T) {
 	clearGCEnv(t)
 	disableManagedDoltRecoveryForTest(t)

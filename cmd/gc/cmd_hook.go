@@ -444,7 +444,14 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 		sessionID := strings.TrimSpace(overrides["GC_SESSION_ID"])
 		sessionName := strings.TrimSpace(sessionForQuery)
 		alias := strings.TrimSpace(overrides["GC_ALIAS"])
-		assignee := firstNonEmptyHookValue(sessionName, sessionID, alias, agentForQuery, resolvedAgentName)
+		// The written assignee must be the alias/agent form: read paths
+		// (the agent's own ready query and the assigned-work scope) filter
+		// on GC_AGENT, so a claim written under the session-name form is
+		// invisible to its own claimer immediately after claiming (ga-i44k).
+		// Session forms remain as fallback for unaliased pool workers,
+		// whose query env carries the same string in GC_AGENT.
+		assignee := firstNonEmptyHookValue(alias, agentForQuery, resolvedAgentName, sessionName, sessionID)
+		routeTarget := hookClaimPrimaryRouteTarget(&a)
 		claimOpts := hookClaimOptions{
 			Assignee: assignee,
 			// IdentityCandidates governs ADOPTION of already-owned in_progress/open
