@@ -294,6 +294,37 @@ func doPrimeWithHookFormat(args []string, stdout, stderr io.Writer, hookMode boo
 				fmt.Fprintf(stderr, "gc prime: prompt_template %q for agent %q: %v\n", a.PromptTemplate, agentName, fErr) //nolint:errcheck
 				return 1
 			}
+			// Configured fragments that resolve to no registered template
+			// render as silent no-ops — a debugging mistake --strict exists
+			// to catch (a governance fragment can otherwise silently not
+			// exist; see the local-pack fragment bug).
+			rigName := os.Getenv("GC_RIG")
+			if rigName == "" {
+				rigName = configuredRigName(cityPath, &a, cfg.Rigs)
+			}
+			packDirs := cfg.PackDirsForRig(rigName)
+			fragments := effectivePromptFragments(
+				cfg.Workspace.GlobalFragments,
+				a.InjectFragments,
+				a.AppendFragments,
+				a.InheritedAppendFragments,
+				cfg.AgentDefaults.AppendFragments,
+			)
+			if missing := unresolvedPromptFragments(fsys.OSFS{}, cityPath, cityName, a.PromptTemplate, cfg.Workspace.SessionTemplate, packDirs, fragments); len(missing) > 0 {
+				for _, name := range missing {
+					fmt.Fprintf(stderr, "gc prime: agent %q: fragment %q not found in any template-fragments/ or shared/ directory\n", agentName, name) //nolint:errcheck
+				}
+				return 1
+			}
+			// Template variables outside the SDK field set + agent env render
+			// as silent empty strings (missingkey=zero over a string map) —
+			// the {{ .Rig }} class of defect. Same static check as gc lint.
+			if issues := strictUnknownTemplateVariables(cityPath, cityName, &a, cfg, packDirs, fragments); len(issues) > 0 {
+				for _, issue := range issues {
+					fmt.Fprintf(stderr, "gc prime: agent %q: unknown template variable {{ .%s }} in template %q (%s): not an SDK field or agent env var\n", agentName, issue.Field, issue.TemplateName, issue.Location) //nolint:errcheck
+				}
+				return 1
+			}
 		}
 		// Strict preconditions passed; now it's safe to update provider resume metadata.
 		runHookSideEffects()
@@ -385,6 +416,19 @@ func doPrimeWithHookFormat(args []string, stdout, stderr io.Writer, hookMode boo
 	}
 	writePrimePromptWithFormat(stdout, cityName, agentName, defaultPrimePrompt, hookMode, hookFormat, suppressHookPrompt, stepReminder)
 	return 0
+}
+
+// strictUnknownTemplateVariables runs the static unknown-variable check for
+// one agent under gc prime --strict. The known key set is exactly what the
+// runtime render would offer: the SDK fields plus the agent's env vars
+// (buildTemplateData over a context carrying only Env — SDK field NAMES are
+// value-independent).
+func strictUnknownTemplateVariables(cityPath, cityName string, a *config.Agent, cfg *config.City, packDirs, fragments []string) []templateVarIssue {
+	known := make(map[string]struct{})
+	for key := range buildTemplateData(PromptContext{Env: a.Env}) {
+		known[key] = struct{}{}
+	}
+	return promptTemplateUnknownVariables(fsys.OSFS{}, cityPath, cityName, a.PromptTemplate, cfg.Workspace.SessionTemplate, packDirs, fragments, known)
 }
 
 func primeAgentCandidates(agentName string, hookMode bool, cityPath string) []string {

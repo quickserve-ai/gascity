@@ -45,6 +45,24 @@ prompt dynamically customized to its deployment context.
   `{{template "name" .}}` calls still control in-body placement;
   appended fragment settings do not.
 
+- **Fragment naming**: A `template-fragments/` file authored as
+  `{{define "name"}}...{{end}}` registers each defined name. A file with
+  no `{{define}}` block is a *raw fragment*: its whole body (frontmatter
+  stripped) registers under the file's base name, so
+  `template-fragments/law.template.md` is referenceable as `law` with no
+  boilerplate. Fragments loaded from a pack directory also register under
+  the pack-qualified alias `<pack-name>/<fragment>` (pack name from
+  `pack.toml`, falling back to the directory base name), which
+  disambiguates same-named fragments across packs.
+
+- **Fail-loud surfaces**: A configured fragment name that resolves to no
+  registered template is skipped with a stderr warning at render time
+  (best-effort), but `gc prime --strict` fails on it, and `gc lint`
+  reports it as an error. Both also fail on *unknown template variables*
+  — dot-rooted references outside the SDK field set + agent env keys —
+  because prompt data is a string map rendered with `missingkey=zero`,
+  where a typo like `{{ .Rig }}` silently renders as an empty string.
+
 - **Template Functions**: Three built-in functions: `cmd` (binary
   name), `session` (compute session name for an agent), `basename`
   (extract base name from qualified name).

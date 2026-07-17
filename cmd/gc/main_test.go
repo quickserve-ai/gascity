@@ -7881,3 +7881,164 @@ func TestDoAgentResumeNotFound(t *testing.T) {
 		t.Errorf("stderr = %q, want 'not found'", stderr.String())
 	}
 }
+
+// TestDoPrimeStrictMissingFragmentFails verifies --strict fails loud when a
+// configured append_fragments name resolves to no registered template
+// (ga-14a: silent-skip meant a governance fragment could silently not
+// exist). Non-strict keeps the best-effort render.
+func TestDoPrimeStrictMissingFragmentFails(t *testing.T) {
+	t.Setenv("GC_ALIAS", "")
+	t.Setenv("GC_AGENT", "")
+	t.Setenv("GC_RIG", "")
+
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "prompts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "prompts", "mayor.template.md"), []byte("mayor body\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	toml := `[workspace]
+name = "test-city"
+
+[[agent]]
+name = "mayor"
+prompt_template = "prompts/mayor.template.md"
+append_fragments = ["ghost-law"]
+`
+	if err := os.WriteFile(filepath.Join(dir, "city.toml"), []byte(toml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	orig, _ := os.Getwd()
+	t.Cleanup(func() { _ = os.Chdir(orig) })
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doPrimeWithMode([]string{"mayor"}, &stdout, &stderr, false, true)
+	if code == 0 {
+		t.Fatalf("doPrimeWithMode(strict, missing fragment) = 0, want non-zero; stderr: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `fragment "ghost-law" not found`) {
+		t.Errorf("stderr = %q, want missing-fragment error", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = doPrimeWithMode([]string{"mayor"}, &stdout, &stderr, false, false)
+	if code != 0 {
+		t.Fatalf("doPrimeWithMode(non-strict, missing fragment) = %d, want 0 (best-effort)", code)
+	}
+	if !strings.Contains(stdout.String(), "mayor body") {
+		t.Errorf("non-strict stdout = %q, want rendered body", stdout.String())
+	}
+}
+
+// TestDoPrimeStrictRawFragmentResolves verifies the ga-14a fix end-to-end:
+// a raw (no {{define}}) city-root template-fragments/ file resolves by base
+// name, renders into the prompt, and passes --strict.
+func TestDoPrimeStrictRawFragmentResolves(t *testing.T) {
+	t.Setenv("GC_ALIAS", "")
+	t.Setenv("GC_AGENT", "")
+	t.Setenv("GC_RIG", "")
+
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "prompts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "template-fragments"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "prompts", "mayor.template.md"), []byte("mayor body\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "template-fragments", "city-law.template.md"), []byte("# City Law\nalways verify\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	toml := `[workspace]
+name = "test-city"
+
+[[agent]]
+name = "mayor"
+prompt_template = "prompts/mayor.template.md"
+append_fragments = ["city-law"]
+`
+	if err := os.WriteFile(filepath.Join(dir, "city.toml"), []byte(toml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	orig, _ := os.Getwd()
+	t.Cleanup(func() { _ = os.Chdir(orig) })
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doPrimeWithMode([]string{"mayor"}, &stdout, &stderr, false, true)
+	if code != 0 {
+		t.Fatalf("doPrimeWithMode(strict, raw fragment) = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "# City Law") {
+		t.Errorf("stdout = %q, want raw fragment rendered", stdout.String())
+	}
+}
+
+// TestDoPrimeStrictUnknownTemplateVariableFails verifies --strict fails on
+// template references outside the SDK field set + agent env (ga-80ij: they
+// render as silent empty strings otherwise). Non-strict stays permissive.
+func TestDoPrimeStrictUnknownTemplateVariableFails(t *testing.T) {
+	t.Setenv("GC_ALIAS", "")
+	t.Setenv("GC_AGENT", "")
+	t.Setenv("GC_RIG", "")
+
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "prompts"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "prompts", "mayor.template.md"), []byte("Rig: {{ .Rig }}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	toml := `[workspace]
+name = "test-city"
+
+[[agent]]
+name = "mayor"
+prompt_template = "prompts/mayor.template.md"
+`
+	if err := os.WriteFile(filepath.Join(dir, "city.toml"), []byte(toml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	orig, _ := os.Getwd()
+	t.Cleanup(func() { _ = os.Chdir(orig) })
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doPrimeWithMode([]string{"mayor"}, &stdout, &stderr, false, true)
+	if code == 0 {
+		t.Fatalf("doPrimeWithMode(strict, unknown var) = 0, want non-zero; stderr: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "unknown template variable {{ .Rig }}") {
+		t.Errorf("stderr = %q, want unknown-variable error", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = doPrimeWithMode([]string{"mayor"}, &stdout, &stderr, false, false)
+	if code != 0 {
+		t.Fatalf("doPrimeWithMode(non-strict, unknown var) = %d, want 0 (permissive render)", code)
+	}
+}
