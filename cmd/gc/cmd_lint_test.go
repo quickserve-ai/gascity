@@ -30,18 +30,99 @@ func TestLintValidPackPasses(t *testing.T) {
 	}
 }
 
-func TestLintUsesRuntimeMissingKeyPolicyForUnknownVariables(t *testing.T) {
+// TestLintFailsOnUnknownTemplateVariables: unknown top-level keys render as
+// silent empty strings at runtime (missingkey=zero over a string map), so
+// lint must fail on them. Reverses the earlier tolerate-unknowns policy —
+// that policy shipped the {{ .Rig }} blank-prompt defect (ga-80ij).
+func TestLintFailsOnUnknownTemplateVariables(t *testing.T) {
 	packDir := t.TempDir()
 	writeLintPack(t, packDir, "typo", "witness", "prompts/witness.template.md")
 	writeLintFile(t, filepath.Join(packDir, "prompts", "witness.template.md"), "runtime-compatible {{.CommitSha}}\n")
 
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"lint", packDir}, &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("gc lint = 0, want failure on unknown variable\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "unknown template variable {{ .CommitSha }}") {
+		t.Fatalf("stderr missing unknown-variable diagnostic:\n%s", stderr.String())
+	}
+}
+
+// TestLintAcceptsAgentEnvVariables: keys from the agent's env block are part
+// of the known set and must not be flagged.
+func TestLintAcceptsAgentEnvVariables(t *testing.T) {
+	packDir := t.TempDir()
+	writeLintFile(t, filepath.Join(packDir, "pack.toml"), `[pack]
+name = "env-ok"
+version = "0.1.0"
+schema = 2
+
+[[agent]]
+name = "worker"
+prompt_template = "prompts/worker.template.md"
+
+[agent.env]
+CUSTOM_FLAG = "1"
+`)
+	writeLintFile(t, filepath.Join(packDir, "prompts", "worker.template.md"), "flag {{.CUSTOM_FLAG}} agent {{.AgentName}}\n")
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"lint", packDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("gc lint = %d, want 0\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
 	}
-	if stderr.Len() != 0 {
-		t.Fatalf("stderr = %q, want empty", stderr.String())
+}
+
+// TestLintResolvesRawFragmentFiles: a template-fragments/ file with no
+// {{define}} wrapper registers under its base name (and pack-qualified
+// alias), so referencing it is not a missing-fragment error (ga-14a).
+func TestLintResolvesRawFragmentFiles(t *testing.T) {
+	packDir := t.TempDir()
+	writeLintFile(t, filepath.Join(packDir, "pack.toml"), `[pack]
+name = "raw-frag"
+version = "0.1.0"
+schema = 2
+
+[[agent]]
+name = "worker"
+prompt_template = "prompts/worker.template.md"
+append_fragments = ["law", "raw-frag/law"]
+`)
+	writeLintFile(t, filepath.Join(packDir, "prompts", "worker.template.md"), "hello {{.AgentName}}\n")
+	writeLintFile(t, filepath.Join(packDir, "template-fragments", "law.template.md"), "# The Law\nAgent {{.AgentName}} must verify.\n")
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"lint", packDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("gc lint = %d, want raw fragment to resolve\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+	}
+}
+
+// TestLintFlagsUnknownVariableInsideFragment: the unknown-variable check
+// covers configured fragments, not just the prompt body.
+func TestLintFlagsUnknownVariableInsideFragment(t *testing.T) {
+	packDir := t.TempDir()
+	writeLintFile(t, filepath.Join(packDir, "pack.toml"), `[pack]
+name = "frag-typo"
+version = "0.1.0"
+schema = 2
+
+[[agent]]
+name = "worker"
+prompt_template = "prompts/worker.template.md"
+append_fragments = ["law"]
+`)
+	writeLintFile(t, filepath.Join(packDir, "prompts", "worker.template.md"), "hello {{.AgentName}}\n")
+	writeLintFile(t, filepath.Join(packDir, "template-fragments", "law.template.md"), "rig {{.Rig}}\n")
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"lint", packDir}, &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("gc lint = 0, want failure on unknown variable in fragment\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "unknown template variable {{ .Rig }}") {
+		t.Fatalf("stderr missing fragment unknown-variable diagnostic:\n%s", stderr.String())
 	}
 }
 
