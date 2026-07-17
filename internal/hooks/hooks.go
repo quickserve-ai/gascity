@@ -36,7 +36,7 @@ const (
 	managedPiHookVersion       = 7
 	managedOpenCodeHookVersion = 5
 	managedMimoCodeHookVersion = 2
-	managedOmpHookVersion      = 2
+	managedOmpHookVersion      = 3
 )
 
 var (
