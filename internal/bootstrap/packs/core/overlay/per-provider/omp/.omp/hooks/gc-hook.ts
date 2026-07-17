@@ -11,9 +11,9 @@
 import { execFileSync } from "node:child_process";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
-const GC_OMP_HOOK_VERSION = 2;
+const GC_OMP_HOOK_VERSION = 3;
 const PATH_PREFIX =
-  `/opt/homebrew/bin:/usr/local/bin:${process.env.HOME}/go/bin:${process.env.HOME}/.local/bin:`;
+  `${process.env.HOME}/go/bin:${process.env.HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:`;
 
 function run(args: string[], cwd?: string, extraEnv: Record<string, string> = {}): string {
   try {
