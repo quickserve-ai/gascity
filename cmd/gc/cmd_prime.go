@@ -749,6 +749,17 @@ func persistPrimeHookProviderSessionKey(hookProviderSessionID string, stderr io.
 	}
 }
 
+// hookStdinSessionIDTrusted reports whether a provider family's session-start
+// hook delivers the provider conversation id on stdin in a shape we trust
+// ({"session_id": ...}). Claude has no env-based channel at all — the CLI
+// mints its own conversation id and the spawn path launches without a
+// --session-id flag — so hook stdin is the only way a claude session's resume
+// key is ever learned; rejecting it left session_key permanently empty and
+// made wake_mode=resume a no-op for every claude agent (ga-lqk3).
+func hookStdinSessionIDTrusted(family string) bool {
+	return family == "codex" || family == "claude" || strings.HasPrefix(family, "claude-")
+}
+
 // isPoolInstance reports whether a resolved agent (with Pool=nil) originated
 // from a pool template. Checks if the agent's base name (without -N suffix)
 // matches a configured pool agent in the same dir.

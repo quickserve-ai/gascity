@@ -7275,11 +7275,40 @@ base = "builtin:codex"`)
 	}
 }
 
-func TestDoPrimeHookIgnoresProviderSessionKeyFromHookStdinForNonCodex(t *testing.T) {
+func TestDoPrimeClaudeHookPersistsProviderSessionKeyFromHookStdin(t *testing.T) {
 	dir, sessionID := setupPrimeHookProviderSessionKeyTest(t, "claude", `[providers.claude]
 base = "builtin:claude"`)
 	setPrimeHookStdinJSON(t, map[string]string{
-		"session_id":      "claude-provider-session",
+		"session_id":      "a1473624-c72c-4e42-b379-9e27e753d1ec",
+		"transcript_path": "/home/ubuntu/.claude/projects/-home-ubuntu-city/a1473624-c72c-4e42-b379-9e27e753d1ec.jsonl",
+		"hook_event_name": "SessionStart",
+		"source":          "startup",
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := doPrimeWithMode(nil, &stdout, &stderr, true, false)
+	if code != 0 {
+		t.Fatalf("doPrimeWithMode = %d, want 0; stderr: %s", code, stderr.String())
+	}
+
+	updatedStore, err := openCityStoreAt(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := updatedStore.Get(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(updated.Metadata["session_key"]); got != "a1473624-c72c-4e42-b379-9e27e753d1ec" {
+		t.Fatalf("session_key = %q, want claude provider session id from hook stdin", got)
+	}
+}
+
+func TestDoPrimeHookIgnoresProviderSessionKeyFromHookStdinForUntrustedProvider(t *testing.T) {
+	dir, sessionID := setupPrimeHookProviderSessionKeyTest(t, "kimi", `[providers.kimi]
+base = "builtin:kimi"`)
+	setPrimeHookStdinJSON(t, map[string]string{
+		"session_id":      "kimi-provider-session",
 		"hook_event_name": "SessionStart",
 		"source":          "startup",
 	})
@@ -7299,7 +7328,42 @@ base = "builtin:claude"`)
 		t.Fatal(err)
 	}
 	if got := strings.TrimSpace(updated.Metadata["session_key"]); got != "" {
-		t.Fatalf("session_key = %q, want empty for non-Codex hook stdin session id", got)
+		t.Fatalf("session_key = %q, want empty for untrusted-provider hook stdin session id", got)
+	}
+}
+
+func TestDoPrimeClaudeHookDoesNotOverwriteExistingSessionKey(t *testing.T) {
+	dir, sessionID := setupPrimeHookProviderSessionKeyTest(t, "claude", `[providers.claude]
+base = "builtin:claude"`)
+	seedStore, err := openCityStoreAt(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := seedStore.SetMetadata(sessionID, "session_key", "existing-conversation-id"); err != nil {
+		t.Fatal(err)
+	}
+	setPrimeHookStdinJSON(t, map[string]string{
+		"session_id":      "newer-conversation-id",
+		"hook_event_name": "SessionStart",
+		"source":          "startup",
+	})
+
+	var stdout, stderr bytes.Buffer
+	code := doPrimeWithMode(nil, &stdout, &stderr, true, false)
+	if code != 0 {
+		t.Fatalf("doPrimeWithMode = %d, want 0; stderr: %s", code, stderr.String())
+	}
+
+	updatedStore, err := openCityStoreAt(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := updatedStore.Get(sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(updated.Metadata["session_key"]); got != "existing-conversation-id" {
+		t.Fatalf("session_key = %q, want existing key preserved over hook stdin id", got)
 	}
 }
 
