@@ -622,8 +622,8 @@ func persistPrimeHookProviderSessionKey(hookProviderSessionID string, stderr io.
 		warn("loading session bead %q: %v", gcSessionID, err)
 		return
 	}
-	if fromHookStdin && sessionProviderFamily(sessionBead) != "codex" {
-		warn("hook stdin provider session id is only accepted for codex session %q", gcSessionID)
+	if fromHookStdin && !hookStdinSessionIDTrusted(sessionProviderFamily(sessionBead)) {
+		warn("hook stdin provider session id is only accepted for codex/claude session %q", gcSessionID)
 		return
 	}
 	if existing := strings.TrimSpace(sessionBead.Metadata["session_key"]); existing != "" {
@@ -632,6 +632,17 @@ func persistPrimeHookProviderSessionKey(hookProviderSessionID string, stderr io.
 	if err := store.SetMetadata(gcSessionID, "session_key", providerSessionID); err != nil {
 		warn("writing session_key for session %q: %v", gcSessionID, err)
 	}
+}
+
+// hookStdinSessionIDTrusted reports whether a provider family's session-start
+// hook delivers the provider conversation id on stdin in a shape we trust
+// ({"session_id": ...}). Claude has no env-based channel at all — the CLI
+// mints its own conversation id and the spawn path launches without a
+// --session-id flag — so hook stdin is the only way a claude session's resume
+// key is ever learned; rejecting it left session_key permanently empty and
+// made wake_mode=resume a no-op for every claude agent (ga-lqk3).
+func hookStdinSessionIDTrusted(family string) bool {
+	return family == "codex" || family == "claude" || strings.HasPrefix(family, "claude-")
 }
 
 // isPoolInstance reports whether a resolved agent (with Pool=nil) originated
