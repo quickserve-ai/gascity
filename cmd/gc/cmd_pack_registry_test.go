@@ -519,7 +519,7 @@ func TestPackRegistrySearchWarnsOnStaleCache(t *testing.T) {
 	}
 }
 
-func TestRegistryCommandTreeKeepsTopLevelAndPackCompatibilityPaths(t *testing.T) {
+func TestRegistryCommandTreeUsesPackNamespace(t *testing.T) {
 	cmd := newPackCmd(&bytes.Buffer{}, &bytes.Buffer{})
 	for _, args := range [][]string{{"registry", "list"}, {"fetch"}, {"list"}} {
 		found, remaining, err := cmd.Find(args)
@@ -541,10 +541,9 @@ func TestRegistryCommandTreeKeepsTopLevelAndPackCompatibilityPaths(t *testing.T)
 	}
 
 	root := newRootCmd(&bytes.Buffer{}, &bytes.Buffer{})
-	for _, name := range []string{"login", "publish", "whoami"} {
-		found, remaining, err := root.Find([]string{"registry", name})
-		if err != nil || found == root || len(remaining) != 0 || found.Name() != name {
-			t.Fatalf("gc registry %s not found: found=%v remaining=%v err=%v", name, found, remaining, err)
+	for _, child := range root.Commands() {
+		if child.Name() == "registry" {
+			t.Fatal("unexpected top-level gc registry command; use gc pack registry")
 		}
 	}
 }

@@ -2779,8 +2779,7 @@
       "notice_policy": "eligible",
       "classification": "pack-registry-login",
       "owner": "immediate",
-      "id": 103,
-      "canonical_target": "gc registry login"
+      "id": 103
     },
     {
       "path": "gc pack registry publish",
@@ -2795,8 +2794,7 @@
       "notice_policy": "eligible",
       "classification": "pack-registry-publish",
       "owner": "immediate",
-      "id": 104,
-      "canonical_target": "gc registry publish"
+      "id": 104
     },
     {
       "path": "gc pack registry refresh",
@@ -2871,8 +2869,7 @@
       "notice_policy": "eligible",
       "classification": "pack-registry-whoami",
       "owner": "immediate",
-      "id": 109,
-      "canonical_target": "gc registry whoami"
+      "id": 109
     },
     {
       "path": "gc pack release",
@@ -3063,70 +3060,6 @@
       "classification": "register",
       "owner": "immediate",
       "id": 118
-    },
-    {
-      "path": "gc registry",
-      "aliases": [],
-      "conditional_modes": [],
-      "hidden": false,
-      "effective_hidden": false,
-      "disable_flag_parsing": false,
-      "shape": "runnable-group",
-      "recording_policy": "recordable",
-      "mode": "standard",
-      "notice_policy": "eligible",
-      "classification": "help",
-      "canonical_target": "@help",
-      "owner": "immediate",
-      "id": 1
-    },
-    {
-      "path": "gc registry login",
-      "aliases": [],
-      "conditional_modes": [],
-      "hidden": false,
-      "effective_hidden": false,
-      "disable_flag_parsing": false,
-      "shape": "runnable",
-      "recording_policy": "recordable",
-      "mode": "standard",
-      "notice_policy": "eligible",
-      "classification": "pack-registry-login",
-      "owner": "immediate",
-      "id": 103,
-      "canonical_identity": true
-    },
-    {
-      "path": "gc registry publish",
-      "aliases": [],
-      "conditional_modes": [],
-      "hidden": false,
-      "effective_hidden": false,
-      "disable_flag_parsing": false,
-      "shape": "runnable",
-      "recording_policy": "recordable",
-      "mode": "standard",
-      "notice_policy": "eligible",
-      "classification": "pack-registry-publish",
-      "owner": "immediate",
-      "id": 104,
-      "canonical_identity": true
-    },
-    {
-      "path": "gc registry whoami",
-      "aliases": [],
-      "conditional_modes": [],
-      "hidden": false,
-      "effective_hidden": false,
-      "disable_flag_parsing": false,
-      "shape": "runnable",
-      "recording_policy": "recordable",
-      "mode": "standard",
-      "notice_policy": "eligible",
-      "classification": "pack-registry-whoami",
-      "owner": "immediate",
-      "id": 109,
-      "canonical_identity": true
     },
     {
       "path": "gc reload",

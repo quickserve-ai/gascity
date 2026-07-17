@@ -122,7 +122,7 @@ schema = 2
 
 // TestBuildRegistryPublishRequestIgnoresPoisonedGitEnv proves the publish
 // request is derived from the pack repository even when git-locating
-// environment variables point elsewhere. Running `gc registry publish` inside a
+// environment variables point elsewhere. Running `gc pack registry publish` inside a
 // pre-commit hook or nested worktree tooling exports GIT_DIR/GIT_WORK_TREE/
 // GIT_INDEX_FILE for an unrelated repository; the publish git subprocesses must
 // strip those so status, HEAD, upstream, and remote URL are read from the pack
@@ -1458,6 +1458,45 @@ func TestRegistryHelpDoesNotLeakEnvironmentSecrets(t *testing.T) {
 	}
 }
 
+func TestRegistryCommandErrorsUsePackNamespace(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(io.Writer) int
+	}{
+		{
+			name: "login",
+			run: func(stderr io.Writer) int {
+				return doRegistryLogin(t.Context(), registryLoginOptions{RegistryURL: "http://registry.example"}, io.Discard, stderr)
+			},
+		},
+		{
+			name: "publish",
+			run: func(stderr io.Writer) int {
+				return doRegistryPublish(t.Context(), "", registryPublishOptions{RegistryURL: "http://registry.example"}, io.Discard, stderr)
+			},
+		},
+		{
+			name: "whoami",
+			run: func(stderr io.Writer) int {
+				return doRegistryWhoami(t.Context(), registryLoginOptions{RegistryURL: "http://registry.example"}, io.Discard, stderr)
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			if code := test.run(&stderr); code == 0 {
+				t.Fatalf("%s unexpectedly succeeded", test.name)
+			}
+			want := "gc pack registry " + test.name + ":"
+			if !strings.HasPrefix(stderr.String(), want) {
+				t.Fatalf("stderr = %q, want prefix %q", stderr.String(), want)
+			}
+		})
+	}
+}
+
 func TestRegistryCredentialProviderArgvDefaultsToGasworks(t *testing.T) {
 	argv, err := parseRegistryCredentialProviderArgv("", false)
 	if err != nil {
@@ -2019,7 +2058,7 @@ func TestRegistryPollDeviceToken(t *testing.T) {
 // TestRegistryDeviceLoginCompletesAfterPending drives the device-code login
 // orchestration end to end: it requests a device code, prints the verification
 // instructions, polls through an authorization_pending response, and returns the
-// access token once the registry approves. This covers gc registry login
+// access token once the registry approves. This covers gc pack registry login
 // --device above the registryPollDeviceToken helper unit test.
 func TestRegistryDeviceLoginCompletesAfterPending(t *testing.T) {
 	var mu sync.Mutex

@@ -107,7 +107,7 @@ through the configured credential provider without storing its credential.`,
 func doRegistryLogin(ctx context.Context, opts registryLoginOptions, stdout, stderr io.Writer) int {
 	baseURL, err := resolveRegistryPublishBaseURL(opts.RegistryURL)
 	if err != nil {
-		fmt.Fprintf(stderr, "gc registry login: %v\n", err) //nolint:errcheck
+		fmt.Fprintf(stderr, "gc pack registry login: %v\n", err) //nolint:errcheck
 		return 1
 	}
 	ctx, cancel := context.WithTimeout(ctx, opts.Timeout)
@@ -123,18 +123,18 @@ func doRegistryLogin(ctx context.Context, opts registryLoginOptions, stdout, std
 			token, err = registryBrowserLogin(ctx, baseURL, opts.Label, stdout, !opts.NoBrowser)
 		}
 		if err != nil {
-			fmt.Fprintf(stderr, "gc registry login: %v\n", err) //nolint:errcheck
+			fmt.Fprintf(stderr, "gc pack registry login: %v\n", err) //nolint:errcheck
 			return 1
 		}
 	}
 
 	user, err := registryFetchCurrentUser(ctx, registryPublishHTTPClient, baseURL, token)
 	if err != nil {
-		fmt.Fprintf(stderr, "gc registry login: %v\n", err) //nolint:errcheck
+		fmt.Fprintf(stderr, "gc pack registry login: %v\n", err) //nolint:errcheck
 		return 1
 	}
 	if err := writeRegistryConfiguredToken(baseURL, token); err != nil {
-		fmt.Fprintf(stderr, "gc registry login: %v\n", err) //nolint:errcheck
+		fmt.Fprintf(stderr, "gc pack registry login: %v\n", err) //nolint:errcheck
 		return 1
 	}
 	fmt.Fprintf(stdout, "Logged in to %s as @%s\n", baseURL, user.Handle) //nolint:errcheck
@@ -144,7 +144,7 @@ func doRegistryLogin(ctx context.Context, opts registryLoginOptions, stdout, std
 func doRegistryWhoami(ctx context.Context, opts registryLoginOptions, stdout, stderr io.Writer) int {
 	baseURL, err := resolveRegistryPublishBaseURL(opts.RegistryURL)
 	if err != nil {
-		fmt.Fprintf(stderr, "gc registry whoami: %v\n", err) //nolint:errcheck
+		fmt.Fprintf(stderr, "gc pack registry whoami: %v\n", err) //nolint:errcheck
 		return 1
 	}
 	ctx, cancel := context.WithTimeout(ctx, opts.Timeout)
@@ -155,7 +155,7 @@ func doRegistryWhoami(ctx context.Context, opts registryLoginOptions, stdout, st
 	if token == "" {
 		token, err = readRegistryConfiguredToken(baseURL)
 		if err != nil {
-			fmt.Fprintf(stderr, "gc registry whoami: %v\n", err) //nolint:errcheck
+			fmt.Fprintf(stderr, "gc pack registry whoami: %v\n", err) //nolint:errcheck
 			return 1
 		}
 	}
@@ -163,12 +163,12 @@ func doRegistryWhoami(ctx context.Context, opts registryLoginOptions, stdout, st
 	if token == "" {
 		providerSource, err = newRegistryGasworksCredentialSource(baseURL)
 		if err != nil {
-			fmt.Fprintf(stderr, "gc registry whoami: configuring credential provider: %v\n", err) //nolint:errcheck
+			fmt.Fprintf(stderr, "gc pack registry whoami: configuring credential provider: %v\n", err) //nolint:errcheck
 			return 1
 		}
 		token, err = providerSource(ctx, false)
 		if err != nil {
-			fmt.Fprintf(stderr, "gc registry whoami: minting credential: %v; run `gasworks login` or `gc registry login`\n", err) //nolint:errcheck
+			fmt.Fprintf(stderr, "gc pack registry whoami: minting credential: %v; run `gasworks login` or `gc pack registry login`\n", err) //nolint:errcheck
 			return 1
 		}
 	}
@@ -178,7 +178,7 @@ func doRegistryWhoami(ctx context.Context, opts registryLoginOptions, stdout, st
 	}
 	user, err := registryFetchCurrentUser(ctx, client, baseURL, token)
 	if err != nil {
-		fmt.Fprintf(stderr, "gc registry whoami: %v\n", err) //nolint:errcheck
+		fmt.Fprintf(stderr, "gc pack registry whoami: %v\n", err) //nolint:errcheck
 		return 1
 	}
 	fmt.Fprintf(stdout, "@%s (%s)\n", user.Handle, user.ID) //nolint:errcheck
