@@ -14,6 +14,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/formula"
 	"github.com/gastownhall/gascity/internal/molecule"
+	"github.com/gastownhall/gascity/internal/prguard"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
 )
 
@@ -61,7 +62,13 @@ type ProcessOptions struct {
 	// roots. When set, workflow-finalize uses it to avoid closing a source bead
 	// while any live root in another store still references that source.
 	SourceWorkflowStores func() ([]SourceWorkflowStore, error)
-	Tracef               func(format string, args ...any)
+	// PRCloseCheck overrides the qc-p45lz unmerged-PR close guard applied
+	// before source-chain closes. Nil uses the real gh-backed check
+	// (internal/prguard); tests inject a fake to stay hermetic. The check
+	// only runs for beads that actually record a pr_url, so nil is safe
+	// for fixtures without PR metadata.
+	PRCloseCheck func(metadata map[string]string) prguard.Result
+	Tracef       func(format string, args ...any)
 }
 
 var (
@@ -865,6 +872,17 @@ func walkSourceBeadChain(rootStore beads.Store, rootID string, opts ProcessOptio
 				opts.tracef("close-source-chain root=%s skip reason=already_closed source=%s ref=%s", rootID, nextID, sourceChainStoreLabel(effectiveRef))
 				return nil
 			}
+			// qc-p45lz invariant: a source bead whose PR is confirmed
+			// unmerged stays OPEN when its workflow completes — the open
+			// bead is what drives the merge gate. Terminal metadata was
+			// already propagated above; only the close is withheld.
+			if guard := sourceBeadPRCloseGuard(opts, loaded.Metadata); guard.Verdict == prguard.Block {
+				opts.tracef("close-source-chain root=%s skip reason=pr_unmerged source=%s ref=%s pr=%s pr_state=%s", rootID, nextID, sourceChainStoreLabel(effectiveRef), guard.PRURL, guard.State)
+				stopWalk = true
+				return nil
+			} else if guard.Note != "" {
+				opts.tracef("close-source-chain root=%s pr-guard-note source=%s ref=%s note=%q", rootID, nextID, sourceChainStoreLabel(effectiveRef), guard.Note)
+			}
 			if err := closeSourceBeadPreservingOutcome(nextStore, loaded); err != nil {
 				return fmt.Errorf("closing source bead %s in %s: %w", nextID, sourceChainStoreLabel(effectiveRef), err)
 			}
@@ -1056,6 +1074,23 @@ func sourceChainRootIDs(roots []beads.Bead) string {
 	}
 	sort.Strings(ids)
 	return strings.Join(ids, ",")
+}
+
+// sourceBeadPRCloseGuard applies the qc-p45lz unmerged-PR invariant to a
+// source bead about to be closed by workflow completion. Beads without
+// PR metadata Allow without any external call; the disabled kill switch
+// (GC_PR_CLOSE_GUARD=off) Allows everything.
+func sourceBeadPRCloseGuard(opts ProcessOptions, metadata map[string]string) prguard.Result {
+	if !prguard.Enabled() {
+		return prguard.Result{Verdict: prguard.Allow}
+	}
+	if prguard.MetadataPRURL(metadata) == "" {
+		return prguard.Result{Verdict: prguard.Allow}
+	}
+	if opts.PRCloseCheck != nil {
+		return opts.PRCloseCheck(metadata)
+	}
+	return prguard.CheckBeadClosable(metadata, nil, 5*time.Second)
 }
 
 func closeSourceBeadPreservingOutcome(store beads.Store, bead beads.Bead) error {

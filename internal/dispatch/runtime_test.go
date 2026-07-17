@@ -20,6 +20,7 @@ import (
 	"github.com/gastownhall/gascity/internal/convergence"
 	"github.com/gastownhall/gascity/internal/formula"
 	"github.com/gastownhall/gascity/internal/formulatest"
+	"github.com/gastownhall/gascity/internal/prguard"
 	"github.com/gastownhall/gascity/internal/molecule"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
 )
@@ -9623,4 +9624,104 @@ func TestProcessWorkflowFinalize_PurgeOnMissingDir(t *testing.T) {
 	if !result.Processed {
 		t.Fatalf("result = %+v, want processed", result)
 	}
+}
+
+func TestWorkflowFinalizeSourceCloseHonorsPRCloseGuard(t *testing.T) {
+	t.Parallel()
+
+	buildFixture := func(t *testing.T, store *beads.MemStore) (source, finalizer beads.Bead) {
+		t.Helper()
+		source = mustCreateWorkflowBead(t, store, beads.Bead{
+			Title: "work bead with submitted PR",
+			Type:  "task",
+			Metadata: map[string]string{
+				"pr_url":         "https://github.com/quickserve-ai/q-core/pull/2493",
+				"merge_strategy": "pr",
+			},
+		})
+		workflow := mustCreateWorkflowBead(t, store, beads.Bead{
+			Title: "mol-implement",
+			Type:  "task",
+			Metadata: map[string]string{
+				"gc.kind":             "workflow",
+				"gc.formula_contract": "graph.v2",
+				"gc.source_bead_id":   source.ID,
+			},
+		})
+		step := mustCreateWorkflowBead(t, store, beads.Bead{
+			Title:  "implement step",
+			Type:   "task",
+			Status: "closed",
+			Metadata: map[string]string{
+				"gc.outcome": "pass",
+			},
+		})
+		finalizer = mustCreateWorkflowBead(t, store, beads.Bead{
+			Title: "Finalize workflow",
+			Type:  "task",
+			Metadata: map[string]string{
+				"gc.kind":         "workflow-finalize",
+				"gc.root_bead_id": workflow.ID,
+			},
+		})
+		mustDepAdd(t, store, finalizer.ID, step.ID, "blocks")
+		mustDepAdd(t, store, workflow.ID, finalizer.ID, "blocks")
+		return source, finalizer
+	}
+
+	t.Run("unmerged PR leaves source open", func(t *testing.T) {
+		t.Parallel()
+		store := beads.NewMemStore()
+		source, finalizer := buildFixture(t, store)
+
+		var checkedURLs []string
+		result, err := ProcessControl(store, finalizer, ProcessOptions{
+			PRCloseCheck: func(metadata map[string]string) prguard.Result {
+				url := metadata["pr_url"]
+				checkedURLs = append(checkedURLs, url)
+				return prguard.Result{Verdict: prguard.Block, PRURL: url, State: "OPEN"}
+			},
+		})
+		if err != nil {
+			t.Fatalf("ProcessControl(workflow-finalize): %v", err)
+		}
+		if !result.Processed || result.Action != "workflow-pass" {
+			t.Fatalf("workflow result = %+v, want processed workflow-pass", result)
+		}
+		if len(checkedURLs) != 1 || checkedURLs[0] != "https://github.com/quickserve-ai/q-core/pull/2493" {
+			t.Fatalf("PRCloseCheck calls = %v, want exactly the source bead's pr_url", checkedURLs)
+		}
+		sourceAfter, err := store.Get(source.ID)
+		if err != nil {
+			t.Fatalf("get source bead: %v", err)
+		}
+		if sourceAfter.Status == "closed" {
+			t.Fatal("source bead closed despite confirmed-unmerged PR (qc-p45lz invariant violated)")
+		}
+	})
+
+	t.Run("merged PR closes source", func(t *testing.T) {
+		t.Parallel()
+		store := beads.NewMemStore()
+		source, finalizer := buildFixture(t, store)
+
+		result, err := ProcessControl(store, finalizer, ProcessOptions{
+			PRCloseCheck: func(metadata map[string]string) prguard.Result {
+				return prguard.Result{Verdict: prguard.Allow, PRURL: metadata["pr_url"], State: "MERGED"}
+			},
+		})
+		if err != nil {
+			t.Fatalf("ProcessControl(workflow-finalize): %v", err)
+		}
+		if !result.Processed || result.Action != "workflow-pass" {
+			t.Fatalf("workflow result = %+v, want processed workflow-pass", result)
+		}
+		sourceAfter, err := store.Get(source.ID)
+		if err != nil {
+			t.Fatalf("get source bead: %v", err)
+		}
+		if sourceAfter.Status != "closed" {
+			t.Fatalf("source bead status = %q, want closed when PR is merged", sourceAfter.Status)
+		}
+	})
 }

@@ -2669,3 +2669,38 @@ prefix = "fe"
 		t.Fatalf("SQL query = %q, want %q", strings.TrimSpace(string(query)), wantQuery)
 	}
 }
+
+func TestBdCloseShape(t *testing.T) {
+	cases := []struct {
+		name      string
+		args      []string
+		forceEnv  string
+		wantClose bool
+		wantForce bool
+	}{
+		{name: "empty", args: nil},
+		{name: "show is not close", args: []string{"show", "qc-1"}},
+		{name: "plain close", args: []string{"close", "qc-1"}, wantClose: true},
+		{name: "close with reason", args: []string{"close", "qc-1", "--reason", "done"}, wantClose: true},
+		{name: "close force long", args: []string{"close", "qc-1", "--force"}, wantClose: true, wantForce: true},
+		{name: "close force short", args: []string{"close", "-f", "qc-1"}, wantClose: true, wantForce: true},
+		{name: "close force after ddash ignored", args: []string{"close", "qc-1", "--", "--force"}, wantClose: true},
+		{name: "close env escape", args: []string{"close", "qc-1"}, forceEnv: "1", wantClose: true, wantForce: true},
+		{name: "update status closed", args: []string{"update", "qc-1", "--status", "closed"}, wantClose: true},
+		{name: "update status=closed", args: []string{"update", "qc-1", "--status=closed"}, wantClose: true},
+		{name: "update status closed case", args: []string{"update", "qc-1", "--status", "CLOSED"}, wantClose: true},
+		{name: "update status open", args: []string{"update", "qc-1", "--status", "open"}},
+		{name: "update no status", args: []string{"update", "qc-1", "--priority", "1"}},
+		{name: "update env escape", args: []string{"update", "qc-1", "--status", "closed"}, forceEnv: "1", wantClose: true, wantForce: true},
+		{name: "update status after ddash ignored", args: []string{"update", "qc-1", "--", "--status", "closed"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("GC_FORCE_UNMERGED_CLOSE", tc.forceEnv)
+			isClose, forced := bdCloseShape(tc.args)
+			if isClose != tc.wantClose || forced != tc.wantForce {
+				t.Fatalf("bdCloseShape(%v) = (%t, %t), want (%t, %t)", tc.args, isClose, forced, tc.wantClose, tc.wantForce)
+			}
+		})
+	}
+}
