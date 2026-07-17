@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"text/template"
 
 	gascitypacks "github.com/gastownhall/gascity-packs"
 
@@ -1442,5 +1443,213 @@ func TestRenderPromptCityRootFragmentsAbsentNoEffect(t *testing.T) {
 	want := "plain body x"
 	if got != want {
 		t.Errorf("renderPrompt(no city-root fragments) = %q, want %q", got, want)
+	}
+}
+
+// --- ga-14a: raw fragment files (no {{define}} wrapper) must resolve ---
+
+// TestRenderPromptRawFragmentFileResolvesByBaseName verifies that a
+// template-fragments/ file authored as raw markdown (no {{define}} block)
+// registers under its file base name. Regression test for the local-pack
+// fragment bug: raw files were parsed into the root template body and
+// silently discarded.
+func TestRenderPromptRawFragmentFileResolvesByBaseName(t *testing.T) {
+	f := fsys.NewFake()
+	f.Files["/city/prompts/agent.template.md"] = []byte("Body")
+	f.Files["/packs/mypack/template-fragments/law.template.md"] = []byte("# The Law\nAlways verify.\n")
+	got := renderPrompt(f, "/city", "", "prompts/agent.template.md", PromptContext{}, "", io.Discard,
+		[]string{"/packs/mypack"}, []string{"law"}, nil)
+	want := "Body\n\n# The Law\nAlways verify.\n"
+	if got != want {
+		t.Errorf("renderPrompt(raw fragment by base name) = %q, want %q", got, want)
+	}
+}
+
+// TestRenderPromptRawFragmentFileResolvesByQualifiedName verifies the
+// pack-qualified "<pack>/<fragment>" spelling used by city.toml patches.
+func TestRenderPromptRawFragmentFileResolvesByQualifiedName(t *testing.T) {
+	f := fsys.NewFake()
+	f.Files["/city/prompts/agent.template.md"] = []byte("Body")
+	f.Files["/packs/mypack/template-fragments/law.template.md"] = []byte("qualified law text")
+	got := renderPrompt(f, "/city", "", "prompts/agent.template.md", PromptContext{}, "", io.Discard,
+		[]string{"/packs/mypack"}, []string{"mypack/law"}, nil)
+	want := "Body\n\nqualified law text"
+	if got != want {
+		t.Errorf("renderPrompt(raw fragment by qualified name) = %q, want %q", got, want)
+	}
+}
+
+// TestRenderPromptDefineFragmentQualifiedAlias verifies define-style
+// fragments also gain the pack-qualified alias.
+func TestRenderPromptDefineFragmentQualifiedAlias(t *testing.T) {
+	f := fsys.NewFake()
+	f.Files["/city/prompts/agent.template.md"] = []byte("Body")
+	f.Files["/packs/mypack/template-fragments/frag.template.md"] = []byte(`{{ define "frag" }}defined text{{ end }}`)
+	got := renderPrompt(f, "/city", "", "prompts/agent.template.md", PromptContext{}, "", io.Discard,
+		[]string{"/packs/mypack"}, []string{"mypack/frag"}, nil)
+	want := "Body\n\ndefined text"
+	if got != want {
+		t.Errorf("renderPrompt(define fragment qualified alias) = %q, want %q", got, want)
+	}
+}
+
+// TestRenderPromptRawFragmentStripsFrontmatter verifies raw fragment files
+// carrying YAML frontmatter register the body only, matching main-template
+// handling.
+func TestRenderPromptRawFragmentStripsFrontmatter(t *testing.T) {
+	f := fsys.NewFake()
+	f.Files["/city/prompts/agent.template.md"] = []byte("Body")
+	f.Files["/packs/mypack/template-fragments/law.template.md"] = []byte("---\nversion: v1\n---\nlaw body")
+	got := renderPrompt(f, "/city", "", "prompts/agent.template.md", PromptContext{}, "", io.Discard,
+		[]string{"/packs/mypack"}, []string{"law"}, nil)
+	want := "Body\n\nlaw body"
+	if got != want {
+		t.Errorf("renderPrompt(raw fragment frontmatter) = %q, want %q", got, want)
+	}
+}
+
+// TestRenderPromptRawFragmentExecutesTemplateVars verifies raw fragments
+// still get template execution (they are fragments, not inert text).
+func TestRenderPromptRawFragmentExecutesTemplateVars(t *testing.T) {
+	f := fsys.NewFake()
+	f.Files["/city/prompts/agent.template.md"] = []byte("Body")
+	f.Files["/packs/mypack/template-fragments/law.template.md"] = []byte("Agent: {{ .AgentName }}")
+	got := renderPrompt(f, "/city", "", "prompts/agent.template.md", PromptContext{AgentName: "ada"}, "", io.Discard,
+		[]string{"/packs/mypack"}, []string{"law"}, nil)
+	want := "Body\n\nAgent: ada"
+	if got != want {
+		t.Errorf("renderPrompt(raw fragment vars) = %q, want %q", got, want)
+	}
+}
+
+// TestRenderPromptWithMetaReportsMissingFragments verifies unresolved
+// fragment names surface in PromptRenderResult.MissingFragments.
+func TestRenderPromptWithMetaReportsMissingFragments(t *testing.T) {
+	f := fsys.NewFake()
+	f.Files["/city/prompts/agent.template.md"] = []byte("Body")
+	res := renderPromptWithMeta(f, "/city", "", "prompts/agent.template.md", PromptContext{}, "", io.Discard,
+		nil, []string{"no-such-fragment"}, nil)
+	if len(res.MissingFragments) != 1 || res.MissingFragments[0] != "no-such-fragment" {
+		t.Errorf("MissingFragments = %v, want [no-such-fragment]", res.MissingFragments)
+	}
+	if res.Text != "Body" {
+		t.Errorf("Text = %q, want %q (render stays best-effort)", res.Text, "Body")
+	}
+}
+
+// TestUnresolvedPromptFragments verifies the strict-mode resolution probe.
+func TestUnresolvedPromptFragments(t *testing.T) {
+	f := fsys.NewFake()
+	f.Files["/city/prompts/agent.template.md"] = []byte("Body")
+	f.Files["/packs/mypack/template-fragments/law.template.md"] = []byte("law")
+	missing := unresolvedPromptFragments(f, "/city", "", "prompts/agent.template.md", "",
+		[]string{"/packs/mypack"}, []string{"law", "mypack/law", "ghost"})
+	if len(missing) != 1 || missing[0] != "ghost" {
+		t.Errorf("unresolvedPromptFragments = %v, want [ghost]", missing)
+	}
+}
+
+// TestUnresolvedPromptFragmentsMainBodyDefines verifies fragments defined in
+// the main template body itself count as resolved.
+func TestUnresolvedPromptFragmentsMainBodyDefines(t *testing.T) {
+	f := fsys.NewFake()
+	f.Files["/city/prompts/agent.template.md"] = []byte(`Body{{ define "inline" }}x{{ end }}`)
+	missing := unresolvedPromptFragments(f, "/city", "", "prompts/agent.template.md", "", nil, []string{"inline"})
+	if len(missing) != 0 {
+		t.Errorf("unresolvedPromptFragments = %v, want none", missing)
+	}
+}
+
+// --- ga-80ij: unknown template variables must be detectable statically ---
+
+func testUnknownVarsTemplate(t *testing.T, body string) *template.Template {
+	t.Helper()
+	var tmpl *template.Template
+	tmpl = template.New("prompt").
+		Funcs(promptFuncMap("", "", nil, func() *template.Template { return tmpl })).
+		Option("missingkey=zero")
+	parsed, err := tmpl.Parse(body)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	return parsed
+}
+
+func knownKeysForTest(env map[string]string) map[string]struct{} {
+	known := make(map[string]struct{})
+	for key := range buildTemplateData(PromptContext{Env: env}) {
+		known[key] = struct{}{}
+	}
+	return known
+}
+
+// TestUnknownTemplateVariablesFlagsUnknownField reproduces the {{ .Rig }}
+// defect: an unknown top-level key must be reported.
+func TestUnknownTemplateVariablesFlagsUnknownField(t *testing.T) {
+	tmpl := testUnknownVarsTemplate(t, "Rig: {{ .Rig }} Name: {{ .RigName }}")
+	issues := unknownTemplateVariables(tmpl, []string{"prompt"}, knownKeysForTest(nil))
+	if len(issues) != 1 || issues[0].Field != "Rig" {
+		t.Fatalf("issues = %+v, want exactly one for field Rig", issues)
+	}
+}
+
+// TestUnknownTemplateVariablesAcceptsEnvVars verifies agent env keys extend
+// the known set.
+func TestUnknownTemplateVariablesAcceptsEnvVars(t *testing.T) {
+	tmpl := testUnknownVarsTemplate(t, "{{ .CUSTOM_FLAG }}")
+	if issues := unknownTemplateVariables(tmpl, []string{"prompt"}, knownKeysForTest(map[string]string{"CUSTOM_FLAG": "1"})); len(issues) != 0 {
+		t.Errorf("issues = %+v, want none (env var is known)", issues)
+	}
+	if issues := unknownTemplateVariables(tmpl, []string{"prompt"}, knownKeysForTest(nil)); len(issues) != 1 {
+		t.Errorf("issues = %+v, want one (env var missing)", issues)
+	}
+}
+
+// TestUnknownTemplateVariablesChecksBranchesAndDollar verifies references
+// inside if-branches and via $ are checked.
+func TestUnknownTemplateVariablesChecksBranchesAndDollar(t *testing.T) {
+	tmpl := testUnknownVarsTemplate(t, "{{ if .WorkDir }}{{ .Bogus }}{{ else }}{{ $.AlsoBogus }}{{ end }}")
+	issues := unknownTemplateVariables(tmpl, []string{"prompt"}, knownKeysForTest(nil))
+	fields := map[string]bool{}
+	for _, issue := range issues {
+		fields[issue.Field] = true
+	}
+	if !fields["Bogus"] || !fields["AlsoBogus"] || len(issues) != 2 {
+		t.Errorf("issues = %+v, want Bogus and AlsoBogus", issues)
+	}
+}
+
+// TestUnknownTemplateVariablesFollowsTemplateCalls verifies the walk follows
+// {{template "x" .}} edges into dot-rooted subtemplates.
+func TestUnknownTemplateVariablesFollowsTemplateCalls(t *testing.T) {
+	tmpl := testUnknownVarsTemplate(t, `{{ define "sub" }}{{ .Nope }}{{ end }}{{ template "sub" . }}`)
+	issues := unknownTemplateVariables(tmpl, []string{"prompt"}, knownKeysForTest(nil))
+	if len(issues) != 1 || issues[0].Field != "Nope" || issues[0].TemplateName != "sub" {
+		t.Fatalf("issues = %+v, want one for Nope in sub", issues)
+	}
+}
+
+// TestUnknownTemplateVariablesSkipsRebindingBodies verifies range/with
+// bodies (dot re-bound) don't false-positive on element fields, and that
+// subtemplates invoked with non-dot data are not dot-root checked.
+func TestUnknownTemplateVariablesSkipsRebindingBodies(t *testing.T) {
+	tmpl := testUnknownVarsTemplate(t,
+		`{{ define "sub" }}{{ .Field }}{{ end }}{{ with .WorkDir }}{{ .NotTopLevel }}{{ end }}{{ template "sub" .WorkDir }}`)
+	issues := unknownTemplateVariables(tmpl, []string{"prompt"}, knownKeysForTest(nil))
+	if len(issues) != 0 {
+		t.Errorf("issues = %+v, want none (re-bound dot contexts skipped)", issues)
+	}
+}
+
+// TestPromptTemplateUnknownVariablesCoversFragments verifies the full-path
+// checker walks configured fragments too.
+func TestPromptTemplateUnknownVariablesCoversFragments(t *testing.T) {
+	f := fsys.NewFake()
+	f.Files["/city/prompts/agent.template.md"] = []byte("Body")
+	f.Files["/packs/mypack/template-fragments/law.template.md"] = []byte("{{ .Rig }}")
+	issues := promptTemplateUnknownVariables(f, "/city", "", "prompts/agent.template.md", "",
+		[]string{"/packs/mypack"}, []string{"law"}, knownKeysForTest(nil))
+	if len(issues) != 1 || issues[0].Field != "Rig" || issues[0].TemplateName != "law" {
+		t.Fatalf("issues = %+v, want one for Rig in law", issues)
 	}
 }

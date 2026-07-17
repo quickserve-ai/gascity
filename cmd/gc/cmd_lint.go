@@ -298,17 +298,20 @@ func lintPrompt(packDir string, packDirs []string, providers map[string]config.P
 		Option("missingkey=zero")
 
 	for _, dir := range packDirs {
-		diagnostics = append(diagnostics, lintLoadSharedTemplates(tmpl, filepath.Join(dir, "prompts", "shared"))...)
-		diagnostics = append(diagnostics, lintLoadSharedTemplates(tmpl, filepath.Join(dir, "template-fragments"))...)
+		ns := promptPackNamespace(fsys.OSFS{}, dir)
+		diagnostics = append(diagnostics, lintLoadSharedTemplates(tmpl, filepath.Join(dir, "prompts", "shared"), ns)...)
+		diagnostics = append(diagnostics, lintLoadSharedTemplates(tmpl, filepath.Join(dir, "template-fragments"), ns)...)
 	}
 	if sourcePackRoot := promptSourcePackRoot(packDir, sourcePath); sourcePackRoot != "" {
-		diagnostics = append(diagnostics, lintLoadSharedTemplates(tmpl, filepath.Join(sourcePackRoot, "prompts", "shared"))...)
-		diagnostics = append(diagnostics, lintLoadSharedTemplates(tmpl, filepath.Join(sourcePackRoot, "template-fragments"))...)
+		ns := promptPackNamespace(fsys.OSFS{}, sourcePackRoot)
+		diagnostics = append(diagnostics, lintLoadSharedTemplates(tmpl, filepath.Join(sourcePackRoot, "prompts", "shared"), ns)...)
+		diagnostics = append(diagnostics, lintLoadSharedTemplates(tmpl, filepath.Join(sourcePackRoot, "template-fragments"), ns)...)
 	}
-	diagnostics = append(diagnostics, lintLoadSharedTemplates(tmpl, filepath.Join(packDir, "prompts", "shared"))...)
-	diagnostics = append(diagnostics, lintLoadSharedTemplates(tmpl, filepath.Join(packDir, "template-fragments"))...)
-	diagnostics = append(diagnostics, lintLoadSharedTemplates(tmpl, filepath.Join(filepath.Dir(sourcePath), "shared"))...)
-	diagnostics = append(diagnostics, lintLoadSharedTemplates(tmpl, filepath.Join(filepath.Dir(sourcePath), "template-fragments"))...)
+	packNs := promptPackNamespace(fsys.OSFS{}, packDir)
+	diagnostics = append(diagnostics, lintLoadSharedTemplates(tmpl, filepath.Join(packDir, "prompts", "shared"), packNs)...)
+	diagnostics = append(diagnostics, lintLoadSharedTemplates(tmpl, filepath.Join(packDir, "template-fragments"), packNs)...)
+	diagnostics = append(diagnostics, lintLoadSharedTemplates(tmpl, filepath.Join(filepath.Dir(sourcePath), "shared"), "")...)
+	diagnostics = append(diagnostics, lintLoadSharedTemplates(tmpl, filepath.Join(filepath.Dir(sourcePath), "template-fragments"), "")...)
 
 	if _, err := tmpl.Parse(body); err != nil {
 		return append(diagnostics, diagnosticFromError(sourcePath, err))
@@ -319,21 +322,38 @@ func lintPrompt(packDir string, packDirs []string, providers map[string]config.P
 	if err := tmpl.Execute(&buf, dataMap); err != nil {
 		diagnostics = append(diagnostics, diagnosticFromError(sourcePath, err))
 	}
-	for _, name := range effectivePromptFragments(nil, target.agent.InjectFragments, target.agent.AppendFragments, target.agent.InheritedAppendFragments, nil) {
+	fragments := effectivePromptFragments(nil, target.agent.InjectFragments, target.agent.AppendFragments, target.agent.InheritedAppendFragments, nil)
+	resolvedFragments := make([]string, 0, len(fragments))
+	for _, name := range fragments {
 		frag := tmpl.Lookup(name)
 		if frag == nil {
 			diagnostics = append(diagnostics, newLintDiagnostic(sourcePath, 0, fmt.Sprintf("inject_fragment %q: template not found", name)))
 			continue
 		}
+		resolvedFragments = append(resolvedFragments, name)
 		var fbuf bytes.Buffer
 		if err := frag.Execute(&fbuf, dataMap); err != nil {
 			diagnostics = append(diagnostics, diagnosticFromError(sourcePath, err))
 		}
 	}
+
+	// Unknown template variables render as silent empty strings at runtime
+	// (missingkey=zero over a string map) — the {{ .Rig }} class of defect.
+	// Statically diff every dot-rooted reference in the prompt body and its
+	// configured fragments against the SDK field set + agent env keys.
+	known := make(map[string]struct{}, len(dataMap))
+	for key := range dataMap {
+		known[key] = struct{}{}
+	}
+	roots := append([]string{"prompt"}, resolvedFragments...)
+	for _, issue := range unknownTemplateVariables(tmpl, roots, known) {
+		diagnostics = append(diagnostics, newLintDiagnostic(sourcePath, 0,
+			fmt.Sprintf("unknown template variable {{ .%s }} in template %q (%s): not an SDK field or agent env var — renders as empty string", issue.Field, issue.TemplateName, issue.Location)))
+	}
 	return diagnostics
 }
 
-func lintLoadSharedTemplates(tmpl *template.Template, dir string) []lintDiagnostic {
+func lintLoadSharedTemplates(tmpl *template.Template, dir, namespace string) []lintDiagnostic {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil
@@ -346,7 +366,7 @@ func lintLoadSharedTemplates(tmpl *template.Template, dir string) []lintDiagnost
 			diagnostics = append(diagnostics, diagnosticFromError(path, err))
 			continue
 		}
-		if _, err := tmpl.Parse(string(data)); err != nil {
+		if err := registerSharedTemplateContent(tmpl, name, string(data), namespace); err != nil {
 			diagnostics = append(diagnostics, diagnosticFromError(path, err))
 		}
 	}
