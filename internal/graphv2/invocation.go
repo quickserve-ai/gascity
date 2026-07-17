@@ -155,7 +155,7 @@ func PrepareInvocation(ctx context.Context, store beads.Store, formulaName strin
 	if store == nil {
 		return Invocation{}, fmt.Errorf("v2 formula %q requires a bead store to normalize target %s", formulaName, targetID)
 	}
-	convoyID, err := NormalizeInputConvoy(store, targetID)
+	convoyID, err := NormalizeInputConvoyForFormula(store, targetID, formulaName)
 	if err != nil {
 		return Invocation{}, err
 	}
@@ -350,7 +350,22 @@ func ValidateNoReservedUserVars(vars map[string]string) error {
 // NormalizeInputConvoy returns targetID when it is already a convoy, otherwise
 // it creates a visible system-created one-item convoy tracking targetID.
 func NormalizeInputConvoy(store beads.Store, targetID string) (string, error) {
+	return NormalizeInputConvoyForFormula(store, targetID, "")
+}
+
+// NormalizeInputConvoyForFormula is NormalizeInputConvoy with same-formula
+// input-convoy adoption. When formulaName is non-empty and the target already
+// has an open synthetic input convoy minted for the same formula, that convoy
+// is adopted instead of creating another: repeated invocations on the same
+// target (e.g. re-dispatch after a dep-block clears) otherwise create one
+// convoy per attempt, each with a fresh graph.v2 root key, so the singleton
+// check never fires and duplicate convoys/workflows pile up (ga-1pql).
+// Adoption is scoped to the same formula so different formulas on one bead
+// keep independent convoys/roots. Lookup errors fall through to creation —
+// the pre-adoption behavior.
+func NormalizeInputConvoyForFormula(store beads.Store, targetID, formulaName string) (string, error) {
 	targetID = strings.TrimSpace(targetID)
+	formulaName = strings.TrimSpace(formulaName)
 	if store == nil {
 		return "", fmt.Errorf("formulas v2 invocation requires a bead store")
 	}
@@ -370,7 +385,23 @@ func NormalizeInputConvoy(store beads.Store, targetID string) (string, error) {
 	if target.Type == "convoy" {
 		return target.ID, nil
 	}
-	inputConvoy, err := CreateSingleItemInputConvoy(store, target)
+	if formulaName != "" {
+		if existing, lookupErr := convoycore.TrackingConvoysForItem(store, target.ID); lookupErr == nil {
+			for _, c := range existing {
+				if convoycore.IsTerminalStatus(c.Status) {
+					continue
+				}
+				if strings.TrimSpace(c.Metadata[syntheticMetadataKey]) != "true" {
+					continue
+				}
+				if strings.TrimSpace(c.Metadata[beadmeta.FormulaNameMetadataKey]) != formulaName {
+					continue
+				}
+				return c.ID, nil
+			}
+		}
+	}
+	inputConvoy, err := createSingleItemInputConvoyForFormula(store, target, formulaName)
 	if err != nil {
 		return "", err
 	}
@@ -380,6 +411,10 @@ func NormalizeInputConvoy(store beads.Store, targetID string) (string, error) {
 // CreateSingleItemInputConvoy creates a system-created one-item convoy for a
 // graph.v2 invocation target.
 func CreateSingleItemInputConvoy(store beads.Store, target beads.Bead) (beads.Bead, error) {
+	return createSingleItemInputConvoyForFormula(store, target, "")
+}
+
+func createSingleItemInputConvoyForFormula(store beads.Store, target beads.Bead, formulaName string) (beads.Bead, error) {
 	if store == nil {
 		return beads.Bead{}, fmt.Errorf("formulas v2 invocation requires a bead store")
 	}
@@ -391,6 +426,9 @@ func CreateSingleItemInputConvoy(store beads.Store, target beads.Bead) (beads.Be
 	}
 	metadata := map[string]string{
 		syntheticMetadataKey: "true",
+	}
+	if formulaName = strings.TrimSpace(formulaName); formulaName != "" {
+		metadata[beadmeta.FormulaNameMetadataKey] = formulaName
 	}
 	created, err := store.Create(beads.Bead{
 		Title:    "input convoy for " + target.ID,

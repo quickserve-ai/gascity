@@ -737,7 +737,7 @@ func runGitForFormulaTest(t *testing.T, dir string, args ...string) {
 	}
 }
 
-func TestFormulaCookAttachGraphV2CreatesFreshRootForBareBeadTarget(t *testing.T) {
+func TestFormulaCookAttachGraphV2AdoptsLiveRootForBareBeadTarget(t *testing.T) {
 	formulatest.EnableV2ForTest(t)
 	t.Setenv("GC_HOME", t.TempDir())
 	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
@@ -790,6 +790,9 @@ title = "Do work for {{convoy_id}}"
 			t.Fatalf("formula cook: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
 		}
 	}
+	// Re-cooking the same formula on the same still-open target adopts the
+	// live root via the shared input convoy + root key instead of minting a
+	// duplicate workflow (ga-1pql / ga-d4rb).
 	runCook()
 	runCook()
 
@@ -799,8 +802,8 @@ title = "Do work for {{convoy_id}}"
 	if err != nil {
 		t.Fatalf("list workflow roots: %v", err)
 	}
-	if len(roots) != 2 {
-		t.Fatalf("workflow roots = %+v, want two independent graph.v2 attach roots", roots)
+	if len(roots) != 1 {
+		t.Fatalf("workflow roots = %+v, want one adopted graph.v2 attach root", roots)
 	}
 	for _, root := range roots {
 		if root.Metadata["gc.graphv2_root_key"] == "" {

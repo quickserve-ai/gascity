@@ -60,17 +60,21 @@ title = "Inspect {{convoy_id}}"
 	if created.Type != "convoy" {
 		t.Fatalf("input convoy type = %q, want convoy", created.Type)
 	}
-	wantMetadata := map[string]string{"gc.synthetic": "true"}
+	wantMetadata := map[string]string{"gc.synthetic": "true", "gc.formula_name": "work"}
 	if !maps.Equal(created.Metadata, wantMetadata) {
 		t.Fatalf("input convoy metadata = %+v, want %+v", created.Metadata, wantMetadata)
 	}
 
+	// Re-invocation on the same still-open target adopts the existing open
+	// synthetic input convoy (ga-1pql: fresh-per-invocation convoys gave
+	// every re-dispatch a fresh RootKey, so the graph.v2 singleton check
+	// never fired and duplicate convoys/workflows were minted).
 	again, err := PrepareInvocation(context.Background(), store, "work", []string{dir}, target.ID, nil)
 	if err != nil {
 		t.Fatalf("PrepareInvocation again: %v", err)
 	}
-	if again.InputConvoy == inv.InputConvoy {
-		t.Fatalf("input convoy was reused: first=%s second=%s", inv.InputConvoy, again.InputConvoy)
+	if again.InputConvoy != inv.InputConvoy {
+		t.Fatalf("input convoy not adopted: first=%s second=%s", inv.InputConvoy, again.InputConvoy)
 	}
 }
 
@@ -1019,5 +1023,73 @@ func TestRootKeyIgnoresDeprecatedIssueRuntimeVar(t *testing.T) {
 	}, "", "")
 	if base != withAlias {
 		t.Fatalf("RootKey with alias vars = %q, want %q (issue/bead_id must not affect idempotence keys)", withAlias, base)
+	}
+}
+
+func TestNormalizeInputConvoyAdoptsExistingSyntheticConvoy(t *testing.T) {
+	store := beads.NewMemStore()
+	target, err := store.Create(beads.Bead{Title: "work", Type: "task", Status: "open"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := NormalizeInputConvoyForFormula(store, target.ID, "work")
+	if err != nil {
+		t.Fatalf("first NormalizeInputConvoyForFormula: %v", err)
+	}
+	second, err := NormalizeInputConvoyForFormula(store, target.ID, "work")
+	if err != nil {
+		t.Fatalf("second NormalizeInputConvoyForFormula: %v", err)
+	}
+	if second != first {
+		t.Fatalf("second invocation minted new convoy %s, want adoption of %s (ga-1pql)", second, first)
+	}
+
+	// A different formula on the same target keeps its own convoy so
+	// independent workflows stay independent.
+	other, err := NormalizeInputConvoyForFormula(store, target.ID, "other-work")
+	if err != nil {
+		t.Fatalf("NormalizeInputConvoyForFormula(other-work): %v", err)
+	}
+	if other == first {
+		t.Fatalf("different formula adopted convoy %s, want a fresh one", first)
+	}
+}
+
+func TestNormalizeInputConvoySkipsClosedAndUserConvoys(t *testing.T) {
+	store := beads.NewMemStore()
+	target, err := store.Create(beads.Bead{Title: "work", Type: "task", Status: "open"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A user-created convoy tracking the target must not be adopted.
+	user, err := store.Create(beads.Bead{Title: "user convoy", Type: "convoy", Status: "open"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := convoycore.TrackItem(store, user.ID, target.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	// A closed synthetic input convoy must not be adopted either.
+	first, err := NormalizeInputConvoyForFormula(store, target.ID, "work")
+	if err != nil {
+		t.Fatalf("first NormalizeInputConvoyForFormula: %v", err)
+	}
+	if first == user.ID {
+		t.Fatalf("adopted user convoy %s, want synthetic", user.ID)
+	}
+	closed := "closed"
+	if err := store.Update(first, beads.UpdateOpts{Status: &closed}); err != nil {
+		t.Fatal(err)
+	}
+
+	next, err := NormalizeInputConvoyForFormula(store, target.ID, "work")
+	if err != nil {
+		t.Fatalf("NormalizeInputConvoyForFormula after close: %v", err)
+	}
+	if next == first || next == user.ID {
+		t.Fatalf("adopted %s, want a fresh synthetic convoy (closed=%s user=%s)", next, first, user.ID)
 	}
 }
