@@ -179,6 +179,52 @@ func killTestSocketPath(socketPath string) error {
 }
 
 // listTestSocketPaths returns tmux socket paths for orphaned gctest cities.
+// KillSocketRootServers kills every tmux server whose socket lives under
+// socketRoot (the TMUX_TMPDIR handed to ConfigureProcessEnv), regardless of
+// socket name. Package TestMains must call this before deleting a per-run
+// socket root: removing the directory alone orphans the server processes,
+// which then accumulate holding dead cwds (ga-utvl). Returns the number of
+// servers killed.
+func KillSocketRootServers(socketRoot string) int {
+	socketRoot = strings.TrimSpace(socketRoot)
+	if socketRoot == "" {
+		return 0
+	}
+	entries, err := filepath.Glob(filepath.Join(socketRoot, "tmux-"+strconv.Itoa(os.Getuid()), "*"))
+	if err != nil {
+		return 0
+	}
+	killed := 0
+	for _, socketPath := range entries {
+		if killTestSocketPath(socketPath) == nil {
+			killed++
+		}
+	}
+	return killed
+}
+
+// SweepStaleSocketRootParents reaps socket-root parent dirs matching
+// globPattern (e.g. "/tmp/gct-*") left behind by crashed or timed-out test
+// binaries: it kills any tmux servers still bound to sockets under
+// <parent>/tmux, then removes the parent. Parents younger than staleAfter
+// are skipped so concurrent test shards on the same machine are never
+// touched. Callers run this from TestMain before creating their own root.
+func SweepStaleSocketRootParents(globPattern string, staleAfter time.Duration) {
+	parents, err := filepath.Glob(globPattern)
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	for _, parent := range parents {
+		info, err := os.Stat(parent)
+		if err != nil || now.Sub(info.ModTime()) < staleAfter {
+			continue
+		}
+		KillSocketRootServers(filepath.Join(parent, "tmux"))
+		_ = os.RemoveAll(parent)
+	}
+}
+
 func listTestSocketPaths() []string {
 	activeRoot := strings.TrimSpace(os.Getenv(tmuxTmpEnv))
 	if activeRoot != "" {
