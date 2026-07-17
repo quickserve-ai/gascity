@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -160,5 +161,64 @@ func TestNewGuardWithSocketCityNameFormat(t *testing.T) {
 		if len(name) != 15 {
 			t.Fatalf("city name %q has length %d, want 15", name, len(name))
 		}
+	}
+}
+
+func TestKillSocketRootServersReapsSpawnedServer(t *testing.T) {
+	RequireTmux(t)
+	// Unix socket paths are capped (~104 bytes on macOS); t.TempDir() is too
+	// deep, so use a short /tmp root like the runtime does.
+	socketRoot, err := os.MkdirTemp("/tmp", "gct-ut-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketRoot) })
+
+	spawn := exec.Command("tmux", "-L", "test-city", "new-session", "-d", "-s", "probe", "sleep", "300")
+	spawn.Env = append(os.Environ(), tmuxTmpEnv+"="+socketRoot)
+	if out, err := spawn.CombinedOutput(); err != nil {
+		t.Fatalf("spawning probe tmux server: %v\n%s", err, out)
+	}
+	t.Cleanup(func() {
+		kill := exec.Command("tmux", "-L", "test-city", "kill-server")
+		kill.Env = append(os.Environ(), tmuxTmpEnv+"="+socketRoot)
+		_ = kill.Run()
+	})
+
+	socketPath := filepath.Join(socketRoot, "tmux-"+strconv.Itoa(os.Getuid()), "test-city")
+	if _, err := os.Stat(socketPath); err != nil {
+		t.Fatalf("probe socket missing after spawn: %v", err)
+	}
+
+	if killed := KillSocketRootServers(socketRoot); killed != 1 {
+		t.Fatalf("KillSocketRootServers() = %d, want 1", killed)
+	}
+
+	check := exec.Command("tmux", "-L", "test-city", "has-session", "-t", "probe")
+	check.Env = append(os.Environ(), tmuxTmpEnv+"="+socketRoot)
+	if err := check.Run(); err == nil {
+		t.Fatalf("probe server still alive after KillSocketRootServers")
+	}
+}
+
+func TestSweepStaleSocketRootParentsSkipsFreshParents(t *testing.T) {
+	parent := t.TempDir()
+	target := filepath.Join(parent, "gct-fresh")
+	if err := os.MkdirAll(filepath.Join(target, "tmux"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	SweepStaleSocketRootParents(filepath.Join(parent, "gct-*"), time.Hour)
+	if _, err := os.Stat(target); err != nil {
+		t.Fatalf("fresh parent was swept: %v", err)
+	}
+
+	old := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(target, old, old); err != nil {
+		t.Fatal(err)
+	}
+	SweepStaleSocketRootParents(filepath.Join(parent, "gct-*"), time.Hour)
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("stale parent survived sweep: %v", err)
 	}
 }

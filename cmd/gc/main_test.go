@@ -188,12 +188,20 @@ var testTempRootAliveSentinel *os.File
 var tmuxSocketAliveSentinel *os.File
 
 type cleanupTestingM struct {
-	m     testscript.TestingM
-	paths []string
+	m testscript.TestingM
+	// tmuxSocketRoots are TMUX_TMPDIR roots whose servers must be killed
+	// after the run. Deleting the socket directory alone orphans the tmux
+	// server processes (ga-utvl), so servers are reaped before paths are
+	// removed.
+	tmuxSocketRoots []string
+	paths           []string
 }
 
 func (m cleanupTestingM) Run() int {
 	code := m.m.Run()
+	for _, root := range m.tmuxSocketRoots {
+		tmuxtest.KillSocketRootServers(root)
+	}
 	for _, path := range m.paths {
 		if path != "" {
 			_ = os.RemoveAll(path)
@@ -267,6 +275,10 @@ func TestMain(m *testing.M) {
 	if err := tmuxtest.ConfigureProcessEnv(tmuxSocketRoot); err != nil {
 		panic(err)
 	}
+	// Reap tmux servers leaked by crashed or timed-out prior runs (their
+	// teardown never ran). 2h staleness keeps concurrent shards on this
+	// machine safe — CI shards run ~15min (ga-utvl).
+	tmuxtest.SweepStaleSocketRootParents("/tmp/gct-*", 2*time.Hour)
 	tmpRoot := os.TempDir()
 	sweepOrphanPIDPrefixedDirs(tmpRoot, testGCHomeDirPrefix)
 	sweepOrphanPIDPrefixedDirs(tmpRoot, testRuntimeDirPrefix)
@@ -303,8 +315,10 @@ func TestMain(m *testing.M) {
 	configureFSPressureForTests()
 	configureSupervisorHooksForTests()
 	var testRunner testscript.TestingM = newDoltLeakGuardedTestingM(m, testTempRoot, testTempRoot, gcHome, runtimeDir, providerStubDir, sharedTestFixtureRoot)
-	if tmuxSocketCleanupRoot != "" {
-		testRunner = cleanupTestingM{m: testRunner, paths: []string{tmuxSocketCleanupRoot}}
+	testRunner = cleanupTestingM{
+		m:               testRunner,
+		tmuxSocketRoots: []string{tmuxSocketRoot},
+		paths:           []string{tmuxSocketCleanupRoot},
 	}
 	testscript.Main(testRunner, map[string]func(){
 		"gc": func() {
