@@ -2234,6 +2234,7 @@ push_remote_after_compaction() {
   fi
   rm -f "$push_err_tmp"
   clear_compact_marker "${push_marker_dir:-$pending_push_dir}" "${push_marker_key:-$db}"
+  write_backup_push_stamp "$db" "$remote" "$local_branch" "$remote_branch"
   printf 'compact: db=%s remote=%s pushed compacted %s\n' "$db" "$remote" "$remote_branch"
   return 0
 }

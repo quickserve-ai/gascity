@@ -593,6 +593,7 @@ sync_database_sql() {
 
   if [ "$push_rc" -eq 0 ]; then
     echo "  $name: pushed $local_branch -> $remote_name:$remote_branch ($remote_url)"
+    write_backup_push_stamp "$name" "$remote_name" "$local_branch" "$remote_branch"
     rm -f "$push_err_tmp"
     return 0
   fi
@@ -700,6 +701,7 @@ sync_database_cli() {
 
   if [ "$cli_rc" -eq 0 ]; then
     echo "  $name: pushed $local_branch -> $remote_name:$remote_branch ($remote)"
+    write_backup_push_stamp "$name" "$remote_name" "$local_branch" "$remote_branch"
     return 0
   fi
 
