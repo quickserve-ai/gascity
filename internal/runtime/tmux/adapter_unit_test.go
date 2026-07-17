@@ -8,6 +8,26 @@ import (
 	"github.com/gastownhall/gascity/internal/runtime"
 )
 
+func TestWrapInteractiveColorEnv(t *testing.T) {
+	for _, tc := range []struct {
+		provider string
+		command  string
+		want     string
+	}{
+		{provider: "claude", command: "claude", want: "env -u CI -u NO_COLOR claude"},
+		{provider: "claude/tmux-cli", command: "claude", want: "env -u CI -u NO_COLOR claude"},
+		{provider: "codex", command: "codex", want: "env -u CI -u NO_COLOR codex"},
+		{provider: "omp", command: "omp", want: "omp"},
+		{provider: "custom-codex", command: "custom-codex", want: "custom-codex"},
+	} {
+		t.Run(tc.provider, func(t *testing.T) {
+			if got := wrapInteractiveColorEnv(tc.provider, tc.command); got != tc.want {
+				t.Fatalf("command = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestProviderAttachRefusesDeadPane(t *testing.T) {
 	fe := &fakeExecutor{
 		outs: []string{"", "1"},

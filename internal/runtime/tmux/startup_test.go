@@ -1775,9 +1775,10 @@ func TestEnsureFreshSession_Success(t *testing.T) {
 	ops := &fakeStartOps{}
 
 	cfg := runtime.Config{
-		WorkDir: "/proj",
-		Command: "claude",
-		Env:     map[string]string{"GC_AGENT": "mayor"},
+		WorkDir:      "/proj",
+		Command:      "claude",
+		Env:          map[string]string{"GC_AGENT": "mayor"},
+		ProviderName: "claude",
 	}
 	err := ensureFreshSession(ops, "gc-test", cfg)
 	if err != nil {
@@ -1794,8 +1795,8 @@ func TestEnsureFreshSession_Success(t *testing.T) {
 	if c.workDir != "/proj" {
 		t.Errorf("workDir = %q, want %q", c.workDir, "/proj")
 	}
-	if c.command != "claude" {
-		t.Errorf("command = %q, want %q", c.command, "claude")
+	if c.command != "env -u CI -u NO_COLOR claude" {
+		t.Errorf("command = %q, want %q", c.command, "env -u CI -u NO_COLOR claude")
 	}
 	if c.env["GC_AGENT"] != "mayor" {
 		t.Errorf("env = %v, want GC_AGENT=mayor", c.env)
