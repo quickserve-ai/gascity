@@ -10,18 +10,21 @@ import (
 
 func TestWrapInteractiveColorEnv(t *testing.T) {
 	for _, tc := range []struct {
+		name     string
 		provider string
-		command  string
+		launch   string
 		want     string
 	}{
-		{provider: "claude", command: "claude", want: "env -u CI -u NO_COLOR claude"},
-		{provider: "claude/tmux-cli", command: "claude", want: "env -u CI -u NO_COLOR claude"},
-		{provider: "codex", command: "codex", want: "env -u CI -u NO_COLOR codex"},
-		{provider: "omp", command: "omp", want: "omp"},
-		{provider: "custom-codex", command: "custom-codex", want: "custom-codex"},
+		{name: "claude", provider: "claude", launch: "claude --model opus", want: "env -u CI -u NO_COLOR claude --model opus"},
+		{name: "codex", provider: "codex", launch: "codex resume abc", want: "env -u CI -u NO_COLOR codex resume abc"},
+		{name: "path claude", provider: "/usr/local/bin/claude", launch: "/usr/local/bin/claude", want: "env -u CI -u NO_COLOR /usr/local/bin/claude"},
+		{name: "long prompt shell", provider: "claude", launch: "sh -c 'exec claude prompt'", want: "env -u CI -u NO_COLOR sh -c 'exec claude prompt'"},
+		{name: "kiro", provider: "kiro-cli", launch: "kiro-cli chat", want: "kiro-cli chat"},
+		{name: "omp", provider: "omp", launch: "omp", want: "omp"},
+		{name: "custom codex name", provider: "custom-codex", launch: "custom-codex", want: "custom-codex"},
 	} {
-		t.Run(tc.provider, func(t *testing.T) {
-			if got := wrapInteractiveColorEnv(tc.provider, tc.command); got != tc.want {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := wrapInteractiveColorEnv(tc.provider, tc.launch); got != tc.want {
 				t.Fatalf("command = %q, want %q", got, tc.want)
 			}
 		})

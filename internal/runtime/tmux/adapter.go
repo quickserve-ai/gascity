@@ -1188,17 +1188,19 @@ func runPreStart(ctx context.Context, ops startOps, _ string, cfg runtime.Config
 // (~2KB) so large prompts cause "command too long" errors.
 const maxInlinePromptLen = 1024
 
-func wrapInteractiveColorEnv(providerName, command string) string {
-	if command == "" {
-		return command
+func wrapInteractiveColorEnv(providerCommand, launchCommand string) string {
+	if launchCommand == "" {
+		return launchCommand
 	}
-	if base, _, ok := strings.Cut(providerName, "/"); ok {
-		providerName = base
+	args := shellquote.Split(providerCommand)
+	if len(args) == 0 {
+		return launchCommand
 	}
-	if providerName == "claude" || providerName == "codex" {
-		return "env -u CI -u NO_COLOR " + command
+	executable := filepath.Base(args[0])
+	if executable == "claude" || executable == "codex" {
+		return "env -u CI -u NO_COLOR " + launchCommand
 	}
-	return command
+	return launchCommand
 }
 
 func ensureFreshSession(ops startOps, name string, cfg runtime.Config) error {
@@ -1229,7 +1231,7 @@ func ensureFreshSession(ops startOps, name string, cfg runtime.Config) error {
 			}
 		}
 	}
-	fullCommand = wrapInteractiveColorEnv(cfg.ProviderName, fullCommand)
+	fullCommand = wrapInteractiveColorEnv(cfg.Command, fullCommand)
 	err := ops.createSession(name, cfg.WorkDir, fullCommand, cfg.Env)
 	if err == nil {
 		return nil // created successfully
