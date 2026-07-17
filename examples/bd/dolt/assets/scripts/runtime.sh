@@ -33,6 +33,33 @@ else
 fi
 DOLT_PROVIDER_STATE_FILE="$DOLT_STATE_DIR/dolt-provider-state.json"
 
+# Backup push-success stamps (qc-lu207). One file per database under
+# $PACK_STATE_DIR/backup-freshness/<db>, written by the push paths (sync,
+# compact) on push success and read by health's backup-freshness check.
+#
+# SEMANTICS — a stamp means "the pusher believes the push succeeded" (the
+# push call returned 0), NOT "the remote confirmed receipt". Verifying the
+# remote would take a network round-trip on every health call, which would
+# hang exactly when the remote is down — i.e. exactly when someone runs
+# health. The stamp is the deliberate cheap, local proxy; do not "upgrade"
+# it to a remote probe.
+BACKUP_FRESHNESS_DIR="$PACK_STATE_DIR/backup-freshness"
+
+# write_backup_push_stamp <db> <remote> <local_branch> <remote_branch>
+# Best-effort: a stamp failure must never fail the push path that already
+# succeeded, so every step degrades to a silent no-op. tmp+mv keeps a
+# concurrent health read from seeing a torn file.
+write_backup_push_stamp() {
+  bfs_db="$1"
+  mkdir -p "$BACKUP_FRESHNESS_DIR" 2>/dev/null || return 0
+  {
+    printf 'pushed_at_epoch=%s\n' "$(date +%s)"
+    printf 'remote=%s\n' "$2"
+    printf 'refspec=%s:%s\n' "$3" "$4"
+  } > "$BACKUP_FRESHNESS_DIR/$bfs_db.tmp" 2>/dev/null || { rm -f "$BACKUP_FRESHNESS_DIR/$bfs_db.tmp" 2>/dev/null; return 0; }
+  mv -f "$BACKUP_FRESHNESS_DIR/$bfs_db.tmp" "$BACKUP_FRESHNESS_DIR/$bfs_db" 2>/dev/null || return 0
+}
+
 GC_BEADS_BD_SCRIPT="$GC_CITY_PATH/.gc/scripts/gc-beads-bd.sh"
 
 read_runtime_state_flag() (

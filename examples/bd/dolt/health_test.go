@@ -1625,3 +1625,118 @@ func TestHealthScriptJSONAlwaysExitsZero(t *testing.T) {
 		t.Errorf("JSON payload missing expected `\"reachable\": false`; got:\n%s", out)
 	}
 }
+
+// TestHealthBackupFreshnessFailsClosedWhenServerUnreachable is the qc-lu207
+// regression guard. The historical check stat()ed migration-backup-* dirs;
+// in a city without them the guarding if-block never ran and the
+// stale=false INITIALIZER was published as a healthy verdict. The rewritten
+// check must fail CLOSED: when the server is unreachable (so backup targets
+// are unknowable), backups report stale=true / state "unknown" — never a
+// reassuring default.
+func TestHealthBackupFreshnessFailsClosedWhenServerUnreachable(t *testing.T) {
+	if _, err := exec.LookPath("dolt"); err != nil {
+		t.Skip("dolt not installed; skipping")
+	}
+	if _, errT := exec.LookPath("timeout"); errT != nil {
+		if _, errG := exec.LookPath("gtimeout"); errG != nil {
+			t.Skip("neither timeout nor gtimeout installed; skipping")
+		}
+	}
+
+	port, cleanup := startDeadTCPListener(t)
+	defer cleanup()
+
+	cityPath := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityPath, ".beads"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, ".beads", "metadata.json"),
+		[]byte(`{"database":"dolt","backend":"dolt","dolt_database":"at"}`), 0o644); err != nil {
+		t.Fatalf("write metadata: %v", err)
+	}
+
+	root := repoRoot(t)
+	binDir := t.TempDir()
+	writeExecutable(t, filepath.Join(binDir, "gc"), "#!/bin/sh\nexit 1\n")
+
+	cmd := exec.Command("sh", filepath.Join(root, healthScript), "--json")
+	cmd.Env = append(os.Environ(),
+		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"GC_CITY_PATH="+cityPath,
+		"GC_PACK_DIR="+root,
+		"GC_DOLT_HOST=127.0.0.1",
+		"GC_DOLT_PORT="+strconv.Itoa(port),
+		"GC_DOLT_USER=root",
+		"GC_DOLT_PASSWORD=",
+		"GC_HEALTH_SKIP_ZOMBIE_SCAN=1",
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		// JSON mode exits 0 by contract; anything else is a script failure.
+		t.Fatalf("health --json: %v\n%s", err, out)
+	}
+
+	var doc struct {
+		Backups struct {
+			Freshness string `json:"dolt_freshness"`
+			AgeSec    int    `json:"dolt_age_sec"`
+			Stale     bool   `json:"dolt_stale"`
+			State     string `json:"dolt_backup_state"`
+		} `json:"backups"`
+	}
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatalf("health --json emitted invalid JSON: %v\n%s", err, out)
+	}
+	if !doc.Backups.Stale {
+		t.Fatalf("dolt_stale = false with unreachable server — the qc-lu207 fail-open is back:\n%s", out)
+	}
+	if doc.Backups.State != "unknown" {
+		t.Fatalf("dolt_backup_state = %q, want \"unknown\" with unreachable server:\n%s", doc.Backups.State, out)
+	}
+}
+
+// TestWriteBackupPushStampWritesParseableStamp exercises the runtime.sh
+// stamp writer directly: the stamp must land atomically under
+// $PACK_STATE_DIR/backup-freshness/<db> with the epoch/remote/refspec keys
+// health parses.
+func TestWriteBackupPushStampWritesParseableStamp(t *testing.T) {
+	root := repoRoot(t)
+	cityPath := t.TempDir()
+	stateDir := filepath.Join(cityPath, "pack-state")
+
+	script := `set -e
+. "$GC_PACK_DIR/assets/scripts/runtime.sh"
+write_backup_push_stamp hq origin main main-flat-20260716
+`
+	cmd := exec.Command("sh", "-c", script)
+	cmd.Env = append(filteredEnv("GC_PACK_STATE_DIR"),
+		"GC_CITY_PATH="+cityPath,
+		"GC_PACK_DIR="+root,
+		"GC_PACK_STATE_DIR="+stateDir,
+		// runtime.sh fail-louds when it cannot resolve a server port; the
+		// stamp writer itself never touches the server, so any value works.
+		"GC_DOLT_PORT=13306",
+	)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("write_backup_push_stamp: %v\n%s", err, out)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(stateDir, "backup-freshness", "hq"))
+	if err != nil {
+		t.Fatalf("stamp not written: %v", err)
+	}
+	content := string(raw)
+	epochRe := regexp.MustCompile(`(?m)^pushed_at_epoch=\d+$`)
+	if !epochRe.MatchString(content) {
+		t.Fatalf("stamp missing numeric pushed_at_epoch:\n%s", content)
+	}
+	if !strings.Contains(content, "remote=origin\n") {
+		t.Fatalf("stamp missing remote line:\n%s", content)
+	}
+	if !strings.Contains(content, "refspec=main:main-flat-20260716\n") {
+		t.Fatalf("stamp missing refspec line:\n%s", content)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "backup-freshness", "hq.tmp")); !os.IsNotExist(err) {
+		t.Fatalf("tmp stamp left behind: %v", err)
+	}
+}

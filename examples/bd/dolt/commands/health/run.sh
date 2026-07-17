@@ -183,20 +183,106 @@ if [ -d "$data_dir" ] && [ "$server_reachable" = true ]; then
     case "$open_beads" in
       ''|*[!0-9]*) open_beads=0 ;;
     esac
-    db_info="$db_info$name|$commits|$open_beads
+    # Count configured remotes (bounded, fail-soft to "" so a probe failure
+    # is distinguishable from a measured 0). Feeds the backup-freshness
+    # check below: only databases WITH a remote are backup targets.
+    remotes_csv=$(run_bounded 5 dolt $conn_args sql --result-format csv \
+      -q "USE \`$name\`; SELECT COUNT(*) FROM dolt_remotes;" 2>/dev/null || true)
+    remotes=$(printf '%s\n' "$remotes_csv" | grep -E '^[0-9]+$' | head -1)
+    db_info="$db_info$name|$commits|$open_beads|$remotes
 "
   done
 fi
 
-# Check backup freshness.
+# Check backup freshness (qc-lu207).
+#
+# Source of truth: push-success stamps written by the sync/compact push
+# paths into $BACKUP_FRESHNESS_DIR (see runtime.sh). A stamp means "the
+# pusher believes the push succeeded", NOT "the remote confirmed receipt" —
+# that proxy is deliberate: probing the remote from health would fork the
+# network/git-subprocess class that hangs exactly when the remote is down.
+#
+# Verdict rules — no data must NEVER read as healthy:
+#   - db with a remote and a fresh stamp             -> ok
+#   - db with a remote and an old stamp              -> stale (dolt_stale=true)
+#   - db with a remote and NO stamp                  -> unknown (dolt_stale=true)
+#     (a fresh install reads "unknown" until its first successful push —
+#      that is correct fail-closed behavior, not a broken backup)
+#   - db without a remote                            -> skipped (not a target)
+#   - no db has a remote                             -> state "no-remotes",
+#     dolt_stale=false: that is a MEASURED verdict (nothing is supposed to
+#     be backed up), unlike the historical fail-open where stale=false was
+#     just an initializer that never got overwritten.
+#   - server unreachable (remotes unknowable)        -> unknown, dolt_stale=true
+backup_stale_threshold="${GC_DOLT_BACKUP_STALE_SECS:-7200}"
+case "$backup_stale_threshold" in ''|*[!0-9]*) backup_stale_threshold=7200 ;; esac
 backup_freshness=""
-backup_stale=false
 backup_age_sec=0
-newest_backup=$(ls -1d "$GC_CITY_PATH"/migration-backup-* 2>/dev/null | sort -r | head -1 || true)
-if [ -n "$newest_backup" ]; then
-  backup_mtime=$(stat -c %Y "$newest_backup" 2>/dev/null || stat -f %m "$newest_backup" 2>/dev/null || echo 0)
-  now=$(date +%s)
-  backup_age_sec=$((now - backup_mtime))
+backup_stale=true
+backup_state="unknown"
+backup_detail=""
+bf_now=$(date +%s)
+bf_any_remote_db=false
+bf_any_bad=false
+bf_probe_failed=false
+bf_newest_epoch=0
+if [ "$server_reachable" = true ] && [ -n "$db_info" ]; then
+  # Parse the per-db lines collected above (name|commits|open_beads|remotes).
+  bf_lines=$(printf '%s' "$db_info")
+  while IFS='|' read -r bf_name _bf_commits _bf_open bf_remotes; do
+    [ -z "$bf_name" ] && continue
+    case "$bf_remotes" in
+      '') bf_probe_failed=true; continue ;;   # probe failed: can't classify this db
+      0) continue ;;                          # no remote: not a backup target
+    esac
+    bf_any_remote_db=true
+    bf_stamp="$BACKUP_FRESHNESS_DIR/$bf_name"
+    bf_state="unknown"
+    bf_age=""
+    bf_refspec=""
+    if [ -f "$bf_stamp" ]; then
+      bf_epoch=$(sed -n 's/^pushed_at_epoch=//p' "$bf_stamp" 2>/dev/null | head -1)
+      bf_refspec=$(sed -n 's/^refspec=//p' "$bf_stamp" 2>/dev/null | head -1)
+      case "$bf_epoch" in
+        ''|*[!0-9]*) bf_state="unknown" ;;
+        *)
+          bf_age=$((bf_now - bf_epoch))
+          [ "$bf_age" -lt 0 ] && bf_age=0
+          if [ "$bf_age" -le "$backup_stale_threshold" ]; then
+            bf_state="ok"
+          else
+            bf_state="stale"
+          fi
+          if [ "$bf_epoch" -gt "$bf_newest_epoch" ]; then
+            bf_newest_epoch="$bf_epoch"
+          fi
+          ;;
+      esac
+    fi
+    [ "$bf_state" = "ok" ] || bf_any_bad=true
+    backup_detail="$backup_detail$bf_name|$bf_state|$bf_age|$bf_refspec
+"
+  done <<BFEOF
+$bf_lines
+BFEOF
+  if [ "$bf_any_remote_db" = false ] && [ "$bf_probe_failed" = false ]; then
+    backup_state="no-remotes"
+    backup_stale=false
+  elif [ "$bf_any_bad" = true ] || [ "$bf_probe_failed" = true ]; then
+    backup_stale=true
+    if [ "$bf_newest_epoch" -gt 0 ]; then
+      backup_state="stale"
+    else
+      backup_state="unknown"
+    fi
+  else
+    backup_state="ok"
+    backup_stale=false
+  fi
+fi
+if [ "$bf_newest_epoch" -gt 0 ]; then
+  backup_age_sec=$((bf_now - bf_newest_epoch))
+  [ "$backup_age_sec" -lt 0 ] && backup_age_sec=0
   if [ "$backup_age_sec" -ge 3600 ]; then
     backup_freshness="$((backup_age_sec / 3600))h$((backup_age_sec % 3600 / 60))m"
   elif [ "$backup_age_sec" -ge 60 ]; then
@@ -204,7 +290,6 @@ if [ -n "$newest_backup" ]; then
   else
     backup_freshness="${backup_age_sec}s"
   fi
-  [ "$backup_age_sec" -gt 1800 ] && backup_stale=true
 fi
 
 # Find orphan databases.
@@ -421,7 +506,7 @@ if [ "$json_output" = true ]; then
   "databases": [
 JSONEOF
   first=true
-  echo "$db_info" | while IFS='|' read -r name commits open_beads; do
+  echo "$db_info" | while IFS='|' read -r name commits open_beads remotes; do
     [ -z "$name" ] && continue
     if [ "$first" = true ]; then first=false; else echo ","; fi
     printf '    {"name": "%s", "commits": %s, "open_beads": %s}' "$name" "$commits" "$open_beads"
@@ -432,7 +517,21 @@ JSONEOF
   "backups": {
     "dolt_freshness": "$backup_freshness",
     "dolt_age_sec": $backup_age_sec,
-    "dolt_stale": $backup_stale
+    "dolt_stale": $backup_stale,
+    "dolt_backup_state": "$backup_state",
+    "dolt_backup_dbs": [
+JSONEOF
+  first=true
+  echo "$backup_detail" | while IFS='|' read -r bname bstate bage brefspec; do
+    [ -z "$bname" ] && continue
+    if [ "$first" = true ]; then first=false; else echo ","; fi
+    case "$bage" in ''|*[!0-9]*) bage=null ;; esac
+    printf '      {"name": "%s", "state": "%s", "age_sec": %s, "refspec": "%s"}' \
+      "$bname" "$bstate" "$bage" "$brefspec"
+  done
+  cat <<JSONEOF
+
+    ]
   },
   "orphans": [
 JSONEOF
@@ -471,20 +570,36 @@ fi
 if [ -n "$db_info" ]; then
   echo ""
   echo "Databases:"
-  echo "$db_info" | while IFS='|' read -r name commits open_beads; do
+  echo "$db_info" | while IFS='|' read -r name commits open_beads remotes; do
     [ -z "$name" ] && continue
     echo "  $name: $commits commits, $open_beads open beads"
   done
 fi
 
-if [ -n "$backup_freshness" ]; then
-  stale=""
-  [ "$backup_stale" = true ] && stale=" [STALE]"
-  echo ""
-  echo "Backups: ${backup_freshness} ago${stale}"
-else
-  echo ""
-  echo "Backups: none found"
+echo ""
+case "$backup_state" in
+  no-remotes)
+    echo "Backups: no databases have a configured remote (nothing to back up)" ;;
+  ok)
+    echo "Backups: ok (last push ${backup_freshness} ago)" ;;
+  *)
+    stale=""
+    [ "$backup_stale" = true ] && [ "$backup_state" != "stale" ] && stale=" [STALE]"
+    if [ -n "$backup_freshness" ]; then
+      echo "Backups: ${backup_state}${stale} (last recorded push ${backup_freshness} ago)"
+    else
+      echo "Backups: ${backup_state}${stale} (no successful push recorded)"
+    fi ;;
+esac
+if [ -n "$backup_detail" ]; then
+  echo "$backup_detail" | while IFS='|' read -r bname bstate bage brefspec; do
+    [ -z "$bname" ] && continue
+    if [ -n "$bage" ]; then
+      echo "  $bname: $bstate (pushed ${bage}s ago, $brefspec)"
+    else
+      echo "  $bname: $bstate (no successful push recorded)"
+    fi
+  done
 fi
 
 if [ "$orphan_count" -gt 0 ]; then
