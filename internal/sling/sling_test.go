@@ -2282,7 +2282,13 @@ func TestSlingAttachGraphFormulaCreatesConvoyFirstRoot(t *testing.T) {
 	}
 }
 
-func TestSlingAttachGraphFormulaCreatesFreshRootForBareBeadTarget(t *testing.T) {
+func TestSlingAttachGraphFormulaAdoptsLiveRootForBareBeadTarget(t *testing.T) {
+	// Re-slinging the same formula at the same still-open bead while the
+	// first workflow is live adopts that workflow instead of minting a
+	// duplicate root + input convoy (ga-1pql duplicate convoys, ga-d4rb
+	// duplicate workers on one worktree). Deliberate re-runs use --force;
+	// a target whose prior run CLOSED gets a fresh root because the closed
+	// input convoy is not adoptable.
 	formulaDir := t.TempDir()
 	writeGraphV2ConvoyFormula(t, formulaDir)
 	cfg := graphV2SlingTestConfig(t, formulaDir)
@@ -2304,8 +2310,8 @@ func TestSlingAttachGraphFormulaCreatesFreshRootForBareBeadTarget(t *testing.T) 
 	if err != nil {
 		t.Fatalf("second AttachFormula: %v", err)
 	}
-	if second.WorkflowID == first.WorkflowID {
-		t.Fatalf("WorkflowID = %q, want fresh root for fresh input convoy", second.WorkflowID)
+	if second.WorkflowID != first.WorkflowID {
+		t.Fatalf("WorkflowID = %q, want adoption of live root %q", second.WorkflowID, first.WorkflowID)
 	}
 }
 

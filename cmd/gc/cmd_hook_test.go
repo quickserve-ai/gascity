@@ -1823,3 +1823,90 @@ func TestDoHookNormalizesSingleObjectOutputToArray(t *testing.T) {
 		t.Fatalf("stdout = %q, want normalized JSON array", got)
 	}
 }
+
+func TestDoHookClaimAdoptsReadyAssignment(t *testing.T) {
+	// Incident shape from ga-d4rb: the bead is open and pre-assigned to a
+	// prior incarnation's identity ("worker-old"), which this session still
+	// answers to. Adoption must flip it to in_progress under the CURRENT
+	// canonical identity so sibling workers and the reconciler stop seeing
+	// adoptable work.
+	runner := func(string, string) (string, error) {
+		return `[{"id":"hw-pre","status":"open","assignee":"worker-old","metadata":{"gc.routed_to":"worker"}}]`, nil
+	}
+	var adoptedID, adoptedAssignee string
+	ops := hookClaimOps{
+		Runner: runner,
+		Claim: func(context.Context, string, []string, string, string) (beads.Bead, bool, error) {
+			t.Fatal("atomic claim must not run for pre-assigned work")
+			return beads.Bead{}, false, nil
+		},
+		Adopt: func(_ context.Context, _ string, _ []string, beadID, assignee string) error {
+			adoptedID, adoptedAssignee = beadID, assignee
+			return nil
+		},
+	}
+	opts := hookClaimOptions{
+		Assignee:           "worker-1",
+		IdentityCandidates: []string{"worker-1", "worker-old"},
+		RouteTargets:       []string{"worker"},
+		JSON:               true,
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("bd ready --json", "/tmp/work", opts, ops, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doHookClaim(ready_assignment) = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if adoptedID != "hw-pre" || adoptedAssignee != "worker-1" {
+		t.Fatalf("adopt called with (%q, %q), want (hw-pre, worker-1)", adoptedID, adoptedAssignee)
+	}
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("stdout is not JSON: %v\nraw: %s", err, stdout.String())
+	}
+	if result.Action != "work" || result.Reason != "ready_assignment" || result.BeadID != "hw-pre" {
+		t.Fatalf("unexpected claim result: %+v", result)
+	}
+	if result.Assignee != "worker-1" {
+		t.Fatalf("result assignee = %q, want normalized worker-1", result.Assignee)
+	}
+}
+
+func TestDoHookClaimReadyAssignmentSurvivesAdoptFailure(t *testing.T) {
+	// A store hiccup during adoption must not strand the session — the
+	// pre-fix behavior (work returned, no mutation) is the fallback.
+	runner := func(string, string) (string, error) {
+		return `[{"id":"hw-pre","status":"open","assignee":"worker-old","metadata":{"gc.routed_to":"worker"}}]`, nil
+	}
+	ops := hookClaimOps{
+		Runner: runner,
+		Adopt: func(context.Context, string, []string, string, string) error {
+			return errors.New("store unavailable")
+		},
+	}
+	opts := hookClaimOptions{
+		Assignee:           "worker-1",
+		IdentityCandidates: []string{"worker-1", "worker-old"},
+		RouteTargets:       []string{"worker"},
+		JSON:               true,
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doHookClaim("bd ready --json", "/tmp/work", opts, ops, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doHookClaim(adopt failure) = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "adopting hw-pre") {
+		t.Fatalf("stderr = %q, want adoption warning", stderr.String())
+	}
+	var result hookClaimJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("stdout is not JSON: %v\nraw: %s", err, stdout.String())
+	}
+	if result.Reason != "ready_assignment" || result.BeadID != "hw-pre" {
+		t.Fatalf("unexpected claim result: %+v", result)
+	}
+	if result.Assignee != "worker-old" {
+		t.Fatalf("result assignee = %q, want unchanged worker-old on adopt failure", result.Assignee)
+	}
+}

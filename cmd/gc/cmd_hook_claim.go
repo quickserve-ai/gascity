@@ -29,6 +29,7 @@ type hookClaimOptions struct {
 type hookClaimOps struct {
 	Runner             WorkQueryRunner
 	Claim              hookClaimFunc
+	Adopt              hookAdoptFunc
 	ListContinuation   hookListContinuationFunc
 	AssignContinuation hookAssignContinuationFunc
 	DrainAck           hookDrainAckFunc
@@ -37,6 +38,7 @@ type hookClaimOps struct {
 
 type (
 	hookClaimFunc              func(context.Context, string, []string, string, string) (beads.Bead, bool, error)
+	hookAdoptFunc              func(context.Context, string, []string, string, string) error
 	hookListContinuationFunc   func(context.Context, string, []string, string, string) ([]beads.Bead, error)
 	hookAssignContinuationFunc func(context.Context, string, []string, string, string) error
 	hookDrainAckFunc           func(io.Writer) error
@@ -69,6 +71,9 @@ func doHookClaim(workQuery, dir string, opts hookClaimOptions, ops hookClaimOps,
 	}
 	if ops.Claim == nil {
 		ops.Claim = hookClaimWithBdStore
+	}
+	if ops.Adopt == nil {
+		ops.Adopt = hookAdoptWithBdStore
 	}
 	if ops.ListContinuation == nil {
 		ops.ListContinuation = hookListContinuationWithBdStore
@@ -105,6 +110,24 @@ func doHookClaim(workQuery, dir string, opts hookClaimOptions, ops hookClaimOps,
 	}
 
 	if result, bead, ok := hookClaimExistingOrAssigned(candidates, opts); ok {
+		if result.Reason == "ready_assignment" {
+			// Pre-assigned work skips the atomic-claim arbitration, so
+			// nothing moves the bead out of "open": to every other scanner
+			// (pool demand, ready passes, sibling hooks) it stays adoptable
+			// while this session works it, and pool slot-name reuse lets a
+			// dead incarnation's assignment re-arm on the next spawn —
+			// three workers landed on one worktree that way (ga-d4rb).
+			// Adopt before working: in_progress + this session's canonical
+			// identity. Best-effort — a store hiccup should not strand the
+			// session, and pre-adoption behavior was no mutation at all.
+			adoptCtx, adoptCancel := context.WithTimeout(context.Background(), hookClaimMutationTimeout)
+			if err := ops.Adopt(adoptCtx, dir, opts.Env, bead.ID, opts.Assignee); err != nil {
+				fmt.Fprintf(stderr, "gc hook --claim: adopting %s: %v\n", bead.ID, err) //nolint:errcheck
+			} else {
+				result.Assignee = opts.Assignee
+			}
+			adoptCancel()
+		}
 		return writeHookClaimWorkResultForBead(result, bead, opts, ops, dir, stdout, stderr)
 	}
 
@@ -272,6 +295,12 @@ func hookClaimWithBdStore(_ context.Context, dir string, env []string, beadID, a
 		return beads.Bead{}, false, nil
 	}
 	return claimed, true, nil
+}
+
+func hookAdoptWithBdStore(_ context.Context, dir string, env []string, beadID, assignee string) error {
+	store := hookClaimBdStore(dir, env, assignee)
+	inProgress := "in_progress"
+	return store.Update(beadID, beads.UpdateOpts{Status: &inProgress, Assignee: &assignee})
 }
 
 func hookListContinuationWithBdStore(_ context.Context, dir string, env []string, rootID, group string) ([]beads.Bead, error) {
