@@ -37,7 +37,12 @@ const (
 	// import and is fetched from git for real — so editing a pin always
 	// does what it says. The pin names a real gascity.git commit where the
 	// bundled pack paths exist, keeping that fetch path honest.
-	BundledPackImportVersion = "sha:f895c0ff47d6ee9334ed282a416387eb5b084d24"
+	// NOTE (platform fork): this pin names a commit on the local
+	// v1.3.5-platform fork, not a gastownhall/gascity commit — the fork IS
+	// the distribution for this machine's cities, and the binary serves the
+	// pinned content from its embedded FS, so the network fetch path is
+	// never taken here. Carries the qc-lu207 backup-freshness fix.
+	BundledPackImportVersion = "sha:f4128e404f6e8329fabb6343f8825f6db753e01b"
 )
 
 // SupersededBundledPackImportVersions lists previous canonical pins for the
@@ -54,6 +59,10 @@ var SupersededBundledPackImportVersions = []string{
 	// commit, so current binaries must re-pin it offline instead of trying to
 	// fetch it as an exact commit.
 	"sha:282d2bf26b1a9396016e90b0128c1cd16b719f4d3af7cd0ea06cf25fbc426d18",
+	// Pre-qc-lu207 bundled pin (upstream release commit). Doctor re-pins
+	// cities from this to the current fork pin so they pick up the
+	// backup-freshness fix from the binary's embedded content.
+	"sha:f895c0ff47d6ee9334ed282a416387eb5b084d24",
 }
 
 // SupersededPublicGastownPackVersions lists previous canonical pins for the
