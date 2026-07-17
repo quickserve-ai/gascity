@@ -16,6 +16,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/formula"
 	"github.com/gastownhall/gascity/internal/molecule"
+	"github.com/gastownhall/gascity/internal/prguard"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
 )
 
@@ -63,38 +64,23 @@ type ProcessOptions struct {
 	// roots. When set, workflow-finalize uses it to avoid closing a source bead
 	// while any live root in another store still references that source.
 	SourceWorkflowStores func() ([]SourceWorkflowStore, error)
-	// MemberStores is the work-class store tail probed (after the primary
-	// graph store) when a drain reads convoy membership. A control bead and
-	// its drain item-root molecules live in the graph store, but the convoy
-	// members a drain expands over are work beads that may live in a different
-	// per-class store; MemberStores supplies those additional stores to
-	// convoycore.Members so member Gets resolve across the class boundary.
-	// Empty (the default for single-store callers) collapses the probe set to
-	// the primary store, exactly matching the pre-seam single-store behavior.
+	// MemberStores is the work-class store tail probed after the graph store.
 	MemberStores []beads.Store
+	// PRCloseCheck overrides the unmerged-PR close guard. Nil uses the real checker.
+	PRCloseCheck func(metadata map[string]string) prguard.Result
 	Tracef       func(format string, args ...any)
 
-	// routeCfg lazily caches the city.toml used for attempt-time routing
-	// decisions so a single ProcessControl invocation parses it at most once
-	// (previously it was re-parsed per processed bead via loadAttemptRouteConfig,
-	// beadUsesMetadataPoolRoute, and retryPreservedAssignee). It is a pointer so
-	// the cache is shared across the by-value opts copies handed to sub-steps.
+	// routeCfg lazily caches the city.toml used for attempt-time routing.
 	routeCfg *routeConfigCache
 }
 
-// routeConfigCache memoizes a single attempt-route config load (and its error)
-// for the lifetime of one ProcessControl invocation.
+// routeConfigCache memoizes a single attempt-route config load.
 type routeConfigCache struct {
 	once sync.Once
 	cfg  *config.City
 	err  error
 }
 
-// routeConfig returns the attempt-route config for this invocation, loading it
-// at most once. The load error is no longer swallowed: it is memoized, traced
-// once, and returned to callers so routing decisions can observe it. Callers
-// that bypass ProcessControl (direct-called sub-steps in tests) get a fresh
-// uncached load, preserving their prior behavior.
 func (opts ProcessOptions) routeConfig() (*config.City, error) {
 	cache := opts.routeCfg
 	if cache == nil {
@@ -967,6 +953,17 @@ func walkSourceBeadChain(rootStore beads.Store, rootID string, opts ProcessOptio
 				opts.tracef("close-source-chain root=%s skip reason=already_closed source=%s ref=%s", rootID, nextID, sourceChainStoreLabel(effectiveRef))
 				return nil
 			}
+			// qc-p45lz invariant: a source bead whose PR is confirmed
+			// unmerged stays OPEN when its workflow completes — the open
+			// bead is what drives the merge gate. Terminal metadata was
+			// already propagated above; only the close is withheld.
+			if guard := sourceBeadPRCloseGuard(opts, loaded.Metadata); guard.Verdict == prguard.Block {
+				opts.tracef("close-source-chain root=%s skip reason=pr_unmerged source=%s ref=%s pr=%s pr_state=%s", rootID, nextID, sourceChainStoreLabel(effectiveRef), guard.PRURL, guard.State)
+				stopWalk = true
+				return nil
+			} else if guard.Note != "" {
+				opts.tracef("close-source-chain root=%s pr-guard-note source=%s ref=%s note=%q", rootID, nextID, sourceChainStoreLabel(effectiveRef), guard.Note)
+			}
 			if err := closeSourceBeadPreservingOutcome(nextStore, loaded); err != nil {
 				return fmt.Errorf("closing source bead %s in %s: %w", nextID, sourceChainStoreLabel(effectiveRef), err)
 			}
@@ -1158,6 +1155,23 @@ func sourceChainRootIDs(roots []beads.Bead) string {
 	}
 	sort.Strings(ids)
 	return strings.Join(ids, ",")
+}
+
+// sourceBeadPRCloseGuard applies the qc-p45lz unmerged-PR invariant to a
+// source bead about to be closed by workflow completion. Beads without
+// PR metadata Allow without any external call; the disabled kill switch
+// (GC_PR_CLOSE_GUARD=off) Allows everything.
+func sourceBeadPRCloseGuard(opts ProcessOptions, metadata map[string]string) prguard.Result {
+	if !prguard.Enabled() {
+		return prguard.Result{Verdict: prguard.Allow}
+	}
+	if prguard.MetadataPRURL(metadata) == "" {
+		return prguard.Result{Verdict: prguard.Allow}
+	}
+	if opts.PRCloseCheck != nil {
+		return opts.PRCloseCheck(metadata)
+	}
+	return prguard.CheckBeadClosable(metadata, nil, 5*time.Second)
 }
 
 func closeSourceBeadPreservingOutcome(store beads.Store, bead beads.Bead) error {
