@@ -2964,7 +2964,7 @@ func TestSharedServerContinuityAfterHandoffStop(t *testing.T) {
 		t.Skip("tmux not installed")
 	}
 
-	socket := fmt.Sprintf("gct-handoff-%d-%d", os.Getpid(), time.Now().UnixNano())
+	socket := fmt.Sprintf("gctest-handoff-%d-%d", os.Getpid(), time.Now().UnixNano())
 	cfg := DefaultConfig()
 	cfg.SocketName = socket
 	provider := NewProviderWithConfig(cfg)
@@ -3034,7 +3034,7 @@ func TestConfigureServerReappliesExitEmptyAfterReplacement(t *testing.T) {
 		t.Skip("tmux not installed")
 	}
 
-	socket := fmt.Sprintf("gct-handoff-replacement-%d-%d", os.Getpid(), time.Now().UnixNano())
+	socket := fmt.Sprintf("gctest-handoff-replacement-%d-%d", os.Getpid(), time.Now().UnixNano())
 	cfg := DefaultConfig()
 	cfg.SocketName = socket
 	provider := NewProviderWithConfig(cfg)
