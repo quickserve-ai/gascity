@@ -187,6 +187,9 @@ provider = "exec:/tmp/custom-beads"
 	if got := rawBeadsProviderForScope(rigDir, cityDir); got != "exec:/tmp/custom-beads" {
 		t.Fatalf("rawBeadsProviderForScope() = %q, want custom exec provider", got)
 	}
+	if got := authoritativeBeadsProviderForScope(rigDir, cityDir); got != "exec:/tmp/custom-beads" {
+		t.Fatalf("authoritativeBeadsProviderForScope() = %q, want custom exec provider", got)
+	}
 }
 
 func TestRawBeadsProviderForScopeKeepsSessionOverrideScoped(t *testing.T) {
@@ -211,6 +214,9 @@ provider = "file"
 
 	if got := rawBeadsProviderForScope(rigDir, cityDir); got != "bd" {
 		t.Fatalf("rawBeadsProviderForScope(rig) = %q, want bd", got)
+	}
+	if got := authoritativeBeadsProviderForScope(rigDir, cityDir); got != "bd" {
+		t.Fatalf("authoritativeBeadsProviderForScope(rig) = %q, want scope-pinned bd override", got)
 	}
 	if got := rawBeadsProviderForScope(cityDir, cityDir); got != "file" {
 		t.Fatalf("rawBeadsProviderForScope(city) = %q, want file outside scoped override", got)
@@ -279,7 +285,7 @@ provider = "file"
 // default for city-root scope without ever consulting the on-disk store
 // marker -- a bead whose prefix resolves to the city root (e.g. the HQ
 // prefix) was silently pointed at the wrong backend and could never be found.
-func TestRawBeadsProviderForScopeDetectsBdMetadataAtCityRoot(t *testing.T) {
+func TestAuthoritativeBeadsProviderForScopeDetectsBdMetadataAtCityRootDespiteAmbientFile(t *testing.T) {
 	cityDir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(cityDir, ".beads"), 0o755); err != nil {
 		t.Fatal(err)
@@ -295,9 +301,13 @@ provider = "file"
 	if err := os.WriteFile(filepath.Join(cityDir, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"gc"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("GC_BEADS", "file")
 
-	if got := rawBeadsProviderForScope(cityDir, cityDir); got != "bd" {
-		t.Fatalf("rawBeadsProviderForScope(cityRoot) = %q, want bd metadata to outrank the city's configured file default", got)
+	if got := authoritativeBeadsProviderForScope(cityDir, cityDir); got != "bd" {
+		t.Fatalf("authoritativeBeadsProviderForScope(cityRoot) = %q, want bd metadata to outrank unscoped ambient GC_BEADS=file", got)
+	}
+	if got := rawBeadsProviderForScope(cityDir, cityDir); got != "file" {
+		t.Fatalf("rawBeadsProviderForScope(cityRoot) = %q, want caller-scope GC_BEADS=file semantics preserved", got)
 	}
 }
 

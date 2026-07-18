@@ -4844,6 +4844,7 @@ provider = "file"
 	if err := os.WriteFile(filepath.Join(cityPath, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"gc"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	t.Setenv("GC_BEADS", "file")
 
 	cfg := &config.City{
 		Workspace: config.Workspace{Name: "bright-lights", Prefix: "hq"},
@@ -4856,8 +4857,8 @@ provider = "file"
 	if storeDir != cityPath {
 		t.Fatalf("resolveSlingStoreRoot() = %q, want city root %q", storeDir, cityPath)
 	}
-	if got := rawBeadsProviderForScope(storeDir, cityPath); got != "bd" {
-		t.Fatalf("rawBeadsProviderForScope(HQ store root) = %q, want bd (on-disk store identity, not the configured file default)", got)
+	if got := authoritativeBeadsProviderForScope(storeDir, cityPath); got != "bd" {
+		t.Fatalf("authoritativeBeadsProviderForScope(HQ store root) = %q, want bd (on-disk store identity, not ambient GC_BEADS=file)", got)
 	}
 
 	// Regression guard: a normal rig store with no Dolt marker of its own
@@ -4868,8 +4869,8 @@ provider = "file"
 	if rigStoreDir != wantRigDir {
 		t.Fatalf("resolveSlingStoreRoot(rig bead) = %q, want %q", rigStoreDir, wantRigDir)
 	}
-	if got := rawBeadsProviderForScope(rigStoreDir, cityPath); got != "file" {
-		t.Fatalf("rawBeadsProviderForScope(rig store root) = %q, want file (no on-disk marker, city default preserved)", got)
+	if got := authoritativeBeadsProviderForScope(rigStoreDir, cityPath); got != "file" {
+		t.Fatalf("authoritativeBeadsProviderForScope(rig store root) = %q, want file (no on-disk marker, city default preserved)", got)
 	}
 }
 
