@@ -4819,6 +4819,60 @@ func TestResolveSlingStoreRootUsesCityRootForHQPrefix(t *testing.T) {
 	}
 }
 
+// TestResolveSlingStoreRootHQPrefixUsesBdProviderFromCityRootMetadata
+// reproduces dr-h6ze end to end at the sling layer: an HQ-prefixed bead
+// (e.g. "dr-h6ze") correctly resolves its store root to the city root, but
+// the city's own root is a Dolt-backed HQ store even though [beads]
+// provider declares "file" as the default for rigs. Source validation,
+// gc.routed_to mutation, and convoy/nudge all open the store via this same
+// (storeDir, cityPath) pair, so the provider resolved here is what every
+// downstream sling step actually talks to -- it must be "bd", not the
+// configured file default, or the bead is silently unroutable.
+func TestResolveSlingStoreRootHQPrefixUsesBdProviderFromCityRootMetadata(t *testing.T) {
+	cityPath := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityPath, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(`[workspace]
+name = "bright-lights"
+
+[beads]
+provider = "file"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"gc"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "bright-lights", Prefix: "hq"},
+		Rigs: []config.Rig{
+			{Name: "alpha", Path: filepath.Join(cityPath, "rigs", "alpha"), Prefix: "al"},
+		},
+	}
+
+	storeDir := resolveSlingStoreRoot(cfg, cityPath, "hq-123", config.Agent{Dir: "alpha"})
+	if storeDir != cityPath {
+		t.Fatalf("resolveSlingStoreRoot() = %q, want city root %q", storeDir, cityPath)
+	}
+	if got := rawBeadsProviderForScope(storeDir, cityPath); got != "bd" {
+		t.Fatalf("rawBeadsProviderForScope(HQ store root) = %q, want bd (on-disk store identity, not the configured file default)", got)
+	}
+
+	// Regression guard: a normal rig store with no Dolt marker of its own
+	// still resolves through its declared file/bd contract unaffected by
+	// the city-root fix above.
+	rigStoreDir := resolveSlingStoreRoot(cfg, cityPath, "al-1", config.Agent{Dir: "alpha"})
+	wantRigDir := filepath.Join(cityPath, "rigs", "alpha")
+	if rigStoreDir != wantRigDir {
+		t.Fatalf("resolveSlingStoreRoot(rig bead) = %q, want %q", rigStoreDir, wantRigDir)
+	}
+	if got := rawBeadsProviderForScope(rigStoreDir, cityPath); got != "file" {
+		t.Fatalf("rawBeadsProviderForScope(rig store root) = %q, want file (no on-disk marker, city default preserved)", got)
+	}
+}
+
 func TestSlingFormulaRepoDirUsesCanonicalRigRoot(t *testing.T) {
 	cityPath := filepath.Join(t.TempDir(), "city")
 	deps := slingDeps{

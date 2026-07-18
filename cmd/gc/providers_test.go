@@ -272,6 +272,55 @@ provider = "file"
 	}
 }
 
+// TestRawBeadsProviderForScopeDetectsBdMetadataAtCityRoot reproduces dr-h6ze:
+// a city's own root can host a Dolt-backed HQ store even though [beads]
+// provider declares "file" as the default for rigs. Regression for the
+// samePath(scopeRoot, cityPath) shortcut that returned the configured/ambient
+// default for city-root scope without ever consulting the on-disk store
+// marker -- a bead whose prefix resolves to the city root (e.g. the HQ
+// prefix) was silently pointed at the wrong backend and could never be found.
+func TestRawBeadsProviderForScopeDetectsBdMetadataAtCityRoot(t *testing.T) {
+	cityDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(`[workspace]
+name = "hq-demo"
+
+[beads]
+provider = "file"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityDir, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"gc"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := rawBeadsProviderForScope(cityDir, cityDir); got != "bd" {
+		t.Fatalf("rawBeadsProviderForScope(cityRoot) = %q, want bd metadata to outrank the city's configured file default", got)
+	}
+}
+
+// TestRawBeadsProviderForScopeCityRootWithoutMarkersKeepsConfiguredDefault is
+// the regression guard alongside the fix above: a city root that carries no
+// on-disk store marker at all (the common case -- no separate HQ Dolt store)
+// must keep resolving to the configured/ambient default exactly as before.
+func TestRawBeadsProviderForScopeCityRootWithoutMarkersKeepsConfiguredDefault(t *testing.T) {
+	cityDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(`[workspace]
+name = "plain-demo"
+
+[beads]
+provider = "file"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := rawBeadsProviderForScope(cityDir, cityDir); got != "file" {
+		t.Fatalf("rawBeadsProviderForScope(cityRoot) = %q, want configured file default preserved when no store marker exists", got)
+	}
+}
+
 func TestConfiguredACPSessionNames_UsesProvidedSnapshot(t *testing.T) {
 	snapshot := newSessionBeadSnapshot([]beads.Bead{{
 		Type:   sessionBeadType,
