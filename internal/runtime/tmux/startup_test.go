@@ -394,8 +394,8 @@ func TestDoStartSession_FullSequence(t *testing.T) {
 	if create.workDir != "/proj" {
 		t.Errorf("createSession workDir = %q, want %q", create.workDir, "/proj")
 	}
-	if create.command != "claude" {
-		t.Errorf("createSession command = %q, want %q", create.command, "claude")
+	if create.command != "env -u CI -u NO_COLOR claude" {
+		t.Errorf("createSession command = %q, want %q", create.command, "env -u CI -u NO_COLOR claude")
 	}
 	if create.env["GC_AGENT"] != "mayor" {
 		t.Errorf("createSession env = %v, want GC_AGENT=mayor", create.env)
@@ -2084,7 +2084,7 @@ func TestEnsureFreshSession_LongPromptSuffixUsesFileExpansion(t *testing.T) {
 
 	c := ops.calls[0]
 	// Should use sh -c with $(cat ...) expansion rather than inline.
-	if !strings.HasPrefix(c.command, "sh -c '") {
+	if !strings.HasPrefix(trimInteractiveColorEnvPrefix(c.command), "sh -c '") {
 		t.Errorf("long prompt should use sh -c wrapper, got %q", c.command)
 	}
 	if !strings.Contains(c.command, "$(cat ") {
@@ -2113,7 +2113,7 @@ func TestEnsureFreshSession_LongPromptWithFlagUsesFileExpansion(t *testing.T) {
 
 	c := ops.calls[0]
 	// Should use sh -c with $(cat ...) expansion.
-	if !strings.HasPrefix(c.command, "sh -c '") {
+	if !strings.HasPrefix(trimInteractiveColorEnvPrefix(c.command), "sh -c '") {
 		t.Fatalf("long prompt should use sh -c wrapper, got %q", c.command)
 	}
 	// The flag must appear as a separate token before the loaded prompt.
@@ -2122,8 +2122,17 @@ func TestEnsureFreshSession_LongPromptWithFlagUsesFileExpansion(t *testing.T) {
 	}
 }
 
+// trimInteractiveColorEnvPrefix removes the interactive color wrapper
+// (env -u CI -u NO_COLOR, applied for claude/codex providers by
+// wrapInteractiveColorEnv) so shape assertions see the underlying command.
+// No-op for providers that don't get the wrapper.
+func trimInteractiveColorEnvPrefix(command string) string {
+	return strings.TrimPrefix(command, "env -u CI -u NO_COLOR ")
+}
+
 func longPromptScriptFromCommand(t *testing.T, command string) string {
 	t.Helper()
+	command = trimInteractiveColorEnvPrefix(command)
 	args := shellquote.Split(command)
 	if len(args) != 3 || args[0] != "sh" || args[1] != "-c" {
 		t.Fatalf("long-prompt command should be sh -c <script>, got args %#v from %q", args, command)
@@ -2365,7 +2374,7 @@ func TestEnsureFreshSession_LongPromptEmptyWorkDirFallsBackToOSTemp(t *testing.T
 	}
 
 	c := ops.calls[0]
-	if !strings.HasPrefix(c.command, "sh -c '") {
+	if !strings.HasPrefix(trimInteractiveColorEnvPrefix(c.command), "sh -c '") {
 		t.Fatalf("long prompt with empty workdir should use sh -c wrapper, got %q", c.command)
 	}
 	if strings.Contains(c.command, longPromptRaw) {
