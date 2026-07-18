@@ -233,6 +233,13 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	// Canonicalize hand-written assignees before forwarding (ga-i44k): known
+	// non-canonical spellings are rewritten to the alias form the find-work
+	// read paths actually match; unrecognized shapes warn but pass through
+	// (cross-town assignees are legitimate). Fail-open — never blocks the
+	// write.
+	bdArgs = canonicalizeBdAssigneeArgs(bdArgs, cityPath, cfg, stderr)
+
 	// Pre-flight exact-ID guard for write-mutating subcommands (gcy-g4o).
 	// bd's fuzzy/substring resolver can silently match a longer ID that
 	// contains the supplied ID as a substring (e.g. "gcy-dv7" → "gcy-wisp-dv78").
