@@ -89,6 +89,13 @@ const (
 	// timeout. Operators use the typed payload to correlate the stuck
 	// session, template, reset timestamp, and elapsed wait.
 	SessionResetStalled = "session.reset_stalled"
+	// SessionConfigDriftWave fires once per reconciler tick when config
+	// drift wants to restart/drain more sessions than the per-tick drift
+	// budget allows — i.e., a config change has drifted a large slice of
+	// the roster at once. Operators use it as the advance notice that a
+	// gradual drift roll is in progress (ga-9n5hj: the 2026-07-18 crash
+	// was such a wave executing all at once, unannounced).
+	SessionConfigDriftWave = "session.config_drift_wave"
 	// SessionWorkQueryFailed fires when the current managed session's
 	// work-discovery query subprocess is killed by an external signal or
 	// aborted by the runner-imposed timeout before producing output.
@@ -252,6 +259,7 @@ var KnownEventTypes = []string{
 	SessionStranded,
 	SessionUnknownState,
 	SessionResetStalled,
+	SessionConfigDriftWave,
 	SessionWorkQueryFailed,
 	SessionColdStartTimeout,
 	BeadCreated, BeadClosed, BeadDeleted, BeadUpdated,

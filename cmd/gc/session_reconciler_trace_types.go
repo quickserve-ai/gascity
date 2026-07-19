@@ -238,7 +238,6 @@ const (
 	// current FingerprintVersion (older or future binary). No drain, no
 	// event.
 	TraceOutcomeRebaselinedVersionMismatch TraceOutcomeCode = "rebaselined_version_mismatch"
-
 	TraceOutcomeRollbackDeferred    TraceOutcomeCode = "rollback_deferred"
 	TraceOutcomeKeptOpen            TraceOutcomeCode = "kept_open"
 	TraceOutcomeDeferred            TraceOutcomeCode = "deferred"
@@ -262,7 +261,6 @@ const (
 	TraceOutcomeHoldDeferred        TraceOutcomeCode = "hold_deferred"
 	TraceOutcomeHeld                TraceOutcomeCode = "held"
 	TraceOutcomeHealed              TraceOutcomeCode = "healed"
-
 	TraceOutcomeResolutionFailed    TraceOutcomeCode = "resolution_failed"
 	TraceOutcomeStartErrorConverged TraceOutcomeCode = "start_error_converged"
 	TraceOutcomeSessionInitializing TraceOutcomeCode = "session_initializing"
@@ -270,15 +268,10 @@ const (
 	TraceOutcomeDeferredUserHold    TraceOutcomeCode = "deferred_user_hold"
 	TraceOutcomeDeferredQuarantine  TraceOutcomeCode = "deferred_quarantine"
 	TraceOutcomeDeferredBusy        TraceOutcomeCode = "deferred_busy"
-
-	// TraceOutcomeSkippedLivenessError marks a destructive reconciler action
-	// (pending-create rollback, failed-create close, drain-ack finalize, or
-	// orphan close) skipped this tick because the runtime liveness probe
-	// returned an observation error. providerAlive=false then means
-	// "observation unavailable", not "confirmed dead", so the level-triggered
-	// loop fails closed and re-observes next tick rather than orphaning a
-	// possibly-live session (#3872-family).
 	TraceOutcomeSkippedLivenessError TraceOutcomeCode = "skipped_liveness_error"
+	TraceOutcomeDeferredLazy        TraceOutcomeCode = "deferred_lazy"
+	TraceOutcomeDeferredStagger     TraceOutcomeCode = "deferred_stagger"
+	TraceOutcomeClearedStaleMarker  TraceOutcomeCode = "cleared_stale_marker"
 )
 
 type TraceCompletionStatus string
@@ -569,6 +562,169 @@ func normalizedTraceTemplate(v string) string {
 	return strings.TrimSpace(filepath.Clean(v))
 }
 
+func normalizeTraceSiteCode(raw string) (TraceSiteCode, string) {
+	raw = strings.TrimSpace(raw)
+	switch raw {
+	case "reconciler.session.unknown_state":
+		return TraceSiteReconcilerUnknownState, ""
+	case "reconciler.session.pending_create":
+		return TraceSiteReconcilerPendingCreate, ""
+	case "reconciler.session.wake":
+		return TraceSiteReconcilerWakeDecision, ""
+	case "reconciler.session.drain":
+		return TraceSiteReconcilerDrainDecision, ""
+	}
+	switch TraceSiteCode(raw) {
+	case TraceSiteUnknown,
+		TraceSiteScaleCheckExec,
+		TraceSiteCycleStart,
+		TraceSiteCycleFinish,
+		TraceSiteConfigReload,
+		TraceSiteControllerTickPhase,
+		TraceSiteDesiredStateBuild,
+		TraceSiteDemandSnapshot,
+		TraceSiteOrderDispatch,
+		TraceSitePoolDemandCompute,
+		TraceSiteSessionSnapshot,
+		TraceSiteSessionSync,
+		TraceSiteSessionReconcileBuildDeps,
+		TraceSiteSessionReconcileHealRetire,
+		TraceSiteSessionReconcileTopoOrder,
+		TraceSiteSessionReconcileCircuitBreaker,
+		TraceSiteSessionReconcileForwardPass,
+		TraceSiteSessionReconcileAwakeSet,
+		TraceSiteSessionReconcileWakeSleep,
+		TraceSiteSessionReconcileStartExecution,
+		TraceSiteSessionReconcileDrainAdvance,
+		TraceSitePoolAgentCap,
+		TraceSitePoolRigCap,
+		TraceSitePoolWorkspaceCap,
+		TraceSitePoolAccept,
+		TraceSitePoolMinFill,
+		TraceSitePoolInFlightReuse,
+		TraceSitePoolWakeKnownIdentity,
+		TraceSiteReconcilerUnknownState,
+		TraceSiteReconcilerOrphaned,
+		TraceSiteReconcilerCloseOrphan,
+		TraceSiteReconcilerPendingCreate,
+		TraceSiteReconcilerConfigDrift,
+		TraceSiteReconcilerIdleDrain,
+		TraceSiteReconcilerIdleTimeout,
+		TraceSiteReconcilerResetStalled,
+		TraceSiteReconcilerProgressStallExempt,
+		TraceSiteReconcilerWakeDecision,
+		TraceSiteReconcilerDrainDecision,
+		TraceSiteDrainStale,
+		TraceSiteDrainComplete,
+		TraceSiteDrainCancel,
+		TraceSiteDrainTimeout,
+		TraceSiteMutationBeadMetadata,
+		TraceSiteMutationRuntimeMeta,
+		TraceSiteLifecycleStartRollback,
+		TraceSiteLifecycleStartFailed,
+		TraceSiteLifecycleStartRun,
+		TraceSiteLifecycleStartPrepare,
+		TraceSiteLifecycleStartExecute,
+		TraceSiteLifecycleStartCommit,
+		TraceSiteLifecycleDrainBegin,
+		TraceSiteLifecycleDrainAdvance,
+		TraceSiteSupervisorFSPressure,
+		TraceSiteTraceControl:
+		return TraceSiteCode(raw), ""
+	default:
+		return TraceSiteUnknown, raw
+	}
+}
+
+func normalizeTraceReasonCode(raw string) (TraceReasonCode, string) {
+	raw = strings.TrimSpace(raw)
+	switch raw {
+	case "config-drift":
+		return TraceReasonConfigDrift, ""
+	case "store-partial":
+		return TraceReasonStorePartial, ""
+	case "no-wake-reason":
+		return TraceReasonNoWakeReason, ""
+	}
+	switch TraceReasonCode(raw) {
+	case TraceReasonUnknown,
+		TraceReasonNoDemand,
+		TraceReasonNoMatchingSession,
+		TraceReasonDependencyBlocked,
+		TraceReasonStorePartial,
+		TraceReasonConfigDrift,
+		TraceReasonIdle,
+		TraceReasonPendingCreateRollback,
+		TraceReasonWakeFailureIncremented,
+		TraceReasonQuarantineEntered,
+		TraceReasonUnknownStateSkipped,
+		TraceReasonTemplateMissing,
+		TraceReasonNoEffectTemplateMatch,
+		TraceReasonAutoArmSuppressed,
+		TraceReasonRetained,
+		TraceReasonExpired,
+		TraceReasonAgentCap,
+		TraceReasonRigCap,
+		TraceReasonWorkspaceCap,
+		TraceReasonCap,
+		TraceReasonMinFill,
+		TraceReasonInFlightReuse,
+		TraceReasonWake,
+		TraceReasonIdleTimeout,
+		TraceReasonStaleGeneration,
+		TraceReasonSuspended,
+		TraceReasonOrphaned,
+		TraceReasonDrainTimeout,
+		TraceReasonStoreQueryPartial,
+		TraceReasonNoWakeReason,
+		TraceReasonFSPressure,
+		TraceReasonResetStalled:
+		return TraceReasonCode(raw), ""
+	default:
+		return TraceReasonUnknown, raw
+	}
+}
+
+func normalizeTraceOutcomeCode(raw string) (TraceOutcomeCode, string) {
+	switch TraceOutcomeCode(strings.TrimSpace(raw)) {
+	case TraceOutcomeUnknown,
+		TraceOutcomeComplete,
+		TraceOutcomePartial,
+		TraceOutcomeApplied,
+		TraceOutcomeNoChange,
+		TraceOutcomeFailed,
+		TraceOutcomeSuccess,
+		TraceOutcomeDeferredByWakeBudget,
+		TraceOutcomeSessionExists,
+		TraceOutcomeSessionExistsConverged,
+		TraceOutcomeBlockedOnDependencies,
+		TraceOutcomeProviderError,
+		TraceOutcomePanicRecovered,
+		TraceOutcomeDeadlineExceeded,
+		TraceOutcomeCanceled,
+		TraceOutcomeSlowStorageDegraded,
+		TraceOutcomeLowSpaceDegraded,
+		TraceOutcomePromotionPartialContext,
+		TraceOutcomeAccepted,
+		TraceOutcomeRejected,
+		TraceOutcomeSkipped,
+		TraceOutcomeDrain,
+		TraceOutcomeClosed,
+		TraceOutcomeRollback,
+		TraceOutcomeDeferredAttached,
+		TraceOutcomeDeferredActive,
+		TraceOutcomeStop,
+		TraceOutcomeStartCandidate,
+		TraceOutcomeRetry,
+		TraceOutcomeCancel,
+		TraceOutcomeDeferredLazy,
+		TraceOutcomeDeferredStagger,
+		TraceOutcomeClearedStaleMarker:
+		return TraceOutcomeCode(strings.TrimSpace(raw)), ""
+	default:
+		return TraceOutcomeUnknown, strings.TrimSpace(raw)
+	}
+}
 func newTraceID(prefix string) string {
 	var buf [8]byte
 	if _, err := rand.Read(buf[:]); err != nil {

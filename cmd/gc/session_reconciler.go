@@ -271,6 +271,122 @@ func recordResetStallIfDue(
 	}
 }
 
+// clearStaleResetMarkerIfHealthy self-heals a continuation-reset marker whose
+// startup ack never arrived. RestartRequestPatch (gc handoff / request-restart,
+// applied by both the reconciler and the worker handle's Reset) commits
+// continuation_reset_pending + reset_committed_at, and the marker is normally
+// cleared by CommitStartedPatch when the controller itself performs the next
+// start. But a runtime can also come back via paths that never commit a start
+// through this bead — pane-level respawn with the SessionStart hook seeding
+// session_key — leaving the fulfilled promise armed indefinitely. Armed, it is
+// a time bomb: the moment the session next dies for ANY reason, the wake path
+// honors the stale marker and starts FRESH, discarding the live conversation
+// (ga-2aq43: a 20:31Z handoff marker hard-reset the healthy attached mayor at
+// 00:04Z, 3.5h later, mid-crash).
+//
+// Evidence bar for clearing: the runtime is alive well past the startup
+// window AND either a user is attached or provider activity is observed
+// after reset_committed_at + startupTimeout — proof this runtime is
+// conducting a conversation that began after the reset commit. The one
+// legitimate marker+alive state (stale runtime pending a fresh cycle) is
+// transient — the wake machinery kills it within a tick — so it never
+// accumulates the required age. Worst-case misfire converts "handoff didn't
+// yield a fresh session" (re-runnable) for "healthy session destroyed"
+// (unrecoverable) — the safe direction.
+func clearStaleResetMarkerIfHealthy(
+	session *beads.Bead,
+	store beads.Store,
+	sp runtime.Provider,
+	template string,
+	name string,
+	alive bool,
+	startupTimeout time.Duration,
+	now time.Time,
+	dt *drainTracker,
+	rec events.Recorder,
+	stderr io.Writer,
+	trace *sessionReconcilerTraceCycle,
+) {
+	if session == nil || store == nil || sp == nil || !alive || startupTimeout <= 0 {
+		return
+	}
+	resetCommittedAt, committedAt, pending := resetPendingCommittedAt(*session)
+	if !pending {
+		return
+	}
+	staleAfter := 2 * startupTimeout
+	if staleAfter < 2*time.Minute {
+		staleAfter = 2 * time.Minute
+	}
+	elapsed := now.Sub(committedAt)
+	if elapsed <= staleAfter {
+		return
+	}
+	healthyAfter := committedAt.Add(startupTimeout)
+	evidence := ""
+	if sp.IsAttached(name) {
+		evidence = "attached"
+	} else if sessionActivityReportable(sp, name) {
+		if lastActivity, err := sp.GetLastActivity(name); err == nil && !lastActivity.IsZero() && lastActivity.After(healthyAfter) {
+			evidence = "activity_after_reset"
+		}
+	}
+	if evidence == "" {
+		return
+	}
+	batch := map[string]string{
+		"continuation_reset_pending":   "",
+		sessionpkg.ResetCommittedAtKey: "",
+	}
+	if err := store.SetMetadataBatch(session.ID, batch); err != nil {
+		if stderr != nil {
+			fmt.Fprintf(stderr, "session reconciler: clearing stale reset marker for %s: %v\n", name, err) //nolint:errcheck
+		}
+		return
+	}
+	if session.Metadata == nil {
+		session.Metadata = make(map[string]string, len(batch))
+	}
+	for k, v := range batch {
+		session.Metadata[k] = v
+	}
+	if dt != nil {
+		dt.clearResetStall(session.ID)
+	}
+	elapsedSeconds := int(elapsed / time.Second)
+	msg := fmt.Sprintf(
+		"session reconciler: cleared stale reset marker for %s: runtime healthy (%s), reset_committed_at=%s elapsed_s=%d",
+		name, evidence, resetCommittedAt, elapsedSeconds,
+	)
+	if stderr != nil {
+		fmt.Fprintln(stderr, msg) //nolint:errcheck
+	}
+	if rec != nil {
+		rec.Record(events.Event{
+			Type:    events.SessionUpdated,
+			Actor:   "gc",
+			Subject: name,
+			Message: msg,
+		})
+	}
+	if trace != nil {
+		trace.RecordDecision(
+			TraceSiteReconcilerResetStalled,
+			TraceReasonResetStalled,
+			TraceOutcomeClearedStaleMarker,
+			template,
+			name,
+			map[string]any{
+				"bead_id":            session.ID,
+				"evidence":           evidence,
+				"elapsed_s":          elapsedSeconds,
+				"reset_committed_at": resetCommittedAt,
+				"startup_timeout_s":  int(startupTimeout / time.Second),
+			},
+		)
+	}
+}
+
 func drainAckAsyncStopKey(sessionID, name string) string {
 	if id := strings.TrimSpace(sessionID); id != "" {
 		return "id:" + id
@@ -1546,12 +1662,21 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 	// remaining stale beads roll back on subsequent ticks.
 	const maxRollbacksPerTick = 5
 	rollbacksThisTick := 0
-	// attemptRollbackPendingCreate returns the metadata batch the rollback mirrored
-	// onto the raw bead (nil when the per-tick budget is exhausted, i.e. nothing was
-	// rolled back), so each forward-pass caller can fold it onto the typed snapshot
-	// (Step 6d write-returns-Info). The batch carries NO Closed change: the close is
-	// store-only, so a raw re-projection of *session still sees it open — the fold
-	// must match that.
+	configDriftRestartsThisTick := 0
+	configDriftWaveAnnounced := false
+	allowConfigDriftRestart := func(templateName, name string) bool {
+		if configDriftRestartsThisTick < maxConfigDriftRestartsPerTick {
+			configDriftRestartsThisTick++
+			return true
+		}
+		if !configDriftWaveAnnounced {
+			configDriftWaveAnnounced = true
+			msg := fmt.Sprintf("config-drift wave: more than %d sessions need drift restarts this tick; rolling %d per tick (first deferred: %s)", maxConfigDriftRestartsPerTick, maxConfigDriftRestartsPerTick, name)
+			fmt.Fprintf(stderr, "session reconciler: %s\n", msg) //nolint:errcheck
+			rec.Record(events.Event{Type: events.SessionConfigDriftWave, Actor: "gc", Subject: templateName, Message: msg})
+		}
+		return false
+	}
 	attemptRollbackPendingCreate := func(info sessionpkg.Info, templateName, name, action, detail string, clearClaim bool) map[string]string {
 		if rollbacksThisTick >= maxRollbacksPerTick {
 			fmt.Fprintf(stderr, "session reconciler: deferring rollback of %s (%s): rollback budget exhausted this tick\n", name, detail) //nolint:errcheck
@@ -2161,12 +2286,13 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		// and activity are probed by the narrower branches that use them.
 		running, alive := observeRuntimeProviderLiveness(sp, name, tp.Hints.ProcessNames)
 		if shadowTick != nil {
-			// 3a: capture the desired fast path's OWN two-bit probe (present +
-			// alive) by name, enabling zombie (present && !alive) expression.
 			shadowTick.captureRuntime(id, "observeRuntimeProviderLiveness", name, triFromBool(running), triFromBool(alive))
 		}
 		peek := cachedSessionPeek(cityPath, store, sp, cfg, id, tp.Hints.ProcessNames)
 		recordResetStallIfDue(infoByID[id], tp.TemplateName, name, alive, startupTimeout, clk.Now().UTC(), dt, rec, stderr, trace)
+		if raw, err := store.Get(id); err == nil {
+			clearStaleResetMarkerIfHealthy(&raw, store, sp, tp.TemplateName, name, alive, startupTimeout, clk.Now().UTC(), dt, rec, stderr, trace)
+		}
 
 		// Zombie capture: session exists but process dead — grab scrollback for forensics.
 		// markProviderTerminalError persists + folds its write onto the snapshot in one
@@ -2771,9 +2897,27 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							}
 							continue
 						}
+						driftedFields := runtime.CoreFingerprintDriftFieldsFromJSON(session.Metadata["core_hash_breakdown"], agentCfg)
+						// Prompt-only drift (FPExtra: append_fragments and
+						// other rendered-prompt inputs) applies LAZILY: it
+						// only affects the NEXT conversation, so it is never
+						// worth killing a live session over. Skip before the
+						// diagnostics so a lazily-drifted roster doesn't spam
+						// stderr every tick; the new config lands at the next
+						// natural cycle (wake, pool respawn, asleep repair,
+						// or an unrelated restart). ga-9n5hj: the 2026-07-18
+						// crash was an FPExtra-only wave force-restarting the
+						// whole roster after guard expiry.
+						if configDriftLazyApplicable(driftedFields) {
+							if trace != nil {
+								trace.recordDecision("reconciler.session.config_drift", tp.TemplateName, name, "config_drift", string(TraceOutcomeDeferredLazy), configDriftTracePayload(storedHash, currentHash, driftedFields, traceRecordPayload{
+									"active_reason": "lazy_prompt_only",
+								}), nil, "")
+							}
+							continue
+						}
 						fmt.Fprintf(stderr, "config-drift %s: stored=%s current=%s cmd=%q\n", name, truncateHashForLog(storedHash), truncateHashForLog(currentHash), agentCfg.Command) //nolint:errcheck
 						// Diagnostic: log per-field breakdown to identify the drifting field.
-						driftedFields := runtime.CoreFingerprintDriftFieldsFromJSON(infoByID[id].CoreHashBreakdown, agentCfg)
 						runtime.LogCoreFingerprintDrift(stderr, name, infoByID[id].CoreHashBreakdown, agentCfg)
 						// Launch-only drift (B2.3): the box (provision half) is
 						// unchanged but the agent (launch half) moved. When the
@@ -2839,6 +2983,12 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 									trace.RecordDecision(TraceSiteReconcilerConfigDrift, TraceReasonConfigDrift, TraceOutcomeDeferredActive, tp.TemplateName, name, configDriftTracePayload(storedHash, currentHash, driftedFields, traceRecordPayload{
 										"active_reason": activeReason,
 									}))
+								}
+								continue
+							}
+							if !allowConfigDriftRestart(tp.TemplateName, name) {
+								if trace != nil {
+									trace.RecordDecision(TraceSiteReconcilerConfigDrift, TraceReasonConfigDrift, TraceOutcomeDeferredStagger, tp.TemplateName, name, configDriftTracePayload(storedHash, currentHash, driftedFields, nil))
 								}
 								continue
 							}
@@ -2921,6 +3071,12 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 									}))
 								}
 								fmt.Fprintf(stdout, "Skipping config-drift drain for '%s': live assigned work found\n", name) //nolint:errcheck
+								continue
+							}
+							if !allowConfigDriftRestart(tp.TemplateName, name) {
+								if trace != nil {
+									trace.RecordDecision(TraceSiteReconcilerConfigDrift, TraceReasonConfigDrift, TraceOutcomeDeferredStagger, tp.TemplateName, name, configDriftTracePayload(storedHash, currentHash, driftedFields, nil))
+								}
 								continue
 							}
 							if launchOnlyDrift {
@@ -4613,6 +4769,11 @@ func sessionHasOpenAssignedWorkForTier(store beads.Store, assignee, status strin
 // deferrals for one fixed drift episode. Recent output is only a heuristic,
 // unlike an attachment or pending interaction, so it should not hide config
 // drift indefinitely.
+// maxConfigDriftRestartsPerTick bounds config-drift restarts/drains per
+// reconciler tick so a wave rolls gradually instead of simultaneously
+// (ga-9n5hj; see the budget closure in reconcileSessionBeads).
+const maxConfigDriftRestartsPerTick = 2
+
 const (
 	namedSessionActivityThreshold                      = 2 * time.Minute
 	namedSessionRecentActivityConfigDriftDeferralLimit = 30 * time.Second
@@ -4879,6 +5040,34 @@ func sessionConfigDriftKey(info sessionpkg.Info, cfg *config.City, tp TemplatePa
 		return ""
 	}
 	return storedHash + ":" + currentHash
+}
+
+// configDriftLazyFields are core-fingerprint fields whose drift affects only
+// the rendered prompt/context of the NEXT conversation — nothing about the
+// currently running process. Drift confined to these fields never restarts or
+// drains a live session; it applies at the session's next natural cycle.
+// Deliberately narrow: FPExtra is exactly the field the 2026-07-18 city-wide
+// [agent_defaults].append_fragments change drifted (ga-9n5hj). Env is NOT
+// lazy — fingerprinted env keys (BEADS_DIR, GC_RIG, CLAUDE_CONFIG_DIR pins)
+// change where an agent reads work or which account it bills, and running
+// indefinitely on the old values is itself a hazard.
+var configDriftLazyFields = map[string]bool{
+	"FPExtra": true,
+}
+
+// configDriftLazyApplicable reports whether ALL drifted fields are lazily
+// applicable. An empty field list (no stored breakdown — legacy bead) cannot
+// be classified and keeps the eager path.
+func configDriftLazyApplicable(driftedFields []string) bool {
+	if len(driftedFields) == 0 {
+		return false
+	}
+	for _, f := range driftedFields {
+		if !configDriftLazyFields[f] {
+			return false
+		}
+	}
+	return true
 }
 
 func configDriftTracePayload(storedHash, currentHash string, driftedFields []string, extra traceRecordPayload) traceRecordPayload {
