@@ -90,6 +90,7 @@ func TestResolveFormulaScope_CwdInsideRig(t *testing.T) {
 	prev := rigFlag
 	t.Cleanup(func() { rigFlag = prev })
 	rigFlag = ""
+	t.Setenv("GC_RIG", "")
 
 	scope, err := resolveFormulaScope(cfg, cityPath)
 	if err != nil {
@@ -101,6 +102,105 @@ func TestResolveFormulaScope_CwdInsideRig(t *testing.T) {
 	want := []string{"/city/formulas", "/rigs/my-project/formulas"}
 	if !reflect.DeepEqual(scope.searchPaths, want) {
 		t.Errorf("searchPaths = %v, want %v", scope.searchPaths, want)
+	}
+}
+
+// TestResolveFormulaScope_GCRigEnv verifies GC_RIG env resolves the rig when
+// --rig is unset and the cwd is outside the rig path — the agent-worktree
+// case (.gc/worktrees/<rig>/<agent>), where cwd detection fails (ga-96qs).
+// Priority mirrors gc bd: --rig > GC_RIG > cwd > city.
+func TestResolveFormulaScope_GCRigEnv(t *testing.T) {
+	cityPath := t.TempDir()
+	rigPath := filepath.Join(cityPath, "my-project")
+	otherPath := filepath.Join(cityPath, "other-rig")
+	worktree := filepath.Join(cityPath, ".gc", "worktrees", "my-project", "refinery")
+	for _, p := range []string{rigPath, otherPath, worktree} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", p, err)
+		}
+	}
+
+	cfg := &config.City{
+		Rigs: []config.Rig{
+			{
+				Name:        "my-project",
+				Path:        rigPath,
+				FormulaVars: map[string]string{"test_command": "make test-fast"},
+			},
+			{Name: "other-rig", Path: otherPath},
+		},
+		FormulaLayers: config.FormulaLayers{
+			City: []string{"/city/formulas"},
+			Rigs: map[string][]string{
+				"my-project": {"/city/formulas", "/rigs/my-project/formulas"},
+				"other-rig":  {"/city/formulas", "/rigs/other-rig/formulas"},
+			},
+		},
+	}
+
+	t.Chdir(worktree)
+	prev := rigFlag
+	t.Cleanup(func() { rigFlag = prev })
+	rigFlag = ""
+	t.Setenv("GC_RIG", "my-project")
+
+	scope, err := resolveFormulaScope(cfg, cityPath)
+	if err != nil {
+		t.Fatalf("resolveFormulaScope: %v", err)
+	}
+	if scope.storeRoot != rigPath {
+		t.Errorf("storeRoot = %q, want %q", scope.storeRoot, rigPath)
+	}
+	want := []string{"/city/formulas", "/rigs/my-project/formulas"}
+	if !reflect.DeepEqual(scope.searchPaths, want) {
+		t.Errorf("searchPaths = %v, want %v", scope.searchPaths, want)
+	}
+
+	vars := rigFormulaVarsForScope(cfg, cityPath)
+	if got := vars["test_command"]; got != "make test-fast" {
+		t.Errorf("rigFormulaVarsForScope[test_command] = %q, want %q", got, "make test-fast")
+	}
+
+	// An explicit --rig flag still beats GC_RIG.
+	rigFlag = "other-rig"
+	scope, err = resolveFormulaScope(cfg, cityPath)
+	if err != nil {
+		t.Fatalf("resolveFormulaScope (--rig over env): %v", err)
+	}
+	if scope.storeRoot != otherPath {
+		t.Errorf("--rig over env: storeRoot = %q, want %q", scope.storeRoot, otherPath)
+	}
+}
+
+// TestResolveFormulaScope_GCRigEnvUnknownFallsThrough: an unknown or unbound
+// GC_RIG is a soft signal — fall through to cwd/city rather than erroring,
+// matching gc bd semantics so cross-city commands still work from rig agents.
+func TestResolveFormulaScope_GCRigEnvUnknownFallsThrough(t *testing.T) {
+	cityPath := t.TempDir()
+	cfg := &config.City{
+		Rigs: []config.Rig{{Name: "unbound", Path: ""}},
+		FormulaLayers: config.FormulaLayers{
+			City: []string{"/city/formulas"},
+		},
+	}
+
+	t.Chdir(cityPath)
+	prev := rigFlag
+	t.Cleanup(func() { rigFlag = prev })
+	rigFlag = ""
+
+	for _, env := range []string{"ghost", "unbound"} {
+		t.Setenv("GC_RIG", env)
+		scope, err := resolveFormulaScope(cfg, cityPath)
+		if err != nil {
+			t.Fatalf("resolveFormulaScope (GC_RIG=%s): %v", env, err)
+		}
+		if scope.storeRoot != cityPath {
+			t.Errorf("GC_RIG=%s: storeRoot = %q, want city %q", env, scope.storeRoot, cityPath)
+		}
+		if vars := rigFormulaVarsForScope(cfg, cityPath); len(vars) != 0 {
+			t.Errorf("GC_RIG=%s: rigFormulaVarsForScope = %v, want empty", env, vars)
+		}
 	}
 }
 
@@ -119,6 +219,7 @@ func TestResolveFormulaScope_CityScopeWhenNoRig(t *testing.T) {
 	prev := rigFlag
 	t.Cleanup(func() { rigFlag = prev })
 	rigFlag = ""
+	t.Setenv("GC_RIG", "")
 
 	scope, err := resolveFormulaScope(cfg, cityPath)
 	if err != nil {
@@ -215,6 +316,7 @@ func TestRigFormulaVarsForScope(t *testing.T) {
 		prev := rigFlag
 		t.Cleanup(func() { rigFlag = prev })
 		rigFlag = ""
+		t.Setenv("GC_RIG", "")
 
 		t.Chdir(cityPath)
 		// Without --rig and outside a rig cwd, formula_vars are not injected.

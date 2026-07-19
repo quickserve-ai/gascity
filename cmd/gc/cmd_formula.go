@@ -1090,8 +1090,8 @@ type formulaScope struct {
 }
 
 // resolveFormulaScope determines the rig (if any) under which a formula
-// invocation should run. Priority: --rig flag > enclosing rig from cwd >
-// city.
+// invocation should run. Priority: --rig flag > GC_RIG env > enclosing rig
+// from cwd > city.
 func resolveFormulaScope(cfg *config.City, cityPath string) (formulaScope, error) {
 	if name := strings.TrimSpace(rigFlag); name != "" {
 		rig, ok := rigByName(cfg, name)
@@ -1101,6 +1101,10 @@ func resolveFormulaScope(cfg *config.City, cityPath string) (formulaScope, error
 		if strings.TrimSpace(rig.Path) == "" {
 			return formulaScope{}, fmt.Errorf("rig %q is declared but has no path binding — run `gc rig add <dir> --name %s` to bind it", rig.Name, rig.Name)
 		}
+		return rigFormulaScope(cfg, cityPath, rig), nil
+	}
+
+	if rig, ok := rigFromEnvScope(cfg); ok {
 		return rigFormulaScope(cfg, cityPath, rig), nil
 	}
 
@@ -1130,8 +1134,8 @@ func rigFormulaScope(cfg *config.City, cityPath string, rig config.Rig) formulaS
 }
 
 // rigFormulaVarsForScope returns rig-scoped formula var defaults for the
-// active scope (honoring --rig and cwd). Returns an empty map when no rig
-// context is active so callers can treat the result as read-only
+// active scope (honoring --rig, GC_RIG, and cwd). Returns an empty map when
+// no rig context is active so callers can treat the result as read-only
 // annotations without nil checks.
 func rigFormulaVarsForScope(cfg *config.City, cityPath string) map[string]string {
 	if cfg == nil {
@@ -1142,6 +1146,9 @@ func rigFormulaVarsForScope(cfg *config.City, cityPath string) map[string]string
 			return cloneStringMap(rig.FormulaVars)
 		}
 		return map[string]string{}
+	}
+	if rig, ok := rigFromEnvScope(cfg); ok {
+		return cloneStringMap(rig.FormulaVars)
 	}
 	if cwd, err := os.Getwd(); err == nil {
 		if rig, ok, rerr := resolveRigForDir(cfg, cityPath, cwd); rerr == nil && ok {

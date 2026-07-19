@@ -14,6 +14,24 @@ func rigForDir(cfg *config.City, cityPath, dir string) (config.Rig, bool) {
 	return rig, ok
 }
 
+// rigFromEnvScope returns the rig named by GC_RIG when it resolves to a
+// declared, path-bound rig. Mirrors resolveBdScopeTarget's env handling
+// (cmd_bd.go): the controller sets GC_RIG reliably on every rig agent,
+// while cwd detection fails for agent worktrees under .gc/worktrees/.
+// An unknown or unbound GC_RIG returns false so callers fall through to
+// cwd/city resolution rather than erroring.
+func rigFromEnvScope(cfg *config.City) (config.Rig, bool) {
+	gcRig := strings.TrimSpace(os.Getenv("GC_RIG"))
+	if gcRig == "" {
+		return config.Rig{}, false
+	}
+	rig, ok := rigByName(cfg, gcRig)
+	if !ok || strings.TrimSpace(rig.Path) == "" {
+		return config.Rig{}, false
+	}
+	return rig, true
+}
+
 func resolveRigForDir(cfg *config.City, cityPath, dir string) (config.Rig, bool, error) {
 	dir = normalizePathForCompare(dir)
 	resolveRigPaths(cityPath, cfg.Rigs)
