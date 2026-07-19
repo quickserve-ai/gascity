@@ -193,6 +193,24 @@ const (
 	// current FingerprintVersion (older or future binary). No drain, no
 	// event.
 	TraceOutcomeRebaselinedVersionMismatch TraceOutcomeCode = "rebaselined_version_mismatch"
+	// TraceOutcomeDeferredLazy marks config drift confined to lazily
+	// applicable fields (prompt-only: FPExtra). The session is never
+	// drained or restarted for it; the new config applies at the next
+	// natural session cycle (wake, pool respawn, unrelated restart).
+	// See ga-9n5hj: forcing restarts for prompt-only drift rolled the
+	// whole roster mid-work on 2026-07-18.
+	TraceOutcomeDeferredLazy TraceOutcomeCode = "deferred_lazy"
+	// TraceOutcomeDeferredStagger marks a config-drift restart/drain held
+	// because this tick's drift-restart budget was already spent. The
+	// session is reconsidered next tick. Bounds a drift wave to a gradual
+	// roll instead of a simultaneous roster-wide restart (ga-9n5hj).
+	TraceOutcomeDeferredStagger TraceOutcomeCode = "deferred_stagger"
+	// TraceOutcomeClearedStaleMarker marks a continuation-reset marker
+	// cleared by the reconciler because the session's runtime is alive and
+	// demonstrably conducting a conversation begun after the reset commit —
+	// the reset happened via a path that never emitted the startup ack
+	// (ga-2aq43: a 3.5h-stale marker hard-reset a healthy attached mayor).
+	TraceOutcomeClearedStaleMarker TraceOutcomeCode = "cleared_stale_marker"
 )
 
 type TraceCompletionStatus string
@@ -693,7 +711,10 @@ func normalizeTraceOutcomeCode(raw string) (TraceOutcomeCode, string) {
 		TraceOutcomeStop,
 		TraceOutcomeStartCandidate,
 		TraceOutcomeRetry,
-		TraceOutcomeCancel:
+		TraceOutcomeCancel,
+		TraceOutcomeDeferredLazy,
+		TraceOutcomeDeferredStagger,
+		TraceOutcomeClearedStaleMarker:
 		return TraceOutcomeCode(strings.TrimSpace(raw)), ""
 	default:
 		return TraceOutcomeUnknown, strings.TrimSpace(raw)

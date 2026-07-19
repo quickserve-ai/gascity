@@ -517,6 +517,7 @@ func init() {
 	events.RegisterPayload(events.SessionDrainAckedWithAssignedWork, SessionDrainAckedWithAssignedWorkPayload{})
 	events.RegisterPayload(events.SessionStranded, SessionStrandedPayload{})
 	events.RegisterPayload(events.SessionResetStalled, events.SessionResetStalledPayload{})
+	events.RegisterPayload(events.SessionConfigDriftWave, events.NoPayload{})
 	events.RegisterPayload(events.SessionWorkQueryFailed, SessionLifecyclePayload{})
 	events.RegisterPayload(events.SessionColdStartTimeout, events.NoPayload{})
 	events.RegisterPayload(events.ConvoyCreated, events.NoPayload{})
