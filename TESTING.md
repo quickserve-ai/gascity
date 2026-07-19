@@ -942,9 +942,19 @@ Run it in isolation with `make dashboard-e2e-go`
 package: the CI `packages` integration shard (`go list ./...` under
 `scripts/test-integration-shard packages`, invoked by
 `make test-integration-shards-parallel`) picks it up automatically alongside the
-REST/formula shards — no dedicated shard registration is needed. The
-structured-transcript view is not covered here; it lands with its serving path
-(PR #3931) and is asserted then.
+REST/formula shards — no dedicated shard registration is needed. Its structured
+transcript coverage verifies REST-to-SSE cursor handoff, exact replay
+suppression, inclusive-tail upserts, and reset parity through the real supervisor
+wire.
+
+The opt-in browser layer runs the embedded production SPA in Chromium against
+that same `test/dashport` listener. Run it with `make dashboard-e2e-play` after
+installing the pinned Playwright browser, or run both layers with `make
+dashboard-e2e`. `TestStructuredTranscriptBrowser` asserts the rendered DOM,
+request URLs, SSE upsert/reset behavior, duplicate suppression, and a clean
+console/network/error-boundary surface. It adds no second HTTP listener and is
+not part of the default integration shard because browser binaries are an
+explicit local/CI provisioning choice.
 
 #### Dashboard Playwright render smoke (`internal/api/dashboardspa/web/frontend/e2e`)
 

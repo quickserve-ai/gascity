@@ -79,11 +79,17 @@ func TestExtractCodexTailUsage(t *testing.T) {
 	if first.OutputTokens != 355 {
 		t.Errorf("first.OutputTokens = %d, want 355 (reasoning is a subset, not added)", first.OutputTokens)
 	}
+	if first.ReasoningTokens != 166 {
+		t.Errorf("first.ReasoningTokens = %d, want 166", first.ReasoningTokens)
+	}
 	if first.CacheReadTokens != 10624 {
 		t.Errorf("first.CacheReadTokens = %d, want 10624", first.CacheReadTokens)
 	}
 	if first.CacheCreationTokens != 0 {
 		t.Errorf("first.CacheCreationTokens = %d, want 0", first.CacheCreationTokens)
+	}
+	if first.ContextWindowTokens != 258400 {
+		t.Errorf("first.ContextWindowTokens = %d, want 258400", first.ContextWindowTokens)
 	}
 
 	second := usages[1]
@@ -102,8 +108,14 @@ func TestExtractCodexTailUsage(t *testing.T) {
 	if second.OutputTokens != 309 {
 		t.Errorf("second.OutputTokens = %d, want 309", second.OutputTokens)
 	}
+	if second.ReasoningTokens != 28 {
+		t.Errorf("second.ReasoningTokens = %d, want 28", second.ReasoningTokens)
+	}
 	if second.CacheReadTokens != 15232 {
 		t.Errorf("second.CacheReadTokens = %d, want 15232", second.CacheReadTokens)
+	}
+	if second.ContextWindowTokens != 258400 {
+		t.Errorf("second.ContextWindowTokens = %d, want 258400", second.ContextWindowTokens)
 	}
 }
 

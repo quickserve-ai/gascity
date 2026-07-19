@@ -235,6 +235,7 @@ func boundedContextPercentage(inputTokens, contextWindow int) int {
 //   - CacheReadTokens = last cached_input_tokens
 //   - OutputTokens = last output_tokens (reasoning_output_tokens is a subset
 //     of output_tokens and must not be added)
+//   - ReasoningTokens = last reasoning_output_tokens
 //   - CacheCreationTokens = 0 (codex reports no cache-write tokens)
 //
 // Model comes from the latest preceding turn_context payload.model — empty
@@ -289,15 +290,21 @@ func ExtractCodexTailUsage(path string) ([]TailUsage, error) {
 		if input < 0 {
 			input = 0
 		}
-		u := TailUsage{
-			EntryUUID:       entry.Timestamp,
-			MessageID:       fmt.Sprintf("total:%d", payload.Info.TotalTokenUsage.TotalTokens),
-			Model:           turnModel,
-			InputTokens:     input,
-			OutputTokens:    last.OutputTokens,
-			CacheReadTokens: last.CachedInputTokens,
+		contextWindowTokens := 0
+		if payload.Info.ModelContextWindow != nil {
+			contextWindowTokens = *payload.Info.ModelContextWindow
 		}
-		if u.InputTokens <= 0 && u.OutputTokens <= 0 && u.CacheReadTokens <= 0 {
+		u := TailUsage{
+			EntryUUID:           entry.Timestamp,
+			MessageID:           fmt.Sprintf("total:%d", payload.Info.TotalTokenUsage.TotalTokens),
+			Model:               turnModel,
+			InputTokens:         input,
+			OutputTokens:        last.OutputTokens,
+			ReasoningTokens:     last.ReasoningOutputTokens,
+			CacheReadTokens:     last.CachedInputTokens,
+			ContextWindowTokens: contextWindowTokens,
+		}
+		if u.InputTokens <= 0 && u.OutputTokens <= 0 && u.ReasoningTokens <= 0 && u.CacheReadTokens <= 0 {
 			continue
 		}
 		if i, seen := byMessageID[u.MessageID]; seen {
