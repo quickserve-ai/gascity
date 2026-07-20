@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/api"
@@ -1664,6 +1665,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 	rollbacksThisTick := 0
 	configDriftRestartsThisTick := 0
 	configDriftWaveAnnounced := false
+	configDriftWaveMsg := ""
 	allowConfigDriftRestart := func(templateName, name string) bool {
 		if configDriftRestartsThisTick < maxConfigDriftRestartsPerTick {
 			configDriftRestartsThisTick++
@@ -3463,6 +3465,17 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		"assigned_work_bead_cnt": len(assignedWorkBeads),
 	})
 
+	// Drift-wave mail (ga-9n5hj residual, ruling 2026-07-20): a wave lasts
+	// many ticks, but the coordinator needs one durable notice per wave, not
+	// one per tick — the event stream above stays the per-tick record.
+	if driftWaveMailNotifier.observeTick(configDriftWaveAnnounced, clk.Now().UTC()) {
+		recipient := ""
+		if cfg != nil {
+			recipient = strings.TrimSpace(cfg.Session.DriftWaveNotify)
+		}
+		sendConfigDriftWaveMail(store, rec, recipient, configDriftWaveMsg, stderr)
+	}
+
 	if ctx != nil && ctx.Err() != nil {
 		return 0
 	}
@@ -4773,6 +4786,82 @@ func sessionHasOpenAssignedWorkForTier(store beads.Store, assignee, status strin
 // reconciler tick so a wave rolls gradually instead of simultaneously
 // (ga-9n5hj; see the budget closure in reconcileSessionBeads).
 const maxConfigDriftRestartsPerTick = 2
+
+// configDriftWaveRenotifyInterval is how long a wave must keep rolling
+// before the notifier mails a reminder. A healthy wave clears in a few
+// ticks; one still active after this interval deserves a second look.
+const configDriftWaveRenotifyInterval = time.Hour
+
+// configDriftWaveNotifier dedupes drift-wave mail across reconciler ticks:
+// one mail when a wave starts, a reminder if the same wave is still rolling
+// after configDriftWaveRenotifyInterval, and re-arm once a tick passes with
+// no wave. State is in-process only — a supervisor restart mid-wave mails
+// once more, which is acceptable for an incident-grade notice.
+type configDriftWaveNotifier struct {
+	mu         sync.Mutex
+	waveActive bool
+	lastMailed time.Time
+}
+
+var driftWaveMailNotifier configDriftWaveNotifier
+
+// observeTick records this tick's wave state and reports whether a mail
+// should be sent now.
+func (n *configDriftWaveNotifier) observeTick(waveAnnounced bool, now time.Time) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if !waveAnnounced {
+		n.waveActive = false
+		return false
+	}
+	if n.waveActive && now.Sub(n.lastMailed) < configDriftWaveRenotifyInterval {
+		return false
+	}
+	n.waveActive = true
+	n.lastMailed = now
+	return true
+}
+
+// reset re-arms the notifier. Test hook.
+func (n *configDriftWaveNotifier) reset() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.waveActive = false
+	n.lastMailed = time.Time{}
+}
+
+// sendConfigDriftWaveMail delivers a drift-wave notice as durable mail so
+// the configured coordinator sees a roster-wide roll even when not watching
+// the event stream (ruling ga-wisp-j23i1gj: default recipient is the mayor,
+// who relays to the operator when the wave is roster-wide). Best-effort:
+// failures log to stderr and never block the tick.
+func sendConfigDriftWaveMail(store beads.Store, rec events.Recorder, recipient, msg string, stderr io.Writer) {
+	if store == nil || recipient == "" || msg == "" {
+		return
+	}
+	b, err := store.Create(beads.Bead{
+		Title: "config-drift wave: staggered roster roll in progress",
+		Description: msg + "\n\nDeferred sessions restart on later ticks (budget " +
+			fmt.Sprintf("%d", maxConfigDriftRestartsPerTick) + "/tick); attached sessions and live work re-check their guards each tick. " +
+			"Per-tick detail: session.config_drift_wave events and the reconciler trace. " +
+			"If this wave is unexpected, check for an unintended city-wide config edit (eager fields roll the roster; see ga-9n5hj).",
+		Type:      "message",
+		Assignee:  recipient,
+		From:      controllerMailIdentity,
+		Ephemeral: true,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "session reconciler: sending config-drift wave mail to %s: %v\n", recipient, err) //nolint:errcheck // best-effort stderr
+		return
+	}
+	rec.Record(events.Event{
+		Type:    events.MailSent,
+		Actor:   controllerMailIdentity,
+		Subject: b.ID,
+		Message: recipient,
+		Payload: mailEventPayload(nil),
+	})
+}
 
 const (
 	namedSessionActivityThreshold                      = 2 * time.Minute

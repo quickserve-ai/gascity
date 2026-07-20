@@ -273,6 +273,7 @@ func newReconcilerTestEnv() *reconcilerTestEnv {
 	sessionCircuitBreakerMu.Lock()
 	sessionCircuitBreakerSingleton = newSessionCircuitBreaker(sessionCircuitBreakerConfig{})
 	sessionCircuitBreakerMu.Unlock()
+	driftWaveMailNotifier.reset()
 	return &reconcilerTestEnv{
 		store:        beads.NewMemStore(),
 		sp:           runtime.NewFake(),

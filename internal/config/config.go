@@ -1599,6 +1599,14 @@ type SessionConfig struct {
 	// this pattern go to K8s; all others stay local (tmux).
 	// Overridden by the GC_HYBRID_REMOTE_MATCH env var if set.
 	RemoteMatch string `toml:"remote_match,omitempty"`
+	// DriftWaveNotify is the mail recipient for config-drift wave notices:
+	// when more sessions need config-drift restarts in one tick than the
+	// per-tick budget allows, the reconciler mails this address once per
+	// wave (plus periodic reminders while the wave keeps rolling) so a
+	// coordinator sees a roster-wide roll in progress. Empty disables the
+	// mail; the session.config_drift_wave event and stderr notice always
+	// fire regardless.
+	DriftWaveNotify string `toml:"drift_wave_notify,omitempty"`
 }
 
 // durationOr parses raw as a Go duration, returning def when raw is empty or
