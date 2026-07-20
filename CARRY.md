@@ -25,7 +25,7 @@ from fetched `upstream/main` and pushed to a **personal** fork, never to
 ## Tweak ledger — the carry stack above upstream v1.3.5
 
 Authoritative enumeration: `git log --no-merges v1.3.5..carry/operational`
-(29 commits at time of writing). Every entry is an intentional divergence;
+(33 commits at time of writing). Every entry is an intentional divergence;
 a rebase that silently drops one is a regression. Grouped by concern,
 oldest first. "Drop when" = the doctrine's absorption evidence, not a
 guess — prove with `git patch-id` / `git range-diff` + behavior check.
@@ -45,6 +45,9 @@ guess — prove with `git patch-id` / `git range-diff` + behavior check.
 | Test hygiene (ga-utvl) | 667a75424 | Reap test-city tmux servers in TestMain; stale-root sweep. | Upstream equivalent. |
 | Dolt/OMP pack carries (qc-lu207) | f4128e404, 354ba4cac, 997b8a563, 9d0353651 | Backup freshness fails closed on push-success stamps; managed gc preferred in OMP PATH; bundled pack pins carrying both. | gascity-packs upstream releases with the fixes; re-pin instead of carrying. |
 | Assignee identity (ga-i44k) | 6d6c33382, 68dcb8150 | Claim verb writes the alias identity (not session name); `gc bd` canonicalizes hand-written assignees + warns on unknown shapes. Non-canonical assignees are invisible to find-work and silently strand P1s. | Upstream lands unified identity resolution (the ga-xweq class). |
+| Formula scope (ga-96qs) | cafc02918 | Formula scope resolution honors the GC_RIG env — without it, rig-scoped formula steps resolved against the city and dispatched to the wrong refinery. | Upstream equivalent. |
+| Reconciler crash policy (ga-9n5hj, ga-2aq43) | 845d3280f | Lazy FPExtra drift (prompt-only config edits never restart a live session); eager drift restarts budgeted 2/tick with a `session.config_drift_wave` event; stale continuation-reset markers self-heal on demonstrably healthy runtimes. Regression suite: `cmd/gc/session_reconciler_crash_policy_test.go`. The 2026-07-18 crash rolled ~17 sessions at once and cycled the tmux server. | Upstream absorbs drift laziness + stagger (verify the crash-policy suite passes unmodified). |
+| Drift-wave mail (ga-9n5hj residual) | eec80cd99 | Wave notices mailed once per wave to `[session] drift_wave_notify` (city.toml sets `gastown.mayor` per the 2026-07-20 Mayor ruling); 1h renotify, re-armed on quiet ticks. | Upstream equivalent notify path. |
 
 ## Deploy recipe
 
