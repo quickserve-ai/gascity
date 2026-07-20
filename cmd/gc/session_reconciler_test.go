@@ -306,6 +306,7 @@ func waitAsyncStopsForTest(t *testing.T, stops *asyncStartTracker) {
 
 func newReconcilerTestEnv(t testing.TB) *reconcilerTestEnv {
 	setSessionCircuitBreakerForTest(t, newSessionCircuitBreaker(sessionCircuitBreakerConfig{}))
+	driftWaveMailNotifier.reset()
 	env := &reconcilerTestEnv{
 		store:        beads.NewMemStore(),
 		sp:           runtime.NewFake(),
