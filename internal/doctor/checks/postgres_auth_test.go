@@ -1,4 +1,4 @@
-package doctor
+package checks
 
 import (
 	"bytes"
@@ -8,7 +8,9 @@ import (
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/doctor"
 	"github.com/gastownhall/gascity/internal/pgauth"
+	"github.com/gastownhall/gascity/internal/warmup"
 )
 
 // scrubAmbientPostgresEnv ensures resolver tier 3/5 (process env) cannot
@@ -52,9 +54,9 @@ func TestPostgresAuthCheck_StatusOK_ScopeFile(t *testing.T) {
 
 	cfg := &config.City{Rigs: []config.Rig{{Name: "pwu", Path: "rigs/pwu"}}}
 	check := NewPostgresAuthCheck(cityPath, cfg)
-	r := check.Run(&CheckContext{CityPath: cityPath})
+	r := check.Run(&doctor.CheckContext{CityPath: cityPath})
 
-	if r.Status != StatusOK {
+	if r.Status != doctor.StatusOK {
 		t.Fatalf("status = %v; want StatusOK; message=%q", r.Status, r.Message)
 	}
 	if want := "rigs/pwu (db.example.test:5432): password from scope file"; r.Message != want {
@@ -77,9 +79,9 @@ func TestPostgresAuthCheck_StatusWarning_ParentShellEnv(t *testing.T) {
 
 	cfg := &config.City{Rigs: []config.Rig{{Name: "pwu", Path: "rigs/pwu"}}}
 	check := NewPostgresAuthCheck(cityPath, cfg)
-	r := check.Run(&CheckContext{CityPath: cityPath})
+	r := check.Run(&doctor.CheckContext{CityPath: cityPath})
 
-	if r.Status != StatusWarning {
+	if r.Status != doctor.StatusWarning {
 		t.Fatalf("status = %v; want StatusWarning; message=%q", r.Status, r.Message)
 	}
 	if want := "rigs/pwu (db.example.test:5432): password from parent shell env"; r.Message != want {
@@ -101,9 +103,9 @@ func TestPostgresAuthCheck_StatusError_NoCredentials(t *testing.T) {
 
 	cfg := &config.City{Rigs: []config.Rig{{Name: "pwu", Path: "rigs/pwu"}}}
 	check := NewPostgresAuthCheck(cityPath, cfg)
-	r := check.Run(&CheckContext{CityPath: cityPath})
+	r := check.Run(&doctor.CheckContext{CityPath: cityPath})
 
-	if r.Status != StatusError {
+	if r.Status != doctor.StatusError {
 		t.Fatalf("status = %v; want StatusError; message=%q", r.Status, r.Message)
 	}
 	if want := "rigs/pwu (db.example.test:5432): no password resolvable"; r.Message != want {
@@ -132,9 +134,9 @@ func TestPostgresAuthCheck_StatusError_PermissiveMode(t *testing.T) {
 
 	cfg := &config.City{Rigs: []config.Rig{{Name: "pwu", Path: "rigs/pwu"}}}
 	check := NewPostgresAuthCheck(cityPath, cfg)
-	r := check.Run(&CheckContext{CityPath: cityPath})
+	r := check.Run(&doctor.CheckContext{CityPath: cityPath})
 
-	if r.Status != StatusError {
+	if r.Status != doctor.StatusError {
 		t.Fatalf("status = %v; want StatusError; message=%q", r.Status, r.Message)
 	}
 	if !strings.Contains(r.Message, "credentials file mode") {
@@ -156,9 +158,9 @@ func TestPostgresAuthCheck_NoScopes_ReturnsOK(t *testing.T) {
 	cityPath := t.TempDir()
 
 	check := NewPostgresAuthCheck(cityPath, &config.City{})
-	r := check.Run(&CheckContext{CityPath: cityPath})
+	r := check.Run(&doctor.CheckContext{CityPath: cityPath})
 
-	if r.Status != StatusOK {
+	if r.Status != doctor.StatusOK {
 		t.Fatalf("status = %v; want StatusOK", r.Status)
 	}
 	if r.Message != "no postgres-backed scopes" {
@@ -186,9 +188,9 @@ func TestPostgresAuthCheck_MultipleScopes(t *testing.T) {
 		{Name: "beta", Path: "rigs/beta"},
 	}}
 	check := NewPostgresAuthCheck(cityPath, cfg)
-	r := check.Run(&CheckContext{CityPath: cityPath})
+	r := check.Run(&doctor.CheckContext{CityPath: cityPath})
 
-	if r.Status != StatusError {
+	if r.Status != doctor.StatusError {
 		t.Fatalf("status = %v; want StatusError (rig B failed)", r.Status)
 	}
 	if !strings.HasPrefix(r.Message, "2 postgres-backed scope(s); first issue: ") {
@@ -211,7 +213,7 @@ func TestPostgresAuthCheck_CanFix_ReturnsFalse(t *testing.T) {
 func TestPostgresAuthCheck_RenderExtras_NoScopesPrintsHint(t *testing.T) {
 	check := NewPostgresAuthCheck(t.TempDir(), &config.City{})
 	var buf bytes.Buffer
-	check.RenderExtras(&CheckContext{ExplainPostgresAuth: true}, &buf)
+	check.RenderExtras(&doctor.CheckContext{ExplainPostgresAuth: true}, &buf)
 	got := buf.String()
 	if !strings.Contains(got, "no postgres-backed scopes (this flag has no effect)") {
 		t.Fatalf("RenderExtras (no scopes) output = %q; want §4.6 hint", got)
@@ -228,10 +230,10 @@ func TestPostgresAuthCheck_RenderExtras_FlagOff(t *testing.T) {
 
 	cfg := &config.City{Rigs: []config.Rig{{Name: "pwu", Path: "rigs/pwu"}}}
 	check := NewPostgresAuthCheck(cityPath, cfg)
-	check.Run(&CheckContext{CityPath: cityPath})
+	check.Run(&doctor.CheckContext{CityPath: cityPath})
 
 	var buf bytes.Buffer
-	check.RenderExtras(&CheckContext{ExplainPostgresAuth: false}, &buf)
+	check.RenderExtras(&doctor.CheckContext{ExplainPostgresAuth: false}, &buf)
 	if buf.Len() != 0 {
 		t.Fatalf("RenderExtras (flag off) wrote %d bytes; want zero", buf.Len())
 	}
@@ -249,10 +251,10 @@ func TestPostgresAuthCheck_RenderExtras_ExplainTable_OK_TierFour(t *testing.T) {
 
 	cfg := &config.City{Rigs: []config.Rig{{Name: "pwu", Path: "rigs/pwu"}}}
 	check := NewPostgresAuthCheck(cityPath, cfg)
-	check.Run(&CheckContext{CityPath: cityPath})
+	check.Run(&doctor.CheckContext{CityPath: cityPath})
 
 	var buf bytes.Buffer
-	check.RenderExtras(&CheckContext{ExplainPostgresAuth: true}, &buf)
+	check.RenderExtras(&doctor.CheckContext{ExplainPostgresAuth: true}, &buf)
 	out := buf.String()
 
 	// Header.
@@ -303,10 +305,10 @@ func TestPostgresAuthCheck_RenderExtras_NoCredsPrintsAllNoTokens(t *testing.T) {
 
 	cfg := &config.City{Rigs: []config.Rig{{Name: "pwu", Path: "rigs/pwu"}}}
 	check := NewPostgresAuthCheck(cityPath, cfg)
-	check.Run(&CheckContext{CityPath: cityPath})
+	check.Run(&doctor.CheckContext{CityPath: cityPath})
 
 	var buf bytes.Buffer
-	check.RenderExtras(&CheckContext{ExplainPostgresAuth: true}, &buf)
+	check.RenderExtras(&doctor.CheckContext{ExplainPostgresAuth: true}, &buf)
 	out := buf.String()
 	if strings.Contains(out, "[YES]") {
 		t.Errorf("no-creds case rendered [YES]:\n%s", out)
@@ -347,5 +349,64 @@ func TestHumanSourceLabel(t *testing.T) {
 				t.Fatalf("humanSourceLabel(%v) = %q; want %q", tc.in, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestPostgresAuthCheck_WarmupEligible_True locks the warm-up opt-in:
+// postgres-auth failures must be caught before agents EAUTH on first
+// bd-write, so the check participates in the `gc start` warm-up scan.
+func TestPostgresAuthCheck_WarmupEligible_True(t *testing.T) {
+	check := NewPostgresAuthCheck(t.TempDir(), &config.City{})
+	if !check.WarmupEligible() {
+		t.Fatal("WarmupEligible() = false; want true")
+	}
+}
+
+// TestPostgresAuthCheck_SoleFailureMail_MultiScope regresses the bug
+// where SoleFailureMail rendered report.Failures (one aggregate entry
+// per check) instead of the per-scope c.results, collapsing multi-scope
+// failures into a single line with the wrong count.
+func TestPostgresAuthCheck_SoleFailureMail_MultiScope(t *testing.T) {
+	scrubAmbientPostgresEnv(t)
+	cityPath := t.TempDir()
+
+	// Two PG scopes, both failing (no creds).
+	rigAPath := filepath.Join(cityPath, "rigs", "alpha")
+	writePGMetadata(t, rigAPath)
+	rigBPath := filepath.Join(cityPath, "rigs", "beta")
+	writePGMetadata(t, rigBPath)
+
+	cfg := &config.City{Rigs: []config.Rig{
+		{Name: "alpha", Path: "rigs/alpha"},
+		{Name: "beta", Path: "rigs/beta"},
+	}}
+	check := NewPostgresAuthCheck(cityPath, cfg)
+	// Run populates c.results, which SoleFailureMail renders from.
+	check.Run(&doctor.CheckContext{CityPath: cityPath})
+
+	subject, body := check.SoleFailureMail(warmup.WarmupReport{})
+
+	if subject != WarmupMailSubject {
+		t.Fatalf("subject = %q; want %q", subject, WarmupMailSubject)
+	}
+	if !strings.Contains(body, "2 PG-backed scope(s) failed") {
+		t.Fatalf("body missing multi-scope count:\n%s", body)
+	}
+	// A distinct per-scope line for each failing scope's display.
+	for _, want := range []string{
+		"rigs/alpha (db.example.test:5432)",
+		"rigs/beta (db.example.test:5432)",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("body missing per-scope line %q:\n%s", want, body)
+		}
+	}
+	// Must not fall back to the aggregate Run() message phrasing.
+	if strings.Contains(body, "postgres-backed scope(s); first issue:") {
+		t.Fatalf("body used aggregate Run() phrasing:\n%s", body)
+	}
+	// No password value leaks (none were written, but guard the invariant).
+	if strings.Contains(body, "devpw") || strings.Contains(body, "shellpw") {
+		t.Fatalf("body leaked a password value:\n%s", body)
 	}
 }
