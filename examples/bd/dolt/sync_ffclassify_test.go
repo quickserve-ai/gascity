@@ -52,6 +52,45 @@ func runFFSync(t *testing.T, binDir string, args ...string) string {
 	return string(out)
 }
 
+// runFFSyncStatus is runFFSync plus the process exit code, for tests that
+// assert on the exit-code contract rather than just push/no-push behavior.
+func runFFSyncStatus(t *testing.T, binDir string, args ...string) (string, int) {
+	t.Helper()
+	root := repoRoot(t)
+	script := filepath.Join(root, syncScript)
+	port, cleanup := startReachableTCPListener(t)
+	defer cleanup()
+
+	cityPath := t.TempDir()
+	dataDir := filepath.Join(cityPath, "data")
+	if err := os.MkdirAll(filepath.Join(dataDir, "app", ".dolt"), 0o755); err != nil {
+		t.Fatalf("mkdir db: %v", err)
+	}
+	writeSyncFakeBeadsBD(t, cityPath)
+
+	cmd := exec.Command("sh", append([]string{script}, args...)...)
+	cmd.Env = append(syncFilteredEnv(),
+		"PATH="+binDir+":"+os.Getenv("PATH"),
+		"GC_CITY_PATH="+cityPath,
+		"GC_PACK_DIR="+root,
+		"GC_DOLT_DATA_DIR="+dataDir,
+		fmt.Sprintf("GC_DOLT_PORT=%d", port),
+		"GC_DOLT_USER=root",
+		"GC_DOLT_PASSWORD=",
+	)
+	out, err := cmd.CombinedOutput()
+	exitCode := 0
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		} else {
+			t.Fatalf("gc dolt sync failed to run: %v\n%s", err, out)
+		}
+	}
+	return string(out), exitCode
+}
+
 // fakeDoltHeader is the shared preamble: log argv and answer the remote-lookup
 // + active_branch metadata queries the sync path issues before classification.
 func fakeDoltHeader(logPath, branch string) string {
@@ -170,6 +209,57 @@ func TestSyncUpToDateSkipsPush(t *testing.T) {
 	}
 	if !strings.Contains(out, "up-to-date") {
 		t.Fatalf("expected an 'up-to-date' status.\nout:\n%s", out)
+	}
+}
+
+// TestSyncDivergedRealRunExitsNonZero locks in the real-run (non-dry-run)
+// contract that ga-co5cx's --dry-run gap (fixed alongside this test) was
+// compared against: a diverged DB must fail the overall `gc dolt sync` run,
+// not just print a warning, so a cron/patrol caller can detect
+// reconcile-needed state from the exit code alone.
+func TestSyncDivergedRealRunExitsNonZero(t *testing.T) {
+	binDir := t.TempDir()
+	logPath := writeSyncFakeDoltClassify(t, binDir, 2, 3)
+	out, exitCode := runFFSyncStatus(t, binDir, "--db", "app")
+	if pushed(readLog(t, logPath)) {
+		t.Fatalf("diverged DB must NOT be pushed.\nout:\n%s", out)
+	}
+	if exitCode == 0 {
+		t.Fatalf("a diverged DB must exit non-zero.\nout:\n%s", out)
+	}
+}
+
+// TestSyncDryRunDivergedReturnsNonZero is the ga-co5cx fix: --dry-run must
+// mirror the real run's exit code (0 up-to-date/behind, 1 diverged/classify-
+// failed) so a health-style probe can preview reconcile-needed state without
+// side effects. Before the fix, --dry-run unconditionally returned 0.
+func TestSyncDryRunDivergedReturnsNonZero(t *testing.T) {
+	binDir := t.TempDir()
+	logPath := writeSyncFakeDoltClassify(t, binDir, 2, 3)
+	out, exitCode := runFFSyncStatus(t, binDir, "--db", "app", "--dry-run")
+	if pushed(readLog(t, logPath)) {
+		t.Fatalf("--dry-run must NEVER push.\nout:\n%s", out)
+	}
+	if exitCode == 0 {
+		t.Fatalf("--dry-run preview of a diverged DB must exit non-zero.\nout:\n%s", out)
+	}
+	if !strings.Contains(out, "diverged") {
+		t.Fatalf("expected a 'diverged' status.\nout:\n%s", out)
+	}
+}
+
+// TestSyncDryRunUpToDateReturnsZero guards the benign side of the same
+// contract: --dry-run must not turn a harmless behind/up-to-date skip into a
+// false-positive failure.
+func TestSyncDryRunUpToDateReturnsZero(t *testing.T) {
+	binDir := t.TempDir()
+	logPath := writeSyncFakeDoltClassify(t, binDir, 0, 0)
+	out, exitCode := runFFSyncStatus(t, binDir, "--db", "app", "--dry-run")
+	if pushed(readLog(t, logPath)) {
+		t.Fatalf("--dry-run must NEVER push.\nout:\n%s", out)
+	}
+	if exitCode != 0 {
+		t.Fatalf("--dry-run preview of an up-to-date DB should exit zero.\nout:\n%s", out)
 	}
 }
 
