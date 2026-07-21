@@ -440,6 +440,11 @@ sync_database_sql() {
   if [ "$dry_run" = true ]; then
     if [ "$ff_decision" = "skip" ]; then
       echo "  $name: would skip $local_branch -> $remote_name:$remote_branch ($remote_url) [$ff_status]"
+      # Mirror the real-run exit code (ff_rc) here: up-to-date/behind are benign
+      # (0), diverged/classify-failed need human reconcile (1). Without this a
+      # --dry-run health-style probe of a diverged/unreconcilable DB reports
+      # success, masking exactly the state dry-run exists to surface.
+      return "$ff_rc"
     elif [ "$force" = true ]; then
       echo "  $name: would force-push $local_branch -> $remote_name:$remote_branch ($remote_url)"
     else
