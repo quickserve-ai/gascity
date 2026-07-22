@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -307,6 +308,56 @@ func TestDoHookClaimClaimsRoutedUnassignedWork(t *testing.T) {
 	}
 	if result.Action != "work" || result.Reason != "claimed" || result.BeadID != "hw-2" || result.Assignee != "worker-1" {
 		t.Fatalf("unexpected claim result: %+v", result)
+	}
+}
+
+func TestRouteHookClaimOpsUsesResolvedStoreForEveryMutation(t *testing.T) {
+	defaultDir := "/city"
+	rigDir := "/rig/qcore"
+	defaultEnv := []string{"BEADS_DIR=/city/.beads"}
+	rigEnv := []string{"BEADS_DIR=/rig/qcore/.beads"}
+	var calls []string
+	base := hookClaimOps{
+		Claim: func(_ context.Context, dir string, env []string, beadID, _ string) (beads.Bead, bool, error) {
+			calls = append(calls, "claim:"+dir+":"+env[0]+":"+beadID)
+			return beads.Bead{ID: beadID}, true, nil
+		},
+		Adopt: func(_ context.Context, dir string, env []string, beadID, _ string) error {
+			calls = append(calls, "adopt:"+dir+":"+env[0]+":"+beadID)
+			return nil
+		},
+		ListContinuation: func(_ context.Context, dir string, env []string, rootID, _ string) ([]beads.Bead, error) {
+			calls = append(calls, "list:"+dir+":"+env[0]+":"+rootID)
+			return nil, nil
+		},
+		AssignContinuation: func(_ context.Context, dir string, env []string, beadID, _ string) error {
+			calls = append(calls, "assign:"+dir+":"+env[0]+":"+beadID)
+			return nil
+		},
+	}
+	resolve := func(beadID string) (string, []string, bool) {
+		if strings.HasPrefix(beadID, "qc-") {
+			return rigDir, rigEnv, true
+		}
+		return "", nil, false
+	}
+	ops := routeHookClaimOps(base, defaultDir, defaultEnv, resolve)
+	ctx := context.Background()
+	_, _, _ = ops.Claim(ctx, defaultDir, defaultEnv, "qc-work", "woodhouse")
+	_ = ops.Adopt(ctx, defaultDir, defaultEnv, "qc-assigned", "woodhouse")
+	_, _ = ops.ListContinuation(ctx, defaultDir, defaultEnv, "qc-root", "group")
+	_ = ops.AssignContinuation(ctx, defaultDir, defaultEnv, "qc-next", "woodhouse")
+	_, _, _ = ops.Claim(ctx, defaultDir, defaultEnv, "ga-city", "woodhouse")
+
+	want := []string{
+		"claim:/rig/qcore:BEADS_DIR=/rig/qcore/.beads:qc-work",
+		"adopt:/rig/qcore:BEADS_DIR=/rig/qcore/.beads:qc-assigned",
+		"list:/rig/qcore:BEADS_DIR=/rig/qcore/.beads:qc-root",
+		"assign:/rig/qcore:BEADS_DIR=/rig/qcore/.beads:qc-next",
+		"claim:/city:BEADS_DIR=/city/.beads:ga-city",
+	}
+	if !slices.Equal(calls, want) {
+		t.Fatalf("mutation calls = %#v, want %#v", calls, want)
 	}
 }
 

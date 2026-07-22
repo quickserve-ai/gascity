@@ -44,6 +44,59 @@ type (
 	hookDrainAckFunc           func(io.Writer) error
 )
 
+type hookClaimStoreResolver func(beadID string) (dir string, env []string, ok bool)
+
+// routeHookClaimOps keeps every mutation in the store that produced the bead.
+// Cross-store work queries can return a rig bead to a city-scoped agent; the
+// default claim ops otherwise write through the agent's city-store dir/env and
+// fail with "bead not found". Continuation reads and assignments must follow
+// the same routing or a successful root claim can still strand its siblings.
+func routeHookClaimOps(base hookClaimOps, defaultDir string, defaultEnv []string, resolve hookClaimStoreResolver) hookClaimOps {
+	storeFor := func(beadID, dir string, env []string) (string, []string) {
+		if resolve != nil {
+			if resolvedDir, resolvedEnv, ok := resolve(beadID); ok {
+				return resolvedDir, resolvedEnv
+			}
+		}
+		if dir == "" {
+			dir = defaultDir
+		}
+		if env == nil {
+			env = defaultEnv
+		}
+		return dir, env
+	}
+	if base.Claim != nil {
+		claim := base.Claim
+		base.Claim = func(ctx context.Context, dir string, env []string, beadID, assignee string) (beads.Bead, bool, error) {
+			dir, env = storeFor(beadID, dir, env)
+			return claim(ctx, dir, env, beadID, assignee)
+		}
+	}
+	if base.Adopt != nil {
+		adopt := base.Adopt
+		base.Adopt = func(ctx context.Context, dir string, env []string, beadID, assignee string) error {
+			dir, env = storeFor(beadID, dir, env)
+			return adopt(ctx, dir, env, beadID, assignee)
+		}
+	}
+	if base.ListContinuation != nil {
+		list := base.ListContinuation
+		base.ListContinuation = func(ctx context.Context, dir string, env []string, rootID, group string) ([]beads.Bead, error) {
+			dir, env = storeFor(rootID, dir, env)
+			return list(ctx, dir, env, rootID, group)
+		}
+	}
+	if base.AssignContinuation != nil {
+		assign := base.AssignContinuation
+		base.AssignContinuation = func(ctx context.Context, dir string, env []string, beadID, assignee string) error {
+			dir, env = storeFor(beadID, dir, env)
+			return assign(ctx, dir, env, beadID, assignee)
+		}
+	}
+	return base
+}
+
 type hookClaimJSONResult struct {
 	SchemaVersion        string   `json:"schema_version"`
 	OK                   bool     `json:"ok"`

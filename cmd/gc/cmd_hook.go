@@ -357,7 +357,26 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 			DrainAck:     opts.DrainAck,
 			JSON:         opts.JSON,
 		}
-		return doHookClaim(workQuery, workDir, claimOpts, hookClaimOps{Runner: runner}, stdout, stderr)
+		claimOps := hookClaimOps{
+			Runner:             runner,
+			Claim:              hookClaimWithBdStore,
+			Adopt:              hookAdoptWithBdStore,
+			ListContinuation:   hookListContinuationWithBdStore,
+			AssignContinuation: hookAssignContinuationWithBdStore,
+		}
+		resolveMutationStore := func(beadID string) (string, []string, bool) {
+			rigDir, ok := crossStoreClaimDir(cfg, &a, beadID)
+			if !ok {
+				return "", nil, false
+			}
+			rigEnv, envErr := bdRuntimeEnvForRigWithError(cityPath, cfg, rigDir)
+			if envErr != nil {
+				return "", nil, false
+			}
+			return rigDir, mergeRuntimeEnv(os.Environ(), rigEnv), true
+		}
+		claimOps = routeHookClaimOps(claimOps, workDir, queryEnv, resolveMutationStore)
+		return doHookClaim(workQuery, workDir, claimOpts, claimOps, stdout, stderr)
 	}
 	return doHook(workQuery, workDir, false, runner, stdout, stderr)
 }
