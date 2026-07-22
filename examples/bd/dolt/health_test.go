@@ -2028,6 +2028,16 @@ func TestHealthBackupFreshnessFailsClosedWhenServerUnreachable(t *testing.T) {
 		[]byte(`{"database":"dolt","backend":"dolt","dolt_database":"at"}`), 0o644); err != nil {
 		t.Fatalf("write metadata: %v", err)
 	}
+	backupDir := filepath.Join(cityPath, ".dolt-backup")
+	for _, db := range []string{"hq", "qcore", "as"} {
+		dir := filepath.Join(backupDir, db)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir backup %s: %v", db, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "manifest"), []byte("backup"), 0o644); err != nil {
+			t.Fatalf("write backup manifest %s: %v", db, err)
+		}
+	}
 
 	root := repoRoot(t)
 	binDir := t.TempDir()
@@ -2043,6 +2053,7 @@ func TestHealthBackupFreshnessFailsClosedWhenServerUnreachable(t *testing.T) {
 		"GC_DOLT_USER=root",
 		"GC_DOLT_PASSWORD=",
 		"GC_HEALTH_SKIP_ZOMBIE_SCAN=1",
+		"GC_BACKUP_ARTIFACT_DIR="+backupDir,
 	)
 	out, err := cmd.Output()
 	if err != nil {
@@ -2056,6 +2067,14 @@ func TestHealthBackupFreshnessFailsClosedWhenServerUnreachable(t *testing.T) {
 			AgeSec    int    `json:"dolt_age_sec"`
 			Stale     bool   `json:"dolt_stale"`
 			State     string `json:"dolt_backup_state"`
+			Local     struct {
+				State string `json:"state"`
+				Stale bool   `json:"stale"`
+			} `json:"local"`
+			OriginMirrors struct {
+				State string `json:"state"`
+				Stale bool   `json:"stale"`
+			} `json:"origin_mirrors"`
 		} `json:"backups"`
 	}
 	if err := json.Unmarshal(out, &doc); err != nil {
@@ -2066,6 +2085,12 @@ func TestHealthBackupFreshnessFailsClosedWhenServerUnreachable(t *testing.T) {
 	}
 	if doc.Backups.State != "unknown" {
 		t.Fatalf("dolt_backup_state = %q, want \"unknown\" with unreachable server:\n%s", doc.Backups.State, out)
+	}
+	if doc.Backups.Local.State != "ok" || doc.Backups.Local.Stale {
+		t.Fatalf("local backup state = %+v, want fresh local recovery artifacts despite unreachable mirror probe:\n%s", doc.Backups.Local, out)
+	}
+	if doc.Backups.OriginMirrors.State != "unknown" || !doc.Backups.OriginMirrors.Stale {
+		t.Fatalf("origin mirror state = %+v, want unknown/stale with unreachable server:\n%s", doc.Backups.OriginMirrors, out)
 	}
 }
 

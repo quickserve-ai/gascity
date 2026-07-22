@@ -340,6 +340,81 @@ if [ "$bf_newest_epoch" -gt 0 ]; then
   fi
 fi
 
+# Local recovery artifacts are a separate backup plane from GitHub-origin
+# mirrors. mol-dog-backup writes one <db>/manifest under .dolt-backup; mirror
+# push stamps above say nothing about those local artifacts (ga-co5cx).
+local_backup_dir="${GC_BACKUP_ARTIFACT_DIR:-$GC_CITY_PATH/.dolt-backup}"
+local_backup_threshold="${GC_DOLT_LOCAL_BACKUP_STALE_SECS:-28800}"
+case "$local_backup_threshold" in ''|*[!0-9]*) local_backup_threshold=28800 ;; esac
+local_backup_state="unknown"
+local_backup_stale=true
+local_backup_age_sec=0
+local_backup_freshness=""
+local_backup_detail=""
+local_backup_any=false
+local_backup_bad=false
+local_backup_oldest_epoch=0
+
+file_mtime_epoch() {
+  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || true
+}
+
+local_db_names=""
+if [ -n "$db_info" ]; then
+  local_db_names=$(printf '%s\n' "$db_info" | cut -d'|' -f1)
+elif [ -d "$local_backup_dir" ]; then
+  local_db_names=$(for local_manifest in "$local_backup_dir"/*/manifest; do
+    [ -f "$local_manifest" ] || continue
+    basename "$(dirname "$local_manifest")"
+  done)
+fi
+
+for local_db in $local_db_names; do
+  local_manifest="$local_backup_dir/$local_db/manifest"
+  local_state="unknown"
+  local_age=""
+  if [ -f "$local_manifest" ]; then
+    local_backup_any=true
+    local_epoch=$(file_mtime_epoch "$local_backup_dir/$local_db")
+    case "$local_epoch" in
+      ''|*[!0-9]*) local_state="unknown" ;;
+      *)
+        local_age=$((bf_now - local_epoch))
+        [ "$local_age" -lt 0 ] && local_age=0
+        if [ "$local_age" -le "$local_backup_threshold" ]; then
+          local_state="ok"
+        else
+          local_state="stale"
+        fi
+        if [ "$local_backup_oldest_epoch" -eq 0 ] || [ "$local_epoch" -lt "$local_backup_oldest_epoch" ]; then
+          local_backup_oldest_epoch="$local_epoch"
+        fi
+        ;;
+    esac
+  fi
+  [ "$local_state" = "ok" ] || local_backup_bad=true
+  local_backup_detail="$local_backup_detail$local_db|$local_state|$local_age
+"
+done
+
+if [ "$local_backup_any" = true ] && [ "$local_backup_bad" = false ]; then
+  local_backup_state="ok"
+  local_backup_stale=false
+elif [ "$local_backup_any" = true ]; then
+  local_backup_state="stale"
+fi
+if [ "$local_backup_oldest_epoch" -gt 0 ]; then
+  local_backup_age_sec=$((bf_now - local_backup_oldest_epoch))
+  [ "$local_backup_age_sec" -lt 0 ] && local_backup_age_sec=0
+  if [ "$local_backup_age_sec" -ge 3600 ]; then
+    local_backup_freshness="$((local_backup_age_sec / 3600))h$((local_backup_age_sec % 3600 / 60))m"
+  elif [ "$local_backup_age_sec" -ge 60 ]; then
+    local_backup_freshness="$((local_backup_age_sec / 60))m$((local_backup_age_sec % 60))s"
+  else
+    local_backup_freshness="${local_backup_age_sec}s"
+  fi
+fi
+
 # Find orphan databases.
 #
 # Authoritative source: `gc dolt-cleanup` (HYPHEN — the Go-side command,
@@ -570,6 +645,43 @@ JSONEOF
 
   ],
   "backups": {
+    "local": {
+      "freshness": "$local_backup_freshness",
+      "age_sec": $local_backup_age_sec,
+      "stale": $local_backup_stale,
+      "state": "$local_backup_state",
+      "databases": [
+JSONEOF
+  first=true
+  echo "$local_backup_detail" | while IFS='|' read -r bname bstate bage; do
+    [ -z "$bname" ] && continue
+    if [ "$first" = true ]; then first=false; else echo ","; fi
+    case "$bage" in ''|*[!0-9]*) bage=null ;; esac
+    printf '        {"name": "%s", "state": "%s", "age_sec": %s}' "$bname" "$bstate" "$bage"
+  done
+  cat <<JSONEOF
+
+      ]
+    },
+    "origin_mirrors": {
+      "freshness": "$backup_freshness",
+      "age_sec": $backup_age_sec,
+      "stale": $backup_stale,
+      "state": "$backup_state",
+      "databases": [
+JSONEOF
+  first=true
+  echo "$backup_detail" | while IFS='|' read -r bname bstate bage brefspec; do
+    [ -z "$bname" ] && continue
+    if [ "$first" = true ]; then first=false; else echo ","; fi
+    case "$bage" in ''|*[!0-9]*) bage=null ;; esac
+    printf '        {"name": "%s", "state": "%s", "age_sec": %s, "refspec": "%s"}' \
+      "$bname" "$bstate" "$bage" "$brefspec"
+  done
+  cat <<JSONEOF
+
+      ]
+    },
     "dolt_freshness": "$backup_freshness",
     "dolt_age_sec": $backup_age_sec,
     "dolt_stale": $backup_stale,
@@ -639,18 +751,33 @@ if [ -n "$db_info" ]; then
 fi
 
 echo ""
+case "$local_backup_state" in
+  ok) echo "Local recovery backups: ok (oldest update ${local_backup_freshness} ago)" ;;
+  *) echo "Local recovery backups: ${local_backup_state} [STALE]" ;;
+esac
+if [ -n "$local_backup_detail" ]; then
+  echo "$local_backup_detail" | while IFS='|' read -r bname bstate bage; do
+    [ -z "$bname" ] && continue
+    if [ -n "$bage" ]; then
+      echo "  $bname: $bstate (updated ${bage}s ago)"
+    else
+      echo "  $bname: $bstate (backup missing or unreadable)"
+    fi
+  done
+fi
+
 case "$backup_state" in
   no-remotes)
-    echo "Backups: no databases have a configured remote (nothing to back up)" ;;
+    echo "Origin mirrors: no databases have a configured remote" ;;
   ok)
-    echo "Backups: ok (last push ${backup_freshness} ago)" ;;
+    echo "Origin mirrors: ok (last push ${backup_freshness} ago)" ;;
   *)
     stale=""
     [ "$backup_stale" = true ] && [ "$backup_state" != "stale" ] && stale=" [STALE]"
     if [ -n "$backup_freshness" ]; then
-      echo "Backups: ${backup_state}${stale} (last recorded push ${backup_freshness} ago)"
+      echo "Origin mirrors: ${backup_state}${stale} (last recorded push ${backup_freshness} ago)"
     else
-      echo "Backups: ${backup_state}${stale} (no successful push recorded)"
+      echo "Origin mirrors: ${backup_state}${stale} (no successful push recorded)"
     fi ;;
 esac
 if [ -n "$backup_detail" ]; then
