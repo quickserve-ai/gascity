@@ -748,6 +748,71 @@ func TestLookupConfiguredNamedSession_SessionNameConflictReportedOverBareAliasMa
 	}
 }
 
+func TestLookupConfiguredNamedSession_ReportsEphemeralBackingTemplateConflict(t *testing.T) {
+	maxOne := 1
+	store := beads.NewMemStore()
+	spec := NamedSessionSpec{
+		Agent:       &config.Agent{Name: "woodhouse", MaxActiveSessions: &maxOne},
+		Identity:    "woodhouse",
+		SessionName: "demo--woodhouse",
+	}
+	shadow, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Status: "open",
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"session_name":   "woodhouse-ga-dl5gy",
+			"template":       "woodhouse",
+			"pool_managed":   "true",
+			"agent_name":     "woodhouse",
+			"session_origin": "ephemeral",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(shadow): %v", err)
+	}
+
+	lookup, err := LookupConfiguredNamedSession(store, spec)
+	if err != nil {
+		t.Fatalf("LookupConfiguredNamedSession: %v", err)
+	}
+	if !lookup.HasConflict || lookup.Conflict.ID != shadow.ID {
+		t.Fatalf("lookup = %+v, want ephemeral backing-template conflict %s", lookup, shadow.ID)
+	}
+}
+
+func TestLookupConfiguredNamedSession_AllowsManualBackingTemplateSession(t *testing.T) {
+	maxOne := 1
+	store := beads.NewMemStore()
+	spec := NamedSessionSpec{
+		Agent:       &config.Agent{Name: "woodhouse", MaxActiveSessions: &maxOne},
+		Identity:    "woodhouse",
+		SessionName: "demo--woodhouse",
+	}
+	_, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Status: "open",
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"session_name":   "operator-chosen",
+			"template":       "woodhouse",
+			"agent_name":     "operator-chosen",
+			"session_origin": "manual",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(manual): %v", err)
+	}
+
+	lookup, err := LookupConfiguredNamedSession(store, spec)
+	if err != nil {
+		t.Fatalf("LookupConfiguredNamedSession: %v", err)
+	}
+	if lookup.HasConflict || lookup.HasCanonical {
+		t.Fatalf("lookup = %+v, want manual session preserved without conflict", lookup)
+	}
+}
+
 func TestLookupConfiguredNamedSession_EmptySpecNoListCall(t *testing.T) {
 	store := &listCountingStore{MemStore: beads.NewMemStore()}
 
@@ -1338,5 +1403,44 @@ func TestClosedNamedSessionBeadIndexMissesBeadWithNeitherTypeNorLabel(t *testing
 	}
 	if _, ok := idx.Find(identity); ok {
 		t.Fatalf("index lookup ok = true, want false (identity=%q) — a bead with neither Type nor Label should stay outside both batched legs", identity)
+	}
+}
+
+func TestFindNamedSessionSpecsByBackingTemplate(t *testing.T) {
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{
+			{Name: "helper"},
+			{Name: "solo"},
+		},
+		NamedSessions: []config.NamedSession{
+			{Name: "lana", Template: "helper", Mode: "always"},
+			{Name: "pam", Template: "helper", Mode: "on_demand"},
+			{Name: "ray", Template: "solo"},
+		},
+	}
+
+	specs := FindNamedSessionSpecsByBackingTemplate(cfg, "test-city", "helper")
+	if len(specs) != 2 {
+		t.Fatalf("specs for helper = %d, want 2", len(specs))
+	}
+	got := map[string]bool{}
+	for _, s := range specs {
+		got[s.Identity] = true
+	}
+	if !got["lana"] || !got["pam"] {
+		t.Fatalf("specs identities = %v, want lana and pam", got)
+	}
+
+	specs = FindNamedSessionSpecsByBackingTemplate(cfg, "test-city", "solo")
+	if len(specs) != 1 || specs[0].Identity != "ray" {
+		t.Fatalf("specs for solo = %#v, want single ray", specs)
+	}
+
+	if specs := FindNamedSessionSpecsByBackingTemplate(cfg, "test-city", "unbacked"); len(specs) != 0 {
+		t.Fatalf("specs for unbacked template = %d, want 0", len(specs))
+	}
+	if specs := FindNamedSessionSpecsByBackingTemplate(nil, "test-city", "helper"); specs != nil {
+		t.Fatalf("specs for nil cfg = %#v, want nil", specs)
 	}
 }
