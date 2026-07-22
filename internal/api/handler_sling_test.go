@@ -95,8 +95,11 @@ func TestSlingWithBead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get(%q): %v", b.ID, err)
 	}
-	if got := updated.Metadata["gc.routed_to"]; got != "myrig/worker" {
-		t.Fatalf("gc.routed_to = %q, want myrig/worker", got)
+	if got := updated.Assignee; got != "myrig/worker" {
+		t.Fatalf("assignee = %q, want canonical named identity myrig/worker", got)
+	}
+	if got := strings.TrimSpace(updated.Metadata["gc.routed_to"]); got != "" {
+		t.Fatalf("gc.routed_to = %q, want empty for direct named-session assignment", got)
 	}
 }
 

@@ -430,13 +430,38 @@ func cmdSlingWithJSON(args []string, isFormula, doNudge, force bool, title strin
 	// rig-scoped implicit agents (e.g., "hello-world/claude").
 	resolveRigPaths(cityPath, cfg.Rigs)
 
-	a, ok := resolveAgentIdentity(cfg, target, currentRigContext(cfg))
-	if !ok {
-		if jsonOutput {
-			return writeJSONError(stdout, stderr, "target_resolve_failed", agentNotFoundMsg("gc sling", target, cfg), 1)
+	routeTarget := ""
+	var a config.Agent
+	if spec, named, resolveErr := resolveNamedSessionSpecForConfigTarget(cfg, cityName, target, currentRigContext(cfg)); resolveErr != nil {
+		return fail("target_resolve_failed", fmt.Sprintf("gc sling: %v", resolveErr))
+	} else if named {
+		a = *spec.Agent
+		routeTarget = spec.Identity
+	} else {
+		var ok bool
+		a, ok = resolveAgentIdentity(cfg, target, currentRigContext(cfg))
+		if !ok {
+			if jsonOutput {
+				return writeJSONError(stdout, stderr, "target_resolve_failed", agentNotFoundMsg("gc sling", target, cfg), 1)
+			}
+			fmt.Fprintln(stderr, agentNotFoundMsg("gc sling", target, cfg)) //nolint:errcheck // best-effort stderr
+			return 1
 		}
-		fmt.Fprintln(stderr, agentNotFoundMsg("gc sling", target, cfg)) //nolint:errcheck // best-effort stderr
-		return 1
+		routeTarget = a.QualifiedName()
+		if !a.SupportsMultipleSessions() && !isCustomSlingQuery(a) {
+			specs := findNamedSessionSpecsByBackingTemplate(cfg, cityName, a.QualifiedName())
+			switch len(specs) {
+			case 0:
+			case 1:
+				routeTarget = specs[0].Identity
+			default:
+				identities := make([]string, len(specs))
+				for i, spec := range specs {
+					identities[i] = spec.Identity
+				}
+				return fail("target_resolve_failed", fmt.Sprintf("gc sling: template %q backs multiple configured named sessions (%s) — target one named identity", a.QualifiedName(), strings.Join(identities, ", ")))
+			}
+		}
 	}
 
 	sp, err := newSessionProvider()
@@ -461,23 +486,24 @@ func cmdSlingWithJSON(args []string, isFormula, doNudge, force bool, title strin
 	}
 
 	opts := slingOpts{
-		Target:        a,
-		BeadOrFormula: beadOrFormula,
-		IsFormula:     isFormula,
-		OnFormula:     onFormula,
-		NoFormula:     noFormula,
-		Title:         title,
-		Vars:          vars,
-		Merge:         merge,
-		NoConvoy:      noConvoy,
-		Owned:         owned,
-		Reassign:      reassign,
-		Nudge:         doNudge,
-		Force:         force,
-		DryRun:        dryRun,
-		InlineText:    inlineText,
-		ScopeKind:     scopeKind,
-		ScopeRef:      scopeRef,
+		Target:         a,
+		TargetIdentity: routeTarget,
+		BeadOrFormula:  beadOrFormula,
+		IsFormula:      isFormula,
+		OnFormula:      onFormula,
+		NoFormula:      noFormula,
+		Title:          title,
+		Vars:           vars,
+		Merge:          merge,
+		NoConvoy:       noConvoy,
+		Owned:          owned,
+		Reassign:       reassign,
+		Nudge:          doNudge,
+		Force:          force,
+		DryRun:         dryRun,
+		InlineText:     inlineText,
+		ScopeKind:      scopeKind,
+		ScopeRef:       scopeRef,
 	}
 	runner := SlingRunner(shellSlingRunner)
 	if len(storeEnv) > 0 {
@@ -758,6 +784,25 @@ func (r cliBeadRouter) Route(_ context.Context, req sling.RouteRequest) error {
 			return err
 		}
 	}
+	if r.deps.Cfg != nil {
+		cityName := r.deps.CityName
+		if cityName == "" {
+			cityName = config.EffectiveCityName(r.deps.Cfg, filepath.Base(r.deps.CityPath))
+		}
+		if spec, ok := findNamedSessionSpec(r.deps.Cfg, cityName, req.Target); ok {
+			if r.deps.Store == nil {
+				return fmt.Errorf("direct named-session routing requires a store")
+			}
+			identity := spec.Identity
+			if err := r.deps.Store.Update(req.BeadID, beads.UpdateOpts{
+				Assignee: &identity,
+				Metadata: map[string]string{beadmeta.RoutedToMetadataKey: ""},
+			}); err != nil {
+				return fmt.Errorf("assigning %s to configured named session %s: %w", req.BeadID, identity, err)
+			}
+			return nil
+		}
+	}
 	if r.deps.Store == nil {
 		return fmt.Errorf("built-in sling routing requires a store")
 	}
@@ -975,7 +1020,7 @@ func doSlingBatchWithJSON(opts slingOpts, deps slingDeps, querier BeadChildQueri
 	// ExpandConvoy is for plain bead routing of convoy children.
 	var result sling.SlingResult
 	var err error
-	if opts.IsFormula || opts.OnFormula != "" || (!opts.NoFormula && opts.Target.EffectiveDefaultSlingFormula() != "") {
+	if opts.IsFormula || opts.OnFormula != "" || opts.TargetIdentity != opts.Target.QualifiedName() || (!opts.NoFormula && opts.Target.EffectiveDefaultSlingFormula() != "") {
 		// Formula paths need per-child wisp attachment -- use legacy API.
 		result, err = sling.DoSlingBatch(opts, deps, querier)
 	} else {

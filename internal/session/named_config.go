@@ -317,6 +317,13 @@ func BeadConflictsWithNamedSession(b beads.Bead, spec NamedSessionSpec) bool {
 	if strings.TrimSpace(b.Metadata["alias"]) == spec.Identity {
 		return true
 	}
+	backing := NamedSessionBackingTemplate(spec)
+	if backing != "" && spec.Agent != nil && !spec.Agent.SupportsMultipleSessions() &&
+		strings.TrimSpace(b.Metadata["session_origin"]) == "ephemeral" &&
+		strings.TrimSpace(b.Metadata["pool_managed"]) == "true" &&
+		NormalizeNamedSessionTarget(b.Metadata["template"]) == backing {
+		return true
+	}
 	return false
 }
 
@@ -404,6 +411,13 @@ func lookupConfiguredNamedSession(store beads.Store, spec NamedSessionSpec, incl
 		matches, err := listConfiguredNamedSessionBeadsByMetadata(store, "alias", spec.Identity)
 		if err != nil {
 			return ConfiguredNamedSessionLookup{}, fmt.Errorf("listing alias conflicts: %w", err)
+		}
+		conflictCandidates = appendUniqueNamedSessionCandidates(conflictCandidates, make(map[string]bool, len(conflictCandidates)+len(matches)), matches)
+	}
+	if backing := NamedSessionBackingTemplate(spec); backing != "" && spec.Agent != nil && !spec.Agent.SupportsMultipleSessions() {
+		matches, err := listConfiguredNamedSessionBeadsByMetadata(store, "template", backing)
+		if err != nil {
+			return ConfiguredNamedSessionLookup{}, fmt.Errorf("listing backing-template conflicts: %w", err)
 		}
 		conflictCandidates = appendUniqueNamedSessionCandidates(conflictCandidates, make(map[string]bool, len(conflictCandidates)+len(matches)), matches)
 	}

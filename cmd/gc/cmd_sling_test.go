@@ -1682,6 +1682,84 @@ dir = "frontend"
 	}
 }
 
+func TestCmdSlingRawSingletonTemplateRoutesToCanonicalNamedSession(t *testing.T) {
+	configureIsolatedRuntimeEnv(t)
+	t.Setenv("GC_BEADS", "file")
+
+	cityDir := t.TempDir()
+	rigDir := filepath.Join(cityDir, "qcore")
+	if err := os.MkdirAll(rigDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(rig): %v", err)
+	}
+	if err := ensureScopedFileStoreLayout(cityDir); err != nil {
+		t.Fatalf("ensureScopedFileStoreLayout: %v", err)
+	}
+	if err := ensurePersistedScopeLocalFileStore(rigDir); err != nil {
+		t.Fatalf("ensurePersistedScopeLocalFileStore(rig): %v", err)
+	}
+	cityToml := `[workspace]
+name = "demo"
+
+[[rigs]]
+name = "qcore"
+path = "qcore"
+prefix = "QC"
+
+[[agent]]
+name = "cherub-law.lana"
+dir = "qcore"
+max_active_sessions = 1
+
+[[named_session]]
+name = "lana"
+template = "cherub-law.lana"
+dir = "qcore"
+mode = "always"
+`
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(cityToml), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	cfg, _, err := loadSlingCityConfig(cityDir)
+	if err != nil {
+		t.Fatalf("loadSlingCityConfig: %v", err)
+	}
+	backing, ok := resolveAgentIdentity(cfg, "qcore/cherub-law.lana", "")
+	if !ok {
+		t.Fatal("resolveAgentIdentity(raw backing) = false")
+	}
+	if backing.SupportsMultipleSessions() {
+		t.Fatalf("raw backing unexpectedly supports multiple sessions: %+v", backing)
+	}
+	if specs := findNamedSessionSpecsByBackingTemplate(cfg, "demo", backing.QualifiedName()); len(specs) != 1 || specs[0].Identity != "qcore/lana" {
+		t.Fatalf("named specs = %+v, want one qcore/lana", specs)
+	}
+	store, err := openStoreAtForCity(rigDir, cityDir)
+	if err != nil {
+		t.Fatalf("openStoreAtForCity(rig): %v", err)
+	}
+	created, err := store.Create(beads.Bead{ID: "QC-1", Title: "work", Type: "task", Status: "open"})
+	if err != nil {
+		t.Fatalf("Create(QC-1): %v", err)
+	}
+	t.Chdir(cityDir)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdSling([]string{"qcore/cherub-law.lana", created.ID}, false, false, true, "", nil, "", true, false, false, "", true, false, false, "", "", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdSling(raw singleton template) = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	got, err := store.Get(created.ID)
+	if err != nil {
+		t.Fatalf("Get(%s): %v", created.ID, err)
+	}
+	if got.Assignee != "qcore/lana" {
+		t.Fatalf("assignee = %q, want canonical named identity qcore/lana; metadata=%v stdout=%s stderr=%s", got.Assignee, got.Metadata, stdout.String(), stderr.String())
+	}
+	if routed := strings.TrimSpace(got.Metadata["gc.routed_to"]); routed != "" {
+		t.Fatalf("gc.routed_to = %q, want empty for direct named-session assignment", routed)
+	}
+}
+
 func TestCmdSlingDefaultFormulaDoesNotMaterializePoolSession(t *testing.T) {
 	configureIsolatedRuntimeEnv(t)
 	t.Setenv("GC_BEADS", "file")

@@ -5241,8 +5241,8 @@ func TestResolveConfiguredNamedSessionIDWithContext_BoundedConflictListCalls(t *
 	if !errors.Is(err, errConfiguredNamedSessionConflict) {
 		t.Fatalf("error = %v, want errConfiguredNamedSessionConflict", err)
 	}
-	if len(store.listCalls) > 4 {
-		t.Fatalf("List calls = %d, want bounded small constant without duplicate session_name lookup", len(store.listCalls))
+	if len(store.listCalls) > 5 {
+		t.Fatalf("List calls = %d, want bounded small constant including backing-template conflict lookup", len(store.listCalls))
 	}
 	assertSessionResolverMetadataFilteredListCalls(t, store.listCalls)
 }

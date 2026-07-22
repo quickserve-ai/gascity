@@ -85,7 +85,7 @@ func DoSling(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult, 
 func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult, error) {
 	a := opts.Target
 	var result SlingResult
-	result.Target = a.QualifiedName()
+	result.Target = opts.routeTarget()
 
 	if a.Suspended && !opts.Force {
 		result.AgentSuspended = true
@@ -171,7 +171,8 @@ func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult
 // as a bead warning rather than silently flipping into a mutating attach path.
 func resolveIdempotentShortCircuit(opts SlingOpts, a config.Agent, deps SlingDeps, querier BeadQuerier, result *SlingResult) bool {
 	check := CheckBeadStateWithOptions(querier, opts.BeadOrFormula, a, deps, BeadCheckOptions{
-		NoConvoy: opts.NoConvoy,
+		NoConvoy:       opts.NoConvoy,
+		TargetIdentity: opts.routeTarget(),
 	})
 	if check.Idempotent {
 		needsAttach, probeErr := onFormulaNeedsAttachment(opts, querier, deps)
@@ -534,7 +535,7 @@ func finalize(opts SlingOpts, deps SlingDeps, beadID, method string, result Slin
 		}
 		req := RouteRequest{
 			BeadID:  beadID,
-			Target:  a.QualifiedName(),
+			Target:  opts.routeTarget(),
 			WorkDir: rigDir,
 			Env:     slingEnv,
 			Force:   opts.Force,
@@ -1485,7 +1486,8 @@ func DoSlingBatch(opts SlingOpts, deps SlingDeps, querier BeadChildQuerier) (Sli
 
 		if !opts.Force {
 			check := CheckBeadStateWithOptions(querier, child.ID, a, deps, BeadCheckOptions{
-				NoConvoy: opts.NoConvoy,
+				NoConvoy:       opts.NoConvoy,
+				TargetIdentity: opts.routeTarget(),
 			})
 			if check.Idempotent {
 				childResult.Skipped = true
@@ -1549,7 +1551,7 @@ func DoSlingBatch(opts SlingOpts, deps SlingDeps, querier BeadChildQuerier) (Sli
 			}
 			req := RouteRequest{
 				BeadID:  child.ID,
-				Target:  a.QualifiedName(),
+				Target:  opts.routeTarget(),
 				WorkDir: rigDir,
 				Env:     childEnv,
 				Force:   opts.Force,

@@ -518,6 +518,46 @@ func TestResolveSessionIDWithConfig_ReservedNamedTargetConflictsWithLiveAlias(t 
 	}
 }
 
+func TestResolveSessionIDMaterializingNamed_UndefinedNameRejectsLiveEphemeralBackingShadow(t *testing.T) {
+	maxOne := 1
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents:    []config.Agent{{Name: "woodhouse", MaxActiveSessions: &maxOne}},
+		NamedSessions: []config.NamedSession{{
+			Template: "woodhouse",
+			Mode:     "on_demand",
+		}},
+	}
+	shadow, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Status: "open",
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"session_name":   "woodhouse-ga-dl5gy",
+			"template":       "woodhouse",
+			"agent_name":     "woodhouse",
+			"session_origin": "ephemeral",
+			"pool_managed":   "true",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(shadow): %v", err)
+	}
+
+	_, err = resolveSessionIDMaterializingNamed(filepath.Join(t.TempDir(), "city"), cfg, store, "woodhouse")
+	if !errors.Is(err, errNamedSessionConflict) {
+		t.Fatalf("resolveSessionIDMaterializingNamed(woodhouse) = %v, want errNamedSessionConflict", err)
+	}
+	all, err := session.ListAllSessionBeads(store, beads.ListQuery{})
+	if err != nil {
+		t.Fatalf("ListAllSessionBeads: %v", err)
+	}
+	if len(all) != 1 || all[0].ID != shadow.ID {
+		t.Fatalf("sessions = %+v, want only existing ephemeral shadow %s", all, shadow.ID)
+	}
+}
+
 func TestResolveSessionIDMaterializingNamed_QualifiedAliasBasenameDoesNotStealNamedTarget(t *testing.T) {
 	t.Setenv("GC_SESSION", "fake")
 

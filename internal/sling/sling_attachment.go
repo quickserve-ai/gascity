@@ -451,7 +451,10 @@ func CheckBeadStateWithOptions(q BeadQuerier, beadID string, a config.Agent, dep
 		return BeadCheckResult{Warnings: routedStateWarnings(b, beadID)}
 	}
 
-	target := a.QualifiedName()
+	target := strings.TrimSpace(opts.TargetIdentity)
+	if target == "" {
+		target = a.QualifiedName()
+	}
 	if strings.TrimSpace(b.Metadata[beadmeta.RoutedToMetadataKey]) == target {
 		if b.Assignee == "" || b.Assignee == target {
 			return resolveConvoyRecovery(q, b, deps, opts, beadID)
