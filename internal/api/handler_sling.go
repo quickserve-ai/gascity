@@ -19,6 +19,7 @@ import (
 	"github.com/gastownhall/gascity/internal/execenv"
 	gitpkg "github.com/gastownhall/gascity/internal/git"
 	"github.com/gastownhall/gascity/internal/reconcilekey"
+	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/sling"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
 )
@@ -553,6 +554,24 @@ func (r apiBeadRouter) Route(_ context.Context, req sling.RouteRequest) error {
 	store := r.store
 	if req.Store != nil && req.Store == relocatedGraphStore(r.server.state) {
 		store = req.Store
+	}
+	if cfg != nil {
+		if spec, ok := session.FindNamedSessionSpec(cfg, r.server.state.CityName(), req.Target); ok {
+			if store == nil {
+				return fmt.Errorf("direct named-session routing requires a store")
+			}
+			identity := spec.Identity
+			if err := store.Update(req.BeadID, beads.UpdateOpts{
+				Assignee: &identity,
+				Metadata: map[string]string{beadmeta.RoutedToMetadataKey: ""},
+			}); err != nil {
+				if req.Force && errors.Is(err, beads.ErrNotFound) {
+					return nil
+				}
+				return fmt.Errorf("assigning %s to configured named session %s: %w", req.BeadID, identity, err)
+			}
+			return nil
+		}
 	}
 	if store == nil {
 		return fmt.Errorf("built-in sling routing requires a store")
