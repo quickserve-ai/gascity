@@ -85,7 +85,7 @@ func DoSling(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult, 
 func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult, error) {
 	a := opts.Target
 	var result SlingResult
-	result.Target = a.QualifiedName()
+	result.Target = opts.routeTarget()
 
 	if a.Suspended && !opts.Force {
 		result.AgentSuspended = true
@@ -119,7 +119,8 @@ func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult
 	// Pre-flight idempotency check.
 	if shouldCheckBeadState(opts) {
 		check := CheckBeadStateWithOptions(querier, opts.BeadOrFormula, a, deps, BeadCheckOptions{
-			NoConvoy: opts.NoConvoy,
+			NoConvoy:       opts.NoConvoy,
+			TargetIdentity: opts.routeTarget(),
 		})
 		if check.Idempotent {
 			result.Idempotent = true
@@ -129,6 +130,14 @@ func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult
 			return result, nil
 		}
 		result.BeadWarnings = append(result.BeadWarnings, check.Warnings...)
+		if opts.TargetIdentity != "" && opts.TargetIdentity != a.QualifiedName() && !opts.Reassign {
+			if bead, err := querier.Get(opts.BeadOrFormula); err == nil {
+				assignee := strings.TrimSpace(bead.Assignee)
+				if assignee != "" && assignee != opts.routeTarget() {
+					return result, fmt.Errorf("bead %s is assigned to %q; pass --reassign to route it to configured named session %q", bead.ID, assignee, opts.routeTarget())
+				}
+			}
+		}
 	}
 	if shouldValidateBuiltInRouteStoreReachable(opts, deps) {
 		if err := validateBuiltInRouteStoreReachable(deps, opts.BeadOrFormula, a); err != nil {
@@ -511,7 +520,7 @@ func finalize(opts SlingOpts, deps SlingDeps, beadID, method string, result Slin
 		}
 		req := RouteRequest{
 			BeadID:  beadID,
-			Target:  a.QualifiedName(),
+			Target:  opts.routeTarget(),
 			WorkDir: rigDir,
 			Env:     slingEnv,
 			Force:   opts.Force,
@@ -1346,7 +1355,8 @@ func DoSlingBatch(opts SlingOpts, deps SlingDeps, querier BeadChildQuerier) (Sli
 
 		if !opts.Force {
 			check := CheckBeadStateWithOptions(querier, child.ID, a, deps, BeadCheckOptions{
-				NoConvoy: opts.NoConvoy,
+				NoConvoy:       opts.NoConvoy,
+				TargetIdentity: opts.routeTarget(),
 			})
 			if check.Idempotent {
 				childResult.Skipped = true
@@ -1410,7 +1420,7 @@ func DoSlingBatch(opts SlingOpts, deps SlingDeps, querier BeadChildQuerier) (Sli
 			}
 			req := RouteRequest{
 				BeadID:  child.ID,
-				Target:  a.QualifiedName(),
+				Target:  opts.routeTarget(),
 				WorkDir: rigDir,
 				Env:     childEnv,
 				Force:   opts.Force,

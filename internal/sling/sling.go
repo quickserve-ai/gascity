@@ -23,6 +23,7 @@ import (
 	"github.com/gastownhall/gascity/internal/molecule"
 	"github.com/gastownhall/gascity/internal/pathutil"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/shellquote"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
 	workdirutil "github.com/gastownhall/gascity/internal/workdir"
@@ -43,18 +44,23 @@ type BeadChildQuerier interface {
 type SlingOpts struct {
 	Target        config.Agent
 	BeadOrFormula string
-	IsFormula     bool
-	OnFormula     string
-	NoFormula     bool
-	SkipPoke      bool
-	Title         string
-	Vars          []string
-	Merge         string // "", "direct", "pr", "mr", "local"
-	NoConvoy      bool
-	Owned         bool
-	Nudge         bool
-	Force         bool
-	DryRun        bool
+	// TargetIdentity overrides Target.QualifiedName for routing while retaining
+	// the backing agent's provider, formula, and work-directory configuration.
+	// Configured named sessions use this to route directly to their canonical
+	// identity instead of waking a duplicate raw-template session.
+	TargetIdentity string
+	IsFormula      bool
+	OnFormula      string
+	NoFormula      bool
+	SkipPoke       bool
+	Title          string
+	Vars           []string
+	Merge          string // "", "direct", "pr", "mr", "local"
+	NoConvoy       bool
+	Owned          bool
+	Nudge          bool
+	Force          bool
+	DryRun         bool
 	// Reassign clears any existing human assignee on the bead before
 	// routing so the target pool/agent can claim it. Without this, a
 	// bead claimed by a human (`bd update --claim`) stays invisible
@@ -66,6 +72,13 @@ type SlingOpts struct {
 	InlineText bool
 	ScopeKind  string
 	ScopeRef   string
+}
+
+func (o SlingOpts) routeTarget() string {
+	if target := strings.TrimSpace(o.TargetIdentity); target != "" {
+		return target
+	}
+	return o.Target.QualifiedName()
 }
 
 // AgentResolver resolves an agent name to a config.Agent.
@@ -196,6 +209,22 @@ type SlingChildResult struct {
 	FormulaName string // formula used
 }
 
+func CanonicalTargetIdentity(cfg *config.City, cityName string, target config.Agent) string {
+	raw := target.QualifiedName()
+	if target.SupportsMultipleSessions() || IsCustomSlingQuery(target) || cfg == nil {
+		return raw
+	}
+	specs := session.FindNamedSessionSpecsByBackingTemplate(cfg, cityName, raw)
+	if len(specs) == 1 {
+		return specs[0].Identity
+	}
+	return raw
+}
+
+func (s *Sling) targetIdentity(target config.Agent) string {
+	return CanonicalTargetIdentity(s.deps.Cfg, s.deps.CityName, target)
+}
+
 // Sling provides intent-based work routing operations. Construct via New.
 type Sling struct {
 	deps SlingDeps
@@ -239,68 +268,72 @@ type FormulaOpts struct {
 // RouteBead routes a plain bead to an agent.
 func (s *Sling) RouteBead(_ context.Context, beadID string, target config.Agent, opts RouteOpts) (SlingResult, error) {
 	return DoSling(SlingOpts{
-		Target:        target,
-		BeadOrFormula: beadID,
-		Merge:         opts.Merge,
-		NoConvoy:      opts.NoConvoy,
-		Owned:         opts.Owned,
-		Nudge:         opts.Nudge,
-		Force:         opts.Force,
-		SkipPoke:      opts.SkipPoke,
-		DryRun:        opts.DryRun,
-		InlineText:    opts.InlineText,
+		Target:         target,
+		TargetIdentity: s.targetIdentity(target),
+		BeadOrFormula:  beadID,
+		Merge:          opts.Merge,
+		NoConvoy:       opts.NoConvoy,
+		Owned:          opts.Owned,
+		Nudge:          opts.Nudge,
+		Force:          opts.Force,
+		SkipPoke:       opts.SkipPoke,
+		DryRun:         opts.DryRun,
+		InlineText:     opts.InlineText,
 	}, s.deps, s.deps.Store)
 }
 
 // LaunchFormula instantiates a formula and routes the resulting wisp.
 func (s *Sling) LaunchFormula(_ context.Context, formulaName string, target config.Agent, opts FormulaOpts) (SlingResult, error) {
 	return DoSling(SlingOpts{
-		Target:        target,
-		BeadOrFormula: formulaName,
-		IsFormula:     true,
-		Title:         opts.Title,
-		Vars:          opts.Vars,
-		Merge:         opts.Merge,
-		Nudge:         opts.Nudge,
-		Force:         opts.Force,
-		SkipPoke:      opts.SkipPoke,
-		DryRun:        opts.DryRun,
-		ScopeKind:     opts.ScopeKind,
-		ScopeRef:      opts.ScopeRef,
+		Target:         target,
+		TargetIdentity: s.targetIdentity(target),
+		BeadOrFormula:  formulaName,
+		IsFormula:      true,
+		Title:          opts.Title,
+		Vars:           opts.Vars,
+		Merge:          opts.Merge,
+		Nudge:          opts.Nudge,
+		Force:          opts.Force,
+		SkipPoke:       opts.SkipPoke,
+		DryRun:         opts.DryRun,
+		ScopeKind:      opts.ScopeKind,
+		ScopeRef:       opts.ScopeRef,
 	}, s.deps, s.deps.Store)
 }
 
 // AttachFormula attaches a formula wisp to an existing bead and routes the bead.
 func (s *Sling) AttachFormula(_ context.Context, formulaName, beadID string, target config.Agent, opts FormulaOpts) (SlingResult, error) {
 	return DoSling(SlingOpts{
-		Target:        target,
-		BeadOrFormula: beadID,
-		OnFormula:     formulaName,
-		Title:         opts.Title,
-		Vars:          opts.Vars,
-		Merge:         opts.Merge,
-		Nudge:         opts.Nudge,
-		Force:         opts.Force,
-		SkipPoke:      opts.SkipPoke,
-		DryRun:        opts.DryRun,
-		ScopeKind:     opts.ScopeKind,
-		ScopeRef:      opts.ScopeRef,
+		Target:         target,
+		TargetIdentity: s.targetIdentity(target),
+		BeadOrFormula:  beadID,
+		OnFormula:      formulaName,
+		Title:          opts.Title,
+		Vars:           opts.Vars,
+		Merge:          opts.Merge,
+		Nudge:          opts.Nudge,
+		Force:          opts.Force,
+		SkipPoke:       opts.SkipPoke,
+		DryRun:         opts.DryRun,
+		ScopeKind:      opts.ScopeKind,
+		ScopeRef:       opts.ScopeRef,
 	}, s.deps, s.deps.Store)
 }
 
 // ExpandConvoy expands a convoy and routes each open child.
 func (s *Sling) ExpandConvoy(_ context.Context, convoyID string, target config.Agent, opts RouteOpts, querier BeadChildQuerier) (SlingResult, error) {
 	return DoSlingBatch(SlingOpts{
-		Target:        target,
-		BeadOrFormula: convoyID,
-		Merge:         opts.Merge,
-		NoConvoy:      opts.NoConvoy,
-		Owned:         opts.Owned,
-		Nudge:         opts.Nudge,
-		Force:         opts.Force,
-		SkipPoke:      opts.SkipPoke,
-		DryRun:        opts.DryRun,
-		InlineText:    opts.InlineText,
+		Target:         target,
+		TargetIdentity: s.targetIdentity(target),
+		BeadOrFormula:  convoyID,
+		Merge:          opts.Merge,
+		NoConvoy:       opts.NoConvoy,
+		Owned:          opts.Owned,
+		Nudge:          opts.Nudge,
+		Force:          opts.Force,
+		SkipPoke:       opts.SkipPoke,
+		DryRun:         opts.DryRun,
+		InlineText:     opts.InlineText,
 	}, s.deps, querier)
 }
 
@@ -1268,7 +1301,8 @@ func InstantiateSlingFormula(ctx context.Context, formulaName string, searchPath
 		}
 	}
 	SlingTracef("instantiate compiled formula=%s dur=%s steps=%d", formulaName, time.Since(compileStart), len(recipe.Steps))
-	if err := graphroute.ApplyGraphRouting(recipe, &a, a.QualifiedName(), opts.Vars, sourceBeadID, scopeKind, scopeRef, deps.StoreRef, deps.Store, deps.CityName, deps.Cfg, deps.graphrouteDeps()); err != nil {
+	routeTarget := CanonicalTargetIdentity(deps.Cfg, deps.CityName, a)
+	if err := graphroute.ApplyGraphRouting(recipe, &a, routeTarget, opts.Vars, sourceBeadID, scopeKind, scopeRef, deps.StoreRef, deps.Store, deps.CityName, deps.Cfg, deps.graphrouteDeps()); err != nil {
 		SlingTracef("instantiate decorate-error formula=%s err=%v", formulaName, err)
 		return nil, err
 	}
@@ -1563,5 +1597,6 @@ type BeadCheckResult struct {
 
 // BeadCheckOptions configures pre-flight bead state checks for a route.
 type BeadCheckOptions struct {
-	NoConvoy bool
+	NoConvoy       bool
+	TargetIdentity string
 }

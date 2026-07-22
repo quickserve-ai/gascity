@@ -565,6 +565,71 @@ func TestLookupConfiguredNamedSession_ReportsSessionNameConflictBeforeAliasConfl
 	}
 }
 
+func TestLookupConfiguredNamedSession_ReportsEphemeralBackingTemplateConflict(t *testing.T) {
+	maxOne := 1
+	store := beads.NewMemStore()
+	spec := NamedSessionSpec{
+		Agent:       &config.Agent{Name: "woodhouse", MaxActiveSessions: &maxOne},
+		Identity:    "woodhouse",
+		SessionName: "demo--woodhouse",
+	}
+	shadow, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Status: "open",
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"session_name":   "woodhouse-ga-dl5gy",
+			"template":       "woodhouse",
+			"pool_managed":   "true",
+			"agent_name":     "woodhouse",
+			"session_origin": "ephemeral",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(shadow): %v", err)
+	}
+
+	lookup, err := LookupConfiguredNamedSession(store, spec)
+	if err != nil {
+		t.Fatalf("LookupConfiguredNamedSession: %v", err)
+	}
+	if !lookup.HasConflict || lookup.Conflict.ID != shadow.ID {
+		t.Fatalf("lookup = %+v, want ephemeral backing-template conflict %s", lookup, shadow.ID)
+	}
+}
+
+func TestLookupConfiguredNamedSession_AllowsManualBackingTemplateSession(t *testing.T) {
+	maxOne := 1
+	store := beads.NewMemStore()
+	spec := NamedSessionSpec{
+		Agent:       &config.Agent{Name: "woodhouse", MaxActiveSessions: &maxOne},
+		Identity:    "woodhouse",
+		SessionName: "demo--woodhouse",
+	}
+	_, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Status: "open",
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"session_name":   "operator-chosen",
+			"template":       "woodhouse",
+			"agent_name":     "operator-chosen",
+			"session_origin": "manual",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(manual): %v", err)
+	}
+
+	lookup, err := LookupConfiguredNamedSession(store, spec)
+	if err != nil {
+		t.Fatalf("LookupConfiguredNamedSession: %v", err)
+	}
+	if lookup.HasConflict || lookup.HasCanonical {
+		t.Fatalf("lookup = %+v, want manual session preserved without conflict", lookup)
+	}
+}
+
 func TestLookupConfiguredNamedSession_EmptySpecNoListCall(t *testing.T) {
 	store := &listCountingStore{MemStore: beads.NewMemStore()}
 
