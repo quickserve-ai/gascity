@@ -59,7 +59,7 @@ func TestClearStaleResetMarkerIfHealthy_ClearsForAttachedSession(t *testing.T) {
 	session := resetMarkerTestSetup(env, time.Hour)
 	env.sp.SetAttached("worker", true)
 
-	clearStaleResetMarkerIfHealthy(&session, env.store, env.sp, "worker", "worker",
+	clearStaleResetMarkerIfHealthy(seedSessionInfo(session), env.store, env.sp, "worker", "worker",
 		true, time.Minute, env.clk.Now().UTC(), env.dt, env.rec, &env.stderr, nil)
 
 	got, err := env.store.Get(session.ID)
@@ -86,7 +86,7 @@ func TestClearStaleResetMarkerIfHealthy_ClearsForActivityAfterReset(t *testing.T
 	// after the reset, so the reset evidently happened.
 	env.sp.SetActivity("worker", env.clk.Now().UTC().Add(-5*time.Minute))
 
-	clearStaleResetMarkerIfHealthy(&session, env.store, env.sp, "worker", "worker",
+	clearStaleResetMarkerIfHealthy(seedSessionInfo(session), env.store, env.sp, "worker", "worker",
 		true, time.Minute, env.clk.Now().UTC(), env.dt, env.rec, &env.stderr, nil)
 
 	got, err := env.store.Get(session.ID)
@@ -126,7 +126,7 @@ func TestClearStaleResetMarkerIfHealthy_KeepsMarker(t *testing.T) {
 			name:  "no evidence",
 			age:   time.Hour,
 			alive: true,
-			setup: func(env *reconcilerTestEnv) {},
+			setup: func(_ *reconcilerTestEnv) {},
 		},
 		{
 			// Activity from before the reset commit proves nothing about
@@ -146,7 +146,7 @@ func TestClearStaleResetMarkerIfHealthy_KeepsMarker(t *testing.T) {
 			session := resetMarkerTestSetup(env, tc.age)
 			tc.setup(env)
 
-			clearStaleResetMarkerIfHealthy(&session, env.store, env.sp, "worker", "worker",
+			clearStaleResetMarkerIfHealthy(seedSessionInfo(session), env.store, env.sp, "worker", "worker",
 				tc.alive, time.Minute, env.clk.Now().UTC(), env.dt, env.rec, &env.stderr, nil)
 
 			got, err := env.store.Get(session.ID)
