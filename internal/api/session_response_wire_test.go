@@ -209,3 +209,46 @@ func TestSessionResponseFromInfoWireByteIdentical(t *testing.T) {
 		})
 	}
 }
+
+func TestSessionResponseEmitsNavigatorClassificationFields(t *testing.T) {
+	cfg := &config.City{Agents: []config.Agent{{
+		Name:         config.ControlDispatcherAgentName,
+		StartCommand: config.ControlDispatcherStartCommandFor(config.ControlDispatcherAgentName),
+	}}}
+	info := session.Info{
+		ID:                     "gc-control",
+		Template:               "control-dispatcher",
+		SessionName:            "gc-control",
+		State:                  session.StateAsleep,
+		MetadataState:          "asleep",
+		SleepReason:            "drained",
+		ConfiguredNamedSession: false,
+		SessionOrigin:          "ephemeral",
+		PoolManaged:            true,
+		Provider:               "",
+	}
+	pr := session.PersistedResponse{Status: "open", Metadata: map[string]string{
+		"state": "asleep", "session_origin": "ephemeral", "pool_managed": "true",
+	}}
+	got := sessionResponseWithReason(info, pr, cfg, nil, false)
+	payload, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+	var row map[string]any
+	if err := json.Unmarshal(payload, &row); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	for key, want := range map[string]any{
+		"configured_named_session": false,
+		"session_origin":           "ephemeral",
+		"pool_managed":             true,
+		"control_plane":            true,
+		"base_state":               "asleep",
+		"navigator_schema_version": "1",
+	} {
+		if got := row[key]; got != want {
+			t.Errorf("%s = %#v, want %#v; row=%#v", key, got, want, row)
+		}
+	}
+}
