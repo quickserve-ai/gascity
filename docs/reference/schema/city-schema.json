@@ -2497,6 +2497,10 @@
           "type": "string",
           "description": "DefaultBranch is the rig repository's mainline branch (e.g. \"main\",\n\"master\", \"develop\"). When set, routing formulas use this as the\ndefault merge target instead of probing origin/HEAD at sling time.\nCaptured by `gc rig add` from the rig's git config; set manually for\nrigs whose mainline isn't reachable via origin/HEAD."
         },
+        "default_merge_strategy": {
+          "type": "string",
+          "description": "DefaultMergeStrategy is the merge_strategy metadata written to a\nbead slung to this rig's agents when --merge is not passed (e.g.\n\"pr\" for rigs whose mainline only accepts changes through pull\nrequests). Empty writes no metadata, so downstream formulas apply\ntheir own default — the gastown refinery assumes \"direct\", which\na protected mainline rejects at push time."
+        },
         "suspended": {
           "type": "boolean",
           "description": "Suspended is the deprecated pre-runtime-state suspension flag.\nParsed for backwards compatibility and treated as an alias for\nSuspendedOnStart by [Rig.EffectiveSuspendedOnStart], so existing\ncities with `suspended = true` continue to start their rigs\nsuspended after upgrade. Live suspend/resume commands no longer\nwrite this field. `gc doctor` flags it and offers `--fix` to\nrename to suspended_on_start."
@@ -2784,6 +2788,10 @@
         "remote_match": {
           "type": "string",
           "description": "RemoteMatch is a substring pattern for the hybrid provider to route\nsessions to the remote (K8s) backend. Sessions whose names contain\nthis pattern go to K8s; all others stay local (tmux).\nOverridden by the GC_HYBRID_REMOTE_MATCH env var if set."
+        },
+        "drift_wave_notify": {
+          "type": "string",
+          "description": "DriftWaveNotify is the mail recipient for config-drift wave notices:\nwhen more sessions need config-drift restarts in one tick than the\nper-tick budget allows, the reconciler mails this address once per\nwave (plus periodic reminders while the wave keeps rolling) so a\ncoordinator sees a roster-wide roll in progress. Empty disables the\nmail; the session.config_drift_wave event and stderr notice always\nfire regardless."
         }
       },
       "additionalProperties": false,

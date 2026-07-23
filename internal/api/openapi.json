@@ -7465,6 +7465,9 @@
           "attached": {
             "type": "boolean"
           },
+          "base_state": {
+            "type": "string"
+          },
           "configured_named_session": {
             "type": "boolean"
           },
@@ -7475,6 +7478,9 @@
           "context_window": {
             "format": "int64",
             "type": "integer"
+          },
+          "control_plane": {
+            "type": "boolean"
           },
           "created_at": {
             "type": "string"
@@ -7506,6 +7512,9 @@
           "model": {
             "type": "string"
           },
+          "navigator_schema_version": {
+            "type": "string"
+          },
           "options": {
             "additionalProperties": {
               "type": "string"
@@ -7514,6 +7523,9 @@
           },
           "pool": {
             "type": "string"
+          },
+          "pool_managed": {
+            "type": "boolean"
           },
           "provider": {
             "type": "string"
@@ -7528,6 +7540,9 @@
             "type": "boolean"
           },
           "session_name": {
+            "type": "string"
+          },
+          "session_origin": {
             "type": "string"
           },
           "state": {
@@ -7555,6 +7570,11 @@
           "session_name",
           "created_at",
           "attached",
+          "configured_named_session",
+          "pool_managed",
+          "control_plane",
+          "base_state",
+          "navigator_schema_version",
           "running"
         ],
         "type": "object"
@@ -11913,6 +11933,7 @@
             "request.result.session.submit": "#/components/schemas/TypedEventStreamEnvelopeRequestResultSessionSubmit",
             "rig.provision.progress": "#/components/schemas/TypedEventStreamEnvelopeRigProvisionProgress",
             "session.cold_start_timeout": "#/components/schemas/TypedEventStreamEnvelopeSessionColdStartTimeout",
+            "session.config_drift_wave": "#/components/schemas/TypedEventStreamEnvelopeSessionConfigDriftWave",
             "session.crashed": "#/components/schemas/TypedEventStreamEnvelopeSessionCrashed",
             "session.drain_acked_with_assigned_work": "#/components/schemas/TypedEventStreamEnvelopeSessionDrainAckedWithAssignedWork",
             "session.draining": "#/components/schemas/TypedEventStreamEnvelopeSessionDraining",
@@ -12103,6 +12124,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionColdStartTimeout"
+          },
+          {
+            "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionConfigDriftWave"
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionCrashed"
@@ -13091,6 +13115,7 @@
                 "session.stranded",
                 "session.unknown_state",
                 "session.reset_stalled",
+                "session.config_drift_wave",
                 "session.work_query_failed",
                 "session.cold_start_timeout",
                 "bead.created",
@@ -15110,6 +15135,57 @@
         "title": "TypedEventStreamEnvelope session.cold_start_timeout",
         "type": "object"
       },
+      "TypedEventStreamEnvelopeSessionConfigDriftWave": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/NoPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.config_drift_wave",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload"
+        ],
+        "title": "TypedEventStreamEnvelope session.config_drift_wave",
+        "type": "object"
+      },
       "TypedEventStreamEnvelopeSessionCrashed": {
         "additionalProperties": false,
         "properties": {
@@ -16291,6 +16367,7 @@
             "request.result.session.submit": "#/components/schemas/TypedTaggedEventStreamEnvelopeRequestResultSessionSubmit",
             "rig.provision.progress": "#/components/schemas/TypedTaggedEventStreamEnvelopeRigProvisionProgress",
             "session.cold_start_timeout": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionColdStartTimeout",
+            "session.config_drift_wave": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionConfigDriftWave",
             "session.crashed": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionCrashed",
             "session.drain_acked_with_assigned_work": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionDrainAckedWithAssignedWork",
             "session.draining": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionDraining",
@@ -16481,6 +16558,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionColdStartTimeout"
+          },
+          {
+            "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionConfigDriftWave"
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionCrashed"
@@ -17540,6 +17620,7 @@
                 "session.stranded",
                 "session.unknown_state",
                 "session.reset_stalled",
+                "session.config_drift_wave",
                 "session.work_query_failed",
                 "session.cold_start_timeout",
                 "bead.created",
@@ -19710,6 +19791,61 @@
           "city"
         ],
         "title": "TypedTaggedEventStreamEnvelope session.cold_start_timeout",
+        "type": "object"
+      },
+      "TypedTaggedEventStreamEnvelopeSessionConfigDriftWave": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/NoPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.config_drift_wave",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload",
+          "city"
+        ],
+        "title": "TypedTaggedEventStreamEnvelope session.config_drift_wave",
         "type": "object"
       },
       "TypedTaggedEventStreamEnvelopeSessionCrashed": {

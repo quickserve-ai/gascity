@@ -712,6 +712,45 @@ func TestHandleSessionList(t *testing.T) {
 	}
 }
 
+func TestHandleSessionListEmitsNavigatorClassificationFields(t *testing.T) {
+	fs := newSessionFakeState(t)
+	fs.cfg.Agents = []config.Agent{{
+		Name:         config.ControlDispatcherAgentName,
+		StartCommand: config.ControlDispatcherStartCommandFor(config.ControlDispatcherAgentName),
+	}}
+	_, err := fs.cityBeadStore.Create(beads.Bead{
+		ID: "gc-control", Type: session.BeadType, Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"session_name": "gc-control", "template": config.ControlDispatcherAgentName,
+			"state": "asleep", "session_origin": "ephemeral", "pool_managed": "true",
+			"sleep_reason": "drained",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create session bead: %v", err)
+	}
+	srv := New(fs)
+	h := newTestCityHandlerWith(t, fs, srv)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, httptest.NewRequest("GET", cityURL(fs, "/sessions"), nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("list status = %d; body=%s", w.Code, w.Body.String())
+	}
+	var got struct {
+		Items []map[string]any `json:"items"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&got); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if len(got.Items) != 1 {
+		t.Fatalf("items = %d, want 1", len(got.Items))
+	}
+	row := got.Items[0]
+	if row["control_plane"] != true || row["base_state"] != "asleep" || row["session_origin"] != "ephemeral" || row["pool_managed"] != true {
+		t.Fatalf("classification fields = %#v", row)
+	}
+}
+
 func TestHandleSessionListFilterByState(t *testing.T) {
 	fs := newSessionFakeState(t)
 	srv := New(fs)

@@ -986,7 +986,7 @@ func doSessionListFallback(stateFilter, templateFilter string, jsonOutput bool, 
 	sortSessionsCreatedDesc(sessions)
 
 	if jsonOutput {
-		return writeSessionListJSON(sessions, stateFilter, templateFilter, stdout, stderr)
+		return writeSessionListJSON(sessions, providerCtx.cfg, stateFilter, templateFilter, stdout, stderr)
 	}
 
 	// Build the per-session reason-projection index from the one snapshot (no
@@ -1056,28 +1056,34 @@ func doSessionListFallback(stateFilter, templateFilter string, jsonOutput bool, 
 }
 
 type sessionListJSONRow struct {
-	ID                   string        `json:"id"`
-	Name                 string        `json:"name,omitempty"`
-	Template             string        `json:"template"`
-	Provider             string        `json:"provider,omitempty"`
-	State                session.State `json:"state"`
-	Title                string        `json:"title,omitempty"`
-	Rig                  string        `json:"rig,omitempty"`
-	Alias                string        `json:"alias,omitempty"`
-	AgentName            string        `json:"agent_name,omitempty"`
-	Transport            string        `json:"transport,omitempty"`
-	Command              string        `json:"command,omitempty"`
-	WorkDir              string        `json:"work_dir,omitempty"`
-	SessionName          string        `json:"session_name,omitempty"`
-	SessionKey           string        `json:"session_key,omitempty"`
-	ResumeFlag           string        `json:"resume_flag,omitempty"`
-	ResumeStyle          string        `json:"resume_style,omitempty"`
-	ResumeCommand        string        `json:"resume_command,omitempty"`
-	CreatedAt            time.Time     `json:"created_at"`
-	LastActive           time.Time     `json:"last_active"`
-	LastNudgeDeliveredAt *time.Time    `json:"last_nudge_delivered_at,omitempty"`
-	Attached             bool          `json:"attached"`
-	Closed               bool          `json:"closed"`
+	ID                     string        `json:"id"`
+	Name                   string        `json:"name,omitempty"`
+	Template               string        `json:"template"`
+	Provider               string        `json:"provider,omitempty"`
+	State                  session.State `json:"state"`
+	Title                  string        `json:"title,omitempty"`
+	Rig                    string        `json:"rig,omitempty"`
+	Alias                  string        `json:"alias,omitempty"`
+	AgentName              string        `json:"agent_name,omitempty"`
+	Transport              string        `json:"transport,omitempty"`
+	Command                string        `json:"command,omitempty"`
+	WorkDir                string        `json:"work_dir,omitempty"`
+	SessionName            string        `json:"session_name,omitempty"`
+	ConfiguredNamedSession bool          `json:"configured_named_session"`
+	SessionOrigin          string        `json:"session_origin,omitempty"`
+	PoolManaged            bool          `json:"pool_managed"`
+	ControlPlane           bool          `json:"control_plane"`
+	BaseState              string        `json:"base_state"`
+	NavigatorSchemaVersion string        `json:"navigator_schema_version"`
+	SessionKey             string        `json:"session_key,omitempty"`
+	ResumeFlag             string        `json:"resume_flag,omitempty"`
+	ResumeStyle            string        `json:"resume_style,omitempty"`
+	ResumeCommand          string        `json:"resume_command,omitempty"`
+	CreatedAt              time.Time     `json:"created_at"`
+	LastActive             time.Time     `json:"last_active"`
+	LastNudgeDeliveredAt   *time.Time    `json:"last_nudge_delivered_at,omitempty"`
+	Attached               bool          `json:"attached"`
+	Closed                 bool          `json:"closed"`
 }
 
 type sessionListJSON struct {
@@ -1099,8 +1105,8 @@ type sessionListSummary struct {
 	Closed    int `json:"closed"`
 }
 
-func writeSessionListJSON(sessions []session.Info, stateFilter, templateFilter string, stdout, stderr io.Writer) int {
-	rows := sessionListJSONRows(sessions)
+func writeSessionListJSON(sessions []session.Info, cfg *config.City, stateFilter, templateFilter string, stdout, stderr io.Writer) int {
+	rows := sessionListJSONRows(sessions, cfg)
 	result := sessionListJSON{
 		SchemaVersion: "1",
 		Filters:       sessionListFilters{State: stateFilter, Template: templateFilter},
@@ -1146,31 +1152,37 @@ func writeSessionNewJSON(stdout, stderr io.Writer, result sessionNewJSON) error 
 	return writeCLIJSONLineOrErr(stdout, stderr, "gc session new", result)
 }
 
-func sessionListJSONRows(sessions []session.Info) []sessionListJSONRow {
+func sessionListJSONRows(sessions []session.Info, cfg *config.City) []sessionListJSONRow {
 	rows := make([]sessionListJSONRow, len(sessions))
 	for i, s := range sessions {
 		rows[i] = sessionListJSONRow{
-			ID:            s.ID,
-			Name:          sessionListJSONName(s),
-			Template:      s.Template,
-			State:         s.State,
-			Closed:        s.Closed,
-			Title:         s.Title,
-			Rig:           sessionListJSONRig(s),
-			Alias:         s.Alias,
-			AgentName:     s.AgentName,
-			Provider:      s.Provider,
-			Transport:     s.Transport,
-			Command:       s.Command,
-			WorkDir:       s.WorkDir,
-			SessionName:   s.SessionName,
-			SessionKey:    s.SessionKey,
-			ResumeFlag:    s.ResumeFlag,
-			ResumeStyle:   s.ResumeStyle,
-			ResumeCommand: s.ResumeCommand,
-			CreatedAt:     s.CreatedAt,
-			LastActive:    s.LastActive,
-			Attached:      s.Attached,
+			ID:                     s.ID,
+			Name:                   sessionListJSONName(s),
+			Template:               s.Template,
+			State:                  s.State,
+			Closed:                 s.Closed,
+			Title:                  s.Title,
+			Rig:                    sessionListJSONRig(s),
+			Alias:                  s.Alias,
+			AgentName:              s.AgentName,
+			Provider:               s.Provider,
+			Transport:              s.Transport,
+			Command:                s.Command,
+			WorkDir:                s.WorkDir,
+			SessionName:            s.SessionName,
+			ConfiguredNamedSession: s.ConfiguredNamedSession,
+			SessionOrigin:          s.SessionOrigin,
+			PoolManaged:            s.PoolManaged,
+			ControlPlane:           sessionListJSONControlPlane(s, cfg),
+			BaseState:              sessionListJSONBaseState(s),
+			NavigatorSchemaVersion: "1",
+			SessionKey:             s.SessionKey,
+			ResumeFlag:             s.ResumeFlag,
+			ResumeStyle:            s.ResumeStyle,
+			ResumeCommand:          s.ResumeCommand,
+			CreatedAt:              s.CreatedAt,
+			LastActive:             s.LastActive,
+			Attached:               s.Attached,
 		}
 		if !s.LastNudgeDeliveredAt.IsZero() {
 			stamp := s.LastNudgeDeliveredAt.UTC()
@@ -1178,6 +1190,22 @@ func sessionListJSONRows(sessions []session.Info) []sessionListJSONRow {
 		}
 	}
 	return rows
+}
+
+func sessionListJSONBaseState(info session.Info) string {
+	state := strings.TrimSpace(info.MetadataState)
+	if state != "" {
+		return state
+	}
+	return string(info.State)
+}
+
+func sessionListJSONControlPlane(info session.Info, cfg *config.City) bool {
+	if cfg == nil {
+		return false
+	}
+	agent := findAgentByTemplate(cfg, info.Template)
+	return agent != nil && config.IsDeterministicControlDispatcher(agent)
 }
 
 func sessionListJSONName(s session.Info) string {

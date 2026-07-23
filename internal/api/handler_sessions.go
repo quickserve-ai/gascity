@@ -38,9 +38,17 @@ type sessionResponse struct {
 	LastNudgeDeliveredAt string `json:"last_nudge_delivered_at,omitempty"`
 	Attached             bool   `json:"attached"`
 
-	// Classification fields derived from config (for dashboard grouping).
+	// Classification fields are additive and come from the typed session.Info
+	// plus the configured agent. They let clients classify without name rules.
 	Rig  string `json:"rig,omitempty"`
 	Pool string `json:"pool,omitempty"`
+
+	ConfiguredNamedSession bool   `json:"configured_named_session"`
+	SessionOrigin          string `json:"session_origin,omitempty"`
+	PoolManaged            bool   `json:"pool_managed"`
+	ControlPlane           bool   `json:"control_plane"`
+	BaseState              string `json:"base_state"`
+	NavigatorSchemaVersion string `json:"navigator_schema_version"`
 
 	// AgentKind classifies the agent backing the session so dashboards can
 	// route it to the right panel without re-deriving from template names.
@@ -63,10 +71,6 @@ type sessionResponse struct {
 	// SubmissionCapabilities describes which semantic submit intents the
 	// session runtime can honor.
 	SubmissionCapabilities session.SubmissionCapabilities `json:"submission_capabilities,omitempty"`
-
-	// ConfiguredNamedSession marks canonical singleton sessions materialized from
-	// [[named_session]] configuration.
-	ConfiguredNamedSession bool `json:"configured_named_session,omitempty"`
 
 	// Options contains the effective per-session option overrides from
 	// template_overrides bead metadata (e.g., {"permission_mode":"unrestricted"}).
@@ -94,26 +98,32 @@ func sessionToResponse(info session.Info, cfg *config.City) sessionResponse {
 		provider, displayName = resolveProviderInfo(info.Provider, cfg)
 	}
 	rig, _ := config.ParseQualifiedName(info.Template)
-	r := sessionResponse{
-		ID:          info.ID,
-		Template:    info.Template,
-		State:       string(info.State),
-		Title:       info.Title,
-		Alias:       info.Alias,
-		Provider:    provider,
-		DisplayName: displayName,
-		SessionName: info.SessionName,
-		WorkDir:     info.WorkDir,
-		CreatedAt:   info.CreatedAt.Format(time.RFC3339),
-		Attached:    info.Attached,
-		Rig:         rig,
+	baseState := strings.TrimSpace(info.MetadataState)
+	if baseState == "" {
+		baseState = string(info.State)
 	}
-	// Populate pool and agent_kind from config lookup. The pool field is
-	// the agent's base name (e.g., "polecat"), useful for dashboard type
-	// classification. AgentKind tells the dashboard which panel a session
-	// belongs to (crew/pool/role).
+	r := sessionResponse{
+		ID:                     info.ID,
+		Template:               info.Template,
+		State:                  string(info.State),
+		Title:                  info.Title,
+		Alias:                  info.Alias,
+		Provider:               provider,
+		DisplayName:            displayName,
+		SessionName:            info.SessionName,
+		WorkDir:                info.WorkDir,
+		CreatedAt:              info.CreatedAt.Format(time.RFC3339),
+		Attached:               info.Attached,
+		Rig:                    rig,
+		NavigatorSchemaVersion: "1",
+		ConfiguredNamedSession: info.ConfiguredNamedSession,
+		SessionOrigin:          info.SessionOrigin,
+		PoolManaged:            info.PoolManaged,
+		BaseState:              baseState,
+	}
 	if cfg != nil {
 		if agent, ok := findAgent(cfg, info.Template); ok {
+			r.ControlPlane = config.IsDeterministicControlDispatcher(&agent)
 			if isMultiSessionAgent(agent) {
 				r.Pool = agent.Name
 			}

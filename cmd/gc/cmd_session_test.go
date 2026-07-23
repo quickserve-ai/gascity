@@ -2023,19 +2023,25 @@ func TestRenderSessionListFromAPIJSONUsesSnakeCaseSessionFields(t *testing.T) {
 		AgeSeconds: 1.25,
 		Body: []SessionView{
 			{
-				ID:          "gc-abc",
-				Template:    "worker",
-				State:       "active",
-				Reason:      "assigned",
-				Title:       "Worker session",
-				Alias:       "worker-1",
-				SessionName: "worker-gc-abc",
-				WorkDir:     "/tmp/gc/workspaces/worker",
-				CreatedAt:   "2026-04-23T10:00:00Z",
-				LastActive:  "2026-04-23T12:00:00Z",
-				Attached:    true,
-				Running:     true,
-				LastOutput:  "ready",
+				ID:                     "gc-abc",
+				Template:               "worker",
+				State:                  "active",
+				Reason:                 "assigned",
+				Title:                  "Worker session",
+				Alias:                  "worker-1",
+				SessionName:            "worker-gc-abc",
+				WorkDir:                "/tmp/gc/workspaces/worker",
+				CreatedAt:              "2026-04-23T10:00:00Z",
+				LastActive:             "2026-04-23T12:00:00Z",
+				Attached:               true,
+				Running:                true,
+				LastOutput:             "ready",
+				ConfiguredNamedSession: true,
+				SessionOrigin:          "named",
+				PoolManaged:            false,
+				ControlPlane:           false,
+				BaseState:              "active",
+				NavigatorSchemaVersion: "1",
 			},
 		},
 	}, true, &stdout)
@@ -2065,6 +2071,9 @@ func TestRenderSessionListFromAPIJSONUsesSnakeCaseSessionFields(t *testing.T) {
 	}
 	if got.Sessions[0]["session_name"] != "worker-gc-abc" {
 		t.Fatalf("session_name = %#v, want worker-gc-abc; row=%#v", got.Sessions[0]["session_name"], got.Sessions[0])
+	}
+	if got.Sessions[0]["configured_named_session"] != true || got.Sessions[0]["session_origin"] != "named" || got.Sessions[0]["pool_managed"] != false || got.Sessions[0]["control_plane"] != false || got.Sessions[0]["base_state"] != "active" || got.Sessions[0]["navigator_schema_version"] != "1" {
+		t.Fatalf("classification fields = %#v", got.Sessions[0])
 	}
 	if got.Sessions[0]["work_dir"] != "/tmp/gc/workspaces/worker" {
 		t.Fatalf("work_dir = %#v, want /tmp/gc/workspaces/worker; row=%#v", got.Sessions[0]["work_dir"], got.Sessions[0])
@@ -2183,6 +2192,73 @@ func TestCmdSessionList_RendersLastNudgeColumn(t *testing.T) {
 	}
 	if got := lastField(quietRow); got != "-" {
 		t.Fatalf("quiet-session LAST NUDGE = %q, want %q; row=%q", got, "-", quietRow)
+	}
+}
+
+func TestWriteSessionListJSONEmitsSessionClassificationFields(t *testing.T) {
+	infos := []session.Info{
+		{
+			ID:                     "gc-named",
+			Template:               "crew/adolin",
+			SessionName:            "crew--adolin",
+			State:                  session.StateActive,
+			ConfiguredNamedSession: true,
+			SessionOrigin:          "named",
+		},
+		{
+			ID:            "gc-pool",
+			Template:      "crew/implementation-worker",
+			SessionName:   "crew--implementation-worker",
+			State:         session.StateActive,
+			SessionOrigin: "ephemeral",
+			PoolManaged:   true,
+		},
+	}
+	var stdout, stderr bytes.Buffer
+	if code := writeSessionListJSON(infos, nil, "", "", &stdout, &stderr); code != 0 {
+		t.Fatalf("writeSessionListJSON = %d; stderr=%s", code, stderr.String())
+	}
+	var envelope map[string]any
+	if err := json.Unmarshal(stdout.Bytes(), &envelope); err != nil {
+		t.Fatalf("stdout is not JSON: %v; stdout=%q", err, stdout.String())
+	}
+	rows, ok := envelope["sessions"].([]any)
+	if !ok || len(rows) != len(infos) {
+		t.Fatalf("sessions = %#v, want %d rows", envelope["sessions"], len(infos))
+	}
+	bySessionName := make(map[string]map[string]any, len(rows))
+	for _, raw := range rows {
+		row, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("session row = %#v, want object", raw)
+		}
+		name, ok := row["session_name"].(string)
+		if !ok {
+			t.Fatalf("session row has no session_name: %#v", row)
+		}
+		bySessionName[name] = row
+	}
+	for name, want := range map[string]map[string]any{
+		"crew--adolin": {
+			"configured_named_session": true,
+			"session_origin":           "named",
+			"pool_managed":             false,
+		},
+		"crew--implementation-worker": {
+			"configured_named_session": false,
+			"session_origin":           "ephemeral",
+			"pool_managed":             true,
+		},
+	} {
+		row := bySessionName[name]
+		if row == nil {
+			t.Fatalf("missing session row %q: %#v", name, bySessionName)
+		}
+		for key, wantValue := range want {
+			if got := row[key]; got != wantValue {
+				t.Errorf("%s[%s] = %#v, want %#v; row=%#v", name, key, got, wantValue, row)
+			}
+		}
 	}
 }
 
@@ -3606,5 +3682,29 @@ mode = "always"
 	stderr.Reset()
 	if code := cmdSessionNew([]string{"demo/helper"}, "demo/sky", "", "", true, false, 0, &stdout, &stderr); code != 0 {
 		t.Fatalf("cmdSessionNew(raw template, --alias) = %d, want 0; stderr=%s", code, stderr.String())
+	}
+}
+
+func TestSessionListJSONRowsEmitsControlPlaneAndRawBaseState(t *testing.T) {
+	cfg := &config.City{Agents: []config.Agent{{
+		Name:         config.ControlDispatcherAgentName,
+		StartCommand: config.ControlDispatcherStartCommandFor(config.ControlDispatcherAgentName),
+	}}}
+	info := session.Info{
+		ID:            "gc-control",
+		Template:      config.ControlDispatcherAgentName,
+		State:         session.StateAsleep,
+		MetadataState: "asleep",
+		SleepReason:   "drained",
+		Provider:      "",
+		SessionOrigin: "ephemeral",
+		PoolManaged:   true,
+	}
+	rows := sessionListJSONRows([]session.Info{info}, cfg)
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(rows))
+	}
+	if !rows[0].ControlPlane || rows[0].BaseState != "asleep" {
+		t.Fatalf("control_plane=%v base_state=%q, want true/asleep", rows[0].ControlPlane, rows[0].BaseState)
 	}
 }
