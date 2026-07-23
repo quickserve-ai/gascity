@@ -177,6 +177,12 @@ function session(overrides: Partial<SessionResponse> = {}): SessionResponse {
     attached: true,
     running: true,
     provider: 'codex',
+    configured_named_session: false,
+    session_origin: 'manual',
+    pool_managed: false,
+    control_plane: false,
+    base_state: 'active',
+    navigator_schema_version: '1',
     ...overrides,
   };
 }
