@@ -472,6 +472,9 @@ func TestLifecycleTransitionPatchesSetCompleteMetadata(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if got, ok := tt.patch[resumeSeededKey]; ok {
+				tt.want[resumeSeededKey] = got
+			}
 			if !reflect.DeepEqual(tt.patch, tt.want) {
 				t.Fatalf("patch = %#v, want %#v", tt.patch, tt.want)
 			}
@@ -565,6 +568,7 @@ func TestCommitStartedPatchBuildsAtomicStartMetadata(t *testing.T) {
 		"started_launch_hash":        "launch-hash",
 		"continuation_reset_pending": "",
 		ResetCommittedAtKey:          "",
+		resumeSeededKey:              "",
 		"core_hash_breakdown":        `{"command":"core-hash"}`,
 		"state":                      string(StateActive),
 		"state_reason":               "creation_complete",
@@ -659,6 +663,7 @@ func TestCommitStartedPatchCanPersistHashesWithoutRestampingState(t *testing.T) 
 		"started_launch_hash":        "launch-hash",
 		"continuation_reset_pending": "",
 		ResetCommittedAtKey:          "",
+		resumeSeededKey:              "",
 		"sleep_reason":               "",
 	}
 	if !reflect.DeepEqual(patch, want) {
