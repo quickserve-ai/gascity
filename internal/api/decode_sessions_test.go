@@ -125,3 +125,29 @@ func TestSessionsFromGenList_PartialMissingFields(t *testing.T) {
 		t.Errorf("required fields mismatch: %+v", v)
 	}
 }
+
+func TestSessionsFromGenListPreservesNavigatorClassificationFields(t *testing.T) {
+	item := genclient.SessionResponse{
+		Id:                     "gc-classified",
+		Template:               "crew/adolin",
+		State:                  "active",
+		Title:                  "Adolin",
+		SessionName:            "crew--adolin",
+		CreatedAt:              "2026-07-22T10:00:00Z",
+		ConfiguredNamedSession: true,
+		SessionOrigin:          stringPtrForTest("named"),
+		PoolManaged:            false,
+		ControlPlane:           false,
+		BaseState:              "active",
+		NavigatorSchemaVersion: "1",
+	}
+	got := sessionsFromGenList(&genclient.ListBodySessionResponse{Items: &[]genclient.SessionResponse{item}})
+	if len(got) != 1 {
+		t.Fatalf("len = %d, want 1", len(got))
+	}
+	if !got[0].ConfiguredNamedSession || got[0].SessionOrigin != "named" || got[0].PoolManaged || got[0].ControlPlane || got[0].BaseState != "active" || got[0].NavigatorSchemaVersion != "1" {
+		t.Fatalf("classification fields = %+v", got[0])
+	}
+}
+
+func stringPtrForTest(v string) *string { return &v }
