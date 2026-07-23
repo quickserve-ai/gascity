@@ -7,33 +7,39 @@ import "github.com/gastownhall/gascity/internal/api/genclient"
 // sessionResponse fields that the CLI formatter reads so cmd/gc/ never
 // imports genclient directly.
 type SessionView struct {
-	ID          string `json:"id"`
-	Template    string `json:"template"`
-	State       string `json:"state"`
-	Reason      string `json:"reason"`
-	Title       string `json:"title"`
-	Alias       string `json:"alias"`
-	SessionName string `json:"session_name"`
-	WorkDir     string `json:"work_dir"`
-	CreatedAt   string `json:"created_at"`
-	LastActive  string `json:"last_active"`
-	Attached    bool   `json:"attached"`
-	Running     bool   `json:"running"`
-	LastOutput  string `json:"last_output"`
+	ID                     string `json:"id"`
+	Template               string `json:"template"`
+	State                  string `json:"state"`
+	Reason                 string `json:"reason"`
+	Title                  string `json:"title"`
+	Alias                  string `json:"alias"`
+	SessionName            string `json:"session_name"`
+	WorkDir                string `json:"work_dir"`
+	CreatedAt              string `json:"created_at"`
+	LastActive             string `json:"last_active"`
+	Attached               bool   `json:"attached"`
+	Running                bool   `json:"running"`
+	LastOutput             string `json:"last_output"`
+	ConfiguredNamedSession bool   `json:"configured_named_session"`
+	SessionOrigin          string `json:"session_origin,omitempty"`
+	PoolManaged            bool   `json:"pool_managed"`
+	ControlPlane           bool   `json:"control_plane"`
+	BaseState              string `json:"base_state"`
+	NavigatorSchemaVersion string `json:"navigator_schema_version"`
 }
 
 // sessionViewFromGen translates one genclient.SessionResponse into a
 // SessionView. Optional pointer fields are dereferenced safely.
 func sessionViewFromGen(g genclient.SessionResponse) SessionView {
 	out := SessionView{
-		ID:          g.Id,
-		Template:    g.Template,
-		State:       g.State,
-		Title:       g.Title,
-		SessionName: g.SessionName,
-		CreatedAt:   g.CreatedAt,
-		Attached:    g.Attached,
-		Running:     g.Running,
+		ID: g.Id, Template: g.Template, State: g.State, Title: g.Title,
+		SessionName: g.SessionName, CreatedAt: g.CreatedAt, Attached: g.Attached,
+		Running: g.Running, ConfiguredNamedSession: g.ConfiguredNamedSession,
+		PoolManaged: g.PoolManaged, ControlPlane: g.ControlPlane, BaseState: g.BaseState,
+		NavigatorSchemaVersion: g.NavigatorSchemaVersion,
+	}
+	if g.SessionOrigin != nil {
+		out.SessionOrigin = *g.SessionOrigin
 	}
 	if g.WorkDir != nil {
 		out.WorkDir = *g.WorkDir
