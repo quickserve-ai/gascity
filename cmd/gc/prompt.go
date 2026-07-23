@@ -571,7 +571,7 @@ func unknownTemplateVariables(tmpl *template.Template, roots []string, known map
 		}
 		seen[item.name] = item.dotRooted
 		t := tmpl.Lookup(item.name)
-		if t == nil || t.Tree == nil || t.Tree.Root == nil {
+		if t == nil || t.Tree == nil || t.Root == nil {
 			continue
 		}
 		tree := t.Tree

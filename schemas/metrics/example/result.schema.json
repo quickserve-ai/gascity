@@ -205,7 +205,9 @@
               "login",
               "logout",
               "whoami",
-              "runtime-heartbeat"
+              "runtime-heartbeat",
+              "session-resume",
+              "session-history"
             ]
           },
           "event_id": {

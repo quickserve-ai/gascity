@@ -37,7 +37,7 @@ var allProjectedMetadataKeys = []string{
 	aliasHistoryMetadataKey, "continuity_eligible", "last_woke_at", "awake_started_at", "usage_compute_emitted_at", "state_reason",
 	"creation_complete_at", "continuation_reset_pending", SessionCircuitStateMetadataKey,
 	ResetCommittedAtKey,
-	"generation", "started_config_hash", "pin_awake", "held_until", "wait_hold",
+	"generation", "started_config_hash", resumeSeededKey, "pin_awake", "held_until", "wait_hold",
 	"churn_count", "wake_mode", "sleep_intent", "instance_token", "detached_at",
 	CurrentBeadIDKey, "core_hash_breakdown", "started_provision_hash",
 	"started_launch_hash", "started_live_hash", "live_hash", "startup_dialog_verified",

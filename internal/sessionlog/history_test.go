@@ -8,9 +8,11 @@ import (
 	"time"
 )
 
-const historyTestUUIDA = "11111111-2222-3333-4444-555555555555"
-const historyTestUUIDB = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-const historyTestUUIDC = "99999999-8888-7777-6666-555555555555"
+const (
+	historyTestUUIDA = "11111111-2222-3333-4444-555555555555"
+	historyTestUUIDB = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	historyTestUUIDC = "99999999-8888-7777-6666-555555555555"
+)
 
 func writeHistoryTranscript(t *testing.T, dir, stem string, lines []string, mod time.Time) string {
 	t.Helper()

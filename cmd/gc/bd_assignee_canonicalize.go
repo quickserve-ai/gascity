@@ -413,7 +413,8 @@ func bdAssigneeLeafAndPrefix(raw string) (string, string) {
 		return raw[i+1:], prefix
 	}
 	if i := strings.LastIndex(raw, "--"); i >= 0 && i+2 < len(raw) {
-		return raw[i+2:], raw[:strings.Index(raw, "--")]
+		prefix, _, _ := strings.Cut(raw, "--")
+		return raw[i+2:], prefix
 	}
 	return raw, ""
 }

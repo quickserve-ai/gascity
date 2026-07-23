@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "next_id": 196,
+  "next_id": 198,
   "permanent_ids": [
     {
       "name": "help",
@@ -3509,6 +3509,21 @@
       "id": 141
     },
     {
+      "path": "gc session history",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "session-history",
+      "owner": "immediate",
+      "id": 197
+    },
+    {
       "path": "gc session kill",
       "aliases": [],
       "conditional_modes": [],
@@ -3657,6 +3672,21 @@
       "classification": "session-reset",
       "owner": "immediate",
       "id": 151
+    },
+    {
+      "path": "gc session resume",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "session-resume",
+      "owner": "immediate",
+      "id": 196
     },
     {
       "path": "gc session submit",

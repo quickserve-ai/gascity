@@ -737,8 +737,8 @@ func persistPrimeHookProviderSessionKey(hookProviderSessionID string, stderr io.
 		warn("%v", err)
 		return
 	}
-	if fromHookStdin && sessionProviderFamily(info) != "codex" {
-		warn("hook stdin provider session id is only accepted for codex session %q", gcSessionID)
+	if fromHookStdin && !hookStdinSessionIDTrusted(sessionProviderFamily(info)) {
+		warn("hook stdin provider session id is only accepted for codex/claude session %q", gcSessionID)
 		return
 	}
 	if existing := strings.TrimSpace(info.SessionKey); existing != "" {

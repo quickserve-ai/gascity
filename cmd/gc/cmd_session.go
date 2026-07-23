@@ -225,8 +225,8 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach, json
 			for i, s := range specs {
 				identities[i] = s.Identity
 			}
-			fmt.Fprintf(stderr, "gc session new: template %q backs configured named session %s — target it directly (e.g. \"gc nudge %s\"), or pass --alias to create a separate session under its own identity\n",
-				found.QualifiedName(), strings.Join(identities, ", "), identities[0]) //nolint:errcheck // best-effort stderr
+			_, _ = fmt.Fprintf(stderr, "gc session new: template %q backs configured named session %s — target it directly (e.g. \"gc nudge %s\"), or pass --alias to create a separate session under its own identity\n",
+				found.QualifiedName(), strings.Join(identities, ", "), identities[0])
 			return 1
 		}
 	}

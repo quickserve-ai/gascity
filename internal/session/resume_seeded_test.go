@@ -39,7 +39,7 @@ func TestStampPriorSessionKey(t *testing.T) {
 			t.Fatal("stamped prior_session_key for unchanged key")
 		}
 	})
-	t.Run("nil-safe", func(t *testing.T) {
+	t.Run("nil-safe", func(_ *testing.T) {
 		StampPriorSessionKey(nil, map[string]string{"session_key": "x"})
 		StampPriorSessionKey(MetadataPatch{"session_key": ""}, nil)
 	})

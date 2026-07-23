@@ -1432,6 +1432,9 @@ case "$*" in
   *"update hw-claim --claim --json"*)
     printf '[{"id":"hw-claim","status":"in_progress","assignee":"%%s","metadata":{"gc.routed_to":"worker"}}]' "${BEADS_ACTOR:-}"
     ;;
+  *"show --json hw-claim"*)
+    printf '[{"id":"hw-claim","status":"in_progress","assignee":"%%s","metadata":{"gc.routed_to":"worker"}}]' "${BEADS_ACTOR:-}"
+    ;;
   *"query --json ephemeral=true AND status=open --limit 0"*)
     printf '[]'
     ;;

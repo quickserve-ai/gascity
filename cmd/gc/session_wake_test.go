@@ -277,7 +277,7 @@ func TestPreWakeCommit_SeededResumeSurvivesFreshMode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, _, err := preWakeCommit(&b, store, clk); err != nil {
+	if _, _, _, err := preWakeCommit(seedSessionInfo(b), sessionFrontDoor(store), clk); err != nil {
 		t.Fatalf("preWakeCommit: %v", err)
 	}
 	got, _ := store.Get(b.ID)

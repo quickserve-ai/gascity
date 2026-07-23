@@ -638,7 +638,7 @@ func retireDuplicateConfiguredNamedSessionBeads(
 				continue
 			}
 			batch := session.RetireNamedSessionPatch(now, "duplicate-repair", spec.Identity)
-			if setMetaBatch(store, b.ID, batch, stderr) != nil {
+			if setMetaBatch(sessionFrontDoor(store), b.ID, batch, stderr) != nil {
 				continue
 			}
 			status := "open"

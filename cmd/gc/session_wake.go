@@ -693,10 +693,6 @@ func completeDrain(info sessions.Info, sessFront *sessions.Store, ds *drainState
 	sessions.StampPriorSessionKeyInfo(batch, info)
 	_ = sessFront.ApplyPatch(info.ID, batch)
 }
-	}
-	batch := sessions.CompleteDrainPatch(clk.Now(), ds.reason, info.WakeMode == "fresh")
-	_ = sessFront.ApplyPatch(info.ID, batch)
-}
 
 // verifiedStop stops a session after verifying the instance_token matches.
 // Prevents stale drain operations from targeting a re-woken session.

@@ -732,7 +732,7 @@ func TestSweepStaleNudgeMail_HandoffMailLongTTL(t *testing.T) {
 	}
 	store := beads.NewMemStoreFrom(100, seed, nil)
 
-	counts, err := countStaleNudgeMail(store, nil, now, nudgeMailSweepDefaultNudgeTTL, mailTTL, 0)
+	counts, err := countStaleNudgeMail(beads.NudgesStore{Store: store}, beads.MailStore{Store: store}, nil, now, nudgeMailSweepDefaultNudgeTTL, mailTTL, 0)
 	if err != nil {
 		t.Fatalf("count: %v", err)
 	}
@@ -740,7 +740,7 @@ func TestSweepStaleNudgeMail_HandoffMailLongTTL(t *testing.T) {
 		t.Errorf("count: MailClosed = %d, want 2", counts.MailClosed)
 	}
 
-	result, err := sweepStaleNudgeMail(store, nil, now, nudgeMailSweepDefaultNudgeTTL, mailTTL, 0)
+	result, err := sweepStaleNudgeMail(beads.NudgesStore{Store: store}, beads.MailStore{Store: store}, nil, now, nudgeMailSweepDefaultNudgeTTL, mailTTL, 0)
 	if err != nil {
 		t.Fatalf("sweep: %v", err)
 	}

@@ -8084,7 +8084,7 @@ func TestDoPrimeStrictUnknownTemplateVariableFails(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dir, "prompts"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "prompts", "mayor.template.md"), []byte("Rig: {{ .Rig }}\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "prompts", "mayor.template.md"), []byte("Rig: {{ .Rgi }}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	toml := `[workspace]
@@ -8109,7 +8109,7 @@ prompt_template = "prompts/mayor.template.md"
 	if code == 0 {
 		t.Fatalf("doPrimeWithMode(strict, unknown var) = 0, want non-zero; stderr: %s", stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "unknown template variable {{ .Rig }}") {
+	if !strings.Contains(stderr.String(), "unknown template variable {{ .Rgi }}") {
 		t.Errorf("stderr = %q, want unknown-variable error", stderr.String())
 	}
 

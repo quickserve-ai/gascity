@@ -451,7 +451,6 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 		// Session forms remain as fallback for unaliased pool workers,
 		// whose query env carries the same string in GC_AGENT.
 		assignee := firstNonEmptyHookValue(alias, agentForQuery, resolvedAgentName, sessionName, sessionID)
-		routeTarget := hookClaimPrimaryRouteTarget(&a)
 		claimOpts := hookClaimOptions{
 			Assignee: assignee,
 			// IdentityCandidates governs ADOPTION of already-owned in_progress/open

@@ -3595,7 +3595,7 @@ mode = "always"
 	}
 
 	var stdout, stderr bytes.Buffer
-	if code := cmdSessionNew([]string{"demo/helper"}, "", "", "", true, false, &stdout, &stderr); code != 1 {
+	if code := cmdSessionNew([]string{"demo/helper"}, "", "", "", true, false, 0, &stdout, &stderr); code != 1 {
 		t.Fatalf("cmdSessionNew(raw template) = %d, want 1; stderr=%s", code, stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "demo/lana") {
@@ -3604,7 +3604,7 @@ mode = "always"
 
 	stdout.Reset()
 	stderr.Reset()
-	if code := cmdSessionNew([]string{"demo/helper"}, "demo/sky", "", "", true, false, &stdout, &stderr); code != 0 {
+	if code := cmdSessionNew([]string{"demo/helper"}, "demo/sky", "", "", true, false, 0, &stdout, &stderr); code != 0 {
 		t.Fatalf("cmdSessionNew(raw template, --alias) = %d, want 0; stderr=%s", code, stderr.String())
 	}
 }
