@@ -39,7 +39,7 @@ func TestStampPriorSessionKey(t *testing.T) {
 			t.Fatal("stamped prior_session_key for unchanged key")
 		}
 	})
-	t.Run("nil-safe", func(t *testing.T) {
+	t.Run("nil-safe", func(_ *testing.T) {
 		StampPriorSessionKey(nil, map[string]string{"session_key": "x"})
 		StampPriorSessionKey(MetadataPatch{"session_key": ""}, nil)
 	})
@@ -52,7 +52,7 @@ func TestResumeSeededClearedByResetPaths(t *testing.T) {
 		"RestartRequestPatch":        RestartRequestPatch("rotated", now),
 		"ContinuationResetWakePatch": ContinuationResetWakePatch(now),
 		"ConfigDriftResetPatch":      ConfigDriftResetPatch(StateAsleep, "rotated", now),
-		"AcknowledgeDrainPatchFresh": AcknowledgeDrainPatch(true),
+		"AcknowledgeDrainPatchFresh": AcknowledgeDrainPatch(now, true),
 		"CompleteDrainPatchFresh":    CompleteDrainPatch(now, "idle", true),
 		"PreWakePatchFresh": PreWakePatch(PreWakePatchInput{
 			Generation: 1, InstanceToken: "t", ContinuationEpoch: 1, Now: now, FreshWake: true,
@@ -69,7 +69,7 @@ func TestResumeSeededClearedByResetPaths(t *testing.T) {
 func TestResumeSeededSurvivesNonFreshPaths(t *testing.T) {
 	now := time.Now()
 	cases := map[string]MetadataPatch{
-		"AcknowledgeDrainPatch": AcknowledgeDrainPatch(false),
+		"AcknowledgeDrainPatch": AcknowledgeDrainPatch(now, false),
 		"CompleteDrainPatch":    CompleteDrainPatch(now, "idle", false),
 		"PreWakePatch": PreWakePatch(PreWakePatchInput{
 			Generation: 1, InstanceToken: "t", ContinuationEpoch: 1, Now: now, FreshWake: false,
