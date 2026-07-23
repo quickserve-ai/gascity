@@ -190,7 +190,7 @@ func ReadClaudeTranscriptSummary(path string) TranscriptSummary {
 		}
 	}
 	if s.Title == "" {
-		if tail := readTailWindow(f, transcriptScanWindow); len(tail) > 0 {
+		if tail := readHistoryTailWindow(f, transcriptScanWindow); len(tail) > 0 {
 			for _, line := range strings.Split(string(tail), "\n") {
 				scanTranscriptLine([]byte(line), &s, &summaryTitle)
 			}
@@ -279,9 +279,9 @@ func firstUserTextLine(raw json.RawMessage) string {
 	return ""
 }
 
-// readTailWindow returns the final up-to-window bytes of f, aligned to the
-// first full line, or nil when the file fits inside the head scan already.
-func readTailWindow(f *os.File, window int) []byte {
+// readHistoryTailWindow returns the final up-to-window bytes of f, aligned to
+// the first full line, or nil when the file fits inside the head scan already.
+func readHistoryTailWindow(f *os.File, window int) []byte {
 	info, err := f.Stat()
 	if err != nil || info.Size() <= int64(window) {
 		return nil
