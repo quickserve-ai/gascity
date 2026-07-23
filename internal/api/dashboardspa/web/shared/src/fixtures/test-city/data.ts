@@ -124,6 +124,12 @@ function buildSessions(
         created_at: iso(6 * HOUR),
         rig: a.rig,
         model: a.model,
+        configured_named_session: false,
+        session_origin: 'ephemeral',
+        pool_managed: true,
+        control_plane: false,
+        base_state: a.state,
+        navigator_schema_version: '1',
       };
       if (a.activeBead !== undefined) session.active_bead = a.activeBead;
       if (a.contextPct !== undefined) session.context_pct = a.contextPct;
