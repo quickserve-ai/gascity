@@ -279,8 +279,8 @@ func firstUserTextLine(raw json.RawMessage) string {
 	return ""
 }
 
-// readHistoryTailWindow returns the final up-to-window bytes of f, aligned to the
-// first full line, or nil when the file fits inside the head scan already.
+// readHistoryTailWindow returns the final up-to-window bytes of f, aligned to
+// the first full line, or nil when the file fits inside the head scan already.
 func readHistoryTailWindow(f *os.File, window int) []byte {
 	info, err := f.Stat()
 	if err != nil || info.Size() <= int64(window) {
