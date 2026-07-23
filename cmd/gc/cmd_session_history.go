@@ -141,7 +141,7 @@ func resolveSessionHistoryTarget(cityPath string, cfg *config.City, store beads.
 		}
 	}
 	if store != nil {
-		if logCtx, ok := resolveSessionLogContext(cityPath, cfg, store, identifier); ok {
+		if logCtx, ok := resolveSessionLogContext(cityPath, cfg, sessionFrontDoor(store), identifier); ok {
 			return sessionHistoryTarget{
 				identifier: identifier,
 				workDir:    logCtx.workDir,
@@ -158,7 +158,7 @@ func resolveSessionHistoryTarget(cityPath string, cfg *config.City, store beads.
 func historyProviderForAgent(cfg *config.City, agentCfg *config.Agent) string {
 	resolved, err := config.ResolveProvider(agentCfg, &cfg.Workspace, cfg.Providers, exec.LookPath)
 	if err == nil {
-		if family := sessionTranscriptProvider(resolved, nil); family != "" {
+		if family := sessionTranscriptProvider(resolved, sessionpkg.Info{}); family != "" {
 			return family
 		}
 	}
@@ -189,16 +189,16 @@ func liveSessionKeysForWorkDir(store beads.Store, workDir string) map[string]str
 	if store == nil || strings.TrimSpace(workDir) == "" {
 		return live
 	}
-	found, err := store.ListByMetadata(map[string]string{"work_dir": workDir}, 0)
+	found, err := sessionFrontDoor(store).ListByMetadataInfos(map[string]string{"work_dir": workDir}, 0)
 	if err != nil {
 		return live
 	}
-	for _, b := range found {
-		if !sessionLogFallbackCandidateLive(b) {
+	for _, info := range found {
+		if !sessionLogFallbackCandidateLive(info) {
 			continue
 		}
-		if key := strings.TrimSpace(b.Metadata["session_key"]); key != "" {
-			live[key] = b.ID
+		if key := strings.TrimSpace(info.SessionKey); key != "" {
+			live[key] = info.ID
 		}
 	}
 	return live
@@ -482,13 +482,14 @@ func cmdSessionResume(args []string, last, printOnly bool, archiveRoot string, s
 		fmt.Fprintf(stderr, "gc session resume: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	b, err := store.Get(sessionID)
+	sessFront := sessionFrontDoor(store)
+	info, err := sessFront.Get(sessionID)
 	if err != nil {
-		fmt.Fprintf(stderr, "gc session resume: %v\n", err) //nolint:errcheck // best-effort stderr
+		fmt.Fprintf(stderr, "gc session resume: %v\n", err) //nolint:errcheck
 		return 1
 	}
-	if sessionLogFallbackCandidateLive(b) {
-		fmt.Fprintf(stderr, "gc session resume: %s is currently running — attach with: gc session attach %s, or use --print for a side-channel dive\n", target.identifier, target.identifier) //nolint:errcheck // best-effort stderr
+	if sessionLogFallbackCandidateLive(info) {
+		fmt.Fprintf(stderr, "gc session resume: %s is currently running — attach with: gc session attach %s, or use --print for a side-channel dive\n", target.identifier, target.identifier) //nolint:errcheck
 		return 1
 	}
 
@@ -497,17 +498,11 @@ func cmdSessionResume(args []string, last, printOnly bool, archiveRoot string, s
 		sessionpkg.ResumeSeededKey(): "true",
 		"continuation_reset_pending": "",
 	}
-	sessionpkg.StampPriorSessionKey(patch, b.Metadata)
-	if setMetaBatch(store, sessionID, patch, stderr) != nil {
+	sessionpkg.StampPriorSessionKeyInfo(patch, info)
+	if setMetaBatch(sessFront, sessionID, patch, stderr) != nil {
 		return 1
 	}
-	for k, v := range patch {
-		if b.Metadata == nil {
-			b.Metadata = make(map[string]string, len(patch))
-		}
-		b.Metadata[k] = v
-	}
-	if _, err := sessionpkg.WakeSession(store, b, time.Now().UTC()); err != nil {
+	if _, err := sessFront.WakeSession(sessionID, time.Now().UTC(), sessionpkg.WakeOpts{}); err != nil {
 		if state, conflict := sessionpkg.WakeConflictState(err); conflict {
 			fmt.Fprintf(stderr, "gc session resume: session %s is %s\n", sessionID, state) //nolint:errcheck // best-effort stderr
 			return 1
