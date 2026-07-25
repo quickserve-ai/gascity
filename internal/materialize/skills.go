@@ -46,6 +46,7 @@ import (
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/bootstrap"
+	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
 )
@@ -339,6 +340,19 @@ type Request struct {
 	// symlinks. Pass nil to skip legacy migration. Use LegacyStubNames()
 	// for the canonical list.
 	LegacyNames []string
+	// LegacyOwnedRoots lists RETIRED gc-managed source roots whose
+	// stranded symlinks the cleanup walk should still recognize as
+	// gc-owned: targets under them are gc's own leftover property, never
+	// user content. The motivating case is the .gc/system/packs
+	// projection retired by #3344 with a config-only migration —
+	// pre-manifest sink links pointing into it classify as "user-owned"
+	// under OwnedRoots+manifest alone and are skipped forever
+	// (hq-38je). Links under these roots are re-pointed when their name
+	// is desired and deleted only once dangling when undesired; a
+	// still-resolving legacy link for an undesired name is left alone.
+	// Use LegacyOwnedRootsFor for the canonical list. Pass nil to keep
+	// the historical behavior.
+	LegacyOwnedRoots []string
 }
 
 // SkippedConflict records a name in the desired set that could not be
@@ -490,6 +504,19 @@ func Run(req Request) (Result, error) {
 	manifest := loadOwnershipManifest(absSink)
 	manifestDirty := false
 
+	legacyOwned := make([]string, 0, len(req.LegacyOwnedRoots))
+	for _, root := range req.LegacyOwnedRoots {
+		if root == "" {
+			continue
+		}
+		canon, err := canonicalizePath(root)
+		if err != nil {
+			result.Warnings = append(result.Warnings, fmt.Sprintf("canonicalize legacy owned root %q: %v", root, err))
+			continue
+		}
+		legacyOwned = append(legacyOwned, canon)
+	}
+
 	// Step 2: legacy stub migration.
 	for _, name := range req.LegacyNames {
 		path := filepath.Join(absSink, name)
@@ -536,15 +563,30 @@ func Run(req Request) (Result, error) {
 			result.Warnings = append(result.Warnings, fmt.Sprintf("canonicalize target %q: %v", target, terr))
 			continue
 		}
+		legacyTarget := false
 		if !targetUnderOwnedRoot(canonTarget, owned) && !manifestRecordsTarget(manifest, name, canonTarget) {
-			// External target — symlink the user placed themselves. Not
-			// under any currently-owned root, and not a target this
+			// Not under any currently-owned root, and not a target this
 			// materializer's own manifest remembers writing for this name
-			// in a previous pass.
-			continue
+			// in a previous pass. Retired gc-managed roots
+			// (LegacyOwnedRoots) still mark the link as gc's own stranded
+			// property — e.g. a pre-#3344 .gc/system/packs projection
+			// target orphaned by the config-only retirement migration.
+			if !targetUnderOwnedRoot(canonTarget, legacyOwned) {
+				// External target — symlink the user placed themselves.
+				continue
+			}
+			legacyTarget = true
 		}
 		desired, want := desiredByName[name]
 		if !want {
+			if legacyTarget {
+				// Stranded legacy-root links are removed only once they
+				// dangle; a still-resolving link for an undesired name may
+				// be serving content the user relies on.
+				if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+					continue
+				}
+			}
 			// Owned but not desired — delete (covers dangling and orphaned).
 			if rmErr := os.Remove(path); rmErr != nil {
 				result.Warnings = append(result.Warnings, fmt.Sprintf("removing orphan symlink %q: %v", path, rmErr))
@@ -651,6 +693,52 @@ func Run(req Request) (Result, error) {
 	sort.Strings(result.LegacyMigrated)
 	sort.Strings(result.Warnings)
 	return result, nil
+}
+
+// TargetUnderManagedRoot reports whether target falls under one of the
+// given gc-managed roots, canonicalizing both sides the same way the
+// cleanup walk does so /var ↔ /private/var aliases compare equal. It
+// exists so the doctor dangling-sink check classifies link ownership
+// with exactly the materializer's logic instead of drifting into a
+// second convention. Canonicalization failures classify as false (not
+// owned) — the safe direction for a deletion decision.
+func TargetUnderManagedRoot(target string, roots []string) bool {
+	canonTarget, err := canonicalizePath(target)
+	if err != nil {
+		return false
+	}
+	canonRoots := make([]string, 0, len(roots))
+	for _, root := range roots {
+		if root == "" {
+			continue
+		}
+		canon, err := canonicalizePath(root)
+		if err != nil {
+			continue
+		}
+		canonRoots = append(canonRoots, canon)
+	}
+	return targetUnderOwnedRoot(canonTarget, canonRoots)
+}
+
+// LegacyOwnedRootsFor returns the canonical retired gc-managed source
+// roots for Request.LegacyOwnedRoots:
+//
+//   - <cityPath>/.gc/system/packs — the per-city projection retired by
+//     #3344, whose config-only migration stranded every pre-manifest
+//     sink symlink that pointed into it (hq-38je).
+//   - <GC_HOME>/cache/repos — the global content-addressed pack
+//     checkout cache; a pruned checkout strands pre-manifest links
+//     that #4130's manifest only covers going forward.
+//
+// The cache root is omitted when GC_HOME is unresolvable (hermetic
+// test binaries) rather than erroring the whole materialization pass.
+func LegacyOwnedRootsFor(cityPath string) []string {
+	roots := []string{filepath.Join(cityPath, citylayout.SystemPacksRoot)}
+	if cacheRoot, err := config.GlobalRepoCacheRoot(); err == nil {
+		roots = append(roots, cacheRoot)
+	}
+	return roots
 }
 
 // LegacyStubNames returns the canonical list of v0.15.0 stub names that
