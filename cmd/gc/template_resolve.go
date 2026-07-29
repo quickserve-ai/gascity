@@ -488,6 +488,7 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 	env := mergeEnv(passthroughEnv(), expandEnvMap(workspaceEnv), expandEnvMap(resolved.Env), expandEnvMap(cfgAgent.Env), agentEnv)
 	processenv.PrependGCBinDirToPATH(env, env["GC_BIN"])
 	env = convergence.ScrubTokenEnv(env)
+	stampContextLaunchModel(env, command)
 
 	// OperatorEnv carries only the operator-authored layers (workspace,
 	// resolved provider, agent) — excluding passthrough and the generated
@@ -780,6 +781,15 @@ func isOperationalScript(rel string) bool {
 		}
 	}
 	return false
+}
+
+func stampContextLaunchModel(env map[string]string, command string) {
+	if env == nil {
+		return
+	}
+	if model := launchModelFromCommand(command); model != "" {
+		env["GC_CONTEXT_LAUNCH_MODEL"] = model
+	}
 }
 
 func installHooksIncludeFamily(installHooks []string, family string, providers map[string]config.ProviderSpec) bool {
