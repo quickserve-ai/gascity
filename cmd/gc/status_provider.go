@@ -14,8 +14,9 @@ import (
 var (
 	// Carry (ga-63pjp re-apply): upstream's 50ms budget tripped the bounded
 	// probe on this town's runtime, so `gc status` routinely degraded to
-	// partial output. 2s lets a healthy probe finish while still bounding a
-	// wedged one.
+	// partial output. Raised to 500ms by 0c61ea37e and then to 2s by
+	// c2adf8cd8 (the later commit, and the value the deployed binary runs);
+	// 2s lets a healthy probe finish while still bounding a wedged one.
 	statusProviderCallTimeout    = 2 * time.Second
 	statusProviderTimeoutWarning = func() {
 		fmt.Fprintln(os.Stderr, "gc status: runtime status probe timed out; using partial status")

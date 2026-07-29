@@ -226,6 +226,7 @@ func reapClosedBeadWorktrees(
 	rec events.Recorder,
 	stderr io.Writer,
 	dryRun bool,
+	sessionSnapshotAvailable bool,
 	activeSessions ...beads.Bead,
 ) int {
 	if stderr == nil {
@@ -251,6 +252,10 @@ func reapClosedBeadWorktrees(
 		rigGit := newBeadWorktreeGitProbe(rigRoot)
 		registered, registrationErr := registeredBeadWorktrees(rigGit)
 		for _, candidate := range discoverBeadWorktreeCandidates(cityPath, cfg, rigName) {
+			if !sessionSnapshotAvailable {
+				fmt.Fprintf(stderr, "reapClosedBeadWorktrees: dry-run action=would-skip path=%s bead=%s reason=runtime/session snapshot unavailable\n", candidate.Path, candidate.BeadID) //nolint:errcheck
+				continue
+			}
 			if live, reason := candidateOwnedByActiveSession(candidate, activeSessions, sp); live {
 				recordBeadWorktreeSkip(rec, stderr, candidate, reason)
 				continue
@@ -288,7 +293,7 @@ func reapClosedBeadWorktrees(
 				continue
 			}
 			if dryRun {
-				fmt.Fprintf(stderr, "reapClosedBeadWorktrees: dry-run action=indeterminate candidate_action=%s path=%s bead=%s reason=runtime/session snapshot unavailable; candidate safety=%s\n", freshDecision.Action, candidate.Path, candidate.BeadID, freshDecision.Reason) //nolint:errcheck
+				fmt.Fprintf(stderr, "reapClosedBeadWorktrees: dry-run action=would-remove path=%s bead=%s reason=%s\n", candidate.Path, candidate.BeadID, freshDecision.Reason) //nolint:errcheck
 				continue
 			}
 			quarantinePath := candidate.Path + ".gc-reap-" + fmt.Sprintf("%d", time.Now().UnixNano())
