@@ -323,7 +323,7 @@ func TestReapClosedBeadWorktreesRemovesSafeNestedWorktreeWithoutForce(t *testing
 	}
 
 	var stderr bytes.Buffer
-	got := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{"qcore": store}, runtime.NewFake(), nil, &stderr, false)
+	got := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{"qcore": store}, runtime.NewFake(), nil, &stderr, false, true)
 	if got != 1 {
 		t.Fatalf("reaped = %d, want 1; stderr=%s", got, stderr.String())
 	}
@@ -356,7 +356,7 @@ func TestReapClosedBeadWorktreesPreservesDependenciesAfterRemoveFailure(t *testi
 		return candidateGit
 	}
 
-	if got := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{"qcore": store}, runtime.NewFake(), nil, nil, false); got != 0 {
+	if got := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{"qcore": store}, runtime.NewFake(), nil, nil, false, true); got != 0 {
 		t.Fatalf("reaped = %d, want 0 whole worktrees", got)
 	}
 	if _, err := os.Stat(candidatePath); err != nil {
@@ -382,7 +382,7 @@ func TestReapClosedBeadWorktreesDryRunDoesNotMutate(t *testing.T) {
 	defer func() { newBeadWorktreeGitProbe = orig }()
 	newBeadWorktreeGitProbe = func(string) beadWorktreeGitProbe { return fakeGit }
 
-	reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{"qcore": store}, runtime.NewFake(), nil, nil, true)
+	reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{"qcore": store}, runtime.NewFake(), nil, nil, true, true)
 	if fakeGit.removedPath != "" {
 		t.Fatalf("dry-run removed %q", fakeGit.removedPath)
 	}
@@ -440,7 +440,7 @@ func TestReapClosedBeadWorktreesReevaluatesGitSafetyBeforeRemoval(t *testing.T) 
 		probeCount++
 		return &fakeBeadWorktreeGit{isRepo: true, branch: "polecat/qc-race1", dirty: probeCount > 1}
 	}
-	reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{"qcore": store}, runtime.NewFake(), nil, nil, false)
+	reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{"qcore": store}, runtime.NewFake(), nil, nil, false, true)
 	if rigGit.removedPath != "" {
 		t.Fatalf("removed candidate after safety changed: %q", rigGit.removedPath)
 	}
@@ -471,8 +471,31 @@ func TestReapClosedBeadWorktreesSkipsUnstampedLiveSessionWorktree(t *testing.T) 
 		t.Fatal(err)
 	}
 	session := beads.Bead{ID: "session-1", Status: "open", Metadata: map[string]string{"session_name": "live-session", "work_dir": home}}
-	reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{"qcore": store}, sp, nil, nil, false, session)
+	reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{"qcore": store}, sp, nil, nil, false, true, session)
 	if rigGit.movedFrom != "" || rigGit.removedPath != "" {
 		t.Fatalf("live unstamped worktree was mutated: move=%q remove=%q", rigGit.movedFrom, rigGit.removedPath)
+	}
+}
+
+func TestReapClosedBeadWorktreesUnavailableSnapshotWouldSkip(t *testing.T) {
+	cityPath := t.TempDir()
+	rigRoot := filepath.Join(cityPath, "rigs", "qcore")
+	candidatePath := filepath.Join(cityPath, ".gc", "worktrees", "qcore", "qc-unowned1")
+	if err := os.MkdirAll(candidatePath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	store := beads.NewMemStoreFrom(1, []beads.Bead{{ID: "qc-unowned1", Status: "closed"}}, nil)
+	cfg := &config.City{Workspace: config.Workspace{Name: "test", Prefix: "ga"}, Rigs: []config.Rig{{Name: "qcore", Prefix: "qc", Path: rigRoot}}}
+	rigGit := &fakeBeadWorktreeGit{isRepo: true, worktrees: []git.Worktree{{Path: candidatePath, Branch: "refs/heads/polecat/qc-unowned1"}}}
+	orig := newBeadWorktreeGitProbe
+	defer func() { newBeadWorktreeGitProbe = orig }()
+	newBeadWorktreeGitProbe = func(string) beadWorktreeGitProbe { return rigGit }
+	var output bytes.Buffer
+	reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{"qcore": store}, nil, nil, &output, true, false)
+	if !strings.Contains(output.String(), "action=would-skip") || strings.Contains(output.String(), "indeterminate") {
+		t.Fatalf("output = %q, want deterministic would-skip", output.String())
+	}
+	if rigGit.movedFrom != "" || rigGit.removedPath != "" {
+		t.Fatalf("unavailable snapshot mutated worktree: move=%q remove=%q", rigGit.movedFrom, rigGit.removedPath)
 	}
 }

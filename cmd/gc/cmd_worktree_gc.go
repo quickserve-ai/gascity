@@ -42,7 +42,7 @@ func newWorktreeGCCmd(stdout, stderr io.Writer) *cobra.Command {
 				stores[rig.Name] = store
 			}
 			fmt.Fprintln(stdout, "Worktree GC preview (no files will be changed; recorded session owners are skipped when liveness is unavailable):") //nolint:errcheck
-			reapClosedBeadWorktrees(cityPath, cfg, stores, nil, nil, stdout, true)
+			reapClosedBeadWorktrees(cityPath, cfg, stores, nil, nil, stdout, true, false)
 			return nil
 		},
 	}
