@@ -164,8 +164,28 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 				Choices: []BuiltinOptionChoice{
 					{Value: "", Label: "Default"},
 					{Value: "fable-5", Label: "Fable 5", FlagArgs: []string{"--model", "claude-fable-5"}, FlagAliases: [][]string{{"-m", "claude-fable-5"}}},
-					{Value: "opus", Label: "Opus", FlagArgs: []string{"--model", "claude-opus-4-8"}, FlagAliases: [][]string{{"-m", "claude-opus-4-8"}}},
+					// "opus" tracks the CURRENT Opus generation at the 1M context window
+					// through the CLI's own family alias + [1m] suffix, NOT a dated model
+					// ID (Cherub 2026-07-28: agents should "default to the latest version
+					// of opus ... on start"). A hardcoded generation has now gone stale
+					// under the fleet twice — sonnet-4-6 (ga-w8e27) and opus-4-8 here,
+					// after Opus 5 shipped — so the alias is the durable fix: the CLI
+					// resolves the newest Opus at spawn time. The [1m] suffix preserves
+					// the 1M window the dated opus-4-8 pin gave us; without it the alias
+					// lands on the 200k tier. Brackets are safe through gc's quoting
+					// layer: shellquote treats [ and ] as metacharacters and single-quotes
+					// the arg, and StripFlags re-splits before comparing tokens, so
+					// restart/override paths still match and don't duplicate the flag.
+					// The dated pins below stay for determinism and rollback.
+					{Value: "opus", Label: "Opus (latest, 1M)", FlagArgs: []string{"--model", "opus[1m]"}, FlagAliases: [][]string{{"-m", "opus[1m]"}}},
+					{Value: "opus-5", Label: "Opus 5", FlagArgs: []string{"--model", "claude-opus-5[1m]"}, FlagAliases: [][]string{{"-m", "claude-opus-5[1m]"}}},
+					{Value: "opus-4-8", Label: "Opus 4.8", FlagArgs: []string{"--model", "claude-opus-4-8"}, FlagAliases: [][]string{{"-m", "claude-opus-4-8"}}},
 					{Value: "opus-4-7", Label: "Opus 4.7", FlagArgs: []string{"--model", "claude-opus-4-7"}, FlagAliases: [][]string{{"-m", "claude-opus-4-7"}}},
+					// "sonnet" tracks the current Sonnet generation, same as "opus"
+					// tracks latest above; "sonnet-4-6" is the explicit pin for the prior
+					// generation, same pattern as "opus-4-8"/"opus-4-7" (ga-w8e27 sweep,
+					// 2026-07-21: this choice was still pointing at claude-sonnet-4-6, a
+					// stale generation, while "opus" then tracked the current 4.8).
 					{Value: "sonnet", Label: "Sonnet", FlagArgs: []string{"--model", "claude-sonnet-5"}, FlagAliases: [][]string{{"-m", "claude-sonnet-5"}}},
 					{Value: "sonnet-5", Label: "Sonnet 5", FlagArgs: []string{"--model", "claude-sonnet-5"}, FlagAliases: [][]string{{"-m", "claude-sonnet-5"}}},
 					{Value: "sonnet-4-6", Label: "Sonnet 4.6", FlagArgs: []string{"--model", "claude-sonnet-4-6"}, FlagAliases: [][]string{{"-m", "claude-sonnet-4-6"}}},
