@@ -274,3 +274,66 @@ func withHookStdin(t *testing.T, data []byte) {
 		_ = r.Close()
 	})
 }
+
+func TestContextWindowTokensClaudeOpus5WithEmptySidecar(t *testing.T) {
+	t.Setenv("GC_CONTEXT_WINDOW_TOKENS", "")
+	t.Setenv("GC_CONTEXT_LAUNCH_MODEL", "")
+	if got := contextWindowTokensWithOverride([]string{"claude-opus-5", ""}, 0); got != 1_000_000 {
+		t.Fatalf("contextWindowTokensWithOverride(opus-5 + empty) = %d, want 1000000", got)
+	}
+}
+
+func TestContextInjectUsesLaunchModelWhenTranscriptLosesSuffix(t *testing.T) {
+	t.Setenv("GC_INJECT_CONTEXT", "")
+	t.Setenv("GC_CONTEXT_WINDOW_TOKENS", "")
+	t.Setenv("GC_CONTEXT_LAUNCH_MODEL", "opus[1m]")
+	p := writeTranscript(t, usageLine("future-resolved-model", 10_000, 190_000, 10_000))
+	if got := contextInjectLine(hookInputFor(p)); got != "" {
+		t.Fatalf("200k of a launch-declared 1M session should be below advisory, got %q", got)
+	}
+}
+
+func TestLaunchModelFromCommand(t *testing.T) {
+	for _, tc := range []struct {
+		command string
+		want    string
+	}{
+		{command: "claude --model 'opus[1m]' --settings /tmp/settings.json", want: "opus[1m]"},
+		{command: "claude --model=claude-sonnet-5", want: "claude-sonnet-5"},
+		{command: "claude --settings /tmp/settings.json", want: ""},
+	} {
+		if got := launchModelFromCommand(tc.command); got != tc.want {
+			t.Errorf("launchModelFromCommand(%q) = %q, want %q", tc.command, got, tc.want)
+		}
+	}
+}
+
+// An unrecognized model (modelwindow.Window == 0) floors to the conservative
+// default and is named on stderr once per resolution, however many transcript
+// entries repeat it.
+func TestContextWindowTokensWarnsForUnrecognizedModel(t *testing.T) {
+	t.Setenv("GC_CONTEXT_WINDOW_TOKENS", "")
+	t.Setenv("GC_CONTEXT_LAUNCH_MODEL", "")
+	var warnings strings.Builder
+	original := contextWindowWarningWriter
+	contextWindowWarningWriter = &warnings
+	t.Cleanup(func() { contextWindowWarningWriter = original })
+
+	if got := contextWindowTokensWithOverride([]string{"future-unknown-model", "future-unknown-model"}, 0); got != 200_000 {
+		t.Fatalf("unknown model window = %d, want conservative 200000", got)
+	}
+	if !strings.Contains(warnings.String(), "future-unknown-model") || !strings.Contains(warnings.String(), "defaulting to 200000") {
+		t.Fatalf("warning = %q, want model and fallback", warnings.String())
+	}
+	if n := strings.Count(warnings.String(), "unrecognized model"); n != 1 {
+		t.Fatalf("warning = %q, want exactly one line for a repeated model, got %d", warnings.String(), n)
+	}
+}
+
+func TestStampContextLaunchModel(t *testing.T) {
+	env := map[string]string{}
+	stampContextLaunchModel(env, "claude --model 'opus[1m]'")
+	if got := env["GC_CONTEXT_LAUNCH_MODEL"]; got != "opus[1m]" {
+		t.Fatalf("GC_CONTEXT_LAUNCH_MODEL = %q, want opus[1m]", got)
+	}
+}
