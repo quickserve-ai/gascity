@@ -1151,8 +1151,12 @@ func (cr *CityRuntime) tick(
 	}
 	if cr.cfg.Daemon.AutoReapClosedBeadWorktreesEnabled() {
 		phaseStart = time.Now()
-		beadWorktreesReaped := reapClosedBeadWorktrees(cr.cityPath, cr.cfg, cr.rigBeadStores(), cr.rec, cr.stderr)
-		recordPhase(TraceSiteControllerTickPhase, "reap_closed_bead_worktrees", phaseStart, map[string]any{"reaped": beadWorktreesReaped})
+		if sessionErr := sessionBeads.LoadError(); sessionErr != nil {
+			fmt.Fprintf(cr.stderr, "reapClosedBeadWorktrees: skipping pass: session snapshot degraded: %v\n", sessionErr) //nolint:errcheck
+		} else {
+			beadWorktreesReaped := reapClosedBeadWorktrees(cr.cityPath, cr.cfg, cr.rigBeadStores(), cr.sp, cr.rec, cr.stderr, false, sessionBeads.Open()...)
+			recordPhase(TraceSiteControllerTickPhase, "reap_closed_bead_worktrees", phaseStart, map[string]any{"reaped": beadWorktreesReaped})
+		}
 		phaseStart = time.Now()
 		agentHomesReset := cleanupClosedBeadAgentHomeWorktrees(cr.cityPath, cr.cfg, cr.rigBeadStores(), cr.stderr)
 		recordPhase(TraceSiteControllerTickPhase, "cleanup_agent_home_worktrees", phaseStart, map[string]any{"reset": agentHomesReset})

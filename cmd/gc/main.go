@@ -379,6 +379,7 @@ func newRootCmdWithOptions(stdout, stderr io.Writer, options rootCommandOptions)
 		newLoginCmd(stdout, stderr),
 		newWhoamiCmd(stdout, stderr),
 		newLogoutCmd(stdout, stderr),
+		newWorktreeGCCmd(stdout, stderr),
 	)
 	// gen-doc needs the root command to walk the tree; add after construction.
 	root.AddCommand(newGenDocCmd(stdout, stderr, root))
