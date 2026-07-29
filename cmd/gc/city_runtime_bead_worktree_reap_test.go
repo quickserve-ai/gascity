@@ -128,9 +128,9 @@ func TestCityRuntimeTick_AttemptsClosedBeadWorktreeReapWhenEnabled(t *testing.T)
 	var prevPoolRunning map[string]bool
 	cr.tick(context.Background(), &dirty, &lastProviderName, cityPath, &prevPoolRunning, "test")
 
-	// The reaper logs "reapClosedBeadWorktrees: skipping ..." because the
-	// non-git dir is treated as dirty. This proves the gate fires when enabled.
-	if !strings.Contains(stderr.String(), "reapClosedBeadWorktrees: skipping") {
-		t.Errorf("stderr = %q, want reaper skipping-log proving gate fires when enabled", stderr.String())
+	// The configured reaper reached the worktree-GC phase and failed closed
+	// because this isolated fixture deliberately has no bound rig root.
+	if !strings.Contains(stderr.String(), "skipping rig mrig: owning rig root unresolved") {
+		t.Errorf("stderr = %q, want unresolved-rig skip proving the enabled reaper ran", stderr.String())
 	}
 }

@@ -3,17 +3,215 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io"
-	"os"
-	"path/filepath"
-	"strings"
-
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/git"
+	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/sling"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
 )
+
+type beadWorktreeCandidate struct {
+	Rig    string
+	BeadID string
+	Path   string
+}
+
+// discoverBeadWorktreeCandidates finds only the two layouts Gas City creates:
+// direct per-bead worktrees and polecat-home/worktrees/<bead-id>. It does not
+// perform an unrestricted recursive scan, so main, refinery, staging, and
+// arbitrary nested directories never become removal candidates.
+func discoverBeadWorktreeCandidates(cityPath string, cfg *config.City, rigName string) []beadWorktreeCandidate {
+	if cfg == nil || rigName == "" {
+		return nil
+	}
+	rigRoot := filepath.Join(cityPath, ".gc", "worktrees", rigName)
+	protectedHomes := make(map[string]bool, len(cfg.Agents)*2)
+	for i := range cfg.Agents {
+		protectedHomes[cfg.Agents[i].Name] = true
+		protectedHomes[cfg.Agents[i].BindingQualifiedName()] = true
+	}
+	var candidates []beadWorktreeCandidate
+	addChildren := func(parent string) {
+		entries, err := os.ReadDir(parent)
+		if err != nil {
+			return
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
+				continue
+			}
+			if protectedHomes[entry.Name()] {
+				continue
+			}
+			beadID := extractBeadIDFromWorktreeName(cfg, entry.Name())
+			if beadID == "" {
+				continue
+			}
+			if entry.Name() != beadID {
+				continue
+			}
+			path := filepath.Join(parent, entry.Name())
+			if !isStrictlyUnderDir(rigRoot, path) {
+				continue
+			}
+			candidates = append(candidates, beadWorktreeCandidate{Rig: rigName, BeadID: beadID, Path: path})
+		}
+	}
+
+	addChildren(rigRoot)
+	polecatRoot := filepath.Join(rigRoot, "polecats")
+	homes, err := os.ReadDir(polecatRoot)
+	if err != nil {
+		return candidates
+	}
+	for _, home := range homes {
+		if !home.IsDir() || home.Type()&os.ModeSymlink != 0 || strings.HasPrefix(home.Name(), ".gascity-worktree-stage.") {
+			continue
+		}
+		addChildren(filepath.Join(polecatRoot, home.Name(), "worktrees"))
+	}
+	return candidates
+}
+
+type beadWorktreeAction string
+
+const (
+	beadWorktreeSkip   beadWorktreeAction = "skip"
+	beadWorktreeRemove beadWorktreeAction = "remove"
+)
+
+type beadWorktreeDecision struct {
+	Candidate beadWorktreeCandidate
+	Bead      beads.Bead
+	Action    beadWorktreeAction
+	Reason    string
+	Branch    string
+}
+
+type beadWorktreeGitProbe interface {
+	IsRepo() bool
+	HasUncommittedWork() bool
+	HasUnpushedCommitsResult() (bool, error)
+	HasStashesResult() (bool, error)
+	CurrentBranch() (string, error)
+	WorktreeRemove(path string, force bool) error
+	WorktreeMove(oldPath, newPath string) error
+	WorktreeList() ([]git.Worktree, error)
+}
+
+var newBeadWorktreeGitProbe = func(path string) beadWorktreeGitProbe { return git.New(path) }
+
+func evaluateBeadWorktreeCandidate(candidate beadWorktreeCandidate, cityPath string, store beads.Store, sp runtime.Provider, wg beadWorktreeGitProbe) beadWorktreeDecision {
+	decision := beadWorktreeDecision{Candidate: candidate, Action: beadWorktreeSkip}
+	if store == nil {
+		decision.Reason = "bead store unavailable"
+		return decision
+	}
+	bead, err := store.Get(candidate.BeadID)
+	if err != nil {
+		decision.Reason = "bead lookup failed: " + err.Error()
+		return decision
+	}
+	decision.Bead = bead
+	if bead.Status != "closed" {
+		decision.Reason = "bead status is " + bead.Status
+		return decision
+	}
+	if !safeBeadWorktreePath(cityPath, candidate) {
+		decision.Reason = "path is not a real directory strictly contained by the rig worktree root"
+		return decision
+	}
+	sessionName := strings.TrimSpace(bead.Metadata["gc.session_name"])
+	if sessionName == "" {
+		sessionName = strings.TrimSpace(bead.Metadata["session_name"])
+	}
+	if sessionName != "" {
+		if sp == nil {
+			decision.Reason = "owning runtime liveness unavailable: " + sessionName
+			return decision
+		}
+		if sp.IsRunning(sessionName) {
+			decision.Reason = "owning runtime is live: " + sessionName
+			return decision
+		}
+	}
+	if wg == nil || !wg.IsRepo() {
+		decision.Reason = "candidate is not a registered git worktree"
+		return decision
+	}
+	branch, branchErr := wg.CurrentBranch()
+	if branchErr != nil {
+		decision.Reason = "branch probe failed: " + branchErr.Error()
+		return decision
+	}
+	decision.Branch = branch
+	unpushed, err := wg.HasUnpushedCommitsResult()
+	if err != nil {
+		decision.Reason = "unpushed probe failed: " + err.Error()
+		return decision
+	}
+	stashes, err := wg.HasStashesResult()
+	if err != nil {
+		decision.Reason = "stash probe failed: " + err.Error()
+		return decision
+	}
+	dirty := wg.HasUncommittedWork()
+	rejected := strings.TrimSpace(bead.Metadata["rejection_reason"]) != "" || strings.TrimSpace(bead.Metadata["gc.rejection_reason"]) != ""
+	resumePending := strings.TrimSpace(bead.Metadata["resume_pending"]) != "" || strings.TrimSpace(bead.Metadata["gc.resume_pending"]) != ""
+	if dirty || unpushed || stashes || rejected || resumePending {
+		decision.Reason = fmt.Sprintf("preserve checkout: dirty=%v unpushed=%v stashes=%v rejected=%v resume_pending=%v", dirty, unpushed, stashes, rejected, resumePending)
+		return decision
+	}
+	decision.Action = beadWorktreeRemove
+	decision.Reason = "closed and safe to remove"
+	return decision
+}
+
+func safeBeadWorktreePath(cityPath string, candidate beadWorktreeCandidate) bool {
+	rigRoot := filepath.Join(cityPath, ".gc", "worktrees", candidate.Rig)
+	info, err := os.Lstat(candidate.Path)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return false
+	}
+	canonicalRoot, err := filepath.EvalSymlinks(rigRoot)
+	if err != nil {
+		return false
+	}
+	canonicalPath, err := filepath.EvalSymlinks(candidate.Path)
+	if err != nil {
+		return false
+	}
+	return isStrictlyUnderDir(canonicalRoot, canonicalPath)
+}
+
+func registeredBeadWorktrees(wg beadWorktreeGitProbe) (map[string]string, error) {
+	worktrees, err := wg.WorktreeList()
+	if err != nil {
+		return nil, err
+	}
+	registered := make(map[string]string, len(worktrees))
+	for _, worktree := range worktrees {
+		canonical, err := filepath.EvalSymlinks(worktree.Path)
+		if err != nil {
+			continue
+		}
+		registered[canonical] = strings.TrimPrefix(worktree.Branch, "refs/heads/")
+	}
+	return registered, nil
+}
+
+func branchMatchesBead(cfg *config.City, branch, beadID string) bool {
+	if branch == "" || branch == "HEAD" {
+		return false
+	}
+	return beadIDFromBranch(cfg, branch) == beadID
+}
 
 // reapClosedBeadWorktrees scans per-bead git worktrees under
 // cityPath/.gc/worktrees/<rig>/ and removes any that are associated with a
@@ -24,8 +222,11 @@ func reapClosedBeadWorktrees(
 	cityPath string,
 	cfg *config.City,
 	rigBeadStores map[string]beads.Store,
+	sp runtime.Provider,
 	rec events.Recorder,
 	stderr io.Writer,
+	dryRun bool,
+	activeSessions ...beads.Bead,
 ) int {
 	if stderr == nil {
 		stderr = io.Discard
@@ -37,121 +238,158 @@ func reapClosedBeadWorktrees(
 		return 0
 	}
 
-	// Build a guard set of session home names so agent template directories
-	// are never touched.
-	sessionHomes := make(map[string]bool, len(cfg.Agents))
-	for i := range cfg.Agents {
-		if name := cfg.Agents[i].BindingQualifiedName(); name != "" {
-			sessionHomes[name] = true
-		}
-	}
-
-	wtRoot := filepath.Join(cityPath, ".gc", "worktrees")
 	reaped := 0
-
 	for rigName, store := range rigBeadStores {
 		if store == nil {
 			continue
 		}
-		rigWorktreeDir := filepath.Join(wtRoot, rigName)
-		entries, err := os.ReadDir(rigWorktreeDir)
-		if err != nil {
-			if !os.IsNotExist(err) {
-				fmt.Fprintf(stderr, "reapClosedBeadWorktrees: reading %s: %v\n", rigWorktreeDir, err) //nolint:errcheck
-			}
+		rigRoot := configuredRigRoot(cityPath, cfg, rigName)
+		if rigRoot == "" {
+			fmt.Fprintf(stderr, "reapClosedBeadWorktrees: skipping rig %s: owning rig root unresolved\n", rigName) //nolint:errcheck
 			continue
 		}
-		for _, entry := range entries {
-			if !entry.IsDir() {
+		rigGit := newBeadWorktreeGitProbe(rigRoot)
+		registered, registrationErr := registeredBeadWorktrees(rigGit)
+		for _, candidate := range discoverBeadWorktreeCandidates(cityPath, cfg, rigName) {
+			if live, reason := candidateOwnedByActiveSession(candidate, activeSessions, sp); live {
+				recordBeadWorktreeSkip(rec, stderr, candidate, reason)
 				continue
 			}
-			name := entry.Name()
-
-			// Session home guard: never touch agent template directories.
-			if sessionHomes[name] {
+			if registrationErr != nil {
+				recordBeadWorktreeSkip(rec, stderr, candidate, "worktree registration probe failed: "+registrationErr.Error())
 				continue
 			}
-
-			// Extract a bead ID candidate from the directory name.
-			beadID := extractBeadIDFromWorktreeName(cfg, name)
-			if beadID == "" {
+			canonicalCandidate, err := filepath.EvalSymlinks(candidate.Path)
+			if err != nil {
+				recordBeadWorktreeSkip(rec, stderr, candidate, "candidate canonicalization failed: "+err.Error())
 				continue
 			}
-
-			// Confirm the bead exists and is closed in this rig's store.
-			bead, err := store.Get(beadID)
-			if err != nil || bead.Status != "closed" {
-				// ErrNotFound, transient error, or bead not yet closed — skip.
+			registeredBranch, registeredOK := registered[canonicalCandidate]
+			if !registeredOK || !branchMatchesBead(cfg, registeredBranch, candidate.BeadID) {
+				recordBeadWorktreeSkip(rec, stderr, candidate, "candidate is not authoritatively registered to its bead branch")
 				continue
 			}
-
-			worktreePath := filepath.Join(rigWorktreeDir, name)
-
-			// Scope gate: only act on paths strictly under the worktree root.
-			if !isStrictlyUnderDir(wtRoot, worktreePath) {
+			initialInfo, err := os.Stat(candidate.Path)
+			if err != nil {
+				recordBeadWorktreeSkip(rec, stderr, candidate, "candidate identity probe failed: "+err.Error())
 				continue
 			}
-
-			// Safety checks: run from the worktree directory so git status
-			// and stash list apply to the worktree's branch.
-			wg := git.New(worktreePath)
-			hasUncommitted := wg.HasUncommittedWork()
-			hasUnpushed, _ := wg.HasUnpushedCommitsResult()
-			hasStashes, _ := wg.HasStashesResult()
-
-			if hasUncommitted || hasUnpushed || hasStashes {
-				reason := fmt.Sprintf("uncommitted=%v unpushed=%v stashes=%v", hasUncommitted, hasUnpushed, hasStashes)
-				fmt.Fprintf(stderr, //nolint:errcheck
-					"reapClosedBeadWorktrees: skipping %s (bead %s closed but unsafe: %s)\n",
-					worktreePath, beadID, reason,
-				)
-				if raw, err := json.Marshal(events.BeadWorktreeReapSkippedPayload{
-					BeadID: beadID,
-					Path:   worktreePath,
-					Rig:    rigName,
-					Reason: reason,
-				}); err == nil {
-					rec.Record(events.Event{
-						Type:    events.BeadWorktreeReapSkipped,
-						Actor:   "gc",
-						Subject: beadID,
-						Payload: raw,
-					})
-				}
+			decision := evaluateBeadWorktreeCandidate(candidate, cityPath, store, sp, newBeadWorktreeGitProbe(candidate.Path))
+			freshDecision := evaluateBeadWorktreeCandidate(candidate, cityPath, store, sp, newBeadWorktreeGitProbe(candidate.Path))
+			if freshDecision.Action != decision.Action || freshDecision.Action != beadWorktreeRemove {
+				recordBeadWorktreeSkip(rec, stderr, candidate, "candidate changed before mutation: "+freshDecision.Reason)
 				continue
 			}
-
-			// Capture branch before removal — the worktree dir will be gone after.
-			branch, _ := wg.CurrentBranch()
-
-			// Remove the worktree. git worktree remove must be run from the
-			// main repo root, not from within the worktree being removed.
-			mainRepo := git.New(cityPath)
-			if err := mainRepo.WorktreeRemove(worktreePath, false); err != nil {
-				fmt.Fprintf(stderr, "reapClosedBeadWorktrees: removing %s: %v\n", worktreePath, err) //nolint:errcheck
+			freshRegistered, freshRegistrationErr := registeredBeadWorktrees(rigGit)
+			currentInfo, currentStatErr := os.Stat(candidate.Path)
+			currentLstat, currentLstatErr := os.Lstat(candidate.Path)
+			if freshRegistrationErr != nil || currentStatErr != nil || currentLstatErr != nil || currentLstat.Mode()&os.ModeSymlink != 0 || !os.SameFile(initialInfo, currentInfo) || freshRegistered[canonicalCandidate] != registeredBranch {
+				recordBeadWorktreeSkip(rec, stderr, candidate, "candidate registration or filesystem identity changed before mutation")
 				continue
 			}
-			fmt.Fprintf(stderr, //nolint:errcheck
-				"reapClosedBeadWorktrees: removed worktree %s for closed bead %s\n",
-				worktreePath, beadID,
-			)
-			if raw, err := json.Marshal(events.BeadWorktreeReapedPayload{
-				BeadID: beadID,
-				Path:   worktreePath,
-				Rig:    rigName,
-				Branch: branch,
-			}); err == nil {
-				rec.Record(events.Event{
-					Type:    events.BeadWorktreeReaped,
-					Actor:   "gc",
-					Subject: beadID,
-					Payload: raw,
-				})
+			if dryRun {
+				fmt.Fprintf(stderr, "reapClosedBeadWorktrees: dry-run action=indeterminate candidate_action=%s path=%s bead=%s reason=runtime/session snapshot unavailable; candidate safety=%s\n", freshDecision.Action, candidate.Path, candidate.BeadID, freshDecision.Reason) //nolint:errcheck
+				continue
+			}
+			quarantinePath := candidate.Path + ".gc-reap-" + fmt.Sprintf("%d", time.Now().UnixNano())
+			if err := rigGit.WorktreeMove(candidate.Path, quarantinePath); err != nil {
+				recordBeadWorktreeSkip(rec, stderr, candidate, "worktree quarantine move failed: "+err.Error())
+				continue
+			}
+			quarantined, quarantineErr := registeredBeadWorktrees(rigGit)
+			canonicalQuarantine, canonicalQuarantineErr := filepath.EvalSymlinks(quarantinePath)
+			if quarantineErr != nil || canonicalQuarantineErr != nil || quarantined[canonicalQuarantine] != registeredBranch {
+				restoreErr := rigGit.WorktreeMove(quarantinePath, candidate.Path)
+				fmt.Fprintf(stderr, "reapClosedBeadWorktrees: quarantine verification failed for %s; restore=%v\n", candidate.Path, restoreErr) //nolint:errcheck
+				continue
+			}
+			quarantinedCandidate := candidate
+			quarantinedCandidate.Path = quarantinePath
+			if live, reason := candidateOwnedByActiveSession(quarantinedCandidate, activeSessions, sp); live {
+				restoreErr := rigGit.WorktreeMove(quarantinePath, candidate.Path)
+				fmt.Fprintf(stderr, "reapClosedBeadWorktrees: quarantined candidate became unsafe (%s); restore=%v\n", reason, restoreErr) //nolint:errcheck
+				continue
+			}
+			quarantineDecision := evaluateBeadWorktreeCandidate(quarantinedCandidate, cityPath, store, sp, newBeadWorktreeGitProbe(quarantinePath))
+			if quarantineDecision.Action != beadWorktreeRemove {
+				restoreErr := rigGit.WorktreeMove(quarantinePath, candidate.Path)
+				fmt.Fprintf(stderr, "reapClosedBeadWorktrees: quarantined candidate failed final safety check (%s); restore=%v\n", quarantineDecision.Reason, restoreErr) //nolint:errcheck
+				continue
+			}
+			if err := rigGit.WorktreeRemove(quarantinePath, false); err != nil {
+				restoreErr := rigGit.WorktreeMove(quarantinePath, candidate.Path)
+				fmt.Fprintf(stderr, "reapClosedBeadWorktrees: quarantined %s but removal failed: %v; restore=%v\n", candidate.Path, err, restoreErr) //nolint:errcheck
+				continue
+			}
+			fmt.Fprintf(stderr, "reapClosedBeadWorktrees: removed worktree %s for closed bead %s\n", candidate.Path, candidate.BeadID) //nolint:errcheck
+			if raw, err := json.Marshal(events.BeadWorktreeReapedPayload{BeadID: candidate.BeadID, Path: candidate.Path, Rig: rigName, Branch: freshDecision.Branch}); err == nil {
+				rec.Record(events.Event{Type: events.BeadWorktreeReaped, Actor: "gc", Subject: candidate.BeadID, Payload: raw})
 			}
 			reaped++
 		}
 	}
 	return reaped
+}
+
+func configuredRigRoot(cityPath string, cfg *config.City, rigName string) string {
+	for i := range cfg.Rigs {
+		if cfg.Rigs[i].Name != rigName {
+			continue
+		}
+		path := strings.TrimSpace(cfg.Rigs[i].Path)
+		if path == "" {
+			return ""
+		}
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(cityPath, path)
+		}
+		return filepath.Clean(path)
+	}
+	return ""
+}
+
+func candidateOwnedByActiveSession(candidate beadWorktreeCandidate, sessions []beads.Bead, sp runtime.Provider) (bool, string) {
+	canonicalCandidate, err := filepath.EvalSymlinks(candidate.Path)
+	if err != nil {
+		return true, "candidate path liveness check failed: " + err.Error()
+	}
+	for _, session := range sessions {
+		workDir := strings.TrimSpace(session.Metadata["work_dir"])
+		if workDir == "" {
+			continue
+		}
+		canonicalWorkDir, err := filepath.EvalSymlinks(workDir)
+		if err != nil {
+			continue
+		}
+		rel, err := filepath.Rel(canonicalWorkDir, canonicalCandidate)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			continue
+		}
+		sessionName := strings.TrimSpace(session.Metadata["session_name"])
+		if sp == nil || sessionName == "" || sp.IsRunning(sessionName) {
+			return true, "candidate belongs to active or unverifiable session path: " + sessionName
+		}
+	}
+	return false, ""
+}
+
+func beadWorktreeOwnerIsLive(bead beads.Bead, sp runtime.Provider) bool {
+	if sp == nil {
+		return false
+	}
+	sessionName := strings.TrimSpace(bead.Metadata["gc.session_name"])
+	if sessionName == "" {
+		sessionName = strings.TrimSpace(bead.Metadata["session_name"])
+	}
+	return sessionName != "" && sp.IsRunning(sessionName)
+}
+
+func recordBeadWorktreeSkip(rec events.Recorder, stderr io.Writer, candidate beadWorktreeCandidate, reason string) {
+	fmt.Fprintf(stderr, "reapClosedBeadWorktrees: skipping %s (bead %s: %s)\n", candidate.Path, candidate.BeadID, reason) //nolint:errcheck
+	if raw, err := json.Marshal(events.BeadWorktreeReapSkippedPayload{BeadID: candidate.BeadID, Path: candidate.Path, Rig: candidate.Rig, Reason: reason}); err == nil {
+		rec.Record(events.Event{Type: events.BeadWorktreeReapSkipped, Actor: "gc", Subject: candidate.BeadID, Payload: raw})
+	}
 }
 
 // extractBeadIDFromWorktreeName scans consecutive dash-separated segment pairs

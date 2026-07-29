@@ -76,6 +76,7 @@ gc [flags]
 | [gc unregister](#gc-unregister) | Remove a city from the machine-wide supervisor |
 | [gc version](#gc-version) | Print gc version |
 | [gc wait](#gc-wait) | Inspect and manage durable session waits |
+| [gc worktree-gc](#gc-worktree-gc) | Preview closed-bead worktree reclamation |
 
 ## gc agent
 
@@ -3772,7 +3773,7 @@ gc sling [target] <bead-or-formula-or-text> [flags]
 | `--force` | bool |  | suppress warnings, allow cross-rig routing, allow formulas v2 workflow replacement, and for direct bead routes dispatch even if the bead does not resolve in the local store |
 | `-f`, `--formula` | bool |  | treat argument as formula name |
 | `--json` | bool |  | Output dispatch result in JSON format |
-| `--merge` | string |  | merge strategy: direct, mr, or local |
+| `--merge` | string |  | merge strategy: direct, pr, mr, or local |
 | `--no-convoy` | bool |  | skip auto-convoy creation |
 | `--no-formula` | bool |  | suppress default formula (route raw bead) |
 | `--nudge` | bool |  | nudge target after routing |
@@ -4239,3 +4240,11 @@ gc wait ready <wait-id> [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--json` | bool |  | Output in JSONL format |
+
+## gc worktree-gc
+
+Preview closed-bead worktree reclamation
+
+```
+gc worktree-gc
+```
