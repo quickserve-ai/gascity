@@ -476,6 +476,7 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 	env := mergeEnv(passthroughEnv(), expandEnvMap(workspaceEnv), expandEnvMap(resolved.Env), expandEnvMap(cfgAgent.Env), agentEnv)
 	processenv.PrependGCBinDirToPATH(env, env["GC_BIN"])
 	env = convergence.ScrubTokenEnv(env)
+	stampContextLaunchModel(env, command)
 
 	// Step 10b: Upstream axis (Phase C). Inject the selected upstream's serving
 	// env LAST so it is authoritative for the model-serving keys, and after
@@ -760,6 +761,15 @@ func isOperationalScript(rel string) bool {
 		}
 	}
 	return false
+}
+
+func stampContextLaunchModel(env map[string]string, command string) {
+	if env == nil {
+		return
+	}
+	if model := launchModelFromCommand(command); model != "" {
+		env["GC_CONTEXT_LAUNCH_MODEL"] = model
+	}
 }
 
 func installHooksIncludeFamily(installHooks []string, family string, providers map[string]config.ProviderSpec) bool {
