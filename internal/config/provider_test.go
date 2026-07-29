@@ -2,7 +2,10 @@ package config
 
 import (
 	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/gastownhall/gascity/internal/shellquote"
 )
 
 func TestBuiltinProviders(t *testing.T) {
@@ -73,6 +76,8 @@ func TestBuiltinProvidersClaude(t *testing.T) {
 func TestBuiltinProvidersClaudeModelChoices(t *testing.T) {
 	p := BuiltinProviders()["claude"]
 	var model OptionChoice
+	var opus5 OptionChoice
+	var opus48 OptionChoice
 	var oldOpus OptionChoice
 	for _, opt := range p.OptionsSchema {
 		if opt.Key != "model" {
@@ -82,16 +87,76 @@ func TestBuiltinProvidersClaudeModelChoices(t *testing.T) {
 			switch choice.Value {
 			case "opus":
 				model = choice
+			case "opus-5":
+				opus5 = choice
+			case "opus-4-8":
+				opus48 = choice
 			case "opus-4-7":
 				oldOpus = choice
 			}
 		}
 	}
-	if !reflect.DeepEqual(model.FlagArgs, []string{"--model", "claude-opus-4-8"}) {
-		t.Fatalf("opus FlagArgs = %v, want Opus 4.8", model.FlagArgs)
+	// "opus" must stay a generation-tracking alias, not a dated ID: the fleet's
+	// providers select model = "opus" and are expected to land on the newest Opus
+	// at spawn, at the 1M window.
+	if !reflect.DeepEqual(model.FlagArgs, []string{"--model", "opus[1m]"}) {
+		t.Fatalf("opus FlagArgs = %v, want the latest-Opus 1M alias", model.FlagArgs)
+	}
+	if !reflect.DeepEqual(opus5.FlagArgs, []string{"--model", "claude-opus-5[1m]"}) {
+		t.Fatalf("opus-5 FlagArgs = %v, want Opus 5 pinned at 1M", opus5.FlagArgs)
+	}
+	if !reflect.DeepEqual(opus48.FlagArgs, []string{"--model", "claude-opus-4-8"}) {
+		t.Fatalf("opus-4-8 FlagArgs = %v, want Opus 4.8 preserved for rollback", opus48.FlagArgs)
 	}
 	if !reflect.DeepEqual(oldOpus.FlagArgs, []string{"--model", "claude-opus-4-7"}) {
 		t.Fatalf("opus-4-7 FlagArgs = %v, want Opus 4.7 preserved", oldOpus.FlagArgs)
+	}
+}
+
+// Live sessions carry a command string baked at creation time, so the fleet only
+// moves to a new Opus generation if a restart STRIPS the old dated --model flag
+// before re-applying the resolved one. That works because the superseded dated
+// pins stay in the schema (and therefore in the strip list) — dropping them
+// would leave restarts with two --model flags. Also guards the [1m] suffix's
+// shell round-trip: brackets are quoted on the way out and re-split on the way
+// back in, so the flag still matches on the next restart.
+func TestReplaceSchemaFlagsMigratesDatedOpusPinToAlias(t *testing.T) {
+	p := BuiltinProviders()["claude"]
+	rp := &ResolvedProvider{
+		Command:       p.Command,
+		Args:          p.Args,
+		OptionsSchema: p.OptionsSchema,
+		EffectiveDefaults: ComputeEffectiveDefaults(p.OptionsSchema, p.OptionDefaults,
+			map[string]string{"model": "opus", "effort": "xhigh"}),
+	}
+
+	// Exactly the shape a qcore claude-opus session command has on disk today.
+	live := `claude --dangerously-skip-permissions --effort xhigh --model claude-opus-4-8 --settings /Users/cherub/gascity/.gc/settings.json`
+
+	got := ReplaceSchemaFlags(live, p.OptionsSchema, rp.ResolveDefaultArgs())
+
+	if strings.Contains(got, "claude-opus-4-8") {
+		t.Fatalf("restart command = %q, stale dated Opus pin survived the strip", got)
+	}
+	if n := strings.Count(got, "--model"); n != 1 {
+		t.Fatalf("restart command = %q, want exactly one --model flag, got %d", got, n)
+	}
+	tokens := shellquote.Split(got)
+	var model string
+	for i, tok := range tokens {
+		if tok == "--model" && i+1 < len(tokens) {
+			model = tokens[i+1]
+		}
+	}
+	if model != "opus[1m]" {
+		t.Fatalf("restart command = %q, resolved model token = %q, want opus[1m]", got, model)
+	}
+	// Flags the schema does not own must survive untouched.
+	if !strings.Contains(got, "--settings") || !strings.Contains(got, ".gc/settings.json") {
+		t.Fatalf("restart command = %q, non-schema --settings flag was dropped", got)
+	}
+	if !strings.Contains(got, "--effort xhigh") {
+		t.Fatalf("restart command = %q, want --effort xhigh preserved", got)
 	}
 }
 
