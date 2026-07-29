@@ -7,6 +7,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/gastownhall/gascity/internal/shellquote"
 )
 
 // Context-usage injection — the context-pressure sibling of clock_inject.go.
@@ -45,6 +47,8 @@ import (
 type hookStdinInput struct {
 	TranscriptPath string `json:"transcript_path"`
 }
+
+var contextWindowWarningWriter io.Writer = os.Stderr
 
 // transcriptUsage is the usage block shape inside provider transcript entries.
 type transcriptUsage struct {
@@ -123,21 +127,29 @@ func lastTranscriptUsage(path string) (tokens int, models []string, ok bool) {
 }
 
 // contextWindowTokens resolves the session's context window as the MAX window
-// of any model it ran (they share one context), so a 200k-window sidecar or
-// compaction call (e.g. a bare claude-opus-4-8 entry inside a Fable session)
-// can't flip a 1M session to the 200k default and fire the urgent tier at
-// ~20% of real usage. GC_CONTEXT_WINDOW_TOKENS overrides — gc-managed
-// deployments that know the launch model should pin it for determinism.
+// of the launch model and every model recorded in the transcript. Including
+// GC_CONTEXT_LAUNCH_MODEL closes the launch/transcript mismatch where a CLI
+// alias such as opus[1m] is recorded as a resolved model ID without its [1m]
+// suffix. A 200k-window sidecar still cannot shrink a 1M session.
 func contextWindowTokens(models []string) int {
 	if v := strings.TrimSpace(os.Getenv("GC_CONTEXT_WINDOW_TOKENS")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			return n
 		}
 	}
+	allModels := make([]string, 0, len(models)+1)
+	if launchModel := strings.TrimSpace(os.Getenv("GC_CONTEXT_LAUNCH_MODEL")); launchModel != "" {
+		allModels = append(allModels, launchModel)
+	}
+	allModels = append(allModels, models...)
 	best := 0
-	for _, m := range models {
-		if w := classifyWindow(m); w > best {
-			best = w
+	for _, model := range allModels {
+		window, recognized := classifiedWindow(model)
+		if !recognized && strings.TrimSpace(model) != "" {
+			fmt.Fprintf(contextWindowWarningWriter, "gc context: unrecognized model %q; defaulting to 200000 context tokens\n", model) //nolint:errcheck
+		}
+		if window > best {
+			best = window
 		}
 	}
 	if best == 0 {
@@ -146,20 +158,47 @@ func contextWindowTokens(models []string) int {
 	return best
 }
 
-// classifyWindow maps one model string to its context window. 1M families:
-// Opus 4.6/4.7/4.8, Sonnet 4.6, Fable, Mythos, and an explicit [1m] launch
-// suffix; everything else (Haiku, older models, unrecognized) is a
-// conservative 200k. Kept simple/substring rather than a strict table so a
-// dated-suffix variant still matches; pin GC_CONTEXT_WINDOW_TOKENS when a new
-// model's window isn't yet recognized here.
+// classifyWindow maps one model string to its context window. It intentionally
+// uses family substrings so dated variants continue to match.
 func classifyWindow(model string) int {
-	ml := strings.ToLower(model)
-	for _, s := range []string{"[1m]", "fable", "mythos", "opus-4-6", "opus-4-7", "opus-4-8", "sonnet-4-6"} {
-		if strings.Contains(ml, s) {
-			return 1_000_000
+	window, _ := classifiedWindow(model)
+	return window
+}
+
+func classifiedWindow(model string) (int, bool) {
+	ml := strings.ToLower(strings.TrimSpace(model))
+	if ml == "" {
+		return 200_000, true
+	}
+	for _, family := range []string{"[1m]", "fable", "mythos", "opus-5", "sonnet-5", "opus-4-6", "opus-4-7", "opus-4-8", "sonnet-4-6"} {
+		if strings.Contains(ml, family) {
+			return 1_000_000, true
 		}
 	}
-	return 200_000
+	for _, family := range []string{"haiku", "opus-", "sonnet-", "claude-3"} {
+		if strings.Contains(ml, family) {
+			return 200_000, true
+		}
+	}
+	return 200_000, false
+}
+
+// launchModelFromCommand extracts the effective --model value from the
+// resolved provider command. shellquote.Split round-trips gc's own command
+// rendering, including quoted aliases such as opus[1m]. Last flag wins.
+func launchModelFromCommand(command string) string {
+	args := shellquote.Split(command)
+	model := ""
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--model" && i+1 < len(args):
+			model = args[i+1]
+			i++
+		case strings.HasPrefix(args[i], "--model="):
+			model = strings.TrimPrefix(args[i], "--model=")
+		}
+	}
+	return model
 }
 
 // contextUsageMessage renders the guidance line for tokens used of window, or

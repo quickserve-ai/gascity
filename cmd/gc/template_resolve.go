@@ -417,6 +417,7 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 	env := mergeEnv(passthroughEnv(), expandEnvMap(workspaceEnv), expandEnvMap(resolved.Env), expandEnvMap(cfgAgent.Env), agentEnv)
 	prependGCBinDirToPATH(env, env["GC_BIN"])
 	env = convergence.ScrubTokenEnv(env)
+	stampContextLaunchModel(env, command)
 
 	// Interactive tmux TUI agents render monochrome even with a clean color
 	// env. The ga-od2 ~/.tmux.conf band-aid scrubs the NO_COLOR=1 / TERM=dumb
@@ -634,6 +635,15 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 	params.SessionOverride = cfgAgent.Session
 	params.EffectiveSessionProvider = effectiveSessionProvider(cfgAgent.Session, p.sessionProvider)
 	return params, nil
+}
+
+func stampContextLaunchModel(env map[string]string, command string) {
+	if env == nil {
+		return
+	}
+	if model := launchModelFromCommand(command); model != "" {
+		env["GC_CONTEXT_LAUNCH_MODEL"] = model
+	}
 }
 
 func installHooksIncludeFamily(installHooks []string, family string, providers map[string]config.ProviderSpec) bool {

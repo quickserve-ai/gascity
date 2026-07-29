@@ -48,6 +48,7 @@ guess — prove with `git patch-id` / `git range-diff` + behavior check.
 | Formula scope (ga-96qs) | cafc02918 | Formula scope resolution honors the GC_RIG env — without it, rig-scoped formula steps resolved against the city and dispatched to the wrong refinery. | Upstream equivalent. |
 | Reconciler crash policy (ga-9n5hj, ga-2aq43) | 845d3280f | Lazy FPExtra drift (prompt-only config edits never restart a live session); eager drift restarts budgeted 2/tick with a `session.config_drift_wave` event; stale continuation-reset markers self-heal on demonstrably healthy runtimes. Regression suite: `cmd/gc/session_reconciler_crash_policy_test.go`. The 2026-07-18 crash rolled ~17 sessions at once and cycled the tmux server. | Upstream absorbs drift laziness + stagger (verify the crash-policy suite passes unmodified). |
 | Drift-wave mail (ga-9n5hj residual) | eec80cd99 | Wave notices mailed once per wave to `[session] drift_wave_notify` (city.toml sets `gastown.mayor` per the 2026-07-20 Mayor ruling); 1h renotify, re-armed on quiet ticks. | Upstream equivalent notify path. |
+| Context-window guidance (ga-pipu6) | 0443acce0 | Recognize Claude 5 1M families, stamp the resolved launch model into hook env, and warn on unknown-model fallback. Without the launch model, resolved transcript IDs silently fell back to 200k and told 1M Opus agents to recycle at ~20%. | Upstream derives context guidance from authoritative launch metadata and recognizes current Claude context windows. |
 
 ## Deploy recipe
 
