@@ -49,6 +49,8 @@ type hookStdinInput struct {
 	TranscriptPath string `json:"transcript_path"`
 }
 
+var contextWindowWarningWriter io.Writer = os.Stderr
+
 // transcriptUsage is the usage block shape inside provider transcript entries.
 type transcriptUsage struct {
 	InputTokens              int `json:"input_tokens"`
@@ -136,15 +138,19 @@ func lastTranscriptUsage(path string) (tokens int, models []string, ok bool) {
 }
 
 // contextWindowTokensWithOverride resolves the session's context window as the
-// MAX window of any model it ran (they share one context), so a smaller-window
-// sidecar or compaction call (e.g. a 200k-window Haiku entry inside a 1M Fable
-// session) can't flip the session to the 200k default and fire the urgent tier
-// at ~20% of real usage. Per-model windows come from the shared modelwindow
-// package so this agrees with the API/session-log path; an unrecognized model
-// (window 0) floors to the conservative default. GC_CONTEXT_WINDOW_TOKENS
-// overrides first — gc-managed deployments that know the launch model should
-// pin it for determinism — then configuredWindow, the advisory policy's
-// window_tokens, when non-zero.
+// MAX window of the launch model and every model the session ran (they share
+// one context), so a smaller-window sidecar or compaction call (e.g. a
+// 200k-window Haiku entry inside a 1M Fable session) can't flip the session to
+// the 200k default and fire the urgent tier at ~20% of real usage. Per-model
+// windows come from the shared modelwindow package so this agrees with the
+// API/session-log path. GC_CONTEXT_LAUNCH_MODEL, stamped from the launch
+// command's --model (ga-pipu6), joins the transcript models: it closes the
+// launch/transcript mismatch where a CLI alias such as opus[1m] is recorded as
+// a resolved model ID without its [1m] suffix. An unrecognized model (window 0)
+// is named once on stderr and floors to the conservative default when nothing
+// else is recognized. GC_CONTEXT_WINDOW_TOKENS overrides first — gc-managed
+// deployments that know the launch model should pin it for determinism — then
+// configuredWindow, the advisory policy's window_tokens, when non-zero.
 func contextWindowTokensWithOverride(models []string, configuredWindow int) int {
 	if v := strings.TrimSpace(os.Getenv("GC_CONTEXT_WINDOW_TOKENS")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -154,9 +160,20 @@ func contextWindowTokensWithOverride(models []string, configuredWindow int) int 
 	if configuredWindow > 0 {
 		return configuredWindow
 	}
+	allModels := make([]string, 0, len(models)+1)
+	if launchModel := strings.TrimSpace(os.Getenv("GC_CONTEXT_LAUNCH_MODEL")); launchModel != "" {
+		allModels = append(allModels, launchModel)
+	}
+	allModels = append(allModels, models...)
 	best := 0
-	for _, m := range models {
-		if w := modelwindow.Window(m); w > best {
+	warned := make(map[string]bool)
+	for _, m := range allModels {
+		w := modelwindow.Window(m)
+		if name := strings.TrimSpace(m); w == 0 && name != "" && !warned[name] {
+			warned[name] = true
+			fmt.Fprintf(contextWindowWarningWriter, "gc context: unrecognized model %q; defaulting to %d context tokens\n", name, modelwindow.Default) //nolint:errcheck // best-effort diagnostic
+		}
+		if w > best {
 			best = w
 		}
 	}
@@ -164,6 +181,15 @@ func contextWindowTokensWithOverride(models []string, configuredWindow int) int 
 		return modelwindow.Default
 	}
 	return best
+}
+
+// launchModelFromCommand extracts the effective --model value from the
+// resolved provider command (config.LaunchModelFromCommand: shellquote.Split
+// round-trips gc's own command rendering, including quoted aliases such as
+// opus[1m]; last flag wins). stampContextLaunchModel stamps it into the
+// session env as GC_CONTEXT_LAUNCH_MODEL.
+func launchModelFromCommand(command string) string {
+	return config.LaunchModelFromCommand(command)
 }
 
 func contextUsageMessageForPolicy(tokens, window int, policy config.ContextAdvisoryPolicy) string {
