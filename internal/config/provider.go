@@ -266,6 +266,23 @@ func (rp *ResolvedProvider) ACPCommandString() string {
 	return cmd + " " + shellquote.Join(args)
 }
 
+// LaunchModelFromCommand extracts the effective --model value from a resolved
+// provider command. Last flag wins, matching CLI flag semantics.
+func LaunchModelFromCommand(command string) string {
+	tokens := shellquote.Split(command)
+	model := ""
+	for i := 0; i < len(tokens); i++ {
+		switch {
+		case tokens[i] == "--model" && i+1 < len(tokens):
+			model = tokens[i+1]
+			i++
+		case strings.HasPrefix(tokens[i], "--model="):
+			model = strings.TrimPrefix(tokens[i], "--model=")
+		}
+	}
+	return model
+}
+
 // DefaultSessionTransport returns the transport used for provider-backed
 // sessions when no template-level session override exists.
 func (rp *ResolvedProvider) DefaultSessionTransport() string {

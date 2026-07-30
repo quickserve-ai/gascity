@@ -146,6 +146,35 @@ func TestResolvedWorkerRuntimeWithConfigUsesProviderLaunchCommand(t *testing.T) 
 	}
 }
 
+func TestResolvedWorkerRuntimeWithConfigStampsContextLaunchModel(t *testing.T) {
+	cityDir := t.TempDir()
+	gcDir := filepath.Join(cityDir, ".gc")
+	if err := os.MkdirAll(gcDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gcDir, "settings.json"), []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents:    []config.Agent{{Name: "worker", Provider: "custom-claude"}},
+		Providers: map[string]config.ProviderSpec{
+			"custom-claude": {Command: "claude", Args: []string{"--model", "opus[1m]"}},
+		},
+	}
+	resolved, err := resolvedWorkerRuntimeWithConfig(cityDir, cfg, session.Info{
+		Command:  "claude",
+		WorkDir:  cityDir,
+		Provider: "custom-claude",
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resolved.SessionEnv["GC_CONTEXT_LAUNCH_MODEL"]; got != "opus[1m]" {
+		t.Fatalf("restart SessionEnv launch model = %q, want opus[1m] (command=%q)", got, resolved.Command)
+	}
+}
+
 // TestResolvedWorkerRuntimeResumesPoolSessionPreservesLaunchFlags is a
 // regression test for gastownhall/gascity#799: a pool-agent session
 // resumed through the control-dispatcher path must reconstruct the full
