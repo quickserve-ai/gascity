@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/gastownhall/gascity/internal/shellquote"
+	"github.com/gastownhall/gascity/internal/config"
 )
 
 // Context-usage injection — the context-pressure sibling of clock_inject.go.
@@ -187,18 +187,7 @@ func classifiedWindow(model string) (int, bool) {
 // resolved provider command. shellquote.Split round-trips gc's own command
 // rendering, including quoted aliases such as opus[1m]. Last flag wins.
 func launchModelFromCommand(command string) string {
-	args := shellquote.Split(command)
-	model := ""
-	for i := 0; i < len(args); i++ {
-		switch {
-		case args[i] == "--model" && i+1 < len(args):
-			model = args[i+1]
-			i++
-		case strings.HasPrefix(args[i], "--model="):
-			model = strings.TrimPrefix(args[i], "--model=")
-		}
-	}
-	return model
+	return config.LaunchModelFromCommand(command)
 }
 
 // contextUsageMessage renders the guidance line for tokens used of window, or

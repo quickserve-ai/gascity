@@ -180,6 +180,24 @@ func TestResolvedSessionConfigForProviderScrubsControllerToken(t *testing.T) {
 	}
 }
 
+func TestResolvedSessionConfigForProviderStampsContextLaunchModel(t *testing.T) {
+	resolved := &config.ResolvedProvider{
+		Name:    "claude",
+		Command: "claude",
+		Args:    []string{"--model", "opus[1m]"},
+	}
+	cfg, err := resolvedSessionConfigForProvider(
+		"/tmp/test-city", "worker", "", "worker", "Worker", "", nil,
+		resolved, "", "/tmp/workdir", nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Runtime.SessionEnv["GC_CONTEXT_LAUNCH_MODEL"]; got != "opus[1m]" {
+		t.Fatalf("API SessionEnv launch model = %q, want opus[1m]", got)
+	}
+}
+
 func TestResolvedSessionConfigForProviderRejectsNilProvider(t *testing.T) {
 	if _, err := resolvedSessionConfigForProvider(
 		"/tmp/test-city",
