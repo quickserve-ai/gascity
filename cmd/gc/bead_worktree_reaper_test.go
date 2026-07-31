@@ -13,6 +13,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/git"
 	"github.com/gastownhall/gascity/internal/runtime"
+	sessionpkg "github.com/gastownhall/gascity/internal/session"
 )
 
 func gaConfig() *config.City {
@@ -470,7 +471,7 @@ func TestReapClosedBeadWorktreesSkipsUnstampedLiveSessionWorktree(t *testing.T) 
 	if err := sp.Start(t.Context(), "live-session", runtime.Config{}); err != nil {
 		t.Fatal(err)
 	}
-	session := beads.Bead{ID: "session-1", Status: "open", Metadata: map[string]string{"session_name": "live-session", "work_dir": home}}
+	session := sessionpkg.Info{ID: "session-1", SessionName: "live-session", WorkDir: home}
 	reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{"qcore": store}, sp, nil, nil, false, true, session)
 	if rigGit.movedFrom != "" || rigGit.removedPath != "" {
 		t.Fatalf("live unstamped worktree was mutated: move=%q remove=%q", rigGit.movedFrom, rigGit.removedPath)

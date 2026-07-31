@@ -8,6 +8,7 @@ import (
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/git"
 	"github.com/gastownhall/gascity/internal/runtime"
+	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/sling"
 	"io"
 	"os"
@@ -227,7 +228,7 @@ func reapClosedBeadWorktrees(
 	stderr io.Writer,
 	dryRun bool,
 	sessionSnapshotAvailable bool,
-	activeSessions ...beads.Bead,
+	activeSessions ...sessionpkg.Info,
 ) int {
 	if stderr == nil {
 		stderr = io.Discard
@@ -353,13 +354,19 @@ func configuredRigRoot(cityPath string, cfg *config.City, rigName string) string
 	return ""
 }
 
-func candidateOwnedByActiveSession(candidate beadWorktreeCandidate, sessions []beads.Bead, sp runtime.Provider) (bool, string) {
+// candidateOwnedByActiveSession reports whether a reap candidate lives inside
+// the work dir of a session that is still live. Takes session.Info rather than
+// raw beads: upstream's WI-7 refactor deleted the snapshot's raw-bead surface
+// (sessionBeadSnapshot.Open), leaving OpenInfos as the sole domain projection,
+// and Info exposes WorkDir/SessionName as typed fields instead of metadata-map
+// lookups.
+func candidateOwnedByActiveSession(candidate beadWorktreeCandidate, sessions []sessionpkg.Info, sp runtime.Provider) (bool, string) {
 	canonicalCandidate, err := filepath.EvalSymlinks(candidate.Path)
 	if err != nil {
 		return true, "candidate path liveness check failed: " + err.Error()
 	}
 	for _, session := range sessions {
-		workDir := strings.TrimSpace(session.Metadata["work_dir"])
+		workDir := strings.TrimSpace(session.WorkDir)
 		if workDir == "" {
 			continue
 		}
@@ -371,7 +378,7 @@ func candidateOwnedByActiveSession(candidate beadWorktreeCandidate, sessions []b
 		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 			continue
 		}
-		sessionName := strings.TrimSpace(session.Metadata["session_name"])
+		sessionName := strings.TrimSpace(session.SessionName)
 		if sp == nil || sessionName == "" || sp.IsRunning(sessionName) {
 			return true, "candidate belongs to active or unverifiable session path: " + sessionName
 		}

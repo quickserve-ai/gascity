@@ -187,7 +187,7 @@ func TestResolvedSessionConfigForProviderStampsContextLaunchModel(t *testing.T) 
 		Args:    []string{"--model", "opus[1m]"},
 	}
 	cfg, err := resolvedSessionConfigForProvider(
-		"/tmp/test-city", "worker", "", "worker", "Worker", "", nil,
+		"/tmp/test-city", nil, "worker", "", "worker", "Worker", "", nil,
 		resolved, "", "/tmp/workdir", nil,
 	)
 	if err != nil {
