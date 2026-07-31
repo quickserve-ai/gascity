@@ -1630,6 +1630,20 @@ func (cr *CityRuntime) tickReapClosedBeadWorktrees(p *tickPass) bool {
 			p.recordPhase(TraceSiteControllerTickPhase, "cleanup_agent_home_worktrees", phaseStart, map[string]any{"reset": agentHomesReset})
 		}
 	}
+	if cr.cfg.Daemon.AutoReapStoppedAgentHomesEnabled() {
+		phaseStart := time.Now()
+		if sessionErr := p.sessionBeads.LoadError(); sessionErr != nil {
+			fmt.Fprintf(cr.stderr, "reapStoppedAgentHomes: skipping pass: session snapshot degraded: %v\n", sessionErr) //nolint:errcheck
+		} else {
+			candidateSessions, historyErr := loadConfiguredStoppedAgentHomeHistory(cr.cfg, cr.cityBeadStore())
+			if historyErr != nil {
+				fmt.Fprintf(cr.stderr, "reapStoppedAgentHomes: skipping pass: session history unavailable: %v\n", historyErr) //nolint:errcheck
+			} else {
+				agentHomesReaped := reapStoppedAgentHomeWorktrees(cr.cityPath, cr.cfg, cr.cityBeadStore(), cr.rigBeadStores(), cr.sp, cr.rec, cr.stderr, false, candidateSessions, activeSessionBeads(p.sessionBeads.OpenInfos()))
+				p.recordPhase(TraceSiteControllerTickPhase, "reap_stopped_agent_homes", phaseStart, map[string]any{"reaped": agentHomesReaped})
+			}
+		}
+	}
 	return p.ctx.Err() != nil
 }
 
