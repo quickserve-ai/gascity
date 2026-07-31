@@ -2365,6 +2365,12 @@ type DaemonConfig struct {
 	// home directories (agent template directories) are never touched.
 	// Defaults to false. Set to true to enable automated worktree cleanup.
 	AutoReapClosedBeadWorktrees *bool `toml:"auto_reap_closed_bead_worktrees,omitempty" jsonschema:"default=false"`
+	// AutoReapStoppedAgentHomes controls whether the reconciler removes closed,
+	// stopped configured named/namepool worktree homes. The reaper fails closed
+	// unless runtime/session and assignment snapshots are available, and requires
+	// a clean registered worktree with no unpushed commits, stashes, or nested
+	// registered worktrees. Defaults to false.
+	AutoReapStoppedAgentHomes *bool `toml:"auto_reap_stopped_agent_homes,omitempty" jsonschema:"default=false"`
 	// StartReadyTimeout is how long `gc start` and `gc register` wait for
 	// the supervisor to report the city as Running. Cities with many
 	// registered or adopted sessions take longer to start because the
@@ -2416,6 +2422,13 @@ func (d *DaemonConfig) AutoReapClosedBeadWorktreesEnabled() bool {
 		return false
 	}
 	return *d.AutoReapClosedBeadWorktrees
+}
+
+// AutoReapStoppedAgentHomesEnabled reports whether stopped configured
+// named/namepool homes may be reclaimed. It is opt-in because these homes are
+// longer-lived than per-bead and ordinary pool worker directories.
+func (d *DaemonConfig) AutoReapStoppedAgentHomesEnabled() bool {
+	return d.AutoReapStoppedAgentHomes != nil && *d.AutoReapStoppedAgentHomes
 }
 
 // AutoPruneWorkerDirEnabled reports whether the reconciler should remove a

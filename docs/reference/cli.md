@@ -76,7 +76,7 @@ gc [flags]
 | [gc unregister](#gc-unregister) | Remove a city from the machine-wide supervisor |
 | [gc version](#gc-version) | Print gc version |
 | [gc wait](#gc-wait) | Inspect and manage durable session waits |
-| [gc worktree-gc](#gc-worktree-gc) | Preview closed-bead worktree reclamation |
+| [gc worktree-gc](#gc-worktree-gc) | Preview per-bead and stopped agent-home reclamation |
 
 ## gc agent
 
@@ -4243,7 +4243,7 @@ gc wait ready <wait-id> [flags]
 
 ## gc worktree-gc
 
-Preview closed-bead worktree reclamation
+Preview both worktree reclamation classes without mutation. Per-bead cleanup is controlled by daemon.auto_reap_closed_bead_worktrees; longer-lived configured named/namepool home cleanup is separately controlled by daemon.auto_reap_stopped_agent_homes. Both require authoritative runtime, session, assignment, registration, and git-safety evidence.
 
 ```
 gc worktree-gc

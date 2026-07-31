@@ -187,6 +187,7 @@ type fakeBeadWorktreeGit struct {
 	moveErr      error
 	worktrees    []git.Worktree
 	worktreeErr  error
+	onMove       func(oldPath, newPath string)
 }
 
 func (f *fakeBeadWorktreeGit) IsRepo() bool             { return f.isRepo }
@@ -219,6 +220,9 @@ func (f *fakeBeadWorktreeGit) WorktreeMove(oldPath, newPath string) error {
 		if f.worktrees[i].Path == oldPath {
 			f.worktrees[i].Path = newPath
 		}
+	}
+	if f.onMove != nil {
+		f.onMove(oldPath, newPath)
 	}
 	return nil
 }
