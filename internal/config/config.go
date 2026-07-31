@@ -2679,6 +2679,12 @@ type DaemonConfig struct {
 	// quarantine entirely (every closed-bead worktree is immediately
 	// eligible for the rest of the gate chain, regardless of age).
 	AutoReapClosedBeadWorktreesMinAgeMinutes *int `toml:"auto_reap_closed_bead_worktrees_min_age_minutes,omitempty" jsonschema:"default=10"`
+	// AutoReapStoppedAgentHomes controls whether the reconciler removes closed,
+	// stopped configured named/namepool worktree homes. The reaper fails closed
+	// unless runtime/session and assignment snapshots are available, and requires
+	// a clean registered worktree with no unpushed commits, stashes, or nested
+	// registered worktrees. Defaults to false.
+	AutoReapStoppedAgentHomes *bool `toml:"auto_reap_stopped_agent_homes,omitempty" jsonschema:"default=false"`
 	// StartReadyTimeout is how long `gc start` and `gc register` wait for
 	// the supervisor to report the city as Running. Cities with many
 	// registered or adopted sessions take longer to start because the
@@ -2758,6 +2764,14 @@ func (d *DaemonConfig) AutoReapClosedBeadWorktreesMinAge() time.Duration {
 		return time.Duration(DefaultAutoReapClosedBeadWorktreesMinAgeMinutes) * time.Minute
 	}
 	return time.Duration(*d.AutoReapClosedBeadWorktreesMinAgeMinutes) * time.Minute
+
+}
+
+// AutoReapStoppedAgentHomesEnabled reports whether stopped configured
+// named/namepool homes may be reclaimed. It is opt-in because these homes are
+// longer-lived than per-bead and ordinary pool worker directories.
+func (d *DaemonConfig) AutoReapStoppedAgentHomesEnabled() bool {
+	return d.AutoReapStoppedAgentHomes != nil && *d.AutoReapStoppedAgentHomes
 }
 
 // AutoPruneWorkerDirEnabled reports whether the reconciler should remove a

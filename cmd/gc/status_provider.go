@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -20,6 +21,7 @@ var (
 	statusProviderTimeoutWarning = func() {
 		fmt.Fprintln(os.Stderr, "gc status: runtime status probe timed out; using partial status")
 	}
+	errRuntimeStatusProbeTimeout = errors.New("runtime status probe timed out")
 )
 
 type statusProvider struct {
@@ -176,7 +178,7 @@ func (p *statusProvider) ListRunning(prefix string) ([]string, error) {
 	result := boundedStatusCall(p, struct {
 		value []string
 		err   error
-	}{}, func() struct {
+	}{err: errRuntimeStatusProbeTimeout}, func() struct {
 		value []string
 		err   error
 	} {
