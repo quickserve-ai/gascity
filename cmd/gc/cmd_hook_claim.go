@@ -1037,6 +1037,30 @@ func hookClaimExistingAssignment(candidates []beads.Bead, opts hookClaimOptions)
 	return hookClaimJSONResult{}, beads.Bead{}, false
 }
 
+func hookClaimExistingOrAssigned(candidates []beads.Bead, opts hookClaimOptions) (hookClaimJSONResult, beads.Bead, bool) {
+	if result, candidate, ok := hookClaimExistingAssignment(candidates, opts); ok {
+		return result, candidate, true
+	}
+	for _, candidate := range candidates {
+		if hookClaimCandidateIsMessage(candidate) {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(candidate.Status), "open") && hookClaimHasIdentity(candidate.Assignee, opts.IdentityCandidates) {
+			return hookClaimJSONResult{
+				SchemaVersion: "1",
+				OK:            true,
+				Command:       hookClaimCommandName,
+				Action:        "work",
+				Reason:        "ready_assignment",
+				BeadID:        candidate.ID,
+				Assignee:      candidate.Assignee,
+				Route:         hookClaimRoute(candidate),
+			}, candidate, true
+		}
+	}
+	return hookClaimJSONResult{}, beads.Bead{}, false
+}
+
 // hookClaimCandidateIsMessage reports whether candidate is a mail message
 // bead (issue_type="message"). Mail is read, not claimed as work: a message
 // bead addressed to this session's identity has the same
