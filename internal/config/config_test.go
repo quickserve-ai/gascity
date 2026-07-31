@@ -3656,6 +3656,23 @@ func TestDaemonAutoReapClosedBeadWorktreesExplicitFalse(t *testing.T) {
 	}
 }
 
+func TestDaemonAutoReapStoppedAgentHomesDefaultsOffAndHonorsFlag(t *testing.T) {
+	d := DaemonConfig{}
+	if d.AutoReapStoppedAgentHomesEnabled() {
+		t.Fatal("AutoReapStoppedAgentHomesEnabled() = true, want false by default")
+	}
+	on := true
+	d.AutoReapStoppedAgentHomes = &on
+	if !d.AutoReapStoppedAgentHomesEnabled() {
+		t.Fatal("AutoReapStoppedAgentHomesEnabled() = false, want true")
+	}
+	off := false
+	d.AutoReapStoppedAgentHomes = &off
+	if d.AutoReapStoppedAgentHomesEnabled() {
+		t.Fatal("AutoReapStoppedAgentHomesEnabled() = true, want false kill switch")
+	}
+}
+
 func TestDaemonRestartWindowDefault(t *testing.T) {
 	d := DaemonConfig{}
 	got := d.RestartWindowDuration()
