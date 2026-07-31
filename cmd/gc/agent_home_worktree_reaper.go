@@ -460,6 +460,21 @@ func safeStoppedAgentHomePath(cityPath string, candidate stoppedAgentHomeCandida
 	return isStrictlyUnderDir(canonicalRoot, canonicalPath)
 }
 
+func activeSessionBeads(infos []sessionpkg.Info) []beads.Bead {
+	sessions := make([]beads.Bead, 0, len(infos))
+	for _, info := range infos {
+		status := "open"
+		if info.Closed {
+			status = "closed"
+		}
+		sessions = append(sessions, beads.Bead{ID: info.ID, Type: info.Type, Status: status, Metadata: map[string]string{
+			"work_dir": info.WorkDir, "session_name": info.SessionName, "alias": info.Alias,
+			namedSessionIdentityMetadata: info.ConfiguredNamedIdentity,
+		}})
+	}
+	return sessions
+}
+
 func reapStoppedAgentHomeWorktrees(
 	cityPath string,
 	cfg *config.City,
@@ -571,7 +586,7 @@ func reapStoppedAgentHomeWorktrees(
 		for _, name := range freshRunningNames {
 			freshRunningSessions[name] = true
 		}
-		fresh := evaluateStoppedAgentHomeCandidate(cityPath, cfg, freshCandidate, freshRunningSessions, cityStore, rigStores, freshActiveSnapshot.Open(), newStoppedAgentHomeGitProbe(candidate.Path), freshRegistered)
+		fresh := evaluateStoppedAgentHomeCandidate(cityPath, cfg, freshCandidate, freshRunningSessions, cityStore, rigStores, activeSessionBeads(freshActiveSnapshot.OpenInfos()), newStoppedAgentHomeGitProbe(candidate.Path), freshRegistered)
 		currentInfo, statErr := os.Stat(candidate.Path)
 		if fresh.Action != stoppedAgentHomeRemove || statErr != nil || !os.SameFile(initialInfo, currentInfo) {
 			recordStoppedAgentHomeSkip(rec, stderr, candidate, "candidate changed before mutation: "+fresh.Reason)
@@ -607,7 +622,7 @@ func reapStoppedAgentHomeWorktrees(
 		quarantinedCandidate.Owners = latestSessions
 		quarantineDecision := stoppedAgentHomeDecision{Candidate: quarantinedCandidate, Action: stoppedAgentHomeSkip, Reason: "quarantine verification unavailable"}
 		if registrationErr == nil && latestSessionErr == nil && latestRuntimeErr == nil && latestActiveErr == nil && latestActiveSnapshot.LoadError() == nil {
-			quarantineDecision = evaluateStoppedAgentHomeCandidate(cityPath, cfg, quarantinedCandidate, latestRunning, cityStore, rigStores, latestActiveSnapshot.Open(), newStoppedAgentHomeGitProbe(quarantinePath), quarantinedRegistered)
+			quarantineDecision = evaluateStoppedAgentHomeCandidate(cityPath, cfg, quarantinedCandidate, latestRunning, cityStore, rigStores, activeSessionBeads(latestActiveSnapshot.OpenInfos()), newStoppedAgentHomeGitProbe(quarantinePath), quarantinedRegistered)
 		}
 		if quarantineDecision.Action != stoppedAgentHomeRemove {
 			restoreErr := rigProbe.WorktreeMove(quarantinePath, candidate.Path)

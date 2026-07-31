@@ -60,10 +60,15 @@ func newWorktreeGCCmd(stdout, stderr io.Writer) *cobra.Command {
 				}
 				stores[rig.Name] = store
 			}
-			sp := newStatusSessionProviderForCity(cfg, cityPath)
+			sp, providerErr := newStatusSessionProviderForCity(cfg, cityPath)
+			if providerErr != nil {
+				fmt.Fprintf(stderr, "gc worktree-gc: runtime provider: %v\n", providerErr) //nolint:errcheck
+				return errExit
+			}
+			activeSessions := activeSessionBeads(sessionSnapshot.OpenInfos())
 			fmt.Fprintln(stdout, "Worktree GC preview (no files will be changed; unavailable liveness or assignment probes are skipped):") //nolint:errcheck
-			reapClosedBeadWorktrees(cityPath, cfg, stores, sp, nil, stdout, true, true, sessionSnapshot.Open()...)
-			reapStoppedAgentHomeWorktrees(cityPath, cfg, cityStore, stores, sp, nil, stdout, true, true, candidateSessions, sessionSnapshot.Open())
+			reapClosedBeadWorktrees(cityPath, cfg, stores, sp, nil, stdout, true, true, sessionSnapshot.OpenInfos()...)
+			reapStoppedAgentHomeWorktrees(cityPath, cfg, cityStore, stores, sp, nil, stdout, true, true, candidateSessions, activeSessions)
 			return nil
 		},
 	}
