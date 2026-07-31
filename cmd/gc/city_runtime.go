@@ -1170,7 +1170,7 @@ func (cr *CityRuntime) tick(
 			if historyErr != nil {
 				fmt.Fprintf(cr.stderr, "reapStoppedAgentHomes: skipping pass: session history unavailable: %v\n", historyErr) //nolint:errcheck
 			} else {
-				agentHomesReaped := reapStoppedAgentHomeWorktrees(cr.cityPath, cr.cfg, cr.cityBeadStore(), cr.rigBeadStores(), cr.sp, cr.rec, cr.stderr, false, true, candidateSessions, activeSessionBeads(sessionBeads.OpenInfos()))
+				agentHomesReaped := reapStoppedAgentHomeWorktrees(cr.cityPath, cr.cfg, cr.cityBeadStore(), cr.rigBeadStores(), cr.sp, cr.rec, cr.stderr, false, candidateSessions, activeSessionBeads(sessionBeads.OpenInfos()))
 				recordPhase(TraceSiteControllerTickPhase, "reap_stopped_agent_homes", phaseStart, map[string]any{"reaped": agentHomesReaped})
 			}
 		}

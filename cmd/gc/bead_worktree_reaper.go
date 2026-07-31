@@ -3,6 +3,12 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
@@ -10,11 +16,6 @@ import (
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/sling"
-	"io"
-	"os"
-	"path/filepath"
-	"strings"
-	"time"
 )
 
 type beadWorktreeCandidate struct {
@@ -384,17 +385,6 @@ func candidateOwnedByActiveSession(candidate beadWorktreeCandidate, sessions []s
 		}
 	}
 	return false, ""
-}
-
-func beadWorktreeOwnerIsLive(bead beads.Bead, sp runtime.Provider) bool {
-	if sp == nil {
-		return false
-	}
-	sessionName := strings.TrimSpace(bead.Metadata["gc.session_name"])
-	if sessionName == "" {
-		sessionName = strings.TrimSpace(bead.Metadata["session_name"])
-	}
-	return sessionName != "" && sp.IsRunning(sessionName)
 }
 
 func recordBeadWorktreeSkip(rec events.Recorder, stderr io.Writer, candidate beadWorktreeCandidate, reason string) {

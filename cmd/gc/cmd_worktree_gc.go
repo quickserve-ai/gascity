@@ -68,7 +68,7 @@ func newWorktreeGCCmd(stdout, stderr io.Writer) *cobra.Command {
 			activeSessions := activeSessionBeads(sessionSnapshot.OpenInfos())
 			fmt.Fprintln(stdout, "Worktree GC preview (no files will be changed; unavailable liveness or assignment probes are skipped):") //nolint:errcheck
 			reapClosedBeadWorktrees(cityPath, cfg, stores, sp, nil, stdout, true, true, sessionSnapshot.OpenInfos()...)
-			reapStoppedAgentHomeWorktrees(cityPath, cfg, cityStore, stores, sp, nil, stdout, true, true, candidateSessions, activeSessions)
+			reapStoppedAgentHomeWorktrees(cityPath, cfg, cityStore, stores, sp, nil, stdout, true, candidateSessions, activeSessions)
 			return nil
 		},
 	}

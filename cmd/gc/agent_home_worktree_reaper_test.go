@@ -87,7 +87,7 @@ func TestDiscoverStoppedAgentHomeCandidatesPreservesSharedHistory(t *testing.T) 
 func TestReapStoppedAgentHomesFailsClosedWhenRuntimeListFails(t *testing.T) {
 	cityPath, cfg, _, session := namedHomeReaperFixture(t)
 	var out bytes.Buffer
-	removed := reapStoppedAgentHomeWorktrees(cityPath, cfg, beads.NewMemStore(), nil, runtime.NewFailFake(), nil, &out, false, true, []beads.Bead{session})
+	removed := reapStoppedAgentHomeWorktrees(cityPath, cfg, beads.NewMemStore(), nil, runtime.NewFailFake(), nil, &out, false, []beads.Bead{session})
 	if removed != 0 || !strings.Contains(out.String(), "runtime snapshot unavailable") {
 		t.Fatalf("removed=%d output=%q, want fail-closed runtime snapshot skip", removed, out.String())
 	}
@@ -171,7 +171,7 @@ func TestReapStoppedAgentHomesDryRunReportsSizeAndNeverMutates(t *testing.T) {
 	t.Cleanup(func() { newStoppedAgentHomeGitProbe = oldFactory })
 
 	var out bytes.Buffer
-	removed := reapStoppedAgentHomeWorktrees(cityPath, cfg, cityStore, namedHomeRigStores(), runtime.NewFake(), nil, &out, true, true, []beads.Bead{session})
+	removed := reapStoppedAgentHomeWorktrees(cityPath, cfg, cityStore, namedHomeRigStores(), runtime.NewFake(), nil, &out, true, []beads.Bead{session})
 	if removed != 0 || rigProbe.removedPath != "" {
 		t.Fatalf("dry run mutated: removed=%d path=%q", removed, rigProbe.removedPath)
 	}
@@ -195,7 +195,7 @@ func TestReapStoppedAgentHomesRemovesOnlyThroughNonForceGit(t *testing.T) {
 
 	cityStore := beads.NewMemStoreFrom(1, []beads.Bead{session}, nil)
 	var out bytes.Buffer
-	removed := reapStoppedAgentHomeWorktrees(cityPath, cfg, cityStore, namedHomeRigStores(), runtime.NewFake(), nil, &out, false, true, []beads.Bead{session})
+	removed := reapStoppedAgentHomeWorktrees(cityPath, cfg, cityStore, namedHomeRigStores(), runtime.NewFake(), nil, &out, false, []beads.Bead{session})
 	if removed != 1 || !strings.HasPrefix(rigProbe.removedPath, home+".gc-reap-") || rigProbe.removedForce {
 		t.Fatalf("removed=%d path=%q force=%v output=%q, want one quarantined non-force removal of %q", removed, rigProbe.removedPath, rigProbe.removedForce, out.String(), home)
 	}
@@ -220,7 +220,7 @@ func TestReapStoppedAgentHomesRefreshesSessionOwnershipBeforeMutation(t *testing
 	t.Cleanup(func() { newStoppedAgentHomeGitProbe = oldFactory })
 
 	var out bytes.Buffer
-	removed := reapStoppedAgentHomeWorktrees(cityPath, cfg, cityStore, namedHomeRigStores(), runtime.NewFake(), nil, &out, false, true, []beads.Bead{closed})
+	removed := reapStoppedAgentHomeWorktrees(cityPath, cfg, cityStore, namedHomeRigStores(), runtime.NewFake(), nil, &out, false, []beads.Bead{closed})
 	if removed != 0 || rigProbe.removedPath != "" || !strings.Contains(out.String(), "overlaps active session") {
 		t.Fatalf("removed=%d path=%q output=%q, want fresh active-session skip", removed, rigProbe.removedPath, out.String())
 	}
@@ -339,7 +339,7 @@ func TestReapStoppedAgentHomesQuarantinesBeforeNonForceRemoval(t *testing.T) {
 
 	stores := map[string]beads.Store{"qcore": beads.NewMemStore()}
 	var out bytes.Buffer
-	removed := reapStoppedAgentHomeWorktrees(cityPath, cfg, beads.NewMemStoreFrom(1, []beads.Bead{session}, nil), stores, runtime.NewFake(), nil, &out, false, true, []beads.Bead{session})
+	removed := reapStoppedAgentHomeWorktrees(cityPath, cfg, beads.NewMemStoreFrom(1, []beads.Bead{session}, nil), stores, runtime.NewFake(), nil, &out, false, []beads.Bead{session})
 	if removed != 1 || rigProbe.movedFrom != home || !strings.HasPrefix(rigProbe.removedPath, home+".gc-reap-") || rigProbe.removedForce {
 		t.Fatalf("removed=%d move=%q remove=%q force=%v output=%q, want quarantine then non-force removal", removed, rigProbe.movedFrom, rigProbe.removedPath, rigProbe.removedForce, out.String())
 	}
@@ -359,7 +359,7 @@ func TestReapStoppedAgentHomesDryRunReportsAllGateResults(t *testing.T) {
 	t.Cleanup(func() { newStoppedAgentHomeGitProbe = oldFactory })
 	var out bytes.Buffer
 	stores := map[string]beads.Store{"qcore": beads.NewMemStore()}
-	reapStoppedAgentHomeWorktrees(cityPath, cfg, beads.NewMemStoreFrom(1, []beads.Bead{session}, nil), stores, runtime.NewFake(), nil, &out, true, true, []beads.Bead{session})
+	reapStoppedAgentHomeWorktrees(cityPath, cfg, beads.NewMemStoreFrom(1, []beads.Bead{session}, nil), stores, runtime.NewFake(), nil, &out, true, []beads.Bead{session})
 	for _, gate := range []string{"runtime=pass", "ownership=pass", "assignments=pass", "containment=pass", "registration=pass", "nested=pass", "dirty=pass", "unpushed=pass", "stash=pass"} {
 		if !strings.Contains(out.String(), gate) {
 			t.Fatalf("dry-run output %q missing gate %q", out.String(), gate)
@@ -395,7 +395,7 @@ func TestReapStoppedAgentHomesRestoresWhenOwnerAppearsAfterQuarantine(t *testing
 	t.Cleanup(func() { newStoppedAgentHomeGitProbe = oldFactory })
 
 	var out bytes.Buffer
-	removed := reapStoppedAgentHomeWorktrees(cityPath, cfg, cityStore, namedHomeRigStores(), runtime.NewFake(), nil, &out, false, true, []beads.Bead{session})
+	removed := reapStoppedAgentHomeWorktrees(cityPath, cfg, cityStore, namedHomeRigStores(), runtime.NewFake(), nil, &out, false, []beads.Bead{session})
 	if removed != 0 || rigProbe.removedPath != "" || !strings.Contains(out.String(), "owner session bead is not closed") {
 		t.Fatalf("removed=%d path=%q output=%q, want post-quarantine ownership skip", removed, rigProbe.removedPath, out.String())
 	}

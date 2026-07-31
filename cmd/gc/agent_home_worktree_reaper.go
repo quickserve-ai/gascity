@@ -236,7 +236,7 @@ func sessionUsesDisposableConfiguredHome(cityPath string, cfg *config.City, sess
 
 func directorySizeBytes(root string) (int64, error) {
 	var size int64
-	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+	err := filepath.WalkDir(root, func(_ string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -484,7 +484,6 @@ func reapStoppedAgentHomeWorktrees(
 	rec events.Recorder,
 	stderr io.Writer,
 	dryRun bool,
-	sessionSnapshotAvailable bool,
 	sessions []beads.Bead,
 	activeSnapshots ...[]beads.Bead,
 ) int {
@@ -510,12 +509,6 @@ func reapStoppedAgentHomeWorktrees(
 			}
 			candidates[i].SizeBytes = size
 		}
-	}
-	if !sessionSnapshotAvailable {
-		for _, candidate := range candidates {
-			fmt.Fprintf(stderr, "reapStoppedAgentHomes: action=would-skip path=%s session=%s size_bytes=%d reason=runtime/session snapshot unavailable\n", candidate.Path, candidate.Session.ID, candidate.SizeBytes) //nolint:errcheck
-		}
-		return 0
 	}
 	if sp == nil {
 		for _, candidate := range candidates {
