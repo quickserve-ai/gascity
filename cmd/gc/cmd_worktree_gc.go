@@ -9,14 +9,15 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// newWorktreeGCCmd exposes a conservative operator preview. The CLI does not
-// own the controller's runtime provider, so candidates with recorded session
-// ownership report unknown liveness and are skipped rather than predicted.
+// newWorktreeGCCmd exposes a conservative operator preview using the same
+// bounded runtime provider and live bead stores as the controller. Any
+// unavailable snapshot or probe fails closed and reports would-skip.
 // Mutation remains controller-owned and kill-switchable.
 func newWorktreeGCCmd(stdout, stderr io.Writer) *cobra.Command {
 	return &cobra.Command{
 		Use:   "worktree-gc",
-		Short: "Preview closed-bead worktree reclamation",
+		Short: "Preview per-bead and stopped agent-home reclamation",
+		Long:  "Preview both worktree reclamation classes without mutation. Per-bead cleanup is controlled by daemon.auto_reap_closed_bead_worktrees; longer-lived configured named/namepool home cleanup is separately controlled by daemon.auto_reap_stopped_agent_homes. Both require authoritative runtime, session, assignment, registration, and git-safety evidence.",
 		Args:  cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
 			cityPath, err := resolveCity()
@@ -27,6 +28,24 @@ func newWorktreeGCCmd(stdout, stderr io.Writer) *cobra.Command {
 			cfg, err := loadCityConfig(cityPath, stderr)
 			if err != nil {
 				fmt.Fprintf(stderr, "gc worktree-gc: %v\n", err) //nolint:errcheck
+				return errExit
+			}
+			cityStore, openCityErr := openStoreAtForCity(cityPath, cityPath)
+			if openCityErr != nil {
+				fmt.Fprintf(stderr, "gc worktree-gc: open city store: %v\n", openCityErr) //nolint:errcheck
+				return errExit
+			}
+			sessionSnapshot, sessionErr := loadSessionBeadSnapshot(cityStore)
+			if sessionErr == nil {
+				sessionErr = sessionSnapshot.LoadError()
+			}
+			if sessionErr != nil {
+				fmt.Fprintf(stderr, "gc worktree-gc: list active sessions: %v\n", sessionErr) //nolint:errcheck
+				return errExit
+			}
+			candidateSessions, historyErr := loadConfiguredStoppedAgentHomeHistory(cfg, cityStore)
+			if historyErr != nil {
+				fmt.Fprintf(stderr, "gc worktree-gc: list configured agent-home history: %v\n", historyErr) //nolint:errcheck
 				return errExit
 			}
 			stores := make(map[string]beads.Store, len(cfg.Rigs))
@@ -41,8 +60,10 @@ func newWorktreeGCCmd(stdout, stderr io.Writer) *cobra.Command {
 				}
 				stores[rig.Name] = store
 			}
-			fmt.Fprintln(stdout, "Worktree GC preview (no files will be changed; recorded session owners are skipped when liveness is unavailable):") //nolint:errcheck
-			reapClosedBeadWorktrees(cityPath, cfg, stores, nil, nil, stdout, true, false)
+			sp := newStatusSessionProviderForCity(cfg, cityPath)
+			fmt.Fprintln(stdout, "Worktree GC preview (no files will be changed; unavailable liveness or assignment probes are skipped):") //nolint:errcheck
+			reapClosedBeadWorktrees(cityPath, cfg, stores, sp, nil, stdout, true, true, sessionSnapshot.Open()...)
+			reapStoppedAgentHomeWorktrees(cityPath, cfg, cityStore, stores, sp, nil, stdout, true, true, candidateSessions, sessionSnapshot.Open())
 			return nil
 		},
 	}
