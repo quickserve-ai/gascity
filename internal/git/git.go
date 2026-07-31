@@ -173,6 +173,15 @@ func (g *Git) WorktreeRemove(path string, force bool) error {
 	return nil
 }
 
+// WorktreeMove atomically relocates a registered worktree through Git so its
+// administrative path is updated with the filesystem move.
+func (g *Git) WorktreeMove(oldPath, newPath string) error {
+	if _, err := g.run("worktree", "move", oldPath, newPath); err != nil {
+		return fmt.Errorf("moving worktree %q to %q: %w", oldPath, newPath, err)
+	}
+	return nil
+}
+
 // WorktreeList returns all worktrees in porcelain format.
 func (g *Git) WorktreeList() ([]Worktree, error) {
 	out, err := g.run("worktree", "list", "--porcelain")
