@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/runtime"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 )
 
@@ -286,5 +287,26 @@ func TestLookupRigRootForSessionInfo(t *testing.T) {
 				t.Errorf("lookupRigRootForSessionInfo(%q) = %q, want %q", c.template, got, c.want)
 			}
 		})
+	}
+}
+
+// TestPruneAgentHomeWorktreeIfSafeInfo_UnknownRuntimeLivenessNeverPruned is the
+// Info-form twin of the unknown-liveness gate (#5544): an unobservable runtime
+// vetoes the prune.
+func TestPruneAgentHomeWorktreeIfSafeInfo_UnknownRuntimeLivenessNeverPruned(t *testing.T) {
+	fx := newPruneFixture(t)
+	probe := &fakeGitProbe{isRepo: true}
+	fx.setProbe(fx.workerDir, probe)
+	rigProbe := &fakeGitProbe{isRepo: true}
+	fx.setProbe(fx.rigRoot, rigProbe)
+	sp := &sweepUnavailableLivenessProvider{Fake: runtime.NewFake()}
+
+	var stderr bytes.Buffer
+	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, sp, &stderr)
+	if rigProbe.removeInvoked {
+		t.Fatal("WorktreeRemove invoked while runtime liveness was unobservable")
+	}
+	if !strings.Contains(stderr.String(), "runtime liveness unknown") {
+		t.Errorf("missing unknown-liveness refusal diagnostic, got: %q", stderr.String())
 	}
 }
