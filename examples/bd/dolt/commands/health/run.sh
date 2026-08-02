@@ -242,26 +242,26 @@ if [ "$server_reachable" = true ]; then
   fi
 fi
 
-# Check backup freshness (qc-lu207).
+# Check off-box mirror freshness (qc-lu207, ga-a8w1c).
 #
-# Source of truth: push-success stamps written by the sync/compact push
-# paths into $BACKUP_FRESHNESS_DIR (see runtime.sh). A stamp means "the
-# pusher believes the push succeeded", NOT "the remote confirmed receipt" —
-# that proxy is deliberate: probing the remote from health would fork the
-# network/git-subprocess class that hangs exactly when the remote is down.
+# Source of truth: remote-verification stamps written by sync/compact into
+# $BACKUP_FRESHNESS_DIR (see runtime.sh). A stamp means the sync path recently
+# proved the remote contains the local branch: either a push succeeded or a
+# fetch-and-classify found local and remote up to date. Health deliberately
+# does not perform network probes itself; they can hang exactly when the remote
+# is down.
 #
 # Verdict rules — no data must NEVER read as healthy:
-#   - db with a remote and a fresh stamp             -> ok
-#   - db with a remote and an old stamp              -> stale (dolt_stale=true)
-#   - db with a remote and NO stamp                  -> unknown (dolt_stale=true)
-#     (a fresh install reads "unknown" until its first successful push —
-#      that is correct fail-closed behavior, not a broken backup)
-#   - db without a remote                            -> skipped (not a target)
-#   - no db has a remote                             -> state "no-remotes",
+#   - db with a remote and a recent verification       -> ok
+#   - db with a remote and an old verification         -> stale
+#   - db with a remote and NO verification             -> unknown
+#     (a fresh install reads "unknown" until sync first verifies its remote)
+#   - db without a remote                              -> skipped (not a target)
+#   - no db has a remote                               -> state "no-remotes",
 #     dolt_stale=false: that is a MEASURED verdict (nothing is supposed to
 #     be backed up), unlike the historical fail-open where stale=false was
 #     just an initializer that never got overwritten.
-#   - server unreachable (remotes unknowable)        -> unknown, dolt_stale=true
+#   - server unreachable (remotes unknowable)          -> unknown, stale=true
 backup_stale_threshold="${GC_DOLT_BACKUP_STALE_SECS:-7200}"
 case "$backup_stale_threshold" in ''|*[!0-9]*) backup_stale_threshold=7200 ;; esac
 backup_freshness=""
@@ -770,23 +770,23 @@ case "$backup_state" in
   no-remotes)
     echo "Origin mirrors: no databases have a configured remote" ;;
   ok)
-    echo "Origin mirrors: ok (last push ${backup_freshness} ago)" ;;
+    echo "Origin mirrors: ok (last verified ${backup_freshness} ago)" ;;
   *)
     stale=""
     [ "$backup_stale" = true ] && [ "$backup_state" != "stale" ] && stale=" [STALE]"
     if [ -n "$backup_freshness" ]; then
-      echo "Origin mirrors: ${backup_state}${stale} (last recorded push ${backup_freshness} ago)"
+      echo "Origin mirrors: ${backup_state}${stale} (last verified ${backup_freshness} ago)"
     else
-      echo "Origin mirrors: ${backup_state}${stale} (no successful push recorded)"
+      echo "Origin mirrors: ${backup_state}${stale} (no successful verification recorded)"
     fi ;;
 esac
 if [ -n "$backup_detail" ]; then
   echo "$backup_detail" | while IFS='|' read -r bname bstate bage brefspec; do
     [ -z "$bname" ] && continue
     if [ -n "$bage" ]; then
-      echo "  $bname: $bstate (pushed ${bage}s ago, $brefspec)"
+      echo "  $bname: $bstate (verified ${bage}s ago, $brefspec)"
     else
-      echo "  $bname: $bstate (no successful push recorded)"
+      echo "  $bname: $bstate (no successful verification recorded)"
     fi
   done
 fi

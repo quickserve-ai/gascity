@@ -244,16 +244,22 @@ dolt_sql() {
 
 # classify_count <db> <revrange> — emit the dolt_log commit count for a revision
 # range (e.g. "remotes/origin/main..main" = commits on the remote-tracking ref
-# not on the local branch). Returns non-zero when the range cannot be resolved —
-# notably when the remote-tracking ref does not exist yet (Dolt errors
-# "branch not found: remotes/..."), which the caller treats as a first push.
+# not on the local branch). Returns non-zero when the query fails OR its CSV
+# result is missing/malformed. Equality is a durability proof only when both
+# counts are explicit non-negative integers; empty output must never become 0.
 # Read-only; bounded by the metadata ceiling. Verified against Dolt 2.1.0:
 #   dolt_log('A..B') counts commits reachable from B but not A.
 classify_count() {
   cc_db="$1"
   cc_range="$2"
   cc_out=$(dolt_sql "USE \`$cc_db\`; SELECT COUNT(*) AS n FROM dolt_log('$cc_range')") || return 1
-  printf '%s\n' "$cc_out" | awk -F, 'NR == 2 { gsub(/^"|"$/, "", $1); print $1; exit }'
+  printf '%s\n' "$cc_out" | awk -F, '
+    NR == 2 {
+      gsub(/^"|"$/, "", $1)
+      if ($1 ~ /^[0-9]+$/) { print $1; found = 1 }
+    }
+    END { if (!found) exit 1 }
+  '
 }
 
 find_remote_sql() {
@@ -418,8 +424,6 @@ sync_database_sql() {
       # (skip without pushing) rather than guessing a count and risking a push.
       if ahead=$(classify_count "$name" "$remote_tracking..$local_branch") &&
         behind=$(classify_count "$name" "$local_branch..$remote_tracking"); then
-        [ -n "$ahead" ] || ahead=0
-        [ -n "$behind" ] || behind=0
         # diverged returns non-zero (needs human action); behind alone is a
         # benign "nothing to push, pull needed" state and returns success.
         if [ "$ahead" = 0 ] && [ "$behind" = 0 ]; then
@@ -455,7 +459,14 @@ sync_database_sql() {
 
   if [ "$ff_decision" = "skip" ]; then
     case "$ff_status" in
-      up-to-date) echo "  $name: up-to-date with $remote_name:$remote_branch" ;;
+      up-to-date)
+        echo "  $name: up-to-date with $remote_name:$remote_branch"
+        # A successful fetch plus zero ahead/behind commits proves the remote
+        # currently contains the local branch. Refresh the same freshness stamp
+        # as a successful push so quiet, fully mirrored databases do not become
+        # falsely stale merely because there was nothing new to push.
+        write_backup_push_stamp "$name" "$remote_name" "$local_branch" "$remote_branch"
+        ;;
       behind*)    echo "  $name: $ff_status — pull needed (gc dolt pull)" ;;
       diverged*)  echo "  $name: $ff_status — manual reconcile" >&2 ;;
       *)          echo "  $name: skipped [$ff_status]" ;;
