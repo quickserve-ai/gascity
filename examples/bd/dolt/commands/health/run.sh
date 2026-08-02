@@ -262,8 +262,8 @@ fi
 #     be backed up), unlike the historical fail-open where stale=false was
 #     just an initializer that never got overwritten.
 #   - server unreachable (remotes unknowable)          -> unknown, stale=true
-backup_stale_threshold="${GC_DOLT_BACKUP_STALE_SECS:-7200}"
-case "$backup_stale_threshold" in ''|*[!0-9]*) backup_stale_threshold=7200 ;; esac
+backup_stale_threshold="${GC_DOLT_BACKUP_STALE_SECS:-1800}"
+case "$backup_stale_threshold" in ''|*[!0-9]*) backup_stale_threshold=1800 ;; esac
 backup_freshness=""
 backup_age_sec=0
 backup_stale=true
@@ -272,8 +272,9 @@ backup_detail=""
 bf_now=$(date +%s)
 bf_any_remote_db=false
 bf_any_bad=false
+bf_any_unknown=false
 bf_probe_failed=false
-bf_newest_epoch=0
+bf_oldest_epoch=0
 if [ "$server_reachable" = true ] && [ -n "$db_info" ]; then
   # Parse the per-db lines collected above (name|commits|open_beads|remotes).
   bf_lines=$(printf '%s' "$db_info")
@@ -301,12 +302,13 @@ if [ "$server_reachable" = true ] && [ -n "$db_info" ]; then
           else
             bf_state="stale"
           fi
-          if [ "$bf_epoch" -gt "$bf_newest_epoch" ]; then
-            bf_newest_epoch="$bf_epoch"
+          if [ "$bf_oldest_epoch" -eq 0 ] || [ "$bf_epoch" -lt "$bf_oldest_epoch" ]; then
+            bf_oldest_epoch="$bf_epoch"
           fi
           ;;
       esac
     fi
+    [ "$bf_state" = "unknown" ] && bf_any_unknown=true
     [ "$bf_state" = "ok" ] || bf_any_bad=true
     backup_detail="$backup_detail$bf_name|$bf_state|$bf_age|$bf_refspec
 "
@@ -316,20 +318,19 @@ BFEOF
   if [ "$bf_any_remote_db" = false ] && [ "$bf_probe_failed" = false ]; then
     backup_state="no-remotes"
     backup_stale=false
-  elif [ "$bf_any_bad" = true ] || [ "$bf_probe_failed" = true ]; then
+  elif [ "$bf_probe_failed" = true ] || [ "$bf_any_unknown" = true ]; then
+    backup_state="unknown"
     backup_stale=true
-    if [ "$bf_newest_epoch" -gt 0 ]; then
-      backup_state="stale"
-    else
-      backup_state="unknown"
-    fi
+  elif [ "$bf_any_bad" = true ]; then
+    backup_state="stale"
+    backup_stale=true
   else
     backup_state="ok"
     backup_stale=false
   fi
 fi
-if [ "$bf_newest_epoch" -gt 0 ]; then
-  backup_age_sec=$((bf_now - bf_newest_epoch))
+if [ "$bf_oldest_epoch" -gt 0 ] && [ "$bf_any_unknown" = false ] && [ "$bf_probe_failed" = false ]; then
+  backup_age_sec=$((bf_now - bf_oldest_epoch))
   [ "$backup_age_sec" -lt 0 ] && backup_age_sec=0
   if [ "$backup_age_sec" -ge 3600 ]; then
     backup_freshness="$((backup_age_sec / 3600))h$((backup_age_sec % 3600 / 60))m"
