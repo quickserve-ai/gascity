@@ -1745,6 +1745,7 @@ func TestCmdSlingRawSingletonTemplateRoutesToCanonicalNamedSession(t *testing.T)
 	t.Setenv("GC_BEADS", "file")
 
 	cityDir := t.TempDir()
+	t.Setenv("GC_CITY", cityDir)
 	rigDir := filepath.Join(cityDir, "qcore")
 	if err := os.MkdirAll(rigDir, 0o755); err != nil {
 		t.Fatalf("MkdirAll(rig): %v", err)
