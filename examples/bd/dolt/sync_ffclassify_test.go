@@ -52,6 +52,46 @@ func runFFSync(t *testing.T, binDir string, args ...string) string {
 	return string(out)
 }
 
+// runFFSyncState is runFFSync plus the pack state dir, for tests that assert on
+// the backup-freshness stamp (qc-lu207) a classification leaves behind rather
+// than on push/no-push behavior. The stamp is what `gc dolt health` reads, so
+// these tests are the seam where sync's classification meets health's verdict.
+func runFFSyncState(t *testing.T, binDir string, args ...string) (string, string) {
+	t.Helper()
+	root := repoRoot(t)
+	script := filepath.Join(root, syncScript)
+	port, cleanup := startReachableTCPListener(t)
+	defer cleanup()
+
+	cityPath := t.TempDir()
+	dataDir := filepath.Join(cityPath, "data")
+	stateDir := filepath.Join(cityPath, "pack-state")
+	if err := os.MkdirAll(filepath.Join(dataDir, "app", ".dolt"), 0o755); err != nil {
+		t.Fatalf("mkdir db: %v", err)
+	}
+	writeSyncFakeBeadsBD(t, cityPath)
+
+	cmd := exec.Command("sh", append([]string{script}, args...)...)
+	cmd.Env = append(syncFilteredEnv(),
+		"PATH="+binDir+":"+os.Getenv("PATH"),
+		"GC_CITY_PATH="+cityPath,
+		"GC_PACK_DIR="+root,
+		"GC_PACK_STATE_DIR="+stateDir,
+		"GC_DOLT_DATA_DIR="+dataDir,
+		fmt.Sprintf("GC_DOLT_PORT=%d", port),
+		"GC_DOLT_USER=root",
+		"GC_DOLT_PASSWORD=",
+	)
+	out, _ := cmd.CombinedOutput()
+	return string(out), stateDir
+}
+
+func stampExists(t *testing.T, stateDir, db string) bool {
+	t.Helper()
+	_, err := os.Stat(filepath.Join(stateDir, "backup-freshness", db))
+	return err == nil
+}
+
 // runFFSyncStatus is runFFSync plus the process exit code, for tests that
 // assert on the exit-code contract rather than just push/no-push behavior.
 func runFFSyncStatus(t *testing.T, binDir string, args ...string) (string, int) {
@@ -209,6 +249,66 @@ func TestSyncUpToDateSkipsPush(t *testing.T) {
 	}
 	if !strings.Contains(out, "up-to-date") {
 		t.Fatalf("expected an 'up-to-date' status.\nout:\n%s", out)
+	}
+}
+
+// TestSyncUpToDateStampsBackupFreshness is the regression for the gap between
+// qc-lu207's stamp and gc-6ommo's classifier: the stamp used to be written
+// ONLY on a successful push, but "up-to-date" is precisely the state in which
+// there is nothing to push. A database that was fully caught up therefore never
+// refreshed its stamp, decayed past the staleness threshold, and `gc dolt
+// health` reported "no successful push recorded" — the same verdict it gives a
+// database that has never been backed up at all, while the patrol line right
+// above it said "up-to-date with origin:main". qc-lu207's stated goal was that
+// "health and dolt-remotes-patrol finally agree"; without this stamp they
+// contradict each other exactly when the mirror is healthy.
+func TestSyncUpToDateStampsBackupFreshness(t *testing.T) {
+	binDir := t.TempDir()
+	logPath := writeSyncFakeDoltClassify(t, binDir, 0, 0)
+	out, stateDir := runFFSyncState(t, binDir, "--db", "app")
+	if pushed(readLog(t, logPath)) {
+		t.Fatalf("up-to-date DB must still NOT be pushed.\nout:\n%s", out)
+	}
+	if !stampExists(t, stateDir, "app") {
+		t.Fatalf("up-to-date DB must stamp backup freshness — health cannot "+
+			"otherwise distinguish a mirrored DB from a never-pushed one.\nout:\n%s", out)
+	}
+}
+
+// TestSyncNonFastForwardStatesDoNotStamp guards the other half of the contract:
+// stamping on up-to-date must NOT leak into states where the mirror provably
+// does not hold our commits. health fails closed on a missing stamp, and that
+// is the desired verdict for behind / diverged / classify-failed — stamping any
+// of them would manufacture a false "ok" for an unmirrored database.
+func TestSyncNonFastForwardStatesDoNotStamp(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		ahead, behind int
+	}{
+		{"behind", 0, 3},
+		{"diverged", 2, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			binDir := t.TempDir()
+			writeSyncFakeDoltClassify(t, binDir, tc.ahead, tc.behind)
+			out, stateDir := runFFSyncState(t, binDir, "--db", "app")
+			if stampExists(t, stateDir, "app") {
+				t.Fatalf("%s DB must NOT stamp backup freshness — health must keep "+
+					"failing closed.\nout:\n%s", tc.name, out)
+			}
+		})
+	}
+}
+
+// TestSyncDryRunUpToDateDoesNotStamp keeps --dry-run a pure probe. A preview
+// that stamped would let a health-style dry-run invocation forge its own
+// freshness evidence without any push or fetch-verified agreement.
+func TestSyncDryRunUpToDateDoesNotStamp(t *testing.T) {
+	binDir := t.TempDir()
+	writeSyncFakeDoltClassify(t, binDir, 0, 0)
+	out, stateDir := runFFSyncState(t, binDir, "--dry-run", "--db", "app")
+	if stampExists(t, stateDir, "app") {
+		t.Fatalf("--dry-run must not write a backup-freshness stamp.\nout:\n%s", out)
 	}
 }
 

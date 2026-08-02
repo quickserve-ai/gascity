@@ -455,7 +455,22 @@ sync_database_sql() {
 
   if [ "$ff_decision" = "skip" ]; then
     case "$ff_status" in
-      up-to-date) echo "  $name: up-to-date with $remote_name:$remote_branch" ;;
+      up-to-date)
+        # Stamp here too, not only on a push. `up-to-date` was just established
+        # by a successful DOLT_FETCH plus a two-way ancestry comparison against
+        # remotes/<remote>/<branch>, which is STRONGER evidence that the mirror
+        # holds our data than a push exit code (qc-lu207's stamp explicitly
+        # means "the pusher believes the push succeeded", not remote-confirmed
+        # receipt). Without this the stamp only ever advances when there is
+        # something to push, so a quiet, fully-mirrored database decays to
+        # "no successful push recorded" — indistinguishable from one that has
+        # never been backed up, and health then contradicts the patrol line
+        # right above it. Deliberately NOT extended to behind / diverged /
+        # classify-failed / fetch-failure: those must stay unstamped so health
+        # keeps failing closed. --dry-run returns before this block, so a probe
+        # never stamps.
+        write_backup_push_stamp "$name" "$remote_name" "$local_branch" "$remote_branch"
+        echo "  $name: up-to-date with $remote_name:$remote_branch" ;;
       behind*)    echo "  $name: $ff_status — pull needed (gc dolt pull)" ;;
       diverged*)  echo "  $name: $ff_status — manual reconcile" >&2 ;;
       *)          echo "  $name: skipped [$ff_status]" ;;
