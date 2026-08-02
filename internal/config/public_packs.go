@@ -37,13 +37,11 @@ const (
 	// import and is fetched from git for real — so editing a pin always
 	// does what it says. The pin names a real gascity.git commit where the
 	// bundled pack paths exist, keeping that fetch path honest.
-	// NOTE (platform fork): this pin names a commit on the local
-	// v1.3.5-platform fork, not a gastownhall/gascity commit — the fork IS
-	// the distribution for this machine's cities, and the binary serves the
-	// pinned content from its embedded FS, so the network fetch path is
-	// never taken here. Carries the qc-lu207 backup-freshness fix and the
-	// qc-nxq5q OMP hook-v3 PATH fix.
-	BundledPackImportVersion = "sha:997b8a563e6d460e6716ecf466b8905049f64139"
+	// NOTE (platform fork): this pin names a commit on the carry/operational
+	// fork, not a gastownhall/gascity commit — the fork IS the distribution
+	// for this machine's cities, and the binary serves the pinned content from
+	// its embedded FS. Carries the ga-a8w1c mirror-verification freshness fix.
+	BundledPackImportVersion = "sha:e37a541e1dc4444e0792272d4029e0b330d82616"
 )
 
 // SupersededBundledPackImportVersions lists previous canonical pins for the
@@ -67,6 +65,9 @@ var SupersededBundledPackImportVersions = []string{
 	// qc-lu207-only fork pin, superseded before it ever deployed (the
 	// window binary was rebuilt to add the OMP hook-v3 fix).
 	"sha:f4128e404f6e8329fabb6343f8825f6db753e01b",
+	// qc-lu207 + OMP hook-v3 pin, superseded by ga-a8w1c's
+	// mirror-verification freshness semantics.
+	"sha:997b8a563e6d460e6716ecf466b8905049f64139",
 }
 
 // SupersededPublicGastownPackVersions lists previous canonical pins for the
