@@ -127,6 +127,17 @@ func writeSyncFakeDoltClassify(t *testing.T, dir string, ahead, behind int) stri
 	return installFFFakeDolt(t, dir, body)
 }
 
+func writeSyncFakeDoltMalformedClassify(t *testing.T, dir string) string {
+	t.Helper()
+	branch := "main"
+	logPath := filepath.Join(dir, "dolt.log")
+	body := fakeDoltHeader(logPath, branch) +
+		"  *\"CALL DOLT_FETCH(\"*) exit 0 ;;\n" +
+		"  *\"dolt_log(\"*) printf 'n\\n' ; exit 0 ;;\n" +
+		"esac\nexit 0\n"
+	return installFFFakeDolt(t, dir, body)
+}
+
 // writeSyncFakeDoltFetchTimeout: the DOLT_FETCH call exits 124 (timeout).
 func writeSyncFakeDoltFetchTimeout(t *testing.T, dir, branch string) string {
 	t.Helper()
@@ -209,6 +220,97 @@ func TestSyncUpToDateSkipsPush(t *testing.T) {
 	}
 	if !strings.Contains(out, "up-to-date") {
 		t.Fatalf("expected an 'up-to-date' status.\nout:\n%s", out)
+	}
+}
+
+func TestSyncUpToDateRefreshesMirrorFreshness(t *testing.T) {
+	binDir := t.TempDir()
+	logPath := writeSyncFakeDoltClassify(t, binDir, 0, 0)
+	cityPath := t.TempDir()
+	dataDir := filepath.Join(cityPath, "data")
+	if err := os.MkdirAll(filepath.Join(dataDir, "app", ".dolt"), 0o755); err != nil {
+		t.Fatalf("mkdir db: %v", err)
+	}
+	writeSyncFakeBeadsBD(t, cityPath)
+	port, cleanup := startReachableTCPListener(t)
+	defer cleanup()
+	stamp := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "backup-freshness", "app")
+	if err := os.MkdirAll(filepath.Dir(stamp), 0o755); err != nil {
+		t.Fatalf("mkdir freshness dir: %v", err)
+	}
+	if err := os.WriteFile(stamp, []byte("pushed_at_epoch=1\nremote=old\nrefspec=old:old\n"), 0o644); err != nil {
+		t.Fatalf("seed stale freshness: %v", err)
+	}
+
+	root := repoRoot(t)
+	cmd := exec.Command("sh", filepath.Join(root, syncScript), "--db", "app")
+	cmd.Env = append(syncFilteredEnv(),
+		"PATH="+binDir+":"+os.Getenv("PATH"),
+		"GC_CITY_PATH="+cityPath,
+		"GC_PACK_DIR="+root,
+		"GC_DOLT_DATA_DIR="+dataDir,
+		fmt.Sprintf("GC_DOLT_PORT=%d", port),
+		"GC_DOLT_USER=root",
+		"GC_DOLT_PASSWORD=",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("up-to-date sync failed: %v\n%s", err, out)
+	}
+	if pushed(readLog(t, logPath)) {
+		t.Fatalf("up-to-date DB must NOT be pushed.\nout:\n%s", out)
+	}
+	raw, err := os.ReadFile(stamp)
+	if err != nil {
+		t.Fatalf("read refreshed mirror freshness: %v\nout:\n%s", err, out)
+	}
+	content := string(raw)
+	if strings.Contains(content, "pushed_at_epoch=1\n") || !strings.Contains(content, "remote=origin\n") || !strings.Contains(content, "refspec=main:main\n") {
+		t.Fatalf("up-to-date verification did not refresh the expected target:\n%s\nout:\n%s", content, out)
+	}
+}
+
+func TestSyncMalformedClassificationDoesNotRefreshMirrorFreshness(t *testing.T) {
+	binDir := t.TempDir()
+	writeSyncFakeDoltMalformedClassify(t, binDir)
+	cityPath := t.TempDir()
+	dataDir := filepath.Join(cityPath, "data")
+	if err := os.MkdirAll(filepath.Join(dataDir, "app", ".dolt"), 0o755); err != nil {
+		t.Fatalf("mkdir db: %v", err)
+	}
+	writeSyncFakeBeadsBD(t, cityPath)
+	port, cleanup := startReachableTCPListener(t)
+	defer cleanup()
+	stamp := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "backup-freshness", "app")
+	if err := os.MkdirAll(filepath.Dir(stamp), 0o755); err != nil {
+		t.Fatalf("mkdir freshness dir: %v", err)
+	}
+	oldStamp := []byte("pushed_at_epoch=1\nremote=origin\nrefspec=main:main\n")
+	if err := os.WriteFile(stamp, oldStamp, 0o644); err != nil {
+		t.Fatalf("seed stale freshness: %v", err)
+	}
+
+	root := repoRoot(t)
+	cmd := exec.Command("sh", filepath.Join(root, syncScript), "--db", "app")
+	cmd.Env = append(syncFilteredEnv(),
+		"PATH="+binDir+":"+os.Getenv("PATH"),
+		"GC_CITY_PATH="+cityPath,
+		"GC_PACK_DIR="+root,
+		"GC_DOLT_DATA_DIR="+dataDir,
+		fmt.Sprintf("GC_DOLT_PORT=%d", port),
+		"GC_DOLT_USER=root",
+		"GC_DOLT_PASSWORD=",
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("malformed classification must fail closed\nout:\n%s", out)
+	}
+	raw, readErr := os.ReadFile(stamp)
+	if readErr != nil {
+		t.Fatalf("read unchanged freshness stamp: %v", readErr)
+	}
+	if string(raw) != string(oldStamp) {
+		t.Fatalf("malformed classification refreshed mirror freshness:\n%s\nout:\n%s", raw, out)
 	}
 }
 
