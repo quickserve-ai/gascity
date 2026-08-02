@@ -33,21 +33,21 @@ else
 fi
 DOLT_PROVIDER_STATE_FILE="$DOLT_STATE_DIR/dolt-provider-state.json"
 
-# Backup push-success stamps (qc-lu207). One file per database under
-# $PACK_STATE_DIR/backup-freshness/<db>, written by the push paths (sync,
-# compact) on push success and read by health's backup-freshness check.
+# Backup remote-verification stamps (qc-lu207, ga-a8w1c). One file per
+# database under $PACK_STATE_DIR/backup-freshness/<db>, written after a push
+# succeeds OR a fetch-and-classify proves local and remote are up to date.
+# Health reads these stamps without making its own network round trip.
 #
-# SEMANTICS — a stamp means "the pusher believes the push succeeded" (the
-# push call returned 0), NOT "the remote confirmed receipt". Verifying the
-# remote would take a network round-trip on every health call, which would
-# hang exactly when the remote is down — i.e. exactly when someone runs
-# health. The stamp is the deliberate cheap, local proxy; do not "upgrade"
-# it to a remote probe.
+# SEMANTICS — a stamp means "the sync path recently proved the remote contains
+# the local branch", either because the push returned 0 or because a successful
+# fetch found zero commits ahead and behind. This local proxy avoids remote
+# probes in health itself, which must stay cheap and bounded when the remote is
+# down.
 BACKUP_FRESHNESS_DIR="$PACK_STATE_DIR/backup-freshness"
 
 # write_backup_push_stamp <db> <remote> <local_branch> <remote_branch>
-# Best-effort: a stamp failure must never fail the push path that already
-# succeeded, so every step degrades to a silent no-op. tmp+mv keeps a
+# Best-effort: a stamp failure must never fail a successful push or remote
+# verification, so every step degrades to a silent no-op. tmp+mv keeps a
 # concurrent health read from seeing a torn file.
 write_backup_push_stamp() {
   bfs_db="$1"
