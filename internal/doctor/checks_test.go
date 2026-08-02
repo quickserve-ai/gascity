@@ -2921,6 +2921,200 @@ func TestDoltNomsSizeCheck_OrphanDatabaseWarnAtThreshold(t *testing.T) {
 	}
 }
 
+// TestDoltNomsSizeCheck_OutOfCityRigNotLabeledOrphan is a regression test for
+// ga-w7xo: a database that is referenced by an out-of-city rig scope root's
+// metadata.json must not be labeled "orphan database" even when
+// ResolveScopeConfigState fails for that scope root.
+func TestDoltNomsSizeCheck_OutOfCityRigNotLabeledOrphan(t *testing.T) {
+	cityDir := setupManagedDoltCity(t) // sets up "hq" as the city's managed db
+
+	// Create a configured out-of-city rig root with metadata that names "qcore".
+	rigDir := t.TempDir()
+	cityConfig := fmt.Sprintf("[workspace]\nname = %q\n\n[[rigs]]\nname = %q\npath = %q\n", "test", "qcore", rigDir)
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte(cityConfig), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(rigDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeDoctorCanonicalMetadata(t, fsys.OSFS{}, rigDir, "qcore")
+
+	// Create the "qcore" database directory in the city's managed data dir.
+	// The check must NOT label it "orphan database qcore".
+	writeFakeFile(t, filepath.Join(cityDir, ".beads", "dolt", "qcore", ".dolt", "noms", "big"), 3*1024*1024*1024)
+
+	// Build the check directly, injecting scope roots that include the out-of-city rig.
+	// applicableKnown=true bypasses the config-based applicable check so we can
+	// control scope roots without needing a full city.toml with a rig declaration.
+	c := &DoltNomsSizeCheck{
+		cityPath:        cityDir,
+		skip:            false,
+		measureDir:      sumDirBytes,
+		applicableKnown: true,
+		applicable:      true,
+		scopeRoots:      []string{cityDir, rigDir},
+	}
+	r := c.Run(&CheckContext{})
+
+	// The check may warn (large qcore db) but must not label qcore as orphan.
+	if strings.Contains(r.Message, "orphan database qcore") {
+		t.Fatalf("qcore must not be labeled orphan: message = %q", r.Message)
+	}
+}
+
+func TestDoltNomsSizeCheck_ExplicitRigOnManagedEndpointNotLabeledOrphan(t *testing.T) {
+	cityDir := setupManagedDoltCity(t)
+	cityTarget, err := contract.ResolveDoltConnectionTarget(fsys.OSFS{}, cityDir, cityDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rigDir := t.TempDir()
+	fs := fsys.OSFS{}
+	writeDoctorCanonicalConfig(t, fs, rigDir, contract.ConfigState{
+		IssuePrefix:    "qc",
+		EndpointOrigin: contract.EndpointOriginExplicit,
+		EndpointStatus: contract.EndpointStatusVerified,
+		DoltHost:       "localhost",
+		DoltPort:       cityTarget.Port,
+	})
+	if err := os.MkdirAll(filepath.Join(rigDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeDoctorCanonicalMetadata(t, fs, rigDir, "qcore")
+	writeFakeFile(t, filepath.Join(cityDir, ".beads", "dolt", "qcore", ".dolt", "noms", "big"), 3*1024*1024*1024)
+
+	c := &DoltNomsSizeCheck{
+		cityPath:        cityDir,
+		skip:            false,
+		measureDir:      sumDirBytes,
+		applicableKnown: true,
+		applicable:      true,
+		scopeRoots:      []string{cityDir, rigDir},
+	}
+	r := c.Run(&CheckContext{})
+
+	if strings.Contains(r.Message, "orphan database qcore") {
+		t.Fatalf("rig on managed city endpoint must not be labeled orphan: message = %q", r.Message)
+	}
+}
+
+func TestDoltNomsSizeCheck_DistinctLoopbackRigDoesNotMaskOrphan(t *testing.T) {
+	cityDir := setupManagedDoltCity(t)
+	cityTarget, err := contract.ResolveDoltConnectionTarget(fsys.OSFS{}, cityDir, cityDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rigDir := t.TempDir()
+	fs := fsys.OSFS{}
+	writeDoctorCanonicalConfig(t, fs, rigDir, contract.ConfigState{
+		IssuePrefix:    "qc",
+		EndpointOrigin: contract.EndpointOriginExplicit,
+		EndpointStatus: contract.EndpointStatusVerified,
+		DoltHost:       "127.0.0.2",
+		DoltPort:       cityTarget.Port,
+	})
+	if err := os.MkdirAll(filepath.Join(rigDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeDoctorCanonicalMetadata(t, fs, rigDir, "qcore")
+	writeFakeFile(t, filepath.Join(cityDir, ".beads", "dolt", "qcore", ".dolt", "noms", "big"), 3*1024*1024*1024)
+
+	c := &DoltNomsSizeCheck{cityPath: cityDir, measureDir: sumDirBytes, applicableKnown: true, applicable: true, scopeRoots: []string{cityDir, rigDir}}
+	r := c.Run(&CheckContext{})
+	if !strings.Contains(r.Message, "orphan database qcore") {
+		t.Fatalf("distinct loopback endpoint must not mask a managed orphan: message = %q", r.Message)
+	}
+}
+
+func TestDoltNomsSizeCheck_ExternalRigMetadataDoesNotMaskOrphan(t *testing.T) {
+	cityDir := setupManagedDoltCity(t)
+	rigDir := t.TempDir()
+	fs := fsys.OSFS{}
+	writeDoctorCanonicalConfig(t, fs, rigDir, contract.ConfigState{
+		IssuePrefix:    "qc",
+		EndpointOrigin: contract.EndpointOriginExplicit,
+		EndpointStatus: contract.EndpointStatusVerified,
+		DoltHost:       "rig-db.example.com",
+		DoltPort:       "4406",
+	})
+	writeDoctorCanonicalMetadata(t, fs, rigDir, "qcore")
+	writeFakeFile(t, filepath.Join(cityDir, ".beads", "dolt", "qcore", ".dolt", "noms", "big"), 3*1024*1024*1024)
+
+	c := &DoltNomsSizeCheck{
+		cityPath:        cityDir,
+		skip:            false,
+		measureDir:      sumDirBytes,
+		applicableKnown: true,
+		applicable:      true,
+		scopeRoots:      []string{cityDir, rigDir},
+	}
+	r := c.Run(&CheckContext{})
+
+	if !strings.Contains(r.Message, "orphan database qcore") {
+		t.Fatalf("external rig metadata must not mask a local orphan: message = %q", r.Message)
+	}
+}
+
+func TestDoltNomsSizeCheck_DoltLiteMetadataDoesNotMaskOrphan(t *testing.T) {
+	cityDir := setupManagedDoltCity(t)
+	rigDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(rigDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := contract.EnsureCanonicalMetadata(fsys.OSFS{}, filepath.Join(rigDir, ".beads", "metadata.json"), contract.MetadataState{
+		Database:     "doltlite",
+		Backend:      "doltlite",
+		DoltDatabase: "qcore",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writeFakeFile(t, filepath.Join(cityDir, ".beads", "dolt", "qcore", ".dolt", "noms", "big"), 3*1024*1024*1024)
+
+	c := &DoltNomsSizeCheck{
+		cityPath:        cityDir,
+		skip:            false,
+		measureDir:      sumDirBytes,
+		applicableKnown: true,
+		applicable:      true,
+		scopeRoots:      []string{cityDir, rigDir},
+	}
+	r := c.Run(&CheckContext{})
+
+	if !strings.Contains(r.Message, "orphan database qcore") {
+		t.Fatalf("DoltLite metadata must not mask a managed Dolt orphan: message = %q", r.Message)
+	}
+}
+
+func TestDoltNomsSizeCheck_EmbeddedDoltMetadataDoesNotMaskOrphan(t *testing.T) {
+	cityDir := setupManagedDoltCity(t)
+	rigDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(rigDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := contract.EnsureCanonicalMetadata(fsys.OSFS{}, filepath.Join(rigDir, ".beads", "metadata.json"), contract.MetadataState{
+		Database:     "dolt",
+		Backend:      "dolt",
+		DoltMode:     "embedded",
+		DoltDatabase: "qcore",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	writeFakeFile(t, filepath.Join(cityDir, ".beads", "dolt", "qcore", ".dolt", "noms", "big"), 3*1024*1024*1024)
+
+	c := &DoltNomsSizeCheck{
+		cityPath:        cityDir,
+		skip:            false,
+		measureDir:      sumDirBytes,
+		applicableKnown: true,
+		applicable:      true,
+		scopeRoots:      []string{cityDir, rigDir},
+	}
+	r := c.Run(&CheckContext{})
+
+	if !strings.Contains(r.Message, "orphan database qcore") {
+		t.Fatalf("embedded Dolt metadata must not mask a managed server orphan: message = %q", r.Message)
+	}
+}
 func TestDoltNomsSizeCheck_SkipsSystemDatabaseMetadata(t *testing.T) {
 	dir := setupManagedDoltCity(t)
 	if err := os.WriteFile(filepath.Join(dir, ".beads", "metadata.json"), []byte(`{"dolt_database":"mysql"}`), 0o644); err != nil {
