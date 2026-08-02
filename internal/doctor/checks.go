@@ -1964,15 +1964,54 @@ func managedLocalDoltScanTargets(cityPath string) ([]doltDataScanTarget, bool) {
 	return managedLocalDoltScanTargetsForScopeRoots(cityPath, managedDoltScopeRoots(cityPath))
 }
 
+func sameManagedDoltHost(left, right string) bool {
+	normalize := func(host string) string {
+		host = strings.ToLower(strings.TrimSpace(host))
+		if host == "localhost" {
+			return "127.0.0.1"
+		}
+		return host
+	}
+	return normalize(left) == normalize(right)
+}
+
 func managedLocalDoltScanTargetsForScopeRoots(cityPath string, scopeRoots []string) ([]doltDataScanTarget, bool) {
 	dataDir := resolveManagedDoltDataDir(cityPath)
 	seenRoots := map[string]struct{}{}
 	targets := make([]doltDataScanTarget, 0, len(scopeRoots))
 	unresolved := false
+	directKnownDBs := make(map[string]struct{})
+	rememberDirectDatabase := func(scopeRoot string) {
+		metadata, ok, err := contract.LoadMetadataState(fsys.OSFS{}, filepath.Join(scopeRoot, ".beads", "metadata.json"))
+		if err != nil || !ok || metadata.Backend != "dolt" || metadata.DoltMode != "server" {
+			return
+		}
+		db := strings.TrimSpace(metadata.DoltDatabase)
+		if isManagedDoltUserDatabase(db) {
+			directKnownDBs[db] = struct{}{}
+		}
+	}
 	for _, scopeRoot := range scopeRoots {
 		target, _, active, err := validateBDStoreTarget(cityPath, scopeRoot)
 		if err == nil {
-			if !active || target.External {
+			if !active {
+				// scopeRoots comes from the city rig roster (or the conservative
+				// filesystem fallback). A rig with metadata but no resolvable
+				// canonical endpoint still references its named managed database.
+				if !sameDoctorScope(scopeRoot, cityPath) {
+					rememberDirectDatabase(scopeRoot)
+					unresolved = true
+				}
+				continue
+			}
+			if target.External {
+				// A rig can explicitly pin the same local server used by the managed
+				// city. ResolveDoltConnectionTarget calls that shape "external" even
+				// though its database lives under the city's managed data directory.
+				cityTarget, cityErr := contract.ResolveDoltConnectionTarget(fsys.OSFS{}, cityPath, cityPath)
+				if cityErr == nil && sameManagedDoltHost(target.Host, cityTarget.Host) && target.Port == cityTarget.Port {
+					rememberDirectDatabase(scopeRoot)
+				}
 				continue
 			}
 			db := strings.TrimSpace(target.Database)
@@ -1993,6 +2032,10 @@ func managedLocalDoltScanTargetsForScopeRoots(cityPath string, scopeRoots []stri
 		resolved, resolveErr := contract.ResolveScopeConfigState(fsys.OSFS{}, cityPath, scopeRoot, "")
 		if resolveErr != nil || resolved.Kind != contract.ScopeConfigAuthoritative {
 			unresolved = true
+			// A configured active scope whose endpoint cannot be resolved
+			// authoritatively still references its metadata-named managed database.
+			// Successfully resolved external scopes never reach this fallback.
+			rememberDirectDatabase(scopeRoot)
 			continue
 		}
 		switch resolved.State.EndpointOrigin {
@@ -2032,7 +2075,8 @@ func managedLocalDoltScanTargetsForScopeRoots(cityPath string, scopeRoots []stri
 			if info, statErr := os.Stat(scanRoot); statErr != nil || !info.IsDir() {
 				continue
 			}
-			appendDoltDataScanTarget(&targets, seenRoots, db, scanRoot, true)
+			_, directlyKnown := directKnownDBs[db]
+			appendDoltDataScanTarget(&targets, seenRoots, db, scanRoot, !directlyKnown)
 		}
 	} else if !os.IsNotExist(err) {
 		unresolved = true
