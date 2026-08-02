@@ -92,6 +92,12 @@ work_query = "printf '[]'"
 	}
 }
 
+func TestHookWorkQueryTimeoutRestoredAfterRouteIndex(t *testing.T) {
+	if hookWorkQueryTimeout != 30*time.Second {
+		t.Fatalf("hookWorkQueryTimeout = %s, want 30s after ga-j2bv route index deployment", hookWorkQueryTimeout)
+	}
+}
+
 // TestShellWorkQueryTimeoutClassifiesTransient guards the contract the
 // control-dispatcher --follow loop depends on: a work-query timeout must be
 // classifiable as a transient store error (wrapping context.DeadlineExceeded)
