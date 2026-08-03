@@ -91,6 +91,7 @@ func freshWakeResetPriorValues(info sessions.Info) map[string]string {
 		"started_config_hash":     info.StartedConfigHash,
 		"started_live_hash":       info.StartedLiveHash,
 		"live_hash":               info.LiveHash,
+		"resume_seeded":           info.ResumeSeeded,
 		"startup_dialog_verified": info.StartupDialogVerified,
 		// Priming markers share the fresh-wake reset (S19 Stage 2), so their prior
 		// values come off the verbatim raw Info mirrors — otherwise the trace's
