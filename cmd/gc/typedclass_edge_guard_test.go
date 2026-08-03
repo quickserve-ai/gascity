@@ -168,7 +168,8 @@ var typedClassCodecCensus = map[string]map[string]int{
 		// internals + internal/mail/beadmail's same-module compile dependency. Full sync
 		// typing is a separate out-of-budget W-sync wave (see tickfeed-design §3
 		// W-unexport).
-		"cmd/gc/session_beads.go": 1,
+		"cmd/gc/session_beads.go":            1,
+		"cmd/gc/bd_assignee_canonicalize.go": 1,
 	},
 	// ResolveSessionBeadByExactID( is now all-zero in the interior: the
 	// worker-boundary resolve+construct site moved to ResolveSessionRecordByExactID
