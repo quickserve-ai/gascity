@@ -141,6 +141,14 @@ func (r ProxiedOpenReport) diagnostic(verdict ProxiedVerdict, detail string) *Pr
 	}
 }
 
+// IsSchemaSkewDiagnostic reports whether native store selection fell back
+// because the database schema is newer than the embedded beads library.
+func IsSchemaSkewDiagnostic(diag BeadsDiagnostic) bool {
+	return diag.PreflightGate == "native_open" &&
+		strings.Contains(diag.PreflightReason, "schema version mismatch: database is at v") &&
+		strings.Contains(diag.PreflightReason, "binary knows up to v")
+}
+
 // StoreOpenOptions holds dependencies for opening a beads Store.
 type StoreOpenOptions struct {
 	ScopeRoot        string
@@ -491,11 +499,14 @@ func StampOpenedStore(store Store, kind string, mode gate.Mode, onDegrade func(C
 func (opts StoreOpenOptions) unstampableResult(result StoreOpenResult, mode gate.Mode, reason string) (StoreOpenResult, error) {
 	switch mode {
 	case gate.Require:
+		// Refuse the store but preserve its native-selection diagnostic so
+		// lifecycle callers can still recognize a more fundamental schema skew.
+		result.Store = nil
 		refusal := &ConditionalWritesRequiredError{StoreKind: result.Diagnostic.Store, Reason: reason}
 		if opts.ScopeRoot == "" {
-			return StoreOpenResult{}, fmt.Errorf("opening %s: %w", result.Diagnostic.Store, refusal)
+			return result, fmt.Errorf("opening %s: %w", result.Diagnostic.Store, refusal)
 		}
-		return StoreOpenResult{}, fmt.Errorf("opening %s at %s: %w", result.Diagnostic.Store, opts.ScopeRoot, refusal)
+		return result, fmt.Errorf("opening %s at %s: %w", result.Diagnostic.Store, opts.ScopeRoot, refusal)
 	case gate.Auto:
 		if opts.Logger != nil {
 			opts.Logger.Warn("conditional_writes degraded at open",
