@@ -232,6 +232,35 @@ func TestOpenStoreAtForCityNativeOpenFailureFallsBackWithDiagnostic(t *testing.T
 	}
 }
 
+func TestIsSchemaSkewDiagnostic(t *testing.T) {
+	diag := BeadsDiagnostic{
+		Store:           BeadsStoreNameBdStore,
+		PreflightGate:   "native_open",
+		PreflightReason: "opening native store: schema version mismatch: database is at v55, binary knows up to v54 (1 migration ahead)",
+	}
+	if !IsSchemaSkewDiagnostic(diag) {
+		t.Fatal("IsSchemaSkewDiagnostic = false, want true")
+	}
+	diag.PreflightReason = "dial native: connection refused"
+	if IsSchemaSkewDiagnostic(diag) {
+		t.Fatal("IsSchemaSkewDiagnostic = true for non-schema native-open failure")
+	}
+
+	// The schema-based preflight refuses a newer store before any open.
+	diag = BeadsDiagnostic{
+		Store:           BeadsStoreNameBdStore,
+		PreflightGate:   string(contract.PreflightCheckVersionCompat),
+		PreflightReason: "database main-lane schema is version 67, ahead of the linked beads library's schema 66; the linked library cannot open this database (schema skew)",
+	}
+	if !IsSchemaSkewDiagnostic(diag) {
+		t.Fatal("IsSchemaSkewDiagnostic = false for a version_compat ahead refusal, want true")
+	}
+	diag.PreflightReason = "database main-lane schema is version 65, behind the linked beads library's schema 66; opening would let the linked library migrate this database, so it needs an explicit opt-in"
+	if IsSchemaSkewDiagnostic(diag) {
+		t.Fatal("IsSchemaSkewDiagnostic = true for a version_compat behind refusal: the store is older, not newer")
+	}
+}
+
 func TestOpenStoreAtForCityExecBdContractFallbackUsesExecStore(t *testing.T) {
 	t.Setenv(nativeForceFallbackEnv, "")
 	scope := "/city"
