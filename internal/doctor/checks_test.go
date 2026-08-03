@@ -1274,6 +1274,81 @@ func TestBeadsStoreCheck_WarnsOnBdStoreFallback(t *testing.T) {
 	}
 }
 
+func TestBeadsStoreCheck_FailsOnSchemaSkewFallback(t *testing.T) {
+	dir := setupCity(t, "[workspace]\nname = \"test\"\n\n[beads]\nprovider = \"file\"\n")
+	spy := &spyPingStore{pingFunc: func() error { return nil }}
+	c := NewBeadsStoreCheck(dir, func(_ string) (beads.StoreOpenResult, error) {
+		return beads.StoreOpenResult{
+			Store: spy,
+			Diagnostic: beads.BeadsDiagnostic{
+				Store:               beads.BeadsStoreNameBdStore,
+				NativeStoreEligible: false,
+				PreflightGate:       "native_open",
+				PreflightReason:     "schema version mismatch: database is at v55, binary knows up to v54 (1 migration ahead)",
+			},
+		}, nil
+	})
+	r := c.Run(&CheckContext{})
+	if r.Status != StatusError {
+		t.Fatalf("status = %d, want Error; msg = %s", r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, "schema version mismatch") {
+		t.Fatalf("message = %q, want schema mismatch cause", r.Message)
+	}
+	if !strings.Contains(r.FixHint, "refusing session reconciliation") {
+		t.Fatalf("FixHint = %q, want fail-closed reconciliation guidance", r.FixHint)
+	}
+}
+
+func TestBeadsStoreCheck_SchemaSkewWinsOverFallbackPingFailure(t *testing.T) {
+	dir := setupCity(t, "[workspace]\nname = \"test\"\n\n[beads]\nprovider = \"file\"\n")
+	spy := &spyPingStore{pingFunc: func() error { return errors.New("fallback bd is also stale") }}
+	c := NewBeadsStoreCheck(dir, func(_ string) (beads.StoreOpenResult, error) {
+		return beads.StoreOpenResult{
+			Store: spy,
+			Diagnostic: beads.BeadsDiagnostic{
+				Store:               beads.BeadsStoreNameBdStore,
+				NativeStoreEligible: false,
+				PreflightGate:       "native_open",
+				PreflightReason:     "schema version mismatch: database is at v55, binary knows up to v54 (1 migration ahead)",
+			},
+		}, nil
+	})
+	r := c.Run(&CheckContext{})
+	if r.Status != StatusError || !strings.Contains(r.Message, "native store schema mismatch") {
+		t.Fatalf("result = status %d message %q, want explicit schema mismatch blocker", r.Status, r.Message)
+	}
+}
+
+func TestBeadsStoreCheck_SchemaSkewWinsOverFallbackOpenFailure(t *testing.T) {
+	dir := setupCity(t, "[workspace]\nname = \"test\"\n\n[beads]\nprovider = \"file\"\n")
+	c := NewBeadsStoreCheck(dir, func(_ string) (beads.StoreOpenResult, error) {
+		return beads.StoreOpenResult{Diagnostic: beads.BeadsDiagnostic{
+			Store: beads.BeadsStoreNameBdStore, PreflightGate: "native_open",
+			PreflightReason: "schema version mismatch: database is at v55, binary knows up to v54 (1 migration ahead)",
+		}}, errors.New("fallback executable unavailable")
+	})
+	r := c.Run(&CheckContext{})
+	if r.Status != StatusError || !strings.Contains(r.Message, "native store schema mismatch") {
+		t.Fatalf("result = status %d message %q, want explicit schema mismatch blocker", r.Status, r.Message)
+	}
+}
+
+func TestBeadsStoreCheck_WarnsOnExecStoreFallback(t *testing.T) {
+	dir := setupCity(t, "[workspace]\nname = \"test\"\n\n[beads]\nprovider = \"file\"\n")
+	spy := &spyPingStore{pingFunc: func() error { return nil }}
+	c := NewBeadsStoreCheck(dir, func(_ string) (beads.StoreOpenResult, error) {
+		return beads.StoreOpenResult{Store: spy, Diagnostic: beads.BeadsDiagnostic{
+			Store: beads.BeadsStoreNameExecStore, PreflightGate: "bd_context_agreement",
+			PreflightReason: "native store context mismatch",
+		}}, nil
+	})
+	r := c.Run(&CheckContext{})
+	if r.Status != StatusWarning {
+		t.Fatalf("status = %d, want Warning; message = %q", r.Status, r.Message)
+	}
+}
+
 // TestBeadsStoreCheck_NativeStoreDiagnosticStaysOK is the inverse of
 // TestBeadsStoreCheck_WarnsOnBdStoreFallback: a store that opened as the
 // native store (the healthy, non-fallback selection) must not warn.

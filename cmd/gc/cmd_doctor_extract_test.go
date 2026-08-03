@@ -187,6 +187,25 @@ func TestBuildDoctorChecks_StartupHealthEpisodesRegisteredRegardlessOfController
 	}
 }
 
+// TestBuildDoctorChecksKeepsBeadsStoreCheckOnExpandedConfigError: a store whose
+// schema is newer than this binary must stay diagnosable when the expanded
+// config fails to load (ga-mw4dg). No store preflight runs without a loaded
+// config, so nothing clears storeOK and beads-store still registers.
+func TestBuildDoctorChecksKeepsBeadsStoreCheckOnExpandedConfigError(t *testing.T) {
+	cityDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte("[workspace]\nname = \"demo\"\n"), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	names := doctorCheckNames(buildDoctorChecks(cityDir, nil, os.ErrInvalid, buildDoctorChecksOpts{
+		ControllerRunning:    true,
+		SkipCityDoltCheck:    true,
+		SkipManagedDoltCheck: true,
+	}))
+	if got := doctorCheckIndex(names, "beads-store"); got < 0 {
+		t.Fatalf("beads-store check missing after expanded config error: %v", names)
+	}
+}
+
 func doctorCheckNames(checks []doctor.Check) []string {
 	names := make([]string, 0, len(checks))
 	for _, check := range checks {

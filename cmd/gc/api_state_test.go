@@ -199,6 +199,52 @@ func (f *failAgentTomlRenameOSFS) Rename(oldpath, newpath string) error {
 	return f.OSFS.Rename(oldpath, newpath)
 }
 
+func TestNewControllerStateSchemaSkewSkipsCachingAndRigStores(t *testing.T) {
+	fallback := beads.NewMemStore()
+	previousOpen := newControllerStateOpenCityStore
+	newControllerStateOpenCityStore = func(string, gate.Mode) (beads.StoreOpenResult, error) {
+		return beads.StoreOpenResult{Store: fallback, Diagnostic: beads.BeadsDiagnostic{
+			Store: beads.BeadsStoreNameBdStore, PreflightGate: "native_open",
+			PreflightReason: "schema version mismatch: database is at v55, binary knows up to v54 (1 migration ahead)",
+		}}, nil
+	}
+	t.Cleanup(func() { newControllerStateOpenCityStore = previousOpen })
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}, Rigs: []config.Rig{{Name: "rig1", Path: t.TempDir()}}}
+
+	cs := newControllerState(context.Background(), cfg, runtime.NewFake(), events.NewFake(), "test-city", t.TempDir())
+
+	if got := cs.CityBeadStore(); got != fallback {
+		t.Fatalf("CityBeadStore = %T, want unwrapped fallback store while schema-skewed", got)
+	}
+	if got := len(cs.beadStores); got != 0 {
+		t.Fatalf("rig stores = %d, want 0 while schema-skewed", got)
+	}
+	if cs.cityMailProv != nil || cs.extmsgSvc != nil {
+		t.Fatal("mail/external-message services enabled while schema-skewed")
+	}
+}
+
+func TestNewControllerStateSchemaSkewWinsOverFallbackOpenFailure(t *testing.T) {
+	previousOpen := newControllerStateOpenCityStore
+	newControllerStateOpenCityStore = func(string, gate.Mode) (beads.StoreOpenResult, error) {
+		return beads.StoreOpenResult{Diagnostic: beads.BeadsDiagnostic{
+			Store: beads.BeadsStoreNameBdStore, PreflightGate: "native_open",
+			PreflightReason: "schema version mismatch: database is at v55, binary knows up to v54 (1 migration ahead)",
+		}}, errors.New("fallback executable unavailable")
+	}
+	t.Cleanup(func() { newControllerStateOpenCityStore = previousOpen })
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}, Rigs: []config.Rig{{Name: "rig1", Path: t.TempDir()}}}
+
+	cs := newControllerState(context.Background(), cfg, runtime.NewFake(), events.NewFake(), "test-city", t.TempDir())
+
+	if diag := cs.CityBeadsDiagnostic(); diag == nil || !beads.IsSchemaSkewDiagnostic(*diag) {
+		t.Fatalf("CityBeadsDiagnostic = %#v, want schema skew", diag)
+	}
+	if got := len(cs.beadStores); got != 0 {
+		t.Fatalf("rig stores = %d, want 0 while schema-skewed", got)
+	}
+}
+
 func TestControllerStateReadAccess(t *testing.T) {
 	t.Setenv("GC_BEADS", "file")
 

@@ -230,6 +230,21 @@ func TestOpenStoreAtForCityNativeOpenFailureFallsBackWithDiagnostic(t *testing.T
 	}
 }
 
+func TestIsSchemaSkewDiagnostic(t *testing.T) {
+	diag := BeadsDiagnostic{
+		Store:           BeadsStoreNameBdStore,
+		PreflightGate:   "native_open",
+		PreflightReason: "opening native store: schema version mismatch: database is at v55, binary knows up to v54 (1 migration ahead)",
+	}
+	if !IsSchemaSkewDiagnostic(diag) {
+		t.Fatal("IsSchemaSkewDiagnostic = false, want true")
+	}
+	diag.PreflightReason = "dial native: connection refused"
+	if IsSchemaSkewDiagnostic(diag) {
+		t.Fatal("IsSchemaSkewDiagnostic = true for non-schema native-open failure")
+	}
+}
+
 func TestOpenStoreAtForCityExecBdContractFallbackUsesExecStore(t *testing.T) {
 	t.Setenv(nativeForceFallbackEnv, "")
 	scope := "/city"
