@@ -1400,6 +1400,14 @@ func runController(
 	cs.services = cr.svc
 	cs.emergencyCh = make(chan emergency.Record, 64)
 	cr.setControllerState(cs)
+	if cr.controllerStoreSchemaSkewDiagnostic() != nil {
+		cr.run(ctx)
+		cr.shutdown()
+		rec.Record(events.Event{Type: events.ControllerStopped, Actor: "gc"})
+		telemetry.RecordControllerLifecycle(context.Background(), "stopped")
+		fmt.Fprintln(stdout, "Controller stopped: native store schema mismatch.") //nolint:errcheck // best-effort stdout
+		return 1
+	}
 
 	// One-time startup hygiene: release stale runtime name claims held by
 	// closed configured named-session beads so on-demand respawn is not blocked

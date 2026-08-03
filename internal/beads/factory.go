@@ -50,6 +50,14 @@ type BeadsDiagnostic struct {
 	PreflightReason     string `json:"preflight_reason,omitempty"`
 }
 
+// IsSchemaSkewDiagnostic reports whether native store selection fell back
+// because the database schema is newer than the embedded beads library.
+func IsSchemaSkewDiagnostic(diag BeadsDiagnostic) bool {
+	return diag.PreflightGate == "native_open" &&
+		strings.Contains(diag.PreflightReason, "schema version mismatch: database is at v") &&
+		strings.Contains(diag.PreflightReason, "binary knows up to v")
+}
+
 // StoreOpenOptions holds dependencies for opening a beads Store.
 type StoreOpenOptions struct {
 	ScopeRoot        string
@@ -226,7 +234,10 @@ func (opts StoreOpenOptions) stampedResult(result StoreOpenResult, err error) (S
 func (opts StoreOpenOptions) unstampableResult(result StoreOpenResult, mode gate.Mode, reason string) (StoreOpenResult, error) {
 	switch mode {
 	case gate.Require:
-		return StoreOpenResult{}, fmt.Errorf("opening %s at %s: %w",
+		// Refuse the store but preserve its native-selection diagnostic so
+		// lifecycle callers can still recognize a more fundamental schema skew.
+		result.Store = nil
+		return result, fmt.Errorf("opening %s at %s: %w",
 			result.Diagnostic.Store, opts.ScopeRoot,
 			&ConditionalWritesRequiredError{StoreKind: result.Diagnostic.Store, Reason: reason})
 	case gate.Auto:

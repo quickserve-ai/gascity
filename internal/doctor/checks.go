@@ -710,6 +710,12 @@ func (c *BeadsStoreCheck) Run(_ *CheckContext) *CheckResult {
 		conn.Close() //nolint:errcheck // best-effort close
 	}
 	result, err := c.newStore(c.cityPath)
+	if beads.IsSchemaSkewDiagnostic(result.Diagnostic) {
+		r.Status = StatusError
+		r.Message = fmt.Sprintf("native store schema mismatch: %s", result.Diagnostic.PreflightReason)
+		r.FixHint = "install a gc binary built against the current beads schema; the controller is refusing session reconciliation until the mismatch is cleared"
+		return r
+	}
 	if err != nil {
 		r.Status = StatusError
 		r.Message = fmt.Sprintf("store open failed: %v", err)
@@ -720,11 +726,11 @@ func (c *BeadsStoreCheck) Run(_ *CheckContext) *CheckResult {
 		r.Message = fmt.Sprintf("store ping failed: %v", err)
 		return r
 	}
-	if result.Diagnostic.Store == beads.BeadsStoreNameBdStore {
+	if !result.Diagnostic.NativeStoreEligible && result.Diagnostic.PreflightGate != "" {
 		r.Status = StatusWarning
 		r.Message = fmt.Sprintf(
-			"beads store running on BdStore fallback (fork-per-op; gate=%s): %s",
-			result.Diagnostic.PreflightGate, result.Diagnostic.PreflightReason)
+			"beads store running on %s fallback (gate=%s): %s",
+			result.Diagnostic.Store, result.Diagnostic.PreflightGate, result.Diagnostic.PreflightReason)
 		r.FixHint = "native store unavailable; repair the named preflight gate, then restart the process to pick up native store eligibility"
 		return r
 	}

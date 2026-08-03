@@ -4572,6 +4572,125 @@ func TestCityRuntimeReloadProviderSwapPreservesDrainTracker(t *testing.T) {
 	}
 }
 
+func TestCityRuntimeReloadSchemaSkewPreservesSessionsBeforeProviderSwap(t *testing.T) {
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	writeCityRuntimeConfig(t, tomlPath, "fake")
+
+	cfg, err := config.Load(osFS{}, tomlPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "existing-agent", runtime.Config{}); err != nil {
+		t.Fatalf("start existing agent: %v", err)
+	}
+	cr := newTestCityRuntime(t, CityRuntimeParams{
+		CityPath: cityPath,
+		CityName: "test-city",
+		TomlPath: tomlPath,
+		Cfg:      cfg,
+		SP:       sp,
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		Dops:   newDrainOps(sp),
+		Rec:    events.Discard,
+		Stdout: io.Discard,
+		Stderr: io.Discard,
+	})
+	cs := newControllerState(context.Background(), cfg, sp, events.NewFake(), "test-city", cityPath)
+	cs.cityBeadStore = beads.NewMemStore()
+	cr.setControllerState(cs)
+
+	previousOpen := newControllerStateOpenCityStore
+	newControllerStateOpenCityStore = func(string, gate.Mode) (beads.StoreOpenResult, error) {
+		return beads.StoreOpenResult{
+			Store: beads.NewMemStore(),
+			Diagnostic: beads.BeadsDiagnostic{
+				Store:               beads.BeadsStoreNameBdStore,
+				NativeStoreEligible: false,
+				PreflightGate:       "native_open",
+				PreflightReason:     "schema version mismatch: database is at v55, binary knows up to v54 (1 migration ahead)",
+			},
+		}, nil
+	}
+	t.Cleanup(func() { newControllerStateOpenCityStore = previousOpen })
+	previousPreflight := controllerStatePreflightCityStore
+	controllerStatePreflightCityStore = func(string, *config.City, gate.Mode) (beads.StoreOpenResult, error) {
+		return newControllerStateOpenCityStore("", gate.ModeUnset)
+	}
+	t.Cleanup(func() { controllerStatePreflightCityStore = previousPreflight })
+
+	writeCityRuntimeConfig(t, tomlPath, "fail")
+	lastProviderName := "fake"
+	reply := cr.reloadConfigTraced(context.Background(), &lastProviderName, cityPath, nil, reloadSourceManual)
+
+	if reply.Outcome != reloadOutcomeFailed {
+		t.Fatalf("reply.Outcome = %q, want %q", reply.Outcome, reloadOutcomeFailed)
+	}
+	if lastProviderName != "fake" {
+		t.Fatalf("lastProviderName = %q, want fake", lastProviderName)
+	}
+	if !sp.IsRunning("existing-agent") {
+		t.Fatal("existing agent stopped before reload schema-skew guard latched")
+	}
+	if cr.controllerStoreSchemaSkewDiagnostic() == nil {
+		t.Fatal("reload schema-skew diagnostic was not latched for the run-loop hold")
+	}
+}
+
+func TestCityRuntimeTickSchemaSkewHoldsBeforePoolDeathHook(t *testing.T) {
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	writeCityRuntimeConfig(t, tomlPath, "fake")
+	cfg, err := config.Load(osFS{}, tomlPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	sp := runtime.NewFake()
+	cr := newTestCityRuntime(t, CityRuntimeParams{
+		CityPath: cityPath, CityName: "test-city", TomlPath: tomlPath,
+		Cfg: cfg, SP: sp, Dops: newDrainOps(sp), Rec: events.Discard,
+		Stdout: io.Discard, Stderr: io.Discard,
+	})
+	cs := newControllerState(context.Background(), cfg, sp, events.NewFake(), "test-city", cityPath)
+	cs.cityBeadStore = beads.NewMemStore()
+	cr.setControllerState(cs)
+
+	previousOpen := newControllerStateOpenCityStore
+	newControllerStateOpenCityStore = func(string, gate.Mode) (beads.StoreOpenResult, error) {
+		return beads.StoreOpenResult{Store: beads.NewMemStore(), Diagnostic: beads.BeadsDiagnostic{
+			Store: beads.BeadsStoreNameBdStore, PreflightGate: "native_open",
+			PreflightReason: "schema version mismatch: database is at v55, binary knows up to v54 (1 migration ahead)",
+		}}, nil
+	}
+	t.Cleanup(func() { newControllerStateOpenCityStore = previousOpen })
+	previousPreflight := controllerStatePreflightCityStore
+	controllerStatePreflightCityStore = func(string, *config.City, gate.Mode) (beads.StoreOpenResult, error) {
+		return newControllerStateOpenCityStore("", gate.ModeUnset)
+	}
+	t.Cleanup(func() { controllerStatePreflightCityStore = previousPreflight })
+
+	hookOutput := filepath.Join(cityPath, "on-death-ran")
+	cr.poolDeathHandlers = map[string]poolDeathInfo{
+		"dead-agent": {Command: fmt.Sprintf("touch %q", hookOutput), Dir: cityPath},
+	}
+	previousRunning := map[string]bool{"dead-agent": true}
+	writeCityRuntimeConfig(t, tomlPath, "fail")
+	var dirty atomic.Bool
+	dirty.Store(true)
+	lastProviderName := "fake"
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	cr.tick(ctx, &dirty, &lastProviderName, cityPath, &previousRunning, "schema-skew-test")
+
+	if _, err := os.Stat(hookOutput); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("on_death hook ran before schema-skew hold: stat error = %v", err)
+	}
+}
+
 func TestCityRuntimeReloadProviderSwapFailsOnPartialSessionListing(t *testing.T) {
 	cityPath := t.TempDir()
 	tomlPath := filepath.Join(cityPath, "city.toml")
@@ -6149,6 +6268,76 @@ func TestCityRuntimeSafeTick_PassesThroughWhenNoPanic(t *testing.T) {
 	}
 	if stderr.Len() != 0 {
 		t.Errorf("stderr = %q, want empty on clean tick", stderr.String())
+	}
+}
+
+// A schema-skewed controller must hold reconciliation and preserve every live
+// session even when an outer lifecycle owner invokes shutdown after run returns.
+func TestCityRuntimeRun_HoldsSessionsWhenControllerStoreSchemaIsNewer(t *testing.T) {
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	writeCityRuntimeConfig(t, tomlPath, "fake")
+
+	cfg, err := config.Load(osFS{}, tomlPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "existing-agent", runtime.Config{}); err != nil {
+		t.Fatalf("start existing agent: %v", err)
+	}
+	var sweepCalls atomic.Int32
+	previousSweepStore := newCityRuntimeOpenSweepStore
+	newCityRuntimeOpenSweepStore = func(string, string) (beads.Store, error) {
+		sweepCalls.Add(1)
+		return beads.NewMemStore(), nil
+	}
+	t.Cleanup(func() { newCityRuntimeOpenSweepStore = previousSweepStore })
+	var stderr bytes.Buffer
+	var buildCalls atomic.Int32
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	t.Cleanup(cancel)
+
+	cr := newTestCityRuntime(t, CityRuntimeParams{
+		CityPath: cityPath,
+		CityName: "test-city",
+		TomlPath: tomlPath,
+		Cfg:      cfg,
+		SP:       sp,
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			buildCalls.Add(1)
+			cancel()
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		Dops:   newDrainOps(sp),
+		Rec:    events.Discard,
+		Stdout: io.Discard,
+		Stderr: &stderr,
+	})
+	cs := newControllerState(context.Background(), cfg, sp, events.NewFake(), "test-city", cityPath)
+	cs.cityBeadStore = beads.NewMemStore()
+	cs.cityBeadsDiagnostic = &beads.BeadsDiagnostic{
+		Store:               beads.BeadsStoreNameBdStore,
+		NativeStoreEligible: false,
+		PreflightGate:       "native_open",
+		PreflightReason:     "schema version mismatch: database is at v55, binary knows up to v54 (1 migration ahead)",
+	}
+	cr.setControllerState(cs)
+
+	cr.run(ctx)
+	cr.shutdown()
+
+	if got := sweepCalls.Load(); got != 0 {
+		t.Fatalf("startup store mutation sweep ran %d time(s), want 0 while schema-skewed", got)
+	}
+	if !sp.IsRunning("existing-agent") {
+		t.Fatal("existing agent was stopped after schema-skew hold returned and shutdown owner ran")
+	}
+	if got := buildCalls.Load(); got != 0 {
+		t.Fatalf("BuildFn invoked %d time(s), want 0 while schema-skewed controller holds reconciliation", got)
+	}
+	if !strings.Contains(stderr.String(), "schema version mismatch") || !strings.Contains(stderr.String(), "session reconciliation held") {
+		t.Fatalf("stderr = %q, want schema-skew fail-closed alarm", stderr.String())
 	}
 }
 
