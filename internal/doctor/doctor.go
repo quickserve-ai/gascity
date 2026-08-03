@@ -166,6 +166,10 @@ func (d *Doctor) boundedRun(c Check, ctx *CheckContext) *CheckResult {
 	var buf bytes.Buffer
 	checkCtx := *ctx
 	checkCtx.Output = &buf
+	// Publish the outer budget so a check with its own internal deadline can
+	// keep that deadline strictly inside ours and still report its specific
+	// diagnostic instead of being abandoned as "outcome unknown".
+	checkCtx.CheckTimeout = d.CheckTimeout
 	done := make(chan *CheckResult, 1)
 	d.inFlight.Add(1)
 	go func() {
