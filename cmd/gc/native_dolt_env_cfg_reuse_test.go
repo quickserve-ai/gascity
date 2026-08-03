@@ -17,7 +17,7 @@ import (
 // after the open, on a reconnect where re-reading current config is the point.
 func TestOpenNativeStoreReusesTheLoadedCityConfig(t *testing.T) {
 	const (
-		enclosing = "openStoreResultAtForCityWithConfig"
+		enclosing = "openStoreResultAtForCityWithConfigOptions"
 		field     = "OpenNativeStore"
 		callee    = "nativeDoltOpenEnvForScope"
 		wantArg   = "cfg"
