@@ -773,3 +773,68 @@ func TestOrderFiringCurrent_TimesOutStalledOrderHistory(t *testing.T) {
 		t.Fatalf("TimedOut = false, want true so callers (JSON output, doctor summary) can distinguish this from a confirmed failure")
 	}
 }
+
+// TestOrderFiringCurrent_HistoryBudgetStaysInsideCheckTimeout pins the fix for
+// the deadline inversion that disabled this check's own timeout diagnostic in
+// production: the internal history budget defaulted to 4m while doctor's
+// per-check budget defaulted to 60s, so the runner always abandoned the check
+// first and reported the generic advisory "timed out ... (outcome unknown)"
+// instead of the specific, actionable order-history message. The internal budget
+// must derive from CheckContext.CheckTimeout and land strictly inside it.
+func TestOrderFiringCurrent_HistoryBudgetStaysInsideCheckTimeout(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrder(t, cityPath, "mol-dog-stalled-history", "cron", "0 */4 * * *")
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.ControllerStarted, Ts: now.Add(-24 * time.Hour)},
+		events.Event{Type: events.OrderFired, Subject: "mol-dog-stalled-history", Ts: now.Add(-13 * time.Hour)},
+	)
+
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	check := NewOrderFiringCurrentCheck(cfg, cityPath)
+	check.clock = func() time.Time { return now }
+	// Leave historyTimeout at its production default (4m), which is far larger
+	// than the outer budget below — exactly the shape that regressed.
+	check.lastRun = func(orders.Order) (time.Time, error) {
+		<-release
+		return time.Time{}, nil
+	}
+
+	outer := 100 * time.Millisecond
+	start := time.Now()
+	result := check.Run(&CheckContext{CityPath: cityPath, CheckTimeout: outer})
+	elapsed := time.Since(start)
+
+	if result.Status != StatusError {
+		t.Fatalf("status = %v, want error; msg = %s", result.Status, result.Message)
+	}
+	if !strings.Contains(result.Message, "order history lookup timed out after 80ms") {
+		t.Fatalf("message = %q, want budget clamped to 80%% of the 100ms per-check timeout", result.Message)
+	}
+	if elapsed >= outer {
+		t.Fatalf("returned after %s, want a verdict before the %s per-check budget expires", elapsed, outer)
+	}
+}
+
+func TestOrderFiringCurrentHistoryBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		internal time.Duration
+		outer    time.Duration
+		want     time.Duration
+	}{
+		{name: "unbounded runner honors internal budget", internal: 4 * time.Minute, outer: 0, want: 4 * time.Minute},
+		{name: "internal budget clamped under outer", internal: 4 * time.Minute, outer: time.Minute, want: 48 * time.Second},
+		{name: "internal budget already inside outer", internal: 15 * time.Second, outer: time.Minute, want: 15 * time.Second},
+		{name: "raised outer budget lifts internal", internal: 4 * time.Minute, outer: 10 * time.Minute, want: 4 * time.Minute},
+		{name: "zero internal falls back to default then clamps", internal: 0, outer: time.Minute, want: 48 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &OrderFiringCurrentCheck{historyTimeout: tc.internal}
+			if got := c.historyBudget(&CheckContext{CheckTimeout: tc.outer}); got != tc.want {
+				t.Fatalf("historyBudget() = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
