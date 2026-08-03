@@ -114,14 +114,14 @@ prompt_template = "prompts/worker.template.md"
 append_fragments = ["law"]
 `)
 	writeLintFile(t, filepath.Join(packDir, "prompts", "worker.template.md"), "hello {{.AgentName}}\n")
-	writeLintFile(t, filepath.Join(packDir, "template-fragments", "law.template.md"), "rig {{.Rig}}\n")
+	writeLintFile(t, filepath.Join(packDir, "template-fragments", "law.template.md"), "rig {{.Rgi}}\n")
 
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"lint", packDir}, &stdout, &stderr)
 	if code == 0 {
 		t.Fatalf("gc lint = 0, want failure on unknown variable in fragment\nstdout:\n%s\nstderr:\n%s", stdout.String(), stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "unknown template variable {{ .Rig }}") {
+	if !strings.Contains(stderr.String(), "unknown template variable {{ .Rgi }}") {
 		t.Fatalf("stderr missing fragment unknown-variable diagnostic:\n%s", stderr.String())
 	}
 }
