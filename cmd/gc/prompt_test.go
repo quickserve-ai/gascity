@@ -1798,10 +1798,10 @@ func knownKeysForTest(env map[string]string) map[string]struct{} {
 // TestUnknownTemplateVariablesFlagsUnknownField reproduces the {{ .Rig }}
 // defect: an unknown top-level key must be reported.
 func TestUnknownTemplateVariablesFlagsUnknownField(t *testing.T) {
-	tmpl := testUnknownVarsTemplate(t, "Rig: {{ .Rig }} Name: {{ .RigName }}")
+	tmpl := testUnknownVarsTemplate(t, "Rig: {{ .Rgi }} Name: {{ .RigName }}")
 	issues := unknownTemplateVariables(tmpl, []string{"prompt"}, knownKeysForTest(nil))
-	if len(issues) != 1 || issues[0].Field != "Rig" {
-		t.Fatalf("issues = %+v, want exactly one for field Rig", issues)
+	if len(issues) != 1 || issues[0].Field != "Rgi" {
+		t.Fatalf("issues = %+v, want exactly one for field Rgi", issues)
 	}
 }
 
@@ -1858,10 +1858,10 @@ func TestUnknownTemplateVariablesSkipsRebindingBodies(t *testing.T) {
 func TestPromptTemplateUnknownVariablesCoversFragments(t *testing.T) {
 	f := fsys.NewFake()
 	f.Files["/city/prompts/agent.template.md"] = []byte("Body")
-	f.Files["/packs/mypack/template-fragments/law.template.md"] = []byte("{{ .Rig }}")
+	f.Files["/packs/mypack/template-fragments/law.template.md"] = []byte("{{ .Rgi }}")
 	issues := promptTemplateUnknownVariables(f, "/city", "", "prompts/agent.template.md", "",
 		[]string{"/packs/mypack"}, []string{"law"}, knownKeysForTest(nil))
-	if len(issues) != 1 || issues[0].Field != "Rig" || issues[0].TemplateName != "law" {
-		t.Fatalf("issues = %+v, want one for Rig in law", issues)
+	if len(issues) != 1 || issues[0].Field != "Rgi" || issues[0].TemplateName != "law" {
+		t.Fatalf("issues = %+v, want one for Rgi in law", issues)
 	}
 }
