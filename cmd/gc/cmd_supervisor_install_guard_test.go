@@ -121,6 +121,7 @@ func TestInstallSupervisorSystemdBinaryMismatchGuard(t *testing.T) {
 }
 
 func TestInstallSupervisorLaunchdBinaryMismatchGuard(t *testing.T) {
+	stubSupervisorLaunchdUnloaded(t)
 	for _, tc := range []struct {
 		name           string
 		existingBinary string
@@ -152,6 +153,12 @@ func TestInstallSupervisorLaunchdBinaryMismatchGuard(t *testing.T) {
 			homeDir := t.TempDir()
 			gcHome := filepath.Join(homeDir, ".gc")
 			currentBinary := filepath.Join(homeDir, "bin", "gc")
+			if err := os.MkdirAll(filepath.Dir(currentBinary), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(currentBinary, []byte("#!/bin/sh\nprintf 'gc version test\\n'\n"), 0o700); err != nil {
+				t.Fatal(err)
+			}
 			t.Setenv("HOME", homeDir)
 			t.Setenv("GC_HOME", gcHome)
 			setSupervisorInstallForceForTest(t, tc.force)
@@ -208,8 +215,8 @@ func TestInstallSupervisorLaunchdBinaryMismatchGuard(t *testing.T) {
 			}
 
 			joined := strings.Join(calls, "\n")
-			if !strings.Contains(joined, "load "+plistPath) {
-				t.Fatalf("launchctl calls = %v, want plist load", calls)
+			if !strings.Contains(joined, "bootstrap "+supervisorLaunchdDomain()+" "+plistPath) {
+				t.Fatalf("launchctl calls = %v, want plist bootstrap", calls)
 			}
 			got, err := os.ReadFile(plistPath)
 			if err != nil {
@@ -276,6 +283,65 @@ func TestSupervisorLaunchdPlistGCPathExtractsProgramArgument(t *testing.T) {
 	}
 	if got := supervisorLaunchdPlistGCPath("<plist><dict></dict></plist>"); got != "" {
 		t.Fatalf("supervisorLaunchdPlistGCPath(missing ProgramArguments) = %q, want empty", got)
+	}
+}
+
+func TestLaunchdPrintReportsAbsent(t *testing.T) {
+	for _, message := range []string{
+		`Bad request.\nCould not find service "com.gastown.daemon" in domain for user gui: 501`,
+		`Could not find service "com.gastown.daemon"`,
+		`No such process`,
+	} {
+		if !launchdPrintReportsAbsent(message) {
+			t.Fatalf("launchdPrintReportsAbsent(%q) = false, want true", message)
+		}
+	}
+	if launchdPrintReportsAbsent("permission denied") {
+		t.Fatal("permission error classified as absent service")
+	}
+}
+
+func TestValidateSupervisorLaunchdPlist(t *testing.T) {
+	if goruntime.GOOS != "darwin" {
+		t.Skip("launchd plist validation only applies on darwin")
+	}
+	const label = "com.gascity.supervisor.test"
+	valid := `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>Label</key><string>` + label + `</string>
+<key>ProgramArguments</key><array><string>GC_PATH</string><string>supervisor</string><string>run</string></array>
+</dict></plist>`
+	tests := []struct {
+		name    string
+		content string
+		script  string
+		wantErr string
+	}{
+		{name: "valid", content: valid, script: "#!/bin/sh\nprintf 'gc version test\\n'\n"},
+		{name: "silent executable", content: valid, script: "#!/bin/sh\nexit 0\n", wantErr: "empty output"},
+		{name: "malformed XML", content: `<plist><dict>`, script: "#!/bin/sh\nprintf 'gc version test\\n'\n", wantErr: "plutil validation failed"},
+		{name: "missing label", content: strings.Replace(valid, label, "com.gascity.other", 1), script: "#!/bin/sh\nprintf 'gc version test\\n'\n", wantErr: "launchd label"},
+		{name: "missing executable", content: strings.Replace(valid, "GC_PATH", "/missing/gc", 1), script: "#!/bin/sh\nprintf 'gc version test\\n'\n", wantErr: "gc executable"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "supervisor.plist")
+			gcPath := filepath.Join(t.TempDir(), "gc")
+			if err := os.WriteFile(gcPath, []byte(tc.script), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			content := strings.Replace(tc.content, "GC_PATH", gcPath, 1)
+			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			err := validateSupervisorLaunchdPlist(path, label, gcPath)
+			if tc.wantErr == "" && err != nil {
+				t.Fatalf("validateSupervisorLaunchdPlist() error = %v", err)
+			}
+			if tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)) {
+				t.Fatalf("validateSupervisorLaunchdPlist() error = %v, want %q", err, tc.wantErr)
+			}
+		})
 	}
 }
 

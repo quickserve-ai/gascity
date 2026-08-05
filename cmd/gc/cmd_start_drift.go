@@ -187,6 +187,8 @@ var driftVerifyProbeTimeout = 2 * time.Second
 // the production kill+spawn (or systemctl) side effects.
 var restartHelpersHook = defaultRestartHelpers
 
+var pollLaunchdRestartVerifiedHook = pollLaunchdRestartVerified
+
 // readSupervisorExePathHook lets tests avoid platform-specific /proc lookups.
 var readSupervisorExePathHook = readSupervisorExePath
 
@@ -298,7 +300,8 @@ func runStartDriftCheck(cityPath string, stdout, stderr io.Writer) (int, bool) {
 		serviceName := supervisorSystemdServiceName()
 		systemdManaged := !delegated && supervisorSystemctlActive(serviceName)
 		launchdLabel := supervisorLaunchdLabel()
-		launchdManaged := !delegated && supervisorRuntimeGOOS == "darwin" && supervisorLaunchdActive(launchdLabel)
+		launchdPID, launchdLoaded, launchdErr := supervisorLaunchdPID(launchdLabel)
+		launchdManaged := !delegated && supervisorRuntimeGOOS == "darwin" && launchdErr == nil && launchdLoaded && launchdPID == pid
 		if exeErr != nil && !delegated && !systemdManaged && !launchdManaged {
 			// We can't safely auto-restart a supervisor whose
 			// /proc/<pid>/exe we can't read — the kernel readlink is
@@ -317,14 +320,17 @@ func runStartDriftCheck(cityPath string, stdout, stderr io.Writer) (int, bool) {
 			fmt.Fprintln(stderr, "error: supervisor restart loop detected (3 restarts in 60s); refusing further restarts. Investigate the stale state with 'gc trace' and consider 'gc stop --force'.") //nolint:errcheck // best-effort stderr
 			return 1, false
 		}
+		launchdGCPath, _ := os.Executable()
 		spec := restartSpec{
-			SystemdManaged: systemdManaged,
-			LaunchdManaged: launchdManaged,
-			PID:            pid,
-			ExePath:        exePath,
-			Argv:           []string{"supervisor", "run"},
-			ServiceName:    serviceName,
-			LaunchdLabel:   launchdLabel,
+			SystemdManaged:   systemdManaged,
+			LaunchdManaged:   launchdManaged,
+			PID:              pid,
+			ExePath:          exePath,
+			Argv:             []string{"supervisor", "run"},
+			ServiceName:      serviceName,
+			LaunchdLabel:     launchdLabel,
+			LaunchdPlistPath: supervisorLaunchdPlistPath(),
+			LaunchdGCPath:    launchdGCPath,
 		}
 		mode := "direct"
 		switch {
@@ -360,23 +366,22 @@ func runStartDriftCheck(cityPath string, stdout, stderr io.Writer) (int, bool) {
 			// A delegated try-restart can fall through a bounded CLI timeout
 			// (or restart the unit asynchronously) with systemd's restart job
 			// still in flight, so the OLD supervisor may keep answering
-			// /health for a moment. A single early probe — or PollReady, which
-			// answers from whatever serves /health — would then misreport "was
-			// not replaced" before the late replacement lands. Poll for genuine
-			// replacement *and* drift-clearance evidence until it is observed
-			// or driftReadyTimeout expires, then surface the last obstacle.
+			// /health for a moment. Poll for replacement and drift clearance.
 			if msg := pollDelegatedRestartVerified(baseURL, pid, status.BuildID, commit, delegation, driftReadyTimeout); msg != "" {
 				fmt.Fprintln(stdout)             //nolint:errcheck // best-effort stdout
 				fmt.Fprintf(stderr, "%s\n", msg) //nolint:errcheck // best-effort stderr
 				return 1, false
 			}
-		} else {
-			// Wait for the new supervisor to come up.
-			if err := PollReady(newHTTPSupervisorClient(baseURL), driftReadyTimeout); err != nil {
-				fmt.Fprintln(stdout)                                                                                                                                                  //nolint:errcheck // best-effort stdout
-				fmt.Fprintf(stderr, "error: supervisor restart timed out after %s; check '%s' for details. Last known pid=%d.\n", driftReadyTimeout, supervisorStatusGuidance(), pid) //nolint:errcheck // best-effort stderr
+		} else if launchdManaged {
+			if msg := pollLaunchdRestartVerifiedHook(baseURL, pid, status.BuildID, commit, driftReadyTimeout); msg != "" {
+				fmt.Fprintln(stdout)             //nolint:errcheck // best-effort stdout
+				fmt.Fprintf(stderr, "%s\n", msg) //nolint:errcheck // best-effort stderr
 				return 1, false
 			}
+		} else if err := PollReady(newHTTPSupervisorClient(baseURL), driftReadyTimeout); err != nil {
+			fmt.Fprintln(stdout)                                                                                                                                                  //nolint:errcheck // best-effort stdout
+			fmt.Fprintf(stderr, "error: supervisor restart timed out after %s; check '%s' for details. Last known pid=%d.\n", driftReadyTimeout, supervisorStatusGuidance(), pid) //nolint:errcheck // best-effort stderr
+			return 1, false
 		}
 		fmt.Fprintf(stdout, " ready (%s).\n", humanizeReadyDuration(time.Since(t0))) //nolint:errcheck // best-effort stdout
 
@@ -411,6 +416,45 @@ func runStartDriftCheck(cityPath string, stdout, stderr io.Writer) (int, bool) {
 	}
 	// Unreachable; decideDriftAction always sets exactly one disposition.
 	return 0, true
+}
+
+func pollLaunchdRestartVerified(baseURL string, oldPID int, oldBuildID, localBuildID string, readyTimeout time.Duration) string {
+	client := newHTTPSupervisorClient(baseURL)
+	deadline := time.Now().Add(readyTimeout)
+	var lastMsg string
+	for {
+		prePID := supervisorAliveHook()
+		preLaunchdPID, preLoaded, preErr := supervisorLaunchdPID(supervisorLaunchdLabel())
+		if preErr != nil || prePID <= 0 || !preLoaded || preLaunchdPID != prePID {
+			lastMsg = fmt.Sprintf("error: cannot establish launchd ownership before health probe: socket pid=%d launchd pid=%d loaded=%t err=%v", prePID, preLaunchdPID, preLoaded, preErr)
+		} else {
+			ctx, cancel := context.WithTimeout(context.Background(), driftVerifyProbeTimeout)
+			status, err := client.Status(ctx)
+			cancel()
+			postPID := supervisorAliveHook()
+			postLaunchdPID, postLoaded, postErr := supervisorLaunchdPID(supervisorLaunchdLabel())
+			switch {
+			case err != nil:
+				lastMsg = fmt.Sprintf("error: cannot verify launchd supervisor refresh: %v; check '%s'", err, supervisorStatusGuidance())
+			case postErr != nil || postPID <= 0 || !postLoaded || postLaunchdPID != postPID:
+				lastMsg = fmt.Sprintf("error: cannot establish launchd ownership after health probe: socket pid=%d launchd pid=%d loaded=%t err=%v", postPID, postLaunchdPID, postLoaded, postErr)
+			case postPID != prePID || postLaunchdPID != preLaunchdPID:
+				lastMsg = fmt.Sprintf("error: supervisor ownership changed during health probe: before pid=%d after pid=%d", prePID, postPID)
+			case postPID == oldPID && status.BuildID == oldBuildID:
+				lastMsg = fmt.Sprintf("error: launchd supervisor was not replaced: PID %d still serves build %s", postPID, status.BuildID)
+			case status.BuildID == "":
+				lastMsg = fmt.Sprintf("error: launchd supervisor restarted but did not report a build identity (local build %s)", localBuildID)
+			case DetectBinaryDrift(localBuildID, status):
+				lastMsg = fmt.Sprintf("error: launchd supervisor restarted but still serves drifted build %s (local build %s)", status.BuildID, localBuildID)
+			default:
+				return ""
+			}
+		}
+		if !time.Now().Before(deadline) {
+			return lastMsg
+		}
+		time.Sleep(supervisorReadyPollInterval)
+	}
 }
 
 // pollDelegatedRestartVerified polls the supervisor API after a delegated
@@ -502,8 +546,10 @@ func readDaemonAutoRestart(cityPath string) bool {
 // syscall.Kill / a backgrounded exec.Cmd for direct launches.
 func defaultRestartHelpers() restartHelpers {
 	return restartHelpers{
-		Systemctl: supervisorSystemctlRun,
-		Launchctl: supervisorLaunchctlRun,
+		Systemctl:            supervisorSystemctlRun,
+		Launchctl:            supervisorLaunchctlRun,
+		ValidateLaunchdPlist: validateSupervisorLaunchdPlist,
+		WaitLaunchdUnloaded:  waitSupervisorLaunchdUnloaded,
 		Kill: func(pid int) error {
 			return syscall.Kill(pid, syscall.SIGTERM)
 		},
