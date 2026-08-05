@@ -264,7 +264,7 @@ func TestInstallSupervisorLaunchdSweepsStaleSiblings(t *testing.T) {
 	t.Cleanup(func() { supervisorLaunchctlRun = oldRun })
 
 	data := &supervisorServiceData{
-		GCPath:       "/tmp/gc-new",
+		GCPath:       writeSupervisorLaunchdTestGC(t),
 		LogPath:      filepath.Join(gcHome, "supervisor.log"),
 		GCHome:       gcHome,
 		LaunchdLabel: supervisorLaunchdLabel(),
