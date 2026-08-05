@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"path/filepath"
@@ -178,6 +179,13 @@ type restartSpec struct {
 	// LaunchdLabel is the macOS launchd label. Used by the launchd branch.
 	// Empty falls back to supervisorLaunchdLabel().
 	LaunchdLabel string
+
+	// LaunchdPlistPath is the plist used to re-bootstrap the launchd job after
+	// binary replacement. Empty falls back to supervisorLaunchdPlistPath().
+	LaunchdPlistPath string
+
+	// LaunchdGCPath is the exact gc executable expected in ProgramArguments.0.
+	LaunchdGCPath string
 }
 
 // restartHelpers abstracts the side-effecting operations
@@ -191,6 +199,12 @@ type restartHelpers struct {
 	// Launchctl invokes launchctl with the given args. Production
 	// uses supervisorLaunchctlRun.
 	Launchctl func(args ...string) error
+
+	// ValidateLaunchdPlist verifies the launchd service file before bootout.
+	ValidateLaunchdPlist func(path, label, gcPath string) error
+
+	// WaitLaunchdUnloaded waits until launchd has removed the scoped job.
+	WaitLaunchdUnloaded func(label string, timeout time.Duration) error
 
 	// Kill sends SIGTERM to pid. Production uses syscall.Kill.
 	Kill func(pid int) error
@@ -207,6 +221,19 @@ type restartHelpers struct {
 	Spawn func(exe string, argv ...string) error
 }
 
+type launchdRestartError struct {
+	err          error
+	rollbackSafe bool
+}
+
+func (e *launchdRestartError) Error() string { return e.err.Error() }
+func (e *launchdRestartError) Unwrap() error { return e.err }
+
+func launchdRestartRollbackSafe(err error) bool {
+	var restartErr *launchdRestartError
+	return errors.As(err, &restartErr) && restartErr.rollbackSafe
+}
+
 // restartSupervisor restarts the gascity-supervisor process. Behavior
 // depends on whether a platform service manager owns the lifecycle:
 //
@@ -215,9 +242,9 @@ type restartHelpers struct {
 //     systemd's responsibility; attempting to kill the PID ourselves
 //     would race with systemd's own respawn.
 //
-//   - LaunchdManaged: a single `launchctl kickstart -k <target>` call
-//     restarts the launchd service. This is the macOS production upgrade
-//     path and does not require /proc/<pid>/exe.
+//   - LaunchdManaged: refreshes the scoped job registration with
+//     `launchctl bootout` / `bootstrap`, then enables and starts it. A plain
+//     kickstart retains launchd's cached launch constraints across binary swaps.
 //
 //   - Direct: we kill the process by PID and spawn a new instance from
 //     ExePath. Kill failures abort the restart so we never run two
@@ -243,8 +270,41 @@ func restartSupervisor(spec restartSpec, h restartHelpers) error {
 			return fmt.Errorf("restartSupervisor: nil Launchctl helper")
 		}
 		target := supervisorLaunchdServiceTarget(spec.LaunchdLabel)
-		if err := h.Launchctl("kickstart", "-k", target); err != nil {
-			return fmt.Errorf("launchctl kickstart -k %s: %w", target, err)
+		plistPath := spec.LaunchdPlistPath
+		if plistPath == "" {
+			plistPath = supervisorLaunchdPlistPath()
+		}
+		if h.ValidateLaunchdPlist == nil || h.WaitLaunchdUnloaded == nil {
+			return fmt.Errorf("restartSupervisor: incomplete launchd helpers")
+		}
+		if err := h.ValidateLaunchdPlist(plistPath, spec.LaunchdLabel, spec.LaunchdGCPath); err != nil {
+			return fmt.Errorf("launchd plist preflight %s: %w", plistPath, err)
+		}
+		_ = h.Launchctl("bootout", supervisorLaunchdServiceTarget(legacyGastownLaunchdLabel))
+		if err := h.Launchctl("bootout", target); err != nil {
+			waitErr := h.WaitLaunchdUnloaded(spec.LaunchdLabel, launchdRefreshWaitTimeout)
+			if waitErr == nil {
+				return &launchdRestartError{err: fmt.Errorf("launchctl bootout %s reported %v after unloading the job; supervisor is stopped; recover with: launchctl bootstrap %s %s && launchctl enable %s && launchctl kickstart -p %s", target, err, shellSingleQuote(supervisorLaunchdDomain()), shellSingleQuote(plistPath), shellSingleQuote(target), shellSingleQuote(target)), rollbackSafe: true}
+			}
+			return fmt.Errorf("launchctl bootout %s reported %v; supervisor job state is unknown (%v); inspect with launchctl print %s before recovery", target, err, waitErr, shellSingleQuote(target))
+		}
+		if err := h.WaitLaunchdUnloaded(spec.LaunchdLabel, launchdRefreshWaitTimeout); err != nil {
+			return fmt.Errorf("waiting for launchd bootout %s: %w; supervisor is stopped and job state is unknown; inspect with: launchctl print %s; once absent, recover with: launchctl bootstrap %s %s && launchctl enable %s && launchctl kickstart -p %s", target, err, shellSingleQuote(target), shellSingleQuote(supervisorLaunchdDomain()), shellSingleQuote(plistPath), shellSingleQuote(target), shellSingleQuote(target))
+		}
+		domainArg := shellSingleQuote(supervisorLaunchdDomain())
+		plistArg := shellSingleQuote(plistPath)
+		targetArg := shellSingleQuote(target)
+		startRecovery := "launchctl kickstart -p " + targetArg
+		enableRecovery := "launchctl enable " + targetArg + " && " + startRecovery
+		bootstrapRecovery := "launchctl bootstrap " + domainArg + " " + plistArg + " && " + enableRecovery
+		if err := h.Launchctl("bootstrap", supervisorLaunchdDomain(), plistPath); err != nil {
+			return &launchdRestartError{err: fmt.Errorf("launchctl bootstrap %s %s: %w; supervisor is stopped; recover with: %s", supervisorLaunchdDomain(), plistPath, err, bootstrapRecovery), rollbackSafe: true}
+		}
+		if err := h.Launchctl("enable", target); err != nil {
+			return &launchdRestartError{err: fmt.Errorf("launchctl enable %s: %w; supervisor is stopped; recover with: %s", target, err, enableRecovery), rollbackSafe: true}
+		}
+		if err := h.Launchctl("kickstart", "-p", target); err != nil {
+			return &launchdRestartError{err: fmt.Errorf("launchctl kickstart -p %s: %w; supervisor is stopped; recover with: %s", target, err, startRecovery), rollbackSafe: true}
 		}
 		return nil
 	}
