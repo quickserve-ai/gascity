@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -343,30 +345,35 @@ func TestRunStartDriftCheck_DarwinLaunchdRestartDoesNotRequireProcExe(t *testing
 	t.Cleanup(func() { dryRunMode, noAutoRestartMode = oldDry, oldNoAR })
 
 	oldGOOS := supervisorRuntimeGOOS
-	oldLaunchdActive := supervisorLaunchdActive
+	oldLaunchdPID := supervisorLaunchdPID
+	oldLaunchdVerify := pollLaunchdRestartVerifiedHook
 	oldReadExe := readSupervisorExePathHook
 	oldHelpers := restartHelpersHook
 	t.Cleanup(func() {
 		supervisorRuntimeGOOS = oldGOOS
-		supervisorLaunchdActive = oldLaunchdActive
+		supervisorLaunchdPID = oldLaunchdPID
+		pollLaunchdRestartVerifiedHook = oldLaunchdVerify
 		readSupervisorExePathHook = oldReadExe
 		restartHelpersHook = oldHelpers
 	})
 
 	supervisorRuntimeGOOS = "darwin"
-	supervisorLaunchdActive = func(label string) bool {
-		return label == supervisorLaunchdLabel()
+	supervisorLaunchdPID = func(label string) (int, bool, error) {
+		return supervisorAliveHook(), label == supervisorLaunchdLabel(), nil
 	}
+	pollLaunchdRestartVerifiedHook = func(string, int, string, string, time.Duration) string { return "" }
 	readSupervisorExePathHook = func(pid int) (string, error) {
 		return "", fmt.Errorf("readlink /proc/%d/exe: no such file or directory", pid)
 	}
-	var launchctlArgs []string
+	var launchctlCalls [][]string
 	restartHelpersHook = func() restartHelpers {
 		return restartHelpers{
 			Launchctl: func(args ...string) error {
-				launchctlArgs = append([]string(nil), args...)
+				launchctlCalls = append(launchctlCalls, append([]string(nil), args...))
 				return nil
 			},
+			ValidateLaunchdPlist: func(string, string, string) error { return nil },
+			WaitLaunchdUnloaded:  func(string, time.Duration) error { return nil },
 			Systemctl: func(...string) error {
 				t.Fatal("systemctl should not handle a Darwin launchd supervisor")
 				return nil
@@ -391,17 +398,44 @@ func TestRunStartDriftCheck_DarwinLaunchdRestartDoesNotRequireProcExe(t *testing
 	if !cont {
 		t.Fatalf("cont = false after successful launchd restart; stdout=%q stderr=%q", stdout.String(), stderr.String())
 	}
-	wantArgs := []string{"kickstart", "-k", supervisorLaunchdServiceTarget(supervisorLaunchdLabel())}
-	if len(launchctlArgs) != len(wantArgs) {
-		t.Fatalf("launchctl args = %v, want %v", launchctlArgs, wantArgs)
+	target := supervisorLaunchdServiceTarget(supervisorLaunchdLabel())
+	domain := "gui/" + strconv.Itoa(os.Getuid())
+	wantCalls := [][]string{
+		{"bootout", supervisorLaunchdServiceTarget(legacyGastownLaunchdLabel)},
+		{"bootout", target},
+		{"enable", target},
+		{"bootstrap", domain, supervisorLaunchdPlistPath()},
+		{"kickstart", "-p", target},
 	}
-	for i := range wantArgs {
-		if launchctlArgs[i] != wantArgs[i] {
-			t.Fatalf("launchctl arg %d = %q, want %q; full args=%v", i, launchctlArgs[i], wantArgs[i], launchctlArgs)
-		}
+	if !reflect.DeepEqual(wantCalls, launchctlCalls) {
+		t.Fatalf("launchctl calls = %v, want %v", launchctlCalls, wantCalls)
 	}
 	if strings.Contains(stderr.String(), "/proc/") {
 		t.Fatalf("stderr leaked /proc restart failure despite launchd management:\n%s", stderr.String())
+	}
+}
+
+func TestPollLaunchdRestartVerifiedRejectsEmptyServedBuildIdentity(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprint(w, `{"status":"ok","version":"v0","build_id":"","uptime_sec":1,"cities_total":0,"cities_running":0}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	oldAlive := supervisorAliveHook
+	oldLaunchdPID := supervisorLaunchdPID
+	t.Cleanup(func() {
+		supervisorAliveHook = oldAlive
+		supervisorLaunchdPID = oldLaunchdPID
+	})
+
+	const replacementPID = 222
+	supervisorAliveHook = func() int { return replacementPID }
+	supervisorLaunchdPID = func(string) (int, bool, error) { return replacementPID, true, nil }
+
+	msg := pollLaunchdRestartVerified(srv.URL, 111, "old-build-id", "", 0)
+	if !strings.Contains(msg, "did not report a build identity") {
+		t.Fatalf("pollLaunchdRestartVerified error = %q, want missing build identity", msg)
 	}
 }
 
