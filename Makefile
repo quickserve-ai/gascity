@@ -146,10 +146,35 @@ install: check-self-contained
 	@mkdir -p $(INSTALL_DIR)
 	@set -e; \
 		tmp="$(INSTALL_DIR)/.$(BINARY).tmp.$$$$"; \
-		trap 'rm -f "$$tmp"' EXIT INT TERM HUP; \
+		backup="$(INSTALL_DIR)/$(BINARY).bak-$$(date +%Y%m%d-%H%M%S)"; \
+		out=$$(mktemp); \
+		trap 'rm -f "$$tmp" "$$out"' EXIT INT TERM HUP; \
 		cp -f "$(BUILD_DIR)/$(BINARY)" "$$tmp"; \
 		chmod 0755 "$$tmp"; \
+		set +e; "$$tmp" version > "$$out" 2>&1; rc=$$?; set -e; \
+		if [ $$rc -ne 0 ] || [ ! -s "$$out" ]; then \
+			echo "FATAL: staged $(BINARY) will not execute (exit=$$rc, output=$$(wc -c < "$$out") bytes)."; \
+			exit 1; \
+		fi; \
+		if [ -e "$(INSTALL_DIR)/$(BINARY)" ]; then cp -p "$(INSTALL_DIR)/$(BINARY)" "$$backup"; fi; \
 		mv -f "$$tmp" "$(INSTALL_DIR)/$(BINARY)"; \
+		: > "$$out"; \
+		set +e; "$(INSTALL_DIR)/$(BINARY)" version > "$$out" 2>&1; rc=$$?; set -e; \
+		if [ $$rc -ne 0 ] || [ ! -s "$$out" ]; then \
+			echo "FATAL: installed $(INSTALL_DIR)/$(BINARY) will not execute (exit=$$rc, output=$$(wc -c < "$$out") bytes)."; \
+			echo "       Exit 137 with no output means macOS SIGKILLed it for an invalid"; \
+			echo "       code signature. Restoring the previous binary by atomic rename."; \
+			if [ -e "$$backup" ]; then \
+				mv -f "$$backup" "$(INSTALL_DIR)/$(BINARY)"; \
+				: > "$$out"; \
+				set +e; "$(INSTALL_DIR)/$(BINARY)" version > "$$out" 2>&1; rollback_rc=$$?; set -e; \
+				if [ $$rollback_rc -ne 0 ] || [ ! -s "$$out" ]; then \
+					echo "FATAL: restored $(BINARY) also failed verification (exit=$$rollback_rc, output=$$(wc -c < "$$out") bytes)."; \
+				fi; \
+			fi; \
+			exit 1; \
+		fi; \
+		echo "Verified $(INSTALL_DIR)/$(BINARY) executes: $$(cat "$$out")"; \
 		trap - EXIT INT TERM HUP
 	@# Migrate from old install location: replace stale binary with symlink
 	@if [ "$(INSTALL_DIR)" != "$(HOME)/.local/bin" ]; then \
