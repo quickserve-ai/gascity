@@ -199,6 +199,50 @@ binary, because ad-hoc signing creates a fresh identity and can cause repeated
 TCC prompts. If you need the old behavior for a local experiment, opt in with
 `GC_ADHOC_SIGN=1`.
 
+### Never `cp` over a live `gc` — swap by atomic rename
+
+On macOS, replacing an executable **in place** — writing new bytes into the
+existing inode — leaves the kernel holding a cached code-signing decision for
+that vnode. A process already running from that inode is then SIGKILLed the
+next time it faults in a page that no longer matches the cached cdhash. The
+crash surfaces as `EXC_CRASH / SIGKILL (Code Signature Invalid)` with
+termination namespace `CODESIGNING`, and the binary appears to exit 137 with no
+output at all. This took the city down repeatedly on 2026-08-03/04
+(`ga-l8pur`, `ga-pmeo1`), and it is silent — it looks like a flaky supervisor.
+
+**Use `make install`.** It stages into a temp file in the destination directory
+and swaps by `mv` (atomic rename), which replaces the *directory entry* and
+leaves any running process's inode untouched. It then execs the installed
+binary to verify it actually runs.
+
+Verified behaviour of the common writers, measured on darwin 25.0.0:
+
+| Writer | Inode | Safe? |
+|---|---|---|
+| `go build -o <path>` | fresh | yes — the Go toolchain unlinks first |
+| `go install` (via `GOBIN`) | fresh | yes |
+| `install -m 755 new <path>` | fresh | yes |
+| `mv -f tmp <path>` | fresh | yes — this is the correct swap |
+| `make build` / `make install` | fresh (explicit rename) | yes |
+| `cp -f new <path>` | **reused** | **no** — this is the hazard |
+| `codesign --force <path>` | **reused** | **no** — never sign a live path |
+
+So the Go toolchain was never the danger here; hand-rolled `cp` recovery steps
+are. If you must place a binary yourself, do it the way `make install` does:
+
+```sh
+cd "$(dirname "$dest")"
+cp -f "$new" ".gc.tmp.$$"     # temp in the SAME filesystem
+chmod 0755 ".gc.tmp.$$"
+mv -f ".gc.tmp.$$" "$dest"    # atomic rename -> fresh inode
+"$dest" version > /tmp/v 2>&1; echo $?   # verify UNPIPED
+```
+
+That last line matters: `gc version | head; echo $?` reports **head's** status
+and prints `0` for a binary that was SIGKILLed before writing a byte. Always
+redirect to a file and check both the exit code and that the output is
+non-empty.
+
 Getting a free local certificate does not require paid Apple Developer Program
 membership:
 
