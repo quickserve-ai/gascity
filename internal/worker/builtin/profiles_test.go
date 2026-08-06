@@ -29,6 +29,30 @@ func TestBuiltinProvidersAndOrder(t *testing.T) {
 	}
 }
 
+func TestBuiltinProviderOMPSpecDeclaresStartupReadiness(t *testing.T) {
+	spec, ok := BuiltinProviders()["omp"]
+	if !ok {
+		t.Fatal("BuiltinProviders() missing omp")
+	}
+	if spec.ReadyPromptPrefix != "" {
+		t.Fatalf("omp ReadyPromptPrefix = %q, want empty fixed-delay readiness", spec.ReadyPromptPrefix)
+	}
+	if got, want := spec.ReadyDelayMs, 8000; got != want {
+		t.Fatalf("omp ReadyDelayMs = %d, want %d", got, want)
+	}
+}
+
+func TestHookEnabledBuiltinProvidersDeclareStartupReadiness(t *testing.T) {
+	for name, spec := range BuiltinProviders() {
+		if !spec.SupportsHooks {
+			continue
+		}
+		if spec.ReadyPromptPrefix == "" && spec.ReadyDelayMs <= 0 {
+			t.Errorf("hook-enabled provider %q has no startup readiness signal", name)
+		}
+	}
+}
+
 func TestBuiltinProviderMimoCodeSpec(t *testing.T) {
 	providers := BuiltinProviders()
 	spec, ok := providers["mimocode"]
