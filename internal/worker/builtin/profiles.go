@@ -811,6 +811,7 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 		Command:          "omp",
 		Args:             []string{"--hook", ".omp/hooks/gc-hook.ts"},
 		PromptMode:       "arg",
+		ReadyDelayMs:     8000,
 		ProcessNames:     []string{"omp", "node", "bun"},
 		SupportsHooks:    true,
 		InstructionsFile: "AGENTS.md",
