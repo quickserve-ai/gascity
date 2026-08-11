@@ -2538,6 +2538,97 @@ func formatGB(bytes int64) string {
 	return fmt.Sprintf("%.2f GB", gb)
 }
 
+// Subtrees of a managed Dolt database's .dolt directory that grow large for
+// unrelated reasons and are reclaimed by different (or no) procedures.
+const (
+	doltNomsSubdir           = "noms"
+	doltGitRemoteCacheSubdir = "git-remote-cache"
+)
+
+// doltDataFootprint splits a .dolt directory's bytes into the parts an
+// operator can act on differently. Reporting only the total invites the wrong
+// remedy: history compaction cannot reclaim transport-cache bytes, and its
+// flatten step rewrites lineage, which permanently breaks an origin mirror
+// (ga-npnoeo / ga-2wvmj9). Naming the subtrees keeps the metric honest about
+// which remedy, if any, applies.
+type doltDataFootprint struct {
+	// Noms is versioned history under noms/ — reclaimed by DOLT_GC and
+	// compaction. This is the subtree the bloat-recovery runbook addresses.
+	Noms int64
+	// GitRemoteCache is the Dolt git-remote transport's chunk cache under
+	// git-remote-cache/, present only for git+https remotes. It is a cache,
+	// not history: compaction cannot reclaim it. It is routinely LARGER on a
+	// database whose mirror is healthy than on one whose mirror is broken, so
+	// its size is not by itself a fault signal.
+	GitRemoteCache int64
+	// Other is everything else in .dolt (config, repo_state, stats). Normally
+	// negligible; carried so the parts always sum to the measured total.
+	Other int64
+}
+
+func (f *doltDataFootprint) add(other doltDataFootprint) {
+	f.Noms += other.Noms
+	f.GitRemoteCache += other.GitRemoteCache
+	f.Other += other.Other
+}
+
+// note renders the breakdown for a message, omitting parts that are absent so
+// a plain single-subtree database does not gain noise.
+func (f doltDataFootprint) note() string {
+	parts := make([]string, 0, 3)
+	if f.Noms > 0 {
+		parts = append(parts, "versioned history "+formatGB(f.Noms))
+	}
+	if f.GitRemoteCache > 0 {
+		parts = append(parts, "git remote cache "+formatGB(f.GitRemoteCache))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(parts, ", ") + ")"
+}
+
+// fixHint routes the operator to the remedy for whichever subtree dominates.
+// Pointing at the history-compaction runbook when the bytes are transport
+// cache is worse than saying nothing: compaction's flatten step is
+// irreversible and cannot reclaim those bytes.
+func (f doltDataFootprint) fixHint() string {
+	if f.GitRemoteCache > f.Noms {
+		return "most of this is git-remote-cache (dolt git-remote transport cache), which compaction does NOT reclaim — do not flatten history for it; see docs/troubleshooting/dolt-bloat-recovery.md#git-remote-cache"
+	}
+	return "see docs/troubleshooting/dolt-bloat-recovery.md"
+}
+
+// measureDoltDataSplit breaks a measured .dolt total into its named subtrees.
+// measure is the injected directory-measure function so this shares the
+// caller's timeout, du fallback, and test double. Each subtree holds a few
+// thousand large files at most, so the extra passes are cheap (measured at
+// <0.2s for a 13 GB database).
+func measureDoltDataSplit(measure func(string) (int64, bool, error), scanRoot string, total int64) (doltDataFootprint, error) {
+	var f doltDataFootprint
+	for _, sub := range []struct {
+		name string
+		dst  *int64
+	}{
+		{doltNomsSubdir, &f.Noms},
+		{doltGitRemoteCacheSubdir, &f.GitRemoteCache},
+	} {
+		bytes, exists, err := measure(filepath.Join(scanRoot, sub.name))
+		if err != nil {
+			return doltDataFootprint{}, err
+		}
+		if exists {
+			*sub.dst = bytes
+		}
+	}
+	// Guard against a negative remainder: the subtree passes are not atomic
+	// with the total, so a concurrent write can make the parts exceed it.
+	if other := total - f.Noms - f.GitRemoteCache; other > 0 {
+		f.Other = other
+	}
+	return f, nil
+}
+
 // DoltNomsSizeCheck warns when the managed Dolt database's on-disk footprint
 // is approaching or exceeds operator-set thresholds.
 type DoltNomsSizeCheck struct {
@@ -2605,7 +2696,9 @@ func (c *DoltNomsSizeCheck) Run(_ *CheckContext) *CheckResult {
 	var (
 		worstTarget doltDataScanTarget
 		worstBytes  int64
+		worstSplit  doltDataFootprint
 		totalBytes  int64
+		totalSplit  doltDataFootprint
 		existsCount int
 	)
 	measureDir := c.measureDir
@@ -2622,11 +2715,24 @@ func (c *DoltNomsSizeCheck) Run(_ *CheckContext) *CheckResult {
 		if !exists {
 			continue
 		}
+		// The scan root is the whole .dolt directory, which holds two
+		// unrelated subtrees with different remedies: noms/ is versioned
+		// history (reclaimed by GC/compaction) and git-remote-cache/ is the
+		// git remote transport's chunk cache (compaction cannot touch it).
+		// Measure them apart so the report cannot misname which one is large.
+		split, err := measureDoltDataSplit(measureDir, target.ScanRoot, total)
+		if err != nil {
+			r.Status = StatusWarning
+			r.Message = fmt.Sprintf("scan dolt data dir: %v", err)
+			return r
+		}
 		existsCount++
 		totalBytes += total
+		totalSplit.add(split)
 		if total > worstBytes {
 			worstBytes = total
 			worstTarget = target
+			worstSplit = split
 		}
 	}
 	if existsCount == 0 {
@@ -2649,20 +2755,20 @@ func (c *DoltNomsSizeCheck) Run(_ *CheckContext) *CheckResult {
 	switch {
 	case worstBytes >= doltNomsErrorBytes:
 		r.Status = StatusError
-		r.Message = fmt.Sprintf("dolt noms directory for %s is %s%s — excessive; recovery recommended", targetLabel, size, scopeNote)
-		r.FixHint = "see docs/troubleshooting/dolt-bloat-recovery.md"
+		r.Message = fmt.Sprintf("dolt data directory for %s is %s%s%s — excessive; recovery recommended", targetLabel, size, worstSplit.note(), scopeNote)
+		r.FixHint = worstSplit.fixHint()
 	case totalBytes >= doltNomsErrorBytes:
 		r.Status = StatusError
-		r.Message = fmt.Sprintf("aggregate dolt data footprint is %s across %d databases — excessive; recovery recommended", formatGB(totalBytes), existsCount)
-		r.FixHint = "see docs/troubleshooting/dolt-bloat-recovery.md"
+		r.Message = fmt.Sprintf("aggregate dolt data footprint is %s%s across %d databases — excessive; recovery recommended", formatGB(totalBytes), totalSplit.note(), existsCount)
+		r.FixHint = totalSplit.fixHint()
 	case worstBytes >= doltNomsWarnBytes:
 		r.Status = StatusWarning
-		r.Message = fmt.Sprintf("dolt noms directory for %s is %s%s — approaching threshold", targetLabel, size, scopeNote)
-		r.FixHint = "see docs/troubleshooting/dolt-bloat-recovery.md"
+		r.Message = fmt.Sprintf("dolt data directory for %s is %s%s%s — approaching threshold", targetLabel, size, worstSplit.note(), scopeNote)
+		r.FixHint = worstSplit.fixHint()
 	case totalBytes >= doltNomsWarnBytes:
 		r.Status = StatusWarning
-		r.Message = fmt.Sprintf("aggregate dolt data footprint is %s across %d databases — approaching threshold", formatGB(totalBytes), existsCount)
-		r.FixHint = "see docs/troubleshooting/dolt-bloat-recovery.md"
+		r.Message = fmt.Sprintf("aggregate dolt data footprint is %s%s across %d databases — approaching threshold", formatGB(totalBytes), totalSplit.note(), existsCount)
+		r.FixHint = totalSplit.fixHint()
 	default:
 		r.Status = StatusOK
 		if existsCount > 1 {
