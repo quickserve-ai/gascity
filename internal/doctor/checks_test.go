@@ -3103,6 +3103,93 @@ func TestDoltNomsSizeCheck_ErrorAtThreshold(t *testing.T) {
 	}
 }
 
+// The .dolt directory holds versioned history (noms/) and the git-remote
+// transport cache (git-remote-cache/) side by side. Reporting the total as
+// "noms" sent an operator to the compaction runbook for cache bytes that
+// compaction cannot reclaim, and whose flatten step permanently broke hq's
+// origin mirror (ga-p8kao1 / ga-npnoeo). The breakdown must be explicit.
+func TestDoltNomsSizeCheck_ReportsSubtreeBreakdown(t *testing.T) {
+	dir := setupManagedDoltCity(t)
+	doltDir := filepath.Join(dir, ".beads", "dolt", "hq", ".dolt")
+	writeFakeFile(t, filepath.Join(doltDir, "noms", "chunks"), 1*1024*1024*1024)
+	writeFakeFile(t, filepath.Join(doltDir, "git-remote-cache", "repo.git", "pack"), 2*1024*1024*1024)
+
+	c := newTestDoltNomsSizeCheck(dir, false)
+	r := c.Run(&CheckContext{})
+
+	if r.Status != StatusWarning {
+		t.Fatalf("status = %d, want Warning (3 GB total); msg = %s", r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, "versioned history 1.00 GB") {
+		t.Errorf("message = %q, want the noms subtree named and sized", r.Message)
+	}
+	if !strings.Contains(r.Message, "git remote cache 2.00 GB") {
+		t.Errorf("message = %q, want the transport cache named and sized", r.Message)
+	}
+	if strings.Contains(r.Message, "noms directory") {
+		t.Errorf("message = %q, must not label the whole .dolt total as the noms directory", r.Message)
+	}
+}
+
+// When the transport cache dominates, the hint must steer AWAY from
+// compaction rather than toward it.
+func TestDoltNomsSizeCheck_CacheDominantFixHintWarnsOffCompaction(t *testing.T) {
+	dir := setupManagedDoltCity(t)
+	doltDir := filepath.Join(dir, ".beads", "dolt", "hq", ".dolt")
+	writeFakeFile(t, filepath.Join(doltDir, "noms", "chunks"), 1*1024*1024*1024)
+	writeFakeFile(t, filepath.Join(doltDir, "git-remote-cache", "repo.git", "pack"), 4*1024*1024*1024)
+
+	c := newTestDoltNomsSizeCheck(dir, false)
+	r := c.Run(&CheckContext{})
+
+	if !strings.Contains(r.FixHint, "git-remote-cache") {
+		t.Errorf("fix hint = %q, want the transport cache named", r.FixHint)
+	}
+	if !strings.Contains(r.FixHint, "does NOT reclaim") {
+		t.Errorf("fix hint = %q, want an explicit statement that compaction cannot reclaim it", r.FixHint)
+	}
+	if !strings.Contains(r.FixHint, "do not flatten") {
+		t.Errorf("fix hint = %q, want the flatten warning", r.FixHint)
+	}
+}
+
+// A history-dominant database keeps the original runbook pointer.
+func TestDoltNomsSizeCheck_NomsDominantKeepsBloatRecoveryHint(t *testing.T) {
+	dir := setupManagedDoltCity(t)
+	doltDir := filepath.Join(dir, ".beads", "dolt", "hq", ".dolt")
+	writeFakeFile(t, filepath.Join(doltDir, "noms", "chunks"), 4*1024*1024*1024)
+	writeFakeFile(t, filepath.Join(doltDir, "git-remote-cache", "repo.git", "pack"), 1*1024*1024*1024)
+
+	c := newTestDoltNomsSizeCheck(dir, false)
+	r := c.Run(&CheckContext{})
+
+	if !strings.Contains(r.FixHint, "dolt-bloat-recovery") {
+		t.Errorf("fix hint = %q, want bloat-recovery doc reference", r.FixHint)
+	}
+	if strings.Contains(r.FixHint, "do not flatten") {
+		t.Errorf("fix hint = %q, must not warn off compaction when history dominates", r.FixHint)
+	}
+}
+
+func TestMeasureDoltDataSplit_RemainderNeverNegative(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeFile(t, filepath.Join(dir, "noms", "chunks"), 4096)
+	writeFakeFile(t, filepath.Join(dir, "git-remote-cache", "pack"), 4096)
+
+	// Total understates the parts, as a concurrent write during a
+	// non-atomic multi-pass measurement can produce.
+	split, err := measureDoltDataSplit(sumDirBytes, dir, 1024)
+	if err != nil {
+		t.Fatalf("measureDoltDataSplit: %v", err)
+	}
+	if split.Other != 0 {
+		t.Errorf("Other = %d, want 0 (remainder must not go negative)", split.Other)
+	}
+	if split.Noms != 4096 || split.GitRemoteCache != 4096 {
+		t.Errorf("Noms = %d, GitRemoteCache = %d, want 4096 each", split.Noms, split.GitRemoteCache)
+	}
+}
+
 func TestDoltNomsSizeCheck_RigDatabaseWarnAtThreshold(t *testing.T) {
 	dir := setupManagedDoltCity(t)
 	rigDir := filepath.Join(dir, "demo")

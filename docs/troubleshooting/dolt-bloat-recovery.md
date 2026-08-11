@@ -19,11 +19,67 @@ and verifying the result.
 ## Symptoms
 
 1. `gc doctor` reports `dolt-noms-size` as **Warning** or **Error**.
-2. `du -sh <cityPath>/.beads/dolt/<database>/.dolt/` returns more than
-   20 GB.
+2. `du -sh <cityPath>/.beads/dolt/<database>/.dolt/noms/` returns more than
+   20 GB. Measure `noms/`, **not** the whole `.dolt/` — see
+   [git-remote-cache](#git-remote-cache) below for why the parent total is
+   usually the wrong number to act on.
 3. `bd` writes feel slower than usual, or `bd ready` takes noticeable time.
 4. Agents fail with Dolt connection or timeout errors, especially shortly
    after start.
+
+## git-remote-cache
+
+**Before running any recovery below, confirm which subtree is actually
+large.** A `.dolt` directory holds two unrelated things that grow for
+different reasons, and only one of them is what this runbook can fix:
+
+```bash
+du -sh <cityPath>/.beads/dolt/<database>/.dolt/noms
+du -sh <cityPath>/.beads/dolt/<database>/.dolt/git-remote-cache
+```
+
+- `noms/` is versioned history. Everything in this runbook applies to it.
+- `git-remote-cache/` is the Dolt git-remote transport's local chunk cache,
+  present only for `git+https://` remotes. **It is a cache, not history.
+  Nothing in this runbook reclaims it — not `DOLT_GC`, not
+  `gc dolt compact`, not a flatten.**
+
+In practice the cache is usually the larger half. Measured on this city
+2026-08-11:
+
+| database | `.dolt` total | `noms/` | `git-remote-cache/` |
+| -------- | ------------- | ------- | ------------------- |
+| hq       | 13.25 GB      | 5.42 GB | 7.82 GB             |
+| qcore    | 10.27 GB      | 1.15 GB | 9.09 GB             |
+| as       | 141 MB        | 141 MB  | — (no remote)       |
+
+Note that the cache is **larger on `qcore`, whose mirror is healthy**, than on
+`hq`, whose mirror is broken. Cache size on its own is not a fault signal and
+is not evidence of a failed push.
+
+### Why this matters enough to have its own section
+
+Reading the `.dolt` total as history and reaching for compaction is not a
+harmless mistake. `gc dolt compact` flattens history, which rewrites lineage,
+which makes every subsequent push to a configured origin mirror fail as
+non-fast-forward — permanently, with no retry, timeout raise, or credential
+fix able to clear it.
+
+That is the recorded cause of a 121-hour loss of off-box durability for `hq`
+(`ga-npnoeo`, `ga-2wvmj9`), triggered while acting on a
+`dolt-noms-size` figure that was 60% transport cache. If your bytes are in
+`git-remote-cache/`, compaction pays none of that cost back.
+
+### Reclaiming it
+
+**Not an established procedure yet.** As of 2026-08-11 `gc` has no code path
+that measures, prunes, or documents this directory beyond the doctor
+breakdown, and no safe-prune sequence has been validated against a live
+server. Do not improvise one on a running city: treat the cache as
+load-bearing for the mirror transport until that work is done.
+
+If disk pressure is genuinely driven by the cache, escalate to the platform
+coordinator (Woodhouse) rather than deleting it. Tracked as `ga-p8kao1`.
 
 ## Preconditions
 
