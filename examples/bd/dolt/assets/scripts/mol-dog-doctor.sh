@@ -189,9 +189,29 @@ if [ -n "$BACKUP_ELIGIBLE_DBS" ]; then
     else
         NOW_S=$(date +%s)
         for db in $BACKUP_ELIGIBLE_DBS; do
-            NEWEST_BACKUP_MTIME=$(newest_backup_mtime_for_db "$db")
+            # ga-g3p5rm: age comes from the sync-success stamp, not from the
+            # newest FILE mtime under the artifact dir. newest_backup_mtime_for_db
+            # is satisfied by the orphan chunks a KILLED sync leaves behind, so
+            # the advisory inherited health's false green. FAIL CLOSED — treat a
+            # missing stamp as "never proven", not as fresh.
+            # Guarded for `set -euo pipefail`: a MISSING stamp is the normal
+            # case (and the whole point of failing closed), but an unguarded
+            # pipeline over a nonexistent file exits non-zero and would abort
+            # the doctor pass.
+            NEWEST_BACKUP_MTIME=0
+            if [ -f "$LOCAL_BACKUP_FRESHNESS_DIR/$db" ]; then
+                NEWEST_BACKUP_MTIME=$(sed -n 's/^synced_at_epoch=//p' \
+                    "$LOCAL_BACKUP_FRESHNESS_DIR/$db" 2>/dev/null | head -1 || true)
+            fi
+            case "$NEWEST_BACKUP_MTIME" in ''|*[!0-9]*) NEWEST_BACKUP_MTIME=0 ;; esac
             if [ "$NEWEST_BACKUP_MTIME" -le 0 ]; then
-                append_backup_stale "$db backup missing"
+                if [ "$(newest_backup_mtime_for_db "$db")" -gt 0 ]; then
+                    # Artifacts exist but no sync ever proved itself: exactly the
+                    # hq shape — gigabytes on disk, none of it known-good.
+                    append_backup_stale "$db backup UNVERIFIED (artifacts present, no successful sync recorded)"
+                else
+                    append_backup_stale "$db backup missing"
+                fi
                 continue
             fi
             BACKUP_AGE=$((NOW_S - NEWEST_BACKUP_MTIME))
