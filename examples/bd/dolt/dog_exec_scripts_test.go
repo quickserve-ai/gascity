@@ -4013,6 +4013,41 @@ func TestBackupScriptCountsFailedRemoteAutoConfiguration(t *testing.T) {
 	}
 }
 
+// doctorBackupStaleEnv sets the doctor's backup-staleness horizon for these
+// fixtures.
+//
+// It used to be 1 second, which raced the harness: the fixtures set a backup's
+// mtime to time.Now() and then exec the doctor script, so any delay above one
+// second between those two steps aged a deliberately-FRESH backup past the
+// horizon and the test failed. Under the parallel runner that delay is routine
+// (measured ~400ms latency and 2s test durations), which is why these tests
+// passed in isolation and failed nondeterministically in a full run — and why
+// a different one of the five failed on each run (ga-w97tq).
+//
+// 300s is chosen to sit far above any plausible process-startup delay while
+// staying far below the only STALE fixture in this file (-2h, in
+// TestDoctorScriptChecksBackupArtifactFreshnessPerDatabase), so freshness
+// discrimination is still exercised exactly as before.
+const doctorBackupStaleEnv = "GC_DOCTOR_BACKUP_STALE_S=300"
+
+// writeDoctorLocalSyncStamp seeds the local-plane sync-success stamp the doctor
+// now reads for freshness (ga-g3p5rm). Freshness deliberately no longer comes
+// from artifact mtimes: a KILLED `dolt backup sync` writes chunk files, which
+// bumped every mtime-derived reading and made a 6.5-day-dead hq backup report
+// as fresh in production. A stamp exists only when a sync exited 0.
+func writeDoctorLocalSyncStamp(t *testing.T, cityPath, db string, syncedAt time.Time) {
+	t.Helper()
+
+	stampDir := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "local-backup-freshness")
+	if err := os.MkdirAll(stampDir, 0o755); err != nil {
+		t.Fatalf("mkdir local-backup-freshness: %v", err)
+	}
+	body := fmt.Sprintf("synced_at_epoch=%d\nartifact_dir=\n", syncedAt.Unix())
+	if err := os.WriteFile(filepath.Join(stampDir, db), []byte(body), 0o644); err != nil {
+		t.Fatalf("write sync stamp for %s: %v", db, err)
+	}
+}
+
 func TestDoctorScriptChecksBackupArtifactFreshnessPerDatabase(t *testing.T) {
 	cityPath := t.TempDir()
 	dataDir := filepath.Join(cityPath, "dolt-data")
@@ -4037,6 +4072,11 @@ func TestDoctorScriptChecksBackupArtifactFreshnessPerDatabase(t *testing.T) {
 	if err := os.Chtimes(staleBackup, old, old); err != nil {
 		t.Fatalf("chtimes stale backup: %v", err)
 	}
+	// Freshness is stamp-driven now, so express the fresh/stale split there.
+	// The artifact mtimes above are left as-is deliberately: they no longer
+	// decide anything, and keeping them proves the doctor ignores them.
+	writeDoctorLocalSyncStamp(t, cityPath, "prod", fresh)
+	writeDoctorLocalSyncStamp(t, cityPath, "archive", old)
 
 	binDir := t.TempDir()
 	gcLogPath := writeDogFakeGC(t, binDir)
@@ -4249,6 +4289,11 @@ func TestDoctorScriptDoesNotCreditSharedPrefixBackupToDatabase(t *testing.T) {
 	if err := os.Chtimes(freshSiblingBackup, fresh, fresh); err != nil {
 		t.Fatalf("chtimes fresh sibling backup: %v", err)
 	}
+	// Only prod_dev ever synced successfully. prod gets NO stamp, so the
+	// sibling's success must not be credited to it — the same attribution
+	// guarantee this test has always asserted, now enforced structurally by
+	// one stamp file per exact database name rather than by prefix matching.
+	writeDoctorLocalSyncStamp(t, cityPath, "prod_dev", fresh)
 
 	binDir := t.TempDir()
 	gcLogPath := writeDogFakeGC(t, binDir)

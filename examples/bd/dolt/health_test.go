@@ -1663,6 +1663,14 @@ func TestHealthBackupFreshnessFailsClosedWhenServerUnreachable(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "manifest"), []byte("backup"), 0o644); err != nil {
 			t.Fatalf("write backup manifest %s: %v", db, err)
 		}
+		// ga-g3p5rm: local freshness comes from a sync-SUCCESS stamp, not from
+		// artifact mtimes, so a legitimately-fresh local plane must be expressed
+		// by stamping. Without this the manifests above would once have read
+		// "ok" purely because they were just created — the false green this
+		// test would otherwise re-assert. What this test actually guards is
+		// PLANE INDEPENDENCE (an unreachable server must not contaminate the
+		// local plane), and that is preserved exactly.
+		writeLocalSyncStamp(t, cityPath, db, time.Now())
 	}
 
 	root := repoRoot(t)

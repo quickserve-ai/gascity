@@ -20,6 +20,12 @@ SYSTEM_DBS="^(information_schema|mysql|dolt_cluster|__gc_probe|performance_schem
 MIN_DOLT_BACKUP_VERSION="2.1.0"
 BACKUP_LOCK_FILE="${GC_DOLT_BACKUP_LOCK_FILE:-$GC_CITY_PATH/.gc/runtime/packs/dolt/backup-sync.lock}"
 BACKUP_LOCK_WAIT_SECONDS="${GC_DOLT_BACKUP_LOCK_WAIT_SECONDS:-5}"
+# Per-database `dolt backup sync` bound, seconds (ga-g3p5rm). Was a hardcoded
+# 120 that hq could never finish inside. The order's own cadence is 6h, so a
+# 30-minute ceiling still leaves ample headroom while remaining bounded — this
+# holds the backup flock, so it must never be unbounded.
+BACKUP_SYNC_TIMEOUT="${GC_DOLT_BACKUP_SYNC_TIMEOUT_SECONDS:-1800}"
+case "$BACKUP_SYNC_TIMEOUT" in ''|*[!0-9]*|0) BACKUP_SYNC_TIMEOUT=1800 ;; esac
 
 dolt_sql() {
     DOLT_CLI_PASSWORD="${GC_DOLT_PASSWORD:-}" \
@@ -176,11 +182,36 @@ for db in $DATABASES; do
         append_failed_db "$db(not found)"
         continue
     fi
-    if (cd "$db_dir" && run_bounded 120 dolt backup sync "${db}-backup" 2>/dev/null); then
+    # ga-g3p5rm: the bound used to be a hardcoded 120s with no override, which
+    # no database larger than a couple of GB could ever finish. hq (5.4 GB /
+    # 53k commits) writes ~1 GB per ~30s, so it was killed partway on EVERY run
+    # from the moment it outgrew the bound — abandoning gigabytes of unreachable
+    # chunks and never advancing its manifest. as and qcore were small enough to
+    # finish, which is why only hq silently rotted.
+    #
+    # Keep it BOUNDED (this holds the backup flock and competes for I/O with the
+    # whole city) but size it so a real database can complete, and let the
+    # operator raise it without editing the pack.
+    sync_stderr="$(mktemp -t dolt-backup-sync 2>/dev/null || printf '%s' "/tmp/dolt-backup-sync.$$")"
+    if (cd "$db_dir" && run_bounded "$BACKUP_SYNC_TIMEOUT" dolt backup sync "${db}-backup" 2>"$sync_stderr"); then
         SYNCED=$((SYNCED + 1))
+        # Stamp ONLY on exit 0. Health reads this instead of any mtime on the
+        # artifact plane, because the failure path can write those too.
+        write_local_backup_sync_stamp "$db" "$BACKUP_ARTIFACT_DIR"
     else
-        append_failed_db "$db(sync failed)"
+        # ga-28huj class: the reason used to go to /dev/null, so "sync failed"
+        # was unactionable. Carry the first stderr line into the failure label.
+        # Guarded for `set -euo pipefail`: an EMPTY stderr file is the normal
+        # case on a timeout kill, and an unguarded pipeline over it exits
+        # non-zero and would abort the whole backup run.
+        sync_reason=""
+        if [ -s "$sync_stderr" ]; then
+            sync_reason="$(tr -s '[:space:]' ' ' < "$sync_stderr" 2>/dev/null | head -1 | cut -c1-120 || true)"
+        fi
+        [ -n "$sync_reason" ] || sync_reason="no stderr; exceeded ${BACKUP_SYNC_TIMEOUT}s bound or exited non-zero"
+        append_failed_db "$db(sync failed: $sync_reason)"
     fi
+    rm -f "$sync_stderr" 2>/dev/null || true
 done
 
 FAILED_COUNT=$FAILED

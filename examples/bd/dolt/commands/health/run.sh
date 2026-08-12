@@ -296,6 +296,12 @@ fi
 # Local recovery artifacts are a separate backup plane from GitHub-origin
 # mirrors. mol-dog-backup writes one <db>/manifest under .dolt-backup; mirror
 # push stamps above say nothing about those local artifacts (ga-co5cx).
+#
+# Freshness on this plane comes from $LOCAL_BACKUP_FRESHNESS_DIR/<db>
+# (synced_at_epoch, written only on a sync that exits 0 — see runtime.sh), NOT
+# from any mtime under .dolt-backup. The manifest's presence still gates
+# "is this database a local backup target at all", but it does not date it:
+# a killed sync leaves chunks and an old manifest behind (ga-g3p5rm).
 local_backup_dir="${GC_BACKUP_ARTIFACT_DIR:-$GC_CITY_PATH/.dolt-backup}"
 local_backup_threshold="${GC_DOLT_LOCAL_BACKUP_STALE_SECS:-28800}"
 case "$local_backup_threshold" in ''|*[!0-9]*) local_backup_threshold=28800 ;; esac
@@ -307,10 +313,6 @@ local_backup_detail=""
 local_backup_any=false
 local_backup_bad=false
 local_backup_oldest_epoch=0
-
-file_mtime_epoch() {
-  stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || true
-}
 
 local_db_names=""
 if [ -n "$db_info" ]; then
@@ -324,11 +326,18 @@ fi
 
 for local_db in $local_db_names; do
   local_manifest="$local_backup_dir/$local_db/manifest"
+  local_stamp="$LOCAL_BACKUP_FRESHNESS_DIR/$local_db"
   local_state="unknown"
   local_age=""
   if [ -f "$local_manifest" ]; then
     local_backup_any=true
-    local_epoch=$(file_mtime_epoch "$local_backup_dir/$local_db")
+    # ga-g3p5rm: freshness comes from a stamp that ONLY a sync exiting 0 writes,
+    # never from an mtime on the artifact plane. A failed sync writes chunk
+    # files into .dolt-backup/<db>, which bumps that directory's mtime exactly
+    # as a successful sync would — so the old reading self-healed in the wrong
+    # direction and reported a 6.5-day-dead hq backup as ok. FAIL CLOSED: no
+    # stamp means unknown, and unknown is not ok.
+    local_epoch=$(sed -n 's/^synced_at_epoch=//p' "$local_stamp" 2>/dev/null | head -1)
     case "$local_epoch" in
       ''|*[!0-9]*) local_state="unknown" ;;
       *)
