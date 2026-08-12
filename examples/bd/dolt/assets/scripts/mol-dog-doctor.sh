@@ -247,12 +247,33 @@ if [ -n "$BACKUP_ELIGIBLE_DBS" ]; then
     else
         NOW_S=$(date +%s)
         for db in $BACKUP_ELIGIBLE_DBS; do
-            BACKUP_COMMIT_MTIME=$(backup_commit_mtime_for_db "$db")
-            if [ "$BACKUP_COMMIT_MTIME" -le 0 ]; then
-                append_backup_stale "$db backup missing"
+            # ga-g3p5rm: age comes from the sync-success stamp, not from the
+            # backup remote's manifest (backup_commit_mtime_for_db, upstream #7381):
+            # an up-to-date sync does not rewrite the manifest, so manifest dating
+            # pages on every idle database, and before #7381 the newest FILE mtime
+            # was satisfied by the orphan chunks a KILLED sync leaves behind. FAIL CLOSED — treat a
+            # missing stamp as "never proven", not as fresh.
+            # Guarded for `set -euo pipefail`: a MISSING stamp is the normal
+            # case (and the whole point of failing closed), but an unguarded
+            # pipeline over a nonexistent file exits non-zero and would abort
+            # the doctor pass.
+            NEWEST_BACKUP_MTIME=0
+            if [ -f "$LOCAL_BACKUP_FRESHNESS_DIR/$db" ]; then
+                NEWEST_BACKUP_MTIME=$(sed -n 's/^synced_at_epoch=//p' \
+                    "$LOCAL_BACKUP_FRESHNESS_DIR/$db" 2>/dev/null | head -1 || true)
+            fi
+            case "$NEWEST_BACKUP_MTIME" in ''|*[!0-9]*) NEWEST_BACKUP_MTIME=0 ;; esac
+            if [ "$NEWEST_BACKUP_MTIME" -le 0 ]; then
+                if [ "$(backup_commit_mtime_for_db "$db")" -gt 0 ]; then
+                    # Artifacts exist but no sync ever proved itself: exactly the
+                    # hq shape — gigabytes on disk, none of it known-good.
+                    append_backup_stale "$db backup UNVERIFIED (artifacts present, no successful sync recorded)"
+                else
+                    append_backup_stale "$db backup missing"
+                fi
                 continue
             fi
-            BACKUP_AGE=$((NOW_S - BACKUP_COMMIT_MTIME))
+            BACKUP_AGE=$((NOW_S - NEWEST_BACKUP_MTIME))
             if [ "$BACKUP_AGE" -gt "$BACKUP_STALE_S" ]; then
                 append_backup_stale "$db backup is $((BACKUP_AGE / 3600))h old"
             fi
