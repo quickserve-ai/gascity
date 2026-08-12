@@ -286,6 +286,10 @@ for db in $DATABASES; do
     sync_failure_detail=""
     if sync_failure_detail=$(sync_one_database "$db" "$db_dir"); then
         SYNCED=$((SYNCED + 1))
+        # Stamp ONLY on exit 0 (ga-g3p5rm). The doctor dog dates each database's
+        # local backup from this stamp and never from an artifact mtime, because
+        # a killed sync writes chunk files on the failure path too.
+        write_local_backup_sync_stamp "$db" "$BACKUP_ARTIFACT_DIR"
     else
         append_failed_db "$db(sync failed)"
         append_failed_detail "$db" "$sync_failure_detail"
