@@ -85,6 +85,17 @@ append_backup_stale() {
     else
         BACKUP_STALE_ITEMS="$backup_stale_item"
     fi
+    # Second argument is the LATCH SIGNATURE token — a stable identity for this
+    # item, deliberately distinct from the human-readable text above. The prose
+    # carries a drifting age ("hq backup is 13h old" becomes "14h old" an hour
+    # later); a signature built from it would change every hour, never match the
+    # marker, and latch nothing. See the advisory-latch block below.
+    backup_stale_sig_token="${2:-unclassified}"
+    if [ -n "$BACKUP_STALE_SIG_ITEMS" ]; then
+        BACKUP_STALE_SIG_ITEMS="$BACKUP_STALE_SIG_ITEMS,$backup_stale_sig_token"
+    else
+        BACKUP_STALE_SIG_ITEMS="$backup_stale_sig_token"
+    fi
 }
 
 send_escalation() {
@@ -101,21 +112,139 @@ send_escalation() {
     fi
 }
 
+# --- Advisory latch (ga-466izs) ---
+#
+# WHY THIS EXISTS — this advisory had no latch and no dedupe. Any warning that
+# is STICKY rather than transient produced one operator mail every 5 minutes for
+# as long as the condition held: 288/day. Measured 2026-08-13, 43 MEDIUM mails
+# in 4h once ga-g3p5rm's fail-closed backup check began (correctly) reporting
+# UNVERIFIED, and again the same day on sustained latency.
+#
+# The mail volume is not the failure. Alarm fatigue is: an advisory that arrives
+# 288x/day trains the operator to ignore the channel, so the NEXT genuine MEDIUM
+# is invisible (ga-mlvzm3 — the human mailbox is already a dead-letter box).
+#
+# Four properties, three of them copied from the sibling that already solved
+# this (packs/cherub-law/assets/scripts/dolt-mirror-alarm.sh):
+#
+#   PER CLASS, not aggregate. latency / connections / orphans / backup latch
+#   independently. Latching the aggregate would let one sticky backup warning
+#   suppress a genuinely NEW latency warning — trading a mail storm for a
+#   blind spot, which is a worse bug than the one being fixed.
+#
+#   SIGNATURE, not mere existence. A materially different incident still pages
+#   while a repeat of the same one stays quiet.
+#
+#   BANDED, not raw — the trap that makes a naive signature useless. Latency
+#   reads 1054ms, then 1010ms, then 3160ms; connection counts and backup ages
+#   drift every cycle. A signature carrying the raw measurement changes every
+#   pass, never matches its marker, and suppresses NOTHING — the fix would read
+#   as correct and latch zero mails. So signatures carry a severity BAND or a
+#   stable identity (<db>:<kind>): a steady incident is one signature, while a
+#   materially WORSENING one crosses a band and re-pages.
+#
+#   HEARTBEAT. A latched incident re-sends every GC_DOCTOR_ADVISORY_REPEAT_S
+#   (default 6h) so a long-running condition is never silently forgotten.
+#   Worst case 4 mails/day instead of 288.
+#
+# Latch ONLY after mail is actually delivered (the sibling's rule — an
+# undelivered alert that latches is a lost alert), and re-arm a class the moment
+# it stops warning, so a condition that clears and recurs pages again.
+DOCTOR_LATCH_DIR="${GC_DOCTOR_LATCH_DIR:-$PACK_STATE_DIR/doctor-advisory-latch}"
+ADVISORY_REPEAT_S="${GC_DOCTOR_ADVISORY_REPEAT_S:-21600}"
+ADVISORY_ACTIVE=""
+ADVISORY_ACTIVE_CLASSES=""
+
+# advisory_band <value> <threshold> -> warn | high | severe
+# Collapses a drifting measurement into a stable severity band so that only a
+# materially worse incident changes the signature.
+advisory_band() {
+    ab_value="$1"
+    ab_threshold="$2"
+    case "$ab_value" in ''|*[!0-9]*) ab_value=0 ;; esac
+    case "$ab_threshold" in ''|*[!0-9]*) ab_threshold=0 ;; esac
+    if [ "$ab_threshold" -le 0 ]; then
+        printf 'warn\n'
+        return 0
+    fi
+    if [ "$ab_value" -ge $((ab_threshold * 5)) ]; then
+        printf 'severe\n'
+    elif [ "$ab_value" -ge $((ab_threshold * 2)) ]; then
+        printf 'high\n'
+    else
+        printf 'warn\n'
+    fi
+}
+
+# advisory_mark_active <class> <signature>
+advisory_mark_active() {
+    ADVISORY_ACTIVE="${ADVISORY_ACTIVE}$1 $2
+"
+    ADVISORY_ACTIVE_CLASSES="$ADVISORY_ACTIVE_CLASSES $1"
+}
+
+# advisory_class_should_send <class> <signature>
+# 0 = this class justifies a mail (new, changed, or heartbeat due), 1 = latched.
+advisory_class_should_send() {
+    acs_marker="$DOCTOR_LATCH_DIR/$1"
+    if [ ! -f "$acs_marker" ]; then
+        return 0
+    fi
+    acs_prev=$(sed -n '1p' "$acs_marker" 2>/dev/null || true)
+    if [ "$acs_prev" != "$2" ]; then
+        return 0
+    fi
+    acs_age=$(( $(date +%s) - $(file_mtime "$acs_marker") ))
+    if [ "$acs_age" -ge "$ADVISORY_REPEAT_S" ]; then
+        return 0
+    fi
+    return 1
+}
+
+# advisory_latch <class> <signature>
+# Best-effort: a marker write must never fail an otherwise-delivered advisory.
+# tmp+mv keeps a concurrent read from seeing a torn file.
+advisory_latch() {
+    mkdir -p "$DOCTOR_LATCH_DIR" 2>/dev/null || return 0
+    printf '%s\n' "$2" > "$DOCTOR_LATCH_DIR/$1.tmp" 2>/dev/null || {
+        rm -f "$DOCTOR_LATCH_DIR/$1.tmp" 2>/dev/null
+        return 0
+    }
+    mv -f "$DOCTOR_LATCH_DIR/$1.tmp" "$DOCTOR_LATCH_DIR/$1" 2>/dev/null || return 0
+}
+
+# advisory_rearm <class> — drop the marker so the next occurrence pages.
+advisory_rearm() {
+    rm -f "$DOCTOR_LATCH_DIR/$1" 2>/dev/null || true
+}
+
 # --- Step 1: Probe connectivity and measure latency ---
 
 PROBE_START_MS=$(now_ms)
 if ! dolt_sql -q "SELECT active_branch()" >/dev/null 2>&1; then
-    if send_escalation \
-        "ESCALATION: Dolt server unreachable on port $PORT [CRITICAL]" \
-        "Doctor probe failed: server did not respond to active_branch() query."; then
-        dolt_notify_done "doctor — server: UNREACHABLE (escalated)"
-        echo "doctor: server unreachable on port $PORT (escalated)"
+    # The CRITICAL path is latched on the same terms as the MEDIUM advisory
+    # below: an unreachable server is the stickiest condition this script can
+    # observe, so without a latch a multi-hour outage mails the operator every
+    # 5 minutes. The heartbeat still re-pages it, and a delivery failure does
+    # not latch, so an outage is never silently swallowed.
+    if advisory_class_should_send unreachable "port:$PORT"; then
+        if send_escalation \
+            "ESCALATION: Dolt server unreachable on port $PORT [CRITICAL]" \
+            "Doctor probe failed: server did not respond to active_branch() query."; then
+            advisory_latch unreachable "port:$PORT"
+            dolt_notify_done "doctor — server: UNREACHABLE (escalated)"
+            echo "doctor: server unreachable on port $PORT (escalated)"
+        else
+            dolt_notify_done "doctor — server: UNREACHABLE (escalation failed)"
+            echo "doctor: server unreachable on port $PORT (escalation failed)"
+        fi
     else
-        dolt_notify_done "doctor — server: UNREACHABLE (escalation failed)"
-        echo "doctor: server unreachable on port $PORT (escalation failed)"
+        dolt_notify_done "doctor — server: UNREACHABLE (alert latched)"
+        echo "doctor: server unreachable on port $PORT (alert latched)"
     fi
     exit 0
 fi
+advisory_rearm unreachable
 PROBE_END_MS=$(now_ms)
 LATENCY_MS=$((PROBE_END_MS - PROBE_START_MS))
 LATENCY_WARN=""
@@ -157,13 +286,14 @@ fi
 # unless the backup dog itself is failing.
 BACKUP_ELIGIBLE_DBS=""
 BACKUP_STALE_ITEMS=""
+BACKUP_STALE_SIG_ITEMS=""
 for db in $USER_DBS; do
     db_dir="$DOLT_DATA_DIR/$db"
     if [ -d "$db_dir/.dolt" ]; then
         if (cd "$db_dir" && run_bounded 30 dolt backup 2>/dev/null | awk '{print $1}' | grep -qx "${db}-backup"); then
             BACKUP_ELIGIBLE_DBS="$BACKUP_ELIGIBLE_DBS $db"
         else
-            append_backup_stale "$db backup remote missing"
+            append_backup_stale "$db backup remote missing" "$db:remote-missing"
         fi
     fi
 done
@@ -173,6 +303,7 @@ BACKUP_STALE=""
 if [ -n "$BACKUP_ELIGIBLE_DBS" ]; then
     if [ ! -d "$BACKUP_ARTIFACT_DIR" ]; then
         BACKUP_STALE=" [WARN: backup artifact dir missing]"
+        BACKUP_STALE_SIG_ITEMS="artifact-dir:missing"
     else
         NOW_S=$(date +%s)
         for db in $BACKUP_ELIGIBLE_DBS; do
@@ -195,15 +326,15 @@ if [ -n "$BACKUP_ELIGIBLE_DBS" ]; then
                 if [ "$(newest_backup_mtime_for_db "$db")" -gt 0 ]; then
                     # Artifacts exist but no sync ever proved itself: exactly the
                     # hq shape — gigabytes on disk, none of it known-good.
-                    append_backup_stale "$db backup UNVERIFIED (artifacts present, no successful sync recorded)"
+                    append_backup_stale "$db backup UNVERIFIED (artifacts present, no successful sync recorded)" "$db:unverified"
                 else
-                    append_backup_stale "$db backup missing"
+                    append_backup_stale "$db backup missing" "$db:missing"
                 fi
                 continue
             fi
             BACKUP_AGE=$((NOW_S - NEWEST_BACKUP_MTIME))
             if [ "$BACKUP_AGE" -gt "$BACKUP_STALE_S" ]; then
-                append_backup_stale "$db backup is $((BACKUP_AGE / 3600))h old"
+                append_backup_stale "$db backup is $((BACKUP_AGE / 3600))h old" "$db:stale"
             fi
         done
     fi
@@ -215,16 +346,68 @@ fi
 # --- Step 3: Compose report and escalate if critical ---
 
 WARNINGS="${LATENCY_WARN}${CONN_WARN}${ORPHAN_WARN}${BACKUP_STALE}"
+
+# Register each warning class with a signature that is stable while the incident
+# is unchanged. See the advisory-latch block above for why these are banded
+# rather than carrying the raw measurement.
+if [ -n "$LATENCY_WARN" ]; then
+    advisory_mark_active latency "over:$(advisory_band "$LATENCY_MS" "$LATENCY_WARN_MS")"
+fi
+if [ -n "$CONN_WARN" ]; then
+    advisory_mark_active connections "over:$(advisory_band "$CONN_COUNT" "$CONN_WARN_AT")"
+fi
+if [ -n "$ORPHAN_WARN" ]; then
+    advisory_mark_active orphans "count:$(advisory_band "$ORPHAN_COUNT" 10)"
+fi
+if [ -n "$BACKUP_STALE" ]; then
+    # Sorted so that a change in SHOW DATABASES ordering is not mistaken for a
+    # new incident.
+    advisory_mark_active backup "$(printf '%s' "$BACKUP_STALE_SIG_ITEMS" \
+        | tr ',' '\n' | sort | tr '\n' ',' | sed 's/,$//')"
+fi
+
 if [ -n "$WARNINGS" ]; then
-    if ! send_escalation \
-        "Dolt health advisory [MEDIUM]" \
-        "Latency: ${LATENCY_MS}ms${LATENCY_WARN}
+    ADVISORY_SEND=false
+    ADVISORY_LATCHED_CLASSES=""
+    while IFS=' ' read -r advisory_class advisory_signature; do
+        [ -n "$advisory_class" ] || continue
+        if advisory_class_should_send "$advisory_class" "$advisory_signature"; then
+            ADVISORY_SEND=true
+        else
+            ADVISORY_LATCHED_CLASSES="$ADVISORY_LATCHED_CLASSES $advisory_class"
+        fi
+    done <<EOF
+$ADVISORY_ACTIVE
+EOF
+    if [ "$ADVISORY_SEND" = true ]; then
+        if send_escalation \
+            "Dolt health advisory [MEDIUM]" \
+            "Latency: ${LATENCY_MS}ms${LATENCY_WARN}
 Connections: ${CONN_COUNT}/${CONN_MAX}${CONN_WARN}
 Disk: ${DISK_USAGE}
 Orphan DBs: ${ORPHAN_COUNT}${ORPHAN_WARN}${BACKUP_STALE}"; then
-        :
+            # Latch only what was actually delivered. On failure nothing is
+            # latched, so the next cycle retries rather than going quiet.
+            while IFS=' ' read -r advisory_class advisory_signature; do
+                [ -n "$advisory_class" ] || continue
+                advisory_latch "$advisory_class" "$advisory_signature"
+            done <<EOF
+$ADVISORY_ACTIVE
+EOF
+        fi
+    else
+        echo "doctor: advisory suppressed — warning classes latched:${ADVISORY_LATCHED_CLASSES}"
     fi
 fi
+
+# Re-arm every class that is not currently warning, so a condition that clears
+# and later recurs pages again instead of staying silently latched.
+for advisory_class in latency connections orphans backup; do
+    case " $ADVISORY_ACTIVE_CLASSES " in
+        *" $advisory_class "*) ;;
+        *) advisory_rearm "$advisory_class" ;;
+    esac
+done
 
 SUMMARY="doctor — server: ok, latency: ${LATENCY_MS}ms, conns: ${CONN_COUNT}/${CONN_MAX}, disk: ${DISK_USAGE}, orphans: ${ORPHAN_COUNT}"
 dolt_notify_done "$SUMMARY"
