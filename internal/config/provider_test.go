@@ -990,3 +990,47 @@ func TestPathCheckBinary(t *testing.T) {
 		})
 	}
 }
+
+// TestReplaceSchemaFlagsMigratesBareFablePinTo1M locks the fable half of the
+// "[1m] is load-bearing" contract (ga-ljcm7c), exactly as
+// TestReplaceSchemaFlagsMigratesDatedOpusPinToAlias locks the opus half. A
+// session command baked with the pre-fix bare `--model claude-fable-5` (the
+// 200k tier) must migrate to `claude-fable-5[1m]` on restart, with exactly one
+// --model flag. This holds only while the bare pin stays in the enum as
+// "fable-5-200k" — StripFlags can only strip sequences the schema still
+// declares, so deleting that pin re-breaks restart migration silently.
+func TestReplaceSchemaFlagsMigratesBareFablePinTo1M(t *testing.T) {
+	p := BuiltinProviders()["claude"]
+	rp := &ResolvedProvider{
+		Command:       p.Command,
+		Args:          p.Args,
+		OptionsSchema: p.OptionsSchema,
+		EffectiveDefaults: ComputeEffectiveDefaults(p.OptionsSchema, p.OptionDefaults,
+			map[string]string{"model": "fable-5", "effort": "high"}),
+	}
+
+	// The shape a fable-lane session command had on disk before the fix.
+	live := `claude --dangerously-skip-permissions --effort high --model claude-fable-5 --settings /Users/cherub/gascity/.gc/settings.json`
+
+	got := ReplaceSchemaFlags(live, p.OptionsSchema, rp.ResolveDefaultArgs())
+
+	if n := strings.Count(got, "--model"); n != 1 {
+		t.Fatalf("restart command = %q, want exactly one --model flag, got %d", got, n)
+	}
+	tokens := shellquote.Split(got)
+	var model string
+	for i, tok := range tokens {
+		if tok == "--model" && i+1 < len(tokens) {
+			model = tokens[i+1]
+		}
+	}
+	if model != "claude-fable-5[1m]" {
+		t.Fatalf("restart command = %q, resolved model token = %q, want claude-fable-5[1m] — the fable lane is silently on the 200k tier", got, model)
+	}
+	if !strings.Contains(got, "--settings") || !strings.Contains(got, ".gc/settings.json") {
+		t.Fatalf("restart command = %q, non-schema --settings flag was dropped", got)
+	}
+	if !strings.Contains(got, "--effort high") {
+		t.Fatalf("restart command = %q, want --effort high preserved", got)
+	}
+}
