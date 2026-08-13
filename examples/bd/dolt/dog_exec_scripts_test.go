@@ -4591,6 +4591,17 @@ func TestCompactScriptStillQuarantinesRowDecreaseWithStableHead(t *testing.T) {
 
 // --- Copy-on-write snapshot backup path (ga-npnoeo) ---
 
+// Dolt table file hashes are exactly 32 base32 characters, and the prune
+// validates that — a manifest entry shaped like anything else (`../sentinel`,
+// say) is treated as a manifest we do not understand.
+const (
+	keepAHash   = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	keepBHash   = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	orphan1Hash = "cccccccccccccccccccccccccccccccc"
+	orphan2Hash = "dddddddddddddddddddddddddddddddd"
+	absentHash  = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+)
+
 // cowCloneAvailable reports whether this filesystem supports the reflink copy
 // the snapshot path depends on. APFS and btrfs/xfs do; ext4 does not. The
 // script degrades to in-place sync where it doesn't, so tests that assert the
@@ -4817,8 +4828,8 @@ func TestBackupScriptPrunesUnreferencedBackupTableFiles(t *testing.T) {
 	}
 	artifactDir := filepath.Join(cityPath, ".dolt-backup")
 	dbDir := writeBackupArtifacts(t, artifactDir, "prod",
-		"5:__DOLT__:lock0:root0:00000000000000000000000000000000:keepa:12:keepb:34",
-		"keepa", "keepb", "orphan1", "orphan2")
+		"5:__DOLT__:lock0:root0:00000000000000000000000000000000:"+keepAHash+":12:"+keepBHash+":34",
+		keepAHash, keepBHash, orphan1Hash, orphan2Hash)
 
 	binDir := t.TempDir()
 	_ = writeDogFakeGC(t, binDir)
@@ -4829,12 +4840,12 @@ func TestBackupScriptPrunesUnreferencedBackupTableFiles(t *testing.T) {
 	if !strings.Contains(out, "pruned 2 unreferenced table file(s)") {
 		t.Fatalf("expected orphan prune to report 2 files:\n%s", out)
 	}
-	for _, keep := range []string{"keepa", "keepb"} {
+	for _, keep := range []string{keepAHash, keepBHash} {
 		if _, err := os.Stat(filepath.Join(dbDir, keep+".darc")); err != nil {
 			t.Fatalf("referenced table file %s must survive: %v", keep, err)
 		}
 	}
-	for _, gone := range []string{"orphan1", "orphan2"} {
+	for _, gone := range []string{orphan1Hash, orphan2Hash} {
 		if _, err := os.Stat(filepath.Join(dbDir, gone+".darc")); !os.IsNotExist(err) {
 			t.Fatalf("unreferenced table file %s should be pruned, stat err: %v", gone, err)
 		}
@@ -4853,8 +4864,8 @@ func TestBackupScriptRefusesToPruneWhenManifestReferencesMissingTableFile(t *tes
 	artifactDir := filepath.Join(cityPath, ".dolt-backup")
 	// References keepa + absent; only keepa exists on disk.
 	dbDir := writeBackupArtifacts(t, artifactDir, "prod",
-		"5:__DOLT__:lock0:root0:00000000000000000000000000000000:keepa:12:absent:34",
-		"keepa", "orphan1")
+		"5:__DOLT__:lock0:root0:00000000000000000000000000000000:"+keepAHash+":12:"+absentHash+":34",
+		keepAHash, orphan1Hash)
 
 	binDir := t.TempDir()
 	_ = writeDogFakeGC(t, binDir)
@@ -4865,7 +4876,7 @@ func TestBackupScriptRefusesToPruneWhenManifestReferencesMissingTableFile(t *tes
 	if !strings.Contains(out, "orphan prune SKIPPED") {
 		t.Fatalf("prune must fail closed on an unverifiable manifest:\n%s", out)
 	}
-	if _, err := os.Stat(filepath.Join(dbDir, "orphan1.darc")); err != nil {
+	if _, err := os.Stat(filepath.Join(dbDir, orphan1Hash+".darc")); err != nil {
 		t.Fatalf("nothing may be deleted when the manifest cannot be verified: %v", err)
 	}
 }
@@ -4881,8 +4892,8 @@ func TestBackupScriptRefusesToPruneTruncatedManifest(t *testing.T) {
 	artifactDir := filepath.Join(cityPath, ".dolt-backup")
 	// Trailing hash with no chunk count.
 	dbDir := writeBackupArtifacts(t, artifactDir, "prod",
-		"5:__DOLT__:lock0:root0:00000000000000000000000000000000:keepa:12:keepb",
-		"keepa", "keepb", "orphan1")
+		"5:__DOLT__:lock0:root0:00000000000000000000000000000000:"+keepAHash+":12:"+keepBHash,
+		keepAHash, keepBHash, orphan1Hash)
 
 	binDir := t.TempDir()
 	_ = writeDogFakeGC(t, binDir)
@@ -4893,7 +4904,7 @@ func TestBackupScriptRefusesToPruneTruncatedManifest(t *testing.T) {
 	if !strings.Contains(out, "orphan prune SKIPPED") {
 		t.Fatalf("prune must fail closed on a truncated manifest:\n%s", out)
 	}
-	if _, err := os.Stat(filepath.Join(dbDir, "orphan1.darc")); err != nil {
+	if _, err := os.Stat(filepath.Join(dbDir, orphan1Hash+".darc")); err != nil {
 		t.Fatalf("truncated manifest must delete nothing: %v", err)
 	}
 }
@@ -4908,8 +4919,8 @@ func TestBackupScriptPruneCanBeDisabled(t *testing.T) {
 	}
 	artifactDir := filepath.Join(cityPath, ".dolt-backup")
 	dbDir := writeBackupArtifacts(t, artifactDir, "prod",
-		"5:__DOLT__:lock0:root0:00000000000000000000000000000000:keepa:12",
-		"keepa", "orphan1")
+		"5:__DOLT__:lock0:root0:00000000000000000000000000000000:"+keepAHash+":12",
+		keepAHash, orphan1Hash)
 
 	binDir := t.TempDir()
 	_ = writeDogFakeGC(t, binDir)
@@ -4921,7 +4932,213 @@ func TestBackupScriptPruneCanBeDisabled(t *testing.T) {
 	if strings.Contains(out, "pruned") {
 		t.Fatalf("prune must stay off when disabled:\n%s", out)
 	}
-	if _, err := os.Stat(filepath.Join(dbDir, "orphan1.darc")); err != nil {
+	if _, err := os.Stat(filepath.Join(dbDir, orphan1Hash+".darc")); err != nil {
 		t.Fatalf("disabled prune must delete nothing: %v", err)
+	}
+}
+
+// --- Guards on the paths that reach `rm -rf` (codex cross-family review) ---
+
+// TestBackupScriptNeverDeletesLiveDatabaseWhenSnapshotRootIsDataDir pins the
+// worst defect the review found. Pointing the snapshot root at the data dir is
+// correctly refused for STAGING, but the per-database cleanup still ran, and
+// its lexical guard accepted "$BACKUP_SNAPSHOT_DIR/$db" — which in that
+// configuration is the live database. The backup script deleted the thing it
+// exists to protect.
+func TestBackupScriptNeverDeletesLiveDatabaseWhenSnapshotRootIsDataDir(t *testing.T) {
+	cityPath := t.TempDir()
+	dataDir := filepath.Join(cityPath, "dolt-data")
+	liveDB := filepath.Join(dataDir, "prod")
+	if err := os.MkdirAll(filepath.Join(liveDB, ".dolt"), 0o755); err != nil {
+		t.Fatalf("mkdir db: %v", err)
+	}
+	canary := filepath.Join(liveDB, ".dolt", "manifest")
+	if err := os.WriteFile(canary, []byte("live data"), 0o644); err != nil {
+		t.Fatalf("write canary: %v", err)
+	}
+	binDir := t.TempDir()
+	_ = writeDogFakeGC(t, binDir)
+	_ = writeBackupPWDLoggingDolt(t, binDir, 0)
+
+	runDogScript(t, "mol-dog-backup.sh", binDir, cityPath, dataDir,
+		"GC_BACKUP_DATABASES=prod", "GC_DOLT_BACKUP_SNAPSHOT_DIR="+dataDir)
+
+	if _, err := os.Stat(liveDB); err != nil {
+		t.Fatalf("LIVE DATABASE DELETED: %v", err)
+	}
+	data, err := os.ReadFile(canary)
+	if err != nil || string(data) != "live data" {
+		t.Fatalf("live database contents damaged: %v %q", err, data)
+	}
+}
+
+// TestBackupScriptRefusesSnapshotRootAboveDataDir: the stale-snapshot sweep
+// deletes every direct child of the snapshot root, so a root ABOVE the data dir
+// would wipe the data dir (and its siblings) before the backup even starts. The
+// original guard only looked downward.
+func TestBackupScriptRefusesSnapshotRootAboveDataDir(t *testing.T) {
+	cityPath := t.TempDir()
+	dataDir := filepath.Join(cityPath, "dolt-data")
+	if err := os.MkdirAll(filepath.Join(dataDir, "prod", ".dolt"), 0o755); err != nil {
+		t.Fatalf("mkdir db: %v", err)
+	}
+	sibling := filepath.Join(cityPath, "precious")
+	if err := os.MkdirAll(sibling, 0o755); err != nil {
+		t.Fatalf("mkdir sibling: %v", err)
+	}
+	binDir := t.TempDir()
+	_ = writeDogFakeGC(t, binDir)
+	doltLogPath := writeBackupPWDLoggingDolt(t, binDir, 0)
+
+	// cityPath is a strict ancestor of dataDir.
+	runDogScript(t, "mol-dog-backup.sh", binDir, cityPath, dataDir,
+		"GC_BACKUP_DATABASES=prod", "GC_DOLT_BACKUP_SNAPSHOT_DIR="+cityPath)
+
+	for _, must := range []string{dataDir, sibling, filepath.Join(dataDir, "prod", ".dolt")} {
+		if _, err := os.Stat(must); err != nil {
+			t.Fatalf("ancestor snapshot root deleted %s: %v", must, err)
+		}
+	}
+	doltLog, err := os.ReadFile(doltLogPath)
+	if err != nil {
+		t.Fatalf("read dolt log: %v", err)
+	}
+	if !strings.Contains(string(doltLog), "sync-cwd "+filepath.Join(dataDir, "prod")) {
+		t.Fatalf("should fall back to in-place, log:\n%s", doltLog)
+	}
+}
+
+// TestBackupScriptDoesNotDeleteOutsideSnapshotRootForTraversalDatabaseName:
+// GC_BACKUP_DATABASES is operator-set, and a name like `../victim` slid
+// straight through a lexical prefix guard.
+func TestBackupScriptDoesNotDeleteOutsideSnapshotRootForTraversalDatabaseName(t *testing.T) {
+	cityPath := t.TempDir()
+	dataDir := filepath.Join(cityPath, "dolt-data")
+	if err := os.MkdirAll(filepath.Join(dataDir, "prod", ".dolt"), 0o755); err != nil {
+		t.Fatalf("mkdir db: %v", err)
+	}
+	snapshotRoot := filepath.Join(cityPath, "snaproot")
+	victim := filepath.Join(snapshotRoot, "..", "victim")
+	if err := os.MkdirAll(filepath.Join(victim, ".dolt"), 0o755); err != nil {
+		t.Fatalf("mkdir victim: %v", err)
+	}
+	canary := filepath.Join(victim, ".dolt", "manifest")
+	if err := os.WriteFile(canary, []byte("live data"), 0o644); err != nil {
+		t.Fatalf("write canary: %v", err)
+	}
+	binDir := t.TempDir()
+	_ = writeDogFakeGC(t, binDir)
+	_ = writeBackupPWDLoggingDolt(t, binDir, 0)
+
+	// dataDir/../victim resolves to the same directory.
+	_, _ = runDogScriptCommand(t, "mol-dog-backup.sh", binDir, cityPath, dataDir,
+		"GC_BACKUP_DATABASES=../victim", "GC_DOLT_BACKUP_SNAPSHOT_DIR="+snapshotRoot)
+
+	if _, err := os.Stat(victim); err != nil {
+		t.Fatalf("traversal database name deleted a directory outside the snapshot root: %v", err)
+	}
+	if data, err := os.ReadFile(canary); err != nil || string(data) != "live data" {
+		t.Fatalf("victim contents damaged: %v %q", err, data)
+	}
+}
+
+// TestBackupScriptDoesNotSyncFromStaleSnapshotWhenCleanupFails: `cp -R src
+// existing-dir` succeeds by nesting src inside it. If cleanup of a stale
+// destination silently failed, the sync would then run from the STALE outer
+// copy and stamp success — a false green backed by old data.
+func TestBackupScriptDoesNotSyncFromStaleSnapshotWhenCleanupFails(t *testing.T) {
+	cityPath := t.TempDir()
+	dataDir := filepath.Join(cityPath, "dolt-data")
+	liveDB := filepath.Join(dataDir, "prod")
+	if err := os.MkdirAll(filepath.Join(liveDB, ".dolt"), 0o755); err != nil {
+		t.Fatalf("mkdir db: %v", err)
+	}
+	snapshotRoot := filepath.Join(cityPath, "snaproot")
+	stale := filepath.Join(snapshotRoot, "prod")
+	if err := os.MkdirAll(filepath.Join(stale, ".dolt"), 0o755); err != nil {
+		t.Fatalf("mkdir stale snapshot: %v", err)
+	}
+	binDir := t.TempDir()
+	_ = writeDogFakeGC(t, binDir)
+	doltLogPath := writeBackupPWDLoggingDolt(t, binDir, 0)
+	// An rm that never removes anything, standing in for a cleanup failure.
+	writeExecutable(t, filepath.Join(binDir, "rm"), `#!/usr/bin/env bash
+exit 1
+`)
+
+	out := runDogScript(t, "mol-dog-backup.sh", binDir, cityPath, dataDir,
+		"GC_BACKUP_DATABASES=prod", "GC_DOLT_BACKUP_SNAPSHOT_DIR="+snapshotRoot)
+
+	doltLog, err := os.ReadFile(doltLogPath)
+	if err != nil {
+		t.Fatalf("read dolt log: %v", err)
+	}
+	if strings.Contains(string(doltLog), "sync-cwd "+stale) {
+		t.Fatalf("must NOT sync from a stale snapshot:\n%s\n%s", doltLog, out)
+	}
+	if strings.Contains(string(doltLog), "sync-cwd "+filepath.Join(stale, "prod")) {
+		t.Fatalf("must NOT sync from a nested stale clone:\n%s", doltLog)
+	}
+	if !strings.Contains(string(doltLog), "sync-cwd "+liveDB) {
+		t.Fatalf("should fall back to in-place sync, log:\n%s", doltLog)
+	}
+}
+
+// TestBackupScriptSkipsPruneAfterFailedSync: a manifest truncated exactly at a
+// pair boundary still parses cleanly while silently omitting real table files,
+// which we would then classify as orphans and delete. Only a sync that just
+// exited 0 proves dolt itself wrote the manifest we are about to trust.
+func TestBackupScriptSkipsPruneAfterFailedSync(t *testing.T) {
+	cityPath := t.TempDir()
+	dataDir := filepath.Join(cityPath, "dolt-data")
+	if err := os.MkdirAll(filepath.Join(dataDir, "prod", ".dolt"), 0o755); err != nil {
+		t.Fatalf("mkdir db: %v", err)
+	}
+	artifactDir := filepath.Join(cityPath, ".dolt-backup")
+	dbDir := writeBackupArtifacts(t, artifactDir, "prod",
+		"5:__DOLT__:lock0:root0:00000000000000000000000000000000:"+keepAHash+":12",
+		keepAHash, orphan1Hash)
+
+	binDir := t.TempDir()
+	_ = writeDogFakeGC(t, binDir)
+	_ = writeBackupPWDLoggingDolt(t, binDir, 1) // sync FAILS
+
+	out := runDogScript(t, "mol-dog-backup.sh", binDir, cityPath, dataDir,
+		"GC_BACKUP_DATABASES=prod", "GC_BACKUP_ARTIFACT_DIR="+artifactDir)
+	if strings.Contains(out, "pruned") {
+		t.Fatalf("must not prune behind a failed sync:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(dbDir, orphan1Hash+".darc")); err != nil {
+		t.Fatalf("failed sync must delete nothing: %v", err)
+	}
+}
+
+// TestBackupScriptRefusesToPruneMultiLineManifest: `read` sees only line 1, so
+// references on any later line are invisible — and every file they name would
+// look like an orphan.
+func TestBackupScriptRefusesToPruneMultiLineManifest(t *testing.T) {
+	cityPath := t.TempDir()
+	dataDir := filepath.Join(cityPath, "dolt-data")
+	if err := os.MkdirAll(filepath.Join(dataDir, "prod", ".dolt"), 0o755); err != nil {
+		t.Fatalf("mkdir db: %v", err)
+	}
+	artifactDir := filepath.Join(cityPath, ".dolt-backup")
+	dbDir := writeBackupArtifacts(t, artifactDir, "prod",
+		"5:__DOLT__:lock0:root0:00000000000000000000000000000000:"+keepAHash+":12\n"+keepBHash+":34",
+		keepAHash, keepBHash, orphan1Hash)
+
+	binDir := t.TempDir()
+	_ = writeDogFakeGC(t, binDir)
+	_ = writeBackupPWDLoggingDolt(t, binDir, 0)
+
+	out := runDogScript(t, "mol-dog-backup.sh", binDir, cityPath, dataDir,
+		"GC_BACKUP_DATABASES=prod", "GC_BACKUP_ARTIFACT_DIR="+artifactDir)
+	if !strings.Contains(out, "not a single line") {
+		t.Fatalf("multi-line manifest must be refused:\n%s", out)
+	}
+	for _, must := range []string{keepAHash, keepBHash, orphan1Hash} {
+		if _, err := os.Stat(filepath.Join(dbDir, must+".darc")); err != nil {
+			t.Fatalf("multi-line manifest must delete nothing (%s): %v", must, err)
+		}
 	}
 }

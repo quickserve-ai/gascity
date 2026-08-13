@@ -198,34 +198,61 @@ ensure_backup_remote() {
 # The snapshot is crash-consistent, not transactionally consistent. For a
 # content-addressed, append-mostly store that yields a valid slightly-older
 # root — strictly better than the 7-day-old alternative it replaces.
+#
+# Every guard below is written against a HOSTILE value of
+# GC_DOLT_BACKUP_SNAPSHOT_DIR, because this function's output feeds an `rm -rf`.
+# Lexical prefix tests are not enough: they cannot see through `..` or symlinks,
+# and they treat an ANCESTOR of the data dir as unrelated to it. Both mistakes
+# were live in the first version of this change — setting the override to the
+# data dir made the cleanup delete a live database.
 snapshot_root_is_safe() {
     [ -n "$BACKUP_SNAPSHOT_DIR" ] || return 1
+    case "$BACKUP_SNAPSHOT_DIR" in
+        /*) : ;;
+        *) return 1 ;;   # relative roots resolve against an unknown cwd
+    esac
     mkdir -p "$BACKUP_SNAPSHOT_DIR" 2>/dev/null || return 1
-    if same_path "$BACKUP_SNAPSHOT_DIR" "$DOLT_DATA_DIR"; then
-        return 1
-    fi
-    # Refuse a snapshot root anywhere beneath the data dir: the sql-server
-    # would discover the clones as databases.
-    snapshot_canon="$(canonical_path "$BACKUP_SNAPSHOT_DIR")"
-    data_canon="$(canonical_path "$DOLT_DATA_DIR")"
+    snapshot_canon="$(canonical_path "$BACKUP_SNAPSHOT_DIR")" || return 1
+    data_canon="$(canonical_path "$DOLT_DATA_DIR")" || return 1
+    [ -n "$snapshot_canon" ] && [ -n "$data_canon" ] || return 1
+    [ "$snapshot_canon" != "/" ] || return 1
+    [ "$snapshot_canon" != "$data_canon" ] || return 1
+    # Beneath the data dir: the sql-server would discover the clones as
+    # databases.
     case "$snapshot_canon/" in
         "$data_canon"/*) return 1 ;;
+    esac
+    # ABOVE the data dir: the stale-snapshot sweep deletes every direct child
+    # of the root, so an ancestor root would delete the data dir itself.
+    case "$data_canon/" in
+        "$snapshot_canon"/*) return 1 ;;
     esac
     return 0
 }
 
-# discard_db_snapshot removes a staged clone. It refuses any path that is not a
-# direct child of the snapshot root, so a mis-set variable can never turn this
-# into an rm -rf of a live Dolt database.
+# discard_db_snapshot removes a staged clone. It resolves the path first and
+# requires it to be a PROPER DESCENDANT of a snapshot root that is itself safe,
+# so neither a mis-set root nor a database named `../victim` can turn this into
+# an rm -rf of live data.
 discard_db_snapshot() {
     snapshot_path="$1"
     [ -n "$snapshot_path" ] || return 0
+    # Reject traversal before resolving: $db reaches this from operator-set
+    # GC_BACKUP_DATABASES.
     case "$snapshot_path" in
-        "$BACKUP_SNAPSHOT_DIR"/?*) : ;;
-        *) return 0 ;;
+        *..*) return 0 ;;
     esac
     [ -d "$snapshot_path" ] || return 0
-    rm -rf "$snapshot_path" 2>/dev/null || true
+    snapshot_root_is_safe || return 0
+    discard_canon="$(canonical_path "$snapshot_path")" || return 0
+    root_canon="$(canonical_path "$BACKUP_SNAPSHOT_DIR")" || return 0
+    [ -n "$discard_canon" ] && [ -n "$root_canon" ] || return 0
+    [ "$discard_canon" != "$root_canon" ] || return 0
+    case "$discard_canon/" in
+        "$root_canon"/*) : ;;
+        *) return 0 ;;
+    esac
+    rm -rf "$discard_canon" 2>/dev/null || true
 }
 
 # clone_db_snapshot stages a copy-on-write clone. Both `cp -c` (APFS) and
@@ -237,10 +264,21 @@ clone_db_snapshot() {
     clone_src="$1"
     clone_dest="$2"
     discard_db_snapshot "$clone_dest"
+    # If the destination survived cleanup, ABORT rather than clone into it.
+    # `cp -R src existing-dir` succeeds by nesting src INSIDE it, so the sync
+    # would then run from the stale outer copy and report success — a false
+    # green backed by old data, which is the exact failure class this whole
+    # change exists to remove.
+    if [ -e "$clone_dest" ]; then
+        return 1
+    fi
     if run_bounded 120 cp -c -R "$clone_src" "$clone_dest" 2>/dev/null; then
         return 0
     fi
     discard_db_snapshot "$clone_dest"
+    if [ -e "$clone_dest" ]; then
+        return 1
+    fi
     if run_bounded 120 cp --reflink=always -R "$clone_src" "$clone_dest" 2>/dev/null; then
         return 0
     fi
@@ -271,6 +309,17 @@ prune_backup_orphans() {
     # Everything after the appendix is (table file hash, chunk count) pairs.
     # Do NOT match "any 32-char hash" — the lock, root and the all-zeros
     # appendix sentinel all look like table file hashes and are not.
+    # A manifest is ONE line. `read` sees only the first, so a second line
+    # would carry table file references we never parse — and every file they
+    # reference would then look like an orphan and be deleted. Refuse outright
+    # rather than prune from a partial view.
+    # (A trailing newline is fine; only real content past line 1 is a problem.)
+    prune_extra="$(sed -n '2,$p' "$prune_manifest" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [ -n "$prune_extra" ]; then
+        echo "backup: $prune_db — orphan prune SKIPPED (manifest is not a single line)"
+        return 0
+    fi
+
     # `read` exits non-zero on a file with no trailing newline — which is
     # exactly how Dolt writes the manifest — but still assigns every field, so
     # the magic check below is the real validation. Swallowing the status here
@@ -302,6 +351,16 @@ prune_backup_orphans() {
         case "$prune_count" in
             ''|*[!0-9]*) prune_malformed=1; break ;;
         esac
+        # Dolt table file hashes are 32 base32 characters. Anything else is a
+        # manifest we do not understand — including `../sentinel`, which would
+        # otherwise resolve to a real file and validate.
+        case "$prune_hash" in
+            *[!0-9a-v]*) prune_malformed=1; break ;;
+        esac
+        if [ "${#prune_hash}" -ne 32 ]; then
+            prune_malformed=1
+            break
+        fi
         if [ ! -f "$prune_dir/$prune_hash.darc" ]; then
             prune_malformed=1
             break
@@ -330,6 +389,14 @@ prune_backup_orphans() {
         case "$prune_referenced" in
             *" $prune_base "*) continue ;;
         esac
+        # Only reap things that actually look like Dolt table files. Anything
+        # else in here is not ours to delete.
+        case "$prune_base" in
+            *[!0-9a-v]*) continue ;;
+        esac
+        if [ "${#prune_base}" -ne 32 ]; then
+            continue
+        fi
         # Never reap anything newer than the manifest we just validated.
         if [ "$prune_file" -nt "$prune_manifest" ]; then
             continue
@@ -388,8 +455,12 @@ for db in $DATABASES; do
     # to the in-place path when no clone is possible.
     sync_dir="$db_dir"
     sync_mode="in-place"
-    db_snapshot="$BACKUP_SNAPSHOT_DIR/$db"
+    sync_ok=0
+    # Only ever names a path under the snapshot root, and only when snapshots
+    # are actually enabled — this value reaches an `rm -rf`.
+    db_snapshot=""
     if [ "$SNAPSHOT_ENABLED" -eq 1 ]; then
+        db_snapshot="$BACKUP_SNAPSHOT_DIR/$db"
         if clone_db_snapshot "$db_dir" "$db_snapshot"; then
             sync_dir="$db_snapshot"
             sync_mode="snapshot"
@@ -399,6 +470,7 @@ for db in $DATABASES; do
     fi
     if (cd "$sync_dir" && run_bounded "$BACKUP_SYNC_TIMEOUT" dolt backup sync "${db}-backup" 2>"$sync_stderr"); then
         SYNCED=$((SYNCED + 1))
+        sync_ok=1
         echo "backup: $db — synced ($sync_mode)"
         # Stamp ONLY on exit 0. Health reads this instead of any mtime on the
         # artifact plane, because the failure path can write those too.
@@ -417,11 +489,19 @@ for db in $DATABASES; do
         append_failed_db "$db($sync_mode sync failed: $sync_reason)"
     fi
     rm -f "$sync_stderr" 2>/dev/null || true
-    discard_db_snapshot "$db_snapshot"
-    # Reclaim chunks abandoned by a killed sync, so the bloat cannot eat the
-    # headroom the next sync needs. Runs after success too: a conjoin leaves
-    # the table files it superseded unreferenced.
-    prune_backup_orphans "$db"
+    if [ "$SNAPSHOT_ENABLED" -eq 1 ]; then
+        discard_db_snapshot "$db_snapshot"
+    fi
+    # Reclaim chunks abandoned by earlier killed syncs — but ONLY behind a sync
+    # that just exited 0, because that is the only state in which dolt itself
+    # has just written the manifest we are about to trust. After a FAILED sync
+    # the manifest is exactly as likely to be half-written, and a manifest
+    # truncated at a pair boundary still parses cleanly while silently omitting
+    # real table files, which we would then delete. Waiting for the next
+    # successful run costs one cycle and reclaims the same bytes.
+    if [ "$sync_ok" -eq 1 ]; then
+        prune_backup_orphans "$db"
+    fi
 done
 
 FAILED_COUNT=$FAILED
