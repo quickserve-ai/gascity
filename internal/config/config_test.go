@@ -6284,11 +6284,14 @@ func TestSessionNudgeLockTimeoutInvalid(t *testing.T) {
 	}
 }
 
+// The startup default is 300s, not 60s (ga-fcdvn): at 60s this deadline killed
+// healthy agents whose MCP-server connects outlasted the budget, and the
+// reconciler restarted them in an endless 60s loop.
 func TestSessionStartupTimeoutDefault(t *testing.T) {
 	s := SessionConfig{}
 	got := s.StartupTimeoutDuration()
-	if got != 60*time.Second {
-		t.Errorf("StartupTimeoutDuration() = %v, want 60s", got)
+	if got != 300*time.Second {
+		t.Errorf("StartupTimeoutDuration() = %v, want 300s", got)
 	}
 }
 
@@ -6303,8 +6306,8 @@ func TestSessionStartupTimeoutCustom(t *testing.T) {
 func TestSessionStartupTimeoutInvalid(t *testing.T) {
 	s := SessionConfig{StartupTimeout: "bad"}
 	got := s.StartupTimeoutDuration()
-	if got != 60*time.Second {
-		t.Errorf("StartupTimeoutDuration() = %v, want 60s (default for invalid)", got)
+	if got != 300*time.Second {
+		t.Errorf("StartupTimeoutDuration() = %v, want 300s (default for invalid)", got)
 	}
 }
 
