@@ -124,6 +124,13 @@ func TestReconciler_DefersStalePendingCreateRollbackForFreshLease(t *testing.T) 
 
 func TestReconciler_DefersStalePendingCreateRollbackForRateLimit(t *testing.T) {
 	h := newSessionChaosHarness(t, 20260517)
+	// Pin the start-in-flight gate: this test ages the pending create by ~2
+	// minutes, which must land PAST the gate for the rollback (and its
+	// rate-limit deferral) to be considered at all. The gate follows
+	// [session] startup_timeout, whose default is 300s (ga-fcdvn), so an
+	// unpinned config would leave the attempt "in flight" and the test would
+	// assert against a tick that never reached the rate-limit check.
+	h.env.cfg.Session.StartupTimeout = "1m"
 	h.createSessionIntent()
 	h.assertCreatingIntent()
 
