@@ -257,22 +257,73 @@ type agentInfo struct {
 	Revision uint64 `json:"revision"`
 }
 
-// startupBootBudgetMS is the bound every wait that can land inside an agent's
-// boot pays. It is deliberately one number: a cold, concurrent claude boot
-// during a town-wide restart is slow in every phase, and the phases are
+// startupBootBudgetMS is the bound every fixed wait that can land inside an
+// agent's boot pays. It is deliberately one number: a cold, concurrent claude
+// boot during a town-wide restart is slow in every phase, and the phases are
 // sequential parts of the same event. Sizing any one of them off the 15s
 // shell-prompt bounds elsewhere in this package (paneShellReadyWait, the
 // launch probes) would make that phase the one that gives up early on the
 // exact wave it exists to survive. Its Duration twin is
-// startupNudgeIdleTimeout. The worst case is three of these end to end
-// (readiness, prompt confirmation, Enter recovery), well inside the
-// reconciler's pendingCreateNeverStartedTimeout of 10m.
+// startupNudgeIdleTimeout. Readiness itself (`agent start`) is not one of
+// them: its bound derives from the caller's ctx deadline (agentStartTimeoutFor
+// below), so the worst case is that deadline plus two of these (prompt
+// confirmation, Enter recovery).
 const startupBootBudgetMS = 60000
 
-// agentStartTimeoutMS bounds herdr's own wait for the launched agent TUI to
-// be detected and interactive-ready (`agent start --timeout`). herdr requires
-// >3000 and defaults to 30000; sized up to the boot budget.
-const agentStartTimeoutMS = startupBootBudgetMS
+// Bounds for herdr's own wait for the launched agent TUI to be detected and
+// interactive-ready (`agent start --timeout`).
+//
+// This was a hardcoded 60000 (ga-fcdvn), and the caller's ctx deadline —
+// [session] startup_timeout — ALSO defaulted to 60s. Two equal nested
+// deadlines are the inversion trap: whichever fires first kills a healthy,
+// still-booting agent, the reconciler restarts it, and the next attempt dies
+// the same way, forever. Observed: 37 kill/restart cycles in ~35 minutes on an
+// agent that reached its idle prompt in ~2s but whose stacked MCP-server
+// connects burned past 60s. So the herdr bound is now DERIVED from the ctx
+// deadline rather than pinned: one knob ([session] startup_timeout) governs
+// the whole start path and the two bounds can never invert.
+const (
+	// agentStartTimeoutDefaultMS applies only when the caller's ctx carries no
+	// deadline (city-less/standalone construction). Generous by design: a slow
+	// start that eventually succeeds beats a fast kill of a working agent.
+	agentStartTimeoutDefaultMS = 300000
+	// agentStartDeadlineMarginMS is subtracted from the ctx's remaining time so
+	// herdr gives up and returns its OWN structured error before the outer ctx
+	// kills the CLI process — "herdr agent start timed out" is diagnosable,
+	// "signal: killed" is not.
+	agentStartDeadlineMarginMS = 5000
+	// agentStartTimeoutMinMS is the floor: herdr rejects --timeout <= 3000. A
+	// ctx already this close to its deadline is doomed either way; the floor
+	// just keeps the request well-formed.
+	agentStartTimeoutMinMS = 3001
+)
+
+// agentStartTimeoutFor derives the `agent start --timeout` value from the
+// caller's ctx deadline (see the inversion note above).
+func agentStartTimeoutFor(ctx context.Context) int {
+	dl, ok := ctx.Deadline()
+	if !ok {
+		return agentStartTimeoutDefaultMS
+	}
+	remaining := int(time.Until(dl).Milliseconds()) - agentStartDeadlineMarginMS
+	if remaining < agentStartTimeoutMinMS {
+		return agentStartTimeoutMinMS
+	}
+	return remaining
+}
+
+// agentStartArgs assembles the full `agent start` CLI argument list, including
+// the ctx-derived --timeout. Split from startAgentKind so the regression tests
+// guard the arguments the CLI actually receives, not just the helper — a call
+// site quietly pinned back to a constant must fail a test.
+func agentStartArgs(ctx context.Context, name, kind, paneID string, args []string) []string {
+	cli := []string{"agent", "start", name, "--kind", kind, "--pane", paneID, "--timeout", strconv.Itoa(agentStartTimeoutFor(ctx))}
+	if len(args) > 0 {
+		cli = append(cli, "--")
+		cli = append(cli, args...)
+	}
+	return cli
+}
 
 // startAgentKind → `herdr agent start <name> --kind <kind> --pane <paneID>
 // --timeout <ms> [-- <args…>]` (herdr ≥0.7.5). herdr launches the kind's
@@ -283,12 +334,7 @@ const agentStartTimeoutMS = startupBootBudgetMS
 // env are properties of the pane (set at tab/workspace creation), not of the
 // agent start.
 func (c *client) startAgentKind(ctx context.Context, name, kind, paneID string, args []string) (agentInfo, error) {
-	cli := []string{"agent", "start", name, "--kind", kind, "--pane", paneID, "--timeout", strconv.Itoa(agentStartTimeoutMS)}
-	if len(args) > 0 {
-		cli = append(cli, "--")
-		cli = append(cli, args...)
-	}
-	res, err := c.run(ctx, cli...)
+	res, err := c.run(ctx, agentStartArgs(ctx, name, kind, paneID, args)...)
 	if err != nil {
 		return agentInfo{}, err
 	}

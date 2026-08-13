@@ -1611,8 +1611,16 @@ type SessionConfig struct {
 	// Defaults to 5000.
 	DisplayMs *int `toml:"display_ms,omitempty" jsonschema:"default=5000"`
 	// StartupTimeout is how long to wait for each agent's Start() call before
-	// treating it as failed. Duration string (e.g., "60s", "2m"). Defaults to "60s".
-	StartupTimeout string `toml:"startup_timeout,omitempty" jsonschema:"default=60s"`
+	// treating it as failed. Duration string (e.g., "60s", "5m"). Defaults to
+	// "300s" — generous by design (ga-fcdvn): at 60s this deadline killed
+	// healthy agents whose stacked MCP-server connects outlasted the budget,
+	// and the reconciler then restarted them in a 60s loop (37 kill cycles in
+	// ~35 minutes, taking down a merge-queue consumer). A start that is merely
+	// slow must not be treated as failed; a truly dead start still fails, just
+	// later, and the retry loop is 5x cheaper. The herdr provider derives its
+	// inner `agent start --timeout` from this same deadline, so the two bounds
+	// cannot invert.
+	StartupTimeout string `toml:"startup_timeout,omitempty" jsonschema:"default=300s"`
 	// ProgressStallTimeout, when set, enables progress-aware session recycling:
 	// a desired, alive, claim-less session on a healthy provider whose last
 	// provider-reported activity is older than this duration is restarted fresh.
@@ -1725,9 +1733,9 @@ func (s *SessionConfig) NudgeLockTimeoutDuration() time.Duration {
 }
 
 // StartupTimeoutDuration returns the startup timeout as a time.Duration.
-// Defaults to 60s if empty or unparseable.
+// Defaults to 300s if empty or unparseable (ga-fcdvn — see StartupTimeout).
 func (s *SessionConfig) StartupTimeoutDuration() time.Duration {
-	return durationOr(s.StartupTimeout, 60*time.Second)
+	return durationOr(s.StartupTimeout, 300*time.Second)
 }
 
 // ProgressStallTimeoutDuration returns the progress-stall recycle timeout, or
