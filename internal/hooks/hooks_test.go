@@ -2074,7 +2074,7 @@ export default {
 		t.Fatal("legacy OMP object-export hook was preserved; expected managed upgrade")
 	}
 	for _, want := range []string{
-		"const GC_OMP_HOOK_VERSION = 3",
+		"const GC_OMP_HOOK_VERSION = 4",
 		`export default function gascityOmpExtension(pi: ExtensionAPI)`,
 		`pi.on("session_start"`,
 		`pi.on("session_compact"`,
@@ -2112,9 +2112,50 @@ func TestInstallOMPHookPrioritizesManagedGCBinariesOverHomebrew(t *testing.T) {
 	}
 }
 
+// TestBundledOMPHookDoesNotRequestPerpetualUpgrade guards against the upgrade
+// check drifting away from the file it checks. Adding a marker to
+// ompHookNeedsUpgrade that the bundled hook does not actually contain makes every
+// install decide the freshly-installed hook is stale — an endless rewrite loop
+// that looks like a working install. Nearly shipped exactly that on ga-r9ehgm by
+// matching "gc hook --inject", a string that appears only in the PI hook's
+// header comment.
+func TestBundledOMPHookDoesNotRequestPerpetualUpgrade(t *testing.T) {
+	fs := fsys.NewFake()
+	if err := Install(fs, "/city", "/work", []string{"omp"}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	installed := fs.Files["/work/.omp/hooks/gc-hook.ts"]
+	if len(installed) == 0 {
+		t.Fatal("OMP hook was not installed")
+	}
+	if ompHookNeedsUpgrade(installed) {
+		t.Fatal("freshly installed OMP hook reports it needs an upgrade; install would loop forever")
+	}
+}
+
+// TestOMPHookNeedsUpgradeOnMissingContinuationMarkers: an installed hook from
+// before ga-r9ehgm parses as a valid hook and would otherwise be left in place,
+// silently dropping every injected handoff.
+func TestOMPHookNeedsUpgradeOnMissingContinuationMarkers(t *testing.T) {
+	fs := fsys.NewFake()
+	if err := Install(fs, "/city", "/work", []string{"omp"}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	current := fs.Files["/work/.omp/hooks/gc-hook.ts"]
+
+	withoutWork := bytes.Replace(current, []byte(`run(["hook", "--inject"]`), []byte(`run(["noop", "--inject"]`), 1)
+	if !ompHookNeedsUpgrade(withoutWork) {
+		t.Fatal("hook without assigned-work injection did not request upgrade")
+	}
+	withoutContinuation := bytes.Replace(current, []byte("GAS CITY CONTINUATION:"), []byte("OLD BANNER:"), 1)
+	if !ompHookNeedsUpgrade(withoutContinuation) {
+		t.Fatal("hook without the continuation instruction did not request upgrade")
+	}
+}
+
 func TestOMPHookNeedsUpgradeComparesParsedVersion(t *testing.T) {
 	current := []byte(`// Gas City hooks for Oh My Pi (OMP).
-const GC_OMP_HOOK_VERSION = 3;
+const GC_OMP_HOOK_VERSION = 4;
 function logRunFailure(args: string[], cwd: string | undefined, err: unknown) {}
 function providerSessionEnv(ctx: { sessionManager?: { getSessionId?: () => string } }): Record<string, string> {}
 export default function gascityOmpExtension(pi: ExtensionAPI) {
@@ -2122,12 +2163,14 @@ export default function gascityOmpExtension(pi: ExtensionAPI) {
   pi.on("session_compact", () => {});
   pi.on("before_agent_start", () => {});
 }
+run(["hook", "--inject"];
+GAS CITY CONTINUATION:;
 GC_PROVIDER_SESSION_ID;
 GC_PROVIDER_SESSION_ID_REQUIRED;
 stdio: ["ignore", "pipe", "inherit"];
 `)
-	stale := bytes.Replace(current, []byte("GC_OMP_HOOK_VERSION = 3"), []byte("GC_OMP_HOOK_VERSION = 2"), 1)
-	future := bytes.Replace(current, []byte("GC_OMP_HOOK_VERSION = 3"), []byte("GC_OMP_HOOK_VERSION = 4"), 1)
+	stale := bytes.Replace(current, []byte("GC_OMP_HOOK_VERSION = 4"), []byte("GC_OMP_HOOK_VERSION = 3"), 1)
+	future := bytes.Replace(current, []byte("GC_OMP_HOOK_VERSION = 4"), []byte("GC_OMP_HOOK_VERSION = 5"), 1)
 	missingRequiredProvider := bytes.Replace(current, []byte("GC_PROVIDER_SESSION_ID_REQUIRED;\n"), nil, 1)
 
 	if !ompHookNeedsUpgrade(stale) {
@@ -2486,5 +2529,39 @@ func TestInstallEmpty(t *testing.T) {
 	}
 	if len(fs.Files) != 0 {
 		t.Errorf("Install(nil) should not write files; got %v", fs.Files)
+	}
+}
+
+// TestSmokeInstallOMPHookToRealFilesystem is the ga-r9ehgm acceptance smoke
+// check: install into a real temporary workdir (not the fake FS) and assert the
+// file that actually lands on disk carries the new version and behaviour. The
+// fake-FS tests prove the logic; this proves the embedded overlay reaches disk.
+func TestSmokeInstallOMPHookToRealFilesystem(t *testing.T) {
+	workDir := t.TempDir()
+	cityDir := t.TempDir()
+
+	if err := Install(fsys.OSFS{}, cityDir, workDir, []string{"omp"}); err != nil {
+		t.Fatalf("Install to real filesystem: %v", err)
+	}
+
+	hookPath := filepath.Join(workDir, ".omp", "hooks", "gc-hook.ts")
+	data, err := os.ReadFile(hookPath)
+	if err != nil {
+		t.Fatalf("read installed hook: %v", err)
+	}
+	for _, want := range []string{
+		"const GC_OMP_HOOK_VERSION = 4",
+		`run(["hook", "--inject"]`,
+		`run(["nudge", "drain", "--inject"]`,
+		`run(["mail", "check", "--inject"]`,
+		"GAS CITY CONTINUATION:",
+		"payload.length === 0",
+	} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("installed OMP hook missing %q:\n%s", want, data)
+		}
+	}
+	if ompHookNeedsUpgrade(data) {
+		t.Fatal("hook installed to a real filesystem immediately reports needing upgrade")
 	}
 }

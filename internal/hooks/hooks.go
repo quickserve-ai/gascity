@@ -36,7 +36,7 @@ const (
 	managedPiHookVersion       = 7
 	managedOpenCodeHookVersion = 5
 	managedMimoCodeHookVersion = 2
-	managedOmpHookVersion      = 3
+	managedOmpHookVersion      = 4
 )
 
 var (
@@ -360,6 +360,11 @@ func ompHookNeedsUpgrade(existing []byte) bool {
 		!strings.Contains(content, `pi.on("session_compact"`) ||
 		!strings.Contains(content, `pi.on("before_agent_start"`) ||
 		!strings.Contains(content, "logRunFailure") ||
+		// ga-r9ehgm: an installed hook without assigned-work injection or the
+		// continuation instruction silently drops handoffs, so both are upgrade
+		// triggers rather than cosmetic drift.
+		!strings.Contains(content, `run(["hook", "--inject"]`) ||
+		!strings.Contains(content, "GAS CITY CONTINUATION:") ||
 		!strings.Contains(content, `stdio: ["ignore", "pipe", "inherit"]`) {
 		return true
 	}

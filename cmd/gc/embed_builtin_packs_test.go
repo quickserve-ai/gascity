@@ -359,11 +359,39 @@ func TestBundledPiHookUsesCurrentExtensionAPI(t *testing.T) {
 	}
 }
 
+// TestBundledOmpHookInjectsAssignedWorkAndContinuation pins ga-r9ehgm. A managed
+// OMP session gets ONE automatic launch turn, and that launch payload can say no
+// more than "Run gc prime". The hook injects nudges and mail, and the auto-handoff
+// message is archived once injected — so an agent that stops after priming drops
+// the continuation on the floor with nothing left to recover it from.
+//
+// Two things are required. The hook must inject ASSIGNED WORK (`gc hook --inject`)
+// the way the Pi hook already does — OMP was the only managed provider omitting it
+// — and, when there is actually a payload, it must tell the agent that the payload
+// IS the current task and priming is not the end of the turn.
+func TestBundledOmpHookInjectsAssignedWorkAndContinuation(t *testing.T) {
+	data := readBundledPackFileForTest(t, "core", "overlay/per-provider/omp/.omp/hooks/gc-hook.ts")
+	for _, want := range []string{
+		`run(["hook", "--inject"]`,
+		`run(["nudge", "drain", "--inject"]`,
+		`run(["mail", "check", "--inject"]`,
+		"GAS CITY CONTINUATION:",
+		// The continuation is CONDITIONAL: no payload, no extra instruction, so a
+		// routine start is not turned into a spurious "you have work" turn.
+		"payload.length === 0",
+		"const GC_OMP_HOOK_VERSION = 4",
+	} {
+		if !strings.Contains(data, want) {
+			t.Errorf("bundled OMP hook missing %q:\n%s", want, data)
+		}
+	}
+}
+
 func TestBundledOmpHookPublishesProviderSessionID(t *testing.T) {
 	data := readBundledPackFileForTest(t, "core", "overlay/per-provider/omp/.omp/hooks/gc-hook.ts")
 	for _, want := range []string{
 		`import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent"`,
-		`const GC_OMP_HOOK_VERSION = 3`,
+		`const GC_OMP_HOOK_VERSION = 4`,
 		`${process.env.HOME}/go/bin:${process.env.HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:`,
 		`export default function gascityOmpExtension(pi: ExtensionAPI)`,
 		`pi.on("session_start"`,
