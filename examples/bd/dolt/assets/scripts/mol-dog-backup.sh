@@ -26,6 +26,12 @@ BACKUP_LOCK_WAIT_SECONDS="${GC_DOLT_BACKUP_LOCK_WAIT_SECONDS:-5}"
 # holds the backup flock, so it must never be unbounded.
 BACKUP_SYNC_TIMEOUT="${GC_DOLT_BACKUP_SYNC_TIMEOUT_SECONDS:-1800}"
 case "$BACKUP_SYNC_TIMEOUT" in ''|*[!0-9]*|0) BACKUP_SYNC_TIMEOUT=1800 ;; esac
+# Copy-on-write snapshot staging dir (ga-npnoeo). MUST live outside
+# DOLT_DATA_DIR — anything under the data dir is discovered by the running
+# sql-server as a database — and on the same filesystem, or the clone fails.
+BACKUP_SNAPSHOT_DIR="${GC_DOLT_BACKUP_SNAPSHOT_DIR:-$PACK_STATE_DIR/backup-snapshot}"
+BACKUP_SNAPSHOT_MODE="${GC_DOLT_BACKUP_SNAPSHOT:-auto}"
+BACKUP_PRUNE_ORPHANS="${GC_DOLT_BACKUP_PRUNE_ORPHANS:-1}"
 
 dolt_sql() {
     DOLT_CLI_PASSWORD="${GC_DOLT_PASSWORD:-}" \
@@ -167,6 +173,190 @@ ensure_backup_remote() {
     return 1
 }
 
+# --- Copy-on-write snapshot staging (ga-npnoeo) ---
+#
+# `dolt backup sync` run inside a live database directory does NOT touch files
+# directly: the CLI finds the sql-server marker at the DATA DIR root
+# ($DOLT_DATA_DIR/.dolt/sql-server.info) and proxies the whole operation
+# through the running server. Proof: `dolt sql -q "show databases"` from inside
+# .beads/dolt/hq lists as, qcore and mysql — databases that directory knows
+# nothing about.
+#
+# That proxy is the reason hq could not be backed up at all. The sync then has
+# to stream ~11 GB through one server connection, and the connection dies long
+# before the data does — observed three ways on 2026-08-12/13: a 97s server
+# crash, a ~7min `Error 1105: connection was closed` with the server surviving,
+# and repeated timeout kills. Raising the timeout cannot fix it, because the
+# limit is the connection window, not the clock. The same one-connection
+# ceiling is why the mirror push fails (ga-nqm4gv) — one root cause, two planes.
+#
+# A copy of the database OUTSIDE the data dir has no server marker above it, so
+# dolt falls back to direct file access and no connection exists to drop. On
+# APFS `cp -c` clones by reference: measured 11 GB in 0.051s at zero disk cost,
+# and the sync that had never once completed finished in 8s.
+#
+# The snapshot is crash-consistent, not transactionally consistent. For a
+# content-addressed, append-mostly store that yields a valid slightly-older
+# root — strictly better than the 7-day-old alternative it replaces.
+snapshot_root_is_safe() {
+    [ -n "$BACKUP_SNAPSHOT_DIR" ] || return 1
+    mkdir -p "$BACKUP_SNAPSHOT_DIR" 2>/dev/null || return 1
+    if same_path "$BACKUP_SNAPSHOT_DIR" "$DOLT_DATA_DIR"; then
+        return 1
+    fi
+    # Refuse a snapshot root anywhere beneath the data dir: the sql-server
+    # would discover the clones as databases.
+    snapshot_canon="$(canonical_path "$BACKUP_SNAPSHOT_DIR")"
+    data_canon="$(canonical_path "$DOLT_DATA_DIR")"
+    case "$snapshot_canon/" in
+        "$data_canon"/*) return 1 ;;
+    esac
+    return 0
+}
+
+# discard_db_snapshot removes a staged clone. It refuses any path that is not a
+# direct child of the snapshot root, so a mis-set variable can never turn this
+# into an rm -rf of a live Dolt database.
+discard_db_snapshot() {
+    snapshot_path="$1"
+    [ -n "$snapshot_path" ] || return 0
+    case "$snapshot_path" in
+        "$BACKUP_SNAPSHOT_DIR"/?*) : ;;
+        *) return 0 ;;
+    esac
+    [ -d "$snapshot_path" ] || return 0
+    rm -rf "$snapshot_path" 2>/dev/null || true
+}
+
+# clone_db_snapshot stages a copy-on-write clone. Both `cp -c` (APFS) and
+# `cp --reflink=always` (btrfs/xfs) FAIL rather than silently degrading to a
+# byte copy, which is what we want: a real 11 GB copy every 6h would be worse
+# than the bug. When no CoW clone is possible the caller falls back to the
+# in-place path and the run degrades to previous behaviour instead of breaking.
+clone_db_snapshot() {
+    clone_src="$1"
+    clone_dest="$2"
+    discard_db_snapshot "$clone_dest"
+    if run_bounded 120 cp -c -R "$clone_src" "$clone_dest" 2>/dev/null; then
+        return 0
+    fi
+    discard_db_snapshot "$clone_dest"
+    if run_bounded 120 cp --reflink=always -R "$clone_src" "$clone_dest" 2>/dev/null; then
+        return 0
+    fi
+    discard_db_snapshot "$clone_dest"
+    return 1
+}
+
+# prune_backup_orphans deletes table files the backup manifest does not
+# reference. A killed sync leaves its partial chunks behind, and nothing ever
+# reclaimed them: 46.89 GB had accumulated by 2026-08-13, and the failed 07:02Z
+# run alone left 2.58 GB. That bloat is self-reinforcing — it consumed the disk
+# headroom the next sync needed, and a full disk is what crashed the server
+# mid-rescue at 98%.
+#
+# FAILS CLOSED. Nothing is deleted unless the manifest parses AND every table
+# file it references is present on disk; a backup we cannot fully verify is one
+# we do not touch.
+prune_backup_orphans() {
+    prune_db="$1"
+    if [ "$BACKUP_PRUNE_ORPHANS" = "0" ]; then
+        return 0
+    fi
+    prune_dir="$BACKUP_ARTIFACT_DIR/$prune_db"
+    prune_manifest="$prune_dir/manifest"
+    [ -s "$prune_manifest" ] || return 0
+
+    # manifest: version:__DOLT__:lock:root:appendix:(hash:count)*
+    # Everything after the appendix is (table file hash, chunk count) pairs.
+    # Do NOT match "any 32-char hash" — the lock, root and the all-zeros
+    # appendix sentinel all look like table file hashes and are not.
+    # `read` exits non-zero on a file with no trailing newline — which is
+    # exactly how Dolt writes the manifest — but still assigns every field, so
+    # the magic check below is the real validation. Swallowing the status here
+    # is deliberate: `|| return 0` would skip the prune on every real manifest.
+    IFS=: read -r _ prune_magic _ _ _ prune_rest < "$prune_manifest" || true
+    [ "$prune_magic" = "__DOLT__" ] || return 0
+
+    prune_referenced=" "
+    prune_pairs=0
+    prune_malformed=0
+    while [ -n "$prune_rest" ]; do
+        prune_hash="${prune_rest%%:*}"
+        case "$prune_rest" in
+            *:*) prune_rest="${prune_rest#*:}" ;;
+            *) prune_rest="" ;;
+        esac
+        # A hash with no count after it means a truncated manifest.
+        if [ -z "$prune_rest" ]; then
+            if [ -n "$prune_hash" ]; then
+                prune_malformed=1
+            fi
+            break
+        fi
+        prune_count="${prune_rest%%:*}"
+        case "$prune_rest" in
+            *:*) prune_rest="${prune_rest#*:}" ;;
+            *) prune_rest="" ;;
+        esac
+        case "$prune_count" in
+            ''|*[!0-9]*) prune_malformed=1; break ;;
+        esac
+        if [ ! -f "$prune_dir/$prune_hash.darc" ]; then
+            prune_malformed=1
+            break
+        fi
+        prune_referenced="$prune_referenced$prune_hash "
+        prune_pairs=$((prune_pairs + 1))
+    done
+
+    if [ "$prune_malformed" -ne 0 ]; then
+        echo "backup: $prune_db — orphan prune SKIPPED (manifest unreadable or references a missing table file)"
+        return 0
+    fi
+    if [ "$prune_pairs" -eq 0 ]; then
+        # A manifest that references nothing cannot authorise deleting
+        # anything. "No referenced files" means unverified, never "everything
+        # in this directory is an orphan" — that reading would empty a backup.
+        return 0
+    fi
+
+    prune_removed=0
+    prune_freed=0
+    for prune_file in "$prune_dir"/*.darc; do
+        [ -f "$prune_file" ] || continue
+        prune_base="${prune_file##*/}"
+        prune_base="${prune_base%.darc}"
+        case "$prune_referenced" in
+            *" $prune_base "*) continue ;;
+        esac
+        # Never reap anything newer than the manifest we just validated.
+        if [ "$prune_file" -nt "$prune_manifest" ]; then
+            continue
+        fi
+        prune_size="$(stat -f%z "$prune_file" 2>/dev/null || stat -c%s "$prune_file" 2>/dev/null || echo 0)"
+        case "$prune_size" in ''|*[!0-9]*) prune_size=0 ;; esac
+        if rm -f "$prune_file" 2>/dev/null; then
+            prune_removed=$((prune_removed + 1))
+            prune_freed=$((prune_freed + prune_size))
+        fi
+    done
+
+    if [ "$prune_removed" -gt 0 ]; then
+        echo "backup: $prune_db — pruned $prune_removed unreferenced table file(s), $((prune_freed / 1048576)) MB reclaimed ($prune_pairs referenced files verified present)"
+    fi
+}
+
+SNAPSHOT_ENABLED=0
+if [ "$BACKUP_SNAPSHOT_MODE" != "off" ] && snapshot_root_is_safe; then
+    SNAPSHOT_ENABLED=1
+    # Reap clones stranded by a previous crashed run before staging new ones.
+    for stale_snapshot in "$BACKUP_SNAPSHOT_DIR"/*; do
+        [ -d "$stale_snapshot" ] || continue
+        discard_db_snapshot "$stale_snapshot"
+    done
+fi
+
 TOTAL=$(printf '%s\n' "$DATABASES" | awk 'NF {count++} END {print count + 0}')
 SYNCED=0
 FAILED=0
@@ -193,8 +383,23 @@ for db in $DATABASES; do
     # whole city) but size it so a real database can complete, and let the
     # operator raise it without editing the pack.
     sync_stderr="$(mktemp -t dolt-backup-sync 2>/dev/null || printf '%s' "/tmp/dolt-backup-sync.$$")"
-    if (cd "$db_dir" && run_bounded "$BACKUP_SYNC_TIMEOUT" dolt backup sync "${db}-backup" 2>"$sync_stderr"); then
+    # Sync from a CoW clone so dolt uses direct file access instead of proxying
+    # through the sql-server connection the data cannot fit inside. Falls back
+    # to the in-place path when no clone is possible.
+    sync_dir="$db_dir"
+    sync_mode="in-place"
+    db_snapshot="$BACKUP_SNAPSHOT_DIR/$db"
+    if [ "$SNAPSHOT_ENABLED" -eq 1 ]; then
+        if clone_db_snapshot "$db_dir" "$db_snapshot"; then
+            sync_dir="$db_snapshot"
+            sync_mode="snapshot"
+        else
+            echo "backup: $db — copy-on-write clone unavailable, falling back to in-place sync through the sql-server"
+        fi
+    fi
+    if (cd "$sync_dir" && run_bounded "$BACKUP_SYNC_TIMEOUT" dolt backup sync "${db}-backup" 2>"$sync_stderr"); then
         SYNCED=$((SYNCED + 1))
+        echo "backup: $db — synced ($sync_mode)"
         # Stamp ONLY on exit 0. Health reads this instead of any mtime on the
         # artifact plane, because the failure path can write those too.
         write_local_backup_sync_stamp "$db" "$BACKUP_ARTIFACT_DIR"
@@ -209,9 +414,14 @@ for db in $DATABASES; do
             sync_reason="$(tr -s '[:space:]' ' ' < "$sync_stderr" 2>/dev/null | head -1 | cut -c1-120 || true)"
         fi
         [ -n "$sync_reason" ] || sync_reason="no stderr; exceeded ${BACKUP_SYNC_TIMEOUT}s bound or exited non-zero"
-        append_failed_db "$db(sync failed: $sync_reason)"
+        append_failed_db "$db($sync_mode sync failed: $sync_reason)"
     fi
     rm -f "$sync_stderr" 2>/dev/null || true
+    discard_db_snapshot "$db_snapshot"
+    # Reclaim chunks abandoned by a killed sync, so the bloat cannot eat the
+    # headroom the next sync needs. Runs after success too: a conjoin leaves
+    # the table files it superseded unreferenced.
+    prune_backup_orphans "$db"
 done
 
 FAILED_COUNT=$FAILED
