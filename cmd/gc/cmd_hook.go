@@ -1066,6 +1066,13 @@ func doHook(workQuery, dir string, inject bool, runner WorkQueryRunner, stdout, 
 		if normalized != "" {
 			fmt.Fprint(stdout, normalized) //nolint:errcheck // best-effort stdout
 		}
+		// Say which kind of exit 1 this is. The documented contract overloads
+		// the code — 1 means "no ready work" here and "the hook failed" on
+		// every path above — and a silent empty exit is indistinguishable from
+		// a crash to both scripts and agents reading their own hook output. An
+		// agent paired this silence with unrelated stderr decoration and filed
+		// a config failure that did not exist (ga-3upjic).
+		fmt.Fprintln(stderr, "gc hook: no ready work (exit 1 means the queue is empty, not that the hook failed)") //nolint:errcheck // best-effort stderr
 		return 1
 	}
 	fmt.Fprint(stdout, normalized) //nolint:errcheck // best-effort stdout
