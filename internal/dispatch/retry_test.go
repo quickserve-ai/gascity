@@ -2132,15 +2132,11 @@ func TestProcessRetryEvalRetriesDistinctInvalidWorkerResultContracts(t *testing.
 			},
 			reason: "pass_with_failure_metadata",
 		},
-		{
-			name: "fail with unknown failure class",
-			meta: map[string]string{
-				"gc.outcome":        "fail",
-				"gc.failure_class":  "mystery",
-				"gc.failure_reason": "weird",
-			},
-			reason: "unknown_failure_class",
-		},
+		// "fail with unknown failure class" deliberately no longer belongs to
+		// this table: an out-of-vocabulary class now disposes HARD, not retry.
+		// See TestProcessRetryEvalHardFailsUnknownFailureClass below and the
+		// contract note on TestProcessRetryControlHardFailsUnknownFailureClass
+		// in control_test.go (ga-033u0e, 2026-08-14).
 		{
 			name: "unknown outcome value",
 			meta: map[string]string{
@@ -2221,6 +2217,80 @@ func TestProcessRetryEvalRetriesDistinctInvalidWorkerResultContracts(t *testing.
 				t.Fatalf("logical gc.failure_reason = %q, want %q", logicalAfter.Metadata["gc.failure_reason"], tc.reason)
 			}
 		})
+	}
+}
+
+// TestProcessRetryEvalHardFailsUnknownFailureClass is the retry-eval half of
+// the fail-closed contract pinned in control_test.go. An attempt that declares
+// gc.outcome=fail with an out-of-vocabulary gc.failure_class terminates the
+// loop on attempt 1 of 3 instead of consuming the retry budget. (ga-033u0e)
+func TestProcessRetryEvalHardFailsUnknownFailureClass(t *testing.T) {
+	t.Parallel()
+
+	store := newStrictCloseStore()
+	root := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "workflow",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":             "workflow",
+			"gc.formula_contract": "graph.v2",
+		},
+	})
+	logical := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "review",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":         "retry",
+			"gc.root_bead_id": root.ID,
+			"gc.step_ref":     "demo.review",
+			"gc.max_attempts": "3",
+			"gc.on_exhausted": "hard_fail",
+		},
+	})
+	run1 := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:  "review attempt 1",
+		Type:   "task",
+		Status: "closed",
+		Metadata: map[string]string{
+			"gc.kind":            "retry-run",
+			"gc.root_bead_id":    root.ID,
+			"gc.step_ref":        "demo.review.run.1",
+			"gc.logical_bead_id": logical.ID,
+			"gc.attempt":         "1",
+			"gc.max_attempts":    "3",
+			"gc.on_exhausted":    "hard_fail",
+			"gc.outcome":         "fail",
+			"gc.failure_class":   "root_bead_missing",
+			"gc.failure_reason":  "root gone",
+		},
+	})
+	eval1 := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title: "review eval 1",
+		Type:  "task",
+		Metadata: map[string]string{
+			"gc.kind":            "retry-eval",
+			"gc.root_bead_id":    root.ID,
+			"gc.step_ref":        "demo.review.eval.1",
+			"gc.logical_bead_id": logical.ID,
+			"gc.attempt":         "1",
+			"gc.max_attempts":    "3",
+			"gc.on_exhausted":    "hard_fail",
+		},
+	})
+	mustDepAdd(t, store, logical.ID, eval1.ID, "blocks")
+	mustDepAdd(t, store, eval1.ID, run1.ID, "blocks")
+
+	result, err := ProcessControl(store, eval1, ProcessOptions{})
+	if err != nil {
+		t.Fatalf("ProcessControl(retry-eval unknown class): %v", err)
+	}
+	if !result.Processed || result.Action != "hard-fail" {
+		t.Fatalf("result = %+v, want processed hard-fail on attempt 1 of 3", result)
+	}
+
+	logicalAfter := mustGetBead(t, store, logical.ID)
+	if logicalAfter.Metadata["gc.failure_reason"] != "unknown_failure_class" {
+		t.Fatalf("logical gc.failure_reason = %q, want unknown_failure_class", logicalAfter.Metadata["gc.failure_reason"])
 	}
 }
 
