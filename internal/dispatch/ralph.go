@@ -134,9 +134,17 @@ func processRalphCheck(store beads.Store, bead beads.Bead, opts ProcessOptions) 
 	// diverges on the empty class: classifyRetryAttempt maps an empty
 	// gc.failure_class to hard (retry.go: `case beadmeta.FailureClassHard, "":`),
 	// whereas this loop keeps an empty or transient class repairable and clones up
-	// to gc.max_attempts below. Only an explicit "hard" class terminates here.
+	// to gc.max_attempts below. That divergence is intentional and preserved.
+	//
+	// An OUT-OF-VOCABULARY class is terminal here too. It previously fell through
+	// to the clone path, which meant a misspelled class was treated as MORE
+	// repairable than an explicit "hard" — and since gc.failure_class is
+	// unvalidated at write time, the misspellings in practice describe permanent
+	// conditions that no retry can fix. Only a recognized transient/empty class
+	// stays repairable now. (ga-033u0e forensics, 2026-08-14.)
 	if subject.Metadata[beadmeta.OutcomeMetadataKey] == beadmeta.OutcomeFail &&
-		strings.TrimSpace(subject.Metadata[beadmeta.FailureClassMetadataKey]) == beadmeta.FailureClassHard {
+		(strings.TrimSpace(subject.Metadata[beadmeta.FailureClassMetadataKey]) == beadmeta.FailureClassHard ||
+			!beadmeta.IsRecognizedFailureClass(subject.Metadata[beadmeta.FailureClassMetadataKey])) {
 		if err := store.SetMetadataBatch(logicalID, map[string]string{
 			beadmeta.OutcomeMetadataKey:          beadmeta.OutcomeFail,
 			beadmeta.FailedAttemptMetadataKey:    strconv.Itoa(attempt),
