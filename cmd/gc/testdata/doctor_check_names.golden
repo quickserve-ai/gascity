@@ -57,6 +57,7 @@ beads-role
 controller
 supervisor-http-api
 supervisor-unit-ownership
+beads-cache-reconcile
 agent-sessions
 zombie-sessions
 orphan-sessions
