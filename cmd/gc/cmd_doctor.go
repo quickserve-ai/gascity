@@ -324,6 +324,16 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 		register(newBacklogDepthCheck(cityPath, storeFactory))
 		register(newOrderTrackingRetentionCheck(cityPath, storeFactory))
 		register(&sessionModelDoctorCheck{cfg: cfg, cityPath: cityPath, newStore: storeFactory})
+		// Wedged session creates: a session bead stuck mid-create holding a
+		// configured identity's reserved runtime name is a permanent outage for
+		// that agent, and produced zero operator signal for 62 consecutive
+		// reconciler failures (ga-2otk73) and for fourteen days (ga-qcuz36).
+		// Deliberately NOT gated on the controller being stopped like the
+		// agent/zombie/orphan trio above: a wedged create is a RUNNING city's
+		// failure mode, so that gate would blind it to the only situation it
+		// exists for. Its liveness probe is built lazily inside the check so the
+		// provider construction lands in the check's own time budget.
+		register(newSessionCreateWedgeCheck(cfg, cityPath, storeFactory, doctorSessionRuntimeLiveness))
 	}
 	register(newDoctorDoltServerCheck(cityPath, opts.SkipCityDoltCheck))
 	// Host-level fork-rate watch: surfaces the per-command data-plane fork storm
