@@ -395,6 +395,10 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 	register(doctor.NewSupervisorHTTPCheck(opts.SupervisorRunning))
 	register(doctor.NewSupervisorUnitOwnershipCheck(opts.SupervisorRunning, opts.SupervisorPID, opts.SupervisorUnitOwnership))
 	register(doctor.NewSupervisorBinaryCheck(opts.SupervisorRunning, opts.SupervisorPID, opts.SupervisorBinary))
+	// Beads-cache reconcile watch: alarms on the ABSENCE of a reconcile
+	// heartbeat. Registered next to the controller checks because it is a
+	// statement about the RUNNING controller, and it self-skips when none is.
+	register(newBeadsCacheReconcileCheck(cityPath, cfg, controllerRunning))
 
 	// sessionSP is the session provider the session checks read, and the
 	// ownerless-runtimes check after them; sessionSPErr is why there is none.
