@@ -634,14 +634,6 @@ func TestProcessRetryControlRetriesInvalidWorkerResultContract(t *testing.T) {
 			wantReason: "missing_outcome",
 		},
 		{
-			name: "unknown failure class",
-			attemptMeta: map[string]string{
-				"gc.outcome":       "fail",
-				"gc.failure_class": "mystery",
-			},
-			wantReason: "unknown_failure_class",
-		},
-		{
 			name: "invalid outcome value",
 			attemptMeta: map[string]string{
 				"gc.outcome":       "mystery",
@@ -763,6 +755,77 @@ func TestProcessRetryControlFoldsTypedCoordinatorOutcomeWithoutRetry(t *testing.
 	after := mustGet(t, store, control.ID)
 	if after.Status != "closed" || after.Metadata["gc.outcome"] != "pass" {
 		t.Fatalf("control = status %q outcome %q, want closed/pass", after.Status, after.Metadata["gc.outcome"])
+	}
+}
+
+// TestProcessRetryControlHardFailsUnknownFailureClass pins the fail-CLOSED
+// disposition for an out-of-vocabulary gc.failure_class.
+//
+// CONTRACT CHANGE (ga-033u0e, 2026-08-14). This case used to live in
+// TestProcessRetryControlRetriesInvalidWorkerResultContract above and assert
+// "retry". It is deliberately split out and inverted. The sibling cases in that
+// table (missing_outcome, invalid_outcome_value, pass_with_failure_metadata) are
+// genuine "the worker did not tell us what happened" contracts where another
+// attempt is the right hardening, and they keep retrying. This one is not: the
+// worker DID declare gc.outcome=fail — a definite self-reported terminal result
+// — and only used a non-canonical word for why.
+//
+// Retrying on that was strictly more permissive than the empty class, which
+// already disposes hard (retry.go: `case FailureClassHard, "":`). So writing a
+// garbage class bought MORE retries than writing nothing at all, and because
+// gc.failure_class is unvalidated at write time the values that actually land
+// here are agent-authored strings for permanent conditions. Measured on the
+// 2026-08-12T00:55Z pour: 8 of 8 non-empty classes were out-of-vocabulary, in
+// four spellings of one unfixable condition, each retried to exhaustion and
+// emitting an escalation per attempt.
+func TestProcessRetryControlHardFailsUnknownFailureClass(t *testing.T) {
+	t.Parallel()
+	store := beads.NewMemStore()
+
+	root := mustCreate(t, store, beads.Bead{
+		Title:    "workflow",
+		Metadata: map[string]string{"gc.kind": "workflow"},
+	})
+	control := mustCreate(t, store, beads.Bead{
+		Title: "review",
+		Metadata: map[string]string{
+			"gc.kind":             "retry",
+			"gc.root_bead_id":     root.ID,
+			"gc.step_ref":         "mol-test.review",
+			"gc.step_id":          "review",
+			"gc.max_attempts":     "2",
+			"gc.on_exhausted":     "hard_fail",
+			"gc.source_step_spec": `{"id":"review","title":"Review","type":"task","retry":{"max_attempts":2}}`,
+			"gc.control_epoch":    "1",
+		},
+	})
+	attempt1 := mustCreate(t, store, beads.Bead{
+		Title: "review attempt 1",
+		Metadata: map[string]string{
+			"gc.root_bead_id":  root.ID,
+			"gc.step_ref":      "mol-test.review.attempt.1",
+			"gc.attempt":       "1",
+			"gc.outcome":       "fail",
+			"gc.failure_class": "missing-root-bead",
+		},
+	})
+	mustClose(t, store, attempt1.ID)
+	mustDep(t, store, control.ID, attempt1.ID, "blocks")
+
+	result, err := processRetryControl(store, mustGet(t, store, control.ID), ProcessOptions{})
+	if err != nil {
+		t.Fatalf("processRetryControl: %v", err)
+	}
+	if result.Action != "hard-fail" {
+		t.Fatalf("action = %q, want hard-fail (attempt 1 of 2 — an unknown class must not consume the retry budget)", result.Action)
+	}
+
+	after := mustGet(t, store, control.ID)
+	if after.Status != "closed" {
+		t.Fatalf("control status = %q, want closed", after.Status)
+	}
+	if after.Metadata["gc.failure_reason"] != "unknown_failure_class" {
+		t.Fatalf("control gc.failure_reason = %q, want unknown_failure_class", after.Metadata["gc.failure_reason"])
 	}
 }
 

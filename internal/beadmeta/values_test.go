@@ -50,6 +50,34 @@ func TestPinnedOutcomeAndFailureClassValues(t *testing.T) {
 	}
 }
 
+// TestIsRecognizedFailureClass pins the membership predicate used by the retry
+// and Ralph dispatchers to decide whether a gc.failure_class value can be acted
+// on. The real-world out-of-vocabulary cases below are the four distinct
+// spellings observed on the 2026-08-12T00:55Z pour (ga-033u0e) — every one of
+// them an agent-authored name for the same permanent condition.
+func TestIsRecognizedFailureClass(t *testing.T) {
+	recognized := []string{"transient", "hard", "", "  ", " transient ", "\thard\n"}
+	for _, class := range recognized {
+		if !IsRecognizedFailureClass(class) {
+			t.Errorf("IsRecognizedFailureClass(%q) = false, want true", class)
+		}
+	}
+	unrecognized := []string{
+		"missing-root-bead",
+		"missing-workflow-root-bead",
+		"root_bead_missing",
+		"missing_workflow_root",
+		"Transient",
+		"HARD",
+		"mystery",
+	}
+	for _, class := range unrecognized {
+		if IsRecognizedFailureClass(class) {
+			t.Errorf("IsRecognizedFailureClass(%q) = true, want false", class)
+		}
+	}
+}
+
 // TestPinnedVocabularyValues pins the remaining per-key value vocabularies
 // (formula contract, scope roles, state machines, dispositions, modes). All of
 // these are persisted into bead metadata; the persisted-data caveat from
