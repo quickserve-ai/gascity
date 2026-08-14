@@ -195,6 +195,48 @@ func TestMergeControlReadyGroupsSkipsInstantiatingWithoutMarkingSeen(t *testing.
 	}
 }
 
+// TestMergeControlReadyGroupsSkipsFailedPartialMolecules is the ga-033u0e
+// regression: when instantiation aborts partway it marks every bead it already
+// wrote molecule_failed AND clears their gc.instantiating fence, so the failure
+// path used to promote correctly-hidden steps into the dispatch queue. Those
+// steps cannot make progress — each one fails on missing root metadata and
+// mails an escalation — so a partial pour became an escalation generator.
+func TestMergeControlReadyGroupsSkipsFailedPartialMolecules(t *testing.T) {
+	assigned := []beads.Bead{
+		// The exact end state markFailed leaves behind: fence cleared, failed
+		// mark set. Hiding must key on the failed mark, not the empty fence.
+		{ID: "ga-partial-step", Metadata: map[string]string{
+			beadmeta.MoleculeFailedMetadataKey: "true",
+			beadmeta.InstantiatingMetadataKey:  "",
+		}},
+		{ID: "ga-healthy", Metadata: map[string]string{"gc.kind": "run"}},
+	}
+	routed := []beads.Bead{
+		{ID: "ga-partial-routed", Metadata: map[string]string{beadmeta.MoleculeFailedMetadataKey: "true"}},
+		{ID: "ga-healthy-routed", Metadata: map[string]string{"gc.kind": "scope-check"}},
+	}
+
+	got := mergeControlReadyGroups(assigned, routed)
+	wantIDs := []string{"ga-healthy", "ga-healthy-routed"}
+	if !stringSlicesEqual(beadIDs(got), wantIDs) {
+		t.Fatalf("mergeControlReadyGroups ids = %#v, want %#v", beadIDs(got), wantIDs)
+	}
+}
+
+// TestControlReadyShellFilterMatchesGoFilterOnFailedPartialMolecules pins the
+// two dispatch surfaces together. The readiness scan exists twice — this Go
+// merge and the jq reduce that dispatch_runtime.go ships to the shell — and a
+// filter that lands on only one leaves the defect live on whichever path the
+// city takes. This asserts the shell filter names both metadata keys.
+func TestControlReadyShellFilterMatchesGoFilterOnFailedPartialMolecules(t *testing.T) {
+	query := workflowServeControlReadyQuery(config.Agent{Name: config.ControlDispatcherAgentName, Dir: "gascity"})
+	for _, key := range []string{beadmeta.InstantiatingMetadataKey, beadmeta.MoleculeFailedMetadataKey} {
+		if !strings.Contains(query, key) {
+			t.Fatalf("shell control-ready query does not filter %q — it has drifted from mergeControlReadyGroups:\n%s", key, query)
+		}
+	}
+}
+
 // TestEvaluateControlReadyMatchesShellQueryPriority ports
 // TestWorkflowServeControlReadyQueryPreservesQueryPriorityWhenMerging's
 // scenario (cmd_convoy_dispatch_test.go) at the Go level: given the same
