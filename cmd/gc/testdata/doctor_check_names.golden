@@ -62,6 +62,7 @@ controller
 supervisor-http-api
 supervisor-unit-ownership
 supervisor-binary
+beads-cache-reconcile
 agent-sessions
 zombie-sessions
 orphan-sessions

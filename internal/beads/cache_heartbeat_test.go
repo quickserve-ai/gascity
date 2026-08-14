@@ -128,7 +128,7 @@ func TestSetReconcileHeartbeatSinkNilDoesNotPublishOrStamp(t *testing.T) {
 
 // TestReconcileHeartbeatSinkDefaultsOff pins that a store nobody wired
 // publishes nothing: every CLI-path and test store keeps its previous behavior.
-func TestReconcileHeartbeatSinkDefaultsOff(t *testing.T) {
+func TestReconcileHeartbeatSinkDefaultsOff(_ *testing.T) {
 	backing := NewMemStore()
 	c := NewCachingStoreForTestWithPrefix(backing, "ga", nil)
 	// No panic, no write, no observable effect.
