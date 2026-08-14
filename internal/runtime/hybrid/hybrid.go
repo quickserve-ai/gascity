@@ -25,6 +25,7 @@ var (
 	_ runtime.InterruptedTurnResetProvider  = (*Provider)(nil)
 	_ runtime.RelaunchProvider              = (*Provider)(nil)
 	_ runtime.LivenessObserver              = (*Provider)(nil)
+	_ runtime.LivenessAttester              = (*Provider)(nil)
 )
 
 // New creates a hybrid provider. isRemote returns true for sessions
@@ -91,6 +92,14 @@ func (p *Provider) ProcessAlive(name string, processNames []string) bool {
 // IsRunning+ProcessAlive fold.
 func (p *Provider) ObserveLiveness(name string, processNames []string) runtime.Liveness {
 	return runtime.ObserveLiveness(p.route(name), name, processNames)
+}
+
+// AttestLiveness delegates to the routed backend, carrying its freshness
+// attestation. Without it a hybrid-wrapped tmux backend would report "cannot
+// attest" and every caller that fails closed on an unattested probe would treat
+// a healthy fleet as unobservable.
+func (p *Provider) AttestLiveness(name string, processNames []string) runtime.AttestedLiveness {
+	return runtime.AttestLiveness(p.route(name), name, processNames)
 }
 
 // Nudge delegates to the routed backend.

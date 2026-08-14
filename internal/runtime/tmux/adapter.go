@@ -42,6 +42,8 @@ var (
 	_ runtime.InterruptedTurnResetProvider  = (*Provider)(nil)
 	_ runtime.ProcessTableScanner           = (*Provider)(nil)
 	_ runtime.ServerLifecycleProvider       = (*Provider)(nil)
+	_ runtime.LivenessObserver              = (*Provider)(nil)
+	_ runtime.LivenessAttester              = (*Provider)(nil)
 )
 
 // NewProvider returns a [Provider] backed by a real tmux installation
@@ -399,24 +401,41 @@ func (p *Provider) ForgetSession(name string) {
 // tmux session. If processNames is empty, it strictly consults GT_PROCESS_NAMES
 // from the session environment; it never falls back to Claude defaults.
 func (p *Provider) ObserveLiveness(name string, processNames []string) runtime.Liveness {
+	return p.AttestLiveness(name, processNames).Liveness
+}
+
+// AttestLiveness implements [runtime.LivenessAttester]: the same observation
+// ObserveLiveness returns, plus whether the StateCache snapshot behind it came
+// from a probe that SUCCEEDED (see StateCache.currentStateAttested).
+//
+// tmux is the provider that most needs this. Both halves of the answer are read
+// from ONE cache snapshot, so a wedged tmux fetch does not degrade them
+// independently — past staleTTL the cache serves an empty snapshot and every
+// session reads stopped-and-dead at once. Fresh=false is that state.
+//
+// ObserveLiveness delegates here rather than duplicating the fold, so the
+// attested and unattested answers can never drift apart.
+func (p *Provider) AttestLiveness(name string, processNames []string) runtime.AttestedLiveness {
 	if strings.TrimSpace(name) == "" {
-		return runtime.Liveness{}
+		return runtime.AttestedLiveness{}
 	}
-	running := p.cache.IsRunning(name)
 	processNames = nonEmptyProcessNames(processNames)
 	if len(processNames) == 0 {
 		processNames = p.sessionProcessNames(name)
 	}
+	running, alive, attested := p.cache.observeAttested(name, processNames)
 	if len(processNames) == 0 {
-		return runtime.Liveness{Running: running, Alive: running}
+		return runtime.AttestedLiveness{
+			Liveness: runtime.Liveness{Running: running, Alive: running},
+			Fresh:    attested,
+		}
 	}
-	alive := p.cache.ProcessAlive(name, processNames)
 	if alive && !running {
 		running = true
 	}
-	return runtime.Liveness{
-		Running: running,
-		Alive:   alive,
+	return runtime.AttestedLiveness{
+		Liveness: runtime.Liveness{Running: running, Alive: alive},
+		Fresh:    attested,
 	}
 }
 

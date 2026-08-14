@@ -118,15 +118,36 @@ func (c *StateCache) ProcessAlive(name string, processNames []string) bool {
 }
 
 func (c *StateCache) currentState() runtimeStateSnapshot {
+	state, _ := c.currentStateAttested()
+	return state
+}
+
+// currentStateAttested returns the snapshot currentState serves, plus whether
+// the cache can ATTEST it: the snapshot exists, it is within staleTTL, nothing
+// has invalidated it, and the most recent refresh attempt SUCCEEDED.
+//
+// The distinction matters because a false answer from this cache has two
+// completely different meanings that the snapshot itself cannot tell apart:
+//
+//   - "the session is not there" — a successful fetch that did not list it;
+//   - "the cache has nothing" — the degraded empty snapshot below, served for as
+//     long as the fetch keeps failing past staleTTL, and also served (with
+//     lastError set) to a never-primed cache that cannot reach a tmux server.
+//
+// Callers that merely decide whether to nudge may treat both as "stopped".
+// Callers that DESTROY state on "stopped" must not: for them an unattested
+// snapshot is UNKNOWN. See runtime.AttestedLiveness.
+func (c *StateCache) currentStateAttested() (runtimeStateSnapshot, bool) {
 	c.mu.RLock()
 	state := c.state
 	fetchedAt := c.fetchedAt
 	dirty := c.dirty
+	lastError := c.lastError
 	c.mu.RUnlock()
 
 	// Cache hit: fresh data, not invalidated.
 	if state.Sessions != nil && !fetchedAt.IsZero() && !dirty && time.Since(fetchedAt) < c.ttl {
-		return state
+		return state, lastError == nil
 	}
 
 	// Stale, empty, or dirty — trigger refresh.
@@ -141,15 +162,40 @@ func (c *StateCache) currentState() runtimeStateSnapshot {
 	c.mu.RLock()
 	state = c.state
 	fetchedAt = c.fetchedAt
+	dirty = c.dirty
+	lastError = c.lastError
 	c.mu.RUnlock()
 
 	// If the cache is older than staleTTL, report all sessions as not running.
 	// Note: fetchedAt is preserved on failure (never zeroed), so this only
 	// triggers after staleTTL of real wall-clock time since last success.
 	if state.Sessions == nil || fetchedAt.IsZero() || time.Since(fetchedAt) > c.staleTTL {
-		return runtimeStateSnapshot{}
+		return runtimeStateSnapshot{}, false
 	}
-	return state
+	// Inside staleTTL the data is real last-known-good, but only a refresh that
+	// SUCCEEDED proves it is current: a failed refresh leaves lastError set and
+	// fetchedAt untouched, so the same rows would keep attesting for the whole
+	// 30s grace while the fetch subsystem is wedged. dirty means an invalidation
+	// raced this read and the refresh did not land, which is the same UNKNOWN.
+	return state, lastError == nil && !dirty
+}
+
+// observeAttested answers both halves of a liveness observation off ONE snapshot
+// read, together with that snapshot's attestation.
+//
+// Reading once matters for the attestation to mean anything: IsRunning followed
+// by ProcessAlive takes two independent currentState() reads, so a refresh
+// landing between them could attest a snapshot that did not produce the answer.
+// The per-half semantics are unchanged — an empty processNames slice preserves
+// Provider.ProcessAlive's "no check possible" true.
+func (c *StateCache) observeAttested(name string, processNames []string) (running, alive, attested bool) {
+	state, attested := c.currentStateAttested()
+	session, ok := state.Sessions[name]
+	running = ok && session.Running
+	if len(processNames) == 0 {
+		return running, true, attested
+	}
+	return running, state.processAlive(name, processNames), attested
 }
 
 // Invalidate marks the cache as dirty, forcing the next IsRunning call

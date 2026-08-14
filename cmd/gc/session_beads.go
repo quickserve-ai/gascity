@@ -1829,9 +1829,13 @@ func syncSessionBeadsWithSnapshotAndRigStores(
 							//
 							// This runs inside WithCitySessionIdentifierLocks
 							// below, so it is serialized against any other
-							// claim on this name.
+							// claim on this name. The name lock does NOT cover
+							// the holder bead's own start lane (the start
+							// commit takes neither name nor alias lock), so
+							// the release takes a per-bead start lock of its
+							// own — cityPath is threaded through for it.
 							recoverStaleNamedSessionNameSquatter(
-								store, cfg, sp, err, sn,
+								store, cfg, sp, err, cityPath, sn,
 								strings.TrimSpace(tp.ConfiguredNamedIdentity),
 								clk, now, stderr,
 							)

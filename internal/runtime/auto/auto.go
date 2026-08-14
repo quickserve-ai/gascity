@@ -33,6 +33,7 @@ var (
 	_ runtime.TransportCapabilityProvider   = (*Provider)(nil)
 	_ runtime.RelaunchProvider              = (*Provider)(nil)
 	_ runtime.LivenessObserver              = (*Provider)(nil)
+	_ runtime.LivenessAttester              = (*Provider)(nil)
 )
 
 // New creates a composite provider. defaultSP handles sessions not
@@ -246,6 +247,31 @@ func (p *Provider) ObserveLiveness(name string, processNames []string) runtime.L
 		other = p.defaultSP
 	}
 	return runtime.ObserveLiveness(other, name, processNames)
+}
+
+// AttestLiveness mirrors ObserveLiveness — same routing, same stale-route
+// fall-through — and carries the routed backend's freshness attestation with it.
+// Without this forwarding an auto-wrapped tmux provider would report "cannot
+// attest" for every session, and callers that fail closed on an unattested probe
+// (the ga-2otk73 named-name release) would silently stop working on any city
+// that also routes some sessions to ACP.
+//
+// The fall-through keeps the attestation of whichever backend produced the
+// returned observation, so a Fresh answer always describes the probe it came
+// from.
+func (p *Provider) AttestLiveness(name string, processNames []string) runtime.AttestedLiveness {
+	primary := runtime.AttestLiveness(p.route(name), name, processNames)
+	if primary.Running {
+		return primary
+	}
+	p.mu.RLock()
+	isACP := p.routes[name]
+	p.mu.RUnlock()
+	other := p.acpSP
+	if isACP {
+		other = p.defaultSP
+	}
+	return runtime.AttestLiveness(other, name, processNames)
 }
 
 // Nudge delegates to the routed backend.

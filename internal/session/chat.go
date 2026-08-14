@@ -273,6 +273,56 @@ func WithSessionMutationLock(id string, fn func() error) error {
 	return withSessionMutationLock(id, fn)
 }
 
+// WithSessionBeadStartLock serializes every write that mints, commits, or
+// abandons ONE session bead's pending-create attempt — and, with them, the
+// ga-2otk73 name-squat release, which re-reads, compares and CLOSES the bead
+// inside this lock.
+//
+// It is not the only fence on that release — the close itself is a store-level
+// CAS (beads.ConditionalWriter.CloseIfMatch against the revision the decision
+// was read at), which DETECTS any interleaved write. This lock is what keeps the
+// start lane out of the window in the first place, so the common case is a clean
+// release rather than a rejected one retried a tick later, and it is the only
+// fence left on a store whose backing cannot do conditional writes.
+//
+// Two layers, because the writers live in two scopes:
+//
+//   - a per-bead FILE lock under the city, so a second PROCESS (gc session
+//     start, the API server) is excluded too. Skipped when cityPath is empty,
+//     which callers pass deliberately as well as incidentally: the file layer
+//     costs one never-reclaimed lock file per bead ID, so cmd/gc asks for it
+//     only for configured NAMED beads (the only beads the release can target)
+//     and not for pool beads, which mint a fresh ID per start attempt.
+//   - the per-bead in-process mutation lock, which the pre-wake mint already
+//     held before this helper existed.
+//
+// The order is always FILE then MUTEX, and neither layer is reentrant: a caller
+// already holding either lock for the same bead must not call this.
+//
+// It does NOT cover every writer of the bead. Only the start lane participates
+// (pre-wake mint, start commit, in-flight lease clear) plus the release itself;
+// any other concurrent metadata write is still caught by the fingerprint compare
+// alone, which is a narrow window, not an excluded one.
+func WithSessionBeadStartLock(cityPath, id string, fn func() error) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return fn()
+	}
+	guarded := func() error { return withSessionMutationLock(id, fn) }
+	if strings.TrimSpace(cityPath) == "" {
+		return guarded()
+	}
+	return withCitySessionIdentifierLock(cityPath, sessionBeadStartLockIdentifier(id), guarded)
+}
+
+// sessionBeadStartLockIdentifier namespaces the per-bead start lock away from
+// the session-name and alias locks that share the city's lock directory. A bead
+// ID can never collide with a session name, but the prefix makes the intent
+// explicit and keeps a future ID scheme from aliasing one.
+func sessionBeadStartLockIdentifier(id string) string {
+	return "session-bead-start:" + id
+}
+
 func withSessionMutationLock(id string, fn func() error) error {
 	lock := acquireSessionMutationLock(id)
 	defer releaseSessionMutationLock(id, lock)

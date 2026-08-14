@@ -37,13 +37,19 @@ var (
 // errors.Is(err, ErrSessionNameExists) caller behaves exactly as before, and
 // its Error() text is byte-identical to the fmt.Errorf it replaces.
 //
-// The typed HolderID exists so a caller can resolve the holder BY ID. That is
-// the one read tier that cannot be served from a stale list cache: the
+// The typed HolderID exists so a caller can resolve the holder BY ID. The
 // ga-2otk73 incident had a half-created session bead that the name-uniqueness
 // query could see (it takes a live IncludeClosed read) while every
 // IncludeClosed=false list the reconciler and syncSessionBeads use could not.
-// The holder ID is the only bridge across that split, and it was already in
-// the error string — it just wasn't reachable without parsing prose.
+// The holder ID is the bridge across that split, and it was already in the error
+// string — it just wasn't reachable without parsing prose.
+//
+// Precisely: an id ABSENT from CachingStore's in-memory map falls through to the
+// backing store (caching_store_reads.go:398-460), and absent-from-the-map is
+// exactly why the cached list could not see it. A by-ID read is NOT a
+// categorically fresher tier — an id the cache HAS is answered from the cache,
+// stale row and all — so a caller that acts destructively on what it reads must
+// carry its own evidence, not lean on the read.
 //
 // Only the outright session_name holder is reported. Alias- and
 // identifier-collision conflicts keep their plain fmt.Errorf form: those name

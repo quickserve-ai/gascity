@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
@@ -36,16 +37,29 @@ import (
 // bead the per-tick feed never contained.
 //
 // THE REPAIR happens at the COLLISION SITE, and resolves the holder BY BEAD ID.
-// The conflict error already named the holder; a by-ID store read is the one
-// tier a stale list cache cannot hide. That also means the repair does not
-// depend on WHY the bead was invisible — only on what the bead itself says.
+// The conflict error already named the holder, and a by-ID read is what reaches
+// the incident's holder: the cached list and CachingStore.Get read the SAME
+// in-memory map, and an id ABSENT from that map falls through to the backing
+// store (caching_store_reads.go:398-460) — which is exactly the shape of an
+// invisible bead. The repair therefore does not depend on WHY the bead was
+// invisible.
+//
+// It is NOT a universally stronger read tier, and this code must not be read as
+// if it were: an id that is PRESENT in the cache is answered FROM the cache, so
+// a stale-but-present row is served to a by-ID read exactly as stale as it is
+// served to a list. Beads this process wrote are marked dirty and re-read live,
+// so the staleness that survives is another WRITER's commit that this cache has
+// not absorbed yet. That residue is covered by the liveness gate, not by the
+// read: a session whose start really did commit elsewhere has a runtime, and the
+// confirmation window below refuses to advance on any probe that cannot attest
+// it actually looked.
 //
 // It is deliberately narrow and fails SAFE (leaves the session alone) on every
 // uncertainty:
 //
 //   - the holder must be a configured NAMED session bead, never a manual one;
-//   - it must carry pending_create_claim in a rollback state, with the lease
-//     EXPIRED under the reconciler's OWN predicate
+//   - it must carry pending_create_claim in a rollback state that is NOT
+//     StateAsleep, with the lease EXPIRED under the reconciler's OWN predicate
 //     (pendingCreateLeaseExpiredForRollbackInfo; a never-started claim gets
 //     pendingCreateNeverStartedTimeout, currently 10 minutes);
 //   - its session_name must equal the contested name AND its
@@ -54,10 +68,13 @@ import (
 //     ga-841/kg4uh4 phantom class: on ambiguity, do nothing);
 //   - the runtime must be observed stopped on namedNameReleaseConfirmTicks
 //     CONSECUTIVE ticks spanning at least namedNameReleaseConfirmWindow of wall
-//     clock (see namedSessionRuntimeConfirmedStopped for why a single probe is
-//     not evidence);
-//   - every gate is re-evaluated against a FRESH by-ID read immediately before
-//     the close commits.
+//     clock, and every one of those observations must come from a probe the
+//     provider can ATTEST as fresh and successful (see
+//     observeNamedSessionLiveness);
+//   - every gate is re-evaluated against a fresh by-ID read immediately before
+//     the close commits, and that read-compare-close runs inside the per-bead
+//     start lock every start-lane writer also takes, so it is a guarded update
+//     and not a compare followed by an unprotected write.
 //
 // What it deliberately does NOT do:
 //
@@ -83,6 +100,17 @@ import (
 //     admitted ASLEEP named sessions carrying a claim, which are
 //     "authoritatively stopped" by construction and so unprotectable by any
 //     runtime gate. See the report for the full rationale.
+//   - It does not touch an ASLEEP holder either, and that is the same argument
+//     applied to this path (reviewer finding F1). The sweep carve-out was
+//     dropped because no runtime gate can protect a shape that is stopped by
+//     definition; pendingCreateRollbackState (session_reconciler.go) admits
+//     StateAsleep, so without an explicit exclusion HERE the collision path
+//     would close exactly the class the sweep was denied — and this path is
+//     strictly worse for it, because it clears sleep_intent on the way out, so
+//     the successor is force-restarted rather than left asleep. The exclusion
+//     lives in staleNamedPendingCreateInfo. It leaves ONE shape unrepaired — an
+//     asleep holder that is also invisible to the list tier — which is stated
+//     there rather than papered over.
 
 const (
 	// namedSessionSquatCloseState is the terminal state stamped on a named
@@ -116,8 +144,16 @@ const (
 	// is older than defaultStaleTTL = 30s (internal/runtime/tmux/state_cache.go),
 	// and on a busy box N ticks can all land inside one such stale window, so N
 	// identical "stopped" answers can be N reads of the same degraded snapshot.
-	// The window is set well clear of that 30s stale TTL so a confirmed
-	// sequence must survive at least one successful cache refresh.
+	//
+	// The window does NOT by itself rule that out — wall-clock spacing only
+	// proves the readings were taken apart in time, never that any of them came
+	// from a probe that succeeded, and a fetch subsystem wedged for the whole
+	// window degrades every reading in it identically. Proving the probe looked
+	// is the attestation's job (observeNamedSessionLiveness): an unattested
+	// reading cannot advance the chain at all. The window is retained as the
+	// second, independent barrier — it bounds how transient a real death may be
+	// and still be believed, and it is set clear of the 30s stale TTL so a
+	// confirmed sequence spans more than one cache generation.
 	//
 	// The cost is bounded and small: the lease is already expired by
 	// pendingCreateNeverStartedTimeout (10m) before the first confirming tick,
@@ -190,6 +226,27 @@ func staleNamedPendingCreateInfo(info sessionpkg.Info, clk clock.Clock, startupT
 	if !info.PendingCreateClaim {
 		return false
 	}
+	// ASLEEP is excluded (reviewer finding F1). pendingCreateLeaseExpiredForRollbackInfo
+	// runs pendingCreateRollbackState, which accepts StateAsleep as well as
+	// start-pending/creating — the reconciler documents the shape ("keep
+	// never-started pending-create leases alive after heal has rewritten
+	// state=creating to asleep", session_reconcile.go). This change dropped the
+	// sweep's named carve-out with the argument that an asleep named session is
+	// authoritatively stopped by construction, so no runtime gate can protect it;
+	// that argument does not stop being true at this call site. Worse here: the
+	// close clears sleep_intent, so the successor comes back AWAKE — a
+	// deliberately-sleeping, user-held session would be force-restarted.
+	//
+	// It costs the incident's own repair nothing (that bead was
+	// state=start-pending), but it is not free in general: an asleep holder that
+	// is ALSO invisible to the controller's list tier keeps wedging its name,
+	// with no automatic repair — the pre-ga-2otk73 status quo for that one shape.
+	// That is the accepted price. The alternative is closing a session a user
+	// deliberately put to sleep on evidence ("no runtime") that can never
+	// distinguish it from a dead one.
+	if sessionpkg.State(strings.TrimSpace(info.MetadataState)) == sessionpkg.StateAsleep {
+		return false
+	}
 	return pendingCreateLeaseExpiredForRollbackInfo(info, clk, startupTimeout)
 }
 
@@ -219,28 +276,60 @@ func abandonedNamedSessionNameHolder(
 	return staleNamedPendingCreateInfo(info, clk, startupTimeout)
 }
 
-// namedSessionRuntimeConfirmedStopped reports a SINGLE "no runtime" observation
-// for info's session name. It fails CLOSED: a nil provider or an empty session
-// name means the observation is unavailable, which is reported as "not
-// confirmed stopped", never as "stopped".
+// namedSessionLivenessObservation is ONE tick's liveness reading for a holder
+// bead, kept as a tri-state on purpose. "Stopped" and "could not tell" are
+// different answers, and only code that keeps them apart can fail closed.
+type namedSessionLivenessObservation struct {
+	// Stopped is the content of the reading: neither the provider session nor
+	// the agent process was seen.
+	Stopped bool
+	// Attested reports that the provider stands behind the reading — it came
+	// from a probe that actually SUCCEEDED and is current
+	// (runtime.AttestedLiveness.Fresh). False means UNKNOWN.
+	Attested bool
+}
+
+// ConfirmsStopped reports whether this observation may advance the confirmation
+// chain. Both halves are required: an unattested "stopped" is the degraded
+// reading this whole mechanism exists to reject.
+func (o namedSessionLivenessObservation) ConfirmsStopped() bool {
+	return o.Stopped && o.Attested
+}
+
+// observeNamedSessionLiveness takes a SINGLE liveness reading for info's session
+// name, with the provider's freshness attestation attached. It fails CLOSED: a
+// nil provider or an empty session name yields the zero value — not stopped, not
+// attested.
 //
 // It reads both halves of runtime.Liveness (provider session AND agent process)
-// because a tmux-level false negative with a live agent process is exactly the
-// case where closing the bead would strand a working agent.
+// because a runtime-level false negative with a live agent process would strand
+// a working agent. Those halves are NOT independent evidence, and must not be
+// counted as two channels: for tmux they are two lookups into ONE StateCache
+// snapshot (internal/runtime/tmux/adapter.go, state_cache.go), so a cache that
+// cannot refresh zeroes both together. That is precisely what the attestation is
+// for — the two halves answer "is it alive", the attestation answers "did we
+// actually look".
 //
-// IMPORTANT — this is one observation, not proof. runtime.Liveness carries no
-// error or quality channel, so a provider that is degraded, timing out, or
-// serving a stale snapshot is INDISTINGUISHABLE here from one reporting a truly
-// dead session; tmux's StateCache in particular reports every session
-// not-running once its snapshot passes defaultStaleTTL (30s). Callers must
-// therefore never act on one call — route through
+// WHICH PROVIDERS CAN ATTEST. tmux can (StateCache knows its own fetchedAt,
+// staleTTL and last refresh error) and the auto/hybrid routers and the status
+// wrapper forward it; runtime.Fake attests, since its map is the truth it
+// simulates and a BROKEN fake attests false. Every other provider — acp, k8s,
+// ssh, exec, subprocess, herdr, t3bridge, and any pack-declared runtime — does
+// not implement runtime.LivenessAttester and is therefore treated as UNABLE to
+// attest. For those the observation is permanently UNKNOWN and this recovery
+// NEVER releases a name. That is the deliberate trade: the failure it prevents
+// (closing a live agent's bead) is unrecoverable, the failure it causes (a named
+// session stays wedged until a human intervenes, exactly as it did before this
+// change) is not.
+//
+// IMPORTANT — one attested observation is still not proof. Route through
 // recordNamedNameReleaseConfirmation, which requires
 // namedNameReleaseConfirmTicks consecutive confirmations spanning at least
 // namedNameReleaseConfirmWindow.
-func namedSessionRuntimeConfirmedStopped(info sessionpkg.Info, cfg *config.City, sp runtime.Provider) bool {
+func observeNamedSessionLiveness(info sessionpkg.Info, cfg *config.City, sp runtime.Provider) namedSessionLivenessObservation {
 	name := strings.TrimSpace(info.SessionNameMetadata)
 	if sp == nil || name == "" {
-		return false
+		return namedSessionLivenessObservation{}
 	}
 	var processNames []string
 	if cfg != nil {
@@ -252,8 +341,32 @@ func namedSessionRuntimeConfirmedStopped(info sessionpkg.Info, cfg *config.City,
 			processNames = config.AgentProcessNames(cfg, *agentCfg, exec.LookPath)
 		}
 	}
-	obs := runtime.ObserveLiveness(sp, name, processNames)
-	return !obs.Running && !obs.Alive
+	obs := runtime.AttestLiveness(sp, name, processNames)
+	return namedSessionLivenessObservation{
+		Stopped:  !obs.Running && !obs.Alive,
+		Attested: obs.Fresh,
+	}
+}
+
+// namedSessionStartLockPath returns the cityPath the per-bead start lock should
+// use for info: the real city path for a CONFIGURED NAMED bead, "" (in-process
+// layer only) for everything else.
+//
+// The file layer of that lock exists for exactly one caller — the ga-2otk73
+// name-squat release — and the release only ever targets a configured named
+// bead (abandonedNamedSessionNameHolder requires a matching
+// configured_named_identity). Taking the file layer for pool beads too would be
+// pure cost: a pool worker mints a NEW bead per attempt, so the city's lock
+// directory would grow one never-reclaimed file per start, forever. Named beads
+// are bounded by config and turn over rarely.
+//
+// The in-process layer is unconditional, so the controller's own start lane is
+// serialized for every bead either way.
+func namedSessionStartLockPath(cityPath string, info sessionpkg.Info) string {
+	if sessionpkg.NamedSessionIdentityInfo(info) == "" {
+		return ""
+	}
+	return cityPath
 }
 
 // pendingCreateAttemptFingerprint digests the fields that identify ONE
@@ -287,24 +400,37 @@ func pendingCreateAttemptFingerprint(info sessionpkg.Info) string {
 }
 
 // samePendingCreateAttempt reports whether two reads of the same bead describe
-// the SAME pending-create attempt. It is the read-compare-write fence around
-// the destructive close: between deciding a claim is abandoned and closing the
-// bead, the original creator may have finished spawning and committed.
+// the SAME pending-create attempt. It is the comparison half of the guarded
+// update around the destructive close: between deciding a claim is abandoned and
+// closing the bead, the original creator may have finished spawning and
+// committed.
 //
-// This is not a store-level CAS (the session front door has no conditional
-// close today); it shrinks the window and matches the recheck discipline
-// releasePoolAssignmentWithRecheck already uses. The multi-tick confirmation
-// window is the independent second barrier.
+// It is the SEMANTIC half of the fence and no longer the whole of it. The close
+// itself is now issued as a store-level compare-and-swap — CloseIfMatch against
+// the beads revision the gates were read at (beads.ConditionalWriter) — so the
+// mechanical question "did this bead change at all" is answered by the store,
+// atomically with the close. This compare answers the narrower question the
+// recovery actually reasons about ("is it still the same attempt"), it is what
+// runs on a store without the capability, and it is what produces a legible
+// diagnostic instead of a revision mismatch.
+//
+// Both run inside sessionpkg.WithSessionBeadStartLock, which every start-lane
+// write that can move this fingerprint — the pre-wake mint, the start commit,
+// the in-flight lease clear — also takes. The lock keeps the start lane out of
+// the window entirely; the revision fence catches everyone else.
 func samePendingCreateAttempt(a, b sessionpkg.Info) bool {
 	return a.ID == b.ID && pendingCreateAttemptFingerprint(a) == pendingCreateAttemptFingerprint(b)
 }
 
 // clearNamedNameReleaseConfirmation breaks the confirmation chain after a tick
 // that did NOT confirm the holder is stopped — the runtime looked alive, or the
-// probe could not tell. Both must reset the sequence: "N consecutive
-// confirmations" is the whole point, and a probe that flickers
+// probe could not attest that it looked at all. Both must reset the sequence:
+// "N consecutive confirmations" is the whole point, and a probe that flickers
 // stopped/alive/stopped is precisely the transient-degradation signature the
-// window exists to reject.
+// window exists to reject. An UNKNOWN tick resets rather than merely holding,
+// which is the stricter of the two safe options: a fetch subsystem that is
+// wobbling in and out (the ga-03ixvj / ga-0ecw5 tmux failure mode) can then
+// never assemble a chain out of the good moments between its bad ones.
 //
 // This is an explicit reset rather than letting namedNameReleaseProbeMaxGap
 // expire, because that gap is deliberately wide (see its comment) — wide enough
@@ -340,11 +466,12 @@ type namedNameReleaseConfirmation struct {
 // "the holder is dead" confirmation sequence for holder, persisting its state
 // on the holder bead, and reports whether the sequence is now complete.
 //
-// The caller must already have observed the runtime as stopped THIS tick; this
-// function owns only the counting. A tick that observed the runtime as alive or
-// unobservable resets the sequence through clearNamedNameReleaseConfirmation
-// instead, and a tick that never reaches either (the create stopped being
-// attempted, the controller restarted) lapses via namedNameReleaseProbeMaxGap.
+// The caller must already have taken an ATTESTED stopped observation this tick
+// (namedSessionLivenessObservation.ConfirmsStopped); this function owns only the
+// counting. A tick that saw the runtime alive, or whose probe could not attest
+// itself, resets the sequence through clearNamedNameReleaseConfirmation instead,
+// and a tick that never reaches either (the create stopped being attempted, the
+// controller restarted) lapses via namedNameReleaseProbeMaxGap.
 //
 // Completion requires BOTH namedNameReleaseConfirmTicks observations AND
 // namedNameReleaseConfirmWindow of wall clock between the first and the current
@@ -443,7 +570,15 @@ func recordNamedNameReleaseConfirmation(
 // so nothing ran that could have claimed work as that bead ID; the reconciler's
 // orphan-release pass remains the idempotent fallback. Noted as residual risk
 // rather than hidden.
-func closeDeadNamedSessionNameHolder(sessFront *sessionpkg.Store, holder sessionpkg.Info, now time.Time, stderr io.Writer) bool {
+// expectedRevision is the beads revision the caller's gates were evaluated
+// against. When the store implements beads.ConditionalWriter the close is issued
+// as CloseIfMatch against it — a genuine store-level compare-and-swap: ANY
+// user-visible mutation of the bead since that read (not just a pending-create
+// fingerprint change) moves the revision and the close is refused. Pass 0 to
+// skip the fence; a store without the capability falls back to the Tx form,
+// where the caller's fingerprint compare and the per-bead start lock are the
+// only fence.
+func closeDeadNamedSessionNameHolder(sessFront *sessionpkg.Store, holder sessionpkg.Info, expectedRevision int64, now time.Time, stderr io.Writer) bool {
 	if sessFront == nil || strings.TrimSpace(holder.ID) == "" {
 		return false
 	}
@@ -466,6 +601,36 @@ func closeDeadNamedSessionNameHolder(sessFront *sessionpkg.Store, holder session
 	for _, key := range namedNameReleaseProbeKeys() {
 		patch[key] = ""
 	}
+	if writer, ok := beads.ConditionalWriterFor(store.Store); ok && expectedRevision > 0 {
+		switch closed, err := closeNamedSessionNameHolderIfCurrent(writer, holder.ID, expectedRevision, stderr); {
+		case err == nil && closed:
+			// Closed under the fence. The clears follow the close here rather
+			// than preceding it, which inverts the Tx form's ordering on
+			// purpose: the fence can only be evaluated by the close itself, and
+			// of the two partial-failure shapes this is the recoverable one. A
+			// failed clear leaves a CLOSED bead still carrying its claim — the
+			// name is released (that is the repair), the next tick reopens the
+			// bead, the collision recurs and this recovery runs again. The
+			// opposite order fails to an OPEN bead whose claim is gone, which
+			// staleNamedPendingCreateInfo will never look at again: a permanent
+			// wedge.
+			if err := store.SetMetadataBatch(holder.ID, map[string]string(patch)); err != nil {
+				fmt.Fprintf(stderr, "session beads: clearing the released claim on %s after a fenced close: %v\n", holder.ID, err) //nolint:errcheck
+			}
+			cancelStateAssignedToRetiredSessionBead(store.Store, holder.ID, now, stderr)
+			return true
+		case err == nil && !closed:
+			// The fence rejected it: the bead moved under us. Diagnosed inside
+			// the helper; leave it alone.
+			return false
+		default:
+			// The store advertised the capability but could not use it (an
+			// unsupported backing behind a caching wrapper is the documented
+			// case). Fall through to the Tx form rather than skipping the
+			// repair — the caller still holds the per-bead start lock and has
+			// already compared the attempt fingerprint.
+		}
+	}
 	// The metadata batch is ordered before the Close so that on a store whose
 	// Tx is not atomic the claim clears still land if the Close then fails —
 	// a stale claim on a still-open bead would ping-pong the reconciler. The
@@ -487,12 +652,56 @@ func closeDeadNamedSessionNameHolder(sessFront *sessionpkg.Store, holder session
 	return true
 }
 
+// closeNamedSessionNameHolderIfCurrent issues the fenced close and classifies
+// the three outcomes the caller must tell apart:
+//
+//	(true,  nil) — closed; the bead had not moved since expectedRevision.
+//	(false, nil) — the fence REJECTED it (beads.PreconditionFailedError). The
+//	               bead changed under us; do not close it by another route.
+//	(false, err) — the capability is not actually usable (or the store failed).
+//	               The caller may fall back to the unfenced Tx form.
+//
+// The rejection is the interesting one, and it is strictly stronger than the
+// pending-create fingerprint compare: the fingerprint only notices the fields
+// this recovery reasons about, while the revision notices every user-visible
+// write. A release refused here is retried from scratch on the next collision
+// tick, so a spurious rejection (an unrelated metadata write landing in the same
+// instant) costs one tick and never costs safety.
+func closeNamedSessionNameHolderIfCurrent(writer beads.ConditionalWriter, holderID string, expectedRevision int64, stderr io.Writer) (bool, error) {
+	err := writer.CloseIfMatch(holderID, expectedRevision)
+	if err == nil {
+		return true, nil
+	}
+	var precondition *beads.PreconditionFailedError
+	if errors.As(err, &precondition) {
+		_, _ = fmt.Fprintf(stderr,
+			"session beads: holder %s changed under us (revision fence: expected %d, current %d), leaving it alone\n",
+			holderID, precondition.Expected, precondition.Current)
+		return false, nil
+	}
+	if errors.Is(err, beads.ErrConditionalWriteUnsupported) {
+		return false, err
+	}
+	fmt.Fprintf(stderr, "session beads: fenced close of %s failed: %v\n", holderID, err) //nolint:errcheck
+	return false, err
+}
+
 // recoverStaleNamedSessionNameSquatter is the repair at the collision site.
 //
 // When a configured named session cannot be materialized because its
 // session_name is already taken, the conflict error names the holder — and the
-// holder ID is the ONE handle that resolves through a by-ID store read, the one
-// read tier a stale list cache cannot serve.
+// holder ID is the handle that reaches a bead the cached list has dropped, since
+// CachingStore.Get falls through to the backing store for an id ABSENT from its
+// map. (It does not outrank the cache for an id the cache HAS; see the file
+// header.)
+//
+// cityPath scopes the per-bead start lock the guarded update below takes. It is
+// passed straight through rather than via namedSessionStartLockPath because the
+// holder is a configured NAMED bead by construction here
+// (abandonedNamedSessionNameHolder), which is exactly the condition that helper
+// applies on the start-lane side — so both sides take the same lock file. Empty
+// (unit tests, cityPath-less callers) degrades the lock to its in-process layer,
+// which is still the layer this process's own start lane uses.
 //
 // Returns true when the name was released. The caller does NOT retry the create
 // in the same tick: the release is the repair, and re-driving the create inside
@@ -503,6 +712,7 @@ func recoverStaleNamedSessionNameSquatter(
 	cfg *config.City,
 	sp runtime.Provider,
 	nameErr error,
+	cityPath string,
 	sessionName string,
 	identity string,
 	clk clock.Clock,
@@ -535,9 +745,9 @@ func recoverStaleNamedSessionNameSquatter(
 	}
 
 	sessFront := sessionFrontDoor(store)
-	// By-ID reads: the one tier that cannot be served from a stale list. The
-	// raw bead carries the confirmation-window markers (session.Info projects a
-	// fixed field set and would drop them); the typed Info carries the fields
+	// By-ID reads: the tier that still resolves a bead the cached list dropped.
+	// The raw bead carries the confirmation-window markers (session.Info projects
+	// a fixed field set and would drop them); the typed Info carries the fields
 	// every shared predicate reads.
 	raw, err := store.Get(holderID)
 	if err != nil {
@@ -552,9 +762,21 @@ func recoverStaleNamedSessionNameSquatter(
 	if !abandonedNamedSessionNameHolder(holder, sessionName, identity, clk, startupTimeout) {
 		return false
 	}
-	if !namedSessionRuntimeConfirmedStopped(holder, cfg, sp) {
-		// Alive, or the probe could not tell. Either way this tick did not
-		// confirm anything, so the sequence restarts from zero.
+	if obs := observeNamedSessionLiveness(holder, cfg, sp); !obs.ConfirmsStopped() {
+		// Alive, or the probe could not attest that it looked. Either way this
+		// tick confirmed nothing, so the sequence restarts from zero.
+		//
+		// The unattested case gets its own diagnostic because it is an
+		// OPERATIONAL signal, not a benign one: the runtime provider cannot
+		// currently see anything, which on tmux means the fetch subsystem is
+		// wedged or the server is gone. Silently logging "awaiting confirmation"
+		// forever would hide a fleet-wide probe outage behind a per-session
+		// recovery message.
+		if !obs.Attested {
+			_, _ = fmt.Fprintf(stderr,
+				"session beads: session_name %q holder %s: runtime probe cannot attest a fresh reading, treating liveness as UNKNOWN and holding the name\n",
+				sessionName, holderID)
+		}
 		clearNamedNameReleaseConfirmation(sessFront, raw, stderr)
 		return false
 	}
@@ -568,33 +790,107 @@ func recoverStaleNamedSessionNameSquatter(
 		return false
 	}
 
-	// TOCTOU fence. The observations above were taken across ticks against
-	// possibly cached runtime state; an async start can commit between the last
-	// probe and this close, and closeBead re-checks only Status=="closed". So
-	// re-read the holder BY ID and re-evaluate EVERY gate — including the
-	// pending-create fence and a fresh liveness probe — immediately before
-	// committing.
-	fresh, err := sessFront.Get(holderID)
-	if err != nil {
-		fmt.Fprintf(stderr, "session beads: re-reading session_name %q holder %s before release: %v\n", sessionName, holderID, err) //nolint:errcheck
-		return false
-	}
-	if !samePendingCreateAttempt(holder, fresh) {
-		fmt.Fprintf(stderr, "session beads: session_name %q holder %s changed under us, leaving it alone\n", sessionName, holderID) //nolint:errcheck
-		return false
-	}
-	if !abandonedNamedSessionNameHolder(fresh, sessionName, identity, clk, startupTimeout) {
-		return false
-	}
-	if !namedSessionRuntimeConfirmedStopped(fresh, cfg, sp) {
-		return false
-	}
-
-	if !closeDeadNamedSessionNameHolder(sessFront, fresh, now, stderr) {
+	if !releaseDeadNamedSessionNameHolder(sessFront, cfg, sp, holder, cityPath, sessionName, identity, clk, startupTimeout, now, stderr) {
 		return false
 	}
 	fmt.Fprintf(stderr,
 		"session beads: released session_name %q from abandoned pending-create bead %s (%s): lease expired and no runtime on %d consecutive ticks over %s\n",
 		sessionName, holderID, identity, confirmation.Count, confirmation.Elapsed.Round(time.Second)) //nolint:errcheck
 	return true
+}
+
+// releaseDeadNamedSessionNameHolder is the guarded update: re-read the holder,
+// re-evaluate EVERY gate against that read, and close — all inside the per-bead
+// start lock, so the comparison cannot be invalidated between the compare and
+// the write by any writer that takes the same lock.
+//
+// It replaces what was a compare-then-write. The compare alone was not a fence:
+// the real start-commit path (CommitStartedPatch / ClearPendingCreateClaim in
+// commitStartResult) writes through sessFront.ApplyPatch and used to hold no
+// lock at all, so it could land after the re-read, after the compare, after the
+// liveness re-check, or in the middle of the close. Two mechanisms replace it:
+//
+//   - a store-level CAS. The close is issued as CloseIfMatch against the beads
+//     revision this function read the bead at (beads.ConditionalWriter, via
+//     closeDeadNamedSessionNameHolder). The store refuses it if ANY user-visible
+//     write touched the bead in between — which is a superset of the
+//     fingerprint, and is evaluated atomically with the close rather than before
+//     it.
+//   - the per-bead start lock, which the pre-wake mint, the start commit and the
+//     in-flight-lease clear all take now. The CAS would DETECT those writers;
+//     the lock keeps them out of the window, so the common case is a clean
+//     release instead of a rejected one retried next tick.
+//
+// What that closes, and what it does not:
+//
+//   - CLOSED against any writer, on a store that implements
+//     beads.ConditionalWriter — CachingStore (the controller's own store),
+//     BdStore, MemStore and FileStore all do. The close cannot land on a bead
+//     that moved after the gates read it.
+//   - DEGRADED to lock + fingerprint compare on a store without the capability
+//     (a caching wrapper over an unsupported backing returns
+//     ErrConditionalWriteUnsupported). There the start lane is still excluded by
+//     the lock, and every other writer is only DETECTED, with a window between
+//     the re-read and the Tx.
+//   - NOT a guarantee that the re-read is current. It is a by-ID read through
+//     the same CachingStore, so a commit made by ANOTHER process that this cache
+//     has not absorbed is invisible to it — though the revision fence is
+//     evaluated by the BACKING store, so such a write still rejects the close.
+//     The liveness gate covers what remains: a session that really started has a
+//     runtime.
+func releaseDeadNamedSessionNameHolder(
+	sessFront *sessionpkg.Store,
+	cfg *config.City,
+	sp runtime.Provider,
+	holder sessionpkg.Info,
+	cityPath string,
+	sessionName string,
+	identity string,
+	clk clock.Clock,
+	startupTimeout time.Duration,
+	now time.Time,
+	stderr io.Writer,
+) bool {
+	holderID := holder.ID
+	released := false
+	lockErr := sessionpkg.WithSessionBeadStartLock(cityPath, holderID, func() error {
+		// The observations above were taken across ticks against runtime state
+		// that may have moved since; an in-flight start can have committed. Every
+		// gate is re-evaluated here against a read taken INSIDE the lock.
+		//
+		// The RAW read comes FIRST and its revision is what the close is fenced
+		// on. The order is load-bearing: a write landing between the two reads
+		// then makes the typed projection NEWER than the fenced revision, so the
+		// close is refused. Reading the revision second would fence on a
+		// revision newer than the state the gates judged — a fence that passes
+		// precisely when it should fail.
+		freshRaw, err := sessFront.Store().Get(holderID)
+		if err != nil {
+			fmt.Fprintf(stderr, "session beads: re-reading session_name %q holder %s before release: %v\n", sessionName, holderID, err) //nolint:errcheck
+			return nil
+		}
+		fresh, err := sessFront.Get(holderID)
+		if err != nil {
+			fmt.Fprintf(stderr, "session beads: re-reading session_name %q holder %s before release: %v\n", sessionName, holderID, err) //nolint:errcheck
+			return nil
+		}
+		if !samePendingCreateAttempt(holder, fresh) {
+			fmt.Fprintf(stderr, "session beads: session_name %q holder %s changed under us, leaving it alone\n", sessionName, holderID) //nolint:errcheck
+			return nil
+		}
+		if !abandonedNamedSessionNameHolder(fresh, sessionName, identity, clk, startupTimeout) {
+			return nil
+		}
+		if !observeNamedSessionLiveness(fresh, cfg, sp).ConfirmsStopped() {
+			return nil
+		}
+		released = closeDeadNamedSessionNameHolder(sessFront, fresh, freshRaw.Revision, now, stderr)
+		return nil
+	})
+	if lockErr != nil {
+		// Fail CLOSED: without the lock the close would be an unguarded write.
+		fmt.Fprintf(stderr, "session beads: locking session_name %q holder %s for release: %v\n", sessionName, holderID, lockErr) //nolint:errcheck
+		return false
+	}
+	return released
 }

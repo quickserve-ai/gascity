@@ -372,6 +372,22 @@ func (f *Fake) ProcessAlive(name string, processNames []string) bool {
 	return !f.Zombies[name]
 }
 
+// AttestLiveness implements [LivenessAttester]. The fake's session map IS the
+// truth it is simulating — there is no cache to go stale and no fetch to fail —
+// so a healthy fake attests every observation as fresh.
+//
+// A BROKEN fake is the opposite: it reports every session not-running because
+// its probe "failed", which is precisely the degraded reading that must never be
+// read as a confirmed stop. It attests Fresh=false, so callers that fail closed
+// on an unattested probe see the failure instead of a fleet of dead sessions.
+func (f *Fake) AttestLiveness(name string, processNames []string) AttestedLiveness {
+	obs := ObserveLiveness(f, name, processNames)
+	f.mu.Lock()
+	broken := f.broken
+	f.mu.Unlock()
+	return AttestedLiveness{Liveness: obs, Fresh: !broken}
+}
+
 // Nudge records the call and returns nil (or an error if broken).
 func (f *Fake) Nudge(name string, content []ContentBlock) error {
 	f.mu.Lock()
