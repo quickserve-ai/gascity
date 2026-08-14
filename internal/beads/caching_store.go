@@ -73,7 +73,10 @@ type CachingStore struct {
 	// tests, every CLI-path store) publishes nothing and behaves exactly as
 	// before. Guarded by lifecycleMu alongside reconcilerArmedAt.
 	heartbeatSink func(ReconcileHeartbeat)
-	// reconcilerArmedAt records when StartReconciler armed this store's
+	// reconcilerArmedAt starts the watchdog's never-reconciled clock. First
+	// stamped by SetReconcileHeartbeatSink at install time (so a store whose
+	// reconciler never starts still goes visibly stale), then re-stamped by
+	// StartReconciler when it actually arms this store's
 	// loop. It is the floor of the heartbeat staleness clock, so a store
 	// that has been armed but has not yet completed its first cycle is
 	// judged against its arm time rather than looking infinitely stale.
@@ -1117,11 +1120,14 @@ func (c *CachingStore) StartReconciler(ctx context.Context, stagger StaggerOptio
 	c.mu.Unlock()
 
 	log.Printf("beads cache: stagger=%dms agent=%s", offset.Milliseconds(), agentID)
-	// Publish the arm stamp BEFORE the loop starts. Without it, a store whose
-	// reconciler is armed but never completes a cycle would publish nothing at
-	// all, and "no record" is deliberately read as unknown/quiet — the exact
-	// shape the watchdog must catch would be the shape it ignores.
-	c.publishReconcileHeartbeat()
+	// No heartbeat publish here — the arm stamp is published synchronously by
+	// SetReconcileHeartbeatSink at install time. StartReconciler frequently
+	// runs on a goroutine the caller never waits on (primeThenStartReconciler),
+	// and a publish from here races external teardown of the city root:
+	// WriteReconcileHeartbeat MkdirAll's its directory, so a late publish
+	// re-creates <city>/.gc/runtime/beads-cache mid-RemoveAll (the
+	// controllerState TempDir-cleanup failures, 21+/40 runs). The re-stamp of
+	// reconcilerArmedAt above still flows into every loop publish.
 
 	go func() {
 		defer c.lifecycleWG.Done()
@@ -1130,8 +1136,18 @@ func (c *CachingStore) StartReconciler(ctx context.Context, stagger StaggerOptio
 }
 
 // SetReconcileHeartbeatSink installs the durable liveness publisher for this
-// store. Call it BEFORE StartReconciler so the arm stamp is published; a nil
-// sink (the default) disables publishing entirely.
+// store and, for a non-nil sink, synchronously publishes the arm stamp before
+// returning. A nil sink (the default) disables publishing entirely.
+//
+// Publishing here rather than in StartReconciler is deliberate, twice over.
+// Mechanically: install runs synchronously in the store constructor, so the
+// arm write is sequenced before any caller teardown, while StartReconciler is
+// typically reached on an unwaited goroutine whose late write races removal
+// of the city root (B1). Semantically: the watchdog clock starts the moment a
+// sink is installed — a store that installs a sink but whose reconciler NEVER
+// starts (the suspected ga-yc0chj shape: a rebuilt store with no reconciler
+// goroutine) now publishes an arm record that goes stale and alarms, instead
+// of publishing nothing and reading as unknown/quiet forever.
 //
 // The sink receives a fully populated ReconcileHeartbeat except for Scope,
 // which the caller owns — the store knows its bead prefix but not which city
@@ -1142,7 +1158,13 @@ func (c *CachingStore) SetReconcileHeartbeatSink(sink func(ReconcileHeartbeat)) 
 	}
 	c.lifecycleMu.Lock()
 	c.heartbeatSink = sink
+	if sink != nil && c.reconcilerArmedAt.IsZero() {
+		c.reconcilerArmedAt = time.Now()
+	}
 	c.lifecycleMu.Unlock()
+	if sink != nil {
+		c.publishReconcileHeartbeat()
+	}
 }
 
 // publishReconcileHeartbeat hands the current liveness snapshot to the sink.
