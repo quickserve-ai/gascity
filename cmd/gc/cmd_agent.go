@@ -217,6 +217,18 @@ func shouldEmitLoadCityConfigWarning(warning string) bool {
 	if config.IsLegacyWorkspaceFieldWarning(warning) {
 		return false
 	}
+	// The always+fresh wake_mode advisory describes a standing configuration
+	// choice, not a condition of this invocation, so emitting it inline put
+	// four unconditional stderr lines above the output of EVERY gc command in
+	// every agent's context. That is worse than untidy: an agent read the
+	// banner, read gc hook's documented exit 1 for "no ready work", connected
+	// them, and filed a config-validation failure that did not exist
+	// (ga-3upjic). It stays a warning and stays fully visible on the surfaces
+	// built to review configuration — gc config show and gc start print
+	// prov.Warnings unfiltered — but no longer decorates unrelated commands.
+	if config.IsAlwaysFreshWakeModeWarning(warning) {
+		return false
+	}
 	if strings.Contains(warning, "both [agent_defaults] and [agents] are present") {
 		return true
 	}
