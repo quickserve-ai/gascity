@@ -97,6 +97,43 @@ func TestBeadsCacheReconcileCheckFiresWhenArmedButNeverReconciled(t *testing.T) 
 	if !strings.Contains(got.Message, "NEVER completed a reconcile") {
 		t.Errorf("Message = %q, want it to distinguish never-reconciled from went-stale", got.Message)
 	}
+	// The never-reconciled shape IS the first-reconcile starvation defect, and
+	// a restart provably does not clear it: on the incident fleet the 17:33:04
+	// restart was followed by 75 more minutes of silence before the first scan
+	// landed. A hint that prescribes a restart spends every live agent session
+	// to reproduce the fault, so it must not appear on this shape.
+	lower := strings.ToLower(got.FixHint)
+	if !strings.Contains(lower, "do not restart") {
+		t.Errorf("FixHint = %q, want it to warn against restarting on the never-reconciled shape", got.FixHint)
+	}
+	if strings.Contains(lower, "must be restarted") {
+		t.Errorf("FixHint = %q, want no restart prescription on the never-reconciled shape", got.FixHint)
+	}
+}
+
+// TestBeadsCacheReconcileCheckWentStaleHintIsNotTheStarvationHint pins that the
+// two stall shapes get their own operator advice. A scope that reconciled
+// normally and then stopped is a wedged scan or a failing backing store, not
+// the starvation defect, so it must not be handed the starvation explanation.
+func TestBeadsCacheReconcileCheckWentStaleHintIsNotTheStarvationHint(t *testing.T) {
+	hb := healthyHeartbeat()
+	hb.LastReconcileAt = heartbeatNow.Add(-2 * time.Hour)
+
+	c := newTestBeadsCacheReconcileCheck(map[string]beads.ReconcileHeartbeat{"city": hb}, "city")
+
+	got := c.Run(&CheckContext{})
+	if got.Status != StatusError {
+		t.Fatalf("Status = %v, want StatusError; message = %q", got.Status, got.Message)
+	}
+	if strings.Contains(got.Message, "NEVER completed") {
+		t.Fatalf("Message = %q, want the went-stale label", got.Message)
+	}
+	if strings.Contains(got.FixHint, "starvation") {
+		t.Errorf("FixHint = %q, want the went-stale advice, not the starvation explanation", got.FixHint)
+	}
+	if !strings.Contains(got.FixHint, "backoff") {
+		t.Errorf("FixHint = %q, want it to name sync-failure backoff as a cause a restart cannot fix", got.FixHint)
+	}
 }
 
 // TestBeadsCacheReconcileCheckQuietOnHealthyCache is the accept case. A watch
@@ -132,6 +169,29 @@ func TestBeadsCacheReconcileCheckQuietOnHealthyCache(t *testing.T) {
 	}
 	if !strings.Contains(got.Message, "3 beads cache(s)") {
 		t.Errorf("Message = %q, want it to report all 3 watched scopes as evaluated", got.Message)
+	}
+	if strings.Contains(got.Message, "NOT evaluated") {
+		t.Errorf("Message = %q, want no not-evaluated tail when every scope produced a verdict", got.Message)
+	}
+}
+
+// TestBeadsCacheReconcileCheckCountsUnevaluatedScopes is the partial-coverage
+// guard. An expected scope that publishes nothing (legacy shared-file rigs do
+// so permanently, and any scope whose store failed to open does so silently)
+// is invisible to this check. Reporting only the healthy count would render
+// "1 beads cache reconciling ✓" while a second expected cache sat unwatched —
+// a green tick over the exact blind spot the check exists to remove.
+func TestBeadsCacheReconcileCheckCountsUnevaluatedScopes(t *testing.T) {
+	c := newTestBeadsCacheReconcileCheck(
+		map[string]beads.ReconcileHeartbeat{"city": healthyHeartbeat()},
+		"city", "legacy-shared-rig")
+
+	got := c.Run(&CheckContext{})
+	if got.Status != StatusOK {
+		t.Fatalf("Status = %v, want StatusOK; message = %q", got.Status, got.Message)
+	}
+	if !strings.Contains(got.Message, "1 expected scope(s) NOT evaluated") {
+		t.Errorf("Message = %q, want the unevaluated scope counted in the headline, not buried in Details", got.Message)
 	}
 }
 
@@ -217,8 +277,14 @@ func TestBeadsCacheReconcileCheckQuietOnUnknownData(t *testing.T) {
 			if got.Status != StatusOK {
 				t.Fatalf("Status = %v, want StatusOK (fail quiet); message = %q", got.Status, got.Message)
 			}
-			if !strings.Contains(got.Message, "nothing to watch") {
+			if !strings.Contains(got.Message, "WATCH INACTIVE") {
 				t.Errorf("Message = %q, want the not-evaluated message", got.Message)
+			}
+			// The tick must not read as a clean bill of health: with the
+			// controller running and nothing published, the watch is off, and
+			// a message that says "healthy" is how a broken watch survives.
+			if strings.Contains(strings.ToLower(got.Message), "reconciling within") {
+				t.Errorf("Message = %q, want it NOT to claim the caches are reconciling", got.Message)
 			}
 		})
 	}
