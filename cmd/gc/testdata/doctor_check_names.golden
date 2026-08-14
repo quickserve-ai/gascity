@@ -54,6 +54,7 @@ lsof-binary
 beads-role
 controller
 supervisor-http-api
+beads-cache-reconcile
 agent-sessions
 zombie-sessions
 orphan-sessions
