@@ -66,6 +66,7 @@ type AwakeSessionBead struct {
 	ExplicitWake              bool      // explicit durable wake request is pending
 	DependencyOnly            bool      // only wakeable via dependency gate
 	NamedIdentity             string    // non-empty for named session beads
+	Alias                     string    // "alias" metadata: the canonical assignee form for pool workers
 	ConfiguredNamedSession    bool      // configured_named_session metadata is true
 	Pinned                    bool      // pin_awake durable wake reason
 	Drained                   bool      // state=="drained" or sleep_reason=="drained"
@@ -768,6 +769,14 @@ func sessionAssigneeMatches(named []AwakeNamedSession, bead AwakeSessionBead, as
 		return false
 	}
 	if assignee == bead.ID || assignee == bead.SessionName {
+		return true
+	}
+	// A pool worker's alias IS its canonical assignee: bdAssigneeIndex
+	// (bd_assignee_canonicalize.go) rewrites the bead-ID and session-name forms
+	// INTO the alias, so every bead a polecat claims carries the alias. Without
+	// this arm a worker mid-claim shows no assigned-work demand, drops out of
+	// the desired set, and is drained as "orphaned" seconds into real work.
+	if bead.Alias != "" && assignee == bead.Alias {
 		return true
 	}
 	if bead.NamedIdentity != "" {
