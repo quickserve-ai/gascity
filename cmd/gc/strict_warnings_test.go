@@ -6,18 +6,30 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 )
 
-// TestAlwaysFreshWakeModeWarningIsNonFatalAndEmitted proves the always+fresh
-// advisory behaves like a warning on both downstream re-classifiers of config
-// warnings: strict mode — on by default for `gc start` — keeps it NON-FATAL,
-// and the agent warning-emit path SURFACES it. The bundled gastown pack trips
-// this warning, so without the config.IsAlwaysFreshWakeModeWarning wiring
-// `gc start --foreground` / `--controller` / `--dry-run` exits 1 on the shipped
-// example city, and `gc agent` drops the advisory silently.
+// TestAlwaysFreshWakeModeWarningIsNonFatalAndNotEmittedInline proves the
+// always+fresh advisory behaves like a warning on both downstream
+// re-classifiers of config warnings: strict mode — on by default for
+// `gc start` — keeps it NON-FATAL, and the ambient per-command warning-emit
+// path does NOT decorate unrelated commands with it. The bundled gastown pack
+// trips this warning, so without the config.IsAlwaysFreshWakeModeWarning
+// wiring `gc start --foreground` / `--controller` / `--dry-run` exits 1 on the
+// shipped example city.
+//
+// The emit half of this test previously asserted the opposite — that
+// emitLoadCityConfigWarnings surfaces it — on the reasoning that a dropped
+// advisory is worse than a noisy one. Practice inverted that (ga-3upjic): the
+// advisory is a standing property of the config, not of any one invocation, so
+// inline emission put four unconditional stderr lines above the output of every
+// gc command in every agent's context, and an agent misread that banner as the
+// cause of gc hook's documented empty exit 1 and filed a config failure that did
+// not exist. Suppressed here, still surfaced where configuration is reviewed:
+// `gc config show` and `gc start` print prov.Warnings unfiltered, which is why
+// this test still requires the validator to produce it.
 //
 // The warning text is derived from config.ValidateNamedSessions rather than
 // hardcoded so this test cannot pass against a string the validator no longer
 // emits.
-func TestAlwaysFreshWakeModeWarningIsNonFatalAndEmitted(t *testing.T) {
+func TestAlwaysFreshWakeModeWarningIsNonFatalAndNotEmittedInline(t *testing.T) {
 	warnings, err := config.ValidateNamedSessions(&config.City{
 		Workspace: config.Workspace{Name: "test-city"},
 		Agents:    []config.Agent{{Name: "watchdog", WakeMode: "fresh"}},
@@ -41,8 +53,14 @@ func TestAlwaysFreshWakeModeWarningIsNonFatalAndEmitted(t *testing.T) {
 	if len(fatal) != 0 || len(nonFatal) != 1 {
 		t.Errorf("strict split: fatal=%v nonFatal=%v, want the always+fresh warning non-fatal", fatal, nonFatal)
 	}
-	if !shouldEmitLoadCityConfigWarning(w) {
-		t.Error("an always+fresh warning must be emitted to the operator, not swallowed")
+	if shouldEmitLoadCityConfigWarning(w) {
+		t.Error("the always+fresh advisory must not be emitted inline on every gc command (ga-3upjic)")
+	}
+	// Suppressing it inline is only safe because it survives in prov.Warnings,
+	// which gc config show and gc start print unfiltered. The assertions above
+	// pin that: ValidateNamedSessions still produces exactly this warning.
+	if len(warnings) != 1 || !config.IsAlwaysFreshWakeModeWarning(warnings[0]) {
+		t.Fatalf("warnings = %v, want the advisory retained for config-review surfaces", warnings)
 	}
 }
 
