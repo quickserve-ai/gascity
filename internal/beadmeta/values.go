@@ -1,5 +1,7 @@
 package beadmeta
 
+import "strings"
+
 // Value vocabulary for engine-minted structural metadata keys. These are DATA
 // declarations only: which kinds a dispatcher accepts, which kinds trigger the
 // graph contract, and what an outcome means remain decisions owned by the
@@ -89,6 +91,26 @@ const (
 	FailureClassTransient = "transient"
 	FailureClassHard      = "hard"
 )
+
+// IsRecognizedFailureClass reports whether a gc.failure_class value is in the
+// canonical vocabulary. The empty string is recognized: an unclassified failure
+// is a legitimate state that each dispatcher dispositions on its own terms.
+//
+// Nothing validates this field at WRITE time — it is stamped by prompt-following
+// agents as often as by code — so readers must assume out-of-vocabulary values
+// exist and must not let one take a more permissive branch than an explicit
+// class would. Measured on the 2026-08-12T00:55Z github-pr-fix pour: 8 of 8
+// non-empty gc.failure_class values were out-of-vocabulary, in four distinct
+// spellings of one condition ("missing-workflow-root-bead", "root_bead_missing",
+// "missing-root-bead", "missing_workflow_root"). See ga-033u0e.
+func IsRecognizedFailureClass(class string) bool {
+	switch strings.TrimSpace(class) {
+	case FailureClassTransient, FailureClassHard, "":
+		return true
+	default:
+		return false
+	}
+}
 
 // FormulaContractGraphV2 is the value of FormulaContractMetadataKey
 // ("gc.formula_contract") marking a workflow compiled under the graph.v2
