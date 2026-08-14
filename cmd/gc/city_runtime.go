@@ -2828,14 +2828,20 @@ func (cr *CityRuntime) waitForAsyncStops() bool {
 // poolSweepWouldDrain reports whether sweepUndesiredPoolSessionBeads would
 // close at least one running pool session this tick — i.e. an open pool session
 // bead is not present in desiredState. It mirrors the sweep's core candidate
-// filter (open, not desired, not a manual/named session); it intentionally
-// omits the sweep's transient create/post-create grace checks because an
+// filter (open, not desired, not a manual session, and — since ga-2otk73 — not
+// a named session UNLESS it carries an abandoned pending-create claim, the one
+// named shape the sweep can now close); it intentionally omits the sweep's
+// transient create/post-create grace checks and its runtime probe because an
 // over-inclusive answer only costs an extra identity probe, never a wrong hold.
+// The invariant that matters is the other direction: anything the sweep CAN
+// close must make this return true, or the managed-Dolt squatter probe is
+// skipped on a tick that destroys a bead.
 // Used to gate the managed-Dolt squatter probe to actual scale-down events.
 func poolSweepWouldDrain(sessionBeads *sessionBeadSnapshot, desiredState map[string]TemplateParams, cfg *config.City) bool {
 	if sessionBeads == nil || cfg == nil {
 		return false
 	}
+	startupTimeout := cfg.Session.StartupTimeoutDuration()
 	for _, info := range sessionBeads.OpenInfos() {
 		if info.Closed {
 			continue
@@ -2843,7 +2849,8 @@ func poolSweepWouldDrain(sessionBeads *sessionBeadSnapshot, desiredState map[str
 		if _, desired := desiredState[info.SessionNameMetadata]; desired {
 			continue
 		}
-		if isManualSessionInfo(info) || isNamedSessionInfo(info) {
+		if isManualSessionInfo(info) ||
+			(isNamedSessionInfo(info) && !staleNamedPendingCreateInfo(info, nil, startupTimeout)) {
 			continue
 		}
 		return true
@@ -2872,7 +2879,34 @@ func sweepUndesiredPoolSessionBeads(
 		if _, desired := desiredState[info.SessionNameMetadata]; desired {
 			continue
 		}
-		if isManualSessionInfo(info) || isNamedSessionInfo(info) {
+		// GAP 1 (ga-2otk73): the stale-create-lease escape below was
+		// UNREACHABLE for named sessions, because this guard bailed first and
+		// isNamedSessionInfo is simply ConfiguredNamedSession. That is
+		// backwards. A pool worker's session name is generated per attempt, so
+		// an abandoned half-create costs it one slot; a NAMED session's name is
+		// fixed by config, so an abandoned half-create holding that name is a
+		// permanent outage for that agent.
+		//
+		// Named sessions therefore get exactly ONE way through this sweep: the
+		// abandoned-pending-create shape (claim set, rollback state, lease
+		// EXPIRED under the reconciler's own predicate). Everything else about
+		// a named session — asleep, suspended, quarantined, idle, mid-start —
+		// still bails here. Manual sessions bail unconditionally.
+		namedStaleCreate := staleNamedPendingCreateInfo(info, nil, startupTimeout)
+		if isManualSessionInfo(info) || (isNamedSessionInfo(info) && !namedStaleCreate) {
+			continue
+		}
+		if namedStaleCreate {
+			// A named session leaves this loop only via the authoritative
+			// runtime probe. namedSessionRuntimeConfirmedStopped fails CLOSED
+			// (an unavailable provider reads as "cannot tell", not "stopped"),
+			// unlike the pool path below, which treats a probe error as
+			// sweepable. GCSweepSessionBeads then applies the live cross-store
+			// assigned-work guard, which also fails closed.
+			if !namedSessionRuntimeConfirmedStopped(info, cfg, sp) {
+				continue
+			}
+			candidates = append(candidates, info)
 			continue
 		}
 		// Don't sweep beads that the reconciler still considers "start
