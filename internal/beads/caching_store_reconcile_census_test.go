@@ -99,6 +99,14 @@ func TestMergeOracleFieldCoverage(t *testing.T) {
 		"lifecycleMu": true, "lifecycleWG": true, "cancelFn": true, "stopCh": true,
 		"stopped": true, "latencyWindow": true, "latencyDriverActive": true,
 		"applyEventBeforeCommitForTest": true,
+		// Reconcile-liveness publishing (ga-yc0chj). Both are lifecycle
+		// state, not merge state: they are written once at arm time under
+		// lifecycleMu and only READ by the merge path (via
+		// publishReconcileHeartbeat, after c.mu is released). The merge
+		// oracle compares end-state the merge PRODUCES; neither field is
+		// produced by it, and the snapshot they publish is assembled from
+		// stats fields the oracle already compares.
+		"heartbeatSink": true, "reconcilerArmedAt": true,
 	}
 	assertFieldsClassified(t, reflect.TypeOf(CachingStore{}), comparedStore, excludedStore)
 
