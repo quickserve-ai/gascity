@@ -19,6 +19,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/beadmeta"
 )
 
 // Verdict is the outcome of a pre-close PR check.
@@ -59,7 +61,7 @@ var prURLPattern = regexp.MustCompile(`^https?://github\.com/([^/]+)/([^/]+)/pul
 // metadataPRURLKeys are the bead metadata keys, in precedence order,
 // that may carry the PR URL. "pr_url" is what the qcore lanes write
 // today; "gc.pr_url" is the reserved beadmeta key.
-var metadataPRURLKeys = []string{"pr_url", "gc.pr_url"}
+var metadataPRURLKeys = []string{"pr_url", beadmeta.PRURLMetadataKey}
 
 // disableEnv turns the guard off entirely (emergency kill switch).
 const disableEnv = "GC_PR_CLOSE_GUARD"
