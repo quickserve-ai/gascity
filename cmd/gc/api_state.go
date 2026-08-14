@@ -293,7 +293,7 @@ func wrapWithCachingStore(ctx context.Context, store beads.Store, ep events.Prov
 	}
 	// Arm the durable liveness record before the reconciler goroutine starts,
 	// so StartReconciler's arm stamp is published rather than raced past.
-	installCacheHeartbeatSink(cs, cityPath, heartbeatScope)
+	installCacheHeartbeatSink(ctx, cs, cityPath, heartbeatScope)
 	// Full prime runs async — backfills remaining beads for List()
 	// callers (convergence reconcile, sweep, API handlers).
 	go primeThenStartReconciler(ctx, cs, os.Getenv("GC_AGENT"))
@@ -324,7 +324,18 @@ var primeArmBound = 5 * time.Minute
 // publisher. The sink is best-effort: a heartbeat that cannot be written is
 // logged at most once per store-and-error and never interferes with the
 // reconcile it was reporting on. An empty cityPath or scope disables it.
-func installCacheHeartbeatSink(cs *beads.CachingStore, cityPath, scope string) {
+//
+// ctx is the cache lifetime. The sink STOPS as soon as it is done, for two
+// reasons. Operationally, a torn-down store must not keep stamping a liveness
+// record: the record would still name a live supervisor pid while its
+// LastReconcileAt froze, and `gc doctor` would read the corpse as a stalled
+// cache. Mechanically, WriteReconcileHeartbeat MkdirAll's its directory on
+// every write, so a publisher that outlives its city root RE-CREATES
+// <city>/.gc/runtime/beads-cache after the tree is removed — which is exactly
+// how the controllerState tests lost their t.TempDir() cleanup
+// ("unlinkat .../.gc/runtime/beads-cache: directory not empty", 33 failures in
+// 40 runs of -run TestControllerState before this guard).
+func installCacheHeartbeatSink(ctx context.Context, cs *beads.CachingStore, cityPath, scope string) {
 	cityPath = strings.TrimSpace(cityPath)
 	scope = strings.TrimSpace(scope)
 	if cs == nil || cityPath == "" || scope == "" {
@@ -332,6 +343,9 @@ func installCacheHeartbeatSink(cs *beads.CachingStore, cityPath, scope string) {
 	}
 	var warnedOnce sync.Once
 	cs.SetReconcileHeartbeatSink(func(hb beads.ReconcileHeartbeat) {
+		if ctx != nil && ctx.Err() != nil {
+			return
+		}
 		hb.Scope = scope
 		if err := beads.WriteReconcileHeartbeat(cityPath, hb); err != nil {
 			warnedOnce.Do(func() {
@@ -438,7 +452,7 @@ func (cs *controllerState) buildStores(cfg *config.City) map[string]beads.Store 
 		}
 		store = cs.openRigStore(scopeProvider, rig.Name, scopeRoot, rig.EffectivePrefix(), cfg)
 		stores[rig.Name] = wrapWithCachingStore(cs.cacheCtx, store, cs.eventProv,
-			rigStoreBackgroundRefresh(suspState, rig), cs.cityPath, rig.Name)
+			rigStoreBackgroundRefresh(suspState, rig), cs.cityPath, cacheHeartbeatScopeForRig(rig.Name))
 	}
 	return stores
 }

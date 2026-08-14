@@ -39,6 +39,42 @@ func TestCacheHeartbeatWatchedScopesExcludesSuspendedRigs(t *testing.T) {
 	}
 }
 
+// TestCacheHeartbeatScopeForRigRefusesTheCityLabel is the aliasing guard.
+// "city" is NOT a reserved rig name — config.ValidateRigs reserves only the
+// [[orders.overrides]] wildcard — so a rig named "city" would publish its
+// reconcile heartbeat into the CITY store's record: one file, two live
+// reconcilers, last writer wins. A healthy rig would then keep that record
+// fresh while the city cache sat stalled, masking the exact ga-yc0chj shape
+// behind a green tick. Such a rig publishes nothing instead.
+func TestCacheHeartbeatScopeForRigRefusesTheCityLabel(t *testing.T) {
+	if got := cacheHeartbeatScopeForRig(cacheHeartbeatCityScope); got != "" {
+		t.Errorf("cacheHeartbeatScopeForRig(%q) = %q, want \"\" — a rig must never alias the city record",
+			cacheHeartbeatCityScope, got)
+	}
+	if got := cacheHeartbeatScopeForRig("  "); got != "" {
+		t.Errorf("cacheHeartbeatScopeForRig(blank) = %q, want \"\"", got)
+	}
+	if got := cacheHeartbeatScopeForRig(" qcore "); got != "qcore" {
+		t.Errorf("cacheHeartbeatScopeForRig(\" qcore \") = %q, want \"qcore\"", got)
+	}
+}
+
+// TestCacheHeartbeatWatchedScopesDropsRigNamedCity pins the same guard at the
+// watch-list seam: the city scope must appear exactly once, never twice, so a
+// duplicated label cannot double-count a single record as two healthy caches.
+func TestCacheHeartbeatWatchedScopesDropsRigNamedCity(t *testing.T) {
+	cfg := &config.City{Rigs: []config.Rig{
+		{Name: "city", Path: filepath.Join(t.TempDir(), "city-rig")},
+		{Name: "qcore", Path: filepath.Join(t.TempDir(), "qcore")},
+	}}
+
+	got := cacheHeartbeatWatchedScopes(t.TempDir(), cfg)
+	want := []string{cacheHeartbeatCityScope, "qcore"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("watched scopes = %v, want %v (the rig named \"city\" must not alias the city record)", got, want)
+	}
+}
+
 // TestCacheHeartbeatWatchedScopesAlwaysIncludesCity pins that the city store —
 // the scope that actually stalled in ga-yc0chj — is watched even when the
 // config is unavailable.
