@@ -66,6 +66,7 @@ work-option-metadata-migration
 backlog-depth
 order-tracking-retention
 session-model
+session-create-wedge
 dolt-server
 fork-rate
 dolt-noms-size

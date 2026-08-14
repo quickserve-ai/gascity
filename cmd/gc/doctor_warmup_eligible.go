@@ -79,3 +79,8 @@ func (v2WorkspaceNameCheck) WarmupEligible() bool { return false }
 // WarmupEligible returns false; this check is not part of the
 // `gc start` warm-up scan.
 func (c *censusOwnerLivenessCheck) WarmupEligible() bool { return false }
+
+// WarmupEligible returns false; this check is not part of the
+// `gc start` warm-up scan. A wedged create is a steady-state failure of a
+// RUNNING city, not a boot precondition, so it belongs on `gc doctor`.
+func (c *sessionCreateWedgeCheck) WarmupEligible() bool { return false }
