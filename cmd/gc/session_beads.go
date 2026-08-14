@@ -989,6 +989,13 @@ func sessionAssignmentIdentifierRaw(sessionBead beads.Bead) []string {
 		strings.TrimSpace(sessionBead.ID),
 		strings.TrimSpace(sessionBead.Metadata["session_name"]),
 		strings.TrimSpace(sessionBead.Metadata[namedSessionIdentityMetadata]),
+		// The alias is the CANONICAL assignee: bdAssigneeIndex
+		// (bd_assignee_canonicalize.go) rewrites the bead-ID and session-name
+		// forms into it, so a pool worker's claimed beads carry only the alias.
+		// Omitting it here made sessionHasOpenAssignedWorkForConfig* blind to a
+		// live polecat's own work, and the live-session orphan branch drained
+		// the worker mid-claim (8+ spawn->claim->die loops, 2026-08-13).
+		strings.TrimSpace(sessionBead.Metadata["alias"]),
 	}
 }
 
@@ -1036,6 +1043,8 @@ func sessionAssignmentIdentifierRawInfo(info session.Info) []string {
 		strings.TrimSpace(info.ID),
 		strings.TrimSpace(info.SessionNameMetadata),
 		strings.TrimSpace(info.ConfiguredNamedIdentity),
+		// Mirrors the alias arm in sessionAssignmentIdentifierRaw; see there.
+		strings.TrimSpace(info.Alias),
 	}
 }
 
