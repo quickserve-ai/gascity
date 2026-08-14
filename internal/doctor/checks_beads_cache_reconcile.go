@@ -117,6 +117,14 @@ func (c *BeadsCacheReconcileCheck) Run(_ *CheckContext) *CheckResult {
 	var findings []string
 	var details []string
 	watched := 0
+	// skipped counts expected scopes that produced no verdict. It is reported
+	// alongside the healthy count because "2 caches reconciling" reads as a
+	// clean bill of health even when a third expected scope was never looked
+	// at — and an unwatched scope is precisely the state this check exists to
+	// make visible. Legacy shared-file rigs publish no record by design and
+	// land here permanently.
+	skipped := 0
+	anyNeverReconciled := false
 	for _, scope := range c.scopes {
 		scope = strings.TrimSpace(scope)
 		if scope == "" {
@@ -124,21 +132,25 @@ func (c *BeadsCacheReconcileCheck) Run(_ *CheckContext) *CheckResult {
 		}
 		hb, ok, err := c.readHeartbeat(c.cityPath, scope)
 		if err != nil || !ok {
+			skipped++
 			details = append(details, fmt.Sprintf("%s: no usable heartbeat record — not evaluated", scope))
 			continue
 		}
 		if !c.processAlive(hb.PID) {
+			skipped++
 			details = append(details, fmt.Sprintf("%s: heartbeat was written by pid %d, which is gone — not evaluated", scope, hb.PID))
 			continue
 		}
 		verdict := evaluateReconcileHeartbeat(scope, hb, now, c.staleFactor, c.staleFloor)
 		if !verdict.evaluated {
+			skipped++
 			details = append(details, fmt.Sprintf("%s: %s — not evaluated", scope, verdict.detail))
 			continue
 		}
 		watched++
 		if verdict.stale {
 			findings = append(findings, verdict.detail)
+			anyNeverReconciled = anyNeverReconciled || verdict.neverReconciled
 			continue
 		}
 		details = append(details, fmt.Sprintf("%s: %s", scope, verdict.detail))
@@ -147,9 +159,19 @@ func (c *BeadsCacheReconcileCheck) Run(_ *CheckContext) *CheckResult {
 	if len(findings) == 0 {
 		r.Status = StatusOK
 		if watched == 0 {
-			r.Message = "no beads cache is publishing a reconcile heartbeat — nothing to watch"
+			// The controller IS running and not one expected scope published a
+			// record. That is not a clean bill of health, it is the watch being
+			// INACTIVE — a gc binary older than this check, a city path that
+			// does not match the controller's, or every store still priming.
+			// Keep the status quiet (an ambiguous input must never gate), but
+			// never let the tick read as "the reconcilers are fine".
+			r.Message = "WATCH INACTIVE — controller is running but no beads cache published a reconcile heartbeat; " +
+				"nothing was evaluated (this is not a healthy verdict)"
 		} else {
 			r.Message = fmt.Sprintf("%d beads cache(s) reconciling within %d x their adaptive interval", watched, c.staleFactor)
+			if skipped > 0 {
+				r.Message += fmt.Sprintf("; %d expected scope(s) NOT evaluated (see details)", skipped)
+			}
 		}
 		r.Details = details
 		return r
@@ -165,10 +187,41 @@ func (c *BeadsCacheReconcileCheck) Run(_ *CheckContext) *CheckResult {
 		"Cache-age signals do NOT catch this — LastFreshAt is bumped by every local write,",
 		"so X-GC-Cache-Age-S stays near zero while the reconciler is dead.",
 	)
-	r.FixHint = "confirm in ~/.gc/supervisor.log that 'beads cache: reconciled rig=<prefix>' " +
-		"stopped for the named scope; if it did, the controller is serving that scope from a " +
-		"frozen snapshot and must be restarted (gc supervisor restart) to re-arm its reconciler"
+	r.FixHint = reconcileStaleFixHint(anyNeverReconciled)
 	return r
+}
+
+// reconcileStaleFixHint returns the operator next step for a stalled scope.
+//
+// The two shapes need OPPOSITE advice, and getting it wrong is expensive on a
+// live fleet, so they are split:
+//
+//   - NEVER reconciled since arming is the first-reconcile starvation defect
+//     (ga-yc0chj): nextReconcileDelay anchors the first full scan on lastFreshAt
+//     while stats.LastReconcileAt is still zero, and ~30 write paths bump
+//     lastFreshAt, so a store whose write traffic is denser than its cadence
+//     never becomes due. Restarting re-arms straight back into the same window —
+//     on the incident fleet the 17:33:04 restart was followed by 75 more minutes
+//     of silence before the first scan landed. Recommending a restart here
+//     spends live agent sessions to reproduce the fault.
+//   - Went stale AFTER reconciling normally is a different fault: a wedged bd
+//     full scan, or a backing-store outage holding the loop in its
+//     sync-failure backoff (up to 10 minutes between attempts). Read the cache
+//     state and LastProblem before touching the controller.
+func reconcileStaleFixHint(neverReconciled bool) string {
+	const common = "cross-check ~/.gc/supervisor.log: 'beads cache: stagger=' marks the arm, " +
+		"'beads cache: reconciled rig=<prefix>' marks each completed scan (rate-limited to one per minute)"
+	if neverReconciled {
+		return common + ". The named scope has NEVER completed a scan since it armed: this is the " +
+			"first-reconcile starvation defect (ga-yc0chj), where local write traffic keeps pushing " +
+			"the first full scan out of reach. Do NOT restart the controller to clear it — a restart " +
+			"re-arms into the same starvation window and costs every live session for nothing. It " +
+			"self-clears on a write lull longer than the cadence, and is immune once one scan lands"
+	}
+	return common + ". The named scope reconciled normally and then stopped, so check the cache " +
+		"state and last problem first (a degraded state means the backing store is failing and the " +
+		"loop is in sync-failure backoff, which no restart fixes). A restart re-arms the reconciler " +
+		"only when the loop itself is wedged with a healthy backing store"
 }
 
 // reconcileHeartbeatVerdict is the pure classification of ONE heartbeat record.
@@ -177,7 +230,12 @@ func (c *BeadsCacheReconcileCheck) Run(_ *CheckContext) *CheckResult {
 type reconcileHeartbeatVerdict struct {
 	evaluated bool
 	stale     bool
-	detail    string
+	// neverReconciled reports that the scope has not completed a single
+	// reconcile since it armed, as opposed to having reconciled normally and
+	// then stopped. The two need opposite operator advice — see
+	// reconcileStaleFixHint.
+	neverReconciled bool
+	detail          string
 }
 
 // evaluateReconcileHeartbeat decides whether one scope's reconciler has missed
@@ -231,8 +289,9 @@ func evaluateReconcileHeartbeat(scope string, hb beads.ReconcileHeartbeat, now t
 		prefix = fmt.Sprintf(" (rig=%s)", p)
 	}
 	return reconcileHeartbeatVerdict{
-		evaluated: true,
-		stale:     true,
+		evaluated:       true,
+		stale:           true,
+		neverReconciled: neverReconciled,
 		detail: fmt.Sprintf("beads cache %s%s %s in %s — over %s (%d x its %s adaptive interval); cache state=%s",
 			scope, prefix, label, age.Round(time.Second), window.Round(time.Second), factor, interval, heartbeatState(hb)),
 	}
