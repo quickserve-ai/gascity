@@ -440,7 +440,19 @@ func classifyRetryAttempt(subject beads.Bead) retryEvalResult {
 		case beadmeta.FailureClassHard, "":
 			return retryEvalResult{Outcome: "hard", Reason: retryFailureReason(subject)}
 		default:
-			return retryEvalResult{Outcome: "transient", Reason: "unknown_failure_class"}
+			// Fail CLOSED on an out-of-vocabulary class. This used to return
+			// "transient", which handed an unrecognized value the MOST
+			// retry-eager disposition available — more permissive than either
+			// legal class, and more permissive than leaving the field empty.
+			// Because nothing validates gc.failure_class at write time, the
+			// values that land here are overwhelmingly hand-written agent
+			// strings for permanently unsatisfiable conditions (a deleted
+			// workflow root, a vanished worktree), so every scheduled retry was
+			// guaranteed to fail identically and re-stamp the same unknown
+			// class — burning the whole gc.max_attempts budget and emitting an
+			// escalation per attempt. Unknown now disposes like the empty
+			// class: hard. (ga-033u0e forensics, 2026-08-14.)
+			return retryEvalResult{Outcome: "hard", Reason: "unknown_failure_class"}
 		}
 	case beadmeta.OutcomeCanceled:
 		// A canceled attempt subject (its run was canceled via the API) is a
