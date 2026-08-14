@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -17,6 +18,13 @@ import (
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 )
+
+// fenceRevisionUnavailableOnce rate-limits the "store cannot supply a fence
+// revision" diagnostic to once per process: the condition is a property of the
+// deployed bd version, not of any one release attempt, and repeating it every
+// collision tick would drown the recovery's real per-tick diagnostics.
+var fenceRevisionUnavailableOnce sync.Once
+
 
 // ga-2otk73: a named session's session_name is FIXED by config. A pool worker
 // gets a freshly generated name per attempt, so an abandoned half-created bead
@@ -194,6 +202,13 @@ const (
 	namedNameReleaseProbeCountKey   = "name_release_probe_count"
 	namedNameReleaseProbeFirstAtKey = "name_release_probe_first_at"
 	namedNameReleaseProbeLastAtKey  = "name_release_probe_last_at"
+	// namedNameReleaseProbeUnattestedKey marks that the holder's last probe
+	// could not attest a fresh reading. It exists solely to make the
+	// UNKNOWN-liveness diagnostic transition-based — logged when the probe
+	// DEGRADES, silent while it stays degraded — instead of one line per
+	// reconcile tick per wedged name for the whole outage. Cleared whenever
+	// the probe attests again (either verdict) and on release.
+	namedNameReleaseProbeUnattestedKey = "name_release_probe_unattested"
 )
 
 func namedNameReleaseProbeKeys() []string {
@@ -202,6 +217,7 @@ func namedNameReleaseProbeKeys() []string {
 		namedNameReleaseProbeCountKey,
 		namedNameReleaseProbeFirstAtKey,
 		namedNameReleaseProbeLastAtKey,
+		namedNameReleaseProbeUnattestedKey,
 	}
 }
 
@@ -237,14 +253,20 @@ func staleNamedPendingCreateInfo(info sessionpkg.Info, clk clock.Clock, startupT
 	// close clears sleep_intent, so the successor comes back AWAKE — a
 	// deliberately-sleeping, user-held session would be force-restarted.
 	//
-	// It costs the incident's own repair nothing (that bead was
-	// state=start-pending), but it is not free in general: an asleep holder that
-	// is ALSO invisible to the controller's list tier keeps wedging its name,
-	// with no automatic repair — the pre-ga-2otk73 status quo for that one shape.
-	// That is the accepted price. The alternative is closing a session a user
-	// deliberately put to sleep on evidence ("no runtime") that can never
-	// distinguish it from a dead one.
-	if sessionpkg.State(strings.TrimSpace(info.MetadataState)) == sessionpkg.StateAsleep {
+	// The discriminator is INTENT, not the asleep state itself: heal rewrites
+	// creating -> asleep while a never-started pending-create lease is still
+	// live (session_reconcile.go, pendingCreateAttemptStaleInfo), so keying on
+	// state alone would make the heal-produced variant of the ga-2otk73 shape
+	// permanently unrepairable by BOTH paths (the sweep already refuses named
+	// beads). A deliberate hold writes sleep_intent; the heal rewrite does not.
+	// It costs the incident's own repair nothing (that bead carried no intent),
+	// but it is not free in general: a held holder that is ALSO invisible to
+	// the controller's list tier keeps wedging its name, with no automatic
+	// repair — the pre-ga-2otk73 status quo for that one shape. That is the
+	// accepted price. The alternative is closing a session a user deliberately
+	// put to sleep on evidence ("no runtime") that can never distinguish it
+	// from a dead one.
+	if strings.TrimSpace(info.SleepIntent) != "" {
 		return false
 	}
 	return pendingCreateLeaseExpiredForRollbackInfo(info, clk, startupTimeout)
@@ -454,6 +476,31 @@ func clearNamedNameReleaseConfirmation(sessFront *sessionpkg.Store, raw beads.Be
 	}
 }
 
+// markNamedNameReleaseUnattested resets the confirmation chain (an unattested
+// tick confirms nothing) while raising the degraded-probe marker that keeps the
+// UNKNOWN-liveness diagnostic transition-based. One patch, so the marker and
+// the chain reset land together.
+func markNamedNameReleaseUnattested(sessFront *sessionpkg.Store, raw beads.Bead, stderr io.Writer) {
+	patch := sessionpkg.MetadataPatch{}
+	for _, key := range namedNameReleaseProbeKeys() {
+		if key == namedNameReleaseProbeUnattestedKey {
+			continue
+		}
+		if strings.TrimSpace(raw.Metadata[key]) != "" {
+			patch[key] = ""
+		}
+	}
+	if strings.TrimSpace(raw.Metadata[namedNameReleaseProbeUnattestedKey]) == "" {
+		patch[namedNameReleaseProbeUnattestedKey] = "1"
+	}
+	if len(patch) == 0 {
+		return
+	}
+	if err := sessFront.ApplyPatch(raw.ID, patch); err != nil && stderr != nil {
+		fmt.Fprintf(stderr, "session beads: recording degraded-probe hold on %s: %v\n", raw.ID, err) //nolint:errcheck
+	}
+}
+
 // namedNameReleaseConfirmation is one tick's answer from the confirmation
 // window: whether the release may proceed, and the progress to log if not.
 type namedNameReleaseConfirmation struct {
@@ -571,13 +618,20 @@ func recordNamedNameReleaseConfirmation(
 // orphan-release pass remains the idempotent fallback. Noted as residual risk
 // rather than hidden.
 // expectedRevision is the beads revision the caller's gates were evaluated
-// against. When the store implements beads.ConditionalWriter the close is issued
-// as CloseIfMatch against it — a genuine store-level compare-and-swap: ANY
-// user-visible mutation of the bead since that read (not just a pending-create
-// fingerprint change) moves the revision and the close is refused. Pass 0 to
-// skip the fence; a store without the capability falls back to the Tx form,
-// where the caller's fingerprint compare and the per-bead start lock are the
-// only fence.
+// against. When the store implements beads.ConditionalWriter AND the backing
+// actually supplies revisions, the close is issued as CloseIfMatch — a genuine
+// store-level compare-and-swap: ANY user-visible mutation of the bead since
+// that read (not just a pending-create fingerprint change) moves the revision
+// and the close is refused.
+//
+// HONEST PRODUCTION STATUS (review F2): the controller's deployed backing is
+// pre-#4682 bd, which omits the revision field — it decodes to 0, so the
+// fenced path is INOPERATIVE on the live fleet today and the release is
+// guarded by the per-bead start lock plus the caller's fingerprint compare
+// alone. The fence arms itself automatically the day bd supplies revisions; a
+// once-per-process diagnostic below makes the current skip discoverable in the
+// log. Pass 0 to skip the fence explicitly; a store without the capability
+// falls back to the Tx form on the same guard.
 func closeDeadNamedSessionNameHolder(sessFront *sessionpkg.Store, holder sessionpkg.Info, expectedRevision int64, now time.Time, stderr io.Writer) bool {
 	if sessFront == nil || strings.TrimSpace(holder.ID) == "" {
 		return false
@@ -601,7 +655,22 @@ func closeDeadNamedSessionNameHolder(sessFront *sessionpkg.Store, holder session
 	for _, key := range namedNameReleaseProbeKeys() {
 		patch[key] = ""
 	}
-	if writer, ok := beads.ConditionalWriterFor(store.Store); ok && expectedRevision > 0 {
+	writer, writerOK := beads.ConditionalWriterFor(store.Store)
+	if writerOK && expectedRevision == 0 {
+		// The store advertises conditional writes but its backing supplied no
+		// revision to fence on (pre-#4682 bd omits the field, so it decodes to
+		// 0 — the store this controller actually deploys against today). The
+		// fenced path below is therefore INOPERATIVE in production: the release
+		// is guarded by the per-bead start lock and the fingerprint compare
+		// alone. Say so once, loudly, instead of skipping silently — an
+		// operator reading "CAS-guarded" comments must be able to discover from
+		// the log that the fence is not running.
+		fenceRevisionUnavailableOnce.Do(func() {
+			fmt.Fprintf(stderr,
+				"session beads: store cannot supply a fence revision (pre-#4682 bd); named-name releases are guarded by the per-bead start lock and fingerprint compare only\n") //nolint:errcheck
+		})
+	}
+	if writerOK && expectedRevision > 0 {
 		switch closed, err := closeNamedSessionNameHolderIfCurrent(writer, holder.ID, expectedRevision, stderr); {
 		case err == nil && closed:
 			// Closed under the fence. The clears follow the close here rather
@@ -773,9 +842,20 @@ func recoverStaleNamedSessionNameSquatter(
 		// forever would hide a fleet-wide probe outage behind a per-session
 		// recovery message.
 		if !obs.Attested {
-			_, _ = fmt.Fprintf(stderr,
-				"session beads: session_name %q holder %s: runtime probe cannot attest a fresh reading, treating liveness as UNKNOWN and holding the name\n",
-				sessionName, holderID)
+			// Transition-based, not per-tick: the degraded-probe condition
+			// typically persists for a whole outage, and a line per reconcile
+			// tick per wedged name is noise that buries the signal. The marker
+			// lives on the holder bead, so the line fires when the probe
+			// DEGRADES, stays silent while it remains degraded, and re-arms
+			// when the probe attests again. The doctor-side wedge alarm is the
+			// durable operational surface.
+			if strings.TrimSpace(raw.Metadata[namedNameReleaseProbeUnattestedKey]) == "" {
+				_, _ = fmt.Fprintf(stderr,
+					"session beads: session_name %q holder %s: runtime probe cannot attest a fresh reading, treating liveness as UNKNOWN and holding the name (logged once per degradation)\n",
+					sessionName, holderID)
+			}
+			markNamedNameReleaseUnattested(sessFront, raw, stderr)
+			return false
 		}
 		clearNamedNameReleaseConfirmation(sessFront, raw, stderr)
 		return false

@@ -60,14 +60,23 @@ func TestWoodhouseProbe_AutoAttestsAnACPSessionFromTheTmuxBackend(t *testing.T) 
 	}
 }
 
-// The other direction of the same swap. A session routed to the ATTESTING
-// default backend (tmux) that is genuinely stopped: the primary probe attests,
-// but because Running==false the router falls through and returns the ACP
-// backend's attestation instead — Fresh=false. So on ANY city that carries the
-// auto wrapper, the ga-2otk73 recovery is permanently INERT for tmux sessions
-// as well: the exact outage the change exists to repair silently stops being
-// repaired.
-func TestWoodhouseProbe_AutoLosesTheDefaultBackendAttestationOnAStoppedSession(t *testing.T) {
+// The other direction of the same swap, RESOLVED in iteration 4 as a deliberate
+// trade-off rather than the reviewer probe's original expectation. A session
+// routed to the ATTESTING default backend (tmux) that is genuinely stopped:
+// the primary attests the stop, the router then consults the other backend for
+// the stale-route recovery, and the final verdict's freshness is the
+// CONJUNCTION of both probes. With a counterpart that cannot attest (acp), the
+// stop therefore comes back Fresh=false — UNKNOWN — and the ga-2otk73 release
+// never confirms on an auto-wrapped city.
+//
+// That inertness is the ACCEPTED price, chosen over the alternative: taking the
+// primary's attestation alone would let a stale route plus a degraded
+// counterpart probe attest the death of a session that is actually alive on
+// the other backend — a false close, the exact H1 class. Fail closed wins.
+// The recovery remains fully operative on cities without the auto wrapper,
+// which includes this fleet (city.toml has zero acp targets, so
+// resolveSessionTransportProvider never builds the wrapper).
+func TestWoodhouseProbe_AutoStoppedVerdictIsUnknownWhenCounterpartCannotAttest(t *testing.T) {
 	healthyDefault := runtime.NewFake()
 	acp := &nonAttestingBackend{Provider: runtime.NewFake()}
 	p := New(healthyDefault, acp)
@@ -79,9 +88,13 @@ func TestWoodhouseProbe_AutoLosesTheDefaultBackendAttestationOnAStoppedSession(t
 
 	got := p.AttestLiveness("tmux-agent", []string{"claude"})
 	t.Logf("direct=%+v  through-auto=%+v", direct, got)
-	if !got.Fresh {
-		t.Errorf("FINDING: the auto router DROPPED the attesting default backend's Fresh=true "+
-			"(direct=%+v, through-auto=%+v) because the stopped reading fell through to the "+
-			"non-attesting ACP backend. The recovery can never fire on an auto-wrapped city.", direct, got)
+	if got.Running || got.Alive {
+		t.Fatalf("probe setup wrong: %+v, expected the stopped reading", got)
+	}
+	if got.Fresh {
+		t.Errorf("a stopped verdict through the auto router must be UNKNOWN (Fresh=false) when "+
+			"the counterpart backend cannot attest — the conjunction is what stops a stale route "+
+			"plus a degraded counterpart from attesting a live session's death (direct=%+v, through-auto=%+v)",
+			direct, got)
 	}
 }

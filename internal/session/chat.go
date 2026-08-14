@@ -285,24 +285,39 @@ func WithSessionMutationLock(id string, fn func() error) error {
 // release rather than a rejected one retried a tick later, and it is the only
 // fence left on a store whose backing cannot do conditional writes.
 //
-// Two layers, because the writers live in two scopes:
+// Two layers, because the writers COULD live in two scopes:
 //
-//   - a per-bead FILE lock under the city, so a second PROCESS (gc session
-//     start, the API server) is excluded too. Skipped when cityPath is empty,
-//     which callers pass deliberately as well as incidentally: the file layer
-//     costs one never-reclaimed lock file per bead ID, so cmd/gc asks for it
+//   - a per-bead FILE lock under the city, so that a second PROCESS taking the
+//     same lock would be excluded. As of ga-2otk73 iteration 4 no external
+//     caller does: `gc session start` and the API server do not take this
+//     lock, so today every participant lives in the controller process and the
+//     file layer is FORWARD PROVISION, not live protection. If an external
+//     writer is ever taught to participate, note the trap that both sides must
+//     derive cityPath from the SAME source — the release passes cmd/gc's
+//     cityPath while the start lane's env carries GC_CITY_PATH, and any
+//     normalization difference between them silently lands the two on
+//     different lock files. Skipped when cityPath is empty; cmd/gc asks for it
 //     only for configured NAMED beads (the only beads the release can target)
 //     and not for pool beads, which mint a fresh ID per start attempt.
 //   - the per-bead in-process mutation lock, which the pre-wake mint already
-//     held before this helper existed.
+//     held before this helper existed. This is the layer doing the real work
+//     today.
 //
 // The order is always FILE then MUTEX, and neither layer is reentrant: a caller
 // already holding either lock for the same bead must not call this.
 //
-// It does NOT cover every writer of the bead. Only the start lane participates
-// (pre-wake mint, start commit, in-flight lease clear) plus the release itself;
-// any other concurrent metadata write is still caught by the fingerprint compare
-// alone, which is a narrow window, not an excluded one.
+// It does NOT cover every writer of the bead. Only the start lane's LIVE-MAKING
+// writers participate (pre-wake mint, start commit, in-flight lease clear) plus
+// the release itself. Deliberately NOT covered: the start lane's failure and
+// rollback writers (rollbackPendingCreate and siblings, markProviderTerminalError,
+// recordRateLimitQuarantine) — they clear fingerprint fields, but every one of
+// them moves the bead TOWARD closed/cleared, which is convergent with the
+// release, never a live session the release could kill. Racing them can at
+// worst double-close or clobber a quarantine stamp on a bead already proven
+// abandoned. Any other concurrent metadata write is caught by the fingerprint
+// compare alone — and note that on a pre-#4682 bd backing the revision fence
+// downstream of that compare is inoperative (revision decodes to 0), so the
+// compare-plus-these-locks IS the whole guard in production today.
 func WithSessionBeadStartLock(cityPath, id string, fn func() error) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
