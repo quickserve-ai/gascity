@@ -352,6 +352,12 @@ func (c *CachingStore) runReconciliation() {
 	if emit {
 		log.Print(logLine)
 	}
+	// The success log line above is rate-limited to one per minute, so it is
+	// not a reliable per-cycle signal; the heartbeat is published on EVERY
+	// completed reconcile so its own staleness is an exact measure of how long
+	// this cache has gone without a full scan. Best-effort by construction: the
+	// sink is nil outside the controller and never returns an error here.
+	c.publishReconcileHeartbeat()
 	c.notifyChanges(res.notifications)
 }
 

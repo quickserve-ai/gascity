@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -67,6 +68,19 @@ type CachingStore struct {
 	cancelFn    context.CancelFunc
 	stopCh      chan struct{}
 	stopped     bool
+	// heartbeatSink publishes the durable ReconcileHeartbeat record. It is
+	// nil by default — every store that is not wired by the controller (all
+	// tests, every CLI-path store) publishes nothing and behaves exactly as
+	// before. Guarded by lifecycleMu alongside reconcilerArmedAt.
+	heartbeatSink func(ReconcileHeartbeat)
+	// reconcilerArmedAt starts the watchdog's never-reconciled clock. First
+	// stamped by SetReconcileHeartbeatSink at install time (so a store whose
+	// reconciler never starts still goes visibly stale), then re-stamped by
+	// StartReconciler when it actually arms this store's
+	// loop. It is the floor of the heartbeat staleness clock, so a store
+	// that has been armed but has not yet completed its first cycle is
+	// judged against its arm time rather than looking infinitely stale.
+	reconcilerArmedAt time.Time
 
 	// latencyWindow holds the most recent reconciliation bd-list
 	// durations for adaptive cadence decisions. Bounded at
@@ -1095,6 +1109,7 @@ func (c *CachingStore) StartReconciler(ctx context.Context, stagger StaggerOptio
 		return
 	}
 	c.cancelFn = cancel
+	c.reconcilerArmedAt = time.Now()
 	c.lifecycleWG.Add(1)
 	c.lifecycleMu.Unlock()
 
@@ -1105,11 +1120,90 @@ func (c *CachingStore) StartReconciler(ctx context.Context, stagger StaggerOptio
 	c.mu.Unlock()
 
 	log.Printf("beads cache: stagger=%dms agent=%s", offset.Milliseconds(), agentID)
+	// No heartbeat publish here — the arm stamp is published synchronously by
+	// SetReconcileHeartbeatSink at install time. StartReconciler frequently
+	// runs on a goroutine the caller never waits on (primeThenStartReconciler),
+	// and a publish from here races external teardown of the city root:
+	// WriteReconcileHeartbeat MkdirAll's its directory, so a late publish
+	// re-creates <city>/.gc/runtime/beads-cache mid-RemoveAll (the
+	// controllerState TempDir-cleanup failures, 21+/40 runs). The re-stamp of
+	// reconcilerArmedAt above still flows into every loop publish.
 
 	go func() {
 		defer c.lifecycleWG.Done()
 		c.reconcileLoop(ctx, offset)
 	}()
+}
+
+// SetReconcileHeartbeatSink installs the durable liveness publisher for this
+// store and, for a non-nil sink, synchronously publishes the arm stamp before
+// returning. A nil sink (the default) disables publishing entirely.
+//
+// Publishing here rather than in StartReconciler is deliberate, twice over.
+// Mechanically: install runs synchronously in the store constructor, so the
+// arm write is sequenced before any caller teardown, while StartReconciler is
+// typically reached on an unwaited goroutine whose late write races removal
+// of the city root (B1). Semantically: the watchdog clock starts the moment a
+// sink is installed — a store that installs a sink but whose reconciler NEVER
+// starts (the suspected ga-yc0chj shape: a rebuilt store with no reconciler
+// goroutine) now publishes an arm record that goes stale and alarms, instead
+// of publishing nothing and reading as unknown/quiet forever.
+//
+// The sink receives a fully populated ReconcileHeartbeat except for Scope,
+// which the caller owns — the store knows its bead prefix but not which city
+// scope label the operator-facing tooling files it under.
+func (c *CachingStore) SetReconcileHeartbeatSink(sink func(ReconcileHeartbeat)) {
+	if c == nil {
+		return
+	}
+	c.lifecycleMu.Lock()
+	c.heartbeatSink = sink
+	if sink != nil && c.reconcilerArmedAt.IsZero() {
+		c.reconcilerArmedAt = time.Now()
+	}
+	c.lifecycleMu.Unlock()
+	if sink != nil {
+		c.publishReconcileHeartbeat()
+	}
+}
+
+// publishReconcileHeartbeat hands the current liveness snapshot to the sink.
+// Best-effort and lock-free from the caller's perspective: it takes no lock
+// while the sink runs, so a slow publisher can never stall a reconcile or
+// block a reader. A nil sink short-circuits before any state is read.
+func (c *CachingStore) publishReconcileHeartbeat() {
+	c.lifecycleMu.Lock()
+	sink := c.heartbeatSink
+	armedAt := c.reconcilerArmedAt
+	c.lifecycleMu.Unlock()
+	if sink == nil {
+		return
+	}
+	c.mu.RLock()
+	hb := c.reconcileHeartbeatSnapshotLocked()
+	c.mu.RUnlock()
+	hb.ArmedAt = armedAt
+	sink(hb)
+}
+
+// reconcileHeartbeatSnapshotLocked builds the liveness record from current
+// cache state. IntervalMs falls back to the adaptive cadence when the stats
+// field has not been computed yet (arm time, before the first cycle), so a
+// well-formed record always carries a positive interval and readers can treat
+// a non-positive one as unknown. Caller must hold c.mu.
+func (c *CachingStore) reconcileHeartbeatSnapshotLocked() ReconcileHeartbeat {
+	interval := c.stats.CurrentReconcileInterval
+	if interval <= 0 {
+		interval = c.adaptiveIntervalLocked()
+	}
+	return ReconcileHeartbeat{
+		Prefix:          c.idPrefix,
+		PID:             os.Getpid(),
+		LastReconcileAt: c.stats.LastReconcileAt,
+		IntervalMs:      interval.Milliseconds(),
+		State:           c.stateStringLocked(),
+		UpdatedAt:       time.Now(),
+	}
 }
 
 // StopReconciler cancels and waits for cache-owned background work.
@@ -1134,17 +1228,23 @@ func (c *CachingStore) Stats() CacheStats {
 	defer c.mu.RUnlock()
 
 	s := c.stats
+	s.State = c.stateStringLocked()
+	return s
+}
+
+// stateStringLocked renders the cache state enum as the wire string used by
+// CacheStats.State and the durable reconcile heartbeat. Caller must hold c.mu.
+func (c *CachingStore) stateStringLocked() string {
 	switch c.state {
 	case cachePartial:
-		s.State = "partial"
+		return "partial"
 	case cacheLive:
-		s.State = "live"
+		return "live"
 	case cacheDegraded:
-		s.State = "degraded"
+		return "degraded"
 	default:
-		s.State = "uninitialized"
+		return "uninitialized"
 	}
-	return s
 }
 
 // IsLive reports whether reads are served from the cache.
