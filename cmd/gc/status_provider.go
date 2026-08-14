@@ -112,6 +112,15 @@ func (p *statusProvider) ObserveLiveness(name string, processNames []string) run
 	})
 }
 
+// AttestLiveness forwards the base provider's freshness attestation. The bounded
+// zero value is the correct degraded answer: a call that blew the status budget
+// produces Fresh=false, i.e. UNKNOWN, not "everything is stopped".
+func (p *statusProvider) AttestLiveness(name string, processNames []string) runtime.AttestedLiveness {
+	return boundedStatusCall(p, runtime.AttestedLiveness{}, func() runtime.AttestedLiveness {
+		return runtime.AttestLiveness(p.base, name, processNames)
+	})
+}
+
 func (p *statusProvider) Nudge(name string, content []runtime.ContentBlock) error {
 	return p.base.Nudge(name, content)
 }

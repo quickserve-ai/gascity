@@ -33,6 +33,7 @@ var (
 	_ runtime.TransportCapabilityProvider   = (*Provider)(nil)
 	_ runtime.RelaunchProvider              = (*Provider)(nil)
 	_ runtime.LivenessObserver              = (*Provider)(nil)
+	_ runtime.LivenessAttester              = (*Provider)(nil)
 )
 
 // New creates a composite provider. defaultSP handles sessions not
@@ -246,6 +247,38 @@ func (p *Provider) ObserveLiveness(name string, processNames []string) runtime.L
 		other = p.defaultSP
 	}
 	return runtime.ObserveLiveness(other, name, processNames)
+}
+
+// AttestLiveness mirrors ObserveLiveness's routing and keeps its stale-route
+// recovery, but the attestation composes differently from the observation —
+// getting this wrong re-opens the exact H1 class the attestation exists for:
+//
+//   - An UNATTESTED "stopped" from the routed backend must NOT fall through.
+//     The other backend does not manage this session; its (healthy, fresh)
+//     "never heard of it" answer would launder a degraded probe into an
+//     attested stop, and three such ticks close a live agent's bead.
+//   - An ATTESTED "stopped" may consult the other backend for the stale-route
+//     case, but a final "stopped" verdict is only as fresh as BOTH probes:
+//     Fresh is the conjunction, so one degraded backend keeps the caller in
+//     UNKNOWN (fail closed) instead of borrowing the other's attestation.
+func (p *Provider) AttestLiveness(name string, processNames []string) runtime.AttestedLiveness {
+	primary := runtime.AttestLiveness(p.route(name), name, processNames)
+	if primary.Running || !primary.Fresh {
+		// Live: done. Unattested: UNKNOWN never falls through (see above).
+		return primary
+	}
+	p.mu.RLock()
+	isACP := p.routes[name]
+	p.mu.RUnlock()
+	otherSP := p.acpSP
+	if isACP {
+		otherSP = p.defaultSP
+	}
+	other := runtime.AttestLiveness(otherSP, name, processNames)
+	if other.Running {
+		return other
+	}
+	return runtime.AttestedLiveness{Liveness: other.Liveness, Fresh: primary.Fresh && other.Fresh}
 }
 
 // Nudge delegates to the routed backend.

@@ -33,6 +33,12 @@ var (
 	// Relaunch (B2) rides the embedded raw *Provider — it is NOT one of the 18
 	// seam-routed methods, so the warm-box relaunch stays on the real provider.
 	_ runtime.RelaunchProvider = (*seamBackedProvider)(nil)
+	// This is the provider the city actually builds (runtime_registry.go
+	// registers NewSeamBackedWithConfig as both "tmux" and the fallback), so the
+	// freshness attestation must survive the wrapper: a caller that fails closed
+	// on an unattested probe — the ga-2otk73 named-name release — would silently
+	// stop working everywhere if a future enumerate-style refactor dropped it.
+	_ runtime.LivenessAttester = (*seamBackedProvider)(nil)
 )
 
 // NewSeamBackedWithConfig constructs a tmux provider served through the seams.

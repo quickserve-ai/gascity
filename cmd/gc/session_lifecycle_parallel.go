@@ -835,7 +835,16 @@ func prepareStartCandidateForCity(
 	workDirResolver taskWorkDirResolver,
 ) (*preparedStart, error) {
 	if id := strings.TrimSpace(candidate.info.ID); id != "" && store != nil {
-		if err := sessionpkg.WithSessionMutationLock(id, func() error {
+		// WithSessionBeadStartLock is WithSessionMutationLock plus — for a
+		// configured NAMED bead (namedSessionStartLockPath) — a per-bead file lock
+		// under the city (ga-2otk73). The pre-wake mint rotates instance_token /
+		// generation / pending_create_started_at / last_woke_at, i.e. the whole
+		// pending-create attempt identity, and the name-squat release closes a
+		// bead only while holding this same lock. Serializing the two is what
+		// makes that release a guarded update rather than a hopeful re-read; the
+		// file layer extends the exclusion to a second PROCESS driving a start for
+		// the same named bead.
+		if err := sessionpkg.WithSessionBeadStartLock(namedSessionStartLockPath(cityPath, candidate.info), id, func() error {
 			sessFront := sessionFrontDoor(store)
 			// GENUINE store re-Get (WI-6 R4): the whole bead is reloaded through the
 			// session front door AS Info (template_overrides can change out of band,
@@ -1756,11 +1765,21 @@ func asyncStartPreparedCommandStaleInfo(prepared preparedStart, current sessionp
 // re-attempts. The transactional rollback siblings now clear last_woke_at inside
 // their own store.Tx (rollbackPendingCreateClears), so this helper no longer
 // returns a fold batch.
+//
+// last_woke_at is part of the pending-create attempt fingerprint (ga-2otk73), so
+// this write goes under the per-bead start lock: it is the third and last write
+// in the start lane that can move a holder bead's attempt identity while the
+// name-squat release is deciding whether to close it. In-process layer only —
+// the helper has no cityPath — which is the layer the controller's own start
+// lane and the release share.
 func clearPendingStartInFlightLease(handle string, sessFront *sessionpkg.Store, stderr io.Writer) {
 	if strings.TrimSpace(handle) == "" || sessFront == nil {
 		return
 	}
-	setMeta(sessFront, handle, "last_woke_at", "", stderr) //nolint:errcheck
+	_ = sessionpkg.WithSessionBeadStartLock("", handle, func() error {
+		setMeta(sessFront, handle, "last_woke_at", "", stderr) //nolint:errcheck
+		return nil
+	})
 }
 
 func stopStaleAsyncStartRuntime(result startResult, sp runtime.Provider, stderr io.Writer) {
@@ -2139,7 +2158,19 @@ func commitStartResultTraced(
 			metadata[sessionpkg.MCPIdentityMetadataKey] = storedMCPIdentity
 		}
 	}
-	if err := sessFront.ApplyPatch(info.ID, metadata); err != nil {
+	// THE start commit: it clears pending_create_claim, confirms the state, and
+	// stamps creation_complete_at — i.e. it retires the pending-create attempt
+	// the ga-2otk73 name-squat release may be deciding to abandon. Under the
+	// per-bead start lock the two cannot interleave: either this commit lands
+	// first and the release's guarded re-read sees a changed fingerprint and
+	// aborts, or the release closes the bead first and this commit follows it.
+	// Without the lock the release's compare was a hopeful recheck with a real
+	// window after it.
+	if err := sessionpkg.WithSessionBeadStartLock(
+		namedSessionStartLockPath(result.prepared.cfg.Env["GC_CITY_PATH"], info),
+		info.ID,
+		func() error { return sessFront.ApplyPatch(info.ID, metadata) },
+	); err != nil {
 		clearPendingStartInFlightLease(info.ID, sessFront, stderr)
 		fmt.Fprintf(stderr, "session reconciler: storing hashes for %s: %v\n", name, err) //nolint:errcheck
 		if trace != nil {
