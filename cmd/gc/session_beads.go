@@ -1816,6 +1816,25 @@ func syncSessionBeadsWithSnapshotAndRigStores(
 					if isConfiguredNamed {
 						if err := session.EnsureSessionNameAvailableWithConfigForOwner(store, cfg, sn, "", managedAlias); err != nil {
 							fmt.Fprintf(stderr, "session beads: session_name %q for %s unavailable: %v\n", sn, agentName, err) //nolint:errcheck
+							// ga-2otk73. A named session's session_name is
+							// fixed by config, so this is not a lost slot — it
+							// is a PERMANENT outage for this agent unless the
+							// holder is released. If the holder is this
+							// identity's own half-create, proven dead (lease
+							// expired, no runtime, confirmed across ticks),
+							// release the name now; the next tick reopens that
+							// same bead with its continuity intact. Every other
+							// holder is left untouched. We stay blocked for
+							// THIS tick either way — the release is the repair.
+							//
+							// This runs inside WithCitySessionIdentifierLocks
+							// below, so it is serialized against any other
+							// claim on this name.
+							recoverStaleNamedSessionNameSquatter(
+								store, cfg, sp, err, sn,
+								strings.TrimSpace(tp.ConfiguredNamedIdentity),
+								clk, now, stderr,
+							)
 							createErr = err
 							blocked = true
 							return nil
