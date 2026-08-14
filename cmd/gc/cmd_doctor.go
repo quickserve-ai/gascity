@@ -328,6 +328,10 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 	register(doctor.NewControllerCheck(cityPath, controllerRunning))
 	register(doctor.NewSupervisorHTTPCheck(opts.SupervisorRunning))
 	register(doctor.NewSupervisorUnitOwnershipCheck(opts.SupervisorRunning, opts.SupervisorPID, opts.SupervisorUnitOwnership))
+	// Beads-cache reconcile watch: alarms on the ABSENCE of a reconcile
+	// heartbeat. Registered next to the controller checks because it is a
+	// statement about the RUNNING controller, and it self-skips when none is.
+	register(newBeadsCacheReconcileCheck(cityPath, cfg, controllerRunning))
 
 	if cfgErr == nil && cfg != nil {
 		cityName := loadedCityName(cfg, cityPath)
