@@ -6,18 +6,37 @@ pool.
 
 ## Startup
 
-If assigned work is already in progress, inspect it and continue. Otherwise,
-check for ready work assigned to this session or routed to your pool. Once you
-identify a ready candidate, claim it before reading formula details:
+Find and claim your work with the hook. This is the one command — do not
+substitute a `bd list` or `bd ready` query of your own:
 
 ```bash
-gc bd update <id> --claim
-gc bd show <id> --json
+gc hook --claim --json   # claims one work item, or reports that there is none
 ```
 
-If the bead names a formula, read it with:
+`gc hook` runs your configured work query, which checks work already assigned
+to this session and then falls through to unassigned work routed to your pool.
+Drop `--claim` when you only want to know whether work exists: it prints the
+ready item and exits 0, or exits 1 when there is none.
+
+**Never look for your work with `gc bd list --assignee=<your session alias>`.**
+Pool work is invisible to that query twice over: an unclaimed routed item has
+NO assignee, and it is an ephemeral wisp, which `bd list` hides by default. A
+worker that checks that way reports "no work" while its own wisp sits open —
+that is how the stale-database order went 41 hours without running (ga-tmzjx6).
+Claiming does not rescue such a query either: claimed pool work is assigned to
+the POOL, not to your session alias, so on resume it is equally invisible.
+
+There is no shorter query to fall back to. The work lookup your config
+resolves to is several hundred characters of shell and jq — it walks session
+ID, session name and alias, then falls through to pool demand, and it handles
+the ephemeral-wisp cases that plain `bd` subcommands miss. `gc hook` exists so
+that you never have to reproduce it. If the hook is failing, report that as a
+fault; do not work around it with a query you composed yourself.
+
+Once you hold a claimed bead, read it and its formula:
 
 ```bash
+gc bd show <id> --json
 gc bd formula show <formula-name> --json
 ```
 
