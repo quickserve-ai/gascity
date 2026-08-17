@@ -248,12 +248,19 @@ func TestSyncUpToDateRefreshesMirrorFreshness(t *testing.T) {
 	writeSyncFakeBeadsBD(t, cityPath)
 	port, cleanup := startReachableTCPListener(t)
 	defer cleanup()
-	stamp := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "backup-freshness", "app")
+	// ga-3o5xrw: the stamp is keyed <db>@<remote>. Seeding the pre-ga-3o5xrw
+	// per-database key as well proves the refresh lands on the pair key and is
+	// not merely overwriting whatever file happened to be there.
+	stamp := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "backup-freshness", "app@origin")
+	legacyStamp := filepath.Join(filepath.Dir(stamp), "app")
 	if err := os.MkdirAll(filepath.Dir(stamp), 0o755); err != nil {
 		t.Fatalf("mkdir freshness dir: %v", err)
 	}
 	if err := os.WriteFile(stamp, []byte("pushed_at_epoch=1\nremote=old\nrefspec=old:old\n"), 0o644); err != nil {
 		t.Fatalf("seed stale freshness: %v", err)
+	}
+	if err := os.WriteFile(legacyStamp, []byte("pushed_at_epoch=1\nremote=old\nrefspec=old:old\n"), 0o644); err != nil {
+		t.Fatalf("seed legacy freshness: %v", err)
 	}
 
 	root := repoRoot(t)
@@ -295,7 +302,7 @@ func TestSyncMalformedClassificationDoesNotRefreshMirrorFreshness(t *testing.T) 
 	writeSyncFakeBeadsBD(t, cityPath)
 	port, cleanup := startReachableTCPListener(t)
 	defer cleanup()
-	stamp := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "backup-freshness", "app")
+	stamp := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "backup-freshness", "app@origin")
 	if err := os.MkdirAll(filepath.Dir(stamp), 0o755); err != nil {
 		t.Fatalf("mkdir freshness dir: %v", err)
 	}
@@ -692,6 +699,141 @@ func TestSyncCLIRemoteOverridePinsNonLocal(t *testing.T) {
 	}
 	if !strings.Contains(out, "-> origin:main (git+https://github.com/gastownhall/beads)") {
 		t.Fatalf("GC_DOLT_REMOTE_APP=origin should pin selection to origin even though usb (file://) is available.\nout:\n%s", out)
+	}
+}
+
+// --- ga-3o5xrw: a listed GC_DOLT_REMOTE_<DB> pushes each named remote ---
+//
+// One pinned remote per run starves a database mirrored twice whenever the
+// pinned mirror is dead. A comma-separated override names several remotes;
+// sync handles each on its own, in the order listed, and one remote's failure
+// never suppresses the next. Only named remotes are touched, so the default
+// policy's refusal of unpinned network remotes is unchanged.
+
+// TestSyncRemoteEnvOverrideListSelectsEachListedRemote pins the selection half:
+// every listed remote is synced in the order given, and an unlisted local
+// remote the default policy would have chosen is left alone.
+func TestSyncRemoteEnvOverrideListSelectsEachListedRemote(t *testing.T) {
+	t.Parallel()
+	binDir := t.TempDir()
+	writeSyncFakeDoltMultiRemote(t, binDir, []string{
+		"origin,git+https://github.com/gastownhall/beads",
+		"usb,file:///mnt/usb/beads",
+		"mirror,git+https://example.invalid/mirror",
+	})
+
+	out, err := runFFSyncEnv(t, binDir, []string{"GC_DOLT_REMOTE_APP=mirror,origin"}, "--db", "app", "--force", "--dry-run")
+	if err != nil {
+		t.Fatalf("gc dolt sync failed: %v\n%s", err, out)
+	}
+	mirror := strings.Index(out, "-> mirror:main (git+https://example.invalid/mirror)")
+	origin := strings.Index(out, "-> origin:main (git+https://github.com/gastownhall/beads)")
+	if mirror < 0 || origin < 0 {
+		t.Fatalf("GC_DOLT_REMOTE_APP=mirror,origin should sync both listed remotes.\nout:\n%s", out)
+	}
+	if mirror > origin {
+		t.Fatalf("listed remotes must be synced in the order given (mirror before origin).\nout:\n%s", out)
+	}
+	if strings.Contains(out, "-> usb:") {
+		t.Fatalf("an unlisted remote must not be synced once the override names remotes.\nout:\n%s", out)
+	}
+}
+
+// TestSyncRemoteEnvOverrideListRefusesUnconfiguredEntry pins that a list is
+// validated as a whole before anything is synced: one misspelled name fails
+// the database loudly instead of silently syncing the rest.
+func TestSyncRemoteEnvOverrideListRefusesUnconfiguredEntry(t *testing.T) {
+	t.Parallel()
+	binDir := t.TempDir()
+	writeSyncFakeDoltMultiRemote(t, binDir, []string{
+		"origin,git+https://github.com/gastownhall/beads",
+		"usb,file:///mnt/usb/beads",
+	})
+
+	out, err := runFFSyncEnv(t, binDir, []string{"GC_DOLT_REMOTE_APP=origin,nope"}, "--db", "app", "--force", "--dry-run")
+	if err == nil {
+		t.Fatalf("a list naming an unconfigured remote must fail the database.\nout:\n%s", out)
+	}
+	if !strings.Contains(out, "GC_DOLT_REMOTE override 'nope' does not match any configured remote") {
+		t.Fatalf("expected the error to name the unconfigured entry.\nout:\n%s", out)
+	}
+	if !strings.Contains(out, "remote selection refused") {
+		t.Fatalf("summary must attribute the failure to the refusal.\nout:\n%s", out)
+	}
+	if strings.Contains(out, "would") {
+		t.Fatalf("no remote may be synced when the list is invalid.\nout:\n%s", out)
+	}
+}
+
+// writeSyncFakeDoltDeadAndLiveRemotes installs a fake dolt with two non-local
+// remotes: origin's fetch fails the way a mirror with a dangling chunk does,
+// and probe is healthy and one commit behind local, so a fast-forward is due.
+func writeSyncFakeDoltDeadAndLiveRemotes(t *testing.T, dir string) string {
+	t.Helper()
+	logPath := filepath.Join(dir, "dolt.log")
+	body := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$*\" >> \"" + logPath + "\"\n" +
+		"case \"$*\" in\n" +
+		"  *\"SELECT name, url FROM dolt_remotes ORDER BY name\"*)\n" +
+		"    printf 'name,url\\norigin,https://example.invalid/dead\\nprobe,https://example.invalid/live\\n' ; exit 0 ;;\n" +
+		"  *\"SELECT active_branch()\"*)\n" +
+		"    printf 'active_branch()\\nmain\\n' ; exit 0 ;;\n" +
+		"  *\"DOLT_FETCH('origin'\"*)\n" +
+		"    echo 'fatal: Blob not found: 06ctnedcgrbc44rc8hbd2ird9flmpif3.darc' >&2 ; exit 1 ;;\n" +
+		"  *\"DOLT_FETCH('probe'\"*) exit 0 ;;\n" +
+		"  *\"dolt_log('remotes/probe/main..main')\"*) printf 'n\\n1\\n' ; exit 0 ;;\n" +
+		"  *\"dolt_log('main..remotes/probe/main')\"*) printf 'n\\n0\\n' ; exit 0 ;;\n" +
+		"esac\nexit 0\n"
+	return installFFFakeDolt(t, dir, body)
+}
+
+// TestSyncRemoteEnvOverrideListFailedRemoteDoesNotSuppressTheNext is the
+// ga-3o5xrw regression: with origin dead and probe live, a failed fetch on
+// origin must not stop the push to probe, and the run must still fail with a
+// summary naming the remote that failed.
+func TestSyncRemoteEnvOverrideListFailedRemoteDoesNotSuppressTheNext(t *testing.T) {
+	binDir := t.TempDir()
+	logPath := writeSyncFakeDoltDeadAndLiveRemotes(t, binDir)
+
+	out, err := runFFSyncEnv(t, binDir, []string{"GC_DOLT_REMOTE_APP=origin,probe"}, "--db", "app")
+	log := readLog(t, logPath)
+	if !strings.Contains(log, "DOLT_FETCH('origin'") {
+		t.Fatalf("the dead remote was never attempted.\nlog:\n%s\nout:\n%s", log, out)
+	}
+	if !strings.Contains(log, "DOLT_PUSH('probe', 'main')") {
+		t.Fatalf("the live remote was never pushed: a failed remote suppressed it.\nlog:\n%s\nout:\n%s", log, out)
+	}
+	if strings.Contains(log, "DOLT_PUSH('origin'") {
+		t.Fatalf("the remote whose fetch failed must not be pushed.\nlog:\n%s\nout:\n%s", log, out)
+	}
+	if err == nil {
+		t.Fatalf("a failed remote must still fail the run.\nout:\n%s", out)
+	}
+	if !strings.Contains(out, "app (remote origin: fetch failed (exit 1))") {
+		t.Fatalf("summary must name the failed remote and its reason.\nout:\n%s", out)
+	}
+}
+
+// TestSyncCLIRemoteOverrideListSyncsEachListedRemote is the CLI-mode twin of
+// TestSyncRemoteEnvOverrideListSelectsEachListedRemote.
+func TestSyncCLIRemoteOverrideListSyncsEachListedRemote(t *testing.T) {
+	t.Parallel()
+	cityPath := writeSyncCLIRemotes(t, `{"remotes":[{"name":"origin","url":"git+https://github.com/gastownhall/beads"},{"name":"usb","url":"file:///mnt/usb/beads"}]}`)
+	binDir := t.TempDir()
+	_ = writeSyncFakeDolt(t, binDir)
+	_ = writeSyncFakeBeadsBD(t, cityPath)
+
+	out, err := runSync(t, binDir, cityPath, []string{"GC_DOLT_REMOTE_APP=usb,origin"}, "--db", "app", "--dry-run")
+	if err != nil {
+		t.Fatalf("gc dolt sync failed: %v\n%s", err, out)
+	}
+	for _, want := range []string{
+		"would push main -> usb:main (file:///mnt/usb/beads)",
+		"would push main -> origin:main (git+https://github.com/gastownhall/beads)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("CLI mode should sync every listed remote; missing %q.\nout:\n%s", want, out)
+		}
 	}
 }
 
