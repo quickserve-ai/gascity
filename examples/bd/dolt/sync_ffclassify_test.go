@@ -97,7 +97,7 @@ func fakeDoltHeader(logPath, branch string) string {
 	return "#!/bin/sh\n" +
 		"printf '%s\\n' \"$*\" >> \"" + logPath + "\"\n" +
 		"case \"$*\" in\n" +
-		"  *\"SELECT name, url FROM dolt_remotes LIMIT 1\"*)\n" +
+		"  *\"SELECT name, url FROM dolt_remotes\"*)\n" +
 		"    printf 'name,url\\norigin,https://example.invalid/repo\\n' ; exit 0 ;;\n" +
 		"  *\"SELECT active_branch()\"*)\n" +
 		"    printf 'active_branch()\\n" + branch + "\\n' ; exit 0 ;;\n"
@@ -234,12 +234,19 @@ func TestSyncUpToDateRefreshesMirrorFreshness(t *testing.T) {
 	writeSyncFakeBeadsBD(t, cityPath)
 	port, cleanup := startReachableTCPListener(t)
 	defer cleanup()
-	stamp := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "backup-freshness", "app")
+	// ga-3o5xrw: the stamp is keyed <db>@<remote>. Seeding the pre-ga-3o5xrw
+	// per-database key as well proves the refresh lands on the pair key and is
+	// not merely overwriting whatever file happened to be there.
+	stamp := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "backup-freshness", "app@origin")
+	legacyStamp := filepath.Join(filepath.Dir(stamp), "app")
 	if err := os.MkdirAll(filepath.Dir(stamp), 0o755); err != nil {
 		t.Fatalf("mkdir freshness dir: %v", err)
 	}
 	if err := os.WriteFile(stamp, []byte("pushed_at_epoch=1\nremote=old\nrefspec=old:old\n"), 0o644); err != nil {
 		t.Fatalf("seed stale freshness: %v", err)
+	}
+	if err := os.WriteFile(legacyStamp, []byte("pushed_at_epoch=1\nremote=old\nrefspec=old:old\n"), 0o644); err != nil {
+		t.Fatalf("seed legacy freshness: %v", err)
 	}
 
 	root := repoRoot(t)
@@ -281,7 +288,7 @@ func TestSyncMalformedClassificationDoesNotRefreshMirrorFreshness(t *testing.T) 
 	writeSyncFakeBeadsBD(t, cityPath)
 	port, cleanup := startReachableTCPListener(t)
 	defer cleanup()
-	stamp := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "backup-freshness", "app")
+	stamp := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "backup-freshness", "app@origin")
 	if err := os.MkdirAll(filepath.Dir(stamp), 0o755); err != nil {
 		t.Fatalf("mkdir freshness dir: %v", err)
 	}

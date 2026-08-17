@@ -189,10 +189,67 @@ if [ -d "$data_dir" ] && [ "$server_reachable" = true ]; then
     remotes_csv=$(run_bounded 5 dolt $conn_args sql --result-format csv \
       -q "USE \`$name\`; SELECT COUNT(*) FROM dolt_remotes;" 2>/dev/null || true)
     remotes=$(printf '%s\n' "$remotes_csv" | grep -E '^[0-9]+$' | head -1)
-    db_info="$db_info$name|$commits|$open_beads|$remotes
+    # ga-3o5xrw: the COUNT alone cannot say WHICH remotes are configured, and
+    # the mirror-freshness verdict below needs the names — it requires a recent
+    # stamp for EACH of them, not merely for "some remote". Field 4 keeps its
+    # existing meaning (count; empty = probe failed and remotes are unknowable)
+    # so nothing downstream changes; field 5 adds the names.
+    remote_names=""
+    if [ -n "$remotes" ] && [ "$remotes" != "0" ]; then
+      names_csv=$(run_bounded 5 dolt $conn_args sql --result-format csv \
+        -q "USE \`$name\`; SELECT name FROM dolt_remotes ORDER BY name;" 2>/dev/null || true)
+      remote_names=$(printf '%s\n' "$names_csv" | sed '1d' | tr -d '"\r' \
+        | grep -E '^[A-Za-z0-9_.-]+$' | paste -sd, -)
+    fi
+    db_info="$db_info$name|$commits|$open_beads|$remotes|$remote_names
 "
   done
 fi
+
+# mirror_park_reason <db> <remote> — echo the reason a database/remote pair is
+# deliberately excluded from the durability verdict, or nothing if it is not.
+#
+# GC_DOLT_MIRROR_PARKED is a comma-separated list of `<db>/<remote>[=reason]`,
+# e.g. "qcore/origin=gated on ga-qo9w". Parking is PER REMOTE, never per
+# database: parking a whole database would also silence its healthy mirrors,
+# which is the failure the park is supposed to make visible, not hide.
+#
+# WHY HEALTH KNOWS ABOUT PARKS AT ALL (ga-3o5xrw). qcore's dead mirror was
+# deliberately parked on 2026-08-05, but the decision existed only as an env var
+# inside an order file and a note on a bead — not in `gc dolt health`, which is
+# where anyone actually looks. Three agents in one night each investigated that
+# documented silence as a broken alarm, and each filed it as a monitoring defect
+# before finding the park. A monitor must state what it is NOT covering and why,
+# or correct silence costs more than a false alarm would have.
+mirror_park_reason() {
+  _mp_key="$1/$2"
+  [ -z "${GC_DOLT_MIRROR_PARKED:-}" ] && return 0
+  # Split on commas via $IFS word-splitting rather than a `| while read` loop:
+  # the right-hand side of a pipeline is a subshell in POSIX sh, where `return`
+  # is not portable and any state set inside is discarded on exit.
+  _mp_saved_ifs="$IFS"
+  IFS=','
+  # Intentionally unquoted: this is the split.
+  # shellcheck disable=SC2086
+  set -- $GC_DOLT_MIRROR_PARKED
+  IFS="$_mp_saved_ifs"
+  for _mp_entry in "$@"; do
+    _mp_entry=$(printf '%s' "$_mp_entry" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    [ -z "$_mp_entry" ] && continue
+    case "$_mp_entry" in
+      "$_mp_key")
+        printf 'parked\n'
+        return 0
+        ;;
+      "$_mp_key="*)
+        _mp_reason=${_mp_entry#"$_mp_key="}
+        printf '%s\n' "${_mp_reason:-parked}"
+        return 0
+        ;;
+    esac
+  done
+  return 0
+}
 
 # Check off-box mirror freshness (qc-lu207, ga-a8w1c).
 #
@@ -202,6 +259,11 @@ fi
 # fetch-and-classify found local and remote up to date. Health deliberately
 # does not perform network probes itself; they can hang exactly when the remote
 # is down.
+#
+# The verdict is PER DATABASE-AND-REMOTE PAIR (ga-3o5xrw): a database is only
+# as backed up as its least-verified non-parked remote, so one silently
+# under-pushed mirror makes the whole database read stale rather than being
+# averaged away by a healthy sibling.
 #
 # Verdict rules — no data must NEVER read as healthy:
 #   - db with a remote and a recent verification       -> ok
@@ -230,40 +292,78 @@ bf_oldest_epoch=0
 if [ "$server_reachable" = true ] && [ -n "$db_info" ]; then
   # Parse the per-db lines collected above (name|commits|open_beads|remotes).
   bf_lines=$(printf '%s' "$db_info")
-  while IFS='|' read -r bf_name _bf_commits _bf_open bf_remotes; do
+  while IFS='|' read -r bf_name _bf_commits _bf_open bf_remotes bf_remote_names; do
     [ -z "$bf_name" ] && continue
     case "$bf_remotes" in
       '') bf_probe_failed=true; continue ;;   # probe failed: can't classify this db
       0) continue ;;                          # no remote: not a backup target
     esac
     bf_any_remote_db=true
-    bf_stamp="$BACKUP_FRESHNESS_DIR/$bf_name"
-    bf_state="unknown"
-    bf_age=""
-    bf_refspec=""
-    if [ -f "$bf_stamp" ]; then
-      bf_epoch=$(sed -n 's/^pushed_at_epoch=//p' "$bf_stamp" 2>/dev/null | head -1)
-      bf_refspec=$(sed -n 's/^refspec=//p' "$bf_stamp" 2>/dev/null | head -1)
-      case "$bf_epoch" in
-        ''|*[!0-9]*) bf_state="unknown" ;;
-        *)
-          bf_age=$((bf_now - bf_epoch))
-          [ "$bf_age" -lt 0 ] && bf_age=0
-          if [ "$bf_age" -le "$backup_stale_threshold" ]; then
-            bf_state="ok"
-          else
-            bf_state="stale"
-          fi
-          if [ "$bf_oldest_epoch" -eq 0 ] || [ "$bf_epoch" -lt "$bf_oldest_epoch" ]; then
-            bf_oldest_epoch="$bf_epoch"
-          fi
-          ;;
-      esac
-    fi
-    [ "$bf_state" = "unknown" ] && bf_any_unknown=true
-    [ "$bf_state" = "ok" ] || bf_any_bad=true
-    backup_detail="$backup_detail$bf_name|$bf_state|$bf_age|$bf_refspec
+    # The count says there ARE remotes but the name probe came back empty, so
+    # this database's remotes are unknowable. Never fall through to "nothing to
+    # verify" — that is the false-green shape this whole check exists to avoid.
+    if [ -z "$bf_remote_names" ]; then
+      bf_probe_failed=true
+      backup_detail="$backup_detail$bf_name|unknown|||remote list unreadable
 "
+      continue
+    fi
+    # ga-3o5xrw: verify EVERY configured remote, not "some remote". The stamp
+    # used to be one file per database, so on a two-remote database a fresh
+    # stamp could equally mean "the live mirror was pushed" or "the dead mirror
+    # was picked and nothing was pushed at all" — health could not tell those
+    # apart and read ok for both. Requiring a per-remote stamp makes a mirror
+    # that is silently receiving nothing show up as its own stale line.
+    for bf_remote in $(printf '%s\n' "$bf_remote_names" | tr ',' ' '); do
+      [ -z "$bf_remote" ] && continue
+      bf_park_reason=$(mirror_park_reason "$bf_name" "$bf_remote")
+      if [ -n "$bf_park_reason" ]; then
+        # A deliberately parked mirror is excluded from the durability verdict
+        # but still PRINTED (ga-3o5xrw). Correct silence has to be legible as
+        # deliberate: three agents each investigated this park as a broken
+        # alarm in one night because the decision lived only in an order file
+        # and a bead note, nowhere health was actually read.
+        backup_detail="$backup_detail$bf_name@$bf_remote|parked|||$bf_park_reason
+"
+        continue
+      fi
+      bf_stamp="$BACKUP_FRESHNESS_DIR/$bf_name@$bf_remote"
+      bf_state="unknown"
+      bf_age=""
+      bf_refspec=""
+      # Legacy per-database stamp (pre-ga-3o5xrw layout). It records which
+      # remote it was written for, so it is a valid stamp for exactly that
+      # remote and nothing else. Honoring it avoids a spurious city-wide RED
+      # window on the deploy that changes the layout; it ages out on its own
+      # once every remote has been stamped under the new key.
+      if [ ! -f "$bf_stamp" ] && [ -f "$BACKUP_FRESHNESS_DIR/$bf_name" ] &&
+        [ "$(sed -n 's/^remote=//p' "$BACKUP_FRESHNESS_DIR/$bf_name" 2>/dev/null | head -1)" = "$bf_remote" ]; then
+        bf_stamp="$BACKUP_FRESHNESS_DIR/$bf_name"
+      fi
+      if [ -f "$bf_stamp" ]; then
+        bf_epoch=$(sed -n 's/^pushed_at_epoch=//p' "$bf_stamp" 2>/dev/null | head -1)
+        bf_refspec=$(sed -n 's/^refspec=//p' "$bf_stamp" 2>/dev/null | head -1)
+        case "$bf_epoch" in
+          ''|*[!0-9]*) bf_state="unknown" ;;
+          *)
+            bf_age=$((bf_now - bf_epoch))
+            [ "$bf_age" -lt 0 ] && bf_age=0
+            if [ "$bf_age" -le "$backup_stale_threshold" ]; then
+              bf_state="ok"
+            else
+              bf_state="stale"
+            fi
+            if [ "$bf_oldest_epoch" -eq 0 ] || [ "$bf_epoch" -lt "$bf_oldest_epoch" ]; then
+              bf_oldest_epoch="$bf_epoch"
+            fi
+            ;;
+        esac
+      fi
+      [ "$bf_state" = "unknown" ] && bf_any_unknown=true
+      [ "$bf_state" = "ok" ] || bf_any_bad=true
+      backup_detail="$backup_detail$bf_name@$bf_remote|$bf_state|$bf_age|$bf_refspec|
+"
+    done
   done <<BFEOF
 $bf_lines
 BFEOF
@@ -626,12 +726,12 @@ JSONEOF
       "databases": [
 JSONEOF
   first=true
-  echo "$backup_detail" | while IFS='|' read -r bname bstate bage brefspec; do
+  echo "$backup_detail" | while IFS='|' read -r bname bstate bage brefspec bnote; do
     [ -z "$bname" ] && continue
     if [ "$first" = true ]; then first=false; else echo ","; fi
     case "$bage" in ''|*[!0-9]*) bage=null ;; esac
-    printf '        {"name": "%s", "state": "%s", "age_sec": %s, "refspec": "%s"}' \
-      "$bname" "$bstate" "$bage" "$brefspec"
+    printf '        {"name": "%s", "state": "%s", "age_sec": %s, "refspec": "%s", "note": "%s"}' \
+      "$bname" "$bstate" "$bage" "$brefspec" "$bnote"
   done
   cat <<JSONEOF
 
@@ -644,12 +744,12 @@ JSONEOF
     "dolt_backup_dbs": [
 JSONEOF
   first=true
-  echo "$backup_detail" | while IFS='|' read -r bname bstate bage brefspec; do
+  echo "$backup_detail" | while IFS='|' read -r bname bstate bage brefspec bnote; do
     [ -z "$bname" ] && continue
     if [ "$first" = true ]; then first=false; else echo ","; fi
     case "$bage" in ''|*[!0-9]*) bage=null ;; esac
-    printf '      {"name": "%s", "state": "%s", "age_sec": %s, "refspec": "%s"}' \
-      "$bname" "$bstate" "$bage" "$brefspec"
+    printf '      {"name": "%s", "state": "%s", "age_sec": %s, "refspec": "%s", "note": "%s"}' \
+      "$bname" "$bstate" "$bage" "$brefspec" "$bnote"
   done
   cat <<JSONEOF
 
@@ -729,10 +829,16 @@ case "$backup_state" in
     fi ;;
 esac
 if [ -n "$backup_detail" ]; then
-  echo "$backup_detail" | while IFS='|' read -r bname bstate bage brefspec; do
+  echo "$backup_detail" | while IFS='|' read -r bname bstate bage brefspec bnote; do
     [ -z "$bname" ] && continue
-    if [ -n "$bage" ]; then
+    if [ "$bstate" = parked ]; then
+      # Printed, not omitted: a deliberately excluded mirror must be legible as
+      # deliberate in the same output where the others read fresh or stale.
+      echo "  $bname: parked — ${bnote:-no reason recorded} (not counted for durability)"
+    elif [ -n "$bage" ]; then
       echo "  $bname: $bstate (verified ${bage}s ago, $brefspec)"
+    elif [ -n "$bnote" ]; then
+      echo "  $bname: $bstate ($bnote)"
     else
       echo "  $bname: $bstate (no successful verification recorded)"
     fi

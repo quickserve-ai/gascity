@@ -262,10 +262,28 @@ classify_count() {
   '
 }
 
-find_remote_sql() {
+# list_remotes_sql <db> — emit EVERY configured remote as "name|url", one per
+# line, in a deterministic order.
+#
+# ga-3o5xrw: this replaced find_remote_sql, which ran
+#     SELECT name, url FROM dolt_remotes LIMIT 1
+# with no ORDER BY and synced only that single row. A database with N configured
+# remotes therefore got exactly ONE of them pushed per run, chosen by whatever
+# row order the engine happened to return — and the choice VARIED BETWEEN RUNS,
+# which is why the resulting staleness looked intermittent and defeated three
+# root-cause attempts. Measured on qcore (remotes: origin=dead, probe=live):
+# the live mirror won 2 of 5 real patrol runs, so an intended 15-minute offsite
+# cadence ran at ~37 minutes, invisibly.
+#
+# Adding ORDER BY alone would NOT have been a fix. It would have made every run
+# pick the same single remote — and on qcore that is `origin`, the dead one, so
+# the live mirror would then have received nothing at all. Deterministic and
+# wrong is worse than random and sometimes right. The fix is to sync every
+# remote; the ORDER BY is here only so output and tests are reproducible.
+list_remotes_sql() {
   db="$1"
-  remote_csv=$(dolt_sql "USE \`$db\`; SELECT name, url FROM dolt_remotes LIMIT 1") || return 1
-  printf '%s\n' "$remote_csv" | awk -F, 'NR > 1 && $1 != "" {print $1 "|" $2; exit}'
+  remote_csv=$(dolt_sql "USE \`$db\`; SELECT name, url FROM dolt_remotes ORDER BY name") || return 1
+  printf '%s\n' "$remote_csv" | awk -F, 'NR > 1 && $1 != "" {print $1 "|" $2}'
 }
 
 # resolve_refspec_sql <db> — emit two lines: local-branch and remote-branch.
@@ -353,31 +371,69 @@ resolve_refspec_cli() {
   printf 'main\nmain\n'
 }
 
+# sync_database_sql <db> — sync a database to EVERY remote it has configured.
+#
+# ga-3o5xrw: this used to resolve one arbitrary remote and sync only that one.
+# Two failure modes came out of that, and they compounded:
+#   1. a database with N remotes got 1 of them pushed per run, chosen at random;
+#   2. when the arbitrary pick was a BROKEN remote, its fetch failure returned
+#      early and the healthy remote it did not pick got nothing either — so a
+#      failed READ on a dead mirror suppressed the WRITE to a live one.
+# Iterating every remote fixes both: each remote is classified and pushed on its
+# own, and a failure is recorded without short-circuiting the remotes after it.
+#
+# The refspec is resolved ONCE per database, not per remote: it describes which
+# local branch this database publishes, which is a property of the database.
 sync_database_sql() {
-  name="$1"
-  if ! valid_database_name "$name"; then
-    echo "  $name: ERROR: invalid database name" >&2
+  sdb_name="$1"
+  if ! valid_database_name "$sdb_name"; then
+    echo "  $sdb_name: ERROR: invalid database name" >&2
     return 1
   fi
 
-  remote_pair=$(find_remote_sql "$name") || {
-    echo "  $name: ERROR: failed to query remotes" >&2
+  sdb_remotes=$(list_remotes_sql "$sdb_name") || {
+    echo "  $sdb_name: ERROR: failed to query remotes" >&2
     return 1
   }
-  if [ -z "$remote_pair" ]; then
-    echo "  $name: skipped (no remote)"
+  if [ -z "$sdb_remotes" ]; then
+    echo "  $sdb_name: skipped (no remote)"
     return 0
   fi
-  remote_name=${remote_pair%%|*}
-  remote_url=${remote_pair#*|}
-  if ! valid_remote_name "$remote_name"; then
-    echo "  $name: ERROR: invalid remote name: $remote_name" >&2
-    return 1
-  fi
 
-  refspec_pair=$(resolve_refspec_sql "$name") || return 1
-  local_branch=$(printf '%s\n' "$refspec_pair" | sed -n '1p')
-  remote_branch=$(printf '%s\n' "$refspec_pair" | sed -n '2p')
+  sdb_refspec=$(resolve_refspec_sql "$sdb_name") || return 1
+  sdb_local=$(printf '%s\n' "$sdb_refspec" | sed -n '1p')
+  sdb_remote_branch=$(printf '%s\n' "$sdb_refspec" | sed -n '2p')
+
+  sdb_rc=0
+  # Feed the loop from a here-doc, NOT `printf ... | while read`. In POSIX sh
+  # the right-hand side of a pipeline runs in a subshell, so every `sdb_rc=1`
+  # would be discarded when the subshell exits — a database whose every remote
+  # failed would return 0 and the caller would report the sync as successful.
+  while IFS='|' read -r sdb_rname sdb_rurl; do
+    [ -z "$sdb_rname" ] && continue
+    if ! valid_remote_name "$sdb_rname"; then
+      echo "  $sdb_name: ERROR: invalid remote name: $sdb_rname" >&2
+      sdb_rc=1
+      continue
+    fi
+    # One remote's failure must not skip the remotes after it — that
+    # suppression is the defect this loop exists to remove.
+    sync_remote_sql "$sdb_name" "$sdb_rname" "$sdb_rurl" "$sdb_local" "$sdb_remote_branch" || sdb_rc=1
+  done <<SYNCREMOTESEOF
+$sdb_remotes
+SYNCREMOTESEOF
+  return "$sdb_rc"
+}
+
+# sync_remote_sql <db> <remote> <url> <local_branch> <remote_branch> — classify
+# and push ONE database to ONE remote. Returns non-zero when this remote could
+# not be verified or pushed; the caller keeps going to the remaining remotes.
+sync_remote_sql() {
+  name="$1"
+  remote_name="$2"
+  remote_url="$3"
+  local_branch="$4"
+  remote_branch="$5"
 
   # gc-6ommo: fast-forward-only-or-refuse. Unless --force, fetch the remote and
   # classify local vs remotes/<remote>/<remote_branch>. Push only on a
@@ -406,10 +462,10 @@ sync_database_sql() {
       rm -f "$fetch_err_tmp"
     elif [ "$fetch_rc" -eq 124 ]; then
       rm -f "$fetch_err_tmp"
-      echo "  $name: fetch timed out after ${fetch_timeout}s — skipped (NOT pushed)" >&2
+      echo "  $name: fetch timed out after ${fetch_timeout}s — skipped (NOT pushed) [remote $remote_name]" >&2
       return 1
     elif [ "$fetch_rc" -ne 0 ]; then
-      echo "  $name: fetch failed (exit $fetch_rc) — skipped (NOT pushed)" >&2
+      echo "  $name: fetch failed (exit $fetch_rc) — skipped (NOT pushed) [remote $remote_name]" >&2
       if [ -s "$fetch_err_tmp" ]; then
         while IFS= read -r line || [ -n "$line" ]; do
           printf '  %s: %s\n' "$name" "$line" >&2
@@ -467,9 +523,9 @@ sync_database_sql() {
         # falsely stale merely because there was nothing new to push.
         write_backup_push_stamp "$name" "$remote_name" "$local_branch" "$remote_branch"
         ;;
-      behind*)    echo "  $name: $ff_status — pull needed (gc dolt pull)" ;;
-      diverged*)  echo "  $name: $ff_status — manual reconcile" >&2 ;;
-      *)          echo "  $name: skipped [$ff_status]" ;;
+      behind*)    echo "  $name: $ff_status — pull needed (gc dolt pull) [remote $remote_name]" ;;
+      diverged*)  echo "  $name: $ff_status — manual reconcile [remote $remote_name]" >&2 ;;
+      *)          echo "  $name: skipped [$ff_status] [remote $remote_name]" ;;
     esac
     return "$ff_rc"
   fi
@@ -514,9 +570,9 @@ sync_database_sql() {
     # SIGKILLed client leaves no stderr; the no-mechanism path leaves the
     # "cannot run bounded command" marker, so the stderr replay below
     # disambiguates the two at zero extra mechanism.
-    echo "  $name: TIMEOUT after ${push_timeout}s — push manually or increase timeout (GC_DOLT_SYNC_PUSH_TIMEOUT_SECS)" >&2
+    echo "  $name: TIMEOUT after ${push_timeout}s — push manually or increase timeout (GC_DOLT_SYNC_PUSH_TIMEOUT_SECS) [remote $remote_name]" >&2
   else
-    echo "  $name: ERROR: push failed (exit $push_rc)" >&2
+    echo "  $name: ERROR: push failed (exit $push_rc) [remote $remote_name]" >&2
   fi
 
   # Replay the captured dolt stderr, prefixed with the db name for scannable
@@ -538,6 +594,16 @@ sync_database_sql() {
   return 1
 }
 
+# KNOWN LIMITATION, stated rather than hidden (ga-3o5xrw, follow-on ga-34kjld):
+# this CLI fallback still syncs only the FIRST remote in remotes.json. The
+# SQL path above was fixed to sync every configured remote; this one was not,
+# because parsing N remotes out of remotes.json with grep is fragile and CLI
+# mode only runs when the Dolt server is down — a state in which the sync
+# patrol is not the durability mechanism anyway. A multi-remote database synced
+# through this path is under-pushed exactly as the SQL path used to be, and it
+# stamps only the remote it picked, so health reports the others unverified
+# rather than falsely fresh. Do not read the one-remote behavior here as
+# evidence that one remote is the intended contract.
 sync_database_cli() {
   d="$1"
   name="$2"

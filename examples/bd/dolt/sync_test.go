@@ -61,7 +61,7 @@ func writeSyncFakeDolt(t *testing.T, dir string) string {
 	body := `#!/bin/sh
 printf '%s\n' "$*" >> "` + logPath + `"
 case "$*" in
-  *"SELECT name, url FROM dolt_remotes LIMIT 1"*)
+  *"SELECT name, url FROM dolt_remotes"*)
     printf 'name,url\norigin,https://example.invalid/repo\n'
     ;;
   *"CALL DOLT_FETCH("*)
@@ -88,7 +88,7 @@ func writeSyncFakeDoltActiveBranch(t *testing.T, dir, activeBranch string) strin
 	body := `#!/bin/sh
 printf '%s\n' "$*" >> "` + logPath + `"
 case "$*" in
-  *"SELECT name, url FROM dolt_remotes LIMIT 1"*)
+  *"SELECT name, url FROM dolt_remotes"*)
     printf 'name,url\norigin,https://example.invalid/repo\n'
     ;;
   *"CALL DOLT_FETCH("*)
@@ -118,7 +118,7 @@ func writeSyncFakeDoltInvalidActiveBranch(t *testing.T, dir string) string {
 	body := `#!/bin/sh
 printf '%s\n' "$*" >> "` + logPath + `"
 case "$*" in
-  *"SELECT name, url FROM dolt_remotes LIMIT 1"*)
+  *"SELECT name, url FROM dolt_remotes"*)
     printf 'name,url\norigin,https://example.invalid/repo\n'
     ;;
   *"CALL DOLT_FETCH("*)
@@ -148,7 +148,7 @@ func writeSyncFakeDoltRemoteLookupFailure(t *testing.T, dir string) string {
 	body := `#!/bin/sh
 printf '%s\n' "$*" >> "` + logPath + `"
 case "$*" in
-  *"SELECT name, url FROM dolt_remotes LIMIT 1"*)
+  *"SELECT name, url FROM dolt_remotes"*)
     printf 'sql lookup failed\n' >&2
     exit 7
     ;;
@@ -181,7 +181,7 @@ func writeSyncFakeDoltPushFails(t *testing.T, dir string, exitCode int, stderr s
 	body := `#!/bin/sh
 printf '%s\n' "$*" >> "` + logPath + `"
 case "$*" in
-  *"SELECT name, url FROM dolt_remotes LIMIT 1"*)
+  *"SELECT name, url FROM dolt_remotes"*)
     printf 'name,url\norigin,https://example.invalid/repo\n'
     exit 0
     ;;
@@ -223,7 +223,7 @@ func writeSyncFakeDoltPushFailsNoTrailingNewline(t *testing.T, dir string, exitC
 	body := `#!/bin/sh
 printf '%s\n' "$*" >> "` + logPath + `"
 case "$*" in
-  *"SELECT name, url FROM dolt_remotes LIMIT 1"*)
+  *"SELECT name, url FROM dolt_remotes"*)
     printf 'name,url\norigin,https://example.invalid/repo\n'
     exit 0
     ;;
@@ -288,7 +288,7 @@ func writeSyncFakeDoltPushEchoesArgs(t *testing.T, dir string) {
 	body := `#!/bin/sh
 printf '%s\n' "$*" >> "` + logPath + `"
 case "$*" in
-  *"SELECT name, url FROM dolt_remotes LIMIT 1"*)
+  *"SELECT name, url FROM dolt_remotes"*)
     printf 'name,url\norigin,https://example.invalid/repo\n'
     exit 0
     ;;
@@ -398,7 +398,7 @@ func TestSyncUsesLiveSQLWhenManagedServerReachable(t *testing.T) {
 	}
 	log := string(data)
 	for _, want := range []string{
-		"SELECT name, url FROM dolt_remotes LIMIT 1",
+		"SELECT name, url FROM dolt_remotes",
 		"CALL DOLT_PUSH('origin', 'main')",
 	} {
 		if !strings.Contains(log, want) {
@@ -669,7 +669,7 @@ func TestSyncReportsLiveSQLRemoteLookupFailure(t *testing.T) {
 		t.Fatalf("read fake dolt log: %v", err)
 	}
 	log := string(data)
-	if !strings.Contains(log, "SELECT name, url FROM dolt_remotes LIMIT 1") {
+	if !strings.Contains(log, "SELECT name, url FROM dolt_remotes") {
 		t.Fatalf("dolt log missing remote lookup:\n%s", log)
 	}
 	if strings.Contains(log, "DOLT_PUSH") {

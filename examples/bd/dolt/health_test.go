@@ -1744,7 +1744,7 @@ func TestHealthOriginMirrorsReportsWorstCaseAgeAndDefaultStaleness(t *testing.T)
 	const now int64 = 2_000_000_000
 	for db, age := range map[string]int64{"hq": 1801, "qcore": 1800} {
 		stamp := fmt.Sprintf("pushed_at_epoch=%d\nremote=origin\nrefspec=main:main\n", now-age)
-		if err := os.WriteFile(filepath.Join(freshnessDir, db), []byte(stamp), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(freshnessDir, db+"@origin"), []byte(stamp), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1769,6 +1769,7 @@ case "$*" in
   *"SELECT 1"*) exit 0 ;;
   *"dolt_log"*) printf 'COUNT(*)\n1\n' ;;
   *"FROM issues"*) printf 'COUNT(*)\n0\n' ;;
+  *"SELECT name FROM dolt_remotes"*) printf 'name\norigin\n' ;;
   *"FROM dolt_remotes"*) printf 'COUNT(*)\n1\n' ;;
 esac
 exit 0
@@ -1826,10 +1827,12 @@ exit 0
 	for _, db := range mirrors.Databases {
 		states[db.Name] = db.State
 	}
-	if states["hq"] != "stale" || states["qcore"] != "ok" {
-		t.Fatalf("per-db mirror states = %v, want hq stale and qcore ok\n%s", states, out)
+	// ga-3o5xrw: the verdict is keyed per database-and-remote pair, so the
+	// reported name carries the remote it was verified against.
+	if states["hq@origin"] != "stale" || states["qcore@origin"] != "ok" {
+		t.Fatalf("per-remote mirror states = %v, want hq@origin stale and qcore@origin ok\n%s", states, out)
 	}
-	if err := os.Remove(filepath.Join(freshnessDir, "hq")); err != nil {
+	if err := os.Remove(filepath.Join(freshnessDir, "hq@origin")); err != nil {
 		t.Fatal(err)
 	}
 	unknownOut, unknownDoc := runHealth()
