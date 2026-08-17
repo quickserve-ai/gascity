@@ -24,6 +24,13 @@
 #      by name (same key derivation as GC_DOLT_REFSPEC_<DB_UPPER> above). This
 #      pins the remote regardless of scheme — an explicit override is by
 #      definition intentional, so it is honored even for a non-local remote.
+#      A comma-separated list (e.g. GC_DOLT_REMOTE_QCORE=origin,probe) pins
+#      several: each listed remote is fetched, classified and pushed on its
+#      own, in the order given, and one remote's failure never skips the
+#      remotes after it (ga-3o5xrw). Every listed name must be configured.
+#      This is the only way sync pushes more than one remote of a database;
+#      `gc dolt pull` takes a single name, so set a list on the sync order's
+#      environment rather than city-wide.
 #   2. No override: the first file:// remote in name-sorted order wins,
 #      deterministically and independent of whatever order the database
 #      itself returns candidates in (gc-fqi7kq: an unordered SELECT made
@@ -44,6 +51,7 @@
 #   GC_DOLT_REMOTE_<DB>                   (optional) — select which remote to
 #                     push to when a database has several, or to permit
 #                     pushing to a non-file:// remote (see Remote resolution).
+#                     A comma-separated list pushes each listed remote.
 #   GC_DOLT_SYNC_PUSH_TIMEOUT_SECS
 #     (default: 1800) — wall-clock bound for SQL-mode remote push. Increase for
 #                     slow links or large first pushes (a multi-GB first push to
@@ -85,7 +93,8 @@ while [ $# -gt 0 ]; do
       echo ""
       echo "Environment:"
       echo "  GC_DOLT_REMOTE_<DB>              Select which remote to push to when a database has several"
-      echo "                                   (also the only way to push to a non-file:// remote)"
+      echo "                                   (also the only way to push to a non-file:// remote;"
+      echo "                                   a comma-separated list pushes each listed remote)"
       echo "  GC_DOLT_SYNC_FETCH_TIMEOUT_SECS  pre-push fetch bound (default 60)"
       echo "  GC_DOLT_SYNC_PUSH_TIMEOUT_SECS   push bound (default 1800)"
       exit 0
@@ -314,6 +323,13 @@ classify_count() {
 # any policy rule is applied. Returns 1 (with its own stderr message) only when
 # GC_DOLT_REMOTE_<DB> is set but names a remote that is not among the
 # candidates.
+#
+# A comma-separated override emits one "name|url" line per listed remote, in
+# the order listed, duplicates dropped (ga-3o5xrw). One pinned remote per run
+# is not enough for a database mirrored twice: when the pinned mirror is dead,
+# the live one receives nothing (measured on qcore, origin dead and probe
+# live). Listing both keeps every named mirror fed while the default policy
+# above still never selects a network remote that nobody named.
 select_remote() {
   sr_db="$1"
   sr_pairs="$2"
@@ -323,12 +339,27 @@ select_remote() {
 
   sr_override=$(remote_env_value "$sr_db") || return 1
   if [ -n "$sr_override" ]; then
-    sr_match=$(printf '%s\n' "$sr_sorted" | awk -F'|' -v want="$sr_override" '$1 == want {print; exit}')
-    if [ -z "$sr_match" ]; then
-      echo "  $sr_db: ERROR: GC_DOLT_REMOTE override '$sr_override' does not match any configured remote" >&2
+    sr_selected=""
+    sr_wanted=$(printf '%s\n' "$sr_override" | tr ',' '\n' | awk 'length && !seen[$0]++')
+    # A here-doc, not a pipeline, feeds the loop so `return 1` leaves the
+    # function instead of a subshell.
+    while IFS= read -r sr_want; do
+      [ -n "$sr_want" ] || continue
+      sr_match=$(printf '%s\n' "$sr_sorted" | awk -F'|' -v want="$sr_want" '$1 == want {print; exit}')
+      if [ -z "$sr_match" ]; then
+        echo "  $sr_db: ERROR: GC_DOLT_REMOTE override '$sr_want' does not match any configured remote" >&2
+        return 1
+      fi
+      sr_selected="$sr_selected$sr_match
+"
+    done <<SRWANTEOF
+$sr_wanted
+SRWANTEOF
+    if [ -z "$sr_selected" ]; then
+      echo "  $sr_db: ERROR: GC_DOLT_REMOTE override '$sr_override' names no remote" >&2
       return 1
     fi
-    printf '%s\n' "$sr_match"
+    printf '%s' "$sr_selected"
     return 0
   fi
 
@@ -343,11 +374,12 @@ select_remote() {
 }
 
 # find_remote_sql <db> — query all configured remotes over SQL and resolve
-# the one to sync against via select_remote. ORDER BY name keeps the raw
-# query itself deterministic; select_remote re-sorts independently so
-# correctness never relies on the server actually honoring it. Returns 1 when
-# the query itself fails (and reports that), and 2 when select_remote refuses
-# — it has already printed its own, more specific reason.
+# the remote(s) to sync against via select_remote, one "name|url" per line.
+# ORDER BY name keeps the raw query itself deterministic; select_remote
+# re-sorts independently so correctness never relies on the server actually
+# honoring it. Returns 1 when the query itself fails (and reports that), and 2
+# when select_remote refuses — it has already printed its own, more specific
+# reason.
 find_remote_sql() {
   db="$1"
   remote_csv=$(dolt_sql "USE \`$db\`; SELECT name, url FROM dolt_remotes ORDER BY name") || {
@@ -444,6 +476,63 @@ resolve_refspec_cli() {
   printf 'main\nmain\n'
 }
 
+# sync_selected_remotes <db> <pairs> <command> [args...] — run
+# `<command> [args...] <remote> <url>` once for each "name|url" line in <pairs>
+# (select_remote's output), attempting every remote even after one fails.
+#
+# ga-3o5xrw: syncing one remote per run let a failed READ on a dead mirror
+# suppress the WRITE to a live one, because the fetch failure returned before
+# the other remote was ever considered. Each remote is therefore classified and
+# pushed on its own, and a failure is recorded without short-circuiting the
+# remotes after it. Returns non-zero when any remote failed.
+#
+# last_fail_reason keeps the wording #5621's failure summary prints for a
+# single remote; with several remotes, each failure is prefixed with the
+# remote it belongs to, so the summary names every one that failed.
+sync_selected_remotes() {
+  ssr_db="$1"
+  ssr_pairs="$2"
+  shift 2
+  ssr_count=$(printf '%s\n' "$ssr_pairs" | awk 'NF {n++} END {print n + 0}')
+  ssr_rc=0
+  ssr_reasons=""
+  # Feed the loop from a here-doc, NOT `printf ... | while read`. In POSIX sh
+  # the right-hand side of a pipeline runs in a subshell, so ssr_rc would be
+  # discarded when the subshell exits — a database whose every remote failed
+  # would return 0 and the caller would report the sync as successful. Each
+  # per-remote run gets /dev/null on stdin so nothing it spawns can consume the
+  # rest of the remote list.
+  while IFS='|' read -r ssr_remote ssr_url; do
+    [ -z "$ssr_remote" ] && continue
+    last_fail_reason=""
+    ssr_remote_rc=0
+    if valid_remote_name "$ssr_remote"; then
+      "$@" "$ssr_remote" "$ssr_url" </dev/null || ssr_remote_rc=$?
+    else
+      echo "  $ssr_db: ERROR: invalid remote name: $ssr_remote" >&2
+      last_fail_reason="invalid remote name: $ssr_remote"
+      ssr_remote_rc=1
+    fi
+    if [ "$ssr_remote_rc" -ne 0 ]; then
+      ssr_rc=1
+      ssr_reason="${last_fail_reason:-unknown error}"
+      if [ "$ssr_count" -gt 1 ]; then
+        ssr_reason="remote $ssr_remote: $ssr_reason"
+      fi
+      ssr_reasons="${ssr_reasons:+$ssr_reasons; }$ssr_reason"
+    fi
+  done <<SYNCREMOTESEOF
+$ssr_pairs
+SYNCREMOTESEOF
+  last_fail_reason="$ssr_reasons"
+  return "$ssr_rc"
+}
+
+# sync_database_sql <db> — sync a database to the remote(s) select_remote
+# resolves for it (see "Remote resolution" in the header).
+#
+# The refspec is resolved ONCE per database, not per remote: it describes which
+# local branch this database publishes, which is a property of the database.
 sync_database_sql() {
   name="$1"
   if ! valid_database_name "$name"; then
@@ -452,7 +541,7 @@ sync_database_sql() {
     return 1
   fi
 
-  remote_pair=$(find_remote_sql "$name") || {
+  remote_pairs=$(find_remote_sql "$name") || {
     find_rc=$?
     if [ "$find_rc" -eq 2 ]; then
       last_fail_reason="remote selection refused"
@@ -461,25 +550,31 @@ sync_database_sql() {
     fi
     return 1
   }
-  if [ -z "$remote_pair" ] || [ "$remote_pair" = "AMBIGUOUS" ]; then
-    if [ "$remote_pair" = "AMBIGUOUS" ]; then
+  if [ -z "$remote_pairs" ] || [ "$remote_pairs" = "AMBIGUOUS" ]; then
+    if [ "$remote_pairs" = "AMBIGUOUS" ]; then
       echo "  $name: skipped (no local remote; set GC_DOLT_REMOTE_$(db_env_key "$name" 2>/dev/null) to push to a non-local remote)"
     else
       echo "  $name: skipped (no remote)"
     fi
     return 0
   fi
-  remote_name=${remote_pair%%|*}
-  remote_url=${remote_pair#*|}
-  if ! valid_remote_name "$remote_name"; then
-    echo "  $name: ERROR: invalid remote name: $remote_name" >&2
-    last_fail_reason="invalid remote name: $remote_name"
-    return 1
-  fi
 
   refspec_pair=$(resolve_refspec_sql "$name") || { last_fail_reason="refspec resolution failed"; return 1; }
   local_branch=$(printf '%s\n' "$refspec_pair" | sed -n '1p')
   remote_branch=$(printf '%s\n' "$refspec_pair" | sed -n '2p')
+
+  sync_selected_remotes "$name" "$remote_pairs" sync_remote_sql "$name" "$local_branch" "$remote_branch"
+}
+
+# sync_remote_sql <db> <local_branch> <remote_branch> <remote> <url> — classify
+# and push ONE database to ONE remote. Returns non-zero when this remote could
+# not be verified or pushed; sync_selected_remotes still goes on to the next.
+sync_remote_sql() {
+  name="$1"
+  local_branch="$2"
+  remote_branch="$3"
+  remote_name="$4"
+  remote_url="$5"
 
   # gc-6ommo: fast-forward-only-or-refuse. Unless --force, fetch the remote and
   # classify local vs remotes/<remote>/<remote_branch>. Push only on a
@@ -509,11 +604,11 @@ sync_database_sql() {
       rm -f "$fetch_err_tmp"
     elif [ "$fetch_rc" -eq 124 ]; then
       rm -f "$fetch_err_tmp"
-      echo "  $name: fetch timed out after ${fetch_timeout}s — skipped (NOT pushed)" >&2
+      echo "  $name: fetch timed out after ${fetch_timeout}s — skipped (NOT pushed) [remote $remote_name]" >&2
       last_fail_reason="fetch timed out after ${fetch_timeout}s"
       return 1
     elif [ "$fetch_rc" -ne 0 ]; then
-      echo "  $name: fetch failed (exit $fetch_rc) — skipped (NOT pushed)" >&2
+      echo "  $name: fetch failed (exit $fetch_rc) — skipped (NOT pushed) [remote $remote_name]" >&2
       if [ -s "$fetch_err_tmp" ]; then
         while IFS= read -r line || [ -n "$line" ]; do
           printf '  %s: %s\n' "$name" "$line" >&2
@@ -552,7 +647,10 @@ sync_database_sql() {
       # Mirror the real-run exit code (ff_rc) here: up-to-date/behind are benign
       # (0), diverged/classify-failed need human reconcile (1). Without this a
       # --dry-run health-style probe of a diverged/unreconcilable DB reports
-      # success, masking exactly the state dry-run exists to surface.
+      # success, masking exactly the state dry-run exists to surface. The
+      # reason is recorded exactly as the real-run skip path records it, so the
+      # failure summary names the classification rather than "unknown error".
+      last_fail_reason="$ff_status"
       return "$ff_rc"
     elif [ "$force" = true ]; then
       echo "  $name: would force-push $local_branch -> $remote_name:$remote_branch ($remote_url)"
@@ -572,9 +670,9 @@ sync_database_sql() {
         # falsely stale merely because there was nothing new to push.
         write_backup_push_stamp "$name" "$remote_name" "$local_branch" "$remote_branch"
         ;;
-      behind*)    echo "  $name: $ff_status — pull needed (gc dolt pull)" ;;
-      diverged*)  echo "  $name: $ff_status — manual reconcile" >&2 ;;
-      *)          echo "  $name: skipped [$ff_status]" ;;
+      behind*)    echo "  $name: $ff_status — pull needed (gc dolt pull) [remote $remote_name]" ;;
+      diverged*)  echo "  $name: $ff_status — manual reconcile [remote $remote_name]" >&2 ;;
+      *)          echo "  $name: skipped [$ff_status] [remote $remote_name]" ;;
     esac
     last_fail_reason="$ff_status"
     return "$ff_rc"
@@ -621,10 +719,10 @@ sync_database_sql() {
     # SIGKILLed client leaves no stderr; the no-mechanism path leaves the
     # "cannot run bounded command" marker, so the stderr replay below
     # disambiguates the two at zero extra mechanism.
-    echo "  $name: TIMEOUT after ${push_timeout}s — push manually or increase timeout (GC_DOLT_SYNC_PUSH_TIMEOUT_SECS)" >&2
+    echo "  $name: TIMEOUT after ${push_timeout}s — push manually or increase timeout (GC_DOLT_SYNC_PUSH_TIMEOUT_SECS) [remote $remote_name]" >&2
     last_fail_reason="TIMEOUT after ${push_timeout}s"
   else
-    echo "  $name: ERROR: push failed (exit $push_rc)" >&2
+    echo "  $name: ERROR: push failed (exit $push_rc) [remote $remote_name]" >&2
     last_fail_reason="push failed (exit $push_rc)"
   fi
 
@@ -658,6 +756,9 @@ remotes_json_pairs() {
     sed 's/"name":"//;s/","url":"/|/;s/"$//'
 }
 
+# sync_database_cli <db-dir> <db> — the CLI-mode twin of sync_database_sql,
+# used only when the SQL server is down. Same remote selection, including a
+# listed override pushing each named remote.
 sync_database_cli() {
   d="$1"
   name="$2"
@@ -668,30 +769,35 @@ sync_database_cli() {
 
   # Check for remote.
   pairs=$(remotes_json_pairs "$d/.dolt/remotes.json")
-  remote_pair=$(select_remote "$name" "$pairs") || {
+  remote_pairs=$(select_remote "$name" "$pairs") || {
     last_fail_reason="remote selection refused"
     return 1
   }
-  if [ -z "$remote_pair" ] || [ "$remote_pair" = "AMBIGUOUS" ]; then
-    if [ "$remote_pair" = "AMBIGUOUS" ]; then
+  if [ -z "$remote_pairs" ] || [ "$remote_pairs" = "AMBIGUOUS" ]; then
+    if [ "$remote_pairs" = "AMBIGUOUS" ]; then
       echo "  $name: skipped (no local remote; set GC_DOLT_REMOTE_$(db_env_key "$name" 2>/dev/null) to push to a non-local remote)"
     else
       echo "  $name: skipped (no remote)"
     fi
     return 0
   fi
-  remote_name=${remote_pair%%|*}
-  remote=${remote_pair#*|}
-
-  if ! valid_remote_name "$remote_name"; then
-    echo "  $name: ERROR: invalid remote name: $remote_name" >&2
-    last_fail_reason="invalid remote name: $remote_name"
-    return 1
-  fi
 
   refspec_pair=$(resolve_refspec_cli "$d" "$name") || { last_fail_reason="refspec resolution failed"; return 1; }
   local_branch=$(printf '%s\n' "$refspec_pair" | sed -n '1p')
   remote_branch=$(printf '%s\n' "$refspec_pair" | sed -n '2p')
+
+  sync_selected_remotes "$name" "$remote_pairs" sync_remote_cli "$d" "$name" "$local_branch" "$remote_branch"
+}
+
+# sync_remote_cli <db-dir> <db> <local_branch> <remote_branch> <remote> <url> —
+# push ONE database to ONE remote with the dolt CLI.
+sync_remote_cli() {
+  d="$1"
+  name="$2"
+  local_branch="$3"
+  remote_branch="$4"
+  remote_name="$5"
+  remote="$6"
 
   if [ "$dry_run" = true ]; then
     echo "  $name: would push $local_branch -> $remote_name:$remote_branch ($remote)"
