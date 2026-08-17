@@ -221,17 +221,21 @@ db_name_is_safe() {
   return 0
 }
 
-# db_commit_and_open_counts NAME — emit `NAME|commits|open_beads` by querying the
-# running server for NAME's commit count (dolt_log) and open-bead count (issues
-# WHERE status='open'). Both counts come from SQL against the live server: it is
-# authoritative, never deadlocks with an on-disk dolt client, and is cheap.
-# 0 on timeout, error, or a database without the table (a non-beads DB) — the
-# same fail-soft contract for every database so one bad DB never hangs the
-# report. Under managed Dolt the beads live in the server's `issues` table, not
-# an on-disk beads.jsonl (absent or stale), which the old file grep reported as
-# open_beads=0 for every live database (#3200). Extract the first fully-numeric
-# line rather than a fixed row so a future `USE`/warning banner cannot silently
-# collapse the count to 0.
+# db_commit_and_open_counts NAME — emit `NAME|commits|open_beads|remotes|remote_names`
+# by querying the running server for NAME's commit count (dolt_log) and
+# open-bead count (issues WHERE status='open'). Both counts come from SQL
+# against the live server: it is authoritative, never deadlocks with an on-disk
+# dolt client, and is cheap. 0 on timeout, error, or a database without the
+# table (a non-beads DB) — the same fail-soft contract for every database so
+# one bad DB never hangs the report. Under managed Dolt the beads live in the
+# server's `issues` table, not an on-disk beads.jsonl (absent or stale), which
+# the old file grep reported as open_beads=0 for every live database (#3200).
+# Extract the first fully-numeric line rather than a fixed row so a future
+# `USE`/warning banner cannot silently collapse the count to 0.
+#
+# The remote fields feed the origin-mirror verdict: the count stays EMPTY on
+# probe failure, so mirror freshness fails closed instead of claiming no
+# target, and the names list every configured remote.
 db_commit_and_open_counts() {
   _name="$1"
   _commits_csv=$(run_bounded 5 dolt $conn_args sql --result-format csv \
@@ -242,7 +246,23 @@ db_commit_and_open_counts() {
     -q "USE \`$_name\`; SELECT COUNT(*) FROM issues WHERE status='open';" 2>/dev/null || true)
   _open_beads=$(printf '%s\n' "$_open_csv" | grep -E '^[0-9]+$' | head -1)
   case "$_open_beads" in ''|*[!0-9]*) _open_beads=0 ;; esac
-  printf '%s|%s|%s\n' "$_name" "$_commits" "$_open_beads"
+  _remotes_csv=$(run_bounded 5 dolt $conn_args sql --result-format csv \
+    -q "USE \`$_name\`; SELECT COUNT(*) FROM dolt_remotes;" 2>/dev/null || true)
+  _remotes=$(printf '%s\n' "$_remotes_csv" | grep -E '^[0-9]+$' | head -1)
+  case "$_remotes" in *[!0-9]*) _remotes= ;; esac
+  # ga-3o5xrw: the COUNT alone cannot say WHICH remotes are configured, and the
+  # mirror-freshness verdict below needs the names — it has to require a recent
+  # stamp for EACH of them, not merely for "some remote". Field 4 keeps its
+  # existing meaning (count; empty = the probe failed and remotes are
+  # unknowable) so nothing downstream changes; field 5 adds the names.
+  _remote_names=""
+  if [ -n "$_remotes" ] && [ "$_remotes" != "0" ]; then
+    _names_csv=$(run_bounded 5 dolt $conn_args sql --result-format csv \
+      -q "USE \`$_name\`; SELECT name FROM dolt_remotes ORDER BY name;" 2>/dev/null || true)
+    _remote_names=$(printf '%s\n' "$_names_csv" | sed '1d' | tr -d '"\r' \
+      | grep -E '^[A-Za-z0-9_.-]+$' | paste -sd, -)
+  fi
+  printf '%s|%s|%s|%s|%s\n' "$_name" "$_commits" "$_open_beads" "$_remotes" "$_remote_names"
 }
 
 # external_database_names — list user databases on a configured external Dolt
@@ -434,6 +454,196 @@ if [ -n "$newest_backup" ]; then
   migration_freshness=$(format_age "$migration_age_sec")
   migration_stale=false
   [ "$migration_age_sec" -gt 1800 ] && migration_stale=true
+fi
+
+# mirror_park_reason <db> <remote> — echo the reason a database/remote pair is
+# deliberately excluded from the mirror durability verdict, or nothing if it
+# is not.
+#
+# GC_DOLT_MIRROR_PARKED is a comma-separated list of `<db>/<remote>[=reason]`,
+# e.g. "qcore/origin=gated on ga-qo9w". Parking is PER REMOTE, never per
+# database: parking a whole database would also silence its healthy mirrors,
+# which is the failure the park is supposed to make visible, not hide.
+#
+# WHY HEALTH KNOWS ABOUT PARKS AT ALL (ga-3o5xrw). qcore's dead mirror was
+# deliberately parked on 2026-08-05, but the decision existed only as an env var
+# inside an order file and a note on a bead — not in `gc dolt health`, which is
+# where anyone actually looks. Three agents in one night each investigated that
+# documented silence as a broken alarm, and each filed it as a monitoring defect
+# before finding the park. A monitor must state what it is NOT covering and why,
+# or correct silence costs more than a false alarm would have.
+mirror_park_reason() {
+  _mp_key="$1/$2"
+  [ -z "${GC_DOLT_MIRROR_PARKED:-}" ] && return 0
+  # Split on commas via $IFS word-splitting rather than a `| while read` loop:
+  # the right-hand side of a pipeline is a subshell in POSIX sh, where `return`
+  # is not portable and any state set inside is discarded on exit.
+  _mp_saved_ifs="$IFS"
+  IFS=','
+  # Intentionally unquoted: this is the split.
+  # shellcheck disable=SC2086
+  set -- $GC_DOLT_MIRROR_PARKED
+  IFS="$_mp_saved_ifs"
+  for _mp_entry in "$@"; do
+    _mp_entry=$(printf '%s' "$_mp_entry" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    [ -z "$_mp_entry" ] && continue
+    case "$_mp_entry" in
+      "$_mp_key")
+        printf 'parked\n'
+        return 0
+        ;;
+      "$_mp_key="*)
+        _mp_reason=${_mp_entry#"$_mp_key="}
+        printf '%s\n' "${_mp_reason:-parked}"
+        return 0
+        ;;
+    esac
+  done
+  return 0
+}
+
+# Check off-box mirror freshness (qc-lu207, ga-a8w1c).
+#
+# This plane is reported under backups.origin_mirrors and never through the
+# dolt_* fields above: those date the LOCAL backup remotes under
+# GC_BACKUP_ARTIFACT_DIR by their manifests, and a fresh local backup says
+# nothing about whether any off-box remote has received the data, nor the
+# reverse.
+#
+# Source of truth: remote-verification stamps written by sync/compact into
+# $BACKUP_FRESHNESS_DIR (see runtime.sh). A stamp means the sync path recently
+# proved the remote contains the local branch: either a push succeeded or a
+# fetch-and-classify found local and remote up to date. Health deliberately
+# does not perform network probes itself; they can hang exactly when the remote
+# is down.
+#
+# The verdict is PER DATABASE-AND-REMOTE PAIR (ga-3o5xrw): a database is only
+# as backed up as its least-verified non-parked remote, so one silently
+# under-pushed mirror makes the whole database read stale rather than being
+# averaged away by a healthy sibling. Every configured remote counts, including
+# one `gc dolt sync` does not select by default (see its "Remote resolution"):
+# name it in GC_DOLT_REMOTE_<DB> so sync pushes it, or park it here.
+#
+# Verdict rules — no data must NEVER read as healthy:
+#   - db with a remote and a recent verification       -> ok
+#   - db with a remote and an old verification         -> stale
+#   - db with a remote and NO verification             -> unknown
+#     (a fresh install reads "unknown" until sync first verifies its remote)
+#   - db without a remote                              -> skipped (not a target)
+#   - no db has a remote                               -> state "no-remotes",
+#     stale=false: that is a MEASURED verdict (nothing is supposed to be
+#     mirrored), unlike the historical fail-open where stale=false was just an
+#     initializer that never got overwritten.
+#   - server unreachable (remotes unknowable)          -> unknown, stale=true
+mirror_stale_threshold="${GC_DOLT_BACKUP_STALE_SECS:-1800}"
+case "$mirror_stale_threshold" in ''|*[!0-9]*) mirror_stale_threshold=1800 ;; esac
+mirror_freshness=""
+mirror_stale=true
+mirror_age_sec=0
+mirror_state="unknown"
+mirror_detail=""
+bf_any_remote_db=false
+bf_any_bad=false
+bf_any_unknown=false
+bf_probe_failed=false
+bf_oldest_epoch=0
+if [ "$server_reachable" = true ] && [ -n "$db_info" ]; then
+  # Parse the per-db lines collected above
+  # (name|commits|open_beads|remote_count|remote_names).
+  bf_lines=$(printf '%s' "$db_info")
+  while IFS='|' read -r bf_name _bf_commits _bf_open bf_remotes bf_remote_names; do
+    [ -z "$bf_name" ] && continue
+    case "$bf_remotes" in
+      '') bf_probe_failed=true; continue ;;   # probe failed: can't classify this db
+      0) continue ;;                          # no remote: not a mirror target
+    esac
+    bf_any_remote_db=true
+    # The count says there ARE remotes but the name probe came back empty, so
+    # this database's remotes are unknowable. Never fall through to "nothing to
+    # verify" — that is the false-green shape this whole check exists to avoid.
+    if [ -z "$bf_remote_names" ]; then
+      bf_probe_failed=true
+      mirror_detail="$mirror_detail$bf_name|unknown|||remote list unreadable
+"
+      continue
+    fi
+    # ga-3o5xrw: verify EVERY configured remote, not "some remote". The stamp
+    # used to be one file per database, so on a two-remote database a fresh
+    # stamp could equally mean "the live mirror was pushed" or "the dead mirror
+    # was picked and nothing was pushed at all" — health could not tell those
+    # apart and read ok for both. Requiring a per-remote stamp makes a mirror
+    # that is silently receiving nothing show up as its own stale line.
+    for bf_remote in $(printf '%s\n' "$bf_remote_names" | tr ',' ' '); do
+      [ -z "$bf_remote" ] && continue
+      bf_park_reason=$(mirror_park_reason "$bf_name" "$bf_remote")
+      if [ -n "$bf_park_reason" ]; then
+        # A deliberately parked mirror is excluded from the durability verdict
+        # but still PRINTED (ga-3o5xrw). Correct silence has to be legible as
+        # deliberate: three agents each investigated this park as a broken
+        # alarm in one night because the decision lived only in an order file
+        # and a bead note, nowhere health was actually read.
+        mirror_detail="$mirror_detail$bf_name@$bf_remote|parked|||$bf_park_reason
+"
+        continue
+      fi
+      bf_stamp="$BACKUP_FRESHNESS_DIR/$bf_name@$bf_remote"
+      bf_state="unknown"
+      bf_age=""
+      bf_refspec=""
+      # Legacy per-database stamp (pre-ga-3o5xrw layout). It records which
+      # remote it was written for, so it is a valid stamp for exactly that
+      # remote and nothing else. Honoring it avoids a spurious city-wide RED
+      # window on the deploy that changes the layout; it ages out on its own
+      # once every remote has been stamped under the new key.
+      if [ ! -f "$bf_stamp" ] && [ -f "$BACKUP_FRESHNESS_DIR/$bf_name" ] &&
+        [ "$(sed -n 's/^remote=//p' "$BACKUP_FRESHNESS_DIR/$bf_name" 2>/dev/null | head -1)" = "$bf_remote" ]; then
+        bf_stamp="$BACKUP_FRESHNESS_DIR/$bf_name"
+      fi
+      if [ -f "$bf_stamp" ]; then
+        bf_epoch=$(sed -n 's/^pushed_at_epoch=//p' "$bf_stamp" 2>/dev/null | head -1)
+        bf_refspec=$(sed -n 's/^refspec=//p' "$bf_stamp" 2>/dev/null | head -1)
+        case "$bf_epoch" in
+          ''|*[!0-9]*) bf_state="unknown" ;;
+          *)
+            bf_age=$((now - bf_epoch))
+            [ "$bf_age" -lt 0 ] && bf_age=0
+            if [ "$bf_age" -le "$mirror_stale_threshold" ]; then
+              bf_state="ok"
+            else
+              bf_state="stale"
+            fi
+            if [ "$bf_oldest_epoch" -eq 0 ] || [ "$bf_epoch" -lt "$bf_oldest_epoch" ]; then
+              bf_oldest_epoch="$bf_epoch"
+            fi
+            ;;
+        esac
+      fi
+      [ "$bf_state" = "unknown" ] && bf_any_unknown=true
+      [ "$bf_state" = "ok" ] || bf_any_bad=true
+      mirror_detail="$mirror_detail$bf_name@$bf_remote|$bf_state|$bf_age|$bf_refspec|
+"
+    done
+  done <<BFEOF
+$bf_lines
+BFEOF
+  if [ "$bf_any_remote_db" = false ] && [ "$bf_probe_failed" = false ]; then
+    mirror_state="no-remotes"
+    mirror_stale=false
+  elif [ "$bf_probe_failed" = true ] || [ "$bf_any_unknown" = true ]; then
+    mirror_state="unknown"
+    mirror_stale=true
+  elif [ "$bf_any_bad" = true ]; then
+    mirror_state="stale"
+    mirror_stale=true
+  else
+    mirror_state="ok"
+    mirror_stale=false
+  fi
+fi
+if [ "$bf_oldest_epoch" -gt 0 ] && [ "$bf_any_unknown" = false ] && [ "$bf_probe_failed" = false ]; then
+  mirror_age_sec=$((now - bf_oldest_epoch))
+  [ "$mirror_age_sec" -lt 0 ] && mirror_age_sec=0
+  mirror_freshness=$(format_age "$mirror_age_sec")
 fi
 
 # Find orphan databases.
@@ -705,7 +915,7 @@ if [ "$json_output" = true ]; then
   "databases": [
 JSONEOF
   first=true
-  echo "$db_info" | while IFS='|' read -r name commits open_beads; do
+  echo "$db_info" | while IFS='|' read -r name commits open_beads remotes; do
     [ -z "$name" ] && continue
     if [ "$first" = true ]; then first=false; else echo ","; fi
     printf '    {"name": "%s", "commits": %s, "open_beads": %s}' "$name" "$commits" "$open_beads"
@@ -735,7 +945,30 @@ JSONEOF
   done
   cat <<JSONEOF
 
-    ]
+    ],
+    "origin_mirrors": {
+      "freshness": "$mirror_freshness",
+      "age_sec": $mirror_age_sec,
+      "stale": $mirror_stale,
+      "state": "$mirror_state",
+      "databases": [
+JSONEOF
+  first=true
+  echo "$mirror_detail" | while IFS='|' read -r bname bstate bage brefspec bnote; do
+    [ -z "$bname" ] && continue
+    if [ "$first" = true ]; then first=false; else echo ","; fi
+    case "$bage" in ''|*[!0-9]*) bage=null ;; esac
+    # The park reason comes from operator env and the refspec from a stamp
+    # file; escape backslash then quote so neither can break the document.
+    brefspec_esc=$(printf '%s' "$brefspec" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    bnote_esc=$(printf '%s' "$bnote" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    printf '        {"name": "%s", "state": "%s", "age_sec": %s, "refspec": "%s", "note": "%s"}' \
+      "$bname" "$bstate" "$bage" "$brefspec_esc" "$bnote_esc"
+  done
+  cat <<JSONEOF
+
+      ]
+    }
   },
   "orphans": [
 JSONEOF
@@ -795,7 +1028,7 @@ fi
 if [ -n "$db_info" ]; then
   echo ""
   echo "Databases:"
-  echo "$db_info" | while IFS='|' read -r name commits open_beads; do
+  echo "$db_info" | while IFS='|' read -r name commits open_beads remotes; do
     [ -z "$name" ] && continue
     echo "  $name: $commits commits, $open_beads open beads"
   done
@@ -821,6 +1054,37 @@ if [ "$migration_measured" = true ]; then
   migration_stale_note=""
   [ "$migration_stale" = true ] && migration_stale_note=" [STALE]"
   echo "Migration snapshots: ${migration_freshness} ago${migration_stale_note}"
+fi
+
+case "$mirror_state" in
+  no-remotes)
+    echo "Origin mirrors: no databases have a configured remote" ;;
+  ok)
+    echo "Origin mirrors: ok (last verified ${mirror_freshness} ago)" ;;
+  *)
+    stale=""
+    [ "$mirror_stale" = true ] && [ "$mirror_state" != "stale" ] && stale=" [STALE]"
+    if [ -n "$mirror_freshness" ]; then
+      echo "Origin mirrors: ${mirror_state}${stale} (last verified ${mirror_freshness} ago)"
+    else
+      echo "Origin mirrors: ${mirror_state}${stale} (no successful verification recorded)"
+    fi ;;
+esac
+if [ -n "$mirror_detail" ]; then
+  echo "$mirror_detail" | while IFS='|' read -r bname bstate bage brefspec bnote; do
+    [ -z "$bname" ] && continue
+    if [ "$bstate" = parked ]; then
+      # Printed, not omitted: a deliberately excluded mirror must be legible as
+      # deliberate in the same output where the others read fresh or stale.
+      echo "  $bname: parked — ${bnote:-no reason recorded} (not counted for durability)"
+    elif [ -n "$bage" ]; then
+      echo "  $bname: $bstate (verified ${bage}s ago, $brefspec)"
+    elif [ -n "$bnote" ]; then
+      echo "  $bname: $bstate ($bnote)"
+    else
+      echo "  $bname: $bstate (no successful verification recorded)"
+    fi
+  done
 fi
 
 if [ "$quarantine_count" -gt 0 ]; then

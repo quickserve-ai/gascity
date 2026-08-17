@@ -2557,3 +2557,119 @@ func TestHealthReportsARemoteWithChunksButNoManifestAsNeverBackedUp(t *testing.T
 		t.Errorf("dolt_age_sec = %d, want -1; the chunk's mtime must not pass for a backup age\n%s", backups.DoltAgeSec, out)
 	}
 }
+
+// TestHealthOriginMirrorsReportsWorstCaseAgeAndDefaultStaleness pins the
+// off-box mirror plane (qc-lu207): it reports the OLDEST per-remote stamp
+// against the 1800s default, reads a missing stamp as unknown rather than
+// fresh, and lives under backups.origin_mirrors without touching the dolt_*
+// fields that measure local backups.
+func TestHealthOriginMirrorsReportsWorstCaseAgeAndDefaultStaleness(t *testing.T) {
+	cityPath := t.TempDir()
+	dataDir := filepath.Join(cityPath, ".beads", "dolt")
+	for _, db := range []string{"hq", "qcore"} {
+		if err := os.MkdirAll(filepath.Join(dataDir, db, ".dolt"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stateDir := t.TempDir()
+	freshnessDir := filepath.Join(stateDir, "backup-freshness")
+	if err := os.MkdirAll(freshnessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const now int64 = 2_000_000_000
+	for db, age := range map[string]int64{"hq": 1801, "qcore": 1800} {
+		stamp := fmt.Sprintf("pushed_at_epoch=%d\nremote=origin\nrefspec=main:main\n", now-age)
+		if err := os.WriteFile(filepath.Join(freshnessDir, db+"@origin"), []byte(stamp), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	binDir := t.TempDir()
+	writeExecutable(t, filepath.Join(binDir, "gc"), "#!/bin/sh\nexit 1\n")
+	writeExecutable(t, filepath.Join(binDir, "nc"), "#!/bin/sh\nexit 0\n")
+	writeExecutable(t, filepath.Join(binDir, "lsof"), "#!/bin/sh\necho 424242\n")
+	writeExecutable(t, filepath.Join(binDir, "date"), `#!/bin/sh
+case "$1" in
+  +%s%N) echo 2000000000000000000 ;;
+  +%s) echo 2000000000 ;;
+  *) /bin/date "$@" ;;
+esac
+`)
+	writeExecutable(t, filepath.Join(binDir, "ps"), `#!/bin/sh
+if [ "$1" = "-p" ]; then echo " 424242"; exit 0; fi
+exit 0
+`)
+	writeExecutable(t, filepath.Join(binDir, "dolt"), `#!/bin/sh
+case "$*" in
+  *"SELECT 1"*) exit 0 ;;
+  *"dolt_log"*) printf 'COUNT(*)\n1\n' ;;
+  *"FROM issues"*) printf 'COUNT(*)\n0\n' ;;
+  *"SELECT name FROM dolt_remotes"*) printf 'name\norigin\n' ;;
+  *"FROM dolt_remotes"*) printf 'COUNT(*)\n1\n' ;;
+esac
+exit 0
+`)
+	root := repoRoot(t)
+	type healthDoc struct {
+		Backups struct {
+			DoltMeasured  bool  `json:"dolt_measured"`
+			DoltStale     *bool `json:"dolt_stale"`
+			OriginMirrors struct {
+				State     string `json:"state"`
+				Stale     bool   `json:"stale"`
+				AgeSec    int64  `json:"age_sec"`
+				Databases []struct {
+					Name  string `json:"name"`
+					State string `json:"state"`
+				} `json:"databases"`
+			} `json:"origin_mirrors"`
+		} `json:"backups"`
+	}
+	runHealth := func() ([]byte, healthDoc) {
+		cmd := exec.Command("sh", filepath.Join(root, healthScript), "--json")
+		cmd.Env = append(filteredEnv("GC_CITY_PATH", "GC_PACK_DIR", "GC_PACK_STATE_DIR", "GC_DOLT_DATA_DIR", "GC_DOLT_HOST", "GC_DOLT_PORT", "GC_DOLT_USER", "GC_DOLT_PASSWORD", "GC_DOLT_BACKUP_STALE_SECS", "GC_HEALTH_SKIP_ZOMBIE_SCAN", "PATH"),
+			"GC_CITY_PATH="+cityPath, "GC_PACK_DIR="+root, "GC_PACK_STATE_DIR="+stateDir,
+			"GC_DOLT_DATA_DIR="+dataDir, "GC_DOLT_HOST=127.0.0.1", "GC_DOLT_PORT=3306",
+			"GC_DOLT_USER=root", "GC_DOLT_PASSWORD=", "GC_HEALTH_SKIP_ZOMBIE_SCAN=1",
+			"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("health --json: %v\n%s", err, out)
+		}
+		var doc healthDoc
+		if err := json.Unmarshal(out, &doc); err != nil {
+			t.Fatalf("parse health JSON: %v\n%s", err, out)
+		}
+		return out, doc
+	}
+	out, doc := runHealth()
+	mirrors := doc.Backups.OriginMirrors
+	if mirrors.State != "stale" || !mirrors.Stale {
+		t.Fatalf("origin mirrors = %+v, want stale worst-case verdict\n%s", mirrors, out)
+	}
+	if mirrors.AgeSec != 1801 {
+		t.Fatalf("origin mirrors age = %d, want the exact oldest stamp age 1801\n%s", mirrors.AgeSec, out)
+	}
+	// The mirror plane must not leak into the dolt_* fields, which date LOCAL
+	// backup remotes by their manifests (#5329). This city has no .dolt-backup
+	// directory, so the local plane stays unmeasured however stale its mirrors are.
+	if doc.Backups.DoltMeasured || doc.Backups.DoltStale != nil {
+		t.Fatalf("dolt_measured=%v dolt_stale=%v, want false/null: mirror freshness leaked into the local backup fields\n%s", doc.Backups.DoltMeasured, doc.Backups.DoltStale, out)
+	}
+	states := map[string]string{}
+	for _, db := range mirrors.Databases {
+		states[db.Name] = db.State
+	}
+	// ga-3o5xrw: the verdict is keyed per database-and-remote pair, so the
+	// reported name carries the remote it was verified against.
+	if states["hq@origin"] != "stale" || states["qcore@origin"] != "ok" {
+		t.Fatalf("per-remote mirror states = %v, want hq@origin stale and qcore@origin ok\n%s", states, out)
+	}
+	if err := os.Remove(filepath.Join(freshnessDir, "hq@origin")); err != nil {
+		t.Fatal(err)
+	}
+	unknownOut, unknownDoc := runHealth()
+	unknown := unknownDoc.Backups.OriginMirrors
+	if unknown.State != "unknown" || !unknown.Stale || unknown.AgeSec != 0 {
+		t.Fatalf("origin mirrors with missing hq stamp = %+v, want unknown/stale with no finite aggregate age\n%s", unknown, unknownOut)
+	}
+}
