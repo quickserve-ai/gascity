@@ -29,6 +29,7 @@ package dolt_test
 // the pre-fix script and FAILS there; the failure mode is recorded on each.
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -78,6 +79,15 @@ exit 0
 // and returns the fake's argv log, the command output, and the freshness dir.
 func runMultiRemoteSync(t *testing.T, binDir string) (log, out, freshnessDir string) {
 	t.Helper()
+	log, out, _, freshnessDir = runMultiRemoteSyncEnv(t, binDir)
+	return log, out, freshnessDir
+}
+
+// runMultiRemoteSyncEnv is runMultiRemoteSync with extra environment and the
+// sync's own exit code, which the parked-remote case turns on: the point of
+// skipping a parked remote is that the run SUCCEEDS.
+func runMultiRemoteSyncEnv(t *testing.T, binDir string, extraEnv ...string) (log, out string, exitCode int, freshnessDir string) {
+	t.Helper()
 	root := repoRoot(t)
 	port, cleanup := startReachableTCPListener(t)
 	defer cleanup()
@@ -99,8 +109,18 @@ func runMultiRemoteSync(t *testing.T, binDir string) (log, out, freshnessDir str
 		"GC_DOLT_USER=root",
 		"GC_DOLT_PASSWORD=",
 	)
-	raw, _ := cmd.CombinedOutput()
-	return readLog(t, filepath.Join(binDir, "dolt.log")), string(raw),
+	cmd.Env = append(cmd.Env, extraEnv...)
+	raw, err := cmd.CombinedOutput()
+	code := 0
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			code = exitErr.ExitCode()
+		} else {
+			t.Fatalf("run sync: %v", err)
+		}
+	}
+	return readLog(t, filepath.Join(binDir, "dolt.log")), string(raw), code,
 		filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "backup-freshness")
 }
 
@@ -338,5 +358,42 @@ func TestHealthParkIsPerRemoteNotPerDatabase(t *testing.T) {
 	}
 	if strings.Contains(out, `"dolt_backup_state": "ok"`) {
 		t.Fatalf("a database-level park entry cleared the verdict:\n%s", out)
+	}
+}
+
+
+// TestSyncSkipsAParkedRemoteAndStillSucceeds pins the other half of parking.
+//
+// Health already excludes a parked pair from the durability verdict. Sync did
+// not: it still fetched the abandoned mirror, still failed on it, and that
+// failure is the run's exit code — so dolt-remotes-patrol reported exec-failed
+// on EVERY cycle while the live mirror was being pushed perfectly. An alarm
+// that is always red cannot tell anyone that a remote we still care about has
+// broken.
+//
+// PRE-FIX FAILURE (verified by removing the park check from sync_database_sql):
+// the log contains DOLT_FETCH('origin' and the run exits 1.
+func TestSyncSkipsAParkedRemoteAndStillSucceeds(t *testing.T) {
+	binDir := t.TempDir()
+	fakeDoltTwoRemotes(t, binDir)
+	log, out, code, freshnessDir := runMultiRemoteSyncEnv(t, binDir,
+		"GC_DOLT_MIRROR_PARKED=app/origin=corrupt remote-side; gated on a federation decision")
+
+	if strings.Contains(log, "DOLT_FETCH('origin'") {
+		t.Fatalf("a parked remote was contacted anyway.\nlog:\n%s", log)
+	}
+	if code != 0 {
+		t.Fatalf("sync exited %d with only a PARKED remote failing; the patrol reads this as a failed run.\nout:\n%s", code, out)
+	}
+	// Parking is not silence: the skip must be visible, with its reason.
+	if !strings.Contains(out, "parked remote origin") || !strings.Contains(out, "corrupt remote-side") {
+		t.Fatalf("the parked remote was skipped without saying so, or without its reason.\nout:\n%s", out)
+	}
+	// The remote that is NOT parked must still be pushed and stamped.
+	if !strings.Contains(log, "DOLT_PUSH('probe'") {
+		t.Fatalf("parking one remote suppressed the live one.\nlog:\n%s\nout:\n%s", log, out)
+	}
+	if _, err := os.Stat(filepath.Join(freshnessDir, "app@probe")); err != nil {
+		t.Fatalf("live remote not stamped while a sibling was parked: %v\nout:\n%s", err, out)
 	}
 }

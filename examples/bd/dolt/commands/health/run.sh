@@ -206,51 +206,6 @@ if [ -d "$data_dir" ] && [ "$server_reachable" = true ]; then
   done
 fi
 
-# mirror_park_reason <db> <remote> — echo the reason a database/remote pair is
-# deliberately excluded from the durability verdict, or nothing if it is not.
-#
-# GC_DOLT_MIRROR_PARKED is a comma-separated list of `<db>/<remote>[=reason]`,
-# e.g. "qcore/origin=gated on ga-qo9w". Parking is PER REMOTE, never per
-# database: parking a whole database would also silence its healthy mirrors,
-# which is the failure the park is supposed to make visible, not hide.
-#
-# WHY HEALTH KNOWS ABOUT PARKS AT ALL (ga-3o5xrw). qcore's dead mirror was
-# deliberately parked on 2026-08-05, but the decision existed only as an env var
-# inside an order file and a note on a bead — not in `gc dolt health`, which is
-# where anyone actually looks. Three agents in one night each investigated that
-# documented silence as a broken alarm, and each filed it as a monitoring defect
-# before finding the park. A monitor must state what it is NOT covering and why,
-# or correct silence costs more than a false alarm would have.
-mirror_park_reason() {
-  _mp_key="$1/$2"
-  [ -z "${GC_DOLT_MIRROR_PARKED:-}" ] && return 0
-  # Split on commas via $IFS word-splitting rather than a `| while read` loop:
-  # the right-hand side of a pipeline is a subshell in POSIX sh, where `return`
-  # is not portable and any state set inside is discarded on exit.
-  _mp_saved_ifs="$IFS"
-  IFS=','
-  # Intentionally unquoted: this is the split.
-  # shellcheck disable=SC2086
-  set -- $GC_DOLT_MIRROR_PARKED
-  IFS="$_mp_saved_ifs"
-  for _mp_entry in "$@"; do
-    _mp_entry=$(printf '%s' "$_mp_entry" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-    [ -z "$_mp_entry" ] && continue
-    case "$_mp_entry" in
-      "$_mp_key")
-        printf 'parked\n'
-        return 0
-        ;;
-      "$_mp_key="*)
-        _mp_reason=${_mp_entry#"$_mp_key="}
-        printf '%s\n' "${_mp_reason:-parked}"
-        return 0
-        ;;
-    esac
-  done
-  return 0
-}
-
 # Check off-box mirror freshness (qc-lu207, ga-a8w1c).
 #
 # Source of truth: remote-verification stamps written by sync/compact into

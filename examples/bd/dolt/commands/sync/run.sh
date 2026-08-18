@@ -416,6 +416,17 @@ sync_database_sql() {
       sdb_rc=1
       continue
     fi
+    # A parked remote is one we have already decided to abandon (ga-3o5xrw).
+    # Do not fetch it, do not push it, and above all do not fail on it: an
+    # abandoned mirror that returns non-zero every cycle holds the patrol
+    # permanently exec-failed, and a signal that is always red says nothing
+    # when a remote we DO care about breaks. Printed, never silent — the same
+    # rule health follows.
+    sdb_park=$(mirror_park_reason "$sdb_name" "$sdb_rname")
+    if [ -n "$sdb_park" ]; then
+      echo "  $sdb_name: skipped parked remote $sdb_rname ($sdb_park)"
+      continue
+    fi
     # One remote's failure must not skip the remotes after it — that
     # suppression is the defect this loop exists to remove.
     sync_remote_sql "$sdb_name" "$sdb_rname" "$sdb_rurl" "$sdb_local" "$sdb_remote_branch" || sdb_rc=1
