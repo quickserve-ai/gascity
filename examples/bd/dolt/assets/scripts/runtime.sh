@@ -123,10 +123,19 @@ GC_BEADS_BD_SCRIPT="$GC_CITY_PATH/.gc/scripts/gc-beads-bd.sh"
 # mirror_park_reason <db> <remote> — echo the reason a database/remote pair is
 # deliberately excluded from the durability verdict, or nothing if it is not.
 #
-# GC_DOLT_MIRROR_PARKED is a comma-separated list of `<db>/<remote>[=reason]`,
-# e.g. "qcore/origin=gated on ga-qo9w". Parking is PER REMOTE, never per
-# database: parking a whole database would also silence its healthy mirrors,
-# which is the failure the park is supposed to make visible, not hide.
+# THE DECLARATION HAS TWO SOURCES, in this precedence order:
+#
+#   1. GC_DOLT_MIRROR_PARKED — a comma-separated list of `<db>/<remote>[=reason]`,
+#      e.g. "qcore/origin=gated on ga-qo9w". An explicit override for one
+#      invocation or one order. A reason here may not contain a comma.
+#   2. $GC_CITY_PATH/config/dolt/mirrors-parked — the city's declaration file,
+#      one entry per line, `#` comments and blank lines ignored, reasons free to
+#      contain commas. This is the source of truth; the env var exists to
+#      override it.
+#
+# Parking is PER REMOTE, never per database: parking a whole database would also
+# silence its healthy mirrors, which is the failure the park is supposed to make
+# visible, not hide.
 #
 # WHY HEALTH KNOWS ABOUT PARKS AT ALL (ga-3o5xrw). qcore's dead mirror was
 # deliberately parked on 2026-08-05, but the decision existed only as an env var
@@ -135,33 +144,61 @@ GC_BEADS_BD_SCRIPT="$GC_CITY_PATH/.gc/scripts/gc-beads-bd.sh"
 # documented silence as a broken alarm, and each filed it as a monitoring defect
 # before finding the park. A monitor must state what it is NOT covering and why,
 # or correct silence costs more than a false alarm would have.
+#
+# WHY THE FILE EXISTS (ga-p2xtt4). Fixing the above by teaching health to read an
+# env var did not finish the job: [order.env] reaches the two patrols and nothing
+# else, so a person or agent typing `gc dolt health` still saw the parked mirror
+# as "unknown" and the aggregate as STALE — the same false alarm, from the same
+# decision, on the read path that everyone actually uses. A declaration that only
+# some callers can see is not a declaration. It is also why the file, not the env
+# var, is the source of truth: gc has no city-wide pack env (ga-7fbot5), so an
+# env-only park has to be copied into every caller and silently rots out of step.
+MIRROR_PARK_FILE="$GC_CITY_PATH/config/dolt/mirrors-parked"
+
+# _mirror_park_match_entry <db/remote key> <entry> — echo the reason and succeed
+# when this one declaration entry parks the key, else fail. Both sources share it
+# so the env form and the file form cannot drift in how they match.
+_mirror_park_match_entry() {
+  _mpm_key="$1"
+  _mpm_entry=$(printf '%s' "$2" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  case "$_mpm_entry" in
+    ''|'#'*) return 1 ;;
+    "$_mpm_key")
+      printf 'parked\n'
+      return 0
+      ;;
+    "$_mpm_key="*)
+      _mpm_reason=${_mpm_entry#"$_mpm_key="}
+      printf '%s\n' "${_mpm_reason:-parked}"
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 mirror_park_reason() {
   _mp_key="$1/$2"
-  [ -z "${GC_DOLT_MIRROR_PARKED:-}" ] && return 0
-  # Split on commas via $IFS word-splitting rather than a `| while read` loop:
-  # the right-hand side of a pipeline is a subshell in POSIX sh, where `return`
-  # is not portable and any state set inside is discarded on exit.
-  _mp_saved_ifs="$IFS"
-  IFS=','
-  # Intentionally unquoted: this is the split.
-  # shellcheck disable=SC2086
-  set -- $GC_DOLT_MIRROR_PARKED
-  IFS="$_mp_saved_ifs"
-  for _mp_entry in "$@"; do
-    _mp_entry=$(printf '%s' "$_mp_entry" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-    [ -z "$_mp_entry" ] && continue
-    case "$_mp_entry" in
-      "$_mp_key")
-        printf 'parked\n'
-        return 0
-        ;;
-      "$_mp_key="*)
-        _mp_reason=${_mp_entry#"$_mp_key="}
-        printf '%s\n' "${_mp_reason:-parked}"
-        return 0
-        ;;
-    esac
-  done
+  if [ -n "${GC_DOLT_MIRROR_PARKED:-}" ]; then
+    # Split on commas via $IFS word-splitting rather than a `| while read` loop:
+    # the right-hand side of a pipeline is a subshell in POSIX sh, where `return`
+    # is not portable and any state set inside is discarded on exit.
+    _mp_saved_ifs="$IFS"
+    IFS=','
+    # Intentionally unquoted: this is the split.
+    # shellcheck disable=SC2086
+    set -- $GC_DOLT_MIRROR_PARKED
+    IFS="$_mp_saved_ifs"
+    for _mp_entry in "$@"; do
+      _mirror_park_match_entry "$_mp_key" "$_mp_entry" && return 0
+    done
+    return 0
+  fi
+  [ -r "$MIRROR_PARK_FILE" ] || return 0
+  # A redirect, not a pipe: `while ... done < file` runs in this shell, so the
+  # `return` below actually returns from mirror_park_reason.
+  while IFS= read -r _mp_line || [ -n "$_mp_line" ]; do
+    _mirror_park_match_entry "$_mp_key" "$_mp_line" && return 0
+  done < "$MIRROR_PARK_FILE"
   return 0
 }
 
