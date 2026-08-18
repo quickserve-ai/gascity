@@ -1868,7 +1868,10 @@ write_backup_push_stamp hq origin main main-flat-20260716
 		t.Fatalf("write_backup_push_stamp: %v\n%s", err, out)
 	}
 
-	raw, err := os.ReadFile(filepath.Join(stateDir, "backup-freshness", "hq"))
+	// ga-3o5xrw: the stamp is keyed per database-AND-remote pair, so a
+	// database with N remotes can record which of them was actually verified.
+	// A per-database key could only ever answer "was SOMETHING pushed?".
+	raw, err := os.ReadFile(filepath.Join(stateDir, "backup-freshness", "hq@origin"))
 	if err != nil {
 		t.Fatalf("stamp not written: %v", err)
 	}
@@ -1883,7 +1886,7 @@ write_backup_push_stamp hq origin main main-flat-20260716
 	if !strings.Contains(content, "refspec=main:main-flat-20260716\n") {
 		t.Fatalf("stamp missing refspec line:\n%s", content)
 	}
-	if _, err := os.Stat(filepath.Join(stateDir, "backup-freshness", "hq.tmp")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(stateDir, "backup-freshness", "hq@origin.tmp")); !os.IsNotExist(err) {
 		t.Fatalf("tmp stamp left behind: %v", err)
 	}
 }
