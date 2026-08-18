@@ -1867,7 +1867,15 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 	if cityErr == nil && cfg != nil {
 		rigStores = buildStandaloneRigStores(cfg, cityPath, stderr)
 	}
-	unclaimWorkAssignedToRetiredSessionBead(store, rigStores, closedSessionBead, "", stderr)
+	// ga-sdynmb: cfg is what makes this close non-destructive for CREW. A provider
+	// flip or config-drift roll runs `gc session close <agent>` (city.toml documents
+	// it as the required move -- `reset` does not re-resolve the provider), and this
+	// sweep used to clear the assignee on EVERY open/in_progress bead the agent held,
+	// across the city AND rig stores, with runTargetFallback="" leaving them unrouted
+	// as well. Passing cfg lets the sweep keep work whose assignee is a still-configured
+	// [[named_session]] identity, which the respawned agent re-acquires; a genuinely
+	// retired or pool session matches nothing in cfg and is released exactly as before.
+	unclaimWorkAssignedToRetiredSessionBead(store, rigStores, closedSessionBead, "", cfg, stderr)
 
 	if asJSON {
 		if err := writeSessionActionJSON(stdout, sessionActionResult{

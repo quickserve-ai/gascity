@@ -7758,7 +7758,7 @@ func TestUnclaimResetsInProgressStatus(t *testing.T) {
 	}
 
 	var stderr bytes.Buffer
-	unclaimWorkAssignedToRetiredSessionBead(store, nil, sessionBead, "myrig/codex-max", &stderr)
+	unclaimWorkAssignedToRetiredSessionBead(store, nil, sessionBead, "myrig/codex-max", nil, &stderr)
 
 	gotInProgress, err := store.Get(work.ID)
 	if err != nil {
@@ -7814,7 +7814,7 @@ func TestUnclaimWorkAssignedToRetiredSessionBeadPreservesRunTargetRoute(t *testi
 	}
 
 	var stderr bytes.Buffer
-	unclaimWorkAssignedToRetiredSessionBead(store, nil, sessionBead, "fallback/worker", &stderr)
+	unclaimWorkAssignedToRetiredSessionBead(store, nil, sessionBead, "fallback/worker", nil, &stderr)
 
 	got, err := store.Get(work.ID)
 	if err != nil {
@@ -7874,7 +7874,7 @@ func TestUnclaimWorkAssignedToRetiredSessionBeadClearsSessionAffinity(t *testing
 	}
 
 	var stderr bytes.Buffer
-	unclaimWorkAssignedToRetiredSessionBead(store, nil, sessionBead, "fallback/worker", &stderr)
+	unclaimWorkAssignedToRetiredSessionBead(store, nil, sessionBead, "fallback/worker", nil, &stderr)
 
 	got, err := store.Get(work.ID)
 	if err != nil {
@@ -8284,6 +8284,7 @@ func TestUnclaimWorkAssignedToRetiredSessionBeadClearsRigStoreSessionIdentifiers
 		map[string]beads.Store{"frontend": rigStore},
 		sessionBead,
 		"frontend/codex-max",
+		nil,
 		&stderr,
 	)
 

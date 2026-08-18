@@ -290,6 +290,7 @@ func TestUnclaimWorkAssignedToRetiredSessionBead_UsesLiveOpenOwnership(t *testin
 		nil,
 		beads.Bead{ID: "retired-session"},
 		"worker",
+		nil,
 		io.Discard,
 	)
 
@@ -322,6 +323,7 @@ func TestUnclaimWorkAssignedToRetiredSessionBead_IncludesEphemeralWork(t *testin
 		nil,
 		beads.Bead{ID: "retired-session"},
 		"worker",
+		nil,
 		io.Discard,
 	)
 

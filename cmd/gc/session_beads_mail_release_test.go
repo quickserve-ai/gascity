@@ -179,7 +179,7 @@ func TestUnclaimWorkAssignedToRetiredSessionBeadLeavesMailBeadUntouched(t *testi
 	}
 
 	var stderr bytes.Buffer
-	unclaimWorkAssignedToRetiredSessionBead(store, nil, sessionBead, "fallback/worker", &stderr)
+	unclaimWorkAssignedToRetiredSessionBead(store, nil, sessionBead, "fallback/worker", nil, &stderr)
 
 	gotMail, err := store.Get(mailBead.ID)
 	if err != nil {

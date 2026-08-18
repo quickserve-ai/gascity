@@ -827,7 +827,11 @@ func retireRemovedConfiguredNamedSessionBead(
 		fmt.Fprintf(stderr, "session beads: archiving removed named session %s: %v\n", b.ID, err) //nolint:errcheck
 		return false
 	}
-	unclaimWorkAssignedToRetiredSessionBead(store, rigStores, b, retiredSessionFallbackRoute(b), stderr)
+	// cfg=nil is deliberate and behavior-preserving: this path fires only for a
+	// named session whose spec was REMOVED from the config, so that identity does
+	// NOT survive and isConfiguredNamedSessionIdentity would report false for it
+	// under any cfg. A real retirement must still release its work.
+	unclaimWorkAssignedToRetiredSessionBead(store, rigStores, b, retiredSessionFallbackRoute(b), nil, stderr)
 	cancelStateAssignedToRetiredSessionBead(store, b.ID, now, stderr)
 	return true
 }
@@ -1062,6 +1066,7 @@ func unclaimWorkAssignedToRetiredSessionBead(
 	rigStores map[string]beads.Store,
 	sessionBead beads.Bead,
 	fallbackRoute string,
+	cfg *config.City,
 	stderr io.Writer,
 ) {
 	if store == nil || strings.TrimSpace(sessionBead.ID) == "" {
@@ -1076,6 +1081,31 @@ func unclaimWorkAssignedToRetiredSessionBead(
 		wa := workAssignmentForStore(beads.WorkStore{Store: ownerStore})
 		for _, status := range []string{"open", "in_progress"} {
 			for _, assignee := range identifiers {
+				// ga-sdynmb: A RESTART IS NOT A RETIREMENT. When the closing
+				// session's assignee names a [[named_session]] that is STILL in
+				// the city config, that identity outlives this session bead: the
+				// supervisor respawns the same agent under the same identity and
+				// its own hook re-finds the work. Detaching here left 91 crew
+				// beads open+unassigned+unrouted across three session rolls on
+				// 2026-08-17/18 -- invisible to the pool demand probe (keys on
+				// gc.routed_to), skipped by releaseOrphanedPoolAssignments (skips
+				// empty-routed beads), and deliberately not recovered by the
+				// witness (orphan recovery is scoped to POOL/EPHEMERAL identities,
+				// so crew work is never dumped into the polecat pool). Nothing
+				// picked them up, and the clear emitted no ledger event, so the
+				// loss was silent in both directions.
+				//
+				// isConfiguredNamedSessionIdentity is structural (cfg only, no
+				// store lookup), so it holds exactly when the identity survives
+				// the close, and it already excludes a SUSPENDED named agent --
+				// whose work must still be released, since the named-session tier
+				// will not claim for a suspended agent. Ephemeral identifiers (the
+				// session bead ID, the "rig--agent" session_name form) do not match
+				// a configured identity and are still released, so work bound to a
+				// dying identifier is never stranded on it.
+				if isConfiguredNamedSessionIdentity(cfg, assignee) {
+					continue
+				}
 				work, err := wa.OpenAssignedTo(assignee, status, beads.TierBoth, true)
 				if err != nil {
 					fmt.Fprintf(stderr, "session beads: listing work assigned to retired session %s via %q: %v\n", sessionBead.ID, assignee, err) //nolint:errcheck
