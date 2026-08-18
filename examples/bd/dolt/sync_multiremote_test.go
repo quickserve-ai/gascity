@@ -135,6 +135,14 @@ func TestSyncPushesEveryConfiguredRemote(t *testing.T) {
 	if !strings.Contains(out, "remote origin") {
 		t.Fatalf("the broken remote's failure was not reported against its name.\nout:\n%s", out)
 	}
+	// Pin the QUERY, not just the loop. The fake above answers any dolt_remotes
+	// query with both rows, so restoring `LIMIT 1` in the SQL text leaves every
+	// assertion above green while a real server hands back exactly one row and
+	// the defect is fully back. Verified: with `LIMIT 1` restored and this
+	// assertion removed, this test passes.
+	if strings.Contains(log, "FROM dolt_remotes LIMIT") {
+		t.Fatalf("the remote lookup is limited to a single row again — against a real server that reinstates the coin flip.\nlog:\n%s", log)
+	}
 }
 
 // TestSyncStampsThePushedRemoteNotTheDatabase pins the stamp key. The old
