@@ -136,7 +136,22 @@ func (s *Store) StaleOpenRuns(cutoff time.Time) ([]OrderRun, error) {
 	if s.store.Store == nil {
 		return nil, nil
 	}
-	all, err := s.store.ListByLabel(labelOrderTracking, 0, beads.WithBothTiers)
+	// LIVE, for the same cache-bypass reason as RecentRunsAll/OpenRuns, and this
+	// one is load-bearing: tracking beads are created and closed through the
+	// dispatcher's OWN uncached handle, so a cached read never observes them at
+	// all. Reading non-Live here made the stale-tracking watchdog return zero rows
+	// every 30s for 43h against a frozen city cache while the (Live) open-work
+	// gate saw the very same beads and held the orders shut — ga-v5vnyp.
+	// Sort oldest-first so the caller's close budget drains the oldest jam rather
+	// than an arbitrary slice of it (the wrapper drops Sort, leaving Go map order).
+	// IncludeClosed stays false and there is deliberately no Status filter, so
+	// in_progress tracking beads are still returned exactly as before.
+	all, err := beads.HandlesFor(s.store.Store).Live.List(beads.ListQuery{
+		Label:         labelOrderTracking,
+		IncludeClosed: false,
+		Sort:          beads.SortCreatedAsc,
+		TierMode:      beads.TierBoth,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -161,7 +176,15 @@ func (s *Store) OrphanedOpenRuns() ([]OrderRun, error) {
 	if s.store.Store == nil {
 		return nil, nil
 	}
-	all, err := s.store.ListByLabel(labelOrderTracking, 0, beads.WithBothTiers)
+	// LIVE for the same reason as StaleOpenRuns: the startup sweep exists to clean
+	// up after a controller that died holding tracking beads, and a cache primed by
+	// the very process doing the sweeping cannot be trusted to contain them.
+	all, err := beads.HandlesFor(s.store.Store).Live.List(beads.ListQuery{
+		Label:         labelOrderTracking,
+		IncludeClosed: false,
+		Sort:          beads.SortCreatedAsc,
+		TierMode:      beads.TierBoth,
+	})
 	if err != nil {
 		return nil, err
 	}

@@ -1987,6 +1987,100 @@ func TestOrderTrackingSweepWatchdogClosesAllStaleTracking(t *testing.T) {
 	}
 }
 
+// TestOrderTrackingSweepWatchdogSeesBeadsWrittenBehindTheCache is the
+// regression test for ga-v5vnyp, and it is deliberately built on the PRODUCTION
+// store stack rather than a bare MemStore.
+//
+// That distinction is the whole point. Every other watchdog test here hands
+// CityRuntime a raw beads.NewMemStore(), so every read is authoritative and the
+// suite stayed green for the entire 43 hours the watchdog was blind in
+// production. The real controller store is a beadPolicyStore wrapping a
+// CachingStore, and order-tracking beads are created and closed through the
+// DISPATCHER's own uncached handle — so the cache never observes them. A
+// non-Live read therefore returns zero rows forever, the watchdog prints
+// nothing (it only speaks when it closes >0), and two orders sat gated for 51
+// minutes behind a 2-minute age-out that was running the whole time.
+//
+// The test reproduces exactly that: prime the cache while the store is EMPTY,
+// then write the stale tracking bead straight to the backing. Revert either
+// sweep reader to s.store.ListByLabel and this fails.
+func TestOrderTrackingSweepWatchdogSeesBeadsWrittenBehindTheCache(t *testing.T) {
+	backing := beads.NewMemStore()
+	cached := beads.NewCachingStoreForTest(backing, nil)
+	if err := cached.PrimeActive(); err != nil {
+		t.Fatalf("PrimeActive(): %v", err)
+	}
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	store := wrapStoreWithBeadPolicies(cached, cfg)
+
+	// Written AFTER the prime and NOT through the cache — the dispatcher's
+	// uncached-handle shape.
+	stale, err := backing.Create(beads.Bead{
+		Title:  "order:nudge-on-route",
+		Labels: []string{"order-run:nudge-on-route", labelOrderTracking},
+	})
+	if err != nil {
+		t.Fatalf("Create(stale): %v", err)
+	}
+
+	cr := &CityRuntime{
+		cityName:            "test-city",
+		cfg:                 cfg,
+		standaloneCityStore: store,
+		stdout:              io.Discard,
+		stderr:              io.Discard,
+		logPrefix:           "gc test",
+	}
+	cr.runOrderTrackingSweepWatchdog(time.Now().Add(orderTrackingSweepWatchdogStaleAfter + time.Second))
+
+	got, err := backing.Get(stale.ID)
+	if err != nil {
+		t.Fatalf("Get(stale): %v", err)
+	}
+	if got.Status != "closed" {
+		t.Fatalf("stale tracking status = %s, want closed — the watchdog read a cached snapshot that never contained this bead (ga-v5vnyp)", got.Status)
+	}
+}
+
+// TestOrphanedOrderTrackingSweepSeesBeadsWrittenBehindTheCache is the same
+// proof for the STARTUP sweep, which is the other non-Live reader. It is the
+// net that is supposed to catch tracking beads orphaned by a controller that
+// died holding them — and it runs inside the very process whose cache cannot
+// be trusted to contain them.
+func TestOrphanedOrderTrackingSweepSeesBeadsWrittenBehindTheCache(t *testing.T) {
+	backing := beads.NewMemStore()
+	cached := beads.NewCachingStoreForTest(backing, nil)
+	if err := cached.PrimeActive(); err != nil {
+		t.Fatalf("PrimeActive(): %v", err)
+	}
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	store := wrapStoreWithBeadPolicies(cached, cfg)
+
+	orphan, err := backing.Create(beads.Bead{
+		Title:  "order:order-tracking-sweep",
+		Labels: []string{"order-run:" + orderTrackingSweepOrder, labelOrderTracking},
+	})
+	if err != nil {
+		t.Fatalf("Create(orphan): %v", err)
+	}
+
+	// The startup path (CityRuntime.sweepOrphanedOrderTracking) opens its own
+	// store from cityPath rather than using standaloneCityStore, so drive the
+	// sweep function directly with the production-shaped store. What this pins
+	// is the READER: OrphanedOpenRuns must see a bead the cache never absorbed.
+	if _, err := sweepOrphanedOrderTrackingLimit(store, orderTrackingSweepCloseBudget); err != nil {
+		t.Fatalf("sweepOrphanedOrderTrackingLimit(): %v", err)
+	}
+
+	got, err := backing.Get(orphan.ID)
+	if err != nil {
+		t.Fatalf("Get(orphan): %v", err)
+	}
+	if got.Status != "closed" {
+		t.Fatalf("orphaned tracking status = %s, want closed — the startup sweep read a cached snapshot (ga-v5vnyp)", got.Status)
+	}
+}
+
 func TestOrderTrackingSweepWatchdogUsesCloseBudget(t *testing.T) {
 	store := beads.NewMemStore()
 	ids := make([]string, 0, orderTrackingSweepCloseBudget+1)
@@ -4704,6 +4798,98 @@ func TestCityRuntimeTickSchemaSkewHoldsBeforePoolDeathHook(t *testing.T) {
 
 	if _, err := os.Stat(hookOutput); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("on_death hook ran before schema-skew hold: stat error = %v", err)
+	}
+}
+
+// TestCityRuntimeTickJudgesPoolDeathByPreReloadHandlers pins that a pool
+// instance which died before a config reload is judged by the handler set it
+// died under. The reload in the same tick drops the dead instance's handler —
+// the bounded pool is removed, or the unlimited pool is rediscovered without
+// the stopped instance — yet its pre-reload on_death hook must run exactly
+// once, and prevPoolRunning must be reset rather than keep the dead instance
+// marked running for a later handler set to fire on.
+func TestCityRuntimeTickJudgesPoolDeathByPreReloadHandlers(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		maxSessions string
+		keepPool    bool
+	}{
+		{name: "bounded_pool_removed", maxSessions: "2", keepPool: false},
+		{name: "unlimited_pool_rediscovered_without_dead_instance", maxSessions: "-1", keepPool: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cityPath := t.TempDir()
+			tomlPath := filepath.Join(cityPath, "city.toml")
+			hookOutput := filepath.Join(cityPath, "on-death-runs")
+			poolTOML := "[[agent]]\nname = \"worker\"\nstart_command = \"true\"\n" +
+				"min_active_sessions = 0\nmax_active_sessions = " + tc.maxSessions + "\n" +
+				"on_death = \"echo fired >> " + shellQuotePath(hookOutput) + "\"\n"
+			writeConfig := func(body string) {
+				t.Helper()
+				clearInheritedBeadsEnv(t)
+				requireNoLeakedDoltAfterForPaths(t, cityPath)
+				data := "[workspace]\nname = \"test-city\"\n\n[beads]\nprovider = \"file\"\n\n[session]\nprovider = \"fake\"\n\n" + body
+				if err := os.WriteFile(tomlPath, []byte(data), 0o644); err != nil {
+					t.Fatalf("write config: %v", err)
+				}
+			}
+			writeConfig(poolTOML)
+			cfg, err := config.Load(osFS{}, tomlPath)
+			if err != nil {
+				t.Fatalf("load config: %v", err)
+			}
+
+			const deadSession = "worker-1"
+			sp := runtime.NewFake()
+			if err := sp.Start(context.Background(), deadSession, runtime.Config{}); err != nil {
+				t.Fatalf("start %s: %v", deadSession, err)
+			}
+			cr := newTestCityRuntime(t, CityRuntimeParams{
+				CityPath: cityPath, CityName: "test-city", TomlPath: tomlPath,
+				Cfg: cfg, SP: sp, Dops: newDrainOps(sp), Rec: events.Discard,
+				BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+					return DesiredStateResult{State: map[string]TemplateParams{}}
+				},
+				Stdout: io.Discard, Stderr: io.Discard,
+			})
+			cs := newControllerState(context.Background(), cfg, sp, events.NewFake(), "test-city", cityPath)
+			cs.cityBeadStore = beads.NewMemStore()
+			cr.setControllerState(cs)
+
+			cr.poolDeathHandlers = computePoolDeathHandlers(cfg, "test-city", cityPath, sp, io.Discard)
+			if _, ok := cr.poolDeathHandlers[deadSession]; !ok {
+				t.Fatalf("pre-reload handlers %v have no entry for %s", cr.poolDeathHandlers, deadSession)
+			}
+			previousRunning := map[string]bool{deadSession: true}
+			if err := sp.Stop(deadSession); err != nil {
+				t.Fatalf("stop %s: %v", deadSession, err)
+			}
+
+			if tc.keepPool {
+				writeConfig(poolTOML + "\n[daemon]\nshutdown_timeout = \"9s\"\n")
+			} else {
+				writeConfig("")
+			}
+			var dirty atomic.Bool
+			dirty.Store(true)
+			lastProviderName := "fake"
+
+			cr.tick(context.Background(), &dirty, &lastProviderName, cityPath, &previousRunning, "pool-death-reload-test")
+
+			if _, ok := cr.poolDeathHandlers[deadSession]; ok {
+				t.Fatalf("reload kept a handler for %s, so this fixture no longer drops it: %v", deadSession, cr.poolDeathHandlers)
+			}
+			data, err := os.ReadFile(hookOutput)
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("read on_death output: %v", err)
+			}
+			if got := strings.Count(string(data), "fired"); got != 1 {
+				t.Errorf("pre-reload on_death hook for %s ran %d times, want exactly 1", deadSession, got)
+			}
+			if len(previousRunning) != 0 {
+				t.Errorf("prevPoolRunning = %v after the tick, want it reset (nothing is running)", previousRunning)
+			}
+		})
 	}
 }
 
