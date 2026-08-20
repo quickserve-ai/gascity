@@ -51,6 +51,7 @@ and the behavior check.
 | Doctor live-rig classification (ga-w7xo) | 5886594b1 | Prevent a live rig DB on the managed endpoint from being labeled orphan. | Upstream equivalent topology classification. |
 | Navigator contract | 73d410d71, 0cdd157f7 | Stable navigator classification fields and regenerated API/dashboard clients. | Upstream exposes the same wire contract. |
 | Bundled pack pin | 6b747120d, fe59ba7c0 | Canonical core/bd pin names a real carry commit containing current embedded pack content. | Re-pin whenever current carry pack content changes. |
+| Cross-city mail (upstream #5386 cherry-pick, ga-d755oq) | 84acc9794 | `gc --context <peer> mail send / reply / inbox` routed to a REMOTE city over the control plane (`cmd/gc/mail_remote.go`, `api.Client.SendMail/ReplyMail/ListMailInboxPage`). Carried as the single upstream commit `cdcd0611c1` (gastownhall/gascity PR #5386, still OPEN at carry time) per Cherub/Alex-town direction — deliberately NOT the fork-PR #3 copy (`3a8c37580`) and NOT fork-PR #4's portable beads pin, which ride together on `origin/carry/operational`. Only conflict: reply help text (kept our `--notify` wording, appended the remote paragraph). | Upstream merges #5386 — the range-diff then absorbs it; take upstream's line unmodified. |
 
 ## Deploy recipe
 
