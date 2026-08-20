@@ -1731,6 +1731,100 @@ func TestOrderTrackingSweepWatchdogClosesAllStaleTracking(t *testing.T) {
 	}
 }
 
+// TestOrderTrackingSweepWatchdogSeesBeadsWrittenBehindTheCache is the
+// regression test for ga-v5vnyp, and it is deliberately built on the PRODUCTION
+// store stack rather than a bare MemStore.
+//
+// That distinction is the whole point. Every other watchdog test here hands
+// CityRuntime a raw beads.NewMemStore(), so every read is authoritative and the
+// suite stayed green for the entire 43 hours the watchdog was blind in
+// production. The real controller store is a beadPolicyStore wrapping a
+// CachingStore, and order-tracking beads are created and closed through the
+// DISPATCHER's own uncached handle — so the cache never observes them. A
+// non-Live read therefore returns zero rows forever, the watchdog prints
+// nothing (it only speaks when it closes >0), and two orders sat gated for 51
+// minutes behind a 2-minute age-out that was running the whole time.
+//
+// The test reproduces exactly that: prime the cache while the store is EMPTY,
+// then write the stale tracking bead straight to the backing. Revert either
+// sweep reader to s.store.ListByLabel and this fails.
+func TestOrderTrackingSweepWatchdogSeesBeadsWrittenBehindTheCache(t *testing.T) {
+	backing := beads.NewMemStore()
+	cached := beads.NewCachingStoreForTest(backing, nil)
+	if err := cached.PrimeActive(); err != nil {
+		t.Fatalf("PrimeActive(): %v", err)
+	}
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	store := wrapStoreWithBeadPolicies(cached, cfg)
+
+	// Written AFTER the prime and NOT through the cache — the dispatcher's
+	// uncached-handle shape.
+	stale, err := backing.Create(beads.Bead{
+		Title:  "order:nudge-on-route",
+		Labels: []string{"order-run:nudge-on-route", labelOrderTracking},
+	})
+	if err != nil {
+		t.Fatalf("Create(stale): %v", err)
+	}
+
+	cr := &CityRuntime{
+		cityName:            "test-city",
+		cfg:                 cfg,
+		standaloneCityStore: store,
+		stdout:              io.Discard,
+		stderr:              io.Discard,
+		logPrefix:           "gc test",
+	}
+	cr.runOrderTrackingSweepWatchdog(time.Now().Add(orderTrackingSweepWatchdogStaleAfter + time.Second))
+
+	got, err := backing.Get(stale.ID)
+	if err != nil {
+		t.Fatalf("Get(stale): %v", err)
+	}
+	if got.Status != "closed" {
+		t.Fatalf("stale tracking status = %s, want closed — the watchdog read a cached snapshot that never contained this bead (ga-v5vnyp)", got.Status)
+	}
+}
+
+// TestOrphanedOrderTrackingSweepSeesBeadsWrittenBehindTheCache is the same
+// proof for the STARTUP sweep, which is the other non-Live reader. It is the
+// net that is supposed to catch tracking beads orphaned by a controller that
+// died holding them — and it runs inside the very process whose cache cannot
+// be trusted to contain them.
+func TestOrphanedOrderTrackingSweepSeesBeadsWrittenBehindTheCache(t *testing.T) {
+	backing := beads.NewMemStore()
+	cached := beads.NewCachingStoreForTest(backing, nil)
+	if err := cached.PrimeActive(); err != nil {
+		t.Fatalf("PrimeActive(): %v", err)
+	}
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	store := wrapStoreWithBeadPolicies(cached, cfg)
+
+	orphan, err := backing.Create(beads.Bead{
+		Title:  "order:order-tracking-sweep",
+		Labels: []string{"order-run:" + orderTrackingSweepOrder, labelOrderTracking},
+	})
+	if err != nil {
+		t.Fatalf("Create(orphan): %v", err)
+	}
+
+	// The startup path (CityRuntime.sweepOrphanedOrderTracking) opens its own
+	// store from cityPath rather than using standaloneCityStore, so drive the
+	// sweep function directly with the production-shaped store. What this pins
+	// is the READER: OrphanedOpenRuns must see a bead the cache never absorbed.
+	if _, err := sweepOrphanedOrderTrackingLimit(store, orderTrackingSweepCloseBudget); err != nil {
+		t.Fatalf("sweepOrphanedOrderTrackingLimit(): %v", err)
+	}
+
+	got, err := backing.Get(orphan.ID)
+	if err != nil {
+		t.Fatalf("Get(orphan): %v", err)
+	}
+	if got.Status != "closed" {
+		t.Fatalf("orphaned tracking status = %s, want closed — the startup sweep read a cached snapshot (ga-v5vnyp)", got.Status)
+	}
+}
+
 func TestOrderTrackingSweepWatchdogUsesCloseBudget(t *testing.T) {
 	store := beads.NewMemStore()
 	ids := make([]string, 0, orderTrackingSweepCloseBudget+1)
