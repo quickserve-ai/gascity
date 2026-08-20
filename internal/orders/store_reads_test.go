@@ -150,6 +150,83 @@ func TestRecentRunsAllOpenRunsUseLiveTier(t *testing.T) {
 		t.Fatalf("OpenRuns(): %v", err)
 	}
 	assertAllLive(t, "OpenRuns", spy.queries)
+
+	// The two SWEEP readers are the ones that were NOT Live (ga-v5vnyp): they read
+	// through the controller's CachingStore, whose city-scope snapshot had been
+	// frozen for 43h and never contained the dispatcher-written tracking beads at
+	// all. They returned zero rows every 30s, silently, while the Live open-work
+	// gate saw the same beads and held the orders shut.
+	spy.queries = nil
+	if _, err := st.StaleOpenRuns(time.Now()); err != nil {
+		t.Fatalf("StaleOpenRuns(): %v", err)
+	}
+	assertAllLive(t, "StaleOpenRuns", spy.queries)
+	assertOldestFirst(t, "StaleOpenRuns", spy.queries)
+
+	spy.queries = nil
+	if _, err := st.OrphanedOpenRuns(); err != nil {
+		t.Fatalf("OrphanedOpenRuns(): %v", err)
+	}
+	assertAllLive(t, "OrphanedOpenRuns", spy.queries)
+	assertOldestFirst(t, "OrphanedOpenRuns", spy.queries)
+}
+
+// assertOldestFirst pins the close-budget ordering. Both sweep readers feed a
+// bounded close budget (orderTrackingSweepCloseBudget), so the order the rows
+// come back in decides WHICH stale beads get closed. Anything but oldest-first
+// lets a genuinely jammed old bead be starved indefinitely by newer ones.
+func assertOldestFirst(t *testing.T, name string, queries []beads.ListQuery) {
+	t.Helper()
+	if len(queries) == 0 {
+		t.Fatalf("%s issued no List query", name)
+	}
+	for i, q := range queries {
+		if q.Sort != beads.SortCreatedAsc {
+			t.Fatalf("%s query[%d].Sort = %v, want SortCreatedAsc (budgeted closes must drain oldest-first)", name, i, q.Sort)
+		}
+	}
+}
+
+// TestStaleOpenRunsKeepsInProgressAndExcludesClosed pins the two status
+// semantics the Live rewrite had to preserve. The pre-fix read passed no Status
+// filter, so an in_progress tracking bead was returned; adding Status:"open"
+// would have silently narrowed the sweep and left in_progress beads gating their
+// orders forever — a regression in the same direction as the bug being fixed.
+func TestStaleOpenRunsKeepsInProgressAndExcludesClosed(t *testing.T) {
+	store := beads.NewMemStore()
+	mk := func(title, status string) beads.Bead {
+		b, err := store.Create(beads.Bead{Title: title, Labels: []string{"order-run:digest", "order-tracking"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status != "open" {
+			if err := store.Update(b.ID, beads.UpdateOpts{Status: &status}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return b
+	}
+	openBead := mk("order:digest open", "open")
+	inProgress := mk("order:digest running", "in_progress")
+	closedBead := mk("order:digest done", "closed")
+
+	runs, err := NewStore(beads.OrdersStore{Store: store}).StaleOpenRuns(time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("StaleOpenRuns(): %v", err)
+	}
+	got := make(map[string]bool, len(runs))
+	for _, r := range runs {
+		got[r.ID] = true
+	}
+	if !got[openBead.ID] {
+		t.Errorf("open tracking bead %s missing from StaleOpenRuns", openBead.ID)
+	}
+	if !got[inProgress.ID] {
+		t.Errorf("in_progress tracking bead %s missing from StaleOpenRuns — a Status:\"open\" filter would strand it", inProgress.ID)
+	}
+	if got[closedBead.ID] {
+		t.Errorf("closed tracking bead %s must not be swept", closedBead.ID)
+	}
 }
 
 func assertAllLive(t *testing.T, name string, queries []beads.ListQuery) {
