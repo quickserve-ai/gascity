@@ -20,6 +20,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/api"
@@ -28,6 +29,7 @@ import (
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/mail"
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/storeref"
@@ -453,6 +455,120 @@ func recordResetStallIfDue(
 	}
 }
 
+// clearStaleResetMarkerIfHealthy self-heals a continuation-reset marker whose
+// startup ack never arrived. RestartRequestPatch (gc handoff / request-restart,
+// applied by both the reconciler and the worker handle's Reset) commits
+// continuation_reset_pending + reset_committed_at, and the marker is normally
+// cleared by CommitStartedPatch when the controller itself performs the next
+// start. But a runtime can also come back via paths that never commit a start
+// through this bead — pane-level respawn with the SessionStart hook seeding
+// session_key — leaving the fulfilled promise armed indefinitely. Armed, it is
+// a time bomb: the moment the session next dies for ANY reason, the wake path
+// honors the stale marker and starts FRESH, discarding the live conversation
+// (ga-2aq43: a 20:31Z handoff marker hard-reset the healthy attached mayor at
+// 00:04Z, 3.5h later, mid-crash).
+//
+// Evidence bar for clearing: the runtime is alive well past the startup
+// window AND either a user is attached or provider activity is observed
+// after reset_committed_at + startupTimeout — proof this runtime is
+// conducting a conversation that began after the reset commit. The one
+// legitimate marker+alive state (stale runtime pending a fresh cycle) is
+// transient — the wake machinery kills it within a tick — so it never
+// accumulates the required age. Worst-case misfire converts "handoff didn't
+// yield a fresh session" (re-runnable) for "healthy session destroyed"
+// (unrecoverable) — the safe direction.
+//
+// It returns the patch it persisted through the session front door (nil when
+// nothing was cleared) so the caller folds it onto the tick snapshot.
+func clearStaleResetMarkerIfHealthy(
+	info sessionpkg.Info,
+	store beads.Store,
+	sp runtime.Provider,
+	template string,
+	name string,
+	alive bool,
+	startupTimeout time.Duration,
+	now time.Time,
+	dt *drainTracker,
+	rec events.Recorder,
+	stderr io.Writer,
+	trace *sessionReconcilerTraceCycle,
+) sessionpkg.MetadataPatch {
+	if store == nil || sp == nil || !alive || startupTimeout <= 0 {
+		return nil
+	}
+	resetCommittedAt, committedAt, pending := resetPendingCommittedAtInfo(info)
+	if !pending {
+		return nil
+	}
+	staleAfter := 2 * startupTimeout
+	if staleAfter < 2*time.Minute {
+		staleAfter = 2 * time.Minute
+	}
+	elapsed := now.Sub(committedAt)
+	if elapsed <= staleAfter {
+		return nil
+	}
+	healthyAfter := committedAt.Add(startupTimeout)
+	evidence := ""
+	if sp.IsAttached(name) {
+		evidence = "attached"
+	} else if sessionActivityReportable(sp, name) {
+		if lastActivity, err := sp.GetLastActivity(name); err == nil && !lastActivity.IsZero() && lastActivity.After(healthyAfter) {
+			evidence = "activity_after_reset"
+		}
+	}
+	if evidence == "" {
+		return nil
+	}
+	batch := sessionpkg.MetadataPatch{
+		"continuation_reset_pending":   "",
+		sessionpkg.ResetCommittedAtKey: "",
+	}
+	if err := sessionFrontDoor(store).ApplyPatch(info.ID, batch); err != nil {
+		if stderr != nil {
+			fmt.Fprintf(stderr, "session reconciler: clearing stale reset marker for %s: %v\n", name, err) //nolint:errcheck
+		}
+		return nil
+	}
+	if dt != nil {
+		dt.clearResetStall(info.ID)
+	}
+	elapsedSeconds := int(elapsed / time.Second)
+	msg := fmt.Sprintf(
+		"session reconciler: cleared stale reset marker for %s: runtime healthy (%s), reset_committed_at=%s elapsed_s=%d",
+		name, evidence, resetCommittedAt, elapsedSeconds,
+	)
+	if stderr != nil {
+		fmt.Fprintln(stderr, msg) //nolint:errcheck
+	}
+	if rec != nil {
+		rec.Record(events.Event{
+			Type:    events.SessionUpdated,
+			Actor:   "gc",
+			Subject: name,
+			Message: msg,
+		})
+	}
+	if trace != nil {
+		trace.RecordDecision(
+			TraceSiteReconcilerResetStalled,
+			TraceReasonResetStalled,
+			TraceOutcomeClearedStaleMarker,
+			template,
+			name,
+			map[string]any{
+				"bead_id":            info.ID,
+				"evidence":           evidence,
+				"elapsed_s":          elapsedSeconds,
+				"reset_committed_at": resetCommittedAt,
+				"startup_timeout_s":  int(startupTimeout / time.Second),
+			},
+		)
+	}
+	return batch
+}
+
 func drainAckAsyncStopKey(sessionID, name string) string {
 	if id := strings.TrimSpace(sessionID); id != "" {
 		return "id:" + id
@@ -876,7 +992,7 @@ func finalizeDrainAckStoppedSession(
 	if hasAssignedWork {
 		batch = sessionpkg.CompleteDrainPatch(clk.Now().UTC(), string(sessionpkg.SleepReasonIdle), info.WakeMode == "fresh")
 	}
-	sessionpkg.StampPriorSessionKey(batch, session.Metadata)
+	sessionpkg.StampPriorSessionKeyInfo(batch, info)
 	// An always-mode named session with wake_mode=fresh re-qualifies for wake
 	// the moment its drain-ack lands: ComputeAwakeSet's named-always branch has
 	// no drained-exclusion, and drain-ack pokes an immediate reconcile. A
@@ -886,8 +1002,8 @@ func finalizeDrainAckStoppedSession(
 	// hard wake blocker and an explicit wake request (nudge/attach) clears it,
 	// so urgent demand still wakes the session immediately.
 	if !hasAssignedWork &&
-		session.Metadata["wake_mode"] == "fresh" &&
-		strings.TrimSpace(session.Metadata[sessionpkg.NamedSessionModeMetadata]) == "always" {
+		info.WakeMode == "fresh" &&
+		strings.TrimSpace(info.ConfiguredNamedMode) == "always" {
 		batch["held_until"] = clk.Now().Add(freshWakeHeartbeatCooldown).UTC().Format(time.RFC3339)
 	}
 	// A drain-ack that completes a restart-request cycle (gc session reset →
@@ -1849,6 +1965,27 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 	var startCandidates []startCandidate
 	var wakeTargets []wakeTarget
 	rollbacksThisTick := 0
+	// allowConfigDriftRestart spends the per-tick config-drift restart budget
+	// (ga-9n5hj): a wave rolls maxConfigDriftRestartsPerTick sessions per tick,
+	// and the first deferral announces the wave once (stderr, the
+	// session.config_drift_wave event, and the drift-wave mail after the pass).
+	configDriftRestartsThisTick := 0
+	configDriftWaveAnnounced := false
+	configDriftWaveMsg := ""
+	allowConfigDriftRestart := func(templateName, name string) bool {
+		if configDriftRestartsThisTick < maxConfigDriftRestartsPerTick {
+			configDriftRestartsThisTick++
+			return true
+		}
+		if !configDriftWaveAnnounced {
+			configDriftWaveAnnounced = true
+			msg := fmt.Sprintf("config-drift wave: more than %d sessions need drift restarts this tick; rolling %d per tick (first deferred: %s)", maxConfigDriftRestartsPerTick, maxConfigDriftRestartsPerTick, name)
+			configDriftWaveMsg = msg
+			fmt.Fprintf(stderr, "session reconciler: %s\n", msg) //nolint:errcheck
+			rec.Record(events.Event{Type: events.SessionConfigDriftWave, Actor: "gc", Subject: templateName, Message: msg})
+		}
+		return false
+	}
 	// attemptRollbackPendingCreate returns the metadata batch the rollback mirrored
 	// onto the raw bead, so each forward-pass caller can fold it onto the typed
 	// snapshot (Step 6d write-returns-Info). The batch carries NO Closed change:
@@ -2639,6 +2776,12 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			_, _ = peek(rateLimitPeekLines)
 		}
 		recordResetStallIfDue(cityPath, store, sp, cfg, infoByID[id], tp.TemplateName, name, running, alive, startupTimeout, clk.Now().UTC(), dt, rec, stderr, trace)
+		// The alive half of the reset-marker lifecycle (ga-2aq43): a marker
+		// whose runtime is demonstrably healthy is cleared, and the clear is
+		// folded onto the snapshot (write-returns-Info) so this tick's later
+		// readers do not honor the stale marker. Disjoint from the not-alive
+		// eviction above.
+		tick.apply(id, clearStaleResetMarkerIfHealthy(infoByID[id], store, sp, tp.TemplateName, name, alive, startupTimeout, clk.Now().UTC(), dt, rec, stderr, trace))
 
 		// Zombie capture: session exists but process dead — grab scrollback for forensics.
 		// markProviderTerminalError persists + folds its write onto the snapshot in one
@@ -3316,9 +3459,52 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							}
 							continue
 						}
+						driftedFields := runtime.CoreFingerprintDriftFieldsFromJSON(infoByID[id].CoreHashBreakdown, agentCfg)
+						// Prompt-only drift (FPExtra: append_fragments and
+						// other rendered-prompt inputs) applies LAZILY: it
+						// only affects the NEXT conversation, so it is never
+						// worth killing a live session over. Skip before the
+						// diagnostics so a lazily-drifted roster doesn't spam
+						// stderr every tick; the new config lands at the next
+						// natural cycle (wake, pool respawn, asleep repair,
+						// or an unrelated restart). ga-9n5hj: the 2026-07-18
+						// crash was an FPExtra-only wave force-restarting the
+						// whole roster after guard expiry.
+						//
+						// CopyFiles-ONLY drift is also lazy, but is ACCEPTED IN
+						// PLACE (core baselines rebaselined) rather than skipped:
+						// a staged copy is never re-read by the running process,
+						// so the drain buys nothing and destroys context
+						// (hq-wi4ka, the 2026-08-20 fleet drain). Rebasing records
+						// that the copy refreshes at the next natural start. On a
+						// persist failure we fall THROUGH to the eager drain path
+						// so a transient store error never silently suppresses a
+						// real config change.
+						if configDriftLazyApplicable(driftedFields) {
+							if configDriftCopyFilesOnly(driftedFields) {
+								acceptBatch, acceptErr := acceptCopyFilesDriftInPlace(id, sessFront, agentCfg)
+								if acceptErr == nil {
+									tick.apply(id, acceptBatch)
+									if trace != nil {
+										trace.RecordDecision(TraceSiteReconcilerConfigDrift, TraceReasonConfigDrift, TraceOutcomeDeferredLazy, tp.TemplateName, name, configDriftTracePayload(storedHash, currentHash, driftedFields, traceRecordPayload{
+											"active_reason": "lazy_copyfiles_inplace",
+										}))
+									}
+									fmt.Fprintf(stdout, "Accepted copy-files config drift in place for '%s' (applies at next start)\n", name) //nolint:errcheck
+									continue
+								}
+								fmt.Fprintf(stderr, "session reconciler: accepting copy-files drift in place for %s: %v; falling back to drain\n", name, acceptErr) //nolint:errcheck
+							} else {
+								if trace != nil {
+									trace.RecordDecision(TraceSiteReconcilerConfigDrift, TraceReasonConfigDrift, TraceOutcomeDeferredLazy, tp.TemplateName, name, configDriftTracePayload(storedHash, currentHash, driftedFields, traceRecordPayload{
+										"active_reason": "lazy_prompt_only",
+									}))
+								}
+								continue
+							}
+						}
 						fmt.Fprintf(stderr, "config-drift %s: stored=%s current=%s cmd=%q\n", name, truncateHashForLog(storedHash), truncateHashForLog(currentHash), agentCfg.Command) //nolint:errcheck
 						// Diagnostic: log per-field breakdown to identify the drifting field.
-						driftedFields := runtime.CoreFingerprintDriftFieldsFromJSON(infoByID[id].CoreHashBreakdown, agentCfg)
 						runtime.LogCoreFingerprintDrift(stderr, name, infoByID[id].CoreHashBreakdown, agentCfg)
 						// Launch-only drift (B2.3): the box (provision half) is
 						// unchanged but the agent (launch half) moved. When the
@@ -3390,6 +3576,12 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 								}
 								continue
 							}
+							if !allowConfigDriftRestart(tp.TemplateName, name) {
+								if trace != nil {
+									trace.RecordDecision(TraceSiteReconcilerConfigDrift, TraceReasonConfigDrift, TraceOutcomeDeferredStagger, tp.TemplateName, name, configDriftTracePayload(storedHash, currentHash, driftedFields, nil))
+								}
+								continue
+							}
 							if launchOnlyDrift {
 								relaunched, launchBatch := relaunchAgentForLaunchDrift(ctx, sp, sessFront, infoByID[id], name,
 									tp, cityPath, cfg, store, storedHash, currentHash, storedProvision, storedLaunch,
@@ -3415,6 +3607,11 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							// aggregating refresh @~2710 today, but folding here future-proofs
 							// that refresh's retirement (STEP6-PREPASS-AUDIT group 10).
 							tick.apply(id, resetConfiguredNamedSessionForConfigDriftInfo(infoByID[id], tp, store, sp, name, alive, string(sessionpkg.StateStartPending), clk.Now().UTC(), stderr))
+							// Record a handoff BEFORE committing the restart so
+							// the rebuilt named session can recover its context
+							// (hq-wi4ka: config-drift restart with no handoff
+							// destroys the conversation). Best-effort.
+							sendConfigDriftHandoffMailWithStores(reconcilerMailStore(cityPath, cfg, store, rec), store, rec, tp.DisplayName(), stderr)
 							if trace != nil {
 								trace.RecordDecision(TraceSiteReconcilerConfigDrift, TraceReasonConfigDrift, TraceOutcomeRestartInPlace, tp.TemplateName, name, configDriftTracePayload(storedHash, currentHash, driftedFields, nil))
 							}
@@ -3471,6 +3668,12 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 								fmt.Fprintf(stdout, "Skipping config-drift drain for '%s': live assigned work found\n", name) //nolint:errcheck
 								continue
 							}
+							if !allowConfigDriftRestart(tp.TemplateName, name) {
+								if trace != nil {
+									trace.RecordDecision(TraceSiteReconcilerConfigDrift, TraceReasonConfigDrift, TraceOutcomeDeferredStagger, tp.TemplateName, name, configDriftTracePayload(storedHash, currentHash, driftedFields, nil))
+								}
+								continue
+							}
 							if launchOnlyDrift {
 								relaunched, launchBatch := relaunchAgentForLaunchDrift(ctx, sp, sessFront, infoByID[id], name,
 									tp, cityPath, cfg, store, storedHash, currentHash, storedProvision, storedLaunch,
@@ -3496,6 +3699,9 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 								ddt = defaultDrainTimeout
 							}
 							if beginSessionDrainInfo(infoByID[id], sp, dt, "config-drift", clk, ddt) {
+								// Record a handoff BEFORE the drain so the rebuilt
+								// session can recover its context (hq-wi4ka). Best-effort.
+								sendConfigDriftHandoffMailWithStores(reconcilerMailStore(cityPath, cfg, store, rec), store, rec, tp.DisplayName(), stderr)
 								fmt.Fprintf(stdout, "Draining session '%s': config-drift\n", name) //nolint:errcheck
 								if trace != nil {
 									trace.RecordDecision(TraceSiteReconcilerConfigDrift, TraceReasonConfigDrift, TraceOutcomeDrain, tp.TemplateName, name, configDriftTracePayload(storedHash, currentHash, driftedFields, nil))
@@ -3922,6 +4128,19 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		"start_candidate_count":  len(startCandidates),
 		"assigned_work_bead_cnt": len(assignedWorkBeads),
 	})
+
+	// Drift-wave mail (ga-9n5hj residual, ruling 2026-07-20): a wave lasts
+	// many ticks, but the coordinator needs one durable notice per wave, not
+	// one per tick — the event stream above stays the per-tick record.
+	if driftWaveMailNotifier.observeTick(configDriftWaveAnnounced, clk.Now().UTC()) {
+		recipient := ""
+		if cfg != nil {
+			recipient = strings.TrimSpace(cfg.Session.DriftWaveNotify)
+		}
+		if recipient != "" {
+			sendConfigDriftWaveMail(reconcilerMailStore(cityPath, cfg, store, rec), rec, recipient, configDriftWaveMsg, stderr)
+		}
+	}
 
 	if ctx != nil && ctx.Err() != nil {
 		return 0
@@ -5734,6 +5953,141 @@ func sessionHasOpenAssignedWorkForTier(store beads.Store, assignee, status strin
 	return wa.HasNonSessionWork(items), nil
 }
 
+// maxConfigDriftRestartsPerTick bounds config-drift restarts/drains per
+// reconciler tick so a wave rolls gradually instead of simultaneously
+// (ga-9n5hj; see the budget closure in reconcileSessionBeads).
+const maxConfigDriftRestartsPerTick = 2
+
+// configDriftWaveRenotifyInterval is how long a wave must keep rolling
+// before the notifier mails a reminder. A healthy wave clears in a few
+// ticks; one still active after this interval deserves a second look.
+const configDriftWaveRenotifyInterval = time.Hour
+
+// configDriftWaveNotifier dedupes drift-wave mail across reconciler ticks:
+// one mail when a wave starts, a reminder if the same wave is still rolling
+// after configDriftWaveRenotifyInterval, and re-arm once a tick passes with
+// no wave. State is in-process only — a supervisor restart mid-wave mails
+// once more, which is acceptable for an incident-grade notice.
+type configDriftWaveNotifier struct {
+	mu         sync.Mutex
+	waveActive bool
+	lastMailed time.Time
+}
+
+var driftWaveMailNotifier configDriftWaveNotifier
+
+// observeTick records this tick's wave state and reports whether a mail
+// should be sent now.
+func (n *configDriftWaveNotifier) observeTick(waveAnnounced bool, now time.Time) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if !waveAnnounced {
+		n.waveActive = false
+		return false
+	}
+	if n.waveActive && now.Sub(n.lastMailed) < configDriftWaveRenotifyInterval {
+		return false
+	}
+	n.waveActive = true
+	n.lastMailed = now
+	return true
+}
+
+// reset re-arms the notifier. Test hook.
+func (n *configDriftWaveNotifier) reset() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.waveActive = false
+	n.lastMailed = time.Time{}
+}
+
+// sendConfigDriftWaveMail delivers a drift-wave notice as durable mail so
+// the configured coordinator sees a roster-wide roll even when not watching
+// the event stream (ruling ga-wisp-j23i1gj: default recipient is the mayor,
+// who relays to the operator when the wave is roster-wide). Best-effort:
+// failures log to stderr and never block the tick. store is the mail-class
+// store (the reconciler passes reconcilerMailStore).
+func sendConfigDriftWaveMail(store beads.Store, rec events.Recorder, recipient, msg string, stderr io.Writer) {
+	if store == nil || recipient == "" || msg == "" {
+		return
+	}
+	b, err := store.Create(beads.Bead{
+		Title: "config-drift wave: staggered roster roll in progress",
+		Description: msg + "\n\nDeferred sessions restart on later ticks (budget " +
+			fmt.Sprintf("%d", maxConfigDriftRestartsPerTick) + "/tick); attached sessions and live work re-check their guards each tick. " +
+			"Per-tick detail: session.config_drift_wave events and the reconciler trace. " +
+			"If this wave is unexpected, check for an unintended city-wide config edit (eager fields roll the roster; see ga-9n5hj).",
+		Type:      "message",
+		Assignee:  recipient,
+		From:      controllerMailIdentity,
+		Ephemeral: true,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "session reconciler: sending config-drift wave mail to %s: %v\n", recipient, err) //nolint:errcheck // best-effort stderr
+		return
+	}
+	rec.Record(events.Event{
+		Type:    events.MailSent,
+		Actor:   controllerMailIdentity,
+		Subject: b.ID,
+		Message: recipient,
+		Payload: mailEventPayload(nil),
+	})
+}
+
+// sendConfigDriftHandoffMail records a durable handoff for a session about to
+// be recycled by config drift, so the conversation's context survives the
+// drain. Without it a config-drift restart is a kill+rematerialize with NO
+// handoff and the context is destroyed — the 2026-08-19/20 fleet drains
+// (hq-wi4ka) lost every crew session's context this way. The reconciler wires
+// the same auto-handoff path the PreCompact "context cycle" hook uses
+// (cmd_handoff.go createHandoffMail, labels gc:auto-handoff +
+// archive-after-inject): the mail is addressed to the session's own identity
+// so the rebuilt session picks its prior context up on wake.
+//
+// Best-effort: a mail failure logs to stderr and NEVER blocks or cancels the
+// drain — config-drift handling is a reconvergence restart, and failing to
+// record a handoff must not strand a drifted session running stale config.
+// recipient is the session's mail address (its alias/qualified name, matching
+// GC_ALIAS); it is skipped (no mail) when empty.
+//
+// This single-store form serves a city whose messaging and session classes
+// share one store; the reconciler sends through
+// sendConfigDriftHandoffMailWithStores with the resolved mail-class store.
+func sendConfigDriftHandoffMail(store beads.Store, rec events.Recorder, recipient string, stderr io.Writer) {
+	sendConfigDriftHandoffMailWithStores(store, store, rec, recipient, stderr)
+}
+
+// sendConfigDriftHandoffMailWithStores is sendConfigDriftHandoffMail over the
+// two stores createHandoffMail takes, mirroring gc handoff: the handoff message
+// bead is MESSAGING-class (msgStore) and beadmail's addressing reads are
+// SESSIONS-class (sessStore). On a split city the two differ, and minting the
+// handoff into the session store would write it where nothing delivers from.
+func sendConfigDriftHandoffMailWithStores(msgStore, sessStore beads.Store, rec events.Recorder, recipient string, stderr io.Writer) {
+	if msgStore == nil || sessStore == nil || recipient == "" {
+		return
+	}
+	createHandoffMail(msgStore, sessStore, rec, controllerMailIdentity, recipient,
+		[]string{"HANDOFF: config-drift restart"}, "HANDOFF: config-drift restart",
+		[]string{mail.AutoHandoffLabel, mail.ArchiveAfterInjectLabel, "priority:1"}, stderr)
+}
+
+// reconcilerMailStore resolves the MESSAGING-class store for the mail the
+// reconciler itself sends (config-drift handoffs and drift-wave notices). The
+// reconciler is handed the SESSIONS-class store, which on a split city is not
+// where mail lives, so the class is resolved through the routes this process
+// answers residency from (a running controller's registered boot routes, else
+// the one-shot funnel) over the city work store that controller registered.
+// Without a registration the session store stands in for the work store: the
+// same store on every city that relocates nothing.
+func reconcilerMailStore(cityPath string, cfg *config.City, sessStore beads.Store, rec events.Recorder) beads.Store {
+	work := registeredCityWorkStore(cityPath)
+	if work == nil {
+		work = sessStore
+	}
+	return resolveMailMessagesStore(residencyRoutesForCity(cityPath), work, cfg, cityPath, rec)
+}
+
 // namedSessionActivityThreshold is the maximum age of the last reliable
 // activity reference for a named session to be considered "actively in use".
 //
@@ -6015,6 +6369,67 @@ func sessionConfigDriftKey(info sessionpkg.Info, cfg *config.City, tp TemplatePa
 	return storedHash + ":" + currentHash
 }
 
+// configDriftLazyFields are core-fingerprint fields whose drift affects only
+// the rendered prompt/context of the NEXT conversation — nothing about the
+// currently running process. Drift confined to these fields never restarts or
+// drains a live session; it applies at the session's next natural cycle.
+// Deliberately narrow: FPExtra is exactly the field the 2026-07-18 city-wide
+// [agent_defaults].append_fragments change drifted (ga-9n5hj). Env is NOT
+// lazy — fingerprinted env keys (BEADS_DIR, GC_RIG, CLAUDE_CONFIG_DIR pins)
+// change where an agent reads work or which account it bills, and running
+// indefinitely on the old values is itself a hazard.
+//
+// The two fields share the "next cycle, nothing about the live process"
+// property but are applied differently (see the classification site):
+//   - FPExtra-only drift is SKIPPED: the stored hash is left stale so a
+//     concurrent eager change (command/env) keeps the mismatch visible and the
+//     drift re-evaluates each tick until a natural cycle picks the new prompt
+//     up. A prompt fragment never needs a restart to take effect.
+//   - CopyFiles-only drift is ACCEPTED IN PLACE: the core baselines are
+//     rebaselined (acceptCopyFilesDriftInPlace) because a staged copy is
+//     written into the session workDir before the process starts and is never
+//     re-read while it runs (internal/runtime/staging.go StageWorkDir). A
+//     CopyFiles-ONLY drift describes re-materializing staged content for the
+//     NEXT start, not a change to the live agent's behavior. The 2026-08-20
+//     fleet drain (hq-wi4ka) proved the eager path is catastrophic here: a
+//     one-line edit to a tracked script under <city>/scripts flipped all 14
+//     sessions' CopyFiles hash and drained the fleet with no handoff,
+//     destroying every conversation — to change a file no running session had
+//     open. Rebasing in place records that the copy refreshes at the next
+//     natural start and stops the drain without destroying context. Unlike
+//     FPExtra, CopyFiles sits in the PROVISION half (fingerprint_partition.go),
+//     so without an in-place accept the drift would otherwise force a full
+//     re-provision rebuild.
+//
+// Both stay narrow: drift in these fields combined with ANY other field keeps
+// the eager path, and non-listed fields are unaffected. Env remains eager.
+var configDriftLazyFields = map[string]bool{
+	"FPExtra":   true,
+	"CopyFiles": true,
+}
+
+// configDriftCopyFilesOnly reports whether the drift is exactly CopyFiles
+// (no other field). Such drift is accepted in place (rebaselined) rather than
+// skipped like FPExtra — see configDriftLazyFields.
+func configDriftCopyFilesOnly(driftedFields []string) bool {
+	return len(driftedFields) == 1 && driftedFields[0] == "CopyFiles"
+}
+
+// configDriftLazyApplicable reports whether ALL drifted fields are lazily
+// applicable. An empty field list (no stored breakdown — legacy bead) cannot
+// be classified and keeps the eager path.
+func configDriftLazyApplicable(driftedFields []string) bool {
+	if len(driftedFields) == 0 {
+		return false
+	}
+	for _, f := range driftedFields {
+		if !configDriftLazyFields[f] {
+			return false
+		}
+	}
+	return true
+}
+
 func configDriftTracePayload(storedHash, currentHash string, driftedFields []string, extra traceRecordPayload) traceRecordPayload {
 	fields := append([]string(nil), driftedFields...)
 	if fields == nil {
@@ -6261,7 +6676,7 @@ func resetConfiguredNamedSessionForConfigDriftInfo(
 	if preserveResume {
 		batch["started_config_hash"] = priorStartedConfigHash
 	}
-	sessionpkg.StampPriorSessionKey(batch, session.Metadata)
+	sessionpkg.StampPriorSessionKeyInfo(batch, info)
 	batch[namedSessionConfigDriftDeferredAtMetadata] = ""
 	batch[namedSessionConfigDriftDeferredKeyMetadata] = ""
 	batch[sessionAttachedConfigDriftDeferredAtMetadata] = ""
@@ -6726,6 +7141,53 @@ func sessionHashRebaselineMetadata(agentCfg runtime.Config) (map[string]string, 
 		"started_launch_hash":    runtime.LaunchFingerprint(agentCfg),
 		"core_hash_breakdown":    string(breakdownJSON),
 	}, nil
+}
+
+// copyFilesDriftRebaselineMetadata builds the rebaseline patch for a
+// CopyFiles-ONLY config drift accepted in place. Unlike
+// sessionHashRebaselineMetadata (the version-artifact path, where the config
+// did not actually change so every baseline moves), this moves ONLY the core
+// identity baselines — started_config_hash, started_provision_hash,
+// started_launch_hash, and core_hash_breakdown — and deliberately leaves
+// started_live_hash/live_hash untouched: a CopyFiles drift says nothing about
+// the live half, and moving the live baseline here would mask a concurrent
+// SessionLive change that the live-drift clause is responsible for
+// re-applying. The staged content itself is NOT re-copied (the running process
+// never re-reads it); the new content takes effect at the session's next
+// natural start, and rebaselining simply records that outcome so the
+// reconciler stops reporting drift for a change that requires no restart.
+func copyFilesDriftRebaselineMetadata(agentCfg runtime.Config) (map[string]string, error) {
+	breakdownJSON, err := json.Marshal(runtime.CoreFingerprintBreakdown(agentCfg))
+	if err != nil {
+		return nil, fmt.Errorf("marshaling core_hash_breakdown: %w", err)
+	}
+	return map[string]string{
+		"started_config_hash":    runtime.CoreFingerprint(agentCfg),
+		"started_provision_hash": runtime.ProvisionFingerprint(agentCfg),
+		"started_launch_hash":    runtime.LaunchFingerprint(agentCfg),
+		"core_hash_breakdown":    string(breakdownJSON),
+	}, nil
+}
+
+// acceptCopyFilesDriftInPlace rebaselines a CopyFiles-ONLY drift in place
+// instead of draining the session. Returns (patch, nil) on success so the
+// caller can fold it onto the typed snapshot (Step 6d write-returns-Info),
+// (nil, nil) when there is nothing to do (empty id / nil front-door), and
+// (nil, err) on persist failure — on failure the caller falls through to the
+// normal eager drain path so a transient store error never silently suppresses
+// a real config change.
+func acceptCopyFilesDriftInPlace(id string, sessFront *sessionpkg.Store, agentCfg runtime.Config) (map[string]string, error) {
+	if id == "" || sessFront == nil {
+		return nil, nil
+	}
+	patch, err := copyFilesDriftRebaselineMetadata(agentCfg)
+	if err != nil {
+		return nil, err
+	}
+	if err := sessFront.ApplyPatch(id, patch); err != nil {
+		return nil, fmt.Errorf("accepting copy-files drift in place: %w", err)
+	}
+	return patch, nil
 }
 
 // silentRebaselineSessionHashes overwrites the four fingerprint metadata
