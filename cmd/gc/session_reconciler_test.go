@@ -349,6 +349,29 @@ func (e *reconcilerTestEnv) addDesiredLive(name, template string, running bool, 
 	}
 }
 
+// addDesiredCopyFiles registers a running session whose desired config carries
+// a probed CopyFiles entry with the given content hash. Used to drive a
+// CopyFiles-only drift against a session bead stamped with a different hash.
+func (e *reconcilerTestEnv) addDesiredCopyFiles(name, template, contentHash string) {
+	e.addDesiredCopyFilesWithCommand(name, template, "test-cmd", contentHash)
+}
+
+// addDesiredCopyFilesWithCommand is addDesiredCopyFiles with an explicit
+// desired command, so a test can drift CopyFiles alone or CopyFiles+Command.
+// CopyFiles reaches the drift fingerprint via Hints (StartupHints.CopyFiles),
+// projected by ToRuntimeConfig inside templateParamsToConfig.
+func (e *reconcilerTestEnv) addDesiredCopyFilesWithCommand(name, template, command, contentHash string) {
+	cfgs := []runtime.CopyEntry{{Src: "/city/scripts", RelDst: ".gc/scripts", Probed: true, ContentHash: contentHash}}
+	tp := TemplateParams{
+		Command:      command,
+		SessionName:  name,
+		TemplateName: template,
+		Hints:        agent.StartupHints{CopyFiles: cfgs},
+	}
+	e.desiredState[name] = tp
+	_ = e.sp.Start(context.Background(), name, runtime.Config{Command: command, CopyFiles: cfgs})
+}
+
 func (e *reconcilerTestEnv) createSessionBead(name, template string) beads.Bead {
 	meta := map[string]string{
 		"session_name":   name,
