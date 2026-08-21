@@ -12,6 +12,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/mail"
 )
 
 func TestConfigDriftWaveNotifierObserveTick(t *testing.T) {
@@ -102,8 +103,13 @@ func TestReconcileSessionBeads_ConfigDriftWaveMailsOncePerWave(t *testing.T) {
 }
 
 // TestReconcileSessionBeads_ConfigDriftWaveNoRecipientNoMail verifies the
-// knob's zero value disables the mail while the wave stagger itself still
-// works (event + stderr remain the record).
+// drift_wave_notify knob's zero value disables the COORDINATOR wave notice
+// while the wave stagger itself still works (event + stderr remain the
+// record). Per-session config-drift HANDOFF mail is a separate, unconditional
+// mechanism (hq-wi4ka): every session recycled by an eager config-drift drain
+// gets a context-recovery handoff regardless of the wave-notify knob, so those
+// beads ARE present here and must not be mistaken for the gated coordinator
+// notice.
 func TestReconcileSessionBeads_ConfigDriftWaveNoRecipientNoMail(t *testing.T) {
 	env := newReconcilerTestEnv()
 	sessions := driftWaveMailTestSessions(env, 4)
@@ -114,9 +120,31 @@ func TestReconcileSessionBeads_ConfigDriftWaveNoRecipientNoMail(t *testing.T) {
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
+	coordinatorNotices := 0
 	for _, b := range all {
-		if b.Type == "message" {
-			t.Fatalf("no recipient configured, but found mail bead %s (%s)", b.ID, b.Title)
+		if b.Type != "message" {
+			continue
+		}
+		// The coordinator wave notice is the stagger announcement; per-session
+		// handoffs carry the auto-handoff label and are expected (not gated).
+		if beadHasLabelForTest(b, mail.AutoHandoffLabel) {
+			continue
+		}
+		coordinatorNotices++
+		t.Errorf("no drift_wave_notify recipient configured, but found coordinator wave-mail bead %s (%s)", b.ID, b.Title)
+	}
+	if coordinatorNotices != 0 {
+		t.Fatalf("found %d coordinator wave-mail beads, want 0", coordinatorNotices)
+	}
+}
+
+// beadHasLabelForTest reports whether b carries the label, avoiding an
+// internal/beads import cycle for the unexported beadHasLabel.
+func beadHasLabelForTest(b beads.Bead, want string) bool {
+	for _, l := range b.Labels {
+		if l == want {
+			return true
 		}
 	}
+	return false
 }
