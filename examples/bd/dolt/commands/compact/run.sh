@@ -509,6 +509,42 @@ discover_database_names() {
 # dolt_query — wrapper that runs a single SQL statement against the
 # managed server with the configured port/host/user. Honors the
 # per-call timeout. Output is the raw -r result-format-tsv body.
+# remote_identity_user / remote_identity_sql_args — see commands/sync/run.sh for
+# the full rationale (ga-p5bmfx). Short version: the server-side DOLT_* procedures
+# authenticate to the remote as the LOCAL SQL SESSION USER, this pack connects as
+# GC_DOLT_USER (root), and a remotesapi hub that knows a different account denies
+# every fetch and push. compact does its own remote round-trip (fetch_remote and
+# push_remote_refspec below), so it needs the same identity or it stays denied
+# while sync and pull work — the confusing half-fixed state.
+#
+# Keyed GC_DOLT_REMOTE_USER_<DB>_<REMOTE>, per (database, remote), no global
+# fallback. Unset means nothing is emitted and the SQL is byte-identical to
+# before. THE PASSWORD NEVER TRAVELS HERE: it comes from the dolt SERVER process
+# environment (DOLT_REMOTE_PASSWORD), because argv is world-readable via ps.
+remote_identity_user() {
+  riu_db="$1"
+  riu_remote="$2"
+  valid_database_name "$riu_db" || return 1
+  valid_remote_name "$riu_remote" || return 1
+  riu_key="$(printf '%s' "$riu_db" | tr 'a-z.-' 'A-Z__')_$(printf '%s' "$riu_remote" | tr 'a-z.-' 'A-Z__')"
+  case "$riu_key" in
+    *[!A-Z0-9_]*) return 0 ;;
+  esac
+  eval "printf '%s' \"\${GC_DOLT_REMOTE_USER_$riu_key:-}\""
+}
+
+remote_identity_sql_args() {
+  risa_user=$(remote_identity_user "$1" "$2") || return 1
+  [ -n "$risa_user" ] || return 0
+  case "$risa_user" in
+    *[!A-Za-z0-9_.-]*)
+      printf 'gc dolt compact: refusing remote user %s for %s/%s (allowed A-Za-z0-9_.-)\n' "$risa_user" "$1" "$2" >&2
+      return 1
+      ;;
+  esac
+  printf "'--user', '%s', " "$risa_user"
+}
+
 dolt_query() {
   db="$1"
   query="$2"
@@ -740,7 +776,8 @@ select_remote() {
 fetch_remote() {
   db="$1"
   remote="$2"
-  dolt_query "$db" "CALL DOLT_FETCH('$remote')"
+  ri=$(remote_identity_sql_args "$db" "$remote") || return 1
+  dolt_query "$db" "CALL DOLT_FETCH(${ri}'$remote')"
 }
 
 remote_branch_head() {
@@ -769,12 +806,13 @@ push_remote_refspec() {
   else
     refspec_arg="$local_branch:$remote_branch"
   fi
+  ri=$(remote_identity_sql_args "$db" "$remote") || return 1
   export DOLT_CLI_PASSWORD="${GC_DOLT_PASSWORD:-}"
   run_bounded "$push_timeout" \
     dolt --host "$host" --port "$GC_DOLT_PORT" \
     --user "$GC_DOLT_USER" --no-tls \
     --use-db "$db" \
-    sql -r tabular -q "CALL DOLT_PUSH('--force', '--set-upstream', '$remote', '$refspec_arg')"
+    sql -r tabular -q "CALL DOLT_PUSH(${ri}'--force', '--set-upstream', '$remote', '$refspec_arg')"
 }
 
 # preflight_counts — write "<table> <count> <value-hash>" lines for the user

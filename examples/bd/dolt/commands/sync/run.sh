@@ -24,6 +24,15 @@
 #   GC_DOLT_PORT                          (required) — managed dolt port
 #   GC_DOLT_USER                          (default: root)
 #   GC_DOLT_PASSWORD                      (optional)
+#   GC_DOLT_REMOTE_USER_<DB>_<REMOTE>     (optional) — remote identity.
+#     The username this database presents to that remote for DOLT_FETCH and
+#     DOLT_PUSH. Both halves of the key are uppercased with '-' and '.'
+#     replaced by '_' (database qcore + remote origin ->
+#     GC_DOLT_REMOTE_USER_QCORE_ORIGIN=cherub). Unset means no identity is
+#     passed and the emitted SQL is byte-identical to before ga-p5bmfx.
+#     The PASSWORD is never read here and never travels in the call: it comes
+#     from the dolt SERVER process environment (DOLT_REMOTE_PASSWORD), because
+#     argv is world-readable via ps.
 #   GC_DOLT_SYNC_PUSH_TIMEOUT_SECS
 #     (default: 1800) — wall-clock bound for SQL-mode remote push. Increase for
 #                     slow links or large first pushes (a multi-GB first push to
@@ -199,6 +208,51 @@ refspec_env_value() {
     *[!A-Z0-9_]*) return 0 ;;
   esac
   eval "printf '%s' \"\${GC_DOLT_REFSPEC_$key:-}\""
+}
+
+# remote_identity_user <db> <remote> — emit the configured remote username for
+# this (database, remote) pair, or nothing.
+#
+# WHY THIS EXISTS (ga-tj1bgl): the server-side DOLT_* procedures authenticate to
+# the remote as the LOCAL SQL SESSION USER unless told otherwise. This pack
+# connects as GC_DOLT_USER (root), so against a remotesapi hub that knows a
+# different account every fetch and push is denied, with no diagnostic anywhere
+# that points at identity.
+#
+# SCOPING is per (DATABASE, REMOTE), keyed GC_DOLT_REMOTE_USER_<DB>_<REMOTE>,
+# reusing the GC_DOLT_REFSPEC_<DB> normalization extended to '.' because
+# valid_remote_name admits it. As with refspec, names differing only by those
+# characters intentionally share one key. There is deliberately NO global
+# fallback: remote names are not unique across databases, so a city-wide
+# identity would silently attach a hub account to unrelated local mirrors.
+remote_identity_user() {
+  riu_db="$1"
+  riu_remote="$2"
+  valid_database_name "$riu_db" || return 1
+  valid_remote_name "$riu_remote" || return 1
+  riu_key="$(printf '%s' "$riu_db" | tr 'a-z.-' 'A-Z__')_$(printf '%s' "$riu_remote" | tr 'a-z.-' 'A-Z__')"
+  # Guard the eval: anything outside [A-Z0-9_] cannot be an env key, and this
+  # case is the only thing between a database/remote name and shell expansion.
+  case "$riu_key" in
+    *[!A-Z0-9_]*) return 0 ;;
+  esac
+  eval "printf '%s' \"\${GC_DOLT_REMOTE_USER_$riu_key:-}\""
+}
+
+# remote_identity_sql_args <db> <remote> — emit the leading "'--user', '<user>', "
+# fragment for a DOLT_FETCH/DOLT_PUSH call, or nothing when no identity is
+# configured. Fails loudly on a username that is not a plausible account name,
+# so a typo cannot be spliced into SQL. THE PASSWORD IS NEVER EMITTED HERE.
+remote_identity_sql_args() {
+  risa_user=$(remote_identity_user "$1" "$2") || return 1
+  [ -n "$risa_user" ] || return 0
+  case "$risa_user" in
+    *[!A-Za-z0-9_.-]*)
+      printf 'gc dolt sync: refusing remote user %s for %s/%s (allowed A-Za-z0-9_.-)\n' "$risa_user" "$1" "$2" >&2
+      return 1
+      ;;
+  esac
+  printf "'--user', '%s', " "$risa_user"
 }
 
 warn_refspec_fallback() {
@@ -446,6 +500,14 @@ sync_remote_sql() {
   local_branch="$4"
   remote_branch="$5"
 
+  # Resolved once for this (database, remote) pair and reused by the fetch and
+  # both push shapes below, so all three present the SAME identity. Empty when
+  # unconfigured, which reproduces the pre-ga-p5bmfx SQL exactly.
+  remote_ident=$(remote_identity_sql_args "$name" "$remote_name") || {
+    echo "  $name: ERROR: invalid remote identity for remote $remote_name" >&2
+    return 1
+  }
+
   # gc-6ommo: fast-forward-only-or-refuse. Unless --force, fetch the remote and
   # classify local vs remotes/<remote>/<remote_branch>. Push only on a
   # fast-forward (ahead-only, or a first push where the remote branch does not
@@ -462,7 +524,7 @@ sync_remote_sql() {
       return 1
     }
     fetch_rc=0
-    dolt_sql "USE \`$name\`; CALL DOLT_FETCH('$remote_name', '$remote_branch')" "$fetch_timeout" \
+    dolt_sql "USE \`$name\`; CALL DOLT_FETCH(${remote_ident}'$remote_name', '$remote_branch')" "$fetch_timeout" \
       >/dev/null 2>"$fetch_err_tmp" || fetch_rc=$?
     if [ "$fetch_rc" -ne 0 ] && { grep -q "no branches found in remote" "$fetch_err_tmp" 2>/dev/null || grep -q "invalid ref spec" "$fetch_err_tmp" 2>/dev/null; }; then
       # The remote has no such branch: an empty remote ("no branches found in
@@ -548,9 +610,9 @@ sync_remote_sql() {
   fi
 
   if [ "$force" = true ]; then
-    push_query="USE \`$name\`; CALL DOLT_PUSH('--force', '--set-upstream', '$remote_name', '$refspec_arg')"
+    push_query="USE \`$name\`; CALL DOLT_PUSH(${remote_ident}'--force', '--set-upstream', '$remote_name', '$refspec_arg')"
   else
-    push_query="USE \`$name\`; CALL DOLT_PUSH('$remote_name', '$refspec_arg')"
+    push_query="USE \`$name\`; CALL DOLT_PUSH(${remote_ident}'$remote_name', '$refspec_arg')"
   fi
   push_rc=0
   # Guard mktemp: under `set -e` a bare `$(mktemp)` failure (unwritable or
