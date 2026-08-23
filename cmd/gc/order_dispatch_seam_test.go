@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -151,4 +152,112 @@ func TestDispatchSeamRefusesMissingRequiredParam(t *testing.T) {
 	if !strings.Contains(res.Reason, "repo") {
 		t.Fatalf("reason = %q, want it to name the missing required param", res.Reason)
 	}
+}
+
+// TestDispatchSeamFormulaWispReceivesDispatchVars proves that a webhook-fired
+// FORMULA order hands the delivery's extracted args to the wisp: a required
+// formula var must validate against the dispatch vars (not an empty var set),
+// and the instantiated beads must carry the substituted values. Before the fix
+// dispatchWisp validated and instantiated with an empty molecule.Options{}, so
+// every `required = true` var was reported missing, and a formula that declared
+// the same vars with defaults poured the DEFAULTS instead of the payload values
+// — a webhook lane that matched, fired, and then reviewed nothing.
+func TestDispatchSeamFormulaWispReceivesDispatchVars(t *testing.T) {
+	cityDir := t.TempDir()
+	store := beads.NewMemStore()
+	var rec memRecorder
+
+	formulaDir := t.TempDir()
+	writeFile(t, filepath.Join(formulaDir, "webhook-formula-vars.toml"), `
+formula = "webhook-formula-vars"
+version = 1
+
+[vars.repo]
+description = "owner/repo from the delivery"
+required = true
+
+[vars.head_sha]
+description = "head sha from the delivery"
+default = ""
+
+[[steps]]
+id = "review"
+title = "Review {{repo}} at {{head_sha}}"
+description = "repo={{repo}} head_sha={{head_sha}}"
+`)
+
+	filler := orders.Order{Name: "filler", Trigger: "cooldown", Interval: "1h", Exec: "true"}
+	ad := buildOrderDispatcherFromListExec([]orders.Order{filler}, store, nil, nil, &rec)
+	if ad == nil {
+		t.Fatal("expected non-nil dispatcher")
+	}
+	mad := ad.(*memoryOrderDispatcher)
+	mad.cityPath = cityDir
+
+	order := orders.Order{
+		Name:         "pr-review-formula",
+		Trigger:      "webhook",
+		Formula:      "webhook-formula-vars",
+		FormulaLayer: formulaDir,
+		Params: map[string]orders.OrderParam{
+			"repo":     {Required: true},
+			"head_sha": {Required: true},
+		},
+	}
+	rawVars := map[string]string{"repo": "octo/demo", "head_sha": "abc123"}
+
+	res, err := mad.Dispatch(context.Background(), orderdispatch.DispatchRequest{
+		Order:   order,
+		Vars:    rawVars,
+		ExecEnv: webhookmatch.ExecEnvVars(rawVars),
+		Source:  orderdispatch.SourceWebhook,
+	})
+	if err != nil {
+		t.Fatalf("Dispatch: %v", err)
+	}
+	if !res.Fired || res.TrackingID == "" {
+		t.Fatalf("expected fired dispatch with tracking id, got %+v", res)
+	}
+
+	drainCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if !mad.drain(drainCtx) {
+		t.Fatal("dispatch did not drain in time")
+	}
+
+	for _, event := range rec.events {
+		if event.Type == events.OrderFailed {
+			t.Fatalf("order.failed: %s", event.Message)
+		}
+	}
+	if !rec.hasType(events.OrderCompleted) {
+		t.Fatal("missing order.completed event")
+	}
+
+	roots, err := store.ListByLabel("order-run:pr-review-formula", 0, beads.IncludeClosed, beads.WithBothTiers)
+	if err != nil {
+		t.Fatalf("ListByLabel: %v", err)
+	}
+	if len(roots) == 0 {
+		t.Fatal("no wisp root labelled order-run:pr-review-formula")
+	}
+	root := roots[0]
+	if got := root.Metadata["gc.var.repo"]; got != "octo/demo" {
+		t.Fatalf("root gc.var.repo = %q, want octo/demo (dispatch vars must reach the wisp)", got)
+	}
+	if got := root.Metadata["gc.var.head_sha"]; got != "abc123" {
+		t.Fatalf("root gc.var.head_sha = %q, want abc123 (payload value must beat the formula default)", got)
+	}
+	// The substituted step bead exists somewhere under the root; search the
+	// whole store rather than assuming a tier.
+	allBeads, err := store.List(beads.ListQuery{AllowScan: true})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	for _, b := range allBeads {
+		if b.Title == "Review octo/demo at abc123" {
+			return
+		}
+	}
+	t.Fatal("no step bead titled \"Review octo/demo at abc123\"; dispatch vars were not substituted at instantiation")
 }
