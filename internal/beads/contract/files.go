@@ -66,6 +66,17 @@ type ConfigState struct {
 // DoltConfig is the Dolt-specific subset of .beads/config.yaml that GC owns.
 type DoltConfig struct {
 	DisableEventFlush *bool
+
+	// RemotePasswordFile is a path to a file whose contents are the password
+	// for authenticated remote operations (DOLT_REMOTE_PASSWORD). It holds a
+	// PATH and never the secret itself, so config.yaml stays safe to commit.
+	//
+	// It exists because the credential used to travel only by inheritance from
+	// whichever process happened to start managed dolt, and the dolt scope
+	// watchdog freezes that environment for every server it later respawns —
+	// so an uncredentialed caller (any agent shell) permanently pinned an
+	// uncredentialed server. See ga-10irxc.
+	RemotePasswordFile string
 }
 
 // DisableEventFlushEnabled returns whether managed Dolt launches should disable
@@ -846,6 +857,16 @@ func nestedConfigBoolValue(root *yaml.Node, section string, keys ...string) (boo
 	return configBoolValue(sectionNode, keys...)
 }
 
+// nestedConfigStringValue is the string counterpart of nestedConfigBoolValue:
+// it reads keys nested one level under section (e.g. dolt: -> key:).
+func nestedConfigStringValue(root *yaml.Node, section string, keys ...string) (string, bool) {
+	sectionNode := findValue(root, section)
+	if sectionNode == nil || sectionNode.Kind != yaml.MappingNode {
+		return "", false
+	}
+	return configStringValue(sectionNode, keys...)
+}
+
 func scanConfigLineValue(fs fsys.FS, path string, prefixes ...string) (string, bool) {
 	data, err := fs.ReadFile(path)
 	if err != nil {
@@ -947,14 +968,24 @@ func readConfigStateFromRoot(root *yaml.Node) ConfigState {
 	}
 }
 
+// readDoltConfigFromRoot parses every DoltConfig field independently.
+//
+// Each field gets its own if/else-if pair on purpose. The original shape
+// RETURNED as soon as the nested disable-event-flush key matched, which meant
+// any field added later would silently never parse whenever that key happened
+// to be present — a defect that passes every test written against one field.
+// Nested form still wins over the flat dotted form, unchanged.
 func readDoltConfigFromRoot(root *yaml.Node) DoltConfig {
 	var cfg DoltConfig
 	if value, ok := nestedConfigBoolValue(root, "dolt", "disable-event-flush", "disable_event_flush"); ok {
 		cfg.DisableEventFlush = &value
-		return cfg
-	}
-	if value, ok := configBoolValue(root, "dolt.disable-event-flush", "dolt.disable_event_flush"); ok {
+	} else if value, ok := configBoolValue(root, "dolt.disable-event-flush", "dolt.disable_event_flush"); ok {
 		cfg.DisableEventFlush = &value
+	}
+	if value, ok := nestedConfigStringValue(root, "dolt", "remote-password-file", "remote_password_file"); ok {
+		cfg.RemotePasswordFile = strings.TrimSpace(value)
+	} else if value, ok := configStringValue(root, "dolt.remote-password-file", "dolt.remote_password_file"); ok {
+		cfg.RemotePasswordFile = strings.TrimSpace(value)
 	}
 	return cfg
 }
@@ -964,20 +995,27 @@ func readDoltConfigFromData(data []byte) (DoltConfig, bool) {
 	return cfg, cfg.hasValues()
 }
 
+// readDoltConfigFromDataOrEmpty is the line-scanning fallback used when the
+// YAML document will not parse. It mirrors readDoltConfigFromRoot field for
+// field, including parsing each field independently rather than returning on
+// the first hit.
 func readDoltConfigFromDataOrEmpty(data []byte) DoltConfig {
 	var cfg DoltConfig
 	if value, ok := scanNestedConfigBoolValueFromData(data, "dolt", "disable-event-flush", "disable_event_flush"); ok {
 		cfg.DisableEventFlush = &value
-		return cfg
-	}
-	if value, ok := scanConfigBoolValueFromData(data, "dolt.disable-event-flush:", "dolt.disable_event_flush:"); ok {
+	} else if value, ok := scanConfigBoolValueFromData(data, "dolt.disable-event-flush:", "dolt.disable_event_flush:"); ok {
 		cfg.DisableEventFlush = &value
+	}
+	if value, ok := scanNestedConfigLineValueFromData(data, "dolt", "remote-password-file", "remote_password_file"); ok {
+		cfg.RemotePasswordFile = strings.TrimSpace(value)
+	} else if value, ok := scanConfigLineValueFromData(data, "dolt.remote-password-file:", "dolt.remote_password_file:"); ok {
+		cfg.RemotePasswordFile = strings.TrimSpace(value)
 	}
 	return cfg
 }
 
 func (c DoltConfig) hasValues() bool {
-	return c.DisableEventFlush != nil
+	return c.DisableEventFlush != nil || c.RemotePasswordFile != ""
 }
 
 func doltDisableEventFlushFallbackValue(data []byte, state ConfigState) bool {
