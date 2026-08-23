@@ -1550,7 +1550,13 @@ func (m *memoryOrderDispatcher) dispatchWisp(ctx context.Context, store beads.St
 		m.markTrackingFailure(store, trackingID, scoped, a, headSeq)
 		return
 	}
-	if err := molecule.ValidateRecipeRuntimeVars(recipe, molecule.Options{}); err != nil {
+	// The dispatch vars (webhook args / `gc order run --var`) are the formula's
+	// runtime vars: validate AND instantiate with them. Compile leaves every
+	// {{var}} placeholder in the recipe (substitution is an instantiation-time
+	// step), so an empty Options here would report every required var missing
+	// and pour formula defaults in place of the delivered values. Tick-fired
+	// orders pass nil vars, for which this is unchanged behavior.
+	if err := molecule.ValidateRecipeRuntimeVars(recipe, molecule.Options{Vars: vars}); err != nil {
 		m.rec.Record(events.Event{
 			Type:    events.OrderFailed,
 			Actor:   "controller",
@@ -1594,7 +1600,7 @@ func (m *memoryOrderDispatcher) dispatchWisp(ctx context.Context, store beads.St
 		return
 	}
 
-	cookResult, err := molecule.Instantiate(ctx, store, recipe, molecule.Options{})
+	cookResult, err := molecule.Instantiate(ctx, store, recipe, molecule.Options{Vars: vars})
 	if err != nil {
 		m.rec.Record(events.Event{
 			Type:    events.OrderFailed,
