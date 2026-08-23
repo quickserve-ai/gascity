@@ -662,6 +662,16 @@ Canonical keys owned by GC:
 - `issue_prefix`
 - `dolt.auto-start`
 - `dolt.disable-event-flush` (serialized as `dolt: { disable-event-flush: ... }`)
+- `dolt.remote-password-file` (serialized as `dolt: { remote-password-file: ... }`) —
+  path to a file whose contents are `DOLT_REMOTE_PASSWORD` for authenticated
+  remote operations. Holds a PATH, never the secret, so `config.yaml` stays safe
+  to commit. Relative paths resolve against the city root. The file must not be
+  group- or world-readable (mode `&0o077 == 0`) or it is refused with a printed
+  reason. Absent this key, managed-dolt launch environments are unchanged.
+  Added for ga-10irxc: the credential previously travelled only by inheritance
+  from whichever process started dolt, and the scope watchdog froze that
+  environment for every server it later respawned, so an uncredentialed caller
+  (any agent shell) permanently pinned an uncredentialed server.
 - `gc.endpoint_origin`
 - `gc.endpoint_status`
 - external-only:
