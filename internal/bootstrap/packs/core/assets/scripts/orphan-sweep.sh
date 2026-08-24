@@ -124,9 +124,19 @@ fi
 # Step 2: Get all known agent identities from resolved config.
 # `gc config explain` prints Agent.QualifiedName(), including import binding
 # and rig scope. Fall back to the older config-show parser for older binaries.
+# ROSTER_FROM_FALLBACK records whether the rig scope was LOST, and is set at the
+# point the fallback is actually taken. It must not be inferred from the roster's
+# shape: a modern city whose agents are all city-scoped legitimately emits bare
+# names from `gc config explain`, because Agent.QualifiedName() omits the rig when
+# Dir is empty. Treating "no slash anywhere" as evidence of the fallback would
+# enable degraded leaf matching on a city that lost nothing — and a foreign
+# "qcore/worker" would then match a local city-scoped "worker" and be released,
+# reopening the cross-city defect this guard exists to close.
+ROSTER_FROM_FALLBACK=0
 AGENTS=$(gc config explain 2>/dev/null | awk '/^Agent: /{print $2}') || AGENTS=""
 if [ -z "$AGENTS" ]; then
     AGENTS=$(gc config show 2>/dev/null | awk '/^\[\[agent\]\]/{a=1} a && /^[[:space:]]*name[[:space:]]*=/{print; a=0}' | sed 's/.*=[[:space:]]*"\(.*\)"/\1/') || exit 0
+    ROSTER_FROM_FALLBACK=1
 fi
 if [ -z "$AGENTS" ]; then
     exit 0
@@ -348,6 +358,249 @@ reset_orphan_if_current() {
 # Step 3: Find orphaned beads (assigned to non-existent agents).
 # Pool instances use names like "worker-3"; strip the -N suffix to match
 # the template name from config.
+# AGENT_PUBLIC_FORMS / LOCAL_BINDINGS — the identity forms an assignee may
+# legitimately carry for a LOCALLY CONFIGURED agent.
+#
+# $AGENTS holds Agent.QualifiedName() from `gc config explain`, which is
+# BINDING-qualified: "qcore/cherub-law.krieger", "qcore/gastown.polecat",
+# "qcore/gc.run-operator". Real assignees are the PUBLIC identity:
+# "qcore/krieger". Comparing the two directly reads this city's own named crew
+# as foreign — measured, before this was added — so derive every public form:
+# the qualified name itself, <rig>/<leaf-after-the-last-dot>, and the bare leaf.
+#
+# LOCAL_BINDINGS is the set of import bindings this city actually uses
+# (cherub-law, gastown, gc, ...). It is what lets a NAMEPOOL instance be
+# recognised: `gc config explain` does not emit namepool names at all, so
+# "qcore/gastown.furiosa" matches no roster entry — but "gastown" is a binding
+# this city imports, and no other city's crew names arrive in that shape.
+# Without this, every dead polecat claim would be protected forever and the
+# sweep would stop doing its actual job.
+AGENT_PUBLIC_FORMS=$(printf '%s\n' "$AGENTS" | awk '
+    function emit(v) { if (v != "" && !seen[v]++) { print v } }
+    NF {
+        emit($0)
+        rig = ""; leaf = $0
+        i = index($0, "/")
+        if (i > 0) { rig = substr($0, 1, i - 1); leaf = substr($0, i + 1) }
+        n = leaf
+        while (index(n, ".") > 0) { n = substr(n, index(n, ".") + 1) }
+        if (rig != "") { emit(rig "/" n) }
+        emit(n)
+    }' ) || AGENT_PUBLIC_FORMS="$AGENTS"
+
+LOCAL_BINDINGS=$(printf '%s\n' "$AGENTS" | awk '
+    NF {
+        leaf = $0
+        i = index($0, "/")
+        if (i > 0) { leaf = substr($0, i + 1) }
+        if (index(leaf, ".") > 0) {
+            b = substr(leaf, 1, index(leaf, ".") - 1)
+            if (b != "" && !seen[b]++) { print b }
+        }
+    }' ) || LOCAL_BINDINGS=""
+
+# The degraded-roster mode below keys off ROSTER_FROM_FALLBACK, set above at the
+# point `gc config show` is actually used. See that comment for why the roster's
+# SHAPE cannot stand in for the fact of the fallback.
+#
+# Why the mode is needed at all: `gc config show` yields only each agent's BARE
+# name, so with that roster no rig-qualified assignee can match and EVERY locally
+# configured agent is classified foreign, its dead claims protected forever.
+# Measured on a simulated fallback roster {worker, polecat, krieger}:
+# project/worker, qcore/krieger AND qcore/dalinar were all protected. That is the
+# stranding defect this guard was narrowed to avoid, returning through a path
+# nobody was looking at.
+#
+# The population that hits it is precisely the one running older gc — the same
+# deployments most likely to install a core-pack fix without updating anything
+# else, so the rare-path assumption behind a low severity does not hold here.
+#
+# ACCEPTED LIMITATION, stated rather than hidden: in that mode the rig
+# information does not exist and cannot be reconstructed, so a foreign
+# "other-rig/worker" is indistinguishable from a local "local-rig/worker" and is
+# released. Strictly better than the alternatives — protecting it strands local
+# work on every old deployment, disabling the guard protects nothing — and
+# foreign crew names whose leaf is unknown locally (the shape both observed
+# incidents took) are still protected.
+
+agent_public_form_exists() {
+    local candidate="$1"
+    [ -n "$candidate" ] && printf '%s\n' "$AGENT_PUBLIC_FORMS" | grep -Fxq -- "$candidate"
+}
+
+local_binding_exists() {
+    local candidate="$1"
+    [ -n "$candidate" ] && [ -n "$LOCAL_BINDINGS" ] \
+        && printf '%s\n' "$LOCAL_BINDINGS" | grep -Fxq -- "$candidate"
+}
+
+# strip_instance_suffix — remove a suffix gc mints for a pool instance.
+# Two generators exist: poolInstanceName's numeric slot ("-11") and
+# GenerateAdhocIdentity ("-adhoc-<token>"). Deliberately a closed grammar: a
+# third generator added later would have its claims PROTECTED and reported in
+# the per-sweep summary rather than silently stripped, which is the safe
+# direction. Add new generators here.
+strip_instance_suffix() {
+    local name="$1"
+    case "$name" in
+        *-adhoc-*) printf '%s' "${name%-adhoc-*}"; return 0 ;;
+    esac
+    local base="${name%-[0-9]*}"
+    if [ "$base" != "$name" ]; then printf '%s' "$base"; return 0; fi
+    printf '%s' "$name"
+}
+
+# is_locally_configured_identity — CONFIG membership ONLY, deliberately with no
+# liveness check.
+#
+# is_known_agent below answers "is this a live/known agent", which conflates two
+# different questions. For the foreign-identity guard we need only the first:
+# does this city's own configuration DEFINE this identity at all? A locally
+# configured agent whose session is dead must still answer YES here, so that its
+# claims keep being reset exactly as they are today.
+is_locally_configured_identity() {
+    local name="$1"
+    [ -z "$name" ] && return 1
+    if [ "$name" = "human" ]; then return 0; fi
+    if agent_public_form_exists "$name"; then return 0; fi
+
+    local stripped
+    stripped=$(strip_instance_suffix "$name")
+    if [ "$stripped" != "$name" ] && agent_public_form_exists "$stripped"; then return 0; fi
+
+    # Degraded roster (see ROSTER_FROM_FALLBACK): the rig scope was LOST upstream,
+    # so match the leaf or every qualified local agent reads as foreign.
+    if [ "$ROSTER_FROM_FALLBACK" = "1" ]; then
+        local bare="${name##*/}"
+        if [ "$bare" != "$name" ]; then
+            if agent_public_form_exists "$bare"; then return 0; fi
+            local bare_stripped
+            bare_stripped=$(strip_instance_suffix "$bare")
+            if [ "$bare_stripped" != "$bare" ] && agent_public_form_exists "$bare_stripped"; then return 0; fi
+        fi
+    fi
+
+    # Binding-qualified leaf: "<rig>/<binding>.<anything>" where <binding> is an
+    # import this city uses. Covers namepool instances, which the roster cannot
+    # enumerate.
+    local leaf="${name##*/}"
+    if [ "$leaf" != "$name" ] || [ "${name#*.}" != "$name" ]; then
+        case "$leaf" in
+            *.*)
+                if local_binding_exists "${leaf%%.*}"; then return 0; fi
+                ;;
+        esac
+    fi
+    return 1
+}
+
+# is_foreign_qualified_identity — a well-formed <rig>/<name> that this city does
+# not configure.
+#
+# THE DEFECT THIS GUARDS. Step 1 above walks EVERY rig explicitly, including rigs
+# whose bead store is SHARED with another Gas City. A claim in a shared store is
+# visible to every attached city, but the evidence that its owner is alive — this
+# city's config and sessions — is not federated. So "doesn't exist in ANY rig",
+# which is correct on a single-city store, silently means "an agent I cannot see
+# from here" on a shared one, and this sweep resets another city's live claim.
+#
+# Measured: fifteen beads in the shared qcore store were reset this way between
+# 2026-08-21 and 2026-08-24, including workflow children.
+#
+# The discriminator is the AGENT IDENTITY against the local roster, NOT the rig
+# prefix: the shared rig is precisely the one both cities use, so a prefix test
+# would protect nothing.
+is_foreign_qualified_identity() {
+    local name="$1"
+    local rig="${name%/*}"
+    local leaf="${name##*/}"
+    # Not <rig>/<name> at all: bare aliases, session names and ephemeral ids are
+    # this city's own naming and were never the cross-city hazard. Leave them on
+    # the existing path so local behaviour is unchanged.
+    [ "$rig" = "$name" ] && return 1
+    [ -z "$rig" ] && return 1
+    [ -z "$leaf" ] && return 1
+    # WELL-FORMED means exactly one slash and two components drawn from the agent
+    # identity grammar — not merely "contains a slash". Without this, anything
+    # slash-shaped is protected: "a/b/c", "a//worker", "./worker" and
+    # "/tmp/worker" all split into a rig and a dotless leaf and would be treated
+    # as another city's crew, stranding malformed LOCAL claims forever. The rig
+    # is taken from the LAST slash, so a nested path leaves separators in $rig
+    # and is rejected here.
+    case "$rig" in
+        *[!A-Za-z0-9_-]*) return 1 ;;
+    esac
+    case "$leaf" in
+        *[!A-Za-z0-9_-]*) return 1 ;;
+    esac
+    # DELIBERATE NARROWING: only a BARE leaf qualifies. "<rig>/<binding>.<name>"
+    # is an identity minted by a PACK IMPORT, and a binding this city does not
+    # import is ambiguous — it is equally consistent with another city's pack and
+    # with a LOCAL import that has since been retired. Protecting that shape
+    # would strand a stale local agent's work forever on every single-city
+    # deployment, which is the overwhelming majority of them, and this script
+    # runs on all of them. The existing contract (a stale qualified local
+    # assignee is still cleaned up) is preserved rather than changed under a
+    # core pack.
+    # "<rig>/<bare-name>" is by contrast a NAMED SESSION public identity — the
+    # crew-name shape. A crew name this city does not configure is another
+    # city's crew, and that is precisely the shape both observed incidents took
+    # (qcore/dalinar, qcore/pattern, qcore/szeth inbound; qcore/barry,
+    # qcore/lana outbound).
+    # RESIDUAL, stated rather than hidden: a foreign POOL instance
+    # ("westeros/gastown.furiosa") is not protected by this. It is already
+    # unprotectable by roster membership anyway, because two cities importing the
+    # same pack share that identity space verbatim.
+    # (A dotted leaf is already rejected by the grammar check above: '.' is not
+    # in the permitted character set. Kept explicit in the comment because the
+    # NARROWING is a deliberate design choice, not a side effect of the grammar.)
+    # Match the FULL <rig>/<name>, never the bare leaf. Stripping the rig would
+    # let a foreign "other-rig/worker" match this city's bare "worker" form and
+    # fall through to be reset — preserving the very cross-city defect this guard
+    # exists to close whenever two cities share a common agent leaf under
+    # different rig prefixes. The rig prefix is signal here; it is only useless
+    # as a SOLE discriminator (the shared rig is common to both cities).
+    if is_locally_configured_identity "$name"; then return 1; fi
+    return 0
+}
+
+# PROTECTED_TMP accumulates one "<identity>\t<bead>" line per protected claim so
+# the skip can be reported ONCE PER SWEEP naming identities.
+#
+# The skip MUST be observable. A locally DECOMMISSIONED agent is also "not in the
+# local roster", so its claims become protected too — correct as a default, but a
+# permanent SILENT leak if nobody can see it. Fifty protected claims for an
+# identity nobody recognises has to read as a decommissioned agent leaking, from
+# the log alone, without knowing to look for it. A silent skip here would be a
+# fresh instance of the very class this guard exists to fix.
+PROTECTED=0
+PROTECTED_TMP=$(mktemp) || PROTECTED_TMP=""
+if [ -n "$PROTECTED_TMP" ]; then
+    trap 'rm -f "$TMP" "$SESSION_TMP" "$PROTECTED_TMP"' EXIT
+fi
+
+record_protected_identity() {
+    local identity="$1"
+    local bead="$2"
+    PROTECTED=$((PROTECTED + 1))
+    # A tab or newline inside either value would re-key the grouping or forge an
+    # extra record in the summary, which is the ONLY signal that a decommissioned
+    # local agent is leaking. Neutralise rather than trust the input: these are
+    # read off beads that another city may have written.
+    identity=${identity//$'\t'/ }
+    identity=${identity//$'\n'/ }
+    bead=${bead//$'\t'/ }
+    bead=${bead//$'\n'/ }
+    if [ -n "$PROTECTED_TMP" ]; then
+        printf '%s\t%s\n' "$identity" "$bead" >>"$PROTECTED_TMP" || PROTECTED_TMP=""
+    fi
+    # MUST return 0: this is called unguarded in the sweep loop, and under
+    # `set -e` a function whose last command fails (no temp file, or a failed
+    # write) would terminate the entire sweep — turning a degraded summary into
+    # a dead patrol.
+    return 0
+}
+
 is_known_agent() {
     local name="$1"
     # The human operator. "human" is the canonical operator alias across gc
@@ -408,6 +661,14 @@ FAILED=0
 # shell so $ORPHANED survives for the summary message below.
 while IFS=$'\t' read -r bead_id assignee; do
     if ! is_known_agent "$assignee"; then
+        # Foreign-identity guard, ahead of every liveness and reset step: for an
+        # identity this city does not configure, a missing session is
+        # UNOBSERVABLE rather than absent, and the checks below cannot tell those
+        # apart. Locally configured identities fall through unchanged.
+        if is_foreign_qualified_identity "$assignee"; then
+            record_protected_identity "$assignee" "$bead_id"
+            continue
+        fi
         if work_bead_still_resettable "$bead_id" "$assignee"; then
             :
         else
@@ -469,4 +730,72 @@ fi
 if [ "$FAILED" -gt 0 ]; then
     echo "orphan-sweep: $FAILED escalation summary(ies) could not be delivered to '$ESCALATION_TARGET' (see above)" >&2
     exit 1
+fi
+
+# Emitted ONCE PER SWEEP and only when something was protected: at a 5m cadence an
+# unconditional line is ~288 entries a day saying nothing, which is how a channel
+# stops being read. Identities are sorted so consecutive sweeps are comparable,
+# and each carries its claim count plus a bounded sample of bead ids.
+if [ "$PROTECTED" -gt 0 ]; then
+    # One POSIX awk pass, and deliberately NO external sort/cut/wc: this script
+    # runs under a restricted PATH in the pack test harness, where `sort` is not
+    # present. Depending on it printed "sort: command not found" to stderr on
+    # every run and broke six existing subtests. awk is already a hard dependency
+    # of this script; nothing new is assumed.
+    PROTECTED_SUMMARY=""
+    PROTECTED_SUMMARY_FAILED=0
+    if [ -n "$PROTECTED_TMP" ] && [ -s "$PROTECTED_TMP" ]; then
+        if ! PROTECTED_SUMMARY=$(awk -F'\t' '
+            {
+                if (!($1 in count)) { keys[++nkeys] = $1 }
+                count[$1]++
+                if (count[$1] <= 5) { ids[$1] = (ids[$1] == "" ? $2 : ids[$1] ", " $2) }
+            }
+            END {
+                # Insertion sort over the key list so consecutive sweeps render
+                # comparably. asorti() is a gawk extension and absent from the BSD
+                # awk on macOS, where this order runs on the operator box.
+                for (i = 2; i <= nkeys; i++) {
+                    k = keys[i]
+                    for (j = i - 1; j >= 1 && keys[j] > k; j--) { keys[j + 1] = keys[j] }
+                    keys[j + 1] = k
+                }
+                out = ""
+                for (i = 1; i <= nkeys; i++) {
+                    k = keys[i]
+                    extra = (count[k] > 5) ? sprintf(" +%d more", count[k] - 5) : ""
+                    entry = sprintf("%s (%d: %s%s)", k, count[k], ids[k], extra)
+                    out = (out == "" ? entry : out ", " entry)
+                }
+                printf "%d\t%s", nkeys, out
+            }' "$PROTECTED_TMP"); then
+            PROTECTED_SUMMARY_FAILED=1
+            PROTECTED_SUMMARY=""
+        fi
+    elif [ "$PROTECTED" -gt 0 ]; then
+        # Claims were protected but nothing reached the spool — the temp file was
+        # unavailable or a write failed. That is a failure, not a zero.
+        PROTECTED_SUMMARY_FAILED=1
+    fi
+    IDENTITY_COUNT="${PROTECTED_SUMMARY%%	*}"
+    PROTECTED_DETAIL="${PROTECTED_SUMMARY#*	}"
+    case "$IDENTITY_COUNT" in
+        ''|*[!0-9]*) IDENTITY_COUNT=0; PROTECTED_DETAIL="" ;;
+    esac
+    # A FAILED summary must never render as "0 identities". The count is the only
+    # evidence that a decommissioned local agent is accumulating protected
+    # claims, so reporting zero when the aggregation broke would suppress exactly
+    # the signal this mechanism exists to produce — and it would contradict the
+    # claim count printed beside it. Say it is unavailable instead. awk's stderr
+    # is deliberately NOT discarded so the cause is visible.
+    if [ "$PROTECTED_SUMMARY_FAILED" = "1" ]; then
+        echo "orphan-sweep: protected $PROTECTED claims this pass, but the per-identity summary is UNAVAILABLE (aggregation failed; see stderr above) — identities NOT listed"
+    fi
+    if [ "$PROTECTED_SUMMARY_FAILED" != "1" ]; then
+        if [ -n "$PROTECTED_DETAIL" ]; then
+            echo "orphan-sweep: protected $IDENTITY_COUNT foreign/unknown identities this pass ($PROTECTED claims): $PROTECTED_DETAIL"
+        else
+            echo "orphan-sweep: protected $IDENTITY_COUNT foreign/unknown identities this pass ($PROTECTED claims)"
+        fi
+    fi
 fi
