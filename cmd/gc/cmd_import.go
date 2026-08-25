@@ -25,15 +25,16 @@ import (
 )
 
 var (
-	syncImports             = packman.SyncLock
-	syncImportsSelective    = packman.SyncLockSelectiveUpgrade
-	installLockedImports    = packman.InstallLocked
-	checkInstalledImports   = packman.CheckInstalled
-	readImportLockfile      = packman.ReadLockfile
-	writeImportLockfile     = packman.WriteLockfile
-	resolveImportVersion    = packman.ResolveVersion
-	defaultImportConstraint = packman.DefaultConstraint
-	resolveImportHeadCommit = defaultImportHeadCommit
+	syncImports              = packman.SyncLock
+	syncImportsSelective     = packman.SyncLockSelectiveUpgrade
+	installLockedImports     = packman.InstallLocked
+	checkInstalledImports    = packman.CheckInstalled
+	verifySourceReachability = packman.VerifySourceReachability
+	readImportLockfile       = packman.ReadLockfile
+	writeImportLockfile      = packman.WriteLockfile
+	resolveImportVersion     = packman.ResolveVersion
+	defaultImportConstraint  = packman.DefaultConstraint
+	resolveImportHeadCommit  = defaultImportHeadCommit
 
 	// validateComposedConfigAfterInstall loads the composed city config after
 	// install, so `gc import install` fails on the same load errors gc
@@ -209,7 +210,8 @@ func newImportRemoveCmd(stdout, stderr io.Writer) *cobra.Command {
 }
 
 func newImportCheckCmd(stdout, stderr io.Writer) *cobra.Command {
-	return &cobra.Command{
+	var verifySource bool
+	cmd := &cobra.Command{
 		Use:   "check",
 		Short: "Validate installed pack import state",
 		Args:  cobra.NoArgs,
@@ -219,12 +221,15 @@ func newImportCheckCmd(stdout, stderr io.Writer) *cobra.Command {
 				fmt.Fprintf(stderr, "gc import check: %v\n", err) //nolint:errcheck
 				return errExit
 			}
-			if doImportCheck(cityPath, stdout, stderr) != 0 {
+			if doImportCheck(cityPath, stdout, stderr, verifySource) != 0 {
 				return errExit
 			}
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&verifySource, "verify-source", false,
+		"also contact each declared source and verify it can produce the pinned commit (network, seconds per source)")
+	return cmd
 }
 
 func newImportInstallCmd(stdout, stderr io.Writer) *cobra.Command {
@@ -766,7 +771,7 @@ func doImportInstall(cityPath string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func doImportCheck(cityPath string, stdout, stderr io.Writer) int {
+func doImportCheck(cityPath string, stdout, stderr io.Writer, verifySource bool) int {
 	allImports, err := collectAllImportsFS(cityPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc import check: %v\n", err) //nolint:errcheck
@@ -779,12 +784,48 @@ func doImportCheck(cityPath string, stdout, stderr io.Writer) int {
 	}
 	if !report.HasIssues() {
 		fmt.Fprintf(stdout, "Import state OK: %d remote import(s) checked\n", report.CheckedSources) //nolint:errcheck
+	} else {
+		fmt.Fprintf(stdout, "Import state has %d issue(s):\n", len(report.Issues)) //nolint:errcheck
+		writeImportCheckIssues(stdout, report.Issues)
+	}
+	failed := report.ErrorCount() > 0
+
+	// The source probe runs even when the offline pass found issues. A pin its
+	// source cannot produce is exactly the state that leaves the cache looking
+	// broken, so gating the probe on a clean offline pass would hide the cause
+	// behind its own symptom.
+	if verifySource {
+		if verifyImportSourceReachability(cityPath, report.CheckedPins, stdout, stderr) != 0 {
+			failed = true
+		}
+	}
+	if failed {
+		return 1
+	}
+	return 0
+}
+
+// verifyImportSourceReachability runs the network phase and reports it as its
+// own section. Warnings (probe could not reach a verdict) are printed but do
+// not fail the command: an offline machine has learned nothing about its
+// imports, and reporting that as a broken import would train readers to
+// ignore the check.
+func verifyImportSourceReachability(cityPath string, pins map[string]string, stdout, stderr io.Writer) int {
+	report, err := verifySourceReachability(cityPath, pins)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc import check --verify-source: %v\n", err) //nolint:errcheck
+		return 1
+	}
+	if !report.HasIssues() {
+		fmt.Fprintf(stdout, "Source pins OK: %d source(s) can produce their pinned commit\n", report.CheckedSources) //nolint:errcheck
 		return 0
 	}
-
-	fmt.Fprintf(stdout, "Import state has %d issue(s):\n", len(report.Issues)) //nolint:errcheck
+	fmt.Fprintf(stdout, "Source pin check found %d issue(s) across %d source(s):\n", len(report.Issues), report.CheckedSources) //nolint:errcheck
 	writeImportCheckIssues(stdout, report.Issues)
-	return 1
+	if report.ErrorCount() > 0 {
+		return 1
+	}
+	return 0
 }
 
 func writeImportCheckIssues(w io.Writer, issues []packman.CheckIssue) {
