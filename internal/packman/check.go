@@ -21,6 +21,10 @@ type CheckSeverity string
 const (
 	// CheckSeverityError means the import state is not usable as-is.
 	CheckSeverityError CheckSeverity = "error"
+	// CheckSeverityWarning means a check could not reach a verdict. It exists
+	// so "I could not tell" never renders identically to "I checked and it is
+	// bad" -- an offline network probe must not read as a broken import.
+	CheckSeverityWarning CheckSeverity = "warning"
 )
 
 // CheckIssue describes one read-only import state validation finding.
@@ -39,6 +43,11 @@ type CheckIssue struct {
 type CheckReport struct {
 	CheckedSources int
 	Issues         []CheckIssue
+	// CheckedPins maps each declared remote source to the commit it is pinned
+	// to, as this run understood it. VerifySourceReachability consumes it so
+	// the network probe interrogates exactly the pins the offline check
+	// validated, instead of re-deriving them and drifting from this walk.
+	CheckedPins map[string]string
 }
 
 // ErrorCount returns the number of error-severity issues in the report.
@@ -82,6 +91,13 @@ func CheckInstalled(cityRoot string, imports map[string]config.Import) (*CheckRe
 			Message:    fmt.Sprintf("%s is missing for declared remote imports", LockfileName),
 			RepairHint: `run "gc import install"`,
 		})
+		// The closure walk is skipped here, so nothing downstream would learn
+		// what this city is pinned to -- and a city with no lockfile at all is
+		// the fresh-bootstrap case a source-reachability probe most needs to
+		// answer for. Record what the declaration itself states. Nested
+		// imports are genuinely unknowable at this point: they live inside
+		// cached packs that have never been fetched.
+		recordDeclaredShaPins(report, imports)
 		return report, nil
 	}
 
@@ -154,6 +170,9 @@ func (s *importCheckState) walkImport(name string, imp config.Import, declDir st
 		s.report.CheckedSources++
 	}
 	s.reachable[imp.Source] = struct{}{}
+	if declared, ok := strings.CutPrefix(mergedConstraint, "sha:"); ok {
+		s.report.recordPin(imp.Source, declared)
+	}
 
 	locked, ok := s.lock.Packs[imp.Source]
 	if !ok {
@@ -190,6 +209,8 @@ func (s *importCheckState) walkImport(name string, imp config.Import, declDir st
 		})
 		return
 	}
+
+	s.report.recordPin(imp.Source, locked.Commit)
 
 	packDir, ok := s.validateCachedPack(name, imp.Source, locked.Commit)
 	if !ok {
@@ -479,6 +500,23 @@ func (s *importCheckState) addIssue(issue CheckIssue) {
 	s.report.addIssue(issue)
 }
 
+// recordPin remembers the commit a source is pinned to. The declared "sha:"
+// constraint is recorded first so a city with no packs.lock yet -- the fresh
+// bootstrap case this whole check exists for -- still has something to probe;
+// the locked commit overwrites it once validated, because that is what an
+// install actually materializes.
+func (r *CheckReport) recordPin(source, commit string) {
+	source = strings.TrimSpace(source)
+	commit = strings.TrimSpace(commit)
+	if source == "" || commit == "" {
+		return
+	}
+	if r.CheckedPins == nil {
+		r.CheckedPins = make(map[string]string)
+	}
+	r.CheckedPins[source] = commit
+}
+
 func (r *CheckReport) addIssue(issue CheckIssue) {
 	if issue.Severity == "" {
 		issue.Severity = CheckSeverityError
@@ -495,6 +533,21 @@ func lockfileExists(cityRoot string) (bool, error) {
 		return false, nil
 	}
 	return false, fmt.Errorf("checking %s: %w", LockfileName, err)
+}
+
+// recordDeclaredShaPins records the pin every remote import declares outright.
+// Only "sha:" constraints name a commit; a semver constraint has no pin until
+// an install resolves one.
+func recordDeclaredShaPins(report *CheckReport, imports map[string]config.Import) {
+	for _, name := range sortedImportNames(imports) {
+		imp := imports[name]
+		if !isRemoteSource(imp.Source) {
+			continue
+		}
+		if declared, ok := strings.CutPrefix(strings.TrimSpace(imp.Version), "sha:"); ok {
+			report.recordPin(imp.Source, declared)
+		}
+	}
 }
 
 func countRemoteImports(imports map[string]config.Import) int {
