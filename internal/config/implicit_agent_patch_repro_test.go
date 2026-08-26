@@ -173,12 +173,24 @@ suspended = true
 	if err := os.WriteFile(filepath.Join(dir, "city.toml"), []byte(cityTOML), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, _, err := LoadWithIncludes(fsys.OSFS{}, filepath.Join(dir, "city.toml"))
-	if err == nil {
-		t.Fatal("expected error for typo patch target, got nil")
+	// The typo is STILL CAUGHT — the guarantee this test was written for — but
+	// no longer by aborting the load (ga-djvbvp). Every gc command loads
+	// config, so aborting meant one seat's typo stopped every agent in the
+	// city; on 2026-08-25 it killed a `gc bd update` on an unrelated bead.
+	// It is now reported in provenance, printed by the CLI on every command,
+	// and fails `gc config --validate`.
+	_, prov, err := LoadWithIncludes(fsys.OSFS{}, filepath.Join(dir, "city.toml"))
+	if err != nil {
+		t.Fatalf("load must not fail on a typo patch target: %v", err)
 	}
-	if !strings.Contains(err.Error(), "not found in merged config") {
-		t.Fatalf("unexpected error shape: %v", err)
+	found := false
+	for _, w := range prov.Warnings {
+		if IsUnappliedPatchWarning(w) && strings.Contains(w, "not found in merged config") && strings.Contains(w, "not-a-real-agent") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("typo patch target was not reported; warnings = %q", prov.Warnings)
 	}
 }
 
