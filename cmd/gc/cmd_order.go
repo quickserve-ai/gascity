@@ -1581,18 +1581,18 @@ func renderOrderHistoryFromAPI(cr api.CachedRead[[]api.OrderHistoryView], name, 
 	}
 
 	if hasRig {
-		fmt.Fprintf(stdout, "%-20s %-15s %-15s %s\n", "ORDER", "RIG", "BEAD", "EXECUTED") //nolint:errcheck
+		fmt.Fprintf(stdout, "%-20s %-15s %-15s %-21s %s\n", "ORDER", "RIG", "BEAD", "EXECUTED", "OUTCOME") //nolint:errcheck
 		for _, e := range entries {
 			rig := e.Rig
 			if rig == "" {
 				rig = "-"
 			}
-			fmt.Fprintf(stdout, "%-20s %-15s %-15s %s\n", e.Name, rig, e.BeadID, e.CreatedAt) //nolint:errcheck
+			fmt.Fprintf(stdout, "%-20s %-15s %-15s %-21s %s\n", e.Name, rig, e.BeadID, e.CreatedAt, orderHistoryAPIOutcomeUnavailable) //nolint:errcheck
 		}
 	} else {
-		fmt.Fprintf(stdout, "%-20s %-15s %s\n", "ORDER", "BEAD", "EXECUTED") //nolint:errcheck
+		fmt.Fprintf(stdout, "%-20s %-15s %-21s %s\n", "ORDER", "BEAD", "EXECUTED", "OUTCOME") //nolint:errcheck
 		for _, e := range entries {
-			fmt.Fprintf(stdout, "%-20s %-15s %s\n", e.Name, e.BeadID, e.CreatedAt) //nolint:errcheck
+			fmt.Fprintf(stdout, "%-20s %-15s %-21s %s\n", e.Name, e.BeadID, e.CreatedAt, orderHistoryAPIOutcomeUnavailable) //nolint:errcheck
 		}
 	}
 
@@ -1654,6 +1654,7 @@ func doOrderHistoryBounded(name, rig string, aa []orders.Order, resolveStores or
 		rig       string
 		id        string
 		createdAt time.Time
+		outcome   string
 	}
 	var entries []historyEntry
 	seenEntries := make(map[string]bool)
@@ -1693,6 +1694,7 @@ func doOrderHistoryBounded(name, rig string, aa []orders.Order, resolveStores or
 					rig:       a.Rig,
 					id:        r.ID,
 					createdAt: r.CreatedAt,
+					outcome:   orderRunOutcomeDisplay(r),
 				})
 			}
 		}
@@ -1744,6 +1746,7 @@ func doOrderHistoryBounded(name, rig string, aa []orders.Order, resolveStores or
 				BeadID:    e.id,
 				Executed:  e.createdAt.Format(time.RFC3339),
 				CreatedAt: e.createdAt,
+				Outcome:   e.outcome,
 			})
 		}
 		return writeCLIJSONLineOrExit(stdout, stderr, "gc order history", payload)
@@ -1758,21 +1761,54 @@ func doOrderHistoryBounded(name, rig string, aa []orders.Order, resolveStores or
 	}
 
 	if hasRig {
-		fmt.Fprintf(stdout, "%-20s %-15s %-15s %s\n", "ORDER", "RIG", "BEAD", "EXECUTED") //nolint:errcheck
+		fmt.Fprintf(stdout, "%-20s %-15s %-15s %-21s %s\n", "ORDER", "RIG", "BEAD", "EXECUTED", "OUTCOME") //nolint:errcheck
 		for _, e := range entries {
 			rig := e.rig
 			if rig == "" {
 				rig = "-"
 			}
-			fmt.Fprintf(stdout, "%-20s %-15s %-15s %s\n", e.order, rig, e.id, e.createdAt.Format(time.RFC3339)) //nolint:errcheck
+			fmt.Fprintf(stdout, "%-20s %-15s %-15s %-21s %s\n", e.order, rig, e.id, e.createdAt.Format(time.RFC3339), e.outcome) //nolint:errcheck
 		}
 	} else {
-		fmt.Fprintf(stdout, "%-20s %-15s %s\n", "ORDER", "BEAD", "EXECUTED") //nolint:errcheck
+		fmt.Fprintf(stdout, "%-20s %-15s %-21s %s\n", "ORDER", "BEAD", "EXECUTED", "OUTCOME") //nolint:errcheck
 		for _, e := range entries {
-			fmt.Fprintf(stdout, "%-20s %-15s %s\n", e.order, e.id, e.createdAt.Format(time.RFC3339)) //nolint:errcheck
+			fmt.Fprintf(stdout, "%-20s %-15s %-21s %s\n", e.order, e.id, e.createdAt.Format(time.RFC3339), e.outcome) //nolint:errcheck
 		}
 	}
 	return 0
+}
+
+// orderHistoryAPIOutcomeUnavailable is what the API-sourced history route
+// prints in the OUTCOME column. api.OrderHistoryView (and the genclient entry
+// behind it) carry no outcome field, so that route genuinely cannot report one.
+// It prints "-" rather than blank or a guess: a surface that cannot tell success
+// from failure must SAY so, which is the whole lesson of ga-kahru9.
+const orderHistoryAPIOutcomeUnavailable = "-"
+
+// orderRunOutcomeDisplay renders one order run's terminal outcome for
+// `gc order history`, distinguishing the three states a tracking bead can end in.
+// Collapsing them is what let a 5-hour sync outage read as healthy (ga-7unsv0):
+// 18 of 21 consecutive runs carried the exec-failed label and the CLI showed only
+// that an exec had happened.
+//
+//	Outcome.Display() non-empty -> success | failed | canceled  (dispatcher stamped it)
+//	open                        -> running                      (still in flight)
+//	closed, nothing stamped     -> unknown                      (killed or swept
+//	                                                             before the
+//	                                                             dispatcher could
+//	                                                             stamp an outcome)
+//
+// The third state is the dangerous one and must never render as success: a run
+// killed mid-flight is closed by the order-tracking retention sweep with no
+// outcome label at all, which is byte-identical on the surface to a clean run.
+func orderRunOutcomeDisplay(r orders.OrderRun) string {
+	if d := r.Outcome.Display(); d != "" {
+		return d
+	}
+	if r.Open {
+		return "running"
+	}
+	return "unknown"
 }
 
 type orderHistoryJSONResult struct {
@@ -1790,6 +1826,10 @@ type orderHistoryJSONEntry struct {
 	BeadID    string    `json:"bead_id"`
 	Executed  string    `json:"executed"`
 	CreatedAt time.Time `json:"created_at"`
+	// Outcome is the run's terminal outcome: success, failed, canceled,
+	// running, or unknown. Omitted entirely by the API route, which cannot
+	// report one — see orderRunOutcomeDisplay.
+	Outcome string `json:"outcome,omitempty"`
 }
 
 type orderHistoryJSONSummary struct {
