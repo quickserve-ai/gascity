@@ -637,15 +637,19 @@ name = "refinery"
 scope = "rig"
 `)
 
-	_, _, err := LoadWithIncludes(fsys.OSFS{}, filepath.Join(dir, "city.toml"))
-	if err == nil {
-		t.Fatal("expected LoadWithIncludes to fail for nonexistent patch target")
+	// Reported, not fatal (ga-djvbvp) — see TestLoadWithIncludes_PatchTargetMissing.
+	_, prov, err := LoadWithIncludes(fsys.OSFS{}, filepath.Join(dir, "city.toml"))
+	if err != nil {
+		t.Fatalf("load must not fail for a nonexistent patch target: %v", err)
 	}
-	if !strings.Contains(err.Error(), "proj/gs.nonexistent") {
-		t.Errorf("error = %q, want mention of proj/gs.nonexistent", err)
+	found := false
+	for _, w := range prov.Warnings {
+		if IsUnappliedPatchWarning(w) && strings.Contains(w, "proj/gs.nonexistent") && strings.Contains(w, "not found") {
+			found = true
+		}
 	}
-	if !strings.Contains(err.Error(), "not found") {
-		t.Errorf("error = %q, want mention of 'not found'", err)
+	if !found {
+		t.Errorf("nonexistent patch target was not reported; warnings = %q", prov.Warnings)
 	}
 }
 
