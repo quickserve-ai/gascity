@@ -92,6 +92,30 @@ config element. Use -f to layer additional config files.`,
 }
 
 // doConfigShow loads city.toml (with includes) and dumps the resolved
+// unappliedPatchValidationErrors promotes unapplied-patch load warnings to
+// validation errors, so `gc config --validate` exits non-zero on them
+// (ga-djvbvp).
+//
+// This is the second half of a deliberate split. An unapplied patch is
+// NON-FATAL to ordinary commands, because every gc command loads config and
+// aborting the load meant one seat's typo stopped the entire city. It is FATAL
+// here, on the surface built to review configuration, because a fix that only
+// did the first half would trade a loud outage for a silent misconfiguration
+// that survives forever.
+//
+// Extracted from doConfigShow so the promotion is testable on its own:
+// doConfigShow resolves a city from the environment, and a mutation that
+// deleted this promotion inline survived the whole suite.
+func unappliedPatchValidationErrors(warnings []string) []string {
+	var errs []string
+	for _, w := range warnings {
+		if config.IsUnappliedPatchWarning(w) {
+			errs = append(errs, w)
+		}
+	}
+	return errs
+}
+
 // config, validates it, or shows provenance.
 func doConfigShow(validate, showProvenance, asJSON bool, stdout, stderr io.Writer) int {
 	cityPath, err := resolveCity()
@@ -135,6 +159,7 @@ func doConfigShow(validate, showProvenance, asJSON bool, stdout, stderr io.Write
 		validationErrors = append(validationErrors, err.Error())
 	}
 	validationErrors = append(validationErrors, validateLegacyFormulaConfigRoutes(cfg)...)
+	validationErrors = append(validationErrors, unappliedPatchValidationErrors(compositionWarnings)...)
 	validationWarnings := singletonSessionMigrationWarnings(cfg)
 
 	if validate {
