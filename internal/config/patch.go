@@ -1,6 +1,9 @@
 package config
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // Patches holds all patch blocks from composition. Patches target existing
 // resources by identity key and modify specific fields. They are applied
@@ -333,34 +336,73 @@ func Fragments(items ...string) *[]string {
 	return &out
 }
 
+// unappliedPatchMarker is a stable substring on the warning emitted when a
+// patch cannot be applied. CLI warning classification keys off this marker, so
+// keep it in sync with IsUnappliedPatchWarning.
+const unappliedPatchMarker = "was NOT APPLIED"
+
+// IsUnappliedPatchWarning reports whether a load warning records a patch that
+// could not be applied. Keep in sync with unappliedPatchMarker.
+func IsUnappliedPatchWarning(warning string) bool {
+	return strings.Contains(warning, unappliedPatchMarker)
+}
+
 // ApplyPatches applies all patches to the config. Patches target existing
-// resources by identity key. If a patch targets a nonexistent resource,
-// an error is returned. Patches are intentional — they never generate
-// collision warnings.
+// resources by identity key.
+//
+// A PATCH THAT CANNOT BE APPLIED IS SKIPPED AND RECORDED, NOT FATAL
+// (ga-djvbvp). It used to abort the whole load, and because every gc command
+// loads config that meant one dangling reference stopped the entire city: on
+// 2026-08-25 a `gc bd update` on an unrelated bead died with
+// `patches.agent[12]: agent "cherub-law.conway" not found in merged config`
+// while a new seat was mid-stand-up. Standing up a seat touches the pack and
+// city.toml, and a local-path pack is live the instant it is written, so ANY
+// two-file edit opens a window where a reference exists and its target does
+// not. Halting every agent for the duration of someone else's edit is a worse
+// outcome than leaving one patch unapplied.
+//
+// Skipping is safe in a way that failing is not: a patch that matched nothing
+// changed nothing, so the config here is exactly the config without that
+// patch. The risk is the opposite one — that a real typo becomes invisible —
+// which is why every skip is recorded on LoadWarnings, why the CLI prints
+// those on EVERY command rather than only on configuration surfaces, and why
+// `gc config --validate` still exits non-zero on them.
+//
+// Every patch is attempted, so one bad patch no longer hides the next: the old
+// code returned on the first failure and reported one defect at a time.
+//
+// Patches are intentional — they never generate collision warnings.
+//
+// The error return is retained for systemic failures; unappliable targets do
+// not produce one.
 func ApplyPatches(cfg *City, patches Patches) error {
+	record := func(kind string, i int, err error) {
+		cfg.LoadWarnings = appendUnique(cfg.LoadWarnings,
+			fmt.Sprintf("patches.%s[%d] %s: %v", kind, i, unappliedPatchMarker, err))
+	}
 	for i, p := range patches.Agents {
 		if err := applyAgentPatch(cfg, &p); err != nil {
-			return fmt.Errorf("patches.agent[%d]: %w", i, err)
+			record("agent", i, err)
 		}
 	}
 	for i, p := range patches.NamedSessions {
 		if err := applyNamedSessionPatch(cfg, &p); err != nil {
-			return fmt.Errorf("patches.named_session[%d]: %w", i, err)
+			record("named_session", i, err)
 		}
 	}
 	for i, p := range patches.Rigs {
 		if err := applyRigPatch(cfg, &p); err != nil {
-			return fmt.Errorf("patches.rigs[%d]: %w", i, err)
+			record("rigs", i, err)
 		}
 	}
 	for i, p := range patches.Providers {
 		if err := applyProviderPatch(cfg, &p); err != nil {
-			return fmt.Errorf("patches.providers[%d]: %w", i, err)
+			record("providers", i, err)
 		}
 	}
 	for i, p := range patches.GitHubPRMonitors {
 		if err := applyGitHubPRMonitorPatch(cfg, &p); err != nil {
-			return fmt.Errorf("patches.github_pr_monitor[%d]: %w", i, err)
+			record("github_pr_monitor", i, err)
 		}
 	}
 	return nil
