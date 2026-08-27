@@ -168,6 +168,15 @@ func (c *doltTopologyCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 		r.FixHint = "reconcile canonical .beads config with deprecated city.toml Dolt settings"
 		return r
 	}
+	// Advisories are drift worth fixing that must not refuse a city start
+	// (ga-298g8t). Doctor is exactly where they belong: visible, actionable, and
+	// unable to strand anything.
+	if advisories := compatDoltDriftAdvisories(c.cityPath, c.cfg); len(advisories) > 0 {
+		r.Status = doctor.StatusWarning
+		r.Message = fmt.Sprintf("canonical/compat Dolt drift (advisory): %s", strings.Join(advisories, "; "))
+		r.FixHint = "run a rig init (or gc reload) to reconcile .beads/config.yaml with the city.toml declaration"
+		return r
+	}
 	r.Status = doctor.StatusOK
 	r.Message = "canonical and deprecated Dolt endpoint config agree"
 	return r
