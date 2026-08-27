@@ -190,6 +190,11 @@ func startBeadsLifecycle(cityPath, _ string, cfg *config.City, stderr io.Writer)
 	if err := validateCanonicalCompatDoltDrift(cityPath, cfg); err != nil {
 		return err
 	}
+	// Advisories never block the start, but they must be said out loud: an
+	// endpoint disagreement nobody can see is how ga-tmhxnd cost a day.
+	for _, advisory := range compatDoltDriftAdvisories(cityPath, cfg) {
+		fmt.Fprintf(stderr, "gc: warning: canonical/compat Dolt drift: %s\n", advisory) //nolint:errcheck // best-effort stderr
+	}
 	// Register per-city dolt config so env builders and isExternalDolt can
 	// read it without process-global env vars. This is the single
 	// registration point — supervisor, standalone, and reload all flow
@@ -1141,6 +1146,33 @@ func verifyCanonicalBdScopeStoreReady(store beads.Store, sleep func(time.Duratio
 	return lastErr
 }
 
+// forcedScopeDoltConfigStateForInit derives a scope's canonical config from
+// city.toml WITHOUT consulting the scope file, so a post-init scope whose
+// .beads/config.yaml bd rewrote (or that carries nothing at all) is still put
+// back into canonical shape. That is what "forced" means, and for prefix,
+// types, mode and metadata it is correct.
+//
+// It must not force an ENDPOINT it has no source for. city.toml is the only
+// input here, so when it declares no endpoint for a scope the result is an
+// INFERENCE ("this scope must inherit the city"), not a declaration — while the
+// scope file may hold an endpoint an operator set deliberately.
+//
+// ga-uurd84 / ga-tmhxnd, 2026-08-27 22:50:16Z: rig qcore's file stated
+// gc.endpoint_origin: explicit with the westeros hub (100.71.23.94:3307) after
+// the hub flip; city.toml carried no endpoint keys for the rig. A controller
+// reload reached finalizeCanonicalBdScopeInit, this function inferred
+// inherited_city, and the write stripped dolt.host/dolt.port/dolt.user and
+// stamped the result verified. Every resolution without an ambient
+// GC_DOLT_HOST/PORT then read the frozen local archive with no error at all —
+// silent stale reads, not visible breakage.
+//
+// The reason it had never fired: the bd lifecycle script was failing upstream
+// (hub host dialed on the managed-local port), so initBeadsForDirWithExecutor
+// returned the error and never reached finalize. Fixing the script (ed608d79d)
+// removed an accidental guard.
+//
+// So: an on-disk origin that DECLARES an endpoint outranks an inferred one.
+//
 //nolint:unparam // error slot preserves the resolver-shaped contract
 func forcedScopeDoltConfigStateForInit(cityPath, dir, prefix string) (contract.ConfigState, bool, error) {
 	if strings.TrimSpace(dir) == "" || strings.TrimSpace(prefix) == "" {
@@ -1153,16 +1185,18 @@ func forcedScopeDoltConfigStateForInit(cityPath, dir, prefix string) (contract.C
 		cityState := desiredCityDoltConfigState(cityPath, cfg.Dolt, config.EffectiveHQPrefix(cfg))
 		if samePath(cityPath, dir) {
 			cityState.IssuePrefix = prefix
-			return cityState, true, nil
+			return preservedDeclaredScopeEndpoint(cityPath, dir, prefix, cityState), true, nil
 		}
 		for i := range cfg.Rigs {
 			if samePath(cfg.Rigs[i].Path, dir) {
 				rig := cfg.Rigs[i]
 				rig.Prefix = prefix
-				return desiredRigDoltConfigState(cityPath, rig, cityState), true, nil
+				forced := desiredRigDoltConfigState(cityPath, rig, cityState)
+				return preservedDeclaredScopeEndpoint(cityPath, dir, prefix, forced), true, nil
 			}
 		}
-		return desiredRigDoltConfigState(cityPath, config.Rig{Name: filepath.Base(dir), Path: dir, Prefix: prefix}, cityState), true, nil
+		forced := desiredRigDoltConfigState(cityPath, config.Rig{Name: filepath.Base(dir), Path: dir, Prefix: prefix}, cityState)
+		return preservedDeclaredScopeEndpoint(cityPath, dir, prefix, forced), true, nil
 	}
 	if loaded, ok := cityDoltConfigs.Load(cityPath); ok {
 		if cfg, ok := loaded.(config.DoltConfig); ok {
@@ -1171,9 +1205,47 @@ func forcedScopeDoltConfigStateForInit(cityPath, dir, prefix string) (contract.C
 	}
 	cityState := desiredCityDoltConfigState(cityPath, cityDolt, prefix)
 	if samePath(cityPath, dir) {
-		return cityState, true, nil
+		return preservedDeclaredScopeEndpoint(cityPath, dir, prefix, cityState), true, nil
 	}
-	return desiredRigDoltConfigState(cityPath, config.Rig{Name: filepath.Base(dir), Path: dir, Prefix: prefix}, cityState), true, nil
+	forced := desiredRigDoltConfigState(cityPath, config.Rig{Name: filepath.Base(dir), Path: dir, Prefix: prefix}, cityState)
+	return preservedDeclaredScopeEndpoint(cityPath, dir, prefix, forced), true, nil
+}
+
+// preservedDeclaredScopeEndpoint keeps a scope's own DECLARED endpoint when the
+// forced state would replace it with an inferred one.
+//
+// "Declared" means the scope file resolves to an authoritative origin that
+// carries an endpoint — explicit for a rig, city_canonical for a city. Those
+// only get written by an operator action (gc rig endpoint set, gc beads city
+// endpoint set) or a deliberate edit. "Inferred" means the origin was computed
+// from the absence of endpoint keys in city.toml — inherited_city or
+// managed_city. Replacing the first with the second is never an upgrade: it
+// discards the only record of where the store actually is, and it does so
+// silently, because a managed-local endpoint usually resolves and answers.
+//
+// The reverse direction is untouched: a forced state that DECLARES an endpoint
+// (city.toml carries the keys) still wins, so an operator's city.toml remains
+// the way to move a scope's endpoint. Anything the forced state owns that is
+// not the endpoint — prefix above all — is carried onto the preserved state, so
+// this narrows only the endpoint decision.
+func preservedDeclaredScopeEndpoint(cityPath, dir, prefix string, forced contract.ConfigState) contract.ConfigState {
+	if contract.EndpointOriginDeclaresEndpoint(forced.EndpointOrigin) {
+		return forced
+	}
+	resolved, err := contract.ResolveScopeConfigState(fsys.OSFS{}, cityPath, dir, prefix)
+	if err != nil || resolved.Kind != contract.ScopeConfigAuthoritative {
+		return forced
+	}
+	if !contract.EndpointOriginDeclaresEndpoint(resolved.State.EndpointOrigin) {
+		return forced
+	}
+	preserved := resolved.State
+	preserved.IssuePrefix = forced.IssuePrefix
+	if strings.TrimSpace(preserved.DoltMode) == "" {
+		preserved.DoltMode = forced.DoltMode
+	}
+	preserved.CustomTypes = contract.MergeCustomTypes(preserved.CustomTypes, forced.CustomTypes)
+	return preserved
 }
 
 func initFileStoreForDir(cityPath, dir string) error {
@@ -2076,6 +2148,32 @@ func wrapInvalidEndpointStateError(scope string, err error) error {
 	}
 }
 
+// validateCanonicalCompatDoltDrift reports contradictions between the canonical
+// .beads config and the deprecated city.toml Dolt settings.
+//
+// It returns only HARD errors, because it is the first statement of
+// startBeadsLifecycle — which runs on `gc start` and on every controller config
+// reload — so anything it refuses rejects reloads and can stop the city coming
+// back. That is the ga-tmhxnd symptom class, and it is far too expensive a
+// response to a disagreement the next init would have reconciled.
+//
+// A hard error therefore means two DECLARATIONS contradict each other: a rig
+// file that states an endpoint disagreeing with city.toml, or a city.toml rig
+// endpoint that disagrees with an external city endpoint the rig mirrors. Those
+// are operator contradictions with no safe resolution, and failing closed is
+// right.
+//
+// Everything else comes back from compatDoltDriftAdvisories instead. See
+// ga-298g8t: a rig file carrying the DERIVED inherited_city while city.toml
+// declares an endpoint used to be a hard error, which made the two defenses
+// protecting rig qcore's hub endpoint on 2026-08-27 mutually exclusive — the
+// operator's city.toml declaration, and the rig file being explicit. They only
+// avoided colliding because of the order the repair happened in; keys before
+// restore would have refused to start the city. inherited_city is not an
+// operator statement about where a store is, it is what the ABSENCE of city.toml
+// keys computes to, and a derived value must not veto a declaration. Same class
+// as ga-uurd84 one layer over: there an inference overwrote a declaration, here
+// it blocked one.
 func validateCanonicalCompatDoltDrift(cityPath string, cfg *config.City) error {
 	if cfg == nil || !workspaceUsesManagedBdStoreContract(cityPath, cfg.Rigs) {
 		return nil
@@ -2114,9 +2212,11 @@ func validateCanonicalCompatDoltDrift(cityPath string, cfg *config.City) error {
 		switch rigState.EndpointOrigin {
 		case contract.EndpointOriginInheritedCity:
 			if cityState.EndpointOrigin == contract.EndpointOriginManagedCity {
-				if compatRigHost != "" || compatRigPort != "" {
-					return fmt.Errorf("deprecated rig dolt_host/dolt_port conflict with inherited canonical endpoint for rig %q", cfg.Rigs[i].Name)
-				}
+				// city.toml declares an endpoint for this rig while the rig file
+				// still carries the derived inherited_city. The declaration is
+				// the operator's; the file is stale and the next init
+				// reconciles it. Advisory, not a refusal (ga-298g8t) — see the
+				// doc comment above for why a refusal here is unaffordable.
 				break
 			}
 			if (compatRigHost != "" || compatRigPort != "") && !sameConfiguredExternalTarget(rigState.DoltHost, rigState.DoltPort, compatRigHost, compatRigPort) {
@@ -2129,6 +2229,42 @@ func validateCanonicalCompatDoltDrift(cityPath string, cfg *config.City) error {
 		}
 	}
 	return nil
+}
+
+// compatDoltDriftAdvisories reports canonical/compat Dolt disagreements that are
+// real and worth fixing but must not refuse a city start. Demoting them from
+// errors without reporting them anywhere would trade a startup landmine for a
+// silent one, which is the failure mode this whole family of bugs is made of.
+func compatDoltDriftAdvisories(cityPath string, cfg *config.City) []string {
+	if cfg == nil || !workspaceUsesManagedBdStoreContract(cityPath, cfg.Rigs) {
+		return nil
+	}
+	cityResolved, err := contract.ResolveScopeConfigState(fsys.OSFS{}, cityPath, cityPath, config.EffectiveHQPrefix(cfg))
+	if err != nil || cityResolved.Kind != contract.ScopeConfigAuthoritative {
+		return nil
+	}
+	if cityResolved.State.EndpointOrigin != contract.EndpointOriginManagedCity {
+		return nil
+	}
+	var advisories []string
+	for i := range cfg.Rigs {
+		rig := normalizedRigConfig(cityPath, cfg.Rigs[i])
+		rigResolved, err := contract.ResolveScopeConfigState(fsys.OSFS{}, cityPath, rig.Path, rig.EffectivePrefix())
+		if err != nil || rigResolved.Kind != contract.ScopeConfigAuthoritative {
+			continue
+		}
+		if rigResolved.State.EndpointOrigin != contract.EndpointOriginInheritedCity {
+			continue
+		}
+		compatRigHost, compatRigPort := configuredExternalDoltTargetForRig(cfg.Rigs[i])
+		if compatRigHost == "" && compatRigPort == "" {
+			continue
+		}
+		advisories = append(advisories, fmt.Sprintf(
+			"rig %q: city.toml declares dolt endpoint %s but the rig's .beads/config.yaml still carries the derived gc.endpoint_origin: inherited_city; the declaration wins and the next rig init reconciles the file",
+			cfg.Rigs[i].Name, net.JoinHostPort(canonicalExternalHost(compatRigHost, compatRigPort), compatRigPort)))
+	}
+	return advisories
 }
 
 func sameConfiguredExternalTarget(aHost, aPort, bHost, bPort string) bool {
@@ -2304,8 +2440,29 @@ func applyLegacyRigScopeInitDoltEnv(env map[string]string, cityPath, scopeRoot s
 		return
 	}
 	target := applyLegacyRigExternalTarget(env, *explicitRig)
-	clearProjectedDoltPasswordEnv(env)
-	applyResolvedDoltAuthEnv(env, scopeRoot, "")
+	// qc-ow3u50: the rig-init server_reachable probe was dialing a PARTIAL
+	// (user, password) because this path cleared the projected password and then
+	// resolved auth with an EMPTY fallback user against the raw scope root.
+	// ResolveScopedFromEnv disallows ambient BEADS_DOLT_PASSWORD and
+	// resolveUser("") returns "", so the child env ended up with GC_DOLT_USER and
+	// GC_DOLT_PASSWORD both empty — and every auth mismatch surfaced as "managed
+	// Dolt server unreachable", wedging rig init (and with it the review plane).
+	// Project credentials the way the SESSION path does (applyCanonicalDoltAuthEnv,
+	// applyCanonicalDoltAuthEnv): resolve auth against the
+	// credential-owning scope root (doltauth.AuthScopeRoot — the rig for an
+	// explicit endpoint, the city otherwise) with the target's user as the
+	// fallback, so the init subprocess receives the same complete (user, password)
+	// the session projection already produces. Declared endpoint credentials must
+	// reach the init child env, not be cleared and half-resolved.
+	//
+	// The fallback user comes from the canonical resolver (the scope's own
+	// .beads/config.yaml dolt.user), which woodhouse's de62dbae1 now preserves
+	// rather than overwriting with an inferred value. If resolution fails, the
+	// empty fallback keeps the prior behavior rather than inventing a user.
+	if resolved, rerr := contract.ResolveDoltConnectionTarget(fsys.OSFS{}, cityPath, scopeRoot); rerr == nil {
+		target.User = strings.TrimSpace(resolved.User)
+	}
+	applyCanonicalDoltAuthEnv(env, cityPath, scopeRoot, target)
 	mirrorBeadsDoltScopeEnv(env, target)
 }
 
