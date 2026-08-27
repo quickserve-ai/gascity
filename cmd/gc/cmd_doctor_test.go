@@ -937,7 +937,7 @@ port = 3307
 	}
 }
 
-func TestDoltTopologyCheckReportsInheritedRigCompatDrift(t *testing.T) {
+func TestDoltTopologyCheckWarnsOnInheritedRigCompatDrift(t *testing.T) {
 	cityDir := t.TempDir()
 	rigDir := filepath.Join(cityDir, "frontend")
 	if err := os.MkdirAll(rigDir, 0o755); err != nil {
@@ -974,12 +974,19 @@ dolt_port = "3308"
 	}
 	resolveRigPaths(cityDir, cfg.Rigs)
 
+	// ga-298g8t: WARNING, not error. The same predicate gates startBeadsLifecycle,
+	// so an error here is a refusal to start the city over a disagreement the next
+	// rig init reconciles in city.toml's favour anyway. Doctor is the right place
+	// for it — visible and actionable, unable to strand anything.
 	res := newDoltTopologyCheck(cityDir, cfg).Run(&doctor.CheckContext{CityPath: cityDir})
-	if res.Status != doctor.StatusError {
-		t.Fatalf("status = %v, want error", res.Status)
+	if res.Status != doctor.StatusWarning {
+		t.Fatalf("status = %v, want warning", res.Status)
 	}
-	if !strings.Contains(res.Message, `deprecated rig dolt_host/dolt_port conflict with inherited canonical endpoint for rig "frontend"`) {
-		t.Fatalf("message = %q, want inherited rig drift", res.Message)
+	if !strings.Contains(res.Message, `rig "frontend"`) {
+		t.Fatalf("message = %q, want the advisory to name the drifting rig", res.Message)
+	}
+	if !strings.Contains(res.Message, "inherited_city") {
+		t.Fatalf("message = %q, want the advisory to name the stale derived origin", res.Message)
 	}
 }
 

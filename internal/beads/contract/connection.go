@@ -298,7 +298,18 @@ func ResolveAuthoritativeConfigState(fs fsys.FS, cityRoot, scopeRoot, issuePrefi
 			if cityResolved.Kind == ScopeConfigAuthoritative && cityResolved.State.EndpointOrigin == EndpointOriginCityCanonical {
 				return ConfigState{}, false, nil
 			}
-			return ConfigState{IssuePrefix: issuePrefix, EndpointOrigin: EndpointOriginInheritedCity, EndpointStatus: EndpointStatusVerified}, true, nil
+			// A port with no host beside it and no stated origin: infer that
+			// this rig follows the city. The status must be INHERITED from the
+			// city, not asserted here — "verified" is the word the
+			// endpoint-setting commands write only after
+			// verifyExternalDoltEndpoint actually connected, and nothing has
+			// probed anything on this path. Claiming it is how a wrong
+			// endpoint survives review (ga-uurd84).
+			return ConfigState{
+				IssuePrefix:    issuePrefix,
+				EndpointOrigin: EndpointOriginInheritedCity,
+				EndpointStatus: inheritedCityEndpointStatus(cityResolved),
+			}, true, nil
 		}
 		cityResolved, err := ResolveScopeConfigState(fs, cityRoot, cityRoot, "")
 		if err != nil {
@@ -558,6 +569,21 @@ func deriveRigLegacyExternalOrigin(fs fsys.FS, cityRoot string, rigCfg ConfigSta
 		return EndpointOriginInheritedCity
 	}
 	return EndpointOriginExplicit
+}
+
+// inheritedCityEndpointStatus reports the status an inherited rig may claim:
+// the city's own, when the city config is authoritative, and otherwise
+// unverified. An inherited rig owns no independent verification state (see
+// inheritedEndpointStatus in cmd/gc), so with no authoritative city state there
+// is nothing to inherit and nothing has been measured.
+func inheritedCityEndpointStatus(cityResolved ScopeConfigResolution) EndpointStatus {
+	if cityResolved.Kind != ScopeConfigAuthoritative {
+		return EndpointStatusUnverified
+	}
+	if status := cityResolved.State.EndpointStatus; status != "" {
+		return status
+	}
+	return EndpointStatusUnverified
 }
 
 func sameExternalEndpoint(a, b ConfigState) bool {
