@@ -26,6 +26,26 @@ const (
 	EndpointOriginExplicit      EndpointOrigin = "explicit"
 )
 
+// EndpointOriginDeclaresEndpoint reports whether an origin records WHERE a
+// scope's store is, as opposed to inferring it from another scope.
+//
+// explicit (a rig's own endpoint) and city_canonical (a city's own external
+// endpoint) are declarations: something wrote a host and a port. inherited_city
+// and managed_city are inferences — they name a source to follow, and carry no
+// endpoint of their own for a managed city.
+//
+// The distinction matters wherever one state replaces another: an inference may
+// never overwrite a declaration, because the declaration is the only record of
+// where the store actually is (ga-uurd84).
+func EndpointOriginDeclaresEndpoint(origin EndpointOrigin) bool {
+	switch origin {
+	case EndpointOriginExplicit, EndpointOriginCityCanonical:
+		return true
+	default:
+		return false
+	}
+}
+
 // EndpointStatus records whether a canonical external endpoint has been validated.
 type EndpointStatus string
 
