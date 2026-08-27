@@ -36,7 +36,7 @@ func AuthScopeRoot(cityRoot, scopeRoot string, target contract.DoltConnectionTar
 func Resolve(scopeRoot, fallbackUser, host string, port int) Resolved {
 	overridePath := strings.TrimSpace(os.Getenv("BEADS_CREDENTIALS_FILE"))
 	return Resolved{
-		User:                    resolveUser(fallbackUser),
+		User:                    resolveUser(fallbackUser, host, port),
 		Password:                resolvePassword(scopeRoot, host, port, overridePath),
 		CredentialsFileOverride: overridePath,
 	}
@@ -72,14 +72,83 @@ func resolveFromEnv(scopeRoot, fallbackUser string, env map[string]string, allow
 	}
 	envPass := strings.TrimSpace(env["BEADS_DOLT_PASSWORD"])
 	return Resolved{
-		User:                    resolveUser(fallbackUser),
+		User:                    resolveUser(fallbackUser, host, port),
 		Password:                resolvePasswordWithEnv(envPass, scopeRoot, host, port, overridePath, allowAmbientBeadsPassword),
 		CredentialsFileOverride: overridePath,
 	}
 }
 
-func resolveUser(fallbackUser string) string {
-	if user := strings.TrimSpace(os.Getenv("GC_DOLT_USER")); user != "" {
+// ambientIdentityAppliesTo reports whether an ambient GC_DOLT_USER override may
+// be applied to the endpoint being resolved.
+//
+// THE AMBIENT IDENTITY TRAVELS WITH THE AMBIENT ENDPOINT (ga-3qvmjj). gc already
+// resolves host and port PER STORE and ignores an ambient endpoint that does not
+// match the store being opened — that is the "ignoring ambient Dolt host/port
+// override for external target" warning in cmd_bd.go. The identity had no such
+// guard, so the endpoint was resolved per store while the credential was
+// resolved per process, and the two disagreed.
+//
+// What that cost, measured 2026-08-27 after the qcore hub flip: an agent session
+// projected for the hub (GC_DOLT_HOST=100.71.23.94, GC_DOLT_PORT=3307,
+// GC_DOLT_USER=cherub) could not open the LOCAL city store at all —
+//
+//	failed to check if database "hq" exists on server 127.0.0.1:51361:
+//	Error 1045 (28000): Access denied for user 'cherub'
+//
+// because no "cherub" exists on the managed local server. Note what that error
+// proves: the endpoint had ALREADY correctly resolved to 127.0.0.1:51361, so the
+// ambient 3307 was being ignored while the credential that came with it was not.
+// hq is the coordination plane, so the blast radius was the agent's mail, its
+// ga- beads, its hook queue and its work queue — it presents as the agent
+// dropping out of the city, not as a connection error.
+//
+// The same hazard was already recognised for the PASSWORD one scope up: see
+// ResolveScopedFromEnv, "scoped GC projections must not let one external rig
+// password contaminate another scope's managed city/HQ connection". This closes
+// the same class for the user.
+//
+// A BARE OVERRIDE STILL APPLIES EVERYWHERE. When the ambient environment names
+// no endpoint, GC_DOLT_USER is a deliberate operator override — the documented
+// behaviour that doltauth reads it via os.Getenv rather than from the resolution
+// map — and it keeps working unchanged. Likewise when the target endpoint is
+// unknown there is nothing to disagree with, so the override applies. Only an
+// ambient identity that PROVABLY belongs to a different endpoint is declined.
+func ambientIdentityAppliesTo(targetHost string, targetPort int) bool {
+	ambientHost := strings.TrimSpace(os.Getenv("GC_DOLT_HOST"))
+	ambientPort := strings.TrimSpace(os.Getenv("GC_DOLT_PORT"))
+	if ambientHost == "" && ambientPort == "" {
+		return true
+	}
+	if strings.TrimSpace(targetHost) == "" && targetPort == 0 {
+		return true
+	}
+	if ambientHost != "" && strings.TrimSpace(targetHost) != "" &&
+		!sameDoltHost(ambientHost, targetHost) {
+		return false
+	}
+	if ambientPort != "" && targetPort != 0 && ambientPort != strconv.Itoa(targetPort) {
+		return false
+	}
+	return true
+}
+
+// sameDoltHost compares two spellings of the same endpoint. "localhost" and
+// "127.0.0.1" name the same server and both spellings appear across the config
+// surface, so a literal comparison would decline a legitimate override.
+func sameDoltHost(a, b string) bool {
+	norm := func(h string) string {
+		h = strings.ToLower(strings.TrimSpace(h))
+		if h == "localhost" || h == "::1" {
+			return "127.0.0.1"
+		}
+		return h
+	}
+	return norm(a) == norm(b)
+}
+
+func resolveUser(fallbackUser, targetHost string, targetPort int) string {
+	if user := strings.TrimSpace(os.Getenv("GC_DOLT_USER")); user != "" &&
+		ambientIdentityAppliesTo(targetHost, targetPort) {
 		return user
 	}
 	return strings.TrimSpace(fallbackUser)
@@ -90,7 +159,24 @@ func resolvePassword(scopeRoot, host string, port int, overridePath string) stri
 }
 
 func resolvePasswordWithEnv(envPass, scopeRoot, host string, port int, overridePath string, allowAmbientBeadsPassword bool) string {
-	if pass := strings.TrimSpace(os.Getenv("GC_DOLT_PASSWORD")); pass != "" {
+	// The ambient PASSWORD is half of the ambient identity and is declined on
+	// the same provable endpoint mismatch as the ambient user
+	// (ambientIdentityAppliesTo). Guarding the user alone is not enough, and the
+	// way it fails is actively misleading: a password present at all forces the
+	// credentialed path, so with the user correctly declined the connection
+	// falls back to the local default and the error moves from
+	//
+	//	Access denied for user 'cherub'   ->   Access denied for user 'root'
+	//
+	// which reads as an unrelated bug rather than as the same leak one variable
+	// further along. Measured by lana on 2026-08-27 against the first fix
+	// (5b70f17f4): with a real crew env, `env -u GC_DOLT_PASSWORD` alone
+	// restored hq while `env -u GC_DOLT_USER` alone did not.
+	//
+	// root on the managed local server has NO password, so supplying one is not
+	// merely redundant — it is what makes the connection fail.
+	ambientApplies := ambientIdentityAppliesTo(host, port)
+	if pass := strings.TrimSpace(os.Getenv("GC_DOLT_PASSWORD")); pass != "" && ambientApplies {
 		return pass
 	}
 	if pass := ReadStoreLocalPassword(scopeRoot); pass != "" {
@@ -100,7 +186,7 @@ func resolvePasswordWithEnv(envPass, scopeRoot, host string, port int, overrideP
 		return envPass
 	}
 	if allowAmbientBeadsPassword {
-		if pass := strings.TrimSpace(os.Getenv("BEADS_DOLT_PASSWORD")); pass != "" {
+		if pass := strings.TrimSpace(os.Getenv("BEADS_DOLT_PASSWORD")); pass != "" && ambientApplies {
 			return pass
 		}
 	}
