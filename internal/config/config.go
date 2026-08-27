@@ -631,6 +631,23 @@ type Rig struct {
 	// MaxActiveSessions is the rig-level cap on total concurrent sessions across
 	// all agents in this rig. Nil means inherit from workspace (or unlimited).
 	MaxActiveSessions *int `toml:"max_active_sessions,omitempty"`
+	// OrphanRelease controls whether the controller's in-process pool orphan
+	// sweeper (releaseOrphanedPoolAssignments) may clear assignees and reopen
+	// work in THIS rig's bead store. Nil means enabled, which is the behavior
+	// every city had before the knob existed; set false to stop the sweeper
+	// writing to this rig without suspending it.
+	//
+	// The lever exists for cutovers where a rig's store is shared with another
+	// city and every autonomous writer has to be quiesced (ga-h5435p). It is
+	// rig config rather than an environment variable on purpose: the sweeper
+	// runs inside the long-lived supervisor, so an env knob could only be
+	// thrown by restarting that process, which can strand every session in the
+	// city (ga-4v3ckk) — the worst possible move mid-cutover.
+	//
+	// Turning it off stops orphan RECOVERY for the rig too: work whose claimant
+	// died stays claimed until the knob comes back. That is the intended
+	// trade for a cutover window, not a setting to leave off indefinitely.
+	OrphanRelease *bool `toml:"orphan_release,omitempty"`
 	// Overrides are per-agent patches applied after pack expansion.
 	// V2 renames this to "patches" for consistency with [[patches.agent]].
 	// Both TOML keys are accepted during migration.
@@ -2778,7 +2795,6 @@ func (d *DaemonConfig) AutoReapClosedBeadWorktreesMinAge() time.Duration {
 		return time.Duration(DefaultAutoReapClosedBeadWorktreesMinAgeMinutes) * time.Minute
 	}
 	return time.Duration(*d.AutoReapClosedBeadWorktreesMinAgeMinutes) * time.Minute
-
 }
 
 // AutoReapStoppedAgentHomesEnabled reports whether stopped configured

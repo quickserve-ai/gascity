@@ -269,6 +269,11 @@ func releaseOrphanedPoolAssignments(
 	}
 
 	var released []releasedPoolAssignment
+	var protectedForeign protectedForeignAssignees
+	defer protectedForeign.log()
+	var heldByGate heldByOrphanReleaseGate
+	defer heldByGate.log()
+	cityName := cfg.EffectiveCityName()
 	for i, wb := range assignedWorkBeads {
 		if wb.Status != "open" && wb.Status != "in_progress" {
 			continue
@@ -298,11 +303,45 @@ func releaseOrphanedPoolAssignments(
 		if agentCfg == nil || !agentCfg.SupportsGenericEphemeralSessions() {
 			continue
 		}
+		// OPERATOR STOP LEVER (ga-h5435p), deliberately ahead of every liveness
+		// check and of the detached probe, which spawns a subprocess: when the
+		// switch is thrown for this rig the sweeper must do NOTHING for its
+		// work, not merely decline the final write.
+		//
+		// Placed AFTER the candidacy filters above so the held count means
+		// "claims this lever actually held" rather than "beads the loop walked
+		// past" — the summary line is read as cutover evidence that the lever
+		// took effect, so it has to be the honest number.
+		var (
+			gateRig     string
+			gateAllowed bool
+		)
+		if storeRefAware {
+			gateRig = strings.TrimSpace(assignedWorkStoreRefs[i])
+			gateAllowed = poolOrphanReleaseAllowed(cfg, gateRig)
+		} else {
+			// No usable store refs this tick; resolve the owning rig from the
+			// bead itself and fail closed if it cannot be resolved while any
+			// rig has the switch thrown.
+			gateRig = poolOrphanReleaseRigForBead(cfg, wb)
+			gateAllowed = poolOrphanReleaseAllowedForBead(cfg, wb)
+		}
+		if !gateAllowed {
+			heldByGate.add(gateRig, wb.ID)
+			continue
+		}
 		// Resolved before the liveness gates because the graph-resident-session
 		// probe below reads the same store; the missing-store report stays where
 		// it was, so a bead skipped by a liveness gate never reaches it.
 		ownerStore := assignedWorkOwnerStore(cfg, store, rigStores, assignedWorkStores, i, wb)
 		if assignee == "" {
+			// OUTSIDE the roster gate by construction: an empty assignee
+			// carries no identity to test, so this arm shares the stated
+			// residual with bare session names (see the package comment in
+			// pool_orphan_foreign_identity.go). The damage class the gate
+			// exists for — writing away another city's CLAIM — cannot occur
+			// here, since there is no claim identity to strip; what this arm
+			// touches is unassigned in_progress routing state only.
 			if wb.Status != "in_progress" {
 				continue
 			}
@@ -319,6 +358,17 @@ func releaseOrphanedPoolAssignments(
 			// openSessionInfos snapshot while the next one issues a live
 			// per-assignee store listing.
 			if liveEphemeralSessionForTemplate(openSessionInfos, cfg, cityPath, agentCfg, assignee, template, workStoreRef, storeRefAware) {
+				continue
+			}
+			// Roster gate, deliberately AHEAD of the liveness question:
+			// liveOpenSessionAssignmentExists answers from THIS city's stores
+			// only, so for an identity this city does not configure a missing
+			// session bead is unobservable rather than absent. The
+			// positive-evidence checks above can only ever SKIP a release, so
+			// running them first costs nothing and keeps the protected count
+			// reporting exactly the claims this gate saved.
+			if !poolAssigneeIsLocallyObservable(cfg, cityName, assignee) {
+				protectedForeign.add(assignee, wb.ID)
 				continue
 			}
 			if memoizedLiveOpenSessionAssignmentExists(sessionStoreLiveAssignee, assignee, sessionStore.Store, assignee) {
@@ -453,12 +503,42 @@ func releaseConfirmedOrphanSessionWork(
 		if _, ok := identifiers[assignee]; !ok {
 			continue
 		}
+		// Roster gate on the SECOND release site. The identifiers set is
+		// built from this city's own session info, but it includes RAW
+		// metadata strings (bead ID, session_name, configured identity read
+		// off the store — see sessionAssignmentIdentifierRawInfo), not
+		// roster-derived names; a stored value that collides with another
+		// city's identity would otherwise carry that identity straight into
+		// a release here, ungated. Same predicate, same failure direction as
+		// the sweep path: unobservable means protect, loudly. The
+		// shared-pack residual applies here as everywhere — a pool instance
+		// byte-identical across cities passes any roster test (see the
+		// package comment in pool_orphan_foreign_identity.go).
+		if !poolAssigneeIsLocallyObservable(cfg, config.EffectiveCityName(cfg, ""), assignee) {
+			log.Printf("releaseConfirmedOrphanSessionWork: protected %q (%s): assignee is not locally observable — refusing orphan-close release", assignee, wb.ID)
+			continue
+		}
 		template := routedToOrLegacyWorkflowTarget(wb)
 		if template == "" {
 			continue
 		}
 		agentCfg := findAgentByTemplate(cfg, template)
 		if agentCfg == nil || !agentCfg.SupportsGenericEphemeralSessions() {
+			continue
+		}
+		// OPERATOR STOP LEVER (ga-h5435p) on the SECOND release site: a thrown
+		// orphan_release = false must stop every autonomous write to the rig's
+		// work, and this tie-break writes the same fields the sweep does. Same
+		// placement rule as the sweep — after the candidacy filters, ahead of
+		// the live re-read and the detached probe — and never silent. No store
+		// refs reach this caller, so the rig is resolved from the bead and an
+		// unresolvable bead fails closed while any rig has the switch thrown.
+		if !poolOrphanReleaseAllowedForBead(cfg, wb) {
+			rigName := poolOrphanReleaseRigForBead(cfg, wb)
+			if rigName == "" {
+				rigName = "<unresolved>"
+			}
+			log.Printf("releaseConfirmedOrphanSessionWork: orphan_release=false held %s in rig %q: refusing orphan-close release of %q", wb.ID, rigName, assignee)
 			continue
 		}
 		ownerStore := assignedWorkOwnerStore(cfg, store, rigStores, assignedWorkStores, i, wb)
