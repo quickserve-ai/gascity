@@ -22,7 +22,7 @@ import (
 // OBSERVABLE from here":
 //
 //	foreign / unknown  -> unobservable -> PROTECTED (skip, do not release)
-//	locally configured -> observable   -> today's behaviour, UNCHANGED
+//	locally configured -> observable   -> today's behavior, UNCHANGED
 //
 // The unchanged-for-local property is what makes this shippable onto a box
 // running live reviews, so every helper here is a pure read of local config.
@@ -53,25 +53,90 @@ import (
 // aliases, session bead IDs and runtime session names ("gastown__dog-ga-up143",
 // "claude-mc-xyz") are this city's own naming and were never the cross-city
 // hazard. Keeping them on the existing path is what preserves current
-// behaviour for every local assignee shape.
+// behavior for every local assignee shape.
 func poolAssigneeIsLocallyObservable(cfg *config.City, cityName, assignee string) bool {
+	return poolAssigneeObservability(cfg, cityName, assignee).Local
+}
+
+// poolRosterReason names the narrowing that decided a roster verdict. It exists
+// so a PROTECTED claim can say WHY, per identity, rather than only that it was
+// skipped: an invisible gate is a fresh instance of the class this file fixes,
+// and "foreign_binding" versus "absent_from_roster" is the difference between
+// another city's live agent and one of ours that was decommissioned.
+type poolRosterReason string
+
+// Roster verdict reasons. The matched ones name which resolver answered; the
+// unmatched ones name why none could.
+const (
+	// poolRosterReasonNotQualified: not a <rig>/<name> identity at all — a bare
+	// alias, a session bead ID, a runtime session name. This city's own naming,
+	// never the cross-city hazard, so it stays on the existing liveness path.
+	poolRosterReasonNotQualified poolRosterReason = "not_qualified"
+
+	poolRosterReasonNamedSession     poolRosterReason = "named_session"
+	poolRosterReasonAgentTemplate    poolRosterReason = "agent_template"
+	poolRosterReasonConfiguredAgent  poolRosterReason = "configured_agent"
+	poolRosterReasonNamepoolInstance poolRosterReason = "namepool_instance"
+	poolRosterReasonAgentInstance    poolRosterReason = "agent_instance"
+
+	// poolRosterReasonForeignBinding: every candidate carried a binding prefix
+	// this city does not mint, so no resolver was allowed to run (ga-8yi7ne).
+	// This is the reason that distinguishes another city's canonical naming
+	// ("qcore/pool.omp-1") from one of our own stale identities.
+	poolRosterReasonForeignBinding poolRosterReason = "foreign_binding"
+
+	// poolRosterReasonAbsentFromRoster: well-formed, binding acceptable, and no
+	// resolver matched. Another city's unbound identity, or one of ours that
+	// config no longer carries.
+	poolRosterReasonAbsentFromRoster poolRosterReason = "absent_from_roster"
+
+	// poolRosterReasonNoConfig: no resolved city config to answer from. Not a
+	// statement about the identity — a statement that this city cannot answer.
+	poolRosterReasonNoConfig poolRosterReason = "no_config"
+)
+
+// poolRosterVerdict is one roster decision with the narrowing that produced it.
+type poolRosterVerdict struct {
+	// Local is the sweeper's existing boolean: true means this city is in a
+	// position to answer the identity's liveness, false means PROTECT.
+	Local bool
+	// Reason names the narrowing that fired.
+	Reason poolRosterReason
+	// Detail carries the narrowing's subject when there is one — the matched
+	// candidate, or the foreign binding that blocked every candidate.
+	Detail string
+}
+
+// poolAssigneeObservability is the explained form of
+// poolAssigneeIsLocallyObservable. The boolean predicate delegates here so
+// there is exactly ONE implementation of this decision: a second copy that
+// drifts from the in-process sweeper would make the two disagree about which
+// city owns a claim, which is the failure this file exists to prevent.
+func poolAssigneeObservability(cfg *config.City, cityName, assignee string) poolRosterVerdict {
 	assignee = strings.TrimSpace(assignee)
-	if cfg == nil || assignee == "" {
-		return true
+	if assignee == "" {
+		return poolRosterVerdict{Local: true, Reason: poolRosterReasonNotQualified}
+	}
+	if cfg == nil {
+		// Unchanged for the sweeper (it passes a loaded cfg), and honest for a
+		// caller that could not load one: no roster, no answer.
+		return poolRosterVerdict{Local: true, Reason: poolRosterReasonNoConfig}
 	}
 	rig, local := config.ParseQualifiedName(assignee)
 	if strings.TrimSpace(rig) == "" || strings.TrimSpace(local) == "" {
-		return true
+		return poolRosterVerdict{Local: true, Reason: poolRosterReasonNotQualified}
 	}
-	return poolIdentityInLocalRoster(cfg, cityName, assignee)
+	return poolIdentityLocalRosterVerdict(cfg, cityName, assignee)
 }
 
-// poolIdentityInLocalRoster resolves a <rig>/<name> identity against local
+// poolIdentityLocalRosterVerdict resolves a <rig>/<name> identity against local
 // config: configured named sessions, configured agent templates (including the
 // legacy bound form that persisted assignees still carry), namepool-themed pool
 // instances, and the instance identities gc mints for a local agent (numeric
-// slots and adhoc tokens).
-func poolIdentityInLocalRoster(cfg *config.City, cityName, identity string) bool {
+// slots and adhoc tokens). The verdict carries the reason the identity was
+// judged local or foreign, not just the boolean.
+func poolIdentityLocalRosterVerdict(cfg *config.City, cityName, identity string) poolRosterVerdict {
+	foreignBinding := ""
 	for _, candidate := range poolIdentityLocalCandidates(cfg, identity) {
 		// A candidate still carrying a binding this city does not mint cannot
 		// name a local agent, whatever the resolvers say (ga-8yi7ne). This is
@@ -90,25 +155,45 @@ func poolIdentityInLocalRoster(cfg *config.City, cityName, identity string) bool
 		// five resolvers below inherit it, so a sixth added later cannot
 		// silently reopen the hole.
 		if !poolCandidateBindingIsLocal(cfg, candidate) {
+			if foreignBinding == "" {
+				foreignBinding = poolCandidateBinding(candidate)
+			}
 			continue
 		}
 		if _, ok := findNamedSessionSpec(cfg, cityName, candidate); ok {
-			return true
+			return poolRosterVerdict{Local: true, Reason: poolRosterReasonNamedSession, Detail: candidate}
 		}
 		if findAgentByTemplate(cfg, candidate) != nil {
-			return true
+			return poolRosterVerdict{Local: true, Reason: poolRosterReasonAgentTemplate, Detail: candidate}
 		}
 		if config.FindAgent(cfg, candidate) != nil {
-			return true
+			return poolRosterVerdict{Local: true, Reason: poolRosterReasonConfiguredAgent, Detail: candidate}
 		}
 		if poolIdentityIsThemedInstance(cfg, candidate) {
-			return true
+			return poolRosterVerdict{Local: true, Reason: poolRosterReasonNamepoolInstance, Detail: candidate}
 		}
 		if poolIdentityIsInstanceOfLocalAgent(cfg, candidate) {
-			return true
+			return poolRosterVerdict{Local: true, Reason: poolRosterReasonAgentInstance, Detail: candidate}
 		}
 	}
-	return false
+	// A foreign binding is reported ahead of a plain roster miss because it is
+	// the stronger statement: the identity names an import this city does not
+	// bind, so it cannot be ours however config changes.
+	if foreignBinding != "" {
+		return poolRosterVerdict{Reason: poolRosterReasonForeignBinding, Detail: foreignBinding}
+	}
+	return poolRosterVerdict{Reason: poolRosterReasonAbsentFromRoster, Detail: identity}
+}
+
+// poolCandidateBinding returns a candidate's binding prefix, or "" when it
+// carries none.
+func poolCandidateBinding(candidate string) string {
+	_, local := config.ParseQualifiedName(strings.TrimSpace(candidate))
+	binding, unbound, ok := strings.Cut(local, ".")
+	if !ok || strings.TrimSpace(binding) == "" || strings.TrimSpace(unbound) == "" {
+		return ""
+	}
+	return binding
 }
 
 // poolIdentityLocalCandidates returns the identity itself plus, when its local
@@ -137,7 +222,7 @@ func poolIdentityInLocalRoster(cfg *config.City, cityName, identity string) bool
 // carried them (config.Agent.BindingName), so the set is exact and needs no
 // heuristic. Measured on this city: {bd, cherub-law, core, gastown, gc,
 // oversight} — which covers every historically-reaped local identity — while
-// the neighbouring city's "pool" and "review" are absent. Their naming is
+// the neighboring city's "pool" and "review" are absent. Their naming is
 // linter-certified canonical on their side and cannot be changed, so the
 // discriminator has to live here.
 func poolIdentityLocalCandidates(cfg *config.City, identity string) []string {
@@ -181,7 +266,7 @@ func poolIdentityLocalCandidates(cfg *config.City, identity string) []string {
 // It fails in the safe direction: declining to resolve only ever PROTECTS a
 // claim. Stranding this city's own stale work is repairable and, in the pool
 // sweeper, reported in the per-sweep protected-identity summary; releasing a
-// neighbouring city's live claim is neither.
+// neighboring city's live claim is neither.
 func cityMintsBinding(cfg *config.City, binding string) bool {
 	binding = strings.TrimSpace(binding)
 	if cfg == nil || binding == "" {
@@ -274,7 +359,7 @@ func cityHasRigNamed(cfg *config.City, name string) bool {
 // Those are the two instance-name generators in the tree — poolInstanceName's
 // numeric slot form and session.GenerateAdhocIdentity, which cmd_hook.go writes
 // straight into the claim assignee for an aliasless pool worker
-// ("rig/polecat-adhoc-<hash>"). Both are recognised WITHOUT consulting the
+// ("rig/polecat-adhoc-<hash>"). Both are recognized WITHOUT consulting the
 // pool's configured ceiling: see the capacity note at the top of this file.
 //
 // The grammar is closed on purpose rather than accepting any suffix, so this
@@ -299,7 +384,7 @@ func poolIdentityIsInstanceOfLocalAgent(cfg *config.City, identity string) bool 
 	return false
 }
 
-// poolInstanceBaseNames strips a recognised instance suffix off an identity's
+// poolInstanceBaseNames strips a recognized instance suffix off an identity's
 // local part and returns the candidate agent names it could have been minted
 // from.
 func poolInstanceBaseNames(local string) []string {
@@ -353,7 +438,7 @@ func cutLastDash(s string) (string, string, bool) {
 // would be a fresh instance of the class it was written to fix. A local agent
 // removed from config is also "not in the local roster", so its claims become
 // protected too — correct as a default, but a permanent silent leak if nobody
-// can see it. Fifty protected claims for an identity nobody recognises has to
+// can see it. Fifty protected claims for an identity nobody recognizes has to
 // read as a decommissioned agent leaking, from the log alone, without knowing
 // to look for it.
 type protectedForeignAssignees struct {
