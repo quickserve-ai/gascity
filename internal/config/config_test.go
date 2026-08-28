@@ -1993,6 +1993,96 @@ esac
 	}
 }
 
+// TestEffectiveWorkQueryBD105SurfacesEphemeralOpenAssignedWork is the mirror of
+// the in-progress test above, and it covers the defect that was re-filed four
+// times over eight days (ga-lnlwrq, ga-0hxp79, ga-w7qlju, ga-dpz553): a patrol
+// formula pours a successor wisp, assigns it, and leaves it OPEN, and `gc hook`
+// then reports no ready work until somebody hand-mutates the row to
+// in_progress. That hand-mutation is the tell — it moves the wisp out of the
+// broken ready tier and into the in-progress tier, which has always had a real
+// wisps-tier probe.
+//
+// The ready tier had none under bd 1.0.5+: it delegated to
+// `bd ready --include-ephemeral`, on the assumption that the flag reads the
+// wisps tier. Measured against a live store on 2026-08-28, it does not --
+// `bd ready --include-ephemeral --assignee=gastown.deacon` returned [] for a
+// wisp that `bd query "ephemeral=true AND status=open AND assignee=..."`
+// returned immediately.
+//
+// The fake bd below encodes exactly that: `ready` answers [] no matter what
+// flags it is given, so the only way to surface the wisp is a real query probe.
+func TestEffectiveWorkQueryBD105SurfacesEphemeralOpenAssignedWork(t *testing.T) {
+	a := Agent{Name: "deacon", Dir: "gastown"}
+	out := runEffectiveWorkQueryForBeads(t, a, BeadsConfig{BDCompatibility: BeadsBDCompatibility105}, map[string]string{
+		"GC_SESSION_NAME": "gastown.deacon",
+	}, `#!/bin/sh
+set -eu
+case "$1" in
+  list)
+    printf '[]'
+    ;;
+  ready)
+    printf '[]'
+    ;;
+  query)
+    case "$*" in
+      *"ephemeral=true AND status=open"*)
+        printf '[{"id":"ga-ephemeral-open","assignee":"gastown.deacon","issue_type":"molecule","status":"open","ephemeral":true,"created_at":"2026-08-28T22:25:15Z"}]'
+        ;;
+      *)
+        printf '[]'
+        ;;
+    esac
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`)
+	if !strings.Contains(out, "ga-ephemeral-open") {
+		t.Fatalf("EffectiveWorkQueryForBeads(bd-1.0.5) did not surface assigned ephemeral OPEN work: %q", out)
+	}
+}
+
+// TestEffectiveWorkQueryBD105EphemeralOpenProbeRespectsReadiness pins the half
+// of the fix that is easy to lose. `bd query status=open` is NOT a readiness
+// query -- bd's own help says dependency-blocked issues keep status "open" --
+// so a probe that simply returned the first matching row would serve blocked
+// wisps that the tier it replaced would have filtered out. Trading a blind
+// tier for one that hands out unworkable rows is not a fix.
+func TestEffectiveWorkQueryBD105EphemeralOpenProbeRespectsReadiness(t *testing.T) {
+	a := Agent{Name: "deacon", Dir: "gastown"}
+	out := runEffectiveWorkQueryForBeads(t, a, BeadsConfig{BDCompatibility: BeadsBDCompatibility105}, map[string]string{
+		"GC_SESSION_NAME": "gastown.deacon",
+	}, `#!/bin/sh
+set -eu
+case "$1" in
+  list)
+    printf '[]'
+    ;;
+  ready)
+    printf '[]'
+    ;;
+  query)
+    case "$*" in
+      *"ephemeral=true AND status=open"*)
+        printf '[{"id":"ga-blocked-wisp","assignee":"gastown.deacon","issue_type":"molecule","status":"open","ephemeral":true,"created_at":"2026-08-28T22:00:00Z","dependencies":[{"type":"blocks","status":"open"}]}]'
+        ;;
+      *)
+        printf '[]'
+        ;;
+    esac
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`)
+	if strings.Contains(out, "ga-blocked-wisp") {
+		t.Fatalf("EffectiveWorkQueryForBeads(bd-1.0.5) served a dependency-blocked ephemeral wisp: %q", out)
+	}
+}
+
 func TestEffectiveWorkQueryCustom(t *testing.T) {
 	a := Agent{Name: "mayor", WorkQuery: "bd ready --label=pool:polecats"}
 	got := a.EffectiveWorkQuery()
@@ -3825,9 +3915,9 @@ func TestDaemonAutoReapClosedBeadWorktreesMinAgeMinutesExplicitZeroDisables(t *t
 	got := d.AutoReapClosedBeadWorktreesMinAge()
 	if got != 0 {
 		t.Errorf("AutoReapClosedBeadWorktreesMinAge() = %v, want 0 (quarantine disabled)", got)
-
 	}
 }
+
 func TestDaemonAutoReapStoppedAgentHomesDefaultsOffAndHonorsFlag(t *testing.T) {
 	d := DaemonConfig{}
 	if d.AutoReapStoppedAgentHomesEnabled() {
