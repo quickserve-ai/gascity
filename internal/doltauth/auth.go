@@ -78,8 +78,11 @@ func resolveFromEnv(scopeRoot, fallbackUser string, env map[string]string, allow
 	}
 }
 
-// ambientIdentityAppliesTo reports whether an ambient GC_DOLT_USER override may
-// be applied to the endpoint being resolved.
+// AmbientIdentityAppliesTo reports whether the ambient GC_DOLT_USER /
+// GC_DOLT_PASSWORD override may be applied to the endpoint being resolved.
+// Exported for the cmd/gc paths that dial Dolt directly (the managed-Dolt SQL
+// helpers, the bd store bridge) and read the ambient password themselves: they
+// must decline it on the same provable endpoint mismatch (gc-49ho).
 //
 // THE AMBIENT IDENTITY TRAVELS WITH THE AMBIENT ENDPOINT (ga-3qvmjj). gc already
 // resolves host and port PER STORE and ignores an ambient endpoint that does not
@@ -102,18 +105,18 @@ func resolveFromEnv(scopeRoot, fallbackUser string, env map[string]string, allow
 // ga- beads, its hook queue and its work queue — it presents as the agent
 // dropping out of the city, not as a connection error.
 //
-// The same hazard was already recognised for the PASSWORD one scope up: see
+// The same hazard was already recognized for the PASSWORD one scope up: see
 // ResolveScopedFromEnv, "scoped GC projections must not let one external rig
 // password contaminate another scope's managed city/HQ connection". This closes
 // the same class for the user.
 //
 // A BARE OVERRIDE STILL APPLIES EVERYWHERE. When the ambient environment names
 // no endpoint, GC_DOLT_USER is a deliberate operator override — the documented
-// behaviour that doltauth reads it via os.Getenv rather than from the resolution
+// behavior that doltauth reads it via os.Getenv rather than from the resolution
 // map — and it keeps working unchanged. Likewise when the target endpoint is
 // unknown there is nothing to disagree with, so the override applies. Only an
 // ambient identity that PROVABLY belongs to a different endpoint is declined.
-func ambientIdentityAppliesTo(targetHost string, targetPort int) bool {
+func AmbientIdentityAppliesTo(targetHost string, targetPort int) bool {
 	ambientHost := strings.TrimSpace(os.Getenv("GC_DOLT_HOST"))
 	ambientPort := strings.TrimSpace(os.Getenv("GC_DOLT_PORT"))
 	if ambientHost == "" && ambientPort == "" {
@@ -148,7 +151,7 @@ func sameDoltHost(a, b string) bool {
 
 func resolveUser(fallbackUser, targetHost string, targetPort int) string {
 	if user := strings.TrimSpace(os.Getenv("GC_DOLT_USER")); user != "" &&
-		ambientIdentityAppliesTo(targetHost, targetPort) {
+		AmbientIdentityAppliesTo(targetHost, targetPort) {
 		return user
 	}
 	return strings.TrimSpace(fallbackUser)
@@ -161,7 +164,7 @@ func resolvePassword(scopeRoot, host string, port int, overridePath string) stri
 func resolvePasswordWithEnv(envPass, scopeRoot, host string, port int, overridePath string, allowAmbientBeadsPassword bool) string {
 	// The ambient PASSWORD is half of the ambient identity and is declined on
 	// the same provable endpoint mismatch as the ambient user
-	// (ambientIdentityAppliesTo). Guarding the user alone is not enough, and the
+	// (AmbientIdentityAppliesTo). Guarding the user alone is not enough, and the
 	// way it fails is actively misleading: a password present at all forces the
 	// credentialed path, so with the user correctly declined the connection
 	// falls back to the local default and the error moves from
@@ -175,7 +178,7 @@ func resolvePasswordWithEnv(envPass, scopeRoot, host string, port int, overrideP
 	//
 	// root on the managed local server has NO password, so supplying one is not
 	// merely redundant — it is what makes the connection fail.
-	ambientApplies := ambientIdentityAppliesTo(host, port)
+	ambientApplies := AmbientIdentityAppliesTo(host, port)
 	if pass := strings.TrimSpace(os.Getenv("GC_DOLT_PASSWORD")); pass != "" && ambientApplies {
 		return pass
 	}
