@@ -23,7 +23,7 @@ var managedDoltServingDataDirDirectFn = managedDoltServingDataDirDirect
 // configured managed password selects the pooled driver connection, which
 // keeps it away from the dolt CLI. The query is bounded by ctx.
 func managedDoltServingDataDir(ctx context.Context, port string) (string, error) {
-	if managedDoltPassword() != "" {
+	if managedDoltPassword("", port) != "" {
 		return managedDoltServingDataDirDirectFn(ctx, port)
 	}
 	out, err := runManagedDoltSQLContext(ctx, "", port, "", "-r", "csv", "-q", "SELECT @@datadir")

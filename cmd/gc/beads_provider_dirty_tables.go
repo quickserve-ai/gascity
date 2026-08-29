@@ -138,7 +138,7 @@ func commitDirtyScopeTablesViaManagedDolt(cityPath, database string) (bool, erro
 // probes, a configured managed password selects the pooled driver connection,
 // which keeps it away from the dolt CLI.
 func managedDoltCommitDirtyTables(port, database string) error {
-	if managedDoltPassword() != "" {
+	if managedDoltPassword("", port) != "" {
 		return managedDoltCommitDirtyTablesDirectFn(port, database)
 	}
 	_, err := runManagedDoltSQL("", port, "root", "-q", dirtyScopeTablesCommitSQL(database))
@@ -169,7 +169,7 @@ func managedDoltDirtyTableCountSQL(database string) string {
 // configured managed password selects the pooled driver connection, as in
 // managedDoltCommitDirtyTables.
 func managedDoltDirtyTableCount(port, database string) (int, error) {
-	if managedDoltPassword() != "" {
+	if managedDoltPassword("", port) != "" {
 		return managedDoltDirtyTableCountDirectFn(port, database)
 	}
 	out, err := runManagedDoltSQL("", port, "root", "-r", "csv", "-q", managedDoltDirtyTableCountSQL(database))
