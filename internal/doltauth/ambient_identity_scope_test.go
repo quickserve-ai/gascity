@@ -33,7 +33,7 @@ func TestResolveUser_AppliesToItsOwnEndpoint(t *testing.T) {
 	}
 }
 
-// The operator override is documented behaviour and must survive: doltauth
+// The operator override is documented behavior and must survive: doltauth
 // reads GC_DOLT_USER via os.Getenv precisely so an operator can force it.
 func TestResolveUser_BareOverrideStillAppliesEverywhere(t *testing.T) {
 	t.Setenv("GC_DOLT_HOST", "")
@@ -160,5 +160,32 @@ func TestResolveScopedFromEnv_CrewEnvDeclinesBothOnMismatch(t *testing.T) {
 	}
 	if got.Password != "" {
 		t.Error("scoped resolution leaked the ambient hub password onto the local store")
+	}
+}
+
+// AmbientIdentityAppliesTo is the exported form of the rule above, for callers
+// in cmd/gc that dial Dolt directly (the managed-Dolt SQL helpers, the bd store
+// bridge) and read the ambient password themselves rather than through
+// Resolve: they must decline it on the same provable endpoint mismatch
+// (gc-49ho — the native-store identity probe presented the hub's password to
+// the managed local server).
+func TestAmbientIdentityAppliesTo_DeclinesOnlyAProvablyForeignEndpoint(t *testing.T) {
+	t.Setenv("GC_DOLT_HOST", "100.71.23.94")
+	t.Setenv("GC_DOLT_PORT", "3307")
+
+	if AmbientIdentityAppliesTo("127.0.0.1", 55221) {
+		t.Fatal("hub-bound ambient identity applied to the managed local store")
+	}
+	if !AmbientIdentityAppliesTo("100.71.23.94", 3307) {
+		t.Fatal("ambient identity declined for its own endpoint")
+	}
+	if !AmbientIdentityAppliesTo("", 0) {
+		t.Fatal("ambient identity declined for an unknown target endpoint")
+	}
+
+	t.Setenv("GC_DOLT_HOST", "")
+	t.Setenv("GC_DOLT_PORT", "")
+	if !AmbientIdentityAppliesTo("127.0.0.1", 55221) {
+		t.Fatal("bare override (no ambient endpoint) declined")
 	}
 }
