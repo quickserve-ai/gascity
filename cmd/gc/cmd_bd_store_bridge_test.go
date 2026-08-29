@@ -378,3 +378,32 @@ func TestBdStoreBridgeListCommandForwardsFilters(t *testing.T) {
 		}
 	}
 }
+
+// gc-49ho: the bridge dials the endpoint named on its command line, so an
+// ambient password that arrived with a DIFFERENT ambient endpoint is not its
+// to present (ga-3qvmjj: the ambient identity travels with the ambient
+// endpoint). Both spellings are declined on the same provable mismatch.
+func TestBdStoreBridgePasswordDeclinesAmbientPasswordBoundToForeignEndpoint(t *testing.T) {
+	t.Setenv("GC_DOLT_HOST", "100.71.23.94")
+	t.Setenv("GC_DOLT_PORT", "3307")
+	t.Setenv("GC_DOLT_PASSWORD", "hub-secret")
+	t.Setenv("BEADS_DOLT_PASSWORD", "hub-secret-mirror")
+
+	if got := bdStoreBridgePassword("127.0.0.1", "55221"); got != "" {
+		t.Fatalf("bdStoreBridgePassword(managed local) = %q, want the hub-bound password declined", got)
+	}
+	if got := bdStoreBridgePassword("100.71.23.94", "3307"); got != "hub-secret" {
+		t.Fatalf("bdStoreBridgePassword(hub) = %q, want hub-secret", got)
+	}
+}
+
+func TestBdStoreBridgePasswordFallsBackToBeadsSpellingForABareOverride(t *testing.T) {
+	t.Setenv("GC_DOLT_HOST", "")
+	t.Setenv("GC_DOLT_PORT", "")
+	t.Setenv("GC_DOLT_PASSWORD", "")
+	t.Setenv("BEADS_DOLT_PASSWORD", "beads-secret")
+
+	if got := bdStoreBridgePassword("127.0.0.1", "55221"); got != "beads-secret" {
+		t.Fatalf("bdStoreBridgePassword(managed local) = %q, want the bare BEADS_DOLT_PASSWORD override applied", got)
+	}
+}

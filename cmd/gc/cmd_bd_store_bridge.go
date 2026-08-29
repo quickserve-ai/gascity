@@ -120,7 +120,14 @@ func parseBdStoreBridgeCommandArgs(args []string) (op string, opArgs []string, d
 	return args[i], args[i+1:], dir, host, port, user, nil
 }
 
-func bdStoreBridgePassword() string {
+// bdStoreBridgePassword returns the ambient password the bridge may present to
+// the endpoint named on its command line. An ambient password that arrived with
+// a DIFFERENT ambient GC_DOLT_HOST/PORT belongs to that other endpoint and is
+// declined (gc-49ho; the rule is doltauth.AmbientIdentityAppliesTo).
+func bdStoreBridgePassword(host, port string) string {
+	if !ambientDoltIdentityAppliesTo(host, port) {
+		return ""
+	}
 	password := strings.TrimSpace(os.Getenv("GC_DOLT_PASSWORD"))
 	if password == "" {
 		password = strings.TrimSpace(os.Getenv("BEADS_DOLT_PASSWORD"))
@@ -138,7 +145,7 @@ func runBdStoreBridge(op string, args []string, dir, host, port, user string, st
 	if strings.TrimSpace(port) == "" {
 		return fmt.Errorf("missing --port")
 	}
-	password := bdStoreBridgePassword()
+	password := bdStoreBridgePassword(host, port)
 	store := beads.NewBdStore(dir, beads.ExecCommandRunnerWithEnv(bdStoreBridgeEnv(dir, host, port, user, password)))
 	switch op {
 	case "create":

@@ -94,6 +94,23 @@ func TestNativeStorageFixtureBootTimeoutSurvivesShardContention(t *testing.T) {
 
 func startPasswordedDoltServer(t *testing.T, repoDir string, setupQueries ...string) (string, int, int, func()) {
 	t.Helper()
+	return startDoltServerForTest(t, repoDir, "secret", setupQueries...)
+}
+
+// startUnpasswordedDoltServer starts a Dolt sql-server whose root carries no
+// password — the managed local server's shape (root@localhost, empty).
+func startUnpasswordedDoltServer(t *testing.T, repoDir string, setupQueries ...string) (string, int, int, func()) {
+	t.Helper()
+	return startDoltServerForTest(t, repoDir, "", setupQueries...)
+}
+
+// startDoltServerForTest starts a real Dolt sql-server in repoDir. A non-empty
+// rootPassword provisions root@'%' with it and projects it as the bare
+// GC_DOLT_PASSWORD override; an empty one leaves root passwordless and clears
+// any ambient GC_DOLT_PASSWORD so the readiness probe dials the way gc's
+// managed-local path does.
+func startDoltServerForTest(t *testing.T, repoDir, rootPassword string, setupQueries ...string) (string, int, int, func()) {
+	t.Helper()
 	skipSlowCmdGCTest(t, "requires a real Dolt server; run make test-cmd-gc-process for full coverage")
 	configureTestDoltIdentityEnv(t)
 
@@ -126,7 +143,9 @@ func startPasswordedDoltServer(t *testing.T, repoDir string, setupQueries ...str
 	for _, query := range setupQueries {
 		run("sql", "-q", query)
 	}
-	run("sql", "-q", "CREATE USER 'root'@'%' IDENTIFIED BY 'secret'; GRANT ALL ON *.* TO 'root'@'%';")
+	if rootPassword != "" {
+		run("sql", "-q", fmt.Sprintf("CREATE USER 'root'@'%%' IDENTIFIED BY '%s'; GRANT ALL ON *.* TO 'root'@'%%';", rootPassword))
+	}
 
 	port := reserveRandomTCPPort(t)
 	cmd := exec.Command(doltPath, "sql-server", "--host", "127.0.0.1", "--port", fmt.Sprintf("%d", port), "--allow-cleartext-passwords", "--loglevel=warning")
@@ -134,10 +153,10 @@ func startPasswordedDoltServer(t *testing.T, repoDir string, setupQueries ...str
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
-		t.Fatalf("start passworded dolt sql-server: %v", err)
+		t.Fatalf("start dolt sql-server: %v", err)
 	}
 
-	t.Setenv("GC_DOLT_PASSWORD", "secret")
+	t.Setenv("GC_DOLT_PASSWORD", rootPassword)
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
 		if err := managedDoltQueryProbeDirect("127.0.0.1", fmt.Sprintf("%d", port), "root"); err == nil {
@@ -154,7 +173,7 @@ func startPasswordedDoltServer(t *testing.T, repoDir string, setupQueries ...str
 
 	_ = cmd.Process.Kill()
 	_, _ = cmd.Process.Wait()
-	t.Fatalf("passworded dolt sql-server on %d did not become query-ready", port)
+	t.Fatalf("dolt sql-server on %d did not become query-ready", port)
 	return "", 0, 0, func() {}
 }
 
@@ -339,5 +358,35 @@ func TestProjectIdentityL3AdapterContractAndManagedComposition(t *testing.T) {
 	}
 	if !l1OK || !l3OK || l1 != "composition-id" || l2 != "composition-id" || l3 != "composition-id" {
 		t.Fatalf("composition state = (L1:%q/%v L2:%q L3:%q/%v), want composition-id in all layers", l1, l1OK, l2, l3, l3OK)
+	}
+}
+
+// TestManagedDoltOpenDatabaseDeclinesForeignAmbientPasswordAgainstLocalServer
+// reproduces the field failure behind gc-49ho against a real server. After the
+// 2026-08-27 qcore hub flip every crew session carried the hub's credentials
+// (GC_DOLT_HOST/PORT/PASSWORD for 100.71.23.94:3307) while the managed LOCAL
+// server's root has no password. The native-store identity probe dialed the
+// local server as root presenting the hub password — Error 1045 — and every
+// city-store open degraded off the native store with "database project_id
+// could not be confirmed". The ambient identity travels with the ambient
+// endpoint: a password bound to a different endpoint is not presented here.
+func TestManagedDoltOpenDatabaseDeclinesForeignAmbientPasswordAgainstLocalServer(t *testing.T) {
+	repoDir := filepath.Join(t.TempDir(), "hq")
+	_, port, _, cleanup := startUnpasswordedDoltServer(t, repoDir)
+	defer cleanup()
+
+	t.Setenv("GC_DOLT_HOST", "100.71.23.94")
+	t.Setenv("GC_DOLT_PORT", "3307")
+	t.Setenv("GC_DOLT_PASSWORD", "hub-secret")
+
+	db, err := managedDoltOpenDatabase("127.0.0.1", fmt.Sprintf("%d", port), "root", "hq")
+	if err != nil {
+		t.Fatalf("managedDoltOpenDatabase: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		t.Fatalf("PingContext(local server, hub-bound ambient password in env) = %v, want the foreign password declined and root connecting passwordless", err)
 	}
 }

@@ -31,14 +31,39 @@ import (
 // default managed loopback behavior is desired.
 const ManagedCityHostEnv = "GC_DOLT_HOST"
 
-// managedCityHost returns the host to use for managed-city Dolt
-// connections. Honors GC_DOLT_HOST as an override so containerised
-// callers can redirect away from loopback.
+// ManagedLocalDoltEnv records what the ambient GC_DOLT_* endpoint IS. GC's own
+// projections set it: a session or exec projected for the managed local server
+// carries "1", one projected for a DIFFERENT store (an external rig endpoint)
+// carries "0" (cmd/gc applyCanonicalDoltTargetEnv / applyLegacyRigExternalTarget
+// / order exec). The managed-city resolver reads it to tell a container's
+// redirect of the managed server from another store's address that merely
+// happens to sit in the same ambient GC_DOLT_HOST.
+const ManagedLocalDoltEnv = "GC_DOLT_MANAGED_LOCAL"
+
+// managedCityHost returns the host to use for managed-city Dolt connections.
+// Honors GC_DOLT_HOST as an override so containerised callers can redirect
+// away from loopback — UNLESS GC's own projection has recorded that the
+// ambient endpoint is a different store (ManagedLocalDoltEnv = "0").
+//
+// gc-49ho: after the 2026-08-27 qcore hub flip every crew session projected
+// for the external qcore rig store carried that store's endpoint as
+// GC_DOLT_HOST/GC_DOLT_PORT (100.71.23.94:3307) in its inherited environment.
+// Every `gc` run inside the session read that ambient host and redirected the
+// city's OWN managed-city target to the hub host — a server that does not hold
+// the city store — so each city-scope resolve, the runtime-state reachability
+// probe and the native-store identity probe included, failed and the fleet
+// went mail-deaf. A container's legitimate redirect and a rig projection are
+// indistinguishable from the host string alone, so gc records which one it is
+// at projection time and the resolver trusts that record: only "0" declines.
 func managedCityHost() string {
-	if host := strings.TrimSpace(os.Getenv(ManagedCityHostEnv)); host != "" {
-		return host
+	host := strings.TrimSpace(os.Getenv(ManagedCityHostEnv))
+	if host == "" {
+		return "127.0.0.1"
 	}
-	return "127.0.0.1"
+	if strings.TrimSpace(os.Getenv(ManagedLocalDoltEnv)) == "0" {
+		return "127.0.0.1"
+	}
+	return host
 }
 
 // DoltHostIsLocal reports whether host names the caller's local network
