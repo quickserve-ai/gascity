@@ -2981,7 +2981,19 @@ prefix = "ct"
 	}
 }
 
-func TestOrderRunExecPreservesAuthOnlyOverridesForManagedLocal(t *testing.T) {
+// managedLocalOrderExecFixture is a city whose store is the managed local
+// Dolt server (endpoint_origin=managed_city) with a live-looking dolt-state
+// file naming a port the test owns, plus the shell probe an order exec runs
+// to print the Dolt env it received.
+type managedLocalOrderExecFixture struct {
+	cityDir string
+	cfg     *config.City
+	port    string
+	outPath string
+}
+
+func newManagedLocalOrderExecFixture(t *testing.T) managedLocalOrderExecFixture {
+	t.Helper()
 	cityDir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(cityDir, ".beads", "dolt"), 0o755); err != nil {
 		t.Fatal(err)
@@ -2990,9 +3002,6 @@ func TestOrderRunExecPreservesAuthOnlyOverridesForManagedLocal(t *testing.T) {
 name = "test-city"
 prefix = "ct"
 `)
-	if err := os.MkdirAll(filepath.Join(cityDir, ".beads"), 0o755); err != nil {
-		t.Fatal(err)
-	}
 	writeFile(t, filepath.Join(cityDir, ".beads", "config.yaml"), strings.Join([]string{
 		"issue_prefix: ct",
 		"gc.endpoint_origin: managed_city",
@@ -3004,11 +3013,11 @@ prefix = "ct"
 	if err != nil {
 		t.Fatalf("Listen: %v", err)
 	}
-	defer func() {
+	t.Cleanup(func() {
 		if err := listener.Close(); err != nil {
-			t.Fatalf("Close listener: %v", err)
+			t.Errorf("Close listener: %v", err)
 		}
-	}()
+	})
 	port := fmt.Sprint(listener.Addr().(*net.TCPAddr).Port)
 	stateDir := filepath.Join(cityDir, ".gc", "runtime", "packs", "dolt")
 	if err := os.MkdirAll(stateDir, 0o755); err != nil {
@@ -3024,6 +3033,50 @@ prefix = "ct"
 	if err != nil {
 		t.Fatalf("loadCityConfig: %v", err)
 	}
+	return managedLocalOrderExecFixture{
+		cityDir: cityDir,
+		cfg:     cfg,
+		port:    port,
+		outPath: filepath.Join(cityDir, "exec-dolt-env.txt"),
+	}
+}
+
+// execDoltEnv runs an order exec that prints the Dolt env it received and
+// returns the printed lines.
+func (f managedLocalOrderExecFixture) execDoltEnv(t *testing.T) []string {
+	t.Helper()
+	a := orders.Order{
+		Name:     "poll",
+		Trigger:  "cooldown",
+		Interval: "1m",
+		Exec: fmt.Sprintf(
+			`printf 'host=<%%s>\nport=<%%s>\nuser=<%%s>\npass=<%%s>\nbeads_host=<%%s>\nbeads_port=<%%s>\nbeads_user=<%%s>\nbeads_pass=<%%s>\n' "$GC_DOLT_HOST" "$GC_DOLT_PORT" "$GC_DOLT_USER" "$GC_DOLT_PASSWORD" "$BEADS_DOLT_SERVER_HOST" "$BEADS_DOLT_SERVER_PORT" "$BEADS_DOLT_SERVER_USER" "$BEADS_DOLT_PASSWORD" > %q`,
+			f.outPath,
+		),
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doOrderRunExec(a, f.cityDir, f.cfg, nil, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doOrderRunExec = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	data, err := os.ReadFile(f.outPath)
+	if err != nil {
+		t.Fatalf("ReadFile(exec-dolt-env): %v", err)
+	}
+	return strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
+}
+
+// TestOrderRunExecDeclinesForeignEndpointIdentityForManagedLocal pins the
+// ga-3qvmjj contract at the order-exec layer: the ambient identity travels
+// with the ambient endpoint. Credentials that arrived WITH an ambient
+// GC_DOLT_HOST/PORT naming a different server are declined for the managed
+// local store rather than carried over as "auth-only overrides" — the
+// pre-ga-3qvmjj reading this test used to assert (gc-mbtd). Presenting a
+// foreign endpoint's password to the managed local server, whose root has
+// none, is what broke every city-store open after the 2026-08-27 hub flip.
+func TestOrderRunExecDeclinesForeignEndpointIdentityForManagedLocal(t *testing.T) {
+	f := newManagedLocalOrderExecFixture(t)
 
 	t.Setenv("GC_DOLT_HOST", "ambient.invalid")
 	t.Setenv("GC_DOLT_PORT", "9999")
@@ -3033,36 +3086,49 @@ prefix = "ct"
 	t.Setenv("BEADS_DOLT_SERVER_PORT", "9998")
 	t.Setenv("BEADS_DOLT_SERVER_USER", "ambient-beads-user")
 	t.Setenv("BEADS_DOLT_PASSWORD", "ambient-beads-secret")
-	outPath := filepath.Join(cityDir, "exec-dolt-env.txt")
-	a := orders.Order{
-		Name:     "poll",
-		Trigger:  "cooldown",
-		Interval: "1m",
-		Exec: fmt.Sprintf(
-			`printf 'host=<%%s>\nport=<%%s>\nuser=<%%s>\npass=<%%s>\nbeads_host=<%%s>\nbeads_port=<%%s>\nbeads_user=<%%s>\nbeads_pass=<%%s>\n' "$GC_DOLT_HOST" "$GC_DOLT_PORT" "$GC_DOLT_USER" "$GC_DOLT_PASSWORD" "$BEADS_DOLT_SERVER_HOST" "$BEADS_DOLT_SERVER_PORT" "$BEADS_DOLT_SERVER_USER" "$BEADS_DOLT_PASSWORD" > %q`,
-			outPath,
-		),
-	}
 
-	var stdout, stderr bytes.Buffer
-	code := doOrderRunExec(a, cityDir, cfg, nil, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("doOrderRunExec = %d, want 0; stderr: %s", code, stderr.String())
-	}
-	data, err := os.ReadFile(outPath)
-	if err != nil {
-		t.Fatalf("ReadFile(exec-dolt-env): %v", err)
-	}
-	got := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
+	got := f.execDoltEnv(t)
 	want := []string{
 		"host=<>",
-		"port=<" + port + ">",
-		"user=<ambient-user>",
-		"pass=<ambient-secret>",
+		"port=<" + f.port + ">",
+		"user=<>",
+		"pass=<>",
 		"beads_host=<>",
-		"beads_port=<" + port + ">",
-		"beads_user=<ambient-user>",
-		"beads_pass=<ambient-secret>",
+		"beads_port=<" + f.port + ">",
+		"beads_user=<>",
+		"beads_pass=<>",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("exec dolt env:\ngot:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+// TestOrderRunExecPreservesBareAuthOverridesForManagedLocal is the case the
+// old test name meant: an operator's bare GC_DOLT_USER/GC_DOLT_PASSWORD, set
+// with no ambient endpoint, is a deliberate override and still reaches the
+// managed-local exec env, mirrored into the BEADS_* spellings bd reads.
+func TestOrderRunExecPreservesBareAuthOverridesForManagedLocal(t *testing.T) {
+	f := newManagedLocalOrderExecFixture(t)
+
+	t.Setenv("GC_DOLT_HOST", "")
+	t.Setenv("GC_DOLT_PORT", "")
+	t.Setenv("GC_DOLT_USER", "operator-user")
+	t.Setenv("GC_DOLT_PASSWORD", "operator-secret")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "")
+	t.Setenv("BEADS_DOLT_SERVER_USER", "")
+	t.Setenv("BEADS_DOLT_PASSWORD", "")
+
+	got := f.execDoltEnv(t)
+	want := []string{
+		"host=<>",
+		"port=<" + f.port + ">",
+		"user=<operator-user>",
+		"pass=<operator-secret>",
+		"beads_host=<>",
+		"beads_port=<" + f.port + ">",
+		"beads_user=<operator-user>",
+		"beads_pass=<operator-secret>",
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("exec dolt env:\ngot:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
@@ -4569,5 +4635,107 @@ prefix = "ct"
 	}
 	if got.Status != "closed" {
 		t.Fatalf("%s status = %q, want closed — stale-close must run alongside retention", openID, got.Status)
+	}
+}
+
+// TestOrderHistoryRendersOutcomeForAllTrackingStates pins the ga-kahru9 fix.
+//
+// `gc order history` used to print ORDER/BEAD/EXECUTED only, so a run that
+// FAILED and a run that SUCCEEDED rendered byte-identically. During the
+// ga-7unsv0 sync outage 18 of 21 consecutive runs carried the exec-failed label
+// and the operator could not see one of them; the outage read as healthy for
+// roughly five hours.
+//
+// The third state is the one that matters most: a run killed before the
+// dispatcher stamped any outcome closes with NO outcome label at all, and must
+// render "unknown" — never blank, and never success.
+func TestOrderHistoryRendersOutcomeForAllTrackingStates(t *testing.T) {
+	store := beads.NewBdStore(t.TempDir(), func(_, _ string, args ...string) ([]byte, error) {
+		if !strings.Contains(strings.Join(args, " "), "--label=order-run:sync") {
+			return []byte(`[]`), nil
+		}
+		return []byte(`[
+			{"id":"RUN-OK","title":"sync","status":"closed","issue_type":"task","created_at":"2026-02-27T13:00:00Z","labels":["order-run:sync","exec"]},
+			{"id":"RUN-FAIL","title":"sync","status":"closed","issue_type":"task","created_at":"2026-02-27T12:00:00Z","labels":["order-run:sync","exec-failed"]},
+			{"id":"RUN-KILLED","title":"sync","status":"closed","issue_type":"task","created_at":"2026-02-27T11:00:00Z","labels":["order-run:sync"]},
+			{"id":"RUN-LIVE","title":"sync","status":"open","issue_type":"task","created_at":"2026-02-27T10:00:00Z","labels":["order-run:sync"]}
+		]`), nil
+	})
+	aa := []orders.Order{{Name: "sync", Formula: "mol-sync"}}
+	resolver := func(orders.Order) ([]beads.OrdersStore, error) {
+		return []beads.OrdersStore{{Store: store}}, nil
+	}
+
+	want := map[string]string{
+		"RUN-OK":     "success",
+		"RUN-FAIL":   "failed",
+		"RUN-KILLED": "unknown",
+		"RUN-LIVE":   "running",
+	}
+
+	// --- human table ---
+	var stdout, stderr bytes.Buffer
+	if code := doOrderHistoryWithStoresResolverJSON("sync", "", aa, resolver, false, &stdout, &stderr); code != 0 {
+		t.Fatalf("doOrderHistory = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "OUTCOME") {
+		t.Fatalf("table has no OUTCOME column:\n%s", out)
+	}
+	seen := map[string]bool{}
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			continue
+		}
+		id := fields[1]
+		if _, tracked := want[id]; !tracked {
+			continue
+		}
+		seen[id] = true
+		if got := fields[len(fields)-1]; got != want[id] {
+			t.Errorf("%s outcome = %q, want %q\nline: %s", id, got, want[id], line)
+		}
+	}
+	// Non-vacuity: every state must actually have been exercised, or a
+	// silently-missing row would let this test pass while proving nothing.
+	for id := range want {
+		if !seen[id] {
+			t.Errorf("row %s never appeared in the table — assertion was vacuous:\n%s", id, out)
+		}
+	}
+
+	// --- json ---
+	stdout.Reset()
+	stderr.Reset()
+	if code := doOrderHistoryWithStoresResolverJSON("sync", "", aa, resolver, true, &stdout, &stderr); code != 0 {
+		t.Fatalf("doOrderHistory --json = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	var payload orderHistoryJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout.String())
+	}
+	if len(payload.Entries) != len(want) {
+		t.Fatalf("json entries = %d, want %d: %+v", len(payload.Entries), len(want), payload.Entries)
+	}
+	for _, e := range payload.Entries {
+		if e.Outcome != want[e.BeadID] {
+			t.Errorf("json %s outcome = %q, want %q", e.BeadID, e.Outcome, want[e.BeadID])
+		}
+	}
+}
+
+// TestOrderRunOutcomeDisplayNeverBlankForClosedRun guards the specific
+// regression: a closed run with no outcome label must not come back "" (which
+// rendered as an empty column and read as "nothing wrong").
+func TestOrderRunOutcomeDisplayNeverBlankForClosedRun(t *testing.T) {
+	if got := orderRunOutcomeDisplay(orders.OrderRun{Open: false}); got != "unknown" {
+		t.Errorf("closed run with no outcome = %q, want %q", got, "unknown")
+	}
+	if got := orderRunOutcomeDisplay(orders.OrderRun{Open: true}); got != "running" {
+		t.Errorf("open run with no outcome = %q, want %q", got, "running")
+	}
+	if got := orderRunOutcomeDisplay(orders.OrderRun{Outcome: orders.RunOutcomeExecFailed}); got != "failed" {
+		t.Errorf("exec-failed run = %q, want %q", got, "failed")
 	}
 }

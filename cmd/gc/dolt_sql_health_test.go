@@ -465,3 +465,34 @@ func TestRunManagedDoltSQLIncludesConfiguredPasswordFlag(t *testing.T) {
 		t.Fatalf("dolt args missing configured password flag:\n%s", data)
 	}
 }
+
+// gc-49ho: the ambient identity travels with the ambient endpoint. After the
+// 2026-08-27 qcore hub flip every crew session carried the hub's credentials
+// (GC_DOLT_HOST=100.71.23.94 GC_DOLT_PORT=3307 GC_DOLT_PASSWORD=<hub>) and
+// the managed-Dolt SQL helpers presented that password to the managed LOCAL
+// server, whose root has none — Error 1045 on the native-store identity
+// probe, "database project_id could not be confirmed" on every city-store
+// open. doltauth already declines the ambient identity on exactly this
+// mismatch (ga-3qvmjj); the helpers dial with the same rule.
+func TestManagedDoltPasswordDeclinesAmbientPasswordBoundToForeignEndpoint(t *testing.T) {
+	t.Setenv("GC_DOLT_HOST", "100.71.23.94")
+	t.Setenv("GC_DOLT_PORT", "3307")
+	t.Setenv("GC_DOLT_PASSWORD", "hub-secret")
+
+	if got := managedDoltPassword("127.0.0.1", "55221"); got != "" {
+		t.Fatalf("managedDoltPassword(managed local) = %q, want the hub-bound password declined", got)
+	}
+	if got := managedDoltPassword("100.71.23.94", "3307"); got != "hub-secret" {
+		t.Fatalf("managedDoltPassword(hub) = %q, want hub-secret", got)
+	}
+}
+
+func TestManagedDoltPasswordBareOverrideStillAppliesEverywhere(t *testing.T) {
+	t.Setenv("GC_DOLT_HOST", "")
+	t.Setenv("GC_DOLT_PORT", "")
+	t.Setenv("GC_DOLT_PASSWORD", "operator-secret")
+
+	if got := managedDoltPassword("127.0.0.1", "55221"); got != "operator-secret" {
+		t.Fatalf("managedDoltPassword(managed local) = %q, want the bare operator override applied", got)
+	}
+}

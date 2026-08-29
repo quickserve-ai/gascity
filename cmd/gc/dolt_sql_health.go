@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/doltauth"
 	"github.com/gastownhall/gascity/internal/doltpool"
 )
 
@@ -110,7 +111,7 @@ func managedDoltReadOnlyProbeSQLFor(db string) string {
 }
 
 func managedDoltQueryProbe(host, port, user string) error {
-	if managedDoltPassword() != "" {
+	if managedDoltPassword(host, port) != "" {
 		return managedDoltQueryProbeDirectFn(host, port, user)
 	}
 	_, err := runManagedDoltSQL(host, port, user, "-r", "csv", "-q", "SELECT COUNT(*) AS cnt FROM information_schema.SCHEMATA")
@@ -124,7 +125,7 @@ func managedDoltQueryProbe(host, port, user string) error {
 }
 
 func managedDoltReadOnlyState(host, port, user string) (string, error) {
-	if managedDoltPassword() != "" {
+	if managedDoltPassword(host, port) != "" {
 		return managedDoltReadOnlyStateDirectFn(host, port, user)
 	}
 	db, err := managedDoltSelectUserDatabase(host, port, user)
@@ -218,7 +219,7 @@ func managedDoltUserDatabases(lines []string) []string {
 }
 
 func managedDoltConnectionCount(host, port, user string) (string, error) {
-	if managedDoltPassword() != "" {
+	if managedDoltPassword(host, port) != "" {
 		return managedDoltConnectionCountDirectFn(host, port, user)
 	}
 	out, err := runManagedDoltSQL(host, port, user, "-r", "csv", "-q", "SELECT COUNT(*) AS cnt FROM information_schema.PROCESSLIST")
@@ -274,13 +275,38 @@ func managedDoltHealthCheckFields(report managedDoltSQLHealthReport) []string {
 	}
 }
 
-func managedDoltPassword() string {
-	return strings.TrimSpace(os.Getenv("GC_DOLT_PASSWORD"))
+// managedDoltPassword returns the ambient GC_DOLT_PASSWORD for a direct dial of
+// host:port, declining it when the ambient identity provably belongs to a
+// different endpoint (doltauth.AmbientIdentityAppliesTo — the ambient identity
+// travels with the ambient endpoint).
+//
+// gc-49ho: after the 2026-08-27 qcore hub flip every crew session carried the
+// hub's credentials (GC_DOLT_HOST/PORT/PASSWORD for the external rig store).
+// The managed-Dolt helpers presented that password to the managed LOCAL
+// server, whose root has none, so the native-store identity probe failed with
+// Error 1045 and every city-store open was demoted to the bd fallback with
+// "database project_id could not be confirmed". A bare override — no ambient
+// endpoint — is still the operator's deliberate choice and applies everywhere.
+func managedDoltPassword(host, port string) string {
+	pass := strings.TrimSpace(os.Getenv("GC_DOLT_PASSWORD"))
+	if pass == "" || !ambientDoltIdentityAppliesTo(host, port) {
+		return ""
+	}
+	return pass
+}
+
+// ambientDoltIdentityAppliesTo adapts a cmd/gc host:port pair to doltauth's
+// endpoint-binding rule. An empty host is the managed loopback server, exactly
+// as the dial helpers treat it; an unparsable port compares as unknown.
+func ambientDoltIdentityAppliesTo(host, port string) bool {
+	portNum, _ := strconv.Atoi(strings.TrimSpace(port))
+	return doltauth.AmbientIdentityAppliesTo(managedDoltConnectHost(host), portNum)
 }
 
 // managedDoltOpenDB returns the shared pooled server-level *sql.DB (no
 // database selected) for a managed Dolt endpoint. The handle is owned by
-// internal/doltpool — callers must NOT Close it.
+// internal/doltpool — callers must NOT Close it. The password is the
+// endpoint-bound ambient identity (gc-49ho); the pool key includes it.
 func managedDoltOpenDB(host, port, user string) (*sql.DB, error) {
 	host = managedDoltConnectHost(host)
 	port = strings.TrimSpace(port)
@@ -291,7 +317,7 @@ func managedDoltOpenDB(host, port, user string) (*sql.DB, error) {
 	if user == "" {
 		user = "root"
 	}
-	return doltpool.Open(host, port, user, managedDoltPassword(), "")
+	return doltpool.Open(host, port, user, managedDoltPassword(host, port), "")
 }
 
 func managedDoltQueryProbeDirect(host, port, user string) error {
@@ -395,7 +421,7 @@ func managedDoltConnectionCountDirect(host, port, user string) (string, error) {
 }
 
 func managedDoltResetProbe(host, port, user string) error {
-	if managedDoltPassword() != "" {
+	if managedDoltPassword(host, port) != "" {
 		return managedDoltResetProbeDirectFn(host, port, user)
 	}
 	if _, err := runManagedDoltSQL(host, port, user, "-q", "DROP DATABASE IF EXISTS "+managedDoltProbeDatabase); err != nil {
@@ -469,7 +495,7 @@ func runManagedDoltSQLContext(parent context.Context, host, port, user string, a
 		"--host", host,
 		"--port", port,
 		"--user", user,
-		"--password", managedDoltPassword(),
+		"--password", managedDoltPassword(host, port),
 		"--no-tls",
 		"sql",
 	}

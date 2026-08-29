@@ -1143,6 +1143,44 @@ func TestManagedCityHost_EnvTrimmed(t *testing.T) {
 	}
 }
 
+// TestManagedCityHost_AmbientHostRecordedAsAnotherStoreIsDeclined pins gc-49ho's
+// host leg. A crew session projected for the external qcore rig store carries
+// that store's endpoint as GC_DOLT_HOST (2026-08-27 hub flip: 100.71.23.94) in
+// its inherited env AND the projection recorded that this endpoint is not the
+// managed local server (GC_DOLT_MANAGED_LOCAL=0). Redirecting the city's own
+// managed-city target to the hub host named a server that does not hold the
+// city store; the record is the proof, so the override is declined.
+func TestManagedCityHost_AmbientHostRecordedAsAnotherStoreIsDeclined(t *testing.T) {
+	t.Setenv(ManagedCityHostEnv, "100.71.23.94")
+	t.Setenv(ManagedLocalDoltEnv, "0")
+	if got := managedCityHost(); got != "127.0.0.1" {
+		t.Fatalf("managedCityHost() = %q, want 127.0.0.1 (ambient host recorded as another store declined)", got)
+	}
+}
+
+// TestManagedCityHost_AmbientHostRecordedAsManagedLocalApplies keeps the
+// container redirect (host.docker.internal → the managed server) working when
+// the record says the ambient endpoint IS the managed server.
+func TestManagedCityHost_AmbientHostRecordedAsManagedLocalApplies(t *testing.T) {
+	t.Setenv(ManagedCityHostEnv, "host.docker.internal")
+	t.Setenv(ManagedLocalDoltEnv, "1")
+	if got := managedCityHost(); got != "host.docker.internal" {
+		t.Fatalf("managedCityHost() = %q, want host.docker.internal", got)
+	}
+}
+
+// TestManagedCityHost_AmbientHostWithNoRecordApplies keeps the bare
+// operator/container override working: with no projection record there is
+// nothing to say the ambient host is another store's, so it still redirects —
+// this is why the existing ProjectsHostOverride contract stays intact.
+func TestManagedCityHost_AmbientHostWithNoRecordApplies(t *testing.T) {
+	t.Setenv(ManagedCityHostEnv, "host.docker.internal")
+	t.Setenv(ManagedLocalDoltEnv, "")
+	if got := managedCityHost(); got != "host.docker.internal" {
+		t.Fatalf("managedCityHost() = %q, want host.docker.internal (no record must not decline)", got)
+	}
+}
+
 // TestResolveDoltConnectionTargetManagedCity_EnvOverride asserts that a
 // managed-city resolve honors GC_DOLT_HOST with a value distinguishable from
 // the unset default.
@@ -1188,5 +1226,34 @@ func TestResolveDoltConnectionTargetManagedCity_EnvOverrideAppliesToReachability
 	_, err := ResolveDoltConnectionTarget(fs, city, city)
 	if err == nil || !strings.Contains(err.Error(), "dolt runtime state unavailable") {
 		t.Fatalf("ResolveDoltConnectionTarget() error = %v, want unavailable (override routed liveness probe elsewhere)", err)
+	}
+}
+
+// TestResolveDoltConnectionTargetManagedCity_DeclinesAmbientHostRecordedAsAnotherStore
+// is the resolver-level regression for gc-49ho's host leg. The ambient host is
+// non-routable TEST-NET-1; if the override were honored the reachability probe
+// would fail exactly as
+// TestResolveDoltConnectionTargetManagedCity_EnvOverrideAppliesToReachability
+// proves. With the projection recording the ambient endpoint as another store,
+// the host is declined and the managed loopback server resolves normally.
+func TestResolveDoltConnectionTargetManagedCity_DeclinesAmbientHostRecordedAsAnotherStore(t *testing.T) {
+	t.Setenv(ManagedCityHostEnv, "192.0.2.1")
+	t.Setenv(ManagedLocalDoltEnv, "0")
+	fs := fsys.OSFS{}
+	city := t.TempDir()
+	writeCanonicalConfig(t, fs, city, ConfigState{
+		IssuePrefix:    "gc",
+		EndpointOrigin: EndpointOriginManagedCity,
+		EndpointStatus: EndpointStatusVerified,
+	})
+	writeCanonicalMetadata(t, fs, city, "hq")
+	port := writeReachableRuntimeState(t, fs, city)
+
+	target, err := ResolveDoltConnectionTarget(fs, city, city)
+	if err != nil {
+		t.Fatalf("ResolveDoltConnectionTarget() error = %v, want the ambient host declined and loopback resolved", err)
+	}
+	if target.Host != "127.0.0.1" || target.Port != port {
+		t.Fatalf("target = %+v, want host 127.0.0.1 port %q", target, port)
 	}
 }
