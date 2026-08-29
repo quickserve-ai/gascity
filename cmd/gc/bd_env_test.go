@@ -5918,3 +5918,54 @@ func TestApplyCanonicalDoltTargetEnvUnixSocket(t *testing.T) {
 		t.Fatalf("env = %#v", env)
 	}
 }
+
+// TestBdRuntimeEnvForExplicitRigRecordsAmbientEndpointAsAnotherStore pins the
+// projection half of gc-49ho's host leg: a session projected for an explicit
+// external rig store carries GC_DOLT_MANAGED_LOCAL=0 so the managed-city
+// resolver (contract.ManagedLocalDoltEnv) knows the ambient GC_DOLT_HOST is
+// that store's, not a redirect of the city's managed server — while the city
+// scope's own projection carries no such record.
+func TestBdRuntimeEnvForExplicitRigRecordsAmbientEndpointAsAnotherStore(t *testing.T) {
+	cityDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityDir, ".gc", "runtime", "packs", "dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(cityDir, ".beads"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = ln.Close() }() //nolint:errcheck // test cleanup
+	if err := writeDoltState(cityDir, doltRuntimeState{
+		Running:   true,
+		PID:       os.Getpid(),
+		Port:      ln.Addr().(*net.TCPAddr).Port,
+		DataDir:   filepath.Join(cityDir, ".beads", "dolt"),
+		StartedAt: "2026-04-02T08:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rigDir := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(filepath.Join(rigDir, ".beads"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{
+		Rigs: []config.Rig{{
+			Name:     "repo",
+			Path:     rigDir,
+			DoltHost: "rig-db.example.com",
+			DoltPort: "3307",
+		}},
+	}
+
+	rigEnv := mustBdRuntimeEnvForRig(t, cityDir, cfg, rigDir)
+	if got := rigEnv["GC_DOLT_MANAGED_LOCAL"]; got != "0" {
+		t.Fatalf("rig GC_DOLT_MANAGED_LOCAL = %q, want %q (ambient endpoint recorded as another store)", got, "0")
+	}
+	cityEnv := mustBdRuntimeEnv(t, cityDir)
+	if got, ok := cityEnv["GC_DOLT_MANAGED_LOCAL"]; ok {
+		t.Fatalf("city GC_DOLT_MANAGED_LOCAL = %q, want absent for the managed city scope", got)
+	}
+}
