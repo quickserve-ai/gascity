@@ -246,6 +246,12 @@ func buildRecipeApplyPlan(recipe *formula.Recipe, opts Options) (*beads.GraphApp
 				}
 				node.Metadata[beadmeta.WorkflowExpandedMetadataKey] = "true"
 			}
+			if recipe.PathAgnostic {
+				if node.Metadata == nil {
+					node.Metadata = make(map[string]string, 1)
+				}
+				node.Metadata[beadmeta.FormulaPathAgnosticMetadataKey] = "true"
+			}
 		} else {
 			// graph.v2 workflows and their retry/Ralph attempt sub-recipes
 			// use step beads as independently routable actionable work, not
