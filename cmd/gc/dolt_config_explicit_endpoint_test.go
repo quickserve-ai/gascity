@@ -65,7 +65,7 @@ func TestForcedScopeInitKeepsOperatorSetExplicitRigEndpoint(t *testing.T) {
 // state DECLARES an endpoint rather than inferring one.
 func TestForcedScopeInitStillHonorsCityTomlEndpoint(t *testing.T) {
 	cityPath, rigPath := writeExplicitHubRigFixture(t)
-	appendRigEndpointToCityToml(t, cityPath, rigPath, "10.9.9.9", "3399")
+	appendRigEndpointToCityToml(t, cityPath, "10.9.9.9", "3399")
 
 	state, ok, err := forcedScopeDoltConfigStateForInit(cityPath, rigPath, "qc")
 	if err != nil {
@@ -193,7 +193,7 @@ func writeExplicitHubRigFixture(t *testing.T) (cityPath, rigPath string) {
 	return cityPath, rigPath
 }
 
-func appendRigEndpointToCityToml(t *testing.T, cityPath, rigPath, host, port string) {
+func appendRigEndpointToCityToml(t *testing.T, cityPath, host, port string) {
 	t.Helper()
 	path := filepath.Join(cityPath, "city.toml")
 	data, err := os.ReadFile(path)
