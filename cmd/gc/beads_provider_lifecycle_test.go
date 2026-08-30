@@ -7242,7 +7242,7 @@ func runGcBeadsBdHQInitForTest(t *testing.T, script, cityPath, binDir string) ([
 	return cmd.CombinedOutput()
 }
 
-func TestGcBeadsBdInitMetadataOnlyFallsThroughToForcedBdInitWithPinnedDatabaseWhenSchemaMissing(t *testing.T) {
+func TestGcBeadsBdInitMetadataOnlyFallsThroughToLocalReinitWithPinnedDatabaseWhenSchemaMissing(t *testing.T) {
 	cityPath := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
 		t.Fatal(err)
@@ -7281,14 +7281,14 @@ case "$cmd" in
       echo "legacy Dolt server workspace detected; explicit migration is required" >&2
       exit 3
     fi
-    has_force=false
+    has_reinit=false
     for arg in "$@"; do
-      if [ "$arg" = "--force" ]; then
-        has_force=true
+      if [ "$arg" = "--reinit-local" ]; then
+        has_reinit=true
       fi
     done
-    if [ "$has_force" != "true" ]; then
-      echo "bd init fallback must force reinitialize existing workspace" >&2
+    if [ "$has_reinit" != "true" ]; then
+      echo "bd init fallback must reinitialize existing workspace" >&2
       exit 2
     fi
     printf '1\n' > %q
@@ -7359,7 +7359,7 @@ esac
 		t.Fatalf("expected bd init fallback to run: %v", err)
 	}
 	got := string(data)
-	for _, want := range []string{"--force", "--server", "-p", "gc", "--database", "hq", cityPath} {
+	for _, want := range []string{"--reinit-local", "--server", "-p", "gc", "--database", "hq", cityPath} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("bd init argv missing %q:\n%s", want, got)
 		}
@@ -7426,14 +7426,14 @@ case "$cmd" in
       echo "legacy Dolt server workspace detected; explicit migration is required" >&2
       exit 3
     fi
-    has_force=false
+    has_reinit=false
     for arg in "$@"; do
-      if [ "$arg" = "--force" ]; then
-        has_force=true
+      if [ "$arg" = "--reinit-local" ]; then
+        has_reinit=true
       fi
     done
-    if [ "$has_force" != "true" ]; then
-      echo "bd init fallback must force reinitialize existing workspace" >&2
+    if [ "$has_reinit" != "true" ]; then
+      echo "bd init fallback must reinitialize existing workspace" >&2
       exit 2
     fi
     printf '1\n' > %q
@@ -7505,6 +7505,294 @@ esac
 	witness := filepath.Join(cityPath, ".beads", ".local_version")
 	if _, statErr := os.Stat(witness); !os.IsNotExist(statErr) {
 		t.Fatalf("adopted pre-existing database must not receive a bd version witness at %s (stat err = %v)", witness, statErr)
+	}
+}
+
+func TestGcBeadsBdInitDirtySchemaRecovery(t *testing.T) {
+	const exactError = "Error: failed to open Dolt store: failed to initialize schema: schema migration: pending schema migrations alter pre-existing dirty tables: comments, compaction_snapshots, dependencies, events, issue_snapshots, labels; run 'bd dolt commit' to commit the working set at the current schema, then re-run the migration (gastownhall/beads#4566)"
+	const similarError = "Error: failed to open Dolt store: failed to initialize schema: schema migration: pending schema migrations alter pre-existing dirty tables: comments, dependencies; retry manually"
+	const migrationDirtyTables = "comments\ncompaction_snapshots\ndependencies\ndolt_schemas\nevents\nissue_snapshots\nlabels\nschema_migrations\n"
+
+	tests := []struct {
+		name                string
+		initError           string
+		dirtyTables         string
+		databasePreexisting bool
+		databaseDirectory   bool
+		alreadyClean        bool
+		wantSuccess         bool
+		wantInitCount       string
+		wantCheckpoint      bool
+	}{
+		{
+			name:           "exact v1.1.0 fresh-init signature is checkpointed selectively",
+			initError:      exactError,
+			dirtyTables:    migrationDirtyTables,
+			wantSuccess:    true,
+			wantInitCount:  "2",
+			wantCheckpoint: true,
+		},
+		{
+			name:          "similar unrecognized error fails closed",
+			initError:     similarError,
+			dirtyTables:   migrationDirtyTables,
+			wantInitCount: "1",
+		},
+		{
+			name:          "unexpected dirty table fails closed",
+			initError:     exactError,
+			dirtyTables:   migrationDirtyTables + "operator_notes\n",
+			wantInitCount: "1",
+		},
+		{
+			name:                "preexisting database fails closed",
+			initError:           exactError,
+			dirtyTables:         migrationDirtyTables,
+			databasePreexisting: true,
+			wantInitCount:       "1",
+		},
+		{
+			name:              "uncataloged database directory fails closed",
+			initError:         exactError,
+			dirtyTables:       migrationDirtyTables,
+			databaseDirectory: true,
+			wantInitCount:     "1",
+		},
+		{
+			// The reworded refusal must still be refused as pre-existing, so
+			// gc's Go recovery sees the script's refusal and does not commit.
+			name:                "reworded refusal on a preexisting database fails closed as preexisting",
+			initError:           similarError,
+			dirtyTables:         migrationDirtyTables,
+			databasePreexisting: true,
+			wantInitCount:       "1",
+		},
+		{
+			// gc's Go matcher ignores case, so the script's refusal must too.
+			name:                "capitalized refusal on a preexisting database fails closed as preexisting",
+			initError:           "Error: failed to open Dolt store: schema migration: Pending schema migrations Alter Pre-Existing Dirty Tables: comments, dependencies; retry manually",
+			dirtyTables:         migrationDirtyTables,
+			databasePreexisting: true,
+			wantInitCount:       "1",
+		},
+		{
+			name:          "already-clean recovery is idempotent",
+			initError:     exactError,
+			alreadyClean:  true,
+			wantSuccess:   true,
+			wantInitCount: "2",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cityPath := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Join(cityPath, ".beads"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(cityPath, ".beads", "metadata.json"),
+				[]byte(`{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"hq"}`), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			materializeBuiltinPacksForTest(t, cityPath)
+			script := gcBeadsBdScriptPath(cityPath)
+			binDir := filepath.Join(t.TempDir(), "bin")
+			if err := os.MkdirAll(binDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			stateDir := t.TempDir()
+			initCountFile := filepath.Join(stateDir, "bd-init-count")
+			checkpointFile := filepath.Join(stateDir, "schema-checkpointed")
+			recoveryReadyFile := filepath.Join(stateDir, "recovery-ready")
+			schemaReadyFile := filepath.Join(stateDir, "schema-ready")
+			databaseFile := filepath.Join(stateDir, "database-exists")
+			dirtyTablesFile := filepath.Join(stateDir, "dirty-tables")
+			stageLogFile := filepath.Join(stateDir, "staged-tables")
+			sqlLogFile := filepath.Join(stateDir, "dolt-sql")
+			dataDir := filepath.Join(stateDir, "dolt-data")
+			if err := os.WriteFile(dirtyTablesFile, []byte(tt.dirtyTables), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if tt.databasePreexisting {
+				if err := os.WriteFile(databaseFile, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tt.databasePreexisting || tt.databaseDirectory {
+				if err := os.MkdirAll(filepath.Join(dataDir, "hq"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			alreadyClean := "false"
+			if tt.alreadyClean {
+				alreadyClean = "true"
+			}
+
+			fakeBd := filepath.Join(binDir, "bd")
+			// The version answer feeds the fresh managed-Dolt version witness the
+			// script seeds for a database this invocation created (#5294).
+			fakeBdScript := fmt.Sprintf(`#!/bin/sh
+set -eu
+case "${1:-}" in
+  --version|version)
+    echo "bd version 1.2.1 (test)"
+    exit 0
+    ;;
+  init)
+    count=0
+    if [ -f %q ]; then
+      count=$(cat %q)
+    fi
+    count=$((count + 1))
+    printf '%%s\n' "$count" > %q
+    case " $* " in
+      *" --reinit-local "*) ;;
+      *) echo "bd init must use --reinit-local" >&2; exit 2 ;;
+    esac
+    if [ "$count" -eq 1 ]; then
+      printf '%%s\n' %q >&2
+      exit 1
+    fi
+    if [ ! -f %q ] && [ ! -f %q ]; then
+      echo "bd init retried before the partial schema was checkpointed" >&2
+      exit 2
+    fi
+    : > %q
+    exit 0
+    ;;
+  config|migrate|list)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`, initCountFile, initCountFile, initCountFile, tt.initError, checkpointFile, recoveryReadyFile, schemaReadyFile)
+			if err := os.WriteFile(fakeBd, []byte(fakeBdScript), 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			fakeDolt := filepath.Join(binDir, "dolt")
+			fakeDoltScript := fmt.Sprintf(`#!/bin/sh
+set -eu
+query=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-q" ]; then
+    query="$arg"
+    break
+  fi
+  prev="$arg"
+done
+printf '%%s\n' "$query" >> %q
+case "$query" in
+  'SELECT 1')
+    exit 0
+    ;;
+  'USE `+"`hq`"+`')
+    [ -f %q ]
+    ;;
+  'CREATE DATABASE IF NOT EXISTS `+"`hq`"+`')
+    : > %q
+    ;;
+  'USE `+"`hq`"+`; SELECT 1 FROM config LIMIT 1')
+    [ -f %q ]
+    ;;
+  *'FROM dolt_status'*)
+    printf 'table_name\n'
+    cat %q
+    if [ %q = true ]; then
+      : > %q
+    fi
+    ;;
+  *'CALL DOLT_ADD('* )
+    case "$query" in
+      *operator_notes*) echo "refusing to stage operator_notes" >&2; exit 3 ;;
+    esac
+    printf '%%s\n' "$query" >> %q
+    ;;
+  *'CALL DOLT_COMMIT('* )
+    case "$query" in
+      *"'-A"*|*"'-a"*) echo "refusing checkpoint-all commit" >&2; exit 3 ;;
+    esac
+    if [ %q = true ]; then
+      echo "nothing to commit" >&2
+      exit 1
+    fi
+    [ -s %q ] || { echo "commit attempted before selective staging" >&2; exit 3; }
+    : > %q
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`, sqlLogFile, databaseFile, databaseFile, schemaReadyFile, dirtyTablesFile, alreadyClean, recoveryReadyFile, stageLogFile, alreadyClean, stageLogFile, checkpointFile)
+			if err := os.WriteFile(fakeDolt, []byte(fakeDoltScript), 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			cmd := exec.Command(script, "init", cityPath, "gc", "hq")
+			cmd.Env = sanitizedBaseEnv(append(gcBeadsBdTestHomeEnv(t),
+				"GC_CITY_PATH="+cityPath,
+				"GC_DOLT_DATA_DIR="+dataDir,
+				"PATH="+strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
+			)...)
+			out, err := cmd.CombinedOutput()
+			if tt.wantSuccess && err != nil {
+				t.Fatalf("gc-beads-bd init failed: %v\n%s", err, out)
+			}
+			if !tt.wantSuccess && err == nil {
+				t.Fatalf("gc-beads-bd init unexpectedly succeeded:\n%s", out)
+			}
+			if !tt.wantSuccess && !strings.Contains(string(out), tt.initError) {
+				t.Fatalf("gc-beads-bd init output lost original error %q:\n%s", tt.initError, out)
+			}
+			if !tt.wantSuccess && (tt.databasePreexisting || tt.databaseDirectory) &&
+				!strings.Contains(string(out), "refusing to checkpoint a pre-existing database") {
+				t.Fatalf("gc-beads-bd init did not refuse the pre-existing database:\n%s", out)
+			}
+
+			countData, err := os.ReadFile(initCountFile)
+			if err != nil {
+				t.Fatalf("read init count: %v", err)
+			}
+			if got := strings.TrimSpace(string(countData)); got != tt.wantInitCount {
+				t.Fatalf("bd init count = %q, want %s", got, tt.wantInitCount)
+			}
+			sqlData, err := os.ReadFile(sqlLogFile)
+			if err != nil {
+				t.Fatalf("read Dolt SQL log: %v", err)
+			}
+			sqlText := string(sqlData)
+			if strings.Contains(sqlText, "DOLT_COMMIT('-A") || strings.Contains(sqlText, "DOLT_COMMIT('-a") {
+				t.Fatalf("recovery must not checkpoint every dirty table:\n%s", sqlText)
+			}
+			if tt.wantCheckpoint {
+				for _, table := range []string{"comments", "compaction_snapshots", "dependencies", "dolt_schemas", "events", "issue_snapshots", "labels", "schema_migrations"} {
+					if !strings.Contains(sqlText, "DOLT_ADD('-f', '"+table+"')") {
+						t.Fatalf("Dolt SQL log missing selective stage for %q:\n%s", table, sqlText)
+					}
+				}
+				if !strings.Contains(sqlText, "DOLT_COMMIT('--skip-empty', '-m', 'gc: checkpoint partial bd init schema')") {
+					t.Fatalf("Dolt SQL log missing idempotent recovery commit:\n%s", sqlText)
+				}
+			} else {
+				// No partial-schema checkpoint may run. A successful init still
+				// commits the bd runtime config (#5287: DOLT_ADD('config') plus
+				// 'gc: record beads runtime config'), which is not recovery staging.
+				if strings.Contains(sqlText, "DOLT_ADD('-f'") || strings.Contains(sqlText, "gc: checkpoint partial bd init schema") {
+					t.Fatalf("recovery checkpoint ran on a path that must not checkpoint:\n%s", sqlText)
+				}
+				if !tt.wantSuccess && (strings.Contains(sqlText, "DOLT_ADD(") || strings.Contains(sqlText, "DOLT_COMMIT(")) {
+					t.Fatalf("fail-closed path must not stage or commit Dolt state:\n%s", sqlText)
+				}
+			}
+		})
 	}
 }
 
@@ -7752,7 +8040,9 @@ esac
 			t.Fatalf("bd init retry args missing %q:\n%s", want, gotArgs)
 		}
 	}
-	if strings.Contains(gotArgs, "--force") {
+	// The forced local reinit is spelled --reinit-local here; a plain retry
+	// carries neither that flag nor bd's older --force.
+	if strings.Contains(gotArgs, "--reinit-local") || strings.Contains(gotArgs, "--force") {
 		t.Fatalf("post-init schema retry should rerun plain init, got:\n%s", gotArgs)
 	}
 }
@@ -7877,7 +8167,7 @@ esac
 	}
 	gotState := string(stateData)
 	for _, want := range []string{
-		"metadata=yes args=init --force --quiet --server -p gc --database hq",
+		"metadata=yes args=init --reinit-local --quiet --server -p gc --database hq",
 		"metadata=no args=init --quiet --server -p gc --database hq",
 	} {
 		if !strings.Contains(gotState, want) {
@@ -10549,7 +10839,7 @@ op_ensure_ready
 	}
 }
 
-func TestValidateCanonicalCompatDoltDriftRejectsInheritedRigCompatOverrideWithRelativePath(t *testing.T) {
+func TestValidateCanonicalCompatDoltDriftAdvisesInheritedRigCompatOverrideWithRelativePath(t *testing.T) {
 	cityPath := t.TempDir()
 	rigRel := "frontend"
 	rigPath := filepath.Join(cityPath, rigRel)
@@ -10598,13 +10888,22 @@ dolt.auto-start: false
 		}
 	}()
 
-	err = validateCanonicalCompatDoltDrift(cityPath, cfg)
-	if err == nil || !strings.Contains(err.Error(), `rig "frontend"`) {
-		t.Fatalf("validateCanonicalCompatDoltDrift() error = %v, want inherited rig compat error", err)
+	// ga-298g8t: this is an ADVISORY, not a refusal. validateCanonicalCompatDoltDrift
+	// is the first statement of startBeadsLifecycle, which runs on gc start and
+	// on every controller config reload, so refusing here rejects reloads and can
+	// stop the city coming back. inherited_city in a rig file is what the ABSENCE
+	// of city.toml endpoint keys computes to — a derived value — and it must not
+	// veto the operator's declaration. The drift is still reported.
+	if err = validateCanonicalCompatDoltDrift(cityPath, cfg); err != nil {
+		t.Fatalf("validateCanonicalCompatDoltDrift() error = %v, want no refusal for a derived inherited_city vs a city.toml declaration", err)
+	}
+	advisories := compatDoltDriftAdvisories(cityPath, cfg)
+	if len(advisories) != 1 || !strings.Contains(advisories[0], `rig "frontend"`) {
+		t.Fatalf("advisories = %v, want one naming rig \"frontend\" so the drift stays visible", advisories)
 	}
 }
 
-func TestValidateCanonicalCompatDoltDriftRejectsInheritedRigCompatOverride(t *testing.T) {
+func TestValidateCanonicalCompatDoltDriftAdvisesInheritedRigCompatOverride(t *testing.T) {
 	cityPath := t.TempDir()
 	rigPath := filepath.Join(cityPath, "frontend")
 	t.Setenv("GC_BEADS", "bd")
@@ -10639,9 +10938,14 @@ dolt.auto-start: false
 		}},
 	}
 
-	err := validateCanonicalCompatDoltDrift(cityPath, cfg)
-	if err == nil || !strings.Contains(err.Error(), `rig "frontend"`) {
-		t.Fatalf("validateCanonicalCompatDoltDrift() error = %v, want inherited rig compat error", err)
+	// ga-298g8t: advisory, not a refusal — see the sibling test above for why a
+	// refusal on this shape is unaffordable on the city-start path.
+	if err := validateCanonicalCompatDoltDrift(cityPath, cfg); err != nil {
+		t.Fatalf("validateCanonicalCompatDoltDrift() error = %v, want no refusal for a derived inherited_city vs a city.toml declaration", err)
+	}
+	advisories := compatDoltDriftAdvisories(cityPath, cfg)
+	if len(advisories) != 1 || !strings.Contains(advisories[0], `rig "frontend"`) {
+		t.Fatalf("advisories = %v, want one naming rig \"frontend\" so the drift stays visible", advisories)
 	}
 }
 
@@ -11902,6 +12206,101 @@ func TestVerifyManagedDoltDatabaseExistsAfterInitCatalogMatch(t *testing.T) {
 	}
 }
 
+// TestVerifyManagedDoltDatabaseExistsAfterInitSkipsExternalRigScopeInManagedLocalCity
+// pins hq-mbe2s: the post-init catalog verify must skip a rig whose OWN scope
+// declares an external endpoint, even though the CITY is managed-local. The
+// pre-fix guard checked isExternalDolt(cityPath) — the city — so a remote-hub
+// rig (qcore) in a managed-local city (qlandia) had its declared-remote database
+// looked up in the LOCAL managed catalog, where it does not exist (the local
+// qcore mirror was retired 2026-08-28), failing every reload rig-init. The guard
+// must resolve the RIG SCOPE's declared endpoint.
+func TestVerifyManagedDoltDatabaseExistsAfterInitSkipsExternalRigScopeInManagedLocalCity(t *testing.T) {
+	original := verifyManagedDoltDatabaseExistsAfterInit
+	originalListDatabases := managedDoltListUserDatabasesAfterInit
+	t.Cleanup(func() { managedDoltListUserDatabasesAfterInit = originalListDatabases })
+
+	cityPath, rigScope := externalHubRigScopeInManagedLocalCityForTest(t)
+
+	called := false
+	managedDoltListUserDatabasesAfterInit = func(string) ([]string, error) {
+		called = true
+		return nil, fmt.Errorf("managed-local catalog lister must not run for an external rig scope")
+	}
+
+	if err := original(cityPath, rigScope, "qcore"); err != nil {
+		t.Fatalf("verify for an external rig scope in a managed-local city = %v, want nil (skip local catalog)", err)
+	}
+	if called {
+		t.Fatal("managed-local catalog lister was called for an external rig scope; the guard must be scope-aware")
+	}
+}
+
+// TestCommitDirtyScopeTablesRefusesExternalRigScopeInManagedLocalCity extends
+// hq-mbe2s to the dirty-table recovery (#4812), which runs once per rig scope
+// on the same init path and asked the same city-scoped question: a remote-hub
+// rig in a managed-local city must not have "its" working set committed on the
+// LOCAL managed server. The commit must refuse on the rig scope's external
+// endpoint before any local-server SQL, exactly as it refuses for an external
+// city.
+func TestCommitDirtyScopeTablesRefusesExternalRigScopeInManagedLocalCity(t *testing.T) {
+	cityPath, rigScope := externalHubRigScopeInManagedLocalCityForTest(t)
+
+	committed, err := commitDirtyScopeTablesViaManagedDolt(cityPath, rigScope, "qcore")
+	if committed {
+		t.Fatal("committed a working set on the local managed server for an external rig scope")
+	}
+	if err == nil || !strings.Contains(err.Error(), "is external") {
+		t.Fatalf("commitDirtyScopeTablesViaManagedDolt(external rig scope) error = %v, want the external-scope refusal before any local-server SQL", err)
+	}
+}
+
+// externalHubRigScopeInManagedLocalCityForTest builds the hq-mbe2s topology: a
+// managed-local city with a reachable managed port, and a rig scope OUTSIDE the
+// city whose .beads/config.yaml declares an explicit external endpoint (the
+// qcore-on-hub shape). It asserts the preconditions that make a city-scoped
+// endpoint check observably wrong: the CITY is managed-local (so a city-scoped
+// guard does not fire), the RIG SCOPE resolves external (so a scope-aware guard
+// must), and a managed port is resolvable (so a port=="" early return cannot
+// mask the result).
+func externalHubRigScopeInManagedLocalCityForTest(t *testing.T) (cityPath, rigScope string) {
+	t.Helper()
+	cityPath = setupBdContractCityForTest(t)
+	writeReachableProviderManagedDoltState(t, cityPath)
+
+	rigScope = filepath.Join(t.TempDir(), "q-core")
+	rigBeads := filepath.Join(rigScope, ".beads")
+	if err := os.MkdirAll(rigBeads, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rigBeads, "config.yaml"), []byte("issue_prefix: qc\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rigBeads, "metadata.json"), []byte(`{"backend":"dolt","dolt_database":"qcore","dolt_mode":"server"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureCanonicalScopeConfigState(fsys.OSFS{}, rigScope, contract.ConfigState{
+		IssuePrefix:    "qc",
+		EndpointOrigin: contract.EndpointOriginExplicit,
+		EndpointStatus: contract.EndpointStatusVerified,
+		DoltHost:       "100.71.23.94",
+		DoltPort:       "3307",
+		DoltUser:       "alex",
+	}); err != nil {
+		t.Fatalf("ensureCanonicalScopeConfigState(external rig): %v", err)
+	}
+
+	if isExternalDolt(cityPath) {
+		t.Fatal("precondition: city must be managed-local so a city-scoped guard does not fire")
+	}
+	if target, ok, err := canonicalScopeDoltTarget(cityPath, rigScope); err != nil || !ok || !target.External {
+		t.Fatalf("precondition: rig scope must resolve External; got target=%+v ok=%v err=%v", target, ok, err)
+	}
+	if currentResolvableManagedDoltPort(cityPath) == "" {
+		t.Fatal("precondition: expected a resolvable managed port so the result is observable")
+	}
+	return cityPath, rigScope
+}
+
 func TestVerifyManagedDoltDatabaseExistsAfterInitUsesProviderStateWhenPublishedStateIsMissing(t *testing.T) {
 	original := verifyManagedDoltDatabaseExistsAfterInit
 	originalListDatabases := managedDoltListUserDatabasesAfterInit
@@ -12300,7 +12699,7 @@ provider = "bd"
 	}
 
 	var commits int
-	stubCommitDirtyScopeTables(t, func(string, string) (bool, error) {
+	stubCommitDirtyScopeTables(t, func(string, string, string) (bool, error) {
 		commits++
 		return true, nil
 	})
@@ -12332,5 +12731,73 @@ provider = "bd"
 	}
 	if commits != 1 {
 		t.Fatalf("commit rounds = %d, want 1", commits)
+	}
+}
+
+// TestApplyLegacyRigScopeInitDoltEnvProjectsEndpointCredentials is the
+// qc-ow3u50 regression: the rig-init (independent-scope) env path used by the
+// supervisor's beads init must project the rig's external endpoint CREDENTIALS
+// (GC_DOLT_USER + GC_DOLT_PASSWORD), not just host/port. Before the fix this
+// path cleared the password and resolved auth with an empty fallback user, so
+// the init subprocess dialed with a partial (user, password) and the
+// server_reachable probe failed as "managed Dolt server unreachable", wedging
+// rig init and the review plane. The fix routes auth through the canonical
+// session-path projection (applyCanonicalDoltAuthEnv), resolving against the
+// credential-owning scope root with the target's user.
+func TestApplyLegacyRigScopeInitDoltEnvProjectsEndpointCredentials(t *testing.T) {
+	// Isolate from any ambient host env so only the projected values surface.
+	for _, k := range []string{"GC_DOLT_USER", "GC_DOLT_PASSWORD", "GC_DOLT_HOST", "GC_DOLT_PORT", "BEADS_DOLT_PASSWORD"} {
+		t.Setenv(k, "")
+	}
+
+	cityPath := t.TempDir()
+	rigPath := filepath.Join(cityPath, "qcore")
+	if err := os.MkdirAll(filepath.Join(rigPath, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// City config declares the rig's external endpoint (dolt_host/dolt_port).
+	cityToml := `[workspace]
+name = "demo"
+
+[[rigs]]
+name = "qcore"
+path = "qcore"
+prefix = "qc"
+dolt_host = "rig-db.example.com"
+dolt_port = "4406"
+`
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(cityToml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The rig's own .beads/config.yaml DECLARES the endpoint + user (explicit).
+	rigCfg := "issue_prefix: qc\ngc.endpoint_origin: explicit\ngc.endpoint_status: verified\ndolt.host: rig-db.example.com\ndolt.port: \"4406\"\ndolt.user: qcworker\ndolt.auto-start: false\n"
+	if err := os.WriteFile(filepath.Join(rigPath, ".beads", "config.yaml"), []byte(rigCfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The credential for the endpoint lives in a credentials file keyed by
+	// host:port; point the resolver at it.
+	credFile := filepath.Join(cityPath, "creds")
+	credData := "[rig-db.example.com:4406]\npassword = s3cret-rig-pw\n"
+	if err := os.WriteFile(credFile, []byte(credData), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BEADS_CREDENTIALS_FILE", credFile)
+
+	env := map[string]string{}
+	applyLegacyRigScopeInitDoltEnv(env, cityPath, rigPath)
+
+	if got := env["GC_DOLT_HOST"]; got != "rig-db.example.com" {
+		t.Errorf("GC_DOLT_HOST = %q, want rig-db.example.com", got)
+	}
+	if got := env["GC_DOLT_PORT"]; got != "4406" {
+		t.Errorf("GC_DOLT_PORT = %q, want 4406", got)
+	}
+	// The credentials must reach the init child env. Before the fix both were
+	// empty (password cleared, empty fallback user).
+	if got := env["GC_DOLT_USER"]; got != "qcworker" {
+		t.Errorf("GC_DOLT_USER = %q, want qcworker (projected from the scope's declared endpoint)", got)
+	}
+	if got := env["GC_DOLT_PASSWORD"]; got != "s3cret-rig-pw" {
+		t.Errorf("GC_DOLT_PASSWORD = %q, want the resolved credential for the endpoint (init must not dial with an empty password)", got)
 	}
 }
