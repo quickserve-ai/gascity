@@ -35,6 +35,7 @@
         "started_claim_held",
         "no_work",
         "claims_errored",
+        "declined_foreign",
         "stale_session",
         "non_turn_context",
         "drain_pending",
@@ -43,6 +44,10 @@
         "agent_suspended",
         "rig_suspended"
       ]
+    },
+    "declined_foreign": {
+      "type": "integer",
+      "minimum": 1
     },
     "bead_id": {
       "type": "string"
@@ -105,6 +110,7 @@
             "enum": [
               "no_work",
               "claims_errored",
+              "declined_foreign",
               "stale_session",
               "non_turn_context",
               "drain_pending",

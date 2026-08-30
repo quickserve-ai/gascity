@@ -52,6 +52,10 @@ type Recipe struct {
 
 	// FormulaSource is the file path from which the formula was loaded.
 	FormulaSource string
+
+	// PathAgnostic carries the formula's path_agnostic declaration (ga-h4iqzr):
+	// molecules compiled from it are claimable by any town's seats.
+	PathAgnostic bool
 }
 
 // RecipeStep represents a single step in a compiled recipe.
