@@ -128,6 +128,14 @@ type Formula struct {
 	// Patrol and release workflows should typically use "vapor" since they're operational.
 	Phase string `json:"phase,omitempty"`
 
+	// PathAgnostic declares that this formula's compiled molecules are
+	// executable on ANY host: no step depends on the instantiating host's
+	// filesystem paths. Cross-town pool seats DECLINE foreign-instantiated
+	// molecules unless this is set (ga-h4iqzr, cross-town invariant R2a) —
+	// the guard keys on this positive declaration, never on a path heuristic,
+	// so an undeclared formula is declined by default when poured elsewhere.
+	PathAgnostic bool `json:"path_agnostic,omitempty" toml:"path_agnostic,omitempty"`
+
 	// Pour controls whether steps are materialized as individual child issues.
 	// If true, each step becomes a DB row with dependency tracking (checkpoint recovery).
 	// If false (default), only the root issue is created; steps are read inline at prime time.

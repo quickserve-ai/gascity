@@ -314,6 +314,7 @@ func toRecipeWithGraph(f *Formula, graphWorkflow bool) (*Recipe, error) {
 		Pour:          f.Pour,
 		ContentHash:   f.ContentHash,
 		FormulaSource: f.Source,
+		PathAgnostic:  f.PathAgnostic,
 	}
 
 	// Determine root title: use {{title}} placeholder if the variable
