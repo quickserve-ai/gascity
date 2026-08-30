@@ -189,6 +189,7 @@ install: check-self-contained
 			exit 1; \
 		fi; \
 		echo "Verified $(INSTALL_DIR)/$(BINARY) executes: $$(cat "$$out")"; \
+		( cd "$(INSTALL_DIR)" && ls -t $(BINARY).bak-* 2>/dev/null | tail -n +3 | while read -r old; do rm -f -- "$$old" && echo "Pruned old backup: $$old"; done ); \
 		trap - EXIT INT TERM HUP
 	@# Migrate from old install location: replace stale binary with symlink
 	@if [ "$(INSTALL_DIR)" != "$(HOME)/.local/bin" ]; then \
