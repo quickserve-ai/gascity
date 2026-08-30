@@ -1065,12 +1065,20 @@ var verifyManagedDoltDatabaseExistsAfterInit = func(cityPath, dir, dbName string
 	if !cityUsesBdStoreContract(cityPath) {
 		return nil
 	}
-	if isExternalDolt(cityPath) {
-		// External/hosted dolt endpoint (e.g. a per-tenant beads-gateway): the
-		// managed-local catalog is irrelevant, and the gateway denies the
-		// SHOW DATABASES catalog listing this guard relies on (it scopes each
-		// connection to its own provisioner-created project DB). Reachability of
-		// that DB is already proven by bd init's own connection.
+	if initScopeUsesExternalDolt(cityPath, dir, nil) {
+		// External/hosted dolt endpoint (e.g. a per-tenant beads-gateway, or a
+		// rig pinned to a remote hub): the managed-LOCAL catalog is irrelevant,
+		// and a gateway denies the SHOW DATABASES catalog listing this guard
+		// relies on (it scopes each connection to its own provisioner-created
+		// project DB). Reachability of the DB is already proven by bd init's own
+		// connection to the declared endpoint.
+		//
+		// The check is on the RIG SCOPE (dir), not the city (hq-mbe2s): a
+		// remote-hub rig can live inside a managed-local city, and looking its
+		// declared-remote database up in the local catalog fails every reload
+		// rig-init once that database is not mirrored locally. A nil config is
+		// sufficient here — the scope's own .beads/config.yaml carries the
+		// canonical endpoint that initScopeUsesExternalDolt resolves.
 		return nil
 	}
 	port := currentResolvableManagedDoltPort(cityPath)
@@ -1831,7 +1839,7 @@ func initBeadsForDirWithExecutor(cityPath, dir, prefix, doltDatabase string, exe
 				// created this database, so clear it here instead of handing
 				// the operator that circular advice.
 				if isBdInitDirtyTablesError(err) {
-					if recoverErr := recoverBdInitFromDirtyTables(cityPath, canonicalDoltDatabase, err, reinit); recoverErr != nil {
+					if recoverErr := recoverBdInitFromDirtyTables(cityPath, dir, canonicalDoltDatabase, err, reinit); recoverErr != nil {
 						// A re-init that reports the scope is already
 						// initialized succeeded, exactly as it does on the
 						// first attempt above.
