@@ -180,6 +180,7 @@ const (
 	FormulaContractMetadataKey           = "gc.formula_contract"
 	FormulaHashMetadataKey               = "gc.formula_hash"
 	FormulaNameMetadataKey               = "gc.formula_name"
+	FormulaPathAgnosticMetadataKey       = "gc.formula_path_agnostic"
 	FormulaSourceMetadataKey             = "gc.formula_source"
 	GCExemptMetadataKey                  = "gc.gc_exempt"
 	Graphv2RootKeyMetadataKey            = "gc.graphv2_root_key"
@@ -584,6 +585,7 @@ var KnownMetadataKeys = []string{
 	FormulaContractMetadataKey,
 	FormulaHashMetadataKey,
 	FormulaNameMetadataKey,
+	FormulaPathAgnosticMetadataKey,
 	FormulaSourceMetadataKey,
 	GCExemptMetadataKey,
 	Graphv2RootKeyMetadataKey,
