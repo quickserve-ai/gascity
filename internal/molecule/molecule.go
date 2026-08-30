@@ -865,6 +865,9 @@ func Instantiate(ctx context.Context, store beads.Store, recipe *formula.Recipe,
 			if recipe.FormulaSource != "" {
 				b.Metadata[beadmeta.FormulaSourceMetadataKey] = recipe.FormulaSource
 			}
+			if recipe.PathAgnostic {
+				b.Metadata[beadmeta.FormulaPathAgnosticMetadataKey] = "true"
+			}
 			if opts.IdempotencyKey != "" {
 				b.Metadata["idempotency_key"] = opts.IdempotencyKey
 			}

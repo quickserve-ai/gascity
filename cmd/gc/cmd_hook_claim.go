@@ -25,9 +25,10 @@ const hookClaimCommandName = "hook"
 // action is "drain": an idle store, an operational claim-write failure, or a
 // refused stale session.
 const (
-	hookClaimReasonNoWork        = "no_work"
-	hookClaimReasonClaimsErrored = "claims_errored"
-	hookClaimReasonStaleSession  = "stale_session"
+	hookClaimReasonNoWork          = "no_work"
+	hookClaimReasonClaimsErrored   = "claims_errored"
+	hookClaimReasonDeclinedForeign = "declined_foreign"
+	hookClaimReasonStaleSession    = "stale_session"
 )
 
 var hookClaimMutationTimeout = 10 * time.Second
@@ -41,6 +42,10 @@ type hookClaimOptions struct {
 	Env                []string
 	DrainAck           bool
 	JSON               bool
+	// HostRoots are the filesystem roots this host instantiates formulas
+	// under, for the declined-foreign guard (ga-h4iqzr). Defaulted from
+	// hookClaimHostRoots() when nil; settable for tests.
+	HostRoots []string
 }
 
 type hookClaimOps struct {
@@ -93,6 +98,10 @@ type hookClaimJSONResult struct {
 	ContinuationGroup    string   `json:"continuation_group,omitempty"`
 	ContinuationAssigned []string `json:"continuation_assigned,omitempty"`
 	DrainAcknowledged    bool     `json:"drain_acknowledged,omitempty"`
+	// DeclinedForeign counts routed candidates declined by the cross-town
+	// invariant (ga-h4iqzr) during the pass that ended in this drain. The
+	// feeder detector consumes this count; it is never silently dropped.
+	DeclinedForeign int `json:"declined_foreign,omitempty"`
 }
 
 // hookClaimResult is the outcome of attempting a claim against one store's
@@ -113,6 +122,10 @@ type hookClaimResult struct {
 	// contention or a controller-socket flap in the read→write window) is not
 	// laundered into an idle signal. Meaningless on a terminal result.
 	claimsErrored bool
+	// declinedForeign counts candidates declined by the cross-town invariant
+	// (ga-h4iqzr) on a NON-terminal result, so the shared drain can carry the
+	// countable declined-foreign fact instead of laundering it into no_work.
+	declinedForeign int
 }
 
 func doHookClaim(workQuery, dir string, opts hookClaimOptions, ops hookClaimOps, stdout, stderr io.Writer) int {
@@ -120,7 +133,7 @@ func doHookClaim(workQuery, dir string, opts hookClaimOptions, ops hookClaimOps,
 	if res.terminal {
 		return res.code
 	}
-	return writeHookClaimNoWork(opts, ops, res.claimsErrored, stdout, stderr)
+	return writeHookClaimNoWork(opts, ops, res.claimsErrored, res.declinedForeign, stdout, stderr)
 }
 
 // tryHookClaim runs the work query for one store (dir, via ops.Runner) and
@@ -134,6 +147,9 @@ func tryHookClaim(workQuery, dir string, opts *hookClaimOptions, ops *hookClaimO
 	opts.Assignee = strings.TrimSpace(opts.Assignee)
 	opts.IdentityCandidates = hookClaimIdentityCandidates(append([]string{opts.Assignee}, opts.IdentityCandidates...)...)
 	opts.RouteTargets = hookClaimRouteTargets(opts.RouteTargets...)
+	if opts.HostRoots == nil {
+		opts.HostRoots = hookClaimHostRoots()
+	}
 	if opts.Assignee == "" {
 		fmt.Fprintln(stderr, "gc hook --claim: assignee not specified (set $GC_ALIAS, $GC_AGENT, or $GC_SESSION_NAME)") //nolint:errcheck
 		return hookClaimResult{terminal: true, code: 1}
@@ -302,8 +318,16 @@ func claimFirstEligibleHookCandidate(candidates []beads.Bead, opts hookClaimOpti
 	ctx, cancel := context.WithTimeout(context.Background(), hookClaimMutationTimeout)
 	defer cancel()
 	claimsErrored := false
+	var declinedForeign []string
 	for _, candidate := range candidates {
 		if !hookCandidateClaimable(candidate, opts.RouteTargets) {
+			continue
+		}
+		// Cross-town invariant (ga-h4iqzr / R2a): never claim a molecule
+		// instantiated for another host unless its formula declares
+		// path_agnostic. Declined loudly and counted — never a silent skip.
+		if src, foreign := hookCandidateForeignSource(candidate, opts.HostRoots); foreign {
+			declinedForeign = append(declinedForeign, candidate.ID+"="+src)
 			continue
 		}
 		if ctx.Err() != nil {
@@ -354,10 +378,12 @@ func claimFirstEligibleHookCandidate(candidates []beads.Bead, opts hookClaimOpti
 		if result.Assignee == "" {
 			result.Assignee = opts.Assignee
 		}
+		reportDeclinedForeign(stderr, declinedForeign)
 		return hookClaimResult{terminal: true, code: writeHookClaimWorkResultForBead(result, claimed, opts, ops, dir, stdout, stderr)}
 	}
 
-	return hookClaimResult{claimsErrored: claimsErrored}
+	reportDeclinedForeign(stderr, declinedForeign)
+	return hookClaimResult{claimsErrored: claimsErrored, declinedForeign: len(declinedForeign)}
 }
 
 // mergeHookClaimCandidateMetadata retains work-query metadata when bd update
@@ -455,12 +481,17 @@ func writeHookClaimWorkResultForBead(result hookClaimJSONResult, bead beads.Bead
 // "claims_errored" when claimsErrored is set — ready work existed but every
 // eligible claim mutation errored — so an operational write failure stays
 // distinguishable from idle even though both still drain and reclaim next tick.
-func writeHookClaimNoWork(opts hookClaimOptions, ops hookClaimOps, claimsErrored bool, stdout, stderr io.Writer) int {
+func writeHookClaimNoWork(opts hookClaimOptions, ops hookClaimOps, claimsErrored bool, declinedForeign int, stdout, stderr io.Writer) int {
+	// Reason precedence: an operational write failure outranks the invariant
+	// decline (it needs a responder), and both outrank a healthy no_work.
 	reason := hookClaimReasonNoWork
+	if declinedForeign > 0 {
+		reason = hookClaimReasonDeclinedForeign
+	}
 	if claimsErrored {
 		reason = hookClaimReasonClaimsErrored
 	}
-	return writeHookClaimDrain(reason, opts.JSON, opts.DrainAck, ops.DrainAck, stdout, stderr)
+	return writeHookClaimDrain(reason, declinedForeign, opts.JSON, opts.DrainAck, ops.DrainAck, stdout, stderr)
 }
 
 // writeHookClaimStaleSessionDrain emits the terminal result for a refused stale
@@ -471,7 +502,7 @@ func writeHookClaimNoWork(opts hookClaimOptions, ops hookClaimOps, claimsErrored
 // acknowledges drain and exits cleanly rather than seeing a bare exit 1 and
 // retrying the refusal forever.
 func writeHookClaimStaleSessionDrain(opts hookCommandOptions, stdout, stderr io.Writer) int {
-	return writeHookClaimDrain(hookClaimReasonStaleSession, opts.JSON, opts.DrainAck, hookRuntimeDrainAck, stdout, stderr)
+	return writeHookClaimDrain(hookClaimReasonStaleSession, 0, opts.JSON, opts.DrainAck, hookRuntimeDrainAck, stdout, stderr)
 }
 
 // writeHookClaimDrain writes the single structured drain result shared by every
@@ -481,13 +512,14 @@ func writeHookClaimStaleSessionDrain(opts hookCommandOptions, stdout, stderr io.
 // acknowledged. The exit code mirrors the historical contract — 0 once drain is
 // acknowledged, else 1 — so a non-drain-ack caller still reports action=drain
 // (a completed drain) rather than a bare failure.
-func writeHookClaimDrain(reason string, jsonOut, drainAck bool, drainAckFn hookDrainAckFunc, stdout, stderr io.Writer) int {
+func writeHookClaimDrain(reason string, declinedForeign int, jsonOut, drainAck bool, drainAckFn hookDrainAckFunc, stdout, stderr io.Writer) int {
 	result := hookClaimJSONResult{
-		SchemaVersion: "1",
-		OK:            true,
-		Command:       hookClaimCommandName,
-		Action:        "drain",
-		Reason:        reason,
+		SchemaVersion:   "1",
+		OK:              true,
+		Command:         hookClaimCommandName,
+		Action:          "drain",
+		Reason:          reason,
+		DeclinedForeign: declinedForeign,
 	}
 	if drainAck {
 		if err := drainAckFn(stderr); err != nil {

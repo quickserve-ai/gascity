@@ -34,8 +34,13 @@
         "ready_assignment",
         "no_work",
         "claims_errored",
+        "declined_foreign",
         "stale_session"
       ]
+    },
+    "declined_foreign": {
+      "type": "integer",
+      "minimum": 1
     },
     "bead_id": {
       "type": "string"
@@ -98,6 +103,7 @@
             "enum": [
               "no_work",
               "claims_errored",
+              "declined_foreign",
               "stale_session"
             ]
           }

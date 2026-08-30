@@ -642,6 +642,7 @@ func claimHookWorkWithRunner(workQuery, workDir string, queryEnv []string, store
 	// work but every eligible claim mutation errored, so the shared drain below can
 	// report claims_errored instead of laundering a write failure into no_work.
 	claimsErrored := false
+	declinedForeign := 0
 	for len(remaining) > 0 {
 		_, selected, err := firstStoreWithWork(workQuery, remaining, primary, run)
 		if err != nil {
@@ -679,6 +680,7 @@ func claimHookWorkWithRunner(workQuery, workDir string, queryEnv []string, store
 		if res.claimsErrored {
 			claimsErrored = true
 		}
+		declinedForeign += res.declinedForeign
 		// This store reported ready work but the claim acquired nothing — every
 		// claimable row was lost to another claimant, none matched this session, or
 		// every claimable row's claim mutation errored and was skipped. Drop it and
@@ -687,7 +689,7 @@ func claimHookWorkWithRunner(workQuery, workDir string, queryEnv []string, store
 		// signal to the shared drain.
 		remaining = removeHookStore(remaining, claimStore)
 	}
-	return writeHookClaimNoWork(claimOpts, ops, claimsErrored, stdout, stderr)
+	return writeHookClaimNoWork(claimOpts, ops, claimsErrored, declinedForeign, stdout, stderr)
 }
 
 func hookClaimPrimaryRouteTarget(a *config.Agent) string {
