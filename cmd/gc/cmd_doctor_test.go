@@ -976,7 +976,7 @@ dolt_port = "3308"
 
 	// ga-298g8t: WARNING, not error. The same predicate gates startBeadsLifecycle,
 	// so an error here is a refusal to start the city over a disagreement the next
-	// rig init reconciles in city.toml's favour anyway. Doctor is the right place
+	// rig init reconciles in city.toml's favor anyway. Doctor is the right place
 	// for it — visible and actionable, unable to strand anything.
 	res := newDoltTopologyCheck(cityDir, cfg).Run(&doctor.CheckContext{CityPath: cityDir})
 	if res.Status != doctor.StatusWarning {
