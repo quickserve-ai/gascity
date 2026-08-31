@@ -54,6 +54,10 @@ func TestResolveCityAddress(t *testing.T) {
 		{"city names match exactly, not case-folded", "Gastown/mayor", CityAddressNone, "Gastown/mayor"},
 		{"surrounding whitespace is trimmed", "  gastown/mayor  ", CityAddressForeign, "gastown/mayor"},
 		{"whitespace inside the first segment is not a city match", "gastown /mayor", CityAddressNone, "gastown /mayor"},
+		{"foreign remainder trims a trailing slash like local resolution does", "gastown/mayor/", CityAddressForeign, "gastown/mayor"},
+		{"foreign remainder trims surrounding whitespace", "gastown/ mayor", CityAddressForeign, "gastown/mayor"},
+		{"foreign remainder that is only separators falls through", "gastown//", CityAddressNone, "gastown//"},
+		{"local remainder trims a trailing slash", "qlandia/mayor/", CityAddressLocal, "mayor"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -88,7 +92,7 @@ func TestUnknownCityErrorMessage(t *testing.T) {
 	}
 }
 
-func TestWrapUnresolvedRecipient(t *testing.T) {
+func TestRefuseUnknownCity(t *testing.T) {
 	roster := enabledRoster()
 	base := fmt.Errorf("unknown recipient %q", "x")
 	rigs := []string{"qcore", "gascity"}
@@ -108,7 +112,7 @@ func TestWrapUnresolvedRecipient(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := WrapUnresolvedRecipient(base, tt.recipient, tt.roster, rigs)
+			got := RefuseUnknownCity(base, tt.recipient, tt.roster, rigs)
 			var unknownCity *UnknownCityError
 			if tt.wantCity == "" {
 				if !errors.Is(got, base) {
@@ -128,9 +132,9 @@ func TestWrapUnresolvedRecipient(t *testing.T) {
 
 // The unknown-city refusal must replace the fall-through resolution error so a
 // stale roster can never be spelled "session not found".
-func TestWrapUnresolvedRecipientDoesNotUnwrapToOriginal(t *testing.T) {
+func TestRefuseUnknownCityDoesNotUnwrapToOriginal(t *testing.T) {
 	sentinel := errors.New("session not found")
-	got := WrapUnresolvedRecipient(sentinel, "gastwn/mayor", enabledRoster(), nil)
+	got := RefuseUnknownCity(sentinel, "gastwn/mayor", enabledRoster(), nil)
 	if errors.Is(got, sentinel) {
 		t.Errorf("unknown-city error must not unwrap to the resolution error it replaces")
 	}
