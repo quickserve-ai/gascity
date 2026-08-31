@@ -25,20 +25,3 @@ func crossCityNotifyRefusal(cmdName, recipient string) string {
 	return fmt.Sprintf("%s: --notify does not cross cities: %q is in city %q; its wake is that city's own mail sweep. Retry without --notify.",
 		cmdName, recipient, strings.SplitN(recipient, "/", 2)[0])
 }
-
-// mailCityLocalScopes returns the first-segment names that stay local-scope
-// under cross-city addressing — the configured rig names — so a failed
-// rig-qualified resolution keeps today's error instead of an unknown-city
-// refusal.
-func mailCityLocalScopes(cfg *config.City) []string {
-	if cfg == nil || len(cfg.Rigs) == 0 {
-		return nil
-	}
-	scopes := make([]string, 0, len(cfg.Rigs))
-	for i := range cfg.Rigs {
-		if cfg.Rigs[i].Name != "" {
-			scopes = append(scopes, cfg.Rigs[i].Name)
-		}
-	}
-	return scopes
-}
