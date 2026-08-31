@@ -546,6 +546,16 @@ MailConfig holds mail provider settings.
 |-------|------|----------|---------|-------------|
 | `provider` | string |  |  | Provider selects the mail backend: "fake", "fail", "exec:&lt;script&gt;", or "" (default: beadmail). |
 | `retention_ttl` | string |  |  | RetentionTTL has two consumers: it is how long read messages are retained before purge, and how long a read mail bead stays open before the nudge-mail sweep closes it. Empty or "0" disables read-message purge. The sweep distinguishes the two: empty leaves it at its own 60-minute default, while "0" disables its mail-close phase. |
+| `crosscity` | MailCrossCityConfig |  |  | CrossCity enables city-qualified mail addressing (&lt;city&gt;/&lt;address&gt;). Absent means disabled: every recipient resolves exactly as today. |
+
+## MailCrossCityConfig
+
+MailCrossCityConfig enables city-qualified mail addressing: recipients of the form <city>/<address>, where the first path segment names a city and the remainder is that city's own address form.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `city` | string |  |  | City is this city's own segment in city-qualified addresses. Empty defaults to the effective city name (workspace name, else the city directory's base name). &lt;City&gt;/&lt;address&gt; and &lt;address&gt; are one mailbox. |
+| `cities` | []string | **yes** |  | Cities lists the peer cities addressable as &lt;city&gt;/&lt;address&gt;. A recipient naming a listed city resolves against the roster and is never looked up in the local session store. |
 
 ## MaintenanceConfig
 
