@@ -2029,6 +2029,9 @@ type MailConfig struct {
 	// the nudge-mail sweep closes it. Empty or "0" disables the unread-mail
 	// phase; it is opt-in so unread mail is never closed by default.
 	UnreadRetentionTTL string `toml:"unread_retention_ttl,omitempty"`
+	// CrossCity enables city-qualified mail addressing (<city>/<address>).
+	// Absent means disabled: every recipient resolves exactly as today.
+	CrossCity *MailCrossCityConfig `toml:"crosscity,omitempty"`
 }
 
 // RetentionTTLDuration parses RetentionTTL as a Go time.Duration. Empty or
