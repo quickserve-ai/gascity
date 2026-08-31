@@ -350,10 +350,18 @@ fi
 # gc closes a session's own claim under the identity that claimed it. A failed
 # close withdraws the outcome, so the wisp it leaves open carries none, as on
 # every other fail-open path.
+#
+# A refused terminal close must leave evidence, never a clean drain: under
+# set -euo pipefail an unguarded failure aborts the script, the EXIT trap
+# still drain-acks, and the controller re-dispatches a fresh agent against
+# the still-open bead forever (we-m34w5: 15 wakes in ~40 minutes).
 gc bd update "$WORK_BEAD" --set-metadata gc.outcome=pass
 if ! gc bd close "$WORK_BEAD" --reason "Stale DB scan complete (orphans=${ORPHAN_TOTAL}, applied=${APPLIED}, escalated=${ESCALATED})"; then
   run_or_warn "withdraw pass outcome" gc bd update "$WORK_BEAD" --unset-metadata gc.outcome
-  fail_open_after_drain "gc bd close failed; leaving work bead open"
+  run_or_warn "emit close-refused escalation" gc event emit mol-dog-stale-db.escalate \
+    --message "terminal close refused for ${WORK_BEAD}; leaving work bead open — close it by hand with the assignee identity"
+  maintenance_notice "MAINTENANCE_ESCALATE: stale-db terminal close REFUSED for ${WORK_BEAD}; an open bead behind a clean drain re-dispatches forever"
+  fail_open_after_drain "terminal close refused for ${WORK_BEAD}; leaving work bead open"
 fi
 drain_ack_once # drain-ack before normal exit
 exit
