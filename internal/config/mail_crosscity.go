@@ -76,10 +76,26 @@ func ValidateMailCrossCity(cfg *City, cityRoot string) error {
 	}
 	for i := range cfg.Rigs {
 		if seen[cfg.Rigs[i].Name] || cfg.Rigs[i].Name == local {
-			return fmt.Errorf("rig %q collides with [mail.crosscity] city %q: the first mail-address segment must name either a rig or a city, never both", cfg.Rigs[i].Name, cfg.Rigs[i].Name)
+			return fmt.Errorf("rig %q collides with a [mail.crosscity] city of the same name: the first mail-address segment must name either a rig or a city, never both", cfg.Rigs[i].Name)
 		}
 	}
 	return nil
+}
+
+// RigNames returns the configured rig names. Cross-city mail resolution uses
+// them as the first-segment scopes that stay local, so a failed rig-qualified
+// lookup keeps its ordinary error instead of an unknown-city refusal.
+func (c *City) RigNames() []string {
+	if c == nil || len(c.Rigs) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(c.Rigs))
+	for i := range c.Rigs {
+		if c.Rigs[i].Name != "" {
+			names = append(names, c.Rigs[i].Name)
+		}
+	}
+	return names
 }
 
 // validateMailCityName enforces the city-segment syntax: non-empty, and

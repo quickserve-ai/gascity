@@ -94,7 +94,7 @@ func (s *Server) resolveMailSendRecipientWithContext(ctx context.Context, recipi
 		// A slash-form recipient whose first segment names neither a rig nor
 		// a roster city refuses as unknown-city, so a stale roster is never
 		// spelled as a session lookup failure.
-		return "", mail.WrapUnresolvedRecipient(err, recipient, roster, mailCityLocalScopes(s.state.Config()))
+		return "", mail.RefuseUnknownCity(err, recipient, roster, s.state.Config().RigNames())
 	}
 	return resolved, nil
 }
@@ -171,23 +171,6 @@ func (s *Server) mailCityRoster() mail.CityRoster {
 	}
 	local, peers := cfg.MailCityRoster(fallback)
 	return mail.CityRoster{Local: local, Peers: peers}
-}
-
-// mailCityLocalScopes returns the first-segment names that stay local-scope
-// under cross-city addressing — the configured rig names — so a failed
-// rig-qualified resolution keeps today's error instead of an unknown-city
-// refusal.
-func mailCityLocalScopes(cfg *config.City) []string {
-	if cfg == nil || len(cfg.Rigs) == 0 {
-		return nil
-	}
-	scopes := make([]string, 0, len(cfg.Rigs))
-	for i := range cfg.Rigs {
-		if cfg.Rigs[i].Name != "" {
-			scopes = append(scopes, cfg.Rigs[i].Name)
-		}
-	}
-	return scopes
 }
 
 func (s *Server) resolveMailQueryRecipientsWithContext(ctx context.Context, recipient string) []string {
