@@ -258,6 +258,39 @@ func TestCmdMailSendCrossCityForeignFromAccepted(t *testing.T) {
 	}
 }
 
+// Delivery is a read on the operator's surface too: mail addressed to
+// <local city>/human is served by the plain `gc mail inbox` human default.
+// This drives the full command, not the resolver helper — the human
+// fast-path in resolveMailTargetsForCommand must route through the roster.
+func TestCmdMailInboxCrossCityServesCityQualifiedHumanDelivery(t *testing.T) {
+	cityPath := writeCrossCityTestCity(t)
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	if _, err := beadmail.New(store).Send("gastown/mayor", "qlandia/human", "for the operator", "cutover done"); err != nil {
+		t.Fatalf("seed Send: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailInbox(nil, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdMailInbox = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "for the operator") {
+		t.Errorf("inbox output %q must serve mail addressed to the city-qualified human form", stdout.String())
+	}
+
+	stdout.Reset()
+	code = cmdMailCountWithJSON([]string{"human"}, false, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdMailCount = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "1") {
+		t.Errorf("count output %q must include the city-qualified delivery", stdout.String())
+	}
+}
+
 func seedForeignOriginMessage(t *testing.T, cityPath string) string {
 	t.Helper()
 	store, err := openCityStoreAt(cityPath)
@@ -355,8 +388,63 @@ func TestCmdMailSendCrossCityLocalFromStillChecked(t *testing.T) {
 		if code != 1 {
 			t.Errorf("cmdMailSend --from %q = %d, want 1", from, code)
 		}
-		if !strings.Contains(stderr.String(), "invalid sender") {
-			t.Errorf("--from %q stderr = %q, want invalid sender refusal", from, stderr.String())
+		if !strings.Contains(stderr.String(), `invalid sender "nobody"`) {
+			t.Errorf("--from %q stderr = %q, want the refused sender named", from, stderr.String())
 		}
+	}
+}
+
+// The invalid-sender refusal names the sender the caller gave. (Previously
+// the message printed the zeroed resolution result: `invalid sender ""`.)
+func TestCmdMailSendInvalidFromNamesTheGivenSender(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_MAIL", "")
+	t.Setenv("GC_ALIAS", "")
+	t.Setenv("GC_SESSION_ID", "")
+	t.Setenv("GC_AGENT", "")
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"plain-city\"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	t.Setenv("GC_CITY", cityPath)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend(nil, false, false, "nobody", "human", "s", "b", &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("cmdMailSend = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), `invalid sender "nobody"`) {
+		t.Errorf("stderr = %q, want the refused sender named", stderr.String())
+	}
+}
+
+// With the roster enabled, a reply whose thread origin cannot be read fails
+// closed: the cross-city rules (notify refusal, sender qualification) cannot
+// be applied to an unverifiable thread.
+func TestCmdMailReplyCrossCityFailsClosedWhenOriginUnreadable(t *testing.T) {
+	writeCrossCityTestCity(t)
+	t.Setenv("GC_MAIL", "fail")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailReply([]string{"gc-999", "body"}, "", "", false, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("cmdMailReply = %d, want 1; stdout=%s", code, stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "thread origin") {
+		t.Errorf("stderr = %q, want the fail-closed origin-verification refusal", stderr.String())
+	}
+}
+
+// The JSON surface refuses cross-city --notify with a typed error code.
+func TestCmdMailSendCrossCityNotifyRefusedJSON(t *testing.T) {
+	writeCrossCityTestCity(t)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSendJSON(nil, true, false, "human", "gastown/mayor", "s", "b", true, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("cmdMailSendJSON = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "cross_city_notify") {
+		t.Errorf("json output %q must carry the cross_city_notify error code", stdout.String())
 	}
 }
