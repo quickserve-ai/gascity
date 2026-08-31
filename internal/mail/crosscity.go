@@ -43,20 +43,28 @@ const (
 // recipient with no "/", an empty remainder, or a first segment naming no
 // roster city is CityAddressNone with the recipient returned unchanged, so
 // bare names and rig-qualified names keep today's behavior.
+//
+// The remainder gets the same minimal normalization local resolution applies
+// (surrounding whitespace and one trailing "/" trimmed), so a foreign send
+// cannot mint a mailbox the destination's own reads would never serve. The
+// split is single-level: <local>/<local>/<addr> is not recursively stripped.
 func (r CityRoster) ResolveCityAddress(recipient string) (CityAddressKind, string) {
 	if !r.Enabled() {
 		return CityAddressNone, recipient
 	}
-	trimmed := strings.TrimSpace(recipient)
-	city, rest, found := strings.Cut(trimmed, "/")
-	if !found || rest == "" {
+	city, rest, found := strings.Cut(strings.TrimSpace(recipient), "/")
+	if !found {
+		return CityAddressNone, recipient
+	}
+	rest = strings.TrimSuffix(strings.TrimSpace(rest), "/")
+	if rest == "" {
 		return CityAddressNone, recipient
 	}
 	if city == r.Local {
 		return CityAddressLocal, rest
 	}
 	if slices.Contains(r.Peers, city) {
-		return CityAddressForeign, trimmed
+		return CityAddressForeign, city + "/" + rest
 	}
 	return CityAddressNone, recipient
 }
@@ -74,12 +82,12 @@ func (e *UnknownCityError) Error() string {
 	return fmt.Sprintf("unknown city %q (known cities: %s)", e.City, strings.Join(e.Known, ", "))
 }
 
-// WrapUnresolvedRecipient upgrades a resolution failure into an
+// RefuseUnknownCity upgrades a resolution failure into an
 // *UnknownCityError when the failed recipient's first segment names neither a
 // known city nor a local scope (a rig, or the local city itself). Every other
 // failure — no roster, no "/", a local scope the resolver already understood —
 // returns err unchanged.
-func WrapUnresolvedRecipient(err error, recipient string, roster CityRoster, localScopes []string) error {
+func RefuseUnknownCity(err error, recipient string, roster CityRoster, localScopes []string) error {
 	if err == nil || !roster.Enabled() {
 		return err
 	}
