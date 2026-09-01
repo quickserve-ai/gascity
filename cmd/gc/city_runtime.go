@@ -111,6 +111,12 @@ type CityRuntime struct {
 	fsPressureConsecutiveSkips int
 	fsPressureEpisodeLogged    bool
 
+	// Cross-tick memo of bead-status Get verdicts for the worktree reaper —
+	// pass-1 discovery otherwise pays one remote hub round trip per
+	// bead-shaped worktree on every tick (ga-singc6). Lazily initialized at
+	// the reap call site.
+	reapBeadStatuses *beadStatusCache
+
 	convScopes          map[string]*convergenceScope // nil until bead store available; keyed by rig name ("" = city/HQ)
 	convScopesMu        sync.RWMutex                 // guards convScopes map pointer
 	convergenceReqCh    chan convergenceRequest      // receives CLI commands from controller.sock
@@ -1200,7 +1206,20 @@ func (cr *CityRuntime) tick(
 		// addition to the authoritative /proc cwd scan. Real removal supersedes
 		// dry-run when both flags are set.
 		liveSessionDirs := liveSessionWorktreeDirs(sessionBeads)
-		report := reapClosedBeadWorktrees(cr.cityPath, cr.cfg, cr.rigBeadStores(), liveSessionDirs, !reapEnabled, cr.rec, cr.stderr)
+		// Memoize pass-1 bead-status Gets across ticks: for hub-backed rigs
+		// each Get is a remote multi-statement hydration, and the statuses
+		// the reaper discovers against change roughly never. Every safety
+		// gate (git, borrow-veto List, liveness) still runs fresh per pass —
+		// see reapBeadStatusCacheTTL for the staleness analysis (ga-singc6).
+		if cr.reapBeadStatuses == nil {
+			cr.reapBeadStatuses = newBeadStatusCache(reapBeadStatusCacheTTL)
+		}
+		rigStores := cr.rigBeadStores()
+		cachedStores := make(map[string]beads.Store, len(rigStores))
+		for rigName, rigStore := range rigStores {
+			cachedStores[rigName] = cr.reapBeadStatuses.wrap(rigName, rigStore)
+		}
+		report := reapClosedBeadWorktrees(cr.cityPath, cr.cfg, cachedStores, liveSessionDirs, !reapEnabled, cr.rec, cr.stderr)
 		recordPhase(TraceSiteControllerTickPhase, "reap_closed_bead_worktrees", phaseStart, map[string]any{
 			"reaped":    len(report.Reaped),
 			"protected": len(report.Protected),
