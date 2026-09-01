@@ -571,12 +571,15 @@ func tickPhaseNames(phases []tickPhase) []string {
 }
 
 // Kills: a tick phase reordered, skipped or duplicated. The list is the
-// tick as main ran it before the split; the session column is what the v2
-// reconciler takes over.
+// tick as main ran it before the split, with the carry's pool-death order
+// (handlers captured before the reload, deaths judged after the schema-skew
+// hold, ga-mw4dg); the session column is what the v2 reconciler takes over.
 func TestCityRuntimeTickLegacyPhaseSequenceUnchanged(t *testing.T) {
 	want := []string{
-		"reconcile_pool_deaths",
+		"capture_pool_death_handlers",
 		"config_reload",
+		"schema_skew_hold",
+		"reconcile_pool_deaths",
 		"fs_pressure_gate",
 		"managed_dolt_preflight",
 		"wake_orders_lane",
@@ -797,8 +800,10 @@ func transcriptMetaStarted(cr *CityRuntime) bool {
 // writes nothing to the session row and traces no session phase.
 func TestCityRuntimeTickV2RunsMaintenancePhasesOnly(t *testing.T) {
 	assertLinesEqual(t, "v2 tick phases", taggedPhaseNames(maintenancePhases(legacyTickPhases)), []string{
-		"reconcile_pool_deaths",
+		"capture_pool_death_handlers",
 		"config_reload",
+		"schema_skew_hold",
+		"reconcile_pool_deaths",
 		"fs_pressure_gate",
 		"managed_dolt_preflight",
 		"wake_orders_lane",
