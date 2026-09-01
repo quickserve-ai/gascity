@@ -55,6 +55,53 @@ and the behavior check.
 | Cross-city mail (upstream #5386, ga-d755oq) | `3a8c37580` (fork PR #3) | `gc --context <peer> mail send / reply / inbox` routed to a REMOTE city over the control plane (`cmd/gc/mail_remote.go`, `api.Client.SendMail/ReplyMail/ListMailInboxPage`). Originally carried on this box as `84acc9794` cherry-picked from upstream `cdcd0611c1` (gastownhall/gascity PR #5386). That local copy proved BYTE-IDENTICAL to fork-PR #3's `3a8c37580` — same `git patch-id` `087346b84633ab5aeaee0340744f14b7745b8b53` — and was dropped as a duplicate when the deploy lineage was reconciled onto `origin/carry/operational` (ga-33s83a). The distinction an earlier draft of this row drew between the two copies is not a real one. | Upstream merges #5386 — the range-diff then absorbs it; take upstream's line unmodified. |
 | Dolt endpoint identity & credential projection (ga-3qvmjj, ga-uurd84, ga-298g8t, ga-tmhxnd, qc-ow3u50, gc-49ho, hq-mbe2s) | 5b70f17f4, deb7cda61, de62dbae1, 848f5fad2, ed608d79d, e3e944674, 709ad6944, 01e0660fd, bd87ef4be | Ambient Dolt identity travels with its endpoint — declined on a provable host/port mismatch (`doltauth.AmbientIdentityAppliesTo`), in the resolver and on the direct-dial city-store paths; an inferred endpoint must not overwrite or veto a declared one; a remote store keeps its own port; rig-init projects the scope endpoint credentials; the post-init catalog verify resolves the rig scope's declared endpoint, not the city's (a remote-hub rig in a managed-local city). Adapting the pre-`ga-3qvmjj` contract made `TestOrderRunExecPreservesAuthOnlyOverridesForManagedLocal` the branch's known-red test — resolved in `709ad6944`, split into `TestOrderRunExecDeclinesForeignEndpointIdentityForManagedLocal` + `…PreservesBareAuthOverridesForManagedLocal`; the new `GC_DOLT_MANAGED_LOCAL` env read is goldened in `01e0660fd`. | Upstream absorbs the ambient-identity endpoint binding + the scope-aware init verify. |
 
+## Disposition ledger — harsh-lens re-audit, 2026-09-01
+
+Overseer ruling (Alex, 2026-09-01, corroborated by syl's hq-wisp-ji23mdd): gascity Go
+changes are a last resort; configuration and proper usage come first; the carry
+stack is reviewed harshly, not accumulated. Queue discipline: at most **six**
+open upstream PRs from us at once, and every generic fix carried here gets a
+written drop-or-carry decision, **default DROP unless incident-critical**.
+Evidence and per-item reasoning: gascity rig bead `gc-28wj` and
+`https://westeros.tailfe923a.ts.net:9443/harsh-lens-ledger.html`. Nothing below
+is executed by this ledger — it is the plan for the next carry rebase, and every
+DROP still needs the doctrine's equivalence/behavior check at that rebase.
+
+Dispositions: **KILL** (no independent behavior, or superseded — squash or drop
+at rebase) · **CONFIG** (replace with a city.toml key, prompt, or ops step) ·
+**RE-SCOPE** (a fork assumption leaked into a generic path — gate it or
+resolve its root cause) · **QUEUE** (a real generic fix worth carrying until it
+is upstreamed under the six-PR cap) · **DROP** (a real generic fix we accept
+upstream's behavior on) · **DECIDE** (owner decision still open).
+
+| Disposition | Commits | Why / drop path |
+|---|---|---|
+| KILL | 74407adde | Machine-local `go.mod replace`; this ledger already calls it a mistake, superseded by e3c8ee5a0. |
+| KILL | 062ab7220, 1309ae48d | Upstream #4981 (2e1a9cf76, 2026-08-04) unifies claim identity via `session.AssigneeIdentifier`; verify by range-diff at rebase, then drop the ga-i44k row above. |
+| KILL | 8d3a45fb1 | `-buildvcs=false` + dirty detection already on upstream twice (61282dc04 / #4805, 88cfe71fe). |
+| KILL | 13fc83a4d | Config-file delivery of `dolt_transaction_commit` proven inert and reverted by 95f7b4acc. |
+| KILL (regenerate) | 2ae8a3fb2, 1e38d8078, 6b747120d, b3992f239, 1455a2841, 556af06ef, 4ece728bc, fe59ba7c0, 0cdd157f7, 0849640b4, 07799e485, e0de7cbdf, 2134a265d, 517c50833, 68abb7b64, bb3bab38e, f5c53048e, 4b68c77b7, 435fa0000, b858c1f8e, 52aa3d774 | Pin bumps, rebase glue, regenerated artifacts, ledger prose. None encodes behavior; a rebase regenerates pins and squashes glue into its cluster. |
+| CONFIG | 5d44a4da4 | OMP `ready_delay_ms` is a documented provider override; each city sets `[providers.omp] ready_delay_ms` itself (qlandia already does). Drop the builtin-default patch. |
+| CONFIG | 601bd0aad, ad1dcda2b | `FORCE_COLOR=3` belongs in the provider env override (`[providers.<x>.env]`), not the builtin. |
+| CONFIG | 9ddae51b3 | Model-alias policy is the opposite of upstream's dated-id design; express the fleet's choice via provider `option_defaults`, not a patch. |
+| CONFIG (needs a knob) | 8e98c7c0e, a78d87c2e | Deployment-tuned latency constants (status probe 50ms→2s; doctor scan 15s→4m) baked into shared globals. Carry until an upstream config knob exists; propose the knob, not the number. |
+| CONFIG (ops) | 6e45ddd39 | OMP PATH precedence is machine PATH ordering; fix operationally. |
+| CONFIG (prompt) | cc943b76b (raw-fragment half), 2f78ea92b | Raw fragments: author with the existing `{{define}}` wrapper. Unmerged-PR close refusal: a formula/prompt rule, not Go. The fail-loud half of cc943b76b stays QUEUE. |
+| RE-SCOPE | 2cf205cb8, e3c8ee5a0, 39db1cea5, 367ff5f2e, ecad36bb3, 296312910, abf1ec89d | Beads-pin family: patches the generic `preflight_checker.go` gate for our pseudo-version pin. Root cause is the v54/v59 skew — resolved by the fleet upgrade (`gc-oooy`). Re-evaluate after v59: upstream also pins a pseudo-version, so 367ff5f2e/ecad36bb3/abf1ec89d may still be small upstream fixes with the cadence explanation. |
+| RE-SCOPE | 5b70f17f4, deb7cda61, ed608d79d, de62dbae1, 848f5fad2, e3e944674, 709ad6944, 01e0660fd, bd87ef4be, 2d2a31314 | Tier-D Dolt endpoint identity: unconditional edits to `internal/doltauth/auth.go` and `internal/beads/contract/connection.go`. Gate on the multi-rig topology or upstream behind a flag; the row above already names its drop path. |
+| RE-SCOPE | 3ebbc7aad, d4416aaa9, 9966e35f7, dad1e6030, 72aeb0294, e1b04acb1, 67571c228, 2cd979afd | Orphan-sweep / foreign-claim family (eight commits, one fix): assumes a shared rig store across independently run cities. Defend the topology explicitly (then upstream behind a flag) or drop. |
+| QUEUE (city loss) | 51def01c8, 762071902, dc8c5de73 | Never signal / never classify the tmux server (upstream #5392 minimal fix covers 762071902's core; the other two follow it). |
+| QUEUE (data/ledger) | 95f7b4acc, 0cdbb2ef3, 2b826295e, 69bb07d26, 576ef7314 | Writes silently never committed; dolt credential sourcing at spawn; agent writes attributed to a human; fail closed on schema skew; fresh-server schema recovery. |
+| QUEUE (pool/dispatch) | 328d2def1, 7eecacd36, daee627dd, d0a01ea09, b9d7bd366, 652b599e9 | Pool alias identity; adopt pre-assigned work + convoy dedupe; singleton nudge shadows; raw-template shadowing; failure_class fail-closed; probe pushdown (outage-driven). |
+| QUEUE (reconciler) | d82969adb, 10d1de02b, 82ac9baf1 | Prune TOCTOU + heartbeat storm; crash policy; CopyFiles-only drift. |
+| QUEUE (doctor/dolt pack) | 5886594b1, e99eac8b7, 697e7f698, fe074dc53, 645ce5c19, 2e7176d49, 7e0667d48, abcf2b639, 26576784b, 55e8ed622, 823078c57, 6b7fa10c1, 3f4a87833 | Doctor classification fixes and `examples/bd/dolt` pack fixes — the pack is default upstream surface (#5818 precedent), so these go up as pack PRs. |
+| QUEUE (misc) | e382acd7a, c22be3a4e, e6ac0111a, 138186d31, 5e5da4fbf, cc943b76b (fail-loud half) | herdr start deadline; fable-5 context suffix; launch-model classification; atomic binary swap; fragment fail-loud. |
+| QUEUE (until #5386 merges) | 3a8c37580 | Byte-identical to upstream PR #5386; drops the day it merges. |
+| DROP | 5d3ee9eb1, e002c63ec, ddc1931ba, 29d4edea9, 67108e67f | Test determinism, timer hygiene, tmuxtest reap, gitignore hygiene — accept upstream's behavior; not worth carry weight. |
+| DROP | e6d5658b7, 87fef6410 | Gitignore-aware skill hashing; drift-wave mail. Marginal features; upstream has adjacent mechanisms. |
+| DECIDE (gastown owns) | e942f8e96, 01ac00df4 (wake-resume), 4cf480760, 4507a0369, 73d410d71, f30c6575f, 49cf1f72f, 4ef314987, 79c08b780 | Session history/resume (note: qc-iop4wa's "gc gap" is a bug in THIS carry feature, not in upstream); stopped-home reaper; navigator fields (HUD is asleep); merge-strategy; the launchd family (operator call). Features, not fixes — Cherub's town decides keep-and-upstream vs drop. |
+| CARRY (wanted custom, dated) | 718888c3e | In-process orphan-sweeper off switch, built for our cutover posture. Drop after the cutover completes. |
+
 ## Beads pin — the fleet contract
 
 The native store *is* the beads library linked into `gc`, so `go.mod`'s beads
