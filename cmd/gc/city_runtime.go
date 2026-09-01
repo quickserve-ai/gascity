@@ -1884,6 +1884,9 @@ func (cr *CityRuntime) reloadConfigTraced(
 		}
 		if cr.cs != nil && cr.cs.storeMetadataChanged(result.Cfg) {
 			cr.cs.update(result.Cfg, cr.sp)
+			// The reap status memo may hold verdicts read from the replaced
+			// backends; a same-named rig can now be a different store.
+			cr.reapBeadStatuses = nil
 			message := fmt.Sprintf("Config reloaded: bead store metadata changed (rev %s)", shortRev(result.Revision))
 			if ordersChanged {
 				message = fmt.Sprintf("Config reloaded: bead store metadata changed; orders reloaded: %s (rev %s)", orderSummary, shortRev(result.Revision))
@@ -2141,6 +2144,9 @@ func (cr *CityRuntime) reloadConfigTraced(
 			cr.standaloneCityStore = s
 		}
 		cr.standaloneRigStores = buildStandaloneRigStores(nextCfg, cr.cityPath, cr.stderr)
+		// Rebuilt stores invalidate the reap status memo (see the cs.update
+		// branch above).
+		cr.reapBeadStatuses = nil
 	}
 
 	// Rebuild convergence scopes against the reloaded config so rigs added,

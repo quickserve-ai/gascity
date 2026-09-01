@@ -440,8 +440,13 @@ func scanBorrowVetoReferences(store beads.Store, candidates []reapCandidate) (ma
 	// The query excludes closed beads at the store level (IsTerminalStatus
 	// would discard them anyway) and skips label hydration this scan never
 	// reads. TierBoth is explicit so the reaper's safety contract does not
-	// depend on a wrapping store expanding the default tier for it.
-	all, err := store.List(beads.ListQuery{AllowScan: true, SkipLabels: true, TierMode: beads.TierBoth})
+	// depend on a wrapping store expanding the default tier for it. Live is
+	// explicit because this is a destructive-path safety gate: it must
+	// observe a reopen or work_dir stamp written by ANOTHER process
+	// immediately, not after a CachingStore reconcile converges — and the
+	// ga-singc6 status memo's staleness argument leans on this scan being
+	// authoritative at reap time.
+	all, err := store.List(beads.ListQuery{AllowScan: true, SkipLabels: true, TierMode: beads.TierBoth, Live: true})
 	if err != nil {
 		return nil, err
 	}

@@ -24,9 +24,10 @@ import (
 // through the cache wrapper, and can force Get to fail transiently.
 type reapGetCountingStore struct {
 	beads.Store
-	gets   int
-	lists  int
-	getErr error
+	gets      int
+	lists     int
+	liveLists int
+	getErr    error
 }
 
 func (s *reapGetCountingStore) Get(id string) (beads.Bead, error) {
@@ -39,6 +40,9 @@ func (s *reapGetCountingStore) Get(id string) (beads.Bead, error) {
 
 func (s *reapGetCountingStore) List(q beads.ListQuery) ([]beads.Bead, error) {
 	s.lists++
+	if q.Live {
+		s.liveLists++
+	}
 	return s.Store.List(q)
 }
 
@@ -198,5 +202,35 @@ func TestReapStatusCache_BorrowVetoListNeverMemoized(t *testing.T) {
 	}
 	if store.lists != 2 {
 		t.Fatalf("borrow-veto List ran %d time(s) over two passes, want 2 — the safety scan must never be memoized", store.lists)
+	}
+	// The scan must also be Live: a production rig store is a CachingStore,
+	// and only a Live query bypasses its in-memory active set. Without it
+	// the "borrow-veto runs fresh" half of the staleness argument silently
+	// depends on another cache's reconcile cadence.
+	if store.liveLists != 2 {
+		t.Fatalf("borrow-veto issued %d Live List(s) of %d, want all Live", store.liveLists, store.lists)
+	}
+}
+
+// A negative cache hit must return the ORIGINAL error, not a flattened
+// ErrNotFound: ErrIDCollision wraps ErrNotFound but stays distinguishable,
+// and a caller checking for the collision sub-case must see it on hits too.
+func TestReapStatusCache_PreservesNotFoundErrorIdentity(t *testing.T) {
+	cache, now := newTestStatusCache(5 * time.Minute)
+	store := &reapGetCountingStore{
+		Store:  beads.NewMemStoreFrom(1, nil, nil),
+		getErr: beads.ErrIDCollision,
+	}
+	wrapped := cache.wrap(reapTestRigName, store)
+
+	if _, err := wrapped.Get("ga-fuzzy01"); !errors.Is(err, beads.ErrIDCollision) {
+		t.Fatalf("first Get err = %v, want ErrIDCollision", err)
+	}
+	*now = now.Add(20 * time.Second)
+	if _, err := wrapped.Get("ga-fuzzy01"); !errors.Is(err, beads.ErrIDCollision) {
+		t.Fatalf("cached Get err = %v, want the ORIGINAL ErrIDCollision preserved", err)
+	}
+	if store.gets != 1 {
+		t.Fatalf("gets = %d, want 1 (collision verdict memoized like any not-found)", store.gets)
 	}
 }

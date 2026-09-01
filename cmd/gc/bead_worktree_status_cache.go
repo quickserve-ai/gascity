@@ -30,11 +30,14 @@ import (
 //     nothing a `worktree add` cannot recreate.
 const reapBeadStatusCacheTTL = 5 * time.Minute
 
-// beadStatusCacheEntry is one memoized Get verdict.
+// beadStatusCacheEntry is one memoized Get verdict. err is non-nil only for
+// negative entries and preserves the backing store's original error identity
+// (ErrIDCollision wraps ErrNotFound but stays distinguishable — a hit must
+// not flatten it).
 type beadStatusCacheEntry struct {
-	bead     beads.Bead
-	notFound bool
-	at       time.Time
+	bead beads.Bead
+	err  error
+	at   time.Time
 }
 
 // beadStatusCache memoizes bead-store Get verdicts across reconciler ticks.
@@ -93,24 +96,15 @@ func (s *statusCachingStore) Get(id string) (beads.Bead, error) {
 	now := c.now()
 	if e, ok := c.entries[key]; ok && now.Sub(e.at) < c.ttl {
 		c.mu.Unlock()
-		if e.notFound {
-			return beads.Bead{}, beads.ErrNotFound
-		}
-		return e.bead, nil
+		return e.bead, e.err
 	}
 	c.mu.Unlock()
 
 	bead, err := s.Store.Get(id)
-	switch {
-	case err == nil:
+	if err == nil || errors.Is(err, beads.ErrNotFound) {
 		c.mu.Lock()
 		c.prune(now)
-		c.entries[key] = beadStatusCacheEntry{bead: bead, at: now}
-		c.mu.Unlock()
-	case errors.Is(err, beads.ErrNotFound):
-		c.mu.Lock()
-		c.prune(now)
-		c.entries[key] = beadStatusCacheEntry{notFound: true, at: now}
+		c.entries[key] = beadStatusCacheEntry{bead: bead, err: err, at: now}
 		c.mu.Unlock()
 	}
 	return bead, err
