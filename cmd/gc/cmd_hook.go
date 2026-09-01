@@ -1329,14 +1329,17 @@ func isHeldHookCandidate(item map[string]any) bool {
 // the claim path (cmd_hook_claim.go), and cross-store selection
 // (hook_cross_store.go) all normalize through filterUnreadyHookCandidates. The
 // control-dispatcher's own workflow-serve scan filters the same condition
-// separately, in mergeControlReadyGroups and its jq twin.
+// separately, in mergeControlReadyGroups and its jq twin, and the demand side
+// (demandRowServable and the reconciler's count-form) must agree with this
+// strip, or a row no hook will show is counted as capacity and spawns a seat
+// that reads empty. The rule itself is beadmeta.MoleculeFailed, shared by all.
 func isFailedPartialMoleculeHookCandidate(item map[string]any) bool {
 	metadata, ok := item["metadata"].(map[string]any)
 	if !ok {
 		return false
 	}
-	value, ok := metadata[beadmeta.MoleculeFailedMetadataKey].(string)
-	return ok && strings.EqualFold(strings.TrimSpace(value), "true")
+	value, _ := metadata[beadmeta.MoleculeFailedMetadataKey].(string)
+	return beadmeta.MoleculeFailed(value)
 }
 
 // isClosedHookCandidate reports whether item is a closed bead. Defense-in-depth
