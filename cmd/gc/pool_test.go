@@ -194,6 +194,52 @@ func TestEvaluatePoolDefaultScaleCheckIgnoresRoutedActiveUnassignedWork(t *testi
 	}
 }
 
+// TestEvaluatePoolDefaultScaleCheckIgnoresFailedPartialMoleculeWork runs the
+// default scale_check against a real bd. bd knows nothing about
+// molecule_failed, so its routed reader returns the step of a pour that
+// aborted partway exactly as it returns live work; the count-form's own jq
+// stage is what has to drop it. The hook drops the same row on the serve
+// side, and a seat minted for a row its hook will never show it drains and
+// is re-counted forever (ga-033u0e). The live sibling keeps the assertion
+// honest: a count of 1 proves the reader returned rows and the filter was
+// selective, where a bare 0 could also be an empty read.
+func TestEvaluatePoolDefaultScaleCheckIgnoresFailedPartialMoleculeWork(t *testing.T) {
+	skipSlowCmdGCTest(t, "uses real bd and jq for default scale_check coverage; run make test-cmd-gc-process for full coverage")
+	bdPath, err := findPreferredBinary("bd", "/home/ubuntu/.local/bin/bd")
+	if err != nil {
+		t.Skip("bd not installed")
+	}
+	jqPath, err := exec.LookPath("jq")
+	if err != nil {
+		t.Skip("jq not installed")
+	}
+	t.Setenv("PATH", filepath.Dir(bdPath)+":"+filepath.Dir(jqPath)+":"+os.Getenv("PATH"))
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n"), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	runExternal(t, dir, bdPath, "init", "-p", "ct", "--skip-hooks", "-q")
+
+	runExternal(t, dir, bdPath, "create", "--json", "step of a partial pour", "-t", "task",
+		"--metadata", `{"gc.routed_to":"worker","molecule_failed":"true"}`)
+	runExternal(t, dir, bdPath, "create", "--json", "live worker job", "-t", "task",
+		"--metadata", `{"gc.routed_to":"worker"}`)
+
+	agent := &config.Agent{
+		Name:              "worker",
+		MinActiveSessions: intPtr(0),
+		MaxActiveSessions: intPtr(3),
+	}
+	got, err := evaluatePool("worker", scaleParamsFor(agent), dir, nil, shellScaleCheck)
+	if err != nil {
+		t.Fatalf("evaluatePool with a partial-workflow step: %v", err)
+	}
+	if got != 1 {
+		t.Fatalf("evaluatePool with a partial-workflow step = %d, want 1 (only the live row is demand)", got)
+	}
+}
+
 func TestEvaluatePoolNewDemandDoesNotApplyMinOrMax(t *testing.T) {
 	sp := scaleParams{Min: 2, Max: 3, Check: "ignored"}
 	runner := func(_, _ string, _ map[string]string) (string, error) { return "5\n", nil }
