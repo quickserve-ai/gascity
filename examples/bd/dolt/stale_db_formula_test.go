@@ -11,6 +11,11 @@ import (
 	"github.com/gastownhall/gascity/internal/orders"
 )
 
+// staleDBFilteredEnv scrubs the host's Gas City environment before a rendered
+// formula shell runs. BEADS_ACTOR is named explicitly: it carries no GC_ prefix,
+// so filteredEnv's prefix scrub misses it, and it is the identity a close runs
+// under — a host that exports it (any gc session running this suite) would
+// otherwise leak its own actor into a rendered-script run.
 func staleDBFilteredEnv(keys ...string) []string {
 	keys = append(keys,
 		"GC_BEAD_ID",
@@ -20,8 +25,6 @@ func staleDBFilteredEnv(keys ...string) []string {
 		"GC_ESCALATION_RECIPIENT",
 		"GC_SYSTEM_PACKS_DIR",
 		"GC_MAINTENANCE_DONE_TARGET",
-		// The close actor chain leads with BEADS_ACTOR; never let the host
-		// session's own actor leak into a rendered-script run.
 		"BEADS_ACTOR",
 	)
 	return filteredEnv(keys...)
@@ -1075,6 +1078,9 @@ type staleDBFailureCase struct {
 	wantLog      string
 	forbidLog    string
 	forbidOutput string
+	// env is appended after the scrubbed harness environment, so a case can
+	// stand in for one runtime identity shape.
+	env []string
 }
 
 func TestStaleDBFormulaFailurePathsDrainAck(t *testing.T) {
@@ -1183,10 +1189,15 @@ func TestStaleDBFormulaSuccessPathFailuresDrainAck(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		fail        string
+		env         []string
 		wantFailure bool
 		forbid      string
 		// then is a write that must follow the failed one.
 		then string
+		// wantLog lines must all be recorded after the injected failure, and
+		// wantMail must appear on the escalation mail line itself.
+		wantLog  []string
+		wantMail string
 	}{
 		{
 			name: "scan event failure",
@@ -1203,16 +1214,31 @@ func TestStaleDBFormulaSuccessPathFailuresDrainAck(t *testing.T) {
 			forbid:      staleDBCloseWrite("bead-1"),
 		},
 		{
+			// The terminal close is the one call whose failure is not
+			// nonessential: the bead stays open behind a drained session and
+			// the controller re-dispatches against it forever (we-m34w5). A
+			// refusal must reach the operator on every channel the script's
+			// other operator paths use — escalation mail carrying bd's own
+			// refusal text, the escalate event, and the maintenance nudge —
+			// before the fail-open exit, never as a bare non-zero status.
 			name:        "close failure",
 			fail:        staleDBCloseWrite("bead-1"),
+			env:         []string{"GC_MAINTENANCE_DONE_TARGET=health"},
 			wantFailure: true,
 			then:        staleDBOutcomeWithdrawal("bead-1"),
+			wantLog: []string{
+				"gc mail send human -s ESCALATION: stale-db terminal close refused for bead-1 [HIGH] -m terminal close refused for bead-1: ",
+				"gc event emit mol-dog-stale-db.escalate --message terminal close refused for bead-1: ",
+				"gc session nudge health MAINTENANCE_ESCALATE: stale-db terminal close REFUSED for bead-1",
+			},
+			wantMail: "assignee mismatch",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			log, out, err := runStaleDBFormulaFailureCase(t, staleDBFailureCase{
 				scanJSON:     cleanScan,
 				failContains: tc.fail,
+				env:          tc.env,
 			})
 			if tc.forbid != "" && strings.Contains(log, tc.forbid) {
 				t.Fatalf("%q ran after the failed %q\nlog:\n%s\noutput:\n%s", tc.forbid, tc.fail, log, out)
@@ -1232,11 +1258,101 @@ func TestStaleDBFormulaSuccessPathFailuresDrainAck(t *testing.T) {
 			if tc.then != "" && strings.Index(log, tc.then) < strings.Index(log, tc.fail) {
 				t.Fatalf("%q did not follow the failed %q\nlog:\n%s\noutput:\n%s", tc.then, tc.fail, log, out)
 			}
+			for _, want := range tc.wantLog {
+				if !strings.Contains(log, want) {
+					t.Fatalf("%q path did not record %q\nlog:\n%s\noutput:\n%s", tc.fail, want, log, out)
+				}
+			}
+			if tc.wantMail != "" {
+				mail := staleDBLogLine(log, "gc mail send ")
+				if !strings.Contains(mail, tc.wantMail) {
+					t.Fatalf("%q path escalation mail does not carry bd's refusal %q\nmail: %q\nlog:\n%s\noutput:\n%s", tc.fail, tc.wantMail, mail, log, out)
+				}
+			}
 			if !tc.wantFailure && !strings.Contains(log, staleDBCloseWrite("bead-1")) {
 				t.Fatalf("%q path did not close work after nonessential failure\nlog:\n%s\noutput:\n%s", tc.fail, log, out)
 			}
 		})
 	}
+}
+
+// TestStaleDBFormulaTerminalCloseLeavesTheClaimIdentityToGc pins that no
+// runtime identity shape puts an --actor back on the terminal close. bd's
+// ownership guard compares the closer's actor with the assignee verbatim, and
+// `gc hook --claim` records the assignee as GC_ALIAS, then the session bead id,
+// then BEADS_ACTOR, GC_AGENT and GC_SESSION_NAME (hookClaimAssigneeIdentity in
+// cmd/gc). The close is `gc bd close --reason`, so gc presents that identity:
+// a session's runtime env carries it as BEADS_ACTOR (AssigneeIdentifier), and
+// for a close of the session's own claim gc re-pins the bd child's BEADS_ACTOR
+// to GC_SESSION_ID (closeActorForOwnClaim, TestCloseActorForOwnClaim). The pool
+// row is the shipped dog — max_active_sessions with no namepool — with a blank
+// GC_ALIAS, its session bead id in GC_SESSION_ID, and the slot name every
+// occupant of that slot reuses in BEADS_ACTOR, GC_AGENT and GC_SESSION_NAME:
+// presenting the slot name is exactly the refusal that re-dispatched a fresh dog
+// every firing (we-m34w5), and an --actor here would also be refused outright
+// where gc serves the wisp in process.
+func TestStaleDBFormulaTerminalCloseLeavesTheClaimIdentityToGc(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skipf("bash not found: %v", err)
+	}
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skipf("jq not found: %v", err)
+	}
+
+	const (
+		sessionID = "gcg-session-557fc1017792caa9a01355325b212416"
+		slot      = "test-city--dog-1-pool"
+		alias     = "test-city/dog"
+	)
+	cleanScan := `{"schema":"gc.dolt.cleanup.v1","dropped":{"count":0,"failed":[],"skipped":[]},"purge":{"bytes_reclaimed":0},"reaped":{"count":0,"targets":[]},"summary":{"bytes_freed_disk":0,"bytes_freed_rss":0,"errors_total":0}}`
+	for _, tc := range []struct {
+		name string
+		env  []string
+	}{
+		{
+			name: "unaliased pool dog",
+			env:  []string{"GC_ALIAS=", "GC_SESSION_ID=" + sessionID, "BEADS_ACTOR=" + slot, "GC_AGENT=" + slot, "GC_SESSION_NAME=" + slot},
+		},
+		{
+			name: "aliased session",
+			env:  []string{"GC_ALIAS=" + alias, "GC_SESSION_ID=" + sessionID, "BEADS_ACTOR=" + alias, "GC_AGENT=" + alias, "GC_SESSION_NAME=test-city--dog"},
+		},
+		{
+			name: "no session bead id",
+			env:  []string{"GC_ALIAS=", "GC_SESSION_ID=", "BEADS_ACTOR=" + slot, "GC_AGENT=" + slot},
+		},
+		{
+			name: "no identity at all",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			log, out, err := runStaleDBFormulaFailureCase(t, staleDBFailureCase{scanJSON: cleanScan, env: tc.env})
+			if err != nil {
+				t.Fatalf("rendered script failed: %v\nlog:\n%s\noutput:\n%s", err, log, out)
+			}
+			closeLine := staleDBLogLine(log, "gc bd close ")
+			if !strings.HasPrefix(closeLine, staleDBCloseWrite("bead-1")) {
+				t.Fatalf("terminal close = %q, want prefix %q\nlog:\n%s\noutput:\n%s", closeLine, staleDBCloseWrite("bead-1"), log, out)
+			}
+			if strings.Contains(closeLine, "--actor") {
+				t.Fatalf("terminal close %q presents an --actor\nlog:\n%s\noutput:\n%s", closeLine, log, out)
+			}
+			if strings.Contains(log, "\nbd close ") || strings.HasPrefix(log, "bd close ") {
+				t.Fatalf("terminal close ran bare bd\nlog:\n%s\noutput:\n%s", log, out)
+			}
+		})
+	}
+}
+
+// staleDBLogLine returns the first recorded command line starting with prefix,
+// or "" when the fake binaries never logged one.
+func staleDBLogLine(log, prefix string) string {
+	for _, line := range strings.Split(log, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			return line
+		}
+	}
+	return ""
 }
 
 func runStaleDBFormulaFailureCase(t *testing.T, tc staleDBFailureCase) (string, []byte, error) {
@@ -1261,6 +1377,10 @@ set -euo pipefail
 maybe_fail() {
   local rendered="$1"
   if [ -n "${GC_TEST_FAIL_CONTAINS:-}" ] && [[ "$rendered" == *"$GC_TEST_FAIL_CONTAINS"* ]]; then
+    # A refused gc bd write forwards bd's refusal: a reason on stderr.
+    case "$rendered" in
+      "gc bd "*) echo "bd: ${rendered} refused: assignee mismatch" >&2 ;;
+    esac
     exit 70
   fi
 }
@@ -1294,6 +1414,8 @@ set -euo pipefail
 maybe_fail() {
   local rendered="$1"
   if [ -n "${GC_TEST_FAIL_CONTAINS:-}" ] && [[ "$rendered" == *"$GC_TEST_FAIL_CONTAINS"* ]]; then
+    # Refuse the way bd's ownership guard does: with a reason on stderr.
+    echo "bd: ${rendered} refused: assignee mismatch" >&2
     exit 70
   fi
 }
@@ -1323,6 +1445,7 @@ esac
 		"GC_TEST_APPLY_EXIT="+tc.applyExit,
 		"GC_TEST_FAIL_CONTAINS="+tc.failContains,
 	)
+	cmd.Env = append(cmd.Env, tc.env...)
 	out, err := cmd.CombinedOutput()
 	logData, readErr := os.ReadFile(logPath)
 	if readErr != nil {
