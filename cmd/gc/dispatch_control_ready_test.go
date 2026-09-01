@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -223,18 +224,95 @@ func TestMergeControlReadyGroupsSkipsFailedPartialMolecules(t *testing.T) {
 	}
 }
 
-// TestControlReadyShellFilterMatchesGoFilterOnFailedPartialMolecules pins the
-// two dispatch surfaces together. The readiness scan exists twice — this Go
-// merge and the jq reduce that dispatch_runtime.go ships to the shell — and a
-// filter that lands on only one leaves the defect live on whichever path the
-// city takes. This asserts the shell filter names both metadata keys.
-func TestControlReadyShellFilterMatchesGoFilterOnFailedPartialMolecules(t *testing.T) {
+// TestControlReadyShellReduceDropsFailedPartialMolecules pins the two dispatch
+// surfaces together by EXECUTING the shell one. The readiness scan exists
+// twice — the Go merge above and the jq reduce that dispatch_runtime.go ships
+// to the shell — and a filter that lands on only one leaves the defect live on
+// whichever path the city takes. Naming the metadata keys in the query is not
+// the property: a program can mention a key and still admit the row. So the
+// reduce is sliced out of the generated query exactly as it ships, fed the
+// same groups TestMergeControlReadyGroupsSkipsFailedPartialMolecules uses, and
+// required to return the ids the Go merge returns.
+func TestControlReadyShellReduceDropsFailedPartialMolecules(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not installed; the control-ready shell query merges with jq")
+	}
 	query := workflowServeControlReadyQuery(config.Agent{Name: config.ControlDispatcherAgentName, Dir: "gascity"})
-	for _, key := range []string{beadmeta.InstantiatingMetadataKey, beadmeta.MoleculeFailedMetadataKey} {
-		if !strings.Contains(query, key) {
-			t.Fatalf("shell control-ready query does not filter %q — it has drifted from mergeControlReadyGroups:\n%s", key, query)
+	program := controlReadyShellReduceProgram(t, query)
+
+	assigned := []beads.Bead{
+		// The exact end state markFailed leaves behind: fence cleared, failed
+		// mark set. Dropping must key on the failed mark, not the empty fence.
+		{ID: "ga-partial-step", Metadata: map[string]string{
+			beadmeta.MoleculeFailedMetadataKey: "true",
+			beadmeta.InstantiatingMetadataKey:  "",
+		}},
+		{ID: "ga-healthy", Metadata: map[string]string{"gc.kind": "run"}},
+		{ID: "ga-instantiating", Metadata: map[string]string{beadmeta.InstantiatingMetadataKey: "true"}},
+	}
+	routed := []beads.Bead{
+		{ID: "ga-partial-routed", Metadata: map[string]string{beadmeta.MoleculeFailedMetadataKey: "true"}},
+		{ID: "ga-healthy-routed", Metadata: map[string]string{"gc.kind": "scope-check"}},
+		// Re-surfaced id: the first occurrence wins on both surfaces.
+		{ID: "ga-healthy", Metadata: map[string]string{"gc.kind": "duplicate"}},
+	}
+
+	// The shell appends each non-empty tier's JSON array as its own line and
+	// slurps the file; feed the reduce the same shape on stdin.
+	var stdin bytes.Buffer
+	for _, group := range [][]beads.Bead{assigned, routed} {
+		encoded, err := json.Marshal(group)
+		if err != nil {
+			t.Fatalf("marshal fixture group: %v", err)
+		}
+		stdin.Write(encoded)
+		stdin.WriteByte('\n')
+	}
+	cmd := exec.Command("jq", "-s", program)
+	cmd.Stdin = &stdin
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("jq -s %q: %v\n%s", program, err, out)
+	}
+	var shellMerged []beads.Bead
+	if err := json.Unmarshal(out, &shellMerged); err != nil {
+		t.Fatalf("decode jq output %q: %v", out, err)
+	}
+
+	got := beadIDs(shellMerged)
+	want := beadIDs(mergeControlReadyGroups(assigned, routed))
+	if !stringSlicesEqual(got, want) {
+		t.Fatalf("the shipped jq reduce admits %#v, the Go merge admits %#v — the two dispatch surfaces have drifted", got, want)
+	}
+	for _, id := range got {
+		if strings.HasPrefix(id, "ga-partial") {
+			t.Fatalf("shell reduce served a step of a partially-instantiated workflow: %#v", got)
 		}
 	}
+}
+
+// controlReadyShellReduceProgram slices the jq program out of the generated
+// query as it ships — between `jq -s "` and `" "$tmp"` — and undoes the
+// double-quote escaping workflowServeControlReadyQueryForBeads applies to it,
+// so the test runs the shipped bytes rather than a copy that could drift from
+// them.
+func controlReadyShellReduceProgram(t *testing.T, query string) string {
+	t.Helper()
+	const openMarker, closeMarker = `jq -s "`, `" "$tmp"`
+	start := strings.Index(query, openMarker)
+	if start < 0 {
+		t.Fatalf("generated control-ready query has no jq -s merge:\n%s", query)
+	}
+	rest := query[start+len(openMarker):]
+	end := strings.Index(rest, closeMarker)
+	if end < 0 {
+		t.Fatalf("generated control-ready query's jq program is unterminated:\n%s", query)
+	}
+	program := rest[:end]
+	program = strings.ReplaceAll(program, `\$`, `$`)
+	program = strings.ReplaceAll(program, `\"`, `"`)
+	program = strings.ReplaceAll(program, `\\`, `\`)
+	return program
 }
 
 // TestEvaluateControlReadyMatchesShellQueryPriority ports
