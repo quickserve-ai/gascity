@@ -1246,6 +1246,13 @@ var supervisorServiceEnvKeys = map[string]bool{
 	// the key must survive plist regeneration or `gc start` dies at rig
 	// beads init (ga-v2yrs4).
 	"BD_IGNORE_SCHEMA_SKEW":                    true,
+	// bd spawns a detached send-metrics flusher (POST to the metrics
+	// endpoint) on every invocation unless disabled. Metrics are off by
+	// user config here, but the controller's per-op bd spawns must not
+	// depend on that config file surviving — allowlist the env override so
+	// the off state is durable in the service env (ga, cross-town hardening
+	// from the beads owner).
+	"BD_DISABLE_METRICS":                       true,
 	"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": true,
 	"CLAUDE_CODE_EFFORT_LEVEL":                 true,
 	"CLAUDE_CODE_OAUTH_TOKEN":                  true,
