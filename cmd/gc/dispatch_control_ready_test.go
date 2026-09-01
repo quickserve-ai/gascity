@@ -234,7 +234,8 @@ func TestMergeControlReadyGroupsSkipsFailedPartialMolecules(t *testing.T) {
 // same groups TestMergeControlReadyGroupsSkipsFailedPartialMolecules uses, and
 // required to return the ids the Go merge returns.
 func TestControlReadyShellReduceDropsFailedPartialMolecules(t *testing.T) {
-	if _, err := exec.LookPath("jq"); err != nil {
+	jqPath, err := exec.LookPath("jq")
+	if err != nil {
 		t.Skip("jq not installed; the control-ready shell query merges with jq")
 	}
 	query := workflowServeControlReadyQuery(config.Agent{Name: config.ControlDispatcherAgentName, Dir: "gascity"})
@@ -257,23 +258,25 @@ func TestControlReadyShellReduceDropsFailedPartialMolecules(t *testing.T) {
 		{ID: "ga-healthy", Metadata: map[string]string{"gc.kind": "duplicate"}},
 	}
 
-	// The shell appends each non-empty tier's JSON array as its own line and
-	// slurps the file; feed the reduce the same shape on stdin.
-	var stdin bytes.Buffer
+	// The shell appends each non-empty tier's JSON array as its own line to a
+	// temp file and slurps it (`jq -s "$filter" "$tmp"`); hand the reduce a
+	// file of the same shape through the package's existing external-command
+	// seam rather than a second os/exec call site.
+	var tiers bytes.Buffer
 	for _, group := range [][]beads.Bead{assigned, routed} {
 		encoded, err := json.Marshal(group)
 		if err != nil {
 			t.Fatalf("marshal fixture group: %v", err)
 		}
-		stdin.Write(encoded)
-		stdin.WriteByte('\n')
+		tiers.Write(encoded)
+		tiers.WriteByte('\n')
 	}
-	cmd := exec.Command("jq", "-s", program)
-	cmd.Stdin = &stdin
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("jq -s %q: %v\n%s", program, err, out)
+	dir := t.TempDir()
+	fixture := filepath.Join(dir, "ready-tiers.json")
+	if err := os.WriteFile(fixture, tiers.Bytes(), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
 	}
+	out := runExternalOutput(t, dir, jqPath, "-s", program, fixture)
 	var shellMerged []beads.Bead
 	if err := json.Unmarshal(out, &shellMerged); err != nil {
 		t.Fatalf("decode jq output %q: %v", out, err)
