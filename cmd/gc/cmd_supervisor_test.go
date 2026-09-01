@@ -703,6 +703,30 @@ UNRELATED_SECRET=do-not-persist
 	}
 }
 
+// TestBuildSupervisorServiceDataPersistsSchemaSkewEscapeHatch asserts the
+// ga-v2yrs4 guarantee: BD_IGNORE_SCHEMA_SKEW set only in ${GC_HOME}/secrets.env
+// survives plist regeneration from a shell that does not export it. During a
+// fleet schema-skew window the controller's bd calls live or die on this key.
+func TestBuildSupervisorServiceDataPersistsSchemaSkewEscapeHatch(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	t.Setenv("GC_HOME", filepath.Join(homeDir, ".gc"))
+	t.Setenv("PATH", "/usr/local/bin:/usr/bin:/bin")
+	t.Setenv("BD_IGNORE_SCHEMA_SKEW", "")
+
+	writeSupervisorSecretsEnvFile(t, "BD_IGNORE_SCHEMA_SKEW=1\n")
+
+	data, err := buildSupervisorServiceData()
+	if err != nil {
+		t.Fatalf("buildSupervisorServiceData: %v", err)
+	}
+
+	if got := supervisorServiceEnvMap(data.ExtraEnv); got["BD_IGNORE_SCHEMA_SKEW"] != "1" {
+		t.Fatalf("ExtraEnv[BD_IGNORE_SCHEMA_SKEW] = %q, want %q (all env: %#v)",
+			got["BD_IGNORE_SCHEMA_SKEW"], "1", got)
+	}
+}
+
 // TestBuildSupervisorServiceDataShellEnvWinsOverSecretsFile asserts the
 // gap-fill precedence: a value exported in the calling shell takes precedence
 // over the same key in ${GC_HOME}/secrets.env.

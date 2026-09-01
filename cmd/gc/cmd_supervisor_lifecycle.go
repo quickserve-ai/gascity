@@ -1241,6 +1241,11 @@ var supervisorServiceEnvNameRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 // context need to survive launchd/systemd startup; arbitrary shell state can
 // be opted in with GC_SUPERVISOR_ENV.
 var supervisorServiceEnvKeys = map[string]bool{
+	// bd's documented schema-skew escape hatch. The controller's own bd
+	// calls see only the service env, so during a fleet schema-skew window
+	// the key must survive plist regeneration or `gc start` dies at rig
+	// beads init (ga-v2yrs4).
+	"BD_IGNORE_SCHEMA_SKEW":                    true,
 	"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": true,
 	"CLAUDE_CODE_EFFORT_LEVEL":                 true,
 	"CLAUDE_CODE_OAUTH_TOKEN":                  true,
