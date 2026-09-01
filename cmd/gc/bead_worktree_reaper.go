@@ -70,7 +70,10 @@ type reapReport struct {
 //  5. Liveness: no live process cwd and no active-session working directory may
 //     sit at or beneath the worktree. If the liveness scan is indeterminate
 //     (no /proc), NOTHING is reaped this pass — the reaper cannot prove any
-//     tree is idle (root cause B: closed-bead != end-of-use).
+//     tree is idle (root cause B: closed-bead != end-of-use). The scan is a
+//     host-wide process-table enumeration (lsof on darwin) and is gathered
+//     LAZILY, at most once per pass, and only when a candidate actually
+//     reaches this gate — see the ga-singc6 note at the gather site.
 //  6. Git state: no uncommitted changes, no unpushed commits, no stashes.
 //
 // When dryRun is true the reaper performs all discovery and classification and
@@ -107,9 +110,32 @@ func reapClosedBeadWorktrees(
 		}
 	}
 
-	// Authoritative liveness signal, gathered once for the whole pass. When the
-	// scan is indeterminate the reaper protects every candidate (fail closed).
-	live := collectLiveWorktreeStateFn()
+	// Authoritative liveness signal, gathered at most ONCE for the whole pass
+	// and only on demand. When the scan is indeterminate the reaper protects
+	// every candidate (fail closed).
+	//
+	// ga-singc6: this used to run unconditionally, before discovering whether
+	// any reap candidate existed. On darwin the scan is a host-wide
+	// `lsof -a -d cwd` over the entire process table, executed inline in the
+	// controller's reconciler tick — and that tick is the city's clock (orders
+	// dispatch once per tick). Measured over 70h of reconciler-trace records:
+	// this phase ran on 99.9% of ticks while the fleet usually had ZERO eligible
+	// candidates (six worktrees, none reapable), and on a slow host it grew from
+	// a 5s median to 48s, accounting for ~73% of tick inflation. Gathering it
+	// lazily removes the cost entirely in the common zero-candidate case and
+	// changes nothing about the verdict: every candidate that reaches the gate
+	// still sees the same scan, and an indeterminate scan still protects all.
+	var (
+		live         liveWorktreeState
+		liveGathered bool
+	)
+	liveness := func() liveWorktreeState {
+		if !liveGathered {
+			live = collectLiveWorktreeStateFn()
+			liveGathered = true
+		}
+		return live
+	}
 
 	wtRoot := filepath.Join(cityPath, ".gc", "worktrees")
 
@@ -245,6 +271,7 @@ func reapClosedBeadWorktrees(
 			// or active session is working in it, or when liveness could not be
 			// determined at all.
 			if reason == "" {
+				live := liveness()
 				switch {
 				case !live.scanned:
 					reason = "liveness scan unavailable (failing closed, protecting all)"

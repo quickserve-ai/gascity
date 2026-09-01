@@ -28,9 +28,17 @@ import (
 var lsofPath = "/usr/sbin/lsof"
 
 // lsofCWDTimeout bounds the enumeration. Measured on the live fleet host:
-// 659 processes in ~0.66s. The ceiling is generous because a slow answer is
-// still useful, while NO answer means fail-closed and zero reclamation.
-var lsofCWDTimeout = 30 * time.Second
+// 659 processes in ~0.66s (700+ processes in ~0.7s a week later). The ceiling
+// leaves ~15x headroom over that because a slow answer is still useful, while
+// NO answer means fail-closed and zero reclamation for this pass.
+//
+// ga-singc6: this was 30s, LARGER than the reconciler's healthy tick period
+// (~23s median). An inner deadline above its outer budget cannot protect the
+// outer one — a single pathological enumeration could stretch the city's clock
+// tick by more than a whole tick. 10s keeps the worst case inside the tick.
+// The cost of tripping it is bounded and safe: the scan reports indeterminate,
+// every candidate is protected, and the next pass tries again.
+var lsofCWDTimeout = 10 * time.Second
 
 // collectLiveWorktreeState enumerates every live process's current working
 // directory via lsof and records the canonical paths.
