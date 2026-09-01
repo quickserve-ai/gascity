@@ -63,18 +63,29 @@ type reapReport struct {
 //     against the race between worktree creation and its owning bead's
 //     work-dir metadata being stamped by the next reconcile pass. An
 //     indeterminate age (the ".git" pointer file cannot be stat'd) protects.
-//  4. Borrow-veto scan: batched once per rig per tick, this finds any
-//     non-terminal bead — in any molecule — whose gc.work_dir/work_dir
-//     metadata still points at the worktree's path and protects it if so.
-//     A query error protects every remaining candidate in that rig's tick.
-//  5. Liveness: no live process cwd and no active-session working directory may
+//  4. Git state: no uncommitted changes, no unpushed commits, no stashes.
+//     This is the CHEAP, LOCAL gate (three git subprocesses against the
+//     worktree itself), so it runs before the two expensive signals below;
+//     a candidate it protects never triggers them (ga-singc6).
+//  5. Borrow-veto scan: batched once per rig per tick over the candidates
+//     that survived gate 4, this finds any non-terminal bead — in any
+//     molecule — whose gc.work_dir/work_dir metadata still points at the
+//     worktree's path and protects it if so. It is a full List of the rig's
+//     store (for a hub-backed rig, a remote scan of every open issue and
+//     wisp). A query error protects every remaining candidate in that rig's
+//     tick.
+//  6. Liveness: no live process cwd and no active-session working directory may
 //     sit at or beneath the worktree. If the liveness scan is indeterminate
 //     (no /proc), NOTHING is reaped this pass — the reaper cannot prove any
 //     tree is idle (root cause B: closed-bead != end-of-use). The scan is a
 //     host-wide process-table enumeration (lsof on darwin) and is gathered
 //     LAZILY, at most once per pass, and only when a candidate actually
 //     reaches this gate — see the ga-singc6 note at the gather site.
-//  6. Git state: no uncommitted changes, no unpushed commits, no stashes.
+//
+// Gate order never changes WHICH worktrees are reaped — a worktree is reaped
+// only when every gate passes and protected when any gate protects — it only
+// decides which reason is recorded and how much the pass costs. Cheap and
+// local runs before expensive and remote.
 //
 // When dryRun is true the reaper performs all discovery and classification and
 // emits bead.worktree.reap_skipped events describing what it would reap and
@@ -232,6 +243,37 @@ func reapClosedBeadWorktrees(
 			continue
 		}
 
+		// Git safety gate FIRST (ga-singc6). It is local and cheap — three git
+		// subprocesses against the worktree — while the two gates after it are
+		// a full remote store scan and a host-wide process-table scan. On the
+		// live fleet a single worktree sat protected by this gate for 11 hours
+		// (a repo-global stash, ga-gsfxag) and every ~20s tick paid the store
+		// scan and the process scan anyway, for a verdict this gate had already
+		// reached. Protecting here costs nothing downstream: a candidate that
+		// fails git safety is dropped before either expensive signal is asked
+		// for. Verdict-neutral — see the gate-order note in the doc comment.
+		survivors := make([]reapCandidate, 0, len(candidates))
+		for _, c := range candidates {
+			reason := gitSafetyReason(c.worktreePath)
+			if reason == "" {
+				survivors = append(survivors, c)
+				continue
+			}
+			branch, _ := git.New(c.worktreePath).CurrentBranch()
+			fmt.Fprintf(stderr, //nolint:errcheck
+				"reapClosedBeadWorktrees: protecting %s (bead %s closed but %s)\n",
+				c.worktreePath, c.beadID, reason,
+			)
+			recordReapSkipped(rec, c.beadID, c.worktreePath, rigName, reason)
+			report.Protected = append(report.Protected, reapDecision{
+				BeadID: c.beadID, Path: c.worktreePath, Rig: rigName, Branch: branch, Reason: reason,
+			})
+		}
+		candidates = survivors
+		if len(candidates) == 0 {
+			continue
+		}
+
 		// Borrow-veto scan (FR-1/FR-2/FR-3): one batched query for every
 		// surviving candidate in this rig instead of one query per candidate.
 		// A query error fails closed — every remaining candidate in this
@@ -253,8 +295,8 @@ func reapClosedBeadWorktrees(
 			continue
 		}
 
-		// Pass 2: apply the borrow-veto verdict, then the existing
-		// liveness/git-safety gates, to each surviving candidate.
+		// Pass 2: apply the borrow-veto verdict, then the liveness gate, to
+		// each surviving candidate. Git safety already ran above.
 		for _, c := range candidates {
 			worktreePath := c.worktreePath
 			beadID := c.beadID
@@ -279,22 +321,6 @@ func reapClosedBeadWorktrees(
 					if isLive, why := worktreeIsLive(worktreePath, live, liveSessionDirs); isLive {
 						reason = "live: " + why
 					}
-				}
-			}
-
-			// Git safety gates, only if not already protected.
-			if reason == "" {
-				wg := git.New(worktreePath)
-				hasUncommitted := wg.HasUncommittedWork()
-				hasUnpushed, unpushedErr := wg.HasUnpushedCommitsResult()
-				hasStashes, stashesErr := wg.HasStashesResult()
-				switch {
-				case unpushedErr != nil:
-					reason = "unpushed commit probe failed (failing closed): " + unpushedErr.Error()
-				case stashesErr != nil:
-					reason = "stash probe failed (failing closed): " + stashesErr.Error()
-				case hasUncommitted || hasUnpushed || hasStashes:
-					reason = fmt.Sprintf("unsafe git state: uncommitted=%v unpushed=%v stashes=%v", hasUncommitted, hasUnpushed, hasStashes)
 				}
 			}
 
@@ -363,6 +389,28 @@ func reapClosedBeadWorktrees(
 type reapCandidate struct {
 	beadID       string
 	worktreePath string
+}
+
+// gitSafetyReason applies the git-state gate to one worktree and returns the
+// protecting reason, or "" when the tree is clean, fully pushed, and the repo
+// carries no stashes. Probe failures fail closed with their own reason. The
+// stash probe is repo-global by construction (`git stash list` reads
+// refs/stash of the common repository), so one stash anywhere in the repo
+// protects every worktree of that repo — see ga-gsfxag.
+func gitSafetyReason(worktreePath string) string {
+	wg := git.New(worktreePath)
+	hasUncommitted := wg.HasUncommittedWork()
+	hasUnpushed, unpushedErr := wg.HasUnpushedCommitsResult()
+	hasStashes, stashesErr := wg.HasStashesResult()
+	switch {
+	case unpushedErr != nil:
+		return "unpushed commit probe failed (failing closed): " + unpushedErr.Error()
+	case stashesErr != nil:
+		return "stash probe failed (failing closed): " + stashesErr.Error()
+	case hasUncommitted || hasUnpushed || hasStashes:
+		return fmt.Sprintf("unsafe git state: uncommitted=%v unpushed=%v stashes=%v", hasUncommitted, hasUnpushed, hasStashes)
+	}
+	return ""
 }
 
 // computeWorktreeAge returns how long ago worktreePath was created, using the

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -150,5 +151,92 @@ func TestReapClosedBeadWorktrees_LazyScanStillFailsClosedForAllCandidates(t *tes
 		if _, err := os.Stat(wt); err != nil {
 			t.Fatalf("worktree %s was removed under an indeterminate liveness scan: %v", wt, err)
 		}
+	}
+}
+
+// reapListCountingStore records List calls so these tests can prove the
+// batched borrow-veto scan — a full store List, remote for a hub-backed rig —
+// is not issued for candidates the cheap git gate already protected.
+type reapListCountingStore struct {
+	beads.Store
+	calls int
+}
+
+func (s *reapListCountingStore) List(q beads.ListQuery) ([]beads.Bead, error) {
+	s.calls++
+	return s.Store.List(q)
+}
+
+// The live-fleet shape behind ga-singc6: ONE candidate, protected every tick
+// by the git gate (here an uncommitted file; on the fleet a repo-global stash,
+// ga-gsfxag). The verdict is decided locally, so neither the store scan nor
+// the process-table scan may run.
+func TestReapClosedBeadWorktrees_GitProtectedCandidateSkipsStoreAndProcessScans(t *testing.T) {
+	cityPath, rigRoot := initReapRig(t)
+	wt := addClosedWorktree(t, rigRoot, cityPath, "polecats", "ga-dirty001")
+	if err := os.WriteFile(filepath.Join(wt, "scratch.txt"), []byte("uncommitted\n"), 0o644); err != nil {
+		t.Fatalf("dirty the worktree: %v", err)
+	}
+	store := &reapListCountingStore{Store: beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-dirty001", Status: "closed"}}, nil)}
+	cfg := reapTestConfig(rigRoot)
+	calls := injectCountingLiveness(t, liveWorktreeState{scanned: true})
+
+	var stderr bytes.Buffer
+	report := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, events.Discard, &stderr)
+
+	if store.calls != 0 {
+		t.Fatalf("borrow-veto List ran %d time(s) for a candidate the git gate protects; the store scan must not run for it", store.calls)
+	}
+	if *calls != 0 {
+		t.Fatalf("liveness scan ran %d time(s) for a candidate the git gate protects; the process-table scan must not run for it", *calls)
+	}
+	if len(report.Reaped) != 0 {
+		t.Fatalf("Reaped = %+v, want 0", report.Reaped)
+	}
+	if len(report.Protected) != 1 || !strings.Contains(report.Protected[0].Reason, "unsafe git state") {
+		t.Fatalf("Protected = %+v, want exactly one git-state protection", report.Protected)
+	}
+	if _, err := os.Stat(wt); err != nil {
+		t.Fatalf("worktree %s was removed or unstattable: %v", wt, err)
+	}
+}
+
+// Mixed pass: a git-protected candidate is dropped before the expensive gates,
+// while a clean candidate still goes through the batched store scan (once) and
+// the process scan (once) and is reaped. Gate order changes cost, not verdicts.
+func TestReapClosedBeadWorktrees_GitGateOnlyDropsItsOwnCandidates(t *testing.T) {
+	cityPath, rigRoot := initReapRig(t)
+	dirty := addClosedWorktree(t, rigRoot, cityPath, "builder", "ga-mixd0001")
+	clean := addClosedWorktree(t, rigRoot, cityPath, "builder-2", "ga-mixc0002")
+	if err := os.WriteFile(filepath.Join(dirty, "scratch.txt"), []byte("uncommitted\n"), 0o644); err != nil {
+		t.Fatalf("dirty the worktree: %v", err)
+	}
+	store := &reapListCountingStore{Store: beads.NewMemStoreFrom(1, []beads.Bead{
+		{ID: "ga-mixd0001", Status: "closed"},
+		{ID: "ga-mixc0002", Status: "closed"},
+	}, nil)}
+	cfg := reapTestConfig(rigRoot)
+	calls := injectCountingLiveness(t, liveWorktreeState{scanned: true})
+
+	var stderr bytes.Buffer
+	report := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, events.Discard, &stderr)
+
+	if store.calls != 1 {
+		t.Fatalf("borrow-veto List ran %d time(s), want exactly 1 for the surviving clean candidate", store.calls)
+	}
+	if *calls != 1 {
+		t.Fatalf("liveness scan ran %d time(s), want exactly 1 for the surviving clean candidate", *calls)
+	}
+	if len(report.Reaped) != 1 || report.Reaped[0].BeadID != "ga-mixc0002" {
+		t.Fatalf("Reaped = %+v, want exactly the clean ga-mixc0002\nstderr:\n%s", report.Reaped, stderr.String())
+	}
+	if len(report.Protected) != 1 || report.Protected[0].BeadID != "ga-mixd0001" || !strings.Contains(report.Protected[0].Reason, "unsafe git state") {
+		t.Fatalf("Protected = %+v, want exactly the dirty ga-mixd0001 with a git-state reason", report.Protected)
+	}
+	if _, err := os.Stat(dirty); err != nil {
+		t.Fatalf("dirty worktree %s was removed or unstattable: %v", dirty, err)
+	}
+	if _, err := os.Stat(clean); !os.IsNotExist(err) {
+		t.Fatalf("clean worktree %s still present after reap (stat err=%v)", clean, err)
 	}
 }
