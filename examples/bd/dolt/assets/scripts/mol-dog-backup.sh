@@ -20,6 +20,24 @@ SYSTEM_DBS="^(information_schema|mysql|dolt_cluster|__gc_probe|performance_schem
 MIN_DOLT_BACKUP_VERSION="2.1.0"
 BACKUP_LOCK_FILE="${GC_DOLT_BACKUP_LOCK_FILE:-$GC_CITY_PATH/.gc/runtime/packs/dolt/backup-sync.lock}"
 BACKUP_LOCK_WAIT_SECONDS="${GC_DOLT_BACKUP_LOCK_WAIT_SECONDS:-5}"
+# ORDER_TIMEOUT is set by the harness when running as an exec order.
+# We divide the order timeout fairly across all discovered databases.
+# Fixed costs: 30s SQL probe + 300s rsync. Remainder is per-database budget.
+ORDER_TIMEOUT="${GC_BACKUP_ORDER_TIMEOUT_SECONDS:-1800}"
+case "$ORDER_TIMEOUT" in ''|*[!0-9]*|0) ORDER_TIMEOUT=1800 ;; esac
+
+# Per-database `dolt backup sync` bound is computed dynamically based on the
+# order timeout and the number of databases discovered. This replaces the
+# hardcoded bound (was 120s in ga-g3p5rm, was raised to 1800s in ga-g3p5rm
+# after hq outgrew 120s) which created a deadline inversion — the outer order
+# timeout would fire before the first database completed its per-database timeout.
+# The new approach ensures: inner bound < outer bound always, and every database
+# gets a fair share of the remaining budget.
+#
+# We will compute this after database discovery, since we don't know how many
+# databases exist yet. For now, set a default that won't be used.
+BACKUP_SYNC_TIMEOUT="${GC_DOLT_BACKUP_SYNC_TIMEOUT_SECONDS:-1800}"
+case "$BACKUP_SYNC_TIMEOUT" in ''|*[!0-9]*|0) BACKUP_SYNC_TIMEOUT=1800 ;; esac
 
 dolt_sql() {
     DOLT_CLI_PASSWORD="${GC_DOLT_PASSWORD:-}" \
@@ -166,6 +184,26 @@ SYNCED=0
 FAILED=0
 FAILED_DBS=""
 
+# Compute fair per-database timeout based on order timeout and database count.
+# Fixed costs: 30s SQL probe (per database via ensure_backup_remote) and
+# 300s final rsync. Divide the remainder equally among databases.
+# This ensures: per_db_timeout < order_timeout, and the inner bound can actually fire.
+FIXED_COST_SECONDS=$((30 * TOTAL + 300))
+REMAINING_BUDGET=$((ORDER_TIMEOUT - FIXED_COST_SECONDS))
+if [ "$REMAINING_BUDGET" -le 0 ]; then
+    # Order timeout is too tight to fit even the fixed costs. Fall back to the
+    # default and let the outer timeout fire as designed (it will cut off
+    # databases that can't complete, which surfaces as an opaque kill rather
+    # than per-database timeout diagnostics — ga-28huj — but better than
+    # infinite loops or unbounded waits).
+    BACKUP_SYNC_TIMEOUT=120
+else
+    # Give each database an equal share, with a minimum of 30s to avoid
+    # pathological cases where REMAINING_BUDGET is a small positive number.
+    BACKUP_SYNC_TIMEOUT=$((REMAINING_BUDGET / TOTAL))
+    [ "$BACKUP_SYNC_TIMEOUT" -lt 30 ] && BACKUP_SYNC_TIMEOUT=30
+fi
+
 for db in $DATABASES; do
     if ! ensure_backup_remote "$db"; then
         append_failed_db "$db(backup add failed)"
@@ -176,11 +214,36 @@ for db in $DATABASES; do
         append_failed_db "$db(not found)"
         continue
     fi
-    if (cd "$db_dir" && run_bounded 120 dolt backup sync "${db}-backup" 2>/dev/null); then
+    # ga-g3p5rm: the bound used to be a hardcoded 120s with no override, which
+    # no database larger than a couple of GB could ever finish. hq (5.4 GB /
+    # 53k commits) writes ~1 GB per ~30s, so it was killed partway on EVERY run
+    # from the moment it outgrew the bound — abandoning gigabytes of unreachable
+    # chunks and never advancing its manifest. as and qcore were small enough to
+    # finish, which is why only hq silently rotted.
+    #
+    # Keep it BOUNDED (this holds the backup flock and competes for I/O with the
+    # whole city) but size it so a real database can complete, and let the
+    # operator raise it without editing the pack.
+    sync_stderr="$(mktemp -t dolt-backup-sync 2>/dev/null || printf '%s' "/tmp/dolt-backup-sync.$$")"
+    if (cd "$db_dir" && run_bounded "$BACKUP_SYNC_TIMEOUT" dolt backup sync "${db}-backup" 2>"$sync_stderr"); then
         SYNCED=$((SYNCED + 1))
+        # Stamp ONLY on exit 0. Health reads this instead of any mtime on the
+        # artifact plane, because the failure path can write those too.
+        write_local_backup_sync_stamp "$db" "$BACKUP_ARTIFACT_DIR"
     else
-        append_failed_db "$db(sync failed)"
+        # ga-28huj class: the reason used to go to /dev/null, so "sync failed"
+        # was unactionable. Carry the first stderr line into the failure label.
+        # Guarded for `set -euo pipefail`: an EMPTY stderr file is the normal
+        # case on a timeout kill, and an unguarded pipeline over it exits
+        # non-zero and would abort the whole backup run.
+        sync_reason=""
+        if [ -s "$sync_stderr" ]; then
+            sync_reason="$(tr -s '[:space:]' ' ' < "$sync_stderr" 2>/dev/null | head -1 | cut -c1-120 || true)"
+        fi
+        [ -n "$sync_reason" ] || sync_reason="no stderr; exceeded ${BACKUP_SYNC_TIMEOUT}s bound or exited non-zero"
+        append_failed_db "$db(sync failed: $sync_reason)"
     fi
+    rm -f "$sync_stderr" 2>/dev/null || true
 done
 
 FAILED_COUNT=$FAILED
