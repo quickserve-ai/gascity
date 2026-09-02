@@ -22,12 +22,14 @@ import (
 // *release tarball* CI and Docker install and can only name a published tag.
 // The two are deliberately independent; TestBDVersionPins owns that one.
 func TestBeadsModulePin(t *testing.T) {
-	// v1.1.1-0.20260716185344-67652d8b5caf is commit 67652d8b5caf on
-	// gastownhall/beads main (2026-07-16), the first revision carrying schema
-	// v54 (0054_add_lease_columns) and the revision every bd in this town is
-	// built from. It is a pseudo-version rather than a tag because no released
-	// tag carries v54: v1.1.0 and v1.1.1 both stop at v53.
-	const beadsFleetPin = "v1.1.1-0.20260716185344-67652d8b5caf"
+	// v1.1.1-0.20260805093327-bf97b73749ac is commit bf97b73749ac on
+	// gastownhall/beads main (2026-08-05), schema v59 — the revision upstream
+	// gastownhall/gascity main pins, and therefore the one every bd in the
+	// fleet is built from since the 2026-09-01 window (the fleet pins what
+	// upstream gascity main pins at window time, never ahead of it). Carry
+	// builds of bd keep this exact label in main.Version — gc's version_compat
+	// gate requires it — and carry their identity in main.Build/Commit/Branch.
+	const beadsFleetPin = "v1.1.1-0.20260805093327-bf97b73749ac"
 
 	gomod := readFile(t, repoRoot(t), "go.mod")
 
