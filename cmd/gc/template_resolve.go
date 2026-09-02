@@ -281,7 +281,13 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		"GC_SESSION_ORIGIN":   "ephemeral",
 		"GC_AGENT":            sessName,
 		"GC_ALIAS":            qualifiedName,
-		"BEADS_ACTOR":         sessName,
+		// One identity to bd: hook --claim writes the alias-first identity
+		// (ga-i44k) and bd's ownership guard compares the closer's
+		// BEADS_ACTOR against the bead's assignee, so the actor seeded here
+		// must be the same qualified identity GC_ALIAS carries. Seeding the
+		// runtime session name split the two on every pool/ephemeral spawn
+		// and the session's own terminal close was refused (we-m34w5).
+		"BEADS_ACTOR":         beadsActorIdentity(qualifiedName, sessName),
 		"GC_DIR":              workDir,
 		"GC_BEADS_SCOPE_ROOT": p.cityPath,
 		// Explicit empty values matter here. tmux session creation uses `env -u`
@@ -915,3 +921,14 @@ func prependStartupPromptToNudge(prompt, nudge string) string {
 }
 
 const startupPromptNudgeSeparator = "\n\n---\n\n"
+
+// beadsActorIdentity returns the identity a session presents to bd: the
+// qualified alias when one exists, else the runtime session name. This is the
+// same alias-first preference hook --claim uses when writing an assignee, so
+// a session's own closes pass bd's ownership guard.
+func beadsActorIdentity(qualifiedName, sessName string) string {
+	if qualifiedName != "" {
+		return qualifiedName
+	}
+	return sessName
+}

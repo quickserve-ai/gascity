@@ -87,6 +87,15 @@ func RuntimeEnvWithSessionContext(sessionID, sessionName, alias, template, origi
 	}
 	if alias != "" {
 		env["GC_AGENT"] = alias
+		// The identity a session presents to bd must be the identity a claim
+		// writes as assignee: hook --claim writes the alias-first identity
+		// (ga-i44k), and bd's ownership guard compares the closer's
+		// BEADS_ACTOR against it. Leaving the base RuntimeEnv's session-name
+		// actor in place here split one session into two identities, and its
+		// own terminal close was refused (we-m34w5). The session-name value
+		// stays for alias-less sessions — the resume-path guarantee
+		// (ga-xs28em) is unchanged.
+		env["BEADS_ACTOR"] = alias
 	} else if sessionName != "" {
 		env["GC_AGENT"] = sessionName
 	}

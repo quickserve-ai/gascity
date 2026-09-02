@@ -51,7 +51,7 @@ and the behavior check.
 | Doctor live-rig classification (ga-w7xo) | 5886594b1 | Prevent a live rig DB on the managed endpoint from being labeled orphan. | Upstream equivalent topology classification. |
 | Navigator contract | 73d410d71, 0cdd157f7 | Stable navigator classification fields and regenerated API/dashboard clients. | Upstream exposes the same wire contract. |
 | Bundled pack pin | 6b747120d, fe59ba7c0 | Canonical core/bd pin names a real carry commit containing current embedded pack content. | Re-pin whenever current carry pack content changes. |
-| Beads schema pin | see "Beads pin" below | `go.mod` requires beads at the town's schema-v54 revision instead of upstream's v1.1.0-era pin. | Upstream's pin reaches the revision the fleet's `bd` runs — then take upstream's line unmodified. |
+| Beads schema pin | see "Beads pin" below | Since 2026-09-01 `go.mod`'s beads line **equals upstream main's** (`bf97b73749ac`, schema v59); the row stays as the fleet-contract pointer, not as a divergence. | Absorbed 2026-09-01 — the drop condition ("upstream's line unmodified") is met; keep the line equal to upstream's pin at every rebase. |
 | Cross-city mail (upstream #5386, ga-d755oq) | `3a8c37580` (fork PR #3) | `gc --context <peer> mail send / reply / inbox` routed to a REMOTE city over the control plane (`cmd/gc/mail_remote.go`, `api.Client.SendMail/ReplyMail/ListMailInboxPage`). Originally carried on this box as `84acc9794` cherry-picked from upstream `cdcd0611c1` (gastownhall/gascity PR #5386). That local copy proved BYTE-IDENTICAL to fork-PR #3's `3a8c37580` — same `git patch-id` `087346b84633ab5aeaee0340744f14b7745b8b53` — and was dropped as a duplicate when the deploy lineage was reconciled onto `origin/carry/operational` (ga-33s83a). The distinction an earlier draft of this row drew between the two copies is not a real one. | Upstream merges #5386 — the range-diff then absorbs it; take upstream's line unmodified. |
 | Dolt endpoint identity & credential projection (ga-3qvmjj, ga-uurd84, ga-298g8t, ga-tmhxnd, qc-ow3u50, gc-49ho, hq-mbe2s) | 5b70f17f4, deb7cda61, de62dbae1, 848f5fad2, ed608d79d, e3e944674, 709ad6944, 01e0660fd, bd87ef4be | Ambient Dolt identity travels with its endpoint — declined on a provable host/port mismatch (`doltauth.AmbientIdentityAppliesTo`), in the resolver and on the direct-dial city-store paths; an inferred endpoint must not overwrite or veto a declared one; a remote store keeps its own port; rig-init projects the scope endpoint credentials; the post-init catalog verify resolves the rig scope's declared endpoint, not the city's (a remote-hub rig in a managed-local city). Adapting the pre-`ga-3qvmjj` contract made `TestOrderRunExecPreservesAuthOnlyOverridesForManagedLocal` the branch's known-red test — resolved in `709ad6944`, split into `TestOrderRunExecDeclinesForeignEndpointIdentityForManagedLocal` + `…PreservesBareAuthOverridesForManagedLocal`; the new `GC_DOLT_MANAGED_LOCAL` env read is goldened in `01e0660fd`. | Upstream absorbs the ambient-identity endpoint binding + the scope-aware init verify. |
 
@@ -68,16 +68,17 @@ turns red. That is why the pin is a written contract rather than a preference.
 
 | Where | Value |
 |---|---|
-| `go.mod` require | `github.com/steveyegge/beads v1.1.1-0.20260716185344-67652d8b5caf` |
-| Upstream commit | `67652d8b5caf` on `gastownhall/beads` main (2026-07-16), schema **v54** |
-| Every machine's `bd version` | `v1.1.1-0.20260716185344-67652d8b5caf` |
+| `go.mod` require | `github.com/steveyegge/beads v1.1.1-0.20260805093327-bf97b73749ac` |
+| Upstream commit | `bf97b73749ac` on `gastownhall/beads` main (2026-08-05), schema **v59** — the revision upstream `gastownhall/gascity` main pins |
+| Every machine's `bd version` | starts `v1.1.1-0.20260805093327-bf97b73749ac`; a carry build appends its identity, e.g. `(bf97b73+carry.8f7471e: carry-v59/be-qfm-be-4at@8f7471e01238)` — the label itself must stay the pin (gc's version_compat gate) |
 
-`v1.1.0` — the last *tagged* beads release below this — tops out at schema
-**v53**, and so does the `v1.1.1` tag; the v54 migration
-(`0054_add_lease_columns`) exists only between them, which is why the pin is a
-pseudo-version rather than a tag. The library's exported surface is unchanged
-across that span (`beads.go` is byte-identical and `go doc -all` matches), so
-this pin buys schema catalog and nothing else — no API and no wire movement.
+The pin is a pseudo-version rather than a tag because the fleet pins **whatever
+upstream `gastownhall/gascity` main pins at window time** — on-support, never
+ahead, never waiting on an announcement — and upstream main pins this commit
+(`qc-bridge` `shared/fork-upstream-operating-principles.v1.md`, principle 3).
+History: the previous pin was `v1.1.1-0.20260716185344-67652d8b5caf` (schema
+v54, 2026-07-16 to 2026-09-01); the sections below that measure v54 stores
+are dated and kept as the record of that period.
 
 **Every machine gets v54 from `go build` alone.** That revision is published on
 the public Go module proxy and covered by `go.sum`, so a plain checkout builds
@@ -99,11 +100,12 @@ Note this is a different axis from `deps.env`'s `BD_VERSION`, which pins the bd
 **Moving the pin moves the fleet.** Bump `go.mod`, the `beadsFleetPin` constant
 in that test, and the table above together, and redeploy `bd` on every machine
 in the same window — a `gc` that migrates a city DB past what the other
-machines' `bd` knows produces the same skew from the opposite side. Upstream
-`gastownhall/gascity` main has since moved to
-`v1.1.1-0.20260805093327-bf97b73749ac` (schema **v59**); adopting it is a fleet
-`bd` upgrade, not a `go.mod` edit, and stays out of carry until that upgrade is
-scheduled.
+machines' `bd` knows produces the same skew from the opposite side. The move
+from v54 to v59 happened 2026-09-01: the alex laptop, the westeros box and the
+q-core hub advanced in one window (deliberate hub migration past the
+migration-interlock remote); Cherub's hq/as stores complete it in their
+2026-09-02 unfork window, which also ends the forked 0054 (dropped, not
+renumbered). The next move is when upstream gascity main's pin moves.
 
 **Working against a local beads checkout** (patching beads and gascity together)
 is the one case for an override. Use an **untracked** `go.work` at the repo

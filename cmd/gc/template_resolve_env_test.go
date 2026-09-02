@@ -238,3 +238,39 @@ func TestResolveTemplateInjectsPerDispatcherTraceDefault(t *testing.T) {
 		})
 	}
 }
+
+// The template agent env presents ONE identity to bd: BEADS_ACTOR must be the
+// same qualified identity GC_ALIAS carries, because hook --claim writes the
+// alias-first identity (ga-i44k) and bd's ownership guard compares the
+// closer's BEADS_ACTOR against the bead's assignee. Seeding the runtime
+// session name here split the two on every pool/ephemeral spawn, and the
+// session's own terminal close was refused (we-m34w5).
+func TestResolveTemplateSeedsBeadsActorFromQualifiedAlias(t *testing.T) {
+	cityPath := t.TempDir()
+	writeTemplateResolveCityConfig(t, cityPath, "file")
+
+	params := &agentBuildParams{
+		cityName:   "city",
+		cityPath:   cityPath,
+		workspace:  &config.Workspace{Provider: "test"},
+		providers:  map[string]config.ProviderSpec{"test": {Command: "echo", PromptMode: "none"}},
+		lookPath:   func(string) (string, error) { return "/bin/echo", nil },
+		fs:         fsys.OSFS{},
+		beaconTime: time.Unix(0, 0),
+		beadNames:  make(map[string]string),
+		stderr:     io.Discard,
+	}
+
+	agent := &config.Agent{Name: "dog-1", Dir: "bd"}
+	tp, err := resolveTemplate(params, agent, agent.QualifiedName(), nil)
+	if err != nil {
+		t.Fatalf("resolveTemplate: %v", err)
+	}
+	alias := tp.Env["GC_ALIAS"]
+	if alias == "" {
+		t.Fatal("GC_ALIAS is empty")
+	}
+	if got := tp.Env["BEADS_ACTOR"]; got != alias {
+		t.Fatalf("BEADS_ACTOR = %q, want the qualified alias %q (session name was %q)", got, alias, tp.Env["GC_SESSION_NAME"])
+	}
+}

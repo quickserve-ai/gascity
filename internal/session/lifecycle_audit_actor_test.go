@@ -34,14 +34,21 @@ func TestRuntimeEnvVariantsPropagateAuditActor(t *testing.T) {
 	// The restart/resume path (cmd/gc/session_lifecycle_parallel.go) merges this
 	// variant LAST over the agent config env, which is what makes it the fix for
 	// a resumed session that never got the create-time template env.
+	//
+	// The context variant follows the alias-first claim identity. This pin
+	// previously demanded the session-name form here ("the ledger records
+	// session names"), while ga-i44k made hook --claim write the alias — one
+	// session owning work under a different exact string than it presented to
+	// bd. bd's ownership guard then refused the session's own terminal close
+	// (we-m34w5: a clean-drain re-dispatch loop). The ledger attribution for
+	// aliased sessions changes to the alias form at this boundary, which is
+	// the string their claims already carry.
 	ctx := RuntimeEnvWithSessionContext("sid", "gastown__mayor", "gastown.mayor", "mayor", "named", 37, 36, "tok-c")
-	if got := ctx["BEADS_ACTOR"]; got != "gastown__mayor" {
-		t.Errorf("WithSessionContext BEADS_ACTOR = %q, want gastown__mayor", got)
+	if got := ctx["BEADS_ACTOR"]; got != "gastown.mayor" {
+		t.Errorf("WithSessionContext BEADS_ACTOR = %q, want the alias-first claim identity gastown.mayor", got)
 	}
-	// The alias form (gastown.mayor) is NOT the actor: the ledger records
-	// session names, and mixing the two splits one agent's history in two.
-	if ctx["BEADS_ACTOR"] == ctx["GC_ALIAS"] {
-		t.Errorf("BEADS_ACTOR = GC_ALIAS = %q, want the session-name form", ctx["BEADS_ACTOR"])
+	if ctx["BEADS_ACTOR"] != ctx["GC_AGENT"] {
+		t.Errorf("BEADS_ACTOR = %q but GC_AGENT = %q; the audit actor and the ownership identity must be one string", ctx["BEADS_ACTOR"], ctx["GC_AGENT"])
 	}
 }
 
@@ -55,5 +62,31 @@ func TestRuntimeEnvClearsAuditActorWhenSessionNameEmpty(t *testing.T) {
 	}
 	if got := env["BEADS_ACTOR"]; got != "" {
 		t.Errorf("BEADS_ACTOR = %q, want empty", got)
+	}
+}
+
+// The identity a session presents to bd must be the identity a claim writes
+// as assignee. hook --claim writes the alias-first identity (ga-i44k), so an
+// aliased session whose env still carried the runtime session name owned its
+// work under one string and spoke to bd under another — bd's ownership guard
+// then refused the session's own terminal close, and under a drain-ack EXIT
+// trap the controller saw a clean drain with an open bead and re-dispatched
+// forever (we-m34w5: 15 wakes in ~40 minutes on a scan that found nothing).
+func TestRuntimeEnvWithSessionContextAlignsAuditActorWithClaimIdentity(t *testing.T) {
+	env := RuntimeEnvWithSessionContext("gcs-1", "bd__dog-we-ucuj0", "bd.dog-1", "", "", 1, 0, "tok")
+	if got := env["BEADS_ACTOR"]; got != "bd.dog-1" {
+		t.Fatalf("BEADS_ACTOR = %q, want the alias-first claim identity %q", got, "bd.dog-1")
+	}
+	if got := env["GC_AGENT"]; got != "bd.dog-1" {
+		t.Fatalf("GC_AGENT = %q, want %q", got, "bd.dog-1")
+	}
+}
+
+// Without an alias the audit actor keeps the session-name fallback the resume
+// path depends on (ga-xs28em).
+func TestRuntimeEnvWithSessionContextKeepsSessionNameActorWithoutAlias(t *testing.T) {
+	env := RuntimeEnvWithSessionContext("gcs-1", "mayor", "", "", "", 1, 0, "tok")
+	if got := env["BEADS_ACTOR"]; got != "mayor" {
+		t.Fatalf("BEADS_ACTOR = %q, want session-name fallback %q", got, "mayor")
 	}
 }
