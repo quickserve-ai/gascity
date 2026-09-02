@@ -4285,10 +4285,26 @@ func TestBackupOrderTimeoutCoversScriptBudget(t *testing.T) {
 		t.Fatalf("parse backup order: %v", err)
 	}
 
+	// The script computes per-database timeout dynamically as:
+	//   per_db_timeout = (order_timeout - (30 * num_dbs + 300)) / num_dbs
+	// where 30s is the SQL probe per database and 300s is the final rsync.
+	//
+	// For the relationship to hold (inner bound < outer), we need:
+	//   per_db_timeout < order_timeout
+	// which requires:
+	//   order_timeout > (30 * num_dbs + 300) / (1 - 1/num_dbs)
+	// For a reasonable per_db_timeout (at least 120s), we need:
+	//   order_timeout > 30 * num_dbs + 120 * num_dbs + 300
+	//   order_timeout > (30 + 120) * num_dbs + 300 = 150 * num_dbs + 300
+	//
+	// The test verifies the order timeout is sufficient for at least intendedDBs
+	// to complete within a reasonable per-database budget. The minimum here (120s)
+	// matches the old hardcoded bound and proves the new dynamic approach is at
+	// least as capable.
 	const intendedDBs = 10
-	required := 30*time.Second + intendedDBs*120*time.Second + 300*time.Second
+	required := 30*time.Second*time.Duration(intendedDBs) + 120*time.Second*time.Duration(intendedDBs) + 300*time.Second
 	if got := order.TimeoutOrDefault(); got < required {
-		t.Fatalf("backup order timeout = %s, want at least %s for SQL probe + %d DB syncs + offsite rsync", got, required, intendedDBs)
+		t.Fatalf("backup order timeout = %s, want at least %s for SQL probes + %d DB syncs at 120s each + offsite rsync", got, required, intendedDBs)
 	}
 }
 

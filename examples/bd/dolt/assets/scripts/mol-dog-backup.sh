@@ -20,10 +20,22 @@ SYSTEM_DBS="^(information_schema|mysql|dolt_cluster|__gc_probe|performance_schem
 MIN_DOLT_BACKUP_VERSION="2.1.0"
 BACKUP_LOCK_FILE="${GC_DOLT_BACKUP_LOCK_FILE:-$GC_CITY_PATH/.gc/runtime/packs/dolt/backup-sync.lock}"
 BACKUP_LOCK_WAIT_SECONDS="${GC_DOLT_BACKUP_LOCK_WAIT_SECONDS:-5}"
-# Per-database `dolt backup sync` bound, seconds (ga-g3p5rm). Was a hardcoded
-# 120 that hq could never finish inside. The order's own cadence is 6h, so a
-# 30-minute ceiling still leaves ample headroom while remaining bounded — this
-# holds the backup flock, so it must never be unbounded.
+# ORDER_TIMEOUT is set by the harness when running as an exec order.
+# We divide the order timeout fairly across all discovered databases.
+# Fixed costs: 30s SQL probe + 300s rsync. Remainder is per-database budget.
+ORDER_TIMEOUT="${GC_BACKUP_ORDER_TIMEOUT_SECONDS:-1800}"
+case "$ORDER_TIMEOUT" in ''|*[!0-9]*|0) ORDER_TIMEOUT=1800 ;; esac
+
+# Per-database `dolt backup sync` bound is computed dynamically based on the
+# order timeout and the number of databases discovered. This replaces the
+# hardcoded bound (was 120s in ga-g3p5rm, was raised to 1800s in ga-g3p5rm
+# after hq outgrew 120s) which created a deadline inversion — the outer order
+# timeout would fire before the first database completed its per-database timeout.
+# The new approach ensures: inner bound < outer bound always, and every database
+# gets a fair share of the remaining budget.
+#
+# We will compute this after database discovery, since we don't know how many
+# databases exist yet. For now, set a default that won't be used.
 BACKUP_SYNC_TIMEOUT="${GC_DOLT_BACKUP_SYNC_TIMEOUT_SECONDS:-1800}"
 case "$BACKUP_SYNC_TIMEOUT" in ''|*[!0-9]*|0) BACKUP_SYNC_TIMEOUT=1800 ;; esac
 
@@ -171,6 +183,26 @@ TOTAL=$(printf '%s\n' "$DATABASES" | awk 'NF {count++} END {print count + 0}')
 SYNCED=0
 FAILED=0
 FAILED_DBS=""
+
+# Compute fair per-database timeout based on order timeout and database count.
+# Fixed costs: 30s SQL probe (per database via ensure_backup_remote) and
+# 300s final rsync. Divide the remainder equally among databases.
+# This ensures: per_db_timeout < order_timeout, and the inner bound can actually fire.
+FIXED_COST_SECONDS=$((30 * TOTAL + 300))
+REMAINING_BUDGET=$((ORDER_TIMEOUT - FIXED_COST_SECONDS))
+if [ "$REMAINING_BUDGET" -le 0 ]; then
+    # Order timeout is too tight to fit even the fixed costs. Fall back to the
+    # default and let the outer timeout fire as designed (it will cut off
+    # databases that can't complete, which surfaces as an opaque kill rather
+    # than per-database timeout diagnostics — ga-28huj — but better than
+    # infinite loops or unbounded waits).
+    BACKUP_SYNC_TIMEOUT=120
+else
+    # Give each database an equal share, with a minimum of 30s to avoid
+    # pathological cases where REMAINING_BUDGET is a small positive number.
+    BACKUP_SYNC_TIMEOUT=$((REMAINING_BUDGET / TOTAL))
+    [ "$BACKUP_SYNC_TIMEOUT" -lt 30 ] && BACKUP_SYNC_TIMEOUT=30
+fi
 
 for db in $DATABASES; do
     if ! ensure_backup_remote "$db"; then
