@@ -126,6 +126,14 @@ func isNothingToCommit(err error) bool {
 
 // doltIgnoreIsUncommitted reports whether dolt_ignore itself has changes in the
 // working set or the index — the shape a DEFERRED seed leaves behind.
+//
+// It cannot distinguish OUR uncommitted seed from another writer's uncommitted
+// dolt_ignore pattern, so a commit triggered by this check can carry that
+// writer's pattern along under our message. Deliberate: dolt_ignore is a
+// one-row-per-pattern table nobody edits in flight, and a pattern committed a
+// little early is a far smaller problem than the working set staying dirty
+// forever, which is what wedges hub merges (ga-7unsv0). The other-tables guard
+// below still protects everything that is not dolt_ignore.
 func doltIgnoreIsUncommitted(ctx context.Context, db DB) (bool, error) {
 	rows, err := db.QueryContext(ctx, "SELECT COUNT(*) FROM dolt_status WHERE table_name = 'dolt_ignore'")
 	if err != nil {
