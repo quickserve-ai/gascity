@@ -121,11 +121,8 @@ func TestSetReconcileHeartbeatSinkNilDoesNotPublishOrStamp(t *testing.T) {
 	backing := NewMemStore()
 	c := NewCachingStoreForTestWithPrefix(backing, "ga", nil)
 	c.SetReconcileHeartbeatSink(nil)
-	c.lifecycleMu.Lock()
-	armed := c.reconcilerArmedAt
-	c.lifecycleMu.Unlock()
-	if !armed.IsZero() {
-		t.Errorf("reconcilerArmedAt = %s after nil install, want zero", armed)
+	if armed := c.ReconcilerArmedAt(); !armed.IsZero() {
+		t.Errorf("ReconcilerArmedAt() = %s after nil install, want zero", armed)
 	}
 }
 

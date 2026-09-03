@@ -71,16 +71,22 @@ type CachingStore struct {
 	// heartbeatSink publishes the durable ReconcileHeartbeat record. It is
 	// nil by default — every store that is not wired by the controller (all
 	// tests, every CLI-path store) publishes nothing and behaves exactly as
-	// before. Guarded by lifecycleMu alongside reconcilerArmedAt.
+	// before. Guarded by lifecycleMu.
 	heartbeatSink func(ReconcileHeartbeat)
-	// reconcilerArmedAt starts the watchdog's never-reconciled clock. First
-	// stamped by SetReconcileHeartbeatSink at install time (so a store whose
-	// reconciler never starts still goes visibly stale), then re-stamped by
-	// StartReconciler when it actually arms this store's
-	// loop. It is the floor of the heartbeat staleness clock, so a store
-	// that has been armed but has not yet completed its first cycle is
-	// judged against its arm time rather than looking infinitely stale.
-	reconcilerArmedAt time.Time
+	// reconcilerArmedAtNanos starts the watchdog's never-reconciled clock, as
+	// UnixNano; zero means "this store is not expected to reconcile at all".
+	// First stamped by SetReconcileHeartbeatSink at install time (so a store
+	// whose reconciler never starts still goes visibly stale), then re-stamped
+	// by StartReconciler when it actually arms this store's loop. It is the
+	// floor of the staleness clock, so a store that has been armed but has not
+	// yet completed its first cycle is judged against its arm time rather than
+	// looking infinitely stale.
+	//
+	// Atomic rather than lifecycleMu-guarded because the read path consults it
+	// while holding c.mu: taking lifecycleMu there would put the two locks in
+	// an order no other path uses, and would put lifecycleMu on every cached
+	// read. An atomic has neither cost.
+	reconcilerArmedAtNanos atomic.Int64
 
 	// latencyWindow holds the most recent reconciliation bd-list
 	// durations for adaptive cadence decisions. Bounded at
@@ -1109,9 +1115,9 @@ func (c *CachingStore) StartReconciler(ctx context.Context, stagger StaggerOptio
 		return
 	}
 	c.cancelFn = cancel
-	c.reconcilerArmedAt = time.Now()
 	c.lifecycleWG.Add(1)
 	c.lifecycleMu.Unlock()
+	c.reconcilerArmedAtNanos.Store(time.Now().UnixNano())
 
 	offset := stagger.resolve(agentID)
 
@@ -1127,7 +1133,7 @@ func (c *CachingStore) StartReconciler(ctx context.Context, stagger StaggerOptio
 	// WriteReconcileHeartbeat MkdirAll's its directory, so a late publish
 	// re-creates <city>/.gc/runtime/beads-cache mid-RemoveAll (the
 	// controllerState TempDir-cleanup failures, 21+/40 runs). The re-stamp of
-	// reconcilerArmedAt above still flows into every loop publish.
+	// arm re-stamp above still flows into every loop publish.
 
 	go func() {
 		defer c.lifecycleWG.Done()
@@ -1158,13 +1164,35 @@ func (c *CachingStore) SetReconcileHeartbeatSink(sink func(ReconcileHeartbeat)) 
 	}
 	c.lifecycleMu.Lock()
 	c.heartbeatSink = sink
-	if sink != nil && c.reconcilerArmedAt.IsZero() {
-		c.reconcilerArmedAt = time.Now()
-	}
 	c.lifecycleMu.Unlock()
 	if sink != nil {
+		c.reconcilerArmedAtNanos.CompareAndSwap(0, time.Now().UnixNano())
 		c.publishReconcileHeartbeat()
 	}
+}
+
+// ReconcilerArmedAt reports when this store's reconcile loop was armed, or the
+// zero time when the store is not expected to reconcile at all. The two are
+// genuinely different states and callers must not conflate them: every
+// CLI-path and test store legitimately never reconciles, and judging one
+// against a reconcile schedule it was never given would condemn a healthy
+// cache. Only a store whose reconciler was armed — or which had a heartbeat
+// sink installed, which is the controller declaring the same intent — carries
+// a non-zero arm time.
+func (c *CachingStore) ReconcilerArmedAt() time.Time {
+	if c == nil {
+		return time.Time{}
+	}
+	return armedAtFromNanos(c.reconcilerArmedAtNanos.Load())
+}
+
+// armedAtFromNanos converts the stored arm clock to a time, mapping the zero
+// sentinel to the zero time rather than to the Unix epoch.
+func armedAtFromNanos(nanos int64) time.Time {
+	if nanos == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, nanos)
 }
 
 // publishReconcileHeartbeat hands the current liveness snapshot to the sink.
@@ -1174,11 +1202,11 @@ func (c *CachingStore) SetReconcileHeartbeatSink(sink func(ReconcileHeartbeat)) 
 func (c *CachingStore) publishReconcileHeartbeat() {
 	c.lifecycleMu.Lock()
 	sink := c.heartbeatSink
-	armedAt := c.reconcilerArmedAt
 	c.lifecycleMu.Unlock()
 	if sink == nil {
 		return
 	}
+	armedAt := c.ReconcilerArmedAt()
 	c.mu.RLock()
 	hb := c.reconcileHeartbeatSnapshotLocked()
 	c.mu.RUnlock()
