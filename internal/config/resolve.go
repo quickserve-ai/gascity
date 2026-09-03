@@ -114,6 +114,11 @@ func ResolveProvider(agent *Agent, ws *Workspace, cityProviders map[string]Provi
 		resolved.EffectiveDefaults = nil
 	}
 
+	// Step 4c: claude-family sessions default their harness display name to
+	// the agent's qualified identity (`--name <gc address>`), after 4b so an
+	// escape-hatch command (cleared schema) is never decorated (ga-n0rvsk).
+	injectSessionNameOption(resolved, agent)
+
 	// Step 5: default prompt_mode.
 	if resolved.PromptMode == "" {
 		resolved.PromptMode = "arg"
