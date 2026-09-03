@@ -470,11 +470,18 @@ func (c *CachingStore) Ready(query ...ReadyQuery) ([]Bead, error) {
 		depsByID   map[string][]Dep
 		openBeads  []Bead
 	)
-	// Ready requires a fully live cache with complete dependency coverage; the
-	// overlay refreshes any dirty rows first, then computes readiness from the
-	// cache. On overlay error the read takes the old full backing.Ready scan.
+	// Ready requires a fully live cache with complete dependency coverage, and
+	// the same freshness bound the other cached reads apply — a readiness
+	// verdict computed from a snapshot that stopped reconciling hours ago is
+	// exactly as wrong as a stale List, and gates work rather than merely
+	// reporting it. The overlay refreshes any dirty rows first, then computes
+	// readiness from the cache. On overlay error — including a refusal for
+	// staleness — the read takes the old full backing.Ready scan.
 	if err := c.readCacheWithOverlay(
-		func() bool { return c.state == cacheLive && c.depsComplete && c.primePartialErr == nil },
+		func() bool {
+			return c.state == cacheLive && c.depsComplete && c.primePartialErr == nil &&
+				c.freshEnoughToServeLocked()
+		},
 		func(suppressed map[string]struct{}) {
 			statusByID = make(map[string]string, len(c.beads))
 			openBeads = make([]Bead, 0, len(c.beads))

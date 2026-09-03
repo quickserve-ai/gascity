@@ -107,7 +107,11 @@ func TestMergeOracleFieldCoverage(t *testing.T) {
 		// the merge PRODUCES; neither field is produced by it, and the
 		// snapshot they publish is assembled from stats fields the oracle
 		// already compares.
+		// staleServeLogAtNanos is likewise not merge state: it is a
+		// rate-limiter clock for the serve-staleness refusal log, touched
+		// only by readers.
 		"heartbeatSink": true, "reconcilerArmedAtNanos": true,
+		"staleServeLogAtNanos": true,
 	}
 	assertFieldsClassified(t, reflect.TypeOf(CachingStore{}), comparedStore, excludedStore)
 

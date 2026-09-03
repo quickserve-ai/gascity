@@ -87,6 +87,11 @@ type CachingStore struct {
 	// an order no other path uses, and would put lifecycleMu on every cached
 	// read. An atomic has neither cost.
 	reconcilerArmedAtNanos atomic.Int64
+	// staleServeLogAtNanos rate-limits the stale-serve refusal log, as
+	// UnixNano. Atomic because the refusal is evaluated under c.mu held for
+	// READING, where a plain timestamp field could not be updated without
+	// racing other readers.
+	staleServeLogAtNanos atomic.Int64
 
 	// latencyWindow holds the most recent reconciliation bd-list
 	// durations for adaptive cadence decisions. Bounded at
@@ -517,12 +522,140 @@ const dirtyOverlayMaxGets = 8
 // each unchanged per site). It never escapes the read site.
 var errDirtyOverlayFallback = errors.New("beads cache: dirty overlay fallback")
 
+const (
+	// cacheServeStaleFactor and cacheServeStaleFloor bound how long a cache
+	// that is SUPPOSED to be reconciling may go without completing a reconcile
+	// and still answer a read from its own snapshot.
+	//
+	// Refusing trades a silent wrong answer for a live read plus a visible
+	// degradation. That trade only pays past a generous bound, because the
+	// fallback is real backing I/O on a hot path: refuse eagerly under
+	// transient pressure and the controller sheds its cache exactly when the
+	// data plane can least absorb the load.
+	//
+	// The floor is 3x cacheReconcileMaxBackoff. A backing-store outage drives
+	// the reconciler to its 10-minute maximum backoff, so the cache must ride
+	// out several full retry cycles before it stops serving — below that the
+	// cure is worse than the disease, since refusing sends every read to the
+	// same backing store that is already failing.
+	//
+	// The factor is 4x the doctor watchdog's beadsCacheStaleFactor, so the
+	// beads-cache-reconcile alarm fires well before the serve path degrades.
+	// The order is the point: alarm first, degrade second. An operator should
+	// learn about a stalled reconciler from the watchdog, not by noticing a
+	// controller that quietly went uncached.
+	//
+	// Every measured occurrence is still caught with orders of magnitude to
+	// spare: the observed stalls were 3h31m, 4h34m, 35h41m and 43h.
+	cacheServeStaleFactor = 20
+	cacheServeStaleFloor  = 30 * time.Minute
+	// cacheStaleServeLogWindow rate-limits the refusal log. Staleness is
+	// evaluated on EVERY cached read, so an unlimited line here would be a log
+	// storm measured in thousands per minute rather than a signal.
+	cacheStaleServeLogWindow = 5 * time.Minute
+)
+
 // cacheServableLocked reports whether the active read model can answer from
-// cache: the cache is live or partial and the prime was not a partial error.
-// Dirty is no longer a serve-blocker — it is handled by readCacheWithOverlay.
+// cache: the cache is live or partial, the prime was not a partial error, and
+// the snapshot is not stale past the serve bound. Dirty is no longer a
+// serve-blocker — it is handled by readCacheWithOverlay.
 // Caller must hold c.mu (read or write).
 func (c *CachingStore) cacheServableLocked() bool {
-	return (c.state == cacheLive || c.state == cachePartial) && c.primePartialErr == nil
+	if (c.state != cacheLive && c.state != cachePartial) || c.primePartialErr != nil {
+		return false
+	}
+	return c.freshEnoughToServeLocked()
+}
+
+// freshEnoughToServeLocked is the staleness half of servability, split out so
+// the Ready gate — which has its own state and dependency requirements — can
+// apply the same bound without restating the rest of cacheServableLocked.
+//
+// Returning false is not an error: every caller of the gate takes its existing
+// backing-store fallback path (I5), so a refusal degrades the read from cached
+// to live rather than failing it. Caller must hold c.mu.
+func (c *CachingStore) freshEnoughToServeLocked() bool {
+	age, bound, stale := c.staleBeyondServeBoundLocked(time.Now())
+	if !stale {
+		return true
+	}
+	c.logStaleServeRefusal(age, bound)
+	return false
+}
+
+// staleBeyondServeBoundLocked reports whether this cache has gone so long
+// without completing a reconcile that answering from its snapshot would be a
+// confident wrong answer rather than a slightly old one. It returns the
+// measured age and the bound alongside the verdict so the caller can report
+// both without recomputing them.
+//
+// It says false for every store with a zero arm time — the whole CLI, test and
+// projection population. Those stores are not expected to reconcile at all,
+// and holding one to a reconcile schedule it was never given would refuse a
+// perfectly healthy cache.
+//
+// The clock floors at the arm time, because LastReconcileAt stays zero until
+// the first cycle COMPLETES and a successful prime does not set it. Without
+// the floor, every freshly armed store would read as infinitely stale and
+// refuse to serve from the moment it was wired up. Caller must hold c.mu.
+func (c *CachingStore) staleBeyondServeBoundLocked(now time.Time) (age, bound time.Duration, stale bool) {
+	armedAt := armedAtFromNanos(c.reconcilerArmedAtNanos.Load())
+	if armedAt.IsZero() {
+		return 0, 0, false
+	}
+	since := c.stats.LastReconcileAt
+	if since.Before(armedAt) {
+		since = armedAt
+	}
+	age = now.Sub(since)
+	bound = c.serveStaleBoundLocked()
+	return age, bound, age > bound
+}
+
+// serveStaleBoundLocked returns how long this store may go without completing
+// a reconcile before its snapshot stops being servable. It scales with the
+// store's own cadence so a LARGE-cadence store is not judged against a
+// SMALL-cadence store's expectations, and never drops below the floor.
+// Caller must hold c.mu.
+func (c *CachingStore) serveStaleBoundLocked() time.Duration {
+	interval := c.stats.CurrentReconcileInterval
+	if interval <= 0 {
+		interval = c.adaptiveIntervalLocked()
+	}
+	if bound := time.Duration(cacheServeStaleFactor) * interval; bound > cacheServeStaleFloor {
+		return bound
+	}
+	return cacheServeStaleFloor
+}
+
+// logStaleServeRefusal emits at most one line per cacheStaleServeLogWindow per
+// store.
+//
+// The window is enforced with an atomic compare-and-swap rather than a
+// mutex-guarded timestamp because this runs under c.mu held for READING: a
+// plain read-modify-write of a struct field there would be a data race between
+// concurrent readers. Losing the CAS means another reader is already emitting
+// this window's line, so dropping ours is the correct outcome, not a miss.
+//
+// Logging under c.mu follows recordProblemLocked, which already emits its own
+// rate-limited problem line while holding the lock for writing; this one holds
+// it only for reading and fires at most twelve times an hour.
+func (c *CachingStore) logStaleServeRefusal(age, bound time.Duration) {
+	now := time.Now()
+	prev := c.staleServeLogAtNanos.Load()
+	if prev != 0 && now.Sub(time.Unix(0, prev)) < cacheStaleServeLogWindow {
+		return
+	}
+	if !c.staleServeLogAtNanos.CompareAndSwap(prev, now.UnixNano()) {
+		return
+	}
+	rig := c.idPrefix
+	if rig == "" {
+		rig = "(no-prefix)"
+	}
+	log.Printf("beads cache: REFUSING to serve rig=%s from cache — no reconcile completed in %s "+
+		"(serve bound %s); reads fall back to the backing store until the reconciler recovers",
+		rig, age.Round(time.Second), bound)
 }
 
 // readCacheWithOverlay serves a cached read after refreshing only the dirty
