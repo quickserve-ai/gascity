@@ -55,7 +55,10 @@ type CachingStore struct {
 	// cadence (30 s) would still produce 2 lines/min — and at faster test
 	// cadences would flood logs. cacheReconcileSuccessLogWindow caps the
 	// rate at one line per minute, matching cacheProblemLogWindow.
-	lastReconcileLogAt     time.Time
+	lastReconcileLogAt time.Time
+	// lastOverdueLogAt rate-limits the reconcile-overdue line on its own
+	// window, independent of the problem log — see checkReconcileOverdue.
+	lastOverdueLogAt       time.Time
 	primeMu                sync.Mutex
 	primeRunning           bool
 	primeCycle             *fullPrimeCycle
@@ -122,6 +125,24 @@ type CacheStats struct {
 	LastProblemAt           time.Time
 	LastProblem             string
 	State                   string
+	// ReconcilerArmedAt is when StartReconciler last armed the reconcile
+	// loop. Zero means a reconciler was NEVER armed for this store — the
+	// suspended-rig opt-out builds exactly that. It is NOT cleared by
+	// StopReconciler, so a nonzero value means "was armed at some point",
+	// not "is running now". It exists so a consumer can tell "armed and
+	// never reconciled" (which the reconcile watchdog treats as overdue)
+	// apart from "never armed" (which is not a fault); LastReconcileAt
+	// alone is zero in both cases.
+	ReconcilerArmedAt time.Time
+	// ReconcileOverdueCount is how many watchdog ticks have found no
+	// completed reconcile inside the staleness bound, and
+	// LastReconcileOverdueAt is when the most recent such tick was. They are
+	// the watchdog's OWN counters: it deliberately does not report through
+	// recordProblemLocked, because that stamps LastProblemAt, which
+	// nextReconcileDelay uses as the retry-backoff anchor — see
+	// checkReconcileOverdue.
+	ReconcileOverdueCount  int64
+	LastReconcileOverdueAt time.Time
 	// StaggerOffsetMs is the one-shot startup delay applied between Prime
 	// and the first reconciler tick, in milliseconds. Set once when
 	// StartReconciler runs; zero if stagger is disabled.
@@ -1095,13 +1116,17 @@ func (c *CachingStore) StartReconciler(ctx context.Context, stagger StaggerOptio
 		return
 	}
 	c.cancelFn = cancel
-	c.lifecycleWG.Add(1)
+	// Two: the reconcile loop and the reconcile watchdog. Both deltas are
+	// registered inside the same critical section as the stopped check, so
+	// neither can race a concurrent StopReconciler's Wait.
+	c.lifecycleWG.Add(2)
 	c.lifecycleMu.Unlock()
 
 	offset := stagger.resolve(agentID)
 
 	c.mu.Lock()
 	c.stats.StaggerOffsetMs = offset.Milliseconds()
+	c.stats.ReconcilerArmedAt = time.Now()
 	c.mu.Unlock()
 
 	log.Printf("beads cache: stagger=%dms agent=%s", offset.Milliseconds(), agentID)
@@ -1109,6 +1134,14 @@ func (c *CachingStore) StartReconciler(ctx context.Context, stagger StaggerOptio
 	go func() {
 		defer c.lifecycleWG.Done()
 		c.reconcileLoop(ctx, offset)
+	}()
+
+	// The absence-of-heartbeat watchdog runs on its OWN goroutine, because the
+	// reconcile loop cannot detect its own death — the measured failure is that
+	// loop wedged inside a context-free backing.List (ga-yc0chj).
+	go func() {
+		defer c.lifecycleWG.Done()
+		c.startReconcileWatchdog(ctx)
 	}()
 }
 
