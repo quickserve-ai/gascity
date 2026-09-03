@@ -193,7 +193,7 @@ The split and the merge are both invisible to callers:
   falls back to whatever the committed metadata holds, so pre-existing session
   beads work with no migration step.
 
-Two consequences worth knowing:
+Three consequences worth knowing:
 
 - **`updated_at` on a session bead goes quiet.** Nothing touches the row between
   genuine status transitions. Code that needs a "last we heard from this
@@ -212,7 +212,7 @@ Two consequences worth knowing:
 
 `GC_SESSION_LIVENESS_STORE` controls this:
 
-| Value | Behaviour |
+| Value | Behavior |
 |---|---|
 | `table` (default) | Split writes as above. Liveness keys never reach the versioned table. |
 | `metadata` | Rollback. The full patch goes to versioned bead metadata exactly as before (restoring the commit churn); liveness keys are still mirrored into the table so the read overlay never shadows fresh committed values with frozen rows. |
@@ -220,7 +220,7 @@ Two consequences worth knowing:
 Reads always apply the overlay, in both modes — harmless when the table is
 empty, and what makes the flag reversible in both directions. A scope with no
 reachable Dolt endpoint (a `file` or `doltlite` provider, or a server that is
-down) degrades to the `metadata` behaviour on its own: liveness keeps working,
+down) degrades to the `metadata` behavior on its own: liveness keeps working,
 it just costs commits again until the endpoint comes back.
 
 ## Going further
