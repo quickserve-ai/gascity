@@ -35,12 +35,14 @@ const (
 
 // Drain-action reasons for the gc hook --claim result contract
 // (schemas/hook/result.schema.json). Every value here is a valid reason when
-// action is "drain": an idle store, an operational claim-write failure, a
+// action is "drain": an idle store, an operational claim-write failure, a pass
+// whose only claimable candidates were declined as foreign-instantiated, a
 // refused stale session, a refused non-turn invocation, or a seat whose session
 // row is already draining.
 const (
 	hookClaimReasonNoWork                     = "no_work"
 	hookClaimReasonClaimsErrored              = "claims_errored"
+	hookClaimReasonDeclinedForeign            = "declined_foreign"
 	hookClaimReasonStaleSession               = "stale_session"
 	hookClaimReasonNonTurnContext             = "non_turn_context"
 	hookClaimReasonDrainPending               = "drain_pending"
@@ -159,6 +161,10 @@ type hookClaimOptions struct {
 	Env                []string
 	DrainAck           bool
 	JSON               bool
+	// HostRoots are the filesystem roots this host instantiates formulas
+	// under, for the declined-foreign guard (ga-h4iqzr). Defaulted from
+	// hookClaimHostRoots() when nil; settable for tests.
+	HostRoots []string
 }
 
 // continuationPinAssignee returns the identity a continuation sibling is pinned
@@ -205,6 +211,10 @@ type hookClaimOps struct {
 	// EmitClaimRejected publishes a bead.claim_rejected event when a claim is
 	// lost to a different live claimant (ADR-0009). Best-effort.
 	EmitClaimRejected hookEmitClaimRejectedFunc
+	// OwnerSessionLive answers whether the session a candidate records as its
+	// executor is still live, for the declined-live-owner guard (ga-pzop1c).
+	// Nil disables the guard (non-session invocations and legacy callers).
+	OwnerSessionLive hookOwnerSessionProbe
 	// ResolveWorkBranch returns the git branch of the worker's worktree, stamped
 	// onto the bead as gc.work_branch at claim time. It is handed a tree that
 	// already carries the repository it resolved to, so the branch comes from the
@@ -295,6 +305,10 @@ type hookClaimJSONResult struct {
 	ContinuationGroup    string   `json:"continuation_group,omitempty"`
 	ContinuationAssigned []string `json:"continuation_assigned,omitempty"`
 	DrainAcknowledged    bool     `json:"drain_acknowledged,omitempty"`
+	// DeclinedForeign counts routed candidates declined by the cross-town
+	// invariant (ga-h4iqzr) during the pass that ended in this drain. The
+	// feeder detector consumes this count; it is never silently dropped.
+	DeclinedForeign int `json:"declined_foreign,omitempty"`
 }
 
 // hookClaimResult is the outcome of attempting a claim against one store's
@@ -317,6 +331,10 @@ type hookClaimResult struct {
 	// see-but-cannot-claim shape — is not laundered into an idle signal.
 	// Meaningless on a terminal result.
 	claimsErrored bool
+	// declinedForeign counts candidates declined by the cross-town invariant
+	// (ga-h4iqzr) on a NON-terminal result, so the shared drain can carry the
+	// countable declined-foreign fact instead of laundering it into no_work.
+	declinedForeign int
 }
 
 func doHookClaim(workQuery, dir string, opts hookClaimOptions, ops hookClaimOps, stdout, stderr io.Writer) int {
@@ -324,7 +342,7 @@ func doHookClaim(workQuery, dir string, opts hookClaimOptions, ops hookClaimOps,
 	if res.terminal {
 		return res.code
 	}
-	return writeHookClaimNoWork(opts, ops, res.claimsErrored, dir, stdout, stderr)
+	return writeHookClaimNoWork(opts, ops, res.claimsErrored, res.declinedForeign, dir, stdout, stderr)
 }
 
 // tryHookClaim runs the work query for one store (dir, via ops.Runner) and
@@ -338,6 +356,9 @@ func tryHookClaim(workQuery, dir string, opts *hookClaimOptions, ops *hookClaimO
 	opts.Assignee = strings.TrimSpace(opts.Assignee)
 	opts.IdentityCandidates = hookClaimIdentityCandidates(append([]string{opts.Assignee}, opts.IdentityCandidates...)...)
 	opts.RouteTargets = hookClaimRouteTargets(opts.RouteTargets...)
+	if opts.HostRoots == nil {
+		opts.HostRoots = hookClaimHostRoots()
+	}
 	if opts.Assignee == "" {
 		fmt.Fprintln(stderr, "gc hook --claim: assignee not specified (set $GC_SESSION_NAME or $GC_SESSION_ID)") //nolint:errcheck
 		return hookClaimResult{terminal: true, code: 1}
@@ -760,13 +781,37 @@ func claimFirstEligibleHookCandidate(candidates []beads.Bead, opts hookClaimOpti
 	defer cancel()
 	claimsErrored := false
 	now := ops.nowOrWallClock()
+	var declinedForeign []string
+	var declinedLiveOwner []string
 	for _, candidate := range candidates {
 		if !hookCandidateClaimable(candidate, opts.RouteTargets, now) {
 			continue
 		}
+		// Cross-town invariant (ga-h4iqzr / R2a): never claim a molecule
+		// instantiated for another host unless its formula declares
+		// path_agnostic. Declined loudly and counted — never a silent skip.
+		if src, foreign := hookCandidateForeignSource(candidate, opts.HostRoots); foreign {
+			declinedForeign = append(declinedForeign, candidate.ID+"="+src)
+			continue
+		}
+		// Live-owner invariant (ga-pzop1c): a bead can read as unassigned (a
+		// reaper cleared assignee/status) while its gc.session_id still names a
+		// live session mid-work in the bead's worktree. Claiming it puts two
+		// live sessions in one worktree. Decline while the recorded session is
+		// live, and decline (fail closed) when its liveness cannot be read.
+		if owner := hookCandidateRecordedSession(candidate, hookClaimSessionID(opts.Env)); owner != "" && ops.OwnerSessionLive != nil {
+			if verdict, reason := ops.OwnerSessionLive(owner); verdict != hookOwnerSessionGone {
+				declinedLiveOwner = append(declinedLiveOwner, fmt.Sprintf("%s=%s (%s)", candidate.ID, owner, reason))
+				continue
+			}
+		}
 		// F-B. The fresh-claim CAS is the mutation that mints a new obligation,
-		// so it is the one the turn-binding window most directly guards.
+		// so it is the one the turn-binding window most directly guards. The
+		// declines above mutate nothing, so they run first and are still
+		// reported when the window refuses.
 		if ops.claimWindowSpent() {
+			reportDeclinedForeign(stderr, declinedForeign)
+			reportDeclinedLiveOwner(stderr, declinedLiveOwner)
 			return refuseExpiredHookClaimWindow(candidate.ID, ops, stderr)
 		}
 		if ctx.Err() != nil {
@@ -842,10 +887,14 @@ func claimFirstEligibleHookCandidate(candidates []beads.Bead, opts hookClaimOpti
 		if result.Assignee == "" {
 			result.Assignee = opts.Assignee
 		}
+		reportDeclinedForeign(stderr, declinedForeign)
+		reportDeclinedLiveOwner(stderr, declinedLiveOwner)
 		return hookClaimResult{terminal: true, code: writeHookClaimWorkResultForBead(result, claimed, opts, ops, dir, true, stdout, stderr)}
 	}
 
-	return hookClaimResult{claimsErrored: claimsErrored}
+	reportDeclinedForeign(stderr, declinedForeign)
+	reportDeclinedLiveOwner(stderr, declinedLiveOwner)
+	return hookClaimResult{claimsErrored: claimsErrored, declinedForeign: len(declinedForeign)}
 }
 
 // mergeHookClaimCandidateMetadata retains work-query metadata when bd update
@@ -968,30 +1017,6 @@ func hookClaimExistingAssignment(candidates []beads.Bead, opts hookClaimOptions)
 				Route:         hookClaimRoute(candidate),
 			}
 			return result, candidate, true
-		}
-	}
-	return hookClaimJSONResult{}, beads.Bead{}, false
-}
-
-func hookClaimExistingOrAssigned(candidates []beads.Bead, opts hookClaimOptions) (hookClaimJSONResult, beads.Bead, bool) {
-	if result, candidate, ok := hookClaimExistingAssignment(candidates, opts); ok {
-		return result, candidate, true
-	}
-	for _, candidate := range candidates {
-		if hookClaimCandidateIsMessage(candidate) {
-			continue
-		}
-		if strings.EqualFold(strings.TrimSpace(candidate.Status), "open") && hookClaimHasIdentity(candidate.Assignee, opts.IdentityCandidates) {
-			return hookClaimJSONResult{
-				SchemaVersion: "1",
-				OK:            true,
-				Command:       hookClaimCommandName,
-				Action:        "work",
-				Reason:        "ready_assignment",
-				BeadID:        candidate.ID,
-				Assignee:      candidate.Assignee,
-				Route:         hookClaimRoute(candidate),
-			}, candidate, true
 		}
 	}
 	return hookClaimJSONResult{}, beads.Bead{}, false
@@ -1137,17 +1162,25 @@ func unwindUndeliveredHookClaim(reason, cause string, bead beads.Bead, opts hook
 // "claims_errored" when claimsErrored is set — ready work existed but every
 // eligible claim mutation errored — so an operational write failure stays
 // distinguishable from idle even though both still drain and reclaim next tick.
+// It is "declined_foreign" when declinedForeign candidates were refused by the
+// cross-town invariant (ga-h4iqzr) and no claim errored; the count rides on the
+// drain record either way.
 //
 // dir is the store context the diagnostics classification reads through; it is
 // used ONLY after the drain has been written. See recordDemandClaimDivergence:
 // a demand-spawned seat draining empty is either correct pull or a broken
 // agreement invariant, and the drain itself cannot tell an operator which.
-func writeHookClaimNoWork(opts hookClaimOptions, ops hookClaimOps, claimsErrored bool, dir string, stdout, stderr io.Writer) int {
+func writeHookClaimNoWork(opts hookClaimOptions, ops hookClaimOps, claimsErrored bool, declinedForeign int, dir string, stdout, stderr io.Writer) int {
+	// Reason precedence: an operational write failure outranks the invariant
+	// decline (it needs a responder), and both outrank a healthy no_work.
 	reason := hookClaimReasonNoWork
+	if declinedForeign > 0 {
+		reason = hookClaimReasonDeclinedForeign
+	}
 	if claimsErrored {
 		reason = hookClaimReasonClaimsErrored
 	}
-	code := writeHookClaimDrain(hookClaimLabel, reason, opts.JSON, opts.DrainAck, ops.DrainAck, stdout, stderr)
+	code := writeHookClaimDrain(hookClaimLabel, reason, declinedForeign, opts.JSON, opts.DrainAck, ops.DrainAck, stdout, stderr)
 	// Strictly after the result: the drain is already written and its exit code
 	// is already decided, so nothing below can influence either.
 	if reason == hookClaimReasonNoWork {
@@ -1208,7 +1241,7 @@ func writeHookClaimDrainPending(label, sessionID string, opts hookClaimOptions, 
 		"%s: drain pending for this session; run: gc runtime drain-ack %s — then exit\n",
 		label, sessionID)
 
-	return writeHookClaimDrain(label, hookClaimReasonDrainPending, opts.JSON, opts.DrainAck, ops.DrainAck, stdout, stderr)
+	return writeHookClaimDrain(label, hookClaimReasonDrainPending, 0, opts.JSON, opts.DrainAck, ops.DrainAck, stdout, stderr)
 }
 
 // writeHookClaimStaleSessionDrain emits the terminal result for a refused stale
@@ -1219,7 +1252,7 @@ func writeHookClaimDrainPending(label, sessionID string, opts hookClaimOptions, 
 // acknowledges drain and exits cleanly rather than seeing a bare exit 1 and
 // retrying the refusal forever.
 func writeHookClaimStaleSessionDrain(opts hookCommandOptions, stdout, stderr io.Writer) int {
-	return writeHookClaimDrain(hookClaimLabel, hookClaimReasonStaleSession, opts.JSON, opts.DrainAck, hookRuntimeDrainAck, stdout, stderr)
+	return writeHookClaimDrain(hookClaimLabel, hookClaimReasonStaleSession, 0, opts.JSON, opts.DrainAck, hookRuntimeDrainAck, stdout, stderr)
 }
 
 // writeHookClaimMissingSessionRegistrationDrain emits the terminal result for a
@@ -1230,7 +1263,7 @@ func writeHookClaimStaleSessionDrain(opts hookCommandOptions, stdout, stderr io.
 // distinct reason so a wrapper or dashboard can tell "never registered" apart
 // from "registered, then went stale."
 func writeHookClaimMissingSessionRegistrationDrain(opts hookCommandOptions, stdout, stderr io.Writer) int {
-	return writeHookClaimDrain(hookClaimLabel, hookClaimReasonMissingSessionRegistration, opts.JSON, opts.DrainAck, hookRuntimeDrainAck, stdout, stderr)
+	return writeHookClaimDrain(hookClaimLabel, hookClaimReasonMissingSessionRegistration, 0, opts.JSON, opts.DrainAck, hookRuntimeDrainAck, stdout, stderr)
 }
 
 // writeHookClaimDrain writes the single structured drain result shared by every
@@ -1245,13 +1278,17 @@ func writeHookClaimMissingSessionRegistrationDrain(opts hookCommandOptions, stdo
 // caller but the drain-pending fence is claim-only, but that fence is reachable
 // through the DISCOVERY door too, and a hardcoded prefix would report the wrong
 // command to the operator reading the pane.
-func writeHookClaimDrain(label, reason string, jsonOut, drainAck bool, drainAckFn hookDrainAckFunc, stdout, stderr io.Writer) int {
+//
+// declinedForeign is the cross-town decline count (ga-h4iqzr) the record
+// carries; only the no-work drain can have a nonzero one.
+func writeHookClaimDrain(label, reason string, declinedForeign int, jsonOut, drainAck bool, drainAckFn hookDrainAckFunc, stdout, stderr io.Writer) int {
 	result := hookClaimJSONResult{
-		SchemaVersion: "1",
-		OK:            true,
-		Command:       hookClaimCommandName,
-		Action:        "drain",
-		Reason:        reason,
+		SchemaVersion:   "1",
+		OK:              true,
+		Command:         hookClaimCommandName,
+		Action:          "drain",
+		Reason:          reason,
+		DeclinedForeign: declinedForeign,
 	}
 	// A FAILED ack no longer swallows the drain record.
 	//
@@ -1515,8 +1552,15 @@ func hookClaimIdentityPatch(bead beads.Bead, opts hookClaimOptions, ops hookClai
 		patch[beadmeta.WorkBranchMetadataKey] = branch
 	}
 	if sessionID != "" && !isControl {
-		if strings.TrimSpace(bead.Metadata[beadmeta.SessionIDMetadataKey]) != sessionID {
+		if prior := strings.TrimSpace(bead.Metadata[beadmeta.SessionIDMetadataKey]); prior != sessionID {
 			patch[beadmeta.SessionIDMetadataKey] = sessionID
+			// Takeover of a bead another session executed: preserve the
+			// displaced back-reference so recovery can detect the handover
+			// instead of finding the prior owner erased (ga-pzop1c). The
+			// live-owner guard has already established that session is gone.
+			if prior != "" {
+				patch[beadmeta.PrevSessionIDMetadataKey] = prior
+			}
 		}
 		if sessionName := hookClaimSessionName(opts.Env); sessionName != "" &&
 			strings.TrimSpace(bead.Metadata[beadmeta.SessionNameMetadataKey]) != sessionName {
