@@ -29,10 +29,19 @@ import (
 // Dolt at all (file / doltlite provider, and every unit test working in a temp
 // dir) resolves non-authoritative and gets a nil binding.
 
-// livenessOpenRetryInterval bounds how often a failed liveness open is retried.
+// livenessOpenRetryInterval bounds how often a REACHABILITY failure is retried.
 // Without it a scope whose Dolt server is briefly down would re-dial on every
 // single store operation.
 const livenessOpenRetryInterval = 30 * time.Second
+
+// livenessNoEndpointRetryInterval bounds how often a scope with NO Dolt endpoint
+// re-resolves. Such a scope — a file/doltlite provider, an unconfigured scope, a
+// test temp dir — cannot acquire one without a config change, so retrying it on
+// the reachability cadence is pure waste: it re-reads the scope's config files
+// every 30 seconds, forever, for every scope the process ever touched. A long
+// interval still lets a genuine config change be picked up eventually without
+// making a no-Dolt city pay for the check.
+const livenessNoEndpointRetryInterval = 10 * time.Minute
 
 // livenessOpenTimeout bounds the dial + schema-seed round trip.
 const livenessOpenTimeout = 10 * time.Second
@@ -52,6 +61,7 @@ type livenessBinding struct {
 	mu          sync.Mutex
 	store       liveness.Store
 	lastAttempt time.Time
+	retryAfter  time.Duration
 	dialing     bool
 	warned      bool
 }
@@ -104,10 +114,11 @@ func (b *livenessBinding) Mode() liveness.Mode {
 	return b.mode
 }
 
-// Store returns the live liveness store, opening it on first use and retrying a
-// failed open no more than once per livenessOpenRetryInterval. It returns nil
-// whenever liveness is unavailable — callers treat nil as "pass everything
-// through to versioned metadata".
+// Store returns the live liveness store, opening it on first use and backing off
+// after a failure (livenessOpenRetryInterval when the endpoint exists but could
+// not be reached, livenessNoEndpointRetryInterval when there is no endpoint at
+// all). It returns nil whenever liveness is unavailable — callers treat nil as
+// "pass everything through to versioned metadata".
 //
 // Only the FIRST dial is synchronous, and the binding's lock is never held
 // across it. Every retry after a failure runs in the background and Store()
@@ -126,7 +137,7 @@ func (b *livenessBinding) Store() liveness.Store {
 		b.mu.Unlock()
 		return store
 	}
-	if b.dialing || (!b.lastAttempt.IsZero() && time.Since(b.lastAttempt) < livenessOpenRetryInterval) {
+	if b.dialing || (!b.lastAttempt.IsZero() && time.Since(b.lastAttempt) < b.retryAfter) {
 		b.mu.Unlock()
 		return nil
 	}
@@ -150,6 +161,12 @@ func (b *livenessBinding) dial() liveness.Store {
 	defer b.mu.Unlock()
 	b.dialing = false
 	if err != nil {
+		// A scope with no endpoint cannot acquire one without a config change, so
+		// it backs off far harder than a server that is merely unreachable.
+		b.retryAfter = livenessOpenRetryInterval
+		if errors.Is(err, errNoLivenessEndpoint) {
+			b.retryAfter = livenessNoEndpointRetryInterval
+		}
 		// A scope with no Dolt endpoint at all — a file/doltlite provider, or any
 		// test working in a temp dir — is the expected steady state, not a
 		// degradation: log nothing. Only a scope that HAS an endpoint and could
