@@ -1601,16 +1601,26 @@ func openStoreResultAtForCityWithAuthority(storePath, cityPath string, modeOverr
 // project pool; every other open is a one-shot CLI open and takes the
 // single-connection cap from nativeDoltOneShotOpenEnvForScope.
 func openStoreResultAtForCityWithConfig(storePath, cityPath string, cfg *config.City, modeOverride gate.Mode, haveMode, authoritative, longLived bool) (beads.StoreOpenResult, error) {
+	return openStoreResultAtForCityWithConfigOptions(storePath, cityPath, cfg, modeOverride, haveMode, authoritative, longLived, true)
+}
+
+// openStoreResultAtForCityWithConfigOptions is openStoreResultAtForCityWithConfig
+// with the builtin-cache readiness pass made optional. ensureAssets=false is
+// for the controller's reload schema preflight, which must decide whether to
+// hold reconciliation without first mutating pack artifacts (ga-mw4dg).
+func openStoreResultAtForCityWithConfigOptions(storePath, cityPath string, cfg *config.City, modeOverride gate.Mode, haveMode, authoritative, longLived, ensureAssets bool) (beads.StoreOpenResult, error) {
 	runtimeCityPath := cityPath
 	if runtimeCityPath == "" {
 		runtimeCityPath = cityForStoreDir(storePath)
 	}
 	if cfg == nil {
 		cfg, _ = loadCityConfig(runtimeCityPath, io.Discard)
-	} else {
+	} else if ensureAssets {
 		// Loading the config would have run the builtin-cache readiness pass.
 		// Reusing one must not skip that self-heal for a city this process has
-		// never readied.
+		// never readied. The reload schema preflight is the one exception: that
+		// safety probe must not mutate pack artifacts before deciding whether
+		// reconciliation must be held.
 		_ = ensureBuiltinRuntimeAssetsForSuppliedConfig(runtimeCityPath, io.Discard)
 	}
 	scopeRoot := resolveStoreScopeRoot(runtimeCityPath, storePath)
@@ -1695,9 +1705,9 @@ func openStoreResultAtForCityWithConfig(storePath, cityPath string, cfg *config.
 		},
 	})
 	if err != nil {
-		return beads.StoreOpenResult{}, err
+		return result, err
 	}
-	result.Store = wrapStoreWithBeadPolicies(result.Store, cfg)
+	result.Store = wrapStoreWithBeadPolicies(result.Store, cfg, sessionLivenessFor(runtimeCityPath, scopeRoot))
 	return result, nil
 }
 
