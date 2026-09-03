@@ -160,10 +160,16 @@ func (b *livenessBinding) Store() liveness.Store {
 	return b.dial()
 }
 
+// openScopeLivenessStoreFn is the dialer dial() calls. A package var so a test
+// can drive the REAL dial-and-install path — the one that has to capture the
+// clock offset — without standing up a whole authoritative scope config just to
+// reach it.
+var openScopeLivenessStoreFn = openScopeLivenessStore
+
 // dial performs one open attempt and installs the result. It runs with the lock
 // released; b.dialing keeps a second attempt from starting alongside it.
 func (b *livenessBinding) dial() liveness.Store {
-	store, err := openScopeLivenessStore(b.cityPath, b.scopeRoot)
+	store, err := openScopeLivenessStoreFn(b.cityPath, b.scopeRoot)
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.dialing = false
@@ -187,10 +193,19 @@ func (b *livenessBinding) dial() liveness.Store {
 	}
 	if b.store != nil {
 		// Another dial won the race; drop this handle rather than leaking it.
+		// Its offset is not recorded either: the winner already recorded one
+		// from the handle that is actually installed, and this one is about to
+		// be closed.
 		_ = store.Close()
 		return b.store
 	}
 	b.store = store
+	// Record the skew from the store we are INSTALLING, while it is alive. This
+	// is the production path's only chance: after a pool retirement there is no
+	// store left to ask, and an unrecorded offset silently sends Now() — and so
+	// every fence stamp minted while the endpoint is down — back to the raw local
+	// clock, in the wrong timebase for the server-minted written_at it fences.
+	b.rememberClockOffset(store)
 	b.warned = false
 	return b.store
 }
@@ -216,7 +231,9 @@ func (b *livenessBinding) Now() time.Time {
 }
 
 // rememberClockOffset records the skew a live store reports so Now() keeps
-// returning server time after that store is retired.
+// returning server time after that store is retired. Callers hold b.mu (dial
+// and setStoreForTest do; newLivenessBindingForTest has not published the
+// binding yet).
 func (b *livenessBinding) rememberClockOffset(store liveness.Store) {
 	if b == nil || store == nil {
 		return
