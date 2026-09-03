@@ -15,6 +15,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/liveness"
 	"github.com/gastownhall/gascity/internal/prguard"
 	"github.com/spf13/cobra"
 )
@@ -87,11 +88,16 @@ city store and disables rig auto-detection (GC_RIG, cwd, bead prefix), so a
 deliberate city-scoped query is never silently downgraded to a rig store.
 
 All arguments after "gc bd" are forwarded to bd unchanged, except the
-gc-only "heartbeat <issue-id>" subcommand, which rewrites to
-"update <issue-id> --set-metadata gc.last_heartbeat_at=<RFC3339 UTC now>"
-so long-running workers can signal liveness to the dashboard, and
-"release-if-current <issue-id> <assignee>", which conditionally resets an
-in-progress assignment only when the bead still has that assignee.
+gc-only "heartbeat <issue-id>" subcommand, which stamps
+gc.last_heartbeat_at=<RFC3339 UTC now> so long-running workers can signal
+liveness to the dashboard, and "release-if-current <issue-id> <assignee>",
+which conditionally resets an in-progress assignment only when the bead
+still has that assignee.
+
+heartbeat writes to the non-versioned session_liveness table, so it mints no
+Dolt commit. Set GC_SESSION_LIVENESS_STORE=metadata to roll back to the legacy
+"bd update --set-metadata" form (which commits on every beat); the legacy form
+is also used automatically when the scope has no reachable Dolt endpoint.
 
 gc bd forces BD_EXPORT_AUTO=false to prevent bd's git auto-export hook
 from wedging the wrapper after printing command output. If you need
@@ -171,6 +177,54 @@ func warnExternalBdOverrideDrift(stderr io.Writer, cityPath string, target execS
 	_, _ = fmt.Fprintf(stderr, "gc bd: warning: ignoring ambient Dolt host/port override for external target: %s\n", strings.Join(drift, ", "))
 }
 
+// parseBdHeartbeatArgs recognizes the gc-only `heartbeat <issue-id>` subcommand
+// and returns the bead id. It applies exactly the validation
+// rewriteBdHeartbeatArgs applies, so both heartbeat paths accept and reject the
+// same argument shapes.
+func parseBdHeartbeatArgs(bdArgs []string) (id string, ok bool, err error) {
+	if len(bdArgs) == 0 || bdArgs[0] != "heartbeat" {
+		return "", false, nil
+	}
+	rest := bdArgs[1:]
+	if len(rest) != 1 || rest[0] == "" || strings.HasPrefix(rest[0], "-") ||
+		strings.IndexFunc(rest[0], unicode.IsSpace) >= 0 {
+		return "", true, fmt.Errorf("usage: gc bd heartbeat <issue-id>")
+	}
+	return rest[0], true, nil
+}
+
+// doBdHeartbeatThroughLiveness writes gc.last_heartbeat_at straight to the
+// non-versioned session_liveness table instead of shelling `bd update`.
+//
+// This is the single largest remaining source of session-bead Dolt commits:
+// every `gc bd heartbeat` shelled to bd, whose UpdateIssue commits
+// unconditionally, so a fleet of long-running workers minted a permanent
+// ~840 KB commit per heartbeat for a value that is pure liveness telemetry.
+//
+// Reported as handled=false — meaning "fall through to the legacy bd path" —
+// whenever the liveness table is not usable for this scope: the rollback flag is
+// set to metadata, no Dolt endpoint resolves, or the write itself failed. A
+// heartbeat that costs a commit is strictly better than a heartbeat the
+// dashboard never sees, so availability wins over the commit saving here.
+func doBdHeartbeatThroughLiveness(cityPath string, target execStoreTarget, beadID string, stderr io.Writer) (code int, handled bool) {
+	binding := sessionLivenessFor(cityPath, target.ScopeRoot)
+	if binding.Mode() != liveness.ModeTable {
+		return 0, false
+	}
+	store := binding.Store()
+	if store == nil {
+		return 0, false
+	}
+	ctx, cancel := livenessOpContext()
+	defer cancel()
+	stamp := bdHeartbeatNow().UTC().Format(time.RFC3339)
+	if err := store.SetBatch(ctx, beadID, map[string]string{heartbeatMetadataKey: stamp}); err != nil {
+		fmt.Fprintf(stderr, "gc bd heartbeat: liveness write failed, falling back to bd: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 0, false
+	}
+	return 0, true
+}
+
 // rewriteBdHeartbeatArgs expands the gc-only `heartbeat <issue-id>`
 // subcommand into the bd command that performs the write:
 //
@@ -201,7 +255,17 @@ func rewriteBdHeartbeatArgs(bdArgs []string) ([]string, error) {
 func doBd(args []string, stdout, stderr io.Writer) int {
 	cityName, rigName, bdArgs := extractBdScopeFlags(args)
 
-	bdArgs, err := rewriteBdHeartbeatArgs(bdArgs)
+	// Recognize the heartbeat form BEFORE the rewrite so the liveness path below
+	// still has the bead id. The rewrite still runs: the rewritten args are what
+	// routes the write to the correct scope, and they remain the fallback when
+	// the liveness table is unavailable.
+	heartbeatID, isHeartbeat, err := parseBdHeartbeatArgs(bdArgs)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc bd: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+
+	bdArgs, err = rewriteBdHeartbeatArgs(bdArgs)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc bd: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -228,6 +292,11 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "gc bd: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
+	}
+	if isHeartbeat {
+		if code, handled := doBdHeartbeatThroughLiveness(cityPath, target, heartbeatID, stderr); handled {
+			return code
+		}
 	}
 	if id, expectedAssignee, ok, err := parseBdReleaseIfCurrentArgs(bdArgs); ok || err != nil {
 		if err != nil {
