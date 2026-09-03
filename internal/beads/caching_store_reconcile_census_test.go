@@ -134,6 +134,20 @@ func TestMergeOracleFieldCoverage(t *testing.T) {
 		// cached one, which the IncludeClosed=false scan does not do. Its
 		// exactly-once behavior is pinned by caching_store_close_event_test.go.
 		"unannouncedCloses": true, "hasUnannouncedCloses": true,
+		// Reconcile-liveness publishing (ga-yc0chj). Both are lifecycle
+		// state, not merge state: they are written once at arm time (the
+		// sink under lifecycleMu, the arm clock atomically) and only READ
+		// by the merge path — via publishReconcileHeartbeat, after c.mu is
+		// released, and via the serve-staleness gate, which reads the arm
+		// clock but never writes it. The merge oracle compares end-state
+		// the merge PRODUCES; neither field is produced by it, and the
+		// snapshot they publish is assembled from stats fields the oracle
+		// already compares.
+		// staleServeLogAtNanos is likewise not merge state: it is a
+		// rate-limiter clock for the serve-staleness refusal log, touched
+		// only by readers.
+		"heartbeatSink": true, "reconcilerArmedAtNanos": true,
+		"staleServeLogAtNanos": true,
 	}
 	assertFieldsClassified(t, reflect.TypeOf(CachingStore{}), comparedStore, excludedStore)
 
