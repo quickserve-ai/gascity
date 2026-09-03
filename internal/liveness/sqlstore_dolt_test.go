@@ -296,14 +296,27 @@ func TestSQLStoreAgainstDolt(t *testing.T) {
 		// UNCALIBRATED local clock could fail to fence on a Dolt host whose clock
 		// differs. Calibrate() is what makes the two comparable; this proves the
 		// round trip on a real server.
+		//
+		// The stamps are SEPARATED from the write by a margin. Calibrate estimates
+		// the offset from one round trip, so it carries that round trip's own
+		// asymmetry as error — a few milliseconds on a busy machine. Comparing a
+		// stamp against a row written microseconds away measures that error, not
+		// the fence. Production never has that shape: a fallback stamp is minted
+		// when the endpoint has gone away, whole seconds after the last row it has
+		// to fence.
+		const margin = 250 * time.Millisecond
 		calibrated := NewSQLStore(server.connect(t))
 		if err := calibrated.Calibrate(ctx); err != nil {
 			t.Fatalf("Calibrate: %v", err)
 		}
 		before := calibrated.Now()
+		time.Sleep(margin)
 		if err := calibrated.SetBatch(ctx, "gc-fence", map[string]string{"state": "active"}); err != nil {
 			t.Fatalf("SetBatch: %v", err)
 		}
+		time.Sleep(margin)
+		after := calibrated.Now()
+
 		snap, err := calibrated.Get(ctx, "gc-fence")
 		if err != nil {
 			t.Fatalf("Get: %v", err)
@@ -317,7 +330,6 @@ func TestSQLStoreAgainstDolt(t *testing.T) {
 			t.Errorf("written_at %v is not after the pre-write stamp %v; the fence would drop a fresh row", written, before)
 		}
 		// ...and one taken AFTER must fence it.
-		after := calibrated.Now()
 		if written.After(after) {
 			t.Errorf("written_at %v is after a post-write stamp %v; the fence would keep a stale row", written, after)
 		}
