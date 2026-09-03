@@ -121,6 +121,87 @@ func TestDoBdHeartbeatThroughLivenessWritesTheTableInsteadOfShellingBd(t *testin
 	}
 }
 
+// TestHeartbeatRetriesTheOverlayMarkerAfterItFails is the round-2
+// fix-before-merge: "already seeded?" must be read from the store's COMMITTED
+// metadata, never from the bead the policy store returned. That bead's
+// gc.last_heartbeat_at is the OVERLAID value — the row this very beat wrote — so
+// it reads non-empty on every beat whether or not a marker ever committed.
+// Keyed on that, a marker write that failed on beat #1 was never retried and the
+// bead stayed invisible to beadMayCarryLiveness on List paths for its whole life.
+func TestHeartbeatRetriesTheOverlayMarkerAfterItFails(t *testing.T) {
+	resetSessionLivenessBindingsForTest()
+	t.Cleanup(resetSessionLivenessBindingsForTest)
+
+	cityPath := t.TempDir()
+	scopeRoot := filepath.Join(cityPath, "rigs", "demo")
+	lv := liveness.NewMemStore()
+	sessionLivenessFor(cityPath, scopeRoot).setStoreForTest(lv, liveness.ModeTable)
+
+	backing := &markerFailingStore{MemStore: beads.NewMemStore(), fail: true}
+	store := wrapStoreWithBeadPolicies(backing, &config.City{})
+	orig := heartbeatBeadStoreOpener
+	t.Cleanup(func() { heartbeatBeadStoreOpener = orig })
+	heartbeatBeadStoreOpener = func(string, string, *config.City) (beads.Store, error) { return store, nil }
+
+	created, err := store.Create(beads.Bead{Title: "worker task", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	var stderr bytes.Buffer
+	// Beat #1: the beat lands, the marker write fails.
+	if _, handled := doBdHeartbeatThroughLiveness(cityPath, nil, execStoreTarget{ScopeRoot: scopeRoot}, created.ID, &stderr); !handled {
+		t.Fatalf("beat #1 was not handled by the liveness path (stderr: %q)", stderr.String())
+	}
+	if backing.markerAttempts != 1 {
+		t.Fatalf("markerAttempts = %d after beat #1, want 1", backing.markerAttempts)
+	}
+
+	// Beat #2 must RETRY it. The bead now reads a non-empty overlaid
+	// gc.last_heartbeat_at (beat #1's row), which is exactly the value the old
+	// check mistook for "already committed".
+	backing.fail = false
+	if _, handled := doBdHeartbeatThroughLiveness(cityPath, nil, execStoreTarget{ScopeRoot: scopeRoot}, created.ID, &stderr); !handled {
+		t.Fatalf("beat #2 was not handled by the liveness path")
+	}
+	if backing.markerAttempts != 2 {
+		t.Fatalf("markerAttempts = %d after beat #2, want 2 — a failed marker is never retried and the bead stays invisible to List overlays", backing.markerAttempts)
+	}
+
+	// Beat #3 finds a committed marker and leaves it alone: one commit per bead
+	// for its whole life, not one per beat.
+	if _, handled := doBdHeartbeatThroughLiveness(cityPath, nil, execStoreTarget{ScopeRoot: scopeRoot}, created.ID, &stderr); !handled {
+		t.Fatalf("beat #3 was not handled by the liveness path")
+	}
+	if backing.markerAttempts != 2 {
+		t.Fatalf("markerAttempts = %d after beat #3, want 2 — a committed marker must not be rewritten on every beat", backing.markerAttempts)
+	}
+	committed, err := backing.Get(created.ID)
+	if err != nil {
+		t.Fatalf("backing Get: %v", err)
+	}
+	if committed.Metadata[heartbeatMetadataKey] == "" {
+		t.Fatalf("no marker was ever committed; List reads stay stale forever")
+	}
+}
+
+// markerFailingStore fails the one-time overlay-marker write while it is armed.
+type markerFailingStore struct {
+	*beads.MemStore
+	fail           bool
+	markerAttempts int
+}
+
+func (s *markerFailingStore) SetMetadata(id, key, value string) error {
+	if key == heartbeatMetadataKey {
+		s.markerAttempts++
+		if s.fail {
+			return errors.New("commit refused")
+		}
+	}
+	return s.MemStore.SetMetadata(id, key, value)
+}
+
 // TestDoBdHeartbeatRejectsAnUnknownBead is the review's fix-before-merge B: the
 // legacy path inherited non-zero-exit-on-unknown-id from `bd update`, and the
 // liveness path must not silently exit 0 while writing an orphan row.

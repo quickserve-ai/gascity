@@ -226,8 +226,10 @@ func doBdHeartbeatThroughLiveness(cityPath string, cfg *config.City, target exec
 		fmt.Fprintf(stderr, "gc bd heartbeat: cannot verify %s, falling back to bd: %v\n", beadID, err) //nolint:errcheck // best-effort stderr
 		return 0, false
 	}
-	bead, err := beadStore.Get(beadID)
-	if errors.Is(err, beads.ErrNotFound) {
+	// Only existence is read here; the bead itself is deliberately not reused —
+	// see seedHeartbeatOverlayMarker for why its metadata cannot answer whether
+	// the overlay marker was ever committed.
+	if _, err = beadStore.Get(beadID); errors.Is(err, beads.ErrNotFound) {
 		fmt.Fprintf(stderr, "gc bd heartbeat: no issue found: %s\n", beadID) //nolint:errcheck // best-effort stderr
 		return 1, true
 	}
@@ -243,7 +245,7 @@ func doBdHeartbeatThroughLiveness(cityPath string, cfg *config.City, target exec
 		fmt.Fprintf(stderr, "gc bd heartbeat: liveness write failed, falling back to bd: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 0, false
 	}
-	seedHeartbeatOverlayMarker(bead, beadStore, beadID, stamp, stderr)
+	seedHeartbeatOverlayMarker(beadStore, beadID, stamp, stderr)
 	return 0, true
 }
 
@@ -264,12 +266,23 @@ var heartbeatBeadStoreOpener = openStoreAtForCityWithConfig
 //
 // Best-effort by construction: a failed marker only costs list-path freshness
 // for that bead until the next attempt, and the beat itself already landed.
-func seedHeartbeatOverlayMarker(bead beads.Bead, store beads.Store, beadID, stamp string, stderr io.Writer) {
-	if strings.TrimSpace(bead.Metadata[heartbeatMetadataKey]) != "" {
-		return
-	}
+//
+// "Already seeded" is read from the UNWRAPPED store, never from the bead the
+// caller validated. That bead came back through the POLICY store, so its
+// gc.last_heartbeat_at is the OVERLAID value — the row this very beat just
+// wrote — and it reads non-empty on every beat whether or not a marker was ever
+// committed. Keyed on that, a marker write that failed on beat #1 would never be
+// retried, and the bead would stay invisible to beadMayCarryLiveness on List
+// paths for its whole life. Only committed metadata can answer the question.
+func seedHeartbeatOverlayMarker(store beads.Store, beadID, stamp string, stderr io.Writer) {
 	base, _, _ := unwrapBeadPolicyStore(store)
 	if base == nil {
+		return
+	}
+	// A read failure falls through to the write: re-committing a marker that is
+	// already there is one wasted commit, and skipping one that is not there
+	// costs list-path freshness forever.
+	if committed, err := base.Get(beadID); err == nil && strings.TrimSpace(committed.Metadata[heartbeatMetadataKey]) != "" {
 		return
 	}
 	// Deliberately the UNWRAPPED store: routing this through the splitter would
