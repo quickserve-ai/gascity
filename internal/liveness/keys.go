@@ -9,14 +9,17 @@
 // the working set and never stage, commit, or replicate — the same mechanism the
 // beads library itself uses for leases and wisps.
 //
-// The package deliberately depends on nothing else in gascity: the key set has
-// to be referenceable from internal/session, internal/beads and cmd/gc without
-// creating an import cycle.
+// The package deliberately depends on nothing else in gascity except
+// internal/beadmeta — the stdlib-only key-vocabulary leaf that everything may
+// import: the key set has to be referenceable from internal/session,
+// internal/beads and cmd/gc without creating an import cycle.
 package liveness
 
 import (
 	"strings"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/beadmeta"
 )
 
 // WrittenAtKey is a SYNTHETIC metadata key the read overlay stamps onto a bead
@@ -31,7 +34,7 @@ import (
 //
 // It is never accepted as an INPUT: SetBatch refuses it, so it can only ever be
 // produced by the overlay from the table's own timestamps.
-const WrittenAtKey = "gc.liveness_written_at"
+const WrittenAtKey = beadmeta.LivenessWrittenAtMetadataKey
 
 // FencePrefix begins the VERSIONED marker keys that fence stale liveness rows
 // out of the overlay. There is ONE marker per fenced liveness key —
@@ -71,7 +74,7 @@ const WrittenAtKey = "gc.liveness_written_at"
 //
 // Like WrittenAtKey these are infrastructure, never session state: they are
 // refused as liveness keys on input and stripped from any inbound patch.
-const FencePrefix = "gc.liveness_fence."
+const FencePrefix = beadmeta.LivenessFencePrefix
 
 // StampFormat is the wire format for every marker key. Nanosecond precision
 // matters: the table's written_at is DATETIME(6), and a second-granularity
@@ -142,7 +145,8 @@ var keys = map[string]struct{}{
 	"creation_complete_at":       {},
 	"detached_at":                {},
 	"usage_compute_emitted_at":   {},
-	"gc.last_heartbeat_at":       {},
+
+	beadmeta.LastHeartbeatAtMetadataKey: {},
 }
 
 // KNOWN LIMIT — do not filter a bead QUERY on a moved key. The read overlay
