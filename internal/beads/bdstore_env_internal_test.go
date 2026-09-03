@@ -66,6 +66,72 @@ func TestExecEnvForBd_MergesOtherOverrides(t *testing.T) {
 	}
 }
 
+// ga-bb7rzy REGRESSION. The field splice, at the exact call that produced it.
+//
+// A qcore-scoped `gc hook --claim` federates onto the CITY store. The city
+// projection resolves a managed-local target: no host (loopback needs none),
+// port 51361. The parent process is the witness session, whose environment
+// carries the qcore rig endpoint 100.71.23.94:3307.
+//
+// execEnvFor overlays the projected map onto that parent environment, and an
+// overlay replaces ONLY the keys the map contains. So the map must carry the
+// host key EXPLICITLY EMPTY. When it does, the hub host is overwritten and bd
+// falls back to 127.0.0.1 — the city's own server. When the key is merely
+// absent (the pre-fix projection), the hub host survives beside the city's
+// port and bd dials 100.71.23.94:51361, an endpoint no scope declares.
+func TestExecEnvForBd_ProjectedEmptyHostOverwritesInheritedEndpoint(t *testing.T) {
+	parent := []string{
+		"PATH=/usr/bin",
+		"BEADS_DOLT_SERVER_HOST=100.71.23.94",
+		"BEADS_DOLT_SERVER_PORT=3307",
+		"GC_DOLT_HOST=100.71.23.94",
+		"GC_DOLT_PORT=3307",
+		"GC_DOLT_MANAGED_LOCAL=0",
+	}
+	// The managed-city projection as cmd/gc builds it after the fix.
+	cityProjection := map[string]string{
+		"BEADS_DOLT_SERVER_HOST": "",
+		"BEADS_DOLT_SERVER_PORT": "51361",
+		"GC_DOLT_HOST":           "",
+		"GC_DOLT_PORT":           "51361",
+		"GC_DOLT_MANAGED_LOCAL":  "",
+	}
+
+	got := execEnvFor("bd", parent, cityProjection)
+
+	for _, tc := range []struct{ key, want string }{
+		{"BEADS_DOLT_SERVER_HOST", ""},
+		{"GC_DOLT_HOST", ""},
+		{"GC_DOLT_MANAGED_LOCAL", ""},
+		{"BEADS_DOLT_SERVER_PORT", "51361"},
+		{"GC_DOLT_PORT", "51361"},
+	} {
+		vals := envValues(got, tc.key)
+		if len(vals) != 1 || vals[0] != tc.want {
+			t.Errorf("%s values = %v, want exactly [%q] — the inherited rig value must not survive the overlay", tc.key, vals, tc.want)
+		}
+	}
+}
+
+// TestExecEnvForBd_AbsentHostKeyIsResurrected pins the MECHANISM the fix above
+// depends on, so nobody "tidies" a projection back to deleting the key: with the
+// host key absent from the map, the overlay leaves the parent's host standing
+// next to the projected port — reconstituting the exact field chimera. If this
+// ever stops holding, execEnvFor has started stripping keys and the
+// present-and-empty projections may be relaxed.
+func TestExecEnvForBd_AbsentHostKeyIsResurrected(t *testing.T) {
+	parent := []string{"PATH=/usr/bin", "BEADS_DOLT_SERVER_HOST=100.71.23.94"}
+	preFixProjection := map[string]string{"BEADS_DOLT_SERVER_PORT": "51361"}
+
+	got := execEnvFor("bd", parent, preFixProjection)
+
+	host := envValues(got, "BEADS_DOLT_SERVER_HOST")
+	port := envValues(got, "BEADS_DOLT_SERVER_PORT")
+	if len(host) != 1 || host[0] != "100.71.23.94" || len(port) != 1 || port[0] != "51361" {
+		t.Fatalf("host = %v port = %v; expected the overlay to leave the inherited host beside the projected port (the ga-bb7rzy mechanism)", host, port)
+	}
+}
+
 func TestExecEnvForNonBd_LeavesEnvAlone(t *testing.T) {
 	// The runner also execs dolt directly; non-bd commands keep the
 	// caller-visible environment untouched.

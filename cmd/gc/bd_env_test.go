@@ -1848,11 +1848,30 @@ func TestBdRuntimeEnvLocalHostNoHostKey(t *testing.T) {
 	cityPath := t.TempDir()
 	env := mustBdRuntimeEnv(t, cityPath)
 
-	if _, ok := env["GC_DOLT_HOST"]; ok {
-		t.Error("GC_DOLT_HOST should not be present when not configured")
+	// ga-bb7rzy: this test always meant "the stale ambient
+	// BEADS_DOLT_SERVER_HOST must not survive" — note the stale value seeded
+	// above — but it checked ABSENCE from the map, and absence is exactly what
+	// let the stale value survive. The bd child-env overlay (internal/beads
+	// mergeEnv) replaces only keys the map CONTAINS, so a key deleted here was
+	// refilled from the parent environ. The contract is now present-and-empty:
+	// an explicit "" overwrites the inherited value in the child.
+	//
+	// BEADS_DOLT_SERVER_HOST is the load-bearing key — it is the one beads reads
+	// (internal/storage/dolt/store.go) — and mirrorBeadsDoltEnv runs on every
+	// return of this builder, including the clear-and-mirror error paths, so the
+	// guarantee holds even when city resolution fails as it does here.
+	if got, ok := env["BEADS_DOLT_SERVER_HOST"]; !ok || got != "" {
+		t.Errorf("BEADS_DOLT_SERVER_HOST = %q (present=%v), want present and empty so the stale ambient host cannot be inherited", got, ok)
 	}
-	if _, ok := env["BEADS_DOLT_SERVER_HOST"]; ok {
-		t.Error("BEADS_DOLT_SERVER_HOST should not be present when not configured")
+	// GC_DOLT_HOST is deliberately NOT asserted present here. This scope has no
+	// .beads/config.yaml, so city resolution fails and the builder takes the
+	// clearProjectedDoltEnv path, which still DELETES the gc-side keys. That
+	// helper also clears credential keys across a dozen call sites, so
+	// converting it is a separate change; it is recorded as the remaining
+	// in-class site rather than fixed here. Nothing reads GC_DOLT_HOST to open a
+	// store — only the mirrored BEADS_* key above reaches bd.
+	if got, ok := env["GC_DOLT_HOST"]; ok && got != "" {
+		t.Errorf("GC_DOLT_HOST = %q, want empty or absent when no host is configured", got)
 	}
 }
 
@@ -6487,7 +6506,10 @@ func TestBdRuntimeEnvForExplicitRigRecordsAmbientEndpointAsAnotherStore(t *testi
 		t.Fatalf("rig GC_DOLT_MANAGED_LOCAL = %q, want %q (ambient endpoint recorded as another store)", got, "0")
 	}
 	cityEnv := mustBdRuntimeEnv(t, cityDir)
-	if got, ok := cityEnv["GC_DOLT_MANAGED_LOCAL"]; ok {
-		t.Fatalf("city GC_DOLT_MANAGED_LOCAL = %q, want absent for the managed city scope", got)
+	// ga-bb7rzy: present-and-empty, not absent. Deleting the key left the rig's
+	// inherited "0" standing after the bd child-env overlay, so a managed-city
+	// projection still claimed to address another store.
+	if got, ok := cityEnv["GC_DOLT_MANAGED_LOCAL"]; !ok || got != "" {
+		t.Fatalf("city GC_DOLT_MANAGED_LOCAL = %q (present=%v), want present and empty for the managed city scope so an inherited %q cannot outlive it", got, ok, "0")
 	}
 }

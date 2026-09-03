@@ -101,7 +101,20 @@ func execCommandRunnerWithEnv(parent context.Context, env map[string]string) Com
 		cmd.Cancel = func() error {
 			return killCommandTree(cmd)
 		}
-		cmd.Env = execEnvFor(name, processEnvSnapshotExcludingNativeDoltOpen(), env)
+		// The fully merged child environment exists only here, and the ga-bb7rzy
+		// splice is observable only after the merge: neither half of the endpoint
+		// is wrong on its own. Check before exec so an impossible pair fails in
+		// milliseconds naming both halves, instead of burning the command's whole
+		// budget on refused dials. See dolt_endpoint_guard.go for the predicate and
+		// why this closure is the choke point for the incident path.
+		childEnv := execEnvFor(name, processEnvSnapshotExcludingNativeDoltOpen(), env)
+		if guardSynthesizedDoltEndpointEnabled() {
+			if guardErr := guardSynthesizedDoltEndpoint(childEnv, dir); guardErr != nil {
+				trace("refused", guardErr)
+				return nil, guardErr
+			}
+		}
+		cmd.Env = childEnv
 		var stderr bytes.Buffer
 		cmd.Stderr = &stderr
 		out, err := cmd.Output()

@@ -434,10 +434,26 @@ func applyCanonicalDoltTargetEnv(env map[string]string, target contract.DoltConn
 	// GC-owned projections must use the resolved target, not ambient parent
 	// shell host/port. Stale GC_DOLT_HOST/PORT was causing gc bd and projected
 	// session flows to drift away from the canonical external endpoint.
+	//
+	// A scope that declares NO host records the key PRESENT AND EMPTY rather than
+	// deleting it (ga-bb7rzy). RESURRECTION HAZARD: a deleted key is
+	// indistinguishable from a key this projection never had an opinion about, and
+	// the bd child-env builders overlay the projected map onto os.Environ()
+	// (internal/beads mergeEnv, via execEnvFor) — an overlay only replaces keys the
+	// map CONTAINS. So a delete leaves the PARENT's host standing while the sibling
+	// port branch below overwrites the port, splicing one scope's host onto
+	// another's port. On 2026-09-02 a qcore-scoped `gc hook --claim` opened the
+	// managed CITY store and dialed 100.71.23.94:51361 for 48s — the westeros hub
+	// host carried in from the session env, with the city's managed-local port —
+	// an endpoint no scope declares. An empty value is overlaid like any other and
+	// overwrites the inherited one; every consumer TrimSpace-tests these keys, so
+	// empty and absent mean the same thing downstream (see the sibling
+	// BEADS_DOLT_SERVER_PORT branch in mirrorBeadsDoltServerEnv, which has kept the
+	// key present for this reason).
 	if shouldProjectResolvedDoltHost(target) {
 		env["GC_DOLT_HOST"] = strings.TrimSpace(target.Host)
 	} else {
-		delete(env, "GC_DOLT_HOST")
+		env["GC_DOLT_HOST"] = ""
 	}
 	if strings.TrimSpace(target.Port) != "" {
 		env["GC_DOLT_PORT"] = target.Port
@@ -451,8 +467,16 @@ func applyCanonicalDoltTargetEnv(env map[string]string, target contract.DoltConn
 // managed-city resolve run from this projected environment can tell an
 // external store's ambient GC_DOLT_HOST from a container's redirect of the
 // managed server (gc-49ho). An external target records "0"; a managed target
-// clears the key so an inherited "0" from a parent environment cannot outlive
-// the projection that made it true.
+// records the key PRESENT AND EMPTY so an inherited "0" from a parent
+// environment cannot outlive the projection that made it true.
+//
+// The empty write is what makes that guarantee real (ga-bb7rzy). Deleting the
+// key only removed it from the MAP; the bd child-env overlay onto os.Environ()
+// (internal/beads mergeEnv) then resurrected the parent's "0", so a managed-city
+// projection inherited from a rig-scoped session still claimed to be pointing at
+// another store — and the endpoint guard that reads this record could not tell
+// the two apart. An explicit empty overwrites the inherited value; every reader
+// TrimSpace-compares against "0", so empty reads exactly like absent.
 func recordManagedLocalDoltEnv(env map[string]string, target contract.DoltConnectionTarget) {
 	if env == nil {
 		return
@@ -460,7 +484,7 @@ func recordManagedLocalDoltEnv(env map[string]string, target contract.DoltConnec
 	if target.External {
 		env[contract.ManagedLocalDoltEnv] = "0"
 	} else {
-		delete(env, contract.ManagedLocalDoltEnv)
+		env[contract.ManagedLocalDoltEnv] = ""
 	}
 }
 
@@ -1752,7 +1776,15 @@ func mirrorBeadsDoltServerEnv(env map[string]string, carryAmbientTLS bool) {
 	if host := strings.TrimSpace(env["GC_DOLT_HOST"]); host != "" {
 		env["BEADS_DOLT_SERVER_HOST"] = host
 	} else {
-		delete(env, "BEADS_DOLT_SERVER_HOST")
+		// Keep the key present so child bd processes cannot inherit a stale
+		// BEADS_DOLT_SERVER_HOST from an ambient parent environment — the same
+		// reason the port branch below has always kept its key. Deleting it was
+		// the ga-bb7rzy splice: the bd child-env overlay (internal/beads mergeEnv)
+		// only replaces keys the projected map CONTAINS, so a deleted host was
+		// refilled from the parent environ while the port branch below wrote the
+		// city's managed port — producing 100.71.23.94:51361, a hub host on a
+		// managed-local port that no scope declares.
+		env["BEADS_DOLT_SERVER_HOST"] = ""
 	}
 	if port := strings.TrimSpace(env["GC_DOLT_PORT"]); port != "" {
 		env["BEADS_DOLT_SERVER_PORT"] = port
