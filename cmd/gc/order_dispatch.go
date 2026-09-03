@@ -2490,9 +2490,17 @@ func sweepClosedOrderTrackingRetentionBounded(store beads.Store, now time.Time, 
 
 	byOrder := bucketClosedRetentionRuns(runs, onlyOrders)
 
+	// Candidate-count series for the list-starvation investigation
+	// (ga-hujj6s): SQL counts ~48.6k eligible closed tracking rows while the
+	// watchdog prunes single digits per cycle, so the size of the list this
+	// sweep actually RECEIVED is the load-bearing fact. One line per 15m
+	// watchdog cycle.
+	log.Printf("order-tracking retention: sweep received %d closed candidate(s) in %d order bucket(s)", len(runs), len(byOrder))
+
 	cutoff := now.Add(-policy.deleteAfterClose)
 	deleted := 0
 	stranded := 0
+	phantom := 0
 	var deleteErr error
 	for _, runs := range byOrder {
 		if deleted >= limit {
@@ -2521,6 +2529,14 @@ func sweepClosedOrderTrackingRetentionBounded(store beads.Store, now time.Time, 
 					stranded++
 					continue
 				}
+				// A candidate the list returned but the store no longer holds:
+				// the row is already gone, which is the sweep's goal — but a
+				// list serving phantom rows is the ga-hujj6s defect, so count
+				// it as evidence instead of spraying one error line per id.
+				if errors.Is(err, beads.ErrNotFound) {
+					phantom++
+					continue
+				}
 				deleteErr = errors.Join(deleteErr, fmt.Errorf("deleting closed order-tracking bead %q: %w", run.ID, err))
 				continue
 			}
@@ -2528,6 +2544,9 @@ func sweepClosedOrderTrackingRetentionBounded(store beads.Store, now time.Time, 
 		}
 	}
 	logRetainedForLiveDescendants(stranded)
+	if phantom > 0 {
+		log.Printf("order-tracking retention: %d candidate(s) from the list no longer exist in the store — phantom list rows (ga-hujj6s)", phantom)
+	}
 	return deleted, deleteErr
 }
 
