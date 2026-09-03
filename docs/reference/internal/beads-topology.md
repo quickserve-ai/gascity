@@ -167,6 +167,56 @@ If you want a true cross-rig view, query Dolt directly using the port from
 `my-city/.beads/dolt-server.port`. The `bd` CLI is intentionally not the tool
 for that — its job is to enforce per-scope namespacing.
 
+## Session liveness lives outside version control
+
+Session beads carry two very different kinds of metadata. Identity and config
+(`agent_name`, `alias`, `command`, `provider`, `gc.session_name`, `gc.work_dir`)
+is durable, mergeable, and belongs in history. Liveness telemetry — `state`,
+`awake_started_at`, `last_woke_at`, `slept_at`, `generation`, `instance_token`,
+`gc.last_heartbeat_at` and friends — is node-local, last-write-wins, and useless
+in history. Writing it into the versioned `issues` table minted a permanent Dolt
+commit (~840 KB) per transition, several hundred an hour across a fleet.
+
+Those fields now live in a `session_liveness` table registered in `dolt_ignore`,
+so its rows exist only in the working set and never stage, commit, or replicate —
+the same mechanism the beads library uses for `leases` and `wisps`. `gc` seeds
+the table itself, idempotently, when it first binds a scope.
+
+The split and the merge are both invisible to callers:
+
+- **Writes** are split at the store wrapper. Liveness keys go to the table;
+  everything else goes to bead metadata as before. When a patch contained
+  nothing but liveness keys, no bead write happens at all — that skipped write
+  is the commit that no longer exists.
+- **Reads** merge the table back onto `Bead.Metadata` at materialization, so
+  every existing consumer sees the same keys it always did. A key with no row
+  falls back to whatever the committed metadata holds, so pre-existing session
+  beads work with no migration step.
+
+Two consequences worth knowing:
+
+- **`updated_at` on a session bead goes quiet.** Nothing touches the row between
+  genuine status transitions. Code that needs a "last we heard from this
+  session" clock reads `session.EffectiveUpdatedAt`, which folds in the
+  synthetic `gc.liveness_written_at` key the read overlay stamps.
+- **Raw SQL against `issues` no longer sees live telemetry.** Anything reading
+  session state or `gc.last_heartbeat_at` must come through the `gc` API (or
+  join `session_liveness` itself), not through `bd show` or a direct
+  `issues`-table query.
+
+`GC_SESSION_LIVENESS_STORE` controls this:
+
+| Value | Behaviour |
+|---|---|
+| `table` (default) | Split writes as above. Liveness keys never reach the versioned table. |
+| `metadata` | Rollback. The full patch goes to versioned bead metadata exactly as before (restoring the commit churn); liveness keys are still mirrored into the table so the read overlay never shadows fresh committed values with frozen rows. |
+
+Reads always apply the overlay, in both modes — harmless when the table is
+empty, and what makes the flag reversible in both directions. A scope with no
+reachable Dolt endpoint (a `file` or `doltlite` provider, or a server that is
+down) degrades to the `metadata` behaviour on its own: liveness keeps working,
+it just costs commits again until the endpoint comes back.
+
 ## Going further
 
 - [`bd` CLI](https://github.com/gastownhall/beads) — upstream documentation for
