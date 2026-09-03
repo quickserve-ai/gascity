@@ -257,3 +257,61 @@ func TestBuildProviderLaunchCommandWithoutOptionsIgnoresDeprecatedKindForSetting
 		t.Fatalf("unexpected settings source from deprecated Kind fallback: %#v", got)
 	}
 }
+
+func TestAppendClaudeSessionNameGates(t *testing.T) {
+	base := &ResolvedProvider{BuiltinAncestor: "claude", SessionDisplayName: "qcore/oversight.project-lead"}
+
+	if got := appendClaudeSessionName("claude --effort max", base, ""); got != "claude --effort max --name qcore/oversight.project-lead" {
+		t.Fatalf("tmux claude append = %q", got)
+	}
+	// Identity needing quoting.
+	quoted := &ResolvedProvider{BuiltinAncestor: "claude", SessionDisplayName: "a b"}
+	if got := appendClaudeSessionName("claude", quoted, "tmux"); got != `claude --name "a b"` && got != "claude --name 'a b'" {
+		t.Fatalf("quoted append = %q", got)
+	}
+	// ACP transport never gets the flag.
+	if got := appendClaudeSessionName("claude-code-acp", base, SessionTransportACP); got != "claude-code-acp" {
+		t.Fatalf("acp append = %q", got)
+	}
+	// Non-claude family untouched.
+	omp := &ResolvedProvider{BuiltinAncestor: "omp", SessionDisplayName: "deacon"}
+	if got := appendClaudeSessionName("omp run", omp, ""); got != "omp run" {
+		t.Fatalf("non-claude append = %q", got)
+	}
+	// Explicit --name in the command wins.
+	if got := appendClaudeSessionName("claude --name custom", base, ""); got != "claude --name custom" {
+		t.Fatalf("explicit --name overridden: %q", got)
+	}
+	// No identity -> untouched.
+	anon := &ResolvedProvider{BuiltinAncestor: "claude"}
+	if got := appendClaudeSessionName("claude", anon, ""); got != "claude" {
+		t.Fatalf("anonymous append = %q", got)
+	}
+}
+
+func TestBuildProviderResumeCommandCarriesSessionName(t *testing.T) {
+	rp := &ResolvedProvider{
+		BuiltinAncestor:    "claude",
+		SessionDisplayName: "woodhouse",
+		ResumeCommand:      "claude --resume {{session_key}}",
+	}
+	got, err := BuildProviderResumeCommand(rp, nil)
+	if err != nil {
+		t.Fatalf("BuildProviderResumeCommand: %v", err)
+	}
+	if got != "claude --resume {{session_key}} --name woodhouse" {
+		t.Fatalf("resume command = %q", got)
+	}
+}
+
+func TestResolveProviderStampsSessionDisplayName(t *testing.T) {
+	agent := Agent{Name: "woodhouse", Provider: "claude"}
+	ws := Workspace{}
+	resolved, err := ResolveProvider(&agent, &ws, map[string]ProviderSpec{"claude": BuiltinProviders()["claude"]}, func(string) (string, error) { return "/usr/bin/claude", nil })
+	if err != nil {
+		t.Fatalf("ResolveProvider: %v", err)
+	}
+	if resolved.SessionDisplayName != agent.QualifiedName() {
+		t.Fatalf("SessionDisplayName = %q, want %q", resolved.SessionDisplayName, agent.QualifiedName())
+	}
+}
