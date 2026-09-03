@@ -142,7 +142,13 @@ const (
 	PackRootMetadataKey                  = "gc.pack_root"
 	PackWorkspaceMetadataKey             = "gc.pack_workspace"
 	PerDispatchModelMetadataKey          = "gc.per_dispatch_model"
-	PRURLMetadataKey                     = "gc.pr_url"
+	// PrevSessionIDMetadataKey preserves the session back-reference a claim
+	// displaced: when gc hook --claim takes over a bead whose gc.session_id
+	// named a different (no longer live) session, the displaced id is kept
+	// here so recovery can detect the takeover instead of finding the prior
+	// owner erased (ga-pzop1c).
+	PrevSessionIDMetadataKey = "gc.prev_session_id"
+	PRURLMetadataKey         = "gc.pr_url"
 	RalphStepIDMetadataKey               = "gc.ralph_step_id"
 	ReasoningMetadataKey                 = "gc.reasoning"
 	RequiredArtifactMetadataKey          = "gc.required_artifact"
@@ -385,6 +391,7 @@ var KnownMetadataKeys = []string{
 	PackRootMetadataKey,
 	PackWorkspaceMetadataKey,
 	PerDispatchModelMetadataKey,
+	PrevSessionIDMetadataKey,
 	PRURLMetadataKey,
 	RalphStepIDMetadataKey,
 	ReasoningMetadataKey,

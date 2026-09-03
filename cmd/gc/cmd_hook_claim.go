@@ -58,6 +58,10 @@ type hookClaimOps struct {
 	// EmitClaimRejected publishes a bead.claim_rejected event when a claim is
 	// lost to a different live claimant (ADR-0009). Best-effort.
 	EmitClaimRejected hookEmitClaimRejectedFunc
+	// OwnerSessionLive answers whether the session a candidate records as its
+	// executor is still live, for the declined-live-owner guard (ga-pzop1c).
+	// Nil disables the guard (non-session invocations and legacy callers).
+	OwnerSessionLive hookOwnerSessionProbe
 	// ResolveWorkBranch returns the git branch of the worker's worktree (dir),
 	// stamped onto the bead as gc.work_branch at claim time. Empty result (no
 	// repo / detached HEAD) omits the branch key — the session back-reference is
@@ -319,6 +323,7 @@ func claimFirstEligibleHookCandidate(candidates []beads.Bead, opts hookClaimOpti
 	defer cancel()
 	claimsErrored := false
 	var declinedForeign []string
+	var declinedLiveOwner []string
 	for _, candidate := range candidates {
 		if !hookCandidateClaimable(candidate, opts.RouteTargets) {
 			continue
@@ -329,6 +334,17 @@ func claimFirstEligibleHookCandidate(candidates []beads.Bead, opts hookClaimOpti
 		if src, foreign := hookCandidateForeignSource(candidate, opts.HostRoots); foreign {
 			declinedForeign = append(declinedForeign, candidate.ID+"="+src)
 			continue
+		}
+		// Live-owner invariant (ga-pzop1c): a bead can read as unassigned (a
+		// reaper cleared assignee/status) while its gc.session_id still names a
+		// live session mid-work in the bead's worktree. Claiming it puts two
+		// live sessions in one worktree. Decline while the recorded session is
+		// live, and decline (fail closed) when its liveness cannot be read.
+		if owner := hookCandidateRecordedSession(candidate, hookClaimSessionID(opts.Env)); owner != "" && ops.OwnerSessionLive != nil {
+			if verdict, reason := ops.OwnerSessionLive(owner); verdict != hookOwnerSessionGone {
+				declinedLiveOwner = append(declinedLiveOwner, fmt.Sprintf("%s=%s (%s)", candidate.ID, owner, reason))
+				continue
+			}
 		}
 		if ctx.Err() != nil {
 			// The shared claim budget is spent (an earlier slow-failing claim
@@ -379,10 +395,12 @@ func claimFirstEligibleHookCandidate(candidates []beads.Bead, opts hookClaimOpti
 			result.Assignee = opts.Assignee
 		}
 		reportDeclinedForeign(stderr, declinedForeign)
+		reportDeclinedLiveOwner(stderr, declinedLiveOwner)
 		return hookClaimResult{terminal: true, code: writeHookClaimWorkResultForBead(result, claimed, opts, ops, dir, stdout, stderr)}
 	}
 
 	reportDeclinedForeign(stderr, declinedForeign)
+	reportDeclinedLiveOwner(stderr, declinedLiveOwner)
 	return hookClaimResult{claimsErrored: claimsErrored, declinedForeign: len(declinedForeign)}
 }
 
@@ -645,8 +663,15 @@ func hookClaimIdentityPatch(bead beads.Bead, opts hookClaimOptions, ops hookClai
 	}
 	if sessionID := hookClaimSessionID(opts.Env); sessionID != "" &&
 		!beadmeta.IsControlKind(strings.TrimSpace(bead.Metadata[beadmeta.KindMetadataKey])) {
-		if strings.TrimSpace(bead.Metadata[beadmeta.SessionIDMetadataKey]) != sessionID {
+		if prior := strings.TrimSpace(bead.Metadata[beadmeta.SessionIDMetadataKey]); prior != sessionID {
 			patch[beadmeta.SessionIDMetadataKey] = sessionID
+			// Takeover of a bead another session executed: preserve the
+			// displaced back-reference so recovery can detect the handover
+			// instead of finding the prior owner erased (ga-pzop1c). The
+			// live-owner guard has already established that session is gone.
+			if prior != "" {
+				patch[beadmeta.PrevSessionIDMetadataKey] = prior
+			}
 		}
 		if sessionName := hookClaimSessionName(opts.Env); sessionName != "" &&
 			strings.TrimSpace(bead.Metadata[beadmeta.SessionNameMetadataKey]) != sessionName {

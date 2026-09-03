@@ -478,7 +478,9 @@ func cmdHookWithOptions(args []string, opts hookCommandOptions, stdout, stderr i
 			DrainAck:     opts.DrainAck,
 			JSON:         opts.JSON,
 		}
-		return claimHookWork(workQuery, workDir, queryEnv, stores, claimOpts, emitQueryFailure, stdout, stderr)
+		return claimHookWork(workQuery, workDir, queryEnv, stores, claimOpts,
+			hookClaimOps{OwnerSessionLive: newHookOwnerSessionProbe(cityPath, cfg)},
+			emitQueryFailure, stdout, stderr)
 	}
 	return doHook(workQuery, workDir, false, runner, stdout, stderr)
 }
@@ -608,8 +610,8 @@ func hookClaimSessionEligibility(info session.Info, instanceToken string) (hookC
 // claimHookWork claims routed work for gc hook --claim from the federated store
 // set, binding the production shell work-query runner and real claim ops. See
 // claimHookWorkWithRunner for the federation and lost-claim-race semantics.
-func claimHookWork(workQuery, workDir string, queryEnv []string, stores []hookStore, claimOpts hookClaimOptions, emitFailure func(command string, err error), stdout, stderr io.Writer) int {
-	return claimHookWorkWithRunner(workQuery, workDir, queryEnv, stores, claimOpts, hookClaimOps{}, shellWorkQueryWithEnv, emitFailure, stdout, stderr)
+func claimHookWork(workQuery, workDir string, queryEnv []string, stores []hookStore, claimOpts hookClaimOptions, ops hookClaimOps, emitFailure func(command string, err error), stdout, stderr io.Writer) int {
+	return claimHookWorkWithRunner(workQuery, workDir, queryEnv, stores, claimOpts, ops, shellWorkQueryWithEnv, emitFailure, stdout, stderr)
 }
 
 // claimHookWorkWithRunner is claimHookWork with the work-query runner and claim
