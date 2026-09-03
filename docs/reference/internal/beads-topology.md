@@ -203,6 +203,12 @@ Two consequences worth knowing:
   session state or `gc.last_heartbeat_at` must come through the `gc` API (or
   join `session_liveness` itself), not through `bd show` or a direct
   `issues`-table query.
+- **Do not filter a bead query on a moved key.** The overlay merges values on
+  after the store has already selected the beads, so a metadata predicate on
+  `state` or `pending_create_claim` matches the stale committed value. Query
+  `session_liveness` directly, or filter in memory after the read. (No such
+  query exists today — every metadata filter in the tree keys on versioned
+  fields.)
 
 `GC_SESSION_LIVENESS_STORE` controls this:
 

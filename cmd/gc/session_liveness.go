@@ -51,6 +51,7 @@ type livenessBinding struct {
 	mu          sync.Mutex
 	store       liveness.Store
 	lastAttempt time.Time
+	dialing     bool
 	warned      bool
 }
 
@@ -106,26 +107,58 @@ func (b *livenessBinding) Mode() liveness.Mode {
 // failed open no more than once per livenessOpenRetryInterval. It returns nil
 // whenever liveness is unavailable — callers treat nil as "pass everything
 // through to versioned metadata".
+//
+// Only the FIRST dial is synchronous, and the binding's lock is never held
+// across it. Every retry after a failure runs in the background and Store()
+// returns nil immediately: a dead Dolt server must degrade liveness to the
+// legacy write path, never add a multi-second stall to each of the controller's
+// bead operations. Because a store operation cannot wait for a retry, the write
+// it was routing goes to versioned metadata — a commit, which is exactly the
+// right trade while the endpoint is down.
 func (b *livenessBinding) Store() liveness.Store {
 	if b == nil {
 		return nil
 	}
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if b.store != nil {
-		return b.store
+		store := b.store
+		b.mu.Unlock()
+		return store
 	}
-	if !b.lastAttempt.IsZero() && time.Since(b.lastAttempt) < livenessOpenRetryInterval {
+	if b.dialing || (!b.lastAttempt.IsZero() && time.Since(b.lastAttempt) < livenessOpenRetryInterval) {
+		b.mu.Unlock()
 		return nil
 	}
+	first := b.lastAttempt.IsZero()
+	b.dialing = true
 	b.lastAttempt = time.Now()
+	b.mu.Unlock()
+
+	if !first {
+		go b.dial()
+		return nil
+	}
+	return b.dial()
+}
+
+// dial performs one open attempt and installs the result. It runs with the lock
+// released; b.dialing keeps a second attempt from starting alongside it.
+func (b *livenessBinding) dial() liveness.Store {
 	store, err := openScopeLivenessStore(b.cityPath, b.scopeRoot)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.dialing = false
 	if err != nil {
 		if !b.warned {
 			b.warned = true
 			log.Printf("session liveness: %s unavailable (session telemetry keeps committing to bead metadata): %v", b.scopeRoot, err)
 		}
 		return nil
+	}
+	if b.store != nil {
+		// Another dial won the race; drop this handle rather than leaking it.
+		_ = store.Close()
+		return b.store
 	}
 	b.store = store
 	b.warned = false

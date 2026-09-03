@@ -89,9 +89,24 @@ func startTestDoltServer(t *testing.T) doltTestServer {
 // connect opens a NEW connection pool to the test database. Separate calls are
 // genuinely separate client connections — that is what makes the concurrency and
 // restart-recovery cases meaningful.
+//
+// parseTime is deliberately OFF, matching the production dialer
+// (cmd/gc managedDoltOpenDatabase): the driver then hands written_at back as raw
+// bytes, and the store has to normalize it itself. connectParseTime covers the
+// other half.
 func (s doltTestServer) connect(t *testing.T) *sql.DB {
 	t.Helper()
-	db, err := sql.Open("mysql", s.dsnPrefix+s.database+"?parseTime=true")
+	return s.open(t, s.dsnPrefix+s.database)
+}
+
+func (s doltTestServer) connectParseTime(t *testing.T) *sql.DB {
+	t.Helper()
+	return s.open(t, s.dsnPrefix+s.database+"?parseTime=true")
+}
+
+func (s doltTestServer) open(t *testing.T, dsn string) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		t.Fatalf("open %s: %v", s.database, err)
 	}
@@ -218,6 +233,26 @@ func TestSQLStoreAgainstDolt(t *testing.T) {
 		}
 		if snap.Values["instance_token"] != "tok-42" || snap.Values["state"] != "asleep" {
 			t.Fatalf("after reopen Values = %v, want the pre-restart values", snap.Values)
+		}
+	})
+
+	t.Run("the write clock survives either parseTime setting", func(t *testing.T) {
+		if err := store.SetBatch(ctx, "gc-clock", map[string]string{"state": "active"}); err != nil {
+			t.Fatalf("SetBatch: %v", err)
+		}
+		plain, err := store.Get(ctx, "gc-clock")
+		if err != nil {
+			t.Fatalf("Get (parseTime off): %v", err)
+		}
+		if plain.WrittenAt.IsZero() {
+			t.Fatalf("WrittenAt is zero with parseTime off — the production dialer sets no parseTime, so the store must normalize raw bytes itself")
+		}
+		parsed, err := NewSQLStore(server.connectParseTime(t)).Get(ctx, "gc-clock")
+		if err != nil {
+			t.Fatalf("Get (parseTime on): %v", err)
+		}
+		if !parsed.WrittenAt.Equal(plain.WrittenAt) {
+			t.Fatalf("WrittenAt differs by parseTime setting: %v vs %v", plain.WrittenAt, parsed.WrittenAt)
 		}
 	})
 

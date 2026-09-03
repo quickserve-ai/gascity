@@ -65,25 +65,33 @@ func noteLivenessFailure(op string, err error) {
 // failed liveness write, the legacy versioned write is the only way the value
 // survives. A degrade therefore costs a Dolt commit, never a lost transition.
 func (s *beadPolicyStore) livenessRoute(id string, patch map[string]string) map[string]string {
+	rest, _ := s.livenessRouteStatus(id, patch)
+	return rest
+}
+
+// livenessRouteStatus is livenessRoute plus whether the liveness half actually
+// landed. ok is false only for a genuine degrade (no store, or a failed write) —
+// a patch with no liveness keys at all routes fine and reports true.
+func (s *beadPolicyStore) livenessRouteStatus(id string, patch map[string]string) (rest map[string]string, ok bool) {
 	if s == nil || len(patch) == 0 {
-		return patch
+		return patch, true
 	}
 	store := s.lv.Store()
 	if store == nil {
-		return patch
+		return patch, false
 	}
 	plan := liveness.PlanWrite(s.lv.Mode(), patch)
 	if len(plan.Liveness) == 0 {
-		return plan.Versioned
+		return plan.Versioned, true
 	}
 	ctx, cancel := livenessOpContext()
 	err := store.SetBatch(ctx, id, plan.Liveness)
 	cancel()
 	if err != nil {
 		noteLivenessFailure("write", err)
-		return patch
+		return patch, false
 	}
-	return plan.Versioned
+	return plan.Versioned, true
 }
 
 // SetMetadataBatch splits the patch. When nothing but liveness keys were in it,
@@ -137,13 +145,26 @@ func updateOptsMetadataOnly(opts beads.UpdateOpts) bool {
 
 // CloseAll splits the close metadata. The close itself always runs: a status
 // change is genuine lifecycle history and must keep committing.
+//
+// If the liveness write degrades for ANY id, the full metadata goes versioned
+// for ALL of them. A per-id remainder would be wrong: CloseAll applies one
+// metadata map to every bead, so the safe resolution of a partial degrade is the
+// one that loses nothing.
 func (s *beadPolicyStore) CloseAll(ids []string, metadata map[string]string) (int, error) {
-	if len(metadata) == 0 {
+	if len(metadata) == 0 || len(ids) == 0 {
 		return s.Store.CloseAll(ids, metadata)
 	}
-	rest := metadata
+	rest, degraded := metadata, false
 	for _, id := range ids {
-		rest = s.livenessRoute(id, metadata)
+		routed, ok := s.livenessRouteStatus(id, metadata)
+		if !ok {
+			degraded = true
+			continue
+		}
+		rest = routed
+	}
+	if degraded {
+		rest = metadata
 	}
 	return s.Store.CloseAll(ids, rest)
 }

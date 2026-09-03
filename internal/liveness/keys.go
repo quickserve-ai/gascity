@@ -63,6 +63,16 @@ var keys = map[string]struct{}{
 	"gc.last_heartbeat_at":       {},
 }
 
+// KNOWN LIMIT — do not filter a bead QUERY on a moved key. The read overlay
+// merges liveness values onto beads AFTER the store has selected them, so a
+// ListQuery.Metadata / ListByMetadata predicate on (say) state or
+// pending_create_claim still matches the STALE committed value and would select
+// the wrong beads. No such query exists in the tree today (verified across
+// cmd/gc and internal/ when the split landed: every metadata filter keys on
+// alias, named-session identity, kind, routed_to, root-bead id or idempotency
+// key — all versioned). A new one must either query session_liveness directly or
+// filter in memory after the overlay.
+
 // IsKey reports whether key is a session-liveness key that must be routed to the
 // liveness table instead of versioned bead metadata.
 func IsKey(key string) bool {

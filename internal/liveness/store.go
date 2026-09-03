@@ -217,11 +217,16 @@ func (s *SQLStore) query(ctx context.Context, ids []string) (map[string]Snapshot
 	for rows.Next() {
 		var (
 			beadID, k, v string
-			writtenAt    time.Time
+			rawWritten   any
 		)
-		if err := rows.Scan(&beadID, &k, &v, &writtenAt); err != nil {
+		// written_at is scanned as any, not time.Time: whether the driver hands
+		// back a time.Time or the raw bytes depends on the connection's
+		// parseTime flag, and this store must not depend on how the caller
+		// happened to build its DSN.
+		if err := rows.Scan(&beadID, &k, &v, &rawWritten); err != nil {
 			return nil, fmt.Errorf("liveness: scan: %w", err)
 		}
+		writtenAt := parseWrittenAt(rawWritten)
 		snap, ok := out[beadID]
 		if !ok {
 			snap = Snapshot{Values: make(map[string]string, 8)}
@@ -236,6 +241,45 @@ func (s *SQLStore) query(ctx context.Context, ids []string) (map[string]Snapshot
 		return nil, fmt.Errorf("liveness: read: %w", err)
 	}
 	return out, nil
+}
+
+// writtenAtLayouts are the textual DATETIME(6) shapes a driver returns when it
+// is NOT parsing times itself, in the order Dolt/MySQL emit them.
+var writtenAtLayouts = []string{
+	"2006-01-02 15:04:05.999999",
+	"2006-01-02 15:04:05",
+	time.RFC3339Nano,
+	time.RFC3339,
+}
+
+// parseWrittenAt normalizes whatever the driver produced for written_at into a
+// UTC time. An unparseable value yields the zero time, which the caller treats
+// as "no clock" — a missing freshness stamp degrades to Bead.UpdatedAt rather
+// than failing the read.
+func parseWrittenAt(raw any) time.Time {
+	var text string
+	switch v := raw.(type) {
+	case nil:
+		return time.Time{}
+	case time.Time:
+		return v.UTC()
+	case []byte:
+		text = string(v)
+	case string:
+		text = v
+	default:
+		return time.Time{}
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return time.Time{}
+	}
+	for _, layout := range writtenAtLayouts {
+		if parsed, err := time.Parse(layout, text); err == nil {
+			return parsed.UTC()
+		}
+	}
+	return time.Time{}
 }
 
 func dedupeIDs(in []string) []string {
