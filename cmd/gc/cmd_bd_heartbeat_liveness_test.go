@@ -138,7 +138,13 @@ func TestHeartbeatRetriesTheOverlayMarkerAfterItFails(t *testing.T) {
 	sessionLivenessFor(cityPath, scopeRoot).setStoreForTest(lv, liveness.ModeTable)
 
 	backing := &markerFailingStore{MemStore: beads.NewMemStore(), fail: true}
-	store := wrapStoreWithBeadPolicies(backing, &config.City{})
+	// The validation store carries the SAME liveness binding as the heartbeat
+	// path, the shape production uses (openStoreAtForCityWithConfig attaches
+	// one). Without it the overlay is off, this store's Get serves committed
+	// metadata directly, and the pre-fix marker check — which read the OVERLAID
+	// value — passes this test too. The binding is what lets beat #2 observe
+	// beat #1's row and is therefore what makes this test able to fail.
+	store := wrapStoreWithBeadPolicies(backing, &config.City{}, sessionLivenessFor(cityPath, scopeRoot))
 	orig := heartbeatBeadStoreOpener
 	t.Cleanup(func() { heartbeatBeadStoreOpener = orig })
 	heartbeatBeadStoreOpener = func(string, string, *config.City) (beads.Store, error) { return store, nil }
