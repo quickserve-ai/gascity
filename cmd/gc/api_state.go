@@ -433,7 +433,7 @@ func wrapWithCachingStoreFeed(ctx context.Context, store beads.Store, ep events.
 	// rig): serve from the synchronous pre-prime only, no async prime/reconcile.
 	if ctx.Done() == nil || !backgroundRefresh {
 		if policyWrapped {
-			return wrapStoreWithBeadPolicies(cs, policyStore.cfg)
+			return wrapStoreWithBeadPolicies(cs, policyStore.cfg, policyStore.lv)
 		}
 		return cs
 	}
@@ -442,7 +442,7 @@ func wrapWithCachingStoreFeed(ctx context.Context, store beads.Store, ep events.
 	go primeThenStartReconciler(ctx, cs, os.Getenv("GC_AGENT"))
 	attached.start(ctx)
 	if policyWrapped {
-		return wrapStoreWithBeadPolicies(cs, policyStore.cfg)
+		return wrapStoreWithBeadPolicies(cs, policyStore.cfg, policyStore.lv)
 	}
 	return cs
 }
@@ -495,7 +495,7 @@ func (cs *controllerState) buildStores(cfg *config.City) map[string]beads.Store 
 			},
 		})
 		if err == nil {
-			sharedLegacyFileStore = wrapStoreWithBeadPolicies(result.Store, cfg)
+			sharedLegacyFileStore = wrapStoreWithBeadPolicies(result.Store, cfg, sessionLivenessFor(cs.cityPath, cs.cityPath))
 		} else {
 			cs.rolloutWarnf("api: shared legacy file store: %v\n", err)
 		}
@@ -708,7 +708,7 @@ func (cs *controllerState) openRigStore(provider, rigName, rigPath, prefix strin
 	if err != nil {
 		return unavailableStore{err: fmt.Errorf("open rig store %s: %w", scopeRoot, err)}
 	}
-	return wrapStoreWithBeadPolicies(result.Store, cfg)
+	return wrapStoreWithBeadPolicies(result.Store, cfg, sessionLivenessFor(cs.cityPath, scopeRoot))
 }
 
 // startBeadEventWatcher subscribes to the event bus and feeds bead events
