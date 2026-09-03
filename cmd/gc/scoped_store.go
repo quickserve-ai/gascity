@@ -74,13 +74,15 @@ func bdStoreBacking(store beads.Store) (*beads.BdStore, bool) {
 	return nil, false
 }
 
-// beadPolicyConfig finds the policy layer, if any, in the same bounded store
+// beadPolicyLayer finds the policy layer, if any, in the same bounded store
 // stack understood by bdStoreBacking. A scoped clone must retain this layer:
-// policy-aware zero-value List and Ready reads span both logical tiers.
-func beadPolicyConfig(store beads.Store) (*config.City, bool) {
+// policy-aware zero-value List and Ready reads span both logical tiers, and the
+// session-liveness read overlay hangs off the same wrapper — a clone that
+// dropped it would serve frozen committed telemetry.
+func beadPolicyLayer(store beads.Store) (*beadPolicyStore, bool) {
 	for range 8 {
 		if _, policy, ok := unwrapBeadPolicyStore(store); ok {
-			return policy.cfg, true
+			return policy, true
 		}
 		cached, ok := store.(*beads.CachingStore)
 		if !ok || cached == nil || cached.Backing() == nil {
@@ -105,7 +107,7 @@ func scopedStoreLike(ctx context.Context, cityPath string, cfg *config.City, exi
 	if !ok {
 		return nil, nil
 	}
-	policyCfg, policyWrapped := beadPolicyConfig(existing)
+	policy, policyWrapped := beadPolicyLayer(existing)
 	dir := bs.Dir()
 	var scoped beads.Store
 	var err error
@@ -118,7 +120,7 @@ func scopedStoreLike(ctx context.Context, cityPath string, cfg *config.City, exi
 		return nil, err
 	}
 	if policyWrapped {
-		scoped = wrapStoreWithBeadPolicies(scoped, policyCfg)
+		scoped = wrapStoreWithBeadPolicies(scoped, policy.cfg, policy.lv)
 	}
 	return scoped, nil
 }

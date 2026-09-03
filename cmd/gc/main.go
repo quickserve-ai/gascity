@@ -1490,7 +1490,7 @@ func openStoreResultAtForCityWithConfigOptions(storePath, cityPath string, cfg *
 	if err != nil {
 		return result, err
 	}
-	result.Store = wrapStoreWithBeadPolicies(result.Store, cfg)
+	result.Store = wrapStoreWithBeadPolicies(result.Store, cfg, sessionLivenessFor(runtimeCityPath, scopeRoot))
 	return result, nil
 }
 
