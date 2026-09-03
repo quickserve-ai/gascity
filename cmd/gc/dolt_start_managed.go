@@ -250,14 +250,14 @@ func startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel str
 
 		readyReport, readyErr := managedDoltWaitForReadyFn(cityPath, host, strconv.Itoa(currentPort), user, started.PID, timeout, false)
 		if readyErr == nil && readyReport.Ready {
-			// Applied HERE, after readiness, because dolt ignores
-			// dolt_transaction_commit in the config file's system_variables
-			// block and does not read back its own SET PERSIST when started
-			// with --config. Without it a large class of bd writes never
-			// becomes a Dolt commit and their rows wedge the next merge
-			// (ga-7unsv0). Re-applied on every managed start by design: the
-			// setting is in-memory and does not survive a restart.
-			applyManagedDoltGlobalSetup(host, strconv.Itoa(currentPort), user, os.Stderr)
+			// Checked HERE, after readiness, because these are in-memory
+			// server globals: they cannot be read before the server answers
+			// queries, and they do not survive a restart, so every managed
+			// start has to look again. This used to SET
+			// dolt_transaction_commit = 1; under the v59 beads pin bd commits
+			// explicitly and 0 is the correct value, so the same slot now
+			// asserts it (ga-09xcry). Fail visible, never fail closed.
+			verifyManagedDoltGlobals(host, strconv.Itoa(currentPort), user, os.Stderr)
 			report.Ready = true
 			if publish {
 				if err := publishManagedDoltRuntimeStateIfOwned(cityPath); err != nil {
