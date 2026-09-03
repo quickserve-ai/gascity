@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"path/filepath"
@@ -149,7 +150,12 @@ func (b *livenessBinding) dial() liveness.Store {
 	defer b.mu.Unlock()
 	b.dialing = false
 	if err != nil {
-		if !b.warned {
+		// A scope with no Dolt endpoint at all — a file/doltlite provider, or any
+		// test working in a temp dir — is the expected steady state, not a
+		// degradation: log nothing. Only a scope that HAS an endpoint and could
+		// not be reached or seeded is worth an operator's attention, and then
+		// only once per binding.
+		if !b.warned && !errors.Is(err, errNoLivenessEndpoint) {
 			b.warned = true
 			log.Printf("session liveness: %s unavailable (session telemetry keeps committing to bead metadata): %v", b.scopeRoot, err)
 		}
@@ -183,21 +189,27 @@ func newLivenessBindingForTest(store liveness.Store, mode liveness.Mode) *livene
 	return b
 }
 
+// errNoLivenessEndpoint marks the benign "this scope has no Dolt at all" case:
+// a file or doltlite provider, an unconfigured scope, or any test working in a
+// temp dir. It is the expected steady state for those scopes, so it degrades
+// silently rather than warning.
+var errNoLivenessEndpoint = errors.New("scope has no Dolt endpoint to bind")
+
 // openScopeLivenessStore dials the scope's managed Dolt database and seeds the
 // liveness schema.
 func openScopeLivenessStore(cityPath, scopeRoot string) (liveness.Store, error) {
 	if strings.TrimSpace(cityPath) == "" {
-		return nil, fmt.Errorf("no city path for scope %s", scopeRoot)
+		return nil, fmt.Errorf("%w: no city path for scope %s", errNoLivenessEndpoint, scopeRoot)
 	}
 	target, ok, err := canonicalScopeDoltTarget(cityPath, scopeRoot)
 	if err != nil {
 		return nil, fmt.Errorf("resolving Dolt target: %w", err)
 	}
 	if !ok {
-		return nil, fmt.Errorf("scope config is not authoritative; no Dolt endpoint to bind")
+		return nil, fmt.Errorf("%w: scope config is not authoritative", errNoLivenessEndpoint)
 	}
 	if strings.TrimSpace(target.Port) == "" || strings.TrimSpace(target.Database) == "" {
-		return nil, fmt.Errorf("scope Dolt target is incomplete (port=%q database=%q)", target.Port, target.Database)
+		return nil, fmt.Errorf("%w: incomplete target (port=%q database=%q)", errNoLivenessEndpoint, target.Port, target.Database)
 	}
 	db, err := managedDoltOpenDatabase(target.Host, target.Port, target.User, target.Database)
 	if err != nil {
