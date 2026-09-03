@@ -89,7 +89,10 @@ func (r *storageRoutes) withControllerCache(ctx context.Context, ep events.Provi
 		}
 		wrapped, ok := cached[store]
 		if !ok {
-			wrapped = wrapWithCachingStore(ctx, store, ep, true, append([]beads.CachingStoreOption{beads.WithEventIDPrefixes(r.namespacesServedBy(store)...)}, opts...)...)
+			// A binding engine serves several classes and no single heartbeat
+			// scope owns it, so it publishes no reconcile heartbeat (an empty
+			// scope), as the legacy shared-file cache does (ga-yc0chj).
+			wrapped = wrapWithCachingStore(ctx, store, ep, true, "", "", append([]beads.CachingStoreOption{beads.WithEventIDPrefixes(r.namespacesServedBy(store)...)}, opts...)...)
 			if wrapped == nil {
 				continue
 			}
