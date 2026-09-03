@@ -22,7 +22,8 @@ import (
 //   - caching "open"/"not found" only DELAYS a newly closed bead's reap by at
 //     most the TTL — the reaper's whole job is eventual cleanup;
 //   - caching "closed" cannot reap a live tree: the git-safety gate (clean,
-//     no unpushed, no stash), the borrow-veto scan (any non-terminal bead
+//     no unpushed — stashes deliberately excluded, ga-gsfxag), the
+//     borrow-veto scan (any non-terminal bead
 //     whose work_dir metadata references the path — including a reopened
 //     bead), and the process/session liveness gate all still run FRESH on
 //     every pass. The residual exposure is a bead reopened within the TTL
