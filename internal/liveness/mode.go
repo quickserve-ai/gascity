@@ -21,16 +21,27 @@ const (
 	ModeTable Mode = "table"
 
 	// ModeMetadata is the rollback path: the FULL patch goes to versioned bead
-	// metadata exactly as it did before this change, restoring the pre-change
-	// commit behavior byte for byte.
+	// metadata, restoring the pre-change commit volume.
 	//
-	// It still MIRRORS liveness keys into the table. That is deliberate and is
-	// the one deviation from "no split at all": reads overlay the table in both
-	// modes, so a mode flip that stopped updating the table would leave the
-	// overlay shadowing fresh committed metadata with frozen table rows. The
-	// mirror keeps both stores in agreement, which makes the flag genuinely
-	// reversible in BOTH directions instead of one-way. A mirror failure is not
-	// fatal in this mode — versioned metadata is authoritative here.
+	// Versioned metadata really is AUTHORITATIVE in this mode, and the mechanism
+	// is the fence, not the absence of a table. Reads overlay unconditionally in
+	// BOTH modes — the overlay has no idea which mode wrote a row, and a process
+	// running in table mode can be reading beads a metadata-mode process just
+	// wrote — so "metadata mode" cannot mean "the overlay is off". Instead every
+	// metadata-mode write carries a FallbackAtKey stamp, which fences out every
+	// table row written at or before it. The committed value therefore wins, in
+	// this process and in every other one, without anybody having to agree on a
+	// mode.
+	//
+	// It still MIRRORS liveness keys into the table so that a flip BACK to table
+	// mode finds them current instead of frozen at the instant the flag was set.
+	// A mirror failure is not fatal here: the fence already made the committed
+	// value authoritative.
+	//
+	// SCOPE OF THE FLAG: it is read once per scope, when that scope's binding is
+	// first created, and cached for the life of the process. Changing it requires
+	// restarting the processes that should observe it — for the fleet that means
+	// the controller, not just the next CLI invocation.
 	ModeMetadata Mode = "metadata"
 )
 

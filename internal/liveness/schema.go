@@ -3,6 +3,8 @@ package liveness
 import (
 	"context"
 	"fmt"
+	"log"
+	"strings"
 )
 
 // createTableStmt is the liveness table DDL. bead_id + k is the primary key, so
@@ -45,17 +47,111 @@ func EnsureSchema(ctx context.Context, db DB) error {
 	// in the working set as an uncommitted diff instead of getting its own
 	// commit, which is strictly the less surprising failure.
 	if n, raErr := res.RowsAffected(); raErr == nil && n > 0 {
-		if err := drainCall(ctx, db, "CALL DOLT_ADD('dolt_ignore')"); err != nil {
-			return fmt.Errorf("liveness: staging seeded dolt_ignore: %w", err)
-		}
-		if err := drainCall(ctx, db, "CALL DOLT_COMMIT('-m', ?)", seedCommitMessage); err != nil {
-			return fmt.Errorf("liveness: committing seeded dolt_ignore: %w", err)
+		// DOLT_COMMIT commits the whole STAGED set, not just what we added. If
+		// another writer already has tables staged, committing here would sweep
+		// their in-flight work into a commit labeled as ours. Leave the seed as
+		// a working-set diff instead and let the next call (or that writer's own
+		// commit) carry it — the pattern is already effective the moment it is
+		// inserted, so deferring the commit costs nothing but a dirty
+		// dolt_ignore until then.
+		staged, checkErr := otherStagedTables(ctx, db)
+		switch {
+		case checkErr != nil:
+			// Cannot prove the staging area is clean: do not commit. Same
+			// reasoning, failing closed.
+			warnf("liveness: cannot inspect dolt_status (%v); leaving the dolt_ignore seed uncommitted in the working set", checkErr)
+		case len(staged) > 0:
+			warnf("liveness: %d other table(s) staged (%s); leaving the dolt_ignore seed uncommitted rather than committing another writer's work",
+				len(staged), strings.Join(staged, ", "))
+		default:
+			if err := drainCall(ctx, db, "CALL DOLT_ADD('dolt_ignore')"); err != nil {
+				return fmt.Errorf("liveness: staging seeded dolt_ignore: %w", err)
+			}
+			if err := drainCall(ctx, db, "CALL DOLT_COMMIT('-m', ?)", seedCommitMessage); err != nil {
+				return fmt.Errorf("liveness: committing seeded dolt_ignore: %w", err)
+			}
 		}
 	}
 	if _, err := db.ExecContext(ctx, createTableStmt); err != nil {
 		return fmt.Errorf("liveness: creating %s: %w", TableName, err)
 	}
+	assertTransactionCommitOff(ctx, db)
 	return nil
+}
+
+// warnf is the package's diagnostic sink. It is a var so tests can capture it.
+var warnf = func(format string, args ...any) {
+	log.Printf(format, args...)
+}
+
+// otherStagedTables returns the staged tables OTHER than dolt_ignore itself.
+// dolt_status reports (table_name, staged, status); a row with staged=1 is in
+// the index and would ride along with any DOLT_COMMIT we issue.
+func otherStagedTables(ctx context.Context, db DB) ([]string, error) {
+	rows, err := db.QueryContext(ctx, "SELECT table_name FROM dolt_status WHERE staged = TRUE")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		if name == "dolt_ignore" {
+			continue
+		}
+		out = append(out, name)
+	}
+	return out, rows.Err()
+}
+
+// assertTransactionCommitOff verifies the invariant the whole design rests on:
+// with @@GLOBAL.dolt_transaction_commit = 1 every SQL transaction against this
+// server mints a Dolt commit, so liveness writes would commit ~250 times an hour
+// exactly as before — the change would be silently inert. It warns rather than
+// refusing: the table is still the right place for this data, and refusing the
+// open would take liveness down over a server setting a human must change.
+func assertTransactionCommitOff(ctx context.Context, db DB) {
+	rows, err := db.QueryContext(ctx, "SELECT @@GLOBAL.dolt_transaction_commit")
+	if err != nil {
+		warnf("liveness: cannot read @@GLOBAL.dolt_transaction_commit (%v); cannot confirm that liveness writes mint no Dolt commits", err)
+		return
+	}
+	defer func() { _ = rows.Close() }()
+	if !rows.Next() {
+		return
+	}
+	var raw any
+	if err := rows.Scan(&raw); err != nil {
+		return
+	}
+	if !isZeroish(raw) {
+		warnf("liveness: @@GLOBAL.dolt_transaction_commit is %v, not 0 — EVERY liveness write will mint a Dolt commit and this change is inert until it is turned off", raw)
+	}
+}
+
+// isZeroish reports whether a MySQL system-variable value reads as 0/off across
+// the shapes a driver may hand back (int64, []byte, string).
+func isZeroish(raw any) bool {
+	switch v := raw.(type) {
+	case nil:
+		return true
+	case int64:
+		return v == 0
+	case []byte:
+		return isZeroText(string(v))
+	case string:
+		return isZeroText(v)
+	default:
+		return isZeroText(fmt.Sprint(v))
+	}
+}
+
+func isZeroText(s string) bool {
+	s = strings.ToLower(strings.TrimSpace(s))
+	return s == "0" || s == "off" || s == "false" || s == ""
 }
 
 // drainCall runs a Dolt stored procedure and consumes its result set. Dolt's

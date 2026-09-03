@@ -72,15 +72,21 @@ func (s *beadPolicyStore) livenessRoute(id string, patch map[string]string) map[
 // livenessRouteStatus is livenessRoute plus whether the liveness half actually
 // landed. ok is false only for a genuine degrade (no store, or a failed write) —
 // a patch with no liveness keys at all routes fine and reports true.
+//
+// EVERY degraded return is FENCED. The returned patch carries the liveness keys
+// AND a FallbackAtKey stamp, so once the pool recovers the pre-outage rows it
+// left behind cannot shadow what this write just committed. Returning the bare
+// patch instead is the stale-shadow defect: the overlay would let any surviving
+// row win, and wake fencing would compare against a resurrected instance_token.
 func (s *beadPolicyStore) livenessRouteStatus(id string, patch map[string]string) (rest map[string]string, ok bool) {
 	if s == nil || len(patch) == 0 {
 		return patch, true
 	}
 	store := s.lv.Store()
 	if store == nil {
-		return patch, false
+		return liveness.FallbackPlan(patch, s.lv.Now()), false
 	}
-	plan := liveness.PlanWrite(s.lv.Mode(), patch)
+	plan := liveness.PlanWrite(s.lv.Mode(), patch, store.Now())
 	if len(plan.Liveness) == 0 {
 		return plan.Versioned, true
 	}
@@ -88,8 +94,14 @@ func (s *beadPolicyStore) livenessRouteStatus(id string, patch map[string]string
 	err := store.SetBatch(ctx, id, plan.Liveness)
 	cancel()
 	if err != nil {
+		// Mint the fence from the store we STILL hold. noteOpError retires the
+		// pool, and a stamp taken after that would fall back to the raw local
+		// clock — the wrong timebase for the server-minted written_at values it
+		// has to fence.
+		now := store.Now()
 		noteLivenessFailure("write", err)
-		return patch, false
+		s.lv.noteOpError(err)
+		return liveness.FallbackPlan(patch, now), false
 	}
 	return plan.Versioned, true
 }
@@ -164,18 +176,40 @@ func (s *beadPolicyStore) CloseAll(ids []string, metadata map[string]string) (in
 		rest = routed
 	}
 	if degraded {
-		rest = metadata
+		// Fenced, and a fresh map — never the caller's.
+		rest = liveness.FallbackPlan(metadata, s.lv.Now())
 	}
 	return s.Store.CloseAll(ids, rest)
 }
 
-// Tx routes the transaction's metadata writes through the same splitter.
+// Tx does NOT split. Inside a transaction every metadata key — liveness
+// included — goes to versioned bead metadata, fenced with a FallbackAtKey stamp.
 //
-// The liveness half is written OUTSIDE the transaction, so a rolled-back Tx
-// leaves it applied. That is correct for this data: liveness is last-write-wins
-// telemetry with no rollback semantics of its own, and the alternative — holding
-// liveness writes until commit — would make a lifecycle transition's telemetry
-// invisible to a concurrently-reading process for the whole transaction.
+// WHY NOT SPLIT. Two Tx call sites carry explicit invariants that a split
+// breaks, and both are about a bead's status and its liveness state being
+// observable together or not at all:
+//
+//   - session_beads.go closeSessionBeadInTx (ga-igcny0.1.1): a closed session
+//     bead must ALWAYS carry its terminal state.
+//   - session_beads.go the reopen path: the reopen must not be observable split
+//     from the metadata that accompanies it.
+//
+// Writing liveness before the transaction inverts the atomicity outright — a
+// rolled-back Tx leaves the telemetry applied. Buffering it and flushing after
+// commit is better but still leaves a real window: a crash between COMMIT and
+// FLUSH leaves a bead whose status changed and whose liveness rows still hold
+// the pre-transition values, which the overlay would then serve over the
+// committed terminal state. That is precisely the split both comments forbid.
+//
+// Going fully versioned closes the window instead of narrowing it, and it costs
+// nothing: every one of these call sites is a low-frequency lifecycle event
+// (close, reopen, failed-create rollback) whose transaction commits regardless.
+// The commit-churn this change exists to remove comes from the non-Tx transition
+// patches, which still split. The fence stamp is what keeps the stale table rows
+// these writes leave behind from shadowing the committed values afterwards.
+//
+// The reviewers' requirement — "a failed versioned write must leave liveness
+// untouched" — holds trivially: no liveness write is issued at all.
 func (s *beadPolicyStore) Tx(commitMsg string, fn func(tx beads.Tx) error) error {
 	if fn == nil {
 		return s.Store.Tx(commitMsg, fn)
@@ -185,7 +219,7 @@ func (s *beadPolicyStore) Tx(commitMsg string, fn func(tx beads.Tx) error) error
 	})
 }
 
-// livenessTx applies the write splitter inside a Store.Tx callback.
+// livenessTx fences a Store.Tx callback's metadata writes. See Tx.
 type livenessTx struct {
 	inner  beads.Tx
 	policy *beadPolicyStore
@@ -198,23 +232,14 @@ func (t *livenessTx) Create(b beads.Bead) (beads.Bead, error) { return t.inner.C
 func (t *livenessTx) Close(id string) error { return t.inner.Close(id) }
 
 func (t *livenessTx) Update(id string, opts beads.UpdateOpts) error {
-	if len(opts.Metadata) == 0 {
-		return t.inner.Update(id, opts)
+	if len(opts.Metadata) > 0 {
+		opts.Metadata = liveness.FallbackPlan(opts.Metadata, t.policy.lv.Now())
 	}
-	rest := t.policy.livenessRoute(id, opts.Metadata)
-	if len(rest) == 0 && updateOptsMetadataOnly(opts) {
-		return nil
-	}
-	opts.Metadata = rest
 	return t.inner.Update(id, opts)
 }
 
 func (t *livenessTx) SetMetadataBatch(id string, kvs map[string]string) error {
-	rest := t.policy.livenessRoute(id, kvs)
-	if len(rest) == 0 {
-		return nil
-	}
-	return t.inner.SetMetadataBatch(id, rest)
+	return t.inner.SetMetadataBatch(id, liveness.FallbackPlan(kvs, t.policy.lv.Now()))
 }
 
 // Get overlays the bead's liveness values onto its committed metadata. This is a
@@ -238,6 +263,7 @@ func (s *beadPolicyStore) overlayBead(b beads.Bead) beads.Bead {
 	cancel()
 	if err != nil {
 		noteLivenessFailure("read", err)
+		s.lv.noteOpError(err)
 		return b
 	}
 	return applyLivenessSnapshot(b, snap)
@@ -257,13 +283,20 @@ func (s *beadPolicyStore) overlayBeads(list []beads.Bead) []beads.Bead {
 	}
 	ids := make([]string, 0, len(list))
 	for _, b := range list {
+		if !beadMayCarryLiveness(b) {
+			continue
+		}
 		ids = append(ids, b.ID)
+	}
+	if len(ids) == 0 {
+		return list
 	}
 	ctx, cancel := livenessOpContext()
 	snaps, err := store.GetMany(ctx, ids)
 	cancel()
 	if err != nil {
 		noteLivenessFailure("read", err)
+		s.lv.noteOpError(err)
 		return list
 	}
 	if len(snaps) == 0 {
@@ -275,6 +308,39 @@ func (s *beadPolicyStore) overlayBeads(list []beads.Bead) []beads.Bead {
 		}
 	}
 	return list
+}
+
+// beadMayCarryLiveness reports whether a bead is worth a liveness lookup on a
+// LIST path. Without it every List queried the liveness table for every bead it
+// returned — thousands of ids on a whole-city list, against a store with
+// documented complex-read stalls.
+//
+// The predicate is a deliberate SUPERSET of "is a session bead", because session
+// beads are NOT the only writers: `gc bd heartbeat <issue-id>` stamps
+// gc.last_heartbeat_at on an arbitrary WORK bead (cmd_bd.go), and that key is in
+// the moved set. The second and third clauses cover it: the heartbeat path
+// commits a one-time marker the first time it sees a bead, so any bead that has
+// ever been heartbeated carries a committed liveness key forever after and stays
+// in the candidate set from then on. The fence stamp does the same for any bead
+// that ever took a degraded or transactional write.
+//
+// Get is deliberately NOT filtered — a single-bead read is one point query, and
+// the fencing and lifecycle paths that read one bead must always be exact.
+func beadMayCarryLiveness(b beads.Bead) bool {
+	if b.Type == sessionBeadType {
+		return true
+	}
+	for _, label := range b.Labels {
+		if label == sessionBeadLabel {
+			return true
+		}
+	}
+	for k := range b.Metadata {
+		if liveness.IsKey(k) || liveness.IsMarkerKey(k) {
+			return true
+		}
+	}
+	return false
 }
 
 // applyLivenessSnapshot merges one snapshot onto one bead. Absent keys fall back

@@ -64,6 +64,13 @@ type livenessBinding struct {
 	retryAfter  time.Duration
 	dialing     bool
 	warned      bool
+	// clockOffset is the last known (server - local) skew, retained across a
+	// retired pool. Fallback stamps are minted exactly when the store is
+	// UNAVAILABLE, so falling back to the raw local clock at that moment would
+	// mint the fence in the wrong timebase and it would fence nothing (or
+	// everything). The last measured offset is a far better estimate than zero.
+	clockOffset     time.Duration
+	haveClockOffset bool
 }
 
 // livenessBindings memoizes one binding per scope root so a process opens at
@@ -188,6 +195,67 @@ func (b *livenessBinding) dial() liveness.Store {
 	return b.store
 }
 
+// Now reports the liveness endpoint's clock — the timebase fallback stamps must
+// be minted in, because written_at is minted server-side. With no store open
+// there is nothing to calibrate against and the local clock is the best
+// available estimate.
+func (b *livenessBinding) Now() time.Time {
+	if b == nil {
+		return time.Now().UTC()
+	}
+	b.mu.Lock()
+	store, offset, have := b.store, b.clockOffset, b.haveClockOffset
+	b.mu.Unlock()
+	if store != nil {
+		return store.Now()
+	}
+	if have {
+		return time.Now().UTC().Add(offset)
+	}
+	return time.Now().UTC()
+}
+
+// rememberClockOffset records the skew a live store reports so Now() keeps
+// returning server time after that store is retired.
+func (b *livenessBinding) rememberClockOffset(store liveness.Store) {
+	if b == nil || store == nil {
+		return
+	}
+	b.clockOffset = store.Now().Sub(time.Now().UTC())
+	b.haveClockOffset = true
+}
+
+// noteOpError retires the pooled handle when err says the transport is gone.
+//
+// database/sql reconnects on its own, but only to the SAME address — and the
+// failure this exists for is a managed-Dolt hard-kill/rebind, which moves the
+// PORT. Without this the pool dials the dead port forever and liveness silently
+// reverts to committing for the life of the process (which is also what arms the
+// stale-shadow the fence guards against). The bead store solves the identical
+// problem with WithNativeReopen; this is the same idea, one layer up: drop the
+// handle, let the backoff gate the next attempt, and re-RESOLVE the endpoint
+// rather than re-dialing the cached one.
+//
+// A statement-level error (bad SQL, constraint) is left alone: retiring the pool
+// for those would turn one bad query into an endpoint flap.
+func (b *livenessBinding) noteOpError(err error) {
+	if b == nil || !liveness.IsConnectionError(err) {
+		return
+	}
+	b.mu.Lock()
+	store := b.store
+	b.store = nil
+	// Arm the backoff from NOW so a storm of in-flight operations all failing at
+	// once produces one re-dial, not one per operation.
+	b.lastAttempt = time.Now()
+	b.retryAfter = livenessOpenRetryInterval
+	b.warned = false
+	b.mu.Unlock()
+	if store != nil {
+		_ = store.Close()
+	}
+}
+
 // setStoreForTest installs a store directly, bypassing the dialer.
 func (b *livenessBinding) setStoreForTest(store liveness.Store, mode liveness.Mode) {
 	if b == nil {
@@ -196,6 +264,7 @@ func (b *livenessBinding) setStoreForTest(store liveness.Store, mode liveness.Mo
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.store = store
+	b.rememberClockOffset(store)
 	b.mode = mode
 }
 
@@ -203,6 +272,7 @@ func (b *livenessBinding) setStoreForTest(store liveness.Store, mode liveness.Mo
 func newLivenessBindingForTest(store liveness.Store, mode liveness.Mode) *livenessBinding {
 	b := &livenessBinding{mode: mode}
 	b.store = store
+	b.rememberClockOffset(store)
 	return b
 }
 
@@ -242,7 +312,14 @@ func openScopeLivenessStore(cityPath, scopeRoot string) (liveness.Store, error) 
 		_ = db.Close()
 		return nil, err
 	}
-	return liveness.NewSQLStore(db), nil
+	store := liveness.NewSQLStore(db)
+	// Calibrate against the server clock so fallback stamps and the server-minted
+	// written_at they fence share a timebase. Best-effort: an uncalibrated store
+	// falls back to the local clock, which is exact for a same-host managed Dolt.
+	if err := store.Calibrate(ctx); err != nil {
+		log.Printf("session liveness: %s: server clock uncalibrated, fallback stamps use the local clock: %v", scopeRoot, err)
+	}
+	return store, nil
 }
 
 // livenessOpContext bounds one liveness read or write.

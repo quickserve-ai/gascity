@@ -3,11 +3,19 @@ package liveness
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
+
+	"github.com/go-sql-driver/mysql"
 )
 
 // TableName is the non-versioned table holding session-liveness rows. It is
@@ -27,8 +35,15 @@ type Snapshot struct {
 	// meaningful entry: it means the key was CLEARED, and the overlay must
 	// project that empty value rather than falling back to committed metadata.
 	Values map[string]string
+	// Times carries each row's OWN written_at. The overlay fences PER KEY
+	// against the bead's FallbackAtKey stamp, so a bead-level max is not
+	// sufficient: after a degraded write, one key may have been refreshed since
+	// the fallback while its siblings are still pre-outage rows that must be
+	// dropped.
+	Times map[string]time.Time
 	// WrittenAt is max(written_at) across the bead's rows — the bead's "last
-	// liveness write" clock. Zero when the bead has no rows.
+	// liveness write" clock, and the value the overlay projects as WrittenAtKey.
+	// Zero when the bead has no rows.
 	WrittenAt time.Time
 }
 
@@ -47,6 +62,11 @@ type Store interface {
 	// GetMany returns snapshots for the requested beads. Beads with no rows are
 	// simply absent from the result map.
 	GetMany(ctx context.Context, beadIDs []string) (map[string]Snapshot, error)
+	// Now returns this store's best estimate of the SERVER's clock. Fallback
+	// stamps are minted from it so a stamp written by a client whose clock
+	// differs from the Dolt host's still compares correctly against the
+	// server-minted written_at values it fences.
+	Now() time.Time
 	// Close releases the store's resources.
 	Close() error
 }
@@ -70,6 +90,14 @@ type DB interface {
 // in-process handle to borrow.
 type SQLStore struct {
 	db DB
+	// clockOffsetNanos is (server clock - local clock), measured at open. Every
+	// row's written_at is minted SERVER-side (UTC_TIMESTAMP(6)), so a fallback
+	// stamp minted from an unadjusted local clock would compare against a
+	// different timebase on any scope whose Dolt lives on another host — and a
+	// client running behind the server would fail to fence exactly the stale
+	// rows the stamp exists to fence. Calibrate turns local time into
+	// server time so the two are comparable.
+	clockOffsetNanos atomic.Int64
 	// getMaxIDs bounds the id list in one GetMany statement. Larger batches are
 	// chunked. Dolt plans `bead_id IN (...)` as a primary-key prefix probe, so
 	// the chunk size only bounds statement text, not work.
@@ -83,6 +111,46 @@ var _ Store = (*SQLStore)(nil)
 // pointed db at the SAME database that holds the scope's `issues` table.
 func NewSQLStore(db DB) *SQLStore {
 	return &SQLStore{db: db, getMaxIDs: 400}
+}
+
+// Calibrate measures the server clock against the local one so Now() can report
+// server time. It is best-effort: a failure leaves the offset at zero, which is
+// exactly the local-clock behavior, and is correct for the overwhelmingly common
+// case of a managed Dolt on the same host.
+func (s *SQLStore) Calibrate(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("liveness: store not open")
+	}
+	rows, err := s.db.QueryContext(ctx, "SELECT UTC_TIMESTAMP(6)")
+	if err != nil {
+		return fmt.Errorf("liveness: reading server clock: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("liveness: reading server clock: %w", err)
+		}
+		return fmt.Errorf("liveness: server clock returned no row")
+	}
+	var raw any
+	if err := rows.Scan(&raw); err != nil {
+		return fmt.Errorf("liveness: reading server clock: %w", err)
+	}
+	local := time.Now().UTC()
+	server := parseWrittenAt(raw)
+	if server.IsZero() {
+		return fmt.Errorf("liveness: server clock unparseable")
+	}
+	s.clockOffsetNanos.Store(server.Sub(local).Nanoseconds())
+	return nil
+}
+
+// Now returns local time shifted onto the server's clock.
+func (s *SQLStore) Now() time.Time {
+	if s == nil {
+		return time.Now().UTC()
+	}
+	return time.Now().UTC().Add(time.Duration(s.clockOffsetNanos.Load()))
 }
 
 // Close closes the underlying handle.
@@ -114,8 +182,6 @@ func (s *SQLStore) SetBatch(ctx context.Context, beadID string, kv map[string]st
 	if err != nil {
 		return err
 	}
-	now := time.Now().UTC()
-
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("liveness: begin: %w", err)
@@ -126,10 +192,14 @@ func (s *SQLStore) SetBatch(ctx context.Context, beadID string, kv map[string]st
 			_ = tx.Rollback()
 		}
 	}()
-	const stmt = "INSERT INTO " + TableName + " (bead_id, k, v, written_at) VALUES (?, ?, ?, ?) " +
-		"ON DUPLICATE KEY UPDATE v = VALUES(v), written_at = VALUES(written_at)"
+	// written_at is minted SERVER-side. A client clock is not a safe timebase for
+	// a value the fence compares against: two gc processes on different hosts
+	// would otherwise write rows whose ordering does not reflect reality, and a
+	// client running behind the Dolt host would defeat the FallbackAtKey fence.
+	const stmt = "INSERT INTO " + TableName + " (bead_id, k, v, written_at) VALUES (?, ?, ?, UTC_TIMESTAMP(6)) " +
+		"ON DUPLICATE KEY UPDATE v = VALUES(v), written_at = UTC_TIMESTAMP(6)"
 	for _, k := range keysToWrite {
-		if _, err := tx.ExecContext(ctx, stmt, beadID, k, kv[k], now); err != nil {
+		if _, err := tx.ExecContext(ctx, stmt, beadID, k, kv[k]); err != nil {
 			return fmt.Errorf("liveness: upsert %s[%s]: %w", beadID, k, err)
 		}
 	}
@@ -241,9 +311,10 @@ func (s *SQLStore) query(ctx context.Context, ids []string) (map[string]Snapshot
 		writtenAt := parseWrittenAt(rawWritten)
 		snap, ok := out[beadID]
 		if !ok {
-			snap = Snapshot{Values: make(map[string]string, 8)}
+			snap = Snapshot{Values: make(map[string]string, 8), Times: make(map[string]time.Time, 8)}
 		}
 		snap.Values[k] = v
+		snap.Times[k] = writtenAt
 		if writtenAt.After(snap.WrittenAt) {
 			snap.WrittenAt = writtenAt
 		}
@@ -253,6 +324,54 @@ func (s *SQLStore) query(ctx context.Context, ids []string) (map[string]Snapshot
 		return nil, fmt.Errorf("liveness: read: %w", err)
 	}
 	return out, nil
+}
+
+// IsConnectionError reports whether err is a transport-class failure — the
+// connection is gone or was never established — as opposed to a statement the
+// server rejected. Callers use it to decide whether to throw away a pooled
+// handle and re-resolve the endpoint: a managed Dolt hard-kill/rebind moves the
+// PORT, so database/sql's own reconnect (which re-dials the SAME address) can
+// never recover it and the pool stays dead for the life of the process.
+//
+// Matching is by error identity where the driver offers one and by message
+// shape otherwise; the driver does not export a single sentinel that covers
+// every path (a dead server surfaces as driver.ErrBadConn, as
+// mysql.ErrInvalidConn, or as a bare *net.OpError depending on when it dies).
+// A false positive costs one re-resolve; a false negative costs the outage.
+func IsConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, mysql.ErrInvalidConn) ||
+		errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF) ||
+		errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.EPIPE) {
+		return true
+	}
+	var netErr *net.OpError
+	if errors.As(err, &netErr) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"invalid connection",
+		"bad connection",
+		"broken pipe",
+		"connection refused",
+		"connection reset",
+		"can't connect",
+		"cannot connect",
+		"no such host",
+		"server has gone away",
+		"use of closed network connection",
+		"database is closed",
+		"sql: database is closed",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // writtenAtLayouts are the textual DATETIME(6) shapes a driver returns when it
@@ -318,8 +437,8 @@ func dedupeIDs(in []string) []string {
 type MemStore struct {
 	mu   sync.Mutex
 	rows map[string]map[string]memRow
-	// Now, when set, supplies the write timestamp (tests pin it).
-	Now func() time.Time
+	// Clock, when set, supplies the write timestamp (tests pin it).
+	Clock func() time.Time
 }
 
 type memRow struct {
@@ -346,10 +465,7 @@ func (m *MemStore) SetBatch(_ context.Context, beadID string, kv map[string]stri
 	if _, err := sortedWritableKeys(kv); err != nil {
 		return err
 	}
-	now := time.Now().UTC()
-	if m.Now != nil {
-		now = m.Now()
-	}
+	now := m.Now()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.rows == nil {
@@ -391,9 +507,13 @@ func (m *MemStore) snapshotLocked(beadID string) Snapshot {
 	if len(bead) == 0 {
 		return Snapshot{}
 	}
-	snap := Snapshot{Values: make(map[string]string, len(bead))}
+	snap := Snapshot{
+		Values: make(map[string]string, len(bead)),
+		Times:  make(map[string]time.Time, len(bead)),
+	}
 	for k, row := range bead {
 		snap.Values[k] = row.value
+		snap.Times[k] = row.writtenAt
 		if row.writtenAt.After(snap.WrittenAt) {
 			snap.WrittenAt = row.writtenAt
 		}
@@ -401,8 +521,28 @@ func (m *MemStore) snapshotLocked(beadID string) Snapshot {
 	return snap
 }
 
+// Now reports the store's clock. An in-process store has no server to skew
+// against, so this is simply the local clock unless a test pins Clock.
+func (m *MemStore) Now() time.Time {
+	if m != nil && m.Clock != nil {
+		return m.Clock().UTC()
+	}
+	return time.Now().UTC()
+}
+
 // Close is a no-op.
 func (m *MemStore) Close() error { return nil }
+
+// keyIsFenced reports whether the bead's fallback stamp applies to key. A stamp
+// with no key list fences the whole bead — the conservative reading for data
+// this code did not write.
+func keyIsFenced(key string, fenced map[string]struct{}) bool {
+	if fenced == nil {
+		return true
+	}
+	_, ok := fenced[key]
+	return ok
+}
 
 // Overlay merges a bead's liveness snapshot over a copy of its committed
 // metadata and returns the merged map. Keys present in the snapshot WIN
@@ -410,23 +550,67 @@ func (m *MemStore) Close() error { return nil }
 // the committed metadata holds — the natural carry-over that lets pre-existing
 // session beads work with no migration step.
 //
-// When the snapshot has rows, WrittenAtKey is stamped with its clock so
+// THE FENCE. A row only wins if it was written AFTER the bead's FallbackAtKey
+// stamp. That stamp is committed alongside any liveness values that had to go
+// to versioned metadata — a degraded write, a transactional write, or every
+// write in ModeMetadata — and it is what stops a pre-outage row from shadowing
+// the post-outage committed value once the liveness pool recovers. Without it
+// the overlay is unconditional across arbitrary time, and a recovered pool
+// resurrects a stale instance_token / generation / pending_create_claim into
+// the wake-fencing path.
+//
+// The comparison is per KEY, against each row's own written_at, because a
+// degraded write is usually followed by successful ones: the keys refreshed
+// since the fallback must keep winning while their pre-outage siblings are
+// dropped. A row exactly AT the stamp is dropped — the stamp is minted at the
+// moment the versioned write is composed, so anything not strictly newer lost
+// the race to it.
+//
+// The fence is also SCOPED to the keys the fallback actually committed
+// (FallbackKeysKey). A key the fallback did not write has no newer committed
+// value to be shadowed, so fencing it would swap live telemetry for whatever
+// ancient value the bead happens to carry — see FallbackKeysKey.
+//
+// When any row survives, WrittenAtKey is stamped with the surviving max so
 // freshness consumers have a replacement for the now-quiet Bead.UpdatedAt.
-// A zero-value snapshot returns meta unchanged (same map, not a copy) so the
-// no-liveness case allocates nothing.
+// A snapshot with nothing to contribute returns meta unchanged (same map, not a
+// copy) so the no-liveness case allocates nothing.
 func Overlay(meta map[string]string, snap Snapshot) map[string]string {
 	if len(snap.Values) == 0 {
 		return meta
 	}
+	fence := ParseFence(meta[FallbackAtKey])
+	fenced := ParseFenceKeys(meta[FallbackKeysKey])
 	merged := make(map[string]string, len(meta)+len(snap.Values)+1)
 	for k, v := range meta {
 		merged[k] = v
 	}
+	newest := time.Time{}
+	applied := false
 	for k, v := range snap.Values {
+		if !fence.IsZero() && keyIsFenced(k, fenced) {
+			written, ok := snap.Times[k]
+			// A row with no usable timestamp cannot prove it postdates the
+			// fence, so a fenced bead drops it. Fail closed: the committed
+			// value is the one the fallback write just recorded.
+			if !ok || written.IsZero() || !written.After(fence) {
+				continue
+			}
+		}
 		merged[k] = v
+		applied = true
+		if written, ok := snap.Times[k]; ok && written.After(newest) {
+			newest = written
+		}
 	}
-	if !snap.WrittenAt.IsZero() {
-		merged[WrittenAtKey] = snap.WrittenAt.UTC().Format(time.RFC3339Nano)
+	if !applied {
+		return meta
+	}
+	if newest.IsZero() {
+		newest = snap.WrittenAt
+	}
+	if !newest.IsZero() {
+		merged[WrittenAtKey] = newest.UTC().Format(StampFormat)
 	}
 	return merged
 }

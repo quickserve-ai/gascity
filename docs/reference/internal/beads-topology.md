@@ -215,13 +215,27 @@ Three consequences worth knowing:
 | Value | Behavior |
 |---|---|
 | `table` (default) | Split writes as above. Liveness keys never reach the versioned table. |
-| `metadata` | Rollback. The full patch goes to versioned bead metadata exactly as before (restoring the commit churn); liveness keys are still mirrored into the table so the read overlay never shadows fresh committed values with frozen rows. |
+| `metadata` | Rollback. The full patch goes to versioned bead metadata (restoring the commit volume), fenced so the committed value is authoritative; liveness keys are still mirrored into the table so a flip back to `table` finds them current. |
 
-Reads always apply the overlay, in both modes — harmless when the table is
-empty, and what makes the flag reversible in both directions. A scope with no
-reachable Dolt endpoint (a `file` or `doltlite` provider, or a server that is
-down) degrades to the `metadata` behavior on its own: liveness keeps working,
-it just costs commits again until the endpoint comes back.
+The flag is read once per scope when that scope's store is first bound and
+cached for the life of the process, so changing it means restarting the
+processes that should observe it — the controller, not just the next CLI call.
+
+**Reads always apply the overlay, in both modes**, because a process cannot know
+which mode wrote a given row. What keeps a table row from shadowing a committed
+value is a fence, not a mode: any write whose liveness half went to versioned
+metadata — a degraded write, a write inside a transaction, or every write under
+`metadata` mode — also commits `gc.liveness_fallback_at`, and the overlay drops
+every row written at or before that stamp. A later successful table write is
+newer than the stamp and takes over again on its own.
+
+That fence is what makes the degraded path safe. A scope whose Dolt endpoint is
+unreachable (a `file` or `doltlite` provider, or a server that is down) writes
+liveness to versioned metadata instead — it costs commits again until the
+endpoint returns, but the rows the outage left behind can never come back and
+shadow it. Timestamps on both sides of the comparison are minted on the Dolt
+server (`written_at` via `UTC_TIMESTAMP(6)`; the stamp via the store's measured
+clock offset), so a scope whose Dolt lives on another host compares correctly.
 
 ## Going further
 
