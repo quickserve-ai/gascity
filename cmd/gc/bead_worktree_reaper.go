@@ -63,8 +63,9 @@ type reapReport struct {
 //     against the race between worktree creation and its owning bead's
 //     work-dir metadata being stamped by the next reconcile pass. An
 //     indeterminate age (the ".git" pointer file cannot be stat'd) protects.
-//  4. Git state: no uncommitted changes, no unpushed commits, no stashes.
-//     This is the CHEAP, LOCAL gate (three git subprocesses against the
+//  4. Git state: no uncommitted changes, no unpushed commits. Stashes are
+//     deliberately not consulted — see gitSafetyReason (ga-gsfxag).
+//     This is the CHEAP, LOCAL gate (two git subprocesses against the
 //     worktree itself), so it runs before the two expensive signals below;
 //     a candidate it protects never triggers them (ga-singc6).
 //  5. Borrow-veto scan: batched once per rig per tick over the candidates
@@ -243,7 +244,7 @@ func reapClosedBeadWorktrees(
 			continue
 		}
 
-		// Git safety gate FIRST (ga-singc6). It is local and cheap — three git
+		// Git safety gate FIRST (ga-singc6). It is local and cheap — two git
 		// subprocesses against the worktree — while the two gates after it are
 		// a full remote store scan and a host-wide process-table scan. On the
 		// live fleet a single worktree sat protected by this gate for 11 hours
@@ -392,23 +393,32 @@ type reapCandidate struct {
 }
 
 // gitSafetyReason applies the git-state gate to one worktree and returns the
-// protecting reason, or "" when the tree is clean, fully pushed, and the repo
-// carries no stashes. Probe failures fail closed with their own reason. The
-// stash probe is repo-global by construction (`git stash list` reads
-// refs/stash of the common repository), so one stash anywhere in the repo
-// protects every worktree of that repo — see ga-gsfxag.
+// protecting reason, or "" when the tree is clean and fully pushed. Probe
+// failures fail closed with their own reason.
+//
+// Stashes are deliberately NOT a veto here (ga-gsfxag), even though "protect
+// when stashes exist" reads as obviously safe. A stash lives in refs/stash of
+// the COMMON repository, never in a linked worktree, and `git stash list` is
+// repo-global — so a stash veto lets one stash anywhere in the repo protect
+// every worktree of that repo forever (measured on the fleet: 99.1% of all
+// reap_skipped events, every one a clean, fully-pushed tree). And STASHED
+// WORK specifically cannot be lost by the reap: it removes trees via
+// `git worktree remove`, which never touches refs/stash and refuses to remove
+// a main worktree — the only tree whose deletion could carry refs/stash away.
+// (Removal does discard the worktree's PRIVATE admin state — HEAD reflog,
+// refs/worktree/*, refs/bisect/*, config.worktree. This gate has never
+// protected those, with or without the stash veto; the dirty/unpushed probes
+// are the per-worktree signals that guard authored work.)
+// Do not re-add a stash condition without scoping it to loss that is possible.
 func gitSafetyReason(worktreePath string) string {
 	wg := git.New(worktreePath)
 	hasUncommitted := wg.HasUncommittedWork()
 	hasUnpushed, unpushedErr := wg.HasUnpushedCommitsResult()
-	hasStashes, stashesErr := wg.HasStashesResult()
 	switch {
 	case unpushedErr != nil:
 		return "unpushed commit probe failed (failing closed): " + unpushedErr.Error()
-	case stashesErr != nil:
-		return "stash probe failed (failing closed): " + stashesErr.Error()
-	case hasUncommitted || hasUnpushed || hasStashes:
-		return fmt.Sprintf("unsafe git state: uncommitted=%v unpushed=%v stashes=%v", hasUncommitted, hasUnpushed, hasStashes)
+	case hasUncommitted || hasUnpushed:
+		return fmt.Sprintf("unsafe git state: uncommitted=%v unpushed=%v", hasUncommitted, hasUnpushed)
 	}
 	return ""
 }

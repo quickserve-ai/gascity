@@ -168,9 +168,9 @@ func (s *reapListCountingStore) List(q beads.ListQuery) ([]beads.Bead, error) {
 }
 
 // The live-fleet shape behind ga-singc6: ONE candidate, protected every tick
-// by the git gate (here an uncommitted file; on the fleet a repo-global stash,
-// ga-gsfxag). The verdict is decided locally, so neither the store scan nor
-// the process-table scan may run.
+// by the git gate (an uncommitted file; historically the repo-global stash
+// veto, since removed by ga-gsfxag). The verdict is decided locally, so
+// neither the store scan nor the process-table scan may run.
 func TestReapClosedBeadWorktrees_GitProtectedCandidateSkipsStoreAndProcessScans(t *testing.T) {
 	cityPath, rigRoot := initReapRig(t)
 	wt := addClosedWorktree(t, rigRoot, cityPath, "polecats", "ga-dirty001")
