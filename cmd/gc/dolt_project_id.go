@@ -491,6 +491,14 @@ func formatLegacyL2L3MismatchError(l2, l3 string) error {
 }
 
 func managedDoltOpenDatabase(host, port, user, database string) (*sql.DB, error) {
+	return managedDoltOpenDatabaseAuthed(host, port, user, "", database)
+}
+
+// managedDoltOpenDatabaseAuthed opens a database handle with an explicitly
+// resolved password (doltauth.Resolve for the owning scope). An empty password
+// keeps the managed-ambient behavior: managedDoltPassword is endpoint-bound and
+// returns empty for anything but the local managed server.
+func managedDoltOpenDatabaseAuthed(host, port, user, password, database string) (*sql.DB, error) {
 	host = managedDoltConnectHost(host)
 	port = strings.TrimSpace(port)
 	if port == "" {
@@ -504,9 +512,12 @@ func managedDoltOpenDatabase(host, port, user, database string) (*sql.DB, error)
 	if database == "" {
 		return nil, fmt.Errorf("missing database")
 	}
+	if strings.TrimSpace(password) == "" {
+		password = managedDoltPassword(host, port)
+	}
 	cfg := mysql.NewConfig()
 	cfg.User = user
-	cfg.Passwd = managedDoltPassword(host, port)
+	cfg.Passwd = password
 	cfg.Net = "tcp"
 	cfg.Addr = host + ":" + port
 	cfg.DBName = database
