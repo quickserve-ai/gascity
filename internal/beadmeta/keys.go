@@ -183,6 +183,7 @@ const (
 	LastFailureClassMetadataKey         = "gc.last_failure_class"
 	LastFinalizeErrorMetadataKey        = "gc.last_finalize_error"
 	LeaseOwnerMetadataKey               = "gc.lease_owner"
+	LivenessWrittenAtMetadataKey        = "gc.liveness_written_at"
 	LogicalBeadIDMetadataKey            = "gc.logical_bead_id"
 	MaxAttemptsMetadataKey              = "gc.max_attempts"
 	MissingRootBeadIDMetadataKey        = "gc.missing_root_bead_id"
@@ -204,31 +205,38 @@ const (
 	PackRootMetadataKey                 = "gc.pack_root"
 	PackWorkspaceMetadataKey            = "gc.pack_workspace"
 	PerDispatchModelMetadataKey         = "gc.per_dispatch_model"
-	RalphStepIDMetadataKey              = "gc.ralph_step_id"
-	ReasoningMetadataKey                = "gc.reasoning"
-	RequiredArtifactMetadataKey         = "gc.required_artifact"
-	RequiredArtifactsMetadataKey        = "gc.required_artifacts"
-	ReviewGateMetadataKey               = "gc.review_gate"
-	RetryCountMetadataKey               = "gc.retry_count"
-	RetryFromMetadataKey                = "gc.retry_from"
-	RetrySessionRecycledMetadataKey     = "gc.retry_session_recycled"
-	RetryStateMetadataKey               = "gc.retry_state"
-	RigRootMetadataKey                  = "gc.rig_root"
-	RootBeadIDMetadataKey               = "gc.root_bead_id"
-	RootSettleFailedAtMetadataKey       = "gc.root_settle_failed_at"
-	RootSettleFailedMetadataKey         = "gc.root_settle_failed"
-	RootStoreRefMetadataKey             = "gc.root_store_ref"
-	RouteQuarantineMetadataKey          = "gc.route_recovery_quarantined"
-	RouteQuarantineReasonMetadataKey    = "gc.route_recovery_quarantine_reason"
-	RoutedToMetadataKey                 = "gc.routed_to"
-	RunTargetMetadataKey                = "gc.run_target"
-	RuntimeVarsMetadataKey              = "gc.graphv2_vars.v1"
-	ScopeKindMetadataKey                = "gc.scope_kind"
-	ScopeNameMetadataKey                = "gc.scope_name"
-	ScopeRefMetadataKey                 = "gc.scope_ref"
-	ScopeRoleMetadataKey                = "gc.scope_role"
-	SessionAffinityMetadataKey          = "gc.session_affinity"
-	SessionIDMetadataKey                = "gc.session_id"
+	// PrevSessionIDMetadataKey preserves the session back-reference a claim
+	// displaced: when gc hook --claim takes over a bead whose gc.session_id
+	// named a different (no longer live) session, the displaced id is kept
+	// here so recovery can detect the takeover instead of finding the prior
+	// owner erased (ga-pzop1c).
+	PrevSessionIDMetadataKey         = "gc.prev_session_id"
+	PRURLMetadataKey                 = "gc.pr_url"
+	RalphStepIDMetadataKey           = "gc.ralph_step_id"
+	ReasoningMetadataKey             = "gc.reasoning"
+	RequiredArtifactMetadataKey      = "gc.required_artifact"
+	RequiredArtifactsMetadataKey     = "gc.required_artifacts"
+	ReviewGateMetadataKey            = "gc.review_gate"
+	RetryCountMetadataKey            = "gc.retry_count"
+	RetryFromMetadataKey             = "gc.retry_from"
+	RetrySessionRecycledMetadataKey  = "gc.retry_session_recycled"
+	RetryStateMetadataKey            = "gc.retry_state"
+	RigRootMetadataKey               = "gc.rig_root"
+	RootBeadIDMetadataKey            = "gc.root_bead_id"
+	RootSettleFailedAtMetadataKey    = "gc.root_settle_failed_at"
+	RootSettleFailedMetadataKey      = "gc.root_settle_failed"
+	RootStoreRefMetadataKey          = "gc.root_store_ref"
+	RouteQuarantineMetadataKey       = "gc.route_recovery_quarantined"
+	RouteQuarantineReasonMetadataKey = "gc.route_recovery_quarantine_reason"
+	RoutedToMetadataKey              = "gc.routed_to"
+	RunTargetMetadataKey             = "gc.run_target"
+	RuntimeVarsMetadataKey           = "gc.graphv2_vars.v1"
+	ScopeKindMetadataKey             = "gc.scope_kind"
+	ScopeNameMetadataKey             = "gc.scope_name"
+	ScopeRefMetadataKey              = "gc.scope_ref"
+	ScopeRoleMetadataKey             = "gc.scope_role"
+	SessionAffinityMetadataKey       = "gc.session_affinity"
+	SessionIDMetadataKey             = "gc.session_id"
 	// SessionIDCamelMetadataKey is the camelCase variant some bead writers stamp
 	// alongside the snake_case SessionIDMetadataKey; both are read when resolving a
 	// bead's session link.
@@ -338,6 +346,16 @@ const (
 // variables are written as gc.var.<name>. The suffix is open-world (a
 // user-authored variable name), so it is declared as a prefix, not enumerated.
 const FormulaVarPrefix = Namespace + "var."
+
+// LivenessFencePrefix begins the per-key fence markers the session-liveness
+// machinery commits into VERSIONED metadata whenever a liveness value had to
+// go to bead metadata instead of the non-versioned session_liveness table (a
+// degraded write, a transactional write, or metadata mode). One marker per
+// fenced key — "gc.liveness_fence.state" — whose value is the commit moment;
+// the read overlay drops table rows written at or before it. The suffix is
+// the fenced liveness key, so the family is declared as a prefix. Producer
+// and sole consumer: internal/liveness (which aliases this constant).
+const LivenessFencePrefix = Namespace + "liveness_fence."
 
 // IdemPrefix is the key prefix for the remote rig-create idempotency record's
 // metadata (gc.idem.kind/city/request_id/digest/state/event_cursor/rig_name,
@@ -542,6 +560,7 @@ var KnownMetadataKeys = []string{
 	LastFailureClassMetadataKey,
 	LastFinalizeErrorMetadataKey,
 	LeaseOwnerMetadataKey,
+	LivenessWrittenAtMetadataKey,
 	LogicalBeadIDMetadataKey,
 	MaxAttemptsMetadataKey,
 	MissingRootBeadIDMetadataKey,
@@ -563,6 +582,8 @@ var KnownMetadataKeys = []string{
 	PackRootMetadataKey,
 	PackWorkspaceMetadataKey,
 	PerDispatchModelMetadataKey,
+	PrevSessionIDMetadataKey,
+	PRURLMetadataKey,
 	RalphStepIDMetadataKey,
 	ReasoningMetadataKey,
 	RequiredArtifactMetadataKey,
@@ -634,6 +655,7 @@ var KnownMetadataKeys = []string{
 var KnownMetadataPrefixes = []string{
 	FormulaVarPrefix,
 	IdemPrefix,
+	LivenessFencePrefix,
 }
 
 // SessionAffinityMetadataKeys are the metadata keys that pin a work bead to a
