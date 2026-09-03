@@ -225,17 +225,37 @@ processes that should observe it — the controller, not just the next CLI call.
 which mode wrote a given row. What keeps a table row from shadowing a committed
 value is a fence, not a mode: any write whose liveness half went to versioned
 metadata — a degraded write, a write inside a transaction, or every write under
-`metadata` mode — also commits `gc.liveness_fallback_at`, and the overlay drops
-every row written at or before that stamp. A later successful table write is
-newer than the stamp and takes over again on its own.
+`metadata` mode — also commits one fence marker **per liveness key it wrote**,
+`gc.liveness_fence.<key>`, whose value is the moment of that write. The overlay
+drops a key's row when the row was written at or before that key's own marker,
+and leaves a key with no marker alone — nothing ever committed a newer value for
+it, so its row is the freshest thing anyone has. A later successful table write
+is newer than the stamp and takes over again on its own.
+
+Per key, so the markers **accumulate**. A second fallback covering a different
+key set adds its own markers and leaves the first one's standing; so does the
+second batch of a multi-batch transaction. A single stamp plus a list of fenced
+keys would be last-write-wins on both halves, so the later write would un-fence
+the earlier one's keys and let their pre-outage rows win again.
 
 That fence is what makes the degraded path safe. A scope whose Dolt endpoint is
 unreachable (a `file` or `doltlite` provider, or a server that is down) writes
 liveness to versioned metadata instead — it costs commits again until the
 endpoint returns, but the rows the outage left behind can never come back and
 shadow it. Timestamps on both sides of the comparison are minted on the Dolt
-server (`written_at` via `UTC_TIMESTAMP(6)`; the stamp via the store's measured
-clock offset), so a scope whose Dolt lives on another host compares correctly.
+server (`written_at` via `UTC_TIMESTAMP(6)`; the stamp via the clock offset the
+store measures when it dials and retains across a retired pool), so a scope
+whose Dolt lives on another host compares correctly.
+
+Transactions get one further step. A transaction's fences are minted while its
+callback runs, but it does not commit until that callback returns — so a row
+another process writes in the gap is stamped *after* the fence and survives it.
+Once the transaction commits, `gc` **deletes** the table rows for exactly the
+keys it fenced: with no row at all the overlay falls through to the committed
+metadata the transaction just made authoritative. That sweep is best-effort and
+necessarily runs after the commit, so a crash in the sliver between them leaves
+those rows in place — the fence still bounds what can survive, and the next
+healthy write for that key overwrites the row.
 
 ## Going further
 
