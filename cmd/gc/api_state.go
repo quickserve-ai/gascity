@@ -293,9 +293,26 @@ func wrapWithCachingStore(ctx context.Context, store beads.Store, ep events.Prov
 	return cs
 }
 
+// primeArmBound is how long the initial full prime may run before the
+// reconciler is armed anyway. A prime that FAILS already falls through to
+// StartReconciler; a prime that HANGS did not, and that is a different and
+// worse outage: CachingStore.Prime blocks in backing.List, which takes no
+// context, so neither ctx cancellation nor a timeout on ctx can interrupt it.
+//
+// Generous on purpose. A healthy full scan finishes well inside the
+// reconciler's own 30-60s cadence, so this only ever fires on a genuinely
+// stuck scan, and firing it early costs one concurrent full scan. The
+// alternative is what ga-yc0chj measured: the city rig's prime never returned,
+// StartReconciler was never reached, and the controller reconciled nothing for
+// 3h31m while the qc rig ticked normally — a stall that is invisible because a
+// partial cache is still served, so every non-Live read is answered
+// confidently from a frozen snapshot.
+// A var, not a const, only so the test that hangs a prime can shorten it.
+var primeArmBound = 5 * time.Minute
+
 // primeThenStartReconciler runs the async full prime and then arms the
-// watchdog reconciler. The reconciler starts even when the prime fails:
-// its periodic full scan loads the same snapshot a successful prime
+// watchdog reconciler. The reconciler starts even when the prime fails or
+// HANGS: its periodic full scan loads the same snapshot a successful prime
 // would and promotes the cache to live, so a transient prime failure at
 // startup heals on the next reconcile cycle. Without this, one failed
 // prime left the store serving its PrimeActive-era snapshot for the
@@ -303,10 +320,27 @@ func wrapWithCachingStore(ctx context.Context, store beads.Store, ep events.Prov
 // storage-level state created before a restart (e.g. routed pool work
 // feeding scale-check demand) stayed invisible until something else
 // touched the bead. Only shutdown (ctx canceled) skips the reconciler.
+//
+// A prime left running past primeArmBound is NOT abandoned or cancelled — it
+// keeps going and applies its snapshot if it ever completes. That is safe
+// because prime discards its result unless c.mutationSeq is unchanged, so a
+// late prime cannot overwrite anything the now-running reconciler has done.
 func primeThenStartReconciler(ctx context.Context, cs *beads.CachingStore, agentID string) {
 	log.Printf("caching-store: priming ...")
-	if err := cs.Prime(ctx); err != nil {
-		log.Printf("caching-store: prime FAILED: %v (reads use bd subprocess until the reconciler converges)", err)
+	primed := make(chan error, 1)
+	go func() { primed <- cs.Prime(ctx) }()
+
+	timer := time.NewTimer(primeArmBound)
+	defer timer.Stop()
+	select {
+	case err := <-primed:
+		if err != nil {
+			log.Printf("caching-store: prime FAILED: %v (reads use bd subprocess until the reconciler converges)", err)
+		}
+	case <-timer.C:
+		log.Printf("caching-store: prime still running after %s; arming the reconciler anyway (a hung prime must not disable reconciliation — ga-yc0chj)", primeArmBound)
+	case <-ctx.Done():
+		return
 	}
 	if ctx.Err() != nil {
 		return
