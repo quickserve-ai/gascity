@@ -807,7 +807,9 @@ func hookClaimSessionEligibility(info session.Info, instanceToken string) (hookC
 // federated set is a bd WORKSPACE, and a relocated coordination class is not
 // one, so the binding is reached through the ops rather than through a leg. On a
 // city that relocates nothing the route is nil and the ops are the work-store
-// ops alone.
+// ops alone: the invocation's own (hookCity.claimOps) plus the live-owner probe
+// (ga-pzop1c). The class route is layered over those seams, never in place of
+// them.
 func claimHookWork(city *hookCity, workQuery, workDir string, queryEnv []string, stores []hookStore, claimOpts hookClaimOptions, emitFailure func(command string, err error), stdout, stderr io.Writer) int {
 	// The city relocates a class and its front door could not be projected.
 	// Claiming through the work store anyway would write ownership into a
@@ -816,10 +818,15 @@ func claimHookWork(city *hookCity, workQuery, workDir string, queryEnv []string,
 	// exception, a binding with no claim CAS, degrades to unrouted claiming;
 	// see hookClaimRouteVerdict.
 	opened, err := hookClaimClassRouteForCity(city.path)
+	base := city.claimOps()
+	// Live-owner guard (ga-pzop1c): a candidate whose recorded gc.session_id
+	// names another live session is declined, read through the invocation's
+	// one session front door.
+	base.OwnerSessionLive = newHookOwnerSessionProbe(city.sessionFront)
 	// Work-store writes announce themselves to the city's event log so the run
 	// views see a claim within a poll (hook_claim_bead_events.go). They are
 	// wrapped before the class route, whose binding writes announce themselves.
-	ops, proceed := routedHookClaimOps(withHookClaimBeadEvents(city.claimOps(), city.path), opened, err, city.recorder, stderr)
+	ops, proceed := routedHookClaimOps(withHookClaimBeadEvents(base, city.path), opened, err, city.recorder, stderr)
 	if !proceed {
 		return 1
 	}
@@ -898,6 +905,7 @@ func claimHookWorkWithRunner(workQuery, workDir string, queryEnv []string, store
 	// work but every eligible claim mutation errored, so the shared drain below can
 	// report claims_errored instead of laundering a write failure into no_work.
 	claimsErrored := false
+	declinedForeign := 0
 	for len(remaining) > 0 {
 		discovered, selected, err := selectStoreWithWorkRetrying(workQuery, remaining, primary, run, &ops, noteStoreFailure)
 		if err != nil {
@@ -937,6 +945,7 @@ func claimHookWorkWithRunner(workQuery, workDir string, queryEnv []string, store
 		if res.claimsErrored {
 			claimsErrored = true
 		}
+		declinedForeign += res.declinedForeign
 		// This store reported ready work but the claim acquired nothing — every
 		// claimable row was lost to another claimant, none matched this session, or
 		// every claimable row's claim mutation errored and was skipped. Drop it and
@@ -945,7 +954,7 @@ func claimHookWorkWithRunner(workQuery, workDir string, queryEnv []string, store
 		// signal to the shared drain.
 		remaining = removeHookStore(remaining, claimStore)
 	}
-	return writeHookClaimNoWork(claimOpts, ops, claimsErrored, workDir, stdout, stderr)
+	return writeHookClaimNoWork(claimOpts, ops, claimsErrored, declinedForeign, workDir, stdout, stderr)
 }
 
 // reportClaimWorkQueryFailure reports a failed claim-path work query on stderr
