@@ -743,8 +743,11 @@ func TestCheckTriggerCronCatchupAcrossMultiDayGapInZone(t *testing.T) {
 	last := time.Date(2026, 7, 4, 11, 0, 0, 0, time.UTC) // Jul 4 07:00 ET
 	now := time.Date(2026, 7, 7, 3, 0, 0, 0, loc)        // off-slot eval, two slots missed
 	res := checkCron(a, now, fixedLastRun(last))
-	if !res.Due || res.Reason != "cron: caught up missed occurrence" {
+	if !res.Due || !strings.HasPrefix(res.Reason, "cron: caught up missed occurrence") {
 		t.Errorf("due=%v reason=%q, want catch-up fire for the missed Jul 5/6 07:00 ET slots", res.Due, res.Reason)
+	}
+	if !res.Late {
+		t.Errorf("Late = false, want true (slots missed for days)")
 	}
 }
 
@@ -837,5 +840,120 @@ func TestCheckTriggerCronBadTZFailsClosed(t *testing.T) {
 	res := CheckTrigger(a, now, neverRan, nil, nil)
 	if res.Due || !strings.Contains(res.Reason, "bad tz") {
 		t.Errorf("due=%v reason=%q, want fail-closed with a bad-tz reason", res.Due, res.Reason)
+	}
+}
+
+// --- Late-fire signal + condition exit classification (ga-44iyd) ---
+
+func TestCheckTriggerCooldownLateFire(t *testing.T) {
+	// A cooldown fire at >= lateFireFactor x its interval means at least one
+	// full cycle was silently skipped (coalesced ticks, starvation). The
+	// result must carry Late so the dispatcher can leave a durable record —
+	// the original ga-44iyd evidence (a 120.8m hole on a 15m patrol) was
+	// reconstructable only from run-history gaps a day later.
+	a := Order{Name: "patrol", Trigger: "cooldown", Interval: "15m"}
+	now := time.Date(2026, 2, 27, 12, 0, 0, 0, time.UTC)
+	lastRun := now.Add(-47 * time.Minute)
+	lastRunFn := func(_ string) (time.Time, error) { return lastRun, nil }
+
+	result := CheckTrigger(a, now, lastRunFn, nil, nil)
+	if !result.Due {
+		t.Fatalf("Due = false, want true (47m > 15m); reason=%q", result.Reason)
+	}
+	if !result.Late {
+		t.Errorf("Late = false, want true (47m >= 2x15m)")
+	}
+	if !strings.Contains(result.Reason, "late: 3.1x") {
+		t.Errorf("Reason = %q, want the lateness ratio in it", result.Reason)
+	}
+}
+
+func TestCheckTriggerCooldownOrdinaryFireNotLate(t *testing.T) {
+	// Ordinary jitter (fire between 1x and lateFireFactor x interval) must
+	// NOT read as late, or the signal drowns in noise.
+	a := Order{Name: "patrol", Trigger: "cooldown", Interval: "15m"}
+	now := time.Date(2026, 2, 27, 12, 0, 0, 0, time.UTC)
+	lastRun := now.Add(-16 * time.Minute)
+	lastRunFn := func(_ string) (time.Time, error) { return lastRun, nil }
+
+	result := CheckTrigger(a, now, lastRunFn, nil, nil)
+	if !result.Due {
+		t.Fatalf("Due = false, want true (16m > 15m); reason=%q", result.Reason)
+	}
+	if result.Late {
+		t.Errorf("Late = true, want false (16m < 2x15m)")
+	}
+}
+
+func TestCheckTriggerCooldownNeverRunNotLate(t *testing.T) {
+	a := Order{Name: "patrol", Trigger: "cooldown", Interval: "15m"}
+	now := time.Date(2026, 2, 27, 12, 0, 0, 0, time.UTC)
+	result := CheckTrigger(a, now, neverRan, nil, nil)
+	if !result.Due || result.Late {
+		t.Errorf("due=%v late=%v, want first fire due and not late", result.Due, result.Late)
+	}
+}
+
+func TestCheckTriggerCronCatchUpLate(t *testing.T) {
+	// The mol-dog-stale-db shape (deacon, 2026-08-12): a 4-hourly cron whose
+	// occurrence elapsed HOURS ago. The catch-up fire must carry Late and
+	// say how far behind it is.
+	a := Order{Name: "stale-db", Trigger: "cron", Schedule: "0 */4 * * *"}
+	lastRun := time.Date(2026, 5, 29, 0, 0, 30, 0, time.UTC)
+	now := time.Date(2026, 5, 29, 6, 30, 0, 0, time.UTC) // 04:00 elapsed 2h30m ago
+	lastRunFn := func(_ string) (time.Time, error) { return lastRun, nil }
+
+	result := CheckTrigger(a, now, lastRunFn, nil, nil)
+	if !result.Due {
+		t.Fatalf("Due = false, want true (catch up 04:00); reason=%q", result.Reason)
+	}
+	if !result.Late {
+		t.Errorf("Late = false, want true (2h30m past the scheduled minute)")
+	}
+	if !strings.Contains(result.Reason, "2h30m") {
+		t.Errorf("Reason = %q, want the delay named in it", result.Reason)
+	}
+}
+
+func TestCheckTriggerCronCatchUpRecentNotLate(t *testing.T) {
+	// A catch-up one minute after the boundary is the controller's normal
+	// eval cadence straddling the scheduled minute — not a missed cycle.
+	a := Order{Name: "stale-db", Trigger: "cron", Schedule: "0 */4 * * *"}
+	lastRun := time.Date(2026, 5, 29, 0, 0, 30, 0, time.UTC)
+	now := time.Date(2026, 5, 29, 4, 1, 0, 0, time.UTC)
+	lastRunFn := func(_ string) (time.Time, error) { return lastRun, nil }
+
+	result := CheckTrigger(a, now, lastRunFn, nil, nil)
+	if !result.Due {
+		t.Fatalf("Due = false, want true (catch up 04:00); reason=%q", result.Reason)
+	}
+	if result.Late {
+		t.Errorf("Late = true, want false (1m past the boundary is ordinary cadence)")
+	}
+}
+
+func TestCheckTriggerConditionExit1IsNotMetNotFailure(t *testing.T) {
+	// Exit 1 is the condition convention for "not met" (packs author checks
+	// as `[ gate ] && test state`). It must NOT read as a failed probe: the
+	// failure wording is reserved for a probe that is actually broken, so a
+	// broken one is distinguishable from a deliberately-false condition.
+	a := Order{Name: "check", Trigger: "condition", Check: "exit 1"}
+	result := CheckTrigger(a, time.Now(), neverRan, nil, nil)
+	if result.Due {
+		t.Fatalf("Due = true, want false")
+	}
+	if result.Reason != "condition: not met (exit 1)" {
+		t.Errorf("Reason = %q, want %q", result.Reason, "condition: not met (exit 1)")
+	}
+}
+
+func TestCheckTriggerConditionExitAbove1IsProbeError(t *testing.T) {
+	a := Order{Name: "check", Trigger: "condition", Check: "exit 2"}
+	result := CheckTrigger(a, time.Now(), neverRan, nil, nil)
+	if result.Due {
+		t.Fatalf("Due = true, want false")
+	}
+	if !strings.HasPrefix(result.Reason, ConditionProbeErrorMarker) {
+		t.Errorf("Reason = %q, want prefix %q (a broken probe must not read as a quiet not-met)", result.Reason, ConditionProbeErrorMarker)
 	}
 }

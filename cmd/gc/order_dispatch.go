@@ -620,6 +620,13 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 			if a.Trigger == "condition" && strings.Contains(result.Reason, orders.ConditionCheckTimedOutMarker) {
 				logDispatchError(m.stderr, "gc: order dispatch: %s %s — raise check_timeout if the check needs a slow store read", a.ScopedName(), result.Reason)
 			}
+			// Exit 1 means "condition not met" and stays quiet; anything
+			// else (exit >= 2, spawn failure) is the probe itself broken —
+			// the order can NEVER fire until the check command is fixed, and
+			// without this line that reads as an ordinary quiet "not due".
+			if a.Trigger == "condition" && strings.HasPrefix(result.Reason, orders.ConditionProbeErrorMarker) {
+				logDispatchError(m.stderr, "gc: order dispatch: %s %s — condition probe is BROKEN (not the exit-1 not-met convention); the order cannot fire until the check command is fixed", a.ScopedName(), result.Reason)
+			}
 			continue
 		}
 		if lastRunFromCache && orderTriggerUsesLastRun(a) {
@@ -677,6 +684,14 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 			continue
 		}
 		m.rememberLastRun(scoped, storeKeysForGate, trackingBead.CreatedAt)
+		// A Late fire means cycles were silently skipped (coalesced ticks,
+		// starvation, a stalled store). This line is the durable record of
+		// the miss — run history only shows the fires that happened, so
+		// without it a 2h patrol hole is reconstructable only by diffing
+		// run-history gaps after the fact (ga-44iyd).
+		if result.Late {
+			logDispatchError(m.stderr, "gc: order dispatch: %s fired LATE — %s (missed cycles; trend: ga-44iyd)", scoped, result.Reason)
+		}
 		if spendDispatchBudget(idx) {
 			return
 		}
