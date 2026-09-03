@@ -167,6 +167,96 @@ If you want a true cross-rig view, query Dolt directly using the port from
 `my-city/.beads/dolt-server.port`. The `bd` CLI is intentionally not the tool
 for that — its job is to enforce per-scope namespacing.
 
+## Session liveness lives outside version control
+
+Session beads carry two very different kinds of metadata. Identity and config
+(`agent_name`, `alias`, `command`, `provider`, `gc.session_name`, `gc.work_dir`)
+is durable, mergeable, and belongs in history. Liveness telemetry — `state`,
+`awake_started_at`, `last_woke_at`, `slept_at`, `generation`, `instance_token`,
+`gc.last_heartbeat_at` and friends — is node-local, last-write-wins, and useless
+in history. Writing it into the versioned `issues` table minted a permanent Dolt
+commit (~840 KB) per transition, several hundred an hour across a fleet.
+
+Those fields now live in a `session_liveness` table registered in `dolt_ignore`,
+so its rows exist only in the working set and never stage, commit, or replicate —
+the same mechanism the beads library uses for `leases` and `wisps`. `gc` seeds
+the table itself, idempotently, when it first binds a scope.
+
+The split and the merge are both invisible to callers:
+
+- **Writes** are split at the store wrapper. Liveness keys go to the table;
+  everything else goes to bead metadata as before. When a patch contained
+  nothing but liveness keys, no bead write happens at all — that skipped write
+  is the commit that no longer exists.
+- **Reads** merge the table back onto `Bead.Metadata` at materialization, so
+  every existing consumer sees the same keys it always did. A key with no row
+  falls back to whatever the committed metadata holds, so pre-existing session
+  beads work with no migration step.
+
+Three consequences worth knowing:
+
+- **`updated_at` on a session bead goes quiet.** Nothing touches the row between
+  genuine status transitions. Code that needs a "last we heard from this
+  session" clock reads `session.EffectiveUpdatedAt`, which folds in the
+  synthetic `gc.liveness_written_at` key the read overlay stamps.
+- **Raw SQL against `issues` no longer sees live telemetry.** Anything reading
+  session state or `gc.last_heartbeat_at` must come through the `gc` API (or
+  join `session_liveness` itself), not through `bd show` or a direct
+  `issues`-table query.
+- **Do not filter a bead query on a moved key.** The overlay merges values on
+  after the store has already selected the beads, so a metadata predicate on
+  `state` or `pending_create_claim` matches the stale committed value. Query
+  `session_liveness` directly, or filter in memory after the read. (No such
+  query exists today — every metadata filter in the tree keys on versioned
+  fields.)
+
+`GC_SESSION_LIVENESS_STORE` controls this:
+
+| Value | Behavior |
+|---|---|
+| `table` (default) | Split writes as above. Liveness keys never reach the versioned table. |
+| `metadata` | Rollback. The full patch goes to versioned bead metadata (restoring the commit volume), fenced so the committed value is authoritative; liveness keys are still mirrored into the table so a flip back to `table` finds them current. |
+
+The flag is read once per scope when that scope's store is first bound and
+cached for the life of the process, so changing it means restarting the
+processes that should observe it — the controller, not just the next CLI call.
+
+**Reads always apply the overlay, in both modes**, because a process cannot know
+which mode wrote a given row. What keeps a table row from shadowing a committed
+value is a fence, not a mode: any write whose liveness half went to versioned
+metadata — a degraded write, a write inside a transaction, or every write under
+`metadata` mode — also commits one fence marker **per liveness key it wrote**,
+`gc.liveness_fence.<key>`, whose value is the moment of that write. The overlay
+drops a key's row when the row was written at or before that key's own marker,
+and leaves a key with no marker alone — nothing ever committed a newer value for
+it, so its row is the freshest thing anyone has. A later successful table write
+is newer than the stamp and takes over again on its own.
+
+Per key, so the markers **accumulate**. A second fallback covering a different
+key set adds its own markers and leaves the first one's standing; so does the
+second batch of a multi-batch transaction. A single stamp plus a list of fenced
+keys would be last-write-wins on both halves, so the later write would un-fence
+the earlier one's keys and let their pre-outage rows win again.
+
+That fence is what makes the degraded path safe. A scope whose Dolt endpoint is
+unreachable (a `file` or `doltlite` provider, or a server that is down) writes
+liveness to versioned metadata instead — it costs commits again until the
+endpoint returns, but the rows the outage left behind can never come back and
+shadow it. Timestamps on both sides of the comparison are minted on the Dolt
+server (`written_at` via `UTC_TIMESTAMP(6)`; the stamp via the clock offset the
+store measures when it dials and retains across a retired pool), so a scope
+whose Dolt lives on another host compares correctly.
+
+Transactions get one further step. A transaction's fences are minted while its
+callback runs, but it does not commit until that callback returns — so a row
+another process writes in the gap is stamped *after* the fence and survives it.
+Once the transaction commits, `gc` **deletes** the table rows for exactly the
+keys it fenced: with no row at all the overlay falls through to the committed
+metadata the transaction just made authoritative. That sweep is best-effort and
+necessarily runs after the commit, so a crash in the sliver between them leaves
+those rows in place — the fence still bounds what can survive, and the next
+healthy write for that key overwrites the row.
+
 ## Going further
 
 - [`bd` CLI](https://github.com/gastownhall/beads) — upstream documentation for

@@ -28,6 +28,13 @@ const (
 type beadPolicyStore struct {
 	beads.Store
 	cfg *config.City
+	// lv routes session-liveness telemetry to the non-versioned
+	// session_liveness table instead of the versioned issues metadata. A nil
+	// binding disables both the write split and the read overlay, leaving this
+	// wrapper byte-identical to its pre-liveness behavior — which is what
+	// every scope without a resolvable managed Dolt endpoint (file/doltlite
+	// providers, unit tests) gets. See bead_policy_store_liveness.go.
+	lv *livenessBinding
 }
 
 type beadPolicyGraphStore struct {
@@ -41,13 +48,17 @@ var (
 )
 
 // ConditionalWritesResolveTarget declares the wrapped store as the
-// conditional-writes resolution target. The policy layer shapes creation and
-// reads; it does not intercept metadata writes (SetMetadata promotes from the
-// embedded store), so fenced writes resolve against the inner store — without
-// this declaration, interface embedding would hide the factory stamp and a
-// require deployment would silently collapse to legacy writes through the
-// wrapper. beadPolicyGraphStore inherits this via its embedded
+// conditional-writes resolution target. Fenced writes resolve against the inner
+// store — without this declaration, interface embedding would hide the factory
+// stamp and a require deployment would silently collapse to legacy writes
+// through the wrapper. beadPolicyGraphStore inherits this via its embedded
 // *beadPolicyStore.
+//
+// The policy layer DOES now intercept plain metadata writes (the session
+// liveness splitter, bead_policy_store_liveness.go), but the fenced surface is
+// unaffected: the only CAS'd keys in the tree are the control epoch and the
+// exclusive drain reservation, and neither is a liveness key — so no write can
+// take the CAS path and end up shadowed by a liveness row.
 func (s *beadPolicyStore) ConditionalWritesResolveTarget() beads.Store { return s.Store }
 
 var (
@@ -55,13 +66,20 @@ var (
 	_ beads.BatchDeleter = (*beadPolicyGraphStore)(nil)
 )
 
-func wrapStoreWithBeadPolicies(store beads.Store, cfg *config.City) beads.Store {
+// wrapStoreWithBeadPolicies wraps store with the bead storage-tier policy layer
+// and, when a liveness binding is supplied, the session-liveness write splitter
+// and read overlay. The binding is variadic so the ~40 existing call sites
+// (mostly tests, which want the plain policy behavior) stay untouched.
+func wrapStoreWithBeadPolicies(store beads.Store, cfg *config.City, lv ...*livenessBinding) beads.Store {
 	if store == nil {
 		return nil
 	}
 	policyStore := &beadPolicyStore{
 		Store: store,
 		cfg:   cfg,
+	}
+	if len(lv) > 0 {
+		policyStore.lv = lv[0]
 	}
 	if applier, ok := beads.GraphApplyFor(store); ok {
 		return &beadPolicyGraphStore{
@@ -88,13 +106,17 @@ func (s *beadPolicyStore) Create(b beads.Bead) (beads.Bead, error) {
 	return createWithStoragePolicy(s.createTarget(coordclass.Classify(b)), b, storage)
 }
 
+// List materializes beads with their session-liveness values overlaid, so every
+// consumer of a listed bead's raw metadata reads fresh telemetry. ListOpen /
+// Children / ListByLabel / ListByAssignee / ListByMetadata all funnel through
+// here, so one overlay point covers the whole legacy list surface.
 func (s *beadPolicyStore) List(query beads.ListQuery) ([]beads.Bead, error) {
 	query = expandPolicyReadTier(query)
-	return s.Store.List(query)
+	return s.overlayResult(s.Store.List(query))
 }
 
 func (s *beadPolicyStore) Ready(query ...beads.ReadyQuery) ([]beads.Bead, error) {
-	return s.Store.Ready(expandPolicyReadyQuery(query...))
+	return s.overlayResult(s.Store.Ready(expandPolicyReadyQuery(query...)))
 }
 
 // ReadyContext preserves the policy-expanded read tier for deadline-sensitive
@@ -105,7 +127,7 @@ func (s *beadPolicyStore) ReadyContext(ctx context.Context, query ...beads.Ready
 	if !ok {
 		return nil, fmt.Errorf("reading ready beads through policy store: %w", beads.ErrReadyContextUnsupported)
 	}
-	return reader.ReadyContext(ctx, expandPolicyReadyQuery(query...))
+	return s.overlayResult(reader.ReadyContext(ctx, expandPolicyReadyQuery(query...)))
 }
 
 // Count implements beads.Counter with the same read-tier expansion as List.
@@ -138,34 +160,56 @@ func (s *beadPolicyStore) DeleteBatch(ids []string) error {
 
 func (s *beadPolicyStore) Handles() beads.StoreHandles {
 	handles := beads.HandlesFor(s.Store)
-	handles.Cached = beadPolicyCachedReader{CachedReader: handles.Cached}
-	handles.Live = beadPolicyLiveReader{LiveReader: handles.Live}
+	handles.Cached = beadPolicyCachedReader{CachedReader: handles.Cached, policy: s}
+	handles.Live = beadPolicyLiveReader{LiveReader: handles.Live, policy: s}
 	handles.Writer = s
 	return handles
 }
 
+// beadPolicyCachedReader carries both policy read-tier expansion and the
+// session-liveness overlay. The narrow handles bypass beadPolicyStore.List /
+// Get, so the overlay has to be re-applied here or a Handles() consumer would
+// read frozen committed telemetry.
 type beadPolicyCachedReader struct {
 	beads.CachedReader
+	policy *beadPolicyStore
+}
+
+func (r beadPolicyCachedReader) Get(id string) (beads.Bead, error) {
+	b, err := r.CachedReader.Get(id)
+	if err != nil {
+		return b, err
+	}
+	return r.policy.overlayBead(b), nil
 }
 
 func (r beadPolicyCachedReader) List(query beads.ListQuery) ([]beads.Bead, error) {
-	return r.CachedReader.List(expandPolicyReadTier(query))
+	return r.policy.overlayResult(r.CachedReader.List(expandPolicyReadTier(query)))
 }
 
 func (r beadPolicyCachedReader) Ready(query ...beads.ReadyQuery) ([]beads.Bead, error) {
-	return r.CachedReader.Ready(expandPolicyReadyQuery(query...))
+	return r.policy.overlayResult(r.CachedReader.Ready(expandPolicyReadyQuery(query...)))
 }
 
 type beadPolicyLiveReader struct {
 	beads.LiveReader
+	policy *beadPolicyStore
+}
+
+func (r beadPolicyLiveReader) Get(id string) (beads.Bead, error) {
+	b, err := r.LiveReader.Get(id)
+	if err != nil {
+		return b, err
+	}
+	return r.policy.overlayBead(b), nil
 }
 
 func (r beadPolicyLiveReader) List(query beads.ListQuery) ([]beads.Bead, error) {
-	return r.LiveReader.List(expandPolicyReadTier(query))
+	return r.policy.overlayResult(r.LiveReader.List(expandPolicyReadTier(query)))
 }
 
 func (r beadPolicyLiveReader) Ready(query ...beads.ReadyQuery) ([]beads.Bead, error) {
-	return r.LiveReader.Ready(expandPolicyReadyQuery(query...))
+	return r.policy.overlayResult(r.LiveReader.Ready(expandPolicyReadyQuery(query...)))
 }
 
 func (s *beadPolicyStore) Children(parentID string, opts ...beads.QueryOpt) ([]beads.Bead, error) {

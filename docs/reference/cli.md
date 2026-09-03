@@ -301,11 +301,16 @@ city store and disables rig auto-detection (GC_RIG, cwd, bead prefix), so a
 deliberate city-scoped query is never silently downgraded to a rig store.
 
 All arguments after "gc bd" are forwarded to bd unchanged, except the
-gc-only "heartbeat &lt;issue-id&gt;" subcommand, which rewrites to
-"update &lt;issue-id&gt; --set-metadata gc.last_heartbeat_at=&lt;RFC3339 UTC now&gt;"
-so long-running workers can signal liveness to the dashboard, and
-"release-if-current &lt;issue-id&gt; &lt;assignee&gt;", which conditionally resets an
-in-progress assignment only when the bead still has that assignee.
+gc-only "heartbeat &lt;issue-id&gt;" subcommand, which stamps
+gc.last_heartbeat_at=&lt;RFC3339 UTC now&gt; so long-running workers can signal
+liveness to the dashboard, and "release-if-current &lt;issue-id&gt; &lt;assignee&gt;",
+which conditionally resets an in-progress assignment only when the bead
+still has that assignee.
+
+heartbeat writes to the non-versioned session_liveness table, so it mints no
+Dolt commit. Set GC_SESSION_LIVENESS_STORE=metadata to roll back to the legacy
+"bd update --set-metadata" form (which commits on every beat); the legacy form
+is also used automatically when the scope has no reachable Dolt endpoint.
 
 gc bd forces BD_EXPORT_AUTO=false to prevent bd's git auto-export hook
 from wedging the wrapper after printing command output. If you need

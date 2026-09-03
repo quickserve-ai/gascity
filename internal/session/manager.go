@@ -19,6 +19,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/clock"
+	"github.com/gastownhall/gascity/internal/liveness"
 	"github.com/gastownhall/gascity/internal/pathutil"
 	"github.com/gastownhall/gascity/internal/runtime"
 )
@@ -1687,11 +1688,45 @@ func templateOverrideWakeInFlight(metadata map[string]string, state State, now t
 	return now.UTC().Before(started.UTC().Add(templateOverrideWakeInFlightGrace()))
 }
 
+// EffectiveUpdatedAt is a session bead's freshness clock: the later of its
+// row-level UpdatedAt and the last write to its non-versioned liveness row.
+//
+// It exists because session-liveness telemetry no longer touches the issues row
+// (see internal/liveness). A live session that sleeps, wakes, heartbeats and
+// re-syncs now leaves Bead.UpdatedAt frozen at its last genuine versioned write,
+// so any rule that reads UpdatedAt as "when did we last hear from this session"
+// silently ages a healthy session — and prune deletes on exactly that reading.
+// The read overlay stamps liveness.WrittenAtKey on every bead that has liveness
+// rows, and this function folds it back in.
+//
+// A bead with no liveness rows (a legacy bead, or a scope with liveness
+// disabled) returns b.UpdatedAt unchanged, so behavior is identical to before.
+func EffectiveUpdatedAt(b beads.Bead) time.Time {
+	updated := b.UpdatedAt
+	raw := strings.TrimSpace(b.Metadata[liveness.WrittenAtKey])
+	if raw == "" {
+		return updated
+	}
+	written, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return updated
+	}
+	if written.After(updated) {
+		return written
+	}
+	return updated
+}
+
 // pruneStateTimestamp returns the timestamp that PruneDetailed compares
 // against its cutoff for a session in the given state. Suspended sessions keep
 // the historical CreatedAt fallback for legacy beads. Asleep sessions normally
 // require slept_at, except legacy drained-asleep beads without slept_at can use
 // the bead update timestamp because sleep_reason=drained is terminal.
+//
+// That drained-asleep fallback reads EffectiveUpdatedAt, not the raw
+// Bead.UpdatedAt: liveness writes no longer touch the row, so the raw column
+// would report a still-beating session as untouched since its last versioned
+// write and prune it early.
 func pruneStateTimestamp(b beads.Bead, state State) (time.Time, bool) {
 	switch state {
 	case StateSuspended:
@@ -1711,8 +1746,8 @@ func pruneStateTimestamp(b beads.Bead, state State) (time.Time, bool) {
 		if strings.TrimSpace(b.Metadata["sleep_reason"]) != "drained" {
 			return time.Time{}, false
 		}
-		if !b.UpdatedAt.IsZero() {
-			return b.UpdatedAt, true
+		if updated := EffectiveUpdatedAt(b); !updated.IsZero() {
+			return updated, true
 		}
 		if !b.CreatedAt.IsZero() {
 			return b.CreatedAt, true

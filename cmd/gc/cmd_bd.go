@@ -15,6 +15,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/liveness"
 	"github.com/gastownhall/gascity/internal/prguard"
 	"github.com/spf13/cobra"
 )
@@ -87,11 +88,16 @@ city store and disables rig auto-detection (GC_RIG, cwd, bead prefix), so a
 deliberate city-scoped query is never silently downgraded to a rig store.
 
 All arguments after "gc bd" are forwarded to bd unchanged, except the
-gc-only "heartbeat <issue-id>" subcommand, which rewrites to
-"update <issue-id> --set-metadata gc.last_heartbeat_at=<RFC3339 UTC now>"
-so long-running workers can signal liveness to the dashboard, and
-"release-if-current <issue-id> <assignee>", which conditionally resets an
-in-progress assignment only when the bead still has that assignee.
+gc-only "heartbeat <issue-id>" subcommand, which stamps
+gc.last_heartbeat_at=<RFC3339 UTC now> so long-running workers can signal
+liveness to the dashboard, and "release-if-current <issue-id> <assignee>",
+which conditionally resets an in-progress assignment only when the bead
+still has that assignee.
+
+heartbeat writes to the non-versioned session_liveness table, so it mints no
+Dolt commit. Set GC_SESSION_LIVENESS_STORE=metadata to roll back to the legacy
+"bd update --set-metadata" form (which commits on every beat); the legacy form
+is also used automatically when the scope has no reachable Dolt endpoint.
 
 gc bd forces BD_EXPORT_AUTO=false to prevent bd's git auto-export hook
 from wedging the wrapper after printing command output. If you need
@@ -171,6 +177,121 @@ func warnExternalBdOverrideDrift(stderr io.Writer, cityPath string, target execS
 	_, _ = fmt.Fprintf(stderr, "gc bd: warning: ignoring ambient Dolt host/port override for external target: %s\n", strings.Join(drift, ", "))
 }
 
+// parseBdHeartbeatArgs recognizes the gc-only `heartbeat <issue-id>` subcommand
+// and returns the bead id. It applies exactly the validation
+// rewriteBdHeartbeatArgs applies, so both heartbeat paths accept and reject the
+// same argument shapes.
+func parseBdHeartbeatArgs(bdArgs []string) (id string, ok bool, err error) {
+	if len(bdArgs) == 0 || bdArgs[0] != "heartbeat" {
+		return "", false, nil
+	}
+	rest := bdArgs[1:]
+	if len(rest) != 1 || rest[0] == "" || strings.HasPrefix(rest[0], "-") ||
+		strings.IndexFunc(rest[0], unicode.IsSpace) >= 0 {
+		return "", true, fmt.Errorf("usage: gc bd heartbeat <issue-id>")
+	}
+	return rest[0], true, nil
+}
+
+// doBdHeartbeatThroughLiveness writes gc.last_heartbeat_at straight to the
+// non-versioned session_liveness table instead of shelling `bd update`.
+//
+// This is the single largest remaining source of session-bead Dolt commits:
+// every `gc bd heartbeat` shelled to bd, whose UpdateIssue commits
+// unconditionally, so a fleet of long-running workers minted a permanent
+// ~840 KB commit per heartbeat for a value that is pure liveness telemetry.
+//
+// Reported as handled=false — meaning "fall through to the legacy bd path" —
+// whenever the liveness table is not usable for this scope: the rollback flag is
+// set to metadata, no Dolt endpoint resolves, or the write itself failed. A
+// heartbeat that costs a commit is strictly better than a heartbeat the
+// dashboard never sees, so availability wins over the commit saving here.
+func doBdHeartbeatThroughLiveness(cityPath string, cfg *config.City, target execStoreTarget, beadID string, stderr io.Writer) (code int, handled bool) {
+	binding := sessionLivenessFor(cityPath, target.ScopeRoot)
+	if binding.Mode() != liveness.ModeTable {
+		return 0, false
+	}
+	store := binding.Store()
+	if store == nil {
+		return 0, false
+	}
+
+	// Validate the bead EXISTS before writing. The legacy path inherited this
+	// from `bd update`, which exits non-zero on an unknown id; without it a typo
+	// in a worker's heartbeat loop would exit 0 forever while writing orphan rows
+	// keyed on an id that names nothing. Falling through to bd on a store error
+	// keeps the check fail-open — bd then performs its own validation.
+	beadStore, err := heartbeatBeadStoreOpener(target.ScopeRoot, cityPath, cfg)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc bd heartbeat: cannot verify %s, falling back to bd: %v\n", beadID, err) //nolint:errcheck // best-effort stderr
+		return 0, false
+	}
+	// Only existence is read here; the bead itself is deliberately not reused —
+	// see seedHeartbeatOverlayMarker for why its metadata cannot answer whether
+	// the overlay marker was ever committed.
+	if _, err = beadStore.Get(beadID); errors.Is(err, beads.ErrNotFound) {
+		fmt.Fprintf(stderr, "gc bd heartbeat: no issue found: %s\n", beadID) //nolint:errcheck // best-effort stderr
+		return 1, true
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "gc bd heartbeat: cannot verify %s, falling back to bd: %v\n", beadID, err) //nolint:errcheck // best-effort stderr
+		return 0, false
+	}
+
+	ctx, cancel := livenessOpContext()
+	defer cancel()
+	stamp := bdHeartbeatNow().UTC().Format(time.RFC3339)
+	if err := store.SetBatch(ctx, beadID, map[string]string{heartbeatMetadataKey: stamp}); err != nil {
+		fmt.Fprintf(stderr, "gc bd heartbeat: liveness write failed, falling back to bd: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 0, false
+	}
+	seedHeartbeatOverlayMarker(beadStore, beadID, stamp, stderr)
+	return 0, true
+}
+
+// heartbeatBeadStoreOpener resolves the bead store the heartbeat path uses to
+// validate the id. A package var so tests can supply an in-process store.
+var heartbeatBeadStoreOpener = openStoreAtForCityWithConfig
+
+// seedHeartbeatOverlayMarker commits gc.last_heartbeat_at ONCE per bead, the
+// first time that bead is ever heartbeated.
+//
+// A heartbeat lands on an arbitrary WORK bead, not a session bead, so the
+// list-path overlay filter (beadMayCarryLiveness) would otherwise never look it
+// up and the dashboard would read a frozen value from committed metadata. One
+// committed marker puts the bead in the candidate set permanently; every
+// subsequent beat is table-only. That is one Dolt commit per bead for its whole
+// life instead of one per beat — the churn this change exists to remove is
+// untouched.
+//
+// Best-effort by construction: a failed marker only costs list-path freshness
+// for that bead until the next attempt, and the beat itself already landed.
+//
+// "Already seeded" is read from the UNWRAPPED store, never from the bead the
+// caller validated. That bead came back through the POLICY store, so its
+// gc.last_heartbeat_at is the OVERLAID value — the row this very beat just
+// wrote — and it reads non-empty on every beat whether or not a marker was ever
+// committed. Keyed on that, a marker write that failed on beat #1 would never be
+// retried, and the bead would stay invisible to beadMayCarryLiveness on List
+// paths for its whole life. Only committed metadata can answer the question.
+func seedHeartbeatOverlayMarker(store beads.Store, beadID, stamp string, stderr io.Writer) {
+	base, _, _ := unwrapBeadPolicyStore(store)
+	if base == nil {
+		return
+	}
+	// A read failure falls through to the write: re-committing a marker that is
+	// already there is one wasted commit, and skipping one that is not there
+	// costs list-path freshness forever.
+	if committed, err := base.Get(beadID); err == nil && strings.TrimSpace(committed.Metadata[heartbeatMetadataKey]) != "" {
+		return
+	}
+	// Deliberately the UNWRAPPED store: routing this through the splitter would
+	// divert it straight back to the table and commit nothing.
+	if err := base.SetMetadata(beadID, heartbeatMetadataKey, stamp); err != nil {
+		fmt.Fprintf(stderr, "gc bd heartbeat: seeding the overlay marker for %s failed (list reads stay stale until the next beat): %v\n", beadID, err) //nolint:errcheck // best-effort stderr
+	}
+}
+
 // rewriteBdHeartbeatArgs expands the gc-only `heartbeat <issue-id>`
 // subcommand into the bd command that performs the write:
 //
@@ -201,7 +322,17 @@ func rewriteBdHeartbeatArgs(bdArgs []string) ([]string, error) {
 func doBd(args []string, stdout, stderr io.Writer) int {
 	cityName, rigName, bdArgs := extractBdScopeFlags(args)
 
-	bdArgs, err := rewriteBdHeartbeatArgs(bdArgs)
+	// Recognize the heartbeat form BEFORE the rewrite so the liveness path below
+	// still has the bead id. The rewrite still runs: the rewritten args are what
+	// routes the write to the correct scope, and they remain the fallback when
+	// the liveness table is unavailable.
+	heartbeatID, isHeartbeat, err := parseBdHeartbeatArgs(bdArgs)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc bd: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+
+	bdArgs, err = rewriteBdHeartbeatArgs(bdArgs)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc bd: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -228,6 +359,11 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "gc bd: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
+	}
+	if isHeartbeat {
+		if code, handled := doBdHeartbeatThroughLiveness(cityPath, cfg, target, heartbeatID, stderr); handled {
+			return code
+		}
 	}
 	if id, expectedAssignee, ok, err := parseBdReleaseIfCurrentArgs(bdArgs); ok || err != nil {
 		if err != nil {
