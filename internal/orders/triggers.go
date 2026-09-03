@@ -24,6 +24,14 @@ type TriggerResult struct {
 	Reason string
 	// LastRun is the last execution time (zero if never run).
 	LastRun time.Time
+	// Late is set on a Due result when the fire is materially behind its own
+	// cadence — a cooldown fire at >= lateFireFactor x its interval, or a
+	// cron catch-up landing >= lateCronThreshold past its scheduled minute.
+	// The dispatcher logs Late fires so silently skipped cycles leave a
+	// durable record instead of vanishing into coalesced ticker deliveries
+	// (ga-44iyd: a 2h patrol hole was only reconstructable from run-history
+	// gaps a day later). Never set on a "never run" first fire.
+	Late bool
 }
 
 // LastRunFunc returns the last run time for a named order.
@@ -64,6 +72,24 @@ var (
 // consumer in the dispatcher reference this one constant instead of coupling
 // on a separately-typed literal across packages.
 const ConditionCheckTimedOutMarker = "timed out"
+
+// ConditionProbeErrorMarker prefixes a condition trigger's Reason when the
+// check command errored in a way that is NOT the exit-1 "condition not met"
+// convention — a nonzero exit >= 2 (127 for a missing binary), or a spawn
+// failure. The dispatcher matches on it to warn that the probe itself is
+// broken and the order can never fire; exit 1 stays a quiet "not due".
+const ConditionProbeErrorMarker = "check command failed"
+
+// Late-fire thresholds. A cooldown order firing at twice its own interval
+// has silently skipped at least one full cycle; a cron catch-up more than
+// five minutes past its scheduled minute is beyond anything the
+// controller's normal eval cadence (seconds to ~1 minute between ticks)
+// explains. Deliberately coarse: the signal exists to make missed cycles
+// visible, not to police jitter.
+const (
+	lateFireFactor    = 2
+	lateCronThreshold = 5 * time.Minute
+)
 
 // CheckTrigger evaluates an order's trigger condition and returns whether it's due.
 // ep is an events Provider used by event triggers to query events; may be nil for
@@ -115,11 +141,16 @@ func checkCooldown(a Order, now time.Time, lastRunFn LastRunFunc) TriggerResult 
 
 	elapsed := now.Sub(last)
 	if elapsed >= interval {
-		return TriggerResult{
+		result := TriggerResult{
 			Due:     true,
 			Reason:  fmt.Sprintf("elapsed %s >= interval %s", elapsed.Round(time.Second), interval),
 			LastRun: last,
 		}
+		if elapsed >= time.Duration(lateFireFactor)*interval {
+			result.Late = true
+			result.Reason = fmt.Sprintf("%s (late: %.1fx the interval)", result.Reason, float64(elapsed)/float64(interval))
+		}
+		return result
 	}
 
 	remaining := interval - elapsed
@@ -255,10 +286,17 @@ func checkCron(a Order, now time.Time, lastRunFn LastRunFunc) TriggerResult {
 		_, prevOff := prev.Zone()
 		_, tOff := t.Zone()
 		if tOff > prevOff && matchesInWallGap(matchesAt, prev, t) {
-			return TriggerResult{Due: true, Reason: "cron: caught up occurrence skipped by DST spring-forward", LastRun: last}
+			result := TriggerResult{Due: true, Reason: "cron: caught up occurrence skipped by DST spring-forward", LastRun: last}
+			result.Late = now.Sub(t) >= lateCronThreshold
+			return result
 		}
 		if matchesAt(t) && !sameWallMinute(last, t) {
-			return TriggerResult{Due: true, Reason: "cron: caught up missed occurrence", LastRun: last}
+			result := TriggerResult{Due: true, Reason: "cron: caught up missed occurrence", LastRun: last}
+			if behind := now.Sub(t); behind >= lateCronThreshold {
+				result.Late = true
+				result.Reason = fmt.Sprintf("cron: caught up missed occurrence (late: %s past the scheduled minute)", behind.Round(time.Minute))
+			}
+			return result
 		}
 		prev = t
 	}
@@ -332,18 +370,23 @@ func checkCondition(a Order, opts TriggerOptions) TriggerResult {
 			}
 			return TriggerResult{Due: false, Reason: reason}
 		}
-		// A non-zero exit is the condition-probe contract, but *exec.ExitError
-		// also covers processes we killed and processes something else killed.
-		// Both predicates are load-bearing and neither subsumes the other:
-		// ctx.Err() == nil rules out our own cancel/deadline (on Windows a
-		// canceled check is Kill()ed and reports a clean-looking exit 1), and
-		// Exited() rules out a signal death we did not cause (OOM killer,
-		// external SIGKILL), where ExitCode() is a meaningless -1.
+		// *exec.ExitError also covers processes we killed and processes
+		// something else killed: ctx.Err() == nil rules out our own
+		// cancel/deadline (on Windows a canceled check is Kill()ed and reports
+		// a clean-looking exit 1), and Exited() rules out a signal death we did
+		// not cause (OOM killer, external SIGKILL), where ExitCode() is a
+		// meaningless -1.
+		//
+		// Only exit 1 is "condition not met": packs author checks as
+		// `[ gate ] && test state`, and test and grep reserve exit >= 2 for an
+		// error. A probe that can never fire (exit 127, a missing binary) must
+		// not read as a quiet "not due" forever, so everything else carries
+		// ConditionProbeErrorMarker.
 		var exitErr *exec.ExitError
-		if ctx.Err() == nil && errors.As(err, &exitErr) && exitErr.Exited() {
-			return TriggerResult{Due: false, Reason: fmt.Sprintf("condition: not met (exit %d)", exitErr.ExitCode())}
+		if ctx.Err() == nil && errors.As(err, &exitErr) && exitErr.Exited() && exitErr.ExitCode() == 1 {
+			return TriggerResult{Due: false, Reason: "condition: not met (exit 1)"}
 		}
-		return TriggerResult{Due: false, Reason: fmt.Sprintf("check command failed: %v", err)}
+		return TriggerResult{Due: false, Reason: fmt.Sprintf("%s: %v", ConditionProbeErrorMarker, err)}
 	}
 	return TriggerResult{Due: true, Reason: "condition: check passed (exit 0)"}
 }
