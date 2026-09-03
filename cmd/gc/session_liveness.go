@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/doltauth"
 	"github.com/gastownhall/gascity/internal/liveness"
 )
 
@@ -17,9 +18,10 @@ import (
 // to a bead-store scope. See internal/liveness/keys.go for why the fields moved.
 //
 // Resolution rule: the liveness table lives on the SAME managed Dolt database
-// that holds the scope's `issues` table, resolved through exactly the helper the
-// native-store preflight already uses (canonicalScopeDoltTarget +
-// managedDoltOpenDatabase). It therefore works identically whether the scope's
+// that holds the scope's `issues` table: canonicalScopeDoltTarget names the
+// endpoint (as the native-store preflight does), doltauth.ResolveScopedFromEnv
+// supplies its credentials (as the bd env projection does), and
+// managedDoltOpenDatabaseAuthed dials. It therefore works identically whether the scope's
 // beads.Store resolved to NativeDoltStore or fell back to the exec/bd BdStore —
 // the fallback has no in-process SQL handle to borrow, which is why this opens
 // its own.
@@ -101,14 +103,6 @@ func sessionLivenessFor(cityPath, scopeRoot string) *livenessBinding {
 	}
 	livenessBindings[key] = b
 	return b
-}
-
-// resetSessionLivenessBindingsForTest drops the memo table. Tests that install a
-// fake binding use it so state does not leak between cases.
-func resetSessionLivenessBindingsForTest() {
-	livenessBindingsMu.Lock()
-	defer livenessBindingsMu.Unlock()
-	livenessBindings = map[string]*livenessBinding{}
 }
 
 // Mode reports the write discipline this binding applies. A nil binding reports
@@ -232,8 +226,7 @@ func (b *livenessBinding) Now() time.Time {
 
 // rememberClockOffset records the skew a live store reports so Now() keeps
 // returning server time after that store is retired. Callers hold b.mu (dial
-// and setStoreForTest do; newLivenessBindingForTest has not published the
-// binding yet).
+// does; newLivenessBindingForTest has not published the binding yet).
 func (b *livenessBinding) rememberClockOffset(store liveness.Store) {
 	if b == nil || store == nil {
 		return
@@ -273,18 +266,6 @@ func (b *livenessBinding) noteOpError(err error) {
 	}
 }
 
-// setStoreForTest installs a store directly, bypassing the dialer.
-func (b *livenessBinding) setStoreForTest(store liveness.Store, mode liveness.Mode) {
-	if b == nil {
-		return
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.store = store
-	b.rememberClockOffset(store)
-	b.mode = mode
-}
-
 // newLivenessBindingForTest builds an unregistered binding over a supplied store.
 func newLivenessBindingForTest(store liveness.Store, mode liveness.Mode) *livenessBinding {
 	b := &livenessBinding{mode: mode}
@@ -315,7 +296,30 @@ func openScopeLivenessStore(cityPath, scopeRoot string) (liveness.Store, error) 
 	if strings.TrimSpace(target.Port) == "" || strings.TrimSpace(target.Database) == "" {
 		return nil, fmt.Errorf("%w: incomplete target (port=%q database=%q)", errNoLivenessEndpoint, target.Port, target.Database)
 	}
-	db, err := managedDoltOpenDatabase(target.Host, target.Port, target.User, target.Database)
+	// Resolve credentials the way the bd projection does for this scope
+	// (dolt_auth.go), not just the managed-local ambient password. A scope whose
+	// endpoint is an authed external server (the qcore scope's westeros hub)
+	// refuses the bare target user with Error 1045, and the dial then silently
+	// degrades to committing telemetry — the churn this store exists to remove,
+	// continued on the one server shared with another town (ga-ca29dh).
+	// AuthScopeRoot picks which scope's .beads/.env and credentials files own
+	// this endpoint, and the env projection names the endpoint explicitly so
+	// every piece of the connection comes from ONE resolution (the
+	// endpoint-assembled-from-two-scopes incident class).
+	//
+	// The SCOPED variant matters: plain Resolve falls back to ambient
+	// BEADS_DOLT_PASSWORD whenever GC_DOLT_HOST/PORT are unset, which would
+	// present an external rig's password to the managed LOCAL server and
+	// degrade every local scope's dial — the exact contamination
+	// ResolveScopedFromEnv exists to prevent. The local managed server's own
+	// password still arrives via managedDoltOpenDatabaseAuthed's endpoint-bound
+	// empty-password fallback.
+	authRoot := doltauth.AuthScopeRoot(cityPath, scopeRoot, target)
+	auth := doltauth.ResolveScopedFromEnv(authRoot, target.User, map[string]string{
+		"GC_DOLT_HOST": managedDoltConnectHost(target.Host),
+		"GC_DOLT_PORT": strings.TrimSpace(target.Port),
+	})
+	db, err := managedDoltOpenDatabaseAuthed(target.Host, target.Port, auth.User, auth.Password, target.Database)
 	if err != nil {
 		return nil, fmt.Errorf("opening %s: %w", target.Database, err)
 	}
