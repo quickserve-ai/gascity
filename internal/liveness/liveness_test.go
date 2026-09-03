@@ -14,12 +14,23 @@ import (
 
 func TestIsKeyCoversTheMovedFieldSet(t *testing.T) {
 	moved := []string{
-		"state", "awake_started_at", "last_woke_at", "slept_at", "sleep_reason",
+		"state", "state_reason", "awake_started_at", "last_woke_at", "slept_at",
+		"sleep_reason", "sleep_intent",
 		"synced_at", "generation", "held_until", "drain_at", "quarantined_until",
-		"churn_count", "continuation_epoch", "continuation_reset_pending",
+		"quarantine_cycle", "churn_count", "wake_attempts", "wait_hold",
+		"wake_request", "wake_requested_at",
+		"continuation_epoch", "continuation_reset_pending",
 		"pending_create_claim", "pending_create_started_at", "primed_at",
 		"priming_attempted_at", "instance_token", "prior_session_key",
-		"creation_complete_at", "detached_at", "usage_compute_emitted_at",
+		"creation_complete_at", "detached_at",
+		"currently_processing_bead_id",
+		"usage_compute_emitted_at", "usage_model_swept_at",
+		"last_nudge_delivered_at",
+		"idle_claim_nudge_trigger", "idle_claim_nudge_count", "idle_claim_nudge_at",
+		"continuation_claim_nudge_work", "continuation_claim_nudge_root",
+		"continuation_claim_nudge_store_ref", "continuation_claim_nudge_generation",
+		"continuation_claim_nudge_count", "continuation_claim_nudge_at",
+		"stranded_event_emitted_at",
 		"gc.last_heartbeat_at",
 	}
 	for _, k := range moved {
@@ -33,11 +44,109 @@ func TestIsKeyCoversTheMovedFieldSet(t *testing.T) {
 	// Stable identity/config must stay in versioned metadata.
 	for _, k := range []string{
 		"agent_name", "alias", "command", "provider", "gc.session_name",
-		"gc.work_dir", "state_reason", "session_name", "template",
-		"suspended_at", "wait_hold", "sleep_intent",
+		"gc.work_dir", "session_name", "template",
+		"suspended_at", "session_key", "started_config_hash", "started_live_hash",
+		"prompt_hash", "resume_seeded", "continuity_eligible", "archived_at",
+		"close_reason", "closed_at", "pin_awake",
 	} {
 		if IsKey(k) {
 			t.Errorf("IsKey(%q) = true, want false — versioned metadata must not move", k)
+		}
+	}
+}
+
+// TestTriggerBeadIDStaysVersioned pins the one measured churn driver the sweep
+// deliberately did NOT move. gc.trigger_bead_id is the pool slot's binding to
+// its dispatched work, not telemetry, and it is written as one member of the
+// trigger/provenance cluster that session.Store.UpdateMetadataInfo commits in a
+// single backend operation — splitting it out would send the trigger id to the
+// table and the store ref / pack / work dir through Update, which is exactly the
+// partial provenance row that contract forbids. See the LEFT VERSIONED note in
+// keys.go.
+func TestTriggerBeadIDStaysVersioned(t *testing.T) {
+	for _, k := range []string{
+		"gc.trigger_bead_id", "gc.trigger_bead_store_ref", "gc.pack",
+		"gc.pack_workspace", "gc.brain_parent_sid",
+	} {
+		if IsKey(k) {
+			t.Errorf("IsKey(%q) = true; the trigger/provenance cluster must commit atomically in versioned metadata", k)
+		}
+	}
+}
+
+// TestSweptKeysCoverTheHotPatchBuilders is the batch-completeness guard: the
+// splitter only skips the versioned write when EVERY key in a patch is a
+// liveness key, so one straggler in a hot builder costs the whole commit. These
+// are the exact key sets the internal/session lifecycle builders emit; a new
+// key added to any of them must be classified here rather than silently
+// re-minting the commit its siblings avoid.
+func TestSweptKeysCoverTheHotPatchBuilders(t *testing.T) {
+	builders := map[string][]string{
+		// SleepPatch
+		"SleepPatch": {
+			"state", "state_reason", "sleep_reason", "last_woke_at",
+			"pending_create_claim", "pending_create_started_at", "sleep_intent",
+			"slept_at",
+		},
+		// ConfirmStartedPatch
+		"ConfirmStartedPatch": {
+			"state", "state_reason", "creation_complete_at", "awake_started_at",
+			"pending_create_claim", "pending_create_started_at", "sleep_reason",
+		},
+		// BeginDrainPatch / DrainAckStopPendingPatch
+		"DrainAckStopPendingPatch": {
+			"state", "state_reason", "drain_at",
+			"pending_create_claim", "pending_create_started_at",
+		},
+		// RequestWakePatch
+		"RequestWakePatch": {
+			"state", "state_reason", "pending_create_claim",
+			"pending_create_started_at", "held_until", "quarantined_until",
+			"sleep_reason", "wait_hold", "sleep_intent", "wake_attempts",
+			"churn_count",
+		},
+		// PreWakePatch (non-fresh)
+		"PreWakePatch": {
+			"instance_token", "continuation_epoch", "continuation_reset_pending",
+			"detached_at", "state", "pending_create_started_at", "last_woke_at",
+			"sleep_reason", "sleep_intent", "generation", "wake_request",
+			"wake_requested_at",
+		},
+		// ClearWakeBlockersPatch
+		"ClearWakeBlockersPatch": {
+			"held_until", "quarantined_until", "wait_hold", "sleep_intent",
+			"wake_attempts", "churn_count", "state", "sleep_reason",
+		},
+		// ClearExpiredQuarantinePatch
+		"ClearExpiredQuarantinePatch": {
+			"quarantined_until", "wake_attempts", "churn_count", "sleep_reason",
+		},
+		// QuarantinePatch
+		"QuarantinePatch": {
+			"state", "state_reason", "quarantined_until", "quarantine_cycle",
+			"last_woke_at",
+		},
+		// writeIdleClaimMarker / clearIdleClaimMarker (cmd/gc/idle_nudge.go)
+		"idleClaimMarker": {
+			"idle_claim_nudge_trigger", "idle_claim_nudge_count",
+			"idle_claim_nudge_at",
+		},
+		// writeContinuationClaimMarker / clearContinuationClaimMarker
+		"continuationClaimMarker": {
+			"continuation_claim_nudge_work", "continuation_claim_nudge_root",
+			"continuation_claim_nudge_store_ref",
+			"continuation_claim_nudge_generation",
+			"continuation_claim_nudge_count", "continuation_claim_nudge_at",
+		},
+	}
+	for name, patch := range builders {
+		kvs := make(map[string]string, len(patch))
+		for _, k := range patch {
+			kvs[k] = "v"
+		}
+		plan := PlanWrite(ModeTable, kvs, time.Now())
+		if len(plan.Versioned) != 0 {
+			t.Errorf("%s leaves %v versioned; one straggler re-mints the whole commit", name, plan.Versioned)
 		}
 	}
 }
@@ -57,19 +166,21 @@ func TestEveryMovedKeyFitsTheColumn(t *testing.T) {
 func TestSplitPartitionsAndPreservesClears(t *testing.T) {
 	live, rest := Split(map[string]string{
 		"state":                "asleep",
+		"state_reason":         "idle timeout",
 		"slept_at":             "2026-09-03T00:00:00Z",
 		"pending_create_claim": "", // a clear must reach the liveness half, not be dropped
-		"state_reason":         "idle timeout",
+		"session_key":          "conv-1",
 		"alias":                "katya",
 	})
 	wantLive := map[string]string{
 		"state":                "asleep",
+		"state_reason":         "idle timeout",
 		"slept_at":             "2026-09-03T00:00:00Z",
 		"pending_create_claim": "",
 	}
 	wantRest := map[string]string{
-		"state_reason": "idle timeout",
-		"alias":        "katya",
+		"session_key": "conv-1",
+		"alias":       "katya",
 	}
 	if !reflect.DeepEqual(live, wantLive) {
 		t.Errorf("live = %v, want %v", live, wantLive)
@@ -419,17 +530,17 @@ func TestOverlayWithAnUnparseableFenceKeepsTelemetry(t *testing.T) {
 func TestFallbackPlanFencesAndCarriesEverythingVersioned(t *testing.T) {
 	now := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
 	got := FallbackPlan(map[string]string{
-		"state":        "asleep",
-		"state_reason": "idle",
+		"state":       "asleep",
+		"session_key": "conv-1",
 	}, now)
-	if got["state"] != "asleep" || got["state_reason"] != "idle" {
+	if got["state"] != "asleep" || got["session_key"] != "conv-1" {
 		t.Errorf("FallbackPlan = %v, want both halves versioned", got)
 	}
 	if got[FenceKeyFor("state")] != FenceStamp(now) {
 		t.Errorf("FallbackPlan did not stamp %s", FenceKeyFor("state"))
 	}
-	if _, stamped := got[FenceKeyFor("state_reason")]; stamped {
-		t.Errorf("FallbackPlan fenced the versioned key state_reason; it has no table row to fence")
+	if _, stamped := got[FenceKeyFor("session_key")]; stamped {
+		t.Errorf("FallbackPlan fenced the versioned key session_key; it has no table row to fence")
 	}
 	// No liveness keys means nothing to fence, so no marker is committed.
 	plain := FallbackPlan(map[string]string{"alias": "katya"}, now)

@@ -83,8 +83,9 @@ func TestLivenessSplitterDivertsLivenessKeysAndKeepsTheRest(t *testing.T) {
 
 	err := store.SetMetadataBatch(bead.ID, map[string]string{
 		"state":        "asleep",               // liveness
+		"state_reason": "idle timeout",         // liveness (swept in with state)
 		"slept_at":     "2026-09-03T00:00:00Z", // liveness
-		"state_reason": "idle timeout",         // versioned
+		"session_key":  "conv-1",               // versioned: restart identity history
 	})
 	if err != nil {
 		t.Fatalf("SetMetadataBatch: %v", err)
@@ -94,7 +95,7 @@ func TestLivenessSplitterDivertsLivenessKeysAndKeepsTheRest(t *testing.T) {
 		t.Fatalf("backing saw %d batches, want 1", len(backing.batches))
 	}
 	got := backing.batches[0]
-	if len(got) != 1 || got["state_reason"] != "idle timeout" {
+	if len(got) != 1 || got["session_key"] != "conv-1" {
 		t.Fatalf("versioned batch = %v, want only the non-liveness key", got)
 	}
 

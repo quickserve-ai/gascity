@@ -122,18 +122,40 @@ func ParseFence(raw string) time.Time {
 // provider, gc.session_name, gc.work_dir, configured_*) stays versioned, and so
 // do the bead's own columns (status, assignee, close_reason) — those are genuine
 // lifecycle history and SHOULD keep committing.
+//
+// BATCH COMPLETENESS is the second rule, and the reason this set grew after the
+// first deploy. The splitter skips the versioned write only when EVERY key in a
+// patch is a liveness key, so one straggler in a hot patch costs the whole
+// commit: post-deploy churn stayed at ~244/hr because state moved but its
+// same-batch companion state_reason did not, and every SleepPatch /
+// ConfirmStartedPatch / RequestWakePatch still minted a Dolt commit for it.
+// Before leaving a key versioned, check which patch builders in
+// internal/session/lifecycle_transition.go carry it: a key that only ever
+// appears beside moved keys must move too, or it re-mints every commit they
+// avoid.
 var keys = map[string]struct{}{
+	// Lifecycle state and its same-batch companions. state_reason accompanies
+	// state in every builder that writes one (Sleep/ConfirmStarted/BeginDrain/
+	// Quarantine/Reactivate/RequestWake); leaving it behind made all of them
+	// commit anyway.
 	"state":                      {},
+	"state_reason":               {},
 	"awake_started_at":           {},
 	"last_woke_at":               {},
 	"slept_at":                   {},
 	"sleep_reason":               {},
+	"sleep_intent":               {},
 	"synced_at":                  {},
 	"generation":                 {},
 	"held_until":                 {},
 	"drain_at":                   {},
 	"quarantined_until":          {},
+	"quarantine_cycle":           {},
 	"churn_count":                {},
+	"wake_attempts":              {},
+	"wait_hold":                  {},
+	"wake_request":               {},
+	"wake_requested_at":          {},
 	"continuation_epoch":         {},
 	"continuation_reset_pending": {},
 	"pending_create_claim":       {},
@@ -144,17 +166,82 @@ var keys = map[string]struct{}{
 	"prior_session_key":          {},
 	"creation_complete_at":       {},
 	"detached_at":                {},
-	"usage_compute_emitted_at":   {},
+
+	// The work bead a session is currently processing. A secondary marker that
+	// the reconciler re-derives from the live assignment every tick and that
+	// build_desired_state explicitly refuses to treat as authoritative ("that
+	// secondary marker can lag the live process"), so it carries no history.
+	"currently_processing_bead_id": {},
+
+	// Per-awake-interval accounting markers. Both are idempotency stamps keyed
+	// on awake_started_at, never history; usage_model_swept_at is the declared
+	// sibling of usage_compute_emitted_at (cmd/gc/usage_compute.go) and is
+	// written by its own single-key SetMetadata, so leaving it behind kept one
+	// commit per terminal interval.
+	"usage_compute_emitted_at": {},
+	"usage_model_swept_at":     {},
+
+	// Nudge delivery. Stamped on EVERY successful delivery (cmd_nudge.go,
+	// cmd_sling.go, the ACP dispatcher) by a single-key SetMarker, and read only
+	// to render "last nudge N ago" in `gc session list` and the API. The single
+	// biggest churn class measured after the first deploy.
+	"last_nudge_delivered_at": {},
+
+	// Stalled-claim backstop state machine (cmd/gc/idle_nudge.go). All three
+	// keys are written by ONE SetMetadataBatch in writeIdleClaimMarker and
+	// cleared by one in clearIdleClaimMarker, so the count key has to move with
+	// the other two or the batch keeps committing.
+	"idle_claim_nudge_trigger": {},
+	"idle_claim_nudge_count":   {},
+	"idle_claim_nudge_at":      {},
+
+	// Post-step continuation-claim backstop — the same engine, the same
+	// write-one-batch shape (writeContinuationClaimMarker), so the same
+	// all-or-nothing rule applies to its six keys.
+	"continuation_claim_nudge_work":       {},
+	"continuation_claim_nudge_root":       {},
+	"continuation_claim_nudge_store_ref":  {},
+	"continuation_claim_nudge_generation": {},
+	"continuation_claim_nudge_count":      {},
+	"continuation_claim_nudge_at":         {},
+
+	// Per-episode throttle for the session.stranded diagnostic. Its own writer
+	// already documents the durable value as best-effort ("the in-memory marker
+	// is the load-bearing single-emission guarantee"), and it is set and cleared
+	// once per stranding episode by a single-key SetMarker.
+	"stranded_event_emitted_at": {},
 
 	beadmeta.LastHeartbeatAtMetadataKey: {},
 }
+
+// LEFT VERSIONED ON PURPOSE — gc.trigger_bead_id (beadmeta.TriggerBeadIDMetadataKey).
+// It drives commits, but it fails the membership rule on two counts.
+//
+//  1. It is not telemetry. It is the pool slot's binding to the work it was
+//     dispatched for: build_desired_state reads it to decide worktree reuse and
+//     live-resume continuation, and the idle-claim backstop keys its whole state
+//     machine on it. The reconciler never re-derives it — it IS the record.
+//
+//  2. Moving it would break a documented atomicity guarantee. It is written as
+//     one member of the trigger/provenance cluster (trigger id, store ref, brain
+//     parent sid, pack, workspace, work dir) through
+//     session.Store.UpdateMetadataInfo, whose contract is one backend operation
+//     so the cluster "commits atomically or not at all"
+//     (internal/session/store.go). The splitter would send the trigger id to the
+//     table and the rest through Update — exactly the split that contract
+//     exists to forbid, leaving a bead bound to a new trigger with the old
+//     store ref and work dir.
+//
+// The same reasoning keeps gc.trigger_bead_store_ref, gc.pack,
+// gc.pack_workspace, gc.work_dir and gc.brain_parent_sid versioned.
 
 // KNOWN LIMIT — do not filter a bead QUERY on a moved key. The read overlay
 // merges liveness values onto beads AFTER the store has selected them, so a
 // ListQuery.Metadata / ListByMetadata predicate on (say) state or
 // pending_create_claim still matches the STALE committed value and would select
 // the wrong beads. No such query exists in the tree today (verified across
-// cmd/gc and internal/ when the split landed: every metadata filter keys on
+// cmd/gc and internal/ when the split landed, and re-verified key by key when
+// the sweep widened the set: every metadata filter keys on
 // alias, named-session identity, kind, routed_to, root-bead id or idempotency
 // key — all versioned). A new one must either query session_liveness directly or
 // filter in memory after the overlay.
