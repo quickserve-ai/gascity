@@ -534,6 +534,12 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 		UpstreamAPIKeyEnv:  "AMP_API_KEY",
 		Args:               []string{"--dangerously-allow-all", "--no-ide"},
 		PromptMode:         "arg",
+		// A profile with NO readiness signal leaves every session stuck in
+		// state=creating forever (the omp incident, ga-8ouxd): gc never
+		// observes ready, the reconciler retries the start until it gives
+		// up. Delay-based like the other TUIs whose prompt glyph is
+		// unverified; replace with ReadyPromptPrefix when one is measured.
+		ReadyDelayMs:       8000,
 		ProcessNames:       []string{"amp"},
 		InstructionsFile:   "AGENTS.md",
 		ResumeFlag:         "threads continue",
@@ -683,6 +689,10 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 		Command:          "auggie",
 		Args:             []string{"--allow-indexing"},
 		PromptMode:       "arg",
+		// See the amp comment: no readiness signal = sessions never leave
+		// state=creating (ga-8ouxd). Delay until a real prompt glyph is
+		// measured.
+		ReadyDelayMs:     8000,
 		ProcessNames:     []string{"auggie"},
 		InstructionsFile: "AGENTS.md",
 		ResumeFlag:       "--resume",
