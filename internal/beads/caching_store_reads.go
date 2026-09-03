@@ -37,7 +37,7 @@ func (c *CachingStore) List(query ListQuery) ([]Bead, error) {
 	// takes the old full-scan fallback.
 	var cached []Bead
 	if err := c.readCacheWithOverlay(func() bool {
-		return c.cacheServableForListQueryLocked(query)
+		return c.cacheServableForListQueryLocked(query) && c.freshEnoughToServeLocked()
 	}, func(suppressed map[string]struct{}) {
 		cached = make([]Bead, 0, len(c.beads))
 		for _, b := range c.beads {
@@ -183,7 +183,7 @@ func (c *CachingStore) cachedCountContext(ctx context.Context, query ListQuery, 
 	}
 	defer c.mu.RUnlock()
 
-	if !c.cacheServableForListQueryLocked(query) || len(c.dirty) > 0 {
+	if !c.cacheServableForListQueryLocked(query) || len(c.dirty) > 0 || !c.freshEnoughToServeLocked() {
 		return 0, false, nil
 	}
 	var n int
@@ -290,9 +290,17 @@ func (c *CachingStore) collectCachedListLocked(query ListQuery) []Bead {
 // cacheServableForListQueryLocked refuses to treat PrimeActive's open and
 // in-progress subset as a complete answer to a broader nonclosed query. A full
 // prime may answer every nonclosed status; a partial prime may answer only the
-// two status filters it actually loaded. Caller must hold c.mu.
+// two status filters it actually loaded.
+//
+// It is shared with the strict cache-only list reads (CachedList and the
+// Cached handle's List), so it applies only the structural half of
+// servability. The stale-serve bound (freshEnoughToServeLocked, ga-yc0chj) is
+// added by the reads that fall back to the backing store (List, Count), where
+// a refusal degrades the read to a live one; a cache-only read has no live
+// read to degrade to, and ga-yc0chj deliberately left those handles
+// unbounded. Caller must hold c.mu.
 func (c *CachingStore) cacheServableForListQueryLocked(query ListQuery) bool {
-	if !c.cacheServableLocked() {
+	if (c.state != cacheLive && c.state != cachePartial) || c.primePartialErr != nil {
 		return false
 	}
 	if c.state == cacheLive {
@@ -564,14 +572,18 @@ func (c *CachingStore) Ready(query ...ReadyQuery) ([]Bead, error) {
 		openBeads       []Bead
 		unanswerable    bool
 	)
-	// Ready requires a fully live cache with complete dependency coverage and a
-	// ready projection the backing store can actually serve; the overlay
-	// refreshes any dirty rows first, then computes readiness from the cache.
-	// On overlay error the read takes the old full backing.Ready scan.
+	// Ready requires a fully live cache with complete dependency coverage, a
+	// ready projection the backing store can actually serve, and the same
+	// freshness bound the other fallback-backed cached reads apply — a readiness
+	// verdict computed from a snapshot that stopped reconciling hours ago is
+	// exactly as wrong as a stale List, and gates work rather than merely
+	// reporting it (ga-yc0chj). The overlay refreshes any dirty rows first, then
+	// computes readiness from the cache. On overlay error — including a refusal
+	// for staleness — the read takes the old full backing.Ready scan.
 	if err := c.readCacheWithOverlay(
 		func() bool {
 			return c.state == cacheLive && c.depsComplete && c.primePartialErr == nil &&
-				!c.readyReadsMustGoLive()
+				!c.readyReadsMustGoLive() && c.freshEnoughToServeLocked()
 		},
 		func(suppressed map[string]struct{}) {
 			statusByID = make(map[string]string, len(c.beads))
