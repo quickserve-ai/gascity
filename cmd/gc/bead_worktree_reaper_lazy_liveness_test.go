@@ -43,7 +43,7 @@ func TestReapClosedBeadWorktrees_NoWorktreesSkipsLivenessScan(t *testing.T) {
 	calls := injectCountingLiveness(t, liveWorktreeState{scanned: true})
 
 	var stderr bytes.Buffer
-	report := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, events.Discard, &stderr)
+	report := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, events.Discard, nil, &stderr)
 
 	if *calls != 0 {
 		t.Fatalf("liveness scan ran %d time(s) on a pass with zero worktrees; the host-wide scan must not run when there is nothing to gate", *calls)
@@ -68,7 +68,7 @@ func TestReapClosedBeadWorktrees_NoCandidatesSkipsLivenessScan(t *testing.T) {
 	calls := injectCountingLiveness(t, liveWorktreeState{scanned: true})
 
 	var stderr bytes.Buffer
-	report := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, events.Discard, &stderr)
+	report := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, events.Discard, nil, &stderr)
 
 	if *calls != 0 {
 		t.Fatalf("liveness scan ran %d time(s) with zero reap candidates (one open bead, one quarantined worktree)\nstderr:\n%s", *calls, stderr.String())
@@ -101,7 +101,7 @@ func TestReapClosedBeadWorktrees_LivenessGatheredOncePerPass(t *testing.T) {
 	calls := injectCountingLiveness(t, liveWorktreeState{scanned: true}) // scanned, nothing live
 
 	var stderr bytes.Buffer
-	report := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, events.Discard, &stderr)
+	report := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, events.Discard, nil, &stderr)
 
 	if *calls != 1 {
 		t.Fatalf("liveness scan ran %d time(s) for two candidates, want exactly 1 (once per pass, not per candidate)", *calls)
@@ -131,7 +131,7 @@ func TestReapClosedBeadWorktrees_LazyScanStillFailsClosedForAllCandidates(t *tes
 	calls := injectCountingLiveness(t, liveWorktreeState{scanned: false})
 
 	var stderr bytes.Buffer
-	report := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, events.Discard, &stderr)
+	report := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, events.Discard, nil, &stderr)
 
 	if *calls != 1 {
 		t.Fatalf("liveness scan ran %d time(s), want exactly 1 even when indeterminate", *calls)
@@ -168,9 +168,9 @@ func (s *reapListCountingStore) List(q beads.ListQuery) ([]beads.Bead, error) {
 }
 
 // The live-fleet shape behind ga-singc6: ONE candidate, protected every tick
-// by the git gate (here an uncommitted file; on the fleet a repo-global stash,
-// ga-gsfxag). The verdict is decided locally, so neither the store scan nor
-// the process-table scan may run.
+// by the git gate (an uncommitted file; historically the repo-global stash
+// veto, since removed by ga-gsfxag). The verdict is decided locally, so
+// neither the store scan nor the process-table scan may run.
 func TestReapClosedBeadWorktrees_GitProtectedCandidateSkipsStoreAndProcessScans(t *testing.T) {
 	cityPath, rigRoot := initReapRig(t)
 	wt := addClosedWorktree(t, rigRoot, cityPath, "polecats", "ga-dirty001")
@@ -182,7 +182,7 @@ func TestReapClosedBeadWorktrees_GitProtectedCandidateSkipsStoreAndProcessScans(
 	calls := injectCountingLiveness(t, liveWorktreeState{scanned: true})
 
 	var stderr bytes.Buffer
-	report := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, events.Discard, &stderr)
+	report := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, events.Discard, nil, &stderr)
 
 	if store.calls != 0 {
 		t.Fatalf("borrow-veto List ran %d time(s) for a candidate the git gate protects; the store scan must not run for it", store.calls)
@@ -219,7 +219,7 @@ func TestReapClosedBeadWorktrees_GitGateOnlyDropsItsOwnCandidates(t *testing.T) 
 	calls := injectCountingLiveness(t, liveWorktreeState{scanned: true})
 
 	var stderr bytes.Buffer
-	report := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, events.Discard, &stderr)
+	report := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, events.Discard, nil, &stderr)
 
 	if store.calls != 1 {
 		t.Fatalf("borrow-veto List ran %d time(s), want exactly 1 for the surviving clean candidate", store.calls)
