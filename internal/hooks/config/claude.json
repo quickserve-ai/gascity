@@ -32,6 +32,10 @@
         "hooks": [
           {
             "type": "command",
+            "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && gc hook run --timeout 15s --timeout-exit-code 0 -- hook context-inject"
+          },
+          {
+            "type": "command",
             "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:$PATH\" && gc hook run --timeout 15s --timeout-exit-code 0 -- nudge drain --inject"
           },
           {

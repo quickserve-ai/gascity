@@ -401,29 +401,30 @@ func nonNilQueuedNudges(items []queuedNudge) []queuedNudge {
 }
 
 func cmdNudgeDrainWithFormat(args []string, inject bool, hookFormat string, stdout, stderr io.Writer) int {
-	// On every prompt, emit a live clock (operator-local + UTC + epoch) and
-	// the agent's active formula step (if any) as UserPromptSubmit hook context.
-	// When a nudge also fires we fold everything into that nudge's single
-	// provider-formatted payload (see the combined write below); otherwise this
-	// deferred fallback emits clock+step on their own. Either way exactly one
-	// provider hook context is written per invocation, so JSON formats
-	// (codex/gemini) stay one valid document rather than two concatenated objects.
-	// See clock_inject.go and wisp_step_inject.go.
+	// On every prompt, emit the agent's active formula step (if any) as
+	// UserPromptSubmit hook context. When a nudge also fires we fold the step
+	// into that nudge's single provider-formatted payload (see the combined
+	// write below); otherwise the deferred fallback emits the step on its own.
+	// Either way exactly one provider hook context is written per invocation, so
+	// JSON formats (codex/gemini) stay one valid document rather than two
+	// concatenated objects.
+	//
+	// The clock + context-usage advisory is NOT emitted here: it is delivered by
+	// the dedicated store-free `gc hook context-inject` UserPromptSubmit entry
+	// (see cmd_hook_context_inject.go). It used to ride in this drain, but this
+	// path resolves a target and drains the nudge queue from the shared store —
+	// 33–35s on the single-store topology — so a `gc hook run --timeout 15s`
+	// wrapper timed out and DISCARDED the deferred flush, dropping the advisory
+	// on every prompt for every laptop crew session (qc-s3i236.4). The active
+	// step (wispExtra) is itself store-bound (it needs the resolved target), so
+	// it legitimately stays on this path. See wisp_step_inject.go, and
+	// clock_inject.go / context_inject.go for the split-out carrier.
 	var wispExtra string // set after target resolution; captured by defer closure
 	emittedHookContext := false
-	var injectPrefix string
 	if inject {
-		// Read the provider hook input once (UserPromptSubmit JSON on stdin,
-		// pipe-only — see readHookStdin) and build the shared inject prefix:
-		// the clock line plus, when context pressure crosses its threshold,
-		// the context-usage guidance (see context_inject.go).
-		injectPrefix = clockInjectLine() + contextInjectLine(readHookStdin())
 		defer func() {
-			if !emittedHookContext {
-				line := injectPrefix + wispExtra
-				if line != "" {
-					_ = writeProviderHookContextForEvent(stdout, hookFormat, "UserPromptSubmit", line)
-				}
+			if !emittedHookContext && wispExtra != "" {
+				_ = writeProviderHookContextForEvent(stdout, hookFormat, "UserPromptSubmit", wispExtra)
 			}
 		}()
 	}
@@ -519,11 +520,12 @@ func cmdNudgeDrainWithFormat(args []string, inject bool, hookFormat string, stdo
 	}
 	var writeErr error
 	if inject {
-		// Fold the clock and active formula step into the nudge so a single
-		// provider-formatted payload carries all; this is the one place the
-		// combined context is written.
+		// Fold the active formula step into the nudge so a single
+		// provider-formatted payload carries both; this is the one place the
+		// combined context is written. (Clock + context advisory ride the
+		// separate store-free hook — see the block at the top of this func.)
 		emittedHookContext = true
-		writeErr = writeProviderHookContextForEvent(stdout, hookFormat, "UserPromptSubmit", injectPrefix+out+wispExtra)
+		writeErr = writeProviderHookContextForEvent(stdout, hookFormat, "UserPromptSubmit", out+wispExtra)
 	} else {
 		_, writeErr = io.WriteString(stdout, out)
 	}
