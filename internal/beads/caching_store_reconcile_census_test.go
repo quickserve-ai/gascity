@@ -115,7 +115,8 @@ func TestMergeOracleFieldCoverage(t *testing.T) {
 		"reconcileGate": true, // reconcile-loop gate, fixed at construction
 		"now":           true, // the clock (WithClock), fixed at construction
 		"onChange":      true, "problemf": true, "problemLog": true,
-		"lastReconcileLogAt": true, "primeMu": true, "primeRunning": true,
+		"lastReconcileLogAt": true, "lastOverdueLogAt": true,
+		"primeMu": true, "primeRunning": true,
 		"primeCycle": true, "lastFullPrimeStartedAt": true, "primeRetryDelay": true,
 		"lifecycleMu": true, "lifecycleWG": true, "cancelFn": true, "stopCh": true,
 		"stopped": true, "latencyWindow": true, "latencyDriverActive": true,
@@ -158,6 +159,13 @@ func TestMergeOracleFieldCoverage(t *testing.T) {
 		"SyncFailures": true, "ProblemCount": true, "LastProblemAt": true,
 		"LastProblem": true, "State": true, "StaggerOffsetMs": true,
 		"CurrentReconcileInterval": true, "LatencyP95Ms": true, "CadenceDriver": true,
+		// The reconcile watchdog's own fields: ReconcilerArmedAt is stamped by
+		// StartReconciler, the other two by checkReconcileOverdue. The merge
+		// seam never writes any of them, exactly like StaggerOffsetMs above.
+		// They are deliberately separate from ProblemCount/LastProblemAt,
+		// because LastProblemAt is the reconciler's retry-backoff anchor.
+		"ReconcilerArmedAt": true, "ReconcileOverdueCount": true,
+		"LastReconcileOverdueAt": true,
 	}
 	assertFieldsClassified(t, reflect.TypeOf(CacheStats{}), comparedStats, excludedStats)
 }
