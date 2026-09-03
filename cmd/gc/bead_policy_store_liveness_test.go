@@ -83,8 +83,9 @@ func TestLivenessSplitterDivertsLivenessKeysAndKeepsTheRest(t *testing.T) {
 
 	err := store.SetMetadataBatch(bead.ID, map[string]string{
 		"state":        "asleep",               // liveness
+		"state_reason": "idle timeout",         // liveness (swept in with state)
 		"slept_at":     "2026-09-03T00:00:00Z", // liveness
-		"state_reason": "idle timeout",         // versioned
+		"session_key":  "conv-1",               // versioned: restart identity history
 	})
 	if err != nil {
 		t.Fatalf("SetMetadataBatch: %v", err)
@@ -94,7 +95,7 @@ func TestLivenessSplitterDivertsLivenessKeysAndKeepsTheRest(t *testing.T) {
 		t.Fatalf("backing saw %d batches, want 1", len(backing.batches))
 	}
 	got := backing.batches[0]
-	if len(got) != 1 || got["state_reason"] != "idle timeout" {
+	if len(got) != 1 || got["session_key"] != "conv-1" {
 		t.Fatalf("versioned batch = %v, want only the non-liveness key", got)
 	}
 
@@ -491,7 +492,7 @@ func TestTxFailureLeavesLivenessUnwritten(t *testing.T) {
 
 // TestTxKeepsLivenessVersionedAndFenced pins the other half of the invariant:
 // a session bead that reports closed always carries its terminal state, because
-// the state travelled in the same store write as the Close — not to a different
+// the state traveled in the same store write as the Close — not to a different
 // store that a crash could leave behind.
 func TestTxKeepsLivenessVersionedAndFenced(t *testing.T) {
 	store, backing, lv := newLivenessTestStore(t, liveness.ModeTable)
@@ -858,8 +859,8 @@ func TestBeadMayCarryLiveness(t *testing.T) {
 		{name: "session type", bead: beads.Bead{Type: sessionBeadType}, want: true},
 		{name: "session label", bead: beads.Bead{Type: "task", Labels: []string{sessionBeadLabel}}, want: true},
 		{
-			name: "work bead that has been heartbeated",
-			bead: beads.Bead{Type: "task", Metadata: beads.StringMap{heartbeatMetadataKey: "2026-09-03T00:00:00Z"}},
+			name: "work bead carrying a moved liveness key",
+			bead: beads.Bead{Type: "task", Metadata: beads.StringMap{"slept_at": "2026-09-03T00:00:00Z"}},
 			want: true,
 		},
 		{
