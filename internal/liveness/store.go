@@ -277,8 +277,14 @@ func (s *SQLStore) DeleteKeys(ctx context.Context, beadID string, keys []string)
 func sortedWritableKeys(kv map[string]string) ([]string, error) {
 	out := make([]string, 0, len(kv))
 	for k := range kv {
-		if k == WrittenAtKey {
-			return nil, fmt.Errorf("liveness: %s is derived from the table's own timestamps and cannot be written", WrittenAtKey)
+		// No marker key is ever a table row. WrittenAtKey is derived from the
+		// table's own timestamps, and a fence marker is a VERSIONED value the
+		// overlay reads off committed metadata — a row carrying one would let a
+		// table write forge its own fence or freshness clock. Split already
+		// strips them from every inbound patch; this is the same guard at the
+		// other end, for a caller that reaches the store directly.
+		if IsMarkerKey(k) {
+			return nil, fmt.Errorf("liveness: %s is an overlay marker, not session telemetry, and cannot be written to the table", k)
 		}
 		if strings.TrimSpace(k) == "" {
 			return nil, fmt.Errorf("liveness: empty metadata key")
@@ -659,6 +665,12 @@ func Overlay(meta map[string]string, snap Snapshot) map[string]string {
 	newest := time.Time{}
 	applied := false
 	for k, v := range snap.Values {
+		// A marker has no business being a row (SetBatch refuses one). If one
+		// somehow is, it must never reach the merged metadata: it would forge
+		// this bead's own fence or freshness clock out of table data.
+		if IsMarkerKey(k) {
+			continue
+		}
 		if fence := ParseFence(meta[FenceKeyFor(k)]); !fence.IsZero() {
 			written, ok := snap.Times[k]
 			// A row with no usable timestamp cannot prove it postdates the

@@ -178,11 +178,56 @@ func TestOverlayWithNoRowsIsIdentity(t *testing.T) {
 	}
 }
 
-func TestSetBatchRejectsTheDerivedClockKey(t *testing.T) {
+func TestSetBatchRejectsEveryOverlayMarker(t *testing.T) {
 	m := NewMemStore()
-	err := m.SetBatch(context.Background(), "gc-1", map[string]string{WrittenAtKey: "now"})
-	if err == nil {
-		t.Fatalf("SetBatch(%s) = nil, want an error: the clock is derived, never written", WrittenAtKey)
+	for _, k := range []string{WrittenAtKey, FenceKeyFor("state"), FencePrefix + "anything"} {
+		if err := m.SetBatch(context.Background(), "gc-1", map[string]string{k: "now"}); err == nil {
+			t.Errorf("SetBatch(%s) = nil, want an error: a marker is never a table row", k)
+		}
+	}
+}
+
+// TestOverlayIgnoresAMarkerKeyThatSomehowBecameARow is the other end of the
+// forgery guard: a row carrying a marker key must never reach merged metadata,
+// where it would forge the bead's own fence or freshness clock out of table data.
+func TestOverlayIgnoresAMarkerKeyThatSomehowBecameARow(t *testing.T) {
+	fence := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	committed := map[string]string{
+		"state":                       "active",
+		FenceKeyFor("state"):          FenceStamp(fence),
+		"instance_token":              "committed",
+		FenceKeyFor("instance_token"): FenceStamp(fence),
+	}
+	snap := Snapshot{
+		Values: map[string]string{
+			// A forged fence that would un-fence instance_token, and a forged
+			// freshness clock.
+			FenceKeyFor("instance_token"): FenceStamp(fence.Add(-time.Hour)),
+			WrittenAtKey:                  FenceStamp(fence.Add(time.Hour)),
+			"instance_token":              "forged",
+			"state":                       "asleep",
+		},
+		Times: map[string]time.Time{
+			FenceKeyFor("instance_token"): fence.Add(time.Minute),
+			WrittenAtKey:                  fence.Add(time.Minute),
+			"instance_token":              fence.Add(-time.Minute),
+			"state":                       fence.Add(time.Minute),
+		},
+		WrittenAt: fence.Add(time.Minute),
+	}
+	got := Overlay(committed, snap)
+	if got[FenceKeyFor("instance_token")] != FenceStamp(fence) {
+		t.Errorf("%s = %q, want the COMMITTED stamp; a table row forged the fence",
+			FenceKeyFor("instance_token"), got[FenceKeyFor("instance_token")])
+	}
+	if got["instance_token"] != "committed" {
+		t.Errorf("instance_token = %q, want the committed value", got["instance_token"])
+	}
+	if got[WrittenAtKey] != FenceStamp(fence.Add(time.Minute)) {
+		t.Errorf("%s = %q, want the surviving rows' max, not the forged value", WrittenAtKey, got[WrittenAtKey])
+	}
+	if got["state"] != "asleep" {
+		t.Errorf("state = %q, want the genuine post-fence row to still win", got["state"])
 	}
 }
 
