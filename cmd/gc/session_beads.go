@@ -475,6 +475,11 @@ func reopenClosedConfiguredNamedSessionBead(
 		// "open without its reopen metadata" split cannot occur, even on a store
 		// whose Tx executes callbacks sequentially without rollback
 		// (ga-igcny0.1.1). The Tx wrapper is kept only for the labeled commit.
+		//
+		// batch carries session-liveness keys, which inside a Tx stay VERSIONED
+		// (see beadPolicyStore.Tx) precisely so this one-write property survives:
+		// routing them to the liveness table would make the reopen observable
+		// split across two stores, which is the case this comment rules out.
 		open := "open"
 		var lockedErr error
 		reopened, lockedErr = reopenClosedConfiguredNamedSessionBeadLocked(store, cfg, identity, sessionName, bead, batch, func() error {
@@ -3930,6 +3935,12 @@ func closeBeadPreservingAssignees(store beads.Store, id, reason string, preserve
 	// with the metadata ordered first. There the metadata may land while the
 	// Close fails; the helper then reports failure and the reconciler re-runs
 	// the close next tick, so no bead is durably left half-closed.
+	//
+	// ClosePatch carries session-liveness keys (state, slept_at, ...). On the
+	// terminal write those deliberately stay VERSIONED rather than splitting to
+	// the liveness table (ga-lys454; see beadPolicyStore.Tx): the terminal state
+	// and the Close must land in one store, fenced, so no stale table row can
+	// shadow the committed terminal state.
 	closed, err := sessionFrontDoor(store).CloseWithTerminalPatch(id, session.ClosePatch(now, reason), "gc: close session "+id, now)
 	if err != nil {
 		fmt.Fprintf(stderr, "session beads: closing %s: %v\n", id, err) //nolint:errcheck
