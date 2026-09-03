@@ -155,7 +155,10 @@ func withMainStoreEmission(store beads.Store, cityPath string) beads.Store {
 	if !underPolicy {
 		return emitting
 	}
-	return wrapStoreWithBeadPolicies(emitting, policy.cfg)
+	// The rebuilt policy layer keeps the session-liveness binding, or a
+	// one-shot session write through the emitter would skip the splitter
+	// (ga-lys454).
+	return wrapStoreWithBeadPolicies(emitting, policy.cfg, policy.lv)
 }
 
 // mainStoreEmissionEngine reports whether store is an engine the one-shot
