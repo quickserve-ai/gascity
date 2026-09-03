@@ -155,6 +155,14 @@ var newControllerStateOpenCityStore = func(cityPath string, mode gate.Mode) (bea
 	return openStoreResultAtForCityWithMode(cityPath, cityPath, mode, true, true)
 }
 
+// controllerStatePreflightCityStore opens a candidate city store for the
+// reload schema preflight, which closes it again at once: a one-shot open
+// that also skips the builtin-cache readiness pass (see
+// preflightCityStoreReload). Tests swap this seam.
+var controllerStatePreflightCityStore = func(cityPath string, cfg *config.City, mode gate.Mode) (beads.StoreOpenResult, error) {
+	return openStoreResultAtForCityWithConfigOptions(cityPath, cityPath, cfg, mode, true, false, false, false)
+}
+
 // controllerStateOpenRigStoreAtForCity routes controller rig stores through
 // the same native-selection factory as direct city/rig store opens. Tests swap
 // this seam to avoid opening real native Dolt handles.
@@ -250,20 +258,31 @@ func newControllerStateWithRoutes(
 	for _, n := range cs.rolloutFlags.Notices() {
 		cs.rolloutWarnf("api: rollout: %s\n", n.Message)
 	}
-	cs.beadStores = cs.buildStores(cfg)
 	// Capture the initial raw config snapshot so provenance reads before the
 	// first reload still use the gate's basis. nil is tolerated: RawConfig
 	// lazily retries on the first read.
 	cs.rawCfg = cs.loadRawSnapshot()
-	// Open city-level store for session beads and mail (best-effort).
-	if opened, err := newControllerStateOpenCityStore(cityPath, cs.rolloutFlags.BeadsConditionalWrites()); err != nil {
-		fmt.Fprintf(os.Stderr, "api: city bead store: %v (session/mail endpoints disabled)\n", err)
-	} else {
-		store := opened.Store
-		cs.cityBeadStore = wrapWithCachingStore(ctx, store, ep, true)
+	// Open the city store first. A schema-skew fallback is diagnostic-only:
+	// do not start cache reconcilers, rig stores, mail, or external messaging.
+	opened, cityStoreErr := newControllerStateOpenCityStore(cityPath, cs.rolloutFlags.BeadsConditionalWrites())
+	schemaSkewed := beads.IsSchemaSkewDiagnostic(opened.Diagnostic)
+	if schemaSkewed {
+		cs.cityBeadStore = opened.Store
 		cs.cityBeadsDiagnostic = diagnosticPtr(opened.Diagnostic)
-		cs.cityMailProv = newCityMailProvider(cs.storageRoutes, cs.cityBeadStore, cfg, cityPath, ep)
-		cs.extmsgSvc = newCityExtMsgServices(cs.storageRoutes, cs.cityBeadStore, cfg, cityPath, ep)
+		if cityStoreErr != nil {
+			fmt.Fprintf(os.Stderr, "api: city bead store schema mismatch; fallback unavailable: %v (session/mail endpoints disabled)\n", cityStoreErr)
+		}
+	} else {
+		if cityStoreErr != nil {
+			fmt.Fprintf(os.Stderr, "api: city bead store: %v (session/mail endpoints disabled)\n", cityStoreErr)
+		}
+		cs.beadStores = cs.buildStores(cfg)
+		if cityStoreErr == nil {
+			cs.cityBeadStore = wrapWithCachingStore(ctx, opened.Store, ep, true, cityPath, cacheHeartbeatCityScope)
+			cs.cityBeadsDiagnostic = diagnosticPtr(opened.Diagnostic)
+			cs.cityMailProv = newCityMailProvider(cs.storageRoutes, cs.cityBeadStore, cfg, cityPath, ep)
+			cs.extmsgSvc = newCityExtMsgServices(cs.storageRoutes, cs.cityBeadStore, cfg, cityPath, ep)
+		}
 	}
 	cs.preflightConditionalWrites()
 	cs.storeMetadataSignature = storeMetadataSignature(cityPath, cfg)
@@ -278,7 +297,14 @@ func newControllerStateWithRoutes(
 // Suspended rigs pass false: they spawn no agents, so nothing writes locally and
 // a continuously refreshed cache buys nothing; reconciling every suspended rig
 // every cycle is what pegs the supervisor (gastownhall/gascity #1978 follow-up).
-func wrapWithCachingStore(ctx context.Context, store beads.Store, ep events.Provider, backgroundRefresh bool) beads.Store {
+//
+// cityPath and heartbeatScope wire the store's durable reconcile-liveness
+// record (beads.ReconcileHeartbeat). They are only consulted on the path that
+// actually arms a reconciler; pass an empty scope to publish nothing. A store
+// that publishes nothing is invisible to `gc doctor`'s beads-cache-reconcile
+// watch, which is the correct default for any store that is not supposed to be
+// reconciling.
+func wrapWithCachingStore(ctx context.Context, store beads.Store, ep events.Provider, backgroundRefresh bool, cityPath, heartbeatScope string) beads.Store {
 	baseStore, policyStore, policyWrapped := unwrapBeadPolicyStore(store)
 	if baseStore == nil {
 		return nil
@@ -320,6 +346,9 @@ func wrapWithCachingStore(ctx context.Context, store beads.Store, ep events.Prov
 		}
 		return cs
 	}
+	// Arm the durable liveness record before the reconciler goroutine starts,
+	// so StartReconciler's arm stamp is published rather than raced past.
+	installCacheHeartbeatSink(ctx, cs, cityPath, heartbeatScope)
 	// Full prime runs async — backfills remaining beads for List()
 	// callers (convergence reconcile, sweep, API handlers).
 	go primeThenStartReconciler(ctx, cs, os.Getenv("GC_AGENT"))
@@ -327,6 +356,42 @@ func wrapWithCachingStore(ctx context.Context, store beads.Store, ep events.Prov
 		return wrapStoreWithBeadPolicies(cs, policyStore.cfg, policyStore.lv)
 	}
 	return cs
+}
+
+// installCacheHeartbeatSink wires a CachingStore's durable reconcile-liveness
+// publisher. The sink is best-effort: a heartbeat that cannot be written is
+// logged at most once per store-and-error and never interferes with the
+// reconcile it was reporting on. An empty cityPath or scope disables it.
+//
+// ctx is the cache lifetime. The sink STOPS as soon as it is done, for two
+// reasons. Operationally, a torn-down store must not keep stamping a liveness
+// record: the record would still name a live supervisor pid while its
+// LastReconcileAt froze, and `gc doctor` would read the corpse as a stalled
+// cache. Mechanically, WriteReconcileHeartbeat MkdirAll's its directory on
+// every write, so a publisher that outlives its city root RE-CREATES
+// <city>/.gc/runtime/beads-cache after the tree is removed — which is exactly
+// how the controllerState tests lost their t.TempDir() cleanup
+// ("unlinkat .../.gc/runtime/beads-cache: directory not empty", 33 failures in
+// 40 runs of -run TestControllerState before this guard).
+func installCacheHeartbeatSink(ctx context.Context, cs *beads.CachingStore, cityPath, scope string) {
+	cityPath = strings.TrimSpace(cityPath)
+	scope = strings.TrimSpace(scope)
+	if cs == nil || cityPath == "" || scope == "" {
+		return
+	}
+	var warnedOnce sync.Once
+	cs.SetReconcileHeartbeatSink(func(hb beads.ReconcileHeartbeat) {
+		if ctx != nil && ctx.Err() != nil {
+			return
+		}
+		hb.Scope = scope
+		if err := beads.WriteReconcileHeartbeat(cityPath, hb); err != nil {
+			warnedOnce.Do(func() {
+				log.Printf("beads cache: heartbeat publish failed for scope %s: %v "+
+					"(gc doctor's beads-cache-reconcile watch will read this scope as unknown)", scope, err)
+			})
+		}
+	})
 }
 
 // primeArmBound is how long the initial full prime may run before the
@@ -432,13 +497,17 @@ func (cs *controllerState) buildStores(cfg *config.City) map[string]beads.Store 
 			// Legacy file mode aliases every rig to the same backing store, so
 			// the cache handle must be shared too for immediate cross-rig reads.
 			if sharedLegacyCachedStore == nil {
-				sharedLegacyCachedStore = wrapWithCachingStore(cs.cacheCtx, sharedLegacyFileStore, cs.eventProv, true)
+				// Legacy shared-file mode aliases every rig onto one store, so no
+				// single rig scope owns its heartbeat; publish none rather than
+				// file one scope's liveness under another's name.
+				sharedLegacyCachedStore = wrapWithCachingStore(cs.cacheCtx, sharedLegacyFileStore, cs.eventProv, true, cs.cityPath, "")
 			}
 			stores[rig.Name] = sharedLegacyCachedStore
 			continue
 		}
 		store = cs.openRigStore(scopeProvider, rig.Name, scopeRoot, rig.EffectivePrefix(), cfg)
-		stores[rig.Name] = wrapWithCachingStore(cs.cacheCtx, store, cs.eventProv, rigStoreBackgroundRefresh(suspState, rig))
+		stores[rig.Name] = wrapWithCachingStore(cs.cacheCtx, store, cs.eventProv,
+			rigStoreBackgroundRefresh(suspState, rig), cs.cityPath, cacheHeartbeatScopeForRig(rig.Name))
 	}
 	return stores
 }
@@ -973,13 +1042,15 @@ func beadEventID(evt events.Event) string {
 func (cs *controllerState) update(cfg *config.City, sp runtime.Provider) {
 	cs.updateMu.Lock()
 	defer cs.updateMu.Unlock()
+	cs.updateLocked(cfg, sp)
+}
 
+// updateLocked rebuilds and publishes controller state while updateMu is held.
+func (cs *controllerState) updateLocked(cfg *config.City, sp runtime.Provider) {
 	// The beads CAS gate is boot-latched: a reload that would change it only
 	// records a pending-restart notice, it does not flip the process mid-run.
 	cs.noteRolloutDrift(cfg)
 
-	// Build new stores outside the lock (may do file I/O / subprocess spawns).
-	stores := cs.buildStores(cfg)
 	storeSignature := storeMetadataSignature(cs.cityPath, cfg)
 	// Capture the raw config from the same on-disk generation as cfg, outside
 	// the lock (it does a TOML parse). nil signals "keep the prior snapshot".
@@ -995,12 +1066,24 @@ func (cs *controllerState) update(cfg *config.City, sp runtime.Provider) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "api: city bead store reload: %v\n", err) //nolint:errcheck // best-effort stderr
 	}
+	if beads.IsSchemaSkewDiagnostic(openedCityStore.Diagnostic) {
+		if openedCityStore.Store != nil {
+			closeBeadStoreHandle(openedCityStore.Store) //nolint:errcheck
+		}
+		cs.mu.Lock()
+		cs.cityBeadsDiagnostic = diagnosticPtr(openedCityStore.Diagnostic)
+		cs.mu.Unlock()
+		return
+	}
+	// Build rig stores only after the publishing city-store open passes the
+	// schema gate; otherwise their cache loops would reconcile degraded state.
+	stores := cs.buildStores(cfg)
 	cityStore := openedCityStore.Store
 	cityBeadsDiagnostic := diagnosticPtr(openedCityStore.Diagnostic)
 	var cityMailProv mail.Provider
 	var extSvc *extmsg.Services
 	if cityStore != nil {
-		cityStore = wrapWithCachingStore(cs.cacheCtx, cityStore, cs.eventProv, true)
+		cityStore = wrapWithCachingStore(cs.cacheCtx, cityStore, cs.eventProv, true, cs.cityPath, cacheHeartbeatCityScope)
 		cityMailProv = newCityMailProvider(cs.storageRoutes, cityStore, cfg, cs.cityPath, cs.eventProv)
 		extSvc = newCityExtMsgServices(cs.storageRoutes, cityStore, cfg, cs.cityPath, cs.eventProv)
 	}
@@ -1763,6 +1846,33 @@ func (cs *controllerState) CityBeadsDiagnostic() *beads.BeadsDiagnostic {
 	}
 	diag := *cs.cityBeadsDiagnostic
 	return &diag
+}
+
+// preflightCityStoreReload opens and closes the candidate city store without
+// publishing it. Schema-skew diagnostics are latched so the runtime can enter
+// fail-closed preserve mode before any reload mutation stops sessions.
+func (cs *controllerState) preflightCityStoreReload() (*beads.BeadsDiagnostic, error) {
+	cs.mu.RLock()
+	cfg := cs.cfg
+	cs.mu.RUnlock()
+	opened, err := controllerStatePreflightCityStore(cs.cityPath, cfg, cs.rolloutFlags.BeadsConditionalWrites())
+	diag := opened.Diagnostic
+	if beads.IsSchemaSkewDiagnostic(diag) {
+		if opened.Store != nil {
+			defer closeBeadStoreHandle(opened.Store) //nolint:errcheck
+		}
+		cs.mu.Lock()
+		cs.cityBeadsDiagnostic = diagnosticPtr(diag)
+		cs.mu.Unlock()
+		return &diag, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if opened.Store != nil {
+		defer closeBeadStoreHandle(opened.Store) //nolint:errcheck
+	}
+	return &diag, nil
 }
 
 // Orders scans formula layers and returns active orders.
@@ -2880,6 +2990,8 @@ func (s *configMutationSnapshot) restore() error {
 }
 
 func (cs *controllerState) mutateAndPoke(mutate func() error) error {
+	cs.updateMu.Lock()
+	defer cs.updateMu.Unlock()
 	var snapshot *configMutationSnapshot
 	if cs.cityPath != "" {
 		var err error
@@ -2925,7 +3037,7 @@ func (cs *controllerState) refreshConfigSnapshot() (string, error) {
 	cs.mu.RLock()
 	sp := cs.sp
 	cs.mu.RUnlock()
-	cs.update(nextCfg, sp)
+	cs.updateLocked(nextCfg, sp)
 	return revision, nil
 }
 
