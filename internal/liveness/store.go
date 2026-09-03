@@ -36,7 +36,7 @@ type Snapshot struct {
 	// project that empty value rather than falling back to committed metadata.
 	Values map[string]string
 	// Times carries each row's OWN written_at. The overlay fences PER KEY
-	// against the bead's FallbackAtKey stamp, so a bead-level max is not
+	// against that key's own fence marker, so a bead-level max is not
 	// sufficient: after a degraded write, one key may have been refreshed since
 	// the fallback while its siblings are still pre-outage rows that must be
 	// dropped.
@@ -56,6 +56,14 @@ type Store interface {
 	// An empty-string value writes a tombstone row (v=''), not a delete — see
 	// the note on Snapshot.Values.
 	SetBatch(ctx context.Context, beadID string, kv map[string]string) error
+	// DeleteKeys REMOVES beadID's rows for the named keys. It is the one
+	// operation that is a genuine delete rather than a tombstone, and the
+	// difference is the point: with no row at all the overlay falls back to the
+	// bead's committed metadata, which is precisely what a transactional write
+	// just made authoritative. A tombstone would instead project an empty value
+	// over it. Used only by the post-commit Tx sweep (cmd/gc beadPolicyStore.Tx).
+	// Deleting a key that has no row is not an error.
+	DeleteKeys(ctx context.Context, beadID string, keys []string) error
 	// Get returns the snapshot for one bead. A bead with no rows yields a
 	// zero Snapshot and a nil error.
 	Get(ctx context.Context, beadID string) (Snapshot, error)
@@ -172,10 +180,14 @@ func (s *SQLStore) Close() error {
 
 // SetBatch upserts kv for beadID in a single SQL transaction.
 //
-// It never calls DOLT_COMMIT: the table is dolt_ignore'd and
-// @@GLOBAL.dolt_transaction_commit is 0 on the target servers, so a plain SQL
-// transaction here mints no Dolt commit. That is the entire point of the change;
-// a DOLT_COMMIT added here would silently restore the churn it removes.
+// It never calls DOLT_COMMIT. The table is dolt_ignore'd, and an ignored table's
+// rows are not part of any commit's tree — so a plain SQL transaction here mints
+// no Dolt commit EVEN THOUGH gc sets @@GLOBAL.dolt_transaction_commit = 1 on
+// every managed server (cmd/gc/dolt_transaction_commit.go). Measured on a real
+// dolt server: 10 SetBatch writes with the global ON minted 0 commits, while 10
+// control writes to a non-ignored table on the same connection minted 10. That
+// is the entire point of the change; a DOLT_COMMIT added here would silently
+// restore the churn it removes.
 func (s *SQLStore) SetBatch(ctx context.Context, beadID string, kv map[string]string) error {
 	if s == nil || s.db == nil {
 		return fmt.Errorf("liveness: store not open")
@@ -216,6 +228,46 @@ func (s *SQLStore) SetBatch(ctx context.Context, beadID string, kv map[string]st
 		return fmt.Errorf("liveness: commit: %w", err)
 	}
 	committed = true
+	return nil
+}
+
+// DeleteKeys removes beadID's rows for keys in one statement.
+//
+// A real DELETE, not a tombstone: the caller is the post-commit Tx sweep, whose
+// whole purpose is to make the overlay fall THROUGH to the committed metadata
+// the transaction just wrote. Writing v=” instead would project an empty value
+// over that metadata — the opposite of what the sweep is for.
+func (s *SQLStore) DeleteKeys(ctx context.Context, beadID string, keys []string) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("liveness: store not open")
+	}
+	beadID = strings.TrimSpace(beadID)
+	if beadID == "" {
+		return fmt.Errorf("liveness: empty bead id")
+	}
+	wanted := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if k = strings.TrimSpace(k); k != "" {
+			wanted = append(wanted, k)
+		}
+	}
+	if len(wanted) == 0 {
+		return nil
+	}
+	// Same deterministic order as SetBatch, for the same reason: concurrent
+	// writers touching overlapping keys take row locks in one order.
+	sort.Strings(wanted)
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(wanted)), ",")
+	args := make([]any, 0, len(wanted)+1)
+	args = append(args, beadID)
+	for _, k := range wanted {
+		args = append(args, k)
+	}
+	//nolint:gosec // G201: the only interpolation is a generated ?-placeholder list.
+	stmt := "DELETE FROM " + TableName + " WHERE bead_id = ? AND k IN (" + placeholders + ")"
+	if _, err := s.db.ExecContext(ctx, stmt, args...); err != nil {
+		return fmt.Errorf("liveness: delete %s: %w", beadID, err)
+	}
 	return nil
 }
 
@@ -491,6 +543,29 @@ func (m *MemStore) SetBatch(_ context.Context, beadID string, kv map[string]stri
 	return nil
 }
 
+// DeleteKeys removes the named rows, mirroring the SQL store's genuine delete.
+func (m *MemStore) DeleteKeys(_ context.Context, beadID string, keys []string) error {
+	if strings.TrimSpace(beadID) == "" {
+		return fmt.Errorf("liveness: empty bead id")
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	bead := m.rows[beadID]
+	if bead == nil {
+		return nil
+	}
+	for _, k := range keys {
+		delete(bead, k)
+	}
+	if len(bead) == 0 {
+		delete(m.rows, beadID)
+	}
+	return nil
+}
+
 // Get returns one bead's snapshot.
 func (m *MemStore) Get(_ context.Context, beadID string) (Snapshot, error) {
 	m.mu.Lock()
@@ -542,43 +617,32 @@ func (m *MemStore) Now() time.Time {
 // Close is a no-op.
 func (m *MemStore) Close() error { return nil }
 
-// keyIsFenced reports whether the bead's fallback stamp applies to key. A stamp
-// with no key list fences the whole bead — the conservative reading for data
-// this code did not write.
-func keyIsFenced(key string, fenced map[string]struct{}) bool {
-	if fenced == nil {
-		return true
-	}
-	_, ok := fenced[key]
-	return ok
-}
-
 // Overlay merges a bead's liveness snapshot over a copy of its committed
 // metadata and returns the merged map. Keys present in the snapshot WIN
 // (including an empty-string clear); keys absent from it fall back to whatever
 // the committed metadata holds — the natural carry-over that lets pre-existing
 // session beads work with no migration step.
 //
-// THE FENCE. A row only wins if it was written AFTER the bead's FallbackAtKey
-// stamp. That stamp is committed alongside any liveness values that had to go
-// to versioned metadata — a degraded write, a transactional write, or every
-// write in ModeMetadata — and it is what stops a pre-outage row from shadowing
-// the post-outage committed value once the liveness pool recovers. Without it
-// the overlay is unconditional across arbitrary time, and a recovered pool
-// resurrects a stale instance_token / generation / pending_create_claim into
-// the wake-fencing path.
+// THE FENCE. A row for key k only wins if it was written AFTER k's own fence
+// marker (FenceKeyFor(k)). That marker is committed alongside any liveness value
+// that had to go to versioned metadata — a degraded write, a transactional
+// write, or every write in ModeMetadata — and it is what stops a pre-outage row
+// from shadowing the post-outage committed value once the liveness pool
+// recovers. Without it the overlay is unconditional across arbitrary time, and a
+// recovered pool resurrects a stale instance_token / generation /
+// pending_create_claim into the wake-fencing path.
 //
-// The comparison is per KEY, against each row's own written_at, because a
-// degraded write is usually followed by successful ones: the keys refreshed
-// since the fallback must keep winning while their pre-outage siblings are
-// dropped. A row exactly AT the stamp is dropped — the stamp is minted at the
-// moment the versioned write is composed, so anything not strictly newer lost
-// the race to it.
+// A row exactly AT its stamp is dropped — the stamp is minted at the moment the
+// versioned write is composed, so anything not strictly newer lost the race to
+// it. A key with NO marker is not fenced at all: nothing ever committed a newer
+// value for it, so its row is the freshest thing anyone has, and fencing it
+// would swap live telemetry for whatever ancient value the bead happens to
+// carry.
 //
-// The fence is also SCOPED to the keys the fallback actually committed
-// (FallbackKeysKey). A key the fallback did not write has no newer committed
-// value to be shadowed, so fencing it would swap live telemetry for whatever
-// ancient value the bead happens to carry — see FallbackKeysKey.
+// Because the markers are per key they also accumulate: the keys refreshed since
+// a fallback keep winning while their pre-outage siblings are dropped, and a
+// SECOND fallback over a different key set fences its own keys without
+// un-fencing the first one's.
 //
 // When any row survives, WrittenAtKey is stamped with the surviving max so
 // freshness consumers have a replacement for the now-quiet Bead.UpdatedAt.
@@ -588,8 +652,6 @@ func Overlay(meta map[string]string, snap Snapshot) map[string]string {
 	if len(snap.Values) == 0 {
 		return meta
 	}
-	fence := ParseFence(meta[FallbackAtKey])
-	fenced := ParseFenceKeys(meta[FallbackKeysKey])
 	merged := make(map[string]string, len(meta)+len(snap.Values)+1)
 	for k, v := range meta {
 		merged[k] = v
@@ -597,10 +659,10 @@ func Overlay(meta map[string]string, snap Snapshot) map[string]string {
 	newest := time.Time{}
 	applied := false
 	for k, v := range snap.Values {
-		if !fence.IsZero() && keyIsFenced(k, fenced) {
+		if fence := ParseFence(meta[FenceKeyFor(k)]); !fence.IsZero() {
 			written, ok := snap.Times[k]
 			// A row with no usable timestamp cannot prove it postdates the
-			// fence, so a fenced bead drops it. Fail closed: the committed
+			// fence, so a fenced key drops it. Fail closed: the committed
 			// value is the one the fallback write just recorded.
 			if !ok || written.IsZero() || !written.After(fence) {
 				continue

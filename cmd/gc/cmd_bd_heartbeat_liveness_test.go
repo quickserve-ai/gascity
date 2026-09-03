@@ -277,6 +277,10 @@ func (failingLivenessStore) SetBatch(context.Context, string, map[string]string)
 	return errors.New("liveness table unavailable")
 }
 
+func (failingLivenessStore) DeleteKeys(context.Context, string, []string) error {
+	return errors.New("liveness table unavailable")
+}
+
 func (failingLivenessStore) Get(context.Context, string) (liveness.Snapshot, error) {
 	return liveness.Snapshot{}, errors.New("liveness table unavailable")
 }

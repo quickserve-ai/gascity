@@ -15,7 +15,6 @@
 package liveness
 
 import (
-	"sort"
 	"strings"
 	"time"
 )
@@ -34,95 +33,69 @@ import (
 // produced by the overlay from the table's own timestamps.
 const WrittenAtKey = "gc.liveness_written_at"
 
-// FallbackAtKey is the VERSIONED marker that fences stale liveness rows out of
-// the overlay. It is written into the same versioned patch whenever liveness
-// values had to go to bead metadata instead of the table — a degraded write, a
-// transactional write, or every write under ModeMetadata.
+// FencePrefix begins the VERSIONED marker keys that fence stale liveness rows
+// out of the overlay. There is ONE marker per fenced liveness key —
+// FenceKeyFor("state") is "gc.liveness_fence.state" — and its value is the
+// moment that key's value was committed to versioned metadata instead of the
+// table: a degraded write, a transactional write, or every write under
+// ModeMetadata.
 //
-// It exists because the overlay would otherwise let ANY surviving liveness row
-// win over committed metadata, across arbitrary time. Concretely: the liveness
-// pool dies, a session transition falls back to a versioned write, the pool
-// recovers — and now the PRE-outage rows for generation / instance_token /
-// pending_create_claim / state shadow the POST-outage committed values. Wake
-// fencing then compares against a stale instance_token and can tear down a live
-// session, or re-enter a pending-create that was already rolled back.
+// The fence exists because the overlay would otherwise let ANY surviving
+// liveness row win over committed metadata, across arbitrary time. Concretely:
+// the liveness pool dies, a session transition falls back to a versioned write,
+// the pool recovers — and now the PRE-outage rows for generation /
+// instance_token / pending_create_claim / state shadow the POST-outage committed
+// values. Wake fencing then compares against a stale instance_token and can tear
+// down a live session, or re-enter a pending-create that was already rolled back.
+//
+// WHY PER KEY, not one stamp plus a key list. Metadata writes MERGE per key at
+// the store layer, so a marker per key accumulates: a later fallback covering a
+// different key set adds its own markers and leaves the earlier ones standing.
+// The scalar pair this replaces (a single stamp plus a comma-separated list) was
+// last-write-wins on BOTH halves, so the second fallback — or merely the second
+// batch of a multi-batch Tx — rewrote the list and UN-FENCED every key the first
+// one had fenced, resurrecting exactly the stale instance_token /
+// pending_create_claim rows the fence exists to bury.
+//
+// Scoping to actual keys still matters, and per-key markers give it for free. A
+// bead-wide fence would also drop rows for keys the fallback never wrote — and
+// for a key that only ever lives in the table (state, say, after the create-time
+// value went stale) the committed value is not newer, it is ancient. Fencing it
+// would replace live telemetry with the value the bead was created with, which
+// is worse than the shadow the fence exists to prevent.
 //
 // The rule is a strict inequality on the row's OWN timestamp: Overlay drops a
-// row whose written_at is at or before the bead's FallbackAtKey stamp, and keeps
+// row whose written_at is at or before that key's fence stamp, and keeps
 // anything written after it. A later successful liveness write therefore takes
 // over again on its own, with no reset step.
 //
-// Like WrittenAtKey this is infrastructure, never session state: it is refused
-// as a liveness key on input and stripped from any inbound patch.
-const FallbackAtKey = "gc.liveness_fallback_at"
+// Like WrittenAtKey these are infrastructure, never session state: they are
+// refused as liveness keys on input and stripped from any inbound patch.
+const FencePrefix = "gc.liveness_fence."
 
-// FallbackKeysKey lists which liveness keys the fallback actually committed, as
-// a comma-separated set. The fence is SCOPED to that list.
-//
-// Scoping matters. A bead-wide fence would also drop rows for keys the fallback
-// never wrote — and for a key that only ever lives in the table (state, say,
-// after the create-time value went stale) the committed fallback is not the
-// newer value, it is an ancient one. Fencing it would replace live telemetry
-// with the value the bead was created with, which is worse than the shadow the
-// fence exists to prevent. A key the fallback did not commit has no newer
-// committed value, so its row is still the freshest thing anyone has.
-//
-// An absent list next to a present stamp is treated as "fence everything" — the
-// conservative reading, for data this code did not write.
-const FallbackKeysKey = "gc.liveness_fallback_keys"
-
-// StampFormat is the wire format for both marker keys. Nanosecond precision
+// StampFormat is the wire format for every marker key. Nanosecond precision
 // matters: the table's written_at is DATETIME(6), and a second-granularity
 // stamp would fence out rows written in the same second as the fallback.
 const StampFormat = time.RFC3339Nano
+
+// FenceKeyFor returns the marker key that fences liveness key k.
+func FenceKeyFor(k string) string {
+	return FencePrefix + k
+}
 
 // IsMarkerKey reports whether key is one of the overlay's own infrastructure
 // markers rather than session telemetry. Markers are never accepted as liveness
 // input and never routed to the table.
 func IsMarkerKey(key string) bool {
-	return key == WrittenAtKey || key == FallbackAtKey || key == FallbackKeysKey
+	return key == WrittenAtKey || strings.HasPrefix(key, FencePrefix)
 }
 
-// FenceStamp renders at as a FallbackAtKey value.
+// FenceStamp renders at as a fence-marker value.
 func FenceStamp(at time.Time) string {
 	return at.UTC().Format(StampFormat)
 }
 
-// FenceKeys renders a fenced key set as a FallbackKeysKey value. The order is
-// sorted so the committed value is stable across writes of the same key set and
-// does not produce spurious metadata diffs.
-func FenceKeys(fenced map[string]string) string {
-	if len(fenced) == 0 {
-		return ""
-	}
-	out := make([]string, 0, len(fenced))
-	for k := range fenced {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return strings.Join(out, ",")
-}
-
-// ParseFenceKeys parses a FallbackKeysKey value. A nil result means "no list",
-// which Overlay reads as "fence everything".
-func ParseFenceKeys(raw string) map[string]struct{} {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return nil
-	}
-	out := map[string]struct{}{}
-	for _, k := range strings.Split(raw, ",") {
-		if k = strings.TrimSpace(k); k != "" {
-			out[k] = struct{}{}
-		}
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
-}
-
-// ParseFence parses a FallbackAtKey value. An absent or unparseable stamp yields
+// ParseFence parses a fence-marker value. An absent or unparseable stamp yields
 // the zero time, which fences nothing — the conservative direction: a corrupt
 // marker must not silently discard live telemetry.
 func ParseFence(raw string) time.Time {

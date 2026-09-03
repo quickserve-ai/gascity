@@ -243,8 +243,8 @@ func TestLivenessMetadataModeWritesVersionedAndMirrors(t *testing.T) {
 	}
 	// The fence is what actually makes committed metadata authoritative: the
 	// overlay is unconditional and cannot know which mode wrote a row.
-	if got[liveness.FallbackAtKey] == "" {
-		t.Fatalf("metadata mode wrote no %s fence; a table row would still shadow the committed value", liveness.FallbackAtKey)
+	if got[liveness.FenceKeyFor("state")] == "" {
+		t.Fatalf("metadata mode wrote no %s fence; a table row would still shadow the committed value", liveness.FenceKeyFor("state"))
 	}
 	// The mirror is what keeps the always-on read overlay from shadowing fresh
 	// committed metadata with frozen rows after a rollback.
@@ -351,8 +351,10 @@ func TestLivenessTxWritesEverythingVersionedAndFenced(t *testing.T) {
 	if committed.Metadata["state"] != "failed_create" {
 		t.Errorf("committed state = %q, want failed_create", committed.Metadata["state"])
 	}
-	if committed.Metadata[liveness.FallbackAtKey] == "" {
-		t.Errorf("the transactional write committed no fence")
+	for _, k := range []string{"state", "pending_create_claim", "pending_create_started_at"} {
+		if committed.Metadata[liveness.FenceKeyFor(k)] == "" {
+			t.Errorf("the transactional write committed no fence for %q", k)
+		}
 	}
 	// Nothing was routed to the table.
 	snap, err := lv.Get(context.Background(), bead.ID)
@@ -418,8 +420,10 @@ func TestDegradedWriteIsFencedAgainstStaleRows(t *testing.T) {
 	if committed.Metadata["instance_token"] != "post-outage" {
 		t.Fatalf("the degraded write did not reach versioned metadata: %v", committed.Metadata)
 	}
-	if committed.Metadata[liveness.FallbackAtKey] == "" {
-		t.Fatalf("the degraded write committed no %s fence; stale rows can shadow it", liveness.FallbackAtKey)
+	for _, k := range []string{"instance_token", "generation"} {
+		if committed.Metadata[liveness.FenceKeyFor(k)] == "" {
+			t.Fatalf("the degraded write committed no fence for %q; stale rows can shadow it", k)
+		}
 	}
 
 	// The pool recovers. Reads go through a healthy store over the SAME rows.
@@ -515,8 +519,17 @@ func TestTxKeepsLivenessVersionedAndFenced(t *testing.T) {
 	if committed.Metadata["state"] != "closed" {
 		t.Errorf("committed state = %q, want closed: the terminal state must ride with the Close", committed.Metadata["state"])
 	}
-	if committed.Metadata[liveness.FallbackAtKey] == "" {
+	if committed.Metadata[liveness.FenceKeyFor("state")] == "" {
 		t.Errorf("the transactional write committed no fence; the stale row can shadow the terminal state")
+	}
+	// The post-commit sweep removes the row the fence covers, so the overlay
+	// falls THROUGH to the terminal state instead of merely out-dating a row.
+	snap, err := lv.Get(context.Background(), bead.ID)
+	if err != nil {
+		t.Fatalf("liveness Get: %v", err)
+	}
+	if _, present := snap.Values["state"]; present {
+		t.Errorf("the pre-close state row survived the post-commit sweep: %v", snap.Values)
 	}
 	got, err := store.Get(bead.ID)
 	if err != nil {
@@ -525,6 +538,263 @@ func TestTxKeepsLivenessVersionedAndFenced(t *testing.T) {
 	if got.Metadata["state"] != "closed" {
 		t.Errorf("overlaid state = %q, want closed; the pre-close row won", got.Metadata["state"])
 	}
+}
+
+// --- gate round 2: per-key fences and the post-commit sweep -------------------
+
+// TestSecondFallbackKeepsTheFirstFallbacksFences is the round-2 blocker,
+// end to end — the F-1 probe sequence. A degraded write fences
+// {generation, instance_token, pending_create_claim}; a LATER degraded write
+// fences {state, synced_at}; then the pool recovers and healthy reads must serve
+// the committed post-outage values for ALL FIVE.
+//
+// Under the scalar stamp + key-list this replaced, the second fallback rewrote
+// the list and un-fenced the first three, resurrecting exactly the
+// instance_token / pending_create_claim rows the fence exists to bury.
+func TestSecondFallbackKeepsTheFirstFallbacksFences(t *testing.T) {
+	ctx := context.Background()
+	backing := &recordingMetaStore{Store: beads.NewMemStore()}
+	lv := liveness.NewMemStore()
+
+	// A pinned, hand-advanced liveness clock: every row is written before either
+	// fallback stamp, and the two fallback stamps are distinguishable.
+	preOutage := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	clockNow := preOutage
+	lv.Clock = func() time.Time { return clockNow }
+
+	healthy := wrapStoreWithBeadPolicies(backing, &config.City{}, newLivenessBindingForTest(lv, liveness.ModeTable))
+	bead := mustCreateSessionBead(t, healthy, nil)
+
+	if err := healthy.SetMetadataBatch(bead.ID, map[string]string{
+		"generation":           "4",
+		"instance_token":       "pre-outage",
+		"pending_create_claim": "true",
+		"state":                "active",
+		"synced_at":            "2026-09-03T11:00:00Z",
+	}); err != nil {
+		t.Fatalf("healthy SetMetadataBatch: %v", err)
+	}
+
+	// A fresh binding per fallback. The first failure RETIRES the pool, so a
+	// reused binding would take the no-store path on the second write and never
+	// ask the store at all — which is a real degrade shape, but not this one.
+	broken := &brokenLivenessStore{MemStore: lv}
+	degradedStore := func() beads.Store {
+		return wrapStoreWithBeadPolicies(backing, &config.City{}, newLivenessBindingForTest(broken, liveness.ModeTable))
+	}
+
+	// Fallback #1.
+	clockNow = preOutage.Add(time.Minute)
+	if err := degradedStore().SetMetadataBatch(bead.ID, map[string]string{
+		"generation":           "5",
+		"instance_token":       "post-outage",
+		"pending_create_claim": "",
+	}); err != nil {
+		t.Fatalf("first degraded write: %v", err)
+	}
+	// Fallback #2, LATER and over a DIFFERENT key set.
+	clockNow = preOutage.Add(2 * time.Minute)
+	if err := degradedStore().SetMetadataBatch(bead.ID, map[string]string{
+		"state":     "asleep",
+		"synced_at": "2026-09-03T12:30:00Z",
+	}); err != nil {
+		t.Fatalf("second degraded write: %v", err)
+	}
+	if broken.writes != 2 {
+		t.Fatalf("the degraded store took %d writes, want 2; the test proves nothing", broken.writes)
+	}
+	// Each fallback's own stamp survives the other.
+	committed, err := backing.Get(bead.ID)
+	if err != nil {
+		t.Fatalf("backing Get: %v", err)
+	}
+	for _, k := range []string{"generation", "instance_token", "pending_create_claim"} {
+		if got := committed.Metadata[liveness.FenceKeyFor(k)]; got != liveness.FenceStamp(preOutage.Add(time.Minute)) {
+			t.Errorf("%s = %q, want the FIRST fallback's stamp; the second fallback un-fenced it", liveness.FenceKeyFor(k), got)
+		}
+	}
+	for _, k := range []string{"state", "synced_at"} {
+		if got := committed.Metadata[liveness.FenceKeyFor(k)]; got != liveness.FenceStamp(preOutage.Add(2*time.Minute)) {
+			t.Errorf("%s = %q, want the second fallback's stamp", liveness.FenceKeyFor(k), got)
+		}
+	}
+	// The pre-outage rows are all still sitting in the table.
+	if snap, _ := lv.Get(ctx, bead.ID); len(snap.Values) != 5 {
+		t.Fatalf("precondition: liveness rows = %v, want all five pre-outage rows", snap.Values)
+	}
+
+	// The pool recovers. Every key must read the committed post-outage value.
+	got, err := healthy.Get(bead.ID)
+	if err != nil {
+		t.Fatalf("Get after recovery: %v", err)
+	}
+	for k, want := range map[string]string{
+		"generation":           "5",
+		"instance_token":       "post-outage",
+		"pending_create_claim": "",
+		"state":                "asleep",
+		"synced_at":            "2026-09-03T12:30:00Z",
+	} {
+		if got.Metadata[k] != want {
+			t.Errorf("%s = %q, want the committed %q; the second fallback un-fenced the first one's keys",
+				k, got.Metadata[k], want)
+		}
+	}
+}
+
+// TestMultiBatchTxKeepsEveryBatchsFences reproduces rollbackPendingCreateClears'
+// exact shape: batch1 clears last_woke_at, then closeFailedCreateBeadInTx writes
+// the failed-create ClosePatch keys, all inside ONE Tx. Both batches fence, and
+// the overlaid read must serve batch1's CLEARED last_woke_at — not the stale
+// table row batch2 used to un-fence.
+func TestMultiBatchTxKeepsEveryBatchsFences(t *testing.T) {
+	ctx := context.Background()
+	store, backing, lv := newLivenessTestStore(t, liveness.ModeTable)
+	bead := mustCreateSessionBead(t, store, nil)
+
+	// Rows the transaction is about to supersede, written BEFORE it runs.
+	preTx := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	lv.Clock = func() time.Time { return preTx }
+	if err := lv.SetBatch(ctx, bead.ID, map[string]string{
+		"last_woke_at":         "2026-09-03T11:00:00Z",
+		"state":                "creating",
+		"pending_create_claim": "true",
+	}); err != nil {
+		t.Fatalf("seed liveness: %v", err)
+	}
+	lv.Clock = nil
+
+	err := store.Tx("gc: rollback pending-create session "+bead.ID, func(tx beads.Tx) error {
+		// batch1: the in-flight-lease marker clears before the close.
+		if err := tx.SetMetadataBatch(bead.ID, map[string]string{"last_woke_at": ""}); err != nil {
+			return err
+		}
+		// batch2: closeFailedCreateBeadInTx's ClosePatch + claim clears.
+		return tx.SetMetadataBatch(bead.ID, map[string]string{
+			"state":                     "failed_create",
+			"closed_at":                 "2026-09-03T12:30:00Z",
+			"pending_create_claim":      "",
+			"pending_create_started_at": "",
+		})
+	})
+	if err != nil {
+		t.Fatalf("Tx: %v", err)
+	}
+
+	committed, err := backing.Get(bead.ID)
+	if err != nil {
+		t.Fatalf("backing Get: %v", err)
+	}
+	// BOTH batches' fences survive: batch2 must not have clobbered batch1's.
+	for _, k := range []string{"last_woke_at", "state", "pending_create_claim", "pending_create_started_at"} {
+		if committed.Metadata[liveness.FenceKeyFor(k)] == "" {
+			t.Errorf("no fence committed for %q; a later batch un-fenced an earlier one", k)
+		}
+	}
+
+	got, err := store.Get(bead.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Metadata["last_woke_at"] != "" {
+		t.Errorf("last_woke_at = %q, want batch1's clear; the stale pre-Tx row won", got.Metadata["last_woke_at"])
+	}
+	if got.Metadata["state"] != "failed_create" {
+		t.Errorf("state = %q, want failed_create", got.Metadata["state"])
+	}
+	if got.Metadata["pending_create_claim"] != "" {
+		t.Errorf("pending_create_claim = %q, want the clear", got.Metadata["pending_create_claim"])
+	}
+}
+
+// TestTxSweepDropsARowWrittenWhileTheCallbackRan closes the mid-callback race.
+// The fence is minted while the callback runs, but the Tx does not commit until
+// after it returns — so another process's row landing in that gap is timestamped
+// AFTER the fence, clears it, and would shadow the committed terminal state
+// forever. The post-commit sweep deletes exactly the keys the Tx fenced.
+func TestTxSweepDropsARowWrittenWhileTheCallbackRan(t *testing.T) {
+	ctx := context.Background()
+	store, backing, lv := newLivenessTestStore(t, liveness.ModeTable)
+	bead := mustCreateSessionBead(t, store, nil)
+
+	err := store.Tx("gc: close session", func(tx beads.Tx) error {
+		if err := tx.SetMetadataBatch(bead.ID, map[string]string{
+			"state":        "closed",
+			"close_reason": "done",
+		}); err != nil {
+			return err
+		}
+		// ANOTHER PROCESS writes the same bead's liveness row, after this Tx
+		// minted its fence and before the Tx commits. Its written_at postdates
+		// the fence, so the fence alone cannot drop it.
+		return lv.SetBatch(ctx, bead.ID, map[string]string{"state": "active"})
+	})
+	if err != nil {
+		t.Fatalf("Tx: %v", err)
+	}
+
+	snap, err := lv.Get(ctx, bead.ID)
+	if err != nil {
+		t.Fatalf("liveness Get: %v", err)
+	}
+	if _, present := snap.Values["state"]; present {
+		t.Fatalf("the mid-callback row survived the post-commit sweep: %v", snap.Values)
+	}
+
+	committed, err := backing.Get(bead.ID)
+	if err != nil {
+		t.Fatalf("backing Get: %v", err)
+	}
+	if committed.Metadata["state"] != "closed" {
+		t.Fatalf("committed state = %q, want closed", committed.Metadata["state"])
+	}
+	got, err := store.Get(bead.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.Metadata["state"] != "closed" {
+		t.Errorf("overlaid state = %q, want the committed closed; the mid-callback row shadowed it", got.Metadata["state"])
+	}
+}
+
+// TestTxSweepFailureDoesNotFailTheCommittedTx pins the honest limit: the sweep
+// runs after the transaction has already committed, so a sweep failure must be
+// logged and swallowed. Reporting it would send callers down rollback paths for
+// work that succeeded.
+func TestTxSweepFailureDoesNotFailTheCommittedTx(t *testing.T) {
+	backing := &recordingMetaStore{Store: beads.NewMemStore()}
+	sweepless := &sweepFailingLivenessStore{MemStore: liveness.NewMemStore()}
+	store := wrapStoreWithBeadPolicies(backing, &config.City{}, newLivenessBindingForTest(sweepless, liveness.ModeTable))
+	bead := mustCreateSessionBead(t, store, nil)
+
+	err := store.Tx("gc: close session", func(tx beads.Tx) error {
+		return tx.SetMetadataBatch(bead.ID, map[string]string{"state": "closed"})
+	})
+	if err != nil {
+		t.Fatalf("Tx = %v, want nil: the transaction committed and only the sweep failed", err)
+	}
+	if sweepless.deletes == 0 {
+		t.Fatalf("the sweep never ran; the test proves nothing")
+	}
+	committed, err := backing.Get(bead.ID)
+	if err != nil {
+		t.Fatalf("backing Get: %v", err)
+	}
+	if committed.Metadata["state"] != "closed" {
+		t.Fatalf("committed state = %q, want closed", committed.Metadata["state"])
+	}
+}
+
+// sweepFailingLivenessStore fails only DeleteKeys, so a Tx commits normally and
+// only its post-commit sweep degrades.
+type sweepFailingLivenessStore struct {
+	*liveness.MemStore
+	deletes int
+}
+
+func (s *sweepFailingLivenessStore) DeleteKeys(context.Context, string, []string) error {
+	s.deletes++
+	return errors.New("Error 1105: sweep refused")
 }
 
 // --- review blocker 3: the pool re-dials -------------------------------------
@@ -572,7 +842,7 @@ func TestDegradedWriteFencesWhenTheStoreIsGoneEntirely(t *testing.T) {
 	if committed.Metadata["state"] != "asleep" {
 		t.Errorf("state = %q, want the versioned fallback", committed.Metadata["state"])
 	}
-	if committed.Metadata[liveness.FallbackAtKey] == "" {
+	if committed.Metadata[liveness.FenceKeyFor("state")] == "" {
 		t.Errorf("no fence stamped with the store gone entirely")
 	}
 }
@@ -594,7 +864,7 @@ func TestBeadMayCarryLiveness(t *testing.T) {
 		},
 		{
 			name: "work bead that took a fenced write",
-			bead: beads.Bead{Type: "task", Metadata: beads.StringMap{liveness.FallbackAtKey: "2026-09-03T00:00:00Z"}},
+			bead: beads.Bead{Type: "task", Metadata: beads.StringMap{liveness.FenceKeyFor("state"): "2026-09-03T00:00:00Z"}},
 			want: true,
 		},
 		{name: "ordinary work bead", bead: beads.Bead{Type: "task", Metadata: beads.StringMap{"alias": "x"}}, want: false},

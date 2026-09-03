@@ -323,6 +323,31 @@ func TestSQLStoreAgainstDolt(t *testing.T) {
 		}
 	})
 
+	t.Run("DeleteKeys removes rows and mints no commits", func(t *testing.T) {
+		before := doltCommitCount(t, db)
+		if err := store.SetBatch(ctx, "gc-sweep", map[string]string{"state": "active", "generation": "3"}); err != nil {
+			t.Fatalf("SetBatch: %v", err)
+		}
+		if err := store.DeleteKeys(ctx, "gc-sweep", []string{"state", "never-written"}); err != nil {
+			t.Fatalf("DeleteKeys: %v", err)
+		}
+		snap, err := store.Get(ctx, "gc-sweep")
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		// Gone, not tombstoned: the overlay must fall through to committed
+		// metadata, which is what the swept transaction made authoritative.
+		if _, present := snap.Values["state"]; present {
+			t.Errorf("state survived DeleteKeys: %v", snap.Values)
+		}
+		if snap.Values["generation"] != "3" {
+			t.Errorf("generation = %q, want 3 — DeleteKeys must not touch unnamed keys", snap.Values["generation"])
+		}
+		if got := doltCommitCount(t, db); got != before {
+			t.Fatalf("dolt_log went %d -> %d across a sweep, want unchanged", before, got)
+		}
+	})
+
 	t.Run("concurrent writers on separate connections lose nothing per key", func(t *testing.T) {
 		testSQLStoreConcurrentWritersAcrossSeparateConnections(ctx, t, server)
 	})

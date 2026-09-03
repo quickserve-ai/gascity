@@ -28,10 +28,10 @@ const (
 	// BOTH modes — the overlay has no idea which mode wrote a row, and a process
 	// running in table mode can be reading beads a metadata-mode process just
 	// wrote — so "metadata mode" cannot mean "the overlay is off". Instead every
-	// metadata-mode write carries a FallbackAtKey stamp, which fences out every
-	// table row written at or before it. The committed value therefore wins, in
-	// this process and in every other one, without anybody having to agree on a
-	// mode.
+	// metadata-mode write carries a fence marker per liveness key in it, and
+	// each fences out that key's table row if it was written at or before the
+	// stamp. The committed value therefore wins, in this process and in every
+	// other one, without anybody having to agree on a mode.
 	//
 	// It still MIRRORS liveness keys into the table so that a flip BACK to table
 	// mode finds them current instead of frozen at the instant the flag was set.

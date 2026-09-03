@@ -102,9 +102,12 @@ func TestPlanWriteMetadataModeSendsTheFullPatchVersionedAndMirrors(t *testing.T)
 		}
 	}
 	// The fence is what makes "versioned is authoritative" true in a mode the
-	// overlay cannot see.
-	if plan.Versioned[FallbackAtKey] != FenceStamp(now) {
-		t.Errorf("Versioned[%s] = %q, want the fence stamp %q", FallbackAtKey, plan.Versioned[FallbackAtKey], FenceStamp(now))
+	// overlay cannot see, and it is stamped PER liveness key.
+	if got := plan.Versioned[FenceKeyFor("state")]; got != FenceStamp(now) {
+		t.Errorf("Versioned[%s] = %q, want the fence stamp %q", FenceKeyFor("state"), got, FenceStamp(now))
+	}
+	if _, stamped := plan.Versioned[FenceKeyFor("alias")]; stamped {
+		t.Errorf("Versioned fenced the non-liveness key alias; only liveness keys have table rows to fence")
 	}
 	if !reflect.DeepEqual(plan.Liveness, map[string]string{"state": "active"}) {
 		t.Errorf("Liveness = %v, want the liveness half mirrored", plan.Liveness)
@@ -250,21 +253,24 @@ func TestMemStoreConcurrentDisjointKeysLoseNothing(t *testing.T) {
 
 // TestOverlayFencesRowsOlderThanTheFallbackStamp is the unit half of the
 // stale-shadow blocker: after a degraded write commits liveness values plus a
-// fence stamp, a PRE-outage row must not come back and win once the pool
-// recovers. Without the fence the overlay is unconditional across arbitrary
+// fence marker per key, a PRE-outage row must not come back and win once the
+// pool recovers. Without the fence the overlay is unconditional across arbitrary
 // time, and wake fencing reads a resurrected instance_token.
 func TestOverlayFencesRowsOlderThanTheFallbackStamp(t *testing.T) {
 	fence := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
 	committed := map[string]string{
-		"instance_token": "post-outage",
-		"generation":     "9",
-		FallbackAtKey:    FenceStamp(fence),
+		"instance_token":                    "post-outage",
+		"generation":                        "9",
+		FenceKeyFor("instance_token"):       FenceStamp(fence),
+		FenceKeyFor("generation"):           FenceStamp(fence),
+		FenceKeyFor("state"):                FenceStamp(fence),
+		FenceKeyFor("pending_create_claim"): FenceStamp(fence),
 	}
 	snap := Snapshot{
 		Values: map[string]string{
-			"instance_token": "pre-outage", // written before the fence: dropped
-			"generation":     "4",          // written before the fence: dropped
-			"state":          "asleep",     // written AFTER: still wins
+			"instance_token": "pre-outage", // written before its fence: dropped
+			"generation":     "4",          // written before its fence: dropped
+			"state":          "asleep",     // written AFTER its fence: still wins
 		},
 		Times: map[string]time.Time{
 			"instance_token": fence.Add(-time.Hour),
@@ -288,9 +294,40 @@ func TestOverlayFencesRowsOlderThanTheFallbackStamp(t *testing.T) {
 	}
 }
 
+// TestOverlayLeavesUnfencedKeysAlone is the other half of the per-key rule. A
+// key with no marker never had a newer committed value, so its row is the
+// freshest thing anyone has — fencing it would swap live telemetry for whatever
+// ancient value the bead was created with.
+func TestOverlayLeavesUnfencedKeysAlone(t *testing.T) {
+	fence := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	committed := map[string]string{
+		"instance_token":              "post-outage",
+		"state":                       "created-long-ago",
+		FenceKeyFor("instance_token"): FenceStamp(fence),
+	}
+	snap := Snapshot{
+		Values: map[string]string{
+			"instance_token": "pre-outage",
+			"state":          "asleep",
+		},
+		Times: map[string]time.Time{
+			"instance_token": fence.Add(-time.Hour),
+			"state":          fence.Add(-time.Hour), // older than the OTHER key's fence
+		},
+		WrittenAt: fence.Add(-time.Hour),
+	}
+	got := Overlay(committed, snap)
+	if got["instance_token"] != "post-outage" {
+		t.Errorf("instance_token = %q, want the fenced committed value", got["instance_token"])
+	}
+	if got["state"] != "asleep" {
+		t.Errorf("state = %q, want the unfenced row to win; it has no marker of its own", got["state"])
+	}
+}
+
 func TestOverlayDropsEverythingWhenNoRowPostdatesTheFence(t *testing.T) {
 	fence := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
-	committed := map[string]string{"state": "active", FallbackAtKey: FenceStamp(fence)}
+	committed := map[string]string{"state": "active", FenceKeyFor("state"): FenceStamp(fence)}
 	snap := Snapshot{
 		Values:    map[string]string{"state": "asleep"},
 		Times:     map[string]time.Time{"state": fence}, // exactly AT the fence: dropped
@@ -305,10 +342,25 @@ func TestOverlayDropsEverythingWhenNoRowPostdatesTheFence(t *testing.T) {
 	}
 }
 
+// TestOverlayFencesAKeyWhoseRowHasNoTimestamp pins the fail-closed rule: a row
+// that cannot prove it postdates its fence is dropped, because the committed
+// value is the one the fallback write just recorded.
+func TestOverlayFencesAKeyWhoseRowHasNoTimestamp(t *testing.T) {
+	fence := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	committed := map[string]string{"state": "active", FenceKeyFor("state"): FenceStamp(fence)}
+	snap := Snapshot{
+		Values: map[string]string{"state": "asleep"},
+		Times:  map[string]time.Time{}, // no clock at all
+	}
+	if got := Overlay(committed, snap)["state"]; got != "active" {
+		t.Errorf("state = %q, want the committed value; a row with no timestamp cannot clear its fence", got)
+	}
+}
+
 func TestOverlayWithAnUnparseableFenceKeepsTelemetry(t *testing.T) {
 	// A corrupt marker must not silently discard live telemetry — fencing
 	// nothing is the conservative direction.
-	committed := map[string]string{"state": "active", FallbackAtKey: "garbage"}
+	committed := map[string]string{"state": "active", FenceKeyFor("state"): "garbage"}
 	snap := Snapshot{
 		Values:    map[string]string{"state": "asleep"},
 		Times:     map[string]time.Time{"state": time.Now().UTC()},
@@ -328,33 +380,126 @@ func TestFallbackPlanFencesAndCarriesEverythingVersioned(t *testing.T) {
 	if got["state"] != "asleep" || got["state_reason"] != "idle" {
 		t.Errorf("FallbackPlan = %v, want both halves versioned", got)
 	}
-	if got[FallbackAtKey] != FenceStamp(now) {
-		t.Errorf("FallbackPlan did not stamp %s", FallbackAtKey)
+	if got[FenceKeyFor("state")] != FenceStamp(now) {
+		t.Errorf("FallbackPlan did not stamp %s", FenceKeyFor("state"))
+	}
+	if _, stamped := got[FenceKeyFor("state_reason")]; stamped {
+		t.Errorf("FallbackPlan fenced the versioned key state_reason; it has no table row to fence")
 	}
 	// No liveness keys means nothing to fence, so no marker is committed.
 	plain := FallbackPlan(map[string]string{"alias": "katya"}, now)
-	if _, stamped := plain[FallbackAtKey]; stamped {
-		t.Errorf("FallbackPlan stamped a fence on a patch with no liveness keys: %v", plain)
+	for k := range plain {
+		if IsMarkerKey(k) {
+			t.Errorf("FallbackPlan stamped %q on a patch with no liveness keys: %v", k, plain)
+		}
+	}
+}
+
+// TestFallbackPlanFencesAreIndependentPerKey is the round-2 blocker in unit
+// form. Two fallbacks over DIFFERENT key sets merge into committed metadata the
+// way the store applies them — key by key — and the second must not un-fence the
+// first. The scalar stamp + key-list this replaced was last-write-wins on both
+// halves, so the second fallback resurrected the first one's rows.
+func TestFallbackPlanFencesAreIndependentPerKey(t *testing.T) {
+	first := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	second := first.Add(time.Minute)
+
+	committed := map[string]string{}
+	for k, v := range FallbackPlan(map[string]string{
+		"generation":           "5",
+		"instance_token":       "post-outage",
+		"pending_create_claim": "",
+	}, first) {
+		committed[k] = v
+	}
+	// A LATER fallback, different keys. Metadata writes merge per key.
+	for k, v := range FallbackPlan(map[string]string{
+		"state":     "asleep",
+		"synced_at": "2026-09-03T12:01:00Z",
+	}, second) {
+		committed[k] = v
+	}
+
+	for _, k := range []string{"generation", "instance_token", "pending_create_claim"} {
+		if got := committed[FenceKeyFor(k)]; got != FenceStamp(first) {
+			t.Errorf("%s = %q, want the FIRST fallback's stamp %q — the second fallback un-fenced it",
+				FenceKeyFor(k), got, FenceStamp(first))
+		}
+	}
+	for _, k := range []string{"state", "synced_at"} {
+		if got := committed[FenceKeyFor(k)]; got != FenceStamp(second) {
+			t.Errorf("%s = %q, want the second fallback's stamp %q", FenceKeyFor(k), got, FenceStamp(second))
+		}
+	}
+
+	// And the overlay honors all five: every pre-outage row is dropped.
+	preOutage := first.Add(-time.Hour)
+	snap := Snapshot{
+		Values: map[string]string{
+			"generation": "4", "instance_token": "pre-outage", "pending_create_claim": "true",
+			"state": "active", "synced_at": "2026-09-03T11:00:00Z",
+		},
+		Times: map[string]time.Time{
+			"generation": preOutage, "instance_token": preOutage, "pending_create_claim": preOutage,
+			"state": preOutage, "synced_at": preOutage,
+		},
+		WrittenAt: preOutage,
+	}
+	got := Overlay(committed, snap)
+	for k, want := range map[string]string{
+		"generation": "5", "instance_token": "post-outage", "pending_create_claim": "",
+		"state": "asleep", "synced_at": "2026-09-03T12:01:00Z",
+	} {
+		if got[k] != want {
+			t.Errorf("%s = %q, want the committed %q; a stale row survived", k, got[k], want)
+		}
 	}
 }
 
 func TestSplitDropsMarkerKeysFromBothHalves(t *testing.T) {
 	live, rest := Split(map[string]string{
-		"state":       "active",
-		"alias":       "katya",
-		WrittenAtKey:  "forged",
-		FallbackAtKey: "forged",
+		"state":                 "active",
+		"alias":                 "katya",
+		WrittenAtKey:            "forged",
+		FenceKeyFor("state"):    "forged",
+		FencePrefix + "made_up": "forged",
 	})
 	if _, ok := live[WrittenAtKey]; ok {
 		t.Errorf("marker leaked into the liveness half: %v", live)
 	}
-	for _, k := range []string{WrittenAtKey, FallbackAtKey} {
+	for _, k := range []string{WrittenAtKey, FenceKeyFor("state"), FencePrefix + "made_up"} {
 		if _, ok := rest[k]; ok {
 			t.Errorf("marker %q leaked into the versioned remainder; a caller could forge the freshness clock", k)
+		}
+		if _, ok := live[k]; ok {
+			t.Errorf("marker %q leaked into the liveness half", k)
 		}
 	}
 	if live["state"] != "active" || rest["alias"] != "katya" {
 		t.Errorf("Split lost real keys: live=%v rest=%v", live, rest)
+	}
+}
+
+func TestMemStoreDeleteKeysRemovesRowsRatherThanTombstoningThem(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemStore()
+	if err := m.SetBatch(ctx, "gc-1", map[string]string{"state": "active", "generation": "7"}); err != nil {
+		t.Fatalf("SetBatch: %v", err)
+	}
+	if err := m.DeleteKeys(ctx, "gc-1", []string{"state", "never-written"}); err != nil {
+		t.Fatalf("DeleteKeys: %v", err)
+	}
+	snap, err := m.Get(ctx, "gc-1")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	// Absent, not an empty tombstone: the overlay must fall THROUGH to the
+	// committed metadata, not project an empty value over it.
+	if _, present := snap.Values["state"]; present {
+		t.Errorf("state is still present after DeleteKeys: %v", snap.Values)
+	}
+	if snap.Values["generation"] != "7" {
+		t.Errorf("generation = %q, want 7 — DeleteKeys must not touch unnamed keys", snap.Values["generation"])
 	}
 }
 

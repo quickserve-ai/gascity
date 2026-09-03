@@ -21,6 +21,7 @@ import (
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/liveness"
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/session/sessiontest"
@@ -3375,6 +3376,98 @@ func TestRollbackPendingCreateClearingClaimUsesSingleTransactionForAllWrites(t *
 	}
 	if v, ok := batch["pending_create_started_at"]; !ok || v != "" {
 		t.Fatalf("returned batch pending_create_started_at = %q present=%v, want empty-string clear", v, ok)
+	}
+}
+
+// TestRollbackPendingCreateClearingClaimThroughTheLivenessOverlay runs the real
+// rollback transaction with the session-liveness splitter and read overlay
+// INSTALLED — the shape production actually has, which none of its siblings
+// exercise because they wrap a bare store.
+//
+// It is the multi-batch Tx in the flesh: batch1 clears last_woke_at,
+// closeFailedCreateBeadInTx then writes the failed-create ClosePatch. Both
+// batches fence, per key, and the fences must survive each other; the stale
+// pre-rollback table rows must not shadow any of it on the way back out.
+func TestRollbackPendingCreateClearingClaimThroughTheLivenessOverlay(t *testing.T) {
+	ctx := context.Background()
+	spy := newTxSpyStore()
+	lv := liveness.NewMemStore()
+	store := wrapStoreWithBeadPolicies(spy, &config.City{}, newLivenessBindingForTest(lv, liveness.ModeTable))
+
+	now := time.Date(2026, 3, 7, 12, 0, 0, 0, time.UTC)
+	b, err := store.Create(beads.Bead{
+		Title:  "worker",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: creatingMeta(map[string]string{
+			"session_name":          "worker",
+			"session_name_explicit": "true",
+			"pending_create_claim":  "true",
+			"last_woke_at":          now.Format(time.RFC3339),
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The liveness rows the running session left behind, all written BEFORE the
+	// rollback. Every one of them is a value the rollback supersedes.
+	if err := lv.SetBatch(ctx, b.ID, map[string]string{
+		"state":                     "creating",
+		"last_woke_at":              now.Format(time.RFC3339),
+		"pending_create_claim":      "true",
+		"pending_create_started_at": now.Format(time.RFC3339),
+	}); err != nil {
+		t.Fatalf("seed liveness rows: %v", err)
+	}
+
+	info := sessionpkg.Info{ID: b.ID, SessionNameExplicit: "true"}
+	if batch := rollbackPendingCreateClearingClaim(info, sessionFrontDoor(store), now, ioDiscard{}); batch == nil {
+		t.Fatalf("rollbackPendingCreateClearingClaim reported failure")
+	}
+	if spy.txCalls != 1 {
+		t.Fatalf("txCalls = %d, want 1", spy.txCalls)
+	}
+
+	// Committed metadata carries a fence for every key both batches wrote.
+	committed, err := spy.Get(b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"last_woke_at", "state", "pending_create_claim", "pending_create_started_at"} {
+		if committed.Metadata[liveness.FenceKeyFor(k)] == "" {
+			t.Errorf("no fence committed for %q; one batch un-fenced another", k)
+		}
+	}
+
+	// The overlaid read — what every session consumer actually sees.
+	got, err := store.Get(b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "closed" {
+		t.Fatalf("Status = %q, want closed", got.Status)
+	}
+	for k, want := range map[string]string{
+		"state":                     string(sessionpkg.StateFailedCreate),
+		"last_woke_at":              "",
+		"pending_create_claim":      "",
+		"pending_create_started_at": "",
+		"session_name":              "",
+	} {
+		if got.Metadata[k] != want {
+			t.Errorf("overlaid %s = %q, want %q; a stale liveness row shadowed the rollback", k, got.Metadata[k], want)
+		}
+	}
+
+	// And the post-commit sweep removed the rows the transaction fenced, so the
+	// overlay falls through to the committed terminal state from here on.
+	snap, err := lv.Get(ctx, b.ID)
+	if err != nil {
+		t.Fatalf("liveness Get: %v", err)
+	}
+	if len(snap.Values) != 0 {
+		t.Errorf("liveness rows = %v, want none after the post-commit sweep", snap.Values)
 	}
 }
 

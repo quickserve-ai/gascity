@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"sort"
 	"sync"
 	"time"
 
@@ -74,10 +75,11 @@ func (s *beadPolicyStore) livenessRoute(id string, patch map[string]string) map[
 // a patch with no liveness keys at all routes fine and reports true.
 //
 // EVERY degraded return is FENCED. The returned patch carries the liveness keys
-// AND a FallbackAtKey stamp, so once the pool recovers the pre-outage rows it
-// left behind cannot shadow what this write just committed. Returning the bare
-// patch instead is the stale-shadow defect: the overlay would let any surviving
-// row win, and wake fencing would compare against a resurrected instance_token.
+// AND one fence marker per liveness key, so once the pool recovers the
+// pre-outage rows it left behind cannot shadow what this write just committed.
+// Returning the bare patch instead is the stale-shadow defect: the overlay would
+// let any surviving row win, and wake fencing would compare against a
+// resurrected instance_token.
 func (s *beadPolicyStore) livenessRouteStatus(id string, patch map[string]string) (rest map[string]string, ok bool) {
 	if s == nil || len(patch) == 0 {
 		return patch, true
@@ -183,7 +185,8 @@ func (s *beadPolicyStore) CloseAll(ids []string, metadata map[string]string) (in
 }
 
 // Tx does NOT split. Inside a transaction every metadata key — liveness
-// included — goes to versioned bead metadata, fenced with a FallbackAtKey stamp.
+// included — goes to versioned bead metadata, fenced with a per-key fence
+// marker, and the rows those keys left behind are SWEPT after the commit.
 //
 // WHY NOT SPLIT. Two Tx call sites carry explicit invariants that a split
 // breaks, and both are about a bead's status and its liveness state being
@@ -201,31 +204,107 @@ func (s *beadPolicyStore) CloseAll(ids []string, metadata map[string]string) (in
 // the pre-transition values, which the overlay would then serve over the
 // committed terminal state. That is precisely the split both comments forbid.
 //
-// Going fully versioned closes the window instead of narrowing it, and it costs
+// Going fully versioned closes that window instead of narrowing it, and it costs
 // nothing: every one of these call sites is a low-frequency lifecycle event
 // (close, reopen, failed-create rollback) whose transaction commits regardless.
 // The commit-churn this change exists to remove comes from the non-Tx transition
-// patches, which still split. The fence stamp is what keeps the stale table rows
-// these writes leave behind from shadowing the committed values afterwards.
+// patches, which still split.
 //
-// The reviewers' requirement — "a failed versioned write must leave liveness
-// untouched" — holds trivially: no liveness write is issued at all.
+// WHY THE SWEEP, on top of the fence. A fence marker is minted while the
+// CALLBACK runs, but the transaction does not commit until after it returns. A
+// concurrent process writing the same bead's liveness row inside that gap
+// timestamps it AFTER the fence, so the fence — correctly — keeps it, and it
+// then shadows the terminal state this transaction committed, forever. Deleting
+// the rows for exactly the keys the transaction fenced closes that: with no row
+// at all the overlay falls through to the committed metadata, which is what the
+// transaction just made authoritative. (A tombstone would not do; it would
+// project an empty value over that metadata.)
+//
+// HONEST LIMIT: the sweep runs AFTER the commit, so a crash in the sliver
+// between them leaves those rows in place. The fence still bounds it — only a
+// row written after fence-mint survives — and it self-heals: the next healthy
+// liveness write for that key overwrites the row, and the next transactional
+// write re-fences and re-sweeps it. A failed sweep is logged and does NOT fail
+// the Tx: the transaction has already committed, and reporting an error for work
+// that succeeded would send callers down rollback paths for nothing.
 func (s *beadPolicyStore) Tx(commitMsg string, fn func(tx beads.Tx) error) error {
 	if fn == nil {
 		return s.Store.Tx(commitMsg, fn)
 	}
-	return s.Store.Tx(commitMsg, func(tx beads.Tx) error {
-		return fn(&livenessTx{inner: tx, policy: s})
-	})
+	lt := &livenessTx{policy: s}
+	if err := s.Store.Tx(commitMsg, func(tx beads.Tx) error {
+		lt.inner = tx
+		return fn(lt)
+	}); err != nil {
+		return err
+	}
+	s.sweepFencedLivenessRows(lt.fenced)
+	return nil
 }
 
-// livenessTx fences a Store.Tx callback's metadata writes. See Tx.
+// sweepFencedLivenessRows deletes the table rows for the keys a committed
+// transaction fenced. Best-effort by construction — see Tx.
+func (s *beadPolicyStore) sweepFencedLivenessRows(fenced map[string]map[string]struct{}) {
+	if s == nil || len(fenced) == 0 {
+		return
+	}
+	store := s.lv.Store()
+	if store == nil {
+		return
+	}
+	for id, keySet := range fenced {
+		keys := make([]string, 0, len(keySet))
+		for k := range keySet {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		ctx, cancel := livenessOpContext()
+		err := store.DeleteKeys(ctx, id, keys)
+		cancel()
+		if err == nil {
+			continue
+		}
+		noteLivenessFailure("sweep", err)
+		s.lv.noteOpError(err)
+		if liveness.IsConnectionError(err) {
+			// The pool is gone; the handle we are holding cannot serve the
+			// remaining beads either. Stop rather than log once per bead.
+			return
+		}
+	}
+}
+
+// livenessTx fences a Store.Tx callback's metadata writes and records which
+// liveness keys it fenced, so Tx can sweep their rows after the commit. See Tx.
 type livenessTx struct {
 	inner  beads.Tx
 	policy *beadPolicyStore
+	// fenced is bead id -> the liveness keys this transaction sent to versioned
+	// metadata. It accumulates across every write in the callback: a Tx that
+	// writes two batches fences both, so both must be swept.
+	fenced map[string]map[string]struct{}
 }
 
 var _ beads.Tx = (*livenessTx)(nil)
+
+// noteFenced records the liveness half of one patch for the post-commit sweep.
+func (t *livenessTx) noteFenced(id string, patch map[string]string) {
+	live, _ := liveness.Split(patch)
+	if len(live) == 0 {
+		return
+	}
+	if t.fenced == nil {
+		t.fenced = map[string]map[string]struct{}{}
+	}
+	keys := t.fenced[id]
+	if keys == nil {
+		keys = make(map[string]struct{}, len(live))
+		t.fenced[id] = keys
+	}
+	for k := range live {
+		keys[k] = struct{}{}
+	}
+}
 
 func (t *livenessTx) Create(b beads.Bead) (beads.Bead, error) { return t.inner.Create(b) }
 
@@ -233,12 +312,14 @@ func (t *livenessTx) Close(id string) error { return t.inner.Close(id) }
 
 func (t *livenessTx) Update(id string, opts beads.UpdateOpts) error {
 	if len(opts.Metadata) > 0 {
+		t.noteFenced(id, opts.Metadata)
 		opts.Metadata = liveness.FallbackPlan(opts.Metadata, t.policy.lv.Now())
 	}
 	return t.inner.Update(id, opts)
 }
 
 func (t *livenessTx) SetMetadataBatch(id string, kvs map[string]string) error {
+	t.noteFenced(id, kvs)
 	return t.inner.SetMetadataBatch(id, liveness.FallbackPlan(kvs, t.policy.lv.Now()))
 }
 
