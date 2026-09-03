@@ -3,6 +3,7 @@ package liveness
 import (
 	"context"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -35,6 +36,18 @@ func TestIsKeyCoversTheMovedFieldSet(t *testing.T) {
 		if IsKey(k) {
 			t.Errorf("IsKey(%q) = true, want false — versioned metadata must not move", k)
 		}
+	}
+}
+
+func TestEveryMovedKeyFitsTheColumn(t *testing.T) {
+	for _, k := range Keys() {
+		if len(k) > maxKeyLen {
+			t.Errorf("key %q is %d bytes; the k column holds %d", k, len(k), maxKeyLen)
+		}
+	}
+	long := strings.Repeat("x", maxKeyLen+1)
+	if err := NewMemStore().SetBatch(context.Background(), "gc-1", map[string]string{long: "v"}); err == nil {
+		t.Errorf("SetBatch accepted a %d-byte key; the server would truncate it into a collision", len(long))
 	}
 }
 

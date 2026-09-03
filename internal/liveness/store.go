@@ -15,6 +15,12 @@ import (
 // only in the working set: they never stage, never commit, and never replicate.
 const TableName = "session_liveness"
 
+// maxKeyLen matches the k column's VARCHAR(64). Every key in the moved set is
+// well under it (the longest, continuation_reset_pending, is 26 bytes); the
+// bound exists so a future caller cannot hand the server a key it would
+// silently truncate into a collision. TestEveryMovedKeyFitsTheColumn pins it.
+const maxKeyLen = 64
+
 // Snapshot is one bead's liveness state as the table holds it.
 type Snapshot struct {
 	// Values maps liveness key -> value. An empty-string value is a real,
@@ -145,6 +151,12 @@ func sortedWritableKeys(kv map[string]string) ([]string, error) {
 		}
 		if strings.TrimSpace(k) == "" {
 			return nil, fmt.Errorf("liveness: empty metadata key")
+		}
+		// The k column is VARCHAR(64). Refuse an over-long key rather than let
+		// the server truncate it: a truncated key would collide with whatever
+		// shares its first 64 bytes and silently corrupt that bead's telemetry.
+		if len(k) > maxKeyLen {
+			return nil, fmt.Errorf("liveness: key %q is %d bytes; the column holds %d", k, len(k), maxKeyLen)
 		}
 		out = append(out, k)
 	}
