@@ -14,13 +14,25 @@ import (
 
 func TestIsKeyCoversTheMovedFieldSet(t *testing.T) {
 	moved := []string{
-		"state", "awake_started_at", "last_woke_at", "slept_at", "sleep_reason",
+		"state", "state_reason", "awake_started_at", "last_woke_at", "slept_at",
+		"suspended_at", "sleep_reason", "sleep_intent",
 		"synced_at", "generation", "held_until", "drain_at", "quarantined_until",
-		"churn_count", "continuation_epoch", "continuation_reset_pending",
+		"quarantine_cycle", "churn_count", "wake_attempts", "wait_hold",
+		"wake_request", "wake_requested_at",
+		"continuation_epoch", "continuation_reset_pending",
 		"pending_create_claim", "pending_create_started_at", "primed_at",
 		"priming_attempted_at", "instance_token", "prior_session_key",
-		"creation_complete_at", "detached_at", "usage_compute_emitted_at",
-		"gc.last_heartbeat_at",
+		"creation_complete_at", "detached_at",
+		"currently_processing_bead_id",
+		"usage_compute_emitted_at", "usage_model_swept_at",
+		"last_nudge_delivered_at",
+		"idle_claim_nudge_trigger", "idle_claim_nudge_count", "idle_claim_nudge_at",
+		"continuation_claim_nudge_work", "continuation_claim_nudge_root",
+		"continuation_claim_nudge_store_ref", "continuation_claim_nudge_generation",
+		"continuation_claim_nudge_count", "continuation_claim_nudge_at",
+		"stranded_event_emitted_at", "wake_refused_event_at",
+		"config_drift_deferred_at", "config_drift_deferred_key",
+		"attached_config_drift_deferred_at", "attached_config_drift_deferred_key",
 	}
 	for _, k := range moved {
 		if !IsKey(k) {
@@ -33,11 +45,59 @@ func TestIsKeyCoversTheMovedFieldSet(t *testing.T) {
 	// Stable identity/config must stay in versioned metadata.
 	for _, k := range []string{
 		"agent_name", "alias", "command", "provider", "gc.session_name",
-		"gc.work_dir", "state_reason", "session_name", "template",
-		"suspended_at", "wait_hold", "sleep_intent",
+		"gc.work_dir", "session_name", "template",
+		"session_key", "started_config_hash", "started_live_hash",
+		"prompt_hash", "resume_seeded", "continuity_eligible", "archived_at",
+		"close_reason", "closed_at", "pin_awake",
 	} {
 		if IsKey(k) {
 			t.Errorf("IsKey(%q) = true, want false — versioned metadata must not move", k)
+		}
+	}
+}
+
+// TestTriggerBeadIDStaysVersioned pins the one measured churn driver the sweep
+// deliberately did NOT move. gc.trigger_bead_id is the pool slot's binding to
+// its dispatched work, not telemetry, and it is written as one member of the
+// trigger/provenance cluster that session.Store.UpdateMetadataInfo commits in a
+// single backend operation — splitting it out would send the trigger id to the
+// table and the store ref / pack / work dir through Update, which is exactly the
+// partial provenance row that contract forbids. See the LEFT VERSIONED note in
+// keys.go.
+func TestTriggerBeadIDStaysVersioned(t *testing.T) {
+	for _, k := range []string{
+		"gc.trigger_bead_id", "gc.trigger_bead_store_ref", "gc.pack",
+		"gc.pack_workspace", "gc.brain_parent_sid",
+	} {
+		if IsKey(k) {
+			t.Errorf("IsKey(%q) = true; the trigger/provenance cluster must commit atomically in versioned metadata", k)
+		}
+	}
+}
+
+// TestCircuitAndUsageCursorStayVersioned pins the two measured churn classes
+// the second sweep deliberately did NOT move. Both read as node-local
+// telemetry, and both fail the membership rule the same way: a missing
+// working-set row does not leave the value merely stale, it leaves it wrong at
+// a cost. The committed session_circuit_state a moved write would strand on the
+// bead can resurface as an ancient CIRCUIT_OPEN that blocks spawning and that
+// maybeAutoResetLocked cannot heal without a last_restart, and
+// session_circuit_reset_generation is by its own declaration the durable fence
+// that rejects a stale snapshot after an operator reset. A lost
+// invocation_usage_cursor makes the end-of-interval sweep re-emit token and
+// cost counters for the whole bounded tail, upstream of the IdempotencyKey
+// dedup that makes fact replay safe. See the LEFT VERSIONED note in keys.go.
+func TestCircuitAndUsageCursorStayVersioned(t *testing.T) {
+	for _, k := range []string{
+		"session_circuit_state", "session_circuit_restarts",
+		"session_circuit_last_restart", "session_circuit_last_progress",
+		"session_circuit_last_observed", "session_circuit_progress_signature",
+		"session_circuit_opened_at", "session_circuit_open_restart_count",
+		"session_circuit_reset_generation",
+		"invocation_usage_cursor",
+	} {
+		if IsKey(k) {
+			t.Errorf("IsKey(%q) = true; a working-set row for this key is not merely stale when lost, it is wrong at a cost — see the LEFT VERSIONED note in keys.go", k)
 		}
 	}
 }
@@ -57,19 +117,21 @@ func TestEveryMovedKeyFitsTheColumn(t *testing.T) {
 func TestSplitPartitionsAndPreservesClears(t *testing.T) {
 	live, rest := Split(map[string]string{
 		"state":                "asleep",
+		"state_reason":         "idle timeout",
 		"slept_at":             "2026-09-03T00:00:00Z",
 		"pending_create_claim": "", // a clear must reach the liveness half, not be dropped
-		"state_reason":         "idle timeout",
+		"session_key":          "conv-1",
 		"alias":                "katya",
 	})
 	wantLive := map[string]string{
 		"state":                "asleep",
+		"state_reason":         "idle timeout",
 		"slept_at":             "2026-09-03T00:00:00Z",
 		"pending_create_claim": "",
 	}
 	wantRest := map[string]string{
-		"state_reason": "idle timeout",
-		"alias":        "katya",
+		"session_key": "conv-1",
+		"alias":       "katya",
 	}
 	if !reflect.DeepEqual(live, wantLive) {
 		t.Errorf("live = %v, want %v", live, wantLive)
@@ -419,17 +481,17 @@ func TestOverlayWithAnUnparseableFenceKeepsTelemetry(t *testing.T) {
 func TestFallbackPlanFencesAndCarriesEverythingVersioned(t *testing.T) {
 	now := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
 	got := FallbackPlan(map[string]string{
-		"state":        "asleep",
-		"state_reason": "idle",
+		"state":       "asleep",
+		"session_key": "conv-1",
 	}, now)
-	if got["state"] != "asleep" || got["state_reason"] != "idle" {
+	if got["state"] != "asleep" || got["session_key"] != "conv-1" {
 		t.Errorf("FallbackPlan = %v, want both halves versioned", got)
 	}
 	if got[FenceKeyFor("state")] != FenceStamp(now) {
 		t.Errorf("FallbackPlan did not stamp %s", FenceKeyFor("state"))
 	}
-	if _, stamped := got[FenceKeyFor("state_reason")]; stamped {
-		t.Errorf("FallbackPlan fenced the versioned key state_reason; it has no table row to fence")
+	if _, stamped := got[FenceKeyFor("session_key")]; stamped {
+		t.Errorf("FallbackPlan fenced the versioned key session_key; it has no table row to fence")
 	}
 	// No liveness keys means nothing to fence, so no marker is committed.
 	plain := FallbackPlan(map[string]string{"alias": "katya"}, now)
