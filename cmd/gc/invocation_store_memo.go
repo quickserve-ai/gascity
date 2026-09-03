@@ -89,6 +89,9 @@ type invocationStoreEntry struct {
 	cfg             *config.City
 	mode            gate.Mode
 	nativeTransport beads.NativeTransportMode
+	// lv is the session-liveness binding resolved at the open (ga-lys454);
+	// every borrowed handle wraps the store with it.
+	lv *livenessBinding
 }
 
 // invocationStoreMemo is the memo of one invocation. A nil memo is disabled.
@@ -173,6 +176,7 @@ func (m *invocationStoreMemo) close() error {
 			}
 			e.opened = false
 			e.result = beads.StoreOpenResult{}
+			e.lv = nil
 		}
 		e.mu.Unlock()
 	}
@@ -183,6 +187,6 @@ func (m *invocationStoreMemo) close() error {
 // policies of cfg. The caller holds e.mu.
 func (e *invocationStoreEntry) borrow(cfg *config.City) beads.StoreOpenResult {
 	result := e.result
-	result.Store = borrowedStoreWithBeadPolicies(result.Store, cfg)
+	result.Store = borrowedStoreWithBeadPolicies(result.Store, cfg, e.lv)
 	return result
 }
