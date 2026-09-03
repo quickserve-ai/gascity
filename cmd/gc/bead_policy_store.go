@@ -31,7 +31,7 @@ type beadPolicyStore struct {
 	// lv routes session-liveness telemetry to the non-versioned
 	// session_liveness table instead of the versioned issues metadata. A nil
 	// binding disables both the write split and the read overlay, leaving this
-	// wrapper byte-identical to its pre-liveness behaviour — which is what
+	// wrapper byte-identical to its pre-liveness behavior — which is what
 	// every scope without a resolvable managed Dolt endpoint (file/doltlite
 	// providers, unit tests) gets. See bead_policy_store_liveness.go.
 	lv *livenessBinding
@@ -69,7 +69,7 @@ var (
 // wrapStoreWithBeadPolicies wraps store with the bead storage-tier policy layer
 // and, when a liveness binding is supplied, the session-liveness write splitter
 // and read overlay. The binding is variadic so the ~40 existing call sites
-// (mostly tests, which want the plain policy behaviour) stay untouched.
+// (mostly tests, which want the plain policy behavior) stay untouched.
 func wrapStoreWithBeadPolicies(store beads.Store, cfg *config.City, lv ...*livenessBinding) beads.Store {
 	if store == nil {
 		return nil

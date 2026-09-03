@@ -17,7 +17,7 @@ type Plan struct {
 // PlanWrite routes patch according to mode.
 //
 //   - ModeTable splits: liveness keys to the table, everything else versioned.
-//   - ModeMetadata sends the FULL patch versioned (the rollback behaviour) and
+//   - ModeMetadata sends the FULL patch versioned (the rollback behavior) and
 //     additionally mirrors the liveness keys into the table so the read overlay
 //     never shadows fresh committed metadata with frozen rows.
 //

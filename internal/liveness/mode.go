@@ -22,7 +22,7 @@ const (
 
 	// ModeMetadata is the rollback path: the FULL patch goes to versioned bead
 	// metadata exactly as it did before this change, restoring the pre-change
-	// commit behaviour byte for byte.
+	// commit behavior byte for byte.
 	//
 	// It still MIRRORS liveness keys into the table. That is deliberate and is
 	// the one deviation from "no split at all": reads overlay the table in both
@@ -36,7 +36,7 @@ const (
 
 // ModeFromEnv resolves the mode from the process environment. An unset, empty,
 // or unrecognized value resolves to ModeTable: the flag exists to turn the new
-// behaviour OFF deliberately, never to have it disabled by a typo silently
+// behavior OFF deliberately, never to have it disabled by a typo silently
 // re-enabling ~250 Dolt commits an hour.
 func ModeFromEnv() Mode {
 	return ParseMode(os.Getenv(ModeEnv))

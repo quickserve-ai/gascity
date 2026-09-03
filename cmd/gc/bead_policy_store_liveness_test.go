@@ -220,7 +220,7 @@ func TestLivenessMetadataModeWritesVersionedAndMirrors(t *testing.T) {
 		t.Fatalf("SetMetadataBatch: %v", err)
 	}
 	if len(backing.batches) != 1 || len(backing.batches[0]) != 2 {
-		t.Fatalf("versioned batches = %v, want the FULL patch (rollback behaviour)", backing.batches)
+		t.Fatalf("versioned batches = %v, want the FULL patch (rollback behavior)", backing.batches)
 	}
 	// The mirror is what keeps the always-on read overlay from shadowing fresh
 	// committed metadata with frozen rows after a rollback.
@@ -311,7 +311,7 @@ func TestLivenessTxSplitsMetadataWrites(t *testing.T) {
 	// The Tx handle comes from the backing store itself, so its writes bypass the
 	// recorder; assert on the committed row instead, read straight from the
 	// backing store so no overlay can mask what actually landed.
-	committed, err := backing.Store.Get(bead.ID)
+	committed, err := backing.Get(bead.ID)
 	if err != nil {
 		t.Fatalf("backing Get: %v", err)
 	}

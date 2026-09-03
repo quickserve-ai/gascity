@@ -257,7 +257,7 @@ func TestSQLStoreAgainstDolt(t *testing.T) {
 	})
 
 	t.Run("concurrent writers on separate connections lose nothing per key", func(t *testing.T) {
-		testSQLStoreConcurrentWritersAcrossSeparateConnections(t, ctx, server)
+		testSQLStoreConcurrentWritersAcrossSeparateConnections(ctx, t, server)
 	})
 }
 
@@ -267,7 +267,7 @@ func TestSQLStoreAgainstDolt(t *testing.T) {
 // the same bead. Each owns a disjoint key, and both keys must survive. The
 // sidecar could not offer this: each process cached the whole JSON document and
 // atomically rewrote it, so the loser's keys vanished.
-func testSQLStoreConcurrentWritersAcrossSeparateConnections(t *testing.T, ctx context.Context, server doltTestServer) {
+func testSQLStoreConcurrentWritersAcrossSeparateConnections(ctx context.Context, t *testing.T, server doltTestServer) {
 	t.Helper()
 	const rounds = 40
 	writers := []struct {

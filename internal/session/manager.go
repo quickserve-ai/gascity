@@ -1700,7 +1700,7 @@ func templateOverrideWakeInFlight(metadata map[string]string, state State, now t
 // rows, and this function folds it back in.
 //
 // A bead with no liveness rows (a legacy bead, or a scope with liveness
-// disabled) returns b.UpdatedAt unchanged, so behaviour is identical to before.
+// disabled) returns b.UpdatedAt unchanged, so behavior is identical to before.
 func EffectiveUpdatedAt(b beads.Bead) time.Time {
 	updated := b.UpdatedAt
 	raw := strings.TrimSpace(b.Metadata[liveness.WrittenAtKey])

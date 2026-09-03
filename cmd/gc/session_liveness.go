@@ -96,7 +96,7 @@ func resetSessionLivenessBindingsForTest() {
 
 // Mode reports the write discipline this binding applies. A nil binding reports
 // ModeMetadata: with no liveness store there is nowhere to split TO, so the only
-// correct behaviour is the legacy pass-through.
+// correct behavior is the legacy pass-through.
 func (b *livenessBinding) Mode() liveness.Mode {
 	if b == nil {
 		return liveness.ModeMetadata
