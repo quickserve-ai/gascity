@@ -31,6 +31,8 @@ func TestIsKeyCoversTheMovedFieldSet(t *testing.T) {
 		"continuation_claim_nudge_store_ref", "continuation_claim_nudge_generation",
 		"continuation_claim_nudge_count", "continuation_claim_nudge_at",
 		"stranded_event_emitted_at",
+		"config_drift_deferred_at", "config_drift_deferred_key",
+		"attached_config_drift_deferred_at", "attached_config_drift_deferred_key",
 		"gc.last_heartbeat_at",
 	}
 	for _, k := range moved {
@@ -70,6 +72,33 @@ func TestTriggerBeadIDStaysVersioned(t *testing.T) {
 	} {
 		if IsKey(k) {
 			t.Errorf("IsKey(%q) = true; the trigger/provenance cluster must commit atomically in versioned metadata", k)
+		}
+	}
+}
+
+// TestCircuitAndUsageCursorStayVersioned pins the two measured churn classes
+// the second sweep deliberately did NOT move. Both read as node-local
+// telemetry, and both fail the membership rule the same way: a missing
+// working-set row does not leave the value merely stale, it leaves it wrong at
+// a cost. The committed session_circuit_state a moved write would strand on the
+// bead can resurface as an ancient CIRCUIT_OPEN that blocks spawning and that
+// maybeAutoResetLocked cannot heal without a last_restart, and
+// session_circuit_reset_generation is by its own declaration the durable fence
+// that rejects a stale snapshot after an operator reset. A lost
+// invocation_usage_cursor makes the end-of-interval sweep re-emit token and
+// cost counters for the whole bounded tail, upstream of the IdempotencyKey
+// dedup that makes fact replay safe. See the LEFT VERSIONED note in keys.go.
+func TestCircuitAndUsageCursorStayVersioned(t *testing.T) {
+	for _, k := range []string{
+		"session_circuit_state", "session_circuit_restarts",
+		"session_circuit_last_restart", "session_circuit_last_progress",
+		"session_circuit_last_observed", "session_circuit_progress_signature",
+		"session_circuit_opened_at", "session_circuit_open_restart_count",
+		"session_circuit_reset_generation",
+		"invocation_usage_cursor",
+	} {
+		if IsKey(k) {
+			t.Errorf("IsKey(%q) = true; a working-set row for this key is not merely stale when lost, it is wrong at a cost — see the LEFT VERSIONED note in keys.go", k)
 		}
 	}
 }
