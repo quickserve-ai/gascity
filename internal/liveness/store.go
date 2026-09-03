@@ -117,10 +117,18 @@ func NewSQLStore(db DB) *SQLStore {
 // server time. It is best-effort: a failure leaves the offset at zero, which is
 // exactly the local-clock behavior, and is correct for the overwhelmingly common
 // case of a managed Dolt on the same host.
+//
+// The local reading BRACKETS the query. The server sampled its clock somewhere
+// inside the round trip, so comparing it against a local reading taken only
+// AFTER the Scan charges the whole round trip to the offset and reports the
+// server as running behind by that much — a systematic backward bias, and the
+// bias direction that makes the fence fail to fence. Midpoint is the standard
+// correction and is exact when the two legs are symmetric.
 func (s *SQLStore) Calibrate(ctx context.Context) error {
 	if s == nil || s.db == nil {
 		return fmt.Errorf("liveness: store not open")
 	}
+	t0 := time.Now().UTC()
 	rows, err := s.db.QueryContext(ctx, "SELECT UTC_TIMESTAMP(6)")
 	if err != nil {
 		return fmt.Errorf("liveness: reading server clock: %w", err)
@@ -136,11 +144,12 @@ func (s *SQLStore) Calibrate(ctx context.Context) error {
 	if err := rows.Scan(&raw); err != nil {
 		return fmt.Errorf("liveness: reading server clock: %w", err)
 	}
-	local := time.Now().UTC()
+	t1 := time.Now().UTC()
 	server := parseWrittenAt(raw)
 	if server.IsZero() {
 		return fmt.Errorf("liveness: server clock unparseable")
 	}
+	local := t0.Add(t1.Sub(t0) / 2)
 	s.clockOffsetNanos.Store(server.Sub(local).Nanoseconds())
 	return nil
 }
