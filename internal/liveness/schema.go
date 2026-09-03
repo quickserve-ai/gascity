@@ -33,8 +33,25 @@ const seedCommitMessage = "gc: seed dolt_ignore " + TableName
 // (an already-committed table stays committed) and every liveness write is back
 // to minting the commits this whole change exists to remove.
 //
-// The seed commit fires ONLY when INSERT IGNORE actually added the row, so a
-// healthy database performs zero writes here and steady state mints no commits.
+// The seed commit is attempted only when there is something to commit: either
+// the INSERT IGNORE just added the row, or a previous call added it and had to
+// DEFER the commit. That second case is why the deferral is re-checked rather
+// than trusted to "the next call will insert again" — the insert succeeds
+// exactly ONCE per database, so a single deferral would otherwise leave the seed
+// uncommitted forever, and a permanently dirty working set is the documented hub
+// merge-wedge class (ga-7unsv0). A healthy steady state finds nothing to do here
+// and mints no commits.
+//
+// ON @@GLOBAL.dolt_transaction_commit. gc sets it to 1 on every managed server
+// (cmd/gc/dolt_transaction_commit.go) and this code must NOT ask an operator to
+// turn it off: doing so re-opens the stranded-writes class that setting exists
+// to close. It costs liveness nothing — MEASURED on a real dolt server with the
+// global ON, 10 SetBatch writes to this dolt_ignore'd table minted 0 Dolt
+// commits while 10 control writes to a non-ignored table on the same connection
+// minted 10. An ignored table's rows are simply not part of any commit's tree.
+// The one visible effect is here: the INSERT above auto-commits, so the DOLT_ADD
+// below stages nothing and DOLT_COMMIT answers "nothing to commit" — success,
+// not failure, and treated as such.
 func EnsureSchema(ctx context.Context, db DB) error {
 	if db == nil {
 		return fmt.Errorf("liveness: nil database handle")
@@ -45,8 +62,24 @@ func EnsureSchema(ctx context.Context, db DB) error {
 	}
 	// A RowsAffected error degrades to "not changed": the seed then rides along
 	// in the working set as an uncommitted diff instead of getting its own
-	// commit, which is strictly the less surprising failure.
+	// commit, which is strictly the less surprising failure. The dirty check
+	// below catches it on the next call anyway.
+	inserted := false
 	if n, raErr := res.RowsAffected(); raErr == nil && n > 0 {
+		inserted = true
+	}
+	needsCommit := inserted
+	if !needsCommit {
+		// The row already existed. It may still be sitting UNCOMMITTED from an
+		// earlier call that deferred — the insert will never fire again, so this
+		// is the only thing that can ever carry that seed into history.
+		dirty, checkErr := doltIgnoreIsUncommitted(ctx, db)
+		if checkErr != nil {
+			warnf("liveness: cannot inspect dolt_status (%v); cannot confirm the dolt_ignore seed is committed", checkErr)
+		}
+		needsCommit = dirty
+	}
+	if needsCommit {
 		// DOLT_COMMIT commits the whole STAGED set, not just what we added. If
 		// another writer already has tables staged, committing here would sweep
 		// their in-flight work into a commit labeled as ours. Leave the seed as
@@ -67,7 +100,7 @@ func EnsureSchema(ctx context.Context, db DB) error {
 			if err := drainCall(ctx, db, "CALL DOLT_ADD('dolt_ignore')"); err != nil {
 				return fmt.Errorf("liveness: staging seeded dolt_ignore: %w", err)
 			}
-			if err := drainCall(ctx, db, "CALL DOLT_COMMIT('-m', ?)", seedCommitMessage); err != nil {
+			if err := drainCall(ctx, db, "CALL DOLT_COMMIT('-m', ?)", seedCommitMessage); err != nil && !isNothingToCommit(err) {
 				return fmt.Errorf("liveness: committing seeded dolt_ignore: %w", err)
 			}
 		}
@@ -75,8 +108,38 @@ func EnsureSchema(ctx context.Context, db DB) error {
 	if _, err := db.ExecContext(ctx, createTableStmt); err != nil {
 		return fmt.Errorf("liveness: creating %s: %w", TableName, err)
 	}
-	assertTransactionCommitOff(ctx, db)
 	return nil
+}
+
+// isNothingToCommit reports whether a DOLT_COMMIT failed only because the
+// staging area was already empty.
+//
+// This is the NORMAL outcome on a gc-managed server: with
+// @@GLOBAL.dolt_transaction_commit = 1 the INSERT IGNORE above auto-commits, so
+// by the time DOLT_ADD runs there is nothing left to stage and DOLT_COMMIT
+// returns Error 1105 "nothing to commit". Treating that as a failure took the
+// whole dial down on a fresh database and degraded liveness for a 30-second
+// retry window, over a database that was in exactly the desired state.
+func isNothingToCommit(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "nothing to commit")
+}
+
+// doltIgnoreIsUncommitted reports whether dolt_ignore itself has changes in the
+// working set or the index — the shape a DEFERRED seed leaves behind.
+func doltIgnoreIsUncommitted(ctx context.Context, db DB) (bool, error) {
+	rows, err := db.QueryContext(ctx, "SELECT COUNT(*) FROM dolt_status WHERE table_name = 'dolt_ignore'")
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = rows.Close() }()
+	if !rows.Next() {
+		return false, rows.Err()
+	}
+	var n int
+	if err := rows.Scan(&n); err != nil {
+		return false, err
+	}
+	return n > 0, rows.Err()
 }
 
 // warnf is the package's diagnostic sink. It is a var so tests can capture it.
@@ -105,53 +168,6 @@ func otherStagedTables(ctx context.Context, db DB) ([]string, error) {
 		out = append(out, name)
 	}
 	return out, rows.Err()
-}
-
-// assertTransactionCommitOff verifies the invariant the whole design rests on:
-// with @@GLOBAL.dolt_transaction_commit = 1 every SQL transaction against this
-// server mints a Dolt commit, so liveness writes would commit ~250 times an hour
-// exactly as before — the change would be silently inert. It warns rather than
-// refusing: the table is still the right place for this data, and refusing the
-// open would take liveness down over a server setting a human must change.
-func assertTransactionCommitOff(ctx context.Context, db DB) {
-	rows, err := db.QueryContext(ctx, "SELECT @@GLOBAL.dolt_transaction_commit")
-	if err != nil {
-		warnf("liveness: cannot read @@GLOBAL.dolt_transaction_commit (%v); cannot confirm that liveness writes mint no Dolt commits", err)
-		return
-	}
-	defer func() { _ = rows.Close() }()
-	if !rows.Next() {
-		return
-	}
-	var raw any
-	if err := rows.Scan(&raw); err != nil {
-		return
-	}
-	if !isZeroish(raw) {
-		warnf("liveness: @@GLOBAL.dolt_transaction_commit is %v, not 0 — EVERY liveness write will mint a Dolt commit and this change is inert until it is turned off", raw)
-	}
-}
-
-// isZeroish reports whether a MySQL system-variable value reads as 0/off across
-// the shapes a driver may hand back (int64, []byte, string).
-func isZeroish(raw any) bool {
-	switch v := raw.(type) {
-	case nil:
-		return true
-	case int64:
-		return v == 0
-	case []byte:
-		return isZeroText(string(v))
-	case string:
-		return isZeroText(v)
-	default:
-		return isZeroText(fmt.Sprint(v))
-	}
-}
-
-func isZeroText(s string) bool {
-	s = strings.ToLower(strings.TrimSpace(s))
-	return s == "0" || s == "off" || s == "false" || s == ""
 }
 
 // drainCall runs a Dolt stored procedure and consumes its result set. Dolt's

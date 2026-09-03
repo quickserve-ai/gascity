@@ -204,7 +204,7 @@ func (s *SQLStore) SetBatch(ctx context.Context, beadID string, kv map[string]st
 	// written_at is minted SERVER-side. A client clock is not a safe timebase for
 	// a value the fence compares against: two gc processes on different hosts
 	// would otherwise write rows whose ordering does not reflect reality, and a
-	// client running behind the Dolt host would defeat the FallbackAtKey fence.
+	// client running behind the Dolt host would defeat the fence entirely.
 	const stmt = "INSERT INTO " + TableName + " (bead_id, k, v, written_at) VALUES (?, ?, ?, UTC_TIMESTAMP(6)) " +
 		"ON DUPLICATE KEY UPDATE v = VALUES(v), written_at = UTC_TIMESTAMP(6)"
 	for _, k := range keysToWrite {

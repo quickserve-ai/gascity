@@ -477,34 +477,192 @@ func TestEnsureSchemaDefersTheSeedCommitWhenOtherTablesAreStaged(t *testing.T) {
 	}
 }
 
-// TestEnsureSchemaWarnsWhenTransactionCommitIsOn covers the other half of item
-// E: with @@GLOBAL.dolt_transaction_commit on, every liveness write mints a Dolt
-// commit and the whole change is inert. That must be loud, not silent.
-func TestEnsureSchemaWarnsWhenTransactionCommitIsOn(t *testing.T) {
+// TestEnsureSchemaCommitsASeedItHadToDeferEarlier is the other half of the
+// deferral: the INSERT IGNORE succeeds exactly ONCE per database, so if that one
+// call had to defer the commit, nothing would ever carry the seed into history
+// again — and a permanently dirty working set is the documented hub merge-wedge
+// class (ga-7unsv0). A later call must notice the uncommitted dolt_ignore and
+// commit it once the staging area is clear.
+func TestEnsureSchemaCommitsASeedItHadToDeferEarlier(t *testing.T) {
 	server := startTestDoltServer(t)
 	ctx := context.Background()
 	db := server.connect(t)
 
-	if _, err := db.ExecContext(ctx, "SET @@GLOBAL.dolt_transaction_commit = 1"); err != nil {
+	origWarn := warnf
+	warnf = func(string, ...any) {}
+	t.Cleanup(func() { warnf = origWarn })
+
+	// Another writer's staged work forces the first call to defer.
+	if _, err := db.ExecContext(ctx, "CREATE TABLE someone_elses_work (id INT PRIMARY KEY)"); err != nil {
+		t.Fatalf("create other table: %v", err)
+	}
+	if err := drainCall(ctx, db, "CALL DOLT_ADD('someone_elses_work')"); err != nil {
+		t.Fatalf("stage other table: %v", err)
+	}
+	if err := EnsureSchema(ctx, db); err != nil {
+		t.Fatalf("EnsureSchema (deferring): %v", err)
+	}
+	if !doltIgnoreDirty(t, db) {
+		t.Fatalf("precondition: dolt_ignore is already clean, so the deferral never happened")
+	}
+
+	// The other writer commits its own work; the staging area is clear again.
+	if err := drainCall(ctx, db, "CALL DOLT_COMMIT('-m', 'someone else')"); err != nil {
+		t.Fatalf("other writer's commit: %v", err)
+	}
+
+	before := doltCommitCount(t, db)
+	if err := EnsureSchema(ctx, db); err != nil {
+		t.Fatalf("EnsureSchema (second call): %v", err)
+	}
+	if got := doltCommitCount(t, db); got != before+1 {
+		t.Fatalf("dolt_log went %d -> %d, want the deferred seed committed exactly once", before, got)
+	}
+	if doltIgnoreDirty(t, db) {
+		t.Fatalf("dolt_ignore is still uncommitted; a permanently dirty working set wedges hub merges (ga-7unsv0)")
+	}
+	// And a third call finds nothing to do.
+	before = doltCommitCount(t, db)
+	if err := EnsureSchema(ctx, db); err != nil {
+		t.Fatalf("EnsureSchema (third call): %v", err)
+	}
+	if got := doltCommitCount(t, db); got != before {
+		t.Fatalf("dolt_log went %d -> %d on a clean re-seed, want unchanged", before, got)
+	}
+}
+
+// setGlobalTransactionCommit flips @@GLOBAL.dolt_transaction_commit on its own
+// throwaway connection. A session copies the global when it CONNECTS, so the
+// setter's own connection would never see the new value — every connection the
+// test then opens does.
+func setGlobalTransactionCommit(ctx context.Context, t *testing.T, server *doltTestServer, value int) {
+	t.Helper()
+	setter := server.connect(t)
+	if _, err := setter.ExecContext(ctx, fmt.Sprintf("SET @@GLOBAL.dolt_transaction_commit = %d", value)); err != nil {
 		t.Skipf("cannot set @@GLOBAL.dolt_transaction_commit on this dolt build: %v", err)
 	}
-	t.Cleanup(func() { _, _ = db.ExecContext(ctx, "SET @@GLOBAL.dolt_transaction_commit = 0") })
+	t.Cleanup(func() {
+		_, _ = setter.ExecContext(context.Background(), "SET @@GLOBAL.dolt_transaction_commit = 0")
+	})
+}
+
+// assertTransactionCommitIsOn proves the instrument before the measurement: a
+// test that silently ran with the global OFF would measure nothing.
+func assertTransactionCommitIsOn(ctx context.Context, t *testing.T, db *sql.DB) {
+	t.Helper()
+	var raw string
+	if err := db.QueryRowContext(ctx, "SELECT @@SESSION.dolt_transaction_commit").Scan(&raw); err != nil {
+		t.Fatalf("read @@SESSION.dolt_transaction_commit: %v", err)
+	}
+	if raw == "0" || strings.EqualFold(raw, "off") {
+		t.Skipf("@@SESSION.dolt_transaction_commit = %q on this dolt build; the global did not propagate to a new session", raw)
+	}
+}
+
+func doltIgnoreDirty(t *testing.T, db *sql.DB) bool {
+	t.Helper()
+	var n int
+	if err := db.QueryRow("SELECT COUNT(*) FROM dolt_status WHERE table_name = 'dolt_ignore'").Scan(&n); err != nil {
+		t.Fatalf("read dolt_status: %v", err)
+	}
+	return n > 0
+}
+
+// TestEnsureSchemaOnAFreshDBWithTransactionCommitOn is the case every
+// gc-MANAGED server hits on its first dial: gc sets
+// @@GLOBAL.dolt_transaction_commit = 1 (cmd/gc/dolt_transaction_commit.go), so
+// the INSERT IGNORE auto-commits, DOLT_ADD stages nothing, and DOLT_COMMIT
+// answers "nothing to commit". Treating that as an error failed the dial and
+// degraded liveness for a 30-second retry window on a database that was in
+// exactly the desired state.
+func TestEnsureSchemaOnAFreshDBWithTransactionCommitOn(t *testing.T) {
+	server := startTestDoltServer(t)
+	ctx := context.Background()
+	// The global seeds each session's copy AT CONNECT TIME, so the connection
+	// that sets it never observes it. Everything under test dials afterwards.
+	setGlobalTransactionCommit(ctx, t, server, 1)
+	db := server.connect(t)
+	assertTransactionCommitIsOn(ctx, t, db)
 
 	var warnings []string
 	origWarn := warnf
 	warnf = func(format string, args ...any) { warnings = append(warnings, fmt.Sprintf(format, args...)) }
 	t.Cleanup(func() { warnf = origWarn })
 
+	before := doltCommitCount(t, db)
+	if err := EnsureSchema(ctx, db); err != nil {
+		t.Fatalf("EnsureSchema on a fresh db with dolt_transaction_commit on: %v", err)
+	}
+	// The seed is committed exactly once — by the INSERT's own auto-commit, not
+	// by the DOLT_COMMIT below it. That auto-commit is what leaves DOLT_ADD with
+	// nothing to stage and makes DOLT_COMMIT answer Error 1105 "nothing to
+	// commit"; measured on dolt here, verbatim.
+	if got := doltCommitCount(t, db); got != before+1 {
+		t.Fatalf("dolt_log went %d -> %d, want exactly one seed commit", before, got)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("EnsureSchema warned on a healthy fresh db: %v", warnings)
+	}
+	var ignored bool
+	if err := db.QueryRowContext(ctx, "SELECT ignored FROM dolt_ignore WHERE pattern = ?", TableName).Scan(&ignored); err != nil {
+		t.Fatalf("read dolt_ignore: %v", err)
+	}
+	if !ignored {
+		t.Fatalf("dolt_ignore[%s].ignored = false", TableName)
+	}
+	if doltIgnoreDirty(t, db) {
+		t.Fatalf("dolt_ignore is uncommitted after a clean seed; the working set must not stay dirty")
+	}
+	// Idempotent, and still silent.
+	warnings = nil
+	if err := EnsureSchema(ctx, db); err != nil {
+		t.Fatalf("EnsureSchema (second call): %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("the second EnsureSchema warned: %v", warnings)
+	}
+}
+
+// TestLivenessWritesMintNoCommitsEvenWithTransactionCommitOn is the MEASUREMENT
+// that retired the old "@@GLOBAL.dolt_transaction_commit must be off" warning.
+// The warning's claim was false, and an operator acting on it by turning the
+// global off would re-open the stranded-writes class it exists to close
+// (ga-7unsv0). A dolt_ignore'd table's rows are simply not part of any commit's
+// tree; the control writes to a NON-ignored table on the same connection are
+// what make that a measurement rather than an assumption.
+func TestLivenessWritesMintNoCommitsEvenWithTransactionCommitOn(t *testing.T) {
+	server := startTestDoltServer(t)
+	ctx := context.Background()
+	setGlobalTransactionCommit(ctx, t, server, 1)
+	db := server.connect(t)
+	assertTransactionCommitIsOn(ctx, t, db)
+
 	if err := EnsureSchema(ctx, db); err != nil {
 		t.Fatalf("EnsureSchema: %v", err)
 	}
-	found := false
-	for _, w := range warnings {
-		if strings.Contains(w, "dolt_transaction_commit") {
-			found = true
+	if _, err := db.ExecContext(ctx, "CREATE TABLE control_versioned (id INT PRIMARY KEY, v TEXT)"); err != nil {
+		t.Fatalf("create control table: %v", err)
+	}
+
+	store := NewSQLStore(db)
+	before := doltCommitCount(t, db)
+	for i := 0; i < 10; i++ {
+		if err := store.SetBatch(ctx, "gc-measure", map[string]string{"generation": strconv.Itoa(i)}); err != nil {
+			t.Fatalf("SetBatch #%d: %v", i, err)
 		}
 	}
-	if !found {
-		t.Fatalf("no warning about dolt_transaction_commit being on; got %v", warnings)
+	afterLiveness := doltCommitCount(t, db)
+	if afterLiveness != before {
+		t.Fatalf("10 liveness writes minted %d Dolt commits with the global ON, want 0", afterLiveness-before)
+	}
+
+	for i := 0; i < 10; i++ {
+		if _, err := db.ExecContext(ctx, "INSERT INTO control_versioned (id, v) VALUES (?, ?)", i, "x"); err != nil {
+			t.Fatalf("control insert #%d: %v", i, err)
+		}
+	}
+	afterControl := doltCommitCount(t, db)
+	if afterControl == afterLiveness {
+		t.Fatalf("the control writes to a NON-ignored table minted no commits either; the global is not actually on and this test measures nothing")
 	}
 }
