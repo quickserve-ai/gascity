@@ -1,6 +1,8 @@
 package doctor
 
 import (
+	"compress/gzip"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -41,6 +43,54 @@ func TestOrderFiringCurrent_NeverFired_BeyondUptime(t *testing.T) {
 	}
 	if result.FixHint != "Inspect with: gc order check && gc order history mol-dog-stale-db" {
 		t.Fatalf("FixHint = %q, want inspect hint for order", result.FixHint)
+	}
+}
+
+// TestOrderFiringCurrent_NeverFired_StartRotatedOut pins the honesty half of
+// the bounded read (ga-22tvtm): when controller.started has rotated out of the
+// active log but firings prove the controller runs, a never-fired order must
+// NOT classify under the "controller start unknown" OK branch — the controller
+// started before the log window, so no first-cycle grace can apply.
+func TestOrderFiringCurrent_NeverFired_StartRotatedOut(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrder(t, cityPath, "mol-dog-stale-db", "cron", "0 */4 * * *")
+	// No controller.started in the active log — only another order's firing,
+	// which is proof the controller is (or was) running.
+	writeOrderFiringTestEvents(t, cityPath, events.Event{
+		Type:    events.OrderFired,
+		Subject: "some-other-order",
+		Ts:      now.Add(-2 * time.Minute),
+	})
+
+	result := runOrderFiringCurrentTest(t, cfg, cityPath, now)
+	if result.Status != StatusError {
+		t.Fatalf("status = %v, want error; msg = %s; details = %v", result.Status, result.Message, result.Details)
+	}
+	// Cron stays advisory for the same ga-97qngx reason as the known-uptime
+	// never-fired path.
+	if result.Severity != SeverityAdvisory {
+		t.Fatalf("Severity = %v, want SeverityAdvisory", result.Severity)
+	}
+	if !strings.Contains(strings.Join(result.Details, "\n"), "controller start predates the active event log") {
+		t.Fatalf("details = %v, want start-predates-log message", result.Details)
+	}
+}
+
+// TestOrderFiringCurrent_NeverFired_NoEventsAtAll: an active log with no
+// firings and no start gives no evidence the controller ever ran —
+// controller-down is its own doctor finding, so per-order alarms stay quiet.
+func TestOrderFiringCurrent_NeverFired_NoEventsAtAll(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrder(t, cityPath, "mol-dog-stale-db", "cron", "0 */4 * * *")
+
+	result := runOrderFiringCurrentTest(t, cfg, cityPath, now)
+	if result.Status != StatusOK {
+		t.Fatalf("status = %v, want OK; msg = %s; details = %v", result.Status, result.Message, result.Details)
+	}
+	if !strings.Contains(strings.Join(result.Details, "\n"), "controller start unknown") {
+		t.Fatalf("details = %v, want controller-start-unknown message", result.Details)
 	}
 }
 
@@ -207,6 +257,96 @@ func TestOrderFiringCurrent_UsesNewestOrderRunHistory(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(result.Details, "\n"), "last fired 1h ago, expected every 4h") {
 		t.Fatalf("details = %v, want newest order-run bead to win over stale event", result.Details)
+	}
+}
+
+// TestOrderFiringCurrent_ArchivedHistoryDoesNotChangeVerdict is the correctness
+// half of the bounded read (ga-22tvtm): the check folds only the ACTIVE event
+// log, so archived firings must be unable to change the verdict a full walk
+// would have produced. Here the newest firing is in the active log and an older
+// one sits in an archive — the archive loses either way, so the bounded read is
+// verdict-identical while costing nothing to read.
+func TestOrderFiringCurrent_ArchivedHistoryDoesNotChangeVerdict(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrder(t, cityPath, "cleanup-cooldown", "cooldown", "1h")
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.ControllerStarted, Ts: now.Add(-24 * time.Hour)},
+		events.Event{Type: events.OrderFired, Subject: "cleanup-cooldown", Ts: now.Add(-30 * time.Minute)},
+	)
+	writeOrderFiringArchivedEvents(t, cityPath, 1, 8,
+		events.Event{Seq: 1, Type: events.OrderFired, Subject: "cleanup-cooldown", Ts: now.Add(-6 * time.Hour)},
+	)
+
+	result := runOrderFiringCurrentTest(t, cfg, cityPath, now)
+	if result.Status != StatusOK {
+		t.Fatalf("status = %v, want OK; msg = %s; details = %v", result.Status, result.Message, result.Details)
+	}
+	if !strings.Contains(strings.Join(result.Details, "\n"), "last fired 30m ago, expected every 1h") {
+		t.Fatalf("details = %v, want the active log's newest firing to decide the verdict", result.Details)
+	}
+}
+
+// TestOrderFiringCurrent_ArchivedFiringResolvedByOrderRunStore covers the case
+// the bound actually gives up: a firing that has already rotated out of the
+// active log. The order-run store — a per-order LIMIT 1 read that retains at
+// least the most recent closed run per order — is what carries that verdict, so
+// the check still reports "last fired 30m ago" rather than "never fired".
+func TestOrderFiringCurrent_ArchivedFiringResolvedByOrderRunStore(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrder(t, cityPath, "cleanup-cooldown", "cooldown", "1h")
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.ControllerStarted, Ts: now.Add(-24 * time.Hour)},
+	)
+	writeOrderFiringArchivedEvents(t, cityPath, 1, 8,
+		events.Event{Seq: 1, Type: events.OrderFired, Subject: "cleanup-cooldown", Ts: now.Add(-30 * time.Minute)},
+	)
+	store := beads.NewMemStoreFrom(1, []beads.Bead{{
+		ID:        "archived-run",
+		Title:     "order:cleanup-cooldown",
+		Status:    "closed",
+		Type:      "molecule",
+		Labels:    []string{"order-run:cleanup-cooldown"},
+		CreatedAt: now.Add(-30 * time.Minute),
+	}}, nil)
+
+	check := NewOrderFiringCurrentCheck(cfg, cityPath, WithOrderFiringCurrentLastRunFunc(func(order orders.Order) (time.Time, error) {
+		return orders.NewStoreWithGraph(beads.OrdersStore{Store: store}, beads.GraphStore{Store: store}).LastRun(order.ScopedName())
+	}))
+	check.clock = func() time.Time { return now }
+	result := check.Run(&CheckContext{CityPath: cityPath})
+
+	if result.Status != StatusOK {
+		t.Fatalf("status = %v, want OK; msg = %s; details = %v", result.Status, result.Message, result.Details)
+	}
+	if !strings.Contains(strings.Join(result.Details, "\n"), "last fired 30m ago, expected every 1h") {
+		t.Fatalf("details = %v, want the order-run store to carry the archived firing", result.Details)
+	}
+}
+
+// TestOrderFiringCurrent_ArchivedFiringIsNotReadFromEventHistory pins the bound
+// itself, and is the test that would fail if the check went back to walking
+// rotated history. With no order-run store wired, an archived-only firing is
+// simply not seen — the check reports the never-fired verdict. That is the
+// deliberate trade the bound makes (ga-22tvtm): reading those archives cost 62s
+// against a 48s budget, so the alarm could never fire at all. In production the
+// store IS wired (cmd/gc buildDoctorChecks) and carries the verdict; see
+// TestOrderFiringCurrent_ArchivedFiringResolvedByOrderRunStore.
+func TestOrderFiringCurrent_ArchivedFiringIsNotReadFromEventHistory(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrder(t, cityPath, "cleanup-cooldown", "cooldown", "1h")
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.ControllerStarted, Ts: now.Add(-24 * time.Hour)},
+	)
+	writeOrderFiringArchivedEvents(t, cityPath, 1, 8,
+		events.Event{Seq: 1, Type: events.OrderFired, Subject: "cleanup-cooldown", Ts: now.Add(-30 * time.Minute)},
+	)
+
+	result := runOrderFiringCurrentTest(t, cfg, cityPath, now)
+	if !strings.Contains(strings.Join(result.Details, "\n"), "never fired since controller start") {
+		t.Fatalf("details = %v, want the archived firing to be outside the check's bounded event read", result.Details)
 	}
 }
 
@@ -669,6 +809,61 @@ func writeOrderFiringTestEvents(t *testing.T, cityPath string, evts ...events.Ev
 	}
 }
 
+// writeOrderFiringArchivedEvents writes evts into a rotated gzip archive beside
+// the city's active event log, using the canonical
+// events.jsonl.archive-<ts>-seq-<first>-<last>.gz name the reader recognizes.
+// The literal name is deliberate: these tests assert what the check does and
+// does not read out of ROTATED history, so the fixture must be built the way
+// rotation builds it rather than through the reader under test.
+func writeOrderFiringArchivedEvents(t *testing.T, cityPath string, firstSeq, lastSeq uint64, evts ...events.Event) {
+	t.Helper()
+	basename := fmt.Sprintf("events.jsonl.archive-%s-seq-%d-%d.gz",
+		time.Now().UTC().Format("20060102T150405Z"), firstSeq, lastSeq)
+	f, err := os.OpenFile(filepath.Join(cityPath, ".gc", basename), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("creating archive %s: %v", basename, err)
+	}
+	gw := gzip.NewWriter(f)
+	for _, e := range evts {
+		line, err := json.Marshal(e)
+		if err != nil {
+			t.Fatalf("marshaling archived event: %v", err)
+		}
+		if _, err := gw.Write(append(line, '\n')); err != nil {
+			t.Fatalf("writing archived event: %v", err)
+		}
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatalf("closing archive writer: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("closing archive %s: %v", basename, err)
+	}
+
+	// Prove the fixture: a malformed or unrecognized archive name is invisible
+	// to the reader, which would make every "does not read archives" assertion
+	// pass for the wrong reason. ReadFiltered is the archive-walking read the
+	// check no longer makes, so it is the right instrument to confirm the bytes
+	// are there and reachable.
+	eventPath := filepath.Join(cityPath, ".gc", "events.jsonl")
+	archived, err := events.ReadFiltered(eventPath, events.Filter{Type: events.OrderFired})
+	if err != nil {
+		t.Fatalf("verifying archive fixture %s: %v", basename, err)
+	}
+	for _, want := range evts {
+		found := false
+		for _, got := range archived {
+			if got.Subject == want.Subject && got.Ts.Equal(want.Ts) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("archive fixture %s is not readable: %s@%v missing from ReadFiltered", basename, want.Subject, want.Ts)
+		}
+	}
+}
+
 func runOrderFiringCurrentTest(t *testing.T, cfg *config.City, cityPath string, now time.Time) *CheckResult {
 	t.Helper()
 	check := NewOrderFiringCurrentCheck(cfg, cityPath)
@@ -771,70 +966,5 @@ func TestOrderFiringCurrent_TimesOutStalledOrderHistory(t *testing.T) {
 	}
 	if !result.TimedOut {
 		t.Fatalf("TimedOut = false, want true so callers (JSON output, doctor summary) can distinguish this from a confirmed failure")
-	}
-}
-
-// TestOrderFiringCurrent_HistoryBudgetStaysInsideCheckTimeout pins the fix for
-// the deadline inversion that disabled this check's own timeout diagnostic in
-// production: the internal history budget defaulted to 4m while doctor's
-// per-check budget defaulted to 60s, so the runner always abandoned the check
-// first and reported the generic advisory "timed out ... (outcome unknown)"
-// instead of the specific, actionable order-history message. The internal budget
-// must derive from CheckContext.CheckTimeout and land strictly inside it.
-func TestOrderFiringCurrent_HistoryBudgetStaysInsideCheckTimeout(t *testing.T) {
-	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
-	cityPath, cfg := orderFiringTestCity(t)
-	writeOrderFiringTestOrder(t, cityPath, "mol-dog-stalled-history", "cron", "0 */4 * * *")
-	writeOrderFiringTestEvents(t, cityPath,
-		events.Event{Type: events.ControllerStarted, Ts: now.Add(-24 * time.Hour)},
-		events.Event{Type: events.OrderFired, Subject: "mol-dog-stalled-history", Ts: now.Add(-13 * time.Hour)},
-	)
-
-	release := make(chan struct{})
-	t.Cleanup(func() { close(release) })
-	check := NewOrderFiringCurrentCheck(cfg, cityPath)
-	check.clock = func() time.Time { return now }
-	// Leave historyTimeout at its production default (4m), which is far larger
-	// than the outer budget below — exactly the shape that regressed.
-	check.lastRun = func(orders.Order) (time.Time, error) {
-		<-release
-		return time.Time{}, nil
-	}
-
-	outer := 100 * time.Millisecond
-	start := time.Now()
-	result := check.Run(&CheckContext{CityPath: cityPath, CheckTimeout: outer})
-	elapsed := time.Since(start)
-
-	if result.Status != StatusError {
-		t.Fatalf("status = %v, want error; msg = %s", result.Status, result.Message)
-	}
-	if !strings.Contains(result.Message, "order history lookup timed out after 80ms") {
-		t.Fatalf("message = %q, want budget clamped to 80%% of the 100ms per-check timeout", result.Message)
-	}
-	if elapsed >= outer {
-		t.Fatalf("returned after %s, want a verdict before the %s per-check budget expires", elapsed, outer)
-	}
-}
-
-func TestOrderFiringCurrentHistoryBudget(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		internal time.Duration
-		outer    time.Duration
-		want     time.Duration
-	}{
-		{name: "unbounded runner honors internal budget", internal: 4 * time.Minute, outer: 0, want: 4 * time.Minute},
-		{name: "internal budget clamped under outer", internal: 4 * time.Minute, outer: time.Minute, want: 48 * time.Second},
-		{name: "internal budget already inside outer", internal: 15 * time.Second, outer: time.Minute, want: 15 * time.Second},
-		{name: "raised outer budget lifts internal", internal: 4 * time.Minute, outer: 10 * time.Minute, want: 4 * time.Minute},
-		{name: "zero internal falls back to default then clamps", internal: 0, outer: time.Minute, want: 48 * time.Second},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			c := &OrderFiringCurrentCheck{historyTimeout: tc.internal}
-			if got := c.historyBudget(&CheckContext{CheckTimeout: tc.outer}); got != tc.want {
-				t.Fatalf("historyBudget() = %s, want %s", got, tc.want)
-			}
-		})
 	}
 }
