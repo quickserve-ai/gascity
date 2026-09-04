@@ -175,6 +175,11 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 		result.Message = fmt.Sprintf("read controller start events: %v", err)
 		return result
 	}
+	// No controller start in the active log or any retained archive, while
+	// the active log holds firings, means the controller runs but started
+	// before every retained log — not that it never ran. See
+	// classifyOrderFiring for why the two must not classify alike.
+	startPredatesRetainedLogs := startedAt.IsZero() && len(firedEvents) > 0
 
 	now := c.clock()
 	if now.IsZero() {
@@ -223,7 +228,7 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 			blockingErrors++
 			continue
 		}
-		status, severity, detail := classifyOrderFiring(order, now, expected, lastFired, startedAt)
+		status, severity, detail := classifyOrderFiring(order, now, expected, lastFired, startedAt, startPredatesRetainedLogs)
 		worst = worseStatus(worst, status)
 		result.Details = append(result.Details, detail)
 		if status != StatusOK {
@@ -697,11 +702,28 @@ func latestOrderFiredAt(evts []events.Event, subject string) time.Time {
 	return latest
 }
 
-func classifyOrderFiring(order orders.Order, now time.Time, expected time.Duration, lastFired, controllerStarted time.Time) (CheckStatus, CheckSeverity, string) {
+func classifyOrderFiring(order orders.Order, now time.Time, expected time.Duration, lastFired, controllerStarted time.Time, startPredatesRetainedLogs bool) (CheckStatus, CheckSeverity, string) {
 	name := orderDisplayName(order)
 	if lastFired.IsZero() {
 		if controllerStarted.IsZero() {
-			return StatusOK, SeverityBlocking, fmt.Sprintf("%s: never fired (controller start unknown)", name)
+			// Two very different situations produce a zero start. With no
+			// firings either, the controller may simply never have run —
+			// controller-down is its own finding, and one alarm per order
+			// would only restate it. With firings present, the controller is
+			// running and started before every retained log, longer ago than
+			// any first-cycle grace could cover. Reporting OK there is the
+			// silent-green path: a never-fired order on a long-running
+			// controller is exactly the scheduler blindness this check exists
+			// to catch (ga-22tvtm).
+			if !startPredatesRetainedLogs {
+				return StatusOK, SeverityBlocking, fmt.Sprintf("%s: never fired (controller start unknown)", name)
+			}
+			// Cron stays advisory for the same cron-scheduler reason as the
+			// known-uptime path below (ga-97qngx); cooldown stays blocking.
+			if order.Trigger == "cron" {
+				return StatusError, SeverityAdvisory, fmt.Sprintf("%s: never fired; controller start predates the active event log and every retained archive (no first-cycle grace)", name)
+			}
+			return StatusError, SeverityBlocking, fmt.Sprintf("%s: never fired; controller start predates the active event log and every retained archive (no first-cycle grace)", name)
 		}
 		uptime := nonNegativeDuration(now.Sub(controllerStarted))
 		if uptime >= expected+expected/2 {
@@ -743,9 +765,8 @@ func orderHistoryHintTarget(order orders.Order) string {
 }
 
 func worseStatus(a, b CheckStatus) CheckStatus {
-	// Delegates to WorseOf: CheckStatus const order is NOT severity order
-	// (StatusSkipped is declared last but ranks lowest), so a raw `b > a`
-	// here would let a not-assessed result mask a real error.
+	// Delegates to WorseOf, whose explicit ranking keeps a not-assessed
+	// result from ever masking a real finding (ga-51iq0s).
 	return WorseOf(a, b)
 }
 
