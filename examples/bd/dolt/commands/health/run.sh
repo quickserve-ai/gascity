@@ -464,6 +464,7 @@ offsite_backup_declared="$(read_offsite_backup_declared_path)"
 offsite_backup_checked="$(read_offsite_backup_checked_epoch)"
 offsite_backup_epoch="$(read_offsite_backup_sync_epoch)"
 offsite_backup_stamp_path="$(read_offsite_backup_stamp_path)"
+offsite_backup_outcome="$(read_offsite_backup_last_outcome)"
 
 # ORDER MATTERS HERE, and getting it wrong is how a fail-closed plane fails open.
 # Read the DECLARED INTENT first and only then consult the stamp. Consulting the
@@ -486,9 +487,25 @@ elif [ -z "$offsite_backup_declared" ]; then
 elif [ -z "$offsite_backup_epoch" ]; then
   offsite_backup_state="unknown"
   offsite_backup_note="off-box target $offsite_backup_declared is declared; no completed copy on record"
-elif [ -n "$offsite_backup_stamp_path" ] && [ "$offsite_backup_stamp_path" != "$offsite_backup_declared" ]; then
+elif [ "$offsite_backup_stamp_path" != "$offsite_backup_declared" ]; then
+  # NOTE THE ABSENT -n TEST. Requiring the stamp path to be NON-EMPTY before
+  # comparing it let an old-format stamp — one carrying only synced_at_epoch —
+  # skip the comparison entirely and be read as a copy to whatever target is
+  # declared now. A stamp that does not say where it copied to is not evidence
+  # about this target.
   offsite_backup_state="unknown"
-  offsite_backup_note="last completed copy went to $offsite_backup_stamp_path but the declared target is now $offsite_backup_declared"
+  if [ -z "$offsite_backup_stamp_path" ]; then
+    offsite_backup_note="freshness stamp does not record which target it copied to, so it is not evidence about $offsite_backup_declared"
+  else
+    offsite_backup_note="last completed copy went to $offsite_backup_stamp_path but the declared target is now $offsite_backup_declared"
+  fi
+elif [ -n "$offsite_backup_outcome" ] && [ "$offsite_backup_outcome" != "ok" ]; then
+  # The run that owns this leg reported a NON-OK outcome. A matching fresh stamp
+  # alongside it means the stamp SHOULD have been invalidated and was not — a
+  # read-only state dir, a permission error. Believe the outcome, not the file
+  # the failure path was supposed to remove.
+  offsite_backup_state="unknown"
+  offsite_backup_note="the last run reported outcome=$offsite_backup_outcome, so the freshness stamp beside it cannot be trusted"
 else
   offsite_backup_age_sec=$((bf_now - offsite_backup_epoch))
   if [ "$offsite_backup_age_sec" -lt 0 ]; then

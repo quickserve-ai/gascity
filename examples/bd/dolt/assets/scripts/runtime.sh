@@ -143,15 +143,22 @@ OFFSITE_BACKUP_FRESHNESS_FILE="$PACK_STATE_DIR/offsite-backup-freshness"
 # Best-effort in exactly the sense the local writer is: a stamp failure must
 # never fail an otherwise successful copy. tmp+mv keeps a concurrent health read
 # from seeing a torn file.
+# Returns non-zero when the stamp could NOT be written. The write stays
+# best-effort in the sense that it must not fail an otherwise good copy — but it
+# must not be SILENT either: if ENOSPC or a permission error eats the stamp, the
+# run would report `offsite: ok` while every reader is left with no evidence a
+# copy happened, which is this bead's own failure mode wearing a different hat.
+# The caller reports the discrepancy; it does not escalate it.
 write_offsite_backup_sync_stamp() {
   obs_path="${1:-}"
-  mkdir -p "$(dirname "$OFFSITE_BACKUP_FRESHNESS_FILE")" 2>/dev/null || return 0
+  mkdir -p "$(dirname "$OFFSITE_BACKUP_FRESHNESS_FILE")" 2>/dev/null || return 1
   {
     printf 'synced_at_epoch=%s\n' "$(date +%s)"
     printf 'offsite_path=%s\n' "$obs_path"
     printf 'artifact_dir=%s\n' "${2:-}"
-  } > "$OFFSITE_BACKUP_FRESHNESS_FILE.tmp" 2>/dev/null || { rm -f "$OFFSITE_BACKUP_FRESHNESS_FILE.tmp" 2>/dev/null; return 0; }
-  mv -f "$OFFSITE_BACKUP_FRESHNESS_FILE.tmp" "$OFFSITE_BACKUP_FRESHNESS_FILE" 2>/dev/null || return 0
+  } > "$OFFSITE_BACKUP_FRESHNESS_FILE.tmp" 2>/dev/null || { rm -f "$OFFSITE_BACKUP_FRESHNESS_FILE.tmp" 2>/dev/null; return 1; }
+  mv -f "$OFFSITE_BACKUP_FRESHNESS_FILE.tmp" "$OFFSITE_BACKUP_FRESHNESS_FILE" 2>/dev/null || return 1
+  return 0
 }
 
 # read_offsite_backup_sync_epoch — echo the epoch of the last REAL off-box copy,
@@ -159,9 +166,15 @@ write_offsite_backup_sync_stamp() {
 read_offsite_backup_sync_epoch() {
   [ -f "$OFFSITE_BACKUP_FRESHNESS_FILE" ] || return 0
   robs_epoch=$(sed -n 's/^synced_at_epoch=//p' "$OFFSITE_BACKUP_FRESHNESS_FILE" 2>/dev/null | head -1)
+  # Digits alone are not a safe shell integer: a leading zero makes $(( )) parse
+  # it as octal, and `08` is an ARITHMETIC ERROR that aborts health under set -e
+  # — the report then never prints and its consumer reads the empty output as an
+  # unreachable Dolt server. Strip leading zeros and bound the length.
+  robs_epoch=$(printf '%s' "$robs_epoch" | sed -e 's/^0*//' -e 's/[^0-9].*$//')
   case "$robs_epoch" in
     ''|*[!0-9]*) return 0 ;;
   esac
+  [ "${#robs_epoch}" -le 12 ] || return 0
   printf '%s' "$robs_epoch"
 }
 
@@ -198,7 +211,16 @@ offsite_waiver_reason() {
     # the very remedy this mechanism tells operators to declare.
     # Escaping at emit time as well (json_escape_string) is belt and braces; this
     # is the belt.
-    printf '%s' "$owr_line" | tr -d '\000-\037' | tr '"\\' "''"
+    # Reduce to PRINTABLE ASCII and cap the length. Byte-oriented deletion of
+    # \000-\037 alone left DEL (\177) intact and could split a multibyte
+    # character into invalid UTF-8, which then reaches a JSON document that a
+    # 30-second patrol parses. A waiver reason is a short operator sentence;
+    # there is nothing it needs outside printable ASCII, and an unbounded line
+    # would otherwise be echoed into every health report.
+    printf '%s' "$owr_line" \
+      | LC_ALL=C tr -cd '\040-\176' \
+      | LC_ALL=C tr '"\\' "''" \
+      | cut -c1-500
     return 0
   done < "$owr_file"
   return 0
@@ -208,9 +230,14 @@ offsite_waiver_reason() {
 # Escapes backslash and double quote and drops control characters. Used by any
 # pack script that interpolates operator-supplied text into a JSON report.
 json_escape_string() {
+  # LC_ALL=C keeps tr byte-oriented and keeps sed from rejecting or re-encoding
+  # a byte sequence that is not valid in the ambient locale — on BSD sed that
+  # rejection is an error, and health runs under `set -e`, so an unescapable
+  # byte would abort the report entirely and its consumer would read the empty
+  # output as "the Dolt server is unreachable".
   printf '%s' "${1:-}" \
-    | tr -d '\000-\037' \
-    | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+    | LC_ALL=C tr -cd '\040-\176' \
+    | LC_ALL=C sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }
 
 # --- The offsite DECLARATION record ------------------------------------------
@@ -250,10 +277,17 @@ read_offsite_backup_declared_path() {
 read_offsite_backup_checked_epoch() {
   [ -f "$OFFSITE_BACKUP_DECLARATION_FILE" ] || return 0
   robc_epoch=$(sed -n 's/^checked_at_epoch=//p' "$OFFSITE_BACKUP_DECLARATION_FILE" 2>/dev/null | head -1)
+  robc_epoch=$(printf '%s' "$robc_epoch" | sed -e 's/^0*//' -e 's/[^0-9].*$//')
   case "$robc_epoch" in
     ''|*[!0-9]*) return 0 ;;
   esac
+  [ "${#robc_epoch}" -le 12 ] || return 0
   printf '%s' "$robc_epoch"
+}
+
+read_offsite_backup_last_outcome() {
+  [ -f "$OFFSITE_BACKUP_DECLARATION_FILE" ] || return 0
+  sed -n 's/^last_outcome=//p' "$OFFSITE_BACKUP_DECLARATION_FILE" 2>/dev/null | head -1
 }
 
 # read_offsite_backup_stamp_path — the path the last REAL copy went to. Health
@@ -282,25 +316,75 @@ clear_offsite_backup_sync_stamp() {
 # copies. Nothing verified that: `rsync -a --delete X/ X/` exits 0, so pointing
 # the target at a sibling directory on the same 93%-full volume produced a
 # stamped, "ok" off-box plane that was not off anything.
+#
+# A TARGET THAT DOES NOT EXIST YET IS THE COMMON CASE — the operator names a
+# directory and expects rsync to create it. Comparing only paths that already
+# exist made the guard fail OPEN for exactly that case: the target was skipped,
+# rsync created it on the same disk, and the copy was stamped as off-box. So each
+# side resolves to its nearest EXISTING ancestor, which is the filesystem the
+# path will land on. A device that cannot be read at all returns "cannot tell",
+# and the caller must treat that as unverified rather than as different.
+nearest_existing_dir() {
+  ned_path="${1:-}"
+  [ -n "$ned_path" ] || return 1
+  while [ ! -e "$ned_path" ]; do
+    case "$ned_path" in
+      */*) ned_path="${ned_path%/*}"; [ -n "$ned_path" ] || ned_path="/" ;;
+      *) ned_path="."; break ;;
+    esac
+  done
+  printf '%s' "$ned_path"
+}
+
+path_device_id() {
+  pdi_path="$(nearest_existing_dir "${1:-}")" || return 1
+  [ -n "$pdi_path" ] || return 1
+  pdi_dev=$(stat -f '%d' "$pdi_path" 2>/dev/null || stat -c '%d' "$pdi_path" 2>/dev/null || printf '')
+  [ -n "$pdi_dev" ] || return 1
+  printf '%s' "$pdi_dev"
+}
+
 paths_on_same_volume() {
   posv_a="${1:-}"
   posv_b="${2:-}"
   [ -n "$posv_a" ] && [ -n "$posv_b" ] || return 1
-  [ -e "$posv_a" ] && [ -e "$posv_b" ] || return 1
-  posv_da=$(stat -f '%d' "$posv_a" 2>/dev/null || stat -c '%d' "$posv_a" 2>/dev/null || printf '')
-  posv_db=$(stat -f '%d' "$posv_b" 2>/dev/null || stat -c '%d' "$posv_b" 2>/dev/null || printf '')
-  [ -n "$posv_da" ] && [ -n "$posv_db" ] || return 1
+  posv_da=$(path_device_id "$posv_a") || return 1
+  posv_db=$(path_device_id "$posv_b") || return 1
   [ "$posv_da" = "$posv_db" ]
+}
+
+# offsite_target_volume_is_unverifiable <target> <artifact_dir> — 0 when we could
+# not establish which volume the target lands on. "Cannot tell" is not "off-box".
+offsite_target_volume_is_unverifiable() {
+  path_device_id "${1:-}" >/dev/null 2>&1 || return 0
+  path_device_id "${2:-}" >/dev/null 2>&1 || return 0
+  return 1
 }
 
 # offsite_target_is_remote <path> — 0 when the target is an rsync REMOTE spec
 # (user@host:/path or host:/path), where a local device comparison is
 # meaningless and must not be attempted.
+# This deliberately mirrors RSYNC'S OWN rule rather than inventing a stricter
+# one: rsync treats anything with a colon before the first slash as host:path, so
+# `C:\backup` and `backup:2026` are remote specs to rsync too and will simply
+# fail to connect. Classifying them any other way here would make this function
+# disagree with the tool it is describing, which is a worse defect than the one
+# it would prevent. The consequence — such a target skips the local device
+# comparison — is contained because it also never receives a copy, and a copy
+# that did not happen cannot be stamped.
 offsite_target_is_remote() {
   otir_path="${1:-}"
   case "$otir_path" in
     rsync://*|*::*) return 0 ;;
     /*) return 1 ;;
+  esac
+  # rsync's actual rule is a colon BEFORE THE FIRST SLASH, so the test has to be
+  # on that prefix and not on the whole string. Testing the whole string called
+  # `host:/path` local (it contains a slash) and `dir/with:colon` remote — both
+  # backwards, and the first one silently disabled the same-volume guard's
+  # counterpart, the remote skip.
+  otir_head="${otir_path%%/*}"
+  case "$otir_head" in
     *:*) return 0 ;;
     *) return 1 ;;
   esac

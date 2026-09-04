@@ -3706,7 +3706,14 @@ func TestBackupScriptDiscoversNamedBackupsAndSyncsArtifactsOffsite(t *testing.T)
 	doltLogPath := writeBackupFakeDolt(t, binDir, "2.1.0", 0, "prod")
 	rsyncLogPath := writeBackupFakeRsync(t, binDir)
 
-	out := runDogScript(t, "mol-dog-backup.sh", binDir, cityPath, dataDir, "GC_BACKUP_OFFSITE_PATH="+offsiteDir)
+	// Remote-shaped target (ga-l9smko): an off-box copy must land on a different
+	// VOLUME, and this test's temp dir shares one with the artifact dir it copies
+	// from, so a bare local path is now correctly refused as same-volume. The
+	// remote form is the realistic production shape and is the branch where a
+	// local device comparison is meaningless. The stub rsync ignores the host
+	// part; the refusal itself is covered by
+	// TestBackupRefusesAnOffsiteTargetOnTheSameVolume.
+	out := runDogScript(t, "mol-dog-backup.sh", binDir, cityPath, dataDir, "GC_BACKUP_OFFSITE_PATH=offsitehost:"+offsiteDir)
 	if !strings.Contains(out, "synced: 1/1") || !strings.Contains(out, "offsite: ok") {
 		t.Fatalf("unexpected backup summary:\n%s", out)
 	}

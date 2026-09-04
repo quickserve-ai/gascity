@@ -284,15 +284,19 @@ func TestBackupStampsAndDatesARealOffsiteCopy(t *testing.T) {
 		t.Fatalf("stamp must name the path it copied to; got:\n%s", stamp)
 	}
 
-	// Cross-run persistence: age the stamp on disk so a "never" here can only
-	// come from the SECOND run reading what the FIRST one wrote, not from the
-	// second run's own write. (Backdating also makes the assertion meaningful —
-	// a same-second stamp would read "0s ago" either way.)
+	// CROSS-RUN PERSISTENCE. Backdating and then running WITH the target again
+	// proved nothing: that run copies successfully and overwrites the stamp
+	// before the age is read, so it passes against an implementation that only
+	// ever reads its own write. The second run here is UNCONFIGURED — it neither
+	// writes nor clears a stamp — so the age it prints can only have come from
+	// the file the first run left behind.
 	writeOffsiteStamp(t, cityPath, offsiteTarget, time.Now().Add(-2*time.Hour))
-	out = runDogScript(t, "mol-dog-backup.sh", binDir, cityPath, dataDir,
-		"GC_BACKUP_OFFSITE_PATH="+offsiteTarget)
+	out = runDogScript(t, "mol-dog-backup.sh", binDir, cityPath, dataDir)
 	if strings.Contains(out, "last off-box copy: never") {
-		t.Fatalf("after a real copy the age must not read never; got:\n%s", out)
+		t.Fatalf("a later run must read the stamp a previous run wrote; got:\n%s", out)
+	}
+	if !strings.Contains(out, "last off-box copy: 7") {
+		t.Fatalf("the age must be the backdated ~7200s, i.e. read from disk; got:\n%s", out)
 	}
 }
 
@@ -669,5 +673,119 @@ func TestBackupPublishesTheDeclarationEveryRun(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "last_outcome=failed") {
 		t.Fatalf("declaration must carry the outcome; got:\n%s", body)
+	}
+}
+
+// --- regression guards for the cross-family review round ----------------------
+
+// TestHealthOffsiteStampWithoutATargetFieldIsNotOk — requiring the stamp path to
+// be NON-EMPTY before comparing it let a stamp that records only a timestamp
+// skip the comparison and be read as a copy to whatever target is declared now.
+// A stamp that does not say where it went is not evidence about anywhere.
+func TestHealthOffsiteStampWithoutATargetFieldIsNotOk(t *testing.T) {
+	cityPath := t.TempDir()
+	writeDeclaration(t, cityPath, "/mnt/off", "ok", time.Now())
+	stamp := offsiteStampPath(cityPath)
+	if err := os.MkdirAll(filepath.Dir(stamp), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	body := "synced_at_epoch=" + strconv.FormatInt(time.Now().Add(-5*time.Minute).Unix(), 10) + "\n"
+	if err := os.WriteFile(stamp, []byte(body), 0o644); err != nil {
+		t.Fatalf("write stamp: %v", err)
+	}
+	report := runHealthForOffsite(t, cityPath)
+	if report.Backups.Offsite.State != "unknown" || !report.Backups.Offsite.Stale {
+		t.Fatalf("state = %q stale = %v, want unknown/true for a stamp with no target field",
+			report.Backups.Offsite.State, report.Backups.Offsite.Stale)
+	}
+}
+
+// TestHealthOffsiteNonOkOutcomeOverridesAFreshStamp — the failure path removes
+// the stamp, but that removal can itself fail (read-only state dir, permissions,
+// I/O error). The run's own reported outcome is the stronger evidence; believe
+// it over a file the failure path was supposed to have deleted.
+func TestHealthOffsiteNonOkOutcomeOverridesAFreshStamp(t *testing.T) {
+	cityPath := t.TempDir()
+	writeDeclaration(t, cityPath, "/mnt/off", "failed", time.Now())
+	writeOffsiteStamp(t, cityPath, "/mnt/off", time.Now().Add(-1*time.Minute))
+	report := runHealthForOffsite(t, cityPath)
+	if report.Backups.Offsite.State != "unknown" || !report.Backups.Offsite.Stale {
+		t.Fatalf("state = %q stale = %v, want unknown/true when the last run reported failure",
+			report.Backups.Offsite.State, report.Backups.Offsite.Stale)
+	}
+}
+
+// TestHealthOffsiteSurvivesAnOctalLookingEpoch — digits alone are not a safe
+// shell integer. `08` inside $(( )) is an ARITHMETIC ERROR, and health runs under
+// set -e, so it would abort before printing anything — and its consumer reads an
+// empty report as "the Dolt server is unreachable". The report must still be
+// valid JSON.
+func TestHealthOffsiteSurvivesAnOctalLookingEpoch(t *testing.T) {
+	cityPath := t.TempDir()
+	writeDeclaration(t, cityPath, "/mnt/off", "ok", time.Now())
+	stamp := offsiteStampPath(cityPath)
+	if err := os.MkdirAll(filepath.Dir(stamp), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(stamp, []byte("synced_at_epoch=08\noffsite_path=/mnt/off\n"), 0o644); err != nil {
+		t.Fatalf("write stamp: %v", err)
+	}
+	// runHealthForOffsite fails the test if the script errors or emits invalid
+	// JSON, which is the whole assertion here.
+	report := runHealthForOffsite(t, cityPath)
+	if !report.Backups.Offsite.Stale {
+		t.Fatalf("an epoch from 1970 must never read fresh; state = %q", report.Backups.Offsite.State)
+	}
+}
+
+// TestBackupRefusesASameVolumeTargetThatDoesNotExistYet — naming a directory and
+// letting rsync create it is the COMMON case, and comparing only paths that
+// already exist made the guard fail open for exactly it: the check was skipped,
+// rsync created the directory on the same disk, and the copy was stamped as
+// off-box.
+func TestBackupRefusesASameVolumeTargetThatDoesNotExistYet(t *testing.T) {
+	cityPath, dataDir, _, binDir := seedBackupCity(t)
+	writeCopyingRsync(t, binDir)
+	notYetThere := filepath.Join(cityPath, "does", "not", "exist", "yet")
+
+	out, err := runDogScriptCommand(t, "mol-dog-backup.sh", binDir, cityPath, dataDir,
+		"GC_BACKUP_OFFSITE_PATH="+notYetThere)
+	if err == nil {
+		t.Fatalf("a not-yet-created target on the same volume must still be refused; got exit 0:\n%s", out)
+	}
+	if !strings.Contains(out, "same-volume") {
+		t.Fatalf("the refusal must name why; got:\n%s", out)
+	}
+	if _, err := os.Stat(offsiteStampPath(cityPath)); !os.IsNotExist(err) {
+		t.Fatalf("a refused target must never stamp (stat err = %v)", err)
+	}
+}
+
+// TestBackupPublishesTheDeclarationBeforeTheCopyAttempt — the copy can run for
+// the better part of an hour and the process can be killed inside it. Publishing
+// the binding only at the end left health reading the PREVIOUS target — and,
+// with a matching stamp, calling it ok — for that whole window. Here the run is
+// killed by a refusal before any copy, and the declaration must already name the
+// new target.
+func TestBackupPublishesTheDeclarationBeforeTheCopyAttempt(t *testing.T) {
+	cityPath, dataDir, _, binDir := seedBackupCity(t)
+	writeCopyingRsync(t, binDir)
+	// A previous run's binding to an older target.
+	writeDeclaration(t, cityPath, "offsitehost:/mnt/old", "ok", time.Now().Add(-6*time.Hour))
+	sameVolume := filepath.Join(cityPath, "not-really-offsite")
+
+	if _, err := runDogScriptCommand(t, "mol-dog-backup.sh", binDir, cityPath, dataDir,
+		"GC_BACKUP_OFFSITE_PATH="+sameVolume); err == nil {
+		t.Fatalf("expected the same-volume refusal to fail the run")
+	}
+	body, err := os.ReadFile(filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "offsite-backup-declaration"))
+	if err != nil {
+		t.Fatalf("read declaration: %v", err)
+	}
+	if strings.Contains(string(body), "/mnt/old") {
+		t.Fatalf("the declaration must not still name the previous target:\n%s", body)
+	}
+	if !strings.Contains(string(body), "declared_path="+sameVolume) {
+		t.Fatalf("the declaration must name the target this run was given:\n%s", body)
 	}
 }

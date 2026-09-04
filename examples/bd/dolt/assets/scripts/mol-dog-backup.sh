@@ -549,6 +549,13 @@ OFFSITE_STATUS="unconfigured — NO OFF-BOX COPY"
 OFFSITE_FATAL=0
 OFFSITE_DETAIL=""
 
+# PUBLISH THE BINDING BEFORE THE WORK, not only after it. The copy can take the
+# better part of an hour and the process can be killed inside it; publishing only
+# at the end left health reading the PREVIOUS target's declaration — and, with a
+# matching stamp, calling it ok — for the whole window, and indefinitely if the
+# run never reached the end. Written again below with the outcome.
+write_offsite_backup_declaration "$OFFSITE_PATH" "in-progress"
+
 if [ -n "$OFFSITE_PATH" ]; then
     if [ ! -d "$BACKUP_ARTIFACT_DIR" ]; then
         OFFSITE_STATUS="missing-artifacts"
@@ -558,6 +565,13 @@ if [ -n "$OFFSITE_PATH" ]; then
         OFFSITE_STATUS="invalid-source"
         OFFSITE_FATAL=1
         OFFSITE_DETAIL="artifact dir resolves to the live data dir ($DOLT_DATA_DIR); refusing to rsync live data off-box"
+    elif ! offsite_target_is_remote "$OFFSITE_PATH" \
+         && offsite_target_volume_is_unverifiable "$OFFSITE_PATH" "$BACKUP_ARTIFACT_DIR"; then
+        # "Cannot tell which volume this lands on" is not "a different volume".
+        # A guard that cannot measure must abstain loudly rather than pass.
+        OFFSITE_STATUS="volume-unverifiable"
+        OFFSITE_FATAL=1
+        OFFSITE_DETAIL="could not determine which volume $OFFSITE_PATH lands on (stat unavailable or path unresolvable), so its off-box claim is unverified"
     elif ! offsite_target_is_remote "$OFFSITE_PATH" \
          && paths_on_same_volume "$OFFSITE_PATH" "$BACKUP_ARTIFACT_DIR"; then
         # THE PREMISE, ENFORCED. "Off-box" is the entire claim this plane makes,
@@ -570,7 +584,13 @@ if [ -n "$OFFSITE_PATH" ]; then
         OFFSITE_DETAIL="offsite target $OFFSITE_PATH is on the SAME VOLUME as $BACKUP_ARTIFACT_DIR; a copy there survives no disk event and is not an off-box copy"
     elif run_bounded "$OFFSITE_TIMEOUT_SECS" rsync -a --delete "$BACKUP_ARTIFACT_DIR/" "$OFFSITE_PATH/" 2>/dev/null; then
         OFFSITE_STATUS="ok"
-        write_offsite_backup_sync_stamp "$OFFSITE_PATH" "$BACKUP_ARTIFACT_DIR"
+        # A stamp that could not be written must not be reported as if it were.
+        # The copy really happened, so this is not a failure of the run — but
+        # every reader is now blind to it, and saying plain "ok" would recreate
+        # the gap between what happened and what the evidence shows.
+        if ! write_offsite_backup_sync_stamp "$OFFSITE_PATH" "$BACKUP_ARTIFACT_DIR"; then
+            OFFSITE_STATUS="ok (FRESHNESS STAMP NOT WRITTEN — readers stay blind)"
+        fi
     else
         OFFSITE_STATUS="failed"
         OFFSITE_FATAL=1
