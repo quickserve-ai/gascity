@@ -145,10 +145,7 @@ func TestResolveProviderAgentProvider(t *testing.T) {
 		t.Errorf("CommandString() = %q, want %q", cs, "claude")
 	}
 	defaultArgs := rp.ResolveDefaultArgs()
-	// claude-family agents also carry --name <qualified identity> so the
-	// harness /resume picker and peer listing identify the owning seat
-	// (ga-n0rvsk).
-	wantArgs := []string{"--dangerously-skip-permissions", "--effort", "max", "--name", "mayor"}
+	wantArgs := []string{"--dangerously-skip-permissions", "--effort", "max"}
 	if len(defaultArgs) != len(wantArgs) {
 		t.Errorf("ResolveDefaultArgs() = %v, want %v", defaultArgs, wantArgs)
 	} else {

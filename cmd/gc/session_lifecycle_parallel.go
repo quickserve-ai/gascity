@@ -953,16 +953,6 @@ func buildPreparedStartWithWorkDirResolver(
 	sessionOverrides := parseSessionTemplateOverridesForLaunch(candidate.info)
 	applySchemaOptionOverridesForLaunch(&agentCfg, &tp, candidate.info.ID, sessionOverrides)
 
-	// Pool siblings resolve from one shared base template, so the base
-	// injection in config.ResolveProvider stamps every instance with the
-	// SAME name (the base qualified identity). Overlay the per-instance
-	// identity here so each pool session's --name (and thus its /resume row
-	// and peer-listing address) is unique (ga-n0rvsk). The choice is ensured
-	// on a duplicated resolved provider BEFORE the overlay resolves it, or
-	// the select-only validation would reject the fresh value and error-bail
-	// the whole overlay (dropping model/effort with it).
-	applySessionNameForInstance(&agentCfg, &tp, candidate.info)
-
 	coreHash := runtime.CoreFingerprint(agentCfg)
 	coreBreakdown := runtime.CoreFingerprintBreakdown(agentCfg)
 	liveHash := runtime.LiveFingerprint(agentCfg)
@@ -1211,46 +1201,6 @@ func parseSessionTemplateOverridesForLaunch(info sessionpkg.Info) map[string]str
 		return nil
 	}
 	return overrides
-}
-
-// applySessionNameForInstance overlays the per-instance session display name
-// onto a claude-family pool/instance session. config.ResolveProvider already
-// injected the base template's qualified identity as the "name" option; for a
-// pool this is identical across siblings, so the true per-instance identity
-// (the bead's agent_name, else the resolved InstanceName) must replace it.
-// No-op when the identity already matches the base value, for non-claude
-// families, or for escape-hatch sessions whose OptionsSchema was cleared.
-func applySessionNameForInstance(agentCfg *runtime.Config, tp *TemplateParams, info sessionpkg.Info) {
-	if agentCfg == nil || tp == nil {
-		return
-	}
-	resolved := tp.ResolvedProvider
-	if resolved == nil || len(resolved.OptionsSchema) == 0 {
-		return
-	}
-	family := strings.TrimSpace(resolved.BuiltinAncestor)
-	if family == "" {
-		family = strings.TrimSpace(resolved.Name)
-	}
-	if family != "claude" {
-		return
-	}
-	instance := strings.TrimSpace(info.AgentName)
-	if instance == "" {
-		instance = strings.TrimSpace(tp.InstanceName)
-	}
-	if instance == "" {
-		return
-	}
-	if resolved.EffectiveDefaults != nil &&
-		resolved.EffectiveDefaults[config.SessionNameOptionKey] == instance {
-		return
-	}
-	dup := *resolved
-	config.EnsureSessionNameOption(&dup, instance)
-	tp.ResolvedProvider = &dup
-	applySchemaOptionOverridesForLaunch(agentCfg, tp, info.ID,
-		map[string]string{config.SessionNameOptionKey: instance})
 }
 
 func applySchemaOptionOverridesForLaunch(agentCfg *runtime.Config, tp *TemplateParams, sessionID string, overrides map[string]string) {
