@@ -208,6 +208,15 @@ func startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel str
 		if err := writeManagedDoltConfigFile(layout.ConfigFile, host, strconv.Itoa(currentPort), layout.DataDir, logLevel, doltConfig); err != nil {
 			return report, err
 		}
+		// ga-drkbcd: a stop-intent marker vouches for a status-0 exit of the PID
+		// it names. Clearing it here — before any server exists — is what makes
+		// the vouch safe: every surviving marker was written after this spawn,
+		// so it can only ever refer to the server generation about to start,
+		// and a marker abandoned by a crashed stopper can never silence the
+		// next server's unexpected exit.
+		if err := clearManagedDoltStopIntent(layout.ConfigFile); err != nil {
+			managedDoltCleanupLogf("clearing stale stop intent before spawn: %v", err)
+		}
 
 		logOffset, err := managedDoltLogSize(layout.LogFile)
 		if err != nil {
