@@ -1,6 +1,8 @@
 package doctor
 
 import (
+	"compress/gzip"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -205,6 +207,96 @@ func TestOrderFiringCurrent_UsesNewestOrderRunHistory(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(result.Details, "\n"), "last fired 1h ago, expected every 4h") {
 		t.Fatalf("details = %v, want newest order-run bead to win over stale event", result.Details)
+	}
+}
+
+// TestOrderFiringCurrent_ArchivedHistoryDoesNotChangeVerdict is the correctness
+// half of the bounded read (ga-22tvtm): the check folds only the ACTIVE event
+// log, so archived firings must be unable to change the verdict a full walk
+// would have produced. Here the newest firing is in the active log and an older
+// one sits in an archive — the archive loses either way, so the bounded read is
+// verdict-identical while costing nothing to read.
+func TestOrderFiringCurrent_ArchivedHistoryDoesNotChangeVerdict(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrder(t, cityPath, "cleanup-cooldown", "cooldown", "1h")
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.ControllerStarted, Ts: now.Add(-24 * time.Hour)},
+		events.Event{Type: events.OrderFired, Subject: "cleanup-cooldown", Ts: now.Add(-30 * time.Minute)},
+	)
+	writeOrderFiringArchivedEvents(t, cityPath, 1, 8,
+		events.Event{Seq: 1, Type: events.OrderFired, Subject: "cleanup-cooldown", Ts: now.Add(-6 * time.Hour)},
+	)
+
+	result := runOrderFiringCurrentTest(t, cfg, cityPath, now)
+	if result.Status != StatusOK {
+		t.Fatalf("status = %v, want OK; msg = %s; details = %v", result.Status, result.Message, result.Details)
+	}
+	if !strings.Contains(strings.Join(result.Details, "\n"), "last fired 30m ago, expected every 1h") {
+		t.Fatalf("details = %v, want the active log's newest firing to decide the verdict", result.Details)
+	}
+}
+
+// TestOrderFiringCurrent_ArchivedFiringResolvedByOrderRunStore covers the case
+// the bound actually gives up: a firing that has already rotated out of the
+// active log. The order-run store — a per-order LIMIT 1 read that retains at
+// least the most recent closed run per order — is what carries that verdict, so
+// the check still reports "last fired 30m ago" rather than "never fired".
+func TestOrderFiringCurrent_ArchivedFiringResolvedByOrderRunStore(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrder(t, cityPath, "cleanup-cooldown", "cooldown", "1h")
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.ControllerStarted, Ts: now.Add(-24 * time.Hour)},
+	)
+	writeOrderFiringArchivedEvents(t, cityPath, 1, 8,
+		events.Event{Seq: 1, Type: events.OrderFired, Subject: "cleanup-cooldown", Ts: now.Add(-30 * time.Minute)},
+	)
+	store := beads.NewMemStoreFrom(1, []beads.Bead{{
+		ID:        "archived-run",
+		Title:     "order:cleanup-cooldown",
+		Status:    "closed",
+		Type:      "molecule",
+		Labels:    []string{"order-run:cleanup-cooldown"},
+		CreatedAt: now.Add(-30 * time.Minute),
+	}}, nil)
+
+	check := NewOrderFiringCurrentCheck(cfg, cityPath, WithOrderFiringCurrentLastRunFunc(func(order orders.Order) (time.Time, error) {
+		return orders.NewStoreWithGraph(beads.OrdersStore{Store: store}, beads.GraphStore{Store: store}).LastRun(order.ScopedName())
+	}))
+	check.clock = func() time.Time { return now }
+	result := check.Run(&CheckContext{CityPath: cityPath})
+
+	if result.Status != StatusOK {
+		t.Fatalf("status = %v, want OK; msg = %s; details = %v", result.Status, result.Message, result.Details)
+	}
+	if !strings.Contains(strings.Join(result.Details, "\n"), "last fired 30m ago, expected every 1h") {
+		t.Fatalf("details = %v, want the order-run store to carry the archived firing", result.Details)
+	}
+}
+
+// TestOrderFiringCurrent_ArchivedFiringIsNotReadFromEventHistory pins the bound
+// itself, and is the test that would fail if the check went back to walking
+// rotated history. With no order-run store wired, an archived-only firing is
+// simply not seen — the check reports the never-fired verdict. That is the
+// deliberate trade the bound makes (ga-22tvtm): reading those archives cost 62s
+// against a 48s budget, so the alarm could never fire at all. In production the
+// store IS wired (cmd/gc buildDoctorChecks) and carries the verdict; see
+// TestOrderFiringCurrent_ArchivedFiringResolvedByOrderRunStore.
+func TestOrderFiringCurrent_ArchivedFiringIsNotReadFromEventHistory(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrder(t, cityPath, "cleanup-cooldown", "cooldown", "1h")
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.ControllerStarted, Ts: now.Add(-24 * time.Hour)},
+	)
+	writeOrderFiringArchivedEvents(t, cityPath, 1, 8,
+		events.Event{Seq: 1, Type: events.OrderFired, Subject: "cleanup-cooldown", Ts: now.Add(-30 * time.Minute)},
+	)
+
+	result := runOrderFiringCurrentTest(t, cfg, cityPath, now)
+	if !strings.Contains(strings.Join(result.Details, "\n"), "never fired since controller start") {
+		t.Fatalf("details = %v, want the archived firing to be outside the check's bounded event read", result.Details)
 	}
 }
 
@@ -572,6 +664,61 @@ func writeOrderFiringTestEvents(t *testing.T, cityPath string, evts ...events.Ev
 	}
 }
 
+// writeOrderFiringArchivedEvents writes evts into a rotated gzip archive beside
+// the city's active event log, using the canonical
+// events.jsonl.archive-<ts>-seq-<first>-<last>.gz name the reader recognizes.
+// The literal name is deliberate: these tests assert what the check does and
+// does not read out of ROTATED history, so the fixture must be built the way
+// rotation builds it rather than through the reader under test.
+func writeOrderFiringArchivedEvents(t *testing.T, cityPath string, firstSeq, lastSeq uint64, evts ...events.Event) {
+	t.Helper()
+	basename := fmt.Sprintf("events.jsonl.archive-%s-seq-%d-%d.gz",
+		time.Now().UTC().Format("20060102T150405Z"), firstSeq, lastSeq)
+	f, err := os.OpenFile(filepath.Join(cityPath, ".gc", basename), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("creating archive %s: %v", basename, err)
+	}
+	gw := gzip.NewWriter(f)
+	for _, e := range evts {
+		line, err := json.Marshal(e)
+		if err != nil {
+			t.Fatalf("marshaling archived event: %v", err)
+		}
+		if _, err := gw.Write(append(line, '\n')); err != nil {
+			t.Fatalf("writing archived event: %v", err)
+		}
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatalf("closing archive writer: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("closing archive %s: %v", basename, err)
+	}
+
+	// Prove the fixture: a malformed or unrecognized archive name is invisible
+	// to the reader, which would make every "does not read archives" assertion
+	// pass for the wrong reason. ReadFiltered is the archive-walking read the
+	// check no longer makes, so it is the right instrument to confirm the bytes
+	// are there and reachable.
+	eventPath := filepath.Join(cityPath, ".gc", "events.jsonl")
+	archived, err := events.ReadFiltered(eventPath, events.Filter{Type: events.OrderFired})
+	if err != nil {
+		t.Fatalf("verifying archive fixture %s: %v", basename, err)
+	}
+	for _, want := range evts {
+		found := false
+		for _, got := range archived {
+			if got.Subject == want.Subject && got.Ts.Equal(want.Ts) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("archive fixture %s is not readable: %s@%v missing from ReadFiltered", basename, want.Subject, want.Ts)
+		}
+	}
+}
+
 func runOrderFiringCurrentTest(t *testing.T, cfg *config.City, cityPath string, now time.Time) *CheckResult {
 	t.Helper()
 	check := NewOrderFiringCurrentCheck(cfg, cityPath)
@@ -583,8 +730,8 @@ func TestLatestOrderFiredAt_RecentEventSkipsLastRun(t *testing.T) {
 	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
 	expected := 4 * time.Hour
 	order := orders.Order{Name: "cleanup-cooldown", Trigger: "cooldown"}
-	evts := []events.Event{
-		{Type: events.OrderFired, Subject: order.ScopedName(), Ts: now.Add(-1 * time.Hour)},
+	evts := map[events.TypeSubject]events.Event{
+		{Type: events.OrderFired, Subject: order.ScopedName()}: {Type: events.OrderFired, Subject: order.ScopedName(), Ts: now.Add(-1 * time.Hour)},
 	}
 
 	lastRunCalled := false
@@ -614,8 +761,8 @@ func TestLatestOrderFiredAt_StaleEventConsultsLastRun(t *testing.T) {
 	// Event age (13h) exceeds expected*1.5 (6h), so the fast path must not apply.
 	staleEvent := now.Add(-13 * time.Hour)
 	freshRun := now.Add(-1 * time.Hour)
-	evts := []events.Event{
-		{Type: events.OrderFired, Subject: order.ScopedName(), Ts: staleEvent},
+	evts := map[events.TypeSubject]events.Event{
+		{Type: events.OrderFired, Subject: order.ScopedName()}: {Type: events.OrderFired, Subject: order.ScopedName(), Ts: staleEvent},
 	}
 
 	lastRunCalled := false

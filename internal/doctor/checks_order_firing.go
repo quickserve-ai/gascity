@@ -147,19 +147,23 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 		return result
 	}
 
+	// One bounded aggregate pass, not two full-history reads. This check needs
+	// exactly two things from the event log — the newest order.fired per order
+	// and the newest controller.started — and both are folds, so it reads them
+	// as folds over the active log. See latestOrderFiredAt for how firings older
+	// than the active log are resolved (the order-run store, per order), and
+	// events.LatestPerSubjectInActiveLog for why the archives are excluded.
 	eventPath := filepath.Join(cityPath, citylayout.RuntimeRoot, "events.jsonl")
-	firedEvents, err := events.ReadFiltered(eventPath, events.Filter{Type: events.OrderFired})
+	katyaT0 := time.Now()
+	latestEvents, err := events.LatestPerSubjectInActiveLog(eventPath, events.OrderFired, events.ControllerStarted)
+	log.Printf("KATYA LatestPerSubjectInActiveLog: %v (%d pairs)", time.Since(katyaT0), len(latestEvents))
+	defer func() { log.Printf("KATYA whole check run(): %v", time.Since(katyaT0)) }()
 	if err != nil {
 		result.Status = StatusError
 		result.Message = fmt.Sprintf("read order firing events: %v", err)
 		return result
 	}
-	startedAt, err := latestControllerStartedAt(eventPath)
-	if err != nil {
-		result.Status = StatusError
-		result.Message = fmt.Sprintf("read controller start events: %v", err)
-		return result
-	}
+	startedAt := events.LatestTsForType(latestEvents, events.ControllerStarted)
 
 	now := c.clock()
 	if now.IsZero() {
@@ -192,7 +196,7 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 			blockingErrors++
 			continue
 		}
-		lastFired, err := c.latestOrderFiredAt(firedEvents, order, expected, now)
+		lastFired, err := c.latestOrderFiredAt(latestEvents, order, expected, now)
 		if err != nil {
 			worst = worseStatus(worst, StatusError)
 			result.Details = append(result.Details, fmt.Sprintf("%s: cannot read order history: %v", orderDisplayName(order), err))
@@ -576,22 +580,20 @@ func cronRangeForDoctor(rangePart string, lowerBound, upperBound int) (int, int,
 	}
 }
 
-func latestControllerStartedAt(eventPath string) (time.Time, error) {
-	startEvents, err := events.ReadFiltered(eventPath, events.Filter{Type: events.ControllerStarted})
-	if err != nil {
-		return time.Time{}, err
-	}
-	var latest time.Time
-	for _, event := range startEvents {
-		if event.Ts.After(latest) {
-			latest = event.Ts
-		}
-	}
-	return latest, nil
-}
-
-func (c *OrderFiringCurrentCheck) latestOrderFiredAt(evts []events.Event, order orders.Order, expected time.Duration, now time.Time) (time.Time, error) {
-	latest := latestOrderFiredAt(evts, order.ScopedName())
+// latestOrderFiredAt resolves the order's newest firing from the two sources
+// this check composes, cheapest first.
+//
+// The event fold is the fast path and answers for anything that fired inside
+// the active log. Anything older falls through to the order-run store, whose
+// read is a per-order LIMIT 1 on the order-run:<scoped> label — O(orders), not
+// O(history) — and which retains at least the most recent closed run per order
+// permanently (the retention prune's hardcoded recent-history floor). That is
+// why the fold above can stop at the active log without losing an order's last
+// firing: for anything the log no longer covers, the store is the authority,
+// and it is the cheaper of the two reads anyway (measured: ~0.7s for every
+// monitored order, against 62s for the event history it replaces — ga-22tvtm).
+func (c *OrderFiringCurrentCheck) latestOrderFiredAt(latestEvents map[events.TypeSubject]events.Event, order orders.Order, expected time.Duration, now time.Time) (time.Time, error) {
+	latest := latestOrderFiredAt(latestEvents, order.ScopedName())
 	if c.lastRun == nil {
 		return latest, nil
 	}
@@ -608,17 +610,8 @@ func (c *OrderFiringCurrentCheck) latestOrderFiredAt(evts []events.Event, order 
 	return latest, nil
 }
 
-func latestOrderFiredAt(evts []events.Event, subject string) time.Time {
-	var latest time.Time
-	for _, event := range evts {
-		if event.Subject != subject {
-			continue
-		}
-		if event.Ts.After(latest) {
-			latest = event.Ts
-		}
-	}
-	return latest
+func latestOrderFiredAt(latestEvents map[events.TypeSubject]events.Event, subject string) time.Time {
+	return latestEvents[events.TypeSubject{Type: events.OrderFired, Subject: subject}].Ts
 }
 
 func classifyOrderFiring(order orders.Order, now time.Time, expected time.Duration, lastFired, controllerStarted time.Time) (CheckStatus, CheckSeverity, string) {
