@@ -244,6 +244,8 @@ func TestSweepStaleIsolatedSupervisorServicesMissingDirIsNoop(t *testing.T) {
 }
 
 func TestInstallSupervisorLaunchdSweepsStaleSiblings(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
 	homeDir := t.TempDir()
 	gcHome := filepath.Join(t.TempDir(), "isolated-home")
 	t.Setenv("HOME", homeDir)
