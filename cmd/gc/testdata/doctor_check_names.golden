@@ -73,6 +73,7 @@ dolt-noms-size
 dolt-journal-size
 dolt-config
 dolt-version
+city:dolt-local-only-remote
 events-log
 events-log-size
 bd-backup-size

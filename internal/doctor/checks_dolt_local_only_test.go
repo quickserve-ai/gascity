@@ -521,3 +521,95 @@ func TestDoltLocalOnlyRemoteCheck_DBNameFromMetadata(t *testing.T) {
 			r.Status, r.Message)
 	}
 }
+
+// --- City-store scope (ga-51iq0s item b) ---------------------------------
+//
+// hq — the city's own beads database — is NOT a rig, so for as long as this
+// check was registered only inside cmd_doctor's per-rig loop it had no
+// registration that could ever inspect the one database that actually carried
+// an off-box remote (ga-cc4wzn, 22h green). These cover the city variant.
+
+// TestCityDoltLocalOnlyRemoteCheck_NameIsNotARig pins the identity. A city
+// check that calls itself "rig:..." lies about what it inspected, which is the
+// same defect class this whole bead is about.
+func TestCityDoltLocalOnlyRemoteCheck_NameIsNotARig(t *testing.T) {
+	c := NewCityDoltLocalOnlyRemoteCheck(t.TempDir(), "")
+	want := "city:dolt-local-only-remote"
+	if got := c.Name(); got != want {
+		t.Errorf("Name() = %q, want %q", got, want)
+	}
+	if strings.Contains(c.Name(), "rig:") {
+		t.Errorf("Name() = %q, must not claim rig scope for the city store", c.Name())
+	}
+}
+
+// TestCityDoltLocalOnlyRemoteCheck_DetectsOffBoxRemote is THE regression for
+// ga-cc4wzn: local-only true on the city store, with an off-box remote
+// re-derived from the city's own git origin, must be reported.
+func TestCityDoltLocalOnlyRemoteCheck_DetectsOffBoxRemote(t *testing.T) {
+	cityPath := t.TempDir()
+	doltDataDir := filepath.Join(cityPath, ".beads", "dolt")
+
+	// City store config + identity live at <cityPath>/.beads/, exactly as a
+	// rig's do at <rigPath>/.beads/.
+	writeRigConfigYAML(t, cityPath, "dolt.local-only: true\n")
+	writeRigMetadata(t, cityPath, "hq")
+	writeRepoStateWithRemotes(t, doltDataDir, "hq", map[string]string{
+		"origin": "git+https://github.com/gastownhall/gascity.git",
+	})
+
+	c := NewCityDoltLocalOnlyRemoteCheck(cityPath, doltDataDir)
+	r := c.Run(&CheckContext{CityPath: cityPath})
+
+	if r.Status != StatusWarning {
+		t.Fatalf("status = %d (%s), want StatusWarning — an off-box remote on a "+
+			"local-only city store is the ga-cc4wzn fault", r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, "city store") {
+		t.Errorf("message = %q, want it to name the city store", r.Message)
+	}
+	if strings.Contains(r.Message, "rig ") {
+		t.Errorf("message = %q, must not describe the city store as a rig", r.Message)
+	}
+	if !strings.Contains(r.Message, "origin") {
+		t.Errorf("message = %q, want the offending remote named", r.Message)
+	}
+}
+
+// TestCityDoltLocalOnlyRemoteCheck_CleanStoreOK covers the healthy case the
+// live city is in today: local-only true, zero remotes.
+func TestCityDoltLocalOnlyRemoteCheck_CleanStoreOK(t *testing.T) {
+	cityPath := t.TempDir()
+	doltDataDir := filepath.Join(cityPath, ".beads", "dolt")
+	writeRigConfigYAML(t, cityPath, "dolt.local-only: true\n")
+	writeRigMetadata(t, cityPath, "hq")
+	writeRepoStateWithRemotes(t, doltDataDir, "hq", map[string]string{})
+
+	c := NewCityDoltLocalOnlyRemoteCheck(cityPath, doltDataDir)
+	r := c.Run(&CheckContext{CityPath: cityPath})
+	if r.Status != StatusOK {
+		t.Fatalf("status = %d (%s), want StatusOK for a clean local-only city store",
+			r.Status, r.Message)
+	}
+}
+
+// TestCityDoltLocalOnlyRemoteCheck_UnconfiguredIsSkipped ensures the city
+// variant inherits the honest-skip contract rather than reporting a vacuous OK.
+func TestCityDoltLocalOnlyRemoteCheck_UnconfiguredIsSkipped(t *testing.T) {
+	cityPath := t.TempDir()
+	doltDataDir := filepath.Join(cityPath, ".beads", "dolt")
+	writeRigMetadata(t, cityPath, "hq")
+	writeRepoStateWithRemotes(t, doltDataDir, "hq", map[string]string{
+		"origin": "git+https://github.com/gastownhall/gascity.git",
+	})
+
+	c := NewCityDoltLocalOnlyRemoteCheck(cityPath, doltDataDir)
+	r := c.Run(&CheckContext{CityPath: cityPath})
+	if r.Status != StatusSkipped {
+		t.Fatalf("status = %d (%s), want StatusSkipped when local-only is unset",
+			r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, "NOT checked") {
+		t.Errorf("message = %q, want it to disclose that remotes were not checked", r.Message)
+	}
+}
