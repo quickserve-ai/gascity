@@ -61,7 +61,7 @@ func (c *DoltJournalSizeCheck) Name() string { return "dolt-journal-size" }
 func (c *DoltJournalSizeCheck) Run(_ *CheckContext) *CheckResult {
 	r := &CheckResult{Name: c.Name()}
 	if c.skip || !c.managedApplicable() {
-		r.Status = StatusOK
+		r.Status = StatusSkipped
 		r.Message = "skipped (file backend, external dolt endpoint, or GC_DOLT=skip)"
 		return r
 	}
@@ -75,11 +75,11 @@ func (c *DoltJournalSizeCheck) Run(_ *CheckContext) *CheckResult {
 	}
 	if len(targets) == 0 {
 		if unresolved {
-			r.Status = StatusOK
+			r.Status = StatusSkipped
 			r.Message = "skipped (dolt target unresolved)"
 			return r
 		}
-		r.Status = StatusOK
+		r.Status = StatusSkipped
 		r.Message = "skipped (file backend, external dolt endpoint, or GC_DOLT=skip)"
 		return r
 	}

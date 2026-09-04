@@ -74,7 +74,7 @@ func TestSupervisorHTTPCheck_WarmupEligible(t *testing.T) {
 func TestSupervisorHTTPCheck_SkipWhenSupervisorNotRunning(t *testing.T) {
 	c := makeSupervisorHTTPCheck(false, 8372, nil)
 	r := c.Run(&CheckContext{})
-	if r.Status != StatusOK {
+	if r.Status != StatusSkipped {
 		t.Errorf("status = %d, want OK; msg = %s", r.Status, r.Message)
 	}
 	if !strings.Contains(r.Message, "skipped") {

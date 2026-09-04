@@ -402,7 +402,7 @@ func (c *BinaryCheck) Name() string { return c.binary + "-binary" }
 func (c *BinaryCheck) Run(_ *CheckContext) *CheckResult {
 	r := &CheckResult{Name: c.Name()}
 	if c.skipMsg != "" {
-		r.Status = StatusOK
+		r.Status = StatusSkipped
 		r.Message = c.skipMsg
 		return r
 	}
@@ -1262,7 +1262,7 @@ func (c *DoltServerCheck) Name() string { return "dolt-server" }
 func (c *DoltServerCheck) Run(_ *CheckContext) *CheckResult {
 	r := &CheckResult{Name: c.Name()}
 	if c.skip {
-		r.Status = StatusOK
+		r.Status = StatusSkipped
 		r.Message = "skipped (file backend or GC_DOLT=skip)"
 		return r
 	}
@@ -1327,7 +1327,7 @@ func (c *RigDoltServerCheck) Name() string { return "rig:" + c.rig.Name + ":dolt
 func (c *RigDoltServerCheck) Run(_ *CheckContext) *CheckResult {
 	r := &CheckResult{Name: c.Name()}
 	if c.skip {
-		r.Status = StatusOK
+		r.Status = StatusSkipped
 		r.Message = "skipped (file backend or GC_DOLT=skip)"
 		return r
 	}
@@ -2672,7 +2672,7 @@ func (c *DoltNomsSizeCheck) Name() string { return "dolt-noms-size" }
 func (c *DoltNomsSizeCheck) Run(_ *CheckContext) *CheckResult {
 	r := &CheckResult{Name: c.Name()}
 	if c.skip || !c.managedApplicable() {
-		r.Status = StatusOK
+		r.Status = StatusSkipped
 		r.Message = "skipped (file backend, external dolt endpoint, or GC_DOLT=skip)"
 		return r
 	}
@@ -2684,11 +2684,11 @@ func (c *DoltNomsSizeCheck) Run(_ *CheckContext) *CheckResult {
 	if len(targets) == 0 {
 		if unresolved {
 			// Let the beads-store / dolt-server checks report resolution errors.
-			r.Status = StatusOK
+			r.Status = StatusSkipped
 			r.Message = "skipped (dolt target unresolved)"
 			return r
 		}
-		r.Status = StatusOK
+		r.Status = StatusSkipped
 		r.Message = "skipped (file backend, external dolt endpoint, or GC_DOLT=skip)"
 		return r
 	}
@@ -2943,7 +2943,7 @@ func (c *DoltConfigCheck) Name() string { return "dolt-config" }
 func (c *DoltConfigCheck) Run(_ *CheckContext) *CheckResult {
 	r := &CheckResult{Name: c.Name()}
 	if c.skip || !c.managedApplicable() {
-		r.Status = StatusOK
+		r.Status = StatusSkipped
 		r.Message = "skipped (file backend, external dolt endpoint, or GC_DOLT=skip)"
 		return r
 	}
@@ -3102,7 +3102,7 @@ func (c *DoltVersionCheck) Name() string { return "dolt-version" }
 func (c *DoltVersionCheck) Run(_ *CheckContext) *CheckResult {
 	r := &CheckResult{Name: c.Name()}
 	if c.skip || (c.cityPath != "" && !c.managedApplicable()) {
-		r.Status = StatusOK
+		r.Status = StatusSkipped
 		r.Message = "skipped (file backend, external dolt endpoint, or GC_DOLT=skip)"
 		return r
 	}
