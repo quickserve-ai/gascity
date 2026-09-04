@@ -8,6 +8,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/session"
 )
 
 // foreignIdentityTestCity mirrors the config shapes this city actually runs:
@@ -229,7 +230,7 @@ func TestPoolAssigneeIsLocallyObservable(t *testing.T) {
 		{"namepool-themed instance", "repo/furiosa", true},
 		// cmd_hook.go writes session.GenerateAdhocIdentity straight into the
 		// claim assignee for an aliasless pool worker ("rig/polecat-adhoc-<hash>").
-		// Unrecognised, its work would be protected forever the moment that
+		// Unrecognized, its work would be protected forever the moment that
 		// session died — a silent LOCAL leak, the worst failure this gate has.
 		{"adhoc pool instance", "repo/worker-adhoc-a1b2c3d4e5", true},
 		{"legacy bound adhoc pool instance", "repo/pack.worker-adhoc-a1b2c3d4e5", true},
@@ -244,7 +245,7 @@ func TestPoolAssigneeIsLocallyObservable(t *testing.T) {
 		{"runtime session name", "gastown__dog-ga-up143", true},
 		{"session bead id form", "claude-mc-xyz", true},
 		{"empty", "", true},
-		// ga-8yi7ne: a NEIGHBOURING city's canonical "<rig>/<binding>.<name>"
+		// ga-8yi7ne: a NEIGHBORING city's canonical "<rig>/<binding>.<name>"
 		// whose binding this city does not mint. "pool" is not one of our
 		// imports; "worker" is our agent. Before the binding gate, every one of
 		// these resolved to our local worker and their live claims were
@@ -341,12 +342,12 @@ func TestProtectedForeignAssigneesSummary(t *testing.T) {
 // "<binding>.<name>" identity could have been minted HERE (ga-8yi7ne).
 //
 // Both sources are asserted, and so is the refusal: an unknown binding must be
-// rejected, because that is the only thing standing between a neighbouring
+// rejected, because that is the only thing standing between a neighboring
 // city's canonical identity and our local agent of the same leaf name.
 func TestCityMintsBinding(t *testing.T) {
 	cfg := &config.City{
 		Agents: []config.Agent{
-			{Name: "worker"},                            // unbound: contributes nothing
+			{Name: "worker"}, // unbound: contributes nothing
 			{Name: "polecat", BindingName: "gastown"},   // bound: contributes "gastown"
 			{Name: "dog", BindingName: "bd"},            // bound: contributes "bd"
 			{Name: "spaced", BindingName: "  padded  "}, // trimmed on both sides
@@ -362,8 +363,8 @@ func TestCityMintsBinding(t *testing.T) {
 		{"second binding on the same city", "bd", true},
 		{"binding is trimmed before comparison", "padded", true},
 		{"default rig import with no instantiated agent", "core", true},
-		{"neighbouring city's binding", "pool", false},
-		{"neighbouring city's other binding", "review", false},
+		{"neighboring city's binding", "pool", false},
+		{"neighboring city's other binding", "review", false},
 		{"empty binding is never ours", "", false},
 		{"whitespace binding is never ours", "   ", false},
 		{"agent NAME is not a binding", "worker", false},
@@ -452,5 +453,108 @@ func TestPoolCandidateBindingIsLocal(t *testing.T) {
 				t.Fatalf("poolCandidateBindingIsLocal(%q) = %v, want %v", tc.candidate, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestReleaseOrphanedPoolAssignments_DecommissionedLocalIsProtectedAndReported
+// closes the review gap that the decommissioned-agent case existed only in the
+// predicate table. A locally-DECOMMISSIONED named identity is indistinguishable
+// from a foreign one — "not in the local roster" is all the gate can see — so
+// its claims are knowingly left unreapable. That is the accepted trade, and the
+// summary line IS its mitigation: this test proves through a real sweep over a
+// real store that the bead survives AND the summary names the identity, so the
+// leak is legible rather than silent.
+func TestReleaseOrphanedPoolAssignments_DecommissionedLocalIsProtectedAndReported(t *testing.T) {
+	cityPath := t.TempDir()
+	cityStore := beads.NewMemStore()
+	rigStore := beads.NewMemStore()
+
+	// "repo/mad-max" reads exactly like yesterday's crew member whose agent
+	// stanza was removed: well-formed <rig>/<name>, rig resolves, name absent
+	// from the roster foreignIdentityTestCity declares.
+	decommissioned := seedForeignIdentityWork(t, rigStore, "claim held by a decommissioned local agent", "repo/mad-max")
+
+	logBuf := captureSweepLog(t)
+	released := releaseOrphanedPoolAssignmentsFromBeads(
+		cityStore,
+		foreignIdentityTestCity(t),
+		cityPath,
+		nil,
+		[]beads.Bead{decommissioned},
+		[]beads.Store{rigStore},
+		[]string{"repo"},
+		map[string]beads.Store{"repo": rigStore},
+	)
+
+	if len(released) != 0 {
+		t.Fatalf("released = %v, want none (a decommissioned identity is protected, not reaped)", released)
+	}
+	got, err := rigStore.Get(decommissioned.ID)
+	if err != nil {
+		t.Fatalf("Get decommissioned claim: %v", err)
+	}
+	if got.Status != "in_progress" || got.Assignee != "repo/mad-max" {
+		t.Fatalf("claim = status %q assignee %q, want in_progress/repo/mad-max untouched", got.Status, got.Assignee)
+	}
+	logged := logBuf.String()
+	if !strings.Contains(logged, "protected 1 foreign/unknown identities this pass (1 claims)") {
+		t.Fatalf("the accepted leak's mitigation is the summary line, and it is missing:\n%s", logged)
+	}
+	if !strings.Contains(logged, `"repo/mad-max" (1: `+decommissioned.ID+")") {
+		t.Fatalf("summary must name the decommissioned identity and its claim:\n%s", logged)
+	}
+}
+
+// TestReleaseConfirmedOrphanSessionWork_GatesUnobservableIdentifier covers the
+// SECOND release site (the ga-jrnou orphan-close tie-break). Its identifier set
+// is built from raw session-bead metadata (sessionAssignmentIdentifierRawInfo),
+// not from the roster, so a stored session_name colliding with another city's
+// identity reaches this release with no other guard. One call carries both
+// claims: the unobservable identity is protected while the locally-minted pool
+// instance is still released — the same non-vacuity shape as the sweep test, so
+// a gate that simply disabled this site would fail the second half.
+func TestReleaseConfirmedOrphanSessionWork_GatesUnobservableIdentifier(t *testing.T) {
+	cityStore := beads.NewMemStore()
+	rigStore := beads.NewMemStore()
+	cfg := foreignIdentityTestCity(t)
+	rigStores := map[string]beads.Store{"repo": rigStore}
+
+	foreign := seedForeignIdentityWork(t, rigStore, "claim under a foreign-shaped stored name", "repo/dalinar")
+	local := seedForeignIdentityWork(t, rigStore, "claim under a locally minted pool instance", "repo/worker-1")
+
+	logBuf := captureSweepLog(t)
+	released := releaseConfirmedOrphanSessionWork(cfg, cityStore, rigStores,
+		[]beads.Bead{foreign, local},
+		[]beads.Store{rigStore, rigStore},
+		session.Info{SessionNameMetadata: "repo/dalinar"},
+	)
+	if len(released) != 0 {
+		t.Fatalf("released = %v, want none (the only matching identifier is unobservable)", released)
+	}
+	gotForeign, err := rigStore.Get(foreign.ID)
+	if err != nil {
+		t.Fatalf("Get foreign-shaped claim: %v", err)
+	}
+	if gotForeign.Status != "in_progress" || gotForeign.Assignee != "repo/dalinar" {
+		t.Fatalf("claim = status %q assignee %q, want in_progress/repo/dalinar untouched", gotForeign.Status, gotForeign.Assignee)
+	}
+	if logged := logBuf.String(); !strings.Contains(logged, `protected "repo/dalinar" (`+foreign.ID+`)`) {
+		t.Fatalf("gate must refuse loudly, naming the identity and claim:\n%s", logged)
+	}
+
+	released = releaseConfirmedOrphanSessionWork(cfg, cityStore, rigStores,
+		[]beads.Bead{foreign, local},
+		[]beads.Store{rigStore, rigStore},
+		session.Info{SessionNameMetadata: "repo/worker-1"},
+	)
+	if len(released) != 1 || released[0].ID != local.ID {
+		t.Fatalf("released = %v, want exactly [%s] (the locally minted instance still releases)", released, local.ID)
+	}
+	gotLocal, err := rigStore.Get(local.ID)
+	if err != nil {
+		t.Fatalf("Get local claim: %v", err)
+	}
+	if gotLocal.Status != "open" || gotLocal.Assignee != "" {
+		t.Fatalf("local claim = status %q assignee %q, want open/unassigned", gotLocal.Status, gotLocal.Assignee)
 	}
 }
