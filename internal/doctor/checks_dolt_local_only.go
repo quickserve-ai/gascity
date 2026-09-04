@@ -55,8 +55,11 @@ func (c *DoltLocalOnlyRemoteCheck) Run(_ *CheckContext) *CheckResult {
 		return r
 	}
 	if !configured {
-		r.Status = StatusOK
-		r.Message = "dolt local-only not configured"
+		// NOT StatusOK: an unset key does not mean the rig cannot hold an
+		// off-box remote — hq carried exactly the remote this check hunts for
+		// 22 hours while this branch reported green (ga-cc4wzn / ga-51iq0s).
+		r.Status = StatusSkipped
+		r.Message = "dolt local-only not configured — off-box remotes NOT checked"
 		return r
 	}
 	if !localOnly {

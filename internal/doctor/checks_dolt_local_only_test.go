@@ -96,10 +96,10 @@ func TestDoltLocalOnlyRemoteCheck_Name(t *testing.T) {
 	}
 }
 
-// TestDoltLocalOnlyRemoteCheck_NoConfig_OK verifies that a rig with no
-// .beads/config.yaml is treated as StatusOK — local-only is not configured so
+// TestDoltLocalOnlyRemoteCheck_NoConfig_Skipped verifies that a rig with no
+// .beads/config.yaml is reported as StatusSkipped — local-only is not configured so
 // any remote is legitimate.
-func TestDoltLocalOnlyRemoteCheck_NoConfig_OK(t *testing.T) {
+func TestDoltLocalOnlyRemoteCheck_NoConfig_Skipped(t *testing.T) {
 	cityPath := t.TempDir()
 	doltDataDir := filepath.Join(cityPath, ".beads", "dolt")
 	rigPath := filepath.Join(cityPath, "rig")
@@ -115,8 +115,16 @@ func TestDoltLocalOnlyRemoteCheck_NoConfig_OK(t *testing.T) {
 	c := NewDoltLocalOnlyRemoteCheck(cityPath, rig, doltDataDir)
 	r := c.Run(&CheckContext{CityPath: cityPath})
 
-	if r.Status != StatusOK {
-		t.Fatalf("status = %d (%s), want StatusOK (local-only not configured)", r.Status, r.Message)
+	// StatusSkipped, NOT StatusOK: this fixture deliberately plants an
+	// off-box remote (git+https://github.com/...) — exactly the fault this
+	// check exists to catch. Returning OK here is what let hq carry that
+	// remote for 22 hours behind a green line (ga-cc4wzn / ga-51iq0s). The
+	// check genuinely did not look, and must say so.
+	if r.Status != StatusSkipped {
+		t.Fatalf("status = %d (%s), want StatusSkipped (local-only not configured — remotes NOT checked)", r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, "NOT checked") {
+		t.Errorf("message = %q, want it to disclose that off-box remotes were not checked", r.Message)
 	}
 }
 

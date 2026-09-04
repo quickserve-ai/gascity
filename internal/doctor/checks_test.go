@@ -710,8 +710,8 @@ func TestBinaryCheck_NotFound(t *testing.T) {
 func TestBinaryCheck_Skipped(t *testing.T) {
 	c := NewBinaryCheck("bd", "skipped (GC_BEADS=file)", nil)
 	r := c.Run(&CheckContext{})
-	if r.Status != StatusOK {
-		t.Errorf("status = %d, want OK (skipped)", r.Status)
+	if r.Status != StatusSkipped {
+		t.Errorf("status = %d, want StatusSkipped", r.Status)
 	}
 	if r.Message != "skipped (GC_BEADS=file)" {
 		t.Errorf("message = %q, want skip message", r.Message)
@@ -1760,8 +1760,8 @@ func TestDoltServerCheck_InvalidCityExplicitOriginFailsResolution(t *testing.T) 
 func TestDoltServerCheck_Skipped(t *testing.T) {
 	c := NewDoltServerCheck("/tmp", true)
 	r := c.Run(&CheckContext{})
-	if r.Status != StatusOK {
-		t.Errorf("status = %d, want OK (skipped)", r.Status)
+	if r.Status != StatusSkipped {
+		t.Errorf("status = %d, want StatusSkipped", r.Status)
 	}
 }
 
@@ -2676,8 +2676,8 @@ func newTestDoltNomsSizeCheck(cityPath string, skip bool) *DoltNomsSizeCheck {
 func TestDoltNomsSizeCheck_Skipped(t *testing.T) {
 	c := newTestDoltNomsSizeCheck(t.TempDir(), true)
 	r := c.Run(&CheckContext{})
-	if r.Status != StatusOK {
-		t.Fatalf("status = %d, want OK (skipped); msg = %s", r.Status, r.Message)
+	if r.Status != StatusSkipped {
+		t.Fatalf("status = %d, want StatusSkipped; msg = %s", r.Status, r.Message)
 	}
 	if !strings.Contains(r.Message, "skipped") {
 		t.Errorf("message = %q, want skipped", r.Message)
@@ -2712,8 +2712,8 @@ func TestDoltNomsSizeCheck_SkipsExternalTargets(t *testing.T) {
 
 		c := newTestDoltNomsSizeCheck(dir, false)
 		r := c.Run(&CheckContext{})
-		if r.Status != StatusOK {
-			t.Fatalf("status = %d, want OK skip; msg = %s", r.Status, r.Message)
+		if r.Status != StatusSkipped {
+			t.Fatalf("status = %d, want StatusSkipped; msg = %s", r.Status, r.Message)
 		}
 		if !strings.Contains(r.Message, "skipped") {
 			t.Fatalf("message = %q, want skipped", r.Message)
@@ -2744,8 +2744,8 @@ path = "demo"
 
 		c := newTestDoltNomsSizeCheck(dir, false)
 		r := c.Run(&CheckContext{})
-		if r.Status != StatusOK {
-			t.Fatalf("status = %d, want OK skip; msg = %s", r.Status, r.Message)
+		if r.Status != StatusSkipped {
+			t.Fatalf("status = %d, want StatusSkipped; msg = %s", r.Status, r.Message)
 		}
 		if !strings.Contains(r.Message, "skipped") {
 			t.Fatalf("message = %q, want skipped", r.Message)
@@ -2782,8 +2782,8 @@ path = "demo"
 		}
 		c := newTestDoltNomsSizeCheck(dir, false)
 		r := c.Run(&CheckContext{})
-		if r.Status != StatusOK {
-			t.Fatalf("status = %d, want OK skip; msg = %s", r.Status, r.Message)
+		if r.Status != StatusSkipped {
+			t.Fatalf("status = %d, want StatusSkipped; msg = %s", r.Status, r.Message)
 		}
 		if !strings.Contains(r.Message, "skipped") {
 			t.Fatalf("message = %q, want skipped", r.Message)
@@ -3294,8 +3294,8 @@ func TestDoltNomsSizeCheck_SkipsSystemDatabaseMetadata(t *testing.T) {
 		return 0, false, nil
 	}
 	r := c.Run(&CheckContext{})
-	if r.Status != StatusOK {
-		t.Fatalf("status = %d, want OK; msg = %s", r.Status, r.Message)
+	if r.Status != StatusSkipped {
+		t.Fatalf("status = %d, want StatusSkipped; msg = %s", r.Status, r.Message)
 	}
 }
 
@@ -3313,8 +3313,8 @@ func TestDoltNomsSizeCheck_SkipsInvalidDatabaseMetadata(t *testing.T) {
 		return 0, false, nil
 	}
 	r := c.Run(&CheckContext{})
-	if r.Status != StatusOK {
-		t.Fatalf("status = %d, want OK; msg = %s", r.Status, r.Message)
+	if r.Status != StatusSkipped {
+		t.Fatalf("status = %d, want StatusSkipped; msg = %s", r.Status, r.Message)
 	}
 }
 
@@ -3625,8 +3625,8 @@ func renderDoctorTestYAML(b *strings.Builder, m map[string]any, indent int) {
 func TestDoltConfigCheck_Skipped(t *testing.T) {
 	c := NewDoltConfigCheck(t.TempDir(), true)
 	r := c.Run(&CheckContext{})
-	if r.Status != StatusOK {
-		t.Fatalf("status = %d, want OK; msg = %s", r.Status, r.Message)
+	if r.Status != StatusSkipped {
+		t.Fatalf("status = %d, want StatusSkipped; msg = %s", r.Status, r.Message)
 	}
 	if !strings.Contains(r.Message, "skipped") {
 		t.Errorf("message = %q, want skipped", r.Message)
@@ -3912,8 +3912,8 @@ func TestDoltConfigCheck_SkipsExternalTargets(t *testing.T) {
 
 		c := NewDoltConfigCheck(dir, false)
 		r := c.Run(&CheckContext{})
-		if r.Status != StatusOK {
-			t.Fatalf("status = %d, want OK skip; msg = %s", r.Status, r.Message)
+		if r.Status != StatusSkipped {
+			t.Fatalf("status = %d, want StatusSkipped; msg = %s", r.Status, r.Message)
 		}
 		if !strings.Contains(r.Message, "skipped") {
 			t.Fatalf("message = %q, want skipped", r.Message)
@@ -3944,8 +3944,8 @@ path = "demo"
 
 		c := NewDoltConfigCheck(dir, false)
 		r := c.Run(&CheckContext{})
-		if r.Status != StatusOK {
-			t.Fatalf("status = %d, want OK skip; msg = %s", r.Status, r.Message)
+		if r.Status != StatusSkipped {
+			t.Fatalf("status = %d, want StatusSkipped; msg = %s", r.Status, r.Message)
 		}
 		if !strings.Contains(r.Message, "skipped") {
 			t.Fatalf("message = %q, want skipped", r.Message)
@@ -3961,14 +3961,14 @@ func TestManagedDoltChecksSkipInvalidCityConfig(t *testing.T) {
 
 	sizeCheck := NewDoltNomsSizeCheck(dir, false)
 	sizeResult := sizeCheck.Run(&CheckContext{})
-	if sizeResult.Status != StatusOK || !strings.Contains(sizeResult.Message, "skipped") {
-		t.Fatalf("dolt-noms-size status=%d message=%q, want skipped OK", sizeResult.Status, sizeResult.Message)
+	if sizeResult.Status != StatusSkipped || !strings.Contains(sizeResult.Message, "skipped") {
+		t.Fatalf("dolt-noms-size status=%d message=%q, want StatusSkipped", sizeResult.Status, sizeResult.Message)
 	}
 
 	configCheck := NewDoltConfigCheck(dir, false)
 	configResult := configCheck.Run(&CheckContext{})
-	if configResult.Status != StatusOK || !strings.Contains(configResult.Message, "skipped") {
-		t.Fatalf("dolt-config status=%d message=%q, want skipped OK", configResult.Status, configResult.Message)
+	if configResult.Status != StatusSkipped || !strings.Contains(configResult.Message, "skipped") {
+		t.Fatalf("dolt-config status=%d message=%q, want StatusSkipped", configResult.Status, configResult.Message)
 	}
 
 	versionCheck := NewScopedDoltVersionCheck(dir)
@@ -3977,8 +3977,8 @@ func TestManagedDoltChecksSkipInvalidCityConfig(t *testing.T) {
 		return "", nil
 	}
 	versionResult := versionCheck.Run(&CheckContext{})
-	if versionResult.Status != StatusOK || !strings.Contains(versionResult.Message, "skipped") {
-		t.Fatalf("dolt-version status=%d message=%q, want skipped OK", versionResult.Status, versionResult.Message)
+	if versionResult.Status != StatusSkipped || !strings.Contains(versionResult.Message, "skipped") {
+		t.Fatalf("dolt-version status=%d message=%q, want StatusSkipped", versionResult.Status, versionResult.Message)
 	}
 }
 
@@ -4150,8 +4150,8 @@ func TestDoltVersionCheck_Skipped(t *testing.T) {
 		return "", nil
 	}
 	r := c.Run(&CheckContext{})
-	if r.Status != StatusOK {
-		t.Fatalf("status = %d, want OK", r.Status)
+	if r.Status != StatusSkipped {
+		t.Fatalf("status = %d, want StatusSkipped", r.Status)
 	}
 	if !strings.Contains(r.Message, "skipped") {
 		t.Fatalf("message = %q, want skipped", r.Message)
@@ -4177,8 +4177,8 @@ func TestDoltVersionCheck_SkipsExternalTargets(t *testing.T) {
 			return "", nil
 		}
 		r := c.Run(&CheckContext{})
-		if r.Status != StatusOK {
-			t.Fatalf("status = %d, want OK skip; msg = %s", r.Status, r.Message)
+		if r.Status != StatusSkipped {
+			t.Fatalf("status = %d, want StatusSkipped; msg = %s", r.Status, r.Message)
 		}
 		if !strings.Contains(r.Message, "skipped") {
 			t.Fatalf("message = %q, want skipped", r.Message)
@@ -4213,8 +4213,8 @@ path = "demo"
 			return "", nil
 		}
 		r := c.Run(&CheckContext{})
-		if r.Status != StatusOK {
-			t.Fatalf("status = %d, want OK skip; msg = %s", r.Status, r.Message)
+		if r.Status != StatusSkipped {
+			t.Fatalf("status = %d, want StatusSkipped; msg = %s", r.Status, r.Message)
 		}
 		if !strings.Contains(r.Message, "skipped") {
 			t.Fatalf("message = %q, want skipped", r.Message)
