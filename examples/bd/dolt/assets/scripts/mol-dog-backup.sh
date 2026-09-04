@@ -32,6 +32,17 @@ case "$BACKUP_SYNC_TIMEOUT" in ''|*[!0-9]*|0) BACKUP_SYNC_TIMEOUT=1800 ;; esac
 BACKUP_SNAPSHOT_DIR="${GC_DOLT_BACKUP_SNAPSHOT_DIR:-$PACK_STATE_DIR/backup-snapshot}"
 BACKUP_SNAPSHOT_MODE="${GC_DOLT_BACKUP_SNAPSHOT:-auto}"
 BACKUP_PRUNE_ORPHANS="${GC_DOLT_BACKUP_PRUNE_ORPHANS:-1}"
+# ga-l9smko. When 1, a run that produced NO off-box copy and carries no operator
+# waiver exits non-zero, so its history row differs from a run that actually
+# copied off-box. DEFAULT 0, and that default is an evidenced choice rather than
+# timidity: an order that is red on every cycle for a condition its owner cannot
+# discharge is what got qcore/origin PARKED, and the park is what made a real
+# outage invisible for three days (ga-8bt85j). The UNCONDITIONAL half of this
+# change is what removes the false green — a real-failure exit, a stamp only a
+# real copy writes, and readers that cannot go green without one. This knob is
+# the city's policy call on top of that, one line in [[orders.overrides]] env.
+OFFSITE_REQUIRED="${GC_BACKUP_OFFSITE_REQUIRED:-0}"
+case "$OFFSITE_REQUIRED" in 1|true|TRUE|yes|YES) OFFSITE_REQUIRED=1 ;; *) OFFSITE_REQUIRED=0 ;; esac
 
 dolt_sql() {
     DOLT_CLI_PASSWORD="${GC_DOLT_PASSWORD:-}" \
@@ -505,20 +516,69 @@ for db in $DATABASES; do
 done
 
 FAILED_COUNT=$FAILED
-OFFSITE_STATUS="skipped"
 
 # --- Step 3: Rsync backup artifacts to offsite storage ---
+#
+# ga-l9smko. This leg used to report itself in ONE WORD inside a summary line
+# while the RUN recorded success either way, so "nobody ever configured an
+# off-box copy" and "the off-box copy completed" were byte-identical durable
+# evidence — and the only recurring durability job this city runs was green BY
+# CONSTRUCTION for as long as GC_BACKUP_OFFSITE_PATH stayed unset.
+#
+# Three changes, the first two unconditional:
+#   * a CONFIGURED leg that did not copy now FAILS the run. It used to be
+#     labelled "failed (non-fatal)" and exit 0. An off-box copy that did not
+#     happen is not a non-fatal detail — it is the entire purpose of the leg —
+#     and unlike an unconfigured target it is a real, dischargeable failure.
+#   * the freshness stamp is written ONLY by an rsync that exits 0, so readers
+#     can answer "how old is the off-box copy" instead of assuming it. An
+#     unconfigured or waived run writes NO stamp, which is what stops any reader
+#     from going green without a real copy behind it.
+#   * an unconfigured leg is NAMED as such rather than "skipped", and fails the
+#     run only under GC_BACKUP_OFFSITE_REQUIRED=1.
+OFFSITE_STATUS="unconfigured — NO OFF-BOX COPY"
+OFFSITE_FATAL=0
+OFFSITE_DETAIL=""
 
 if [ -n "$OFFSITE_PATH" ]; then
     if [ ! -d "$BACKUP_ARTIFACT_DIR" ]; then
         OFFSITE_STATUS="missing-artifacts"
+        OFFSITE_FATAL=1
+        OFFSITE_DETAIL="artifact dir $BACKUP_ARTIFACT_DIR does not exist, so nothing was copied off-box"
     elif same_path "$BACKUP_ARTIFACT_DIR" "$DOLT_DATA_DIR"; then
         OFFSITE_STATUS="invalid-source"
+        OFFSITE_FATAL=1
+        OFFSITE_DETAIL="artifact dir resolves to the live data dir ($DOLT_DATA_DIR); refusing to rsync live data off-box"
     elif run_bounded 300 rsync -a --delete "$BACKUP_ARTIFACT_DIR/" "$OFFSITE_PATH/" 2>/dev/null; then
         OFFSITE_STATUS="ok"
+        write_offsite_backup_sync_stamp "$OFFSITE_PATH" "$BACKUP_ARTIFACT_DIR"
     else
-        OFFSITE_STATUS="failed (non-fatal)"
+        OFFSITE_STATUS="failed"
+        OFFSITE_FATAL=1
+        OFFSITE_DETAIL="rsync to $OFFSITE_PATH exited non-zero or exceeded its 300s bound"
     fi
+else
+    OFFSITE_WAIVER="$(offsite_waiver_reason)"
+    if [ -n "$OFFSITE_WAIVER" ]; then
+        # An operator risk acceptance, declared in the city and dated by its
+        # file. It still writes NO stamp: a waiver records that nobody expects
+        # an off-box copy, not that one exists.
+        OFFSITE_STATUS="waived: $OFFSITE_WAIVER"
+    elif [ "$OFFSITE_REQUIRED" -eq 1 ]; then
+        OFFSITE_FATAL=1
+        OFFSITE_DETAIL="GC_BACKUP_OFFSITE_PATH is unset and no waiver is declared in config/dolt/offsite-waived, while GC_BACKUP_OFFSITE_REQUIRED=1"
+    fi
+fi
+
+# Age of the last REAL off-box copy, so the run output answers the question
+# rather than leaving it to be assumed. No stamp reports "never", never a fresh
+# copy — and "never" is the honest reading of an unconfigured leg.
+OFFSITE_AGE="never"
+OFFSITE_EPOCH="$(read_offsite_backup_sync_epoch)"
+if [ -n "$OFFSITE_EPOCH" ]; then
+    OFFSITE_AGE_SEC=$(( $(date +%s) - OFFSITE_EPOCH ))
+    [ "$OFFSITE_AGE_SEC" -lt 0 ] && OFFSITE_AGE_SEC=0
+    OFFSITE_AGE="${OFFSITE_AGE_SEC}s ago"
 fi
 
 # --- Step 4: Report ---
@@ -530,6 +590,20 @@ if [ "$FAILED_COUNT" -gt 0 ]; then
         2>/dev/null || true
 fi
 
-SUMMARY="backup — synced: $SYNCED/$TOTAL, offsite: $OFFSITE_STATUS"
+if [ "$OFFSITE_FATAL" -eq 1 ] && [ -n "$OFFSITE_PATH" ]; then
+    # Only a CONFIGURED leg escalates. An unconfigured one is a standing
+    # condition with an open decision behind it, and re-alarming a standing
+    # condition every cycle is how a signal gets parked (ga-8bt85j).
+    dolt_escalate \
+        "Dolt backup: the off-box copy did not happen — $OFFSITE_STATUS [HIGH]" \
+        "$OFFSITE_DETAIL. Last real off-box copy: $OFFSITE_AGE. The local .dolt-backup artifacts and the live store share one volume, so until this leg works there is no copy that survives a disk event." \
+        2>/dev/null || true
+fi
+
+SUMMARY="backup — synced: $SYNCED/$TOTAL, offsite: $OFFSITE_STATUS, last off-box copy: $OFFSITE_AGE"
 dolt_notify_done "$SUMMARY"
 echo "backup: $SUMMARY"
+if [ "$OFFSITE_FATAL" -eq 1 ]; then
+    echo "backup: FAILING THE RUN — $OFFSITE_DETAIL" >&2
+    exit 1
+fi

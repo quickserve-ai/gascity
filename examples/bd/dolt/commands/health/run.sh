@@ -432,6 +432,63 @@ if [ "$local_backup_oldest_epoch" -gt 0 ]; then
   fi
 fi
 
+# --- OFF-BOX (offsite) backup plane, ga-l9smko -------------------------------
+#
+# The local plane above dates the artifacts in .dolt-backup. It says nothing
+# about whether those artifacts were copied OFF THE BOX, and this report had no
+# offsite plane at all — so a city with no off-box copy whatsoever read exactly
+# like one whose off-box copy completed an hour ago. That is the same shape as
+# ga-g3p5rm one plane down, and it is why the only recurring durability job here
+# could report success every six hours with its off-box leg unconfigured
+# (ga-l9smko).
+#
+# FAIL CLOSED, and note what "closed" means here: no stamp is UNKNOWN, and
+# unknown is never ok. Only mol-dog-backup's rsync exiting 0 writes the stamp,
+# so nothing on this plane can be manufactured by a failure path or by an mtime.
+# STATES: ok | stale | unknown (configured, never proved a copy) |
+#         waived (operator risk acceptance, dated by its declaration file) |
+#         unconfigured (no target declared and no waiver — no off-box copy).
+# Only `ok` sets stale=false. `waived` is deliberately NOT ok: the city has
+# accepted the risk, not eliminated it, and a reader must still see that there
+# is no second copy.
+offsite_backup_state="unconfigured"
+offsite_backup_stale=true
+offsite_backup_age_sec=0
+offsite_backup_freshness=""
+offsite_backup_note=""
+offsite_backup_threshold="${GC_DOLT_OFFSITE_BACKUP_STALE_SECS:-86400}"
+case "$offsite_backup_threshold" in ''|*[!0-9]*) offsite_backup_threshold=86400 ;; esac
+offsite_backup_epoch="$(read_offsite_backup_sync_epoch)"
+offsite_backup_waiver="$(offsite_waiver_reason)"
+if [ -n "$offsite_backup_epoch" ]; then
+  offsite_backup_age_sec=$((bf_now - offsite_backup_epoch))
+  [ "$offsite_backup_age_sec" -lt 0 ] && offsite_backup_age_sec=0
+  if [ "$offsite_backup_age_sec" -le "$offsite_backup_threshold" ]; then
+    offsite_backup_state="ok"
+    offsite_backup_stale=false
+  else
+    offsite_backup_state="stale"
+  fi
+  if [ "$offsite_backup_age_sec" -ge 3600 ]; then
+    offsite_backup_freshness="$((offsite_backup_age_sec / 3600))h$((offsite_backup_age_sec % 3600 / 60))m"
+  elif [ "$offsite_backup_age_sec" -ge 60 ]; then
+    offsite_backup_freshness="$((offsite_backup_age_sec / 60))m$((offsite_backup_age_sec % 60))s"
+  else
+    offsite_backup_freshness="${offsite_backup_age_sec}s"
+  fi
+elif [ -n "$offsite_backup_waiver" ]; then
+  offsite_backup_state="waived"
+  offsite_backup_note="$offsite_backup_waiver"
+elif [ -n "${GC_BACKUP_OFFSITE_PATH:-}" ]; then
+  # A target is declared but no run has ever proved a copy to it. Distinct from
+  # `unconfigured` on purpose: this one is a job that is failing or has never
+  # run, and it has a different remedy.
+  offsite_backup_state="unknown"
+  offsite_backup_note="offsite path configured; no completed copy on record"
+else
+  offsite_backup_note="no GC_BACKUP_OFFSITE_PATH and no waiver in config/dolt/offsite-waived"
+fi
+
 # Find orphan databases.
 #
 # Authoritative source: `gc dolt-cleanup` (HYPHEN — the Go-side command,
@@ -673,6 +730,13 @@ JSONEOF
 
       ]
     },
+    "offsite": {
+      "freshness": "$offsite_backup_freshness",
+      "age_sec": $offsite_backup_age_sec,
+      "stale": $offsite_backup_stale,
+      "state": "$offsite_backup_state",
+      "note": "$offsite_backup_note"
+    },
     "origin_mirrors": {
       "freshness": "$backup_freshness",
       "age_sec": $backup_age_sec,
@@ -768,6 +832,13 @@ if [ -n "$local_backup_detail" ]; then
     fi
   done
 fi
+
+case "$offsite_backup_state" in
+  ok)     echo "Off-box copy: ok (last completed ${offsite_backup_freshness} ago)" ;;
+  stale)  echo "Off-box copy: STALE — last completed ${offsite_backup_freshness} ago" ;;
+  waived) echo "Off-box copy: NONE — waived: ${offsite_backup_note}" ;;
+  *)      echo "Off-box copy: NONE — ${offsite_backup_state}: ${offsite_backup_note}" ;;
+esac
 
 case "$backup_state" in
   no-remotes)

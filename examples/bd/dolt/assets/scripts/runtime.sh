@@ -115,6 +115,83 @@ write_local_backup_sync_stamp() {
   mv -f "$LOCAL_BACKUP_FRESHNESS_DIR/$lbs_db.tmp" "$LOCAL_BACKUP_FRESHNESS_DIR/$lbs_db" 2>/dev/null || return 0
 }
 
+# --- OFF-BOX (offsite) backup plane, ga-l9smko -------------------------------
+#
+# The local plane above proves a database was synced to .dolt-backup. It says
+# NOTHING about whether that artifact directory was then copied OFF THE BOX, and
+# for a city whose live store and its .dolt-backup sit on the same 93%-full
+# volume, off-box is the only copy that survives the failure people actually
+# hit. One disk event takes both (ga-jtjcdy).
+#
+# THE DEFECT THIS EXISTS TO REMOVE. mol-dog-backup's offsite leg was reported
+# only as a word inside a summary line ("offsite: skipped"), while the RUN
+# recorded success either way. So "GC_BACKUP_OFFSITE_PATH was never configured
+# and nothing was copied" and "the off-box copy completed" produced byte-
+# identical durable evidence, and the city's backup posture was green BY
+# CONSTRUCTION for as long as the variable stayed unset.
+#
+# SEMANTICS, deliberately the same fail-closed shape as the local plane: a stamp
+# means "rsync to the configured off-box path exited 0 at this time". Absence
+# means UNKNOWN, never ok. Nothing but a real copy may write it — in particular
+# an mtime under the offsite path must never be read as freshness, because the
+# failure path writes there too. That is exactly how ga-g3p5rm's local plane
+# reported a 6.5-day-dead backup as ok, and it self-healed in the wrong
+# direction: the more often the dog ran and failed, the fresher it looked.
+OFFSITE_BACKUP_FRESHNESS_FILE="$PACK_STATE_DIR/offsite-backup-freshness"
+
+# write_offsite_backup_sync_stamp <offsite_path> [artifact_dir]
+# Best-effort in exactly the sense the local writer is: a stamp failure must
+# never fail an otherwise successful copy. tmp+mv keeps a concurrent health read
+# from seeing a torn file.
+write_offsite_backup_sync_stamp() {
+  obs_path="${1:-}"
+  mkdir -p "$(dirname "$OFFSITE_BACKUP_FRESHNESS_FILE")" 2>/dev/null || return 0
+  {
+    printf 'synced_at_epoch=%s\n' "$(date +%s)"
+    printf 'offsite_path=%s\n' "$obs_path"
+    printf 'artifact_dir=%s\n' "${2:-}"
+  } > "$OFFSITE_BACKUP_FRESHNESS_FILE.tmp" 2>/dev/null || { rm -f "$OFFSITE_BACKUP_FRESHNESS_FILE.tmp" 2>/dev/null; return 0; }
+  mv -f "$OFFSITE_BACKUP_FRESHNESS_FILE.tmp" "$OFFSITE_BACKUP_FRESHNESS_FILE" 2>/dev/null || return 0
+}
+
+# read_offsite_backup_sync_epoch — echo the epoch of the last REAL off-box copy,
+# or nothing. Callers must treat "nothing" as unknown, never as ok.
+read_offsite_backup_sync_epoch() {
+  [ -f "$OFFSITE_BACKUP_FRESHNESS_FILE" ] || return 0
+  robs_epoch=$(sed -n 's/^synced_at_epoch=//p' "$OFFSITE_BACKUP_FRESHNESS_FILE" 2>/dev/null | head -1)
+  case "$robs_epoch" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  printf '%s' "$robs_epoch"
+}
+
+# offsite_waiver_reason — echo the reason this city has DELIBERATELY accepted
+# having no off-box copy, or nothing when no such declaration exists.
+#
+# ONE SOURCE ON PURPOSE. The mirror-park declaration next door takes both a file
+# and an env override, and its own comment records the hazard that created: the
+# env copy silently OUTRANKS an edited file, so the declaration a reader edits
+# can be the one that does not apply. A waiver is a durable operator risk
+# acceptance, not a per-invocation flag, so it lives in exactly one place a
+# person can read, diff and date:
+#
+#   $GC_CITY_PATH/config/dolt/offsite-waived
+#
+# First non-blank, non-comment line is the reason. Same file shape as
+# config/dolt/mirrors-parked, so operators learn one convention rather than two.
+offsite_waiver_reason() {
+  owr_file="${GC_BACKUP_OFFSITE_WAIVER_FILE:-$GC_CITY_PATH/config/dolt/offsite-waived}"
+  [ -f "$owr_file" ] || return 0
+  while IFS= read -r owr_line || [ -n "$owr_line" ]; do
+    case "$owr_line" in
+      ''|\#*) continue ;;
+    esac
+    printf '%s' "$owr_line"
+    return 0
+  done < "$owr_file"
+  return 0
+}
+
 GC_BEADS_BD_SCRIPT="$GC_CITY_PATH/.gc/scripts/gc-beads-bd.sh"
 
 # Shared by health (which excludes a parked pair from the durability verdict
