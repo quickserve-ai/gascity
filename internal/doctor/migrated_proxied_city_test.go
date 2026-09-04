@@ -59,8 +59,10 @@ func TestMigratedProxiedCityIsNotManagedLocal(t *testing.T) {
 		t.Fatal("a migrated proxied city classified as managed-local")
 	}
 	result := NewDoltConfigCheck(city, false).Run(&CheckContext{})
-	if result.Status != StatusOK {
-		t.Fatalf("dolt-config on a migrated proxied city = %v (%q), want ok", result.Status, result.Message)
+	// Carry (ga-51iq0s): a check that did not look reports Skipped, never OK;
+	// upstream returns OK here. Both agree the proxied scope gets no guidance.
+	if result.Status != StatusSkipped {
+		t.Fatalf("dolt-config on a migrated proxied city = %v (%q), want skipped", result.Status, result.Message)
 	}
 	if result.FixHint != "" {
 		t.Fatalf("dolt-config emitted guidance for a scope gc does not manage: %q", result.FixHint)
