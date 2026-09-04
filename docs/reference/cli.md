@@ -2496,7 +2496,8 @@ gc mail send --all "Status update: tests passing"
 | `--from` | string |  | sender identity (default: $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human") |
 | `--json` | bool |  | emit JSONL result |
 | `-m`, `--message` | string |  | message body text |
-| `--notify` | bool |  | nudge the recipient about this message, even if earlier mail is still unread |
+| `--no-notify` | bool |  | suppress the default recipient nudge for a direct local send |
+| `--notify` | bool |  | nudge the recipient about this message, even if earlier mail is still unread (the default for direct local sends; see --no-notify) |
 | `-s`, `--subject` | string |  | message subject line |
 | `--to` | string |  | recipient address (alternative to positional argument) |
 
