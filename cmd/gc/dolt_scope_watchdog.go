@@ -37,6 +37,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/emergency"
 )
 
 const (
@@ -139,6 +141,16 @@ func startManagedDoltSQLServerWithScopeWatchdog(cityPath, configFile, logFilePat
 	cmd.Stdin = nil
 	cmd.SysProcAttr = managedDoltSQLServerSysProcAttr()
 	cmd.Env = doltServerEnv(cityPath, os.Environ())
+	// ga-drkbcd R1: hand the watchdog a duplicate of our own stderr when — and
+	// only when — it is a regular file. Under the installed supervisor service
+	// that file is ~/.gc/supervisor.log and this process is the supervisor, so
+	// the escalation summary for a data-plane stop lands where the supervisor
+	// plane already captures everything else. See dolt_watchdog_alarm.go for why
+	// neither of the watchdog's own standard streams can carry it.
+	if channel := managedDoltWatchdogSupervisorChannelForSpawn(os.Stderr); channel != nil {
+		cmd.ExtraFiles = []*os.File{channel}
+		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%d", managedDoltWatchdogSupervisorFDEnv, managedDoltWatchdogSupervisorFD))
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return managedDoltStartedProcess{}, fmt.Errorf("prepare dolt scope watchdog: %w", err)
@@ -195,6 +207,11 @@ func runManagedDoltScopeWatchdog(args []string, stdout, stderr *os.File) int {
 	}
 	defer logFile.Close() //nolint:errcheck
 
+	// ga-drkbcd R1: adopt the supervisor-plane escalation channel our spawner
+	// declared, before the dolt child is spawned (the adoption sets close-on-exec
+	// so the server never inherits it).
+	managedDoltWatchdogSupervisorChannel = adoptManagedDoltWatchdogSupervisorChannel(os.Getenv(managedDoltWatchdogSupervisorFDEnv))
+
 	cmd := exec.Command("dolt", "sql-server", "--config", configFile)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
@@ -230,12 +247,13 @@ func runManagedDoltScopeWatchdog(args []string, stdout, stderr *os.File) int {
 	// handshake — which the parent reads under a timeout — never blocks on a ps
 	// fork when /proc ticks are available.
 	startPID := cmd.Process.Pid
+	startedAt := time.Now()
 	startTicks, startIdentity := snapshotManagedDoltStartIdentity(startPID)
 	fmt.Fprintln(stdout, formatManagedDoltWatchdogStartLine(startPID, startTicks, startIdentity)) //nolint:errcheck
 
 	interval := managedDoltScopeWatchdogInterval()
-	fmt.Fprintf(logFile, "gc scope watchdog: supervising dolt sql-server pid %d (config %s, poll interval %s)\n", //nolint:errcheck
-		cmd.Process.Pid, configFile, interval)
+	fmt.Fprintf(logFile, "gc scope watchdog: supervising dolt sql-server pid %d (config %s, poll interval %s, watchdog pid %d)\n", //nolint:errcheck
+		cmd.Process.Pid, configFile, interval, os.Getpid())
 
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
@@ -250,7 +268,20 @@ func runManagedDoltScopeWatchdog(args []string, stdout, stderr *os.File) int {
 	for {
 		select {
 		case sig := <-signals:
+			// ga-drkbcd ask A. The sender is unrecoverable through os/signal,
+			// so record everything that narrows it. The receipt line goes down
+			// first so the log carries the moment even if the snapshot below
+			// stalls; the snapshot itself is taken BEFORE the child is
+			// terminated, because its value is the state of the box at receipt,
+			// not tens of seconds later once the SIGTERM grace has elapsed. It
+			// is hard-bounded by managedDoltSignalActorSnapshotTimeout.
+			receivedAt := time.Now()
 			fmt.Fprintf(logFile, "gc scope watchdog: received %v; terminating dolt sql-server pid %d\n", sig, cmd.Process.Pid) //nolint:errcheck
+			attribution := collectManagedDoltSignalAttribution(sig, receivedAt)
+			for _, line := range formatManagedDoltSignalAttribution(attribution) {
+				fmt.Fprintln(logFile, line) //nolint:errcheck
+			}
+			reportManagedDoltWatchdogStopSignal(logFile, cityPath, configFile, attribution, cmd.Process.Pid)
 			_ = terminateManagedDoltScopeWatchdogChild(cityPath, cmd.Process.Pid, startTicks, startIdentity)
 			<-done
 			return 0
@@ -269,14 +300,124 @@ func runManagedDoltScopeWatchdog(args []string, stdout, stderr *os.File) int {
 			<-done
 			return 0
 		case err := <-done:
-			if err != nil {
-				fmt.Fprintf(logFile, "gc scope watchdog: dolt sql-server pid %d exited with error: %v\n", cmd.Process.Pid, err) //nolint:errcheck
-				return 1
+			// ga-drkbcd ask B. Reaching this branch already means the watchdog
+			// did not itself ask for the exit — the two self-initiated paths
+			// above drain `done` inline and return. What remains is separating
+			// a stop gc asked for through some OTHER path (`gc dolt stop`
+			// signals the dolt PID directly, never the watchdog) from a server
+			// that chose to exit 0 mid-service. The stop-intent marker carries
+			// that distinction; without it both render identically, which is
+			// the defect.
+			report := classifyManagedDoltWatchdogChildExit(
+				observeManagedDoltWatchdogChildExit(cmd.Process.Pid, configFile, logFilePath, startedAt, err, pendingManagedDoltWatchdogSignal(signals)))
+			for _, line := range report.Lines {
+				fmt.Fprintln(logFile, line) //nolint:errcheck
 			}
-			fmt.Fprintf(logFile, "gc scope watchdog: dolt sql-server pid %d exited cleanly\n", cmd.Process.Pid) //nolint:errcheck
-			return 0
+			if report.Alarm {
+				reportManagedDoltWatchdogExitAlarm(logFile, cityPath, configFile, report, cmd.Process.Pid)
+			}
+			return report.ExitCode
 		}
 	}
+}
+
+// pendingManagedDoltWatchdogSignal drains one already-delivered stop signal, if
+// any, without blocking. It closes the one race the branch structure cannot:
+// when a signal and the child's exit land together, `select` may pick the exit,
+// and a shutdown we were told to perform would otherwise be reported as an
+// unexplained clean exit.
+func pendingManagedDoltWatchdogSignal(signals <-chan os.Signal) bool {
+	select {
+	case <-signals:
+		return true
+	default:
+		return false
+	}
+}
+
+// observeManagedDoltWatchdogChildExit gathers the disk-backed evidence the exit
+// classification needs. The stop-intent marker and the server's last log line
+// are read only for a status-0 exit: an error exit is already unambiguous and
+// already loud, so neither read is worth doing on that path.
+func observeManagedDoltWatchdogChildExit(pid int, configFile, logFilePath string, startedAt time.Time, waitErr error, signalPending bool) managedDoltWatchdogChildExit {
+	exit := managedDoltWatchdogChildExit{
+		PID:           pid,
+		WatchdogPID:   os.Getpid(),
+		ConfigFile:    configFile,
+		Uptime:        time.Since(startedAt),
+		WaitErr:       waitErr,
+		SignalPending: signalPending,
+		Now:           time.Now(),
+	}
+	if waitErr != nil {
+		return exit
+	}
+	exit.Intent, exit.IntentFound = readManagedDoltStopIntent(configFile)
+	exit.LastServerLogLine = lastManagedDoltServerLogLine(readManagedDoltServerLogTail(logFilePath))
+	return exit
+}
+
+// reportManagedDoltWatchdogExitAlarm escalates an unexpected clean exit to the
+// city emergency spool and events.jsonl, where automation can see it. dolt.log
+// alone is not an alarm: nothing in the repo reads it.
+func reportManagedDoltWatchdogExitAlarm(logFile *os.File, cityPath, configFile string, report managedDoltWatchdogExitReport, doltPID int) {
+	if len(report.Lines) > 0 {
+		writeManagedDoltWatchdogSupervisorSummary(report.Lines[0])
+	}
+	spoolPath, err := escalateManagedDoltWatchdogAlarm(managedDoltWatchdogAlarm{
+		CityPath:   cityPath,
+		ConfigFile: configFile,
+		Severity:   emergency.SeverityCritical,
+		Cause:      string(report.Cause),
+		Message:    report.AlarmMessage,
+		DoltPID:    doltPID,
+		// The event-log recorder complains to this writer instead of failing,
+		// so a lost live alarm leaves a line in dolt.log rather than nothing.
+		Diagnostics: logFile,
+	})
+	if err != nil {
+		fmt.Fprintf(logFile, "gc scope watchdog: ALARM UNEXPECTED CLEAN EXIT: escalation failed, this stop is recorded in dolt.log ONLY: %v\n", err) //nolint:errcheck
+		return
+	}
+	fmt.Fprintf(logFile, "gc scope watchdog: ALARM UNEXPECTED CLEAN EXIT: escalated to the emergency spool at %s and to .gc/events.jsonl\n", spoolPath) //nolint:errcheck
+}
+
+// reportManagedDoltWatchdogStopSignal grades and escalates a stop signal
+// delivered to the watchdog (ga-drkbcd ask A, R2). gc's own stop paths signal
+// the dolt PID directly, and its startup-failure cleanup signals the watchdog
+// as well — both record a stop-intent marker first. So the same question the
+// exit path asks decides this one: a signal covered by a live marker is a stop
+// we asked for (info), and a signal nothing explains is the database going down
+// with no attribution (critical, the same class as an unexpected clean exit).
+func reportManagedDoltWatchdogStopSignal(logFile *os.File, cityPath, configFile string, attribution managedDoltSignalAttribution, doltPID int) {
+	intent, intentFound := readManagedDoltStopIntent(configFile)
+	report := classifyManagedDoltWatchdogStopSignal(managedDoltWatchdogStopSignal{
+		Attribution: attribution,
+		DoltPID:     doltPID,
+		Intent:      intent,
+		IntentFound: intentFound,
+		Now:         time.Now(),
+	})
+	for _, line := range report.Lines {
+		fmt.Fprintln(logFile, line) //nolint:errcheck
+	}
+	if !report.Covered && len(report.Lines) > 0 {
+		writeManagedDoltWatchdogSupervisorSummary(report.Lines[0])
+	}
+	spoolPath, err := escalateManagedDoltWatchdogAlarm(managedDoltWatchdogAlarm{
+		CityPath:    cityPath,
+		ConfigFile:  configFile,
+		Severity:    report.Severity,
+		Cause:       report.Cause,
+		Message:     report.Message,
+		DoltPID:     doltPID,
+		Diagnostics: logFile,
+	})
+	if err != nil {
+		fmt.Fprintf(logFile, "gc scope watchdog: stop signal attribution: escalation failed, this stop is recorded in dolt.log ONLY: %v\n", err) //nolint:errcheck
+		return
+	}
+	fmt.Fprintf(logFile, "gc scope watchdog: stop signal attribution: escalated to the emergency spool at %s and to .gc/events.jsonl\n", spoolPath) //nolint:errcheck
 }
 
 // terminateManagedDoltScopeWatchdogChild terminates the watchdog's own dolt
