@@ -3,7 +3,8 @@ package main
 import (
 	"fmt"
 	"io"
-	"regexp"
+	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -65,10 +66,37 @@ const (
 	publishedAwaitingGate = "pr_published_awaiting_gate"
 )
 
-// prURLPattern matches a GitHub pull-request URL and captures its number, so the
-// gate can verify that pr_url is re-derivable and that a supplied pr_number
-// agrees with it.
-var prURLPattern = regexp.MustCompile(`^https://github\.com/[^/\s]+/[^/\s]+/pull/(\d+)(?:[/#?].*)?$`)
+// parsePRURL reports the PR number a pr_url names, and whether the URL is a
+// fetchable GitHub pull-request URL at all.
+//
+// Parsed with net/url rather than matched with a regex: a hand-rolled pattern
+// whose host and path segments merely exclude "/" accepts strings that are not
+// PR URLs (query and fragment delimiters slip into what looks like a path, so
+// "https://github.com/?/repo/pull/1" matches) while rejecting fetchable variants
+// like an uppercase host. Host comparison is therefore case-folded, and the path
+// is validated segment by segment on the PARSED path, after url.Parse has
+// already split off any query or fragment.
+func parsePRURL(raw string) (number string, ok bool) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.Scheme != "https" {
+		return "", false
+	}
+	if !strings.EqualFold(parsed.Hostname(), "github.com") {
+		return "", false
+	}
+	segments := strings.Split(strings.Trim(parsed.EscapedPath(), "/"), "/")
+	// owner / repo / "pull" / number
+	if len(segments) < 4 || segments[2] != "pull" {
+		return "", false
+	}
+	if segments[0] == "" || segments[1] == "" {
+		return "", false
+	}
+	if _, err := strconv.Atoi(segments[3]); err != nil {
+		return "", false
+	}
+	return segments[3], true
+}
 
 // publishPointerViolation describes why a write was refused, in terms the caller
 // can act on.
@@ -117,15 +145,15 @@ func checkPublishPointer(beadID, mergeResult, prNumber, prURL string) *publishPo
 			"carries %s=%s but no %s — a bare PR number names no repository and cannot be fetched",
 			prNumberMetadataKey, prNumber, prURLMetadataKey)}
 	}
-	match := prURLPattern.FindStringSubmatch(prURL)
-	if match == nil {
+	urlNumber, ok := parsePRURL(prURL)
+	if !ok {
 		return &publishPointerViolation{beadID: beadID, reason: fmt.Sprintf(
 			"%s=%q is not a fetchable GitHub pull-request URL", prURLMetadataKey, prURL)}
 	}
-	if prNumber != "" && prNumber != match[1] {
+	if prNumber != "" && prNumber != urlNumber {
 		return &publishPointerViolation{beadID: beadID, reason: fmt.Sprintf(
 			"%s=%s disagrees with %s (which names PR #%s) — the two pointers must not name different PRs",
-			prNumberMetadataKey, prNumber, prURLMetadataKey, match[1])}
+			prNumberMetadataKey, prNumber, prURLMetadataKey, urlNumber)}
 	}
 	return nil
 }
@@ -193,7 +221,7 @@ func publishPointerTargets(bdArgs []string) ([]string, bool) {
 	if len(bdArgs) == 0 || bdArgs[0] != "update" {
 		return nil, false
 	}
-	if !bdUpdateTouchesMergeResult(bdArgs) {
+	if !bdUpdateTouchesPublishState(bdArgs) {
 		return nil, false
 	}
 	ids, ok, ambiguous := bdMutationWriteIDs(bdArgs)
@@ -206,9 +234,16 @@ func publishPointerTargets(bdArgs []string) ([]string, bool) {
 // bdUpdateTouchesMergeResult reports whether an update mentions merge_result in
 // any metadata form. A cheap pre-filter so the gate parses and reads a bead only
 // for the writes that could possibly trip it.
-func bdUpdateTouchesMergeResult(bdArgs []string) bool {
+func bdUpdateTouchesPublishState(bdArgs []string) bool {
 	for _, arg := range bdArgs {
-		if strings.Contains(arg, mergeResultMetadataKey) {
+		// merge_result: the state itself. pr_url / pr_number: REMOVING or
+		// blanking the pointer on a bead already in the published state breaks
+		// the same invariant as never setting it, and an update that mentions
+		// only the pointer would otherwise sail past a merge_result-only
+		// trigger.
+		if strings.Contains(arg, mergeResultMetadataKey) ||
+			strings.Contains(arg, prURLMetadataKey) ||
+			strings.Contains(arg, prNumberMetadataKey) {
 			return true
 		}
 	}

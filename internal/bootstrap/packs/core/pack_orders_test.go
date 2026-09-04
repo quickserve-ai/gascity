@@ -433,12 +433,60 @@ func TestDetectSilentPublishedWorkScriptContract(t *testing.T) {
 	}
 	// The 08:10Z constraint, pinned as a mechanism rather than a comment: gate
 	// dedup and auto-resolve must ask the store what exists NOW.
-	if !strings.Contains(body, "open_gate_for_episode") {
+	if !strings.Contains(body, "list_episode_gates") {
 		t.Error("detect-silent-published-work.sh must resolve gate existence with a live query (08:10Z: a state query, not an action log)")
 	}
 	// Loud-fail exit contract (#4543): the controller logs an exec order's
 	// output only on a non-zero exit, so failures must exit non-zero.
 	if !strings.Contains(body, `"$FAILED" -gt 0`) {
 		t.Error("detect-silent-published-work.sh must exit non-zero when an action failed, or the loud-fail messages are never logged (#4543)")
+	}
+
+	// A BLIND SWEEP MUST NOT LOOK LIKE A CLEAN ONE. UNKNOWN reported on a zero
+	// exit is invisible to the controller, so it is indistinguishable from
+	// "nothing is stalled" — the exact confusion this order exists to prevent.
+	if !strings.Contains(body, `"$UNKNOWN" -gt 0 ] || [ "$FAILED" -gt 0`) {
+		t.Error("detect-silent-published-work.sh must exit non-zero on UNKNOWN too; a partially blind sweep that exits 0 is indistinguishable from a clean one")
+	}
+
+	// RECORD SEPARATOR. `read` with IFS=$'\t' COLLAPSES consecutive tabs,
+	// because tab is IFS-whitespace — so a record with an empty middle field
+	// (pr_number absent but pr_url present, the most common shape on the live
+	// store) shifts every later field and the detector goes UNKNOWN forever on
+	// exactly the beads it exists to find. Verified by construction; the unit
+	// separator is not IFS-whitespace and does not collapse.
+	if strings.Contains(body, `IFS="$(printf '\t')"`) {
+		t.Error("detect-silent-published-work.sh must not split records on TAB: IFS-whitespace collapses consecutive tabs and shifts fields when a middle field is empty")
+	}
+	if !strings.Contains(body, `US="$(printf '\037')"`) {
+		t.Error("detect-silent-published-work.sh must split records on the unit separator, which does not collapse")
+	}
+
+	// Gate auto-resolve must be RE-DERIVED from live state each sweep, across
+	// every case the candidate loop cannot see: a bead that changed silent
+	// class, moved to a different PR, or left the published states entirely and
+	// so vanished from the candidate query.
+	if !strings.Contains(body, "LIVE_EPISODES") {
+		t.Error("detect-silent-published-work.sh must reconcile open episode gates against the live episode set, not only resolve from inside the candidate loop")
+	}
+
+	// A rig-discovery failure is not an empty rig list: the published population
+	// lives on the rig stores, so sweeping HQ alone and exiting 0 reports
+	// "nothing is stalled" from a sweep that never looked.
+	if !strings.Contains(body, "RIG_DISCOVERY_OK") {
+		t.Error("detect-silent-published-work.sh must fail loudly when rigs cannot be enumerated rather than sweeping HQ only and exiting clean")
+	}
+
+	// An UNKNOWN read must CARRY the prior observation forward. Dropping it
+	// restarts that bead's clock next sweep, so a flapping API would hold a real
+	// stall permanently below threshold.
+	if !strings.Contains(body, "carry_forward") {
+		t.Error("detect-silent-published-work.sh must carry a prior observation forward on UNKNOWN, or a flapping read keeps resetting the clock")
+	}
+
+	// Pruning must never write an empty state on failure: an empty state file
+	// resets every clock, which silently guarantees no alarm ever fires again.
+	if !strings.Contains(body, "keeping the unpruned state") {
+		t.Error("detect-silent-published-work.sh must keep the unpruned state when the prune fails; writing an empty state resets every clock")
 	}
 }
