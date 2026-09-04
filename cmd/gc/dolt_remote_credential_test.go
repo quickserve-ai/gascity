@@ -281,7 +281,7 @@ func TestReadDoltConfig_FlatDottedForm(t *testing.T) {
 }
 
 // doltServerEnv must still do its original job; the credential work must not
-// disturb the event-flush behaviour it shares a function with.
+// disturb the event-flush behavior it shares a function with.
 func TestDoltServerEnv_EventFlushStillAppliedAlongsideCredential(t *testing.T) {
 	city := writeCity(t, "dolt:\n  remote-password-file: secret.txt\n")
 	writeSecret(t, city, "secret.txt", "s3cr3t", 0o600)
