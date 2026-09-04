@@ -22,6 +22,11 @@ type DoltLocalOnlyRemoteCheck struct {
 	rig          config.Rig
 	doltDataDir  string
 	removeRemote func(rigPath, remoteName string) error
+	// cityScope marks this instance as inspecting the CITY store rather than
+	// a rig. The detection logic is identical — only the reported identity
+	// differs — but the distinction must reach the output, because a check
+	// that calls the city store a "rig" is lying about what it inspected.
+	cityScope bool
 }
 
 // NewDoltLocalOnlyRemoteCheck creates a per-rig local-only Dolt remote check.
@@ -37,9 +42,39 @@ func NewDoltLocalOnlyRemoteCheck(cityPath string, rig config.Rig, doltDataDir st
 	}
 }
 
-// Name returns the check identifier ("rig:<name>:dolt-local-only-remote").
+// NewCityDoltLocalOnlyRemoteCheck creates the CITY-store variant of the
+// local-only Dolt remote check.
+//
+// This exists because the per-rig registration cannot see the city's own beads
+// database. hq — this city's primary store — is not a rig, so for as long as
+// the check was registered only inside the per-rig loop it had no registration
+// that could ever inspect the database that actually carried the off-box remote
+// (ga-cc4wzn / ga-51iq0s).
+//
+// The city store is addressed by pointing the same logic at cityPath: the
+// config lives at <cityPath>/.beads/config.yaml and the database name comes
+// from <cityPath>/.beads/metadata.json, exactly as it does for a rig.
+func NewCityDoltLocalOnlyRemoteCheck(cityPath, doltDataDir string) *DoltLocalOnlyRemoteCheck {
+	c := NewDoltLocalOnlyRemoteCheck(cityPath, config.Rig{Name: "city", Path: cityPath}, doltDataDir)
+	c.cityScope = true
+	return c
+}
+
+// Name returns the check identifier — "city:dolt-local-only-remote" for the
+// city store, "rig:<name>:dolt-local-only-remote" for a rig.
 func (c *DoltLocalOnlyRemoteCheck) Name() string {
+	if c.cityScope {
+		return "city:dolt-local-only-remote"
+	}
 	return "rig:" + c.rig.Name + ":dolt-local-only-remote"
+}
+
+// scopeDesc names the inspected store for operator-facing messages.
+func (c *DoltLocalOnlyRemoteCheck) scopeDesc() string {
+	if c.cityScope {
+		return "city store"
+	}
+	return fmt.Sprintf("rig %q", c.rig.Name)
 }
 
 // Run executes the check.
@@ -50,13 +85,16 @@ func (c *DoltLocalOnlyRemoteCheck) Run(_ *CheckContext) *CheckResult {
 	localOnly, configured, err := rigDoltLocalOnly(rigPath)
 	if err != nil {
 		r.Status = StatusWarning
-		r.Message = fmt.Sprintf("rig %q: cannot read dolt local-only config", c.rig.Name)
+		r.Message = c.scopeDesc() + ": cannot read dolt local-only config"
 		r.Details = []string{err.Error()}
 		return r
 	}
 	if !configured {
-		r.Status = StatusOK
-		r.Message = "dolt local-only not configured"
+		// NOT StatusOK: an unset key does not mean the rig cannot hold an
+		// off-box remote — hq carried exactly the remote this check hunts for
+		// 22 hours while this branch reported green (ga-cc4wzn / ga-51iq0s).
+		r.Status = StatusSkipped
+		r.Message = "dolt local-only not configured — off-box remotes NOT checked"
 		return r
 	}
 	if !localOnly {
@@ -69,7 +107,7 @@ func (c *DoltLocalOnlyRemoteCheck) Run(_ *CheckContext) *CheckResult {
 	r.Details = append(r.Details, details...)
 	if err != nil {
 		r.Status = StatusWarning
-		r.Message = fmt.Sprintf("rig %q: cannot inspect Dolt repo_state.json", c.rig.Name)
+		r.Message = c.scopeDesc() + ": cannot inspect Dolt repo_state.json"
 		r.Details = append(r.Details, err.Error())
 		return r
 	}
@@ -80,8 +118,8 @@ func (c *DoltLocalOnlyRemoteCheck) Run(_ *CheckContext) *CheckResult {
 	}
 
 	r.Status = StatusWarning
-	r.Message = fmt.Sprintf("rig %q: dolt.local-only is true but off-box Dolt remote(s) are registered: %s",
-		c.rig.Name, localOnlyRemoteNames(offBox))
+	r.Message = fmt.Sprintf("%s: dolt.local-only is true but off-box Dolt remote(s) are registered: %s",
+		c.scopeDesc(), localOnlyRemoteNames(offBox))
 	r.FixHint = localOnlyRemoteFixHint(offBox)
 	return r
 }
