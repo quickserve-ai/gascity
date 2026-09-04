@@ -1,0 +1,281 @@
+package main
+
+// Stop-intent markers for the managed dolt sql-server (ga-drkbcd).
+//
+// The scope watchdog supervises the server but does not own every stop of it.
+// `gc dolt stop` — and the recovery path behind it — signals the dolt PID
+// DIRECTLY (stopManagedDoltProcessWithOptions), never the watchdog. dolt
+// handles SIGTERM and shuts down gracefully, so cmd.Wait() in the watchdog
+// returns nil. From the watchdog's side a shutdown we asked for and a healthy
+// server that decided to exit 0 mid-service are therefore the SAME observation,
+// and both rendered as the reassuring line "exited cleanly". That is why the
+// 2026-08-15 data-plane stop was silent: the most disruptive event of the day
+// took the branch every alarm treats as the good one.
+//
+// The marker closes that gap by writing the intent down where the watchdog can
+// read it. The stopper records "I am about to stop pid N" beside the server's
+// --config file — the one path the stopper (via managedDoltRuntimeLayout) and
+// the watchdog (via its argv) already agree on — and the watchdog consults it
+// when its child exits with status 0. A status-0 exit covered by a fresh marker
+// is a shutdown we requested; a status-0 exit with no marker is an UNEXPECTED
+// clean exit and alarms.
+//
+// Every write and delete here is advisory and best-effort: a marker that fails
+// to land never fails a stop. The degradation is a false ALARM on a stop we did
+// request, which is the safe direction — the failure mode being replaced is
+// silence.
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/gastownhall/gascity/internal/fsys"
+)
+
+const (
+	// managedDoltStopIntentFileName is the marker's basename inside the
+	// server's pack state dir (the directory holding its --config file).
+	managedDoltStopIntentFileName = "dolt-stop-intent.json"
+
+	// managedDoltStopIntentTTL is the DEFAULT window in which a marker can
+	// vouch for a clean exit. It only has to outlast one stop: SIGTERM, the
+	// configured SIGTERM→SIGKILL grace (config.DefaultDoltStopTimeout, 30s),
+	// and dolt's own journal flush. Ten minutes is far past that while still
+	// guaranteeing a marker abandoned by a crashed stopper cannot silence a
+	// later unexpected exit indefinitely. The primary staleness defense is not
+	// the TTL but the PID match plus the clear-on-spawn in
+	// startManagedDoltProcessWithOptions: a marker can only ever name the
+	// current server generation.
+	//
+	// A stopper whose own grace window is LONGER than this records a bigger one
+	// in the marker (managedDoltStopIntentTTLForGrace); a fixed default would
+	// otherwise expire mid-shutdown and alarm on a stop still in progress.
+	managedDoltStopIntentTTL = 10 * time.Minute
+
+	// managedDoltStopIntentGraceSlack is added to a stopper's configured grace
+	// when sizing its marker, covering the work that happens after the grace
+	// ends — SIGKILL escalation, the store-lock release wait, dolt's journal
+	// flush — so the marker outlives the stop it authorizes rather than
+	// expiring in its last seconds.
+	managedDoltStopIntentGraceSlack = 2 * time.Minute
+
+	// managedDoltStopIntentTTLCap bounds any vouching window, whatever a
+	// stopper asked for. No real shutdown of this server takes a day; a window
+	// past that could only silence a genuinely unexplained exit. The cap is
+	// also what makes the TTL arithmetic total: with every input clamped to it
+	// first, the additions and second-multiplications below cannot overflow on
+	// a pathological configured timeout or a hostile marker value.
+	managedDoltStopIntentTTLCap = 24 * time.Hour
+
+	// managedDoltStopIntentFutureSkew tolerates a marker stamped slightly in
+	// the future (clock adjustment between the stopper and the watchdog).
+	// Beyond it the marker is not trusted — an unexplained future timestamp is
+	// exactly the state where we would rather alarm than reassure.
+	managedDoltStopIntentFutureSkew = time.Minute
+
+	// managedDoltStopIntentRequesterMaxLen bounds the recorded requester argv
+	// so a pathological command line cannot bloat the marker or the log line
+	// that quotes it.
+	managedDoltStopIntentRequesterMaxLen = 240
+)
+
+// managedDoltStopIntent is one recorded "gc is stopping this server" decision.
+// It is the attribution the 2026-08-15 postmortem could not produce: who asked,
+// from which process, when, and for which server PID.
+type managedDoltStopIntent struct {
+	PID          int    `json:"pid"`
+	RequestedAt  string `json:"requested_at"`
+	RequesterPID int    `json:"requester_pid"`
+	Requester    string `json:"requester"`
+	Reason       string `json:"reason"`
+	// TTLSeconds is the vouching window this stopper asked for, when it is
+	// longer than the default. Zero (including every marker written before the
+	// field existed) means the default. It can only ever LENGTHEN the window —
+	// see managedDoltStopIntentEffectiveTTL — so a corrupt or hostile small
+	// value cannot shorten the authorization of a stop in progress.
+	TTLSeconds int `json:"ttl_seconds,omitempty"`
+}
+
+// managedDoltStopIntentTTLForGrace sizes a marker for a stopper whose grace
+// window is known. Anything at or below the default keeps the default.
+func managedDoltStopIntentTTLForGrace(gracePeriod time.Duration) time.Duration {
+	if gracePeriod <= 0 {
+		return managedDoltStopIntentTTL
+	}
+	// Compare before adding: past the cap the answer is the cap, and the
+	// unperformed addition is what keeps a huge configured grace from
+	// wrapping negative.
+	if gracePeriod >= managedDoltStopIntentTTLCap-managedDoltStopIntentGraceSlack {
+		return managedDoltStopIntentTTLCap
+	}
+	return max(managedDoltStopIntentTTL, gracePeriod+managedDoltStopIntentGraceSlack)
+}
+
+// managedDoltStopIntentEffectiveTTL is the window a marker actually vouches
+// for: the longer of the default and what the stopper recorded.
+func managedDoltStopIntentEffectiveTTL(intent managedDoltStopIntent) time.Duration {
+	if intent.TTLSeconds <= 0 {
+		return managedDoltStopIntentTTL
+	}
+	// Clamp the seconds before multiplying: a marker is on-disk JSON, so the
+	// field can hold any int a writer chose, including one whose
+	// nanosecond conversion wraps.
+	seconds := intent.TTLSeconds
+	if capSeconds := int(managedDoltStopIntentTTLCap / time.Second); seconds > capSeconds {
+		seconds = capSeconds
+	}
+	return max(managedDoltStopIntentTTL, time.Duration(seconds)*time.Second)
+}
+
+// managedDoltStopIntentPath locates the marker for the server started with
+// configFile. Both sides derive it from the config path rather than from the
+// city layout because the watchdog is a bare re-exec that receives only the
+// config path, the log path and the city path — resolving a layout there would
+// re-read env that may have moved since the spawn.
+func managedDoltStopIntentPath(configFile string) string {
+	configFile = strings.TrimSpace(configFile)
+	if configFile == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(configFile), managedDoltStopIntentFileName)
+}
+
+// managedDoltStopIntentRequester describes the calling process for the marker.
+// It reads its own argv rather than forking ps: the stopper IS the requester,
+// so no inspection is needed and the stop path stays fork-free.
+func managedDoltStopIntentRequester() string {
+	return truncateManagedDoltStopIntentField(strings.Join(os.Args, " "))
+}
+
+func truncateManagedDoltStopIntentField(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) <= managedDoltStopIntentRequesterMaxLen {
+		return value
+	}
+	return value[:managedDoltStopIntentRequesterMaxLen] + "…"
+}
+
+// recordManagedDoltStopIntent writes the marker before a stop signals pid,
+// vouching for the default window. Best-effort by contract: the returned error
+// is for tests and callers that want to log it, never for failing a stop.
+func recordManagedDoltStopIntent(configFile string, pid int, reason string) error {
+	return recordManagedDoltStopIntentWithTTL(configFile, pid, reason, managedDoltStopIntentTTL)
+}
+
+// recordManagedDoltStopIntentWithTTL is recordManagedDoltStopIntent for a
+// stopper that knows its own shutdown window and needs the marker to outlast
+// it. A ttl at or below the default is recorded as the default.
+func recordManagedDoltStopIntentWithTTL(configFile string, pid int, reason string, ttl time.Duration) error {
+	path := managedDoltStopIntentPath(configFile)
+	if path == "" || pid <= 0 {
+		return nil
+	}
+	ttlSeconds := 0
+	if ttl > managedDoltStopIntentTTL {
+		// Cap first (total arithmetic), then round UP: a window rounded down
+		// could expire fractionally before the stop it vouches for completes,
+		// and the whole point of recording one is that it outlasts the stop.
+		if ttl > managedDoltStopIntentTTLCap {
+			ttl = managedDoltStopIntentTTLCap
+		}
+		ttlSeconds = int((ttl + time.Second - 1) / time.Second)
+	}
+	intent := managedDoltStopIntent{
+		PID:          pid,
+		RequestedAt:  time.Now().UTC().Format(time.RFC3339Nano),
+		RequesterPID: os.Getpid(),
+		Requester:    managedDoltStopIntentRequester(),
+		Reason:       truncateManagedDoltStopIntentField(reason),
+		TTLSeconds:   ttlSeconds,
+	}
+	data, err := json.Marshal(intent)
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return fsys.WriteFileAtomic(fsys.OSFS{}, path, data, 0o644)
+}
+
+// clearManagedDoltStopIntent removes the marker. Called when a stop completes
+// and again before every fresh spawn, so a marker never outlives the server
+// generation it was written for.
+func clearManagedDoltStopIntent(configFile string) error {
+	path := managedDoltStopIntentPath(configFile)
+	if path == "" {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// readManagedDoltStopIntent loads the marker. A missing or unreadable marker
+// reports found=false, which the exit classifier treats as "nobody asked" —
+// the alarming direction.
+func readManagedDoltStopIntent(configFile string) (managedDoltStopIntent, bool) {
+	path := managedDoltStopIntentPath(configFile)
+	if path == "" {
+		return managedDoltStopIntent{}, false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return managedDoltStopIntent{}, false
+	}
+	var intent managedDoltStopIntent
+	if err := json.Unmarshal(data, &intent); err != nil {
+		return managedDoltStopIntent{}, false
+	}
+	return intent, true
+}
+
+// managedDoltStopIntentCovers reports whether intent explains a stop of pid
+// observed at now. It is the whole intentional-vs-unexpected decision, kept
+// pure so the classification is testable without processes or files.
+//
+// Coverage requires all of: a positive PID that matches exactly, a parseable
+// timestamp, and a timestamp inside [now-TTL, now+skew], where the TTL is the
+// marker's own effective window. Anything else — a marker for a different PID,
+// an unparseable stamp, a stale marker, a marker from the future — fails to
+// cover, and the exit alarms.
+func managedDoltStopIntentCovers(intent managedDoltStopIntent, pid int, now time.Time) bool {
+	if pid <= 0 || intent.PID != pid {
+		return false
+	}
+	requestedAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(intent.RequestedAt))
+	if err != nil {
+		return false
+	}
+	age := now.Sub(requestedAt)
+	if age > managedDoltStopIntentEffectiveTTL(intent) {
+		return false
+	}
+	return age >= -managedDoltStopIntentFutureSkew
+}
+
+// describeManagedDoltStopIntent renders the marker for a log line. It names the
+// requester so the log answers "who stopped the database" directly rather than
+// leaving the reader to correlate timestamps across files.
+func describeManagedDoltStopIntent(intent managedDoltStopIntent) string {
+	parts := make([]string, 0, 3)
+	if reason := strings.TrimSpace(intent.Reason); reason != "" {
+		parts = append(parts, reason)
+	}
+	if intent.RequesterPID > 0 {
+		parts = append(parts, "requester pid "+strconv.Itoa(intent.RequesterPID))
+	}
+	if requester := strings.TrimSpace(intent.Requester); requester != "" {
+		parts = append(parts, "argv "+requester)
+	}
+	if len(parts) == 0 {
+		return "gc (unattributed marker)"
+	}
+	return strings.Join(parts, ", ")
+}
