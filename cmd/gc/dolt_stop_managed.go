@@ -121,6 +121,16 @@ func stopManagedDoltProcessWithOptions(cityPath, port string, clearPublishedStat
 	}
 	report.HadPID = true
 	report.PID = targetPID
+	// ga-drkbcd: this path signals the dolt PID DIRECTLY, never the scope
+	// watchdog, and dolt shuts down gracefully on SIGTERM — so the watchdog
+	// sees cmd.Wait() return nil, exactly as it would for a server that chose
+	// to exit 0 mid-service. Record the intent before signaling so the watchdog
+	// can tell the two apart; without it the watchdog must either alarm on
+	// every requested stop or stay silent on every unrequested one. Advisory:
+	// a marker that fails to land costs a false alarm, never the stop.
+	if err := recordManagedDoltStopIntent(layout.ConfigFile, targetPID, "gc managed dolt stop"); err != nil {
+		managedDoltCleanupLogf("recording stop intent for pid %d: %v", targetPID, err)
+	}
 	if managedStopPIDAlive(targetPID) {
 		if err := syscall.Kill(targetPID, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
 			return report, fmt.Errorf("signal %d with SIGTERM: %w", targetPID, err)
@@ -180,6 +190,12 @@ func stopManagedDoltProcessWithOptions(cityPath, port string, clearPublishedStat
 }
 
 func clearManagedDoltRuntime(layout managedDoltRuntimeLayout, portText string) error {
+	// ga-drkbcd: the stop is over, so the intent marker has done its job. Left
+	// behind it would be a stale vouching record; its TTL and PID match already
+	// bound the damage, but the marker should not outlive the stop it records.
+	if err := clearManagedDoltStopIntent(layout.ConfigFile); err != nil {
+		managedDoltCleanupLogf("clearing stop intent: %v", err)
+	}
 	port := 0
 	if state, err := readDoltRuntimeStateFile(layout.StateFile); err == nil {
 		port = state.Port
