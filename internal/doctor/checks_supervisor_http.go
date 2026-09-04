@@ -52,7 +52,7 @@ func (c *SupervisorHTTPCheck) Fix(_ *CheckContext) error { return nil }
 func (c *SupervisorHTTPCheck) Run(_ *CheckContext) *CheckResult {
 	r := &CheckResult{Name: c.Name()}
 	if !c.supervisorRunning {
-		r.Status = StatusOK
+		r.Status = StatusSkipped
 		r.Message = "supervisor socket not running — HTTP API check skipped"
 		return r
 	}
