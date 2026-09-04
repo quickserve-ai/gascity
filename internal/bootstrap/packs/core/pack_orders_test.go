@@ -331,3 +331,114 @@ func TestRenudgeStaleHumanGatesScriptContract(t *testing.T) {
 		t.Error("renudge-stale-human-gates.sh must exit non-zero when a re-nudge failed, or the loud-fail message is never logged (#4543)")
 	}
 }
+
+// TestDetectSilentPublishedWorkOrder pins the silence detector's dispatch
+// contract: a mechanical cooldown sweep run via exec, no pool, pointing at an
+// embedded script.
+func TestDetectSilentPublishedWorkOrder(t *testing.T) {
+	assertCooldownExecOrder(t, "detect-silent-published-work.toml", "detect-silent-published-work.sh")
+}
+
+// TestDetectSilentPublishedWorkScriptContract guards the behaviors that make
+// this detector trustworthy. Its runtime failures are best-effort and its whole
+// purpose is to be believed when it says "nothing is stalled", so the load-
+// bearing elements are pinned here rather than left to review:
+//
+//   - EVIDENCE DISCIPLINE (ga-mmvpq1 08:10Z, binding): progress is established
+//     by comparing live state against a persisted OBSERVATION, never by reading
+//     a record of what a prior sweep did. The persisted keys are therefore
+//     observed_* and first_observed_in_state_at, and gate dedup/auto-resolve go
+//     through a live gate query. An action log can lose an entry for an action
+//     that succeeded or keep one for an action that never took effect, and
+//     neither is detectable from the log — so a log-based detector reports clean
+//     sweeps that never happened, which is the exact class it exists to catch.
+//   - READ-FAILURE IS NOT ABSENCE: a failed read classifies UNKNOWN and is
+//     skipped, never counted as silence (false alarm on every PR at once) and
+//     never as health (the fault, hidden by its own detector). Mirrors the
+//     refinery predicate's "refusing rather than reporting a read failure as
+//     gate-absence".
+//   - STICKY IDENTITY IS AUTHENTICATED: a bare startswith match is not enough —
+//     a read-only member can post a lookalike gate comment. The author's
+//     EFFECTIVE repo permission must be write or higher, matching the predicate.
+//   - HEALTH-BLIND: the detector must not read CI conclusions, mergeability, or
+//     review verdicts. No PR-health signal separates the four exhibits, and
+//     reading them would rank a red-but-worked PR below a green abandoned one.
+//   - NOT OBSERVE-ONLY (explicit ratification prohibition): there must be no
+//     dry-run knob. A detector that observes and does not act is
+//     indistinguishable from one that is switched off.
+//   - Portable timestamps: GNU-only `date -d` returns empty on BSD/macOS, which
+//     would fail every age check and pass the whole sweep as clean.
+//   - Loud-fail: surfacing requires a NON-ZERO exit, since the controller logs
+//     an exec order's output only on failure (#4543).
+func TestDetectSilentPublishedWorkScriptContract(t *testing.T) {
+	data, err := fs.ReadFile(PackFS, "assets/scripts/detect-silent-published-work.sh")
+	if err != nil {
+		t.Fatalf("reading detect-silent-published-work.sh: %v", err)
+	}
+	body := string(data)
+
+	for _, want := range []string{
+		"pr_published_awaiting_gate", // B1 arm (i): the published states
+		"gate_clear_awaiting_merge",
+		"first_observed_in_state_at", // B3: the clock, anchored on observation
+		"observed_head",              // B3: push detected by head comparison
+		"observed_marker",            // B3: re-render detected by marker change
+		"GC_SILENT_WORK_THRESHOLD",   // B3: the one knob
+		"collaborators/",             // B2: effective-permission authentication
+		"## Sherpa gate",             // B2: sticky selection, predicate-identical
+		`\*\*Gate status\*\*`,        // B2: the canonical verdict line (sed-escaped in the script)
+		`\*\*HEAD\*\*`,               // B2: the pinned-head freshness marker (sed-escaped)
+		"silent-ungated",             // B2: STATE 1
+		"silent-stale",               // B2: STATE 2
+		"silent-unexecuted",          // B2: STATE 2' (refinery as dead owner)
+		"bypass-detected",            // A6: merged with no CLEAR gate
+		"gc bd gate create",          // B4(ii): the supported creation surface
+		"gc.silent_work_alarm",       // B4(i): the bead-attached record
+		"THIS WORK EXISTS",           // B4(i): the anti-duplication signal
+		"gh pr list",                 // B1 arm (ii): reconciliation
+		"--limit 0",                  // no silent truncation of candidates
+		"date -ju -f",                // portable timestamps (BSD/macOS)
+		".hq != true",                // cross-rig convention
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("detect-silent-published-work.sh missing load-bearing element %q", want)
+		}
+	}
+
+	// Health-blind by construction. If any of these ever appear, the detector
+	// has started ranking PRs by health, which demonstrably does not separate
+	// the exhibits it exists to catch.
+	for _, forbidden := range []string{
+		"mergeable",
+		"check-runs",
+		"statusCheckRollup",
+		"reviewDecision",
+	} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("detect-silent-published-work.sh reads PR health signal %q; the detector must key on absence of progress only", forbidden)
+		}
+	}
+
+	// The explicit ratification prohibition: no observe-only escape hatch.
+	for _, forbidden := range []string{"DRY_RUN", "dry_run", "--dry-run"} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("detect-silent-published-work.sh contains %q; ga-mmvpq1 ratification prohibits shipping this detector in observe-only mode", forbidden)
+		}
+	}
+
+	// Read-failure must classify UNKNOWN and skip, never fall through to a
+	// silence verdict or a health verdict.
+	if !strings.Contains(body, "UNKNOWN") {
+		t.Error("detect-silent-published-work.sh must classify read failures as UNKNOWN rather than as absence of work")
+	}
+	// The 08:10Z constraint, pinned as a mechanism rather than a comment: gate
+	// dedup and auto-resolve must ask the store what exists NOW.
+	if !strings.Contains(body, "open_gate_for_episode") {
+		t.Error("detect-silent-published-work.sh must resolve gate existence with a live query (08:10Z: a state query, not an action log)")
+	}
+	// Loud-fail exit contract (#4543): the controller logs an exec order's
+	// output only on a non-zero exit, so failures must exit non-zero.
+	if !strings.Contains(body, `"$FAILED" -gt 0`) {
+		t.Error("detect-silent-published-work.sh must exit non-zero when an action failed, or the loud-fail messages are never logged (#4543)")
+	}
+}
