@@ -110,7 +110,10 @@ func (c *CachingStore) checkReconcileOverdue(now time.Time) {
 		return
 	}
 	c.lastOverdueLogAt = now
-	c.problemf("beads cache: reconcile overdue: " + errCacheReconcileOverdue.Error())
+	// No "beads cache:" prefix here — the production problemf already adds one
+	// (NewCachingStore), and a doubled prefix in the supervisor log reads as a bug
+	// in the alarm, which is the last thing an alarm can afford to look like.
+	c.problemf("reconcile overdue: " + errCacheReconcileOverdue.Error())
 }
 
 // reconcileOverdueLocked reports whether a completed reconcile is overdue.
