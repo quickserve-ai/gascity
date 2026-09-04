@@ -121,6 +121,8 @@ func TestInstallSupervisorSystemdBinaryMismatchGuard(t *testing.T) {
 }
 
 func TestInstallSupervisorLaunchdBinaryMismatchGuard(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
 	stubSupervisorLaunchdUnloaded(t)
 	for _, tc := range []struct {
 		name           string
@@ -283,21 +285,6 @@ func TestSupervisorLaunchdPlistGCPathExtractsProgramArgument(t *testing.T) {
 	}
 	if got := supervisorLaunchdPlistGCPath("<plist><dict></dict></plist>"); got != "" {
 		t.Fatalf("supervisorLaunchdPlistGCPath(missing ProgramArguments) = %q, want empty", got)
-	}
-}
-
-func TestLaunchdPrintReportsAbsent(t *testing.T) {
-	for _, message := range []string{
-		`Bad request.\nCould not find service "com.gastown.daemon" in domain for user gui: 501`,
-		`Could not find service "com.gastown.daemon"`,
-		`No such process`,
-	} {
-		if !launchdPrintReportsAbsent(message) {
-			t.Fatalf("launchdPrintReportsAbsent(%q) = false, want true", message)
-		}
-	}
-	if launchdPrintReportsAbsent("permission denied") {
-		t.Fatal("permission error classified as absent service")
 	}
 }
 

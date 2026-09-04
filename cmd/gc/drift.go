@@ -243,8 +243,10 @@ func launchdRestartRollbackSafe(err error) bool {
 //     would race with systemd's own respawn.
 //
 //   - LaunchdManaged: refreshes the scoped job registration with
-//     `launchctl bootout` / `bootstrap`, then enables and starts it. A plain
-//     kickstart retains launchd's cached launch constraints across binary swaps.
+//     `launchctl bootout`, then `enable`, `bootstrap` and `kickstart -p`. A
+//     plain kickstart retains launchd's cached launch constraints across binary
+//     swaps. The job is enabled before bootstrap because `gc supervisor stop`
+//     disables it (#5334) and launchd refuses to bootstrap a disabled service.
 //
 //   - Direct: we kill the process by PID and spawn a new instance from
 //     ExePath. Kill failures abort the restart so we never run two
@@ -284,24 +286,24 @@ func restartSupervisor(spec restartSpec, h restartHelpers) error {
 		if err := h.Launchctl("bootout", target); err != nil {
 			waitErr := h.WaitLaunchdUnloaded(spec.LaunchdLabel, launchdRefreshWaitTimeout)
 			if waitErr == nil {
-				return &launchdRestartError{err: fmt.Errorf("launchctl bootout %s reported %v after unloading the job; supervisor is stopped; recover with: launchctl bootstrap %s %s && launchctl enable %s && launchctl kickstart -p %s", target, err, shellSingleQuote(supervisorLaunchdDomain()), shellSingleQuote(plistPath), shellSingleQuote(target), shellSingleQuote(target)), rollbackSafe: true}
+				return &launchdRestartError{err: fmt.Errorf("launchctl bootout %s reported %w after unloading the job; supervisor is stopped; recover with: launchctl enable %s && launchctl bootstrap %s %s && launchctl kickstart -p %s", target, err, shellSingleQuote(target), shellSingleQuote(supervisorLaunchdDomain()), shellSingleQuote(plistPath), shellSingleQuote(target)), rollbackSafe: true}
 			}
-			return fmt.Errorf("launchctl bootout %s reported %v; supervisor job state is unknown (%v); inspect with launchctl print %s before recovery", target, err, waitErr, shellSingleQuote(target))
+			return fmt.Errorf("launchctl bootout %s reported %w; supervisor job state is unknown (%w); inspect with launchctl print %s before recovery", target, err, waitErr, shellSingleQuote(target))
 		}
 		if err := h.WaitLaunchdUnloaded(spec.LaunchdLabel, launchdRefreshWaitTimeout); err != nil {
-			return fmt.Errorf("waiting for launchd bootout %s: %w; supervisor is stopped and job state is unknown; inspect with: launchctl print %s; once absent, recover with: launchctl bootstrap %s %s && launchctl enable %s && launchctl kickstart -p %s", target, err, shellSingleQuote(target), shellSingleQuote(supervisorLaunchdDomain()), shellSingleQuote(plistPath), shellSingleQuote(target), shellSingleQuote(target))
+			return fmt.Errorf("waiting for launchd bootout %s: %w; supervisor is stopped and job state is unknown; inspect with: launchctl print %s; once absent, recover with: launchctl enable %s && launchctl bootstrap %s %s && launchctl kickstart -p %s", target, err, shellSingleQuote(target), shellSingleQuote(target), shellSingleQuote(supervisorLaunchdDomain()), shellSingleQuote(plistPath), shellSingleQuote(target))
 		}
 		domainArg := shellSingleQuote(supervisorLaunchdDomain())
 		plistArg := shellSingleQuote(plistPath)
 		targetArg := shellSingleQuote(target)
 		startRecovery := "launchctl kickstart -p " + targetArg
-		enableRecovery := "launchctl enable " + targetArg + " && " + startRecovery
-		bootstrapRecovery := "launchctl bootstrap " + domainArg + " " + plistArg + " && " + enableRecovery
-		if err := h.Launchctl("bootstrap", supervisorLaunchdDomain(), plistPath); err != nil {
-			return &launchdRestartError{err: fmt.Errorf("launchctl bootstrap %s %s: %w; supervisor is stopped; recover with: %s", supervisorLaunchdDomain(), plistPath, err, bootstrapRecovery), rollbackSafe: true}
-		}
+		bootstrapRecovery := "launchctl bootstrap " + domainArg + " " + plistArg + " && " + startRecovery
+		enableRecovery := "launchctl enable " + targetArg + " && " + bootstrapRecovery
 		if err := h.Launchctl("enable", target); err != nil {
 			return &launchdRestartError{err: fmt.Errorf("launchctl enable %s: %w; supervisor is stopped; recover with: %s", target, err, enableRecovery), rollbackSafe: true}
+		}
+		if err := h.Launchctl("bootstrap", supervisorLaunchdDomain(), plistPath); err != nil {
+			return &launchdRestartError{err: fmt.Errorf("launchctl bootstrap %s %s: %w; supervisor is stopped; recover with: %s", supervisorLaunchdDomain(), plistPath, err, bootstrapRecovery), rollbackSafe: true}
 		}
 		if err := h.Launchctl("kickstart", "-p", target); err != nil {
 			return &launchdRestartError{err: fmt.Errorf("launchctl kickstart -p %s: %w; supervisor is stopped; recover with: %s", target, err, startRecovery), rollbackSafe: true}
