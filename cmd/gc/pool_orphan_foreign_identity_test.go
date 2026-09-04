@@ -1305,3 +1305,57 @@ func TestCityRuntimeBeadReconcileTick_OrphanCloseReleasesTrimmedSeatAndClosesIt(
 		t.Fatalf("foreign claim = status %q assignee %q, want in_progress/repo/dalinar untouched", gotForeign.Status, gotForeign.Assignee)
 	}
 }
+
+// TestReleaseConfirmedOrphanSessionWork_GatesUnobservableIdentifier covers the
+// SECOND release site (the ga-jrnou orphan-close tie-break). Its identifier set
+// is built from raw session-bead metadata (sessionAssignmentIdentifierRawInfo),
+// not from the roster, so a stored session_name colliding with another city's
+// identity reaches this release with no other guard. One call carries both
+// claims: the unobservable identity is protected while the locally-minted pool
+// instance is still released — the same non-vacuity shape as the sweep test, so
+// a gate that simply disabled this site would fail the second half.
+func TestReleaseConfirmedOrphanSessionWork_GatesUnobservableIdentifier(t *testing.T) {
+	cityStore := beads.NewMemStore()
+	rigStore := beads.NewMemStore()
+	cfg := foreignIdentityTestCity(t)
+	rigStores := map[string]beads.Store{"repo": rigStore}
+
+	foreign := seedForeignIdentityWork(t, rigStore, "claim under a foreign-shaped stored name", "repo/dalinar")
+	local := seedForeignIdentityWork(t, rigStore, "claim under a locally minted pool instance", "repo/worker-1")
+
+	logBuf := captureSweepLog(t)
+	released := releaseConfirmedOrphanSessionWork(cfg, cityStore, rigStores,
+		[]beads.Bead{foreign, local},
+		[]beads.Store{rigStore, rigStore},
+		session.Info{SessionNameMetadata: "repo/dalinar"},
+	)
+	if len(released) != 0 {
+		t.Fatalf("released = %v, want none (the only matching identifier is unobservable)", released)
+	}
+	gotForeign, err := rigStore.Get(foreign.ID)
+	if err != nil {
+		t.Fatalf("Get foreign-shaped claim: %v", err)
+	}
+	if gotForeign.Status != "in_progress" || gotForeign.Assignee != "repo/dalinar" {
+		t.Fatalf("claim = status %q assignee %q, want in_progress/repo/dalinar untouched", gotForeign.Status, gotForeign.Assignee)
+	}
+	if logged := logBuf.String(); !strings.Contains(logged, `protected "repo/dalinar" (`+foreign.ID+`)`) {
+		t.Fatalf("gate must refuse loudly, naming the identity and claim:\n%s", logged)
+	}
+
+	released = releaseConfirmedOrphanSessionWork(cfg, cityStore, rigStores,
+		[]beads.Bead{foreign, local},
+		[]beads.Store{rigStore, rigStore},
+		session.Info{SessionNameMetadata: "repo/worker-1"},
+	)
+	if len(released) != 1 || released[0].ID != local.ID {
+		t.Fatalf("released = %v, want exactly [%s] (the locally minted instance still releases)", released, local.ID)
+	}
+	gotLocal, err := rigStore.Get(local.ID)
+	if err != nil {
+		t.Fatalf("Get local claim: %v", err)
+	}
+	if gotLocal.Status != "open" || gotLocal.Assignee != "" {
+		t.Fatalf("local claim = status %q assignee %q, want open/unassigned", gotLocal.Status, gotLocal.Assignee)
+	}
+}
