@@ -49,7 +49,7 @@ func TestSlingCommands(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected error for invalid merge strategy, got success")
 		}
-		if !strings.Contains(out, "must be direct, mr, or local") {
+		if !strings.Contains(out, "must be direct, pr, mr, or local") {
 			t.Errorf("expected merge strategy error, got:\n%s", out)
 		}
 	})
