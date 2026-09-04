@@ -9,7 +9,7 @@ import (
 func TestDoltJournalSizeCheck_Skipped(t *testing.T) {
 	c := NewDoltJournalSizeCheck(t.TempDir(), true)
 	r := c.Run(&CheckContext{})
-	if r.Status != StatusOK {
+	if r.Status != StatusSkipped {
 		t.Fatalf("status = %d, want OK; msg = %s", r.Status, r.Message)
 	}
 	if !strings.Contains(r.Message, "skipped") {
@@ -21,7 +21,7 @@ func TestDoltJournalSizeCheck_NonManagedDolt(t *testing.T) {
 	dir := setupFreshManagedDoltCity(t)
 	c := NewDoltJournalSizeCheck(dir, false)
 	r := c.Run(&CheckContext{})
-	if r.Status != StatusOK {
+	if r.Status != StatusSkipped {
 		t.Fatalf("status = %d, want OK; msg = %s", r.Status, r.Message)
 	}
 	if !strings.Contains(r.Message, "skipped") {
