@@ -541,6 +541,59 @@ fi
 offsite_backup_note_json="$(json_escape_string "$offsite_backup_note")"
 offsite_backup_state_json="$(json_escape_string "$offsite_backup_state")"
 
+# --- COMPACT PENDING-PUSH plane, ga-2wvmj9 -----------------------------------
+#
+# A post-compaction mirror push is CORRECTLY rejected — a flatten rewrites lineage
+# — so the compactor records a deferral marker and retries it later, verifying the
+# remote head has not moved before force-updating. Past its max age it stops
+# retrying and prints "manual review required" to STDOUT, which orders do not
+# persist. Nothing else has ever read that directory: commands/compact/run.sh
+# contains no dolt_escalate and no dolt_notify, and no patrol, doctor check or
+# health plane looked at it. A deferral is a promise to retry; an expired one with
+# no reader is a promise nobody keeps, and the live proof was a qcore marker from
+# 2026-07-16 that had gone fifty days without a single mention.
+#
+# THE THRESHOLD IS DELIBERATELY THE COMPACTOR'S OWN. Reading the same
+# GC_DOLT_COMPACT_PENDING_PUSH_MAX_AGE_SECS means health calls a marker stale at
+# exactly the moment the compactor stops auto-retrying it, so the two can never
+# disagree about whether a human is needed.
+compact_pending_state="ok"
+compact_pending_stale=false
+compact_pending_count=0
+compact_pending_oldest_age=0
+compact_pending_detail=""
+compact_pending_max_age="${GC_DOLT_COMPACT_PENDING_PUSH_MAX_AGE_SECS:-172800}"
+case "$compact_pending_max_age" in ''|*[!0-9]*) compact_pending_max_age=172800 ;; esac
+
+for cp_db in $(compact_pending_push_markers); do
+  compact_pending_count=$((compact_pending_count + 1))
+  cp_epoch="$(compact_pending_push_created_epoch "$cp_db")"
+  cp_age=""
+  case "$cp_epoch" in
+    ''|*[!0-9]*)
+      # A marker we cannot date is a marker we cannot clear. Unknown, never ok.
+      cp_state="unknown"
+      compact_pending_stale=true
+      [ "$compact_pending_state" = "stale" ] || compact_pending_state="unknown"
+      ;;
+    *)
+      cp_age=$((bf_now - cp_epoch))
+      [ "$cp_age" -lt 0 ] && cp_age=0
+      if [ "$cp_age" -gt "$compact_pending_max_age" ]; then
+        cp_state="stale"
+        compact_pending_state="stale"
+        compact_pending_stale=true
+      else
+        cp_state="deferred"
+        [ "$compact_pending_state" = "ok" ] && compact_pending_state="deferred"
+      fi
+      [ "$cp_age" -gt "$compact_pending_oldest_age" ] && compact_pending_oldest_age="$cp_age"
+      ;;
+  esac
+  compact_pending_detail="$compact_pending_detail$cp_db|$cp_state|$cp_age
+"
+done
+
 # Find orphan databases.
 #
 # Authoritative source: `gc dolt-cleanup` (HYPHEN — the Go-side command,
@@ -826,6 +879,27 @@ JSONEOF
 
     ]
   },
+  "compaction": {
+    "pending_push": {
+      "state": "$compact_pending_state",
+      "stale": $compact_pending_stale,
+      "count": $compact_pending_count,
+      "oldest_age_sec": $compact_pending_oldest_age,
+      "max_age_sec": $compact_pending_max_age,
+      "databases": [
+JSONEOF
+  first=true
+  echo "$compact_pending_detail" | while IFS='|' read -r cname cstate cage; do
+    [ -z "$cname" ] && continue
+    if [ "$first" = true ]; then first=false; else echo ","; fi
+    case "$cage" in ''|*[!0-9]*) cage=null ;; esac
+    printf '        {"name": "%s", "state": "%s", "age_sec": %s}' "$cname" "$cstate" "$cage"
+  done
+  cat <<JSONEOF
+
+      ]
+    }
+  },
   "orphans": [
 JSONEOF
   first=true
@@ -882,6 +956,22 @@ if [ -n "$local_backup_detail" ]; then
     else
       echo "  $bname: $bstate (backup missing or unreadable)"
     fi
+  done
+fi
+
+case "$compact_pending_state" in
+  ok) : ;;
+  deferred)
+    echo "Post-compaction mirror push: $compact_pending_count deferred, oldest ${compact_pending_oldest_age}s (the compactor still retries these)" ;;
+  stale)
+    echo "Post-compaction mirror push: $compact_pending_count DEFERRED PAST RETRY, oldest ${compact_pending_oldest_age}s (max ${compact_pending_max_age}s) — the compactor has stopped retrying; a human must review" ;;
+  *)
+    echo "Post-compaction mirror push: $compact_pending_count marker(s), state ${compact_pending_state}" ;;
+esac
+if [ -n "$compact_pending_detail" ]; then
+  echo "$compact_pending_detail" | while IFS='|' read -r cname cstate cage; do
+    [ -z "$cname" ] && continue
+    echo "  $cname: $cstate (deferred ${cage:-?}s ago)"
   done
 fi
 

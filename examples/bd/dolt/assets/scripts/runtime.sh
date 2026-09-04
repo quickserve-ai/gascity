@@ -115,6 +115,67 @@ write_local_backup_sync_stamp() {
   mv -f "$LOCAL_BACKUP_FRESHNESS_DIR/$lbs_db.tmp" "$LOCAL_BACKUP_FRESHNESS_DIR/$lbs_db" 2>/dev/null || return 0
 }
 
+# --- COMPACT PENDING-PUSH plane, ga-2wvmj9 -----------------------------------
+#
+# mol-dog-compactor flattens a database's history, which deliberately rewrites
+# lineage, so the next push to a mirror is CORRECTLY rejected as non-fast-forward.
+# The compactor records a deferral marker and retries it on later runs, verifying
+# the remote head has not moved before it force-updates. Past
+# GC_DOLT_COMPACT_PENDING_PUSH_MAX_AGE_SECS it stops auto-retrying and says
+# "manual review required".
+#
+# THAT SENTENCE GOES TO STDOUT, AND AN ORDER'S STDOUT IS PERSISTED NOWHERE. Read
+# 2026-09-04: commands/compact/run.sh contains zero dolt_escalate and zero
+# dolt_notify calls, and nothing outside the compactor itself reads the marker
+# directory — not health, not doctor, not a patrol. So an expired deferral is a
+# promise to retry that has quietly become a promise nobody kept, and the live
+# proof was sitting in the directory: a qcore marker created 2026-07-16, fifty
+# days old, expected_remote_head_verified=0, never mentioned by anything.
+#
+# A MARKER IS A FILE NAMED EXACTLY FOR ITS DATABASE. The compactor's own lookup
+# is `[ -f "$dir/$db" ]`, so the retirement convention used in that directory —
+# renaming to <db>.superseded-<bead>-<date> — genuinely retires a marker, because
+# the renamed file can no longer be found by any database name. The reader below
+# applies the SAME rule (valid database name = leading [A-Za-z0-9_], then
+# [A-Za-z0-9_-]) so health and the compactor cannot disagree about which markers
+# are live.
+COMPACT_PENDING_PUSH_DIR="$PACK_STATE_DIR/compact-pending-push"
+
+# compact_pending_push_markers — one LIVE marker database name per line.
+compact_pending_push_markers() {
+  [ -d "$COMPACT_PENDING_PUSH_DIR" ] || return 0
+  for cppm_file in "$COMPACT_PENDING_PUSH_DIR"/*; do
+    [ -f "$cppm_file" ] || continue
+    cppm_name="${cppm_file##*/}"
+    case "$cppm_name" in
+      [A-Za-z0-9_]*) : ;;
+      *) continue ;;
+    esac
+    case "$cppm_name" in
+      *[!A-Za-z0-9_-]*) continue ;;
+    esac
+    printf '%s\n' "$cppm_name"
+  done
+}
+
+# compact_pending_push_created_epoch <db> — echo the marker's created_at as an
+# epoch, or nothing. Parsed the same two ways the compactor parses it, so a
+# marker it can read is a marker health can read.
+compact_pending_push_created_epoch() {
+  cppc_db="${1:-}"
+  [ -n "$cppc_db" ] || return 0
+  cppc_file="$COMPACT_PENDING_PUSH_DIR/$cppc_db"
+  [ -f "$cppc_file" ] || return 0
+  cppc_at=$(sed -n 's/^created_at=//p' "$cppc_file" 2>/dev/null | head -1)
+  [ -n "$cppc_at" ] || return 0
+  case "$cppc_at" in
+    *[!0-9TZ:.-]*) return 0 ;;
+  esac
+  date -u -d "$cppc_at" +%s 2>/dev/null ||
+    date -ju -f "%Y-%m-%dT%H:%M:%SZ" "$cppc_at" +%s 2>/dev/null ||
+    return 0
+}
+
 # --- OFF-BOX (offsite) backup plane, ga-l9smko -------------------------------
 #
 # The local plane above proves a database was synced to .dolt-backup. It says
