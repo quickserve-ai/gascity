@@ -43,6 +43,15 @@ BACKUP_PRUNE_ORPHANS="${GC_DOLT_BACKUP_PRUNE_ORPHANS:-1}"
 # the city's policy call on top of that, one line in [[orders.overrides]] env.
 OFFSITE_REQUIRED="${GC_BACKUP_OFFSITE_REQUIRED:-0}"
 case "$OFFSITE_REQUIRED" in 1|true|TRUE|yes|YES) OFFSITE_REQUIRED=1 ;; *) OFFSITE_REQUIRED=0 ;; esac
+# Wall-clock bound for the off-box rsync. Was a hardcoded 300s, which is ~37 MB/s
+# sustained for this city's 11G artifact dir — unreachable over SSH, NFS or USB.
+# With the leg now FAILING the run that bound would have made a correctly
+# configured target fail forever, every 6h, which is the standing-red trap this
+# change is written to avoid. Sized to match the per-database sync ceiling and
+# left settable, because the right value is a property of the operator's link,
+# not of this script.
+OFFSITE_TIMEOUT_SECS="${GC_BACKUP_OFFSITE_TIMEOUT_SECS:-1800}"
+case "$OFFSITE_TIMEOUT_SECS" in ''|*[!0-9]*|0) OFFSITE_TIMEOUT_SECS=1800 ;; esac
 
 dolt_sql() {
     DOLT_CLI_PASSWORD="${GC_DOLT_PASSWORD:-}" \
@@ -549,13 +558,32 @@ if [ -n "$OFFSITE_PATH" ]; then
         OFFSITE_STATUS="invalid-source"
         OFFSITE_FATAL=1
         OFFSITE_DETAIL="artifact dir resolves to the live data dir ($DOLT_DATA_DIR); refusing to rsync live data off-box"
-    elif run_bounded 300 rsync -a --delete "$BACKUP_ARTIFACT_DIR/" "$OFFSITE_PATH/" 2>/dev/null; then
+    elif ! offsite_target_is_remote "$OFFSITE_PATH" \
+         && paths_on_same_volume "$OFFSITE_PATH" "$BACKUP_ARTIFACT_DIR"; then
+        # THE PREMISE, ENFORCED. "Off-box" is the entire claim this plane makes,
+        # and `rsync -a --delete X/ Y/` exits 0 whether Y is a different machine
+        # or a sibling directory on the same disk. Without this check a target
+        # on the same volume produced a stamped, ok, "off-box" copy that one
+        # disk event would take along with the original.
+        OFFSITE_STATUS="same-volume"
+        OFFSITE_FATAL=1
+        OFFSITE_DETAIL="offsite target $OFFSITE_PATH is on the SAME VOLUME as $BACKUP_ARTIFACT_DIR; a copy there survives no disk event and is not an off-box copy"
+    elif run_bounded "$OFFSITE_TIMEOUT_SECS" rsync -a --delete "$BACKUP_ARTIFACT_DIR/" "$OFFSITE_PATH/" 2>/dev/null; then
         OFFSITE_STATUS="ok"
         write_offsite_backup_sync_stamp "$OFFSITE_PATH" "$BACKUP_ARTIFACT_DIR"
     else
         OFFSITE_STATUS="failed"
         OFFSITE_FATAL=1
-        OFFSITE_DETAIL="rsync to $OFFSITE_PATH exited non-zero or exceeded its 300s bound"
+        OFFSITE_DETAIL="rsync to $OFFSITE_PATH exited non-zero or exceeded its ${OFFSITE_TIMEOUT_SECS}s bound"
+    fi
+    if [ "$OFFSITE_FATAL" -eq 1 ]; then
+        # INVALIDATE THE FRESHNESS PLANE. The copy runs with --delete, so a run
+        # killed partway leaves the destination in a state the previous stamp no
+        # longer describes. Keeping that stamp is worse than having none: the
+        # reader would report `ok` over a mutilated tree for a whole staleness
+        # window. Unknown is recoverable on the next successful run; a
+        # confidently wrong ok is not.
+        clear_offsite_backup_sync_stamp
     fi
 else
     OFFSITE_WAIVER="$(offsite_waiver_reason)"
@@ -600,7 +628,18 @@ if [ "$OFFSITE_FATAL" -eq 1 ] && [ -n "$OFFSITE_PATH" ]; then
         2>/dev/null || true
 fi
 
-SUMMARY="backup — synced: $SYNCED/$TOTAL, offsite: $OFFSITE_STATUS, last off-box copy: $OFFSITE_AGE"
+# Publish what this job was TOLD to do, every run, success or failure.
+# GC_BACKUP_OFFSITE_PATH is this order's env; `gc dolt health` runs from a
+# different order and cannot see it, so without this record health cannot tell a
+# configured-but-broken city from one that never declared a target — and would
+# send the operator after the wrong fix.
+write_offsite_backup_declaration "$OFFSITE_PATH" "$OFFSITE_STATUS"
+
+if [ "$OFFSITE_FATAL" -eq 1 ]; then
+    SUMMARY="backup FAILED — synced: $SYNCED/$TOTAL, offsite: $OFFSITE_STATUS, last off-box copy: $OFFSITE_AGE"
+else
+    SUMMARY="backup — synced: $SYNCED/$TOTAL, offsite: $OFFSITE_STATUS, last off-box copy: $OFFSITE_AGE"
+fi
 dolt_notify_done "$SUMMARY"
 echo "backup: $SUMMARY"
 if [ "$OFFSITE_FATAL" -eq 1 ]; then

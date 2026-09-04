@@ -183,13 +183,127 @@ offsite_waiver_reason() {
   owr_file="${GC_BACKUP_OFFSITE_WAIVER_FILE:-$GC_CITY_PATH/config/dolt/offsite-waived}"
   [ -f "$owr_file" ] || return 0
   while IFS= read -r owr_line || [ -n "$owr_line" ]; do
+    # Strip a trailing CR before the emptiness test, or a CRLF file's blank and
+    # comment lines both survive it and a reason arrives with a raw CR glued on.
+    owr_line="${owr_line%$(printf '\r')}"
     case "$owr_line" in
       ''|\#*) continue ;;
     esac
-    printf '%s' "$owr_line"
+    # SANITISE AT THE SOURCE. This string is operator-typed prose that reaches a
+    # JSON document, a shell summary and a mail body. Reduce it here to
+    # printable ASCII-safe text rather than trusting every downstream consumer
+    # to escape it: a stray quote in a waiver reason took `gc dolt health --json`
+    # from valid to unparseable, and its 30s consumer then reported the DOLT
+    # SERVER as unreachable — an alarm that blames the wrong subsystem, fired by
+    # the very remedy this mechanism tells operators to declare.
+    # Escaping at emit time as well (json_escape_string) is belt and braces; this
+    # is the belt.
+    printf '%s' "$owr_line" | tr -d '\000-\037' | tr '"\\' "''"
     return 0
   done < "$owr_file"
   return 0
+}
+
+# json_escape_string — emit an arbitrary string safe for a JSON string literal.
+# Escapes backslash and double quote and drops control characters. Used by any
+# pack script that interpolates operator-supplied text into a JSON report.
+json_escape_string() {
+  printf '%s' "${1:-}" \
+    | tr -d '\000-\037' \
+    | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+# --- The offsite DECLARATION record ------------------------------------------
+#
+# WHY THIS EXISTS. GC_BACKUP_OFFSITE_PATH is an [[orders.overrides]] env value on
+# mol-dog-backup. `gc dolt health` runs from a DIFFERENT order and inherits none
+# of it, so health cannot see whether a target is declared at all — it would
+# report a configured-but-broken city as "unconfigured" and point the operator at
+# the wrong fix. Two processes needing one fact is exactly the hazard the
+# mirrors-parked note above records.
+#
+# So the order that OWNS the fact publishes it, every run, success or failure.
+# This is configuration state, not an action log: it says what the job was told
+# to do and what it observed this cycle, and it is re-derived from scratch on
+# every run rather than accumulated.
+OFFSITE_BACKUP_DECLARATION_FILE="$PACK_STATE_DIR/offsite-backup-declaration"
+
+# write_offsite_backup_declaration <declared_path> <outcome>
+write_offsite_backup_declaration() {
+  obd_path="${1:-}"
+  obd_outcome="${2:-}"
+  mkdir -p "$(dirname "$OFFSITE_BACKUP_DECLARATION_FILE")" 2>/dev/null || return 0
+  {
+    printf 'checked_at_epoch=%s\n' "$(date +%s)"
+    printf 'declared_path=%s\n' "$obd_path"
+    printf 'last_outcome=%s\n' "$obd_outcome"
+  } > "$OFFSITE_BACKUP_DECLARATION_FILE.tmp" 2>/dev/null || { rm -f "$OFFSITE_BACKUP_DECLARATION_FILE.tmp" 2>/dev/null; return 0; }
+  mv -f "$OFFSITE_BACKUP_DECLARATION_FILE.tmp" "$OFFSITE_BACKUP_DECLARATION_FILE" 2>/dev/null || return 0
+}
+
+# read_offsite_backup_declared_path / _checked_epoch — echo the field or nothing.
+read_offsite_backup_declared_path() {
+  [ -f "$OFFSITE_BACKUP_DECLARATION_FILE" ] || return 0
+  sed -n 's/^declared_path=//p' "$OFFSITE_BACKUP_DECLARATION_FILE" 2>/dev/null | head -1
+}
+
+read_offsite_backup_checked_epoch() {
+  [ -f "$OFFSITE_BACKUP_DECLARATION_FILE" ] || return 0
+  robc_epoch=$(sed -n 's/^checked_at_epoch=//p' "$OFFSITE_BACKUP_DECLARATION_FILE" 2>/dev/null | head -1)
+  case "$robc_epoch" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  printf '%s' "$robc_epoch"
+}
+
+# read_offsite_backup_stamp_path — the path the last REAL copy went to. Health
+# compares it against the declared path: a stamp written to a target that is no
+# longer configured dates a copy that is no longer the copy we would rely on.
+read_offsite_backup_stamp_path() {
+  [ -f "$OFFSITE_BACKUP_FRESHNESS_FILE" ] || return 0
+  sed -n 's/^offsite_path=//p' "$OFFSITE_BACKUP_FRESHNESS_FILE" 2>/dev/null | head -1
+}
+
+# clear_offsite_backup_sync_stamp — invalidate the freshness plane.
+#
+# Called whenever a copy to the CONFIGURED target fails. The offsite rsync runs
+# with --delete, so a run killed partway leaves the destination mutilated: the
+# previous stamp then dates a tree that no longer exists in the form it
+# described. Fail closed by removing it — "unknown" is recoverable on the next
+# successful run, a confidently wrong "ok" is not.
+clear_offsite_backup_sync_stamp() {
+  rm -f "$OFFSITE_BACKUP_FRESHNESS_FILE" 2>/dev/null || true
+  return 0
+}
+
+# paths_on_same_volume <a> <b> — 0 when both exist and share a device.
+#
+# The whole premise of an off-box copy is that one disk event cannot take both
+# copies. Nothing verified that: `rsync -a --delete X/ X/` exits 0, so pointing
+# the target at a sibling directory on the same 93%-full volume produced a
+# stamped, "ok" off-box plane that was not off anything.
+paths_on_same_volume() {
+  posv_a="${1:-}"
+  posv_b="${2:-}"
+  [ -n "$posv_a" ] && [ -n "$posv_b" ] || return 1
+  [ -e "$posv_a" ] && [ -e "$posv_b" ] || return 1
+  posv_da=$(stat -f '%d' "$posv_a" 2>/dev/null || stat -c '%d' "$posv_a" 2>/dev/null || printf '')
+  posv_db=$(stat -f '%d' "$posv_b" 2>/dev/null || stat -c '%d' "$posv_b" 2>/dev/null || printf '')
+  [ -n "$posv_da" ] && [ -n "$posv_db" ] || return 1
+  [ "$posv_da" = "$posv_db" ]
+}
+
+# offsite_target_is_remote <path> — 0 when the target is an rsync REMOTE spec
+# (user@host:/path or host:/path), where a local device comparison is
+# meaningless and must not be attempted.
+offsite_target_is_remote() {
+  otir_path="${1:-}"
+  case "$otir_path" in
+    rsync://*|*::*) return 0 ;;
+    /*) return 1 ;;
+    *:*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 GC_BEADS_BD_SCRIPT="$GC_CITY_PATH/.gc/scripts/gc-beads-bd.sh"

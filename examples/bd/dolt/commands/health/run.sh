@@ -458,36 +458,71 @@ offsite_backup_freshness=""
 offsite_backup_note=""
 offsite_backup_threshold="${GC_DOLT_OFFSITE_BACKUP_STALE_SECS:-86400}"
 case "$offsite_backup_threshold" in ''|*[!0-9]*) offsite_backup_threshold=86400 ;; esac
-offsite_backup_epoch="$(read_offsite_backup_sync_epoch)"
+
 offsite_backup_waiver="$(offsite_waiver_reason)"
-if [ -n "$offsite_backup_epoch" ]; then
-  offsite_backup_age_sec=$((bf_now - offsite_backup_epoch))
-  [ "$offsite_backup_age_sec" -lt 0 ] && offsite_backup_age_sec=0
-  if [ "$offsite_backup_age_sec" -le "$offsite_backup_threshold" ]; then
-    offsite_backup_state="ok"
-    offsite_backup_stale=false
-  else
-    offsite_backup_state="stale"
-  fi
-  if [ "$offsite_backup_age_sec" -ge 3600 ]; then
-    offsite_backup_freshness="$((offsite_backup_age_sec / 3600))h$((offsite_backup_age_sec % 3600 / 60))m"
-  elif [ "$offsite_backup_age_sec" -ge 60 ]; then
-    offsite_backup_freshness="$((offsite_backup_age_sec / 60))m$((offsite_backup_age_sec % 60))s"
-  else
-    offsite_backup_freshness="${offsite_backup_age_sec}s"
-  fi
-elif [ -n "$offsite_backup_waiver" ]; then
+offsite_backup_declared="$(read_offsite_backup_declared_path)"
+offsite_backup_checked="$(read_offsite_backup_checked_epoch)"
+offsite_backup_epoch="$(read_offsite_backup_sync_epoch)"
+offsite_backup_stamp_path="$(read_offsite_backup_stamp_path)"
+
+# ORDER MATTERS HERE, and getting it wrong is how a fail-closed plane fails open.
+# Read the DECLARED INTENT first and only then consult the stamp. Consulting the
+# stamp first reports `ok` off a copy made to a target that has since been
+# removed or repointed — and masks a waiver behind an old stamp.
+if [ -n "$offsite_backup_waiver" ]; then
+  # A waiver is a live operator decision; it outranks any stamp, however fresh.
   offsite_backup_state="waived"
   offsite_backup_note="$offsite_backup_waiver"
-elif [ -n "${GC_BACKUP_OFFSITE_PATH:-}" ]; then
-  # A target is declared but no run has ever proved a copy to it. Distinct from
-  # `unconfigured` on purpose: this one is a job that is failing or has never
-  # run, and it has a different remedy.
+elif [ -z "$offsite_backup_declared" ]; then
+  if [ -n "$offsite_backup_epoch" ]; then
+    offsite_backup_state="unknown"
+    offsite_backup_note="a freshness stamp exists but no off-box target is declared; it dates a copy to a target this city no longer uses"
+  elif [ -z "$offsite_backup_checked" ]; then
+    offsite_backup_state="unknown"
+    offsite_backup_note="mol-dog-backup has not run, so nothing has reported whether an off-box target is declared"
+  else
+    offsite_backup_note="no GC_BACKUP_OFFSITE_PATH on mol-dog-backup and no waiver in config/dolt/offsite-waived"
+  fi
+elif [ -z "$offsite_backup_epoch" ]; then
   offsite_backup_state="unknown"
-  offsite_backup_note="offsite path configured; no completed copy on record"
+  offsite_backup_note="off-box target $offsite_backup_declared is declared; no completed copy on record"
+elif [ -n "$offsite_backup_stamp_path" ] && [ "$offsite_backup_stamp_path" != "$offsite_backup_declared" ]; then
+  offsite_backup_state="unknown"
+  offsite_backup_note="last completed copy went to $offsite_backup_stamp_path but the declared target is now $offsite_backup_declared"
 else
-  offsite_backup_note="no GC_BACKUP_OFFSITE_PATH and no waiver in config/dolt/offsite-waived"
+  offsite_backup_age_sec=$((bf_now - offsite_backup_epoch))
+  if [ "$offsite_backup_age_sec" -lt 0 ]; then
+    # A stamp dated in the future is evidence the stamp cannot be trusted, not
+    # evidence of a very recent copy. Clamping to 0 here made a skewed stamp read
+    # permanently fresh — fail-open in the one place that must fail closed.
+    offsite_backup_state="unknown"
+    offsite_backup_note="freshness stamp is dated in the FUTURE (clock skew); refusing to read it as a recent copy"
+    offsite_backup_age_sec=0
+  else
+    if [ "$offsite_backup_age_sec" -le "$offsite_backup_threshold" ]; then
+      offsite_backup_state="ok"
+      offsite_backup_stale=false
+    else
+      offsite_backup_state="stale"
+    fi
+    if [ "$offsite_backup_age_sec" -ge 3600 ]; then
+      offsite_backup_freshness="$((offsite_backup_age_sec / 3600))h$((offsite_backup_age_sec % 3600 / 60))m"
+    elif [ "$offsite_backup_age_sec" -ge 60 ]; then
+      offsite_backup_freshness="$((offsite_backup_age_sec / 60))m$((offsite_backup_age_sec % 60))s"
+    else
+      offsite_backup_freshness="${offsite_backup_age_sec}s"
+    fi
+  fi
 fi
+
+# Escape before the value reaches a JSON string literal. The note carries
+# operator-typed prose (a waiver reason) and filesystem paths, and this report is
+# consumed every 30s by `gc dolt health-check`, which parses it with jq. One
+# unescaped quote made the document unparseable and the consumer then reported
+# THE DOLT SERVER as unreachable — a false P0 pointing at the wrong subsystem,
+# raised by the very remedy this plane tells operators to declare.
+offsite_backup_note_json="$(json_escape_string "$offsite_backup_note")"
+offsite_backup_state_json="$(json_escape_string "$offsite_backup_state")"
 
 # Find orphan databases.
 #
@@ -734,8 +769,8 @@ JSONEOF
       "freshness": "$offsite_backup_freshness",
       "age_sec": $offsite_backup_age_sec,
       "stale": $offsite_backup_stale,
-      "state": "$offsite_backup_state",
-      "note": "$offsite_backup_note"
+      "state": "$offsite_backup_state_json",
+      "note": "$offsite_backup_note_json"
     },
     "origin_mirrors": {
       "freshness": "$backup_freshness",
