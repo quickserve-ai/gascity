@@ -17,7 +17,7 @@ func TestUnappliedPatchWarningIsAlwaysEmitted(t *testing.T) {
 	warning := `patches.agent[12] was NOT APPLIED: agent "cherub-law.conway" not found in merged config`
 
 	if !config.IsUnappliedPatchWarning(warning) {
-		t.Fatal("IsUnappliedPatchWarning did not recognise the emitted warning shape — the marker and the emitter have drifted apart")
+		t.Fatal("IsUnappliedPatchWarning did not recognize the emitted warning shape — the marker and the emitter have drifted apart")
 	}
 	if !shouldEmitLoadCityConfigWarning(warning) {
 		t.Fatal("an unapplied patch must print on every command; suppressing it turns a loud outage into a silent misconfiguration")
