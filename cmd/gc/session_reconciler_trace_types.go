@@ -289,6 +289,9 @@ const (
 	// lifecycle metadata and re-observes next tick rather than healing, rolling
 	// back, or closing a possibly-live session (#3872-family).
 	TraceOutcomeSkippedLivenessError TraceOutcomeCode = "skipped_liveness_error"
+	TraceOutcomeDeferredLazy         TraceOutcomeCode = "deferred_lazy"
+	TraceOutcomeDeferredStagger      TraceOutcomeCode = "deferred_stagger"
+	TraceOutcomeClearedStaleMarker   TraceOutcomeCode = "cleared_stale_marker"
 )
 
 type TraceCompletionStatus string
