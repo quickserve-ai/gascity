@@ -6,7 +6,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -133,4 +135,56 @@ while True:
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("managed port blocker on %d did not become ready", port)
+}
+
+// startFakeOwnedManagedDolt starts a stand-in for the managed dolt sql-server
+// that every check in the stop path accepts as ours. Ownership is decided by
+// the process's argv carrying "--config <configFile>"
+// (inspectManagedDoltOwnership → containsProcessConfig), so a shell spawned
+// with those trailing arguments is indistinguishable from the real server to
+// the inspection, and it can be scripted to answer SIGTERM the way dolt does —
+// or to refuse it. The process is reaped in the background so it never lingers
+// as a zombie that pidAlive would still report as alive.
+func startFakeOwnedManagedDolt(t *testing.T, configFile, body string, env ...string) int {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX process semantics required")
+	}
+	cmd := exec.Command("/bin/sh", "-c", body, "dolt", "sql-server", "--config", configFile)
+	cmd.Env = append(os.Environ(), env...)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start fake owned managed dolt: %v", err)
+	}
+	pid := cmd.Process.Pid
+	reaped := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(reaped)
+	}()
+	t.Cleanup(func() {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+		select {
+		case <-reaped:
+		case <-time.After(5 * time.Second):
+		}
+	})
+	return pid
+}
+
+// waitForFakeManagedDoltReady blocks until the stand-in server has installed
+// its signal disposition and touched its ready file. Without it a SIGTERM can
+// land on a shell that has not yet run `trap`, which is a different scenario
+// from the one under test.
+func waitForFakeManagedDoltReady(t *testing.T, readyPath string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(readyPath); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("fake managed dolt never became ready (%s)", readyPath)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
