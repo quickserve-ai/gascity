@@ -180,13 +180,14 @@ func (c *BeadsCacheReconcileCheck) Run(_ *CheckContext) *CheckResult {
 	sort.Strings(findings)
 	r.Status = StatusError
 	r.Message = strings.Join(findings, "; ")
-	r.Details = append(details,
+	details = append(details,
 		"A cache that stops reconciling goes silently blind: CachingStore.List answers",
 		"IncludeClosed=false purely from cache, and the reconciler is the only path by which",
 		"a bead created through another store instance or another gc process enters it.",
 		"Cache-age signals do NOT catch this — LastFreshAt is bumped by every local write,",
 		"so X-GC-Cache-Age-S stays near zero while the reconciler is dead.",
 	)
+	r.Details = details
 	r.FixHint = reconcileStaleFixHint(anyNeverReconciled)
 	return r
 }
