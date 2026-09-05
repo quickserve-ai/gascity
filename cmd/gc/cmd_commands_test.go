@@ -3115,7 +3115,7 @@ echo "beadspass=$BEADS_DOLT_PASSWORD"
 	}
 }
 
-func TestRunDiscoveredCommand_RemovesAmbientDoltEnvDeletedByProjection(t *testing.T) {
+func TestRunDiscoveredCommand_ManagedDoltEndpointRejectsAmbientValues(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, ".beads"), 0o755); err != nil {
 		t.Fatal(err)
@@ -3132,25 +3132,20 @@ func TestRunDiscoveredCommand_RemovesAmbientDoltEnvDeletedByProjection(t *testin
 		t.Fatal(err)
 	}
 	scriptPath := filepath.Join(sourceDir, "run.sh")
-	// ${VAR+set} distinguishes unset from set-but-empty: the projection
-	// must delete these keys, not blank them.
+	// Exercise the fallback semantics used by pack commands, not whether a
+	// cleared environment key is represented as unset or explicitly empty.
 	script := `#!/bin/sh
-echo "managed=$GC_DOLT_MANAGED_LOCAL"
-echo "gchost=${GC_DOLT_HOST+set}"
-echo "gcport=${GC_DOLT_PORT+set}"
-echo "mirrorhost=${BEADS_DOLT_SERVER_HOST+set}"
+printf '%s:%s|%s:%s\n' "${GC_DOLT_HOST:-127.0.0.1}" "${GC_DOLT_PORT:-unresolved}" "${BEADS_DOLT_SERVER_HOST:-127.0.0.1}" "${BEADS_DOLT_SERVER_PORT:-unresolved}"
 `
 	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
-	// A managed-local canonical city deletes the host key (and its
-	// BEADS mirror) instead of projecting a value; stale ambient
-	// entries must be stripped from the child environment, not passed
-	// through.
+	// Neither endpoint may inherit stale values from the launching shell.
 	t.Setenv("GC_DOLT_HOST", "stale.example")
 	t.Setenv("GC_DOLT_PORT", "9999")
 	t.Setenv("BEADS_DOLT_SERVER_HOST", "stale.example")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "9999")
 	t.Setenv("BEADS_CREDENTIALS_FILE", filepath.Join(dir, "no-credentials"))
 
 	entry := config.DiscoveredCommand{
@@ -3168,18 +3163,8 @@ echo "mirrorhost=${BEADS_DOLT_SERVER_HOST+set}"
 		t.Fatalf("exit code = %d, want 0; stderr: %s", code, stderr.String())
 	}
 
-	out := stdout.String()
-	if !strings.Contains(out, "managed=1\n") {
-		t.Fatalf("projection did not run (want managed=1), got:\n%s", out)
-	}
-	for _, want := range []string{
-		"gchost=",
-		"gcport=",
-		"mirrorhost=",
-	} {
-		if !strings.Contains(out, want+"\n") {
-			t.Fatalf("stale ambient key not removed (want %q line), got:\n%s", want, out)
-		}
+	if got, want := stdout.String(), "127.0.0.1:unresolved|127.0.0.1:unresolved\n"; got != want {
+		t.Fatalf("pack endpoints = %q, want %q", got, want)
 	}
 }
 

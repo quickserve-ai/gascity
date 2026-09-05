@@ -1836,23 +1836,44 @@ func TestMergeRuntimeEnvIncludesDoltHost(t *testing.T) {
 	}
 }
 
-func TestBdRuntimeEnvLocalHostNoHostKey(t *testing.T) {
-	t.Setenv("GC_BEADS", "bd")
-	t.Setenv("GC_DOLT", "skip")
-	t.Setenv("GC_DOLT_HOST", "")
-	_ = os.Unsetenv("GC_DOLT_HOST")
-	t.Setenv("GC_DOLT_PORT", "")
-	_ = os.Unsetenv("GC_DOLT_PORT")
-	t.Setenv("BEADS_DOLT_SERVER_HOST", "stale.example.com")
-
-	cityPath := t.TempDir()
-	env := mustBdRuntimeEnv(t, cityPath)
-
-	if _, ok := env["GC_DOLT_HOST"]; ok {
-		t.Error("GC_DOLT_HOST should not be present when not configured")
+// A rig-scoped parent must not resurrect its endpoint when a claim's projected
+// environment is flattened to a map and overlaid again by the bd runner.
+func TestDoltProjectionSurvivesClaimSubprocessOverlay(t *testing.T) {
+	for key, value := range map[string]string{
+		"GC_DOLT_HOST":           "hub.example.com",
+		"GC_DOLT_PORT":           "3307",
+		"BEADS_DOLT_SERVER_HOST": "hub.example.com",
+		"BEADS_DOLT_SERVER_PORT": "3307",
+		"GC_DOLT_MANAGED_LOCAL":  "0",
+	} {
+		t.Setenv(key, value)
 	}
-	if _, ok := env["BEADS_DOLT_SERVER_HOST"]; ok {
-		t.Error("BEADS_DOLT_SERVER_HOST should not be present when not configured")
+	dir := t.TempDir()
+	for _, tc := range []struct {
+		name   string
+		target contract.DoltConnectionTarget
+		want   string
+	}{
+		{"managed city", contract.DoltConnectionTarget{Host: "127.0.0.1", Port: "51361"}, "127.0.0.1:51361|127.0.0.1:51361|"},
+		{"external rig", contract.DoltConnectionTarget{Host: "other.example.com", Port: "4406", External: true}, "other.example.com:4406|other.example.com:4406|0"},
+		{"container redirect", contract.DoltConnectionTarget{Host: "container.example.com", Port: "51361"}, "container.example.com:51361|container.example.com:51361|"},
+		{"unresolved managed port", contract.DoltConnectionTarget{Host: "127.0.0.1"}, "127.0.0.1:unset|127.0.0.1:unset|"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			projected := make(map[string]string)
+			applyCanonicalDoltTargetEnv(projected, tc.target)
+			mirrorBeadsDoltServerEnv(projected, false)
+			env := hookClaimEnvMap(mergeRuntimeEnv(nil, projected), dir, "")
+			run := beads.ExecCommandRunnerWithEnvContext(t.Context(), env)
+			// Exercise the real child environment without dialing either store.
+			out, err := run(dir, "sh", "-c", `printf '%s:%s|%s:%s|%s' "${GC_DOLT_HOST:-127.0.0.1}" "${GC_DOLT_PORT:-unset}" "${BEADS_DOLT_SERVER_HOST:-127.0.0.1}" "${BEADS_DOLT_SERVER_PORT:-unset}" "$GC_DOLT_MANAGED_LOCAL"`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(out) != tc.want {
+				t.Fatalf("child endpoints = %q, want %q", out, tc.want)
+			}
+		})
 	}
 }
 
@@ -2798,6 +2819,13 @@ dolt.user: stale-user
 }
 
 func TestBdRuntimeEnvForRigPrefersExplicitRigDoltConfigOverManagedCity(t *testing.T) {
+	t.Setenv("GC_BEADS", "bd")
+	t.Setenv("GC_DOLT", "skip")
+	t.Setenv("GC_DOLT_HOST", "127.0.0.1")
+	t.Setenv("GC_DOLT_PORT", "9999")
+	t.Setenv("BEADS_DOLT_SERVER_HOST", "stale.example.com")
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "9999")
+	t.Setenv("GC_DOLT_MANAGED_LOCAL", "0")
 	cityDir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(cityDir, ".gc", "runtime", "packs", "dolt"), 0o755); err != nil {
 		t.Fatal(err)
@@ -2805,6 +2833,7 @@ func TestBdRuntimeEnvForRigPrefersExplicitRigDoltConfigOverManagedCity(t *testin
 	if err := os.MkdirAll(filepath.Join(cityDir, ".beads"), 0o700); err != nil {
 		t.Fatal(err)
 	}
+	writeFile(t, filepath.Join(cityDir, ".beads", "config.yaml"), "issue_prefix: ct\ngc.endpoint_origin: managed_city\n")
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -2836,27 +2865,29 @@ func TestBdRuntimeEnvForRigPrefersExplicitRigDoltConfigOverManagedCity(t *testin
 		}},
 	}
 
-	env := mustBdRuntimeEnvForRig(t, cityDir, cfg, rigDir)
-	if got := env["GC_DOLT_HOST"]; got != "rig-db.example.com" {
-		t.Fatalf("GC_DOLT_HOST = %q, want %q", got, "rig-db.example.com")
-	}
-	if got := env["GC_DOLT_PORT"]; got != "3307" {
-		t.Fatalf("GC_DOLT_PORT = %q, want %q", got, "3307")
-	}
-	if got := env["BEADS_DOLT_SERVER_HOST"]; got != "rig-db.example.com" {
-		t.Fatalf("BEADS_DOLT_SERVER_HOST = %q, want %q", got, "rig-db.example.com")
-	}
-	if got := env["BEADS_DOLT_SERVER_PORT"]; got != "3307" {
-		t.Fatalf("BEADS_DOLT_SERVER_PORT = %q, want %q", got, "3307")
-	}
-	if got := env["BEADS_DIR"]; got != filepath.Join(rigDir, ".beads") {
-		t.Fatalf("BEADS_DIR = %q, want %q", got, filepath.Join(rigDir, ".beads"))
-	}
-	if got := env["GC_RIG"]; got != "repo" {
-		t.Fatalf("GC_RIG = %q, want %q", got, "repo")
-	}
-	if got := env["GC_RIG_ROOT"]; got != rigDir {
-		t.Fatalf("GC_RIG_ROOT = %q, want %q", got, rigDir)
+	port := ln.Addr().(*net.TCPAddr).Port
+	for _, tc := range []struct {
+		name string
+		dir  string
+		env  map[string]string
+		want string
+	}{
+		{"rig", rigDir, mustBdRuntimeEnvForRig(t, cityDir, cfg, rigDir),
+			"rig-db.example.com:3307|rig-db.example.com:3307|0|" + filepath.Join(rigDir, ".beads")},
+		{"city", cityDir, mustBdRuntimeEnv(t, cityDir),
+			fmt.Sprintf("127.0.0.1:%d|127.0.0.1:%d||%s", port, port, filepath.Join(cityDir, ".beads"))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := hookClaimEnvMap(mergeRuntimeEnv(nil, tc.env), tc.dir, "")
+			run := beads.ExecCommandRunnerWithEnvContext(t.Context(), env)
+			out, err := run(tc.dir, "sh", "-c", `printf '%s:%s|%s:%s|%s|%s' "${GC_DOLT_HOST:-127.0.0.1}" "$GC_DOLT_PORT" "${BEADS_DOLT_SERVER_HOST:-127.0.0.1}" "$BEADS_DOLT_SERVER_PORT" "$GC_DOLT_MANAGED_LOCAL" "$BEADS_DIR"`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(out) != tc.want {
+				t.Fatalf("child store target = %q, want %q", out, tc.want)
+			}
+		})
 	}
 }
 
@@ -6438,56 +6469,5 @@ func TestApplyAgentBdActorWarnsThroughTheEnvBuilder(t *testing.T) {
 	// attribution bug.
 	if got := env["BEADS_ACTOR"]; got != "" {
 		t.Fatalf("applyAgentBdActor overrode the explicit actor with %q", got)
-	}
-}
-
-// TestBdRuntimeEnvForExplicitRigRecordsAmbientEndpointAsAnotherStore pins the
-// projection half of gc-49ho's host leg: a session projected for an explicit
-// external rig store carries GC_DOLT_MANAGED_LOCAL=0 so the managed-city
-// resolver (contract.ManagedLocalDoltEnv) knows the ambient GC_DOLT_HOST is
-// that store's, not a redirect of the city's managed server — while the city
-// scope's own projection carries no such record.
-func TestBdRuntimeEnvForExplicitRigRecordsAmbientEndpointAsAnotherStore(t *testing.T) {
-	cityDir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(cityDir, ".gc", "runtime", "packs", "dolt"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Join(cityDir, ".beads"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	defer func() { _ = ln.Close() }() //nolint:errcheck // test cleanup
-	if err := writeDoltState(cityDir, doltRuntimeState{
-		Running:   true,
-		PID:       os.Getpid(),
-		Port:      ln.Addr().(*net.TCPAddr).Port,
-		DataDir:   filepath.Join(cityDir, ".beads", "dolt"),
-		StartedAt: "2026-04-02T08:00:00Z",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	rigDir := filepath.Join(t.TempDir(), "repo")
-	if err := os.MkdirAll(filepath.Join(rigDir, ".beads"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	cfg := &config.City{
-		Rigs: []config.Rig{{
-			Name:     "repo",
-			Path:     rigDir,
-			DoltHost: "rig-db.example.com",
-			DoltPort: "3307",
-		}},
-	}
-
-	rigEnv := mustBdRuntimeEnvForRig(t, cityDir, cfg, rigDir)
-	if got := rigEnv["GC_DOLT_MANAGED_LOCAL"]; got != "0" {
-		t.Fatalf("rig GC_DOLT_MANAGED_LOCAL = %q, want %q (ambient endpoint recorded as another store)", got, "0")
-	}
-	cityEnv := mustBdRuntimeEnv(t, cityDir)
-	if got, ok := cityEnv["GC_DOLT_MANAGED_LOCAL"]; ok {
-		t.Fatalf("city GC_DOLT_MANAGED_LOCAL = %q, want absent for the managed city scope", got)
 	}
 }

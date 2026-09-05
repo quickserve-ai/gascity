@@ -434,15 +434,17 @@ func applyCanonicalDoltTargetEnv(env map[string]string, target contract.DoltConn
 	// GC-owned projections must use the resolved target, not ambient parent
 	// shell host/port. Stale GC_DOLT_HOST/PORT was causing gc bd and projected
 	// session flows to drift away from the canonical external endpoint.
+	// Keep cleared keys present: bd runners overlay this map onto the parent
+	// environment, so deleting a key would resurrect the parent's endpoint.
 	if shouldProjectResolvedDoltHost(target) {
 		env["GC_DOLT_HOST"] = strings.TrimSpace(target.Host)
 	} else {
-		delete(env, "GC_DOLT_HOST")
+		env["GC_DOLT_HOST"] = ""
 	}
 	if strings.TrimSpace(target.Port) != "" {
 		env["GC_DOLT_PORT"] = target.Port
 	} else {
-		delete(env, "GC_DOLT_PORT")
+		env["GC_DOLT_PORT"] = ""
 	}
 	recordManagedLocalDoltEnv(env, target)
 }
@@ -451,8 +453,8 @@ func applyCanonicalDoltTargetEnv(env map[string]string, target contract.DoltConn
 // managed-city resolve run from this projected environment can tell an
 // external store's ambient GC_DOLT_HOST from a container's redirect of the
 // managed server (gc-49ho). An external target records "0"; a managed target
-// clears the key so an inherited "0" from a parent environment cannot outlive
-// the projection that made it true.
+// explicitly clears the key so a later child-env overlay cannot resurrect an
+// inherited "0" from a parent projected for another store.
 func recordManagedLocalDoltEnv(env map[string]string, target contract.DoltConnectionTarget) {
 	if env == nil {
 		return
@@ -460,7 +462,7 @@ func recordManagedLocalDoltEnv(env map[string]string, target contract.DoltConnec
 	if target.External {
 		env[contract.ManagedLocalDoltEnv] = "0"
 	} else {
-		delete(env, contract.ManagedLocalDoltEnv)
+		env[contract.ManagedLocalDoltEnv] = ""
 	}
 }
 
@@ -1752,7 +1754,8 @@ func mirrorBeadsDoltServerEnv(env map[string]string, carryAmbientTLS bool) {
 	if host := strings.TrimSpace(env["GC_DOLT_HOST"]); host != "" {
 		env["BEADS_DOLT_SERVER_HOST"] = host
 	} else {
-		delete(env, "BEADS_DOLT_SERVER_HOST")
+		// As with the port, an explicit empty value defeats parent inheritance.
+		env["BEADS_DOLT_SERVER_HOST"] = ""
 	}
 	if port := strings.TrimSpace(env["GC_DOLT_PORT"]); port != "" {
 		env["BEADS_DOLT_SERVER_PORT"] = port
