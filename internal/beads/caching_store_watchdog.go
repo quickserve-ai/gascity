@@ -23,7 +23,7 @@ import (
 // WHY A SEPARATE GOROUTINE, and not a check inside the reconcile loop. The loop
 // cannot detect its own death. The measured failure mode is the loop wedged
 // inside backing.List — a call that takes no context and therefore cannot be
-// timed out or cancelled — so any check that lives on the loop's own goroutine
+// timed out or canceled — so any check that lives on the loop's own goroutine
 // is wedged with it. The watchdog keeps ticking because it shares nothing with
 // the scan but the mutex, and it only takes that briefly.
 //
@@ -66,7 +66,7 @@ var errCacheReconcileOverdue = errors.New(
 	"no reconcile has completed within the staleness bound; the reconciler is stopped or wedged, " +
 		"and every non-Live read is being served from a frozen snapshot")
 
-// startReconcileWatchdog launches the absence-of-heartbeat watchdog. Cancelling
+// startReconcileWatchdog launches the absence-of-heartbeat watchdog. Canceling
 // ctx or calling StopReconciler stops it. Caller must have registered a
 // lifecycleWG delta for it.
 func (c *CachingStore) startReconcileWatchdog(ctx context.Context) {

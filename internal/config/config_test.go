@@ -3820,9 +3820,9 @@ func TestDaemonAutoReapClosedBeadWorktreesMinAgeMinutesExplicitZeroDisables(t *t
 	got := d.AutoReapClosedBeadWorktreesMinAge()
 	if got != 0 {
 		t.Errorf("AutoReapClosedBeadWorktreesMinAge() = %v, want 0 (quarantine disabled)", got)
-
 	}
 }
+
 func TestDaemonAutoReapStoppedAgentHomesDefaultsOffAndHonorsFlag(t *testing.T) {
 	d := DaemonConfig{}
 	if d.AutoReapStoppedAgentHomesEnabled() {

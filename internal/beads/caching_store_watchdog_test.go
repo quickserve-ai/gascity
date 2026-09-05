@@ -288,7 +288,7 @@ func TestWatchdogFiresWhileTheReconcileLoopIsWedged(t *testing.T) {
 	}
 }
 
-// fullScanBlockingStore blocks every full-scan List until released, modelling a
+// fullScanBlockingStore blocks every full-scan List until released, modeling a
 // reconcile loop wedged in a context-free backing call. It signals `entered`
 // once, so a test can wait for the wedge to be real before judging it.
 type fullScanBlockingStore struct {

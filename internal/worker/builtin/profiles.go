@@ -539,11 +539,11 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 		// observes ready, the reconciler retries the start until it gives
 		// up. Delay-based like the other TUIs whose prompt glyph is
 		// unverified; replace with ReadyPromptPrefix when one is measured.
-		ReadyDelayMs:       8000,
-		ProcessNames:       []string{"amp"},
-		InstructionsFile:   "AGENTS.md",
-		ResumeFlag:         "threads continue",
-		ResumeStyle:        "subcommand",
+		ReadyDelayMs:     8000,
+		ProcessNames:     []string{"amp"},
+		InstructionsFile: "AGENTS.md",
+		ResumeFlag:       "threads continue",
+		ResumeStyle:      "subcommand",
 	},
 	"opencode": {
 		DisplayName:      "OpenCode",
@@ -685,10 +685,10 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 		// gastownhall/gascity#672. Nudges still drain via the supervisor
 		// dispatcher / per-session poller without requiring provider
 		// hooks.
-		DisplayName:      "Auggie CLI",
-		Command:          "auggie",
-		Args:             []string{"--allow-indexing"},
-		PromptMode:       "arg",
+		DisplayName: "Auggie CLI",
+		Command:     "auggie",
+		Args:        []string{"--allow-indexing"},
+		PromptMode:  "arg",
 		// See the amp comment: no readiness signal = sessions never leave
 		// state=creating (ga-8ouxd). Delay until a real prompt glyph is
 		// measured.

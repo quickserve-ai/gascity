@@ -629,7 +629,7 @@ type Rig struct {
 	MaxActiveSessions *int `toml:"max_active_sessions,omitempty"`
 	// OrphanRelease controls whether the controller's in-process pool orphan
 	// sweeper (releaseOrphanedPoolAssignments) may clear assignees and reopen
-	// work in THIS rig's bead store. Nil means enabled, which is the behaviour
+	// work in THIS rig's bead store. Nil means enabled, which is the behavior
 	// every city had before the knob existed; set false to stop the sweeper
 	// writing to this rig without suspending it.
 	//
@@ -2716,7 +2716,6 @@ func (d *DaemonConfig) AutoReapClosedBeadWorktreesMinAge() time.Duration {
 		return time.Duration(DefaultAutoReapClosedBeadWorktreesMinAgeMinutes) * time.Minute
 	}
 	return time.Duration(*d.AutoReapClosedBeadWorktreesMinAgeMinutes) * time.Minute
-
 }
 
 // AutoReapStoppedAgentHomesEnabled reports whether stopped configured

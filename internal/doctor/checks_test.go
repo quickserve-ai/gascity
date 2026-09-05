@@ -3277,6 +3277,7 @@ func TestDoltNomsSizeCheck_EmbeddedDoltMetadataDoesNotMaskOrphan(t *testing.T) {
 		t.Fatalf("embedded Dolt metadata must not mask a managed server orphan: message = %q", r.Message)
 	}
 }
+
 func TestDoltNomsSizeCheck_SkipsSystemDatabaseMetadata(t *testing.T) {
 	dir := setupManagedDoltCity(t)
 	if err := os.WriteFile(filepath.Join(dir, ".beads", "metadata.json"), []byte(`{"dolt_database":"mysql"}`), 0o644); err != nil {
