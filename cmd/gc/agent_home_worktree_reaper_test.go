@@ -46,9 +46,11 @@ func (f *fakeStoppedAgentHomeGit) WorktreeRemove(path string, force bool) error 
 	f.removedPath, f.removedForce = path, force
 	return f.removeErr
 }
+
 func (f *fakeStoppedAgentHomeGit) WorktreeList() ([]git.Worktree, error) {
 	return f.worktrees, f.worktreeErr
 }
+
 func (f *fakeStoppedAgentHomeGit) WorktreeMove(oldPath, newPath string) error {
 	f.movedFrom, f.movedTo = oldPath, newPath
 	if f.moveErr != nil {
