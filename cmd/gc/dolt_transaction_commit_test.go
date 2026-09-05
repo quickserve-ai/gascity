@@ -28,7 +28,13 @@ func TestVerifyManagedDoltGlobalsIsSilentWhenTheGlobalIsCorrect(t *testing.T) {
 func TestVerifyManagedDoltGlobalsWarnsLoudlyWhenTheGlobalIsOn(t *testing.T) {
 	orig := managedDoltGlobalCheckExecFn
 	t.Cleanup(func() { managedDoltGlobalCheckExecFn = orig })
-	managedDoltGlobalCheckExecFn = func(_, _, _, _ string) (string, error) {
+	managedDoltGlobalCheckExecFn = func(_, _, _, stmt string) (string, error) {
+		// This boundary may only read the server-wide policy. A SET would
+		// change the policy being checked; a session read could conceal it.
+		query := strings.ToUpper(strings.TrimSpace(stmt))
+		if !strings.HasPrefix(query, "SELECT @@GLOBAL.DOLT_TRANSACTION_COMMIT ") || strings.Contains(query, ";") {
+			t.Fatalf("global-policy check must issue a read-only GLOBAL query, got %q", stmt)
+		}
 		return "+---+\n| v |\n+---+\n| 1 |\n+---+\n", nil
 	}
 
