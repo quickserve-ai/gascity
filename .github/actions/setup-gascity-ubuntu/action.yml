@@ -13,12 +13,6 @@ inputs:
   dolt-version:
     description: Dolt version to install
     required: true
-  bd-version:
-    description: >-
-      Beads release version to install. Empty string means the caller builds or
-      installs bd itself (used by the cross-version contract "current" cell).
-    required: false
-    default: ""
   install-claude-cli:
     description: Whether to install the Claude CLI
     required: false
@@ -47,12 +41,14 @@ runs:
       shell: bash
       run: ${{ github.action_path }}/../../scripts/install-dolt-archive.sh "${{ inputs.dolt-version }}"
 
-    - name: Install released bd v${{ inputs.bd-version }}
-      # Skip when no version is given: the contract cross-version "current" cell
-      # builds bd from source instead of installing a released tarball.
-      if: ${{ inputs.bd-version != '' }}
+    # bd is NOT version-pinned here. It is built from the beads revision go.mod
+    # pins, because that library is what gc links and what decides the schema
+    # version gc migrates a store to; a separately-pinned bd drifted to a schema
+    # the store had already moved past (ga-yl326d). Cross-version contract cells
+    # that deliberately want some other bd install it themselves, after this.
+    - name: Install bd in lockstep with go.mod's beads pin
       shell: bash
-      run: ${{ github.action_path }}/../../scripts/install-bd-archive.sh "${{ inputs.bd-version }}"
+      run: ${{ github.action_path }}/../../scripts/install-bd-lockstep.sh
 
     - name: Install Claude CLI
       if: ${{ inputs.install-claude-cli == 'true' }}

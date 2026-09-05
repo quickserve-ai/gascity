@@ -94,8 +94,13 @@ that gate does not — drift in the `require` line itself — and `.gitignore` k
 `go.work` out of the tree so a local override cannot be committed by accident.
 
 Note this is a different axis from `deps.env`'s `BD_VERSION`, which pins the bd
-*release tarball* CI and Docker install and can only name a published tag —
-`TestBDVersionPins` owns that one, and it stays where upstream left it.
+*release tarball* the container image and the minimum-supported contract cell
+install, and can only name a published tag — `TestBDVersionPins` owns that one,
+and it stays where upstream left it. The general CI path no longer rides that
+axis at all: since ga-yl326d every `setup-gascity-*` job builds `bd` from this
+same `go.mod` pin via `.github/scripts/install-bd-lockstep.sh`, so the CLI
+cannot skew from the linked library. It used to — CI ran gc at schema v59
+beside the `v1.1.0` tarball at v53, and `bd create` refused the store.
 
 **Moving the pin moves the fleet.** Bump `go.mod`, the `beadsFleetPin` constant
 in that test, and the table above together, and redeploy `bd` on every machine
