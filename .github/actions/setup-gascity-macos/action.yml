@@ -13,9 +13,6 @@ inputs:
   dolt-version:
     description: Dolt version to install (without leading v)
     required: true
-  bd-version:
-    description: Beads release version to install (with leading v)
-    required: true
   install-claude-cli:
     description: Whether to install the Claude CLI
     required: false
@@ -113,9 +110,11 @@ runs:
       shell: bash
       run: ${{ github.action_path }}/../../scripts/install-dolt-archive.sh "${{ inputs.dolt-version }}" --cache
 
-    - name: Install released bd v${{ inputs.bd-version }}
+    # See setup-gascity-ubuntu: bd tracks go.mod's beads pin, not a version of
+    # its own, so the CLI can never skew from the linked library (ga-yl326d).
+    - name: Install bd in lockstep with go.mod's beads pin
       shell: bash
-      run: ${{ github.action_path }}/../../scripts/install-bd-archive.sh "${{ inputs.bd-version }}" --cache
+      run: ${{ github.action_path }}/../../scripts/install-bd-lockstep.sh --cache
 
     - name: Install Claude CLI
       if: ${{ inputs.install-claude-cli == 'true' }}

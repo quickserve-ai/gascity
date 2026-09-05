@@ -8,7 +8,6 @@ permissions:
 
 env:
   DOLT_VERSION: "2.1.7"
-  BD_VERSION: "v1.1.0"
   ANTHROPIC_BASE_URL: https://ollama.com
   ANTHROPIC_API_KEY: ""
   ANTHROPIC_AUTH_TOKEN: ${{ secrets.OLLAMA_API_KEY }}
@@ -30,7 +29,6 @@ jobs:
       - uses: ./.github/actions/setup-gascity-ubuntu
         with:
           dolt-version: ${{ env.DOLT_VERSION }}
-          bd-version: ${{ env.BD_VERSION }}
           install-claude-cli: "true"
       - name: Validate Ollama Claude configuration
         run: |
