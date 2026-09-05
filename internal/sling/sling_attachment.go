@@ -453,7 +453,11 @@ func CheckBeadStateWithOptions(q BeadQuerier, beadID string, a config.Agent, dep
 
 	target := strings.TrimSpace(opts.TargetIdentity)
 	if target == "" {
-		target = a.QualifiedName()
+		// RoutedToIdentity, not QualifiedName: the fallback must collapse a
+		// pool instance to the identity gc sling stamps (its PoolName), or
+		// pool-instance idempotency breaks — the ga-79uuwq bypass, regressed
+		// once already when the TargetIdentity override was introduced.
+		target = agentutil.RoutedToIdentity(&a)
 	}
 	if strings.TrimSpace(b.Metadata[beadmeta.RoutedToMetadataKey]) == target {
 		if b.Assignee == "" || b.Assignee == target {
