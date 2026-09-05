@@ -2872,10 +2872,14 @@ func TestBdRuntimeEnvForRigPrefersExplicitRigDoltConfigOverManagedCity(t *testin
 		env  map[string]string
 		want string
 	}{
-		{"rig", rigDir, mustBdRuntimeEnvForRig(t, cityDir, cfg, rigDir),
-			"rig-db.example.com:3307|rig-db.example.com:3307|0|" + filepath.Join(rigDir, ".beads")},
-		{"city", cityDir, mustBdRuntimeEnv(t, cityDir),
-			fmt.Sprintf("127.0.0.1:%d|127.0.0.1:%d||%s", port, port, filepath.Join(cityDir, ".beads"))},
+		{
+			"rig", rigDir, mustBdRuntimeEnvForRig(t, cityDir, cfg, rigDir),
+			"rig-db.example.com:3307|rig-db.example.com:3307|0|" + filepath.Join(rigDir, ".beads"),
+		},
+		{
+			"city", cityDir, mustBdRuntimeEnv(t, cityDir),
+			fmt.Sprintf("127.0.0.1:%d|127.0.0.1:%d||%s", port, port, filepath.Join(cityDir, ".beads")),
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			env := hookClaimEnvMap(mergeRuntimeEnv(nil, tc.env), tc.dir, "")
