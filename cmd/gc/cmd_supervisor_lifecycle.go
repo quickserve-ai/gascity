@@ -1245,7 +1245,7 @@ var supervisorServiceEnvKeys = map[string]bool{
 	// calls see only the service env, so during a fleet schema-skew window
 	// the key must survive plist regeneration or `gc start` dies at rig
 	// beads init (ga-v2yrs4).
-	"BD_IGNORE_SCHEMA_SKEW":                    true,
+	"BD_IGNORE_SCHEMA_SKEW": true,
 	// bd spawns a detached send-metrics flusher (POST to the metrics
 	// endpoint) on every invocation unless disabled. Metrics are off by
 	// user config here, but the controller's per-op bd spawns must not
@@ -1622,7 +1622,14 @@ func bootoutSupervisorLaunchdJob(label string) error {
 	target := supervisorLaunchdServiceTarget(label)
 	bootoutErr := supervisorLaunchctlRun("bootout", target)
 	if waitErr := waitSupervisorLaunchdUnloaded(label, launchdRefreshWaitTimeout); waitErr != nil {
-		return fmt.Errorf("launchd job %s state is unknown after bootout (%v): %w", target, bootoutErr, waitErr)
+		// Split on bootoutErr rather than formatting it unconditionally: bootout
+		// can SUCCEED (nil error) while the unload wait still times out, and a
+		// nil error rendered into the message adds nothing an operator can act
+		// on. When both failed, both are wrapped so errors.Is/As reaches either.
+		if bootoutErr != nil {
+			return fmt.Errorf("launchd job %s state is unknown after bootout (%w): %w", target, bootoutErr, waitErr)
+		}
+		return fmt.Errorf("launchd job %s state is unknown after bootout: %w", target, waitErr)
 	}
 	return nil
 }
@@ -2098,11 +2105,12 @@ func installSupervisorLaunchd(data *supervisorServiceData, stdout, stderr io.Wri
 		if err != nil {
 			if legacyOwnerLabel != "" || launchdRestartRollbackSafe(err) {
 				var rollbackErr error
-				if legacyOwnerLabel != "" {
+				switch {
+				case legacyOwnerLabel != "":
 					rollbackErr = rollbackLegacySupervisorLaunchdMigration(path, hadCurrent, existing, legacyOwnerLabel, stderr)
-				} else if hadCurrent {
+				case hadCurrent:
 					rollbackErr = restorePreviousSupervisorLaunchdInstall(path, existing, stderr)
-				} else {
+				default:
 					rollbackErr = rollbackNewSupervisorLaunchdInstall(path, legacyPresent, stderr)
 				}
 				if rollbackErr != nil {

@@ -45,7 +45,7 @@ import (
 // `LIMIT 1` code deterministically picks the BROKEN one. That ordering is
 // deliberate: it makes the pre-fix failure reproducible instead of a coin flip,
 // which is the only way this test can be a reliable mutant-killer.
-func fakeDoltTwoRemotes(t *testing.T, dir string) string {
+func fakeDoltTwoRemotes(t *testing.T, dir string) {
 	t.Helper()
 	logPath := filepath.Join(dir, "dolt.log")
 	body := `#!/bin/sh
@@ -71,7 +71,6 @@ exit 0
 	if err := os.WriteFile(filepath.Join(dir, "dolt"), []byte(body), 0o755); err != nil {
 		t.Fatalf("write fake dolt: %v", err)
 	}
-	return logPath
 }
 
 // runMultiRemoteSync runs `gc dolt sync --db app` against a one-database city

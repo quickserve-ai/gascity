@@ -46,10 +46,14 @@ func (s *reapGetCountingStore) List(q beads.ListQuery) ([]beads.Bead, error) {
 	return s.Store.List(q)
 }
 
+// testStatusCacheTTL is the TTL every cache test builds its clock advances
+// around: shorter advances must hit the cache, longer ones must miss.
+const testStatusCacheTTL = 5 * time.Minute
+
 // newTestStatusCache returns a cache on a manual clock the caller advances.
-func newTestStatusCache(ttl time.Duration) (*beadStatusCache, *time.Time) {
+func newTestStatusCache() (*beadStatusCache, *time.Time) {
 	now := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
-	c := newBeadStatusCache(ttl)
+	c := newBeadStatusCache(testStatusCacheTTL)
 	c.now = func() time.Time { return now }
 	return c, &now
 }
@@ -70,7 +74,7 @@ func TestReapStatusCache_SecondPassWithinTTLSkipsGets(t *testing.T) {
 	addClosedWorktree(t, rigRoot, cityPath, "builder", "ga-cache001")
 	store := &reapGetCountingStore{Store: beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-cache001", Status: "open"}}, nil)}
 	cfg := reapTestConfig(rigRoot)
-	cache, now := newTestStatusCache(5 * time.Minute)
+	cache, now := newTestStatusCache()
 	injectCountingLiveness(t, liveWorktreeState{scanned: true})
 
 	reapOnceWithCache(t, cityPath, cfg, store, cache)
@@ -96,7 +100,7 @@ func TestReapStatusCache_StatusFlipHonoredAfterTTL(t *testing.T) {
 	mem := beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-cache002", Status: "open"}}, nil)
 	store := &reapGetCountingStore{Store: mem}
 	cfg := reapTestConfig(rigRoot)
-	cache, now := newTestStatusCache(5 * time.Minute)
+	cache, now := newTestStatusCache()
 	injectCountingLiveness(t, liveWorktreeState{scanned: true})
 
 	reapOnceWithCache(t, cityPath, cfg, store, cache)
@@ -136,7 +140,7 @@ func TestReapStatusCache_NotFoundCached(t *testing.T) {
 	addClosedWorktree(t, rigRoot, cityPath, "builder", "ga-cache003")
 	store := &reapGetCountingStore{Store: beads.NewMemStoreFrom(1, nil, nil)}
 	cfg := reapTestConfig(rigRoot)
-	cache, now := newTestStatusCache(5 * time.Minute)
+	cache, now := newTestStatusCache()
 	injectCountingLiveness(t, liveWorktreeState{scanned: true})
 
 	reapOnceWithCache(t, cityPath, cfg, store, cache)
@@ -157,7 +161,7 @@ func TestReapStatusCache_TransientErrorsNotCached(t *testing.T) {
 		getErr: errors.New("hub connection reset"),
 	}
 	cfg := reapTestConfig(rigRoot)
-	cache, now := newTestStatusCache(5 * time.Minute)
+	cache, now := newTestStatusCache()
 	injectCountingLiveness(t, liveWorktreeState{scanned: true})
 
 	reapOnceWithCache(t, cityPath, cfg, store, cache)
@@ -187,7 +191,7 @@ func TestReapStatusCache_BorrowVetoListNeverMemoized(t *testing.T) {
 	addClosedWorktree(t, rigRoot, cityPath, "builder", "ga-cache005")
 	store := &reapGetCountingStore{Store: beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-cache005", Status: "closed"}}, nil)}
 	cfg := reapTestConfig(rigRoot)
-	cache, now := newTestStatusCache(5 * time.Minute)
+	cache, now := newTestStatusCache()
 	injectCountingLiveness(t, liveWorktreeState{}) // scanned=false: indeterminate, protects
 
 	report := reapOnceWithCache(t, cityPath, cfg, store, cache)
@@ -216,7 +220,7 @@ func TestReapStatusCache_BorrowVetoListNeverMemoized(t *testing.T) {
 // ErrNotFound: ErrIDCollision wraps ErrNotFound but stays distinguishable,
 // and a caller checking for the collision sub-case must see it on hits too.
 func TestReapStatusCache_PreservesNotFoundErrorIdentity(t *testing.T) {
-	cache, now := newTestStatusCache(5 * time.Minute)
+	cache, now := newTestStatusCache()
 	store := &reapGetCountingStore{
 		Store:  beads.NewMemStoreFrom(1, nil, nil),
 		getErr: beads.ErrIDCollision,

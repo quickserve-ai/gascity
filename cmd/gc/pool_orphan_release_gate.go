@@ -19,7 +19,7 @@ import (
 // 1.4.1; this fork still runs it, and until now it had no off switch at all.
 //
 // WHY THIS FORK CANNOT SIMPLY DROP IT TO MATCH UPSTREAM. Upstream retired the
-// sweeper in favour of lease-based reclaim (bd reclaim over the leases table
+// sweeper in favor of lease-based reclaim (bd reclaim over the leases table
 // migration 0055 creates). Measured on this city 2026-08-26: none of our three
 // stores has a leases table, all three sit at migration 54, our bd 1.1.0 is
 // built from the carry fork and ships no heartbeat or reclaim verb, and every
@@ -58,7 +58,7 @@ func poolOrphanReleaseAllowed(cfg *config.City, storeRef string) bool {
 }
 
 // rigOrphanReleaseDisabled reports whether rigName is configured with
-// orphan_release = false. An unset knob means enabled, which is the behaviour
+// orphan_release = false. An unset knob means enabled, which is the behavior
 // every city had before this switch existed.
 func rigOrphanReleaseDisabled(cfg *config.City, rigName string) bool {
 	if cfg == nil {
@@ -109,7 +109,7 @@ func cityHasAnyOrphanReleaseDisabled(cfg *config.City) bool {
 // anyway whenever provenance is murky is not a kill switch. Note this costs
 // nothing on the overwhelming majority of cities, where no rig sets the knob:
 // cityHasAnyOrphanReleaseDisabled is false, so an unresolvable bead is allowed
-// exactly as it is today and behaviour is bit-for-bit unchanged.
+// exactly as it is today and behavior is bit-for-bit unchanged.
 func poolOrphanReleaseAllowedForBead(cfg *config.City, wb beads.Bead) bool {
 	if cfg == nil {
 		return true

@@ -3134,7 +3134,18 @@ func stubSupervisorLaunchdUnloaded(t *testing.T) {
 	t.Cleanup(func() { supervisorLaunchdLoaded = oldLoaded })
 }
 
+// skipUnlessDarwinLaunchd is the mirror of the inline systemd guards: the
+// launchd install path shells out to plutil, so it only applies on darwin.
+func skipUnlessDarwinLaunchd(t *testing.T) {
+	t.Helper()
+	if goruntime.GOOS != "darwin" {
+		t.Skip("launchd path only applies on darwin")
+	}
+}
+
 func TestInstallSupervisorLaunchdRemovesMatchingLegacyDefaultPlistForIsolatedGCHome(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
 	homeDir := t.TempDir()
 	gcHome := filepath.Join(t.TempDir(), "isolated-home")
 	t.Setenv("HOME", homeDir)
@@ -3198,6 +3209,8 @@ func TestInstallSupervisorLaunchdRemovesMatchingLegacyDefaultPlistForIsolatedGCH
 }
 
 func TestInstallSupervisorLaunchdWritesPrivatePlist(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
 	homeDir := t.TempDir()
 	gcHome := filepath.Join(t.TempDir(), "isolated-home")
 	t.Setenv("HOME", homeDir)
@@ -3237,6 +3250,8 @@ func TestInstallSupervisorLaunchdWritesPrivatePlist(t *testing.T) {
 }
 
 func TestInstallSupervisorLaunchdBootsOutGastownDaemonBeforeBootstrap(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
 	homeDir := t.TempDir()
 	gcHome := filepath.Join(t.TempDir(), "isolated-home")
 	t.Setenv("HOME", homeDir)
@@ -3292,6 +3307,8 @@ func TestInstallSupervisorLaunchdBootsOutGastownDaemonBeforeBootstrap(t *testing
 }
 
 func TestInstallSupervisorLaunchdIgnoresLegacyBootoutFailures(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
 	homeDir := t.TempDir()
 	gcHome := filepath.Join(t.TempDir(), "isolated-home")
 	t.Setenv("HOME", homeDir)
@@ -3345,6 +3362,8 @@ func TestInstallSupervisorLaunchdIgnoresLegacyBootoutFailures(t *testing.T) {
 }
 
 func TestInstallSupervisorLaunchdKeepsLegacyPlistWhenNewServiceFails(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
 	stubSupervisorLaunchdUnloaded(t)
 	homeDir := t.TempDir()
 	gcHome := filepath.Join(t.TempDir(), "isolated-home")
@@ -3417,6 +3436,8 @@ func TestInstallSupervisorLaunchdKeepsLegacyPlistWhenNewServiceFails(t *testing.
 }
 
 func TestInstallSupervisorLaunchdRestoresLegacyPlistWhenEnableFails(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
 	stubSupervisorLaunchdUnloaded(t)
 	homeDir := t.TempDir()
 	gcHome := filepath.Join(t.TempDir(), "isolated-home")
@@ -3499,6 +3520,8 @@ func TestInstallSupervisorLaunchdRestoresLegacyPlistWhenEnableFails(t *testing.T
 }
 
 func TestInstallSupervisorLaunchdRestoresLegacyPlistWhenKickstartFails(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
 	stubSupervisorLaunchdUnloaded(t)
 	homeDir := t.TempDir()
 	gcHome := filepath.Join(t.TempDir(), "isolated-home")
@@ -3572,6 +3595,8 @@ func TestInstallSupervisorLaunchdRestoresLegacyPlistWhenKickstartFails(t *testin
 }
 
 func TestInstallSupervisorLaunchdRestoresPreviousCurrentPlistWhenUpdateFails(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
 	homeDir := t.TempDir()
 	gcHome := filepath.Join(t.TempDir(), "isolated-home")
 	t.Setenv("HOME", homeDir)
@@ -3649,6 +3674,8 @@ func TestInstallSupervisorLaunchdRestoresPreviousCurrentPlistWhenUpdateFails(t *
 }
 
 func TestInstallSupervisorLaunchdRefreshesWhenUnchangedAndLaunchdManaged(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
 	homeDir := t.TempDir()
 	gcHome := filepath.Join(t.TempDir(), "isolated-home")
 	t.Setenv("HOME", homeDir)
@@ -3742,6 +3769,8 @@ func TestInstallSupervisorLaunchdRefreshesWhenUnchangedAndLaunchdManaged(t *test
 }
 
 func TestInstallSupervisorLaunchdMigratesLegacyOwnedLivePID(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
 	homeDir := t.TempDir()
 	gcHome := filepath.Join(t.TempDir(), "isolated-home")
 	t.Setenv("HOME", homeDir)
@@ -3855,6 +3884,8 @@ func TestInstallSupervisorLaunchdMigratesLegacyOwnedLivePID(t *testing.T) {
 }
 
 func TestInstallSupervisorLaunchdMigratesGastownOwnedLivePID(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
 	homeDir := t.TempDir()
 	gcHome := filepath.Join(homeDir, ".gc")
 	t.Setenv("HOME", homeDir)
@@ -3915,6 +3946,8 @@ func TestInstallSupervisorLaunchdMigratesGastownOwnedLivePID(t *testing.T) {
 }
 
 func TestInstallSupervisorLaunchdDoesNotStartSecondSupervisorWhenDirectProcessAlive(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
 	homeDir := t.TempDir()
 	gcHome := filepath.Join(t.TempDir(), "isolated-home")
 	t.Setenv("HOME", homeDir)
@@ -3971,6 +4004,8 @@ func TestInstallSupervisorLaunchdDoesNotStartSecondSupervisorWhenDirectProcessAl
 }
 
 func TestInstallSupervisorLaunchdReloadsWhenUnchangedButSupervisorStopped(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
 	homeDir := t.TempDir()
 	gcHome := filepath.Join(t.TempDir(), "isolated-home")
 	t.Setenv("HOME", homeDir)
@@ -6489,6 +6524,8 @@ func TestInstallSupervisorSystemdCreatesLogDirBeforeStartingService(t *testing.T
 }
 
 func TestInstallSupervisorLaunchdCreatesLogDirBeforeLoadingService(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
 	homeDir := t.TempDir()
 	gcHome := filepath.Join(t.TempDir(), "fresh-gc-home")
 	t.Setenv("HOME", homeDir)

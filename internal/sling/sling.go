@@ -234,6 +234,11 @@ type SlingChildResult struct {
 	FormulaName string // formula used
 }
 
+// CanonicalTargetIdentity resolves the identity a sling should address for a
+// target agent: the template's qualified name, unless the target is a
+// single-session template backed by exactly one configured named session, in
+// which case that session's identity is the canonical address. Pool targets,
+// custom-query targets, and a nil config keep the raw qualified name.
 func CanonicalTargetIdentity(cfg *config.City, cityName string, target config.Agent) string {
 	raw := target.QualifiedName()
 	if target.SupportsMultipleSessions() || IsCustomSlingQuery(target) || cfg == nil {

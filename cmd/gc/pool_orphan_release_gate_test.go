@@ -8,14 +8,20 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 )
 
-// gateTestCity builds a city with one pool-capable agent and one rig, with the
-// rig's orphan_release knob set to orphanRelease (nil leaves it unset).
-func gateTestCity(rigName string, orphanRelease *bool) *config.City {
+// gateTestRig is the single rig gateTestCity declares. The store refs the tests
+// pass alongside the city ("qcore", "astro", "") are matched against it, so the
+// name is fixed here rather than threaded through every call.
+const gateTestRig = "qcore"
+
+// gateTestCity builds a city with one pool-capable agent and one rig named
+// gateTestRig, with that rig's orphan_release knob set to orphanRelease (nil
+// leaves it unset).
+func gateTestCity(orphanRelease *bool) *config.City {
 	return &config.City{
 		Agents: []config.Agent{{Name: "worker", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(2)}},
 		Rigs: []config.Rig{{
-			Name:          rigName,
-			Path:          "/tmp/" + rigName,
+			Name:          gateTestRig,
+			Path:          "/tmp/" + gateTestRig,
 			OrphanRelease: orphanRelease,
 		}},
 	}
@@ -67,11 +73,11 @@ func TestPoolOrphanReleaseGate_UnsetKnobStillReleases(t *testing.T) {
 	work := seedGateWork(t, store)
 
 	released := releaseOrphanedPoolAssignmentsFromBeads(
-		store, gateTestCity("qcore", nil), "", nil,
+		store, gateTestCity(nil), "", nil,
 		[]beads.Bead{work}, nil, []string{"qcore"}, nil,
 	)
 	if len(released) != 1 || released[0].ID != work.ID {
-		t.Fatalf("released = %v, want [%s] — an unset knob must not change behaviour", released, work.ID)
+		t.Fatalf("released = %v, want [%s] — an unset knob must not change behavior", released, work.ID)
 	}
 	got, err := store.Get(work.ID)
 	if err != nil {
@@ -87,7 +93,7 @@ func TestPoolOrphanReleaseGate_DisabledRigHoldsClaim(t *testing.T) {
 	work := seedGateWork(t, store)
 
 	released := releaseOrphanedPoolAssignmentsFromBeads(
-		store, gateTestCity("qcore", boolPtr(false)), "", nil,
+		store, gateTestCity(boolPtr(false)), "", nil,
 		[]beads.Bead{work}, nil, []string{"qcore"}, nil,
 	)
 	if len(released) != 0 {
@@ -101,7 +107,7 @@ func TestPoolOrphanReleaseGate_ExplicitTrueStillReleases(t *testing.T) {
 	work := seedGateWork(t, store)
 
 	released := releaseOrphanedPoolAssignmentsFromBeads(
-		store, gateTestCity("qcore", boolPtr(true)), "", nil,
+		store, gateTestCity(boolPtr(true)), "", nil,
 		[]beads.Bead{work}, nil, []string{"qcore"}, nil,
 	)
 	if len(released) != 1 {
@@ -115,7 +121,7 @@ func TestPoolOrphanReleaseGate_DisabledRigDoesNotAffectOtherRig(t *testing.T) {
 	store := beads.NewMemStore()
 	work := seedGateWork(t, store)
 
-	cfg := gateTestCity("qcore", boolPtr(false))
+	cfg := gateTestCity(boolPtr(false))
 	cfg.Rigs = append(cfg.Rigs, config.Rig{Name: "astro", Path: "/tmp/astro"})
 
 	released := releaseOrphanedPoolAssignmentsFromBeads(
@@ -134,7 +140,7 @@ func TestPoolOrphanReleaseGate_CityStoreWorkUnaffected(t *testing.T) {
 	work := seedGateWork(t, store)
 
 	released := releaseOrphanedPoolAssignmentsFromBeads(
-		store, gateTestCity("qcore", boolPtr(false)), "", nil,
+		store, gateTestCity(boolPtr(false)), "", nil,
 		[]beads.Bead{work}, nil, []string{""}, nil,
 	)
 	if len(released) != 1 {
@@ -150,7 +156,7 @@ func TestPoolOrphanReleaseGate_NoStoreRefsFailsClosedWhenAnyRigDisabled(t *testi
 	work := seedGateWork(t, store)
 
 	released := releaseOrphanedPoolAssignmentsFromBeads(
-		store, gateTestCity("qcore", boolPtr(false)), "", nil,
+		store, gateTestCity(boolPtr(false)), "", nil,
 		[]beads.Bead{work}, nil, nil, nil,
 	)
 	if len(released) != 0 {
@@ -166,7 +172,7 @@ func TestPoolOrphanReleaseGate_NoStoreRefsUnchangedWhenNoRigDisabled(t *testing.
 	work := seedGateWork(t, store)
 
 	released := releaseOrphanedPoolAssignmentsFromBeads(
-		store, gateTestCity("qcore", nil), "", nil,
+		store, gateTestCity(nil), "", nil,
 		[]beads.Bead{work}, nil, nil, nil,
 	)
 	if len(released) != 1 {
@@ -203,7 +209,7 @@ func TestHeldByOrphanReleaseGate_SummaryNamesRigCountAndIDs(t *testing.T) {
 }
 
 func TestRigOrphanReleaseDisabled_UnknownRigAndNilConfig(t *testing.T) {
-	cfg := gateTestCity("qcore", boolPtr(false))
+	cfg := gateTestCity(boolPtr(false))
 	if rigOrphanReleaseDisabled(cfg, "nosuchrig") {
 		t.Fatal("an unknown rig must not be treated as disabled")
 	}

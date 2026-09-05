@@ -275,12 +275,12 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 
 	// Step 8: Build agent environment.
 	agentEnv := map[string]string{
-		"GC_SESSION_NAME":     sessName,
-		"GC_SESSION_ID":       sessionBeadID,
-		"GC_TEMPLATE":         templateNameFor(cfgAgent, qualifiedName),
-		"GC_SESSION_ORIGIN":   "ephemeral",
-		"GC_AGENT":            sessName,
-		"GC_ALIAS":            qualifiedName,
+		"GC_SESSION_NAME":   sessName,
+		"GC_SESSION_ID":     sessionBeadID,
+		"GC_TEMPLATE":       templateNameFor(cfgAgent, qualifiedName),
+		"GC_SESSION_ORIGIN": "ephemeral",
+		"GC_AGENT":          sessName,
+		"GC_ALIAS":          qualifiedName,
 		// One identity to bd: hook --claim writes the alias-first identity
 		// (ga-i44k) and bd's ownership guard compares the closer's
 		// BEADS_ACTOR against the bead's assignee, so the actor seeded here

@@ -140,7 +140,7 @@ func TestCollectLiveWorktreeState_FailsClosedOnTimeoutWithPartialOutput(t *testi
 	}
 }
 
-// A NON-ZERO exit with good output is lsof's normal partial-success behaviour and
+// A NON-ZERO exit with good output is lsof's normal partial-success behavior and
 // must be ACCEPTED. Rejecting it would silently restore never-reaps.
 func TestCollectLiveWorktreeState_AcceptsNonZeroExitWithOutput(t *testing.T) {
 	orig := lsofPath
