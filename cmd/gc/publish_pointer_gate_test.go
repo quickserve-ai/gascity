@@ -123,7 +123,8 @@ func TestPublishPointerTargets(t *testing.T) {
 		t.Error("an update that does not touch merge_result must not trigger the gate")
 	}
 	ids, ok := publishPointerTargets([]string{
-		"update", "qc-1", "--set-metadata", mergeResultMetadataKey + "=" + publishedAwaitingGate})
+		"update", "qc-1", "--set-metadata", mergeResultMetadataKey + "=" + publishedAwaitingGate,
+	})
 	if !ok || len(ids) != 1 || ids[0] != "qc-1" {
 		t.Errorf("publishPointerTargets = %v, %v; want [qc-1], true", ids, ok)
 	}

@@ -196,13 +196,13 @@ func runPublishPointerGate(bdArgs []string, store beads.Store, preFetched map[st
 		if violation == nil {
 			continue
 		}
-		fmt.Fprintf(stderr, "gc bd: refusing to set %s=%s on %s: %s\n",
-			mergeResultMetadataKey, publishedAwaitingGate, violation.beadID, violation.reason) //nolint:errcheck // best-effort stderr
-		fmt.Fprintf(stderr, "  A bead in this state means \"a PR exists and is waiting\". Without a fetchable\n"+
+		fmt.Fprintf(stderr, "gc bd: refusing to set %s=%s on %s: %s\n", //nolint:errcheck // best-effort stderr
+			mergeResultMetadataKey, publishedAwaitingGate, violation.beadID, violation.reason)
+		fmt.Fprintf(stderr, "  A bead in this state means \"a PR exists and is waiting\". Without a fetchable\n"+ //nolint:errcheck // best-effort stderr
 			"  %s nothing that starts from the bead can reach the work, which is how a\n"+
 			"  published branch becomes invisible and gets rebuilt from scratch (qc-tdkydo.58).\n"+
 			"  Set it in the same update:  --set-metadata %s=https://github.com/<owner>/<repo>/pull/<n>\n",
-			prURLMetadataKey, prURLMetadataKey) //nolint:errcheck // best-effort stderr
+			prURLMetadataKey, prURLMetadataKey)
 		blocked = true
 	}
 	return blocked
