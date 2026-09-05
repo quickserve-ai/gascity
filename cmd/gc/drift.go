@@ -284,9 +284,9 @@ func restartSupervisor(spec restartSpec, h restartHelpers) error {
 		if err := h.Launchctl("bootout", target); err != nil {
 			waitErr := h.WaitLaunchdUnloaded(spec.LaunchdLabel, launchdRefreshWaitTimeout)
 			if waitErr == nil {
-				return &launchdRestartError{err: fmt.Errorf("launchctl bootout %s reported %v after unloading the job; supervisor is stopped; recover with: launchctl bootstrap %s %s && launchctl enable %s && launchctl kickstart -p %s", target, err, shellSingleQuote(supervisorLaunchdDomain()), shellSingleQuote(plistPath), shellSingleQuote(target), shellSingleQuote(target)), rollbackSafe: true}
+				return &launchdRestartError{err: fmt.Errorf("launchctl bootout %s reported %w after unloading the job; supervisor is stopped; recover with: launchctl bootstrap %s %s && launchctl enable %s && launchctl kickstart -p %s", target, err, shellSingleQuote(supervisorLaunchdDomain()), shellSingleQuote(plistPath), shellSingleQuote(target), shellSingleQuote(target)), rollbackSafe: true}
 			}
-			return fmt.Errorf("launchctl bootout %s reported %v; supervisor job state is unknown (%v); inspect with launchctl print %s before recovery", target, err, waitErr, shellSingleQuote(target))
+			return fmt.Errorf("launchctl bootout %s reported %w; supervisor job state is unknown (%w); inspect with launchctl print %s before recovery", target, err, waitErr, shellSingleQuote(target))
 		}
 		if err := h.WaitLaunchdUnloaded(spec.LaunchdLabel, launchdRefreshWaitTimeout); err != nil {
 			return fmt.Errorf("waiting for launchd bootout %s: %w; supervisor is stopped and job state is unknown; inspect with: launchctl print %s; once absent, recover with: launchctl bootstrap %s %s && launchctl enable %s && launchctl kickstart -p %s", target, err, shellSingleQuote(target), shellSingleQuote(supervisorLaunchdDomain()), shellSingleQuote(plistPath), shellSingleQuote(target), shellSingleQuote(target))

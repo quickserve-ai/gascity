@@ -492,7 +492,7 @@ func TestTxFailureLeavesLivenessUnwritten(t *testing.T) {
 
 // TestTxKeepsLivenessVersionedAndFenced pins the other half of the invariant:
 // a session bead that reports closed always carries its terminal state, because
-// the state travelled in the same store write as the Close — not to a different
+// the state traveled in the same store write as the Close — not to a different
 // store that a crash could leave behind.
 func TestTxKeepsLivenessVersionedAndFenced(t *testing.T) {
 	store, backing, lv := newLivenessTestStore(t, liveness.ModeTable)

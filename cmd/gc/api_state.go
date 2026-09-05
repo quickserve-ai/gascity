@@ -321,7 +321,7 @@ var primeArmBound = 5 * time.Minute
 // feeding scale-check demand) stayed invisible until something else
 // touched the bead. Only shutdown (ctx canceled) skips the reconciler.
 //
-// A prime left running past primeArmBound is NOT abandoned or cancelled — it
+// A prime left running past primeArmBound is NOT abandoned or canceled — it
 // keeps going and applies its snapshot if it ever completes. That is safe
 // because prime discards its result unless c.mutationSeq is unchanged, so a
 // late prime cannot overwrite anything the now-running reconciler has done.

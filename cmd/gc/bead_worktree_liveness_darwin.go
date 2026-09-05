@@ -46,13 +46,13 @@ var lsofCWDTimeout = 10 * time.Second
 // Contract, identical to the /proc scanner: scanned=false means liveness is
 // indeterminate and the caller MUST protect every candidate worktree.
 //
-// Two deliberate decisions about lsof's behaviour:
+// Two deliberate decisions about lsof's behavior:
 //
 //  1. A NON-ZERO EXIT IS NOT A FAILURE. lsof routinely exits 1 while emitting
 //     perfectly good output — it reports partial success when some processes
 //     cannot be examined (another user's, or one that exited mid-scan). Judging
 //     on the exit code alone would throw away a complete answer and silently
-//     restore the very never-reaps behaviour this fixes. So the verdict is based
+//     restore the very never-reaps behavior this fixes. So the verdict is based
 //     on what was PARSED, not on the status.
 //
 //  2. ZERO PARSED CWDS IS A FAILURE, even on a clean exit. This process is
@@ -79,12 +79,12 @@ func collectLiveWorktreeState() liveWorktreeState {
 	// Wait() blocks until EVERY writer closes it — so the process dies while the
 	// call hangs anyway. A regression test (FailsClosedOnTimeout) caught exactly
 	// that: a 300ms timeout took 30s. Setpgid puts the enumerator in its own
-	// process group so the whole group is signalled, and WaitDelay caps how long
+	// process group so the whole group is signaled, and WaitDelay caps how long
 	// Wait() will linger on inherited pipes afterwards.
 	//
 	// HONEST COVERAGE NOTE: WaitDelay is defense-in-depth and is NOT covered by a
 	// killing test. Mutation-setting it to 0 leaves the suite green, because once
-	// the whole process group is signalled nothing survives to hold the pipe, and
+	// the whole process group is signaled nothing survives to hold the pipe, and
 	// macOS ships no setsid binary to build a group-escaping stub with. Keep it
 	// anyway — it is the only thing that bounds Wait() if a future enumerator
 	// double-forks out of the group — but do not read the green suite as proof

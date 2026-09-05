@@ -179,8 +179,10 @@ func releaseOrphanedPoolAssignments(
 		// "claims this lever actually held" rather than "beads the loop walked
 		// past" — the summary line is read as cutover evidence that the lever
 		// took effect, so it has to be the honest number.
-		gateRig := ""
-		gateAllowed := true
+		var (
+			gateRig     string
+			gateAllowed bool
+		)
 		if storeRefAware {
 			gateRig = strings.TrimSpace(assignedWorkStoreRefs[i])
 			gateAllowed = poolOrphanReleaseAllowed(cfg, gateRig)

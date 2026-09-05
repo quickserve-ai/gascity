@@ -18,7 +18,7 @@ import (
 // guarding against a loss that cannot happen, because `git worktree remove`
 // never touches refs/stash. This test requires TWO worktrees of ONE repo so it
 // can distinguish repo-global from per-worktree scope: a single-worktree test
-// would pass under both behaviours.
+// would pass under both behaviors.
 func TestReapClosedBeadWorktrees_RepoStashDoesNotProtectCleanWorktree(t *testing.T) {
 	cityPath, rigRoot := initReapRig(t)
 	cleanWT := addClosedWorktree(t, rigRoot, cityPath, "polecats", "ga-clean001")
