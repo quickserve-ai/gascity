@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -5819,12 +5820,255 @@ func TestResolveBdBinaryForScope(t *testing.T) {
 	})
 }
 
+// --- ga-xs28em: bd audit actor must not fall through to the human git user ---
+//
+// bd resolves its actor as $BEADS_ACTOR -> git user.name -> $USER. gc's session
+// identity is nowhere in that chain, so a session whose env was built by a path
+// that does not seed BEADS_ACTOR (the attach/resume builders reseed only the
+// city anchors) writes to the ledger as the repo's git user. On 2026-08-17 the
+// mayor wrote as "Cherub Kumar" — the Overseer — for ~12 hours, which is the
+// distinction the whole citation framework turns on.
+
+// The default is the alias-first claim identity (session.AssigneeIdentifier):
+// an aliased session owns its beads under the alias, so it must write to bd
+// under the alias too, not under its runtime session name.
+func TestBdRuntimeEnvDefaultsActorToAgentSessionIdentity(t *testing.T) {
+	t.Setenv("GC_BEADS", "bd")
+	t.Setenv("BEADS_ACTOR", "")
+	t.Setenv("GC_SESSION_NAME", "gastown__mayor")
+	t.Setenv("GC_AGENT", "")
+	t.Setenv("GC_ALIAS", "gastown.mayor")
+
+	env := mustBdRuntimeEnv(t, t.TempDir())
+	if got := env["BEADS_ACTOR"]; got != "gastown.mayor" {
+		t.Fatalf("BEADS_ACTOR = %q, want the alias-first claim identity %q (bd would otherwise attribute the write to git user.name)", got, "gastown.mayor")
+	}
+}
+
+func TestBdRuntimeEnvForRigDefaultsActorToAgentSessionIdentity(t *testing.T) {
+	t.Setenv("GC_BEADS", "bd")
+	t.Setenv("BEADS_ACTOR", "")
+	t.Setenv("GC_SESSION_NAME", "qcore--pam")
+	// No alias: an unaliased pool slot claims, and so writes, under its
+	// session name.
+	t.Setenv("GC_AGENT", "")
+	t.Setenv("GC_ALIAS", "")
+
+	cityPath := t.TempDir()
+	rigPath := filepath.Join(cityPath, "rigs", "qcore")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatalf("creating rig dir: %v", err)
+	}
+	env := mustBdRuntimeEnvForRig(t, cityPath, nil, rigPath)
+	if got := env["BEADS_ACTOR"]; got != "qcore--pam" {
+		t.Fatalf("rig BEADS_ACTOR = %q, want %q", got, "qcore--pam")
+	}
+}
+
+func TestBdRuntimeEnvKeepsExplicitActor(t *testing.T) {
+	t.Setenv("GC_BEADS", "bd")
+	t.Setenv("BEADS_ACTOR", "order:dolt-remotes-patrol")
+	t.Setenv("GC_SESSION_NAME", "gastown__deacon")
+
+	env := mustBdRuntimeEnv(t, t.TempDir())
+	// An explicit actor is more specific than the session it happens to run
+	// under: order-exec pins "order:<name>" and must keep it.
+	if got := strings.TrimSpace(env["BEADS_ACTOR"]); got != "" && got != "order:dolt-remotes-patrol" {
+		t.Fatalf("BEADS_ACTOR override = %q, want it left to the explicit process value", got)
+	}
+}
+
+func TestBdRuntimeEnvLeavesActorUnsetOutsideAgentSession(t *testing.T) {
+	t.Setenv("GC_BEADS", "bd")
+	t.Setenv("BEADS_ACTOR", "")
+	t.Setenv("GC_SESSION_NAME", "")
+	t.Setenv("GC_AGENT", "")
+	t.Setenv("GC_ALIAS", "")
+
+	env := mustBdRuntimeEnv(t, t.TempDir())
+	// A human running gc bd from a terminal keeps bd's git-user attribution;
+	// inventing an actor for them would be its own misattribution.
+	if got := strings.TrimSpace(env["BEADS_ACTOR"]); got != "" {
+		t.Fatalf("BEADS_ACTOR = %q outside a managed session, want empty", got)
+	}
+}
+
+func TestApplyControllerBdEnvDoesNotClobberAgentActor(t *testing.T) {
+	t.Setenv("BEADS_ACTOR", "")
+	t.Setenv("GC_SESSION_NAME", "gastown__mayor")
+	t.Setenv("GC_AGENT", "")
+	t.Setenv("GC_ALIAS", "")
+
+	env := map[string]string{}
+	applyAgentBdActor(env)
+	applyControllerBdEnv(env)
+	if got := env["BEADS_ACTOR"]; got != "gastown__mayor" {
+		t.Fatalf("BEADS_ACTOR after controller env = %q, want the agent identity to survive", got)
+	}
+}
+
+func TestApplyControllerBdEnvStillDefaultsToControllerOutsideSession(t *testing.T) {
+	t.Setenv("BEADS_ACTOR", "")
+	t.Setenv("GC_SESSION_NAME", "")
+	t.Setenv("GC_AGENT", "")
+	t.Setenv("GC_ALIAS", "")
+
+	env := map[string]string{}
+	applyAgentBdActor(env)
+	applyControllerBdEnv(env)
+	if got := env["BEADS_ACTOR"]; got != "controller" {
+		t.Fatalf("BEADS_ACTOR = %q, want controller for the supervisor's own writes", got)
+	}
+}
+
+// --- ga-xs28em: an actor that is not this session must be LOUD -----------
+//
+// The 12-hour misattribution produced no error anywhere: bd fell through to
+// git user.name and stored a human's name for an agent's ruling. An actor
+// silently resolving to a HUMAN while running as an agent is never intentional,
+// so gc says so on stderr where the agent that ran the command will see it.
+
+func captureActorWarning(t *testing.T, actor string) string {
+	t.Helper()
+	var buf bytes.Buffer
+	prevWriter := beadsActorWarnWriter
+	beadsActorWarnWriter = &buf
+	beadsActorWarned.Store(false)
+	t.Cleanup(func() {
+		beadsActorWarnWriter = prevWriter
+		beadsActorWarned.Store(false)
+	})
+	warnOnActorSessionMismatch(actor)
+	return buf.String()
+}
+
+func TestActorMismatchWarnsWhenActorIsNotTheSession(t *testing.T) {
+	t.Setenv("GC_SESSION_ID", "ga-xiwqtp")
+	t.Setenv("GC_SESSION_NAME", "gastown__mayor")
+	t.Setenv("GC_AGENT", "gastown.mayor")
+	t.Setenv("GC_ALIAS", "gastown.mayor")
+
+	got := captureActorWarning(t, "Cherub Kumar")
+	if !strings.Contains(got, "Cherub Kumar") || !strings.Contains(got, "gastown__mayor") {
+		t.Fatalf("warning = %q, want it to name both the wrong actor and the session", got)
+	}
+}
+
+func TestActorUnresolvedInsideSessionWarnsAboutTheHumanFallback(t *testing.T) {
+	t.Setenv("GC_SESSION_ID", "ga-xiwqtp")
+	t.Setenv("GC_SESSION_NAME", "gastown__mayor")
+
+	got := captureActorWarning(t, "")
+	if !strings.Contains(got, "git user.name") {
+		t.Fatalf("warning = %q, want it to name the human fallback bd is about to take", got)
+	}
+}
+
+func TestActorMatchingTheSessionIsSilent(t *testing.T) {
+	t.Setenv("GC_SESSION_ID", "ga-xiwqtp")
+	t.Setenv("GC_SESSION_NAME", "gastown__mayor")
+	t.Setenv("GC_ALIAS", "gastown.mayor")
+
+	if got := captureActorWarning(t, "gastown__mayor"); got != "" {
+		t.Fatalf("warning = %q, want silence for the session's own identity", got)
+	}
+	// The alias is the same agent by another name; warning on it would train
+	// every agent to ignore the warning.
+	if got := captureActorWarning(t, "gastown.mayor"); got != "" {
+		t.Fatalf("alias warning = %q, want silence", got)
+	}
+}
+
+func TestDeliberateNonSessionActorsAreSilent(t *testing.T) {
+	t.Setenv("GC_SESSION_ID", "ga-xiwqtp")
+	t.Setenv("GC_SESSION_NAME", "gastown__deacon")
+
+	// order-exec and the supervisor pin an actor that is deliberately NOT the
+	// session's own; both are more specific, not a misattribution.
+	if got := captureActorWarning(t, "order:dolt-remotes-patrol"); got != "" {
+		t.Fatalf("order actor warning = %q, want silence", got)
+	}
+	if got := captureActorWarning(t, "controller"); got != "" {
+		t.Fatalf("controller actor warning = %q, want silence", got)
+	}
+}
+
+func TestActorWarningSilentOutsideManagedSession(t *testing.T) {
+	t.Setenv("GC_SESSION_ID", "")
+	t.Setenv("GC_SESSION_NAME", "")
+	t.Setenv("GC_AGENT", "")
+	t.Setenv("GC_ALIAS", "")
+
+	// A human running gc bd from a terminal SHOULD be attributed to their git
+	// identity — warning there would be noise on the one correct case.
+	if got := captureActorWarning(t, ""); got != "" {
+		t.Fatalf("warning = %q, want silence outside a managed session", got)
+	}
+}
+
+func TestActorWarningEmittedOncePerProcess(t *testing.T) {
+	t.Setenv("GC_SESSION_ID", "ga-xiwqtp")
+	t.Setenv("GC_SESSION_NAME", "gastown__mayor")
+
+	var buf bytes.Buffer
+	prevWriter := beadsActorWarnWriter
+	beadsActorWarnWriter = &buf
+	beadsActorWarned.Store(false)
+	t.Cleanup(func() {
+		beadsActorWarnWriter = prevWriter
+		beadsActorWarned.Store(false)
+	})
+	warnOnActorSessionMismatch("Cherub Kumar")
+	first := buf.Len()
+	warnOnActorSessionMismatch("Cherub Kumar")
+	if buf.Len() != first {
+		t.Fatalf("second warning appended %d bytes; want one line per process", buf.Len()-first)
+	}
+	if first == 0 {
+		t.Fatal("no warning emitted at all")
+	}
+}
+
+// The warning must fire on the path gc actually takes, not just when called
+// directly: applyAgentBdActor is the one place that sees the effective actor
+// before bd runs, so pin the wiring, not only the helper.
+func TestApplyAgentBdActorWarnsThroughTheEnvBuilder(t *testing.T) {
+	t.Setenv("GC_SESSION_ID", "ga-xiwqtp")
+	t.Setenv("GC_SESSION_NAME", "gastown__mayor")
+	t.Setenv("GC_AGENT", "")
+	t.Setenv("GC_ALIAS", "")
+	t.Setenv("BEADS_ACTOR", "Cherub Kumar")
+
+	var buf bytes.Buffer
+	prevWriter := beadsActorWarnWriter
+	beadsActorWarnWriter = &buf
+	beadsActorWarned.Store(false)
+	t.Cleanup(func() {
+		beadsActorWarnWriter = prevWriter
+		beadsActorWarned.Store(false)
+	})
+
+	env := map[string]string{}
+	applyAgentBdActor(env)
+	if !strings.Contains(buf.String(), "Cherub Kumar") {
+		t.Fatalf("no warning from applyAgentBdActor; got %q", buf.String())
+	}
+	// The pinned actor still wins — warning about it is not the same as
+	// overriding it, and silently rewriting an explicit actor would be its own
+	// attribution bug.
+	if got := env["BEADS_ACTOR"]; got != "" {
+		t.Fatalf("applyAgentBdActor overrode the explicit actor with %q", got)
+	}
+}
+
 // TestBdRuntimeEnvForExplicitRigRecordsAmbientEndpointAsAnotherStore pins the
 // projection half of gc-49ho's host leg: a session projected for an explicit
 // external rig store carries GC_DOLT_MANAGED_LOCAL=0 so the managed-city
 // resolver (contract.ManagedLocalDoltEnv) knows the ambient GC_DOLT_HOST is
 // that store's, not a redirect of the city's managed server — while the city
-// scope's own projection carries no such record.
+// scope's own projection never records itself as another store. The managed
+// projection clears the record rather than deleting it, so the city side
+// accepts empty as well as absent.
 func TestBdRuntimeEnvForExplicitRigRecordsAmbientEndpointAsAnotherStore(t *testing.T) {
 	cityDir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(cityDir, ".gc", "runtime", "packs", "dolt"), 0o755); err != nil {
@@ -5865,7 +6109,7 @@ func TestBdRuntimeEnvForExplicitRigRecordsAmbientEndpointAsAnotherStore(t *testi
 		t.Fatalf("rig GC_DOLT_MANAGED_LOCAL = %q, want %q (ambient endpoint recorded as another store)", got, "0")
 	}
 	cityEnv := mustBdRuntimeEnv(t, cityDir)
-	if got, ok := cityEnv["GC_DOLT_MANAGED_LOCAL"]; ok {
-		t.Fatalf("city GC_DOLT_MANAGED_LOCAL = %q, want absent for the managed city scope", got)
+	if got := cityEnv["GC_DOLT_MANAGED_LOCAL"]; got != "" {
+		t.Fatalf("city GC_DOLT_MANAGED_LOCAL = %q, want empty or absent for the managed city scope", got)
 	}
 }
