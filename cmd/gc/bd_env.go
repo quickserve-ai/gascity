@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -452,9 +453,136 @@ func applyExportSuppressionEnv(env map[string]string) {
 
 func applyControllerBdEnv(env map[string]string) {
 	applyExportSuppressionEnv(env)
-	if strings.TrimSpace(os.Getenv("BEADS_ACTOR")) == "" {
+	// Only the supervisor's OWN writes are the controller's. An agent identity
+	// already resolved onto env (applyAgentBdActor) is more specific and must
+	// survive: clobbering it here would trade one misattribution for another.
+	if strings.TrimSpace(os.Getenv("BEADS_ACTOR")) == "" && strings.TrimSpace(env["BEADS_ACTOR"]) == "" {
 		env["BEADS_ACTOR"] = "controller"
 	}
+}
+
+// gcAgentSessionActor returns the gc agent identity this process is running
+// under, or "" when it is not inside a managed agent session.
+//
+// The order (alias -> agent -> session name) is agentScriptClaimActor's, minus
+// the BEADS_ACTOR this resolves a default for, so a bead's audit actor and its
+// claim actor name the same alias-first identity (session.AssigneeIdentifier).
+// A session-name-first order would split an aliased session into two strings:
+// owning its bead under the alias while writing to bd under the runtime name.
+func gcAgentSessionActor() string {
+	for _, key := range []string{"GC_ALIAS", "GC_AGENT", "GC_SESSION_NAME"} {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+// applyAgentBdActor defaults BEADS_ACTOR to the gc agent identity when this
+// process runs inside a managed agent session and no actor has been pinned.
+//
+// bd resolves its audit actor as $BEADS_ACTOR -> git user.name -> $USER. gc's
+// session identity is nowhere in that chain, so a session whose environment was
+// built by a path that does not seed BEADS_ACTOR writes to the ledger as the
+// repo's git user -- a HUMAN. Session env is not a reliable carrier: the
+// attach/resume builders (cmd/gc/worker_handle.go, internal/api/session_runtime.go)
+// reseed only the city identity anchors, so a session recreated through them
+// runs for its whole life with no actor. On 2026-08-17 the mayor wrote to the
+// ledger as "Cherub Kumar" for ~12 hours that way (ga-xs28em). That is not a
+// cosmetic mislabel: "who decided this" is the field every adjudication, gate,
+// and sign-off is answered by, so an agent note stored under the Overseer's
+// name manufactures authority out of ordinary operation -- silently, with no
+// error anywhere. Resolving the actor HERE, where gc builds every bd
+// subprocess environment, makes the attribution independent of how the session
+// was started.
+//
+// An explicit BEADS_ACTOR always wins: order-exec pins "order:<name>" and the
+// supervisor pins "controller", and both are more specific than the session
+// they happen to run under. Outside a managed session this is a no-op, so a
+// human running gc bd from a terminal keeps bd's git-user attribution.
+func applyAgentBdActor(env map[string]string) {
+	actor := strings.TrimSpace(os.Getenv("BEADS_ACTOR"))
+	if actor == "" {
+		actor = strings.TrimSpace(env["BEADS_ACTOR"])
+	}
+	if actor == "" {
+		if resolved := gcAgentSessionActor(); resolved != "" {
+			env["BEADS_ACTOR"] = resolved
+			actor = resolved
+		}
+	}
+	warnOnActorSessionMismatch(actor)
+}
+
+// beadsActorWarnWriter is where the audit-actor warning lands. A package var so
+// tests can read it back; production writes to the process stderr, which is
+// where an agent sees the output of the gc command it just ran.
+var beadsActorWarnWriter io.Writer = os.Stderr
+
+// beadsActorWarned keeps the warning to one line per process. gc rebuilds a bd
+// environment many times per command, and a warning that repeats on every
+// rebuild is a warning that gets scrolled past.
+var beadsActorWarned atomic.Bool
+
+// deliberateNonSessionActor reports whether actor is one gc pins on purpose for
+// a write that is NOT the session's own. Order execution stamps
+// "order:<name>" (cmd/gc/order_store.go) and the supervisor stamps
+// "controller" (cmd/gc/cmd_supervisor_lifecycle.go); both are more specific
+// than the session they happen to run under, so neither is a mismatch.
+func deliberateNonSessionActor(actor string) bool {
+	return actor == "controller" || strings.HasPrefix(actor, "order:")
+}
+
+// warnOnActorSessionMismatch complains when a bd write made from inside a gc
+// agent session would be attributed to something other than that session.
+//
+// The failure this exists to make loud: bd resolves its audit actor as
+// $BEADS_ACTOR -> git user.name -> $USER, so an agent session that reaches bd
+// with no actor writes to the ledger under the repo's git user -- a HUMAN,
+// silently, with no error anywhere. "Who decided this" is the field every
+// adjudication, gate, and sign-off is answered by, so an agent note stored
+// under the Overseer's name does not merely mislabel work: it manufactures
+// authority out of ordinary operation (ga-xs28em, where the mayor wrote as
+// "Cherub Kumar" for ~12 hours after a machine restart).
+//
+// Silent outside a managed session (GC_SESSION_ID absent): a human running gc
+// bd from a terminal SHOULD be attributed to their git identity.
+func warnOnActorSessionMismatch(actor string) {
+	if strings.TrimSpace(os.Getenv("GC_SESSION_ID")) == "" {
+		return
+	}
+	actor = strings.TrimSpace(actor)
+	sessionName := strings.TrimSpace(os.Getenv("GC_SESSION_NAME"))
+	if actor != "" {
+		if deliberateNonSessionActor(actor) {
+			return
+		}
+		// Any of the session identity anchors is an acceptable actor: they name
+		// the same agent, and gcAgentSessionActor falls back through them in
+		// this order.
+		for _, key := range []string{"GC_ALIAS", "GC_AGENT", "GC_SESSION_NAME"} {
+			if value := strings.TrimSpace(os.Getenv(key)); value != "" && actor == value {
+				return
+			}
+		}
+	}
+	if !beadsActorWarned.CompareAndSwap(false, true) {
+		return
+	}
+	if sessionName == "" {
+		sessionName = strings.TrimSpace(os.Getenv("GC_SESSION_ID"))
+	}
+	if actor == "" {
+		//nolint:errcheck // best-effort warning: a write failure must not block env projection
+		fmt.Fprintf(beadsActorWarnWriter,
+			"gc: WARNING: bd audit actor is unresolved inside gc session %q -- bd will fall back to git user.name and attribute these ledger writes to a HUMAN (ga-xs28em)\n",
+			sessionName)
+		return
+	}
+	//nolint:errcheck // best-effort warning: a write failure must not block env projection
+	fmt.Fprintf(beadsActorWarnWriter,
+		"gc: WARNING: bd audit actor %q does not name gc session %q -- ledger writes from this session will be attributed to %q (ga-xs28em)\n",
+		actor, sessionName, actor)
 }
 
 func issuePrefixForScope(scopeRoot, cityPath string, cfg *config.City) string {
@@ -551,6 +679,24 @@ func applyCanonicalDoltTargetEnv(env map[string]string, target contract.DoltConn
 		env["GC_DOLT_PORT"] = target.Port
 	} else {
 		delete(env, "GC_DOLT_PORT")
+	}
+	recordManagedLocalDoltEnv(env, target)
+}
+
+// recordManagedLocalDoltEnv stamps contract.ManagedLocalDoltEnv so a
+// managed-city resolve run from this projected environment can tell an
+// external store's ambient GC_DOLT_HOST from a container's redirect of the
+// managed server (gc-49ho). An external target records "0"; a managed target
+// explicitly clears the key so a later child-env overlay cannot resurrect an
+// inherited "0" from a parent projected for another store.
+func recordManagedLocalDoltEnv(env map[string]string, target contract.DoltConnectionTarget) {
+	if env == nil {
+		return
+	}
+	if target.External {
+		env[contract.ManagedLocalDoltEnv] = "0"
+	} else {
+		env[contract.ManagedLocalDoltEnv] = ""
 	}
 }
 
@@ -1630,7 +1776,11 @@ func applyLegacyRigExternalTarget(env map[string]string, rig config.Rig) contrac
 	if port != "" {
 		env["GC_DOLT_PORT"] = port
 	}
-	return contract.DoltConnectionTarget{Host: host, Port: port, External: true}
+	target := contract.DoltConnectionTarget{Host: host, Port: port, External: true}
+	// A legacy rig dolt_host is the qlandia city.toml shape, so this path is as
+	// load-bearing for gc-49ho as the canonical one.
+	recordManagedLocalDoltEnv(env, target)
+	return target
 }
 
 func rigRuntimeEnvIndependentOfCityProjection(cityPath, rigPath string, explicitRig *config.Rig) bool {
@@ -1849,6 +1999,10 @@ func bdRuntimeEnvWithErrorRecoveryContext(ctx context.Context, cityPath string, 
 	// stuck-looping backup_export sync wedged the whole town on 2026-06-08
 	// (ga-0eq); managed backups run through mol-dog-backup, not this path.
 	applyBdAutoBackupOptOut(env)
+	// Resolve the audit actor from the gc session identity when nothing has
+	// pinned one. Set before every early return below so the attribution does
+	// not depend on which backend branch this scope takes. See applyAgentBdActor.
+	applyAgentBdActor(env)
 	if !cityUsesBdStoreContract(cityPath) {
 		return env, nil
 	}
