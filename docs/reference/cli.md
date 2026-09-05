@@ -1884,7 +1884,26 @@ gc hook [agent] [flags]
 
 | Subcommand | Description |
 |------------|-------------|
+| [gc hook context-inject](#gc-hook-context-inject) | Emit the clock + context-usage advisory (store-free UserPromptSubmit hook) |
 | [gc hook run](#gc-hook-run) | Run a managed hook command with a hard timeout |
+
+## gc hook context-inject
+
+Emits the live clock and, above the context-usage threshold, the
+context-pressure advisory as a single UserPromptSubmit provider payload.
+
+Store-free and sub-second by construction: it reads only the hook input JSON on
+stdin (transcript_path) and the local transcript file, never the nudge queue or
+any other store, so it always flushes within the hook timeout. Wire it as its
+own UserPromptSubmit entry alongside (not replacing) nudge drain / mail check.
+
+```
+gc hook context-inject [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--hook-format` | string |  | format hook output for a provider |
 
 ## gc hook run
 

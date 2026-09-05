@@ -8,6 +8,15 @@
       }
     ]
   },
+  "gascity-context-inject": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "export PATH=\"$HOME/go/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\" && gc hook run --timeout 15s --timeout-exit-code 0 -- hook context-inject --hook-format antigravity",
+        "timeout": 30
+      }
+    ]
+  },
   "gascity-nudge-drain": {
     "PreInvocation": [
       {

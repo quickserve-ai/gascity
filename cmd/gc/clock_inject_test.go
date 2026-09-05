@@ -74,11 +74,13 @@ func TestClockInjectPrefixCodexIsJSON(t *testing.T) {
 	}
 }
 
-// TestCmdNudgeDrainInjectClockAndNudgeSingleJSONDocument is the combined-path
-// regression: when a nudge fires alongside the clock under a JSON hook format,
-// stdout must be exactly one JSON document carrying both the clock line and the
-// nudge content in additionalContext — not two concatenated objects.
-func TestCmdNudgeDrainInjectClockAndNudgeSingleJSONDocument(t *testing.T) {
+// TestCmdNudgeDrainInjectNudgeSingleJSONDocument is the nudge-path regression:
+// when a nudge fires under a JSON hook format, stdout must be exactly one JSON
+// document carrying the nudge content in additionalContext — not two
+// concatenated objects. The clock + context advisory is delivered by the
+// separate store-free `gc hook context-inject` entry (qc-s3i236.4), so it must
+// NOT appear in this store-bound drain's output.
+func TestCmdNudgeDrainInjectNudgeSingleJSONDocument(t *testing.T) {
 	for _, hookFormat := range []string{"codex", "gemini"} {
 		t.Run(hookFormat, func(t *testing.T) {
 			clearGCEnv(t)
@@ -141,21 +143,23 @@ func TestCmdNudgeDrainInjectClockAndNudgeSingleJSONDocument(t *testing.T) {
 			if !ok {
 				t.Fatalf("missing additionalContext string, got %#v", hook)
 			}
-			if !strings.Contains(ctx, "Current time:") {
-				t.Errorf("additionalContext missing clock line, got %q", ctx)
-			}
 			if !strings.Contains(ctx, "check hook output") {
 				t.Errorf("additionalContext missing nudge content, got %q", ctx)
+			}
+			// The clock rides the separate store-free hook now, never the drain.
+			if strings.Contains(ctx, "Current time:") {
+				t.Errorf("drain output must not carry the clock (it moved to gc hook context-inject), got %q", ctx)
 			}
 		})
 	}
 }
 
 // TestCmdNudgeDrainInjectStepInSingleJSONDocument is the nudge leg of the
-// hook-inject feature: when a nudge fires alongside the clock and the agent has
-// an active formula step, stdout must be exactly one JSON document whose
-// additionalContext carries the clock line, the nudge content, AND the active
-// step <system-reminder> — never concatenated objects.
+// hook-inject feature: when a nudge fires and the agent has an active formula
+// step, stdout must be exactly one JSON document whose additionalContext
+// carries the nudge content AND the active step <system-reminder> — never
+// concatenated objects. The clock + context advisory rides the separate
+// store-free `gc hook context-inject` entry (qc-s3i236.4), not this drain.
 func TestCmdNudgeDrainInjectStepInSingleJSONDocument(t *testing.T) {
 	for _, hookFormat := range []string{"codex", "gemini"} {
 		t.Run(hookFormat, func(t *testing.T) {
@@ -237,10 +241,14 @@ func TestCmdNudgeDrainInjectStepInSingleJSONDocument(t *testing.T) {
 			if !ok {
 				t.Fatalf("missing additionalContext string, got %#v", hook)
 			}
-			for _, want := range []string{"Current time:", "check hook output", "<system-reminder>", step.Title, step.ID, "Write the widget code"} {
+			for _, want := range []string{"check hook output", "<system-reminder>", step.Title, step.ID, "Write the widget code"} {
 				if !strings.Contains(ctx, want) {
 					t.Errorf("additionalContext missing %q, got %q", want, ctx)
 				}
+			}
+			// The clock rides the separate store-free hook now, never the drain.
+			if strings.Contains(ctx, "Current time:") {
+				t.Errorf("drain output must not carry the clock (it moved to gc hook context-inject), got %q", ctx)
 			}
 		})
 	}
