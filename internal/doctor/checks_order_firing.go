@@ -154,16 +154,17 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 	// than the active log are resolved (the order-run store, per order), and
 	// events.LatestPerSubjectInActiveLog for why the archives are excluded.
 	eventPath := filepath.Join(cityPath, citylayout.RuntimeRoot, "events.jsonl")
-	katyaT0 := time.Now()
 	latestEvents, err := events.LatestPerSubjectInActiveLog(eventPath, events.OrderFired, events.ControllerStarted)
-	log.Printf("KATYA LatestPerSubjectInActiveLog: %v (%d pairs)", time.Since(katyaT0), len(latestEvents))
-	defer func() { log.Printf("KATYA whole check run(): %v", time.Since(katyaT0)) }()
 	if err != nil {
 		result.Status = StatusError
 		result.Message = fmt.Sprintf("read order firing events: %v", err)
 		return result
 	}
 	startedAt := events.LatestTsForType(latestEvents, events.ControllerStarted)
+	// A zero startedAt with firings present means the start event rotated out
+	// of the active log, not that the controller never ran — see
+	// classifyOrderFiring for why the two must not classify alike.
+	startRotatedOut := startedAt.IsZero() && anyEventOfType(latestEvents, events.OrderFired)
 
 	now := c.clock()
 	if now.IsZero() {
@@ -206,7 +207,7 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 			blockingErrors++
 			continue
 		}
-		status, severity, detail := classifyOrderFiring(order, now, expected, lastFired, startedAt)
+		status, severity, detail := classifyOrderFiring(order, now, expected, lastFired, startedAt, startRotatedOut)
 		worst = worseStatus(worst, status)
 		result.Details = append(result.Details, detail)
 		if status != StatusOK {
@@ -614,11 +615,36 @@ func latestOrderFiredAt(latestEvents map[events.TypeSubject]events.Event, subjec
 	return latestEvents[events.TypeSubject{Type: events.OrderFired, Subject: subject}].Ts
 }
 
-func classifyOrderFiring(order orders.Order, now time.Time, expected time.Duration, lastFired, controllerStarted time.Time) (CheckStatus, CheckSeverity, string) {
+func anyEventOfType(latestEvents map[events.TypeSubject]events.Event, eventType string) bool {
+	for key := range latestEvents {
+		if key.Type == eventType {
+			return true
+		}
+	}
+	return false
+}
+
+func classifyOrderFiring(order orders.Order, now time.Time, expected time.Duration, lastFired, controllerStarted time.Time, startRotatedOut bool) (CheckStatus, CheckSeverity, string) {
 	name := orderDisplayName(order)
 	if lastFired.IsZero() {
 		if controllerStarted.IsZero() {
-			return StatusOK, SeverityBlocking, fmt.Sprintf("%s: never fired (controller start unknown)", name)
+			// Two very different situations produce a zero start. If the active
+			// log holds no firings either, the controller may simply never have
+			// run — controller-down is its own finding, and 40 per-order alarms
+			// would only restate it. But if firings ARE present, the controller
+			// is running and its start event has merely rotated into the
+			// archives, which means it started before the active log window —
+			// longer ago than any first-cycle grace could cover. Reporting OK
+			// there is the silent-green path: a never-fired order on a
+			// long-running controller is exactly the scheduler blindness this
+			// check exists to catch.
+			if !startRotatedOut {
+				return StatusOK, SeverityBlocking, fmt.Sprintf("%s: never fired (controller start unknown)", name)
+			}
+			if order.Trigger == "cron" {
+				return StatusError, SeverityAdvisory, fmt.Sprintf("%s: never fired; controller start predates the active event log (no first-cycle grace)", name)
+			}
+			return StatusError, SeverityBlocking, fmt.Sprintf("%s: never fired; controller start predates the active event log (no first-cycle grace)", name)
 		}
 		uptime := nonNegativeDuration(now.Sub(controllerStarted))
 		if uptime >= expected+expected/2 {

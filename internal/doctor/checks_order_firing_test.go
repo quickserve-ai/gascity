@@ -44,6 +44,54 @@ func TestOrderFiringCurrent_NeverFired_BeyondUptime(t *testing.T) {
 	}
 }
 
+// TestOrderFiringCurrent_NeverFired_StartRotatedOut pins the honesty half of
+// the bounded read (ga-22tvtm): when controller.started has rotated out of the
+// active log but firings prove the controller runs, a never-fired order must
+// NOT classify under the "controller start unknown" OK branch — the controller
+// started before the log window, so no first-cycle grace can apply.
+func TestOrderFiringCurrent_NeverFired_StartRotatedOut(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrder(t, cityPath, "mol-dog-stale-db", "cron", "0 */4 * * *")
+	// No controller.started in the active log — only another order's firing,
+	// which is proof the controller is (or was) running.
+	writeOrderFiringTestEvents(t, cityPath, events.Event{
+		Type:    events.OrderFired,
+		Subject: "some-other-order",
+		Ts:      now.Add(-2 * time.Minute),
+	})
+
+	result := runOrderFiringCurrentTest(t, cfg, cityPath, now)
+	if result.Status != StatusError {
+		t.Fatalf("status = %v, want error; msg = %s; details = %v", result.Status, result.Message, result.Details)
+	}
+	// Cron stays advisory for the same ga-97qngx reason as the known-uptime
+	// never-fired path.
+	if result.Severity != SeverityAdvisory {
+		t.Fatalf("Severity = %v, want SeverityAdvisory", result.Severity)
+	}
+	if !strings.Contains(strings.Join(result.Details, "\n"), "controller start predates the active event log") {
+		t.Fatalf("details = %v, want start-predates-log message", result.Details)
+	}
+}
+
+// TestOrderFiringCurrent_NeverFired_NoEventsAtAll: an active log with no
+// firings and no start gives no evidence the controller ever ran —
+// controller-down is its own doctor finding, so per-order alarms stay quiet.
+func TestOrderFiringCurrent_NeverFired_NoEventsAtAll(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrder(t, cityPath, "mol-dog-stale-db", "cron", "0 */4 * * *")
+
+	result := runOrderFiringCurrentTest(t, cfg, cityPath, now)
+	if result.Status != StatusOK {
+		t.Fatalf("status = %v, want OK; msg = %s; details = %v", result.Status, result.Message, result.Details)
+	}
+	if !strings.Contains(strings.Join(result.Details, "\n"), "controller start unknown") {
+		t.Fatalf("details = %v, want controller-start-unknown message", result.Details)
+	}
+}
+
 func TestOrderFiringCurrent_Stale_StaysBlocking(t *testing.T) {
 	// Cooldown stale (CRITICAL) must remain blocking even though the
 	// sibling "never fired" path was demoted to advisory; the stale
