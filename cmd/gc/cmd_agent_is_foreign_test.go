@@ -151,7 +151,7 @@ func TestAgentIsForeign_VerdictsAndExitCodes(t *testing.T) {
 // TestAgentIsForeign_ForeignBindingCollision is the ga-8yi7ne case, named
 // because the mayor's decision on ga-7dr90m requires it.
 //
-// A neighbouring city's canonical "<rig>/<binding>.<name>-<slot>" must NOT
+// A neighboring city's canonical "<rig>/<binding>.<name>-<slot>" must NOT
 // resolve against our same-named unbound agent. Stripping ANY binding prefix is
 // what turned this gate into a cross-city hazard in the field on 2026-08-25:
 // westeros's "qcore/pool.omp-1" strips to "qcore/omp-1", matches our configured
@@ -330,8 +330,8 @@ func TestPoolAssigneeObservability_ReasonsMatchTheNarrowingThatFired(t *testing.
 			// The boolean predicate the in-process sweeper calls must agree with
 			// the explained form in every case — that agreement is what makes
 			// this ONE implementation rather than two that can drift.
-			if bool := poolAssigneeIsLocallyObservable(cfg, "testcity", tc.identity); bool != got.Local {
-				t.Fatalf("poolAssigneeIsLocallyObservable = %v but poolAssigneeObservability.Local = %v — the predicate and the explained form have drifted", bool, got.Local)
+			if observable := poolAssigneeIsLocallyObservable(cfg, "testcity", tc.identity); observable != got.Local {
+				t.Fatalf("poolAssigneeIsLocallyObservable = %v but poolAssigneeObservability.Local = %v — the predicate and the explained form have drifted", observable, got.Local)
 			}
 		})
 	}

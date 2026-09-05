@@ -65,7 +65,7 @@ var managedDoltGlobalChecks = []struct {
 // tested. A warning nobody has ever seen fire is a warning that may not fire.
 var managedDoltGlobalCheckExecFn = func(host, port, user, stmt string) (string, error) {
 	out, err := runManagedDoltSQL(host, port, user, "-q", stmt)
-	return string(out), err
+	return out, err
 }
 
 // verifyManagedDoltGlobals checks the post-readiness global settings on a
