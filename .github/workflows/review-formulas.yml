@@ -37,7 +37,6 @@ concurrency:
 
 env:
   DOLT_VERSION: "2.1.7"
-  BD_VERSION: "v1.1.0"
 
 jobs:
   runner-policy:
@@ -181,7 +180,6 @@ jobs:
       - uses: ./.github/actions/setup-gascity-ubuntu
         with:
           dolt-version: ${{ env.DOLT_VERSION }}
-          bd-version: ${{ env.BD_VERSION }}
           install-claude-cli: "true"
       - name: Install tools
         run: make install-tools

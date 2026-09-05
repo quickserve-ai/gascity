@@ -458,6 +458,17 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	// Publish-pointer gate (ga-krso22 / ga-mmvpq1 B5): a bead may not enter
+	// merge_result=pr_published_awaiting_gate without a fetchable pr_url. The
+	// state means "a PR exists and is waiting"; without a re-derivable pointer
+	// nothing that starts from the bead can reach the work, which is how a
+	// published branch becomes invisible and gets rebuilt from scratch
+	// (qc-tdkydo.58). Unlike the work-record gate this enforces by default: the
+	// refusal fires only on a write that would create the hole.
+	if runPublishPointerGate(bdArgs, guardStore, guardBeads, stderr) {
+		return 1
+	}
+
 	reapStaleBdExportJSONL(target.ScopeRoot)
 	warnExternalBdOverrideDrift(stderr, cityPath, target)
 

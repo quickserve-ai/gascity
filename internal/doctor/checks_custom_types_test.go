@@ -18,7 +18,7 @@ func TestCustomTypesCheck_NoBeadsDir(t *testing.T) {
 	dir := t.TempDir()
 	c := NewCustomTypesCheck(dir, "test")
 	r := c.Run(&CheckContext{CityPath: dir})
-	if r.Status != StatusOK {
+	if r.Status != StatusSkipped {
 		t.Fatalf("status = %d, want OK (no .beads dir)", r.Status)
 	}
 }

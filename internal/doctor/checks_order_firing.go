@@ -667,10 +667,10 @@ func orderHistoryHintTarget(order orders.Order) string {
 }
 
 func worseStatus(a, b CheckStatus) CheckStatus {
-	if b > a {
-		return b
-	}
-	return a
+	// Delegates to WorseOf: CheckStatus const order is NOT severity order
+	// (StatusSkipped is declared last but ranks lowest), so a raw `b > a`
+	// here would let a not-assessed result mask a real error.
+	return WorseOf(a, b)
 }
 
 func nonNegativeDuration(d time.Duration) time.Duration {

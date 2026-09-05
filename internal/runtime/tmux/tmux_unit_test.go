@@ -311,24 +311,24 @@ func TestTerminateProcessesNeverSignalsTheTmuxServer(t *testing.T) {
 
 	tmuxServerPIDsFn = func() map[string]bool { return map[string]bool{serverPID: true} }
 
-	var signalled []string
-	killSignalFn = func(pid, signal string) { signalled = append(signalled, signal+":"+pid) }
+	var signaled []string
+	killSignalFn = func(pid, signal string) { signaled = append(signaled, signal+":"+pid) }
 
 	// The mayor's own teardown set: the server and its pane were founded in the
 	// same instant, two PIDs apart, so both land in the kill list.
 	terminateProcesses([]string{serverPID, "71746", "71750"})
 
-	for _, s := range signalled {
+	for _, s := range signaled {
 		if s == "TERM:"+serverPID || s == "KILL:"+serverPID {
-			t.Fatalf("terminateProcesses signalled the tmux server (%s); signals=%v", s, signalled)
+			t.Fatalf("terminateProcesses signaled the tmux server (%s); signals=%v", s, signaled)
 		}
 	}
-	if len(signalled) == 0 {
+	if len(signaled) == 0 {
 		t.Fatal("guard blocked everything — session processes must still be terminated")
 	}
 	for _, want := range []string{"TERM:71746", "TERM:71750"} {
-		if !slices.Contains(signalled, want) {
-			t.Errorf("expected %s among signals, got %v", want, signalled)
+		if !slices.Contains(signaled, want) {
+			t.Errorf("expected %s among signals, got %v", want, signaled)
 		}
 	}
 }

@@ -339,32 +339,26 @@ func installCacheHeartbeatSink(ctx context.Context, cs *beads.CachingStore, city
 	})
 }
 
-// cachePrimeArmBound is how long primeThenStartReconciler waits for the
-// initial full prime to RETURN before arming the reconciler regardless.
+// primeArmBound is how long the initial full prime may run before the
+// reconciler is armed anyway. A prime that FAILS already falls through to
+// StartReconciler; a prime that HANGS did not, and that is a different and
+// worse outage: CachingStore.Prime blocks in backing.List, which takes no
+// context, so neither ctx cancellation nor a timeout on ctx can interrupt it.
 //
-// A hung prime used to cost the controller its reconciler permanently. Prime's
-// work is a backing.List plus a dep fetch, and Store.List takes no context, so
-// a wedged bd subprocess or a stalled Dolt read blocks Prime with no deadline
-// and no error — the prime's own 3-attempt retry never runs because it is the
-// individual List that hangs. StartReconciler sat after that call, so it was
-// simply never reached: on 2026-08-18 the city scope logged "caching-store:
-// priming ..." and then produced neither a prime failure nor a single reconcile
-// for 43 hours, while a sibling rig reconciled 1675 times.
-//
-// Two minutes is chosen against what a HEALTHY prime costs, not against what a
-// sick one might: the reconciler's equivalent full scan measures 54-113 ms in
-// the field, the synchronous pre-prime is documented at 1-2 s, and the slowest
-// adaptive cadence is 120 s. A prime still outstanding at two minutes is not
-// slow, it is wedged or starved. Arming anyway is close to free in that state —
-// the reconciler's first action is the same scan the prime is stuck on, so it
-// blocks or fails and backs off exactly as designed — and it is what converts
-// the failure from permanent to self-healing: the loop exists, so the cache
-// converges the moment the backing store recovers.
-var cachePrimeArmBound = 2 * time.Minute
+// Generous on purpose. A healthy full scan finishes well inside the
+// reconciler's own 30-60s cadence, so this only ever fires on a genuinely
+// stuck scan, and firing it early costs one concurrent full scan. The
+// alternative is what ga-yc0chj measured: the city rig's prime never returned,
+// StartReconciler was never reached, and the controller reconciled nothing for
+// 3h31m while the qc rig ticked normally — a stall that is invisible because a
+// partial cache is still served, so every non-Live read is answered
+// confidently from a frozen snapshot.
+// A var, not a const, only so the test that hangs a prime can shorten it.
+var primeArmBound = 5 * time.Minute
 
 // primeThenStartReconciler runs the async full prime and then arms the
-// watchdog reconciler. The reconciler starts even when the prime fails:
-// its periodic full scan loads the same snapshot a successful prime
+// watchdog reconciler. The reconciler starts even when the prime fails or
+// HANGS: its periodic full scan loads the same snapshot a successful prime
 // would and promotes the cache to live, so a transient prime failure at
 // startup heals on the next reconcile cycle. Without this, one failed
 // prime left the store serving its PrimeActive-era snapshot for the
@@ -373,33 +367,26 @@ var cachePrimeArmBound = 2 * time.Minute
 // feeding scale-check demand) stayed invisible until something else
 // touched the bead. Only shutdown (ctx canceled) skips the reconciler.
 //
-// The prime runs on its own goroutine so a prime that never RETURNS is no
-// longer a prime that costs the store its reconciler (cachePrimeArmBound).
-// Letting the abandoned prime keep running is deliberate and safe: a late
-// prime is already an anticipated state — CachingStore serializes full primes
-// itself (beginFullPrime), the reconciler's own lazy re-prime path can start
-// one at any time, and prime's absorb is fenced on the mutation sequence it
-// captured, so a prime that lands after the reconciler has moved the cache
-// merges rather than overwrites.
+// A prime left running past primeArmBound is NOT abandoned or canceled — it
+// keeps going and applies its snapshot if it ever completes. That is safe
+// because prime discards its result unless c.mutationSeq is unchanged, so a
+// late prime cannot overwrite anything the now-running reconciler has done.
 func primeThenStartReconciler(ctx context.Context, cs *beads.CachingStore, agentID string) {
 	log.Printf("caching-store: priming ...")
-	primed := make(chan struct{})
-	go func() {
-		defer close(primed)
-		if err := cs.Prime(ctx); err != nil {
-			log.Printf("caching-store: prime FAILED: %v (reads use bd subprocess until the reconciler converges)", err)
-		}
-	}()
-	timer := time.NewTimer(cachePrimeArmBound)
+	primed := make(chan error, 1)
+	go func() { primed <- cs.Prime(ctx) }()
+
+	timer := time.NewTimer(primeArmBound)
 	defer timer.Stop()
 	select {
-	case <-primed:
+	case err := <-primed:
+		if err != nil {
+			log.Printf("caching-store: prime FAILED: %v (reads use bd subprocess until the reconciler converges)", err)
+		}
+	case <-timer.C:
+		log.Printf("caching-store: prime still running after %s; arming the reconciler anyway (a hung prime must not disable reconciliation — ga-yc0chj)", primeArmBound)
 	case <-ctx.Done():
 		return
-	case <-timer.C:
-		log.Printf("caching-store: prime has not returned after %s — arming the reconciler anyway "+
-			"(the prime keeps running; the reconciler converges the cache once the backing store answers)",
-			cachePrimeArmBound)
 	}
 	if ctx.Err() != nil {
 		return

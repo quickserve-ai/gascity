@@ -356,6 +356,17 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 	register(doctor.NewDoltJournalSizeCheckForConfig(cityPath, opts.SkipManagedDoltCheck, cfg, cfgErr))
 	register(doctor.NewDoltConfigCheckForConfig(cityPath, opts.SkipManagedDoltCheck, cfg, cfgErr))
 	register(doctor.NewScopedDoltVersionCheckForConfig(cityPath, opts.SkipManagedDoltCheck, cfg, cfgErr))
+	// City-store local-only remote check (ga-51iq0s). The per-rig registration
+	// below cannot reach this: hq, the city's own beads database, is not a rig,
+	// so the check that hunts off-box Dolt remotes had NO registration able to
+	// inspect the one database that actually carried one (ga-cc4wzn, 22h).
+	//
+	// Deliberately NOT gated on SkipManagedDoltCheck, unlike its siblings above.
+	// Gating is what made this check invisible in the first place, and the check
+	// now reports StatusSkipped when local-only is unconfigured — a visible
+	// "not assessed" beats a silently absent line. A file-backed or external
+	// workspace gets one honest skipped row, which gates nothing.
+	register(doctor.NewCityDoltLocalOnlyRemoteCheck(cityPath, managedDoltDataDir))
 	register(&doctor.EventsLogCheck{})
 	register(doctor.NewEventLogSizeCheck())
 	// bd auto-backup growth canary. bd's auto-backup pipeline (upstream of
@@ -613,13 +624,17 @@ type doctorJSONResult struct {
 }
 
 type doctorJSONReport struct {
-	Passed         int                `json:"passed"`
-	Warned         int                `json:"warned"`
-	Failed         int                `json:"failed"`
-	BlockingFailed int                `json:"blocking_failed"`
-	Fixed          int                `json:"fixed"`
-	Results        []doctorJSONResult `json:"results"`
-	Error          string             `json:"error,omitempty"`
+	Passed         int `json:"passed"`
+	Warned         int `json:"warned"`
+	Failed         int `json:"failed"`
+	BlockingFailed int `json:"blocking_failed"`
+	// Skipped counts checks that did NOT assess their subject. These were
+	// previously folded into Passed, so a consumer comparing passed counts
+	// across versions will see passed drop by exactly this much (ga-51iq0s).
+	Skipped int                `json:"skipped"`
+	Fixed   int                `json:"fixed"`
+	Results []doctorJSONResult `json:"results"`
+	Error   string             `json:"error,omitempty"`
 }
 
 func doctorStatusString(s doctor.CheckStatus) string {
@@ -630,6 +645,8 @@ func doctorStatusString(s doctor.CheckStatus) string {
 		return "warning"
 	case doctor.StatusError:
 		return "error"
+	case doctor.StatusSkipped:
+		return "skipped"
 	}
 	return "unknown"
 }
@@ -650,6 +667,7 @@ func writeDoctorJSON(w io.Writer, report *doctor.Report) error {
 		Warned:         report.Warned,
 		Failed:         report.Failed,
 		BlockingFailed: report.BlockingFailed,
+		Skipped:        report.Skipped,
 		Fixed:          report.Fixed,
 		Results:        make([]doctorJSONResult, 0, len(report.Results)),
 	}

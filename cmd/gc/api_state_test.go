@@ -4098,6 +4098,67 @@ func TestPrimeThenStartReconcilerSkipsReconcilerOnShutdown(t *testing.T) {
 	}
 }
 
+// fullScanHangingStore blocks every full-scan List until released, while
+// letting status-filtered List calls (PrimeActive) through — a backing store
+// whose full prime never returns, which is what ga-yc0chj measured on the city
+// rig. It is deliberately distinct from fullScanFailingStore: a prime that
+// FAILS already fell through to StartReconciler, a prime that HANGS did not.
+type fullScanHangingStore struct {
+	beads.Store
+	release chan struct{}
+}
+
+func (s *fullScanHangingStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	if query.AllowScan {
+		<-s.release
+	}
+	return s.Store.List(query)
+}
+
+// TestPrimeThenStartReconcilerArmsReconcilerWhenPrimeHangs asserts the
+// watchdog reconciler is armed even when the async full prime never returns.
+// CachingStore.Prime blocks inside backing.List, which takes no context, so
+// neither ctx cancellation nor a deadline on ctx can interrupt it — the bound
+// has to live at this call site. Without it the controller reconciled nothing
+// for 3h31m (ga-yc0chj) while still serving its partial cache, which silently
+// disabled every consumer that reads non-Live.
+func TestPrimeThenStartReconcilerArmsReconcilerWhenPrimeHangs(t *testing.T) {
+	backing := &fullScanHangingStore{Store: beads.NewMemStore(), release: make(chan struct{})}
+	cs := beads.NewCachingStore(backing, nil)
+	cs.SetPrimeRetryDelayForTest(func(int) time.Duration { return 0 })
+	if err := cs.PrimeActive(); err != nil {
+		t.Fatalf("PrimeActive: %v", err)
+	}
+
+	prev := primeArmBound
+	primeArmBound = 50 * time.Millisecond
+	defer func() { primeArmBound = prev }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	returned := make(chan struct{})
+	go func() {
+		primeThenStartReconciler(ctx, cs, "armed")
+		close(returned)
+	}()
+
+	select {
+	case <-returned:
+	case <-time.After(10 * time.Second):
+		close(backing.release)
+		t.Fatal("primeThenStartReconciler never returned while the prime was hung; a hung prime still disables reconciliation")
+	}
+
+	// "armed" is the FNV stagger for this agent ID; a non-zero value can
+	// only have been written by StartReconciler.
+	got := cs.Stats().StaggerOffsetMs
+	close(backing.release) // let the hung prime finish so its goroutine exits
+	if got <= 0 {
+		t.Fatalf("StaggerOffsetMs = %d, want > 0 (reconciler must arm when the prime hangs)", got)
+	}
+}
+
 // TestRigStoreBackgroundRefreshUsesEffectiveSuspension asserts the
 // background-refresh gate consults the EFFECTIVE rig suspension — the
 // runtime suspend/resume override layered over the rig's committable

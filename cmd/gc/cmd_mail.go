@@ -1423,6 +1423,7 @@ type multiRecipientMailCounter interface {
 
 func newMailSendCmd(stdout, stderr io.Writer) *cobra.Command {
 	var notify bool
+	var noNotify bool
 	var all bool
 	var from string
 	var to string
@@ -1458,6 +1459,19 @@ city that mails you. --all and --notify are refused for a remote city.`,
   gc mail send --all "Status update: tests passing"`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
+			// Notify-on-by-default for DIRECT LOCAL sends (ga-bjbaui,
+			// ratified 2026-09-03): plain mail never reaches a running-but-
+			// idle seat until its own next turn, which is how deadline mail
+			// went unread for 67 minutes on 9/3. Broadcast (--all), remote
+			// cities (which refuse --notify), and an explicit --no-notify
+			// keep the old no-nudge behavior. Delivery stays wait-idle, so
+			// the recipient is never interrupted mid-turn, and a "human"
+			// recipient is skipped at the invocation site as before.
+			if !notify && !noNotify && !all {
+				if _, isRemote, _, rerr := resolveWriteTarget(); rerr == nil && !isRemote {
+					notify = true
+				}
+			}
 			code := 0
 			if jsonOut {
 				code = cmdMailSendJSON(args, notify, all, from, to, subject, message, true, stdout, stderr)
@@ -1470,9 +1484,10 @@ city that mails you. --all and --notify are refused for a remote city.`,
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&notify, "notify", false, "nudge the recipient about this message, even if earlier mail is still unread")
+	cmd.Flags().BoolVar(&notify, "notify", false, "nudge the recipient about this message, even if earlier mail is still unread (the default for direct local sends; see --no-notify)")
 	cmd.Flags().BoolVar(&notify, "nudge", false, "alias for --notify")
 	_ = cmd.Flags().MarkHidden("nudge")
+	cmd.Flags().BoolVar(&noNotify, "no-notify", false, "suppress the default recipient nudge for a direct local send")
 	cmd.Flags().BoolVar(&all, "all", false, "broadcast to all live sessions (excludes sender and human)")
 	cmd.Flags().StringVar(&from, "from", "", "sender identity (default: $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or \"human\")")
 	cmd.Flags().StringVar(&to, "to", "", "recipient address (alternative to positional argument)")

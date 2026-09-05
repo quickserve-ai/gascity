@@ -121,6 +121,8 @@ func TestInstallSupervisorSystemdBinaryMismatchGuard(t *testing.T) {
 }
 
 func TestInstallSupervisorLaunchdBinaryMismatchGuard(t *testing.T) {
+	skipUnlessDarwinLaunchd(t)
+
 	stubSupervisorLaunchdUnloaded(t)
 	for _, tc := range []struct {
 		name           string

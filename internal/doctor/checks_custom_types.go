@@ -74,7 +74,7 @@ func (c *CustomTypesCheck) Run(_ *CheckContext) *CheckResult {
 	// Check if .beads directory exists — if not, skip (no store here).
 	beadsDir := filepath.Join(c.Dir, ".beads")
 	if !dirExists(beadsDir) {
-		r.Status = StatusOK
+		r.Status = StatusSkipped
 		r.Message = "no .beads directory, skipping"
 		return r
 	}

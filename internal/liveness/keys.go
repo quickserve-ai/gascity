@@ -205,6 +205,37 @@ var keys = map[string]struct{}{
 	"continuation_claim_nudge_count":      {},
 	"continuation_claim_nudge_at":         {},
 
+	// Config-drift deferral throttles (cmd/gc/session_reconciler.go). Four
+	// stamps whose ONLY job is to rate-limit a decision the reconciler
+	// re-derives from live config on every tick: config drifted, the session is
+	// attached, so applying it is deferred. recordSessionAttachedConfigDriftDeferral
+	// says so itself — "without a throttle it would emit ... a durable Dolt
+	// commit ... every tick for every attached session with persistent drift" —
+	// and the throttle it settled for still costs one commit per session per
+	// 2 min (sessionAttachedConfigDriftRefreshInterval). Measured 2026-09-03
+	// 21:40-22:40Z: 23 of gastown.mayor's 27 commits that hour changed
+	// attached_config_drift_deferred_at and NOTHING else, on a session that did
+	// no work — the largest fixable class left after the first key sweep, and a
+	// direct violation of this bead's idle-steady-state acceptance.
+	//
+	// Batch completeness holds writer by writer, not because one batch carries
+	// all four: the named writer writes its pair, the attached writer writes
+	// its pair, clearSessionConfigDriftDeferral clears all four, and the mixed
+	// ConfigDriftResetPatch batch is a genuine restart that commits anyway.
+	// Every one of those batches is all-liveness (or already committing), which
+	// is the condition that matters. All four move together regardless, because
+	// the clear path writes them as one batch.
+	//
+	// Losing a working-set row costs at most a stale-but-bounded deferral: the
+	// pre-move committed stamp can resurface and suppress one re-defer until it
+	// ages past sessionAttachedConfigDriftFalseNegativeLimit (5 min), after
+	// which the reconciler re-derives drift from live config as it does every
+	// tick. The value is a throttle, never a decision.
+	"config_drift_deferred_at":           {},
+	"config_drift_deferred_key":          {},
+	"attached_config_drift_deferred_at":  {},
+	"attached_config_drift_deferred_key": {},
+
 	// Per-episode throttle for the session.stranded diagnostic. Its own writer
 	// already documents the durable value as best-effort ("the in-memory marker
 	// is the load-bearing single-emission guarantee"), and it is set and cleared
@@ -234,6 +265,32 @@ var keys = map[string]struct{}{
 //
 // The same reasoning keeps gc.trigger_bead_store_ref, gc.pack,
 // gc.pack_workspace, gc.work_dir and gc.brain_parent_sid versioned.
+
+// LEFT VERSIONED ON PURPOSE — the session_circuit_* cluster and
+// invocation_usage_cursor. Both are measured churn (~8/hr and ~10/hr on
+// 2026-09-03) and both READ as telemetry, but each fails the membership rule on
+// the same point: the value is not merely stale when a working-set row is
+// missing, it is WRONG in a direction that costs something.
+//
+//  1. session_circuit_* — a moved write skips the versioned row, so the
+//     pre-move committed session_circuit_state stays on the bead forever. Lose
+//     the rows (or read them through a degraded overlay, which by design
+//     returns committed metadata) and an ancient CIRCUIT_OPEN resurfaces and
+//     blocks spawning; maybeAutoResetLocked cannot heal it when the restored
+//     record has no last_restart, because it returns early on a zero
+//     lastRestart. session_circuit_reset_generation is worse: its own
+//     declaration calls it the durable monotonic fence that lets a later
+//     snapshot be rejected as stale after an operator reset, and a fence in a
+//     non-durable store is not a fence. Moving these trades ~8 commits/hr for a
+//     session that can be held down. Tracked separately.
+//
+//  2. invocation_usage_cursor — losing it does not re-count one interval. The
+//     end-of-interval sweep's usagesSinceCursor returns the ENTIRE bounded tail
+//     when the cursor is empty or has scrolled out of the window, and
+//     SweepSessionModelUsage records gc.agent.tokens.* and cost for every entry
+//     BEFORE the sink write whose IdempotencyKey dedup is what makes replay
+//     safe for facts. So a degraded liveness read double-counts the whole
+//     tail's token and cost counters. Tracked separately.
 
 // KNOWN LIMIT — do not filter a bead QUERY on a moved key. The read overlay
 // merges liveness values onto beads AFTER the store has selected them, so a

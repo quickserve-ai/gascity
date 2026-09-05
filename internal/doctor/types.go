@@ -18,7 +18,77 @@ const (
 	StatusWarning
 	// StatusError means the check found a critical problem.
 	StatusError
+	// StatusSkipped means the check did NOT assess its subject — it was
+	// unconfigured, inapplicable, or its precondition could not be resolved.
+	//
+	// It exists to separate two states that StatusOK previously merged:
+	//
+	//	"I looked and it is fine"   -> StatusOK
+	//	"I was not asked to look"   -> StatusSkipped
+	//
+	// The operator read a green line either way, which is worse than a
+	// missing check: a missing check is visibly absent, while a vacuous OK
+	// actively reassures. dolt-local-only-remote returned OK on an unset
+	// config key for at least 22 hours while hq carried precisely the
+	// off-box remote that check exists to catch (ga-cc4wzn / ga-51iq0s).
+	//
+	// Skipped is NOT a failure: it does not gate dispatch, does not affect
+	// exit codes, and never triggers --fix. Use IsFailure to ask whether a
+	// status represents an actual problem; do not compare against StatusOK.
+	//
+	// Only use Skipped where the check genuinely did not assess. When
+	// "unconfigured" means the subject CANNOT have the fault (no config, so
+	// no config can be wrong), StatusOK remains honest and correct.
+	StatusSkipped
 )
+
+// IsFailure reports whether the status represents a problem the operator
+// should act on. StatusOK (assessed, healthy) and StatusSkipped (not
+// assessed) are both non-failures.
+//
+// Prefer this over `status != StatusOK`, which silently treats a skipped
+// check as failing — attempting fixes, printing hints, and marking it
+// advisory.
+func (s CheckStatus) IsFailure() bool {
+	return s == StatusWarning || s == StatusError
+}
+
+// Assessed reports whether the check actually evaluated its subject. A
+// false result means the check produced no evidence either way.
+func (s CheckStatus) Assessed() bool { return s != StatusSkipped }
+
+// severityRank orders statuses by how much they demand the operator's
+// attention, for "worst result wins" aggregation.
+//
+// This exists because the CONST ORDER IS NOT A SEVERITY ORDER. StatusSkipped
+// is declared last so that StatusOK keeps the zero value (an unset
+// CheckResult must default to OK, not to "not assessed") and so existing
+// numeric values stay stable. That leaves StatusSkipped numerically GREATER
+// than StatusError, so a raw `a > b` comparison would rank a skipped check as
+// worse than a failing one and let it mask a genuine error during
+// aggregation. Never compare CheckStatus values with < or > directly.
+func (s CheckStatus) severityRank() int {
+	switch s {
+	case StatusSkipped:
+		return 0 // not assessed — never outranks a real finding
+	case StatusOK:
+		return 1
+	case StatusWarning:
+		return 2
+	case StatusError:
+		return 3
+	}
+	return 0
+}
+
+// WorseOf returns whichever status demands more attention, ranking a
+// not-assessed result below every assessed one.
+func WorseOf(a, b CheckStatus) CheckStatus {
+	if b.severityRank() > a.severityRank() {
+		return b
+	}
+	return a
+}
 
 // CheckSeverity tells consumers (e.g. dispatch gates) whether a failing check
 // should be treated as blocking or merely informational. The zero value is

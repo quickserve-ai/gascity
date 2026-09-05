@@ -248,6 +248,7 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 				Type:  "select",
 				Choices: []BuiltinOptionChoice{
 					{Value: "", Label: "Default"},
+					{Value: "gpt-6-astra", Label: "GPT-6 Astra", FlagArgs: []string{"--model", "gpt-6-astra"}, FlagAliases: [][]string{{"-m", "gpt-6-astra"}}},
 					{Value: "gpt-5.6-sol", Label: "GPT-5.6 Sol", FlagArgs: []string{"--model", "gpt-5.6-sol"}, FlagAliases: [][]string{{"-m", "gpt-5.6-sol"}}},
 					{Value: "gpt-5.6-terra", Label: "GPT-5.6 Terra", FlagArgs: []string{"--model", "gpt-5.6-terra"}, FlagAliases: [][]string{{"-m", "gpt-5.6-terra"}}},
 					{Value: "gpt-5.6-luna", Label: "GPT-5.6 Luna", FlagArgs: []string{"--model", "gpt-5.6-luna"}, FlagAliases: [][]string{{"-m", "gpt-5.6-luna"}}},
@@ -539,11 +540,11 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 		// observes ready, the reconciler retries the start until it gives
 		// up. Delay-based like the other TUIs whose prompt glyph is
 		// unverified; replace with ReadyPromptPrefix when one is measured.
-		ReadyDelayMs:       8000,
-		ProcessNames:       []string{"amp"},
-		InstructionsFile:   "AGENTS.md",
-		ResumeFlag:         "threads continue",
-		ResumeStyle:        "subcommand",
+		ReadyDelayMs:     8000,
+		ProcessNames:     []string{"amp"},
+		InstructionsFile: "AGENTS.md",
+		ResumeFlag:       "threads continue",
+		ResumeStyle:      "subcommand",
 	},
 	"opencode": {
 		DisplayName:      "OpenCode",
@@ -685,10 +686,10 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 		// gastownhall/gascity#672. Nudges still drain via the supervisor
 		// dispatcher / per-session poller without requiring provider
 		// hooks.
-		DisplayName:      "Auggie CLI",
-		Command:          "auggie",
-		Args:             []string{"--allow-indexing"},
-		PromptMode:       "arg",
+		DisplayName: "Auggie CLI",
+		Command:     "auggie",
+		Args:        []string{"--allow-indexing"},
+		PromptMode:  "arg",
 		// See the amp comment: no readiness signal = sessions never leave
 		// state=creating (ga-8ouxd). Delay until a real prompt glyph is
 		// measured.
