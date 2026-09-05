@@ -1,0 +1,55 @@
+# detect-silent-published-work finds PUBLISHED WORK WAITING ON NOBODY: a PR that
+# was opened on a bead's behalf and then went quiet, with no owner, no gate, and
+# nothing in the system that would ever mention it again.
+#
+# It exists because four such PRs (#3743, #3420, #3397, #2917) were each found by
+# a human doing something else — the earliest after 5.5 hours, the latest after
+# 30 days. The cost was 45,000 lines of work and three people independently
+# rebuilding the same branch, each having correctly concluded that nothing
+# existed. Half A of ga-mmvpq1 (the q-core fast lane) could not have landed any
+# of them: all four had ZERO gate stickies, so there was nothing for a fast lane
+# to carry. Only this detector touches them.
+#
+# THE KEY, and it is deliberately narrow: ABSENCE OF PROGRESS, carrying a clock.
+# It is NOT conditioned on CI colour, mergeability, or review state — no
+# PR-health signal separates the four exhibits, and reading those would make a
+# red-but-actively-worked PR look worse than a green abandoned one. What it reads
+# is whether anything MOVED.
+#
+# Its value is not only that stalled work lands. It is that THE NEXT PERSON TO
+# PICK UP THE BEAD LEARNS THE WORK EXISTS — so the alarm's primary artifact is a
+# record ON THE BEAD, and mail is delivery, not the record.
+#
+# Runs as a cooldown sweep (mechanical: list beads, read PR state, compare
+# against a persisted observation — no LLM judgment), mirroring
+# renudge-stale-human-gates. The controller runs it via exec, so no agent context
+# is burned.
+#
+# EVIDENCE DISCIPLINE (ga-mmvpq1 08:10Z binding constraint). An action log is
+# structurally weaker evidence than a state query: a log can lose an entry for an
+# action that succeeded, or keep one for an action that never took effect, and
+# neither is detectable from the log alone. So this sweep determines "is this
+# work waiting on nobody" by READING CURRENT STATE — the bead's fields, the PR's
+# live head/base/marker — never by reading a record of what a prior sweep did.
+# "A push happened" is established by the live head differing from the persisted
+# observed_head, not by finding a push record. The gate's auto-resolve is
+# re-derived from live state every sweep, never inferred from having previously
+# emitted a resolve. Built the other way, the detector would confidently report
+# clean sweeps that never happened and stalls that had already cleared — the
+# exact class it exists to catch, reproduced inside the catcher.
+#
+# The persisted state file therefore holds OBSERVATIONS (what the last sweep SAW)
+# and never actions (what the last sweep DID). See
+# assets/scripts/detect-silent-published-work.sh.
+#
+# THIS ORDER DOES NOT SHIP IN OBSERVE-ONLY MODE (ga-mmvpq1 ratification,
+# explicit prohibition). A detector that observes and does not act is
+# indistinguishable from one that is switched off, and it becomes permanent.
+# There is no GC_SILENT_WORK_DRY_RUN knob and one must not be added; the tunable
+# is the THRESHOLD, not whether it acts.
+[order]
+description = "Detect published work waiting on nobody — absence of progress past a threshold, alarmed on the bead and gated for a human"
+trigger = "cooldown"
+interval = "5m"
+timeout = "180s"
+exec = "$PACK_DIR/assets/scripts/detect-silent-published-work.sh"
