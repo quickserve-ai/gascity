@@ -667,7 +667,14 @@ func checkReadBeadState(q BeadQuerier, b beads.Bead, beadID string, a config.Age
 		return BeadCheckResult{Warnings: routedStateWarnings(b, beadID)}
 	}
 
-	target := agentutil.RoutedToIdentity(&a)
+	target := strings.TrimSpace(opts.TargetIdentity)
+	if target == "" {
+		// RoutedToIdentity, not QualifiedName: the fallback must collapse a
+		// pool instance to the identity gc sling stamps (its PoolName), or
+		// pool-instance idempotency breaks — the ga-79uuwq bypass, regressed
+		// once already when the TargetIdentity override was introduced.
+		target = agentutil.RoutedToIdentity(&a)
+	}
 	isMulti := agentutil.IsMultiSessionAgent(&a)
 	if strings.TrimSpace(b.Metadata[beadmeta.RoutedToMetadataKey]) == target {
 		// A pool session claims routed work under its own session identity
