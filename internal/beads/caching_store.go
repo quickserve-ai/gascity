@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -70,6 +71,30 @@ type CachingStore struct {
 	cancelFn    context.CancelFunc
 	stopCh      chan struct{}
 	stopped     bool
+	// heartbeatSink publishes the durable ReconcileHeartbeat record. It is
+	// nil by default — every store that is not wired by the controller (all
+	// tests, every CLI-path store) publishes nothing and behaves exactly as
+	// before. Guarded by lifecycleMu.
+	heartbeatSink func(ReconcileHeartbeat)
+	// reconcilerArmedAtNanos starts the watchdog's never-reconciled clock, as
+	// UnixNano; zero means "this store is not expected to reconcile at all".
+	// First stamped by SetReconcileHeartbeatSink at install time (so a store
+	// whose reconciler never starts still goes visibly stale), then re-stamped
+	// by StartReconciler when it actually arms this store's loop. It is the
+	// floor of the staleness clock, so a store that has been armed but has not
+	// yet completed its first cycle is judged against its arm time rather than
+	// looking infinitely stale.
+	//
+	// Atomic rather than lifecycleMu-guarded because the read path consults it
+	// while holding c.mu: taking lifecycleMu there would put the two locks in
+	// an order no other path uses, and would put lifecycleMu on every cached
+	// read. An atomic has neither cost.
+	reconcilerArmedAtNanos atomic.Int64
+	// staleServeLogAtNanos rate-limits the stale-serve refusal log, as
+	// UnixNano. Atomic because the refusal is evaluated under c.mu held for
+	// READING, where a plain timestamp field could not be updated without
+	// racing other readers.
+	staleServeLogAtNanos atomic.Int64
 
 	// latencyWindow holds the most recent reconciliation bd-list
 	// durations for adaptive cadence decisions. Bounded at
@@ -518,12 +543,140 @@ const dirtyOverlayMaxGets = 8
 // each unchanged per site). It never escapes the read site.
 var errDirtyOverlayFallback = errors.New("beads cache: dirty overlay fallback")
 
+const (
+	// cacheServeStaleFactor and cacheServeStaleFloor bound how long a cache
+	// that is SUPPOSED to be reconciling may go without completing a reconcile
+	// and still answer a read from its own snapshot.
+	//
+	// Refusing trades a silent wrong answer for a live read plus a visible
+	// degradation. That trade only pays past a generous bound, because the
+	// fallback is real backing I/O on a hot path: refuse eagerly under
+	// transient pressure and the controller sheds its cache exactly when the
+	// data plane can least absorb the load.
+	//
+	// The floor is 3x cacheReconcileMaxBackoff. A backing-store outage drives
+	// the reconciler to its 10-minute maximum backoff, so the cache must ride
+	// out several full retry cycles before it stops serving — below that the
+	// cure is worse than the disease, since refusing sends every read to the
+	// same backing store that is already failing.
+	//
+	// The factor is 4x the doctor watchdog's beadsCacheStaleFactor, so the
+	// beads-cache-reconcile alarm fires well before the serve path degrades.
+	// The order is the point: alarm first, degrade second. An operator should
+	// learn about a stalled reconciler from the watchdog, not by noticing a
+	// controller that quietly went uncached.
+	//
+	// Every measured occurrence is still caught with orders of magnitude to
+	// spare: the observed stalls were 3h31m, 4h34m, 35h41m and 43h.
+	cacheServeStaleFactor = 20
+	cacheServeStaleFloor  = 30 * time.Minute
+	// cacheStaleServeLogWindow rate-limits the refusal log. Staleness is
+	// evaluated on EVERY cached read, so an unlimited line here would be a log
+	// storm measured in thousands per minute rather than a signal.
+	cacheStaleServeLogWindow = 5 * time.Minute
+)
+
 // cacheServableLocked reports whether the active read model can answer from
-// cache: the cache is live or partial and the prime was not a partial error.
-// Dirty is no longer a serve-blocker — it is handled by readCacheWithOverlay.
+// cache: the cache is live or partial, the prime was not a partial error, and
+// the snapshot is not stale past the serve bound. Dirty is no longer a
+// serve-blocker — it is handled by readCacheWithOverlay.
 // Caller must hold c.mu (read or write).
 func (c *CachingStore) cacheServableLocked() bool {
-	return (c.state == cacheLive || c.state == cachePartial) && c.primePartialErr == nil
+	if (c.state != cacheLive && c.state != cachePartial) || c.primePartialErr != nil {
+		return false
+	}
+	return c.freshEnoughToServeLocked()
+}
+
+// freshEnoughToServeLocked is the staleness half of servability, split out so
+// the Ready gate — which has its own state and dependency requirements — can
+// apply the same bound without restating the rest of cacheServableLocked.
+//
+// Returning false is not an error: every caller of the gate takes its existing
+// backing-store fallback path (I5), so a refusal degrades the read from cached
+// to live rather than failing it. Caller must hold c.mu.
+func (c *CachingStore) freshEnoughToServeLocked() bool {
+	age, bound, stale := c.staleBeyondServeBoundLocked(time.Now())
+	if !stale {
+		return true
+	}
+	c.logStaleServeRefusal(age, bound)
+	return false
+}
+
+// staleBeyondServeBoundLocked reports whether this cache has gone so long
+// without completing a reconcile that answering from its snapshot would be a
+// confident wrong answer rather than a slightly old one. It returns the
+// measured age and the bound alongside the verdict so the caller can report
+// both without recomputing them.
+//
+// It says false for every store with a zero arm time — the whole CLI, test and
+// projection population. Those stores are not expected to reconcile at all,
+// and holding one to a reconcile schedule it was never given would refuse a
+// perfectly healthy cache.
+//
+// The clock floors at the arm time, because LastReconcileAt stays zero until
+// the first cycle COMPLETES and a successful prime does not set it. Without
+// the floor, every freshly armed store would read as infinitely stale and
+// refuse to serve from the moment it was wired up. Caller must hold c.mu.
+func (c *CachingStore) staleBeyondServeBoundLocked(now time.Time) (age, bound time.Duration, stale bool) {
+	armedAt := armedAtFromNanos(c.reconcilerArmedAtNanos.Load())
+	if armedAt.IsZero() {
+		return 0, 0, false
+	}
+	since := c.stats.LastReconcileAt
+	if since.Before(armedAt) {
+		since = armedAt
+	}
+	age = now.Sub(since)
+	bound = c.serveStaleBoundLocked()
+	return age, bound, age > bound
+}
+
+// serveStaleBoundLocked returns how long this store may go without completing
+// a reconcile before its snapshot stops being servable. It scales with the
+// store's own cadence so a LARGE-cadence store is not judged against a
+// SMALL-cadence store's expectations, and never drops below the floor.
+// Caller must hold c.mu.
+func (c *CachingStore) serveStaleBoundLocked() time.Duration {
+	interval := c.stats.CurrentReconcileInterval
+	if interval <= 0 {
+		interval = c.adaptiveIntervalLocked()
+	}
+	if bound := time.Duration(cacheServeStaleFactor) * interval; bound > cacheServeStaleFloor {
+		return bound
+	}
+	return cacheServeStaleFloor
+}
+
+// logStaleServeRefusal emits at most one line per cacheStaleServeLogWindow per
+// store.
+//
+// The window is enforced with an atomic compare-and-swap rather than a
+// mutex-guarded timestamp because this runs under c.mu held for READING: a
+// plain read-modify-write of a struct field there would be a data race between
+// concurrent readers. Losing the CAS means another reader is already emitting
+// this window's line, so dropping ours is the correct outcome, not a miss.
+//
+// Logging under c.mu follows recordProblemLocked, which already emits its own
+// rate-limited problem line while holding the lock for writing; this one holds
+// it only for reading and fires at most twelve times an hour.
+func (c *CachingStore) logStaleServeRefusal(age, bound time.Duration) {
+	now := time.Now()
+	prev := c.staleServeLogAtNanos.Load()
+	if prev != 0 && now.Sub(time.Unix(0, prev)) < cacheStaleServeLogWindow {
+		return
+	}
+	if !c.staleServeLogAtNanos.CompareAndSwap(prev, now.UnixNano()) {
+		return
+	}
+	rig := c.idPrefix
+	if rig == "" {
+		rig = "(no-prefix)"
+	}
+	log.Printf("beads cache: REFUSING to serve rig=%s from cache — no reconcile completed in %s "+
+		"(serve bound %s); reads fall back to the backing store until the reconciler recovers",
+		rig, age.Round(time.Second), bound)
 }
 
 // readCacheWithOverlay serves a cached read after refreshing only the dirty
@@ -1121,6 +1274,7 @@ func (c *CachingStore) StartReconciler(ctx context.Context, stagger StaggerOptio
 	// neither can race a concurrent StopReconciler's Wait.
 	c.lifecycleWG.Add(2)
 	c.lifecycleMu.Unlock()
+	c.reconcilerArmedAtNanos.Store(time.Now().UnixNano())
 
 	offset := stagger.resolve(agentID)
 
@@ -1130,6 +1284,14 @@ func (c *CachingStore) StartReconciler(ctx context.Context, stagger StaggerOptio
 	c.mu.Unlock()
 
 	log.Printf("beads cache: stagger=%dms agent=%s", offset.Milliseconds(), agentID)
+	// No heartbeat publish here — the arm stamp is published synchronously by
+	// SetReconcileHeartbeatSink at install time. StartReconciler frequently
+	// runs on a goroutine the caller never waits on (primeThenStartReconciler),
+	// and a publish from here races external teardown of the city root:
+	// WriteReconcileHeartbeat MkdirAll's its directory, so a late publish
+	// re-creates <city>/.gc/runtime/beads-cache mid-RemoveAll (the
+	// controllerState TempDir-cleanup failures, 21+/40 runs). The re-stamp of
+	// arm re-stamp above still flows into every loop publish.
 
 	go func() {
 		defer c.lifecycleWG.Done()
@@ -1143,6 +1305,99 @@ func (c *CachingStore) StartReconciler(ctx context.Context, stagger StaggerOptio
 		defer c.lifecycleWG.Done()
 		c.startReconcileWatchdog(ctx)
 	}()
+}
+
+// SetReconcileHeartbeatSink installs the durable liveness publisher for this
+// store and, for a non-nil sink, synchronously publishes the arm stamp before
+// returning. A nil sink (the default) disables publishing entirely.
+//
+// Publishing here rather than in StartReconciler is deliberate, twice over.
+// Mechanically: install runs synchronously in the store constructor, so the
+// arm write is sequenced before any caller teardown, while StartReconciler is
+// typically reached on an unwaited goroutine whose late write races removal
+// of the city root (B1). Semantically: the watchdog clock starts the moment a
+// sink is installed — a store that installs a sink but whose reconciler NEVER
+// starts (the suspected ga-yc0chj shape: a rebuilt store with no reconciler
+// goroutine) now publishes an arm record that goes stale and alarms, instead
+// of publishing nothing and reading as unknown/quiet forever.
+//
+// The sink receives a fully populated ReconcileHeartbeat except for Scope,
+// which the caller owns — the store knows its bead prefix but not which city
+// scope label the operator-facing tooling files it under.
+func (c *CachingStore) SetReconcileHeartbeatSink(sink func(ReconcileHeartbeat)) {
+	if c == nil {
+		return
+	}
+	c.lifecycleMu.Lock()
+	c.heartbeatSink = sink
+	c.lifecycleMu.Unlock()
+	if sink != nil {
+		c.reconcilerArmedAtNanos.CompareAndSwap(0, time.Now().UnixNano())
+		c.publishReconcileHeartbeat()
+	}
+}
+
+// ReconcilerArmedAt reports when this store's reconcile loop was armed, or the
+// zero time when the store is not expected to reconcile at all. The two are
+// genuinely different states and callers must not conflate them: every
+// CLI-path and test store legitimately never reconciles, and judging one
+// against a reconcile schedule it was never given would condemn a healthy
+// cache. Only a store whose reconciler was armed — or which had a heartbeat
+// sink installed, which is the controller declaring the same intent — carries
+// a non-zero arm time.
+func (c *CachingStore) ReconcilerArmedAt() time.Time {
+	if c == nil {
+		return time.Time{}
+	}
+	return armedAtFromNanos(c.reconcilerArmedAtNanos.Load())
+}
+
+// armedAtFromNanos converts the stored arm clock to a time, mapping the zero
+// sentinel to the zero time rather than to the Unix epoch.
+func armedAtFromNanos(nanos int64) time.Time {
+	if nanos == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, nanos)
+}
+
+// publishReconcileHeartbeat hands the current liveness snapshot to the sink.
+// Best-effort and lock-free from the caller's perspective: it takes no lock
+// while the sink runs, so a slow publisher can never stall a reconcile or
+// block a reader. A nil sink short-circuits before any state is read.
+func (c *CachingStore) publishReconcileHeartbeat() {
+	c.lifecycleMu.Lock()
+	sink := c.heartbeatSink
+	c.lifecycleMu.Unlock()
+	if sink == nil {
+		return
+	}
+	armedAt := c.ReconcilerArmedAt()
+	c.mu.RLock()
+	hb := c.reconcileHeartbeatSnapshotLocked()
+	c.mu.RUnlock()
+	hb.ArmedAt = armedAt
+	sink(hb)
+}
+
+// reconcileHeartbeatSnapshotLocked builds the liveness record from current
+// cache state. IntervalMs falls back to the adaptive cadence when the stats
+// field has not been computed yet (arm time, before the first cycle), so a
+// well-formed record always carries a positive interval and readers can treat
+// a non-positive one as unknown. Caller must hold c.mu.
+func (c *CachingStore) reconcileHeartbeatSnapshotLocked() ReconcileHeartbeat {
+	interval := c.stats.CurrentReconcileInterval
+	if interval <= 0 {
+		interval = c.adaptiveIntervalLocked()
+	}
+	return ReconcileHeartbeat{
+		Prefix:          c.idPrefix,
+		PID:             os.Getpid(),
+		LastReconcileAt: c.stats.LastReconcileAt,
+		IntervalMs:      interval.Milliseconds(),
+		State:           c.stateStringLocked(),
+		UpdatedAt:       time.Now(),
+	}
 }
 
 // StopReconciler cancels and waits for cache-owned background work.
@@ -1167,17 +1422,23 @@ func (c *CachingStore) Stats() CacheStats {
 	defer c.mu.RUnlock()
 
 	s := c.stats
+	s.State = c.stateStringLocked()
+	return s
+}
+
+// stateStringLocked renders the cache state enum as the wire string used by
+// CacheStats.State and the durable reconcile heartbeat. Caller must hold c.mu.
+func (c *CachingStore) stateStringLocked() string {
 	switch c.state {
 	case cachePartial:
-		s.State = "partial"
+		return "partial"
 	case cacheLive:
-		s.State = "live"
+		return "live"
 	case cacheDegraded:
-		s.State = "degraded"
+		return "degraded"
 	default:
-		s.State = "uninitialized"
+		return "uninitialized"
 	}
-	return s
 }
 
 // IsLive reports whether reads are served from the cache.

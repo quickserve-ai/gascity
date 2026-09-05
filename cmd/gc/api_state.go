@@ -223,7 +223,7 @@ func newControllerState(
 		}
 		cs.beadStores = cs.buildStores(cfg)
 		if cityStoreErr == nil {
-			cs.cityBeadStore = wrapWithCachingStore(ctx, opened.Store, ep, true)
+			cs.cityBeadStore = wrapWithCachingStore(ctx, opened.Store, ep, true, cityPath, cacheHeartbeatCityScope)
 			cs.cityBeadsDiagnostic = diagnosticPtr(opened.Diagnostic)
 			cs.cityMailProv = newCityMailProvider(cs.cityBeadStore, cfg, cityPath, ep)
 			svc := extmsg.NewServices(cs.cityBeadStore)
@@ -243,7 +243,14 @@ func newControllerState(
 // Suspended rigs pass false: they spawn no agents, so nothing writes locally and
 // a continuously refreshed cache buys nothing; reconciling every suspended rig
 // every cycle is what pegs the supervisor (gastownhall/gascity #1978 follow-up).
-func wrapWithCachingStore(ctx context.Context, store beads.Store, ep events.Provider, backgroundRefresh bool) beads.Store {
+//
+// cityPath and heartbeatScope wire the store's durable reconcile-liveness
+// record (beads.ReconcileHeartbeat). They are only consulted on the path that
+// actually arms a reconciler; pass an empty scope to publish nothing. A store
+// that publishes nothing is invisible to `gc doctor`'s beads-cache-reconcile
+// watch, which is the correct default for any store that is not supposed to be
+// reconciling.
+func wrapWithCachingStore(ctx context.Context, store beads.Store, ep events.Provider, backgroundRefresh bool, cityPath, heartbeatScope string) beads.Store {
 	baseStore, policyStore, policyWrapped := unwrapBeadPolicyStore(store)
 	if baseStore == nil {
 		return nil
@@ -284,6 +291,9 @@ func wrapWithCachingStore(ctx context.Context, store beads.Store, ep events.Prov
 		}
 		return cs
 	}
+	// Arm the durable liveness record before the reconciler goroutine starts,
+	// so StartReconciler's arm stamp is published rather than raced past.
+	installCacheHeartbeatSink(ctx, cs, cityPath, heartbeatScope)
 	// Full prime runs async — backfills remaining beads for List()
 	// callers (convergence reconcile, sweep, API handlers).
 	go primeThenStartReconciler(ctx, cs, os.Getenv("GC_AGENT"))
@@ -291,6 +301,42 @@ func wrapWithCachingStore(ctx context.Context, store beads.Store, ep events.Prov
 		return wrapStoreWithBeadPolicies(cs, policyStore.cfg, policyStore.lv)
 	}
 	return cs
+}
+
+// installCacheHeartbeatSink wires a CachingStore's durable reconcile-liveness
+// publisher. The sink is best-effort: a heartbeat that cannot be written is
+// logged at most once per store-and-error and never interferes with the
+// reconcile it was reporting on. An empty cityPath or scope disables it.
+//
+// ctx is the cache lifetime. The sink STOPS as soon as it is done, for two
+// reasons. Operationally, a torn-down store must not keep stamping a liveness
+// record: the record would still name a live supervisor pid while its
+// LastReconcileAt froze, and `gc doctor` would read the corpse as a stalled
+// cache. Mechanically, WriteReconcileHeartbeat MkdirAll's its directory on
+// every write, so a publisher that outlives its city root RE-CREATES
+// <city>/.gc/runtime/beads-cache after the tree is removed — which is exactly
+// how the controllerState tests lost their t.TempDir() cleanup
+// ("unlinkat .../.gc/runtime/beads-cache: directory not empty", 33 failures in
+// 40 runs of -run TestControllerState before this guard).
+func installCacheHeartbeatSink(ctx context.Context, cs *beads.CachingStore, cityPath, scope string) {
+	cityPath = strings.TrimSpace(cityPath)
+	scope = strings.TrimSpace(scope)
+	if cs == nil || cityPath == "" || scope == "" {
+		return
+	}
+	var warnedOnce sync.Once
+	cs.SetReconcileHeartbeatSink(func(hb beads.ReconcileHeartbeat) {
+		if ctx != nil && ctx.Err() != nil {
+			return
+		}
+		hb.Scope = scope
+		if err := beads.WriteReconcileHeartbeat(cityPath, hb); err != nil {
+			warnedOnce.Do(func() {
+				log.Printf("beads cache: heartbeat publish failed for scope %s: %v "+
+					"(gc doctor's beads-cache-reconcile watch will read this scope as unknown)", scope, err)
+			})
+		}
+	})
 }
 
 // primeArmBound is how long the initial full prime may run before the
@@ -396,13 +442,17 @@ func (cs *controllerState) buildStores(cfg *config.City) map[string]beads.Store 
 			// Legacy file mode aliases every rig to the same backing store, so
 			// the cache handle must be shared too for immediate cross-rig reads.
 			if sharedLegacyCachedStore == nil {
-				sharedLegacyCachedStore = wrapWithCachingStore(cs.cacheCtx, sharedLegacyFileStore, cs.eventProv, true)
+				// Legacy shared-file mode aliases every rig onto one store, so no
+				// single rig scope owns its heartbeat; publish none rather than
+				// file one scope's liveness under another's name.
+				sharedLegacyCachedStore = wrapWithCachingStore(cs.cacheCtx, sharedLegacyFileStore, cs.eventProv, true, cs.cityPath, "")
 			}
 			stores[rig.Name] = sharedLegacyCachedStore
 			continue
 		}
 		store = cs.openRigStore(scopeProvider, rig.Name, scopeRoot, rig.EffectivePrefix(), cfg)
-		stores[rig.Name] = wrapWithCachingStore(cs.cacheCtx, store, cs.eventProv, rigStoreBackgroundRefresh(suspState, rig))
+		stores[rig.Name] = wrapWithCachingStore(cs.cacheCtx, store, cs.eventProv,
+			rigStoreBackgroundRefresh(suspState, rig), cs.cityPath, cacheHeartbeatScopeForRig(rig.Name))
 	}
 	return stores
 }
@@ -790,7 +840,7 @@ func (cs *controllerState) updateLocked(cfg *config.City, sp runtime.Provider) {
 	var cityMailProv mail.Provider
 	var extSvc *extmsg.Services
 	if cityStore != nil {
-		cityStore = wrapWithCachingStore(cs.cacheCtx, cityStore, cs.eventProv, true)
+		cityStore = wrapWithCachingStore(cs.cacheCtx, cityStore, cs.eventProv, true, cs.cityPath, cacheHeartbeatCityScope)
 		cityMailProv = newCityMailProvider(cityStore, cfg, cs.cityPath, cs.eventProv)
 		svc := extmsg.NewServices(cityStore)
 		extSvc = &svc
