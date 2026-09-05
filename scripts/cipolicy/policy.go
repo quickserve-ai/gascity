@@ -20,10 +20,10 @@ const (
 	// policy review, while workflow, job, step, and input descriptions remain
 	// free to change. A failure prints the projection and candidate digest.
 	expectedCITriggersHash       = "d1a8bcd089019589658d8f154af9c26a70877285d84a384c2dcea299efc9554a"
-	expectedCIExecutionHash      = "917fdf8ac535519725f709422d1bf4b650ae7e5c4a61a350c25227cc3f2e0fe9"
+	expectedCIExecutionHash      = "9347c1c9c1f6fa7cfa60b1e26912be5b2a90eb3900522c0c5993a4f20c3e806c"
 	expectedNightlyTriggersHash  = "0a4400a09ac567e90adf8be1232eef1f14e36efd8dba3e143aa6e36f5b7a36f5"
-	expectedNightlyExecutionHash = "80575ca368f28ba9f8b14bf72ce5767a7877ffe4dcadc136854ab4b0b5f1377a"
-	expectedSetupActionHash      = "b7864038195cd054aee7fccfa903cab335b375bcab1a35239c17c5da7d32c07e"
+	expectedNightlyExecutionHash = "a3bdc404cae3315269424ab05aa2328ca3a15c6d8f750a614142763ad05ce3f7"
+	expectedSetupActionHash      = "a58374aafd7fb2d7fa6e627e5f8da803b6aee50701b4575cb4e3d2e44aca4132"
 )
 
 var requiredFilterPaths = map[string][]string{
@@ -45,6 +45,7 @@ var requiredFilterPaths = map[string][]string{
 		"test/acceptance/beads_cli_contract_test.go",
 		"deps.env",
 		".github/scripts/install-bd-archive.sh",
+		".github/scripts/install-bd-lockstep.sh",
 		"cmd/gc/init_provider_readiness.go",
 	},
 	"packs": {
@@ -115,6 +116,7 @@ var requiredFilterPaths = map[string][]string{
 		".github/actions/setup-gascity-ubuntu/**",
 		".github/scripts/install-dolt-archive.sh",
 		".github/scripts/install-bd-archive.sh",
+		".github/scripts/install-bd-lockstep.sh",
 		".github/scripts/install-claude-native.sh",
 		"internal/beads/**",
 		"internal/events/**",

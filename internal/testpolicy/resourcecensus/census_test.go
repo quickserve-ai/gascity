@@ -1989,12 +1989,12 @@ func TestBootstrapPolicyOwnsNetListenDebtAndExactMediumOwners(t *testing.T) {
 	t.Parallel()
 
 	debt := findRow(t, bootstrapPolicy.Debt, ScopeUntagged, ResourceNetListen)
-	if debt.BaselineCalls != 95 || debt.BaselineFiles != 36 || debt.ReportedCalls != 92 || debt.ReportedFiles != 34 {
-		t.Fatalf("stream-listener source baseline/reported = %d/%d, %d/%d; want 95/36, 92/34", debt.BaselineCalls, debt.BaselineFiles, debt.ReportedCalls, debt.ReportedFiles)
+	if debt.BaselineCalls != 98 || debt.BaselineFiles != 38 || debt.ReportedCalls != 92 || debt.ReportedFiles != 34 {
+		t.Fatalf("stream-listener source baseline/reported = %d/%d, %d/%d; want 98/38, 92/34", debt.BaselineCalls, debt.BaselineFiles, debt.ReportedCalls, debt.ReportedFiles)
 	}
 	smallDebt := findRow(t, bootstrapPolicy.SmallDebt, ScopeUntagged, ResourceNetListen)
-	if smallDebt.BaselineCalls != 93 || smallDebt.BaselineFiles != 35 {
-		t.Fatalf("stream-listener Small baseline = %d/%d, want 93/35", smallDebt.BaselineCalls, smallDebt.BaselineFiles)
+	if smallDebt.BaselineCalls != 96 || smallDebt.BaselineFiles != 37 {
+		t.Fatalf("stream-listener Small baseline = %d/%d, want 96/37", smallDebt.BaselineCalls, smallDebt.BaselineFiles)
 	}
 	for _, row := range []*Baseline{debt, smallDebt} {
 		if row.OwnerBead != "ga-80po0c.2.2.2" || row.MigrationTarget != "P0.4c-listener" {
@@ -2069,8 +2069,8 @@ func TestBootstrapPolicyOwnsTmuxDebtAndExactMediumSetup(t *testing.T) {
 	t.Parallel()
 
 	debt := findRow(t, bootstrapPolicy.Debt, ScopeUntagged, ResourceTmux)
-	if debt.BaselineCalls != 6 || debt.BaselineFiles != 2 {
-		t.Fatalf("tmux source baseline = %d/%d, want 6/2", debt.BaselineCalls, debt.BaselineFiles)
+	if debt.BaselineCalls != 11 || debt.BaselineFiles != 3 {
+		t.Fatalf("tmux source baseline = %d/%d, want 11/3", debt.BaselineCalls, debt.BaselineFiles)
 	}
 	smallDebt := findRow(t, bootstrapPolicy.SmallDebt, ScopeUntagged, ResourceTmux)
 	if smallDebt.BaselineCalls != 0 || smallDebt.BaselineFiles != 0 {
@@ -2085,6 +2085,11 @@ func TestBootstrapPolicyOwnsTmuxDebtAndExactMediumSetup(t *testing.T) {
 	wantOwners := map[string]map[Resource]bool{
 		"cmd/gc|main|TestMain":                {ResourceEnvironment: true, ResourceTmux: true},
 		"internal/runtime/tmux|tmux|TestMain": {ResourceEnvironment: true, ResourceTmux: true},
+		// The tmuxtest guard's own reaping proofs spawn a real server on a
+		// private socket root; each reaps it in its own cleanup, so the Small
+		// tmux census stays at zero.
+		"test/tmuxtest|tmuxtest|TestKillSocketRootServersReapsSpawnedServer":                   {ResourceTmux: true},
+		"test/tmuxtest|tmuxtest|TestSweepOrphanPIDPrefixedDirsReapsServerBeforeRemovingParent": {ResourceTmux: true},
 	}
 	for _, row := range bootstrapPolicy.Medium {
 		key := row.PackageDir + "|" + row.PackageName + "|" + row.Owner
@@ -2093,7 +2098,7 @@ func TestBootstrapPolicyOwnsTmuxDebtAndExactMediumSetup(t *testing.T) {
 			continue
 		}
 		if len(row.Resources) != len(want) {
-			t.Fatalf("medium owner %s resources = %v, want environment and tmux", key, row.Resources)
+			t.Fatalf("medium owner %s resources = %v, want %v", key, row.Resources, want)
 		}
 		for _, resource := range row.Resources {
 			if !want[resource] {

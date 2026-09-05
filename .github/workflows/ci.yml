@@ -95,6 +95,7 @@ jobs:
               - 'test/acceptance/beads_cli_contract_test.go'
               - 'deps.env'
               - '.github/scripts/install-bd-archive.sh'
+              - '.github/scripts/install-bd-lockstep.sh'
               - 'cmd/gc/init_provider_readiness.go'
             packs:
               - 'examples/gastown/**'
@@ -168,6 +169,7 @@ jobs:
               - '.github/actions/setup-gascity-ubuntu/**'
               - '.github/scripts/install-dolt-archive.sh'
               - '.github/scripts/install-bd-archive.sh'
+              - '.github/scripts/install-bd-lockstep.sh'
               - '.github/scripts/install-claude-native.sh'
               - 'internal/beads/**'
               - 'internal/events/**'
@@ -271,13 +273,11 @@ jobs:
     runs-on: ${{ needs.runner-policy.outputs.runner_32vcpu }}
     env:
       DOLT_VERSION: "2.1.7"
-      BD_VERSION: "v1.1.0"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: ./.github/actions/setup-gascity-ubuntu
         with:
           dolt-version: ${{ env.DOLT_VERSION }}
-          bd-version: ${{ env.BD_VERSION }}
           install-claude-cli: "false"
       - name: Install tools
         run: make install-tools
@@ -300,7 +300,6 @@ jobs:
     runs-on: ${{ needs.runner-policy.outputs.runner_32vcpu }}
     env:
       DOLT_VERSION: "2.1.7"
-      BD_VERSION: "v1.1.0"
     strategy:
       fail-fast: false
       matrix:
@@ -310,7 +309,6 @@ jobs:
       - uses: ./.github/actions/setup-gascity-ubuntu
         with:
           dolt-version: ${{ env.DOLT_VERSION }}
-          bd-version: ${{ env.BD_VERSION }}
           install-claude-cli: "false"
       - name: Install tools
         run: make install-tools
@@ -560,13 +558,11 @@ jobs:
         shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     env:
       DOLT_VERSION: "2.1.7"
-      BD_VERSION: "v1.1.0"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: ./.github/actions/setup-gascity-ubuntu
         with:
           dolt-version: ${{ env.DOLT_VERSION }}
-          bd-version: ${{ env.BD_VERSION }}
           install-claude-cli: "false"
       - name: Run cmd/gc process shard
         env:
@@ -714,13 +710,11 @@ jobs:
             command: ./scripts/test-integration-shard rest-smoke-2-of-2
     env:
       DOLT_VERSION: "2.1.7"
-      BD_VERSION: "v1.1.0"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: ./.github/actions/setup-gascity-ubuntu
         with:
           dolt-version: ${{ env.DOLT_VERSION }}
-          bd-version: ${{ env.BD_VERSION }}
           install-claude-cli: "false"
       - name: Run integration shard
         run: ${{ matrix.command }}
@@ -741,13 +735,11 @@ jobs:
         shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     env:
       DOLT_VERSION: "2.1.7"
-      BD_VERSION: "v1.1.0"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: ./.github/actions/setup-gascity-ubuntu
         with:
           dolt-version: ${{ env.DOLT_VERSION }}
-          bd-version: ${{ env.BD_VERSION }}
           install-claude-cli: "false"
       - name: Run full REST shard
         run: ./scripts/test-integration-shard rest-full-${{ matrix.shard }}-of-16
