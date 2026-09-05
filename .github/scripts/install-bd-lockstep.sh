@@ -100,7 +100,15 @@ else
   # workflow already builds bd from source for the cross-version contract cells.
   # It also keeps the build hermetic: the cgo path needs ICU headers the runners
   # do not carry.
+  #
+  # Stamp the resolved pin into the version label (contrib/k8s/Dockerfile.agent
+  # precedent): the pseudo-version's commit suffix makes `bd version` name the
+  # exact revision in CI logs, and gc's version_compat preflight (a commit-token
+  # scan) can then equate it with go.mod's pin instead of warning on an
+  # anonymous "1.1.0 (dev)" — a label byte-identical to the skewed tarball
+  # binary this installer exists to replace.
   GOBIN="$bin_dir" CGO_ENABLED=0 go install -tags gms_pure_go \
+    -ldflags "-X main.Version=${resolved_version#v}" \
     "${resolved_path}/cmd/bd@${resolved_version}"
 fi
 

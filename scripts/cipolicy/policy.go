@@ -23,7 +23,7 @@ const (
 	expectedCIExecutionHash      = "9347c1c9c1f6fa7cfa60b1e26912be5b2a90eb3900522c0c5993a4f20c3e806c"
 	expectedNightlyTriggersHash  = "0a4400a09ac567e90adf8be1232eef1f14e36efd8dba3e143aa6e36f5b7a36f5"
 	expectedNightlyExecutionHash = "a3bdc404cae3315269424ab05aa2328ca3a15c6d8f750a614142763ad05ce3f7"
-	expectedSetupActionHash      = "8471ecc3f5e88de4428b86bdaa73d5103ba3badab49f112268b37ed2b13a2335"
+	expectedSetupActionHash      = "a58374aafd7fb2d7fa6e627e5f8da803b6aee50701b4575cb4e3d2e44aca4132"
 )
 
 var requiredFilterPaths = map[string][]string{

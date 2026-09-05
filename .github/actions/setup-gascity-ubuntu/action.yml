@@ -48,7 +48,11 @@ runs:
     # that deliberately want some other bd install it themselves, after this.
     - name: Install bd in lockstep with go.mod's beads pin
       shell: bash
-      run: ${{ github.action_path }}/../../scripts/install-bd-lockstep.sh
+      # --cache keys the build on the resolved version under RUNNER_TOOL_CACHE
+      # (as the macos action already does): a cold cache costs exactly the
+      # uncached from-source build (~60s), a warm one skips it — which matters
+      # on the 10-minute-budget shard jobs that all ride this action.
+      run: ${{ github.action_path }}/../../scripts/install-bd-lockstep.sh --cache
 
     - name: Install Claude CLI
       if: ${{ inputs.install-claude-cli == 'true' }}
