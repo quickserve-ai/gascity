@@ -6,9 +6,9 @@ import (
 	"strings"
 )
 
-// This file used to SET GLOBAL dolt_transaction_commit = 1 on every managed
-// Dolt server once it was query-ready. It now ASSERTS THE OPPOSITE, because
-// under the v59 beads pin 1 is the hazardous value and 0 is correct.
+// Managed servers keep dolt_transaction_commit = 0: gc does not enable implicit
+// Dolt commits for SQL writers. Before the v59 beads pin this file set it to 1
+// to compensate for bd writes that did not commit in server mode.
 //
 // WHY IT WAS SET (2026-08-26 - 2026-09-02). Pre-v59, beads' post-run
 // auto-commit hook returned immediately outside embedded mode -- "Skips SQL
@@ -31,15 +31,13 @@ import (
 // WHY IT IS RETIRED. v59 beads commits EXPLICITLY: CALL DOLT_COMMIT in
 // DoltStore.UpdateIssue / UpdateIssueChecked, StageAndCommit in
 // runDoltTransaction. The stranded-writes hazard the global compensated for is
-// fixed upstream, and re-applying the global now buys the doubling trap in the
-// other direction -- every SQL transaction auto-commits a Dolt commit ON TOP of
-// bd's explicit one. It would also make the gc-owned session_liveness writes
-// (ga-lys454) auto-commit-eligible, and those exist precisely so that a
-// high-frequency telemetry write mints NO commit; the table is in dolt_ignore
-// so its rows never stage, but a server-side auto-commit is a different path
-// and not worth being clever about. Measured 2026-09-03 on the running server
-// (up since the 2026-09-02 unfork window): the global reads 0, hq and as
-// working sets are clean, and commits flow.
+// fixed upstream. This does NOT mean enabling the global doubles bd commits:
+// the fleet-pin fixture recorded one commit per close with either value
+// (ga-nrefug, 2026-09-04). bd's explicit commit leaves nothing for the
+// SQL-boundary auto-commit to commit again. The live hub's implicit commits
+// were instead attributed to gc's own SQL writers. Keeping the global at 0
+// avoids enabling that implicit-commit path; it is not a claim that every
+// ignored-table write produces a commit.
 //
 // So the global staying 0 is now the correct state, and the only thing worth
 // spending a managed start on is noticing if something turns it back on.
@@ -57,7 +55,7 @@ var managedDoltGlobalChecks = []struct {
 		name: "dolt_transaction_commit",
 		stmt: "SELECT @@GLOBAL.dolt_transaction_commit AS v",
 		want: "0",
-		harm: "under the v59 beads pin bd commits explicitly, so a server that ALSO auto-commits doubles every write's Dolt commits; see ga-09xcry (and if this pin is ever rolled back below v59, 1 is correct again and this check is the thing to change)",
+		harm: "keep explicit commit ownership for SQL writers rather than enabling server-side implicit commits; v59 bd already commits explicitly; see ga-09xcry and ga-nrefug",
 	},
 }
 
