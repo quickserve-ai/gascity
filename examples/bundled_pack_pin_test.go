@@ -35,7 +35,7 @@ import (
 func TestShippedExamplesPinBundledPacksAtCanonicalVersion(t *testing.T) {
 	root := examplesRoot(t)
 
-	seenSources := map[string]bool{}
+	seenPacks := map[string]bool{}
 	pins := 0
 
 	walkErr := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
@@ -65,9 +65,21 @@ func TestShippedExamplesPinBundledPacksAtCanonicalVersion(t *testing.T) {
 
 		for _, pin := range found {
 			pins++
-			seenSources[pin.source] = true
+			if name, ok := builtinpacks.NameForSource(pin.source); ok {
+				seenPacks[name] = true
+			}
+			// The comparison is deliberately exact per field, in the spelling
+			// the resolver consumes: version fields carry the "sha:<commit>"
+			// constraint form (packman treats anything else as a ref to fetch
+			// over the network), and the lockfile commit field is the bare
+			// commit (it keys the repo cache and IsBundledSourceAtCanonicalPin
+			// verbatim). A pin that is "the right sha in the wrong spelling"
+			// still strands an offline runner, so it must fail here too.
 			want := config.BundledSourcePinnedVersion(pin.source)
-			if sameSha(pin.value, want) {
+			if pin.field == "commit" {
+				want = strings.TrimPrefix(want, "sha:")
+			}
+			if pin.value == want {
 				continue
 			}
 			rel, relErr := filepath.Rel(root, path)
@@ -75,12 +87,12 @@ func TestShippedExamplesPinBundledPacksAtCanonicalVersion(t *testing.T) {
 				rel = path
 			}
 			exampleDir := filepath.ToSlash(filepath.Dir(filepath.Join("examples", rel)))
-			t.Errorf("examples/%s: %s pins bundled source %s at %s, but the binary's canonical pin is %s.\n"+
-				"Only the canonical pin is served offline from embedded content, so this fixture fails "+
-				"config.LoadWithIncludes on any machine without a pre-warmed cache (every CI runner).\n"+
-				"Run \"gc doctor --fix\" in %s to re-pin it, or update the fixture in the same commit as the "+
-				"config.BundledPackImportVersion bump.",
-				filepath.ToSlash(rel), pin.field, pin.source, quoteSha(pin.value), quoteSha(want), exampleDir)
+			t.Errorf("examples/%s: %s pins bundled source %s at %q, but the binary's canonical pin is %q.\n"+
+				"Only the canonical pin, in exactly that spelling, is served offline from embedded content, so "+
+				"this fixture fails config.LoadWithIncludes on any machine without a pre-warmed cache (every CI "+
+				"runner).\nRun \"gc doctor --fix\" in %s to re-pin it, or update the fixture in the same commit "+
+				"as the config.BundledPackImportVersion bump.",
+				filepath.ToSlash(rel), pin.field, pin.source, pin.value, want, exampleDir)
 		}
 		return nil
 	})
@@ -95,13 +107,9 @@ func TestShippedExamplesPinBundledPacksAtCanonicalVersion(t *testing.T) {
 		t.Fatal("found no bundled pack pins under examples/ — the fixture walk stopped measuring anything; " +
 			"fix the walk before trusting this guard")
 	}
-	bdSource, ok := builtinpacks.Source("bd")
-	if !ok {
-		t.Fatal("bundled bd pack not registered")
-	}
-	if !seenSources[bdSource] {
-		t.Errorf("no example fixture pins %s; this guard exists to keep that import current, "+
-			"so a walk that never sees it is not guarding anything", bdSource)
+	if !seenPacks["bd"] {
+		t.Error("no example fixture pins the bundled bd pack (under any source spelling); this guard " +
+			"exists to keep that import current, so a walk that never sees it is not guarding anything")
 	}
 }
 
@@ -109,7 +117,7 @@ func TestShippedExamplesPinBundledPacksAtCanonicalVersion(t *testing.T) {
 type bundledPin struct {
 	source string
 	field  string // the pin's field name, e.g. `version` or `commit`
-	value  string // as written, with or without the "sha:" prefix
+	value  string // exactly as written; the comparison is spelling-exact per field
 }
 
 // lockfileBundledPins reports the bundled-source pins recorded in a packs.lock.
@@ -136,13 +144,15 @@ func lockfileBundledPins(path string) ([]bundledPin, error) {
 		if !builtinpacks.IsSource(source) {
 			continue
 		}
+		// Emit both fields unconditionally: a builtin lock entry missing its
+		// version or commit is itself drift (install always writes both), and
+		// an empty value fails the exact comparison with a message naming the
+		// field instead of being silently skipped.
 		locked := lock.Packs[source]
-		if v := strings.TrimSpace(locked.Version); v != "" {
-			pins = append(pins, bundledPin{source: source, field: "version", value: v})
-		}
-		if c := strings.TrimSpace(locked.Commit); c != "" {
-			pins = append(pins, bundledPin{source: source, field: "commit", value: c})
-		}
+		pins = append(pins,
+			bundledPin{source: source, field: "version", value: strings.TrimSpace(locked.Version)},
+			bundledPin{source: source, field: "commit", value: strings.TrimSpace(locked.Commit)},
+		)
 	}
 	return pins, nil
 }
@@ -196,23 +206,4 @@ func collectImportPins(node any, pins *[]bundledPin) {
 			collectImportPins(entry, pins)
 		}
 	}
-}
-
-// sameSha compares two pins written either bare or with the "sha:" prefix.
-func sameSha(got, want string) bool {
-	return strings.TrimPrefix(strings.TrimSpace(got), "sha:") ==
-		strings.TrimPrefix(strings.TrimSpace(want), "sha:")
-}
-
-// quoteSha renders a pin in the "sha:<commit>" form the constants use, so the
-// failure message reads the same whichever field carried it.
-func quoteSha(pin string) string {
-	pin = strings.TrimSpace(pin)
-	if pin == "" {
-		return `""`
-	}
-	if !strings.HasPrefix(pin, "sha:") {
-		pin = "sha:" + pin
-	}
-	return pin
 }
