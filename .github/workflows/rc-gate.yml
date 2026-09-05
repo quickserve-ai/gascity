@@ -8,7 +8,6 @@ permissions:
 
 env:
   DOLT_VERSION: "2.1.7"
-  BD_VERSION: "v1.1.0"
   # Bypass the systemd gascity-test.slice re-exec on CI runners. The Blacksmith
   # runners' user systemd cannot reliably create a transient --scope for the
   # heavy acceptance workloads; gc_test_slice_reexec then exec's
@@ -71,7 +70,6 @@ jobs:
       - uses: ./.github/actions/setup-gascity-ubuntu
         with:
           dolt-version: ${{ env.DOLT_VERSION }}
-          bd-version: ${{ env.BD_VERSION }}
           install-claude-cli: "false"
       - name: Run fast test shard
         run: ${{ matrix.command }}
@@ -85,7 +83,6 @@ jobs:
       - uses: ./.github/actions/setup-gascity-ubuntu
         with:
           dolt-version: ${{ env.DOLT_VERSION }}
-          bd-version: ${{ env.BD_VERSION }}
           install-claude-cli: "false"
       - name: Run make check-docs
         run: make check-docs
@@ -142,7 +139,6 @@ jobs:
       - uses: ./.github/actions/setup-gascity-ubuntu
         with:
           dolt-version: ${{ env.DOLT_VERSION }}
-          bd-version: ${{ env.BD_VERSION }}
           install-claude-cli: "true"
       - name: Validate Ollama Claude configuration
         run: |
@@ -167,7 +163,6 @@ jobs:
       - uses: ./.github/actions/setup-gascity-ubuntu
         with:
           dolt-version: ${{ env.DOLT_VERSION }}
-          bd-version: ${{ env.BD_VERSION }}
           install-claude-cli: "false"
       - name: Run acceptance B shard
         run: GO_TEST_TAGS=acceptance_b GO_TEST_TIMEOUT=10m GO_TEST_COUNT=1 ./scripts/test-go-test-shard ./test/acceptance/tier_b ${{ matrix.shard_index }} 3
@@ -197,7 +192,6 @@ jobs:
       - uses: ./.github/actions/setup-gascity-ubuntu
         with:
           dolt-version: ${{ env.DOLT_VERSION }}
-          bd-version: ${{ env.BD_VERSION }}
       - name: Validate Ollama Claude configuration
         run: |
           test -n "$OLLAMA_API_KEY" || { echo "Missing OLLAMA_API_KEY GitHub secret" >&2; exit 1; }
@@ -320,7 +314,6 @@ jobs:
       - uses: ./.github/actions/setup-gascity-ubuntu
         with:
           dolt-version: ${{ env.DOLT_VERSION }}
-          bd-version: ${{ env.BD_VERSION }}
           install-claude-cli: "true"
       - name: Validate Ollama Claude configuration
         run: |
@@ -358,7 +351,6 @@ jobs:
       - uses: ./.github/actions/setup-gascity-ubuntu
         with:
           dolt-version: ${{ env.DOLT_VERSION }}
-          bd-version: ${{ env.BD_VERSION }}
       - name: Validate Ollama Claude configuration
         run: |
           test -n "$OLLAMA_API_KEY" || { echo "Missing OLLAMA_API_KEY GitHub secret" >&2; exit 1; }
@@ -380,7 +372,6 @@ jobs:
       - uses: ./.github/actions/setup-gascity-ubuntu
         with:
           dolt-version: ${{ env.DOLT_VERSION }}
-          bd-version: ${{ env.BD_VERSION }}
           install-claude-cli: "false"
       - name: Verify release output is ignored
         run: make check-release-dist-ignore

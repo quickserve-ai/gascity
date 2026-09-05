@@ -19,8 +19,12 @@ import (
 // "Beads pin" table, and on every machine, together.
 //
 // Note this is a different axis from deps.env's BD_VERSION, which pins the bd
-// *release tarball* CI and Docker install and can only name a published tag.
-// The two are deliberately independent; TestBDVersionPins owns that one.
+// *release tarball* the container image and the minimum-supported contract cell
+// install, and can only name a published tag; TestBDVersionPins owns that one.
+// The general CI path is no longer independent of this pin: since ga-yl326d the
+// setup-gascity-* actions build bd from the revision below
+// (.github/scripts/install-bd-lockstep.sh), so the CLI on PATH and the linked
+// library are the same revision by construction.
 func TestBeadsModulePin(t *testing.T) {
 	// v1.1.1-0.20260805093327-bf97b73749ac is commit bf97b73749ac on
 	// gastownhall/beads main (2026-08-05), schema v59 — the revision upstream

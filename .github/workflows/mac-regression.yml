@@ -75,7 +75,6 @@ concurrency:
 
 env:
   DOLT_VERSION: "2.1.7"
-  BD_VERSION: "v1.1.0"
 
 # Tier routing is centralized in the `gate` job below, which always runs
 # and computes run_smoke/run_full/run_review_formulas plus a human-readable
@@ -209,7 +208,6 @@ jobs:
       - uses: ./.github/actions/setup-gascity-macos
         with:
           dolt-version: ${{ env.DOLT_VERSION }}
-          bd-version: ${{ env.BD_VERSION }}
           install-claude-cli: "false"
       - name: Install tools
         run: make install-tools
@@ -264,7 +262,6 @@ jobs:
       - uses: ./.github/actions/setup-gascity-macos
         with:
           dolt-version: ${{ env.DOLT_VERSION }}
-          bd-version: ${{ env.BD_VERSION }}
           install-claude-cli: "false"
       - name: Run make test-mac
         run: make test-mac
@@ -294,7 +291,6 @@ jobs:
       - uses: ./.github/actions/setup-gascity-macos
         with:
           dolt-version: ${{ env.DOLT_VERSION }}
-          bd-version: ${{ env.BD_VERSION }}
           install-claude-cli: "false"
       - name: Run cmd/gc process shard
         run: make test-cmd-gc-process-shard CMD_GC_PROCESS_SHARD=${{ matrix.shard }} CMD_GC_PROCESS_TOTAL=12
@@ -320,7 +316,6 @@ jobs:
       - uses: ./.github/actions/setup-gascity-macos
         with:
           dolt-version: ${{ env.DOLT_VERSION }}
-          bd-version: ${{ env.BD_VERSION }}
           install-claude-cli: "true"
       - name: Run acceptance tests (Tier A)
         env:
@@ -355,7 +350,6 @@ jobs:
       - uses: ./.github/actions/setup-gascity-macos
         with:
           dolt-version: ${{ env.DOLT_VERSION }}
-          bd-version: ${{ env.BD_VERSION }}
           install-claude-cli: "true"
       - name: Install tools
         run: make install-tools
@@ -430,7 +424,6 @@ jobs:
       - uses: ./.github/actions/setup-gascity-macos
         with:
           dolt-version: ${{ env.DOLT_VERSION }}
-          bd-version: ${{ env.BD_VERSION }}
           install-claude-cli: "true"
       - name: Install tools
         run: make install-tools
@@ -470,7 +463,6 @@ jobs:
       - uses: ./.github/actions/setup-gascity-macos
         with:
           dolt-version: ${{ env.DOLT_VERSION }}
-          bd-version: ${{ env.BD_VERSION }}
           install-claude-cli: "true"
       - name: Install tools
         run: make install-tools
@@ -537,7 +529,6 @@ jobs:
       - uses: ./.github/actions/setup-gascity-macos
         with:
           dolt-version: ${{ env.DOLT_VERSION }}
-          bd-version: ${{ env.BD_VERSION }}
           install-claude-cli: "true"
       - name: Install tools
         run: make install-tools
@@ -578,7 +569,6 @@ jobs:
       - uses: ./.github/actions/setup-gascity-macos
         with:
           dolt-version: ${{ env.DOLT_VERSION }}
-          bd-version: ${{ env.BD_VERSION }}
           install-claude-cli: "true"
       - name: Install tools
         run: make install-tools
