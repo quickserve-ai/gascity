@@ -95,11 +95,27 @@ target="${bin_dir}/bd"
 if $use_cache && [[ -x "$target" ]]; then
   echo "Reusing cached bd ${resolved_version} at ${target}"
 else
-  # CGO_ENABLED=0 with -tags gms_pure_go is beads' own documented rebuild recipe
-  # (it is the command bd prints in its schema-skew error) and matches how this
-  # workflow already builds bd from source for the cross-version contract cells.
-  # It also keeps the build hermetic: the cgo path needs ICU headers the runners
-  # do not carry.
+  # CGO_ENABLED=1: the fleet's bd (and the tarball this installer replaced) is
+  # a CGO build with embedded Dolt; a CGO_ENABLED=0 bd refuses embedded stores
+  # outright ("embedded Dolt requires a CGO build"), which broke every test
+  # that `bd init`s a store (scaffold_roundtrip_any_bd, the doctor
+  # custom-types family) the moment this installer landed. -tags gms_pure_go
+  # stays: it is orthogonal to CGO and matches the shipped-image recipe
+  # (contrib/k8s/Dockerfile.agent builds CGO_ENABLED=1 with the same tag).
+  # Linux runners compile the Dolt cgo deps cleanly (see fork-verify.yml);
+  # macOS needs Homebrew icu4c's keg-only headers on the CGO search path,
+  # same as the Makefile does for local builds.
+  if [[ "$(uname)" == "Darwin" ]]; then
+    icu_prefix="$(brew --prefix icu4c 2>/dev/null || true)"
+    if [[ -z "$icu_prefix" ]]; then
+      brew install -q icu4c >/dev/null 2>&1 || true
+      icu_prefix="$(brew --prefix icu4c 2>/dev/null || true)"
+    fi
+    if [[ -n "$icu_prefix" ]]; then
+      export CGO_CPPFLAGS="${CGO_CPPFLAGS:-} -I${icu_prefix}/include"
+      export CGO_LDFLAGS="${CGO_LDFLAGS:-} -L${icu_prefix}/lib"
+    fi
+  fi
   #
   # Stamp the resolved pin into the version label (contrib/k8s/Dockerfile.agent
   # precedent): the pseudo-version's commit suffix makes `bd version` name the
@@ -107,7 +123,7 @@ else
   # scan) can then equate it with go.mod's pin instead of warning on an
   # anonymous "1.1.0 (dev)" — a label byte-identical to the skewed tarball
   # binary this installer exists to replace.
-  GOBIN="$bin_dir" CGO_ENABLED=0 go install -tags gms_pure_go \
+  GOBIN="$bin_dir" CGO_ENABLED=1 go install -tags gms_pure_go \
     -ldflags "-X main.Version=${resolved_version#v}" \
     "${resolved_path}/cmd/bd@${resolved_version}"
 fi
