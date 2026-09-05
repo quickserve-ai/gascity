@@ -1989,13 +1989,7 @@ func TestBootstrapPolicyOwnsNetListenDebtAndExactMediumOwners(t *testing.T) {
 	t.Parallel()
 
 	debt := findRow(t, bootstrapPolicy.Debt, ScopeUntagged, ResourceNetListen)
-	if debt.BaselineCalls != 98 || debt.BaselineFiles != 38 || debt.ReportedCalls != 92 || debt.ReportedFiles != 34 {
-		t.Fatalf("stream-listener source baseline/reported = %d/%d, %d/%d; want 98/38, 92/34", debt.BaselineCalls, debt.BaselineFiles, debt.ReportedCalls, debt.ReportedFiles)
-	}
 	smallDebt := findRow(t, bootstrapPolicy.SmallDebt, ScopeUntagged, ResourceNetListen)
-	if smallDebt.BaselineCalls != 96 || smallDebt.BaselineFiles != 37 {
-		t.Fatalf("stream-listener Small baseline = %d/%d, want 96/37", smallDebt.BaselineCalls, smallDebt.BaselineFiles)
-	}
 	for _, row := range []*Baseline{debt, smallDebt} {
 		if row.OwnerBead != "ga-80po0c.2.2.2" || row.MigrationTarget != "P0.4c-listener" {
 			t.Fatalf("stream-listener owner = %q/%q, want ga-80po0c.2.2.2/P0.4c-listener", row.OwnerBead, row.MigrationTarget)

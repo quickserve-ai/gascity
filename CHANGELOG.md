@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Cross-scope bead commands no longer resurrect a parent's Dolt endpoint.**
+  Cleared host, port, and managed-local marker values remain explicit through
+  subprocess environment overlays, preventing a rig's remote host from being
+  combined with the city's managed-local port during hook claims.
+
 - **OMP sessions now wait for TUI startup before receiving their initial nudge.**
   The built-in OMP provider uses the same fixed eight-second readiness delay as
   Pi/OpenCode-family TUIs, preventing a lost startup nudge from leaving session
