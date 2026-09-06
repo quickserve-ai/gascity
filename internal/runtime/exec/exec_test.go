@@ -1375,12 +1375,19 @@ func TestProvider_StartCancellationInterruptsForegroundChild(t *testing.T) {
 	dir := t.TempDir()
 	readyFile := filepath.Join(dir, "ready")
 	interruptFile := filepath.Join(dir, "interrupted")
+	// The readiness marker is written BY the foreground child (a subshell
+	// that then execs sleep, keeping the same pid), so its existence proves
+	// the child EXISTS when the test cancels. The original fixture wrote the
+	// marker one line before `sleep 30`: the group-SIGINT then raced the
+	// fork, and a signal landing in that window reached only the shell —
+	// which defers its INT trap behind a foreground child that never got the
+	// signal — so the WaitDelay SIGKILL won and the trap never ran. Measured
+	// 14/40 failures at ~2.2s before this change, 0/40 after (ga-6y88yt).
 	script := writeScript(t, dir, fmt.Sprintf(`
 case "$1" in
   start)
     trap 'printf "%%s\n" interrupted > "%s"; exit 0' INT
-    : > "%s"
-    sleep 30
+    ( : > "%s"; exec sleep 30 )
     ;;
   *) exit 2 ;;
 esac
