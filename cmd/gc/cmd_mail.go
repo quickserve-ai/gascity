@@ -21,6 +21,7 @@ import (
 	"github.com/gastownhall/gascity/internal/extmsg"
 	"github.com/gastownhall/gascity/internal/mail"
 	"github.com/gastownhall/gascity/internal/mail/beadmail"
+	"github.com/gastownhall/gascity/internal/notify"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/telemetry"
 	"github.com/spf13/cobra"
@@ -29,7 +30,7 @@ import (
 // nudgeFunc is an optional callback for nudging an agent after sending or
 // replying to mail. When non-nil, it is called with the recipient name.
 // Errors are non-fatal.
-type nudgeFunc func(recipient string) error
+type nudgeFunc func(recipient string, m mail.Message) error
 
 const (
 	mailInjectMaxMessages          = 3
@@ -114,12 +115,25 @@ func summarizeMailMessage(m mail.Message) mailMessageSummary {
 }
 
 func newMailNudgeFunc(sender string) nudgeFunc {
-	return func(recipient string) error {
+	return func(recipient string, m mail.Message) error {
 		target, err := resolveNudgeTarget(recipient, io.Discard)
 		if err != nil {
 			return err
 		}
-		return sendMailNotify(target, sender)
+		// The mail bead is durably written before this fires; the
+		// notification is a wake hint referencing it (notification plane,
+		// claudemsg-bridge-design.md §4 — this is the [R-1] bead-ID
+		// threading). The default session transport still renders the
+		// pre-plane wake text; Ref/Summary ride for transports that need
+		// them (claude-cloud, attention registry).
+		return sendMailNotify(target, notify.Notification{
+			Kind:      notify.KindMailArrival,
+			Recipient: recipient,
+			Sender:    sender,
+			Ref:       "bead://" + m.ID,
+			Summary:   m.Subject,
+			Urgency:   notify.UrgencyDeadline,
+		})
 	}
 }
 
@@ -1888,7 +1902,7 @@ func doMailSendJSON(mp mail.Provider, rec events.Recorder, validRecipients map[s
 	// Nudge recipient if requested and recipient is not human.
 	notified := false
 	if nudgeFn != nil && to != "human" {
-		if err := nudgeFn(to); err != nil {
+		if err := nudgeFn(to, m); err != nil {
 			fmt.Fprintf(stderr, "gc mail send: nudge failed: %v\n", err) //nolint:errcheck // best-effort stderr
 		} else {
 			notified = true
@@ -1957,7 +1971,7 @@ func doMailSendAllJSON(mp mail.Provider, rec events.Recorder, validRecipients ma
 		}
 
 		if nudgeFn != nil {
-			if err := nudgeFn(to); err != nil {
+			if err := nudgeFn(to, m); err != nil {
 				fmt.Fprintf(stderr, "gc mail send --all: nudge %s failed: %v\n", to, err) //nolint:errcheck // best-effort stderr
 			} else {
 				notified = true
@@ -2307,7 +2321,7 @@ func doMailReplyJSON(mp mail.Provider, rec events.Recorder, id, sender, subject,
 
 	notified := false
 	if nudgeFn != nil && reply.To != "human" {
-		if err := nudgeFn(reply.To); err != nil {
+		if err := nudgeFn(reply.To, reply); err != nil {
 			fmt.Fprintf(stderr, "gc mail reply: nudge failed: %v\n", err) //nolint:errcheck // best-effort stderr
 		} else {
 			notified = true

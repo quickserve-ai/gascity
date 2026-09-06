@@ -24,6 +24,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/extmsg"
 	"github.com/gastownhall/gascity/internal/fsys"
+	"github.com/gastownhall/gascity/internal/notify"
 	"github.com/gastownhall/gascity/internal/nudgepoller"
 	"github.com/gastownhall/gascity/internal/nudgequeue"
 	"github.com/gastownhall/gascity/internal/pidutil"
@@ -1087,7 +1088,7 @@ func writeQueuedSessionNudgeResult(target nudgeTarget, mode nudgeDeliveryMode, j
 	return 0
 }
 
-func sendMailNotify(target nudgeTarget, sender string) error {
+func sendMailNotify(target nudgeTarget, n notify.Notification) error {
 	store := openNudgeBeadStore(target.cityPath)
 	if store.Store == nil {
 		return fmt.Errorf("opening city store for %q", target.agentKey())
@@ -1096,15 +1097,47 @@ func sendMailNotify(target nudgeTarget, sender string) error {
 	if err != nil {
 		return err
 	}
-	return sendMailNotifyWithWorker(target, store.Store, sp, sender)
+	_, err = deliverSessionNotification(target, store.Store, sp, n)
+	return err
 }
 
 func sendMailNotifyWithProvider(target nudgeTarget, sp runtime.Provider) error {
-	return sendMailNotifyWithWorker(target, nil, sp, "human")
+	_, err := deliverSessionNotification(target, nil, sp, notify.Notification{
+		Kind:   notify.KindMailArrival,
+		Sender: "human",
+	})
+	return err
 }
 
+// sendMailNotifyWithWorker is the pre-notification-plane entry point, kept
+// for callers that still speak (target, sender). New call sites construct a
+// notify.Notification and use deliverSessionNotification directly.
 func sendMailNotifyWithWorker(target nudgeTarget, store beads.Store, sp runtime.Provider, sender string) error {
-	msg := fmt.Sprintf("You have mail from %s", sender)
+	_, err := deliverSessionNotification(target, store, sp, notify.Notification{
+		Kind:   notify.KindMailArrival,
+		Sender: sender,
+	})
+	return err
+}
+
+// nudgeSourceForKind maps a notification kind onto the queued-nudge source
+// label, preserving the pre-plane labels ("mail" for mail arrivals).
+func nudgeSourceForKind(kind notify.Kind) string {
+	if kind == notify.KindMailArrival {
+		return "mail"
+	}
+	return "session"
+}
+
+// deliverSessionNotification is the default "session" wake transport of the
+// notification plane (claudemsg-bridge-design.md §4): it renders the
+// notification to the pre-plane wake text and walks exactly the delivery
+// ladder sendMailNotifyWithWorker always walked — live wait-idle nudge,
+// managed enqueue+wake, plain local queue — byte-for-byte, so seats on the
+// default transport see zero behavioral difference.
+func deliverSessionNotification(target nudgeTarget, store beads.Store, sp runtime.Provider, n notify.Notification) (notify.Outcome, error) {
+	msg := notify.WakeText(n)
+	source := nudgeSourceForKind(n.Kind)
 	now := time.Now()
 	// Session-class store for the observe/handle reads and the last-nudge stamp
 	// below; the raw store keeps flowing to canRequestManagedNudgeWake,
@@ -1113,7 +1146,7 @@ func sendMailNotifyWithWorker(target nudgeTarget, store beads.Store, sp runtime.
 	sessStore := cliSessionStore(store, target.cfg, target.cityPath)
 	obs, err := workerObserveNudgeTarget(target, sessStore, sp)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if obs.Running {
 		handle, err := workerHandleForNudgeTarget(target, sessStore, sp)
@@ -1121,7 +1154,7 @@ func sendMailNotifyWithWorker(target nudgeTarget, store beads.Store, sp runtime.
 			result, nudgeErr := handle.Nudge(context.Background(), worker.NudgeRequest{
 				Text:     msg,
 				Delivery: worker.NudgeDeliveryWaitIdle,
-				Source:   "mail",
+				Source:   source,
 				Wake:     worker.NudgeWakeLiveOnly,
 			})
 			if nudgeErr == nil && result.Delivered {
@@ -1131,29 +1164,29 @@ func sendMailNotifyWithWorker(target nudgeTarget, store beads.Store, sp runtime.
 					sessFront = sessionFrontDoor(sessStore)
 				}
 				stampLastNudgeDeliveredAt(sessFront, target.sessionID, time.Now())
-				return nil
+				return notify.OutcomeDelivered, nil
 			}
 		}
 	}
 	if !obs.Running && canRequestManagedNudgeWake(target, store) {
-		item := newQueuedNudgeWithOptions(target.agentKey(), msg, "mail", now, queuedNudgeOptionsFromTarget(target))
+		item := newQueuedNudgeWithOptions(target.agentKey(), msg, source, now, queuedNudgeOptionsFromTarget(target))
 		if err := enqueueManagedNudgeThenWake(target, store, item); err != nil {
-			return err
+			return "", err
 		}
 		if err := nudgePokeController(target.cityPath); err != nil {
 			if nudgeWarningWriter != nil {
 				fmt.Fprintf(nudgeWarningWriter, "gc mail notify: warning: poke failed after managed wake: %v\n", err) //nolint:errcheck
 			}
 		}
-		return nil
+		return notify.OutcomeQueuedLocal, nil
 	}
-	if err := enqueueQueuedNudge(target.cityPath, newQueuedNudgeWithOptions(target.agentKey(), msg, "mail", now, queuedNudgeOptionsFromTarget(target))); err != nil {
-		return err
+	if err := enqueueQueuedNudge(target.cityPath, newQueuedNudgeWithOptions(target.agentKey(), msg, source, now, queuedNudgeOptionsFromTarget(target))); err != nil {
+		return "", err
 	}
 	if obs.Running {
 		maybeStartNudgePoller(target)
 	}
-	return nil
+	return notify.OutcomeQueuedLocal, nil
 }
 
 func resolveNudgeTarget(identifier string, warningWriter ...io.Writer) (nudgeTarget, error) {
