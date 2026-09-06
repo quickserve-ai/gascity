@@ -1121,8 +1121,16 @@ func sendMailNotify(target nudgeTarget, n notify.Notification) error {
 // bead. The mail bead is durably written before this fires, so every failure
 // here loses a wake hint, never the message — errors are loud on purpose.
 func deliverClaudeCloudNotify(target nudgeTarget, n notify.Notification) error {
+	// Every selected cloud-wake attempt is recorded, including the early
+	// refusals below — an unbound seat that silently never appears in
+	// telemetry is invisible to the operator. Pre-launch refusals are
+	// retryable (fix the inputs and re-run); launched sends are not.
+	recordEarly := func(err error) error {
+		telemetry.RecordCloudWake(context.Background(), target.agentKey(), "", n.Ref, "", 0, true, err)
+		return err
+	}
 	if strings.TrimSpace(target.sessionID) == "" {
-		return fmt.Errorf("seat %q selects wake_transport=%q but has no session bead to carry a cloud binding; bind one with `gc session adopt --cloud-id` (ga-bjbaui stage 5) — the mail bead is durably written and unaffected", target.agentKey(), config.WakeTransportClaudeCloud)
+		return recordEarly(fmt.Errorf("seat %q selects wake_transport=%q but has no session bead to carry a cloud binding; bind one with `gc session bind-cloud` — the mail bead is durably written and unaffected", target.agentKey(), config.WakeTransportClaudeCloud))
 	}
 	store := openNudgeBeadStore(target.cityPath)
 	if store.Store == nil {
@@ -1131,37 +1139,50 @@ func deliverClaudeCloudNotify(target nudgeTarget, n notify.Notification) error {
 	front := cliSessionFrontDoor(store.Store, target.cfg, target.cityPath)
 	info, err := front.Get(target.sessionID)
 	if err != nil {
-		return fmt.Errorf("reading session bead %s for the cloud binding: %w", target.sessionID, err)
+		return recordEarly(fmt.Errorf("reading session bead %s for the cloud binding: %w", target.sessionID, err))
 	}
 	if strings.TrimSpace(info.CloudWakeSessionID) == "" {
-		return fmt.Errorf("seat %q selects wake_transport=%q but its session bead carries no %s binding; stamp one with `gc session adopt --cloud-id` (ga-bjbaui stage 5) — the mail bead is durably written and unaffected", target.agentKey(), config.WakeTransportClaudeCloud, session.MetadataCloudWakeSessionID)
+		return recordEarly(fmt.Errorf("seat %q selects wake_transport=%q but its session bead carries no %s binding; stamp one with `gc session bind-cloud` — the mail bead is durably written and unaffected", target.agentKey(), config.WakeTransportClaudeCloud, session.MetadataCloudWakeSessionID))
 	}
 	if strings.TrimSpace(info.CloudWakeAccountDir) == "" {
 		// Ambient auth is refused by design (§5.1): a send under the wrong
 		// account burns the wrong cap, and an account mismatch surfaces as
 		// "Session not found" — falsely marking a healthy binding suspect.
-		return fmt.Errorf("seat %q has a cloud binding but no %s account lineage; refusing to send under ambient auth — stamp it via `gc session adopt --cloud-id` (ga-bjbaui stage 5); the mail bead is durably written and unaffected", target.agentKey(), session.MetadataCloudWakeAccountDir)
+		return recordEarly(fmt.Errorf("seat %q has a cloud binding but no %s account lineage; refusing to send under ambient auth — stamp it via `gc session bind-cloud`; the mail bead is durably written and unaffected", target.agentKey(), session.MetadataCloudWakeAccountDir))
 	}
 	tr := &claudecloud.Transport{Binding: claudecloud.Binding{
 		SessionID:        info.CloudWakeSessionID,
 		AccountConfigDir: info.CloudWakeAccountDir,
 	}}
+	start := time.Now()
 	outcome, derr := tr.Deliver(context.Background(), n)
-	// Reachability and suspect facts are best-effort stamps read by doctor
-	// (stage 5); delivery reporting must not fail on a metadata write.
+	latency := time.Since(start)
+	// Reachability and suspect facts are best-effort stamps read by the
+	// cloud-wake doctor check; delivery reporting must not fail on a
+	// metadata write. COMPARE BEFORE STAMP: an operator may have rebound the
+	// seat while the CLI ran — a result from the OLD binding must never mark
+	// the NEW binding suspect, so re-read and stamp only while the binding
+	// is still the one this send targeted.
 	now := time.Now().UTC().Format(time.RFC3339)
-	if outcome != "" {
-		_ = front.SetMarker(target.sessionID, session.MetadataCloudWakeLastOutcome, string(outcome))
-		_ = front.SetMarker(target.sessionID, session.MetadataCloudWakeLastOutcomeAt, now)
+	if fresh, ferr := front.Get(target.sessionID); ferr == nil &&
+		strings.TrimSpace(fresh.CloudWakeSessionID) == strings.TrimSpace(info.CloudWakeSessionID) {
+		if outcome != "" {
+			_ = front.SetMarker(target.sessionID, session.MetadataCloudWakeLastOutcome, string(outcome))
+			_ = front.SetMarker(target.sessionID, session.MetadataCloudWakeLastOutcomeAt, now)
+		}
+		if claudecloud.SuspectOutcome(outcome) {
+			// Suspect is not dead (design §5.2): credential drift can produce
+			// the same refusal strings a gone session does, so the binding is
+			// flagged for doctor and explicit rebind — never deleted here.
+			_ = front.SetMarker(target.sessionID, session.MetadataCloudWakeBindingSuspect, string(outcome))
+			_ = front.SetMarker(target.sessionID, session.MetadataCloudWakeBindingSuspectAt, now)
+		}
 	}
-	if claudecloud.SuspectOutcome(outcome) {
-		// Suspect is not dead (design §5.2): credential drift can produce the
-		// same refusal strings a gone session does, so the binding is flagged
-		// for doctor and explicit rebind — never deleted here.
-		_ = front.SetMarker(target.sessionID, session.MetadataCloudWakeBindingSuspect, string(outcome))
-		_ = front.SetMarker(target.sessionID, session.MetadataCloudWakeBindingSuspectAt, now)
-	}
-	telemetry.RecordNudge(context.Background(), target.agentKey(), derr)
+	// Retryable is strictly "nothing launched": pre-launch refusals
+	// (unreachable ref, garbage binding, missing lineage) and a CLI that
+	// never started. Everything after launch is at-most-once.
+	retryable := outcome == "" || outcome == notify.OutcomeRefusedNotFound && errors.Is(derr, claudecloud.ErrInvalidSessionID)
+	telemetry.RecordCloudWake(context.Background(), target.agentKey(), string(outcome), n.Ref, info.CloudWakeAccountDir, latency, retryable, derr)
 	return derr
 }
 

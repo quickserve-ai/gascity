@@ -155,6 +155,7 @@ func infoFromPersistedBeadFrozen(b beads.Bead) Info {
 		CloudWakeBindingSuspectAt: b.Metadata[MetadataCloudWakeBindingSuspectAt],
 		CloudWakeLastOutcome:      b.Metadata[MetadataCloudWakeLastOutcome],
 		CloudWakeLastOutcomeAt:    b.Metadata[MetadataCloudWakeLastOutcomeAt],
+		CloudWakeBoundAt:          b.Metadata[MetadataCloudWakeBoundAt],
 
 		SleepPolicyFingerprint:       b.Metadata["sleep_policy_fingerprint"],
 		RequestedSleepAfterIdle:      b.Metadata["requested_sleep_after_idle"],

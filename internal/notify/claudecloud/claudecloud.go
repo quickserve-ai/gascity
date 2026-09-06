@@ -54,6 +54,13 @@ const DefaultCLIPath = "claude"
 // to predict the vendor's ID format.
 var sessionIDPattern = regexp.MustCompile(`^session_[A-Za-z0-9]+$`)
 
+// ValidSessionID reports whether s is syntactically a cloud session ID.
+// Shared by the transport and the binding surface (gc session bind-cloud) so
+// a binding that would be refused at send time is refused at stamp time.
+func ValidSessionID(s string) bool {
+	return sessionIDPattern.MatchString(strings.TrimSpace(s))
+}
+
 // ErrUnreachableRef refuses a notification whose Ref a cloud sandbox cannot
 // reach (anything but https). The mail bead is already durably written when
 // a transport runs, so this loses a wake hint, never the message.

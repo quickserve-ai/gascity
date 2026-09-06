@@ -95,6 +95,9 @@ const (
 	MetadataCloudWakeLastOutcome = "cloud_wake_last_outcome"
 	// MetadataCloudWakeLastOutcomeAt is the RFC3339 time of that send.
 	MetadataCloudWakeLastOutcomeAt = "cloud_wake_last_outcome_at"
+	// MetadataCloudWakeBoundAt is the RFC3339 time the current binding was
+	// stamped (gc session bind-cloud) — the binding-age doctor fact.
+	MetadataCloudWakeBoundAt = "cloud_wake_bound_at"
 )
 
 // Info holds the user-facing details of a chat session.
@@ -139,6 +142,7 @@ type Info struct {
 	CloudWakeBindingSuspectAt string // cloud_wake_binding_suspect_at (RFC3339)
 	CloudWakeLastOutcome      string // cloud_wake_last_outcome
 	CloudWakeLastOutcomeAt    string // cloud_wake_last_outcome_at (RFC3339)
+	CloudWakeBoundAt          string // cloud_wake_bound_at (RFC3339)
 	Attached                  bool
 	// ContinuationEpoch is the persisted continuation_epoch marker, used by the
 	// wait registration/retry paths to stamp registered_epoch on wait beads.

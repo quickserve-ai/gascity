@@ -51,6 +51,7 @@ var allProjectedMetadataKeys = []string{
 	MetadataCloudWakeSessionID, MetadataCloudWakeAccountDir,
 	MetadataCloudWakeBindingSuspect, MetadataCloudWakeBindingSuspectAt,
 	MetadataCloudWakeLastOutcome, MetadataCloudWakeLastOutcomeAt,
+	MetadataCloudWakeBoundAt,
 	"sleep_policy_fingerprint", "requested_sleep_after_idle",
 	"effective_sleep_after_idle", "sleep_policy_source", "sleep_capability",
 	"sleep_policy_adjustment_reason", "config_wake_suppressed",

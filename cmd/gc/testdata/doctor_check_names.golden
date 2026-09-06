@@ -68,6 +68,7 @@ work-option-metadata-migration
 backlog-depth
 order-tracking-retention
 session-model
+cloud-wake-bindings
 dolt-server
 fork-rate
 dolt-noms-size

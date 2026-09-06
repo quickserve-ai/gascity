@@ -2479,6 +2479,7 @@ gc mail send --all "Status update: tests passing"
 | `-m`, `--message` | string |  | message body text |
 | `--no-notify` | bool |  | suppress the default recipient nudge for a direct local send |
 | `--notify` | bool |  | nudge the recipient about this message, even if earlier mail is still unread (the default for direct local sends; see --no-notify) |
+| `--ref` | string |  | https URL (GitHub) where the actionable content lives — required when the notified recipient is a cloud-wake seat; its wake hint points here instead of the mail bead |
 | `-s`, `--subject` | string |  | message subject line |
 | `--to` | string |  | recipient address (alternative to positional argument) |
 
@@ -3821,6 +3822,7 @@ gc session
 | Subcommand | Description |
 |------------|-------------|
 | [gc session attach](#gc-session-attach) | Attach to (or resume) a chat session |
+| [gc session bind-cloud](#gc-session-bind-cloud) | Bind a seat to a Claude Code cloud session for claude-cloud wake delivery |
 | [gc session close](#gc-session-close) | Close a session permanently |
 | [gc session history](#gc-session-history) | List an agent's past conversations |
 | [gc session kill](#gc-session-kill) | Force-kill session runtime (reconciler restarts) |
@@ -3853,6 +3855,32 @@ Accepts a session ID (e.g., gc-42) or session alias (e.g., mayor).
 ```
 gc session attach <session-id-or-alias>
 ```
+
+## gc session bind-cloud
+
+Bind a seat's session bead to a Claude Code cloud session so the
+claude-cloud wake transport (wake_transport = "claude-cloud" on the agent)
+can deliver wake hints into it.
+
+A binding is two facts stamped on the session bead: the cloud session ID
+(session_...) and the account lineage directory (CLAUDE_CONFIG_DIR) that
+owns the cloud session — sends run under that lineage only, never ambient
+auth. Re-running the command rebinds and clears any suspect marker a failed
+send left behind (rebinding IS the explicit recovery action the suspect
+state waits for). --clear removes the binding and its delivery-state facts.
+
+The binding is inert until the seat's agent config selects
+wake_transport = "claude-cloud".
+
+```
+gc session bind-cloud <session-id-or-alias> [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--account-dir` | string |  | account lineage directory (CLAUDE_CONFIG_DIR) that owns the cloud session |
+| `--clear` | bool |  | remove the cloud binding and its delivery-state facts |
+| `--cloud-id` | string |  | cloud session ID (session_...) |
 
 ## gc session close
 

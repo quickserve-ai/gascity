@@ -5232,7 +5232,7 @@ func TestSendMailNotifyCloudSeatWithoutSessionBeadRefusesLoudly(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "cloud binding") || !strings.Contains(err.Error(), "durably written") {
 		t.Fatalf("expected loud missing-binding refusal, got: %v", err)
 	}
-	if err != nil && !strings.Contains(err.Error(), "adopt --cloud-id") {
+	if err != nil && !strings.Contains(err.Error(), "bind-cloud") {
 		t.Fatalf("refusal must name the binding command, got: %v", err)
 	}
 }
@@ -5268,7 +5268,7 @@ func TestSendMailNotifyCloudSeatWithoutBindingMetadataRefusesLoudly(t *testing.T
 		agent:     config.Agent{Name: "cloudy", WakeTransport: config.WakeTransportClaudeCloud},
 	}
 	err := sendMailNotify(target, notify.Notification{Kind: notify.KindMailArrival, Sender: "x"})
-	if err == nil || !strings.Contains(err.Error(), session.MetadataCloudWakeSessionID) || !strings.Contains(err.Error(), "adopt --cloud-id") {
+	if err == nil || !strings.Contains(err.Error(), session.MetadataCloudWakeSessionID) || !strings.Contains(err.Error(), "bind-cloud") {
 		t.Fatalf("expected missing-binding refusal naming the metadata key and bind command, got: %v", err)
 	}
 }

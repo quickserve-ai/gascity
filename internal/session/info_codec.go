@@ -227,6 +227,7 @@ var infoKeyCodec = []infoKeySpec{
 	{MetadataCloudWakeBindingSuspectAt, func(i *Info, v string) { i.CloudWakeBindingSuspectAt = v }},
 	{MetadataCloudWakeLastOutcome, func(i *Info, v string) { i.CloudWakeLastOutcome = v }},
 	{MetadataCloudWakeLastOutcomeAt, func(i *Info, v string) { i.CloudWakeLastOutcomeAt = v }},
+	{MetadataCloudWakeBoundAt, func(i *Info, v string) { i.CloudWakeBoundAt = v }},
 
 	// last_nudge_delivered_at: RFC3339 time. Reset-to-zero first (clears a
 	// carried-forward value in the patch direction; a no-op on a fresh Info).

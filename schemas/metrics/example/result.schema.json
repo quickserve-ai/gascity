@@ -210,7 +210,8 @@
               "session-resume",
               "worktree-gc",
               "session-history",
-              "agent-is-foreign"
+              "agent-is-foreign",
+              "session-bind-cloud"
             ]
           },
           "event_id": {
