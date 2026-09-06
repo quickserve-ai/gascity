@@ -25,6 +25,7 @@ import (
 	"github.com/gastownhall/gascity/internal/extmsg"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/notify"
+	"github.com/gastownhall/gascity/internal/notify/claudecloud"
 	"github.com/gastownhall/gascity/internal/nudgepoller"
 	"github.com/gastownhall/gascity/internal/nudgequeue"
 	"github.com/gastownhall/gascity/internal/pidutil"
@@ -1097,9 +1098,7 @@ func sendMailNotify(target nudgeTarget, n notify.Notification) error {
 	case "", config.WakeTransportSession:
 		// default session transport below
 	case config.WakeTransportClaudeCloud:
-		// Stage 4 of the ga-bjbaui build; refusing loudly beats silently
-		// falling back to a transport the seat's config says cannot reach it.
-		return fmt.Errorf("seat %q selects wake_transport=%q, which is not implemented yet (ga-bjbaui stage 4); the mail bead is durably written and unaffected", target.agentKey(), config.WakeTransportClaudeCloud)
+		return deliverClaudeCloudNotify(target, n)
 	default:
 		return fmt.Errorf("seat %q has unknown wake_transport %q (config validation should have refused this)", target.agentKey(), target.agent.WakeTransport)
 	}
@@ -1113,6 +1112,57 @@ func sendMailNotify(target nudgeTarget, n notify.Notification) error {
 	}
 	_, err = deliverSessionNotification(target, store.Store, sp, n)
 	return err
+}
+
+// deliverClaudeCloudNotify is the claude-cloud branch of the notification
+// plane (claudemsg-bridge-design.md §5, ga-bjbaui stage 4): it reads the
+// seat's cloud binding from session-bead metadata, runs the per-send
+// transport, and stamps reachability + suspect state back onto the session
+// bead. The mail bead is durably written before this fires, so every failure
+// here loses a wake hint, never the message — errors are loud on purpose.
+func deliverClaudeCloudNotify(target nudgeTarget, n notify.Notification) error {
+	if strings.TrimSpace(target.sessionID) == "" {
+		return fmt.Errorf("seat %q selects wake_transport=%q but has no session bead to carry a cloud binding; bind one with `gc session adopt --cloud-id` (ga-bjbaui stage 5) — the mail bead is durably written and unaffected", target.agentKey(), config.WakeTransportClaudeCloud)
+	}
+	store := openNudgeBeadStore(target.cityPath)
+	if store.Store == nil {
+		return fmt.Errorf("opening city store for %q", target.agentKey())
+	}
+	front := cliSessionFrontDoor(store.Store, target.cfg, target.cityPath)
+	info, err := front.Get(target.sessionID)
+	if err != nil {
+		return fmt.Errorf("reading session bead %s for the cloud binding: %w", target.sessionID, err)
+	}
+	if strings.TrimSpace(info.CloudWakeSessionID) == "" {
+		return fmt.Errorf("seat %q selects wake_transport=%q but its session bead carries no %s binding; stamp one with `gc session adopt --cloud-id` (ga-bjbaui stage 5) — the mail bead is durably written and unaffected", target.agentKey(), config.WakeTransportClaudeCloud, session.MetadataCloudWakeSessionID)
+	}
+	if strings.TrimSpace(info.CloudWakeAccountDir) == "" {
+		// Ambient auth is refused by design (§5.1): a send under the wrong
+		// account burns the wrong cap, and an account mismatch surfaces as
+		// "Session not found" — falsely marking a healthy binding suspect.
+		return fmt.Errorf("seat %q has a cloud binding but no %s account lineage; refusing to send under ambient auth — stamp it via `gc session adopt --cloud-id` (ga-bjbaui stage 5); the mail bead is durably written and unaffected", target.agentKey(), session.MetadataCloudWakeAccountDir)
+	}
+	tr := &claudecloud.Transport{Binding: claudecloud.Binding{
+		SessionID:        info.CloudWakeSessionID,
+		AccountConfigDir: info.CloudWakeAccountDir,
+	}}
+	outcome, derr := tr.Deliver(context.Background(), n)
+	// Reachability and suspect facts are best-effort stamps read by doctor
+	// (stage 5); delivery reporting must not fail on a metadata write.
+	now := time.Now().UTC().Format(time.RFC3339)
+	if outcome != "" {
+		_ = front.SetMarker(target.sessionID, session.MetadataCloudWakeLastOutcome, string(outcome))
+		_ = front.SetMarker(target.sessionID, session.MetadataCloudWakeLastOutcomeAt, now)
+	}
+	if claudecloud.SuspectOutcome(outcome) {
+		// Suspect is not dead (design §5.2): credential drift can produce the
+		// same refusal strings a gone session does, so the binding is flagged
+		// for doctor and explicit rebind — never deleted here.
+		_ = front.SetMarker(target.sessionID, session.MetadataCloudWakeBindingSuspect, string(outcome))
+		_ = front.SetMarker(target.sessionID, session.MetadataCloudWakeBindingSuspectAt, now)
+	}
+	telemetry.RecordNudge(context.Background(), target.agentKey(), derr)
+	return derr
 }
 
 func sendMailNotifyWithProvider(target nudgeTarget, sp runtime.Provider) error {

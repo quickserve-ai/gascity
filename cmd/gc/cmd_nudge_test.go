@@ -5226,10 +5226,188 @@ func TestNudgeSenderIdentityAbsentEnvLeavesBareSource(t *testing.T) {
 	}
 }
 
-func TestSendMailNotifyRefusesUnimplementedCloudWakeTransport(t *testing.T) {
+func TestSendMailNotifyCloudSeatWithoutSessionBeadRefusesLoudly(t *testing.T) {
 	target := nudgeTarget{agent: config.Agent{Name: "cloudy", WakeTransport: config.WakeTransportClaudeCloud}}
 	err := sendMailNotify(target, notify.Notification{Kind: notify.KindMailArrival, Sender: "x"})
-	if err == nil || !strings.Contains(err.Error(), "wake_transport") || !strings.Contains(err.Error(), "durably written") {
-		t.Fatalf("expected loud unimplemented-transport refusal, got: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "cloud binding") || !strings.Contains(err.Error(), "durably written") {
+		t.Fatalf("expected loud missing-binding refusal, got: %v", err)
+	}
+	if err != nil && !strings.Contains(err.Error(), "adopt --cloud-id") {
+		t.Fatalf("refusal must name the binding command, got: %v", err)
+	}
+}
+
+// seedCloudWakeSessionBead creates a session bead carrying a cloud-wake
+// binding in a mem store, swaps the openNudgeBeadStore seam to serve that
+// store, and returns the bead ID plus the store. Serial (seam-swapping) test
+// helper — callers must not use t.Parallel.
+func seedCloudWakeSessionBead(t *testing.T, meta map[string]string) (string, beads.Store) {
+	t.Helper()
+	store := beads.NewMemStore()
+	b, err := store.Create(beads.Bead{Type: session.BeadType, Labels: []string{"gc:session"}})
+	if err != nil {
+		t.Fatalf("seeding session bead: %v", err)
+	}
+	for k, v := range meta {
+		if err := store.SetMetadata(b.ID, k, v); err != nil {
+			t.Fatalf("set %s: %v", k, err)
+		}
+	}
+	prev := openNudgeBeadStore
+	openNudgeBeadStore = func(string) beads.NudgesStore {
+		return beads.NudgesStore{Store: store}
+	}
+	t.Cleanup(func() { openNudgeBeadStore = prev })
+	return b.ID, store
+}
+
+func TestSendMailNotifyCloudSeatWithoutBindingMetadataRefusesLoudly(t *testing.T) {
+	beadID, _ := seedCloudWakeSessionBead(t, map[string]string{"session_name": "cloudy"})
+	target := nudgeTarget{
+		sessionID: beadID,
+		agent:     config.Agent{Name: "cloudy", WakeTransport: config.WakeTransportClaudeCloud},
+	}
+	err := sendMailNotify(target, notify.Notification{Kind: notify.KindMailArrival, Sender: "x"})
+	if err == nil || !strings.Contains(err.Error(), session.MetadataCloudWakeSessionID) || !strings.Contains(err.Error(), "adopt --cloud-id") {
+		t.Fatalf("expected missing-binding refusal naming the metadata key and bind command, got: %v", err)
+	}
+}
+
+// TestSendMailNotifyCloudSeatWithoutAccountLineageRefusesLoudly: a binding
+// with a session ID but no account lineage must refuse before any send —
+// ambient auth is refused by design (§5.1).
+func TestSendMailNotifyCloudSeatWithoutAccountLineageRefusesLoudly(t *testing.T) {
+	beadID, _ := seedCloudWakeSessionBead(t, map[string]string{
+		"session_name":                     "cloudy",
+		session.MetadataCloudWakeSessionID: "session_01TESTnoLINEAGE0000000000",
+	})
+	target := nudgeTarget{
+		sessionID: beadID,
+		agent:     config.Agent{Name: "cloudy", WakeTransport: config.WakeTransportClaudeCloud},
+	}
+	err := sendMailNotify(target, notify.Notification{Kind: notify.KindMailArrival, Sender: "x", Ref: "https://github.com/example/repo/pull/7"})
+	if err == nil || !strings.Contains(err.Error(), session.MetadataCloudWakeAccountDir) || !strings.Contains(err.Error(), "ambient auth") {
+		t.Fatalf("expected ambient-auth refusal naming the lineage key, got: %v", err)
+	}
+}
+
+// TestDeliverClaudeCloudNotifySuspectStamping drives the full stage-4 branch
+// with a stubbed CLI: a "Session not found" refusal must stamp both the
+// reachability facts and the suspect marker onto the session bead — and must
+// NOT delete the binding (suspect is not dead, design §5.2).
+func TestDeliverClaudeCloudNotifySuspectStamping(t *testing.T) {
+	cliDir := t.TempDir()
+	cliPath := cliDir + "/claude"
+	script := "#!/bin/sh\nprintf 'Session not found: x' >&2\nexit 1\n"
+	if err := os.WriteFile(cliPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", cliDir)
+
+	const cloudID = "session_01TESTsuspectSTAMPING00000"
+	beadID, store := seedCloudWakeSessionBead(t, map[string]string{
+		"session_name":                      "cloudy",
+		session.MetadataCloudWakeSessionID:  cloudID,
+		session.MetadataCloudWakeAccountDir: "/tmp/accounts/q-withq",
+	})
+	target := nudgeTarget{
+		sessionID: beadID,
+		agent:     config.Agent{Name: "cloudy", WakeTransport: config.WakeTransportClaudeCloud},
+	}
+	err := sendMailNotify(target, notify.Notification{
+		Kind:   notify.KindMailArrival,
+		Sender: "mayor",
+		Ref:    "https://github.com/example/repo/pull/7",
+	})
+	if err == nil || !strings.Contains(err.Error(), "refused") {
+		t.Fatalf("expected a refusal error, got: %v", err)
+	}
+	b, gerr := store.Get(beadID)
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	if got := b.Metadata[session.MetadataCloudWakeLastOutcome]; got != string(notify.OutcomeRefusedNotFound) {
+		t.Errorf("last outcome = %q, want %q", got, notify.OutcomeRefusedNotFound)
+	}
+	if got := b.Metadata[session.MetadataCloudWakeBindingSuspect]; got != string(notify.OutcomeRefusedNotFound) {
+		t.Errorf("suspect marker = %q, want %q", got, notify.OutcomeRefusedNotFound)
+	}
+	if b.Metadata[session.MetadataCloudWakeBindingSuspectAt] == "" || b.Metadata[session.MetadataCloudWakeLastOutcomeAt] == "" {
+		t.Error("suspect/outcome timestamps not stamped")
+	}
+	if got := b.Metadata[session.MetadataCloudWakeSessionID]; got != cloudID {
+		t.Errorf("binding must survive a suspect marking (suspect is not dead), got %q", got)
+	}
+}
+
+// TestDeliverClaudeCloudNotifyAcceptedStampsOutcomeOnly: an accepted send is
+// queued_remote (accepted != delivered), stamps reachability, and leaves the
+// binding unsuspected.
+func TestDeliverClaudeCloudNotifyAcceptedStampsOutcomeOnly(t *testing.T) {
+	cliDir := t.TempDir()
+	cliPath := cliDir + "/claude"
+	script := "#!/bin/sh\nprintf '{\"ok\":true}'\n"
+	if err := os.WriteFile(cliPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", cliDir)
+
+	beadID, store := seedCloudWakeSessionBead(t, map[string]string{
+		"session_name":                      "cloudy",
+		session.MetadataCloudWakeSessionID:  "session_01TESTacceptedOUTCOME0000",
+		session.MetadataCloudWakeAccountDir: "/tmp/accounts/q-withq",
+	})
+	target := nudgeTarget{
+		sessionID: beadID,
+		agent:     config.Agent{Name: "cloudy", WakeTransport: config.WakeTransportClaudeCloud},
+	}
+	err := sendMailNotify(target, notify.Notification{
+		Kind:   notify.KindMailArrival,
+		Sender: "mayor",
+		Ref:    "https://github.com/example/repo/pull/7",
+	})
+	if err != nil {
+		t.Fatalf("accepted send must not error: %v", err)
+	}
+	b, gerr := store.Get(beadID)
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	if got := b.Metadata[session.MetadataCloudWakeLastOutcome]; got != string(notify.OutcomeQueuedRemote) {
+		t.Errorf("last outcome = %q, want %q", got, notify.OutcomeQueuedRemote)
+	}
+	if got := b.Metadata[session.MetadataCloudWakeBindingSuspect]; got != "" {
+		t.Errorf("accepted send must not mark the binding suspect, got %q", got)
+	}
+}
+
+// TestDeliverClaudeCloudNotifyUnreachableRefRefused: a cloud seat whose
+// notification carries only a bead:// ref (unreachable from the cloud
+// sandbox) is refused before any subprocess runs.
+func TestDeliverClaudeCloudNotifyUnreachableRefRefused(t *testing.T) {
+	beadID, store := seedCloudWakeSessionBead(t, map[string]string{
+		"session_name":                      "cloudy",
+		session.MetadataCloudWakeSessionID:  "session_01TESTunreachableREF00000",
+		session.MetadataCloudWakeAccountDir: "/tmp/accounts/q-withq",
+	})
+	t.Setenv("PATH", t.TempDir()) // no claude binary: exec would fail loudly
+	target := nudgeTarget{
+		sessionID: beadID,
+		agent:     config.Agent{Name: "cloudy", WakeTransport: config.WakeTransportClaudeCloud},
+	}
+	err := sendMailNotify(target, notify.Notification{
+		Kind:   notify.KindMailArrival,
+		Sender: "mayor",
+		Ref:    "bead://ga-wisp-xyz",
+	})
+	if err == nil || !strings.Contains(err.Error(), "https") {
+		t.Fatalf("expected unreachable-ref refusal, got: %v", err)
+	}
+	b, gerr := store.Get(beadID)
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	if got := b.Metadata[session.MetadataCloudWakeBindingSuspect]; got != "" {
+		t.Errorf("a ref usage error must not mark the binding suspect, got %q", got)
 	}
 }

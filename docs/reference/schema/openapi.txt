@@ -498,6 +498,12 @@
               "null"
             ]
           },
+          "WakeTransport": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "WorkDir": {
             "type": [
               "string",
@@ -518,6 +524,7 @@
           "PreStart",
           "PromptTemplate",
           "Session",
+          "WakeTransport",
           "Provider",
           "Upstream",
           "Args",
