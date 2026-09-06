@@ -8689,3 +8689,56 @@ func TestSyncTailReturnsFreshStoreLoadNotLocalSlice(t *testing.T) {
 		t.Fatalf("returned snapshot open set %v != fresh store load %v", gotIDs, freshIDs)
 	}
 }
+
+// A seat re-pointed to a provider that is its own family root (name ==
+// BuiltinAncestor, e.g. [providers.omp] base="builtin:omp") used to update
+// only "provider": the != name convention never queued kind/ancestor, so a
+// stale lineage from the PREVIOUS provider survived forever and every
+// ancestry consumer (GC_PROVIDER stamping, the context meter) kept reading
+// the dead harness (ga-vat7sn defect 1, measured live 2026-09-05:
+// provider=omp with provider_kind/builtin_ancestor=claude).
+func TestQueueChangedResolvedProviderMetadataCorrectsStaleLineageOnSelfRootedProvider(t *testing.T) {
+	existing := map[string]string{
+		"provider":         "claude-fable-kumar",
+		"provider_kind":    "claude",
+		"builtin_ancestor": "claude",
+	}
+	queued := map[string]string{}
+	queueChangedResolvedProviderSessionMetadata(existing, func(k, v string) { queued[k] = v }, &config.ResolvedProvider{
+		Name:            "omp",
+		BuiltinAncestor: "omp",
+	})
+	want := map[string]string{
+		"provider":         "omp",
+		"provider_kind":    "omp",
+		"builtin_ancestor": "omp",
+	}
+	if !reflect.DeepEqual(queued, want) {
+		t.Fatalf("queued = %v, want %v (stale claude lineage must be corrected)", queued, want)
+	}
+
+	// Unchanged self-rooted metadata queues nothing (write-if-changed holds).
+	queued = map[string]string{}
+	queueChangedResolvedProviderSessionMetadata(want, func(k, v string) { queued[k] = v }, &config.ResolvedProvider{
+		Name:            "omp",
+		BuiltinAncestor: "omp",
+	})
+	if len(queued) != 0 {
+		t.Fatalf("queued = %v on a converged bead, want no writes", queued)
+	}
+
+	// Same-family stored values are respected, not churned: an alias whose
+	// stored ancestor already names the same family stays as it is.
+	queued = map[string]string{}
+	queueChangedResolvedProviderSessionMetadata(map[string]string{
+		"provider":         "omp",
+		"provider_kind":    "pi",
+		"builtin_ancestor": "pi",
+	}, func(k, v string) { queued[k] = v }, &config.ResolvedProvider{
+		Name:            "omp",
+		BuiltinAncestor: "omp",
+	})
+	if len(queued) != 0 {
+		t.Fatalf("queued = %v for same-family stored lineage, want no writes", queued)
+	}
+}

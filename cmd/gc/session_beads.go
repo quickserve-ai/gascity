@@ -18,6 +18,7 @@ import (
 	"github.com/gastownhall/gascity/internal/extmsg"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/sessionlog"
 )
 
 // sessionBeadLabel is the label for all session beads.
@@ -242,11 +243,33 @@ func queueChangedResolvedProviderSessionMetadata(existing map[string]string, que
 	if name != "" && existing["provider"] != name {
 		queue("provider", name)
 	}
+	// When the resolved provider IS its own family root (a builtin, or an
+	// alias shadowing its builtin's name — [providers.omp] base="builtin:omp"
+	// resolves to name == ancestor == "omp"), the != name convention stores
+	// no kind/ancestor. That convention must not preserve a STALE lineage: a
+	// seat re-pointed from claude to omp updated only "provider" and kept
+	// provider_kind/builtin_ancestor "claude" forever, so every consumer of
+	// the ancestry ladder — GC_PROVIDER stamping, session-log routing, the
+	// context meter — kept reading the dead harness (ga-vat7sn defect 1,
+	// measured on a live seat 2026-09-05). When resolution succeeded and the
+	// stored value belongs to a DIFFERENT family than the resolved lineage,
+	// correct it to the true (self-rooted) value.
+	ancestor := strings.TrimSpace(resolved.BuiltinAncestor)
 	if family := resolvedProviderFamilyMetadata(resolved); family != "" && existing["provider_kind"] != family {
 		queue("provider_kind", family)
+	} else if family == "" && ancestor != "" {
+		if stored := strings.TrimSpace(existing["provider_kind"]); stored != "" &&
+			sessionlog.ProviderFamily(stored) != sessionlog.ProviderFamily(ancestor) {
+			queue("provider_kind", ancestor)
+		}
 	}
-	if ancestor := strings.TrimSpace(resolved.BuiltinAncestor); ancestor != "" && ancestor != name && existing["builtin_ancestor"] != ancestor {
+	if ancestor != "" && ancestor != name && existing["builtin_ancestor"] != ancestor {
 		queue("builtin_ancestor", ancestor)
+	} else if ancestor != "" {
+		if stored := strings.TrimSpace(existing["builtin_ancestor"]); stored != "" && stored != ancestor &&
+			sessionlog.ProviderFamily(stored) != sessionlog.ProviderFamily(ancestor) {
+			queue("builtin_ancestor", ancestor)
+		}
 	}
 }
 
