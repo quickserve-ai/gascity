@@ -91,6 +91,20 @@ func writeSQLServerInfo(t *testing.T, rigDir string, pid, port int) {
 	}
 }
 
+// skipIfPortResolutionDegraded skips a run where the drift check reported the
+// managed port as unresolvable. Port resolution validates runtime state with
+// live process probes (TCP dial, lsof, ps) that time out under heavy gate load
+// (the ga-4mkhyy flake: lsof SIGKILLed at its 2s timeout made a valid provider
+// state read as invalid). The check now names that degradation explicitly
+// instead of failing open, so the tests can distinguish "analysis skipped
+// under load" from a genuinely wrong verdict — only the former is skipped.
+func skipIfPortResolutionDegraded(t *testing.T, r *doctor.CheckResult) {
+	t.Helper()
+	if r.Status == doctor.StatusWarning && strings.Contains(r.Message, "port unresolvable") {
+		t.Skipf("managed Dolt port resolution degraded under load; drift analysis skipped by the check: %v", r.Details)
+	}
+}
+
 func TestDoltDriftCheckCleanManagedCityIsOK(t *testing.T) {
 	cityDir, rigDir, managedPort, cfg := managedCityDriftFixture(t, "clean")
 	// Port file matches canonical managed port — no drift.
@@ -98,6 +112,7 @@ func TestDoltDriftCheckCleanManagedCityIsOK(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := newDoltDriftCheck(cityDir, cfg).Run(&doctor.CheckContext{CityPath: cityDir})
+	skipIfPortResolutionDegraded(t, r)
 	if r.Status != doctor.StatusOK {
 		t.Fatalf("Run() status = %v, want StatusOK; message=%q details=%v", r.Status, r.Message, r.Details)
 	}
@@ -120,6 +135,7 @@ func TestDoltDriftCheckUsesProviderStateWhenPublishedStateIsMissing(t *testing.T
 	}
 
 	r := newDoltDriftCheck(cityDir, cfg).Run(&doctor.CheckContext{CityPath: cityDir})
+	skipIfPortResolutionDegraded(t, r)
 	if r.Status != doctor.StatusError {
 		t.Fatalf("Run() status = %v, want StatusError; message=%q details=%v", r.Status, r.Message, r.Details)
 	}
@@ -212,6 +228,7 @@ func TestDoltDriftCheckDetectsPortFileDrift(t *testing.T) {
 
 	check := newDoltDriftCheck(cityDir, cfg)
 	r := check.Run(&doctor.CheckContext{CityPath: cityDir})
+	skipIfPortResolutionDegraded(t, r)
 	if r.Status != doctor.StatusError {
 		t.Fatalf("Run() status = %v, want StatusError; message=%q details=%v", r.Status, r.Message, r.Details)
 	}
@@ -289,5 +306,30 @@ func TestRigLocalDoltPIDFromSQLServerInfoMissingFile(t *testing.T) {
 	}
 	if alive {
 		t.Errorf("pidAliveNow = true, want false when file absent")
+	}
+}
+
+// TestDoltDriftCheckProxiedCityHasNoPortToResolve: a proxied Dolt (bd-owned,
+// upstream #6273's default) has no managed city port, so the empty port is
+// not a degraded probe and the check must not warn that its analysis was
+// skipped; the topology acceptance suite wants doctor green on that city.
+func TestDoltDriftCheckProxiedCityHasNoPortToResolve(t *testing.T) {
+	cityDir, rigDir, _, cfg := managedCityDriftFixture(t, "proxied")
+	for _, scope := range []string{cityDir, rigDir} {
+		if _, err := contract.EnsureCanonicalMetadata(fsys.OSFS{}, filepath.Join(scope, ".beads", "metadata.json"), contract.MetadataState{
+			Database:     "dolt",
+			Backend:      "dolt",
+			DoltMode:     "proxied-server",
+			DoltDatabase: "r",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if doctor.ManagedLocalDoltChecksApplicableForConfig(cityDir, cfg, nil) {
+		t.Skip("fixture still reads as managed-local; the proxied shape is not what this test exercises")
+	}
+	r := newDoltDriftCheck(cityDir, cfg).Run(&doctor.CheckContext{CityPath: cityDir})
+	if r.Status == doctor.StatusWarning && strings.Contains(r.Message, "port unresolvable") {
+		t.Fatalf("a proxied city has no managed port to resolve; got %q details=%v", r.Message, r.Details)
 	}
 }
