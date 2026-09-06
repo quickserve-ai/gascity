@@ -10344,7 +10344,10 @@ func TestRunDispatchGuardedRecoversPanic(t *testing.T) {
 	var logs bytes.Buffer
 	m := &memoryOrderDispatcher{stderr: &logs} // rec is nil → dispatchOne panics on Record
 
-	order := orders.Order{Name: "boom", Trigger: "webhook", Formula: "f"}
+	// The name must read as a fixture in interleaved gate logs: a previous
+	// name of "boom" rendered as "gc: order boom: dispatch goroutine panic"
+	// and was misfiled as a production nil-deref (ga-4mkhyy).
+	order := orders.Order{Name: "intentional-panic-fixture", Trigger: "webhook", Formula: "f"}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

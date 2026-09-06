@@ -67,6 +67,14 @@ func (c *doltDriftCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 	var errors []string
 	var warnings []string
 
+	// Port resolution validates the runtime state with live process probes
+	// (TCP dial, lsof, ps). When those degrade — no server up, or probe
+	// timeouts under heavy load — the port comes back empty and Case B below
+	// cannot run for any rig. That MUST NOT read as "no drift": a skipped
+	// analysis and a clean one were byte-identical here, which let real
+	// port-file drift hide behind a slow lsof (ga-4mkhyy, serial gate).
+	skippedPortAnalyses := 0
+
 	for i := range c.cfg.Rigs {
 		rig := c.cfg.Rigs[i]
 		if strings.TrimSpace(rig.Path) == "" {
@@ -105,7 +113,9 @@ func (c *doltDriftCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 		}
 
 		// Case B: rig port file disagrees with managed city port.
-		if managedPort != "" {
+		if managedPort == "" {
+			skippedPortAnalyses++
+		} else {
 			rigPortFile := filepath.Join(rig.Path, ".beads", "dolt-server.port")
 			if data, err := os.ReadFile(rigPortFile); err == nil {
 				got := strings.TrimSpace(string(data))
@@ -118,6 +128,14 @@ func (c *doltDriftCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 				}
 			}
 		}
+	}
+
+	portUnresolvable := skippedPortAnalyses > 0
+	if portUnresolvable {
+		warnings = append(warnings, fmt.Sprintf(
+			"managed city Dolt port unresolvable this run (server down, or process probes degraded under load); port-file drift analysis skipped for %d rig(s) — rerun `gc doctor` when the managed Dolt is reachable",
+			skippedPortAnalyses,
+		))
 	}
 
 	if len(errors) == 0 && len(warnings) == 0 {
@@ -136,12 +154,16 @@ func (c *doltDriftCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 		r.FixHint = "`gc doctor --fix` re-pins rig port-file drift; for a live rig-local Dolt, stop it or acknowledge explicit ownership with `gc rig set-endpoint <rig> --self --port <port> --force` (use --external for non-local servers); remove stale .dolt/sql-server.info files"
 		return r
 	}
-	plural := ""
-	if len(warnings) != 1 {
-		plural = "s"
-	}
 	r.Status = doctor.StatusWarning
-	r.Message = fmt.Sprintf("%d stale rig-local Dolt state file%s", len(warnings), plural)
+	if portUnresolvable {
+		r.Message = "managed city Dolt port unresolvable; port-drift analysis skipped this run"
+	} else {
+		plural := ""
+		if len(warnings) != 1 {
+			plural = "s"
+		}
+		r.Message = fmt.Sprintf("%d stale rig-local Dolt state file%s", len(warnings), plural)
+	}
 	r.Details = warnings
 	r.FixHint = "remove stale .dolt/sql-server.info files whose PID is not serving the recorded port"
 	return r
