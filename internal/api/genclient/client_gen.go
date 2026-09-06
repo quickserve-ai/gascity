@@ -994,6 +994,7 @@ type AgentPatch struct {
 	TmuxAlias               *string           `json:"TmuxAlias"`
 	Upstream                *string           `json:"Upstream"`
 	WakeMode                *string           `json:"WakeMode"`
+	WakeTransport           *string           `json:"WakeTransport"`
 	WorkDir                 *string           `json:"WorkDir"`
 }
 
