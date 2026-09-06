@@ -38,16 +38,12 @@ func jqMeta(key string) string {
 	return `(.metadata["` + key + `"] // "")`
 }
 
-// holdParkExcludeSelectJQ is the jq select that drops beads carrying any
-// hold:* label. Under the wait-class contract (bridge-wait-classes.md) a
-// hold:<class> label is the machine-readable "owned-and-waiting" signal: the
-// bead is parked with a watcher, so it is neither stranded nor dispatchable.
-// Routing one anyway burns pool sessions on work that cannot progress
-// (ga-uica16: two sessions consumed on a hold:cert-wait park before a seat
-// recognized the state). The match is a PREFIX, not an enumerated label list —
-// the class set is open by design, and an enumeration would silently miss the
-// next class added to the contract.
-const holdParkExcludeSelectJQ = `select(([.labels[]? | select(startswith("hold:"))] | length) == 0)`
+// holdParkExcludeSelectJQ drops beads carrying any hold:* label — parked
+// under the wait-class contract, so neither stranded nor dispatchable
+// (ga-uica16: two pool sessions consumed on a hold:cert-wait park). The
+// single definition of the rule lives in beadmeta (prefix rationale and the
+// serve/exist contract are documented there).
+const holdParkExcludeSelectJQ = beadmeta.HoldParkExcludeSelectJQ
 
 // holdParkFilterJQ wraps the exclusion select as a whole-array filter.
 func holdParkFilterJQ() string {

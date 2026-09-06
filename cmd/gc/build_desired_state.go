@@ -1760,14 +1760,11 @@ func defaultNamedSessionDemand(targets []defaultScaleCheckTarget, _ *config.City
 // dropped, so the pool never scales up. The returned value is the normalized
 // template name, since callers use it as the counts/demand map key.
 // beadCarriesHoldPark reports whether the bead carries any hold:* label — the
-// wait-class contract's park signal (prefix-matched; the class set is open).
+// wait-class contract's park signal. The rule's single definition lives in
+// beadmeta (prefix rationale and the serve/exist contract are documented
+// there).
 func beadCarriesHoldPark(b beads.Bead) bool {
-	for _, label := range b.Labels {
-		if strings.HasPrefix(strings.TrimSpace(label), "hold:") {
-			return true
-		}
-	}
-	return false
+	return beadmeta.HasHoldLabel(b.Labels)
 }
 
 func controllerDemandRouteTarget(cfg *config.City, b beads.Bead, templates map[string]struct{}) string {
