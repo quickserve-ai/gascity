@@ -105,6 +105,7 @@ type agentFile struct {
 	DependsOn              []string                `toml:"depends_on,omitempty"`
 	ResumeCommand          string                  `toml:"resume_command,omitempty"`
 	WakeMode               string                  `toml:"wake_mode,omitempty"`
+	WakeTransport          string                  `toml:"wake_transport,omitempty"`
 	MouseMode              string                  `toml:"mouse_mode,omitempty"`
 }
 
@@ -962,6 +963,7 @@ func agentConfigFromAgent(agent config.Agent) agentFile {
 		DependsOn:              agent.DependsOn,
 		ResumeCommand:          agent.ResumeCommand,
 		WakeMode:               agent.WakeMode,
+		WakeTransport:          agent.WakeTransport,
 		MouseMode:              agent.MouseMode,
 	}
 }
@@ -1016,6 +1018,7 @@ func isZeroAgentConfig(cfg agentFile) bool {
 		len(cfg.DependsOn) == 0 &&
 		cfg.ResumeCommand == "" &&
 		cfg.WakeMode == "" &&
+		cfg.WakeTransport == "" &&
 		cfg.MouseMode == ""
 }
 

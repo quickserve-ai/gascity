@@ -216,7 +216,12 @@
               "worktree-cleanup",
               "worktree-ensure",
               "worktree-verify",
-              "storage-preflight"
+              "storage-preflight",
+              "session-resume",
+              "worktree-gc",
+              "session-history",
+              "agent-is-foreign",
+              "session-bind-cloud"
             ]
           },
           "event_id": {

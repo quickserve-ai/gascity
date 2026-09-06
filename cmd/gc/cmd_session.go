@@ -66,6 +66,7 @@ continuity.`,
 		newSessionPruneCmd(stdout, stderr),
 		newSessionPeekCmd(stdout, stderr),
 		newSessionKillCmd(stdout, stderr),
+		newSessionBindCloudCmd(stdout, stderr),
 		newSessionNudgeCmd(stdout, stderr),
 		newSessionLogsCmd(stdout, stderr),
 		newSessionHistoryCmd(stdout, stderr),
@@ -219,7 +220,10 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach, json
 	// Multi-session templates are exempt: factory creates there mint
 	// distinct instance identities with an empty alias and are sanctioned
 	// (see TestPhase0CmdSessionNew_FactoryTargetDoesNotMaterializeNamedIdentity).
-	if requestedAlias == "" && !found.SupportsMultipleSessions() {
+	// A template backing a named session of the SAME name is Fix B's case
+	// (#3884, below): it materializes the configured identity rather than a
+	// shadow, so the refusal applies only when no configured owner resolves.
+	if requestedAlias == "" && !found.SupportsMultipleSessions() && sessionNewAliasOwner(cfg, &found) == "" {
 		if specs := findNamedSessionSpecsByBackingTemplate(cfg, cityName, found.QualifiedName()); len(specs) > 0 {
 			identities := make([]string, len(specs))
 			for i, s := range specs {
@@ -1930,6 +1934,15 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 	if cityErr == nil && cfg != nil {
 		rigStores = buildStandaloneRigStores(cfg, cityPath, stderr)
 	}
+	// ga-sdynmb: cfg is what makes this close non-destructive for CREW. A provider
+	// flip or config-drift roll runs `gc session close <agent>` (city.toml documents
+	// it as the required move -- `reset` does not re-resolve the provider), and this
+	// sweep used to clear the assignee on EVERY open/in_progress bead the agent held,
+	// across the city AND rig stores, with an empty fallback route leaving them
+	// unrouted as well. With cfg the sweep keeps work whose assignee is a
+	// still-configured [[named_session]] identity, which the respawned agent
+	// re-acquires; a genuinely retired or pool session matches nothing in cfg and is
+	// released exactly as before.
 	unclaimWorkAssignedToRetiredSessionBead(cityPath, cfg, store, rigStores, closedSessionBead, "", stderr)
 
 	if asJSON {
