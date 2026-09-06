@@ -91,8 +91,16 @@ add_fsys_compile_job() {
 }
 
 add_unit_core_job() {
+  # -timeout 30m: the per-PACKAGE hang budget, measurement-derived — a bare
+  # `go test` inherits Go's default 10m, which examples/gastown alone
+  # exceeds under serial gate constraints (LOCAL_TEST_JOBS=1 GOMAXPROCS=2
+  # -p=1): profiled twice on the fleet host at 725s and 1360s wall for 243
+  # passing script-integration tests, ~2x run-to-run host variance
+  # (ga-m00l03, 2026-09-06). 30m ≈ 1.3x the worst observed. Timeouts are
+  # hang DETECTORS, not sleeps — passing runs are unaffected; only a
+  # genuinely hung package now waits longer before being declared dead.
   add_job "unit-core" \
-    'GC_FAST_UNIT=1 go test $(go list ./... | grep -v '"'"'^github.com/gastownhall/gascity/cmd/gc$'"'"')'
+    'GC_FAST_UNIT=1 go test -timeout 30m $(go list ./... | grep -v '"'"'^github.com/gastownhall/gascity/cmd/gc$'"'"')'
 }
 
 # Runs as a direct shell job rather than through a `go test` wrapper because a
