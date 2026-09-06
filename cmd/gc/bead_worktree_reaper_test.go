@@ -89,3 +89,41 @@ func TestIsStrictlyUnderDirDeepSubpath(t *testing.T) {
 		t.Errorf("isStrictlyUnderDir(%q, %q) = false, want true", dir, path)
 	}
 }
+
+func TestNonSedimentStatusLinesFiltersProvisioningOnly(t *testing.T) {
+	porcelain := "?? .claude/skills/cherub-law.codex/\n" +
+		"?? .omp/hooks/gc-hook.ts\n" +
+		" D .beads/config.yaml\n" +
+		"D  .beads/formulas/brand-review.formula.toml\n" +
+		"?? .beads/routes.jsonl\n" +
+		"?? .worktree-stale\n" +
+		"?? AGENTS-gc.md\n"
+	if got := nonSedimentStatusLines(porcelain); len(got) != 0 {
+		t.Fatalf("pure provisioning sediment classified as authored work: %v", got)
+	}
+}
+
+func TestNonSedimentStatusLinesKeepsAuthoredWork(t *testing.T) {
+	porcelain := "?? .claude/skills/x/\n" +
+		" M internal/server/main.go\n" +
+		"?? newfile.go\n" +
+		" D .beads/config.yaml\n"
+	got := nonSedimentStatusLines(porcelain)
+	if len(got) != 2 {
+		t.Fatalf("authored lines = %v, want the modified tracked file and the untracked source file", got)
+	}
+}
+
+func TestNonSedimentStatusLinesDoesNotOvermatchLookalikes(t *testing.T) {
+	// Paths that merely RESEMBLE sediment must stay authored: deletions
+	// outside .beads/, files whose names embed the markers deeper, and
+	// tracked modifications inside the dot-dirs.
+	porcelain := " D src/config.yaml\n" +
+		"?? docs/.worktree-stale.md\n" +
+		" M .claude/settings.json\n" +
+		"?? vendor/AGENTS-gc.md.bak\n"
+	got := nonSedimentStatusLines(porcelain)
+	if len(got) != 4 {
+		t.Fatalf("lookalike lines = %d authored (%v), want all 4 kept", len(got), got)
+	}
+}
