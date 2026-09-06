@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/runtime"
 )
@@ -183,5 +184,34 @@ func TestTmuxCarrierDrivesOverSSH(t *testing.T) {
 		if !slices.Equal(f.calls[i], want[i]) {
 			t.Errorf("remote argv[%d] = %v, want %v", i, f.calls[i], want[i])
 		}
+	}
+}
+
+// runBoundedProbe runs an availability-prerequisite command under a
+// test-owned deadline. A probe that cannot complete in time is classified
+// unavailable (non-nil error) instead of stalling until the package alarm —
+// a host whose ssh hangs pre-auth held the fast suite for its full ten-minute
+// panic window (ga-hz84hj). WaitDelay bounds reaping even if the client
+// ignores the context kill while holding its pipes.
+func runBoundedProbe(t *testing.T, timeout time.Duration, name string, args ...string) error {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.WaitDelay = 2 * time.Second
+	return cmd.Run()
+}
+
+// TestRunBoundedProbe_ReapsStalledClient proves, without any ambient ssh
+// configuration, that a stalled prerequisite client is canceled, reaped,
+// and classified unavailable rather than hanging (ga-hz84hj regression).
+func TestRunBoundedProbe_ReapsStalledClient(t *testing.T) {
+	start := time.Now()
+	err := runBoundedProbe(t, 200*time.Millisecond, "sleep", "60")
+	if err == nil {
+		t.Fatal("stalled probe reported available (nil error)")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("stalled probe not canceled promptly: took %v", elapsed)
 	}
 }
