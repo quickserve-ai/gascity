@@ -16,6 +16,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/notify"
 	"github.com/gastownhall/gascity/internal/nudgepoller"
 	"github.com/gastownhall/gascity/internal/nudgequeue"
 	"github.com/gastownhall/gascity/internal/pidutil"
@@ -5222,5 +5223,13 @@ func TestNudgeSenderIdentityAbsentEnvLeavesBareSource(t *testing.T) {
 	out := formatNudgeInjectOutput([]queuedNudge{item})
 	if !strings.Contains(out, "- [session] hello") {
 		t.Fatalf("bare-source render regressed:\n%s", out)
+	}
+}
+
+func TestSendMailNotifyRefusesUnimplementedCloudWakeTransport(t *testing.T) {
+	target := nudgeTarget{agent: config.Agent{Name: "cloudy", WakeTransport: config.WakeTransportClaudeCloud}}
+	err := sendMailNotify(target, notify.Notification{Kind: notify.KindMailArrival, Sender: "x"})
+	if err == nil || !strings.Contains(err.Error(), "wake_transport") || !strings.Contains(err.Error(), "durably written") {
+		t.Fatalf("expected loud unimplemented-transport refusal, got: %v", err)
 	}
 }

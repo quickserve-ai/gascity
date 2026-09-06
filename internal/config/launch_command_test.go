@@ -315,3 +315,19 @@ func TestResolveProviderStampsSessionDisplayName(t *testing.T) {
 		t.Fatalf("SessionDisplayName = %q, want %q", resolved.SessionDisplayName, agent.QualifiedName())
 	}
 }
+
+func TestValidateAgentsWakeTransportEnum(t *testing.T) {
+	ok := []Agent{
+		{Name: "a"},
+		{Name: "b", WakeTransport: WakeTransportSession},
+		{Name: "c", WakeTransport: WakeTransportClaudeCloud},
+	}
+	if err := ValidateAgents(ok); err != nil {
+		t.Fatalf("valid wake_transport values rejected: %v", err)
+	}
+	bad := []Agent{{Name: "d", WakeTransport: "carrier-pigeon"}}
+	err := ValidateAgents(bad)
+	if err == nil || !strings.Contains(err.Error(), "wake_transport") {
+		t.Fatalf("invalid wake_transport accepted: %v", err)
+	}
+}

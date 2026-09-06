@@ -260,6 +260,19 @@ const (
 	SessionTransportTmux = "tmux"
 )
 
+// Wake-transport selectors for Agent.WakeTransport (notification plane,
+// claudemsg-bridge-design.md §4). Distinct namespace from the session
+// transports above: a wake transport delivers notifications, it does not
+// create sessions.
+const (
+	// WakeTransportSession is the default: today's worker.Handle
+	// wait-idle/queued nudge path, unchanged.
+	WakeTransportSession = "session"
+	// WakeTransportClaudeCloud delivers wake hints into a bound Claude Code
+	// cloud session via `claude -p --cloud` (ga-bjbaui).
+	WakeTransportClaudeCloud = "claude-cloud"
+)
+
 // IsValidSessionTransport reports whether transport is a recognized explicit
 // session transport. The empty string is valid and means provider default.
 func IsValidSessionTransport(transport string) bool {

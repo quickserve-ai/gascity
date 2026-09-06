@@ -1089,6 +1089,20 @@ func writeQueuedSessionNudgeResult(target nudgeTarget, mode nudgeDeliveryMode, j
 }
 
 func sendMailNotify(target nudgeTarget, n notify.Notification) error {
+	// Per-seat wake-transport selection (notification plane, ga-bjbaui).
+	// Structural: the value was validated at config load; this switch only
+	// routes. The durable record is already written when this fires, so a
+	// transport failure loses a wake hint, never the message.
+	switch strings.TrimSpace(target.agent.WakeTransport) {
+	case "", config.WakeTransportSession:
+		// default session transport below
+	case config.WakeTransportClaudeCloud:
+		// Stage 4 of the ga-bjbaui build; refusing loudly beats silently
+		// falling back to a transport the seat's config says cannot reach it.
+		return fmt.Errorf("seat %q selects wake_transport=%q, which is not implemented yet (ga-bjbaui stage 4); the mail bead is durably written and unaffected", target.agentKey(), config.WakeTransportClaudeCloud)
+	default:
+		return fmt.Errorf("seat %q has unknown wake_transport %q (config validation should have refused this)", target.agentKey(), target.agent.WakeTransport)
+	}
 	store := openNudgeBeadStore(target.cityPath)
 	if store.Store == nil {
 		return fmt.Errorf("opening city store for %q", target.agentKey())

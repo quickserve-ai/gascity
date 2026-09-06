@@ -52,6 +52,9 @@ type AgentPatch struct {
 	PromptTemplate *string `toml:"prompt_template,omitempty"`
 	// Session overrides the session transport ("acp" or "tmux").
 	Session *string `toml:"session,omitempty"`
+	// WakeTransport overrides the seat's notification-plane wake transport
+	// ("session" or "claude-cloud"; see Agent.WakeTransport).
+	WakeTransport *string `toml:"wake_transport,omitempty"`
 	// Provider overrides the provider name.
 	Provider *string `toml:"provider,omitempty"`
 	// Upstream overrides the model-serving endpoint selection (Phase C).
@@ -508,6 +511,9 @@ func applyAgentMutation(a *Agent, p *AgentPatch, sleepSource string) {
 	}
 	if p.PromptTemplate != nil {
 		a.PromptTemplate = *p.PromptTemplate
+	}
+	if p.WakeTransport != nil {
+		a.WakeTransport = *p.WakeTransport
 	}
 	if p.Session != nil {
 		a.Session = *p.Session
