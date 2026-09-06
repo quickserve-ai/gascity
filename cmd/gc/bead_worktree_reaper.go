@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -412,15 +413,51 @@ type reapCandidate struct {
 // Do not re-add a stash condition without scoping it to loss that is possible.
 func gitSafetyReason(worktreePath string) string {
 	wg := git.New(worktreePath)
-	hasUncommitted := wg.HasUncommittedWork()
+	status, statusErr := wg.StatusPorcelain()
 	hasUnpushed, unpushedErr := wg.HasUnpushedCommitsResult()
 	switch {
+	case statusErr != nil:
+		return "status probe failed (failing closed): " + statusErr.Error()
 	case unpushedErr != nil:
 		return "unpushed commit probe failed (failing closed): " + unpushedErr.Error()
-	case hasUncommitted || hasUnpushed:
-		return fmt.Sprintf("unsafe git state: uncommitted=%v unpushed=%v", hasUncommitted, hasUnpushed)
+	}
+	authored := nonSedimentStatusLines(status)
+	switch {
+	case len(authored) > 0 || hasUnpushed:
+		return fmt.Sprintf("unsafe git state: uncommitted=%v unpushed=%v", len(authored) > 0, hasUnpushed)
 	}
 	return ""
+}
+
+// provisioningSedimentStatus matches `git status --porcelain` lines that gc's
+// own worktree provisioning produces on EVERY per-bead worktree — untracked
+// .claude/ and .omp/ materializations (skills, hooks), ANY status under
+// .beads/ (that tree is wholly harness-owned provisioning state: staged and
+// unstaged deletions and untracked additions all appear during
+// normalization), and the reaper's own .worktree-stale marker. Before this
+// sediment made every provisioned worktree read uncommitted=true forever, so
+// the closed-bead reaper never fired and 27 fully-pushed clean trees
+// accumulated 90G before a manual sweep (ga-pi0rzc / ga-mkbux, 2026-09-05).
+// Scope deliberately: only harness-owned dotpaths — an authored change
+// anywhere else, including a staged or modified tracked file under any other
+// path, still vetoes.
+var provisioningSedimentStatus = regexp.MustCompile(
+	`^(\?\? \.claude/|\?\? \.omp/|.. \.beads/|\?\? \.worktree-stale$|\?\? AGENTS-gc\.md$)`)
+
+// nonSedimentStatusLines returns the porcelain status lines that represent
+// authored work — everything except gc's own provisioning sediment.
+func nonSedimentStatusLines(porcelain string) []string {
+	var authored []string
+	for _, line := range strings.Split(porcelain, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		if provisioningSedimentStatus.MatchString(line) {
+			continue
+		}
+		authored = append(authored, line)
+	}
+	return authored
 }
 
 // computeWorktreeAge returns how long ago worktreePath was created, using the
