@@ -1160,6 +1160,7 @@ func TestAgentConfigFromAgentCoversPersistedFields(t *testing.T) {
 		DependsOn:              []string{"other-agent"},
 		ResumeCommand:          "claude --resume {{.SessionKey}} --dangerously",
 		WakeMode:               "fresh",
+		WakeTransport:          "claude-cloud",
 		MouseMode:              "on",
 	}
 
