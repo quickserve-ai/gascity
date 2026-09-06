@@ -301,11 +301,33 @@ func queueChangedResolvedProviderSessionMetadata(existing map[string]string, que
 	if name != "" && existing["provider"] != name {
 		queue("provider", name)
 	}
+	// When the resolved provider IS its own family root (a builtin, or an
+	// alias shadowing its builtin's name — [providers.omp] base="builtin:omp"
+	// resolves to name == ancestor == "omp"), the != name convention stores
+	// no kind/ancestor. That convention must not preserve a STALE lineage: a
+	// seat re-pointed from claude to omp updated only "provider" and kept
+	// provider_kind/builtin_ancestor "claude" forever, so every consumer of
+	// the ancestry ladder — GC_PROVIDER stamping, session-log routing, the
+	// context meter — kept reading the dead harness (ga-vat7sn defect 1,
+	// measured on a live seat 2026-09-05). When resolution succeeded and the
+	// stored value belongs to a DIFFERENT family than the resolved lineage,
+	// correct it to the true (self-rooted) value.
+	ancestor := strings.TrimSpace(resolved.BuiltinAncestor)
 	if family := resolvedProviderFamilyMetadata(resolved); family != "" && existing["provider_kind"] != family {
 		queue("provider_kind", family)
+	} else if family == "" && ancestor != "" {
+		if stored := strings.TrimSpace(existing["provider_kind"]); stored != "" &&
+			session.ProviderFamilyOf(stored) != session.ProviderFamilyOf(ancestor) {
+			queue("provider_kind", ancestor)
+		}
 	}
-	if ancestor := strings.TrimSpace(resolved.BuiltinAncestor); ancestor != "" && ancestor != name && existing["builtin_ancestor"] != ancestor {
+	if ancestor != "" && ancestor != name && existing["builtin_ancestor"] != ancestor {
 		queue("builtin_ancestor", ancestor)
+	} else if ancestor != "" {
+		if stored := strings.TrimSpace(existing["builtin_ancestor"]); stored != "" && stored != ancestor &&
+			session.ProviderFamilyOf(stored) != session.ProviderFamilyOf(ancestor) {
+			queue("builtin_ancestor", ancestor)
+		}
 	}
 }
 
@@ -735,12 +757,15 @@ func retireDuplicateConfiguredNamedSessionBeads(
 			if setMetaBatch(sessionFrontDoor(store), b.ID, batch, stderr) != nil {
 				continue
 			}
-			status := "open"
-			if err := store.Update(b.ID, beads.UpdateOpts{Status: &status}); err != nil {
+			// S19 Stage 3 shadow: record the canonical-identity clears exactly as
+			// the duplicate repair above does, so a converge-shadow soak attributes
+			// this retirement instead of classifying it as a foreign write.
+			recordLegacyCompareWrites(b.ID, "retireDuplicateConfiguredNamedSessionBeads.shadow", batch)
+			if err := sessionFrontDoor(store).SetStatusOpen(b.ID); err != nil {
 				fmt.Fprintf(stderr, "session beads: archiving shadow of named session %s: %v\n", spec.Identity, err) //nolint:errcheck
 				continue
 			}
-			reassignWorkAssignedToRetiredSessionBead(store, rigStores, b, canonical.ID, stderr)
+			reassignWorkAssignedToRetiredSessionBead(cityPath, cfg, store, rigStores, b, canonical.ID, stderr)
 			reassignStateAssignedToRetiredSessionBead(store, b.ID, canonical.ID, now, stderr)
 			if b.Metadata == nil {
 				b.Metadata = make(map[string]string, len(batch))
@@ -748,7 +773,7 @@ func retireDuplicateConfiguredNamedSessionBeads(
 			for k, v := range batch {
 				b.Metadata[k] = v
 			}
-			b.Status = status
+			b.Status = "open"
 			openBeads[idx] = b
 			if oldSessionName != "" {
 				delete(bySessionName, oldSessionName)
@@ -1197,6 +1222,31 @@ func unclaimWorkAssignedToRetiredSessionBead(
 		wa := workAssignmentForStore(beads.WorkStore{Store: ownerStore})
 		for _, status := range []string{"open", "in_progress"} {
 			for _, assignee := range identifiers {
+				// ga-sdynmb: A RESTART IS NOT A RETIREMENT. When the closing
+				// session's assignee names a [[named_session]] that is STILL in
+				// the city config, that identity outlives this session bead: the
+				// supervisor respawns the same agent under the same identity and
+				// its own hook re-finds the work. Detaching here left 91 crew
+				// beads open+unassigned+unrouted across three session rolls on
+				// 2026-08-17/18 -- invisible to the pool demand probe (keys on
+				// gc.routed_to), skipped by releaseOrphanedPoolAssignments (skips
+				// empty-routed beads), and deliberately not recovered by the
+				// witness (orphan recovery is scoped to POOL/EPHEMERAL identities,
+				// so crew work is never dumped into the polecat pool). Nothing
+				// picked them up, and the clear emitted no ledger event, so the
+				// loss was silent in both directions.
+				//
+				// isConfiguredNamedSessionIdentity is structural (cfg only, no
+				// store lookup), so it holds exactly when the identity survives
+				// the close, and it already excludes a SUSPENDED named agent --
+				// whose work must still be released, since the named-session tier
+				// will not claim for a suspended agent. Ephemeral identifiers (the
+				// session bead ID, the "rig--agent" session_name form) do not match
+				// a configured identity and are still released, so work bound to a
+				// dying identifier is never stranded on it.
+				if isConfiguredNamedSessionIdentity(cfg, assignee) {
+					continue
+				}
 				work, err := wa.OpenAssignedTo(assignee, status, beads.TierBoth, true)
 				if err != nil {
 					fmt.Fprintf(stderr, "session beads: listing work assigned to retired session %s via %q: %v\n", sessionBead.ID, assignee, err) //nolint:errcheck
