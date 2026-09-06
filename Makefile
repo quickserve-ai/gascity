@@ -378,6 +378,8 @@ LINT_GOMEMLIMIT ?= 6GiB
 LINT_ENV = GOFLAGS="$(QUALITY_GATE_GOFLAGS)" GOMEMLIMIT=$(LINT_GOMEMLIMIT)
 QUALITY_GATE_GOFLAGS = $$(go env GOFLAGS | sed -E 's/(^|[[:space:]])-mod=[^[:space:]]+//g') -mod=readonly
 CI_STATIC_SELECT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))scripts/ci-static-select
+# CI_STATIC_GO is the go binary make check-lean-local runs (vet, build, test).
+CI_STATIC_GO ?= go
 
 # Lint and vet run as nogo (//tools/nogo): go vet's analyzers plus the
 # linters .golangci.yml enables, validated beside every Go compile, so
@@ -449,6 +451,18 @@ lint-golangci: $(GOLANGCI_LINT)
 ## vet-go: plain `go vet` outside Bazel, for hosts nogo does not cover (macOS jobs)
 vet-go:
 	GOFLAGS="$(QUALITY_GATE_GOFLAGS)" go vet ./...
+
+## check-lean-local: vet/build all packages, then fast tests for affected packages
+## Set LINT_CHANGED_REF to the fetched integration base; defaults to HEAD for
+## local edits. Reuses the ICU CPPFLAGS (C AND C++) and isolated test environment.
+## Selection errors stop instead of silently running a full suite on the host.
+## This is local feedback, never a replacement for required server-side CI.
+.PHONY: check-lean-local
+check-lean-local:
+	$(TEST_ENV) GC_FAST_UNIT=1 GOMAXPROCS=2 \
+		CGO_CFLAGS="$${CGO_CFLAGS-}" CGO_CXXFLAGS="$${CGO_CXXFLAGS-}" \
+		LINT_CHANGED_REF="$(LINT_CHANGED_REF)" LINT_CHANGED_SCOPE="$(LINT_CHANGED_SCOPE)" \
+		"$(CI_STATIC_SELECT)" check-lean-local "$(CI_STATIC_GO)"
 
 ## fmt-check: fail if formatting would change files
 fmt-check: $(GOLANGCI_LINT)
