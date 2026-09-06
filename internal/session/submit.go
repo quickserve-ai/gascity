@@ -323,6 +323,16 @@ func providerKind(b beads.Bead) string {
 	return ProviderFamilyFromMetadata(b.Metadata, "")
 }
 
+// ProviderFamilyOf normalizes one raw provider string to its canonical
+// family, without a precedence ladder. It exists so cmd/gc callers that hold
+// bare provider strings (not a bead or Info) can compare families through
+// the session layer instead of importing internal/sessionlog directly —
+// which the worker-boundary guard (TestGCNonTestFilesStayOnWorkerBoundary)
+// forbids.
+func ProviderFamilyOf(provider string) string {
+	return sessionlog.ProviderFamily(provider)
+}
+
 // ProviderFamilyFromInfo is the session.Info sibling of ProviderFamilyFromMetadata:
 // it walks the same builtin_ancestor → provider_kind → provider precedence ladder,
 // reading the raw mirrors Info carries (BuiltinAncestor, ProviderKind, Provider)

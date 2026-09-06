@@ -18,7 +18,6 @@ import (
 	"github.com/gastownhall/gascity/internal/extmsg"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
-	"github.com/gastownhall/gascity/internal/sessionlog"
 )
 
 // sessionBeadLabel is the label for all session beads.
@@ -259,7 +258,7 @@ func queueChangedResolvedProviderSessionMetadata(existing map[string]string, que
 		queue("provider_kind", family)
 	} else if family == "" && ancestor != "" {
 		if stored := strings.TrimSpace(existing["provider_kind"]); stored != "" &&
-			sessionlog.ProviderFamily(stored) != sessionlog.ProviderFamily(ancestor) {
+			session.ProviderFamilyOf(stored) != session.ProviderFamilyOf(ancestor) {
 			queue("provider_kind", ancestor)
 		}
 	}
@@ -267,7 +266,7 @@ func queueChangedResolvedProviderSessionMetadata(existing map[string]string, que
 		queue("builtin_ancestor", ancestor)
 	} else if ancestor != "" {
 		if stored := strings.TrimSpace(existing["builtin_ancestor"]); stored != "" && stored != ancestor &&
-			sessionlog.ProviderFamily(stored) != sessionlog.ProviderFamily(ancestor) {
+			session.ProviderFamilyOf(stored) != session.ProviderFamilyOf(ancestor) {
 			queue("builtin_ancestor", ancestor)
 		}
 	}

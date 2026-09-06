@@ -855,6 +855,7 @@ func TestDeepCopyAgentCoversAllFields(t *testing.T) {
 		ResumeCommand:                "claude --resume {{.SessionKey}} --dangerously",
 		DependsOn:                    []string{"other-agent"},
 		WakeMode:                     "fresh",
+		WakeTransport:                "claude-cloud",
 		MouseMode:                    "on",
 		TmuxAlias:                    "worker--{{.CityName}}",
 		Implicit:                     true,
