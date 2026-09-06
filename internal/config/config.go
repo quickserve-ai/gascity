@@ -716,6 +716,9 @@ type AgentOverride struct {
 	PromptTemplate *string `toml:"prompt_template,omitempty"`
 	// Session overrides the session transport ("acp").
 	Session *string `toml:"session,omitempty"`
+	// WakeTransport overrides the seat's notification-plane wake transport
+	// ("session" or "claude-cloud"; see Agent.WakeTransport).
+	WakeTransport *string `toml:"wake_transport,omitempty"`
 	// Provider overrides the provider name.
 	Provider *string `toml:"provider,omitempty"`
 	// ContextAdvisory overrides context-pressure guidance for this agent.
@@ -3290,6 +3293,15 @@ type Agent struct {
 	// "acp" uses the Agent Client Protocol (JSON-RPC over stdio).
 	// The agent's resolved provider must have supports_acp = true.
 	Session string `toml:"session,omitempty" jsonschema:"enum=acp"`
+	// WakeTransport selects this seat's notification-plane wake transport
+	// (claudemsg-bridge-design.md §4). "" and "session" mean today's
+	// worker.Handle wait-idle/queued path, byte-for-byte. "claude-cloud"
+	// (ga-bjbaui) delivers wake hints into a bound Claude Code cloud
+	// session. Selection is structural per-seat configuration validated at
+	// load — never a runtime capability probe; a seat whose harness lacks
+	// the selected transport is a config error, not a silent fallback.
+	// (Distinct from WakeMode, which controls resume-vs-fresh on wake.)
+	WakeTransport string `toml:"wake_transport,omitempty" jsonschema:"enum=session,enum=claude-cloud"`
 	// Provider names the provider preset to use for this agent.
 	Provider string `toml:"provider,omitempty"`
 	// ContextAdvisory overrides context-pressure guidance for this agent.
@@ -4172,6 +4184,13 @@ func ValidateAgents(agents []Agent) error {
 			// valid
 		default:
 			return fmt.Errorf("agent %q: wake_mode must be \"resume\", \"fresh\", or empty, got %q", a.QualifiedName(), a.WakeMode)
+		}
+		// WakeTransport enum (notification plane, ga-bjbaui).
+		switch a.WakeTransport {
+		case "", WakeTransportSession, WakeTransportClaudeCloud:
+			// valid
+		default:
+			return fmt.Errorf("agent %q: wake_transport must be %q, %q, or empty, got %q", a.QualifiedName(), WakeTransportSession, WakeTransportClaudeCloud, a.WakeTransport)
 		}
 		// MouseMode enum.
 		switch a.MouseMode {
