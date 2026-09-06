@@ -852,6 +852,50 @@ func TestDefaultScaleCheckCountsSeesExternalRoutedWorkAfterCachePrime(t *testing
 	}
 }
 
+// A hold:*-labeled bead is parked under the wait-class contract — owned and
+// waiting, not dispatchable demand. Counting it spawns pool sessions for work
+// that cannot progress (ga-uica16: two sessions consumed on a hold:cert-wait
+// park). The prefix match keeps the guard valid for classes added later.
+func TestDefaultScaleCheckDemandExcludesHoldParkedBeads(t *testing.T) {
+	const template = "gascity/workflows.codex-min"
+	store := beads.NewMemStore()
+	parked, err := store.Create(beads.Bead{
+		Title:    "parked in cert-wait",
+		Type:     "task",
+		Status:   "open",
+		Labels:   []string{"hold:cert-wait"},
+		Metadata: map[string]string{"gc.routed_to": template},
+	})
+	if err != nil {
+		t.Fatalf("create parked bead: %v", err)
+	}
+	live, err := store.Create(beads.Bead{
+		Title:    "dispatchable work",
+		Type:     "task",
+		Status:   "open",
+		Metadata: map[string]string{"gc.routed_to": template},
+	})
+	if err != nil {
+		t.Fatalf("create live bead: %v", err)
+	}
+
+	counts, demand, _, errs := defaultScaleCheckCountsAndDemand(nil, []defaultScaleCheckTarget{{
+		template: template,
+		storeKey: "rig:gascity",
+		store:    store,
+	}})
+	if len(errs) != 0 {
+		t.Fatalf("defaultScaleCheckCountsAndDemand errs = %v", errs)
+	}
+	if got := counts[template]; got != 1 {
+		t.Fatalf("counts[%q] = %d, want 1 (hold:* park must not count as demand)", template, got)
+	}
+	ids := demand[template].WorkBeadIDs
+	if len(ids) != 1 || ids[0] != live.ID {
+		t.Fatalf("demand WorkBeadIDs = %v, want exactly [%s]; parked %s must be excluded", ids, live.ID, parked.ID)
+	}
+}
+
 func TestDefaultScaleCheckDemandCarriesTriggerBeadID(t *testing.T) {
 	const template = "gascity/workflows.codex-min"
 	store := beads.NewMemStore()

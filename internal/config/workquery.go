@@ -38,6 +38,22 @@ func jqMeta(key string) string {
 	return `(.metadata["` + key + `"] // "")`
 }
 
+// holdParkExcludeSelectJQ is the jq select that drops beads carrying any
+// hold:* label. Under the wait-class contract (bridge-wait-classes.md) a
+// hold:<class> label is the machine-readable "owned-and-waiting" signal: the
+// bead is parked with a watcher, so it is neither stranded nor dispatchable.
+// Routing one anyway burns pool sessions on work that cannot progress
+// (ga-uica16: two sessions consumed on a hold:cert-wait park before a seat
+// recognized the state). The match is a PREFIX, not an enumerated label list —
+// the class set is open by design, and an enumeration would silently miss the
+// next class added to the contract.
+const holdParkExcludeSelectJQ = `select(([.labels[]? | select(startswith("hold:"))] | length) == 0)`
+
+// holdParkFilterJQ wraps the exclusion select as a whole-array filter.
+func holdParkFilterJQ() string {
+	return `[.[] | ` + holdParkExcludeSelectJQ + `]`
+}
+
 func bdReadyPoolDemandShell(limitFlag string, includeEphemeralReady bool) string {
 	return `bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --metadata-field "` + beadmeta.RoutedToMetadataKey + `=$target" --unassigned --exclude-type=epic --json ` + limitFlag
 }
@@ -55,7 +71,7 @@ func bdReadyPoolDemandMigrationShell(limitFlag string, includeEphemeralReady boo
 }
 
 func poolDemandMigrationFilterJQ(limit int) string {
-	filter := `[.[] | select(` + jqMeta(beadmeta.RoutedToMetadataKey) + ` == "")]`
+	filter := `[.[] | select(` + jqMeta(beadmeta.RoutedToMetadataKey) + ` == "") | ` + holdParkExcludeSelectJQ + `]`
 	if limit > 0 {
 		filter += ` | .[:` + strconv.Itoa(limit) + `]`
 	}
@@ -89,7 +105,8 @@ func legacyEphemeralPoolDemandShell(limit int, includeEphemeralReady, quiet bool
 	}
 	filter := legacyEphemeralReadyFilterJQ(
 		`select((.assignee // "") == "")`+
-			` | select((`+jqMeta(beadmeta.RoutedToMetadataKey)+` == $target) or ((`+jqMeta(beadmeta.RoutedToMetadataKey)+` == "") and (`+jqMeta(beadmeta.RunTargetMetadataKey)+` == $target) and (`+jqMeta(beadmeta.KindMetadataKey)+` == "`+beadmeta.KindWorkflow+`")))`,
+			` | select((`+jqMeta(beadmeta.RoutedToMetadataKey)+` == $target) or ((`+jqMeta(beadmeta.RoutedToMetadataKey)+` == "") and (`+jqMeta(beadmeta.RunTargetMetadataKey)+` == $target) and (`+jqMeta(beadmeta.KindMetadataKey)+` == "`+beadmeta.KindWorkflow+`")))`+
+			` | `+holdParkExcludeSelectJQ,
 		limit,
 	)
 	query := bdQueryEphemeralStatusShell("open")
@@ -130,7 +147,11 @@ func routedReadyTierCommand(includeEphemeralReady bool) string {
 	// self-blocked head (is_blocked / status==blocked) has Ready routed work
 	// behind it to fall through to instead of idle-exiting; the hook layer
 	// (filterUnreadyHookCandidates) strips the blocked head from the result.
-	return bdReadyPoolDemandShell("--sort oldest --limit=20", includeEphemeralReady) + ` 2>/dev/null`
+	// hold:*-parked beads are stripped after the window (see
+	// holdParkExcludeSelectJQ); the count-form applies the same exclusion in
+	// its aggregation jq so claim and spawn decisions stay symmetric.
+	return bdReadyPoolDemandShell("--sort oldest --limit=20", includeEphemeralReady) +
+		` 2>/dev/null | jq -c ` + shellquote.Quote(holdParkFilterJQ()) + ` 2>/dev/null`
 }
 
 // poolDemandCountShell emits the reconciler count-form for target: it counts
@@ -150,7 +171,8 @@ func poolDemandCountShell(target string, includeEphemeralReady bool) string {
 		`legacy_candidates=$(` + bdReadyPoolDemandMigrationShell("--limit 0", includeEphemeralReady) + `) || exit $?; ` +
 		`legacy_json=$(printf "%s" "$legacy_candidates" | ` + poolDemandMigrationFilterJQ(0) + `) || exit $?; ` +
 		`legacy_ephemeral_json=$(` + legacyEphemeralPoolDemandShell(0, includeEphemeralReady, false) + `); ` +
-		`printf "%s\n%s\n%s\n" "$ready_json" "$legacy_json" "$legacy_ephemeral_json" | jq -s "(add // []) | unique_by(.id) | length"`
+		`printf "%s\n%s\n%s\n" "$ready_json" "$legacy_json" "$legacy_ephemeral_json" | jq -s ` +
+		shellquote.Quote(`(add // []) | unique_by(.id) | `+holdParkFilterJQ()+` | length`)
 	return shellquote.Join([]string{"sh", "-c", script, "--", target})
 }
 
