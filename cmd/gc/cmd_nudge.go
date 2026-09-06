@@ -373,21 +373,21 @@ func cmdNudgeStatus(args []string, jsonOutput bool, stdout, stderr io.Writer) in
 		fmt.Fprintln(stdout, "") //nolint:errcheck
 		for _, item := range pending {
 			_, _ = fmt.Fprintf(stdout, "pending  %s  due=%s  source=%s  %s\n",
-				item.ID, formatDueTime(item.DeliverAfter), item.Source, item.Message)
+				item.ID, formatDueTime(item.DeliverAfter), nudgeSourceLabel(item.Source, item.Sender), item.Message)
 		}
 	}
 	if len(inFlight) > 0 {
 		fmt.Fprintln(stdout, "") //nolint:errcheck
 		for _, item := range inFlight {
 			_, _ = fmt.Fprintf(stdout, "in-flight  %s  lease=%s  source=%s  %s\n",
-				item.ID, formatDueTime(item.LeaseUntil), item.Source, item.Message)
+				item.ID, formatDueTime(item.LeaseUntil), nudgeSourceLabel(item.Source, item.Sender), item.Message)
 		}
 	}
 	if len(dead) > 0 {
 		fmt.Fprintln(stdout, "") //nolint:errcheck
 		for _, item := range dead {
 			_, _ = fmt.Fprintf(stdout, "dead     %s  reason=%s  source=%s  %s\n",
-				item.ID, deadReason(item), item.Source, item.Message)
+				item.ID, deadReason(item), nudgeSourceLabel(item.Source, item.Sender), item.Message)
 		}
 	}
 	return 0
@@ -807,10 +807,11 @@ func deliverSessionNudgeWithWorker(target nudgeTarget, store beads.Store, sp run
 		fmt.Fprintf(stderr, "gc session nudge: %v\n", err) //nolint:errcheck
 		return 1
 	}
+	directSender, _ := nudgeSenderIdentity()
 	result, err := handle.Nudge(context.Background(), worker.NudgeRequest{
 		Text:     message,
 		Delivery: delivery,
-		Source:   "session",
+		Source:   nudgeSourceLabel("session", directSender),
 	})
 	if err != nil {
 		if errors.Is(err, runtime.ErrSessionNotFound) && target.sessionTransport() == "acp" {
@@ -1652,7 +1653,7 @@ func formatNudgeInjectOutput(items []queuedNudge) string {
 		// the <system-reminder> block — without this, a sender can inject
 		// </system-reminder> sequences and break out of the reminder.
 		// See gastownhall/gascity#2195.
-		source := extmsg.SanitizeForSystemReminder(item.Source)
+		source := extmsg.SanitizeForSystemReminder(nudgeSourceLabel(item.Source, item.Sender))
 		message := extmsg.SanitizeForSystemReminder(item.Message)
 		fmt.Fprintf(&sb, "- [%s] %s\n", source, message)
 	}
@@ -1665,7 +1666,7 @@ func formatNudgeRuntimeMessage(items []queuedNudge) string {
 	var sb strings.Builder
 	sb.WriteString("Deferred reminders:\n")
 	for _, item := range items {
-		fmt.Fprintf(&sb, "- [%s] %s\n", item.Source, item.Message)
+		fmt.Fprintf(&sb, "- [%s] %s\n", nudgeSourceLabel(item.Source, item.Sender), item.Message)
 	}
 	sb.WriteString("\nThese were queued until the session went idle.\n")
 	return sb.String()
@@ -1700,17 +1701,46 @@ func newQueuedNudge(agentName, message string, now time.Time) queuedNudge {
 	return newQueuedNudgeWithOptions(agentName, message, "session", now, queuedNudgeOptions{})
 }
 
+// nudgeSenderIdentity reads the enqueuing process's self-reported identity
+// from its environment: GC_AGENT / GC_ALIAS for agent sessions, BEADS_ACTOR /
+// BD_ACTOR for order execs (the controller stamps BEADS_ACTOR=order:<name>).
+// This is honest-reporting provenance for tracing who paged whom — it is NOT
+// authenticated and must never be treated as authority (ga-txbsqo; the
+// 2026-09-06 cert-patrol page took a multi-session hunt to attribute because
+// queued nudges recorded no sender).
+func nudgeSenderIdentity() (sender, senderSession string) {
+	for _, key := range []string{"GC_AGENT", "GC_ALIAS", "BEADS_ACTOR", "BD_ACTOR"} {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			sender = v
+			break
+		}
+	}
+	return sender, strings.TrimSpace(os.Getenv("GC_SESSION_ID"))
+}
+
+// nudgeSourceLabel renders an item's source with its self-reported sender
+// ("session from woodhouse"); falls back to the bare source.
+func nudgeSourceLabel(source, sender string) string {
+	if sender == "" {
+		return source
+	}
+	return source + " from " + sender
+}
+
 func newQueuedNudgeWithOptions(agentName, message, source string, now time.Time, opts queuedNudgeOptions) queuedNudge {
 	id := opts.ID
 	if id == "" {
 		id = newQueuedNudgeID()
 	}
+	sender, senderSession := nudgeSenderIdentity()
 	return queuedNudge{
 		ID:                id,
 		Agent:             agentName,
 		SessionID:         opts.SessionID,
 		ContinuationEpoch: opts.ContinuationEpoch,
 		Source:            source,
+		Sender:            sender,
+		SenderSession:     senderSession,
 		Message:           message,
 		Reference:         opts.Reference,
 		CreatedAt:         now.UTC(),

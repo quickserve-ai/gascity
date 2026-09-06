@@ -5179,3 +5179,48 @@ func TestResolveNudgePollInterval(t *testing.T) {
 		}
 	})
 }
+
+func TestNudgeSenderIdentityPrecedenceAndStamp(t *testing.T) {
+	t.Setenv("GC_AGENT", "woodhouse")
+	t.Setenv("GC_ALIAS", "wh-alias")
+	t.Setenv("BEADS_ACTOR", "order:cert-landing-patrol")
+	t.Setenv("BD_ACTOR", "bd-actor")
+	t.Setenv("GC_SESSION_ID", "ga-sess42")
+
+	sender, senderSession := nudgeSenderIdentity()
+	if sender != "woodhouse" || senderSession != "ga-sess42" {
+		t.Fatalf("nudgeSenderIdentity = (%q,%q), want (woodhouse, ga-sess42)", sender, senderSession)
+	}
+
+	// Order-exec shape: no agent env, controller-stamped BEADS_ACTOR wins.
+	t.Setenv("GC_AGENT", "")
+	t.Setenv("GC_ALIAS", "")
+	sender, _ = nudgeSenderIdentity()
+	if sender != "order:cert-landing-patrol" {
+		t.Fatalf("order-exec sender = %q, want order:cert-landing-patrol", sender)
+	}
+
+	item := newQueuedNudgeWithOptions("gastown.mayor", "qc-4g802.1", "session", time.Now(), queuedNudgeOptions{})
+	if item.Sender != "order:cert-landing-patrol" || item.SenderSession != "ga-sess42" {
+		t.Fatalf("stamped item sender = (%q,%q), want (order:cert-landing-patrol, ga-sess42)", item.Sender, item.SenderSession)
+	}
+
+	out := formatNudgeInjectOutput([]queuedNudge{item})
+	if !strings.Contains(out, "[session from order:cert-landing-patrol] qc-4g802.1") {
+		t.Fatalf("inject output missing sender provenance:\n%s", out)
+	}
+}
+
+func TestNudgeSenderIdentityAbsentEnvLeavesBareSource(t *testing.T) {
+	for _, k := range []string{"GC_AGENT", "GC_ALIAS", "BEADS_ACTOR", "BD_ACTOR", "GC_SESSION_ID"} {
+		t.Setenv(k, "")
+	}
+	item := newQueuedNudgeWithOptions("gastown.mayor", "hello", "session", time.Now(), queuedNudgeOptions{})
+	if item.Sender != "" || item.SenderSession != "" {
+		t.Fatalf("expected empty sender fields, got (%q,%q)", item.Sender, item.SenderSession)
+	}
+	out := formatNudgeInjectOutput([]queuedNudge{item})
+	if !strings.Contains(out, "- [session] hello") {
+		t.Fatalf("bare-source render regressed:\n%s", out)
+	}
+}

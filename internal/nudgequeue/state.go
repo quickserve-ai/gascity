@@ -29,23 +29,30 @@ type Reference struct {
 
 // Item is a persisted deferred nudge.
 type Item struct {
-	ID                string     `json:"id"`
-	BeadID            string     `json:"bead_id,omitempty"`
-	Agent             string     `json:"agent"`
-	SessionID         string     `json:"session_id,omitempty"`
-	ContinuationEpoch string     `json:"continuation_epoch,omitempty"`
-	Source            string     `json:"source"`
-	Message           string     `json:"message"`
-	Reference         *Reference `json:"reference,omitempty"`
-	CreatedAt         time.Time  `json:"created_at"`
-	DeliverAfter      time.Time  `json:"deliver_after"`
-	ExpiresAt         time.Time  `json:"expires_at"`
-	Attempts          int        `json:"attempts,omitempty"`
-	LastAttemptAt     time.Time  `json:"last_attempt_at,omitempty"`
-	LastError         string     `json:"last_error,omitempty"`
-	ClaimedAt         time.Time  `json:"claimed_at,omitempty"`
-	LeaseUntil        time.Time  `json:"lease_until,omitempty"`
-	DeadAt            time.Time  `json:"dead_at,omitempty"`
+	ID                string `json:"id"`
+	BeadID            string `json:"bead_id,omitempty"`
+	Agent             string `json:"agent"`
+	SessionID         string `json:"session_id,omitempty"`
+	ContinuationEpoch string `json:"continuation_epoch,omitempty"`
+	Source            string `json:"source"`
+	// Sender is the self-reported identity of the enqueuing process
+	// (GC_AGENT / GC_ALIAS / BEADS_ACTOR / BD_ACTOR at enqueue time). It is
+	// honest-reporting provenance, not authenticated: treat it as a trace
+	// aid, never as authority (ga-txbsqo).
+	Sender        string `json:"sender,omitempty"`
+	SenderSession string `json:"sender_session,omitempty"`
+
+	Message       string     `json:"message"`
+	Reference     *Reference `json:"reference,omitempty"`
+	CreatedAt     time.Time  `json:"created_at"`
+	DeliverAfter  time.Time  `json:"deliver_after"`
+	ExpiresAt     time.Time  `json:"expires_at"`
+	Attempts      int        `json:"attempts,omitempty"`
+	LastAttemptAt time.Time  `json:"last_attempt_at,omitempty"`
+	LastError     string     `json:"last_error,omitempty"`
+	ClaimedAt     time.Time  `json:"claimed_at,omitempty"`
+	LeaseUntil    time.Time  `json:"lease_until,omitempty"`
+	DeadAt        time.Time  `json:"dead_at,omitempty"`
 }
 
 // State is the persisted nudge queue snapshot.
