@@ -733,6 +733,36 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 		InstructionsFile: "AGENTS.md",
 		ResumeFlag:       "--resume",
 		ResumeStyle:      "flag",
+		// Per-seat model pinning (ga-dfnyv5): effort rides inside omp's
+		// --model string as a :<effort> suffix (verified live on omp 18.1.10,
+		// 2026-09-04/05). "Default" (empty) leaves the seat on omp's own
+		// configured default. omp also exposes a separate --thinking flag,
+		// surfaced as its own option so a pin need not hardcode effort.
+		OptionsSchema: []BuiltinProviderOption{
+			{
+				Key:   "model",
+				Label: "Model",
+				Type:  "select",
+				Choices: []BuiltinOptionChoice{
+					{Value: "", Label: "Default (omp config)"},
+					{Value: "astra-high", Label: "GPT-6 Astra (high)", FlagArgs: []string{"--model", "openai-codex/gpt-6-astra:high"}},
+					{Value: "astra-medium", Label: "GPT-6 Astra (medium)", FlagArgs: []string{"--model", "openai-codex/gpt-6-astra:medium"}},
+					{Value: "sol-high", Label: "GPT-5.6 Sol (high)", FlagArgs: []string{"--model", "openai-codex/gpt-5.6-sol:high"}},
+					{Value: "sol-medium", Label: "GPT-5.6 Sol (medium)", FlagArgs: []string{"--model", "openai-codex/gpt-5.6-sol:medium"}},
+				},
+			},
+			{
+				Key:   "thinking",
+				Label: "Thinking Level",
+				Type:  "select",
+				Choices: []BuiltinOptionChoice{
+					{Value: "", Label: "Default"},
+					{Value: "high", Label: "High", FlagArgs: []string{"--thinking", "high"}},
+					{Value: "medium", Label: "Medium", FlagArgs: []string{"--thinking", "medium"}},
+					{Value: "low", Label: "Low", FlagArgs: []string{"--thinking", "low"}},
+				},
+			},
+		},
 	},
 	"antigravity": {
 		DisplayName: "Antigravity",

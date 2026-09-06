@@ -199,3 +199,71 @@ func TestBuiltinCodexModelChoicesIncludeGPT56Variants(t *testing.T) {
 		}
 	}
 }
+
+func TestBuiltinOMPModelChoicesPinModelWithEffortSuffix(t *testing.T) {
+	omp, ok := BuiltinProviders()["omp"]
+	if !ok {
+		t.Fatal("BuiltinProviders() missing omp")
+	}
+
+	var modelOption BuiltinProviderOption
+	for _, option := range omp.OptionsSchema {
+		if option.Key == "model" {
+			modelOption = option
+			break
+		}
+	}
+	if modelOption.Key == "" {
+		t.Fatal("omp provider missing model option")
+	}
+
+	byValue := make(map[string]BuiltinOptionChoice, len(modelOption.Choices))
+	for _, choice := range modelOption.Choices {
+		byValue[choice.Value] = choice
+	}
+
+	def, ok := byValue[""]
+	if !ok {
+		t.Fatal("omp model choices missing the empty Default choice")
+	}
+	if len(def.FlagArgs) != 0 {
+		t.Fatalf("omp Default model choice FlagArgs = %v, want none (omp's own config decides)", def.FlagArgs)
+	}
+
+	// Effort rides inside omp's --model string as a :<effort> suffix
+	// (verified live on omp 18.1.10, 2026-09-04).
+	wantModels := map[string]string{
+		"astra-high":   "openai-codex/gpt-6-astra:high",
+		"astra-medium": "openai-codex/gpt-6-astra:medium",
+		"sol-high":     "openai-codex/gpt-5.6-sol:high",
+		"sol-medium":   "openai-codex/gpt-5.6-sol:medium",
+	}
+	for value, wantModel := range wantModels {
+		choice, ok := byValue[value]
+		if !ok {
+			t.Fatalf("omp model choices missing %q", value)
+		}
+		if len(choice.FlagArgs) != 2 || choice.FlagArgs[0] != "--model" || choice.FlagArgs[1] != wantModel {
+			t.Errorf("%s FlagArgs = %v, want [--model %s]", value, choice.FlagArgs, wantModel)
+		}
+	}
+
+	var thinkingOption BuiltinProviderOption
+	for _, option := range omp.OptionsSchema {
+		if option.Key == "thinking" {
+			thinkingOption = option
+			break
+		}
+	}
+	if thinkingOption.Key == "" {
+		t.Fatal("omp provider missing thinking option")
+	}
+	for _, choice := range thinkingOption.Choices {
+		if choice.Value == "" {
+			continue
+		}
+		if len(choice.FlagArgs) != 2 || choice.FlagArgs[0] != "--thinking" || choice.FlagArgs[1] != choice.Value {
+			t.Errorf("thinking %s FlagArgs = %v, want [--thinking %s]", choice.Value, choice.FlagArgs, choice.Value)
+		}
+	}
+}
