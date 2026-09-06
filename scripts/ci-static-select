@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run changed-Go formatting or affected-package static checks without lossy paths."""
+"""Run diff-scoped static checks and lean local tests without lossy paths."""
 
 from __future__ import annotations
 
@@ -382,6 +382,34 @@ def lint_affected(
     return run_static_checks(lint_tool, go_tool, lint_flags, packages)
 
 
+def check_lean_local(go_tool: str) -> int:
+    # Reuse the static selector's build-input and reverse-dependency graph.
+    # Unlike lint-affected, a selection failure must NOT expand into a full
+    # test suite on the shared host. CI owns the full-suite fallback.
+    try:
+        records = diff_records()
+        if not records:
+            raise SelectionError("no changes selected; pass the fetched integration base via LINT_CHANGED_REF")
+        if any(posixpath.basename(path) in {"go.mod", "go.sum", "go.work", "go.work.sum"}
+               for _, path in records):
+            raise SelectionError("module/workspace changes require the full CI profile")
+        packages = affected_package_args(records, go_tool)
+    except SelectionError as error:
+        print(f"check-lean-local: cannot safely select tests: {error}", file=sys.stderr)
+        return 2
+    for operation in ("vet", "build"):
+        result = run_tool([go_tool, operation, "-mod=readonly", "-p=2", "./..."])
+        if result != 0:
+            return result
+    if not packages:
+        print("check-lean-local: vet/build passed; no affected Go tests selected")
+        return 0
+    print(f"check-lean-local: testing {' '.join(packages)}", flush=True)
+    return run_tool(
+        [go_tool, "test", "-mod=readonly", "-p=2", "-count=1", "-timeout=15m", *packages]
+    )
+
+
 def fmt_check_changed(tool: str) -> int:
     try:
         records = diff_records()
@@ -410,6 +438,11 @@ def is_regular_file(path: str) -> bool:
 
 
 def main(argv: list[str]) -> int:
+    if len(argv) >= 2 and argv[1] == "check-lean-local":
+        if len(argv) != 3:
+            print("usage: ci-static-select check-lean-local GO", file=sys.stderr)
+            return 2
+        return check_lean_local(argv[2])
     if len(argv) < 3 or argv[1] not in {"lint-affected", "fmt-check-changed"}:
         print(
             "usage: ci-static-select {lint-affected|fmt-check-changed} "
