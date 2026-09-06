@@ -4,14 +4,17 @@
 // files so upgrades can replace this file safely.
 //
 // Events:
-//   session_start       → gc prime --hook (load context side effects and capture OMP session id)
-//   session_compact     → gc prime --hook (reload after compaction)
-//   before_agent_start  → inject queued nudges + unread mail
+//   session_start       → gc prime --hook (context side effects + OMP session id);
+//                         stdout is CACHED and injected at the next
+//                         before_agent_start — discarding it meant a primed
+//                         session never saw its own prime output (ga-vat7sn)
+//   session_compact     → gc prime --hook (reload after compaction), same caching
+//   before_agent_start  → inject cached prime output + queued nudges + unread mail
 
 import { execFileSync } from "node:child_process";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
-const GC_OMP_HOOK_VERSION = 3;
+const GC_OMP_HOOK_VERSION = 4;
 const PATH_PREFIX =
   `${process.env.HOME}/go/bin:${process.env.HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:`;
 
@@ -70,18 +73,28 @@ function appendSystemPrompt(systemPrompt: string[], additions: string[]): string
 }
 
 export default function gascityOmpExtension(pi: ExtensionAPI) {
+  // Prime output from session_start/session_compact, held until the next
+  // before_agent_start can inject it. The start/compact callbacks have no
+  // injection channel of their own, and v3 simply dropped the stdout — so a
+  // freshly primed or freshly compacted session never saw its role context
+  // (ga-vat7sn defect 3, evidence katya ga-c0v33s). Consumed on injection so
+  // a prime is delivered exactly once.
+  let pendingPrime = "";
+
   pi.on("session_start", (_event, ctx) => {
-    run(["prime", "--hook"], ctx.cwd, providerSessionEnv(ctx));
+    pendingPrime = run(["prime", "--hook"], ctx.cwd, providerSessionEnv(ctx));
   });
 
   pi.on("session_compact", (_event, ctx) => {
-    run(["prime", "--hook"], ctx.cwd, providerSessionEnv(ctx));
+    pendingPrime = run(["prime", "--hook"], ctx.cwd, providerSessionEnv(ctx));
   });
 
   pi.on("before_agent_start", (event, ctx) => {
+    const prime = pendingPrime;
+    pendingPrime = "";
     const nudges = run(["nudge", "drain", "--inject"], ctx.cwd);
     const mail = run(["mail", "check", "--inject"], ctx.cwd);
-    const systemPrompt = appendSystemPrompt(event.systemPrompt, [nudges, mail]);
+    const systemPrompt = appendSystemPrompt(event.systemPrompt, [prime, nudges, mail]);
     if (systemPrompt !== event.systemPrompt) {
       return { systemPrompt };
     }
