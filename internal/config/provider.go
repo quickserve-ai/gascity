@@ -244,6 +244,13 @@ type ResolvedProvider struct {
 	// Used by ResolveDefaultArgs() to produce CLI flags and by the API to
 	// tell real-world apps what pre-selections to show.
 	EffectiveDefaults map[string]string
+	// SessionDisplayName is the owning seat's qualified identity (e.g.
+	// "woodhouse", "qcore/oversight.project-lead"), stamped at resolution
+	// time. Claude-family tmux launches append it as `--name` so the
+	// vendor /resume picker, prompt box, and cross-session messaging show
+	// the seat instead of an auto-generated summary (ga-n0rvsk). Empty for
+	// escape-hatch commands, where the user owns the whole command line.
+	SessionDisplayName string
 }
 
 const (
