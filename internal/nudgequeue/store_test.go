@@ -59,6 +59,8 @@ func TestSaveEmitsByteIdenticalCreate(t *testing.T) {
 		"continuation_epoch": "epoch-7",
 		"state":              "queued",
 		"source":             "controller",
+		"sender":             "",
+		"sender_session":     "",
 		"message":            "wake up",
 		"deliver_after":      "2026-06-02T09:00:00Z",
 		"expires_at":         "2026-06-02T10:00:00Z",
