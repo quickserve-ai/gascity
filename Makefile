@@ -157,6 +157,22 @@ endif
 
 ## install: build and install gc to GOPATH/bin (same location as go install)
 install: check-self-contained
+	@# Deploy-freeze gate (ga-rfdkxp): a gated frozen candidate must not be
+	@# silently superseded by a routine install. Supersede consciously with
+	@# FREEZE_ACK=<bead>, which leaves a durable record and demands a stamp.
+	@if [ -f "$(HOME)/.gc/deploy-freeze.json" ]; then \
+		bead=$$(sed -n 's/.*"bead"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$(HOME)/.gc/deploy-freeze.json" | head -1); \
+		if [ -z "$$bead" ] || [ "$(FREEZE_ACK)" != "$$bead" ]; then \
+			echo "FATAL: deploy freeze standing (bead: $${bead:-unparseable}) — a gated candidate is frozen on this machine."; \
+			echo "       Install the frozen candidate per its bead, or consciously supersede:"; \
+			echo "         make install FREEZE_ACK=$$bead"; \
+			echo "       then stamp the supersede decision on the bead (ga-rfdkxp)."; \
+			exit 1; \
+		fi; \
+		mv "$(HOME)/.gc/deploy-freeze.json" "$(HOME)/.gc/deploy-freeze.json.superseded-$$(date -u +%Y%m%dT%H%M%SZ)"; \
+		echo "Deploy freeze $$bead consciously superseded — STAMP THE BEAD NOW:"; \
+		echo "  gc bd comment $$bead \"deploy freeze superseded by <who>: <why>\""; \
+	fi
 	@mkdir -p $(INSTALL_DIR)
 	@set -e; \
 		tmp="$(INSTALL_DIR)/.$(BINARY).tmp.$$$$"; \
