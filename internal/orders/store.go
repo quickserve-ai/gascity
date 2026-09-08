@@ -155,6 +155,13 @@ type OrderRun struct {
 	Open bool
 	// Cursor is the decoded EventCursor (max seq across the run's labels).
 	Cursor EventCursor
+	// Error is the dispatcher-stamped failure excerpt (metadata key
+	// error_excerpt), or "" when the run succeeded or predates the stamp.
+	// Before this field, the WHY of a failed run lived only in the
+	// supervisor log — order history showed a bare "failed" while
+	// worktree-reaper-patrol died with Permission denied for 2.5 days
+	// (ga-swawpo gap 2).
+	Error string
 }
 
 // State returns the feed-facing lifecycle status of the run: "failed" when the
@@ -272,6 +279,32 @@ func (s *Store) CreateRun(scoped string, opts RunOpts) (OrderRun, error) {
 func (s *Store) SetOutcome(runID string, outcome RunOutcome) error {
 	if err := s.store.Update(runID, beads.UpdateOpts{Labels: outcome.Labels()}); err != nil {
 		return fmt.Errorf("setting order run outcome on %q: %w", runID, err)
+	}
+	return nil
+}
+
+// metadataErrorExcerpt is the tracking-bead metadata key carrying the
+// dispatcher's failure text for a failed run, so `gc order history` can
+// answer WHY without the supervisor log (ga-swawpo gap 2).
+const metadataErrorExcerpt = "error_excerpt"
+
+// errorExcerptMaxLen bounds the stamped excerpt: enough to carry a shell
+// error line, small enough to stay a metadata value rather than a log.
+const errorExcerptMaxLen = 300
+
+// SetError stamps the failure excerpt on an existing tracking bead,
+// truncating to errorExcerptMaxLen. Callers treat it as best-effort: a
+// failed stamp must never change the outcome flow.
+func (s *Store) SetError(runID, excerpt string) error {
+	excerpt = strings.TrimSpace(excerpt)
+	if excerpt == "" {
+		return nil
+	}
+	if len(excerpt) > errorExcerptMaxLen {
+		excerpt = excerpt[:errorExcerptMaxLen] + "…"
+	}
+	if err := s.store.SetMetadata(runID, metadataErrorExcerpt, excerpt); err != nil {
+		return fmt.Errorf("setting order run error excerpt on %q: %w", runID, err)
 	}
 	return nil
 }
@@ -445,6 +478,7 @@ func decodeRun(scoped string, b beads.Bead) OrderRun {
 		UpdatedAt: b.UpdatedAt,
 		Open:      b.Status != "closed",
 		Cursor:    EventCursor(MaxSeqFromLabels([][]string{b.Labels})),
+		Error:     b.Metadata[metadataErrorExcerpt],
 	}
 }
 

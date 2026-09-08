@@ -1418,6 +1418,12 @@ func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, front *orders.
 		return
 	}
 	if execErrMsg != "" {
+		// Best-effort WHY stamp: order history renders this excerpt next to
+		// the failed outcome, so a broken order is diagnosable without the
+		// supervisor log (ga-swawpo gap 2). A failed stamp only logs.
+		if err := front.SetError(trackingID, execErrMsg); err != nil {
+			logDispatchError(m.stderr, "gc: order %s: failed to stamp error excerpt on tracking bead %s: %v", scoped, trackingID, err)
+		}
 		if hasEventCursor {
 			execErrMsg = fmt.Sprintf("seq=%d: %s", headSeq, execErrMsg)
 		}
