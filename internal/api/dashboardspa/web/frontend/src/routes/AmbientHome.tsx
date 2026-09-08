@@ -3,6 +3,7 @@ import { laneNeedsOperator } from 'gas-city-dashboard-shared';
 import type { DashboardMetric, RunLane, RunSummary, SourceState } from 'gas-city-dashboard-shared';
 import { getActiveCity } from '../api/cityBase';
 import { AttentionSummaryPanel } from '../attention/AttentionSummaryPanel';
+import { WhosWaitingPane } from '../attention/WhosWaitingPane';
 import { PageHeader } from '../components/PageHeader';
 import { ConcernRegion, type ConcernRow } from '../components/ambient/ConcernRegion';
 import { FirstRunNote } from '../components/ambient/FirstRunNote';
@@ -172,6 +173,11 @@ function AmbientBody({ fresh, cityName, cycleKey, workInProgress }: BodyProps) {
       ) : (
         <div className="mt-6 space-y-6">
           <AttentionSummaryPanel />
+          {/* ga-s0fn27: the attention registry's own read — which seats are
+              waiting on the human right now. Sits beside the summary panel
+              rather than inside the contributor registry, so the nav badge
+              does not count the same needs-you agents twice. */}
+          <WhosWaitingPane />
           <div className="space-y-4">
             <PhaseCensus
               census={summary.census.data}
