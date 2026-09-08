@@ -289,6 +289,35 @@ func TestAppendClaudeSessionNameGates(t *testing.T) {
 	}
 }
 
+func TestAppendClaudeSessionNameIdentity(t *testing.T) {
+	base := &ResolvedProvider{BuiltinAncestor: "claude", SessionDisplayName: "qcore/cherub-law.mallory"}
+
+	// Explicit identity wins over the template-qualified SessionDisplayName —
+	// the addressable form is what a picker row must show (ga-n0rvsk req 1).
+	if got := AppendClaudeSessionNameIdentity("claude", base, "", "qcore/mallory"); got != "claude --name qcore/mallory" {
+		t.Fatalf("identity append = %q", got)
+	}
+	// Empty identity -> untouched (callers may pass a missing metadata field).
+	if got := AppendClaudeSessionNameIdentity("claude", base, "", ""); got != "claude" {
+		t.Fatalf("empty identity append = %q", got)
+	}
+	// Escape-hatch resolutions never stamp SessionDisplayName; a
+	// caller-supplied identity must not bypass that gate — the user owns
+	// that argv.
+	escape := &ResolvedProvider{BuiltinAncestor: "claude"}
+	if got := AppendClaudeSessionNameIdentity("claude --custom", escape, "", "woodhouse"); got != "claude --custom" {
+		t.Fatalf("escape-hatch append = %q", got)
+	}
+	// Family and transport gates still hold with an explicit identity.
+	omp := &ResolvedProvider{BuiltinAncestor: "omp", SessionDisplayName: "deacon"}
+	if got := AppendClaudeSessionNameIdentity("omp run", omp, "", "deacon"); got != "omp run" {
+		t.Fatalf("non-claude identity append = %q", got)
+	}
+	if got := AppendClaudeSessionNameIdentity("claude-code-acp", base, SessionTransportACP, "qcore/mallory"); got != "claude-code-acp" {
+		t.Fatalf("acp identity append = %q", got)
+	}
+}
+
 func TestBuildProviderResumeCommandCarriesSessionName(t *testing.T) {
 	rp := &ResolvedProvider{
 		BuiltinAncestor:    "claude",

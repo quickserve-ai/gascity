@@ -1078,6 +1078,21 @@ func buildPreparedStartWithWorkDirResolver(
 	if sk := candidate.info.SessionKey; sk != "" && tp.ResolvedProvider != nil && !tp.IsACP {
 		agentCfg.Command = resolveSessionCommand(agentCfg.Command, sk, parentSID, tp.ResolvedProvider, firstStart, forceFresh)
 	}
+	// ga-n0rvsk: name the claude session by its gc address, on the EXECUTED
+	// command only. This runs after the coreHash/liveHash stamps above and
+	// mutates neither tp.Command (what session_beads persists as "command")
+	// nor any fingerprint input, so the display name can never re-create the
+	// ga-2pcujo config-drift restart wave — the same post-hash contract the
+	// one-shot dispatch options rely on. The identity prefers the session's
+	// addressable forms over the template-qualified SessionDisplayName so a
+	// /resume picker row is pasteable into gc session nudge / gc mail send.
+	if tp.ResolvedProvider != nil {
+		nameTransport := ""
+		if tp.IsACP {
+			nameTransport = config.SessionTransportACP
+		}
+		agentCfg.Command = config.AppendClaudeSessionNameIdentity(agentCfg.Command, tp.ResolvedProvider, nameTransport, sessionDisplayIdentity(candidate.info, tp.ResolvedProvider))
+	}
 	hasResumeKey := strings.TrimSpace(candidate.info.SessionKey) != ""
 	promptDelivered := delivery.Delivered && (firstStart || forceFresh || !hasResumeKey)
 	promptHash := sessionpkg.PromptHash(tp.Prompt)
@@ -3499,4 +3514,23 @@ func stopSessionsBounded(
 	stdout, stderr io.Writer,
 ) int {
 	return stopTargetsBounded(stopTargetsForNames(names, cfg, store, stderr), cfg, store, sp, rec, actor, stdout, stderr)
+}
+
+// sessionDisplayIdentity returns the identity to display as the vendor
+// session name (ga-n0rvsk): the session's addressable identity — the form
+// `gc mail send` / `gc session nudge` accept, e.g. "qcore/mallory" — falling
+// back to the resolution's template-qualified SessionDisplayName for sessions
+// that carry no identity metadata (the two coincide for unbound agents).
+// Deliberately NOT AssigneeIdentifier: that prefers session_name, whose
+// runtime form ("qcore--mallory") is not a gc address.
+func sessionDisplayIdentity(info sessionpkg.Info, resolved *config.ResolvedProvider) string {
+	for _, v := range []string{info.ConfiguredNamedIdentity, info.Alias, info.AgentName} {
+		if v = strings.TrimSpace(v); v != "" {
+			return v
+		}
+	}
+	if resolved == nil {
+		return ""
+	}
+	return strings.TrimSpace(resolved.SessionDisplayName)
 }

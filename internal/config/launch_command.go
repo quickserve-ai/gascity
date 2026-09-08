@@ -57,6 +57,23 @@ func BuildProviderLaunchCommand(cityPath string, resolved *ResolvedProvider, opt
 // never when the command already carries a --name (an explicit provider or
 // agent choice wins). Same-name collisions get a vendor-side suffix.
 func appendClaudeSessionName(command string, resolved *ResolvedProvider, transport string) string {
+	if resolved == nil {
+		return command
+	}
+	return AppendClaudeSessionNameIdentity(command, resolved, transport, resolved.SessionDisplayName)
+}
+
+// AppendClaudeSessionNameIdentity is appendClaudeSessionName with an explicit
+// identity: callers that know the session's ADDRESSABLE identity — the string
+// `gc mail send` / `gc session nudge` accept, e.g. "qcore/mallory" — pass it
+// here so the display name is pasteable, not just readable. The
+// template-qualified SessionDisplayName differs from the addressable form on
+// binding-imported agents ("qcore/cherub-law.mallory" vs "qcore/mallory").
+// All structural gates from appendClaudeSessionName apply, including
+// requiring a resolution-stamped SessionDisplayName: escape-hatch
+// start_command resolutions return before the stamp, so a caller-supplied
+// identity can never name a command whose argv the user owns.
+func AppendClaudeSessionNameIdentity(command string, resolved *ResolvedProvider, transport, identity string) string {
 	if resolved == nil || strings.TrimSpace(command) == "" {
 		return command
 	}
@@ -70,7 +87,10 @@ func appendClaudeSessionName(command string, resolved *ResolvedProvider, transpo
 	if family != "claude" {
 		return command
 	}
-	name := strings.TrimSpace(resolved.SessionDisplayName)
+	if strings.TrimSpace(resolved.SessionDisplayName) == "" {
+		return command
+	}
+	name := strings.TrimSpace(identity)
 	if name == "" {
 		return command
 	}
