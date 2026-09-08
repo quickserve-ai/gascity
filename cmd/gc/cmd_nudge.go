@@ -25,6 +25,8 @@ import (
 	"github.com/gastownhall/gascity/internal/extmsg"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/mail"
+	"github.com/gastownhall/gascity/internal/notify"
+	"github.com/gastownhall/gascity/internal/notify/claudecloud"
 	"github.com/gastownhall/gascity/internal/nudgepoller"
 	"github.com/gastownhall/gascity/internal/nudgequeue"
 	"github.com/gastownhall/gascity/internal/opjournal"
@@ -1101,7 +1103,21 @@ func cmdNudgePoll(args []string, sessionName string, interval, quiescence time.D
 	var missingSince time.Time
 	var lastFreeOS time.Time
 	var idleTicksSinceObserve int
+	staleCheck := newNudgePollerStaleCheck()
 	for {
+		// Pollers outlive binary swaps (supervisor install re-adopts, never
+		// cycles them), and a pre-swap poller's maintenance passes rewrite
+		// state.json through its older Item schema — plus serve stale logic
+		// (ga-aj9auz). Re-exec through the on-disk binary the moment it is no
+		// longer the one we are running; same PID, so the poller lease
+		// re-acquires cleanly in the fresh image.
+		if staleCheck.stale() {
+			fmt.Fprintf(stderr, "gc nudge poll: binary replaced on disk; re-executing %s\n", staleCheck.path) //nolint:errcheck
+			if err := nudgePollerReExec(staleCheck.path); err != nil {
+				fmt.Fprintf(stderr, "gc nudge poll: re-exec failed, continuing on current build: %v\n", err) //nolint:errcheck
+				staleCheck.disarm()
+			}
+		}
 		// Each tick that observes a changed beads.json re-parses the whole-file
 		// store, leaving several hundred MB of transient garbage. The soft
 		// memory limit caps live arena, but proactively returning freed pages to
@@ -1225,6 +1241,53 @@ func nudgePollTargetHasDueWork(target nudgeTarget, now time.Time) bool {
 		}
 	}
 	return false
+}
+
+// nudgePollerStaleCheck detects the running poller binary being replaced on
+// disk. Identity is captured by stat at startup and compared with
+// os.SameFile, so an atomic-rename swap (new inode at the same path) trips
+// it while an untouched binary never does.
+type nudgePollerStaleCheck struct {
+	path  string
+	start os.FileInfo
+}
+
+func newNudgePollerStaleCheck() nudgePollerStaleCheck {
+	path, err := os.Executable()
+	if err != nil {
+		return nudgePollerStaleCheck{}
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nudgePollerStaleCheck{}
+	}
+	return nudgePollerStaleCheck{path: path, start: fi}
+}
+
+// stale reports whether the on-disk binary at the captured path is no longer
+// the file this process is running. Stat errors (path briefly absent, perms)
+// read as not-stale: delivery must never die on a probe failure.
+func (c nudgePollerStaleCheck) stale() bool {
+	if c.start == nil {
+		return false
+	}
+	fi, err := os.Stat(c.path)
+	if err != nil {
+		return false
+	}
+	return !os.SameFile(c.start, fi)
+}
+
+// disarm stops further staleness checks after a failed re-exec so the poller
+// does not spin retrying an exec that cannot succeed.
+func (c *nudgePollerStaleCheck) disarm() { c.start = nil }
+
+// nudgePollerReExec swaps this process image for the on-disk binary,
+// preserving argv and environment. Var for tests. On success it never
+// returns; the poller lease survives because the PID is unchanged and
+// acquireNudgePollerLease treats an own-PID pidfile as already held.
+var nudgePollerReExec = func(execPath string) error {
+	return syscall.Exec(execPath, os.Args, os.Environ())
 }
 
 func shouldKeepNudgePollerAlive(target nudgeTarget, missingSince, now time.Time) bool {
@@ -1833,7 +1896,28 @@ func queuedNudgeDowngradeNote(target nudgeTarget, undelivered worker.NudgeUndeli
 	}
 }
 
-func sendMailNotify(target nudgeTarget, sender, messageID string) (string, error) {
+func sendMailNotify(target nudgeTarget, n notify.Notification) error {
+	_, err := sendMailNotifyRecorded(target, n)
+	return err
+}
+
+// sendMailNotifyRecorded is sendMailNotify returning the id of the op that
+// records the notice, "" when none does (the mail verbs report it as
+// notify_op_ids).
+func sendMailNotifyRecorded(target nudgeTarget, n notify.Notification) (string, error) {
+	// Per-seat wake-transport selection (notification plane, ga-bjbaui).
+	// Structural: the value was validated at config load; this switch only
+	// routes. The durable record is already written when this fires, so a
+	// transport failure loses a wake hint, never the message. The op journal
+	// records session deliveries only, so the cloud transport runs no op.
+	switch strings.TrimSpace(target.agent.WakeTransport) {
+	case "", config.WakeTransportSession:
+		// default session transport below
+	case config.WakeTransportClaudeCloud:
+		return "", deliverClaudeCloudNotify(target, n)
+	default:
+		return "", fmt.Errorf("seat %q has unknown wake_transport %q (config validation should have refused this)", target.agentKey(), target.agent.WakeTransport)
+	}
 	store, err := openNudgeBeadStoreErr(target.cityPath)
 	if err != nil {
 		return "", err
@@ -1845,7 +1929,79 @@ func sendMailNotify(target nudgeTarget, sender, messageID string) (string, error
 	if err != nil {
 		return "", err
 	}
-	return sendMailNotifyWithOp(target, store.Store, sp, sender, messageID)
+	return sendNotificationWithOp(target, store.Store, sp, n)
+}
+
+// deliverClaudeCloudNotify is the claude-cloud branch of the notification
+// plane (claudemsg-bridge-design.md §5, ga-bjbaui stage 4): it reads the
+// seat's cloud binding from session-bead metadata, runs the per-send
+// transport, and stamps reachability + suspect state back onto the session
+// bead. The mail bead is durably written before this fires, so every failure
+// here loses a wake hint, never the message — errors are loud on purpose.
+func deliverClaudeCloudNotify(target nudgeTarget, n notify.Notification) error {
+	// Every selected cloud-wake attempt is recorded, including the early
+	// refusals below — an unbound seat that silently never appears in
+	// telemetry is invisible to the operator. Pre-launch refusals are
+	// retryable (fix the inputs and re-run); launched sends are not.
+	recordEarly := func(err error) error {
+		telemetry.RecordCloudWake(context.Background(), target.agentKey(), "", n.Ref, "", 0, true, err)
+		return err
+	}
+	if strings.TrimSpace(target.sessionID) == "" {
+		return recordEarly(fmt.Errorf("seat %q selects wake_transport=%q but has no session bead to carry a cloud binding; bind one with `gc session bind-cloud` — the mail bead is durably written and unaffected", target.agentKey(), config.WakeTransportClaudeCloud))
+	}
+	store := openNudgeBeadStore(target.cityPath)
+	if store.Store == nil {
+		return fmt.Errorf("opening city store for %q", target.agentKey())
+	}
+	front := cliSessionFrontDoor(store.Store, target.cfg, target.cityPath)
+	info, err := front.Get(target.sessionID)
+	if err != nil {
+		return recordEarly(fmt.Errorf("reading session bead %s for the cloud binding: %w", target.sessionID, err))
+	}
+	if strings.TrimSpace(info.CloudWakeSessionID) == "" {
+		return recordEarly(fmt.Errorf("seat %q selects wake_transport=%q but its session bead carries no %s binding; stamp one with `gc session bind-cloud` — the mail bead is durably written and unaffected", target.agentKey(), config.WakeTransportClaudeCloud, session.MetadataCloudWakeSessionID))
+	}
+	if strings.TrimSpace(info.CloudWakeAccountDir) == "" {
+		// Ambient auth is refused by design (§5.1): a send under the wrong
+		// account burns the wrong cap, and an account mismatch surfaces as
+		// "Session not found" — falsely marking a healthy binding suspect.
+		return recordEarly(fmt.Errorf("seat %q has a cloud binding but no %s account lineage; refusing to send under ambient auth — stamp it via `gc session bind-cloud`; the mail bead is durably written and unaffected", target.agentKey(), session.MetadataCloudWakeAccountDir))
+	}
+	tr := &claudecloud.Transport{Binding: claudecloud.Binding{
+		SessionID:        info.CloudWakeSessionID,
+		AccountConfigDir: info.CloudWakeAccountDir,
+	}}
+	start := time.Now()
+	outcome, derr := tr.Deliver(context.Background(), n)
+	latency := time.Since(start)
+	// Reachability and suspect facts are best-effort stamps read by the
+	// cloud-wake doctor check; delivery reporting must not fail on a
+	// metadata write. COMPARE BEFORE STAMP: an operator may have rebound the
+	// seat while the CLI ran — a result from the OLD binding must never mark
+	// the NEW binding suspect, so re-read and stamp only while the binding
+	// is still the one this send targeted.
+	now := time.Now().UTC().Format(time.RFC3339)
+	if fresh, ferr := front.Get(target.sessionID); ferr == nil &&
+		strings.TrimSpace(fresh.CloudWakeSessionID) == strings.TrimSpace(info.CloudWakeSessionID) {
+		if outcome != "" {
+			_ = front.SetMarker(target.sessionID, session.MetadataCloudWakeLastOutcome, string(outcome))
+			_ = front.SetMarker(target.sessionID, session.MetadataCloudWakeLastOutcomeAt, now)
+		}
+		if claudecloud.SuspectOutcome(outcome) {
+			// Suspect is not dead (design §5.2): credential drift can produce
+			// the same refusal strings a gone session does, so the binding is
+			// flagged for doctor and explicit rebind — never deleted here.
+			_ = front.SetMarker(target.sessionID, session.MetadataCloudWakeBindingSuspect, string(outcome))
+			_ = front.SetMarker(target.sessionID, session.MetadataCloudWakeBindingSuspectAt, now)
+		}
+	}
+	// Retryable is strictly "nothing launched": pre-launch refusals
+	// (unreachable ref, garbage binding, missing lineage) and a CLI that
+	// never started. Everything after launch is at-most-once.
+	retryable := outcome == "" || outcome == notify.OutcomeRefusedNotFound && errors.Is(derr, claudecloud.ErrInvalidSessionID)
+	telemetry.RecordCloudWake(context.Background(), target.agentKey(), string(outcome), n.Ref, info.CloudWakeAccountDir, latency, retryable, derr)
+	return derr
 }
 
 // sendMailNotifyWithProvider is the store-less notify path (human sender,
@@ -1868,17 +2024,35 @@ func mailNotifyOpKey(messageID string) string {
 // at the boundary (DES-O0API §3.1).
 var mailNotifyOpPolicy = opjournal.Policy{Message: opjournal.MessagePolicy{When: opjournal.WhenBoundary, Wake: opjournal.WakeIfNeeded, Role: opjournal.RoleNotice}}
 
+// notifyBeadRefPrefix is the notify.Notification Ref scheme that names a bead a
+// recipient on the mail plane can read ("bead://<id>", claudemsg-bridge-design.md
+// §4). For a mail arrival the bead is the mail message the wake announces.
+const notifyBeadRefPrefix = "bead://"
+
 // sendMailNotifyWithOp tells target it has mail from sender, and returns the
-// id of the op that records the notice, "" when none does. On a worker site
-// it records only the recipient's wake (requestWorkerSiteNudgeWake), the one
-// notice a box can leave, and no op, and returns
+// id of the op that records the notice, "" when none does: a mail arrival on
+// the default session transport, whose messageID ("" when there is no
+// addressable message) rides as the notification's bead:// Ref
+// (sendNotificationWithOp).
+func sendMailNotifyWithOp(target nudgeTarget, store beads.Store, sp runtime.Provider, sender, messageID string) (string, error) {
+	n := notify.Notification{Kind: notify.KindMailArrival, Sender: sender}
+	if messageID != "" {
+		n.Ref = notifyBeadRefPrefix + messageID
+	}
+	return sendNotificationWithOp(target, store, sp, n)
+}
+
+// sendNotificationWithOp delivers n on the default session transport and
+// returns the id of the op that records the notice, "" when none does. On a
+// worker site it records only the recipient's wake (requestWorkerSiteNudgeWake),
+// the one notice a box can leave, and no op, and returns
 // errWorkerSiteNotifyNotDelivered when it recorded no wake. Elsewhere the
 // notice is recorded as a message{role: notice} op keyed by its mail message
-// (mailNotifyOpKey, causation the message id) before it is delivered or
-// queued, and closed from that result; a notice its op already closed with
-// success is not delivered again. The delivered text is the notice's,
-// unchanged in every ops.content mode.
-func sendMailNotifyWithOp(target nudgeTarget, store beads.Store, sp runtime.Provider, sender, messageID string) (string, error) {
+// (mailNotifyOpKey, causation the message id named by the bead:// Ref) before
+// it is delivered or queued (deliverSessionNotification), and closed from that
+// result; a notice its op already closed with success is not delivered again.
+// The delivered text is the notice's, unchanged in every ops.content mode.
+func sendNotificationWithOp(target nudgeTarget, store beads.Store, sp runtime.Provider, n notify.Notification) (string, error) {
 	if onWorkerSite(target.cityPath) {
 		outcome, err := requestWorkerSiteNudgeWake(target, store)
 		if err != nil {
@@ -1892,7 +2066,11 @@ func sendMailNotifyWithOp(target nudgeTarget, store beads.Store, sp runtime.Prov
 		}
 		return "", nil
 	}
-	msg := mailNotifyText(sender)
+	msg := notify.WakeText(n)
+	messageID := ""
+	if ref := queuedMailNudgeReference(n); ref != nil {
+		messageID = ref.ID
+	}
 	op, start := startMailNotifyOp(target, store, msg, messageID)
 	switch start {
 	case cliOpRefused:
@@ -1902,8 +2080,8 @@ func sendMailNotifyWithOp(target nudgeTarget, store beads.Store, sp runtime.Prov
 		return id, nil
 	}
 	defer op.end()
-	queued, err := deliverMailNotifyLegacy(target, store, sp, msg, messageID)
-	op.finishMessage(queued, err)
+	outcome, err := deliverSessionNotification(target, store, sp, n)
+	op.finishMessage(outcome == notify.OutcomeQueuedLocal, err)
 	id, _, _ := op.jsonFields()
 	return id, err
 }
@@ -1955,21 +2133,56 @@ func mailNotifyRefusedError(messageID string) error {
 	return fmt.Errorf("the op journal refused the notice for %s, so it was not sent", messageID)
 }
 
-// deliverMailNotifyLegacy delivers a mail notice msg live to a running
-// target, else queues it (with a managed wake for a stopped managed
-// session), and reports whether it queued it.
-func deliverMailNotifyLegacy(target nudgeTarget, store beads.Store, sp runtime.Provider, msg, messageID string) (queued bool, err error) {
+// nudgeSourceForKind maps a notification kind onto the queued-nudge source
+// label, preserving the pre-plane labels ("mail" for mail arrivals).
+func nudgeSourceForKind(kind notify.Kind) string {
+	if kind == notify.KindMailArrival {
+		return "mail"
+	}
+	return "session"
+}
+
+// queuedMailNudgeReference returns the delivery-time re-validation reference
+// for a mail-arrival notification whose Ref names the mail bead it announces
+// (bead://<message id>), so a queued reminder is withdrawn when that message is
+// read or gone by delivery (gastownhall/gascity#5321). Any other kind, and a
+// Ref naming no mail bead (the store-less human-sender path), yields nil: the
+// nudge carries no reference and is delivered unconditionally, as before that
+// fix.
+func queuedMailNudgeReference(n notify.Notification) *nudgeReference {
+	if n.Kind != notify.KindMailArrival {
+		return nil
+	}
+	messageID, ok := strings.CutPrefix(strings.TrimSpace(n.Ref), notifyBeadRefPrefix)
+	if !ok || messageID == "" {
+		return nil
+	}
+	return &nudgeReference{Kind: "mail", ID: messageID}
+}
+
+// deliverSessionNotification is the default "session" wake transport of the
+// notification plane (claudemsg-bridge-design.md §4), and the legacy path the
+// notice's op closes from (sendNotificationWithOp): it renders the
+// notification to the pre-plane wake text and walks exactly the delivery
+// ladder the pre-plane mail notify always walked — live wait-idle nudge,
+// managed enqueue+wake, plain local queue — byte-for-byte, so seats on the
+// default transport see zero behavioral difference. OutcomeQueuedLocal is the
+// queued result the op records. A worker site never reaches it: the op layer
+// records only the recipient's wake there, before any op.
+func deliverSessionNotification(target nudgeTarget, store beads.Store, sp runtime.Provider, n notify.Notification) (notify.Outcome, error) {
+	msg := notify.WakeText(n)
+	source := nudgeSourceForKind(n.Kind)
 	now := time.Now()
 	// Carry the mail message ID as the nudge's re-validation reference so
 	// blockedQueuedNudgeReason can re-read the message at delivery time and
 	// withdraw the nudge if it was already read or has since been archived
-	// (see gastownhall/gascity#5321). messageID is empty for callers that
-	// have no addressable message (e.g. sendMailNotifyWithProvider's
-	// store-less human-sender path), in which case the nudge carries no
+	// (see gastownhall/gascity#5321). The message ID rides as the
+	// notification's bead:// Ref; a notification without one (e.g.
+	// sendMailNotifyWithProvider's store-less human-sender path) carries no
 	// reference and is delivered unconditionally, same as before this fix.
 	opts := queuedNudgeOptionsFromTarget(target)
-	if messageID != "" {
-		opts.Reference = &nudgeReference{Kind: "mail", ID: messageID}
+	if ref := queuedMailNudgeReference(n); ref != nil {
+		opts.Reference = ref
 	}
 	// Session-class store for the observe/handle reads and the last-nudge stamp
 	// below; the raw store keeps flowing to canRequestManagedNudgeWake,
@@ -1978,7 +2191,7 @@ func deliverMailNotifyLegacy(target nudgeTarget, store beads.Store, sp runtime.P
 	sessStore := cliSessionStore(store, target.cfg, target.cityPath)
 	obs, err := workerObserveNudgeTarget(target, sessStore, sp)
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	if obs.Running {
 		handle, err := workerHandleForNudgeTarget(target, sessStore, sp)
@@ -1986,7 +2199,7 @@ func deliverMailNotifyLegacy(target nudgeTarget, store beads.Store, sp runtime.P
 			result, nudgeErr := handle.Nudge(context.Background(), sessionActor(session.ActorAgent, target.cityPath), worker.NudgeRequest{
 				Text:     msg,
 				Delivery: worker.NudgeDeliveryWaitIdle,
-				Source:   "mail",
+				Source:   source,
 				Wake:     worker.NudgeWakeLiveOnly,
 			})
 			delivered := nudgeErr == nil && result.Delivered
@@ -2002,33 +2215,33 @@ func deliverMailNotifyLegacy(target nudgeTarget, store beads.Store, sp runtime.P
 					sessFront = sessionFrontDoor(sessStore)
 				}
 				stampLastNudgeDeliveredAt(sessFront, target.sessionID, time.Now())
-				return false, nil
+				return notify.OutcomeDelivered, nil
 			}
 		}
 	}
 	if !obs.Running && canRequestManagedNudgeWake(target, store) {
-		item := newQueuedNudgeWithOptions(target.agentKey(), msg, "mail", now, opts)
+		item := newQueuedNudgeWithOptions(target.agentKey(), msg, source, now, opts)
 		outcome, err := enqueueManagedNudgeThenWake(target, store, item)
 		if err != nil {
-			return false, err
+			return "", err
 		}
 		if outcome == session.WakeHeld {
-			return true, nil // a held session keeps the nudge queued; no poke
+			return notify.OutcomeQueuedLocal, nil // a held session keeps the nudge queued; no poke
 		}
 		if err := nudgePokeController(target.cityPath, reconcilekey.Session(target.sessionID)); err != nil {
 			if nudgeWarningWriter != nil {
 				fmt.Fprintf(nudgeWarningWriter, "gc mail notify: warning: poke failed after managed wake: %v\n", err) //nolint:errcheck
 			}
 		}
-		return true, nil
+		return notify.OutcomeQueuedLocal, nil
 	}
-	if err := enqueueQueuedNudge(target.cityPath, newQueuedNudgeWithOptions(target.agentKey(), msg, "mail", now, opts)); err != nil {
-		return false, err
+	if err := enqueueQueuedNudge(target.cityPath, newQueuedNudgeWithOptions(target.agentKey(), msg, source, now, opts)); err != nil {
+		return "", err
 	}
 	if obs.Running {
 		maybeStartNudgePoller(target)
 	}
-	return true, nil
+	return notify.OutcomeQueuedLocal, nil
 }
 
 func resolveNudgeTarget(identifier string, warningWriter ...io.Writer) (nudgeTarget, error) {
