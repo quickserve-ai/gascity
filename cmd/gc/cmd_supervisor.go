@@ -59,6 +59,7 @@ to add cities.`,
 		newSupervisorReloadCmd(stdout, stderr),
 		newSupervisorLogsCmd(stdout, stderr),
 		newSupervisorInstallCmd(stdout, stderr),
+		newSupervisorCheckFreezeCmd(stdout, stderr),
 		newSupervisorUninstallCmd(stdout, stderr),
 	)
 	return cmd

@@ -75,11 +75,62 @@ func TestDeployFreezeAckedSupersedesDurably(t *testing.T) {
 }
 
 func TestDeployFreezeMalformedFailsClosed(t *testing.T) {
-	for _, content := range []string{"{not json", `{"reason":"no bead field"}`} {
+	for _, content := range []string{"{not json", `{"reason":"no bead field"}`, `{"bead":"ga-test01",`} {
 		path := freezeMarker(t, content)
 		var out, errw bytes.Buffer
 		if rc := checkDeployFreeze(path, "ga-test01", &out, &errw); rc != 1 {
 			t.Errorf("malformed marker %q must fail closed even with an ack, got rc=%d", content, rc)
 		}
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("malformed marker %q must be preserved, not consumed", content)
+		}
+	}
+}
+
+func TestDeployFreezeArchiveFailureBlocks(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "deploy-freeze.json")
+	if err := os.WriteFile(path, []byte(validFreeze), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	var out, errw bytes.Buffer
+	if rc := checkDeployFreeze(path, "ga-test01", &out, &errw); rc != 1 {
+		t.Fatalf("failed supersede rename must block the install, got rc=%d stdout=%s", rc, out.String())
+	}
+	if strings.Contains(out.String(), "superseded") {
+		t.Errorf("must not report a supersede that did not happen: %s", out.String())
+	}
+	_ = os.Chmod(dir, 0o755)
+	if _, err := os.Stat(path); err != nil {
+		t.Error("failed supersede must leave the marker in place")
+	}
+}
+
+// The check-freeze subcommand is the Makefile's entrypoint into the guard;
+// it must carry the same fail-closed behavior, resolving the marker via HOME.
+func TestSupervisorCheckFreezeCmdMalformedFailsClosed(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(home, ".gc", "deploy-freeze.json")
+	if err := os.WriteFile(marker, []byte(`{"bead":"ga-test01",`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errw bytes.Buffer
+	cmd := newSupervisorCheckFreezeCmd(&out, &errw)
+	cmd.SetArgs([]string{"--acknowledge-freeze", "ga-test01"})
+	cmd.SilenceErrors = true
+	cmd.SilenceUsage = true
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("malformed marker must fail closed through the check-freeze command")
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Error("malformed marker must be preserved, not consumed")
 	}
 }

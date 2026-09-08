@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/spf13/cobra"
 )
 
 // deployFreeze is the machine-scoped gated-candidate marker (ga-rfdkxp).
@@ -34,6 +36,30 @@ func deployFreezePath() string {
 		return ""
 	}
 	return filepath.Join(home, ".gc", "deploy-freeze.json")
+}
+
+// newSupervisorCheckFreezeCmd exposes checkDeployFreeze as a standalone,
+// hidden entrypoint so non-Go install paths (the Makefile's `make install`)
+// run the exact same guard instead of a shell reimplementation — a drifting
+// shell duplicate accepted malformed markers and ignored archive failures
+// (ga-rfdkxp review, 2026-09-08).
+func newSupervisorCheckFreezeCmd(stdout, stderr io.Writer) *cobra.Command {
+	var ack string
+	cmd := &cobra.Command{
+		Use:    "check-freeze",
+		Short:  "Run the deploy-freeze gate (block on a standing freeze; --acknowledge-freeze supersedes)",
+		Hidden: true,
+		Args:   cobra.NoArgs,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if checkDeployFreeze(deployFreezePath(), ack, stdout, stderr) != 0 {
+				return errExit
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&ack, "acknowledge-freeze", "",
+		"consciously supersede a standing deploy-freeze marker by its bead id (ga-rfdkxp)")
+	return cmd
 }
 
 // checkDeployFreeze returns 0 when the install may proceed. A standing
