@@ -196,6 +196,7 @@ func (p *Plane) registerRoutes() {
 		writeJSON(w, http.StatusOK, apiHealthResponse{OK: true, TS: time.Now().UTC().Format(time.RFC3339Nano)})
 	})
 	p.registerConfig()
+	p.registerAttention()
 	p.registerGit()
 	p.registerBuilds()
 	p.registerClientLog()

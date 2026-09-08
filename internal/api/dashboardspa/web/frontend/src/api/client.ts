@@ -1,4 +1,5 @@
 import type {
+  AttentionRegistry,
   GitCommitList,
   GitView,
   DeployList,
@@ -307,6 +308,18 @@ const decodeLocalToolVersions = objectDecoder<LocalToolVersions>(
     requireLocalToolVersionField(record, url, 'local tool versions', 'gc');
   },
 );
+// Envelope-only validation: `entries` is the array the pane maps over, and the
+// two counters drive the footnote. Individual entry fields are deliberately NOT
+// required here — two independent runtime hooks write them, so a seat that omits
+// one field should render with that field blank rather than blank the whole pane.
+const decodeAttentionRegistry = objectDecoder<AttentionRegistry>(
+  'attention registry',
+  (record, url) => {
+    requireArrayField(record, url, 'attention registry', 'entries');
+    requireNumberField(record, url, 'attention registry', 'skippedMalformed');
+    requireStringField(record, url, 'attention registry', 'readAt');
+  },
+);
 const decodeDoltTrend = objectDecoder<DoltNomsTrend>('dolt trend', (record, url) => {
   requireBooleanField(record, url, 'dolt trend', 'available');
   requireArrayField(record, url, 'dolt trend', 'samples');
@@ -418,6 +431,12 @@ export const api = {
   // ── City-scoped endpoints (ride /api/city/:cityName/*) ─────────────────
   config(): Promise<DashboardRuntimeConfig> {
     return request('GET', cityPath('/config'), decodeRuntimeConfig);
+  },
+  // The operator-attention registry (ga-s0fn27): which seats are currently
+  // waiting on the human, read from <cityRoot>/.gc/runtime/attention/. A
+  // missing registry directory is an empty registry, never an error.
+  attentionRegistry(): Promise<AttentionRegistry> {
+    return request('GET', cityPath('/attention'), decodeAttentionRegistry);
   },
   systemHealth(): Promise<SystemHealth> {
     return request('GET', '/api/health/system', decodeSystemHealth);
