@@ -8,7 +8,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -53,6 +56,13 @@ type Item struct {
 	ClaimedAt     time.Time  `json:"claimed_at,omitempty"`
 	LeaseUntil    time.Time  `json:"lease_until,omitempty"`
 	DeadAt        time.Time  `json:"dead_at,omitempty"`
+
+	// unknown carries JSON fields written by a newer gc build than this one.
+	// state.json is round-tripped by whichever gc process runs a maintenance
+	// pass; without this overlay an old-schema process silently strips every
+	// field it does not know, city-wide, during every deployment window
+	// (ga-aj9auz). Populated only when such fields exist.
+	unknown map[string]json.RawMessage
 }
 
 // State is the persisted nudge queue snapshot.
@@ -60,6 +70,128 @@ type State struct {
 	Pending  []Item `json:"pending,omitempty"`
 	InFlight []Item `json:"in_flight,omitempty"`
 	Dead     []Item `json:"dead,omitempty"`
+
+	// unknown preserves top-level keys from newer schemas across round-trips
+	// by older binaries; see Item.unknown (ga-aj9auz).
+	unknown map[string]json.RawMessage
+}
+
+// itemAlias and stateAlias strip the custom JSON methods so the standard
+// struct encoding can be reused inside them without recursion.
+type (
+	itemAlias  Item
+	stateAlias State
+)
+
+// knownJSONKeys derives the set of JSON keys a struct type owns from its
+// field tags. Derived, not hand-maintained: a hand-kept list would recreate
+// the original hazard the first time a field was added without updating it.
+func knownJSONKeys(t reflect.Type) map[string]struct{} {
+	keys := make(map[string]struct{}, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if !f.IsExported() {
+			continue
+		}
+		tag := f.Tag.Get("json")
+		if tag == "-" {
+			continue
+		}
+		name, _, _ := strings.Cut(tag, ",")
+		if name == "" {
+			name = f.Name
+		}
+		keys[name] = struct{}{}
+	}
+	return keys
+}
+
+var (
+	itemKnownKeys  = sync.OnceValue(func() map[string]struct{} { return knownJSONKeys(reflect.TypeOf(Item{})) })
+	stateKnownKeys = sync.OnceValue(func() map[string]struct{} { return knownJSONKeys(reflect.TypeOf(State{})) })
+)
+
+// unknownJSONFields returns the keys in data not claimed by known.
+func unknownJSONFields(data []byte, known map[string]struct{}) (map[string]json.RawMessage, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+	for k := range known {
+		delete(raw, k)
+	}
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	return raw, nil
+}
+
+// mergeUnknownJSONFields re-attaches preserved unknown fields to an encoded
+// object. Known fields win on any collision.
+func mergeUnknownJSONFields(encoded []byte, unknown map[string]json.RawMessage) ([]byte, error) {
+	if len(unknown) == 0 {
+		return encoded, nil
+	}
+	var merged map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &merged); err != nil {
+		return nil, err
+	}
+	for k, v := range unknown {
+		if _, ok := merged[k]; !ok {
+			merged[k] = v
+		}
+	}
+	return json.Marshal(merged)
+}
+
+// UnmarshalJSON decodes an item and retains any fields this build does not
+// know so a later MarshalJSON round-trips them verbatim.
+func (it *Item) UnmarshalJSON(data []byte) error {
+	var known itemAlias
+	if err := json.Unmarshal(data, &known); err != nil {
+		return err
+	}
+	unknown, err := unknownJSONFields(data, itemKnownKeys())
+	if err != nil {
+		return err
+	}
+	*it = Item(known)
+	it.unknown = unknown
+	return nil
+}
+
+// MarshalJSON encodes the item's known fields and re-attaches preserved
+// unknown fields from newer schemas.
+func (it Item) MarshalJSON() ([]byte, error) {
+	encoded, err := json.Marshal(itemAlias(it))
+	if err != nil {
+		return nil, err
+	}
+	return mergeUnknownJSONFields(encoded, it.unknown)
+}
+
+// UnmarshalJSON decodes the snapshot and retains unknown top-level keys.
+func (s *State) UnmarshalJSON(data []byte) error {
+	var known stateAlias
+	if err := json.Unmarshal(data, &known); err != nil {
+		return err
+	}
+	unknown, err := unknownJSONFields(data, stateKnownKeys())
+	if err != nil {
+		return err
+	}
+	*s = State(known)
+	s.unknown = unknown
+	return nil
+}
+
+// MarshalJSON encodes the snapshot and re-attaches preserved top-level keys.
+func (s State) MarshalJSON() ([]byte, error) {
+	encoded, err := json.Marshal(stateAlias(s))
+	if err != nil {
+		return nil, err
+	}
+	return mergeUnknownJSONFields(encoded, s.unknown)
 }
 
 // SortState orders items deterministically inside each queue bucket.

@@ -683,7 +683,21 @@ func cmdNudgePoll(args []string, sessionName string, interval, quiescence time.D
 	sessStore := cliSessionStore(store.Store, target.cfg, target.cityPath)
 	var missingSince time.Time
 	var lastFreeOS time.Time
+	staleCheck := newNudgePollerStaleCheck()
 	for {
+		// Pollers outlive binary swaps (supervisor install re-adopts, never
+		// cycles them), and a pre-swap poller's maintenance passes rewrite
+		// state.json through its older Item schema — plus serve stale logic
+		// (ga-aj9auz). Re-exec through the on-disk binary the moment it is no
+		// longer the one we are running; same PID, so the poller lease
+		// re-acquires cleanly in the fresh image.
+		if staleCheck.stale() {
+			fmt.Fprintf(stderr, "gc nudge poll: binary replaced on disk; re-executing %s\n", staleCheck.path) //nolint:errcheck
+			if err := nudgePollerReExec(staleCheck.path); err != nil {
+				fmt.Fprintf(stderr, "gc nudge poll: re-exec failed, continuing on current build: %v\n", err) //nolint:errcheck
+				staleCheck.disarm()
+			}
+		}
 		// Each tick that observes a changed beads.json re-parses the whole-file
 		// store, leaving several hundred MB of transient garbage. The soft
 		// memory limit caps live arena, but proactively returning freed pages to
@@ -733,6 +747,53 @@ func cmdNudgePoll(args []string, sessionName string, interval, quiescence time.D
 		}
 		time.Sleep(interval)
 	}
+}
+
+// nudgePollerStaleCheck detects the running poller binary being replaced on
+// disk. Identity is captured by stat at startup and compared with
+// os.SameFile, so an atomic-rename swap (new inode at the same path) trips
+// it while an untouched binary never does.
+type nudgePollerStaleCheck struct {
+	path  string
+	start os.FileInfo
+}
+
+func newNudgePollerStaleCheck() nudgePollerStaleCheck {
+	path, err := os.Executable()
+	if err != nil {
+		return nudgePollerStaleCheck{}
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nudgePollerStaleCheck{}
+	}
+	return nudgePollerStaleCheck{path: path, start: fi}
+}
+
+// stale reports whether the on-disk binary at the captured path is no longer
+// the file this process is running. Stat errors (path briefly absent, perms)
+// read as not-stale: delivery must never die on a probe failure.
+func (c nudgePollerStaleCheck) stale() bool {
+	if c.start == nil {
+		return false
+	}
+	fi, err := os.Stat(c.path)
+	if err != nil {
+		return false
+	}
+	return !os.SameFile(c.start, fi)
+}
+
+// disarm stops further staleness checks after a failed re-exec so the poller
+// does not spin retrying an exec that cannot succeed.
+func (c *nudgePollerStaleCheck) disarm() { c.start = nil }
+
+// nudgePollerReExec swaps this process image for the on-disk binary,
+// preserving argv and environment. Var for tests. On success it never
+// returns; the poller lease survives because the PID is unchanged and
+// acquireNudgePollerLease treats an own-PID pidfile as already held.
+var nudgePollerReExec = func(execPath string) error {
+	return syscall.Exec(execPath, os.Args, os.Environ())
 }
 
 func shouldKeepNudgePollerAlive(target nudgeTarget, missingSince, now time.Time) bool {
