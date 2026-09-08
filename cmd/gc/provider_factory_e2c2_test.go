@@ -202,7 +202,7 @@ func runE2c2ProviderFailureHelper(t *testing.T, cityPath, sessionID, markerPath 
 	assertE2c2ProviderBuilds(t, providerBuilds, 7, "session nudge JSON")
 	assertE2c2NoQueuedNudges(t, target, "session nudge provider failures")
 
-	if _, err := sendMailNotify(target, notify.Notification{Kind: notify.KindMailArrival, Sender: "human"}); err == nil || err.Error() != e2c2ProviderConstructionFailure {
+	if err := sendMailNotify(target, notify.Notification{Kind: notify.KindMailArrival, Sender: "human"}); err == nil || err.Error() != e2c2ProviderConstructionFailure {
 		t.Fatalf("sendMailNotify provider failure = %v, want %q", err, e2c2ProviderConstructionFailure)
 	}
 	assertE2c2ProviderBuilds(t, providerBuilds, 8, "mail notify")
