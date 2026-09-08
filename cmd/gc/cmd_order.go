@@ -995,6 +995,13 @@ func doOrderRunExecTracked(a orders.Order, cityPath string, cfg *config.City, fr
 		fmt.Fprintf(stderr, "gc order run: labeling exec tracking bead for %s: %v\n", scoped, err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
+	if result.code != 0 {
+		// Match the dispatcher's WHY stamp (ga-swawpo gap 2); best-effort.
+		excerpt := fmt.Sprintf("exit code %d (manual gc order run; error text on the caller's terminal)", result.code)
+		if err := front.SetError(run.ID, excerpt); err != nil {
+			fmt.Fprintf(stderr, "gc order run: stamping error excerpt for %s: %v\n", scoped, err) //nolint:errcheck // best-effort stderr
+		}
+	}
 	return result.code
 }
 
@@ -1655,6 +1662,7 @@ func doOrderHistoryBounded(name, rig string, aa []orders.Order, resolveStores or
 		id        string
 		createdAt time.Time
 		outcome   string
+		errText   string
 	}
 	var entries []historyEntry
 	seenEntries := make(map[string]bool)
@@ -1695,6 +1703,7 @@ func doOrderHistoryBounded(name, rig string, aa []orders.Order, resolveStores or
 					id:        r.ID,
 					createdAt: r.CreatedAt,
 					outcome:   orderRunOutcomeDisplay(r),
+					errText:   r.Error,
 				})
 			}
 		}
@@ -1747,6 +1756,7 @@ func doOrderHistoryBounded(name, rig string, aa []orders.Order, resolveStores or
 				Executed:  e.createdAt.Format(time.RFC3339),
 				CreatedAt: e.createdAt,
 				Outcome:   e.outcome,
+				Error:     e.errText,
 			})
 		}
 		return writeCLIJSONLineOrExit(stdout, stderr, "gc order history", payload)
@@ -1767,15 +1777,26 @@ func doOrderHistoryBounded(name, rig string, aa []orders.Order, resolveStores or
 			if rig == "" {
 				rig = "-"
 			}
-			fmt.Fprintf(stdout, "%-20s %-15s %-15s %-21s %s\n", e.order, rig, e.id, e.createdAt.Format(time.RFC3339), e.outcome) //nolint:errcheck
+			fmt.Fprintf(stdout, "%-20s %-15s %-15s %-21s %s\n", e.order, rig, e.id, e.createdAt.Format(time.RFC3339), outcomeWithError(e.outcome, e.errText)) //nolint:errcheck
 		}
 	} else {
 		fmt.Fprintf(stdout, "%-20s %-15s %-21s %s\n", "ORDER", "BEAD", "EXECUTED", "OUTCOME") //nolint:errcheck
 		for _, e := range entries {
-			fmt.Fprintf(stdout, "%-20s %-15s %-21s %s\n", e.order, e.id, e.createdAt.Format(time.RFC3339), e.outcome) //nolint:errcheck
+			fmt.Fprintf(stdout, "%-20s %-15s %-21s %s\n", e.order, e.id, e.createdAt.Format(time.RFC3339), outcomeWithError(e.outcome, e.errText)) //nolint:errcheck
 		}
 	}
 	return 0
+}
+
+// outcomeWithError appends the dispatcher-stamped failure excerpt to the
+// OUTCOME cell so `gc order history` answers WHY a run failed without the
+// supervisor log (ga-swawpo gap 2). OUTCOME is the last column, so the
+// variable-length excerpt cannot break alignment.
+func outcomeWithError(outcome, errText string) string {
+	if errText == "" {
+		return outcome
+	}
+	return outcome + " — " + errText
 }
 
 // orderHistoryAPIOutcomeUnavailable is what the API-sourced history route
@@ -1830,6 +1851,9 @@ type orderHistoryJSONEntry struct {
 	// running, or unknown. Omitted entirely by the API route, which cannot
 	// report one — see orderRunOutcomeDisplay.
 	Outcome string `json:"outcome,omitempty"`
+	// Error is the dispatcher-stamped failure excerpt for a failed run
+	// (tracking-bead metadata error_excerpt), "" when absent (ga-swawpo).
+	Error string `json:"error,omitempty"`
 }
 
 type orderHistoryJSONSummary struct {
