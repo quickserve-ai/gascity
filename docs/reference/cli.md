@@ -4514,6 +4514,7 @@ gc supervisor install [flags]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
+| `--acknowledge-freeze` | string |  | consciously supersede a standing deploy-freeze marker by its bead id (ga-rfdkxp) |
 | `--force` | bool |  | overwrite an existing service unit even if it references a different gc binary |
 
 ## gc supervisor logs

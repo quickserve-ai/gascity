@@ -138,15 +138,20 @@ func poolDemandFirstRowFunctionScript(includeEphemeralReady bool) string {
 
 func routedReadyTierCommand(includeEphemeralReady bool) string {
 	// The shared predicate stays order-free so the count-form does no wasted
-	// sorting; the worker first-row path asks bd for the oldest candidates.
-	// The tier is widened past a single row (limit=20, not limit=1) so a
-	// self-blocked head (is_blocked / status==blocked) has Ready routed work
-	// behind it to fall through to instead of idle-exiting; the hook layer
+	// sorting; the worker first-row path rides bd's canonical
+	// (priority, created_at, id) default order. An explicit --sort oldest here
+	// makes the claim window priority-blind: a routed P0 behind more than
+	// --limit older lower-priority rows is never served at all (upstream
+	// gastownhall/gascity#5629, carried until it merges). FIFO fairness
+	// survives within a priority band via the created_at term. The tier is
+	// widened past a single row (limit=20, not limit=1) so a self-blocked
+	// head (is_blocked / status==blocked) has Ready routed work behind it to
+	// fall through to instead of idle-exiting; the hook layer
 	// (filterUnreadyHookCandidates) strips the blocked head from the result.
 	// hold:*-parked beads are stripped after the window (see
 	// holdParkExcludeSelectJQ); the count-form applies the same exclusion in
 	// its aggregation jq so claim and spawn decisions stay symmetric.
-	return bdReadyPoolDemandShell("--sort oldest --limit=20", includeEphemeralReady) +
+	return bdReadyPoolDemandShell("--limit=20", includeEphemeralReady) +
 		` 2>/dev/null | jq -c ` + shellquote.Quote(holdParkFilterJQ()) + ` 2>/dev/null`
 }
 
