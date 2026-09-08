@@ -61,6 +61,7 @@ to add cities.`,
 		newSupervisorReloadCmd(stdout, stderr),
 		newSupervisorLogsCmd(stdout, stderr),
 		newSupervisorInstallCmd(stdout, stderr),
+		newSupervisorCheckFreezeCmd(stdout, stderr),
 		newSupervisorUninstallCmd(stdout, stderr),
 	)
 	return cmd
@@ -2335,57 +2336,68 @@ func startOneCity(
 	cs.configDirty = configDirty
 	cs.services = cityRuntime.svc
 	cityRuntime.setControllerState(cs)
+	// A controller store whose schema is newer than this binary holds the
+	// city fail-closed (ga-mw4dg): its sessions are preserved across every
+	// later shutdown, and none of the startup mutations below run. The city
+	// is still published so its API can report the diagnostic, while
+	// CityRuntime.run holds reconciliation until shutdown.
+	schemaSkewed := cityRuntime.controllerStoreSchemaSkewDiagnostic() != nil
+	if schemaSkewed {
+		cityRuntime.preserveSessionsOnShutdown()
+	}
 
-	// One-time startup hygiene: release stale runtime name claims held by
-	// closed configured named-session beads so on-demand respawn is not
-	// blocked by pre-fix legacy entries inherited across a supervisor
-	// restart (ga-n2d Gap C). Best-effort, mirrors runController — a sweep
-	// failure must never block city startup.
-	_ = runPostPrepareStep("releasing_stale_name_claims", func() error {
-		if cs.cityBeadStore == nil {
+	if !schemaSkewed {
+		// One-time startup hygiene: release stale runtime name claims held by
+		// closed configured named-session beads so on-demand respawn is not
+		// blocked by pre-fix legacy entries inherited across a supervisor
+		// restart (ga-n2d Gap C). Best-effort, mirrors runController — a sweep
+		// failure must never block city startup.
+		_ = runPostPrepareStep("releasing_stale_name_claims", func() error {
+			if cs.cityBeadStore == nil {
+				return nil
+			}
+			if released, err := sessionpkg.ReleaseStaleConfiguredNameClaims(cs.cityBeadStore, cfg, cityName); err != nil {
+				fmt.Fprintf(stderr, "gc supervisor: city '%s': stale name-claim sweep: %v\n", cityName, err) //nolint:errcheck
+			} else if released > 0 {
+				fmt.Fprintf(stderr, "gc supervisor: city '%s': released %d stale configured name claim(s) at startup\n", cityName, released) //nolint:errcheck
+			}
 			return nil
-		}
-		if released, err := sessionpkg.ReleaseStaleConfiguredNameClaims(cs.cityBeadStore, cfg, cityName); err != nil {
-			fmt.Fprintf(stderr, "gc supervisor: city '%s': stale name-claim sweep: %v\n", cityName, err) //nolint:errcheck
-		} else if released > 0 {
-			fmt.Fprintf(stderr, "gc supervisor: city '%s': released %d stale configured name claim(s) at startup\n", cityName, released) //nolint:errcheck
-		}
-		return nil
-	})
+		})
 
-	_ = runPostPrepareStep("starting_bead_event_watcher", func() error {
-		cs.startBeadEventWatcher(cityCtx)
-		cs.startMaintenanceLoop(cityCtx)
-		return nil
-	})
+		_ = runPostPrepareStep("starting_bead_event_watcher", func() error {
+			cs.startBeadEventWatcher(cityCtx)
+			cs.startMaintenanceLoop(cityCtx)
+			return nil
+		})
 
-	// G13 §6 sweep-before-serve: reconcile this city's orphan in_flight
-	// rig-create idem records before it is published into the registry (and
-	// thus before the SupervisorMux can route a rig-create/sling request to
-	// it), so a same-id retry can never re-clone over un-torn-down debris.
-	_ = runPostPrepareStep("sweeping_rig_provisions", func() error {
-		if err := cs.sweepOrphanRigProvisions(cityCtx); err != nil {
-			fmt.Fprintf(stderr, "api: rig-create boot sweep (%s): %v\n", cityName, err) //nolint:errcheck // best-effort stderr
-		}
-		return nil
-	})
+		// G13 §6 sweep-before-serve: reconcile this city's orphan in_flight
+		// rig-create idem records before it is published into the registry (and
+		// thus before the SupervisorMux can route a rig-create/sling request to
+		// it), so a same-id retry can never re-clone over un-torn-down debris.
+		_ = runPostPrepareStep("sweeping_rig_provisions", func() error {
+			if err := cs.sweepOrphanRigProvisions(cityCtx); err != nil {
+				fmt.Fprintf(stderr, "api: rig-create boot sweep (%s): %v\n", cityName, err) //nolint:errcheck // best-effort stderr
+			}
+			return nil
+		})
 
-	// Run pool on_boot hooks (same as runController does).
-	if err := runPostPrepareStep("running_pool_on_boot", func() error {
-		runPoolOnBoot(cfg, path, shellRunHook, stderr)
-		return nil
-	}); err != nil {
-		// Same as the controller-state branch above: the runtime is built,
-		// so it is shut down rather than abandoned with its storage binding
-		// still open.
-		cityCancel()
-		cityRuntime.shutdown()
-		if fr != nil {
-			fr.Close() //nolint:errcheck
+		// Run pool on_boot hooks (same as runController does).
+		if err := runPostPrepareStep("running_pool_on_boot", func() error {
+			runPoolOnBoot(cfg, path, shellRunHook, stderr)
+			return nil
+		}); err != nil {
+			// Same as the controller-state branch above: the runtime is built,
+			// so it is shut down rather than abandoned with its storage binding
+			// still open.
+			cityCancel()
+			cityRuntime.shutdown()
+			if fr != nil {
+				fr.Close() //nolint:errcheck
+			}
+			emitPendingCityCreateFailure(cr, path, cityName, "pool_on_boot_failed", err, stderr)
+			recordInitFailure(cityName, fmt.Sprintf("pool on_boot: %v", err))
+			return
 		}
-		emitPendingCityCreateFailure(cr, path, cityName, "pool_on_boot_failed", err, stderr)
-		recordInitFailure(cityName, fmt.Sprintf("pool on_boot: %v", err))
-		return
 	}
 
 	// Insert into map BEFORE launching goroutine to prevent races
