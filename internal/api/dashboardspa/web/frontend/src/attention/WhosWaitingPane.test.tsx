@@ -10,12 +10,21 @@ import { WhosWaitingPane } from './WhosWaitingPane';
 // Renders the real component against a stubbed fetch, so the BFF decoder, the
 // supervisor client, the pure selector, and the paint are all exercised
 // together — the seam this pane actually fails at is the wire, not the markup.
+//
+// The claim under test is the evidence contract: a row's words must never
+// outrun what was actually probed.
 
 interface StubOptions {
   attention?: unknown;
   attentionStatus?: number;
-  /** Reject every /pending probe, as an omp-only city does. */
-  pendingUnsupported?: boolean;
+  /**
+   * How the per-session pending probe answers.
+   *  'pending'     — supported, with a live approval dialog (the confirming case)
+   *  'none'        — supported, nothing pending right now
+   *  'unsupported' — 200 { supported: false }, as an omp/ACP session answers
+   *  'error'       — the probe request fails outright
+   */
+  pending?: 'pending' | 'none' | 'unsupported' | 'error';
 }
 
 const ATTENTION_URL = '/api/city/test-city/attention';
@@ -76,6 +85,21 @@ function sessionRow(alias: string) {
   };
 }
 
+function pendingResponse(mode: StubOptions['pending']): Response {
+  if (mode === 'error') return jsonResponse({ error: 'probe blew up' }, { status: 500 });
+  if (mode === 'unsupported') return jsonResponse({ supported: false });
+  if (mode === 'none') return jsonResponse({ supported: true });
+  return jsonResponse({
+    supported: true,
+    pending: {
+      kind: 'approval',
+      request_id: 'req-1',
+      prompt: 'Run the migration?\nsecond line',
+      metadata: { tool_name: 'Bash' },
+    },
+  });
+}
+
 function stubFetch(options: StubOptions = {}) {
   vi.stubGlobal(
     'fetch',
@@ -118,18 +142,7 @@ function stubFetch(options: StubOptions = {}) {
         });
       }
       if (url.includes('/pending')) {
-        if (options.pendingUnsupported === true) {
-          return jsonResponse({ error: 'unsupported' }, { status: 501 });
-        }
-        return jsonResponse({
-          supported: true,
-          pending: {
-            kind: 'approval',
-            request_id: 'req-1',
-            prompt: 'Run the migration?\nsecond line',
-            metadata: { tool_name: 'Bash' },
-          },
-        });
+        return pendingResponse(options.pending);
       }
       throw new Error(`unexpected fetch: ${url}`);
     }),
@@ -166,55 +179,94 @@ afterEach(() => {
 });
 
 describe('WhosWaitingPane', () => {
-  it('renders the two tiers, links each seat, and accounts for what it hid', async () => {
+  it('confirms only the probed seat, reports the rest, and accounts for what it hid', async () => {
     stubFetch();
     const { container } = renderPane();
 
-    const blocked = await screen.findByTestId('whos-waiting-blocked');
-    expect(within(blocked).getByRole('heading', { name: 'Blocked on you' })).toBeDefined();
-
-    // katya: an omp permission request. qcore/archer: a claude question the
-    // pending probe confirmed, so it is promoted out of the idle tier.
-    await waitFor(() => {
-      const names = within(screen.getByTestId('whos-waiting-blocked'))
+    // qcore/archer: a claude question the pending probe independently confirmed.
+    const confirmed = await screen.findByTestId('whos-waiting-confirmed');
+    expect(within(confirmed).getByRole('heading', { name: 'Needs you (confirmed)' })).toBeDefined();
+    expect(
+      within(confirmed)
         .getAllByRole('link')
-        .map((link) => link.textContent);
-      expect(names).toEqual(['katya', 'qcore/archer']);
-    });
+        .map((l) => l.textContent),
+    ).toEqual(['qcore/archer']);
+    // The probe's own words, not the hook's generic summary.
+    expect(confirmed.textContent).toContain('Bash: Run the migration?');
+    expect(confirmed.textContent).not.toContain('unconfirmed');
+
+    // katya: an omp permission request with no probe of any kind. It is a
+    // REPORT, and it says so — it never reaches the confirmed section.
+    const unconfirmed = screen.getByTestId('whos-waiting-unconfirmed');
+    expect(
+      within(unconfirmed).getByRole('heading', { name: 'Reported waiting (unconfirmed)' }),
+    ).toBeDefined();
+    expect(
+      within(unconfirmed)
+        .getAllByRole('link')
+        .map((l) => l.textContent),
+    ).toEqual(['katya']);
+    // Wording, not wall clock: `useNow` is the real clock here, so the age
+    // phrase itself is not a stable assertion.
+    expect(unconfirmed.textContent).toMatch(
+      /reported permission request — as of \d+[hd] ago, unconfirmed/,
+    );
 
     const katyaLink = screen.getByRole('link', { name: 'katya' });
     expect(katyaLink.getAttribute('href')).toBe('/agents/katya');
     const archerLink = screen.getByRole('link', { name: 'qcore/archer' });
     expect(archerLink.getAttribute('href')).toBe('/agents/qcore%2Farcher');
 
-    // The probe's own words, not the hook's generic summary.
-    expect(screen.getByTestId('whos-waiting-blocked').textContent).toContain(
-      'Bash: Run the migration?',
-    );
-    expect(screen.getByTestId('whos-waiting-blocked').textContent).toContain('permission request');
-
-    // qcore/ghost has no live session: dropped, and counted alongside the
-    // registry's unreadable file.
+    // qcore/ghost has no live session by name: counted as unverifiable, and
+    // never described as stale — only the reaper can say that.
     expect(screen.queryByRole('link', { name: 'qcore/ghost' })).toBeNull();
     expect(screen.getByTestId('whos-waiting-footnote').textContent).toBe(
-      '1 stale entry hidden · 1 unreadable file',
+      '1 entry with no live session (unverifiable) · 1 unreadable file',
     );
+    expect(screen.getByTestId('whos-waiting-footnote').textContent).not.toContain('stale');
 
     assertAtMostOneMark(container);
   });
 
-  it('labels an unconfirmed claude question honestly and puts it in its own tier', async () => {
-    stubFetch({ pendingUnsupported: true });
+  it('does not confirm anything when the probe answers supported+none', async () => {
+    // The tmux probe sees approval markers only, so its negative is not
+    // evidence that the seat is fine.
+    stubFetch({ pending: 'none' });
     renderPane();
 
-    const idle = await screen.findByTestId('whos-waiting-idle');
-    expect(within(idle).getByRole('heading', { name: 'Waiting at prompt' })).toBeDefined();
-    expect(idle.textContent).toContain('qcore/archer');
-    expect(idle.textContent).toContain('idle at prompt');
-    // Never dressed up as an urgent question.
-    expect(idle.textContent).not.toContain('approval prompt');
-    // The probe failing must not take the rest of the pane down with it.
-    expect(screen.getByTestId('whos-waiting-blocked').textContent).toContain('katya');
+    const unconfirmed = await screen.findByTestId('whos-waiting-unconfirmed');
+    expect(screen.queryByTestId('whos-waiting-confirmed')).toBeNull();
+    expect(unconfirmed.textContent).toContain('qcore/archer');
+    expect(unconfirmed.textContent).toContain('reported idle at prompt');
+    expect(unconfirmed.textContent).toContain('unconfirmed');
+    expect(unconfirmed.textContent).not.toContain('approval prompt');
+  });
+
+  it('does not confirm anything when the runtime has no pane to probe', async () => {
+    stubFetch({ pending: 'unsupported' });
+    renderPane();
+
+    const unconfirmed = await screen.findByTestId('whos-waiting-unconfirmed');
+    expect(screen.queryByTestId('whos-waiting-confirmed')).toBeNull();
+    // Both seats are reports; the unsupported probe took nothing else down.
+    expect(
+      within(unconfirmed)
+        .getAllByRole('link')
+        .map((l) => l.textContent),
+    ).toEqual(['katya', 'qcore/archer']);
+  });
+
+  it('puts a seat whose probe errored in the collapsed unknown group, with the reason', async () => {
+    stubFetch({ pending: 'error' });
+    renderPane();
+
+    const unknown = await screen.findByTestId('whos-waiting-unknown');
+    expect(unknown.textContent).toContain('Unknown (1)');
+    expect(unknown.textContent).toContain('qcore/archer');
+    expect(unknown.textContent).toContain('unknown: probe failed');
+    // The failed probe costs exactly that one seat.
+    expect(screen.getByTestId('whos-waiting-unconfirmed').textContent).toContain('katya');
+    expect(screen.queryByTestId('whos-waiting-confirmed')).toBeNull();
   });
 
   it('shows one quiet line, and no headings, when nobody is waiting', async () => {
@@ -249,7 +301,9 @@ describe('WhosWaitingPane', () => {
     renderPane();
 
     await waitFor(() => {
-      expect(screen.getByTestId('whos-waiting-footnote').textContent).toBe('1 stale entry hidden');
+      expect(screen.getByTestId('whos-waiting-footnote').textContent).toBe(
+        '1 entry with no live session (unverifiable)',
+      );
     });
   });
 
