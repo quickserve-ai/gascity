@@ -299,7 +299,15 @@ func (c *CachingStore) nextReconcileDelay(now time.Time) time.Duration {
 		lastFullScanAt = c.lastScanAt
 	}
 	if lastFullScanAt.IsZero() {
-		lastFullScanAt = c.lastFreshAt
+		// Local writes refresh lastFreshAt, so it cannot date the first
+		// full-scan deadline (ga-yc0chj): with no reconcile and no Prime yet
+		// (a hung or failed prime), date it from when the reconciler was
+		// armed, which preserves one cadence of startup warmup; a store not
+		// yet armed is due at once.
+		lastFullScanAt = c.stats.ReconcilerArmedAt
+		if lastFullScanAt.IsZero() {
+			return 0
+		}
 	}
 	dueAt := lastFullScanAt.Add(clock.Backstop(c.adaptiveIntervalLocked()))
 	if !now.Before(dueAt) {
