@@ -168,7 +168,7 @@ func (c *BeadsCacheReconcileCheck) Run(_ *CheckContext) *CheckResult {
 			r.Message = "WATCH INACTIVE — controller is running but no beads cache published a reconcile heartbeat; " +
 				"nothing was evaluated (this is not a healthy verdict)"
 		} else {
-			r.Message = fmt.Sprintf("%d beads cache(s) reconciling within %d x their adaptive interval", watched, c.staleFactor)
+			r.Message = fmt.Sprintf("%d beads cache(s) within their reconcile watchdog window (see details for first-scan progress)", watched)
 			if skipped > 0 {
 				r.Message += fmt.Sprintf("; %d expected scope(s) NOT evaluated (see details)", skipped)
 			}
@@ -194,30 +194,16 @@ func (c *BeadsCacheReconcileCheck) Run(_ *CheckContext) *CheckResult {
 
 // reconcileStaleFixHint returns the operator next step for a stalled scope.
 //
-// The two shapes need OPPOSITE advice, and getting it wrong is expensive on a
-// live fleet, so they are split:
-//
-//   - NEVER reconciled since arming is the first-reconcile starvation defect
-//     (ga-yc0chj): nextReconcileDelay anchors the first full scan on lastFreshAt
-//     while stats.LastReconcileAt is still zero, and ~30 write paths bump
-//     lastFreshAt, so a store whose write traffic is denser than its cadence
-//     never becomes due. Restarting re-arms straight back into the same window —
-//     on the incident fleet the 17:33:04 restart was followed by 75 more minutes
-//     of silence before the first scan landed. Recommending a restart here
-//     spends live agent sessions to reproduce the fault.
-//   - Went stale AFTER reconciling normally is a different fault: a wedged bd
-//     full scan, or a backing-store outage holding the loop in its
-//     sync-failure backoff (up to 10 minutes between attempts). Read the cache
-//     state and LastProblem before touching the controller.
+// A missing first scan and a stalled established loop need distinct diagnostic
+// paths. Neither heartbeat shape alone establishes the cause or warrants restart.
 func reconcileStaleFixHint(neverReconciled bool) string {
 	const common = "cross-check ~/.gc/supervisor.log: 'beads cache: stagger=' marks the arm, " +
 		"'beads cache: reconciled rig=<prefix>' marks each completed scan (rate-limited to one per minute)"
 	if neverReconciled {
-		return common + ". The named scope has NEVER completed a scan since it armed: this is the " +
-			"first-reconcile starvation defect (ga-yc0chj), where local write traffic keeps pushing " +
-			"the first full scan out of reach. Do NOT restart the controller to clear it — a restart " +
-			"re-arms into the same starvation window and costs every live session for nothing. It " +
-			"self-clears on a write lull longer than the cadence, and is immune once one scan lands"
+		return common + ". The named scope has NEVER completed a scan since it armed. Check whether " +
+			"priming or the first backing-store scan is blocked, and inspect the cache state and last problem " +
+			"for retry backoff. On older builds, local writes can postpone the first scan (ga-yc0chj). " +
+			"Do NOT restart solely on this heartbeat: establish the cause first"
 	}
 	return common + ". The named scope reconciled normally and then stopped, so check the cache " +
 		"state and last problem first (a degraded state means the backing store is failing and the " +
@@ -264,8 +250,8 @@ func evaluateReconcileHeartbeat(scope string, hb beads.ReconcileHeartbeat, now t
 	}
 
 	last := hb.LastReconcileAt
-	neverReconciled := last.IsZero()
-	if neverReconciled || last.Before(hb.ArmedAt) {
+	neverReconciled := last.IsZero() || last.Before(hb.ArmedAt)
+	if neverReconciled {
 		last = hb.ArmedAt
 	}
 	age := now.Sub(last)
@@ -274,6 +260,14 @@ func evaluateReconcileHeartbeat(scope string, hb beads.ReconcileHeartbeat, now t
 		return reconcileHeartbeatVerdict{detail: "heartbeat is stamped in the future"}
 	}
 	if age <= window {
+		if neverReconciled {
+			return reconcileHeartbeatVerdict{
+				evaluated:       true,
+				neverReconciled: true,
+				detail: fmt.Sprintf("awaiting first reconcile; armed %s ago (window %s, interval %s)",
+					age.Round(time.Second), window.Round(time.Second), interval),
+			}
+		}
 		return reconcileHeartbeatVerdict{
 			evaluated: true,
 			detail: fmt.Sprintf("last reconcile %s ago (window %s, interval %s)",
