@@ -85,13 +85,14 @@ func checkDeployFreeze(path, ack string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	if ack == "" {
+		//nolint:errcheck // best-effort stderr
 		fmt.Fprintf(stderr, "gc supervisor install: BLOCKED — a gated deploy candidate is frozen on this machine.\n"+
 			"  bead: %s  frozen_by: %s  commit: %s\n  reason: %s\n"+
 			"A routine deploy must not silently supersede a gated candidate (ga-rfdkxp).\n"+
 			"Either install the frozen candidate per its bead, or consciously supersede:\n"+
 			"  gc supervisor install --acknowledge-freeze %s\n"+
 			"then stamp the supersede decision on the bead.\n",
-			fz.Bead, fz.FrozenBy, fz.Commit, fz.Reason, fz.Bead) //nolint:errcheck // best-effort stderr
+			fz.Bead, fz.FrozenBy, fz.Commit, fz.Reason, fz.Bead)
 		return 1
 	}
 	if ack != fz.Bead {
@@ -103,8 +104,9 @@ func checkDeployFreeze(path, ack string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "gc supervisor install: could not record freeze supersede (%v) — refusing rather than proceeding without the durable record.\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
+	//nolint:errcheck // best-effort stdout
 	fmt.Fprintf(stdout, "gc supervisor install: freeze %s consciously superseded; record kept at %s.\n"+
 		"STAMP THE BEAD NOW: gc bd comment %s \"deploy freeze superseded by <who>: <why>\"\n",
-		fz.Bead, superseded, fz.Bead) //nolint:errcheck // best-effort stdout
+		fz.Bead, superseded, fz.Bead)
 	return 0
 }

@@ -1743,12 +1743,15 @@ The recipient defaults to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human".`,
 // cmdMailSend is the CLI entry point for sending mail. It opens the provider,
 // resolves session mailbox identities, and delegates to doMailSend.
 // The to parameter is the --to flag value (empty if not set).
-func cmdMailSend(args []string, notify bool, all bool, from string, to string, subject string, message string, stdout, stderr io.Writer) int {
-	return cmdMailSendJSON(args, notify, all, from, to, subject, message, false, stdout, stderr)
+//
+//nolint:unparam // test-facing compat shim: parameters mirror cmdMailSendJSONRef even where every current caller passes the default
+func cmdMailSend(args []string, all bool, from string, to string, subject string, message string, stdout, stderr io.Writer) int {
+	return cmdMailSendJSON(args, false, all, from, to, subject, message, stdout, stderr)
 }
 
-func cmdMailSendJSON(args []string, notify bool, all bool, from string, to string, subject string, message string, jsonOut bool, stdout, stderr io.Writer) int {
-	return cmdMailSendJSONRef(args, notify, all, from, to, subject, message, "", jsonOut, stdout, stderr)
+//nolint:unparam // test-facing compat shim: parameters mirror cmdMailSendJSONRef even where every current caller passes the default
+func cmdMailSendJSON(args []string, notify bool, all bool, from string, to string, subject string, message string, stdout, stderr io.Writer) int {
+	return cmdMailSendJSONRef(args, notify, all, from, to, subject, message, "", false, stdout, stderr)
 }
 
 // cmdMailSendJSONRef is cmdMailSendJSON plus the sender-supplied reachable

@@ -133,7 +133,7 @@ func (c *OrderExecTargetCheck) scanTargets(ctx *CheckContext) ([]orderExecTarget
 	}
 	allOrders, err := scanOrderFiringCurrentOrders(cityPath, c.cfg)
 	if err != nil {
-		return nil, fmt.Errorf("scan orders: %v", err)
+		return nil, fmt.Errorf("scan orders: %w", err)
 	}
 	targets := make([]orderExecTarget, 0, len(allOrders))
 	for _, order := range allOrders {

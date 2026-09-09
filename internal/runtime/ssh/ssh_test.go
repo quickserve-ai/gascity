@@ -203,7 +203,7 @@ func runBoundedProbe(t *testing.T, timeout time.Duration, name string, args ...s
 }
 
 // TestRunBoundedProbe_ReapsStalledClient proves, without any ambient ssh
-// configuration, that a stalled prerequisite client is cancelled, reaped,
+// configuration, that a stalled prerequisite client is canceled, reaped,
 // and classified unavailable rather than hanging (ga-hz84hj regression).
 func TestRunBoundedProbe_ReapsStalledClient(t *testing.T) {
 	start := time.Now()
@@ -212,7 +212,7 @@ func TestRunBoundedProbe_ReapsStalledClient(t *testing.T) {
 		t.Fatal("stalled probe reported available (nil error)")
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
-		t.Fatalf("stalled probe not cancelled promptly: took %v", elapsed)
+		t.Fatalf("stalled probe not canceled promptly: took %v", elapsed)
 	}
 }
 

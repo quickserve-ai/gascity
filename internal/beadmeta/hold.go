@@ -9,7 +9,7 @@ import "strings"
 // enumerating classes (an enumeration silently misses the next class added
 // to the contract).
 //
-// Contract for consumers (ga-uica16; upstream analogue: the hold-label
+// Contract for consumers (ga-uica16; upstream analog: the hold-label
 // conventions doc's serve/exist split): a hold:*-parked bead must not be
 // SERVED as work or counted as UNASSIGNED pool demand — but assigned-work
 // paths (crash recovery, the owner's own queue) stay hold-transparent, or a

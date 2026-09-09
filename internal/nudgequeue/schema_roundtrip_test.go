@@ -70,8 +70,10 @@ func TestItemMarshalKnownFieldWinsOverStaleUnknown(t *testing.T) {
 }
 
 func TestCurrentSchemaRoundTripUnchanged(t *testing.T) {
-	item := Item{ID: "n-3", Agent: "a", Source: "s", Message: "m",
-		CreatedAt: time.Date(2026, 9, 8, 10, 0, 0, 0, time.UTC)}
+	item := Item{
+		ID: "n-3", Agent: "a", Source: "s", Message: "m",
+		CreatedAt: time.Date(2026, 9, 8, 10, 0, 0, 0, time.UTC),
+	}
 	out, err := json.Marshal(State{Pending: []Item{item}})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)

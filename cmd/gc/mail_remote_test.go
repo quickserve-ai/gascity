@@ -328,7 +328,7 @@ func TestCmdMail_ContextDispatchesRemote(t *testing.T) {
 
 	out.Reset()
 	errb.Reset()
-	if code := cmdMailSendJSON([]string{"mayor", "hi"}, false, false, "", "", "", "", false, &out, &errb); code != 0 {
+	if code := cmdMailSendJSON([]string{"mayor", "hi"}, false, false, "", "", "", "", &out, &errb); code != 0 {
 		t.Fatalf("send exit %d; stderr=%q", code, errb.String())
 	}
 	if code := cmdMailReplyJSON([]string{"mc-wisp-1", "ack"}, "", "", false, false, &out, &errb); code != 0 {
@@ -418,14 +418,14 @@ func TestCmdMail_ContextDispatchMatrix(t *testing.T) {
 	contextFlag = "peer"
 	out.Reset()
 	errb.Reset()
-	if code := cmdMailSendJSON([]string{"mayor", "hi"}, false, false, "", "", "", "", false, &out, &errb); code == 0 || strings.Contains(out.String(), "Sent message") || !strings.Contains(errb.String(), "gc mail send:") {
+	if code := cmdMailSendJSON([]string{"mayor", "hi"}, false, false, "", "", "", "", &out, &errb); code == 0 || strings.Contains(out.String(), "Sent message") || !strings.Contains(errb.String(), "gc mail send:") {
 		t.Errorf("remote failure: exit=%d stdout=%q stderr=%q", code, out.String(), errb.String())
 	}
 	// 2. GC_NO_API + --context is a conflict, surfaced before any wire call.
 	t.Setenv("GC_NO_API", "1")
 	out.Reset()
 	errb.Reset()
-	if code := cmdMailSendJSON([]string{"mayor", "hi"}, false, false, "", "", "", "", false, &out, &errb); code == 0 || !strings.Contains(errb.String(), "GC_NO_API") {
+	if code := cmdMailSendJSON([]string{"mayor", "hi"}, false, false, "", "", "", "", &out, &errb); code == 0 || !strings.Contains(errb.String(), "GC_NO_API") {
 		t.Errorf("GC_NO_API conflict: exit=%d stderr=%q", code, errb.String())
 	}
 	t.Setenv("GC_NO_API", "")
@@ -434,7 +434,7 @@ func TestCmdMail_ContextDispatchMatrix(t *testing.T) {
 	contextFlag = ""
 	out.Reset()
 	errb.Reset()
-	if code := cmdMailSendJSON([]string{"mayor", "hi"}, false, false, "", "", "", "", false, &out, &errb); code == 0 || !strings.Contains(errb.String(), "city") {
+	if code := cmdMailSendJSON([]string{"mayor", "hi"}, false, false, "", "", "", "", &out, &errb); code == 0 || !strings.Contains(errb.String(), "city") {
 		t.Errorf("no city: exit=%d stderr=%q", code, errb.String())
 	}
 	if strings.Contains(errb.String(), "target:") {

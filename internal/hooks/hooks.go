@@ -39,7 +39,7 @@ const (
 	// NOTE: this constant must move WITH the template's GC_OMP_HOOK_VERSION —
 	// the v4 template shipped while this stayed 3, so v4 (the ga-vat7sn
 	// pendingPrime fix) never triggered an upgrade of installed v3 hooks.
-	managedOmpHookVersion      = 5
+	managedOmpHookVersion = 5
 )
 
 var (
