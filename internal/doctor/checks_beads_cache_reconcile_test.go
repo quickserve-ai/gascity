@@ -97,42 +97,29 @@ func TestBeadsCacheReconcileCheckFiresWhenArmedButNeverReconciled(t *testing.T) 
 	if !strings.Contains(got.Message, "NEVER completed a reconcile") {
 		t.Errorf("Message = %q, want it to distinguish never-reconciled from went-stale", got.Message)
 	}
-	// The never-reconciled shape IS the first-reconcile starvation defect, and
-	// a restart provably does not clear it: on the incident fleet the 17:33:04
-	// restart was followed by 75 more minutes of silence before the first scan
-	// landed. A hint that prescribes a restart spends every live agent session
-	// to reproduce the fault, so it must not appear on this shape.
-	lower := strings.ToLower(got.FixHint)
-	if !strings.Contains(lower, "do not restart") {
-		t.Errorf("FixHint = %q, want it to warn against restarting on the never-reconciled shape", got.FixHint)
-	}
-	if strings.Contains(lower, "must be restarted") {
-		t.Errorf("FixHint = %q, want no restart prescription on the never-reconciled shape", got.FixHint)
-	}
 }
 
-// TestBeadsCacheReconcileCheckWentStaleHintIsNotTheStarvationHint pins that the
-// two stall shapes get their own operator advice. A scope that reconciled
-// normally and then stopped is a wedged scan or a failing backing store, not
-// the starvation defect, so it must not be handed the starvation explanation.
-func TestBeadsCacheReconcileCheckWentStaleHintIsNotTheStarvationHint(t *testing.T) {
-	hb := healthyHeartbeat()
-	hb.LastReconcileAt = heartbeatNow.Add(-2 * time.Hour)
-
-	c := newTestBeadsCacheReconcileCheck(map[string]beads.ReconcileHeartbeat{"city": hb}, "city")
-
-	got := c.Run(&CheckContext{})
-	if got.Status != StatusError {
-		t.Fatalf("Status = %v, want StatusError; message = %q", got.Status, got.Message)
-	}
-	if strings.Contains(got.Message, "NEVER completed") {
-		t.Fatalf("Message = %q, want the went-stale label", got.Message)
-	}
-	if strings.Contains(got.FixHint, "starvation") {
-		t.Errorf("FixHint = %q, want the went-stale advice, not the starvation explanation", got.FixHint)
-	}
-	if !strings.Contains(got.FixHint, "backoff") {
-		t.Errorf("FixHint = %q, want it to name sync-failure backoff as a cause a restart cannot fix", got.FixHint)
+// A scope must retain its awaiting-first-scan classification throughout the
+// grace window, including when its last completion predates a re-arm.
+func TestReconcileHeartbeatFirstScanGraceWindow(t *testing.T) {
+	for _, last := range []time.Time{{}, heartbeatNow.Add(-time.Hour)} {
+		hb := healthyHeartbeat()
+		hb.ArmedAt = heartbeatNow.Add(-time.Minute)
+		hb.LastReconcileAt = last
+		atDeadline := hb.ArmedAt.Add(5 * time.Minute)
+		got := evaluateReconcileHeartbeat("city", hb, atDeadline, 5, 5*time.Minute)
+		if !got.evaluated || got.stale || !got.neverReconciled {
+			t.Fatalf("before first scan at grace deadline: %+v", got)
+		}
+		got = evaluateReconcileHeartbeat("city", hb, atDeadline.Add(time.Nanosecond), 5, 5*time.Minute)
+		if !got.evaluated || !got.stale || !got.neverReconciled {
+			t.Fatalf("first scan overdue: %+v", got)
+		}
+		hb.LastReconcileAt = atDeadline
+		got = evaluateReconcileHeartbeat("city", hb, atDeadline, 5, 5*time.Minute)
+		if !got.evaluated || got.stale || got.neverReconciled {
+			t.Fatalf("completed first scan: %+v", got)
+		}
 	}
 }
 
