@@ -246,6 +246,13 @@ func (a *Order) AppliesToBackend(backend string) bool {
 	return slices.Contains(a.RequiresBackend, backend)
 }
 
+// IsRigScoped reports whether the order declares scope = "rig" explicitly.
+// An order that declares nothing is rig-scoped only under a rig import;
+// orderdiscovery.ScanAll says what each declaration means at each scope.
+func (a *Order) IsRigScoped() bool {
+	return a.Scope == "rig"
+}
+
 // TimeoutOrDefault returns the order's configured timeout, or the
 // default: 300s for exec orders, 30s for formula orders.
 func (a *Order) TimeoutOrDefault() time.Duration {
