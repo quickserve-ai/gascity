@@ -281,11 +281,15 @@ func (t *Transport) Deliver(ctx context.Context, n notify.Notification) (notify.
 	if cctx.Err() != nil {
 		reason := "timed out after " + timeout.String()
 		if ctx.Err() != nil {
-			reason = "was cancelled"
+			reason = "was canceled"
 		}
 		return notify.OutcomeAmbiguous, fmt.Errorf("claude-cloud send to %s %s; the message MAY have been queued remotely — not retrying (at-most-once)", id, reason)
 	}
-	return notify.OutcomeAmbiguous, fmt.Errorf("claude-cloud send to %s returned unprovable output (runErr=%v): %s — the message MAY have been queued remotely; not retrying (at-most-once)", id, runErr, detail)
+	runErrText := "<nil>"
+	if runErr != nil {
+		runErrText = runErr.Error()
+	}
+	return notify.OutcomeAmbiguous, fmt.Errorf("claude-cloud send to %s returned unprovable output (runErr=%s): %s — the message MAY have been queued remotely; not retrying (at-most-once)", id, runErrText, detail)
 }
 
 // classifyRefusal maps refusal-shaped CLI output onto typed outcomes. Called

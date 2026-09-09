@@ -856,7 +856,7 @@ func TestMessageVerbsRequireRefuseBeforeMaterializing(t *testing.T) {
 			prev := nudgeWarningWriter
 			nudgeWarningWriter = &warn
 			t.Cleanup(func() { nudgeWarningWriter = prev })
-			_, err := newMailNudgeFunc("human")(killPokeSessionIdentity, "gc-mail-1")
+			_, err := newMailNudgeFunc("human", "")(killPokeSessionIdentity, "gc-mail-1")
 			if err == nil || !strings.Contains(err.Error(), "refused the notice for gc-mail-1") {
 				t.Fatalf("notify err = %v, want the refusal", err)
 			}
