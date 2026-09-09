@@ -124,7 +124,10 @@ func (c *cloudWakeDoctorCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 		details = append(details, fact)
 	}
 
-	r.Details = append(findings, details...)
+	combined := make([]string, 0, len(findings)+len(details))
+	combined = append(combined, findings...)
+	combined = append(combined, details...)
+	r.Details = combined
 	if len(findings) > 0 {
 		r.Status = doctor.StatusWarning
 		r.Severity = doctor.SeverityAdvisory
