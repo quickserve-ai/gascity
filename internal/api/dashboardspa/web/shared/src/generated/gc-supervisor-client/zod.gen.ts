@@ -1072,6 +1072,7 @@ export const zAgentPatch = z.object({
     TmuxAlias: z.string().nullable(),
     Upstream: z.string().nullable(),
     WakeMode: z.string().nullable(),
+    WakeTransport: z.string().nullable(),
     WorkDir: z.string().nullable()
 });
 
