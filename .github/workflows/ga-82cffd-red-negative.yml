@@ -1,0 +1,95 @@
+# Temporary negative-control driver for ga-82cffd stage (ii-d).
+#
+# The carry-operational merge gate (ruleset 22632861) is ACTIVE. The green half
+# of the stage (ii-d) control is already demonstrated (rule-suite 4007218766:
+# github-actions[bot] merged a CI-green PR with all four merge-gate rules
+# passing). This driver demonstrates the RED half: a deliberately red PR must be
+# REFUSED merge server-side for a non-bypass actor.
+#
+# Every human collaborator is a repo admin and bypasses the ruleset, so the
+# actor is github-actions[bot] via this workflow's GITHUB_TOKEN (contents:write,
+# pull-requests:write, no admin, not on any bypass list) — the same proven
+# non-bypass identity as the ga-w1ollm canary driver this file descends from.
+#
+# The job ASSERTS REFUSAL: it exits 0 only when the merge attempt is rejected
+# and the PR is verified still open and unmerged afterwards. If the merge
+# unexpectedly SUCCEEDS the run goes red — that would mean the active merge
+# gate did not hold, and the merged red PR must be reverted immediately.
+#
+# Remove this file once ga-82cffd stage (ii-d) is recorded.
+name: ga-82cffd red negative control
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Number of the deliberately RED PR into carry/operational
+        required: true
+      expected_head_sha:
+        description: Expected PR head SHA (refuses to act if the head moved)
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  red-merge-attempt:
+    runs-on: ubuntu-latest
+    steps:
+      # Inputs reach the shell only via env (never inline interpolation) and
+      # are validated before use — the token carries contents:write.
+      - name: Attempt merge of a red PR and assert server-side refusal
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+        run: |
+          set -u
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "pr_number must be numeric"; exit 1; }
+          [[ "$EXPECTED_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "expected_head_sha must be a full SHA"; exit 1; }
+
+          # Preconditions: open PR into carry/operational at the expected head.
+          pr_json=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --json state,baseRefName,headRefOid,mergeStateStatus)
+          echo "precondition state: $pr_json"
+          state=$(jq -r .state <<<"$pr_json")
+          base=$(jq -r .baseRefName <<<"$pr_json")
+          head=$(jq -r .headRefOid <<<"$pr_json")
+          [ "$state" = "OPEN" ] || { echo "PR #$PR_NUMBER is not open (state=$state)"; exit 1; }
+          [ "$base" = "carry/operational" ] || { echo "PR #$PR_NUMBER base is $base, not carry/operational"; exit 1; }
+          [ "$head" = "$EXPECTED_HEAD_SHA" ] || { echo "PR head moved: $head != $EXPECTED_HEAD_SHA"; exit 1; }
+
+          # Honesty gate: the required context must be RED at this head — an
+          # actually-failing check, not merely pending/expected. A control run
+          # against a pending check would prove less than the spec asks.
+          required_state=$(gh api \
+            "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD_SHA/check-runs" \
+            --paginate --jq '[.check_runs[] | select(.name == "CI / required")] | max_by(.started_at) | "\(.status)/\(.conclusion)"')
+          echo "CI / required at $EXPECTED_HEAD_SHA: $required_state"
+          [ "$required_state" = "completed/failure" ] || {
+            echo "required check is not red yet ($required_state) — dispatch again once it is"; exit 1; }
+
+          # The merge attempt, as github-actions[bot] (non-bypass).
+          set +e
+          merge_out=$(gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --merge \
+            --match-head-commit "$EXPECTED_HEAD_SHA" 2>&1)
+          merge_rc=$?
+          set -e
+          echo "merge exit code: $merge_rc"
+          echo "merge output: $merge_out"
+
+          if [ "$merge_rc" -eq 0 ]; then
+            echo "::error::MERGE SUCCEEDED — the active merge gate DID NOT refuse a red PR. Revert immediately."
+            exit 1
+          fi
+
+          # Re-read server state: refusal must be real, not a client error.
+          post_json=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json state,mergedAt)
+          echo "post-attempt state: $post_json"
+          post_state=$(jq -r .state <<<"$post_json")
+          merged_at=$(jq -r .mergedAt <<<"$post_json")
+          [ "$post_state" = "OPEN" ] && [ "$merged_at" = "null" ] || {
+            echo "::error::PR is no longer open/unmerged after the attempt (state=$post_state mergedAt=$merged_at)"; exit 1; }
+
+          echo "REFUSAL CONFIRMED: non-bypass merge of red PR #$PR_NUMBER was rejected server-side; PR remains open and unmerged."
