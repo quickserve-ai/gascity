@@ -607,7 +607,7 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Ensure timing renderer is available
-        run: command -v jq >/dev/null || (sudo rm -f /etc/apt/sources.list.d/google-chrome* /etc/apt/sources.list.d/microsoft-prod* && sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends jq)
+        run: command -v jq >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends jq)
       - name: Run product metrics testhook profile
         env:
           OBSERVABLE_TIMING_FILE: ${{ runner.temp }}/cmd-gc-productmetrics-testhook.json
