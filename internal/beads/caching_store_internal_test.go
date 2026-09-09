@@ -2423,6 +2423,7 @@ func TestCachingStoreNextReconcileDelayUsesFreshnessWatchdog(t *testing.T) {
 	cache := NewCachingStoreForTest(NewMemStore(), nil)
 	cache.state = cacheLive
 	cache.lastFreshAt = time.Unix(100, 0)
+	cache.stats.ReconcilerArmedAt = time.Unix(100, 0)
 
 	if got := cache.nextReconcileDelay(time.Unix(110, 0)); got != 20*time.Second {
 		t.Fatalf("nextReconcileDelay(fresh) = %s, want 20s", got)
@@ -2435,7 +2436,8 @@ func TestCachingStoreNextReconcileDelayUsesFreshnessWatchdog(t *testing.T) {
 	}
 
 	cache.stats.LastReconcileAt = time.Time{}
-	cache.lastFreshAt = time.Unix(70, 0)
+	cache.stats.ReconcilerArmedAt = time.Unix(70, 0)
+	cache.lastFreshAt = time.Unix(109, 0)
 	if got := cache.nextReconcileDelay(time.Unix(110, 0)); got != 0 {
 		t.Fatalf("nextReconcileDelay(stale) = %s, want immediate reconcile", got)
 	}
