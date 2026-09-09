@@ -97,7 +97,7 @@ func remoteMailSubject(subject, body string) string {
 
 // cmdMailSendRemote is the remote arm of `gc mail send`. args are the
 // positional [to, body...] (after --to has been folded in by the caller).
-func cmdMailSendRemote(c *api.Client, target *remoteTarget, args []string, notify, all bool, from, to, subject, message string, jsonOut bool, stdout, stderr io.Writer) int {
+func cmdMailSendRemote(c *api.Client, target *remoteTarget, args []string, notify, all bool, from, to, subject, message, dedupKey string, jsonOut bool, stdout, stderr io.Writer) int {
 	fail := func(code, msg string) int {
 		if jsonOut {
 			return writeJSONError(stdout, stderr, code, msg, 1)
@@ -110,6 +110,9 @@ func cmdMailSendRemote(c *api.Client, target *remoteTarget, args []string, notif
 	}
 	if notify {
 		return fail("unsupported_remote", "gc mail send: --notify delivery for a remote city lands separately; send without --notify")
+	}
+	if strings.TrimSpace(dedupKey) != "" {
+		return fail("unsupported_remote", "gc mail send: --dedup is local-only (the remote mail API carries no dedup key); send without --dedup or dedup on the sending side")
 	}
 	if to != "" {
 		args = append([]string{to}, args...)
