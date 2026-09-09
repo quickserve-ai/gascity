@@ -90,6 +90,7 @@ Agent defines a configured agent in the city.
 | `prompt_template` | string |  |  | PromptTemplate is the path to this agent's prompt template file. Relative paths resolve against the city directory. |
 | `nudge` | string |  |  | Nudge is text typed into the agent's tmux session after startup. Used for CLI agents that don't accept command-line prompts. |
 | `session` | string |  |  | Session overrides the session transport for this agent. "" (default) uses the city-level session provider (typically tmux). "acp" uses the Agent Client Protocol (JSON-RPC over stdio). The agent's resolved provider must have supports_acp = true. Enum: `acp` |
+| `wake_transport` | string |  |  | WakeTransport selects this seat's notification-plane wake transport (claudemsg-bridge-design.md §4). "" and "session" mean today's worker.Handle wait-idle/queued path, byte-for-byte. "claude-cloud" (ga-bjbaui) delivers wake hints into a bound Claude Code cloud session. Selection is structural per-seat configuration validated at load — never a runtime capability probe; a seat whose harness lacks the selected transport is a config error, not a silent fallback. (Distinct from WakeMode, which controls resume-vs-fresh on wake.) Enum: `session`, `claude-cloud` |
 | `provider` | string |  |  | Provider names the provider preset to use for this agent. |
 | `upstream` | string |  |  | Upstream selects the model-serving endpoint (a key in [upstreams]) for this agent — WHO serves the model. "" (default) falls back to agent_defaults.upstream; if still empty, no upstream env is injected (ambient behavior). Switching it relaunches the agent in the warm box. |
 | `start_command` | string |  |  | StartCommand overrides the provider's command for this agent. |
@@ -170,6 +171,7 @@ AgentOverride modifies a pack-stamped agent for a specific rig.
 | `pre_start` | []string |  |  | PreStart overrides the agent's pre_start commands. |
 | `prompt_template` | string |  |  | PromptTemplate overrides the prompt template path. Relative paths resolve against the declaring config file's directory (pack-safe). Paths prefixed with "//" resolve against the city root. |
 | `session` | string |  |  | Session overrides the session transport ("acp"). |
+| `wake_transport` | string |  |  | WakeTransport overrides the seat's notification-plane wake transport ("session" or "claude-cloud"; see Agent.WakeTransport). |
 | `provider` | string |  |  | Provider overrides the provider name. |
 | `upstream` | string |  |  | Upstream overrides the model-serving endpoint selection (Phase C). |
 | `args` | []string |  |  | Args overrides the provider's default arguments. Leave unset to keep the pack-defined args; set to an empty list to clear them; set to a populated list to replace them entirely (full replace, not append). |
@@ -228,6 +230,7 @@ AgentPatch modifies an existing agent identified by (Dir, Name).
 | `pre_start` | []string |  |  | PreStart overrides the agent's pre_start commands. |
 | `prompt_template` | string |  |  | PromptTemplate overrides the prompt template path. Relative paths resolve against the declaring config file's directory (pack-safe). Paths prefixed with "//" resolve against the city root. |
 | `session` | string |  |  | Session overrides the session transport ("acp" or "tmux"). |
+| `wake_transport` | string |  |  | WakeTransport overrides the seat's notification-plane wake transport ("session" or "claude-cloud"; see Agent.WakeTransport). |
 | `provider` | string |  |  | Provider overrides the provider name. |
 | `upstream` | string |  |  | Upstream overrides the model-serving endpoint selection (Phase C). |
 | `args` | []string |  |  | Args overrides the provider's default arguments. Leave unset to keep the pack-defined args; set to an empty list to clear them; set to a populated list to replace them entirely (full replace, not append). |

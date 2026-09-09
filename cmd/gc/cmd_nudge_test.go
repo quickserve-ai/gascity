@@ -16,6 +16,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/notify"
 	"github.com/gastownhall/gascity/internal/nudgepoller"
 	"github.com/gastownhall/gascity/internal/nudgequeue"
 	"github.com/gastownhall/gascity/internal/pidutil"
@@ -1566,7 +1567,7 @@ func TestSendMailNotifyWithWorkerManagedNonRunningQueuesWakeForController(t *tes
 	}
 	beforeCalls := len(fake.Calls)
 
-	if err := sendMailNotifyWithWorker(target, store, fake, "human"); err != nil {
+	if err := sendMailNotifyWithWorker(target, store, fake); err != nil {
 		t.Fatalf("sendMailNotifyWithWorker: %v", err)
 	}
 	if pokes != 1 {
@@ -1645,7 +1646,7 @@ func TestSendMailNotifyWithWorkerManagedQueueFailureDoesNotWake(t *testing.T) {
 		agent:       config.Agent{Name: "worker", Provider: "claude"},
 	}
 
-	err = sendMailNotifyWithWorker(target, store, fake, "human")
+	err = sendMailNotifyWithWorker(target, store, fake)
 	if err == nil {
 		t.Fatal("sendMailNotifyWithWorker: expected queue error")
 	}
@@ -1719,7 +1720,7 @@ func TestSendMailNotifyQueuesIndependentRemindersForEachMail(t *testing.T) {
 	// Two mails arrive back to back; the first reminder is still pending
 	// (unread) when the second arrives.
 	for i := 0; i < 2; i++ {
-		if err := sendMailNotifyWithWorker(target, store, fake, "human"); err != nil {
+		if err := sendMailNotifyWithWorker(target, store, fake); err != nil {
 			t.Fatalf("sendMailNotifyWithWorker(call %d): %v", i+1, err)
 		}
 	}
@@ -1778,7 +1779,7 @@ func TestSendMailNotifyWithWorkerManagedWakeFailureRollsBackQueuedNudge(t *testi
 		agent:       config.Agent{Name: "worker", Provider: "claude"},
 	}
 
-	err = sendMailNotifyWithWorker(target, store, fake, "human")
+	err = sendMailNotifyWithWorker(target, store, fake)
 	if err == nil {
 		t.Fatal("sendMailNotifyWithWorker: expected wake conflict")
 	}
@@ -1872,7 +1873,7 @@ func TestSendMailNotifyWithWorkerManagedWaitNudgeWithdrawFailureKeepsQueuedNudge
 		agent:       config.Agent{Name: "worker", Provider: "claude"},
 	}
 
-	if err := sendMailNotifyWithWorker(target, store, fake, "human"); err != nil {
+	if err := sendMailNotifyWithWorker(target, store, fake); err != nil {
 		t.Fatalf("sendMailNotifyWithWorker: %v", err)
 	}
 	if withdraws != 1 {
@@ -1964,7 +1965,7 @@ func TestSendMailNotifyWithWorkerManagedWakePokeFailureIsNonFatal(t *testing.T) 
 	}
 	beforeCalls := len(fake.Calls)
 
-	if err := sendMailNotifyWithWorker(target, store, fake, "human"); err != nil {
+	if err := sendMailNotifyWithWorker(target, store, fake); err != nil {
 		t.Fatalf("sendMailNotifyWithWorker: %v", err)
 	}
 	if pokes != 1 {
@@ -2110,7 +2111,7 @@ func TestSendMailNotifyWithWorkerStartsPollerBySessionIDForAliasedTarget(t *test
 	}
 	t.Cleanup(func() { startNudgePoller = prev })
 
-	if err := sendMailNotifyWithWorker(target, store, fake, "human"); err != nil {
+	if err := sendMailNotifyWithWorker(target, store, fake); err != nil {
 		t.Fatalf("sendMailNotifyWithWorker: %v", err)
 	}
 	if !called {
@@ -2209,7 +2210,7 @@ func TestSendMailNotifyWithWorkerWaitIdlePreservesMailSource(t *testing.T) {
 		sessionName: info.SessionName,
 	}
 
-	if err := sendMailNotifyWithWorker(target, store, fake, "human"); err != nil {
+	if err := sendMailNotifyWithWorker(target, store, fake); err != nil {
 		t.Fatalf("sendMailNotifyWithWorker: %v", err)
 	}
 
@@ -2255,7 +2256,7 @@ func TestSendMailNotifyWithWorkerQueuesWhenRuntimeIsGone(t *testing.T) {
 	}
 
 	startCalls := len(fake.Calls)
-	if err := sendMailNotifyWithWorker(target, store, fake, "human"); err != nil {
+	if err := sendMailNotifyWithWorker(target, store, fake); err != nil {
 		t.Fatalf("sendMailNotifyWithWorker: %v", err)
 	}
 	for _, call := range fake.Calls[startCalls:] {
@@ -2304,7 +2305,7 @@ func TestSendMailNotifyWithWorkerQueuesWhenDirectProviderMisses(t *testing.T) {
 		sessionName: info.SessionName,
 	}
 
-	if err := sendMailNotifyWithWorker(target, store, fake, "human"); err != nil {
+	if err := sendMailNotifyWithWorker(target, store, fake); err != nil {
 		t.Fatalf("sendMailNotifyWithWorker: %v", err)
 	}
 
@@ -5178,4 +5179,235 @@ func TestResolveNudgePollInterval(t *testing.T) {
 			t.Fatalf("resolveNudgePollInterval = %v, want default %v", got, defaultNudgePollInterval)
 		}
 	})
+}
+
+func TestNudgeSenderIdentityPrecedenceAndStamp(t *testing.T) {
+	t.Setenv("GC_AGENT", "woodhouse")
+	t.Setenv("GC_ALIAS", "wh-alias")
+	t.Setenv("BEADS_ACTOR", "order:cert-landing-patrol")
+	t.Setenv("BD_ACTOR", "bd-actor")
+	t.Setenv("GC_SESSION_ID", "ga-sess42")
+
+	sender, senderSession := nudgeSenderIdentity()
+	if sender != "woodhouse" || senderSession != "ga-sess42" {
+		t.Fatalf("nudgeSenderIdentity = (%q,%q), want (woodhouse, ga-sess42)", sender, senderSession)
+	}
+
+	// Order-exec shape: no agent env, controller-stamped BEADS_ACTOR wins.
+	t.Setenv("GC_AGENT", "")
+	t.Setenv("GC_ALIAS", "")
+	sender, _ = nudgeSenderIdentity()
+	if sender != "order:cert-landing-patrol" {
+		t.Fatalf("order-exec sender = %q, want order:cert-landing-patrol", sender)
+	}
+
+	item := newQueuedNudgeWithOptions("gastown.mayor", "qc-4g802.1", "session", time.Now(), queuedNudgeOptions{})
+	if item.Sender != "order:cert-landing-patrol" || item.SenderSession != "ga-sess42" {
+		t.Fatalf("stamped item sender = (%q,%q), want (order:cert-landing-patrol, ga-sess42)", item.Sender, item.SenderSession)
+	}
+
+	out := formatNudgeInjectOutput([]queuedNudge{item})
+	if !strings.Contains(out, "[session from order:cert-landing-patrol] qc-4g802.1") {
+		t.Fatalf("inject output missing sender provenance:\n%s", out)
+	}
+}
+
+func TestNudgeSenderIdentityAbsentEnvLeavesBareSource(t *testing.T) {
+	for _, k := range []string{"GC_AGENT", "GC_ALIAS", "BEADS_ACTOR", "BD_ACTOR", "GC_SESSION_ID"} {
+		t.Setenv(k, "")
+	}
+	item := newQueuedNudgeWithOptions("gastown.mayor", "hello", "session", time.Now(), queuedNudgeOptions{})
+	if item.Sender != "" || item.SenderSession != "" {
+		t.Fatalf("expected empty sender fields, got (%q,%q)", item.Sender, item.SenderSession)
+	}
+	out := formatNudgeInjectOutput([]queuedNudge{item})
+	if !strings.Contains(out, "- [session] hello") {
+		t.Fatalf("bare-source render regressed:\n%s", out)
+	}
+}
+
+func TestSendMailNotifyCloudSeatWithoutSessionBeadRefusesLoudly(t *testing.T) {
+	target := nudgeTarget{agent: config.Agent{Name: "cloudy", WakeTransport: config.WakeTransportClaudeCloud}}
+	err := sendMailNotify(target, notify.Notification{Kind: notify.KindMailArrival, Sender: "x"})
+	if err == nil || !strings.Contains(err.Error(), "cloud binding") || !strings.Contains(err.Error(), "durably written") {
+		t.Fatalf("expected loud missing-binding refusal, got: %v", err)
+	}
+	if err != nil && !strings.Contains(err.Error(), "bind-cloud") {
+		t.Fatalf("refusal must name the binding command, got: %v", err)
+	}
+}
+
+// seedCloudWakeSessionBead creates a session bead carrying a cloud-wake
+// binding in a mem store, swaps the openNudgeBeadStore seam to serve that
+// store, and returns the bead ID plus the store. Serial (seam-swapping) test
+// helper — callers must not use t.Parallel.
+func seedCloudWakeSessionBead(t *testing.T, meta map[string]string) (string, beads.Store) {
+	t.Helper()
+	store := beads.NewMemStore()
+	b, err := store.Create(beads.Bead{Type: session.BeadType, Labels: []string{"gc:session"}})
+	if err != nil {
+		t.Fatalf("seeding session bead: %v", err)
+	}
+	for k, v := range meta {
+		if err := store.SetMetadata(b.ID, k, v); err != nil {
+			t.Fatalf("set %s: %v", k, err)
+		}
+	}
+	prev := openNudgeBeadStore
+	openNudgeBeadStore = func(string) beads.NudgesStore {
+		return beads.NudgesStore{Store: store}
+	}
+	t.Cleanup(func() { openNudgeBeadStore = prev })
+	return b.ID, store
+}
+
+func TestSendMailNotifyCloudSeatWithoutBindingMetadataRefusesLoudly(t *testing.T) {
+	beadID, _ := seedCloudWakeSessionBead(t, map[string]string{"session_name": "cloudy"})
+	target := nudgeTarget{
+		sessionID: beadID,
+		agent:     config.Agent{Name: "cloudy", WakeTransport: config.WakeTransportClaudeCloud},
+	}
+	err := sendMailNotify(target, notify.Notification{Kind: notify.KindMailArrival, Sender: "x"})
+	if err == nil || !strings.Contains(err.Error(), session.MetadataCloudWakeSessionID) || !strings.Contains(err.Error(), "bind-cloud") {
+		t.Fatalf("expected missing-binding refusal naming the metadata key and bind command, got: %v", err)
+	}
+}
+
+// TestSendMailNotifyCloudSeatWithoutAccountLineageRefusesLoudly: a binding
+// with a session ID but no account lineage must refuse before any send —
+// ambient auth is refused by design (§5.1).
+func TestSendMailNotifyCloudSeatWithoutAccountLineageRefusesLoudly(t *testing.T) {
+	beadID, _ := seedCloudWakeSessionBead(t, map[string]string{
+		"session_name":                     "cloudy",
+		session.MetadataCloudWakeSessionID: "session_01TESTnoLINEAGE0000000000",
+	})
+	target := nudgeTarget{
+		sessionID: beadID,
+		agent:     config.Agent{Name: "cloudy", WakeTransport: config.WakeTransportClaudeCloud},
+	}
+	err := sendMailNotify(target, notify.Notification{Kind: notify.KindMailArrival, Sender: "x", Ref: "https://github.com/example/repo/pull/7"})
+	if err == nil || !strings.Contains(err.Error(), session.MetadataCloudWakeAccountDir) || !strings.Contains(err.Error(), "ambient auth") {
+		t.Fatalf("expected ambient-auth refusal naming the lineage key, got: %v", err)
+	}
+}
+
+// TestDeliverClaudeCloudNotifySuspectStamping drives the full stage-4 branch
+// with a stubbed CLI: a "Session not found" refusal must stamp both the
+// reachability facts and the suspect marker onto the session bead — and must
+// NOT delete the binding (suspect is not dead, design §5.2).
+func TestDeliverClaudeCloudNotifySuspectStamping(t *testing.T) {
+	cliDir := t.TempDir()
+	cliPath := cliDir + "/claude"
+	script := "#!/bin/sh\nprintf 'Session not found: x' >&2\nexit 1\n"
+	if err := os.WriteFile(cliPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", cliDir)
+
+	const cloudID = "session_01TESTsuspectSTAMPING00000"
+	beadID, store := seedCloudWakeSessionBead(t, map[string]string{
+		"session_name":                      "cloudy",
+		session.MetadataCloudWakeSessionID:  cloudID,
+		session.MetadataCloudWakeAccountDir: "/tmp/accounts/q-withq",
+	})
+	target := nudgeTarget{
+		sessionID: beadID,
+		agent:     config.Agent{Name: "cloudy", WakeTransport: config.WakeTransportClaudeCloud},
+	}
+	err := sendMailNotify(target, notify.Notification{
+		Kind:   notify.KindMailArrival,
+		Sender: "mayor",
+		Ref:    "https://github.com/example/repo/pull/7",
+	})
+	if err == nil || !strings.Contains(err.Error(), "refused") {
+		t.Fatalf("expected a refusal error, got: %v", err)
+	}
+	b, gerr := store.Get(beadID)
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	if got := b.Metadata[session.MetadataCloudWakeLastOutcome]; got != string(notify.OutcomeRefusedNotFound) {
+		t.Errorf("last outcome = %q, want %q", got, notify.OutcomeRefusedNotFound)
+	}
+	if got := b.Metadata[session.MetadataCloudWakeBindingSuspect]; got != string(notify.OutcomeRefusedNotFound) {
+		t.Errorf("suspect marker = %q, want %q", got, notify.OutcomeRefusedNotFound)
+	}
+	if b.Metadata[session.MetadataCloudWakeBindingSuspectAt] == "" || b.Metadata[session.MetadataCloudWakeLastOutcomeAt] == "" {
+		t.Error("suspect/outcome timestamps not stamped")
+	}
+	if got := b.Metadata[session.MetadataCloudWakeSessionID]; got != cloudID {
+		t.Errorf("binding must survive a suspect marking (suspect is not dead), got %q", got)
+	}
+}
+
+// TestDeliverClaudeCloudNotifyAcceptedStampsOutcomeOnly: an accepted send is
+// queued_remote (accepted != delivered), stamps reachability, and leaves the
+// binding unsuspected.
+func TestDeliverClaudeCloudNotifyAcceptedStampsOutcomeOnly(t *testing.T) {
+	cliDir := t.TempDir()
+	cliPath := cliDir + "/claude"
+	script := "#!/bin/sh\nprintf '{\"ok\":true}'\n"
+	if err := os.WriteFile(cliPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", cliDir)
+
+	beadID, store := seedCloudWakeSessionBead(t, map[string]string{
+		"session_name":                      "cloudy",
+		session.MetadataCloudWakeSessionID:  "session_01TESTacceptedOUTCOME0000",
+		session.MetadataCloudWakeAccountDir: "/tmp/accounts/q-withq",
+	})
+	target := nudgeTarget{
+		sessionID: beadID,
+		agent:     config.Agent{Name: "cloudy", WakeTransport: config.WakeTransportClaudeCloud},
+	}
+	err := sendMailNotify(target, notify.Notification{
+		Kind:   notify.KindMailArrival,
+		Sender: "mayor",
+		Ref:    "https://github.com/example/repo/pull/7",
+	})
+	if err != nil {
+		t.Fatalf("accepted send must not error: %v", err)
+	}
+	b, gerr := store.Get(beadID)
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	if got := b.Metadata[session.MetadataCloudWakeLastOutcome]; got != string(notify.OutcomeQueuedRemote) {
+		t.Errorf("last outcome = %q, want %q", got, notify.OutcomeQueuedRemote)
+	}
+	if got := b.Metadata[session.MetadataCloudWakeBindingSuspect]; got != "" {
+		t.Errorf("accepted send must not mark the binding suspect, got %q", got)
+	}
+}
+
+// TestDeliverClaudeCloudNotifyUnreachableRefRefused: a cloud seat whose
+// notification carries only a bead:// ref (unreachable from the cloud
+// sandbox) is refused before any subprocess runs.
+func TestDeliverClaudeCloudNotifyUnreachableRefRefused(t *testing.T) {
+	beadID, store := seedCloudWakeSessionBead(t, map[string]string{
+		"session_name":                      "cloudy",
+		session.MetadataCloudWakeSessionID:  "session_01TESTunreachableREF00000",
+		session.MetadataCloudWakeAccountDir: "/tmp/accounts/q-withq",
+	})
+	t.Setenv("PATH", t.TempDir()) // no claude binary: exec would fail loudly
+	target := nudgeTarget{
+		sessionID: beadID,
+		agent:     config.Agent{Name: "cloudy", WakeTransport: config.WakeTransportClaudeCloud},
+	}
+	err := sendMailNotify(target, notify.Notification{
+		Kind:   notify.KindMailArrival,
+		Sender: "mayor",
+		Ref:    "bead://ga-wisp-xyz",
+	})
+	if err == nil || !strings.Contains(err.Error(), "https") {
+		t.Fatalf("expected unreachable-ref refusal, got: %v", err)
+	}
+	b, gerr := store.Get(beadID)
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	if got := b.Metadata[session.MetadataCloudWakeBindingSuspect]; got != "" {
+		t.Errorf("a ref usage error must not mark the binding suspect, got %q", got)
+	}
 }

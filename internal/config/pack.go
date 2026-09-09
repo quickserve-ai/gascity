@@ -2795,6 +2795,7 @@ func (ov *AgentOverride) toAgentPatch() *AgentPatch {
 		PreStart:                ov.PreStart,
 		PromptTemplate:          ov.PromptTemplate,
 		Session:                 ov.Session,
+		WakeTransport:           ov.WakeTransport,
 		Provider:                ov.Provider,
 		Upstream:                ov.Upstream,
 		Args:                    ov.Args,

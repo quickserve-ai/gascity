@@ -1580,6 +1580,14 @@ func defaultScaleCheckCountsAndDemand(cfg *config.City, targets []defaultScaleCh
 			if strings.TrimSpace(b.Assignee) != "" {
 				continue
 			}
+			// A hold:*-labeled bead is parked under the wait-class contract:
+			// owned-and-waiting, not dispatchable demand. Counting it spawns
+			// sessions for work that cannot progress (ga-uica16 — the pool
+			// consumed two sessions on a hold:cert-wait park). The shell
+			// count-form and worker claim tiers apply the same exclusion.
+			if beadCarriesHoldPark(b) {
+				continue
+			}
 			template := controllerDemandRouteTarget(cfg, b, group.templates)
 			if _, ok := group.templates[template]; !ok {
 				continue
@@ -1751,6 +1759,14 @@ func defaultNamedSessionDemand(targets []defaultScaleCheckTarget, _ *config.City
 // group.templates (keyed by base template names) and the demand is silently
 // dropped, so the pool never scales up. The returned value is the normalized
 // template name, since callers use it as the counts/demand map key.
+// beadCarriesHoldPark reports whether the bead carries any hold:* label — the
+// wait-class contract's park signal. The rule's single definition lives in
+// beadmeta (prefix rationale and the serve/exist contract are documented
+// there).
+func beadCarriesHoldPark(b beads.Bead) bool {
+	return beadmeta.HasHoldLabel(b.Labels)
+}
+
 func controllerDemandRouteTarget(cfg *config.City, b beads.Bead, templates map[string]struct{}) string {
 	for _, candidate := range controllerDemandRouteCandidates(b) {
 		normalized := agentutil.NormalizePoolRouteTarget(cfg, candidate)

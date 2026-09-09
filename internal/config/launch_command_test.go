@@ -257,3 +257,106 @@ func TestBuildProviderLaunchCommandWithoutOptionsIgnoresDeprecatedKindForSetting
 		t.Fatalf("unexpected settings source from deprecated Kind fallback: %#v", got)
 	}
 }
+
+func TestAppendClaudeSessionNameGates(t *testing.T) {
+	base := &ResolvedProvider{BuiltinAncestor: "claude", SessionDisplayName: "qcore/oversight.project-lead"}
+
+	if got := appendClaudeSessionName("claude --effort max", base, ""); got != "claude --effort max --name qcore/oversight.project-lead" {
+		t.Fatalf("tmux claude append = %q", got)
+	}
+	// Identity needing quoting.
+	quoted := &ResolvedProvider{BuiltinAncestor: "claude", SessionDisplayName: "a b"}
+	if got := appendClaudeSessionName("claude", quoted, "tmux"); got != `claude --name "a b"` && got != "claude --name 'a b'" {
+		t.Fatalf("quoted append = %q", got)
+	}
+	// ACP transport never gets the flag.
+	if got := appendClaudeSessionName("claude-code-acp", base, SessionTransportACP); got != "claude-code-acp" {
+		t.Fatalf("acp append = %q", got)
+	}
+	// Non-claude family untouched.
+	omp := &ResolvedProvider{BuiltinAncestor: "omp", SessionDisplayName: "deacon"}
+	if got := appendClaudeSessionName("omp run", omp, ""); got != "omp run" {
+		t.Fatalf("non-claude append = %q", got)
+	}
+	// Explicit --name in the command wins.
+	if got := appendClaudeSessionName("claude --name custom", base, ""); got != "claude --name custom" {
+		t.Fatalf("explicit --name overridden: %q", got)
+	}
+	// No identity -> untouched.
+	anon := &ResolvedProvider{BuiltinAncestor: "claude"}
+	if got := appendClaudeSessionName("claude", anon, ""); got != "claude" {
+		t.Fatalf("anonymous append = %q", got)
+	}
+}
+
+func TestAppendClaudeSessionNameIdentity(t *testing.T) {
+	base := &ResolvedProvider{BuiltinAncestor: "claude", SessionDisplayName: "qcore/cherub-law.mallory"}
+
+	// Explicit identity wins over the template-qualified SessionDisplayName —
+	// the addressable form is what a picker row must show (ga-n0rvsk req 1).
+	if got := AppendClaudeSessionNameIdentity("claude", base, "", "qcore/mallory"); got != "claude --name qcore/mallory" {
+		t.Fatalf("identity append = %q", got)
+	}
+	// Empty identity -> untouched (callers may pass a missing metadata field).
+	if got := AppendClaudeSessionNameIdentity("claude", base, "", ""); got != "claude" {
+		t.Fatalf("empty identity append = %q", got)
+	}
+	// Escape-hatch resolutions never stamp SessionDisplayName; a
+	// caller-supplied identity must not bypass that gate — the user owns
+	// that argv.
+	escape := &ResolvedProvider{BuiltinAncestor: "claude"}
+	if got := AppendClaudeSessionNameIdentity("claude --custom", escape, "", "woodhouse"); got != "claude --custom" {
+		t.Fatalf("escape-hatch append = %q", got)
+	}
+	// Family and transport gates still hold with an explicit identity.
+	omp := &ResolvedProvider{BuiltinAncestor: "omp", SessionDisplayName: "deacon"}
+	if got := AppendClaudeSessionNameIdentity("omp run", omp, "", "deacon"); got != "omp run" {
+		t.Fatalf("non-claude identity append = %q", got)
+	}
+	if got := AppendClaudeSessionNameIdentity("claude-code-acp", base, SessionTransportACP, "qcore/mallory"); got != "claude-code-acp" {
+		t.Fatalf("acp identity append = %q", got)
+	}
+}
+
+func TestBuildProviderResumeCommandCarriesSessionName(t *testing.T) {
+	rp := &ResolvedProvider{
+		BuiltinAncestor:    "claude",
+		SessionDisplayName: "woodhouse",
+		ResumeCommand:      "claude --resume {{session_key}}",
+	}
+	got, err := BuildProviderResumeCommand(rp, nil)
+	if err != nil {
+		t.Fatalf("BuildProviderResumeCommand: %v", err)
+	}
+	if got != "claude --resume {{session_key}} --name woodhouse" {
+		t.Fatalf("resume command = %q", got)
+	}
+}
+
+func TestResolveProviderStampsSessionDisplayName(t *testing.T) {
+	agent := Agent{Name: "woodhouse", Provider: "claude"}
+	ws := Workspace{}
+	resolved, err := ResolveProvider(&agent, &ws, map[string]ProviderSpec{"claude": BuiltinProviders()["claude"]}, func(string) (string, error) { return "/usr/bin/claude", nil })
+	if err != nil {
+		t.Fatalf("ResolveProvider: %v", err)
+	}
+	if resolved.SessionDisplayName != agent.QualifiedName() {
+		t.Fatalf("SessionDisplayName = %q, want %q", resolved.SessionDisplayName, agent.QualifiedName())
+	}
+}
+
+func TestValidateAgentsWakeTransportEnum(t *testing.T) {
+	ok := []Agent{
+		{Name: "a"},
+		{Name: "b", WakeTransport: WakeTransportSession},
+		{Name: "c", WakeTransport: WakeTransportClaudeCloud},
+	}
+	if err := ValidateAgents(ok); err != nil {
+		t.Fatalf("valid wake_transport values rejected: %v", err)
+	}
+	bad := []Agent{{Name: "d", WakeTransport: "carrier-pigeon"}}
+	err := ValidateAgents(bad)
+	if err == nil || !strings.Contains(err.Error(), "wake_transport") {
+		t.Fatalf("invalid wake_transport accepted: %v", err)
+	}
+}

@@ -38,6 +38,18 @@ func jqMeta(key string) string {
 	return `(.metadata["` + key + `"] // "")`
 }
 
+// holdParkExcludeSelectJQ drops beads carrying any hold:* label — parked
+// under the wait-class contract, so neither stranded nor dispatchable
+// (ga-uica16: two pool sessions consumed on a hold:cert-wait park). The
+// single definition of the rule lives in beadmeta (prefix rationale and the
+// serve/exist contract are documented there).
+const holdParkExcludeSelectJQ = beadmeta.HoldParkExcludeSelectJQ
+
+// holdParkFilterJQ wraps the exclusion select as a whole-array filter.
+func holdParkFilterJQ() string {
+	return `[.[] | ` + holdParkExcludeSelectJQ + `]`
+}
+
 func bdReadyPoolDemandShell(limitFlag string, includeEphemeralReady bool) string {
 	return `bd ready` + bdReadyIncludeEphemeralArg(includeEphemeralReady) + ` --metadata-field "` + beadmeta.RoutedToMetadataKey + `=$target" --unassigned --exclude-type=epic --json ` + limitFlag
 }
@@ -55,7 +67,7 @@ func bdReadyPoolDemandMigrationShell(limitFlag string, includeEphemeralReady boo
 }
 
 func poolDemandMigrationFilterJQ(limit int) string {
-	filter := `[.[] | select(` + jqMeta(beadmeta.RoutedToMetadataKey) + ` == "")]`
+	filter := `[.[] | select(` + jqMeta(beadmeta.RoutedToMetadataKey) + ` == "") | ` + holdParkExcludeSelectJQ + `]`
 	if limit > 0 {
 		filter += ` | .[:` + strconv.Itoa(limit) + `]`
 	}
@@ -89,7 +101,8 @@ func legacyEphemeralPoolDemandShell(limit int, includeEphemeralReady, quiet bool
 	}
 	filter := legacyEphemeralReadyFilterJQ(
 		`select((.assignee // "") == "")`+
-			` | select((`+jqMeta(beadmeta.RoutedToMetadataKey)+` == $target) or ((`+jqMeta(beadmeta.RoutedToMetadataKey)+` == "") and (`+jqMeta(beadmeta.RunTargetMetadataKey)+` == $target) and (`+jqMeta(beadmeta.KindMetadataKey)+` == "`+beadmeta.KindWorkflow+`")))`,
+			` | select((`+jqMeta(beadmeta.RoutedToMetadataKey)+` == $target) or ((`+jqMeta(beadmeta.RoutedToMetadataKey)+` == "") and (`+jqMeta(beadmeta.RunTargetMetadataKey)+` == $target) and (`+jqMeta(beadmeta.KindMetadataKey)+` == "`+beadmeta.KindWorkflow+`")))`+
+			` | `+holdParkExcludeSelectJQ,
 		limit,
 	)
 	query := bdQueryEphemeralStatusShell("open")
@@ -125,12 +138,21 @@ func poolDemandFirstRowFunctionScript(includeEphemeralReady bool) string {
 
 func routedReadyTierCommand(includeEphemeralReady bool) string {
 	// The shared predicate stays order-free so the count-form does no wasted
-	// sorting; the worker first-row path asks bd for the oldest candidates.
-	// The tier is widened past a single row (limit=20, not limit=1) so a
-	// self-blocked head (is_blocked / status==blocked) has Ready routed work
-	// behind it to fall through to instead of idle-exiting; the hook layer
+	// sorting; the worker first-row path rides bd's canonical
+	// (priority, created_at, id) default order. An explicit --sort oldest here
+	// makes the claim window priority-blind: a routed P0 behind more than
+	// --limit older lower-priority rows is never served at all (upstream
+	// gastownhall/gascity#5629, carried until it merges). FIFO fairness
+	// survives within a priority band via the created_at term. The tier is
+	// widened past a single row (limit=20, not limit=1) so a self-blocked
+	// head (is_blocked / status==blocked) has Ready routed work behind it to
+	// fall through to instead of idle-exiting; the hook layer
 	// (filterUnreadyHookCandidates) strips the blocked head from the result.
-	return bdReadyPoolDemandShell("--sort oldest --limit=20", includeEphemeralReady) + ` 2>/dev/null`
+	// hold:*-parked beads are stripped after the window (see
+	// holdParkExcludeSelectJQ); the count-form applies the same exclusion in
+	// its aggregation jq so claim and spawn decisions stay symmetric.
+	return bdReadyPoolDemandShell("--limit=20", includeEphemeralReady) +
+		` 2>/dev/null | jq -c ` + shellquote.Quote(holdParkFilterJQ()) + ` 2>/dev/null`
 }
 
 // poolDemandCountShell emits the reconciler count-form for target: it counts
@@ -150,7 +172,8 @@ func poolDemandCountShell(target string, includeEphemeralReady bool) string {
 		`legacy_candidates=$(` + bdReadyPoolDemandMigrationShell("--limit 0", includeEphemeralReady) + `) || exit $?; ` +
 		`legacy_json=$(printf "%s" "$legacy_candidates" | ` + poolDemandMigrationFilterJQ(0) + `) || exit $?; ` +
 		`legacy_ephemeral_json=$(` + legacyEphemeralPoolDemandShell(0, includeEphemeralReady, false) + `); ` +
-		`printf "%s\n%s\n%s\n" "$ready_json" "$legacy_json" "$legacy_ephemeral_json" | jq -s "(add // []) | unique_by(.id) | length"`
+		`printf "%s\n%s\n%s\n" "$ready_json" "$legacy_json" "$legacy_ephemeral_json" | jq -s ` +
+		shellquote.Quote(`(add // []) | unique_by(.id) | `+holdParkFilterJQ()+` | length`)
 	return shellquote.Join([]string{"sh", "-c", script, "--", target})
 }
 

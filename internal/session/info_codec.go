@@ -218,6 +218,17 @@ var infoKeyCodec = []infoKeySpec{
 		}
 	}},
 
+	// cloud-wake binding cluster (raw mirrors, single-field string setters).
+	// The claude-cloud transport and doctor read these projected fields;
+	// timestamps stay raw strings — consumers parse at the point of use.
+	{MetadataCloudWakeSessionID, func(i *Info, v string) { i.CloudWakeSessionID = v }},
+	{MetadataCloudWakeAccountDir, func(i *Info, v string) { i.CloudWakeAccountDir = v }},
+	{MetadataCloudWakeBindingSuspect, func(i *Info, v string) { i.CloudWakeBindingSuspect = v }},
+	{MetadataCloudWakeBindingSuspectAt, func(i *Info, v string) { i.CloudWakeBindingSuspectAt = v }},
+	{MetadataCloudWakeLastOutcome, func(i *Info, v string) { i.CloudWakeLastOutcome = v }},
+	{MetadataCloudWakeLastOutcomeAt, func(i *Info, v string) { i.CloudWakeLastOutcomeAt = v }},
+	{MetadataCloudWakeBoundAt, func(i *Info, v string) { i.CloudWakeBoundAt = v }},
+
 	// last_nudge_delivered_at: RFC3339 time. Reset-to-zero first (clears a
 	// carried-forward value in the patch direction; a no-op on a fresh Info).
 	{MetadataLastNudgeDeliveredAt, func(i *Info, v string) {

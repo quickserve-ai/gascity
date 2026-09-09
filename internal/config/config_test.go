@@ -1831,7 +1831,7 @@ func TestEffectiveWorkQueryDefault(t *testing.T) {
 	if strings.Contains(got, `--include-ephemeral`) {
 		t.Errorf("EffectiveWorkQuery() default must be bd 1.0.4-compatible without --include-ephemeral: %q", got)
 	}
-	if !strings.Contains(got, `bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --json --sort oldest --limit=20`) {
+	if !strings.Contains(got, `bd ready --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --json --limit=20`) {
 		t.Errorf("EffectiveWorkQuery() missing tier 3 pool-demand probe: %q", got)
 	}
 	if !strings.Contains(got, "-- mayor") {
@@ -1853,7 +1853,7 @@ func TestEffectiveWorkQueryDefault(t *testing.T) {
 func TestEffectiveWorkQueryBD105CompatibilityOptIn(t *testing.T) {
 	a := Agent{Name: "mayor"}
 	got := a.EffectiveWorkQueryForBeads(BeadsConfig{BDCompatibility: BeadsBDCompatibility105})
-	if !strings.Contains(got, `bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --json --sort oldest --limit=20`) {
+	if !strings.Contains(got, `bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --json --limit=20`) {
 		t.Errorf("EffectiveWorkQueryForBeads(bd-1.0.5) missing include-ephemeral routed probe: %q", got)
 	}
 	if !strings.Contains(got, `bd ready --include-ephemeral --assignee="$id" --json --limit=1`) {
@@ -2328,13 +2328,13 @@ func TestEffectiveWorkQueryControlDispatcherClaimsLegacyUnassignedRoute(t *testi
 	out := runEffectiveWorkQuery(t, a, nil, `#!/bin/sh
 set -eu
 case "$*" in
-  *"ready --include-ephemeral"*"--metadata-field gc.routed_to=gascity/control-dispatcher"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
+  *"ready --include-ephemeral"*"--metadata-field gc.routed_to=gascity/control-dispatcher"*"--unassigned"*"--exclude-type=epic"*"--json"*"--limit=20"*)
     printf '[]'
     ;;
-  *"ready --metadata-field gc.routed_to=gascity/control-dispatcher"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
+  *"ready --metadata-field gc.routed_to=gascity/control-dispatcher"*"--unassigned"*"--exclude-type=epic"*"--json"*"--limit=20"*)
     printf '[]'
     ;;
-  *"ready --metadata-field gc.routed_to=gascity/workflow-control"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
+  *"ready --metadata-field gc.routed_to=gascity/workflow-control"*"--unassigned"*"--exclude-type=epic"*"--json"*"--limit=20"*)
     printf '[{"id":"ga-legacy-route"}]'
     ;;
   *)
@@ -2347,7 +2347,7 @@ esac
 	}
 }
 
-func TestEffectiveWorkQueryRoutedQueueUsesNativeOldestSortAcrossReadyTiers(t *testing.T) {
+func TestEffectiveWorkQueryRoutedQueueUsesNativeCanonicalSortAcrossReadyTiers(t *testing.T) {
 	a := Agent{Name: "worker", Dir: "hello-world"}
 	got := a.EffectiveWorkQuery()
 	for _, want := range []string{
@@ -2363,19 +2363,19 @@ func TestEffectiveWorkQueryRoutedQueueUsesNativeOldestSortAcrossReadyTiers(t *te
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  "ready --metadata-field gc.routed_to=hello-world/worker --unassigned --exclude-type=epic --json --sort oldest --limit=20")
-    printf '[{"id":"older-no-history","priority":2,"created_at":"2026-05-20T06:09:30Z","no_history":true}]'
+  "ready --metadata-field gc.routed_to=hello-world/worker --unassigned --exclude-type=epic --json --limit=20")
+    printf '[{"id":"served-no-history","priority":2,"created_at":"2026-05-20T06:09:30Z","no_history":true}]'
     ;;
   *)
     printf '[]'
     ;;
 esac
 `)
-	if !strings.Contains(out, "older-no-history") {
-		t.Fatalf("EffectiveWorkQuery() did not pick oldest routed work: %q", out)
+	if !strings.Contains(out, "served-no-history") {
+		t.Fatalf("EffectiveWorkQuery() did not pick routed work from the reader's canonical-order window: %q", out)
 	}
 	if strings.Contains(out, "newer-durable") {
-		t.Fatalf("EffectiveWorkQuery() returned more than first oldest routed work: %q", out)
+		t.Fatalf("EffectiveWorkQuery() returned more than the first routed row: %q", out)
 	}
 }
 
@@ -2401,26 +2401,56 @@ func TestGeneratedBdReadCommandsStayBd104StorageCompatible(t *testing.T) {
 	}
 }
 
-func TestEffectiveWorkQueryRoutedQueueUsesOldestBeforePriority(t *testing.T) {
+// TestEffectiveWorkQueryRoutedQueueRidesReaderPriorityOrder pins the inverse
+// of the retired oldest-before-priority contract (upstream #5629, carried):
+// the routed tier carries NO explicit --sort, so the reader's canonical
+// (priority, created_at, id) default decides the served window and a younger
+// P0 outranks older P1/P2 rows. The stub emulates that reader: it serves the
+// priority-ordered window only for the flagless query, so a reintroduced
+// --sort oldest fails here as well as in the negative-assertion test.
+func TestEffectiveWorkQueryRoutedQueueRidesReaderPriorityOrder(t *testing.T) {
 	a := Agent{Name: "worker", Dir: "hello-world"}
 	out := runEffectiveWorkQuery(t, a, map[string]string{
 		"GC_SESSION_ORIGIN": "ephemeral",
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
+  *"--sort oldest"*)
     printf '[{"id":"older-p2","priority":2,"created_at":"2026-05-20T06:09:30Z"}]'
+    ;;
+  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--limit=20"*)
+    printf '[{"id":"newer-p0","priority":0,"created_at":"2026-05-21T06:09:30Z"},{"id":"older-p2","priority":2,"created_at":"2026-05-20T06:09:30Z"}]'
     ;;
   *)
     printf '[]'
     ;;
 esac
 `)
-	if !strings.Contains(out, "older-p2") {
-		t.Fatalf("EffectiveWorkQuery() did not pick oldest routed work across priorities: %q", out)
+	p0, p2 := strings.Index(out, "newer-p0"), strings.Index(out, "older-p2")
+	if p0 < 0 {
+		t.Fatalf("EffectiveWorkQuery() did not serve the reader's priority-ordered window (a reintroduced --sort oldest hits the first stub arm): %q", out)
 	}
-	if strings.Contains(out, "newer-p0") {
-		t.Fatalf("EffectiveWorkQuery() returned newer high-priority routed work before oldest: %q", out)
+	if p2 >= 0 && p2 < p0 {
+		t.Fatalf("EffectiveWorkQuery() served the older lower-priority row ahead of P0: %q", out)
+	}
+}
+
+// TestEffectiveWorkQueryRoutedTierServesCanonicalPriorityOrder pins the claim
+// tier's ordering contract: the tier 3 routed probe must ride the reader's
+// canonical (priority, created_at, id) default order, never an explicit
+// --sort oldest (upstream #5629, carried). The run_target migration fallback
+// keeps --sort oldest deliberately — it is a retirement-window probe, not the
+// claim path's order contract.
+func TestEffectiveWorkQueryRoutedTierServesCanonicalPriorityOrder(t *testing.T) {
+	blind := `"gc.routed_to=$target" --unassigned --exclude-type=epic --json --sort oldest`
+	a := Agent{Name: "worker"}
+	for name, got := range map[string]string{
+		"default": a.EffectiveWorkQuery(),
+		"bd105":   a.EffectiveWorkQueryForBeads(BeadsConfig{BDCompatibility: BeadsBDCompatibility105}),
+	} {
+		if strings.Contains(got, blind) {
+			t.Errorf("%s: routed tier must serve the reader's canonical priority-first default order, not --sort oldest: %q", name, got)
+		}
 	}
 }
 
@@ -2431,7 +2461,7 @@ func TestEffectiveWorkQueryRoutedFallbackUsesNativeOldestSort(t *testing.T) {
 	}, `#!/bin/sh
 set -eu
 case "$*" in
-  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
+  *"ready --metadata-field gc.routed_to=hello-world/worker"*"--unassigned"*"--exclude-type=epic"*"--json"*"--limit=20"*)
     printf '[]'
     ;;
   *"ready --metadata-field gc.run_target=hello-world/worker"*"--metadata-field gc.kind=workflow"*"--unassigned"*"--exclude-type=epic"*"--json"*"--sort oldest"*"--limit=20"*)
@@ -2842,7 +2872,7 @@ func TestPoolDemandPredicateSharedWithWorkQuery(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			wq := tt.agent.EffectiveWorkQuery()
 			demand := tt.agent.EffectivePoolDemandQuery()
-			workPredicate := bdReadyPoolDemandShell("--sort oldest --limit=20", false)
+			workPredicate := bdReadyPoolDemandShell("--limit=20", false)
 			if !strings.Contains(wq, workPredicate) {
 				t.Errorf("EffectiveWorkQuery() missing shared predicate %q in %q", workPredicate, wq)
 			}

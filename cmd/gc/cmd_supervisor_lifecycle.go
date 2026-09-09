@@ -1027,10 +1027,19 @@ starts on login.`,
 	}
 	cmd.Flags().BoolVar(&supervisorInstallForce, "force", false,
 		"overwrite an existing service unit even if it references a different gc binary")
+	cmd.Flags().StringVar(&supervisorAcknowledgeFreeze, "acknowledge-freeze", "",
+		"consciously supersede a standing deploy-freeze marker by its bead id (ga-rfdkxp)")
 	return cmd
 }
 
+// supervisorAcknowledgeFreeze is set by --acknowledge-freeze on
+// 'gc supervisor install'; see checkDeployFreeze.
+var supervisorAcknowledgeFreeze string
+
 func doSupervisorInstall(stdout, stderr io.Writer) int {
+	if rc := checkDeployFreeze(deployFreezePath(), supervisorAcknowledgeFreeze, stdout, stderr); rc != 0 {
+		return rc
+	}
 	delegation, delegated, err := supervisorSystemdDelegation()
 	if err != nil {
 		fmt.Fprintf(stderr, "gc supervisor install: %v\n", err) //nolint:errcheck // best-effort stderr

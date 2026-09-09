@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "next_id": 201,
+  "next_id": 202,
   "permanent_ids": [
     {
       "name": "help",
@@ -3524,6 +3524,21 @@
       "id": 140
     },
     {
+      "path": "gc session bind-cloud",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "session-bind-cloud",
+      "owner": "immediate",
+      "id": 201
+    },
+    {
       "path": "gc session close",
       "aliases": [],
       "conditional_modes": [],
@@ -3962,6 +3977,21 @@
       "canonical_target": "@help",
       "owner": "immediate",
       "id": 1
+    },
+    {
+      "path": "gc supervisor check-freeze",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": true,
+      "effective_hidden": true,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "classification": "excluded",
+      "notice_policy": "ineligible",
+      "recording_policy": "excluded",
+      "owner": "excluded",
+      "mode": "hidden-private",
+      "exclusion": "hidden-private"
     },
     {
       "path": "gc supervisor install",

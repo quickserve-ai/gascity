@@ -157,6 +157,17 @@ endif
 
 ## install: build and install gc to GOPATH/bin (same location as go install)
 install: check-self-contained
+	@# Deploy-freeze gate (ga-rfdkxp): a gated frozen candidate must not be
+	@# silently superseded by a routine install. The just-built binary runs
+	@# the exact Go guard (JSON parse, fail-closed on malformed/unreadable,
+	@# archive-or-refuse on ack) — never a shell reimplementation, which
+	@# drifted fail-open (sed-mined bead from malformed bytes; ignored mv
+	@# failure). Supersede consciously with FREEZE_ACK=<bead>, which leaves
+	@# a durable record and demands a stamp on the bead.
+	@if ! "$(BUILD_DIR)/$(BINARY)" supervisor check-freeze --acknowledge-freeze "$(FREEZE_ACK)"; then \
+		echo "       (via make: make install FREEZE_ACK=<bead>)"; \
+		exit 1; \
+	fi
 	@mkdir -p $(INSTALL_DIR)
 	@set -e; \
 		tmp="$(INSTALL_DIR)/.$(BINARY).tmp.$$$$"; \

@@ -24,6 +24,8 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/extmsg"
 	"github.com/gastownhall/gascity/internal/fsys"
+	"github.com/gastownhall/gascity/internal/notify"
+	"github.com/gastownhall/gascity/internal/notify/claudecloud"
 	"github.com/gastownhall/gascity/internal/nudgepoller"
 	"github.com/gastownhall/gascity/internal/nudgequeue"
 	"github.com/gastownhall/gascity/internal/pidutil"
@@ -373,21 +375,21 @@ func cmdNudgeStatus(args []string, jsonOutput bool, stdout, stderr io.Writer) in
 		fmt.Fprintln(stdout, "") //nolint:errcheck
 		for _, item := range pending {
 			_, _ = fmt.Fprintf(stdout, "pending  %s  due=%s  source=%s  %s\n",
-				item.ID, formatDueTime(item.DeliverAfter), item.Source, item.Message)
+				item.ID, formatDueTime(item.DeliverAfter), nudgeSourceLabel(item.Source, item.Sender), item.Message)
 		}
 	}
 	if len(inFlight) > 0 {
 		fmt.Fprintln(stdout, "") //nolint:errcheck
 		for _, item := range inFlight {
 			_, _ = fmt.Fprintf(stdout, "in-flight  %s  lease=%s  source=%s  %s\n",
-				item.ID, formatDueTime(item.LeaseUntil), item.Source, item.Message)
+				item.ID, formatDueTime(item.LeaseUntil), nudgeSourceLabel(item.Source, item.Sender), item.Message)
 		}
 	}
 	if len(dead) > 0 {
 		fmt.Fprintln(stdout, "") //nolint:errcheck
 		for _, item := range dead {
 			_, _ = fmt.Fprintf(stdout, "dead     %s  reason=%s  source=%s  %s\n",
-				item.ID, deadReason(item), item.Source, item.Message)
+				item.ID, deadReason(item), nudgeSourceLabel(item.Source, item.Sender), item.Message)
 		}
 	}
 	return 0
@@ -681,7 +683,21 @@ func cmdNudgePoll(args []string, sessionName string, interval, quiescence time.D
 	sessStore := cliSessionStore(store.Store, target.cfg, target.cityPath)
 	var missingSince time.Time
 	var lastFreeOS time.Time
+	staleCheck := newNudgePollerStaleCheck()
 	for {
+		// Pollers outlive binary swaps (supervisor install re-adopts, never
+		// cycles them), and a pre-swap poller's maintenance passes rewrite
+		// state.json through its older Item schema — plus serve stale logic
+		// (ga-aj9auz). Re-exec through the on-disk binary the moment it is no
+		// longer the one we are running; same PID, so the poller lease
+		// re-acquires cleanly in the fresh image.
+		if staleCheck.stale() {
+			fmt.Fprintf(stderr, "gc nudge poll: binary replaced on disk; re-executing %s\n", staleCheck.path) //nolint:errcheck
+			if err := nudgePollerReExec(staleCheck.path); err != nil {
+				fmt.Fprintf(stderr, "gc nudge poll: re-exec failed, continuing on current build: %v\n", err) //nolint:errcheck
+				staleCheck.disarm()
+			}
+		}
 		// Each tick that observes a changed beads.json re-parses the whole-file
 		// store, leaving several hundred MB of transient garbage. The soft
 		// memory limit caps live arena, but proactively returning freed pages to
@@ -731,6 +747,53 @@ func cmdNudgePoll(args []string, sessionName string, interval, quiescence time.D
 		}
 		time.Sleep(interval)
 	}
+}
+
+// nudgePollerStaleCheck detects the running poller binary being replaced on
+// disk. Identity is captured by stat at startup and compared with
+// os.SameFile, so an atomic-rename swap (new inode at the same path) trips
+// it while an untouched binary never does.
+type nudgePollerStaleCheck struct {
+	path  string
+	start os.FileInfo
+}
+
+func newNudgePollerStaleCheck() nudgePollerStaleCheck {
+	path, err := os.Executable()
+	if err != nil {
+		return nudgePollerStaleCheck{}
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nudgePollerStaleCheck{}
+	}
+	return nudgePollerStaleCheck{path: path, start: fi}
+}
+
+// stale reports whether the on-disk binary at the captured path is no longer
+// the file this process is running. Stat errors (path briefly absent, perms)
+// read as not-stale: delivery must never die on a probe failure.
+func (c nudgePollerStaleCheck) stale() bool {
+	if c.start == nil {
+		return false
+	}
+	fi, err := os.Stat(c.path)
+	if err != nil {
+		return false
+	}
+	return !os.SameFile(c.start, fi)
+}
+
+// disarm stops further staleness checks after a failed re-exec so the poller
+// does not spin retrying an exec that cannot succeed.
+func (c *nudgePollerStaleCheck) disarm() { c.start = nil }
+
+// nudgePollerReExec swaps this process image for the on-disk binary,
+// preserving argv and environment. Var for tests. On success it never
+// returns; the poller lease survives because the PID is unchanged and
+// acquireNudgePollerLease treats an own-PID pidfile as already held.
+var nudgePollerReExec = func(execPath string) error {
+	return syscall.Exec(execPath, os.Args, os.Environ())
 }
 
 func shouldKeepNudgePollerAlive(target nudgeTarget, missingSince, now time.Time) bool {
@@ -807,10 +870,11 @@ func deliverSessionNudgeWithWorker(target nudgeTarget, store beads.Store, sp run
 		fmt.Fprintf(stderr, "gc session nudge: %v\n", err) //nolint:errcheck
 		return 1
 	}
+	directSender, _ := nudgeSenderIdentity()
 	result, err := handle.Nudge(context.Background(), worker.NudgeRequest{
 		Text:     message,
 		Delivery: delivery,
-		Source:   "session",
+		Source:   nudgeSourceLabel("session", directSender),
 	})
 	if err != nil {
 		if errors.Is(err, runtime.ErrSessionNotFound) && target.sessionTransport() == "acp" {
@@ -1086,7 +1150,19 @@ func writeQueuedSessionNudgeResult(target nudgeTarget, mode nudgeDeliveryMode, j
 	return 0
 }
 
-func sendMailNotify(target nudgeTarget, sender string) error {
+func sendMailNotify(target nudgeTarget, n notify.Notification) error {
+	// Per-seat wake-transport selection (notification plane, ga-bjbaui).
+	// Structural: the value was validated at config load; this switch only
+	// routes. The durable record is already written when this fires, so a
+	// transport failure loses a wake hint, never the message.
+	switch strings.TrimSpace(target.agent.WakeTransport) {
+	case "", config.WakeTransportSession:
+		// default session transport below
+	case config.WakeTransportClaudeCloud:
+		return deliverClaudeCloudNotify(target, n)
+	default:
+		return fmt.Errorf("seat %q has unknown wake_transport %q (config validation should have refused this)", target.agentKey(), target.agent.WakeTransport)
+	}
 	store := openNudgeBeadStore(target.cityPath)
 	if store.Store == nil {
 		return fmt.Errorf("opening city store for %q", target.agentKey())
@@ -1095,15 +1171,121 @@ func sendMailNotify(target nudgeTarget, sender string) error {
 	if err != nil {
 		return err
 	}
-	return sendMailNotifyWithWorker(target, store.Store, sp, sender)
+	_, err = deliverSessionNotification(target, store.Store, sp, n)
+	return err
+}
+
+// deliverClaudeCloudNotify is the claude-cloud branch of the notification
+// plane (claudemsg-bridge-design.md §5, ga-bjbaui stage 4): it reads the
+// seat's cloud binding from session-bead metadata, runs the per-send
+// transport, and stamps reachability + suspect state back onto the session
+// bead. The mail bead is durably written before this fires, so every failure
+// here loses a wake hint, never the message — errors are loud on purpose.
+func deliverClaudeCloudNotify(target nudgeTarget, n notify.Notification) error {
+	// Every selected cloud-wake attempt is recorded, including the early
+	// refusals below — an unbound seat that silently never appears in
+	// telemetry is invisible to the operator. Pre-launch refusals are
+	// retryable (fix the inputs and re-run); launched sends are not.
+	recordEarly := func(err error) error {
+		telemetry.RecordCloudWake(context.Background(), target.agentKey(), "", n.Ref, "", 0, true, err)
+		return err
+	}
+	if strings.TrimSpace(target.sessionID) == "" {
+		return recordEarly(fmt.Errorf("seat %q selects wake_transport=%q but has no session bead to carry a cloud binding; bind one with `gc session bind-cloud` — the mail bead is durably written and unaffected", target.agentKey(), config.WakeTransportClaudeCloud))
+	}
+	store := openNudgeBeadStore(target.cityPath)
+	if store.Store == nil {
+		return fmt.Errorf("opening city store for %q", target.agentKey())
+	}
+	front := cliSessionFrontDoor(store.Store, target.cfg, target.cityPath)
+	info, err := front.Get(target.sessionID)
+	if err != nil {
+		return recordEarly(fmt.Errorf("reading session bead %s for the cloud binding: %w", target.sessionID, err))
+	}
+	if strings.TrimSpace(info.CloudWakeSessionID) == "" {
+		return recordEarly(fmt.Errorf("seat %q selects wake_transport=%q but its session bead carries no %s binding; stamp one with `gc session bind-cloud` — the mail bead is durably written and unaffected", target.agentKey(), config.WakeTransportClaudeCloud, session.MetadataCloudWakeSessionID))
+	}
+	if strings.TrimSpace(info.CloudWakeAccountDir) == "" {
+		// Ambient auth is refused by design (§5.1): a send under the wrong
+		// account burns the wrong cap, and an account mismatch surfaces as
+		// "Session not found" — falsely marking a healthy binding suspect.
+		return recordEarly(fmt.Errorf("seat %q has a cloud binding but no %s account lineage; refusing to send under ambient auth — stamp it via `gc session bind-cloud`; the mail bead is durably written and unaffected", target.agentKey(), session.MetadataCloudWakeAccountDir))
+	}
+	tr := &claudecloud.Transport{Binding: claudecloud.Binding{
+		SessionID:        info.CloudWakeSessionID,
+		AccountConfigDir: info.CloudWakeAccountDir,
+	}}
+	start := time.Now()
+	outcome, derr := tr.Deliver(context.Background(), n)
+	latency := time.Since(start)
+	// Reachability and suspect facts are best-effort stamps read by the
+	// cloud-wake doctor check; delivery reporting must not fail on a
+	// metadata write. COMPARE BEFORE STAMP: an operator may have rebound the
+	// seat while the CLI ran — a result from the OLD binding must never mark
+	// the NEW binding suspect, so re-read and stamp only while the binding
+	// is still the one this send targeted.
+	now := time.Now().UTC().Format(time.RFC3339)
+	if fresh, ferr := front.Get(target.sessionID); ferr == nil &&
+		strings.TrimSpace(fresh.CloudWakeSessionID) == strings.TrimSpace(info.CloudWakeSessionID) {
+		if outcome != "" {
+			_ = front.SetMarker(target.sessionID, session.MetadataCloudWakeLastOutcome, string(outcome))
+			_ = front.SetMarker(target.sessionID, session.MetadataCloudWakeLastOutcomeAt, now)
+		}
+		if claudecloud.SuspectOutcome(outcome) {
+			// Suspect is not dead (design §5.2): credential drift can produce
+			// the same refusal strings a gone session does, so the binding is
+			// flagged for doctor and explicit rebind — never deleted here.
+			_ = front.SetMarker(target.sessionID, session.MetadataCloudWakeBindingSuspect, string(outcome))
+			_ = front.SetMarker(target.sessionID, session.MetadataCloudWakeBindingSuspectAt, now)
+		}
+	}
+	// Retryable is strictly "nothing launched": pre-launch refusals
+	// (unreachable ref, garbage binding, missing lineage) and a CLI that
+	// never started. Everything after launch is at-most-once.
+	retryable := outcome == "" || outcome == notify.OutcomeRefusedNotFound && errors.Is(derr, claudecloud.ErrInvalidSessionID)
+	telemetry.RecordCloudWake(context.Background(), target.agentKey(), string(outcome), n.Ref, info.CloudWakeAccountDir, latency, retryable, derr)
+	return derr
 }
 
 func sendMailNotifyWithProvider(target nudgeTarget, sp runtime.Provider) error {
-	return sendMailNotifyWithWorker(target, nil, sp, "human")
+	_, err := deliverSessionNotification(target, nil, sp, notify.Notification{
+		Kind:   notify.KindMailArrival,
+		Sender: "human",
+	})
+	return err
 }
 
-func sendMailNotifyWithWorker(target nudgeTarget, store beads.Store, sp runtime.Provider, sender string) error {
-	msg := fmt.Sprintf("You have mail from %s", sender)
+// sendMailNotifyWithWorker is the pre-notification-plane entry point for a
+// human-sent mail arrival. New call sites construct a notify.Notification
+// and use deliverSessionNotification directly.
+func sendMailNotifyWithWorker(target nudgeTarget, store beads.Store, sp runtime.Provider) error {
+	_, err := deliverSessionNotification(target, store, sp, notify.Notification{
+		Kind:   notify.KindMailArrival,
+		Sender: "human",
+	})
+	return err
+}
+
+// nudgeSourceForKind maps a notification kind onto the queued-nudge source
+// label, preserving the pre-plane labels ("mail" for mail arrivals).
+func nudgeSourceForKind(kind notify.Kind) string {
+	if kind == notify.KindMailArrival {
+		return "mail"
+	}
+	return "session"
+}
+
+// deliverSessionNotification is the default "session" wake transport of the
+// notification plane (claudemsg-bridge-design.md §4): it renders the
+// notification to the pre-plane wake text and walks exactly the delivery
+// ladder sendMailNotifyWithWorker always walked — live wait-idle nudge,
+// managed enqueue+wake, plain local queue — byte-for-byte, so seats on the
+// default transport see zero behavioral difference.
+//
+//nolint:unparam // the Outcome return is the notification-plane transport contract (claudemsg-bridge-design §4); the session transport's current callers consume only the error
+func deliverSessionNotification(target nudgeTarget, store beads.Store, sp runtime.Provider, n notify.Notification) (notify.Outcome, error) {
+	msg := notify.WakeText(n)
+	source := nudgeSourceForKind(n.Kind)
 	now := time.Now()
 	// Session-class store for the observe/handle reads and the last-nudge stamp
 	// below; the raw store keeps flowing to canRequestManagedNudgeWake,
@@ -1112,7 +1294,7 @@ func sendMailNotifyWithWorker(target nudgeTarget, store beads.Store, sp runtime.
 	sessStore := cliSessionStore(store, target.cfg, target.cityPath)
 	obs, err := workerObserveNudgeTarget(target, sessStore, sp)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if obs.Running {
 		handle, err := workerHandleForNudgeTarget(target, sessStore, sp)
@@ -1120,7 +1302,7 @@ func sendMailNotifyWithWorker(target nudgeTarget, store beads.Store, sp runtime.
 			result, nudgeErr := handle.Nudge(context.Background(), worker.NudgeRequest{
 				Text:     msg,
 				Delivery: worker.NudgeDeliveryWaitIdle,
-				Source:   "mail",
+				Source:   source,
 				Wake:     worker.NudgeWakeLiveOnly,
 			})
 			if nudgeErr == nil && result.Delivered {
@@ -1130,29 +1312,29 @@ func sendMailNotifyWithWorker(target nudgeTarget, store beads.Store, sp runtime.
 					sessFront = sessionFrontDoor(sessStore)
 				}
 				stampLastNudgeDeliveredAt(sessFront, target.sessionID, time.Now())
-				return nil
+				return notify.OutcomeDelivered, nil
 			}
 		}
 	}
 	if !obs.Running && canRequestManagedNudgeWake(target, store) {
-		item := newQueuedNudgeWithOptions(target.agentKey(), msg, "mail", now, queuedNudgeOptionsFromTarget(target))
+		item := newQueuedNudgeWithOptions(target.agentKey(), msg, source, now, queuedNudgeOptionsFromTarget(target))
 		if err := enqueueManagedNudgeThenWake(target, store, item); err != nil {
-			return err
+			return "", err
 		}
 		if err := nudgePokeController(target.cityPath); err != nil {
 			if nudgeWarningWriter != nil {
 				fmt.Fprintf(nudgeWarningWriter, "gc mail notify: warning: poke failed after managed wake: %v\n", err) //nolint:errcheck
 			}
 		}
-		return nil
+		return notify.OutcomeQueuedLocal, nil
 	}
-	if err := enqueueQueuedNudge(target.cityPath, newQueuedNudgeWithOptions(target.agentKey(), msg, "mail", now, queuedNudgeOptionsFromTarget(target))); err != nil {
-		return err
+	if err := enqueueQueuedNudge(target.cityPath, newQueuedNudgeWithOptions(target.agentKey(), msg, source, now, queuedNudgeOptionsFromTarget(target))); err != nil {
+		return "", err
 	}
 	if obs.Running {
 		maybeStartNudgePoller(target)
 	}
-	return nil
+	return notify.OutcomeQueuedLocal, nil
 }
 
 func resolveNudgeTarget(identifier string, warningWriter ...io.Writer) (nudgeTarget, error) {
@@ -1652,7 +1834,7 @@ func formatNudgeInjectOutput(items []queuedNudge) string {
 		// the <system-reminder> block — without this, a sender can inject
 		// </system-reminder> sequences and break out of the reminder.
 		// See gastownhall/gascity#2195.
-		source := extmsg.SanitizeForSystemReminder(item.Source)
+		source := extmsg.SanitizeForSystemReminder(nudgeSourceLabel(item.Source, item.Sender))
 		message := extmsg.SanitizeForSystemReminder(item.Message)
 		fmt.Fprintf(&sb, "- [%s] %s\n", source, message)
 	}
@@ -1665,7 +1847,7 @@ func formatNudgeRuntimeMessage(items []queuedNudge) string {
 	var sb strings.Builder
 	sb.WriteString("Deferred reminders:\n")
 	for _, item := range items {
-		fmt.Fprintf(&sb, "- [%s] %s\n", item.Source, item.Message)
+		fmt.Fprintf(&sb, "- [%s] %s\n", nudgeSourceLabel(item.Source, item.Sender), item.Message)
 	}
 	sb.WriteString("\nThese were queued until the session went idle.\n")
 	return sb.String()
@@ -1700,17 +1882,46 @@ func newQueuedNudge(agentName, message string, now time.Time) queuedNudge {
 	return newQueuedNudgeWithOptions(agentName, message, "session", now, queuedNudgeOptions{})
 }
 
+// nudgeSenderIdentity reads the enqueuing process's self-reported identity
+// from its environment: GC_AGENT / GC_ALIAS for agent sessions, BEADS_ACTOR /
+// BD_ACTOR for order execs (the controller stamps BEADS_ACTOR=order:<name>).
+// This is honest-reporting provenance for tracing who paged whom — it is NOT
+// authenticated and must never be treated as authority (ga-txbsqo; the
+// 2026-09-06 cert-patrol page took a multi-session hunt to attribute because
+// queued nudges recorded no sender).
+func nudgeSenderIdentity() (sender, senderSession string) {
+	for _, key := range []string{"GC_AGENT", "GC_ALIAS", "BEADS_ACTOR", "BD_ACTOR"} {
+		if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+			sender = v
+			break
+		}
+	}
+	return sender, strings.TrimSpace(os.Getenv("GC_SESSION_ID"))
+}
+
+// nudgeSourceLabel renders an item's source with its self-reported sender
+// ("session from woodhouse"); falls back to the bare source.
+func nudgeSourceLabel(source, sender string) string {
+	if sender == "" {
+		return source
+	}
+	return source + " from " + sender
+}
+
 func newQueuedNudgeWithOptions(agentName, message, source string, now time.Time, opts queuedNudgeOptions) queuedNudge {
 	id := opts.ID
 	if id == "" {
 		id = newQueuedNudgeID()
 	}
+	sender, senderSession := nudgeSenderIdentity()
 	return queuedNudge{
 		ID:                id,
 		Agent:             agentName,
 		SessionID:         opts.SessionID,
 		ContinuationEpoch: opts.ContinuationEpoch,
 		Source:            source,
+		Sender:            sender,
+		SenderSession:     senderSession,
 		Message:           message,
 		Reference:         opts.Reference,
 		CreatedAt:         now.UTC(),

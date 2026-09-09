@@ -37,6 +37,7 @@ export type * from './lists.js';
 export type * from './transcript.js';
 export type * from './dashboard-beads.js';
 export type * from './activity.js';
+export type * from './attention-registry.js';
 export type * from './dashboard-health.js';
 export type * from './rig-store-health.js';
 export type * from './supervisor-status.js';

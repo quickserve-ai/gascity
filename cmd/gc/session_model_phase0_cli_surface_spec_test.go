@@ -63,7 +63,7 @@ func TestPhase0CLISessionTargetingSurfaces_RejectTemplateFactoryTargets(t *testi
 		{
 			name: "gc mail send",
 			run: func(stdout, stderr *bytes.Buffer) int {
-				return cmdMailSend([]string{"template:worker", "hello"}, false, false, "", "", "", "", stdout, stderr)
+				return cmdMailSend([]string{"template:worker", "hello"}, false, "", "", "", "", stdout, stderr)
 			},
 		},
 		{
@@ -149,7 +149,7 @@ func TestPhase0CLISessionTargetingSurfaces_BareConfigNameDoesNotMaterializeOrdin
 		{
 			name: "gc mail send",
 			run: func(stdout, stderr *bytes.Buffer) int {
-				return cmdMailSend([]string{"worker", "hello"}, false, false, "", "", "", "", stdout, stderr)
+				return cmdMailSend([]string{"worker", "hello"}, false, "", "", "", "", stdout, stderr)
 			},
 		},
 		{

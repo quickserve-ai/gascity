@@ -71,6 +71,35 @@ const LabelSession = "gc:session"
 // the wall-clock time of the most recent successful queued-nudge delivery.
 const MetadataLastNudgeDeliveredAt = "last_nudge_delivered_at"
 
+// Cloud-wake binding cluster (claudemsg-bridge-design.md §5.2, ga-bjbaui).
+// A seat on the claude-cloud wake transport binds to one Claude Code cloud
+// session; the binding is seat state, so it lives in session-bead metadata
+// and round-trips through the resolution path like transport/provider do.
+const (
+	// MetadataCloudWakeSessionID is the bound cloud session's stable ID
+	// (session_...), stamped at adoption (gc session adopt --cloud-id).
+	MetadataCloudWakeSessionID = "cloud_wake_session_id"
+	// MetadataCloudWakeAccountDir is the account lineage (CLAUDE_CONFIG_DIR)
+	// that owns the cloud session; the transport runs its subprocess under it.
+	MetadataCloudWakeAccountDir = "cloud_wake_account_dir"
+	// MetadataCloudWakeBindingSuspect flags the binding SUSPECT (holds the
+	// refusal outcome class). Suspect is never auto-deleted: credential drift
+	// produces the same strings a dead session does; doctor surfaces it and
+	// rebinding is an explicit operator/owner action.
+	MetadataCloudWakeBindingSuspect = "cloud_wake_binding_suspect"
+	// MetadataCloudWakeBindingSuspectAt is the RFC3339 time the binding was
+	// last marked suspect.
+	MetadataCloudWakeBindingSuspectAt = "cloud_wake_binding_suspect_at"
+	// MetadataCloudWakeLastOutcome is the outcome class of the most recent
+	// claude-cloud send (reachability doctor fact, distinct from validity).
+	MetadataCloudWakeLastOutcome = "cloud_wake_last_outcome"
+	// MetadataCloudWakeLastOutcomeAt is the RFC3339 time of that send.
+	MetadataCloudWakeLastOutcomeAt = "cloud_wake_last_outcome_at"
+	// MetadataCloudWakeBoundAt is the RFC3339 time the current binding was
+	// stamped (gc session bind-cloud) — the binding-age doctor fact.
+	MetadataCloudWakeBoundAt = "cloud_wake_bound_at"
+)
+
 // Info holds the user-facing details of a chat session.
 type Info struct {
 	ID string
@@ -103,7 +132,18 @@ type Info struct {
 	// Surfaced in `gc session list` so operators can spot warm sessions
 	// whose delivery loop has stalled.
 	LastNudgeDeliveredAt time.Time
-	Attached             bool
+	// Cloud-wake binding cluster: raw metadata mirrors for the claude-cloud
+	// wake transport (see the MetadataCloudWake* keys). Additive,
+	// internal-only (absent from the HTTP wire). The transport and doctor
+	// read these; adopt --cloud-id and the delivery path write them.
+	CloudWakeSessionID        string // cloud_wake_session_id
+	CloudWakeAccountDir       string // cloud_wake_account_dir
+	CloudWakeBindingSuspect   string // cloud_wake_binding_suspect (outcome class)
+	CloudWakeBindingSuspectAt string // cloud_wake_binding_suspect_at (RFC3339)
+	CloudWakeLastOutcome      string // cloud_wake_last_outcome
+	CloudWakeLastOutcomeAt    string // cloud_wake_last_outcome_at (RFC3339)
+	CloudWakeBoundAt          string // cloud_wake_bound_at (RFC3339)
+	Attached                  bool
 	// ContinuationEpoch is the persisted continuation_epoch marker, used by the
 	// wait registration/retry paths to stamp registered_epoch on wait beads.
 	// Additive, internal-only: it is NOT emitted on the HTTP session-response

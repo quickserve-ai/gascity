@@ -244,6 +244,13 @@ type ResolvedProvider struct {
 	// Used by ResolveDefaultArgs() to produce CLI flags and by the API to
 	// tell real-world apps what pre-selections to show.
 	EffectiveDefaults map[string]string
+	// SessionDisplayName is the owning seat's qualified identity (e.g.
+	// "woodhouse", "qcore/oversight.project-lead"), stamped at resolution
+	// time. Claude-family tmux launches append it as `--name` so the
+	// vendor /resume picker, prompt box, and cross-session messaging show
+	// the seat instead of an auto-generated summary (ga-n0rvsk). Empty for
+	// escape-hatch commands, where the user owns the whole command line.
+	SessionDisplayName string
 }
 
 const (
@@ -251,6 +258,19 @@ const (
 	SessionTransportACP = "acp"
 	// SessionTransportTmux creates sessions through the tmux-backed CLI path.
 	SessionTransportTmux = "tmux"
+)
+
+// Wake-transport selectors for Agent.WakeTransport (notification plane,
+// claudemsg-bridge-design.md §4). Distinct namespace from the session
+// transports above: a wake transport delivers notifications, it does not
+// create sessions.
+const (
+	// WakeTransportSession is the default: today's worker.Handle
+	// wait-idle/queued nudge path, unchanged.
+	WakeTransportSession = "session"
+	// WakeTransportClaudeCloud delivers wake hints into a bound Claude Code
+	// cloud session via `claude -p --cloud` (ga-bjbaui).
+	WakeTransportClaudeCloud = "claude-cloud"
 )
 
 // IsValidSessionTransport reports whether transport is a recognized explicit

@@ -359,6 +359,7 @@ func TestMetadataInfoOnlyFilesStayOnInfoSnapshot(t *testing.T) {
 // tripwire protects the routed delivery arm; as a non-front-door router this guard is
 // a regression canary for the file, not a completeness proof.
 var sessionRelocationRoutedFiles = []string{
+	"cmd_session_bind_cloud.go",
 	"cmd_session_wake.go",
 	"cmd_session_pin.go",
 	"cmd_skill.go",

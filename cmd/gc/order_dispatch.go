@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -740,7 +741,11 @@ func (m *memoryOrderDispatcher) launchDispatchOne(ctx context.Context, store bea
 func (m *memoryOrderDispatcher) runDispatchGuarded(ctx context.Context, store beads.Store, target execStoreTarget, a orders.Order, cityPath, trackingID string, vars, execEnv map[string]string) {
 	defer func() {
 		if p := recover(); p != nil {
-			logDispatchError(m.stderr, "gc: order %s: dispatch goroutine panic (tracking %s): %v", a.ScopedName(), trackingID, p)
+			// The stack must be captured here or it is gone: recover() ends the
+			// unwind, and this goroutine is detached from any request that could
+			// carry the failure. Without it a real production nil-deref is a
+			// one-line log with nothing to diagnose from (ga-4mkhyy).
+			logDispatchError(m.stderr, "gc: order %s: dispatch goroutine panic (tracking %s): %v\n%s", a.ScopedName(), trackingID, p, debug.Stack())
 		}
 	}()
 	m.dispatchOne(ctx, store, target, a, cityPath, trackingID, vars, execEnv)
@@ -1413,6 +1418,12 @@ func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, front *orders.
 		return
 	}
 	if execErrMsg != "" {
+		// Best-effort WHY stamp: order history renders this excerpt next to
+		// the failed outcome, so a broken order is diagnosable without the
+		// supervisor log (ga-swawpo gap 2). A failed stamp only logs.
+		if err := front.SetError(trackingID, execErrMsg); err != nil {
+			logDispatchError(m.stderr, "gc: order %s: failed to stamp error excerpt on tracking bead %s: %v", scoped, trackingID, err)
+		}
 		if hasEventCursor {
 			execErrMsg = fmt.Sprintf("seq=%d: %s", headSeq, execErrMsg)
 		}

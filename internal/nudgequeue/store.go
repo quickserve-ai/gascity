@@ -72,6 +72,10 @@ type NudgeShadow struct {
 	SessionID string
 	Source    string
 	Message   string
+	// Sender / SenderSession are the enqueuer's self-reported identity
+	// (see Item.Sender) — trace provenance, not authority.
+	Sender        string
+	SenderSession string
 	// DeliverAfter / ExpiresAt are the parsed scheduling timestamps if present.
 	DeliverAfter time.Time
 	ExpiresAt    time.Time
@@ -111,6 +115,8 @@ func decodeNudgeItem(b beads.Bead) NudgeShadow {
 		SessionID:      b.Metadata["session_id"],
 		Source:         b.Metadata["source"],
 		Message:        b.Metadata["message"],
+		Sender:         b.Metadata["sender"],
+		SenderSession:  b.Metadata["sender_session"],
 	}
 	if raw := b.Metadata["reference_json"]; raw != "" {
 		var ref Reference
@@ -166,6 +172,8 @@ func (s *Store) Save(item Item) (beadID string, created bool, err error) {
 		"continuation_epoch": item.ContinuationEpoch,
 		"state":              "queued",
 		"source":             item.Source,
+		"sender":             item.Sender,
+		"sender_session":     item.SenderSession,
 		"message":            item.Message,
 		"deliver_after":      item.DeliverAfter.UTC().Format(time.RFC3339),
 		"expires_at":         item.ExpiresAt.UTC().Format(time.RFC3339),

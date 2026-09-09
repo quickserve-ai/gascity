@@ -195,6 +195,15 @@ needs = ["body"]
 description = """
 Remove the temporary worktree after the body reaches terminal state.
 
+The removal is SECURE-BEFORE-DESTROY (ga-6xehc5 / ga-8as9s3): the worktree may
+hold the only copy of the work — uncommitted WIP, or commits reachable from no
+remote ref. Teardown first commits any WIP and makes HEAD reachable from
+origin (branch push, falling back to refs/rescue/<bead-id>); if that cannot be
+done, the step FAILS instead of destroying the tree. A repeated failure
+surfaces through the step's retry policy (hard_fail) rather than silently
+deleting work — twice in one night on a peer city, a DB migration included,
+the only guard was an optional worker check.
+
 ```bash
 CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
 WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
@@ -204,6 +213,27 @@ if [ -z "$WORK_BEAD_ID" ]; then
 fi
 WORKTREE=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata.work_dir // empty')
 if [ -n "$WORKTREE" ] && [ -d "$WORKTREE" ]; then
+  (
+    cd "$WORKTREE" || exit 1
+    if [ -n "$(git status --porcelain)" ]; then
+      git add -A
+      git commit -m "rescue(${WORK_BEAD_ID}): WIP secured by cleanup-worktree before teardown" || exit 1
+    fi
+    # HEAD already reachable from a remote ref => nothing to secure.
+    if [ -z "$(git branch -r --contains HEAD 2>/dev/null | head -1)" ]; then
+      BRANCH=$(git rev-parse --abbrev-ref HEAD)
+      if [ "$BRANCH" != "HEAD" ]; then
+        git push origin "HEAD:refs/heads/${BRANCH}" \
+          || git push origin "HEAD:refs/rescue/${WORK_BEAD_ID}" \
+          || exit 1
+      else
+        git push origin "HEAD:refs/rescue/${WORK_BEAD_ID}" || exit 1
+      fi
+    fi
+  ) || {
+    echo "cleanup-worktree: REFUSING to remove $WORKTREE — could not secure WIP/HEAD to origin for $WORK_BEAD_ID; removal would destroy the only copy of the work" >&2
+    exit 1
+  }
   git worktree remove --force "$WORKTREE" || rm -rf "$WORKTREE"
 fi
 gc bd update "$WORK_BEAD_ID" --unset-metadata work_dir
