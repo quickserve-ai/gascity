@@ -62,37 +62,10 @@ func TestReconcileSessionBeads_HeartbeatHoldCancelKeepsExplicitDrain(t *testing.
 	}
 }
 
-// The producer's side of the desired-branch case below: a concrete
-// SessionBeadID request keeps a held seat reusable, which generic demand does
-// not, so a held pool seat can be desired again while the reconciler's own
-// ack still stands on it.
-func TestReusablePoolSessionInfosForRequest_ConcreteRequestKeepsHeldSeat(t *testing.T) {
-	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
-	cfg := &config.City{
-		Agents: []config.Agent{poolAgent("claude", "", intPtr(10), 0)},
-	}
-	held := protectedPoolSessionBeadAt("sess-held", now.Add(-30*time.Second))
-	held.Metadata["held_until"] = now.Add(time.Minute).Format(time.RFC3339)
-	bp := &agentBuildParams{
-		city:         cfg,
-		agents:       cfg.Agents,
-		sessionBeads: newSessionBeadSnapshot([]beads.Bead{held}),
-	}
-	for _, info := range reusablePoolSessionInfosForRequest(bp, &cfg.Agents[0], "claude", SessionRequest{Tier: "new"}, now, nil) {
-		if info.ID == held.ID {
-			t.Fatal("held seat offered to generic demand")
-		}
-	}
-	found := false
-	for _, info := range reusablePoolSessionInfosForRequest(bp, &cfg.Agents[0], "claude", SessionRequest{SessionBeadID: held.ID}, now, nil) {
-		if info.ID == held.ID {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatal("held seat not reusable for its own concrete SessionBeadID request")
-	}
-}
+// The producer-side case (a concrete SessionBeadID request keeps a held seat
+// reusable) targets upstream's request-aware reusablePoolSessionInfosForRequest,
+// which this branch does not carry; carry's reusablePoolSessionInfos has no
+// concrete-request path, so that test stays upstream-only.
 
 // A held pool seat that is desired again must not be queued to stop on the
 // reconciler's own orphan or no-wake-reason ack: the desired ack arm applies
