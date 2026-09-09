@@ -422,8 +422,7 @@ func gitSafetyReason(worktreePath string) string {
 		return "unpushed commit probe failed (failing closed): " + unpushedErr.Error()
 	}
 	authored := nonSedimentStatusLines(status)
-	switch {
-	case len(authored) > 0 || hasUnpushed:
+	if len(authored) > 0 || hasUnpushed {
 		return fmt.Sprintf("unsafe git state: uncommitted=%v unpushed=%v", len(authored) > 0, hasUnpushed)
 	}
 	return ""

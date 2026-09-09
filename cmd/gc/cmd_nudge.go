@@ -1255,13 +1255,13 @@ func sendMailNotifyWithProvider(target nudgeTarget, sp runtime.Provider) error {
 	return err
 }
 
-// sendMailNotifyWithWorker is the pre-notification-plane entry point, kept
-// for callers that still speak (target, sender). New call sites construct a
-// notify.Notification and use deliverSessionNotification directly.
-func sendMailNotifyWithWorker(target nudgeTarget, store beads.Store, sp runtime.Provider, sender string) error {
+// sendMailNotifyWithWorker is the pre-notification-plane entry point for a
+// human-sent mail arrival. New call sites construct a notify.Notification
+// and use deliverSessionNotification directly.
+func sendMailNotifyWithWorker(target nudgeTarget, store beads.Store, sp runtime.Provider) error {
 	_, err := deliverSessionNotification(target, store, sp, notify.Notification{
 		Kind:   notify.KindMailArrival,
-		Sender: sender,
+		Sender: "human",
 	})
 	return err
 }
@@ -1281,6 +1281,8 @@ func nudgeSourceForKind(kind notify.Kind) string {
 // ladder sendMailNotifyWithWorker always walked — live wait-idle nudge,
 // managed enqueue+wake, plain local queue — byte-for-byte, so seats on the
 // default transport see zero behavioral difference.
+//
+//nolint:unparam // the Outcome return is the notification-plane transport contract (claudemsg-bridge-design §4); the session transport's current callers consume only the error
 func deliverSessionNotification(target nudgeTarget, store beads.Store, sp runtime.Provider, n notify.Notification) (notify.Outcome, error) {
 	msg := notify.WakeText(n)
 	source := nudgeSourceForKind(n.Kind)
