@@ -74,9 +74,13 @@ jobs:
           # completed/failure — an actually-red check, not pending, and no
           # queued rerun hiding behind an older failure. --slurp collapses
           # pagination into one document so the assertion sees all pages.
-          runs_json=$(gh api "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD_SHA/check-runs" \
+          # --method GET is load-bearing: -F alone flips gh api to POST (404),
+          # and this gh refuses --slurp together with --jq, so jq runs as its
+          # own process on the slurped pages.
+          runs_json=$(gh api --method GET \
+            "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD_SHA/check-runs" \
             -F per_page=100 --paginate --slurp \
-            --jq '[.[].check_runs[] | select(.name == "CI / required") | "\(.status)/\(.conclusion)"]')
+            | jq '[.[].check_runs[] | select(.name == "CI / required") | "\(.status)/\(.conclusion)"]')
           echo "CI / required check-runs at $EXPECTED_HEAD_SHA: $runs_json"
           run_count=$(jq 'length' <<<"$runs_json")
           red_count=$(jq '[.[] | select(. == "completed/failure")] | length' <<<"$runs_json")
