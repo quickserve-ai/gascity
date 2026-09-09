@@ -9,7 +9,7 @@ import (
 	"github.com/gastownhall/gascity/internal/session"
 )
 
-func bindCloudTestCity(t *testing.T) (string, beads.Store, string) {
+func bindCloudTestCity(t *testing.T) (beads.Store, string) {
 	t.Helper()
 	clearGCEnv(t)
 	clearInheritedCityRoutingEnv(t)
@@ -35,11 +35,11 @@ func bindCloudTestCity(t *testing.T) (string, beads.Store, string) {
 	if err != nil {
 		t.Fatalf("create session bead: %v", err)
 	}
-	return cityDir, store, created.ID
+	return store, created.ID
 }
 
 func TestCmdSessionBindCloudStampsBindingAndClearsSuspect(t *testing.T) {
-	_, store, beadID := bindCloudTestCity(t)
+	store, beadID := bindCloudTestCity(t)
 	// Pre-poison suspect + last-outcome facts: a rebind is the explicit
 	// recovery action, so it must clear them.
 	for k, v := range map[string]string{
@@ -87,7 +87,7 @@ func TestCmdSessionBindCloudStampsBindingAndClearsSuspect(t *testing.T) {
 }
 
 func TestCmdSessionBindCloudRefusesBadInputs(t *testing.T) {
-	_, _, beadID := bindCloudTestCity(t)
+	_, beadID := bindCloudTestCity(t)
 	accountDir := t.TempDir()
 	var stdout, stderr bytes.Buffer
 
@@ -112,7 +112,7 @@ func TestCmdSessionBindCloudRefusesBadInputs(t *testing.T) {
 }
 
 func TestCmdSessionBindCloudClearRemovesBinding(t *testing.T) {
-	_, store, beadID := bindCloudTestCity(t)
+	store, beadID := bindCloudTestCity(t)
 	accountDir := t.TempDir()
 	var stdout, stderr bytes.Buffer
 	if code := cmdSessionBindCloud(beadID, "session_01BINDTESTabcdef0123456789", accountDir, false, &stdout, &stderr); code != 0 {
