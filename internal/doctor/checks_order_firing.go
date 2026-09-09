@@ -363,7 +363,13 @@ func orderFiringCurrentSuspendedRigs(cfg *config.City) map[string]bool {
 		return out
 	}
 	for _, rig := range cfg.Rigs {
-		if rig.Suspended && strings.TrimSpace(rig.Name) != "" {
+		// EffectiveSuspendedOnStart() is the canonical suspension predicate
+		// (Suspended || SuspendedOnStart). Reading the deprecated Suspended
+		// field alone missed rigs suspended via suspended_on_start = true —
+		// e.g. the platform rig, whose orders (publish-platform-work,
+		// watch-platform-controls) then read permanently-due/never-run and
+		// flipped order-firing-current to a stale error (ga-axzhwv).
+		if rig.EffectiveSuspendedOnStart() && strings.TrimSpace(rig.Name) != "" {
 			out[rig.Name] = true
 		}
 	}

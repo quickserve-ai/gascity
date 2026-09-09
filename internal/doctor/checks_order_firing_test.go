@@ -376,6 +376,39 @@ func TestOrderFiringCurrent_SkipsSuspendedRigOrders(t *testing.T) {
 	}
 }
 
+func TestOrderFiringCurrent_SkipsSuspendedOnStartRigOrders(t *testing.T) {
+	// A rig suspended via suspended_on_start = true (the canonical field; the
+	// platform rig uses exactly this) must be skipped identically to one using
+	// the deprecated Suspended flag. Reading Suspended alone left the platform
+	// rig's orders (publish-platform-work, watch-platform-controls) counting
+	// toward staleness, flipping order-firing-current to a stale error
+	// (ga-axzhwv). Fails against the pre-fix helper, passes after it reads
+	// EffectiveSuspendedOnStart().
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	rigPath := filepath.Join(cityPath, "rigs", "parked")
+	rigFormulas := filepath.Join(rigPath, "formulas")
+	rigOrders := filepath.Join(rigPath, "orders")
+	if err := os.MkdirAll(rigOrders, 0o755); err != nil {
+		t.Fatalf("creating rig orders dir: %v", err)
+	}
+	cfg.Rigs = []config.Rig{{Name: "parked", Path: rigPath, SuspendedOnStart: true}}
+	cfg.FormulaLayers.Rigs = map[string][]string{"parked": {cfg.FormulaLayers.City[0], rigFormulas}}
+	writeOrderFiringTestOrderInDir(t, rigOrders, "gate-sweep", "cooldown", "1m")
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.ControllerStarted, Ts: now.Add(-24 * time.Hour)},
+		events.Event{Type: events.OrderFired, Subject: "gate-sweep:rig:parked", Ts: now.Add(-24 * time.Hour)},
+	)
+
+	result := runOrderFiringCurrentTest(t, cfg, cityPath, now)
+	if result.Status != StatusOK {
+		t.Fatalf("status = %v, want OK for suspended_on_start rig; msg = %s; details = %v", result.Status, result.Message, result.Details)
+	}
+	if strings.Contains(strings.Join(result.Details, "\n"), "parked") {
+		t.Fatalf("details = %v, suspended_on_start rig order should be skipped", result.Details)
+	}
+}
+
 func TestOrderFiringCurrent_SkipsSuspendedRigOverrides(t *testing.T) {
 	// Suspended rig orders are pruned from the doctor scan; matching overrides
 	// must be pruned with them so a harmless paused rig does not become a scan
