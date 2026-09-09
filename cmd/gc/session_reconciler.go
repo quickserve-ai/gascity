@@ -2094,12 +2094,16 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						if providerAlive && heartbeatHeldPoolSeatInfo(infoPostHeal, clk.Now()) {
 							if cancelSessionDrainForHeartbeatHoldInfo(infoPostHeal, sp, dt) ||
 								cancelRecoveredDrainForHeartbeatHoldInfo(infoPostHeal, sp, name) {
-								// The cancel cleared the reconciler's own ack keys; only the
-								// drain signal is left to remove. Never dops.clearDrain here:
-								// that also removes GC_DRAIN_ACK, the agent's key, and an
-								// agent ack landing between the hold's read and that
-								// removal would be erased.
-								_ = sp.RemoveMeta(name, "GC_DRAIN")
+								// The cancel cleared everything the reconciler owns: its
+								// tracker entry and its own ack keys. Nothing else is
+								// touched. GC_DRAIN is written only by `gc runtime drain`,
+								// so a value there is an operator's explicit request, which
+								// the hold has no standing to withdraw — it stands, and the
+								// seat drains on the agent's ack or the request's deadline.
+								// GC_DRAIN_ACK is the agent's key: an ack that lands inside
+								// the cancel keeps it and its provenance
+								// (clearReconcilerOwnDrainAckMetadata) and stops the seat on
+								// the next tick.
 								template := normalizedSessionTemplateInfo(infoPostHeal, cfg)
 								if template == "" {
 									template = infoPostHeal.Template
@@ -2498,6 +2502,27 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							trace.RecordDecision(TraceSiteReconcilerDrainAck, TraceReasonStoreQueryPartial, TraceOutcomeDeferred, tp.TemplateName, name, traceRecordPayload{
 								"store_query_partial":  true,
 								"reconciler_owned_ack": true,
+							})
+						}
+						continue
+					}
+					// A live heartbeat hold on a pool seat outranks a reconciler-owned
+					// orphan or no-wake-reason ack on the desired branch as well. A
+					// held seat reaches this arm through a concrete SessionBeadID
+					// request (reusablePoolSessionInfosForRequest keeps held seats
+					// reusable for those), and the hold arrived after the drain began,
+					// so the stop below would lose the run the hold protects — the
+					// lens the not-desired arm applies (gastownhall/gascity#6173, #6178
+					// review). It needs no work query, so it runs ahead of the
+					// assigned-work check. Agent acks and non-cancelable reasons are
+					// left alone.
+					if reconcilerOwnedAck && alive && heartbeatHeldPoolSeatInfo(infoByID[id], clk.Now()) &&
+						(cancelSessionDrainForHeartbeatHoldInfo(infoByID[id], sp, dt) ||
+							cancelRecoveredDrainForHeartbeatHoldInfo(infoByID[id], sp, name)) {
+						fmt.Fprintf(stdout, "Canceled drain-acked session '%s' (heartbeat hold)\n", name) //nolint:errcheck
+						if trace != nil {
+							trace.RecordDecision(TraceSiteDrainCancel, TraceReasonUserHold, TraceOutcomeCancel, tp.TemplateName, name, traceRecordPayload{
+								"held_until": infoByID[id].HeldUntil,
 							})
 						}
 						continue
