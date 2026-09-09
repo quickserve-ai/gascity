@@ -11,10 +11,11 @@
 # pull-requests:write, no admin, not on any bypass list) — the same proven
 # non-bypass identity as the ga-w1ollm canary driver this file descends from.
 #
-# The job ASSERTS REFUSAL: it exits 0 only when the merge attempt is rejected
-# and the PR is verified still open and unmerged afterwards. If the merge
-# unexpectedly SUCCEEDS the run goes red — that would mean the active merge
-# gate did not hold, and the merged red PR must be reverted immediately.
+# The job ASSERTS REFUSAL: it exits 0 only when the merge attempt fails with an
+# error that names the merge-requirement refusal AND the PR re-reads as open,
+# unmerged, with no auto-merge armed. Unclassified errors, an armed auto-merge,
+# or a successful merge all go red — a successful merge means the active gate
+# did not hold, and the merged red PR must be reverted immediately.
 #
 # Remove this file once ga-82cffd stage (ii-d) is recorded.
 name: ga-82cffd red negative control
@@ -49,26 +50,39 @@ jobs:
           [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "pr_number must be numeric"; exit 1; }
           [[ "$EXPECTED_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "expected_head_sha must be a full SHA"; exit 1; }
 
-          # Preconditions: open PR into carry/operational at the expected head.
+          # Preconditions: an open, non-draft PR into carry/operational at the
+          # expected head, BLOCKED by merge requirements (not conflicts or
+          # draft state — a "not mergeable" error for those would not prove
+          # the ruleset refused anything), with no auto-merge armed.
           pr_json=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
-            --json state,baseRefName,headRefOid,mergeStateStatus)
+            --json state,baseRefName,headRefOid,mergeStateStatus,isDraft,autoMergeRequest)
           echo "precondition state: $pr_json"
           state=$(jq -r .state <<<"$pr_json")
           base=$(jq -r .baseRefName <<<"$pr_json")
           head=$(jq -r .headRefOid <<<"$pr_json")
+          merge_state=$(jq -r .mergeStateStatus <<<"$pr_json")
+          is_draft=$(jq -r .isDraft <<<"$pr_json")
+          auto_merge=$(jq -r .autoMergeRequest <<<"$pr_json")
           [ "$state" = "OPEN" ] || { echo "PR #$PR_NUMBER is not open (state=$state)"; exit 1; }
           [ "$base" = "carry/operational" ] || { echo "PR #$PR_NUMBER base is $base, not carry/operational"; exit 1; }
           [ "$head" = "$EXPECTED_HEAD_SHA" ] || { echo "PR head moved: $head != $EXPECTED_HEAD_SHA"; exit 1; }
+          [ "$is_draft" = "false" ] || { echo "PR is a draft; that refusal would prove nothing"; exit 1; }
+          [ "$auto_merge" = "null" ] || { echo "auto-merge is already armed on this PR; disarm before the control"; exit 1; }
+          [ "$merge_state" = "BLOCKED" ] || { echo "mergeStateStatus is $merge_state, not BLOCKED — the control needs a requirements-blocked PR"; exit 1; }
 
-          # Honesty gate: the required context must be RED at this head — an
-          # actually-failing check, not merely pending/expected. A control run
-          # against a pending check would prove less than the spec asks.
-          required_state=$(gh api \
-            "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD_SHA/check-runs" \
-            --paginate --jq '[.check_runs[] | select(.name == "CI / required")] | max_by(.started_at) | "\(.status)/\(.conclusion)"')
-          echo "CI / required at $EXPECTED_HEAD_SHA: $required_state"
-          [ "$required_state" = "completed/failure" ] || {
-            echo "required check is not red yet ($required_state) — dispatch again once it is"; exit 1; }
+          # Honesty gate: EVERY "CI / required" check-run at this head must be
+          # completed/failure — an actually-red check, not pending, and no
+          # queued rerun hiding behind an older failure. --slurp collapses
+          # pagination into one document so the assertion sees all pages.
+          runs_json=$(gh api "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_HEAD_SHA/check-runs" \
+            -F per_page=100 --paginate --slurp \
+            --jq '[.[].check_runs[] | select(.name == "CI / required") | "\(.status)/\(.conclusion)"]')
+          echo "CI / required check-runs at $EXPECTED_HEAD_SHA: $runs_json"
+          run_count=$(jq 'length' <<<"$runs_json")
+          red_count=$(jq '[.[] | select(. == "completed/failure")] | length' <<<"$runs_json")
+          [ "$run_count" -ge 1 ] || { echo "no CI / required check-run found at this head"; exit 1; }
+          [ "$run_count" -eq "$red_count" ] || {
+            echo "not every CI / required run is red yet — dispatch again once it is"; exit 1; }
 
           # The merge attempt, as github-actions[bot] (non-bypass).
           set +e
@@ -79,17 +93,39 @@ jobs:
           echo "merge exit code: $merge_rc"
           echo "merge output: $merge_out"
 
-          if [ "$merge_rc" -eq 0 ]; then
-            echo "::error::MERGE SUCCEEDED — the active merge gate DID NOT refuse a red PR. Revert immediately."
-            exit 1
-          fi
-
-          # Re-read server state: refusal must be real, not a client error.
-          post_json=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json state,mergedAt)
+          # Re-read server state before judging anything.
+          post_json=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --json state,mergedAt,autoMergeRequest)
           echo "post-attempt state: $post_json"
           post_state=$(jq -r .state <<<"$post_json")
           merged_at=$(jq -r .mergedAt <<<"$post_json")
-          [ "$post_state" = "OPEN" ] && [ "$merged_at" = "null" ] || {
-            echo "::error::PR is no longer open/unmerged after the attempt (state=$post_state mergedAt=$merged_at)"; exit 1; }
+          post_auto=$(jq -r .autoMergeRequest <<<"$post_json")
 
-          echo "REFUSAL CONFIRMED: non-bypass merge of red PR #$PR_NUMBER was rejected server-side; PR remains open and unmerged."
+          if [ "$merged_at" != "null" ]; then
+            echo "::error::MERGE SUCCEEDED — the active merge gate DID NOT refuse a red PR. Revert immediately."
+            exit 1
+          fi
+          if [ "$post_auto" != "null" ]; then
+            # gh can arm auto-merge instead of merging when requirements are
+            # unmet; that is not a refusal, and it must not stay armed where a
+            # later green rerun could land the red PR.
+            gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --disable-auto || true
+            echo "::error::gh armed AUTO-MERGE instead of being refused (now disarmed). Not a refusal demonstration."
+            exit 1
+          fi
+          if [ "$merge_rc" -eq 0 ]; then
+            echo "::error::merge command exited 0 but nothing merged and no auto-merge armed — unclassified outcome."
+            exit 1
+          fi
+
+          # Classify the error: only a named merge-requirement refusal counts.
+          # A transient API error, permission gap, or head mismatch must not
+          # be laundered into refusal evidence.
+          if ! grep -Eqi 'not mergeable|required status|rule violation|merging is blocked|base branch policy|protected branch' <<<"$merge_out"; then
+            echo "::error::merge failed for an UNCLASSIFIED reason (see output above) — not accepted as refusal evidence."
+            exit 1
+          fi
+          [ "$post_state" = "OPEN" ] || {
+            echo "::error::PR is no longer open after the attempt (state=$post_state)"; exit 1; }
+
+          echo "REFUSAL CONFIRMED: non-bypass merge of red PR #$PR_NUMBER was rejected server-side with a named merge-requirement error; PR remains open, unmerged, no auto-merge armed."
