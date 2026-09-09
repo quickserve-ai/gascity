@@ -28,6 +28,9 @@ on:
       pr_number:
         description: PR number to merge (green mode only)
         required: false
+      expected_head_sha:
+        description: Expected PR head SHA (green mode only; merge refuses if moved)
+        required: false
 
 permissions:
   contents: write
@@ -51,10 +54,19 @@ jobs:
           echo "deleting $ref"
           git push origin ":$ref"
 
+      # Inputs reach the shell only via env (never inline interpolation) and
+      # are validated before use — the token carries contents:write.
       - name: Green side — non-bypass merge of a green PR
         if: inputs.mode == 'green'
         env:
           GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
         run: |
-          test -n "${{ inputs.pr_number }}" || { echo "pr_number required"; exit 1; }
-          gh pr merge "${{ inputs.pr_number }}" --repo "$GITHUB_REPOSITORY" --merge
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "pr_number must be numeric"; exit 1; }
+          [[ "$EXPECTED_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "expected_head_sha must be a full SHA"; exit 1; }
+          base=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json baseRefName,state \
+                 --jq 'select(.state == "OPEN") | .baseRefName')
+          [ "$base" = "carry/operational" ] || { echo "PR #$PR_NUMBER is not an open PR into carry/operational (base=$base)"; exit 1; }
+          gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --merge \
+            --match-head-commit "$EXPECTED_HEAD_SHA"
