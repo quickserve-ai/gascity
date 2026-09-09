@@ -102,7 +102,7 @@ func TestBeadsCacheReconcileCheckFiresWhenArmedButNeverReconciled(t *testing.T) 
 // A scope must retain its awaiting-first-scan classification throughout the
 // grace window, including when its last completion predates a re-arm.
 func TestReconcileHeartbeatFirstScanGraceWindow(t *testing.T) {
-	for _, last := range []time.Time{time.Time{}, heartbeatNow.Add(-time.Hour)} {
+	for _, last := range []time.Time{{}, heartbeatNow.Add(-time.Hour)} {
 		hb := healthyHeartbeat()
 		hb.ArmedAt = heartbeatNow.Add(-time.Minute)
 		hb.LastReconcileAt = last
