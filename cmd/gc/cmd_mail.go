@@ -21,6 +21,8 @@ import (
 	"github.com/gastownhall/gascity/internal/extmsg"
 	"github.com/gastownhall/gascity/internal/mail"
 	"github.com/gastownhall/gascity/internal/mail/beadmail"
+	"github.com/gastownhall/gascity/internal/notify"
+	"github.com/gastownhall/gascity/internal/notify/claudecloud"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/telemetry"
 	"github.com/spf13/cobra"
@@ -116,13 +118,38 @@ func summarizeMailMessage(m mail.Message) mailMessageSummary {
 	}
 }
 
-func newMailNudgeFunc(sender string) nudgeFunc {
+// mailWakeRef picks the wake-hint reference for one recipient: bead:// (the
+// mail bead) for seats on the mail plane, the sender-supplied https ref for
+// a cloud-wake seat whose sandbox cannot reach our Dolt (design §5.3).
+func mailWakeRef(target nudgeTarget, ref, mailBeadID string) string {
+	if strings.TrimSpace(target.agent.WakeTransport) == config.WakeTransportClaudeCloud && strings.TrimSpace(ref) != "" {
+		return strings.TrimSpace(ref)
+	}
+	return notifyBeadRefPrefix + mailBeadID
+}
+
+func newMailNudgeFunc(sender, ref string) nudgeFunc {
 	return func(recipient, messageID string) error {
 		target, err := resolveNudgeTarget(recipient, io.Discard)
 		if err != nil {
 			return err
 		}
-		return sendMailNotify(target, sender, messageID)
+		// The mail bead is durably written before this fires; the
+		// notification is a wake hint referencing it (notification plane,
+		// claudemsg-bridge-design.md §4 — the [R-1] bead-ID threading rides
+		// on messageID). The default session transport still renders the
+		// pre-plane wake text and turns the bead:// Ref into the queued
+		// nudge's delivery-time re-validation reference
+		// (gastownhall/gascity#5321). A cloud-wake seat gets the
+		// sender-supplied https ref instead of bead:// — its sandbox cannot
+		// reach our Dolt (design §5.3).
+		return sendMailNotify(target, notify.Notification{
+			Kind:      notify.KindMailArrival,
+			Recipient: recipient,
+			Sender:    sender,
+			Ref:       mailWakeRef(target, ref, messageID),
+			Urgency:   notify.UrgencyDeadline,
+		})
 	}
 }
 
@@ -1471,11 +1498,13 @@ type multiRecipientMailCounter interface {
 
 func newMailSendCmd(stdout, stderr io.Writer) *cobra.Command {
 	var notify bool
+	var noNotify bool
 	var all bool
 	var from string
 	var to string
 	var subject string
 	var message string
+	var ref string
 	var jsonOut bool
 	cmd := &cobra.Command{
 		Use:   "send [<to>] [<body>]",
@@ -1489,7 +1518,16 @@ a non-running recipient. Unread mail alone does not request a wake.
 Use --from to override the sender identity.
 Use --to as an alternative to the positional <to> argument.
 Use -s/--subject for the summary line and -m/--message for the body text.
-Use --all to broadcast to all live sessions (excluding sender and "human").`,
+Use --all to broadcast to all live sessions (excluding sender and "human").
+
+With --context/--city-url the message is sent to a REMOTE city over the
+control plane (a hardened city requires the context's grant_command). The
+sender then defaults to "<local city>/<identity>" (e.g. citadel/mayor) so the
+far side knows which city to answer with 'gc --context <city> mail send';
+--from overrides it. The remote city stores an unknown sender literally, but
+if it has a session whose alias equals that string (a rig named after the
+sending city) the message binds to that session — do not name a rig after a
+city that mails you. --all and --notify are refused for a remote city.`,
 		Example: `  gc mail send mayor "Build is green"
   gc mail send mayor -s "Build is green"
   gc mail send myrig/witness -s "Need investigation" -m "Attach logs from the last failed run"
@@ -1499,26 +1537,36 @@ Use --all to broadcast to all live sessions (excluding sender and "human").`,
   gc mail send --all "Status update: tests passing"`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
-			code := 0
-			if jsonOut {
-				code = cmdMailSendJSON(args, notify, all, from, to, subject, message, true, stdout, stderr)
-			} else {
-				code = cmdMailSend(args, notify, all, from, to, subject, message, stdout, stderr)
+			// Notify-on-by-default for DIRECT LOCAL sends (ga-bjbaui,
+			// ratified 2026-09-03): plain mail never reaches a running-but-
+			// idle seat until its own next turn, which is how deadline mail
+			// went unread for 67 minutes on 9/3. Broadcast (--all), remote
+			// cities (which refuse --notify), and an explicit --no-notify
+			// keep the old no-nudge behavior. Delivery stays wait-idle, so
+			// the recipient is never interrupted mid-turn, and a "human"
+			// recipient is skipped at the invocation site as before.
+			if !notify && !noNotify && !all {
+				if _, isRemote, _, rerr := resolveWriteTarget(); rerr == nil && !isRemote {
+					notify = true
+				}
 			}
+			code := cmdMailSendJSONRef(args, notify, all, from, to, subject, message, ref, jsonOut, stdout, stderr)
 			if code != 0 {
 				return errExit
 			}
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&notify, "notify", false, "request a recipient turn (including a managed wake if not running), even with earlier unread mail")
+	cmd.Flags().BoolVar(&notify, "notify", false, "request a recipient turn (including a managed wake if not running), even with earlier unread mail (the default for direct local sends; see --no-notify)")
 	cmd.Flags().BoolVar(&notify, "nudge", false, "alias for --notify")
 	_ = cmd.Flags().MarkHidden("nudge")
+	cmd.Flags().BoolVar(&noNotify, "no-notify", false, "suppress the default recipient nudge for a direct local send")
 	cmd.Flags().BoolVar(&all, "all", false, "broadcast to all live sessions (excludes sender and human)")
 	cmd.Flags().StringVar(&from, "from", "", "sender identity (default: $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or \"human\")")
 	cmd.Flags().StringVar(&to, "to", "", "recipient address (alternative to positional argument)")
 	cmd.Flags().StringVarP(&subject, "subject", "s", "", "message subject line")
 	cmd.Flags().StringVarP(&message, "message", "m", "", "message body text")
+	cmd.Flags().StringVar(&ref, "ref", "", "https URL (GitHub) where the actionable content lives — required when the notified recipient is a cloud-wake seat; its wake hint points here instead of the mail bead")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit JSONL result")
 	cmd.MarkFlagsMutuallyExclusive("to", "all")
 	return cmd
@@ -1532,7 +1580,11 @@ func newMailInboxCmd(stdout, stderr io.Writer) *cobra.Command {
 		Long: `List all unread messages for a session alias or human.
 
 Shows message ID, sender, subject, and body in a table. The recipient defaults
-to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". Pass a session alias to view another inbox.`,
+to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". Pass a session alias to view another inbox.
+
+With --context/--city-url the inbox is read from a REMOTE city; with no
+argument it lists mail addressed to this client's remote identity
+("<local city>/<identity>") — where a far-side 'gc mail reply' lands.`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
 			if cmdMailInboxWithJSON(args, jsonOut, stdout, stderr) != 0 {
@@ -1601,7 +1653,11 @@ Inherits the thread ID from the original message for conversation tracking.
 Use --notify to request a recipient turn after replying. In a managed city,
 it can request a wake for a non-running recipient.
 Unread mail alone does not request a wake.
-Use -s/--subject for the reply subject and -m/--message for the reply body.`,
+Use -s/--subject for the reply subject and -m/--message for the reply body.
+
+With --context/--city-url the reply is sent inside a REMOTE city (the reply
+is addressed by that city to the original sender); the sender is
+"<local city>/<identity>" and --notify is refused.`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
 			code := 0
@@ -1739,11 +1795,39 @@ The recipient defaults to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human".`,
 // cmdMailSend is the CLI entry point for sending mail. It opens the provider,
 // resolves session mailbox identities, and delegates to doMailSend.
 // The to parameter is the --to flag value (empty if not set).
+//
+//nolint:unparam // test-facing compat shim: parameters mirror cmdMailSendJSONRef even where every current caller passes the default
 func cmdMailSend(args []string, notify bool, all bool, from string, to string, subject string, message string, stdout, stderr io.Writer) int {
 	return cmdMailSendJSON(args, notify, all, from, to, subject, message, false, stdout, stderr)
 }
 
+//nolint:unparam // test-facing compat shim: parameters mirror cmdMailSendJSONRef even where every current caller passes the default
 func cmdMailSendJSON(args []string, notify bool, all bool, from string, to string, subject string, message string, jsonOut bool, stdout, stderr io.Writer) int {
+	return cmdMailSendJSONRef(args, notify, all, from, to, subject, message, "", jsonOut, stdout, stderr)
+}
+
+// cmdMailSendJSONRef is cmdMailSendJSON plus the sender-supplied reachable
+// ref for cloud-wake recipients (claudemsg-bridge-design.md §5.3, ga-bjbaui
+// stage 5). ref is optional unless a notified recipient's seat selects
+// wake_transport=claude-cloud, in which case the send is refused UP FRONT
+// (before any bead is written) when the ref is missing or not reachable
+// from a cloud sandbox.
+func cmdMailSendJSONRef(args []string, notify bool, all bool, from string, to string, subject string, message string, ref string, jsonOut bool, stdout, stderr io.Writer) int {
+	if strings.TrimSpace(ref) != "" && !claudecloud.ReachableRef(ref) {
+		fmt.Fprintf(stderr, "gc mail send: --ref %q is not a cloud-reachable https URL (allowed hosts: GitHub); see claudemsg-bridge-design.md §5.3\n", ref) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	// Remote city: forward the mutation over the control plane before any local
+	// provider/store work (mirrors gc sling). A "no city discoverable" error is
+	// deferred to the local path so it reports exactly as before; a genuine
+	// resolution error (bad --context, remote client build failure) fails now,
+	// non-fallbackably (gate G1).
+	if remoteC, isRemote, remoteTgt, rerr := resolveWriteTarget(); rerr != nil && !isCityDiscoveryNotFound(rerr) {
+		fmt.Fprintf(stderr, "gc mail send: %v\n", rerr) //nolint:errcheck // best-effort stderr
+		return 1
+	} else if isRemote {
+		return cmdMailSendRemote(remoteC, remoteTgt, args, notify, all, from, to, subject, message, jsonOut, stdout, stderr)
+	}
 	mp, code := openCityMailProvider(stderr, "gc mail send")
 	if mp == nil {
 		return code
@@ -1806,7 +1890,13 @@ func cmdMailSendJSON(args []string, notify bool, all bool, from string, to strin
 
 	var nf nudgeFunc
 	if notify && store != nil {
-		nf = newMailNudgeFunc(sender)
+		nf = newMailNudgeFunc(sender, ref)
+	} else if notify {
+		// Storeless (exec:) send with notification requested: without the
+		// store there is no recipient wake AND no way to run the cloud-seat
+		// --ref guard. Never skip that silently — a cloud-wake recipient
+		// would simply never hear about the mail.
+		fmt.Fprintln(stderr, "gc mail send: warning: no city store available — the recipient will NOT be notified (and a cloud-wake recipient cannot be detected); the mail bead is still written") //nolint:errcheck // best-effort stderr
 	}
 
 	// When --to is set, prepend it to args so doMailSend sees [to, body].
@@ -1843,6 +1933,18 @@ func cmdMailSendJSON(args []string, notify bool, all bool, from string, to strin
 		args[0] = canonicalTo
 		if validRecipients != nil {
 			validRecipients[canonicalTo] = true
+		}
+		// Cloud-wake guard rail (design §5.3): a notified recipient whose
+		// seat selects claude-cloud needs a reachable ref, and the refusal
+		// happens BEFORE any bead is written so the sender just re-runs
+		// with --ref. Resolution failures fall through — the nudge path
+		// surfaces them after the send exactly as before.
+		if nf != nil && canonicalTo != "human" && strings.TrimSpace(ref) == "" {
+			if target, terr := resolveNudgeTarget(canonicalTo, io.Discard); terr == nil &&
+				strings.TrimSpace(target.agent.WakeTransport) == config.WakeTransportClaudeCloud {
+				fmt.Fprintf(stderr, "gc mail send: recipient %q is a cloud-wake seat (wake_transport=%s); pass --ref <https URL into its GitHub working surface> so its wake hint points at content it can reach (its sandbox cannot read bead:// refs), or --no-notify to send mail without a wake\n", canonicalTo, config.WakeTransportClaudeCloud) //nolint:errcheck // best-effort stderr
+				return 1
+			}
 		}
 	}
 
@@ -1992,6 +2094,14 @@ func cmdMailInbox(args []string, stdout, stderr io.Writer) int {
 }
 
 func cmdMailInboxWithJSON(args []string, jsonOut bool, stdout, stderr io.Writer) int {
+	// Remote city: read the far-side mailbox over the control plane (see
+	// mail_remote.go). Same deferral of "no city discoverable" as mail send.
+	if remoteC, isRemote, remoteTgt, rerr := resolveReadTargetEcho(); rerr != nil && !isCityDiscoveryNotFound(rerr) {
+		fmt.Fprintf(stderr, "gc mail inbox: %v\n", rerr) //nolint:errcheck // best-effort stderr
+		return 1
+	} else if isRemote {
+		return cmdMailInboxRemote(remoteC, remoteTgt, args, jsonOut, stdout, stderr)
+	}
 	mp, code := openCityMailProvider(stderr, "gc mail inbox")
 	if mp == nil {
 		return code
@@ -2216,6 +2326,13 @@ func cmdMailReplyJSON(args []string, subject, message string, notify bool, jsonO
 		fmt.Fprintln(stderr, "gc mail reply: missing message ID") //nolint:errcheck // best-effort stderr
 		return 1
 	}
+	// Remote city: forward the reply over the control plane (see mail_remote.go).
+	if remoteC, isRemote, remoteTgt, rerr := resolveWriteTarget(); rerr != nil && !isCityDiscoveryNotFound(rerr) {
+		fmt.Fprintf(stderr, "gc mail reply: %v\n", rerr) //nolint:errcheck // best-effort stderr
+		return 1
+	} else if isRemote {
+		return cmdMailReplyRemote(remoteC, remoteTgt, args, subject, message, notify, jsonOut, stdout, stderr)
+	}
 
 	mp, code := openCityMailProvider(stderr, "gc mail reply")
 	if mp == nil {
@@ -2275,7 +2392,7 @@ func cmdMailReplyJSON(args []string, subject, message string, notify bool, jsonO
 
 	var nf nudgeFunc
 	if notify && store != nil {
-		nf = newMailNudgeFunc(sender)
+		nf = newMailNudgeFunc(sender, "")
 	} else if notify && strings.HasPrefix(providerName, "exec:") && notifySetupErr != nil {
 		fmt.Fprintf(stderr, "gc mail reply: --notify requested but no city store available; nudge skipped: %v\n", notifySetupErr) //nolint:errcheck // best-effort stderr
 	}
