@@ -278,7 +278,12 @@ func (c *CachingStore) nextReconcileDelay(now time.Time) time.Duration {
 
 	lastFullScanAt := c.stats.LastReconcileAt
 	if lastFullScanAt.IsZero() {
-		lastFullScanAt = c.lastFreshAt
+		// Local writes refresh lastFreshAt, but cannot advance the first
+		// full-scan deadline. Preserve one cadence of startup warmup.
+		lastFullScanAt = c.stats.ReconcilerArmedAt
+		if lastFullScanAt.IsZero() {
+			return 0
+		}
 	}
 	dueAt := lastFullScanAt.Add(c.adaptiveIntervalLocked())
 	if !now.Before(dueAt) {

@@ -59,6 +59,14 @@
           ],
           "description": "Session overrides the session transport for this agent.\n\"\" (default) uses the city-level session provider (typically tmux).\n\"acp\" uses the Agent Client Protocol (JSON-RPC over stdio).\nThe agent's resolved provider must have supports_acp = true."
         },
+        "wake_transport": {
+          "type": "string",
+          "enum": [
+            "session",
+            "claude-cloud"
+          ],
+          "description": "WakeTransport selects this seat's notification-plane wake transport\n(claudemsg-bridge-design.md §4). \"\" and \"session\" mean today's\nworker.Handle wait-idle/queued path, byte-for-byte. \"claude-cloud\"\n(ga-bjbaui) delivers wake hints into a bound Claude Code cloud\nsession. Selection is structural per-seat configuration validated at\nload — never a runtime capability probe; a seat whose harness lacks\nthe selected transport is a config error, not a silent fallback.\n(Distinct from WakeMode, which controls resume-vs-fresh on wake.)"
+        },
         "provider": {
           "type": "string",
           "description": "Provider names the provider preset to use for this agent."
@@ -422,6 +430,10 @@
         "session": {
           "type": "string",
           "description": "Session overrides the session transport (\"acp\" or \"tmux\")."
+        },
+        "wake_transport": {
+          "type": "string",
+          "description": "WakeTransport overrides the seat's notification-plane wake transport\n(\"session\" or \"claude-cloud\"; see Agent.WakeTransport)."
         },
         "provider": {
           "type": "string",
