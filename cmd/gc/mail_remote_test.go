@@ -102,19 +102,21 @@ func TestCmdMailSendRemote_RefusesLocalOnlyModes(t *testing.T) {
 	cases := []struct {
 		name        string
 		notify, all bool
+		dedup       string
 		args        []string
 		want        string
 	}{
-		{"all", false, true, []string{"body"}, "--all"},
-		{"notify", true, false, []string{"mayor", "body"}, "--notify"},
-		{"no-recipient", false, false, nil, "missing recipient"},
-		{"no-body", false, false, []string{"mayor"}, "usage"},
-		{"blank-body", false, false, []string{"mayor", "\n\t "}, "usage"},
+		{"all", false, true, "", []string{"body"}, "--all"},
+		{"notify", true, false, "", []string{"mayor", "body"}, "--notify"},
+		{"dedup", false, false, "k1", []string{"mayor", "body"}, "--dedup"},
+		{"no-recipient", false, false, "", nil, "missing recipient"},
+		{"no-body", false, false, "", []string{"mayor"}, "usage"},
+		{"blank-body", false, false, "", []string{"mayor", "\n\t "}, "usage"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var out, errb bytes.Buffer
-			code := cmdMailSendRemote(remoteTestClient(t, srv.URL), remoteTestTarget(srv.URL), tc.args, tc.notify, tc.all, "", "", "", "", false, &out, &errb)
+			code := cmdMailSendRemote(remoteTestClient(t, srv.URL), remoteTestTarget(srv.URL), tc.args, tc.notify, tc.all, "", "", "", "", tc.dedup, false, &out, &errb)
 			if code == 0 || !strings.Contains(errb.String(), tc.want) {
 				t.Errorf("exit=%d stderr=%q (want %q)", code, errb.String(), tc.want)
 			}
@@ -149,7 +151,7 @@ func TestCmdMailSendRemote_PostsAndRenders(t *testing.T) {
 	defer srv.Close()
 
 	var out, errb bytes.Buffer
-	code := cmdMailSendRemote(remoteTestClient(t, srv.URL), remoteTestTarget(srv.URL), []string{"mayor", "round trip"}, false, false, "", "", "", "", false, &out, &errb)
+	code := cmdMailSendRemote(remoteTestClient(t, srv.URL), remoteTestTarget(srv.URL), []string{"mayor", "round trip"}, false, false, "", "", "", "", "", false, &out, &errb)
 	if code != 0 {
 		t.Fatalf("exit %d; stderr=%q", code, errb.String())
 	}
@@ -183,7 +185,7 @@ func TestCmdMailSendRemote_FlagsAndJSON(t *testing.T) {
 	defer srv.Close()
 
 	var out, errb bytes.Buffer
-	code := cmdMailSendRemote(remoteTestClient(t, srv.URL), remoteTestTarget(srv.URL), nil, false, false, "citadel/mayor", "mayor", "hello", "round trip", true, &out, &errb)
+	code := cmdMailSendRemote(remoteTestClient(t, srv.URL), remoteTestTarget(srv.URL), nil, false, false, "citadel/mayor", "mayor", "hello", "round trip", "", true, &out, &errb)
 	if code != 0 {
 		t.Fatalf("exit %d; stderr=%q", code, errb.String())
 	}
@@ -213,7 +215,7 @@ func TestCmdMailSendRemote_ServerErrorSurfaces(t *testing.T) {
 	}))
 	defer srv.Close()
 	var out, errb bytes.Buffer
-	code := cmdMailSendRemote(remoteTestClient(t, srv.URL), remoteTestTarget(srv.URL), []string{"mayor", "x"}, false, false, "", "", "", "", false, &out, &errb)
+	code := cmdMailSendRemote(remoteTestClient(t, srv.URL), remoteTestTarget(srv.URL), []string{"mayor", "x"}, false, false, "", "", "", "", "", false, &out, &errb)
 	if code == 0 || !strings.Contains(errb.String(), "gc mail send:") {
 		t.Errorf("exit=%d stderr=%q", code, errb.String())
 	}

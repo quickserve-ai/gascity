@@ -90,13 +90,13 @@ const (
 	// OutcomeQueuedRemote means a remote service accepted the hint;
 	// acceptance is NOT delivery (the ga-bjbaui spike's headline finding).
 	OutcomeQueuedRemote Outcome = "queued_remote"
-	// OutcomeRefusedNotFound: the recipient binding does not resolve.
+	// OutcomeRefusedNotFound means the recipient binding does not resolve.
 	OutcomeRefusedNotFound Outcome = "refused_not_found"
-	// OutcomeRefusedArchived: the remote session exists but is closed.
+	// OutcomeRefusedArchived means the remote session exists but is closed.
 	OutcomeRefusedArchived Outcome = "refused_archived"
-	// OutcomeRefusedPolicy: the transport is disabled by org/account policy.
+	// OutcomeRefusedPolicy means the transport is disabled by org/account policy.
 	OutcomeRefusedPolicy Outcome = "refused_policy"
-	// OutcomeAmbiguous: the attempt may or may not have been accepted
+	// OutcomeAmbiguous means the attempt may or may not have been accepted
 	// (e.g. a timeout after the CLI could have queued remotely).
 	OutcomeAmbiguous Outcome = "ambiguous"
 )

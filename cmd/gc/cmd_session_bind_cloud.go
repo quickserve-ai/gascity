@@ -21,7 +21,7 @@ import (
 // operator/owner action, so it gets its own verb.
 func newSessionBindCloudCmd(stdout, stderr io.Writer) *cobra.Command {
 	var cloudID, accountDir string
-	var clear bool
+	var clearBinding bool
 	cmd := &cobra.Command{
 		Use:   "bind-cloud <session-id-or-alias>",
 		Short: "Bind a seat to a Claude Code cloud session for claude-cloud wake delivery",
@@ -40,7 +40,7 @@ The binding is inert until the seat's agent config selects
 wake_transport = "claude-cloud".`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			if cmdSessionBindCloud(args[0], cloudID, accountDir, clear, stdout, stderr) != 0 {
+			if cmdSessionBindCloud(args[0], cloudID, accountDir, clearBinding, stdout, stderr) != 0 {
 				return errExit
 			}
 			return nil
@@ -49,16 +49,16 @@ wake_transport = "claude-cloud".`,
 	}
 	cmd.Flags().StringVar(&cloudID, "cloud-id", "", "cloud session ID (session_...)")
 	cmd.Flags().StringVar(&accountDir, "account-dir", "", "account lineage directory (CLAUDE_CONFIG_DIR) that owns the cloud session")
-	cmd.Flags().BoolVar(&clear, "clear", false, "remove the cloud binding and its delivery-state facts")
+	cmd.Flags().BoolVar(&clearBinding, "clear", false, "remove the cloud binding and its delivery-state facts")
 	return cmd
 }
 
-func cmdSessionBindCloud(target, cloudID, accountDir string, clear bool, stdout, stderr io.Writer) int {
+func cmdSessionBindCloud(target, cloudID, accountDir string, clearBinding bool, stdout, stderr io.Writer) int {
 	fail := func(format string, a ...any) int {
 		fmt.Fprintf(stderr, "gc session bind-cloud: "+format+"\n", a...) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	if clear {
+	if clearBinding {
 		if strings.TrimSpace(cloudID) != "" || strings.TrimSpace(accountDir) != "" {
 			return fail("--clear cannot be combined with --cloud-id/--account-dir")
 		}
@@ -96,7 +96,7 @@ func cmdSessionBindCloud(target, cloudID, accountDir string, clear bool, stdout,
 		return fail("reading session bead %s: %v", sessionID, err)
 	}
 
-	if clear {
+	if clearBinding {
 		// One all-or-nothing write (UpdateMetadataInfo, the single-Update
 		// chokepoint) so a failure can never leave a half-cleared binding.
 		patch := session.MetadataPatch{
