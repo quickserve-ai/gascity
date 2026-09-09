@@ -317,3 +317,30 @@ Absorption is judged per commit. After every rebase, walk this ledger top to
 bottom: each behavior either survives in `upstream/main..carry/operational` or
 has recorded patch-id/range-diff plus behavioral absorption evidence.
 
+
+## Branch governance (server-side rulesets, ga-w1ollm)
+
+Two repository rulesets govern pushes to this fork (created 2026-09-09 under
+the mayor's Q3 ruling; the authority and canary record live on ga-w1ollm):
+
+| Ruleset | Targets | Rules |
+|---|---|---|
+| `rig-ref-confinement (ga-w1ollm)` (22632844) | all branches **except** `polecat/**`, `pl/**` | restrict creation / update / deletion |
+| `carry-operational merge gate (ga-w1ollm)` (22632861) | `carry/operational` | changes via pull request (0 approvals — the gate is the author-run self-gate + CI, not GitHub reviews), required status check `CI / required`, strict up-to-date |
+
+Bypass on both is the **repository-admin role only** — the audited human
+break-glass. The rig/automation identity is deliberately not bypass-capable
+and is confined by exclusion: its writable refs are `polecat/**` and `pl/**`.
+Never grant the automation identity bypass; a control that exists, reports
+green, and never blocks is the advisory-only-audit failure class.
+
+Enforcement is staged: rulesets start in **evaluate** (verdicts recorded,
+nothing blocked) and flip to **active** only when the rule-suites record shows
+both canary sides from a non-bypass actor — a passing green PR merge and a
+refused red direct push. The rule-suites API
+(`repos/quickserve-ai/gascity/rulesets/rule-suites`) is the actor/ref-complete
+push observation source: it records every evaluated push with authenticated
+actor, ref, before/after SHAs, and per-rule verdicts — including refused
+attempts, which no client-side or events-feed source can show. If an
+evaluate-mode verdict would have blocked legitimate traffic, take the specific
+row to the mayor; never widen bypass.
