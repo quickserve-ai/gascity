@@ -1,0 +1,72 @@
+# Temporary ruleset-canary driver for ga-w1ollm (branch-governance arming).
+#
+# The two evaluate-mode rulesets (rig-ref-confinement 22632844, carry-operational
+# merge gate 22632861) need NON-BYPASS verdict rows in the rule-suites record
+# before they may be flipped to active. Every human collaborator is a repo admin
+# and short-circuits to evaluation=bypass, so the canary actor is
+# github-actions[bot] via this workflow's GITHUB_TOKEN (contents:write, no
+# admin, not on any bypass list).
+#
+# mode=red   push-creates then deletes a governed canary/** ref — expected to
+#            record refusal verdicts (creation/deletion rules) in evaluate mode.
+# mode=green merges the named, CI-green PR into carry/operational — records the
+#            merge-gate rule evaluations for a non-bypass merger.
+#
+# Remove this file once ga-w1ollm certifies and the rulesets are active.
+name: ga-w1ollm canary
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: red (governed-ref push) or green (merge PR)
+        required: true
+        type: choice
+        options:
+          - red
+          - green
+      pr_number:
+        description: PR number to merge (green mode only)
+        required: false
+      expected_head_sha:
+        description: Expected PR head SHA (green mode only; merge refuses if moved)
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 1
+
+      - name: Red side — governed-ref creation and deletion
+        if: inputs.mode == 'red'
+        run: |
+          ts=$(date -u +%Y%m%dT%H%M%SZ)
+          ref="refs/heads/canary/ga-w1ollm-red-$ts"
+          echo "pushing $ref as github-actions[bot] (non-bypass)"
+          git push origin "HEAD:$ref"
+          echo "deleting $ref"
+          git push origin ":$ref"
+
+      # Inputs reach the shell only via env (never inline interpolation) and
+      # are validated before use — the token carries contents:write.
+      - name: Green side — non-bypass merge of a green PR
+        if: inputs.mode == 'green'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+        run: |
+          [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || { echo "pr_number must be numeric"; exit 1; }
+          [[ "$EXPECTED_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "expected_head_sha must be a full SHA"; exit 1; }
+          base=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json baseRefName,state \
+                 --jq 'select(.state == "OPEN") | .baseRefName')
+          [ "$base" = "carry/operational" ] || { echo "PR #$PR_NUMBER is not an open PR into carry/operational (base=$base)"; exit 1; }
+          gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --merge \
+            --match-head-commit "$EXPECTED_HEAD_SHA"
