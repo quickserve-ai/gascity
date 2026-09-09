@@ -35,7 +35,14 @@ runs:
 
     - name: Install system dependencies
       shell: bash
-      run: sudo apt-get update && sudo apt-get install -y tmux jq
+      # The runner image preconfigures third-party apt sources (Chrome,
+      # Microsoft) that nothing here installs from; a bad index on any of
+      # them fails the whole update — dl.google.com served Hash Sum
+      # mismatches across two full run attempts on 2026-09-09 (ga-azybk8
+      # class). Drop the unused sources before updating.
+      run: |
+        sudo rm -f /etc/apt/sources.list.d/google-chrome* /etc/apt/sources.list.d/microsoft-prod*
+        sudo apt-get update && sudo apt-get install -y tmux jq
 
     - name: Install dolt v${{ inputs.dolt-version }}
       shell: bash
