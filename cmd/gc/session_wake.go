@@ -246,8 +246,9 @@ const (
 // it. The marker keys themselves are shared with the agent writer, which
 // clears reason and generation and writes source=agent before GC_DRAIN_ACK=1
 // (providerDrainOps.setDrainAck): two writers on source/reason/generation,
-// one on GC_DRAIN_ACK, so a reconciler clear can at worst lose an agent ack's
-// provenance, never the ack. Readers treat either shape as an ack
+// one on GC_DRAIN_ACK, so a reconciler clear can at worst cross an agent
+// ack's provenance, never the ack — and the own-only clear re-asserts that
+// provenance from the ack key it finds. Readers treat either shape as an ack
 // (providerDrainOps.isDrainAcked); an agent's key outranks the marker. A
 // publication that fails part-way cleans up through
 // clearReconcilerOwnDrainAckMetadata for the same reason the hold's cancels
@@ -294,10 +295,15 @@ func clearReconcilerDrainAckMetadata(sp runtime.Provider, name string) error {
 // this: an agent ack that lands at any point — before, during or after the
 // clear — keeps GC_DRAIN_ACK and is honored on the next tick, so there is no
 // interleaving in which the reconciler erases an agent's acknowledgment
-// (gastownhall/gascity#6178 review). What such an interleaving can lose is
-// the ack's source=agent provenance, which only the start-path retirement
-// reads (staleOrLegacyDrainAckBeforeStart): an ack without it is retired at
-// the seat's next successful start, which the honored stop precedes.
+// (gastownhall/gascity#6178 review). What such an interleaving can cross is
+// the ack's source=agent: the agent writes the source before GC_DRAIN_ACK,
+// and a removal here can fall between the two. The clear therefore ends by
+// re-asserting source=agent whenever GC_DRAIN_ACK reads 1 — that key is the
+// agent's alone on this binary — because the provenance is read before any
+// restart: a seat whose agent acked and exited is finalized on the desired
+// branch only when the ack reads as the agent's, and the start-path
+// retirement (staleOrLegacyDrainAckBeforeStartInfo) would otherwise retire
+// it as legacy.
 func clearReconcilerOwnDrainAckMetadata(sp runtime.Provider, name string) error {
 	if sp == nil {
 		return fmt.Errorf("session provider is nil")
@@ -309,7 +315,37 @@ func clearReconcilerOwnDrainAckMetadata(sp runtime.Provider, name string) error 
 			errs = append(errs, fmt.Errorf("removing %s: %w", key, err))
 		}
 	}
+	if err := restoreAgentDrainAckProvenance(sp, name); err != nil {
+		log.Printf("session wake: restoring agent drain ack provenance for %s: %v", name, err)
+		errs = append(errs, err)
+	}
 	return errors.Join(errs...)
+}
+
+// restoreAgentDrainAckProvenance re-asserts source=agent on a seat whose
+// GC_DRAIN_ACK reads 1 but whose source no longer says so. Only the agent's
+// `gc runtime drain-ack` writes GC_DRAIN_ACK on this binary, so the key is the
+// proof; the source it wrote just before can have been crossed by a
+// reconciler clear of its own marker keys.
+func restoreAgentDrainAckProvenance(sp runtime.Provider, name string) error {
+	ack, err := sp.GetMeta(name, "GC_DRAIN_ACK")
+	if err != nil {
+		return fmt.Errorf("reading GC_DRAIN_ACK: %w", err)
+	}
+	if strings.TrimSpace(ack) != "1" {
+		return nil
+	}
+	source, err := sp.GetMeta(name, reconcilerDrainAckSourceKey)
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", reconcilerDrainAckSourceKey, err)
+	}
+	if strings.TrimSpace(source) == drainAckSourceAgentValue {
+		return nil
+	}
+	if err := sp.SetMeta(name, reconcilerDrainAckSourceKey, drainAckSourceAgentValue); err != nil {
+		return fmt.Errorf("restoring %s=%s: %w", reconcilerDrainAckSourceKey, drainAckSourceAgentValue, err)
+	}
+	return nil
 }
 
 // cancelSessionDrainInfo removes a cancelable drain if wake reasons reappeared
