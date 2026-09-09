@@ -381,6 +381,18 @@ lint-changed: $(GOLANGCI_LINT)
 lint-affected: $(GOLANGCI_LINT)
 	@"$(CI_STATIC_SELECT)" lint-affected "$(GOLANGCI_LINT)" "$(CI_STATIC_GO)" $(LINT_FLAGS)
 
+## check-lean-local: vet/build all packages, then fast tests for affected packages
+## Set LINT_CHANGED_REF to the fetched integration base; defaults to HEAD for
+## local edits. Reuses the ICU CPPFLAGS (C AND C++) and isolated test environment.
+## Selection errors stop instead of silently running a full suite on the host.
+## This is local feedback, never a replacement for required server-side CI.
+.PHONY: check-lean-local
+check-lean-local:
+	$(TEST_ENV) GC_FAST_UNIT=1 GOMAXPROCS=2 \
+		CGO_CFLAGS="$${CGO_CFLAGS-}" CGO_CXXFLAGS="$${CGO_CXXFLAGS-}" \
+		LINT_CHANGED_REF="$(LINT_CHANGED_REF)" LINT_CHANGED_SCOPE="$(LINT_CHANGED_SCOPE)" \
+		"$(CI_STATIC_SELECT)" check-lean-local "$(CI_STATIC_GO)"
+
 ## fmt-check: fail if formatting would change files
 fmt-check: $(GOLANGCI_LINT)
 	$(GOLANGCI_LINT) fmt --diff ./...

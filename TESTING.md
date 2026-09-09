@@ -545,6 +545,28 @@ fast unit-only baseline; the integration contribution comes from the
 shard-specific `coverage.integration-*.txt` profiles and their matching
 Codecov flags.
 
+For a lean local check against a fetched integration base, use:
+
+```bash
+make check-lean-local LINT_CHANGED_REF=origin/carry/operational
+```
+
+This runs `go vet` and `go build` across the repository, then fast-unit tests
+for changed Go/native/embedded inputs and their transitive importers, including
+test-only importers. It reuses `ci-static-select` and the Makefile's isolated
+test environment and ICU configuration; `CGO_CPPFLAGS` reaches both C and C++,
+and this target also preserves explicit `CGO_CFLAGS` and `CGO_CXXFLAGS`.
+Package parallelism and `GOMAXPROCS` are capped at two.
+
+`LINT_CHANGED_REF` defaults to `HEAD` for local edits; refinery callers must
+pass their fetched integration base, not rely on that default. The existing
+`LINT_CHANGED_SCOPE` modes apply. Unknown selection and module/workspace
+changes refuse with a diagnostic instead of quietly selecting no tests or
+expanding into a full suite on the shared host. Required server CI remains
+authoritative; this target neither authorizes a merge nor replaces its checks.
+An empty diff also refuses, so a clean committed checkout cannot accidentally
+report a tested change when the caller forgot to select the integration base.
+
 ### Cross-category runners, timing, and resource isolation
 
 For broad local runs, prefer the repo's sharded wrappers over raw `go test`
