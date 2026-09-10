@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -275,6 +276,15 @@ func TestManagedDoltStopIntentTTLFollowsTheStoppersGraceWindow(t *testing.T) {
 	}
 	if got := managedDoltStopIntentEffectiveTTL(managedDoltStopIntent{TTLSeconds: 1}); got != managedDoltStopIntentTTL {
 		t.Errorf("a marker shortened its own window to %v; the default is a floor", got)
+	}
+	// The cap makes the arithmetic total: a pathological configured grace or a
+	// hostile marker value must clamp to the cap, never wrap negative and
+	// collapse to the default.
+	if got := managedDoltStopIntentTTLForGrace(time.Duration(math.MaxInt64)); got != managedDoltStopIntentTTLCap {
+		t.Errorf("a MaxInt64 grace sized the window to %v, want the cap %v", got, managedDoltStopIntentTTLCap)
+	}
+	if got := managedDoltStopIntentEffectiveTTL(managedDoltStopIntent{TTLSeconds: math.MaxInt}); got != managedDoltStopIntentTTLCap {
+		t.Errorf("a MaxInt marker window = %v, want the cap %v", got, managedDoltStopIntentTTLCap)
 	}
 
 	dir := t.TempDir()

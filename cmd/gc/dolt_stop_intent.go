@@ -63,6 +63,14 @@ const (
 	// expiring in its last seconds.
 	managedDoltStopIntentGraceSlack = 2 * time.Minute
 
+	// managedDoltStopIntentTTLCap bounds any vouching window, whatever a
+	// stopper asked for. No real shutdown of this server takes a day; a window
+	// past that could only silence a genuinely unexplained exit. The cap is
+	// also what makes the TTL arithmetic total: with every input clamped to it
+	// first, the additions and second-multiplications below cannot overflow on
+	// a pathological configured timeout or a hostile marker value.
+	managedDoltStopIntentTTLCap = 24 * time.Hour
+
 	// managedDoltStopIntentFutureSkew tolerates a marker stamped slightly in
 	// the future (clock adjustment between the stopper and the watchdog).
 	// Beyond it the marker is not trusted — an unexplained future timestamp is
@@ -98,6 +106,12 @@ func managedDoltStopIntentTTLForGrace(gracePeriod time.Duration) time.Duration {
 	if gracePeriod <= 0 {
 		return managedDoltStopIntentTTL
 	}
+	// Compare before adding: past the cap the answer is the cap, and the
+	// unperformed addition is what keeps a huge configured grace from
+	// wrapping negative.
+	if gracePeriod >= managedDoltStopIntentTTLCap-managedDoltStopIntentGraceSlack {
+		return managedDoltStopIntentTTLCap
+	}
 	return max(managedDoltStopIntentTTL, gracePeriod+managedDoltStopIntentGraceSlack)
 }
 
@@ -107,7 +121,14 @@ func managedDoltStopIntentEffectiveTTL(intent managedDoltStopIntent) time.Durati
 	if intent.TTLSeconds <= 0 {
 		return managedDoltStopIntentTTL
 	}
-	return max(managedDoltStopIntentTTL, time.Duration(intent.TTLSeconds)*time.Second)
+	// Clamp the seconds before multiplying: a marker is on-disk JSON, so the
+	// field can hold any int a writer chose, including one whose
+	// nanosecond conversion wraps.
+	seconds := intent.TTLSeconds
+	if capSeconds := int(managedDoltStopIntentTTLCap / time.Second); seconds > capSeconds {
+		seconds = capSeconds
+	}
+	return max(managedDoltStopIntentTTL, time.Duration(seconds)*time.Second)
 }
 
 // managedDoltStopIntentPath locates the marker for the server started with
@@ -155,7 +176,13 @@ func recordManagedDoltStopIntentWithTTL(configFile string, pid int, reason strin
 	}
 	ttlSeconds := 0
 	if ttl > managedDoltStopIntentTTL {
-		ttlSeconds = int(ttl.Round(time.Second) / time.Second)
+		// Cap first (total arithmetic), then round UP: a window rounded down
+		// could expire fractionally before the stop it vouches for completes,
+		// and the whole point of recording one is that it outlasts the stop.
+		if ttl > managedDoltStopIntentTTLCap {
+			ttl = managedDoltStopIntentTTLCap
+		}
+		ttlSeconds = int((ttl + time.Second - 1) / time.Second)
 	}
 	intent := managedDoltStopIntent{
 		PID:          pid,
