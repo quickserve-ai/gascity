@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	beadslib "github.com/steveyegge/beads"
@@ -140,6 +141,7 @@ func TestNativeDoltStoreSetMetadataBatchRollsBackWhenTheEventInsertFails(t *test
 	if err != nil {
 		t.Fatalf("newNativeDoltStoreAt: %v", err)
 	}
+	t.Cleanup(func() { _ = store.CloseStore() })
 
 	created, err := store.Create(Bead{Title: "rollback probe", Metadata: map[string]string{"gc.a": "1"}})
 	if err != nil {
@@ -157,12 +159,24 @@ func TestNativeDoltStoreSetMetadataBatchRollsBackWhenTheEventInsertFails(t *test
 	if _, err := db.Exec("RENAME TABLE `events` TO `events_offline`"); err != nil {
 		t.Fatalf("take the events table away: %v", err)
 	}
-	writeErr := store.SetMetadataBatch(created.ID, map[string]string{"gc.b": "2"})
-	if _, err := db.Exec("RENAME TABLE `events_offline` TO `events`"); err != nil {
-		t.Fatalf("restore the events table: %v", err)
+	restored := false
+	restoreEvents := func() {
+		if restored {
+			return
+		}
+		restored = true
+		if _, err := db.Exec("RENAME TABLE `events_offline` TO `events`"); err != nil {
+			t.Errorf("restore the events table: %v", err)
+		}
 	}
+	t.Cleanup(restoreEvents)
+	writeErr := store.SetMetadataBatch(created.ID, map[string]string{"gc.b": "2"})
+	restoreEvents()
 	if writeErr == nil {
 		t.Fatal("SetMetadataBatch succeeded with the events table gone; the event insert does not share the write's transaction")
+	}
+	if !strings.Contains(strings.ToLower(writeErr.Error()), "events") {
+		t.Fatalf("SetMetadataBatch error = %v, want the missing events table named (a different failure would not prove the rollback)", writeErr)
 	}
 
 	after, err := storage.GetIssue(ctx, created.ID)
