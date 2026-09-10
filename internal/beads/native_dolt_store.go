@@ -342,6 +342,10 @@ type NativeDoltStore struct {
 	// single wall-clock bound on a read's whole reconnect-and-retry chain. Only
 	// tests set it (to exercise budget exhaustion without a real 90s wait).
 	readRetryBudgetOverride time.Duration
+	// afterMetadataMergeRead, when set, runs after each read that starts a
+	// metadata merge attempt, before its checked write. Only tests set it, to
+	// land a competing write in the window the compare-and-swap protects.
+	afterMetadataMergeRead func(id string)
 
 	// condWritesStamp carries the factory-stamped conditional-writes mode. The
 	// pinned upstream Storage contract requires row-version checked update and
@@ -1785,6 +1789,9 @@ func (s *NativeDoltStore) setMetadataBatchOnce(ctx context.Context, storage bead
 	}
 	if issue == nil {
 		return fmt.Errorf("bead %q: %w", id, ErrNotFound)
+	}
+	if s.afterMetadataMergeRead != nil {
+		s.afterMetadataMergeRead(id)
 	}
 	raw, err := metadataRawWithOverrides(issue.Metadata, kvs)
 	if err != nil {
