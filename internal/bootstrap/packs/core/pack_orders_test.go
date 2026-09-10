@@ -489,4 +489,18 @@ func TestDetectSilentPublishedWorkScriptContract(t *testing.T) {
 	if !strings.Contains(body, "keeping the unpruned state") {
 		t.Error("detect-silent-published-work.sh must keep the unpruned state when the prune fails; writing an empty state resets every clock")
 	}
+
+	// The orphan arm's mail must LATCH. It cannot dedup on a store gate — gate
+	// create requires --blocks and the orphan case is beadless, and the
+	// reconciliation phase resolves any episode the candidate loop did not
+	// re-derive — so it latches on a mailed-at state record with a re-remind
+	// interval, stamped only when the mail actually delivered. Without this
+	// the same orphans re-mail every cooldown forever (measured on the
+	// westeros deployment: nine orphans, ~108 mails/hour).
+	if !strings.Contains(body, "orphan_mailed_at") {
+		t.Error("detect-silent-published-work.sh orphan arm must latch its mail on an orphan_mailed_at state record; a gate nothing creates never dedups and the mail re-sends every cooldown")
+	}
+	if !strings.Contains(body, "ORPHAN_REMIND_S") {
+		t.Error("detect-silent-published-work.sh orphan arm must honor a re-remind interval so a latched orphan still re-surfaces instead of being silenced forever")
+	}
 }

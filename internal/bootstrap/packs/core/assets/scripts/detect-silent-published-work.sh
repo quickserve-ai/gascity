@@ -83,6 +83,10 @@ THRESHOLD="${GC_SILENT_WORK_THRESHOLD:-2h}"
 # Observation entries older than this are pruned so the state file stays bounded.
 RETENTION="${GC_SILENT_WORK_STATE_RETENTION:-30d}"
 ORPHAN_RECIPIENT="${GC_SILENT_WORK_ORPHAN_RECIPIENT:-mayor}"
+# How long one orphan-PR mail stays latched before the reminder re-sends. The
+# orphan CONDITION is re-derived live from gh every sweep; only the MAIL is
+# rate-limited by this.
+ORPHAN_REMIND="${GC_SILENT_WORK_ORPHAN_REMIND:-24h}"
 ESCALATION_RECIPIENT="${GC_ESCALATION_RECIPIENT:-human}"
 BRANCH_PATTERNS="${GC_SILENT_WORK_BRANCH_PATTERNS:-polecat/ fix/ nux/ integration/}"
 
@@ -122,6 +126,7 @@ iso_to_epoch() {
 }
 
 THRESHOLD_S="$(duration_to_seconds "$THRESHOLD")"
+ORPHAN_REMIND_S="$(duration_to_seconds "$ORPHAN_REMIND")"
 NOW_EPOCH="$(date -u +%s)"
 NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -479,16 +484,39 @@ GATE_EOF
         done
         [ "$match" -eq 1 ] || continue
         printf '%s\n' "$POINTED" | grep -Fxq "$opr" && continue
-        # Dedup against the store, not a local record: one open orphan gate per
-        # PR. Without this the mail re-sends every five minutes forever.
+        # Dedup surface for THIS arm is the STATE FILE, not a store gate. Arm
+        # (i) dedups on a gate bead, but `gate create` REQUIRES --blocks and the
+        # orphan case is by definition beadless — there is nothing to block —
+        # and the reconciliation phase above resolves any silentwork gate whose
+        # episode the candidate loop did not re-derive, so a blocking-nothing
+        # gate would be resolved next sweep regardless. This arm previously
+        # CHECKED for a gate that nothing anywhere creates, so the check never
+        # passed and the mail re-sent every cooldown forever (measured on the
+        # westeros deployment: the same nine orphans, ~108 mails/hour). A
+        # mailed-at record with a re-remind interval is honest here BECAUSE the
+        # condition itself is re-derived live from gh every sweep: state loss
+        # costs at most one duplicate mail, and a record for a PR that stops
+        # being an orphan stops being refreshed and ages out with retention.
         OEP="$(episode_key "orphan" "$opr" "no-bead")"
-        if ! GATES="$(list_episode_gates "$scope")"; then UNKNOWN=$((UNKNOWN + 1)); continue; fi
-        if printf '%s' "$GATES" | awk -F"$US" -v k="$OEP" '$2 == k {found=1} END {exit !found}'; then
-            continue
+        oprev="$(echo "$STATE" | jq -c --arg k "$OEP" '.[$k] // empty' 2>/dev/null || true)"
+        ofirst="$NOW_ISO"; omailed=""
+        if [ -n "$oprev" ]; then
+            pf="$(echo "$oprev" | jq -r '.first_observed_in_state_at // ""' 2>/dev/null || true)"
+            [ -n "$pf" ] && ofirst="$pf"
+            omailed="$(echo "$oprev" | jq -r '.orphan_mailed_at // ""' 2>/dev/null || true)"
+        fi
+        if [ -n "$omailed" ]; then
+            om_epoch="$(iso_to_epoch "$omailed")"
+            if [ -n "$om_epoch" ] && [ $(( NOW_EPOCH - om_epoch )) -lt "$ORPHAN_REMIND_S" ]; then
+                # Mailed within the remind window: keep the record alive
+                # (still an orphan) and stay quiet.
+                NEXT_STATE="$(echo "$NEXT_STATE" | jq -c --arg k "$OEP" --argjson v "$oprev" '.[$k] = $v' 2>/dev/null || echo "$NEXT_STATE")"
+                continue
+            fi
         fi
         echo "detect-silent-published-work: ORPHAN PR — $ourl (branch $obranch) has no bead pointing at it" >&2
         ORPHANS=$((ORPHANS + 1))
-        gc mail send "$ORPHAN_RECIPIENT" --notify \
+        if gc mail send "$ORPHAN_RECIPIENT" --notify \
             -s "Orphan factory PR with no bead: $ourl" \
             -m "An OPEN PR on a factory branch has no bead pointing at it, so nothing in the system will ever mention it again.
 
@@ -500,9 +528,16 @@ This is the mirror image of a bead published without a pointer: work that exists
 with no record leading anyone to it. Attach it to its bead, or close it.
 
 Raised by detect-silent-published-work (ga-krso22 / ga-mmvpq1 Half B, B1 arm ii).
-Episode: $OEP" >/dev/null 2>&1 || {
-                echo "detect-silent-published-work: FAILED to report orphan PR $ourl (will retry next sweep)" >&2
-                FAILED=$((FAILED + 1)); }
+Episode: $OEP" >/dev/null 2>&1; then
+            # Stamp the latch ONLY on a delivered mail; a failed send leaves the
+            # prior record (or none) in place so the next sweep retries.
+            NEXT_STATE="$(echo "$NEXT_STATE" | jq -c --arg k "$OEP" --arg f "$ofirst" --arg m "$NOW_ISO" \
+                '.[$k] = {first_observed_in_state_at: $f, orphan_mailed_at: $m}' 2>/dev/null || echo "$NEXT_STATE")"
+        else
+            echo "detect-silent-published-work: FAILED to report orphan PR $ourl (will retry next sweep)" >&2
+            FAILED=$((FAILED + 1))
+            [ -n "$oprev" ] && NEXT_STATE="$(echo "$NEXT_STATE" | jq -c --arg k "$OEP" --argjson v "$oprev" '.[$k] = $v' 2>/dev/null || echo "$NEXT_STATE")"
+        fi
     done <<ORPHAN_EOF
 $(printf '%s' "$OPEN_PRS" | jq -r --arg us "$US" '.[] | [(.number|tostring), .headRefName, .url] | join($us)' 2>/dev/null || true)
 ORPHAN_EOF
