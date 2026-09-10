@@ -12986,10 +12986,13 @@ func TestBuildDesiredStateRecordsDemandSubPhases(t *testing.T) {
 // when a live bead holds a configured named identity's alias without being
 // its canonical session (here: a foreign-template bead with alias=agent-a),
 // the named pass must skip the identity (as before) but say so on stderr,
-// naming the conflicting bead — this class burned 4600+ silent skips. NOTE the ephemeral+pool_managed backing-template shape does
-// NOT reach this branch: InfoConflictsWithNamedSession lacks the pool_managed
-// branch its bead-tier twin has, and the builder adopts/rekeys that shape
-// instead (characterized on ga-dfp1b; matcher parity is L2 scope).
+// naming the conflicting bead — this class burned 4600+ silent skips. NOTE
+// the ephemeral+pool_managed backing-template shape does NOT reach this
+// branch when the shadow is ADOPTABLE (identity-named, alias absent or the
+// identity's own): L2's InfoIsAdoptablePoolShadow carve-out lets the builder
+// materialize it and the sync path adopt it — see
+// named_session_adoption_test.go. Unadoptable shapes (foreign template, as
+// here, or identity != template) still skip loudly through this branch.
 func TestBuildDesiredState_NamedSessionConflictSkipIsLogged(t *testing.T) {
 	cityPath := t.TempDir()
 	store := beads.NewMemStore()
