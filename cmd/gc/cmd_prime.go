@@ -392,6 +392,17 @@ func doPrimeWithHookFormatOpts(args []string, stdout, stderr io.Writer, hookMode
 		case len(resolvedAgents) == 0:
 			fmt.Fprintf(stderr, "gc prime: agent %q not found in city config\n", agentName) //nolint:errcheck
 			return 1, nil
+		case !hookMode && allAgentsEffectivelySuspended(cfg, resolvedAgents):
+			// Without this, the readability loop below skips every suspended
+			// instance, strict "passes", and the render loop then exits 0
+			// having written NOTHING — a silent empty success in exactly the
+			// misconfiguration-shaped case --strict exists to catch (ga-vuh3tj:
+			// astro-rig crew names strict-rendered empty for weeks of probing).
+			// Hook mode is exempt: a suspended seat's SessionStart is a QUIET
+			// success by contract (the sidecar tests pin it) — the suspension
+			// is deliberate there, not a misconfiguration.
+			fmt.Fprintf(stderr, "gc prime: agent %q resolves only to suspended instances; nothing would render\n", agentName) //nolint:errcheck
+			return 1, nil
 		}
 		// renderPrompt returns "" both when the template file cannot be read
 		// and when a valid template legitimately renders empty. Readability is
@@ -410,12 +421,10 @@ func doPrimeWithHookFormatOpts(args []string, stdout, stderr io.Writer, hookMode
 			// Configured fragments that resolve to no registered template
 			// render as silent no-ops — a debugging mistake --strict exists
 			// to catch (a governance fragment can otherwise silently not
-			// exist; see the local-pack fragment bug).
-			rigName := os.Getenv("GC_RIG")
-			if rigName == "" {
-				rigName = configuredRigName(cityPath, &a, cfg.Rigs)
-			}
-			packDirs := cfg.PackDirsForRig(rigName)
+			// exist; see the local-pack fragment bug). Pack dirs come from
+			// the same rig the render resolves against (primeRigName), so
+			// the check composes exactly the fragment set the render will.
+			packDirs := cfg.PackDirsForRig(primeRigName(cityPath, &a, cfg.Rigs))
 			fragments := effectivePromptFragments(
 				cfg.Workspace.GlobalFragments,
 				a.InjectFragments,
@@ -427,7 +436,7 @@ func doPrimeWithHookFormatOpts(args []string, stdout, stderr io.Writer, hookMode
 				for _, name := range missing {
 					fmt.Fprintf(stderr, "gc prime: agent %q: fragment %q not found in any template-fragments/ or shared/ directory\n", agentName, name) //nolint:errcheck
 				}
-				return 1
+				return 1, nil
 			}
 			// Template variables outside the SDK field set + agent env render
 			// as silent empty strings (missingkey=zero over a string map) —
@@ -436,7 +445,7 @@ func doPrimeWithHookFormatOpts(args []string, stdout, stderr io.Writer, hookMode
 				for _, issue := range issues {
 					fmt.Fprintf(stderr, "gc prime: agent %q: unknown template variable {{ .%s }} in template %q (%s): not an SDK field or agent env var\n", agentName, issue.Field, issue.TemplateName, issue.Location) //nolint:errcheck
 				}
-				return 1
+				return 1, nil
 			}
 		}
 		// Strict preconditions passed; now it's safe to update provider resume metadata.
@@ -445,6 +454,14 @@ func doPrimeWithHookFormatOpts(args []string, stdout, stderr io.Writer, hookMode
 
 	for _, a := range resolvedAgents {
 		if isAgentEffectivelySuspended(cfg, &a) {
+			// Hooks must stay silent for a suspended seat (a suspended
+			// agent's SessionStart injecting anything would wake work the
+			// suspension exists to stop). A human at the prompt gets told —
+			// empty stdout with exit 0 reads as success and was misdiagnosed
+			// as a resolution bug (ga-vuh3tj).
+			if !hookMode {
+				fmt.Fprintf(stderr, "gc prime: agent %q is suspended; nothing rendered\n", agentName) //nolint:errcheck
+			}
 			return 0, nil
 		}
 		resolved, rErr := config.ResolveProvider(&a, &cfg.Workspace, cfg.Providers, exec.LookPath)
@@ -534,9 +551,35 @@ func doPrimeWithHookFormatOpts(args []string, stdout, stderr io.Writer, hookMode
 	// when the agent has no prompt_template and doesn't match a builtin
 	// worker prompt — a supported config shape, so the default prompt is
 	// the correct output even under --strict.
+	//
+	// In non-strict NON-hook use, landing here with a name that resolved to
+	// nothing means the caller asked for an agent that does not exist under
+	// that spelling — most often a session-table ALIAS (qcore/archer) instead
+	// of the configured name (qcore/cherub-law.archer). Rendering the generic
+	// prompt wordlessly made that look like the agent's real prompt
+	// (ga-vuh3tj). Hooks keep the silent fallback: GC_ALIAS legitimately
+	// carries user-facing aliases there.
+	if !hookMode && agentName != "" && len(resolvedAgents) == 0 {
+		fmt.Fprintf(stderr, "gc prime: warning: agent %q not found in city config; rendering the generic prompt (a session-table alias is not an agent name — use the configured name, e.g. <rig>/<pack>.<agent>)\n", agentName) //nolint:errcheck
+	}
 	injection := primeHookContextSuffix(cityPath, hookMode, hookContext, stderr, consumeHandoff)
 	writePrimePromptWithFormat(stdout, cityName, agentName, defaultPrimePrompt, hookMode, hookFormat, suppressHookPrompt, injection.text, injection.afterDelivery)
 	return 0, nil
+}
+
+// allAgentsEffectivelySuspended reports whether every resolved agent is
+// suspended (agent flag, its rig, or the city). False for an empty slice —
+// the no-resolution case has its own strict refusal.
+func allAgentsEffectivelySuspended(cfg *config.City, agents []config.Agent) bool {
+	if len(agents) == 0 {
+		return false
+	}
+	for i := range agents {
+		if !isAgentEffectivelySuspended(cfg, &agents[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // strictUnknownTemplateVariables runs the static unknown-variable check for
@@ -1007,6 +1050,19 @@ func buildPrimeContext(cityPath, cityName string, a *config.Agent, rigs []config
 	return buildPrimeContextFor(cityPath, cityName, a, rigs, config.QueryTopology{}, stderr)
 }
 
+// primeRigName is the rig a gc prime render resolves against: GC_RIG inside a
+// managed session, else the agent's configured rig. buildPrimeContextFor sets
+// ctx.RigName from it and the render composes fragments from
+// cfg.PackDirsForRig(ctx.RigName); the --strict fragment and unknown-variable
+// checks derive their pack dirs from the same call, so they can never check a
+// different fragment set than the render uses.
+func primeRigName(cityPath string, a *config.Agent, rigs []config.Rig) string {
+	if gcRig := os.Getenv("GC_RIG"); gcRig != "" {
+		return gcRig
+	}
+	return configuredRigName(cityPath, a, rigs)
+}
+
 func buildPrimeContextFor(cityPath, cityName string, a *config.Agent, rigs []config.Rig, topo config.QueryTopology, stderr io.Writer) PromptContext {
 	ctx := PromptContext{
 		CityRoot:      cityPath,
@@ -1032,17 +1088,17 @@ func buildPrimeContextFor(cityPath, cityName string, a *config.Agent, rigs []con
 	}
 
 	// Rig context.
-	if gcRig := os.Getenv("GC_RIG"); gcRig != "" {
-		ctx.RigName = gcRig
-		ctx.RigRoot = os.Getenv("GC_RIG_ROOT")
-		if ctx.RigRoot == "" {
-			ctx.RigRoot = rigRootForName(gcRig, rigs)
-		}
-		ctx.IssuePrefix = findRigPrefix(gcRig, rigs)
-	} else if rigName := configuredRigName(cityPath, a, rigs); rigName != "" {
+	if rigName := primeRigName(cityPath, a, rigs); rigName != "" {
 		ctx.RigName = rigName
 		ctx.RigRoot = rigRootForName(rigName, rigs)
 		ctx.IssuePrefix = findRigPrefix(rigName, rigs)
+		// Inside a managed session GC_RIG_ROOT is authoritative for the
+		// GC_RIG it accompanies.
+		if os.Getenv("GC_RIG") != "" {
+			if gcRigRoot := os.Getenv("GC_RIG_ROOT"); gcRigRoot != "" {
+				ctx.RigRoot = gcRigRoot
+			}
+		}
 	}
 
 	ctx.Branch = os.Getenv("GC_BRANCH")
