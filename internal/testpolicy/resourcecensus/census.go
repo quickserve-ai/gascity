@@ -205,7 +205,7 @@ var bootstrapPolicy = Ledger{
 		{
 			Scope:           ScopeCmdGCUntagged,
 			Resource:        ResourceCWD,
-			BaselineCalls:   176,
+			BaselineCalls:   182,
 			BaselineFiles:   17,
 			ReportedCalls:   98,
 			ReportedFiles:   13,
@@ -309,8 +309,8 @@ var bootstrapPolicy = Ledger{
 		{
 			Scope:           ScopeUntagged,
 			Resource:        ResourceTmux,
-			BaselineCalls:   9,
-			BaselineFiles:   4,
+			BaselineCalls:   13,
+			BaselineFiles:   5,
 			ReportedCalls:   7,
 			ReportedFiles:   3,
 			OwnerBead:       "ga-cp3hwi",
@@ -637,7 +637,7 @@ var bootstrapPolicy = Ledger{
 		{
 			Scope:           ScopeCmdGCUntagged,
 			Resource:        ResourceCWD,
-			BaselineCalls:   176,
+			BaselineCalls:   182,
 			BaselineFiles:   17,
 			ReportedCalls:   284,
 			ReportedFiles:   43,
@@ -663,8 +663,8 @@ var bootstrapPolicy = Ledger{
 		{
 			Scope:           ScopeUntagged,
 			Resource:        ResourceHTTPTestServer,
-			BaselineCalls:   318,
-			BaselineFiles:   66,
+			BaselineCalls:   331,
+			BaselineFiles:   67,
 			ReportedCalls:   300,
 			ReportedFiles:   66,
 			OwnerBead:       "ga-cp3hwi",
@@ -741,8 +741,8 @@ var bootstrapPolicy = Ledger{
 		{
 			Scope:           ScopeUntagged,
 			Resource:        ResourceTmux,
-			BaselineCalls:   3,
-			BaselineFiles:   2,
+			BaselineCalls:   7,
+			BaselineFiles:   3,
 			ReportedCalls:   1,
 			ReportedFiles:   1,
 			OwnerBead:       "ga-cp3hwi",
