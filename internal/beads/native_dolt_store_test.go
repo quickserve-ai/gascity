@@ -2106,6 +2106,7 @@ type nativeDoltStorageSpy struct {
 	createIssues                func(context.Context, []*beadslib.Issue, string) error
 	getIssue                    func(context.Context, string) (*beadslib.Issue, error)
 	updateIssue                 func(context.Context, string, map[string]interface{}, string) error
+	updateIssueChecked          func(context.Context, string, map[string]interface{}, string, beadslib.UpdateIssueOptions) error
 	runInTransaction            func(context.Context, string, func(beadslib.Transaction) error) error
 	reopenIssue                 func(context.Context, string, string, string) error
 	closeIssue                  func(context.Context, string, string, string, string) error
@@ -2155,6 +2156,13 @@ func (s *nativeDoltStorageSpy) UpdateIssue(ctx context.Context, id string, updat
 		return nil
 	}
 	return s.updateIssue(ctx, id, updates, actor)
+}
+
+func (s *nativeDoltStorageSpy) UpdateIssueChecked(ctx context.Context, id string, updates map[string]interface{}, actor string, opts beadslib.UpdateIssueOptions) error {
+	if s.updateIssueChecked == nil {
+		return nil
+	}
+	return s.updateIssueChecked(ctx, id, updates, actor, opts)
 }
 
 func (s *nativeDoltStorageSpy) RunInTransaction(ctx context.Context, commitMsg string, fn func(beadslib.Transaction) error) error {
@@ -2345,6 +2353,30 @@ func (s *nativeDoltMemStorage) UpdateIssue(_ context.Context, id string, updates
 		return err
 	}
 	return s.store.Update(id, opts)
+}
+
+func (s *nativeDoltMemStorage) UpdateIssueChecked(
+	_ context.Context,
+	id string,
+	updates map[string]interface{},
+	_ string,
+	opts beadslib.UpdateIssueOptions,
+) error {
+	updateOpts, err := nativeDoltMemUpdateOpts(updates)
+	if err != nil {
+		return err
+	}
+	if opts.ExpectedVersion == nil {
+		return s.store.Update(id, updateOpts)
+	}
+	return nativeDoltMemCheckedError(s.store.UpdateIfMatch(id, *opts.ExpectedVersion, updateOpts))
+}
+
+func nativeDoltMemCheckedError(err error) error {
+	if !IsPreconditionFailed(err) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", beadslib.ErrVersionMismatch, err)
 }
 
 func (s *nativeDoltMemStorage) ReopenIssue(_ context.Context, id string, _ string, _ string) error {
