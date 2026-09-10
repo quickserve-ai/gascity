@@ -2118,7 +2118,10 @@ type OrdersConfig struct {
 	// dispatch goroutine, and the pass runs its open-work gates inline,
 	// so very large values trade tick latency and store write volume for
 	// cadence; size to steady-state demand with modest headroom.
-	MaxDispatchesPerTick int `toml:"max_dispatches_per_tick,omitempty"`
+	// Pointer distinguishes "not set" (nil, built-in default) from an
+	// explicit value; a plain int zero would also force the [orders] table
+	// into every marshaled scaffold (BurntSushi omitempty has no int case).
+	MaxDispatchesPerTick *int `toml:"max_dispatches_per_tick,omitempty"`
 	// Overrides apply per-order field overrides after scanning.
 	// Each override targets an order by name and optionally by rig.
 	Overrides []OrderOverride `toml:"overrides,omitempty"`
@@ -2184,10 +2187,10 @@ func (c OrdersConfig) MaxTimeoutDuration() time.Duration {
 }
 
 // MaxDispatchesPerTickOr returns the configured per-tick dispatch cap, or
-// def when the field is unset (<= 0).
+// def when the field is unset or non-positive.
 func (c OrdersConfig) MaxDispatchesPerTickOr(def int) int {
-	if c.MaxDispatchesPerTick > 0 {
-		return c.MaxDispatchesPerTick
+	if c.MaxDispatchesPerTick != nil && *c.MaxDispatchesPerTick > 0 {
+		return *c.MaxDispatchesPerTick
 	}
 	return def
 }

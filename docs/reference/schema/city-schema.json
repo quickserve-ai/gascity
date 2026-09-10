@@ -2113,7 +2113,7 @@
         },
         "max_dispatches_per_tick": {
           "type": "integer",
-          "description": "MaxDispatchesPerTick caps how many orders the controller fires in one\ndispatch pass (one reconciler tick). 0 or negative means the built-in\ndefault. Calibrate to the city's order book: when steady-state demand\n(sum of 3600/interval across cooldown orders, in fires/hour) exceeds\ncap x ticks-per-hour, every short-interval order dilutes toward the\nsame round-robin rotation cadence instead of its own interval\n(ga-44iyd). Each fire costs a tracking-bead write plus an async\ndispatch goroutine, and the pass runs its open-work gates inline,\nso very large values trade tick latency and store write volume for\ncadence; size to steady-state demand with modest headroom."
+          "description": "MaxDispatchesPerTick caps how many orders the controller fires in one\ndispatch pass (one reconciler tick). 0 or negative means the built-in\ndefault. Calibrate to the city's order book: when steady-state demand\n(sum of 3600/interval across cooldown orders, in fires/hour) exceeds\ncap x ticks-per-hour, every short-interval order dilutes toward the\nsame round-robin rotation cadence instead of its own interval\n(ga-44iyd). Each fire costs a tracking-bead write plus an async\ndispatch goroutine, and the pass runs its open-work gates inline,\nso very large values trade tick latency and store write volume for\ncadence; size to steady-state demand with modest headroom.\nPointer distinguishes \"not set\" (nil, built-in default) from an\nexplicit value; a plain int zero would also force the [orders] table\ninto every marshaled scaffold (BurntSushi omitempty has no int case)."
         },
         "overrides": {
           "items": {

@@ -10443,7 +10443,8 @@ func TestOrderDispatchBudgetExhaustionSilentWhenNothingUnvisited(t *testing.T) {
 
 func TestNewMemoryOrderDispatcherHonorsConfiguredBudget(t *testing.T) {
 	cfg := &config.City{}
-	cfg.Orders.MaxDispatchesPerTick = 16
+	sixteen := 16
+	cfg.Orders.MaxDispatchesPerTick = &sixteen
 	m := newMemoryOrderDispatcher(nil, t.TempDir(), cfg, nil, io.Discard)
 	if m.maxDispatchesPerTick != 16 {
 		t.Fatalf("maxDispatchesPerTick = %d, want 16 (configured)", m.maxDispatchesPerTick)
