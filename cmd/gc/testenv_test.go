@@ -38,6 +38,13 @@ var liveTestEnvVars = []string{
 	"BEADS_DOLT_SERVER_HOST",
 	"BEADS_DOLT_SERVER_PORT",
 	"BEADS_DOLT_SERVER_USER",
+	// The developer/agent shell's Claude account selection. With it
+	// inherited, the ga-ai7gz2 declared-account guard sees an ambient
+	// account and refuses env-less claude-family test agents, silently
+	// dropping them from desired state (three BuildDesiredState tests
+	// failed exactly that way). Tests that exercise the guard set it
+	// explicitly via t.Setenv.
+	"CLAUDE_CONFIG_DIR",
 	"DOLT_CONFIG_PATH",
 	"DOLT_ROOT_PATH",
 	"GC_BEADS_PREFIX",

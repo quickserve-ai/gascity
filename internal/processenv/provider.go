@@ -3,6 +3,8 @@
 package processenv
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -115,7 +117,6 @@ func ProviderProcessPassthroughEnv() map[string]string {
 		// time reasoning (e.g. `gc order check`, date math in scripts) agrees
 		// with the supervisor instead of defaulting to UTC.
 		"TZ",
-		"CLAUDE_CONFIG_DIR",
 		"CLAUDE_CODE_OAUTH_TOKEN",
 		"CLAUDE_CODE_SUBAGENT_MODEL",
 		"CLAUDE_CODE_EFFORT_LEVEL",
@@ -165,5 +166,41 @@ func ProviderProcessPassthroughEnv() map[string]string {
 	m["CLAUDE_CODE_ENTRYPOINT"] = ""
 	m["CODEX_THREAD_ID"] = ""
 	m["CODEX_CI"] = ""
+	// CLAUDE_CONFIG_DIR selects the Claude ACCOUNT the session bills to. The
+	// controller's own ambient value must never decide a managed session's
+	// account: an env-less claude provider would silently land on whatever
+	// account the controller happens to run under (ga-ai7gz2 — one seat
+	// inherited the operator's account, another an unrelated one). Reset it
+	// here; a workspace/provider/agent env layer that declares an account
+	// overrides this in the later merge, and RequireDeclaredClaudeAccount is
+	// the spawn-time guard that turns "claude family, ambient present, none
+	// declared" into a loud refusal instead of a silent inheritance.
+	m["CLAUDE_CONFIG_DIR"] = ""
 	return m
+}
+
+// ErrUndeclaredClaudeAccount marks a refused claude-family spawn whose config
+// declares no CLAUDE_CONFIG_DIR while the controller carries an ambient one.
+var ErrUndeclaredClaudeAccount = errors.New("claude provider declares no CLAUDE_CONFIG_DIR")
+
+// RequireDeclaredClaudeAccount refuses to let a claude-family session launch
+// on an inherited account. It errors only when all three hold: the provider
+// resolves to the claude family, the controller itself runs with an ambient
+// CLAUDE_CONFIG_DIR (so there IS an account to wrongly inherit), and no config
+// layer declared one for the session (sessionEnv is the merged session env;
+// ProviderProcessPassthroughEnv resets the key, so a non-empty value can only
+// come from a declared layer). With no ambient value the vanilla single-account
+// setup — claude defaulting to ~/.claude — keeps working untouched. (ga-ai7gz2)
+func RequireDeclaredClaudeAccount(providerName, family string, sessionEnv map[string]string) error {
+	if family != "claude" {
+		return nil
+	}
+	ambient := strings.TrimSpace(os.Getenv("CLAUDE_CONFIG_DIR"))
+	if ambient == "" {
+		return nil
+	}
+	if strings.TrimSpace(sessionEnv["CLAUDE_CONFIG_DIR"]) != "" {
+		return nil
+	}
+	return fmt.Errorf("%w: provider %q resolves to the claude family but no workspace/provider/agent env layer sets CLAUDE_CONFIG_DIR, and the controller runs with an ambient one; declare env.CLAUDE_CONFIG_DIR on the provider so the seat binds to an explicit account instead of silently inheriting the controller's (ga-ai7gz2)", ErrUndeclaredClaudeAccount, providerName)
 }

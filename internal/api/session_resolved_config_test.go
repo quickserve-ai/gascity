@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/convergence"
+	"github.com/gastownhall/gascity/internal/processenv"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
 )
@@ -181,6 +183,10 @@ func TestResolvedSessionConfigForProviderScrubsControllerToken(t *testing.T) {
 }
 
 func TestResolvedSessionConfigForProviderStampsContextLaunchModel(t *testing.T) {
+	// Pin ambient CLAUDE_CONFIG_DIR empty: with an ambient value and no
+	// declared account the claude-family guard refuses the spawn (ga-ai7gz2),
+	// and this test exercises the vanilla no-ambient path deterministically.
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	resolved := &config.ResolvedProvider{
 		Name:    "claude",
 		Command: "claude",
@@ -195,6 +201,37 @@ func TestResolvedSessionConfigForProviderStampsContextLaunchModel(t *testing.T) 
 	}
 	if got := cfg.Runtime.SessionEnv["GC_CONTEXT_LAUNCH_MODEL"]; got != "opus[1m]" {
 		t.Fatalf("API SessionEnv launch model = %q, want opus[1m]", got)
+	}
+}
+
+func TestResolvedSessionConfigForProviderRefusesUndeclaredClaudeAccount(t *testing.T) {
+	// With the controller carrying an ambient CLAUDE_CONFIG_DIR and the claude
+	// provider declaring none, the spawn must refuse loudly — never silently
+	// bind the session to the controller's account (ga-ai7gz2).
+	t.Setenv("CLAUDE_CONFIG_DIR", "/tmp/controller-ambient-account")
+	resolved := &config.ResolvedProvider{
+		Name:    "claude",
+		Command: "claude",
+	}
+	_, err := resolvedSessionConfigForProvider(
+		"/tmp/test-city", nil, "worker", "", "worker", "Worker", "", nil,
+		resolved, "", "/tmp/workdir", nil,
+	)
+	if !errors.Is(err, processenv.ErrUndeclaredClaudeAccount) {
+		t.Fatalf("resolvedSessionConfigForProvider() error = %v, want ErrUndeclaredClaudeAccount", err)
+	}
+
+	// A declared account on the provider env clears the guard.
+	resolved.Env = map[string]string{"CLAUDE_CONFIG_DIR": "/tmp/declared-account"}
+	cfg, err := resolvedSessionConfigForProvider(
+		"/tmp/test-city", nil, "worker", "", "worker", "Worker", "", nil,
+		resolved, "", "/tmp/workdir", nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Runtime.SessionEnv["CLAUDE_CONFIG_DIR"]; got != "/tmp/declared-account" {
+		t.Fatalf("SessionEnv[CLAUDE_CONFIG_DIR] = %q, want the declared account", got)
 	}
 }
 

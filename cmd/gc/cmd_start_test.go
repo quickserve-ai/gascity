@@ -773,12 +773,16 @@ func TestPassthroughEnvIncludesClaudeAuthContext(t *testing.T) {
 	got := passthroughEnv()
 
 	for key, want := range map[string]string{
-		"HOME":                                     "/tmp/gc-home",
-		"USER":                                     "gcuser",
-		"LOGNAME":                                  "gcuser",
-		"XDG_CONFIG_HOME":                          "/tmp/gc-home/.config",
-		"XDG_STATE_HOME":                           "/tmp/gc-home/.local/state",
-		"CLAUDE_CONFIG_DIR":                        "/tmp/gc-home/.claude",
+		"HOME":            "/tmp/gc-home",
+		"USER":            "gcuser",
+		"LOGNAME":         "gcuser",
+		"XDG_CONFIG_HOME": "/tmp/gc-home/.config",
+		"XDG_STATE_HOME":  "/tmp/gc-home/.local/state",
+		// The ambient CLAUDE_CONFIG_DIR is deliberately RESET, not passed
+		// through: it selects the billing account, and a managed session
+		// must get it from a declared config layer, never the controller's
+		// environment (ga-ai7gz2).
+		"CLAUDE_CONFIG_DIR":                        "",
 		"CLAUDE_CODE_OAUTH_TOKEN":                  "oauth-token",
 		"ANTHROPIC_API_KEY":                        "sk-ant-123",
 		"ANTHROPIC_AUTH_TOKEN":                     "anth-auth-token",

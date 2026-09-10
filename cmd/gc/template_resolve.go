@@ -531,6 +531,20 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		}
 	}
 
+	// Account guard (ga-ai7gz2): the passthrough layer resets the ambient
+	// CLAUDE_CONFIG_DIR, so by here a non-empty value can only come from a
+	// declared config layer. A claude-family agent with none declared while
+	// the controller carries an ambient account must fail loudly, never
+	// silently bill the controller's account. k8s sessions are exempt: the
+	// pod builder supplies a pod-local CLAUDE_CONFIG_DIR with mounted
+	// credentials (internal/runtime/k8s/pod.go), so the controller's ambient
+	// state is irrelevant to the account the pod runs under.
+	if rt := effectiveSessionProvider(cfgAgent.Session, p.sessionProvider); rt != "k8s" {
+		if err := processenv.RequireDeclaredClaudeAccount(resolvedProviderName(resolved), resolved.AccountFamily(), env); err != nil {
+			return TemplateParams{}, fmt.Errorf("agent %q: %w", qualifiedName, err)
+		}
+	}
+
 	// Step 11: Expand session setup templates.
 	configDir := p.cityPath
 	if cfgAgent.SourceDir != "" {
