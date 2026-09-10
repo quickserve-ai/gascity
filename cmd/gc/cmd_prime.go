@@ -286,6 +286,17 @@ func doPrimeWithHookFormatOpts(args []string, stdout, stderr io.Writer, hookMode
 		case len(resolvedAgents) == 0:
 			fmt.Fprintf(stderr, "gc prime: agent %q not found in city config\n", agentName) //nolint:errcheck
 			return 1
+		case !hookMode && allAgentsEffectivelySuspended(cfg, resolvedAgents):
+			// Without this, the readability loop below skips every suspended
+			// instance, strict "passes", and the render loop then exits 0
+			// having written NOTHING — a silent empty success in exactly the
+			// misconfiguration-shaped case --strict exists to catch (ga-vuh3tj:
+			// astro-rig crew names strict-rendered empty for weeks of probing).
+			// Hook mode is exempt: a suspended seat's SessionStart is a QUIET
+			// success by contract (the sidecar tests pin it) — the suspension
+			// is deliberate there, not a misconfiguration.
+			fmt.Fprintf(stderr, "gc prime: agent %q resolves only to suspended instances; nothing would render\n", agentName) //nolint:errcheck
+			return 1
 		}
 		// renderPrompt returns "" both when the template file cannot be read
 		// and when a valid template legitimately renders empty. Readability is
@@ -339,6 +350,14 @@ func doPrimeWithHookFormatOpts(args []string, stdout, stderr io.Writer, hookMode
 
 	for _, a := range resolvedAgents {
 		if isAgentEffectivelySuspended(cfg, &a) {
+			// Hooks must stay silent for a suspended seat (a suspended
+			// agent's SessionStart injecting anything would wake work the
+			// suspension exists to stop). A human at the prompt gets told —
+			// empty stdout with exit 0 reads as success and was misdiagnosed
+			// as a resolution bug (ga-vuh3tj).
+			if !hookMode {
+				fmt.Fprintf(stderr, "gc prime: agent %q is suspended; nothing rendered\n", agentName) //nolint:errcheck
+			}
 			return 0
 		}
 		if resolved, rErr := config.ResolveProvider(&a, &cfg.Workspace, cfg.Providers, exec.LookPath); rErr == nil && hookMode {
@@ -411,9 +430,35 @@ func doPrimeWithHookFormatOpts(args []string, stdout, stderr io.Writer, hookMode
 	// when the agent has no prompt_template and doesn't match a builtin
 	// worker prompt — a supported config shape, so the default prompt is
 	// the correct output even under --strict.
+	//
+	// In non-strict NON-hook use, landing here with a name that resolved to
+	// nothing means the caller asked for an agent that does not exist under
+	// that spelling — most often a session-table ALIAS (qcore/archer) instead
+	// of the configured name (qcore/cherub-law.archer). Rendering the generic
+	// prompt wordlessly made that look like the agent's real prompt
+	// (ga-vuh3tj). Hooks keep the silent fallback: GC_ALIAS legitimately
+	// carries user-facing aliases there.
+	if !hookMode && agentName != "" && len(resolvedAgents) == 0 {
+		fmt.Fprintf(stderr, "gc prime: warning: agent %q not found in city config; rendering the generic prompt (a session-table alias is not an agent name — use the configured name, e.g. <rig>/<pack>.<agent>)\n", agentName) //nolint:errcheck
+	}
 	injection := primeHookContextSuffix(cityPath, hookMode, hookContext, stderr, consumeHandoff)
 	writePrimePromptWithFormat(stdout, cityName, agentName, defaultPrimePrompt, hookMode, hookFormat, suppressHookPrompt, injection.text, injection.afterDelivery)
 	return 0
+}
+
+// allAgentsEffectivelySuspended reports whether every resolved agent is
+// suspended (agent flag, its rig, or the city). False for an empty slice —
+// the no-resolution case has its own strict refusal.
+func allAgentsEffectivelySuspended(cfg *config.City, agents []config.Agent) bool {
+	if len(agents) == 0 {
+		return false
+	}
+	for i := range agents {
+		if !isAgentEffectivelySuspended(cfg, &agents[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // strictUnknownTemplateVariables runs the static unknown-variable check for
