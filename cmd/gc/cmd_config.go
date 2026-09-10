@@ -31,16 +31,18 @@ func loadCityConfigWithBuiltinPacks(cityPath string, includes ...string) (*confi
 	if err != nil {
 		return nil, nil, err
 	}
-	// A loaded config's daemon feature flags are in effect from here on, as
-	// loadCityConfigFS guarantees for the CLI: the supervisor's per-city boot
-	// reaches formula compilation and molecule instantiation through this
-	// loader, and without this the process-global flags kept their zero value
-	// until an API request or a reload happened to apply them.
-	applyFeatureFlags(cfg)
 	warnMissingRequiredBuiltinImports(fsys.OSFS{}, cfg, tomlPath, resolveLoadCityConfigWarningWriter())
 	if err := validatePackRuntimeRegistrations(cfg); err != nil {
 		return nil, nil, err
 	}
+	// An accepted config's daemon feature flags are in effect from here on,
+	// as loadCityConfigFS guarantees for the CLI (and in the same order: a
+	// rejected city never rewrites the process-global flags). The
+	// supervisor's per-city boot reaches formula compilation and molecule
+	// instantiation through this loader; without this the flags stayed at
+	// their zero value until the startup config reload or an API request
+	// happened to apply them.
+	applyFeatureFlags(cfg)
 	return cfg, prov, nil
 }
 
