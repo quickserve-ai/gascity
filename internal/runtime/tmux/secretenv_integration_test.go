@@ -44,7 +44,12 @@ func TestColdStartServerArgvAndEnvCarryNoSecrets(t *testing.T) {
 	}
 	workDir := t.TempDir()
 	envDump := filepath.Join(workDir, "pane-env")
-	paneCmd := "env > " + shellquote.Quote(envDump+".tmp") + " && mv " + shellquote.Quote(envDump+".tmp") + " " + shellquote.Quote(envDump) + "; sleep 60"
+	// The pane signals via tmux wait-for once the env dump is complete, so
+	// the test blocks deterministically instead of sleep-polling.
+	const readyChannel = "ga-fhbnmz-env-dump-ready"
+	paneCmd := "env > " + shellquote.Quote(envDump) +
+		"; tmux -L " + shellquote.Quote(cfg.SocketName) + " wait-for -S " + readyChannel +
+		"; sleep 60"
 	if err := tm.NewSessionWithCommandAndEnv("coldstart", workDir, paneCmd, env); err != nil {
 		t.Fatalf("NewSessionWithCommandAndEnv (cold start): %v", err)
 	}
@@ -96,18 +101,14 @@ func TestColdStartServerArgvAndEnvCarryNoSecrets(t *testing.T) {
 	}
 
 	// And in the PANE PROCESS itself — session-env storage alone would not
-	// prove the child received it.
-	deadline := time.Now().Add(10 * time.Second)
-	var paneEnv []byte
-	for {
-		paneEnv, err = os.ReadFile(envDump)
-		if err == nil || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
+	// prove the child received it. wait-for blocks until the pane's dump is
+	// written (bounded by the executor's subprocess timeout).
+	if _, err := tm.run("wait-for", readyChannel); err != nil {
+		t.Fatalf("waiting for the pane env dump: %v", err)
 	}
+	paneEnv, err := os.ReadFile(envDump)
 	if err != nil {
-		t.Fatalf("pane env dump never appeared at %s: %v", envDump, err)
+		t.Fatalf("reading pane env dump: %v", err)
 	}
 	if !strings.Contains(string(paneEnv), "GA_FHBNMZ_DELIVERY_TOKEN="+secretVal) {
 		t.Fatalf("pane process env lacks the -e value; dump:\n%s", paneEnv)

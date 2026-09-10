@@ -76,7 +76,7 @@ func (f *fakeEnvExecutor) executeCtxEnv(_ context.Context, args []string, env []
 	envCp := make([]string, len(env))
 	copy(envCp, env)
 	f.envCalls = append(f.envCalls, envCp)
-	return f.fakeExecutor.executeCtx(context.Background(), args)
+	return f.executeCtx(context.Background(), args)
 }
 
 // callHasFlagBeforeCommand reports whether flag appears before the

@@ -46,7 +46,7 @@ configure_cgo_platform_paths
 extra_env=()
 while IFS='=' read -r name _; do
   case "$name" in
-    ANTHROPIC_*|CLAUDE_CODE_*|GC_ACCEPTANCE_KEEP|GC_TIERC_FORCE|GC_TUTORIAL_GOLDENS_USE_CLAUDE_FOR_CODEX)
+    ANTHROPIC_*|CLAUDE_CODE_*|GC_ACCEPTANCE_KEEP|GC_TIERC_FORCE|GC_TUTORIAL_GOLDENS_USE_CLAUDE_FOR_CODEX|GC_ALLOW_AMBIENT_PROVIDER_CREDS_IN_TESTS)
       extra_env+=("${name}=${!name}")
       ;;
   esac
