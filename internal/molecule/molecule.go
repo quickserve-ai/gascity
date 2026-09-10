@@ -789,6 +789,8 @@ func Instantiate(ctx context.Context, store beads.Store, recipe *formula.Recipe,
 		} else {
 			graphApplyTracef("graph-apply unavailable recipe=%s store=%T", recipe.Name, store)
 		}
+	} else {
+		graphApplyTracef("instantiate recipe=%s path=sequential graph-apply-enabled=%v defer-assignees=%v", recipe.Name, graphApplyOn, opts.DeferAssignees)
 	}
 
 	// Merge variable defaults from recipe with caller-provided vars.

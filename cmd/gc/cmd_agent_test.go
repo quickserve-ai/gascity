@@ -1590,20 +1590,69 @@ func TestLoadCityConfigWithBuiltinPacksAppliesFeatureFlags(t *testing.T) {
 	formulatest.HoldV2ForTest(t)
 	previous := molecule.IsGraphApplyEnabled()
 	t.Cleanup(func() { molecule.SetGraphApplyEnabled(previous) })
+
+	for _, tc := range []struct {
+		name     string
+		cityTOML string
+		before   bool
+		want     bool
+	}{
+		{name: "default on without [daemon]", cityTOML: "[workspace]\nname = \"loader-flags\"\n", before: false, want: true},
+		{name: "declared off", cityTOML: "[workspace]\nname = \"loader-flags-off\"\n\n[daemon]\nformula_v2 = false\n", before: true, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			molecule.SetGraphApplyEnabled(tc.before)
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "city.toml"), []byte(tc.cityTOML), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			cfg, _, err := loadSupervisorCityConfig(dir)
+			if err != nil {
+				t.Fatalf("loadSupervisorCityConfig: %v", err)
+			}
+			if got := cfg.Daemon.FormulaV2Enabled(); got != tc.want {
+				t.Fatalf("cfg.Daemon.FormulaV2Enabled() = %v, want %v", got, tc.want)
+			}
+			if got := molecule.IsGraphApplyEnabled(); got != tc.want {
+				t.Fatalf("graph apply after loadSupervisorCityConfig = %v, want %v: the loader returned a config whose feature flags are not in effect", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoadCityConfigWithBuiltinPacksLeavesFlagsAloneWhenTheLoadIsRejected pins
+// the order the loader applies the flags in: after validation, as
+// loadCityConfigFS does, so a city the loader refuses never rewrites the
+// process-global flags. The rejection here is a pack runtime colliding with a
+// builtin selection name, which fails validatePackRuntimeRegistrations after
+// the config has parsed.
+func TestLoadCityConfigWithBuiltinPacksLeavesFlagsAloneWhenTheLoadIsRejected(t *testing.T) {
+	formulatest.HoldV2ForTest(t)
+	previous := molecule.IsGraphApplyEnabled()
+	t.Cleanup(func() { molecule.SetGraphApplyEnabled(previous) })
 	molecule.SetGraphApplyEnabled(false)
 
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "city.toml"), []byte("[workspace]\nname = \"loader-flags\"\n"), 0o644); err != nil {
+	packDir := filepath.Join(dir, "packs", "rtpack")
+	if err := os.MkdirAll(packDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	cfg, _, err := loadSupervisorCityConfig(dir)
-	if err != nil {
-		t.Fatalf("loadSupervisorCityConfig: %v", err)
+	packTOML := "[pack]\nname = \"rtpack\"\nschema = 1\n\n[runtimes.tmux]\ncommand = \"true\"\n"
+	if err := os.WriteFile(filepath.Join(packDir, "pack.toml"), []byte(packTOML), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if !cfg.Daemon.FormulaV2Enabled() {
-		t.Fatal("a city without [daemon] must default formula_v2 on")
+	cityTOML := "[workspace]\nname = \"loader-rejected\"\n\n[imports.rtpack]\nsource = \"packs/rtpack\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "city.toml"), []byte(cityTOML), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if !molecule.IsGraphApplyEnabled() {
-		t.Fatal("loadSupervisorCityConfig returned a config whose feature flags are not in effect: graph apply is still off")
+	_, _, err := loadSupervisorCityConfig(dir)
+	if err == nil {
+		t.Fatal("loadSupervisorCityConfig accepted a pack runtime named after a builtin; the fixture no longer rejects")
+	}
+	if !strings.Contains(err.Error(), "tmux") {
+		t.Fatalf("loadSupervisorCityConfig error = %v, want the builtin collision on tmux (the fixture rejects for another reason)", err)
+	}
+	if molecule.IsGraphApplyEnabled() {
+		t.Fatal("a rejected load applied the city's feature flags to the process")
 	}
 }
