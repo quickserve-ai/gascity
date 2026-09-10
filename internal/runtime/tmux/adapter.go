@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -798,7 +799,7 @@ func (p *Provider) TeardownServer() error {
 // This enables unit testing without a real tmux server.
 type startOps interface {
 	createSession(name, workDir, command string, env map[string]string) error
-	respawnAgent(name, workDir, command string) error
+	respawnAgent(name, workDir, command string, env map[string]string) error
 	isSessionRunning(name string) bool
 	isRuntimeRunning(name string, processNames []string) bool
 	killSession(name string) error
@@ -849,9 +850,43 @@ func (o *tmuxStartOps) createSession(name, workDir, command string, env map[stri
 }
 
 // respawnAgent relaunches the agent command in the session's existing pane
-// (respawn-pane -k), reusing the warm box and its session environment. The
-// launch-half of the un-weld relaunch path.
-func (o *tmuxStartOps) respawnAgent(name, workDir, command string) error {
+// (respawn-pane -k), reusing the warm box. The launch-half of the un-weld
+// relaunch path.
+//
+// The env map is re-applied the same way createSession applies it (ga-xd3bjx):
+// declared values are written into the tmux SESSION environment so the
+// respawned process sees them, and EMPTY values — the "unset this var"
+// convention — are removed from the session environment AND prefixed onto the
+// command as `env -u`, because the respawned process still inherits the tmux
+// SERVER global environment (which on a supervisor host can carry an ambient
+// CLAUDE_CONFIG_DIR via the service-env allowlist). Without this, the create
+// path's env-unset resets were silently lost on every warm relaunch.
+func (o *tmuxStartOps) respawnAgent(name, workDir, command string, env map[string]string) error {
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var unsetKeys []string
+	for _, k := range keys {
+		if env[k] == "" {
+			unsetKeys = append(unsetKeys, k)
+			if err := o.tm.RemoveEnvironment(name, k); err != nil {
+				return fmt.Errorf("respawn: removing %s from session env: %w", k, err)
+			}
+			continue
+		}
+		if err := o.tm.SetEnvironment(name, k, env[k]); err != nil {
+			return fmt.Errorf("respawn: setting %s in session env: %w", k, err)
+		}
+	}
+	if len(unsetKeys) > 0 && command != "" {
+		var prefix string
+		for _, k := range unsetKeys {
+			prefix += " -u " + k
+		}
+		command = "env" + prefix + " " + command
+	}
 	return o.tm.RespawnPaneWithWorkDir(name, workDir, command)
 }
 
@@ -1230,7 +1265,7 @@ func doRelaunchSession(ctx context.Context, ops startOps, name string, cfg runti
 	if err != nil {
 		return err
 	}
-	if err := ops.respawnAgent(name, cfg.WorkDir, fullCommand); err != nil {
+	if err := ops.respawnAgent(name, cfg.WorkDir, fullCommand, cfg.Env); err != nil {
 		return cleanupPromptFileOnError(promptFile, fmt.Errorf("relaunch: respawning agent in session %q: %w", name, err))
 	}
 	if err := ctx.Err(); err != nil {
