@@ -180,6 +180,111 @@ schema = 2
 	}
 }
 
+// primeLoudnessFixture builds a minimal city with one convention-discovered
+// agent "ada" whose agent.toml carries the given extra lines (e.g.
+// "suspended = true"), and points GC_CITY at it (ga-vuh3tj fixtures).
+func primeLoudnessFixture(t *testing.T, agentTOML string) {
+	t.Helper()
+	cityDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityDir, "agents", "ada"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte("[workspace]\nname = \"backstage\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityDir, "pack.toml"), []byte("[pack]\nname = \"backstage\"\nschema = 2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityDir, "agents", "ada", "prompt.template.md"), []byte("Agent: {{ .AgentName }}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if agentTOML != "" {
+		if err := os.WriteFile(filepath.Join(cityDir, "agents", "ada", "agent.toml"), []byte(agentTOML), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("GC_CITY", cityDir)
+	t.Setenv("GC_ALIAS", "")
+	t.Setenv("GC_AGENT", "")
+}
+
+// TestDoPrime_SuspendedAgentIsLoudForHumansSilentForHooks pins ga-vuh3tj's
+// empty-exit-0 shape: a suspended agent renders nothing, and a HUMAN
+// invocation must say so on stderr while a HOOK invocation stays silent
+// (a suspended seat's SessionStart must not inject anything).
+func TestDoPrime_SuspendedAgentIsLoudForHumansSilentForHooks(t *testing.T) {
+	primeLoudnessFixture(t, "suspended = true\n")
+
+	var stdout, stderr bytes.Buffer
+	code := doPrime([]string{"ada"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doPrime() = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("suspended agent rendered output: %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), `agent "ada" is suspended; nothing rendered`) {
+		t.Fatalf("human invocation must name the suspension on stderr, got %q", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = doPrimeWithMode([]string{"ada"}, &stdout, &stderr, true, false)
+	if code != 0 {
+		t.Fatalf("hook doPrime() = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "suspended") {
+		t.Fatalf("hook invocation must stay silent for a suspended seat, got stderr %q", stderr.String())
+	}
+}
+
+// TestDoPrime_StrictFailsWhenEveryResolvedAgentIsSuspended pins the strict
+// half: --strict exists to catch a prime that would render nothing, and a
+// name resolving only to suspended instances is exactly that.
+func TestDoPrime_StrictFailsWhenEveryResolvedAgentIsSuspended(t *testing.T) {
+	primeLoudnessFixture(t, "suspended = true\n")
+
+	var stdout, stderr bytes.Buffer
+	code := doPrimeWithMode([]string{"ada"}, &stdout, &stderr, false, true)
+	if code != 1 {
+		t.Fatalf("strict doPrime() = %d, want 1; stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "resolves only to suspended instances") {
+		t.Fatalf("strict must name the all-suspended refusal, got %q", stderr.String())
+	}
+}
+
+// TestDoPrime_UnresolvedNameWarnsBeforeGenericFallback pins the DEFAULT-prompt
+// shape: a human priming a name that resolves to nothing (typically a
+// session-table alias) gets the generic prompt WITH a stderr warning naming
+// the miss; a hook keeps the wordless fallback (GC_ALIAS carries user-facing
+// aliases there by design).
+func TestDoPrime_UnresolvedNameWarnsBeforeGenericFallback(t *testing.T) {
+	primeLoudnessFixture(t, "")
+
+	var stdout, stderr bytes.Buffer
+	code := doPrime([]string{"norig/ada"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doPrime() = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	if stdout.Len() == 0 {
+		t.Fatal("generic fallback must still render")
+	}
+	if !strings.Contains(stderr.String(), `agent "norig/ada" not found in city config`) {
+		t.Fatalf("human invocation must warn about the resolution miss, got %q", stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = doPrimeWithMode([]string{"norig/ada"}, &stdout, &stderr, true, false)
+	if code != 0 {
+		t.Fatalf("hook doPrime() = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "not found in city config") {
+		t.Fatalf("hook invocation must keep the wordless fallback, got stderr %q", stderr.String())
+	}
+}
+
 // TestPrimeInjectMailContentSurfacesUnreadMailForPromptlessWake covers the
 // prime-inject-mail patch (dip-bj7pgj): an autonomous/promptless restart runs
 // the SessionStart prime hook but NOT the UserPromptSubmit mail hook, so gc
