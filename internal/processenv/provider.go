@@ -3,6 +3,8 @@
 package processenv
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -150,6 +152,33 @@ func ExpandSessionEnvValue(value string) string {
 	})
 }
 
+// ClaudeAccountEnvKey names the variable that selects the Claude account a
+// session bills to (ga-ai7gz2). ProviderProcessPassthroughEnv pins it empty, so
+// only a declared config layer can give a session an account, and runtimes that
+// carry a withholding past the first launch treat it as authority rather than a
+// nesting flag.
+const ClaudeAccountEnvKey = "CLAUDE_CONFIG_DIR"
+
+// ProviderCredentialEnvPrefixes returns a copy of the curated provider
+// credential env-var name prefixes. Exposed so internal/testenv's stdlib-only
+// mirror of this classification can be pinned by test instead of drifting.
+func ProviderCredentialEnvPrefixes() []string {
+	out := make([]string, len(providerCredentialEnvPrefixes))
+	copy(out, providerCredentialEnvPrefixes)
+	return out
+}
+
+// ProviderCredentialEnvKeys returns a copy of the exact provider credential
+// env-var names. Exposed for the same mirror-pinning reason as
+// ProviderCredentialEnvPrefixes.
+func ProviderCredentialEnvKeys() []string {
+	out := make([]string, 0, len(providerCredentialEnvKeys))
+	for k := range providerCredentialEnvKeys {
+		out = append(out, k)
+	}
+	return out
+}
+
 // IsProviderCredentialEnv reports whether key belongs to the curated provider
 // credential/config allowlist.
 func IsProviderCredentialEnv(key string) bool {
@@ -167,8 +196,9 @@ func IsProviderCredentialEnv(key string) bool {
 // ProviderProcessPassthroughEnv returns non-GC process context that provider
 // sessions need to start reliably: user/home, provider auth/config, locale,
 // time zone, XDG, telemetry, and Claude nesting resets. It also pins
-// ControllerOnlyEnvKeys empty, so every session-env builder that starts here
-// withholds them without having to know they exist.
+// ControllerOnlyEnvKeys and the ambient ClaudeAccountEnvKey empty, so every
+// session-env builder that starts here withholds them without having to know
+// they exist.
 func ProviderProcessPassthroughEnv() map[string]string {
 	m := make(map[string]string)
 	if v := os.Getenv("PATH"); v != "" {
@@ -184,7 +214,6 @@ func ProviderProcessPassthroughEnv() map[string]string {
 		// time reasoning (e.g. `gc order check`, date math in scripts) agrees
 		// with the supervisor instead of defaulting to UTC.
 		"TZ",
-		"CLAUDE_CONFIG_DIR",
 		"CLAUDE_CODE_OAUTH_TOKEN",
 		"CLAUDE_CODE_SUBAGENT_MODEL",
 		"CLAUDE_CODE_EFFORT_LEVEL",
@@ -237,5 +266,43 @@ func ProviderProcessPassthroughEnv() map[string]string {
 	for key, val := range ControllerOnlyEnvOverlay() {
 		m[key] = val
 	}
+	// CLAUDE_CONFIG_DIR selects the Claude ACCOUNT the session bills to. The
+	// controller's own ambient value must never decide a managed session's
+	// account: an env-less claude provider would silently land on whatever
+	// account the controller happens to run under (ga-ai7gz2 — one seat
+	// inherited the operator's account, another an unrelated one). Reset it
+	// here; a workspace/provider/agent env layer that declares an account
+	// overrides this in the later merge, and RequireDeclaredClaudeAccount is
+	// the spawn-time guard that turns "claude family, ambient present, none
+	// declared" into a loud refusal instead of a silent inheritance. It is
+	// deliberately not part of ControllerOnlyEnvOverlay: that overlay is
+	// re-applied after the config layers, and would erase a declared account.
+	m[ClaudeAccountEnvKey] = ""
 	return m
+}
+
+// ErrUndeclaredClaudeAccount marks a refused claude-family spawn whose config
+// declares no CLAUDE_CONFIG_DIR while the controller carries an ambient one.
+var ErrUndeclaredClaudeAccount = errors.New("claude provider declares no CLAUDE_CONFIG_DIR")
+
+// RequireDeclaredClaudeAccount refuses to let a claude-family session launch
+// on an inherited account. It errors only when all three hold: the provider
+// resolves to the claude family, the controller itself runs with an ambient
+// CLAUDE_CONFIG_DIR (so there IS an account to wrongly inherit), and no config
+// layer declared one for the session (sessionEnv is the merged session env;
+// ProviderProcessPassthroughEnv resets the key, so a non-empty value can only
+// come from a declared layer). With no ambient value the vanilla single-account
+// setup — claude defaulting to ~/.claude — keeps working untouched. (ga-ai7gz2)
+func RequireDeclaredClaudeAccount(providerName, family string, sessionEnv map[string]string) error {
+	if family != "claude" {
+		return nil
+	}
+	ambient := strings.TrimSpace(os.Getenv(ClaudeAccountEnvKey))
+	if ambient == "" {
+		return nil
+	}
+	if strings.TrimSpace(sessionEnv[ClaudeAccountEnvKey]) != "" {
+		return nil
+	}
+	return fmt.Errorf("%w: provider %q resolves to the claude family but no workspace/provider/agent env layer sets CLAUDE_CONFIG_DIR, and the controller runs with an ambient one; declare env.CLAUDE_CONFIG_DIR on the provider so the seat binds to an explicit account instead of silently inheriting the controller's (ga-ai7gz2)", ErrUndeclaredClaudeAccount, providerName)
 }
