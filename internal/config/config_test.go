@@ -2066,18 +2066,24 @@ case "$1" in
   query)
     case "$*" in
       *"ephemeral=true AND status=open"*)
-        printf '[{"id":"ga-blocked-wisp","assignee":"gastown.deacon","issue_type":"molecule","status":"open","ephemeral":true,"created_at":"2026-08-28T22:00:00Z","dependencies":[{"type":"blocks","status":"open"}]}]'
+        printf '[{"id":"ga-blocked-wisp","assignee":"gastown.deacon","issue_type":"molecule","status":"open","ephemeral":true,"created_at":"2026-08-28T22:00:00Z","dependency_count":1}]'
         ;;
       *)
         printf '[]'
         ;;
     esac
     ;;
+  show)
+    printf '[{"id":"ga-blocked-wisp","status":"open","dependencies":[{"id":"ga-blocker","dependency_type":"blocks","status":"open"}]}]'
+    ;;
   *)
     printf '[]'
     ;;
 esac
 `)
+	// bd query --json carries only a dependency_count scalar, so the probe
+	// withholds the row on the fast path and resolves it through bd show; the
+	// fake answers both the way bd does for a wisp with an open blocker.
 	if strings.Contains(out, "ga-blocked-wisp") {
 		t.Fatalf("EffectiveWorkQueryForBeads(bd-1.0.5) served a dependency-blocked ephemeral wisp: %q", out)
 	}
@@ -8589,5 +8595,21 @@ func TestDefaultDoltReadTimeoutMillisPreservesOuterDeadlineHeadroom(t *testing.T
 	if DefaultDoltReadTimeoutMillis*2 > DefaultDoltWriteTimeoutMillis {
 		t.Fatalf("DefaultDoltReadTimeoutMillis (%d) leaves less than half of DefaultDoltWriteTimeoutMillis (%d) as headroom for #3101's outer wall-clock deadline to catch a stuck connection pile-up first",
 			DefaultDoltReadTimeoutMillis, DefaultDoltWriteTimeoutMillis)
+	}
+}
+
+func TestOrdersConfigMaxDispatchesPerTickParsesFromTOML(t *testing.T) {
+	cfg, err := Parse([]byte(`
+[workspace]
+name = "test-city"
+
+[orders]
+max_dispatches_per_tick = 12
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := cfg.Orders.MaxDispatchesPerTick; got == nil || *got != 12 {
+		t.Fatalf("Orders.MaxDispatchesPerTick = %v, want 12", got)
 	}
 }
