@@ -239,6 +239,7 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 	}
 	register(newProviderCatalogDoctorCheck(cityPath))
 	register(newProviderCatalogReadinessAdvisoryCheck(cityPath))
+	register(newClaudeAccountDeclarationDoctorCheck(cityPath))
 	register(expandedConfigLoadCheck{})
 	register(&doctor.ImplicitImportCacheCheck{})
 	register(&doctor.DeprecatedAttachmentFieldsCheck{})
@@ -277,6 +278,7 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 		register(doctor.NewSkillDanglingSinkCheck(doctorSkillStaticSinks(cityPath, cfg), materialize.LegacyOwnedRootsFor(cityPath), doctorLiveSessionSinks(cityPath, cfg)))
 		register(doctor.NewOrderFiringCurrentCheck(cfg, cityPath, doctor.WithOrderFiringCurrentLastRunFunc(doctorOrderFiringCurrentLastRunFunc(cityPath, cfg, opts.Stderr))))
 		register(doctor.NewOrderOutcomeHealthyCheck(cfg, cityPath))
+		register(doctor.NewOrderExecTargetCheck(cfg, cityPath))
 		register(newCodexHooksDriftCheck(cityPath, codexHookWorkDirs(cityPath, cfg)))
 		register(doctor.NewRigPackCoverageCheck(cfg, cityPath))
 		register(newPackRuntimesDoctorCheck(cfg))
@@ -377,28 +379,33 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 		}
 	}
 
-	// Data checks.
+	// Data checks. Store schema compatibility stays checkable from the raw
+	// city config even when expanded imports fail to load: storeOK is only
+	// cleared by a preflight that ran against a loaded config.
 	if cfgErr == nil && cfg != nil {
 		register(doctor.NewBDSplitStoreCheck(cityPath))
-		if storeOK {
-			register(doctor.NewBeadsStoreCheck(cityPath, openStoreResultForCity(cityPath)))
-			register(newV2RoutedToNamespaceCheck(cfg, cityPath, storeFactory))
-			register(newExecutorIdentityResidueCheck(cfg, cityPath, storeFactory))
-			register(newCensusOwnerLivenessCheck(cfg, cityPath, storeFactory))
-			register(newRunTargetRoutedToBackfillCheck(cfg, cityPath, storeFactory))
-			register(newRouteRecoveryQuarantineCheck(cfg, cityPath, storeFactory))
-			register(newHoldLabelRoutedToCheck(cfg, cityPath, storeFactory))
-			register(newPoolIdleRoutedWorkCheck(cfg, cityPath, storeFactory))
-			register(newWorkOptionMetadataMigrationCheck(cfg, cityPath, storeFactory))
-			register(newBacklogDepthCheck(cityPath, storeFactory))
-			register(newOrderTrackingRetentionCheck(cityPath, storeFactory))
-			register(&sessionModelDoctorCheck{cfg: cfg, cityPath: cityPath, newStore: storeFactory})
-			register(newStartupHealthEpisodesCheck(cfg, cityPath, storeFactory))
-			// Differential probe: the preflight above just proved the store
-			// reachable with the controller's environment, so a read that
-			// fails under the gate sandbox isolates the sandbox (ga-pqlgh).
-			register(newGateSandboxReadCheck(cityPath))
-		}
+	}
+	if storeOK {
+		register(doctor.NewBeadsStoreCheck(cityPath, openStoreResultForCity(cityPath)))
+	}
+	if cfgErr == nil && cfg != nil && storeOK {
+		register(newV2RoutedToNamespaceCheck(cfg, cityPath, storeFactory))
+		register(newExecutorIdentityResidueCheck(cfg, cityPath, storeFactory))
+		register(newCensusOwnerLivenessCheck(cfg, cityPath, storeFactory))
+		register(newRunTargetRoutedToBackfillCheck(cfg, cityPath, storeFactory))
+		register(newRouteRecoveryQuarantineCheck(cfg, cityPath, storeFactory))
+		register(newHoldLabelRoutedToCheck(cfg, cityPath, storeFactory))
+		register(newPoolIdleRoutedWorkCheck(cfg, cityPath, storeFactory))
+		register(newWorkOptionMetadataMigrationCheck(cfg, cityPath, storeFactory))
+		register(newBacklogDepthCheck(cityPath, storeFactory))
+		register(newOrderTrackingRetentionCheck(cityPath, storeFactory))
+		register(&sessionModelDoctorCheck{cfg: cfg, cityPath: cityPath, newStore: storeFactory})
+		register(&cloudWakeDoctorCheck{cfg: cfg, cityPath: cityPath, newStore: storeFactory})
+		register(newStartupHealthEpisodesCheck(cfg, cityPath, storeFactory))
+		// Differential probe: the preflight above just proved the store
+		// reachable with the controller's environment, so a read that
+		// fails under the gate sandbox isolates the sandbox (ga-pqlgh).
+		register(newGateSandboxReadCheck(cityPath))
 	}
 	register(newDoctorDoltServerCheck(cityPath, opts.SkipCityDoltCheck))
 	// Host-level fork-rate watch: surfaces the per-command data-plane fork storm

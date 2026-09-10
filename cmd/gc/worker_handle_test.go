@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/convergence"
+	"github.com/gastownhall/gascity/internal/processenv"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/worker"
@@ -2669,5 +2671,194 @@ func assertControllerTokenWithheld(t *testing.T, name string, env map[string]str
 	}
 	if val != "" {
 		t.Errorf("%s[%s] = %q, want empty", name, convergence.TokenEnvVar, val)
+	}
+}
+
+// TestResolvedWorkerRuntimeUnresolvedProviderReturnsResetBaseline covers
+// ga-xd3bjx item 1: when the stored session's provider can no longer be
+// resolved (removed or renamed since the session was stored), the resolver
+// must NOT return nil — nil meant "no override", and the stored command was
+// relaunched with the controller's inherited process env, bypassing the
+// passthrough reset and the account guard. The env-only override keeps the
+// stored command/provider in force (empty fields) while pinning the session
+// env to the reset baseline, which empties CLAUDE_CONFIG_DIR.
+func TestResolvedWorkerRuntimeUnresolvedProviderReturnsResetBaseline(t *testing.T) {
+	cfg := &config.City{}
+	resolved, err := resolvedWorkerRuntimeWithConfigAndMetadata("/tmp/city", cfg, session.Info{
+		Template: "gone-provider",
+		Provider: "gone-provider",
+		Command:  "claude --resume abc",
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("resolvedWorkerRuntimeWithConfigAndMetadata: %v", err)
+	}
+	if resolved == nil {
+		t.Fatal("resolver returned nil for an unresolved provider; the relaunch would inherit the controller env")
+	}
+	if resolved.Command != "" {
+		t.Fatalf("Command = %q, want empty so the stored command stays in force", resolved.Command)
+	}
+	v, declared := resolved.SessionEnv["CLAUDE_CONFIG_DIR"]
+	if !declared || v != "" {
+		t.Fatalf("SessionEnv[CLAUDE_CONFIG_DIR] = (%q, %v), want declared-empty (the unset reset)", v, declared)
+	}
+	if got := resolved.SessionEnv["GC_CITY_PATH"]; got != "/tmp/city" {
+		t.Fatalf("SessionEnv[GC_CITY_PATH] = %q, want the city anchor", got)
+	}
+	if got := resolved.Hints.Env["CLAUDE_CONFIG_DIR"]; got != "" {
+		t.Fatalf("Hints.Env[CLAUDE_CONFIG_DIR] = %q, want empty reset", got)
+	}
+}
+
+// TestWorkerSessionRuntimeResolverPassesEnvOnlyOverride covers the wrapper
+// half of ga-xd3bjx item 1: the factory resolver must hand the env-only
+// override through WITHOUT the strict normalization, which requires a
+// command and provider and would otherwise error on every handle lookup
+// (stop, kill, observe) for a session whose provider was removed.
+func TestWorkerSessionRuntimeResolverPassesEnvOnlyOverride(t *testing.T) {
+	resolver := workerSessionRuntimeResolverWithConfig("/tmp/city", &config.City{})
+	if resolver == nil {
+		t.Fatal("resolver = nil")
+	}
+	resolved, err := resolver(session.Info{
+		Template: "gone-provider",
+		Provider: "gone-provider",
+		Command:  "claude --resume abc",
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("resolver: %v (an unresolved provider must not fail handle lookups)", err)
+	}
+	if resolved == nil {
+		t.Fatal("resolver returned nil for an unresolved provider")
+	}
+	if resolved.Command != "" {
+		t.Fatalf("Command = %q, want empty partial override", resolved.Command)
+	}
+	if v, declared := resolved.SessionEnv["CLAUDE_CONFIG_DIR"]; !declared || v != "" {
+		t.Fatalf("SessionEnv[CLAUDE_CONFIG_DIR] = (%q, %v), want declared-empty", v, declared)
+	}
+}
+
+// TestResolvedWorkerSessionEnvWithConfigMergesWorkspaceEnv covers ga-xd3bjx
+// item 3 on the env the CLI direct-create path launches with
+// (newWorkerSessionHandleForResolvedRuntimeWithConfig replaces the builder's
+// SessionEnv with this helper's result): workspace-level env merges between the
+// passthrough baseline and the provider env, matching template_resolve step 10
+// — so a workspace-wide CLAUDE_CONFIG_DIR reaches `gc session new` creates.
+func TestResolvedWorkerSessionEnvWithConfigMergesWorkspaceEnv(t *testing.T) {
+	cfg := &config.City{
+		Workspace: config.Workspace{Env: map[string]string{"CLAUDE_CONFIG_DIR": "/accounts/city-default", "WS_ONLY": "ws"}},
+	}
+	env := resolvedWorkerSessionEnvWithConfig("", cfg, &config.ResolvedProvider{Name: "claude", Env: map[string]string{"PROVIDER_ONLY": "p"}})
+	if got := env["CLAUDE_CONFIG_DIR"]; got != "/accounts/city-default" {
+		t.Fatalf("SessionEnv[CLAUDE_CONFIG_DIR] = %q, want the workspace value", got)
+	}
+	if got := env["WS_ONLY"]; got != "ws" {
+		t.Fatalf("SessionEnv[WS_ONLY] = %q, want ws", got)
+	}
+	if got := env["PROVIDER_ONLY"]; got != "p" {
+		t.Fatalf("SessionEnv[PROVIDER_ONLY] = %q, want p", got)
+	}
+}
+
+// TestResolvedWorkerSessionEnvWithConfigProviderOverridesWorkspaceEnv pins the
+// precedence half of ga-xd3bjx item 3.
+func TestResolvedWorkerSessionEnvWithConfigProviderOverridesWorkspaceEnv(t *testing.T) {
+	cfg := &config.City{
+		Workspace: config.Workspace{Env: map[string]string{"CLAUDE_CONFIG_DIR": "/accounts/city-default"}},
+	}
+	env := resolvedWorkerSessionEnvWithConfig("", cfg, &config.ResolvedProvider{Name: "claude", Env: map[string]string{"CLAUDE_CONFIG_DIR": "/accounts/seat"}})
+	if got := env["CLAUDE_CONFIG_DIR"]; got != "/accounts/seat" {
+		t.Fatalf("SessionEnv[CLAUDE_CONFIG_DIR] = %q, want the provider override", got)
+	}
+}
+
+// TestNewWorkerSessionHandleGuardsTheLaunchedEnvForClaudeAccount pins where the
+// ga-ai7gz2 create-path guard reads: the env the session launches with. An
+// undeclared claude seat is refused while the controller carries an ambient
+// account, and an account declared only in [workspace.env] — which the
+// builder's own env never sees — satisfies the guard.
+func TestNewWorkerSessionHandleGuardsTheLaunchedEnvForClaudeAccount(t *testing.T) {
+	cityDir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", "/tmp/controller-ambient-account")
+	newHandle := func(cfg *config.City) error {
+		_, err := newWorkerSessionHandleForResolvedRuntimeWithConfig(
+			cityDir, nil, runtime.NewFake(), cfg,
+			"worker", "", "worker", "Worker", "", "claude", cityDir, "",
+			&config.ResolvedProvider{Name: "claude"},
+			map[string]string{"session_origin": "test"},
+		)
+		return err
+	}
+
+	if err := newHandle(&config.City{}); !errors.Is(err, processenv.ErrUndeclaredClaudeAccount) {
+		t.Fatalf("undeclared claude seat with an ambient account: err = %v, want ErrUndeclaredClaudeAccount", err)
+	}
+	declared := &config.City{Workspace: config.Workspace{Env: map[string]string{"CLAUDE_CONFIG_DIR": "/accounts/city-default"}}}
+	if err := newHandle(declared); err != nil {
+		t.Fatalf("workspace-declared account: err = %v, want the handle to be built", err)
+	}
+}
+
+// TestResolvedWorkerRuntimeResumeMergesWorkspaceEnv pins reviewer finding 1
+// on ga-xd3bjx: a workspace-declared CLAUDE_CONFIG_DIR must reach the RESUME
+// path's session env exactly as it reaches the create paths and satisfies
+// the doctor check — otherwise every sessionFromRecord relaunch resolves
+// without it and launches with the passthrough reset's empty value.
+func TestResolvedWorkerRuntimeResumeMergesWorkspaceEnv(t *testing.T) {
+	cfg := &config.City{
+		Workspace: config.Workspace{Env: map[string]string{"CLAUDE_CONFIG_DIR": "/accounts/city-default"}},
+		Providers: map[string]config.ProviderSpec{
+			"stub": {Command: "/bin/echo"},
+		},
+	}
+	resolved, err := resolvedWorkerRuntimeWithConfigAndMetadata("", cfg, session.Info{
+		Template: "stub",
+		Provider: "stub",
+		WorkDir:  "/tmp/work",
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("resolvedWorkerRuntimeWithConfigAndMetadata: %v", err)
+	}
+	if resolved == nil {
+		t.Fatal("resolver returned nil for a resolvable provider")
+	}
+	if got := resolved.SessionEnv["CLAUDE_CONFIG_DIR"]; got != "/accounts/city-default" {
+		t.Fatalf("SessionEnv[CLAUDE_CONFIG_DIR] = %q, want the workspace value on resume", got)
+	}
+}
+
+// TestResolvedWorkerRuntimeProviderNotInPATHKeepsDeclaredEnv pins reviewer
+// finding 2 on ga-xd3bjx: a provider that exists in config but whose binary
+// is missing from THIS process's PATH (cron, systemd, an upgrade window)
+// must resolve via the permissive retry and keep its declared env — the
+// env-only RESET override is only for a provider genuinely gone from
+// config, because forcing CLAUDE_CONFIG_DIR="" onto a correctly declared
+// seat is worse than the transient PATH fault.
+func TestResolvedWorkerRuntimeProviderNotInPATHKeepsDeclaredEnv(t *testing.T) {
+	cfg := &config.City{
+		Providers: map[string]config.ProviderSpec{
+			"declared": {
+				Command: "definitely-not-on-path-xyzzy",
+				Env:     map[string]string{"CLAUDE_CONFIG_DIR": "/accounts/seat"},
+			},
+		},
+	}
+	resolved, err := resolvedWorkerRuntimeWithConfigAndMetadata("", cfg, session.Info{
+		Template: "declared",
+		Provider: "declared",
+		WorkDir:  "/tmp/work",
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("resolvedWorkerRuntimeWithConfigAndMetadata: %v", err)
+	}
+	if resolved == nil {
+		t.Fatal("resolver returned nil for a config-present provider with a PATH-missing binary")
+	}
+	if resolved.Command == "" {
+		t.Fatal("Command empty: the PATH-missing provider fell through to the env-only reset override")
+	}
+	if got := resolved.SessionEnv["CLAUDE_CONFIG_DIR"]; got != "/accounts/seat" {
+		t.Fatalf("SessionEnv[CLAUDE_CONFIG_DIR] = %q, want the DECLARED account preserved", got)
 	}
 }
