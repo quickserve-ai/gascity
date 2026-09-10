@@ -762,6 +762,12 @@ func TestGoTestShardPreservesAcceptanceAuthEnv(t *testing.T) {
 		// download there defeats TempDir cleanup (read-only module files).
 		// Keep it in a shared cache instead.
 		"GOMODCACHE=" + filepath.Join(os.TempDir(), "gc-shard-test-gomodcache"),
+		// The contract this test pins changed with ga-fhbnmz: ambient
+		// provider credentials survive into a test binary only when the lane
+		// declares the opt-out (internal/testenv scrubs them otherwise). The
+		// real acceptance lanes set it in their make targets / CI job env;
+		// mirror that here.
+		"GC_ALLOW_AMBIENT_PROVIDER_CREDS_IN_TESTS=1",
 	}
 
 	out, err := cmd.CombinedOutput()
