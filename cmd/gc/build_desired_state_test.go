@@ -12984,10 +12984,9 @@ func TestBuildDesiredStateRecordsDemandSubPhases(t *testing.T) {
 
 // TestBuildDesiredState_NamedSessionConflictSkipIsLogged pins ga-dfp1b's L1:
 // when a live bead holds a configured named identity's alias without being
-// its canonical session (here: a foreign-template bead with alias=woodhouse),
+// its canonical session (here: a foreign-template bead with alias=agent-a),
 // the named pass must skip the identity (as before) but say so on stderr,
-// naming the conflicting bead — the woodhouse/mallory class burned 4600+
-// silent skips. NOTE the ephemeral+pool_managed backing-template shape does
+// naming the conflicting bead — this class burned 4600+ silent skips. NOTE the ephemeral+pool_managed backing-template shape does
 // NOT reach this branch: InfoConflictsWithNamedSession lacks the pool_managed
 // branch its bead-tier twin has, and the builder adopts/rekeys that shape
 // instead (characterized on ga-dfp1b; matcher parity is L2 scope).
@@ -12998,12 +12997,12 @@ func TestBuildDesiredState_NamedSessionConflictSkipIsLogged(t *testing.T) {
 	cfg := &config.City{
 		Workspace: config.Workspace{Name: "test-city"},
 		Agents: []config.Agent{{
-			Name:              "woodhouse",
+			Name:              "agent-a",
 			StartCommand:      "true",
 			MaxActiveSessions: &maxOne,
 		}},
 		NamedSessions: []config.NamedSession{{
-			Template: "woodhouse",
+			Template: "agent-a",
 			Mode:     "always",
 		}},
 	}
@@ -13015,7 +13014,7 @@ func TestBuildDesiredState_NamedSessionConflictSkipIsLogged(t *testing.T) {
 			"session_name":   "other-agent-1",
 			"template":       "other-agent",
 			"agent_name":     "other-agent",
-			"alias":          "woodhouse",
+			"alias":          "agent-a",
 			"session_origin": "ephemeral",
 		},
 	})
@@ -13027,7 +13026,7 @@ func TestBuildDesiredState_NamedSessionConflictSkipIsLogged(t *testing.T) {
 	dsResult := buildDesiredState("test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), store, &stderr)
 
 	for name, tp := range dsResult.State {
-		if tp.ConfiguredNamedIdentity == "woodhouse" {
+		if tp.ConfiguredNamedIdentity == "agent-a" {
 			t.Fatalf("named identity materialized despite alias conflict: %s", name)
 		}
 	}

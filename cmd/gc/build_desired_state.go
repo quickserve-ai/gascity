@@ -964,8 +964,8 @@ func buildDesiredStateWithSessionBeads(
 				// A live bead holds this identity's name/alias/backing
 				// template without the configured_named_* stamps, so the
 				// identity can never materialize and this loop will skip it
-				// again every tick. Say so: the woodhouse/mallory wedges
-				// burned 4600+ of these skips in silence (ga-dfp1b).
+				// again every tick. Say so: this class of wedge burned
+				// 4600+ of these skips in silence (ga-dfp1b).
 				fmt.Fprintf(stderr, "buildDesiredState: named session %q blocked by conflicting session bead %s — close or re-stamp that bead to restore the identity (ga-dfp1b)\n", identity, conflictInfo.ID) //nolint:errcheck
 				continue
 			}
