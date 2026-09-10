@@ -28,6 +28,14 @@
 # Concretely, and this is the whole shape of the script:
 #   * The persisted state file holds OBSERVATIONS — what the last sweep SAW
 #     (state, head, base, marker) — and NEVER actions, never "we alarmed this".
+#     ONE CARVE-OUT (ga-vh6cbz): the beadless orphan arm latches its MAIL
+#     CADENCE on an orphan_mailed_at record, because there is no bead to hang
+#     a gate on and the reconciliation phase resolves any gate the bead arm
+#     did not re-derive. The orphan CONDITION is still re-derived live from gh
+#     every sweep — only the nagging is rate-limited — and a record for a PR
+#     that stops being an orphan is dropped at the very next write (NEXT_STATE
+#     is rebuilt from {} each sweep), so the action record can never suppress
+#     a detection, only a repeat of one mail inside the remind window.
 #   * "A push happened" is established by the live head differing from the
 #     persisted observed_head. Never by finding a push record.
 #   * Gate dedup asks GitHub/beads whether an open gate for this episode EXISTS
@@ -127,6 +135,18 @@ iso_to_epoch() {
 
 THRESHOLD_S="$(duration_to_seconds "$THRESHOLD")"
 ORPHAN_REMIND_S="$(duration_to_seconds "$ORPHAN_REMIND")"
+# A garbage duration must fail LOUDLY, not fail open: an unparseable
+# ORPHAN_REMIND would make the -lt test error out false and the orphan mail
+# would re-send every sweep with the controller none the wiser — the exact
+# flood this latch exists to stop.
+case "$THRESHOLD_S" in ''|*[!0-9]*)
+    echo "detect-silent-published-work: GC_SILENT_WORK_THRESHOLD %r is not a duration: $THRESHOLD" >&2
+    exit 1 ;;
+esac
+case "$ORPHAN_REMIND_S" in ''|*[!0-9]*)
+    echo "detect-silent-published-work: GC_SILENT_WORK_ORPHAN_REMIND is not a duration: $ORPHAN_REMIND" >&2
+    exit 1 ;;
+esac
 NOW_EPOCH="$(date -u +%s)"
 NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -496,9 +516,16 @@ GATE_EOF
         # mailed-at record with a re-remind interval is honest here BECAUSE the
         # condition itself is re-derived live from gh every sweep: state loss
         # costs at most one duplicate mail, and a record for a PR that stops
-        # being an orphan stops being refreshed and ages out with retention.
+        # being an orphan is dropped at the very NEXT write — NEXT_STATE is
+        # rebuilt from {} each sweep, so only refreshed records survive.
         OEP="$(episode_key "orphan" "$opr" "no-bead")"
-        oprev="$(echo "$STATE" | jq -c --arg k "$OEP" '.[$k] // empty' 2>/dev/null || true)"
+        # The state key carries the SCOPE (matching the bead arm's
+        # "$SCOPE_LABEL|$bead" convention): the state file is city-wide while
+        # PR numbers are per-repo, so an unscoped key would let one rig's
+        # latched orphan silence a NEW genuine orphan with the same number on
+        # another rig. OEP alone stays in the mail's Episode: line.
+        OKEY="$SCOPE_LABEL|$OEP"
+        oprev="$(echo "$STATE" | jq -c --arg k "$OKEY" '.[$k] // empty' 2>/dev/null || true)"
         ofirst="$NOW_ISO"; omailed=""
         if [ -n "$oprev" ]; then
             pf="$(echo "$oprev" | jq -r '.first_observed_in_state_at // ""' 2>/dev/null || true)"
@@ -510,7 +537,7 @@ GATE_EOF
             if [ -n "$om_epoch" ] && [ $(( NOW_EPOCH - om_epoch )) -lt "$ORPHAN_REMIND_S" ]; then
                 # Mailed within the remind window: keep the record alive
                 # (still an orphan) and stay quiet.
-                NEXT_STATE="$(echo "$NEXT_STATE" | jq -c --arg k "$OEP" --argjson v "$oprev" '.[$k] = $v' 2>/dev/null || echo "$NEXT_STATE")"
+                NEXT_STATE="$(echo "$NEXT_STATE" | jq -c --arg k "$OKEY" --argjson v "$oprev" '.[$k] = $v' 2>/dev/null || echo "$NEXT_STATE")"
                 continue
             fi
         fi
@@ -531,12 +558,12 @@ Raised by detect-silent-published-work (ga-krso22 / ga-mmvpq1 Half B, B1 arm ii)
 Episode: $OEP" >/dev/null 2>&1; then
             # Stamp the latch ONLY on a delivered mail; a failed send leaves the
             # prior record (or none) in place so the next sweep retries.
-            NEXT_STATE="$(echo "$NEXT_STATE" | jq -c --arg k "$OEP" --arg f "$ofirst" --arg m "$NOW_ISO" \
+            NEXT_STATE="$(echo "$NEXT_STATE" | jq -c --arg k "$OKEY" --arg f "$ofirst" --arg m "$NOW_ISO" \
                 '.[$k] = {first_observed_in_state_at: $f, orphan_mailed_at: $m}' 2>/dev/null || echo "$NEXT_STATE")"
         else
             echo "detect-silent-published-work: FAILED to report orphan PR $ourl (will retry next sweep)" >&2
             FAILED=$((FAILED + 1))
-            [ -n "$oprev" ] && NEXT_STATE="$(echo "$NEXT_STATE" | jq -c --arg k "$OEP" --argjson v "$oprev" '.[$k] = $v' 2>/dev/null || echo "$NEXT_STATE")"
+            [ -n "$oprev" ] && NEXT_STATE="$(echo "$NEXT_STATE" | jq -c --arg k "$OKEY" --argjson v "$oprev" '.[$k] = $v' 2>/dev/null || echo "$NEXT_STATE")"
         fi
     done <<ORPHAN_EOF
 $(printf '%s' "$OPEN_PRS" | jq -r --arg us "$US" '.[] | [(.number|tostring), .headRefName, .url] | join($us)' 2>/dev/null || true)

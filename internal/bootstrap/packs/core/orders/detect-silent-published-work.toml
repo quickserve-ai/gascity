@@ -39,8 +39,10 @@
 # exact class it exists to catch, reproduced inside the catcher.
 #
 # The persisted state file therefore holds OBSERVATIONS (what the last sweep SAW)
-# and never actions (what the last sweep DID). See
-# assets/scripts/detect-silent-published-work.sh.
+# and never actions (what the last sweep DID) — with one carve-out: the
+# beadless orphan arm latches its mail cadence on an orphan_mailed_at record
+# (no bead to gate on; the condition is still re-derived live every sweep).
+# See assets/scripts/detect-silent-published-work.sh.
 #
 # THIS ORDER DOES NOT SHIP IN OBSERVE-ONLY MODE (ga-mmvpq1 ratification,
 # explicit prohibition). A detector that observes and does not act is
