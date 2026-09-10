@@ -220,7 +220,7 @@ func filterManagedDoltLifecycleActorLines(rows map[int]psProcessRow, selfPID, li
 //     unexpected clean exit: CRITICAL.
 //
 // The marker names the dolt PID rather than the watchdog PID because that is
-// the process a stop targets; the watchdog is signalled only as its supervisor.
+// the process a stop targets; the watchdog is signaled only as its supervisor.
 
 // managedDoltWatchdogStopSignalCause values name the two outcomes in the
 // emergency record's metadata, so a reader can split them with one grep.

@@ -458,17 +458,18 @@ func writeScriptedFakeDoltSQLServer(t *testing.T, body string) string {
 	return dir
 }
 
-// waitForWatchdogLogText polls the watchdog log until want appears.
-func waitForWatchdogLogText(t *testing.T, logPath, want string, timeout time.Duration) string {
+// waitForFileText polls path until want appears in it. Used for the watchdog's
+// dolt.log and for the stand-in supervisor log the escalation summary reaches.
+func waitForFileText(t *testing.T, path, want string, timeout time.Duration) string {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for {
-		data, _ := os.ReadFile(logPath)
+		data, _ := os.ReadFile(path)
 		if strings.Contains(string(data), want) {
 			return string(data)
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("watchdog log never contained %q within %s; log:\n%s", want, timeout, data)
+			t.Fatalf("%s never contained %q within %s; content:\n%s", path, want, timeout, data)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -535,22 +536,6 @@ func runScopeWatchdogHelperWithSupervisorLog(t *testing.T, fakeDoltDir, dir, con
 	return doltPID, watchdogPID, cityPath
 }
 
-// waitForFileText polls path until want appears in it.
-func waitForFileText(t *testing.T, path, want string, timeout time.Duration) string {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for {
-		data, _ := os.ReadFile(path)
-		if strings.Contains(string(data), want) {
-			return string(data)
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("%s never contained %q within %s; content:\n%s", path, want, timeout, data)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-}
-
 // readManagedDoltEmergencySpoolRecord returns the one emergency record the
 // watchdog spooled under cityPath.
 func readManagedDoltEmergencySpoolRecord(t *testing.T, cityPath string) string {
@@ -595,7 +580,7 @@ func TestManagedDoltScopeWatchdogAlarmsOnUnexpectedCleanExit(t *testing.T) {
 
 	doltPID, watchdogPID, cityPath := runScopeWatchdogHelper(t, fakeDoltDir, dir, configPath, logPath)
 
-	logData := waitForWatchdogLogText(t, logPath, "ALARM UNEXPECTED CLEAN EXIT", 15*time.Second)
+	logData := waitForFileText(t, logPath, "ALARM UNEXPECTED CLEAN EXIT", 15*time.Second)
 	for _, want := range []string{
 		fmt.Sprintf("pid %d exited with status 0", doltPID),
 		"no stop request from gc",
@@ -615,7 +600,7 @@ func TestManagedDoltScopeWatchdogAlarmsOnUnexpectedCleanExit(t *testing.T) {
 	// spool record plus an emergency.signaled event in the city log. The
 	// escalation runs after the log lines are flushed, so wait for it to
 	// report rather than racing the atomic spool write.
-	logData = waitForWatchdogLogText(t, logPath, "escalated to the emergency spool at", 15*time.Second)
+	logData = waitForFileText(t, logPath, "escalated to the emergency spool at", 15*time.Second)
 	spoolEntries, err := os.ReadDir(filepath.Join(cityPath, ".gc", "emergency"))
 	if err != nil {
 		t.Fatalf("read emergency spool: %v; log:\n%s", err, logData)
@@ -670,7 +655,7 @@ func TestManagedDoltScopeWatchdogQuietOnRequestedStop(t *testing.T) {
 	// The fake installs its SIGTERM trap before announcing readiness, so this
 	// wait is what makes the signal below land on a server that shuts down
 	// gracefully rather than on one still starting up.
-	waitForWatchdogLogText(t, logPath, "INFO dolt: ready", 10*time.Second)
+	waitForFileText(t, logPath, "INFO dolt: ready", 10*time.Second)
 
 	// Record the intent the way stopManagedDoltProcessWithOptions does, then
 	// stop the server the way it does: SIGTERM straight to the dolt PID.
@@ -681,7 +666,7 @@ func TestManagedDoltScopeWatchdogQuietOnRequestedStop(t *testing.T) {
 		t.Fatalf("signal fake dolt: %v", err)
 	}
 
-	logData := waitForWatchdogLogText(t, logPath, "exited cleanly", 15*time.Second)
+	logData := waitForFileText(t, logPath, "exited cleanly", 15*time.Second)
 	if strings.Contains(logData, "ALARM") {
 		t.Errorf("a requested stop raised an alarm; log:\n%s", logData)
 	}
@@ -716,14 +701,14 @@ func TestManagedDoltScopeWatchdogAttributesAnExternalStopSignal(t *testing.T) {
 	}
 
 	doltPID, watchdogPID, cityPath := runScopeWatchdogHelper(t, fakeDoltDir, dir, configPath, logPath)
-	waitForWatchdogLogText(t, logPath, "supervising dolt sql-server", 10*time.Second)
+	waitForFileText(t, logPath, "supervising dolt sql-server", 10*time.Second)
 
 	// The 2026-08-15 event: an external SIGTERM to the watchdog itself.
 	if err := syscall.Kill(watchdogPID, syscall.SIGTERM); err != nil {
 		t.Fatalf("signal watchdog: %v", err)
 	}
 
-	logData := waitForWatchdogLogText(t, logPath, "stop signal attribution", 15*time.Second)
+	logData := waitForFileText(t, logPath, "stop signal attribution", 15*time.Second)
 	for _, want := range []string{
 		"received terminated",
 		fmt.Sprintf("terminating dolt sql-server pid %d", doltPID),
@@ -738,7 +723,7 @@ func TestManagedDoltScopeWatchdogAttributesAnExternalStopSignal(t *testing.T) {
 	// ga-drkbcd R2: an external stop nobody asked for is the same operational
 	// class as an unexpected clean exit — the data plane goes down and no gc
 	// stop explains it — so it escalates CRITICAL, not warn.
-	waitForWatchdogLogText(t, logPath, "escalated to the emergency spool at", 15*time.Second)
+	waitForFileText(t, logPath, "escalated to the emergency spool at", 15*time.Second)
 	spoolData := readManagedDoltEmergencySpoolRecord(t, cityPath)
 	for _, want := range []string{`"severity": "critical"`, "external-stop-signal", managedDoltWatchdogAlarmActor} {
 		if !strings.Contains(spoolData, want) {
@@ -784,7 +769,7 @@ func TestManagedDoltScopeWatchdogQuietOnAStopSignalCoveredByIntent(t *testing.T)
 	}
 
 	doltPID, watchdogPID, cityPath := runScopeWatchdogHelper(t, fakeDoltDir, dir, configPath, logPath)
-	waitForWatchdogLogText(t, logPath, "supervising dolt sql-server", 10*time.Second)
+	waitForFileText(t, logPath, "supervising dolt sql-server", 10*time.Second)
 
 	// The gc-side shape: record the intent for the server, then signal the
 	// watchdog — exactly what terminateManagedDoltStartedProcess does.
@@ -795,7 +780,7 @@ func TestManagedDoltScopeWatchdogQuietOnAStopSignalCoveredByIntent(t *testing.T)
 		t.Fatalf("signal watchdog: %v", err)
 	}
 
-	logData := waitForWatchdogLogText(t, logPath, "covered by a gc stop intent", 15*time.Second)
+	logData := waitForFileText(t, logPath, "covered by a gc stop intent", 15*time.Second)
 	if strings.Contains(logData, "ALARM") {
 		t.Errorf("a stop signal covered by a gc stop intent raised an alarm; log:\n%s", logData)
 	}
@@ -964,7 +949,7 @@ func TestManagedDoltScopeWatchdogReportsALostEventLogWrite(t *testing.T) {
 
 	_, _, cityPath := runScopeWatchdogHelper(t, fakeDoltDir, dir, configPath, logPath)
 
-	logData := waitForWatchdogLogText(t, logPath, "events: lock", 20*time.Second)
+	logData := waitForFileText(t, logPath, "events: lock", 20*time.Second)
 	if !strings.Contains(logData, "ALARM UNEXPECTED CLEAN EXIT") {
 		t.Errorf("the alarm itself is missing; log:\n%s", logData)
 	}

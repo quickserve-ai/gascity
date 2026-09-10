@@ -145,7 +145,7 @@ func classifyManagedDoltWatchdogChildExit(exit managedDoltWatchdogChildExit) man
 		fmt.Sprintf("%s ALARM UNEXPECTED CLEAN EXIT: an unrequested status-0 exit of the database is never routine; this is NOT the healthy requested-shutdown path", managedDoltWatchdogLogPrefix),
 	}
 	if exit.SignalPending {
-		// Says the quiet part out loud: something signalled this watchdog at
+		// Says the quiet part out loud: something signaled this watchdog at
 		// the moment its server left, and nothing gc did explains either event.
 		lines = append(lines, fmt.Sprintf("%s ALARM UNEXPECTED CLEAN EXIT: a stop signal was pending at this watchdog when the server exited, but no gc stop intent covers it — a signal alone authorizes nothing",
 			managedDoltWatchdogLogPrefix))

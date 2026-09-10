@@ -783,7 +783,7 @@ func terminateManagedDoltStartedProcess(started managedDoltStartedProcess) {
 	// including the readiness timeout that a loaded box produces routinely.
 	// Without a marker each of those would escalate a CRITICAL "the data plane
 	// stopped and nobody asked" into the emergency spool for a stop we asked
-	// for ourselves. The marker names the dolt PID; the watchdog PID signalled
+	// for ourselves. The marker names the dolt PID; the watchdog PID signaled
 	// below is covered by the same record, because the watchdog's signal path
 	// consults it too. Advisory, like every other marker write: a failure costs
 	// a false alarm, never the teardown.
