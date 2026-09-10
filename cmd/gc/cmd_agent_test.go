@@ -1577,3 +1577,33 @@ func TestConfigWarnWriter(t *testing.T) {
 		t.Fatalf("human mode: writer must be stderr")
 	}
 }
+
+// TestLoadCityConfigWithBuiltinPacksAppliesFeatureFlags pins that the
+// supervisor's per-city loader puts the daemon feature flags into effect the
+// way loadCityConfigFS does: a city with no [daemon] section defaults
+// formula_v2 on, and after loadSupervisorCityConfig the process-global graph
+// apply flag must say so. Before the fix the loader returned the config and
+// left the flag at its zero value, so a supervisor-run city minted every
+// graph.v2 order on the sequential path until an API request or a reload
+// happened to apply the flags.
+func TestLoadCityConfigWithBuiltinPacksAppliesFeatureFlags(t *testing.T) {
+	formulatest.HoldV2ForTest(t)
+	previous := molecule.IsGraphApplyEnabled()
+	t.Cleanup(func() { molecule.SetGraphApplyEnabled(previous) })
+	molecule.SetGraphApplyEnabled(false)
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "city.toml"), []byte("[workspace]\nname = \"loader-flags\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _, err := loadSupervisorCityConfig(dir)
+	if err != nil {
+		t.Fatalf("loadSupervisorCityConfig: %v", err)
+	}
+	if !cfg.Daemon.FormulaV2Enabled() {
+		t.Fatal("a city without [daemon] must default formula_v2 on")
+	}
+	if !molecule.IsGraphApplyEnabled() {
+		t.Fatal("loadSupervisorCityConfig returned a config whose feature flags are not in effect: graph apply is still off")
+	}
+}

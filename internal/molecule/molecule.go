@@ -759,7 +759,9 @@ func Instantiate(ctx context.Context, store beads.Store, recipe *formula.Recipe,
 	if len(recipe.Steps) == 0 {
 		return nil, fmt.Errorf("recipe %q has no steps", recipe.Name)
 	}
-	if !opts.DeferAssignees && IsGraphApplyEnabled() {
+	graphApplyOn := IsGraphApplyEnabled()
+	graphApplyTracef("instantiate recipe=%s graph-apply-enabled=%v defer-assignees=%v", recipe.Name, graphApplyOn, opts.DeferAssignees)
+	if !opts.DeferAssignees && graphApplyOn {
 		if applier, ok := beads.GraphApplyFor(store); ok {
 			result, err := instantiateViaGraphApply(ctx, applier, recipe, opts)
 			if err == nil {
