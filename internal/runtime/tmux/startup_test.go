@@ -92,12 +92,13 @@ func (f *fakeStartOps) createSession(name, workDir, command string, env map[stri
 	return nil
 }
 
-func (f *fakeStartOps) respawnAgent(name, workDir, command string) error {
+func (f *fakeStartOps) respawnAgent(name, workDir, command string, env map[string]string) error {
 	f.calls = append(f.calls, startCall{
 		method:  "respawnAgent",
 		name:    name,
 		workDir: workDir,
 		command: command,
+		env:     env,
 	})
 	return f.respawnErr
 }
@@ -2829,5 +2830,51 @@ func TestRunSetupCommandCancellationRunsRollbackTrap(t *testing.T) {
 	}
 	if _, statErr := os.Stat(marker); statErr != nil {
 		t.Fatalf("rollback trap never ran — staged state would have been lost: %v", statErr)
+	}
+}
+
+// TestDoRelaunchSession_ReappliesEnvOnRespawn covers ga-xd3bjx item 2: the
+// warm relaunch path must hand cfg.Env to the respawn so declared values are
+// re-applied and — critically — EMPTY values (the "unset this var"
+// convention, e.g. the CLAUDE_CONFIG_DIR reset) are re-enforced. Before
+// this, respawn re-ran buildLaunchCommand without cfg.Env and the respawned
+// pane inherited the tmux server global environment.
+func TestDoRelaunchSession_ReappliesEnvOnRespawn(t *testing.T) {
+	ops := &fakeStartOps{
+		hasSessionResult: true,
+	}
+
+	cfg := runtime.Config{
+		Command: "claude",
+		WorkDir: "/proj",
+		Env: map[string]string{
+			"CLAUDE_CONFIG_DIR": "",
+			"GC_CITY":           "/city",
+		},
+	}
+
+	err := doRelaunchSession(context.Background(), ops, "test", cfg, DefaultConfig().SetupTimeout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var respawn *startCall
+	for i := range ops.calls {
+		if ops.calls[i].method == "respawnAgent" {
+			respawn = &ops.calls[i]
+			break
+		}
+	}
+	if respawn == nil {
+		t.Fatalf("respawnAgent never called; calls = %v", ops.callMethods())
+	}
+	if respawn.env == nil {
+		t.Fatal("respawnAgent received nil env; the create path's env resets are lost on warm relaunch")
+	}
+	if v, ok := respawn.env["CLAUDE_CONFIG_DIR"]; !ok || v != "" {
+		t.Fatalf("respawn env CLAUDE_CONFIG_DIR = (%q, %v), want declared-empty unset", v, ok)
+	}
+	if got := respawn.env["GC_CITY"]; got != "/city" {
+		t.Fatalf("respawn env GC_CITY = %q, want /city", got)
 	}
 }
