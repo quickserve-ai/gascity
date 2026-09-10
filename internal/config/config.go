@@ -270,8 +270,8 @@ type City struct {
 	Formulas FormulasConfig `toml:"formulas,omitempty"`
 	// Daemon configures controller daemon settings.
 	Daemon DaemonConfig `toml:"daemon,omitempty"`
-	// Orders configures order settings: skip list, max_timeout cap, and
-	// per-order overrides.
+	// Orders configures order settings: skip list, max_timeout cap, the
+	// per-tick dispatch budget, and per-order overrides.
 	Orders OrdersConfig `toml:"orders,omitempty"`
 	// API configures the optional HTTP API server.
 	API APIConfig `toml:"api,omitempty"`
@@ -2108,6 +2108,20 @@ type OrdersConfig struct {
 	// timeout only; a condition trigger's check_timeout is a separate probe
 	// deadline and is not capped here.
 	MaxTimeout string `toml:"max_timeout,omitempty"`
+	// MaxDispatchesPerTick caps how many orders the controller fires in one
+	// dispatch pass (one reconciler tick). 0 or negative means the built-in
+	// default. Calibrate to the city's order book: when steady-state demand
+	// (sum of 3600/interval across cooldown orders, in fires/hour) exceeds
+	// cap x ticks-per-hour, every short-interval order dilutes toward the
+	// same round-robin rotation cadence instead of its own interval
+	// (ga-44iyd). Each fire costs a tracking-bead write plus an async
+	// dispatch goroutine, and the pass runs its open-work gates inline,
+	// so very large values trade tick latency and store write volume for
+	// cadence; size to steady-state demand with modest headroom.
+	// Pointer distinguishes "not set" (nil, built-in default) from an
+	// explicit value; a plain int zero would also force the [orders] table
+	// into every marshaled scaffold (BurntSushi omitempty has no int case).
+	MaxDispatchesPerTick *int `toml:"max_dispatches_per_tick,omitempty"`
 	// Overrides apply per-order field overrides after scanning.
 	// Each override targets an order by name and optionally by rig.
 	Overrides []OrderOverride `toml:"overrides,omitempty"`
@@ -2170,6 +2184,15 @@ func normalizeLegacyOrderOverrideAliases(cfg *City) {
 // Returns 0 if unset or unparseable (meaning no cap).
 func (c OrdersConfig) MaxTimeoutDuration() time.Duration {
 	return durationOr(c.MaxTimeout, 0)
+}
+
+// MaxDispatchesPerTickOr returns the configured per-tick dispatch cap, or
+// def when the field is unset or non-positive.
+func (c OrdersConfig) MaxDispatchesPerTickOr(def int) int {
+	if c.MaxDispatchesPerTick != nil && *c.MaxDispatchesPerTick > 0 {
+		return *c.MaxDispatchesPerTick
+	}
+	return def
 }
 
 // DefaultAPIPort is the default TCP port for the API server.

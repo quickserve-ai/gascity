@@ -33,7 +33,7 @@ City is the top-level configuration for a Gas City instance.
 | `dolt` | DoltConfig |  |  | Dolt configures optional dolt server connection overrides. |
 | `formulas` | FormulasConfig |  |  | Formulas is the legacy [formulas] table; authored [formulas].dir is rejected at config load. Formulas live in the well-known formulas/ directory. |
 | `daemon` | DaemonConfig |  |  | Daemon configures controller daemon settings. |
-| `orders` | OrdersConfig |  |  | Orders configures order settings: skip list, max_timeout cap, and per-order overrides. |
+| `orders` | OrdersConfig |  |  | Orders configures order settings: skip list, max_timeout cap, the per-tick dispatch budget, and per-order overrides. |
 | `api` | APIConfig |  |  | API configures the optional HTTP API server. |
 | `chat_sessions` | ChatSessionsConfig |  |  | ChatSessions configures chat session behavior (auto-suspend). |
 | `session_sleep` | SessionSleepConfig |  |  | SessionSleep configures idle sleep policy defaults for managed sessions. |
@@ -599,6 +599,7 @@ OrdersConfig holds order settings for orders discovered from flat TOML files (on
 |-------|------|----------|---------|-------------|
 | `skip` | []string |  |  | Skip lists order names to exclude from scanning. |
 | `max_timeout` | string |  |  | MaxTimeout is an operator hard cap on the per-order dispatch timeout: no order's dispatched exec/formula runs longer than this. Go duration string (e.g., "60s"). Empty means uncapped (no override). This bounds the dispatch timeout only; a condition trigger's check_timeout is a separate probe deadline and is not capped here. |
+| `max_dispatches_per_tick` | integer |  |  | MaxDispatchesPerTick caps how many orders the controller fires in one dispatch pass (one reconciler tick). 0 or negative means the built-in default. Calibrate to the city's order book: when steady-state demand (sum of 3600/interval across cooldown orders, in fires/hour) exceeds cap x ticks-per-hour, every short-interval order dilutes toward the same round-robin rotation cadence instead of its own interval (ga-44iyd). Each fire costs a tracking-bead write plus an async dispatch goroutine, and the pass runs its open-work gates inline, so very large values trade tick latency and store write volume for cadence; size to steady-state demand with modest headroom. Pointer distinguishes "not set" (nil, built-in default) from an explicit value; a plain int zero would also force the [orders] table into every marshaled scaffold (BurntSushi omitempty has no int case). |
 | `overrides` | []OrderOverride |  |  | Overrides apply per-order field overrides after scanning. Each override targets an order by name and optionally by rig. |
 
 ## PackDefaults

@@ -10363,3 +10363,95 @@ func TestRunDispatchGuardedRecoversPanic(t *testing.T) {
 		t.Errorf("expected the recovered panic to be logged, got %q", logs.String())
 	}
 }
+
+func TestOrderDispatchConfiguredBudgetAboveDefaultFiresMore(t *testing.T) {
+	store := beads.NewMemStore()
+	var aa []orders.Order
+	for i := 0; i < 8; i++ {
+		aa = append(aa, orders.Order{
+			Name:     fmt.Sprintf("order-%d", i),
+			Trigger:  "cooldown",
+			Interval: "1m",
+			Exec:     "true",
+		})
+	}
+	ad := buildOrderDispatcherFromListExec(aa, store, nil, func(context.Context, string, string, []string) ([]byte, error) {
+		return []byte("ok\n"), nil
+	}, nil)
+	if ad == nil {
+		t.Fatal("expected non-nil dispatcher")
+	}
+	m := ad.(*memoryOrderDispatcher)
+	m.maxDispatchesPerTick = 6
+	var stderr bytes.Buffer
+	m.stderr = lockedStderr(&stderr)
+
+	now := time.Date(2026, 9, 10, 2, 30, 0, 0, time.UTC)
+	ad.dispatch(context.Background(), t.TempDir(), now)
+	ad.drain(context.Background())
+
+	if got := countOrderTrackingRuns(t, store); got != 6 {
+		t.Fatalf("tracking runs after one tick = %d, want 6 (configured budget above default)", got)
+	}
+	if !strings.Contains(stderr.String(), "per-tick budget (6) spent") {
+		t.Fatalf("expected budget-exhaustion line naming the cap, got stderr:\n%s", stderr.String())
+	}
+
+	// A second pass fires the remaining two (plus rotation continues); the
+	// exhaustion line must NOT fire when the pass ends with nothing unvisited.
+	stderr.Reset()
+	ad.dispatch(context.Background(), t.TempDir(), now.Add(2*time.Minute))
+	ad.drain(context.Background())
+	if got := countOrderTrackingRuns(t, store); got <= 6 {
+		t.Fatalf("tracking runs after second tick = %d, want > 6", got)
+	}
+}
+
+func TestOrderDispatchBudgetExhaustionSilentWhenNothingUnvisited(t *testing.T) {
+	store := beads.NewMemStore()
+	var aa []orders.Order
+	for i := 0; i < 3; i++ {
+		aa = append(aa, orders.Order{
+			Name:     fmt.Sprintf("order-%d", i),
+			Trigger:  "cooldown",
+			Interval: "1m",
+			Exec:     "true",
+		})
+	}
+	ad := buildOrderDispatcherFromListExec(aa, store, nil, func(context.Context, string, string, []string) ([]byte, error) {
+		return []byte("ok\n"), nil
+	}, nil)
+	if ad == nil {
+		t.Fatal("expected non-nil dispatcher")
+	}
+	m := ad.(*memoryOrderDispatcher)
+	m.maxDispatchesPerTick = 3
+	var stderr bytes.Buffer
+	m.stderr = lockedStderr(&stderr)
+
+	now := time.Date(2026, 9, 10, 2, 30, 0, 0, time.UTC)
+	ad.dispatch(context.Background(), t.TempDir(), now)
+	ad.drain(context.Background())
+
+	if got := countOrderTrackingRuns(t, store); got != 3 {
+		t.Fatalf("tracking runs = %d, want 3", got)
+	}
+	if s := stderr.String(); strings.Contains(s, "per-tick budget") {
+		t.Fatalf("exhaustion line must not fire when the last order fired at the end of the rotation, got:\n%s", s)
+	}
+}
+
+func TestNewMemoryOrderDispatcherHonorsConfiguredBudget(t *testing.T) {
+	cfg := &config.City{}
+	sixteen := 16
+	cfg.Orders.MaxDispatchesPerTick = &sixteen
+	m := newMemoryOrderDispatcher(nil, t.TempDir(), cfg, nil, io.Discard)
+	if m.maxDispatchesPerTick != 16 {
+		t.Fatalf("maxDispatchesPerTick = %d, want 16 (configured)", m.maxDispatchesPerTick)
+	}
+
+	m = newMemoryOrderDispatcher(nil, t.TempDir(), &config.City{}, nil, io.Discard)
+	if m.maxDispatchesPerTick != defaultMaxOrderDispatchesPerTick {
+		t.Fatalf("maxDispatchesPerTick = %d, want default %d when unset", m.maxDispatchesPerTick, defaultMaxOrderDispatchesPerTick)
+	}
+}
