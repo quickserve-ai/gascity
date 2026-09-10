@@ -12,6 +12,7 @@ v2-workspace-name
 v2-prompt-template-suffix
 provider-catalog
 provider-catalog-local-readiness
+claude-account-declaration
 expanded-config-load
 implicit-import-cache
 deprecated-attachment-fields
@@ -39,6 +40,7 @@ skill-collision
 skill-dangling-sink
 order-firing-current
 order-outcome-healthy
+order-exec-target
 codex-hooks-drift
 rig-pack-coverage
 pack-runtimes
@@ -74,6 +76,7 @@ work-option-metadata-migration
 backlog-depth
 order-tracking-retention
 session-model
+cloud-wake-bindings
 startup-health-episodes
 gate-sandbox-reads
 dolt-server

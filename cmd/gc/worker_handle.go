@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -102,6 +103,14 @@ func workerSessionRuntimeResolverWithConfig(cityPath string, cfg *config.City) w
 		}
 		if runtimeCfg == nil {
 			return nil, nil
+		}
+		if strings.TrimSpace(runtimeCfg.Command) == "" {
+			// Env-only reset override (unresolved provider, ga-xd3bjx item 1):
+			// the stored command/provider stay in force, so the strict
+			// normalization — which requires both — must not reject it.
+			// applyResolvedRuntimeToSessionSpec applies partial overrides
+			// field-by-field.
+			return runtimeCfg, nil
 		}
 		normalized, err := worker.NormalizeResolvedRuntime(*runtimeCfg)
 		if err != nil {
@@ -297,6 +306,14 @@ func newWorkerSessionHandleForResolvedRuntimeWithConfig(
 	// worker factory. In particular, workspace.env BD_BIN must follow the same
 	// schema-compatible executable as the controller and resumed sessions.
 	sessionEnv := resolvedWorkerSessionEnvWithConfig(cityPath, cfg, resolved)
+	// Account guard (ga-ai7gz2), hard on this create path because it launches a
+	// new process: refuse a claude-family session that would inherit the
+	// controller's ambient CLAUDE_CONFIG_DIR with none declared. It checks the
+	// env the session actually launches with, so an account declared only in
+	// [workspace.env] satisfies it.
+	if err := processenv.RequireDeclaredClaudeAccount(sessionCfg.Runtime.Provider, resolved.AccountFamily(), sessionEnv); err != nil {
+		return nil, err
+	}
 	sessionCfg.Runtime.SessionEnv = sessionEnv
 	sessionCfg.Runtime.Hints.Env = sessionEnv
 	// Stage provider-overlay hooks on the CLI create path the same way the
@@ -598,7 +615,25 @@ func resolvedWorkerRuntimeWithConfigAndMetadata(cityPath string, cfg *config.Cit
 	}
 	resolved, configuredTransport := resolveWorkerRuntimeProviderWithConfigAndMetadata(cfg, info, sessionKind, metadata)
 	if resolved == nil {
-		return nil, nil
+		// The provider can no longer be resolved (removed or renamed since the
+		// session was stored). Returning nil here used to mean "no override",
+		// and the stored command was then relaunched with the controller's
+		// inherited process env — bypassing both the passthrough reset and the
+		// account guard, so a session whose provider declaration was REMOVED
+		// could silently resume under the controller's ambient Claude account
+		// (ga-xd3bjx item 1, codex lens finding). A hard error is not an option
+		// either: this resolver services every session-handle lookup (stop,
+		// kill, observe), and failing it would make such a session impossible
+		// to stop. So return an ENV-ONLY override carrying the reset baseline:
+		// Command/Provider/WorkDir stay empty (the stored values apply), and
+		// the session env is the passthrough reset (which empties
+		// CLAUDE_CONFIG_DIR and friends) plus the city identity anchors.
+		sessionEnv := mergeEnv(providerProcessPassthroughEnv(), cityIdentityAnchorsForCity(cityPath))
+		hints := runtime.Config{Env: sessionEnv}
+		return &worker.ResolvedRuntime{
+			SessionEnv: sessionEnv,
+			Hints:      hints,
+		}, nil
 	}
 	transport := resolvedWorkerRuntimeTransport(info, resolved, configuredTransport, metadata)
 	if transport == "" && startedConfigHashProvesWorkerACPTransport(cityPath, cfg, info, sessionKind, resolved, metadata, configuredTransport) {
@@ -638,6 +673,19 @@ func resolvedWorkerRuntimeWithConfigAndMetadata(cityPath string, cfg *config.Cit
 	// overwritten with the city-uniform default here. template_resolve.go
 	// owns the qualified override for the CLI create path.
 	sessionEnv := resolvedWorkerSessionEnvWithConfig(cityPath, cfg, resolved)
+	if model := config.LaunchModelFromCommand(command); model != "" {
+		sessionEnv["GC_CONTEXT_LAUNCH_MODEL"] = model
+	}
+	// Account guard, warn-only (ga-ai7gz2): this resolver services EVERY
+	// session-handle lookup through worker.Factory (stop, kill, observe —
+	// not just relaunch), so a hard error here would make an undeclared
+	// claude session impossible to stop while the controller carries an
+	// ambient CLAUDE_CONFIG_DIR (codex lens finding). The passthrough reset
+	// still guarantees the env never carries the ambient account; the hard
+	// refusal lives on the create paths, which launch new processes.
+	if err := processenv.RequireDeclaredClaudeAccount(resolved.Name, resolved.AccountFamily(), sessionEnv); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: resumed session %q runs without a declared Claude account: %v\n", info.SessionName, err)
+	}
 	// Resolve session_live so resumed sessions get re-themed (status bar,
 	// keybindings) the same way reconciler-started sessions do. Without this,
 	// `gc session attach` recreates the tmux runtime with an empty
@@ -912,6 +960,31 @@ func resolveWorkerRuntimeProviderWithConfigAndMetadata(cfg *config.City, info se
 			continue
 		}
 		resolved, err := config.ResolveProvider(&config.Agent{Provider: providerName}, &cfg.Workspace, cfg.Providers, exec.LookPath)
+		if err == nil {
+			return resolved, strings.TrimSpace(resolved.ProviderSessionCreateTransport())
+		}
+	}
+	// Permissive retry: the strict passes above also fail on
+	// ErrProviderNotInPATH (a reduced PATH in cron/systemd/upgrade windows),
+	// and returning nil for that case would hand the caller the env-only
+	// RESET override — actively discarding a correctly DECLARED provider env,
+	// worse than the transient PATH fault. A provider that resolves with a
+	// permissive lookPath still exists in config, so its declared env is
+	// authoritative; a relaunch with a genuinely missing binary then fails
+	// loudly at spawn, which is honest. Only a provider that is gone from
+	// config falls through to nil (ga-xd3bjx item 1, reviewer finding 2).
+	permissive := func(name string) (string, error) { return name, nil }
+	if session.UseAgentTemplateForProviderResolution(sessionKind, metadata, info.Provider, found.Provider, foundAgent) && foundAgent {
+		if resolved, err := config.ResolveProvider(&found, &cfg.Workspace, cfg.Providers, permissive); err == nil {
+			return resolved, config.ResolveSessionCreateTransport(found.Session, resolved)
+		}
+	}
+	for _, providerName := range []string{info.Provider, info.Template} {
+		providerName = strings.TrimSpace(providerName)
+		if providerName == "" {
+			continue
+		}
+		resolved, err := config.ResolveProvider(&config.Agent{Provider: providerName}, &cfg.Workspace, cfg.Providers, permissive)
 		if err == nil {
 			return resolved, strings.TrimSpace(resolved.ProviderSessionCreateTransport())
 		}
