@@ -48,10 +48,13 @@ const (
 	// only job that stands up the proxied shapes and ci-required accepted the
 	// skip. `go list -deps ./test/acceptance/... ./cmd/gc` names 139 of 166
 	// internal packages, so the filter is now the graph itself.
-	expectedCIExecutionHash      = "c74219f009d94965f5172398ad5d0cf9ad3215ab2621b8604076afdf02b19674"
+	//
+	// Bumped for the carry's go-mod-warm composite step (ga-azybk8): one
+	// deterministic module warm per job ahead of every go command.
+	expectedCIExecutionHash      = "e058256457401acdbaa06d6190106ff7f061a0dec346e8b1efbc81eb6d762ad2"
 	expectedNightlyTriggersHash  = "0a4400a09ac567e90adf8be1232eef1f14e36efd8dba3e143aa6e36f5b7a36f5"
-	expectedNightlyExecutionHash = "9cc6663eacb2279f8d98b6e0acc72de7b8907b0f58ef85c2f8dc684791c2a823" // reviewed delta: Beads v1.3.0-rc.2 -> v1.3.0
-	expectedSetupActionHash      = "8f2d6b3a57f11d4f33a41211b1d3d5362d1437ba40c7b6db068abb98e731e5ac"
+	expectedNightlyExecutionHash = "6112cdb386602a604767a6d77c21a6ff90ec60587fb0b021105d982fe30c006a" // reviewed delta: Beads v1.3.0-rc.2 -> v1.3.0
+	expectedSetupActionHash      = "12920621ee8af83820e2a89d8b3f216030c1e58559b2650a705e224df23ed3de"
 )
 
 var requiredFilterPaths = map[string][]string{
