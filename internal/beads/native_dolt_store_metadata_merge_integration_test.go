@@ -164,10 +164,11 @@ func TestNativeDoltStoreSetMetadataBatchRollsBackWhenTheEventInsertFails(t *test
 		if restored {
 			return
 		}
-		restored = true
 		if _, err := db.Exec("RENAME TABLE `events_offline` TO `events`"); err != nil {
 			t.Errorf("restore the events table: %v", err)
+			return
 		}
+		restored = true
 	}
 	t.Cleanup(restoreEvents)
 	writeErr := store.SetMetadataBatch(created.ID, map[string]string{"gc.b": "2"})
@@ -175,8 +176,8 @@ func TestNativeDoltStoreSetMetadataBatchRollsBackWhenTheEventInsertFails(t *test
 	if writeErr == nil {
 		t.Fatal("SetMetadataBatch succeeded with the events table gone; the event insert does not share the write's transaction")
 	}
-	if !strings.Contains(strings.ToLower(writeErr.Error()), "events") {
-		t.Fatalf("SetMetadataBatch error = %v, want the missing events table named (a different failure would not prove the rollback)", writeErr)
+	if msg := strings.ToLower(writeErr.Error()); !strings.Contains(msg, "table not found") || !strings.Contains(msg, "events") {
+		t.Fatalf("SetMetadataBatch error = %v, want the missing events table diagnosed: the library names the events table on every event-insert failure, so only the table-not-found text proves the injected fault was the one that failed the write", writeErr)
 	}
 
 	after, err := storage.GetIssue(ctx, created.ID)
