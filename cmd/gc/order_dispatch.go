@@ -2267,6 +2267,11 @@ func (m *memoryOrderDispatcher) dispatchWisp(ctx context.Context, store beads.St
 
 	cookResult, err := molecule.Instantiate(ctx, graphStore, recipe, molecule.Options{Vars: effectiveVars})
 	if err != nil {
+		// The recorder prints only its own write errors, never the event
+		// message, so the ids Instantiate names as left unmarked reach the
+		// controller log only through this line — as the routing failure
+		// above already does.
+		logDispatchError(m.stderr, "gc: order %s: instantiation failed: %v", scoped, err)
 		m.rec.Record(events.Event{
 			Type:    events.OrderFailed,
 			Actor:   "controller",
