@@ -14,6 +14,13 @@
 # Blocked: pseudo-version, prerelease label, local path, git branch/ref, or
 #          any non-semver version token.
 #
+# One carve-out, for one replacement path: github.com/quickserve-ai/beads (the
+# beads fork whose fleet build carry/operational links) may also be pinned at a
+# fleet tag, vX.Y.Z-fleet.YYYYMMDD or vX.Y.Z-fleet.YYYYMMDD.N — a released tag
+# on that fork, cut per beads release (CARRY.md "Beads pin"). Every other path
+# keeps the pure-semver rule, and a pseudo-version on the fork path stays
+# blocked: the carve-out admits a tag shape, never an unreleased commit.
+#
 # Handles both single-line and grouped multi-line replace blocks:
 #   replace foo => bar v1.0.0-pseudo          (single-line)
 #   replace (                                 (grouped block)
@@ -61,6 +68,13 @@ check_replace_rhs() {
 	# No version: path-only redirect with no version to check.
 	[[ -n "$version" ]] || return 0
 
+	# Fleet-tag carve-out: the beads fork's replacement path only (see header).
+	local fleet_tag_path="github.com/quickserve-ai/beads"
+	local fleet_tag_re='^v[0-9]+\.[0-9]+\.[0-9]+-fleet\.[0-9]{8}(\.[0-9]+)?$'
+	if [[ "$path_part" == "$fleet_tag_path" && "$version" =~ $fleet_tag_re ]]; then
+		return 0
+	fi
+
 	# Only pure vX.Y.Z release tags are allowed. Everything else — pseudo-versions
 	# (timestamp+sha suffix), prerelease labels (-rc1, -beta), and non-semver
 	# tokens (branch names like "main", git refs) — is blocked.
@@ -71,6 +85,9 @@ check_replace_rhs() {
 		echo "  Policy: gascity is a public project that must only pin released semver deps." >&2
 		echo "  Only exact vX.Y.Z release tags are allowed; pseudo-versions, prerelease" >&2
 		echo "  labels, and git branch/ref tokens are not. Version seen: $version" >&2
+		if [[ "$path_part" == "$fleet_tag_path" ]]; then
+			echo "  ($fleet_tag_path may also name a released fleet tag, vX.Y.Z-fleet.YYYYMMDD[.N].)" >&2
+		fi
 		echo "  Override: human operator must manually bypass this required CI check." >&2
 		return 1
 	fi
