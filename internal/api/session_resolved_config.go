@@ -39,7 +39,10 @@ func resolvedSessionConfigForProvider(
 		resolvedCommand = resolved.ACPCommandString()
 	}
 	command = firstNonEmptyString(command, resolvedCommand, resolved.Name)
-	sessionEnv := cityAnchoredSessionEnv(cityPath, workspaceEnv, resolved.Env)
+	sessionEnv, err := checkedCityAnchoredSessionEnv(cityPath, workspaceEnv, resolved)
+	if err != nil {
+		return worker.ResolvedSessionConfig{}, err
+	}
 	if model := config.LaunchModelFromCommand(command); model != "" {
 		sessionEnv["GC_CONTEXT_LAUNCH_MODEL"] = model
 	}

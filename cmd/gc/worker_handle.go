@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/materialize"
+	"github.com/gastownhall/gascity/internal/processenv"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/worker"
@@ -353,6 +355,11 @@ func resolvedWorkerSessionConfigWithConfig(
 	if strings.TrimSpace(cityPath) != "" {
 		sessionEnv = mergeEnv(sessionEnv, cityIdentityAnchorsForCity(cityPath))
 	}
+	// Account guard (ga-ai7gz2): refuse a claude-family session that would
+	// inherit the controller's ambient CLAUDE_CONFIG_DIR with none declared.
+	if err := processenv.RequireDeclaredClaudeAccount(providerName, resolved.AccountFamily(), sessionEnv); err != nil {
+		return worker.ResolvedSessionConfig{}, err
+	}
 	return worker.NormalizeResolvedSessionConfig(worker.ResolvedSessionConfig{
 		Alias:        alias,
 		ExplicitName: explicitName,
@@ -600,6 +607,16 @@ func resolvedWorkerRuntimeWithConfigAndMetadata(cityPath string, cfg *config.Cit
 	sessionEnv := mergeEnv(providerProcessPassthroughEnv(), resolved.Env, cityIdentityAnchorsForCity(cityPath))
 	if model := config.LaunchModelFromCommand(command); model != "" {
 		sessionEnv["GC_CONTEXT_LAUNCH_MODEL"] = model
+	}
+	// Account guard, warn-only (ga-ai7gz2): this resolver services EVERY
+	// session-handle lookup through worker.Factory (stop, kill, observe —
+	// not just relaunch), so a hard error here would make an undeclared
+	// claude session impossible to stop while the controller carries an
+	// ambient CLAUDE_CONFIG_DIR (codex lens finding). The passthrough reset
+	// still guarantees the env never carries the ambient account; the hard
+	// refusal lives on the create paths, which launch new processes.
+	if err := processenv.RequireDeclaredClaudeAccount(resolved.Name, resolved.AccountFamily(), sessionEnv); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: resumed session %q runs without a declared Claude account: %v\n", info.SessionName, err)
 	}
 	// Resolve session_live so resumed sessions get re-themed (status bar,
 	// keybindings) the same way reconciler-started sessions do. Without this,

@@ -1,6 +1,7 @@
 package processenv
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -126,5 +127,87 @@ func TestProviderProcessPassthroughEnvOmitsUnsetTZ(t *testing.T) {
 	m := ProviderProcessPassthroughEnv()
 	if v, ok := m["TZ"]; ok {
 		t.Errorf(`m["TZ"] = %q present, want absent when host TZ is unset`, v)
+	}
+}
+
+func TestProviderProcessPassthroughEnvResetsAmbientClaudeConfigDir(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("CLAUDE_CONFIG_DIR", "/tmp/controller-ambient-account")
+
+	got := ProviderProcessPassthroughEnv()
+
+	// The reset must be an explicit empty entry (like the CLAUDECODE nesting
+	// resets), not a mere omission: an omitted key would let the ambient value
+	// leak through env-inheriting spawn paths (ga-ai7gz2).
+	val, ok := got["CLAUDE_CONFIG_DIR"]
+	if !ok {
+		t.Fatalf("ProviderProcessPassthroughEnv()[CLAUDE_CONFIG_DIR] absent, want explicit empty reset")
+	}
+	if val != "" {
+		t.Errorf("ProviderProcessPassthroughEnv()[CLAUDE_CONFIG_DIR] = %q, want empty reset (ambient must not pass through)", val)
+	}
+}
+
+func TestRequireDeclaredClaudeAccount(t *testing.T) {
+	tests := []struct {
+		name    string
+		family  string
+		ambient string
+		env     map[string]string
+		wantErr bool
+	}{
+		{
+			name:    "claude family with ambient and no declaration is refused",
+			family:  "claude",
+			ambient: "/tmp/controller-ambient-account",
+			env:     map[string]string{"CLAUDE_CONFIG_DIR": ""},
+			wantErr: true,
+		},
+		{
+			name:    "claude family with ambient but a declared account passes",
+			family:  "claude",
+			ambient: "/tmp/controller-ambient-account",
+			env:     map[string]string{"CLAUDE_CONFIG_DIR": "/tmp/declared-account"},
+			wantErr: false,
+		},
+		{
+			name:    "claude family without ambient passes undeclared (vanilla single-account)",
+			family:  "claude",
+			ambient: "",
+			env:     map[string]string{"CLAUDE_CONFIG_DIR": ""},
+			wantErr: false,
+		},
+		{
+			name:    "non-claude family is never gated",
+			family:  "codex",
+			ambient: "/tmp/controller-ambient-account",
+			env:     map[string]string{},
+			wantErr: false,
+		},
+		{
+			name:    "whitespace-only declaration counts as undeclared",
+			family:  "claude",
+			ambient: "/tmp/controller-ambient-account",
+			env:     map[string]string{"CLAUDE_CONFIG_DIR": "   "},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("CLAUDE_CONFIG_DIR", tt.ambient)
+			err := RequireDeclaredClaudeAccount("test-provider", tt.family, tt.env)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("RequireDeclaredClaudeAccount() = nil, want error")
+				}
+				if !errors.Is(err, ErrUndeclaredClaudeAccount) {
+					t.Errorf("RequireDeclaredClaudeAccount() error = %v, want ErrUndeclaredClaudeAccount", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("RequireDeclaredClaudeAccount() = %v, want nil", err)
+			}
+		})
 	}
 }

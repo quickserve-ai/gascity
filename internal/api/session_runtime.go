@@ -72,6 +72,19 @@ func cityAnchoredSessionEnv(cityPath string, workspaceEnv, providerEnv map[strin
 	return convergence.ScrubTokenEnv(out)
 }
 
+// checkedCityAnchoredSessionEnv builds the city-anchored session env and
+// enforces the declared-account guard for claude-family providers: the
+// passthrough baseline resets the controller's ambient CLAUDE_CONFIG_DIR, so a
+// claude session whose config layers declare no account of their own is
+// refused loudly instead of silently inheriting the controller's (ga-ai7gz2).
+func checkedCityAnchoredSessionEnv(cityPath string, workspaceEnv map[string]string, resolved *config.ResolvedProvider) (map[string]string, error) {
+	sessionEnv := cityAnchoredSessionEnv(cityPath, workspaceEnv, resolved.Env)
+	if err := processenv.RequireDeclaredClaudeAccount(resolved.Name, resolved.AccountFamily(), sessionEnv); err != nil {
+		return nil, err
+	}
+	return sessionEnv, nil
+}
+
 func configuredWorkspaceSessionEnv(cfg *config.City) map[string]string {
 	if cfg == nil {
 		return nil
@@ -376,7 +389,10 @@ func (s *Server) buildSessionResume(info session.Info) (string, runtime.Config, 
 	resolvedInfo.ResumeFlag = resolved.ResumeFlag
 	resolvedInfo.ResumeStyle = resolved.ResumeStyle
 	resolvedInfo.ResumeCommand = resumeCommand
-	sessionEnv := cityAnchoredSessionEnv(s.state.CityPath(), configuredWorkspaceSessionEnv(s.state.Config()), resolved.Env)
+	sessionEnv, err := checkedCityAnchoredSessionEnv(s.state.CityPath(), configuredWorkspaceSessionEnv(s.state.Config()), resolved)
+	if err != nil {
+		return "", runtime.Config{}, err
+	}
 	return session.BuildResumeCommand(resolvedInfo), sessionResumeHints(resolved, workDir, sessionEnv, mcpServers, sessionResumeInteractive(metadata)), nil
 }
 
@@ -494,7 +510,10 @@ func (s *Server) resolveWorkerSessionRuntimeWithMetadata(info session.Info, _ st
 			resumeCommand = command
 		}
 	}
-	sessionEnv := cityAnchoredSessionEnv(s.state.CityPath(), configuredWorkspaceSessionEnv(s.state.Config()), resolved.Env)
+	sessionEnv, err := checkedCityAnchoredSessionEnv(s.state.CityPath(), configuredWorkspaceSessionEnv(s.state.Config()), resolved)
+	if err != nil {
+		return nil, err
+	}
 	runtimeCfg, err := worker.NormalizeResolvedRuntime(worker.ResolvedRuntime{
 		Command:    command,
 		WorkDir:    firstNonEmptyString(info.WorkDir, workDir),

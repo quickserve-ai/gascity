@@ -140,6 +140,10 @@ func TestBuildSessionResumeAppliesTemplateOverridesToExplicitResumeCommand(t *te
 
 func TestBuildSessionResumePreservesStoredResolvedCommand(t *testing.T) {
 	fs := newSessionFakeState(t)
+	// Pin ambient CLAUDE_CONFIG_DIR empty: with an ambient value and no
+	// declared account the claude-family guard refuses the spawn (ga-ai7gz2),
+	// and this test exercises the vanilla no-ambient path deterministically.
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	fs.cfg = &config.City{
 		Workspace: config.Workspace{Name: "test-city"},
 		Agents: []config.Agent{
@@ -182,6 +186,10 @@ func TestBuildSessionResumePreservesStoredResolvedCommand(t *testing.T) {
 // workers wedged on interactive permission prompts on resume.
 func TestBuildSessionResumeRebuildsBareStoredCommandForPoolClaudeAgent(t *testing.T) {
 	fs := newSessionFakeState(t)
+	// Pin ambient CLAUDE_CONFIG_DIR empty: with an ambient value and no
+	// declared account the claude-family guard refuses the spawn (ga-ai7gz2),
+	// and this test exercises the vanilla no-ambient path deterministically.
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	claude := config.BuiltinProviders()["claude"]
 	claude.PathCheck = "true" // use /usr/bin/true so LookPath succeeds in CI
 	maxActive := 3

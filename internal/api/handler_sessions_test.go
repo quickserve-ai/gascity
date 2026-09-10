@@ -3060,6 +3060,10 @@ func TestMaterializeNamedSession_RebrandedSingletonKeepsTemplateWorkDirIdentity(
 
 func TestMaterializeNamedSessionStampsProviderFamilyMetadata(t *testing.T) {
 	fs := newSessionFakeState(t)
+	// Pin ambient CLAUDE_CONFIG_DIR empty: with an ambient value and no
+	// declared account the claude-family guard refuses the spawn (ga-ai7gz2),
+	// and this test exercises the vanilla no-ambient path deterministically.
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
 	base := "builtin:claude"
 	fs.cfg.Agents = []config.Agent{{
 		Name:              "worker",
