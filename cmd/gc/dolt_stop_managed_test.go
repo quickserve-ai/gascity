@@ -1,8 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
+	"syscall"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -162,5 +165,238 @@ name = "mayor"
 	got := resolveManagedDoltStopTimeout(dir)
 	if got != config.DefaultDoltStopTimeout {
 		t.Errorf("resolveManagedDoltStopTimeout() with invalid duration = %v, want %v (default)", got, config.DefaultDoltStopTimeout)
+	}
+}
+
+// --- ga-drkbcd: the production stop path and its stop-intent marker ---------
+//
+// The tests below drive the REAL stopManagedDoltProcessWithOptions against a
+// stand-in server, rather than writing the marker from the test itself: the
+// marker only defends against a false "exited cleanly" if the production stop
+// is the thing that writes it, and only stays safe if a FAILED stop takes it
+// back down again.
+
+// newManagedDoltStopFixture builds an isolated city + pack-state layout for a
+// stop-path test. GC_PACK_STATE_DIR is the single knob every other layout entry
+// derives from, so the whole managed layout lands under tmpdir.
+func newManagedDoltStopFixture(t *testing.T, cityTOML string) (string, managedDoltRuntimeLayout) {
+	t.Helper()
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(cityTOML), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	packStateDir := filepath.Join(cityPath, "pack-state")
+	if err := os.MkdirAll(packStateDir, 0o755); err != nil {
+		t.Fatalf("mkdir pack state dir: %v", err)
+	}
+	t.Setenv("GC_PACK_STATE_DIR", packStateDir)
+	layout, err := resolveManagedDoltRuntimeLayout(cityPath)
+	if err != nil {
+		t.Fatalf("resolve managed dolt layout: %v", err)
+	}
+	if err := os.MkdirAll(layout.DataDir, 0o755); err != nil {
+		t.Fatalf("mkdir data dir: %v", err)
+	}
+	return cityPath, layout
+}
+
+// writeFakeManagedDoltPIDFile points the layout's pid file at pid, which is how
+// findManagedDoltPID locates the server without a port probe.
+func writeFakeManagedDoltPIDFile(t *testing.T, layout managedDoltRuntimeLayout, pid int) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(layout.PIDFile), 0o755); err != nil {
+		t.Fatalf("mkdir pid dir: %v", err)
+	}
+	if err := os.WriteFile(layout.PIDFile, []byte(strconv.Itoa(pid)+"\n"), 0o644); err != nil {
+		t.Fatalf("write pid file: %v", err)
+	}
+}
+
+const fakeManagedDoltStopCityTOML = `
+[workspace]
+name = "test"
+
+[daemon]
+dolt_stop_timeout = "300ms"
+
+[[agent]]
+name = "mayor"
+`
+
+// TestStopManagedDoltProcessWritesTheStopIntentThroughTheProductionPath is the
+// ga-drkbcd D9 regression: the marker that decides whether a status-0 exit
+// alarms must be written by stopManagedDoltProcessWithOptions itself. The
+// stand-in server captures the marker from inside its own SIGTERM handler, so
+// the assertion is about the file that existed at the instant gc signaled —
+// not one the test wrote, and not one reconstructed afterwards (the stop clears
+// it on success, which is asserted too).
+func TestStopManagedDoltProcessWritesTheStopIntentThroughTheProductionPath(t *testing.T) {
+	cityPath, layout := newManagedDoltStopFixture(t, fakeManagedDoltStopCityTOML)
+	capturePath := filepath.Join(t.TempDir(), "intent-at-signal.json")
+	readyPath := filepath.Join(t.TempDir(), "ready")
+
+	pid := startFakeOwnedManagedDolt(t, layout.ConfigFile,
+		"trap 'cp \"$GC_TEST_INTENT_MARKER\" \"$GC_TEST_INTENT_CAPTURE\" 2>/dev/null; exit 0' TERM\n"+
+			": > \"$GC_TEST_READY\"\n"+
+			"while : ; do sleep 0.05; done\n",
+		"GC_TEST_INTENT_MARKER="+managedDoltStopIntentPath(layout.ConfigFile),
+		"GC_TEST_INTENT_CAPTURE="+capturePath,
+		"GC_TEST_READY="+readyPath,
+	)
+	waitForFakeManagedDoltReady(t, readyPath)
+	writeFakeManagedDoltPIDFile(t, layout, pid)
+
+	report, err := stopManagedDoltProcessWithOptions(cityPath, "", false)
+	if err != nil {
+		t.Fatalf("stop the stand-in managed dolt: %v", err)
+	}
+	if !report.HadPID || report.PID != pid {
+		t.Fatalf("stop report = %+v; expected it to target pid %d", report, pid)
+	}
+
+	captured, err := os.ReadFile(capturePath)
+	if err != nil {
+		t.Fatalf("the production stop never wrote a marker the server could see: %v", err)
+	}
+	var intent managedDoltStopIntent
+	if err := json.Unmarshal(captured, &intent); err != nil {
+		t.Fatalf("marker written by the production stop is not parseable: %v (%s)", err, captured)
+	}
+	if intent.PID != pid {
+		t.Errorf("marker pid = %d, want %d (the pid the stop signaled)", intent.PID, pid)
+	}
+	if intent.RequesterPID != os.Getpid() {
+		t.Errorf("marker requester pid = %d, want %d (the stopping process)", intent.RequesterPID, os.Getpid())
+	}
+	if intent.Reason != "gc managed dolt stop" {
+		t.Errorf("marker reason = %q, want %q", intent.Reason, "gc managed dolt stop")
+	}
+	if !managedDoltStopIntentCovers(intent, pid, time.Now()) {
+		t.Errorf("the marker the production stop wrote does not cover the exit it was written for: %+v", intent)
+	}
+
+	// The marker must OUTLIVE the stop. The watchdog reads it from another
+	// process after its child exits, so a stop that deleted the marker on its
+	// way out would race that read and turn a shutdown gc requested into a
+	// CRITICAL alarm. Expiry is the TTL's job, not the stop's.
+	survivor, found := readManagedDoltStopIntent(layout.ConfigFile)
+	if !found {
+		t.Fatal("the completed stop deleted its own marker; the watchdog can no longer explain the exit it caused")
+	}
+	exitReport := classifyManagedDoltWatchdogChildExit(
+		observeManagedDoltWatchdogChildExit(pid, layout.ConfigFile, layout.LogFile, time.Now().Add(-time.Minute), nil, false))
+	if exitReport.Alarm || exitReport.Cause != managedDoltExitCauseRequested {
+		t.Errorf("the watchdog read the completed stop as %q (alarm=%v); want %q (marker: %+v)",
+			exitReport.Cause, exitReport.Alarm, managedDoltExitCauseRequested, survivor)
+	}
+}
+
+// TestStopManagedDoltProcessMarkerOutlivesALongConfiguredShutdown is the
+// ga-drkbcd P2b regression. The marker's default 10-minute TTL is shorter than
+// a `[daemon] dolt_stop_timeout` an operator is allowed to configure, so a
+// graceful shutdown that legitimately takes longer than the default would
+// outlive its own authorization and alarm as if nobody had asked. The stop path
+// therefore sizes the marker to its own grace window.
+func TestStopManagedDoltProcessMarkerOutlivesALongConfiguredShutdown(t *testing.T) {
+	cityPath, layout := newManagedDoltStopFixture(t, `
+[workspace]
+name = "test"
+
+[daemon]
+dolt_stop_timeout = "15m"
+
+[[agent]]
+name = "mayor"
+`)
+	readyPath := filepath.Join(t.TempDir(), "ready")
+	pid := startFakeOwnedManagedDolt(t, layout.ConfigFile,
+		"trap 'exit 0' TERM\n"+
+			": > \"$GC_TEST_READY\"\n"+
+			"while : ; do sleep 0.05; done\n",
+		"GC_TEST_READY="+readyPath,
+	)
+	waitForFakeManagedDoltReady(t, readyPath)
+	writeFakeManagedDoltPIDFile(t, layout, pid)
+
+	if _, err := stopManagedDoltProcessWithOptions(cityPath, "", false); err != nil {
+		t.Fatalf("stop the stand-in managed dolt: %v", err)
+	}
+	intent, found := readManagedDoltStopIntent(layout.ConfigFile)
+	if !found {
+		t.Fatal("the stop wrote no marker")
+	}
+	// A shutdown that took eleven minutes — inside the configured fifteen — is
+	// still a stop gc asked for.
+	if !managedDoltStopIntentCovers(intent, pid, time.Now().Add(11*time.Minute)) {
+		t.Errorf("a marker written under a 15m stop timeout stopped vouching after 11m: %+v", intent)
+	}
+	// It must still expire: past the configured window plus its slack, nothing
+	// vouches for the pid any more.
+	if managedDoltStopIntentCovers(intent, pid, time.Now().Add(30*time.Minute)) {
+		t.Errorf("the marker never expires: %+v", intent)
+	}
+}
+
+// TestStopManagedDoltProcessClearsTheStopIntentWhenTheStopFails is the
+// ga-drkbcd D2 regression. The intent is recorded BEFORE the signal, so every
+// error return after that point leaves a fresh marker naming a still-live pid.
+// Inside the marker's TTL the next genuinely unexpected status-0 exit of that
+// pid would then be vouched for and suppressed — which is the 2026-08-15
+// failure mode this branch exists to remove.
+func TestStopManagedDoltProcessClearsTheStopIntentWhenTheStopFails(t *testing.T) {
+	cityPath, layout := newManagedDoltStopFixture(t, fakeManagedDoltStopCityTOML)
+
+	// Hold the dolt exclusive store lock so the SIGKILL gate refuses to escalate
+	// and the stop fails AFTER the intent has been recorded. This is a real
+	// production shape: a mid-flush holder is exactly why that gate exists.
+	lockDir := filepath.Join(layout.DataDir, "gc", ".dolt", "noms")
+	if err := os.MkdirAll(lockDir, 0o755); err != nil {
+		t.Fatalf("mkdir lock dir: %v", err)
+	}
+	lockPath := filepath.Join(lockDir, "LOCK")
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatalf("create store lock: %v", err)
+	}
+	defer lockFile.Close() //nolint:errcheck
+	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("hold store lock: %v", err)
+	}
+	defer syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN) //nolint:errcheck
+
+	origLockWindow := managedDoltLockReleaseTimeoutFn
+	managedDoltLockReleaseTimeoutFn = func(string) time.Duration { return 300 * time.Millisecond }
+	t.Cleanup(func() { managedDoltLockReleaseTimeoutFn = origLockWindow })
+
+	readyPath := filepath.Join(t.TempDir(), "ready")
+	pid := startFakeOwnedManagedDolt(t, layout.ConfigFile,
+		// A server that does NOT answer SIGTERM: the stop runs its grace out and
+		// then hits the lock gate.
+		"trap '' TERM\n"+
+			": > \"$GC_TEST_READY\"\n"+
+			"while : ; do sleep 0.05; done\n",
+		"GC_TEST_READY="+readyPath,
+	)
+	waitForFakeManagedDoltReady(t, readyPath)
+	writeFakeManagedDoltPIDFile(t, layout, pid)
+
+	if _, err := stopManagedDoltProcessWithOptions(cityPath, "", false); err == nil {
+		t.Fatal("expected the stop to fail while the store lock is held by a live process")
+	}
+	if !pidAlive(pid) {
+		t.Fatal("the stand-in server died; the failed-stop scenario did not happen")
+	}
+
+	if intent, found := readManagedDoltStopIntent(layout.ConfigFile); found && managedDoltStopIntentCovers(intent, pid, time.Now()) {
+		t.Errorf("a FAILED stop left a marker vouching for still-live pid %d: %+v", pid, intent)
+	}
+
+	// The consequence, stated as the watchdog would see it: the very next
+	// status-0 exit of that pid must still be an alarm.
+	exitReport := classifyManagedDoltWatchdogChildExit(
+		observeManagedDoltWatchdogChildExit(pid, layout.ConfigFile, layout.LogFile, time.Now().Add(-time.Minute), nil, false))
+	if !exitReport.Alarm || exitReport.Cause != managedDoltExitCauseUnexpectedClean {
+		t.Errorf("after a FAILED stop an unexpected clean exit was classified %q (alarm=%v); want %q with an alarm",
+			exitReport.Cause, exitReport.Alarm, managedDoltExitCauseUnexpectedClean)
 	}
 }
