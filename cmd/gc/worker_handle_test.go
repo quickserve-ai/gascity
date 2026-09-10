@@ -2664,3 +2664,66 @@ func TestResolvedWorkerSessionConfigProviderOverridesWorkspaceEnv(t *testing.T) 
 		t.Fatalf("SessionEnv[CLAUDE_CONFIG_DIR] = %q, want the provider override", got)
 	}
 }
+
+// TestResolvedWorkerRuntimeResumeMergesWorkspaceEnv pins reviewer finding 1
+// on ga-xd3bjx: a workspace-declared CLAUDE_CONFIG_DIR must reach the RESUME
+// path's session env exactly as it reaches the create paths and satisfies
+// the doctor check — otherwise every sessionFromRecord relaunch resolves
+// without it and launches with the passthrough reset's empty value.
+func TestResolvedWorkerRuntimeResumeMergesWorkspaceEnv(t *testing.T) {
+	cfg := &config.City{
+		Workspace: config.Workspace{Env: map[string]string{"CLAUDE_CONFIG_DIR": "/accounts/city-default"}},
+		Providers: map[string]config.ProviderSpec{
+			"stub": {Command: "/bin/echo"},
+		},
+	}
+	resolved, err := resolvedWorkerRuntimeWithConfigAndMetadata("", cfg, session.Info{
+		Template: "stub",
+		Provider: "stub",
+		WorkDir:  "/tmp/work",
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("resolvedWorkerRuntimeWithConfigAndMetadata: %v", err)
+	}
+	if resolved == nil {
+		t.Fatal("resolver returned nil for a resolvable provider")
+	}
+	if got := resolved.SessionEnv["CLAUDE_CONFIG_DIR"]; got != "/accounts/city-default" {
+		t.Fatalf("SessionEnv[CLAUDE_CONFIG_DIR] = %q, want the workspace value on resume", got)
+	}
+}
+
+// TestResolvedWorkerRuntimeProviderNotInPATHKeepsDeclaredEnv pins reviewer
+// finding 2 on ga-xd3bjx: a provider that exists in config but whose binary
+// is missing from THIS process's PATH (cron, systemd, an upgrade window)
+// must resolve via the permissive retry and keep its declared env — the
+// env-only RESET override is only for a provider genuinely gone from
+// config, because forcing CLAUDE_CONFIG_DIR="" onto a correctly declared
+// seat is worse than the transient PATH fault.
+func TestResolvedWorkerRuntimeProviderNotInPATHKeepsDeclaredEnv(t *testing.T) {
+	cfg := &config.City{
+		Providers: map[string]config.ProviderSpec{
+			"declared": {
+				Command: "definitely-not-on-path-xyzzy",
+				Env:     map[string]string{"CLAUDE_CONFIG_DIR": "/accounts/seat"},
+			},
+		},
+	}
+	resolved, err := resolvedWorkerRuntimeWithConfigAndMetadata("", cfg, session.Info{
+		Template: "declared",
+		Provider: "declared",
+		WorkDir:  "/tmp/work",
+	}, "", nil)
+	if err != nil {
+		t.Fatalf("resolvedWorkerRuntimeWithConfigAndMetadata: %v", err)
+	}
+	if resolved == nil {
+		t.Fatal("resolver returned nil for a config-present provider with a PATH-missing binary")
+	}
+	if resolved.Command == "" {
+		t.Fatal("Command empty: the PATH-missing provider fell through to the env-only reset override")
+	}
+	if got := resolved.SessionEnv["CLAUDE_CONFIG_DIR"]; got != "/accounts/seat" {
+		t.Fatalf("SessionEnv[CLAUDE_CONFIG_DIR] = %q, want the DECLARED account preserved", got)
+	}
+}

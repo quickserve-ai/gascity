@@ -370,7 +370,7 @@ func resolvedWorkerSessionConfigWithConfig(
 	// city-level CLAUDE_CONFIG_DIR) reaches direct `gc session new` creates
 	// the same way it reaches template/API assembly, and a provider entry
 	// still overrides it (ga-xd3bjx item 3).
-	sessionEnv := mergeEnv(providerProcessPassthroughEnv(), expandEnvMap(workspaceEnv), resolved.Env)
+	sessionEnv := mergeEnv(providerProcessPassthroughEnv(), expandEnvMap(workspaceEnv), expandEnvMap(resolved.Env))
 	if strings.TrimSpace(cityPath) != "" {
 		sessionEnv = mergeEnv(sessionEnv, cityIdentityAnchorsForCity(cityPath))
 	}
@@ -641,7 +641,17 @@ func resolvedWorkerRuntimeWithConfigAndMetadata(cityPath string, cfg *config.Cit
 	// dispatcher trace path is per-dispatcher-qualified and must not be
 	// overwritten with the city-uniform default here. template_resolve.go
 	// owns the qualified override for the CLI create path.
-	sessionEnv := mergeEnv(providerProcessPassthroughEnv(), resolved.Env, cityIdentityAnchorsForCity(cityPath))
+	// Workspace.Env sits between passthrough and provider on resume too —
+	// without it, a workspace-declared CLAUDE_CONFIG_DIR passes the doctor
+	// check and the create paths but every sessionFromRecord relaunch would
+	// resolve WITHOUT it, launching with the passthrough reset's empty value
+	// (reviewer finding 1 on ga-xd3bjx). Both layers are expanded, matching
+	// template_resolve step 10 and the API session env assembly.
+	var resumeWorkspaceEnv map[string]string
+	if cfg != nil {
+		resumeWorkspaceEnv = cfg.Workspace.Env
+	}
+	sessionEnv := mergeEnv(providerProcessPassthroughEnv(), expandEnvMap(resumeWorkspaceEnv), expandEnvMap(resolved.Env), cityIdentityAnchorsForCity(cityPath))
 	if model := config.LaunchModelFromCommand(command); model != "" {
 		sessionEnv["GC_CONTEXT_LAUNCH_MODEL"] = model
 	}
@@ -930,6 +940,31 @@ func resolveWorkerRuntimeProviderWithConfigAndMetadata(cfg *config.City, info se
 			continue
 		}
 		resolved, err := config.ResolveProvider(&config.Agent{Provider: providerName}, &cfg.Workspace, cfg.Providers, exec.LookPath)
+		if err == nil {
+			return resolved, strings.TrimSpace(resolved.ProviderSessionCreateTransport())
+		}
+	}
+	// Permissive retry: the strict passes above also fail on
+	// ErrProviderNotInPATH (a reduced PATH in cron/systemd/upgrade windows),
+	// and returning nil for that case would hand the caller the env-only
+	// RESET override — actively discarding a correctly DECLARED provider env,
+	// worse than the transient PATH fault. A provider that resolves with a
+	// permissive lookPath still exists in config, so its declared env is
+	// authoritative; a relaunch with a genuinely missing binary then fails
+	// loudly at spawn, which is honest. Only a provider that is gone from
+	// config falls through to nil (ga-xd3bjx item 1, reviewer finding 2).
+	permissive := func(name string) (string, error) { return name, nil }
+	if session.UseAgentTemplateForProviderResolution(sessionKind, metadata, info.Provider, found.Provider, foundAgent) && foundAgent {
+		if resolved, err := config.ResolveProvider(&found, &cfg.Workspace, cfg.Providers, permissive); err == nil {
+			return resolved, config.ResolveSessionCreateTransport(found.Session, resolved)
+		}
+	}
+	for _, providerName := range []string{info.Provider, info.Template} {
+		providerName = strings.TrimSpace(providerName)
+		if providerName == "" {
+			continue
+		}
+		resolved, err := config.ResolveProvider(&config.Agent{Provider: providerName}, &cfg.Workspace, cfg.Providers, permissive)
 		if err == nil {
 			return resolved, strings.TrimSpace(resolved.ProviderSessionCreateTransport())
 		}

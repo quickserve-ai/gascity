@@ -80,6 +80,11 @@ func undeclaredClaudeAccountSeats(cfg *config.City) []string {
 	var out []string
 	for i := range cfg.Agents {
 		agent := &cfg.Agents[i]
+		if agent.Suspended {
+			// The reconciler never spawns a suspended seat, so the spawn
+			// guard can never refuse it; warning would be noise.
+			continue
+		}
 		// The permissive lookPath keeps this a CONFIG check: a provider whose
 		// binary is missing from doctor's PATH still has an account-declaration
 		// answer, and the ga-ai7gz2 guard fires regardless of PATH.
