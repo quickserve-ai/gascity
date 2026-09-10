@@ -25,7 +25,7 @@
 #   ~/.gc/gc-codesign-identity.env               — KEY=VALUE file (wizard output,
 #   $GC_CITY_PATH/.gc/secrets/gc-codesign-identity.env)   symlinked/real)
 # Optional alongside the identity:
-#   GC_CODESIGN_ID_NAME   codesign --identifier   (default: com.gastown.gc)
+#   GC_CODESIGN_ID_NAME   codesign --identifier   (default: com.gascity.gc)
 #   GC_CODESIGN_KEYCHAIN  keychain to search      (default: login.keychain-db)
 #
 # HARD CONSTRAINTS (ga-l8pur / ga-4v3ckk, restated by woodhouse on ga-f9dnub):
@@ -82,7 +82,7 @@ done
 
 command -v codesign >/dev/null 2>&1 || die "codesign not found (is this macOS?)"
 
-id_name="${GC_CODESIGN_ID_NAME:-com.gastown.gc}"
+id_name="${GC_CODESIGN_ID_NAME:-com.gascity.gc}"
 keychain="${GC_CODESIGN_KEYCHAIN:-login.keychain-db}"
 
 echo "sign-staged: signing $staged as '$id_name' with identity $identity (keychain $keychain)"
