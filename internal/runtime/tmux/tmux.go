@@ -329,6 +329,23 @@ func (realExecutor) executeCtx(ctx context.Context, args []string) (string, erro
 	return strings.TrimSpace(stdout.String()), nil
 }
 
+// executeCtxEnv runs tmux with an explicit child environment. runCtx routes
+// every client that can found the server through it, so a cold-started tmux
+// daemon inherits a secret-scrubbed environment instead of the controller's
+// full one (ga-fhbnmz).
+func (realExecutor) executeCtxEnv(ctx context.Context, args []string, env []string) (string, error) {
+	cmd := exec.CommandContext(ctx, "tmux", args...)
+	cmd.Env = env
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err != nil {
+		return "", wrapError(err, stderr.String(), args)
+	}
+	return strings.TrimSpace(stdout.String()), nil
+}
+
 // Tmux wraps tmux operations.
 type Tmux struct {
 	cfg                  Config
@@ -406,6 +423,19 @@ func (t *Tmux) approvalDedup() *approvalDedup {
 // context is composed with tmuxSubprocessTimeout so a wedged tmux server
 // or fork-blocked host cannot hang the call indefinitely. When the parent
 // already has an earlier deadline, that earlier deadline wins.
+//
+// On a named socket, a command that can found the server runs with a
+// secret-scrubbed environment (ga-fhbnmz). A tmux server keeps the environment
+// of the client that forked it, as its own process environment and as its
+// global environment (`show-environment -g`), for as long as the city runs.
+// Staging secret session env through a command file (runNewSession) keeps
+// those values out of argv, but not the founding client's ambient credentials
+// out of the server. Only secret-classified names are removed (IsSecretEnvKey),
+// so PATH, locale and socket discovery (TMUX_TMPDIR) are untouched, and a
+// session that needs a secret receives it through its own -e values, never by
+// server inheritance. Commands that cannot start a server are not scrubbed,
+// and neither is the user's default server (no socket name), which
+// probeServerAlive leaves alone for the same reason.
 func (t *Tmux) runCtx(ctx context.Context, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, tmuxSubprocessTimeout)
 	defer cancel()
@@ -414,7 +444,48 @@ func (t *Tmux) runCtx(ctx context.Context, args ...string) (string, error) {
 		allArgs = append(allArgs, "-L", t.cfg.SocketName)
 	}
 	allArgs = append(allArgs, args...)
+	if ee, ok := t.exec.(envExecutor); ok && t.cfg.SocketName != "" && tmuxArgsCanStartServer(args) {
+		return ee.executeCtxEnv(ctx, allArgs, scrubSecretEnviron(os.Environ()))
+	}
 	return t.exec.executeCtx(ctx, allArgs)
+}
+
+// tmuxServerStartingCommands are the tmux commands that start a server when
+// none is listening. Measured against tmux 3.6a: new-session and attach-session
+// fork one (attach-session's "no sessions" reply comes from the server it just
+// started), start-server forks one that exits again when it holds no session,
+// and has-session, source-file and set-environment only ever report that no
+// server is running.
+var tmuxServerStartingCommands = []string{"new-session", "start-server", "attach-session"}
+
+// tmuxArgsCanStartServer reports whether a tmux command list — commands
+// separated by ";" elements, as runNewSession issues them — holds a command that
+// can start the server. tmux accepts aliases and unambiguous abbreviations of a
+// command name (new, start, attach), so a command word counts when it prefixes
+// one of tmuxServerStartingCommands. Over-matching is harmless: scrubbing a
+// client that founds nothing changes nothing. An empty list is tmux's default
+// command, new-session.
+func tmuxArgsCanStartServer(args []string) bool {
+	if len(args) == 0 {
+		return true
+	}
+	commandWord := true
+	for _, arg := range args {
+		if arg == ";" {
+			commandWord = true
+			continue
+		}
+		if !commandWord {
+			continue
+		}
+		commandWord = false
+		for _, starting := range tmuxServerStartingCommands {
+			if strings.HasPrefix(starting, arg) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // run executes a tmux command and returns stdout. All commands include -u
@@ -618,16 +689,20 @@ func validateUnsetEnvKeys(env map[string]string) error {
 // SURVIVE into later processes, rather than only applying to the command tmux
 // execs first.
 //
-// That is controller-scope credentials plus the BEADS_ namespace. A selected
-// workspace can pin any current or future BEADS_ key empty to prevent ambient
-// state from redirecting it, and a warm respawn must retain that choice. The
-// other keys a session env pins empty — CLAUDECODE, CLAUDE_CODE_ENTRYPOINT, the
-// CODEX_ pair — are nesting-detection flags, not authority: the `env -u` prefix
-// already gives them the behavior they need on the launched command.
+// That is controller-scope credentials, the Claude account selector, and the
+// BEADS_ namespace. A selected workspace can pin any current or future BEADS_
+// key empty to prevent ambient state from redirecting it, and a warm respawn
+// must retain that choice. processenv.ClaudeAccountEnvKey is pinned empty for
+// every session whose config declares no account (ga-ai7gz2), and it is
+// authority too: a respawned pane that saw the server's value would bill the
+// controller's own account. The other keys a session env pins empty —
+// CLAUDECODE, CLAUDE_CODE_ENTRYPOINT, the CODEX_ pair — are nesting-detection
+// flags, not authority: the `env -u` prefix already gives them the behavior
+// they need on the launched command.
 func durableWithholdKeys(env map[string]string) []string {
 	var keys []string
 	for _, k := range sessionEnvUnsetKeys(env) {
-		if processenv.IsControllerOnlyEnv(k) || strings.HasPrefix(k, "BEADS_") {
+		if processenv.IsControllerOnlyEnv(k) || k == processenv.ClaudeAccountEnvKey || strings.HasPrefix(k, "BEADS_") {
 			keys = append(keys, k)
 		}
 	}
@@ -694,6 +769,10 @@ func (t *Tmux) markSessionEnvRemoved(session string, keys []string) error {
 // reach the command line: the whole new-session command is staged through a
 // private file instead — see [Tmux.runNewSession]. The session environment tmux
 // ends up holding is identical either way.
+//
+// The client that issues the new-session can be the one that founds the tmux
+// server, so on a named socket it runs with a secret-scrubbed environment (see
+// [Tmux.runCtx]); the session's declared values still arrive through -e.
 func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env map[string]string) error {
 	if err := validateSessionName(name); err != nil {
 		return err
