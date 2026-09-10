@@ -239,7 +239,7 @@ description = "repo={{repo}} head_sha={{head_sha}}"
 		t.Fatalf("ListByLabel: %v", err)
 	}
 	if len(roots) == 0 {
-		t.Fatal("no wisp root labelled order-run:pr-review-formula")
+		t.Fatal("no wisp root labeled order-run:pr-review-formula")
 	}
 	root := roots[0]
 	if got := root.Metadata["gc.var.repo"]; got != "octo/demo" {
