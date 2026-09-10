@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A managed Dolt server that stops is now attributed instead of silent.** The
+  scope watchdog no longer reports every status-0 exit of its `dolt sql-server`
+  as "exited cleanly": gc's stop paths record a stop-intent marker beside the
+  server's config file first, so an exit covered by one names its requester,
+  and an exit nobody asked for raises a CRITICAL alarm into the city emergency
+  spool and `.gc/events.jsonl`. A stop signal delivered to the watchdog itself
+  is graded the same way — covered by a live marker it stays quiet, uncovered
+  it escalates CRITICAL with everything that narrows the sender (the sending
+  PID is not recoverable through `os/signal`). Under the installed supervisor
+  service the one-line escalation summary also reaches `~/.gc/supervisor.log`.
+  gc's own startup-failure teardown records an intent, so a readiness timeout
+  no longer raises a false alarm, and a stop that FAILS clears its marker so it
+  cannot vouch for a later unexpected exit of a still-live server.
+
 - **Cross-scope bead commands no longer resurrect a parent's Dolt endpoint.**
   Cleared host, port, and managed-local marker values remain explicit through
   subprocess environment overlays, preventing a rig's remote host from being

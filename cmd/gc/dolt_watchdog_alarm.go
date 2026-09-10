@@ -2,17 +2,35 @@ package main
 
 // Durable escalation for scope-watchdog data-plane stops (ga-drkbcd).
 //
-// WHY NOT supervisor.log, WHICH THE BEAD ASKED FOR. ~/.gc/supervisor.log is the
-// supervisor process's own teed stdout/stderr (cmd_supervisor.go), machine-
-// scoped rather than city-scoped, with no append helper and no reader but
-// `gc supervisor logs | tail`. The watchdog is a different process with a
-// different lifetime; appending to another component's rotating fd would buy
-// reach into a file nothing parses.
+// SUPERVISOR.LOG, WHICH THE BEAD ASKED FOR. ~/.gc/supervisor.log is machine-
+// scoped rather than city-scoped and is rotated by the supervisor's own start
+// path, so the watchdog must never open it by NAME: an appender holding the old
+// fd across a rotation writes into the archived inode. What it can safely have
+// is the fd its spawner already holds. Under the installed service the
+// supervisor's own stdout/stderr ARE that file (launchd StandardOutPath /
+// StandardErrorPath, systemd StandardOutput=append:), the CityRuntime that
+// starts managed dolt runs inside the supervisor process, and rotation is a
+// rename — so a duplicate of that fd keeps pointing at the same open file the
+// supervisor is writing, with no name lookup and no second opener.
 //
-// The watchdog's own dolt.log lines are worse: a repo-wide search for
-// "gc scope watchdog" finds only the Fprintf sites that write them. They are
-// write-only forensics. That is precisely how the 2026-08-15 outage stayed
-// silent — the evidence existed and no mechanism carried it anywhere.
+// The watchdog's own two standard streams cannot carry it: its stderr is
+// redirected into dolt.log at spawn, and its stdout is the PID-handshake pipe
+// the spawner closes as soon as the handshake is read (writing there later
+// risks EPIPE on fd 1, which kills the process holding the town's database).
+// So the spawner passes the channel explicitly as an extra inherited fd, and
+// only when that fd is a REGULAR FILE — never a pipe or a tty, because the
+// watchdog outlives its spawner and a pipe write end it held open would wedge
+// whoever is reading the other end.
+//
+// This is a summary line, not the record: the durable record is the emergency
+// spool below. dolt.log keeps the full detail.
+//
+// WHY A SUMMARY IS NOT ENOUGH ON ITS OWN. The watchdog's dolt.log lines reach
+// nobody: a repo-wide search for "gc scope watchdog" finds only the Fprintf
+// sites that write them. They are write-only forensics — precisely how the
+// 2026-08-15 outage stayed silent, with the evidence on disk and no mechanism
+// carrying it anywhere. The supervisor-log summary above is a second copy for
+// the plane an operator already watches, never the record itself.
 //
 // WHAT IS ACTUALLY READ. The city event log, .gc/events.jsonl, and the
 // dolt-independent emergency spool that feeds it (internal/emergency). The
@@ -33,6 +51,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/emergency"
 )
@@ -40,6 +60,70 @@ import (
 // managedDoltWatchdogAlarmActor is the emergency-record actor for every alarm
 // raised by the scope watchdog, so the records are greppable as a class.
 const managedDoltWatchdogAlarmActor = "dolt-scope-watchdog"
+
+const (
+	// managedDoltWatchdogSupervisorFDEnv marks the extra inherited fd the
+	// spawner handed the watchdog for supervisor-plane escalation summaries.
+	// The declaration is what makes adopting the fd safe: a watchdog started
+	// any other way (a hand-run re-exec) may have an unrelated fd 3, and must
+	// not write an alarm into it.
+	managedDoltWatchdogSupervisorFDEnv = "GC_DOLT_WATCHDOG_SUPERVISOR_FD"
+
+	// managedDoltWatchdogSupervisorFD is where exec places the first entry of
+	// cmd.ExtraFiles: 0, 1 and 2 are the child's standard streams.
+	managedDoltWatchdogSupervisorFD = 3
+)
+
+// managedDoltWatchdogSupervisorChannel is the adopted escalation channel inside
+// the watchdog process, or nil when it was handed none. Package-level because
+// the alarm sites are reached from the supervise loop with no plumbing between
+// them, and because a test needs to install one.
+var managedDoltWatchdogSupervisorChannel *os.File
+
+// managedDoltWatchdogSupervisorChannelForSpawn returns the file a spawner may
+// hand the watchdog as its escalation channel, or nil. Only a regular file
+// qualifies — see the file header: a pipe or tty would tie the spawner's
+// readers (or an operator's terminal) to the watchdog's whole lifetime.
+func managedDoltWatchdogSupervisorChannelForSpawn(stderr *os.File) *os.File {
+	if stderr == nil {
+		return nil
+	}
+	info, err := stderr.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return nil
+	}
+	return stderr
+}
+
+// adoptManagedDoltWatchdogSupervisorChannel picks up the inherited escalation
+// fd inside the re-exec'd watchdog. The fd is re-checked with a raw fstat
+// BEFORE any *os.File wraps it, so a declaration that does not match reality
+// yields no channel — and no wrapper whose finalizer would close a descriptor
+// this process does not own. It is then close-on-exec'd so the dolt sql-server
+// the watchdog spawns never inherits a handle on the supervisor's log.
+func adoptManagedDoltWatchdogSupervisorChannel(env string) *os.File {
+	fd, err := strconv.Atoi(strings.TrimSpace(env))
+	if err != nil || fd < managedDoltWatchdogSupervisorFD {
+		return nil
+	}
+	var stat syscall.Stat_t
+	if err := syscall.Fstat(fd, &stat); err != nil || stat.Mode&syscall.S_IFMT != syscall.S_IFREG {
+		return nil
+	}
+	syscall.CloseOnExec(fd)
+	return os.NewFile(uintptr(fd), "gc-supervisor-escalation")
+}
+
+// writeManagedDoltWatchdogSupervisorSummary puts one line about a data-plane
+// stop where the supervisor plane captures it. Best-effort and never fatal: an
+// escalation summary that cannot be written must not disturb the stop it
+// reports, and the durable record is the emergency spool regardless.
+func writeManagedDoltWatchdogSupervisorSummary(line string) {
+	if managedDoltWatchdogSupervisorChannel == nil || strings.TrimSpace(line) == "" {
+		return
+	}
+	fmt.Fprintf(managedDoltWatchdogSupervisorChannel, "%s %s\n", time.Now().UTC().Format(time.RFC3339), line) //nolint:errcheck // best-effort escalation
+}
 
 // managedDoltWatchdogAlarm is one escalation request.
 type managedDoltWatchdogAlarm struct {

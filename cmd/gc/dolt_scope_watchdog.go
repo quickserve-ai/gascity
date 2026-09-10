@@ -141,6 +141,16 @@ func startManagedDoltSQLServerWithScopeWatchdog(cityPath, configFile, logFilePat
 	cmd.Stdin = nil
 	cmd.SysProcAttr = managedDoltSQLServerSysProcAttr()
 	cmd.Env = doltServerEnv(cityPath, os.Environ())
+	// ga-drkbcd R1: hand the watchdog a duplicate of our own stderr when — and
+	// only when — it is a regular file. Under the installed supervisor service
+	// that file is ~/.gc/supervisor.log and this process is the supervisor, so
+	// the escalation summary for a data-plane stop lands where the supervisor
+	// plane already captures everything else. See dolt_watchdog_alarm.go for why
+	// neither of the watchdog's own standard streams can carry it.
+	if channel := managedDoltWatchdogSupervisorChannelForSpawn(os.Stderr); channel != nil {
+		cmd.ExtraFiles = []*os.File{channel}
+		cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%d", managedDoltWatchdogSupervisorFDEnv, managedDoltWatchdogSupervisorFD))
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return managedDoltStartedProcess{}, fmt.Errorf("prepare dolt scope watchdog: %w", err)
@@ -196,6 +206,11 @@ func runManagedDoltScopeWatchdog(args []string, stdout, stderr *os.File) int {
 		return 1
 	}
 	defer logFile.Close() //nolint:errcheck
+
+	// ga-drkbcd R1: adopt the supervisor-plane escalation channel our spawner
+	// declared, before the dolt child is spawned (the adoption sets close-on-exec
+	// so the server never inherits it).
+	managedDoltWatchdogSupervisorChannel = adoptManagedDoltWatchdogSupervisorChannel(os.Getenv(managedDoltWatchdogSupervisorFDEnv))
 
 	cmd := exec.Command("dolt", "sql-server", "--config", configFile)
 	cmd.Stdout = logFile
@@ -346,6 +361,9 @@ func observeManagedDoltWatchdogChildExit(pid int, configFile, logFilePath string
 // city emergency spool and events.jsonl, where automation can see it. dolt.log
 // alone is not an alarm: nothing in the repo reads it.
 func reportManagedDoltWatchdogExitAlarm(logFile *os.File, cityPath, configFile string, report managedDoltWatchdogExitReport, doltPID int) {
+	if len(report.Lines) > 0 {
+		writeManagedDoltWatchdogSupervisorSummary(report.Lines[0])
+	}
 	spoolPath, err := escalateManagedDoltWatchdogAlarm(managedDoltWatchdogAlarm{
 		CityPath:   cityPath,
 		ConfigFile: configFile,
@@ -361,22 +379,34 @@ func reportManagedDoltWatchdogExitAlarm(logFile *os.File, cityPath, configFile s
 	fmt.Fprintf(logFile, "gc scope watchdog: ALARM UNEXPECTED CLEAN EXIT: escalated to the emergency spool at %s and to .gc/events.jsonl\n", spoolPath) //nolint:errcheck
 }
 
-// reportManagedDoltWatchdogStopSignal escalates a stop signal delivered to the
-// watchdog. gc's own stop paths signal the dolt PID directly and never the
-// watchdog, so a signal arriving here is by construction externally sourced and
-// worth a durable record — warn rather than critical, because unlike an
-// unexpected clean exit somebody did deliberately ask for this stop, even if we
-// cannot say who.
+// reportManagedDoltWatchdogStopSignal grades and escalates a stop signal
+// delivered to the watchdog (ga-drkbcd ask A, R2). gc's own stop paths signal
+// the dolt PID directly, and its startup-failure cleanup signals the watchdog
+// as well — both record a stop-intent marker first. So the same question the
+// exit path asks decides this one: a signal covered by a live marker is a stop
+// we asked for (info), and a signal nothing explains is the database going down
+// with no attribution (critical, the same class as an unexpected clean exit).
 func reportManagedDoltWatchdogStopSignal(logFile *os.File, cityPath, configFile string, attribution managedDoltSignalAttribution, doltPID int) {
-	message := fmt.Sprintf(
-		"managed dolt sql-server pid %d is being stopped by an external %s delivered to its scope watchdog (watchdog pid %d ppid %d); the sending pid is not recoverable through os/signal — see the stop signal attribution lines in dolt.log",
-		doltPID, attribution.Signal, attribution.PID, attribution.PPID)
+	intent, intentFound := readManagedDoltStopIntent(configFile)
+	report := classifyManagedDoltWatchdogStopSignal(managedDoltWatchdogStopSignal{
+		Attribution: attribution,
+		DoltPID:     doltPID,
+		Intent:      intent,
+		IntentFound: intentFound,
+		Now:         time.Now(),
+	})
+	for _, line := range report.Lines {
+		fmt.Fprintln(logFile, line) //nolint:errcheck
+	}
+	if !report.Covered && len(report.Lines) > 0 {
+		writeManagedDoltWatchdogSupervisorSummary(report.Lines[0])
+	}
 	spoolPath, err := escalateManagedDoltWatchdogAlarm(managedDoltWatchdogAlarm{
 		CityPath:   cityPath,
 		ConfigFile: configFile,
-		Severity:   emergency.SeverityWarn,
-		Cause:      "external-stop-signal",
-		Message:    message,
+		Severity:   report.Severity,
+		Cause:      report.Cause,
+		Message:    report.Message,
 		DoltPID:    doltPID,
 	})
 	if err != nil {

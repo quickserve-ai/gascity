@@ -122,8 +122,14 @@ func classifyManagedDoltWatchdogChildExit(exit managedDoltWatchdogChildExit) man
 		}
 	}
 
+	// The recovery clause is load-bearing and must not overstate: this watchdog
+	// has NO restart path — it exits with its server. What brings the data
+	// plane back is the next CityRuntime tick's managed-dolt health check
+	// (ensureManagedDoltPublishedForRuntime), which only runs while a city is
+	// being supervised; a server started outside one stays down until an
+	// operator starts it.
 	alarmMessage := fmt.Sprintf(
-		"managed dolt sql-server pid %d exited with status 0 after %s with no stop request from gc: the data plane is DOWN until the watchdog restarts it (watchdog pid %d, config %s)",
+		"managed dolt sql-server pid %d exited with status 0 after %s with no stop request from gc: the data plane is DOWN and this watchdog does NOT restart it — recovery waits for the next gc city tick to notice the port is unresolvable and start a new server, and never happens at all without one (watchdog pid %d, config %s)",
 		exit.PID, uptime, exit.WatchdogPID, exit.ConfigFile)
 	lines := []string{
 		managedDoltWatchdogLogPrefix + " ALARM UNEXPECTED CLEAN EXIT: " + alarmMessage,

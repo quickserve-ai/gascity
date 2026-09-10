@@ -39,10 +39,13 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/emergency"
 )
 
 const (
@@ -189,7 +192,7 @@ func filterManagedDoltLifecycleActorLines(rows map[int]psProcessRow, selfPID, li
 		}
 		pids = append(pids, pid)
 	}
-	sortInts(pids)
+	slices.Sort(pids)
 	lines := make([]string, 0, min(limit, len(pids)))
 	for _, pid := range pids {
 		if len(lines) == limit {
@@ -202,11 +205,80 @@ func filterManagedDoltLifecycleActorLines(rows map[int]psProcessRow, selfPID, li
 	return lines
 }
 
-func sortInts(values []int) {
-	for i := 1; i < len(values); i++ {
-		for j := i; j > 0 && values[j] < values[j-1]; j-- {
-			values[j], values[j-1] = values[j-1], values[j]
+// --- coverage: is this stop signal one gc asked for? ------------------------
+//
+// A signal delivered to the watchdog takes the data plane down just as surely
+// as a status-0 exit does, so it is graded by the same question the exit path
+// asks: does a live stop-intent marker explain it?
+//
+//   - COVERED — gc's own startup-failure cleanup signals the dolt PID and the
+//     watchdog PID together (terminateManagedDoltStartedProcess), having first
+//     recorded a marker for the server. That is a stop we asked for: info, and
+//     no alarm wording.
+//   - UNCOVERED — nothing gc did explains it. The database is going down and we
+//     cannot say who asked, which is the same operational class as an
+//     unexpected clean exit: CRITICAL.
+//
+// The marker names the dolt PID rather than the watchdog PID because that is
+// the process a stop targets; the watchdog is signalled only as its supervisor.
+
+// managedDoltWatchdogStopSignalCause values name the two outcomes in the
+// emergency record's metadata, so a reader can split them with one grep.
+const (
+	managedDoltStopSignalCauseExternal  = "external-stop-signal"
+	managedDoltStopSignalCauseRequested = "requested-stop-signal"
+)
+
+// managedDoltWatchdogStopSignal is the evidence available when a stop signal
+// reaches the watchdog.
+type managedDoltWatchdogStopSignal struct {
+	Attribution managedDoltSignalAttribution
+	DoltPID     int
+	Intent      managedDoltStopIntent
+	IntentFound bool
+	Now         time.Time
+}
+
+// managedDoltWatchdogStopSignalReport is the grading plus what to say and spool
+// about it.
+type managedDoltWatchdogStopSignalReport struct {
+	Covered  bool
+	Severity string
+	Cause    string
+	Message  string
+	Lines    []string
+}
+
+// classifyManagedDoltWatchdogStopSignal grades a stop signal. Pure — every
+// input is already in sig — so the covered/uncovered rule is testable without
+// signals, processes or files, exactly like the exit-path rule it mirrors.
+func classifyManagedDoltWatchdogStopSignal(sig managedDoltWatchdogStopSignal) managedDoltWatchdogStopSignalReport {
+	if sig.IntentFound && managedDoltStopIntentCovers(sig.Intent, sig.DoltPID, sig.Now) {
+		requester := describeManagedDoltStopIntent(sig.Intent)
+		message := fmt.Sprintf(
+			"managed dolt sql-server pid %d is being stopped by a %s delivered to its scope watchdog (watchdog pid %d), covered by a gc stop intent (%s)",
+			sig.DoltPID, sig.Attribution.Signal, sig.Attribution.PID, requester)
+		return managedDoltWatchdogStopSignalReport{
+			Covered:  true,
+			Severity: emergency.SeverityInfo,
+			Cause:    managedDoltStopSignalCauseRequested,
+			Message:  message,
+			Lines: []string{
+				fmt.Sprintf("gc scope watchdog: stop signal attribution: this signal is covered by a gc stop intent (%s); recording it as requested rather than alarming", requester),
+			},
 		}
+	}
+	message := fmt.Sprintf(
+		"managed dolt sql-server pid %d is being stopped by an external %s delivered to its scope watchdog (watchdog pid %d ppid %d) with no stop request from gc: the data plane is going DOWN and the sending pid is not recoverable through os/signal — see the stop signal attribution lines in dolt.log",
+		sig.DoltPID, sig.Attribution.Signal, sig.Attribution.PID, sig.Attribution.PPID)
+	return managedDoltWatchdogStopSignalReport{
+		Severity: emergency.SeverityCritical,
+		Cause:    managedDoltStopSignalCauseExternal,
+		Message:  message,
+		Lines: []string{
+			"gc scope watchdog: ALARM EXTERNAL STOP SIGNAL: " + message,
+			"gc scope watchdog: ALARM EXTERNAL STOP SIGNAL: no gc stop intent covers this signal; a stop of the database nobody asked for is never routine",
+		},
 	}
 }
 

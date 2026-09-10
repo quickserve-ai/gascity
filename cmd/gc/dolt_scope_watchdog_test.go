@@ -478,6 +478,21 @@ func waitForWatchdogLogText(t *testing.T, logPath, want string, timeout time.Dur
 // through the helper process and returns (doltPID, watchdogPID, cityPath).
 func runScopeWatchdogHelper(t *testing.T, fakeDoltDir, dir, configPath, logPath string) (int, int, string) {
 	t.Helper()
+	return runScopeWatchdogHelperWithSupervisorLog(t, fakeDoltDir, dir, configPath, logPath, "")
+}
+
+// runScopeWatchdogHelperWithSupervisorLog is runScopeWatchdogHelper with the
+// spawner's stdout/stderr pointed at a REGULAR FILE, which is the production
+// shape under the installed supervisor service (launchd StandardErrorPath /
+// systemd StandardError=append:, both ~/.gc/supervisor.log). Passing "" keeps
+// the pipe-backed CombinedOutput shape used by every other helper caller.
+//
+// The distinction matters: the supervisor-plane escalation channel is an
+// inherited fd on the spawner's stderr, and the watchdog outlives its spawner,
+// so it is only ever handed a regular file — a pipe write end held open by a
+// long-lived grandchild would wedge whoever is reading the other end.
+func runScopeWatchdogHelperWithSupervisorLog(t *testing.T, fakeDoltDir, dir, configPath, logPath, supervisorLogPath string) (int, int, string) {
+	t.Helper()
 	statePath := filepath.Join(dir, "state")
 	cityPath := filepath.Join(dir, "city")
 	if err := os.MkdirAll(cityPath, 0o755); err != nil {
@@ -493,9 +508,24 @@ func runScopeWatchdogHelper(t *testing.T, fakeDoltDir, dir, configPath, logPath 
 		"GC_TEST_MANAGED_DOLT_HELPER_FAKE_DOLT_DIR="+fakeDoltDir,
 		"GC_TEST_MANAGED_DOLT_HELPER_SCOPE_WD_INTERVAL_MS=50",
 	)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("helper failed: %v\n%s", err, output)
+	if supervisorLogPath == "" {
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("helper failed: %v\n%s", err, output)
+		}
+	} else {
+		file, err := os.OpenFile(supervisorLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			t.Fatalf("open stand-in supervisor log: %v", err)
+		}
+		cmd.Stdout = file
+		cmd.Stderr = file
+		runErr := cmd.Run()
+		_ = file.Close()
+		if runErr != nil {
+			output, _ := os.ReadFile(supervisorLogPath)
+			t.Fatalf("helper failed: %v\n%s", runErr, output)
+		}
 	}
 	doltPID, watchdogPID := readManagedDoltTestState(t, statePath)
 	t.Cleanup(func() {
@@ -503,6 +533,46 @@ func runScopeWatchdogHelper(t *testing.T, fakeDoltDir, dir, configPath, logPath 
 		cleanupManagedDoltTestPID(t, watchdogPID)
 	})
 	return doltPID, watchdogPID, cityPath
+}
+
+// waitForFileText polls path until want appears in it.
+func waitForFileText(t *testing.T, path, want string, timeout time.Duration) string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		data, _ := os.ReadFile(path)
+		if strings.Contains(string(data), want) {
+			return string(data)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s never contained %q within %s; content:\n%s", path, want, timeout, data)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// readManagedDoltEmergencySpoolRecord returns the one emergency record the
+// watchdog spooled under cityPath.
+func readManagedDoltEmergencySpoolRecord(t *testing.T, cityPath string) string {
+	t.Helper()
+	spoolDir := filepath.Join(cityPath, ".gc", "emergency")
+	entries, err := os.ReadDir(spoolDir)
+	if err != nil {
+		t.Fatalf("read emergency spool: %v", err)
+	}
+	for _, entry := range entries {
+		// .tmp files are the atomic write's in-flight staging names.
+		if !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(spoolDir, entry.Name()))
+		if err != nil {
+			t.Fatalf("read emergency record: %v", err)
+		}
+		return string(data)
+	}
+	t.Fatalf("no emergency spool record under %s; entries=%v", spoolDir, entries)
+	return ""
 }
 
 // TestManagedDoltScopeWatchdogAlarmsOnUnexpectedCleanExit is the ga-drkbcd
@@ -665,6 +735,16 @@ func TestManagedDoltScopeWatchdogAttributesAnExternalStopSignal(t *testing.T) {
 			t.Errorf("signal attribution missing %q; log:\n%s", want, logData)
 		}
 	}
+	// ga-drkbcd R2: an external stop nobody asked for is the same operational
+	// class as an unexpected clean exit — the data plane goes down and no gc
+	// stop explains it — so it escalates CRITICAL, not warn.
+	waitForWatchdogLogText(t, logPath, "escalated to the emergency spool at", 15*time.Second)
+	spoolData := readManagedDoltEmergencySpoolRecord(t, cityPath)
+	for _, want := range []string{`"severity": "critical"`, "external-stop-signal", managedDoltWatchdogAlarmActor} {
+		if !strings.Contains(spoolData, want) {
+			t.Errorf("emergency record for an uncovered external stop signal missing %q:\n%s", want, spoolData)
+		}
+	}
 	// The snapshot must at least see the dolt server it supervises; a snapshot
 	// that saw nothing would be indistinguishable from one that never ran.
 	if !strings.Contains(logData, "lifecycle actor") && !strings.Contains(logData, "ancestry[") {
@@ -682,5 +762,166 @@ func TestManagedDoltScopeWatchdogAttributesAnExternalStopSignal(t *testing.T) {
 			t.Fatalf("the external stop signal never reached the city event log:\n%s\nwatchdog log:\n%s", data, logData)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestManagedDoltScopeWatchdogQuietOnAStopSignalCoveredByIntent is the other
+// half of ga-drkbcd R2. gc's own startup-failure teardown signals the dolt PID
+// AND the watchdog PID, so the watchdog's signal path sees a stop gc asked for
+// just as often as the exit path does. A signal covered by a live stop-intent
+// marker must therefore stay quiet — otherwise the CRITICAL that an uncovered
+// signal now raises would fire on gc's own routine cleanup.
+func TestManagedDoltScopeWatchdogQuietOnAStopSignalCoveredByIntent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX signal semantics required")
+	}
+	dir := t.TempDir()
+	fakeDoltDir := writeFakeDoltSQLServer(t)
+	configPath := filepath.Join(dir, "dolt-config.yaml")
+	logPath := filepath.Join(dir, "dolt.log")
+	if err := os.WriteFile(configPath, []byte("log_level: debug\n"), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	doltPID, watchdogPID, cityPath := runScopeWatchdogHelper(t, fakeDoltDir, dir, configPath, logPath)
+	waitForWatchdogLogText(t, logPath, "supervising dolt sql-server", 10*time.Second)
+
+	// The gc-side shape: record the intent for the server, then signal the
+	// watchdog — exactly what terminateManagedDoltStartedProcess does.
+	if err := recordManagedDoltStopIntent(configPath, doltPID, "gc managed dolt startup-failure cleanup"); err != nil {
+		t.Fatalf("record stop intent: %v", err)
+	}
+	if err := syscall.Kill(watchdogPID, syscall.SIGTERM); err != nil {
+		t.Fatalf("signal watchdog: %v", err)
+	}
+
+	logData := waitForWatchdogLogText(t, logPath, "covered by a gc stop intent", 15*time.Second)
+	if strings.Contains(logData, "ALARM") {
+		t.Errorf("a stop signal covered by a gc stop intent raised an alarm; log:\n%s", logData)
+	}
+	if !strings.Contains(logData, "gc managed dolt startup-failure cleanup") {
+		t.Errorf("the covered stop signal did not name its requester; log:\n%s", logData)
+	}
+
+	eventPath := filepath.Join(cityPath, ".gc", "events.jsonl")
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		data, _ := os.ReadFile(eventPath)
+		if strings.Contains(string(data), "requested-stop-signal") {
+			break
+		}
+		if strings.Contains(string(data), "external-stop-signal") {
+			t.Fatalf("a covered stop signal was recorded as an external one:\n%s", data)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the covered stop signal never reached the city event log:\n%s\nwatchdog log:\n%s", data, logData)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	spoolData := readManagedDoltEmergencySpoolRecord(t, cityPath)
+	if strings.Contains(spoolData, `"severity": "critical"`) {
+		t.Errorf("a covered stop signal was spooled as critical:\n%s", spoolData)
+	}
+	if !strings.Contains(spoolData, `"severity": "info"`) {
+		t.Errorf("emergency record for a covered stop signal is not info severity:\n%s", spoolData)
+	}
+}
+
+// TestManagedDoltScopeWatchdogEscalationReachesTheSupervisorLog is the
+// ga-drkbcd R1 regression. dolt.log is write-only forensics — nothing reads it
+// — so the escalation summary has to land somewhere the supervisor plane
+// captures. The watchdog's own stdout and stderr cannot carry it (stderr is
+// redirected into dolt.log at spawn; stdout is the PID-handshake pipe the
+// spawner closes), so the spawner hands the watchdog an inherited fd on its own
+// stderr, which under the installed supervisor service IS ~/.gc/supervisor.log.
+// This test stands in for that service by pointing the spawner's stdout/stderr
+// at a regular file.
+func TestManagedDoltScopeWatchdogEscalationReachesTheSupervisorLog(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX process semantics required")
+	}
+	dir := t.TempDir()
+	fakeDoltDir := writeScriptedFakeDoltSQLServer(t, "echo 'INFO dolt: leaving'\nsleep 1\nexit 0\n")
+	configPath := filepath.Join(dir, "dolt-config.yaml")
+	logPath := filepath.Join(dir, "dolt.log")
+	supervisorLog := filepath.Join(dir, "supervisor.log")
+	if err := os.WriteFile(configPath, []byte("log_level: debug\n"), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	doltPID, _, _ := runScopeWatchdogHelperWithSupervisorLog(t, fakeDoltDir, dir, configPath, logPath, supervisorLog)
+
+	summary := waitForFileText(t, supervisorLog, "ALARM UNEXPECTED CLEAN EXIT", 20*time.Second)
+	if !strings.Contains(summary, fmt.Sprintf("pid %d exited with status 0", doltPID)) {
+		t.Errorf("the supervisor-log escalation summary does not name the server that exited; content:\n%s", summary)
+	}
+	if !strings.Contains(summary, "no stop request from gc") {
+		t.Errorf("the supervisor-log escalation summary does not say why it alarmed; content:\n%s", summary)
+	}
+}
+
+// TestManagedDoltWatchdogSupervisorChannelTakesOnlyARegularFile pins the rule
+// that keeps the ga-drkbcd R1 channel safe. The watchdog outlives its spawner,
+// so the only kind of descriptor it may hold is one that stays writable and
+// costs nothing to keep open: a regular file (under the installed service,
+// ~/.gc/supervisor.log). A pipe would tie whoever reads it to the watchdog's
+// whole lifetime; an undeclared fd is not ours to write into at all.
+func TestManagedDoltWatchdogSupervisorChannelTakesOnlyARegularFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX fd semantics required")
+	}
+	logPath := filepath.Join(t.TempDir(), "supervisor.log")
+	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatalf("create stand-in supervisor log: %v", err)
+	}
+	defer file.Close() //nolint:errcheck
+
+	if managedDoltWatchdogSupervisorChannelForSpawn(file) == nil {
+		t.Error("a regular file was refused as the escalation channel")
+	}
+	if managedDoltWatchdogSupervisorChannelForSpawn(nil) != nil {
+		t.Error("a nil stderr produced a channel")
+	}
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	defer reader.Close() //nolint:errcheck
+	defer writer.Close() //nolint:errcheck
+	if managedDoltWatchdogSupervisorChannelForSpawn(writer) != nil {
+		t.Error("a pipe was accepted as the escalation channel; the watchdog would hold its write end for the life of the scope")
+	}
+
+	if adoptManagedDoltWatchdogSupervisorChannel("") != nil {
+		t.Error("adopted a channel with no declaration")
+	}
+	if adoptManagedDoltWatchdogSupervisorChannel("2") != nil {
+		t.Error("adopted a standard stream as the escalation channel")
+	}
+	if adoptManagedDoltWatchdogSupervisorChannel("not-a-number") != nil {
+		t.Error("adopted a channel from an unparseable declaration")
+	}
+	if adoptManagedDoltWatchdogSupervisorChannel(strconv.Itoa(int(writer.Fd()))) != nil {
+		t.Error("adopted a declared fd that is a pipe rather than a regular file")
+	}
+
+	orig := managedDoltWatchdogSupervisorChannel
+	t.Cleanup(func() { managedDoltWatchdogSupervisorChannel = orig })
+	managedDoltWatchdogSupervisorChannel = nil
+	writeManagedDoltWatchdogSupervisorSummary("dropped: there is no channel") // must not panic
+
+	managedDoltWatchdogSupervisorChannel = file
+	writeManagedDoltWatchdogSupervisorSummary("gc scope watchdog: ALARM UNEXPECTED CLEAN EXIT: the data plane is DOWN")
+	writeManagedDoltWatchdogSupervisorSummary("   ")
+	written, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read stand-in supervisor log: %v", err)
+	}
+	if !strings.Contains(string(written), "ALARM UNEXPECTED CLEAN EXIT") {
+		t.Errorf("the escalation summary did not reach the channel: %q", written)
+	}
+	if strings.Count(string(written), "\n") != 1 {
+		t.Errorf("expected exactly one summary line (a blank summary must be dropped): %q", written)
 	}
 }

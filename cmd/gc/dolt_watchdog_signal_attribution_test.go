@@ -8,6 +8,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/emergency"
 )
 
 func TestParsePSProcessRows(t *testing.T) {
@@ -231,15 +233,103 @@ func TestManagedDoltSignalProcessTableReadsTheLivePS(t *testing.T) {
 	}
 }
 
-func TestSortInts(t *testing.T) {
-	values := []int{5, 1, 4, 1, 3}
-	sortInts(values)
-	for i := 1; i < len(values); i++ {
-		if values[i-1] > values[i] {
-			t.Fatalf("sortInts left %v unsorted", values)
-		}
+// TestClassifyManagedDoltWatchdogStopSignal is the ga-drkbcd R2 rule, stated
+// without processes or signals: a stop signal the watchdog cannot attribute to
+// gc takes the data plane down with no explanation — the same operational class
+// as an unexpected clean exit — while one covered by a live stop-intent marker
+// is a stop we asked for and stays quiet.
+func TestClassifyManagedDoltWatchdogStopSignal(t *testing.T) {
+	const doltPID = 17493
+	now := time.Date(2026, 8, 15, 17, 42, 42, 0, time.UTC)
+	attribution := managedDoltSignalAttribution{Signal: "terminated", PID: 17490, PPID: 1}
+	covering := managedDoltStopIntent{
+		PID:          doltPID,
+		RequestedAt:  now.Add(-2 * time.Second).Format(time.RFC3339Nano),
+		RequesterPID: 900,
+		Requester:    "gc dolt-state start --city /city",
+		Reason:       "gc managed dolt startup-failure cleanup",
 	}
-	sortInts(nil)
+
+	cases := []struct {
+		name         string
+		signal       managedDoltWatchdogStopSignal
+		wantCovered  bool
+		wantSeverity string
+		wantCause    string
+	}{
+		{
+			name:         "no marker at all alarms",
+			signal:       managedDoltWatchdogStopSignal{Attribution: attribution, DoltPID: doltPID, Now: now},
+			wantSeverity: emergency.SeverityCritical,
+			wantCause:    managedDoltStopSignalCauseExternal,
+		},
+		{
+			name: "a marker for another pid alarms",
+			signal: managedDoltWatchdogStopSignal{
+				Attribution: attribution, DoltPID: doltPID, Now: now,
+				Intent:      managedDoltStopIntent{PID: doltPID + 1, RequestedAt: covering.RequestedAt},
+				IntentFound: true,
+			},
+			wantSeverity: emergency.SeverityCritical,
+			wantCause:    managedDoltStopSignalCauseExternal,
+		},
+		{
+			name: "a stale marker alarms",
+			signal: managedDoltWatchdogStopSignal{
+				Attribution: attribution, DoltPID: doltPID, Now: now,
+				Intent: managedDoltStopIntent{
+					PID:         doltPID,
+					RequestedAt: now.Add(-managedDoltStopIntentTTL - time.Minute).Format(time.RFC3339Nano),
+				},
+				IntentFound: true,
+			},
+			wantSeverity: emergency.SeverityCritical,
+			wantCause:    managedDoltStopSignalCauseExternal,
+		},
+		{
+			name: "a live marker for this pid stays quiet",
+			signal: managedDoltWatchdogStopSignal{
+				Attribution: attribution, DoltPID: doltPID, Now: now,
+				Intent: covering, IntentFound: true,
+			},
+			wantCovered:  true,
+			wantSeverity: emergency.SeverityInfo,
+			wantCause:    managedDoltStopSignalCauseRequested,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			report := classifyManagedDoltWatchdogStopSignal(tc.signal)
+			if report.Covered != tc.wantCovered {
+				t.Errorf("Covered = %v, want %v", report.Covered, tc.wantCovered)
+			}
+			if report.Severity != tc.wantSeverity {
+				t.Errorf("Severity = %q, want %q", report.Severity, tc.wantSeverity)
+			}
+			if report.Cause != tc.wantCause {
+				t.Errorf("Cause = %q, want %q", report.Cause, tc.wantCause)
+			}
+			joined := strings.Join(report.Lines, "\n")
+			if len(report.Lines) == 0 || !strings.Contains(joined, "gc scope watchdog: ") {
+				t.Fatalf("report says nothing to the log: %v", report.Lines)
+			}
+			if tc.wantCovered {
+				if strings.Contains(joined, "ALARM") {
+					t.Errorf("a covered stop signal used alarm wording:\n%s", joined)
+				}
+				if !strings.Contains(joined, covering.Reason) {
+					t.Errorf("a covered stop signal did not name its requester:\n%s", joined)
+				}
+				return
+			}
+			if !strings.Contains(joined, "ALARM EXTERNAL STOP SIGNAL") {
+				t.Errorf("an uncovered stop signal is not unmistakable in the log:\n%s", joined)
+			}
+			if !strings.Contains(report.Message, "no stop request from gc") {
+				t.Errorf("the escalated message does not say nobody asked: %q", report.Message)
+			}
+		})
+	}
 }
 
 func TestTruncateManagedDoltSignalArgs(t *testing.T) {
