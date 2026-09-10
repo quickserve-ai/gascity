@@ -582,7 +582,7 @@ setup-worker-inference:
 
 ## test-worker-inference: run the live worker inference conformance package
 test-worker-inference:
-	$(TEST_ENV) PROFILE="$(WORKER_INFERENCE_PROFILE)" GC_WORKER_REPORT_DIR="$(GC_WORKER_REPORT_DIR)" go test -count=1 -tags acceptance_c -timeout 45m -v ./test/acceptance/worker_inference
+	$(TEST_ENV) GC_ALLOW_AMBIENT_PROVIDER_CREDS_IN_TESTS=1 PROFILE="$(WORKER_INFERENCE_PROFILE)" GC_WORKER_REPORT_DIR="$(GC_WORKER_REPORT_DIR)" go test -count=1 -tags acceptance_c -timeout 45m -v ./test/acceptance/worker_inference
 
 ## test-worker-inference-phase3: alias for the live worker inference conformance package
 test-worker-inference-phase3: test-worker-inference
@@ -610,7 +610,7 @@ test-acceptance-b:
 
 ## test-acceptance-c: run Tier C acceptance tests (real inference, ~30-40 min, manual/nightly)
 test-acceptance-c:
-	$(TEST_ENV) go test -tags acceptance_c -timeout 45m -v ./test/acceptance/tier_c/...
+	$(TEST_ENV) GC_ALLOW_AMBIENT_PROVIDER_CREDS_IN_TESTS=1 go test -tags acceptance_c -timeout 45m -v ./test/acceptance/tier_c/...
 
 ## test-acceptance-all: run all acceptance tiers
 test-acceptance-all: test-acceptance test-bd-cli-contract test-acceptance-b test-acceptance-c
@@ -742,7 +742,7 @@ test-chaos-dolt:
 ## test-tutorial-goldens: run tutorial golden acceptance tests (requires tmux, dolt, bd, claude auth)
 ## These exercise the published tutorial flow with real inference — run before each release.
 test-tutorial-goldens:
-	$(TEST_ENV) go test -tags acceptance_c -timeout 90m -v ./test/acceptance/tutorial_goldens/...
+	$(TEST_ENV) GC_ALLOW_AMBIENT_PROVIDER_CREDS_IN_TESTS=1 go test -tags acceptance_c -timeout 90m -v ./test/acceptance/tutorial_goldens/...
 
 ## test-tutorial: alias for tutorial goldens
 test-tutorial: test-tutorial-goldens

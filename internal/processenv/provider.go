@@ -85,6 +85,26 @@ var providerCredentialEnvKeys = map[string]bool{
 	"AWS_WEB_IDENTITY_TOKEN_FILE":            true,
 }
 
+// ProviderCredentialEnvPrefixes returns a copy of the curated provider
+// credential env-var name prefixes. Exposed so internal/testenv's stdlib-only
+// mirror of this classification can be pinned by test instead of drifting.
+func ProviderCredentialEnvPrefixes() []string {
+	out := make([]string, len(providerCredentialEnvPrefixes))
+	copy(out, providerCredentialEnvPrefixes)
+	return out
+}
+
+// ProviderCredentialEnvKeys returns a copy of the exact provider credential
+// env-var names. Exposed for the same mirror-pinning reason as
+// ProviderCredentialEnvPrefixes.
+func ProviderCredentialEnvKeys() []string {
+	out := make([]string, 0, len(providerCredentialEnvKeys))
+	for k := range providerCredentialEnvKeys {
+		out = append(out, k)
+	}
+	return out
+}
+
 // IsProviderCredentialEnv reports whether key belongs to the curated provider
 // credential/config allowlist.
 func IsProviderCredentialEnv(key string) bool {
