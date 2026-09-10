@@ -133,9 +133,114 @@ var LeakVectorVars = []string{
 	"GC_DOLT_PORT",
 	"GC_DOLT_USER",
 	"GC_HOME",
+	"GC_INSTANCE_TOKEN",
 	"GC_SESSION_ID",
 	"GC_SESSION_NAME",
 	"GC_TMUX_SESSION",
+}
+
+// AmbientCredentialOptOutVar disables the ambient-credential scrub below.
+// The live-inference acceptance lanes (tier C, worker-inference, tutorial
+// goldens) deliberately consume ambient provider credentials; their make
+// targets and CI job env set this to "1". Everything else runs scrubbed.
+const AmbientCredentialOptOutVar = "GC_ALLOW_AMBIENT_PROVIDER_CREDS_IN_TESTS"
+
+// ambientCredentialPrefixes and ambientCredentialExactKeys classify env vars
+// that carry (or select) real provider credentials. A test process that
+// inherits these ambiently can spend real money, and anything it spawns — a
+// tmux server, a gc subprocess via passthroughEnv — republishes them
+// (ga-fhbnmz: orphaned test tmux servers sat for hours with the developer's
+// live keys in their argv). Scrubbed at init in go-test mode unless
+// AmbientCredentialOptOutVar is "1" or a name is preserved via
+// PassthroughVar.
+//
+// The provider prefixes and the AWS exact-key list MIRROR
+// internal/processenv's curated forwarding allowlist — the set the agent
+// spawn path forwards into sessions — kept as a stdlib-only copy for the
+// same dependency-isolation reason as isLocalDoltHost.
+// TestAmbientCredentialMirrorsProcessenv pins the two together. The entries
+// past the processenv mirror are credential sources the forwarding list does
+// not cover (git hosting tokens, Dolt remote credentials, Claude OAuth, the
+// worker-inference fixture namespace).
+var ambientCredentialPrefixes = []string{
+	"ANTHROPIC_",
+	"AZURE_",
+	"CEREBRAS_",
+	"COHERE_",
+	"DEEPSEEK_",
+	"FIREWORKS_",
+	"GEMINI_",
+	"GOOGLE_",
+	"GROQ_",
+	"MISTRAL_",
+	"OLLAMA_",
+	"OPENAI_",
+	"OPENROUTER_",
+	"TOGETHER_",
+	"VERTEX_",
+	"XAI_",
+	"XIAOMI_",
+	// Beyond the processenv mirror:
+	"GC_WORKER_INFERENCE_",
+}
+
+var ambientCredentialExactKeys = map[string]bool{
+	"AWS_ACCESS_KEY_ID":                      true,
+	"AWS_BEARER_TOKEN_BEDROCK":               true,
+	"AWS_CA_BUNDLE":                          true,
+	"AWS_CONFIG_FILE":                        true,
+	"AWS_CONTAINER_AUTHORIZATION_TOKEN":      true,
+	"AWS_CONTAINER_CREDENTIALS_FULL_URI":     true,
+	"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI": true,
+	"AWS_DEFAULT_REGION":                     true,
+	"AWS_EC2_METADATA_DISABLED":              true,
+	"AWS_ENDPOINT_URL":                       true,
+	"AWS_ENDPOINT_URL_BEDROCK":               true,
+	"AWS_PROFILE":                            true,
+	"AWS_REGION":                             true,
+	"AWS_ROLE_ARN":                           true,
+	"AWS_SDK_LOAD_CONFIG":                    true,
+	"AWS_SECRET_ACCESS_KEY":                  true,
+	"AWS_SESSION_TOKEN":                      true,
+	"AWS_SHARED_CREDENTIALS_FILE":            true,
+	"AWS_USE_DUALSTACK_ENDPOINT":             true,
+	"AWS_USE_FIPS_ENDPOINT":                  true,
+	"AWS_WEB_IDENTITY_TOKEN_FILE":            true,
+	// Beyond the processenv mirror:
+	"CLAUDE_CODE_OAUTH_TOKEN": true,
+	"DOLTHUB_TOKEN":           true,
+	"DOLT_REMOTE_PASSWORD":    true,
+	"GH_TOKEN":                true,
+	"GITHUB_TOKEN":            true,
+}
+
+// isAmbientCredentialEnv reports whether key names an ambient credential
+// (or credential-selecting config) var covered by the init-time scrub.
+func isAmbientCredentialEnv(key string) bool {
+	if ambientCredentialExactKeys[key] {
+		return true
+	}
+	for _, prefix := range ambientCredentialPrefixes {
+		if strings.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// scrubAmbientCredentials unsets every ambient-credential env var not named
+// in keep. No-op when AmbientCredentialOptOutVar is "1".
+func scrubAmbientCredentials(keep map[string]bool) {
+	if os.Getenv(AmbientCredentialOptOutVar) == "1" {
+		return
+	}
+	for _, entry := range os.Environ() {
+		key, _, ok := strings.Cut(entry, "=")
+		if !ok || keep[key] || !isAmbientCredentialEnv(key) {
+			continue
+		}
+		_ = os.Unsetenv(key)
+	}
 }
 
 // ProdDoltPort is the well-known port of the production Dolt server on
@@ -330,4 +435,5 @@ func init() {
 			_ = os.Unsetenv(name)
 		}
 	}
+	scrubAmbientCredentials(keep)
 }

@@ -231,6 +231,22 @@ func (realExecutor) executeCtx(ctx context.Context, args []string) (string, erro
 	return strings.TrimSpace(stdout.String()), nil
 }
 
+// executeCtxEnv runs tmux with an explicit child environment. Used by
+// startServerInert so a cold-started tmux daemon inherits a secret-scrubbed
+// environment instead of the controller's full one (ga-fhbnmz).
+func (realExecutor) executeCtxEnv(ctx context.Context, args []string, env []string) (string, error) {
+	cmd := exec.CommandContext(ctx, "tmux", args...)
+	cmd.Env = env
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err != nil {
+		return "", wrapError(err, stderr.String(), args)
+	}
+	return strings.TrimSpace(stdout.String()), nil
+}
+
 // Tmux wraps tmux operations.
 type Tmux struct {
 	cfg                  Config
@@ -424,6 +440,8 @@ func (t *Tmux) NewSession(name, workDir string) error {
 	if err := t.probeServerAlive(); err != nil {
 		return err
 	}
+	releaseAnchor := t.startServerInert()
+	defer releaseAnchor()
 	args := []string{"new-session", "-d", "-s", name}
 	if workDir != "" {
 		args = append(args, "-c", workDir)
@@ -452,6 +470,8 @@ func (t *Tmux) NewSessionWithCommand(name, workDir, command string) error {
 	if err := t.probeServerAlive(); err != nil {
 		return err
 	}
+	releaseAnchor := t.startServerInert()
+	defer releaseAnchor()
 	args := []string{"new-session", "-d", "-s", name}
 	if workDir != "" {
 		args = append(args, "-c", workDir)
@@ -478,6 +498,14 @@ func (t *Tmux) NewSessionWithCommand(name, workDir, command string) error {
 // The command should still use 'exec env' for WaitForCommand detection compatibility,
 // but -e provides defense-in-depth for the initial shell environment.
 // Requires tmux >= 3.2.
+//
+// The -e pairs ride this CLIENT's argv for the milliseconds it lives, which
+// is acceptable; what must never happen is this call forking the SERVER,
+// whose process-table entry would then carry every pair for the life of the
+// city (ga-fhbnmz). startServerInert below guarantees the daemon already
+// exists — forked by an inert anchor session with a clean argv and a
+// secret-scrubbed environment — before any -e values are put on a command
+// line.
 func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env map[string]string) error {
 	if err := validateSessionName(name); err != nil {
 		return err
@@ -485,10 +513,8 @@ func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env ma
 	if err := t.probeServerAlive(); err != nil {
 		return err
 	}
-	args := []string{"new-session", "-d", "-s", name}
-	if workDir != "" {
-		args = append(args, "-c", workDir)
-	}
+	releaseAnchor := t.startServerInert()
+	defer releaseAnchor()
 	// Add -e flags to set environment variables in the session before the shell starts.
 	// Keys are sorted for deterministic behavior.
 	keys := make([]string, 0, len(env))
@@ -496,15 +522,32 @@ func (t *Tmux) NewSessionWithCommandAndEnv(name, workDir, command string, env ma
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
+	var envArgs []string
 	var unsetKeys []string
 	for _, k := range keys {
 		if env[k] == "" {
 			// Empty values mean "unset this var". Collect for env -u prefix.
 			unsetKeys = append(unsetKeys, k)
 		} else {
-			args = append(args, "-e", fmt.Sprintf("%s=%s", k, env[k]))
+			envArgs = append(envArgs, "-e", fmt.Sprintf("%s=%s", k, env[k]))
 		}
 	}
+	var args []string
+	if len(envArgs) > 0 {
+		// The security invariant, enforced at the enforcement point: a
+		// command carrying -e values must NEVER be the one that forks the
+		// server (its argv would persist in the daemon's process-table entry
+		// — ga-fhbnmz). The client -N flag makes tmux refuse to start a
+		// server for this command, so any window the anchor probe could not
+		// close degrades to ErrNoServer — retried by ensureFreshSession —
+		// never to a daemon carrying secrets.
+		args = append(args, "-N")
+	}
+	args = append(args, "new-session", "-d", "-s", name)
+	if workDir != "" {
+		args = append(args, "-c", workDir)
+	}
+	args = append(args, envArgs...)
 	// For vars that need unsetting, prefix the command with env -u flags.
 	// tmux -e sets session-level env but the shell process still inherits
 	// from the tmux server's global environment. env -u ensures the var

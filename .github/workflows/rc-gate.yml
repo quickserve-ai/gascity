@@ -125,6 +125,9 @@ jobs:
             timeout_minutes: 10
             command: go test -tags acceptance_a -timeout 8m ./test/acceptance/helpers
     env:
+      # These lanes DELIBERATELY consume ambient provider credentials for
+      # real inference; internal/testenv scrubs them by default otherwise.
+      GC_ALLOW_AMBIENT_PROVIDER_CREDS_IN_TESTS: "1"
       ANTHROPIC_BASE_URL: https://ollama.com
       ANTHROPIC_AUTH_TOKEN: ${{ secrets.OLLAMA_API_KEY }}
       OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
@@ -178,6 +181,9 @@ jobs:
       matrix:
         shard_index: [1, 2, 3, 4, 5]
     env:
+      # These lanes DELIBERATELY consume ambient provider credentials for
+      # real inference; internal/testenv scrubs them by default otherwise.
+      GC_ALLOW_AMBIENT_PROVIDER_CREDS_IN_TESTS: "1"
       ANTHROPIC_BASE_URL: https://ollama.com
       ANTHROPIC_AUTH_TOKEN: ${{ secrets.OLLAMA_API_KEY }}
       OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
@@ -300,6 +306,9 @@ jobs:
             timeout_minutes: 20
             command: ./scripts/test-integration-shard rest-full-8-of-8
     env:
+      # These lanes DELIBERATELY consume ambient provider credentials for
+      # real inference; internal/testenv scrubs them by default otherwise.
+      GC_ALLOW_AMBIENT_PROVIDER_CREDS_IN_TESTS: "1"
       ANTHROPIC_BASE_URL: https://ollama.com
       ANTHROPIC_AUTH_TOKEN: ${{ secrets.OLLAMA_API_KEY }}
       OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
@@ -336,6 +345,9 @@ jobs:
       matrix:
         shard_index: [1, 2, 3, 4, 5, 6]
     env:
+      # These lanes DELIBERATELY consume ambient provider credentials for
+      # real inference; internal/testenv scrubs them by default otherwise.
+      GC_ALLOW_AMBIENT_PROVIDER_CREDS_IN_TESTS: "1"
       ANTHROPIC_BASE_URL: https://ollama.com
       ANTHROPIC_AUTH_TOKEN: ${{ secrets.OLLAMA_API_KEY }}
       OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}

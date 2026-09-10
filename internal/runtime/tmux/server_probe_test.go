@@ -123,8 +123,14 @@ func TestNewSessionErrNoServerObservedSafeAllowsCreation(t *testing.T) {
 			if observerCalls != 1 {
 				t.Fatalf("observer calls = %d, want 1", observerCalls)
 			}
-			if len(fe.calls) < 2 || fe.calls[1][3] != "new-session" {
-				t.Fatalf("calls = %#v, want probe followed by new-session", fe.calls)
+			// Call 0 is the preflight probe; startServerInert's cold-socket
+			// aliveness check (ga-fhbnmz) may add a second has-session before
+			// creation, so assert on presence and order, not exact indices.
+			if len(fe.calls) == 0 || !firstArgsContainHasSession(fe.calls[0]) {
+				t.Fatalf("calls = %#v, want the preflight has-session probe first", fe.calls)
+			}
+			if callIndex(fe.calls, "new-session") == -1 {
+				t.Fatalf("calls = %#v, want a new-session after the probe", fe.calls)
 			}
 		})
 	}
@@ -404,9 +410,10 @@ func TestNewSessionProbesBeforeCreatingWhenSocketSet(t *testing.T) {
 			t.Errorf("probe arg %d = %q, want %q", i, probe[i], want[i])
 		}
 	}
-	create := fe.calls[1]
-	if create[3] != "new-session" {
-		t.Fatalf("second call should be new-session, got %v", create)
+	// startServerInert's aliveness check (ga-fhbnmz) may add a second
+	// has-session between the probe and creation; assert order, not index.
+	if callIndex(fe.calls, "new-session") == -1 {
+		t.Fatalf("no new-session call after the probe: %v", fe.calls)
 	}
 }
 
@@ -426,11 +433,10 @@ func TestNewSessionProceedsWhenProbeReportsNoServer(t *testing.T) {
 	if err := tm.NewSession("gc-fresh", ""); err != nil {
 		t.Fatalf("NewSession: %v", err)
 	}
-	if len(fe.calls) < 2 {
-		t.Fatalf("expected new-session to follow probe, got %d calls: %v", len(fe.calls), fe.calls)
-	}
-	if fe.calls[1][3] != "new-session" {
-		t.Fatalf("expected new-session after no-server probe, got %v", fe.calls[1])
+	// startServerInert's aliveness check (ga-fhbnmz) may add a second
+	// has-session between the probe and creation; assert order, not index.
+	if callIndex(fe.calls, "new-session") == -1 {
+		t.Fatalf("expected new-session after no-server probe, got %v", fe.calls)
 	}
 }
 
