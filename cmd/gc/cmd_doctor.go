@@ -286,6 +286,7 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 	}
 	register(newProviderCatalogDoctorCheck(cityPath))
 	register(newProviderCatalogReadinessAdvisoryCheck(cityPath))
+	register(newClaudeAccountDeclarationDoctorCheck(cityPath))
 	register(expandedConfigLoadCheck{})
 	register(&doctor.ImplicitImportCacheCheck{})
 	register(&doctor.DeprecatedAttachmentFieldsCheck{})
@@ -326,6 +327,7 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 		registerCityStoreCheck(doctor.NewOrderFiringCurrentCheck(cfg, cityPath, doctor.WithOrderFiringCurrentLastRunFunc(
 			storeGate.OrderLastRun(cityPath, cfg, doctorOrderFiringCurrentLastRunFunc(cityPath, cfg, opts.Stderr)))))
 		register(doctor.NewOrderOutcomeHealthyCheck(cfg, cityPath))
+		register(doctor.NewOrderExecTargetCheck(cfg, cityPath))
 		register(newCodexHooksDriftCheck(cityPath, codexHookWorkDirs(cityPath, cfg)))
 		register(doctor.NewRigPackCoverageCheck(cfg, cityPath))
 		register(newPackRuntimesDoctorCheck(cfg))
@@ -445,35 +447,40 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 		}
 	}
 
-	// Data checks.
+	// Data checks. Store schema compatibility stays checkable from the raw
+	// city config even when expanded imports fail to load: storeOK is only
+	// cleared by a preflight that ran against a loaded config.
 	if cfgErr == nil && cfg != nil {
 		register(doctor.NewBDSplitStoreCheck(cityPath))
-		if storeOK {
-			registerCityStoreCheck(doctor.NewBeadsStoreCheck(cityPath, openStoreResultForCity(cityPath)))
-			registerCityStoreCheck(newV2RoutedToNamespaceCheck(cfg, cityPath, storeFactory))
-			registerCityStoreCheck(newExecutorIdentityResidueCheck(cfg, cityPath, storeFactory))
-			registerCityStoreCheck(newCensusOwnerLivenessCheck(cfg, cityPath, storeFactory))
-			registerCityStoreCheck(newRunTargetRoutedToBackfillCheck(cfg, cityPath, storeFactory))
-			registerCityStoreCheck(newRouteRecoveryQuarantineCheck(cfg, cityPath, storeFactory))
-			registerCityStoreCheck(newHoldLabelRoutedToCheck(cfg, cityPath, storeFactory))
-			registerCityStoreCheck(newPoolIdleRoutedWorkCheck(cfg, cityPath, storeFactory))
-			registerCityStoreCheck(newWorkOptionMetadataMigrationCheck(cfg, cityPath, storeFactory))
-			registerCityStoreCheck(newBacklogDepthCheck(cityPath, storeFactory))
-			registerCityStoreCheck(newOrderTrackingRetentionCheck(cityPath, storeFactory))
-			registerCityStoreCheck(&sessionModelDoctorCheck{cfg: cfg, cityPath: cityPath, newStore: storeFactory})
-			registerCityStoreCheck(newStartupHealthEpisodesCheck(cfg, cityPath, storeFactory))
-			// Differential probe: the preflight above just proved the store
-			// reachable with the controller's environment, so a read that
-			// fails under the gate sandbox isolates the sandbox (ga-pqlgh).
-			// The check's message asserts that control ("the same read
-			// succeeded for the controller"), so it needs the preflight to
-			// have actually run and passed — storeOK alone also holds when the
-			// probe was skipped or failed in a non-outage shape, and in both
-			// of those the assertion would be false. On a stopped proxied city
-			// it is listed as not checked, like every other store read.
-			if storePreflightPassed || cityStoreStopped {
-				registerCityStoreCheck(newGateSandboxReadCheck(cityPath))
-			}
+	}
+	if storeOK {
+		registerCityStoreCheck(doctor.NewBeadsStoreCheck(cityPath, openStoreResultForCity(cityPath)))
+	}
+	if cfgErr == nil && cfg != nil && storeOK {
+		registerCityStoreCheck(newV2RoutedToNamespaceCheck(cfg, cityPath, storeFactory))
+		registerCityStoreCheck(newExecutorIdentityResidueCheck(cfg, cityPath, storeFactory))
+		registerCityStoreCheck(newCensusOwnerLivenessCheck(cfg, cityPath, storeFactory))
+		registerCityStoreCheck(newRunTargetRoutedToBackfillCheck(cfg, cityPath, storeFactory))
+		registerCityStoreCheck(newRouteRecoveryQuarantineCheck(cfg, cityPath, storeFactory))
+		registerCityStoreCheck(newHoldLabelRoutedToCheck(cfg, cityPath, storeFactory))
+		registerCityStoreCheck(newPoolIdleRoutedWorkCheck(cfg, cityPath, storeFactory))
+		registerCityStoreCheck(newWorkOptionMetadataMigrationCheck(cfg, cityPath, storeFactory))
+		registerCityStoreCheck(newBacklogDepthCheck(cityPath, storeFactory))
+		registerCityStoreCheck(newOrderTrackingRetentionCheck(cityPath, storeFactory))
+		registerCityStoreCheck(&sessionModelDoctorCheck{cfg: cfg, cityPath: cityPath, newStore: storeFactory})
+		registerCityStoreCheck(&cloudWakeDoctorCheck{cfg: cfg, cityPath: cityPath, newStore: storeFactory})
+		registerCityStoreCheck(newStartupHealthEpisodesCheck(cfg, cityPath, storeFactory))
+		// Differential probe: the preflight above just proved the store
+		// reachable with the controller's environment, so a read that
+		// fails under the gate sandbox isolates the sandbox (ga-pqlgh).
+		// The check's message asserts that control ("the same read
+		// succeeded for the controller"), so it needs the preflight to
+		// have actually run and passed — storeOK alone also holds when the
+		// probe was skipped or failed in a non-outage shape, and in both
+		// of those the assertion would be false. On a stopped proxied city
+		// it is listed as not checked, like every other store read.
+		if storePreflightPassed || cityStoreStopped {
+			registerCityStoreCheck(newGateSandboxReadCheck(cityPath))
 		}
 	}
 	register(newDoctorDoltServerCheck(cityPath, opts.SkipCityDoltCheck))
