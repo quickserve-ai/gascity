@@ -176,6 +176,7 @@ install: check-self-contained
 		trap 'rm -f "$$tmp" "$$out"' EXIT INT TERM HUP; \
 		cp -f "$(BUILD_DIR)/$(BINARY)" "$$tmp"; \
 		chmod 0755 "$$tmp"; \
+		./scripts/sign-staged.sh "$$tmp"; \
 		set +e; "$$tmp" version > "$$out" 2>&1; rc=$$?; set -e; \
 		if [ $$rc -ne 0 ] || [ ! -s "$$out" ]; then \
 			echo "FATAL: staged $(BINARY) will not execute (exit=$$rc, output=$$(wc -c < "$$out") bytes)."; \
