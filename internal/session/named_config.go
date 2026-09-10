@@ -317,6 +317,55 @@ func InfoConflictsWithNamedSession(i Info, spec NamedSessionSpec) bool {
 	return false
 }
 
+// InfoIsAdoptablePoolShadow reports whether a live session Info is the
+// adoptable pool-shadow shape of a configured single-session named identity:
+// an ephemeral pool-managed session running the identity's backing template,
+// carrying no configured_named_* stamps and no foreign alias (its alias is
+// absent or already the identity itself). Such a session is not a blocking
+// conflict — the sync path can stamp and converge it onto the named identity
+// — so the desired-state builder materializes the identity instead of
+// skipping it every tick (ga-dfp1b L2: that skip burned 4600+ silent ticks
+// while the identity stayed unresolvable). For RESOLUTION,
+// LookupConfiguredNamedSession takes a shadow that is the sole
+// template-matching holder of the identity's alias as canonical (the alias
+// pass in FindCanonicalNamedSessionBead) and checks any other unstamped shadow
+// against the bead-tier conflict matcher (BeadConflictsWithNamedSession).
+func InfoIsAdoptablePoolShadow(i Info, spec NamedSessionSpec) bool {
+	if IsNamedSessionInfo(i) {
+		return false
+	}
+	backing := NamedSessionBackingTemplate(spec)
+	if backing == "" || spec.Agent == nil || spec.Agent.SupportsMultipleSessions() {
+		return false
+	}
+	if strings.TrimSpace(i.SessionOrigin) != "ephemeral" || !i.PoolManaged {
+		return false
+	}
+	template := NormalizeNamedSessionTarget(strings.TrimSpace(i.Template))
+	agentName := NormalizeNamedSessionTarget(strings.TrimSpace(i.AgentName))
+	if template != backing && agentName != backing {
+		return false
+	}
+	// The builder asks this only after the canonical passes found nothing, so a
+	// shadow that is the sole template-matching holder of the identity's alias
+	// never gets here: FindCanonicalNamedSessionInfo's alias pass takes it as
+	// canonical and the builder keys the desired entry on its session_name.
+	// What does get here (two or more template-matching alias holders) can only
+	// be adopted through the identity-keyed session-name binding
+	// (resolveSessionName looks the IDENTITY up against agent_name/template).
+	// When the identity differs from the backing template that lookup misses
+	// the shadow, so suppressing the conflict would trade a loud wedge for a
+	// silent one. Only the identity-named shape is adoptable.
+	identity := NormalizeNamedSessionTarget(spec.Identity)
+	if template != identity && agentName != identity {
+		return false
+	}
+	if alias := strings.TrimSpace(i.Alias); alias != "" && alias != spec.Identity {
+		return false
+	}
+	return true
+}
+
 // NamedSessionBeadMatchesSpec reports whether a bead belongs to the named session spec.
 func NamedSessionBeadMatchesSpec(b beads.Bead, spec NamedSessionSpec) bool {
 	if IsNamedSessionBead(b) && NamedSessionIdentity(b) == spec.Identity {
@@ -353,6 +402,13 @@ func BeadConflictsWithNamedSession(b beads.Bead, spec NamedSessionSpec) bool {
 		return !NamedSessionBeadMatchesSpec(b, spec)
 	}
 	if strings.TrimSpace(b.Metadata["alias"]) == spec.Identity {
+		return true
+	}
+	backing := NamedSessionBackingTemplate(spec)
+	if backing != "" && spec.Agent != nil && !spec.Agent.SupportsMultipleSessions() &&
+		strings.TrimSpace(b.Metadata["session_origin"]) == "ephemeral" &&
+		strings.TrimSpace(b.Metadata["pool_managed"]) == "true" &&
+		NormalizeNamedSessionTarget(b.Metadata["template"]) == backing {
 		return true
 	}
 	return false
@@ -452,6 +508,13 @@ func lookupConfiguredNamedSession(store beads.Store, spec NamedSessionSpec, incl
 
 	conflictCandidates := append([]beads.Bead{}, runtimeSessionNameMatches...)
 	conflictCandidates = appendUniqueNamedSessionCandidates(conflictCandidates, make(map[string]bool, len(conflictCandidates)+len(aliasMatches)), aliasMatches)
+	if backing := NamedSessionBackingTemplate(spec); backing != "" && spec.Agent != nil && !spec.Agent.SupportsMultipleSessions() {
+		matches, err := listConfiguredNamedSessionBeadsByMetadata(store, "template", backing)
+		if err != nil {
+			return ConfiguredNamedSessionLookup{}, fmt.Errorf("listing backing-template conflicts: %w", err)
+		}
+		conflictCandidates = appendUniqueNamedSessionCandidates(conflictCandidates, make(map[string]bool, len(conflictCandidates)+len(matches)), matches)
+	}
 	if bead, conflict := FindNamedSessionConflict(conflictCandidates, spec); conflict {
 		return ConfiguredNamedSessionLookup{Conflict: bead, HasConflict: true}, nil
 	}
@@ -584,14 +647,25 @@ func FindNamedSessionConflict(candidates []beads.Bead, spec NamedSessionSpec) (b
 // FindNamedSessionConflict: it finds the first live session Info that blocks a
 // configured named session, using the same continuity gate as canonical
 // detection (NamedSessionInfoContinuityEligible), so a bead that cannot own a
-// name cannot block it either.
+// name cannot block it either. DELIBERATE divergence from the bead tier
+// (ga-dfp1b L2): an adoptable pool shadow (InfoIsAdoptablePoolShadow) is not
+// reported as a conflict here, so the desired-state builder materializes the
+// identity and the sync path adopts the shadow. The bead-tier matcher keeps
+// reporting that shape, but LookupConfiguredNamedSession runs its canonical
+// passes first, so a shadow that is the sole template-matching holder of the
+// identity's alias resolves as canonical before sync stamps it.
 func FindNamedSessionConflictInfo(candidates []Info, spec NamedSessionSpec) (Info, bool) {
 	for _, i := range candidates {
 		if !IsSessionBeadOrRepairableInfo(i) || i.Closed ||
 			!NamedSessionInfoContinuityEligible(i) {
 			continue
 		}
-		if InfoConflictsWithNamedSession(i, spec) {
+		// An adoptable pool shadow is deliberately NOT a blocking conflict
+		// here even when it holds the identity's alias: reporting it would
+		// wedge the identity permanently (the builder skips, nothing ever
+		// re-stamps the shadow — ga-dfp1b L2). Materializing lets the sync
+		// path adopt and converge it.
+		if InfoConflictsWithNamedSession(i, spec) && !InfoIsAdoptablePoolShadow(i, spec) {
 			return i, true
 		}
 	}
