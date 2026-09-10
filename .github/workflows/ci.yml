@@ -158,15 +158,17 @@ jobs:
             # universal persistence substrate, events the universal observation
             # substrate, config the universal activation mechanism; build,
             # dependency, and CI workflow/composite-action files affect every
-            # job. The setup-gascity-ubuntu composite action and the installer
-            # scripts it invokes are shared by nearly every job, so a change to
-            # them must re-run all path-gated suites.
+            # job. The setup-gascity-ubuntu composite action, the go-mod-warm
+            # action every Go job now runs, and the installer scripts they
+            # invoke are shared by nearly every job, so a change to them must
+            # re-run all path-gated suites.
             shared:
               - 'go.mod'
               - 'go.sum'
               - 'Makefile'
               - '.github/workflows/**'
               - '.github/actions/setup-gascity-ubuntu/**'
+              - '.github/actions/go-mod-warm/**'
               - '.github/scripts/install-dolt-archive.sh'
               - '.github/scripts/install-bd-archive.sh'
               - '.github/scripts/install-bd-lockstep.sh'
@@ -193,6 +195,11 @@ jobs:
           go-version-file: go.mod
       - name: CI workflow policy
         run: make test-ci-policy
+      # The one job where the warm step is not immediately after setup-go:
+      # scripts/cipolicy requires the focused CI policy to run directly after
+      # the toolchain and before every other guard, so the warm fetch takes the
+      # next slot instead and still precedes all the heavy guards (ga-azybk8).
+      - uses: ./.github/actions/go-mod-warm
       - name: Classify static-analysis scope
         id: static-scope
         env:
@@ -336,6 +343,7 @@ jobs:
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod
+      - uses: ./.github/actions/go-mod-warm
       - name: Acceptance tests (Tier A)
         run: make test-acceptance
 
@@ -351,6 +359,7 @@ jobs:
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod
+      - uses: ./.github/actions/go-mod-warm
       - name: Install minimum-supported bd
         run: |
           set -euo pipefail
@@ -384,6 +393,7 @@ jobs:
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod
+      - uses: ./.github/actions/go-mod-warm
       - name: Resolve bd current pin
         id: bd
         run: |
@@ -429,6 +439,7 @@ jobs:
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod
+      - uses: ./.github/actions/go-mod-warm
       - name: Build bd from beads main HEAD
         run: |
           set -euo pipefail
@@ -456,6 +467,7 @@ jobs:
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod
+      - uses: ./.github/actions/go-mod-warm
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
@@ -606,6 +618,7 @@ jobs:
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod
+      - uses: ./.github/actions/go-mod-warm
       - name: Ensure timing renderer is available
         run: command -v jq >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends jq)
       - name: Run product metrics testhook profile
@@ -649,6 +662,7 @@ jobs:
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod
+      - uses: ./.github/actions/go-mod-warm
       - name: Test credential-provider unit contract
         run: go test -count=1 ./internal/credentialprovider
       - name: Test Windows Job Object descendant cleanup
@@ -759,6 +773,7 @@ jobs:
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod
+      - uses: ./.github/actions/go-mod-warm
       - name: Prepare worker report dir
         run: mkdir -p "$WORKER_REPORT_DIR"
       - name: WorkerCore transcript/continuation conformance
@@ -793,6 +808,7 @@ jobs:
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod
+      - uses: ./.github/actions/go-mod-warm
       - name: Prepare worker report dir
         run: mkdir -p "$WORKER_REPORT_DIR"
       - name: WorkerCore transcript/continuation conformance
@@ -827,6 +843,7 @@ jobs:
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod
+      - uses: ./.github/actions/go-mod-warm
       - name: Prepare worker report dir
         run: mkdir -p "$WORKER_REPORT_DIR"
       - name: WorkerCore transcript/continuation conformance
@@ -970,6 +987,7 @@ jobs:
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod
+      - uses: ./.github/actions/go-mod-warm
       - name: Install system dependencies
         run: sudo rm -f /etc/apt/sources.list.d/google-chrome* /etc/apt/sources.list.d/microsoft-prod* && sudo apt-get update && sudo apt-get install -y tmux
       - name: Prepare worker report dir
@@ -1006,6 +1024,7 @@ jobs:
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod
+      - uses: ./.github/actions/go-mod-warm
       - name: Install system dependencies
         run: sudo rm -f /etc/apt/sources.list.d/google-chrome* /etc/apt/sources.list.d/microsoft-prod* && sudo apt-get update && sudo apt-get install -y tmux
       - name: Prepare worker report dir
@@ -1042,6 +1061,7 @@ jobs:
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod
+      - uses: ./.github/actions/go-mod-warm
       - name: Install system dependencies
         run: sudo rm -f /etc/apt/sources.list.d/google-chrome* /etc/apt/sources.list.d/microsoft-prod* && sudo apt-get update && sudo apt-get install -y tmux
       - name: Prepare worker report dir
@@ -1189,6 +1209,7 @@ jobs:
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod
+      - uses: ./.github/actions/go-mod-warm
       # The gastown pack ships via the gascity-packs Go module, so a routine
       # go.mod bump can silently desync the embedded pack bytes from the
       # provenance pins in internal/config/public_packs.go and the
@@ -1238,6 +1259,7 @@ jobs:
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod
+      - uses: ./.github/actions/go-mod-warm
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
@@ -1351,6 +1373,7 @@ jobs:
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod
+      - uses: ./.github/actions/go-mod-warm
 
       - name: Install system dependencies
         run: sudo rm -f /etc/apt/sources.list.d/google-chrome* /etc/apt/sources.list.d/microsoft-prod* && sudo apt-get update && sudo apt-get install -y jq curl
@@ -1379,6 +1402,7 @@ jobs:
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod
+      - uses: ./.github/actions/go-mod-warm
 
       - name: Install system dependencies
         run: sudo rm -f /etc/apt/sources.list.d/google-chrome* /etc/apt/sources.list.d/microsoft-prod* && sudo apt-get update && sudo apt-get install -y jq
@@ -1404,6 +1428,7 @@ jobs:
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod
+      - uses: ./.github/actions/go-mod-warm
 
       - name: Install system dependencies
         run: sudo rm -f /etc/apt/sources.list.d/google-chrome* /etc/apt/sources.list.d/microsoft-prod* && sudo apt-get update && sudo apt-get install -y jq

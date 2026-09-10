@@ -52,6 +52,12 @@ runs:
         # Keep macOS parity deterministic across hosted and reused runners.
         cache: false
 
+    # One retried module fetch per job, immediately after the toolchain lands,
+    # so every checksum read this job needs happens inside a bounded backoff
+    # instead of unguarded under whichever go command asks first (ga-azybk8).
+    # `cache: false` above makes this the *only* warm path on macOS.
+    - uses: ./.github/actions/go-mod-warm
+
     - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
       with:
         node-version: ${{ inputs.node-version }}
