@@ -90,7 +90,7 @@ expires = "2026-10-31"
 [[debt]]
 scope = "cmd/gc+untagged"
 resource = "cwd"
-baseline_calls = 176
+baseline_calls = 182
 baseline_files = 17
 reported_calls = 98
 reported_files = 13
@@ -194,8 +194,8 @@ expires = "2026-10-31"
 [[debt]]
 scope = "untagged"
 resource = "tmux"
-baseline_calls = 9
-baseline_files = 4
+baseline_calls = 13
+baseline_files = 5
 reported_calls = 7
 reported_files = 3
 owner_bead = "ga-cp3hwi"
@@ -504,7 +504,7 @@ expires = "2026-10-31"
 [[small_debt]]
 scope = "cmd/gc+untagged"
 resource = "cwd"
-baseline_calls = 176
+baseline_calls = 182
 baseline_files = 17
 reported_calls = 284
 reported_files = 43
@@ -530,8 +530,8 @@ expires = "2026-10-31"
 [[small_debt]]
 scope = "untagged"
 resource = "http_test_server"
-baseline_calls = 318
-baseline_files = 66
+baseline_calls = 331
+baseline_files = 67
 reported_calls = 300
 reported_files = 66
 owner_bead = "ga-cp3hwi"
@@ -608,8 +608,8 @@ expires = "2026-10-31"
 [[small_debt]]
 scope = "untagged"
 resource = "tmux"
-baseline_calls = 3
-baseline_files = 2
+baseline_calls = 7
+baseline_files = 3
 reported_calls = 1
 reported_files = 1
 owner_bead = "ga-cp3hwi"
