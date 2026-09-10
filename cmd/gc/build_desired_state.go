@@ -960,7 +960,13 @@ func buildDesiredStateWithSessionBeads(
 	for identity, spec := range namedSpecs {
 		canonicalInfo, hasCanonical := findCanonicalNamedSessionInfo(bp.sessionBeads, spec)
 		if !hasCanonical {
-			if _, conflict := findNamedSessionConflictInfo(bp.sessionBeads, spec); conflict {
+			if conflictInfo, conflict := findNamedSessionConflictInfo(bp.sessionBeads, spec); conflict {
+				// A live bead holds this identity's name/alias/backing
+				// template without the configured_named_* stamps, so the
+				// identity can never materialize and this loop will skip it
+				// again every tick. Say so: the woodhouse/mallory wedges
+				// burned 4600+ of these skips in silence (ga-dfp1b).
+				fmt.Fprintf(stderr, "buildDesiredState: named session %q blocked by conflicting session bead %s — close or re-stamp that bead to restore the identity (ga-dfp1b)\n", identity, conflictInfo.ID) //nolint:errcheck
 				continue
 			}
 		}

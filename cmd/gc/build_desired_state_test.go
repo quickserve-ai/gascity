@@ -12981,3 +12981,58 @@ func TestBuildDesiredStateRecordsDemandSubPhases(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildDesiredState_NamedSessionConflictSkipIsLogged pins ga-dfp1b's L1:
+// when a live bead holds a configured named identity's alias without being
+// its canonical session (here: a foreign-template bead with alias=woodhouse),
+// the named pass must skip the identity (as before) but say so on stderr,
+// naming the conflicting bead — the woodhouse/mallory class burned 4600+
+// silent skips. NOTE the ephemeral+pool_managed backing-template shape does
+// NOT reach this branch: InfoConflictsWithNamedSession lacks the pool_managed
+// branch its bead-tier twin has, and the builder adopts/rekeys that shape
+// instead (characterized on ga-dfp1b; matcher parity is L2 scope).
+func TestBuildDesiredState_NamedSessionConflictSkipIsLogged(t *testing.T) {
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	maxOne := 1
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:              "woodhouse",
+			StartCommand:      "true",
+			MaxActiveSessions: &maxOne,
+		}},
+		NamedSessions: []config.NamedSession{{
+			Template: "woodhouse",
+			Mode:     "always",
+		}},
+	}
+	shadow, err := store.Create(beads.Bead{
+		Type:   sessionpkg.BeadType,
+		Status: "open",
+		Labels: []string{sessionpkg.LabelSession},
+		Metadata: map[string]string{
+			"session_name":   "other-agent-1",
+			"template":       "other-agent",
+			"agent_name":     "other-agent",
+			"alias":          "woodhouse",
+			"session_origin": "ephemeral",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(shadow): %v", err)
+	}
+
+	var stderr bytes.Buffer
+	dsResult := buildDesiredState("test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), store, &stderr)
+
+	for name, tp := range dsResult.State {
+		if tp.ConfiguredNamedIdentity == "woodhouse" {
+			t.Fatalf("named identity materialized despite alias conflict: %s", name)
+		}
+	}
+	out := stderr.String()
+	if !strings.Contains(out, "blocked by conflicting session bead") || !strings.Contains(out, shadow.ID) {
+		t.Fatalf("expected conflict-skip diagnostic naming bead %s, got stderr:\n%s", shadow.ID, out)
+	}
+}
