@@ -238,6 +238,31 @@ func TestNativeDoltStoreRealBackendRoundTrip(t *testing.T) {
 // when the dolt binary is unavailable.
 func startTestDoltServer(t *testing.T) *sql.DB {
 	t.Helper()
+	port := startTestDoltServerPort(t)
+	dsn := fmt.Sprintf("root@tcp(127.0.0.1:%d)/", port)
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open dolt connection: %v", err)
+	}
+	if _, err := db.Exec("CREATE DATABASE repairtest"); err != nil {
+		t.Fatalf("create test database: %v", err)
+	}
+	_ = db.Close()
+
+	db, err = sql.Open("mysql", dsn+"repairtest")
+	if err != nil {
+		t.Fatalf("open test database: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+// startTestDoltServerPort launches a throwaway dolt sql-server on a free port,
+// waits until it answers, and returns the port; the server dies with the test.
+// Tests that open the beads storage itself against the server (server-mode
+// metadata.json) use this; tests that only need raw SQL use startTestDoltServer.
+func startTestDoltServerPort(t *testing.T) int {
+	t.Helper()
 	doltBin, err := exec.LookPath("dolt")
 	if err != nil {
 		t.Skip("dolt binary not in PATH")
@@ -276,17 +301,12 @@ func startTestDoltServer(t *testing.T) *sql.DB {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	if _, err := db.Exec("CREATE DATABASE repairtest"); err != nil {
-		t.Fatalf("create test database: %v", err)
+	// The beads storage opened in server mode expects its database to exist.
+	if _, err := db.Exec("CREATE DATABASE IF NOT EXISTS beads"); err != nil {
+		t.Fatalf("create beads database: %v", err)
 	}
 	_ = db.Close()
-
-	db, err = sql.Open("mysql", dsn+"repairtest")
-	if err != nil {
-		t.Fatalf("open test database: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	return db
+	return port
 }
 
 // TestRepairIDDefaultAgainstDoltServer exercises the SHOW COLUMNS-based probe

@@ -960,7 +960,13 @@ func buildDesiredStateWithSessionBeads(
 	for identity, spec := range namedSpecs {
 		canonicalInfo, hasCanonical := findCanonicalNamedSessionInfo(bp.sessionBeads, spec)
 		if !hasCanonical {
-			if _, conflict := findNamedSessionConflictInfo(bp.sessionBeads, spec); conflict {
+			if conflictInfo, conflict := findNamedSessionConflictInfo(bp.sessionBeads, spec); conflict {
+				// A live bead holds this identity's name/alias/backing
+				// template without the configured_named_* stamps, so the
+				// identity can never materialize and this loop will skip it
+				// again every tick. Say so: this class of wedge burned
+				// 4600+ of these skips in silence (ga-dfp1b).
+				fmt.Fprintf(stderr, "buildDesiredState: named session %q blocked by conflicting session bead %s — close or re-stamp that bead to restore the identity (ga-dfp1b)\n", identity, conflictInfo.ID) //nolint:errcheck
 				continue
 			}
 		}
@@ -3851,6 +3857,46 @@ func createPoolSessionBeadWithGuardedAlias(
 	if bp == nil {
 		return session.Info{}, fmt.Errorf("creating pool session for %q: build params unavailable", template)
 	}
+	// ga-dfp1b L2 create-side guard: when this template's only legitimate
+	// session is a configured single-session named identity, the ordinary
+	// pool mint would birth the pool shadow (ephemeral+pool_managed, no
+	// configured_named_* stamps) that the adoption path then has to converge
+	// through a restart. Mint the canonical named shape instead, so the
+	// shadow is never born; if the canonical session already holds the
+	// identity, refuse — that session IS this template's capacity.
+	//
+	// Dependency-floor creates bypass this guard (they call the pool-shape
+	// variant below): their desired entry carries no ConfiguredNamedIdentity,
+	// so a canonical mint would be stripped back to pool shape on its first
+	// sync while squatting the canonical session_name. The pool shape they
+	// mint instead is healed by the adoption path when the identity is
+	// demanded.
+	if bp.beadStore != nil {
+		if spec, ok := poolCreateBacksSingleNamedSession(bp.city, bp.cityName, template); ok {
+			if err := validateAgentSessionTransportForBuild(bp, cfgAgent, qualifiedInstance); err != nil {
+				return session.Info{}, err
+			}
+			return mintConfiguredNamedSessionBeadForPoolCreate(bp, spec, template, metadata)
+		}
+	}
+	return createPoolSessionBeadWithGuardedAliasPoolShape(bp, cfgAgent, template, qualifiedInstance, slot, metadata)
+}
+
+// createPoolSessionBeadWithGuardedAliasPoolShape is the ordinary pool-shaped
+// mint behind createPoolSessionBeadWithGuardedAlias, without the ga-dfp1b
+// named-session guard. Only the dependency-floor path calls it directly (see
+// the guard comment above for why).
+func createPoolSessionBeadWithGuardedAliasPoolShape(
+	bp *agentBuildParams,
+	cfgAgent *config.Agent,
+	template string,
+	qualifiedInstance string,
+	slot int,
+	metadata map[string]string,
+) (session.Info, error) {
+	if bp == nil {
+		return session.Info{}, fmt.Errorf("creating pool session for %q: build params unavailable", template)
+	}
 	if err := validateAgentSessionTransportForBuild(bp, cfgAgent, qualifiedInstance); err != nil {
 		return session.Info{}, err
 	}
@@ -3903,6 +3949,123 @@ func createPoolSessionBeadWithGuardedAlias(
 		fmt.Fprintf(bp.stderr, "createPoolSessionBeadWithGuardedAlias: locking alias %q for %s: %v; creating without alias\n", alias, template, lockErr) //nolint:errcheck
 	}
 	return createPoolSessionBeadWithAlias(bp.beadStore, template, bp.city, bp.sessionBeads, poolSessionCreateStartedAt(bp), identity, "")
+}
+
+// poolCreateBacksSingleNamedSession reports the configured named session a
+// pool create for template would shadow, when that identity is the
+// template's only legitimate session (single-session backing agent). Multi-
+// session templates and templates backing several named identities keep the
+// ordinary pool mint.
+func poolCreateBacksSingleNamedSession(cfg *config.City, cityName, template string) (session.NamedSessionSpec, bool) {
+	specs := session.FindNamedSessionSpecsByBackingTemplate(cfg, cityName, template)
+	if len(specs) != 1 {
+		return session.NamedSessionSpec{}, false
+	}
+	spec := specs[0]
+	if spec.Agent == nil || spec.Agent.SupportsMultipleSessions() {
+		return session.NamedSessionSpec{}, false
+	}
+	// Only mode=always identities own their template's single session
+	// unconditionally. For an on-demand named session, template-routed
+	// demand legitimately materializes an ordinary POOL session while the
+	// identity stays cold (pinned by the OnDemandNamedSession_DefaultRouted*
+	// tests) — minting canonical here would flip hasCanonical for the same
+	// build snapshot and wake the identity uninvited. If the identity is
+	// demanded later, the adoption path converges the pool session then.
+	if spec.Mode != "always" {
+		return session.NamedSessionSpec{}, false
+	}
+	return spec, true
+}
+
+// mintConfiguredNamedSessionBeadForPoolCreate is the ga-dfp1b L2 create-side
+// guard's mint: a pool create routed at a configured single-session named
+// template produces the CANONICAL named bead (full configured_named_* stamp
+// set, identity alias, canonical session_name, session_origin=named, no
+// pool_managed) through the same durable session front door, under the same
+// identifier locks the sync-path named create takes. If the identity's alias
+// or session_name is already held, the create is refused: the holder is the
+// canonical session, and it — not a fresh pool instance — is this template's
+// capacity, so refusal here cannot strand demand.
+func mintConfiguredNamedSessionBeadForPoolCreate(
+	bp *agentBuildParams,
+	spec session.NamedSessionSpec,
+	template string,
+	callerMetadata map[string]string,
+) (session.Info, error) {
+	store := bp.beadStore
+	identity := strings.TrimSpace(spec.Identity)
+	sn := strings.TrimSpace(spec.SessionName)
+	if identity == "" || sn == "" {
+		return session.Info{}, fmt.Errorf("named session spec for pool template %q has empty identity or session name", template)
+	}
+	now := poolSessionCreateStartedAt(bp)
+	var info session.Info
+	minted := false
+	lockErr := session.WithCitySessionIdentifierLocks(bp.cityPath, []string{identity, sn}, func() error {
+		if err := session.EnsureAliasAvailableWithConfigForOwner(store, bp.city, identity, "", identity); err != nil {
+			return fmt.Errorf("configured named session %q already holds pool template %q: %w", identity, template, err)
+		}
+		if err := session.EnsureSessionNameAvailableWithConfigForOwner(store, bp.city, sn, "", identity); err != nil {
+			return fmt.Errorf("configured named session name %q already held for pool template %q: %w", sn, template, err)
+		}
+		// Caller metadata (trigger-bead linkage etc.) first, canonical named
+		// keys after, so a routed-work stamp can never overwrite the identity
+		// — same ordering discipline as the ordinary pool mint.
+		meta := make(map[string]string, len(callerMetadata)+16)
+		for key, value := range callerMetadata {
+			key = strings.TrimSpace(key)
+			if key == "" {
+				continue
+			}
+			meta[key] = strings.TrimSpace(value)
+		}
+		for key, value := range map[string]string{
+			"template":                   template,
+			"agent_name":                 identity,
+			"state":                      string(session.StateStartPending),
+			"pending_create_claim":       "true",
+			"pending_create_started_at":  pendingCreateStartedAtNow(now),
+			"session_origin":             "named",
+			"generation":                 "1",
+			"continuation_epoch":         "1",
+			"instance_token":             session.NewInstanceToken(),
+			"session_name":               sn,
+			"alias":                      identity,
+			namedSessionMetadataKey:      "true",
+			namedSessionIdentityMetadata: identity,
+			namedSessionModeMetadata:     spec.Mode,
+		} {
+			meta[key] = value
+		}
+		meta[session.CanonicalInstanceNameMetadata] = identity
+		// The canonical named bead must never carry pool markers, whatever
+		// the caller passed.
+		delete(meta, poolManagedMetadataKey)
+		delete(meta, "pool_slot")
+		created, err := sessionFrontDoor(store).CreateSessionInfo(session.CreateSpec{
+			Title:     identity,
+			AgentName: identity,
+			Metadata:  meta,
+		})
+		if err != nil {
+			return err
+		}
+		recordLegacyCompareWrites(created.ID, "poolSessionCreate.namedGuard", meta)
+		info = created
+		minted = true
+		if bp.sessionBeads != nil {
+			bp.sessionBeads.addInfo(info)
+		}
+		return nil
+	})
+	if lockErr != nil {
+		return session.Info{}, lockErr
+	}
+	if !minted {
+		return session.Info{}, fmt.Errorf("configured named session %q mint for pool template %q did not complete", identity, template)
+	}
+	return info, nil
 }
 
 func isFailedCreateSessionBead(bead beads.Bead) bool {
@@ -4849,8 +5012,12 @@ func selectOrCreateDependencyPoolSessionBead(
 	_, qualifiedInstance, poolSlot := poolDesiredRequestIdentity(cfgAgent, 1)
 	// Dependency floors are bounded prerequisites for already-realized roots,
 	// so they bypass the ordinary fresh pool create budget. The wake budget
-	// still caps when those floor sessions can actually start.
-	return createPoolSessionBeadWithGuardedAlias(bp, cfgAgent, template, qualifiedInstance, poolSlot, nil)
+	// still caps when those floor sessions can actually start. They also
+	// bypass the ga-dfp1b named-session guard (pool-shape variant): a
+	// dependency desired entry cannot carry ConfiguredNamedIdentity, so a
+	// canonical named mint here would be stripped back to pool shape on its
+	// first sync while squatting the canonical session_name.
+	return createPoolSessionBeadWithGuardedAliasPoolShape(bp, cfgAgent, template, qualifiedInstance, poolSlot, nil)
 }
 
 func reuseTemplateConfig(bp *agentBuildParams) *config.City {
