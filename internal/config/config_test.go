@@ -8431,3 +8431,40 @@ func TestDurationFloorOr(t *testing.T) {
 		})
 	}
 }
+
+func TestOrdersConfigMaxDispatchesPerTickOr(t *testing.T) {
+	cases := []struct {
+		name string
+		set  int
+		def  int
+		want int
+	}{
+		{"unset falls back to default", 0, 4, 4},
+		{"negative falls back to default", -3, 4, 4},
+		{"positive value wins", 16, 4, 16},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := OrdersConfig{MaxDispatchesPerTick: tc.set}
+			if got := c.MaxDispatchesPerTickOr(tc.def); got != tc.want {
+				t.Errorf("MaxDispatchesPerTickOr(%d) with field %d = %d, want %d", tc.def, tc.set, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestOrdersConfigMaxDispatchesPerTickParsesFromTOML(t *testing.T) {
+	cfg, err := Parse([]byte(`
+[workspace]
+name = "test-city"
+
+[orders]
+max_dispatches_per_tick = 12
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := cfg.Orders.MaxDispatchesPerTick; got != 12 {
+		t.Fatalf("Orders.MaxDispatchesPerTick = %d, want 12", got)
+	}
+}

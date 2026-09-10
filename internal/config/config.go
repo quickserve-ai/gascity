@@ -2108,6 +2108,14 @@ type OrdersConfig struct {
 	// timeout only; a condition trigger's check_timeout is a separate probe
 	// deadline and is not capped here.
 	MaxTimeout string `toml:"max_timeout,omitempty"`
+	// MaxDispatchesPerTick caps how many orders the controller fires in one
+	// dispatch pass (one reconciler tick). 0 or negative means the built-in
+	// default. Calibrate to the city's order book: when steady-state demand
+	// (sum of 3600/interval across cooldown orders, in fires/hour) exceeds
+	// cap x ticks-per-hour, every short-interval order dilutes toward the
+	// same round-robin rotation cadence instead of its own interval
+	// (ga-44iyd).
+	MaxDispatchesPerTick int `toml:"max_dispatches_per_tick,omitempty"`
 	// Overrides apply per-order field overrides after scanning.
 	// Each override targets an order by name and optionally by rig.
 	Overrides []OrderOverride `toml:"overrides,omitempty"`
@@ -2170,6 +2178,15 @@ func normalizeLegacyOrderOverrideAliases(cfg *City) {
 // Returns 0 if unset or unparseable (meaning no cap).
 func (c OrdersConfig) MaxTimeoutDuration() time.Duration {
 	return durationOr(c.MaxTimeout, 0)
+}
+
+// MaxDispatchesPerTickOr returns the configured per-tick dispatch cap, or
+// def when the field is unset (<= 0).
+func (c OrdersConfig) MaxDispatchesPerTickOr(def int) int {
+	if c.MaxDispatchesPerTick > 0 {
+		return c.MaxDispatchesPerTick
+	}
+	return def
 }
 
 // DefaultAPIPort is the default TCP port for the API server.

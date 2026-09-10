@@ -10363,3 +10363,17 @@ func TestRunDispatchGuardedRecoversPanic(t *testing.T) {
 		t.Errorf("expected the recovered panic to be logged, got %q", logs.String())
 	}
 }
+
+func TestNewMemoryOrderDispatcherHonorsConfiguredBudget(t *testing.T) {
+	cfg := &config.City{}
+	cfg.Orders.MaxDispatchesPerTick = 16
+	m := newMemoryOrderDispatcher(nil, t.TempDir(), cfg, nil, io.Discard)
+	if m.maxDispatchesPerTick != 16 {
+		t.Fatalf("maxDispatchesPerTick = %d, want 16 (configured)", m.maxDispatchesPerTick)
+	}
+
+	m = newMemoryOrderDispatcher(nil, t.TempDir(), &config.City{}, nil, io.Discard)
+	if m.maxDispatchesPerTick != defaultMaxOrderDispatchesPerTick {
+		t.Fatalf("maxDispatchesPerTick = %d, want default %d when unset", m.maxDispatchesPerTick, defaultMaxOrderDispatchesPerTick)
+	}
+}

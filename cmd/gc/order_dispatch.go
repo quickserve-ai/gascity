@@ -437,7 +437,7 @@ func newMemoryOrderDispatcher(aa []orders.Order, cityPath string, cfg *config.Ci
 		rec:                  rec,
 		stderr:               lockedStderr(stderr),
 		maxTimeout:           cfg.Orders.MaxTimeoutDuration(),
-		maxDispatchesPerTick: defaultMaxOrderDispatchesPerTick,
+		maxDispatchesPerTick: cfg.Orders.MaxDispatchesPerTickOr(defaultMaxOrderDispatchesPerTick),
 		cfg:                  cfg,
 		cityName:             loadedCityName(cfg, cityPath),
 		cityPath:             cityPath,
@@ -494,7 +494,16 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 		if m.maxDispatchesPerTick > 0 {
 			m.nextDispatchStart = (idx + 1) % total
 		}
-		return m.maxDispatchesPerTick > 0 && budgetSpent >= m.maxDispatchesPerTick
+		if m.maxDispatchesPerTick > 0 && budgetSpent >= m.maxDispatchesPerTick {
+			// The pass ends with orders unvisited. Under sustained overload
+			// (steady-state due demand above cap x tick rate) every
+			// short-interval order dilutes toward the round-robin rotation
+			// cadence; this line is the durable record that the budget, not
+			// the orders, set the pace (ga-44iyd).
+			logDispatchError(m.stderr, "gc: order dispatch: per-tick budget (%d) spent; remaining orders wait for the next tick — raise [orders] max_dispatches_per_tick if LATE fires persist", m.maxDispatchesPerTick)
+			return true
+		}
+		return false
 	}
 
 	for offset := 0; offset < total; offset++ {
