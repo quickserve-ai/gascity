@@ -489,18 +489,23 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 	if m.maxDispatchesPerTick > 0 {
 		start = m.nextDispatchStart % total
 	}
-	spendDispatchBudget := func(idx int) bool {
+	// spendDispatchBudget records one dispatch against the per-tick budget.
+	// offset is the loop's progress through the rotation: when the budget
+	// exhausts with offset < total-1, orders were left unvisited this pass.
+	spendDispatchBudget := func(idx, offset int) bool {
 		budgetSpent++
 		if m.maxDispatchesPerTick > 0 {
 			m.nextDispatchStart = (idx + 1) % total
 		}
 		if m.maxDispatchesPerTick > 0 && budgetSpent >= m.maxDispatchesPerTick {
-			// The pass ends with orders unvisited. Under sustained overload
-			// (steady-state due demand above cap x tick rate) every
-			// short-interval order dilutes toward the round-robin rotation
-			// cadence; this line is the durable record that the budget, not
-			// the orders, set the pace (ga-44iyd).
-			logDispatchError(m.stderr, "gc: order dispatch: per-tick budget (%d) spent; remaining orders wait for the next tick — raise [orders] max_dispatches_per_tick if LATE fires persist", m.maxDispatchesPerTick)
+			if unvisited := total - 1 - offset; unvisited > 0 {
+				// The pass ends with orders unvisited. Under sustained
+				// overload (steady-state due demand above cap x tick rate)
+				// every short-interval order dilutes toward the round-robin
+				// rotation cadence; this line is the durable record that the
+				// budget, not the orders, set the pace (ga-44iyd).
+				logDispatchError(m.stderr, "gc: order dispatch: per-tick budget (%d) spent with %d order(s) unvisited; they wait for the next tick — raise [orders] max_dispatches_per_tick if LATE fires persist", m.maxDispatchesPerTick, unvisited)
+			}
 			return true
 		}
 		return false
@@ -607,7 +612,7 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 				Subject: a.ScopedName(),
 				Message: msg,
 			})
-			if spendDispatchBudget(idx) {
+			if spendDispatchBudget(idx, offset) {
 				return
 			}
 			continue
@@ -702,7 +707,7 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 		if result.Late {
 			logDispatchError(m.stderr, "gc: order dispatch: %s fired LATE — %s (missed cycles; trend: ga-44iyd)", scoped, result.Reason)
 		}
-		if spendDispatchBudget(idx) {
+		if spendDispatchBudget(idx, offset) {
 			return
 		}
 	}

@@ -270,8 +270,8 @@ type City struct {
 	Formulas FormulasConfig `toml:"formulas,omitempty"`
 	// Daemon configures controller daemon settings.
 	Daemon DaemonConfig `toml:"daemon,omitempty"`
-	// Orders configures order settings: skip list, max_timeout cap, and
-	// per-order overrides.
+	// Orders configures order settings: skip list, max_timeout cap, the
+	// per-tick dispatch budget, and per-order overrides.
 	Orders OrdersConfig `toml:"orders,omitempty"`
 	// API configures the optional HTTP API server.
 	API APIConfig `toml:"api,omitempty"`
@@ -2114,7 +2114,10 @@ type OrdersConfig struct {
 	// (sum of 3600/interval across cooldown orders, in fires/hour) exceeds
 	// cap x ticks-per-hour, every short-interval order dilutes toward the
 	// same round-robin rotation cadence instead of its own interval
-	// (ga-44iyd).
+	// (ga-44iyd). Each fire costs a tracking-bead write plus an async
+	// dispatch goroutine, and the pass runs its open-work gates inline,
+	// so very large values trade tick latency and store write volume for
+	// cadence; size to steady-state demand with modest headroom.
 	MaxDispatchesPerTick int `toml:"max_dispatches_per_tick,omitempty"`
 	// Overrides apply per-order field overrides after scanning.
 	// Each override targets an order by name and optionally by rig.
