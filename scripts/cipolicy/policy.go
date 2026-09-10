@@ -82,6 +82,10 @@ const (
 	// TestBeadsProxiedIgnoresUserLevelSharedServer (-timeout 15m) and its job
 	// cap moves 90 -> 105 minutes to keep the step budget under it. Reviewed
 	// delta: one test step and the cap, no new job, trigger or permission.
+	//
+	// Carry (ga-azybk8): the go-mod-warm composite step, one deterministic
+	// module warm per job ahead of every go command; the hashes below are
+	// recomputed from the carried workflows at each re-sync.
 	expectedCIExecutionHash     = "10f31160f31aa60e705a2098ae2722ec82e4fd14dc76895800b8d0acab486416"
 	expectedNightlyTriggersHash = "0a4400a09ac567e90adf8be1232eef1f14e36efd8dba3e143aa6e36f5b7a36f5"
 	// Nightly: reviewed delta Beads v1.3.0-rc.2 -> v1.3.0, then (round3 review,
