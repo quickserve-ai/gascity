@@ -1,0 +1,158 @@
+# Fleet release: build one fleet unit of gc on GitHub and publish it as the
+# attestation the fleet consumes (qc-bridge shared/fleet-gc-binary-roll.v1.md,
+# gc-970o). A unit is an annotated fleet/YYYY-MM-DD tag on carry/operational.
+#
+# Two triggers: pushing a fleet/* tag builds that tag; workflow_dispatch builds
+# a tag that already exists (a unit cut before this workflow did, or a rebuild).
+# Either way the checkout is fresh and refused unless `git describe` names the
+# exact tag, so the Makefile stamps main.version from the tag and main.commit
+# can never carry -dirty. The build uses -tags gms_pure_go, the tag the fleet's
+# bd binary carries, so the binary links no ICU library and runs on any machine
+# of its platform. The release on the tag holds one asset per platform,
+# SHA256SUMS, and the `go version -m` identity per asset.
+name: Fleet release
+
+on:
+  push:
+    tags:
+      - "fleet/**"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing fleet tag to build and publish, e.g. fleet/2026-09-10"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: fleet-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  FLEET_TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: build (${{ matrix.platform }})
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux-amd64
+          - os: macos-15
+            platform: darwin-arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: refs/tags/${{ env.FLEET_TAG }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: Refuse anything but a clean checkout at the tag
+        run: |
+          set -euo pipefail
+          described="$(git describe --tags --exact-match)"
+          if [ "$described" != "$FLEET_TAG" ]; then
+            echo "checkout describes as '$described', not '$FLEET_TAG'" >&2
+            exit 1
+          fi
+          if [ -n "$(git status --porcelain)" ]; then
+            git status --porcelain >&2
+            echo "tree is not clean" >&2
+            exit 1
+          fi
+          echo "unit $FLEET_TAG = $(git rev-parse HEAD)"
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+      - name: Build the unit
+        env:
+          GOFLAGS: -tags=gms_pure_go
+        run: make build
+      - name: Verify the identity and self-containment
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          identity="$(go version -m bin/gc)"
+          printf '%s\n' "$identity" | grep -E 'main\.|-ldflags|-tags'
+          printf '%s\n' "$identity" | grep -q -- "-X main.version=${FLEET_TAG} " || { echo "main.version is not the tag" >&2; exit 1; }
+          printf '%s\n' "$identity" | grep -q -- '-tags=gms_pure_go' || { echo "not built with gms_pure_go" >&2; exit 1; }
+          if printf '%s\n' "$identity" | grep -q -- '-dirty'; then echo "dirty build" >&2; exit 1; fi
+          case "$PLATFORM" in
+            linux-*)  if ldd bin/gc | grep -qi icu; then ldd bin/gc >&2; echo "links ICU" >&2; exit 1; fi ;;
+            darwin-*) if otool -L bin/gc | grep -qi icu; then otool -L bin/gc >&2; echo "links ICU" >&2; exit 1; fi ;;
+          esac
+          ./bin/gc version
+      - name: Name and checksum the asset
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          safe="$(printf '%s' "$FLEET_TAG" | tr '/' '-')"
+          asset="gc-${safe}-${PLATFORM}"
+          mkdir -p out
+          cp bin/gc "out/${asset}"
+          chmod 0755 "out/${asset}"
+          (cd out && shasum -a 256 "${asset}" > "${asset}.sha256")
+          go version -m "out/${asset}" > "out/${asset}.go-version-m"
+          git rev-parse HEAD > out/commit
+          cat "out/${asset}.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.platform }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: publish the release on the tag
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Assemble SHA256SUMS and verify every asset against it
+        run: |
+          set -euo pipefail
+          cd assets
+          cat ./*.sha256 | sort -k2 > SHA256SUMS
+          rm -f ./*.sha256
+          sha256sum -c SHA256SUMS
+          ls -la
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          commit="$(cat assets/commit)"
+          rm -f assets/commit
+          notes="$(mktemp)"
+          {
+            echo "Fleet unit \`${FLEET_TAG}\` = \`${commit}\` on carry/operational."
+            echo
+            echo "Built from a fresh checkout at the tag with the Makefile's ldflags and \`-tags gms_pure_go\` (no ICU linkage) by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}. This release is the unit's attestation; the identity per asset is in its \`.go-version-m\` file. Consuming recipe: qc-bridge \`shared/fleet-gc-binary-roll.v1.md\`."
+            echo
+            echo '```'
+            cat assets/SHA256SUMS
+            echo '```'
+          } > "$notes"
+          if gh release view "$FLEET_TAG" >/dev/null 2>&1; then
+            gh release upload "$FLEET_TAG" assets/* --clobber
+            gh release edit "$FLEET_TAG" --title "fleet unit ${FLEET_TAG}" --notes-file "$notes"
+          else
+            gh release create "$FLEET_TAG" assets/* --verify-tag --title "fleet unit ${FLEET_TAG}" --notes-file "$notes"
+          fi
+          gh release view "$FLEET_TAG"
