@@ -1,0 +1,59 @@
+name: Warm the Go module cache
+description: Download and verify the whole Go module graph once per job, with bounded retries
+
+runs:
+  using: composite
+  steps:
+    - name: Warm the Go module cache
+      shell: bash
+      # Checksum verification stays fully on — nothing here relaxes GOFLAGS,
+      # GOPROXY, GOSUMDB or GONOSUMCHECK. The point is *where* the fetch
+      # happens, not whether it is verified: the deps the proxy 404s (forks,
+      # pseudo-versions) are fetched direct and verified direct against
+      # sum.golang.org, and that path served HTTP/2 INTERNAL_ERROR reading
+      # checksum tiles — on a cold cache every shard hit it independently, so
+      # the flake scaled with the matrix (ga-azybk8). Pull the whole graph
+      # here, once, and this becomes the only step that has to survive a
+      # transient tile read; later go commands that resolve THIS repo's module
+      # graph read the warm cache. Separately-resolved graphs stay out of
+      # scope: `go install ext/tool@version` and separately cloned repos fetch
+      # their own graphs (install-bd-lockstep.sh carries its own copy of this
+      # loop for exactly that reason).
+      # Retry on any nonzero exit — a deterministic failure just costs the two
+      # extra attempts, which is cheaper than teaching this loop to classify
+      # transport errors it would misread.
+      run: |
+        set -uo pipefail
+        cd "${GITHUB_WORKSPACE:-$PWD}"
+        max=3
+        attempt=1
+        while :; do
+          # Captured inside `if` because the runner invokes this shell with
+          # -e: a bare failing assignment-from-substitution would exit the
+          # step before status=$?, silently defeating the retry (verified
+          # under bash --noprofile --norc -e -o pipefail). Unpiped on
+          # purpose: a `go mod download all | tee` would report tee's exit
+          # code and swallow every failure this loop exists for.
+          if output="$(go mod download all 2>&1)"; then
+            status=0
+          else
+            status=$?
+          fi
+          if [[ $status -eq 0 ]]; then
+            printf '%s\n' "$output"
+            echo "go mod download all succeeded on attempt ${attempt}/${max}"
+            break
+          fi
+          printf 'attempt %d/%d: go mod download all exited %d\n' "$attempt" "$max" "$status" >&2
+          printf '%s\n' "$output" >&2
+          if [[ $attempt -ge $max ]]; then
+            echo "go mod download all failed after ${max} attempts; exiting ${status}" >&2
+            exit "$status"
+          fi
+          if [[ $attempt -eq 1 ]]; then
+            sleep 5
+          else
+            sleep 15
+          fi
+          attempt=$((attempt + 1))
+        done

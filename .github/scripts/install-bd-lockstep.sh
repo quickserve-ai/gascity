@@ -123,9 +123,35 @@ else
   # scan) can then equate it with go.mod's pin instead of warning on an
   # anonymous "1.1.0 (dev)" — a label byte-identical to the skewed tarball
   # binary this installer exists to replace.
-  GOBIN="$bin_dir" CGO_ENABLED=1 go install -tags gms_pure_go \
-    -ldflags "-X main.Version=${resolved_version#v}" \
-    "${resolved_path}/cmd/bd@${resolved_version}"
+  # `go install pkg@version` resolves bd's own module graph, not this repo's,
+  # so the go-mod-warm step upstream does not cover it: these checksums are
+  # fetched and verified here, on their own trip to sum.golang.org. Same flake
+  # class (transient HTTP/2 INTERNAL_ERROR on a checksum tile), same bounded
+  # backoff (ga-azybk8). Verification is untouched.
+  install_attempt=1
+  install_max=3
+  while :; do
+    set +e
+    GOBIN="$bin_dir" CGO_ENABLED=1 go install -tags gms_pure_go \
+      -ldflags "-X main.Version=${resolved_version#v}" \
+      "${resolved_path}/cmd/bd@${resolved_version}"
+    install_status=$?
+    set -e
+    if ((install_status == 0)); then
+      break
+    fi
+    echo "attempt ${install_attempt}/${install_max}: go install bd exited ${install_status}" >&2
+    if ((install_attempt >= install_max)); then
+      echo "go install bd failed after ${install_max} attempts; exiting ${install_status}" >&2
+      exit "$install_status"
+    fi
+    if ((install_attempt == 1)); then
+      sleep 5
+    else
+      sleep 15
+    fi
+    install_attempt=$((install_attempt + 1))
+  done
 fi
 
 if [[ ! -x "$target" ]]; then
