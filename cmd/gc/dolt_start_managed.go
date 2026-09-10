@@ -30,7 +30,15 @@ type managedDoltStartReport struct {
 }
 
 type managedDoltStartedProcess struct {
-	CityPath    string
+	CityPath string
+	// ConfigFile is the server's --config path, which is also the anchor for
+	// its stop-intent marker (ga-drkbcd, dolt_stop_intent.go). Startup-failure
+	// cleanup is one of gc's own stop paths, so it has to record an intent like
+	// any other stopper; carrying the config path on the started process is
+	// what lets terminateManagedDoltStartedProcess do that without re-resolving
+	// a layout. Empty when the caller did not record one — the marker write is
+	// then skipped, exactly as it is for a zero PID.
+	ConfigFile  string
 	PID         int
 	WatchdogPID int
 	DisarmFile  string
@@ -234,6 +242,11 @@ func startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel str
 			return report, err
 		}
 		_ = logFile.Close()
+		// ga-drkbcd: stamped here rather than inside each spawn helper so every
+		// startup-failure teardown below — including the readiness timeout,
+		// which is a routine event on a loaded box — can record a stop intent
+		// and be recognized by the watchdog as a stop gc asked for.
+		started.ConfigFile = layout.ConfigFile
 
 		report.PID = started.PID
 		report.Port = currentPort
@@ -764,6 +777,19 @@ var managedDoltCleanupLogf = func(format string, args ...any) {
 
 func terminateManagedDoltStartedProcess(started managedDoltStartedProcess) {
 	unregisterManagedDoltStartedProcess(started)
+	// ga-drkbcd: this teardown is one of gc's OWN stop paths. It SIGTERMs a
+	// server that answers by exiting status 0, which is the exact branch the
+	// scope watchdog now alarms on — and it runs on every startup failure,
+	// including the readiness timeout that a loaded box produces routinely.
+	// Without a marker each of those would escalate a CRITICAL "the data plane
+	// stopped and nobody asked" into the emergency spool for a stop we asked
+	// for ourselves. The marker names the dolt PID; the watchdog PID signalled
+	// below is covered by the same record, because the watchdog's signal path
+	// consults it too. Advisory, like every other marker write: a failure costs
+	// a false alarm, never the teardown.
+	if err := recordManagedDoltStopIntent(started.ConfigFile, started.PID, "gc managed dolt startup-failure cleanup"); err != nil {
+		managedDoltCleanupLogf("recording startup-failure stop intent for pid %d: %v", started.PID, err)
+	}
 	// The reap goroutine in startManagedDoltSQLServer (and the scope watchdog)
 	// Wait()s a failed child and frees its PID, so an unrelated process can reuse
 	// it before — or during — this same-attempt cleanup; signaling by bare PID

@@ -190,3 +190,66 @@ func TestTruncateManagedDoltStopIntentField(t *testing.T) {
 		t.Errorf("truncate trimmed value = %q, want %q", got, "short")
 	}
 }
+
+// TestManagedDoltStartupFailureTeardownRecordsStopIntent is the ga-drkbcd D1
+// regression. gc's OWN startup-failure teardown
+// (terminateManagedDoltStartedProcess) signals the server it just spawned, and
+// dolt answers SIGTERM by exiting status 0 — the branch the watchdog now
+// alarms on. The readiness timeout that reaches this teardown is a routine
+// event on a loaded box, so without an intent marker every one of them would
+// raise a CRITICAL alarm into the emergency spool for a stop gc asked for
+// itself. The teardown must therefore record its intent like any other stopper.
+func TestManagedDoltStartupFailureTeardownRecordsStopIntent(t *testing.T) {
+	readyPath := filepath.Join(t.TempDir(), "ready")
+	var serverPID int
+	cityPath := installStartManagedDoltLoopStubs(t, startManagedDoltLoopStubs{
+		startFn: func(cityPath, configFile, _ string, _ *os.File) (managedDoltStartedProcess, error) {
+			// A server that shuts down gracefully on SIGTERM, exactly as dolt
+			// does — so the teardown below produces a status-0 exit.
+			serverPID = startFakeOwnedManagedDolt(t, configFile,
+				"trap 'exit 0' TERM\n"+
+					": > \"$GC_TEST_READY\"\n"+
+					"while : ; do sleep 0.05; done\n",
+				"GC_TEST_READY="+readyPath)
+			waitForFakeManagedDoltReady(t, readyPath)
+			return managedDoltStartedProcess{CityPath: cityPath, PID: serverPID}, nil
+		},
+		// The readiness-timeout shape: the process is alive, it just never
+		// answered a query in time.
+		waitReadyFn: func(_, _, _, _ string, _ int, _ time.Duration, _ bool) (managedDoltWaitReadyReport, error) {
+			return managedDoltWaitReadyReport{Ready: false, PIDAlive: true}, nil
+		},
+		logSuffixFn:     func(string, int64) (string, error) { return "", nil },
+		portAvailableFn: func(string, int) bool { return true },
+	})
+	layout, err := resolveManagedDoltRuntimeLayout(cityPath)
+	if err != nil {
+		t.Fatalf("resolve managed dolt layout: %v", err)
+	}
+
+	startedAt := time.Now()
+	_, err = startManagedDoltProcessWithOptions(cityPath, "127.0.0.1", "17991", "root", "warning", -1, 50*time.Millisecond, false)
+	if err == nil {
+		t.Fatal("expected the readiness timeout to fail the start")
+	}
+	if !strings.Contains(err.Error(), "did not become query-ready") {
+		t.Fatalf("start failed for the wrong reason: %v", err)
+	}
+	if serverPID <= 0 {
+		t.Fatal("the stubbed spawn never produced a server pid")
+	}
+
+	// What the watchdog sees when the teardown's SIGTERM lands: a status-0 exit
+	// of the server it supervises. It must be attributable to gc, not an alarm.
+	report := classifyManagedDoltWatchdogChildExit(
+		observeManagedDoltWatchdogChildExit(serverPID, layout.ConfigFile, layout.LogFile, startedAt, nil, false))
+	if report.Alarm {
+		t.Errorf("gc's own startup-failure teardown raised a CRITICAL alarm: %v", report.Lines)
+	}
+	if report.Cause != managedDoltExitCauseRequested {
+		t.Errorf("teardown exit classified %q, want %q (covered by a stop intent)", report.Cause, managedDoltExitCauseRequested)
+	}
+	if report.AlarmMessage != "" {
+		t.Errorf("teardown exit produced an alarm message: %q", report.AlarmMessage)
+	}
+}

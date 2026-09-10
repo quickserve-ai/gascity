@@ -82,7 +82,15 @@ func waitForManagedDoltProcessExit(pid int, timeout time.Duration, alive func(in
 	}
 }
 
-func stopManagedDoltProcessWithOptions(cityPath, port string, clearPublishedState bool) (managedDoltStopReport, error) {
+// stopManagedDoltProcessWithOptions is written with named results because the
+// stop-intent marker it records before signaling must be taken back down again
+// on EVERY error return past that point (ga-drkbcd). A failed stop that left
+// its marker behind would leave a fresh record vouching for a still-live PID,
+// and inside the marker's TTL the next genuinely unexpected status-0 exit of
+// that PID would be read as a shutdown we requested — reinstating the 2026-08-15
+// silence this marker exists to end. One deferred clear covers every failure
+// exit, including ones added later.
+func stopManagedDoltProcessWithOptions(cityPath, port string, clearPublishedState bool) (report managedDoltStopReport, err error) {
 	layout, err := resolveManagedDoltRuntimeLayout(cityPath)
 	if err != nil {
 		return managedDoltStopReport{}, err
@@ -91,7 +99,7 @@ func stopManagedDoltProcessWithOptions(cityPath, port string, clearPublishedStat
 	if err != nil {
 		return managedDoltStopReport{}, err
 	}
-	report := managedDoltStopReport{}
+	report = managedDoltStopReport{}
 	targetPID := 0
 	switch {
 	case info.ManagedPID > 0 && info.ManagedOwned && managedDoltProcessControllable(info.ManagedPID, layout):
@@ -128,9 +136,24 @@ func stopManagedDoltProcessWithOptions(cityPath, port string, clearPublishedStat
 	// can tell the two apart; without it the watchdog must either alarm on
 	// every requested stop or stay silent on every unrequested one. Advisory:
 	// a marker that fails to land costs a false alarm, never the stop.
-	if err := recordManagedDoltStopIntent(layout.ConfigFile, targetPID, "gc managed dolt stop"); err != nil {
-		managedDoltCleanupLogf("recording stop intent for pid %d: %v", targetPID, err)
+	intentRecorded := false
+	if recordErr := recordManagedDoltStopIntent(layout.ConfigFile, targetPID, "gc managed dolt stop"); recordErr != nil {
+		managedDoltCleanupLogf("recording stop intent for pid %d: %v", targetPID, recordErr)
+	} else {
+		intentRecorded = true
 	}
+	// The marker vouches for a stop that COMPLETES. Every error return below
+	// leaves the server in an unknown state — usually still running — so the
+	// marker must not survive: a stop that failed explains no future exit.
+	// clearManagedDoltRuntime already clears it on the success paths.
+	defer func() {
+		if err == nil || !intentRecorded {
+			return
+		}
+		if clearErr := clearManagedDoltStopIntent(layout.ConfigFile); clearErr != nil {
+			managedDoltCleanupLogf("clearing stop intent after a failed stop of pid %d: %v", targetPID, clearErr)
+		}
+	}()
 	if managedStopPIDAlive(targetPID) {
 		if err := syscall.Kill(targetPID, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
 			return report, fmt.Errorf("signal %d with SIGTERM: %w", targetPID, err)
