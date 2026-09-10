@@ -328,9 +328,66 @@ func TestStopManagedDoltProcessWritesTheStopIntentThroughTheProductionPath(t *te
 	if !managedDoltStopIntentCovers(intent, pid, time.Now()) {
 		t.Errorf("the marker the production stop wrote does not cover the exit it was written for: %+v", intent)
 	}
-	// The marker must not outlive the stop it recorded.
-	if _, found := readManagedDoltStopIntent(layout.ConfigFile); found {
-		t.Error("the stop-intent marker survived a completed stop")
+
+	// The marker must OUTLIVE the stop. The watchdog reads it from another
+	// process after its child exits, so a stop that deleted the marker on its
+	// way out would race that read and turn a shutdown gc requested into a
+	// CRITICAL alarm. Expiry is the TTL's job, not the stop's.
+	survivor, found := readManagedDoltStopIntent(layout.ConfigFile)
+	if !found {
+		t.Fatal("the completed stop deleted its own marker; the watchdog can no longer explain the exit it caused")
+	}
+	exitReport := classifyManagedDoltWatchdogChildExit(
+		observeManagedDoltWatchdogChildExit(pid, layout.ConfigFile, layout.LogFile, time.Now().Add(-time.Minute), nil, false))
+	if exitReport.Alarm || exitReport.Cause != managedDoltExitCauseRequested {
+		t.Errorf("the watchdog read the completed stop as %q (alarm=%v); want %q (marker: %+v)",
+			exitReport.Cause, exitReport.Alarm, managedDoltExitCauseRequested, survivor)
+	}
+}
+
+// TestStopManagedDoltProcessMarkerOutlivesALongConfiguredShutdown is the
+// ga-drkbcd P2b regression. The marker's default 10-minute TTL is shorter than
+// a `[daemon] dolt_stop_timeout` an operator is allowed to configure, so a
+// graceful shutdown that legitimately takes longer than the default would
+// outlive its own authorization and alarm as if nobody had asked. The stop path
+// therefore sizes the marker to its own grace window.
+func TestStopManagedDoltProcessMarkerOutlivesALongConfiguredShutdown(t *testing.T) {
+	cityPath, layout := newManagedDoltStopFixture(t, `
+[workspace]
+name = "test"
+
+[daemon]
+dolt_stop_timeout = "15m"
+
+[[agent]]
+name = "mayor"
+`)
+	readyPath := filepath.Join(t.TempDir(), "ready")
+	pid := startFakeOwnedManagedDolt(t, layout.ConfigFile,
+		"trap 'exit 0' TERM\n"+
+			": > \"$GC_TEST_READY\"\n"+
+			"while : ; do sleep 0.05; done\n",
+		"GC_TEST_READY="+readyPath,
+	)
+	waitForFakeManagedDoltReady(t, readyPath)
+	writeFakeManagedDoltPIDFile(t, layout, pid)
+
+	if _, err := stopManagedDoltProcessWithOptions(cityPath, "", false); err != nil {
+		t.Fatalf("stop the stand-in managed dolt: %v", err)
+	}
+	intent, found := readManagedDoltStopIntent(layout.ConfigFile)
+	if !found {
+		t.Fatal("the stop wrote no marker")
+	}
+	// A shutdown that took eleven minutes — inside the configured fifteen — is
+	// still a stop gc asked for.
+	if !managedDoltStopIntentCovers(intent, pid, time.Now().Add(11*time.Minute)) {
+		t.Errorf("a marker written under a 15m stop timeout stopped vouching after 11m: %+v", intent)
+	}
+	// It must still expire: past the configured window plus its slack, nothing
+	// vouches for the pid any more.
+	if managedDoltStopIntentCovers(intent, pid, time.Now().Add(30*time.Minute)) {
+		t.Errorf("the marker never expires: %+v", intent)
 	}
 }
 

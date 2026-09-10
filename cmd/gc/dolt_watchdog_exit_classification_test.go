@@ -93,16 +93,45 @@ func TestClassifyManagedDoltWatchdogChildExit(t *testing.T) {
 			wantContain: []string{"ALARM UNEXPECTED CLEAN EXIT"},
 		},
 		{
-			name: "a signal racing the exit is a requested stop, not an alarm",
+			// A signal AUTHORIZES NOTHING. On 2026-08-15 an unattributable
+			// SIGTERM reached the watchdog seven minutes after the first
+			// outage; had it raced the child's status-0 exit, treating the
+			// pending signal as consent would have rendered both events of that
+			// day as an orderly shutdown. Only a stop-intent marker gc wrote
+			// can authorize — the same rule the signal path itself applies.
+			name: "an UNCOVERED signal racing the exit still alarms",
 			exit: managedDoltWatchdogChildExit{
 				PID: 17493, WatchdogPID: 17490, Uptime: time.Minute, Now: now,
 				SignalPending: true,
 			},
-			wantCause:   managedDoltExitCauseRequested,
-			wantAlarm:   false,
-			wantExit:    0,
-			wantContain: []string{"exited cleanly", "stop signal delivered to this watchdog"},
-			wantAbsent:  []string{"ALARM"},
+			wantCause: managedDoltExitCauseUnexpectedClean,
+			wantAlarm: true,
+			wantExit:  1,
+			wantContain: []string{
+				"ALARM UNEXPECTED CLEAN EXIT",
+				"a stop signal was pending at this watchdog",
+				"no gc stop intent covers it",
+			},
+			wantAbsent: []string{"exited cleanly"},
+		},
+		{
+			// The signal is still worth saying out loud when a marker DOES
+			// cover the exit: it explains which of gc's stop paths ran.
+			name: "a signal covered by a marker enriches the requested wording",
+			exit: managedDoltWatchdogChildExit{
+				PID: 17493, WatchdogPID: 17490, Uptime: time.Minute, Now: now,
+				Intent: freshIntent, IntentFound: true, SignalPending: true,
+			},
+			wantCause: managedDoltExitCauseRequested,
+			wantAlarm: false,
+			wantExit:  0,
+			wantContain: []string{
+				"exited cleanly",
+				"stop requested by",
+				"gc managed dolt stop",
+				"stop signal was also delivered to this watchdog",
+			},
+			wantAbsent: []string{"ALARM"},
 		},
 		{
 			name: "a non-zero exit keeps the existing error wording",

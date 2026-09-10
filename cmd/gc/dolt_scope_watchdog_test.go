@@ -925,3 +925,51 @@ func TestManagedDoltWatchdogSupervisorChannelTakesOnlyARegularFile(t *testing.T)
 		t.Errorf("expected exactly one summary line (a blank summary must be dropped): %q", written)
 	}
 }
+
+// TestManagedDoltScopeWatchdogReportsALostEventLogWrite is the ga-drkbcd P2c
+// regression. The emergency spool is the durable record, but the live channel
+// automation watches is .gc/events.jsonl — and the FileRecorder behind it
+// reports flock timeouts and append failures to a diagnostic writer rather than
+// returning them. Discarding that writer made a LOST live alarm look like a
+// delivered one, which is the same class of defect as the silence this bead
+// exists to remove: the evidence existed and nothing carried it anywhere.
+func TestManagedDoltScopeWatchdogReportsALostEventLogWrite(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX flock semantics required")
+	}
+	dir := t.TempDir()
+	fakeDoltDir := writeScriptedFakeDoltSQLServer(t, "echo 'INFO dolt: leaving'\nsleep 1\nexit 0\n")
+	configPath := filepath.Join(dir, "dolt-config.yaml")
+	logPath := filepath.Join(dir, "dolt.log")
+	if err := os.WriteFile(configPath, []byte("log_level: debug\n"), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	// Hold the city event log's flock for the whole test, so the watchdog's
+	// mirror into it times out the way a wedged writer makes it time out in
+	// production. runScopeWatchdogHelper uses this exact city path.
+	eventDir := filepath.Join(dir, "city", ".gc")
+	if err := os.MkdirAll(eventDir, 0o755); err != nil {
+		t.Fatalf("create city runtime dir: %v", err)
+	}
+	eventLog, err := os.OpenFile(filepath.Join(eventDir, "events.jsonl"), os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatalf("create city event log: %v", err)
+	}
+	defer eventLog.Close() //nolint:errcheck
+	if err := syscall.Flock(int(eventLog.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("hold the city event log lock: %v", err)
+	}
+	defer syscall.Flock(int(eventLog.Fd()), syscall.LOCK_UN) //nolint:errcheck
+
+	_, _, cityPath := runScopeWatchdogHelper(t, fakeDoltDir, dir, configPath, logPath)
+
+	logData := waitForWatchdogLogText(t, logPath, "events: lock", 20*time.Second)
+	if !strings.Contains(logData, "ALARM UNEXPECTED CLEAN EXIT") {
+		t.Errorf("the alarm itself is missing; log:\n%s", logData)
+	}
+	// The spool is the durable record and must still have landed.
+	if record := readManagedDoltEmergencySpoolRecord(t, cityPath); !strings.Contains(record, "no stop request from gc") {
+		t.Errorf("the emergency spool record is missing or wrong:\n%s", record)
+	}
+}

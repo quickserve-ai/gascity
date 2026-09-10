@@ -133,6 +133,13 @@ type managedDoltWatchdogAlarm struct {
 	Cause      string
 	Message    string
 	DoltPID    int
+	// Diagnostics receives the events.jsonl recorder's own complaints. The
+	// FileRecorder reports flock timeouts and append failures to this writer
+	// instead of returning them, so discarding it makes a LOST live alarm
+	// indistinguishable from a delivered one — the same failure shape as the
+	// silence this whole mechanism exists to end. Callers point it at dolt.log.
+	// nil discards, for callers that have nowhere to put it.
+	Diagnostics io.Writer
 }
 
 // escalateManagedDoltWatchdogAlarm writes the alarm to the city emergency spool
@@ -175,8 +182,12 @@ func escalateManagedDoltWatchdogAlarm(alarm managedDoltWatchdogAlarm) (string, e
 		return "", fmt.Errorf("write emergency spool: %w", err)
 	}
 	// The spool file is already durable at this point; a failure to mirror into
-	// events.jsonl loses the live channel, not the record.
-	if err := emergency.RecordSignaledToCityLog(alarm.CityPath, rec, io.Discard); err != nil {
+	// events.jsonl loses the live channel, not the record — but it must SAY so.
+	diagnostics := alarm.Diagnostics
+	if diagnostics == nil {
+		diagnostics = io.Discard
+	}
+	if err := emergency.RecordSignaledToCityLog(alarm.CityPath, rec, diagnostics); err != nil {
 		return spoolPath, fmt.Errorf("mirror emergency to events.jsonl: %w", err)
 	}
 	return spoolPath, nil

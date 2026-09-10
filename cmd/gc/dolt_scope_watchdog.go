@@ -371,6 +371,9 @@ func reportManagedDoltWatchdogExitAlarm(logFile *os.File, cityPath, configFile s
 		Cause:      string(report.Cause),
 		Message:    report.AlarmMessage,
 		DoltPID:    doltPID,
+		// The event-log recorder complains to this writer instead of failing,
+		// so a lost live alarm leaves a line in dolt.log rather than nothing.
+		Diagnostics: logFile,
 	})
 	if err != nil {
 		fmt.Fprintf(logFile, "gc scope watchdog: ALARM UNEXPECTED CLEAN EXIT: escalation failed, this stop is recorded in dolt.log ONLY: %v\n", err) //nolint:errcheck
@@ -402,12 +405,13 @@ func reportManagedDoltWatchdogStopSignal(logFile *os.File, cityPath, configFile 
 		writeManagedDoltWatchdogSupervisorSummary(report.Lines[0])
 	}
 	spoolPath, err := escalateManagedDoltWatchdogAlarm(managedDoltWatchdogAlarm{
-		CityPath:   cityPath,
-		ConfigFile: configFile,
-		Severity:   report.Severity,
-		Cause:      report.Cause,
-		Message:    report.Message,
-		DoltPID:    doltPID,
+		CityPath:    cityPath,
+		ConfigFile:  configFile,
+		Severity:    report.Severity,
+		Cause:       report.Cause,
+		Message:     report.Message,
+		DoltPID:     doltPID,
+		Diagnostics: logFile,
 	})
 	if err != nil {
 		fmt.Fprintf(logFile, "gc scope watchdog: stop signal attribution: escalation failed, this stop is recorded in dolt.log ONLY: %v\n", err) //nolint:errcheck

@@ -41,15 +41,27 @@ const (
 	// server's pack state dir (the directory holding its --config file).
 	managedDoltStopIntentFileName = "dolt-stop-intent.json"
 
-	// managedDoltStopIntentTTL bounds how long a marker can vouch for a clean
-	// exit. It only has to outlast one stop: SIGTERM, the configured
-	// SIGTERM→SIGKILL grace (config.DefaultDoltStopTimeout, 30s), and dolt's
-	// own journal flush. Ten minutes is far past that while still guaranteeing
-	// a marker abandoned by a crashed stopper cannot silence a later unexpected
-	// exit indefinitely. The primary staleness defense is not the TTL but the
-	// PID match plus the clear-on-spawn in startManagedDoltProcessWithOptions:
-	// a marker can only ever name the current server generation.
+	// managedDoltStopIntentTTL is the DEFAULT window in which a marker can
+	// vouch for a clean exit. It only has to outlast one stop: SIGTERM, the
+	// configured SIGTERM→SIGKILL grace (config.DefaultDoltStopTimeout, 30s),
+	// and dolt's own journal flush. Ten minutes is far past that while still
+	// guaranteeing a marker abandoned by a crashed stopper cannot silence a
+	// later unexpected exit indefinitely. The primary staleness defense is not
+	// the TTL but the PID match plus the clear-on-spawn in
+	// startManagedDoltProcessWithOptions: a marker can only ever name the
+	// current server generation.
+	//
+	// A stopper whose own grace window is LONGER than this records a bigger one
+	// in the marker (managedDoltStopIntentTTLForGrace); a fixed default would
+	// otherwise expire mid-shutdown and alarm on a stop still in progress.
 	managedDoltStopIntentTTL = 10 * time.Minute
+
+	// managedDoltStopIntentGraceSlack is added to a stopper's configured grace
+	// when sizing its marker, covering the work that happens after the grace
+	// ends — SIGKILL escalation, the store-lock release wait, dolt's journal
+	// flush — so the marker outlives the stop it authorizes rather than
+	// expiring in its last seconds.
+	managedDoltStopIntentGraceSlack = 2 * time.Minute
 
 	// managedDoltStopIntentFutureSkew tolerates a marker stamped slightly in
 	// the future (clock adjustment between the stopper and the watchdog).
@@ -72,6 +84,30 @@ type managedDoltStopIntent struct {
 	RequesterPID int    `json:"requester_pid"`
 	Requester    string `json:"requester"`
 	Reason       string `json:"reason"`
+	// TTLSeconds is the vouching window this stopper asked for, when it is
+	// longer than the default. Zero (including every marker written before the
+	// field existed) means the default. It can only ever LENGTHEN the window —
+	// see managedDoltStopIntentEffectiveTTL — so a corrupt or hostile small
+	// value cannot shorten the authorization of a stop in progress.
+	TTLSeconds int `json:"ttl_seconds,omitempty"`
+}
+
+// managedDoltStopIntentTTLForGrace sizes a marker for a stopper whose grace
+// window is known. Anything at or below the default keeps the default.
+func managedDoltStopIntentTTLForGrace(gracePeriod time.Duration) time.Duration {
+	if gracePeriod <= 0 {
+		return managedDoltStopIntentTTL
+	}
+	return max(managedDoltStopIntentTTL, gracePeriod+managedDoltStopIntentGraceSlack)
+}
+
+// managedDoltStopIntentEffectiveTTL is the window a marker actually vouches
+// for: the longer of the default and what the stopper recorded.
+func managedDoltStopIntentEffectiveTTL(intent managedDoltStopIntent) time.Duration {
+	if intent.TTLSeconds <= 0 {
+		return managedDoltStopIntentTTL
+	}
+	return max(managedDoltStopIntentTTL, time.Duration(intent.TTLSeconds)*time.Second)
 }
 
 // managedDoltStopIntentPath locates the marker for the server started with
@@ -102,13 +138,24 @@ func truncateManagedDoltStopIntentField(value string) string {
 	return value[:managedDoltStopIntentRequesterMaxLen] + "…"
 }
 
-// recordManagedDoltStopIntent writes the marker before a stop signals pid.
-// Best-effort by contract: the returned error is for tests and callers that
-// want to log it, never for failing a stop.
+// recordManagedDoltStopIntent writes the marker before a stop signals pid,
+// vouching for the default window. Best-effort by contract: the returned error
+// is for tests and callers that want to log it, never for failing a stop.
 func recordManagedDoltStopIntent(configFile string, pid int, reason string) error {
+	return recordManagedDoltStopIntentWithTTL(configFile, pid, reason, managedDoltStopIntentTTL)
+}
+
+// recordManagedDoltStopIntentWithTTL is recordManagedDoltStopIntent for a
+// stopper that knows its own shutdown window and needs the marker to outlast
+// it. A ttl at or below the default is recorded as the default.
+func recordManagedDoltStopIntentWithTTL(configFile string, pid int, reason string, ttl time.Duration) error {
 	path := managedDoltStopIntentPath(configFile)
 	if path == "" || pid <= 0 {
 		return nil
+	}
+	ttlSeconds := 0
+	if ttl > managedDoltStopIntentTTL {
+		ttlSeconds = int(ttl.Round(time.Second) / time.Second)
 	}
 	intent := managedDoltStopIntent{
 		PID:          pid,
@@ -116,6 +163,7 @@ func recordManagedDoltStopIntent(configFile string, pid int, reason string) erro
 		RequesterPID: os.Getpid(),
 		Requester:    managedDoltStopIntentRequester(),
 		Reason:       truncateManagedDoltStopIntentField(reason),
+		TTLSeconds:   ttlSeconds,
 	}
 	data, err := json.Marshal(intent)
 	if err != nil {
@@ -166,9 +214,10 @@ func readManagedDoltStopIntent(configFile string) (managedDoltStopIntent, bool) 
 // pure so the classification is testable without processes or files.
 //
 // Coverage requires all of: a positive PID that matches exactly, a parseable
-// timestamp, and a timestamp inside [now-TTL, now+skew]. Anything else — a
-// marker for a different PID, an unparseable stamp, a stale marker, a marker
-// from the future — fails to cover, and the exit alarms.
+// timestamp, and a timestamp inside [now-TTL, now+skew], where the TTL is the
+// marker's own effective window. Anything else — a marker for a different PID,
+// an unparseable stamp, a stale marker, a marker from the future — fails to
+// cover, and the exit alarms.
 func managedDoltStopIntentCovers(intent managedDoltStopIntent, pid int, now time.Time) bool {
 	if pid <= 0 || intent.PID != pid {
 		return false
@@ -178,7 +227,7 @@ func managedDoltStopIntentCovers(intent managedDoltStopIntent, pid int, now time
 		return false
 	}
 	age := now.Sub(requestedAt)
-	if age > managedDoltStopIntentTTL {
+	if age > managedDoltStopIntentEffectiveTTL(intent) {
 		return false
 	}
 	return age >= -managedDoltStopIntentFutureSkew

@@ -253,3 +253,60 @@ func TestManagedDoltStartupFailureTeardownRecordsStopIntent(t *testing.T) {
 		t.Errorf("teardown exit produced an alarm message: %q", report.AlarmMessage)
 	}
 }
+
+// TestManagedDoltStopIntentTTLFollowsTheStoppersGraceWindow pins the ga-drkbcd
+// P2b rule at the unit level: the vouching window may only ever GROW to fit a
+// stopper's configured shutdown, never shrink below the default — a marker that
+// expired mid-shutdown would alarm on a stop still in progress, and one that
+// could be shortened by its own contents would hand any writer a way to silence
+// the default guarantee.
+func TestManagedDoltStopIntentTTLFollowsTheStoppersGraceWindow(t *testing.T) {
+	if got := managedDoltStopIntentTTLForGrace(30 * time.Second); got != managedDoltStopIntentTTL {
+		t.Errorf("a short grace changed the window: %v, want %v", got, managedDoltStopIntentTTL)
+	}
+	if got := managedDoltStopIntentTTLForGrace(0); got != managedDoltStopIntentTTL {
+		t.Errorf("an unknown grace changed the window: %v, want %v", got, managedDoltStopIntentTTL)
+	}
+	if got, want := managedDoltStopIntentTTLForGrace(15*time.Minute), 15*time.Minute+managedDoltStopIntentGraceSlack; got != want {
+		t.Errorf("a 15m grace sized the window to %v, want %v", got, want)
+	}
+	if got := managedDoltStopIntentEffectiveTTL(managedDoltStopIntent{}); got != managedDoltStopIntentTTL {
+		t.Errorf("a marker with no recorded window = %v, want the default %v", got, managedDoltStopIntentTTL)
+	}
+	if got := managedDoltStopIntentEffectiveTTL(managedDoltStopIntent{TTLSeconds: 1}); got != managedDoltStopIntentTTL {
+		t.Errorf("a marker shortened its own window to %v; the default is a floor", got)
+	}
+
+	dir := t.TempDir()
+	configFile := filepath.Join(dir, "dolt-config.yaml")
+	if err := recordManagedDoltStopIntentWithTTL(configFile, 4242, "gc managed dolt stop", 17*time.Minute); err != nil {
+		t.Fatalf("record stop intent: %v", err)
+	}
+	intent, found := readManagedDoltStopIntent(configFile)
+	if !found {
+		t.Fatal("recorded stop intent was not readable")
+	}
+	if got := managedDoltStopIntentEffectiveTTL(intent); got != 17*time.Minute {
+		t.Errorf("round-tripped window = %v, want 17m", got)
+	}
+	now := time.Now()
+	if !managedDoltStopIntentCovers(intent, 4242, now.Add(12*time.Minute)) {
+		t.Error("a 17m marker stopped vouching after 12m")
+	}
+	if managedDoltStopIntentCovers(intent, 4242, now.Add(18*time.Minute)) {
+		t.Error("a 17m marker still vouched after 18m")
+	}
+
+	// The default recorder is untouched by any of this.
+	defaultConfig := filepath.Join(t.TempDir(), "dolt-config.yaml")
+	if err := recordManagedDoltStopIntent(defaultConfig, 4242, "gc managed dolt stop"); err != nil {
+		t.Fatalf("record default stop intent: %v", err)
+	}
+	defaultIntent, _ := readManagedDoltStopIntent(defaultConfig)
+	if defaultIntent.TTLSeconds != 0 {
+		t.Errorf("the default recorder wrote a window of %ds; want none", defaultIntent.TTLSeconds)
+	}
+	if managedDoltStopIntentCovers(defaultIntent, 4242, now.Add(managedDoltStopIntentTTL+time.Minute)) {
+		t.Error("the default window no longer expires")
+	}
+}

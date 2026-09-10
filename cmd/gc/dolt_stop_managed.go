@@ -136,8 +136,15 @@ func stopManagedDoltProcessWithOptions(cityPath, port string, clearPublishedStat
 	// can tell the two apart; without it the watchdog must either alarm on
 	// every requested stop or stay silent on every unrequested one. Advisory:
 	// a marker that fails to land costs a false alarm, never the stop.
+	//
+	// The marker is sized to THIS stop's own grace window: `[daemon]
+	// dolt_stop_timeout` may legitimately exceed the marker's default TTL, and
+	// a graceful shutdown that outlived its own authorization would alarm as if
+	// nobody had asked (managedDoltStopIntentTTLForGrace).
+	gracePeriod := resolveManagedDoltStopTimeout(cityPath)
 	intentRecorded := false
-	if recordErr := recordManagedDoltStopIntent(layout.ConfigFile, targetPID, "gc managed dolt stop"); recordErr != nil {
+	if recordErr := recordManagedDoltStopIntentWithTTL(layout.ConfigFile, targetPID, "gc managed dolt stop",
+		managedDoltStopIntentTTLForGrace(gracePeriod)); recordErr != nil {
 		managedDoltCleanupLogf("recording stop intent for pid %d: %v", targetPID, recordErr)
 	} else {
 		intentRecorded = true
@@ -159,7 +166,6 @@ func stopManagedDoltProcessWithOptions(cityPath, port string, clearPublishedStat
 			return report, fmt.Errorf("signal %d with SIGTERM: %w", targetPID, err)
 		}
 	}
-	gracePeriod := resolveManagedDoltStopTimeout(cityPath)
 	deadline := time.Now().Add(gracePeriod)
 	pollInterval := managedDoltStopPollInterval(gracePeriod)
 	for managedStopPIDAlive(targetPID) && time.Now().Before(deadline) {
@@ -213,12 +219,18 @@ func stopManagedDoltProcessWithOptions(cityPath, port string, clearPublishedStat
 }
 
 func clearManagedDoltRuntime(layout managedDoltRuntimeLayout, portText string) error {
-	// ga-drkbcd: the stop is over, so the intent marker has done its job. Left
-	// behind it would be a stale vouching record; its TTL and PID match already
-	// bound the damage, but the marker should not outlive the stop it records.
-	if err := clearManagedDoltStopIntent(layout.ConfigFile); err != nil {
-		managedDoltCleanupLogf("clearing stop intent: %v", err)
-	}
+	// ga-drkbcd: the marker is deliberately NOT cleared here. A completed stop
+	// is exactly when the marker is needed: the watchdog is a different process
+	// that reads it after ITS child exits, and this function runs on the
+	// stopper's timeline, so clearing it here races that read and can turn a
+	// shutdown gc requested into a CRITICAL "nobody asked" alarm. Expiry is the
+	// TTL's job, and the clear-on-spawn in startManagedDoltProcessWithOptions
+	// guarantees no marker survives into the next server generation. The
+	// accepted residual is a PID reused inside the TTL by another process whose
+	// status-0 exit the watchdog happens to be classifying — which cannot be
+	// this server, because the next server gets its own PID and a marker-free
+	// spawn. A FAILED stop still retracts its marker immediately (see
+	// stopManagedDoltProcessWithOptions).
 	port := 0
 	if state, err := readDoltRuntimeStateFile(layout.StateFile); err == nil {
 		port = state.Port

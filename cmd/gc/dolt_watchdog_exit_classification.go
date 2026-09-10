@@ -12,10 +12,9 @@ package main
 // THE FIX. A status-0 exit is split into two outcomes that no longer share a
 // word:
 //
-//   - REQUESTED — someone asked. Either the watchdog itself was signalled
-//     (SIGINT/SIGTERM forwarded to the child), or a stop-intent marker written
-//     by gc's own stop path (dolt_stop_intent.go) covers this exact PID. Still
-//     "exited cleanly", now with the requester named.
+//   - REQUESTED — gc asked, and said so in advance: a stop-intent marker
+//     written by one of gc's own stop paths (dolt_stop_intent.go) covers this
+//     exact PID. Still "exited cleanly", now with the requester named.
 //   - UNEXPECTED CLEAN EXIT — nobody asked. This is an alarm: it escalates
 //     through the emergency spool and .gc/events.jsonl, and the watchdog exits
 //     non-zero rather than 0.
@@ -23,8 +22,16 @@ package main
 // The watchdog's two self-initiated termination paths (scope-gone and signal
 // forward) never reach here at all — each drains `done` inline and returns —
 // so the only way to arrive at a classification is an exit the watchdog did not
-// itself cause. The SignalPending field closes the one remaining race: a
-// simultaneous signal and child exit, where select may pick the exit first.
+// itself cause.
+//
+// A PENDING SIGNAL IS NOT CONSENT. SignalPending reports the one race the
+// branch structure cannot close: a signal and the child's exit landing
+// together, where select may pick the exit. It is evidence about the exit, not
+// authorization for it — a signal the watchdog cannot attribute is exactly the
+// second half of the 2026-08-15 outage, and the signal path grades it the same
+// way (dolt_watchdog_signal_attribution.go). So coverage comes ONLY from the
+// marker: a pending signal enriches the requester wording when a marker already
+// covers the exit, and is reported as an aggravating detail when none does.
 //
 // Bias: a stop we cannot attribute alarms. The failure being replaced is
 // silence, so a false alarm is the cheap direction.
@@ -137,6 +144,12 @@ func classifyManagedDoltWatchdogChildExit(exit managedDoltWatchdogChildExit) man
 		// dolt.log for the reassuring wording must never match an alarm.
 		fmt.Sprintf("%s ALARM UNEXPECTED CLEAN EXIT: an unrequested status-0 exit of the database is never routine; this is NOT the healthy requested-shutdown path", managedDoltWatchdogLogPrefix),
 	}
+	if exit.SignalPending {
+		// Says the quiet part out loud: something signalled this watchdog at
+		// the moment its server left, and nothing gc did explains either event.
+		lines = append(lines, fmt.Sprintf("%s ALARM UNEXPECTED CLEAN EXIT: a stop signal was pending at this watchdog when the server exited, but no gc stop intent covers it — a signal alone authorizes nothing",
+			managedDoltWatchdogLogPrefix))
+	}
 	if lastLine := strings.TrimSpace(exit.LastServerLogLine); lastLine != "" {
 		lines = append(lines, fmt.Sprintf("%s ALARM UNEXPECTED CLEAN EXIT: last line the server wrote before exiting: %s",
 			managedDoltWatchdogLogPrefix, lastLine))
@@ -153,17 +166,20 @@ func classifyManagedDoltWatchdogChildExit(exit managedDoltWatchdogChildExit) man
 }
 
 // managedDoltCleanExitRequester names who asked for a status-0 exit, or reports
-// that nobody did. Two sources, in order of certainty: a signal the watchdog
-// itself received (we are the requester's proxy), then a stop-intent marker
-// covering this exact PID.
+// that nobody did. One source of authority: a stop-intent marker covering this
+// exact PID. A pending signal only adds to the wording of a stop the marker
+// already explains — it can never supply the authorization itself, because a
+// signal nobody can attribute is precisely the event this alarm must not
+// swallow.
 func managedDoltCleanExitRequester(exit managedDoltWatchdogChildExit) (string, bool) {
+	if !exit.IntentFound || !managedDoltStopIntentCovers(exit.Intent, exit.PID, exit.Now) {
+		return "", false
+	}
+	requester := describeManagedDoltStopIntent(exit.Intent)
 	if exit.SignalPending {
-		return "a stop signal delivered to this watchdog", true
+		requester += "; a stop signal was also delivered to this watchdog"
 	}
-	if exit.IntentFound && managedDoltStopIntentCovers(exit.Intent, exit.PID, exit.Now) {
-		return describeManagedDoltStopIntent(exit.Intent), true
-	}
-	return "", false
+	return requester, true
 }
 
 // lastManagedDoltServerLogLine returns the last line in tail that the server
