@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/shellquote"
 )
 
 // TestColdStartServerArgvAndEnvCarryNoSecrets is the end-to-end proof for
@@ -27,11 +30,22 @@ func TestColdStartServerArgvAndEnvCarryNoSecrets(t *testing.T) {
 	tm := NewTmuxWithConfig(cfg)
 	t.Cleanup(func() { _ = tm.KillServer() })
 
+	// GA_FHBNMZ_DELIVERY_TOKEN probes -e delivery to the pane process. The
+	// realistic name AZURE_OPENAI_API_KEY cannot be used for THAT assertion
+	// on a developer box: tmux runs pane commands via the user's default
+	// shell, and a dotfile (~/.zshenv on the machine that found this)
+	// re-exporting the real key overwrites the delivered value before the
+	// pane command sees it. It still serves the argv/global-env absence
+	// assertions below.
 	env := map[string]string{
-		"AZURE_OPENAI_API_KEY": secretVal,
-		"GC_PROVIDER":          "probe",
+		"AZURE_OPENAI_API_KEY":     secretVal,
+		"GA_FHBNMZ_DELIVERY_TOKEN": secretVal,
+		"GC_PROVIDER":              "probe",
 	}
-	if err := tm.NewSessionWithCommandAndEnv("coldstart", t.TempDir(), "sleep 60", env); err != nil {
+	workDir := t.TempDir()
+	envDump := filepath.Join(workDir, "pane-env")
+	paneCmd := "env > " + shellquote.Quote(envDump+".tmp") + " && mv " + shellquote.Quote(envDump+".tmp") + " " + shellquote.Quote(envDump) + "; sleep 60"
+	if err := tm.NewSessionWithCommandAndEnv("coldstart", workDir, paneCmd, env); err != nil {
 		t.Fatalf("NewSessionWithCommandAndEnv (cold start): %v", err)
 	}
 
@@ -79,5 +93,23 @@ func TestColdStartServerArgvAndEnvCarryNoSecrets(t *testing.T) {
 	}
 	if sessionVal != secretVal {
 		t.Fatalf("session env AZURE_OPENAI_API_KEY = %q, want %q", sessionVal, secretVal)
+	}
+
+	// And in the PANE PROCESS itself — session-env storage alone would not
+	// prove the child received it.
+	deadline := time.Now().Add(10 * time.Second)
+	var paneEnv []byte
+	for {
+		paneEnv, err = os.ReadFile(envDump)
+		if err == nil || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("pane env dump never appeared at %s: %v", envDump, err)
+	}
+	if !strings.Contains(string(paneEnv), "GA_FHBNMZ_DELIVERY_TOKEN="+secretVal) {
+		t.Fatalf("pane process env lacks the -e value; dump:\n%s", paneEnv)
 	}
 }

@@ -2,6 +2,7 @@ package tmux
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -78,6 +79,22 @@ func (f *fakeEnvExecutor) executeCtxEnv(_ context.Context, args []string, env []
 	return f.fakeExecutor.executeCtx(context.Background(), args)
 }
 
+// callHasFlagBeforeCommand reports whether flag appears before the
+// "new-session" command word of one recorded invocation. A -N after the
+// command word would be parsed as a command argument by tmux, not as the
+// no-server-start client flag.
+func callHasFlagBeforeCommand(call []string, flag string) bool {
+	for _, a := range call {
+		if a == flag {
+			return true
+		}
+		if a == "new-session" {
+			return false
+		}
+	}
+	return false
+}
+
 func callIndex(calls [][]string, substr string) int {
 	for i, call := range calls {
 		for _, a := range call {
@@ -112,6 +129,9 @@ func TestColdStartForksServerViaAnchorBeforeEnvArgs(t *testing.T) {
 	killIdx := callIndex(fake.calls, "kill-session")
 	if anchorIdx == -1 {
 		t.Fatalf("no anchor new-session issued on a cold socket; calls: %q", fake.calls)
+	}
+	if envIdx != -1 && !callHasFlagBeforeCommand(fake.calls[envIdx], "-N") {
+		t.Fatalf("the -e new-session must carry the no-server-start flag -N; call: %q", fake.calls[envIdx])
 	}
 	if envIdx == -1 || anchorIdx > envIdx {
 		t.Fatalf("anchor (call %d) must precede the -e new-session (call %d); calls: %q", anchorIdx, envIdx, fake.calls)
@@ -161,6 +181,49 @@ func TestWarmServerSkipsAnchor(t *testing.T) {
 	}
 	if len(fake.envCalls) != 0 {
 		t.Fatalf("executeCtxEnv calls = %d, want 0", len(fake.envCalls))
+	}
+}
+
+func TestEmptyServerSkipsAnchor(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.SocketName = "gctest-empty"
+	tm := NewTmuxWithConfig(cfg)
+	fake := &fakeEnvExecutor{}
+	// A live server holding zero sessions replies ErrNoCurrentTarget — which
+	// WRAPS ErrNoServer. It must be read as alive, not cold.
+	fake.errs = []error{ErrNoCurrentTarget, ErrNoCurrentTarget}
+	tm.exec = fake
+
+	if err := tm.NewSessionWithCommandAndEnv("gctest-empty-sess", "", "claude", map[string]string{"A": "b"}); err != nil {
+		t.Fatalf("NewSessionWithCommandAndEnv: %v", err)
+	}
+	if idx := callIndex(fake.calls, "gc-srv-anchor-"); idx != -1 {
+		t.Fatalf("anchor issued against a live-but-empty server: %q", fake.calls[idx])
+	}
+}
+
+func TestAnchorFailureFailsClosedNotOpenFork(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.SocketName = "gctest-anchorfail"
+	tm := NewTmuxWithConfig(cfg)
+	tm.serverSocketObserver = func(context.Context, string) error { return nil }
+	fake := &fakeEnvExecutor{}
+	// Cold socket; the anchor itself fails; the -N'd new-session then finds
+	// no server. The spawn must FAIL (retriable ErrNoServer), never succeed
+	// by forking a daemon that would carry the -e argv.
+	fake.errs = []error{ErrNoServer, ErrNoServer, ErrNoServer, ErrNoServer}
+	tm.exec = fake
+
+	err := tm.NewSessionWithCommandAndEnv("gctest-anchorfail-sess", "", "claude", map[string]string{"A": "b"})
+	if !errors.Is(err, ErrNoServer) {
+		t.Fatalf("NewSessionWithCommandAndEnv = %v, want ErrNoServer (fail closed)", err)
+	}
+	envIdx := callIndex(fake.calls, "A=b")
+	if envIdx == -1 {
+		t.Fatalf("no -e new-session attempted; calls: %q", fake.calls)
+	}
+	if !callHasFlagBeforeCommand(fake.calls[envIdx], "-N") {
+		t.Fatalf("the -e new-session must carry -N even when the anchor failed; call: %q", fake.calls[envIdx])
 	}
 }
 

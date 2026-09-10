@@ -101,11 +101,15 @@ const serverAnchorLifetime = "120"
 // exists (or failed; either way the server is back to today's semantics).
 // Against a live server it is a no-op returning a no-op cleanup.
 //
-// Best-effort by design: any genuine server problem is surfaced by the
-// new-session call that follows, with its full error mapping (ErrNoServer,
-// ErrSessionExists, ...) intact. The one uncovered window — the server
-// exiting between this check and the caller's new-session — degrades to
-// exactly today's behavior, never to something worse.
+// This is the availability half of the mechanism; the security half is the
+// caller passing tmux's client -N flag ("do not start the server even if
+// the command would normally do so") on every -e-bearing new-session. With
+// -N, any window this probe cannot close — the server exiting between the
+// check and the new-session, a racing creator killing the last session, an
+// anchor that failed to start — turns into an ordinary ErrNoServer on the
+// session call (retried by ensureFreshSession), never into a daemon forked
+// with secrets on its command line. Anchor errors are therefore deliberately
+// swallowed here: the -N'd call is the enforcement point.
 //
 // Skipped when no socket name is configured, mirroring probeServerAlive:
 // that is the ad-hoc/default-server case, where cold-starting the USER'S
@@ -116,10 +120,16 @@ func (t *Tmux) startServerInert() (cleanup func()) {
 	if t.cfg.SocketName == "" {
 		return cleanup
 	}
-	// Only a COLD socket needs the anchor; against a live server an extra
-	// session create/kill per spawn would be pointless churn for hooks and
-	// observers.
-	if _, err := t.run("has-session", "-t", "="+probeSessionName); !errors.Is(err, ErrNoServer) {
+	// Only a COLD socket needs the anchor. Order matters: ErrNoCurrentTarget
+	// (a live server holding zero sessions — persistent under gc's
+	// exit-empty-off default) WRAPS ErrNoServer, so it must be recognized as
+	// "alive" before the ErrNoServer check. Any other error (timeout,
+	// degraded) is indeterminate: skip the anchor and let the -N'd session
+	// call decide — it fails closed rather than forking.
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), newSessionProbeTimeout)
+	_, err := t.runCtx(probeCtx, "has-session", "-t", "="+probeSessionName)
+	probeCancel()
+	if errors.Is(err, ErrNoCurrentTarget) || !errors.Is(err, ErrNoServer) {
 		return cleanup
 	}
 	anchor := fmt.Sprintf("gc-srv-anchor-%d", time.Now().UnixNano())
@@ -130,13 +140,13 @@ func (t *Tmux) startServerInert() (cleanup func()) {
 		"new-session", "-d", "-s", anchor,
 		"/bin/sh", "-c", "sleep " + serverAnchorLifetime,
 	}
-	var err error
+	var anchorErr error
 	if ee, ok := t.exec.(envExecutor); ok {
-		_, err = ee.executeCtxEnv(ctx, args, scrubSecretEnviron(os.Environ()))
+		_, anchorErr = ee.executeCtxEnv(ctx, args, scrubSecretEnviron(os.Environ()))
 	} else {
-		_, err = t.exec.executeCtx(ctx, args)
+		_, anchorErr = t.exec.executeCtx(ctx, args)
 	}
-	if err != nil {
+	if anchorErr != nil {
 		return cleanup
 	}
 	return func() {
