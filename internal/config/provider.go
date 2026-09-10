@@ -284,6 +284,24 @@ func IsValidSessionTransport(transport string) bool {
 	}
 }
 
+// AccountFamily returns the builtin family that owns this provider's
+// account/credential semantics: the chain-derived BuiltinAncestor when set,
+// the deprecated Kind during transition, else the provider's own name (which
+// covers a raw builtin used directly). Consumers gate family-specific account
+// rules on it — e.g. processenv.RequireDeclaredClaudeAccount (ga-ai7gz2).
+func (rp *ResolvedProvider) AccountFamily() string {
+	if rp == nil {
+		return ""
+	}
+	if f := strings.TrimSpace(rp.BuiltinAncestor); f != "" {
+		return f
+	}
+	if f := strings.TrimSpace(rp.Kind); f != "" {
+		return f
+	}
+	return strings.TrimSpace(rp.Name)
+}
+
 // CommandString returns the full command line: command followed by args.
 func (rp *ResolvedProvider) CommandString() string {
 	if len(rp.Args) == 0 {

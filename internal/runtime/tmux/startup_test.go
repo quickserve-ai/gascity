@@ -3527,3 +3527,192 @@ func TestStartOpsSendKeysKeepsWarmBoxOnRelaunch(t *testing.T) {
 		t.Fatalf("relaunch issued %d kill(s); the warm box must survive a failed startup prompt", got)
 	}
 }
+
+// TestDoRelaunchSession_ReappliesEnvOnRespawn covers ga-xd3bjx item 2: the
+// warm relaunch path must hand cfg.Env to the respawn, so the EMPTY values —
+// the "unset this var" convention, e.g. the CLAUDE_CONFIG_DIR reset — reach
+// respawnAgent, which re-marks the durable ones removed from the session
+// environment before respawn-pane runs.
+func TestDoRelaunchSession_ReappliesEnvOnRespawn(t *testing.T) {
+	ops := &fakeStartOps{
+		hasSessionResult: true,
+	}
+
+	cfg := runtime.Config{
+		Command: "claude",
+		WorkDir: "/proj",
+		Env: map[string]string{
+			"CLAUDE_CONFIG_DIR": "",
+			"GC_CITY":           "/city",
+		},
+	}
+
+	err := doRelaunchSession(context.Background(), ops, "test", cfg, DefaultConfig().SetupTimeout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var respawn *startCall
+	for i := range ops.calls {
+		if ops.calls[i].method == "respawnAgent" {
+			respawn = &ops.calls[i]
+			break
+		}
+	}
+	if respawn == nil {
+		t.Fatalf("respawnAgent never called; calls = %v", ops.callMethods())
+	}
+	if respawn.env == nil {
+		t.Fatal("respawnAgent received nil env; the create path's env resets are lost on warm relaunch")
+	}
+	if v, ok := respawn.env["CLAUDE_CONFIG_DIR"]; !ok || v != "" {
+		t.Fatalf("respawn env CLAUDE_CONFIG_DIR = (%q, %v), want declared-empty unset", v, ok)
+	}
+	if got := respawn.env["GC_CITY"]; got != "/city" {
+		t.Fatalf("respawn env GC_CITY = %q, want /city", got)
+	}
+}
+
+// TestRespawnAgentMarksClaudeAccountRemovedFromSessionEnv pins the one key
+// ga-ai7gz2 adds to durableWithholdKeys. An empty CLAUDE_CONFIG_DIR is the
+// passthrough reset every session without a declared account carries, and it is
+// account authority: respawn-pane takes no env argument, so unless the key is
+// marked removed from the SESSION environment the respawned agent sees the
+// server's global value, which is the controller's own account. A declared
+// account is a real value and is never marked.
+func TestRespawnAgentMarksClaudeAccountRemovedFromSessionEnv(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		account   string
+		wantCalls int
+	}{
+		{name: "reset account is withheld across respawn", account: "", wantCalls: 2},
+		{name: "declared account is left in place", account: "/accounts/seat", wantCalls: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &fakeExecutor{}
+			tm := NewTmux()
+			tm.exec = fake
+			ops := &tmuxStartOps{tm: tm}
+
+			env := map[string]string{
+				"GC_CITY":           "/tmp/city",
+				"CLAUDE_CONFIG_DIR": tc.account,
+				"CLAUDECODE":        "",
+			}
+			if err := ops.respawnAgent("gc-test-account-pin", "/proj", "claude", env); err != nil {
+				t.Fatalf("respawnAgent: %v", err)
+			}
+			if len(fake.calls) != tc.wantCalls {
+				t.Fatalf("tmux calls = %d (%v), want %d", len(fake.calls), fake.calls, tc.wantCalls)
+			}
+			if tc.wantCalls == 2 {
+				setEnv := strings.Join(fake.calls[0], " ")
+				if !strings.Contains(setEnv, "set-environment -t gc-test-account-pin -r CLAUDE_CONFIG_DIR") {
+					t.Errorf("first call = %q, want CLAUDE_CONFIG_DIR marked removed from the session env", setEnv)
+				}
+			}
+			if respawn := strings.Join(fake.calls[len(fake.calls)-1], " "); !strings.Contains(respawn, "respawn-pane") {
+				t.Errorf("last call = %q, want respawn-pane", respawn)
+			}
+		})
+	}
+}
+
+// foundingEnvExecutor records which tmux invocations ran with an explicit,
+// caller-built environment (executeCtxEnv) alongside every invocation.
+type foundingEnvExecutor struct {
+	fakeExecutor
+	envCalls [][]string // args of each executeCtxEnv call
+	envs     [][]string // the environment each executeCtxEnv call received
+}
+
+func (f *foundingEnvExecutor) executeCtxEnv(ctx context.Context, args []string, env []string) (string, error) {
+	f.envCalls = append(f.envCalls, append([]string(nil), args...))
+	f.envs = append(f.envs, append([]string(nil), env...))
+	return f.executeCtx(ctx, args)
+}
+
+// TestRunCtxScrubsSecretEnvForServerFoundingClients pins the ga-fhbnmz residual
+// on #5425's staging seam. A tmux server keeps the environment of the client
+// that forked it, so every client that can found the server — the command-file
+// path's start-server and the argv path's new-session alike — runs with
+// secret-classified names removed. Commands that cannot start a server keep gc's
+// environment, and so does every command against the user's default server.
+func TestRunCtxScrubsSecretEnvForServerFoundingClients(t *testing.T) {
+	t.Setenv("TMPDIR", t.TempDir())
+	t.Setenv("GA_FHBNMZ_CANARY_TOKEN", "leak-me-not")
+	t.Setenv("GA_FHBNMZ_PLAIN_CANARY", "keep-me")
+
+	cfg := DefaultConfig()
+	cfg.SocketName = "gctest-founding"
+	tm := NewTmuxWithConfig(cfg)
+	fe := &foundingEnvExecutor{}
+	tm.exec = fe
+
+	if err := tm.NewSessionWithCommandAndEnv("gctest-founding-staged", "/work", "claude",
+		map[string]string{"ANTHROPIC_AUTH_TOKEN": "sk-test-not-a-real-credential"}); err != nil {
+		t.Fatalf("NewSessionWithCommandAndEnv (staged env): %v", err)
+	}
+	if err := tm.NewSessionWithCommandAndEnv("gctest-founding-argv", "/work", "claude",
+		map[string]string{"GC_RIG": "rig-a"}); err != nil {
+		t.Fatalf("NewSessionWithCommandAndEnv (argv env): %v", err)
+	}
+
+	if len(fe.envCalls) != 2 {
+		t.Fatalf("scrubbed-env calls = %d (%q), want 2: one founding client per session", len(fe.envCalls), fe.envCalls)
+	}
+	for i, want := range []string{"start-server", "new-session"} {
+		if !strings.Contains(strings.Join(fe.envCalls[i], " "), want) {
+			t.Errorf("scrubbed-env call %d = %q, want the %s client", i, fe.envCalls[i], want)
+		}
+		var sawPlain bool
+		for _, kv := range fe.envs[i] {
+			if strings.HasPrefix(kv, "GA_FHBNMZ_CANARY_TOKEN=") {
+				t.Errorf("founding client %d still carries the secret: %q", i, kv)
+			}
+			if kv == "GA_FHBNMZ_PLAIN_CANARY=keep-me" {
+				sawPlain = true
+			}
+		}
+		if !sawPlain {
+			t.Errorf("founding client %d lost a non-secret variable; the scrub must remove only secret-classified names", i)
+		}
+	}
+	if len(fe.calls) <= len(fe.envCalls) {
+		t.Fatalf("calls = %q, want the has-session probes and set-option calls to run outside the scrub", fe.calls)
+	}
+
+	defaultServer := NewTmux()
+	defaultFE := &foundingEnvExecutor{}
+	defaultServer.exec = defaultFE
+	if err := defaultServer.NewSessionWithCommandAndEnv("gctest-founding-default", "/work", "claude",
+		map[string]string{"GC_RIG": "rig-a"}); err != nil {
+		t.Fatalf("NewSessionWithCommandAndEnv (default server): %v", err)
+	}
+	if len(defaultFE.envCalls) != 0 {
+		t.Fatalf("scrubbed-env calls on the default server = %q, want none", defaultFE.envCalls)
+	}
+}
+
+func TestTmuxArgsCanStartServer(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		want bool
+	}{
+		{args: []string{"new-session", "-d", "-s", "x"}, want: true},
+		{args: []string{"start-server", ";", "source-file", "/tmp/session.tmux"}, want: true},
+		{args: []string{"attach-session", "-t", "x"}, want: true},
+		{args: []string{"new", "-d"}, want: true},
+		{args: []string{"source-file", "/tmp/a", ";", "new-session", "-d"}, want: true},
+		{args: nil, want: true},
+		{args: []string{"has-session", "-t", "=x"}, want: false},
+		{args: []string{"set-environment", "-t", "x", "-r", "K"}, want: false},
+		{args: []string{"send-keys", "-t", "x", "new-session"}, want: false},
+		{args: []string{"new-window", "-t", "x"}, want: false},
+	} {
+		if got := tmuxArgsCanStartServer(tc.args); got != tc.want {
+			t.Errorf("tmuxArgsCanStartServer(%q) = %v, want %v", tc.args, got, tc.want)
+		}
+	}
+}
