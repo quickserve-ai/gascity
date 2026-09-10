@@ -653,12 +653,27 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 	if m.maxDispatchesPerTick > 0 {
 		start = m.nextDispatchStart % total
 	}
-	spendDispatchBudget := func(idx int) bool {
+	// spendDispatchBudget records one dispatch against the per-tick budget.
+	// unvisited is how many phase-2 candidates the fire loop has not reached
+	// yet: when the budget exhausts with unvisited > 0, orders that passed the
+	// phase-1 gates were left unvisited this pass.
+	spendDispatchBudget := func(idx, unvisited int) bool {
 		budgetSpent++
 		if m.maxDispatchesPerTick > 0 {
 			m.nextDispatchStart = (idx + 1) % total
 		}
-		return m.maxDispatchesPerTick > 0 && budgetSpent >= m.maxDispatchesPerTick
+		if m.maxDispatchesPerTick > 0 && budgetSpent >= m.maxDispatchesPerTick {
+			if unvisited > 0 {
+				// The pass ends with orders unvisited. Under sustained
+				// overload (steady-state due demand above cap x tick rate)
+				// every short-interval order dilutes toward the round-robin
+				// rotation cadence; this line is the durable record that the
+				// budget, not the orders, set the pace (ga-44iyd).
+				logDispatchError(m.stderr, "gc: order dispatch: per-tick budget (%d) spent with %d order(s) unvisited; they wait for the next tick — raise [orders] max_dispatches_per_tick if LATE fires persist", m.maxDispatchesPerTick, unvisited)
+			}
+			return true
+		}
+		return false
 	}
 
 	// Phase 1: resolve and open-tracking-gate every order, in rotation order.
@@ -752,7 +767,9 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 
 	// Phase 2: the fire loop, in the same rotation order, over the same
 	// per-order state phase 1 resolved.
-	for _, cand := range candidates {
+	for i, cand := range candidates {
+		// Candidates after this one, for the budget-exhaustion record.
+		unvisited := len(candidates) - 1 - i
 		idx := cand.idx
 		a := cand.order
 		target := cand.target
@@ -803,7 +820,7 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 				Subject: a.ScopedName(),
 				Message: msg,
 			})
-			if spendDispatchBudget(idx) {
+			if spendDispatchBudget(idx, unvisited) {
 				return
 			}
 			continue
@@ -938,7 +955,7 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 		if result.Late {
 			logDispatchError(m.stderr, "gc: order dispatch: %s fired LATE — %s (missed cycles; trend: ga-44iyd)", scoped, result.Reason)
 		}
-		if spendDispatchBudget(idx) {
+		if spendDispatchBudget(idx, unvisited) {
 			return
 		}
 	}
@@ -3275,9 +3292,17 @@ func sweepClosedOrderTrackingRetentionBounded(store beads.Store, now time.Time, 
 
 	byOrder := bucketClosedRetentionRuns(runs, onlyOrders)
 
+	// Candidate-count series for the list-starvation investigation
+	// (ga-hujj6s): SQL counts ~48.6k eligible closed tracking rows while the
+	// watchdog prunes single digits per cycle, so the size of the list this
+	// sweep actually RECEIVED is the load-bearing fact. One line per 15m
+	// watchdog cycle.
+	log.Printf("order-tracking retention: sweep received %d closed candidate(s) in %d order bucket(s)", len(runs), len(byOrder))
+
 	cutoff := now.Add(-policy.deleteAfterClose)
 	deleted := 0
 	var retained []string
+	phantom := 0
 	var deleteErr error
 	for _, runs := range byOrder {
 		if deleted >= limit {
@@ -3306,6 +3331,14 @@ func sweepClosedOrderTrackingRetentionBounded(store beads.Store, now time.Time, 
 					retained = append(retained, run.ID)
 					continue
 				}
+				// A candidate the list returned but the store no longer holds:
+				// the row is already gone, which is the sweep's goal — but a
+				// list serving phantom rows is the ga-hujj6s defect, so count
+				// it as evidence instead of spraying one error line per id.
+				if errors.Is(err, beads.ErrNotFound) {
+					phantom++
+					continue
+				}
 				deleteErr = errors.Join(deleteErr, fmt.Errorf("deleting closed order-tracking bead %q: %w", run.ID, err))
 				continue
 			}
@@ -3313,6 +3346,9 @@ func sweepClosedOrderTrackingRetentionBounded(store beads.Store, now time.Time, 
 		}
 	}
 	logRetainedForLiveDescendants(retained)
+	if phantom > 0 {
+		log.Printf("order-tracking retention: %d candidate(s) from the list no longer exist in the store — phantom list rows (ga-hujj6s)", phantom)
+	}
 	return deleted, deleteErr
 }
 
