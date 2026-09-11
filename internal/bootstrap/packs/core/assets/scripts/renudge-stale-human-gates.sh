@@ -236,10 +236,16 @@ $HUMAN_GATES
 INNER
 done < "$SCOPES_FILE"
 
-# Prune entries older than RETENTION so the state file stays bounded.
+# Prune entries older than RETENTION so the state file stays bounded. Prune
+# into a separate variable and adopt it only if jq produced a valid object: a
+# failed prune (e.g. one unparseable timestamp) must not blank $STATE and let
+# the final write erase the per-send entries just persisted.
 RETENTION_S="$(duration_to_seconds "$RETENTION")"
-STATE="$(echo "$STATE" | jq --argjson keep "$RETENTION_S" \
-    'with_entries(select((now - (.value | fromdateiso8601)) <= $keep))')" || true
+PRUNED="$(echo "$STATE" | jq --argjson keep "$RETENTION_S" \
+    'with_entries(select((now - (.value | fromdateiso8601)) <= $keep))' 2>/dev/null)" || PRUNED=""
+if [ -n "$PRUNED" ] && echo "$PRUNED" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    STATE="$PRUNED"
+fi
 
 write_state
 
