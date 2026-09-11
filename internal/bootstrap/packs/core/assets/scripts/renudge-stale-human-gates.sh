@@ -135,6 +135,20 @@ fi
 STATE="$(cat "$STATE_FILE" 2>/dev/null || true)"
 echo "$STATE" | jq -e 'type == "object"' >/dev/null 2>&1 || STATE='{}'
 
+# Persist $STATE atomically (temp file in the same dir, then rename). Called
+# after EVERY successful re-nudge, not just at run end: a run that dies
+# mid-sweep (order timeout SIGKILL, crash, host pressure) must not lose the
+# dedup entries for mails it already sent — that exact loss re-sent every
+# stale gate on every 5m sweep for a full day on 2026-09-10 (~1,600 reminder
+# mails to "human"; the 120s-timeout kill always landed between the sends and
+# the single end-of-run state write).
+write_state() {
+    local tmp
+    tmp="$(mktemp "$PACK_STATE_DIR/.renudge-stale-human-gates-state.XXXXXX")" || return 1
+    printf '%s\n' "$STATE" > "$tmp"
+    mv -f "$tmp" "$STATE_FILE"
+}
+
 RENUDGED=0
 FAILED=0
 while IFS= read -r scope; do
@@ -216,6 +230,7 @@ Resolve with: gc bd gate resolve $gate_id"
         # undeliverable one surfaces and retries next sweep.
         if gc mail send "$ADDRESSEE" -s "$SUBJECT" -m "$BODY" --notify >/dev/null 2>&1; then
             STATE="$(echo "$STATE" | jq --arg k "$gate_id" --arg now "$NOW_ISO" '.[$k] = $now')"
+            write_state || echo "renudge-stale-human-gates: WARNING: failed to persist dedup state after $gate_id" >&2
             RENUDGED=$((RENUDGED + 1))
         else
             echo "renudge-stale-human-gates: FAILED to re-notify addressee '$ADDRESSEE' of stale human gate $gate_id (will retry next sweep)" >&2
@@ -231,10 +246,8 @@ RETENTION_S="$(duration_to_seconds "$RETENTION")"
 STATE="$(echo "$STATE" | jq --argjson keep "$RETENTION_S" \
     'with_entries(select((now - (.value | fromdateiso8601)) <= $keep))')" || true
 
-# Atomic write: temp file in the same dir, then rename.
-TMP="$(mktemp "$PACK_STATE_DIR/.renudge-stale-human-gates-state.XXXXXX")"
-printf '%s\n' "$STATE" > "$TMP"
-mv -f "$TMP" "$STATE_FILE"
+# Final write picks up the prune (per-send writes already persisted the sends).
+write_state || echo "renudge-stale-human-gates: WARNING: failed to persist pruned dedup state" >&2
 
 if [ "$RENUDGED" -gt 0 ]; then
     echo "renudge-stale-human-gates: re-notified $RENUDGED stale human gate addressee(s)"
