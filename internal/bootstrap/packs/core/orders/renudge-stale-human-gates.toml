@@ -33,5 +33,10 @@
 description = "Re-mail + re-nudge the addressee of a human gate left open past a staleness threshold"
 trigger = "cooldown"
 interval = "5m"
-timeout = "120s"
+# 600s, not 120s: a sweep's cost scales with the number of stale gates (a
+# store-opening `gc bd show` + `gc mail send --notify` per gate, each seconds
+# under load) plus per-rig enumeration. At 120s a dozen stale gates reliably
+# outran the timeout; the kill is survivable now that dedup state persists
+# per-send, but the sweep should normally be allowed to finish.
+timeout = "600s"
 exec = "$PACK_DIR/assets/scripts/renudge-stale-human-gates.sh"
