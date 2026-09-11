@@ -145,7 +145,13 @@ echo "$STATE" | jq -e 'type == "object"' >/dev/null 2>&1 || STATE='{}'
 write_state() {
     local tmp
     tmp="$(mktemp "$PACK_STATE_DIR/.renudge-stale-human-gates-state.XXXXXX")" || return 1
-    printf '%s\n' "$STATE" > "$tmp"
+    # Check the write explicitly: callers invoke this as `write_state || warn`,
+    # which disables errexit inside the function — without the check, a failed
+    # printf (disk full) would still mv a truncated file over the good state.
+    if ! printf '%s\n' "$STATE" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
     mv -f "$tmp" "$STATE_FILE"
 }
 
@@ -241,10 +247,16 @@ $HUMAN_GATES
 INNER
 done < "$SCOPES_FILE"
 
-# Prune entries older than RETENTION so the state file stays bounded.
+# Prune entries older than RETENTION so the state file stays bounded. Prune
+# into a separate variable and adopt it only if jq produced a valid object: a
+# failed prune (e.g. one unparseable timestamp) must not blank $STATE and let
+# the final write erase the per-send entries just persisted.
 RETENTION_S="$(duration_to_seconds "$RETENTION")"
-STATE="$(echo "$STATE" | jq --argjson keep "$RETENTION_S" \
-    'with_entries(select((now - (.value | fromdateiso8601)) <= $keep))')" || true
+PRUNED="$(echo "$STATE" | jq --argjson keep "$RETENTION_S" \
+    'with_entries(select((now - (.value | fromdateiso8601)) <= $keep))' 2>/dev/null)" || PRUNED=""
+if [ -n "$PRUNED" ] && echo "$PRUNED" | jq -e 'type == "object"' >/dev/null 2>&1; then
+    STATE="$PRUNED"
+fi
 
 # Final write picks up the prune (per-send writes already persisted the sends).
 write_state || echo "renudge-stale-human-gates: WARNING: failed to persist pruned dedup state" >&2
