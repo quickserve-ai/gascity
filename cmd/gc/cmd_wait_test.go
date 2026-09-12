@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	goruntime "runtime"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -650,14 +651,27 @@ func waitTestRealBDPath(t *testing.T) string {
 // version and fail deep inside a test with a cryptic mismatch error instead
 // of cleanly at the point the drift actually originates (ga-r9cvmi).
 //
-// go install's "@version" form deliberately ignores any enclosing module's
-// go.mod/go.sum and resolves the target module's own dependency closure in
-// isolation, which is required here: cmd/bd's full dependency graph (CLI
-// extras like AI-assisted duplicate detection, ADO rich-text rendering,
-// telemetry exporters) is broader than what gascity's own go.sum carries,
-// since gascity only imports internal/beads's storage packages.
+// Without a replace, go install's "@version" form deliberately ignores any
+// enclosing module's go.mod/go.sum and resolves the target module's own
+// dependency closure in isolation, which is required here: cmd/bd's full
+// dependency graph (CLI extras like AI-assisted duplicate detection, ADO
+// rich-text rendering, telemetry exporters) is broader than what gascity's
+// own go.sum carries, since gascity only imports internal/beads's storage
+// packages.
+//
+// With a go.mod replace (carry/operational: `replace
+// github.com/steveyegge/beads => github.com/quickserve-ai/beads <fleet tag>`,
+// CARRY.md "Beads pin") the "@version" form cannot work: the fork declares
+// upstream's module path, so the tag exists only under the fork's path and
+// `go install github.com/quickserve-ai/beads/cmd/bd@<tag>` fails with
+// "module declares its path as: github.com/steveyegge/beads" (CI run
+// 34462807067). That case mirrors .github/scripts/install-bd-lockstep.sh
+// instead: resolve the replacement with `go list -m` from this repo's module
+// and build inside the replacement's module-cache directory, which uses that
+// module's own go.mod/go.sum exactly as the path-versioned install did, and
+// stamp main.Version with the replace version the way the installer does.
 func buildPinnedBDBinaryForTests() (string, error) {
-	version, err := pinnedBeadsModuleVersion()
+	pinned, err := pinnedBeadsModule()
 	if err != nil {
 		return "", fmt.Errorf("resolve pinned beads module version: %w", err)
 	}
@@ -667,38 +681,128 @@ func buildPinnedBDBinaryForTests() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("mktemp bd binary dir: %w", err)
 	}
+	target := filepath.Join(buildDir, "bd")
 
-	cmd := exec.Command("go", "install", "-tags", "gms_pure_go",
-		"github.com/steveyegge/beads/cmd/bd@"+version)
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOBIN="+buildDir)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("go install github.com/steveyegge/beads/cmd/bd@%s: %w\n%s", version, err, out)
+	if !pinned.Replaced {
+		cmd := exec.Command("go", "install", "-tags", "gms_pure_go",
+			"github.com/steveyegge/beads/cmd/bd@"+pinned.Version)
+		cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOBIN="+buildDir)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return "", fmt.Errorf("go install github.com/steveyegge/beads/cmd/bd@%s: %w\n%s", pinned.Version, err, out)
+		}
+		return target, nil
 	}
-	return filepath.Join(buildDir, "bd"), nil
+
+	moduleDir, err := beadsReplacementModuleDir()
+	if err != nil {
+		return "", err
+	}
+	cmd := exec.Command("go", "-C", moduleDir, "build", "-tags", "gms_pure_go",
+		"-ldflags", "-X main.Version="+pinned.VersionLabel(),
+		"-o", target, "./cmd/bd")
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("go -C %s build ./cmd/bd (%s@%s): %w\n%s", moduleDir, pinned.ReplacePath, pinned.Version, err, out)
+	}
+	return target, nil
 }
 
-// pinnedBeadsModuleVersion reports the github.com/steveyegge/beads version
-// this test binary was actually built against, read from this process's own
-// embedded build info rather than a `go list -m` subprocess or a go.mod text
-// scan: debug.ReadBuildInfo reflects the exact resolved dependency graph
+// beadsReplacementModuleDir locates the directory of the module go.mod
+// replaces github.com/steveyegge/beads with, the way
+// .github/scripts/install-bd-lockstep.sh does: `go list -m` reports .Dir for
+// the replacement's module-cache tree once it is downloaded, and `go mod
+// download` populates it when the cache is cold. Both run from this repo's
+// module root, found from this source file the way the installer cd's to the
+// checkout, rather than from the test process's working directory.
+func beadsReplacementModuleDir() (string, error) {
+	_, thisFile, _, ok := goruntime.Caller(0)
+	if !ok {
+		return "", fmt.Errorf("runtime.Caller(0) failed")
+	}
+	repoRoot := filepath.Join(filepath.Dir(thisFile), "..", "..")
+	const module = "github.com/steveyegge/beads"
+	listDir := func() (string, error) {
+		cmd := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", module)
+		cmd.Dir = repoRoot
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		out, err := cmd.Output()
+		if err != nil {
+			return "", fmt.Errorf("go list -m %s: %w\n%s", module, err, stderr.Bytes())
+		}
+		return strings.TrimSpace(string(out)), nil
+	}
+	dir, err := listDir()
+	if err != nil {
+		return "", err
+	}
+	if dir == "" {
+		cmd := exec.Command("go", "mod", "download", module)
+		cmd.Dir = repoRoot
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return "", fmt.Errorf("go mod download %s: %w\n%s", module, err, out)
+		}
+		if dir, err = listDir(); err != nil {
+			return "", err
+		}
+	}
+	if dir == "" {
+		return "", fmt.Errorf("go list -m %s: no module directory even after go mod download", module)
+	}
+	return dir, nil
+}
+
+// pinnedBeadsModuleInfo is the github.com/steveyegge/beads module this test
+// binary links, read from its embedded build info.
+type pinnedBeadsModuleInfo struct {
+	// Version is the linked version: the replace target's when go.mod carries
+	// a replace, the require pin otherwise — the same value gc's
+	// version_compat preflight compares (beadsModuleVersion).
+	Version string
+	// ReplacePath is the module path the replace points at (for example
+	// github.com/quickserve-ai/beads); empty without a replace.
+	ReplacePath string
+	// Replaced reports whether Version came from a replace directive.
+	Replaced bool
+}
+
+// VersionLabel is Version without its leading "v": the form
+// install-bd-lockstep.sh stamps into main.Version and `bd version` prints.
+func (p pinnedBeadsModuleInfo) VersionLabel() string {
+	return strings.TrimPrefix(p.Version, "v")
+}
+
+// pinnedBeadsModule reports the github.com/steveyegge/beads module this test
+// binary was actually built against, read from this process's own embedded
+// build info rather than a `go list -m` subprocess or a go.mod text scan:
+// debug.ReadBuildInfo reflects the exact resolved dependency graph
 // (including any replace/exclude directives) with zero process spawn, and it
 // can never itself drift from go.mod the way a second hardcoded version
-// string could, since the compiler stamps it in at build time.
-func pinnedBeadsModuleVersion() (string, error) {
+// string could, since the compiler stamps it in at build time. A replace
+// that points at a local directory has no revision to build from and is
+// refused, as install-bd-lockstep.sh refuses it.
+func pinnedBeadsModule() (pinnedBeadsModuleInfo, error) {
 	bi, ok := debug.ReadBuildInfo()
 	if !ok {
-		return "", fmt.Errorf("read build info: not available (binary not built with module support)")
+		return pinnedBeadsModuleInfo{}, fmt.Errorf("read build info: not available (binary not built with module support)")
 	}
 	for _, dep := range bi.Deps {
 		if dep.Path != "github.com/steveyegge/beads" {
 			continue
 		}
-		if dep.Replace != nil {
-			return dep.Replace.Version, nil
+		if dep.Replace == nil {
+			return pinnedBeadsModuleInfo{Version: dep.Version}, nil
 		}
-		return dep.Version, nil
+		if dep.Replace.Version == "" {
+			return pinnedBeadsModuleInfo{}, fmt.Errorf("go.mod replaces %s with local directory %s; no revision to build bd from", dep.Path, dep.Replace.Path)
+		}
+		return pinnedBeadsModuleInfo{
+			Version:     dep.Replace.Version,
+			ReplacePath: dep.Replace.Path,
+			Replaced:    true,
+		}, nil
 	}
-	return "", fmt.Errorf("github.com/steveyegge/beads not found in build info deps")
+	return pinnedBeadsModuleInfo{}, fmt.Errorf("github.com/steveyegge/beads not found in build info deps")
 }
 
 // TestBuildPinnedBDBinaryForTestsMatchesGoModVersion locks in the fix for
@@ -726,9 +830,9 @@ func TestBuildPinnedBDBinaryForTestsMatchesGoModVersion(t *testing.T) {
 	// any shard that also holds a waitTestRealBDPath caller.
 	bdPath := waitTestRealBDPath(t)
 
-	pinned, err := pinnedBeadsModuleVersion()
+	pinned, err := pinnedBeadsModule()
 	if err != nil {
-		t.Fatalf("pinnedBeadsModuleVersion: %v", err)
+		t.Fatalf("pinnedBeadsModule: %v", err)
 	}
 
 	// bd's own `version` output is a hardcoded string that only ever matches
@@ -739,15 +843,42 @@ func TestBuildPinnedBDBinaryForTestsMatchesGoModVersion(t *testing.T) {
 	// verify against that, the same by-stamp-not-by-string rule the deploy
 	// recipe applies with `go list -m`. `bd version` still runs first to
 	// prove the binary executes at all.
-	if out, err := exec.Command(bdPath, "version").CombinedOutput(); err != nil {
-		t.Fatalf("%s version: %v\n%s", bdPath, err, out)
+	versionOut, err := exec.Command(bdPath, "version").CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s version: %v\n%s", bdPath, err, versionOut)
 	}
 	out, err := exec.Command("go", "version", "-m", bdPath).CombinedOutput()
 	if err != nil {
 		t.Fatalf("go version -m %s: %v\n%s", bdPath, err, out)
 	}
-	if !strings.Contains(string(out), "github.com/steveyegge/beads\t"+pinned) {
-		t.Fatalf("go version -m %s output %q does not stamp pinned beads module version %q", bdPath, out, pinned)
+	if !pinned.Replaced {
+		if !strings.Contains(string(out), "github.com/steveyegge/beads\t"+pinned.Version) {
+			t.Fatalf("go version -m %s output %q does not stamp pinned beads module version %q", bdPath, out, pinned.Version)
+		}
+		return
+	}
+
+	// Under a replace the binary is a `go -C <module dir> build` of the
+	// replacement, so its build info carries beads as the MAIN module line,
+	// `mod\tgithub.com/steveyegge/beads\t(devel)` (measured on the
+	// v1.1.1-fleet.20260910 pin): a directory build has no module version to
+	// stamp and the fork declares upstream's path, so the replace tag appears
+	// on no module line at all. What the build does record is the `-ldflags`
+	// build setting that stamped main.Version, and `bd version` prints that
+	// label ("bd version 1.1.1-fleet.20260910 (dev)") — the value gc's
+	// version_compat preflight compares with beadsModuleVersion. Check all
+	// three lines: the main-module line proves it is a beads build, the build
+	// setting proves the stamp went in, and the label proves it is what bd
+	// reports.
+	if !strings.Contains(string(out), "\tmod\tgithub.com/steveyegge/beads\t") {
+		t.Fatalf("go version -m %s output %q does not carry github.com/steveyegge/beads as its main module (replace %s@%s)", bdPath, out, pinned.ReplacePath, pinned.Version)
+	}
+	wantLdflags := `-ldflags="-X main.Version=` + pinned.VersionLabel() + `"`
+	if !strings.Contains(string(out), wantLdflags) {
+		t.Fatalf("go version -m %s output %q does not record build setting %q", bdPath, out, wantLdflags)
+	}
+	if !strings.Contains(string(versionOut), pinned.VersionLabel()) {
+		t.Fatalf("%s version printed %q, not the replace version label %q", bdPath, versionOut, pinned.VersionLabel())
 	}
 }
 

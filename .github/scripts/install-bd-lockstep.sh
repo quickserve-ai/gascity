@@ -64,9 +64,11 @@ if ! command -v go >/dev/null 2>&1; then
 fi
 
 # Honour a replace directive: the installed bd must be built from whatever
-# revision actually links into gc. scripts/check-gomod-replace.sh forbids
-# local-path and pseudo-version replace targets, so a replace can only name a
-# released tag -- but refuse loudly rather than guess if that ever changes.
+# revision actually links into gc. On carry/operational that is the beads
+# fork's fleet build (go.mod `replace github.com/steveyegge/beads =>
+# github.com/quickserve-ai/beads <fleet build>`; CARRY.md "Beads pin"). A
+# local-directory replace has no revision to build from -- refuse loudly
+# rather than guess.
 read -r resolved_path resolved_version < <(
   go list -m -f '{{if .Replace}}{{.Replace.Path}} {{if .Replace.Version}}{{.Replace.Version}}{{else}}LOCAL{{end}}{{else}}{{.Path}} {{.Version}}{{end}}' "$module"
 )
@@ -117,32 +119,57 @@ else
     fi
   fi
   #
+  # Build inside the resolved module's own directory instead of
+  # `go install ${resolved_path}/cmd/bd@${resolved_version}`: the beads fork
+  # declares upstream's module path (`module github.com/steveyegge/beads`), so
+  # a path-versioned install of github.com/quickserve-ai/beads fails with
+  # "module declares its path as: github.com/steveyegge/beads". `go list -m`
+  # points .Dir at the replacement's module-cache tree whenever a replace is
+  # present (and at the require pin otherwise); building there uses that
+  # module's own go.mod/go.sum, exactly as the path-versioned install did.
+  # `go mod download` first so .Dir is populated on a cold runner.
+  #
   # Stamp the resolved pin into the version label (contrib/k8s/Dockerfile.agent
-  # precedent): the pseudo-version's commit suffix makes `bd version` name the
-  # exact revision in CI logs, and gc's version_compat preflight (a commit-token
-  # scan) can then equate it with go.mod's pin instead of warning on an
-  # anonymous "1.1.0 (dev)" — a label byte-identical to the skewed tarball
-  # binary this installer exists to replace.
-  # `go install pkg@version` resolves bd's own module graph, not this repo's,
-  # so the go-mod-warm step upstream does not cover it: these checksums are
+  # precedent). With a replace this is the REPLACE version -- the value gc's
+  # version_compat preflight compares (beadsModuleVersion returns
+  # dep.Replace.Version), and a fleet tag carries no commit token for that
+  # gate's commit-scan fallback, so the label must equal it byte-for-byte.
+  # Without a replace, the pseudo-version's commit suffix makes `bd version`
+  # name the exact revision in CI logs, and the same gate can equate it with
+  # go.mod's pin instead of warning on an anonymous "1.1.0 (dev)" — a label
+  # byte-identical to the skewed tarball binary this installer exists to
+  # replace.
+  #
+  # The download and the build resolve bd's own module graph, not this repo's,
+  # so the go-mod-warm step upstream does not cover them: those checksums are
   # fetched and verified here, on their own trip to sum.golang.org. Same flake
   # class (transient HTTP/2 INTERNAL_ERROR on a checksum tile), same bounded
   # backoff (ga-azybk8). Verification is untouched.
+  build_bd_from_module_dir() {
+    go mod download "$module" || return $?
+    local module_dir
+    module_dir="$(go list -m -f '{{.Dir}}' "$module")" || return $?
+    if [[ -z "$module_dir" || ! -d "$module_dir" ]]; then
+      echo "could not locate the module directory for ${resolved_path}@${resolved_version}" >&2
+      return 1
+    fi
+    CGO_ENABLED=1 go -C "$module_dir" build -tags gms_pure_go \
+      -ldflags "-X main.Version=${resolved_version#v}" \
+      -o "$target" ./cmd/bd
+  }
   install_attempt=1
   install_max=3
   while :; do
     set +e
-    GOBIN="$bin_dir" CGO_ENABLED=1 go install -tags gms_pure_go \
-      -ldflags "-X main.Version=${resolved_version#v}" \
-      "${resolved_path}/cmd/bd@${resolved_version}"
+    build_bd_from_module_dir
     install_status=$?
     set -e
     if ((install_status == 0)); then
       break
     fi
-    echo "attempt ${install_attempt}/${install_max}: go install bd exited ${install_status}" >&2
+    echo "attempt ${install_attempt}/${install_max}: bd build exited ${install_status}" >&2
     if ((install_attempt >= install_max)); then
-      echo "go install bd failed after ${install_max} attempts; exiting ${install_status}" >&2
+      echo "bd build failed after ${install_max} attempts; exiting ${install_status}" >&2
       exit "$install_status"
     fi
     if ((install_attempt == 1)); then

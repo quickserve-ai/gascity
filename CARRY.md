@@ -51,7 +51,7 @@ and the behavior check.
 | Doctor live-rig classification (ga-w7xo) | 5886594b1 | Prevent a live rig DB on the managed endpoint from being labeled orphan. | Upstream equivalent topology classification. |
 | Navigator contract | 73d410d71, 0cdd157f7 | Stable navigator classification fields and regenerated API/dashboard clients. | Upstream exposes the same wire contract. |
 | Bundled pack pin | 6b747120d, fe59ba7c0 | Canonical core/bd pin names a real carry commit containing current embedded pack content. | Re-pin whenever current carry pack content changes. |
-| Beads schema pin | see "Beads pin" below | Since 2026-09-01 `go.mod`'s beads line **equals upstream main's** (`bf97b73749ac`, schema v59); the row stays as the fleet-contract pointer, not as a divergence. | Absorbed 2026-09-01 — the drop condition ("upstream's line unmodified") is met; keep the line equal to upstream's pin at every rebase. |
+| Beads schema pin | see "Beads pin" below | Since 2026-09-01 `go.mod`'s beads line **equals upstream main's** (`bf97b73749ac`, schema v59); the row stays as the fleet-contract pointer, not as a divergence; the fork build the fleet actually runs is the next row. | Absorbed 2026-09-01 — the drop condition ("upstream's line unmodified") is met; keep the line equal to upstream's pin at every rebase. |
 | CI bd lockstep install (ga-yl326d) | 2fee7e6bd, 8dbd02a3c | `.github/scripts/install-bd-lockstep.sh` + both `setup-gascity-*` actions build CI's `bd` from go.mod's beads pin (version-stamped, tool-cached) instead of a separately-pinned tarball; deletes the actions' `bd-version` input and its 28 workflow call sites. Broad workflow-file conflict surface at rebase. | Upstream derives CI's bd from go.mod equivalently (or the affected workflows/actions are themselves absorbed); prove by reading upstream's setup path, then take upstream's line. |
 | Silent-work detector (ga-krso22 / ga-mmvpq1 Half B; ga-vh6cbz) | b31cbba15, 6eec3c4de, ce2a6cb48, 58d672f28 | Published-work-waiting-on-nobody sweep: bead-arm gate + comment; orphan-arm mail with a delivered-only, scope-keyed 24h latch and loud-fail duration knobs. | Drop when upstream's core pack ships an equivalent detector (both arms, mail latched) or the order is retired. |
 | Cross-city mail (upstream #5386, ga-d755oq) | `3a8c37580` (fork PR #3) | `gc --context <peer> mail send / reply / inbox` routed to a REMOTE city over the control plane (`cmd/gc/mail_remote.go`, `api.Client.SendMail/ReplyMail/ListMailInboxPage`). Originally carried on this box as `84acc9794` cherry-picked from upstream `cdcd0611c1` (gastownhall/gascity PR #5386). That local copy proved BYTE-IDENTICAL to fork-PR #3's `3a8c37580` — same `git patch-id` `087346b84633ab5aeaee0340744f14b7745b8b53` — and was dropped as a duplicate when the deploy lineage was reconciled onto `origin/carry/operational` (ga-33s83a). The distinction an earlier draft of this row drew between the two copies is not a real one. | Upstream merges #5386 — the range-diff then absorbs it; take upstream's line unmodified. |
@@ -69,6 +69,7 @@ and the behavior check.
 | City-imported rig-scoped orders fan out per rig (gc-8mb7; syl qc-04ff7.87.5 / qc-bridge #298; upstream #6218) | 87bd931b6 (= A3Ackerman fix/order-scope-rig-on-city-import ee4b9bf74, cherry-pick -x, clean apply on 0f37e0710) | `Order.IsRigScoped`; `orderdiscovery.ScanAll` expands a city import's `scope = "rig"` orders once per `[[rigs]]` entry with `Rig` stamped and drops the city copy (a rig that imports the pack itself keeps its own instance; unscoped orders unchanged; Env/Params cloned per copy). A city-imported pack's rig-scoped orders fire per rig instead of never; the per-rig `Rig` stamp is what #34's suspended-rig check attributes on. | Drop when the gastownhall PR for #6218 merges (patch-id equal at the next rebase). |
 | A failed mint stamps its own root and names what it could not confirm (gc-qum2; syl qc-04ff7.109.14; upstream #6235) | be916c30e (= A3Ackerman fix/molecule-failed-root-stamp f3457d6f7, cherry-pick -x, resolved on 734753329 for the two `validateResidualRoutingVars` sites carry lacks — #5060; 15 sites here, 17 upstream) | `markFailed`/`markFailedReporting` share a two-pass stamper: a bead whose `molecule_failed` stamp fails is retried once after every other bead is stamped, and the id-qualified errors of the stamps that still failed are returned or joined (`errors.Join`) instead of dropped or truncated to the first; every mark-then-return site in `Instantiate`/`InstantiateFragment` goes through `failInstantiation`, which appends `(failure stamp not confirmed: <bead: fault>; …)` to the error, and the order dispatcher logs that error before recording `OrderFailed` (as it already did for a routing failure), so the controller log names the stranded root. The 7-of-8 / 6-of-7 shape on westeros: the root's activation failed, `markFailed`'s first write hit the same row and was dropped, the root stayed fenced and invisible to dispatch, voiding and reporting. | Drop when the gastownhall PR for #6235 merges (patch-id differs from the upstream commit because of the two absent sites; verify by the three tests). |
 | Claude account isolation (ga-ai7gz2, ga-xd3bjx; fork PRs #40, #48) | bb981d2f3; 47c763d4d, 9f47485ab, 7b63e700d | A managed session never inherits the controller's ambient `CLAUDE_CONFIG_DIR`: the passthrough baseline resets it to empty (`internal/processenv/provider.go:178`), `RequireDeclaredClaudeAccount` guards create (hard) and resume (warn-only), `respawnAgent` re-applies the empties (`set-environment -u` + the `env -u` prefix) and the values on a reconciler relaunch, the CLI resolver keeps a PATH-missing provider's declared env instead of building a nil env (`worker_handle.go:585-606`, `:944-969`), resume merges `Workspace.Env` in the create path's order, and the claude-account doctor check reads the launchd plist for an ambient value. Multi-account fleet policy; upstream passes `CLAUDE_CONFIG_DIR` through (`internal/processenv/provider.go:187`) and has no reset, so the cluster is fork-only. Open siblings from the fork-owner read of #48: gc-da9g (the API resume resolver keeps the nil-env bypass, `internal/api/session_runtime.go:493-495`), ga-zfllzm (the doctor check reads launchd only; the box's systemd unit is never inspected), ga-kdz9pu (tmux/spec-env hygiene). | Drop when upstream adopts an account-declaration guard, or when every fleet seat declares `CLAUDE_CONFIG_DIR` at provider level and the reset is proven redundant. The respawn half is re-expressed on upstream #5061's `markSessionEnvRemoved` / `durableWithholdKeys` (`cab9da1c8`, 2026-08-06, after the carry base) at the next rebase — upstream withholds only controller-only + `BEADS_*` keys, so a one-line fork delta adding every empty-valued key remains. |
+| Beads pin — fork build via `go.mod` replace (gc-1c2b / lyft be-xnr) | fork PR #52's replace commit (gc-1c2b) | `replace github.com/steveyegge/beads => github.com/quickserve-ai/beads v1.1.1-fleet.20260910` so `gc` links the beads fork's carry build of bd — the one every machine runs. Five places move together: `go.mod`+`go.sum`; `.github/scripts/install-bd-lockstep.sh` (builds CI's bd inside the replace target's module directory — the fork declares upstream's module path, so `go install <fork>/cmd/bd@<ver>` cannot resolve it); `deps.env` `BD_REPO`/`BD_CURRENT_VERSION`/`BD_CURRENT_REF` + the ci.yml current cell's clone URL; `scripts/beads_module_pin_test.go` (`beadsFleetFork*`); the "Beads pin" table below. Plus the two `preflight-static` guards the replace trips: `scripts/check-gomod-replace.sh` (+ `gomod_replace_guard_test.go` fixtures) admits the fork's fleet-tag shape on that path only, and `scripts/cipolicy/policy.go` `expectedCIExecutionHash` for the current cell's clone. Conflict surface at rebase: the `go.mod` tail, the lockstep script, ci.yml's current cell, the replace guard, the cipolicy digest. | Never while the fleet runs a carry build of bd; re-pointed per beads release. |
 
 ## Beads pin — the fleet contract
 
@@ -79,18 +80,26 @@ has written trips beads' schema-skew gate: native-store selection falls back to
 the exec store and everything keeps working, slower and differently. Nothing
 turns red. That is why the pin is a written contract rather than a preference.
 
-**Current pin — one line, three places that must agree:**
+**Current pin — the require line stays upstream's; the replace is what the
+fleet builds. The places that must agree:**
 
 | Where | Value |
 |---|---|
-| `go.mod` require | `github.com/steveyegge/beads v1.1.1-0.20260805093327-bf97b73749ac` |
+| `go.mod` require | `github.com/steveyegge/beads v1.1.1-0.20260805093327-bf97b73749ac` — equal to upstream `gastownhall/gascity` main's pin, unchanged at every rebase |
 | Upstream commit | `bf97b73749ac` on `gastownhall/beads` main (2026-08-05), schema **v59** — the revision upstream `gastownhall/gascity` main pins |
-| Every machine's `bd version` | carries the pin: a laptop/box build starts `v1.1.1-0.20260805093327-bf97b73749ac` and a carry build appends its identity, e.g. `(bf97b73+carry.8f7471e: carry-v59/be-qfm-be-4at@8f7471e01238)`; a CI lockstep build (`install-bd-lockstep.sh`) stamps the same pin without the leading `v` — `1.1.1-0.20260805093327-bf97b73749ac (dev)`. Either way the commit token in the label must stay the pin's commit: gc's version_compat gate equates versions by that token. |
+| `go.mod` replace | `github.com/steveyegge/beads => github.com/quickserve-ai/beads v1.1.1-fleet.20260910` — the beads fork's released fleet build, the one every machine runs; `go list -m github.com/steveyegge/beads` prints it after `=>`. Annotated tag on `quickserve-ai/beads` (tagger a3ackerman, 2026-09-10 09:34:31Z), cut per beads release. |
+| Fork commit | `1370260e6f479099da6fbe789201fe040b200167` — head of `quickserve-ai/beads` `carry-v59/be-qfm-be-4at-be-bs7-be-xnr`, the target of `v1.1.1-fleet.20260910`: the pin `bf97b73749ac` + 8 carries (1370260e6 ci(fleet) workflow, 05ba366c4 #5343 wisp-delete cascade, 327e0869c be-4at narrow, 3d0d62858 #5678, 8f7471e01 be-4at, 4f62045df be-qfm, fba96444a be-qfm, 448baad1f be-qfm), schema v59 (lyft). Not `carry/operational` (`e6b23b0…`), which is the documentation carry — upstream main plus doc commits, schema v66+ — and never a build source. It shares the pin's dependency graph, so `go.mod` moves by the replace line alone and `go.sum` by the replaced module's `h1:` pair (measured 2026-09-10: 727 modules, `dolthub/dolt/go` still `…0715-a6690826d767`; the tag's `/go.mod` hash equals upstream's). `go mod tidy` never downgrades — restore `go.mod`/`go.sum` from the parent before re-pointing. |
+| `deps.env` | `BD_REPO=quickserve-ai/beads`; `BD_CURRENT_VERSION` = the replace version; `BD_CURRENT_REF` = the fork commit. The ci.yml current cell clones `BD_REPO` at that ref. `BD_VERSION`/`BD_PREV_VERSION` stay upstream release tarballs (`install-bd-archive.sh` names `gastownhall/beads` itself; the fork publishes no releases). |
+| `scripts/beads_module_pin_test.go` | `beadsFleetPin` = the require line; `beadsFleetForkPath`/`beadsFleetForkVersion` = the replace. Fails when the replace is missing, versionless, or points anywhere else. |
+| Every machine's `bd version` | `main.Version` must be the replace version **without the leading `v`, byte-for-byte** — `1.1.1-fleet.20260910`. `gc`'s version_compat preflight (`internal/beads/contract/preflight_checker.go`, `checkVersionCompat` + `beadsModuleVersion`) compares `bd context --json`'s `bd_version` — the fork's `cmd/bd/context_cmd.go` emits `main.Version` there — against `dep.Replace.Version` with the `v` trimmed. Its commit-token fallback only rescues labels that embed a hex commit, and a fleet tag (`v1.1.1-fleet.YYYYMMDD`) embeds none, so any other label WARNs → verdict DEGRADED → native store offline (bd exec fallback). CI's lockstep build stamps exactly this label (`-X main.Version=${resolved_version#v}`); a fleet build of bd must stamp the same, and may carry its identity in `main.Build`/`Commit`/`Branch`. |
 
-The pin is a pseudo-version rather than a tag because the fleet pins **whatever
-upstream `gastownhall/gascity` main pins at window time** — on-support, never
-ahead, never waiting on an announcement — and upstream main pins this commit
-(`qc-bridge` `shared/fork-upstream-operating-principles.v1.md`, principle 3).
+The require line is a pseudo-version rather than a tag because the fleet pins
+**whatever upstream `gastownhall/gascity` main pins at window time** — on-support,
+never ahead, never waiting on an announcement — and upstream main pins this commit
+(`qc-bridge` `shared/fork-upstream-operating-principles.v1.md`, principle 3). The
+replace names the beads fork's fleet build — the carry stack lyft maintains
+(be-xnr), released as a semver fleet tag on `quickserve-ai/beads`
+(`v1.1.1-fleet.YYYYMMDD`) and re-pointed per beads release.
 History: the previous pin was `v1.1.1-0.20260716185344-67652d8b5caf` (schema
 v54, 2026-07-16 to 2026-09-01); the sections below that measure v54 stores
 are dated and kept as the record of that period.
@@ -101,11 +110,21 @@ the right beads on every laptop, on westeros, and in CI with no per-machine
 setup. Do not reintroduce a filesystem-path replace to get it: carry commit
 `74407adde` pinned `replace github.com/steveyegge/beads => /Users/cherub/beads-src`,
 which resolved on exactly one box and left every other machine silently building
-the v1.1.0 require pin — a v53 binary against v54 stores. That replace also put
-the carry branch in violation of the repo's own required `make
-check-gomod-replace` gate, which blocks local-path replaces by policy; the
-require-pin shape passes it. `scripts/beads_module_pin_test.go` covers the half
-that gate does not — drift in the `require` line itself — and `.gitignore` keeps
+the v1.1.0 require pin — a v53 binary against v54 stores. A module-path replace
+to the fork is the opposite shape: it resolves identically on every machine
+through the module proxy and `go.sum`. That local-path replace also put the carry
+branch in violation of the repo's own required `make check-gomod-replace` gate
+(`scripts/check-gomod-replace.sh`, ci.yml `preflight-static`). That guard admits
+pure `vX.Y.Z` right-hand sides everywhere and, for the replacement path
+`github.com/quickserve-ai/beads` only, a fleet tag `vX.Y.Z-fleet.YYYYMMDD[.N]`
+(fixtures in `scripts/gomod_replace_guard_test.go`); a pseudo-version stays
+BLOCKED on every path, so only the released tag passes. The same job's `make check-native-dependency-surface`
+counts the module graph: 727 on the untouched tip and 727 with the fork's
+build lineage — within the 730 ceiling (`GC_NATIVE_DEP_MAX_MODULES`,
+`scripts/check-native-dependency-surface.sh`; measured 2026-09-10 at the
+tag), so that knob is untouched; re-measure at every re-point.
+`scripts/beads_module_pin_test.go` covers what neither guard does —
+drift in the `require` line or in the replace's target — and `.gitignore` keeps
 `go.work` out of the tree so a local override cannot be committed by accident.
 
 Note this is a different axis from `deps.env`'s `BD_VERSION`, which pins the bd
@@ -113,19 +132,27 @@ Note this is a different axis from `deps.env`'s `BD_VERSION`, which pins the bd
 install, and can only name a published tag — `TestBDVersionPins` owns that one,
 and it stays where upstream left it. The general CI path no longer rides that
 axis at all: since ga-yl326d every `setup-gascity-*` job builds `bd` from this
-same `go.mod` pin via `.github/scripts/install-bd-lockstep.sh`, so the CLI
-cannot skew from the linked library. It used to — CI ran gc at schema v59
+same `go.mod` pin via `.github/scripts/install-bd-lockstep.sh` — from the
+replace target when one is present: the script resolves `go list -m`, builds
+inside that module's cache directory (the fork declares upstream's module path,
+so a path-versioned `go install` cannot name it) and stamps `main.Version` with
+the resolved version — so the CLI cannot skew from the linked library. It used to — CI ran gc at schema v59
 beside the `v1.1.0` tarball at v53, and `bd create` refused the store.
 
-**Moving the pin moves the fleet.** Bump `go.mod`, the `beadsFleetPin` constant
-in that test, and the table above together, and redeploy `bd` on every machine
-in the same window — a `gc` that migrates a city DB past what the other
+**Moving the pin moves the fleet.** Bump `go.mod` (the replace; the require only
+when upstream main's pin moves) and `go.sum`, `deps.env`
+`BD_CURRENT_VERSION`/`BD_CURRENT_REF`, the `beadsFleetFork*` constants in that
+test (`beadsFleetPin` for the require), the table above and the ledger row
+together, and redeploy `bd` on every machine in the same window — a bd whose
+label is not the replace version takes that machine's native store offline (see
+the table) — a `gc` that migrates a city DB past what the other
 machines' `bd` knows produces the same skew from the opposite side. The move
 from v54 to v59 happened 2026-09-01: the alex laptop, the westeros box and the
 q-core hub advanced in one window (deliberate hub migration past the
 migration-interlock remote); Cherub's hq/as stores complete it in their
 2026-09-02 unfork window, which also ends the forked 0054 (dropped, not
-renumbered). The next move is when upstream gascity main's pin moves.
+renumbered). The require moves when upstream gascity main's pin moves; the
+replace moves per beads fork release.
 
 **Working against a local beads checkout** (patching beads and gascity together)
 is the one case for an override. Use an **untracked** `go.work` at the repo
@@ -150,7 +177,7 @@ use (
 While that file exists you are no longer building the fleet pin — you are
 building whatever revision that checkout happens to be on — and `go build` will
 not say so. `go list -m github.com/steveyegge/beads` reports the local directory
-instead of the pinned pseudo-version; that is the check. Delete `go.work` before
+instead of the pinned replace; that is the check. Delete `go.work` before
 producing a deploy candidate.
 
 ### Correction: schema slot 0054 is forked (ga-grjijl, measured 2026-08-21)
@@ -240,8 +267,9 @@ dashboard surfaces changed. Minimum for a code deploy: `go vet ./...` +
 full `go test ./cmd/gc/ -timeout 35m` (same CGO env; 17–19 min — run it
 detached, never as a foreground tool call) + the targeted package suites
 for whatever you touched. Before building, confirm the beads pin the build
-will actually resolve — `go list -m github.com/steveyegge/beads` — matches
-installed `bd version`, or the schema-skew gate disables the native store.
+will actually resolve — `go list -m github.com/steveyegge/beads`, the version
+after `=>` — matches installed `bd version` byte-for-byte (leading `v` aside),
+or the version_compat gate disables the native store.
 Reading `go.mod` is not the same check: an untracked `go.work` overrides it
 silently (see "Beads pin" above).
 
