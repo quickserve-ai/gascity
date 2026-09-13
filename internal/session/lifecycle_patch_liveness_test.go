@@ -28,11 +28,11 @@ func TestHotPatchBuildersEmitOnlyLivenessKeys(t *testing.T) {
 		"BeginDrainPatch":             BeginDrainPatch(now, "max-age"),
 		"DrainAckStopPendingPatch":    DrainAckStopPendingPatch(now),
 		"AcknowledgeDrainPatch":       AcknowledgeDrainPatch(false),
-		"CompleteDrainPatch":          CompleteDrainPatch(now, "drain_complete", false),
+		"CompleteDrainPatch":          CompleteDrainPatch(now, "drain_complete", "", false),
 		"RequestWakePatch":            RequestWakePatch("demand", now),
 		"RequestExplicitWakePatch":    RequestExplicitWakePatch("operator", now),
 		"ClearWakeBlockersPatch":      ClearWakeBlockersPatch(StateSuspended, string(SleepReasonUserHold)),
-		"ClearExpiredHoldPatch":       ClearExpiredHoldPatch(string(SleepReasonUserHold)),
+		"ClearExpiredHoldPatch":       ClearExpiredHoldPatch(string(SleepReasonUserHold), string(SleepReasonUserHold)),
 		"ClearExpiredQuarantinePatch": ClearExpiredQuarantinePatch(string(SleepReasonQuarantine)),
 		"QuarantinePatch":             QuarantinePatch(now.Add(time.Hour), 3),
 		"PreWakePatch": PreWakePatch(PreWakePatchInput{
