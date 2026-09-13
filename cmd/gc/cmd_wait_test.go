@@ -684,11 +684,9 @@ func buildPinnedBDBinaryForTests() (string, error) {
 	target := filepath.Join(buildDir, "bd")
 
 	if !pinned.Replaced {
-		cmd := exec.Command("go", "install", "-tags", "gms_pure_go",
-			"github.com/steveyegge/beads/cmd/bd@"+pinned.Version)
-		cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOBIN="+buildDir)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return "", fmt.Errorf("go install github.com/steveyegge/beads/cmd/bd@%s: %w\n%s", pinned.Version, err, out)
+		if _, err := runGoForPinnedBD("", []string{"CGO_ENABLED=0", "GOBIN=" + buildDir},
+			"install", "-tags", "gms_pure_go", "github.com/steveyegge/beads/cmd/bd@"+pinned.Version); err != nil {
+			return "", err
 		}
 		return target, nil
 	}
@@ -697,14 +695,32 @@ func buildPinnedBDBinaryForTests() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	cmd := exec.Command("go", "-C", moduleDir, "build", "-tags", "gms_pure_go",
+	if _, err := runGoForPinnedBD(moduleDir, []string{"CGO_ENABLED=0"},
+		"build", "-tags", "gms_pure_go",
 		"-ldflags", "-X main.Version="+pinned.VersionLabel(),
-		"-o", target, "./cmd/bd")
-	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("go -C %s build ./cmd/bd (%s@%s): %w\n%s", moduleDir, pinned.ReplacePath, pinned.Version, err, out)
+		"-o", target, "./cmd/bd"); err != nil {
+		return "", fmt.Errorf("build ./cmd/bd in %s (%s@%s): %w", moduleDir, pinned.ReplacePath, pinned.Version, err)
 	}
 	return target, nil
+}
+
+// runGoForPinnedBD runs one `go` invocation for the pinned-bd build: the
+// single subprocess call site the install, list, download and build steps
+// share, so the helper's process census stays where it was before the replace
+// path grew from one go command to three. dir is the working directory (""
+// inherits the test process's); extraEnv is appended to the environment. On
+// failure the error carries the command line, stdout and stderr.
+func runGoForPinnedBD(dir string, extraEnv []string, args ...string) ([]byte, error) {
+	cmd := exec.Command("go", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), extraEnv...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return out, fmt.Errorf("go %s: %w\n%s%s", strings.Join(args, " "), err, out, stderr.Bytes())
+	}
+	return out, nil
 }
 
 // beadsReplacementModuleDir locates the directory of the module go.mod
@@ -722,13 +738,9 @@ func beadsReplacementModuleDir() (string, error) {
 	repoRoot := filepath.Join(filepath.Dir(thisFile), "..", "..")
 	const module = "github.com/steveyegge/beads"
 	listDir := func() (string, error) {
-		cmd := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", module)
-		cmd.Dir = repoRoot
-		var stderr bytes.Buffer
-		cmd.Stderr = &stderr
-		out, err := cmd.Output()
+		out, err := runGoForPinnedBD(repoRoot, nil, "list", "-m", "-f", "{{.Dir}}", module)
 		if err != nil {
-			return "", fmt.Errorf("go list -m %s: %w\n%s", module, err, stderr.Bytes())
+			return "", err
 		}
 		return strings.TrimSpace(string(out)), nil
 	}
@@ -737,10 +749,8 @@ func beadsReplacementModuleDir() (string, error) {
 		return "", err
 	}
 	if dir == "" {
-		cmd := exec.Command("go", "mod", "download", module)
-		cmd.Dir = repoRoot
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return "", fmt.Errorf("go mod download %s: %w\n%s", module, err, out)
+		if _, err := runGoForPinnedBD(repoRoot, nil, "mod", "download", module); err != nil {
+			return "", err
 		}
 		if dir, err = listDir(); err != nil {
 			return "", err
@@ -858,8 +868,8 @@ func TestBuildPinnedBDBinaryForTestsMatchesGoModVersion(t *testing.T) {
 		return
 	}
 
-	// Under a replace the binary is a `go -C <module dir> build` of the
-	// replacement, so its build info carries beads as the MAIN module line,
+	// Under a replace the binary is a `go build` run inside the replacement's
+	// module directory, so its build info carries beads as the MAIN module line,
 	// `mod\tgithub.com/steveyegge/beads\t(devel)` (measured on the
 	// v1.1.1-fleet.20260910 pin): a directory build has no module version to
 	// stamp and the fork declares upstream's path, so the replace tag appears
