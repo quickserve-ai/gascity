@@ -257,6 +257,21 @@ func inProgressBlockedByEnrichmentScript(shellVar string) string {
 		`fi; `
 }
 
+// standardAssignedReadyWorkQueryScript is the pre-assigned ready tier: the read
+// a seat runs for work already assigned to one of its identities.
+//
+// The CONTROLLER mirrors this predicate before it counts such a row as capacity
+// demand — cmd/gc poolWakeReadiness, the assigned-arm counterpart to the
+// unassigned arm's serve rules. It answers from the Ready() snapshot the demand
+// phase already holds, and deliberately declines to answer for the cases where
+// this command is not what will run: a template carrying its own WorkQuery
+// (which replaces this tier verbatim, see effectiveQuery), a bead type or label
+// Ready() structurally excludes but ephemeralAssignedReadyProbeScript still
+// serves, and a deferred row, which `bd ready` refuses at any timestamp while
+// several Ready() backends resurface it (beads.CarriesDeferral).
+//
+// Change the flags here and that mirror needs the same change, or the pool goes
+// back to spawning seats for rows their own hooks are forbidden to claim.
 func standardAssignedReadyWorkQueryScript(includeEphemeralReady bool) string {
 	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
