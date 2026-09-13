@@ -63,7 +63,10 @@ func nativeDoltOperationContext(parent context.Context) (context.Context, contex
 // of partial work (2026-07-17 code red). Until the per-edge check is replaced
 // by one whole-graph CycleThroughEdges pass (needs a beads-side export of
 // DependencyAddOptions), give each node and edge a slice of budget on top of
-// the flat floor so the atomic path completes instead of falling back.
+// the flat floor so the atomic path completes instead of falling back. When
+// even that budget is spent, the apply reports ErrGraphApplyBudgetExhausted
+// rather than inviting a retry that would derive the same budget for the same
+// plan (#6333).
 func nativeGraphApplyDeadline(plan *GraphApplyPlan) time.Duration {
 	d := bdCommandTimeout
 	if plan == nil {
@@ -71,6 +74,27 @@ func nativeGraphApplyDeadline(plan *GraphApplyPlan) time.Duration {
 	}
 	const perItem = 2 * time.Second
 	return d + time.Duration(len(plan.Nodes)+len(plan.Edges))*perItem
+}
+
+// nativeGraphApplyBudgetError reports a spent graph-apply budget. The test is a
+// return-time snapshot of two contexts: this apply's own derived context has
+// expired and the caller's has not, so what ran out is the budget
+// nativeGraphApplyDeadline sized for this plan.
+//
+// That is an observation about which deadline fired, not a diagnosis of why
+// the work was slow and not a claim that a retry must fail. It marks the error
+// so callers can apply a no-automatic-replay policy to a spent operation
+// budget. It returns nil for every other failure, including the caller
+// canceling and a statement that failed on a deadline of its own while both
+// contexts were still live — those stay plain transients.
+// budget is the value that actually governed applyCtx, passed in rather than
+// re-derived so the number reported is the one that was enforced.
+func nativeGraphApplyBudgetError(parent, applyCtx context.Context, plan *GraphApplyPlan, budget time.Duration, err error) error {
+	if applyCtx.Err() == nil || parent.Err() != nil {
+		return nil
+	}
+	return fmt.Errorf("native graph apply: %w after %s for %d nodes/%d edges: %w",
+		ErrGraphApplyBudgetExhausted, budget, len(plan.Nodes), len(plan.Edges), err)
 }
 
 // ProcessEnvSnapshotExcludingNativeDoltOpen returns a process environment
@@ -1291,7 +1315,8 @@ func (s *NativeDoltStore) ApplyGraphPlanWithStorage(parent context.Context, plan
 	if parent == nil {
 		parent = context.Background()
 	}
-	ctx, cancel := context.WithTimeout(parent, nativeGraphApplyDeadline(plan))
+	budget := nativeGraphApplyDeadline(plan)
+	ctx, cancel := context.WithTimeout(parent, budget)
 	defer cancel()
 
 	if len(req.Items) <= issueops.MaxApplyBatchItems {
@@ -1301,6 +1326,9 @@ func (s *NativeDoltStore) ApplyGraphPlanWithStorage(parent context.Context, plan
 		}
 		applyResult, err := applier.ApplyBatch(ctx, req)
 		if err != nil {
+			if budgetErr := nativeGraphApplyBudgetError(parent, ctx, plan, budget, err); budgetErr != nil {
+				return nil, budgetErr
+			}
 			return nil, fmt.Errorf("native graph apply: %w", err)
 		}
 		result := &GraphApplyResult{IDs: applyResult.Keys}
@@ -1322,6 +1350,9 @@ func (s *NativeDoltStore) ApplyGraphPlanWithStorage(parent context.Context, plan
 		// No transaction was ever opened — ask, don't handshake — so this
 		// backend has no atomic route left for a plan this large at all.
 		return nil, fmt.Errorf("native graph apply: %w", &GraphApplyTooLargeError{Items: len(req.Items), Max: issueops.MaxApplyBatchItems})
+	}
+	if budgetErr := nativeGraphApplyBudgetError(parent, ctx, plan, budget, err); budgetErr != nil {
+		return nil, budgetErr
 	}
 	return nil, fmt.Errorf("native graph apply: %w", err)
 }
