@@ -335,6 +335,104 @@ exit 1
 	}
 }
 
+// TestOrphanSweepReportsProtectedIdentitiesWhenEscalationMailFails pins the
+// order of the sweep's two closing reports. One pass protects a foreign crew
+// claim, resets an orphan, and then cannot mail the escalation. The
+// protected-identity summary is the only signal that a decommissioned local
+// agent is leaking claims, so it must still print, and the undeliverable
+// escalation must still exit non-zero so the controller logs the output
+// (#4543).
+func TestOrphanSweepReportsProtectedIdentitiesWhenEscalationMailFails(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+if [ "$1" = "--rig" ]; then
+  shift 2
+fi
+case "$1" in
+  mail)
+    exit 1
+    ;;
+  config)
+    if [ "$2" = "explain" ]; then
+      cat <<'EOF'
+Agent: project/gastown.refinery
+  source: pack
+EOF
+      exit 0
+    fi
+    ;;
+  rig)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      printf '{"rigs":[{"name":"hq","hq":true},{"name":"project","hq":false}]}\n'
+      exit 0
+    fi
+    ;;
+  session)
+    if [ "$2" = "list" ] && [ "$3" = "--json" ]; then
+      printf '{"sessions":[{"id":"orphan-sweep-test-keepalive","session_name":"orphan-sweep-test-keepalive","closed":false}],"summary":{},"filters":{},"schema_version":"1"}\n'
+      exit 0
+    fi
+    ;;
+  bd)
+    if [ "$2" = "list" ]; then
+      case "$*" in
+        *"--rig project"*)
+          cat <<'EOF'
+[
+  {"id":"ga-foreign","status":"in_progress","assignee":"project/dalinar"},
+  {"id":"ga-orphan","status":"in_progress","assignee":"project/gastown.missing"}
+]
+EOF
+          ;;
+        *)
+          printf '[]\n'
+          ;;
+      esac
+      exit 0
+    fi
+    if [ "$2" = "show" ] && [ "$3" = "ga-orphan" ] && [ "$4" = "--json" ]; then
+      cat <<'EOF'
+[
+  {"id":"ga-orphan","status":"in_progress","assignee":"project/gastown.missing"}
+]
+EOF
+      exit 0
+    fi
+    if [ "$2" = "release-if-current" ]; then
+      printf 'released\n'
+      exit 0
+    fi
+    ;;
+esac
+exit 1
+`)
+
+	out, err := runScriptResult(t, coreScriptPath("orphan-sweep.sh"), map[string]string{
+		"GC_CITY":              cityDir,
+		"GC_CITY_PATH":         cityDir,
+		"GC_CALL_LOG":          gcLog,
+		"GC_ESCALATION_TARGET": "human",
+		"PATH":                 binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	})
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("orphan-sweep exit error = %v, want a non-zero exit for the undeliverable escalation:\n%s", err, out)
+	}
+	for _, want := range []string{
+		"orphan-sweep: reset 1 orphaned beads",
+		"orphan-sweep: 1 escalation summary(ies) could not be delivered to 'human'",
+		"orphan-sweep: protected 1 foreign/unknown identities this pass (1 claims): project/dalinar (1: ga-foreign)",
+	} {
+		if !strings.Contains(string(out), want) {
+			t.Errorf("orphan-sweep output missing %q:\n%s", want, out)
+		}
+	}
+}
+
 // orphanSweepBareShortFormGCStub writes a gc stub whose only live session is
 // the qualified agent "thriva/devpipeline.backend_dev", while the sole
 // in-progress bead is assigned to the bare short form "backend_dev". When
