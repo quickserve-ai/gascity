@@ -163,6 +163,17 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 				Type:  "select",
 				Choices: []BuiltinOptionChoice{
 					{Value: "", Label: "Default"},
+					// "fable" tracks the CURRENT Fable generation at the 1M window
+					// through the CLI's own family alias, for the same reason "opus"
+					// does below — and the dated pin had already gone stale under the
+					// fleet. Measured on the qyburn account 2026-09-14 with fresh -p
+					// probes: `--model claude-fable-5[1m]` served claude-fable-5 (5.0),
+					// while `--model fable[1m]` served claude-fable-5-1. Every one of
+					// the 13 fable providers pinned "fable-5", so every fresh boot
+					// landed on 5.0 while the server migrated only some long-running
+					// sessions to 5.1 mid-flight — a fleet split across two
+					// generations with no way to pin the newer one (ga-a306b1).
+					//
 					// "fable-5" carries the [1m] suffix for the same reason "opus" does
 					// (ga-ljcm7c): without it the model lands on the 200k context tier,
 					// and every fable lane spawned through gc silently lost 800k of
@@ -171,6 +182,8 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 					// this change still match a schema sequence and migrate on restart
 					// instead of accumulating a duplicate --model flag — the same
 					// migration-safety contract the dated opus pins provide.
+					{Value: "fable", Label: "Fable (latest, 1M)", FlagArgs: []string{"--model", "fable[1m]"}, FlagAliases: [][]string{{"-m", "fable[1m]"}}},
+					{Value: "fable-5-1", Label: "Fable 5.1 (1M)", FlagArgs: []string{"--model", "claude-fable-5-1[1m]"}, FlagAliases: [][]string{{"-m", "claude-fable-5-1[1m]"}}},
 					{Value: "fable-5", Label: "Fable 5 (1M)", FlagArgs: []string{"--model", "claude-fable-5[1m]"}, FlagAliases: [][]string{{"-m", "claude-fable-5[1m]"}}},
 					{Value: "fable-5-200k", Label: "Fable 5 (200k)", FlagArgs: []string{"--model", "claude-fable-5"}, FlagAliases: [][]string{{"-m", "claude-fable-5"}}},
 					// "opus" tracks the CURRENT Opus generation at the 1M context window
