@@ -33,6 +33,19 @@ var ErrIDCollision = fmt.Errorf("bd resolved a different bead ID (substring coll
 // it can wrap. See beadstest.RunPinnedIDFenceConformance.
 var ErrPinnedIDOutsideNamespace = errors.New("pinned id outside this store's namespaces")
 
+// ErrVerifyIndeterminate is returned when a lookup could not be completed, so
+// the bead's absence is UNPROVEN. It is deliberately a sub-case of ErrNotFound
+// (same idiom as ErrIDCollision above): errors.Is(err, ErrNotFound) stays true
+// so every existing not-found caller behaves exactly as before, while a caller
+// that must not confuse "definitely absent" with "could not look" checks
+// errors.Is(err, ErrVerifyIndeterminate).
+//
+// This distinction is what makes a read-after-write guard safe. Without it, a
+// verification query that merely TIMED OUT under host load is indistinguishable
+// from a write that never landed, and a guard built on that reading would fail
+// healthy sends at exactly the moment load makes timeouts likely (ga-0ejdbv).
+var ErrVerifyIndeterminate = fmt.Errorf("bead lookup did not complete, absence unproven: %w", ErrNotFound)
+
 // ErrMetadataParse is returned when a bead exists but its stored metadata
 // cannot be decoded into the Store object model.
 var ErrMetadataParse = errors.New("bead metadata parse")
