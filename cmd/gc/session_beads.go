@@ -1254,7 +1254,7 @@ func reassignWorkAssignedToRetiredSessionInfo(
 	}
 }
 
-// unclaimWorkAssignedToRetiredSessionInfo is the session.Info form of
+// unclaimWorkAssignedToRetiredPoolSessionInfo is the session.Info form of
 // unclaimWorkAssignedToRetiredSessionBead: the session-side identity read routes
 // through sessionAssignmentIdentifiersInfo (equivalence-proven), while the
 // work-store fan-out and per-bead release stay bead-shaped (ClassWork). It
@@ -1269,11 +1269,28 @@ func reassignWorkAssignedToRetiredSessionInfo(
 //
 // That is correct for its one caller, repairStrandedPoolWorkerBead, which
 // releases POOL work behind a confirmed-stranding gate and SHOULD release it.
-// It is a trap for anyone else: reach for this form on a NAMED seat and you
-// silently get no guard, which is how a whole portfolio goes missing
-// (ga-9n8hjv). If you need it for a named identity, do not call this — thread
-// cfg through and use the raw form.
-func unclaimWorkAssignedToRetiredSessionInfo(
+// The Pool in this function's name is the contract: it is for POOL/ephemeral
+// identities only. On a NAMED seat you would silently get no guard, which is
+// how a whole portfolio goes missing (ga-9n8hjv). If you need it for a named
+// identity, do not call this — thread cfg through and use the raw form.
+//
+// WHY cfg WAS NOT SIMPLY THREADED IN, because the obvious objection is wrong
+// and a reader who reconstructs it will reach the wrong conclusion. It is NOT
+// that cfg is expensive to reach: repairStrandedPoolWorkerBead has none, but
+// its only production caller (session_reconciler.go, the alive-tick repair
+// branch) has cfg in scope one line below, so threading is one parameter and
+// one argument, with nil only at the test sites.
+//
+// The real reason is that it would be a NO-OP. The ga-sdynmb guard keeps work
+// whose assignee is a configured named identity; a pool assignee is by
+// construction not one. So a threaded cfg would arm a guard that can never
+// fire here, and a parameter every caller passes for nothing is its own trap —
+// it advertises a protection that is not operating. The name carries the
+// constraint instead, with no argument to get wrong.
+//
+// If named work ever DOES route through this path, that calculus flips and cfg
+// is one line away. (katya/woodhouse, ga-9n8hjv, 2026-09-15.)
+func unclaimWorkAssignedToRetiredPoolSessionInfo(
 	store beads.Store,
 	rigStores map[string]beads.Store,
 	retiredSession session.Info,
@@ -1347,7 +1364,7 @@ const strandedRepairCloseReason = "stranded-repair"
 // emitSessionStrandedDiagnostic only reports: a pool session whose runtime
 // exited while it still held in_progress work as assignee, leaving that work
 // invisible to every actuator. It unassigns/reopens the stranded work (reusing
-// unclaimWorkAssignedToRetiredSessionInfo so the bead returns to the routed
+// unclaimWorkAssignedToRetiredPoolSessionInfo so the bead returns to the routed
 // queue with a run_target fallback) and closes the session bead so the slot
 // frees and the pool reclaims the work.
 //
@@ -1366,7 +1383,7 @@ const strandedRepairCloseReason = "stranded-repair"
 // the work passed the detached-probe liveness filter, or the session recovered
 // and cleared it), so the repair defers.
 //
-// The unassign step must land before the close: unclaimWorkAssignedToRetiredSessionInfo
+// The unassign step must land before the close: unclaimWorkAssignedToRetiredPoolSessionInfo
 // reports how many releases failed via unclaimResult. If any failed, the session
 // bead is left OPEN and false returned — closing it would retire the session
 // while work is still assigned to it (a stale-assignee item), masking the leak
@@ -1400,7 +1417,7 @@ func repairStrandedPoolWorkerBead(
 	if first.IsZero() || now.Sub(first) < strandedRepairConfirmGrace {
 		return false // inside the confirmation window — defer the destructive clear
 	}
-	res := unclaimWorkAssignedToRetiredSessionInfo(store, rigStores, info, fallbackRoute, stderr)
+	res := unclaimWorkAssignedToRetiredPoolSessionInfo(store, rigStores, info, fallbackRoute, stderr)
 	if res.Failed > 0 {
 		// At least one unassign did not land. Do NOT close the session bead or
 		// report a repair: closing now would strand the still-assigned work
