@@ -1804,6 +1804,18 @@ Accepts a session ID (e.g., gc-42) or session alias (e.g., mayor).`,
 	return cmd
 }
 
+// cfgErrOrUnknown names why the city config is unavailable. Both legs that can
+// leave cfg nil are error-bearing — resolveCity failing, or loadCityConfig
+// erroring — but a future third leg might not be, and a fail-closed message that
+// says "(<nil>)" reads as a bug in the guard rather than a missing config. Keep
+// the message honest when there is no error to quote.
+func cfgErrOrUnknown(err error) string {
+	if err != nil {
+		return err.Error()
+	}
+	return "reason not reported"
+}
+
 // cmdSessionClose is the CLI entry point for "gc session close".
 func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool) int {
 	asJSON := sessionJSONRequested(jsonOutput)
@@ -1814,8 +1826,16 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 
 	cityPath, cityErr := resolveCity()
 	var cfg *config.City
+	// cfgErr records WHY the config is unavailable, on either leg: resolveCity
+	// failing (the load never runs) or loadCityConfig erroring. The work release
+	// below reads cfg to tell a configured named identity from a retired or pool
+	// one, so a nil cfg there is not a benign default — it makes every assignee
+	// look retired. Keep the reason instead of discarding it (ga-9n8hjv).
+	cfgErr := cityErr
 	if cityErr == nil {
-		cfg, _ = loadCityConfig(cityPath, configWarnWriter(sessionJSONRequested(jsonOutput), stderr))
+		var loadErr error
+		cfg, loadErr = loadCityConfig(cityPath, configWarnWriter(sessionJSONRequested(jsonOutput), stderr))
+		cfgErr = loadErr
 	}
 	// SURGICAL route: the session-class consumers (session-ID resolution, session
 	// worker handle, session bead read) go through the session coordination-class
@@ -1876,7 +1896,35 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 	// as well. Passing cfg lets the sweep keep work whose assignee is a still-configured
 	// [[named_session]] identity, which the respawned agent re-acquires; a genuinely
 	// retired or pool session matches nothing in cfg and is released exactly as before.
-	unclaimWorkAssignedToRetiredSessionBead(store, rigStores, closedSessionBead, "", cfg, stderr)
+	// FAIL CLOSED when the city config did not load. The guard immediately above
+	// is cfg-driven: it keeps work whose assignee is a still-configured
+	// [[named_session]]. With cfg nil there is nothing to match against, so every
+	// assignee — named seat and dead pool worker alike — reads as retired and the
+	// sweep releases the lot. That is not hypothetical: on 2026-09-11 a close on
+	// this path cleared 50 beads off a named seat in one write, 11 of them
+	// downgraded in_progress -> open, which made the owner's own resume check
+	// report "no work" (ga-9n8hjv). The binary serving that day DID carry the
+	// guard, so a present-but-inapplicable guard is the whole failure mode.
+	//
+	// Releasing nothing is the safe side of this trade and the asymmetry is not
+	// close. Skipping leaves at most a stale claim, which is visible, and which
+	// repairStrandedPoolWorkerBead still reclaims on its own confirmed-stranding
+	// path — so pool work is not stranded by this, it is merely released later.
+	// That safety net is not theoretical: session_reconciler.go's
+	// reconcileSessionBeadsTracedWithNamedDemand calls it on the periodic
+	// reconcile, so acceptance item 3 (a genuinely dead pool session's routed
+	// claim is still reclaimed) survives this skip. Verified, not assumed.
+	// Releasing wrongly destroys a named agent's portfolio silently, and the
+	// resume check that exists to catch stranded work is exactly what stops
+	// working. Prefer the recoverable failure.
+	if cfg == nil {
+		fmt.Fprintf(stderr, "gc session close: city config unavailable (%s); "+ //nolint:errcheck // best-effort stderr
+			"not releasing work assigned to %s — a configured named identity cannot be "+
+			"distinguished from a retired one without it. Re-run once the config loads.\n",
+			cfgErrOrUnknown(cfgErr), closedSessionBead.ID)
+	} else {
+		unclaimWorkAssignedToRetiredSessionBead(store, rigStores, closedSessionBead, "", cfg, stderr)
+	}
 
 	if asJSON {
 		if err := writeSessionActionJSON(stdout, sessionActionResult{
