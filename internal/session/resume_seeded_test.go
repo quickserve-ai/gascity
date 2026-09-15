@@ -53,7 +53,7 @@ func TestResumeSeededClearedByResetPaths(t *testing.T) {
 		"ContinuationResetWakePatch": ContinuationResetWakePatch(now),
 		"ConfigDriftResetPatch":      ConfigDriftResetPatch(StateAsleep, "rotated", now),
 		"AcknowledgeDrainPatchFresh": AcknowledgeDrainPatch(true),
-		"CompleteDrainPatchFresh":    CompleteDrainPatch(now, "idle", true),
+		"CompleteDrainPatchFresh":    CompleteDrainPatch(now, "idle", "", true),
 		"PreWakePatchFresh": PreWakePatch(PreWakePatchInput{
 			Generation: 1, InstanceToken: "t", ContinuationEpoch: 1, Now: now, FreshWake: true,
 		}),
@@ -70,7 +70,7 @@ func TestResumeSeededSurvivesNonFreshPaths(t *testing.T) {
 	now := time.Now()
 	cases := map[string]MetadataPatch{
 		"AcknowledgeDrainPatch": AcknowledgeDrainPatch(false),
-		"CompleteDrainPatch":    CompleteDrainPatch(now, "idle", false),
+		"CompleteDrainPatch":    CompleteDrainPatch(now, "idle", "", false),
 		"PreWakePatch": PreWakePatch(PreWakePatchInput{
 			Generation: 1, InstanceToken: "t", ContinuationEpoch: 1, Now: now, FreshWake: false,
 		}),

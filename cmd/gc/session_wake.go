@@ -854,7 +854,7 @@ func completeDrain(info sessions.Info, sessFront *sessions.Store, ds *drainState
 	if sessFront == nil {
 		return
 	}
-	batch := sessions.CompleteDrainPatch(clk.Now(), ds.reason, info.WakeMode == "fresh")
+	batch := sessions.CompleteDrainPatch(clk.Now(), ds.reason, info.SleepIntent, info.WakeMode == "fresh")
 	sessions.StampPriorSessionKeyInfo(batch, info)
 	_ = sessFront.ApplyPatch(info.ID, batch)
 }
