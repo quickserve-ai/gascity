@@ -1804,6 +1804,33 @@ Accepts a session ID (e.g., gc-42) or session alias (e.g., mayor).`,
 	return cmd
 }
 
+// cfgErrOrUnknown names why the city config is unavailable. Both legs that can
+// leave cfg nil are error-bearing — resolveCity failing, or loadCityConfig
+// erroring — but a future third leg might not be, and a fail-closed message that
+// says "(<nil>)" reads as a bug in the guard rather than a missing config. Keep
+// the message honest when there is no error to quote.
+func cfgErrOrUnknown(err error) string {
+	if err != nil {
+		return err.Error()
+	}
+	return "reason not reported"
+}
+
+// sessionBeadIDOnlyIdentity strips a session bead down to its ID, so that
+// sessionAssignmentIdentifiers yields ONLY the bead-ID form and none of the
+// name-shaped identifiers (session_name, the named-session identity, the
+// alias) it would otherwise contribute.
+//
+// This is how the close path releases pool work without a config: a bead ID
+// can never be a configured [[named_session]] identity, so releasing work
+// bound to it is safe even when isConfiguredNamedSessionIdentity has no cfg
+// to consult and therefore protects nothing. Passing the full bead with a nil
+// cfg would release the name-shaped identifiers too — that is the ga-9n8hjv
+// portfolio-stripping bug itself.
+func sessionBeadIDOnlyIdentity(b beads.Bead) beads.Bead {
+	return beads.Bead{ID: b.ID}
+}
+
 // cmdSessionClose is the CLI entry point for "gc session close".
 func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool) int {
 	asJSON := sessionJSONRequested(jsonOutput)
@@ -1814,8 +1841,16 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 
 	cityPath, cityErr := resolveCity()
 	var cfg *config.City
+	// cfgErr records WHY the config is unavailable, on either leg: resolveCity
+	// failing (the load never runs) or loadCityConfig erroring. The work release
+	// below reads cfg to tell a configured named identity from a retired or pool
+	// one, so a nil cfg there is not a benign default — it makes every assignee
+	// look retired. Keep the reason instead of discarding it (ga-9n8hjv).
+	cfgErr := cityErr
 	if cityErr == nil {
-		cfg, _ = loadCityConfig(cityPath, configWarnWriter(sessionJSONRequested(jsonOutput), stderr))
+		var loadErr error
+		cfg, loadErr = loadCityConfig(cityPath, configWarnWriter(sessionJSONRequested(jsonOutput), stderr))
+		cfgErr = loadErr
 	}
 	// SURGICAL route: the session-class consumers (session-ID resolution, session
 	// worker handle, session bead read) go through the session coordination-class
@@ -1876,7 +1911,80 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 	// as well. Passing cfg lets the sweep keep work whose assignee is a still-configured
 	// [[named_session]] identity, which the respawned agent re-acquires; a genuinely
 	// retired or pool session matches nothing in cfg and is released exactly as before.
-	unclaimWorkAssignedToRetiredSessionBead(store, rigStores, closedSessionBead, "", cfg, stderr)
+	// FAIL CLOSED when the city config did not load. The guard immediately above
+	// is cfg-driven: it keeps work whose assignee is a still-configured
+	// [[named_session]]. With cfg nil there is nothing to match against, so every
+	// assignee — named seat and dead pool worker alike — reads as retired and the
+	// sweep releases the lot. That is not hypothetical: on 2026-09-11 a close on
+	// this path cleared 50 beads off a named seat in one write, 11 of them
+	// downgraded in_progress -> open, which made the owner's own resume check
+	// report "no work" (ga-9n8hjv). The binary serving that day DID carry the
+	// guard, so a present-but-inapplicable guard is the whole failure mode.
+	//
+	// Releasing wrongly destroys a named agent's portfolio silently, and the
+	// resume check that exists to catch stranded work is exactly what stops
+	// working. So the nil-cfg branch withholds every NAME-SHAPED identifier.
+	//
+	// But it must NOT withhold everything, and the reason is a trap worth
+	// stating: there is NO safety net downstream of this point. An earlier
+	// version of this comment claimed repairStrandedPoolWorkerBead reclaims
+	// whatever the skip leaves behind. It cannot. CloseDetailed has already
+	// closed the session bead by the time we get here, and the reconciler's
+	// snapshot drops closed sessions (session_bead_snapshot.go, "if in.Closed
+	// { continue }"), so that bead never reaches the repair call in
+	// session_reconciler.go — not on the next tick, and not after the config is
+	// fixed. releaseOrphanedPoolAssignments does not cover the gap either: it
+	// skips unrouted work (pool_session_name.go, "if template == ''"). A blanket
+	// skip therefore STRANDS unrouted pool work permanently, where the old
+	// unconditional release at least freed it. The repair being *reachable* on
+	// the periodic path is true and irrelevant — the bead is no longer in its
+	// input set.
+	//
+	// So release exactly the identifier that cannot be a named seat: the dying
+	// session's own BEAD ID. A bead ID is structurally incapable of matching a
+	// [[named_session]] identity under any cfg, so this needs no config to be
+	// safe.
+	//
+	// Deliberately NOT keyed on the session bead's own named/ephemeral metadata,
+	// which looks like the more natural discriminator. The empirical reason is
+	// that ga-hoy4vl — the bead at the center of the 2026-09-11 wave — was
+	// pool_managed=true / session_origin=ephemeral WHILE SERVING A NAMED AGENT
+	// (the ga-dfp1b class). The structural reason is stronger and is the one to
+	// keep: that metadata is DATA THAT CAN BE WRONG, whereas "a bead ID is not a
+	// configured named identity" is true by construction of the config schema
+	// and cannot be falsified by a mislabeled bead. When the bug class IS bad
+	// metadata, the discriminator must not be metadata.
+	//
+	// HOW MUCH THIS ACTUALLY RELEASES: in practice, almost nothing — say so
+	// plainly rather than let the next reader assume the strand above is fixed.
+	// Pool instances run with GC_AGENT/GC_ALIAS set to their PER-INSTANCE ALIAS
+	// (cmd_hook.go), and gc hook --claim writes that alias as the assignee
+	// (6d6c33382, see bd_assignee_canonicalize.go), so claimed pool work is held
+	// under e.g. "woodhouse-ga-m02ds", never under the bead ID. Measured on this
+	// city's store 2026-09-15: hq.issues rows whose assignee matches ^(ga|gc)- =
+	// ZERO across all statuses, against 92 matching rows in hq.wisps — so the
+	// probe bites and the answer is a real zero.
+	//
+	// This branch is therefore a narrow correctness guarantee (any work that IS
+	// bound to the dying bead ID is freed, and a named seat is never stripped),
+	// NOT a fix for the strand. Alias-held pool work on a session closed under a
+	// broken config stays withheld, and nothing downstream reclaims it — the
+	// operator must re-run the close once the config loads, which the stderr
+	// line instructs. Routed pool work still recovers via
+	// releaseOrphanedPoolAssignments. The durable fix is deferred cleanup that
+	// revisits closed sessions once cfg loads; it is tracked separately and is
+	// deliberately not attempted here, because getting it wrong re-opens the
+	// portfolio-stripping bug this function exists to prevent.
+	if cfg == nil {
+		fmt.Fprintf(stderr, "gc session close: city config unavailable (%s); "+ //nolint:errcheck // best-effort stderr
+			"releasing only work bound to session bead %s, and withholding work held "+
+			"under a name — a configured named identity cannot be distinguished from a "+
+			"retired one without the config. Re-run once the config loads.\n",
+			cfgErrOrUnknown(cfgErr), closedSessionBead.ID)
+		unclaimWorkAssignedToRetiredSessionBead(store, rigStores, sessionBeadIDOnlyIdentity(closedSessionBead), "", nil, stderr)
+	} else {
+		unclaimWorkAssignedToRetiredSessionBead(store, rigStores, closedSessionBead, "", cfg, stderr)
+	}
 
 	if asJSON {
 		if err := writeSessionActionJSON(stdout, sessionActionResult{
