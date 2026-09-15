@@ -5043,6 +5043,20 @@ func mintConfiguredNamedSessionBeadForPoolCreate(
 		if err := session.EnsureSessionNameAvailableWithConfigForOwner(store, bp.city, sn, "", identity); err != nil {
 			return fmt.Errorf("configured named session name %q already held for pool template %q: %w", sn, template, err)
 		}
+		// The checks above answer config reservations and the primary store only.
+		// A holder in any other census leg is invisible to them, so re-read the
+		// full session topology under the same locks, as the pool mint does; an
+		// unreadable leg leaves absence unprovable, so fail before mutation.
+		availabilityInfos, availabilityErr := freshPoolAvailabilityInfos(bp)
+		if availabilityErr != nil {
+			return fmt.Errorf("checking locked availability of configured named session %q for pool template %q: %w", identity, template, availabilityErr)
+		}
+		if err := poolAliasCollisionFromInfos(availabilityInfos, identity); err != nil {
+			return fmt.Errorf("configured named session %q already held in the session census for pool template %q: %w", identity, template, err)
+		}
+		if err := poolAliasCollisionFromInfos(availabilityInfos, sn); err != nil {
+			return fmt.Errorf("configured named session name %q already held in the session census for pool template %q: %w", sn, template, err)
+		}
 		// Caller metadata (trigger-bead linkage etc.) first, canonical named
 		// keys after, so a routed-work stamp can never overwrite the identity
 		// — same ordering discipline as the ordinary pool mint.
