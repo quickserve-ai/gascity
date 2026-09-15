@@ -37,6 +37,28 @@ const (
 	mailSendUnconfirmedExit  = 6
 )
 
+// classifyMailWriteFailure turns a read-after-write verdict into an exit code
+// and the guidance that verdict deserves. The two verdicts stay distinct on
+// purpose: a VERIFIED-ABSENT message must be re-sent, while an UNCONFIRMED one
+// may well have landed and must be CHECKED first — collapsing them would turn
+// every slow verification into duplicate control-channel traffic under exactly
+// the load that causes it. Returns 0 when err is not one of these verdicts, so
+// the caller keeps its own handling.
+func classifyMailWriteFailure(stderr io.Writer, cmdLabel string, err error) int {
+	switch {
+	case errors.Is(err, beadmail.ErrNotPersisted):
+		fmt.Fprintf(stderr, "%s: NOT DELIVERED — %v\n", cmdLabel, err)
+		fmt.Fprintln(stderr, "hint: no message bead exists for this send; re-send the message.")
+		return mailSendNotPersistedExit
+	case errors.Is(err, beadmail.ErrUnconfirmed):
+		fmt.Fprintf(stderr, "%s: DELIVERY UNCONFIRMED — %v\n", cmdLabel, err)
+		fmt.Fprintln(stderr, "hint: the write may have landed. Confirm with \"gc bd show <message-id>\" before")
+		fmt.Fprintln(stderr, "      re-sending; gc bd show answers correctly whether or not it was archived.")
+		return mailSendUnconfirmedExit
+	}
+	return 0
+}
+
 // nudgeFunc is an optional callback for nudging an agent after sending or
 // replying to mail. When non-nil, it is called with the recipient name and
 // the ID of the message the nudge announces. messageID lets the queued nudge
@@ -2070,21 +2092,8 @@ func doMailSendJSON(mp mail.Provider, rec events.Recorder, validRecipients map[s
 	}
 	telemetry.RecordMailOp(context.Background(), "send", err)
 	if err != nil {
-		// The two read-after-write verdicts get distinct exits and distinct
-		// instructions on purpose: a VERIFIED-ABSENT message must be re-sent,
-		// while an UNCONFIRMED one may well have landed and must be checked
-		// first — collapsing them would turn every slow verification into
-		// duplicate control-channel traffic under load (ga-0ejdbv).
-		switch {
-		case errors.Is(err, beadmail.ErrNotPersisted):
-			fmt.Fprintf(stderr, "gc mail send: NOT DELIVERED — %v\n", err)                           //nolint:errcheck // best-effort stderr
-			fmt.Fprintln(stderr, "hint: no message bead exists for this send; re-send the message.") //nolint:errcheck // best-effort stderr
-			return mailSendNotPersistedExit
-		case errors.Is(err, beadmail.ErrUnconfirmed):
-			fmt.Fprintf(stderr, "gc mail send: DELIVERY UNCONFIRMED — %v\n", err)                                    //nolint:errcheck // best-effort stderr
-			fmt.Fprintln(stderr, "hint: the write may have landed. Confirm with \"gc bd show <message-id>\" before") //nolint:errcheck // best-effort stderr
-			fmt.Fprintln(stderr, "      re-sending; gc bd show answers correctly whether or not it was archived.")   //nolint:errcheck // best-effort stderr
-			return mailSendUnconfirmedExit
+		if code := classifyMailWriteFailure(stderr, "gc mail send", err); code != 0 {
+			return code
 		}
 		fmt.Fprintf(stderr, "gc mail send: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -2166,6 +2175,9 @@ func doMailSendAllJSON(mp mail.Provider, rec events.Recorder, validRecipients ma
 	for _, to := range recipients {
 		m, err := mp.Send(sender, to, subject, body)
 		if err != nil {
+			if code := classifyMailWriteFailure(stderr, fmt.Sprintf("gc mail send --all: sending to %s", to), err); code != 0 {
+				return code
+			}
 			fmt.Fprintf(stderr, "gc mail send --all: sending to %s: %v\n", to, err) //nolint:errcheck // best-effort stderr
 			return 1
 		}
@@ -2516,6 +2528,9 @@ func doMailReplyJSON(mp mail.Provider, rec events.Recorder, id, sender, subject,
 	reply, err := mp.Reply(id, sender, subject, body)
 	telemetry.RecordMailOp(context.Background(), "reply", err)
 	if err != nil {
+		if code := classifyMailWriteFailure(stderr, "gc mail reply", err); code != 0 {
+			return code
+		}
 		fmt.Fprintf(stderr, "gc mail reply: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
