@@ -310,9 +310,9 @@ var ErrNotPersisted = errors.New("message bead was not persisted")
 // actions.
 var ErrUnconfirmed = errors.New("message bead could not be confirmed")
 
-// verifyMessageBeadVerifyDisabled lets a deployment whose store cannot read
-// back a freshly written wisp turn the guard off rather than lose mail
-// entirely. Verification is ON unless this is explicitly set to "0" or "false".
+// verifyDisabled lets a deployment whose store cannot read back a freshly
+// written wisp turn the guard off rather than lose mail entirely.
+// Verification is ON unless this is explicitly set to "0" or "false".
 func verifyDisabled() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("GC_MAIL_VERIFY"))) {
 	case "0", "false", "no", "off":
@@ -322,25 +322,49 @@ func verifyDisabled() bool {
 }
 
 // messageVerifyBackoff is the delay before each retry after the first attempt.
-// A bounded retry is what separates read-visibility LAG from write LOSS: a
-// lagging backing catches up within a few short waits, a lost write never
-// appears. Kept short — send is interactive, and these sleeps are only ever
-// paid on a failing verification.
+// The retry absorbs read-visibility LAG, which a backing that is briefly behind
+// recovers from within a few short waits. It does NOT prove lag has ended: a
+// write that stays invisible past the budget below is still reported as lost.
+// That residual is deliberate — the alternative is never reporting loss at all.
 var messageVerifyBackoff = []time.Duration{
 	50 * time.Millisecond,
 	150 * time.Millisecond,
 }
 
+// messageVerifyBudget caps the WALL CLOCK spent verifying, not just the sleeps.
+// A verification read is not necessarily cheap: on the bd-backed store a wisp
+// lookup is two subprocesses, and a bd query can sit on its own multi-second
+// timeout. Without this, three retries of a timing-out lookup would add minutes
+// to an interactive send under exactly the load that triggers it. Retries stop
+// once the budget is spent; the verdict is then formed from what we have.
+var messageVerifyBudget = 10 * time.Second
+
 func (p *Provider) verifyMessageBeadPersisted(id string) error {
-	if verifyDisabled() || p.store == nil || strings.TrimSpace(id) == "" {
+	if verifyDisabled() || p.store == nil {
 		return nil
 	}
+	if strings.TrimSpace(id) == "" {
+		// A create that reported success without an ID cannot be verified and
+		// must not pass silently — that is the same exit-0-with-nothing-behind-it
+		// shape this guard exists to close.
+		return fmt.Errorf("%w: store returned no bead ID", ErrUnconfirmed)
+	}
+	// Read through the LIVE handle. A CachingStore's own Get can serve the bead
+	// its Create just absorbed into the cache — including one absorbed after an
+	// unverified create (see CachingStore.createWith) — which would let the
+	// cache confirm a write that never reached storage. HandlesFor is identity
+	// for a plain store, so this costs nothing on the CLI path.
+	reader := beads.HandlesFor(p.store).Live
+	started := time.Now()
 	var lastErr error
 	for attempt := 0; attempt <= len(messageVerifyBackoff); attempt++ {
 		if attempt > 0 {
+			if time.Since(started) >= messageVerifyBudget {
+				break
+			}
 			time.Sleep(messageVerifyBackoff[attempt-1])
 		}
-		if _, err := p.store.Get(id); err == nil {
+		if _, err := reader.Get(id); err == nil {
 			return nil
 		} else {
 			lastErr = err
