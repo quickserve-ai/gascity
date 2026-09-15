@@ -403,12 +403,12 @@ func TestProvider_RelaunchWithholdsControllerTokenFromRespawnedPane(t *testing.T
 	)
 	t.Setenv(tokenVar, token)
 
-	// A socket unique to this test, so the tmux server it starts forks from THIS
-	// process and its global environment carries the token — that server env is
-	// the thing respawn-pane hands to the new process.
+	// A socket unique to this test, whose server global environment carries the
+	// token — that server env is the thing respawn-pane hands to the new process.
 	cfg := DefaultConfig()
 	cfg.SocketName = privateSocketName("rp")
 	p := NewProviderWithConfig(cfg)
+	seedServerGlobalEnv(t, p.Tmux(), tokenVar, token)
 	name := "gc-test-relaunch-token-pin"
 	_ = p.Stop(name)
 	defer func() { _ = p.Stop(name) }()
@@ -463,6 +463,7 @@ func TestProvider_RelaunchRepinsControllerTokenInPreexistingWarmBox(t *testing.T
 	cfg := DefaultConfig()
 	cfg.SocketName = privateSocketName("rr")
 	p := NewProviderWithConfig(cfg)
+	seedServerGlobalEnv(t, p.Tmux(), tokenVar, token)
 	name := "gc-test-relaunch-token-repin"
 	_ = p.Stop(name)
 	defer func() { _ = p.Stop(name) }()

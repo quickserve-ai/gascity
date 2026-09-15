@@ -21,7 +21,15 @@ const (
 // the controller tick, so a process-table query that hangs must not stall it. A
 // timeout yields no records, which the caller treats as an indeterminate scan
 // and fails closed on — the same posture as a missing /proc.
-const liveScanFallbackTimeout = 20 * time.Second
+//
+// The bound has to sit inside the tick it protects (ga-singc6). A healthy scan
+// takes under a second (~0.7s for 700 processes on a fleet host), while the
+// reconciler's healthy tick runs ~23s: an inner deadline above that outer
+// budget cannot protect it, because one pathological enumeration would stretch
+// the city's clock tick by more than a whole tick. 10s keeps the worst case
+// inside the tick, and tripping it is bounded and safe — the scan reports
+// indeterminate, every candidate is protected, and the next pass tries again.
+const liveScanFallbackTimeout = 10 * time.Second
 
 // liveWorktreeCwdEnumerator lists the working directory of every process this
 // user can see, in lsof field output: "p<pid>" per process, "f<fd>" per
