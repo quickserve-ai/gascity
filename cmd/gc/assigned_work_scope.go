@@ -109,12 +109,18 @@ func assignedWorkIndexReachableFromAgent(cityPath string, cfg *config.City, agen
 
 // filterAssignedWorkBeadsForPoolDemand resolves work through the routed
 // backing template because pool scale decisions are per agent template.
+//
+// wakeReady is the serve side's readiness verdict for the rows whose claimant
+// session is gone (newPoolWakeReadiness). It may be nil, which keeps every row
+// the caller handed in — callers that cannot resolve a verdict must not have
+// one invented for them.
 func filterAssignedWorkBeadsForPoolDemand(
 	cfg *config.City,
 	cityPath string,
 	sessionInfos []sessionpkg.Info,
 	assignedWorkBeads []beads.Bead,
 	assignedWorkStoreRefs []string,
+	wakeReady *poolWakeReadiness,
 ) []beads.Bead {
 	if len(assignedWorkBeads) == 0 || len(assignedWorkStoreRefs) == 0 {
 		return assignedWorkBeads
@@ -124,6 +130,16 @@ func filterAssignedWorkBeadsForPoolDemand(
 	}
 	assigneeToSessionBeadID := make(map[string]string)
 	sessionBeadTemplate := make(map[string]string)
+	// eligibleClaimants is the identity set the WAKE tier itself treats as a
+	// surviving owner. computePoolDesiredStatesAt drops a session carrying a
+	// terminal provider error before it builds the same map, so a row held by
+	// one of those is orphaned as far as that tier is concerned and must face
+	// the readiness veto like any other orphan — sharing assigneeToSessionBeadID
+	// here would let it past the gate and straight into wake demand.
+	// The two maps stay separate deliberately: the template fallback below reads
+	// assigneeToSessionBeadID and must keep resolving a route through a dying
+	// session's own template.
+	eligibleClaimants := make(map[string]struct{})
 	for _, sb := range sessionInfos {
 		if sb.Closed {
 			continue
@@ -135,8 +151,12 @@ func filterAssignedWorkBeadsForPoolDemand(
 		if template != "" {
 			sessionBeadTemplate[sb.ID] = template
 		}
+		eligible := !sessionHasProviderTerminalErrorInfo(sb)
 		for _, id := range sessionBeadAssigneeIdentitiesInfo(sb) {
 			assigneeToSessionBeadID[id] = sb.ID
+			if eligible {
+				eligibleClaimants[id] = struct{}{}
+			}
 		}
 	}
 	filtered := make([]beads.Bead, 0, len(assignedWorkBeads))
@@ -157,6 +177,22 @@ func filterAssignedWorkBeadsForPoolDemand(
 		agentCfg := findAgentByTemplate(cfg, template)
 		if agentCfg == nil {
 			continue
+		}
+		// A row whose claimant is gone can only become demand through the
+		// wake-known-identity tier, and the seat that tier mints reads for an
+		// open row with `bd ready --assignee=<identity>`. The status gate
+		// downstream cannot tell whether that read would answer: Bead.Status is
+		// the collapsed mapBdStatus value, so a dependency-blocked row arrives
+		// here spelled "open" exactly like claimable work, is counted forever,
+		// and every seat it spawns finds an empty hook (#6207, parent #4114).
+		// Ask the serve side's own predicate instead — after the target template
+		// is resolved, because whether that predicate is even the right one is a
+		// property of the agent (see vetoesWakeCandidate).
+		if i < len(assignedWorkStoreRefs) {
+			_, claimantLive := eligibleClaimants[strings.TrimSpace(wb.Assignee)]
+			if wakeReady.vetoesWakeCandidate(wb, agentCfg, claimantLive, assignedWorkStoreRefs[i]) {
+				continue
+			}
 		}
 		if assignedWorkIndexReachableFromAgent(cityPath, cfg, agentCfg, assignedWorkStoreRefs, i) {
 			filtered = append(filtered, wb)
