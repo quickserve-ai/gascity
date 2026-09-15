@@ -464,13 +464,16 @@ func applyControllerBdEnv(env map[string]string) {
 // gcAgentSessionActor returns the gc agent identity this process is running
 // under, or "" when it is not inside a managed agent session.
 //
-// The order (alias -> agent -> session name) is agentScriptClaimActor's, minus
-// the BEADS_ACTOR this resolves a default for, so a bead's audit actor and its
-// claim actor name the same alias-first identity (session.AssigneeIdentifier).
-// A session-name-first order would split an aliased session into two strings:
-// owning its bead under the alias while writing to bd under the runtime name.
+// The order (alias -> session bead id -> agent -> session name) is the claim
+// writer's (hookClaimAssigneeIdentity), so a bead's audit actor and its claim
+// assignee name the same identity. A session-name-first order would split an
+// aliased session into two strings: owning its bead under the alias while
+// writing to bd under the runtime name. The session bead id comes before the
+// name forms because an unaliased pool worker's GC_AGENT and GC_SESSION_NAME
+// are its slot label, which every occupant of the slot reuses
+// (clearPoolTemplateRuntimeIdentity); only the bead id names the occupant.
 func gcAgentSessionActor() string {
-	for _, key := range []string{"GC_ALIAS", "GC_AGENT", "GC_SESSION_NAME"} {
+	for _, key := range []string{"GC_ALIAS", "GC_SESSION_ID", "GC_AGENT", "GC_SESSION_NAME"} {
 		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
 			return value
 		}
@@ -560,7 +563,7 @@ func warnOnActorSessionMismatch(actor string) {
 		// Any of the session identity anchors is an acceptable actor: they name
 		// the same agent, and gcAgentSessionActor falls back through them in
 		// this order.
-		for _, key := range []string{"GC_ALIAS", "GC_AGENT", "GC_SESSION_NAME"} {
+		for _, key := range []string{"GC_ALIAS", "GC_SESSION_ID", "GC_AGENT", "GC_SESSION_NAME"} {
 			if value := strings.TrimSpace(os.Getenv(key)); value != "" && actor == value {
 				return
 			}
