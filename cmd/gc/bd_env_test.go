@@ -5845,6 +5845,48 @@ func TestBdRuntimeEnvDefaultsActorToAgentSessionIdentity(t *testing.T) {
 	}
 }
 
+// An unaliased pool worker's GC_AGENT and GC_SESSION_NAME are its slot label,
+// which every occupant of the slot reuses (clearPoolTemplateRuntimeIdentity).
+// Only its session bead id names the occupant, so that is the default actor,
+// the same identity its claims are recorded under (hookClaimAssigneeIdentity).
+// An aliased session still writes under its alias.
+func TestAgentBdActorNamesThePoolSlotOccupantNotTheSlot(t *testing.T) {
+	const (
+		slotLabel = "test-city--builder-1-pool"
+		sessionID = "gcg-session-557fc1017792caa9a01355325b212416"
+	)
+	t.Setenv("BEADS_ACTOR", "")
+	t.Setenv("GC_ALIAS", "")
+	t.Setenv("GC_SESSION_ID", sessionID)
+	t.Setenv("GC_AGENT", slotLabel)
+	t.Setenv("GC_SESSION_NAME", slotLabel)
+
+	var buf bytes.Buffer
+	prevWriter := beadsActorWarnWriter
+	beadsActorWarnWriter = &buf
+	beadsActorWarned.Store(false)
+	t.Cleanup(func() {
+		beadsActorWarnWriter = prevWriter
+		beadsActorWarned.Store(false)
+	})
+
+	env := map[string]string{}
+	applyAgentBdActor(env)
+	if got := env["BEADS_ACTOR"]; got != sessionID {
+		t.Fatalf("BEADS_ACTOR = %q, want the session bead id %q: the slot label names every occupant of the slot", got, sessionID)
+	}
+	if got := buf.String(); got != "" {
+		t.Fatalf("warning = %q, want silence: the session bead id names this session", got)
+	}
+
+	t.Setenv("GC_ALIAS", "gascity/gc__mayor")
+	env = map[string]string{}
+	applyAgentBdActor(env)
+	if got := env["BEADS_ACTOR"]; got != "gascity/gc__mayor" {
+		t.Fatalf("BEADS_ACTOR = %q, want the alias ahead of the session bead id", got)
+	}
+}
+
 func TestBdRuntimeEnvForRigDefaultsActorToAgentSessionIdentity(t *testing.T) {
 	t.Setenv("GC_BEADS", "bd")
 	t.Setenv("BEADS_ACTOR", "")
