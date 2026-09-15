@@ -312,20 +312,11 @@ func releaseOrphanedPoolAssignments(
 		// "claims this lever actually held" rather than "beads the loop walked
 		// past" — the summary line is read as cutover evidence that the lever
 		// took effect, so it has to be the honest number.
-		var (
-			gateRig     string
-			gateAllowed bool
-		)
-		if storeRefAware {
-			gateRig = strings.TrimSpace(assignedWorkStoreRefs[i])
-			gateAllowed = poolOrphanReleaseAllowed(cfg, gateRig)
-		} else {
-			// No usable store refs this tick; resolve the owning rig from the
-			// bead itself and fail closed if it cannot be resolved while any
-			// rig has the switch thrown.
-			gateRig = poolOrphanReleaseRigForBead(cfg, wb)
-			gateAllowed = poolOrphanReleaseAllowedForBead(cfg, wb)
-		}
+		//
+		// With no usable store refs this tick the owning rig is resolved from
+		// the bead itself, failing closed if it cannot be resolved while any rig
+		// has the switch thrown.
+		gateRig, gateAllowed := poolOrphanReleaseGate(cfg, workStoreRef, storeRefAware, wb)
 		if !gateAllowed {
 			heldByGate.add(gateRig, wb.ID)
 			continue
@@ -470,17 +461,24 @@ func releaseOrphanedPoolAssignments(
 // beads are skipped entirely rather than routed-fallback resolved. Callers must
 // reject a misaligned slice before calling — see reconcileSessionBeads, which
 // nils it and logs the mismatch.
+//
+// assignedWorkStoreRefs is the index-aligned store ref of each row (empty for
+// the city store). The orphan_release stop lever reads the owning rig off it
+// exactly as the sweep does; a slice of any other length is unusable, and the
+// rig is then resolved from the bead.
 func releaseConfirmedOrphanSessionWork(
 	cfg *config.City,
 	store beads.Store,
 	rigStores map[string]beads.Store,
 	assignedWorkBeads []beads.Bead,
 	assignedWorkStores []beads.Store,
+	assignedWorkStoreRefs []string,
 	info session.Info,
 ) []releasedPoolAssignment {
 	if cfg == nil || store == nil || len(assignedWorkBeads) == 0 {
 		return nil
 	}
+	storeRefAware := len(assignedWorkStoreRefs) == len(assignedWorkBeads)
 	identifiers := make(map[string]struct{}, 5)
 	for _, id := range sessionAssignmentIdentifiersForConfigInfo(info, cfg) {
 		if id = strings.TrimSpace(id); id != "" {
@@ -530,11 +528,17 @@ func releaseConfirmedOrphanSessionWork(
 		// orphan_release = false must stop every autonomous write to the rig's
 		// work, and this tie-break writes the same fields the sweep does. Same
 		// placement rule as the sweep — after the candidacy filters, ahead of
-		// the live re-read and the detached probe — and never silent. No store
-		// refs reach this caller, so the rig is resolved from the bead and an
-		// unresolvable bead fails closed while any rig has the switch thrown.
-		if !poolOrphanReleaseAllowedForBead(cfg, wb) {
-			rigName := poolOrphanReleaseRigForBead(cfg, wb)
+		// the live re-read and the detached probe — and never silent. Same
+		// decision as the sweep too: the rig is read off the index-aligned store
+		// ref, so city-owned work is never held by a disabled rig (a held release
+		// leaves the orphaned seat holding the work, and the close guard then
+		// refuses to close it); only without refs is the rig resolved from the
+		// bead, failing closed while any rig has the switch thrown.
+		workStoreRef := ""
+		if storeRefAware {
+			workStoreRef = assignedWorkStoreRefs[i]
+		}
+		if rigName, allowed := poolOrphanReleaseGate(cfg, workStoreRef, storeRefAware, wb); !allowed {
 			if rigName == "" {
 				rigName = "<unresolved>"
 			}

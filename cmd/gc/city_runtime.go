@@ -2881,6 +2881,7 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 		// instead of re-deriving a work ledger from gc.routed_to, which on a
 		// split city does not hold the graph-class row at all (ga-b0o6a).
 		withAssignedWorkStores(awakeAssignedStores),
+		withAssignedWorkStoreRefs(awakeAssignedStoreRefs),
 		// Warm-bind claim nudge: deliver a pool slot's claim instruction to an
 		// already-running, idle slot that had on-demand work bound to it after it
 		// last Started (bindPoolSessionTriggerBead), which cold Start's nudge cannot

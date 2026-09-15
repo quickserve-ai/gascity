@@ -1799,6 +1799,14 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		log.Printf("reconcileSessionBeads: assigned work/store length mismatch: work=%d stores=%d", len(assignedWorkBeads), len(orphanReleaseStores))
 		orphanReleaseStores = nil
 	}
+	// The same alignment contract holds for the store refs the orphan_release
+	// stop lever reads the owning rig from: a misaligned slice falls back to
+	// resolving the rig from each bead.
+	orphanReleaseStoreRefs := reconcileOpts.assignedWorkStoreRefs
+	if len(orphanReleaseStoreRefs) > 0 && len(orphanReleaseStoreRefs) != len(assignedWorkBeads) {
+		log.Printf("reconcileSessionBeads: assigned work/store-ref length mismatch: work=%d storeRefs=%d", len(assignedWorkBeads), len(orphanReleaseStoreRefs))
+		orphanReleaseStoreRefs = nil
+	}
 	maxAgeTr := reconcileOpts.maxSessionAgeTr
 	assignedWorkDeferTr := reconcileOpts.assignedWorkDeferTr
 	asyncStopTracker := reconcileOpts.asyncStopTracker
@@ -2704,7 +2712,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						//
 						// Restricted to "orphaned": a "suspended" seat is configured and
 						// merely scaled down, so its work stays put for its return.
-						if released := releaseConfirmedOrphanSessionWork(cfg, store, rigStores, assignedWorkBeads, orphanReleaseStores, infoByID[id]); len(released) > 0 {
+						if released := releaseConfirmedOrphanSessionWork(cfg, store, rigStores, assignedWorkBeads, orphanReleaseStores, orphanReleaseStoreRefs, infoByID[id]); len(released) > 0 {
 							emitDeadAssigneeReopenedEvents(rec, assignedWorkBeads, released, clk.Now().UTC())
 							closed = closeSessionBeadIfReachableStoreUnassigned(cityPath, cfg, store, rigStores, infoByID[id], reason, clk.Now().UTC(), stderr, false)
 						}

@@ -359,6 +359,12 @@ type startExecutionOptions struct {
 	// from gc.routed_to, which names a work ledger a binding-resident row does
 	// not live in. Nil or misaligned leaves that fallback in place.
 	assignedWorkStores []beads.Store
+	// assignedWorkStoreRefs is index-aligned with the same assignedWorkBeads:
+	// the store ref each row was read under (empty for the city store). The
+	// orphan-close tie-break reads the owning rig off it for the orphan_release
+	// stop lever, as the sweep does. Nil or misaligned falls back to resolving
+	// the rig from the bead itself.
+	assignedWorkStoreRefs []string
 	// warmClaimProbe, when set, enables the warm-bind claim nudge: it reports
 	// whether a pool slot's newly-bound trigger bead is still unclaimed, resolved
 	// through the city's residency contract (newWarmClaimTriggerResolver). Built by
@@ -484,6 +490,18 @@ func withReadyAssignedFlags(readyAssignedFlags []bool) startExecutionOption {
 func withAssignedWorkStores(assignedWorkStores []beads.Store) startExecutionOption {
 	return func(opts *startExecutionOptions) {
 		opts.assignedWorkStores = assignedWorkStores
+	}
+}
+
+// withAssignedWorkStoreRefs installs the index-aligned store refs for this
+// reconcile pass (DesiredStateResult.AssignedWorkStoreRefs, filtered with the
+// same rows as assignedWorkBeads). The orphan-close tie-break reads the owning
+// rig off them for the orphan_release stop lever, so city-owned work keeps the
+// city-store exemption the sweep gives it. A slice of any other length is
+// ignored in favor of resolving the rig from the bead.
+func withAssignedWorkStoreRefs(assignedWorkStoreRefs []string) startExecutionOption {
+	return func(opts *startExecutionOptions) {
+		opts.assignedWorkStoreRefs = assignedWorkStoreRefs
 	}
 }
 
