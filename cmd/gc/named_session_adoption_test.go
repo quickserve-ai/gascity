@@ -504,6 +504,130 @@ func TestPoolCreateForNamedBackedTemplateRefusesWhenCanonicalHolds(t *testing.T)
 	}
 }
 
+// rigScopedNamedGuardCity is a city whose mode=always named session is backed
+// by a single-session rig template, so the identity ("rig/agent-a") and its
+// runtime session_name ("rig--agent-a") are different strings and each census
+// check of the guard is exercised on its own.
+func rigScopedNamedGuardCity(rigPath string) *config.City {
+	maxOne := 1
+	return &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Rigs:      []config.Rig{{Name: "rig", Path: rigPath}},
+		Agents: []config.Agent{{
+			Name:              "agent-a",
+			Dir:               "rig",
+			StartCommand:      "true",
+			MaxActiveSessions: &maxOne,
+		}},
+		NamedSessions: []config.NamedSession{{
+			Template: "agent-a",
+			Dir:      "rig",
+			Mode:     "always",
+		}},
+	}
+}
+
+// requireNamedGuardRoutes fails unless a pool create for the city's only
+// agent reaches the guard's canonical mint. Upstream's pool mint already
+// fences with the lock-time census, so a fixture that fell through to it would
+// pass the named-guard tests below vacuously.
+func requireNamedGuardRoutes(t *testing.T, cfg *config.City) {
+	t.Helper()
+	if _, ok := poolCreateBacksSingleNamedSession(cfg, "test-city", cfg.Agents[0].QualifiedName()); !ok {
+		t.Fatalf("pool create for %q does not route to the named-session guard", cfg.Agents[0].QualifiedName())
+	}
+}
+
+// TestPoolCreateForNamedBackedTemplateRefusesForeignCensusHolder pins the
+// guard's lock-time census: a live session holding the identity's alias or
+// its session_name in a rig census leg refuses the canonical mint. The
+// primary-store checks cannot see that leg, and the holder arrives after
+// planning, so only a census re-read under the identifier locks proves the
+// identity free; without it the mint births a second holder of the identity.
+func TestPoolCreateForNamedBackedTemplateRefusesForeignCensusHolder(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		holdAlias bool
+	}{
+		{name: "alias", holdAlias: true},
+		{name: "session_name", holdAlias: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			primary := beads.NewMemStore()
+			// Rig-leg IDs start past the primary's, so a refusal naming the
+			// holder cannot be naming a primary bead.
+			foreign := beads.NewMemStoreFrom(100, nil, nil)
+			cfg := rigScopedNamedGuardCity(t.TempDir())
+			requireNamedGuardRoutes(t, cfg)
+			spec, ok := findNamedSessionSpec(cfg, "test-city", "rig/agent-a")
+			if !ok {
+				t.Fatalf("findNamedSessionSpec(rig/agent-a) not found")
+			}
+			if spec.Identity == spec.SessionName {
+				t.Fatalf("fixture identity %q must differ from session_name %q", spec.Identity, spec.SessionName)
+			}
+			var stderr bytes.Buffer
+			bp := newAgentBuildParams("test-city", t.TempDir(), cfg, runtime.NewFake(), time.Now().UTC(), primary, &stderr)
+			primeGuardedPoolCrossStoreCensus(t, bp, map[string]beads.Store{"rig": foreign})
+			if len(bp.sessionOccupancyInfos) != 0 {
+				t.Fatalf("pre-lock census = %#v, want empty", bp.sessionOccupancyInfos)
+			}
+
+			alias, sessionName := "", "manual-agent-a"
+			if tc.holdAlias {
+				alias = spec.Identity
+			} else {
+				sessionName = spec.SessionName
+			}
+			holder := seedGuardedPoolSessionHolder(t, foreign, "rig-leg identity holder", "rig/manual", alias, sessionName)
+
+			_, qualifiedInstance, slot := poolDesiredRequestIdentity(&cfg.Agents[0], 1)
+			created, err := createPoolSessionBeadWithGuardedAlias(bp, &cfg.Agents[0], cfg.Agents[0].QualifiedName(), qualifiedInstance, slot, nil)
+			if err == nil || !strings.Contains(err.Error(), holder.ID) {
+				t.Fatalf("guarded named create = (%#v, %v), want refusal naming rig-leg holder %s", created, err, holder.ID)
+			}
+			if created.ID != "" || len(bp.sessionBeads.OpenInfos()) != 0 {
+				t.Fatalf("refused create info=%#v writeback=%#v, want no primary mutation", created, bp.sessionBeads.OpenInfos())
+			}
+			primaryInfos, listErr := sessionFrontDoor(primary).ListAll(sessionpkg.ListAllOptions{})
+			if listErr != nil || len(primaryInfos) != 0 {
+				t.Fatalf("primary sessions = %#v err=%v, want none", primaryInfos, listErr)
+			}
+		})
+	}
+}
+
+// TestPoolCreateForNamedBackedTemplateCensusLegErrorNeverMints pins the
+// guard's fail-closed leg: a census leg that cannot be read at lock time
+// makes the identity's absence unprovable, so the canonical mint refuses
+// rather than trusting the primary store alone.
+func TestPoolCreateForNamedBackedTemplateCensusLegErrorNeverMints(t *testing.T) {
+	primary := beads.NewMemStore()
+	foreign := &toggleListFailStore{Store: beads.NewMemStore()}
+	cfg := rigScopedNamedGuardCity(t.TempDir())
+	requireNamedGuardRoutes(t, cfg)
+	var stderr bytes.Buffer
+	bp := newAgentBuildParams("test-city", t.TempDir(), cfg, runtime.NewFake(), time.Now().UTC(), primary, &stderr)
+	primeGuardedPoolCrossStoreCensus(t, bp, map[string]beads.Store{"rig": foreign})
+	foreign.fail = true // the rig leg degrades after planning, before the lock-time proof
+
+	_, qualifiedInstance, slot := poolDesiredRequestIdentity(&cfg.Agents[0], 1)
+	created, err := createPoolSessionBeadWithGuardedAlias(bp, &cfg.Agents[0], cfg.Agents[0].QualifiedName(), qualifiedInstance, slot, nil)
+	if err == nil ||
+		!strings.Contains(err.Error(), `"rig/agent-a"`) ||
+		!strings.Contains(err.Error(), `session census leg "rig:rig"`) ||
+		!strings.Contains(err.Error(), "cross-store list failed") {
+		t.Fatalf("guarded named create = (%#v, %v), want wrapped lock-time rig-leg census failure naming the identity", created, err)
+	}
+	if created.ID != "" || len(bp.sessionBeads.OpenInfos()) != 0 {
+		t.Fatalf("census-refused create info=%#v writeback=%#v, want no primary mutation", created, bp.sessionBeads.OpenInfos())
+	}
+	primaryInfos, listErr := sessionFrontDoor(primary).ListAll(sessionpkg.ListAllOptions{})
+	if listErr != nil || len(primaryInfos) != 0 {
+		t.Fatalf("primary sessions = %#v err=%v, want none", primaryInfos, listErr)
+	}
+}
+
 // TestPoolCreateForMultiSessionNamedTemplateKeepsPoolMint pins the guard's
 // scope: a named session backed by a MULTI-session template keeps the
 // ordinary pool mint (pool workers beside the named session are legitimate
