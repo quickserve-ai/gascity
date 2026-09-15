@@ -526,6 +526,7 @@ func TestReleaseConfirmedOrphanSessionWork_GatesUnobservableIdentifier(t *testin
 	released := releaseConfirmedOrphanSessionWork(cfg, cityStore, rigStores,
 		[]beads.Bead{foreign, local},
 		[]beads.Store{rigStore, rigStore},
+		nil,
 		session.Info{SessionNameMetadata: "repo/dalinar"},
 	)
 	if len(released) != 0 {
@@ -545,6 +546,7 @@ func TestReleaseConfirmedOrphanSessionWork_GatesUnobservableIdentifier(t *testin
 	released = releaseConfirmedOrphanSessionWork(cfg, cityStore, rigStores,
 		[]beads.Bead{foreign, local},
 		[]beads.Store{rigStore, rigStore},
+		nil,
 		session.Info{SessionNameMetadata: "repo/worker-1"},
 	)
 	if len(released) != 1 || released[0].ID != local.ID {
