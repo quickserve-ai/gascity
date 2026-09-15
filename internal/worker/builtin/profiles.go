@@ -288,6 +288,20 @@ var builtinProviderSpecs = map[string]BuiltinProviderSpec{
 			// turns a short value into its 1M launch id; without them "opus"
 			// would reach the CLI verbatim and land on the 200k tier.
 			modelOption(
+				// "fable" tracks the CURRENT Fable generation at the 1M window
+				// through the CLI's own family alias, for the same reason "opus"
+				// does below, and the dated pin had already gone stale under the
+				// fleet. Measured on the qyburn account 2026-09-14 with fresh -p
+				// probes: `--model claude-fable-5[1m]` served claude-fable-5 (5.0),
+				// while `--model fable[1m]` served claude-fable-5-1. Every fable
+				// provider pinned "fable-5", so every fresh boot landed on 5.0
+				// while the server migrated only some long-running sessions to 5.1
+				// mid-flight: a fleet split across two generations with no value
+				// that selects the newer one (ga-a306b1). The open template would
+				// emit a bare "fable" verbatim and land on the 200k tier, so the
+				// alias is what turns the short value into its 1M launch id.
+				modelAlias("fable", "Fable (latest, 1M)", "fable[1m]"),
+				modelAlias("fable-5-1", "Fable 5.1 (1M)", "claude-fable-5-1[1m]"),
 				// "fable-5" carries the [1m] suffix for the same reason "opus" does
 				// (ga-ljcm7c): without it the model lands on the 200k context tier,
 				// and every fable lane spawned through gc silently lost 800k of

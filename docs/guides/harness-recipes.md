@@ -66,7 +66,8 @@ bearer-token gateways).
 # Direct: your existing Claude login or ambient ANTHROPIC_API_KEY
 # agents/dev/agent.toml
 provider        = "claude"
-option_defaults = { model = "sonnet" }     # opus · sonnet · haiku · opus-4-7 · fable-5
+option_defaults = { model = "sonnet" }     # latest-tracking: opus · sonnet · fable · haiku
+                                           # dated pins:      opus-4-7 · fable-5-1 · fable-5
 ```
 
 ```toml
