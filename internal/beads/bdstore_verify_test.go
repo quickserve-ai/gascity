@@ -3,6 +3,7 @@ package beads_test
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -122,27 +123,36 @@ func TestBdStoreGetConsultsWispsWhenBdShowReturnsEmptySet(t *testing.T) {
 	}
 }
 
-// TestBdStoreGetConsultsWispsOnSubstringCollision covers the third exit: bd
-// resolved a DIFFERENT issue by substring. That is a statement about the issues
-// table and not about whether the requested ID exists as a wisp.
-func TestBdStoreGetConsultsWispsOnSubstringCollision(t *testing.T) {
-	runner := fakeRunner(map[string]struct {
-		out []byte
-		err error
-	}{
-		`bd show --json gc-wisp-abc`: {
-			out: []byte(`[{"id":"gc-wisp-abcdef","title":"a different bead","status":"open","issue_type":"task"}]`),
-		},
-		`bd query --json ephemeral=true AND id=gc-wisp-abc --all --limit 1`: {
-			out: []byte(`[{"id":"gc-wisp-abc","title":"the real message","status":"open","issue_type":"message","assignee":"katya","ephemeral":true}]`),
-		},
-	})
-	s := beads.NewBdStore("/city", runner)
-	b, err := s.Get("gc-wisp-abc")
-	if err != nil {
-		t.Fatalf("Get: %v — a substring collision must not conclude a wisp is absent", err)
+// TestBdStoreGetLeavesASubstringCollisionAlone pins a DECISION, not an
+// oversight. bd show does not consult the wisp tier, so a substring collision
+// has not proven the requested ID absent from it — but this branch is also
+// reached by ReleaseIfCurrent's exact-ID guard, which must issue nothing
+// further to bd once it refuses. Covering a marginal case here would put a
+// subprocess on a conditional-release hot path; mail verification resolves
+// through the other two exits and never needs this one. If this test starts
+// failing because someone added a wisp lookup here, read
+// TestReleaseIfCurrentRefusesAFuzzyIDCollision before "fixing" it.
+func TestBdStoreGetLeavesASubstringCollisionAlone(t *testing.T) {
+	var issued []string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		issued = append(issued, name+" "+strings.Join(args, " "))
+		if len(args) > 0 && args[0] == "show" {
+			return []byte(`[{"id":"gc-wisp-abcdef","title":"a different bead","status":"open","issue_type":"task"}]`), nil
+		}
+		return nil, fmt.Errorf("unexpected command: %s %s", name, strings.Join(args, " "))
 	}
-	if b.ID != "gc-wisp-abc" {
-		t.Errorf("ID = %q, want gc-wisp-abc", b.ID)
+	s := beads.NewBdStore("/city", runner)
+	_, err := s.Get("gc-wisp-abc")
+
+	if !errors.Is(err, beads.ErrIDCollision) {
+		t.Errorf("err = %v, want ErrIDCollision", err)
+	}
+	if errors.Is(err, beads.ErrVerifyIndeterminate) {
+		t.Errorf("err = %v, must not be indeterminate — this exit deliberately does not look further", err)
+	}
+	for _, cmd := range issued {
+		if strings.Contains(cmd, "query") {
+			t.Errorf("a wisp query was issued on the collision path: %q — see ReleaseIfCurrent's exact-ID guard", cmd)
+		}
 	}
 }
