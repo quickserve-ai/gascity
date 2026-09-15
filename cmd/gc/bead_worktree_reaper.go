@@ -199,13 +199,14 @@ func reapClosedBeadWorktrees(
 		// discoverWorktreeLiveness is the shared discovery boundary: it
 		// enumerates every worktree git knows about for this rig — including
 		// ones outside .gc/worktrees entirely — and pass 1 below narrows that
-		// to gc-owned candidates before anything is ever reaped. Called with an
-		// unscanned live state it performs only the enumeration half and
-		// reports no liveness; the liveness half (worktreeIsLive, the same
-		// predicate discovery applies) runs at the gate in pass 2 against the
-		// lazily gathered scan, so a pass that yields no candidate never
-		// enumerates the host's process table (ga-singc6).
-		worktrees, err := discoverWorktreeLiveness(rigRoot, liveWorktreeState{}, nil)
+		// to gc-owned candidates before anything is ever reaped. It gets the
+		// session-dir set the pass already holds but not the host scan, which
+		// ga-singc6 defers, and with an unscanned live state it reports no
+		// liveness from either input. Both are applied at the gate in pass 2 —
+		// worktreeIsLive, the predicate discovery applies, against the lazily
+		// gathered scan and these same liveSessionDirs — so a pass that yields
+		// no candidate never enumerates the host's process table.
+		worktrees, err := discoverWorktreeLiveness(rigRoot, liveWorktreeState{}, liveSessionDirs)
 		if err != nil {
 			fmt.Fprintf(stderr, "reapClosedBeadWorktrees: listing worktrees for rig %s (%s): %v\n", rigName, rigRoot, err) //nolint:errcheck
 			continue
