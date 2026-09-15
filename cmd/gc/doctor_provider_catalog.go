@@ -283,4 +283,16 @@ func (c *providerModelWindowAmbiguityCheck) CanFix() bool { return false }
 
 func (c *providerModelWindowAmbiguityCheck) Fix(_ *doctor.CheckContext) error { return nil }
 
-func (c *providerModelWindowAmbiguityCheck) WarmupEligible() bool { return false }
+// WarmupEligible returns TRUE, unlike its neighbours in this file. katya's
+// review condition on ga-a306b1 was that selecting an unresolvable pin be loud
+// at CONFIG OR LAUNCH, and doctor-only does not meet it: nothing in orders/ or
+// packs/*/orders runs `gc doctor` on a schedule, so a doctor-only warning is
+// heard only when a human happens to run it. `gc start`'s warmup pass DOES
+// surface eligible checks — warmup collects every result at StatusWarning or
+// above, mails the report and writes it to stderr — so this is the launch-time
+// surface the condition asks for.
+//
+// Safe to run in warmup because it is pure config: it loads the expanded city
+// config and walks two maps. No network, no Dolt, no filesystem beyond the
+// config read, and it reports OK when the config cannot be expanded yet.
+func (c *providerModelWindowAmbiguityCheck) WarmupEligible() bool { return true }

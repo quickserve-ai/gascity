@@ -152,3 +152,13 @@ option_defaults = { model = "` + model + `" }
 		})
 	}
 }
+
+// The launch-time surface is the whole point of this check, so lock it: a
+// doctor-only warning is heard only when someone runs gc doctor by hand, and
+// nothing schedules that. If this ever flips back to false the check silently
+// stops meeting the condition it was written for (ga-a306b1, katya's review).
+func TestProviderModelWindowIsSurfacedAtStartupWarmup(t *testing.T) {
+	if !newProviderModelWindowAmbiguityCheck(t.TempDir()).WarmupEligible() {
+		t.Fatal("WarmupEligible() = false; gc start would not surface the model-window warning")
+	}
+}
