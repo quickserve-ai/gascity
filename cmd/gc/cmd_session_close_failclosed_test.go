@@ -32,12 +32,24 @@ import (
 //
 //   - NAME-SHAPED assignee (here the session_name form) must be RETAINED. Losing
 //     this is the 2026-09-11 portfolio wave.
-//   - BEAD-ID assignee must still be RELEASED. Losing this STRANDS pool work
-//     permanently, because nothing downstream reclaims it: CloseDetailed has
-//     already closed the session bead, the reconciler snapshot drops closed
-//     sessions, so repairStrandedPoolWorkerBead never sees it; and
+//   - BEAD-ID assignee must still be RELEASED. Nothing downstream reclaims what
+//     this branch withholds: CloseDetailed has already closed the session bead,
+//     the reconciler snapshot drops closed sessions, so
+//     repairStrandedPoolWorkerBead never sees it; and
 //     releaseOrphanedPoolAssignments skips unrouted work. A blanket
 //     "release nothing" skip looks safe and is not.
+//
+// READ THIS BEFORE TRUSTING THE SECOND HALF AS A STRAND TEST. The bead-ID form
+// asserted below is NOT the shape production holds pool work in. Pool instances
+// run with GC_AGENT/GC_ALIAS set to their per-instance alias and gc hook
+// --claim writes that alias, so real claimed work reads e.g.
+// "woodhouse-ga-m02ds". Measured 2026-09-15 on this city's store: ZERO rows in
+// hq.issues have a ^(ga|gc)- assignee in any status, against 92 such rows in
+// hq.wisps — a real zero, not a broken filter. So this case pins a narrow
+// correctness guarantee (work bound to the dying bead ID is freed, and a named
+// seat is never stripped) and does NOT demonstrate that the alias-held strand
+// is closed. It is not. The durable fix is deferred cleanup that revisits
+// closed sessions once cfg loads, tracked separately.
 //
 // The work bead below is deliberately UNROUTED (no gc.routed_to), which is the
 // exact shape releaseOrphanedPoolAssignments refuses to recover.

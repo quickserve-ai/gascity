@@ -1943,20 +1943,38 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 	// So release exactly the identifier that cannot be a named seat: the dying
 	// session's own BEAD ID. A bead ID is structurally incapable of matching a
 	// [[named_session]] identity under any cfg, so this needs no config to be
-	// safe, and it is what pool work claimed via the bead-ID form is bound to.
+	// safe.
 	//
 	// Deliberately NOT keyed on the session bead's own named/ephemeral metadata,
-	// which looks like the more natural discriminator: ga-hoy4vl — the bead at
-	// the center of the 2026-09-11 wave — was pool_managed=true /
-	// session_origin=ephemeral WHILE SERVING A NAMED AGENT (the ga-dfp1b class).
-	// Keying on that metadata would strip a named seat for precisely the
-	// mislabeled shape that caused the incident.
+	// which looks like the more natural discriminator. The empirical reason is
+	// that ga-hoy4vl — the bead at the center of the 2026-09-11 wave — was
+	// pool_managed=true / session_origin=ephemeral WHILE SERVING A NAMED AGENT
+	// (the ga-dfp1b class). The structural reason is stronger and is the one to
+	// keep: that metadata is DATA THAT CAN BE WRONG, whereas "a bead ID is not a
+	// configured named identity" is true by construction of the config schema
+	// and cannot be falsified by a mislabeled bead. When the bug class IS bad
+	// metadata, the discriminator must not be metadata.
 	//
-	// Residual, stated rather than hidden: work claimed under the alias or
-	// session_name form stays withheld until the operator re-runs the close with
-	// a loading config (the stderr line says so). Routed pool work still
-	// recovers via releaseOrphanedPoolAssignments. That leaves a recoverable
-	// gap instead of a silent one.
+	// HOW MUCH THIS ACTUALLY RELEASES: in practice, almost nothing — say so
+	// plainly rather than let the next reader assume the strand above is fixed.
+	// Pool instances run with GC_AGENT/GC_ALIAS set to their PER-INSTANCE ALIAS
+	// (cmd_hook.go), and gc hook --claim writes that alias as the assignee
+	// (6d6c33382, see bd_assignee_canonicalize.go), so claimed pool work is held
+	// under e.g. "woodhouse-ga-m02ds", never under the bead ID. Measured on this
+	// city's store 2026-09-15: hq.issues rows whose assignee matches ^(ga|gc)- =
+	// ZERO across all statuses, against 92 matching rows in hq.wisps — so the
+	// probe bites and the answer is a real zero.
+	//
+	// This branch is therefore a narrow correctness guarantee (any work that IS
+	// bound to the dying bead ID is freed, and a named seat is never stripped),
+	// NOT a fix for the strand. Alias-held pool work on a session closed under a
+	// broken config stays withheld, and nothing downstream reclaims it — the
+	// operator must re-run the close once the config loads, which the stderr
+	// line instructs. Routed pool work still recovers via
+	// releaseOrphanedPoolAssignments. The durable fix is deferred cleanup that
+	// revisits closed sessions once cfg loads; it is tracked separately and is
+	// deliberately not attempted here, because getting it wrong re-opens the
+	// portfolio-stripping bug this function exists to prevent.
 	if cfg == nil {
 		fmt.Fprintf(stderr, "gc session close: city config unavailable (%s); "+ //nolint:errcheck // best-effort stderr
 			"releasing only work bound to session bead %s, and withholding work held "+
