@@ -573,7 +573,9 @@ func managedDoltOpenDatabaseSocket(socket, user, database string) (*sql.DB, erro
 	if database == "" {
 		return nil, fmt.Errorf("missing database")
 	}
-	return doltpool.OpenSocket(socket, user, managedDoltPassword(), database)
+	// A socket dial has no host:port; an empty host is the managed loopback
+	// server for the endpoint-bound ambient identity (gc-49ho).
+	return doltpool.OpenSocket(socket, user, managedDoltPassword("", ""), database)
 }
 
 func readManagedMetadataProjectID(metadataPath string) (string, error) {
