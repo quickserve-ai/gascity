@@ -172,3 +172,62 @@ func TestReplyAndHandoffAreGuardedToo(t *testing.T) {
 		t.Errorf("Reply err = %v, want ErrNotPersisted", err)
 	}
 }
+
+// lostWriteStore reports every Create as a success but persists nothing, which
+// is the exact shape of the bug: the store says it wrote, the row is not there.
+type lostWriteStore struct {
+	beads.Store
+}
+
+func (s lostWriteStore) Create(b beads.Bead) (beads.Bead, error) {
+	created, err := s.Store.Create(b)
+	if err != nil {
+		return created, err
+	}
+	// Persist nothing — hand back only what the caller would have believed.
+	_ = s.Store.Delete(created.ID)
+	return created, nil
+}
+
+// TestSendCatchesLostWriteThroughCachingStore is the controller/API plane case.
+// CachingStore.Create absorbs the unverified bead into its cache with
+// clearDirty, so a verification read through the store's OWN Get is answered by
+// that cache and confirms a write that never reached storage. The guard must
+// read through the LIVE handle instead. Found by an independent cross-family
+// review of the first cut of this fix.
+func TestSendCatchesLostWriteThroughCachingStore(t *testing.T) {
+	fastVerify(t)
+	backing := lostWriteStore{Store: beads.NewMemStore()}
+	cached := beads.NewCachingStoreForTest(backing, nil)
+	p := New(cached)
+
+	_, err := p.Send("woodhouse", "katya", "subject", "body")
+	if err == nil {
+		t.Fatal("Send reported success for a lost write — the cache confirmed a row that does not exist")
+	}
+	if !errors.Is(err, ErrNotPersisted) {
+		t.Errorf("err = %v, want ErrNotPersisted", err)
+	}
+}
+
+// TestSendRejectsCreateWithNoID pins that a create which reports success but
+// hands back no ID cannot pass verification by default. An unverifiable write
+// is not a verified one.
+func TestSendRejectsCreateWithNoID(t *testing.T) {
+	fastVerify(t)
+	p := New(noIDStore{Store: beads.NewMemStore()})
+
+	if _, err := p.Send("woodhouse", "katya", "subject", "body"); !errors.Is(err, ErrUnconfirmed) {
+		t.Errorf("err = %v, want ErrUnconfirmed", err)
+	}
+}
+
+type noIDStore struct {
+	beads.Store
+}
+
+func (s noIDStore) Create(b beads.Bead) (beads.Bead, error) {
+	created, err := s.Store.Create(b)
+	created.ID = ""
+	return created, err
+}
