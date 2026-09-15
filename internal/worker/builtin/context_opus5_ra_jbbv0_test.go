@@ -36,26 +36,26 @@ func TestBuiltinClaudeModelChoicesIncludeOpus5(t *testing.T) {
 		t.Fatal("claude model choices missing \"opus-5\" (claude-opus-5 has no enum entry, " +
 			"so resolving it yields no --model FlagArgs and gc silently launches the provider default)")
 	}
-	wantFlagArgs := []string{"--model", "claude-opus-5"}
+	// Carried divergence (CARRY.md, "Claude model enum"): the fleet launches
+	// opus-5 at the 1M window and bare "opus" through the generation-tracking
+	// opus[1m] alias, where upstream emits claude-opus-5 and pins
+	// "opus" to claude-opus-4-8. Drop when every city states these choices in
+	// its provider config (options_schema_merge = "by_key").
+	wantFlagArgs := []string{"--model", "claude-opus-5[1m]"}
 	if len(choice.FlagArgs) != 2 || choice.FlagArgs[0] != wantFlagArgs[0] || choice.FlagArgs[1] != wantFlagArgs[1] {
 		t.Errorf("opus-5 FlagArgs = %v, want %v", choice.FlagArgs, wantFlagArgs)
 	}
 	if len(choice.FlagAliases) != 1 || len(choice.FlagAliases[0]) != 2 ||
-		choice.FlagAliases[0][0] != "-m" || choice.FlagAliases[0][1] != "claude-opus-5" {
-		t.Errorf("opus-5 FlagAliases = %v, want [[-m claude-opus-5]]", choice.FlagAliases)
+		choice.FlagAliases[0][0] != "-m" || choice.FlagAliases[0][1] != "claude-opus-5[1m]" {
+		t.Errorf("opus-5 FlagAliases = %v, want [[-m claude-opus-5[1m]]]", choice.FlagAliases)
 	}
 
-	// Unlike the sonnet/fable-5 precedent (#3867, #3284), bare "opus" is NOT
-	// repointed at the new latest here: internal/config/provider_test.go
-	// (TestBuiltinProvidersClaudeModelChoices) pins "opus" to claude-opus-4-8
-	// as a deliberate stability guarantee, and opus-5 is added as a new
-	// explicit alias alongside it rather than replacing the default.
 	bare, ok := byValue["opus"]
 	if !ok {
 		t.Fatal("claude model choices missing \"opus\"")
 	}
-	if len(bare.FlagArgs) != 2 || bare.FlagArgs[1] != "claude-opus-4-8" {
-		t.Errorf("opus (bare) FlagArgs = %v, want [--model claude-opus-4-8] (unchanged)", bare.FlagArgs)
+	if len(bare.FlagArgs) != 2 || bare.FlagArgs[1] != "opus[1m]" {
+		t.Errorf("opus (bare) FlagArgs = %v, want [--model opus[1m]] (carried generation-tracking alias)", bare.FlagArgs)
 	}
 }
 

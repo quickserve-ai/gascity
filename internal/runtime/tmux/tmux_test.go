@@ -49,6 +49,28 @@ func privateSocketName(tag string) string {
 	return fmt.Sprintf("gctest-%d-%s%d", os.Getpid(), tag, time.Now().UnixNano()%1e9)
 }
 
+// seedServerGlobalEnv starts tm's tmux server with a holder session and sets
+// key=value in the server's GLOBAL environment, the environment every pane
+// shell inherits. A value exported by the test process cannot get there by
+// inheritance: the client that founds a server on a named socket runs with
+// secret-named variables scrubbed (ga-fhbnmz). The withholding proofs need the
+// value present in the server, or they pass without exercising the control.
+func seedServerGlobalEnv(t *testing.T, tm *Tmux, key, value string) {
+	t.Helper()
+	const holder = "gc-test-global-env-holder"
+	if _, err := tm.run("new-session", "-d", "-s", holder, "sleep 300"); err != nil {
+		t.Fatalf("starting holder session: %v", err)
+	}
+	t.Cleanup(func() { _ = tm.KillSession(holder) })
+	if _, err := tm.run("set-environment", "-g", key, value); err != nil {
+		t.Fatalf("seeding %s into the server global environment: %v", key, err)
+	}
+	got, err := tm.run("show-environment", "-g", key)
+	if err != nil || !strings.Contains(got, value) {
+		t.Fatalf("server global environment does not carry %s after seeding: %q, %v", key, got, err)
+	}
+}
+
 // testTmux returns a Tmux instance that uses an isolated test socket.
 func testTmux() *Tmux {
 	cfg := DefaultConfig()
@@ -3942,12 +3964,13 @@ func TestNewSessionWithCommandAndEnvWithholdsEmptyVarFromPaneChild(t *testing.T)
 	)
 	t.Setenv(tokenVar, token)
 
-	// A socket unique to this test, so the server it starts forks from THIS
-	// process and its global environment carries the token. The package socket
-	// would hand back a server started by an earlier test, which never saw it.
+	// A socket unique to this test, whose server global environment carries
+	// the token: the state a controller-started server is in. The package
+	// socket would hand back a server started by an earlier test.
 	cfg := DefaultConfig()
 	cfg.SocketName = privateSocketName("tp")
 	tm := NewTmuxWithConfig(cfg)
+	seedServerGlobalEnv(t, tm, tokenVar, token)
 
 	dir := t.TempDir()
 	report := filepath.Join(dir, "child-token")
