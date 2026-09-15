@@ -71,6 +71,34 @@ func isBdInitDirtyTablesError(err error) bool {
 	return strings.Contains(strings.ToLower(err.Error()), bdInitDirtyTablesMarker)
 }
 
+// gcBeadsBdCheckpointRefusals are the fail-closed refusals gc-beads-bd.sh
+// prints when its own dirty-schema checkpoint declines to run: the database is
+// not one that invocation created, a dirty table falls outside bd's partial-init
+// schema, or the checkpoint could not complete (run_bd_init_pinned,
+// checkpoint_partial_bd_init_schema). The script prints bd's refusal first, so
+// such an error also matches isBdInitDirtyTablesError. The script has already
+// decided that database's working set is not gc's to commit.
+var gcBeadsBdCheckpointRefusals = []string{
+	"refusing to checkpoint a pre-existing database",
+	"refusing bd init schema checkpoint with unexpected dirty table",
+	"failed to checkpoint partial bd init schema",
+}
+
+// isGcBeadsBdCheckpointRefusal reports whether err carries one of
+// gc-beads-bd.sh's fail-closed dirty-schema refusals.
+func isGcBeadsBdCheckpointRefusal(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, refusal := range gcBeadsBdCheckpointRefusals {
+		if strings.Contains(msg, refusal) {
+			return true
+		}
+	}
+	return false
+}
+
 // commitDirtyScopeTables commits a scope database's uncommitted working set on
 // the managed Dolt server, reporting whether there was anything to commit. It
 // is a variable so tests can exercise the recovery loop without a live server.
@@ -85,8 +113,12 @@ var commitDirtyScopeTables = commitDirtyScopeTablesViaManagedDolt
 // It only acts on a managed local Dolt server, mirroring the preconditions of
 // verifyManagedDoltDatabaseExistsAfterInit: an external or gateway endpoint is
 // not ours to commit against, and its working set is not what bd is refusing
-// over here.
-func commitDirtyScopeTablesViaManagedDolt(cityPath, database string) (bool, error) {
+// over here. Like that guard it resolves the endpoint of the SCOPE being
+// initialized, not only the city's (hq-mbe2s): a rig pinned to a remote hub can
+// live inside a managed-local city, and committing its database on the local
+// server would miss the store bd refused and write to any same-named local
+// database instead.
+func commitDirtyScopeTablesViaManagedDolt(cityPath, scopeRoot, database string) (bool, error) {
 	database = strings.TrimSpace(database)
 	if database == "" {
 		return false, fmt.Errorf("no Dolt database resolved for scope")
@@ -96,6 +128,9 @@ func commitDirtyScopeTablesViaManagedDolt(cityPath, database string) (bool, erro
 	}
 	if isExternalDolt(cityPath) {
 		return false, fmt.Errorf("dolt endpoint for city %q is external; commit its working set at the endpoint", cityPath)
+	}
+	if initScopeUsesExternalDolt(cityPath, scopeRoot, nil) {
+		return false, fmt.Errorf("dolt endpoint for scope %q is external; commit its working set at the endpoint", scopeRoot)
 	}
 	port := currentResolvableManagedDoltPort(cityPath)
 	if strings.TrimSpace(port) == "" {
@@ -161,18 +196,24 @@ func parseSmokeCount(out string) (int, error) {
 
 // recoverBdInitFromDirtyTables clears the dirty-table deadlock that initErr
 // reports and re-runs init, repeating until init stops refusing. reinit re-runs
-// the same bd init the caller just attempted.
+// the same bd init the caller just attempted, for the scope rooted at
+// scopeRoot.
 //
 // It returns nil once init succeeds. Otherwise it returns an error that wraps
 // the refusal, so a caller that cannot be helped still sees why.
-func recoverBdInitFromDirtyTables(cityPath, database string, initErr error, reinit func() error) error {
+func recoverBdInitFromDirtyTables(cityPath, scopeRoot, database string, initErr error, reinit func() error) error {
 	if strings.TrimSpace(database) == "" {
+		return initErr
+	}
+	// gc-beads-bd.sh already refused to checkpoint this working set.
+	// Committing all of it here would override that refusal.
+	if isGcBeadsBdCheckpointRefusal(initErr) {
 		return initErr
 	}
 
 	err := initErr
 	for round := 0; round < maxBdInitDirtyTableRounds; round++ {
-		committed, commitErr := commitDirtyScopeTables(cityPath, database)
+		committed, commitErr := commitDirtyScopeTables(cityPath, scopeRoot, database)
 		if commitErr != nil {
 			return fmt.Errorf("%w; committing the working set to clear it failed: %w", err, commitErr)
 		}
@@ -185,7 +226,9 @@ func recoverBdInitFromDirtyTables(cityPath, database string, initErr error, rein
 		if retryErr == nil {
 			return nil
 		}
-		if !isBdInitDirtyTablesError(retryErr) {
+		// A refused retry is final for the same reason: after a commit the
+		// database exists, so the script no longer counts it as one it created.
+		if !isBdInitDirtyTablesError(retryErr) || isGcBeadsBdCheckpointRefusal(retryErr) {
 			return retryErr
 		}
 		err = retryErr
