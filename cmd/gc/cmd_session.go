@@ -1816,6 +1816,21 @@ func cfgErrOrUnknown(err error) string {
 	return "reason not reported"
 }
 
+// sessionBeadIDOnlyIdentity strips a session bead down to its ID, so that
+// sessionAssignmentIdentifiers yields ONLY the bead-ID form and none of the
+// name-shaped identifiers (session_name, the named-session identity, the
+// alias) it would otherwise contribute.
+//
+// This is how the close path releases pool work without a config: a bead ID
+// can never be a configured [[named_session]] identity, so releasing work
+// bound to it is safe even when isConfiguredNamedSessionIdentity has no cfg
+// to consult and therefore protects nothing. Passing the full bead with a nil
+// cfg would release the name-shaped identifiers too — that is the ga-9n8hjv
+// portfolio-stripping bug itself.
+func sessionBeadIDOnlyIdentity(b beads.Bead) beads.Bead {
+	return beads.Bead{ID: b.ID}
+}
+
 // cmdSessionClose is the CLI entry point for "gc session close".
 func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool) int {
 	asJSON := sessionJSONRequested(jsonOutput)
@@ -1906,22 +1921,49 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 	// report "no work" (ga-9n8hjv). The binary serving that day DID carry the
 	// guard, so a present-but-inapplicable guard is the whole failure mode.
 	//
-	// Releasing nothing is the safe side of this trade and the asymmetry is not
-	// close. Skipping leaves at most a stale claim, which is visible, and which
-	// repairStrandedPoolWorkerBead still reclaims on its own confirmed-stranding
-	// path — so pool work is not stranded by this, it is merely released later.
-	// That safety net is not theoretical: session_reconciler.go's
-	// reconcileSessionBeadsTracedWithNamedDemand calls it on the periodic
-	// reconcile, so acceptance item 3 (a genuinely dead pool session's routed
-	// claim is still reclaimed) survives this skip. Verified, not assumed.
 	// Releasing wrongly destroys a named agent's portfolio silently, and the
 	// resume check that exists to catch stranded work is exactly what stops
-	// working. Prefer the recoverable failure.
+	// working. So the nil-cfg branch withholds every NAME-SHAPED identifier.
+	//
+	// But it must NOT withhold everything, and the reason is a trap worth
+	// stating: there is NO safety net downstream of this point. An earlier
+	// version of this comment claimed repairStrandedPoolWorkerBead reclaims
+	// whatever the skip leaves behind. It cannot. CloseDetailed has already
+	// closed the session bead by the time we get here, and the reconciler's
+	// snapshot drops closed sessions (session_bead_snapshot.go, "if in.Closed
+	// { continue }"), so that bead never reaches the repair call in
+	// session_reconciler.go — not on the next tick, and not after the config is
+	// fixed. releaseOrphanedPoolAssignments does not cover the gap either: it
+	// skips unrouted work (pool_session_name.go, "if template == ''"). A blanket
+	// skip therefore STRANDS unrouted pool work permanently, where the old
+	// unconditional release at least freed it. The repair being *reachable* on
+	// the periodic path is true and irrelevant — the bead is no longer in its
+	// input set.
+	//
+	// So release exactly the identifier that cannot be a named seat: the dying
+	// session's own BEAD ID. A bead ID is structurally incapable of matching a
+	// [[named_session]] identity under any cfg, so this needs no config to be
+	// safe, and it is what pool work claimed via the bead-ID form is bound to.
+	//
+	// Deliberately NOT keyed on the session bead's own named/ephemeral metadata,
+	// which looks like the more natural discriminator: ga-hoy4vl — the bead at
+	// the centre of the 2026-09-11 wave — was pool_managed=true /
+	// session_origin=ephemeral WHILE SERVING A NAMED AGENT (the ga-dfp1b class).
+	// Keying on that metadata would strip a named seat for precisely the
+	// mislabeled shape that caused the incident.
+	//
+	// Residual, stated rather than hidden: work claimed under the alias or
+	// session_name form stays withheld until the operator re-runs the close with
+	// a loading config (the stderr line says so). Routed pool work still
+	// recovers via releaseOrphanedPoolAssignments. That leaves a recoverable
+	// gap instead of a silent one.
 	if cfg == nil {
 		fmt.Fprintf(stderr, "gc session close: city config unavailable (%s); "+ //nolint:errcheck // best-effort stderr
-			"not releasing work assigned to %s — a configured named identity cannot be "+
-			"distinguished from a retired one without it. Re-run once the config loads.\n",
+			"releasing only work bound to session bead %s, and withholding work held "+
+			"under a name — a configured named identity cannot be distinguished from a "+
+			"retired one without the config. Re-run once the config loads.\n",
 			cfgErrOrUnknown(cfgErr), closedSessionBead.ID)
+		unclaimWorkAssignedToRetiredSessionBead(store, rigStores, sessionBeadIDOnlyIdentity(closedSessionBead), "", nil, stderr)
 	} else {
 		unclaimWorkAssignedToRetiredSessionBead(store, rigStores, closedSessionBead, "", cfg, stderr)
 	}
