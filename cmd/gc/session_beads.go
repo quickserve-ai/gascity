@@ -1257,9 +1257,22 @@ func reassignWorkAssignedToRetiredSessionInfo(
 // unclaimWorkAssignedToRetiredSessionInfo is the session.Info form of
 // unclaimWorkAssignedToRetiredSessionBead: the session-side identity read routes
 // through sessionAssignmentIdentifiersInfo (equivalence-proven), while the
-// work-store fan-out and per-bead release stay bead-shaped (ClassWork). It is
-// byte-identical to the raw form and returns the same unclaimResult; the raw
-// form survives for the whole-bead retirement and closed-session release paths.
+// work-store fan-out and per-bead release stay bead-shaped (ClassWork). It
+// returns the same unclaimResult; the raw form survives for the whole-bead
+// retirement and closed-session release paths.
+//
+// IT IS NOT INTERCHANGEABLE WITH THE RAW FORM, and this comment used to say it
+// was ("byte-identical"). The raw form takes a cfg *config.City and uses it to
+// KEEP work whose assignee is a still-configured [[named_session]] — the
+// ga-sdynmb guard. This form has no cfg parameter, so that guard cannot apply
+// here under any circumstances.
+//
+// That is correct for its one caller, repairStrandedPoolWorkerBead, which
+// releases POOL work behind a confirmed-stranding gate and SHOULD release it.
+// It is a trap for anyone else: reach for this form on a NAMED seat and you
+// silently get no guard, which is how a whole portfolio goes missing
+// (ga-9n8hjv). If you need it for a named identity, do not call this — thread
+// cfg through and use the raw form.
 func unclaimWorkAssignedToRetiredSessionInfo(
 	store beads.Store,
 	rigStores map[string]beads.Store,
