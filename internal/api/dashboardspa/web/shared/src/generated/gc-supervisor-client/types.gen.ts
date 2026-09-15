@@ -115,6 +115,7 @@ export type AgentPatch = {
     TmuxAlias: string | null;
     Upstream: string | null;
     WakeMode: string | null;
+    WakeTransport: string | null;
     WorkDir: string | null;
 };
 
@@ -3485,9 +3486,11 @@ export type SessionResponse = {
     agent_kind?: string;
     alias?: string;
     attached: boolean;
-    configured_named_session?: boolean;
+    base_state: string;
+    configured_named_session: boolean;
     context_pct?: number;
     context_window?: number;
+    control_plane: boolean;
     created_at: string;
     display_name?: string;
     id: string;
@@ -3499,15 +3502,18 @@ export type SessionResponse = {
         [key: string]: string;
     };
     model?: string;
+    navigator_schema_version: string;
     options?: {
         [key: string]: string;
     };
     pool?: string;
+    pool_managed: boolean;
     provider: string;
     reason?: string;
     rig?: string;
     running: boolean;
     session_name: string;
+    session_origin?: string;
     state: string;
     submission_capabilities?: SubmissionCapabilities;
     template: string;
@@ -5593,6 +5599,8 @@ export type TypedEventStreamEnvelope = ({
 } & TypedEventStreamEnvelopeRigProvisionProgress) | ({
     type: 'session.cold_start_timeout';
 } & TypedEventStreamEnvelopeSessionColdStartTimeout) | ({
+    type: 'session.config_drift_wave';
+} & TypedEventStreamEnvelopeSessionConfigDriftWave) | ({
     type: 'session.crashed';
 } & TypedEventStreamEnvelopeSessionCrashed) | ({
     type: 'session.demand_claim_divergence';
@@ -6943,6 +6951,24 @@ export type TypedEventStreamEnvelopeSessionColdStartTimeout = {
 };
 
 /**
+ * TypedEventStreamEnvelope session.config_drift_wave
+ */
+export type TypedEventStreamEnvelopeSessionConfigDriftWave = {
+    actor: string;
+    depends_on_step_ids?: Array<string>;
+    message?: string;
+    payload: NoPayload;
+    run_id?: string;
+    seq: number;
+    session_id?: string;
+    step_id?: string;
+    subject?: string;
+    ts: string;
+    type: 'session.config_drift_wave';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
  * TypedEventStreamEnvelope session.crashed
  */
 export type TypedEventStreamEnvelopeSessionCrashed = {
@@ -7700,6 +7726,8 @@ export type TypedTaggedEventStreamEnvelope = ({
 } & TypedTaggedEventStreamEnvelopeRigProvisionProgress) | ({
     type: 'session.cold_start_timeout';
 } & TypedTaggedEventStreamEnvelopeSessionColdStartTimeout) | ({
+    type: 'session.config_drift_wave';
+} & TypedTaggedEventStreamEnvelopeSessionConfigDriftWave) | ({
     type: 'session.crashed';
 } & TypedTaggedEventStreamEnvelopeSessionCrashed) | ({
     type: 'session.demand_claim_divergence';
@@ -9117,6 +9145,25 @@ export type TypedTaggedEventStreamEnvelopeSessionColdStartTimeout = {
     subject?: string;
     ts: string;
     type: 'session.cold_start_timeout';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedTaggedEventStreamEnvelope session.config_drift_wave
+ */
+export type TypedTaggedEventStreamEnvelopeSessionConfigDriftWave = {
+    actor: string;
+    city: string;
+    depends_on_step_ids?: Array<string>;
+    message?: string;
+    payload: NoPayload;
+    run_id?: string;
+    seq: number;
+    session_id?: string;
+    step_id?: string;
+    subject?: string;
+    ts: string;
+    type: 'session.config_drift_wave';
     workflow?: WorkflowEventProjection;
 };
 
