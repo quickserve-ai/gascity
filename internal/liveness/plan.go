@@ -34,7 +34,7 @@ type Plan struct {
 func PlanWrite(mode Mode, patch map[string]string, now time.Time) Plan {
 	live, rest := Split(patch)
 	if mode == ModeMetadata {
-		full := make(map[string]string, len(patch)+len(live))
+		full := make(map[string]string, len(patch))
 		for k, v := range patch {
 			if IsMarkerKey(k) {
 				continue
@@ -56,7 +56,7 @@ func PlanWrite(mode Mode, patch map[string]string, now time.Time) Plan {
 // to the table: a caller reaching for this either could not write it, or must not.
 func FallbackPlan(patch map[string]string, now time.Time) map[string]string {
 	live, rest := Split(patch)
-	out := make(map[string]string, len(patch)+len(live))
+	out := make(map[string]string, len(patch))
 	for k, v := range rest {
 		out[k] = v
 	}
