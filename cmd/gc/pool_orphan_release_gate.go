@@ -120,6 +120,21 @@ func poolOrphanReleaseAllowedForBead(cfg *config.City, wb beads.Bead) bool {
 	return !cityHasAnyOrphanReleaseDisabled(cfg)
 }
 
+// poolOrphanReleaseGate decides the stop lever for one assigned work bead at
+// either release site. With the bead's index-aligned store ref (storeRefAware)
+// the owning rig is read off the ref, so city-owned work (the empty ref) keeps
+// its exemption; without one the rig is resolved from the bead and an
+// unresolvable bead fails closed while any rig has the switch thrown. It
+// returns the rig to report a hold under ("" when unresolved) and whether the
+// release may proceed.
+func poolOrphanReleaseGate(cfg *config.City, storeRef string, storeRefAware bool, wb beads.Bead) (string, bool) {
+	if storeRefAware {
+		rigName := strings.TrimSpace(storeRef)
+		return rigName, poolOrphanReleaseAllowed(cfg, rigName)
+	}
+	return poolOrphanReleaseRigForBead(cfg, wb), poolOrphanReleaseAllowedForBead(cfg, wb)
+}
+
 // poolOrphanReleaseRigForBead names the rig that owns wb, or "" when no rig
 // claims it. Mirrors storeForPoolAssignment's resolution order.
 func poolOrphanReleaseRigForBead(cfg *config.City, wb beads.Bead) string {
