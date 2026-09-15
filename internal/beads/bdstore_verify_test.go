@@ -94,3 +94,55 @@ func TestBdStoreGetGenuinelyAbsentWispIsNotIndeterminate(t *testing.T) {
 		t.Errorf("err = %v, must NOT be indeterminate — the query completed and the row is absent", err)
 	}
 }
+
+// TestBdStoreGetConsultsWispsWhenBdShowReturnsEmptySet covers the second way
+// Get could conclude absence without ever querying the wisp tier: bd show
+// SUCCEEDS and returns an empty array. bd show reads the issues table only, so
+// that result says nothing about a wisp. Found by an independent cross-family
+// review (ga-0ejdbv).
+func TestBdStoreGetConsultsWispsWhenBdShowReturnsEmptySet(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd show --json gc-wisp-empty`: {
+			out: []byte(`[]`),
+		},
+		`bd query --json ephemeral=true AND id=gc-wisp-empty --all --limit 1`: {
+			out: []byte(`[{"id":"gc-wisp-empty","title":"live message","status":"open","issue_type":"message","assignee":"katya","ephemeral":true}]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	b, err := s.Get("gc-wisp-empty")
+	if err != nil {
+		t.Fatalf("Get: %v — an empty bd show must not conclude a wisp is absent", err)
+	}
+	if b.ID != "gc-wisp-empty" {
+		t.Errorf("ID = %q, want gc-wisp-empty", b.ID)
+	}
+}
+
+// TestBdStoreGetConsultsWispsOnSubstringCollision covers the third exit: bd
+// resolved a DIFFERENT issue by substring. That is a statement about the issues
+// table and not about whether the requested ID exists as a wisp.
+func TestBdStoreGetConsultsWispsOnSubstringCollision(t *testing.T) {
+	runner := fakeRunner(map[string]struct {
+		out []byte
+		err error
+	}{
+		`bd show --json gc-wisp-abc`: {
+			out: []byte(`[{"id":"gc-wisp-abcdef","title":"a different bead","status":"open","issue_type":"task"}]`),
+		},
+		`bd query --json ephemeral=true AND id=gc-wisp-abc --all --limit 1`: {
+			out: []byte(`[{"id":"gc-wisp-abc","title":"the real message","status":"open","issue_type":"message","assignee":"katya","ephemeral":true}]`),
+		},
+	})
+	s := beads.NewBdStore("/city", runner)
+	b, err := s.Get("gc-wisp-abc")
+	if err != nil {
+		t.Fatalf("Get: %v — a substring collision must not conclude a wisp is absent", err)
+	}
+	if b.ID != "gc-wisp-abc" {
+		t.Errorf("ID = %q, want gc-wisp-abc", b.ID)
+	}
+}

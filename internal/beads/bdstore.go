@@ -1401,22 +1401,13 @@ func (s *BdStore) Get(id string) (Bead, error) {
 		// that look like bead IDs are eligible: callers also pass through
 		// non-bead names (e.g. slash-qualified session recipients), which
 		// must not leak into a supplemental wisp query.
-		if isWispQueryableID(id) {
-			wisps, queryErr := s.getEphemeralByID(id)
-			if queryErr != nil {
-				// The wisp leg did not complete — the bd query subprocess failed,
-				// timed out, or is unsupported by this bd. Absence is UNPROVEN:
-				// reporting a bare ErrNotFound here would let a caller read a
-				// timed-out verification as "the row is not there" (ga-0ejdbv).
-				// ErrVerifyIndeterminate still satisfies errors.Is(ErrNotFound),
-				// so callers that only ask "is it missing?" are unchanged.
-				return Bead{}, fmt.Errorf("getting bead %q: %w: %w", id, ErrVerifyIndeterminate, queryErr)
-			}
-			for _, b := range wisps {
-				if b.ID == id {
-					return b, nil
-				}
-			}
+		if b, found, ferr := s.wispFallback(id); ferr != nil {
+			// Absence is UNPROVEN. ErrVerifyIndeterminate still satisfies
+			// errors.Is(ErrNotFound), so callers that only ask "is it missing?"
+			// are unchanged.
+			return Bead{}, fmt.Errorf("getting bead %q: %w: %w", id, ErrVerifyIndeterminate, ferr)
+		} else if found {
+			return b, nil
 		}
 		return Bead{}, fmt.Errorf("getting bead %q: %w", id, ErrNotFound)
 	}
@@ -1425,6 +1416,15 @@ func (s *BdStore) Get(id string) (Bead, error) {
 		return Bead{}, fmt.Errorf("bd show: parsing JSON: %w", err)
 	}
 	if len(issues) == 0 {
+		// bd show returning an empty set is evidence about the ISSUES table
+		// only — it never looks at wisps. Consult the wisp tier before
+		// concluding absence, or an ephemeral bead that exists reads as gone
+		// (ga-0ejdbv).
+		if b, found, ferr := s.wispFallback(id); ferr != nil {
+			return Bead{}, fmt.Errorf("getting bead %q: %w: %w", id, ErrVerifyIndeterminate, ferr)
+		} else if found {
+			return b, nil
+		}
 		return Bead{}, fmt.Errorf("getting bead %q: %w", id, ErrNotFound)
 	}
 	bead := issues[0].toBead()
@@ -1439,6 +1439,17 @@ func (s *BdStore) Get(id string) (Bead, error) {
 		// Return ErrIDCollision so mutation guards can distinguish this from a
 		// plain absent bead. ErrIDCollision wraps ErrNotFound so existing
 		// errors.Is(err, ErrNotFound) callers remain unaffected.
+		// The collision is a statement about the issues table. The requested ID
+		// may still exist in the wisp tier, which bd show never consulted.
+		if b, found, ferr := s.wispFallback(id); ferr != nil {
+			// Carry BOTH: the collision is a real finding about the issues table
+			// that mutation guards rely on, and the failed wisp lookup means the
+			// requested ID's absence is still unproven. Multi-%w keeps
+			// errors.Is true for each, so no existing caller loses information.
+			return Bead{}, fmt.Errorf("getting bead %q (resolved to %q): %w: %w: %w", id, bead.ID, ErrIDCollision, ErrVerifyIndeterminate, ferr)
+		} else if found {
+			return b, nil
+		}
 		return Bead{}, fmt.Errorf("getting bead %q (resolved to %q): %w", id, bead.ID, ErrIDCollision)
 	}
 	return bead, nil
@@ -3012,6 +3023,33 @@ func isWispQueryableID(id string) bool {
 		}
 	}
 	return true
+}
+
+// wispFallback resolves id against the wisp tier, which bd show cannot see.
+// It reports (bead, true, nil) on a hit, (_, false, nil) when the lookup
+// COMPLETED and the row is absent, and (_, false, err) when the lookup could
+// not be completed at all. Keeping those three outcomes distinct is the whole
+// point: a caller that cannot tell "looked and found nothing" from "could not
+// look" will eventually report one as the other (ga-0ejdbv). Every not-found
+// exit in Get routes through here so none of them can conclude absence from a
+// table that was never queried.
+// The returned error is the RAW lookup failure, not a finished Get error: each
+// not-found exit composes its own, so an exit that owes the caller a more
+// specific sentinel (ErrIDCollision) can carry both.
+func (s *BdStore) wispFallback(id string) (Bead, bool, error) {
+	if !isWispQueryableID(id) {
+		return Bead{}, false, nil
+	}
+	wisps, queryErr := s.getEphemeralByID(id)
+	if queryErr != nil {
+		return Bead{}, false, queryErr
+	}
+	for _, b := range wisps {
+		if b.ID == id {
+			return b, true, nil
+		}
+	}
+	return Bead{}, false, nil
 }
 
 func (s *BdStore) getEphemeralByID(id string) ([]Bead, error) {
