@@ -4877,6 +4877,85 @@ func TestCityRuntimeTickJudgesPoolDeathByPreReloadHandlers(t *testing.T) {
 	}
 }
 
+// TestCityRuntimeTickJudgesPoolLivenessByPreReloadProvider pins that pool
+// liveness is read from the session provider in force before a config reload,
+// together with the handler set captured there. A reload that swaps the session
+// provider stops the old provider's sessions and leaves the tick holding a new
+// provider that lists none of them; comparing the pre-reload handlers with that
+// listing mistakes a session that was running when the tick began for a death,
+// and the default on_death hook releases its in_progress claims.
+func TestCityRuntimeTickJudgesPoolLivenessByPreReloadProvider(t *testing.T) {
+	t.Setenv("GC_SESSION", "")
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	hookOutput := filepath.Join(cityPath, "on-death-runs")
+	poolTOML := "[[agent]]\nname = \"worker\"\nstart_command = \"true\"\n" +
+		"min_active_sessions = 0\nmax_active_sessions = 2\n" +
+		"on_death = \"echo fired >> " + shellQuotePath(hookOutput) + "\"\n"
+	writeConfig := func(provider, body string) {
+		t.Helper()
+		clearInheritedBeadsEnv(t)
+		requireNoLeakedDoltAfterForPaths(t, cityPath)
+		data := "[workspace]\nname = \"test-city\"\n\n[beads]\nprovider = \"file\"\n\n[session]\nprovider = \"" + provider + "\"\n\n" + body
+		if err := os.WriteFile(tomlPath, []byte(data), 0o644); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+	}
+	// The pre-reload provider is a fake standing in for tmux: the tick reaches
+	// sessions only through cr.sp, and lastProviderName names what it runs.
+	writeConfig("tmux", poolTOML)
+	cfg, err := config.Load(osFS{}, tomlPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	const liveSession = "worker-1"
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), liveSession, runtime.Config{}); err != nil {
+		t.Fatalf("start %s: %v", liveSession, err)
+	}
+	cr := newTestCityRuntime(t, CityRuntimeParams{
+		CityPath: cityPath, CityName: "test-city", TomlPath: tomlPath,
+		Cfg: cfg, SP: sp, Dops: newDrainOps(sp), Rec: events.Discard,
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		Stdout: io.Discard, Stderr: io.Discard,
+	})
+	cs := newControllerState(context.Background(), cfg, sp, events.NewFake(), "test-city", cityPath)
+	cs.cityBeadStore = beads.NewMemStore()
+	cr.setControllerState(cs)
+
+	cr.poolDeathHandlers = computePoolDeathHandlers(cfg, "test-city", cityPath, sp, io.Discard)
+	if _, ok := cr.poolDeathHandlers[liveSession]; !ok {
+		t.Fatalf("pre-reload handlers %v have no entry for %s", cr.poolDeathHandlers, liveSession)
+	}
+	previousRunning := map[string]bool{liveSession: true}
+
+	// The reloaded config selects another provider, so the reload builds a new,
+	// empty fake and stops the pre-reload provider's sessions.
+	writeConfig("fake", poolTOML+"\n[daemon]\nshutdown_timeout = \"0s\"\n")
+	var dirty atomic.Bool
+	dirty.Store(true)
+	lastProviderName := "tmux"
+
+	cr.tick(context.Background(), &dirty, &lastProviderName, cityPath, &previousRunning, "pool-liveness-provider-swap-test")
+
+	if lastProviderName != "fake" || cr.sp == sp {
+		t.Fatalf("reload did not swap the session provider (lastProviderName = %q), so this fixture no longer tests a swap", lastProviderName)
+	}
+	if cr.sp.IsRunning(liveSession) {
+		t.Fatalf("the post-reload provider lists %s, so this fixture no longer tests a provider that lost it", liveSession)
+	}
+	data, err := os.ReadFile(hookOutput)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read on_death output: %v", err)
+	}
+	if got := strings.Count(string(data), "fired"); got != 0 {
+		t.Errorf("on_death hook for %s ran %d times, want 0: it was running when the tick began, and only the reload's provider swap lost it", liveSession, got)
+	}
+}
+
 func TestCityRuntimeReloadProviderSwapFailsOnPartialSessionListing(t *testing.T) {
 	cityPath := t.TempDir()
 	tomlPath := filepath.Join(cityPath, "city.toml")
