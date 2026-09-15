@@ -71,7 +71,32 @@ jobs:
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
         with:
           go-version-file: go.mod
-      - uses: ./.github/actions/go-mod-warm
+      # Inline, not ./.github/actions/go-mod-warm: a dispatched rebuild runs the
+      # local action from the TAG's tree, so a unit's build must not depend on
+      # that copy. -modfile points the download at a scratch go.mod/go.sum pair:
+      # `go mod download all` records sums for the whole graph, and against the
+      # tracked go.sum that is +607 lines, which the Makefile stamps as -dirty
+      # and the verify step below refuses (fleet/2026-09-15, run 34936741944).
+      - name: Warm the Go module cache without touching the tracked go.sum
+        run: |
+          set -uo pipefail
+          scratch="$(mktemp -d)"
+          cp go.mod "$scratch/go.mod"
+          cp go.sum "$scratch/go.sum"
+          attempt=1
+          until go mod download -modfile="$scratch/go.mod" all; do
+            if [ "$attempt" -ge 3 ]; then
+              echo "go mod download all failed after $attempt attempts" >&2
+              exit 1
+            fi
+            sleep $((attempt * 10))
+            attempt=$((attempt + 1))
+          done
+          if [ -n "$(git status --porcelain)" ]; then
+            git status --porcelain >&2
+            echo "the warm step changed the checkout" >&2
+            exit 1
+          fi
       - name: Build the unit
         env:
           GOFLAGS: -tags=gms_pure_go
