@@ -29,6 +29,14 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// Exit codes for the mail read-after-write guard. Distinct from the generic 1
+// so scripts can tell "definitely lost, re-send" from "unknown, go check"
+// without parsing stderr (ga-0ejdbv).
+const (
+	mailSendNotPersistedExit = 5
+	mailSendUnconfirmedExit  = 6
+)
+
 // nudgeFunc is an optional callback for nudging an agent after sending or
 // replying to mail. When non-nil, it is called with the recipient name and
 // the ID of the message the nudge announces. messageID lets the queued nudge
@@ -2062,6 +2070,22 @@ func doMailSendJSON(mp mail.Provider, rec events.Recorder, validRecipients map[s
 	}
 	telemetry.RecordMailOp(context.Background(), "send", err)
 	if err != nil {
+		// The two read-after-write verdicts get distinct exits and distinct
+		// instructions on purpose: a VERIFIED-ABSENT message must be re-sent,
+		// while an UNCONFIRMED one may well have landed and must be checked
+		// first — collapsing them would turn every slow verification into
+		// duplicate control-channel traffic under load (ga-0ejdbv).
+		switch {
+		case errors.Is(err, beadmail.ErrNotPersisted):
+			fmt.Fprintf(stderr, "gc mail send: NOT DELIVERED — %v\n", err)                           //nolint:errcheck // best-effort stderr
+			fmt.Fprintln(stderr, "hint: no message bead exists for this send; re-send the message.") //nolint:errcheck // best-effort stderr
+			return mailSendNotPersistedExit
+		case errors.Is(err, beadmail.ErrUnconfirmed):
+			fmt.Fprintf(stderr, "gc mail send: DELIVERY UNCONFIRMED — %v\n", err)                                    //nolint:errcheck // best-effort stderr
+			fmt.Fprintln(stderr, "hint: the write may have landed. Confirm with \"gc bd show <message-id>\" before") //nolint:errcheck // best-effort stderr
+			fmt.Fprintln(stderr, "      re-sending; gc bd show answers correctly whether or not it was archived.")   //nolint:errcheck // best-effort stderr
+			return mailSendUnconfirmedExit
+		}
 		fmt.Fprintf(stderr, "gc mail send: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
