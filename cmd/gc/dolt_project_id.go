@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -20,7 +19,6 @@ import (
 	"github.com/gastownhall/gascity/internal/doltpool"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/fsys"
-	mysql "github.com/go-sql-driver/mysql"
 	"github.com/spf13/cobra"
 )
 
@@ -509,16 +507,20 @@ func managedDoltOpenDatabase(host, port, user, database string) (*sql.DB, error)
 	return doltpool.Open(host, port, user, managedDoltPassword(host, port), database)
 }
 
+// managedDoltPrivateDialTimeout bounds the dial and each read and write on a
+// private managed-Dolt handle (managedDoltOpenDatabaseAuthed).
+const managedDoltPrivateDialTimeout = 5 * time.Second
+
 // managedDoltOpenDatabaseAuthed opens a database handle with an explicitly
 // resolved password (doltauth.Resolve for the owning scope). An empty password
 // keeps the managed-ambient behavior: managedDoltPassword is endpoint-bound and
 // returns empty for anything but the local managed server.
 //
-// Unlike managedDoltOpenDatabase, the handle is PRIVATE and the caller must
-// Close it. Its one caller, the session-liveness binding, retires its handle
-// on a transport error and re-resolves the endpoint (a managed-Dolt rebind
-// moves the port). Closing a shared doltpool handle would poison that pool
-// entry for every other gc SQL path dialing the same endpoint.
+// Unlike managedDoltOpenDatabase, the handle is PRIVATE (doltpool.OpenPrivate)
+// and the caller must Close it. Its one caller, the session-liveness binding,
+// retires its handle on a transport error and re-resolves the endpoint (a
+// managed-Dolt rebind moves the port). Closing a shared doltpool handle would
+// poison that pool entry for every other gc SQL path dialing the same endpoint.
 func managedDoltOpenDatabaseAuthed(host, port, user, password, database string) (*sql.DB, error) {
 	host, port, user, database, err := normalizeManagedDoltDatabaseDial(host, port, user, database)
 	if err != nil {
@@ -527,17 +529,7 @@ func managedDoltOpenDatabaseAuthed(host, port, user, password, database string) 
 	if strings.TrimSpace(password) == "" {
 		password = managedDoltPassword(host, port)
 	}
-	cfg := mysql.NewConfig()
-	cfg.User = user
-	cfg.Passwd = password
-	cfg.Net = "tcp"
-	cfg.Addr = net.JoinHostPort(host, port)
-	cfg.DBName = database
-	cfg.Timeout = 5 * time.Second
-	cfg.ReadTimeout = 5 * time.Second
-	cfg.WriteTimeout = 5 * time.Second
-	cfg.AllowNativePasswords = true
-	return sql.Open("mysql", cfg.FormatDSN())
+	return doltpool.OpenPrivate(host, port, user, password, database, managedDoltPrivateDialTimeout)
 }
 
 // normalizeManagedDoltDatabaseDial applies the managed-Dolt dial defaults
