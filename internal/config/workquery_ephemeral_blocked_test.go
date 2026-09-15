@@ -117,18 +117,27 @@ func TestEphemeralInProgressProbeGatesOnReadiness(t *testing.T) {
 // city to bd>=1.0.5 ready semantics does not close the hole. The ephemeral
 // READY probe disables itself under those semantics (bd ready
 // --include-ephemeral covers it); the in_progress probe keeps running ungated.
+//
+// Under bd>=1.0.5 semantics the probe pushes the assignee into a bounded
+// server-side bd query (ga-2s6k), so the two forms now differ. Whichever form
+// runs must keep the readiness gate.
 func TestEphemeralInProgressProbeIgnoresBD105Semantics(t *testing.T) {
 	legacy := ephemeralAssignedInProgressProbeScript("id", QueryTopology{})
 	modern := ephemeralAssignedInProgressProbeScript("id", QueryTopology{Beads: BeadsConfig{BDCompatibility: BeadsBDCompatibility105}})
 
-	if legacy != modern {
-		t.Skip("in_progress probe now varies with bd ready semantics; revisit this pin")
-	}
-	if strings.TrimSpace(modern) == "" {
-		return // probe disabled under modern semantics — hole closed
-	}
-	if !strings.Contains(modern, "blocked_by") && !strings.Contains(modern, "dependencies") {
-		t.Errorf("under bd>=1.0.5 ready semantics the ephemeral in_progress probe "+
-			"still runs with no readiness gate:\n%s", modern)
+	for _, probe := range []struct {
+		semantics string
+		script    string
+	}{
+		{semantics: "bd<1.0.5", script: legacy},
+		{semantics: "bd>=1.0.5", script: modern},
+	} {
+		if strings.TrimSpace(probe.script) == "" {
+			continue // probe disabled under these semantics — hole closed
+		}
+		if !strings.Contains(probe.script, "blocked_by") && !strings.Contains(probe.script, "dependencies") {
+			t.Errorf("under %s ready semantics the ephemeral in_progress probe "+
+				"still runs with no readiness gate:\n%s", probe.semantics, probe.script)
+		}
 	}
 }

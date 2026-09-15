@@ -1166,6 +1166,7 @@ export const zAgentPatch = z.object({
     TmuxAlias: z.string().nullable(),
     Upstream: z.string().nullable(),
     WakeMode: z.string().nullable(),
+    WakeTransport: z.string().nullable(),
     WorkDir: z.string().nullable()
 });
 
@@ -3019,9 +3020,11 @@ export const zSessionResponse = z.object({
     agent_kind: z.string().optional(),
     alias: z.string().optional(),
     attached: z.boolean(),
-    configured_named_session: z.boolean().optional(),
+    base_state: z.string(),
+    configured_named_session: z.boolean(),
     context_pct: z.coerce.bigint().min(BigInt('-9223372036854775808'), { error: 'Invalid value: Expected int64 to be >= -9223372036854775808' }).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }).optional(),
     context_window: z.coerce.bigint().min(BigInt('-9223372036854775808'), { error: 'Invalid value: Expected int64 to be >= -9223372036854775808' }).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }).optional(),
+    control_plane: z.boolean(),
     created_at: z.string(),
     display_name: z.string().optional(),
     id: z.string(),
@@ -3031,13 +3034,16 @@ export const zSessionResponse = z.object({
     last_output: z.string().optional(),
     metadata: z.record(z.string(), z.string()).optional(),
     model: z.string().optional(),
+    navigator_schema_version: z.string(),
     options: z.record(z.string(), z.string()).optional(),
     pool: z.string().optional(),
+    pool_managed: z.boolean(),
     provider: z.string(),
     reason: z.string().optional(),
     rig: z.string().optional(),
     running: z.boolean(),
     session_name: z.string(),
+    session_origin: z.string().optional(),
     state: z.string(),
     submission_capabilities: zSubmissionCapabilities.optional(),
     template: z.string(),
@@ -4725,6 +4731,24 @@ export const zTypedEventStreamEnvelopeSessionColdStartTimeout = z.object({
 });
 
 /**
+ * TypedEventStreamEnvelope session.config_drift_wave
+ */
+export const zTypedEventStreamEnvelopeSessionConfigDriftWave = z.object({
+    actor: z.string(),
+    depends_on_step_ids: z.array(z.string()).optional(),
+    message: z.string().optional(),
+    payload: zNoPayload,
+    run_id: z.string().optional(),
+    seq: z.coerce.bigint().gte(BigInt(0)).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }),
+    session_id: z.string().optional(),
+    step_id: z.string().optional(),
+    subject: z.string().optional(),
+    ts: z.iso.datetime(),
+    type: z.literal('session.config_drift_wave'),
+    workflow: zWorkflowEventProjection.optional()
+});
+
+/**
  * TypedEventStreamEnvelope session.crashed
  */
 export const zTypedEventStreamEnvelopeSessionCrashed = z.object({
@@ -5339,6 +5363,7 @@ export const zTypedEventStreamEnvelope = z.discriminatedUnion('type', [
     zTypedEventStreamEnvelopeRequestResultSessionSubmit.extend({ type: z.literal('request.result.session.submit') }),
     zTypedEventStreamEnvelopeRigProvisionProgress.extend({ type: z.literal('rig.provision.progress') }),
     zTypedEventStreamEnvelopeSessionColdStartTimeout.extend({ type: z.literal('session.cold_start_timeout') }),
+    zTypedEventStreamEnvelopeSessionConfigDriftWave.extend({ type: z.literal('session.config_drift_wave') }),
     zTypedEventStreamEnvelopeSessionCrashed.extend({ type: z.literal('session.crashed') }),
     zTypedEventStreamEnvelopeSessionDemandClaimDivergence.extend({ type: z.literal('session.demand_claim_divergence') }),
     zTypedEventStreamEnvelopeSessionDrainAckedWithAssignedWork.extend({ type: z.literal('session.drain_acked_with_assigned_work') }),
@@ -6711,6 +6736,25 @@ export const zTypedTaggedEventStreamEnvelopeSessionColdStartTimeout = z.object({
 });
 
 /**
+ * TypedTaggedEventStreamEnvelope session.config_drift_wave
+ */
+export const zTypedTaggedEventStreamEnvelopeSessionConfigDriftWave = z.object({
+    actor: z.string(),
+    city: z.string(),
+    depends_on_step_ids: z.array(z.string()).optional(),
+    message: z.string().optional(),
+    payload: zNoPayload,
+    run_id: z.string().optional(),
+    seq: z.coerce.bigint().gte(BigInt(0)).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }),
+    session_id: z.string().optional(),
+    step_id: z.string().optional(),
+    subject: z.string().optional(),
+    ts: z.iso.datetime(),
+    type: z.literal('session.config_drift_wave'),
+    workflow: zWorkflowEventProjection.optional()
+});
+
+/**
  * TypedTaggedEventStreamEnvelope session.crashed
  */
 export const zTypedTaggedEventStreamEnvelopeSessionCrashed = z.object({
@@ -7355,6 +7399,7 @@ export const zTypedTaggedEventStreamEnvelope = z.discriminatedUnion('type', [
     zTypedTaggedEventStreamEnvelopeRequestResultSessionSubmit.extend({ type: z.literal('request.result.session.submit') }),
     zTypedTaggedEventStreamEnvelopeRigProvisionProgress.extend({ type: z.literal('rig.provision.progress') }),
     zTypedTaggedEventStreamEnvelopeSessionColdStartTimeout.extend({ type: z.literal('session.cold_start_timeout') }),
+    zTypedTaggedEventStreamEnvelopeSessionConfigDriftWave.extend({ type: z.literal('session.config_drift_wave') }),
     zTypedTaggedEventStreamEnvelopeSessionCrashed.extend({ type: z.literal('session.crashed') }),
     zTypedTaggedEventStreamEnvelopeSessionDemandClaimDivergence.extend({ type: z.literal('session.demand_claim_divergence') }),
     zTypedTaggedEventStreamEnvelopeSessionDrainAckedWithAssignedWork.extend({ type: z.literal('session.drain_acked_with_assigned_work') }),

@@ -120,6 +120,14 @@
           ],
           "description": "Session overrides the session transport for this agent.\n\"\" (default) uses the city-level session provider (typically tmux).\n\"acp\" uses the Agent Client Protocol (JSON-RPC over stdio).\nThe agent's resolved provider must have supports_acp = true."
         },
+        "wake_transport": {
+          "type": "string",
+          "enum": [
+            "session",
+            "claude-cloud"
+          ],
+          "description": "WakeTransport selects this seat's notification-plane wake transport\n(claudemsg-bridge-design.md §4). \"\" and \"session\" mean today's\nworker.Handle wait-idle/queued path, byte-for-byte. \"claude-cloud\"\n(ga-bjbaui) delivers wake hints into a bound Claude Code cloud\nsession. Selection is structural per-seat configuration validated at\nload — never a runtime capability probe; a seat whose harness lacks\nthe selected transport is a config error, not a silent fallback.\n(Distinct from WakeMode, which controls resume-vs-fresh on wake.)"
+        },
         "provider": {
           "type": "string",
           "description": "Provider names the provider preset to use for this agent."
@@ -496,6 +504,10 @@
           "type": "string",
           "description": "Session overrides the session transport (\"acp\")."
         },
+        "wake_transport": {
+          "type": "string",
+          "description": "WakeTransport overrides the seat's notification-plane wake transport\n(\"session\" or \"claude-cloud\"; see Agent.WakeTransport)."
+        },
         "provider": {
           "type": "string",
           "description": "Provider overrides the provider name."
@@ -792,6 +804,10 @@
         "session": {
           "type": "string",
           "description": "Session overrides the session transport (\"acp\" or \"tmux\")."
+        },
+        "wake_transport": {
+          "type": "string",
+          "description": "WakeTransport overrides the seat's notification-plane wake transport\n(\"session\" or \"claude-cloud\"; see Agent.WakeTransport)."
         },
         "provider": {
           "type": "string",
@@ -1457,6 +1473,11 @@
           "type": "integer",
           "description": "AutoReapClosedBeadWorktreesMinAgeMinutes is the minimum worktree age,\nin minutes, before a closed-bead worktree becomes eligible for reap\nclassification at all (borrow-veto scan and beyond). This quarantines\na worktree against the race between its creation and its owning\nbead's gc.work_dir/work_dir metadata being stamped by the next\nreconcile pass — without it, a just-created worktree could look\nunclaimed to the borrow-veto scan before the metadata that would\nprotect it has been written. Nil (unset) defaults to\nDefaultAutoReapClosedBeadWorktreesMinAgeMinutes. Zero disables the\nquarantine entirely (every closed-bead worktree is immediately\neligible for the rest of the gate chain, regardless of age).",
           "default": 10
+        },
+        "auto_reap_stopped_agent_homes": {
+          "type": "boolean",
+          "description": "AutoReapStoppedAgentHomes controls whether the reconciler removes closed,\nstopped configured named/namepool worktree homes. The reaper fails closed\nunless runtime/session and assignment snapshots are available, and requires\na clean registered worktree with no unpushed commits, stashes, or nested\nregistered worktrees. Defaults to false.",
+          "default": false
         },
         "start_ready_timeout": {
           "type": "string",
@@ -2605,6 +2626,10 @@
           "type": "string",
           "description": "DefaultBranch is the rig repository's mainline branch (e.g. \"main\",\n\"master\", \"develop\"). When set, routing formulas use this as the\ndefault merge target instead of probing origin/HEAD at sling time.\nCaptured by `gc rig add` from the rig's git config; set manually for\nrigs whose mainline isn't reachable via origin/HEAD."
         },
+        "default_merge_strategy": {
+          "type": "string",
+          "description": "DefaultMergeStrategy is the merge_strategy metadata written to a\nbead slung to this rig's agents when --merge is not passed (e.g.\n\"pr\" for rigs whose mainline only accepts changes through pull\nrequests). Empty writes no metadata, so downstream formulas apply\ntheir own default — the gastown refinery assumes \"direct\", which\na protected mainline rejects at push time."
+        },
         "suspended": {
           "type": "boolean",
           "description": "Suspended is the deprecated pre-runtime-state suspension flag.\nParsed for backwards compatibility and treated as an alias for\nSuspendedOnStart by [Rig.EffectiveSuspendedOnStart], so existing\ncities with `suspended = true` continue to start their rigs\nsuspended after upgrade. Live suspend/resume commands no longer\nwrite this field. `gc doctor` flags it and offers `--fix` to\nrename to suspended_on_start."
@@ -2634,6 +2659,10 @@
         "max_active_sessions": {
           "type": "integer",
           "description": "MaxActiveSessions is the rig-level cap on total concurrent sessions across\nall agents in this rig. Nil means inherit from workspace (or unlimited)."
+        },
+        "orphan_release": {
+          "type": "boolean",
+          "description": "OrphanRelease controls whether the controller's in-process pool orphan\nsweeper (releaseOrphanedPoolAssignments) may clear assignees and reopen\nwork in THIS rig's bead store. Nil means enabled, which is the behavior\nevery city had before the knob existed; set false to stop the sweeper\nwriting to this rig without suspending it.\n\nThe lever exists for cutovers where a rig's store is shared with another\ncity and every autonomous writer has to be quiesced (ga-h5435p). It is\nrig config rather than an environment variable on purpose: the sweeper\nruns inside the long-lived supervisor, so an env knob could only be\nthrown by restarting that process, which can strand every session in the\ncity (ga-4v3ckk) — the worst possible move mid-cutover.\n\nTurning it off stops orphan RECOVERY for the rig too: work whose claimant\ndied stays claimed until the knob comes back. That is the intended\ntrade for a cutover window, not a setting to leave off indefinitely."
         },
         "overrides": {
           "items": {
@@ -2882,8 +2911,8 @@
         },
         "startup_timeout": {
           "type": "string",
-          "description": "StartupTimeout is how long to wait for each agent's Start() call before\ntreating it as failed. Duration string (e.g., \"60s\", \"2m\"). Defaults to \"60s\".",
-          "default": "60s"
+          "description": "StartupTimeout is how long to wait for each agent's Start() call before\ntreating it as failed. Duration string (e.g., \"60s\", \"5m\"). Defaults to\n\"300s\" — generous by design (ga-fcdvn): at 60s this deadline killed\nhealthy agents whose stacked MCP-server connects outlasted the budget,\nand the reconciler then restarted them in a 60s loop (37 kill cycles in\n~35 minutes, taking down a merge-queue consumer). A start that is merely\nslow must not be treated as failed; a truly dead start still fails, just\nlater, and the retry loop is 5x cheaper. The herdr provider derives its\ninner `agent start --timeout` from this same deadline, so the two bounds\ncannot invert.",
+          "default": "300s"
         },
         "progress_stall_timeout": {
           "type": "string",
@@ -2900,6 +2929,10 @@
         "remote_match": {
           "type": "string",
           "description": "RemoteMatch is a substring pattern for the hybrid provider to route\nsessions to the remote (K8s) backend. Sessions whose names contain\nthis pattern go to K8s; all others stay local (tmux).\nOverridden by the GC_HYBRID_REMOTE_MATCH env var if set."
+        },
+        "drift_wave_notify": {
+          "type": "string",
+          "description": "DriftWaveNotify is the mail recipient for config-drift wave notices:\nwhen more sessions need config-drift restarts in one tick than the\nper-tick budget allows, the reconciler mails this address once per\nwave (plus periodic reminders while the wave keeps rolling) so a\ncoordinator sees a roster-wide roll in progress. Empty disables the\nmail; the session.config_drift_wave event and stderr notice always\nfire regardless."
         }
       },
       "additionalProperties": false,
