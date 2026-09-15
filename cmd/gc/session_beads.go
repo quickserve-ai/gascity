@@ -982,6 +982,9 @@ func sessionAssignmentIdentifiers(sessionBead beads.Bead) []string {
 // sessionAssigneeMatches and compute_awake_bridge's AwakeNamedSession fields.
 func sessionAssignmentIdentifiersForConfig(sessionBead beads.Bead, cfg *config.City) []string {
 	raw := sessionAssignmentIdentifierRaw(sessionBead)
+	if sessionAliasIsTransientPoolSlot(cfg, sessionBead.Metadata["pool_slot"], sessionBead.Metadata["template"]) {
+		raw = raw[:len(raw)-1] // the alias is sessionAssignmentIdentifierRaw's last entry
+	}
 	if cfg == nil ||
 		strings.TrimSpace(sessionBead.Metadata[namedSessionMetadataKey]) != "true" ||
 		strings.TrimSpace(sessionBead.Metadata[namedSessionIdentityMetadata]) != "" {
@@ -1036,6 +1039,9 @@ func sessionAssignmentIdentifierRaw(sessionBead beads.Bead) []string {
 // byte-identical to the raw form (TestSessionClassifierInfoEquivalence pins it).
 func sessionAssignmentIdentifiersForConfigInfo(info session.Info, cfg *config.City) []string {
 	raw := sessionAssignmentIdentifierRawInfo(info)
+	if sessionAliasIsTransientPoolSlot(cfg, info.PoolSlot, info.Template) {
+		raw = raw[:len(raw)-1] // the alias is sessionAssignmentIdentifierRawInfo's last entry
+	}
 	if cfg == nil ||
 		!info.ConfiguredNamedSession ||
 		strings.TrimSpace(info.ConfiguredNamedIdentity) != "" {
@@ -1076,6 +1082,24 @@ func sessionAssignmentIdentifierRawInfo(info session.Info) []string {
 		// Mirrors the alias arm in sessionAssignmentIdentifierRaw; see there.
 		strings.TrimSpace(info.Alias),
 	}
+}
+
+// sessionAliasIsTransientPoolSlot reports whether the alias of a session holding
+// pool slot poolSlot of template is a rebinding slot label rather than a name
+// for the session. A pool identified by numbered slots
+// (usesTransientPoolSlotIdentity) hands a slot to a fresh session whenever its
+// holder dies, so work assigned to the slot alias names no occupant, and
+// honoring it lets a fresh session shield or inherit a dead holder's claim
+// (TestAssignmentGuardsIgnoreTransientPoolSlotAliases). Only a bead minted
+// before pool slots were unaliased still carries such an alias. A namepool
+// name, a canonical singleton, or a named session keeps its alias as an
+// assignment identity (ga-rht4v5), and so does any session whose slot is blank
+// or whose template does not resolve against cfg.
+func sessionAliasIsTransientPoolSlot(cfg *config.City, poolSlot, template string) bool {
+	if strings.TrimSpace(poolSlot) == "" {
+		return false
+	}
+	return usesTransientPoolSlotIdentity(findAgentByTemplate(cfg, template))
 }
 
 // sessionAssignmentIdentifiersInfo is the session.Info form of
