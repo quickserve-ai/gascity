@@ -2103,12 +2103,15 @@ func (cr *CityRuntime) reloadConfigTraced(
 	if configName == "" {
 		configName = cr.cityName
 	}
+	// A store preflight failure other than schema skew refuses the reload only
+	// after the config parse: opening the city store reads city.toml, so an
+	// unparsable city.toml fails the preflight too, and its store error would
+	// hide the parse error the operator has to fix.
+	var preflightFailure error
 	if cr.cs != nil {
 		diag, preflightErr := cr.cs.preflightCityStoreReload()
 		if preflightErr != nil {
-			err := fmt.Errorf("config reload: preflight city bead store: %w", preflightErr)
-			telemetry.RecordConfigReload(ctx, "", string(source), string(reloadOutcomeFailed), len(warnings), err)
-			return reloadControlReply{Outcome: reloadOutcomeFailed, Error: err.Error(), Warnings: warnings}
+			preflightFailure = fmt.Errorf("config reload: preflight city bead store: %w", preflightErr)
 		}
 		if diag != nil && beads.IsSchemaSkewDiagnostic(*diag) {
 			cr.preserveSessionsOnShutdown()
@@ -2139,6 +2142,10 @@ func (cr *CityRuntime) reloadConfigTraced(
 			Error:    err.Error(),
 			Warnings: warnings,
 		}
+	}
+	if preflightFailure != nil {
+		telemetry.RecordConfigReload(ctx, "", string(source), string(reloadOutcomeFailed), len(warnings), preflightFailure)
+		return reloadControlReply{Outcome: reloadOutcomeFailed, Error: preflightFailure.Error(), Warnings: warnings}
 	}
 	for _, warning := range result.Warnings {
 		appendWarning(warning)
