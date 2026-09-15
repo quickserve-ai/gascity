@@ -148,6 +148,13 @@ func buildAwakeInputFromReconcilerWithObservationErrors(
 		lcInput := session.LifecycleInputFromInfo(info)
 		lcInput.Now = clk
 		lifecycle := session.ProjectLifecycle(lcInput)
+		// A transient pool slot alias names whichever session held the slot, not
+		// this one, so a claim under it must not read as this session's assigned
+		// work (the drain guards apply the same rule).
+		alias := strings.TrimSpace(info.Alias)
+		if sessionAliasIsTransientPoolSlot(cfg, info.PoolSlot, info.Template) {
+			alias = ""
+		}
 		bead := AwakeSessionBead{
 			ID:          info.ID,
 			SessionName: name,
@@ -162,7 +169,7 @@ func buildAwakeInputFromReconcilerWithObservationErrors(
 			ExplicitWake:           lifecycle.HasWakeCause(session.WakeCauseExplicit),
 			DependencyOnly:         info.DependencyOnly,
 			NamedIdentity:          lifecycle.NamedIdentity,
-			Alias:                  strings.TrimSpace(info.Alias),
+			Alias:                  alias,
 			ConfiguredNamedSession: isNamedSessionInfo(info),
 			Pinned:                 lifecycle.HasWakeCause(session.WakeCausePinned),
 			Drained:                lifecycle.BaseState == session.BaseStateDrained,
