@@ -1403,11 +1403,18 @@ func (s *BdStore) Get(id string) (Bead, error) {
 		// must not leak into a supplemental wisp query.
 		if isWispQueryableID(id) {
 			wisps, queryErr := s.getEphemeralByID(id)
-			if queryErr == nil {
-				for _, b := range wisps {
-					if b.ID == id {
-						return b, nil
-					}
+			if queryErr != nil {
+				// The wisp leg did not complete — the bd query subprocess failed,
+				// timed out, or is unsupported by this bd. Absence is UNPROVEN:
+				// reporting a bare ErrNotFound here would let a caller read a
+				// timed-out verification as "the row is not there" (ga-0ejdbv).
+				// ErrVerifyIndeterminate still satisfies errors.Is(ErrNotFound),
+				// so callers that only ask "is it missing?" are unchanged.
+				return Bead{}, fmt.Errorf("getting bead %q: %w: %w", id, ErrVerifyIndeterminate, queryErr)
+			}
+			for _, b := range wisps {
+				if b.ID == id {
+					return b, nil
 				}
 			}
 		}
@@ -3013,7 +3020,12 @@ func (s *BdStore) getEphemeralByID(id string) ([]Bead, error) {
 	out, err := s.runner(s.dir, "bd", args...)
 	if err != nil {
 		if isBdQueryUnsupported(err) {
-			return nil, nil
+			// A bd without "query" cannot answer the wisp question at all. This
+			// used to return (nil, nil), which the caller read as an empty —
+			// i.e. authoritative — result set, turning "I never looked" into
+			// "it is not there". Report it as an error so Get can classify the
+			// lookup as indeterminate (ga-0ejdbv). Get is the only caller.
+			return nil, fmt.Errorf("bd query (wisp by id): unsupported by this bd: %w", err)
 		}
 		return nil, fmt.Errorf("bd query (wisp by id): %w", err)
 	}
