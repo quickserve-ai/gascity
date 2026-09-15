@@ -1250,42 +1250,66 @@ func convergenceStartupComplete(cr *CityRuntime) bool {
 	return true
 }
 
+// poolDeathObservation is one reading of pool liveness: the on_death handler
+// set in force and the sessions its provider listed as running, taken together
+// so a config reload cannot replace one without the other.
+type poolDeathObservation struct {
+	handlers map[string]poolDeathInfo
+	running  map[string]bool
+	listErr  error
+}
+
 // reconcilePoolDeaths detects pool instances that stopped since the prior
 // reconciliation and runs their configured death hooks.
 func (cr *CityRuntime) reconcilePoolDeaths(prevPoolRunning *map[string]bool) {
-	cr.reconcilePoolDeathsWith(cr.publishedPoolDeathHandlers(), prevPoolRunning)
+	cr.actOnPoolDeaths(cr.observePoolDeaths(), prevPoolRunning)
 }
 
-// reconcilePoolDeathsWith is reconcilePoolDeaths against an explicit handler
-// set. tick passes the set it captured before a config reload, so a death is
-// judged by the handlers in force when it happened.
-func (cr *CityRuntime) reconcilePoolDeathsWith(handlers map[string]poolDeathInfo, prevPoolRunning *map[string]bool) {
-	if len(handlers) == 0 {
+// observePoolDeaths reads pool liveness from the current handler set and
+// session provider. It lists no sessions when no pool declares a death hook.
+func (cr *CityRuntime) observePoolDeaths() poolDeathObservation {
+	obs := poolDeathObservation{handlers: cr.publishedPoolDeathHandlers()}
+	if len(obs.handlers) == 0 {
+		return obs
+	}
+	names, err := cr.sp.ListRunning("")
+	if err != nil {
+		obs.listErr = err
+		return obs
+	}
+	obs.running = make(map[string]bool, len(names))
+	for _, name := range names {
+		obs.running[name] = true
+	}
+	return obs
+}
+
+// actOnPoolDeaths runs the on_death hook of every pool instance that
+// prevPoolRunning recorded as running and obs no longer lists, then resets
+// prevPoolRunning from obs. A failed listing runs no hook and keeps
+// prevPoolRunning, so an instance is never judged dead from a partial list.
+func (cr *CityRuntime) actOnPoolDeaths(obs poolDeathObservation, prevPoolRunning *map[string]bool) {
+	if len(obs.handlers) == 0 {
 		return
 	}
-	currentRunning, listErr := cr.sp.ListRunning("")
-	if listErr != nil {
-		if runtime.IsPartialListError(listErr) {
-			fmt.Fprintf(cr.stderr, "%s: pool death check skipped due to partial session listing: %v\n", cr.logPrefix, listErr) //nolint:errcheck // best-effort stderr
+	if obs.listErr != nil {
+		if runtime.IsPartialListError(obs.listErr) {
+			fmt.Fprintf(cr.stderr, "%s: pool death check skipped due to partial session listing: %v\n", cr.logPrefix, obs.listErr) //nolint:errcheck // best-effort stderr
 		} else {
-			fmt.Fprintf(cr.stderr, "%s: pool death check skipped while listing sessions: %v\n", cr.logPrefix, listErr) //nolint:errcheck // best-effort stderr
+			fmt.Fprintf(cr.stderr, "%s: pool death check skipped while listing sessions: %v\n", cr.logPrefix, obs.listErr) //nolint:errcheck // best-effort stderr
 		}
 		return
 	}
-	currentSet := make(map[string]bool, len(currentRunning))
-	for _, name := range currentRunning {
-		currentSet[name] = true
-	}
 	if *prevPoolRunning != nil {
-		for sn, info := range handlers {
-			if (*prevPoolRunning)[sn] && !currentSet[sn] {
+		for sn, info := range obs.handlers {
+			if (*prevPoolRunning)[sn] && !obs.running[sn] {
 				_ = runPoolDeathHook(cr.poolDeathHook(), cr.stderr, sn, info) // reported on stderr
 			}
 		}
 	}
 	*prevPoolRunning = make(map[string]bool)
-	for sn := range handlers {
-		if currentSet[sn] {
+	for sn := range obs.handlers {
+		if obs.running[sn] {
 			(*prevPoolRunning)[sn] = true
 		}
 	}
@@ -1316,9 +1340,9 @@ type tickPass struct {
 	sessionBeads *sessionBeadSnapshot
 	inv          *runtimeInventoryView
 	result       DesiredStateResult
-	// deathHandlers is the on_death handler set captured before this tick's
-	// config reload (tickCapturePoolDeathHandlers).
-	deathHandlers map[string]poolDeathInfo
+	// poolLiveness is the pool liveness observed before this tick's config
+	// reload (tickObservePoolLiveness).
+	poolLiveness poolDeathObservation
 }
 
 func (p *tickPass) recordPhase(site TraceSiteCode, name string, start time.Time, fields map[string]any) {
@@ -1349,7 +1373,7 @@ type tickPhase struct {
 
 // legacyTickPhases is the tick, in order. tick() runs it as is.
 var legacyTickPhases = []tickPhase{
-	{name: "capture_pool_death_handlers", run: (*CityRuntime).tickCapturePoolDeathHandlers},
+	{name: "observe_pool_liveness", run: (*CityRuntime).tickObservePoolLiveness},
 	{name: "config_reload", run: (*CityRuntime).tickConfigReload},
 	{name: "schema_skew_hold", run: (*CityRuntime).tickSchemaSkewHold},
 	{name: "reconcile_pool_deaths", run: (*CityRuntime).tickReconcilePoolDeaths},
@@ -1479,13 +1503,14 @@ func (cr *CityRuntime) completeManualReload(p *tickPass) {
 	cr.clearActiveReloadIf(p.manualReload)
 }
 
-// tickCapturePoolDeathHandlers captures the on_death handler set in force
-// before this tick's config reload; tickReconcilePoolDeaths judges deaths by
-// it after the reload and the schema-skew hold. While the inventory lane runs
-// it owns on_death, off the tick (runtime_inventory_ondeath.go).
-func (cr *CityRuntime) tickCapturePoolDeathHandlers(p *tickPass) bool {
+// tickObservePoolLiveness observes pool liveness — the on_death handler set
+// and the session provider's running list, together — before this tick's
+// config reload can replace either; tickReconcilePoolDeaths acts on it after
+// the reload and the schema-skew hold. While the inventory lane runs it owns
+// on_death, off the tick (runtime_inventory_ondeath.go).
+func (cr *CityRuntime) tickObservePoolLiveness(p *tickPass) bool {
 	if cr.inventoryLane == nil {
-		p.deathHandlers = cr.publishedPoolDeathHandlers()
+		p.poolLiveness = cr.observePoolDeaths()
 	}
 	return false
 }
@@ -1532,18 +1557,20 @@ func (cr *CityRuntime) tickSchemaSkewHold(p *tickPass) bool {
 }
 
 // tickReconcilePoolDeaths detects pool instance deaths since last tick. Two
-// contracts meet here. Deaths are judged by the handler set they happened
-// under: the check uses the handlers tickCapturePoolDeathHandlers captured
-// before this tick's reload, so a reload that removes a pool, or rediscovers
-// an unlimited pool without its dead instance, still runs that instance's
-// on_death hook, and a changed hook applies only to later deaths. The check
-// still runs after the schema-skew hold, so a controller store the reload
+// contracts meet here. Deaths are judged by the state they happened under: the
+// check acts on the handler set and session listing tickObservePoolLiveness
+// observed before this tick's reload, so a reload that removes a pool, or
+// rediscovers an unlimited pool without its dead instance, still runs that
+// instance's on_death hook, a changed hook applies only to later deaths, and a
+// reload that swaps the session provider (stopping the old provider's
+// sessions) does not make a session that was running look dead. The hooks
+// still run only after the schema-skew hold, so a controller store the reload
 // found newer than this binary runs no on_death hook (ga-mw4dg). While the
 // inventory lane runs it owns on_death, off the tick
 // (runtime_inventory_ondeath.go).
 func (cr *CityRuntime) tickReconcilePoolDeaths(p *tickPass) bool {
 	if cr.inventoryLane == nil {
-		cr.reconcilePoolDeathsWith(p.deathHandlers, p.prevPoolRunning)
+		cr.actOnPoolDeaths(p.poolLiveness, p.prevPoolRunning)
 	}
 	return false
 }
