@@ -1015,6 +1015,7 @@ type AgentPatch struct {
 	TmuxAlias               *string           `json:"TmuxAlias"`
 	Upstream                *string           `json:"Upstream"`
 	WakeMode                *string           `json:"WakeMode"`
+	WakeTransport           *string           `json:"WakeTransport"`
 	WorkDir                 *string           `json:"WorkDir"`
 }
 
@@ -3763,9 +3764,11 @@ type SessionResponse struct {
 	AgentKind              *string                 `json:"agent_kind,omitempty"`
 	Alias                  *string                 `json:"alias,omitempty"`
 	Attached               bool                    `json:"attached"`
-	ConfiguredNamedSession *bool                   `json:"configured_named_session,omitempty"`
+	BaseState              string                  `json:"base_state"`
+	ConfiguredNamedSession bool                    `json:"configured_named_session"`
 	ContextPct             *int64                  `json:"context_pct,omitempty"`
 	ContextWindow          *int64                  `json:"context_window,omitempty"`
+	ControlPlane           bool                    `json:"control_plane"`
 	CreatedAt              string                  `json:"created_at"`
 	DisplayName            *string                 `json:"display_name,omitempty"`
 	Id                     string                  `json:"id"`
@@ -3775,13 +3778,16 @@ type SessionResponse struct {
 	LastOutput             *string                 `json:"last_output,omitempty"`
 	Metadata               *map[string]string      `json:"metadata,omitempty"`
 	Model                  *string                 `json:"model,omitempty"`
+	NavigatorSchemaVersion string                  `json:"navigator_schema_version"`
 	Options                *map[string]string      `json:"options,omitempty"`
 	Pool                   *string                 `json:"pool,omitempty"`
+	PoolManaged            bool                    `json:"pool_managed"`
 	Provider               string                  `json:"provider"`
 	Reason                 *string                 `json:"reason,omitempty"`
 	Rig                    *string                 `json:"rig,omitempty"`
 	Running                bool                    `json:"running"`
 	SessionName            string                  `json:"session_name"`
+	SessionOrigin          *string                 `json:"session_origin,omitempty"`
 	State                  string                  `json:"state"`
 	SubmissionCapabilities *SubmissionCapabilities `json:"submission_capabilities,omitempty"`
 	Template               string                  `json:"template"`
@@ -6449,6 +6455,22 @@ type TypedEventStreamEnvelopeSessionColdStartTimeout struct {
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
 }
 
+// TypedEventStreamEnvelopeSessionConfigDriftWave defines model for TypedEventStreamEnvelopeSessionConfigDriftWave.
+type TypedEventStreamEnvelopeSessionConfigDriftWave struct {
+	Actor            string                   `json:"actor"`
+	DependsOnStepIds *[]string                `json:"depends_on_step_ids,omitempty"`
+	Message          *string                  `json:"message,omitempty"`
+	Payload          NoPayload                `json:"payload"`
+	RunId            *string                  `json:"run_id,omitempty"`
+	Seq              int64                    `json:"seq"`
+	SessionId        *string                  `json:"session_id,omitempty"`
+	StepId           *string                  `json:"step_id,omitempty"`
+	Subject          *string                  `json:"subject,omitempty"`
+	Ts               time.Time                `json:"ts"`
+	Type             string                   `json:"type"`
+	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
+}
+
 // TypedEventStreamEnvelopeSessionCrashed defines model for TypedEventStreamEnvelopeSessionCrashed.
 type TypedEventStreamEnvelopeSessionCrashed struct {
 	Actor            string                   `json:"actor"`
@@ -8092,6 +8114,23 @@ type TypedTaggedEventStreamEnvelopeRigProvisionProgress struct {
 
 // TypedTaggedEventStreamEnvelopeSessionColdStartTimeout defines model for TypedTaggedEventStreamEnvelopeSessionColdStartTimeout.
 type TypedTaggedEventStreamEnvelopeSessionColdStartTimeout struct {
+	Actor            string                   `json:"actor"`
+	City             string                   `json:"city"`
+	DependsOnStepIds *[]string                `json:"depends_on_step_ids,omitempty"`
+	Message          *string                  `json:"message,omitempty"`
+	Payload          NoPayload                `json:"payload"`
+	RunId            *string                  `json:"run_id,omitempty"`
+	Seq              int64                    `json:"seq"`
+	SessionId        *string                  `json:"session_id,omitempty"`
+	StepId           *string                  `json:"step_id,omitempty"`
+	Subject          *string                  `json:"subject,omitempty"`
+	Ts               time.Time                `json:"ts"`
+	Type             string                   `json:"type"`
+	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
+}
+
+// TypedTaggedEventStreamEnvelopeSessionConfigDriftWave defines model for TypedTaggedEventStreamEnvelopeSessionConfigDriftWave.
+type TypedTaggedEventStreamEnvelopeSessionConfigDriftWave struct {
 	Actor            string                   `json:"actor"`
 	City             string                   `json:"city"`
 	DependsOnStepIds *[]string                `json:"depends_on_step_ids,omitempty"`
@@ -15233,6 +15272,34 @@ func (t *TypedEventStreamEnvelope) MergeTypedEventStreamEnvelopeSessionColdStart
 	return err
 }
 
+// AsTypedEventStreamEnvelopeSessionConfigDriftWave returns the union data inside the TypedEventStreamEnvelope as a TypedEventStreamEnvelopeSessionConfigDriftWave
+func (t TypedEventStreamEnvelope) AsTypedEventStreamEnvelopeSessionConfigDriftWave() (TypedEventStreamEnvelopeSessionConfigDriftWave, error) {
+	var body TypedEventStreamEnvelopeSessionConfigDriftWave
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedEventStreamEnvelopeSessionConfigDriftWave overwrites any union data inside the TypedEventStreamEnvelope as the provided TypedEventStreamEnvelopeSessionConfigDriftWave
+func (t *TypedEventStreamEnvelope) FromTypedEventStreamEnvelopeSessionConfigDriftWave(v TypedEventStreamEnvelopeSessionConfigDriftWave) error {
+	v.Type = "session.config_drift_wave"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedEventStreamEnvelopeSessionConfigDriftWave performs a merge with any union data inside the TypedEventStreamEnvelope, using the provided TypedEventStreamEnvelopeSessionConfigDriftWave
+func (t *TypedEventStreamEnvelope) MergeTypedEventStreamEnvelopeSessionConfigDriftWave(v TypedEventStreamEnvelopeSessionConfigDriftWave) error {
+	v.Type = "session.config_drift_wave"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsTypedEventStreamEnvelopeSessionCrashed returns the union data inside the TypedEventStreamEnvelope as a TypedEventStreamEnvelopeSessionCrashed
 func (t TypedEventStreamEnvelope) AsTypedEventStreamEnvelopeSessionCrashed() (TypedEventStreamEnvelopeSessionCrashed, error) {
 	var body TypedEventStreamEnvelopeSessionCrashed
@@ -16253,6 +16320,8 @@ func (t TypedEventStreamEnvelope) ValueByDiscriminator() (interface{}, error) {
 		return t.AsTypedEventStreamEnvelopeRigProvisionProgress()
 	case "session.cold_start_timeout":
 		return t.AsTypedEventStreamEnvelopeSessionColdStartTimeout()
+	case "session.config_drift_wave":
+		return t.AsTypedEventStreamEnvelopeSessionConfigDriftWave()
 	case "session.crashed":
 		return t.AsTypedEventStreamEnvelopeSessionCrashed()
 	case "session.demand_claim_divergence":
@@ -18232,6 +18301,34 @@ func (t *TypedTaggedEventStreamEnvelope) MergeTypedTaggedEventStreamEnvelopeSess
 	return err
 }
 
+// AsTypedTaggedEventStreamEnvelopeSessionConfigDriftWave returns the union data inside the TypedTaggedEventStreamEnvelope as a TypedTaggedEventStreamEnvelopeSessionConfigDriftWave
+func (t TypedTaggedEventStreamEnvelope) AsTypedTaggedEventStreamEnvelopeSessionConfigDriftWave() (TypedTaggedEventStreamEnvelopeSessionConfigDriftWave, error) {
+	var body TypedTaggedEventStreamEnvelopeSessionConfigDriftWave
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedTaggedEventStreamEnvelopeSessionConfigDriftWave overwrites any union data inside the TypedTaggedEventStreamEnvelope as the provided TypedTaggedEventStreamEnvelopeSessionConfigDriftWave
+func (t *TypedTaggedEventStreamEnvelope) FromTypedTaggedEventStreamEnvelopeSessionConfigDriftWave(v TypedTaggedEventStreamEnvelopeSessionConfigDriftWave) error {
+	v.Type = "session.config_drift_wave"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedTaggedEventStreamEnvelopeSessionConfigDriftWave performs a merge with any union data inside the TypedTaggedEventStreamEnvelope, using the provided TypedTaggedEventStreamEnvelopeSessionConfigDriftWave
+func (t *TypedTaggedEventStreamEnvelope) MergeTypedTaggedEventStreamEnvelopeSessionConfigDriftWave(v TypedTaggedEventStreamEnvelopeSessionConfigDriftWave) error {
+	v.Type = "session.config_drift_wave"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsTypedTaggedEventStreamEnvelopeSessionCrashed returns the union data inside the TypedTaggedEventStreamEnvelope as a TypedTaggedEventStreamEnvelopeSessionCrashed
 func (t TypedTaggedEventStreamEnvelope) AsTypedTaggedEventStreamEnvelopeSessionCrashed() (TypedTaggedEventStreamEnvelopeSessionCrashed, error) {
 	var body TypedTaggedEventStreamEnvelopeSessionCrashed
@@ -19252,6 +19349,8 @@ func (t TypedTaggedEventStreamEnvelope) ValueByDiscriminator() (interface{}, err
 		return t.AsTypedTaggedEventStreamEnvelopeRigProvisionProgress()
 	case "session.cold_start_timeout":
 		return t.AsTypedTaggedEventStreamEnvelopeSessionColdStartTimeout()
+	case "session.config_drift_wave":
+		return t.AsTypedTaggedEventStreamEnvelopeSessionConfigDriftWave()
 	case "session.crashed":
 		return t.AsTypedTaggedEventStreamEnvelopeSessionCrashed()
 	case "session.demand_claim_divergence":

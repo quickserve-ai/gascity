@@ -55,7 +55,7 @@ func TestIsBdInitDirtyTablesError(t *testing.T) {
 
 // stubCommitDirtyScopeTables swaps the managed-Dolt commit seam for the test's
 // own and restores it afterwards.
-func stubCommitDirtyScopeTables(t *testing.T, fn func(cityPath, database string) (bool, error)) {
+func stubCommitDirtyScopeTables(t *testing.T, fn func(cityPath, scopeRoot, database string) (bool, error)) {
 	t.Helper()
 	prev := commitDirtyScopeTables
 	commitDirtyScopeTables = fn
@@ -67,7 +67,7 @@ func stubCommitDirtyScopeTables(t *testing.T, fn func(cityPath, database string)
 // it. Recovery must keep committing until init stops refusing.
 func TestRecoverBdInitFromDirtyTablesLoopsUntilClean(t *testing.T) {
 	var commits int
-	stubCommitDirtyScopeTables(t, func(_, database string) (bool, error) {
+	stubCommitDirtyScopeTables(t, func(_, _, database string) (bool, error) {
 		commits++
 		if database != "gsp" {
 			t.Fatalf("commit database = %q, want %q", database, "gsp")
@@ -76,7 +76,7 @@ func TestRecoverBdInitFromDirtyTablesLoopsUntilClean(t *testing.T) {
 	})
 
 	var reinits int
-	err := recoverBdInitFromDirtyTables("/city", "gsp", errors.New(bdDirtyTablesErrText), func() error {
+	err := recoverBdInitFromDirtyTables("/city", "/city/rigs/gsp", "gsp", errors.New(bdDirtyTablesErrText), func() error {
 		reinits++
 		if reinits < 2 {
 			return errors.New(bdDirtyTablesErrText)
@@ -99,12 +99,12 @@ func TestRecoverBdInitFromDirtyTablesLoopsUntilClean(t *testing.T) {
 func TestRecoverBdInitFromDirtyTablesStopsWhenNothingLeftToCommit(t *testing.T) {
 	initErr := errors.New(bdDirtyTablesErrText)
 	var commits, reinits int
-	stubCommitDirtyScopeTables(t, func(string, string) (bool, error) {
+	stubCommitDirtyScopeTables(t, func(string, string, string) (bool, error) {
 		commits++
 		return false, nil
 	})
 
-	err := recoverBdInitFromDirtyTables("/city", "gsp", initErr, func() error {
+	err := recoverBdInitFromDirtyTables("/city", "/city/rigs/gsp", "gsp", initErr, func() error {
 		reinits++
 		return nil
 	})
@@ -122,10 +122,10 @@ func TestRecoverBdInitFromDirtyTablesStopsWhenNothingLeftToCommit(t *testing.T) 
 // A non-dirty-table failure on the retry is the real outcome and must surface
 // unchanged rather than being retried as if it were still the deadlock.
 func TestRecoverBdInitFromDirtyTablesSurfacesUnrelatedRetryFailure(t *testing.T) {
-	stubCommitDirtyScopeTables(t, func(string, string) (bool, error) { return true, nil })
+	stubCommitDirtyScopeTables(t, func(string, string, string) (bool, error) { return true, nil })
 
 	other := errors.New("bd init: connection refused")
-	err := recoverBdInitFromDirtyTables("/city", "gsp", errors.New(bdDirtyTablesErrText), func() error {
+	err := recoverBdInitFromDirtyTables("/city", "/city/rigs/gsp", "gsp", errors.New(bdDirtyTablesErrText), func() error {
 		return other
 	})
 	if !errors.Is(err, other) {
@@ -138,9 +138,9 @@ func TestRecoverBdInitFromDirtyTablesSurfacesUnrelatedRetryFailure(t *testing.T)
 func TestRecoverBdInitFromDirtyTablesSurfacesCommitFailure(t *testing.T) {
 	initErr := errors.New(bdDirtyTablesErrText)
 	commitErr := errors.New("connect to managed Dolt: dial tcp: connection refused")
-	stubCommitDirtyScopeTables(t, func(string, string) (bool, error) { return false, commitErr })
+	stubCommitDirtyScopeTables(t, func(string, string, string) (bool, error) { return false, commitErr })
 
-	err := recoverBdInitFromDirtyTables("/city", "gsp", initErr, func() error {
+	err := recoverBdInitFromDirtyTables("/city", "/city/rigs/gsp", "gsp", initErr, func() error {
 		t.Fatal("re-init must not run after a failed commit")
 		return nil
 	})
@@ -155,12 +155,12 @@ func TestRecoverBdInitFromDirtyTablesSurfacesCommitFailure(t *testing.T) {
 // A database that never stops refusing must not spin forever.
 func TestRecoverBdInitFromDirtyTablesBoundsRounds(t *testing.T) {
 	var commits int
-	stubCommitDirtyScopeTables(t, func(string, string) (bool, error) {
+	stubCommitDirtyScopeTables(t, func(string, string, string) (bool, error) {
 		commits++
 		return true, nil
 	})
 
-	err := recoverBdInitFromDirtyTables("/city", "gsp", errors.New(bdDirtyTablesErrText), func() error {
+	err := recoverBdInitFromDirtyTables("/city", "/city/rigs/gsp", "gsp", errors.New(bdDirtyTablesErrText), func() error {
 		return errors.New(bdDirtyTablesErrText)
 	})
 	if err == nil {
@@ -175,16 +175,103 @@ func TestRecoverBdInitFromDirtyTablesBoundsRounds(t *testing.T) {
 // decline rather than guess at a target.
 func TestRecoverBdInitFromDirtyTablesWithoutDatabase(t *testing.T) {
 	initErr := errors.New(bdDirtyTablesErrText)
-	stubCommitDirtyScopeTables(t, func(string, string) (bool, error) {
+	stubCommitDirtyScopeTables(t, func(string, string, string) (bool, error) {
 		t.Fatal("commit must not run without a database name")
 		return false, nil
 	})
 
-	if err := recoverBdInitFromDirtyTables("/city", "  ", initErr, func() error {
+	if err := recoverBdInitFromDirtyTables("/city", "/city/rigs/gsp", "  ", initErr, func() error {
 		t.Fatal("re-init must not run without a database name")
 		return nil
 	}); !errors.Is(err, initErr) {
 		t.Fatalf("error = %v, want the original init error", err)
+	}
+}
+
+// gc-beads-bd.sh prints bd's refusal and then declines its own checkpoint for a
+// database that invocation did not create, for a dirty table outside bd's
+// partial-init schema, or when the checkpoint cannot complete. The provider
+// error carries both texts, so it matches the dirty-table classifier; the
+// recovery must honor the script's refusal instead of committing the whole
+// working set over it.
+func TestRecoverBdInitFromDirtyTablesHonorsGcBeadsBdRefusal(t *testing.T) {
+	tests := []struct {
+		name       string
+		scriptTail string
+	}{
+		{
+			name:       "pre-existing database",
+			scriptTail: "bd init failed for /city/rigs/gsp; refusing to checkpoint a pre-existing database",
+		},
+		{
+			name:       "unexpected dirty table",
+			scriptTail: "error: refusing bd init schema checkpoint with unexpected dirty table: operator_notes",
+		},
+		{
+			name:       "checkpoint could not complete",
+			scriptTail: "failed to checkpoint partial bd init schema for gsp",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stubCommitDirtyScopeTables(t, func(string, string, string) (bool, error) {
+				t.Fatal("commit must not run after gc-beads-bd refused the checkpoint")
+				return false, nil
+			})
+			initErr := fmt.Errorf("exec beads init: %s\n%s", bdDirtyTablesErrText, tt.scriptTail)
+			err := recoverBdInitFromDirtyTables("/city", "/city/rigs/gsp", "gsp", initErr, func() error {
+				t.Fatal("re-init must not run after gc-beads-bd refused the checkpoint")
+				return nil
+			})
+			if !errors.Is(err, initErr) {
+				t.Fatalf("error = %v, want the script's refusal unchanged", err)
+			}
+		})
+	}
+}
+
+// Once a commit has run, the re-init meets a database that already exists, so
+// gc-beads-bd treats it as one it did not create and refuses. That refusal is
+// final: another commit of the whole working set would override it.
+func TestRecoverBdInitFromDirtyTablesStopsAtGcBeadsBdRefusalOnRetry(t *testing.T) {
+	var commits, reinits int
+	stubCommitDirtyScopeTables(t, func(string, string, string) (bool, error) {
+		commits++
+		return true, nil
+	})
+
+	initErr := fmt.Errorf("exec beads init: %s\nbd init retry failed for /city/rigs/gsp", bdDirtyTablesErrText)
+	refusal := fmt.Errorf("exec beads init: %s\nbd init failed for /city/rigs/gsp; refusing to checkpoint a pre-existing database", bdDirtyTablesErrText)
+	err := recoverBdInitFromDirtyTables("/city", "/city/rigs/gsp", "gsp", initErr, func() error {
+		reinits++
+		return refusal
+	})
+	if !errors.Is(err, refusal) {
+		t.Fatalf("error = %v, want the script's refusal on the retry", err)
+	}
+	if commits != 1 {
+		t.Fatalf("commit rounds = %d, want 1", commits)
+	}
+	if reinits != 1 {
+		t.Fatalf("re-init attempts = %d, want 1", reinits)
+	}
+}
+
+// The refusals are matched against gc-beads-bd.sh's own output, so a rewording
+// in the script must fail here rather than silently let the recovery commit the
+// whole working set over a refusal it no longer recognizes.
+func TestGcBeadsBdCheckpointRefusalsMatchScript(t *testing.T) {
+	if len(gcBeadsBdCheckpointRefusals) == 0 {
+		t.Fatal("gcBeadsBdCheckpointRefusals is empty")
+	}
+	script, err := os.ReadFile(filepath.Join(repoRootForLint(t), "examples", "bd", "assets", "scripts", "gc-beads-bd.sh"))
+	if err != nil {
+		t.Fatalf("read gc-beads-bd.sh: %v", err)
+	}
+	for _, refusal := range gcBeadsBdCheckpointRefusals {
+		if !strings.Contains(string(script), refusal) {
+			t.Errorf("gc-beads-bd.sh does not print %q; keep gcBeadsBdCheckpointRefusals in step with the script", refusal)
+		}
 	}
 }
 
@@ -208,10 +295,10 @@ provider = "bd"
 	}
 
 	var commits int
-	var gotCityPath, gotDatabase string
-	stubCommitDirtyScopeTables(t, func(cityPath, database string) (bool, error) {
+	var gotCityPath, gotScopeRoot, gotDatabase string
+	stubCommitDirtyScopeTables(t, func(cityPath, scopeRoot, database string) (bool, error) {
 		commits++
-		gotCityPath, gotDatabase = cityPath, database
+		gotCityPath, gotScopeRoot, gotDatabase = cityPath, scopeRoot, database
 		return true, nil
 	})
 
@@ -240,6 +327,11 @@ provider = "bd"
 	}
 	if gotCityPath != cityDir {
 		t.Fatalf("commit cityPath = %q, want %q", gotCityPath, cityDir)
+	}
+	// The commit must be judged against the RIG scope's endpoint, not the
+	// city's (hq-mbe2s): the recovery has to be handed the scope it re-inits.
+	if gotScopeRoot != rigDir {
+		t.Fatalf("commit scopeRoot = %q, want the rig scope %q", gotScopeRoot, rigDir)
 	}
 	if gotDatabase != "gsp" {
 		t.Fatalf("commit database = %q, want %q", gotDatabase, "gsp")
