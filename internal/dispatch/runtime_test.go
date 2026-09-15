@@ -22,7 +22,6 @@ import (
 	"github.com/gastownhall/gascity/internal/formula"
 	"github.com/gastownhall/gascity/internal/formulatest"
 	"github.com/gastownhall/gascity/internal/molecule"
-	"github.com/gastownhall/gascity/internal/prguard"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
 )
 
