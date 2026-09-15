@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/api"
@@ -209,3 +210,77 @@ func appendBuiltinProviderAliases(cityPath string, providers []string) error {
 	}
 	return os.WriteFile(tomlPath, append(data, []byte(b.String())...), 0o644)
 }
+
+// ambiguousWindowModelPins maps a model choice whose emitted model token the
+// context meter CANNOT tell apart from a different-window sibling, to the
+// explanation an operator needs. Selecting one of these is legal and the seat
+// will run fine — what breaks is the CONTEXT READING for that seat.
+//
+// "fable-5-200k" emits a bare `claude-fable-5`, which is byte-identical to what
+// a 1M fable session writes into its transcript (the "[1m]" suffix is a
+// launch-flag artifact and never reaches the transcript). sessionlog and
+// context_inject therefore resolve BOTH to 1M. For a seat genuinely on the 200k
+// tier that meter reads 5x too EMPTY, which is the dangerous direction: the seat
+// sails past the handoff bands and hits its real ceiling without warning.
+//
+// The pin stays in the enum because StripFlags needs it to migrate command
+// strings baked before ga-ljcm7c. It is a migration artifact, not a seat choice,
+// and nothing should be selecting it — hence a doctor check rather than a
+// refusal, so an existing city says so out loud instead of failing to load
+// (ga-a306b1, katya's review condition).
+var ambiguousWindowModelPins = map[string]string{
+	"fable-5-200k": "emits a bare claude-fable-5, which the context meter reads as 1M; " +
+		"a seat really on the 200k tier will read 5x too empty and blow past its handoff bands",
+}
+
+type providerModelWindowAmbiguityCheck struct{ cityPath string }
+
+func newProviderModelWindowAmbiguityCheck(cityPath string) *providerModelWindowAmbiguityCheck {
+	return &providerModelWindowAmbiguityCheck{cityPath: cityPath}
+}
+
+func (c *providerModelWindowAmbiguityCheck) Name() string { return "provider-model-window" }
+
+func (c *providerModelWindowAmbiguityCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
+	r := &doctor.CheckResult{Name: c.Name()}
+	cfg, err := loadCityConfigAllowMissingProviderReferences(c.cityPath)
+	if err != nil {
+		r.Status = doctor.StatusOK
+		r.Message = "model-window advisory skipped until expanded config loads"
+		return r
+	}
+
+	var found []string
+	for name, spec := range cfg.Providers {
+		if why, bad := ambiguousWindowModelPins[spec.OptionDefaults["model"]]; bad {
+			found = append(found, fmt.Sprintf("[providers.%s] model = %q: %s",
+				name, spec.OptionDefaults["model"], why))
+		}
+	}
+	for i := range cfg.Agents {
+		agent := &cfg.Agents[i]
+		if why, bad := ambiguousWindowModelPins[agent.OptionDefaults["model"]]; bad {
+			found = append(found, fmt.Sprintf("agent %s: model = %q: %s",
+				agent.QualifiedName(), agent.OptionDefaults["model"], why))
+		}
+	}
+	if len(found) == 0 {
+		r.Status = doctor.StatusOK
+		r.Message = "no seat selects a model pin the context meter cannot resolve"
+		return r
+	}
+
+	sort.Strings(found) // stable output: map iteration order is random
+	r.Status = doctor.StatusWarning
+	r.Severity = doctor.SeverityAdvisory
+	r.Message = fmt.Sprintf("%d seat(s) select a model pin with an unresolvable context window", len(found))
+	r.Details = found
+	r.FixHint = "use \"fable\" (latest, 1M) or \"fable-5-1\"; the 200k pin exists only so pre-ga-ljcm7c command strings still migrate"
+	return r
+}
+
+func (c *providerModelWindowAmbiguityCheck) CanFix() bool { return false }
+
+func (c *providerModelWindowAmbiguityCheck) Fix(_ *doctor.CheckContext) error { return nil }
+
+func (c *providerModelWindowAmbiguityCheck) WarmupEligible() bool { return false }
