@@ -4,7 +4,9 @@ import (
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/session/sessiontest"
 )
 
 // ga-<pool-alias>: a pool worker's ALIAS is the canonical assignee.
@@ -73,6 +75,66 @@ func TestPoolAliasIsAnAssignmentIdentity(t *testing.T) {
 		if !poolAliasIdentifiersContain(got, "qcore/gastown.furiosa") {
 			t.Fatalf("%s identifiers %v omit the pool alias — the orphan-drain guard cannot see the worker's claimed work", name, got)
 		}
+	}
+}
+
+// A numbered slot of a pool identified by rebinding slots
+// (usesTransientPoolSlotIdentity) passes to a fresh session whenever its holder
+// dies, so a claim recorded under the slot alias belongs to whichever session
+// held the slot then. It must not keep the current holder awake, and it must not
+// count as that holder's assigned work in the drain guards
+// (TestAssignmentGuardsIgnoreTransientPoolSlotAliases). A namepool member's alias
+// is its own stable name, so its claim still does both, as ga-rht4v5 requires.
+func TestTransientPoolSlotAliasDoesNotKeepSessionAwakeOnAnotherSessionsClaim(t *testing.T) {
+	cfg := &config.City{Agents: []config.Agent{
+		{Name: "polecat", Dir: "qcore", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(3), NamepoolNames: []string{"furiosa", "nux"}},
+		{Name: "worker", Dir: "qcore", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(3)},
+	}}
+	for _, tc := range []struct {
+		name         string
+		template     string
+		alias        string
+		wantIdentity bool
+	}{
+		{name: "namepool alias is the session's own", template: "qcore/polecat", alias: "qcore/furiosa", wantIdentity: true},
+		{name: "transient slot alias is not", template: "qcore/worker", alias: "qcore/worker-2", wantIdentity: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const sessionName = "qcore--pool-ga-f93lvp"
+			bead := beads.Bead{
+				ID:     "ga-f93lvp",
+				Status: "open",
+				Type:   session.BeadType,
+				Labels: []string{session.LabelSession},
+				Metadata: map[string]string{
+					"template":     tc.template,
+					"session_name": sessionName,
+					"alias":        tc.alias,
+					"pool_managed": "true",
+					"pool_slot":    "2",
+					"state":        "active",
+				},
+			}
+			info := sessiontest.SeedBead(t, bead)
+
+			for form, got := range map[string][]string{
+				"bead": sessionAssignmentIdentifiersForConfig(bead, cfg),
+				"info": sessionAssignmentIdentifiersForConfigInfo(info, cfg),
+			} {
+				if has := poolAliasIdentifiersContain(got, tc.alias); has != tc.wantIdentity {
+					t.Fatalf("%s identifiers %v contain alias %q = %v, want %v", form, got, tc.alias, has, tc.wantIdentity)
+				}
+			}
+
+			claimed := []beads.Bead{{ID: "qc-sfk9y", Assignee: tc.alias, Status: "in_progress"}}
+			input := buildAwakeInputFromReconciler(cfg, "", []session.Info{info},
+				nil, nil, nil, nil, nil, claimed, nil, nil, nil, now)
+			input.RunningSessions = map[string]bool{sessionName: true}
+			decision := ComputeAwakeSet(input)[sessionName]
+			if decision.HasAssignedWork != tc.wantIdentity {
+				t.Fatalf("HasAssignedWork = %v, want %v for a claim under alias %q (decision %+v)", decision.HasAssignedWork, tc.wantIdentity, tc.alias, decision)
+			}
+		})
 	}
 }
 
