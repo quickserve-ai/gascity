@@ -283,7 +283,7 @@ func (c *providerModelWindowAmbiguityCheck) CanFix() bool { return false }
 
 func (c *providerModelWindowAmbiguityCheck) Fix(_ *doctor.CheckContext) error { return nil }
 
-// WarmupEligible returns TRUE, unlike its neighbours in this file. katya's
+// WarmupEligible returns TRUE, unlike its neighbors in this file. katya's
 // review condition on ga-a306b1 was that selecting an unresolvable pin be loud
 // at CONFIG OR LAUNCH, and doctor-only does not meet it: nothing in orders/ or
 // packs/*/orders runs `gc doctor` on a schedule, so a doctor-only warning is
