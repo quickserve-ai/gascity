@@ -1947,7 +1947,7 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 	//
 	// Deliberately NOT keyed on the session bead's own named/ephemeral metadata,
 	// which looks like the more natural discriminator: ga-hoy4vl — the bead at
-	// the centre of the 2026-09-11 wave — was pool_managed=true /
+	// the center of the 2026-09-11 wave — was pool_managed=true /
 	// session_origin=ephemeral WHILE SERVING A NAMED AGENT (the ga-dfp1b class).
 	// Keying on that metadata would strip a named seat for precisely the
 	// mislabeled shape that caused the incident.

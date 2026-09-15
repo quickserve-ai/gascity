@@ -27,7 +27,7 @@ import (
 // present-but-inapplicable guard is the whole failure mode, which is why the
 // ga-sdynmb regression suite passes and did not catch this.
 //
-// THIS TEST PINS BOTH HALVES OF THE NIL-CFG BEHAVIOUR, because each half is a
+// THIS TEST PINS BOTH HALVES OF THE NIL-CFG BEHAVIOR, because each half is a
 // separate regression and a fix for one is the natural way to break the other:
 //
 //   - NAME-SHAPED assignee (here the session_name form) must be RETAINED. Losing
