@@ -275,6 +275,29 @@ func withHookStdin(t *testing.T, data []byte) {
 	})
 }
 
+// TestClassifyWindowFableAliasForms locks the context meter against the model
+// tokens the fable enum now emits (ga-a306b1). Both the bare family alias
+// "fable[1m]" and the explicit "claude-fable-5-1[1m]" pin must classify as 1M
+// and must be RECOGNIZED — an unrecognized token silently defaults the meter to
+// 200k, so every fable seat would read its 1M window as 5x fuller than it is
+// and trip the handoff bands while barely a fifth used.
+func TestClassifyWindowFableAliasForms(t *testing.T) {
+	t.Setenv("GC_CONTEXT_WINDOW_TOKENS", "")
+	var warnings strings.Builder
+	original := contextWindowWarningWriter
+	contextWindowWarningWriter = &warnings
+	t.Cleanup(func() { contextWindowWarningWriter = original })
+
+	for _, model := range []string{"fable[1m]", "claude-fable-5-1[1m]", "claude-fable-5[1m]"} {
+		if got := contextWindowTokens([]string{model}); got != 1_000_000 {
+			t.Errorf("contextWindowTokens(%q) = %d, want 1000000", model, got)
+		}
+	}
+	if warnings.Len() != 0 {
+		t.Errorf("fable model tokens warned as unrecognized: %q", warnings.String())
+	}
+}
+
 func TestContextWindowTokensClaudeOpus5WithEmptySidecar(t *testing.T) {
 	t.Setenv("GC_CONTEXT_WINDOW_TOKENS", "")
 	t.Setenv("GC_CONTEXT_LAUNCH_MODEL", "")
