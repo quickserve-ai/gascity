@@ -1,11 +1,17 @@
 package main
 
 import (
+	"context"
+	"io"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
 )
 
@@ -231,35 +237,198 @@ func TestRigOrphanReleaseDisabled_UnknownRigAndNilConfig(t *testing.T) {
 // The same call with the knob unset releases the claim, so the hold is the
 // knob's doing rather than another guard's.
 func TestPoolOrphanReleaseGate_DisabledRigHoldsConfirmedOrphanRelease(t *testing.T) {
-	cityStore := beads.NewMemStore()
-	rigStore := beads.NewMemStore()
-	rigStores := map[string]beads.Store{"repo": rigStore}
+	for _, tc := range []struct {
+		name      string
+		storeRefs []string
+	}{
+		{name: "rig read off the store ref", storeRefs: []string{"repo"}},
+		{name: "rig resolved from the bead", storeRefs: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cityStore := beads.NewMemStore()
+			rigStore := beads.NewMemStore()
+			rigStores := map[string]beads.Store{"repo": rigStore}
+			cfg := foreignIdentityTestCity(t)
+			cfg.Rigs[0].OrphanRelease = boolPtr(false)
+			info := session.Info{SessionNameMetadata: "repo/worker-1"}
+			work := seedForeignIdentityWork(t, rigStore, "claim under a locally minted pool instance", "repo/worker-1")
+
+			logBuf := captureSweepLog(t)
+			released := releaseConfirmedOrphanSessionWork(cfg, cityStore, rigStores,
+				[]beads.Bead{work}, []beads.Store{rigStore}, tc.storeRefs, info)
+			if len(released) != 0 {
+				t.Fatalf("released = %v, want none — orphan_release=false must stop the orphan-close release", released)
+			}
+			got, err := rigStore.Get(work.ID)
+			if err != nil {
+				t.Fatalf("Get work bead: %v", err)
+			}
+			if got.Status != "in_progress" || got.Assignee != "repo/worker-1" {
+				t.Fatalf("claim = status %q assignee %q, want in_progress/repo/worker-1 untouched", got.Status, got.Assignee)
+			}
+			if logged := logBuf.String(); !strings.Contains(logged, `orphan_release=false held `+work.ID+` in rig "repo"`) {
+				t.Fatalf("the hold must be reported with the bead and rig:\n%s", logged)
+			}
+
+			cfg.Rigs[0].OrphanRelease = nil
+			released = releaseConfirmedOrphanSessionWork(cfg, cityStore, rigStores,
+				[]beads.Bead{work}, []beads.Store{rigStore}, tc.storeRefs, info)
+			if len(released) != 1 || released[0].ID != work.ID {
+				t.Fatalf("released = %v, want [%s] with the knob unset", released, work.ID)
+			}
+		})
+	}
+}
+
+// seedCityOwnedGateWork creates in_progress work in the city store, routed to
+// the city-level worker pool and claimed by one of its instances. Neither its
+// route nor its ID prefix names a rig, so only a store ref can say it is
+// city-owned.
+func seedCityOwnedGateWork(t *testing.T, store beads.Store, assignee string) beads.Bead {
+	t.Helper()
+	work, err := store.Create(beads.Bead{
+		Title:    "city-owned pool work",
+		Assignee: assignee,
+		Metadata: map[string]string{beadmeta.RoutedToMetadataKey: "worker"},
+	})
+	if err != nil {
+		t.Fatalf("Create city work bead: %v", err)
+	}
+	if err := store.Update(work.ID, beads.UpdateOpts{Status: stringPtr("in_progress")}); err != nil {
+		t.Fatalf("Set city work status: %v", err)
+	}
+	work, err = store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("Reload city work bead: %v", err)
+	}
+	return work
+}
+
+// TestPoolOrphanReleaseGate_DisabledRigSparesCityOwnedConfirmedOrphanRelease is
+// the city-store exemption on the SECOND release site, matching the sweep's
+// (TestPoolOrphanReleaseGate_CityStoreWorkUnaffected): city-owned work carries
+// the empty store ref and no rig knob, so a rig with orphan_release = false
+// must not hold its orphan-close release. A held release leaves the orphaned
+// seat holding the work, and the close guard then refuses to close it on every
+// tick. Provenance is what earns the exemption: with no store refs this bead's
+// rig cannot be resolved, so the release still fails closed.
+func TestPoolOrphanReleaseGate_DisabledRigSparesCityOwnedConfirmedOrphanRelease(t *testing.T) {
 	cfg := foreignIdentityTestCity(t)
 	cfg.Rigs[0].OrphanRelease = boolPtr(false)
-	info := session.Info{SessionNameMetadata: "repo/worker-1"}
-	work := seedForeignIdentityWork(t, rigStore, "claim under a locally minted pool instance", "repo/worker-1")
+	rigStores := map[string]beads.Store{"repo": beads.NewMemStore()}
+	info := session.Info{SessionNameMetadata: "worker-1"}
 
-	logBuf := captureSweepLog(t)
-	released := releaseConfirmedOrphanSessionWork(cfg, cityStore, rigStores,
-		[]beads.Bead{work}, []beads.Store{rigStore}, info)
-	if len(released) != 0 {
-		t.Fatalf("released = %v, want none — orphan_release=false must stop the orphan-close release", released)
+	t.Run("city store ref releases", func(t *testing.T) {
+		cityStore := beads.NewMemStore()
+		work := seedCityOwnedGateWork(t, cityStore, "worker-1")
+
+		released := releaseConfirmedOrphanSessionWork(cfg, cityStore, rigStores,
+			[]beads.Bead{work}, []beads.Store{cityStore}, []string{""}, info)
+		if len(released) != 1 || released[0].ID != work.ID {
+			t.Fatalf("released = %v, want [%s] — a disabled rig must not hold city-owned work", released, work.ID)
+		}
+		got, err := cityStore.Get(work.ID)
+		if err != nil {
+			t.Fatalf("Get city work bead: %v", err)
+		}
+		if got.Status != "open" || got.Assignee != "" {
+			t.Fatalf("claim = status %q assignee %q, want open/unassigned", got.Status, got.Assignee)
+		}
+	})
+
+	t.Run("no store refs fails closed", func(t *testing.T) {
+		cityStore := beads.NewMemStore()
+		work := seedCityOwnedGateWork(t, cityStore, "worker-1")
+
+		logBuf := captureSweepLog(t)
+		released := releaseConfirmedOrphanSessionWork(cfg, cityStore, rigStores,
+			[]beads.Bead{work}, []beads.Store{cityStore}, nil, info)
+		if len(released) != 0 {
+			t.Fatalf("released = %v, want none — an unresolvable rig must fail closed while a rig is disabled", released)
+		}
+		got, err := cityStore.Get(work.ID)
+		if err != nil {
+			t.Fatalf("Get city work bead: %v", err)
+		}
+		if got.Status != "in_progress" || got.Assignee != "worker-1" {
+			t.Fatalf("claim = status %q assignee %q, want in_progress/worker-1 untouched", got.Status, got.Assignee)
+		}
+		if logged := logBuf.String(); !strings.Contains(logged, `orphan_release=false held `+work.ID+` in rig "<unresolved>"`) {
+			t.Fatalf("the fail-closed hold must be reported:\n%s", logged)
+		}
+	})
+}
+
+// TestPoolOrphanReleaseGate_DisabledRigDoesNotWedgeCityOrphanClose runs the
+// controller's bead-reconcile tick over a confirmed-orphaned CITY pool seat that
+// holds city-store work while a rig has orphan_release = false. The store ref
+// travels the production route (DesiredStateResult, the wake filter, the start
+// option, the orphan close), so the tie-break releases the work and the seat
+// closes in the same tick instead of wedging.
+func TestPoolOrphanReleaseGate_DisabledRigDoesNotWedgeCityOrphanClose(t *testing.T) {
+	cityDir := t.TempDir()
+	writeCityTOML(t, cityDir, "gate-town", "mayor")
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "gate-town"},
+		Session:   config.SessionConfig{Provider: "fake"},
+		Rigs: []config.Rig{{
+			Name:          gateTestRig,
+			Path:          filepath.Join(cityDir, gateTestRig),
+			OrphanRelease: boolPtr(false),
+		}},
+		Agents: []config.Agent{{Name: "worker", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(1)}},
 	}
-	got, err := rigStore.Get(work.ID)
+	store := beads.NewMemStore()
+	seat, err := store.Create(beads.Bead{
+		Title:  "worker",
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"session_name":       "worker-1",
+			"template":           "worker",
+			"agent_name":         "worker",
+			"state":              "asleep",
+			"generation":         "1",
+			"continuation_epoch": "1",
+		},
+	})
 	if err != nil {
-		t.Fatalf("Get work bead: %v", err)
+		t.Fatalf("Create session bead: %v", err)
 	}
-	if got.Status != "in_progress" || got.Assignee != "repo/worker-1" {
-		t.Fatalf("claim = status %q assignee %q, want in_progress/repo/worker-1 untouched", got.Status, got.Assignee)
-	}
-	if logged := logBuf.String(); !strings.Contains(logged, `orphan_release=false held `+work.ID+` in rig "repo"`) {
-		t.Fatalf("the hold must be reported with the bead and rig:\n%s", logged)
-	}
+	work := seedCityOwnedGateWork(t, store, "worker-1")
 
-	cfg.Rigs[0].OrphanRelease = nil
-	released = releaseConfirmedOrphanSessionWork(cfg, cityStore, rigStores,
-		[]beads.Bead{work}, []beads.Store{rigStore}, info)
-	if len(released) != 1 || released[0].ID != work.ID {
-		t.Fatalf("released = %v, want [%s] with the knob unset", released, work.ID)
+	cr := &CityRuntime{
+		cityPath:            cityDir,
+		cityName:            "gate-town",
+		cfg:                 cfg,
+		sp:                  runtime.NewFake(),
+		standaloneCityStore: store,
+		standaloneRigStores: map[string]beads.Store{gateTestRig: beads.NewMemStore()},
+		sessionDrains:       newDrainTracker(),
+		rec:                 events.NewFake(),
+		logPrefix:           "gc",
+		stdout:              io.Discard,
+		stderr:              io.Discard,
+	}
+	cr.beadReconcileTick(context.Background(), DesiredStateResult{
+		State:                 map[string]TemplateParams{},
+		AssignedWorkBeads:     []beads.Bead{work},
+		AssignedWorkStores:    []beads.Store{store},
+		AssignedWorkStoreRefs: []string{""},
+	}, newSessionBeadSnapshot([]beads.Bead{seat}), nil, false)
+
+	gotWork, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("Get city work bead: %v", err)
+	}
+	if gotWork.Status != "open" || gotWork.Assignee != "" {
+		t.Fatalf("claim = status %q assignee %q, want open/unassigned — a disabled rig must not hold city-owned work on a confirmed orphan", gotWork.Status, gotWork.Assignee)
+	}
+	gotSeat, err := store.Get(seat.ID)
+	if err != nil {
+		t.Fatalf("Get session bead: %v", err)
+	}
+	if gotSeat.Status != "closed" {
+		t.Fatalf("session bead status = %q, want closed — once the work is released the close guard stops refusing", gotSeat.Status)
 	}
 }
