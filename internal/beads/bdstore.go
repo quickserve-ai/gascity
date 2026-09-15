@@ -1439,17 +1439,23 @@ func (s *BdStore) Get(id string) (Bead, error) {
 		// Return ErrIDCollision so mutation guards can distinguish this from a
 		// plain absent bead. ErrIDCollision wraps ErrNotFound so existing
 		// errors.Is(err, ErrNotFound) callers remain unaffected.
-		// The collision is a statement about the issues table. The requested ID
-		// may still exist in the wisp tier, which bd show never consulted.
-		if b, found, ferr := s.wispFallback(id); ferr != nil {
-			// Carry BOTH: the collision is a real finding about the issues table
-			// that mutation guards rely on, and the failed wisp lookup means the
-			// requested ID's absence is still unproven. Multi-%w keeps
-			// errors.Is true for each, so no existing caller loses information.
-			return Bead{}, fmt.Errorf("getting bead %q (resolved to %q): %w: %w: %w", id, bead.ID, ErrIDCollision, ErrVerifyIndeterminate, ferr)
-		} else if found {
-			return b, nil
-		}
+		// DELIBERATELY NO WISP FALLBACK HERE, though bd show did not consult the
+		// wisp tier and so has not proven this ID absent from it. Two reasons,
+		// and the second is the binding one:
+		//
+		//  - the case is marginal: it needs a wisp whose ID is a strict
+		//    substring of a real issue ID, and the requested bead to be that
+		//    wisp rather than the resolved issue;
+		//  - this branch is NOT reached only by Get. ReleaseIfCurrent's exact-ID
+		//    guard lands here too, and that path must issue nothing further to
+		//    bd once it has refused (TestReleaseIfCurrentRefusesAFuzzyIDCollision
+		//    pins it). Adding a lookup here puts a subprocess on a conditional-
+		//    release hot path to cover a case the mail guard never meets — mail
+		//    verification resolves through the two exits above.
+		//
+		// So a collision stays a plain collision. If a caller ever needs the
+		// wisp tier consulted on this path, it wants its own verb, not a
+		// widening of this one.
 		return Bead{}, fmt.Errorf("getting bead %q (resolved to %q): %w", id, bead.ID, ErrIDCollision)
 	}
 	return bead, nil
