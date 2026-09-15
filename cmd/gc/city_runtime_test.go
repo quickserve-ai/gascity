@@ -4750,6 +4750,59 @@ func TestCityRuntimeReloadSchemaSkewPreservesSessionsBeforeProviderSwap(t *testi
 	}
 }
 
+// TestCityRuntimeReloadReportsConfigParseErrorBeforeStorePreflightFailure pins
+// the order of two reload refusals. Opening the city store reads city.toml, so
+// an unparsable city.toml also fails the store preflight, and reporting that
+// store error would bury the parse error the operator has to fix. A schema-skew
+// verdict still refuses first (TestCityRuntimeReloadSchemaSkewPreservesSessionsBeforeProviderSwap),
+// and a preflight failure on a config that does parse still refuses the reload
+// before anything is applied.
+func TestCityRuntimeReloadReportsConfigParseErrorBeforeStorePreflightFailure(t *testing.T) {
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	writeCityRuntimeConfig(t, tomlPath, "fake")
+	cfg, err := config.Load(osFS{}, tomlPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	sp := runtime.NewFake()
+	cr := newTestCityRuntime(t, CityRuntimeParams{
+		CityPath: cityPath, CityName: "test-city", TomlPath: tomlPath,
+		Cfg: cfg, SP: sp, Dops: newDrainOps(sp), Rec: events.Discard,
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		Stdout: io.Discard, Stderr: io.Discard,
+	})
+	cs := newControllerState(context.Background(), cfg, sp, events.NewFake(), "test-city", cityPath)
+	cs.cityBeadStore = beads.NewMemStore()
+	cr.setControllerState(cs)
+
+	previousPreflight := controllerStatePreflightCityStore
+	controllerStatePreflightCityStore = func(string, *config.City, gate.Mode) (beads.StoreOpenResult, error) {
+		return beads.StoreOpenResult{}, errors.New("dolt server unreachable")
+	}
+	t.Cleanup(func() { controllerStatePreflightCityStore = previousPreflight })
+
+	if err := os.WriteFile(tomlPath, []byte("[[[ bad toml"), 0o644); err != nil {
+		t.Fatalf("write invalid config: %v", err)
+	}
+	lastProviderName := "fake"
+	reply := cr.reloadConfigTraced(context.Background(), &lastProviderName, cityPath, nil, reloadSourceManual)
+	if reply.Outcome != reloadOutcomeFailed || !strings.Contains(reply.Error, "parsing city.toml") {
+		t.Fatalf("reply = %+v, want a failed reload reporting the city.toml parse error", reply)
+	}
+
+	writeCityRuntimeConfig(t, tomlPath, "fail")
+	reply = cr.reloadConfigTraced(context.Background(), &lastProviderName, cityPath, nil, reloadSourceManual)
+	if reply.Outcome != reloadOutcomeFailed || !strings.Contains(reply.Error, "preflight city bead store: dolt server unreachable") {
+		t.Fatalf("reply = %+v, want a failed reload reporting the store preflight failure", reply)
+	}
+	if lastProviderName != "fake" || cr.sp != sp {
+		t.Fatalf("reload applied a provider change (lastProviderName = %q) despite the failed store preflight", lastProviderName)
+	}
+}
+
 func TestCityRuntimeTickSchemaSkewHoldsBeforePoolDeathHook(t *testing.T) {
 	cityPath := t.TempDir()
 	tomlPath := filepath.Join(cityPath, "city.toml")
