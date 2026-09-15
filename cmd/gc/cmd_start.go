@@ -1083,6 +1083,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 		stdout, stderr,
 		withReadyAssignedFlags(readyAssignedFlagsForBeads(dsResult.ReadyAssigned, awakeAssignedWorkBeads, awakeAssignedStoreRefs)),
 		withAssignedWorkStores(awakeAssignedStores),
+		withAssignedWorkStoreRefs(awakeAssignedStoreRefs),
 	)
 
 	// Post-reconcile sync: update bead state to reflect post-start reality.
