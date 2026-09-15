@@ -15,7 +15,8 @@ var modelFamilyWindows = map[string]int{
 	// files, every fable usage line records a bare "claude-fable-5" or
 	// "claude-fable-5-1" while the seats were launched with "...[1m]". Gating
 	// fable on the suffix therefore reports a 1M seat as 200k — a meter 5x too
-	// full, which trips a handoff on a session that is barely a third used.
+	// full: the meter reads 100% when a 1M seat has used 200k tokens, a FIFTH of
+	// its real window, and the handoff bands trip earlier still.
 	// context_inject.go's classifiedWindow already treats "fable" as 1M for
 	// exactly this reason; this keeps the two window tables from disagreeing.
 	//
