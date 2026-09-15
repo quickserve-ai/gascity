@@ -722,16 +722,6 @@ misidentified live session -- inspect via gc bd show <id> --json." \
     fi
 fi
 
-# Loud-fail: the summary has been printed above, so a non-zero exit now
-# surfaces the failure line to the controller log without losing the sweep's
-# own output. The controller captures an exec order's combined output but logs
-# it only on a non-zero exit (order_dispatch.go), so exit 0 would swallow it
-# (gastownhall/gascity#4543).
-if [ "$FAILED" -gt 0 ]; then
-    echo "orphan-sweep: $FAILED escalation summary(ies) could not be delivered to '$ESCALATION_TARGET' (see above)" >&2
-    exit 1
-fi
-
 # Emitted ONCE PER SWEEP and only when something was protected: at a 5m cadence an
 # unconditional line is ~288 entries a day saying nothing, which is how a channel
 # stops being read. Identities are sorted so consecutive sweeps are comparable,
@@ -798,4 +788,14 @@ if [ "$PROTECTED" -gt 0 ]; then
             echo "orphan-sweep: protected $IDENTITY_COUNT foreign/unknown identities this pass ($PROTECTED claims)"
         fi
     fi
+fi
+
+# Loud-fail, LAST: both summaries have been printed above, so a non-zero exit
+# now surfaces the failure line to the controller log without losing the
+# sweep's own output. The controller captures an exec order's combined output
+# but logs it only on a non-zero exit (order_dispatch.go), so exit 0 would
+# swallow it (gastownhall/gascity#4543).
+if [ "$FAILED" -gt 0 ]; then
+    echo "orphan-sweep: $FAILED escalation summary(ies) could not be delivered to '$ESCALATION_TARGET' (see above)" >&2
+    exit 1
 fi
