@@ -71,7 +71,24 @@ fi
 
 identity=""
 if command -v security >/dev/null 2>&1; then
-	candidates=$(security find-identity -p codesigning -v 2>/dev/null || true)
+	# NO -v. `-v` filters to identities with a TRUSTED chain, which excludes every
+	# self-signed local certificate -- including "GasCity Dev", one of the three
+	# patterns find_stable_identity searches for. So the auto-detect path could
+	# never find the very identity it was written to look for, and every local
+	# build silently fell through to the Go linker's ad-hoc signature.
+	#
+	# That matters because an ad-hoc signature is derived from the binary's
+	# CONTENT: its designated requirement is a cdhash that changes on EVERY
+	# build, so the macOS firewall (and TCC) can never match a previous grant
+	# and re-prompts after each rebuild. Measured on this box 2026-09-16 --
+	# two ad-hoc builds gave two different cdhashes, while a certificate-signed
+	# build gives `identifier "com.gascity.gc" and certificate root = H"..."`,
+	# which is stable across rebuilds. That is the whole point of this script.
+	#
+	# Dropping -v is safe: find_stable_identity still matches only the three
+	# known patterns, and if an admitted identity cannot actually sign, the
+	# auto path already falls through without failing the build.
+	candidates=$(security find-identity -p codesigning 2>/dev/null || true)
 	identity=$(find_stable_identity "$candidates")
 fi
 
