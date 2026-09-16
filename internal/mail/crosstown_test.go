@@ -3,7 +3,7 @@ package mail
 import "testing"
 
 func TestForeignTownPrefix(t *testing.T) {
-	rigs := []string{"qcore", "astro"}
+	rigs := []string{"qcore", "astro", "core"}
 	tests := []struct {
 		name       string
 		recipient  string
@@ -21,6 +21,8 @@ func TestForeignTownPrefix(t *testing.T) {
 		{"leading slash", "/woodhouse", "qlandia", "", false},
 		{"trailing slash only", "gastown/", "qlandia", "", false},
 		{"surrounding space", "  gastown/woodhouse ", "qlandia", "gastown", true},
+		{"template target form", "template:myrig/worker", "qlandia", "", false},
+		{"a local agent dir that differs from its rig", "core/ray", "qlandia", "", false},
 		{"unknown city name still classifies", "gastown/woodhouse", "", "gastown", true},
 	}
 	for _, tt := range tests {
