@@ -33,19 +33,25 @@ func crossTownRecipientHint(cfg *config.City, recipient, contextsPath string) st
 	if !foreign {
 		return ""
 	}
-	ctx := "<hub context>"
-	if names := clientContextNames(contextsPath); len(names) > 0 {
-		ctx = strings.Join(names, "|")
+	names := clientContextNames(contextsPath)
+	if len(names) == 0 {
+		names = []string{"<hub context>"}
 	}
 	here := "this city"
 	if cityName != "" {
 		here = fmt.Sprintf("this city (%s)", cityName)
 	}
-	return fmt.Sprintf("gc mail send: %q is not %s or one of its rigs. If it is a seat in another town, "+
-		"local mail cannot reach it: cross-town agent mail goes through the hub, e.g. "+
-		"gc mail send --context %s <%s's mayor anchor> -s \"[for <rig>/<name>] subject\" -m \"body\" "+
-		"(see the cross-town-coordination skill for the anchor names).",
-		prefix, here, ctx, prefix)
+	var b strings.Builder
+	fmt.Fprintf(&b, "gc mail send: %q is not %s or one of its rigs. If it is a seat in another town, "+
+		"local mail cannot reach it: cross-town agent mail goes through the hub, addressed to a mailbox "+
+		"that town accepts (its cross-town routing address, with a \"[for <rig>/<name>]\" subject). "+
+		"One command per context this client holds:", prefix, here)
+	// One complete command per line. Joining the names with "|" would read as a
+	// choice but paste as a shell pipeline.
+	for _, name := range names {
+		fmt.Fprintf(&b, "\n  gc mail send --context %s <%s routing address> -s \"[for <rig>/<name>] subject\" -m \"body\"", name, prefix)
+	}
+	return b.String()
 }
 
 // clientContextNames lists the named remote cities in the contexts registry.
