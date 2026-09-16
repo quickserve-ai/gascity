@@ -10,7 +10,12 @@
 # bypass of this required CI check — automated workers may NEVER self-authorize
 # an unreleased dependency.
 #
-# Released: exactly vX.Y.Z where X, Y, Z are integers (e.g. v1.0.5, v0.0.1).
+# Released: exactly vX.Y.Z where X, Y, Z are integers (e.g. v1.0.5, v0.0.1),
+#           or the beads fleet tag this repository pins through a go.mod
+#           replace: github.com/quickserve-ai/beads at
+#           vX.Y.Z[-rc.N]-fleet.<YYYYMMDD>[.<serial>] (gc-1c2b). That single
+#           admission is the fork path at a tag the beads owner cut and
+#           published; it is not a general prerelease escape hatch.
 # Blocked: pseudo-version, prerelease label, local path, git branch/ref, or
 #          any non-semver version token.
 #
@@ -60,6 +65,19 @@ check_replace_rhs() {
 
 	# No version: path-only redirect with no version to check.
 	[[ -n "$version" ]] || return 0
+
+	# Fleet-tag admission. The beads module is pinned to a quickserve-ai/beads
+	# build through a replace, and those builds are tagged
+	# vX.Y.Z[-rc.N]-fleet.<YYYYMMDD>[.<serial>] -- a released, immutable,
+	# publicly fetchable tag, but not a bare vX.Y.Z, so the general rule below
+	# would block it. Admit exactly that path at exactly that tag shape: the
+	# upstream path, a sibling fork path, a pseudo-version, a bare prerelease,
+	# and a non-rc prerelease all keep falling through to the block.
+	local fleet_path="github.com/quickserve-ai/beads"
+	local fleet_re='^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?-fleet\.[0-9]{8}(\.[0-9]+)?$'
+	if [[ "$path_part" == "$fleet_path" && "$version" =~ $fleet_re ]]; then
+		return 0
+	fi
 
 	# Only pure vX.Y.Z release tags are allowed. Everything else — pseudo-versions
 	# (timestamp+sha suffix), prerelease labels (-rc1, -beta), and non-semver
