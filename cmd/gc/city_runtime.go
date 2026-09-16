@@ -787,7 +787,7 @@ func (cr *CityRuntime) run(ctx context.Context) {
 		}
 		// Reap stale session beads from a previous run before building desired
 		// state, so desired state does not reference already-closed beads (#742).
-		if reapStaleSessionBeads(cr.sessionsBeadStore().Store, cr.sp, cr.sessionDrains, clock.Real{}, cr.stderr) > 0 {
+		if reapStaleSessionBeads(cr.sessionsBeadStore().Store, cr.cfg, cr.sp, cr.sessionDrains, clock.Real{}, cr.stderr) > 0 {
 			sessionBeads = cr.loadSessionBeadSnapshot()
 		}
 		result := cr.buildDesiredState(sessionBeads, startupTrace)
@@ -1412,7 +1412,7 @@ func (cr *CityRuntime) tick(
 	}
 	recordPhase(TraceSiteControllerTickPhase, "sweep_process_table_orphans", phaseStart, map[string]any{"reaped": swept})
 	phaseStart = time.Now()
-	reaped := reapStaleSessionBeads(cr.sessionsBeadStore().Store, cr.sp, cr.sessionDrains, clock.Real{}, cr.stderr)
+	reaped := reapStaleSessionBeads(cr.sessionsBeadStore().Store, cr.cfg, cr.sp, cr.sessionDrains, clock.Real{}, cr.stderr)
 	recordPhase(TraceSiteControllerTickPhase, "reap_stale_session_beads", phaseStart, map[string]any{"reaped": reaped})
 	if reaped > 0 {
 		phaseStart = time.Now()
@@ -3505,7 +3505,7 @@ func sweepUndesiredPoolSessionBeads(
 		// front door.
 		candidates = append(candidates, info)
 	}
-	return len(GCSweepSessionBeads(cityPath, store.Store, rigStores, candidates))
+	return len(GCSweepSessionBeads(cityPath, store.Store, rigStores, cfg, candidates))
 }
 
 func poolSessionBeadRuntimeRunning(bead beads.Bead, sp runtime.Provider, processNames []string) (bool, error) {
