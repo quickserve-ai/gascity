@@ -35,6 +35,25 @@ func TestCrossTownRecipientHint(t *testing.T) {
 		}
 	}
 
+	// Several contexts: one complete command per context, never a "|" join
+	// that a shell would run as a pipeline.
+	multi := filepath.Join(t.TempDir(), "multi.toml")
+	if err := os.WriteFile(multi, []byte("[[context]]\n  name = \"prod\"\n  url = \"https://a.example:8443\"\n  city = \"a\"\n[[context]]\n  name = \"staging\"\n  url = \"https://b.example:8443\"\n  city = \"b\"\n"), 0o600); err != nil {
+		t.Fatalf("write contexts: %v", err)
+	}
+	got := crossTownRecipientHint(cfg, "gastown/woodhouse", multi)
+	if strings.Contains(got, "prod|staging") {
+		t.Errorf("hint joins contexts into a pipeline: %q", got)
+	}
+	for _, want := range []string{"\n  gc mail send --context prod ", "\n  gc mail send --context staging "} {
+		if !strings.Contains(got, want) {
+			t.Errorf("multi-context hint missing %q; got %q", want, got)
+		}
+	}
+	if strings.Contains(strings.ToLower(got), "mayor") || strings.Contains(got, "skill") {
+		t.Errorf("hint names a pack-specific role or skill: %q", got)
+	}
+
 	// No registry: the hint still fires, with a placeholder instead of a name.
 	missing := filepath.Join(t.TempDir(), "absent.toml")
 	if got := crossTownRecipientHint(cfg, "gastown/woodhouse", missing); !strings.Contains(got, "--context <hub context>") {
