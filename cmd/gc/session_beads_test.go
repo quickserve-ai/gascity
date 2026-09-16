@@ -5543,7 +5543,10 @@ func TestCloseBeadReleasesWorkAssignedByNamedIdentity(t *testing.T) {
 		t.Fatalf("set work in_progress: %v", err)
 	}
 
-	if !closeBead(store, testSeatWork("", servingCity("worker"), store, nil), decidedSessionInfo(store, sessionBead.ID), "suspended", now, ioDiscard{}) {
+	// The close REASON cannot carry this: "suspended" appears at no non-test call
+	// site and nothing reads it. Only cfg can tell a suspended named agent from a
+	// live one, which is why this test needs one (ga-9n8hjv).
+	if !closeBead(store, testSeatWork("", servingRigsCity(namedSessionTestCfg(true), "worker"), store, nil), decidedSessionInfo(store, sessionBead.ID), "suspended", now, ioDiscard{}) {
 		t.Fatal("closeBead returned false, want true")
 	}
 
@@ -5556,6 +5559,145 @@ func TestCloseBeadReleasesWorkAssignedByNamedIdentity(t *testing.T) {
 	}
 	if gotWork.Status != "open" {
 		t.Errorf("work status = %q, want open", gotWork.Status)
+	}
+}
+
+// namedSessionTestCfg declares "reviewer" as a [[named_session]] whose backing agent
+// is live or suspended. releasableAssigneeIdentities reaches it through
+// isConfiguredNamedSessionIdentity, the only thing that can separate a LIVE named seat
+// (whose work must be withheld) from a SUSPENDED one (whose work must be released,
+// because the named-session tier never claims for a suspended agent).
+//
+// The fixture is CITY-SCOPED (no Dir) because that is the shape the fleet actually
+// runs: city.toml declares these seats as [[named_session]] template/scope="city",
+// and a live session bead carries the BARE identity ("katya", "woodhouse") in
+// configured_named_identity — verified against the running town 2026-09-16. A
+// dir-scoped fixture qualifies the identity ("gascity/reviewer"), the bare assignee
+// then matches nothing, and the cfg branch RELEASES a live seat — so a fixture built
+// to the wrong scope would have proved the fixture and hidden a fail-open.
+// TestCloseBeadWithholdsWorkFromLiveRigScopedNamedIdentity pins the other scope.
+func namedSessionTestCfg(suspended bool) *config.City {
+	return &config.City{
+		Agents: []config.Agent{
+			{Name: "reviewer", Suspended: suspended, MaxActiveSessions: intPtr(1)},
+		},
+		NamedSessions: []config.NamedSession{
+			{Template: "reviewer", Scope: "city", Mode: "always"},
+		},
+	}
+}
+
+// namedSessionTestCfgRigScoped is the dir-qualified counterpart: a rig-scoped named
+// session whose identity is "gascity/reviewer".
+func namedSessionTestCfgRigScoped(suspended bool) *config.City {
+	return &config.City{
+		Agents: []config.Agent{
+			{Name: "reviewer", Dir: "gascity", Suspended: suspended, MaxActiveSessions: intPtr(1)},
+		},
+		NamedSessions: []config.NamedSession{
+			{Template: "reviewer", Dir: "gascity", Scope: "rig", Mode: "on_demand"},
+		},
+	}
+}
+
+// closeBeadNamedIdentityFixture builds the ga-9n8hjv shape: a session bead carrying a
+// durable configured_named_identity, plus one in_progress work bead assigned under that
+// same durable identity.
+func closeBeadNamedIdentityFixture(t *testing.T, identity string) (beads.Store, beads.Bead, beads.Bead) {
+	t.Helper()
+	store := beads.NewMemStore()
+	sessionBead, err := store.Create(beads.Bead{
+		Title:  identity,
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name":              "reviewer-gm-dead",
+			"configured_named_identity": identity,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create session bead: %v", err)
+	}
+	work, err := store.Create(beads.Bead{
+		Title:    "named-session work",
+		Assignee: identity,
+	})
+	if err != nil {
+		t.Fatalf("create work bead: %v", err)
+	}
+	if err := store.Update(work.ID, beads.UpdateOpts{Status: strPtr("in_progress")}); err != nil {
+		t.Fatalf("set work in_progress: %v", err)
+	}
+	return store, sessionBead, work
+}
+
+// TestCloseBeadWithholdsWorkFromLiveNamedIdentity is the ga-9n8hjv regression itself:
+// a LIVE configured named seat cycling its session must keep its whole portfolio. The
+// 2026-09-11 incident was 50 beads detached 9s after one session bead closed, 11 of them
+// reset in_progress -> open.
+func TestCloseBeadWithholdsWorkFromLiveNamedIdentity(t *testing.T) {
+	now := time.Date(2026, 4, 18, 12, 0, 0, 0, time.UTC)
+	store, sessionBead, work := closeBeadNamedIdentityFixture(t, "reviewer")
+
+	if !closeBead(store, namedSessionTestCfg(false), sessionBead.ID, "orphaned", now, ioDiscard{}) {
+		t.Fatal("closeBead returned false, want true")
+	}
+
+	gotWork, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("get work bead: %v", err)
+	}
+	if gotWork.Assignee != "reviewer" {
+		t.Errorf("work assignee = %q, want %q (a live named seat keeps its portfolio across a session close)", gotWork.Assignee, "reviewer")
+	}
+	if gotWork.Status != "in_progress" {
+		t.Errorf("work status = %q, want in_progress (releasing would reset it to open and the resume check would report no work)", gotWork.Status)
+	}
+}
+
+// TestCloseBeadWithholdsWorkFromLiveRigScopedNamedIdentity is the same contract for a
+// rig-scoped seat, where both the bead's identity and the config are dir-qualified.
+func TestCloseBeadWithholdsWorkFromLiveRigScopedNamedIdentity(t *testing.T) {
+	now := time.Date(2026, 4, 18, 12, 0, 0, 0, time.UTC)
+	store, sessionBead, work := closeBeadNamedIdentityFixture(t, "gascity/reviewer")
+
+	if !closeBead(store, namedSessionTestCfgRigScoped(false), sessionBead.ID, "orphaned", now, ioDiscard{}) {
+		t.Fatal("closeBead returned false, want true")
+	}
+
+	gotWork, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("get work bead: %v", err)
+	}
+	if gotWork.Assignee != "gascity/reviewer" {
+		t.Errorf("work assignee = %q, want %q (a live rig-scoped named seat keeps its portfolio too)", gotWork.Assignee, "gascity/reviewer")
+	}
+	if gotWork.Status != "in_progress" {
+		t.Errorf("work status = %q, want in_progress", gotWork.Status)
+	}
+}
+
+// TestCloseBeadWithholdsWorkFromNamedIdentityWithoutConfig pins the fail-closed branch.
+// isConfiguredNamedSessionIdentity returns false on a nil cfg, so consulting it blind
+// here would fail OPEN and strip live seats. With no cfg the durable identities are
+// withheld on metadata alone.
+func TestCloseBeadWithholdsWorkFromNamedIdentityWithoutConfig(t *testing.T) {
+	now := time.Date(2026, 4, 18, 12, 0, 0, 0, time.UTC)
+	store, sessionBead, work := closeBeadNamedIdentityFixture(t, "reviewer")
+
+	if !closeBead(store, nil, sessionBead.ID, "orphaned", now, ioDiscard{}) {
+		t.Fatal("closeBead returned false, want true")
+	}
+
+	gotWork, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("get work bead: %v", err)
+	}
+	if gotWork.Assignee != "reviewer" {
+		t.Errorf("work assignee = %q, want %q (no cfg must fail CLOSED, never release a durable identity)", gotWork.Assignee, "reviewer")
+	}
+	if gotWork.Status != "in_progress" {
+		t.Errorf("work status = %q, want in_progress", gotWork.Status)
 	}
 }
 

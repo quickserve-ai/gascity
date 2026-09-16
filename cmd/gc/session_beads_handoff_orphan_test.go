@@ -248,7 +248,7 @@ func TestReleaseWorkFromClosedSessionBeadKeepsNamedSeatPortfolio(t *testing.T) {
 	}
 
 	var stderr bytes.Buffer
-	releaseWorkFromClosedSessionBead(store, sessionBead, &stderr)
+	releaseWorkFromClosedSessionBead(store, nil, sessionBead, &stderr)
 
 	got, err := store.Get(work.ID)
 	if err != nil {
@@ -297,7 +297,7 @@ func TestReleaseWorkFromClosedSessionBeadStillReleasesSessionHandles(t *testing.
 	}
 
 	var stderr bytes.Buffer
-	releaseWorkFromClosedSessionBead(store, sessionBead, &stderr)
+	releaseWorkFromClosedSessionBead(store, nil, sessionBead, &stderr)
 
 	for _, tc := range []struct {
 		name string
