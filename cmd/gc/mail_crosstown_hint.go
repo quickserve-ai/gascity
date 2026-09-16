@@ -21,15 +21,13 @@ import (
 //
 // It runs only on the path that has already refused. It changes no resolution.
 func crossTownRecipientHint(cfg *config.City, recipient, contextsPath string) string {
-	cityName := ""
-	var rigNames []string
-	if cfg != nil {
-		cityName = cfg.EffectiveCityName()
-		for _, rig := range cfg.Rigs {
-			rigNames = append(rigNames, rig.Name)
-		}
+	// Without a loaded config nothing is known about this city's rigs or dirs,
+	// so "not this city" cannot be claimed. Say nothing rather than misdirect.
+	if cfg == nil {
+		return ""
 	}
-	prefix, foreign := mail.ForeignTownPrefix(recipient, cityName, rigNames)
+	cityName := cfg.EffectiveCityName()
+	prefix, foreign := mail.ForeignTownPrefix(recipient, cityName, cfg.LocalAddressPrefixes())
 	if !foreign {
 		return ""
 	}
