@@ -118,14 +118,14 @@ func (s *Server) resolveMailSendRecipientWithContext(ctx context.Context, recipi
 // mailbox the hub knows (gastown/woodhouse, for one) never reaches this branch.
 func (s *Server) mailRecipientNotFound(recipient string) error {
 	notFound := apiSessionTargetNotFound(recipient)
-	cityName := s.state.CityName()
-	var rigNames []string
-	if cfg := s.state.Config(); cfg != nil {
-		for _, rig := range cfg.Rigs {
-			rigNames = append(rigNames, rig.Name)
-		}
+	cfg := s.state.Config()
+	if cfg == nil {
+		// Without config the rigs and agent dirs are unknown; claiming the
+		// address is foreign could misdirect a typo in a local one.
+		return notFound
 	}
-	prefix, foreign := mail.ForeignTownPrefix(recipient, cityName, rigNames)
+	cityName := s.state.CityName()
+	prefix, foreign := mail.ForeignTownPrefix(recipient, cityName, cfg.LocalAddressPrefixes())
 	if !foreign {
 		return notFound
 	}
