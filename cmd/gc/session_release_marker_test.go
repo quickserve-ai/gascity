@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -321,7 +322,10 @@ func TestDeferredReleaseAnnouncesAnUnrecordableObligation(t *testing.T) {
 		t.Fatalf("result claims the obligation persisted through a failing store: %+v", result)
 	}
 	out := stderr.String()
-	for _, want := range []string{"NOTHING will find it", "re-run this close"} {
+	// "reassign that work by hand", not "re-run this close" — see
+	// TestDeferredReleaseAdviceDoesNotPromiseARerunRecovery for why the re-run
+	// advice this test originally asserted was removed.
+	for _, want := range []string{"NOTHING will find it", "by hand"} {
 		if !bytes.Contains([]byte(out), []byte(want)) {
 			t.Errorf("stderr does not say %q; got: %s", want, out)
 		}
@@ -381,5 +385,263 @@ func TestDeferredReleaseEmitsAnObservableEvent(t *testing.T) {
 	}
 	if !slices.Contains(payload.Identities, "worker-named") {
 		t.Errorf("payload identities %v omit the name-shaped form a drain needs", payload.Identities)
+	}
+}
+
+// casFailingStore accepts reads but fails every compare-and-set, standing in for
+// the realistic shape of the ID-only case: the pre-close read failed because the
+// session bead is not reachable, so the write against it cannot land either.
+type casFailingStore struct{ *beads.MemStore }
+
+func (casFailingStore) CompareAndSetMetadataKey(string, string, string, string) (bool, error) {
+	return false, fmt.Errorf("store unreachable")
+}
+
+// The conditional path has its own failure branch, and it is the one that fires
+// in production when the session bead cannot be reached: publishing must report
+// the failure rather than return a result that reads like a successful publish.
+//
+// This is a separate test from the fallback-store case on purpose. That one
+// exercises Update failing; this one exercises the compare-and-set failing, and a
+// fix to either branch is the natural way to break the other.
+func TestDeferredReleaseReportsAFailedConditionalPublish(t *testing.T) {
+	inner := beads.NewMemStore()
+	bead := seedSessionBead(t, inner, map[string]string{"session_name": "worker-named"})
+	store := casFailingStore{MemStore: inner}
+
+	if _, ok := beads.ConditionalWriterFor(store); !ok {
+		t.Fatal("harness no longer exposes a ConditionalWriter, so this test does not reach the branch it names")
+	}
+
+	var stderr bytes.Buffer
+	result := deferMissingConfigWorkRelease(store, bead.ID, bead, true, "config gone", false, nil, time.Now(), &stderr)
+
+	if result.Persisted || result.Published {
+		t.Fatalf("result = %+v, want neither persisted nor published when the swap failed", result)
+	}
+	if result.Err == nil {
+		t.Error("a failed compare-and-set was not reported")
+	}
+	if !bytes.Contains(stderr.Bytes(), []byte("NOTHING will find it")) {
+		t.Errorf("stderr does not warn that the withheld work is unfindable; got: %s", stderr.String())
+	}
+	if got, err := inner.Get(bead.ID); err != nil {
+		t.Fatalf("Get: %v", err)
+	} else if raw := got.Metadata[beadmeta.ReleaseDeferredMetadataKey]; raw != "" {
+		t.Errorf("an obligation was persisted anyway (%q) — the result and the store disagree", raw)
+	}
+}
+
+// policyShapedStore mimics the store the CLI actually holds: *beadPolicyStore
+// embeds the beads.Store INTERFACE — so optional capabilities are NOT promoted
+// through it — and participates in capability lookup only by declaring a
+// resolve target. Asserting CompareAndSetMetadataKey on this shape fails; only a
+// lookup that follows ConditionalWritesResolveTarget finds the capability.
+type policyShapedStore struct {
+	beads.Store
+	target beads.Store
+}
+
+func (s policyShapedStore) ConditionalWritesResolveTarget() beads.Store { return s.target }
+
+// THE TEST THAT WAS MISSING, and whose absence let a real defect ship green.
+//
+// The first version of publishDeferredReleaseObligation used
+// beads.ConditionalWriterFor, which asks for the full four-method
+// ConditionalWriter and does NOT follow a wrapper's declared resolve target. Every
+// other test here passes a bare *MemStore, which implements ConditionalWriter
+// directly — so they all reported ConditionalWrite=true while the production
+// store, wrapped in *beadPolicyStore, silently took the non-atomic fallback.
+//
+// A test built on a fixture that is more capable than production proves the
+// fixture. This one is built on the production SHAPE.
+func TestDeferredReleaseUsesMetadataCASThroughAPolicyShapedWrapper(t *testing.T) {
+	inner := beads.NewMemStore()
+	bead := seedSessionBead(t, inner, map[string]string{"session_name": "worker-named"})
+	store := policyShapedStore{Store: inner, target: inner}
+
+	// Control: prove the harness really is the hard shape. If a direct
+	// ConditionalWriter assertion succeeded, this test would pass for the wrong
+	// reason and prove nothing about the lookup.
+	if _, ok := beads.ConditionalWriterFor(store); ok {
+		t.Fatal("CONTROL FAILED: ConditionalWriterFor resolves this wrapper, so it does not " +
+			"reproduce the production shape and this test cannot detect the defect it exists for")
+	}
+	if _, ok := beads.MetadataCASWriterFor(store); !ok {
+		t.Fatal("MetadataCASWriterFor cannot resolve the wrapper either; the harness is wrong")
+	}
+
+	result := publishDeferredReleaseObligation(store, bead.ID,
+		buildSessionReleaseObligation(bead, true, "config gone", false, time.Now()))
+
+	if !result.Published {
+		t.Fatalf("publish did not land through the wrapper: %+v", result)
+	}
+	if !result.ConditionalWrite {
+		t.Error("ConditionalWrite = false through a policy-shaped wrapper: the publish fell back " +
+			"to a racy read-then-write on the shape production actually uses, so write-once is " +
+			"not enforced where it matters")
+	}
+	if got := releaseObligationOn(t, inner, bead.ID); got.Generation != 1 {
+		t.Errorf("Generation = %d, want 1", got.Generation)
+	}
+}
+
+// FINDING 2. A successful read of an ALREADY-CLOSED session bead is not a
+// pre-close capture. Without this rule, a second close reads the closed, retired
+// bead, labels the degraded snapshot "full", and the write-once rule AUTHORIZES it
+// to replace a good id_only obligation — losing the retired identifiers for good.
+func TestDeferredReleaseWillNotCallAClosedBeadsSnapshotComplete(t *testing.T) {
+	store := beads.NewMemStore()
+	bead := seedSessionBead(t, store, map[string]string{"session_name": "worker-named"})
+
+	// Invocation A: its pre-close read failed, so only the ID is known.
+	if r := publishDeferredReleaseObligation(store, bead.ID,
+		buildSessionReleaseObligation(beads.Bead{ID: bead.ID}, false, "read failed", false, time.Now())); !r.Published {
+		t.Fatalf("degraded publish did not land: %+v", r)
+	}
+
+	// A's close then retires the identifiers and closes the bead. Invocation B now
+	// reads that bead SUCCESSFULLY — but what it reads is post-retirement.
+	retiredAndClosed := beads.Bead{
+		ID:     bead.ID,
+		Status: "closed",
+		Metadata: map[string]string{
+			"session_name":  "",
+			"alias":         "",
+			"alias_history": "worker-ga-abc12",
+		},
+	}
+	obligation := buildSessionReleaseObligation(retiredAndClosed, true, "second close", false, time.Now())
+	if obligation.Capture != releaseCaptureIDOnly {
+		t.Errorf("Capture = %q, want %q: a closed bead cannot yield a pre-retirement capture",
+			obligation.Capture, releaseCaptureIDOnly)
+	}
+
+	second := publishDeferredReleaseObligation(store, bead.ID, obligation)
+	if second.Published {
+		t.Error("a post-close snapshot was allowed to upgrade the obligation")
+	}
+	got := releaseObligationOn(t, store, bead.ID)
+	if got.Reason != "read failed" || got.Generation != 1 {
+		t.Errorf("stored obligation = reason %q generation %d, want the original untouched",
+			got.Reason, got.Generation)
+	}
+}
+
+// FINDING 7. A document this build does not recognize — an unknown capture, a
+// non-positive generation, a bare {} — is left alone, not "upgraded". Reading
+// "not complete" off an unrecognized shape and rewriting it would overwrite a
+// future writer's format and mint a generation an acknowledgement may already
+// name.
+func TestDeferredReleaseLeavesAnUnrecognizedObligationAlone(t *testing.T) {
+	for _, tc := range []struct{ name, stored string }{
+		{"empty object", `{}`},
+		{"unknown capture", `{"generation":1,"capture":"partial"}`},
+		{"zero generation", `{"generation":0,"capture":"id_only"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := beads.NewMemStore()
+			bead := seedSessionBead(t, store, map[string]string{"session_name": "worker-named"})
+			if err := store.Update(bead.ID, beads.UpdateOpts{
+				Metadata: map[string]string{beadmeta.ReleaseDeferredMetadataKey: tc.stored},
+			}); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+
+			result := publishDeferredReleaseObligation(store, bead.ID,
+				buildSessionReleaseObligation(bead, true, "later close", false, time.Now()))
+			if result.Published {
+				t.Error("an unrecognized obligation was overwritten")
+			}
+			if result.Err == nil {
+				t.Error("an unrecognized obligation was not reported")
+			}
+			got, err := store.Get(bead.ID)
+			if err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+			if got.Metadata[beadmeta.ReleaseDeferredMetadataKey] != tc.stored {
+				t.Errorf("stored = %q, want the original bytes preserved",
+					got.Metadata[beadmeta.ReleaseDeferredMetadataKey])
+			}
+		})
+	}
+}
+
+// FINDING 3. The operator message must not tell anyone to re-run the close as a
+// recovery. Once the first close has retired session_name and moved the alias
+// into alias_history, the release path — which reads the CURRENT alias and not
+// alias_history — cannot see what the pool work is held under, so a re-run exits
+// 0 having released nothing. An instruction that runs and silently does nothing
+// is worse than no instruction.
+func TestDeferredReleaseAdviceDoesNotPromiseARerunRecovery(t *testing.T) {
+	store := beads.NewMemStore()
+	bead := seedSessionBead(t, store, map[string]string{"session_name": "worker-named"})
+
+	var stderr bytes.Buffer
+	deferMissingConfigWorkRelease(store, bead.ID, bead, true, "config gone", false, nil, time.Now(), &stderr)
+	out := stderr.String()
+
+	if bytes.Contains([]byte(out), []byte("Re-run this close once the city config loads")) {
+		t.Errorf("stderr still promises a re-run recovery that cannot work; got: %s", out)
+	}
+	for _, want := range []string{"will NOT recover", "alias_history", "by hand"} {
+		if !bytes.Contains([]byte(out), []byte(want)) {
+			t.Errorf("stderr does not say %q; got: %s", want, out)
+		}
+	}
+}
+
+// FINDING 4. The event is emitted BEFORE CloseDetailed, which can still fail. It
+// must not assert a completed close — that record is durable, and a consumer
+// joining on it would believe a still-running session had ended.
+func TestDeferredReleaseEventDoesNotClaimTheCloseHappened(t *testing.T) {
+	store := beads.NewMemStore()
+	bead := seedSessionBead(t, store, map[string]string{"session_name": "worker-named"})
+
+	rec := &deferredReleaseRecorder{}
+	var stderr bytes.Buffer
+	deferMissingConfigWorkRelease(store, bead.ID, bead, true, "config gone", false, rec, time.Now(), &stderr)
+
+	if len(rec.recorded) != 1 {
+		t.Fatalf("recorded %d events, want 1", len(rec.recorded))
+	}
+	msg := rec.recorded[0].Message
+	if strings.Contains(msg, "closed with") {
+		t.Errorf("event message asserts the close completed, but it is emitted before "+
+			"CloseDetailed and that call can fail; got: %s", msg)
+	}
+	if !strings.Contains(msg, "CLOSING") {
+		t.Errorf("event message does not describe the close as in progress; got: %s", msg)
+	}
+}
+
+// FINDING 5. An UPGRADE that fails to write leaves the previous obligation in
+// place, so something usable is still on the bead. Reporting it as unpersisted
+// prints "NOTHING will find it" at an operator whose obligation is intact — a
+// false alarm in the one message that must never cry wolf.
+func TestDeferredReleaseFailedUpgradeStillReportsTheExistingObligation(t *testing.T) {
+	inner := beads.NewMemStore()
+	bead := seedSessionBead(t, inner, map[string]string{"session_name": "worker-named"})
+	if r := publishDeferredReleaseObligation(inner, bead.ID,
+		buildSessionReleaseObligation(beads.Bead{ID: bead.ID}, false, "degraded first", false, time.Now())); !r.Published {
+		t.Fatalf("degraded publish did not land: %+v", r)
+	}
+
+	// A store that reads fine but cannot write, with no CAS capability, so the
+	// upgrade takes the unconditional path and its Update fails.
+	store := storeWithoutConditionalWrites{Store: failingStore{Store: inner}}
+	var stderr bytes.Buffer
+	result := deferMissingConfigWorkRelease(store, bead.ID, bead, true, "second close", false, nil, time.Now(), &stderr)
+
+	if !result.Persisted {
+		t.Error("a failed UPGRADE reported nothing persisted, but the earlier obligation is still there")
+	}
+	if result.Err == nil {
+		t.Error("the failed upgrade was not reported at all")
+	}
+	if bytes.Contains(stderr.Bytes(), []byte("NOTHING will find it")) {
+		t.Errorf("stderr cried wolf on a bead that still carries a usable obligation; got: %s", stderr.String())
 	}
 }
