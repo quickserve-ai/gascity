@@ -16,8 +16,9 @@ package main
 //     so an out-of-tree provider cannot leak back here by accident;
 //   - the whole storage surface compiles identically with CGO on and off, so
 //     the pure-Go driver choice is a checked property rather than a comment;
-//   - the module graph carries no replace directive, so a build of this repo
-//     resolves the dependencies its manifest names and nothing else.
+//   - the module graph carries no replace directive beyond the single one this
+//     fork exists to carry, so a build of this repo resolves the dependencies
+//     its manifest names and nothing else redirected by accident.
 //
 // The last two are what a downstream fork relies on. A fork appends its own
 // factory in its own tree; these arms are what keep the seam it appends to
@@ -33,6 +34,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -201,15 +203,25 @@ func TestStorageSurfaceCompilesIdenticallyWithAndWithoutCGO(t *testing.T) {
 	}
 }
 
-// TestModuleGraphCarriesNoReplaceDirective is the module-graph guarantee a
-// downstream fork builds on: this repo's dependencies are exactly what its
-// manifest names, at released versions, with nothing redirected. It is the
-// tree-side companion to scripts/check-gomod-replace.sh's released-semver-only
-// policy — that script gates what a change adds, this arm gates the result.
+// TestModuleGraphCarriesOnlyTheSanctionedFleetReplace is the carry's
+// re-expression of upstream's TestModuleGraphCarriesNoReplaceDirective, and the
+// reason is in that test's own doc comment: it is "the module-graph guarantee a
+// downstream fork builds on", so that a fork can add ONE replace on top and know
+// nothing else is redirected. carry/operational IS that fork, and the one
+// redirect it exists to carry is gc linking the fleet build of the beads release
+// its go.mod requires (gc-1c2b). Inherited unchanged, upstream's arm asserts the
+// opposite of what this branch is for.
+//
+// So the guarantee is kept and narrowed rather than deleted: exactly one
+// directive is permitted, by path and by released-tag grammar, and every other
+// replace, a left-hand-versioned form of even the permitted one, and a committed
+// go.work all still fail. A second redirect nobody meant to add is caught here
+// just as it was upstream.
 //
 // A replace this parser cannot read is a violation, not a pass: silently
-// ignoring a line we cannot parse is how a guard goes blind.
-func TestModuleGraphCarriesNoReplaceDirective(t *testing.T) {
+// ignoring a line we cannot parse is how a guard goes blind. That arm is
+// upstream's and survives verbatim.
+func TestModuleGraphCarriesOnlyTheSanctionedFleetReplace(t *testing.T) {
 	root := moduleRoot(t)
 	goMod, err := os.ReadFile(filepath.Join(root, "go.mod"))
 	if err != nil {
@@ -219,13 +231,61 @@ func TestModuleGraphCarriesNoReplaceDirective(t *testing.T) {
 	if len(malformed) > 0 {
 		t.Fatalf("go.mod has replace directives this guard cannot parse (lines %v); a manifest we cannot read is a violation, not a pass", malformed)
 	}
-	for _, directive := range directives {
-		t.Errorf("go.mod line %d replaces %q with %q; this module graph carries no replace directive, so a build resolves the dependencies the manifest names and nothing else",
-			directive.line, directive.oldPath, directive.newPath)
+	for _, finding := range unsanctionedReplaceFindings(directives) {
+		t.Error(finding)
 	}
 	if anyGoWorkFile(t, root) {
 		t.Error("the tree commits a go.work; a workspace redirects the module graph for every go invocation started at or below it")
 	}
+}
+
+// The one redirect carry/operational carries: gc links the fleet build of the
+// beads release its go.mod requires, so the library gc compiles in is the same
+// beads code every machine's bd runs (gc-1c2b). The require line is untouched,
+// so the graph still reasons about the upstream path everywhere else.
+const (
+	sanctionedReplaceOldPath = "github.com/steveyegge/beads"
+	sanctionedReplaceNewPath = "github.com/quickserve-ai/beads"
+)
+
+// sanctionedReplaceVersion is the fleet tag grammar, the same shape
+// scripts/check-gomod-replace.sh admits: a released, immutable, proxy-served tag
+// of the required release. A pseudo-version, a branch, a local path or a bare
+// prerelease is not this, and none of them reaches a second reader the way a
+// published tag does.
+var sanctionedReplaceVersion = regexp.MustCompile(`^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?-fleet\.[0-9]{8}(\.[0-9]+)?$`)
+
+// unsanctionedReplaceFindings reports every replace directive that is not the
+// single sanctioned one, one finding per directive. A manifest with no replace
+// at all is clean — the day upstream ships the fleet's beads carries, the pin
+// goes and this guard keeps working unchanged.
+func unsanctionedReplaceFindings(directives []replaceDirective) []string {
+	var findings []string
+	sanctioned := 0
+	for _, directive := range directives {
+		switch {
+		case directive.oldPath != sanctionedReplaceOldPath || directive.newPath != sanctionedReplaceNewPath:
+			findings = append(findings, fmt.Sprintf(
+				"go.mod line %d replaces %q with %q; the only redirect this fork carries is %q => %q, and every other dependency resolves to what the manifest names",
+				directive.line, directive.oldPath, directive.newPath, sanctionedReplaceOldPath, sanctionedReplaceNewPath))
+		case directive.oldVersion != "":
+			findings = append(findings, fmt.Sprintf(
+				"go.mod line %d pins the replace to the single required version %q; the fleet redirect carries no left-hand version, so it keeps applying when the require line moves",
+				directive.line, directive.oldVersion))
+		case !sanctionedReplaceVersion.MatchString(directive.newVersion):
+			findings = append(findings, fmt.Sprintf(
+				"go.mod line %d redirects to %q at %q; the fleet build is named by a released tag matching %s, never a pseudo-version, a branch or a local path",
+				directive.line, directive.newPath, directive.newVersion, sanctionedReplaceVersion))
+		default:
+			sanctioned++
+			if sanctioned > 1 {
+				findings = append(findings, fmt.Sprintf(
+					"go.mod line %d is a second %q redirect; exactly one is carried, and a duplicate means two readers disagree about which build gc links",
+					directive.line, sanctionedReplaceNewPath))
+			}
+		}
+	}
+	return findings
 }
 
 // --- the arms, as functions over an arbitrary tree ---------------------------
