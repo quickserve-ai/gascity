@@ -51,7 +51,7 @@ const (
 	//
 	// Bumped for the carry's go-mod-warm composite step (ga-azybk8): one
 	// deterministic module warm per job ahead of every go command.
-	expectedCIExecutionHash      = "d5a9f53603fe71fbfef74e2b18db8214f8bb7579cb8205fd6ae56a9bccf5afeb"
+	expectedCIExecutionHash      = "b2bd8fb4c7cbf5fe6603612477c0a0dfbfd37abd3f24a85e0d68ed32cf0b96d2"
 	expectedNightlyTriggersHash  = "0a4400a09ac567e90adf8be1232eef1f14e36efd8dba3e143aa6e36f5b7a36f5"
 	expectedNightlyExecutionHash = "6112cdb386602a604767a6d77c21a6ff90ec60587fb0b021105d982fe30c006a" // reviewed delta: Beads v1.3.0-rc.2 -> v1.3.0
 	expectedSetupActionHash      = "12920621ee8af83820e2a89d8b3f216030c1e58559b2650a705e224df23ed3de"
