@@ -66,19 +66,33 @@ func sessionBeadAssigneeIdentities(sb beads.Bead) []string {
 // disciplined the seat is about cycling at clean boundaries, the more often it was
 // stripped.
 //
-// WHY THIS FAILS CLOSED RATHER THAN CONSULTING cfg. Telling a named seat's
-// session_name from a pool session's would need isConfiguredNamedSessionIdentity,
-// which requires *config.City. The close path does not carry one: none of the nine
-// callers of closeBead has cfg in scope, so threading it is a signature cascade
-// through session teardown rather than a local fix. Withholding both name-shaped
-// identifiers is the conservative cut — it can only ever release LESS.
+// WHEN cfg IS PRESENT, this consults it. isConfiguredNamedSessionIdentity answers the
+// question the metadata alone cannot: it separates a LIVE configured named seat (whose
+// work must be withheld) from a SUSPENDED one (whose work must be RELEASED, because the
+// named-session tier never claims work for a suspended agent — withholding there would
+// orphan the bead with neither tier picking it up). This mirrors the sibling release
+// path in cmdSessionClose (unclaimWorkAssignedToRetiredSessionBead) so the two release
+// paths cannot disagree about the same seat.
 //
-// What that costs is bounded and already covered. Pool work is routed, and
-// releaseOrphanedPoolAssignments at the top of the next reconcile tick is this
-// function's documented idempotent fallback for exactly that case; the identifiers
-// pool work is actually claimed under (the bead ID and the alias) are retained here,
-// so ordinary polecat orphan release is untouched.
-func releasableAssigneeIdentities(sb beads.Bead) []string {
+// WHEN cfg IS NIL, this falls back to the metadata alone, and MUST NOT call
+// isConfiguredNamedSessionIdentity: that function returns false on a nil cfg, so calling
+// it blind here would fail OPEN and strip live seats — the original 2026-09-11 bug.
+// Withholding both name-shaped identifiers is the conservative cut; it can only ever
+// release LESS. The cost is bounded: pool work is routed, and releaseOrphanedPoolAssignments
+// at the top of the next reconcile tick is this function's documented idempotent fallback.
+// The identifiers pool work is actually claimed under (the bead ID and the alias) are
+// retained on BOTH branches, so ordinary polecat orphan release is untouched either way.
+func releasableAssigneeIdentities(cfg *config.City, sb beads.Bead) []string {
+	if cfg != nil {
+		identities := make([]string, 0, 5)
+		for _, id := range sessionBeadAssigneeIdentities(sb) {
+			if isConfiguredNamedSessionIdentity(cfg, id) {
+				continue
+			}
+			identities = append(identities, id)
+		}
+		return identities
+	}
 	withheld := map[string]struct{}{}
 	// ONLY a CONFIGURED NAMED session withholds anything. A pool session carries a
 	// session_name too, and work claimed under it belongs to a worker that is gone --
@@ -176,13 +190,13 @@ func boundSessionNameLength(name string) string {
 // typed session.Info projection (WI-5 W4); the close is a session-class op
 // routed through the session front door. Returns the IDs of session beads
 // that were closed.
-func GCSweepSessionBeads(cityPath string, store beads.Store, rigStores map[string]beads.Store, sessionInfos []session.Info) []string {
+func GCSweepSessionBeads(cityPath string, store beads.Store, rigStores map[string]beads.Store, cfg *config.City, sessionInfos []session.Info) []string {
 	var closed []string
 	for _, info := range sessionInfos {
 		if info.Closed {
 			continue
 		}
-		if !closeSessionInfoIfUnassigned(cityPath, store, rigStores, nil, info, "gc_swept", time.Now().UTC(), nil) {
+		if !closeSessionInfoIfUnassigned(cityPath, store, rigStores, cfg, info, "gc_swept", time.Now().UTC(), nil) {
 			continue
 		}
 		closed = append(closed, info.ID)
