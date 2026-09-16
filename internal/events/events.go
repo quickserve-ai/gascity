@@ -146,6 +146,23 @@ const (
 	// the reconciler-detected leak so pack-level subscribers can decide
 	// whether to clear-assignee-and-respawn or escalate.
 	SessionStranded = "session.stranded"
+	// SessionReleaseDeferred fires when "gc session close" WITHHOLDS the work
+	// release because the city config did not load, and publishes a deferred
+	// obligation on the session bead instead (ga-dt5ffp).
+	//
+	// It exists because the withhold is otherwise invisible off-pane. The close
+	// fails closed on purpose — with no config it cannot tell a still-configured
+	// named seat from a retired pool worker, and releasing blind strips a named
+	// agent's whole portfolio (the 2026-09-11 wave, 50 beads) — but the work it
+	// declines to release is then held by nobody: the session bead is already
+	// closed, and the reconciler's snapshot drops closed sessions. Without this
+	// event the only trace is stderr inside one pane.
+	//
+	// marker_persisted is the field to read first. FALSE means the obligation
+	// itself could not be written, so no later drain can find this session, and
+	// the work stays held under a dead session's name until someone re-runs the
+	// close by hand.
+	SessionReleaseDeferred = "session.release_deferred"
 	// SessionUnknownState fires when the reconciler observes a session bead
 	// whose metadata state it does not recognize. The reconciler skips such
 	// beads (forward-compatible rollback: an older reconciler ignores a newer
@@ -431,7 +448,7 @@ var KnownEventTypes = []string{
 	SessionDraining, SessionUndrained, SessionQuarantined,
 	SessionIdleKilled, SessionMaxAgeKilled, SessionSuspended, SessionUpdated,
 	SessionDrainAckedWithAssignedWork,
-	SessionStranded,
+	SessionStranded, SessionReleaseDeferred,
 	SessionUnknownState,
 	SessionWakeRefused,
 	SessionResetStalled,

@@ -523,6 +523,54 @@ type SessionStrandedPayload struct {
 // IsEventPayload marks SessionStrandedPayload as an events.Payload variant.
 func (SessionStrandedPayload) IsEventPayload() {}
 
+// SessionReleaseDeferredPayload carries the machine-readable context for a
+// session.release_deferred event: a "gc session close" that withheld the work
+// release because the city config was unavailable, and published a deferred
+// obligation on the session bead instead.
+//
+// MarkerPersisted is the field a subscriber must branch on. When it is false
+// the obligation was NOT durably recorded, so no drain can ever find this
+// session and the withheld work needs a human; MarkerError says why the write
+// failed. Capture reports whether the identifier set is the full pre-close one
+// or the degraded ID-only fallback — a short Identities list means "we could
+// not read more", never "there is no more".
+type SessionReleaseDeferredPayload struct {
+	SessionID        string   `json:"session_id" doc:"Canonical session bead ID whose close withheld the release (also the envelope Subject)."`
+	Generation       int      `json:"generation" doc:"Obligation generation. 1 for a first publish; higher only when a degraded ID-only obligation was later replaced by a full capture. A drain acknowledges one generation, never the key as a whole."`
+	Reason           string   `json:"reason,omitempty" doc:"Why the city config was unavailable, as reported at close time."`
+	Capture          string   `json:"capture" doc:"\"full\" when the pre-close session bead was read, \"id_only\" when it could not be and only the resolved session ID is known."`
+	Identities       []string `json:"identities,omitempty" doc:"Every identifier under which work could be assigned to this session, captured BEFORE the close mutated them. Untruncated."`
+	RigStoresKnown   bool     `json:"rig_stores_known" doc:"False when rig stores could not be enumerated (the usual case here, since enumerating them needs the config that failed to load). A drain must treat false as \"scope unknown\", never as \"no rig stores\"."`
+	MarkerPersisted  bool     `json:"marker_persisted" doc:"Whether the obligation was durably written to the session bead. False means the deferred release is unrecoverable by any automated path."`
+	MarkerError      string   `json:"marker_error,omitempty" doc:"Why the obligation write failed, when MarkerPersisted is false."`
+	ConditionalWrite bool     `json:"conditional_write" doc:"True when the obligation was published through the store's compare-and-set metadata primitive, which makes the write-once guarantee hold across concurrent close processes. False means the store lacked that capability and a read-then-write fallback was used, which two simultaneous closes could race."`
+}
+
+// IsEventPayload marks SessionReleaseDeferredPayload as an events.Payload variant.
+func (SessionReleaseDeferredPayload) IsEventPayload() {}
+
+// SessionReleaseDeferredPayloadJSON builds the JSON wire form for attachment to
+// an events.Event.Payload field.
+//
+// It takes marker state explicitly rather than inferring it: an obligation that
+// failed to persist still has a generation and an identifier list, and a
+// subscriber that read those without reading MarkerPersisted would conclude the
+// work is queued for recovery when nothing can find it.
+func SessionReleaseDeferredPayloadJSON(sessionID string, generation int, reason, capture string, identities []string, rigStoresKnown, markerPersisted bool, markerError string, conditionalWrite bool) json.RawMessage {
+	b, _ := json.Marshal(SessionReleaseDeferredPayload{
+		SessionID:        sessionID,
+		Generation:       generation,
+		Reason:           reason,
+		Capture:          capture,
+		Identities:       identities,
+		RigStoresKnown:   rigStoresKnown,
+		MarkerPersisted:  markerPersisted,
+		MarkerError:      markerError,
+		ConditionalWrite: conditionalWrite,
+	})
+	return b
+}
+
 // SessionStrandedPayloadJSON builds the JSON wire form for attachment to an
 // events.Event.Payload field. SessionName, Template, and WorkBeadIDs are
 // emitted only when non-empty.
@@ -662,6 +710,7 @@ func init() {
 	events.RegisterPayload(events.SessionUpdated, events.NoPayload{})
 	events.RegisterPayload(events.SessionDrainAckedWithAssignedWork, SessionDrainAckedWithAssignedWorkPayload{})
 	events.RegisterPayload(events.SessionStranded, SessionStrandedPayload{})
+	events.RegisterPayload(events.SessionReleaseDeferred, SessionReleaseDeferredPayload{})
 	events.RegisterPayload(events.SessionUnknownState, SessionUnknownStatePayload{})
 	events.RegisterPayload(events.SessionWakeRefused, SessionWakeRefusedPayload{})
 	events.RegisterPayload(events.SessionResetStalled, events.SessionResetStalledPayload{})
