@@ -1395,6 +1395,7 @@ const strandedRepairCloseReason = "stranded-repair"
 // bead, so the caller mirrors MarkClosed onto the snapshot and prunes the
 // worktree exactly as the clean close path does.
 func repairStrandedPoolWorkerBead(
+	cfg *config.City,
 	store beads.Store,
 	rigStores map[string]beads.Store,
 	info session.Info,
@@ -1426,7 +1427,7 @@ func repairStrandedPoolWorkerBead(
 		fmt.Fprintf(stderr, "session beads: stranded-repair for %s deferred: %d of %d unassign(s) failed; leaving session bead open for retry\n", info.ID, res.Failed, res.Failed+res.Released) //nolint:errcheck
 		return false
 	}
-	return closeBead(store, info.ID, strandedRepairCloseReason, now, stderr)
+	return closeBead(store, cfg, info.ID, strandedRepairCloseReason, now, stderr)
 }
 
 func reassignStateAssignedToRetiredSessionBead(store beads.Store, oldSessionID, newSessionID string, now time.Time, stderr io.Writer) {
@@ -2603,6 +2604,7 @@ func closeFailedCreateBead(sessFront *session.Store, id string, now time.Time, s
 // Returns the number of beads reaped.
 func reapStaleSessionBeads(
 	store beads.Store,
+	cfg *config.City,
 	sp runtime.Provider,
 	dt *drainTracker,
 	clk clock.Clock,
@@ -2697,7 +2699,7 @@ func reapStaleSessionBeads(
 				continue
 			}
 		}
-		if closeBead(store, info.ID, "stale-session", now.UTC(), stderr) {
+		if closeBead(store, cfg, info.ID, "stale-session", now.UTC(), stderr) {
 			fmt.Fprintf(stderr, "WARN: reconciler: reaped stuck-creating session bead %s — tmux session %q not found\n", info.ID, sn) //nolint:errcheck
 			reaped++
 		}
@@ -2708,7 +2710,7 @@ func reapStaleSessionBeads(
 func cleanupDeadRuntimeSessionCorpses(
 	store beads.Store,
 	_ map[string]beads.Store,
-	_ *config.City,
+	cfg *config.City,
 	sessionBeads *sessionBeadSnapshot,
 	dt *drainTracker,
 	sp runtime.Provider,
@@ -2792,7 +2794,7 @@ func cleanupDeadRuntimeSessionCorpses(
 		// runtime-Stop side effect still runs in test contexts that do not
 		// wire a real store; closeBead is idempotent on already-closed beads.
 		if store != nil {
-			closeBead(store, info.ID, "dead-runtime", clk.Now().UTC(), stderr)
+			closeBead(store, cfg, info.ID, "dead-runtime", clk.Now().UTC(), stderr)
 		}
 		cleaned++
 	}
@@ -2998,7 +3000,7 @@ func closeSessionBeadIfRuntimeStoppedAndUnassigned(
 	if isFailedCreateSessionBead(b) {
 		return closeFailedCreateBead(sessionFrontDoor(store), b.ID, now, stderr)
 	}
-	return closeBead(store, b.ID, closeReason, now, stderr)
+	return closeBead(store, cfg, b.ID, closeReason, now, stderr)
 }
 
 func stopRuntimeBeforeSessionBeadMutation(
@@ -3117,7 +3119,7 @@ func staleReapStartBoundaryInfo(i session.Info) (time.Time, bool) {
 // have their assignee cleared and their status reset to "open" so the
 // pool reconciler can re-pick them. Without this, work orphaned by a
 // reap stays orphaned until someone clears the assignee by hand.
-func closeBead(store beads.Store, id, reason string, now time.Time, stderr io.Writer) bool {
+func closeBead(store beads.Store, cfg *config.City, id, reason string, now time.Time, stderr io.Writer) bool {
 	if stderr == nil {
 		stderr = io.Discard
 	}
@@ -3172,7 +3174,7 @@ func closeBead(store beads.Store, id, reason string, now time.Time, stderr io.Wr
 	// slack (#1939).
 	cancelStateAssignedToRetiredSessionBead(store, id, now, stderr)
 	if snapshotErr == nil {
-		releaseWorkFromClosedSessionBead(store, snapshot, stderr)
+		releaseWorkFromClosedSessionBead(store, cfg, snapshot, stderr)
 	}
 	return true
 }
@@ -3187,7 +3189,7 @@ func closeBead(store beads.Store, id, reason string, now time.Time, stderr io.Wr
 // Best-effort: errors are logged to stderr but never fail the caller, since
 // releaseOrphanedPoolAssignments at the top of the next reconcile tick is
 // our idempotent fallback.
-func releaseWorkFromClosedSessionBead(store beads.Store, sessionBead beads.Bead, stderr io.Writer) {
+func releaseWorkFromClosedSessionBead(store beads.Store, cfg *config.City, sessionBead beads.Bead, stderr io.Writer) {
 	if store == nil {
 		return
 	}
@@ -3211,7 +3213,7 @@ func releaseWorkFromClosedSessionBead(store beads.Store, sessionBead beads.Bead,
 	}
 	// RELEASE set, not the capture set: a closing session's durable named identity
 	// must not be used to detach its work (ga-9n8hjv). See releasableAssigneeIdentities.
-	for _, id := range releasableAssigneeIdentities(sessionBead) {
+	for _, id := range releasableAssigneeIdentities(cfg, sessionBead) {
 		addAssignee(id)
 	}
 
