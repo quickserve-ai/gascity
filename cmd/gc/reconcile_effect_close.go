@@ -446,7 +446,9 @@ func (c *closeReleases) cascade(ctx context.Context, it intent) {
 	}
 	if it.Closing.Kind != closeFailedCreate {
 		preserve := assigneePreserveSet(it.Closing.Preserve)
-		scope := releaseScopeOfBead(b, c.cfg).except(preserve)
+		// A closing seat's durable identities are not released on (ga-9n8hjv), as
+		// on the legacy close cascade (releaseWorkFromClosedSessionBeadExcept).
+		scope := releaseScopeOfBead(b, c.cfg).except(preserve).except(durableSessionIdentities(b))
 		if ctx.Err() == nil {
 			if err := clearSessionCurrentClaim(store, b.ID); err != nil {
 				fmt.Fprintf(c.stderr, "session beads: clearing current claim on closing session %s: %v\n", b.ID, err) //nolint:errcheck // best-effort stderr
