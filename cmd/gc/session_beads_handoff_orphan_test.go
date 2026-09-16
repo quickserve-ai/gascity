@@ -202,3 +202,114 @@ func TestReleaseWorkFromClosedSessionBeadWithoutTemplateStillReleases(t *testing
 		t.Fatalf("gc.routed_to = %q, want empty (no template to recover a route from)", got.Metadata[beadmeta.RoutedToMetadataKey])
 	}
 }
+
+// A NAMED agent's entire portfolio was detached every time its session closed.
+// releaseWorkFromClosedSessionBead built its target set from
+// sessionBeadAssigneeIdentities, which includes session_name and
+// configured_named_identity — durable identities, not session handles — so a seat
+// that cycled at a clean boundary (which handoff doctrine REQUIRES) had every open
+// and in-progress bead cleared to an empty assignee, with in_progress reset to open.
+//
+// Measured on hq 2026-09-11T05:08:17Z: 50 beads in one second, 9s after the session
+// bead closed; 11 went in_progress -> open. The seat's next session ran the
+// mechanical resume check (List{assignee, in_progress}) and was told "no work" while
+// holding 11 in-progress items, one of them a P1 durability bead 6h into what became
+// a 95-hour outage. Good behaviour was the trigger (ga-9n8hjv).
+func TestReleaseWorkFromClosedSessionBeadKeepsNamedSeatPortfolio(t *testing.T) {
+	store := beads.NewMemStore()
+
+	sessionBead, err := store.Create(beads.Bead{
+		Title:  "katya",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name":              "katya",
+			"configured_named_identity": "katya",
+			"template":                  "katya",
+			"state":                     "active",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create session bead: %v", err)
+	}
+
+	// The seat's own work, claimed under its DURABLE identity — the normal shape for
+	// a named agent, and the shape the 09-11 wave destroyed.
+	work, err := store.Create(beads.Bead{
+		Title:    "data-plane P1",
+		Status:   "open",
+		Assignee: "katya",
+	})
+	if err != nil {
+		t.Fatalf("create work bead: %v", err)
+	}
+	inProgress := "in_progress"
+	if err := store.Update(work.ID, beads.UpdateOpts{Status: &inProgress}); err != nil {
+		t.Fatalf("mark work in_progress: %v", err)
+	}
+
+	var stderr bytes.Buffer
+	releaseWorkFromClosedSessionBead(store, sessionBead, &stderr)
+
+	got, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("get work bead: %v", err)
+	}
+	// Both halves matter. The assignee is what the resume check queries BY; the
+	// status is what it filters ON. Losing either one makes the work invisible to
+	// the owner, which is the actual harm.
+	if got.Assignee != "katya" {
+		t.Fatalf("named seat lost its assignee: got %q, want \"katya\"", got.Assignee)
+	}
+	if got.Status != "in_progress" {
+		t.Fatalf("named seat's work was reopened: got status %q, want in_progress", got.Status)
+	}
+}
+
+// The other half of the cut: a closing session's HANDLES are still released, so
+// ordinary pool orphan reclamation is untouched. The bead ID and the pool alias name
+// nothing once the session is gone, so work still claimed under one is genuinely
+// orphaned and must not be held forever (ga-9n8hjv acceptance item 3).
+func TestReleaseWorkFromClosedSessionBeadStillReleasesSessionHandles(t *testing.T) {
+	store := beads.NewMemStore()
+
+	sessionBead, err := store.Create(beads.Bead{
+		Title:  "polecat",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name": "gastown__polecat-th-91z",
+			"alias":        "nux",
+			"template":     "gascity/gastown.polecat",
+			"state":        "active",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create session bead: %v", err)
+	}
+
+	byAlias, err := store.Create(beads.Bead{Title: "claimed by alias", Status: "open", Assignee: "nux"})
+	if err != nil {
+		t.Fatalf("create alias work: %v", err)
+	}
+	byID, err := store.Create(beads.Bead{Title: "claimed by bead id", Status: "open", Assignee: sessionBead.ID})
+	if err != nil {
+		t.Fatalf("create id work: %v", err)
+	}
+
+	var stderr bytes.Buffer
+	releaseWorkFromClosedSessionBead(store, sessionBead, &stderr)
+
+	for _, tc := range []struct {
+		name string
+		id   string
+	}{{"alias", byAlias.ID}, {"session bead id", byID.ID}} {
+		got, err := store.Get(tc.id)
+		if err != nil {
+			t.Fatalf("get %s work: %v", tc.name, err)
+		}
+		if got.Assignee != "" {
+			t.Fatalf("work claimed by %s was not released: assignee %q", tc.name, got.Assignee)
+		}
+	}
+}
