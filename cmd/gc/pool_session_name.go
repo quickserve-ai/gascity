@@ -48,6 +48,78 @@ func sessionBeadAssigneeIdentities(sb beads.Bead) []string {
 	return identities
 }
 
+// releasableAssigneeIdentities returns the subset of sessionBeadAssigneeIdentities
+// under which a closing session's work may be DETACHED. Capture and release want
+// opposite sets from the same function, which is the distinction this exists to make
+// explicit (ga-9n8hjv).
+//
+// The session bead ID and the pool alias (plus alias history) are SESSION HANDLES:
+// when the session is gone the handle names nothing, so work still claimed under one
+// is genuinely orphaned and must be released or it is held forever.
+//
+// session_name and configured_named_identity are DURABLE IDENTITIES. A configured
+// named agent between sessions is the normal, doctrine-encouraged state — not an
+// orphan — and releasing on those identifiers strips the seat's whole portfolio every
+// time it cycles. Measured 2026-09-11: 50 beads detached 9s after one session bead
+// closed, 11 of them reset in_progress -> open, after which the mechanical resume
+// check reported "no work" to a seat that held 11 in-progress items. The more
+// disciplined the seat is about cycling at clean boundaries, the more often it was
+// stripped.
+//
+// WHEN cfg IS PRESENT, this consults it. isConfiguredNamedSessionIdentity answers the
+// question the metadata alone cannot: it separates a LIVE configured named seat (whose
+// work must be withheld) from a SUSPENDED one (whose work must be RELEASED, because the
+// named-session tier never claims work for a suspended agent — withholding there would
+// orphan the bead with neither tier picking it up). This mirrors the sibling release
+// path in cmdSessionClose (unclaimWorkAssignedToRetiredSessionBead) so the two release
+// paths cannot disagree about the same seat.
+//
+// WHEN cfg IS NIL, this falls back to the metadata alone, and MUST NOT call
+// isConfiguredNamedSessionIdentity: that function returns false on a nil cfg, so calling
+// it blind here would fail OPEN and strip live seats — the original 2026-09-11 bug.
+// Withholding both name-shaped identifiers is the conservative cut; it can only ever
+// release LESS. The cost is bounded: pool work is routed, and releaseOrphanedPoolAssignments
+// at the top of the next reconcile tick is this function's documented idempotent fallback.
+// The identifiers pool work is actually claimed under (the bead ID and the alias) are
+// retained on BOTH branches, so ordinary polecat orphan release is untouched either way.
+func releasableAssigneeIdentities(cfg *config.City, sb beads.Bead) []string {
+	if cfg != nil {
+		identities := make([]string, 0, 5)
+		for _, id := range sessionBeadAssigneeIdentities(sb) {
+			if isConfiguredNamedSessionIdentity(cfg, id) {
+				continue
+			}
+			identities = append(identities, id)
+		}
+		return identities
+	}
+	withheld := map[string]struct{}{}
+	// ONLY a CONFIGURED NAMED session withholds anything. A pool session carries a
+	// session_name too, and work claimed under it belongs to a worker that is gone --
+	// TestCloseBeadReleasesWorkAssignedBySessionName ("worker-gm-dead"),
+	// ...CleanupDeadRuntimeSessionCorpses... ("crashed-worker", "worker-7") are that
+	// contract. Withholding there would strand a dead polecat's claim forever, and the
+	// pool fallback cannot recover an UNROUTED one. The presence of
+	// configured_named_identity on the session bead is what separates the two, and it
+	// needs no *config.City to read.
+	if strings.TrimSpace(sb.Metadata["configured_named_identity"]) == "" {
+		return sessionBeadAssigneeIdentities(sb)
+	}
+	for _, key := range []string{"session_name", "configured_named_identity"} {
+		if val := strings.TrimSpace(sb.Metadata[key]); val != "" {
+			withheld[val] = struct{}{}
+		}
+	}
+	identities := make([]string, 0, 5)
+	for _, id := range sessionBeadAssigneeIdentities(sb) {
+		if _, skip := withheld[strings.TrimSpace(id)]; skip {
+			continue
+		}
+		identities = append(identities, id)
+	}
+	return identities
+}
+
 // sessionBeadAssigneeIdentitiesInfo is the session.Info mirror of
 // sessionBeadAssigneeIdentities. It reads the RAW session_name
 // (Info.SessionNameMetadata) and the pre-normalized Info.AliasHistory. The body
@@ -118,13 +190,13 @@ func boundSessionNameLength(name string) string {
 // typed session.Info projection (WI-5 W4); the close is a session-class op
 // routed through the session front door. Returns the IDs of session beads
 // that were closed.
-func GCSweepSessionBeads(cityPath string, store beads.Store, rigStores map[string]beads.Store, sessionInfos []session.Info) []string {
+func GCSweepSessionBeads(cityPath string, store beads.Store, rigStores map[string]beads.Store, cfg *config.City, sessionInfos []session.Info) []string {
 	var closed []string
 	for _, info := range sessionInfos {
 		if info.Closed {
 			continue
 		}
-		if !closeSessionInfoIfUnassigned(cityPath, store, rigStores, nil, info, "gc_swept", time.Now().UTC(), nil) {
+		if !closeSessionInfoIfUnassigned(cityPath, store, rigStores, cfg, info, "gc_swept", time.Now().UTC(), nil) {
 			continue
 		}
 		closed = append(closed, info.ID)
