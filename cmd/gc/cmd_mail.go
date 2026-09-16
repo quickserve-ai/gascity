@@ -1953,6 +1953,11 @@ func cmdMailSendJSONFull(args []string, notify bool, all bool, from string, to s
 		canonicalTo, err := resolveMailRecipientIdentityCached(cityPath, cfg, sessStore, args[0], idCache)
 		if err != nil {
 			fmt.Fprintf(stderr, "gc mail send: unknown recipient %q: %v\n", args[0], err) //nolint:errcheck // best-effort stderr
+			if errors.Is(err, session.ErrSessionNotFound) {
+				if hint := crossTownRecipientHint(cfg, args[0], DefaultPath()); hint != "" {
+					fmt.Fprintln(stderr, hint) //nolint:errcheck // best-effort stderr
+				}
+			}
 			return 1
 		}
 		args[0] = canonicalTo

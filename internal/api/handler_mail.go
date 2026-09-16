@@ -105,7 +105,33 @@ func (s *Server) resolveMailSendRecipientWithContext(ctx context.Context, recipi
 	} else if ok {
 		return address, nil
 	}
-	return "", apiSessionTargetNotFound(recipient)
+	return "", s.mailRecipientNotFound(recipient)
+}
+
+// mailRecipientNotFound is the send refusal for a recipient nothing resolved.
+// When the address looks like another town's seat, it says so and names the leg
+// that does work (ga-5toacq). A bare "session not found" reads as a typo, so the
+// sender stops and the message is lost with no record on either side.
+//
+// Only the refusal's text changes. The error still wraps session.ErrSessionNotFound,
+// and every recipient that resolved before still resolves: a foreign-prefixed
+// mailbox the hub knows (gastown/woodhouse, for one) never reaches this branch.
+func (s *Server) mailRecipientNotFound(recipient string) error {
+	notFound := apiSessionTargetNotFound(recipient)
+	cityName := s.state.CityName()
+	var rigNames []string
+	if cfg := s.state.Config(); cfg != nil {
+		for _, rig := range cfg.Rigs {
+			rigNames = append(rigNames, rig.Name)
+		}
+	}
+	prefix, foreign := mail.ForeignTownPrefix(recipient, cityName, rigNames)
+	if !foreign {
+		return notFound
+	}
+	return fmt.Errorf("%w; city %q has no mailbox by that name. If %q is another town, only the mailbox names "+
+		"that town's cross-town poller pulls are addressable here; otherwise send to that town's mayor anchor "+
+		"with a \"[for <rig>/<name>]\" subject (see the cross-town-coordination skill)", notFound, cityName, prefix)
 }
 
 func (s *Server) resolveMailQueryRecipientsWithContext(ctx context.Context, recipient string) []string {
