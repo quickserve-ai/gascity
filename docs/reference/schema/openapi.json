@@ -8084,6 +8084,63 @@
         "description": "Provider-native transcript frame. Gas City forwards the exact JSON the provider wrote to its session log, so the shape is provider-specific and can be any JSON value. The producing provider is identified by the Provider field on the enclosing envelope; consumers dispatch per-provider frame parsing keyed by that identifier.",
         "title": "Session raw transcript frame"
       },
+      "SessionReleaseDeferredPayload": {
+        "additionalProperties": false,
+        "properties": {
+          "capture": {
+            "description": "\"full\" when the pre-close session bead was read, \"id_only\" when it could not be and only the resolved session ID is known.",
+            "type": "string"
+          },
+          "conditional_write": {
+            "description": "True when the obligation was published through the store's compare-and-set metadata primitive, which makes the write-once guarantee hold across concurrent close processes. False means the store lacked that capability and a read-then-write fallback was used, which two simultaneous closes could race.",
+            "type": "boolean"
+          },
+          "generation": {
+            "description": "Obligation generation. 1 for a first publish; higher only when a degraded ID-only obligation was later replaced by a full capture. A drain acknowledges one generation, never the key as a whole.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "identities": {
+            "description": "Every identifier under which work could be assigned to this session, captured BEFORE the close mutated them. Untruncated.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "marker_error": {
+            "description": "Why the obligation write failed, when MarkerPersisted is false.",
+            "type": "string"
+          },
+          "marker_persisted": {
+            "description": "Whether the obligation was durably written to the session bead. False means the deferred release is unrecoverable by any automated path.",
+            "type": "boolean"
+          },
+          "reason": {
+            "description": "Why the city config was unavailable, as reported at close time.",
+            "type": "string"
+          },
+          "rig_stores_known": {
+            "description": "False when rig stores could not be enumerated (the usual case here, since enumerating them needs the config that failed to load). A drain must treat false as \"scope unknown\", never as \"no rig stores\".",
+            "type": "boolean"
+          },
+          "session_id": {
+            "description": "Canonical session bead ID whose close withheld the release (also the envelope Subject).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session_id",
+          "generation",
+          "capture",
+          "rig_stores_known",
+          "marker_persisted",
+          "conditional_write"
+        ],
+        "type": "object"
+      },
       "SessionRenameInputBody": {
         "additionalProperties": false,
         "properties": {
@@ -12836,6 +12893,7 @@
             "session.pending_cleared": "#/components/schemas/TypedEventStreamEnvelopeSessionPendingCleared",
             "session.pool_slot_retired_at_drain_deadline": "#/components/schemas/TypedEventStreamEnvelopeSessionPoolSlotRetiredAtDrainDeadline",
             "session.quarantined": "#/components/schemas/TypedEventStreamEnvelopeSessionQuarantined",
+            "session.release_deferred": "#/components/schemas/TypedEventStreamEnvelopeSessionReleaseDeferred",
             "session.reset_stalled": "#/components/schemas/TypedEventStreamEnvelopeSessionResetStalled",
             "session.stopped": "#/components/schemas/TypedEventStreamEnvelopeSessionStopped",
             "session.stranded": "#/components/schemas/TypedEventStreamEnvelopeSessionStranded",
@@ -13110,6 +13168,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionQuarantined"
+          },
+          {
+            "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionReleaseDeferred"
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionResetStalled"
@@ -18077,6 +18138,63 @@
         "title": "TypedEventStreamEnvelope session.quarantined",
         "type": "object"
       },
+      "TypedEventStreamEnvelopeSessionReleaseDeferred": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/SessionReleaseDeferredPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.release_deferred",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload"
+        ],
+        "title": "TypedEventStreamEnvelope session.release_deferred",
+        "type": "object"
+      },
       "TypedEventStreamEnvelopeSessionResetStalled": {
         "additionalProperties": false,
         "properties": {
@@ -19418,6 +19536,7 @@
             "session.pending_cleared": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionPendingCleared",
             "session.pool_slot_retired_at_drain_deadline": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionPoolSlotRetiredAtDrainDeadline",
             "session.quarantined": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionQuarantined",
+            "session.release_deferred": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionReleaseDeferred",
             "session.reset_stalled": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionResetStalled",
             "session.stopped": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionStopped",
             "session.stranded": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionStranded",
@@ -19692,6 +19811,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionQuarantined"
+          },
+          {
+            "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionReleaseDeferred"
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionResetStalled"
@@ -24993,6 +25115,67 @@
           "city"
         ],
         "title": "TypedTaggedEventStreamEnvelope session.quarantined",
+        "type": "object"
+      },
+      "TypedTaggedEventStreamEnvelopeSessionReleaseDeferred": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/SessionReleaseDeferredPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.release_deferred",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload",
+          "city"
+        ],
+        "title": "TypedTaggedEventStreamEnvelope session.release_deferred",
         "type": "object"
       },
       "TypedTaggedEventStreamEnvelopeSessionResetStalled": {
