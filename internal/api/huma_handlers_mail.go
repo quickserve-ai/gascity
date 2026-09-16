@@ -14,9 +14,17 @@ import (
 	"github.com/gastownhall/gascity/internal/telemetry"
 )
 
-// mailReadDeadline is shorter than the API client's 10s timeout so typed
-// store_slow problem details can reach the CLI before transport timeout.
-var mailReadDeadline = 8 * time.Second
+// defaultMailReadDeadline bounds a mail store read on the server (list, get,
+// count, thread). It must stay strictly shorter than mailReadClientTimeout
+// (25s vs 30s) so a typed store_slow problem detail reaches the CLI before the
+// client gives up on the transport; TestMailReadDeadlineShorterThanClientTimeout
+// enforces the ordering. It was 8s until ga-x49mfh: a hub's mail list query
+// measured 7.4-8.4s over the API on 2026-09-15/16, so 8s failed ~92% of
+// cross-town mailbox reads (~1,400 of ~1,530) with store_slow.
+const defaultMailReadDeadline = 25 * time.Second
+
+// mailReadDeadline is the live server deadline; tests shorten it.
+var mailReadDeadline = defaultMailReadDeadline
 
 type mailReadTimeoutError struct {
 	d time.Duration
