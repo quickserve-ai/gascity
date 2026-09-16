@@ -210,10 +210,32 @@ const (
 	// named a different (no longer live) session, the displaced id is kept
 	// here so recovery can detect the takeover instead of finding the prior
 	// owner erased (ga-pzop1c).
-	PrevSessionIDMetadataKey         = "gc.prev_session_id"
-	PRURLMetadataKey                 = "gc.pr_url"
-	RalphStepIDMetadataKey           = "gc.ralph_step_id"
-	ReasoningMetadataKey             = "gc.reasoning"
+	PrevSessionIDMetadataKey = "gc.prev_session_id"
+	PRURLMetadataKey         = "gc.pr_url"
+	RalphStepIDMetadataKey   = "gc.ralph_step_id"
+	ReasoningMetadataKey     = "gc.reasoning"
+	// ReleaseDeferredMetadataKey carries the IMMUTABLE obligation a session
+	// close publishes when it withholds the work release because the city config
+	// did not load (ga-dt5ffp). The value is a JSON document — see
+	// cmd/gc/session_release_marker.go — recording the pre-close assignee
+	// identifier set, why the release was withheld, whether the capture was
+	// complete, and which stores were reachable at close time.
+	//
+	// It is written BEFORE the close, never rewritten once complete, and is not
+	// a status field: a drain records its progress under
+	// ReleaseDeferredAckMetadataKey instead, so the obligation and its discharge
+	// never contend for one value.
+	ReleaseDeferredMetadataKey = "gc.release_deferred"
+	// ReleaseDeferredAckMetadataKey is RESERVED for the drain that discharges a
+	// ReleaseDeferredMetadataKey obligation. Nothing writes it yet.
+	//
+	// It is a separate key on purpose. The obligation is immutable, so an
+	// acknowledgement cannot be recorded inside it without reopening the
+	// lost-update hazard the immutability exists to close. The drain must
+	// acknowledge PER GENERATION and PER STORE — a wholesale clear would discard
+	// outstanding rig-store cleanup whenever the rig-store map came back
+	// incomplete, which is exactly the silent drop this design refuses.
+	ReleaseDeferredAckMetadataKey    = "gc.release_deferred_ack"
 	RequiredArtifactMetadataKey      = "gc.required_artifact"
 	RequiredArtifactsMetadataKey     = "gc.required_artifacts"
 	ReviewGateMetadataKey            = "gc.review_gate"
@@ -466,6 +488,8 @@ const OptionMetadataPrefix = "opt_"
 // declares. The guard test asserts every gc.* metadata literal used in non-test
 // Go resolves to a member of this slice (or a KnownMetadataPrefixes entry).
 var KnownMetadataKeys = []string{
+	ReleaseDeferredMetadataKey,
+	ReleaseDeferredAckMetadataKey,
 	AttemptLogMetadataKey,
 	AttemptMetadataKey,
 	BondMetadataKey,
