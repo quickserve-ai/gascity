@@ -1871,6 +1871,18 @@ Accepts a session ID (e.g., gc-42) or session alias (e.g., mayor).`,
 	return cmd
 }
 
+// cfgErrOrUnknown names why the city config is unavailable. Both legs that can
+// leave cfg nil are error-bearing — resolveCity failing, or loadCityConfig
+// erroring — but a future third leg might not be, and a fail-closed message that
+// says "(<nil>)" reads as a bug in the guard rather than a missing config. Keep
+// the message honest when there is no error to quote.
+func cfgErrOrUnknown(err error) string {
+	if err != nil {
+		return err.Error()
+	}
+	return "reason not reported"
+}
+
 // cmdSessionClose is the CLI entry point for "gc session close".
 func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool) int {
 	asJSON := sessionJSONRequested(jsonOutput)
@@ -1881,9 +1893,16 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 
 	cityPath, cityErr := resolveCity()
 	var cfg *config.City
-	var cfgErr error
+	// cfgErr records WHY the config is unavailable, on either leg: resolveCity
+	// failing (the load never runs) or loadCityConfig erroring. The work release
+	// below reads cfg to tell a configured named identity from a retired or pool
+	// one, so a nil cfg there is not a benign default — it makes every assignee
+	// look retired. Keep the reason instead of discarding it (ga-9n8hjv).
+	cfgErr := cityErr
 	if cityErr == nil {
-		cfg, cfgErr = loadCityConfig(cityPath, configWarnWriter(sessionJSONRequested(jsonOutput), stderr))
+		var loadErr error
+		cfg, loadErr = loadCityConfig(cityPath, configWarnWriter(sessionJSONRequested(jsonOutput), stderr))
+		cfgErr = loadErr
 	}
 	// SURGICAL route: the session-class consumers (session-ID resolution, session
 	// worker handle, session bead read) go through the session coordination-class
@@ -1962,6 +1981,24 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 	// still-configured [[named_session]] identity, which the respawned agent
 	// re-acquires; a genuinely retired or pool session matches nothing in cfg and is
 	// released exactly as before.
+	// FAIL CLOSED when the city config did not load (ga-9n8hjv). The keep above
+	// is cfg-driven: with cfg nil there is nothing to match a configured
+	// [[named_session]] identity against, so every assignee would read as
+	// retired and the sweep would release a named seat's whole portfolio (on
+	// 2026-09-11 a close on this path cleared 50 beads off a named seat in one
+	// write). Upstream's ReleaseClaims refuses a release with no config at all
+	// (errReleaseNoConfig: no lane can be judged served), so nothing is
+	// released here and the refusal is logged; say why on stderr, since
+	// nothing downstream revisits a closed session's work once the config
+	// loads. (The carry's earlier narrow release of work bound to the dying
+	// bead ID alone is not re-expressed: it would bypass that refusal, and the
+	// carry measured it as freeing nothing in practice.)
+	if cfg == nil {
+		fmt.Fprintf(stderr, "gc session close: city config unavailable (%s); "+ //nolint:errcheck // best-effort stderr
+			"releasing none of the work held by session bead %s — a configured named identity "+
+			"cannot be distinguished from a retired one without the config. Re-run once the config loads.\n",
+			cfgErrOrUnknown(cfgErr), closedSessionBead.ID)
+	}
 	// The session bead lives in the sessions-class store (sessStore), which on a
 	// split city is not the work store the sweep leads with; the claim
 	// back-channel must be cleared where the session bead actually is.
