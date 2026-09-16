@@ -46,6 +46,53 @@ func sessionBeadAssigneeIdentities(sb beads.Bead) []string {
 	return identities
 }
 
+// releasableAssigneeIdentities returns the subset of sessionBeadAssigneeIdentities
+// under which a closing session's work may be DETACHED. Capture and release want
+// opposite sets from the same function, which is the distinction this exists to make
+// explicit (ga-9n8hjv).
+//
+// The session bead ID and the pool alias (plus alias history) are SESSION HANDLES:
+// when the session is gone the handle names nothing, so work still claimed under one
+// is genuinely orphaned and must be released or it is held forever.
+//
+// session_name and configured_named_identity are DURABLE IDENTITIES. A configured
+// named agent between sessions is the normal, doctrine-encouraged state — not an
+// orphan — and releasing on those identifiers strips the seat's whole portfolio every
+// time it cycles. Measured 2026-09-11: 50 beads detached 9s after one session bead
+// closed, 11 of them reset in_progress -> open, after which the mechanical resume
+// check reported "no work" to a seat that held 11 in-progress items. The more
+// disciplined the seat is about cycling at clean boundaries, the more often it was
+// stripped.
+//
+// WHY THIS FAILS CLOSED RATHER THAN CONSULTING cfg. Telling a named seat's
+// session_name from a pool session's would need isConfiguredNamedSessionIdentity,
+// which requires *config.City. The close path does not carry one: none of the nine
+// callers of closeBead has cfg in scope, so threading it is a signature cascade
+// through session teardown rather than a local fix. Withholding both name-shaped
+// identifiers is the conservative cut — it can only ever release LESS.
+//
+// What that costs is bounded and already covered. Pool work is routed, and
+// releaseOrphanedPoolAssignments at the top of the next reconcile tick is this
+// function's documented idempotent fallback for exactly that case; the identifiers
+// pool work is actually claimed under (the bead ID and the alias) are retained here,
+// so ordinary polecat orphan release is untouched.
+func releasableAssigneeIdentities(sb beads.Bead) []string {
+	withheld := map[string]struct{}{}
+	for _, key := range []string{"session_name", "configured_named_identity"} {
+		if val := strings.TrimSpace(sb.Metadata[key]); val != "" {
+			withheld[val] = struct{}{}
+		}
+	}
+	identities := make([]string, 0, 5)
+	for _, id := range sessionBeadAssigneeIdentities(sb) {
+		if _, skip := withheld[strings.TrimSpace(id)]; skip {
+			continue
+		}
+		identities = append(identities, id)
+	}
+	return identities
+}
+
 // sessionBeadAssigneeIdentitiesInfo is the session.Info mirror of
 // sessionBeadAssigneeIdentities. It reads the RAW session_name
 // (Info.SessionNameMetadata) and the pre-normalized Info.AliasHistory. The body

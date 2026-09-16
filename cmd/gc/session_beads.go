@@ -3209,7 +3209,9 @@ func releaseWorkFromClosedSessionBead(store beads.Store, sessionBead beads.Bead,
 		}
 		seenAssignees[val] = struct{}{}
 	}
-	for _, id := range sessionBeadAssigneeIdentities(sessionBead) {
+	// RELEASE set, not the capture set: a closing session's durable named identity
+	// must not be used to detach its work (ga-9n8hjv). See releasableAssigneeIdentities.
+	for _, id := range releasableAssigneeIdentities(sessionBead) {
 		addAssignee(id)
 	}
 
