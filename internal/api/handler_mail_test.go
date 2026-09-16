@@ -1471,7 +1471,7 @@ func TestMailSendUnresolvedForeignTownRecipientNamesTheHubLeg(t *testing.T) {
 	if foreign.Code < 400 || foreign.Code >= 500 {
 		t.Fatalf("foreign send status = %d, want 4xx; body: %s", foreign.Code, foreign.Body.String())
 	}
-	for _, want := range []string{"session not found", `"gastown/woodhouse"`, "mayor anchor", "[for <rig>/<name>]"} {
+	for _, want := range []string{"session not found", `"gastown/woodhouse"`, "cross-town routing address", "[for <rig>/<name>]"} {
 		if got := detail(foreign); !strings.Contains(got, want) {
 			t.Errorf("foreign refusal missing %q; detail: %s", want, got)
 		}
@@ -1486,7 +1486,7 @@ func TestMailSendUnresolvedForeignTownRecipientNamesTheHubLeg(t *testing.T) {
 		if !strings.Contains(got, "session not found") {
 			t.Errorf("send to %q: want plain not-found refusal; detail: %s", to, got)
 		}
-		if strings.Contains(got, "mayor anchor") {
+		if strings.Contains(got, "cross-town routing address") {
 			t.Errorf("send to %q got the cross-town hint, want none; detail: %s", to, got)
 		}
 	}
