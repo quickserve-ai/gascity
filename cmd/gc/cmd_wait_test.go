@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/build"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -27,6 +28,7 @@ import (
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/storeref"
+	"golang.org/x/mod/module"
 	"golang.org/x/mod/semver"
 )
 
@@ -680,26 +682,59 @@ func waitTestRealBDPath(t *testing.T) string {
 	return waitTestRealBDCached
 }
 
-// buildPinnedBDBinaryForTests builds the bd CLI from the exact
-// github.com/steveyegge/beads module version this repo's go.mod requires, so
-// the binary's compiled-in schema/migration knowledge always matches
-// gascity's own in-process beads code (internal/beads imports that same
-// module directly). A bd resolved by searching PATH/home-dir locations
-// instead (as findPreferredBinary does for callers that only need some bd
-// present) carries no such guarantee: it can drift to a different schema
-// version and fail deep inside a test with a cryptic mismatch error instead
-// of cleanly at the point the drift actually originates (ga-r9cvmi).
-//
-// go install's "@version" form deliberately ignores any enclosing module's
-// go.mod/go.sum and resolves the target module's own dependency closure in
-// isolation, which is required here: cmd/bd's full dependency graph (CLI
-// extras like AI-assisted duplicate detection, ADO rich-text rendering,
-// telemetry exporters) is broader than what gascity's own go.sum carries,
-// since gascity only imports internal/beads's storage packages.
+const (
+	// beadsModulePath is the module path gascity requires for beads. A fleet
+	// build of beads is consumed through a go.mod replace and never by
+	// changing this path, so the fork keeps declaring it as its own module
+	// path and this stays correct on both sides of the pin.
+	beadsModulePath = "github.com/steveyegge/beads"
+	// beadsBDPackage is the bd CLI package inside that module.
+	beadsBDPackage = beadsModulePath + "/cmd/bd"
+	// beadsBuildTags is the build-tag set bd is built with: the pure-Go
+	// go-mysql-server backend.
+	beadsBuildTags = "gms_pure_go"
+	// develModuleVersion is what the toolchain stamps as a binary's main
+	// module version when it is built from a module directory instead of
+	// installed at a version.
+	develModuleVersion = "(devel)"
+)
+
+// pinnedBeadsModule identifies the beads module this test binary actually
+// links: the module go.mod requires, or the module that replaces it.
+type pinnedBeadsModule struct {
+	// Path is the module path bd is built from — beadsModulePath unless
+	// go.mod replaces beads, in which case it is the replacement's path.
+	Path string
+	// Version is that module's version. It is empty only for a filesystem
+	// replacement, which scripts/check-gomod-replace.sh forbids in a
+	// committed go.mod but a local experiment can still produce.
+	Version string
+	// Replaced records whether go.mod redirects beads at all.
+	Replaced bool
+}
+
+// pinnedBDBuildPlan is the single `go` invocation that produces a bd binary
+// from the pinned beads module.
+type pinnedBDBuildPlan struct {
+	// Args are the arguments to the `go` command.
+	Args []string
+	// Dir is that command's working directory; empty inherits the caller's.
+	Dir string
+}
+
+// buildPinnedBDBinaryForTests builds the bd CLI from the exact beads module
+// this repo's go.mod selects, so the binary's compiled-in schema/migration
+// knowledge always matches gascity's own in-process beads code
+// (internal/beads imports that same module directly). A bd resolved by
+// searching PATH/home-dir locations instead (as findPreferredBinary does for
+// callers that only need some bd present) carries no such guarantee: it can
+// drift to a different schema version and fail deep inside a test with a
+// cryptic mismatch error instead of cleanly at the point the drift actually
+// originates (ga-r9cvmi).
 func buildPinnedBDBinaryForTests() (string, error) {
-	version, err := pinnedBeadsModuleVersion()
+	mod, err := resolvePinnedBeadsModule()
 	if err != nil {
-		return "", fmt.Errorf("resolve pinned beads module version: %w", err)
+		return "", fmt.Errorf("resolve pinned beads module: %w", err)
 	}
 
 	sweepOrphanPIDPrefixedDirs(os.TempDir(), testBDBinaryDirPrefix)
@@ -707,38 +742,113 @@ func buildPinnedBDBinaryForTests() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("mktemp bd binary dir: %w", err)
 	}
+	binaryPath := filepath.Join(buildDir, "bd")
 
-	cmd := exec.Command("go", "install", "-tags", "gms_pure_go",
-		"github.com/steveyegge/beads/cmd/bd@"+version)
+	plan, err := planPinnedBDBuild(mod, goModuleCacheDir(), binaryPath)
+	if err != nil {
+		return "", err
+	}
+	cmd := exec.Command("go", plan.Args...)
+	cmd.Dir = plan.Dir
 	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOBIN="+buildDir)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("go install github.com/steveyegge/beads/cmd/bd@%s: %w\n%s", version, err, out)
+		return "", fmt.Errorf("go %s: %w\n%s", strings.Join(plan.Args, " "), err, out)
 	}
-	return filepath.Join(buildDir, "bd"), nil
+	return binaryPath, nil
 }
 
-// pinnedBeadsModuleVersion reports the github.com/steveyegge/beads version
-// this test binary was actually built against, read from this process's own
-// embedded build info rather than a `go list -m` subprocess or a go.mod text
-// scan: debug.ReadBuildInfo reflects the exact resolved dependency graph
-// (including any replace/exclude directives) with zero process spawn, and it
-// can never itself drift from go.mod the way a second hardcoded version
-// string could, since the compiler stamps it in at build time.
-func pinnedBeadsModuleVersion() (string, error) {
+// planPinnedBDBuild returns the one `go` invocation that puts bd at outPath.
+//
+// Without a replace that is `go install <pkg>@<version>`, whose "@version"
+// form deliberately ignores any enclosing module's go.mod/go.sum and resolves
+// the target module's own dependency closure in isolation. That is required
+// here: cmd/bd's full dependency graph (CLI extras like AI-assisted duplicate
+// detection, ADO rich-text rendering, telemetry exporters) is broader than
+// what gascity's own go.sum carries, since gascity only imports the module's
+// storage packages.
+//
+// With a replace that form cannot express the pin at all. `go install
+// <path>@<version>` resolves <path> against the module line the fetched
+// module declares, and a fork consumed through a replace keeps declaring the
+// upstream path, so installing the replacement by its own path is rejected as
+// a mismatch. Build the replacement's extracted module directory instead —
+// that directory is the source the replace actually selected, and its own
+// go.mod/go.sum still resolve cmd/bd's wider closure in isolation.
+func planPinnedBDBuild(mod pinnedBeadsModule, modCacheDir, outPath string) (pinnedBDBuildPlan, error) {
+	if !mod.Replaced {
+		return pinnedBDBuildPlan{Args: []string{"install", "-tags", beadsBuildTags, beadsBDPackage + "@" + mod.Version}}, nil
+	}
+	dir, err := replacementModuleDir(mod, modCacheDir)
+	if err != nil {
+		return pinnedBDBuildPlan{}, err
+	}
+	return pinnedBDBuildPlan{
+		Args: []string{"build", "-tags", beadsBuildTags, "-o", outPath, "./cmd/bd"},
+		Dir:  dir,
+	}, nil
+}
+
+// replacementModuleDir reports where the toolchain extracted a replacement
+// module's source under modCacheDir.
+func replacementModuleDir(mod pinnedBeadsModule, modCacheDir string) (string, error) {
+	if mod.Version == "" {
+		// A filesystem replacement names its source directory directly.
+		return mod.Path, nil
+	}
+	escapedPath, err := module.EscapePath(mod.Path)
+	if err != nil {
+		return "", fmt.Errorf("escape beads replacement path %q: %w", mod.Path, err)
+	}
+	escapedVersion, err := module.EscapeVersion(mod.Version)
+	if err != nil {
+		return "", fmt.Errorf("escape beads replacement version %q: %w", mod.Version, err)
+	}
+	dir := filepath.Join(modCacheDir, filepath.FromSlash(escapedPath)+"@"+escapedVersion)
+	info, err := os.Stat(dir)
+	if err != nil {
+		return "", fmt.Errorf("beads replacement %s@%s is not extracted under %s: %w", mod.Path, mod.Version, modCacheDir, err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("beads replacement %s@%s resolved to %s, which is not a directory", mod.Path, mod.Version, dir)
+	}
+	return dir, nil
+}
+
+// goModuleCacheDir reports the directory the toolchain extracts module
+// sources into, matching the go command's own resolution order.
+func goModuleCacheDir() string {
+	if dir := os.Getenv("GOMODCACHE"); dir != "" {
+		return dir
+	}
+	gopath := build.Default.GOPATH
+	if index := strings.IndexRune(gopath, filepath.ListSeparator); index >= 0 {
+		gopath = gopath[:index]
+	}
+	return filepath.Join(gopath, "pkg", "mod")
+}
+
+// resolvePinnedBeadsModule reports the beads module this test binary was
+// actually built against, read from this process's own embedded build info
+// rather than a `go list -m` subprocess or a go.mod text scan:
+// debug.ReadBuildInfo reflects the exact resolved dependency graph (including
+// any replace directive) with zero process spawn, and it can never itself
+// drift from go.mod the way a second hardcoded version string could, since
+// the compiler stamps it in at build time.
+func resolvePinnedBeadsModule() (pinnedBeadsModule, error) {
 	bi, ok := debug.ReadBuildInfo()
 	if !ok {
-		return "", fmt.Errorf("read build info: not available (binary not built with module support)")
+		return pinnedBeadsModule{}, fmt.Errorf("read build info: not available (binary not built with module support)")
 	}
 	for _, dep := range bi.Deps {
-		if dep.Path != "github.com/steveyegge/beads" {
+		if dep.Path != beadsModulePath {
 			continue
 		}
 		if dep.Replace != nil {
-			return dep.Replace.Version, nil
+			return pinnedBeadsModule{Path: dep.Replace.Path, Version: dep.Replace.Version, Replaced: true}, nil
 		}
-		return dep.Version, nil
+		return pinnedBeadsModule{Path: dep.Path, Version: dep.Version}, nil
 	}
-	return "", fmt.Errorf("github.com/steveyegge/beads not found in build info deps")
+	return pinnedBeadsModule{}, fmt.Errorf("%s not found in build info deps", beadsModulePath)
 }
 
 // TestBuildPinnedBDBinaryForTestsUsesGoModSource locks in the fix for
@@ -746,7 +856,8 @@ func pinnedBeadsModuleVersion() (string, error) {
 // old waitTestRealBDPath behavior, still used elsewhere via
 // findPreferredBinary) carries no guarantee of matching the schema/migration
 // knowledge baked into gascity's own in-process beads code, which is compiled
-// from the exact github.com/steveyegge/beads version go.mod pins. Confirmed
+// from the exact beads module go.mod selects — the required version, or the
+// fleet build that replaces it (gc-1c2b). Confirmed
 // live: the same ~/.local/bin/bd path reported two different version stamps
 // across two consecutive invocations in this same fleet sandbox, and
 // ga-r9cvmi's own notes captured a deterministic v49-vs-v53 schema mismatch
@@ -766,9 +877,20 @@ func TestBuildPinnedBDBinaryForTestsUsesGoModSource(t *testing.T) {
 	// any shard that also holds a waitTestRealBDPath caller.
 	bdPath := waitTestRealBDPath(t)
 
-	pinned, err := pinnedBeadsModuleVersion()
+	mod, err := resolvePinnedBeadsModule()
 	if err != nil {
-		t.Fatalf("pinnedBeadsModuleVersion: %v", err)
+		t.Fatalf("resolvePinnedBeadsModule: %v", err)
+	}
+	// The module line carries a version only when bd was installed at one. A
+	// replace makes that impossible (see planPinnedBDBuild), so the
+	// replacement's module directory is built instead and the toolchain
+	// stamps the main module (devel). The declared module path stays
+	// beadsModulePath either way — a fork that keeps declaring the upstream
+	// path is exactly what makes the replace legal, so the path is the part
+	// worth asserting.
+	wantModVersion := mod.Version
+	if mod.Replaced {
+		wantModVersion = develModuleVersion
 	}
 	out, err := exec.Command(bdPath, "version").CombinedOutput()
 	if err != nil {
@@ -792,18 +914,94 @@ func TestBuildPinnedBDBinaryForTestsUsesGoModSource(t *testing.T) {
 	foundPinnedModule := false
 	for _, line := range strings.Split(string(metadata), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) >= 3 && fields[0] == "mod" && fields[1] == "github.com/steveyegge/beads" && fields[2] == pinned {
+		if len(fields) >= 3 && fields[0] == "mod" && fields[1] == beadsModulePath && fields[2] == wantModVersion {
 			foundPinnedModule = true
 			break
 		}
 	}
 	if !foundPinnedModule {
-		t.Fatalf("%s build metadata %q does not retain pinned Beads module version %q", bdPath, metadata, pinned)
+		t.Fatalf("%s build metadata %q does not report module %s at %q", bdPath, metadata, beadsModulePath, wantModVersion)
 	}
 	// `bd version` reports the release variable declared by Beads source
 	// (currently 1.1.0), not the Go module pseudo-version used to fetch that
 	// source. The exact source guarantee is therefore checked through the
 	// compiled binary's module metadata above.
+}
+
+// TestPlanPinnedBDBuildFollowsTheGoModReplace locks in the beads fleet pin
+// (gc-1c2b). go.mod redirects github.com/steveyegge/beads to a fleet build of
+// the fork through a replace, so a bd built for these tests has to come from
+// the replacement module, not from the upstream version the require line
+// still names — an upstream bd would carry different schema/migration
+// knowledge from the beads code gc itself links, which is the exact drift
+// buildPinnedBDBinaryForTests exists to prevent. Without a replace the plan
+// is byte-for-byte what it always was.
+func TestPlanPinnedBDBuildFollowsTheGoModReplace(t *testing.T) {
+	const (
+		forkPath    = "github.com/quickserve-ai/beads"
+		forkVersion = "v1.3.0-rc.2-fleet.20260915.2"
+	)
+	outPath := filepath.Join(t.TempDir(), "bd")
+
+	t.Run("without_a_replace_installs_the_required_module_at_its_version", func(t *testing.T) {
+		plan, err := planPinnedBDBuild(pinnedBeadsModule{Path: beadsModulePath, Version: "v1.3.0-rc.2"}, t.TempDir(), outPath)
+		if err != nil {
+			t.Fatalf("planPinnedBDBuild: %v", err)
+		}
+		want := []string{"install", "-tags", beadsBuildTags, beadsBDPackage + "@v1.3.0-rc.2"}
+		if !reflect.DeepEqual(plan.Args, want) {
+			t.Errorf("plan.Args = %q, want %q", plan.Args, want)
+		}
+		if plan.Dir != "" {
+			t.Errorf("plan.Dir = %q, want the caller's working directory", plan.Dir)
+		}
+	})
+
+	t.Run("with_a_replace_builds_the_replacement_module_directory", func(t *testing.T) {
+		modCacheDir := t.TempDir()
+		srcDir := filepath.Join(modCacheDir, "github.com", "quickserve-ai", "beads@"+forkVersion)
+		if err := os.MkdirAll(filepath.Join(srcDir, "cmd", "bd"), 0o755); err != nil {
+			t.Fatalf("seed module cache: %v", err)
+		}
+		plan, err := planPinnedBDBuild(pinnedBeadsModule{Path: forkPath, Version: forkVersion, Replaced: true}, modCacheDir, outPath)
+		if err != nil {
+			t.Fatalf("planPinnedBDBuild: %v", err)
+		}
+		want := []string{"build", "-tags", beadsBuildTags, "-o", outPath, "./cmd/bd"}
+		if !reflect.DeepEqual(plan.Args, want) {
+			t.Errorf("plan.Args = %q, want %q", plan.Args, want)
+		}
+		if plan.Dir != srcDir {
+			t.Errorf("plan.Dir = %q, want the replacement module directory %q", plan.Dir, srcDir)
+		}
+	})
+
+	t.Run("a_replacement_absent_from_the_module_cache_fails_loudly", func(t *testing.T) {
+		_, err := planPinnedBDBuild(pinnedBeadsModule{Path: forkPath, Version: forkVersion, Replaced: true}, t.TempDir(), outPath)
+		if err == nil {
+			t.Fatal("planPinnedBDBuild accepted a replacement that is not extracted in the module cache")
+		}
+		if !strings.Contains(err.Error(), forkVersion) {
+			t.Errorf("error %q does not name the replacement version", err)
+		}
+	})
+
+	t.Run("the_live_pin_plans_the_shape_its_go_mod_asks_for", func(t *testing.T) {
+		mod, err := resolvePinnedBeadsModule()
+		if err != nil {
+			t.Fatalf("resolvePinnedBeadsModule: %v", err)
+		}
+		plan, err := planPinnedBDBuild(mod, goModuleCacheDir(), outPath)
+		if err != nil {
+			t.Fatalf("planPinnedBDBuild for the live pin %+v: %v", mod, err)
+		}
+		if mod.Replaced && plan.Dir == "" {
+			t.Fatalf("beads is replaced by %s@%s but the plan installs by version: %q", mod.Path, mod.Version, plan.Args)
+		}
+		if !mod.Replaced && plan.Dir != "" {
+			t.Fatalf("beads is not replaced but the plan builds directory %q: %q", plan.Dir, plan.Args)
+		}
+	})
 }
 
 func TestLoadWaitBeadsByLabelUsesBoundedLookup(t *testing.T) {
