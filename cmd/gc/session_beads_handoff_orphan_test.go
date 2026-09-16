@@ -214,7 +214,7 @@ func TestReleaseWorkFromClosedSessionBeadWithoutTemplateStillReleases(t *testing
 // bead closed; 11 went in_progress -> open. The seat's next session ran the
 // mechanical resume check (List{assignee, in_progress}) and was told "no work" while
 // holding 11 in-progress items, one of them a P1 durability bead 6h into what became
-// a 95-hour outage. Good behaviour was the trigger (ga-9n8hjv).
+// a 95-hour outage. Good behavior was the trigger (ga-9n8hjv).
 func TestReleaseWorkFromClosedSessionBeadKeepsNamedSeatPortfolio(t *testing.T) {
 	store := beads.NewMemStore()
 
