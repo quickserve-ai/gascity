@@ -21,7 +21,7 @@ const (
 	// policy review, while workflow, job, step, and input descriptions remain
 	// free to change. A failure prints the projection and candidate digest.
 	expectedCITriggersHash       = "d1a8bcd089019589658d8f154af9c26a70877285d84a384c2dcea299efc9554a"
-	expectedCIExecutionHash      = "706480003d0e6504a6032db3bad3921e8d7bccc0e2c849002d2a8958b3c25b66"
+	expectedCIExecutionHash      = "dd4263f5794cf92f73a6684f521c25d7ba3f9ae1abb25ed8f0cfbe0c84c90b51"
 	expectedNightlyTriggersHash  = "0a4400a09ac567e90adf8be1232eef1f14e36efd8dba3e143aa6e36f5b7a36f5"
 	expectedNightlyExecutionHash = "66dc307f14025b3f4128f640d0084f11f3fb83e9ddf9b1a2cd61c60e1760018a"
 	expectedSetupActionHash      = "12920621ee8af83820e2a89d8b3f216030c1e58559b2650a705e224df23ed3de"
