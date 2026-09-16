@@ -452,9 +452,19 @@ jobs:
           fi
           mkdir -p "${HOME}/.local/bin"
           # -X main.Version because a module-directory build carries the
-          # source default: without it this bd would report the upstream
-          # release the fleet build was cut from, and every version label gc
-          # compares it against would be the wrong one.
+          # source default: without it this bd reports the upstream release
+          # the fleet build was cut from rather than the fleet build itself.
+          #
+          # This is hygiene today, NOT a live correctness requirement, and the
+          # distinction matters: while beads is consumed through a go.mod
+          # replace, gc never compares the label at all. checkVersionCompat
+          # short-circuits to PASS on unconfirmableReason() == "replaced
+          # module" before any comparison happens
+          # (internal/beads/contract/preflight_checker.go). The stamp becomes
+          # load-bearing the moment the pin becomes a bare tag, which arms that
+          # comparison fleet-wide for the first time -- so keep it, but do not
+          # read it as evidence the label comparison is live (woodhouse, B1-B36
+          # read on fork PR #66).
           go -C "$src" build -tags gms_pure_go -ldflags "-X main.Version=${ver#v}" -o "${HOME}/.local/bin/bd" ./cmd/bd
           echo "${HOME}/.local/bin" >> "$GITHUB_PATH"
       - name: Verify bd on PATH
@@ -626,6 +636,16 @@ jobs:
       - name: Build bd from beads main HEAD
         run: |
           set -euo pipefail
+          # NOT a third "build bd from the module go.mod resolves" path, and
+          # deliberately so: this radar builds bd from gastownhall/beads MAIN
+          # HEAD, a different source on purpose, to catch upstream drift before
+          # it reaches a pin. It carries no -ldflags because there is no fleet
+          # version to stamp -- the build is upstream's HEAD, not a fleet build.
+          # A grep for `go build ./cmd/bd` lands here and looks like a parallel
+          # path; the discriminator is the `go list -m -f {{if .Replace}}`
+          # idiom, which only the pinned cell above uses. (woodhouse nearly
+          # reported this as a B23 violation on fork PR #66 before reading the
+          # job context.)
           src="${RUNNER_TEMP}/beads-src"
           git clone --depth 1 --filter=blob:none https://github.com/gastownhall/beads "$src"
           mkdir -p "${HOME}/.local/bin"
