@@ -80,6 +80,17 @@ func sessionBeadAssigneeIdentities(sb beads.Bead) []string {
 // so ordinary polecat orphan release is untouched.
 func releasableAssigneeIdentities(sb beads.Bead) []string {
 	withheld := map[string]struct{}{}
+	// ONLY a CONFIGURED NAMED session withholds anything. A pool session carries a
+	// session_name too, and work claimed under it belongs to a worker that is gone --
+	// TestCloseBeadReleasesWorkAssignedBySessionName ("worker-gm-dead"),
+	// ...CleanupDeadRuntimeSessionCorpses... ("crashed-worker", "worker-7") are that
+	// contract. Withholding there would strand a dead polecat's claim forever, and the
+	// pool fallback cannot recover an UNROUTED one. The presence of
+	// configured_named_identity on the session bead is what separates the two, and it
+	// needs no *config.City to read.
+	if strings.TrimSpace(sb.Metadata["configured_named_identity"]) == "" {
+		return sessionBeadAssigneeIdentities(sb)
+	}
 	for _, key := range []string{"session_name", "configured_named_identity"} {
 		if val := strings.TrimSpace(sb.Metadata[key]); val != "" {
 			withheld[val] = struct{}{}
