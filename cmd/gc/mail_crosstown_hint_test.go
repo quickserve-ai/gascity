@@ -35,6 +35,22 @@ func TestCrossTownRecipientHint(t *testing.T) {
 		}
 	}
 
+	// An agent Dir that differs from its rig name is local: a typo there must
+	// not be sent to the hub.
+	dirCfg := &config.City{
+		Workspace: config.Workspace{Name: "qlandia"},
+		Rigs:      []config.Rig{{Name: "qcore"}},
+		Agents:    []config.Agent{{Name: "ray", Dir: "core"}},
+	}
+	if got := crossTownRecipientHint(dirCfg, "core/rayy", contexts); got != "" {
+		t.Errorf("hint for a local agent dir = %q, want empty", got)
+	}
+
+	// No config loaded: the rigs are unknown, so no foreign-town claim.
+	if got := crossTownRecipientHint(nil, "gastown/woodhouse", contexts); got != "" {
+		t.Errorf("hint with nil cfg = %q, want empty", got)
+	}
+
 	// Several contexts: one complete command per context, never a "|" join
 	// that a shell would run as a pipeline.
 	multi := filepath.Join(t.TempDir(), "multi.toml")
