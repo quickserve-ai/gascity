@@ -136,8 +136,8 @@ func (s *Server) mailRecipientNotFound(recipient string) error {
 		return notFound
 	}
 	return fmt.Errorf("%w; city %q has no mailbox by that name. If %q is another town, only the mailbox names "+
-		"that town's cross-town poller pulls are addressable here; otherwise send to that town's mayor anchor "+
-		"with a \"[for <rig>/<name>]\" subject (see the cross-town-coordination skill)", notFound, cityName, prefix)
+		"that town's cross-town poller pulls are addressable here; otherwise send to that town's cross-town routing address "+
+		"with a \"[for <rig>/<name>]\" subject", notFound, cityName, prefix)
 }
 
 // operatorMailIdentities are the operator's mail identities: the mail
