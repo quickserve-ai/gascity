@@ -4451,7 +4451,7 @@ func releaseWorkFromClosedSessionBeadExcept(store beads.Store, sw *SeatWork, ses
 	// identity (session_name, configured_named_identity) must not be used to
 	// detach its work (ga-9n8hjv; see releasableAssigneeIdentities). The
 	// caller's preserve set withholds further identities on top of it.
-	scope := releaseScopeOfBead(sessionBead, sw.Legs().cfg).except(preserve).except(durableSessionIdentities(sessionBead))
+	scope := releaseScopeOfBead(sessionBead, sw.Legs().cfg).except(preserve).except(durableSessionIdentities(sw.Legs().cfg, sessionBead))
 	out, err := ReleaseClaims(sw, scope, releaseSeatOfBead(sessionBead), releaseCloseCascade, ReleaseOpts{Late: true})
 	logRelease(stderr, "closing", sessionBead.ID, out, err)
 	return out
