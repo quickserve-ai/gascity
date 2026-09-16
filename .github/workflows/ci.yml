@@ -380,10 +380,12 @@ jobs:
 
   # Cross-version contract gate: the "current" cell of the bd matrix. The
   # "prev" cell is contract-acceptance-previous above (the min-supported
-  # release). This cell builds bd from gastownhall/beads source at
-  # BD_CURRENT_REF (deps.env) — a commit, which need not be a tagged release —
+  # release). This cell builds bd from the beads module go.mod itself resolves
+  # — today the quickserve-ai/beads fleet build the replace pins (gc-1c2b) —
   # and runs the same focused CLI contract, so a bd change that breaks gc's
-  # decoder/classifier surface against the newer bd is caught before merge.
+  # decoder/classifier surface is caught before merge, and the bd under test
+  # is provably the same beads code gc links rather than a second pin that can
+  # drift from it.
   # Path-gated on the beads filter; tolerated as a skip by the Check gate.
   contract-acceptance-current:
     name: Contract / acceptance A (bd current)
@@ -398,26 +400,21 @@ jobs:
         with:
           go-version-file: go.mod
       - uses: ./.github/actions/go-mod-warm
-      - name: Resolve bd current pin
-        id: bd
+      - name: Build bd from the beads module go.mod resolves
         run: |
           set -euo pipefail
-          ref="$(grep -E '^BD_CURRENT_REF=' deps.env | cut -d= -f2)"
-          ver="$(grep -E '^BD_CURRENT_VERSION=' deps.env | cut -d= -f2)"
-          if [ -z "$ref" ] || [ -z "$ver" ]; then
-            echo "::error::BD_CURRENT_REF/BD_CURRENT_VERSION missing or empty in deps.env" >&2
+          src="$(go list -m -f '{{if .Replace}}{{.Replace.Dir}}{{else}}{{.Dir}}{{end}}' github.com/steveyegge/beads)"
+          ver="$(go list -m -f '{{if .Replace}}{{.Replace.Version}}{{else}}{{.Version}}{{end}}' github.com/steveyegge/beads)"
+          if [ -z "$src" ] || [ -z "$ver" ]; then
+            echo "::error::could not resolve the beads module source directory and version from go.mod" >&2
             exit 1
           fi
-          echo "ref=$ref" >> "$GITHUB_OUTPUT"
-          echo "ver=$ver" >> "$GITHUB_OUTPUT"
-      - name: Build bd ${{ steps.bd.outputs.ver }} from source @ ${{ steps.bd.outputs.ref }}
-        run: |
-          set -euo pipefail
-          src="${RUNNER_TEMP}/beads-src"
-          git clone --filter=blob:none https://github.com/gastownhall/beads "$src"
-          git -C "$src" checkout "${{ steps.bd.outputs.ref }}"
           mkdir -p "${HOME}/.local/bin"
-          go -C "$src" build -tags gms_pure_go -o "${HOME}/.local/bin/bd" ./cmd/bd
+          # -X main.Version because a module-directory build carries the
+          # source default: without it this bd would report the upstream
+          # release the fleet build was cut from, and every version label gc
+          # compares it against would be the wrong one.
+          go -C "$src" build -tags gms_pure_go -ldflags "-X main.Version=${ver#v}" -o "${HOME}/.local/bin/bd" ./cmd/bd
           echo "${HOME}/.local/bin" >> "$GITHUB_PATH"
       - name: Verify bd on PATH
         run: bd version
