@@ -867,3 +867,82 @@ func TestDoHandoff_PinnedAlwaysSessionPersistsResetAndReconcilerStopsSession(t *
 		t.Fatalf("pinned session %q still running after reconcile; persisted restart should have let the reconciler stop it", sessionName)
 	}
 }
+
+// TestReconcileSessionBeads_RestartRequestOnDemandWithExplicitWakeCycles pins
+// the ga-cctcju self-handoff cycle end to end for an on-demand named session:
+// gc handoff arms wake_request=explicit BEFORE setting restart_requested;
+// tick 1 consumes the restart (kills the runtime and folds
+// RestartRequestPatch, which deliberately leaves wake_request intact); tick
+// 2's wake decision reads the durable ExplicitWake cause and starts the seat
+// fresh — with NO assigned-work demand and NO pool demand present, which is
+// exactly the hole that used to leave a killed on-demand seat down until
+// unrelated work happened to be assigned to it.
+func TestReconcileSessionBeads_RestartRequestOnDemandWithExplicitWakeCycles(t *testing.T) {
+	env, session, sessionName := newLiveRestartRequestScenario(t)
+	env.setSessionMetadata(&session, map[string]string{
+		"restart_requested": "true",
+		"wake_request":      "explicit",
+		"wake_requested_at": env.clk.Now().UTC().Format(time.RFC3339),
+	})
+
+	// Tick 1: the restart consume kills the runtime and must preserve the
+	// explicit wake marker. Pool demand is held at zero throughout so nothing
+	// but the marker can explain a wake.
+	env.reconcileWithPoolDesiredAndDrainOps([]beads.Bead{session}, map[string]int{}, nil)
+	if env.sp.IsRunning(sessionName) {
+		t.Fatalf("session %q still running after restart-requested kill", sessionName)
+	}
+	stopped, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("store.Get(%s): %v", session.ID, err)
+	}
+	if got := stopped.Metadata["restart_requested"]; got != "" {
+		t.Fatalf("restart_requested = %q after consume, want cleared", got)
+	}
+	if got := stopped.Metadata["wake_request"]; got != "explicit" {
+		t.Fatalf("wake_request = %q after restart consume, want 'explicit' preserved (the comeback fence)", got)
+	}
+
+	// Tick 2: the durable explicit wake must start the seat again.
+	env.stdout.Reset()
+	env.stderr.Reset()
+	env.reconcileWithPoolDesiredAndDrainOps([]beads.Bead{stopped}, map[string]int{}, nil)
+	if !env.sp.IsRunning(sessionName) {
+		t.Fatalf("on-demand session %q did not wake from its explicit wake_request after the handoff kill (ga-cctcju); stderr: %s", sessionName, env.stderr.String())
+	}
+	woken, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("store.Get(%s): %v", session.ID, err)
+	}
+	if got := woken.Metadata["wake_request"]; got != "" {
+		t.Errorf("wake_request = %q after wake, want consumed by the start commit", got)
+	}
+}
+
+// TestReconcileSessionBeads_RestartRequestOnDemandWithoutWakeMarkerStaysDown
+// is the negative control for the test above, documenting WHY gc handoff must
+// arm the wake before the restart flag: a restart-consumed on-demand seat
+// with no wake marker and no demand does not come back (#2345 deliberately
+// refuses to force-wake demand-less on-demand sessions). If this test ever
+// starts failing because the seat wakes, the handoff-side fence may be
+// obsolete — re-evaluate ga-cctcju before deleting it.
+func TestReconcileSessionBeads_RestartRequestOnDemandWithoutWakeMarkerStaysDown(t *testing.T) {
+	env, session, sessionName := newLiveRestartRequestScenario(t)
+	env.setSessionMetadata(&session, map[string]string{
+		"restart_requested": "true",
+	})
+
+	env.reconcileWithPoolDesiredAndDrainOps([]beads.Bead{session}, map[string]int{}, nil)
+	if env.sp.IsRunning(sessionName) {
+		t.Fatalf("session %q still running after restart-requested kill", sessionName)
+	}
+	stopped, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("store.Get(%s): %v", session.ID, err)
+	}
+
+	env.reconcileWithPoolDesiredAndDrainOps([]beads.Bead{stopped}, map[string]int{}, nil)
+	if env.sp.IsRunning(sessionName) {
+		t.Fatalf("demand-less on-demand session %q woke without a wake marker — the ga-cctcju handoff fence may be obsolete; re-evaluate before changing it\nstdout: %s\nstderr: %s\nbead: %v", sessionName, env.stdout.String(), env.stderr.String(), stopped.Metadata)
+	}
+}

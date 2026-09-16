@@ -424,7 +424,17 @@ func TestCmdHandoffAutoRejectsTarget(t *testing.T) {
 // on every context compaction. doHandoff must recognize the named-session
 // case, still send the handoff mail, and skip both the tmux and bead restart
 // flags.
-func TestDoHandoff_Regression744_NamedSessionSkipsRestart(t *testing.T) {
+// TestDoHandoff_OnDemandNamedSessionArmsWakeAndRestart supersedes the
+// Regression744 skip test (ga-cctcju). gastownhall/gascity#744's hazard was a
+// restart kill with no respawn path; the fix back then was to skip the
+// restart for named sessions entirely. Always-mode named sessions became
+// restartable when the desired-state pass started rewaking them
+// unconditionally; on-demand named seats now cycle too, with the missing
+// respawn path supplied explicitly: a durable wake_request marker is armed on
+// the session bead BEFORE any restart flag, so the reconciler wakes the seat
+// fresh after the kill even when it has no assigned-work demand (unread mail
+// is not demand — bd ready returns no message beads).
+func TestDoHandoff_OnDemandNamedSessionArmsWakeAndRestart(t *testing.T) {
 	store := beads.NewMemStore()
 	rec := events.NewFake()
 	dops := newFakeDrainOps()
@@ -446,13 +456,6 @@ func TestDoHandoff_Regression744_NamedSessionSkipsRestart(t *testing.T) {
 	if err := store.SetMetadata(b.ID, "configured_named_mode", "on_demand"); err != nil {
 		t.Fatalf("set configured_named_mode: %v", err)
 	}
-	if err := store.SetMetadata(b.ID, "restart_requested", "true"); err != nil {
-		t.Fatalf("set restart_requested: %v", err)
-	}
-	if err := store.SetMetadata(b.ID, "continuation_reset_pending", "true"); err != nil {
-		t.Fatalf("set continuation_reset_pending: %v", err)
-	}
-	dops.restartRequested["mayor"] = true
 
 	persistCalled := false
 	outcome := doHandoffWithOutcome(store, store, rec, dops, func() error {
@@ -462,8 +465,8 @@ func TestDoHandoff_Regression744_NamedSessionSkipsRestart(t *testing.T) {
 	if outcome.code != 0 {
 		t.Fatalf("code = %d, want 0; stderr: %s", outcome.code, stderr.String())
 	}
-	if outcome.restartRequested {
-		t.Fatal("restartRequested = true, want false for on-demand named session")
+	if !outcome.restartRequested {
+		t.Fatal("restartRequested = false, want true for on-demand named session (ga-cctcju)")
 	}
 
 	mailFound := false
@@ -477,34 +480,107 @@ func TestDoHandoff_Regression744_NamedSessionSkipsRestart(t *testing.T) {
 	if !mailFound {
 		t.Fatalf("handoff mail not created; beads=%v", all)
 	}
-	if dops.restartRequested["mayor"] {
-		t.Errorf("restart-requested flag is still set; named sessions must skip restart")
+	if !dops.restartRequested["mayor"] {
+		t.Error("restart-requested flag not set for on-demand named session")
 	}
-	if persistCalled {
-		t.Error("persistRestart was called; named sessions must skip persisted restart requests")
+	if !persistCalled {
+		t.Error("persistRestart was not called for on-demand named session")
 	}
 	refreshed, err := store.Get(b.ID)
 	if err != nil {
 		t.Fatalf("fetching seeded bead: %v", err)
 	}
-	if refreshed.Metadata["restart_requested"] != "" {
-		t.Errorf("bead restart_requested = %q, want cleared for named session", refreshed.Metadata["restart_requested"])
+	if got := refreshed.Metadata["wake_request"]; got != string(session.WakeCauseExplicit) {
+		t.Errorf("bead wake_request = %q, want %q (comeback fence must be armed)", got, session.WakeCauseExplicit)
 	}
-	if refreshed.Metadata["continuation_reset_pending"] != "" {
-		t.Errorf("continuation_reset_pending = %q, want cleared for named session", refreshed.Metadata["continuation_reset_pending"])
+	if refreshed.Metadata["wake_requested_at"] == "" {
+		t.Error("bead wake_requested_at empty, want a timestamp")
 	}
-	if strings.Contains(stdout.String(), "requesting restart") {
-		t.Errorf("stdout = %q, must not promise a restart for named sessions", stdout.String())
+	if !strings.Contains(stdout.String(), "explicit wake armed") {
+		t.Errorf("stdout = %q, want the on-demand cycle contract named", stdout.String())
 	}
-	if len(rec.Events) != 1 {
-		t.Fatalf("got %d events, want 1", len(rec.Events))
+	if len(rec.Events) != 2 {
+		t.Fatalf("got %d events, want 2", len(rec.Events))
 	}
-	if rec.Events[0].Type != events.MailSent {
-		t.Fatalf("event[0].Type = %q, want %q", rec.Events[0].Type, events.MailSent)
+	if rec.Events[1].Type != events.SessionDraining {
+		t.Fatalf("event[1].Type = %q, want %q", rec.Events[1].Type, events.SessionDraining)
 	}
 }
 
-func TestDoHandoff_NamedSessionClearRestartFailureReturnsError(t *testing.T) {
+// TestDoHandoff_OnDemandNamedSessionWakeArmFailureRefusesRestart pins the
+// fence ordering: when the explicit wake cannot be durably persisted, the
+// restart must NOT be requested (a kill without the marker leaves the seat
+// down until unrelated work is assigned to it), the failure must be loud,
+// and the manual remedy must be named.
+func TestDoHandoff_OnDemandNamedSessionWakeArmFailureRefusesRestart(t *testing.T) {
+	mem := beads.NewMemStore()
+	rec := events.NewFake()
+	dops := newFakeDrainOps()
+	var stdout, stderr bytes.Buffer
+
+	b, err := mem.Create(beads.Bead{
+		Type:   sessionBeadType,
+		Labels: []string{"gc:session"},
+	})
+	if err != nil {
+		t.Fatalf("seeding session bead: %v", err)
+	}
+	for k, v := range map[string]string{
+		"session_name":             "mayor",
+		"configured_named_session": "true",
+		"configured_named_mode":    "on_demand",
+	} {
+		if err := mem.SetMetadata(b.ID, k, v); err != nil {
+			t.Fatalf("set %s: %v", k, err)
+		}
+	}
+	store := &wakeArmFailStore{Store: mem, failID: b.ID}
+
+	persistCalled := false
+	outcome := doHandoffWithOutcome(store, store, rec, dops, func() error {
+		persistCalled = true
+		return nil
+	}, "mayor", "mayor", []string{"HANDOFF: context full"}, &stdout, &stderr)
+	if outcome.code != 1 {
+		t.Fatalf("code = %d, want 1; stderr: %s", outcome.code, stderr.String())
+	}
+	if outcome.restartRequested {
+		t.Fatal("restartRequested = true, want false when the comeback wake cannot be armed")
+	}
+	if dops.restartRequested["mayor"] {
+		t.Error("restart-requested flag set despite wake-arm failure; the kill must not be armed")
+	}
+	if persistCalled {
+		t.Error("persistRestart called despite wake-arm failure")
+	}
+	if !strings.Contains(stderr.String(), "cannot arm its comeback wake") {
+		t.Errorf("stderr = %q, want the wake-arm failure named", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "gc session wake mayor") {
+		t.Errorf("stderr = %q, want the manual remedy named", stderr.String())
+	}
+}
+
+// wakeArmFailStore fails metadata batch writes to one bead (the session
+// bead), which is the write chokepoint armExplicitWakeForRestart persists the
+// wake marker through; mail-bead writes pass through untouched.
+type wakeArmFailStore struct {
+	beads.Store
+	failID string
+}
+
+func (s *wakeArmFailStore) SetMetadataBatch(id string, meta map[string]string) error {
+	if id == s.failID {
+		return errors.New("metadata write refused")
+	}
+	return s.Store.SetMetadataBatch(id, meta)
+}
+
+// TestDoHandoff_OnDemandNamedSessionRestartFlagFailureIsLoud pins the fence
+// ordering from the other side: the wake marker is armed BEFORE the runtime
+// restart flag, so when the flag write fails the wake is already durable and
+// the command fails loudly without promising a restart.
+func TestDoHandoff_OnDemandNamedSessionRestartFlagFailureIsLoud(t *testing.T) {
 	store := beads.NewMemStore()
 	rec := events.NewFake()
 	dops := newFakeDrainOps()
@@ -536,11 +612,18 @@ func TestDoHandoff_NamedSessionClearRestartFailureReturnsError(t *testing.T) {
 	if outcome.restartRequested {
 		t.Fatal("restartRequested = true, want false")
 	}
-	if !strings.Contains(stderr.String(), "clearing stale restart request") {
-		t.Fatalf("stderr = %q, want stale restart cleanup error", stderr.String())
+	if !strings.Contains(stderr.String(), "setting restart flag") {
+		t.Fatalf("stderr = %q, want the restart-flag failure named", stderr.String())
 	}
-	if strings.Contains(stdout.String(), "restart skipped") {
-		t.Fatalf("stdout = %q, must not report success when cleanup fails", stdout.String())
+	refreshed, err := store.Get(b.ID)
+	if err != nil {
+		t.Fatalf("fetching seeded bead: %v", err)
+	}
+	if got := refreshed.Metadata["wake_request"]; got != string(session.WakeCauseExplicit) {
+		t.Errorf("bead wake_request = %q, want %q (wake arms before the restart flag)", got, session.WakeCauseExplicit)
+	}
+	if strings.Contains(stdout.String(), "requesting restart") {
+		t.Fatalf("stdout = %q, must not promise a restart the flag write refused", stdout.String())
 	}
 }
 
@@ -676,7 +759,14 @@ func TestHandoffWithMessage(t *testing.T) {
 	}
 }
 
-func TestCmdHandoff_Regression744_NamedSessionReturnsWithoutBlocking(t *testing.T) {
+// TestCmdHandoff_OnDemandNamedSessionArmsWakeWithoutHanging is the cmd-level
+// guard descended from the Regression744 non-blocking test. An on-demand
+// named self-handoff now arms the comeback wake and requests a restart
+// (ga-cctcju); with no live runtime session backing the name the restart-flag
+// write fails fast and loud. Either way the command must return promptly —
+// never hang — and the wake marker must already be durable on the session
+// bead (the fence arms before the flag).
+func TestCmdHandoff_OnDemandNamedSessionArmsWakeWithoutHanging(t *testing.T) {
 	cityDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte("[workspace]\nname = \"demo\"\n"), 0o644); err != nil {
 		t.Fatalf("write city.toml: %v", err)
@@ -715,16 +805,30 @@ func TestCmdHandoff_Regression744_NamedSessionReturnsWithoutBlocking(t *testing.
 		done <- cmdHandoff([]string{"HANDOFF: context full"}, "", false, "", &stdout, &stderr)
 	}()
 
+	var code int
 	select {
-	case code := <-done:
-		if code != 0 {
-			t.Fatalf("code = %d, want 0; stderr: %s", code, stderr.String())
-		}
+	case code = <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("cmdHandoff blocked for named on-demand session")
 	}
-	if !strings.Contains(stdout.String(), "restart skipped") {
-		t.Fatalf("stdout = %q, want restart skipped confirmation", stdout.String())
+	if strings.Contains(stdout.String(), "restart skipped") {
+		t.Fatalf("stdout = %q, the silent skip must be gone (ga-cctcju)", stdout.String())
+	}
+	// No runtime session backs "mayor" here, so the restart arm is expected
+	// to fail loudly after the wake was armed; a provider that accepts the
+	// flag write instead reports the restart. Both are legal — silence is not.
+	if code != 0 && strings.TrimSpace(stderr.String()) == "" {
+		t.Fatalf("code = %d with empty stderr, want a loud failure", code)
+	}
+	if code == 0 && !strings.Contains(stdout.String(), "requesting restart") {
+		t.Fatalf("stdout = %q, want the restart promised on success", stdout.String())
+	}
+	refreshed, err := store.Get(b.ID)
+	if err != nil {
+		t.Fatalf("fetching seeded bead: %v", err)
+	}
+	if got := refreshed.Metadata["wake_request"]; got != string(session.WakeCauseExplicit) {
+		t.Errorf("bead wake_request = %q, want %q (fence arms before the flag)", got, session.WakeCauseExplicit)
 	}
 }
 
@@ -829,7 +933,11 @@ func TestHandoffRemoteRunning(t *testing.T) {
 	}
 }
 
-func TestHandoffRemoteNamedOnDemandSkipsKill(t *testing.T) {
+// TestHandoffRemoteNamedOnDemandArmsWakeAndKills supersedes the skip-kill
+// test (ga-cctcju): a remote handoff to an on-demand named target now arms
+// the durable explicit wake on the session bead FIRST, then kills the target
+// so the reconciler restarts it fresh with the handoff mail waiting.
+func TestHandoffRemoteNamedOnDemandArmsWakeAndKills(t *testing.T) {
 	store := beads.NewMemStore()
 	rec := events.NewFake()
 	sp := runtime.NewFake()
@@ -852,15 +960,6 @@ func TestHandoffRemoteNamedOnDemandSkipsKill(t *testing.T) {
 	if err := store.SetMetadata(b.ID, "configured_named_mode", "on_demand"); err != nil {
 		t.Fatalf("set configured_named_mode: %v", err)
 	}
-	if err := store.SetMetadata(b.ID, "restart_requested", "true"); err != nil {
-		t.Fatalf("set restart_requested: %v", err)
-	}
-	if err := store.SetMetadata(b.ID, "continuation_reset_pending", "true"); err != nil {
-		t.Fatalf("set continuation_reset_pending: %v", err)
-	}
-	if err := sp.SetMeta("mayor", "GC_RESTART_REQUESTED", "1"); err != nil {
-		t.Fatalf("set runtime restart meta: %v", err)
-	}
 
 	var stdout, stderr bytes.Buffer
 	code := doHandoffRemote(store, store, rec, sp, "mayor", "mayor", "deacon",
@@ -868,33 +967,73 @@ func TestHandoffRemoteNamedOnDemandSkipsKill(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("code = %d, want 0; stderr: %s", code, stderr.String())
 	}
-	if !sp.IsRunning("mayor") {
-		t.Error("named on-demand target should still be running")
+	if sp.IsRunning("mayor") {
+		t.Error("named on-demand target should have been killed (ga-cctcju)")
 	}
-	if len(rec.Events) != 1 {
-		t.Fatalf("got %d events, want 1", len(rec.Events))
+	if len(rec.Events) != 2 {
+		t.Fatalf("got %d events, want 2", len(rec.Events))
 	}
 	if rec.Events[0].Type != events.MailSent {
 		t.Fatalf("event[0].Type = %q, want %q", rec.Events[0].Type, events.MailSent)
 	}
-	if strings.Contains(stdout.String(), "killed session") {
-		t.Errorf("stdout = %q, must not report killing a named on-demand session", stdout.String())
+	if rec.Events[1].Type != events.SessionStopped {
+		t.Fatalf("event[1].Type = %q, want %q", rec.Events[1].Type, events.SessionStopped)
 	}
-	if !strings.Contains(stdout.String(), "named session") {
-		t.Errorf("stdout = %q, want named-session skip confirmation", stdout.String())
+	if !strings.Contains(stdout.String(), "killed session") {
+		t.Errorf("stdout = %q, want the kill reported", stdout.String())
 	}
 	refreshed, err := store.Get(b.ID)
 	if err != nil {
 		t.Fatalf("fetching seeded bead: %v", err)
 	}
-	if refreshed.Metadata["restart_requested"] != "" {
-		t.Errorf("bead restart_requested = %q, want cleared for named target", refreshed.Metadata["restart_requested"])
+	if got := refreshed.Metadata["wake_request"]; got != string(session.WakeCauseExplicit) {
+		t.Errorf("bead wake_request = %q, want %q (comeback fence must be armed before the kill)", got, session.WakeCauseExplicit)
 	}
-	if refreshed.Metadata["continuation_reset_pending"] != "" {
-		t.Errorf("continuation_reset_pending = %q, want cleared for named target", refreshed.Metadata["continuation_reset_pending"])
+}
+
+// TestHandoffRemoteNamedOnDemandWakeArmFailureLeavesTargetRunning pins the
+// remote-side fence: when the wake marker cannot be persisted the target must
+// be left running (a kill without the marker has no respawn path) and the
+// failure must be loud with the manual remedy named.
+func TestHandoffRemoteNamedOnDemandWakeArmFailureLeavesTargetRunning(t *testing.T) {
+	mem := beads.NewMemStore()
+	rec := events.NewFake()
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "mayor", runtime.Config{Command: "echo"}); err != nil {
+		t.Fatal(err)
 	}
-	if got, err := sp.GetMeta("mayor", "GC_RESTART_REQUESTED"); err != nil || got != "" {
-		t.Errorf("runtime restart meta = %q, err=%v; want cleared", got, err)
+	b, err := mem.Create(beads.Bead{
+		Type:   sessionBeadType,
+		Labels: []string{"gc:session"},
+	})
+	if err != nil {
+		t.Fatalf("seeding session bead: %v", err)
+	}
+	for k, v := range map[string]string{
+		"session_name":             "mayor",
+		"configured_named_session": "true",
+		"configured_named_mode":    "on_demand",
+	} {
+		if err := mem.SetMetadata(b.ID, k, v); err != nil {
+			t.Fatalf("set %s: %v", k, err)
+		}
+	}
+	store := &wakeArmFailStore{Store: mem, failID: b.ID}
+
+	var stdout, stderr bytes.Buffer
+	code := doHandoffRemote(store, store, rec, sp, "mayor", "mayor", "deacon",
+		[]string{"Context refresh"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("code = %d, want 1; stderr: %s", code, stderr.String())
+	}
+	if !sp.IsRunning("mayor") {
+		t.Error("target must be left running when the comeback wake cannot be armed")
+	}
+	if !strings.Contains(stderr.String(), "cannot arm its comeback wake") {
+		t.Errorf("stderr = %q, want the wake-arm failure named", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "gc session wake mayor") {
+		t.Errorf("stderr = %q, want the manual remedy named", stderr.String())
 	}
 }
 

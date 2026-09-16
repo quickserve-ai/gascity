@@ -32,13 +32,11 @@ func newHandoffCmd(stdout, stderr io.Writer) *cobra.Command {
 		Short: "Send handoff mail and restart controller-managed sessions",
 		Long: `Convenience command for context handoff.
 
-Self-handoff (default): sends mail to self. If the current session is
-controller-restartable, requests a restart and blocks until the controller
-stops the session. For on-demand configured named sessions, sends mail and
-returns without requesting restart: handoff intentionally leaves the
-user-attended session running instead of restarting it out from under the
-user. The controller can restart such a session via
-gc runtime request-restart; handoff deliberately does not.
+Self-handoff (default): sends mail to self, requests a restart, and blocks
+until the controller stops the session. This covers every session class,
+on-demand configured named sessions included (ga-cctcju): the reconciler's
+restart consume durably records the reset-pending comeback marker, so the
+killed seat wakes fresh on the next tick regardless of mode or demand.
 
 For controller-restartable sessions, equivalent to:
 
@@ -55,10 +53,12 @@ Auto handoff (--auto): sends mail to self and returns without requesting a
 restart. This is for PreCompact hooks, where the provider is already managing
 the context compaction lifecycle.
 
-Remote handoff (--target): sends mail to a target session. If the target is
-controller-restartable, kills it so the reconciler restarts it with the handoff
-mail waiting. For on-demand configured named targets, sends mail and returns
-without killing the session.
+Remote handoff (--target): sends mail to a target session, then kills it so
+the reconciler restarts it with the handoff mail waiting. On-demand configured
+named targets are not killed directly — a direct kill would bypass the
+reconciler's comeback marker and leave the seat down — their restart request
+is persisted instead and the reconciler cycles them; if that persist fails
+the target is left running (exit 1).
 
 For controller-restartable targets, equivalent to:
 
@@ -259,19 +259,18 @@ func doHandoffWithOutcome(store, sessStore beads.Store, rec events.Recorder, dop
 		return handoffOutcome{code: 1}
 	}
 
-	restartable, pinned, err := sessionRestartableByController(sessStore, sessionName)
+	verdict, err := sessionRestartableByController(sessStore, sessionName)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc handoff: checking session type: %v\n", err) //nolint:errcheck // best-effort stderr
 		return handoffOutcome{code: 1}
 	}
-	if !restartable {
-		if err := clearRestartRequest(sessStore, dops, sessionName); err != nil {
-			fmt.Fprintf(stderr, "gc handoff: clearing stale restart request: %v\n", err) //nolint:errcheck // best-effort stderr
-			return handoffOutcome{code: 1}
-		}
-		fmt.Fprintf(stdout, "Handoff: sent mail %s (named session; restart skipped).\n", b.ID) //nolint:errcheck // best-effort stdout
-		return handoffOutcome{code: 0}
-	}
+	// On-demand named seats take the same restart path as always-mode ones
+	// (ga-cctcju, completing gastownhall/gascity#744): the reconciler's
+	// restart consume durably lands continuation_reset_pending +
+	// reset_committed_at via RestartRequestPatch, and the awake computation's
+	// reset-pending pass rewakes the killed seat from that marker regardless
+	// of mode or demand. The old mode gate predates that machinery and left
+	// on-demand seats running stale with only a silent "restart skipped".
 
 	if err := dops.setRestartRequested(sessionName); err != nil {
 		fmt.Fprintf(stderr, "gc handoff: setting restart flag: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -284,7 +283,7 @@ func doHandoffWithOutcome(store, sessStore beads.Store, rec events.Recorder, dop
 	// indefinitely. Persisting is therefore mandatory for pinned sessions; for
 	// everything else the runtime flag is primary and the bead write stays
 	// best-effort backup.
-	if pinned {
+	if verdict.pinned {
 		if persistRestart == nil {
 			fmt.Fprintf(stderr, "gc handoff: pinned session %q has no restart persistence available; not requesting restart\n", sessionName) //nolint:errcheck // best-effort stderr
 			return handoffOutcome{code: 1}
@@ -374,33 +373,50 @@ func createHandoffMail(store, sessStore beads.Store, rec events.Recorder, sender
 	return msg, true
 }
 
-// sessionRestartableByController reports whether the controller is willing to
-// restart the named session (restartable) and whether it is a pinned,
-// kill-protected named session (pinned). pinned mirrors the reconciler's own
-// pinnedConfiguredNamedSessionKillProtected predicate (isNamedSessionInfo &&
-// pin_awake == "true") so callers can predict whether the reconciler will
-// refuse a collateral kill absent an explicit controller reset. Both facts
-// come off the single bead read so callers needing both (gc handoff) do not
-// pay for a second store round-trip.
-func sessionRestartableByController(sessStore beads.Store, sessionName string) (restartable, pinned bool, err error) {
+// controllerRestartVerdict describes how the controller can cycle a session
+// for a handoff or an explicit restart request. Every session class is
+// controller-cyclable (ga-cctcju); the fields say which extra care the cycle
+// needs.
+type controllerRestartVerdict struct {
+	// pinned mirrors the reconciler's pinnedConfiguredNamedSessionKillProtected
+	// predicate (isNamedSessionInfo && pin_awake == "true") so callers can
+	// predict whether the reconciler will refuse a collateral kill absent an
+	// explicit controller reset.
+	pinned bool
+	// onDemandNamed: a configured named session whose mode is not "always".
+	// Such a seat cycles safely only through the reconciler's restart
+	// consume, whose RestartRequestPatch durably lands the reset-pending
+	// comeback marker; a direct runtime kill leaves it down until unrelated
+	// work is assigned to it, because neither unread mail (bd ready returns
+	// no message beads) nor the handoff itself is wake demand (ga-cctcju).
+	onDemandNamed bool
+}
+
+// sessionRestartableByController classifies how the controller can restart
+// the named session. All facts come off a single bead read so callers
+// needing several (gc handoff) do not pay for extra store round-trips.
+func sessionRestartableByController(sessStore beads.Store, sessionName string) (controllerRestartVerdict, error) {
 	if sessStore == nil || sessionName == "" {
-		return true, false, nil
+		return controllerRestartVerdict{}, nil
 	}
 	id, err := resolveSessionID(sessStore, sessionName)
 	if err != nil {
 		if errors.Is(err, session.ErrSessionNotFound) {
-			return true, false, nil
+			return controllerRestartVerdict{}, nil
 		}
-		return false, false, fmt.Errorf("resolving session %q: %w", sessionName, err)
+		return controllerRestartVerdict{}, fmt.Errorf("resolving session %q: %w", sessionName, err)
 	}
 	b, err := sessStore.Get(id)
 	if err != nil {
-		return false, false, fmt.Errorf("loading session %q: %w", id, err)
+		return controllerRestartVerdict{}, fmt.Errorf("loading session %q: %w", id, err)
 	}
 	if !isNamedSessionBead(b) {
-		return true, false, nil
+		return controllerRestartVerdict{}, nil
 	}
-	return namedSessionMode(b) == "always", strings.TrimSpace(b.Metadata["pin_awake"]) == "true", nil
+	return controllerRestartVerdict{
+		pinned:        strings.TrimSpace(b.Metadata["pin_awake"]) == "true",
+		onDemandNamed: namedSessionMode(b) != "always",
+	}, nil
 }
 
 func clearRestartRequest(sessStore beads.Store, dops drainOps, sessionName string) error {
@@ -443,17 +459,35 @@ func doHandoffRemote(store, sessStore beads.Store, rec events.Recorder, sp runti
 		return 1
 	}
 
-	restartable, _, err := sessionRestartableByController(sessStore, sessionName)
+	verdict, err := sessionRestartableByController(sessStore, sessionName)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc handoff: checking session type: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	if !restartable {
-		if err := clearRestartRequest(sessStore, newDrainOps(sp), sessionName); err != nil {
-			fmt.Fprintf(stderr, "gc handoff: clearing stale restart request: %v\n", err) //nolint:errcheck // best-effort stderr
+	if verdict.onDemandNamed {
+		// An on-demand named target must NOT be killed directly (ga-cctcju):
+		// the direct kill bypasses the reconciler's restart consume, so the
+		// comeback marker (continuation_reset_pending + reset_committed_at,
+		// landed by RestartRequestPatch) is never written and nothing rewakes
+		// the seat until unrelated work is assigned to it. Route the cycle
+		// through the reconciler instead: persist the restart request on the
+		// session bead and let the consume kill + rewake it.
+		handle, herr := workerHandleForSessionTargetWithConfig("", sessStore, sp, nil, sessionName)
+		if herr == nil {
+			herr = handle.Reset(context.Background())
+		}
+		if herr != nil {
+			fmt.Fprintf(stderr, "gc handoff: on-demand named session %q: cannot persist its restart request: %v\n", sessionName, herr)                                             //nolint:errcheck // best-effort stderr
+			fmt.Fprintf(stderr, "gc handoff: handoff mail %s is delivered but %s was NOT cycled; cycle the seat manually with: gc session wake %s\n", b.ID, targetAddress, sessionName) //nolint:errcheck // best-effort stderr
 			return 1
 		}
-		fmt.Fprintf(stdout, "Handoff: sent mail %s to %s (named session; kill skipped because the controller cannot restart it)\n", b.ID, targetAddress) //nolint:errcheck // best-effort stdout
+		rec.Record(events.Event{
+			Type:    events.SessionDraining,
+			Actor:   sender,
+			Subject: targetAddress,
+			Message: "handoff",
+		})
+		fmt.Fprintf(stdout, "Handoff: sent mail %s to %s, requested restart (reconciler will cycle the on-demand seat and wake it fresh)\n", b.ID, targetAddress) //nolint:errcheck // best-effort stdout
 		return 0
 	}
 

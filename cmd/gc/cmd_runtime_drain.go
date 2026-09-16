@@ -591,14 +591,14 @@ func cmdRuntimeRequestRestart(stdout, stderr io.Writer) int {
 			return handle.Reset(context.Background())
 		}
 	}
-	_, pinned, err := sessionRestartableByController(sessStore, current.sessionName)
+	verdict, err := sessionRestartableByController(sessStore, current.sessionName)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc runtime request-restart: checking session type: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
 	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	return doRuntimeRequestRestart(sigCtx, dops, sp, persistRestart, pinned, rec, current.display, current.sessionName,
+	return doRuntimeRequestRestart(sigCtx, dops, sp, persistRestart, verdict.pinned, rec, current.display, current.sessionName,
 		controllerRestartPollInterval, controllerRestartTimeout(cfg), stdout, stderr)
 }
 
