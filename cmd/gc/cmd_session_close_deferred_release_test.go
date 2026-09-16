@@ -174,6 +174,25 @@ max_active_sessions = 1
 	if !strings.Contains(stderr.String(), "deferred work release") {
 		t.Errorf("stderr does not mention the deferred work release; got: %s", stderr.String())
 	}
+
+	// THE EVENT MUST REACH THE FILE, not just a recorder. The unit test asserts
+	// on a fake recorder, which proves the payload and proves nothing about the
+	// wiring: a wrong path, a RuntimeRoot that moved, or a recorder that failed to
+	// open would all leave the fake test green while the fleet saw nothing. A
+	// withhold visible only in one pane's stderr is the silence this event exists
+	// to end, so assert the durable half here.
+	eventsPath := filepath.Join(cityDir, ".gc", "events.jsonl")
+	raw2, err := os.ReadFile(eventsPath)
+	if err != nil {
+		t.Fatalf("read %s: %v — the close published no event log at all", eventsPath, err)
+	}
+	if !strings.Contains(string(raw2), "session.release_deferred") {
+		t.Errorf("no session.release_deferred event in %s: the withhold is observable only in "+
+			"the stderr of whoever ran the close", eventsPath)
+	}
+	if !strings.Contains(string(raw2), sessionBead.ID) {
+		t.Errorf("the event log does not name the session bead %s", sessionBead.ID)
+	}
 }
 
 // The counterpart: when the config DOES load, the release runs normally and no

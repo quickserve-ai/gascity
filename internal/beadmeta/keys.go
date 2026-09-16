@@ -235,6 +235,11 @@ const (
 	// acknowledge PER GENERATION and PER STORE — a wholesale clear would discard
 	// outstanding rig-store cleanup whenever the rig-store map came back
 	// incomplete, which is exactly the silent drop this design refuses.
+	//
+	// Discharge is recorded by ADDING to this key, never by clearing
+	// ReleaseDeferredMetadataKey. Clearing that key does not mark an obligation
+	// done — it re-arms publication, because an empty value is indistinguishable
+	// from an absent one to both the compare-and-set and the reader.
 	ReleaseDeferredAckMetadataKey    = "gc.release_deferred_ack"
 	RequiredArtifactMetadataKey      = "gc.required_artifact"
 	RequiredArtifactsMetadataKey     = "gc.required_artifacts"
