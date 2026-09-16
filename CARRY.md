@@ -129,7 +129,7 @@ parentheses. The commit that adds this file sits on top of the stack and is not 
 | Doctor order-exec-target check (ga-swawpo) | 0d36ec781 | Flags exec orders whose script cannot launch; `--fix` restores the exec bit. | none; upstreamable | Upstream ships an exec-target check; `internal/doctor/checks_order_exec_target_test.go` passes on upstream. |
 | Managed Dolt stop and exit attribution (ga-drkbcd, fork PR #54) | 8ce001fac | gc's own stops record stop-intent markers, the scope watchdog grades exits and signals by intent, and an unexplained stop raises an alarm. Observability added after the silent managed-Dolt stop of 2026-08-15; upstream logs only a clean or an error exit. | none; carry-only | Upstream attributes managed-Dolt stops, or the fleet stops running managed Dolt. |
 
-### Beads store, pins, Dolt endpoints (9)
+### Beads store, pins, Dolt endpoints (10)
 
 | Behavior | Commits | What / why | Upstream | Drop when |
 |---|---|---|---|---|
@@ -142,6 +142,7 @@ parentheses. The commit that adds this file sits on top of the stack and is not 
 | Scope-aware beads-init endpoint (ga-tmhxnd, ga-uurd84, ga-298g8t, qc-ow3u50, hq-mbe2s) | f7a4e9866, 06562e2c1 | A remote store keeps its own port, an inferred endpoint never overwrites a declared one, a derived origin warns instead of refusing start, rig init gets the scope credentials, and the post-init verify resolves the rig scope. Incident hq-mbe2s; at the re-sync the rig-scope check also covers upstream #4812's dirty-table recovery site. | none; issue owed after the re-sync | Upstream's beads init honors declared rig endpoints and scope credentials; `cmd/gc/dolt_config_explicit_endpoint_test.go` and `cmd/gc/dolt_compat_drift_inference_test.go` pass on upstream. |
 | bd init dirty-schema checkpoint fails closed (release/v1.3.x pick) | folded into f7a4e9866, 06562e2c1 | `gc-beads-bd.sh` checkpoints only allowlisted bd tables of a database this init created, per table with `--skip-empty`, and refuses otherwise. Upstream #4812's Go recovery commits with `DOLT_COMMIT('-A')`, so Go now honors the script's three refusals and commits at most once; before that guard the merge could commit operator rows the script refused (R5a). | #4812 took another route; issue owed on its `-A` (citing #5287) | Upstream's recovery refuses databases it did not create and stages only allowlisted tables; `TestGcBeadsBdInitDirtySchemaRecovery` passes on upstream. |
 | Managed-local marker cleared explicitly across env overlays (fork PR #25) | 914a4dc6d | A managed target clears `GC_DOLT_MANAGED_LOCAL` explicitly, so a child env overlay cannot resurrect an inherited `0`; the endpoint-identity row reads that marker. Its explicit-empty `GC_DOLT_HOST`, `GC_DOLT_PORT` and `BEADS_DOLT_SERVER_HOST` projections were dropped at the re-sync as obsolete (#5154), and upstream's delete-not-blank tests restored. | #5154 fixed the hook-claim symptom; the marker clear is carry-only | Drops with the ambient Dolt identity row. |
+| Beads fleet pin: gc links the fleet beads build through a go.mod replace (gc-1c2b) | f86cd9598 (replace guard admits the fleet tag, with fixtures), 9ed4dc346 (the pinned-bd test helper builds from the replace target), 56182b0cb (the pinned integration bd honors the replace), 92dc76a93 (the go.mod replace, go.sum and the fleet replace test), 39421d409 (the contract bd-current cell builds from the replace target), 22d456b78 (the module-graph guard admits the one sanctioned redirect) | `go.mod` keeps upstream's `github.com/steveyegge/beads v1.3.0-rc.2` require line and adds one replace to `github.com/quickserve-ai/beads` at the fleet tag, so gc's in-process store is the same beads code every machine's `bd` runs. Without it the fix for the 2026-09-14 review-ladder stall reaches the bd CLI only, and gc's own graph-apply and finalize closes keep the defect. The replace guard admits exactly the fork path at `vX.Y.Z[-rc.N]-fleet.<date>[.serial]`, the contract CI cell builds its bd from the module go.mod resolves, and `scripts/beads_fleet_replace_test.go` holds the replace's base in step with the require line. | none; the fleet's beads carries are fork-only | Upstream beads ships the fleet's carries in a release upstream gascity's `go.mod` requires, so the replace names the same code as the require line; then drop the replace, the guard admission and the fleet replace test. |
 
 ### Dispatch, orders, molecules, work queries (22)
 
@@ -170,7 +171,7 @@ parentheses. The commit that adds this file sits on top of the stack and is not 
 | Retention watchdog candidate and phantom counts (ga-28co77, ga-hujj6s) | folded into dece9484d | The bounded retention sweep logs how many candidates it received and how many deletes hit rows that no longer exist, beside #5802's stranded count. Diagnostic for the open ga-hujj6s question. | none; diagnostic | ga-hujj6s is resolved. |
 | Order dispatch budget exhaustion log (ga-44iyd) | dece9484d | When the per-tick dispatch budget runs out with orders unvisited, the dispatcher logs it. Upstream #4491 already ships `max_dispatches_per_tick`; the log is re-expressed in upstream's fire loop. | #4491 absorbed the knob; the log is carry-only | Upstream logs budget exhaustion; the exhaustion-log case in `cmd/gc/order_dispatch_test.go` passes on upstream. |
 
-### Build, CI, deploy, tests, tmux (20)
+### Build, CI, deploy, tests, tmux (21)
 
 | Behavior | Commits | What / why | Upstream | Drop when |
 |---|---|---|---|---|
@@ -194,6 +195,7 @@ parentheses. The commit that adds this file sits on top of the stack and is not 
 | Test binaries scrub ambient provider credentials at init (ga-fhbnmz leg B) | 330baef55 | A test binary drops live provider keys from its environment at init (opt out with `GC_ALLOW_AMBIENT_PROVIDER_CREDS_IN_TESTS`), so tests cannot spend money or forward keys into the gc processes they spawn. go-test tmux servers once outlived runs with a live key in their argv. | none; upstreamable | Upstream's testenv scrubs provider credentials; `internal/testenv/ambient_credentials_test.go` passes on upstream. |
 | Tmux server-founding clients carry no secrets (ga-fhbnmz leg A) | 2c265455e | gc scrubs secret-named variables from the environment of any tmux command that can found a server on a named socket, so a cold-started server cannot inherit them. Re-sync: upstream #5425 already keeps secrets out of server argv, and this founding-client scrub replaced the carry's anchor session and `-N`. | #5425 covers argv; the environment scrub is carry-only (outside upstream's threat model) | Upstream starts cold servers with a scrubbed environment; `TestRunCtxScrubsSecretEnvForServerFoundingClients` passes on upstream. |
 | CI warms and retries Go module downloads once per job (ga-azybk8) | dd9539c2f | A `go-mod-warm` action downloads the module graph with three attempts and backoff after each setup-go, so shards stop failing on sum.golang.org HTTP/2 errors. Upstream's three new setup-go jobs are not warmed this window (CI speed, not correctness). | none; carry-only | The flake does not recur on upstream's tagged beads module graph over a month of CI, or upstream adds a retry. |
+| Product-metrics testhook budget fits its own compile (gc-1c2b) | aace6a894 (the testhook budget, raised on its own timing artifact) | `cmd-gc-productmetrics-testhook` gets 12 minutes instead of 5. Its six tests take 0.87 seconds in total; everything else in the job is `go build` of cmd/gc under the `productmetrics_testhook` tag, on the 4-CPU runner `runner-policy` gives every login but the named maintainers. The job has run at 92-95% of the old budget on upstream's own main, and went over on the first branch whose `go.sum` moved, because that changes setup-go's cache key and the build is then cold. | none yet; filed upstream as the real fix — a warm build cache for the job, or a runner matching the budget | Upstream warms that job's build cache or gives it a runner its budget fits, and the job's own timing artifact shows compile well inside 5 minutes on a 4-CPU runner. |
 
 ## Dropped at the 2026-09-15 re-sync
 
@@ -269,23 +271,25 @@ resolving the merge. The original carry SHAs below are from the pre-09-10 lineag
 
 ## Counts
 
-- 146 behaviors, one written decision each: 115 kept and 31 dropped (30 at the re-sync decision, 1 at integration); 115 + 31 = 146.
-- Kept rows by source: 10 replayed from upstream PR branches; 102 re-expressed from the old carry, 4 of them carried only by later commits; 3 with no commits of their own (Session close fails closed when the city config did not load (ga-9n8hjv); Rebase-reconciliation and test-adapt fixups; golangci-lint 2.12 debt clearances (ga-tn4txq)).
+- 148 behaviors, one written decision each: 117 kept and 31 dropped (30 at the re-sync decision, 1 at integration); 117 + 31 = 148.
+- Kept rows by source: 10 replayed from upstream PR branches; 102 re-expressed from the old carry, 4 of them carried only by later commits; 5 with no commits of their own (Session close fails closed when the city config did not load (ga-9n8hjv); Beads fleet pin: gc links the fleet beads build through a go.mod replace (gc-1c2b); Product-metrics testhook budget fits its own compile (gc-1c2b); Rebase-reconciliation and test-adapt fixups; golangci-lint 2.12 debt clearances (ga-tn4txq)).
 - Dropped at the re-sync decision, by verdict: ABSORBED 16, OBSOLETE 5, PIN 4, NETZERO 2, LEDGER 1, REGEN 1, owner decision 1.
-- The stack above upstream `9700d9a48`: 21 replayed + 135 re-expressed + 1 integration commit (`a3739e25b`, 96 files the resolution changed beyond the per-behavior replay) + 14 commits added after integration = 171 commits, ending at `8d11c1277`.
+- The stack above upstream `9700d9a48`: 21 replayed + 135 re-expressed + 1 integration commit (`a3739e25b`, 96 files the resolution changed beyond the per-behavior replay) + 21 commits added after integration = 178 commits, ending at `aace6a894`.
 - 6 of 141 re-expressed commits went empty at linearize; their hunks landed in later commits, named in their rows as "folded into" (M1 00134b38e, ee585f3f2, 0c953c4a3, 2a7d21147, 2244667fc, 0ed8d76d8).
 
 ## Beads pin
 
 The native store is the beads library linked into `gc`, so `go.mod`'s beads requirement decides
 the highest Dolt schema a `gc` binary can open. Since the 2026-09-15 re-sync, `go.mod` takes upstream
-main's beads line unmodified.
+main's beads requirement unmodified, and adds one replace so the code gc links is the fleet
+build of that same release (gc-1c2b).
 
 | Where | Value |
 |---|---|
-| `go.mod` require | `github.com/steveyegge/beads v1.3.0-rc.2` (schema v66) |
+| `go.mod` require | `github.com/steveyegge/beads v1.3.0-rc.2` (schema v66), upstream's line, unmodified |
+| `go.mod` replace | `github.com/quickserve-ai/beads` at the fleet tag of that release — the same schema, plus the fleet's beads carries |
 | `deps.env` | `BD_VERSION` and `BD_CURRENT_VERSION` are `v1.3.0-rc.2`; `BD_CURRENT_REF` is `c185735c38e2` |
-| CI's `bd` | upstream's release archive at `BD_VERSION`; `scripts/bd_version_pin_test.go` ties it to `go.mod` |
+| CI's `bd` | upstream's release archive at `BD_VERSION` everywhere except the contract bd-current cell, which builds from the module `go.mod` resolves — the replace target — so the bd under contract is the beads code gc links |
 | Every machine's `bd` | moves with the fleet unit, as below |
 
 `checkVersionCompat` (`internal/beads/contract/preflight_checker.go`) refuses the native store on a
@@ -295,11 +299,13 @@ library it cannot confirm (a pseudo-version, a replaced module or a source build
 is stricter than the check: `bd`'s `main.Version` equals the beads version the unit links, so every
 machine's `bd` moves with the unit.
 
-The fleet beads fork (lyft; be-oau) re-syncs to rc.2 as a carry-v66 lineage. Until its fleet tag
-exists, a unit pairs with upstream rc.2 `bd`, or takes a one-window beads hold at `bf97b73749ac`
-(measured to build and vet on upstream main). gc-1c2b tracks the `go.mod` replace that points a unit
-at the fork. `make check-gomod-replace`, a CI step, refuses a replace that names a pseudo-version, a
-prerelease, a local path or a git ref; its only override is an explicit operator decision.
+The fleet beads fork (lyft; be-oau) is re-synced to rc.2 as the carry-v66 lineage, and its released
+fleet tag is what the replace names. Because the linked library is then a REPLACED module,
+`checkVersionCompat` reports it unconfirmable and passes for any `bd` with a readable context — the
+label stops being a gate and stays a fleet rule, enforced by the unit's own preflight rather than by
+gc. `make check-gomod-replace`, a CI step, still refuses a replace that names a pseudo-version, a
+bare prerelease, a local path or a git ref; its one admission is the fork path at
+`vX.Y.Z[-rc.N]-fleet.<YYYYMMDD>[.<serial>]`, with fixtures.
 
 **Moving the pin moves the fleet.** A shared store's writers move in one window: a binary that
 migrates a database past what another machine's `bd` knows produces schema skew from the other
