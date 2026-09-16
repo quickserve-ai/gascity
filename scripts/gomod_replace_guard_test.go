@@ -231,6 +231,87 @@ func TestCheckGomodReplaceGuard(t *testing.T) {
 		})
 	}
 
+	// The fleet-tag admission: this repository pins a quickserve-ai/beads
+	// build of the beads module through a go.mod replace, so the guard has to
+	// let exactly that shape through — the fork path at a fleet tag — while
+	// every neighboring shape stays blocked. A fleet tag is an upstream
+	// release (optionally an -rc.N prerelease) plus a -fleet.<YYYYMMDD> date
+	// and an optional point-release serial, which is what the beads owner
+	// actually cuts (gc-1c2b).
+	fleetTagCases := []struct {
+		name     string
+		gomod    string
+		wantFail bool
+	}{
+		{
+			"fleet_tag_on_fork_path",
+			"module github.com/example/mod\n\ngo 1.22\n\nreplace github.com/steveyegge/beads => github.com/quickserve-ai/beads v1.3.0-rc.2-fleet.20260915.2\n",
+			false,
+		},
+		{
+			"fleet_tag_on_fork_path_without_serial",
+			"module github.com/example/mod\n\ngo 1.22\n\nreplace github.com/steveyegge/beads => github.com/quickserve-ai/beads v1.3.0-rc.2-fleet.20260915\n",
+			false,
+		},
+		{
+			"fleet_tag_on_fork_path_without_prerelease",
+			"module github.com/example/mod\n\ngo 1.22\n\nreplace github.com/steveyegge/beads => github.com/quickserve-ai/beads v1.3.0-fleet.20260915\n",
+			false,
+		},
+		{
+			"fleet_tag_in_block_with_left_version_and_comment",
+			"module github.com/example/mod\n\ngo 1.22\n\nreplace (\n\tgithub.com/steveyegge/beads v1.3.0-rc.2 => github.com/quickserve-ai/beads v1.3.0-rc.2-fleet.20260915.2 // fleet pin\n)\n",
+			false,
+		},
+		{
+			"fleet_tag_on_upstream_path",
+			"module github.com/example/mod\n\ngo 1.22\n\nreplace github.com/steveyegge/beads => github.com/steveyegge/beads v1.3.0-rc.2-fleet.20260915.2\n",
+			true,
+		},
+		{
+			"fleet_tag_on_unrelated_path",
+			"module github.com/example/mod\n\ngo 1.22\n\nreplace github.com/example/dep => github.com/example/dep-fork v1.3.0-rc.2-fleet.20260915.2\n",
+			true,
+		},
+		{
+			"fleet_tag_on_sibling_fork_path",
+			"module github.com/example/mod\n\ngo 1.22\n\nreplace github.com/steveyegge/beads => github.com/quickserve-ai/beads-fork v1.3.0-rc.2-fleet.20260915.2\n",
+			true,
+		},
+		{
+			"fork_path_pseudo_version",
+			"module github.com/example/mod\n\ngo 1.22\n\nreplace github.com/steveyegge/beads => github.com/quickserve-ai/beads v1.3.0-rc.2.0.20260915054652-dc0561af28e9\n",
+			true,
+		},
+		{
+			"fork_path_bare_prerelease",
+			"module github.com/example/mod\n\ngo 1.22\n\nreplace github.com/steveyegge/beads => github.com/quickserve-ai/beads v1.3.0-rc.2\n",
+			true,
+		},
+		{
+			"fork_path_non_rc_prerelease_fleet_tag",
+			"module github.com/example/mod\n\ngo 1.22\n\nreplace github.com/steveyegge/beads => github.com/quickserve-ai/beads v1.3.0-beta.1-fleet.20260915\n",
+			true,
+		},
+		{
+			"fork_path_seven_digit_fleet_date",
+			"module github.com/example/mod\n\ngo 1.22\n\nreplace github.com/steveyegge/beads => github.com/quickserve-ai/beads v1.3.0-rc.2-fleet.2026091\n",
+			true,
+		},
+	}
+	for _, tc := range fleetTagCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			out, code := runScript(t, tc.gomod)
+			if tc.wantFail && code == 0 {
+				t.Fatalf("expected non-zero exit for fleet-tag case %q, got 0\n%s", tc.name, out)
+			}
+			if !tc.wantFail && code != 0 {
+				t.Fatalf("expected exit 0 for fleet-tag case %q, got %d\n%s", tc.name, code, out)
+			}
+		})
+	}
+
 	t.Run("failure_message_mentions_policy", func(t *testing.T) {
 		gomod := "module github.com/example/mod\n\ngo 1.22\n\nreplace github.com/steveyegge/beads => ./local/beads\n"
 		out, code := runScript(t, gomod)

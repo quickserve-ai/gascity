@@ -380,10 +380,12 @@ jobs:
 
   # Cross-version contract gate: the "current" cell of the bd matrix. The
   # "prev" cell is contract-acceptance-previous above (the min-supported
-  # release). This cell builds bd from gastownhall/beads source at
-  # BD_CURRENT_REF (deps.env) — a commit, which need not be a tagged release —
+  # release). This cell builds bd from the beads module go.mod itself resolves
+  # — today the quickserve-ai/beads fleet build the replace pins (gc-1c2b) —
   # and runs the same focused CLI contract, so a bd change that breaks gc's
-  # decoder/classifier surface against the newer bd is caught before merge.
+  # decoder/classifier surface is caught before merge, and the bd under test
+  # is provably the same beads code gc links rather than a second pin that can
+  # drift from it.
   # Path-gated on the beads filter; tolerated as a skip by the Check gate.
   contract-acceptance-current:
     name: Contract / acceptance A (bd current)
@@ -398,26 +400,31 @@ jobs:
         with:
           go-version-file: go.mod
       - uses: ./.github/actions/go-mod-warm
-      - name: Resolve bd current pin
-        id: bd
+      - name: Build bd from the beads module go.mod resolves
         run: |
           set -euo pipefail
-          ref="$(grep -E '^BD_CURRENT_REF=' deps.env | cut -d= -f2)"
-          ver="$(grep -E '^BD_CURRENT_VERSION=' deps.env | cut -d= -f2)"
-          if [ -z "$ref" ] || [ -z "$ver" ]; then
-            echo "::error::BD_CURRENT_REF/BD_CURRENT_VERSION missing or empty in deps.env" >&2
+          src="$(go list -m -f '{{if .Replace}}{{.Replace.Dir}}{{else}}{{.Dir}}{{end}}' github.com/steveyegge/beads)"
+          ver="$(go list -m -f '{{if .Replace}}{{.Replace.Version}}{{else}}{{.Version}}{{end}}' github.com/steveyegge/beads)"
+          if [ -z "$src" ] || [ -z "$ver" ]; then
+            echo "::error::could not resolve the beads module source directory and version from go.mod" >&2
             exit 1
           fi
-          echo "ref=$ref" >> "$GITHUB_OUTPUT"
-          echo "ver=$ver" >> "$GITHUB_OUTPUT"
-      - name: Build bd ${{ steps.bd.outputs.ver }} from source @ ${{ steps.bd.outputs.ref }}
-        run: |
-          set -euo pipefail
-          src="${RUNNER_TEMP}/beads-src"
-          git clone --filter=blob:none https://github.com/gastownhall/beads "$src"
-          git -C "$src" checkout "${{ steps.bd.outputs.ref }}"
           mkdir -p "${HOME}/.local/bin"
-          go -C "$src" build -tags gms_pure_go -o "${HOME}/.local/bin/bd" ./cmd/bd
+          # -X main.Version because a module-directory build carries the
+          # source default: without it this bd reports the upstream release
+          # the fleet build was cut from rather than the fleet build itself.
+          #
+          # This is hygiene today, NOT a live correctness requirement, and the
+          # distinction matters: while beads is consumed through a go.mod
+          # replace, gc never compares the label at all. checkVersionCompat
+          # short-circuits to PASS on unconfirmableReason() == "replaced
+          # module" before any comparison happens
+          # (internal/beads/contract/preflight_checker.go). The stamp becomes
+          # load-bearing the moment the pin becomes a bare tag, which arms that
+          # comparison fleet-wide for the first time -- so keep it, but do not
+          # read it as evidence the label comparison is live (woodhouse, B1-B36
+          # read on fork PR #66).
+          go -C "$src" build -tags gms_pure_go -ldflags "-X main.Version=${ver#v}" -o "${HOME}/.local/bin/bd" ./cmd/bd
           echo "${HOME}/.local/bin" >> "$GITHUB_PATH"
       - name: Verify bd on PATH
         run: bd version
@@ -456,6 +463,16 @@ jobs:
       - name: Build bd from beads main HEAD
         run: |
           set -euo pipefail
+          # NOT a third "build bd from the module go.mod resolves" path, and
+          # deliberately so: this radar builds bd from gastownhall/beads MAIN
+          # HEAD, a different source on purpose, to catch upstream drift before
+          # it reaches a pin. It carries no -ldflags because there is no fleet
+          # version to stamp -- the build is upstream's HEAD, not a fleet build.
+          # A grep for `go build ./cmd/bd` lands here and looks like a parallel
+          # path; the discriminator is the `go list -m -f {{if .Replace}}`
+          # idiom, which only the pinned cell above uses. (woodhouse nearly
+          # reported this as a B23 violation on fork PR #66 before reading the
+          # job context.)
           src="${RUNNER_TEMP}/beads-src"
           git clone --depth 1 --filter=blob:none https://github.com/gastownhall/beads "$src"
           mkdir -p "${HOME}/.local/bin"
@@ -627,7 +644,21 @@ jobs:
       - changes
     if: needs.changes.outputs.cmd_gc_process == 'true'
     runs-on: ${{ needs.runner-policy.outputs.runner_32vcpu }}
-    timeout-minutes: 5
+    # 12, not 5, because on this fork the budget was buying COMPILE time on a
+    # runner it was not sized for. Measured on 2026-09-16 from this job's own
+    # timing artifact at upstream main 9700d9a48: the six tests take 0.87 s
+    # TOTAL, and the job took 4m37 — every remaining second is `go build` of
+    # cmd/gc under the productmetrics_testhook tag. The runner policy resolves
+    # runner_32vcpu to a 4-CPU ubuntu-latest for everyone but the named
+    # maintainer logins, and this fork is never one of them, so the job has run
+    # at 92-95% of a 5-minute budget for days: 4m37 on main, 4m44 on the
+    # re-sync branch, and 5m05 -> killed on the first branch whose go.sum moved
+    # (a changed go.sum changes setup-go's cache key, so that build is cold).
+    # A gate at 95% of budget is a coin flip rather than a check. Raising the
+    # number is the honest fix for the symptom; the real fix is upstream's,
+    # either a warm build cache for this job or a runner that matches the
+    # budget, and it is filed there.
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
