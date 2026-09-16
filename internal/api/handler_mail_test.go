@@ -1437,3 +1437,57 @@ func TestMailReplyWithoutRigHintUsesResolvedRig(t *testing.T) {
 		t.Fatalf("reply event message rig = %q, want %q", payload.Message.Rig, "test-city")
 	}
 }
+
+// A send that nothing resolves must say when the address looks like another
+// town's seat, instead of a bare "session not found" that reads as a typo
+// (ga-5toacq). The negative controls matter as much as the positive: a local
+// rig's unknown seat and a bare unknown name must NOT get the cross-town text.
+func TestMailSendUnresolvedForeignTownRecipientNamesTheHubLeg(t *testing.T) {
+	state := newFakeState(t)
+	// A session store is required to reach the not-found branch at all; without
+	// one the send is refused earlier as "no bead store available".
+	state.cityBeadStore = beads.NewMemStore()
+	h := newTestCityHandler(t, state)
+
+	send := func(to string) *httptest.ResponseRecorder {
+		t.Helper()
+		body := `{"from":"mayor","to":"` + to + `","subject":"cross-town probe","body":"x"}`
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, newPostRequest(cityURL(state, "/mail"), bytes.NewBufferString(body)))
+		return rec
+	}
+	detail := func(rec *httptest.ResponseRecorder) string {
+		t.Helper()
+		var problem struct {
+			Detail string `json:"detail"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &problem); err != nil {
+			t.Fatalf("decode refusal: %v; body: %s", err, rec.Body.String())
+		}
+		return problem.Detail
+	}
+
+	foreign := send("gastown/woodhouse")
+	if foreign.Code < 400 || foreign.Code >= 500 {
+		t.Fatalf("foreign send status = %d, want 4xx; body: %s", foreign.Code, foreign.Body.String())
+	}
+	for _, want := range []string{"session not found", `"gastown/woodhouse"`, "cross-town routing address", "[for <rig>/<name>]"} {
+		if got := detail(foreign); !strings.Contains(got, want) {
+			t.Errorf("foreign refusal missing %q; detail: %s", want, got)
+		}
+	}
+
+	for _, to := range []string{"myrig/nobody", "nobody"} {
+		rec := send(to)
+		if rec.Code < 400 || rec.Code >= 500 {
+			t.Fatalf("send to %q status = %d, want 4xx; body: %s", to, rec.Code, rec.Body.String())
+		}
+		got := detail(rec)
+		if !strings.Contains(got, "session not found") {
+			t.Errorf("send to %q: want plain not-found refusal; detail: %s", to, got)
+		}
+		if strings.Contains(got, "cross-town routing address") {
+			t.Errorf("send to %q got the cross-town hint, want none; detail: %s", to, got)
+		}
+	}
+}
