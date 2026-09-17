@@ -9,6 +9,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/coordclass"
+	"github.com/gastownhall/gascity/internal/liveness"
 	"github.com/gastownhall/gascity/internal/session"
 )
 
@@ -103,7 +104,12 @@ func unwrapBeadPolicyStore(store beads.Store) (beads.Store, *beadPolicyStore, bo
 	}
 }
 
+// Create applies the storage-tier policy. It also strips the liveness overlay's
+// synthetic read-side keys: unlike a metadata patch, a create never passes
+// through the splitter, so a bead assembled from metadata read off another bead
+// would commit them (fork PR #59 review, round 2). See liveness.StripReadSideKeys.
 func (s *beadPolicyStore) Create(b beads.Bead) (beads.Bead, error) {
+	b.Metadata = liveness.StripReadSideKeys(b.Metadata)
 	_, storage := s.policyForCreate(b)
 	return createWithStoragePolicy(s.createTarget(coordclass.Classify(b)), b, storage)
 }
@@ -344,6 +350,7 @@ func (s *beadPolicyGraphStore) ApplyGraphPlan(ctx context.Context, plan *beads.G
 	if plan == nil {
 		return s.graphApplierFor(coordclass.ClassWork).ApplyGraphPlan(ctx, plan)
 	}
+	plan = stripGraphPlanLivenessReadKeys(plan)
 	applier := s.graphApplierFor(coordclass.ClassifyGraphPlan(plan))
 	policyName := policyNameForGraphPlan(plan)
 	if policyName == "" {
@@ -354,6 +361,34 @@ func (s *beadPolicyGraphStore) ApplyGraphPlan(ctx context.Context, plan *beads.G
 		return storageApplier.ApplyGraphPlanWithStorage(ctx, plan, beadStorageClass(storage))
 	}
 	return applier.ApplyGraphPlan(ctx, plan)
+}
+
+// stripGraphPlanLivenessReadKeys returns plan with the liveness overlay's
+// synthetic read-side keys removed from every node's metadata and metadata
+// refs — the graph-create arm of the same rule Create applies. The plan and its
+// nodes are copied only when something has to be stripped, so the ordinary
+// dispatch path is untouched, and the caller's plan is never mutated.
+func stripGraphPlanLivenessReadKeys(plan *beads.GraphApplyPlan) *beads.GraphApplyPlan {
+	carries := false
+	for _, node := range plan.Nodes {
+		for k := range node.Metadata {
+			carries = carries || liveness.IsReadSideKey(k)
+		}
+		for k := range node.MetadataRefs {
+			carries = carries || liveness.IsReadSideKey(k)
+		}
+	}
+	if !carries {
+		return plan
+	}
+	stripped := *plan
+	stripped.Nodes = make([]beads.GraphApplyNode, len(plan.Nodes))
+	for i, node := range plan.Nodes {
+		node.Metadata = liveness.StripReadSideKeys(node.Metadata)
+		node.MetadataRefs = liveness.StripReadSideKeys(node.MetadataRefs)
+		stripped.Nodes[i] = node
+	}
+	return &stripped
 }
 
 // policyNameForGraphPlan returns the storage-tier policy name for a graph-apply
