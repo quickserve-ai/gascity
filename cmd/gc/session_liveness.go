@@ -66,6 +66,13 @@ type livenessBinding struct {
 	retryAfter  time.Duration
 	dialing     bool
 	warned      bool
+	// unavailable is true while the scope HAS a liveness endpoint that cannot
+	// be used: the last dial failed for a reason other than
+	// errNoLivenessEndpoint, or a transport error retired the pool. It is what
+	// separates a degraded overlay (reads fall back to committed metadata that
+	// may lack the moved keys) from a scope that never had liveness at all
+	// (committed metadata is the only copy, so a read of it is exact).
+	unavailable bool
 	// clockOffset is the last known (server - local) skew, retained across a
 	// retired pool. Fallback stamps are minted exactly when the store is
 	// UNAVAILABLE, so falling back to the raw local clock at that moment would
@@ -171,8 +178,10 @@ func (b *livenessBinding) dial() liveness.Store {
 		// A scope with no endpoint cannot acquire one without a config change, so
 		// it backs off far harder than a server that is merely unreachable.
 		b.retryAfter = livenessOpenRetryInterval
+		b.unavailable = true
 		if errors.Is(err, errNoLivenessEndpoint) {
 			b.retryAfter = livenessNoEndpointRetryInterval
+			b.unavailable = false
 		}
 		// A scope with no Dolt endpoint at all — a file/doltlite provider, or any
 		// test working in a temp dir — is the expected steady state, not a
@@ -194,6 +203,7 @@ func (b *livenessBinding) dial() liveness.Store {
 		return b.store
 	}
 	b.store = store
+	b.unavailable = false
 	// Record the skew from the store we are INSTALLING, while it is alive. This
 	// is the production path's only chance: after a pool retirement there is no
 	// store left to ask, and an unrecorded offset silently sends Now() — and so
@@ -260,10 +270,25 @@ func (b *livenessBinding) noteOpError(err error) {
 	b.lastAttempt = time.Now()
 	b.retryAfter = livenessOpenRetryInterval
 	b.warned = false
+	b.unavailable = true
 	b.mu.Unlock()
 	if store != nil {
 		_ = store.Close()
 	}
+}
+
+// readDegraded reports whether a read through this binding right now would
+// fall back to committed metadata although the scope has a liveness store —
+// the pool was retired or the last dial could not reach the endpoint. A nil
+// binding, or a scope with no endpoint at all, is not degraded: there the
+// committed metadata is the only copy.
+func (b *livenessBinding) readDegraded() bool {
+	if b == nil {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.store == nil && b.unavailable
 }
 
 // newLivenessBindingForTest builds an unregistered binding over a supplied store.
