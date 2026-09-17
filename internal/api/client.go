@@ -1410,6 +1410,11 @@ func (c *Client) MarkMailRead(id string) error {
 	if err := c.requireCityScope(); err != nil {
 		return err
 	}
+	// "." and ".." survive path escaping but are collapsed by URL resolution,
+	// so they would POST a different route (e.g. /v0/city/{city}/read).
+	if id == "" || id == "." || id == ".." {
+		return fmt.Errorf("invalid message id %q", id)
+	}
 	params := &genclient.PostV0CityByCityNameMailByIdReadParams{XGCRequest: "true"}
 	resp, err := c.cw.PostV0CityByCityNameMailByIdReadWithResponse(context.Background(), c.cityName, id, params)
 	if err != nil {
