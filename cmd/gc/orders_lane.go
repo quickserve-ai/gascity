@@ -197,7 +197,7 @@ func (cr *CityRuntime) runOrdersLanePass(ctx context.Context, cityRoot, reason s
 	}
 
 	phaseStart = time.Now()
-	cr.dispatchOrdersLocked(ctx, cityRoot, generation, cfg)
+	cr.dispatchOrdersLocked(ctx, cityRoot, generation, cfg, false)
 	lane.notePass(time.Now(), reason)
 	if trace != nil {
 		trace.RecordControllerOperation(TraceSiteOrderDispatch, TraceReasonRetained, TraceOutcomeComplete,
@@ -274,18 +274,27 @@ func (cr *CityRuntime) ordersLaneShouldSkipForFSPressureLocked(lane *ordersLane,
 
 // dispatchOrders runs one dispatch outside the lane goroutine — the startup
 // pass, which must precede the cold-start session reconcile (MAINT-008). It
-// takes the same lock a lane pass does.
-func (cr *CityRuntime) dispatchOrders(ctx context.Context, cityRoot string) {
+// takes the same lock a lane pass does. bootDispatch is true for that startup
+// pass (see dispatchOrdersLocked).
+func (cr *CityRuntime) dispatchOrders(ctx context.Context, cityRoot string, bootDispatch bool) {
 	lane := cr.ordersLaneOf()
 	lane.passMu.Lock()
 	defer lane.passMu.Unlock()
 	generation, cfg := cr.orderPassConfig()
-	cr.dispatchOrdersLocked(ctx, cityRoot, generation, cfg)
+	cr.dispatchOrdersLocked(ctx, cityRoot, generation, cfg, bootDispatch)
 }
 
 // dispatchOrdersLocked is the dispatch body. passMu must be held; generation
 // and cfg come from orderPassConfig.
-func (cr *CityRuntime) dispatchOrdersLocked(ctx context.Context, cityRoot string, generation uint64, cfg *config.City) {
+//
+// bootDispatch is true only for the synchronous pass on the startup path: that
+// pass runs before the city reports ready, so it skips the order-tracking
+// retention watchdog, which is always due at boot and lists every closed
+// order-tracking bead before pruning — on a slow store with a large closed
+// backlog that would hold readiness for the whole pass
+// (gastownhall/gascity#6429). The first lane pass runs the watchdog; the other
+// watchdogs still run on the boot pass.
+func (cr *CityRuntime) dispatchOrdersLocked(ctx context.Context, cityRoot string, generation uint64, cfg *config.City, bootDispatch bool) {
 	if ctx.Err() != nil {
 		return
 	}
@@ -300,7 +309,15 @@ func (cr *CityRuntime) dispatchOrdersLocked(ctx context.Context, cityRoot string
 	// against the outgoing dispatcher.
 	cr.installPendingOrderDispatcherLocked(ctx)
 	cr.runOrderTrackingSweepWatchdog(cfg, now)
-	cr.runOrderTrackingRetentionWatchdog(cfg, now)
+	if bootDispatch {
+		// #6429: skip without stamping orderTrackingRetentionWatchdogLast, so the
+		// first lane pass still finds the watchdog due.
+		if cr.stderr != nil {
+			fmt.Fprintf(cr.stderr, "%s: order-tracking retention watchdog: deferred on boot to the first steady-state tick\n", cr.logPrefix) //nolint:errcheck // best-effort stderr
+		}
+	} else {
+		cr.runOrderTrackingRetentionWatchdog(cfg, now)
+	}
 	cr.runNudgeMailSweepWatchdog(cfg, now)
 	if cr.od != nil {
 		cr.od.dispatch(ctx, cityRoot, now)
