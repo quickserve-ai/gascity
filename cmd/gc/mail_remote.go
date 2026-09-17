@@ -233,3 +233,35 @@ func cmdMailInboxRemote(c *api.Client, target *remoteTarget, args []string, json
 	}
 	return doMailInboxTargetWithJSON(remoteInboxReader{c}, resolvedMailTarget{display: recipient, recipients: []string{recipient}}, jsonOut, stdout, stderr)
 }
+
+// cmdMailMarkReadRemote is the remote arm of `gc mail mark-read <id>`: it
+// POSTs /v0/city/{city}/mail/{id}/read on the far side. Nothing is recorded
+// locally — the event and telemetry belong to the city that owns the message,
+// and its server records them. The operation is reversible
+// (mark-unread) and idempotent, so a caller that re-marks a row after a lost
+// response does no harm. A server refusal (403 grant, 404 unknown id, 5xx) is
+// non-fallbackable and exits non-zero with the server's message.
+func cmdMailMarkReadRemote(c *api.Client, target *remoteTarget, args []string, jsonOut bool, stdout, stderr io.Writer) int {
+	fail := func(code, msg string) int {
+		if jsonOut {
+			return writeJSONError(stdout, stderr, code, msg, 1)
+		}
+		fmt.Fprintln(stderr, msg) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	if len(args) < 1 || strings.TrimSpace(args[0]) == "" {
+		return fail("invalid_arguments", "gc mail mark-read: missing message ID")
+	}
+	id := strings.TrimSpace(args[0])
+	if !jsonOut {
+		fmt.Fprintln(stderr, formatRemoteTarget(target)) //nolint:errcheck // best-effort stderr
+	}
+	if err := c.MarkMailRead(id); err != nil {
+		return fail("mail_mark_read_failed", "gc mail mark-read: "+err.Error())
+	}
+	if jsonOut {
+		return writeCLIJSONLineOrExit(stdout, stderr, "gc mail mark-read", mailActionResult{SchemaVersion: "1", OK: true, Command: "mail.mark-read", Action: "mark-read", ID: id, IDs: []string{id}, Count: intRef(1)})
+	}
+	fmt.Fprintf(stdout, "Marked %s as read\n", id) //nolint:errcheck // best-effort stdout
+	return 0
+}
