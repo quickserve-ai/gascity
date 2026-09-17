@@ -208,7 +208,13 @@ type deferredReleaseResult struct {
 // runs inside the same CloseDetailed that sets the status, so "closed" implies
 // "identifiers may already be degraded" without having to detect the degradation
 // field by field.
-func buildSessionReleaseObligation(sessionBead beads.Bead, captureOK bool, reason string, rigStoresKnown bool, now time.Time) sessionReleaseObligation {
+//
+// RigStoresKnown is always false. Obligations are published only on the close
+// path where the city config failed to load, and rig stores can only be
+// enumerated from that config (buildStandaloneRigStores), so the scope is never
+// known here. The field stays in the persisted record and the event payload so
+// a drain reads false as "scope unknown", never as "no rig stores".
+func buildSessionReleaseObligation(sessionBead beads.Bead, captureOK bool, reason string, now time.Time) sessionReleaseObligation {
 	preRetirement := captureOK && !strings.EqualFold(strings.TrimSpace(sessionBead.Status), "closed")
 	capture := releaseCaptureIDOnly
 	identities := []string{}
@@ -229,7 +235,7 @@ func buildSessionReleaseObligation(sessionBead beads.Bead, captureOK bool, reaso
 		Reason:         strings.TrimSpace(reason),
 		Capture:        capture,
 		Identities:     identities,
-		RigStoresKnown: rigStoresKnown,
+		RigStoresKnown: false,
 	}
 }
 
@@ -413,8 +419,8 @@ func readSessionReleaseObligation(store beads.Store, sessionID string) (sessionR
 // the close refuse when config is unavailable would stop every session closing
 // during a city-wide bad config, which is strictly worse than a withheld
 // release. So every failure here is reported, never returned.
-func deferMissingConfigWorkRelease(store beads.Store, sessionID string, sessionBead beads.Bead, captureOK bool, reason string, rigStoresKnown bool, rec events.Recorder, now time.Time, stderr io.Writer) deferredReleaseResult {
-	obligation := buildSessionReleaseObligation(sessionBead, captureOK, reason, rigStoresKnown, now)
+func deferMissingConfigWorkRelease(store beads.Store, sessionID string, sessionBead beads.Bead, captureOK bool, reason string, rec events.Recorder, now time.Time, stderr io.Writer) deferredReleaseResult {
+	obligation := buildSessionReleaseObligation(sessionBead, captureOK, reason, now)
 	result := publishDeferredReleaseObligation(store, sessionID, obligation)
 
 	// Report the PERSISTED obligation, not the one we tried to write: when an
