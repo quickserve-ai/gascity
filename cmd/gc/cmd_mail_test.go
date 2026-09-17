@@ -11,8 +11,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -4879,6 +4881,210 @@ name = "mayor"
 		t.Fatalf("inject path used API inbox instead of local provider:\n%s", stdout.String())
 	}
 	assertAutoHandoffRetainedAddressable(t, store, auto.ID)
+}
+
+// setMailInjectProbeDeadline shortens the inject probe's client deadline for
+// one test so a stalled-probe case runs in milliseconds, not seconds.
+func setMailInjectProbeDeadline(t *testing.T, d time.Duration) {
+	t.Helper()
+	prev := mailInjectProbeDeadline
+	mailInjectProbeDeadline = d
+	t.Cleanup(func() { mailInjectProbeDeadline = prev })
+}
+
+// delayedMailHandler holds each request for delay before handing it to next,
+// modeling a supervisor inbox read that waits on a slow store. It returns
+// early when the client abandons the request, so srv.Close never waits out
+// the delay. requests counts the reads that actually reached the server.
+func delayedMailHandler(delay time.Duration, requests *atomic.Int32, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(delay):
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// TestRouteMailCheckInjectStalledProbeStillInjectsLocalMail pins ga-c3omvr.
+// The probe's supervisor read stalls far past the inject deadline and then
+// answers store_slow, which is what the server does when its own 25s mail read
+// deadline fires. The hook must stop waiting at the inject deadline and inject
+// the local mailbox that turn, instead of being held until the hook's 15s kill
+// (or answering with only a degraded notice and no mail).
+func TestRouteMailCheckInjectStalledProbeStillInjectsLocalMail(t *testing.T) {
+	clearInheritedBeadsEnv(t)
+	cityPath := t.TempDir()
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_BEADS_SCOPE_ROOT", "")
+	t.Setenv("GC_CITY_PATH", cityPath)
+	t.Setenv("GC_DEBUG", "1")
+	t.Setenv("GC_ALIAS", "mayor")
+	t.Setenv("GC_SESSION_NAME", "mayor")
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(`[workspace]
+name = "test-city"
+
+[[agent]]
+name = "mayor"
+`), 0o644); err != nil {
+		t.Fatalf("write city.toml: %v", err)
+	}
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Type:   "session",
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "mayor",
+			"session_name": "mayor",
+		},
+	}); err != nil {
+		t.Fatalf("Create session: %v", err)
+	}
+	local, err := store.Create(beads.Bead{
+		Title:    "local mail must not wait on the probe",
+		Type:     "message",
+		Assignee: "mayor",
+		From:     "alice",
+	})
+	if err != nil {
+		t.Fatalf("Create message: %v", err)
+	}
+
+	const deadline = 100 * time.Millisecond
+	const stall = 10 * time.Second
+	setMailInjectProbeDeadline(t, deadline)
+	var requests atomic.Int32
+	srv := newRemoteMailTestServer(t, delayedMailHandler(stall, &requests,
+		mailProblemHandler(http.StatusServiceUnavailable, "store_slow: mail read timed out after 25s")(t)))
+	defer srv.Close()
+	c := api.NewCityScopedClient(srv.URL, "test-city")
+
+	var stdout, stderr bytes.Buffer
+	start := time.Now()
+	code := routeMailCheck(cityPath, nil, true, "", c, "", &stdout, &stderr)
+	elapsed := time.Since(start)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("probe requests = %d, want 1 (the stall was never exercised)", got)
+	}
+	if limit := deadline + 3*time.Second; elapsed >= limit {
+		t.Errorf("routeMailCheck took %v, want < %v: the inject probe waited on the stalled supervisor read instead of its own deadline", elapsed, limit)
+	}
+	if !strings.Contains(stdout.String(), local.ID) {
+		t.Errorf("stalled probe starved local injection: stdout missing local message %s:\n%s", local.ID, stdout.String())
+	}
+	if strings.Contains(stdout.String(), mailCheckDegradedNotice) {
+		t.Errorf("stdout carries a degraded notice alongside the local injection:\n%s", stdout.String())
+	}
+	assertMailRouteLog(t, stderr.String(), "fallback", "inject-local-side-effects")
+}
+
+// TestRouteMailCheckNonInjectKeepsFullMailReadDeadline guards the other side
+// of ga-c3omvr: only the inject probe is short. A plain `gc mail check` must
+// still wait out a supervisor read slower than the inject deadline and serve
+// the API answer, rather than falling back to the (empty) local provider.
+func TestRouteMailCheckNonInjectKeepsFullMailReadDeadline(t *testing.T) {
+	cityPath := writeMailTestCity(t)
+	t.Setenv("GC_DEBUG", "1")
+	setMailInjectProbeDeadline(t, 50*time.Millisecond)
+	var requests atomic.Int32
+	srv := newRemoteMailTestServer(t, delayedMailHandler(500*time.Millisecond, &requests, okMailCheckHandler(t)))
+	defer srv.Close()
+	c := api.NewCityScopedClient(srv.URL, "test-city")
+
+	var stdout, stderr bytes.Buffer
+	code := routeMailCheck(cityPath, []string{"mayor"}, false, "", c, "", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (API answer); stderr=%q stdout=%q", code, stderr.String(), stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "1 unread message(s)") {
+		t.Fatalf("stdout = %q, want the API inbox count", stdout.String())
+	}
+	assertMailRouteLog(t, stderr.String(), "api", "")
+}
+
+// TestRouteMailCheckInjectFastProbeContractUnchanged pins that a probe
+// answering inside the inject deadline keeps its pre-ga-c3omvr outcomes:
+// store_slow and partial reads emit exactly their notice without the local
+// injection, and a non-fallback error exits 0 silently.
+func TestRouteMailCheckInjectFastProbeContractUnchanged(t *testing.T) {
+	tests := []struct {
+		name       string
+		handler    mailMatrixHandler
+		wantStdout string
+	}{
+		{
+			name:       "store-slow-error",
+			handler:    mailProblemHandler(http.StatusServiceUnavailable, "store_slow: mail read timed out after 25s"),
+			wantStdout: expectedMailCheckDegradedInjectOutput(),
+		},
+		{
+			name:       "partial-store-slow",
+			handler:    partialStoreSlowMailCheckHandler,
+			wantStdout: expectedMailCheckDegradedInjectOutput(),
+		},
+		{
+			name:       "partial-provider-error",
+			handler:    partialProviderErrorMailCheckHandler,
+			wantStdout: expectedMailCheckPartialDegradedInjectOutput(),
+		},
+		{
+			name:       "non-fallback-error",
+			handler:    mailProblemHandler(http.StatusNotFound, "not_found: no such recipient"),
+			wantStdout: "",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cityPath := writeMailTestCity(t)
+			t.Setenv("GC_DEBUG", "1")
+			setMailInjectProbeDeadline(t, 5*time.Second)
+			srv := newRemoteMailTestServer(t, tc.handler(t))
+			defer srv.Close()
+			c := api.NewCityScopedClient(srv.URL, "test-city")
+
+			var stdout, stderr bytes.Buffer
+			if code := routeMailCheck(cityPath, []string{"mayor"}, true, "", c, "", &stdout, &stderr); code != 0 {
+				t.Fatalf("exit = %d, want 0; stderr=%q stdout=%q", code, stderr.String(), stdout.String())
+			}
+			if got := stdout.String(); got != tc.wantStdout {
+				t.Fatalf("stdout = %q, want %q", got, tc.wantStdout)
+			}
+			assertMailRouteLog(t, stderr.String(), "api", "error")
+		})
+	}
+}
+
+// TestMailInjectProbeTimeoutFitsInsideHookTimeout ties the probe deadline to
+// the hook that runs it. The Claude UserPromptSubmit hook kills `mail check
+// --inject` at its --timeout; the probe must end well inside that so the local
+// read that does the injection still has most of the budget (ga-c3omvr).
+func TestMailInjectProbeTimeoutFitsInsideHookTimeout(t *testing.T) {
+	if mailInjectProbeDeadline != mailInjectProbeTimeout {
+		t.Fatalf("mailInjectProbeDeadline = %v, want the production mailInjectProbeTimeout %v", mailInjectProbeDeadline, mailInjectProbeTimeout)
+	}
+	data, err := os.ReadFile(filepath.Join("..", "..", "internal", "hooks", "config", "claude.json"))
+	if err != nil {
+		t.Fatalf("read Claude hook config: %v", err)
+	}
+	m := regexp.MustCompile(`--timeout (\S+) [^"]*-- mail check --inject`).FindSubmatch(data)
+	if m == nil {
+		t.Fatalf("Claude hook config has no `gc hook run --timeout <d> ... -- mail check --inject` command")
+	}
+	hookTimeout, err := time.ParseDuration(string(m[1]))
+	if err != nil {
+		t.Fatalf("parse hook timeout %q: %v", m[1], err)
+	}
+	if mailInjectProbeTimeout > hookTimeout/3 {
+		t.Fatalf("mailInjectProbeTimeout = %v, want <= a third of the %v hook timeout so local injection keeps the rest", mailInjectProbeTimeout, hookTimeout)
+	}
 }
 
 func TestRenderMailCheckFromAPIInjectCodexUsesUserPromptSubmit(t *testing.T) {
