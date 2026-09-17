@@ -6,12 +6,15 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/session"
 )
@@ -165,6 +168,23 @@ func TestHookCommandClaimStaleSessionRecordsRefusedEvent(t *testing.T) {
 				RuntimeTokenFingerprint: refusalFingerprint(refusalRuntimeToken),
 				RuntimeEpoch:            "2",
 				BeadEpoch:               "2",
+			},
+			wantMatched: boolPtrForRefusalTest(false),
+		},
+		{
+			name: "legacy bead with no generation",
+			setup: func(t *testing.T, cityDir string) setup {
+				id := newRefusalSessionBead(t, cityDir, session.StateActive, refusalBeadToken, "")
+				return setup{sessionID: id, runtimeToken: refusalRuntimeToken}
+			},
+			want: events.HookClaimRefusedPayload{
+				Detail:                  events.HookClaimRefusedDetailTokenSuperseded,
+				State:                   string(session.StateActive),
+				RuntimeTokenFingerprint: refusalFingerprint(refusalRuntimeToken),
+				BeadTokenFingerprint:    refusalFingerprint(refusalBeadToken),
+				RuntimeEpoch:            "2",
+				// Normalized as a start normalizes it, not the raw empty string.
+				BeadEpoch: "1",
 			},
 			wantMatched: boolPtrForRefusalTest(false),
 		},
@@ -346,36 +366,52 @@ func TestHookCommandClaimMissingSessionRegistrationRecordsRefusedEvent(t *testin
 // to identity refusals: an idle no_work drain, the token-less compatibility
 // escape hatch, and a session-store fault the fence fails open on all record
 // nothing. no_work in particular is every idle poll of every seat.
+//
+// Each case proves POSITIVELY which fence path it took — the classifier seam
+// records the verdict it returned, or records that it was never consulted — and
+// that the command went on past the fence into the work query, so a case that
+// silently exited early cannot pass for a non-refusal.
 func TestHookCommandClaimNonRefusalsRecordNoRefusedEvent(t *testing.T) {
 	cases := []struct {
 		name  string
-		setup func(t *testing.T, cityDir string)
+		setup func(t *testing.T, cityDir string) (queryMarker string)
+		// wantVerdicts is what the fence classifier must have returned; empty
+		// means the fence must NOT have consulted it at all.
+		wantVerdicts []hookClaimSessionVerdict
+		wantReason   string
 	}{
 		{
 			name: "eligible session drains no_work",
-			setup: func(t *testing.T, cityDir string) {
+			setup: func(t *testing.T, cityDir string) string {
 				id := newRefusalSessionBead(t, cityDir, session.StateActive, refusalRuntimeToken, "2")
-				installFenceWorkQueryProbe(t)
+				marker := installFenceWorkQueryProbe(t)
 				setFenceClaimEnv(t, cityDir, id, refusalRuntimeToken)
+				return marker
 			},
+			wantVerdicts: []hookClaimSessionVerdict{hookClaimSessionEligible},
+			wantReason:   hookClaimReasonNoWork,
 		},
 		{
 			name: "token-less runtime skips the fence",
-			setup: func(t *testing.T, cityDir string) {
+			setup: func(t *testing.T, cityDir string) string {
 				id := newRefusalSessionBead(t, cityDir, session.StateFailedCreate, refusalBeadToken, "2")
-				installFenceWorkQueryProbe(t)
+				marker := installFenceWorkQueryProbe(t)
 				setFenceClaimEnv(t, cityDir, id, "")
+				return marker
 			},
+			wantReason: hookClaimReasonNoWork,
 		},
 		{
 			name: "session store fault fails open",
-			setup: func(t *testing.T, cityDir string) {
-				installFenceWorkQueryProbe(t)
+			setup: func(t *testing.T, cityDir string) string {
+				marker := installFenceWorkQueryProbe(t)
 				if err := os.WriteFile(filepath.Join(cityDir, ".gc", "beads.json"), []byte("{ not json"), 0o644); err != nil {
 					t.Fatal(err)
 				}
 				setFenceClaimEnv(t, cityDir, "worker-1", refusalRuntimeToken)
+				return marker
 			},
+			wantVerdicts: []hookClaimSessionVerdict{hookClaimSessionStoreUnavailable},
 		},
 	}
 	for _, tc := range cases {
@@ -384,13 +420,34 @@ func TestHookCommandClaimNonRefusalsRecordNoRefusedEvent(t *testing.T) {
 			disableManagedDoltRecoveryForTest(t)
 			t.Setenv("GC_BEADS", "file")
 			cityDir := writeFenceTestCity(t)
-			tc.setup(t, cityDir)
+			queryMarker := tc.setup(t, cityDir)
+
+			var verdicts []hookClaimSessionVerdict
+			realClassify := hookClaimClassifySession
+			hookClaimClassifySession = func(cityPath string, cfg *config.City, sessionID, instanceToken string) (hookClaimSessionVerdict, string, hookClaimStaleDetail) {
+				verdict, reason, detail := realClassify(cityPath, cfg, sessionID, instanceToken)
+				verdicts = append(verdicts, verdict)
+				return verdict, reason, detail
+			}
+			t.Cleanup(func() { hookClaimClassifySession = realClassify })
 
 			var stdout, stderr bytes.Buffer
 			_ = cmdHookWithOptions(nil, hookCommandOptions{Claim: true, JSON: true}, &stdout, &stderr)
 
-			if strings.Contains(stderr.String(), "refusing") {
-				t.Fatalf("case was refused, so it proves nothing about non-refusals: %s", stderr.String())
+			if !slices.Equal(verdicts, tc.wantVerdicts) {
+				t.Fatalf("fence classifier verdicts = %v, want %v; stderr=%s", verdicts, tc.wantVerdicts, stderr.String())
+			}
+			if _, err := os.Stat(queryMarker); err != nil {
+				t.Fatalf("the command never got past the fence to the work query: %v; stderr=%s", err, stderr.String())
+			}
+			if tc.wantReason != "" {
+				var result hookClaimJSONResult
+				if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &result); err != nil {
+					t.Fatalf("stdout is not a JSON result: %v\n%s", err, stdout.String())
+				}
+				if result.Action != "drain" || result.Reason != tc.wantReason {
+					t.Fatalf("result = %+v, want action=drain reason=%s", result, tc.wantReason)
+				}
 			}
 			refused, raw := readRefusedEvents(t, cityDir)
 			if len(refused) != 0 {
@@ -402,8 +459,9 @@ func TestHookCommandClaimNonRefusalsRecordNoRefusedEvent(t *testing.T) {
 
 // TestHookCommandClaimRefusalUnchangedWhenEventLogUnwritable proves recording is
 // never load-bearing: with the city's event log unopenable (a directory where
-// the file belongs) the refusal writes byte-identical stdout, the same stderr,
-// and the same exit code as a run whose event is recorded.
+// the file belongs) the recorder falls back to events.Discard, nothing is
+// written, and the refusal writes byte-identical stdout, the same stderr, and
+// the same exit code as a run whose event is recorded.
 func TestHookCommandClaimRefusalUnchangedWhenEventLogUnwritable(t *testing.T) {
 	run := func(t *testing.T, breakLog bool) (int, string, string) {
 		clearGCEnv(t)
@@ -413,15 +471,43 @@ func TestHookCommandClaimRefusalUnchangedWhenEventLogUnwritable(t *testing.T) {
 		id := newRefusalSessionBead(t, cityDir, session.StateActive, refusalBeadToken, "3")
 		installFenceWorkQueryProbe(t)
 		setFenceClaimEnv(t, cityDir, id, refusalRuntimeToken)
+		logPath := filepath.Join(cityDir, ".gc", "events.jsonl")
 		if breakLog {
-			if err := os.MkdirAll(filepath.Join(cityDir, ".gc", "events.jsonl"), 0o755); err != nil {
+			if err := os.MkdirAll(logPath, 0o755); err != nil {
 				t.Fatal(err)
 			}
 		}
+		var opened []events.Recorder
+		realOpen := hookClaimRefusedRecorder
+		hookClaimRefusedRecorder = func(cityPath string) events.Recorder {
+			rec := realOpen(cityPath)
+			opened = append(opened, rec)
+			return rec
+		}
+		t.Cleanup(func() { hookClaimRefusedRecorder = realOpen })
+
 		var stdout, stderr bytes.Buffer
 		code := cmdHookWithOptions(nil, hookCommandOptions{Claim: true, JSON: true}, &stdout, &stderr)
 		requireStaleDrainRecord(t, code, &stdout, &stderr, hookClaimReasonStaleSession)
-		if !breakLog {
+
+		if len(opened) != 1 {
+			t.Fatalf("event recorder opened %d times, want exactly 1", len(opened))
+		}
+		if breakLog {
+			if opened[0] != events.Discard {
+				t.Fatalf("recorder = %T, want the events.Discard fallback for an unopenable log", opened[0])
+			}
+			entries, err := os.ReadDir(logPath)
+			if err != nil {
+				t.Fatalf("the directory standing in for the log is gone or unreadable: %v", err)
+			}
+			if len(entries) != 0 {
+				t.Fatalf("an unopenable log still received writes: %v", entries)
+			}
+		} else {
+			if _, ok := opened[0].(*events.FileRecorder); !ok {
+				t.Fatalf("control recorder = %T, want *events.FileRecorder", opened[0])
+			}
 			if refused, raw := readRefusedEvents(t, cityDir); len(refused) != 1 {
 				t.Fatalf("control run recorded %d events, want 1; log:\n%s", len(refused), raw)
 			}
@@ -440,6 +526,146 @@ func TestHookCommandClaimRefusalUnchangedWhenEventLogUnwritable(t *testing.T) {
 	if okCode != brokenCode || okStdout != brokenStdout || okStderr != brokenStderr {
 		t.Fatalf("refusal changed with the event log unwritable:\n code %d vs %d\n stdout %q vs %q\n stderr %q vs %q",
 			okCode, brokenCode, okStdout, brokenStdout, okStderr, brokenStderr)
+	}
+}
+
+// TestHookCommandClaimRefusalRecordsBeforeDrainAck pins the ordering the emitter
+// depends on: for both identity refusals, hook.claim.refused is recorded BEFORE
+// the --drain-ack that lets the controller stop the seat. Recorded after it, the
+// event would race the teardown of the very seat it describes.
+func TestHookCommandClaimRefusalRecordsBeforeDrainAck(t *testing.T) {
+	cases := []struct {
+		name       string
+		setup      func(t *testing.T, cityDir string)
+		wantReason string
+	}{
+		{
+			name: "stale session",
+			setup: func(t *testing.T, cityDir string) {
+				id := newRefusalSessionBead(t, cityDir, session.StateActive, refusalBeadToken, "3")
+				installFenceWorkQueryProbe(t)
+				setFenceClaimEnv(t, cityDir, id, refusalRuntimeToken)
+			},
+			wantReason: hookClaimReasonStaleSession,
+		},
+		{
+			name: "missing session registration",
+			setup: func(t *testing.T, cityDir string) {
+				t.Setenv("GC_CITY", cityDir)
+				installFenceWorkQueryProbe(t)
+				setFenceClaimEnvMissingSessionID(t)
+			},
+			wantReason: hookClaimReasonMissingSessionRegistration,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clearGCEnv(t)
+			disableManagedDoltRecoveryForTest(t)
+			t.Setenv("GC_BEADS", "file")
+			cityDir := writeFenceTestCity(t)
+			tc.setup(t, cityDir)
+
+			var order []string
+			realEmit, realAck := hookEmitClaimRefused, hookClaimFenceDrainAck
+			hookEmitClaimRefused = func(_, _ string, payload events.HookClaimRefusedPayload) {
+				order = append(order, "emit:"+payload.Reason)
+			}
+			// Never the real ack: it would signal a controller.
+			hookClaimFenceDrainAck = func(io.Writer) error {
+				order = append(order, "drain-ack")
+				return nil
+			}
+			t.Cleanup(func() { hookEmitClaimRefused, hookClaimFenceDrainAck = realEmit, realAck })
+
+			var stdout, stderr bytes.Buffer
+			code := cmdHookWithOptions(nil, hookCommandOptions{Claim: true, JSON: true, DrainAck: true}, &stdout, &stderr)
+
+			want := []string{"emit:" + tc.wantReason, "drain-ack"}
+			if !slices.Equal(order, want) {
+				t.Fatalf("call order = %v, want %v (the event must be recorded before the drain-ack)", order, want)
+			}
+			if code != 0 {
+				t.Fatalf("code = %d, want 0 for an acknowledged drain; stderr=%s", code, stderr.String())
+			}
+			var result hookClaimJSONResult
+			if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &result); err != nil {
+				t.Fatalf("stdout is not a JSON drain result: %v\n%s", err, stdout.String())
+			}
+			if result.Action != "drain" || result.Reason != tc.wantReason || !result.DrainAcknowledged {
+				t.Fatalf("result = %+v, want an acknowledged %s drain", result, tc.wantReason)
+			}
+		})
+	}
+}
+
+// TestHookCommandClaimMissingRegistrationNeverCreditsTheOperator proves a
+// refusing pool runtime with no alias, agent, session id or BEADS_ACTOR is not
+// recorded under eventActor's "human" fallback.
+func TestHookCommandClaimMissingRegistrationNeverCreditsTheOperator(t *testing.T) {
+	clearGCEnv(t)
+	disableManagedDoltRecoveryForTest(t)
+	t.Setenv("GC_BEADS", "file")
+	cityDir := writeFenceTestCity(t)
+	t.Setenv("GC_CITY", cityDir)
+	installFenceWorkQueryProbe(t)
+	setFenceClaimEnvMissingSessionID(t)
+	t.Setenv("GC_ALIAS", "")
+	t.Setenv("GC_AGENT", "")
+	t.Setenv("BEADS_ACTOR", "")
+	if got := eventActor(); got != "human" {
+		t.Fatalf("precondition: eventActor() = %q, want the \"human\" fallback this test guards against", got)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cmdHookWithOptions(nil, hookCommandOptions{Claim: true, JSON: true}, &stdout, &stderr)
+
+	requireStaleDrainRecord(t, code, &stdout, &stderr, hookClaimReasonMissingSessionRegistration)
+	refused, raw := readRefusedEvents(t, cityDir)
+	if len(refused) != 1 {
+		t.Fatalf("recorded %d hook.claim.refused events, want exactly 1; log:\n%s", len(refused), raw)
+	}
+	if refused[0].Actor != "gc-hook:worker" {
+		t.Fatalf("actor = %q, want gc-hook:worker", refused[0].Actor)
+	}
+}
+
+// TestHookClaimRefusedActor covers the actor substitution without a command run.
+func TestHookClaimRefusedActor(t *testing.T) {
+	clearGCEnv(t)
+	t.Setenv("GC_ALIAS", "")
+	t.Setenv("GC_AGENT", "")
+	t.Setenv("GC_SESSION_ID", "")
+	t.Setenv("BEADS_ACTOR", "")
+	if got := hookClaimRefusedActor(" worker "); got != "gc-hook:worker" {
+		t.Fatalf("actor = %q, want gc-hook:worker", got)
+	}
+	if got := hookClaimRefusedActor(""); got != "gc-hook" {
+		t.Fatalf("actor with no template = %q, want gc-hook", got)
+	}
+	t.Setenv("GC_ALIAS", "worker-1")
+	if got := hookClaimRefusedActor("worker"); got != "worker-1" {
+		t.Fatalf("actor = %q, want the runtime's own alias", got)
+	}
+}
+
+// TestHookClaimRuntimeGenerationMatchesTheStartPath pins bead_epoch's
+// normalization to the one a start applies when it stamps GC_RUNTIME_EPOCH, so a
+// legacy bead with no generation reads "1" beside a runtime_epoch of "1".
+func TestHookClaimRuntimeGenerationMatchesTheStartPath(t *testing.T) {
+	cases := []struct{ raw, want string }{
+		{"", "1"},
+		{"0", "1"},
+		{"-2", "1"},
+		{"abc", "1"},
+		{" 3", "1"}, // the start path parses the untrimmed value
+		{"1", "1"},
+		{"4", "4"},
+	}
+	for _, tc := range cases {
+		if got := hookClaimRuntimeGeneration(tc.raw); got != tc.want {
+			t.Errorf("hookClaimRuntimeGeneration(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
 	}
 }
 

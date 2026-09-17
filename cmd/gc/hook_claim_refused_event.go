@@ -6,13 +6,21 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 
+	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/session"
 )
 
 // hookEmitClaimRefused is the emitter seam, replaced in tests.
 var hookEmitClaimRefused = emitHookClaimRefused
+
+// hookClaimRefusedRecorder opens the event log for one refusal. A seam so a test
+// can observe the events.Discard fallback directly.
+var hookClaimRefusedRecorder = openHookClaimRefusedRecorder
 
 // hookClaimTokenFingerprintHexLen is how much of a token's SHA-256 a
 // hook.claim.refused payload may carry: 8 hex characters (32 bits).
@@ -40,15 +48,15 @@ const hookClaimTokenFingerprintHexLen = 8
 // records nothing. The drain that follows is identical either way.
 func emitHookClaimRefused(cityPath, message string, payload events.HookClaimRefusedPayload) {
 	if strings.TrimSpace(cityPath) == "" {
-		// openCityRecorderAt("") would resolve .gc/events.jsonl against the
-		// working directory, which is not a city.
+		// An empty city path would resolve .gc/events.jsonl against the working
+		// directory, which is not a city.
 		return
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return
 	}
-	rec := openCityRecorderAt(cityPath, io.Discard)
+	rec := hookClaimRefusedRecorder(cityPath)
 	if closer, ok := rec.(io.Closer); ok {
 		defer closer.Close() //nolint:errcheck // best-effort event recorder cleanup
 	}
@@ -58,12 +66,68 @@ func emitHookClaimRefused(cityPath, message string, payload events.HookClaimRefu
 	}
 	rec.Record(events.Event{
 		Type:      events.HookClaimRefused,
-		Actor:     eventActor(),
+		Actor:     hookClaimRefusedActor(payload.Template),
 		Subject:   subject,
 		Message:   message,
 		Payload:   body,
 		SessionID: payload.SessionID,
 	})
+}
+
+// openHookClaimRefusedRecorder opens the city's event log the way a transient,
+// per-invocation writer must — the pattern class_store_emit.go established —
+// rather than through openCityRecorderAt, which is built for a long-lived
+// command's recorder.
+//
+//   - events.WithoutStartupSweep: the orphaned-rotating-file sweep and the
+//     NUL-tail repair belong to the supervisor's long-lived recorder. Run from a
+//     hook they would race it mid-rotation, under a lock, in front of a drain
+//     whose --drain-ack is time-sensitive.
+//   - no WithMaxSize, and no city config load: size-triggered rotation stays
+//     disabled, so this process never rotates the live log and Close never waits
+//     on a background gzip. Rotation remains the supervisor's job.
+//
+// Any open failure falls back to events.Discard.
+func openHookClaimRefusedRecorder(cityPath string) events.Recorder {
+	rec, err := events.NewFileRecorder(
+		filepath.Join(cityPath, citylayout.RuntimeRoot, "events.jsonl"),
+		io.Discard,
+		events.WithoutStartupSweep(),
+	)
+	if err != nil {
+		return events.Discard
+	}
+	return rec
+}
+
+// hookClaimRefusedActor is eventActor() for a refusal, except that it never
+// credits the refusal to the operator. eventActor falls back to "human" when
+// GC_ALIAS, GC_AGENT, GC_SESSION_ID and BEADS_ACTOR are all empty — and a
+// missing-registration refusal fires precisely when GC_SESSION_ID is empty — so
+// that fallback is replaced with the refusing pool runtime's own name.
+func hookClaimRefusedActor(template string) string {
+	actor := eventActor()
+	if actor != "human" {
+		return actor
+	}
+	if template = strings.TrimSpace(template); template != "" {
+		return "gc-hook:" + template
+	}
+	return "gc-hook"
+}
+
+// hookClaimRuntimeGeneration renders a session bead's raw generation metadata
+// exactly as a session start renders it into GC_RUNTIME_EPOCH: the parsed
+// integer, with an empty, zero, negative or unparseable value started as
+// session.DefaultGeneration (session_lifecycle_parallel.go and
+// internal/session/chat.go both parse the untrimmed value). bead_epoch uses it so
+// the two fields compare as written.
+func hookClaimRuntimeGeneration(raw string) string {
+	generation, err := strconv.Atoi(raw)
+	if err != nil || generation <= 0 {
+		generation = session.DefaultGeneration
+	}
+	return strconv.Itoa(generation)
 }
 
 // hookClaimRefusedPayload assembles the hook.claim.refused payload from what the
