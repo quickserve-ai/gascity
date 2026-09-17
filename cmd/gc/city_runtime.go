@@ -859,9 +859,11 @@ func (cr *CityRuntime) run(ctx context.Context) {
 	// Dispatch due orders before startup session reconciliation. A cold-start
 	// reconcile can take minutes when it has stale or config-drifted sessions;
 	// due event/condition formulas should not wait behind that maintenance work.
+	// This pass runs before readiness, so it leaves the order-tracking retention
+	// watchdog to the first steady-state tick (#6429).
 	startupOrdersStart := time.Now()
 	cr.safeTick(func() {
-		cr.dispatchOrders(ctx, cityRoot)
+		cr.dispatchOrders(ctx, cityRoot, true)
 	}, "startup-orders")
 	logPhaseElapsed("startup-orders", startupOrdersStart)
 	if ctx.Err() != nil {
