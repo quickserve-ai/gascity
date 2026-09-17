@@ -306,6 +306,10 @@ func TestValidateSupervisorLaunchdPlist(t *testing.T) {
 	}{
 		{name: "valid", content: valid, script: "#!/bin/sh\nprintf 'gc version test\\n'\n"},
 		{name: "silent executable", content: valid, script: "#!/bin/sh\nexit 0\n", wantErr: "empty output"},
+		// A loaded box runs a healthy gc version for seconds (2.98-5.66s measured
+		// at load 58). The preflight runs before bootout, so failing it here
+		// only blocks the recovery install (ga-jgwpjg).
+		{name: "slow but healthy executable", content: valid, script: "#!/bin/sh\nsleep 3\nprintf 'gc version test\\n'\n"},
 		{name: "malformed XML", content: `<plist><dict>`, script: "#!/bin/sh\nprintf 'gc version test\\n'\n", wantErr: "plutil validation failed"},
 		{name: "missing label", content: strings.Replace(valid, label, "com.gascity.other", 1), script: "#!/bin/sh\nprintf 'gc version test\\n'\n", wantErr: "launchd label"},
 		{name: "missing executable", content: strings.Replace(valid, "GC_PATH", "/missing/gc", 1), script: "#!/bin/sh\nprintf 'gc version test\\n'\n", wantErr: "gc executable"},
