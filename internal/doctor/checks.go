@@ -2417,6 +2417,22 @@ func duDirBytes(root string) (int64, bool, error) {
 		if errors.Is(err, exec.ErrNotFound) {
 			return boundedSumDirBytes(root)
 		}
+		// du reports WHY on stderr ("Permission denied") and exits 1; without
+		// it the caller sees a bare "exit status 1" and cannot tell an
+		// unreadable tree from any other failure (ga-hyhccs).
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			stderr := strings.TrimSpace(string(exitErr.Stderr))
+			if len(stderr) > 300 {
+				stderr = stderr[:300] + "..."
+			}
+			if strings.Contains(stderr, "Permission denied") {
+				return 0, true, fmt.Errorf("measure directory with du -sk: %w: %w: %s", err, fs.ErrPermission, stderr)
+			}
+			if stderr != "" {
+				return 0, true, fmt.Errorf("measure directory with du -sk: %w: %s", err, stderr)
+			}
+		}
 		return 0, true, fmt.Errorf("measure directory with du -sk: %w", err)
 	}
 
