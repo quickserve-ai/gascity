@@ -69,6 +69,15 @@ var SupersededBundledPackImportVersions = []string{
 	// predates the content those binaries embedded, so it is served from
 	// embedded content and never fetched (isSupersededEmbeddedOnlyPin).
 	"sha:f895c0ff47d6ee9334ed282a416387eb5b084d24",
+	// quickserve-ai carry/operational builds through fleet/2026-09-15 pinned
+	// the bundled packs at these carry-only commits. No gastownhall/gascity ref
+	// reaches them, so a city still pinned at one can neither load nor fetch
+	// it; the doctor fix re-pins it offline.
+	"sha:f4128e404f6e8329fabb6343f8825f6db753e01b",
+	"sha:997b8a563e6d460e6716ecf466b8905049f64139",
+	"sha:e37a541e1dc4444e0792272d4029e0b330d82616",
+	"sha:abcf2b639b85f849391ef0daf9ddcd27b0728f0a",
+	"sha:abcf2b6393a1e52378656570028ac6deb3d2f10f",
 }
 
 // SupersededPublicGastownPackVersions lists previous canonical pins for the
