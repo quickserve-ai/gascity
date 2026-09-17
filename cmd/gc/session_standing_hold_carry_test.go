@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/liveness"
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 )
@@ -172,5 +174,163 @@ func TestReconcileSessionBeads_FreshWakeCooldownExtendsButNeverShortensAHold(t *
 				t.Errorf("held_until after drain-ack = %q, want %q (hold was %q, cooldown ends %q)", held, want, hold, cooled)
 			}
 		})
+	}
+}
+
+// unreachableLivenessStore fails every read and write with a connection-class
+// error: the liveness pool is gone. The first failure retires the binding's
+// pool, so later operations through the same binding take the no-store path —
+// both shapes of a degraded overlay are exercised in one tick.
+type unreachableLivenessStore struct {
+	*liveness.MemStore
+	reads int
+}
+
+var errLivenessUnreachable = errors.New("invalid connection")
+
+func (s *unreachableLivenessStore) Get(context.Context, string) (liveness.Snapshot, error) {
+	s.reads++
+	return liveness.Snapshot{}, errLivenessUnreachable
+}
+
+func (s *unreachableLivenessStore) GetMany(context.Context, []string) (map[string]liveness.Snapshot, error) {
+	s.reads++
+	return nil, errLivenessUnreachable
+}
+
+func (s *unreachableLivenessStore) SetBatch(context.Context, string, map[string]string) error {
+	return errLivenessUnreachable
+}
+
+// TestReconcileSessionBeads_DegradedLivenessReadDefersStandingHoldDrainAck runs
+// the drain-ack of a suspended seat with assigned work through the fork's
+// liveness overlay, with the overlay down for exactly the tick that finalizes
+// it — woodhouse's review item 1 on fork PR #59, and the first lifecycle test
+// here that does not run on a bare MemStore.
+//
+// suspend writes an all-liveness batch, so the hold lives only in the liveness
+// table. A failed overlay read serves committed metadata, where sleep_intent
+// and held_until are absent. Finalizing on that read relabels the parked seat
+// idle and writes sleep_intent="" through FallbackPlan; the fence then drops
+// the pre-outage user-hold row once the pool recovers, while the unfenced
+// held_until row survives, so the crash-recovery override reads an operator
+// suspend as an agent keep-alive and respawns the seat. The degraded tick must
+// defer the finalize instead, and the recovered tick must finalize with the
+// hold intact.
+func TestReconcileSessionBeads_DegradedLivenessReadDefersStandingHoldDrainAck(t *testing.T) {
+	backing := beads.NewMemStore()
+	lv := liveness.NewMemStore()
+	lvNow := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
+	lv.Clock = func() time.Time { return lvNow }
+	overlay := func(store liveness.Store) beads.Store {
+		return wrapStoreWithBeadPolicies(backing, &config.City{}, newLivenessBindingForTest(store, liveness.ModeTable))
+	}
+
+	env := newReconcilerTestEnv()
+	env.store = overlay(lv)
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	env.addDesired("worker", "worker", true)
+	session := env.createSessionBead("worker", "worker")
+	env.markSessionActive(&session)
+	heldUntil := env.clk.Now().Add(indefiniteHoldDuration).UTC().Format(time.RFC3339)
+	env.setSessionMetadata(&session, map[string]string{
+		"held_until":   heldUntil,
+		"sleep_intent": string(sessionpkg.SleepReasonUserHold),
+		"state":        "suspended",
+		"last_woke_at": env.clk.Now().Add(-30 * time.Minute).UTC().Format(time.RFC3339),
+	})
+	if committed, err := backing.Get(session.ID); err != nil {
+		t.Fatalf("backing Get: %v", err)
+	} else if committed.Metadata["sleep_intent"] != "" || committed.Metadata["held_until"] != "" {
+		t.Fatalf("precondition: the suspend reached versioned metadata (%v); the hold must live only in the liveness table", committed.Metadata)
+	}
+
+	task, err := env.store.Create(beads.Bead{Title: "assigned task", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create(task): %v", err)
+	}
+	status, assignee := "in_progress", session.ID
+	if err := env.store.Update(task.ID, beads.UpdateOpts{Status: &status, Assignee: &assignee}); err != nil {
+		t.Fatalf("Update(task): %v", err)
+	}
+	if task, err = env.store.Get(task.ID); err != nil {
+		t.Fatalf("Get(task): %v", err)
+	}
+
+	cfgNames := map[string]bool{"worker": true}
+	tick := func(dops drainOps) int {
+		cur, err := env.store.Get(session.ID)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", session.ID, err)
+		}
+		return reconcileSessionBeads(
+			context.Background(), []beads.Bead{cur}, env.desiredState, cfgNames,
+			env.cfg, env.sp, env.store, dops, []beads.Bead{task}, nil, env.dt,
+			map[string]int{"worker": 1}, false, nil, "",
+			nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr, env.startOptions...,
+		)
+	}
+
+	// Healthy tick: the ack moves the seat to stop-pending and stops it.
+	dops := newFakeDrainOps()
+	if err := dops.setDrainAck("worker"); err != nil {
+		t.Fatalf("setDrainAck: %v", err)
+	}
+	if woken := tick(dops); woken != 0 {
+		t.Fatalf("woken on the drain-ack tick = %d, want 0; stderr=%s", woken, env.stderr.String())
+	}
+	waitForProviderStopped(t, env.sp, "worker")
+
+	// Degraded tick: the finalize would run now, on a fail-open read.
+	lvNow = lvNow.Add(time.Minute)
+	down := &unreachableLivenessStore{MemStore: lv}
+	env.store = overlay(down)
+	degradedRead, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("degraded Get: %v", err)
+	}
+	if degradedRead.Metadata[liveness.ReadDegradedKey] != "true" || degradedRead.Metadata["sleep_intent"] != "" {
+		t.Fatalf("precondition: the degraded read = %v, want committed metadata marked degraded with no sleep_intent", degradedRead.Metadata)
+	}
+	if woken := tick(dops); woken != 0 {
+		t.Errorf("woken on the degraded tick = %d, want 0; stderr=%s", woken, env.stderr.String())
+	}
+	if down.reads == 0 {
+		t.Fatalf("the degraded tick never read through the unreachable store; the test proves nothing")
+	}
+
+	// Recovery: the same rows, read through a healthy pool.
+	lvNow = lvNow.Add(time.Minute)
+	env.store = overlay(lv)
+	recovered := env.sessionInfo(session.ID)
+	if recovered.SleepIntent != string(sessionpkg.SleepReasonUserHold) {
+		t.Errorf("sleep_intent after the degraded tick = %q, want %q (a fenced degraded write buried the suspend)",
+			recovered.SleepIntent, sessionpkg.SleepReasonUserHold)
+	}
+	if recovered.SleepReason == string(sessionpkg.SleepReasonIdle) {
+		t.Errorf("sleep_reason after the degraded tick = %q: the parked seat was relabeled idle on a fail-open read", recovered.SleepReason)
+	}
+	if recovered.HeldUntil != heldUntil {
+		t.Errorf("held_until after the degraded tick = %q, want %q", recovered.HeldUntil, heldUntil)
+	}
+
+	// The recovered tick finalizes on a real read, carrying the hold.
+	if woken := tick(dops); woken != 0 {
+		t.Errorf("woken on the recovered drain-ack tick = %d, want 0; stderr=%s", woken, env.stderr.String())
+	}
+	final := env.sessionInfo(session.ID)
+	if final.SleepIntent != string(sessionpkg.SleepReasonUserHold) || final.SleepReason != string(sessionpkg.SleepReasonUserHold) {
+		t.Errorf("after the recovered finalize: sleep_intent=%q sleep_reason=%q, want both %q (state=%q)",
+			final.SleepIntent, final.SleepReason, sessionpkg.SleepReasonUserHold, final.MetadataState)
+	}
+
+	// And the following ticks leave the suspended seat down. Two plain ticks:
+	// the crash-recovery override is what respawns a buried suspend, and it
+	// need not fire on the first tick after the ack is consumed.
+	for i := 1; i <= 2; i++ {
+		if woken := tick(nil); woken != 0 || env.sp.IsRunning("worker") {
+			t.Errorf("plain tick %d after the degraded tick respawned the suspended seat (woken=%d); stderr=%s", i, woken, env.stderr.String())
+			break
+		}
 	}
 }

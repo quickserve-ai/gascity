@@ -173,6 +173,7 @@ var infoKeyCodec = []infoKeySpec{
 	{"wake_mode", func(i *Info, v string) { i.WakeMode = v }},
 	{"drain_at", func(i *Info, v string) { i.DrainAt = v }},
 	{"sleep_intent", func(i *Info, v string) { i.SleepIntent = v }},
+	{beadmeta.LivenessReadDegradedMetadataKey, func(i *Info, v string) { i.LivenessReadDegraded = strings.TrimSpace(v) != "" }},
 	{"instance_token", func(i *Info, v string) { i.InstanceToken = v }},
 	{"detached_at", func(i *Info, v string) { i.DetachedAt = v }},
 	{CurrentBeadIDKey, func(i *Info, v string) { i.CurrentlyProcessingBeadID = v }},
