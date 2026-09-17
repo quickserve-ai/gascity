@@ -19,8 +19,12 @@ type bracketedPasteExecutor struct {
 	provider     string
 	pasteFlag    string
 	pasteFlagErr error
-	calls        [][]string
-	loaded       []string
+	// panePID is the answer to a #{pane_pid} read. Empty means "no pane",
+	// which makes the provider process sniff -- and so the agent-liveness
+	// fallback in paneBracketsPaste -- come back negative.
+	panePID string
+	calls   [][]string
+	loaded  []string
 }
 
 func (f *bracketedPasteExecutor) execute(args []string) (string, error) {
@@ -28,6 +32,8 @@ func (f *bracketedPasteExecutor) execute(args []string) (string, error) {
 	switch {
 	case tmuxArgsContain(args, "#{bracket_paste_flag}"):
 		return f.pasteFlag, f.pasteFlagErr
+	case tmuxArgsContain(args, "#{pane_pid}"):
+		return f.panePID, nil
 	case tmuxArgsContain(args, "show-environment"):
 		if f.provider == "" {
 			return "", errors.New("unknown variable: GC_PROVIDER")
@@ -123,7 +129,7 @@ func TestNudgeSendPathBracketsLongOrMultilineClaudeText(t *testing.T) {
 			tm := NewTmuxWithConfig(DefaultConfig())
 			tm.exec = fe
 
-			if err := tm.sendKeysLiteralWithRetry("%1", tt.text, time.Second); err != nil {
+			if err := tm.sendKeysLiteralWithRetry(context.Background(), "%1", tt.text, time.Second); err != nil {
 				t.Fatalf("sendKeysLiteralWithRetry(%d bytes) = %v, want nil", len(tt.text), err)
 			}
 
@@ -179,7 +185,7 @@ func TestNudgeSendPathLeavesNonClaudeProvidersOnSendKeys(t *testing.T) {
 			tm := NewTmuxWithConfig(DefaultConfig())
 			tm.exec = fe
 
-			if err := tm.sendKeysLiteralWithRetry("%1", text, time.Second); err != nil {
+			if err := tm.sendKeysLiteralWithRetry(context.Background(), "%1", text, time.Second); err != nil {
 				t.Fatalf("sendKeysLiteralWithRetry() = %v, want nil", err)
 			}
 			if literal := fe.literalSends(); len(literal) != 1 || literal[0] != text {
@@ -230,7 +236,7 @@ func TestNudgeSendPathLeavesNonClaudeProvidersOnSendKeys(t *testing.T) {
 		tm.exec = fe
 
 		oversized := sizedNudge(maxSendKeysLiteralLen + 1)
-		if err := tm.sendKeysLiteralWithRetry("%1", oversized, time.Second); err != nil {
+		if err := tm.sendKeysLiteralWithRetry(context.Background(), "%1", oversized, time.Second); err != nil {
 			t.Fatalf("sendKeysLiteralWithRetry() = %v, want nil", err)
 		}
 		if literal := fe.literalSends(); len(literal) != 0 {
@@ -247,9 +253,14 @@ func TestNudgeSendPathLeavesNonClaudeProvidersOnSendKeys(t *testing.T) {
 // the pane's application has turned bracketed paste on; with
 // #{bracket_paste_flag} at 0, tmux writes a multi-line nudge raw as
 // "line1\rline2\r...", and each CR submits a line on its own. So a claude nudge
-// goes out as a paste only when the flag reads "1". A flag of "0", an empty
-// answer, or a failed read keeps the send-keys path this nudge took before
-// ga-6qfgdo, and none of them is an error.
+// goes out as a paste only when the pane is confirmed to bracket it. A flag of
+// "0" refuses outright; an empty answer or a failed read means the server cannot
+// tell (tmux before 3.7), and this executor reports no pane process, so the
+// agent-liveness fallback is negative too and the send-keys path this nudge took
+// before ga-6qfgdo is kept. None of them is an error.
+//
+// The fallback itself is covered by
+// TestNudgeSendPathConfirmsBracketedPasteByAgentLiveness (ga-p93v6w).
 func TestNudgeSendPathPastesOnlyWhenPaneBracketPasteFlagIsOn(t *testing.T) {
 	text := multiLineNudge(900)
 	tests := []struct {
@@ -260,8 +271,8 @@ func TestNudgeSendPathPastesOnlyWhenPaneBracketPasteFlagIsOn(t *testing.T) {
 	}{
 		{name: "flag 1 pastes", flag: "1", wantPaste: true},
 		{name: "flag 0 keeps send-keys", flag: "0"},
-		{name: "empty flag (tmux before 3.7 lacks the format) keeps send-keys", flag: ""},
-		{name: "flag read error keeps send-keys", flagErr: errors.New("can't find pane: %1")},
+		{name: "empty flag (tmux before 3.7 lacks the format) with no live agent keeps send-keys", flag: ""},
+		{name: "flag read error with no live agent keeps send-keys", flagErr: errors.New("can't find pane: %1")},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -269,7 +280,7 @@ func TestNudgeSendPathPastesOnlyWhenPaneBracketPasteFlagIsOn(t *testing.T) {
 			tm := NewTmuxWithConfig(DefaultConfig())
 			tm.exec = fe
 
-			if err := tm.sendKeysLiteralWithRetry("%1", text, time.Second); err != nil {
+			if err := tm.sendKeysLiteralWithRetry(context.Background(), "%1", text, time.Second); err != nil {
 				t.Fatalf("sendKeysLiteralWithRetry() = %v, want nil", err)
 			}
 
