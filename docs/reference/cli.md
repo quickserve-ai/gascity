@@ -5001,7 +5001,7 @@ gc supervisor stop [flags]
 |------|------|---------|-------------|
 | `--json` | bool |  | emit JSONL summary |
 | `--wait` | bool |  | Wait for the supervisor to finish stopping all managed cities and release its socket before returning |
-| `--wait-timeout` | duration | `30s` | Maximum time to wait when --wait is set (in delegated mode, bounds the synchronous systemctl stop regardless of --wait) |
+| `--wait-timeout` | duration | `1m30s` | Maximum time to wait when --wait is set (in delegated mode, bounds the synchronous systemctl stop regardless of --wait) |
 
 ## gc supervisor uninstall
 
