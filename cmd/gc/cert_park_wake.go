@@ -24,43 +24,62 @@ package main
 // START a sleeping owner, so a live seat, an always-on named seat, or a seat
 // woken for any other reason costs nothing, and a parked sleeping owner costs
 // one bead read per tick.
+//
+// The read is bounded. A live Get is a `bd show` with its own long subprocess
+// timeout and retries, and this runs inside the reconcile tick, so a stalled
+// store must not stall the tick. All of a tick's reads run concurrently under
+// ONE budget (certParkReadBudget), and at most certParkReadSlots reads are ever
+// outstanding. A read that misses the budget, or that finds no free slot, is
+// "not parked" — the owner wakes, exactly as before this fix.
 
 import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 )
 
-// certParkedWorkProbe reports whether assignedWorkBeads[i] is, right now,
-// parked on a certification wait.
-type certParkedWorkProbe func(i int) bool
+// certParkReadBudget bounds how long one reconcile tick waits for all of its
+// cert-park label reads together.
+const certParkReadBudget = 2 * time.Second
 
-// newLiveCertParkedWorkProbe reads a work bead's labels through the LIVE handle
-// of the store the row was read through. It returns nil when rows and stores
-// are not index-aligned, which leaves every assignment as wake demand.
+// certParkReadSlots bounds the cert-park reads outstanding at once, across
+// ticks. A read abandoned at the budget keeps its slot until its subprocess
+// returns, so a stalled store caps the leaked reads at this number instead of
+// adding a batch every tick; it is also the per-tick read cap.
+var certParkReadSlots = make(chan struct{}, 8)
+
+// certParkedWorkProbe reports which of the given assignedWorkBeads indexes are,
+// right now, parked on a certification wait. An index absent from the result
+// is not parked.
+type certParkedWorkProbe func(rows []int) map[int]bool
+
+// newLiveCertParkedWorkProbe reads work beads' labels through the LIVE handle of
+// the store each row was read through, bounded by certParkReadBudget. It
+// returns nil when rows and stores are not index-aligned, which leaves every
+// assignment as wake demand.
 //
-// Every failure answers "not parked": a read error, a bead that is no longer
-// in_progress, or one that changed hands. Each of those degrades to the pre-fix
-// behavior (wake the owner), never to a stall.
+// Every failure answers "not parked": a read error, a read that misses the
+// budget or finds no free slot, a bead that is no longer in_progress, or one
+// that changed hands. Each of those degrades to the pre-fix behavior (wake the
+// owner), never to a stall.
 func newLiveCertParkedWorkProbe(workBeads []beads.Bead, stores []beads.Store, stderr io.Writer) certParkedWorkProbe {
+	return newCertParkedWorkProbeWithBudget(workBeads, stores, stderr, certParkReadBudget)
+}
+
+func newCertParkedWorkProbeWithBudget(workBeads []beads.Bead, stores []beads.Store, stderr io.Writer, budget time.Duration) certParkedWorkProbe {
 	if len(workBeads) == 0 || len(stores) != len(workBeads) {
 		return nil
 	}
 	if stderr == nil {
 		stderr = io.Discard
 	}
-	return func(i int) bool {
-		if i < 0 || i >= len(workBeads) || stores[i] == nil {
-			return false
-		}
+	readOne := func(i int) bool {
 		row := workBeads[i]
 		id := strings.TrimSpace(row.ID)
-		if id == "" {
-			return false
-		}
 		fresh, err := beads.HandlesFor(stores[i]).Live.Get(id)
 		if err != nil {
 			fmt.Fprintf(stderr, "session reconciler: reading cert park labels for %s: %v (treating it as unparked)\n", id, err) //nolint:errcheck
@@ -70,6 +89,54 @@ func newLiveCertParkedWorkProbe(workBeads []beads.Bead, stores []beads.Store, st
 			return false
 		}
 		return beadmeta.CertParkSuppressesAssignedWake(fresh.Labels)
+	}
+	return func(rows []int) map[int]bool {
+		type verdict struct {
+			row    int
+			parked bool
+		}
+		// Buffered for every launch, so a read that lands after the budget
+		// never blocks on a receiver that has gone.
+		results := make(chan verdict, len(rows))
+		launched := 0
+		for _, i := range rows {
+			if i < 0 || i >= len(workBeads) || stores[i] == nil || strings.TrimSpace(workBeads[i].ID) == "" {
+				continue
+			}
+			select {
+			case certParkReadSlots <- struct{}{}:
+			default:
+				fmt.Fprintf(stderr, "session reconciler: cert park label read for %s skipped: %d reads already outstanding (treating it as unparked)\n", workBeads[i].ID, cap(certParkReadSlots)) //nolint:errcheck
+				continue
+			}
+			launched++
+			go func(i int) {
+				v := verdict{row: i, parked: readOne(i)}
+				// Free the slot before reporting, so a tick that received every
+				// verdict leaves no slot held; only a read abandoned at the
+				// budget keeps one, until its subprocess returns.
+				<-certParkReadSlots
+				results <- v
+			}(i)
+		}
+		parked := make(map[int]bool)
+		if launched == 0 {
+			return parked
+		}
+		timer := time.NewTimer(budget)
+		defer timer.Stop()
+		for received := 0; received < launched; received++ {
+			select {
+			case v := <-results:
+				if v.parked {
+					parked[v.row] = true
+				}
+			case <-timer.C:
+				fmt.Fprintf(stderr, "session reconciler: %d of %d cert park label reads missed the %s budget (treating them as unparked)\n", launched-received, launched, budget) //nolint:errcheck
+				return parked
+			}
+		}
+		return parked
 	}
 }
 
@@ -83,17 +150,26 @@ func computeAwakeSetWithCertParks(input *AwakeInput, workSources []int, probe ce
 	if probe == nil || len(workSources) != len(input.WorkBeads) {
 		return decisions
 	}
-	marked := false
+	var wanted, rows []int
 	for j := range input.WorkBeads {
-		wb := &input.WorkBeads[j]
+		wb := input.WorkBeads[j]
 		if wb.Status != "in_progress" || wb.Blocked || wb.CertParked {
 			continue
 		}
-		if !certParkReadWanted(input, decisions, *wb) {
+		if !certParkReadWanted(input, decisions, wb) {
 			continue
 		}
-		if probe(workSources[j]) {
-			wb.CertParked = true
+		wanted = append(wanted, j)
+		rows = append(rows, workSources[j])
+	}
+	if len(wanted) == 0 {
+		return decisions
+	}
+	parked := probe(rows)
+	marked := false
+	for _, j := range wanted {
+		if parked[workSources[j]] {
+			input.WorkBeads[j].CertParked = true
 			marked = true
 		}
 	}
