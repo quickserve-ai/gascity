@@ -1510,7 +1510,7 @@ func writeHookClaimDrainPending(label, sessionID string, opts hookClaimOptions, 
 // acknowledges drain and exits cleanly rather than seeing a bare exit 1 and
 // retrying the refusal forever.
 func writeHookClaimStaleSessionDrain(opts hookCommandOptions, stdout, stderr io.Writer) int {
-	return writeHookClaimDrain(hookClaimLabel, hookClaimReasonStaleSession, 0, opts.JSON, opts.DrainAck, tolerateDrainAckRefusal(opts.drainAckFn()), stdout, stderr)
+	return writeHookClaimDrain(hookClaimLabel, hookClaimReasonStaleSession, 0, opts.JSON, opts.DrainAck, tolerateDrainAckRefusal(opts.fenceDrainAckFn()), stdout, stderr)
 }
 
 // drainAckFn returns the injected drain-ack, or the runtime one.
@@ -1521,9 +1521,24 @@ func (opts hookCommandOptions) drainAckFn() hookDrainAckFunc {
 	return hookRuntimeDrainAck
 }
 
+// fenceDrainAckFn is drainAckFn for the two identity-fence drains (stale
+// session, missing registration): the injected drain-ack, else the
+// hookClaimFenceDrainAck seam.
+func (opts hookCommandOptions) fenceDrainAckFn() hookDrainAckFunc {
+	if opts.DrainAckFn != nil {
+		return opts.DrainAckFn
+	}
+	return hookClaimFenceDrainAck
+}
+
 func writeHookClaimSuspensionDrain(reason string, opts hookCommandOptions, stdout, stderr io.Writer) int {
 	return writeHookClaimDrain(hookClaimLabel, reason, 0, opts.JSON, opts.DrainAck, opts.drainAckFn(), stdout, stderr)
 }
+
+// hookClaimFenceDrainAck is the drain-ack the two identity-fence drains run for
+// --drain-ack. A seam so a test can observe that hook.claim.refused is recorded
+// before the ack that lets the controller tear the seat down.
+var hookClaimFenceDrainAck hookDrainAckFunc = hookRuntimeDrainAck
 
 // writeHookClaimMissingSessionRegistrationDrain emits the terminal result for a
 // runtime that carries pool-membership identity (GC_TEMPLATE) but no durable
@@ -1533,7 +1548,7 @@ func writeHookClaimSuspensionDrain(reason string, opts hookCommandOptions, stdou
 // distinct reason so a wrapper or dashboard can tell "never registered" apart
 // from "registered, then went stale."
 func writeHookClaimMissingSessionRegistrationDrain(opts hookCommandOptions, stdout, stderr io.Writer) int {
-	return writeHookClaimDrain(hookClaimLabel, hookClaimReasonMissingSessionRegistration, 0, opts.JSON, opts.DrainAck, tolerateDrainAckRefusal(opts.drainAckFn()), stdout, stderr)
+	return writeHookClaimDrain(hookClaimLabel, hookClaimReasonMissingSessionRegistration, 0, opts.JSON, opts.DrainAck, tolerateDrainAckRefusal(opts.fenceDrainAckFn()), stdout, stderr)
 }
 
 // writeHookClaimDrain writes the single structured drain result shared by every
