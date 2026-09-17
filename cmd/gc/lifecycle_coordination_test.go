@@ -13,9 +13,6 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 )
 
-// writeSpyScript creates a shell script that logs operations to a file and
-// recreates .beads/ on init (simulating bd init wiping hooks). Returns the
-// script path.
 // warmSpyScript runs a freshly written spy script once, as a "probe" provider
 // op (which assertSingleStopWithBenignNoise ignores) through the same
 // runProviderOpWithEnv path stopManagedCity uses, before a test starts a clock
@@ -32,6 +29,9 @@ func warmSpyScript(t *testing.T, script string) {
 	}
 }
 
+// writeSpyScript creates a shell script that logs operations to a file and
+// recreates .beads/ on init (simulating bd init wiping hooks). Returns the
+// script path.
 func writeSpyScript(t *testing.T, logFile string) string {
 	t.Helper()
 	dir := t.TempDir()

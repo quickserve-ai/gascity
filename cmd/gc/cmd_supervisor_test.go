@@ -5617,6 +5617,8 @@ func TestStopManagedCityDoesNotUseStartupOrDriftTimeouts(t *testing.T) {
 		},
 	}
 
+	warmSpyScript(t, script)
+
 	var stderr bytes.Buffer
 	start := time.Now()
 	err := stopManagedCity(mc, cityPath, &stderr)
