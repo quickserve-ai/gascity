@@ -1156,7 +1156,7 @@ func unclaimWorkAssignedToRetiredSessionBead(
 					// stamps fallbackRoute run_target only when the bead is otherwise
 					// unrouted — the same stale-affinity bug fixed on the retry,
 					// reopen, orphan-pool, and closed-session release paths.
-					if err := wa.ReleaseWorkBead(item, fallbackRoute); err != nil {
+					if err := wa.ReleaseWorkBead(item, fallbackRoute, stderr, "retired-session-unclaim"); err != nil {
 						fmt.Fprintf(stderr, "session beads: unclaiming work %s assigned to retired session %s: %v\n", item.ID, sessionBead.ID, err) //nolint:errcheck
 					}
 				}
@@ -1328,7 +1328,7 @@ func unclaimWorkAssignedToRetiredPoolSessionInfo(
 					// detached: ReleaseWorkBead clears the assignee, resets in_progress
 					// to open, and stamps fallbackRoute run_target only when otherwise
 					// unrouted — identical to the raw retirement path.
-					if err := wa.ReleaseWorkBead(item, fallbackRoute); err != nil {
+					if err := wa.ReleaseWorkBead(item, fallbackRoute, stderr, "retired-session-sweep"); err != nil {
 						fmt.Fprintf(stderr, "session beads: unclaiming work %s assigned to retired session %s: %v\n", item.ID, retiredSession.ID, err) //nolint:errcheck
 						res.Failed++
 						continue
@@ -3252,7 +3252,7 @@ func releaseWorkFromClosedSessionBead(store beads.Store, cfg *config.City, sessi
 				// when BOTH routed_to and run_target are empty, and restoreCarriedWorkRoutes
 				// (#3421) then backfills gc.routed_to from that run_target so the work
 				// re-enters pool demand.
-				if err := wa.ReleaseWorkBead(item, fallbackRoute); err != nil {
+				if err := wa.ReleaseWorkBead(item, fallbackRoute, stderr, "closing-session-release"); err != nil {
 					fmt.Fprintf(stderr, "session beads: releasing work %s from closing session %s: %v\n", item.ID, sessionBead.ID, err) //nolint:errcheck
 				}
 			}

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"fmt"
+	"io"
 	"strings"
 
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
@@ -162,26 +164,60 @@ func excludeMailMessageBeads(items []beads.Bead) []beads.Bead {
 // and unclaimWorkAssignedToRetiredSessionBead emitted (proven byte-identical by
 // the recording-fake write tests). Pass runTargetFallback="" for the close-
 // release path, which never stamps a fallback.
-func (w workAssignment) ReleaseWorkBead(item beads.Bead, runTargetFallback string) error {
+//
+// A SUCCESSFUL release writes one audit line to audit naming the bead, the
+// assignee it stripped, the status transition, any stamped fallback route, and
+// releasePath (which of the three release paths ran). Before ga-9n8hjv only the
+// ERROR branch at each call site logged, so a release that worked was
+// indistinguishable from one that never ran: reconstructing the 2026-09-14 wave
+// that stripped 50 beads off a named agent needed hq.dolt_diff_issues forensics
+// after the fact. The write itself is unchanged — the audit line is emitted only
+// after store.Update returns nil, so it never claims a write that did not land.
+//
+// audit and releasePath are REQUIRED parameters rather than optional façade
+// state on purpose: a release path added later cannot silently inherit
+// no-observability. A nil audit degrades to io.Discard so a caller with no
+// writer still releases.
+//
+// This is deliberately a log line and not a bead event: gc-layer bead writes are
+// systematically eventless (measured 4% evented), so an events-table row would
+// be an observability guarantee that is absent exactly when it is needed.
+func (w workAssignment) ReleaseWorkBead(item beads.Bead, runTargetFallback string, audit io.Writer, releasePath string) error {
 	store := w.unwrapped()
 	if store == nil {
 		return nil
+	}
+	if audit == nil {
+		audit = io.Discard
 	}
 	empty := ""
 	update := beads.UpdateOpts{
 		Assignee: &empty,
 		Metadata: clearedSessionAffinityMetadata(),
 	}
+	newStatus := item.Status
 	if item.Status == "in_progress" {
 		open := "open"
 		update.Status = &open
+		newStatus = open
 	}
+	stampedRoute := ""
 	if runTargetFallback != "" &&
 		strings.TrimSpace(item.Metadata[beadmeta.RunTargetMetadataKey]) == "" &&
 		strings.TrimSpace(item.Metadata[beadmeta.RoutedToMetadataKey]) == "" {
 		update.Metadata[beadmeta.RunTargetMetadataKey] = runTargetFallback
+		stampedRoute = runTargetFallback
 	}
-	return store.Update(item.ID, update)
+	if err := store.Update(item.ID, update); err != nil {
+		return err
+	}
+	routeNote := "run_target unchanged"
+	if stampedRoute != "" {
+		routeNote = "run_target=" + stampedRoute
+	}
+	fmt.Fprintf(audit, "session beads: RELEASED work %s: assignee %q -> \"\", status %s -> %s, %s, path=%s\n",
+		item.ID, item.Assignee, item.Status, newStatus, routeNote, releasePath) //nolint:errcheck
+	return nil
 }
 
 // ReassignWorkBead re-homes one WORK bead onto a new session identity, emitting

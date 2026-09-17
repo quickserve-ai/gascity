@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"fmt"
+	"io"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
@@ -86,7 +90,7 @@ func TestWorkAssignmentReleaseWorkBead_OpenStaysOpen(t *testing.T) {
 	wa := workAssignmentForStore(beads.WorkStore{Store: rec})
 
 	item := beads.Bead{ID: "w-open", Status: "open", Assignee: "agent-1"}
-	if err := wa.ReleaseWorkBead(item, ""); err != nil {
+	if err := wa.ReleaseWorkBead(item, "", io.Discard, "test"); err != nil {
 		t.Fatalf("ReleaseWorkBead: %v", err)
 	}
 	if len(rec.updates) != 1 {
@@ -115,7 +119,7 @@ func TestWorkAssignmentReleaseWorkBead_InProgressResetsToOpen(t *testing.T) {
 	wa := workAssignmentForStore(beads.WorkStore{Store: rec})
 
 	item := beads.Bead{ID: "w-ip", Status: "in_progress", Assignee: "agent-1"}
-	if err := wa.ReleaseWorkBead(item, ""); err != nil {
+	if err := wa.ReleaseWorkBead(item, "", io.Discard, "test"); err != nil {
 		t.Fatalf("ReleaseWorkBead: %v", err)
 	}
 	got := rec.updates[0]
@@ -135,7 +139,7 @@ func TestWorkAssignmentReleaseWorkBead_RunTargetFallbackApplied(t *testing.T) {
 	wa := workAssignmentForStore(beads.WorkStore{Store: rec})
 
 	item := beads.Bead{ID: "w-route", Status: "in_progress", Assignee: "agent-1"}
-	if err := wa.ReleaseWorkBead(item, "worker"); err != nil {
+	if err := wa.ReleaseWorkBead(item, "worker", io.Discard, "test"); err != nil {
 		t.Fatalf("ReleaseWorkBead: %v", err)
 	}
 	got := rec.updates[0]
@@ -156,7 +160,7 @@ func TestWorkAssignmentReleaseWorkBead_RunTargetFallbackSkippedWhenRouted(t *tes
 		Assignee: "agent-1",
 		Metadata: map[string]string{beadmeta.RoutedToMetadataKey: "existing"},
 	}
-	if err := wa.ReleaseWorkBead(item, "worker"); err != nil {
+	if err := wa.ReleaseWorkBead(item, "worker", io.Discard, "test"); err != nil {
 		t.Fatalf("ReleaseWorkBead: %v", err)
 	}
 	got := rec.updates[0]
@@ -205,7 +209,7 @@ func TestWorkAssignmentClearDetachedProbe_ByteIdentical(t *testing.T) {
 // underlying store the same way the raw ops did (no panic, no write).
 func TestWorkAssignmentWrite_NilStoreSafe(t *testing.T) {
 	wa := workAssignmentForStore(beads.WorkStore{Store: nil})
-	if err := wa.ReleaseWorkBead(beads.Bead{ID: "x"}, ""); err != nil {
+	if err := wa.ReleaseWorkBead(beads.Bead{ID: "x"}, "", io.Discard, "test"); err != nil {
 		t.Fatalf("nil store ReleaseWorkBead: %v", err)
 	}
 	if err := wa.ReassignWorkBead("x", "y"); err != nil {
@@ -216,5 +220,74 @@ func TestWorkAssignmentWrite_NilStoreSafe(t *testing.T) {
 	}
 	if _, err := wa.OpenAssignedToBasic("a", "open"); err != nil {
 		t.Fatalf("nil store OpenAssignedToBasic: %v", err)
+	}
+}
+
+// failingUpdateWorkStore reports an Update error so the audit-line tests can
+// prove the line is emitted only after a write that actually landed.
+type failingUpdateWorkStore struct {
+	*beads.MemStore
+}
+
+func (s *failingUpdateWorkStore) Update(string, beads.UpdateOpts) error {
+	return errUpdateRefused
+}
+
+var errUpdateRefused = fmt.Errorf("update refused")
+
+// TestWorkAssignmentReleaseWorkBead_EmitsAuditLine is the ga-9n8hjv acceptance-4
+// behaviour check: a SUCCESSFUL release must be observable. Before this, only the
+// error branch at each call site logged, so a release that stripped a named
+// agent's whole portfolio left nothing to grep and needed dolt_diff_issues
+// forensics after the fact. The assert is on the facts a later reader needs —
+// bead, stripped assignee, status transition, stamped route, and WHICH release
+// path ran — not on the exact sentence.
+func TestWorkAssignmentReleaseWorkBead_EmitsAuditLine(t *testing.T) {
+	rec := newRecordingWriteWorkStore()
+	wa := workAssignmentForStore(beads.WorkStore{Store: rec})
+
+	var audit bytes.Buffer
+	item := beads.Bead{ID: "w-1", Status: "in_progress", Assignee: "katya"}
+	if err := wa.ReleaseWorkBead(item, "worker", &audit, "closing-session-release"); err != nil {
+		t.Fatalf("ReleaseWorkBead: %v", err)
+	}
+	got := audit.String()
+	if strings.Count(got, "\n") != 1 {
+		t.Fatalf("expected exactly 1 audit line, got %q", got)
+	}
+	for _, want := range []string{"w-1", "katya", "in_progress", "open", "run_target=worker", "closing-session-release"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("audit line %q missing %q", got, want)
+		}
+	}
+}
+
+// TestWorkAssignmentReleaseWorkBead_NoAuditLineOnFailedWrite is the negative
+// control for the test above: without it, an audit line emitted unconditionally
+// would pass the positive test while announcing releases that never happened —
+// which is worse than the silence it replaces, because it would be believed.
+func TestWorkAssignmentReleaseWorkBead_NoAuditLineOnFailedWrite(t *testing.T) {
+	wa := workAssignmentForStore(beads.WorkStore{Store: &failingUpdateWorkStore{MemStore: beads.NewMemStore()}})
+
+	var audit bytes.Buffer
+	item := beads.Bead{ID: "w-2", Status: "in_progress", Assignee: "katya"}
+	if err := wa.ReleaseWorkBead(item, "", &audit, "closing-session-release"); err == nil {
+		t.Fatal("expected the store Update error to propagate")
+	}
+	if audit.Len() != 0 {
+		t.Fatalf("a failed release must stay silent, got %q", audit.String())
+	}
+}
+
+// TestWorkAssignmentReleaseWorkBead_NilAuditSafe: a caller with no writer still
+// releases. The audit is an addition to the release, never a precondition for it.
+func TestWorkAssignmentReleaseWorkBead_NilAuditSafe(t *testing.T) {
+	rec := newRecordingWriteWorkStore()
+	wa := workAssignmentForStore(beads.WorkStore{Store: rec})
+	if err := wa.ReleaseWorkBead(beads.Bead{ID: "w-3", Status: "open"}, "", nil, "test"); err != nil {
+		t.Fatalf("nil audit ReleaseWorkBead: %v", err)
+	}
+	if len(rec.updates) != 1 {
+		t.Fatalf("expected the release to still write, got %d updates", len(rec.updates))
 	}
 }
