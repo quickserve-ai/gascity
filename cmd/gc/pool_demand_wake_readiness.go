@@ -83,8 +83,13 @@ func (r *poolWakeReadiness) servesWakeCandidate(storeRef, id string) bool {
 //     assigned-ready tier verbatim (config.Agent.effectiveQuery), so the
 //     predicate this gate mirrors is not the one that seat will run.
 //
-// The one thing it does NOT read off the frontier is a deferral, because there
-// the frontier is wrong: see the comment on that branch below.
+// A deferral is not this gate's question. The caller's IsDeferred filter
+// (#5094) has already dropped every row hidden right now, and the seat is
+// served a row whose defer_until has elapsed: `bd ready` keeps
+// `defer_until IS NULL OR defer_until <= UTC_TIMESTAMP()` after its wake sweep
+// reopens an elapsed dated defer, the federated `gc ready` applies IsDeferred
+// through Ready(), and gc hook drops only a future defer_until
+// (isFutureDeferredHookCandidate).
 func (r *poolWakeReadiness) vetoesWakeCandidate(b beads.Bead, agentCfg *config.Agent, claimantLive bool, storeRef string) bool {
 	// No verdict, or none for this row's own store: the gate is not armed here
 	// and every row keeps the demand it had.
@@ -96,18 +101,6 @@ func (r *poolWakeReadiness) vetoesWakeCandidate(b beads.Bead, agentCfg *config.A
 	}
 	if agentCfg != nil && strings.TrimSpace(agentCfg.WorkQuery) != "" {
 		return false
-	}
-	// A deferral is POSITIVE evidence, not an absence, so it is read off the
-	// bead rather than off the frontier. It has to be, because the frontier
-	// disagrees with bd here: mapBdStatus has already spelled a deferred row
-	// "open" by the time it reaches this function, IsDeferred goes false the
-	// moment defer_until elapses, and both the cached tier and
-	// NativeDoltStore.Ready then hand the row back as ready — while `bd ready
-	// --assignee=<id>`, the query the woken seat actually runs, refuses it at
-	// any timestamp (beads.CarriesDeferral records that measurement). This is
-	// the state gastownhall/gascity#6207 reported.
-	if beads.CarriesDeferral(b) {
-		return true
 	}
 	if beads.IsReadyExcludedBead(b) {
 		return false
