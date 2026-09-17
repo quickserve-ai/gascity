@@ -1938,6 +1938,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			continue
 		}
 		rows[i].Info = healExpiredTimersInfo(rows[i].Info, sessFront, clk)
+		rows[i].Info = healReleasedWaitHoldReasonInfo(rows[i].Info, sessFront)
 	}
 	// Phase 0b: retire duplicate configured-named sessions — Info twin over the
 	// rows, returning the folded row set (retired losers carry their retire batch).
