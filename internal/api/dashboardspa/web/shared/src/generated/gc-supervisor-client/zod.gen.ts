@@ -751,6 +751,21 @@ export const zHookClaimReclaimedStalePayload = z.object({
     previous_owner: z.string()
 });
 
+export const zHookClaimRefusedPayload = z.object({
+    agent: z.string().optional(),
+    bead_epoch: z.string().optional(),
+    bead_token_fingerprint: z.string().optional(),
+    detail: z.string(),
+    reason: z.string(),
+    runtime_epoch: z.string().optional(),
+    runtime_token_fingerprint: z.string().optional(),
+    session_id: z.string().optional(),
+    session_name: z.string().optional(),
+    state: z.string().optional(),
+    template: z.string().optional(),
+    token_matched: z.boolean().optional()
+});
+
 export const zInboundEventPayload = z.object({
     actor: z.string(),
     conversation_id: z.string(),
@@ -3345,6 +3360,7 @@ export const zEventPayload = z.union([
     zExecutionStepStalledPayload,
     zGroupCreatedEventPayload,
     zHookClaimReclaimedStalePayload,
+    zHookClaimRefusedPayload,
     zInboundEventPayload,
     zMailEventPayload,
     zMoleculeResolvedPayload,
@@ -4299,6 +4315,24 @@ export const zTypedEventStreamEnvelopeHookClaimReclaimedStale = z.object({
     subject: z.string().optional(),
     ts: z.iso.datetime(),
     type: z.literal('hook.claim.reclaimed_stale'),
+    workflow: zWorkflowEventProjection.optional()
+});
+
+/**
+ * TypedEventStreamEnvelope hook.claim.refused
+ */
+export const zTypedEventStreamEnvelopeHookClaimRefused = z.object({
+    actor: z.string(),
+    depends_on_step_ids: z.array(z.string()).optional(),
+    message: z.string().optional(),
+    payload: zHookClaimRefusedPayload,
+    run_id: z.string().optional(),
+    seq: z.coerce.bigint().gte(BigInt(0)).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }),
+    session_id: z.string().optional(),
+    step_id: z.string().optional(),
+    subject: z.string().optional(),
+    ts: z.iso.datetime(),
+    type: z.literal('hook.claim.refused'),
     workflow: zWorkflowEventProjection.optional()
 });
 
@@ -5343,6 +5377,7 @@ export const zTypedEventStreamEnvelope = z.discriminatedUnion('type', [
     zTypedEventStreamEnvelopeGcStoreMaintenanceDone.extend({ type: z.literal('gc.store.maintenance.done') }),
     zTypedEventStreamEnvelopeGcStoreMaintenanceFailed.extend({ type: z.literal('gc.store.maintenance.failed') }),
     zTypedEventStreamEnvelopeHookClaimReclaimedStale.extend({ type: z.literal('hook.claim.reclaimed_stale') }),
+    zTypedEventStreamEnvelopeHookClaimRefused.extend({ type: z.literal('hook.claim.refused') }),
     zTypedEventStreamEnvelopeMailArchived.extend({ type: z.literal('mail.archived') }),
     zTypedEventStreamEnvelopeMailDeleted.extend({ type: z.literal('mail.deleted') }),
     zTypedEventStreamEnvelopeMailMarkedRead.extend({ type: z.literal('mail.marked_read') }),
@@ -6280,6 +6315,25 @@ export const zTypedTaggedEventStreamEnvelopeHookClaimReclaimedStale = z.object({
     subject: z.string().optional(),
     ts: z.iso.datetime(),
     type: z.literal('hook.claim.reclaimed_stale'),
+    workflow: zWorkflowEventProjection.optional()
+});
+
+/**
+ * TypedTaggedEventStreamEnvelope hook.claim.refused
+ */
+export const zTypedTaggedEventStreamEnvelopeHookClaimRefused = z.object({
+    actor: z.string(),
+    city: z.string(),
+    depends_on_step_ids: z.array(z.string()).optional(),
+    message: z.string().optional(),
+    payload: zHookClaimRefusedPayload,
+    run_id: z.string().optional(),
+    seq: z.coerce.bigint().gte(BigInt(0)).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }),
+    session_id: z.string().optional(),
+    step_id: z.string().optional(),
+    subject: z.string().optional(),
+    ts: z.iso.datetime(),
+    type: z.literal('hook.claim.refused'),
     workflow: zWorkflowEventProjection.optional()
 });
 
@@ -7379,6 +7433,7 @@ export const zTypedTaggedEventStreamEnvelope = z.discriminatedUnion('type', [
     zTypedTaggedEventStreamEnvelopeGcStoreMaintenanceDone.extend({ type: z.literal('gc.store.maintenance.done') }),
     zTypedTaggedEventStreamEnvelopeGcStoreMaintenanceFailed.extend({ type: z.literal('gc.store.maintenance.failed') }),
     zTypedTaggedEventStreamEnvelopeHookClaimReclaimedStale.extend({ type: z.literal('hook.claim.reclaimed_stale') }),
+    zTypedTaggedEventStreamEnvelopeHookClaimRefused.extend({ type: z.literal('hook.claim.refused') }),
     zTypedTaggedEventStreamEnvelopeMailArchived.extend({ type: z.literal('mail.archived') }),
     zTypedTaggedEventStreamEnvelopeMailDeleted.extend({ type: z.literal('mail.deleted') }),
     zTypedTaggedEventStreamEnvelopeMailMarkedRead.extend({ type: z.literal('mail.marked_read') }),

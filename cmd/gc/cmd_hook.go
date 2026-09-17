@@ -18,6 +18,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/session"
 )
@@ -521,6 +522,26 @@ const (
 	hookClaimSessionStoreUnavailable
 )
 
+// hookClaimStaleDetail is the diagnosable shape of a stale verdict: WHICH
+// identity check refused, and what the session bead said when it was read. It
+// rides alongside the verdict and never feeds back into it — the fence decides
+// exactly as it did before this was threaded out; this only lets the refusal be
+// recorded off-pane (hook.claim.refused, ga-cwu447).
+//
+// It holds no raw token. The bead's instance token is reduced to a fingerprint
+// at the classification site, so nothing downstream can log the credential.
+type hookClaimStaleDetail struct {
+	// Detail is one of the events.HookClaimRefusedDetail* values.
+	Detail string
+	// BeadRead reports whether a session bead was loaded; the fields below are
+	// meaningful only when it is true.
+	BeadRead             bool
+	State                string
+	TokenMatched         bool
+	BeadTokenFingerprint string
+	BeadEpoch            string
+}
+
 // fenceHookClaimSession applies the runtime-identity fence that gates
 // gc hook --claim before it runs the work query. It returns (code, handled):
 // handled is true for a definitively stale session OR a managed pool runtime
@@ -550,6 +571,11 @@ func fenceHookClaimSession(cityPath string, cfg *config.City, sessionID string, 
 		// unfenced.
 		if template := strings.TrimSpace(os.Getenv("GC_TEMPLATE")); template != "" {
 			fmt.Fprintf(stderr, "gc hook --claim: refusing unregistered managed session for pool template %q: GC_TEMPLATE is set but GC_SESSION_ID is empty, so no durable session bead can be verified\n", template) //nolint:errcheck
+			// Recorded BEFORE the drain: see hookEmitClaimRefused for why.
+			hookEmitClaimRefused(cityPath,
+				"missing session registration: GC_TEMPLATE is set but GC_SESSION_ID is empty",
+				hookClaimRefusedPayload(hookClaimReasonMissingSessionRegistration, "", "",
+					hookClaimStaleDetail{Detail: events.HookClaimRefusedDetailSessionIDUnset}))
 			return writeHookClaimMissingSessionRegistrationDrain(opts, stdout, stderr), true
 		}
 		return 0, false
@@ -558,9 +584,12 @@ func fenceHookClaimSession(cityPath string, cfg *config.City, sessionID string, 
 	if instanceToken == "" {
 		return 0, false
 	}
-	switch verdict, reason := classifyHookClaimSession(cityPath, cfg, sessionID, instanceToken); verdict {
+	switch verdict, reason, detail := hookClaimClassifySession(cityPath, cfg, sessionID, instanceToken); verdict {
 	case hookClaimSessionStale:
 		fmt.Fprintf(stderr, "gc hook --claim: refusing stale session %s: %s\n", sessionID, reason) //nolint:errcheck
+		// Recorded BEFORE the drain: see hookEmitClaimRefused for why.
+		hookEmitClaimRefused(cityPath, "stale session: "+reason,
+			hookClaimRefusedPayload(hookClaimReasonStaleSession, sessionID, instanceToken, detail))
 		return writeHookClaimStaleSessionDrain(opts, stdout, stderr), true
 	case hookClaimSessionStoreUnavailable:
 		// Fail open: let the claim path run and surface/escalate its own store
@@ -573,6 +602,10 @@ func fenceHookClaimSession(cityPath string, cfg *config.City, sessionID string, 
 	}
 }
 
+// hookClaimClassifySession is the fence's classifier seam, replaced in tests
+// that must prove the fence actually ran rather than infer it from silence.
+var hookClaimClassifySession = classifyHookClaimSession
+
 // classifyHookClaimSession loads the session bead named by sessionID and reports
 // whether the runtime holding instanceToken may claim. A confirmed identity
 // failure — the session bead is absent, or resolves to a non-session bead — is a
@@ -581,10 +614,12 @@ func fenceHookClaimSession(cityPath string, cfg *config.City, sessionID string, 
 // hookClaimSessionStoreUnavailable (transient, fails open), so an infrastructure
 // hiccup is not mislabeled as staleness AND a vanished session is not laundered
 // into an infrastructure hiccup that lets a stale runtime reach the claim path.
-func classifyHookClaimSession(cityPath string, cfg *config.City, sessionID, instanceToken string) (hookClaimSessionVerdict, string) {
+//
+// The detail is meaningful only on a stale verdict.
+func classifyHookClaimSession(cityPath string, cfg *config.City, sessionID, instanceToken string) (hookClaimSessionVerdict, string, hookClaimStaleDetail) {
 	store, err := openCityStoreAt(cityPath)
 	if err != nil {
-		return hookClaimSessionStoreUnavailable, fmt.Sprintf("opening session store: %v", err)
+		return hookClaimSessionStoreUnavailable, fmt.Sprintf("opening session store: %v", err), hookClaimStaleDetail{}
 	}
 	info, err := cliSessionFrontDoor(store, cfg, cityPath).Get(sessionID)
 	if err != nil {
@@ -602,14 +637,16 @@ func classifyHookClaimSession(cityPath string, cfg *config.City, sessionID, inst
 // genuine store open/read fault the fence fails open on, letting the normal claim
 // path surface and escalate its own store error rather than refusing a healthy
 // worker over an infrastructure hiccup.
-func classifyHookClaimSessionLookupError(err error) (hookClaimSessionVerdict, string) {
+func classifyHookClaimSessionLookupError(err error) (hookClaimSessionVerdict, string, hookClaimStaleDetail) {
 	switch {
 	case errors.Is(err, beads.ErrNotFound):
-		return hookClaimSessionStale, fmt.Sprintf("session bead not found: %v", err)
+		return hookClaimSessionStale, fmt.Sprintf("session bead not found: %v", err),
+			hookClaimStaleDetail{Detail: events.HookClaimRefusedDetailSessionBeadNotFound}
 	case errors.Is(err, session.ErrSessionNotFound):
-		return hookClaimSessionStale, fmt.Sprintf("session id resolves to a non-session bead: %v", err)
+		return hookClaimSessionStale, fmt.Sprintf("session id resolves to a non-session bead: %v", err),
+			hookClaimStaleDetail{Detail: events.HookClaimRefusedDetailNotSessionBead}
 	default:
-		return hookClaimSessionStoreUnavailable, fmt.Sprintf("loading session bead: %v", err)
+		return hookClaimSessionStoreUnavailable, fmt.Sprintf("loading session bead: %v", err), hookClaimStaleDetail{}
 	}
 }
 
@@ -627,19 +664,38 @@ func classifyHookClaimSessionLookupError(err error) (hookClaimSessionVerdict, st
 // upgraded legacy runtime would be drained before claiming its routed work.
 // Every other state — failed-create, draining, drained, asleep, suspended,
 // archived, quarantined — is dormant or terminal and classified stale.
-func hookClaimSessionEligibility(info session.Info, instanceToken string) (hookClaimSessionVerdict, string) {
-	if info.Closed {
-		return hookClaimSessionStale, "session bead is closed"
-	}
+//
+// The returned detail describes a stale verdict for hook.claim.refused. It is
+// computed from the same snapshot but never consulted by the decision: the
+// closed check still comes first and short-circuits the token comparison, and
+// the token comparison still short-circuits the state switch.
+func hookClaimSessionEligibility(info session.Info, instanceToken string) (hookClaimSessionVerdict, string, hookClaimStaleDetail) {
 	storedToken := strings.TrimSpace(info.InstanceToken)
-	if storedToken == "" || storedToken != strings.TrimSpace(instanceToken) {
-		return hookClaimSessionStale, "runtime instance token does not match the session bead"
+	state := session.State(strings.TrimSpace(info.MetadataState))
+	detail := hookClaimStaleDetail{
+		BeadRead:             true,
+		State:                string(state),
+		TokenMatched:         storedToken != "" && storedToken == strings.TrimSpace(instanceToken),
+		BeadTokenFingerprint: hookClaimTokenFingerprint(storedToken),
+		BeadEpoch:            hookClaimRuntimeGeneration(info.Generation),
 	}
-	switch state := session.State(strings.TrimSpace(info.MetadataState)); state {
+	if info.Closed {
+		detail.Detail = events.HookClaimRefusedDetailSessionClosed
+		return hookClaimSessionStale, "session bead is closed", detail
+	}
+	if storedToken == "" || storedToken != strings.TrimSpace(instanceToken) {
+		detail.Detail = events.HookClaimRefusedDetailTokenSuperseded
+		if storedToken == "" {
+			detail.Detail = events.HookClaimRefusedDetailBeadTokenMissing
+		}
+		return hookClaimSessionStale, "runtime instance token does not match the session bead", detail
+	}
+	switch state {
 	case session.StateNone, session.StateActive, session.StateAwake, session.StateCreating, session.StateStartPending:
-		return hookClaimSessionEligible, ""
+		return hookClaimSessionEligible, "", hookClaimStaleDetail{}
 	default:
-		return hookClaimSessionStale, fmt.Sprintf("session state %q is not claim-eligible", state)
+		detail.Detail = events.HookClaimRefusedDetailStateNotEligible
+		return hookClaimSessionStale, fmt.Sprintf("session state %q is not claim-eligible", state), detail
 	}
 }
 
