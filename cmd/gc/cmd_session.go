@@ -1968,15 +1968,14 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 	//     between two writes, and moving this call below CloseDetailed keeps the
 	//     whole suite green — measured, not assumed. It rests on this comment.
 	//
-	// rigStoresKnown is false here and not a placeholder: rig stores are
+	// The obligation records the rig-store scope as unenumerated: rig stores are
 	// enumerated only under "cityErr == nil && cfg != nil" below, because
-	// buildStandaloneRigStores needs the config that failed to load. The
-	// obligation records the scope as unenumerated so a drain cannot read an
-	// absent rig list as "there were no rig stores".
+	// buildStandaloneRigStores needs the config that failed to load
+	// (buildSessionReleaseObligation records RigStoresKnown=false for that reason).
 	if cfg == nil {
 		rec, closeRec := openDeferredReleaseEventRecorder(cityPath, stderr)
 		deferMissingConfigWorkRelease(sessStore, sessionID, closedSessionBead, sessionBeadErr == nil,
-			cfgErrOrUnknown(cfgErr), false, rec, time.Now(), stderr)
+			cfgErrOrUnknown(cfgErr), rec, time.Now(), stderr)
 		closeRec()
 	}
 
