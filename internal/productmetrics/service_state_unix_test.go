@@ -17,11 +17,16 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/gchome"
 )
 
 const testNotice = "TEST-ONLY product metrics notice\n"
+
+// testRecordLockWait is the real-time bound on RecordOnce's state-lock wait in
+// tests. See serviceDependencies.recordLockContext.
+const testRecordLockWait = 5 * time.Second
 
 func TestEnvironmentDisableTruthSets(t *testing.T) {
 	for _, value := range []string{"1", "true", "yes", "on", "TRUE", " Yes ", "\ton\n"} {
@@ -1087,6 +1092,12 @@ func defaultTestServiceDependencies(home gchome.ProductUsageHome, epoch uint64) 
 			return randomUUIDv4(rand.Reader)
 		},
 		verifyTTY: func(io.Writer) bool { return true },
+		// Tests move the injected clock, not the wall clock, so a real
+		// deadline derived from it would only measure host load. Keep a real
+		// bound so a genuinely stuck lock still fails the test (ga-653hfj).
+		recordLockContext: func(time.Duration) (context.Context, context.CancelFunc) {
+			return context.WithTimeout(context.Background(), testRecordLockWait)
+		},
 	}
 }
 

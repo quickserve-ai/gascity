@@ -584,6 +584,40 @@ func TestRecordOnceDoesNotWriteAfterQuotaDirectorySyncIsUncertain(t *testing.T) 
 	assertNoQueuedEvents(t, home)
 }
 
+// The state-lock wait takes its deadline from the decision window. Tests freeze
+// the injected clock, so a REAL deadline taken from it measured only host load:
+// on a busy CI runner a slow fsync of the new lock file spent the 50ms and
+// dropped the record before the step under test (ga-653hfj). The sync delay
+// below reproduces that deterministically. With the test dependency the record
+// is stored; with the production default (nil) the same real delay still drops
+// it, which is the intended fail-closed foreground bound.
+func TestRecordOnceStateLockWaitFollowsTheInjectedClock(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		production bool
+		want       RecordResult
+	}{
+		{name: "test dependency", want: RecordStored},
+		{name: "production default", production: true, want: RecordDropped},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, service, permit := newRecordServiceFixture(t, testEventIDOne)
+			if test.production {
+				service.deps.recordLockContext = nil
+			}
+			service.deps.storageHooks.beforeStep = func(step storageStep) error {
+				if step == storageStepFileSync || step == storageStepDirectorySync {
+					time.Sleep(defaultRecordDecisionBudget + 10*time.Millisecond)
+				}
+				return nil
+			}
+			if got := service.RecordOnce(permit, CommandHelp); got != test.want {
+				t.Fatalf("slow lock-file sync with a frozen clock: RecordOnce = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
 func TestRecordOnceDecisionWindowGatesEveryForegroundQuotaBoundary(t *testing.T) {
 	t.Run("quota read", func(t *testing.T) {
 		home, service, permit := newRecordServiceFixture(t, testEventIDOne)
