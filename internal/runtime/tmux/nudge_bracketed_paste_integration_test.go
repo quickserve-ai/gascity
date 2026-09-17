@@ -113,6 +113,87 @@ func TestNudgeSessionDeliversLongClaudeNudgeAsOneBracketedPaste(t *testing.T) {
 	}
 }
 
+// TestNudgeSessionKeepsKeystrokesWhenPaneHasNoBracketedPaste is the real-tmux
+// half of the bracket_paste_flag guard. Its reader never sends ESC[?2004h, so
+// tmux reports #{bracket_paste_flag}=0 for the pane. `paste-buffer -p` into such
+// a pane adds no markers and writes each newline as a CR ("line one\rline
+// two\r..."), so every line would submit on its own. A multi-line claude nudge
+// must instead keep the send-keys path: the pane receives the message with its
+// line feeds intact, preceded only by the C-u and followed only by the submit.
+func TestNudgeSessionKeepsKeystrokesWhenPaneHasNoBracketedPaste(t *testing.T) {
+	if !hasTmux() {
+		t.Skip("tmux not installed")
+	}
+	tm := testTmux()
+	dir := t.TempDir()
+	ready := filepath.Join(dir, "ready")
+	record := filepath.Join(dir, "pane-input.bin")
+	reader := filepath.Join(dir, "plain-reader.sh")
+	script := strings.Join([]string{
+		`stty raw -echo`,
+		`printf ready > ` + shellQuote(ready),
+		`exec cat > ` + shellQuote(record),
+	}, "\n") + "\n"
+	if err := os.WriteFile(reader, []byte(script), 0o600); err != nil {
+		t.Fatalf("writing reader script: %v", err)
+	}
+
+	sessionName := fmt.Sprintf("gt-test-nudge-nobracket-%d", time.Now().UnixNano()%100000)
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSessionWithCommandAndEnv(sessionName, dir, "sh "+shellQuote(reader), map[string]string{
+		"GC_PROVIDER": "claude",
+	}); err != nil {
+		t.Fatalf("NewSessionWithCommandAndEnv: %v", err)
+	}
+	t.Cleanup(func() { _ = tm.KillSession(sessionName) })
+	waitForFileContents(t, ready, 10*time.Second)
+
+	if flag, err := tm.run("display-message", "-t", sessionName, "-p", "#{bracket_paste_flag}"); err != nil || strings.TrimSpace(flag) == "1" {
+		t.Fatalf("reader pane #{bracket_paste_flag} = %q, %v; want bracketed paste off", flag, err)
+	}
+
+	const tail = "TAIL-SENTINEL line four"
+	message := "HEAD-SENTINEL line one\nline two\nline three\n" + tail
+	err := tm.NudgeSession(sessionName, message)
+	if err != nil && !errors.Is(err, ErrNudgeSubmitUnconfirmed) {
+		t.Fatalf("NudgeSession: %v", err)
+	}
+
+	got := waitForSubmitAfter(t, record, tail, 10*time.Second)
+	if strings.Contains(got, bracketedPasteStart) || strings.Contains(got, bracketedPasteEnd) {
+		t.Fatalf("pane without bracketed paste received paste markers: %q", got)
+	}
+	at := strings.Index(got, message)
+	if at < 0 {
+		t.Fatalf("pane did not receive the nudge with its line feeds intact (a raw paste turns each into a CR that submits the line): got %q", got)
+	}
+	if before := got[:at]; strings.Trim(before, "\x15") != "" {
+		t.Fatalf("bytes before the nudge = %q, want only C-u", before)
+	}
+	if after := got[at+len(message):]; after == "" || strings.Trim(after, "\r") != "" {
+		t.Fatalf("bytes after the nudge = %q, want one or more submit Enters (CR)", after)
+	}
+}
+
+// waitForSubmitAfter polls the reader's record until marker is followed by a
+// CR, then returns it; on timeout it returns what arrived.
+func waitForSubmitAfter(t *testing.T, path, marker string, timeout time.Duration) string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		data, _ := os.ReadFile(path)
+		got := string(data)
+		if at := strings.LastIndex(got, marker); at >= 0 && strings.Contains(got[at:], "\r") {
+			return got
+		}
+		if time.Now().After(deadline) {
+			t.Logf("no submit after %q within %s", marker, timeout)
+			return got
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
 // waitForBracketedPasteSubmit polls the reader's record until it holds a
 // closing ESC[201~ followed by at least one submit CR, then returns it. If that
 // never happens it returns what arrived, so the caller's frame assertions report
