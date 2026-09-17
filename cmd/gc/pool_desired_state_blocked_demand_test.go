@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -382,9 +384,10 @@ func TestBuildDesiredStateWithholdsPoolSessionForBlockedOrphanedRoutedWork(t *te
 	store, blockerID, stepID := blockedRoutedDemandFixture(t, poolWakeTemplate)
 	cfg := poolWakeBuilderCity()
 
+	var stderr bytes.Buffer
 	got := buildDesiredStateWithSessionBeads(
 		"test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), store, nil,
-		newSessionBeadSnapshot(nil), nil, io.Discard,
+		newSessionBeadSnapshot(nil), nil, &stderr,
 	)
 	if got.PoolWakeReadiness == nil {
 		t.Fatalf("DesiredStateResult.PoolWakeReadiness = nil — the builder computed no verdict for a store holding wake candidates, so the gate is not wired")
@@ -395,18 +398,142 @@ func TestBuildDesiredStateWithholdsPoolSessionForBlockedOrphanedRoutedWork(t *te
 	if planned := poolWakeSessionsPlanned(got.State); len(planned) != 0 {
 		t.Fatalf("desired state planned %v for %s while its only work (step %s) is blocked by open %s, want none", planned, poolWakeTemplate, stepID, blockerID)
 	}
+	if records := withheldRecords(stderr.String()); len(records) != 1 || !strings.Contains(records[0], stepID) {
+		t.Fatalf("builder WITHHELD records = %q, want exactly one naming step %s", records, stepID)
+	}
 
 	// Control arm: the blocker closes, the step becomes claimable, and the
 	// builder plans the seat.
 	if err := store.Close(blockerID); err != nil {
 		t.Fatalf("close blocker: %v", err)
 	}
+	stderr.Reset()
 	unblocked := buildDesiredStateWithSessionBeads(
 		"test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), store, nil,
-		newSessionBeadSnapshot(nil), nil, io.Discard,
+		newSessionBeadSnapshot(nil), nil, &stderr,
 	)
 	if planned := poolWakeSessionsPlanned(unblocked.State); len(planned) == 0 {
 		t.Fatalf("desired state planned nothing for %s once step %s became claimable, want a seat — the gate must be readiness, not a blanket withhold", poolWakeTemplate, stepID)
+	}
+	if records := withheldRecords(stderr.String()); len(records) != 0 {
+		t.Fatalf("builder WITHHELD records = %q for a claimable step, want none", records)
+	}
+}
+
+// withheldRecords returns the lines of out that report a row the wake
+// readiness gate withheld.
+func withheldRecords(out string) []string {
+	var records []string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "poolWakeReadiness: WITHHELD") {
+			records = append(records, line)
+		}
+	}
+	return records
+}
+
+// TestPoolWakeReadinessNamesEachWithheldRowOnce pins the evidence a withheld row
+// leaves. The fail-open path reports on stderr, so the withhold path reports on
+// the same channel: without a record, a pool that stops scaling looks the same
+// as a pool with no work. Every consumer that recomputes pool demand from one
+// DesiredStateResult hands the filter the same verdict, so the row is named once
+// per verdict, not once per recomputation. A row the gate keeps is not named.
+func TestPoolWakeReadinessNamesEachWithheldRowOnce(t *testing.T) {
+	store, blockerID, stepID := blockedRoutedDemandFixture(t, poolWakeTemplate)
+	cfg := poolWakeTestCity()
+	var stderr bytes.Buffer
+
+	work, workStores, workRefs, _, partial := collectAssignedWorkBeadsWithStores("", cfg, store, nil, nil, nil)
+	if partial {
+		t.Fatalf("collectAssignedWorkBeadsWithStores reported partial results")
+	}
+	wakeReady := newPoolWakeReadiness(nil, work, workStores, workRefs, &stderr)
+	for pass := 1; pass <= 2; pass++ {
+		if kept := filterAssignedWorkBeadsForPoolDemand(cfg, "", store, nil, work, workRefs, wakeReady); len(kept) != 0 {
+			t.Fatalf("pass %d kept %v, want blocked step %s withheld", pass, kept, stepID)
+		}
+	}
+	records := withheldRecords(stderr.String())
+	if len(records) != 1 {
+		t.Fatalf("WITHHELD records = %q after two passes over one verdict, want exactly one", records)
+	}
+	for _, want := range []string{stepID, `"city"`, poolWakeTemplate} {
+		if !strings.Contains(records[0], want) {
+			t.Fatalf("WITHHELD record = %q, want it to name %s", records[0], want)
+		}
+	}
+
+	// Control arm: the blocker closes, a fresh verdict keeps the step, and
+	// nothing is reported.
+	if err := store.Close(blockerID); err != nil {
+		t.Fatalf("close blocker: %v", err)
+	}
+	stderr.Reset()
+	work, workStores, workRefs, _, _ = collectAssignedWorkBeadsWithStores("", cfg, store, nil, nil, nil)
+	wakeReady = newPoolWakeReadiness(nil, work, workStores, workRefs, &stderr)
+	// The census can capture a ready orphan twice (the open-routed pass and the
+	// ready handoff probe); demand dedupes per template, so only presence counts.
+	kept := filterAssignedWorkBeadsForPoolDemand(cfg, "", store, nil, work, workRefs, wakeReady)
+	if !slices.ContainsFunc(kept, func(b beads.Bead) bool { return b.ID == stepID }) {
+		t.Fatalf("kept %v once the blocker closed, want step %s", kept, stepID)
+	}
+	if records := withheldRecords(stderr.String()); len(records) != 0 {
+		t.Fatalf("WITHHELD records = %q for a claimable step, want none", records)
+	}
+}
+
+// TestPoolWakeReadinessDoesNotNameAnUnreachableRow keeps the record to rows the
+// gate removed. A row in a store its pool agent cannot reach is dropped by the
+// reachability check whatever the frontier says, so naming it as withheld would
+// point an operator at the wrong cause.
+func TestPoolWakeReadinessDoesNotNameAnUnreachableRow(t *testing.T) {
+	const template = "riga/" + poolWakeTemplate
+	cityPath := t.TempDir()
+	seedNoRoutes(t, cityPath)
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Rigs:      []config.Rig{{Name: "riga", Path: filepath.Join(cityPath, "riga")}},
+		Agents:    []config.Agent{{Name: poolWakeTemplate, Dir: "riga", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(2)}},
+	}
+	mem := beads.NewMemStore()
+	blocker, err := mem.Create(beads.Bead{Title: "predecessor step", Type: "task", Status: "open"})
+	if err != nil {
+		t.Fatalf("create blocker: %v", err)
+	}
+	step, err := mem.Create(beads.Bead{
+		Title:    "blocked step in the city store, routed to a rig pool",
+		Type:     "task",
+		Status:   "open",
+		Assignee: template,
+		Metadata: map[string]string{beadmeta.RoutedToMetadataKey: template},
+	})
+	if err != nil {
+		t.Fatalf("create step: %v", err)
+	}
+	if err := mem.DepAdd(step.ID, blocker.ID, "blocks"); err != nil {
+		t.Fatalf("block step: %v", err)
+	}
+	step, err = mem.Get(step.ID)
+	if err != nil {
+		t.Fatalf("get step: %v", err)
+	}
+
+	var stderr bytes.Buffer
+	work := []beads.Bead{step}
+	wakeReady := newPoolWakeReadiness(nil, work, []beads.Store{mem}, []string{""}, &stderr)
+	agentCfg := findAgentByTemplate(cfg, template)
+	if agentCfg == nil {
+		t.Fatalf("fixture invalid: no agent resolves %q", template)
+	}
+	if !wakeReady.vetoesWakeCandidate(step, agentCfg, false, "") {
+		t.Fatalf("fixture invalid: the gate would keep blocked step %s, so this test cannot tell a veto from a drop", step.ID)
+	}
+
+	if kept := filterAssignedWorkBeadsForPoolDemand(cfg, cityPath, mem, nil, work, []string{""}, wakeReady); len(kept) != 0 {
+		t.Fatalf("kept %v, want step %s dropped: its store is not reachable from %s", kept, step.ID, template)
+	}
+	if records := withheldRecords(stderr.String()); len(records) != 0 {
+		t.Fatalf("WITHHELD records = %q for a row the reachability check drops, want none", records)
 	}
 }
 
