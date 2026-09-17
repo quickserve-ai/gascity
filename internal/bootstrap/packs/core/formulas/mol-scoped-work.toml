@@ -197,7 +197,9 @@ Remove the temporary worktree after the body reaches terminal state.
 
 The removal is SECURE-BEFORE-DESTROY (ga-6xehc5 / ga-8as9s3): the worktree may
 hold the only copy of the work — uncommitted WIP, or commits reachable from no
-remote ref. Teardown first commits any WIP and makes HEAD reachable from
+remote ref. Teardown first commits any WIP (leaving out only what gc provably
+put there: manifest-recorded skill symlinks, city-synced skill copies,
+AGENTS-gc.md, .worktree-stale) and makes HEAD reachable from
 origin (branch push, falling back to refs/rescue/<bead-id>); if that cannot be
 done, the step FAILS instead of destroying the tree. A repeated failure
 surfaces through the step's retry policy (hard_fail) rather than silently
@@ -215,8 +217,50 @@ WORKTREE=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata.work_dir // 
 if [ -n "$WORKTREE" ] && [ -d "$WORKTREE" ]; then
   (
     cd "$WORKTREE" || exit 1
-    if [ -n "$(git status --porcelain)" ]; then
-      git add -A
+    # Secure every change EXCEPT what gc itself put in the tree. Sediment must be
+    # PROVEN, never guessed from a path: tracked edits under .claude/ or .beads/
+    # are real work (qcore tracks skills and formulas there), and so are
+    # untracked authored files and symlinks. An untracked entry is sediment
+    # only when it is:
+    #  - a skill symlink <sink>/skills/<name> recorded in that sink's
+    #    .gc-skill-ownership.json (gc materializes skills as symlinks), or
+    #    that manifest itself;
+    #  - a regular file under a skills sink that is byte-identical to the same
+    #    path under $GC_CITY_PATH (city-synced copies, e.g. search-sessions);
+    #  - AGENTS-gc.md or .worktree-stale.
+    # Without this, a sediment-only tree (40 skill symlinks measured in a qcore
+    # worktree) committed the symlinks into the work branch and pushed it,
+    # usually a PR head.
+    SEDIMENT_LIST=$(mktemp) || exit 1
+    trap 'rm -f "$SEDIMENT_LIST"' EXIT
+    git status --porcelain -z -uall | while IFS= read -r -d '' entry; do
+      case "$entry" in
+        '?? '*) p=${entry#???} ;;
+        R*|C*|?R*|?C*) IFS= read -r -d '' _orig; continue ;;
+        *) continue ;;
+      esac
+      case "$p" in
+        AGENTS-gc.md|.worktree-stale|.claude/skills/.gc-skill-ownership.json|.omp/skills/.gc-skill-ownership.json)
+          printf '%s\\0' "$p" ;;
+        .claude/skills/*|.omp/skills/*)
+          sink=${p%%/skills/*}/skills
+          rest=${p#"$sink"/}
+          name=${rest%%/*}
+          if [ -L "$p" ] && [ "$rest" = "$name" ] \
+            && jq -e --arg n "$name" '.targets[$n] != null' "$sink/.gc-skill-ownership.json" >/dev/null 2>&1; then
+            printf '%s\\0' "$p"
+          elif [ -f "$p" ] && [ ! -L "$p" ] && [ -n "${GC_CITY_PATH:-}" ] \
+            && [ -f "$GC_CITY_PATH/$p" ] && cmp -s "$p" "$GC_CITY_PATH/$p"; then
+            printf '%s\\0' "$p"
+          fi ;;
+      esac
+    done > "$SEDIMENT_LIST"
+    git add -A || exit 1
+    if [ -s "$SEDIMENT_LIST" ]; then
+      GIT_LITERAL_PATHSPECS=1 git reset -q --pathspec-from-file="$SEDIMENT_LIST" --pathspec-file-nul || exit 1
+    fi
+    rm -f "$SEDIMENT_LIST"
+    if ! git diff --cached --quiet; then
       git commit -m "rescue(${WORK_BEAD_ID}): WIP secured by cleanup-worktree before teardown" || exit 1
     fi
     # HEAD already reachable from a remote ref => nothing to secure.
