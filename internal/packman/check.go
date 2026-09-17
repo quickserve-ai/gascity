@@ -25,6 +25,15 @@ const (
 	// so "I could not tell" never renders identically to "I checked and it is
 	// bad" -- an offline network probe must not read as a broken import.
 	CheckSeverityWarning CheckSeverity = "warning"
+	// CheckSeverityNotice means a check DID reach a verdict and the import is
+	// still usable: a definite finding about state the operator did not choose
+	// and would not otherwise see. It is neither of the other two -- reporting
+	// it as an error would fail the command for a supported configuration,
+	// which is how a check ends up ignored, and reporting it as a warning
+	// would claim no verdict was reached when one was. It does not count
+	// toward ErrorCount, so it never changes an exit code; it exists so
+	// "Import state OK" stops being printed over a finding.
+	CheckSeverityNotice CheckSeverity = "notice"
 )
 
 // CheckIssue describes one read-only import state validation finding.
@@ -216,6 +225,7 @@ func (s *importCheckState) walkImport(name string, imp config.Import, declDir st
 	if !ok {
 		return
 	}
+	s.checkEmbeddedPackDivergence(name, imp.Source, locked.Commit, packDir)
 	nested, err := readPackImports(packDir)
 	if err != nil {
 		s.closureIncomplete = true
@@ -379,6 +389,82 @@ func (s *importCheckState) validateCachedPack(name, source, commit string) (stri
 	}
 
 	return packDir, true
+}
+
+// checkEmbeddedPackDivergence reports how far a materialized import has
+// drifted from the running binary's embedded copy of the same pack.
+//
+// This is the only check here that can see a pack fix that never shipped. An
+// import spelled against a fork of the bundled pack repository resolves as an
+// ordinary remote import, frozen at its pin -- correct behaviour, and nothing
+// in `make install` or `gc supervisor install` refreshes it -- so the content
+// that EXECUTES can be weeks older than the binary serving everything else
+// while every other check here passes and prints "Import state OK".
+//
+// That state was live on this fleet for 24 days and cost a real mis-action
+// (ga-rvvji2 / ga-2essre): a pack fix was verified three separate ways against
+// the installed binary -- file content at the installed commit, the order's
+// timeout at that commit, and merge-base proof that the fix was an ancestor of
+// it -- all three true, and none of them about the copy the orders exec. It
+// also hid a polecat worktree teardown guard and two omp hook versions.
+//
+// The finding is a notice, not an error: pinning a fork of a bundled pack is
+// supported, and failing this command for a supported configuration is how a
+// check gets switched off. Deciding whether a divergence should page is the
+// caller's job -- a city patrol can gate on this code while the command itself
+// keeps exiting 0.
+func (s *importCheckState) checkEmbeddedPackDivergence(name, source, commit, packDir string) {
+	pack, ok := builtinpacks.PackForSourceSubpath(source)
+	if !ok {
+		return
+	}
+	div, err := builtinpacks.DiffEmbeddedPack(pack, packDir)
+	if err != nil {
+		s.addIssue(CheckIssue{
+			Severity:   CheckSeverityWarning,
+			Code:       "bundled-pack-content-unreadable",
+			ImportName: name,
+			Source:     source,
+			Commit:     commit,
+			Path:       packDir,
+			Message:    fmt.Sprintf("cannot compare this import against the embedded %q pack: %v", pack.Name, err),
+		})
+		return
+	}
+	if div.Count() == 0 {
+		return
+	}
+	s.addIssue(CheckIssue{
+		Severity:   CheckSeverityNotice,
+		Code:       "bundled-pack-content-diverged",
+		ImportName: name,
+		Source:     source,
+		Commit:     commit,
+		Path:       packDir,
+		Message: fmt.Sprintf(
+			"content that executes differs from this binary's embedded %q pack: %s",
+			pack.Name, div.Summary(8)),
+		RepairHint: embeddedDivergenceHint(pack.Name, name),
+	})
+}
+
+// embeddedDivergenceHint spells out both ways forward, because the two have
+// different consequences and picking for the operator would be wrong: serving
+// embedded content means every gc install ships pack changes with it, while
+// bumping the pin keeps the city in charge of when pack content moves and
+// leaves this exact staleness possible again.
+func embeddedDivergenceHint(packName, importName string) string {
+	canonical, ok := builtinpacks.Source(packName)
+	if !ok {
+		return fmt.Sprintf("bump this import's version and run %q; no gc install refreshes a pinned import", "gc import install")
+	}
+	pin := config.BundledSourcePinnedVersion(canonical)
+	if strings.TrimSpace(pin) == "" {
+		return fmt.Sprintf("bump this import's version and run %q; no gc install refreshes a pinned import", "gc import install")
+	}
+	return fmt.Sprintf(
+		"a pinned import is frozen and no gc install refreshes it: either re-point imports.%s to %s at %s to serve this binary's embedded content, or bump its version and run \"gc import install\"",
+		importName, canonical, pin)
 }
 
 func (s *importCheckState) validateCachedGitCheckout(name, source, commit, cachePath string) bool {

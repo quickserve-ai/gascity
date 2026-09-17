@@ -341,8 +341,20 @@ func TestCheckInstalledFallsBackToGitCheckoutForBundledSource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CheckInstalled: %v", err)
 	}
-	if report.HasIssues() {
-		t.Fatalf("issues = %#v, want none", report.Issues)
+	// This test's subject is the RESOLUTION fallback: a bundled source pinned
+	// off the canonical commit is fetched as a real git checkout and accepted.
+	// That must never be an error. The checkout staged above is a stub holding
+	// only pack.toml, so the content-divergence notice does fire against the
+	// binary's embedded core pack — that is the divergence leg working, not a
+	// fallback failure. Asserting both explicitly keeps the two behaviours
+	// from masking each other later.
+	if report.ErrorCount() != 0 {
+		t.Fatalf("issues = %#v, want no errors", report.Issues)
+	}
+	for _, issue := range report.Issues {
+		if issue.Code != "bundled-pack-content-diverged" {
+			t.Fatalf("unexpected issue %q: %#v", issue.Code, issue)
+		}
 	}
 }
 
