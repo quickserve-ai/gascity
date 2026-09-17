@@ -609,6 +609,26 @@ const (
 	hookClaimSessionStoreUnavailable
 )
 
+// hookClaimStaleDetail is the diagnosable shape of a stale verdict: WHICH
+// identity check refused, and what the session bead said when it was read. It
+// rides alongside the verdict and never feeds back into it — the fence decides
+// exactly as it did before this was threaded out; this only lets the refusal be
+// recorded off-pane (hook.claim.refused, ga-cwu447).
+//
+// It holds no raw token. The bead's instance token is reduced to a fingerprint
+// at the classification site, so nothing downstream can log the credential.
+type hookClaimStaleDetail struct {
+	// Detail is one of the events.HookClaimRefusedDetail* values.
+	Detail string
+	// BeadRead reports whether a session bead was loaded; the fields below are
+	// meaningful only when it is true.
+	BeadRead             bool
+	State                string
+	TokenMatched         bool
+	BeadTokenFingerprint string
+	BeadEpoch            string
+}
+
 // fenceHookClaimSession applies the runtime-identity fence that gates
 // gc hook --claim before it runs the work query. It returns (code, handled):
 // handled is true for a definitively stale session OR a managed pool runtime
@@ -638,6 +658,11 @@ func fenceHookClaimSession(city *hookCity, sessionID string, opts hookCommandOpt
 		// unfenced.
 		if template := strings.TrimSpace(os.Getenv("GC_TEMPLATE")); template != "" {
 			fmt.Fprintf(stderr, "gc hook --claim: refusing unregistered managed session for pool template %q: GC_TEMPLATE is set but GC_SESSION_ID is empty, so no durable session bead can be verified\n", template) //nolint:errcheck
+			// Recorded BEFORE the drain: see hookEmitClaimRefused for why.
+			hookEmitClaimRefused(city.path,
+				"missing session registration: GC_TEMPLATE is set but GC_SESSION_ID is empty",
+				hookClaimRefusedPayload(hookClaimReasonMissingSessionRegistration, "", "",
+					hookClaimStaleDetail{Detail: events.HookClaimRefusedDetailSessionIDUnset}))
 			return writeHookClaimMissingSessionRegistrationDrain(opts, stdout, stderr), true, nil
 		}
 		return 0, false, nil
@@ -646,10 +671,13 @@ func fenceHookClaimSession(city *hookCity, sessionID string, opts hookCommandOpt
 	if instanceToken == "" {
 		return 0, false, nil
 	}
-	verdict, reason, info := classifyHookClaimSessionVia(city.sessionFront, sessionID, instanceToken)
+	verdict, reason, info, detail := classifyHookClaimSessionVia(city.sessionFront, sessionID, instanceToken)
 	switch verdict {
 	case hookClaimSessionStale:
 		fmt.Fprintf(stderr, "gc hook --claim: refusing stale session %s: %s\n", sessionID, reason) //nolint:errcheck
+		// Recorded BEFORE the drain: see hookEmitClaimRefused for why.
+		hookEmitClaimRefused(city.path, "stale session: "+reason,
+			hookClaimRefusedPayload(hookClaimReasonStaleSession, sessionID, instanceToken, detail))
 		return writeHookClaimStaleSessionDrain(opts, stdout, stderr), true, nil
 	case hookClaimSessionStoreUnavailable:
 		// Fail open: let the claim path run and surface/escalate its own store
@@ -674,14 +702,16 @@ func fenceHookClaimSession(city *hookCity, sessionID string, opts hookCommandOpt
 // It and classifyHookClaimSessionInfo are test-only: `gc hook`'s fence calls
 // classifyHookClaimSessionVia with the invocation's session front door.
 func classifyHookClaimSession(cityPath string, cfg *config.City, sessionID, instanceToken string) (hookClaimSessionVerdict, string) {
-	verdict, reason, _ := classifyHookClaimSessionInfo(cityPath, cfg, sessionID, instanceToken)
+	verdict, reason, _, _ := classifyHookClaimSessionInfo(cityPath, cfg, sessionID, instanceToken)
 	return verdict, reason
 }
 
 // classifyHookClaimSessionInfo is classifyHookClaimSession that also returns the
 // session Info it read when the verdict is eligible (nil otherwise), so the
-// claim can act on the session bead's persisted identity without a second read.
-func classifyHookClaimSessionInfo(cityPath string, cfg *config.City, sessionID, instanceToken string) (hookClaimSessionVerdict, string, *session.Info) {
+// claim can act on the session bead's persisted identity without a second read,
+// and the stale detail the hook.claim.refused event records (ga-cwu447). The
+// detail is meaningful only on a stale verdict.
+func classifyHookClaimSessionInfo(cityPath string, cfg *config.City, sessionID, instanceToken string) (hookClaimSessionVerdict, string, *session.Info, hookClaimStaleDetail) {
 	// cfg is the caller's loaded city config; reuse it rather than reloading
 	// the whole city config inside the open.
 	return classifyHookClaimSessionVia(newHookCity(cityPath, cfg).sessionFront, sessionID, instanceToken)
@@ -690,21 +720,21 @@ func classifyHookClaimSessionInfo(cityPath string, cfg *config.City, sessionID, 
 // classifyHookClaimSessionVia is classifyHookClaimSessionInfo reading the
 // session through front: in `gc hook`, the invocation's one session front door,
 // which the claim's later session reads and writes reuse.
-func classifyHookClaimSessionVia(front sessionFrontGetter, sessionID, instanceToken string) (hookClaimSessionVerdict, string, *session.Info) {
+func classifyHookClaimSessionVia(front sessionFrontGetter, sessionID, instanceToken string) (hookClaimSessionVerdict, string, *session.Info, hookClaimStaleDetail) {
 	sessFront, err := front()
 	if err != nil {
-		return hookClaimSessionStoreUnavailable, fmt.Sprintf("opening session store: %v", err), nil
+		return hookClaimSessionStoreUnavailable, fmt.Sprintf("opening session store: %v", err), nil, hookClaimStaleDetail{}
 	}
 	info, err := sessFront.Get(sessionID)
 	if err != nil {
-		verdict, reason := classifyHookClaimSessionLookupError(err)
-		return verdict, reason, nil
+		verdict, reason, detail := classifyHookClaimSessionLookupError(err)
+		return verdict, reason, nil, detail
 	}
-	verdict, reason := hookClaimSessionEligibility(info, instanceToken)
+	verdict, reason, detail := hookClaimSessionEligibility(info, instanceToken)
 	if verdict != hookClaimSessionEligible {
-		return verdict, reason, nil
+		return verdict, reason, nil, detail
 	}
-	return verdict, reason, &info
+	return verdict, reason, &info, detail
 }
 
 // hookClaimCollapsedIdentity returns the canonical identity a pool session
@@ -758,14 +788,16 @@ func hookClaimCollapsedIdentity(a *config.Agent, info *session.Info, runtimeAlia
 // genuine store open/read fault the fence fails open on, letting the normal claim
 // path surface and escalate its own store error rather than refusing a healthy
 // worker over an infrastructure hiccup.
-func classifyHookClaimSessionLookupError(err error) (hookClaimSessionVerdict, string) {
+func classifyHookClaimSessionLookupError(err error) (hookClaimSessionVerdict, string, hookClaimStaleDetail) {
 	switch {
 	case errors.Is(err, beads.ErrNotFound):
-		return hookClaimSessionStale, fmt.Sprintf("session bead not found: %v", err)
+		return hookClaimSessionStale, fmt.Sprintf("session bead not found: %v", err),
+			hookClaimStaleDetail{Detail: events.HookClaimRefusedDetailSessionBeadNotFound}
 	case errors.Is(err, session.ErrSessionNotFound):
-		return hookClaimSessionStale, fmt.Sprintf("session id resolves to a non-session bead: %v", err)
+		return hookClaimSessionStale, fmt.Sprintf("session id resolves to a non-session bead: %v", err),
+			hookClaimStaleDetail{Detail: events.HookClaimRefusedDetailNotSessionBead}
 	default:
-		return hookClaimSessionStoreUnavailable, fmt.Sprintf("loading session bead: %v", err)
+		return hookClaimSessionStoreUnavailable, fmt.Sprintf("loading session bead: %v", err), hookClaimStaleDetail{}
 	}
 }
 
@@ -783,19 +815,38 @@ func classifyHookClaimSessionLookupError(err error) (hookClaimSessionVerdict, st
 // upgraded legacy runtime would be drained before claiming its routed work.
 // Every other state — failed-create, draining, drained, asleep, suspended,
 // archived, quarantined — is dormant or terminal and classified stale.
-func hookClaimSessionEligibility(info session.Info, instanceToken string) (hookClaimSessionVerdict, string) {
-	if info.Closed {
-		return hookClaimSessionStale, "session bead is closed"
-	}
+//
+// The returned detail describes a stale verdict for hook.claim.refused. It is
+// computed from the same snapshot but never consulted by the decision: the
+// closed check still comes first and short-circuits the token comparison, and
+// the token comparison still short-circuits the state switch.
+func hookClaimSessionEligibility(info session.Info, instanceToken string) (hookClaimSessionVerdict, string, hookClaimStaleDetail) {
 	storedToken := strings.TrimSpace(info.InstanceToken)
-	if storedToken == "" || storedToken != strings.TrimSpace(instanceToken) {
-		return hookClaimSessionStale, "runtime instance token does not match the session bead"
+	state := session.State(strings.TrimSpace(info.MetadataState))
+	detail := hookClaimStaleDetail{
+		BeadRead:             true,
+		State:                string(state),
+		TokenMatched:         storedToken != "" && storedToken == strings.TrimSpace(instanceToken),
+		BeadTokenFingerprint: hookClaimTokenFingerprint(storedToken),
+		BeadEpoch:            strings.TrimSpace(info.Generation),
 	}
-	switch state := session.State(strings.TrimSpace(info.MetadataState)); state {
+	if info.Closed {
+		detail.Detail = events.HookClaimRefusedDetailSessionClosed
+		return hookClaimSessionStale, "session bead is closed", detail
+	}
+	if storedToken == "" || storedToken != strings.TrimSpace(instanceToken) {
+		detail.Detail = events.HookClaimRefusedDetailTokenSuperseded
+		if storedToken == "" {
+			detail.Detail = events.HookClaimRefusedDetailBeadTokenMissing
+		}
+		return hookClaimSessionStale, "runtime instance token does not match the session bead", detail
+	}
+	switch state {
 	case session.StateNone, session.StateActive, session.StateAwake, session.StateCreating, session.StateStartPending:
-		return hookClaimSessionEligible, ""
+		return hookClaimSessionEligible, "", hookClaimStaleDetail{}
 	default:
-		return hookClaimSessionStale, fmt.Sprintf("session state %q is not claim-eligible", state)
+		detail.Detail = events.HookClaimRefusedDetailStateNotEligible
+		return hookClaimSessionStale, fmt.Sprintf("session state %q is not claim-eligible", state), detail
 	}
 }
 
