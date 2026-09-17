@@ -283,14 +283,15 @@ func withHookStdin(t *testing.T, data []byte) {
 // and trip the handoff bands while barely a fifth used.
 func TestClassifyWindowFableAliasForms(t *testing.T) {
 	t.Setenv("GC_CONTEXT_WINDOW_TOKENS", "")
+	t.Setenv("GC_CONTEXT_LAUNCH_MODEL", "")
 	var warnings strings.Builder
 	original := contextWindowWarningWriter
 	contextWindowWarningWriter = &warnings
 	t.Cleanup(func() { contextWindowWarningWriter = original })
 
 	for _, model := range []string{"fable[1m]", "claude-fable-5-1[1m]", "claude-fable-5[1m]"} {
-		if got := contextWindowTokens([]string{model}); got != 1_000_000 {
-			t.Errorf("contextWindowTokens(%q) = %d, want 1000000", model, got)
+		if got := contextWindowTokensWithOverride([]string{model}, 0); got != 1_000_000 {
+			t.Errorf("contextWindowTokensWithOverride(%q) = %d, want 1000000", model, got)
 		}
 	}
 	if warnings.Len() != 0 {
