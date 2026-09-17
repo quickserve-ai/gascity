@@ -167,7 +167,10 @@ func TestCityRuntimeRun_ReadyBeforeRetentionSweep(t *testing.T) {
 		t.Fatalf("city did not report ready within %s\nstderr:\n%s", readyBeforeRetentionWait, stderr.String())
 	}
 
-	// The first steady-state tick MUST reach the retention read.
+	// The first steady-state tick MUST reach the retention read. Parking that
+	// tick inside the blocked read is how this test observes the deferral; it
+	// is not a contract that a tick may block on retention (that steady-state
+	// cost is gastownhall/gascity#2604, outside this test's scope).
 	close(resume)
 	select {
 	case pokeCh <- struct{}{}:
