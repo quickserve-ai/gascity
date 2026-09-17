@@ -97,11 +97,15 @@ func (c *RigWorktreesCheck) Run(_ *CheckContext) *CheckResult {
 	if err != nil {
 		// "We can't tell" must not look like "we're fine". Matches
 		// WorktreeDiskSizeCheck's policy of escalating on measurement
-		// failure — the count alone is still worth reporting.
+		// failure — the count alone is still worth reporting — and its
+		// cause-specific hint: a tree too large to walk in time is not a
+		// permission problem (ga-hyhccs).
 		r.Status = StatusWarning
 		r.Message = fmt.Sprintf("%d per-bead worktree(s) under %s, size unmeasurable", count, root)
 		r.Details = []string{err.Error()}
-		r.FixHint = "check filesystem permissions on <rig>/worktrees/"
+		var unmeasured unmeasuredRigs
+		unmeasured.add(c.rig.Name, err)
+		r.FixHint = unmeasured.hint()
 		return r
 	}
 	if !exists {
