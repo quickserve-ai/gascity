@@ -329,13 +329,27 @@ func (c *Client) bearerToken() (string, error) {
 const sessionMessageTimeout = 4 * time.Minute
 
 // defaultClientTimeout is the overall HTTP timeout for control-plane client
-// calls. The read paths (ListBeads, GetBead, GetStatus, ListMailInbox,
-// ListConvoys, ...) pass context.Background() and rely solely on this ceiling,
+// calls. The read paths (ListBeads, GetBead, GetStatus, ListConvoys, ...) pass
+// context.Background() and rely solely on this ceiling (mail reads carry their
+// own mailReadClientTimeout deadline),
 // and several of them federate the city store plus every rig store — a
 // dolt-backed rig store can take many seconds, so a 10s ceiling false-timed-out
 // healthy-but-slow federated reads. Most calls return in milliseconds; this
 // only bounds the slow federated reads and genuinely hung requests.
 const defaultClientTimeout = 60 * time.Second
+
+// mailReadClientTimeout is the per-request deadline for mail reads
+// (ListMailInboxPage, GetMail, CountMail). It must exceed the server's
+// defaultMailReadDeadline (25s) so a typed store_slow problem detail arrives
+// before the client abandons the request (ga-x49mfh), and must not exceed
+// defaultClientTimeout or remoteResponseHeaderTimeout, which would otherwise
+// cut the request first. Only mail reads use it; other calls are unchanged.
+const mailReadClientTimeout = 30 * time.Second
+
+// mailReadContext returns the request context for a mail read call.
+func mailReadContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), mailReadClientTimeout)
+}
 
 // SessionSubmitResponse is the domain-facing shape of a session submit result.
 type SessionSubmitResponse struct {
@@ -1260,7 +1274,9 @@ func (c *Client) ListMailInboxPage(agent, rig, cursor string, limit int) (Cached
 		l := int64(limit)
 		params.Limit = &l
 	}
-	resp, err := c.cw.GetV0CityByCityNameMailWithResponse(context.Background(), c.cityName, params)
+	ctx, cancel := mailReadContext()
+	defer cancel()
+	resp, err := c.cw.GetV0CityByCityNameMailWithResponse(ctx, c.cityName, params)
 	if err != nil {
 		return CachedRead[MailListView]{}, &connError{err: fmt.Errorf("request failed: %w", err)}
 	}
@@ -1287,7 +1303,9 @@ func (c *Client) GetMail(id, rig string) (CachedRead[mail.Message], error) {
 	if rig != "" {
 		params.Rig = &rig
 	}
-	resp, err := c.cw.GetV0CityByCityNameMailByIdWithResponse(context.Background(), c.cityName, id, params)
+	ctx, cancel := mailReadContext()
+	defer cancel()
+	resp, err := c.cw.GetV0CityByCityNameMailByIdWithResponse(ctx, c.cityName, id, params)
 	if err != nil {
 		return CachedRead[mail.Message]{}, &connError{err: fmt.Errorf("request failed: %w", err)}
 	}
@@ -1396,7 +1414,9 @@ func (c *Client) CountMail(agent, rig string) (CachedRead[MailCountView], error)
 	if rig != "" {
 		params.Rig = &rig
 	}
-	resp, err := c.cw.GetV0CityByCityNameMailCountWithResponse(context.Background(), c.cityName, params)
+	ctx, cancel := mailReadContext()
+	defer cancel()
+	resp, err := c.cw.GetV0CityByCityNameMailCountWithResponse(ctx, c.cityName, params)
 	if err != nil {
 		return CachedRead[MailCountView]{}, &connError{err: fmt.Errorf("request failed: %w", err)}
 	}
