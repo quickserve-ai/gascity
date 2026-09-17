@@ -259,4 +259,3 @@ func extraFiles(dir string, manifest map[string]fileEntry) ([]string, error) {
 	sort.Strings(extras)
 	return extras, nil
 }
-

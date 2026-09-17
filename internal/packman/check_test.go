@@ -346,7 +346,7 @@ func TestCheckInstalledFallsBackToGitCheckoutForBundledSource(t *testing.T) {
 	// That must never be an error. The checkout staged above is a stub holding
 	// only pack.toml, so the content-divergence notice does fire against the
 	// binary's embedded core pack — that is the divergence leg working, not a
-	// fallback failure. Asserting both explicitly keeps the two behaviours
+	// fallback failure. Asserting both explicitly keeps the two behaviors
 	// from masking each other later.
 	if report.ErrorCount() != 0 {
 		t.Fatalf("issues = %#v, want no errors", report.Issues)

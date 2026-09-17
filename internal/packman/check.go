@@ -396,7 +396,7 @@ func (s *importCheckState) validateCachedPack(name, source, commit string) (stri
 //
 // This is the only check here that can see a pack fix that never shipped. An
 // import spelled against a fork of the bundled pack repository resolves as an
-// ordinary remote import, frozen at its pin -- correct behaviour, and nothing
+// ordinary remote import, frozen at its pin -- correct behavior, and nothing
 // in `make install` or `gc supervisor install` refreshes it -- so the content
 // that EXECUTES can be weeks older than the binary serving everything else
 // while every other check here passes and prints "Import state OK".
