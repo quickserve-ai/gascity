@@ -2658,6 +2658,9 @@
             "$ref": "#/components/schemas/HookClaimReclaimedStalePayload"
           },
           {
+            "$ref": "#/components/schemas/HookClaimRefusedPayload"
+          },
+          {
             "$ref": "#/components/schemas/InboundEventPayload"
           },
           {
@@ -3993,6 +3996,64 @@
           "bead_id",
           "previous_owner",
           "new_assignee"
+        ],
+        "type": "object"
+      },
+      "HookClaimRefusedPayload": {
+        "additionalProperties": false,
+        "properties": {
+          "agent": {
+            "description": "The runtime's GC_ALIAS, else GC_AGENT.",
+            "type": "string"
+          },
+          "bead_epoch": {
+            "description": "The session bead's generation metadata, raw: the same counter runtime_epoch was stamped from. Each reconciler wake increments it and mints a new instance token together, so a runtime_epoch below bead_epoch means the generation moved on after this runtime started, normally because a later wake started another incarnation. The refusal itself is decided by the token, not by this comparison.",
+            "type": "string"
+          },
+          "bead_token_fingerprint": {
+            "description": "First 8 hex chars of SHA-256 of the session bead's instance token. Never the token.",
+            "type": "string"
+          },
+          "detail": {
+            "description": "Which identity check refused: session_closed, token_superseded, bead_token_missing, state_not_claim_eligible, session_bead_not_found, not_a_session_bead, or session_id_unset.",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Drain reason the refusal reported: stale_session or missing_session_registration.",
+            "type": "string"
+          },
+          "runtime_epoch": {
+            "description": "The runtime's GC_RUNTIME_EPOCH: the session bead's generation as it stood when this runtime was started (an empty or invalid generation starts as 1).",
+            "type": "string"
+          },
+          "runtime_token_fingerprint": {
+            "description": "First 8 hex chars of SHA-256 of the runtime's instance token. Never the token.",
+            "type": "string"
+          },
+          "session_id": {
+            "description": "The runtime's GC_SESSION_ID (its session bead id); empty for session_id_unset.",
+            "type": "string"
+          },
+          "session_name": {
+            "description": "The runtime's GC_SESSION_NAME.",
+            "type": "string"
+          },
+          "state": {
+            "description": "The session bead's state when it was read.",
+            "type": "string"
+          },
+          "template": {
+            "description": "The runtime's GC_TEMPLATE (pool membership).",
+            "type": "string"
+          },
+          "token_matched": {
+            "description": "Whether the runtime's instance token equals the session bead's; absent when no bead was read.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "reason",
+          "detail"
         ],
         "type": "object"
       },
@@ -12477,6 +12538,7 @@
             "gc.store.maintenance.done": "#/components/schemas/TypedEventStreamEnvelopeGcStoreMaintenanceDone",
             "gc.store.maintenance.failed": "#/components/schemas/TypedEventStreamEnvelopeGcStoreMaintenanceFailed",
             "hook.claim.reclaimed_stale": "#/components/schemas/TypedEventStreamEnvelopeHookClaimReclaimedStale",
+            "hook.claim.refused": "#/components/schemas/TypedEventStreamEnvelopeHookClaimRefused",
             "mail.archived": "#/components/schemas/TypedEventStreamEnvelopeMailArchived",
             "mail.deleted": "#/components/schemas/TypedEventStreamEnvelopeMailDeleted",
             "mail.marked_read": "#/components/schemas/TypedEventStreamEnvelopeMailMarkedRead",
@@ -12673,6 +12735,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeHookClaimReclaimedStale"
+          },
+          {
+            "$ref": "#/components/schemas/TypedEventStreamEnvelopeHookClaimRefused"
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeMailArchived"
@@ -14169,6 +14234,7 @@
                 "bead.claim_rejected",
                 "bead.claim_released",
                 "hook.claim.reclaimed_stale",
+                "hook.claim.refused",
                 "bead.dead_assignee_reopened",
                 "execution.work_associated",
                 "execution.run_anchored",
@@ -15624,6 +15690,63 @@
           "payload"
         ],
         "title": "TypedEventStreamEnvelope hook.claim.reclaimed_stale",
+        "type": "object"
+      },
+      "TypedEventStreamEnvelopeHookClaimRefused": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/HookClaimRefusedPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "hook.claim.refused",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload"
+        ],
+        "title": "TypedEventStreamEnvelope hook.claim.refused",
         "type": "object"
       },
       "TypedEventStreamEnvelopeMailArchived": {
@@ -18811,6 +18934,7 @@
             "gc.store.maintenance.done": "#/components/schemas/TypedTaggedEventStreamEnvelopeGcStoreMaintenanceDone",
             "gc.store.maintenance.failed": "#/components/schemas/TypedTaggedEventStreamEnvelopeGcStoreMaintenanceFailed",
             "hook.claim.reclaimed_stale": "#/components/schemas/TypedTaggedEventStreamEnvelopeHookClaimReclaimedStale",
+            "hook.claim.refused": "#/components/schemas/TypedTaggedEventStreamEnvelopeHookClaimRefused",
             "mail.archived": "#/components/schemas/TypedTaggedEventStreamEnvelopeMailArchived",
             "mail.deleted": "#/components/schemas/TypedTaggedEventStreamEnvelopeMailDeleted",
             "mail.marked_read": "#/components/schemas/TypedTaggedEventStreamEnvelopeMailMarkedRead",
@@ -19007,6 +19131,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeHookClaimReclaimedStale"
+          },
+          {
+            "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeHookClaimRefused"
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeMailArchived"
@@ -20594,6 +20721,7 @@
                 "bead.claim_rejected",
                 "bead.claim_released",
                 "hook.claim.reclaimed_stale",
+                "hook.claim.refused",
                 "bead.dead_assignee_reopened",
                 "execution.work_associated",
                 "execution.run_anchored",
@@ -22146,6 +22274,67 @@
           "city"
         ],
         "title": "TypedTaggedEventStreamEnvelope hook.claim.reclaimed_stale",
+        "type": "object"
+      },
+      "TypedTaggedEventStreamEnvelopeHookClaimRefused": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/HookClaimRefusedPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "hook.claim.refused",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload",
+          "city"
+        ],
+        "title": "TypedTaggedEventStreamEnvelope hook.claim.refused",
         "type": "object"
       },
       "TypedTaggedEventStreamEnvelopeMailArchived": {
