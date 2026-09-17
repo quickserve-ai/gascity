@@ -910,6 +910,17 @@ func finalizeDrainAckStoppedSession(
 	if template == "" {
 		template = info.Template
 	}
+	if info.LivenessReadDegraded {
+		// The overlay read for this bead failed, so info carries committed
+		// metadata: a healthy session's sleep_intent and held_until live only in
+		// the liveness table and read as empty here. Completing now would relabel
+		// a parked seat idle and drop its standing intent, and the degraded write
+		// is fenced, so it would outlive the outage (fork PR #59 review, item 1).
+		// Leave the ack and the stop-pending row alone; a later tick finalizes on
+		// a real read.
+		fmt.Fprintf(stderr, "session reconciler: deferring drain-ack finalize of %s: session liveness read degraded\n", name) //nolint:errcheck
+		return drainAckFinalizeResult{}
+	}
 	recordStopped := func(performedStop bool) {
 		// gc.agent.stops.total counts the stop action, so only the observer
 		// that actually performs the stop transition records it. Under NDI
@@ -1856,7 +1867,14 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 	// fold advances rows[i].Info so the snapshot build below projects the healed
 	// values without re-reading the bead (the coherence the old raw mirror
 	// provided for the later re-projection).
+	//
+	// A row whose liveness read was degraded is not healed: its held_until and
+	// sleep_intent are committed values, and a clear written from them is fenced
+	// and would shadow the live table rows once the overlay recovers.
 	for i := range rows {
+		if rows[i].Info.LivenessReadDegraded {
+			continue
+		}
 		rows[i].Info = healExpiredTimersInfo(rows[i].Info, sessFront, clk)
 	}
 	// Phase 0b: retire duplicate configured-named sessions — Info twin over the
@@ -4354,8 +4372,13 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		// (sleep_intent="user-hold") and config-suppressed sessions are excluded,
 		// and the respawn arm's own quarantine/circuit-breaker/provider-health
 		// gates still apply. See TestReconcileSessionBeads_HeartbeatHeldDeadSessionRespawns.
+		//
+		// An empty sleep_intent only proves a heartbeat hold when the overlay read
+		// succeeded: on a degraded read every liveness key is the committed value,
+		// and a suspend's intent reads as empty there (fork PR #59 review, item 1).
 		if !shouldWake && !target.alive && !eval.ConfigSuppressed &&
 			decision.HasAssignedWork && info.SleepIntent == "" &&
+			!info.LivenessReadDegraded &&
 			lifecycleTimerBlockerInfo(info, clk.Now()) == "user_hold" {
 			shouldWake = true
 		}
