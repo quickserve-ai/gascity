@@ -337,6 +337,9 @@ func (s *beadPolicyStore) Get(id string) (beads.Bead, error) {
 func (s *beadPolicyStore) overlayBead(b beads.Bead) beads.Bead {
 	store := s.lv.Store()
 	if store == nil {
+		if s.lv.readDegraded() {
+			return markLivenessReadDegraded(b)
+		}
 		return b
 	}
 	ctx, cancel := livenessOpContext()
@@ -345,7 +348,7 @@ func (s *beadPolicyStore) overlayBead(b beads.Bead) beads.Bead {
 	if err != nil {
 		noteLivenessFailure("read", err)
 		s.lv.noteOpError(err)
-		return b
+		return markLivenessReadDegraded(b)
 	}
 	return applyLivenessSnapshot(b, snap)
 }
@@ -353,13 +356,17 @@ func (s *beadPolicyStore) overlayBead(b beads.Bead) beads.Bead {
 // overlayBeads merges liveness rows onto a whole result set with ONE batched
 // query (chunked inside the store). A read failure is fail-open: the beads come
 // back with their committed metadata, which is the same fallback a bead with no
-// liveness rows gets.
+// liveness rows gets — marked with liveness.ReadDegradedKey, so a lifecycle
+// decision can tell the fallback from a real read.
 func (s *beadPolicyStore) overlayBeads(list []beads.Bead) []beads.Bead {
 	if s == nil || len(list) == 0 {
 		return list
 	}
 	store := s.lv.Store()
 	if store == nil {
+		if s.lv.readDegraded() {
+			return markLivenessReadDegradedAll(list)
+		}
 		return list
 	}
 	ids := make([]string, 0, len(list))
@@ -378,7 +385,7 @@ func (s *beadPolicyStore) overlayBeads(list []beads.Bead) []beads.Bead {
 	if err != nil {
 		noteLivenessFailure("read", err)
 		s.lv.noteOpError(err)
-		return list
+		return markLivenessReadDegradedAll(list)
 	}
 	if len(snaps) == 0 {
 		return list
@@ -431,6 +438,33 @@ func applyLivenessSnapshot(b beads.Bead, snap liveness.Snapshot) beads.Bead {
 	}
 	b.Metadata = beads.StringMap(liveness.Overlay(b.Metadata, snap))
 	return b
+}
+
+// markLivenessReadDegraded stamps liveness.ReadDegradedKey on a bead the
+// overlay could not be applied to. The marker is read-side only: Split drops
+// it from every inbound patch, so it never reaches the table or versioned
+// metadata. Only beads that may carry liveness are marked, the same set the
+// list overlay queries; the metadata map is copied, never mutated, because it
+// can be shared with the cache below this wrapper.
+func markLivenessReadDegraded(b beads.Bead) beads.Bead {
+	if !beadMayCarryLiveness(b) {
+		return b
+	}
+	marked := make(map[string]string, len(b.Metadata)+1)
+	for k, v := range b.Metadata {
+		marked[k] = v
+	}
+	marked[liveness.ReadDegradedKey] = "true"
+	b.Metadata = beads.StringMap(marked)
+	return b
+}
+
+// markLivenessReadDegradedAll marks every candidate bead in list in place.
+func markLivenessReadDegradedAll(list []beads.Bead) []beads.Bead {
+	for i := range list {
+		list[i] = markLivenessReadDegraded(list[i])
+	}
+	return list
 }
 
 // overlayResult applies the batched overlay to a list-shaped result, leaving an
