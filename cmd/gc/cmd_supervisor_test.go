@@ -5510,6 +5510,8 @@ func TestStopManagedCityForcesCleanupAfterTimeout(t *testing.T) {
 		},
 	}
 
+	warmSpyScript(t, script)
+
 	var stderr bytes.Buffer
 	start := time.Now()
 	err := stopManagedCity(mc, cityPath, &stderr)
@@ -5715,6 +5717,8 @@ func TestStopManagedCityBoundsForcedShutdownWhenRuntimeHangs(t *testing.T) {
 			forceStopShutdown: forceStop,
 		},
 	}
+
+	warmSpyScript(t, script)
 
 	// A sibling 100ms timer, armed as the forced phase begins (the grace's
 	// warning), fires as late as the forced wait's own timer on a loaded
