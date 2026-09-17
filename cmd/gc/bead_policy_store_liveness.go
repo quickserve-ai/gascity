@@ -306,7 +306,12 @@ func (t *livenessTx) noteFenced(id string, patch map[string]string) {
 	}
 }
 
-func (t *livenessTx) Create(b beads.Bead) (beads.Bead, error) { return t.inner.Create(b) }
+// Create strips the overlay's synthetic read-side keys, like the non-Tx create
+// path. Everything else about a transactional create is the inner store's.
+func (t *livenessTx) Create(b beads.Bead) (beads.Bead, error) {
+	b.Metadata = liveness.StripReadSideKeys(b.Metadata)
+	return t.inner.Create(b)
+}
 
 func (t *livenessTx) Close(id string) error { return t.inner.Close(id) }
 
