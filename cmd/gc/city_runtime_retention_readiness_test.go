@@ -17,25 +17,23 @@ import (
 )
 
 // retentionReadBlockingStore blocks the order-tracking retention read until
-// released, signaling each attempt on hit. That read (every closed
-// order-tracking bead with no limit, orders.Store.ClosedRunsForRetention) is
-// made only by the retention sweep: the boot backlog advisory and the doctor
-// check read the same set with a Limit, so Limit == 0 isolates the sweep from
-// every other read on the run path.
+// released, signaling each attempt on hit, and reports each successful delete
+// on deleted. That read (every closed order-tracking bead with no limit,
+// orders.Store.ClosedRunsForRetention) is made only by the retention sweep:
+// the boot backlog advisory and the doctor check read the same set with a
+// Limit, so Limit == 0 isolates the sweep from every other read on the run
+// path.
 type retentionReadBlockingStore struct {
 	beads.Store
-	block <-chan struct{}
-	hit   chan struct{}
+	block   <-chan struct{}
+	hit     chan struct{}
+	deleted chan string
 }
 
 // readyBeforeRetentionWait bounds each wait in
 // TestCityRuntimeRun_ReadyBeforeRetentionSweep. It is generous because the run
-// loop ticks on real timers and the test also runs under -race;
-// readyBeforeRetentionPoll is how often the prune wait re-reads the store.
-const (
-	readyBeforeRetentionWait = 10 * time.Second
-	readyBeforeRetentionPoll = 20 * time.Millisecond
-)
+// loop ticks on real timers and the test also runs under -race.
+const readyBeforeRetentionWait = 10 * time.Second
 
 func (s *retentionReadBlockingStore) List(q beads.ListQuery) ([]beads.Bead, error) {
 	if q.Status == "closed" && q.Label == labelOrderTracking && q.Limit == 0 {
@@ -46,6 +44,19 @@ func (s *retentionReadBlockingStore) List(q beads.ListQuery) ([]beads.Bead, erro
 		<-s.block
 	}
 	return s.Store.List(q)
+}
+
+// Delete forwards to the wrapped store and reports each successful delete, so
+// the test waits on the prune itself instead of polling for its effect.
+func (s *retentionReadBlockingStore) Delete(id string) error {
+	if err := s.Store.Delete(id); err != nil {
+		return err
+	}
+	select {
+	case s.deleted <- id:
+	default:
+	}
+	return nil
 }
 
 // TestCityRuntimeRun_ReadyBeforeRetentionSweep verifies that the controller
@@ -90,9 +101,10 @@ func TestCityRuntimeRun_ReadyBeforeRetentionSweep(t *testing.T) {
 	var unblockOnce sync.Once
 	unblock := func() { unblockOnce.Do(func() { close(block) }) }
 	store := &retentionReadBlockingStore{
-		Store: beads.NewMemStoreFrom(100, seed, nil),
-		block: block,
-		hit:   make(chan struct{}, 8),
+		Store:   beads.NewMemStoreFrom(100, seed, nil),
+		block:   block,
+		hit:     make(chan struct{}, 8),
+		deleted: make(chan string, len(seed)),
 	}
 
 	sp := runtime.NewFake()
@@ -171,17 +183,20 @@ func TestCityRuntimeRun_ReadyBeforeRetentionSweep(t *testing.T) {
 
 	// The deferred pass must also finish the prune through the real run loop:
 	// the two oldest beads past the retain-10 floor go, and the newest ten stay.
-	deadline := time.Now().Add(readyBeforeRetentionWait)
-	for {
-		_, err00 := store.Get("ready-00")
-		_, err01 := store.Get("ready-01")
-		if errors.Is(err00, beads.ErrNotFound) && errors.Is(err01, beads.ErrNotFound) {
-			break
+	pruneTimeout := time.After(readyBeforeRetentionWait)
+	pruned := make(map[string]bool)
+	for !pruned["ready-00"] || !pruned["ready-01"] {
+		select {
+		case id := <-store.deleted:
+			pruned[id] = true
+		case <-pruneTimeout:
+			t.Fatalf("deferred retention pass did not prune ready-00 and ready-01 within %s (deleted: %v)\nstderr:\n%s", readyBeforeRetentionWait, pruned, stderr.String())
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("deferred retention pass did not prune ready-00 and ready-01 within %s (errs: %v, %v)\nstderr:\n%s", readyBeforeRetentionWait, err00, err01, stderr.String())
+	}
+	for _, id := range []string{"ready-00", "ready-01"} {
+		if _, err := store.Get(id); !errors.Is(err, beads.ErrNotFound) {
+			t.Fatalf("%s was reported deleted, but Get returned %v; want ErrNotFound", id, err)
 		}
-		time.Sleep(readyBeforeRetentionPoll)
 	}
 	for i := 2; i < minClosedOrderTrackingRetained+2; i++ {
 		id := fmt.Sprintf("ready-%02d", i)
