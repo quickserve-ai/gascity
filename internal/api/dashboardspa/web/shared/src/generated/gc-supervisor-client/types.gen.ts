@@ -906,7 +906,7 @@ export type EventEmitRequest = {
     type: string;
 };
 
-export type EventPayload = AdapterEventPayload | BackendCredentialResolvedPayload | BeadClaimRejectedPayload | BeadClaimReleasedPayload | BeadDeadAssigneeReopenedPayload | BeadEventPayload | BeadWorktreeReapSkippedPayload | BeadWorktreeReapedPayload | BoundEventPayload | CityCreateSucceededPayload | CityLifecyclePayload | CityUnregisterSucceededPayload | ConditionalWritesDegradedPayload | ControlRootSettleFailedPayload | ControlStalledPayload | ExecutionClaimStalledPayload | ExecutionClaimWindowExpiredPayload | ExecutionStepStalledPayload | GroupCreatedEventPayload | HookClaimReclaimedStalePayload | InboundEventPayload | MailEventPayload | MoleculeResolvedPayload | NoPayload | OrderSuppressedPayload | OutboundChannelMismatchPayload | OutboundEventPayload | ProjectIdentityStampedPayload | Record | RequestFailedPayload | RigCreateSucceededPayload | RigProvisionProgressPayload | RotatedPayload | SessionCreateSucceededPayload | SessionDemandClaimDivergencePayload | SessionDrainAckedWithAssignedWorkPayload | SessionLifecyclePayload | SessionMessageSucceededPayload | SessionReleaseDeferredPayload | SessionResetStalledPayload | SessionStrandedPayload | SessionSubmitSucceededPayload | SessionUnknownStatePayload | SessionWakeRefusedPayload | StorageBindingOutcomePayload | StoreDiskCriticalPayload | StoreDiskWarnPayload | StoreMaintenanceDonePayload | StoreMaintenanceFailedPayload | SupervisorFsPressureSkippedTickPayload | SupervisorRequestPayload | SupervisorShutdownPayload | SupervisorStartedPayload | UnboundEventPayload | WebhookReceivedPayload | WebhookRejectedPayload | WorkerOperationEventPayload;
+export type EventPayload = AdapterEventPayload | BackendCredentialResolvedPayload | BeadClaimRejectedPayload | BeadClaimReleasedPayload | BeadDeadAssigneeReopenedPayload | BeadEventPayload | BeadWorktreeReapSkippedPayload | BeadWorktreeReapedPayload | BoundEventPayload | CityCreateSucceededPayload | CityLifecyclePayload | CityUnregisterSucceededPayload | ConditionalWritesDegradedPayload | ControlRootSettleFailedPayload | ControlStalledPayload | ExecutionClaimStalledPayload | ExecutionClaimWindowExpiredPayload | ExecutionStepStalledPayload | GroupCreatedEventPayload | HookClaimReclaimedStalePayload | HookClaimRefusedPayload | InboundEventPayload | MailEventPayload | MoleculeResolvedPayload | NoPayload | OrderSuppressedPayload | OutboundChannelMismatchPayload | OutboundEventPayload | ProjectIdentityStampedPayload | Record | RequestFailedPayload | RigCreateSucceededPayload | RigProvisionProgressPayload | RotatedPayload | SessionCreateSucceededPayload | SessionDemandClaimDivergencePayload | SessionDrainAckedWithAssignedWorkPayload | SessionLifecyclePayload | SessionMessageSucceededPayload | SessionReleaseDeferredPayload | SessionResetStalledPayload | SessionStrandedPayload | SessionSubmitSucceededPayload | SessionUnknownStatePayload | SessionWakeRefusedPayload | StorageBindingOutcomePayload | StoreDiskCriticalPayload | StoreDiskWarnPayload | StoreMaintenanceDonePayload | StoreMaintenanceFailedPayload | SupervisorFsPressureSkippedTickPayload | SupervisorRequestPayload | SupervisorShutdownPayload | SupervisorStartedPayload | UnboundEventPayload | WebhookReceivedPayload | WebhookRejectedPayload | WorkerOperationEventPayload;
 
 export type EventRotateAnchor = {
     /**
@@ -1443,6 +1443,57 @@ export type HookClaimReclaimedStalePayload = {
     bead_id: string;
     new_assignee: string;
     previous_owner: string;
+};
+
+export type HookClaimRefusedPayload = {
+    /**
+     * The runtime's GC_ALIAS, else GC_AGENT.
+     */
+    agent?: string;
+    /**
+     * The session bead's generation metadata, raw: the same counter runtime_epoch was stamped from. Each reconciler wake increments it and mints a new instance token together, so a runtime_epoch below bead_epoch means the generation moved on after this runtime started, normally because a later wake started another incarnation. The refusal itself is decided by the token, not by this comparison.
+     */
+    bead_epoch?: string;
+    /**
+     * First 8 hex chars of SHA-256 of the session bead's instance token. Never the token.
+     */
+    bead_token_fingerprint?: string;
+    /**
+     * Which identity check refused: session_closed, token_superseded, bead_token_missing, state_not_claim_eligible, session_bead_not_found, not_a_session_bead, or session_id_unset.
+     */
+    detail: string;
+    /**
+     * Drain reason the refusal reported: stale_session or missing_session_registration.
+     */
+    reason: string;
+    /**
+     * The runtime's GC_RUNTIME_EPOCH: the session bead's generation as it stood when this runtime was started (an empty or invalid generation starts as 1).
+     */
+    runtime_epoch?: string;
+    /**
+     * First 8 hex chars of SHA-256 of the runtime's instance token. Never the token.
+     */
+    runtime_token_fingerprint?: string;
+    /**
+     * The runtime's GC_SESSION_ID (its session bead id); empty for session_id_unset.
+     */
+    session_id?: string;
+    /**
+     * The runtime's GC_SESSION_NAME.
+     */
+    session_name?: string;
+    /**
+     * The session bead's state when it was read.
+     */
+    state?: string;
+    /**
+     * The runtime's GC_TEMPLATE (pool membership).
+     */
+    template?: string;
+    /**
+     * Whether the runtime's instance token equals the session bead's; absent when no bead was read.
+     */
+    token_matched?: boolean;
 };
 
 export type InboundEventPayload = {
@@ -5378,6 +5429,8 @@ export type TypedEventStreamEnvelope = ({
 } & TypedEventStreamEnvelopeGcStoreMaintenanceFailed) | ({
     type: 'hook.claim.reclaimed_stale';
 } & TypedEventStreamEnvelopeHookClaimReclaimedStale) | ({
+    type: 'hook.claim.refused';
+} & TypedEventStreamEnvelopeHookClaimRefused) | ({
     type: 'mail.archived';
 } & TypedEventStreamEnvelopeMailArchived) | ({
     type: 'mail.deleted';
@@ -6316,6 +6369,24 @@ export type TypedEventStreamEnvelopeHookClaimReclaimedStale = {
     subject?: string;
     ts: string;
     type: 'hook.claim.reclaimed_stale';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedEventStreamEnvelope hook.claim.refused
+ */
+export type TypedEventStreamEnvelopeHookClaimRefused = {
+    actor: string;
+    depends_on_step_ids?: Array<string>;
+    message?: string;
+    payload: HookClaimRefusedPayload;
+    run_id?: string;
+    seq: number;
+    session_id?: string;
+    step_id?: string;
+    subject?: string;
+    ts: string;
+    type: 'hook.claim.refused';
     workflow?: WorkflowEventProjection;
 };
 
@@ -7405,6 +7476,8 @@ export type TypedTaggedEventStreamEnvelope = ({
 } & TypedTaggedEventStreamEnvelopeGcStoreMaintenanceFailed) | ({
     type: 'hook.claim.reclaimed_stale';
 } & TypedTaggedEventStreamEnvelopeHookClaimReclaimedStale) | ({
+    type: 'hook.claim.refused';
+} & TypedTaggedEventStreamEnvelopeHookClaimRefused) | ({
     type: 'mail.archived';
 } & TypedTaggedEventStreamEnvelopeMailArchived) | ({
     type: 'mail.deleted';
@@ -8389,6 +8462,25 @@ export type TypedTaggedEventStreamEnvelopeHookClaimReclaimedStale = {
     subject?: string;
     ts: string;
     type: 'hook.claim.reclaimed_stale';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedTaggedEventStreamEnvelope hook.claim.refused
+ */
+export type TypedTaggedEventStreamEnvelopeHookClaimRefused = {
+    actor: string;
+    city: string;
+    depends_on_step_ids?: Array<string>;
+    message?: string;
+    payload: HookClaimRefusedPayload;
+    run_id?: string;
+    seq: number;
+    session_id?: string;
+    step_id?: string;
+    subject?: string;
+    ts: string;
+    type: 'hook.claim.refused';
     workflow?: WorkflowEventProjection;
 };
 
