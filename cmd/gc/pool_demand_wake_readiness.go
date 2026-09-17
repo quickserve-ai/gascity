@@ -101,6 +101,27 @@ func (r *poolWakeReadiness) servesWakeCandidate(storeRef, id string) bool {
 // reopens an elapsed dated defer, the federated `gc ready` applies IsDeferred
 // through Ready(), and gc hook drops only a future defer_until
 // (isFutureDeferredHookCandidate).
+//
+// In ONE case this verdict is stricter than the query the minted seat runs, and
+// it is deliberate. Every Ready() backend drops a row whose blocking dependency
+// closed with gc.work_outcome=blocked — internal/beads/bdstore.go:3242,
+// native_dolt_store.go:1555, caching_store_reads.go:702 — and the store
+// conformance suite requires it (beadstest/conformance.go:833, ADR-0009). Raw
+// `bd ready` cannot see that gc metadata (bdstore.go:3205-3209 says so), so on a
+// city whose seats read through it — readyReaderCommand(false),
+// internal/config/workquery.go:63, the single-store default — the seat WOULD be
+// served such a row, and gc hook does not filter it either
+// (isDepBlockedHookCandidate, cmd/gc/cmd_hook.go:1207, refuses only a blocker
+// that is not closed).
+//
+// Withholding stays the answer. It is what Ready() means, and the UNASSIGNED arm
+// already answers the same way for the same row, off the same frontier
+// (defaultScaleCheckCountsAndDemand, build_desired_state.go:1967), so the two
+// arms agree instead of this gate inventing a rule. Making the verdict
+// serve-equivalent per topology would move the store contract, so it is tracked
+// as its own work in bead gc-zkcd;
+// TestBuildDesiredStateWithholdsPoolSessionForBlockedOutcomeOrphanBdReadyWouldServe
+// pins today's answer and flips when that lands.
 func (r *poolWakeReadiness) vetoesWakeCandidate(b beads.Bead, agentCfg *config.Agent, claimantLive bool, storeRef string) bool {
 	// No verdict, or none for this row's own store: the gate is not armed here
 	// and every row keeps the demand it had.
