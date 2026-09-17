@@ -1,7 +1,10 @@
 package doctor
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1313,5 +1316,112 @@ func TestPathStrictlyInside(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("pathStrictlyInside(%q, %q) = %v, want %v", tt.child, tt.parent, got, tt.want)
 		}
+	}
+}
+
+// A rig the check could not size must be the headline, by name. On 2026-08-25
+// this check read 'largest measured: "astro" at 252.9 MB' while the qcore tree
+// it gave up on held 180 GB, and the verdict looked healthy (ga-hyhccs).
+func TestWorktreeDiskSizeCheck_UnmeasuredRigIsNamedNotHiddenBehindLargestMeasured(t *testing.T) {
+	dir := t.TempDir()
+	astro := filepath.Join(dir, ".gc", "worktrees", "astro")
+	qcore := filepath.Join(dir, ".gc", "worktrees", "qcore")
+	for _, p := range []string{astro, qcore} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := &WorktreeDiskSizeCheck{
+		cfg: config.DoctorConfig{WorktreeRigWarnSize: "10GB", WorktreeRigErrorSize: "50GB"},
+		measureDir: fakeMeasure(map[string]int64{
+			astro: 253 * 1024 * 1024,
+		}, map[string]error{
+			qcore: fmt.Errorf("measure directory: du -sk timed out after 1m0s; fallback walk: %w", context.DeadlineExceeded),
+		}),
+	}
+	r := c.Run(&CheckContext{CityPath: dir})
+	if r.Status != StatusWarning {
+		t.Fatalf("status = %d, want Warning; msg=%s", r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, `"qcore"`) {
+		t.Errorf("message must name the unmeasured rig; got %q", r.Message)
+	}
+	if strings.Contains(r.Message, "largest: ") || strings.Contains(r.Message, "largest measured: ") {
+		t.Errorf("message presents a measured size as the answer while a rig is unmeasured; got %q", r.Message)
+	}
+	if strings.Contains(r.FixHint, "permission") {
+		t.Errorf("a measurement that ran out of time must not blame permissions; hint=%q", r.FixHint)
+	}
+}
+
+func TestWorktreeDiskSizeCheck_OverThresholdStillNamesUnmeasuredRig(t *testing.T) {
+	dir := t.TempDir()
+	over := filepath.Join(dir, ".gc", "worktrees", "over")
+	qcore := filepath.Join(dir, ".gc", "worktrees", "qcore")
+	for _, p := range []string{over, qcore} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := &WorktreeDiskSizeCheck{
+		cfg: config.DoctorConfig{WorktreeRigWarnSize: "5GB", WorktreeRigErrorSize: "100GB"},
+		measureDir: fakeMeasure(map[string]int64{
+			over: 8 * 1024 * 1024 * 1024,
+		}, map[string]error{
+			qcore: fmt.Errorf("measure directory: du -sk timed out; fallback walk: %w", context.DeadlineExceeded),
+		}),
+	}
+	r := c.Run(&CheckContext{CityPath: dir})
+	if !strings.Contains(r.Message, `"qcore"`) {
+		t.Errorf("message must name the unmeasured rig even when another rig is over threshold; got %q", r.Message)
+	}
+}
+
+func TestWorktreeDiskSizeCheck_PermissionErrorKeepsPermissionHint(t *testing.T) {
+	dir := t.TempDir()
+	locked := filepath.Join(dir, ".gc", "worktrees", "locked")
+	if err := os.MkdirAll(locked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := &WorktreeDiskSizeCheck{
+		cfg: config.DoctorConfig{},
+		measureDir: fakeMeasure(nil, map[string]error{
+			locked: &fs.PathError{Op: "open", Path: locked, Err: fs.ErrPermission},
+		}),
+	}
+	r := c.Run(&CheckContext{CityPath: dir})
+	if !strings.Contains(r.FixHint, "permission") {
+		t.Errorf("a real permission error should keep the permissions hint; hint=%q", r.FixHint)
+	}
+	if !strings.Contains(r.Message, `"locked"`) {
+		t.Errorf("message must name the unmeasured rig; got %q", r.Message)
+	}
+}
+
+// The production measurer must carry a real permission failure through to the
+// hint: du exits 1 and names the cause only on stderr.
+func TestDuDirBytesReportsUnreadableTreeAsPermissionError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read a mode-000 directory")
+	}
+	root := t.TempDir()
+	locked := filepath.Join(root, "locked")
+	if err := os.MkdirAll(filepath.Join(locked, "inner"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+
+	_, _, err := duDirBytes(root)
+	if err == nil {
+		t.Fatal("duDirBytes on a tree with an unreadable directory returned no error")
+	}
+	if !errors.Is(err, fs.ErrPermission) {
+		t.Errorf("error does not wrap fs.ErrPermission: %v", err)
+	}
+	if !strings.Contains(err.Error(), "Permission denied") {
+		t.Errorf("error does not carry du's stderr: %v", err)
 	}
 }
