@@ -1735,6 +1735,10 @@ The hold is durable: a suspended session that still owns assigned work stays
 asleep rather than being restarted to serve it, and its pool slot and claim are
 left alone. It comes back on ` + "`gc session wake`" + `, or when the hold expires.
 
+Where session liveness is kept in a separate store, this holds only while that
+store can be read: a reconciler tick that cannot read it may still restart a
+held session that owns assigned work.
+
 Accepts a session ID (e.g., gc-42) or session alias (e.g., mayor).`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {

@@ -182,7 +182,11 @@ func newSessionWaitCmd(stdout, stderr io.Writer) *cobra.Command {
 With --sleep the session takes a wait hold and drains to sleep. The hold is
 durable: a wait-held session that still owns assigned work stays asleep rather
 than being restarted to serve it, and its pool slot and claim are left alone. It
-comes back when the wait resolves, or on ` + "`gc session wake`" + `.`,
+comes back when the wait resolves, or on ` + "`gc session wake`" + `.
+
+Where session liveness is kept in a separate store, this holds only while that
+store can be read: a reconciler tick that cannot read it may still restart a
+held session that owns assigned work.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
 			if cmdSessionWait(args, depIDs, matchAny, note, sleep, stdout, stderr) != 0 {
