@@ -62,6 +62,22 @@ const (
 	// of only ever observing the fresh claim with no story for how the prior
 	// assignee's abandoned work moved.
 	HookClaimReclaimedStale = "hook.claim.reclaimed_stale"
+	// HookClaimRefused fires when gc hook --claim refuses to claim because the
+	// seat's OWN runtime identity failed the pre-work-query identity fence
+	// (ga-cwu447): its session bead is closed, absent, not a session, holds a
+	// different instance token than the runtime, or sits in a dormant/terminal
+	// state (reason stale_session); or the runtime carries pool membership
+	// (GC_TEMPLATE) with no session bead to verify at all (reason
+	// missing_session_registration). The refusal already writes a drain result
+	// to the seat's own stdout, but that record dies with the pane, so a pool
+	// seat that refused and stopped on every spawn left nothing countable and
+	// read, off-pane, exactly like a seat that found no work.
+	//
+	// Only those two identity refusals are evented. An idle no_work drain is the
+	// steady state of every poll and deliberately records nothing. The payload
+	// never carries a raw instance or holder token: those are credentials, so a
+	// token comparison travels as a boolean plus short one-way fingerprints.
+	HookClaimRefused = "hook.claim.refused"
 	// ExecutionClaimWindowExpired fires when gc hook --claim reaches a claim
 	// mutation after its invocation window has elapsed — the signature of a
 	// claim command that outlived the agent turn that invoked it (an abandoned
@@ -449,6 +465,7 @@ var KnownEventTypes = []string{
 	BeadWorktreeReaped, BeadWorktreeReapSkipped,
 	BeadClaimRejected, BeadClaimReleased,
 	HookClaimReclaimedStale,
+	HookClaimRefused,
 	BeadDeadAssigneeReopened,
 	ExecutionWorkAssociated, ExecutionRunAnchored, ExecutionStepDefined, ExecutionStepStarted, ExecutionStepCompleted,
 	ExecutionClaimWindowExpired,

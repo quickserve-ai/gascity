@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/session"
 )
 
@@ -334,22 +335,25 @@ func TestHookCommandClaimFailsOpenOnSessionStoreError(t *testing.T) {
 // session.ErrSessionNotFound.
 func TestClassifyHookClaimSessionLookupError(t *testing.T) {
 	cases := []struct {
-		name    string
-		err     error
-		want    hookClaimSessionVerdict
-		wantMsg string
+		name       string
+		err        error
+		want       hookClaimSessionVerdict
+		wantMsg    string
+		wantDetail string
 	}{
 		{
-			name:    "confirmed absent bead is stale",
-			err:     fmt.Errorf("loading session %q: %w", "s", beads.ErrNotFound),
-			want:    hookClaimSessionStale,
-			wantMsg: "not found",
+			name:       "confirmed absent bead is stale",
+			err:        fmt.Errorf("loading session %q: %w", "s", beads.ErrNotFound),
+			want:       hookClaimSessionStale,
+			wantMsg:    "not found",
+			wantDetail: events.HookClaimRefusedDetailSessionBeadNotFound,
 		},
 		{
-			name:    "present but non-session bead is stale",
-			err:     fmt.Errorf("%w: %s", session.ErrSessionNotFound, "s"),
-			want:    hookClaimSessionStale,
-			wantMsg: "non-session",
+			name:       "present but non-session bead is stale",
+			err:        fmt.Errorf("%w: %s", session.ErrSessionNotFound, "s"),
+			want:       hookClaimSessionStale,
+			wantMsg:    "non-session",
+			wantDetail: events.HookClaimRefusedDetailNotSessionBead,
 		},
 		{
 			name:    "genuine store read fault fails open",
@@ -360,12 +364,19 @@ func TestClassifyHookClaimSessionLookupError(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			verdict, msg := classifyHookClaimSessionLookupError(tc.err)
+			verdict, msg, detail := classifyHookClaimSessionLookupError(tc.err)
 			if verdict != tc.want {
 				t.Fatalf("verdict = %d, want %d (msg=%q)", verdict, tc.want, msg)
 			}
 			if !strings.Contains(msg, tc.wantMsg) {
 				t.Fatalf("msg = %q, want substring %q", msg, tc.wantMsg)
+			}
+			if detail.Detail != tc.wantDetail {
+				t.Fatalf("detail = %q, want %q", detail.Detail, tc.wantDetail)
+			}
+			// A lookup failure read no bead, so no bead-derived field may claim otherwise.
+			if detail.BeadRead {
+				t.Fatalf("detail.BeadRead = true for a lookup failure: %+v", detail)
 			}
 		})
 	}
@@ -376,46 +387,56 @@ func TestClassifyHookClaimSessionLookupError(t *testing.T) {
 func TestHookClaimSessionEligibility(t *testing.T) {
 	const token = "current-token"
 	cases := []struct {
-		name    string
-		info    session.Info
-		token   string
-		want    hookClaimSessionVerdict
-		wantMsg string
+		name       string
+		info       session.Info
+		token      string
+		want       hookClaimSessionVerdict
+		wantMsg    string
+		wantDetail string
+		wantMatch  bool
 	}{
 		{
-			name:    "closed",
-			info:    session.Info{ID: "s", Closed: true, InstanceToken: token},
-			token:   token,
-			want:    hookClaimSessionStale,
-			wantMsg: "closed",
+			name:       "closed",
+			info:       session.Info{ID: "s", Closed: true, InstanceToken: token},
+			token:      token,
+			want:       hookClaimSessionStale,
+			wantMsg:    "closed",
+			wantDetail: events.HookClaimRefusedDetailSessionClosed,
+			wantMatch:  true,
 		},
 		{
-			name:    "superseded token",
-			info:    session.Info{ID: "s", MetadataState: string(session.StateActive), InstanceToken: "replacement-token"},
-			token:   "stale-runtime-token",
-			want:    hookClaimSessionStale,
-			wantMsg: "token",
+			name:       "superseded token",
+			info:       session.Info{ID: "s", MetadataState: string(session.StateActive), InstanceToken: "replacement-token"},
+			token:      "stale-runtime-token",
+			want:       hookClaimSessionStale,
+			wantMsg:    "token",
+			wantDetail: events.HookClaimRefusedDetailTokenSuperseded,
 		},
 		{
-			name:    "empty stored token",
-			info:    session.Info{ID: "s", MetadataState: string(session.StateActive), InstanceToken: ""},
-			token:   token,
-			want:    hookClaimSessionStale,
-			wantMsg: "token",
+			name:       "empty stored token",
+			info:       session.Info{ID: "s", MetadataState: string(session.StateActive), InstanceToken: ""},
+			token:      token,
+			want:       hookClaimSessionStale,
+			wantMsg:    "token",
+			wantDetail: events.HookClaimRefusedDetailBeadTokenMissing,
 		},
 		{
-			name:    "failed-create",
-			info:    session.Info{ID: "s", MetadataState: string(session.StateFailedCreate), InstanceToken: token},
-			token:   token,
-			want:    hookClaimSessionStale,
-			wantMsg: "failed-create",
+			name:       "failed-create",
+			info:       session.Info{ID: "s", MetadataState: string(session.StateFailedCreate), InstanceToken: token},
+			token:      token,
+			want:       hookClaimSessionStale,
+			wantMsg:    "failed-create",
+			wantDetail: events.HookClaimRefusedDetailStateNotEligible,
+			wantMatch:  true,
 		},
 		{
-			name:    "drained",
-			info:    session.Info{ID: "s", MetadataState: string(session.StateDrained), InstanceToken: token},
-			token:   token,
-			want:    hookClaimSessionStale,
-			wantMsg: "drained",
+			name:       "drained",
+			info:       session.Info{ID: "s", MetadataState: string(session.StateDrained), InstanceToken: token},
+			token:      token,
+			want:       hookClaimSessionStale,
+			wantMsg:    "drained",
+			wantDetail: events.HookClaimRefusedDetailStateNotEligible,
+			wantMatch:  true,
 		},
 		{
 			name:  "active",
@@ -455,7 +476,7 @@ func TestHookClaimSessionEligibility(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			verdict, reason := hookClaimSessionEligibility(tc.info, tc.token)
+			verdict, reason, detail := hookClaimSessionEligibility(tc.info, tc.token)
 			if verdict != tc.want {
 				t.Fatalf("verdict = %d, want %d (reason=%q)", verdict, tc.want, reason)
 			}
@@ -464,6 +485,18 @@ func TestHookClaimSessionEligibility(t *testing.T) {
 			}
 			if tc.wantMsg != "" && !strings.Contains(reason, tc.wantMsg) {
 				t.Fatalf("reason = %q, want substring %q", reason, tc.wantMsg)
+			}
+			if tc.want == hookClaimSessionEligible {
+				if detail != (hookClaimStaleDetail{}) {
+					t.Fatalf("eligible verdict carried detail %+v, want zero", detail)
+				}
+				return
+			}
+			if detail.Detail != tc.wantDetail {
+				t.Fatalf("detail = %q, want %q", detail.Detail, tc.wantDetail)
+			}
+			if !detail.BeadRead || detail.State != tc.info.MetadataState || detail.TokenMatched != tc.wantMatch {
+				t.Fatalf("detail = %+v, want bead read, state %q, token_matched %v", detail, tc.info.MetadataState, tc.wantMatch)
 			}
 		})
 	}

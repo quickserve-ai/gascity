@@ -105,12 +105,72 @@ type HookClaimReclaimedStalePayload struct {
 // IsEventPayload marks HookClaimReclaimedStalePayload as an events.Payload variant.
 func (HookClaimReclaimedStalePayload) IsEventPayload() {}
 
+// Values of HookClaimRefusedPayload.Detail: which identity check refused the
+// claim. Every value but SessionIDUnset rides reason stale_session.
+const (
+	// HookClaimRefusedDetailSessionClosed: the session bead is closed.
+	HookClaimRefusedDetailSessionClosed = "session_closed"
+	// HookClaimRefusedDetailTokenSuperseded: the session bead holds a different,
+	// non-empty instance token — a newer incarnation owns the session.
+	HookClaimRefusedDetailTokenSuperseded = "token_superseded"
+	// HookClaimRefusedDetailBeadTokenMissing: the session bead holds no instance
+	// token at all, so the runtime's token cannot match it.
+	HookClaimRefusedDetailBeadTokenMissing = "bead_token_missing"
+	// HookClaimRefusedDetailStateNotEligible: the token matched but the bead's
+	// state is dormant or terminal; the payload's state names it.
+	HookClaimRefusedDetailStateNotEligible = "state_not_claim_eligible"
+	// HookClaimRefusedDetailSessionBeadNotFound: GC_SESSION_ID names no bead.
+	HookClaimRefusedDetailSessionBeadNotFound = "session_bead_not_found"
+	// HookClaimRefusedDetailNotSessionBead: GC_SESSION_ID names a bead that is
+	// not a session bead.
+	HookClaimRefusedDetailNotSessionBead = "not_a_session_bead"
+	// HookClaimRefusedDetailSessionIDUnset: GC_TEMPLATE is set but GC_SESSION_ID
+	// is empty (reason missing_session_registration).
+	HookClaimRefusedDetailSessionIDUnset = "session_id_unset"
+)
+
+// HookClaimRefusedPayload is the typed payload for hook.claim.refused events
+// (ga-cwu447). Bead-derived fields (state, token_matched,
+// bead_token_fingerprint, bead_epoch) are present only when the session bead
+// was actually read; runtime-derived fields come from the refusing process's
+// own environment.
+//
+// runtime_epoch and bead_epoch are the SAME quantity read from two sides:
+// session starts stamp GC_RUNTIME_EPOCH from the bead's generation metadata,
+// and preWakeCommit bumps that generation in the same patch that mints a new
+// instance token. They are directly comparable; bead_epoch is carried raw, so
+// an empty bead generation beside runtime_epoch "1" is the start path's
+// default, not a mismatch.
+//
+// SECURITY: an instance token is a credential. No field carries one. A
+// fingerprint is the first 8 hex characters of the token's SHA-256 — enough to
+// tell whether two refusals involve the same incarnation, not enough to
+// recover or present the token.
+type HookClaimRefusedPayload struct {
+	Reason                  string `json:"reason" doc:"Drain reason the refusal reported: stale_session or missing_session_registration."`
+	Detail                  string `json:"detail" doc:"Which identity check refused: session_closed, token_superseded, bead_token_missing, state_not_claim_eligible, session_bead_not_found, not_a_session_bead, or session_id_unset."`
+	State                   string `json:"state,omitempty" doc:"The session bead's state when it was read."`
+	SessionID               string `json:"session_id,omitempty" doc:"The runtime's GC_SESSION_ID (its session bead id); empty for session_id_unset."`
+	SessionName             string `json:"session_name,omitempty" doc:"The runtime's GC_SESSION_NAME."`
+	Template                string `json:"template,omitempty" doc:"The runtime's GC_TEMPLATE (pool membership)."`
+	Agent                   string `json:"agent,omitempty" doc:"The runtime's GC_ALIAS, else GC_AGENT."`
+	TokenMatched            *bool  `json:"token_matched,omitempty" doc:"Whether the runtime's instance token equals the session bead's; absent when no bead was read."`
+	RuntimeTokenFingerprint string `json:"runtime_token_fingerprint,omitempty" doc:"First 8 hex chars of SHA-256 of the runtime's instance token. Never the token."`
+	BeadTokenFingerprint    string `json:"bead_token_fingerprint,omitempty" doc:"First 8 hex chars of SHA-256 of the session bead's instance token. Never the token."`
+	RuntimeEpoch            string `json:"runtime_epoch,omitempty" doc:"The runtime's GC_RUNTIME_EPOCH: the session bead's generation as it stood when this runtime was started (an empty or invalid generation starts as 1)."`
+	BeadEpoch               string `json:"bead_epoch,omitempty" doc:"The session bead's generation metadata, raw: the same counter runtime_epoch was stamped from. Each reconciler wake increments it and mints a new instance token together, so a runtime_epoch below bead_epoch means the generation moved on after this runtime started, normally because a later wake started another incarnation. The refusal itself is decided by the token, not by this comparison."`
+}
+
+// IsEventPayload marks HookClaimRefusedPayload as an events.Payload variant.
+func (HookClaimRefusedPayload) IsEventPayload() {}
+
 func init() {
 	RegisterPayload(BeadWorktreeReaped, BeadWorktreeReapedPayload{})
 	RegisterPayload(BeadWorktreeReapSkipped, BeadWorktreeReapSkippedPayload{})
 	RegisterPayload(BeadClaimRejected, BeadClaimRejectedPayload{})
 	RegisterPayload(BeadClaimReleased, BeadClaimReleasedPayload{})
 	RegisterPayload(HookClaimReclaimedStale, HookClaimReclaimedStalePayload{})
+	RegisterPayload(HookClaimRefused, HookClaimRefusedPayload{})
 }
 
 // StoreDiskWarnPayload is the typed payload for gc.store.disk_warn events.
