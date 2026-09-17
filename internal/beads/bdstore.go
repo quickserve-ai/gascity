@@ -1343,6 +1343,11 @@ func (s *BdStore) CreateWithStorage(b Bead, storage StorageClass) (Bead, error) 
 		return Bead{}, fmt.Errorf("bd create: parsing JSON: %w", err)
 	}
 	created := issue.toBead()
+	if b.ParentID != "" {
+		// qc-p9m8oa9 interim: bd copied every parent label; take back the
+		// state/hold ones. Remove when bd excludes them at create.
+		created.Labels = s.removeInheritedStateLabels(created.ID, b.ParentID, created.Labels, b.Labels)
+	}
 	if created.Assignee == "" {
 		created.Assignee = b.Assignee
 	}

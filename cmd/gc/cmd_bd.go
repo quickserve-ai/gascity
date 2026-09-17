@@ -457,6 +457,14 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 	// write.
 	bdArgs = canonicalizeBdAssigneeArgs(bdArgs, cityPath, cfg, stderr)
 
+	// qc-p9m8oa9 interim: a `create --parent` must not hand the child the
+	// parent's hold:*/cert:*/needs-summon labels, which automation reads as
+	// "already in flight". Dimensional labels still cascade; caller-passed
+	// labels are untouched. Remove when bd excludes these at create.
+	bdArgs = stripInheritedStateLabelsFromBdCreateArgs(bdArgs, func(parentID string) ([]string, error) {
+		return bdCreateParentLabels(cityPath, cfg, target, parentID)
+	}, stderr)
+
 	// Pre-flight exact-ID guard for write-mutating subcommands (gcy-g4o).
 	// bd's fuzzy/substring resolver can silently match a longer ID that
 	// contains the supplied ID as a substring (e.g. "gcy-dv7" → "gcy-wisp-dv78").
