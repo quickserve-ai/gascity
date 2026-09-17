@@ -2099,10 +2099,31 @@ func nextPasteBufferName() string {
 }
 
 func (t *Tmux) sendLiteralText(target, text string) error {
+	return t.sendLiteralTextConfirmingMode(target, text, false)
+}
+
+// sendLiteralTextForNudge delivers a NUDGE. It differs from sendLiteralText in
+// exactly one way: where the tmux server is too old to report
+// #{bracket_paste_flag}, it confirms the pane's bracketed-paste mode by asking
+// whether the pane's agent is alive, rather than giving up and keystroking (see
+// paneBracketsPaste). On tmux 3.7 and later the flag decides and the two paths
+// behave identically.
+//
+// Only the nudge path may do this. The STARTUP path must not: it delivers the
+// role prompt while the agent is deliberately not yet running -- waiting for it
+// is what sendStartupKeysLiteralWithRetry's retry loop is for -- so an
+// agent-liveness precondition there would refuse every seat's prompt on a
+// sub-3.7 server (ga-p93v6w).
+func (t *Tmux) sendLiteralTextForNudge(target, text string) error {
+	return t.sendLiteralTextConfirmingMode(target, text, true)
+}
+
+func (t *Tmux) sendLiteralTextConfirmingMode(target, text string, confirmByAgent bool) error {
 	if len(text) > maxSendKeysLiteralLen {
 		return t.pasteLiteralText(target, text)
 	}
-	if claudeNeedsBracketedPaste(text) && t.targetIsClaudeFamily(target) && t.paneHasBracketedPasteOn(target) {
+	if claudeNeedsBracketedPaste(text) && t.targetIsClaudeFamily(target) &&
+		t.paneBracketsPaste(target, confirmByAgent) {
 		return t.pasteLiteralText(target, text)
 	}
 	_, err := t.run("send-keys", "-t", target, "-l", text)
@@ -2120,23 +2141,46 @@ func claudeNeedsBracketedPaste(text string) bool {
 	return len(text) > claudeMaxUnbracketedNudgeBytes || strings.ContainsAny(text, "\r\n")
 }
 
-// paneHasBracketedPasteOn reports whether the application in target has turned
-// bracketed paste mode on (ESC[?2004h), as tmux's #{bracket_paste_flag} shows.
-// `paste-buffer -p` adds the ESC[200~ ... ESC[201~ markers only when that flag
-// is set. Without it tmux writes the text raw, each newline as a CR, so a
-// multi-line nudge would submit line by line, which is worse than keystrokes.
-// Any answer but "1", including a failed read, reports false, and the caller
-// keeps the send-keys path. It is read last, so only a claude nudge that
-// needs a paste pays for the extra tmux call.
+// paneBracketsPaste reports whether `paste-buffer -p` will BRACKET a paste to
+// target, i.e. whether the application there has turned bracketed-paste mode on
+// (ESC[?2004h). Bracketing is the whole point of the paste path: unbracketed,
+// tmux writes the text raw with every newline as a CR, so a multi-line nudge
+// submits line by line -- and in a pane where the agent has exited and a shell
+// holds the prompt, those lines RUN. Ruling that out is this guard's only job.
 //
-// A tmux server older than 3.7 has no such format and renders it empty (see
-// paneBracketPasteFlag). There the mode cannot be confirmed, so claude nudges
-// keep the send-keys delivery they had before ga-6qfgdo: pasting blind would
-// trade the tail-only loss for line-by-line submits in any pane without the
-// mode, and this guard exists to rule that out.
-func (t *Tmux) paneHasBracketedPasteOn(target string) bool {
+// #{bracket_paste_flag} answers the question exactly, but only on tmux 3.7 and
+// later, which added the format. An older server renders an unknown format as
+// "", which means "cannot tell" -- not "off". Both peer towns are older than
+// that (westeros 3.4, qlandia 3.6a; ga-p93v6w holds the inventory), so on them
+// the flag is never readable and this fallback is the whole behavior.
+//
+// confirmByAgent decides what an unreadable flag means:
+//
+//   - false: treat it as "no" and keep keystrokes. What the startup path wants,
+//     because the agent is not running yet by design.
+//   - true: fall back to the one signal every tmux version can give -- is the
+//     pane's AGENT PROCESS ALIVE. A running claude sits at its prompt with
+//     bracketed paste on, so a paste to it brackets; and the pane this reports
+//     false for is the bare-shell pane, which is precisely the dangerous one.
+//
+// The fallback is a PROXY, not a reading. An agent that is alive but has
+// momentarily disabled bracketed paste would be pasted into anyway. That is the
+// safe direction of the trade -- the alternative is the measured tail-only loss
+// on every sub-3.7 box (ga-6qfgdo), and the payload reaches a live agent rather
+// than a shell -- but it is not equivalent to the flag, and a box that can read
+// the flag never uses it.
+//
+// Cost: the flag read happens last, so only a nudge that already needs a paste
+// pays for it, and the liveness probe runs only where the flag cannot answer.
+func (t *Tmux) paneBracketsPaste(target string, confirmByAgent bool) bool {
 	flag, err := t.paneBracketPasteFlag(target)
-	return err == nil && flag == "1"
+	if err == nil && (flag == "1" || flag == "0") {
+		return flag == "1"
+	}
+	if !confirmByAgent {
+		return false
+	}
+	return t.targetLooksLikeProvider(target, "claude")
 }
 
 // paneBracketPasteFlag returns target's #{bracket_paste_flag}, trimmed. tmux
@@ -2258,7 +2302,7 @@ func sendPasteChunks(chunks []string, send func(string) error, pause func()) err
 // This function ONLY addresses the startup race where the agent TUI hasn't
 // initialized yet, causing tmux send-keys to fail with "not in a mode".
 func (t *Tmux) sendKeysLiteralWithRetry(target, text string, timeout time.Duration) error {
-	return t.sendTextWithRetry(target, text, timeout, t.sendLiteralText)
+	return t.sendTextWithRetry(target, text, timeout, t.sendLiteralTextForNudge)
 }
 
 func (t *Tmux) sendStartupKeysLiteralWithRetry(target, text, provider string, timeout time.Duration) error {
