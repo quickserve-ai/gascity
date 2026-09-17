@@ -650,7 +650,7 @@ func fenceHookClaimSession(cityPath string, cfg *config.City, sessionID string, 
 	if instanceToken == "" {
 		return 0, false, nil
 	}
-	verdict, reason, info, detail := classifyHookClaimSessionInfo(cityPath, cfg, sessionID, instanceToken)
+	verdict, reason, info, detail := hookClaimClassifySession(cityPath, cfg, sessionID, instanceToken)
 	switch verdict {
 	case hookClaimSessionStale:
 		fmt.Fprintf(stderr, "gc hook --claim: refusing stale session %s: %s\n", sessionID, reason) //nolint:errcheck
@@ -668,6 +668,10 @@ func fenceHookClaimSession(cityPath string, cfg *config.City, sessionID string, 
 		return 0, false, info
 	}
 }
+
+// hookClaimClassifySession is the fence's classifier seam, replaced in tests
+// that must prove the fence actually ran rather than infer it from silence.
+var hookClaimClassifySession = classifyHookClaimSessionInfo
 
 // classifyHookClaimSession loads the session bead named by sessionID and reports
 // whether the runtime holding instanceToken may claim. A confirmed identity
@@ -797,7 +801,7 @@ func hookClaimSessionEligibility(info session.Info, instanceToken string) (hookC
 		State:                string(state),
 		TokenMatched:         storedToken != "" && storedToken == strings.TrimSpace(instanceToken),
 		BeadTokenFingerprint: hookClaimTokenFingerprint(storedToken),
-		BeadEpoch:            strings.TrimSpace(info.Generation),
+		BeadEpoch:            hookClaimRuntimeGeneration(info.Generation),
 	}
 	if info.Closed {
 		detail.Detail = events.HookClaimRefusedDetailSessionClosed
