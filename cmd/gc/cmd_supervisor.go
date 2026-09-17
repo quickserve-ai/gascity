@@ -1684,6 +1684,10 @@ func runSupervisor(stdout, stderr io.Writer) int {
 			}
 		case <-ctx.Done():
 			notifySdState(stderr, sdnotify.Stopping)
+			// The stop durations below are the only record of how long
+			// STOPPING takes, which is what a service manager's kill
+			// deadline has to cover (ga-2jjk51).
+			stoppingStarted := time.Now()
 			// Shutdown all cities. Collect under lock, then stop outside
 			// to avoid blocking API requests during graceful shutdown.
 			var toStop map[string]*managedCity
@@ -1712,7 +1716,10 @@ func runSupervisor(stdout, stderr io.Writer) int {
 				if preserveSessions {
 					stopFn = stopManagedCityPreservingSessions
 				}
-				if err := stopFn(mc, name, stderr); err != nil {
+				cityStopStarted := time.Now()
+				err := stopFn(mc, name, stderr)
+				fmt.Fprintf(stdout, "gc supervisor: city '%s' stop took %s\n", name, time.Since(cityStopStarted).Round(time.Millisecond)) //nolint:errcheck
+				if err != nil {
 					stopFailures = append(stopFailures, fmt.Sprintf("%s: %s", name, err.Error()))
 					fmt.Fprintf(stdout, "City '%s' stop reported error (see stderr).\n", name) //nolint:errcheck
 				} else {
@@ -1734,7 +1741,8 @@ func runSupervisor(stdout, stderr io.Writer) int {
 			if err := supervisor.WriteShutdownMarker(supervisor.DefaultHome()); err != nil {
 				fmt.Fprintf(stderr, "gc supervisor: %v\n", err) //nolint:errcheck
 			}
-			fmt.Fprintln(stdout, "Supervisor stopped.") //nolint:errcheck
+			fmt.Fprintf(stdout, "gc supervisor: stopping took %s\n", time.Since(stoppingStarted).Round(time.Millisecond)) //nolint:errcheck
+			fmt.Fprintln(stdout, "Supervisor stopped.")                                                                   //nolint:errcheck
 			return supervisorShutdownExitCode(shutErr)
 		}
 	}

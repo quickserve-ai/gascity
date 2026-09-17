@@ -57,9 +57,17 @@ var (
 	// it serves the new build.
 	launchdRefreshWaitTimeout        = 90 * time.Second
 	supervisorPlistValidationTimeout = 2 * time.Second
-	supervisorLaunchdProbeTimeout    = time.Second
-	supervisorLaunchctlTimeout       = 10 * time.Second
-	supervisorLaunchctlRun           = func(args ...string) error {
+	// supervisorLaunchdExitTimeout is the plist's ExitTimeOut: how long
+	// launchd waits between the SIGTERM of a bootout and its SIGKILL. With
+	// no key launchd uses 5s, which equals a city's default stop grace, so
+	// a stop that needed its grace was killed before it finished
+	// (ga-2jjk51). It must exceed one city's worst-case stop (grace plus
+	// the forced phase, 30s at defaults) and stay below
+	// launchdRefreshWaitTimeout so a refresh still sees the job unload.
+	supervisorLaunchdExitTimeout  = 45 * time.Second
+	supervisorLaunchdProbeTimeout = time.Second
+	supervisorLaunchctlTimeout    = 10 * time.Second
+	supervisorLaunchctlRun        = func(args ...string) error {
 		ctx, cancel := context.WithTimeout(context.Background(), supervisorLaunchctlTimeout)
 		defer cancel()
 		err := exec.CommandContext(ctx, "launchctl", args...).Run()
@@ -1738,6 +1746,8 @@ const supervisorLaunchdTemplate = `<?xml version="1.0" encoding="UTF-8"?>
     </array>
     <key>RunAtLoad</key>
     <true/>
+    <key>ExitTimeOut</key>
+    <integer>{{launchdExitTimeoutSeconds}}</integer>
     <key>KeepAlive</key>
     <dict>
         <key>Crashed</key>
@@ -1820,7 +1830,12 @@ func supervisorSystemdQuotePath(s string) string {
 }
 
 func renderSupervisorTemplate(tmplStr string, data *supervisorServiceData) (string, error) {
-	funcMap := template.FuncMap{"xmlesc": xmlEscape, "systemdenv": systemdEnv, "systemdpath": supervisorSystemdQuotePath}
+	funcMap := template.FuncMap{
+		"xmlesc":                    xmlEscape,
+		"systemdenv":                systemdEnv,
+		"systemdpath":               supervisorSystemdQuotePath,
+		"launchdExitTimeoutSeconds": func() int { return int(supervisorLaunchdExitTimeout / time.Second) },
+	}
 	tmpl, err := template.New("service").Funcs(funcMap).Parse(tmplStr)
 	if err != nil {
 		return "", err
