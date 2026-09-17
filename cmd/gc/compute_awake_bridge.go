@@ -56,6 +56,33 @@ func buildAwakeInputFromReconcilerWithObservationErrors(
 	sp runtime.Provider,
 	clk time.Time,
 ) (AwakeInput, map[string]error) {
+	input, _, observationErrors := buildAwakeInputFromReconcilerWithWorkSources(
+		cfg, cityPath, sessionInfos, poolDesired, namedSessionDemand, namedRoutedDemand,
+		workSet, readyWaitSet, assignedWorkBeads, readyAssignedFlags, wakeTargets, sp, clk,
+	)
+	return input, observationErrors
+}
+
+// buildAwakeInputFromReconcilerWithWorkSources additionally returns, for each
+// AwakeInput.WorkBeads entry, the index of the assignedWorkBeads row it was
+// built from, so a caller can resolve a work bead back to the store it was read
+// through (computeAwakeSetWithCertParks).
+func buildAwakeInputFromReconcilerWithWorkSources(
+	cfg *config.City,
+	cityPath string,
+	sessionInfos []session.Info,
+	poolDesired map[string]int,
+	namedSessionDemand map[string]bool,
+	namedRoutedDemand map[string]bool,
+	workSet map[string]bool,
+	readyWaitSet map[string]bool,
+	assignedWorkBeads []beads.Bead,
+	readyAssignedFlags []bool,
+	wakeTargets []wakeTarget,
+	sp runtime.Provider,
+	clk time.Time,
+) (AwakeInput, []int, map[string]error) {
+	var workSources []int
 	input := AwakeInput{
 		ScaleCheckCounts:         poolDesired,
 		NamedSessionDemand:       cloneBoolMap(namedSessionDemand),
@@ -126,6 +153,7 @@ func buildAwakeInputFromReconcilerWithObservationErrors(
 			input.WorkBeads = append(input.WorkBeads, AwakeWorkBead{
 				ID: wb.ID, Assignee: a, Status: wb.Status, Ready: ready, Blocked: blocked,
 			})
+			workSources = append(workSources, i)
 		}
 	}
 
@@ -242,7 +270,7 @@ func buildAwakeInputFromReconcilerWithObservationErrors(
 		}
 	}
 
-	return input, observationErrors
+	return input, workSources, observationErrors
 }
 
 func shouldProbeAttachmentForAwakeInput(info session.Info, alive bool, cfg *config.City, poolDesired map[string]int) bool {
