@@ -315,6 +315,16 @@ const (
 	hiddenAttachMaxLifetime  = 20 * time.Second
 	hiddenAttachPollInterval = 50 * time.Millisecond
 	maxSendKeysLiteralLen    = 4096
+	// claudeMaxUnbracketedNudgeBytes is the longest single-line nudge a claude
+	// target still receives as `send-keys -l` keystrokes (ga-6qfgdo). Claude
+	// Code reads its pty in 1022-byte chunks and handles each UNBRACKETED read
+	// on its own: a read over 800 characters goes to its paste handler, a
+	// shorter one to its typed editor, which replaces the draft. When a nudge
+	// spans several reads, the last read overwrites the earlier ones and the
+	// head is lost. 512 bytes stays inside a single read with room to spare.
+	// Longer text, and any text with a newline (dropped as a keystroke under
+	// modifyOtherKeys), goes as one bracketed paste instead.
+	claudeMaxUnbracketedNudgeBytes = 512
 	// Copilot CLI converts any single paste larger than 20 KiB into a
 	// workspace attachment. Keep each paste below that provider boundary and
 	// separate consecutive paste events so its TUI does not coalesce them.
@@ -2677,6 +2687,9 @@ func (t *Tmux) sendLiteralText(ctx context.Context, target, text string) error {
 	if len(text) > maxSendKeysLiteralLen || t.pastesMultilineText(target, text) {
 		return t.pasteLiteralText(ctx, target, text)
 	}
+	if claudeNeedsBracketedPaste(text) && t.targetIsClaudeFamily(target) {
+		return t.pasteLiteralText(ctx, target, text)
+	}
 	_, err := t.runCtx(ctx, append([]string{"send-keys", "-t", paneTarget(target), "-l"}, runtime.TmuxLiteralArgs(text)...)...)
 	if isCommandTooLongError(err) {
 		return t.pasteLiteralText(ctx, target, text)
@@ -2692,6 +2705,29 @@ func (t *Tmux) sendLiteralText(ctx context.Context, target, text string) error {
 // the Enter after it submits.
 func (t *Tmux) pastesMultilineText(target, text string) bool {
 	return strings.Contains(text, "\n") && sessionlog.ProviderFamily(t.providerEnv(target)) == "codex"
+}
+
+// claudeNeedsBracketedPaste reports whether text is too long, or spans lines,
+// to reach a claude target intact as keystrokes (see
+// claudeMaxUnbracketedNudgeBytes). It is checked before the provider lookup so
+// a short single-line nudge costs no extra tmux call.
+func claudeNeedsBracketedPaste(text string) bool {
+	return len(text) > claudeMaxUnbracketedNudgeBytes || strings.ContainsAny(text, "\r\n")
+}
+
+// targetIsClaudeFamily reports whether target runs a claude-family provider,
+// resolved the way submitVerifyEligible and nudgeSubmitKeySequence resolve a
+// family: the pane's GC_PROVIDER when set, otherwise a process-name sniff.
+//
+// Only claude is routed through bracketed paste below maxSendKeysLiteralLen
+// for its size; codex pastes only multi-line text (pastesMultilineText). The
+// other families keep keystroke delivery there: how their TUIs take a mid-size
+// bracketed paste followed by their submit sequence is unverified.
+func (t *Tmux) targetIsClaudeFamily(target string) bool {
+	if provider := t.providerEnv(target); provider != "" {
+		return sessionlog.ProviderFamily(provider) == "claude"
+	}
+	return t.targetLooksLikeProvider(target, "claude")
 }
 
 func (t *Tmux) pasteLiteralText(ctx context.Context, target, text string) error {
