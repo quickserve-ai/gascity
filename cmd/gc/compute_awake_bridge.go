@@ -56,11 +56,37 @@ func buildAwakeInputFromReconcilerWithObservationErrors(
 	sp runtime.Provider,
 	clk time.Time,
 ) (AwakeInput, map[string]error) {
+	input, _, observationErrors := buildAwakeInputFromReconcilerWithWorkSources(
+		cfg, cityPath, sessionInfos, poolDesired, namedSessionDemand, namedRoutedDemand,
+		workSet, readyWaitSet, assignedWorkBeads, readyAssignedFlags, wakeTargets, sp, clk,
+	)
+	return input, observationErrors
+}
+
+// buildAwakeInputFromReconcilerWithWorkSources additionally returns, for each
+// AwakeInput.WorkBeads entry, the index of the assignedWorkBeads row it was
+// built from, so a caller can resolve a work bead back to the store it was read
+// through (computeAwakeSetWithCertParks).
+func buildAwakeInputFromReconcilerWithWorkSources(
+	cfg *config.City,
+	cityPath string,
+	sessionInfos []session.Info,
+	poolDesired map[string]int,
+	namedSessionDemand map[string]bool,
+	namedRoutedDemand map[string]bool,
+	workSet map[string]bool,
+	readyWaitSet map[string]bool,
+	assignedWorkBeads []beads.Bead,
+	readyAssignedFlags []bool,
+	wakeTargets []wakeTarget,
+	sp runtime.Provider,
+	clk time.Time,
+) (AwakeInput, []int, map[string]error) {
 	// Load runtime suspension state once against the in-scope city path so
 	// suspension resolves against the controlled city rather than the
 	// process cwd.
 	suspState, _ := loadSuspensionState(fsys.OSFS{}, cityPath)
-	input := newAwakeInputFromSnapshot(
+	input, workSources := newAwakeInputFromSnapshotWithWorkSources(
 		cfg,
 		func(a *config.Agent) bool { return isAgentEffectivelySuspendedWith(cfg, cityPath, a, suspState) },
 		sessionInfos, poolDesired, namedSessionDemand, namedRoutedDemand, workSet, readyWaitSet,
@@ -113,7 +139,7 @@ func buildAwakeInputFromReconcilerWithObservationErrors(
 		}
 	}
 
-	return input, observationErrors
+	return input, workSources, observationErrors
 }
 
 // newAwakeInputFromSnapshot builds every part of AwakeInput that comes from
@@ -134,6 +160,30 @@ func newAwakeInputFromSnapshot(
 	readyAssignedFlags []bool,
 	clk time.Time,
 ) AwakeInput {
+	input, _ := newAwakeInputFromSnapshotWithWorkSources(
+		cfg, agentSuspended, sessionInfos, poolDesired, namedSessionDemand, namedRoutedDemand,
+		workSet, readyWaitSet, assignedWorkBeads, readyAssignedFlags, clk,
+	)
+	return input
+}
+
+// newAwakeInputFromSnapshotWithWorkSources is newAwakeInputFromSnapshot that
+// also returns, for each AwakeInput.WorkBeads entry, the index of the
+// assignedWorkBeads row it was built from (computeAwakeSetWithCertParks).
+func newAwakeInputFromSnapshotWithWorkSources(
+	cfg *config.City,
+	agentSuspended func(*config.Agent) bool,
+	sessionInfos []session.Info,
+	poolDesired map[string]int,
+	namedSessionDemand map[string]bool,
+	namedRoutedDemand map[string]bool,
+	workSet map[string]bool,
+	readyWaitSet map[string]bool,
+	assignedWorkBeads []beads.Bead,
+	readyAssignedFlags []bool,
+	clk time.Time,
+) (AwakeInput, []int) {
+	var workSources []int
 	input := AwakeInput{
 		ScaleCheckCounts:         poolDesired,
 		NamedSessionDemand:       cloneBoolMap(namedSessionDemand),
@@ -200,6 +250,7 @@ func newAwakeInputFromSnapshot(
 			input.WorkBeads = append(input.WorkBeads, AwakeWorkBead{
 				ID: wb.ID, Assignee: a, Status: wb.Status, Ready: ready, Blocked: blocked,
 			})
+			workSources = append(workSources, i)
 		}
 	}
 
@@ -273,7 +324,7 @@ func newAwakeInputFromSnapshot(
 		input.NamedSessionWorkQ[ns.Identity] = true
 	}
 
-	return input
+	return input, workSources
 }
 
 func shouldProbeAttachmentForAwakeInput(info session.Info, alive bool, cfg *config.City, poolDesired map[string]int) bool {
