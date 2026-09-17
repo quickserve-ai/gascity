@@ -1,0 +1,93 @@
+# TEMPORARY driver for ga-w1ollm's authorized non-bypass push test.
+#
+# Authorization: Cherub, 2026-09-17, relayed as mayor mail ga-wisp-zjy4o5k and
+# recorded verbatim on bead ga-w1ollm before this file was written. Scope is
+# EXACTLY TWO pushes TOTAL by github-actions[bot] (non-admin, non-bypass under
+# the active rulesets), in one dispatch:
+#   (a) create polecat/ga-w1ollm-nb-test-<run>        -> expected: SUCCEEDS
+#       (polecat/** is excluded from rig-ref-confinement 22632844)
+#   (b) create witness-salvage/ga-w1ollm-nb-red-<run> -> expected: REFUSED
+#       (governed namespace; also the live evidence for bead ga-fvcdyz —
+#       the salvage path's latent fail-closed)
+#
+# The two-push budget is TOTAL, not per attempt: reruns are refused outright,
+# and (b) still runs when (a) fails so both verdicts come from the single
+# authorized dispatch. The bot performs no other write, no merge, and never
+# deletes anything: cleanup of the (a) branch is done by a human admin
+# afterwards. If (b) unexpectedly SUCCEEDS the run fails loudly and the branch
+# is left for human admin deletion — the driver must not spend a third push
+# hiding the most important possible finding.
+#
+# This workflow is removed by a follow-up PR once the rule-suites rows are
+# copied to the bead. It must not survive the test.
+
+name: ga-w1ollm non-bypass push test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  two-pushes:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reject reruns (the two-push budget is total)
+        shell: bash
+        run: |
+          if [[ "$GITHUB_RUN_ATTEMPT" != "1" ]]; then
+            echo "::error::Reruns are forbidden: this dispatch permits exactly two pushes total."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: "Push (a): permitted polecat/** creation (expect success)"
+        id: push_a
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="refs/heads/polecat/ga-w1ollm-nb-test-${{ github.run_id }}"
+          echo "pushing HEAD ($(git rev-parse HEAD)) to $ref"
+          # Redirect, never pipe: `push | tee` returns tee's status and masks
+          # the push result — the assertion this driver exists to make.
+          if git push origin "HEAD:$ref" >/tmp/push-a.log 2>&1; then
+            cat /tmp/push-a.log
+            echo "PUSH A: SUCCEEDED (expected)"
+          else
+            cat /tmp/push-a.log
+            echo "PUSH A: FAILED — unexpected; the permitted namespace refused a non-bypass actor"
+            exit 1
+          fi
+
+      - name: "Push (b): governed witness-salvage/** creation (expect refusal)"
+        # Runs even when (a) failed: a retry dispatch would exceed the total
+        # two-push authorization, so both verdicts must come from this one.
+        if: ${{ !cancelled() && (steps.push_a.outcome == 'success' || steps.push_a.outcome == 'failure') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="refs/heads/witness-salvage/ga-w1ollm-nb-red-${{ github.run_id }}"
+          echo "pushing HEAD ($(git rev-parse HEAD)) to $ref"
+          # Redirect, never pipe (same masking hazard as push (a)).
+          if git push origin "HEAD:$ref" >/tmp/push-b.log 2>&1; then
+            cat /tmp/push-b.log
+            echo "PUSH B: SUCCEEDED — UNEXPECTED. The governed namespace accepted a non-bypass creation."
+            echo "Leaving the branch in place for human admin review/deletion (no third push)."
+            exit 1
+          fi
+          cat /tmp/push-b.log
+          # Refusal evidence must be an actual ruleset rejection (GH013) for
+          # THIS ref — not a generic access failure. Two anchored greps rather
+          # than one exact-line match: remote prefixes vary, and a false
+          # negative here would claim "no refusal evidence" on a refused push.
+          if grep -Fq "GH013: Repository rule violations found" /tmp/push-b.log \
+             && grep -Fq "$ref" /tmp/push-b.log; then
+            echo "PUSH B: REFUSED with GH013 rule violation for $ref (expected)"
+          else
+            echo "PUSH B: failed, but NOT with a recognizable GH013 rule violation for $ref — inspect the log"
+            exit 1
+          fi
