@@ -259,6 +259,16 @@ const (
 	hiddenAttachMaxLifetime  = 20 * time.Second
 	hiddenAttachPollInterval = 50 * time.Millisecond
 	maxSendKeysLiteralLen    = 4096
+	// claudeMaxUnbracketedNudgeBytes is the longest single-line nudge a claude
+	// target still receives as `send-keys -l` keystrokes (ga-6qfgdo). Claude
+	// Code reads its pty in 1022-byte chunks and handles each UNBRACKETED read
+	// on its own: a read over 800 characters goes to its paste handler, a
+	// shorter one to its typed editor, which replaces the draft. When a nudge
+	// spans several reads, the last read overwrites the earlier ones and the
+	// head is lost. 512 bytes stays inside a single read with room to spare.
+	// Longer text, and any text with a newline (dropped as a keystroke under
+	// modifyOtherKeys), goes as one bracketed paste instead.
+	claudeMaxUnbracketedNudgeBytes = 512
 	// Copilot CLI converts any single paste larger than 20 KiB into a
 	// workspace attachment. Keep each paste below that provider boundary and
 	// separate consecutive paste events so its TUI does not coalesce them.
@@ -2092,11 +2102,65 @@ func (t *Tmux) sendLiteralText(target, text string) error {
 	if len(text) > maxSendKeysLiteralLen {
 		return t.pasteLiteralText(target, text)
 	}
+	if claudeNeedsBracketedPaste(text) && t.targetIsClaudeFamily(target) && t.paneHasBracketedPasteOn(target) {
+		return t.pasteLiteralText(target, text)
+	}
 	_, err := t.run("send-keys", "-t", target, "-l", text)
 	if isCommandTooLongError(err) {
 		return t.pasteLiteralText(target, text)
 	}
 	return err
+}
+
+// claudeNeedsBracketedPaste reports whether text is too long, or spans lines,
+// to reach a claude target intact as keystrokes (see
+// claudeMaxUnbracketedNudgeBytes). It is checked before the provider lookup so
+// a short single-line nudge costs no extra tmux call.
+func claudeNeedsBracketedPaste(text string) bool {
+	return len(text) > claudeMaxUnbracketedNudgeBytes || strings.ContainsAny(text, "\r\n")
+}
+
+// paneHasBracketedPasteOn reports whether the application in target has turned
+// bracketed paste mode on (ESC[?2004h), as tmux's #{bracket_paste_flag} shows.
+// `paste-buffer -p` adds the ESC[200~ ... ESC[201~ markers only when that flag
+// is set. Without it tmux writes the text raw, each newline as a CR, so a
+// multi-line nudge would submit line by line, which is worse than keystrokes.
+// Any answer but "1", including a failed read, reports false, and the caller
+// keeps the send-keys path. It is read last, so only a claude nudge that
+// needs a paste pays for the extra tmux call.
+//
+// A tmux server older than 3.7 has no such format and renders it empty (see
+// paneBracketPasteFlag). There the mode cannot be confirmed, so claude nudges
+// keep the send-keys delivery they had before ga-6qfgdo: pasting blind would
+// trade the tail-only loss for line-by-line submits in any pane without the
+// mode, and this guard exists to rule that out.
+func (t *Tmux) paneHasBracketedPasteOn(target string) bool {
+	flag, err := t.paneBracketPasteFlag(target)
+	return err == nil && flag == "1"
+}
+
+// paneBracketPasteFlag returns target's #{bracket_paste_flag}, trimmed. tmux
+// 3.7 added the format and renders "1" or "0" for a pane. An older server
+// renders the unknown format as "", which therefore means "cannot tell", not
+// "off".
+func (t *Tmux) paneBracketPasteFlag(target string) (string, error) {
+	flag, err := t.run("display-message", "-t", target, "-p", "#{bracket_paste_flag}")
+	return strings.TrimSpace(flag), err
+}
+
+// targetIsClaudeFamily reports whether target runs a claude-family provider,
+// resolved the way submitVerifyEligible and nudgeSubmitKeySequence resolve a
+// family: the pane's GC_PROVIDER when set, otherwise a process-name sniff.
+//
+// Only claude is routed through bracketed paste below maxSendKeysLiteralLen.
+// The other families keep keystroke delivery there: how their TUIs take a
+// mid-size bracketed paste followed by their submit sequence is unverified
+// (codex's Escape-then-Enter was tuned against a send-keys burst).
+func (t *Tmux) targetIsClaudeFamily(target string) bool {
+	if provider := t.providerEnv(target); provider != "" {
+		return sessionlog.ProviderFamily(provider) == "claude"
+	}
+	return t.targetLooksLikeProvider(target, "claude")
 }
 
 func (t *Tmux) pasteLiteralText(target, text string) error {
@@ -4251,8 +4315,20 @@ func paneShowsDrainedComposer(lines []string, sent string) bool {
 	if draft != "" && strings.Contains(remainder, draft) {
 		return false
 	}
+	// Claude Code shows a paste over 800 characters, or with more than two
+	// line breaks, as a "[Pasted text #N +M lines]" placeholder, not its first
+	// line. Long
+	// nudges are pasted (see claudeNeedsBracketedPaste), so a composer
+	// holding that placeholder still holds the unsubmitted nudge.
+	if strings.Contains(remainder, claudePastePlaceholderPrefix) {
+		return false
+	}
 	return true
 }
+
+// claudePastePlaceholderPrefix begins the placeholder Claude Code's composer
+// shows in place of a long bracketed paste.
+const claudePastePlaceholderPrefix = "[Pasted text #"
 
 // lastComposerRemainder returns the text after the ready-prompt prefix on the
 // LAST captured line that matches it -- the live composer, since any earlier
