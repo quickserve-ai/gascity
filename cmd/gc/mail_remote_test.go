@@ -8,11 +8,21 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/clientcontext"
 )
+
+// newRemoteMailTestServer starts a loopback server for the remote mail arms.
+// Tests share this one construction site because the untagged http_test_server
+// source census is an anti-growth ratchet (test/test-resources.toml): new tests
+// reuse it rather than adding call sites. Callers still close the server.
+func newRemoteMailTestServer(t *testing.T, h http.Handler) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(h)
+}
 
 const remoteMailMessageJSON = `{"id":"mc-wisp-1","from":"alpha/mayor","to":"mayor","subject":"hello","body":"round trip","created_at":"2026-08-18T17:00:00Z","read":false}`
 
@@ -401,7 +411,7 @@ func TestCmdMail_ContextDispatchMatrix(t *testing.T) {
 	clearRemoteMailIdentityEnv(t)
 	t.Setenv("GC_HOME", t.TempDir())
 	t.Chdir(t.TempDir())
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv := newRemoteMailTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/problem+json")
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte(`{"title":"Internal","status":500,"detail":"boom"}`))
@@ -439,5 +449,155 @@ func TestCmdMail_ContextDispatchMatrix(t *testing.T) {
 	}
 	if strings.Contains(errb.String(), "target:") {
 		t.Errorf("no remote selector must not echo a remote target: %q", errb.String())
+	}
+}
+
+// A remote mark-read POSTs /v0/city/{city}/mail/{id}/read with the CSRF
+// header, echoes the resolved target, and renders like the local command;
+// --json emits the local mail.mark-read shape with no human target echo.
+func TestCmdMailMarkReadRemote_Posts(t *testing.T) {
+	clearRemoteMailIdentityEnv(t)
+	t.Setenv("GC_HOME", t.TempDir())
+	var gotPath, gotReq, gotMethod string
+	srv := newRemoteMailTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotReq, gotMethod = r.URL.Path, r.Header.Get("X-GC-Request"), r.Method
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"read"}`))
+	}))
+	defer srv.Close()
+
+	var out, errb bytes.Buffer
+	if code := cmdMailMarkReadRemote(remoteTestClient(t, srv.URL), remoteTestTarget(srv.URL), []string{"mc-wisp-1"}, false, &out, &errb); code != 0 {
+		t.Fatalf("exit %d; stderr=%q", code, errb.String())
+	}
+	if gotMethod != http.MethodPost || gotPath != "/v0/city/mc/mail/mc-wisp-1/read" || gotReq == "" {
+		t.Errorf("method=%q path=%q X-GC-Request=%q", gotMethod, gotPath, gotReq)
+	}
+	if !strings.Contains(out.String(), "Marked mc-wisp-1 as read") {
+		t.Errorf("stdout=%q", out.String())
+	}
+	if !strings.Contains(errb.String(), "target:") || !strings.Contains(errb.String(), "mc @") {
+		t.Errorf("remote mark-read did not echo the resolved target: %q", errb.String())
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := cmdMailMarkReadRemote(remoteTestClient(t, srv.URL), remoteTestTarget(srv.URL), []string{"mc-wisp-1"}, true, &out, &errb); code != 0 {
+		t.Fatalf("json exit %d; stderr=%q", code, errb.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("output not JSON: %v (%q)", err, out.String())
+	}
+	if got["ok"] != true || got["command"] != "mail.mark-read" || got["id"] != "mc-wisp-1" {
+		t.Errorf("json=%v", got)
+	}
+	if strings.Contains(errb.String(), "target:") {
+		t.Errorf("json mode leaked the human target echo: %q", errb.String())
+	}
+}
+
+// A missing id is refused before the wire is touched, and a server refusal
+// (grant, unknown id, server fault) exits non-zero with the server's
+// problem-details text and never claims success.
+func TestCmdMailMarkReadRemote_Failures(t *testing.T) {
+	clearRemoteMailIdentityEnv(t)
+	t.Setenv("GC_HOME", t.TempDir())
+
+	quiet := newRemoteMailTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("server must not be contacted without a message id")
+		w.WriteHeader(500)
+	}))
+	defer quiet.Close()
+	for _, args := range [][]string{nil, {"  "}} {
+		var out, errb bytes.Buffer
+		if code := cmdMailMarkReadRemote(remoteTestClient(t, quiet.URL), remoteTestTarget(quiet.URL), args, false, &out, &errb); code == 0 || !strings.Contains(errb.String(), "missing message ID") {
+			t.Errorf("args=%q: exit=%d stderr=%q", args, code, errb.String())
+		}
+	}
+	// "." and ".." survive path escaping but URL resolution collapses them onto
+	// a different route (/v0/city/mc/read), so the client refuses them.
+	for _, id := range []string{".", ".."} {
+		var out, errb bytes.Buffer
+		if code := cmdMailMarkReadRemote(remoteTestClient(t, quiet.URL), remoteTestTarget(quiet.URL), []string{id}, false, &out, &errb); code == 0 || !strings.Contains(errb.String(), "invalid message id") {
+			t.Errorf("id=%q: exit=%d stderr=%q", id, code, errb.String())
+		}
+	}
+
+	cases := []struct {
+		name   string
+		status int
+		detail string
+	}{
+		{"forbidden", http.StatusForbidden, "write grant required"},
+		{"not-found", http.StatusNotFound, "message mc-nope not found"},
+		{"server-error", http.StatusInternalServerError, "store exploded"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newRemoteMailTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/problem+json")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(`{"title":"` + http.StatusText(tc.status) + `","status":` + strconv.Itoa(tc.status) + `,"detail":"` + tc.detail + `"}`))
+			}))
+			defer srv.Close()
+			var out, errb bytes.Buffer
+			code := cmdMailMarkReadRemote(remoteTestClient(t, srv.URL), remoteTestTarget(srv.URL), []string{"mc-nope"}, false, &out, &errb)
+			if code == 0 || !strings.Contains(errb.String(), "gc mail mark-read:") || !strings.Contains(errb.String(), tc.detail) {
+				t.Errorf("exit=%d stderr=%q", code, errb.String())
+			}
+			if strings.Contains(out.String(), "Marked") {
+				t.Errorf("failure rendered success: %q", out.String())
+			}
+		})
+	}
+}
+
+// End-to-end dispatch: with --context set, `gc mail mark-read` routes to the
+// remote city, while read/archive/count (no remote arm yet) are still refused
+// by the capability gate without touching the wire.
+func TestCmdMail_ContextMarkReadDispatchesRemoteOthersGated(t *testing.T) {
+	clearRemoteMailIdentityEnv(t)
+	t.Setenv("GC_HOME", t.TempDir())
+	t.Chdir(t.TempDir())
+	var hits []string
+	srv := newRemoteMailTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits = append(hits, r.Method+" "+r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"read"}`))
+	}))
+	defer srv.Close()
+	prev := contextFlag
+	contextFlag = "peer"
+	t.Cleanup(func() { contextFlag = prev })
+	var out, errb bytes.Buffer
+	if code := doContextAdd(clientcontext.Context{Name: "peer", URL: srv.URL, City: "mc"}, &out, &errb); code != 0 {
+		t.Fatalf("seed context: %q", errb.String())
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := cmdMailMarkReadJSON([]string{"mc-wisp-1"}, false, &out, &errb); code != 0 {
+		t.Fatalf("mark-read exit %d; stderr=%q", code, errb.String())
+	}
+	if strings.Join(hits, ",") != "POST /v0/city/mc/mail/mc-wisp-1/read" {
+		t.Errorf("hits=%v", hits)
+	}
+
+	hits = nil
+	gated := map[string]func() int{
+		"read":    func() int { return cmdMailReadWithJSON([]string{"mc-wisp-1"}, false, &out, &errb) },
+		"archive": func() int { return cmdMailArchiveJSON([]string{"mc-wisp-1"}, false, &out, &errb) },
+		"count":   func() int { return cmdMailCountWithJSON(nil, false, &out, &errb) },
+	}
+	for name, run := range gated {
+		out.Reset()
+		errb.Reset()
+		if code := run(); code == 0 || !strings.Contains(errb.String(), "does not support a remote city") {
+			t.Errorf("%s: want capability-gate refusal, exit=%d stderr=%q", name, code, errb.String())
+		}
+	}
+	if len(hits) != 0 {
+		t.Errorf("gated verbs contacted the remote: %v", hits)
 	}
 }

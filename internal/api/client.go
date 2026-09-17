@@ -1400,6 +1400,32 @@ func (c *Client) ReplyMail(id string, req MailReplyRequest) (mail.Message, error
 	return mailMessageFromGen(*resp.JSON201), nil
 }
 
+// MarkMailRead marks message id read via POST /v0/city/{cityName}/mail/{id}/read.
+// It is a mutation: it carries the CSRF header and, on a remote client, the
+// city-write grant the transport mints per request. The operation is
+// idempotent server-side and reversible (mark-unread). A non-2xx response maps
+// through apiErrorFromResponse, so a 403/404/5xx surfaces with the server's
+// problem-details text rather than a bare status.
+func (c *Client) MarkMailRead(id string) error {
+	if err := c.requireCityScope(); err != nil {
+		return err
+	}
+	// "." and ".." survive path escaping but are collapsed by URL resolution,
+	// so they would POST a different route (e.g. /v0/city/{city}/read).
+	if id == "" || id == "." || id == ".." {
+		return fmt.Errorf("invalid message id %q", id)
+	}
+	params := &genclient.PostV0CityByCityNameMailByIdReadParams{XGCRequest: "true"}
+	resp, err := c.cw.PostV0CityByCityNameMailByIdReadWithResponse(context.Background(), c.cityName, id, params)
+	if err != nil {
+		return &connError{err: fmt.Errorf("request failed: %w", err)}
+	}
+	if resp == nil {
+		return &connError{err: fmt.Errorf("nil response")}
+	}
+	return apiErrorFromResponse(resp.StatusCode(), pdOf(resp))
+}
+
 // CountMail fetches total/unread message counts via
 // GET /v0/city/{cityName}/mail/count. An empty agent lets the server choose
 // the default caller identity; rig narrows to a single rig's provider.
