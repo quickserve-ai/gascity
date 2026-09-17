@@ -388,6 +388,74 @@ func TestRenderSupervisorLaunchdTemplateUsesPreserveEnvFromData(t *testing.T) {
 	}
 }
 
+// Without ExitTimeOut, launchd SIGKILLs a booted-out supervisor 5s after its
+// SIGTERM — the same length as a city's default stop grace, so any stop that
+// needs its grace is killed before it can write the clean-exit token
+// (ga-2jjk51: 28 of 107 signal stops on one machine). The plist must give the
+// supervisor one default city's whole worst-case DESTRUCTIVE stop (grace,
+// forced phase, then the bead provider's stop), and launchd must still drop
+// the job before install's unload wait gives up on it.
+func TestRenderSupervisorLaunchdTemplateCoversCityStopBudget(t *testing.T) {
+	content, err := renderSupervisorTemplate(supervisorLaunchdTemplate, &supervisorServiceData{
+		GCPath:       "/usr/local/bin/gc",
+		LogPath:      "/home/user/.gc/supervisor.log",
+		GCHome:       "/home/user/.gc",
+		LaunchdLabel: defaultSupervisorLaunchdLabel,
+		Path:         "/usr/local/bin:/usr/bin:/bin",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const key = "<key>ExitTimeOut</key>"
+	_, rest, found := strings.Cut(content, key)
+	if !found {
+		t.Fatalf("launchd template has no %s; launchd would kill a stopping supervisor after 5s:\n%s", key, content)
+	}
+	rest = strings.TrimSpace(rest)
+	value, _, found := strings.Cut(strings.TrimPrefix(rest, "<integer>"), "</integer>")
+	if !strings.HasPrefix(rest, "<integer>") || !found {
+		t.Fatalf("%s is not followed by an <integer>:\n%s", key, content)
+	}
+	seconds, err := strconv.Atoi(value)
+	if err != nil {
+		t.Fatalf("%s value %q: %v", key, value, err)
+	}
+	exitTimeout := time.Duration(seconds) * time.Second
+	// The 2s is the provider command's WaitDelay in runProviderOpWithEnv.
+	providerStop := providerOpTimeout("stop") + 2*time.Second
+	stopBudget := managedCityStopTimeout(nil) + managedCityForcedStopTimeout(nil) + providerStop
+	if exitTimeout <= stopBudget {
+		t.Errorf("ExitTimeOut = %s, want more than a default city's worst-case destructive stop of %s", exitTimeout, stopBudget)
+	}
+	if exitTimeout >= launchdRefreshWaitTimeout {
+		t.Errorf("ExitTimeOut = %s, want less than launchdRefreshWaitTimeout (%s) so a refresh sees the job unload", exitTimeout, launchdRefreshWaitTimeout)
+	}
+}
+
+// Every wait on a stopping launchd supervisor must outlast the plist's
+// ExitTimeOut. Before ga-2jjk51 launchd killed the job after 5s, which hid
+// waits that were shorter than a real stop: a longer grace turned them into
+// false "stop failed" reports while the stop was still going.
+func TestSupervisorStopWaitsOutlastLaunchdExitTimeout(t *testing.T) {
+	if supervisorStopWaitTimeout <= supervisorLaunchdExitTimeout {
+		t.Errorf("supervisorStopWaitTimeout = %s, want more than ExitTimeOut %s", supervisorStopWaitTimeout, supervisorLaunchdExitTimeout)
+	}
+	if got := supervisorLaunchctlTimeoutFor([]string{"unload", "/tmp/x.plist"}); got <= supervisorLaunchdExitTimeout {
+		t.Errorf("launchctl unload timeout = %s, want more than ExitTimeOut %s: unload blocks until the job exits", got, supervisorLaunchdExitTimeout)
+	}
+	if got := supervisorLaunchctlTimeoutFor([]string{"bootout", "gui/501/com.gascity.supervisor"}); got != supervisorLaunchctlTimeout {
+		t.Errorf("launchctl bootout timeout = %s, want the general %s: bootout signals and returns", got, supervisorLaunchctlTimeout)
+	}
+	cmd := newSupervisorStopCmd(io.Discard, io.Discard)
+	flag := cmd.Flags().Lookup("wait-timeout")
+	if flag == nil {
+		t.Fatal("gc supervisor stop has no --wait-timeout flag")
+	}
+	if flag.DefValue != supervisorStopWaitTimeout.String() {
+		t.Errorf("--wait-timeout default = %s, want %s", flag.DefValue, supervisorStopWaitTimeout)
+	}
+}
+
 func TestRenderSupervisorSystemdTemplate(t *testing.T) {
 	data := &supervisorServiceData{
 		GCPath:        "/usr/local/bin/gc",
@@ -4935,6 +5003,8 @@ func TestRunSupervisorSIGTERMPreservesSessionsEndToEnd(t *testing.T) {
 		"Preserving city '" + cityPath + "' sessions for re-adoption...",
 		"Preserving agent sessions for supervisor re-adoption.",
 		"City '" + cityPath + "' preserved.",
+		"gc supervisor: city '" + cityPath + "' stop took ",
+		"gc supervisor: stopping took ",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("stdout = %q, want %q; stderr=%q", got, want, stderr.String())

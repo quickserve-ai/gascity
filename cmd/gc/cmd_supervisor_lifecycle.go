@@ -55,16 +55,39 @@ var (
 	// launchdRefreshWaitTimeout bounds each wait inside a launchd refresh:
 	// a booted-out job leaving launchd, and the refreshed supervisor proving
 	// it serves the new build.
-	launchdRefreshWaitTimeout        = 90 * time.Second
-	supervisorPlistValidationTimeout = 2 * time.Second
-	supervisorLaunchdProbeTimeout    = time.Second
-	supervisorLaunchctlTimeout       = 10 * time.Second
-	supervisorLaunchctlRun           = func(args ...string) error {
-		ctx, cancel := context.WithTimeout(context.Background(), supervisorLaunchctlTimeout)
+	launchdRefreshWaitTimeout = 90 * time.Second
+	// supervisorPlistValidationTimeout bounds each plist preflight probe
+	// (plutil lint, plutil convert, gc version). The preflight runs before
+	// any bootout, so patience costs nothing on a healthy box, while a 2s
+	// bound failed the install exactly when the box was loaded: a healthy
+	// gc version took 2.98-5.66s at load average 58 (ga-jgwpjg).
+	supervisorPlistValidationTimeout = 30 * time.Second
+	// supervisorLaunchdExitTimeout is the plist's ExitTimeOut: how long
+	// launchd waits between the SIGTERM of a bootout and its SIGKILL. With
+	// no key launchd uses 5s, which equals a city's default stop grace, so
+	// a stop that needed its grace was killed before it finished
+	// (ga-2jjk51). It covers ONE city's worst-case destructive stop at
+	// default settings: 5s grace, 25s forced phase, then the bead
+	// provider's stop (30s plus a 2s WaitDelay), 62s in all, plus the
+	// supervisor's own teardown after that. A preserve-mode stop needs
+	// 30s. Several slow cities, or a larger shutdown_timeout, can still
+	// exceed it. It stays below launchdRefreshWaitTimeout so a refresh
+	// still sees the job unload.
+	supervisorLaunchdExitTimeout = 75 * time.Second
+	// supervisorStopWaitTimeout is how long gc waits for a supervisor it
+	// asked to stop. It must outlast supervisorLaunchdExitTimeout, or a
+	// stop that launchd is still allowing reads as a failed stop. It also
+	// matches systemd's default TimeoutStopSec.
+	supervisorStopWaitTimeout     = 90 * time.Second
+	supervisorLaunchdProbeTimeout = time.Second
+	supervisorLaunchctlTimeout    = 10 * time.Second
+	supervisorLaunchctlRun        = func(args ...string) error {
+		timeout := supervisorLaunchctlTimeoutFor(args)
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 		err := exec.CommandContext(ctx, "launchctl", args...).Run()
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return fmt.Errorf("launchctl %s timed out after %s", strings.Join(args, " "), supervisorLaunchctlTimeout)
+			return fmt.Errorf("launchctl %s timed out after %s", strings.Join(args, " "), timeout)
 		}
 		return err
 	}
@@ -981,14 +1004,16 @@ func validateSupervisorLaunchdPlist(path, label, expectedGCPath string) error {
 		return fmt.Errorf("gc executable %q is not executable", gcPath)
 	}
 	versionCtx, cancelVersion := context.WithTimeout(context.Background(), supervisorPlistValidationTimeout)
+	versionStarted := time.Now()
 	versionOutput, err := exec.CommandContext(versionCtx, gcPath, "version").CombinedOutput()
+	versionElapsed := time.Since(versionStarted).Round(time.Millisecond)
 	versionTimedOut := errors.Is(versionCtx.Err(), context.DeadlineExceeded)
 	cancelVersion()
 	if err != nil {
 		if versionTimedOut {
 			return fmt.Errorf("gc executable %q version check timed out after %s", gcPath, supervisorPlistValidationTimeout)
 		}
-		return fmt.Errorf("gc executable %q failed execution check: %w", gcPath, err)
+		return fmt.Errorf("gc executable %q failed execution check after %s: %w", gcPath, versionElapsed, err)
 	}
 	if len(versionOutput) == 0 {
 		return fmt.Errorf("gc executable %q returned empty output from version check", gcPath)
@@ -1738,6 +1763,8 @@ const supervisorLaunchdTemplate = `<?xml version="1.0" encoding="UTF-8"?>
     </array>
     <key>RunAtLoad</key>
     <true/>
+    <key>ExitTimeOut</key>
+    <integer>{{launchdExitTimeoutSeconds}}</integer>
     <key>KeepAlive</key>
     <dict>
         <key>Crashed</key>
@@ -1819,8 +1846,25 @@ func supervisorSystemdQuotePath(s string) string {
 	return s
 }
 
+// supervisorLaunchctlTimeoutFor bounds one launchctl call. A legacy
+// "unload" of a running job blocks until the process exits, which launchd
+// allows to take up to the plist's ExitTimeOut; bounding it at the general
+// 10s would report a stop that is still in progress as failed. Every other
+// subcommand returns promptly (bootout signals and returns).
+func supervisorLaunchctlTimeoutFor(args []string) time.Duration {
+	if len(args) > 0 && args[0] == "unload" {
+		return supervisorLaunchdExitTimeout + supervisorLaunchctlTimeout
+	}
+	return supervisorLaunchctlTimeout
+}
+
 func renderSupervisorTemplate(tmplStr string, data *supervisorServiceData) (string, error) {
-	funcMap := template.FuncMap{"xmlesc": xmlEscape, "systemdenv": systemdEnv, "systemdpath": supervisorSystemdQuotePath}
+	funcMap := template.FuncMap{
+		"xmlesc":                    xmlEscape,
+		"systemdenv":                systemdEnv,
+		"systemdpath":               supervisorSystemdQuotePath,
+		"launchdExitTimeoutSeconds": func() int { return int(supervisorLaunchdExitTimeout / time.Second) },
+	}
 	tmpl, err := template.New("service").Funcs(funcMap).Parse(tmplStr)
 	if err != nil {
 		return "", err
@@ -2389,7 +2433,7 @@ func uninstallSupervisorLaunchd(_ *supervisorServiceData, stdout, stderr io.Writ
 		// Socket-protocol stop, never the delegated redirect: uninstall is
 		// cleaning up gc's OWN service and must not stop an operator's
 		// delegated unit (or require systemctl on darwin) as a side effect.
-		if code := stopSupervisorViaSocket(stdout, stderr, true, 30*time.Second); code != 0 {
+		if code := stopSupervisorViaSocket(stdout, stderr, true, supervisorStopWaitTimeout); code != 0 {
 			return code
 		}
 	} else if active {
@@ -2666,7 +2710,7 @@ func uninstallSupervisorSystemd(_ *supervisorServiceData, stdout, stderr io.Writ
 		// Socket-protocol stop, never the delegated redirect: uninstall is
 		// cleaning up gc's OWN unit and must not stop an operator's
 		// delegated unit as a side effect.
-		if code := stopSupervisorViaSocket(stdout, stderr, true, 30*time.Second); code != 0 {
+		if code := stopSupervisorViaSocket(stdout, stderr, true, supervisorStopWaitTimeout); code != 0 {
 			return code
 		}
 	}

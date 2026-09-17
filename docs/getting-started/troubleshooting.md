@@ -478,7 +478,7 @@ With the unit configured:
   to run, and `gc supervisor uninstall` only removes gc's own legacy
   service.
 - `gc supervisor stop` runs `systemctl [--user] stop <unit>`
-  synchronously, bounded by `--wait-timeout` (default 30s) whether or
+  synchronously, bounded by `--wait-timeout` (default 90s) whether or
   not `--wait` is set, then verifies a previously-running supervisor
   actually exited. A live supervisor the unit does not manage (common
   mid-migration) fails the stop with its PID instead of reporting a
