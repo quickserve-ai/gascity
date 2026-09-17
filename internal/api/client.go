@@ -1257,6 +1257,28 @@ func (c *Client) ListMailInbox(agent, rig string) (CachedRead[MailListView], err
 // one page per call, so a caller that wants the whole mailbox loops until
 // NextCursor is empty.
 func (c *Client) ListMailInboxPage(agent, rig, cursor string, limit int) (CachedRead[MailListView], error) {
+	ctx, cancel := mailReadContext()
+	defer cancel()
+	return c.listMailInboxPage(ctx, agent, rig, cursor, limit)
+}
+
+// ListMailInboxWithTimeout is ListMailInbox bounded by timeout instead of
+// mailReadClientTimeout, for a caller that must give up sooner than a full
+// mail read is allowed to take without shortening that deadline for every
+// other mail read (ga-c3omvr: the prompt-submit inject hook's probe). A
+// non-positive timeout uses mailReadClientTimeout. A request cut off by the
+// timeout fails as a transport error (IsConnError), the same as any other
+// abandoned request.
+func (c *Client) ListMailInboxWithTimeout(agent, rig string, timeout time.Duration) (CachedRead[MailListView], error) {
+	if timeout <= 0 {
+		timeout = mailReadClientTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return c.listMailInboxPage(ctx, agent, rig, "", 0)
+}
+
+func (c *Client) listMailInboxPage(ctx context.Context, agent, rig, cursor string, limit int) (CachedRead[MailListView], error) {
 	if err := c.requireCityScope(); err != nil {
 		return CachedRead[MailListView]{}, err
 	}
@@ -1274,8 +1296,6 @@ func (c *Client) ListMailInboxPage(agent, rig, cursor string, limit int) (Cached
 		l := int64(limit)
 		params.Limit = &l
 	}
-	ctx, cancel := mailReadContext()
-	defer cancel()
 	resp, err := c.cw.GetV0CityByCityNameMailWithResponse(ctx, c.cityName, params)
 	if err != nil {
 		return CachedRead[MailListView]{}, &connError{err: fmt.Errorf("request failed: %w", err)}
