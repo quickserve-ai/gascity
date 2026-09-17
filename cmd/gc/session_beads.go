@@ -3701,8 +3701,12 @@ func assigneePreserveSet(preserve []string) map[string]struct{} {
 // Best-effort: errors are logged to stderr but never fail the caller, since
 // releaseOrphanedPoolAssignments at the top of the next reconcile tick is
 // our idempotent fallback.
-func releaseWorkFromClosedSessionBead(store beads.Store, cfg *config.City, sessionBead beads.Bead, stderr io.Writer) {
-	releaseWorkFromClosedSessionBeadExcept(store, cfg, sessionBead, nil, stderr)
+//
+// It passes no city config, so releasableAssigneeIdentities takes its
+// metadata-only branch. closeBead calls releaseWorkFromClosedSessionBeadExcept
+// with the loaded config instead.
+func releaseWorkFromClosedSessionBead(store beads.Store, sessionBead beads.Bead, stderr io.Writer) {
+	releaseWorkFromClosedSessionBeadExcept(store, nil, sessionBead, nil, stderr)
 }
 
 // releaseWorkFromClosedSessionBeadExcept is releaseWorkFromClosedSessionBead
