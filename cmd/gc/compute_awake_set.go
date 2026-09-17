@@ -98,6 +98,19 @@ type AwakeWorkBead struct {
 	// releases the session's scale slot, which can wake a different session
 	// as scaled:demand.
 	Blocked bool
+	// CertParked is true when an in_progress bead is parked on a certification
+	// wait (beadmeta.CertParkSuppressesAssignedWake: hold:cert-wait with no
+	// cert:landed / cert:action), as read LIVE for this tick — never from the
+	// controller's cached row, whose labels the reconcile scan skips. A parked
+	// bead is still owned, but its owner can do nothing with it until the
+	// cert-landing-patrol flips it, so it is not wake demand (ga-mzovhi,
+	// doctrine ga-5zosxs). Removing the hold label is what restores demand, so
+	// the patrol's durable flip wakes the owner without relying on its nudge.
+	//
+	// Like Blocked, it is not purely suppressive: it also releases the owner's
+	// scale slot (countAssignedScaleSlots), which is the pivot the doctrine
+	// asks for — a parked seat's slot is capacity for other work.
+	CertParked bool
 }
 
 // AwakeDecision is the output for a single session.
@@ -116,6 +129,12 @@ type AwakeDecision struct {
 	// restart-style cycle so the next wake starts a fresh conversation on
 	// the newly assigned bead.
 	RequiresFreshCycle bool
+	// HasCertParkedWork is true when the session owns at least one in_progress
+	// bead marked CertParked. The reconciler reads it to keep a parked owner
+	// out of the stranded-worker repair: an asleep pool seat with no wake
+	// reason that still holds in_progress work is otherwise reaped as stranded,
+	// which would unassign the parked bead the patrol later flips (ga-mzovhi).
+	HasCertParkedWork bool
 }
 
 // ComputeAwakeSet determines which sessions should be awake.
@@ -406,12 +425,20 @@ func ComputeAwakeSet(input AwakeInput) map[string]AwakeDecision {
 
 	// Step 2-3: Decide awake
 	result := make(map[string]AwakeDecision)
+	anyCertParked := false
+	for _, wb := range input.WorkBeads {
+		if wb.CertParked {
+			anyCertParked = true
+			break
+		}
+	}
 
 	for _, bead := range input.SessionBeads {
 		name := bead.SessionName
 		anchor, hasAssignedWork := assignedAnchor[name]
 		decision := AwakeDecision{
-			HasAssignedWork: hasAssignedWork,
+			HasAssignedWork:   hasAssignedWork,
+			HasCertParkedWork: anyCertParked && sessionHasCertParkedWork(input.WorkBeads, input.NamedSessions, bead),
 		}
 		if hasAssignedWork {
 			decision.AssignedWorkBeadID = anchor
@@ -753,10 +780,21 @@ func sessionHasClaimedInProgressWork(workBeads []AwakeWorkBead, named []AwakeNam
 	return false
 }
 
+// sessionHasCertParkedWork reports whether the session owns in_progress work
+// parked on a certification wait (AwakeWorkBead.CertParked).
+func sessionHasCertParkedWork(workBeads []AwakeWorkBead, named []AwakeNamedSession, bead AwakeSessionBead) bool {
+	for _, wb := range workBeads {
+		if wb.Status == "in_progress" && wb.CertParked && sessionAssigneeMatches(named, bead, strings.TrimSpace(wb.Assignee)) {
+			return true
+		}
+	}
+	return false
+}
+
 func workBeadHasAwakeDemand(bead AwakeWorkBead) bool {
 	switch bead.Status {
 	case "in_progress":
-		return !bead.Blocked
+		return !bead.Blocked && !bead.CertParked
 	case "open":
 		return bead.Ready
 	default:

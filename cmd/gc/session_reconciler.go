@@ -4203,11 +4203,14 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 	for i := range orderedIDs {
 		sessionInfos[i] = infoByID[orderedIDs[i]]
 	}
-	awakeInput, runtimeObservationErrors := buildAwakeInputFromReconcilerWithObservationErrors(
+	awakeInput, awakeWorkSources, runtimeObservationErrors := buildAwakeInputFromReconcilerWithWorkSources(
 		cfg, cityPath, sessionInfos, poolDesired, namedSessionDemand, namedRoutedDemand, workSet, readyWaitSet,
 		assignedWorkBeads, reconcileOpts.readyAssignedFlags, wakeTargets, sp, clk.Now(),
 	)
-	awakeDecisions := ComputeAwakeSet(awakeInput)
+	// A bead parked for certification is not wake demand for its sleeping owner
+	// (ga-mzovhi); the park is read live from the store each row came through.
+	awakeDecisions := computeAwakeSetWithCertParks(&awakeInput, awakeWorkSources,
+		newLiveCertParkedWorkProbe(assignedWorkBeads, reconcileOpts.assignedWorkStores, stderr))
 	wakeEvals := awakeSetToWakeEvals(awakeDecisions, awakeInput.SessionBeads)
 
 	// Resolve full sleep policies before idle probe selection. ComputeAwakeSet
@@ -4662,7 +4665,13 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		// keep the same bead so later wake/restart happens in place instead
 		// of minting a fresh canonical owner.
 		hasAssignedWork := false
-		poolFreeable := !shouldWake && !target.alive && isPoolSessionSlotFreeableInfo(info) && isPoolManagedSessionInfo(info) && !isNamedSessionInfo(info)
+		// A seat whose only assigned work is parked for certification is asleep
+		// by design, not stranded (ga-mzovhi): before parked work stopped being
+		// wake demand, the assigned-work wake kept such a seat out of this gate,
+		// and without that the stranded repair below would unassign the parked
+		// bead and leave the cert-landing-patrol's flip with no owner to wake.
+		poolFreeable := !shouldWake && !target.alive && isPoolSessionSlotFreeableInfo(info) && isPoolManagedSessionInfo(info) && !isNamedSessionInfo(info) &&
+			!certParkedOwnerDecision(decision, hasDec)
 		if poolFreeable {
 			var assignedErr error
 			hasAssignedWork, assignedErr = sessionHasOpenAssignedWorkForReachableStore(cityPath, cfg, store, rigStores, info)
