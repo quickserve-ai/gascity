@@ -1219,6 +1219,9 @@ func TestSupervisorStatusInvalidDelegationScope(t *testing.T) {
 // is delegated to an operator-managed unit.
 func TestSupervisorInstallRefusesDelegation(t *testing.T) {
 	t.Setenv("GC_HOME", t.TempDir())
+	// The deploy-freeze guard runs before the delegation guard and reads
+	// $HOME/.gc, not GC_HOME: isolate it from the operator's real marker.
+	t.Setenv("HOME", t.TempDir())
 	setDelegationEnvForTest(t, "gascity-prod.service", "")
 
 	var stdout, stderr bytes.Buffer
@@ -1234,6 +1237,9 @@ func TestSupervisorInstallRefusesDelegation(t *testing.T) {
 
 func TestSupervisorInstallInvalidDelegationScopeFails(t *testing.T) {
 	t.Setenv("GC_HOME", t.TempDir())
+	// The deploy-freeze guard runs before the delegation guard and reads
+	// $HOME/.gc, not GC_HOME: isolate it from the operator's real marker.
+	t.Setenv("HOME", t.TempDir())
 	setDelegationEnvForTest(t, "gascity-prod.service", "remote")
 
 	var stdout, stderr bytes.Buffer
