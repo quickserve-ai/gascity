@@ -906,7 +906,7 @@ export type EventEmitRequest = {
     type: string;
 };
 
-export type EventPayload = AdapterEventPayload | BackendCredentialResolvedPayload | BeadClaimRejectedPayload | BeadClaimReleasedPayload | BeadDeadAssigneeReopenedPayload | BeadEventPayload | BeadWorktreeReapSkippedPayload | BeadWorktreeReapedPayload | BoundEventPayload | CityCreateSucceededPayload | CityLifecyclePayload | CityUnregisterSucceededPayload | ConditionalWritesDegradedPayload | ControlRootSettleFailedPayload | ControlStalledPayload | ExecutionClaimStalledPayload | ExecutionClaimWindowExpiredPayload | ExecutionStepStalledPayload | GroupCreatedEventPayload | HookClaimReclaimedStalePayload | InboundEventPayload | MailEventPayload | MoleculeResolvedPayload | NoPayload | OrderSuppressedPayload | OutboundChannelMismatchPayload | OutboundEventPayload | ProjectIdentityStampedPayload | Record | RequestFailedPayload | RigCreateSucceededPayload | RigProvisionProgressPayload | RotatedPayload | SessionCreateSucceededPayload | SessionDemandClaimDivergencePayload | SessionDrainAckedWithAssignedWorkPayload | SessionLifecyclePayload | SessionMessageSucceededPayload | SessionResetStalledPayload | SessionStrandedPayload | SessionSubmitSucceededPayload | SessionUnknownStatePayload | SessionWakeRefusedPayload | StorageBindingOutcomePayload | StoreDiskCriticalPayload | StoreDiskWarnPayload | StoreMaintenanceDonePayload | StoreMaintenanceFailedPayload | SupervisorFsPressureSkippedTickPayload | SupervisorRequestPayload | SupervisorShutdownPayload | SupervisorStartedPayload | UnboundEventPayload | WebhookReceivedPayload | WebhookRejectedPayload | WorkerOperationEventPayload;
+export type EventPayload = AdapterEventPayload | BackendCredentialResolvedPayload | BeadClaimRejectedPayload | BeadClaimReleasedPayload | BeadDeadAssigneeReopenedPayload | BeadEventPayload | BeadWorktreeReapSkippedPayload | BeadWorktreeReapedPayload | BoundEventPayload | CityCreateSucceededPayload | CityLifecyclePayload | CityUnregisterSucceededPayload | ConditionalWritesDegradedPayload | ControlRootSettleFailedPayload | ControlStalledPayload | ExecutionClaimStalledPayload | ExecutionClaimWindowExpiredPayload | ExecutionStepStalledPayload | GroupCreatedEventPayload | HookClaimReclaimedStalePayload | InboundEventPayload | MailEventPayload | MoleculeResolvedPayload | NoPayload | OrderSuppressedPayload | OutboundChannelMismatchPayload | OutboundEventPayload | ProjectIdentityStampedPayload | Record | RequestFailedPayload | RigCreateSucceededPayload | RigProvisionProgressPayload | RotatedPayload | SessionCreateSucceededPayload | SessionDemandClaimDivergencePayload | SessionDrainAckedWithAssignedWorkPayload | SessionLifecyclePayload | SessionMessageSucceededPayload | SessionReleaseDeferredPayload | SessionResetStalledPayload | SessionStrandedPayload | SessionSubmitSucceededPayload | SessionUnknownStatePayload | SessionWakeRefusedPayload | StorageBindingOutcomePayload | StoreDiskCriticalPayload | StoreDiskWarnPayload | StoreMaintenanceDonePayload | StoreMaintenanceFailedPayload | SupervisorFsPressureSkippedTickPayload | SupervisorRequestPayload | SupervisorShutdownPayload | SupervisorStartedPayload | UnboundEventPayload | WebhookReceivedPayload | WebhookRejectedPayload | WorkerOperationEventPayload;
 
 export type EventRotateAnchor = {
     /**
@@ -3272,6 +3272,45 @@ export type SessionPermissionModeBody = {
  */
 export type SessionRawMessageFrame = unknown;
 
+export type SessionReleaseDeferredPayload = {
+    /**
+     * "full" when the pre-close session bead was read, "id_only" when it could not be and only the resolved session ID is known.
+     */
+    capture: string;
+    /**
+     * True when the obligation was published through the store's compare-and-set metadata primitive, which makes the write-once guarantee hold across concurrent close processes. False means the store lacked that capability and a read-then-write fallback was used, which two simultaneous closes could race.
+     */
+    conditional_write: boolean;
+    /**
+     * Obligation generation. 1 for a first publish; higher only when a degraded ID-only obligation was later replaced by a full capture. A drain acknowledges one generation, never the key as a whole.
+     */
+    generation: number;
+    /**
+     * Every identifier under which work could be assigned to this session, captured BEFORE the close mutated them. Untruncated.
+     */
+    identities?: Array<string> | null;
+    /**
+     * Why the obligation write failed, when MarkerPersisted is false.
+     */
+    marker_error?: string;
+    /**
+     * Whether the obligation was durably written to the session bead. False means the deferred release is unrecoverable by any automated path.
+     */
+    marker_persisted: boolean;
+    /**
+     * Why the city config was unavailable, as reported at close time.
+     */
+    reason?: string;
+    /**
+     * False when rig stores could not be enumerated (the usual case here, since enumerating them needs the config that failed to load). A drain must treat false as "scope unknown", never as "no rig stores".
+     */
+    rig_stores_known: boolean;
+    /**
+     * Canonical session bead ID whose close withheld the release (also the envelope Subject).
+     */
+    session_id: string;
+};
+
 export type SessionRenameInputBody = {
     /**
      * New session title.
@@ -5403,6 +5442,8 @@ export type TypedEventStreamEnvelope = ({
 } & TypedEventStreamEnvelopeSessionMaxAgeKilled) | ({
     type: 'session.quarantined';
 } & TypedEventStreamEnvelopeSessionQuarantined) | ({
+    type: 'session.release_deferred';
+} & TypedEventStreamEnvelopeSessionReleaseDeferred) | ({
     type: 'session.reset_stalled';
 } & TypedEventStreamEnvelopeSessionResetStalled) | ({
     type: 'session.stopped';
@@ -6855,6 +6896,24 @@ export type TypedEventStreamEnvelopeSessionQuarantined = {
 };
 
 /**
+ * TypedEventStreamEnvelope session.release_deferred
+ */
+export type TypedEventStreamEnvelopeSessionReleaseDeferred = {
+    actor: string;
+    depends_on_step_ids?: Array<string>;
+    message?: string;
+    payload: SessionReleaseDeferredPayload;
+    run_id?: string;
+    seq: number;
+    session_id?: string;
+    step_id?: string;
+    subject?: string;
+    ts: string;
+    type: 'session.release_deferred';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
  * TypedEventStreamEnvelope session.reset_stalled
  */
 export type TypedEventStreamEnvelopeSessionResetStalled = {
@@ -7410,6 +7469,8 @@ export type TypedTaggedEventStreamEnvelope = ({
 } & TypedTaggedEventStreamEnvelopeSessionMaxAgeKilled) | ({
     type: 'session.quarantined';
 } & TypedTaggedEventStreamEnvelopeSessionQuarantined) | ({
+    type: 'session.release_deferred';
+} & TypedTaggedEventStreamEnvelopeSessionReleaseDeferred) | ({
     type: 'session.reset_stalled';
 } & TypedTaggedEventStreamEnvelopeSessionResetStalled) | ({
     type: 'session.stopped';
@@ -8936,6 +8997,25 @@ export type TypedTaggedEventStreamEnvelopeSessionQuarantined = {
     subject?: string;
     ts: string;
     type: 'session.quarantined';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedTaggedEventStreamEnvelope session.release_deferred
+ */
+export type TypedTaggedEventStreamEnvelopeSessionReleaseDeferred = {
+    actor: string;
+    city: string;
+    depends_on_step_ids?: Array<string>;
+    message?: string;
+    payload: SessionReleaseDeferredPayload;
+    run_id?: string;
+    seq: number;
+    session_id?: string;
+    step_id?: string;
+    subject?: string;
+    ts: string;
+    type: 'session.release_deferred';
     workflow?: WorkflowEventProjection;
 };
 

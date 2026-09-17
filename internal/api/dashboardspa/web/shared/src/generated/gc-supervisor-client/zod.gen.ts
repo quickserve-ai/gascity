@@ -1726,6 +1726,18 @@ export const zSessionPermissionModeBody = z.object({
  */
 export const zSessionRawMessageFrame = z.unknown();
 
+export const zSessionReleaseDeferredPayload = z.object({
+    capture: z.string(),
+    conditional_write: z.boolean(),
+    generation: z.coerce.bigint().min(BigInt('-9223372036854775808'), { error: 'Invalid value: Expected int64 to be >= -9223372036854775808' }).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }),
+    identities: z.array(z.string()).nullish(),
+    marker_error: z.string().optional(),
+    marker_persisted: z.boolean(),
+    reason: z.string().optional(),
+    rig_stores_known: z.boolean(),
+    session_id: z.string()
+});
+
 export const zSessionRenameInputBody = z.object({
     title: z.string().min(1)
 });
@@ -3351,6 +3363,7 @@ export const zEventPayload = z.union([
     zSessionDrainAckedWithAssignedWorkPayload,
     zSessionLifecyclePayload,
     zSessionMessageSucceededPayload,
+    zSessionReleaseDeferredPayload,
     zSessionResetStalledPayload,
     zSessionStrandedPayload,
     zSessionSubmitSucceededPayload,
@@ -4866,6 +4879,24 @@ export const zTypedEventStreamEnvelopeSessionQuarantined = z.object({
 });
 
 /**
+ * TypedEventStreamEnvelope session.release_deferred
+ */
+export const zTypedEventStreamEnvelopeSessionReleaseDeferred = z.object({
+    actor: z.string(),
+    depends_on_step_ids: z.array(z.string()).optional(),
+    message: z.string().optional(),
+    payload: zSessionReleaseDeferredPayload,
+    run_id: z.string().optional(),
+    seq: z.coerce.bigint().gte(BigInt(0)).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }),
+    session_id: z.string().optional(),
+    step_id: z.string().optional(),
+    subject: z.string().optional(),
+    ts: z.iso.datetime(),
+    type: z.literal('session.release_deferred'),
+    workflow: zWorkflowEventProjection.optional()
+});
+
+/**
  * TypedEventStreamEnvelope session.reset_stalled
  */
 export const zTypedEventStreamEnvelopeSessionResetStalled = z.object({
@@ -5344,6 +5375,7 @@ export const zTypedEventStreamEnvelope = z.discriminatedUnion('type', [
     zTypedEventStreamEnvelopeSessionIdleKilled.extend({ type: z.literal('session.idle_killed') }),
     zTypedEventStreamEnvelopeSessionMaxAgeKilled.extend({ type: z.literal('session.max_age_killed') }),
     zTypedEventStreamEnvelopeSessionQuarantined.extend({ type: z.literal('session.quarantined') }),
+    zTypedEventStreamEnvelopeSessionReleaseDeferred.extend({ type: z.literal('session.release_deferred') }),
     zTypedEventStreamEnvelopeSessionResetStalled.extend({ type: z.literal('session.reset_stalled') }),
     zTypedEventStreamEnvelopeSessionStopped.extend({ type: z.literal('session.stopped') }),
     zTypedEventStreamEnvelopeSessionStranded.extend({ type: z.literal('session.stranded') }),
@@ -6860,6 +6892,25 @@ export const zTypedTaggedEventStreamEnvelopeSessionQuarantined = z.object({
 });
 
 /**
+ * TypedTaggedEventStreamEnvelope session.release_deferred
+ */
+export const zTypedTaggedEventStreamEnvelopeSessionReleaseDeferred = z.object({
+    actor: z.string(),
+    city: z.string(),
+    depends_on_step_ids: z.array(z.string()).optional(),
+    message: z.string().optional(),
+    payload: zSessionReleaseDeferredPayload,
+    run_id: z.string().optional(),
+    seq: z.coerce.bigint().gte(BigInt(0)).max(BigInt('9223372036854775807'), { error: 'Invalid value: Expected int64 to be <= 9223372036854775807' }),
+    session_id: z.string().optional(),
+    step_id: z.string().optional(),
+    subject: z.string().optional(),
+    ts: z.iso.datetime(),
+    type: z.literal('session.release_deferred'),
+    workflow: zWorkflowEventProjection.optional()
+});
+
+/**
  * TypedTaggedEventStreamEnvelope session.reset_stalled
  */
 export const zTypedTaggedEventStreamEnvelopeSessionResetStalled = z.object({
@@ -7360,6 +7411,7 @@ export const zTypedTaggedEventStreamEnvelope = z.discriminatedUnion('type', [
     zTypedTaggedEventStreamEnvelopeSessionIdleKilled.extend({ type: z.literal('session.idle_killed') }),
     zTypedTaggedEventStreamEnvelopeSessionMaxAgeKilled.extend({ type: z.literal('session.max_age_killed') }),
     zTypedTaggedEventStreamEnvelopeSessionQuarantined.extend({ type: z.literal('session.quarantined') }),
+    zTypedTaggedEventStreamEnvelopeSessionReleaseDeferred.extend({ type: z.literal('session.release_deferred') }),
     zTypedTaggedEventStreamEnvelopeSessionResetStalled.extend({ type: z.literal('session.reset_stalled') }),
     zTypedTaggedEventStreamEnvelopeSessionStopped.extend({ type: z.literal('session.stopped') }),
     zTypedTaggedEventStreamEnvelopeSessionStranded.extend({ type: z.literal('session.stranded') }),
