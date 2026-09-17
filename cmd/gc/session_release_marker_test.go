@@ -78,7 +78,7 @@ func TestDeferredReleasePublishesFullPreCloseCapture(t *testing.T) {
 	})
 
 	result := publishDeferredReleaseObligation(store, bead.ID,
-		buildSessionReleaseObligation(bead, true, "loading city config: unexpected EOF", false, time.Now()))
+		buildSessionReleaseObligation(bead, true, "loading city config: unexpected EOF", time.Now()))
 
 	if !result.Persisted || !result.Published {
 		t.Fatalf("publish result = %+v, want persisted and published; err=%v", result, result.Err)
@@ -127,7 +127,7 @@ func TestDeferredReleaseNeverOverwrittenByARetiredSecondClose(t *testing.T) {
 	})
 
 	first := publishDeferredReleaseObligation(store, bead.ID,
-		buildSessionReleaseObligation(bead, true, "first close", false, time.Now()))
+		buildSessionReleaseObligation(bead, true, "first close", time.Now()))
 	if !first.Published {
 		t.Fatalf("first publish did not land: %+v", first)
 	}
@@ -142,7 +142,7 @@ func TestDeferredReleaseNeverOverwrittenByARetiredSecondClose(t *testing.T) {
 		"alias_history":                      "worker-ga-abc12",
 	}}
 	second := publishDeferredReleaseObligation(store, bead.ID,
-		buildSessionReleaseObligation(retired, true, "second close", false, time.Now()))
+		buildSessionReleaseObligation(retired, true, "second close", time.Now()))
 	if second.Published {
 		t.Error("the second close REPUBLISHED over a complete obligation; " +
 			"it must leave a complete obligation exactly as it stands")
@@ -179,7 +179,7 @@ func TestDeferredReleaseUpgradesIDOnlyCaptureAndBumpsGeneration(t *testing.T) {
 
 	// captureOK=false: the pre-close read failed, so only the ID is known.
 	degraded := publishDeferredReleaseObligation(store, bead.ID,
-		buildSessionReleaseObligation(beads.Bead{ID: bead.ID}, false, "read failed", false, time.Now()))
+		buildSessionReleaseObligation(beads.Bead{ID: bead.ID}, false, "read failed", time.Now()))
 	if !degraded.Published {
 		t.Fatalf("degraded publish did not land: %+v", degraded)
 	}
@@ -188,7 +188,7 @@ func TestDeferredReleaseUpgradesIDOnlyCaptureAndBumpsGeneration(t *testing.T) {
 	}
 
 	upgraded := publishDeferredReleaseObligation(store, bead.ID,
-		buildSessionReleaseObligation(bead, true, "later close read the bead", false, time.Now()))
+		buildSessionReleaseObligation(bead, true, "later close read the bead", time.Now()))
 	if !upgraded.Published {
 		t.Errorf("a full capture did not replace an id_only obligation: %+v", upgraded)
 	}
@@ -214,11 +214,11 @@ func TestDeferredReleaseNeverDowngradesAFullCapture(t *testing.T) {
 	bead := seedSessionBead(t, store, map[string]string{"session_name": "worker-named"})
 
 	if r := publishDeferredReleaseObligation(store, bead.ID,
-		buildSessionReleaseObligation(bead, true, "full", false, time.Now())); !r.Published {
+		buildSessionReleaseObligation(bead, true, "full", time.Now())); !r.Published {
 		t.Fatalf("full publish did not land: %+v", r)
 	}
 	if r := publishDeferredReleaseObligation(store, bead.ID,
-		buildSessionReleaseObligation(beads.Bead{ID: bead.ID}, false, "degraded", false, time.Now())); r.Published {
+		buildSessionReleaseObligation(beads.Bead{ID: bead.ID}, false, "degraded", time.Now())); r.Published {
 		t.Error("an id_only capture overwrote a full one")
 	}
 
@@ -244,7 +244,7 @@ func TestDeferredReleaseLeavesAnUndecodableObligationAlone(t *testing.T) {
 	}
 
 	result := publishDeferredReleaseObligation(store, bead.ID,
-		buildSessionReleaseObligation(bead, true, "later close", false, time.Now()))
+		buildSessionReleaseObligation(bead, true, "later close", time.Now()))
 	if result.Published {
 		t.Error("the publisher overwrote an obligation it could not read")
 	}
@@ -280,7 +280,7 @@ func TestDeferredReleaseFallbackReportsTheLostAtomicity(t *testing.T) {
 	}
 
 	first := publishDeferredReleaseObligation(store, bead.ID,
-		buildSessionReleaseObligation(bead, true, "fallback first", false, time.Now()))
+		buildSessionReleaseObligation(bead, true, "fallback first", time.Now()))
 	if !first.Published {
 		t.Fatalf("fallback publish did not land: %+v", first)
 	}
@@ -290,7 +290,7 @@ func TestDeferredReleaseFallbackReportsTheLostAtomicity(t *testing.T) {
 	}
 
 	second := publishDeferredReleaseObligation(store, bead.ID,
-		buildSessionReleaseObligation(bead, true, "fallback second", false, time.Now()))
+		buildSessionReleaseObligation(bead, true, "fallback second", time.Now()))
 	if second.Published {
 		t.Error("the fallback overwrote a complete obligation")
 	}
@@ -316,7 +316,7 @@ func TestDeferredReleaseAnnouncesAnUnrecordableObligation(t *testing.T) {
 	store := storeWithoutConditionalWrites{Store: failingStore{Store: inner}}
 
 	var stderr bytes.Buffer
-	result := deferMissingConfigWorkRelease(store, bead.ID, bead, true, "config gone", false, nil, time.Now(), &stderr)
+	result := deferMissingConfigWorkRelease(store, bead.ID, bead, true, "config gone", nil, time.Now(), &stderr)
 
 	if result.Persisted {
 		t.Fatalf("result claims the obligation persisted through a failing store: %+v", result)
@@ -349,7 +349,7 @@ func TestDeferredReleaseEmitsAnObservableEvent(t *testing.T) {
 
 	rec := &deferredReleaseRecorder{}
 	var stderr bytes.Buffer
-	deferMissingConfigWorkRelease(store, bead.ID, bead, true, "config gone", false, rec, time.Now(), &stderr)
+	deferMissingConfigWorkRelease(store, bead.ID, bead, true, "config gone", rec, time.Now(), &stderr)
 
 	if len(rec.recorded) != 1 {
 		t.Fatalf("recorded %d events, want exactly 1", len(rec.recorded))
@@ -414,7 +414,7 @@ func TestDeferredReleaseReportsAFailedConditionalPublish(t *testing.T) {
 	}
 
 	var stderr bytes.Buffer
-	result := deferMissingConfigWorkRelease(store, bead.ID, bead, true, "config gone", false, nil, time.Now(), &stderr)
+	result := deferMissingConfigWorkRelease(store, bead.ID, bead, true, "config gone", nil, time.Now(), &stderr)
 
 	if result.Persisted || result.Published {
 		t.Fatalf("result = %+v, want neither persisted nor published when the swap failed", result)
@@ -472,7 +472,7 @@ func TestDeferredReleaseUsesMetadataCASThroughAPolicyShapedWrapper(t *testing.T)
 	}
 
 	result := publishDeferredReleaseObligation(store, bead.ID,
-		buildSessionReleaseObligation(bead, true, "config gone", false, time.Now()))
+		buildSessionReleaseObligation(bead, true, "config gone", time.Now()))
 
 	if !result.Published {
 		t.Fatalf("publish did not land through the wrapper: %+v", result)
@@ -497,7 +497,7 @@ func TestDeferredReleaseWillNotCallAClosedBeadsSnapshotComplete(t *testing.T) {
 
 	// Invocation A: its pre-close read failed, so only the ID is known.
 	if r := publishDeferredReleaseObligation(store, bead.ID,
-		buildSessionReleaseObligation(beads.Bead{ID: bead.ID}, false, "read failed", false, time.Now())); !r.Published {
+		buildSessionReleaseObligation(beads.Bead{ID: bead.ID}, false, "read failed", time.Now())); !r.Published {
 		t.Fatalf("degraded publish did not land: %+v", r)
 	}
 
@@ -512,7 +512,7 @@ func TestDeferredReleaseWillNotCallAClosedBeadsSnapshotComplete(t *testing.T) {
 			"alias_history": "worker-ga-abc12",
 		},
 	}
-	obligation := buildSessionReleaseObligation(retiredAndClosed, true, "second close", false, time.Now())
+	obligation := buildSessionReleaseObligation(retiredAndClosed, true, "second close", time.Now())
 	if obligation.Capture != releaseCaptureIDOnly {
 		t.Errorf("Capture = %q, want %q: a closed bead cannot yield a pre-retirement capture",
 			obligation.Capture, releaseCaptureIDOnly)
@@ -550,7 +550,7 @@ func TestDeferredReleaseLeavesAnUnrecognizedObligationAlone(t *testing.T) {
 			}
 
 			result := publishDeferredReleaseObligation(store, bead.ID,
-				buildSessionReleaseObligation(bead, true, "later close", false, time.Now()))
+				buildSessionReleaseObligation(bead, true, "later close", time.Now()))
 			if result.Published {
 				t.Error("an unrecognized obligation was overwritten")
 			}
@@ -580,7 +580,7 @@ func TestDeferredReleaseAdviceDoesNotPromiseARerunRecovery(t *testing.T) {
 	bead := seedSessionBead(t, store, map[string]string{"session_name": "worker-named"})
 
 	var stderr bytes.Buffer
-	deferMissingConfigWorkRelease(store, bead.ID, bead, true, "config gone", false, nil, time.Now(), &stderr)
+	deferMissingConfigWorkRelease(store, bead.ID, bead, true, "config gone", nil, time.Now(), &stderr)
 	out := stderr.String()
 
 	if bytes.Contains([]byte(out), []byte("Re-run this close once the city config loads")) {
@@ -602,7 +602,7 @@ func TestDeferredReleaseEventDoesNotClaimTheCloseHappened(t *testing.T) {
 
 	rec := &deferredReleaseRecorder{}
 	var stderr bytes.Buffer
-	deferMissingConfigWorkRelease(store, bead.ID, bead, true, "config gone", false, rec, time.Now(), &stderr)
+	deferMissingConfigWorkRelease(store, bead.ID, bead, true, "config gone", rec, time.Now(), &stderr)
 
 	if len(rec.recorded) != 1 {
 		t.Fatalf("recorded %d events, want 1", len(rec.recorded))
@@ -625,7 +625,7 @@ func TestDeferredReleaseFailedUpgradeStillReportsTheExistingObligation(t *testin
 	inner := beads.NewMemStore()
 	bead := seedSessionBead(t, inner, map[string]string{"session_name": "worker-named"})
 	if r := publishDeferredReleaseObligation(inner, bead.ID,
-		buildSessionReleaseObligation(beads.Bead{ID: bead.ID}, false, "degraded first", false, time.Now())); !r.Published {
+		buildSessionReleaseObligation(beads.Bead{ID: bead.ID}, false, "degraded first", time.Now())); !r.Published {
 		t.Fatalf("degraded publish did not land: %+v", r)
 	}
 
@@ -633,7 +633,7 @@ func TestDeferredReleaseFailedUpgradeStillReportsTheExistingObligation(t *testin
 	// upgrade takes the unconditional path and its Update fails.
 	store := storeWithoutConditionalWrites{Store: failingStore{Store: inner}}
 	var stderr bytes.Buffer
-	result := deferMissingConfigWorkRelease(store, bead.ID, bead, true, "second close", false, nil, time.Now(), &stderr)
+	result := deferMissingConfigWorkRelease(store, bead.ID, bead, true, "second close", nil, time.Now(), &stderr)
 
 	if !result.Persisted {
 		t.Error("a failed UPGRADE reported nothing persisted, but the earlier obligation is still there")
