@@ -263,16 +263,19 @@ func filterAssignedWorkBeadsForPoolDemand(
 		// and every seat it spawns finds an empty hook (#6207, parent #4114).
 		// Ask the serve side's own predicate instead — after the target template
 		// is resolved, because whether that predicate is even the right one is a
-		// property of the agent (see vetoesWakeCandidate).
+		// property of the agent (see vetoesWakeCandidate), and after the
+		// reachability check, so the record names only rows this gate removed.
+		if !assignedWorkIndexReachableFromAgentOnClaimRefs(cityPath, cfg, agentCfg, assignedWorkStoreRefs, i, claimRefs) {
+			continue
+		}
 		if i < len(assignedWorkStoreRefs) {
 			_, claimantLive := eligibleClaimants[strings.TrimSpace(wb.Assignee)]
 			if wakeReady.vetoesWakeCandidate(wb, agentCfg, claimantLive, assignedWorkStoreRefs[i]) {
+				wakeReady.reportWithheld(assignedWorkStoreRefs[i], wb, template)
 				continue
 			}
 		}
-		if assignedWorkIndexReachableFromAgentOnClaimRefs(cityPath, cfg, agentCfg, assignedWorkStoreRefs, i, claimRefs) {
-			filtered = append(filtered, wb)
-		}
+		filtered = append(filtered, wb)
 	}
 	return filtered
 }
