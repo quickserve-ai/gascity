@@ -197,7 +197,8 @@ Remove the temporary worktree after the body reaches terminal state.
 
 The removal is SECURE-BEFORE-DESTROY (ga-6xehc5 / ga-8as9s3): the worktree may
 hold the only copy of the work — uncommitted WIP, or commits reachable from no
-remote ref. Teardown first commits any WIP and makes HEAD reachable from
+remote ref. Teardown first commits any WIP (ignoring harness sediment such as
+.claude/ and AGENTS-gc.md, which is never work) and makes HEAD reachable from
 origin (branch push, falling back to refs/rescue/<bead-id>); if that cannot be
 done, the step FAILS instead of destroying the tree. A repeated failure
 surfaces through the step's retry policy (hard_fail) rather than silently
@@ -215,8 +216,14 @@ WORKTREE=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata.work_dir // 
 if [ -n "$WORKTREE" ] && [ -d "$WORKTREE" ]; then
   (
     cd "$WORKTREE" || exit 1
-    if [ -n "$(git status --porcelain)" ]; then
-      git add -A
+    # gc materializes harness files into every worktree, untracked and not
+    # gitignored (40 entries under .claude/skills/ measured in a qcore worktree).
+    # They are sediment, not work: the same set bead_worktree_reaper.go filters.
+    # Without these excludes a sediment-only tree counted as dirty, and teardown
+    # committed the skills into the work branch and pushed it, usually a PR head.
+    SEDIMENT_EXCLUDES=(':(exclude).claude' ':(exclude).omp' ':(exclude).beads' ':(exclude)AGENTS-gc.md' ':(exclude).worktree-stale')
+    if [ -n "$(git status --porcelain -- . "${SEDIMENT_EXCLUDES[@]}")" ]; then
+      git add -A -- . "${SEDIMENT_EXCLUDES[@]}" || exit 1
       git commit -m "rescue(${WORK_BEAD_ID}): WIP secured by cleanup-worktree before teardown" || exit 1
     fi
     # HEAD already reachable from a remote ref => nothing to secure.
