@@ -33,8 +33,12 @@ func TestMakeInstallFailsClosedWhenCopyFails(t *testing.T) {
 		}
 	}
 
+	// The install target runs the BUILT binary's freeze gate before it copies
+	// anything. A non-executable stand-in failed that gate, so make exited
+	// before cp and this test passed without reaching the copy it is about
+	// (ga-bztbqf). The stand-in must pass the gate for cp to run.
 	sourceBinary := filepath.Join(buildDir, "gc")
-	if err := os.WriteFile(sourceBinary, []byte("new binary"), 0o755); err != nil {
+	if err := os.WriteFile(sourceBinary, []byte("#!/usr/bin/env sh\n# new binary\nexit 0\n"), 0o755); err != nil {
 		t.Fatalf("write source binary: %v", err)
 	}
 	installedBinary := filepath.Join(installDir, "gc")
@@ -42,7 +46,9 @@ func TestMakeInstallFailsClosedWhenCopyFails(t *testing.T) {
 		t.Fatalf("write installed binary: %v", err)
 	}
 
+	cpInvoked := filepath.Join(tmp, "cp-invoked")
 	writeExecutable(t, filepath.Join(binDir, "cp"), `#!/usr/bin/env sh
+: > "`+cpInvoked+`"
 for last do :; done
 printf 'partial binary' > "$last"
 exit 1
@@ -75,6 +81,9 @@ exit 1
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		t.Fatalf("make install succeeded after cp failure:\n%s", out)
+	}
+	if _, statErr := os.Stat(cpInvoked); statErr != nil {
+		t.Fatalf("make install failed before reaching cp, so the copy failure was never exercised:\n%s", out)
 	}
 
 	content, readErr := os.ReadFile(installedBinary)
