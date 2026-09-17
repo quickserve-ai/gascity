@@ -685,6 +685,14 @@ func advanceSessionDrainsWithSessionsTraced(
 			dt.remove(id)
 			continue
 		}
+		if info.LivenessReadDegraded {
+			// The overlay read failed, so generation and sleep_intent below are
+			// committed values: the generation check would cancel a live drain as
+			// stale, and completeDrain would drop a standing hold's intent under a
+			// fenced write (fork PR #59 review, item 1). Keep the drain tracked
+			// and advance it on a later tick's real read.
+			continue
+		}
 		// The whole scan runs off the typed Info: decision reads (session_name,
 		// generation, template), the drain-complete write (completeDrain → store),
 		// the cancel checks (cancelSessionDrainFor*Info), verifiedStop, and the
