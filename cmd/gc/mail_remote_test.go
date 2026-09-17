@@ -14,6 +14,15 @@ import (
 	"github.com/gastownhall/gascity/internal/clientcontext"
 )
 
+// newRemoteMailTestServer starts a loopback server for the remote mail arms.
+// Tests share this one construction site because the untagged http_test_server
+// source census is an anti-growth ratchet (test/test-resources.toml): new tests
+// reuse it rather than adding call sites. Callers still close the server.
+func newRemoteMailTestServer(t *testing.T, h http.Handler) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(h)
+}
+
 const remoteMailMessageJSON = `{"id":"mc-wisp-1","from":"alpha/mayor","to":"mayor","subject":"hello","body":"round trip","created_at":"2026-08-18T17:00:00Z","read":false}`
 
 // clearRemoteMailIdentityEnv strips the identity env so tests control the
@@ -401,7 +410,7 @@ func TestCmdMail_ContextDispatchMatrix(t *testing.T) {
 	clearRemoteMailIdentityEnv(t)
 	t.Setenv("GC_HOME", t.TempDir())
 	t.Chdir(t.TempDir())
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv := newRemoteMailTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/problem+json")
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte(`{"title":"Internal","status":500,"detail":"boom"}`))

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"text/tabwriter"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -40,6 +41,26 @@ const (
 	mailCheckDegradedNotice        = "[mail check degraded — store slow; run 'gc mail inbox' when the factory load drops]"
 	mailCheckPartialDegradedNotice = "[mail check degraded — partial provider read; run 'gc mail inbox' after the provider recovers]"
 )
+
+// mailInjectProbeTimeout bounds the supervisor inbox read that
+// `gc mail check --inject` makes before it injects (ga-c3omvr). That hook runs
+// on every prompt submit and is killed at 15s (`gc hook run --timeout 15s`,
+// internal/hooks/config/claude.json). The probe only decides whether to print
+// a degraded notice; the injection and its archive side effects happen on the
+// local path after it.
+//
+// It is deliberately independent of the mail read deadlines (25s server
+// defaultMailReadDeadline, 30s client mailReadClientTimeout, ga-x49mfh). Those
+// are sized so a slow store reaches `gc mail check`, `gc mail inbox` and the
+// pollers as a typed store_slow error, and both exceed the whole hook: a probe
+// that inherited them held the hook until it was killed, stalling prompt
+// submit for 15s and injecting nothing that turn. A probe that runs out of
+// time fails as a transport error, which ShouldFallbackForRead sends to the
+// local path, so local mail still injects with at least 10s of the hook left.
+const mailInjectProbeTimeout = 5 * time.Second
+
+// mailInjectProbeDeadline is the live inject probe deadline; tests shorten it.
+var mailInjectProbeDeadline = mailInjectProbeTimeout
 
 type mailInboxJSONResult struct {
 	SchemaVersion string         `json:"schema_version"`
@@ -585,7 +606,7 @@ func routeMailCheck(_ string, args []string, inject bool, hookFormat string, c *
 	}
 	if inject {
 		if c != nil {
-			cr, err := c.ListMailInbox(recipient, "")
+			cr, err := c.ListMailInboxWithTimeout(recipient, "", mailInjectProbeDeadline)
 			if err == nil {
 				if mailListHasPartial(cr.Body) {
 					logRoute(stderr, cmdName, "api", "error")
