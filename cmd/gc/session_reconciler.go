@@ -1225,12 +1225,22 @@ func finalizeDrainAckStoppedSession(
 	// lifecycle in one fenced write, since held_until is a cell key
 	// ApplyLifecycle refuses. A live heartbeat hold refuses PreWake, so the
 	// seat stays down for the cooldown; an operator's wake clears it.
+	//
+	// The cooldown extends a hold and never shortens one. A held_until already
+	// past the cooldown is somebody else's hold — gc session suspend's
+	// indefinite sentinel, or an agent keep-alive — and overwriting it releases
+	// that hold early (EvHeartbeat leaves a suspend's own Until alone, but it
+	// replaces a longer heartbeat hold): a suspended always+fresh seat was respawned when the
+	// five-minute stamp expired, with no operator act (fork PR #59 review,
+	// item 3).
 	if !hasAssignedWork &&
 		info.WakeMode == "fresh" &&
 		strings.TrimSpace(info.ConfiguredNamedMode) == "always" {
 		cooldownUntil := clk.Now().Add(freshWakeHeartbeatCooldown).UTC()
-		write = func(id string, patch sessionpkg.MetadataPatch) (sessionpkg.MetadataPatch, error) {
-			return applyDrainAckWithHeartbeatCooldown(store, id, patch, cooldownUntil, clk.Now())
+		if !metadataTimeInFuture(info.HeldUntil, cooldownUntil) {
+			write = func(id string, patch sessionpkg.MetadataPatch) (sessionpkg.MetadataPatch, error) {
+				return applyDrainAckWithHeartbeatCooldown(store, id, patch, cooldownUntil, clk.Now())
+			}
 		}
 	}
 	written, err := write(info.ID, batch)
