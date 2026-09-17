@@ -400,7 +400,7 @@ func delegatedLivenessWithoutSocket(d systemdDelegation) string {
 // contract is preserved.
 func delegatedSupervisorStop(d systemdDelegation, stdout, stderr io.Writer, wait bool, waitTimeout time.Duration, jsonOut bool) int {
 	if waitTimeout <= 0 {
-		waitTimeout = 30 * time.Second
+		waitTimeout = supervisorStopWaitTimeout
 	}
 	pidBefore := supervisorAliveHook()
 	if pidBefore == 0 && !delegatedUnitActive(d) {
