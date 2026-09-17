@@ -334,3 +334,108 @@ func TestReconcileSessionBeads_DegradedLivenessReadDefersStandingHoldDrainAck(t 
 		}
 	}
 }
+
+// TestReconcileSessionBeads_WaitHoldReleasedOnDegradedReadFreesPoolSlot is
+// woodhouse's review item 2 on fork PR #59. clearSessionWaitHold drops
+// sleep_reason only when a PersistedMarkers read confirms "wait-hold", and that
+// read goes through the fail-open overlay. A release during an outage therefore
+// cleared the wait gate (fenced) and left the reason in the liveness table,
+// where it kept the asleep pool seat out of the slot gate for good: the wait
+// bead was already terminal, so nothing retried the release. The Phase-0 heal
+// clears the stranded reason on the next real read, and never on a degraded one.
+func TestReconcileSessionBeads_WaitHoldReleasedOnDegradedReadFreesPoolSlot(t *testing.T) {
+	backing := beads.NewMemStore()
+	lv := liveness.NewMemStore()
+	lvNow := time.Date(2026, 9, 17, 12, 0, 0, 0, time.UTC)
+	lv.Clock = func() time.Time { return lvNow }
+	overlay := func(store liveness.Store) beads.Store {
+		return wrapStoreWithBeadPolicies(backing, &config.City{}, newLivenessBindingForTest(store, liveness.ModeTable))
+	}
+
+	env := newReconcilerTestEnv()
+	env.store = overlay(lv)
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+	// A desired pool seat with no demand: its slot is decided by the pool-slot
+	// gate alone, which is where a stranded reason bites.
+	env.addDesired("worker", "worker", false)
+	seat := env.createSessionBead("worker", "worker")
+	// A wait-parked pool seat after its drain completed under the hold.
+	env.setSessionMetadata(&seat, map[string]string{
+		"pool_managed": "true",
+		"state":        "asleep",
+		"sleep_reason": string(sessionpkg.SleepReasonWaitHold),
+		"slept_at":     env.clk.Now().Add(-time.Hour).UTC().Format(time.RFC3339),
+		"wait_hold":    "true",
+		"sleep_intent": string(sessionpkg.SleepReasonWaitHold),
+	})
+
+	// The wait resolves while the overlay is down.
+	lvNow = lvNow.Add(time.Minute)
+	down := &unreachableLivenessStore{MemStore: lv}
+	if err := clearSessionWaitHold(sessionFrontDoor(overlay(down)), seat.ID); err != nil {
+		t.Fatalf("clearSessionWaitHold: %v", err)
+	}
+	if down.reads == 0 {
+		t.Fatalf("the release never read through the unreachable store; the test proves nothing")
+	}
+
+	// The pool recovers: the gate is gone, its reason is not.
+	lvNow = lvNow.Add(time.Minute)
+	env.store = overlay(lv)
+	stranded := env.sessionInfo(seat.ID)
+	if stranded.WaitHold != "" || stranded.SleepIntent != "" {
+		t.Fatalf("precondition: the degraded release did not land (wait_hold=%q sleep_intent=%q)", stranded.WaitHold, stranded.SleepIntent)
+	}
+	if stranded.SleepReason != string(sessionpkg.SleepReasonWaitHold) || isPoolSessionSlotFreeableInfo(stranded) {
+		t.Fatalf("precondition: want the reason stranded and the slot refused after a degraded release; sleep_reason=%q freeable=%v",
+			stranded.SleepReason, isPoolSessionSlotFreeableInfo(stranded))
+	}
+
+	// A degraded read is never healed: its fields are committed values.
+	degradedFront := sessionFrontDoor(overlay(&unreachableLivenessStore{MemStore: lv}))
+	degraded, err := degradedFront.Get(seat.ID)
+	if err != nil {
+		t.Fatalf("degraded Get: %v", err)
+	}
+	if !degraded.LivenessReadDegraded {
+		t.Fatalf("a read through the unreachable store did not project LivenessReadDegraded")
+	}
+	degraded.SleepReason = string(sessionpkg.SleepReasonWaitHold) // the stale shape a fallback write could leave committed
+	if healed := healReleasedWaitHoldReasonInfo(degraded, degradedFront); healed.SleepReason != degraded.SleepReason {
+		t.Errorf("the heal acted on a degraded read (sleep_reason %q -> %q)", degraded.SleepReason, healed.SleepReason)
+	}
+	if committed, err := backing.Get(seat.ID); err != nil {
+		t.Fatalf("backing Get: %v", err)
+	} else if _, wrote := committed.Metadata[liveness.FenceKeyFor("sleep_reason")]; wrote {
+		t.Errorf("the heal wrote sleep_reason from a degraded read: %v", committed.Metadata)
+	}
+
+	// A healthy tick heals the reason, and the pool-slot arm reclaims the seat.
+	reconcileSessionBeads(
+		context.Background(), []beads.Bead{mustGetBead(t, env.store, seat.ID)}, env.desiredState,
+		map[string]bool{"worker": true}, env.cfg, env.sp, env.store, nil, nil, nil, env.dt,
+		map[string]int{}, false, nil, "",
+		nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr, env.startOptions...,
+	)
+	after, err := env.store.Get(seat.ID)
+	if err != nil {
+		t.Fatalf("Get(%s): %v", seat.ID, err)
+	}
+	if after.Status != "closed" {
+		info := env.sessionInfo(seat.ID)
+		t.Errorf("released wait-hold seat still holds its pool slot after a healthy tick: status=%q state=%q sleep_reason=%q freeable=%v; stderr=%s",
+			after.Status, info.MetadataState, info.SleepReason, isPoolSessionSlotFreeableInfo(info), env.stderr.String())
+	}
+
+	// Control: a seat whose wait still stands keeps its reason.
+	held := env.createSessionBead("worker-held", "worker")
+	env.setSessionMetadata(&held, map[string]string{
+		"pool_managed": "true",
+		"state":        "asleep",
+		"sleep_reason": string(sessionpkg.SleepReasonWaitHold),
+		"wait_hold":    "true",
+	})
+	if got := healReleasedWaitHoldReasonInfo(env.sessionInfo(held.ID), sessionFrontDoor(env.store)); got.SleepReason != string(sessionpkg.SleepReasonWaitHold) {
+		t.Errorf("the heal cleared the reason of a seat whose wait still stands (sleep_reason=%q)", got.SleepReason)
+	}
+}
