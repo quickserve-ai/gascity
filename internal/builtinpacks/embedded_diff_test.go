@@ -112,16 +112,22 @@ func TestDiffEmbeddedPackDetectsChangedContent(t *testing.T) {
 	}
 }
 
-// TestDiffEmbeddedPackDetectsLostExecutableBit covers the failure that reads as
-// nothing at all: bytes match, the order execs the script, and the shell
-// reports a permission error with no reference to the pack.
-func TestDiffEmbeddedPackDetectsLostExecutableBit(t *testing.T) {
+// TestDiffEmbeddedPackIgnoresFileMode pins a decision that the first version of
+// this comparison got wrong in the other direction.
+//
+// gc's MaterializedFileMode assigns 0755 to every .sh/.py/.bash path and 0644
+// to everything else — a function of the file's NAME, carrying no information
+// about whether its content is current. Git's tracked modes legitimately
+// disagree (core's kimi session-start hook is tracked 100644, materialized
+// 0755), so comparing modes fired on a faithful checkout of the pack at the
+// binary's own revision. Mode is not content.
+func TestDiffEmbeddedPackIgnoresFileMode(t *testing.T) {
 	pack, dir := materializeCorePack(t)
-	var script string
 	manifest, err := manifestForFS(pack.FS)
 	if err != nil {
 		t.Fatalf("manifestForFS: %v", err)
 	}
+	var script string
 	for rel, entry := range manifest {
 		if entry.perm.Perm()&0o111 != 0 {
 			script = rel
@@ -138,8 +144,8 @@ func TestDiffEmbeddedPackDetectsLostExecutableBit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DiffEmbeddedPack: %v", err)
 	}
-	if len(div.Differing) != 1 || div.Differing[0] != script {
-		t.Fatalf("Differing = %v, want [%s]", div.Differing, script)
+	if div.Count() != 0 {
+		t.Fatalf("a mode-only change was reported as divergence: %s", div.Summary(10))
 	}
 }
 
@@ -187,6 +193,87 @@ func TestDiffEmbeddedPackCountsTestFilesSeparately(t *testing.T) {
 	}
 	if div.TestOnly != 1 {
 		t.Fatalf("TestOnly = %d, want 1", div.TestOnly)
+	}
+}
+
+// TestDiffEmbeddedPackAgainstTheRealSourceTreeIsClean is the fixture the rest
+// of this file was missing, and it is the one that matters most.
+//
+// Every other test here materializes the pack through materializeFS, which
+// writes exactly the embedded set — so a clean result proves only that the
+// comparison agrees with itself. A real checkout is a SUPERSET of the embedded
+// set: it carries embed.go (the file that selects what gets embedded, so it can
+// never be inside it) and a README. Diffing the repository's own pack source at
+// this binary's revision is the closest thing to what a correctly-pinned fork
+// looks like on disk, and it must be silent. If it is not, the divergence
+// report is permanently non-empty for cities that are doing nothing wrong —
+// and a report that always fires is a report nobody reads.
+func TestDiffEmbeddedPackAgainstTheRealSourceTreeIsClean(t *testing.T) {
+	pack, ok := ByName("core")
+	if !ok {
+		t.Fatal("ByName(core) = !ok")
+	}
+	// Tests run in the package directory.
+	src := filepath.Join("..", "bootstrap", "packs", "core")
+	if _, err := os.Stat(filepath.Join(src, "embed.go")); err != nil {
+		t.Skipf("pack source tree not available at %s: %v", src, err)
+	}
+	div, err := DiffEmbeddedPack(pack, src)
+	if err != nil {
+		t.Fatalf("DiffEmbeddedPack: %v", err)
+	}
+	if div.Count() != 0 {
+		t.Fatalf("the pack's own source tree reports divergence from the binary that embeds it: %s", div.Summary(40))
+	}
+	// And prove the exclusion is doing real work rather than the tree simply
+	// having nothing extra: embed.go is there and must have been counted.
+	if div.SourceOnly == 0 {
+		t.Fatal("SourceOnly = 0, but the source tree carries at least embed.go — the exclusion is not being exercised")
+	}
+}
+
+// TestDiffEmbeddedPackReportsASymlinkedExtra keeps a symlinked script from
+// being a silent clean result: it executes exactly like a regular file.
+func TestDiffEmbeddedPackReportsASymlinkedExtra(t *testing.T) {
+	pack, dir := materializeCorePack(t)
+	target := filepath.Join(dir, "pack.toml")
+	link := filepath.Join(dir, "sneaky.sh")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("cannot create symlink: %v", err)
+	}
+	div, err := DiffEmbeddedPack(pack, dir)
+	if err != nil {
+		t.Fatalf("DiffEmbeddedPack: %v", err)
+	}
+	if len(div.Extra) != 1 || div.Extra[0] != "sneaky.sh" {
+		t.Fatalf("Extra = %v, want [sneaky.sh]", div.Extra)
+	}
+}
+
+// TestDiffEmbeddedPackCountsGoSourceAsSourceOnly pins the rule directly, so a
+// later change to isSourceOnly has to break a named expectation.
+func TestDiffEmbeddedPackCountsGoSourceAsSourceOnly(t *testing.T) {
+	pack, dir := materializeCorePack(t)
+	for name, content := range map[string]string{
+		"embed.go":  "package core\n",
+		"README.md": "# core\n",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatalf("WriteFile(%s): %v", name, err)
+		}
+	}
+	div, err := DiffEmbeddedPack(pack, dir)
+	if err != nil {
+		t.Fatalf("DiffEmbeddedPack: %v", err)
+	}
+	if div.Count() != 0 {
+		t.Fatalf("source-only files counted as divergence: %s", div.Summary(10))
+	}
+	if div.SourceOnly != 2 {
+		t.Fatalf("SourceOnly = %d, want 2", div.SourceOnly)
+	}
+	if !strings.Contains(div.Summary(10), "never embedded") {
+		t.Fatalf("Summary does not disclose the exclusion: %q", div.Summary(10))
 	}
 }
 

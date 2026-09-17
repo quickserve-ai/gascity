@@ -351,10 +351,19 @@ func TestCheckInstalledFallsBackToGitCheckoutForBundledSource(t *testing.T) {
 	if report.ErrorCount() != 0 {
 		t.Fatalf("issues = %#v, want no errors", report.Issues)
 	}
+	sawDivergence := false
 	for _, issue := range report.Issues {
 		if issue.Code != "bundled-pack-content-diverged" {
 			t.Fatalf("unexpected issue %q: %#v", issue.Code, issue)
 		}
+		sawDivergence = true
+	}
+	// Require it, rather than merely tolerating it: a loop that only rejects
+	// OTHER codes passes just as happily when the report is empty, which would
+	// let the divergence leg go silently missing behind a comment claiming it
+	// is asserted here.
+	if !sawDivergence {
+		t.Fatalf("want the content-divergence notice for a stub checkout, got %#v", report.Issues)
 	}
 }
 
