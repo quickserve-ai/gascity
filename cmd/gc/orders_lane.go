@@ -293,7 +293,9 @@ func (cr *CityRuntime) dispatchOrders(ctx context.Context, cityRoot string, boot
 // order-tracking bead before pruning — on a slow store with a large closed
 // backlog that would hold readiness for the whole pass
 // (gastownhall/gascity#6429). The first lane pass runs the watchdog; the other
-// watchdogs still run on the boot pass.
+// watchdogs still run on the boot pass. This moves the pass, it does not
+// shorten it: the first lane pass still runs the watchdog inline, so the same
+// list delays that pass's order dispatch (gastownhall/gascity#2604).
 func (cr *CityRuntime) dispatchOrdersLocked(ctx context.Context, cityRoot string, generation uint64, cfg *config.City, bootDispatch bool) {
 	if ctx.Err() != nil {
 		return
@@ -313,7 +315,7 @@ func (cr *CityRuntime) dispatchOrdersLocked(ctx context.Context, cityRoot string
 		// #6429: skip without stamping orderTrackingRetentionWatchdogLast, so the
 		// first lane pass still finds the watchdog due.
 		if cr.stderr != nil {
-			fmt.Fprintf(cr.stderr, "%s: order-tracking retention watchdog: deferred on boot to the first steady-state tick\n", cr.logPrefix) //nolint:errcheck // best-effort stderr
+			fmt.Fprintf(cr.stderr, "%s: order-tracking retention watchdog: deferred on boot; it runs inline on the first orders-lane pass\n", cr.logPrefix) //nolint:errcheck // best-effort stderr
 		}
 	} else {
 		cr.runOrderTrackingRetentionWatchdog(cfg, now)
