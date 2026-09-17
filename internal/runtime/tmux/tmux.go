@@ -2687,7 +2687,7 @@ func (t *Tmux) sendLiteralText(ctx context.Context, target, text string) error {
 	if len(text) > maxSendKeysLiteralLen || t.pastesMultilineText(target, text) {
 		return t.pasteLiteralText(ctx, target, text)
 	}
-	if claudeNeedsBracketedPaste(text) && t.targetIsClaudeFamily(target) {
+	if claudeNeedsBracketedPaste(text) && t.targetIsClaudeFamily(target) && t.paneHasBracketedPasteOn(target) {
 		return t.pasteLiteralText(ctx, target, text)
 	}
 	_, err := t.runCtx(ctx, append([]string{"send-keys", "-t", paneTarget(target), "-l"}, runtime.TmuxLiteralArgs(text)...)...)
@@ -2713,6 +2713,19 @@ func (t *Tmux) pastesMultilineText(target, text string) bool {
 // a short single-line nudge costs no extra tmux call.
 func claudeNeedsBracketedPaste(text string) bool {
 	return len(text) > claudeMaxUnbracketedNudgeBytes || strings.ContainsAny(text, "\r\n")
+}
+
+// paneHasBracketedPasteOn reports whether the application in target has turned
+// bracketed paste mode on (ESC[?2004h), as tmux's #{bracket_paste_flag} shows.
+// `paste-buffer -p` adds the ESC[200~ ... ESC[201~ markers only when that flag
+// is set. Without it tmux writes the text raw, each newline as a CR, so a
+// multi-line nudge would submit line by line, which is worse than keystrokes.
+// Any answer but "1", including a failed read, reports false, and the caller
+// keeps the send-keys path. It is read last, so only a claude nudge that
+// needs a paste pays for the extra tmux call.
+func (t *Tmux) paneHasBracketedPasteOn(target string) bool {
+	flag, err := t.run("display-message", "-t", target, "-p", "#{bracket_paste_flag}")
+	return err == nil && strings.TrimSpace(flag) == "1"
 }
 
 // targetIsClaudeFamily reports whether target runs a claude-family provider,
