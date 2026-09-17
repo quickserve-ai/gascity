@@ -58,6 +58,7 @@ func TestNudgeSessionDeliversLongClaudeNudgeAsOneBracketedPaste(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = tm.KillSession(sessionName) })
 	waitForFileContents(t, ready, 10*time.Second)
+	requirePaneBracketedPasteOn(t, tm, sessionName, 10*time.Second)
 
 	var b strings.Builder
 	b.WriteString("HEAD-SENTINEL-START ga-6qfgdo bracketed paste probe\n")
@@ -115,11 +116,12 @@ func TestNudgeSessionDeliversLongClaudeNudgeAsOneBracketedPaste(t *testing.T) {
 
 // TestNudgeSessionKeepsKeystrokesWhenPaneHasNoBracketedPaste is the real-tmux
 // half of the bracket_paste_flag guard. Its reader never sends ESC[?2004h, so
-// tmux reports #{bracket_paste_flag}=0 for the pane. `paste-buffer -p` into such
-// a pane adds no markers and writes each newline as a CR ("line one\rline
-// two\r..."), so every line would submit on its own. A multi-line claude nudge
-// must instead keep the send-keys path: the pane receives the message with its
-// line feeds intact, preceded only by the C-u and followed only by the submit.
+// tmux 3.7 and later report #{bracket_paste_flag}=0 for the pane, and an older
+// server renders the format empty. `paste-buffer -p` into such a pane adds no
+// markers and writes each newline as a CR ("line one\rline two\r..."), so every
+// line would submit on its own. A multi-line claude nudge must instead keep the
+// send-keys path on either server: the pane receives the message with its line
+// feeds intact, preceded only by the C-u and followed only by the submit.
 func TestNudgeSessionKeepsKeystrokesWhenPaneHasNoBracketedPaste(t *testing.T) {
 	if !hasTmux() {
 		t.Skip("tmux not installed")
@@ -148,8 +150,8 @@ func TestNudgeSessionKeepsKeystrokesWhenPaneHasNoBracketedPaste(t *testing.T) {
 	t.Cleanup(func() { _ = tm.KillSession(sessionName) })
 	waitForFileContents(t, ready, 10*time.Second)
 
-	if flag, err := tm.run("display-message", "-t", sessionName, "-p", "#{bracket_paste_flag}"); err != nil || strings.TrimSpace(flag) == "1" {
-		t.Fatalf("reader pane #{bracket_paste_flag} = %q, %v; want bracketed paste off", flag, err)
+	if flag, err := tm.paneBracketPasteFlag(sessionName); err != nil || flag == "1" {
+		t.Fatalf("reader pane #{bracket_paste_flag} = %q, %v; want \"0\" (or \"\" before tmux 3.7)", flag, err)
 	}
 
 	const tail = "TAIL-SENTINEL line four"
@@ -175,45 +177,84 @@ func TestNudgeSessionKeepsKeystrokesWhenPaneHasNoBracketedPaste(t *testing.T) {
 	}
 }
 
-// waitForSubmitAfter polls the reader's record until marker is followed by a
-// CR, then returns it; on timeout it returns what arrived.
-func waitForSubmitAfter(t *testing.T, path, marker string, timeout time.Duration) string {
+// requirePaneBracketedPasteOn waits until target's #{bracket_paste_flag} reads
+// "1". The reader writes ESC[?2004h before its ready file, but tmux parses pane
+// output on its own schedule, so the flag can trail the ready file.
+//
+// tmux 3.7 added the format. An older server renders it empty, so
+// sendLiteralText cannot confirm the mode and keeps claude nudges on send-keys
+// by design: the paste frame this test asserts cannot happen there, and the
+// test skips. TestNudgeSessionKeepsKeystrokesWhenPaneHasNoBracketedPaste still
+// covers delivery on such a server. On tmux 3.7 and later, a flag that stays
+// "0" or a failed read fails the test.
+func requirePaneBracketedPasteOn(t *testing.T, tm *Tmux, target string, timeout time.Duration) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for {
-		data, _ := os.ReadFile(path)
-		got := string(data)
-		if at := strings.LastIndex(got, marker); at >= 0 && strings.Contains(got[at:], "\r") {
-			return got
-		}
-		if time.Now().After(deadline) {
-			t.Logf("no submit after %q within %s", marker, timeout)
-			return got
-		}
-		time.Sleep(25 * time.Millisecond)
+	var readErr error
+	flag, _ := pollUntil(timeout, func() (string, bool) {
+		flag, err := tm.paneBracketPasteFlag(target)
+		readErr = err
+		return flag, err == nil && (flag == "1" || flag == "")
+	})
+	switch {
+	case readErr != nil:
+		t.Fatalf("reading #{bracket_paste_flag} for %s: %v", target, readErr)
+	case flag == "":
+		t.Skip("tmux server renders #{bracket_paste_flag} empty (the format arrived in tmux 3.7): sendLiteralText cannot confirm bracketed paste there and keeps claude nudges on send-keys by design, so no paste frame can arrive")
+	case flag != "1":
+		t.Fatalf("reader pane sent ESC[?2004h but #{bracket_paste_flag} = %q after %s, want \"1\"", flag, timeout)
 	}
 }
 
 // waitForBracketedPasteSubmit polls the reader's record until it holds a
-// closing ESC[201~ followed by at least one submit CR, then returns it. If that
-// never happens it returns what arrived, so the caller's frame assertions report
-// the actual bytes instead of a bare timeout.
+// closing ESC[201~ followed by at least one submit CR, then returns it.
 func waitForBracketedPasteSubmit(t *testing.T, path string, timeout time.Duration) string {
 	t.Helper()
+	return waitForRecordedInput(t, path, "bracketed paste frame followed by a submit", timeout, func(got string) bool {
+		end := strings.LastIndex(got, bracketedPasteEnd)
+		return end >= 0 && strings.Contains(got[end:], "\r")
+	})
+}
+
+// waitForSubmitAfter polls the reader's record until marker is followed by at
+// least one submit CR, then returns it.
+func waitForSubmitAfter(t *testing.T, path, marker string, timeout time.Duration) string {
+	t.Helper()
+	return waitForRecordedInput(t, path, fmt.Sprintf("submit after %q", marker), timeout, func(got string) bool {
+		at := strings.LastIndex(got, marker)
+		return at >= 0 && strings.Contains(got[at:], "\r")
+	})
+}
+
+// waitForRecordedInput polls the reader's record until complete accepts it. If
+// that never happens it logs what was awaited and returns what arrived, so the
+// caller's assertions report the actual bytes instead of a bare timeout.
+func waitForRecordedInput(t *testing.T, path, awaited string, timeout time.Duration, complete func(string) bool) string {
+	t.Helper()
+	got, done := pollUntil(timeout, func() (string, bool) {
+		data, _ := os.ReadFile(path)
+		return string(data), complete(string(data))
+	})
+	if !done {
+		t.Logf("no %s within %s", awaited, timeout)
+	}
+	return got
+}
+
+// pollUntil calls probe now and then on a 25ms ticker until it reports done or
+// timeout passes, and returns probe's last value and whether it was done.
+func pollUntil(timeout time.Duration, probe func() (string, bool)) (string, bool) {
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		data, _ := os.ReadFile(path)
-		got := string(data)
-		if end := strings.LastIndex(got, bracketedPasteEnd); end >= 0 && strings.Contains(got[end:], "\r") {
-			return got
+		got, done := probe()
+		if done {
+			return got, true
 		}
 		select {
 		case <-timer.C:
-			t.Logf("no bracketed paste frame followed by a submit within %s", timeout)
-			return got
+			return got, false
 		case <-ticker.C:
 		}
 	}
