@@ -506,6 +506,14 @@ func TestCmdMailMarkReadRemote_Failures(t *testing.T) {
 			t.Errorf("args=%q: exit=%d stderr=%q", args, code, errb.String())
 		}
 	}
+	// "." and ".." survive path escaping but URL resolution collapses them onto
+	// a different route (/v0/city/mc/read), so the client refuses them.
+	for _, id := range []string{".", ".."} {
+		var out, errb bytes.Buffer
+		if code := cmdMailMarkReadRemote(remoteTestClient(t, quiet.URL), remoteTestTarget(quiet.URL), []string{id}, false, &out, &errb); code == 0 || !strings.Contains(errb.String(), "invalid message id") {
+			t.Errorf("id=%q: exit=%d stderr=%q", id, code, errb.String())
+		}
+	}
 
 	cases := []struct {
 		name   string
