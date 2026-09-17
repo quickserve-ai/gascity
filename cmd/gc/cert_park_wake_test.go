@@ -48,12 +48,16 @@ func (s *certParkGetCountingStore) Get(id string) (beads.Bead, error) {
 // one test's stalled reads cannot starve the next test's.
 func waitCertParkReadSlotsFree(t *testing.T) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	timeout := time.NewTimer(5 * time.Second)
+	defer timeout.Stop()
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
 	for len(certParkReadSlots) > 0 {
-		if time.Now().After(deadline) {
+		select {
+		case <-timeout.C:
 			t.Fatalf("cert park read slots still held: %d", len(certParkReadSlots))
+		case <-tick.C:
 		}
-		time.Sleep(5 * time.Millisecond)
 	}
 }
 
