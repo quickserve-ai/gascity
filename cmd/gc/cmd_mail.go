@@ -1703,7 +1703,8 @@ func newMailMarkReadCmd(stdout, stderr io.Writer) *cobra.Command {
 		Long: `Mark a message as read without displaying it. The message will no longer appear in inbox results.
 
 With --context/--city-url the message is marked read in a REMOTE city (the
-id is that city's message id); mark-unread reverses it.`,
+id is that city's message id). There is no remote mark-unread yet; the
+hub's POST /v0/city/{city}/mail/{id}/mark-unread endpoint can reverse it.`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
 			code := 0
