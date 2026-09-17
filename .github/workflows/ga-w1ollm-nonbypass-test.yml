@@ -40,9 +40,13 @@ jobs:
           set -u
           ref="refs/heads/polecat/ga-w1ollm-nb-test-${{ github.run_id }}"
           echo "pushing HEAD ($(git rev-parse HEAD)) to $ref"
-          if git push origin "HEAD:$ref" 2>&1 | tee /tmp/push-a.log; then
+          # Redirect, never pipe: `push | tee` returns tee's status and masks
+          # the push result — the assertion this driver exists to make.
+          if git push origin "HEAD:$ref" >/tmp/push-a.log 2>&1; then
+            cat /tmp/push-a.log
             echo "PUSH A: SUCCEEDED (expected)"
           else
+            cat /tmp/push-a.log
             echo "PUSH A: FAILED — unexpected; the permitted namespace refused a non-bypass actor"
             exit 1
           fi
@@ -52,11 +56,14 @@ jobs:
           set -u
           ref="refs/heads/witness-salvage/ga-w1ollm-nb-red-${{ github.run_id }}"
           echo "pushing HEAD ($(git rev-parse HEAD)) to $ref"
-          if git push origin "HEAD:$ref" 2>&1 | tee /tmp/push-b.log; then
+          # Redirect, never pipe (same masking hazard as push (a)).
+          if git push origin "HEAD:$ref" >/tmp/push-b.log 2>&1; then
+            cat /tmp/push-b.log
             echo "PUSH B: SUCCEEDED — UNEXPECTED. The governed namespace accepted a non-bypass creation."
             echo "Leaving the branch in place for human admin review/deletion (no third push)."
             exit 1
           fi
+          cat /tmp/push-b.log
           if grep -qiE "rule violations|protected ref|restricted" /tmp/push-b.log; then
             echo "PUSH B: REFUSED with a rule violation (expected)"
           else
