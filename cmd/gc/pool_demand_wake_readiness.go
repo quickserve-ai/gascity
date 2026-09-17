@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
@@ -38,6 +39,16 @@ type poolWakeReadiness struct {
 	// its pool's demand, because a hiccup that reads as "no ready work" is how
 	// a live pool gets drained.
 	verified map[string]bool
+	// stderr is the channel this verdict reports on, the same one its PARTIAL
+	// line uses; nil reports nothing.
+	stderr io.Writer
+	// mu guards withheld. DesiredStateResult carries one verdict to every
+	// consumer that recomputes pool demand from it, and the controller caches
+	// that result across ticks.
+	mu sync.Mutex
+	// withheld holds the rows this verdict has already named, so each one is
+	// reported once per verdict rather than once per recomputation.
+	withheld map[storeScopedBeadKey]bool
 }
 
 // isPoolWakeCandidate reports whether a census row could only ever become pool
@@ -108,6 +119,24 @@ func (r *poolWakeReadiness) vetoesWakeCandidate(b beads.Bead, agentCfg *config.A
 	return !r.servesWakeCandidate(storeRef, b.ID)
 }
 
+// reportWithheld names a row this verdict removed from wake demand, once per
+// verdict. The fail-open path reports on stderr, and the withhold path must too:
+// without a record, a pool that stops scaling looks the same as a pool with no
+// work.
+func (r *poolWakeReadiness) reportWithheld(storeRef string, b beads.Bead, template string) {
+	if r == nil || r.stderr == nil {
+		return
+	}
+	key := storeScopedBeadKey{StoreRef: storeRef, ID: b.ID}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.withheld[key] {
+		return
+	}
+	r.withheld[key] = true
+	fmt.Fprintf(r.stderr, "poolWakeReadiness: WITHHELD — %s in store %q is not in its ready frontier, no wake demand for %s (assignee %s)\n", b.ID, storeRefLabel(storeRef), template, strings.TrimSpace(b.Assignee)) //nolint:errcheck
+}
+
 // newPoolWakeReadiness reads the ready frontier once per store that carries a
 // wake candidate, through the per-pass ready cache the demand probes already
 // share (readyDemandCache). A leg the scale-check probes already read is served
@@ -130,6 +159,8 @@ func newPoolWakeReadiness(cache *readyDemandCache, work []beads.Bead, stores []b
 	r := &poolWakeReadiness{
 		ready:    make(map[storeScopedBeadKey]bool),
 		verified: make(map[string]bool),
+		stderr:   stderr,
+		withheld: make(map[storeScopedBeadKey]bool),
 	}
 	seen := make(map[string]bool, len(storeRefs))
 	for i, wb := range work {
