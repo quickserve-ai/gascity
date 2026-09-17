@@ -2567,6 +2567,9 @@ gc mail inbox [session] [flags]
 
 Mark a message as read without displaying it. The message will no longer appear in inbox results.
 
+With --context/--city-url the message is marked read in a REMOTE city (the
+id is that city's message id); mark-unread reverses it.
+
 ```
 gc mail mark-read <id> [flags]
 ```
