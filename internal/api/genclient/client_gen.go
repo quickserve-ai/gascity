@@ -2203,7 +2203,7 @@ type HookClaimRefusedPayload struct {
 	// Agent The runtime's GC_ALIAS, else GC_AGENT.
 	Agent *string `json:"agent,omitempty"`
 
-	// BeadEpoch The session bead's generation metadata, raw: the same counter runtime_epoch was stamped from. Each reconciler wake increments it and mints a new instance token together, so a runtime_epoch below bead_epoch means the generation moved on after this runtime started, normally because a later wake started another incarnation. The refusal itself is decided by the token, not by this comparison.
+	// BeadEpoch The session bead's generation now, normalized as a start normalizes it (empty, zero or unparseable becomes 1), so it compares directly with runtime_epoch. A lower runtime_epoch means the generation moved on after this runtime started. Equal epochs do NOT prove the same incarnation: a start that finds no instance token mints one without bumping the generation.
 	BeadEpoch *string `json:"bead_epoch,omitempty"`
 
 	// BeadTokenFingerprint First 8 hex chars of SHA-256 of the session bead's instance token. Never the token.
@@ -2215,7 +2215,7 @@ type HookClaimRefusedPayload struct {
 	// Reason Drain reason the refusal reported: stale_session or missing_session_registration.
 	Reason string `json:"reason"`
 
-	// RuntimeEpoch The runtime's GC_RUNTIME_EPOCH: the session bead's generation as it stood when this runtime was started (an empty or invalid generation starts as 1).
+	// RuntimeEpoch The runtime's GC_RUNTIME_EPOCH: the session bead's generation when this runtime was started, with an empty, zero or unparseable generation started as 1.
 	RuntimeEpoch *string `json:"runtime_epoch,omitempty"`
 
 	// RuntimeTokenFingerprint First 8 hex chars of SHA-256 of the runtime's instance token. Never the token.
