@@ -356,10 +356,12 @@ func poolWakeBuilderCity() *config.City {
 	return cfg
 }
 
-func poolSessionsPlannedFor(state map[string]TemplateParams, template string) []string {
+// poolWakeSessionsPlanned lists the sessions desired state plans for the pool
+// wake template.
+func poolWakeSessionsPlanned(state map[string]TemplateParams) []string {
 	var out []string
 	for name, tp := range state {
-		if tp.TemplateName == template {
+		if tp.TemplateName == poolWakeTemplate {
 			out = append(out, name)
 		}
 	}
@@ -390,7 +392,7 @@ func TestBuildDesiredStateWithholdsPoolSessionForBlockedOrphanedRoutedWork(t *te
 	if got.PoolWakeReadiness.servesWakeCandidate("", stepID) {
 		t.Fatalf("builder verdict reports blocked step %s as served", stepID)
 	}
-	if planned := poolSessionsPlannedFor(got.State, poolWakeTemplate); len(planned) != 0 {
+	if planned := poolWakeSessionsPlanned(got.State); len(planned) != 0 {
 		t.Fatalf("desired state planned %v for %s while its only work (step %s) is blocked by open %s, want none", planned, poolWakeTemplate, stepID, blockerID)
 	}
 
@@ -403,7 +405,7 @@ func TestBuildDesiredStateWithholdsPoolSessionForBlockedOrphanedRoutedWork(t *te
 		"test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), store, nil,
 		newSessionBeadSnapshot(nil), nil, io.Discard,
 	)
-	if planned := poolSessionsPlannedFor(unblocked.State, poolWakeTemplate); len(planned) == 0 {
+	if planned := poolWakeSessionsPlanned(unblocked.State); len(planned) == 0 {
 		t.Fatalf("desired state planned nothing for %s once step %s became claimable, want a seat — the gate must be readiness, not a blanket withhold", poolWakeTemplate, stepID)
 	}
 }
@@ -425,16 +427,18 @@ func TestBuildDesiredStateFailsOpenWhenWakeReadinessIsUnanswerable(t *testing.T)
 	}
 }
 
-// deferredRoutedDemandFixture builds the state gastownhall/gascity#6207 actually
-// reported: a routed bead with a dead claimant parked by `bd defer`, with NO
-// blocking dependency at all. indefinite selects the reporter's first variant
-// (status=deferred, defer_until absent); otherwise the row carries an ELAPSED
-// defer_until, which is the variant that survives #5094's IsDeferred gate.
+// deferredRoutedDemandFixture builds a routed bead with a dead claimant, a
+// deferral, and NO blocking dependency at all. indefinite selects bd's undated
+// `bd defer` (status=deferred, defer_until absent); otherwise the row carries a
+// defer_until that has already ELAPSED.
 //
-// Serve-side truth, measured against bd 1.1.1-0.20260805093327-bf97b73749ac on a
-// throwaway store: `bd ready --assignee=<id> --json --limit=1` returns NEITHER
-// variant — nor does `bd ready --include-deferred`, whose flag relaxes only a
-// future timestamp. Both are unclaimable; the demand side must agree.
+// The serve side answers the two variants differently. bd's ready read
+// (beads v1.3.0-rc.2 internal/storage/sqlbuild/ready.go, BuildReadyWorkWhere)
+// keeps `status IN ('open', 'in_progress')` and
+// `(defer_until IS NULL OR defer_until <= UTC_TIMESTAMP())`, and GetReadyWork
+// first runs wakeExpiredDefers, which returns an elapsed DATED defer to open.
+// So the undated variant is never served, while the elapsed one is served
+// whichever way it was deferred.
 func deferredRoutedDemandFixture(t *testing.T, indefinite bool) (beads.Store, string) {
 	t.Helper()
 	mem := beads.NewMemStore()
@@ -459,57 +463,131 @@ func deferredRoutedDemandFixture(t *testing.T, indefinite bool) (beads.Store, st
 	if err != nil {
 		t.Fatalf("get deferred row: %v", err)
 	}
-	if !beads.CarriesDeferral(got) {
-		t.Fatalf("fixture invalid: stored row carries no deferral marker: %+v", got)
+	if indefinite && !got.IndefinitelyDeferred {
+		t.Fatalf("fixture invalid: stored row lost its undated deferral: %+v", got)
+	}
+	if !indefinite && (got.DeferUntil == nil || got.DeferUntil.After(time.Now())) {
+		t.Fatalf("fixture invalid: stored row carries no elapsed defer_until: %+v", got)
 	}
 	return mem, created.ID
 }
 
-// TestBuildDesiredStateWithholdsPoolSessionForDeferredRoutedWork is #6207's own
-// reproduction, driven through the builder for both variants the issue names.
+// readyFrontierHas reports whether an unfiltered Ready read of store returns id.
+func readyFrontierHas(t *testing.T, store beads.Store, id string) bool {
+	t.Helper()
+	ready, err := store.Ready(beads.ReadyQuery{TierMode: beads.TierBoth})
+	if err != nil {
+		t.Fatalf("ready: %v", err)
+	}
+	for _, b := range ready {
+		if b.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// TestBuildDesiredStateWithholdsPoolSessionForIndefinitelyDeferredRoutedWork is
+// #6207's undated `bd defer` variant, driven through the builder. bd never serves
+// that row, and #5094's IsDeferred filter withholds it before the readiness gate
+// runs.
+func TestBuildDesiredStateWithholdsPoolSessionForIndefinitelyDeferredRoutedWork(t *testing.T) {
+	store, rowID := deferredRoutedDemandFixture(t, true)
+	if readyFrontierHas(t, store, rowID) {
+		t.Fatalf("fixture invalid: an indefinitely deferred row is in the ready frontier")
+	}
+
+	got := buildDesiredStateWithSessionBeads(
+		"test-city", t.TempDir(), time.Now().UTC(), poolWakeBuilderCity(), runtime.NewFake(), store, nil,
+		newSessionBeadSnapshot(nil), nil, io.Discard,
+	)
+	if planned := poolWakeSessionsPlanned(got.State); len(planned) != 0 {
+		t.Fatalf("desired state planned %v for %s while its only work (%s) is deferred with no date, want none (#6207)", planned, poolWakeTemplate, rowID)
+	}
+}
+
+// TestBuildDesiredStateKeepsPoolSessionForElapsedDeferRoutedWork is the
+// builder-level anti-starvation arm. An orphaned routed row with no blocker whose
+// defer_until has ELAPSED is served by the seat's own read (see
+// deferredRoutedDemandFixture), so the gate must not withhold it. defer_until is
+// cleared only by a reopen or a wake, so a withheld row would be withheld for
+// good.
+func TestBuildDesiredStateKeepsPoolSessionForElapsedDeferRoutedWork(t *testing.T) {
+	store, rowID := deferredRoutedDemandFixture(t, false)
+	if !readyFrontierHas(t, store, rowID) {
+		t.Fatalf("fixture invalid: the elapsed-defer row is absent from the ready frontier, so the gate would withhold it for a reason other than its deferral")
+	}
+
+	got := buildDesiredStateWithSessionBeads(
+		"test-city", t.TempDir(), time.Now().UTC(), poolWakeBuilderCity(), runtime.NewFake(), store, nil,
+		newSessionBeadSnapshot(nil), nil, io.Discard,
+	)
+	if got.PoolWakeReadiness == nil {
+		t.Fatalf("DesiredStateResult.PoolWakeReadiness = nil, want an armed gate — without one this test cannot fail")
+	}
+	if planned := poolWakeSessionsPlanned(got.State); len(planned) == 0 {
+		t.Fatalf("desired state planned nothing for %s while its only work (%s) has an elapsed defer_until and no blocker, want a seat: the seat's ready read serves that row", poolWakeTemplate, rowID)
+	}
+}
+
+// TestPoolWakeReadinessKeepsDemandForElapsedDeferral is the anti-starvation
+// direction of the deferral read, with the gate armed: an orphaned row with no
+// blocker whose defer_until has ELAPSED stays wake demand. The molecule root
+// case covers the ready-excluded carve-out, which Ready() cannot vouch for by
+// type, so nothing in the gate may veto that row for its deferral either.
 //
-// The elapsed variant is the one that needed this change. #5094's gate drops
-// only a bead IsDeferred says is hidden RIGHT NOW, and its companion test keeps
-// an elapsed one on purpose; mapBdStatus spells the row "open"; and the ready
-// frontier then AGREES it is ready — MemStore and the cached tier recompute it,
-// NativeDoltStore.Ready deliberately resurfaces an expired time-bound deferral.
-// So the frontier could not be the oracle here and the deferral is read off the
-// bead instead (beads.CarriesDeferral), which is where bd's own answer lives.
-func TestBuildDesiredStateWithholdsPoolSessionForDeferredRoutedWork(t *testing.T) {
+// A row hidden right now is withheld earlier by #5094's IsDeferred filter, so
+// neither gc hook (isFutureDeferredHookCandidate) nor bd's ready read has any
+// deferral left to refuse at this point.
+func TestPoolWakeReadinessKeepsDemandForElapsedDeferral(t *testing.T) {
+	elapsed := time.Now().UTC().Add(-24 * time.Hour)
 	for _, tc := range []struct {
-		name       string
-		indefinite bool
+		name string
+		row  beads.Bead
 	}{
-		{"defer_until absent", true},
-		{"defer_until elapsed", false},
+		{"routed task", beads.Bead{
+			Title:      "routed step whose defer elapsed",
+			Type:       "task",
+			Status:     "open",
+			Assignee:   poolWakeTemplate,
+			Metadata:   map[string]string{beadmeta.RoutedToMetadataKey: poolWakeTemplate},
+			DeferUntil: &elapsed,
+		}},
+		{"assigned molecule root", beads.Bead{
+			Title:    "assigned workflow root whose defer elapsed",
+			Type:     "molecule",
+			Status:   "open",
+			Assignee: poolWakeTemplate,
+			Metadata: map[string]string{
+				beadmeta.KindMetadataKey:     beadmeta.KindWorkflow,
+				beadmeta.RoutedToMetadataKey: poolWakeTemplate,
+			},
+			DeferUntil: &elapsed,
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			store, rowID := deferredRoutedDemandFixture(t, tc.indefinite)
-			// The frontier's own answer, recorded so the test says WHY each
-			// variant is withheld rather than just that it is.
-			ready, err := store.Ready(beads.ReadyQuery{TierMode: beads.TierBoth})
+			mem := beads.NewMemStore()
+			row, err := mem.Create(tc.row)
 			if err != nil {
-				t.Fatalf("ready: %v", err)
+				t.Fatalf("create row: %v", err)
 			}
-			inFrontier := false
-			for _, b := range ready {
-				if b.ID == rowID {
-					inFrontier = true
-				}
+			cfg := poolWakeTestCity()
+			work, workStores, workRefs, _, partial := collectAssignedWorkBeadsWithStores("", cfg, mem, nil, nil, nil)
+			if partial {
+				t.Fatalf("collectAssignedWorkBeadsWithStores reported partial results")
 			}
-			if tc.indefinite && inFrontier {
-				t.Fatalf("fixture invalid: an indefinitely deferred row is in the ready frontier")
-			}
-			if !tc.indefinite && !inFrontier {
-				t.Fatalf("fixture invalid: the elapsed-defer row is absent from the ready frontier, so this case would pass without the deferral predicate")
+			wakeReady := newPoolWakeReadiness(nil, work, workStores, workRefs, io.Discard)
+			if wakeReady == nil || !wakeReady.verified[""] {
+				t.Fatalf("newPoolWakeReadiness = %+v, want a verdict armed for the city store — without one this test cannot fail", wakeReady)
 			}
 
-			got := buildDesiredStateWithSessionBeads(
-				"test-city", t.TempDir(), time.Now().UTC(), poolWakeBuilderCity(), runtime.NewFake(), store, nil,
-				newSessionBeadSnapshot(nil), nil, io.Discard,
-			)
-			if planned := poolSessionsPlannedFor(got.State, poolWakeTemplate); len(planned) != 0 {
-				t.Fatalf("desired state planned %v for %s while its only work (%s) is deferred, want none — `bd ready --assignee` refuses a deferred row at any timestamp (#6207)", planned, poolWakeTemplate, rowID)
+			poolWork := filterAssignedWorkBeadsForPoolDemand(cfg, "", mem, nil, work, workRefs, wakeReady)
+			states := ComputePoolDesiredStatesWithDemandTraced(cfg, poolWork, nil, nil, nil, nil)
+			if got := PoolDesiredCounts(states)[poolWakeTemplate]; got < 1 {
+				t.Fatalf("poolDesired[%s] = %d for orphaned row %s with an elapsed defer_until and no blocker, want >= 1: the seat's ready read serves it", poolWakeTemplate, got, row.ID)
+			}
+			if woken := wakeKnownIdentityWorkBeads(states); len(woken) != 1 || woken[0] != row.ID {
+				t.Fatalf("wake-known-identity work beads = %v, want [%s]", woken, row.ID)
 			}
 		})
 	}
