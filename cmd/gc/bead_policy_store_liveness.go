@@ -335,9 +335,9 @@ func (s *beadPolicyStore) Get(id string) (beads.Bead, error) {
 }
 
 func (s *beadPolicyStore) overlayBead(b beads.Bead) beads.Bead {
-	store := s.lv.Store()
+	store, degraded := s.lv.acquireForRead()
 	if store == nil {
-		if s.lv.readDegraded() {
+		if degraded {
 			return markLivenessReadDegraded(b)
 		}
 		return b
@@ -362,9 +362,9 @@ func (s *beadPolicyStore) overlayBeads(list []beads.Bead) []beads.Bead {
 	if s == nil || len(list) == 0 {
 		return list
 	}
-	store := s.lv.Store()
+	store, degraded := s.lv.acquireForRead()
 	if store == nil {
-		if s.lv.readDegraded() {
+		if degraded {
 			return markLivenessReadDegradedAll(list)
 		}
 		return list
