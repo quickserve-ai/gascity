@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -26,6 +27,15 @@ type retentionReadBlockingStore struct {
 	block <-chan struct{}
 	hit   chan struct{}
 }
+
+// readyBeforeRetentionWait bounds each wait in
+// TestCityRuntimeRun_ReadyBeforeRetentionSweep. It is generous because the run
+// loop ticks on real timers and the test also runs under -race;
+// readyBeforeRetentionPoll is how often the prune wait re-reads the store.
+const (
+	readyBeforeRetentionWait = 10 * time.Second
+	readyBeforeRetentionPoll = 20 * time.Millisecond
+)
 
 func (s *retentionReadBlockingStore) List(q beads.ListQuery) ([]beads.Bead, error) {
 	if q.Status == "closed" && q.Label == labelOrderTracking && q.Limit == 0 {
@@ -141,8 +151,8 @@ func TestCityRuntimeRun_ReadyBeforeRetentionSweep(t *testing.T) {
 	case <-started:
 	case <-store.hit:
 		t.Fatalf("order-tracking retention read reached before the city reported ready; the startup pass was NOT deferred\nstderr:\n%s", stderr.String())
-	case <-time.After(10 * time.Second):
-		t.Fatalf("city did not report ready within 10s\nstderr:\n%s", stderr.String())
+	case <-time.After(readyBeforeRetentionWait):
+		t.Fatalf("city did not report ready within %s\nstderr:\n%s", readyBeforeRetentionWait, stderr.String())
 	}
 
 	// The first steady-state tick MUST reach the retention read.
@@ -154,8 +164,29 @@ func TestCityRuntimeRun_ReadyBeforeRetentionSweep(t *testing.T) {
 	select {
 	case <-store.hit:
 		// good: the sweep ran after readiness.
-	case <-time.After(10 * time.Second):
+	case <-time.After(readyBeforeRetentionWait):
 		t.Fatalf("first steady-state tick did not reach the order-tracking retention read; the sweep was dropped, not deferred\nstderr:\n%s", stderr.String())
 	}
 	unblock()
+
+	// The deferred pass must also finish the prune through the real run loop:
+	// the two oldest beads past the retain-10 floor go, and the newest ten stay.
+	deadline := time.Now().Add(readyBeforeRetentionWait)
+	for {
+		_, err00 := store.Get("ready-00")
+		_, err01 := store.Get("ready-01")
+		if errors.Is(err00, beads.ErrNotFound) && errors.Is(err01, beads.ErrNotFound) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("deferred retention pass did not prune ready-00 and ready-01 within %s (errs: %v, %v)\nstderr:\n%s", readyBeforeRetentionWait, err00, err01, stderr.String())
+		}
+		time.Sleep(readyBeforeRetentionPoll)
+	}
+	for i := 2; i < minClosedOrderTrackingRetained+2; i++ {
+		id := fmt.Sprintf("ready-%02d", i)
+		if _, err := store.Get(id); err != nil {
+			t.Fatalf("%s is inside the retain-%d floor and must survive the prune: %v", id, minClosedOrderTrackingRetained, err)
+		}
+	}
 }
