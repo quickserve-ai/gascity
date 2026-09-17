@@ -426,6 +426,47 @@ func TestRenderSupervisorLaunchdTemplateUsesPreserveEnvFromData(t *testing.T) {
 	}
 }
 
+// Without ExitTimeOut, launchd SIGKILLs a booted-out supervisor 5s after its
+// SIGTERM — the same length as a city's default stop grace, so any stop that
+// needs its grace is killed before it can write the clean-exit token
+// (ga-2jjk51: 28 of 107 signal stops on one machine). The plist must give the
+// supervisor a city's whole worst-case stop, and launchd must still drop the
+// job before install's unload wait gives up on it.
+func TestRenderSupervisorLaunchdTemplateCoversCityStopBudget(t *testing.T) {
+	content, err := renderSupervisorTemplate(supervisorLaunchdTemplate, &supervisorServiceData{
+		GCPath:       "/usr/local/bin/gc",
+		LogPath:      "/home/user/.gc/supervisor.log",
+		GCHome:       "/home/user/.gc",
+		LaunchdLabel: defaultSupervisorLaunchdLabel,
+		Path:         "/usr/local/bin:/usr/bin:/bin",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const key = "<key>ExitTimeOut</key>"
+	_, rest, found := strings.Cut(content, key)
+	if !found {
+		t.Fatalf("launchd template has no %s; launchd would kill a stopping supervisor after 5s:\n%s", key, content)
+	}
+	rest = strings.TrimSpace(rest)
+	value, _, found := strings.Cut(strings.TrimPrefix(rest, "<integer>"), "</integer>")
+	if !strings.HasPrefix(rest, "<integer>") || !found {
+		t.Fatalf("%s is not followed by an <integer>:\n%s", key, content)
+	}
+	seconds, err := strconv.Atoi(value)
+	if err != nil {
+		t.Fatalf("%s value %q: %v", key, value, err)
+	}
+	exitTimeout := time.Duration(seconds) * time.Second
+	stopBudget := managedCityStopTimeout(nil) + managedCityForcedStopTimeout(nil)
+	if exitTimeout <= stopBudget {
+		t.Errorf("ExitTimeOut = %s, want more than a default city's worst-case stop of %s", exitTimeout, stopBudget)
+	}
+	if exitTimeout >= launchdRefreshWaitTimeout {
+		t.Errorf("ExitTimeOut = %s, want less than launchdRefreshWaitTimeout (%s) so a refresh sees the job unload", exitTimeout, launchdRefreshWaitTimeout)
+	}
+}
+
 func TestRenderSupervisorSystemdTemplate(t *testing.T) {
 	data := &supervisorServiceData{
 		GCPath:        "/usr/local/bin/gc",
@@ -4973,6 +5014,8 @@ func TestRunSupervisorSIGTERMPreservesSessionsEndToEnd(t *testing.T) {
 		"Preserving city '" + cityPath + "' sessions for re-adoption...",
 		"Preserving agent sessions for supervisor re-adoption.",
 		"City '" + cityPath + "' preserved.",
+		"gc supervisor: city '" + cityPath + "' stop took ",
+		"gc supervisor: stopping took ",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("stdout = %q, want %q; stderr=%q", got, want, stderr.String())
