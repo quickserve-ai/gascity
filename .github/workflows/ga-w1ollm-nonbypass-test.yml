@@ -1,0 +1,65 @@
+# TEMPORARY driver for ga-w1ollm's authorized non-bypass push test.
+#
+# Authorization: Cherub, 2026-09-17, relayed as mayor mail ga-wisp-zjy4o5k and
+# recorded verbatim on bead ga-w1ollm before this file was written. Scope is
+# EXACTLY TWO pushes by github-actions[bot] (non-admin, non-bypass under the
+# active rulesets), in one dispatch:
+#   (a) create polecat/ga-w1ollm-nb-test-<run>        -> expected: SUCCEEDS
+#       (polecat/** is excluded from rig-ref-confinement 22632844)
+#   (b) create witness-salvage/ga-w1ollm-nb-red-<run> -> expected: REFUSED
+#       (governed namespace; also the live evidence for bead ga-fvcdyz —
+#       the salvage path's latent fail-closed)
+#
+# The bot performs no other write, no merge, and never deletes anything:
+# cleanup of the (a) branch is done by a human admin afterwards, so the bot's
+# push count stays at two. If (b) unexpectedly SUCCEEDS the run fails loudly
+# and the branch is left for human admin deletion — the driver must not spend
+# a third push hiding the most important possible finding.
+#
+# This workflow is removed by a follow-up PR once the rule-suites rows are
+# copied to the bead. It must not survive the test.
+
+name: ga-w1ollm non-bypass push test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  two-pushes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: "Push (a): permitted polecat/** creation (expect success)"
+        run: |
+          set -u
+          ref="refs/heads/polecat/ga-w1ollm-nb-test-${{ github.run_id }}"
+          echo "pushing HEAD ($(git rev-parse HEAD)) to $ref"
+          if git push origin "HEAD:$ref" 2>&1 | tee /tmp/push-a.log; then
+            echo "PUSH A: SUCCEEDED (expected)"
+          else
+            echo "PUSH A: FAILED — unexpected; the permitted namespace refused a non-bypass actor"
+            exit 1
+          fi
+
+      - name: "Push (b): governed witness-salvage/** creation (expect refusal)"
+        run: |
+          set -u
+          ref="refs/heads/witness-salvage/ga-w1ollm-nb-red-${{ github.run_id }}"
+          echo "pushing HEAD ($(git rev-parse HEAD)) to $ref"
+          if git push origin "HEAD:$ref" 2>&1 | tee /tmp/push-b.log; then
+            echo "PUSH B: SUCCEEDED — UNEXPECTED. The governed namespace accepted a non-bypass creation."
+            echo "Leaving the branch in place for human admin review/deletion (no third push)."
+            exit 1
+          fi
+          if grep -qiE "rule violations|protected ref|restricted" /tmp/push-b.log; then
+            echo "PUSH B: REFUSED with a rule violation (expected)"
+          else
+            echo "PUSH B: failed, but NOT with a recognizable rule violation — inspect the log"
+            exit 1
+          fi
