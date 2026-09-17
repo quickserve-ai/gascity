@@ -1941,6 +1941,44 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 		closedSessionBead = beads.Bead{ID: sessionID}
 	}
 
+	// PUBLISH THE DEFERRED RELEASE BEFORE THE CLOSE (ga-dt5ffp).
+	//
+	// This runs on exactly the path that is about to withhold — cfg == nil, the
+	// same condition the release branch below tests. It releases nothing; it
+	// records what is being withheld so an actor that later holds a real config
+	// can find it. See session_release_marker.go for why each property is
+	// required.
+	//
+	// TWO SEPARATE THINGS DECIDE CORRECTNESS HERE, and conflating them is easy:
+	//
+	//   * WHERE THE CONTENTS COME FROM. The obligation is built from
+	//     closedSessionBead — the snapshot read above, before the close.
+	//     CloseDetailed calls retireConfiguredNamedSessionIdentifiers, which
+	//     blanks session_name, so an obligation built from a bead re-read after
+	//     the close would silently omit it. Do not "simplify" this to a fresh
+	//     Get; TestSessionCloseCapturesTheDeferredReleaseBeforeRetiringIdentifiers
+	//     fails on exactly that change.
+	//   * WHERE THIS CALL SITS. Publishing before the close means a crash between
+	//     the two leaves an obligation on a session that is still OPEN, which is
+	//     inert — a drain's precondition is that the session bead is closed. The
+	//     opposite order loses the obligation entirely on the same crash. Prefer
+	//     an ignored obligation to a missing one.
+	//
+	//     NO TEST COVERS THIS SECOND PROPERTY: a test cannot crash the process
+	//     between two writes, and moving this call below CloseDetailed keeps the
+	//     whole suite green — measured, not assumed. It rests on this comment.
+	//
+	// The obligation records the rig-store scope as unenumerated: rig stores are
+	// enumerated only under "cityErr == nil && cfg != nil" below, because
+	// buildStandaloneRigStores needs the config that failed to load
+	// (buildSessionReleaseObligation records RigStoresKnown=false for that reason).
+	if cfg == nil {
+		rec, closeRec := openDeferredReleaseEventRecorder(cityPath, stderr)
+		deferMissingConfigWorkRelease(sessStore, sessionID, closedSessionBead, sessionBeadErr == nil,
+			cfgErrOrUnknown(cfgErr), rec, time.Now(), stderr)
+		closeRec()
+	}
+
 	closeResult, err := handle.CloseDetailed(context.Background())
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session close: %v\n", err) //nolint:errcheck // best-effort stderr
