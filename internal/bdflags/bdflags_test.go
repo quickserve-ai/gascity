@@ -155,6 +155,20 @@ func TestCreateStatusFlagsConsumeValues(t *testing.T) {
 	}
 }
 
+// TestCreateHiddenDescriptionAliasesConsumeValues pins bd's hidden create
+// aliases (cmd/bd/flags.go registerCommonIssueFlags). Hidden flags never
+// appear in the --help text these tables are transcribed from, and a walker
+// that does not know `-m` consumes a value either misreads the argv or gives
+// up on it (qc-p9m8oa9 review).
+func TestCreateHiddenDescriptionAliasesConsumeValues(t *testing.T) {
+	value := ValueFlags("create")
+	for _, flag := range []string{"--body", "-m", "--message", "--description-file"} {
+		if !value[flag] {
+			t.Errorf("ValueFlags(create)[%q] = false, want true", flag)
+		}
+	}
+}
+
 func TestUpdateFlagSets(t *testing.T) {
 	value := ValueFlags("update")
 	for _, f := range []string{"--assignee", "-a", "--status", "-s", "--priority", "-p", "--set-metadata", "--unset-metadata", "--parent", "--type", "-t"} {

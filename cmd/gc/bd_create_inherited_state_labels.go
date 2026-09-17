@@ -7,6 +7,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/bdflags"
 	"github.com/gastownhall/gascity/internal/beadmeta"
@@ -40,17 +41,26 @@ import (
 //
 // The one gap versus bd's own inheritance is a parent label that changes
 // between gc's read and bd's create — the same race as creating a moment
-// earlier. Fail-open throughout: anything gc cannot read or represent
-// faithfully forwards the argv unchanged with a warning, never a refusal.
+// earlier. Fail-open throughout: anything gc cannot read in time, parse the
+// way bd will, or represent faithfully — including a flag that points bd at
+// a different store than the one gc would read (--repo, --db, --database,
+// --global) — forwards the argv unchanged with a warning, never a refusal.
+
+// bdCreateParentLabelsTimeout bounds the guard's optional parent read. The
+// create must never wait on the guard for longer than this; past it the argv
+// goes to bd unchanged with a warning. Package var so tests can shorten it.
+var bdCreateParentLabelsTimeout = 3 * time.Second
 
 // bdCreateParentLabels reads the labels of the parent a `gc bd create
 // --parent` names, from the store the passthrough targets — the store bd
-// resolves the parent in. Package var so tests stub the store round-trip.
+// resolves the parent in when no store-selecting flag is given. Package var
+// so tests stub the store round-trip.
 var bdCreateParentLabels = func(cityPath string, cfg *config.City, target execStoreTarget, parentID string) ([]string, error) {
 	store, err := openStoreAtForCityWithConfig(target.ScopeRoot, cityPath, cfg)
 	if err != nil {
 		return nil, err
 	}
+	defer closeBeadStoreHandle(store) //nolint:errcheck // best-effort close of a one-shot read handle
 	parent, err := store.Get(parentID)
 	if err != nil {
 		return nil, err
@@ -58,10 +68,34 @@ var bdCreateParentLabels = func(cityPath string, cfg *config.City, target execSt
 	return parent.Labels, nil
 }
 
+// bdCreateParentLabelsWithDeadline runs bdCreateParentLabels under
+// bdCreateParentLabelsTimeout. A read that has not answered by then is
+// abandoned: the goroutine finishes (and closes its store) on its own, and
+// the caller gets a timeout error to fail open on.
+func bdCreateParentLabelsWithDeadline(cityPath string, cfg *config.City, target execStoreTarget, parentID string) ([]string, error) {
+	type result struct {
+		labels []string
+		err    error
+	}
+	timeout := bdCreateParentLabelsTimeout
+	done := make(chan result, 1)
+	go func() {
+		labels, err := bdCreateParentLabels(cityPath, cfg, target, parentID)
+		done <- result{labels: labels, err: err}
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case r := <-done:
+		return r.labels, r.err
+	case <-timer.C:
+		return nil, fmt.Errorf("parent read timed out after %s", timeout)
+	}
+}
+
 // bdCreateInheritance is what a bd create argv says about label inheritance.
 type bdCreateInheritance struct {
 	verbIndex int
-	parentID  string
 	// insertAt is the argv index the guard's flags go in front of: just
 	// after the verb, or just after the caller's last
 	// --no-inherit-labels=<bool> token, because bd takes the LAST occurrence
@@ -69,33 +103,49 @@ type bdCreateInheritance struct {
 	// caller's =false. Both positions follow a complete token, so the
 	// injected flags can never be read as some flag's value.
 	insertAt int
+	parentID string
 	// noInherit is --no-inherit-labels in effect: nothing is inherited.
 	noInherit bool
 	// batch is --file/--graph: bd creates from a plan and ignores --parent.
 	batch bool
-	// repo is --repo: bd resolves the parent in another repo's store.
-	repo     bool
+	// otherStore names the flag (--repo, --db, --database, --global) that
+	// makes bd resolve the parent in a store other than gc's scope store.
+	otherStore string
+	// quiet is bd's -q/--quiet: the informational strip line is suppressed;
+	// warnings are not.
+	quiet    bool
 	explicit []string
-	// unparseable means bd itself would reject this argv; leave it to bd.
+	// unparseable means gc cannot read this argv the way bd will.
 	unparseable bool
 }
+
+const bdCreateGuardSkippedSuffix = "the state-label inheritance guard did not run, so the child may inherit hold:*/cert:*/needs-summon (qc-p9m8oa9)"
 
 // stripInheritedStateLabelsFromBdCreateArgs returns bdArgs rewritten so the
 // created child does not inherit its parent's hold:*/cert:*/needs-summon
 // labels, or bdArgs unchanged when no such inheritance would happen. It logs
-// one line to stderr whenever it strips.
+// one line to stderr whenever it strips (unless -q) or skips a parent create.
 func stripInheritedStateLabelsFromBdCreateArgs(bdArgs []string, parentLabels func(parentID string) ([]string, error), stderr io.Writer) []string {
 	plan, ok := parseBdCreateInheritance(bdArgs)
-	if !ok || plan.parentID == "" || plan.noInherit || plan.batch || plan.unparseable {
+	if !ok {
 		return bdArgs
 	}
-	if plan.repo {
-		fmt.Fprintf(stderr, "gc bd: note: create --repo --parent %s resolves the parent in another store; the state-label inheritance guard did not run, so the child may inherit hold:*/cert:*/needs-summon (qc-p9m8oa9)\n", plan.parentID) //nolint:errcheck // best-effort stderr
+	if plan.unparseable {
+		if plan.parentID != "" || bdArgsMentionParent(bdArgs) {
+			fmt.Fprintf(stderr, "gc bd: WARNING: could not read this create's flags the way bd will; %s\n", bdCreateGuardSkippedSuffix) //nolint:errcheck // best-effort stderr
+		}
+		return bdArgs
+	}
+	if plan.parentID == "" || plan.noInherit || plan.batch {
+		return bdArgs
+	}
+	if plan.otherStore != "" {
+		fmt.Fprintf(stderr, "gc bd: note: create %s --parent %s resolves the parent in another store; %s\n", plan.otherStore, plan.parentID, bdCreateGuardSkippedSuffix) //nolint:errcheck // best-effort stderr
 		return bdArgs
 	}
 	inherited, err := parentLabels(plan.parentID)
 	if err != nil {
-		fmt.Fprintf(stderr, "gc bd: WARNING: could not read the labels of parent %s (%v); the state-label inheritance guard did not run, so the child may inherit hold:*/cert:*/needs-summon (qc-p9m8oa9)\n", plan.parentID, err) //nolint:errcheck // best-effort stderr
+		fmt.Fprintf(stderr, "gc bd: WARNING: could not read the labels of parent %s (%v); %s\n", plan.parentID, err, bdCreateGuardSkippedSuffix) //nolint:errcheck // best-effort stderr
 		return bdArgs
 	}
 	strip := beadmeta.InheritedStateLabelsToStrip(inherited, plan.explicit)
@@ -134,18 +184,42 @@ func stripInheritedStateLabelsFromBdCreateArgs(bdArgs []string, parentLabels fun
 	out = append(out, bdArgs[:plan.insertAt]...)
 	out = append(out, injected...)
 	out = append(out, bdArgs[plan.insertAt:]...)
-	fmt.Fprintf(stderr, "gc bd: create --parent %s: not inheriting the parent's state labels %s — they describe the parent, not a new child; every other parent label is still inherited, and -l <label> keeps one deliberately (qc-p9m8oa9 interim, removed when bd excludes these at create)\n", plan.parentID, strings.Join(strip, ", ")) //nolint:errcheck // best-effort stderr
+	if !plan.quiet {
+		fmt.Fprintf(stderr, "gc bd: create --parent %s: not inheriting the parent's state labels %s — they describe the parent, not a new child; every other parent label is still inherited, and -l <label> keeps one deliberately (qc-p9m8oa9 interim, removed when bd excludes these at create)\n", plan.parentID, strings.Join(strip, ", ")) //nolint:errcheck // best-effort stderr
+	}
 	return out
 }
 
-// parseBdCreateInheritance walks a bd argv the way bd's flag parser (pflag)
-// does, far enough to answer the inheritance questions: which parent, whether
-// inheritance is off, and which labels the caller passed explicitly
-// (-l/--labels/--label, repeatable, each value comma-separated). ok is false
-// when the argv is not a create.
+// bdArgsMentionParent reports whether any token spells --parent, for deciding
+// whether an argv the guard could not parse was a parent create worth a
+// warning. Crude on purpose: a false positive costs one warning line.
+func bdArgsMentionParent(bdArgs []string) bool {
+	for _, arg := range bdArgs {
+		if arg == "--parent" || strings.HasPrefix(arg, "--parent=") {
+			return true
+		}
+	}
+	return false
+}
+
+// parseBdCreateInheritance reads a bd argv the way bd's command line does,
+// far enough to answer the inheritance questions: which parent, in which
+// store, whether inheritance is off, whether output is quiet, and which labels
+// the caller passed explicitly (-l/--labels/--label, repeatable, each value
+// comma-separated). ok is false when the argv is not a create.
+//
+// cobra locates the subcommand by skipping flags, then parses EVERY other
+// token — before and after the verb — with the subcommand's flag set, which
+// includes bd's persistent (global) flags. So the verb is located with the
+// create flag tables and all remaining tokens are walked with them.
 func parseBdCreateInheritance(bdArgs []string) (bdCreateInheritance, bool) {
 	plan := bdCreateInheritance{verbIndex: -1}
-	globals := bdflags.GlobalValueFlags()
+	valueFlags := bdflags.ValueFlags("create")
+	boolFlags := bdflags.BoolFlags("create")
+	// --label is bd's hidden alias for --labels; hidden flags are absent from
+	// the help text the flag tables were transcribed from.
+	valueFlags["--label"] = true
+
 	for i := 0; i < len(bdArgs); i++ {
 		arg := bdArgs[i]
 		if !strings.HasPrefix(arg, "-") {
@@ -155,7 +229,7 @@ func parseBdCreateInheritance(bdArgs []string) (bdCreateInheritance, bool) {
 		if arg == "--" {
 			return plan, false
 		}
-		if !strings.Contains(arg, "=") && globals[arg] {
+		if !strings.Contains(arg, "=") && valueFlags[arg] {
 			i++
 		}
 	}
@@ -167,49 +241,57 @@ func parseBdCreateInheritance(bdArgs []string) (bdCreateInheritance, bool) {
 		return plan, false
 	}
 	plan.insertAt = plan.verbIndex + 1
-	valueFlags := bdflags.ValueFlags("create")
-	boolFlags := bdflags.BoolFlags("create")
-	// --label is bd's hidden alias for --labels; hidden flags are absent from
-	// the help text the flag tables were transcribed from.
-	valueFlags["--label"] = true
 
-	addLabels := func(value string) {
-		labels, err := readBdCSVValue(value)
+	parseBool := func(value string, hasValue bool) (bool, bool) {
+		if !hasValue {
+			return true, true
+		}
+		parsed, err := strconv.ParseBool(value)
 		if err != nil {
 			plan.unparseable = true
-			return
+			return false, false
 		}
-		plan.explicit = append(plan.explicit, labels...)
+		return parsed, true
 	}
 	apply := func(name, value string, hasValue bool) {
 		switch name {
 		case "--parent":
 			plan.parentID = value
 		case "-l", "--labels", "--label":
-			addLabels(value)
-		case "--no-inherit-labels":
-			on := true
-			if hasValue {
-				parsed, err := strconv.ParseBool(value)
-				if err != nil {
-					plan.unparseable = true
-					return
-				}
-				on = parsed
+			labels, err := readBdCSVValue(value)
+			if err != nil {
+				plan.unparseable = true
+				return
 			}
-			plan.noInherit = on
+			plan.explicit = append(plan.explicit, labels...)
+		case "--no-inherit-labels":
+			if on, ok := parseBool(value, hasValue); ok {
+				plan.noInherit = on
+			}
 		case "-f", "--file", "--graph":
 			if value != "" {
 				plan.batch = true
 			}
-		case "--repo":
-			plan.repo = value != ""
+		case "--repo", "--db", "--database":
+			if value != "" {
+				plan.otherStore = name
+			}
+		case "--global":
+			if on, ok := parseBool(value, hasValue); ok && on {
+				plan.otherStore = name
+			}
+		case "-q", "--quiet":
+			if on, ok := parseBool(value, hasValue); ok {
+				plan.quiet = on
+			}
 		}
 	}
 
-	args := bdArgs[plan.verbIndex+1:]
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
+	for i := 0; i < len(bdArgs); i++ {
+		if i == plan.verbIndex {
+			continue
+		}
+		arg := bdArgs[i]
 		switch {
 		case arg == "--":
 			return plan, true
@@ -218,19 +300,19 @@ func parseBdCreateInheritance(bdArgs []string) (bdCreateInheritance, bool) {
 		case strings.HasPrefix(arg, "--"):
 			name, value, inline := strings.Cut(arg, "=")
 			if !inline && valueFlags[name] {
-				if i+1 >= len(args) {
+				if i+1 >= len(bdArgs) {
 					plan.unparseable = true
 					return plan, true
 				}
 				i++
-				value = args[i]
+				value = bdArgs[i]
 				inline = true
 			}
 			if valueFlags[name] || boolFlags[name] {
 				apply(name, value, inline)
 			}
-			if name == "--no-inherit-labels" && inline {
-				plan.insertAt = plan.verbIndex + 1 + i + 1
+			if name == "--no-inherit-labels" && inline && i+1 > plan.insertAt {
+				plan.insertAt = i + 1
 			}
 			// Unknown long flag: skipped without consuming a value, like
 			// the sibling assignee walker. The rewrite only ever adds
@@ -249,9 +331,9 @@ func parseBdCreateInheritance(bdArgs []string) (bdCreateInheritance, bool) {
 						value = rest[1:]
 					case rest != "":
 						value = rest
-					case i+1 < len(args):
+					case i+1 < len(bdArgs):
 						i++
-						value = args[i]
+						value = bdArgs[i]
 					default:
 						plan.unparseable = true
 						return plan, true
@@ -260,7 +342,10 @@ func parseBdCreateInheritance(bdArgs []string) (bdCreateInheritance, bool) {
 					j = len(shorthands)
 				case boolFlags[name]:
 					if len(rest) > 1 && rest[0] == '=' {
+						apply(name, rest[1:], true)
 						j = len(shorthands)
+					} else {
+						apply(name, "", false)
 					}
 				default:
 					plan.unparseable = true

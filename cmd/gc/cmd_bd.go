@@ -462,7 +462,7 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 	// "already in flight". Dimensional labels still cascade; caller-passed
 	// labels are untouched. Remove when bd excludes these at create.
 	bdArgs = stripInheritedStateLabelsFromBdCreateArgs(bdArgs, func(parentID string) ([]string, error) {
-		return bdCreateParentLabels(cityPath, cfg, target, parentID)
+		return bdCreateParentLabelsWithDeadline(cityPath, cfg, target, parentID)
 	}, stderr)
 
 	// Pre-flight exact-ID guard for write-mutating subcommands (gcy-g4o).

@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/spf13/pflag"
@@ -46,6 +47,10 @@ func bdCreateChildLabelsOracle(t *testing.T, bdArgs []string, parentLabels []str
 	fs.StringP("type", "t", "", "")
 	fs.StringP("priority", "p", "", "")
 	fs.StringP("file", "f", "", "")
+	// bd's hidden description aliases (cmd/bd/flags.go registerCommonIssueFlags).
+	fs.String("body", "", "")
+	fs.StringP("message", "m", "", "")
+	fs.String("description-file", "", "")
 	fs.BoolP("quiet", "q", false, "")
 	fs.Bool("json", false, "")
 	fs.Bool("dry-run", false, "")
@@ -398,4 +403,191 @@ echo '{"id":"demo-parent.1"}'
 			t.Fatalf("reads = %q stderr = %q, want no read and no log", reads, stderr.String())
 		}
 	})
+
+	t.Run("a parent read past the deadline forwards the argv unchanged with a warning", func(t *testing.T) {
+		release := make(chan struct{})
+		t.Cleanup(func() { close(release) })
+		bdCreateParentLabels = func(_ string, _ *config.City, _ execStoreTarget, _ string) ([]string, error) {
+			<-release
+			return specimenParentLabels, nil
+		}
+		prevTimeout := bdCreateParentLabelsTimeout
+		bdCreateParentLabelsTimeout = 50 * time.Millisecond
+		t.Cleanup(func() { bdCreateParentLabelsTimeout = prevTimeout })
+
+		args := []string{"create", "Follow-up", "--parent", "demo-parent"}
+		var stdout, stderr bytes.Buffer
+		start := time.Now()
+		if code := doBd(args, &stdout, &stderr); code != 0 {
+			t.Fatalf("doBd = %d, stderr=%q", code, stderr.String())
+		}
+		if got := recorded(t); !slices.Equal(got, args) {
+			t.Fatalf("bd argv = %q, want verbatim %q after the read timed out", got, args)
+		}
+		if !strings.Contains(stderr.String(), "timed out") || !strings.Contains(stderr.String(), "qc-p9m8oa9") {
+			t.Fatalf("stderr = %q, want a timeout warning citing qc-p9m8oa9", stderr.String())
+		}
+		if elapsed := time.Since(start); elapsed > 10*time.Second {
+			t.Fatalf("doBd took %s; the parent read must not hold the create past its deadline", elapsed)
+		}
+	})
+}
+
+func TestStripInheritedStateLabelsPassesThroughWhenAnotherStoreIsNamed(t *testing.T) {
+	// bd resolves --parent in the store these flags select; gc's scope store
+	// may hold a stale copy of the same id, whose labels would be wrong.
+	for _, tc := range []struct {
+		flag string
+		args []string
+	}{
+		{"--repo", []string{"create", "t", "--parent", "qc-1", "--repo", "/other"}},
+		{"--repo", []string{"create", "t", "--parent", "qc-1", "--repo=/other"}},
+		{"--database", []string{"--database", "otherdb", "create", "t", "--parent", "qc-1"}},
+		{"--database", []string{"--database=otherdb", "create", "t", "--parent", "qc-1"}},
+		{"--database", []string{"create", "t", "--parent", "qc-1", "--database", "otherdb"}},
+		{"--database", []string{"create", "t", "--database=otherdb", "--parent", "qc-1"}},
+		{"--db", []string{"--db", "/x/.beads/beads.db", "create", "t", "--parent", "qc-1"}},
+		{"--db", []string{"--db=/x/.beads/beads.db", "create", "t", "--parent", "qc-1"}},
+		{"--db", []string{"create", "t", "--parent", "qc-1", "--db", "/x/.beads/beads.db"}},
+		{"--db", []string{"create", "--db=/x/.beads/beads.db", "t", "--parent", "qc-1"}},
+		{"--global", []string{"--global", "create", "t", "--parent", "qc-1"}},
+		{"--global", []string{"--global=true", "create", "t", "--parent", "qc-1"}},
+		{"--global", []string{"create", "t", "--parent", "qc-1", "--global"}},
+		{"--global", []string{"create", "t", "--global=1", "--parent", "qc-1"}},
+	} {
+		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
+			out, stderr, calls := runStripInheritedStateLabels(t, tc.args, specimenParentLabels, nil)
+			if !slices.Equal(out, tc.args) {
+				t.Fatalf("argv rewritten to %q, want untouched %q", out, tc.args)
+			}
+			if len(calls) != 0 {
+				t.Fatalf("read parent labels %q from gc's scope store, which is not the store %s selects", calls, tc.flag)
+			}
+			if !strings.Contains(stderr, tc.flag) || !strings.Contains(stderr, "qc-p9m8oa9") {
+				t.Fatalf("stderr = %q, want a note naming %s and qc-p9m8oa9", stderr, tc.flag)
+			}
+		})
+	}
+	// Control: a global flag that does NOT move the store leaves the guard on.
+	for _, args := range [][]string{
+		{"--global=false", "create", "t", "--parent", "qc-1"},
+		{"--db=", "create", "t", "--parent", "qc-1"},
+	} {
+		out, _, calls := runStripInheritedStateLabels(t, args, specimenParentLabels, nil)
+		if len(calls) != 1 {
+			t.Fatalf("argv %q: reads = %q, want the guard to run", args, calls)
+		}
+		if got := bdCreateChildLabelsOracle(t, out, specimenParentLabels); !slices.Equal(got, sortedLabels("town:x", "ready:y")) {
+			t.Fatalf("argv %q: child labels = %q, want the strip", args, got)
+		}
+	}
+}
+
+func TestStripInheritedStateLabelsParsesBdHiddenDescriptionAliases(t *testing.T) {
+	for _, args := range [][]string{
+		{"create", "t", "-m", "desc", "--parent", "qc-1"},
+		{"create", "t", "-mdesc", "--parent", "qc-1"},
+		{"create", "t", "--message", "desc", "--parent", "qc-1"},
+		{"create", "t", "--body", "desc", "--parent", "qc-1"},
+		{"create", "t", "--description-file", "d.md", "--parent", "qc-1"},
+	} {
+		out, stderr, calls := runStripInheritedStateLabels(t, args, specimenParentLabels, nil)
+		if !slices.Equal(calls, []string{"qc-1"}) {
+			t.Errorf("argv %q: reads = %q, want [qc-1] (stderr %q)", args, calls, stderr)
+			continue
+		}
+		if got := bdCreateChildLabelsOracle(t, out, specimenParentLabels); !slices.Equal(got, sortedLabels("town:x", "ready:y")) {
+			t.Errorf("argv %q: child labels = %q, want the strip (argv %q)", args, got, out)
+		}
+	}
+	// A value that looks like --parent belongs to the alias, as it does in bd.
+	for _, args := range [][]string{
+		{"create", "t", "--body", "--parent=qc-9"},
+		{"create", "t", "--message", "--parent", "qc-9"},
+		{"create", "t", "--description-file", "--parent=qc-9"},
+	} {
+		out, stderr, calls := runStripInheritedStateLabels(t, args, specimenParentLabels, nil)
+		if !slices.Equal(out, args) || len(calls) != 0 || stderr != "" {
+			t.Errorf("argv %q: out=%q reads=%q stderr=%q, want untouched, no read, silent", args, out, calls, stderr)
+		}
+	}
+}
+
+func TestStripInheritedStateLabelsWarnsWhenItCannotParseAParentCreate(t *testing.T) {
+	for _, args := range [][]string{
+		{"create", "t", "--parent", "qc-1", "-Z"},
+		{"create", "t", "-Z", "--parent", "qc-1"},
+		{"create", "t", "--parent", "qc-1", "-d"},
+		{"create", "t", "--parent=qc-1", "-l", `"unterminated`},
+	} {
+		out, stderr, calls := runStripInheritedStateLabels(t, args, specimenParentLabels, nil)
+		if !slices.Equal(out, args) || len(calls) != 0 {
+			t.Errorf("argv %q: out=%q reads=%q, want untouched and no read", args, out, calls)
+		}
+		if !strings.Contains(stderr, "did not run") || !strings.Contains(stderr, "qc-p9m8oa9") {
+			t.Errorf("argv %q: stderr = %q, want the skip warning", args, stderr)
+		}
+	}
+	// No parent anywhere: nothing would be inherited, so nothing to say.
+	out, stderr, _ := runStripInheritedStateLabels(t, []string{"create", "t", "-Z"}, specimenParentLabels, nil)
+	if stderr != "" || len(out) != 3 {
+		t.Errorf("parentless unparseable create: out=%q stderr=%q, want untouched and silent", out, stderr)
+	}
+}
+
+func TestStripInheritedStateLabelsQuietSuppressesOnlyTheStripLine(t *testing.T) {
+	for _, args := range [][]string{
+		{"create", "t", "--parent", "qc-1", "-q"},
+		{"create", "t", "--parent", "qc-1", "--quiet"},
+		{"-q", "create", "t", "--parent", "qc-1"},
+		{"--quiet=true", "create", "t", "--parent", "qc-1"},
+		{"create", "t", "-ql", "extra", "--parent", "qc-1"},
+	} {
+		out, stderr, _ := runStripInheritedStateLabels(t, args, specimenParentLabels, nil)
+		if got := bdCreateChildLabelsOracle(t, out, specimenParentLabels); slices.Contains(got, "hold:cert-wait") {
+			t.Errorf("argv %q: quiet must not disable the strip; child labels = %q", args, got)
+		}
+		if stderr != "" {
+			t.Errorf("argv %q: stderr = %q, want the strip line suppressed under quiet", args, stderr)
+		}
+	}
+	_, stderr, _ := runStripInheritedStateLabels(t, []string{"create", "t", "--parent", "qc-1", "--quiet=false"}, specimenParentLabels, nil)
+	if !strings.Contains(stderr, "needs-summon") {
+		t.Errorf("--quiet=false: stderr = %q, want the strip line", stderr)
+	}
+	// Warnings are not chatter: they still print under -q.
+	_, stderr, _ = runStripInheritedStateLabels(t, []string{"create", "t", "--parent", "qc-1", "-q"}, nil, errors.New("store unavailable"))
+	if !strings.Contains(stderr, "store unavailable") {
+		t.Errorf("-q with a failed read: stderr = %q, want the warning", stderr)
+	}
+}
+
+func TestBdCreateParentLabelsWithDeadlineTimesOut(t *testing.T) {
+	release := make(chan struct{})
+	prev := bdCreateParentLabels
+	bdCreateParentLabels = func(_ string, _ *config.City, _ execStoreTarget, _ string) ([]string, error) {
+		<-release
+		return specimenParentLabels, nil
+	}
+	prevTimeout := bdCreateParentLabelsTimeout
+	bdCreateParentLabelsTimeout = 20 * time.Millisecond
+	t.Cleanup(func() {
+		close(release)
+		bdCreateParentLabels = prev
+		bdCreateParentLabelsTimeout = prevTimeout
+	})
+
+	labels, err := bdCreateParentLabelsWithDeadline("", nil, execStoreTarget{}, "qc-1")
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("labels=%q err=%v, want a timeout error", labels, err)
+	}
+
+	// Control: a prompt read returns its labels.
+	bdCreateParentLabels = func(_ string, _ *config.City, _ execStoreTarget, _ string) ([]string, error) {
+		return specimenParentLabels, nil
+	}
+	labels, err = bdCreateParentLabelsWithDeadline("", nil, execStoreTarget{}, "qc-1")
+	if err != nil || !slices.Equal(labels, specimenParentLabels) {
+		t.Fatalf("labels=%q err=%v, want the parent labels", labels, err)
+	}
 }

@@ -59,6 +59,10 @@ var valueFlagsBySub = map[string]map[string]bool{
 		"-s": true, "--status": true, "--storage-class": true, "--title": true,
 		"-t": true, "--type": true, "--waits-for": true,
 		"--waits-for-gate": true, "--wisp-type": true,
+		// Hidden aliases, absent from --help (cmd/bd/flags.go
+		// registerCommonIssueFlags): --body and -m/--message alias
+		// --description, --description-file aliases --body-file.
+		"--body": true, "-m": true, "--message": true, "--description-file": true,
 	},
 	"update": {
 		"--acceptance": true, "--add-label": true, "--append-notes": true,
