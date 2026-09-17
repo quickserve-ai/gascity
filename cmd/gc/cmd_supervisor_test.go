@@ -5333,6 +5333,8 @@ func TestStopManagedCityForcesCleanupAfterTimeout(t *testing.T) {
 		},
 	}
 
+	warmSpyScript(t, script)
+
 	var stderr bytes.Buffer
 	start := time.Now()
 	err := stopManagedCity(mc, cityPath, &stderr)
@@ -5497,6 +5499,8 @@ func TestStopManagedCityBoundsForcedShutdownWhenRuntimeHangs(t *testing.T) {
 			forceStopShutdown: forceStop,
 		},
 	}
+
+	warmSpyScript(t, script)
 
 	var stderr bytes.Buffer
 	result := make(chan error, 1)
