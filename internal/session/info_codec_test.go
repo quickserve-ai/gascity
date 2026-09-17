@@ -127,6 +127,7 @@ func infoFromPersistedBeadFrozen(b beads.Bead) Info {
 		WakeMode:                       b.Metadata["wake_mode"],
 		DrainAt:                        b.Metadata["drain_at"],
 		SleepIntent:                    b.Metadata["sleep_intent"],
+		LivenessReadDegraded:           strings.TrimSpace(b.Metadata[beadmeta.LivenessReadDegradedMetadataKey]) != "",
 		InstanceToken:                  b.Metadata["instance_token"],
 		DetachedAt:                     b.Metadata["detached_at"],
 		CurrentlyProcessingBeadID:      b.Metadata[CurrentBeadIDKey],
