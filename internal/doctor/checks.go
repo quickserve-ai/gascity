@@ -2417,6 +2417,28 @@ func duDirBytes(root string) (int64, bool, error) {
 		if errors.Is(err, exec.ErrNotFound) {
 			return boundedSumDirBytes(root)
 		}
+		// du reports WHY on stderr ("Permission denied") and exits 1; without
+		// it the caller sees a bare "exit status 1" and cannot tell an
+		// unreadable tree from any other failure (ga-hyhccs).
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			// Classify on the WHOLE stderr, then shorten it: a few long
+			// worktree paths fill any prefix, and the permission line need
+			// not be first. One line, because callers print the error inside
+			// a single-line doctor message.
+			full := strings.TrimSpace(string(exitErr.Stderr))
+			denied := strings.Contains(full, "Permission denied")
+			stderr := strings.Join(strings.Fields(strings.ReplaceAll(full, "\n", " ; ")), " ")
+			if runes := []rune(stderr); len(runes) > 300 {
+				stderr = string(runes[:300]) + "..."
+			}
+			if denied {
+				return 0, true, fmt.Errorf("measure directory with du -sk: %w: %w: %s", err, fs.ErrPermission, stderr)
+			}
+			if stderr != "" {
+				return 0, true, fmt.Errorf("measure directory with du -sk: %w: %s", err, stderr)
+			}
+		}
 		return 0, true, fmt.Errorf("measure directory with du -sk: %w", err)
 	}
 
