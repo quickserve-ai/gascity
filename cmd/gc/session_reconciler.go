@@ -1013,10 +1013,20 @@ func finalizeDrainAckStoppedSession(
 	// (ga-kaei). Stamp a cooldown hold — held_until is already honored as a
 	// hard wake blocker and an explicit wake request (nudge/attach) clears it,
 	// so urgent demand still wakes the session immediately.
+	//
+	// The cooldown extends a hold and never shortens one. A held_until already
+	// past the cooldown is somebody else's hold — gc session suspend's
+	// indefinite sentinel, or an agent keep-alive — and overwriting it releases
+	// that hold early: a suspended always+fresh seat was respawned when the
+	// five-minute stamp expired, with no operator act (fork PR #59 review,
+	// item 3).
 	if !hasAssignedWork &&
 		info.WakeMode == "fresh" &&
 		strings.TrimSpace(info.ConfiguredNamedMode) == "always" {
-		batch["held_until"] = clk.Now().Add(freshWakeHeartbeatCooldown).UTC().Format(time.RFC3339)
+		cooldownUntil := clk.Now().Add(freshWakeHeartbeatCooldown).UTC()
+		if !metadataTimeInFuture(info.HeldUntil, cooldownUntil) {
+			batch["held_until"] = cooldownUntil.Format(time.RFC3339)
+		}
 	}
 	// A drain-ack that completes a restart-request cycle (gc session reset →
 	// agent drain-ack) must also consume restart_requested. The drain-ack
