@@ -137,10 +137,12 @@ const (
 //
 // runtime_epoch and bead_epoch are the SAME quantity read from two sides:
 // session starts stamp GC_RUNTIME_EPOCH from the bead's generation metadata,
-// and preWakeCommit bumps that generation in the same patch that mints a new
-// instance token. They are directly comparable; bead_epoch is carried raw, so
-// an empty bead generation beside runtime_epoch "1" is the start path's
-// default, not a mismatch.
+// turning an empty, zero or unparseable generation into 1, and bead_epoch is
+// normalized the same way so the two compare as written. Two limits on what the
+// comparison proves: a reconciler wake bumps the generation together with a new
+// instance token, but a start that finds no token mints one WITHOUT a bump, so
+// token_superseded with equal epochs is possible and equal epochs do not prove
+// the same incarnation. The token decides the refusal; the epochs only date it.
 //
 // SECURITY: an instance token is a credential. No field carries one. A
 // fingerprint is the first 8 hex characters of the token's SHA-256 — enough to
@@ -157,8 +159,8 @@ type HookClaimRefusedPayload struct {
 	TokenMatched            *bool  `json:"token_matched,omitempty" doc:"Whether the runtime's instance token equals the session bead's; absent when no bead was read."`
 	RuntimeTokenFingerprint string `json:"runtime_token_fingerprint,omitempty" doc:"First 8 hex chars of SHA-256 of the runtime's instance token. Never the token."`
 	BeadTokenFingerprint    string `json:"bead_token_fingerprint,omitempty" doc:"First 8 hex chars of SHA-256 of the session bead's instance token. Never the token."`
-	RuntimeEpoch            string `json:"runtime_epoch,omitempty" doc:"The runtime's GC_RUNTIME_EPOCH: the session bead's generation as it stood when this runtime was started (an empty or invalid generation starts as 1)."`
-	BeadEpoch               string `json:"bead_epoch,omitempty" doc:"The session bead's generation metadata, raw: the same counter runtime_epoch was stamped from. Each reconciler wake increments it and mints a new instance token together, so a runtime_epoch below bead_epoch means the generation moved on after this runtime started, normally because a later wake started another incarnation. The refusal itself is decided by the token, not by this comparison."`
+	RuntimeEpoch            string `json:"runtime_epoch,omitempty" doc:"The runtime's GC_RUNTIME_EPOCH: the session bead's generation when this runtime was started, with an empty, zero or unparseable generation started as 1."`
+	BeadEpoch               string `json:"bead_epoch,omitempty" doc:"The session bead's generation now, normalized as a start normalizes it (empty, zero or unparseable becomes 1), so it compares directly with runtime_epoch. A lower runtime_epoch means the generation moved on after this runtime started. Equal epochs do NOT prove the same incarnation: a start that finds no instance token mints one without bumping the generation."`
 }
 
 // IsEventPayload marks HookClaimRefusedPayload as an events.Payload variant.
