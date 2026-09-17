@@ -107,9 +107,11 @@ type AwakeWorkBead struct {
 	// doctrine ga-5zosxs). Removing the hold label is what restores demand, so
 	// the patrol's durable flip wakes the owner without relying on its nudge.
 	//
-	// Like Blocked, it is not purely suppressive: it also releases the owner's
-	// scale slot (countAssignedScaleSlots), which is the pivot the doctrine
-	// asks for — a parked seat's slot is capacity for other work.
+	// Like Blocked, it is not purely suppressive: countAssignedScaleSlots no
+	// longer counts the owner as a filled scale slot, so scale_check demand can
+	// wake a different ACTIVE session as scaled:demand. It does not free pool
+	// capacity: the asleep owner's session still exists and still counts
+	// wherever pool session occupancy is counted.
 	CertParked bool
 }
 
