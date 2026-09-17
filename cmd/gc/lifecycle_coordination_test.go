@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -17,9 +16,10 @@ import (
 // writeSpyScript creates a shell script that logs operations to a file and
 // recreates .beads/ on init (simulating bd init wiping hooks). Returns the
 // script path.
-// warmSpyScript execs a freshly written spy script once, as a "probe" op
-// (which assertSingleStopWithBenignNoise ignores), before a test starts a
-// clock around a code path that ends in a provider op. On macOS the FIRST exec
+// warmSpyScript runs a freshly written spy script once, as a "probe" provider
+// op (which assertSingleStopWithBenignNoise ignores) through the same
+// runProviderOpWithEnv path stopManagedCity uses, before a test starts a clock
+// around a code path that ends in a provider op. On macOS the FIRST exec
 // of a just-written executable costs ~190ms while the OS checks it (measured
 // 2026-09-17: 193/189/188ms on the first call, ~4.5ms on every call after,
 // ga-9dmm43). Linux has no such cost, so a wall-clock bound that includes it
@@ -27,8 +27,8 @@ import (
 // WhenRuntimeHangs read ~335ms against its 200ms bound on each local run.
 func warmSpyScript(t *testing.T, script string) {
 	t.Helper()
-	if out, err := exec.Command(script, "probe").CombinedOutput(); err != nil {
-		t.Fatalf("warming spy script: %v: %s", err, out)
+	if err := runProviderOpWithEnv(script, nil, "probe"); err != nil {
+		t.Fatalf("warming spy script: %v", err)
 	}
 }
 
