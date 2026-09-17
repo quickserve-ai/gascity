@@ -224,7 +224,7 @@ func TestNudgeSendPathPastesOnlyWhenPaneBracketPasteFlagIsOn(t *testing.T) {
 	}{
 		{name: "flag 1 pastes", flag: "1", wantPaste: true},
 		{name: "flag 0 keeps send-keys", flag: "0"},
-		{name: "empty flag keeps send-keys", flag: ""},
+		{name: "empty flag (tmux before 3.7 lacks the format) keeps send-keys", flag: ""},
 		{name: "flag read error keeps send-keys", flagErr: errors.New("can't find pane: %1")},
 	}
 	for _, tt := range tests {

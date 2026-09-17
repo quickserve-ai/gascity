@@ -2128,9 +2128,24 @@ func claudeNeedsBracketedPaste(text string) bool {
 // Any answer but "1", including a failed read, reports false, and the caller
 // keeps the send-keys path. It is read last, so only a claude nudge that
 // needs a paste pays for the extra tmux call.
+//
+// A tmux server older than 3.7 has no such format and renders it empty (see
+// paneBracketPasteFlag). There the mode cannot be confirmed, so claude nudges
+// keep the send-keys delivery they had before ga-6qfgdo: pasting blind would
+// trade the tail-only loss for line-by-line submits in any pane without the
+// mode, and this guard exists to rule that out.
 func (t *Tmux) paneHasBracketedPasteOn(target string) bool {
+	flag, err := t.paneBracketPasteFlag(target)
+	return err == nil && flag == "1"
+}
+
+// paneBracketPasteFlag returns target's #{bracket_paste_flag}, trimmed. tmux
+// 3.7 added the format and renders "1" or "0" for a pane. An older server
+// renders the unknown format as "", which therefore means "cannot tell", not
+// "off".
+func (t *Tmux) paneBracketPasteFlag(target string) (string, error) {
 	flag, err := t.run("display-message", "-t", target, "-p", "#{bracket_paste_flag}")
-	return err == nil && strings.TrimSpace(flag) == "1"
+	return strings.TrimSpace(flag), err
 }
 
 // targetIsClaudeFamily reports whether target runs a claude-family provider,
