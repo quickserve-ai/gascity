@@ -1445,6 +1445,7 @@ func TestSupervisorInstallUnsupportedOS(t *testing.T) {
 		t.Skip("unsupported-os test only applies outside darwin/linux")
 	}
 	t.Setenv("GC_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir()) // the deploy-freeze guard reads $HOME/.gc (ga-bztbqf)
 
 	var stdout, stderr bytes.Buffer
 	code := doSupervisorInstall(&stdout, &stderr)
