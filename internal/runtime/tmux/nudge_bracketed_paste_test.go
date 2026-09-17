@@ -12,17 +12,22 @@ import (
 // bracketedPasteExecutor is a recorded tmux runner for the nudge send path. It
 // answers show-environment with the configured GC_PROVIDER (an empty provider
 // reports the variable unset, and the empty display-message reply then makes
-// the process sniff come back negative), and it reads each load-buffer file at
-// load time, because pasteLiteralText deletes that file before returning.
+// the process sniff come back negative), answers the #{bracket_paste_flag} read
+// with pasteFlag or pasteFlagErr, and reads each load-buffer file at load time,
+// because pasteLiteralText deletes that file before returning.
 type bracketedPasteExecutor struct {
-	provider string
-	calls    [][]string
-	loaded   []string
+	provider     string
+	pasteFlag    string
+	pasteFlagErr error
+	calls        [][]string
+	loaded       []string
 }
 
 func (f *bracketedPasteExecutor) execute(args []string) (string, error) {
 	f.calls = append(f.calls, append([]string(nil), args...))
 	switch {
+	case tmuxArgsContain(args, "#{bracket_paste_flag}"):
+		return f.pasteFlag, f.pasteFlagErr
 	case tmuxArgsContain(args, "show-environment"):
 		if f.provider == "" {
 			return "", errors.New("unknown variable: GC_PROVIDER")
@@ -114,7 +119,7 @@ func TestNudgeSendPathBracketsLongOrMultilineClaudeText(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			fe := &bracketedPasteExecutor{provider: "claude"}
+			fe := &bracketedPasteExecutor{provider: "claude", pasteFlag: "1"}
 			tm := NewTmuxWithConfig(DefaultConfig())
 			tm.exec = fe
 
@@ -165,7 +170,9 @@ func TestNudgeSendPathLeavesNonClaudeProvidersOnSendKeys(t *testing.T) {
 	text := multiLineNudge(2646)
 	for _, provider := range []string{"codex", "gemini", "omp", "pi", "opencode", "copilot", "kimi", ""} {
 		t.Run("provider="+provider, func(t *testing.T) {
-			fe := &bracketedPasteExecutor{provider: provider}
+			// The pane reports bracketed paste on, so only the family check
+			// keeps these providers on send-keys.
+			fe := &bracketedPasteExecutor{provider: provider, pasteFlag: "1"}
 			tm := NewTmuxWithConfig(DefaultConfig())
 			tm.exec = fe
 
@@ -199,13 +206,67 @@ func TestNudgeSendPathLeavesNonClaudeProvidersOnSendKeys(t *testing.T) {
 	})
 }
 
+// TestNudgeSendPathPastesOnlyWhenPaneBracketPasteFlagIsOn pins the guard in
+// front of the claude paste route. `paste-buffer -p` brackets a paste only when
+// the pane's application has turned bracketed paste on; with
+// #{bracket_paste_flag} at 0, tmux writes a multi-line nudge raw as
+// "line1\rline2\r...", and each CR submits a line on its own. So a claude nudge
+// goes out as a paste only when the flag reads "1". A flag of "0", an empty
+// answer, or a failed read keeps the send-keys path this nudge took before
+// ga-6qfgdo, and none of them is an error.
+func TestNudgeSendPathPastesOnlyWhenPaneBracketPasteFlagIsOn(t *testing.T) {
+	text := multiLineNudge(900)
+	tests := []struct {
+		name      string
+		flag      string
+		flagErr   error
+		wantPaste bool
+	}{
+		{name: "flag 1 pastes", flag: "1", wantPaste: true},
+		{name: "flag 0 keeps send-keys", flag: "0"},
+		{name: "empty flag keeps send-keys", flag: ""},
+		{name: "flag read error keeps send-keys", flagErr: errors.New("can't find pane: %1")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fe := &bracketedPasteExecutor{provider: "claude", pasteFlag: tt.flag, pasteFlagErr: tt.flagErr}
+			tm := NewTmuxWithConfig(DefaultConfig())
+			tm.exec = fe
+
+			if err := tm.sendKeysLiteralWithRetry("%1", text, time.Second); err != nil {
+				t.Fatalf("sendKeysLiteralWithRetry() = %v, want nil", err)
+			}
+
+			literal := fe.literalSends()
+			pastes := fe.callsWith("paste-buffer")
+			if tt.wantPaste {
+				if len(literal) != 0 || len(pastes) != 1 {
+					t.Fatalf("flag %q: send-keys -l calls = %d, paste-buffer calls = %d, want 0 and 1; calls: %q", tt.flag, len(literal), len(pastes), fe.calls)
+				}
+			} else {
+				if len(pastes) != 0 || len(fe.callsWith("load-buffer")) != 0 {
+					t.Fatalf("flag %q (err %v): nudge used the paste buffer into a pane without bracketed paste, which submits it line by line; calls: %q", tt.flag, tt.flagErr, fe.calls)
+				}
+				if len(literal) != 1 || literal[0] != text {
+					t.Fatalf("flag %q (err %v): send-keys -l texts = %d call(s), want exactly one carrying the whole text; calls: %q", tt.flag, tt.flagErr, len(literal), fe.calls)
+				}
+			}
+
+			reads := fe.callsWith("#{bracket_paste_flag}")
+			if len(reads) != 1 || !tmuxArgsContain(reads[0], "display-message") || !tmuxArgsContain(reads[0], "%1") {
+				t.Fatalf("bracket_paste_flag reads = %q, want one display-message against %%1; calls: %q", reads, fe.calls)
+			}
+		})
+	}
+}
+
 // TestPaneShowsDrainedComposerTreatsClaudePastePlaceholderAsDraft covers the
 // submit-confirm fallback once long nudges are pasted. Claude Code collapses a
-// paste over 800 characters or more than two lines into a "[Pasted text #N ...]"
-// placeholder, so an unsubmitted pasted nudge sits in the composer as that
-// placeholder instead of its first line. Read as "drained", it would be reported
-// ErrNudgeSubmitDeliveredUnobserved, which callers never retry, and the nudge
-// would be lost while it still sat unsubmitted.
+// paste over 800 characters, or with more than two line breaks, into a
+// "[Pasted text #N ...]" placeholder, so an unsubmitted pasted nudge sits in the
+// composer as that placeholder instead of its first line. Read as "drained", it
+// would be reported ErrNudgeSubmitDeliveredUnobserved, which callers never
+// retry, and the nudge would be lost while it still sat unsubmitted.
 func TestPaneShowsDrainedComposerTreatsClaudePastePlaceholderAsDraft(t *testing.T) {
 	sent := multiLineNudge(2646)
 	tests := []struct {
