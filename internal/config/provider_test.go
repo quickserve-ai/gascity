@@ -1132,20 +1132,33 @@ func TestFableModelChoicesResolveToExpectedFlags(t *testing.T) {
 	}
 }
 
-// TestValidateOptionDefaultsAcceptsFableAlias covers the step that is actually
-// blocked until this enum ships: city.toml sets model = "fable" on 13
-// providers, and ValidateOptionDefaults rejects any value outside the enum at
-// config load. Flipping city.toml before the binary serves these choices fails
-// the whole city's config load, so the ordering (enum first, then the provider
-// edit) is a hard dependency, not a preference.
+// TestValidateOptionDefaultsAcceptsFableAlias covers the step the city.toml
+// flip depends on: providers set model = "fable" and config load must accept
+// it AND expand it to the 1M launch id.
+//
+// The model option is open (upstream #5658), so an undeclared value no longer
+// fails config load; it reaches the CLI verbatim. That makes the ordering
+// hazard quieter, not gone: flipping city.toml to "fable" on a binary without
+// these aliases loads fine and launches "--model fable", which lands on the
+// 200k tier. So this test pins the expansion, not just the validation.
 func TestValidateOptionDefaultsAcceptsFableAlias(t *testing.T) {
 	schema := BuiltinProviders()["claude"].OptionsSchema
-	for _, value := range []string{"fable", "fable-5-1", "fable-5", "fable-5-200k"} {
+	opt := findOption(schema, "model")
+	if opt == nil {
+		t.Fatal("claude schema has no model option")
+	}
+	for value, wantModel := range map[string]string{
+		"fable":        "fable[1m]",
+		"fable-5-1":    "claude-fable-5-1[1m]",
+		"fable-5":      "claude-fable-5[1m]",
+		"fable-5-200k": "claude-fable-5",
+	} {
 		if err := ValidateOptionDefaults(schema, map[string]string{"model": value}); err != nil {
 			t.Errorf("ValidateOptionDefaults(model=%q) = %v, want nil", value, err)
 		}
-	}
-	if err := ValidateOptionDefaults(schema, map[string]string{"model": "fable-5-2"}); err == nil {
-		t.Error("ValidateOptionDefaults(model=\"fable-5-2\") = nil, want an error — an unknown pin must fail config load, not resolve to a default")
+		args, ok := OptionFlagArgs(*opt, value)
+		if !ok || !containsFlagValue(args, "--model", wantModel) {
+			t.Errorf("OptionFlagArgs(model=%q) = %v, %v; want --model %s", value, args, ok, wantModel)
+		}
 	}
 }
