@@ -878,6 +878,66 @@ fetched = "2026-06-11T17:08:05Z"
 	}
 }
 
+// TestImportStateDoctorCheckMigratesCarryCanonicalPin covers a city whose
+// pack.toml and packs.lock both pin the bundled core pack, under its tree-URL
+// source, at the canonical commit carry builds wrote through
+// fleet/2026-09-15. A binary with a different canonical pin cannot load that
+// city, and gastownhall/gascity has no ref that reaches the commit, so the
+// fix must re-pin both files without a fetch.
+func TestImportStateDoctorCheckMigratesCarryCanonicalPin(t *testing.T) {
+	clearGCEnv(t)
+	const carryCommit = "abcf2b6393a1e52378656570028ac6deb3d2f10f"
+	const coreSource = "https://github.com/gastownhall/gascity/tree/main/internal/bootstrap/packs/core"
+	gcHome := filepath.Join(t.TempDir(), "gc-home")
+	t.Setenv("GC_HOME", gcHome)
+	cityDir := t.TempDir()
+	writeCityToml(t, cityDir, "[workspace]\nname = \"demo\"\n")
+	writePackToml(t, cityDir, `[pack]
+name = "demo"
+schema = 2
+
+[imports.core]
+source = "`+coreSource+`"
+version = "sha:`+carryCommit+`"
+`)
+	if err := os.WriteFile(filepath.Join(cityDir, "packs.lock"), []byte(`schema = 1
+
+[packs."`+coreSource+`"]
+version = "sha:`+carryCommit+`"
+commit = "`+carryCommit+`"
+fetched = "2026-08-13T05:03:17Z"
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	check := newImportStateDoctorCheck(cityDir)
+	result := check.Run(&doctor.CheckContext{CityPath: cityDir})
+	if result.Status != doctor.StatusError {
+		t.Fatalf("status = %v, want error for a carry canonical pin; result=%#v", result.Status, result)
+	}
+	details := strings.Join(result.Details, "\n")
+	if !strings.Contains(details, carryCommit) || !strings.Contains(details, "superseded-canonical-pin") {
+		t.Fatalf("details = %v, want a superseded carry canonical pin detail", result.Details)
+	}
+
+	if err := check.Fix(&doctor.CheckContext{CityPath: cityDir}); err != nil {
+		t.Fatalf("Fix: %v", err)
+	}
+	canonicalCommit := strings.TrimPrefix(config.BundledPackImportVersion, "sha:")
+	for _, name := range []string{"pack.toml", "packs.lock"} {
+		data, err := os.ReadFile(filepath.Join(cityDir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(data), carryCommit) {
+			t.Fatalf("%s still pins the carry canonical commit after fix:\n%s", name, data)
+		}
+		if !strings.Contains(string(data), canonicalCommit) {
+			t.Fatalf("%s missing the current canonical commit after fix:\n%s", name, data)
+		}
+	}
+}
+
 type errorInjectingFS struct {
 	fsys.OSFS
 	failWritePath string
