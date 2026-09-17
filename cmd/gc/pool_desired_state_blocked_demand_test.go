@@ -657,6 +657,73 @@ func TestBuildDesiredStateKeepsPoolSessionForElapsedDeferRoutedWork(t *testing.T
 	}
 }
 
+// TestBuildDesiredStateWithholdsPoolSessionForBlockedOutcomeOrphanBdReadyWouldServe
+// pins the ONE case where this gate is deliberately stricter than the query the
+// seat it would mint actually runs.
+//
+// Every Ready() backend drops a row whose blocking dependency closed with
+// gc.work_outcome=blocked, and the store conformance suite requires it
+// (internal/beads/beadstest/conformance.go, ADR-0009: such a close does not
+// satisfy the dependency). Raw `bd ready` does not know that key, so on a
+// single-store city — where the seat's assigned-ready tier IS raw `bd ready` —
+// the seat would be served this row, and gc hook would not filter it out either.
+//
+// Withholding is still the answer this gate gives, on purpose: it is what
+// Ready() means, and the unassigned arm already answers the same way for the
+// same row, so the two arms agree rather than this gate inventing a rule. See
+// vetoesWakeCandidate for the full reasoning and the evidence on both sides.
+//
+// If this test ever flips — a seat IS planned — the frontier was made
+// serve-equivalent per topology (bead gc-zkcd) and that doc comment is stale.
+func TestBuildDesiredStateWithholdsPoolSessionForBlockedOutcomeOrphanBdReadyWouldServe(t *testing.T) {
+	cityPath := t.TempDir()
+	seedNoRoutes(t, cityPath)
+	cfg := poolWakeBuilderCity()
+	topo := cityQueryTopology(cityPath, cfg)
+	if topo.FederatedReady {
+		t.Fatalf("fixture invalid: the city reads claimable work through the federated reader")
+	}
+	if q := cfg.Agents[0].EffectiveAssignedReadyQueryFor(topo); !strings.Contains(q, "bd ready") {
+		t.Fatalf("fixture invalid: the seat's assigned-ready tier is not raw bd ready: %s", q)
+	}
+
+	mem := beads.NewMemStore()
+	blocker, err := mem.Create(beads.Bead{Title: "predecessor that closed blocked", Type: "task", Status: "open"})
+	if err != nil {
+		t.Fatalf("create blocker: %v", err)
+	}
+	step, err := mem.Create(beads.Bead{
+		Title:    "routed step behind a blocked-outcome close",
+		Type:     "task",
+		Status:   "open",
+		Assignee: poolWakeTemplate,
+		Metadata: map[string]string{beadmeta.RoutedToMetadataKey: poolWakeTemplate},
+	})
+	if err != nil {
+		t.Fatalf("create step: %v", err)
+	}
+	if err := mem.DepAdd(step.ID, blocker.ID, "blocks"); err != nil {
+		t.Fatalf("block step: %v", err)
+	}
+	if err := mem.Close(blocker.ID); err != nil {
+		t.Fatalf("close blocker: %v", err)
+	}
+	if err := mem.SetMetadataBatch(blocker.ID, map[string]string{beadmeta.WorkOutcomeMetadataKey: beadmeta.WorkOutcomeBlocked}); err != nil {
+		t.Fatalf("record blocked outcome: %v", err)
+	}
+	if readyFrontierHas(t, mem, step.ID) {
+		t.Fatalf("fixture invalid: Ready() returned step %s, so the gate would not veto it", step.ID)
+	}
+
+	got := buildDesiredStateWithSessionBeads(
+		"test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), mem, nil,
+		newSessionBeadSnapshot(nil), nil, io.Discard,
+	)
+	if planned := poolWakeSessionsPlanned(got.State); len(planned) != 0 {
+		t.Fatalf("desired state planned %v for %s while its only work (%s) sits behind a blocked-outcome close, want none — Ready() does not serve that row, so the gate withholds it even though this city's seats read with raw `bd ready` and would be served it (gc-zkcd)", planned, poolWakeTemplate, step.ID)
+	}
+}
+
 // TestPoolWakeReadinessKeepsDemandForElapsedDeferral is the anti-starvation
 // direction of the deferral read, with the gate armed: an orphaned row with no
 // blocker whose defer_until has ELAPSED stays wake demand. The molecule root
