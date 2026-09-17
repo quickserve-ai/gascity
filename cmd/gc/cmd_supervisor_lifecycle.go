@@ -55,8 +55,13 @@ var (
 	// launchdRefreshWaitTimeout bounds each wait inside a launchd refresh:
 	// a booted-out job leaving launchd, and the refreshed supervisor proving
 	// it serves the new build.
-	launchdRefreshWaitTimeout        = 90 * time.Second
-	supervisorPlistValidationTimeout = 2 * time.Second
+	launchdRefreshWaitTimeout = 90 * time.Second
+	// supervisorPlistValidationTimeout bounds each plist preflight probe
+	// (plutil lint, plutil convert, gc version). The preflight runs before
+	// any bootout, so patience costs nothing on a healthy box, while a 2s
+	// bound failed the install exactly when the box was loaded: a healthy
+	// gc version took 2.98-5.66s at load average 58 (ga-jgwpjg).
+	supervisorPlistValidationTimeout = 30 * time.Second
 	// supervisorLaunchdExitTimeout is the plist's ExitTimeOut: how long
 	// launchd waits between the SIGTERM of a bootout and its SIGKILL. With
 	// no key launchd uses 5s, which equals a city's default stop grace, so
@@ -999,14 +1004,16 @@ func validateSupervisorLaunchdPlist(path, label, expectedGCPath string) error {
 		return fmt.Errorf("gc executable %q is not executable", gcPath)
 	}
 	versionCtx, cancelVersion := context.WithTimeout(context.Background(), supervisorPlistValidationTimeout)
+	versionStarted := time.Now()
 	versionOutput, err := exec.CommandContext(versionCtx, gcPath, "version").CombinedOutput()
+	versionElapsed := time.Since(versionStarted).Round(time.Millisecond)
 	versionTimedOut := errors.Is(versionCtx.Err(), context.DeadlineExceeded)
 	cancelVersion()
 	if err != nil {
 		if versionTimedOut {
 			return fmt.Errorf("gc executable %q version check timed out after %s", gcPath, supervisorPlistValidationTimeout)
 		}
-		return fmt.Errorf("gc executable %q failed execution check: %w", gcPath, err)
+		return fmt.Errorf("gc executable %q failed execution check after %s: %w", gcPath, versionElapsed, err)
 	}
 	if len(versionOutput) == 0 {
 		return fmt.Errorf("gc executable %q returned empty output from version check", gcPath)
