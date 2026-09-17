@@ -219,6 +219,9 @@ func (service *Service) RecordOnce(permit RecordingPermit, commandID CommandID) 
 		}
 	}
 	lockContext, cancel := newLockContext(remaining)
+	if lockContext == nil || cancel == nil {
+		return RecordDropped
+	}
 	defer cancel()
 	lock, err := root.acquireLock(lockContext, stateLockName)
 	if err != nil {
