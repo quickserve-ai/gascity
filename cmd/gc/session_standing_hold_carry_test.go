@@ -400,7 +400,17 @@ func TestReconcileSessionBeads_WaitHoldReleasedOnDegradedReadFreesPoolSlot(t *te
 	if !degraded.LivenessReadDegraded {
 		t.Fatalf("a read through the unreachable store did not project LivenessReadDegraded")
 	}
-	degraded.SleepReason = string(sessionpkg.SleepReasonWaitHold) // the stale shape a fallback write could leave committed
+	// Give the degraded Info exactly the stranded shape a fallback write can
+	// leave committed, with every OTHER condition of the heal satisfied: asleep,
+	// the wait-hold reason set, and both halves of the hold gone. Only the
+	// degraded guard can refuse it now — without that guard the heal fires and
+	// writes. (As read, the Info carries no state at all: state lives in the
+	// liveness table, so the state check alone would have refused this and the
+	// check would have proved nothing.)
+	degraded.MetadataState = string(sessionpkg.StateAsleep)
+	degraded.SleepReason = string(sessionpkg.SleepReasonWaitHold)
+	degraded.WaitHold = ""
+	degraded.SleepIntent = ""
 	if healed := healReleasedWaitHoldReasonInfo(degraded, degradedFront); healed.SleepReason != degraded.SleepReason {
 		t.Errorf("the heal acted on a degraded read (sleep_reason %q -> %q)", degraded.SleepReason, healed.SleepReason)
 	}
