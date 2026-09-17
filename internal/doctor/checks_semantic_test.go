@@ -1425,3 +1425,34 @@ func TestDuDirBytesReportsUnreadableTreeAsPermissionError(t *testing.T) {
 		t.Errorf("error does not carry du's stderr: %v", err)
 	}
 }
+
+// Several unreadable directories fill any stderr prefix: the permission cause
+// must still be found, and the error must stay on one line for doctor's
+// single-line message.
+func TestDuDirBytesFindsPermissionPastLongStderrAndStaysOneLine(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read a mode-000 directory")
+	}
+	root := t.TempDir()
+	long := strings.Repeat("a-very-long-worktree-directory-name-", 4)
+	for i := 0; i < 4; i++ {
+		locked := filepath.Join(root, fmt.Sprintf("%s%d", long, i))
+		if err := os.MkdirAll(filepath.Join(locked, "inner"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(locked, 0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+	}
+	_, _, err := duDirBytes(root)
+	if err == nil {
+		t.Fatal("duDirBytes on unreadable directories returned no error")
+	}
+	if !errors.Is(err, fs.ErrPermission) {
+		t.Errorf("error does not wrap fs.ErrPermission: %v", err)
+	}
+	if strings.Contains(err.Error(), "\n") {
+		t.Errorf("error spans lines: %q", err.Error())
+	}
+}
