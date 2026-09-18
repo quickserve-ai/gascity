@@ -74,6 +74,10 @@ duration_to_hours() {
     echo "${dur%h}"
 }
 
+# bd stores UTC in every timestamp column, so each age cutoff and each
+# closed_at write below uses UTC_TIMESTAMP(). The server-local clock is off by
+# the host's UTC offset and shifts an hour at each DST change. Closes also set
+# updated_at, because bd's ON UPDATE clause on that column uses the local clock.
 MAX_AGE_H=$(duration_to_hours "$MAX_AGE")
 PURGE_AGE_H=$(duration_to_hours "$PURGE_AGE")
 STALE_AGE_H=$(duration_to_hours "$STALE_ISSUE_AGE")
@@ -174,6 +178,7 @@ TOTAL_WOULD_CLOSE_WORKFLOW_ROOTS=0
 TOTAL_WORKFLOW_ROOTS_STORE_REF_SKIPPED=0
 TOTAL_WORKFLOW_ISSUE_ROOTS_SKIPPED=0
 TOTAL_ISSUES_CLOSED=0
+TOTAL_WOULD_CLOSE_STALE=0
 TOTAL_STALE_ISSUES_SKIPPED=0
 TOTAL_EXPIRED_ISSUES_CLOSED=0
 TOTAL_EXPIRED_ISSUES_SKIPPED=0
@@ -581,8 +586,8 @@ workflow_root_candidates_cte() {
             WHERE $alias.status IN ($WORKFLOW_ROOT_CLOSE_STATUSES)
             AND $alias.issue_type NOT IN ($issue_type_exclusions)
             AND COALESCE($alias.assignee, '') = ''
-            AND $alias.created_at < DATE_SUB(NOW(), INTERVAL $MAX_AGE_H HOUR)
-            AND COALESCE($alias.updated_at, $alias.created_at) < DATE_SUB(NOW(), INTERVAL $MAX_AGE_H HOUR)
+            AND $alias.created_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL $MAX_AGE_H HOUR)
+            AND COALESCE($alias.updated_at, $alias.created_at) < DATE_SUB(UTC_TIMESTAMP(), INTERVAL $MAX_AGE_H HOUR)
             AND (
                 JSON_UNQUOTE(JSON_EXTRACT($alias.metadata, '$."gc.kind"')) = 'workflow'
                 OR JSON_UNQUOTE(JSON_EXTRACT($alias.metadata, '$."gc.formula_contract"')) = 'graph.v2'
@@ -655,7 +660,7 @@ $(workflow_root_store_ref_local_condition "$db" "$alias")
                 descendant_wisp.created_at,
                 descendant_issue.updated_at,
                 descendant_issue.created_at
-            ) >= DATE_SUB(NOW(), INTERVAL $MAX_AGE_H HOUR)
+            ) >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL $MAX_AGE_H HOUR)
         )
 SQL
 }
@@ -725,7 +730,7 @@ $(workflow_root_candidates_cte "$db" "workflow_wisp_root_candidates" "wisps" "w"
         closeable_workflow_wisp_roots AS (
 $(workflow_root_closeable_select "workflow_wisp_root_candidates")
         )
-        UPDATE \`$db\`.wisps SET status='closed', closed_at=NOW(), metadata = JSON_SET(COALESCE(metadata, JSON_OBJECT()), '$."gc.outcome"', 'skipped', '$."close_reason"', '$WORKFLOW_ROOT_CLOSE_REASON')
+        UPDATE \`$db\`.wisps SET status='closed', closed_at=UTC_TIMESTAMP(), updated_at=UTC_TIMESTAMP(), metadata = JSON_SET(COALESCE(metadata, JSON_OBJECT()), '$."gc.outcome"', 'skipped', '$."close_reason"', '$WORKFLOW_ROOT_CLOSE_REASON')
         WHERE id IN (SELECT id FROM closeable_workflow_wisp_roots)
 SQL
 }
@@ -857,7 +862,7 @@ while IFS= read -r DB; do
         SELECT COUNT(*) FROM \`$DB\`.wisps
         WHERE status IN ('open', 'hooked', 'in_progress')
         AND issue_type NOT IN ('message')
-        AND created_at < DATE_SUB(NOW(), INTERVAL $MAX_AGE_H HOUR)
+        AND created_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL $MAX_AGE_H HOUR)
     "
     STALE_WISP_COUNT=$SQL_COUNT_RESULT
 
@@ -878,7 +883,7 @@ while IFS= read -r DB; do
             LEFT JOIN \`$DB\`.wisps parent_wisp ON d.depends_on_wisp_id = parent_wisp.id
             LEFT JOIN \`$DB\`.issues parent_issue ON d.depends_on_issue_id = parent_issue.id
             WHERE w.status IN ('open', 'hooked', 'in_progress')
-            AND w.created_at < DATE_SUB(NOW(), INTERVAL $MAX_AGE_H HOUR)
+            AND w.created_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL $MAX_AGE_H HOUR)
             AND (
                 parent_wisp.status = 'closed'
                 OR parent_issue.status = 'closed'
@@ -894,9 +899,9 @@ while IFS= read -r DB; do
         fi
 
         if run_sql_change "$DB" "closing stale wisps" "
-            UPDATE \`$DB\`.wisps SET status='closed', closed_at=NOW()
+            UPDATE \`$DB\`.wisps SET status='closed', closed_at=UTC_TIMESTAMP(), updated_at=UTC_TIMESTAMP()
             WHERE status IN ('open', 'hooked', 'in_progress')
-            AND created_at < DATE_SUB(NOW(), INTERVAL $MAX_AGE_H HOUR)
+            AND created_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL $MAX_AGE_H HOUR)
             AND id IN (
                 SELECT id FROM (
                     SELECT w.id FROM \`$DB\`.wisps w
@@ -906,7 +911,7 @@ while IFS= read -r DB; do
                     LEFT JOIN \`$DB\`.wisps parent_wisp ON d.depends_on_wisp_id = parent_wisp.id
                     LEFT JOIN \`$DB\`.issues parent_issue ON d.depends_on_issue_id = parent_issue.id
                     WHERE w.status IN ('open', 'hooked', 'in_progress')
-                    AND w.created_at < DATE_SUB(NOW(), INTERVAL $MAX_AGE_H HOUR)
+                    AND w.created_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL $MAX_AGE_H HOUR)
                     AND (
                         parent_wisp.status = 'closed'
                         OR parent_issue.status = 'closed'
@@ -986,7 +991,7 @@ while IFS= read -r DB; do
     get_sql_count "$DB" "closed wisp purge" "
         SELECT COUNT(*) FROM \`$DB\`.wisps
         WHERE status = 'closed'
-        AND closed_at < DATE_SUB(NOW(), INTERVAL $PURGE_AGE_H HOUR)
+        AND closed_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL $PURGE_AGE_H HOUR)
         AND id NOT IN (
             SELECT DISTINCT d.depends_on_wisp_id FROM \`$DB\`.wisp_dependencies d
             INNER JOIN \`$DB\`.wisps child_wisp ON d.issue_id = child_wisp.id
@@ -1000,7 +1005,7 @@ while IFS= read -r DB; do
         if run_sql_change "$DB" "purging closed wisps" "
             DELETE FROM \`$DB\`.wisps
             WHERE status = 'closed'
-            AND closed_at < DATE_SUB(NOW(), INTERVAL $PURGE_AGE_H HOUR)
+            AND closed_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL $PURGE_AGE_H HOUR)
             AND id NOT IN (
                 SELECT DISTINCT d.depends_on_wisp_id FROM \`$DB\`.wisp_dependencies d
                 INNER JOIN \`$DB\`.wisps child_wisp ON d.issue_id = child_wisp.id
@@ -1119,13 +1124,14 @@ while IFS= read -r DB; do
         fi
     fi
 
-    # Step 5: Auto-close stale issues (exclude P0/P1, epics, active deps).
+    # Step 5: Auto-close stale issues (exclude P0/P1, epics, active deps,
+    # operator directives). A dry run lists each row it would close.
     DB_ISSUES_CLOSED=0
     get_sql_rows "$DB" "stale issue" "
         SELECT id, CASE WHEN COALESCE(assignee, '') = '' THEN 'bare' ELSE 'force' END
         FROM \`$DB\`.issues
         WHERE status IN ('open', 'in_progress')
-        AND updated_at < DATE_SUB(NOW(), INTERVAL $STALE_AGE_H HOUR)
+        AND updated_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL $STALE_AGE_H HOUR)
         AND priority > 1
         AND issue_type != 'epic'
         AND (
@@ -1141,10 +1147,13 @@ while IFS= read -r DB; do
             INNER JOIN \`$DB\`.issues i ON d.issue_id = i.id
             WHERE i.status IN ('open', 'in_progress')
         )
+        -- A directive stays binding because its trigger is rare, so age alone must never close it.
+        -- NOT EXISTS, not a second NOT IN: Dolt 2.2.4 then drops the NOT from the dependency guard above.
+        AND NOT EXISTS (SELECT 1 FROM \`$DB\`.labels od WHERE od.issue_id = issues.id AND od.label = 'operator-directive')
     "
     STALE_IDS=$SQL_ROWS_RESULT
 
-    if [ -n "$STALE_IDS" ] && [ -z "$DRY_RUN" ]; then
+    if [ -n "$STALE_IDS" ]; then
         if [ -z "$CITY_DB" ]; then
             if [ "$CITY_DB_ANOMALY_RECORDED" -eq 0 ]; then
                 record_anomaly "city" "city database could not be determined from GC_REAPER_CITY_DATABASE or $CITY/.beads/metadata.json; stale issue auto-close disabled"
@@ -1155,6 +1164,12 @@ while IFS= read -r DB; do
         elif [ "$DB" != "$CITY_DB" ]; then
             SKIPPED_ISSUES=$(printf '%s\n' "$STALE_IDS" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')
             TOTAL_STALE_ISSUES_SKIPPED=$((TOTAL_STALE_ISSUES_SKIPPED + SKIPPED_ISSUES))
+        elif [ -n "$DRY_RUN" ]; then
+            while IFS=, read -r issue_id close_mode; do
+                [ -z "$issue_id" ] && continue
+                printf 'reaper: would-close-stale %s %s %s\n' "$DB" "$issue_id" "$close_mode"
+                TOTAL_WOULD_CLOSE_STALE=$((TOTAL_WOULD_CLOSE_STALE + 1))
+            done <<< "$STALE_IDS"
         else
             while IFS=, read -r issue_id close_mode; do
                 [ -z "$issue_id" ] && continue
@@ -1185,7 +1200,7 @@ while IFS= read -r DB; do
         SELECT COUNT(*) FROM \`$DB\`.wisps
         WHERE status IN ('open', 'hooked', 'in_progress')
         AND issue_type NOT IN ('message')
-        AND created_at < DATE_SUB(NOW(), INTERVAL $MAX_AGE_H HOUR)
+        AND created_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL $MAX_AGE_H HOUR)
     "
     REAPABLE_WISPS=$SQL_COUNT_RESULT
 
@@ -1414,7 +1429,7 @@ EOF
                 SELECT COUNT(*) FROM \`$CITY_DB\`.issues
                 WHERE id LIKE '$_TYPE_GUARD_LIKE'
                 AND status = 'closed'
-                AND closed_at < DATE_SUB(NOW(), INTERVAL $_TYPE_GUARD_AGE_H HOUR)
+                AND closed_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL $_TYPE_GUARD_AGE_H HOUR)
                 AND issue_type != 'session'
             "
             if [ "${ANOMALIES:-}" != "$_TYPE_GUARD_ANOMALIES_BEFORE" ]; then
@@ -1451,13 +1466,13 @@ EOF
             record_anomaly "session" "type-safe SQL path: city database unresolved — skipping"
         else
             if [ -n "$DRY_RUN" ]; then
-                RAW=$(dolt_sql -r csv -q "USE \`${CITY_DB}\`; SELECT COUNT(*) FROM issues WHERE issue_type='session' AND status='closed' AND closed_at < DATE_SUB(NOW(), INTERVAL ${SESSION_AGE_H} HOUR);") 2>/dev/null || RAW=""
+                RAW=$(dolt_sql -r csv -q "USE \`${CITY_DB}\`; SELECT COUNT(*) FROM issues WHERE issue_type='session' AND status='closed' AND closed_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ${SESSION_AGE_H} HOUR);") 2>/dev/null || RAW=""
                 COUNT=$(printf '%s\n' "$RAW" | tail -n +2 | tr -d ',' | grep -v '^$' | head -1)
                 TOTAL_SESSIONS_PRUNED="${COUNT:-0}"
             else
                 TOTAL=0
                 while true; do
-                    RAW=$(dolt_sql -r csv -q "USE \`${CITY_DB}\`; SELECT id FROM issues WHERE issue_type='session' AND status='closed' AND closed_at < DATE_SUB(NOW(), INTERVAL ${SESSION_AGE_H} HOUR) LIMIT 500;") 2>/dev/null || break
+                    RAW=$(dolt_sql -r csv -q "USE \`${CITY_DB}\`; SELECT id FROM issues WHERE issue_type='session' AND status='closed' AND closed_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ${SESSION_AGE_H} HOUR) LIMIT 500;") 2>/dev/null || break
                     BATCH_IDS=$(printf '%s\n' "$RAW" | tail -n +2 | grep -v '^$')
                     BATCH_COUNT=$(printf '%s\n' "$BATCH_IDS" | grep -c . || true)
                     [ "$BATCH_COUNT" -gt 0 ] || break
@@ -1510,7 +1525,7 @@ fi
 
 SUMMARY="reaper — stale_wisps:$TOTAL_STALE_WISPS, closed_wisps:$TOTAL_CLOSED_WISPS, workflow_roots:$TOTAL_WORKFLOW_ROOTS_CLOSED, skipped_cross_store_workflow_roots:$TOTAL_WORKFLOW_ROOTS_STORE_REF_SKIPPED, skipped_non_city_workflow_issue_roots:$TOTAL_WORKFLOW_ISSUE_ROOTS_SKIPPED, purged:$TOTAL_PURGED, sessions-pruned:$TOTAL_SESSIONS_PRUNED, closed:$TOTAL_ISSUES_CLOSED, expired:$TOTAL_EXPIRED_ISSUES_CLOSED, expired_skipped:$TOTAL_EXPIRED_ISSUES_SKIPPED, skipped_non_city_issues:$TOTAL_STALE_ISSUES_SKIPPED, mail_wisps:$TOTAL_MAIL_WISPS"
 if [ -n "$DRY_RUN" ]; then
-    SUMMARY="$SUMMARY, would_close_wisps:$TOTAL_WOULD_CLOSE_WISPS, would_close_workflow_roots:$TOTAL_WOULD_CLOSE_WORKFLOW_ROOTS, would_expire:$TOTAL_WOULD_EXPIRE (dry run)"
+    SUMMARY="$SUMMARY, would_close_wisps:$TOTAL_WOULD_CLOSE_WISPS, would_close_workflow_roots:$TOTAL_WOULD_CLOSE_WORKFLOW_ROOTS, would_expire:$TOTAL_WOULD_EXPIRE, would_close_stale:$TOTAL_WOULD_CLOSE_STALE (dry run)"
 fi
 
 maintenance_done "$SUMMARY"
