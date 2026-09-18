@@ -173,6 +173,7 @@ func (d *Doctor) boundedRun(c Check, ctx *CheckContext) *CheckResult {
 	var buf bytes.Buffer
 	checkCtx := *ctx
 	checkCtx.Output = &buf
+	checkCtx.Deadline = time.Now().Add(d.CheckTimeout)
 	done := make(chan *CheckResult, 1)
 	d.inFlight.Add(1)
 	go func() {
