@@ -47,10 +47,11 @@ func cityPackWithOrder(t *testing.T, name, content string) string {
 	return packDir
 }
 
-func enabledRigs(aa []orders.Order, name string) []string {
+// enabledPatrolRigs returns the rigs whose "patrol" instance is enabled.
+func enabledPatrolRigs(aa []orders.Order) []string {
 	var rigs []string
 	for _, a := range aa {
-		if a.Name == name && a.IsEnabled() {
+		if a.Name == "patrol" && a.IsEnabled() {
 			rigs = append(rigs, a.Rig)
 		}
 	}
@@ -75,7 +76,7 @@ func TestScanAllOverrideReEnablesPackDisabledOrder(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ScanAll returned error: %v", err)
 			}
-			if got := enabledRigs(aa, "patrol"); strings.Join(got, ",") != strings.Join(tt.want, ",") {
+			if got := enabledPatrolRigs(aa); strings.Join(got, ",") != strings.Join(tt.want, ",") {
 				t.Fatalf("enabled patrol rigs = %v, want %v", got, tt.want)
 			}
 			if len(aa) != len(tt.want) {
@@ -295,7 +296,7 @@ enabled = false
 		if err != nil {
 			t.Fatalf("ScanAll returned error: %v", err)
 		}
-		if got := enabledRigs(aa, "patrol"); strings.Join(got, ",") != "alpha" {
+		if got := enabledPatrolRigs(aa); strings.Join(got, ",") != "alpha" {
 			t.Fatalf("enabled patrol rigs = %v, want [alpha]: beta's own enabled = false was reopened", got)
 		}
 		if len(aa) != 1 {
@@ -362,7 +363,7 @@ func TestScanAllReEnabledThenDisabledOrderStaysListed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ScanAll returned error: %v", err)
 	}
-	if got := enabledRigs(aa, "patrol"); strings.Join(got, ",") != "beta" {
+	if got := enabledPatrolRigs(aa); strings.Join(got, ",") != "beta" {
 		t.Fatalf("enabled patrol rigs = %v, want [beta]", got)
 	}
 	var alpha *orders.Order
@@ -400,7 +401,7 @@ enabled = false
 	if err != nil {
 		t.Fatalf("ScanAll returned error: %v", err)
 	}
-	if got := enabledRigs(aa, "patrol"); strings.Join(got, ",") != "beta" || len(aa) != 1 {
+	if got := enabledPatrolRigs(aa); strings.Join(got, ",") != "beta" || len(aa) != 1 {
 		t.Fatalf("ScanAll = %+v, want only patrol:rig:beta, enabled", aa)
 	}
 }
