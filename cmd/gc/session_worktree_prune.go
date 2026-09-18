@@ -25,7 +25,6 @@ type gitProbe interface {
 	CurrentBranch() (string, error)
 	HasUncommittedWork() bool
 	HasUnpushedCommitsResult() (bool, error)
-	HasStashesResult() (bool, error)
 	WorktreeRemove(path string, force bool) error
 }
 
@@ -71,7 +70,8 @@ func writeWorktreeStaleMarker(gp gitProbe, workerDir, reason string, stderr io.W
 //   - the session bead has no worker_dir metadata
 //   - the worker_dir does not live under cityPath/.gc/worktrees/
 //   - the worker_dir is missing on disk or has no .git pointer
-//   - the worktree has uncommitted changes, unpushed commits, or stashes
+//   - the worktree has uncommitted changes or unpushed commits (a repo stash
+//     does not block it: ga-bjenxa)
 //   - the rig that owns the session cannot be resolved to a filesystem path
 //
 // Removal failures are logged but never surfaced — an orphaned worktree
@@ -128,16 +128,10 @@ func pruneAgentHomeWorktreeIfSafe(session beads.Bead, cityPath string, cfg *conf
 		writeWorktreeStaleMarker(gp, workerDir, "unpushed-commits", stderr)
 		return false
 	}
-	hasStashes, err := gp.HasStashesResult()
-	if err != nil {
-		fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir %s: stash probe failed: %v\n", workerDir, err) //nolint:errcheck
-		return false
-	}
-	if hasStashes {
-		fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir %s: has stashed work\n", workerDir) //nolint:errcheck
-		writeWorktreeStaleMarker(gp, workerDir, "stashed-work", stderr)
-		return false
-	}
+	// No stash veto (ga-bjenxa; full argument on gitSafetyReason, ga-gsfxag):
+	// `git stash list` is repo-global, so one stash anywhere in the repo blocked
+	// this prune for every worktree of it, and WorktreeRemove below never touches
+	// refs/stash, so stashed work cannot be lost here.
 
 	// Run `git worktree remove` from the rig root rather than from the
 	// worktree being removed: git refuses to remove a worktree whose path
@@ -233,16 +227,10 @@ func pruneAgentHomeWorktreeIfSafeInfo(info sessionpkg.Info, cityPath string, cfg
 		writeWorktreeStaleMarker(gp, workerDir, "unpushed-commits", stderr)
 		return
 	}
-	hasStashes, err := gp.HasStashesResult()
-	if err != nil {
-		fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir %s: stash probe failed: %v\n", workerDir, err) //nolint:errcheck
-		return
-	}
-	if hasStashes {
-		fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir %s: has stashed work\n", workerDir) //nolint:errcheck
-		writeWorktreeStaleMarker(gp, workerDir, "stashed-work", stderr)
-		return
-	}
+	// No stash veto (ga-bjenxa; full argument on gitSafetyReason, ga-gsfxag):
+	// `git stash list` is repo-global, so one stash anywhere in the repo blocked
+	// this prune for every worktree of it, and WorktreeRemove below never touches
+	// refs/stash, so stashed work cannot be lost here.
 
 	rigRoot := lookupRigRootForSessionInfo(info, cfg)
 	if rigRoot == "" {
