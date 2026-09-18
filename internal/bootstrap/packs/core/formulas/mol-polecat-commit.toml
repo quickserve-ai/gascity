@@ -133,27 +133,36 @@ for attempt in 1 2 3; do
 done
 ```
 
-**3. Clean up worktree:**
+**3. Clean up worktree (secure locally first, ga-w805wc):**
+
+Tear down the worktree the BEAD records, never whatever the current directory
+happens to be. `gc worktree rescue` makes everything the tree holds reachable
+from refs/rescue/<bead> in the shared ref store before anything is removed;
+the bead records it; `gc worktree teardown` removes the tree only if it still
+matches that rescue, and refuses anything that is not a registered linked
+worktree. Any failure stops here with the worktree and work_dir intact.
 ```bash
-WORKTREE_PATH=$(pwd)
-# --git-common-dir, not --show-toplevel: inside a linked worktree the latter
-# returns the worktree itself, which stops existing halfway through cleanup
-# and is useless for the prune fallback.
-REPO=$(git rev-parse --path-format=absolute --git-common-dir)
-cd ..
-if [ -z "$REPO" ]; then
-    echo "cleanup: could not resolve the owning repo; leaving $WORKTREE_PATH in place" >&2
-elif ! git -C "$REPO" worktree remove --force "$WORKTREE_PATH"; then
-    # A linked worktree's .git is a file; a main checkout's is a directory.
-    # Without this check, a failed remove on a main checkout rm -rf's the repo.
-    if [ -f "$WORKTREE_PATH/.git" ]; then
-        rm -rf "$WORKTREE_PATH"
-        git -C "$REPO" worktree prune
-    else
-        echo "cleanup: refusing to rm -rf $WORKTREE_PATH: not a linked worktree" >&2
+BEAD_JSON=$(gc bd show "$WORK_BEAD_ID" --json) || exit 1
+WORKTREE_PATH=$(printf '%s' "$BEAD_JSON" | jq -er '.[0].metadata.work_dir // ""') || exit 1
+if [ -z "$WORKTREE_PATH" ]; then
+    echo "cleanup: $WORK_BEAD_ID records no work_dir; nothing to tear down"
+else
+    RESCUE=$(gc worktree rescue --path "$WORKTREE_PATH" --bead "$WORK_BEAD_ID" --absent-ok --json) || {
+        echo "cleanup: REFUSING to remove $WORKTREE_PATH: its work could not be secured for $WORK_BEAD_ID" >&2
+        exit 1
+    }
+    ABSENT=$(printf '%s' "$RESCUE" | jq -r '.absent == true') || exit 1
+    if [ "$ABSENT" != "true" ]; then
+        RESCUE_REF=$(printf '%s' "$RESCUE" | jq -er '.rescue_ref') || exit 1
+        RESCUE_SHA=$(printf '%s' "$RESCUE" | jq -er '.rescue_sha') || exit 1
+        RESCUE_REPO=$(printf '%s' "$RESCUE" | jq -er '.repo') || exit 1
+        RESCUE_TAINT=$(printf '%s' "$RESCUE" | jq -er '(.taint // []) | join(",")') || exit 1
+        gc bd update "$WORK_BEAD_ID" --set-metadata rescue_ref="$RESCUE_REF" --set-metadata rescue_sha="$RESCUE_SHA" --set-metadata rescue_repo="$RESCUE_REPO" --set-metadata rescue_taint="$RESCUE_TAINT" || exit 1
+        cd "$(dirname "$WORKTREE_PATH")" || exit 1
+        gc worktree teardown --path "$WORKTREE_PATH" --bead "$WORK_BEAD_ID" --rescue-sha "$RESCUE_SHA" || exit 1
     fi
+    gc bd update "$WORK_BEAD_ID" --unset-metadata work_dir || exit 1
 fi
-gc bd update "$WORK_BEAD_ID" --unset-metadata work_dir
 ```
 
 **4. Close the bead:**
