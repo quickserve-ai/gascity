@@ -5305,6 +5305,8 @@ gc worktree
 |------------|-------------|
 | [gc worktree cleanup](#gc-worktree-cleanup) | Remove an owned worktree after all safety gates pass |
 | [gc worktree ensure](#gc-worktree-ensure) | Ensure the worktree exists and satisfies all postconditions |
+| [gc worktree rescue](#gc-worktree-rescue) | Secure a linked worktree's work in a local rescue ref |
+| [gc worktree teardown](#gc-worktree-teardown) | Remove a linked worktree whose rescue was recorded |
 | [gc worktree verify](#gc-worktree-verify) | Verify the worktree satisfies all postconditions without mutating |
 
 ## gc worktree cleanup
@@ -5365,6 +5367,64 @@ gc worktree ensure [flags]
 | `--repo` | string |  | repository directory the worktree belongs to (required) |
 | `--root` | string |  | configured per-rig worktree root; path must be its direct child (required) |
 | `--store-ref` | string |  | work bead store reference (required) |
+
+## gc worktree rescue
+
+Secure a linked worktree's work in a local rescue ref.
+
+Rescue snapshots everything in the worktree that is not gitignored (commits,
+staged and unstaged edits, untracked files) and makes it reachable from
+refs/rescue/&lt;bead&gt; in the repository's shared ref store, where removing the
+worktree cannot touch it. HEAD, the index, the working tree and every branch
+are left unchanged, no hook runs, and no remote is contacted.
+
+Files gc itself put in the tree are left out, but only when that is provable:
+manifest-recorded skill symlinks, skill copies byte-identical to the city's,
+AGENTS-gc.md and .worktree-stale. A failure to classify them fails the rescue.
+
+With no changes beyond HEAD the rescue is HEAD. Rerunning on an unchanged tree
+returns the same commit. An existing rescue ref is only ever advanced to a
+descendant; a divergent rescue is written beside it as
+refs/rescue/&lt;bead&gt;-&lt;sha12&gt;. Credential-shaped file names are reported as taint
+and recorded in the rescue commit's Rescue-Taint trailer.
+
+```
+gc worktree rescue [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--bead` | string |  | work bead the rescue ref is named for (required) |
+| `--city-path` | string |  | city directory whose synced skill copies count as gc sediment (default: $GC_CITY_PATH) |
+| `--json` | bool |  | emit the report as JSON |
+| `--path` | string |  | root of the linked worktree (required) |
+
+## gc worktree teardown
+
+Remove a linked worktree whose rescue was recorded.
+
+Teardown rescues the worktree again and removes it only if the result is
+exactly --rescue-sha, the rescue the caller recorded (normally on the work
+bead) after running gc worktree rescue. A worktree that changed in between is
+secured anew and left in place, and the error names the new rescue to record.
+
+It refuses anything that is not a registered linked worktree: a main checkout,
+a submodule checkout, a subdirectory, or an unregistered directory. A locked
+worktree is removed. If git cannot remove the tree (one holding submodules),
+the directory is deleted only after it is proven a registered linked worktree
+again, and the registration is pruned. A path that no longer exists succeeds.
+
+```
+gc worktree teardown [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--bead` | string |  | work bead the rescue ref is named for (required) |
+| `--city-path` | string |  | city directory whose synced skill copies count as gc sediment (default: $GC_CITY_PATH) |
+| `--json` | bool |  | emit the report as JSON |
+| `--path` | string |  | root of the linked worktree (required) |
+| `--rescue-sha` | string |  | rescue commit recorded by the caller before removal (required) |
 
 ## gc worktree verify
 

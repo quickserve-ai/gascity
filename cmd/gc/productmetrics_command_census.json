@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "next_id": 212,
+  "next_id": 214,
   "permanent_ids": [
     {
       "name": "help",
@@ -4701,6 +4701,36 @@
       "classification": "worktree-ensure",
       "owner": "immediate",
       "id": 204
+    },
+    {
+      "path": "gc worktree rescue",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "worktree-rescue",
+      "owner": "immediate",
+      "id": 212
+    },
+    {
+      "path": "gc worktree teardown",
+      "aliases": [],
+      "conditional_modes": [],
+      "hidden": false,
+      "effective_hidden": false,
+      "disable_flag_parsing": false,
+      "shape": "runnable",
+      "recording_policy": "recordable",
+      "mode": "standard",
+      "notice_policy": "eligible",
+      "classification": "worktree-teardown",
+      "owner": "immediate",
+      "id": 213
     },
     {
       "path": "gc worktree verify",
