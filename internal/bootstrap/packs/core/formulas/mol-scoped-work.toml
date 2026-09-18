@@ -231,19 +231,23 @@ if [ -z "$WORKTREE" ]; then
   echo "cleanup-worktree: $WORK_BEAD_ID records no work_dir; nothing to tear down"
   exit 0
 fi
-if [ -e "$WORKTREE" ]; then
-  RESCUE=$(gc worktree rescue --path "$WORKTREE" --bead "$WORK_BEAD_ID" --json) || {
-    echo "cleanup-worktree: REFUSING to remove $WORKTREE: its work could not be secured for $WORK_BEAD_ID" >&2
-    exit 1
-  }
+# Whether the worktree is gone is decided by gc (ENOENT only): a shell
+# existence test also reads an UNREADABLE path as absent and would clear the
+# pointer to a live worktree.
+RESCUE=$(gc worktree rescue --path "$WORKTREE" --bead "$WORK_BEAD_ID" --absent-ok --json) || {
+  echo "cleanup-worktree: REFUSING to remove $WORKTREE: its work could not be secured for $WORK_BEAD_ID" >&2
+  exit 1
+}
+ABSENT=$(printf '%s' "$RESCUE" | jq -r '.absent == true') || exit 1
+if [ "$ABSENT" = "true" ]; then
+  echo "cleanup-worktree: $WORKTREE is already gone; clearing work_dir"
+else
   RESCUE_REF=$(printf '%s' "$RESCUE" | jq -er '.rescue_ref') || exit 1
   RESCUE_SHA=$(printf '%s' "$RESCUE" | jq -er '.rescue_sha') || exit 1
   RESCUE_REPO=$(printf '%s' "$RESCUE" | jq -er '.repo') || exit 1
   RESCUE_TAINT=$(printf '%s' "$RESCUE" | jq -er '(.taint // []) | join(",")') || exit 1
   gc bd update "$WORK_BEAD_ID" --set-metadata rescue_ref="$RESCUE_REF" --set-metadata rescue_sha="$RESCUE_SHA" --set-metadata rescue_repo="$RESCUE_REPO" --set-metadata rescue_taint="$RESCUE_TAINT" || exit 1
   gc worktree teardown --path "$WORKTREE" --bead "$WORK_BEAD_ID" --rescue-sha "$RESCUE_SHA" || exit 1
-else
-  echo "cleanup-worktree: $WORKTREE is already gone; clearing work_dir"
 fi
 gc bd update "$WORK_BEAD_ID" --unset-metadata work_dir || exit 1
 ```
