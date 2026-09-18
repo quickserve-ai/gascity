@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path"
@@ -13,6 +14,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 
 	"github.com/gastownhall/gascity/internal/git"
 	"github.com/gastownhall/gascity/internal/pathutil"
@@ -626,8 +628,59 @@ func requireSubmodulesSecured(dir, prefix, modulesRoot string) error {
 	return nil
 }
 
-// todoCommitToken matches an object name in a sequencer or rebase todo line.
-var todoCommitToken = regexp.MustCompile(`^[0-9a-f]{7,64}$`)
+// todoObjectName matches an object name as a todo list writes it. Git never
+// abbreviates below four hex digits (core.abbrev's minimum), and with
+// core.abbrev=4 a stopped cherry-pick really writes `pick e3b6 x`.
+var todoObjectName = regexp.MustCompile(`^[0-9a-f]{4,64}$`)
+
+// todoPickCommands are the todo commands whose operand names a commit.
+var todoPickCommands = map[string]bool{
+	"pick": true, "p": true, "revert": true, "edit": true, "e": true,
+	"reword": true, "r": true, "squash": true, "s": true, "fixup": true,
+	"f": true, "drop": true, "d": true, "merge": true, "m": true,
+}
+
+// todoObjectNames returns the object name a sequencer or rebase todo line
+// operates on. Only the command's operand counts: subjects, labels and exec
+// commands are text, where a four-digit number would otherwise read as an
+// abbreviation. A line holding only a name (sequencer/head) is that name.
+func todoObjectNames(line string) []string {
+	f := strings.Fields(line)
+	if len(f) == 0 || strings.HasPrefix(f[0], "#") {
+		return nil
+	}
+	if len(f) == 1 {
+		if todoObjectName.MatchString(f[0]) {
+			return f
+		}
+		return nil
+	}
+	if !todoPickCommands[f[0]] {
+		return nil
+	}
+	rest := f[1:]
+	switch {
+	case rest[0] == "-C" || rest[0] == "-c":
+		rest = rest[1:]
+	case f[0] == "merge" || f[0] == "m":
+		return nil // without -C/-c a merge names only a label
+	}
+	if len(rest) > 0 && todoObjectName.MatchString(rest[0]) {
+		return rest[:1]
+	}
+	return nil
+}
+
+// commitsMatching returns every commit whose name starts with abbrev. An
+// abbreviation in a todo list may have become ambiguous since git wrote it;
+// keeping every match is exact when it is unique and safe when it is not.
+func commitsMatching(wt, abbrev string) ([]string, error) {
+	out, err := gitOutput(wt, []string{"GIT_NO_LAZY_FETCH=1"}, "rev-parse", "--disambiguate="+abbrev)
+	if err != nil {
+		return nil, err
+	}
+	return existingCommits(wt, strings.Fields(out))
+}
 
 // perWorktreeRefDirs are the ref namespaces private to one worktree.
 var perWorktreeRefDirs = []string{"refs/worktree/", "refs/bisect/", "refs/rewritten/"}
@@ -680,15 +733,12 @@ func privateRootTips(wt, head, base string) ([]string, error) {
 			return nil, err
 		}
 		for _, line := range strings.Split(string(data), "\n") {
-			if strings.HasPrefix(strings.TrimSpace(line), "#") {
-				continue
-			}
-			for _, tok := range strings.Fields(line) {
-				if todoCommitToken.MatchString(tok) {
-					if err := add(tok); err != nil {
-						return nil, err
-					}
+			for _, name := range todoObjectNames(line) {
+				commits, err := commitsMatching(wt, name)
+				if err != nil {
+					return nil, err
 				}
+				cands = append(cands, commits...)
 			}
 		}
 	}
@@ -1005,6 +1055,18 @@ func requireNoNestedRepos(wt, tree string) error {
 		if d.IsDir() && known[rel] {
 			return filepath.SkipDir
 		}
+		if d.Name() == "HEAD" && !d.IsDir() {
+			// A BARE repository has no .git child: HEAD, objects/ and refs/
+			// sit directly in its directory (Codex review of #97).
+			bare, err := looksLikeBareRepo(filepath.Dir(p))
+			if err != nil {
+				return err
+			}
+			if bare {
+				return fmt.Errorf("%s is a bare git repository (ignored or untracked); a rescue does not carry it and removal would delete it, so move or push it first", path.Dir(rel))
+			}
+			return nil
+		}
 		if d.Name() != ".git" {
 			return nil
 		}
@@ -1014,7 +1076,10 @@ func requireNoNestedRepos(wt, tree string) error {
 		if d.IsDir() {
 			return fmt.Errorf("%s holds its own git repository (ignored or untracked); a rescue does not carry it and removal would delete it, so move or push it first", path.Dir(rel))
 		}
-		target, live := gitPointerTarget(p)
+		target, live, err := gitPointerTarget(p)
+		if err != nil {
+			return fmt.Errorf("inspecting %s (failing closed): %w", rel, err)
+		}
 		if !live {
 			// A pointer to nothing holds no git data. Packages ship these:
 			// temporalio's wheel carries its source tree's submodule .git file.
@@ -1024,37 +1089,71 @@ func requireNoNestedRepos(wt, tree string) error {
 	})
 }
 
+// looksLikeBareRepo applies git's own test for a repository directory: a HEAD
+// file beside objects/ and refs/ directories. Only a missing entry means no;
+// any other error fails closed.
+func looksLikeBareRepo(dir string) (bool, error) {
+	for _, sub := range []string{"objects", "refs"} {
+		st, err := os.Stat(filepath.Join(dir, sub))
+		if missingPath(err) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if !st.IsDir() {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
 // gitPointerTarget reports where a .git FILE (or symlink) points, and whether
 // that git dir exists. A file that is not a "gitdir:" pointer points nowhere,
-// as it does for git itself.
-func gitPointerTarget(p string) (string, bool) {
+// as it does for git itself. Only a target that is provably missing counts as
+// dangling: any other failure to inspect it is returned, so a checkout whose
+// git dir cannot be read is refused rather than deleted (Codex review of #97).
+func gitPointerTarget(p string) (target string, live bool, err error) {
 	info, err := os.Lstat(p)
 	if err != nil {
-		return "", false
+		return "", false, err
 	}
-	var target string
 	if info.Mode()&os.ModeSymlink != 0 {
-		if target, err = filepath.EvalSymlinks(p); err != nil {
-			return "", false
+		target, err = filepath.EvalSymlinks(p)
+		if missingPath(err) {
+			return "", false, nil
+		}
+		if err != nil {
+			return "", false, err
 		}
 	} else {
 		data, err := os.ReadFile(p)
 		if err != nil {
-			return "", false
+			return "", false, err
 		}
 		rest, ok := strings.CutPrefix(strings.TrimSpace(string(data)), "gitdir:")
 		if !ok {
-			return "", false
+			return "", false, nil
 		}
 		target = strings.TrimSpace(rest)
 		if !filepath.IsAbs(target) {
 			target = filepath.Join(filepath.Dir(p), target)
 		}
 	}
-	if st, err := os.Stat(target); err != nil || !st.IsDir() {
-		return target, false
+	st, err := os.Stat(target)
+	if missingPath(err) {
+		return target, false, nil
 	}
-	return target, true
+	if err != nil {
+		return target, false, err
+	}
+	return target, st.IsDir(), nil
+}
+
+// missingPath reports whether err says a path does not exist (including a
+// path component that is a file, not a directory).
+func missingPath(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)
 }
 
 // resolveHead returns HEAD's commit, or "" for an unborn HEAD.
