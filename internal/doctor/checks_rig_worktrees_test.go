@@ -1,28 +1,30 @@
 package doctor
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/config"
 )
 
 // newRigWorktreesCheckWithMeasure builds the check with an injected
 // measurement so tests never shell out to du.
-func newRigWorktreesCheckWithMeasure(t *testing.T, rigPath string, cfg config.DoctorConfig, measure func(string) (int64, bool, error)) *RigWorktreesCheck {
+func newRigWorktreesCheckWithMeasure(t *testing.T, rigPath string, cfg config.DoctorConfig, measure dirMeasure) *RigWorktreesCheck {
 	t.Helper()
 	c := NewRigWorktreesCheck(config.Rig{Name: "testrig", Path: rigPath}, cfg)
 	c.measureDir = measure
 	return c
 }
 
-// fixedSize returns a measurement stub reporting n bytes for an
-// existing directory.
-func fixedSize(n int64) func(string) (int64, bool, error) {
-	return func(string) (int64, bool, error) { return n, true, nil }
+// fixedSize returns a measurement stub reporting n fully counted bytes
+// for an existing directory.
+func fixedSize(n int64) dirMeasure {
+	return func(context.Context, string) (dirSize, error) { return dirSize{bytes: n, exists: true}, nil }
 }
 
 // makeWorktreeDirs creates <rigPath>/worktrees/<name> for each name and
@@ -165,8 +167,8 @@ func TestRigWorktreesCheck_FilesAreNotCountedAsWorktrees(t *testing.T) {
 // WorktreeDiskSizeCheck applies to measurement failure.
 func TestRigWorktreesCheck_MeasureFails_WarnsAndKeepsTheCount(t *testing.T) {
 	rigPath := makeWorktreeDirs(t, "tlp-aaa", "tlp-bbb")
-	c := newRigWorktreesCheckWithMeasure(t, rigPath, config.DoctorConfig{}, func(string) (int64, bool, error) {
-		return 0, false, errors.New("du exploded")
+	c := newRigWorktreesCheckWithMeasure(t, rigPath, config.DoctorConfig{}, func(context.Context, string) (dirSize, error) {
+		return dirSize{}, errors.New("du exploded")
 	})
 
 	r := c.Run(&CheckContext{})
@@ -228,5 +230,70 @@ func TestWorktreeCheck_EmptyCityDirMessageNamesGcWorktrees(t *testing.T) {
 	}
 	if !strings.Contains(r.Message, ".gc/worktrees") {
 		t.Errorf("message = %q, want the .gc/worktrees scope named", r.Message)
+	}
+}
+
+// The rig-root population shares the measurer, so it shares the budget: a
+// per-bead worktree tree too large to size in time is reported as a labeled
+// lower bound, inside the check's budget, with the ran-out-of-time hint.
+func TestRigWorktreesCheck_UnfinishedWalkReportsLowerBoundInsideBudget(t *testing.T) {
+	rigPath := makeWorktreeDirs(t, "tlp-aaa", "tlp-bbb")
+	cfg := config.DoctorConfig{WorktreeRigWarnSize: "10GB", WorktreeRigErrorSize: "50GB"}
+	c := newRigWorktreesCheckWithMeasure(t, rigPath, cfg, func(ctx context.Context, _ string) (dirSize, error) {
+		<-ctx.Done()
+		return dirSize{bytes: 2 * 1024 * 1024 * 1024, exists: true, lowerBound: true}, nil
+	})
+	c.budget = 100 * time.Millisecond
+
+	start := time.Now()
+	r := c.Run(&CheckContext{})
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("check took %s, want it to stop soon after its budget", elapsed)
+	}
+	if r.Status != StatusWarning {
+		t.Fatalf("status = %d (%s), want StatusWarning", r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, "2 per-bead worktree(s)") {
+		t.Errorf("message = %q, want the count", r.Message)
+	}
+	if !strings.Contains(r.Message, "at least 2.0 GB logical (lower bound: the size walk did not finish within 100ms)") {
+		t.Errorf("message = %q, want the labeled lower bound", r.Message)
+	}
+	if !strings.Contains(r.FixHint, "ran out of time") {
+		t.Errorf("FixHint = %q, want the ran-out-of-time hint", r.FixHint)
+	}
+	assertDuSizesLabeledLogical(t, r.Message)
+}
+
+func TestRigWorktreesCheck_LowerBoundPastErrorThresholdIsAnError(t *testing.T) {
+	rigPath := makeWorktreeDirs(t, "tlp-aaa")
+	cfg := config.DoctorConfig{WorktreeRigWarnSize: "10GB", WorktreeRigErrorSize: "50GB"}
+	c := newRigWorktreesCheckWithMeasure(t, rigPath, cfg, func(ctx context.Context, _ string) (dirSize, error) {
+		<-ctx.Done()
+		return dirSize{bytes: 60 * 1024 * 1024 * 1024, exists: true, lowerBound: true}, nil
+	})
+	c.budget = 50 * time.Millisecond
+
+	r := c.Run(&CheckContext{})
+	if r.Status != StatusError {
+		t.Fatalf("status = %d (%s), want StatusError", r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, "at least 60.0 GB logical") || !strings.Contains(r.Message, "error threshold") {
+		t.Errorf("message = %q, want the lower bound flagged against the error threshold", r.Message)
+	}
+	assertDuSizesLabeledLogical(t, r.Message)
+}
+
+// pl-59k part (d): the size is du's LOGICAL count, and says so.
+func TestRigWorktreesCheck_SizeIsLabeledLogical(t *testing.T) {
+	rigPath := makeWorktreeDirs(t, "tlp-aaa")
+	cfg := config.DoctorConfig{WorktreeRigWarnSize: "10GB", WorktreeRigErrorSize: "50GB"}
+	for _, n := range []int64{1 << 30, 20 << 30, 60 << 30} {
+		c := newRigWorktreesCheckWithMeasure(t, rigPath, cfg, fixedSize(n))
+		r := c.Run(&CheckContext{})
+		if !strings.Contains(r.Message, " logical") {
+			t.Errorf("message = %q, want a labeled size", r.Message)
+		}
+		assertDuSizesLabeledLogical(t, r.Message)
 	}
 }
