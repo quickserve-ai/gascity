@@ -1224,3 +1224,90 @@ func TestRescueRefusesAnotherRepositorysCheckoutUnderAnIgnoredPath(t *testing.T)
 		t.Fatalf("Rescue err = %v, want the nested checkout refused", err)
 	}
 }
+
+// Codex review of #97, round 7, P1: with core.abbrev=4 a stopped cherry-pick
+// writes `pick e3b6 x` into sequencer/todo.
+func TestRescueKeepsCherryPickCommitsNamedByFourCharAbbreviations(t *testing.T) {
+	repo, wt, base := linkedWorktree(t)
+	id := []string{"-c", "user.name=t", "-c", "user.email=t@t"}
+	runGit(t, repo, "checkout", "-q", "-b", "side", base)
+	var picks []string
+	for _, c := range []string{"side-a", "side-b", "side-c"} {
+		writeFile(t, filepath.Join(repo, "a.txt"), c+"\n")
+		runGit(t, repo, append(id, "commit", "-qam", c)...)
+		picks = append(picks, runGit(t, repo, "rev-parse", "HEAD"))
+	}
+	writeFile(t, filepath.Join(wt, "a.txt"), "conflicting\n")
+	runGit(t, wt, append(id, "commit", "-qam", "conflicting")...)
+	if runGitAllowFail(wt, append(append(id, "-c", "core.abbrev=4"), "cherry-pick", picks[0], picks[1], picks[2])...) == nil {
+		t.Fatal("control: the cherry-pick should stop on a conflict")
+	}
+	gitDir := runGit(t, wt, "rev-parse", "--path-format=absolute", "--git-dir")
+	todo, err := os.ReadFile(filepath.Join(gitDir, "sequencer", "todo"))
+	if err != nil || !strings.Contains(string(todo), "pick "+picks[1][:4]+" ") {
+		t.Fatalf("control: todo should name %s by four characters, got %q (%v)", picks[1], todo, err)
+	}
+	runGit(t, repo, "checkout", "-q", "--detach", base)
+	runGit(t, repo, "branch", "-D", "side") // only the four-character names remain
+	rep, err := Rescue(rescueSpec(wt))
+	if err != nil {
+		t.Fatalf("Rescue: %v", err)
+	}
+	for _, c := range picks {
+		assertReachableFromRescue(t, repo, rep.RescueRef, c)
+	}
+}
+
+// Only a todo command's operand is an object name: a four-digit number in a
+// subject, an exec command or a label would otherwise read as one.
+func TestTodoObjectNamesTakesOnlyTheOperand(t *testing.T) {
+	for line, want := range map[string]string{
+		"pick e3b6 fix the 2026 report":                "e3b6",
+		"p e3b6abc subject":                            "e3b6abc",
+		"revert 1a2b3c4d revert beef":                  "1a2b3c4d",
+		"fixup -C beef0 amend":                         "beef0",
+		"merge -C abcd1234 feature # merge 2026":       "abcd1234",
+		"merge feature":                                "",
+		"exec make 1234":                               "",
+		"label 2026":                                   "",
+		"reset abcd":                                   "",
+		"# pick dead beef":                             "",
+		"9ae9c2633e5dd7d5f6f160b19d45fc8eb1d062a6":     "9ae9c2633e5dd7d5f6f160b19d45fc8eb1d062a6",
+		"pick abc three-hex-digits-is-never-an-abbrev": "",
+	} {
+		if got := strings.Join(todoObjectNames(line), ","); got != want {
+			t.Errorf("todoObjectNames(%q) = %q, want %q", line, got, want)
+		}
+	}
+}
+
+// Codex review of #97, round 7, P1: a BARE repository has no .git child, so
+// the ignored-path walk must recognize HEAD beside objects/ and refs/.
+func TestRescueRefusesABareRepositoryUnderAnIgnoredPath(t *testing.T) {
+	_, wt, _ := linkedWorktree(t)
+	writeFile(t, filepath.Join(wt, ".gitignore"), "vendor/\n")
+	runGit(t, wt, "init", "-q", "--bare", filepath.Join("vendor", "store.git"))
+	if _, err := Rescue(rescueSpec(wt)); err == nil || !strings.Contains(err.Error(), "vendor/store.git is a bare git repository") {
+		t.Fatalf("Rescue err = %v, want the bare repository refused", err)
+	}
+}
+
+// Codex review of #97, round 7, P1: a checkout whose git dir cannot be read
+// is not provably dangling, so the rescue must fail closed.
+func TestRescueFailsClosedWhenANestedGitDirCannotBeInspected(t *testing.T) {
+	_, wt, _ := linkedWorktree(t)
+	writeFile(t, filepath.Join(wt, ".gitignore"), "vendor/\n")
+	other, _ := initTestRepo(t)
+	runGit(t, other, "worktree", "add", "-q", "--detach", filepath.Join(wt, "vendor", "other"), "HEAD")
+	locked := filepath.Join(other, ".git", "worktrees")
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+	if _, err := os.Stat(filepath.Join(locked, "other")); err == nil {
+		t.Skip("control: this environment can read a mode-000 directory (running as root?)")
+	}
+	if _, err := Rescue(rescueSpec(wt)); err == nil || !strings.Contains(err.Error(), "failing closed") {
+		t.Fatalf("Rescue err = %v, want an inspection failure refused", err)
+	}
+}
