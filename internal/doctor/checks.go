@@ -2449,6 +2449,17 @@ func sumDirBytes(root string) (int64, bool, error) {
 }
 
 func sumDirBytesWithContext(ctx context.Context, root string) (int64, bool, error) {
+	total, exists, err := countDirBytes(ctx, root)
+	if err != nil {
+		return 0, exists, err
+	}
+	return total, exists, nil
+}
+
+// countDirBytes is sumDirBytesWithContext that also returns, alongside a walk
+// error, the bytes counted before the walk stopped: a lower bound when the
+// error is ctx's deadline.
+func countDirBytes(ctx context.Context, root string) (int64, bool, error) {
 	info, err := os.Stat(root)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -2480,7 +2491,7 @@ func sumDirBytesWithContext(ctx context.Context, root string) (int64, bool, erro
 		return nil
 	})
 	if err != nil {
-		return 0, true, err
+		return total, true, err
 	}
 	return total, true, nil
 }
@@ -2519,27 +2530,10 @@ func duDirBytes(root string) (int64, bool, error) {
 		if errors.Is(err, exec.ErrNotFound) {
 			return boundedSumDirBytes(root)
 		}
-		// du reports WHY on stderr ("Permission denied") and exits 1; without
-		// it the caller sees a bare "exit status 1" and cannot tell an
-		// unreadable tree from any other failure (ga-hyhccs).
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			// Classify on the WHOLE stderr, then shorten it: a few long
-			// worktree paths fill any prefix, and the permission line need
-			// not be first. One line, because callers print the error inside
-			// a single-line doctor message.
 			full := strings.TrimSpace(string(exitErr.Stderr))
-			denied := strings.Contains(full, "Permission denied")
-			stderr := strings.Join(strings.Fields(strings.ReplaceAll(full, "\n", " ; ")), " ")
-			if runes := []rune(stderr); len(runes) > 300 {
-				stderr = string(runes[:300]) + "..."
-			}
-			if denied {
-				return 0, true, fmt.Errorf("measure directory with du -sk: %w: %w: %s", err, fs.ErrPermission, stderr)
-			}
-			if stderr != "" {
-				return 0, true, fmt.Errorf("measure directory with du -sk: %w: %s", err, stderr)
-			}
+			return 0, true, duExitError("du -sk", err, strings.Contains(full, "Permission denied"), full)
 		}
 		return 0, true, fmt.Errorf("measure directory with du -sk: %w", err)
 	}
@@ -2553,6 +2547,27 @@ func duDirBytes(root string) (int64, bool, error) {
 		return 0, true, fmt.Errorf("measure directory with du -sk: parse %q: %w", fields[0], err)
 	}
 	return kb * 1024, true, nil
+}
+
+// duExitError explains a du that exited non-zero. du reports WHY only on
+// stderr ("Permission denied") and exits 1; without it the caller sees a bare
+// "exit status 1" and cannot tell an unreadable tree from any other failure
+// (ga-hyhccs). denied must be decided over the WHOLE stderr, since a few long
+// worktree paths fill any prefix and the permission line need not be first;
+// the text is then shortened to one line, because callers print the error
+// inside a single-line doctor message.
+func duExitError(invocation string, err error, denied bool, stderr string) error {
+	stderr = strings.Join(strings.Fields(strings.ReplaceAll(stderr, "\n", " ; ")), " ")
+	if runes := []rune(stderr); len(runes) > 300 {
+		stderr = string(runes[:300]) + "..."
+	}
+	if denied {
+		return fmt.Errorf("measure directory with %s: %w: %w: %s", invocation, err, fs.ErrPermission, stderr)
+	}
+	if stderr != "" {
+		return fmt.Errorf("measure directory with %s: %w: %s", invocation, err, stderr)
+	}
+	return fmt.Errorf("measure directory with %s: %w", invocation, err)
 }
 
 func formatGB(bytes int64) string {

@@ -7,8 +7,10 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/git"
@@ -386,19 +388,19 @@ func TestHumanSize(t *testing.T) {
 
 // --- WorktreeDiskSizeCheck ---
 
-// fakeMeasure returns a deterministic byte count per directory path so
-// tests don't shell out to du. Returns sizes[path] when present; treats
-// missing keys as not-existent (mirrors duDirBytes signature).
-func fakeMeasure(sizes map[string]int64, errs map[string]error) func(string) (int64, bool, error) {
-	return func(path string) (int64, bool, error) {
+// fakeMeasure returns a deterministic, fully counted byte total per
+// directory path so tests don't shell out to du. Returns sizes[path] when
+// present; treats missing keys as not-existent.
+func fakeMeasure(sizes map[string]int64, errs map[string]error) dirMeasure {
+	return func(_ context.Context, path string) (dirSize, error) {
 		if e, ok := errs[path]; ok {
-			return 0, true, e
+			return dirSize{exists: true}, e
 		}
 		n, ok := sizes[path]
 		if !ok {
-			return 0, false, nil
+			return dirSize{}, nil
 		}
-		return n, true, nil
+		return dirSize{bytes: n, exists: true}, nil
 	}
 }
 
@@ -1454,5 +1456,331 @@ func TestDuDirBytesFindsPermissionPastLongStderrAndStaysOneLine(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "\n") {
 		t.Errorf("error spans lines: %q", err.Error())
+	}
+}
+
+// --- worktree-disk-size inside its budget (pl-59k) ---
+
+// sizeWithNextWord finds a printed byte count and the word after it.
+var sizeWithNextWord = regexp.MustCompile(`(\d+(?:\.\d+)? (?:B|KB|MB|GB))(?: (\w+))?`)
+
+// assertDuSizesLabeledLogical fails when text prints a byte count that is
+// neither labeled logical nor a configured threshold. Thresholds are always
+// printed followed by "warn" or "error".
+func assertDuSizesLabeledLogical(t *testing.T, text string) {
+	t.Helper()
+	for _, m := range sizeWithNextWord.FindAllStringSubmatch(text, -1) {
+		switch m[2] {
+		case "logical", "warn", "error":
+		default:
+			t.Errorf("byte count %q printed without the logical label: %q", m[1], text)
+		}
+	}
+}
+
+// makeRigDirs creates .gc/worktrees/<name> under dir for each name and
+// returns their paths by name.
+func makeRigDirs(t *testing.T, dir string, names ...string) map[string]string {
+	t.Helper()
+	paths := make(map[string]string, len(names))
+	for _, name := range names {
+		p := filepath.Join(dir, ".gc", "worktrees", name)
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		paths[name] = p
+	}
+	return paths
+}
+
+// The discharge for pl-59k: with a rig the walk cannot finish inside the
+// budget, the check (1) completes inside the budget, (2) names that rig,
+// (3) reports a labeled lower bound, never a bare number, and (4) does not
+// present another rig's size as its verdict.
+func TestWorktreeDiskSizeCheck_UnfinishedWalkIsNamedLowerBoundInsideBudget(t *testing.T) {
+	dir := t.TempDir()
+	rigs := makeRigDirs(t, dir, "astro", "qcore")
+	const budget = 100 * time.Millisecond
+	c := &WorktreeDiskSizeCheck{
+		cfg:    config.DoctorConfig{WorktreeRigWarnSize: "10GB", WorktreeRigErrorSize: "50GB"},
+		budget: budget,
+		measureDir: func(ctx context.Context, root string) (dirSize, error) {
+			if root == rigs["astro"] {
+				return dirSize{bytes: 253 * 1024 * 1024, exists: true}, nil
+			}
+			// A tree too large to finish: the walk stops only at the deadline.
+			<-ctx.Done()
+			return dirSize{bytes: 3 * 1024 * 1024 * 1024, exists: true, lowerBound: true}, nil
+		},
+	}
+	d := &Doctor{CheckTimeout: 5 * time.Second}
+	d.Register(c)
+
+	start := time.Now()
+	report := d.RunCollect(&CheckContext{CityPath: dir}, false)
+	elapsed := time.Since(start)
+	d.Wait()
+
+	r := report.Results[0]
+	if r.TimedOut {
+		t.Fatalf("check was abandoned at doctor's per-check timeout: %s", r.Message)
+	}
+	if elapsed > time.Second {
+		t.Errorf("check took %s, want it to stop soon after its %s budget", elapsed, budget)
+	}
+	if r.Status != StatusWarning {
+		t.Fatalf("status = %d, want Warning; msg=%s", r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, `"qcore" at least 3.0 GB logical (lower bound: the size walk did not finish within 100ms)`) {
+		t.Errorf("message must name the unfinished rig with its labeled lower bound; got %q", r.Message)
+	}
+	if strings.Contains(r.Message, `"astro"`) || strings.Contains(r.Message, "253.0 MB") {
+		t.Errorf("message presents another rig's size as the verdict; got %q", r.Message)
+	}
+	if !strings.Contains(r.FixHint, "ran out of time") {
+		t.Errorf("hint must say the walk ran out of time; got %q", r.FixHint)
+	}
+	assertDuSizesLabeledLogical(t, r.Message)
+	assertDuSizesLabeledLogical(t, strings.Join(r.Details, "\n"))
+}
+
+// A measurer that does not stop at the deadline (du stuck in the kernel on a
+// hung mount) is abandoned: the check still returns inside its budget and
+// names the rig it gave up on.
+func TestWorktreeDiskSizeCheck_MeasurerIgnoringDeadlineIsAbandoned(t *testing.T) {
+	dir := t.TempDir()
+	rigs := makeRigDirs(t, dir, "astro", "stuck")
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	c := &WorktreeDiskSizeCheck{
+		cfg:    config.DoctorConfig{WorktreeRigWarnSize: "10GB", WorktreeRigErrorSize: "50GB"},
+		budget: 100 * time.Millisecond,
+		measureDir: func(_ context.Context, root string) (dirSize, error) {
+			if root == rigs["astro"] {
+				return dirSize{bytes: 253 * 1024 * 1024, exists: true}, nil
+			}
+			<-release
+			return dirSize{}, nil
+		},
+	}
+
+	start := time.Now()
+	r := c.Run(&CheckContext{CityPath: dir})
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("check took %s, want it to abandon the stuck measurer at its budget", elapsed)
+	}
+	if r.Status != StatusWarning {
+		t.Fatalf("status = %d, want Warning; msg=%s", r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, `"stuck" (size UNKNOWN)`) {
+		t.Errorf("message must name the abandoned rig; got %q", r.Message)
+	}
+	// A walk that survives being stopped is stuck in the kernel, not merely
+	// large: the prune-it advice would send the operator the wrong way.
+	if !strings.Contains(r.FixHint, "hung mount") {
+		t.Errorf("hint must point at a stuck walk; got %q", r.FixHint)
+	}
+	if strings.Contains(r.FixHint, "not unreadable") {
+		t.Errorf("hint blames tree size for a walk that would not stop; got %q", r.FixHint)
+	}
+}
+
+// The budget follows doctor's own per-check timeout: with --check-timeout
+// lowered below the default budget, the check still returns its verdict
+// instead of being abandoned as "outcome unknown".
+func TestWorktreeDiskSizeCheck_FinishesInsideALoweredCheckTimeout(t *testing.T) {
+	dir := t.TempDir()
+	makeRigDirs(t, dir, "qcore")
+	c := &WorktreeDiskSizeCheck{
+		cfg: config.DoctorConfig{WorktreeRigWarnSize: "10GB", WorktreeRigErrorSize: "50GB"},
+		measureDir: func(ctx context.Context, _ string) (dirSize, error) {
+			<-ctx.Done()
+			return dirSize{bytes: 1024 * 1024 * 1024, exists: true, lowerBound: true}, nil
+		},
+	}
+	d := &Doctor{CheckTimeout: 900 * time.Millisecond}
+	d.Register(c)
+	report := d.RunCollect(&CheckContext{CityPath: dir}, false)
+	d.Wait()
+
+	r := report.Results[0]
+	if r.TimedOut {
+		t.Fatalf("check was abandoned at a 900ms --check-timeout: %s", r.Message)
+	}
+	if !strings.Contains(r.Message, `"qcore" at least 1.0 GB logical (lower bound`) {
+		t.Errorf("message must name the rig with its labeled lower bound; got %q", r.Message)
+	}
+}
+
+// More rigs than measuring slots, every walk running to the deadline: the rig
+// that never got a slot is named, with a hint that says why, rather than the
+// "tree is very large" advice that fits the walks that did run.
+func TestWorktreeDiskSizeCheck_StarvedRigIsNamedWithItsOwnHint(t *testing.T) {
+	dir := t.TempDir()
+	makeRigDirs(t, dir, "r1", "r2", "r3", "r4", "r5")
+	c := &WorktreeDiskSizeCheck{
+		cfg:    config.DoctorConfig{WorktreeRigWarnSize: "10GB", WorktreeRigErrorSize: "50GB"},
+		budget: 100 * time.Millisecond,
+		measureDir: func(ctx context.Context, _ string) (dirSize, error) {
+			<-ctx.Done()
+			return dirSize{bytes: 1024 * 1024 * 1024, exists: true, lowerBound: true}, nil
+		},
+	}
+	r := c.Run(&CheckContext{CityPath: dir})
+	if got := strings.Count(r.Message, "(size UNKNOWN)"); got != 1 {
+		t.Errorf("want exactly the one starved rig of five reported UNKNOWN, got %d; msg=%q", got, r.Message)
+	}
+	if got := strings.Count(r.Message, "at least 1.0 GB logical"); got != 4 {
+		t.Errorf("want the four measured rigs as lower bounds, got %d; msg=%q", got, r.Message)
+	}
+	if !strings.Contains(r.FixHint, "measuring slot") {
+		t.Errorf("hint must explain the starved rig; got %q", r.FixHint)
+	}
+}
+
+// Measuring runs on goroutines of its own, outside the runner's panic
+// recovery: a panic there must fail that rig, not the whole doctor process.
+func TestWorktreeDiskSizeCheck_PanickingMeasurerFailsOnlyItsRig(t *testing.T) {
+	dir := t.TempDir()
+	rigs := makeRigDirs(t, dir, "astro", "boom")
+	c := &WorktreeDiskSizeCheck{
+		cfg:    config.DoctorConfig{WorktreeRigWarnSize: "10GB", WorktreeRigErrorSize: "50GB"},
+		budget: time.Second,
+		measureDir: func(_ context.Context, root string) (dirSize, error) {
+			if root == rigs["boom"] {
+				panic("walker exploded")
+			}
+			return dirSize{bytes: 253 * 1024 * 1024, exists: true}, nil
+		},
+	}
+	r := c.Run(&CheckContext{CityPath: dir})
+	if r.Status != StatusWarning {
+		t.Fatalf("status = %d, want Warning; msg=%s", r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, `"boom" (size UNKNOWN)`) {
+		t.Errorf("message must name the rig whose walk panicked; got %q", r.Message)
+	}
+	if !strings.Contains(strings.Join(r.Details, "\n"), "walker exploded") {
+		t.Errorf("details must carry the panic; got %v", r.Details)
+	}
+}
+
+// A lower bound already past the error threshold is a definite verdict: the
+// tree holds at least that much.
+func TestWorktreeDiskSizeCheck_LowerBoundPastErrorThresholdIsAnError(t *testing.T) {
+	dir := t.TempDir()
+	makeRigDirs(t, dir, "qcore")
+	c := &WorktreeDiskSizeCheck{
+		cfg:    config.DoctorConfig{WorktreeRigWarnSize: "10GB", WorktreeRigErrorSize: "50GB"},
+		budget: 50 * time.Millisecond,
+		measureDir: func(ctx context.Context, _ string) (dirSize, error) {
+			<-ctx.Done()
+			return dirSize{bytes: 60 * 1024 * 1024 * 1024, exists: true, lowerBound: true}, nil
+		},
+	}
+	r := c.Run(&CheckContext{CityPath: dir})
+	if r.Status != StatusError {
+		t.Fatalf("status = %d, want Error; msg=%s", r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, `"qcore" at least 60.0 GB logical`) {
+		t.Errorf("message must carry the labeled lower bound; got %q", r.Message)
+	}
+	if len(r.Details) != 1 || !strings.Contains(r.Details[0], "at least 60.0 GB logical") ||
+		!strings.Contains(r.Details[0], "exceeds 50.0 GB error threshold") {
+		t.Errorf("details = %v, want the lower bound flagged against the error threshold", r.Details)
+	}
+	assertDuSizesLabeledLogical(t, r.Message)
+	assertDuSizesLabeledLogical(t, strings.Join(r.Details, "\n"))
+}
+
+// Rigs are sized side by side under one deadline, so a tree that cannot be
+// finished does not use up the time the other rigs needed.
+func TestWorktreeDiskSizeCheck_UnfinishableRigDoesNotStarveTheOthers(t *testing.T) {
+	dir := t.TempDir()
+	rigs := makeRigDirs(t, dir, "aaa-huge", "zzz-small")
+	c := &WorktreeDiskSizeCheck{
+		cfg:    config.DoctorConfig{WorktreeRigWarnSize: "10GB", WorktreeRigErrorSize: "50GB"},
+		budget: 100 * time.Millisecond,
+		measureDir: func(ctx context.Context, root string) (dirSize, error) {
+			if root == rigs["aaa-huge"] {
+				<-ctx.Done()
+				return dirSize{bytes: 1024 * 1024 * 1024, exists: true, lowerBound: true}, nil
+			}
+			if ctx.Err() != nil {
+				// Started after the budget was spent: nothing counted.
+				return dirSize{exists: true, lowerBound: true}, nil
+			}
+			return dirSize{bytes: 1024 * 1024 * 1024, exists: true}, nil
+		},
+	}
+	r := c.Run(&CheckContext{CityPath: dir})
+	if !strings.Contains(r.Message, `"aaa-huge" at least`) {
+		t.Errorf("message must name the unfinished rig; got %q", r.Message)
+	}
+	if strings.Contains(r.Message, `"zzz-small"`) {
+		t.Errorf("the small rig was starved of its measuring time; got %q", r.Message)
+	}
+}
+
+// pl-59k part (d): du charges every APFS clone at full size, so each size
+// this check prints is labeled logical, on every path.
+func TestWorktreeDiskSizeCheck_EveryPrintedSizeIsLabeledLogical(t *testing.T) {
+	const gb = int64(1024 * 1024 * 1024)
+	cases := map[string]map[string]dirSize{
+		"under thresholds":             {"a": {bytes: 1 * gb, exists: true}},
+		"over warn":                    {"a": {bytes: 20 * gb, exists: true}, "b": {bytes: 1 * gb, exists: true}},
+		"over error":                   {"a": {bytes: 60 * gb, exists: true}, "b": {bytes: 20 * gb, exists: true}},
+		"lower bound under warn":       {"a": {bytes: 1 * gb, exists: true, lowerBound: true}, "b": {bytes: 2 * gb, exists: true}},
+		"lower bound over warn":        {"a": {bytes: 20 * gb, exists: true, lowerBound: true}, "b": {bytes: 2 * gb, exists: true}},
+		"over warn beside lower bound": {"a": {bytes: 20 * gb, exists: true}, "b": {bytes: 2 * gb, exists: true, lowerBound: true}},
+	}
+	for name, sizes := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			names := make([]string, 0, len(sizes))
+			for n := range sizes {
+				names = append(names, n)
+			}
+			makeRigDirs(t, dir, names...)
+			c := &WorktreeDiskSizeCheck{
+				cfg:    config.DoctorConfig{WorktreeRigWarnSize: "10GB", WorktreeRigErrorSize: "50GB"},
+				budget: time.Second,
+				measureDir: func(_ context.Context, root string) (dirSize, error) {
+					return sizes[filepath.Base(root)], nil
+				},
+			}
+			r := c.Run(&CheckContext{CityPath: dir})
+			if !strings.Contains(r.Message, " logical") {
+				t.Errorf("message prints no labeled size; got %q", r.Message)
+			}
+			assertDuSizesLabeledLogical(t, r.Message)
+			assertDuSizesLabeledLogical(t, strings.Join(r.Details, "\n"))
+		})
+	}
+}
+
+// End to end through the production measurer: du on the huge rig is still
+// walking at the deadline, du on the small rig finishes. The huge rig's
+// finished subtrees become its labeled lower bound.
+func TestWorktreeDiskSizeCheck_ProductionMeasurerStopsDuAtBudget(t *testing.T) {
+	dir := t.TempDir()
+	makeRigDirs(t, dir, "astro", "qcore")
+	installFakeDu(t, `case "$2" in
+*/qcore) printf '2097152\t%s/polecats/a\n' "$2"; exec sleep 30 ;;
+*) printf '1024\t%s\n' "$2" ;;
+esac
+`)
+	c := NewWorktreeDiskSizeCheck(config.DoctorConfig{WorktreeRigWarnSize: "10GB", WorktreeRigErrorSize: "50GB"})
+	c.budget = 300 * time.Millisecond
+
+	r := c.Run(&CheckContext{CityPath: dir})
+	if r.Status != StatusWarning {
+		t.Fatalf("status = %d, want Warning; msg=%s details=%v", r.Status, r.Message, r.Details)
+	}
+	if !strings.Contains(r.Message, `"qcore" at least 2.0 GB logical (lower bound: the size walk did not finish within 300ms)`) {
+		t.Errorf("message must carry du's counted subtrees as the lower bound; got %q", r.Message)
+	}
+	if strings.Contains(r.Message, `"astro"`) {
+		t.Errorf("message presents another rig's size as the verdict; got %q", r.Message)
 	}
 }

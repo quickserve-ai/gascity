@@ -3,7 +3,10 @@
 // output, optional --fix support, and a summary report.
 package doctor
 
-import "io"
+import (
+	"io"
+	"time"
+)
 
 // CheckStatus represents the outcome of a health check.
 type CheckStatus int
@@ -133,6 +136,11 @@ type CheckContext struct {
 	// Checks that need to surface fix-time diagnostics should use this
 	// writer so captured doctor output includes the diagnostics.
 	Output io.Writer
+	// Deadline is when the runner will abandon this Run under its per-check
+	// timeout, or zero when no timeout applies. A check doing bounded work
+	// sizes its budget from it so it returns a verdict before being
+	// abandoned as "outcome unknown".
+	Deadline time.Time
 }
 
 // Renderer is implemented by checks that produce additional, optional
