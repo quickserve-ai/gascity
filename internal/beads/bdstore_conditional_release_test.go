@@ -326,7 +326,7 @@ func TestReleaseIfCurrentFallsBackToSQLOnAnOldBd(t *testing.T) {
 	if len(calls) != 2 {
 		t.Fatalf("calls = %v, want the verb probe then the SQL fallback", calls)
 	}
-	wantQuery := "UPDATE issues SET status = 'open', assignee = '', updated_at = CURRENT_TIMESTAMP, revision = <revision>" +
+	wantQuery := "UPDATE issues SET status = 'open', assignee = '', updated_at = UTC_TIMESTAMP(), revision = <revision>" +
 		" WHERE id = 'bd-42' AND status = 'in_progress' AND assignee = 'worker-''1'"
 	got := append([]string(nil), calls[1]...)
 	got[len(got)-1] = normalizeReleaseRevisionQuery(t, got[len(got)-1])
