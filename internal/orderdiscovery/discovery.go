@@ -69,8 +69,7 @@ func ScanAll(cityPath string, cfg *config.City, opts ScanOptions) ([]orders.Orde
 	}
 
 	retainDisabled := overrideTargetNames(cfg.Orders.Overrides)
-	operatorDirs := operatorOrderDirs(cityPath, cfg, cityLayers, rigNames)
-	cityOrders, err := orders.ScanRootsRetaining(fsysImpl, withoutOperatorPackRoots(CityOrderRoots(cityPath, cfg), operatorDirs), cfg.Orders.Skip, retainDisabled)
+	cityOrders, err := orders.ScanRootsRetaining(fsysImpl, withoutOperatorPackRoots(CityOrderRoots(cityPath, cfg), cityOperatorOrderDirs(cityPath)), cfg.Orders.Skip, retainDisabled)
 	if err != nil {
 		return nil, err
 	}
@@ -95,7 +94,7 @@ func ScanAll(cityPath string, cfg *config.City, opts ScanOptions) ([]orders.Orde
 			continue
 		}
 		roots := rigOrderRoots(exclusive, exclusivePackDirs, rigLocalFormulaLayer(exclusive, exclusivePackDirs))
-		aa, err := orders.ScanRootsRetaining(fsysImpl, withoutOperatorPackRoots(roots, operatorDirs), cfg.Orders.Skip, retainDisabled)
+		aa, err := orders.ScanRootsRetaining(fsysImpl, withoutOperatorPackRoots(roots, rigOperatorOrderDirs(cityPath, cfg, cityLayers, rigName)), cfg.Orders.Skip, retainDisabled)
 		if err != nil {
 			if opts.OnRigScanError != nil {
 				if handlerErr := opts.OnRigScanError(rigName, err); handlerErr != nil {
@@ -415,18 +414,30 @@ func overrideTargetNames(cfgOverrides []config.OrderOverride) []string {
 	return names
 }
 
-// operatorOrderDirs returns the order directories the operator owns: the
-// city's own orders/ and every rig's local layer. An order disabled in one of
-// them is the operator's decision, so even when a pack dir resolves to the
-// same directory it must never be retained for an override to reopen.
-func operatorOrderDirs(cityPath string, cfg *config.City, cityLayers []string, rigNames map[string]struct{}) []string {
-	dirs := []string{citylayout.OrdersPath(cityPath)}
-	// A rig's configured formulas_dir is the operator's even when it is the
-	// same directory as one of the rig's pack formula layers, where
-	// rigLocalFormulaLayer cannot see it. Relative paths resolve against the
-	// city directory.
+// cityOperatorOrderDirs lists the order directories the operator owns in the
+// CITY scan: the city's own orders directory. An order disabled in an
+// operator-owned directory is the operator's decision, so even when a pack dir
+// resolves to the same directory it must never be retained for an override
+// to reopen.
+func cityOperatorOrderDirs(cityPath string) []string {
+	return []string{citylayout.OrdersPath(cityPath)}
+}
+
+// rigOperatorOrderDirs lists the order directories the operator owns in ONE
+// rig's scan: the city's own, plus that rig's configured formulas_dir and its
+// rig-local formula layer. Ownership is per scope: when rig A's formulas_dir
+// is the same directory as a pack that rig B (or the city) imports, the
+// orders there are A's own but still B's pack orders, so marking them
+// operator-owned in every scope would stop B's enable override from
+// re-enabling them.
+//
+// A rig's formulas_dir is the operator's even when it is the same directory
+// as one of the rig's pack formula layers, where rigLocalFormulaLayer cannot
+// see it. Relative paths resolve against the city directory.
+func rigOperatorOrderDirs(cityPath string, cfg *config.City, cityLayers []string, rigName string) []string {
+	dirs := cityOperatorOrderDirs(cityPath)
 	for _, rig := range cfg.Rigs {
-		if rig.FormulasDir == "" {
+		if rig.Name != rigName || rig.FormulasDir == "" {
 			continue
 		}
 		dir := rig.FormulasDir
@@ -435,11 +446,9 @@ func operatorOrderDirs(cityPath string, cfg *config.City, cityLayers []string, r
 		}
 		dirs = append(dirs, formulaLayerRoot(dir).Dir)
 	}
-	for rigName := range rigNames {
-		exclusive := RigExclusiveLayers(cfg.FormulaLayers.Rigs[rigName], cityLayers)
-		if local := rigLocalFormulaLayer(exclusive, cfg.RigPackDirs[rigName]); local != "" {
-			dirs = append(dirs, formulaLayerRoot(local).Dir)
-		}
+	exclusive := RigExclusiveLayers(cfg.FormulaLayers.Rigs[rigName], cityLayers)
+	if local := rigLocalFormulaLayer(exclusive, cfg.RigPackDirs[rigName]); local != "" {
+		dirs = append(dirs, formulaLayerRoot(local).Dir)
 	}
 	return dirs
 }
