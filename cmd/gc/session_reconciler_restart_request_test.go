@@ -867,3 +867,38 @@ func TestDoHandoff_PinnedAlwaysSessionPersistsResetAndReconcilerStopsSession(t *
 		t.Fatalf("pinned session %q still running after reconcile; persisted restart should have let the reconciler stop it", sessionName)
 	}
 }
+
+// TestReconcileSessionBeads_RestartRequestOnDemandWakesFromResetMarker pins the
+// premise that lets gc handoff cycle an on-demand configured named seat
+// (ga-cctcju): with NO wake marker and NO pool or assigned-work demand, the
+// restart consume kills the runtime and lands RestartRequestPatch, and the
+// durable reset-pending marker (continuation_reset_pending + reset_committed_at)
+// wakes the seat fresh on the next tick. If this ever stops holding, a
+// self-handoff would leave an on-demand seat down, and the handoff must arm an
+// explicit wake before requesting the restart.
+func TestReconcileSessionBeads_RestartRequestOnDemandWakesFromResetMarker(t *testing.T) {
+	env, session, sessionName := newLiveRestartRequestScenario(t)
+	env.setSessionMetadata(&session, map[string]string{
+		"restart_requested": "true",
+	})
+
+	env.reconcileWithPoolDesiredAndDrainOps([]beads.Bead{session}, map[string]int{}, nil)
+	if env.sp.IsRunning(sessionName) {
+		t.Fatalf("session %q still running after the restart-requested kill", sessionName)
+	}
+	stopped, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("store.Get(%s): %v", session.ID, err)
+	}
+	if got := stopped.Metadata["continuation_reset_pending"]; got != "true" {
+		t.Fatalf("continuation_reset_pending = %q after the consume, want the durable reset marker", got)
+	}
+	if stopped.Metadata["wake_request"] != "" {
+		t.Fatalf("wake_request = %q; this case must carry no wake marker", stopped.Metadata["wake_request"])
+	}
+
+	env.reconcileWithPoolDesiredAndDrainOps([]beads.Bead{stopped}, map[string]int{}, nil)
+	if !env.sp.IsRunning(sessionName) {
+		t.Fatalf("on-demand session %q did not wake from its reset marker after the restart kill (ga-cctcju)\nstdout: %s\nstderr: %s", sessionName, env.stdout.String(), env.stderr.String())
+	}
+}
