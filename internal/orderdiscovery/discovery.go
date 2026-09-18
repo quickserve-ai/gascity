@@ -421,6 +421,20 @@ func overrideTargetNames(cfgOverrides []config.OrderOverride) []string {
 // same directory it must never be retained for an override to reopen.
 func operatorOrderDirs(cityPath string, cfg *config.City, cityLayers []string, rigNames map[string]struct{}) []string {
 	dirs := []string{citylayout.OrdersPath(cityPath)}
+	// A rig's configured formulas_dir is the operator's even when it is the
+	// same directory as one of the rig's pack formula layers, where
+	// rigLocalFormulaLayer cannot see it. Relative paths resolve against the
+	// city directory.
+	for _, rig := range cfg.Rigs {
+		if rig.FormulasDir == "" {
+			continue
+		}
+		dir := rig.FormulasDir
+		if !filepath.IsAbs(dir) {
+			dir = filepath.Join(cityPath, dir)
+		}
+		dirs = append(dirs, formulaLayerRoot(dir).Dir)
+	}
 	for rigName := range rigNames {
 		exclusive := RigExclusiveLayers(cfg.FormulaLayers.Rigs[rigName], cityLayers)
 		if local := rigLocalFormulaLayer(exclusive, cfg.RigPackDirs[rigName]); local != "" {
