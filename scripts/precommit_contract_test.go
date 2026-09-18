@@ -71,7 +71,8 @@ func TestTestFastParallelUsesSanitizedEnvironmentAndMachineAwareConcurrency(t *t
 			strings.HasPrefix(entry, "PUSH_GATE_MAX_WAIT_SECONDS=") ||
 			strings.HasPrefix(entry, "PUSH_GATE_POLL_SECONDS=") ||
 			strings.HasPrefix(entry, "PUSH_GATE_UNRELATED_SENTINEL=") ||
-			strings.HasPrefix(entry, "GC_TEST_LOCAL_LOADAVG=") {
+			strings.HasPrefix(entry, "GC_TEST_LOCAL_LOADAVG=") ||
+			strings.HasPrefix(entry, "GC_TEST_LOCAL_LOADAVG_FILE=") {
 			continue
 		}
 		baseEnv = append(baseEnv, entry)

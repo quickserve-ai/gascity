@@ -108,6 +108,40 @@ else
     echo "  skip loadavg.default_path_opens_proc_loadavg — strace not installed"
 fi
 
+# macOS has no /proc/loadavg, and the strace guard above never runs there, so
+# the default path was silently load-blind on the host where the refinery runs
+# the gate (ga-ry1bra). Drive the sysctl fallback on ANY host: point the file
+# seam at a path that does not exist and put a stub sysctl first on PATH.
+# The zero-load case is the control: it proves the stub is read and changes
+# nothing, so the saturating case's 2 cannot come from somewhere else.
+STUB_BIN="$(mktemp -d)"
+trap 'rm -rf "$STUB_BIN"' EXIT
+write_sysctl_stub() {
+    printf '#!/usr/bin/env bash\n[[ "$*" == "-n vm.loadavg" ]] || exit 1\nprintf "%%s\\n" "%s"\n' "$1" > "$STUB_BIN/sysctl"
+    chmod +x "$STUB_BIN/sysctl"
+}
+darwin_job_count() {
+    env -u GC_TEST_LOCAL_LOADAVG PATH="$STUB_BIN:$PATH" GC_TEST_LOCAL_CPUS=16 \
+        GC_TEST_LOCAL_MEMORY_KIB="$HUGE_MEM_KIB" GC_TEST_LOCAL_LOADAVG_FILE="$STUB_BIN/no-such-loadavg" "$JOB_COUNT"
+}
+write_sysctl_stub "{ 0.00 0.00 0.00 }"
+assert_eq "loadavg.darwin_sysctl_zero_load_unchanged" "$(darwin_job_count)" "16"
+write_sysctl_stub "{ 10.52 8.00 6.00 }"
+assert_eq "loadavg.darwin_sysctl_subtracts_from_cpus" "$(darwin_job_count)" "6"
+write_sysctl_stub "{ 100.16 113.27 68.61 }"
+assert_eq "loadavg.darwin_sysctl_saturated_floors_at_min" "$(darwin_job_count)" "2"
+write_sysctl_stub "garbage"
+assert_eq "loadavg.darwin_sysctl_unparseable_skips_load" "$(darwin_job_count)" "16"
+rm -f "$STUB_BIN/sysctl"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$STUB_BIN/sysctl"; chmod +x "$STUB_BIN/sysctl"
+assert_eq "loadavg.darwin_sysctl_failing_skips_load" "$(darwin_job_count)" "16"
+# A readable file still wins over sysctl: Linux behaviour is unchanged.
+printf '3.00 2.00 1.00 1/100 42\n' > "$STUB_BIN/loadavg"
+write_sysctl_stub "{ 100.00 100.00 100.00 }"
+assert_eq "loadavg.readable_file_wins_over_sysctl" \
+    "$(env -u GC_TEST_LOCAL_LOADAVG PATH="$STUB_BIN:$PATH" GC_TEST_LOCAL_CPUS=16 \
+        GC_TEST_LOCAL_MEMORY_KIB="$HUGE_MEM_KIB" GC_TEST_LOCAL_LOADAVG_FILE="$STUB_BIN/loadavg" "$JOB_COUNT")" "13"
+
 # ============================================================
 # Part B — scripts/lib/inner-parallelism.sh (sourced in-process)
 # ============================================================
