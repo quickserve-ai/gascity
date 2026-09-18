@@ -181,17 +181,20 @@ INSERT INTO wisp_dependencies (issue_id, depends_on_issue_id, type) VALUES
 		"utc-young": "open",
 	})
 
-	// Step 1 closed the orphan wisp. Its closed_at must be UTC; the
-	// server-local clock would put it 330 minutes in the future.
+	// Step 1 closed the orphan wisp. Its closed_at and updated_at must be
+	// UTC; the server-local clock would put them 330 minutes in the future.
+	// updated_at is the ON UPDATE column, so the close must set it explicitly.
 	requireMaintenanceStatuses(t, queryMaintenanceStatusByID(t, f.doltPath, f.port, "citydb", "wisps"), map[string]string{
 		"utc-orphan-wisp": "closed",
 	})
-	skew := f.column(t, "SELECT ABS(TIMESTAMPDIFF(MINUTE, closed_at, UTC_TIMESTAMP())) FROM wisps WHERE id = 'utc-orphan-wisp'")
-	if len(skew) != 1 {
-		t.Fatalf("closed_at skew query returned %q, want one row", skew)
-	}
-	if minutes, err := strconv.Atoi(skew[0]); err != nil || minutes > 5 {
-		t.Fatalf("wisp closed_at is %q minutes from UTC, want at most 5; the close wrote server-local time", skew[0])
+	for _, column := range []string{"closed_at", "updated_at"} {
+		skew := f.column(t, fmt.Sprintf("SELECT ABS(TIMESTAMPDIFF(MINUTE, %s, UTC_TIMESTAMP())) FROM wisps WHERE id = 'utc-orphan-wisp'", column))
+		if len(skew) != 1 {
+			t.Fatalf("%s skew query returned %q, want one row", column, skew)
+		}
+		if minutes, err := strconv.Atoi(skew[0]); err != nil || minutes > 5 {
+			t.Fatalf("wisp %s is %q minutes from UTC, want at most 5; the close wrote server-local time", column, skew[0])
+		}
 	}
 }
 
@@ -434,6 +437,9 @@ func (f *reaperStaleIssueFixture) column(t *testing.T, query string) []string {
 	return rows
 }
 
+// maintenanceReaperSchemaSQL mirrors the bd columns the reaper touches. Like
+// bd, updated_at is ON UPDATE CURRENT_TIMESTAMP, which Dolt fills from the
+// server-local clock whenever an UPDATE leaves the column unset.
 func maintenanceReaperSchemaSQL() string {
 	return `
 CREATE TABLE wisps (
@@ -443,7 +449,7 @@ CREATE TABLE wisps (
   issue_type VARCHAR(32),
   priority BIGINT,
   created_at DATETIME(6),
-  updated_at DATETIME(6),
+  updated_at DATETIME(6) DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
   closed_at DATETIME(6),
   assignee VARCHAR(255),
   description LONGTEXT,
@@ -456,7 +462,7 @@ CREATE TABLE issues (
   issue_type VARCHAR(32),
   priority BIGINT,
   created_at DATETIME(6),
-  updated_at DATETIME(6),
+  updated_at DATETIME(6) DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
   closed_at DATETIME(6),
   assignee VARCHAR(255),
   description LONGTEXT,

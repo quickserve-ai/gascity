@@ -76,7 +76,8 @@ duration_to_hours() {
 
 # bd stores UTC in every timestamp column, so each age cutoff and each
 # closed_at write below uses UTC_TIMESTAMP(). The server-local clock is off by
-# the host's UTC offset and shifts an hour at each DST change.
+# the host's UTC offset and shifts an hour at each DST change. Closes also set
+# updated_at, because bd's ON UPDATE clause on that column uses the local clock.
 MAX_AGE_H=$(duration_to_hours "$MAX_AGE")
 PURGE_AGE_H=$(duration_to_hours "$PURGE_AGE")
 STALE_AGE_H=$(duration_to_hours "$STALE_ISSUE_AGE")
@@ -729,7 +730,7 @@ $(workflow_root_candidates_cte "$db" "workflow_wisp_root_candidates" "wisps" "w"
         closeable_workflow_wisp_roots AS (
 $(workflow_root_closeable_select "workflow_wisp_root_candidates")
         )
-        UPDATE \`$db\`.wisps SET status='closed', closed_at=UTC_TIMESTAMP(), metadata = JSON_SET(COALESCE(metadata, JSON_OBJECT()), '$."gc.outcome"', 'skipped', '$."close_reason"', '$WORKFLOW_ROOT_CLOSE_REASON')
+        UPDATE \`$db\`.wisps SET status='closed', closed_at=UTC_TIMESTAMP(), updated_at=UTC_TIMESTAMP(), metadata = JSON_SET(COALESCE(metadata, JSON_OBJECT()), '$."gc.outcome"', 'skipped', '$."close_reason"', '$WORKFLOW_ROOT_CLOSE_REASON')
         WHERE id IN (SELECT id FROM closeable_workflow_wisp_roots)
 SQL
 }
@@ -898,7 +899,7 @@ while IFS= read -r DB; do
         fi
 
         if run_sql_change "$DB" "closing stale wisps" "
-            UPDATE \`$DB\`.wisps SET status='closed', closed_at=UTC_TIMESTAMP()
+            UPDATE \`$DB\`.wisps SET status='closed', closed_at=UTC_TIMESTAMP(), updated_at=UTC_TIMESTAMP()
             WHERE status IN ('open', 'hooked', 'in_progress')
             AND created_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL $MAX_AGE_H HOUR)
             AND id IN (
