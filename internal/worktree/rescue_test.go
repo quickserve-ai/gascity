@@ -1065,3 +1065,71 @@ func TestRescueTaintCoversTheIndexParent(t *testing.T) {
 		t.Fatalf("taint = %v, want the staged-only .env", rep.Taint)
 	}
 }
+
+// Codex review of #97, round 5, P1: validation ran before the path lock, so a
+// tree replaced while teardown waited was rescued and removed unchecked.
+func TestTeardownRevalidatesThePathUnderItsLock(t *testing.T) {
+	repo, wt, _ := linkedWorktree(t)
+	rep, err := Rescue(rescueSpec(wt))
+	if err != nil {
+		t.Fatalf("Rescue: %v", err)
+	}
+	// While teardown waits for the lock, the worktree is replaced by an
+	// independent clone at the same path.
+	afterPathLock = func() {
+		afterPathLock = nil
+		if err := os.RemoveAll(wt); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, filepath.Dir(wt), "clone", "-q", repo, wt)
+	}
+	t.Cleanup(func() { afterPathLock = nil })
+	_, err = Teardown(TeardownSpec{RescueSpec: rescueSpec(wt), RescueSHA: rep.RescueSHA})
+	if err == nil || !strings.Contains(err.Error(), "changed while waiting for its lock") {
+		t.Fatalf("Teardown err = %v, want the replacement refused under the lock", err)
+	}
+	if refs := rescueRefs(t, wt); len(refs) != 0 {
+		t.Fatalf("the replacement clone was rescued before being refused: %v", refs)
+	}
+	if _, err := os.Stat(filepath.Join(wt, "a.txt")); err != nil {
+		t.Fatalf("the replacement clone was damaged: %v", err)
+	}
+}
+
+// Codex review of #97, round 5, P2: a clean worktree on a local-only commit
+// that added a credential file has nothing beyond HEAD, but the rescue makes
+// that commit durable, so taint must name the file.
+func TestRescueTaintCoversALocalOnlyCommit(t *testing.T) {
+	repo, wt, base := linkedWorktree(t)
+	runGit(t, repo, "update-ref", "refs/remotes/origin/main", base) // the base is published
+	writeFile(t, filepath.Join(wt, ".env"), "TOKEN=x\n")
+	runGit(t, wt, "add", ".env")
+	runGit(t, wt, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "local secret")
+	rep, err := Rescue(rescueSpec(wt))
+	if err != nil {
+		t.Fatalf("Rescue: %v", err)
+	}
+	if rep.WIP {
+		t.Fatalf("control: a clean worktree needs no snapshot, got %+v", rep)
+	}
+	if !containsString(rep.Taint, ".env") {
+		t.Fatalf("taint = %v, want the .env the local-only HEAD added", rep.Taint)
+	}
+}
+
+// A credential path that a remote-tracking ref already reaches was published
+// before the rescue; the rescue does not newly expose it.
+func TestRescueTaintSkipsCommitsARemoteAlreadyHas(t *testing.T) {
+	repo, wt, _ := linkedWorktree(t)
+	writeFile(t, filepath.Join(wt, ".env"), "TOKEN=x\n")
+	runGit(t, wt, "add", ".env")
+	runGit(t, wt, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "published secret")
+	runGit(t, repo, "update-ref", "refs/remotes/origin/main", runGit(t, wt, "rev-parse", "HEAD"))
+	rep, err := Rescue(rescueSpec(wt))
+	if err != nil {
+		t.Fatalf("Rescue: %v", err)
+	}
+	if len(rep.Taint) != 0 {
+		t.Fatalf("taint = %v, want none: the remote already has that commit", rep.Taint)
+	}
+}
