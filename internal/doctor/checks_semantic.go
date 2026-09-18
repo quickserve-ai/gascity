@@ -198,37 +198,55 @@ func (c *EventLogSizeCheck) Fix(_ *CheckContext) error { return nil }
 
 // --- Worktree disk size check ---
 
-// rigSize pairs a rig directory name with its measured byte footprint
-// under .gc/worktrees/<rig>/. Used as the sort key for ordered output.
+// rigSize pairs a rig directory name with its measured footprint under
+// .gc/worktrees/<rig>/. Sorted by size.bytes for ordered output.
 type rigSize struct {
-	name  string
-	bytes int64
+	name string
+	size dirSize
+}
+
+// describe renders the rig and its labeled size, e.g. `"astro" at 252.9 MB
+// logical` or `"qcore" at least 12.0 GB logical (lower bound: ...)`.
+func (s rigSize) describe(budget time.Duration) string {
+	if s.size.lowerBound {
+		return strconv.Quote(s.name) + " " + logicalSizeLabel(s.size, budget)
+	}
+	return strconv.Quote(s.name) + " at " + logicalSizeLabel(s.size, budget)
 }
 
 // WorktreeDiskSizeCheck warns when a per-rig footprint under
 // .gc/worktrees/<rig>/ exceeds the configured threshold. Build
 // artifacts, nested task worktrees, and accumulated state can grow
 // unboundedly here; without this check the disk fills silently.
+//
+// Sizes are du's LOGICAL counts (see dirSize), and sizing stops at the
+// check's own budget so the check always returns a verdict: a tree still
+// being walked at the deadline is reported by name with the lower bound
+// counted so far (pl-59k).
 type WorktreeDiskSizeCheck struct {
 	cfg config.DoctorConfig
 	// measureDir is injectable so tests can avoid shelling out to du.
-	// Production uses duDirBytes from checks.go.
-	measureDir func(string) (int64, bool, error)
+	// Production uses duDirSizeWithin.
+	measureDir dirMeasure
+	// budget caps the time Run spends measuring, before sizingBudget fits
+	// it to the runner's deadline. Zero means worktreeSizeBudget; tests set
+	// it small.
+	budget time.Duration
 }
 
 // NewWorktreeDiskSizeCheck creates a worktree disk-footprint check.
 // The cfg is read for thresholds and policy at Run time, so reload-time
 // changes propagate naturally.
 func NewWorktreeDiskSizeCheck(cfg config.DoctorConfig) *WorktreeDiskSizeCheck {
-	// Wrap duDirBytes so its dolt-flavored error messages
-	// ("measure dolt data dir: ...") get re-tagged as worktree
-	// measurement failures when surfaced through this check.
-	measure := func(path string) (int64, bool, error) {
-		n, ok, err := duDirBytes(path)
+	// Wrap duDirSizeWithin so its generic error messages
+	// ("measure directory with du -k: ...") name the worktree path when
+	// surfaced through this check.
+	measure := func(ctx context.Context, path string) (dirSize, error) {
+		size, err := duDirSizeWithin(ctx, path)
 		if err != nil {
-			return n, ok, fmt.Errorf("measure worktree dir %q: %w", path, err)
+			return size, fmt.Errorf("measure worktree dir %q: %w", path, err)
 		}
-		return n, ok, nil
+		return size, nil
 	}
 	return &WorktreeDiskSizeCheck{cfg: cfg, measureDir: measure}
 }
@@ -256,27 +274,35 @@ func (c *WorktreeDiskSizeCheck) Run(ctx *CheckContext) *CheckResult {
 
 	measure := c.measureDir
 	if measure == nil {
-		measure = duDirBytes
+		measure = duDirSizeWithin
+	}
+	budget := sizingBudget(ctx, c.budget)
+
+	var names, roots []string
+	for _, e := range rigEntries {
+		if e.IsDir() {
+			names = append(names, e.Name())
+			roots = append(roots, filepath.Join(wtRoot, e.Name()))
+		}
 	}
 
 	var sizes []rigSize
 	var measureErrs []string
-	var unmeasured unmeasuredRigs
-	for _, e := range rigEntries {
-		if !e.IsDir() {
+	unmeasured := unmeasuredRigs{budget: budget}
+	for i, m := range measureDirsWithin(budget, measure, roots) {
+		if m.err != nil {
+			measureErrs = append(measureErrs, fmt.Sprintf("%s: %v", names[i], m.err))
+			unmeasured.add(names[i], m.err)
 			continue
 		}
-		root := filepath.Join(wtRoot, e.Name())
-		bytes, exists, err := measure(root)
-		if err != nil {
-			measureErrs = append(measureErrs, fmt.Sprintf("%s: %v", e.Name(), err))
-			unmeasured.add(e.Name(), err)
+		if !m.size.exists {
 			continue
 		}
-		if !exists {
-			continue
+		s := rigSize{name: names[i], size: m.size}
+		sizes = append(sizes, s)
+		if m.size.lowerBound {
+			unmeasured.addLowerBound(s)
 		}
-		sizes = append(sizes, rigSize{name: e.Name(), bytes: bytes})
 	}
 
 	if len(sizes) == 0 {
@@ -294,7 +320,7 @@ func (c *WorktreeDiskSizeCheck) Run(ctx *CheckContext) *CheckResult {
 		return r
 	}
 
-	sort.Slice(sizes, func(i, j int) bool { return sizes[i].bytes > sizes[j].bytes })
+	sort.Slice(sizes, func(i, j int) bool { return sizes[i].size.bytes > sizes[j].size.bytes })
 
 	warn := c.cfg.WorktreeRigWarnBytes()
 	errBytes := c.cfg.WorktreeRigErrorBytes()
@@ -303,65 +329,79 @@ func (c *WorktreeDiskSizeCheck) Run(ctx *CheckContext) *CheckResult {
 	var overThreshold int
 	status := StatusOK
 	for _, s := range sizes {
+		// A lower bound past a threshold is a definite crossing: the
+		// tree holds at least that much.
 		switch {
-		case s.bytes >= errBytes:
+		case s.size.bytes >= errBytes:
 			details = append(details, fmt.Sprintf("rig %q: %s (exceeds %s error threshold)",
-				s.name, humanSize(s.bytes), humanSize(errBytes)))
+				s.name, logicalSizeLabel(s.size, budget), humanSize(errBytes)))
 			overThreshold++
 			if status < StatusError {
 				status = StatusError
 			}
-		case s.bytes >= warn:
+		case s.size.bytes >= warn:
 			details = append(details, fmt.Sprintf("rig %q: %s (exceeds %s warn threshold)",
-				s.name, humanSize(s.bytes), humanSize(warn)))
+				s.name, logicalSizeLabel(s.size, budget), humanSize(warn)))
 			overThreshold++
 			if status < StatusWarning {
 				status = StatusWarning
 			}
+		case s.size.lowerBound:
+			details = append(details, fmt.Sprintf("rig %q: %s (full size UNKNOWN; the count so far is under the %s warn threshold)",
+				s.name, logicalSizeLabel(s.size, budget), humanSize(warn)))
 		}
 	}
 	for _, e := range measureErrs {
 		details = append(details, "measure error: "+e)
 	}
-	if len(measureErrs) > 0 && status < StatusWarning {
+	if unmeasured.any() && status < StatusWarning {
 		status = StatusWarning
 	}
 
 	r.Status = status
 	switch status {
 	case StatusError:
-		r.Message = fmt.Sprintf("%d rig(s) over worktree size threshold (%s: %q at %s)",
-			overThreshold, unmeasured.largestLabel(), sizes[0].name, humanSize(sizes[0].bytes)) + unmeasured.suffix()
+		r.Message = fmt.Sprintf("%d rig(s) over worktree size threshold (%s: %s)",
+			overThreshold, unmeasured.largestLabel(), sizes[0].describe(budget)) + unmeasured.suffix(sizes[0].name)
 		r.Details = details
 		r.FixHint = "investigate .gc/worktrees/<rig>/ for build-artifact accumulation; consider routing builds out of worktrees, periodic clean steps, or running `gc doctor --fix` to remove safely-prunable nested worktrees" + unmeasured.hintSuffix()
 	case StatusWarning:
 		if overThreshold > 0 {
-			r.Message = fmt.Sprintf("%d rig(s) approaching worktree size limit (%s: %q at %s)",
-				overThreshold, unmeasured.largestLabel(), sizes[0].name, humanSize(sizes[0].bytes)) + unmeasured.suffix()
+			r.Message = fmt.Sprintf("%d rig(s) approaching worktree size limit (%s: %s)",
+				overThreshold, unmeasured.largestLabel(), sizes[0].describe(budget)) + unmeasured.suffix(sizes[0].name)
 			r.FixHint = "see fix hint for nested-worktree-prune; tune [doctor].worktree_rig_warn_size if 10 GB is too tight for this install" + unmeasured.hintSuffix()
 		} else {
-			// The unmeasured rig is the verdict. A size from the rigs that
-			// did finish says nothing about it: on 2026-08-25 this read
-			// 252.9 MB for astro while the skipped qcore tree held 180 GB
-			// (ga-hyhccs).
-			r.Message = fmt.Sprintf("could not measure rig worktree path(s): %s (size UNKNOWN; the measured rigs are under the %s warn threshold)",
-				unmeasured.names(), humanSize(warn))
+			// The rigs that could not be fully sized are the verdict. A
+			// size from the rigs that did finish says nothing about them:
+			// on 2026-08-25 this read 252.9 MB for astro while the skipped
+			// qcore tree held 180 GB (ga-hyhccs).
+			r.Message = "rig worktree path(s) not fully sized: " + unmeasured.describe("")
+			if len(sizes) > len(unmeasured.partial) {
+				r.Message += fmt.Sprintf("; the fully measured rigs are under the %s warn threshold", humanSize(warn))
+			}
 			r.FixHint = unmeasured.hint()
 		}
 		r.Details = details
 	default:
 		// All under thresholds: report the worst rig as info.
-		r.Message = fmt.Sprintf("largest rig worktree: %q at %s (under %s warn)",
-			sizes[0].name, humanSize(sizes[0].bytes), humanSize(warn))
+		r.Message = fmt.Sprintf("largest rig worktree: %s (under %s warn)",
+			sizes[0].describe(budget), humanSize(warn))
 	}
 	return r
 }
 
-// unmeasuredRigs records the rigs a size check could not measure and why, so
-// the verdict can name them and give a hint that matches the failure.
+// unmeasuredRigs records the rigs a size check could not fully measure and
+// why, so the verdict can name them and give a hint that matches the failure.
 type unmeasuredRigs struct {
-	rigs       []string
+	// rigs could not be sized at all.
+	rigs []string
+	// partial were sized only to a lower bound before the budget ran out.
+	partial []rigSize
+	// budget is the measuring budget, for labeling partial sizes.
+	budget     time.Duration
 	timedOut   bool
+	stuck      bool
+	starved    bool
 	permission bool
 }
 
@@ -370,10 +410,24 @@ func (u *unmeasuredRigs) add(name string, err error) {
 	if errors.Is(err, context.DeadlineExceeded) {
 		u.timedOut = true
 	}
+	if errors.Is(err, errSizeWalkStuck) {
+		u.stuck = true
+	}
+	if errors.Is(err, errSizeWalkStarved) {
+		u.starved = true
+	}
 	if errors.Is(err, fs.ErrPermission) {
 		u.permission = true
 	}
 }
+
+// addLowerBound records a rig whose walk stopped at the budget.
+func (u *unmeasuredRigs) addLowerBound(s rigSize) {
+	u.partial = append(u.partial, s)
+	u.timedOut = true
+}
+
+func (u *unmeasuredRigs) any() bool { return len(u.rigs)+len(u.partial) > 0 }
 
 func (u *unmeasuredRigs) names() string {
 	quoted := make([]string, len(u.rigs))
@@ -383,26 +437,51 @@ func (u *unmeasuredRigs) names() string {
 	return strings.Join(quoted, ", ")
 }
 
-// largestLabel keeps "largest" honest: with a rig unmeasured, the biggest
-// size seen is only the largest MEASURED one.
+// largestLabel keeps "largest" honest: with a rig not fully sized, the
+// biggest size seen is only the largest MEASURED one.
 func (u *unmeasuredRigs) largestLabel() string {
-	if len(u.rigs) > 0 {
+	if u.any() {
 		return "largest measured"
 	}
 	return "largest"
 }
 
-func (u *unmeasuredRigs) suffix() string {
-	if len(u.rigs) == 0 {
+// describe names every rig not fully sized with what is known of it: its
+// labeled lower bound, or that its size is unknown. The rig named skip is
+// left out, for when a message has already described it.
+func (u *unmeasuredRigs) describe(skip string) string {
+	var parts []string
+	for _, s := range u.partial {
+		if s.name != skip {
+			parts = append(parts, s.describe(u.budget))
+		}
+	}
+	for _, name := range u.rigs {
+		parts = append(parts, strconv.Quote(name)+" (size UNKNOWN)")
+	}
+	return strings.Join(parts, ", ")
+}
+
+// suffix appends the rigs not fully sized to a verdict about another rig,
+// leaving out headline, the rig the verdict already describes.
+func (u *unmeasuredRigs) suffix(headline string) string {
+	described := u.describe(headline)
+	if described == "" {
 		return ""
 	}
-	return fmt.Sprintf("; could not measure %s (size UNKNOWN)", u.names())
+	return "; not fully sized: " + described
 }
 
 func (u *unmeasuredRigs) hint() string {
 	var parts []string
 	if u.timedOut {
 		parts = append(parts, "the size measurement ran out of time: the tree is very large, not unreadable — count and prune its worktrees (see nested-worktree-prune) rather than raising the timeout")
+	}
+	if u.stuck {
+		parts = append(parts, "a size walk did not stop when its deadline passed and was abandoned: du is likely blocked on a hung mount or a failing disk, so look for stuck du processes and check that filesystem")
+	}
+	if u.starved {
+		parts = append(parts, "a rig was never measured because the budget ran out while larger trees held every measuring slot; prune the largest worktree trees so every rig can be sized in time")
 	}
 	if u.permission {
 		parts = append(parts, "check filesystem permissions on .gc/worktrees/<rig>/")
@@ -414,10 +493,10 @@ func (u *unmeasuredRigs) hint() string {
 }
 
 func (u *unmeasuredRigs) hintSuffix() string {
-	if len(u.rigs) == 0 {
+	if !u.any() {
 		return ""
 	}
-	return "; unmeasured rigs: " + u.hint()
+	return "; rigs not fully sized: " + u.hint()
 }
 
 // CanFix returns false — pruning is the responsibility of
