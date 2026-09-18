@@ -5473,12 +5473,12 @@ Removal also deletes everything private to the worktree, so the rescue keeps
 it reachable too: staged content that differs from both HEAD and the working
 tree (an index parent), and, through an anchor parent, every commit that only
 the worktree's own state reaches: its HEAD reflog, an in-progress rebase,
-merge, cherry-pick, revert or bisect, refs/worktree/*, and the HEADs of its
-submodules (imported into the shared object store, since a linked worktree's
-submodule repositories live in its admin dir). Remote-tracking refs are not
-trusted to keep anything: fetch --prune drops them. Index bits that make git
-skip real edits (assume-unchanged, skip-worktree on a present file) are
-ignored.
+merge, cherry-pick, revert or bisect, and refs/worktree/*. Only tags and
+other beads' rescues count as already durable: remote-tracking refs are
+dropped by fetch --prune and local branches by merged-branch cleanup. Index
+bits that make git skip real edits (assume-unchanged, skip-worktree on a
+present file) are ignored. Submodule repositories are not analyzed here;
+gc worktree teardown preserves them verbatim.
 
 Refused, because a rescue cannot carry them: a submodule with uncommitted or
 untracked changes, an untracked directory holding its own git repository,
@@ -5516,6 +5516,12 @@ linked worktree again, and then only THIS worktree's admin directory is
 removed. It never runs a repo-wide worktree prune, which would drop other
 worktrees' stale registrations and the commits they still keep alive. A path
 that no longer exists succeeds.
+
+A linked worktree's submodule repositories live in its admin dir (modules/),
+which removal deletes, so before removing the tree teardown moves that
+directory, with every branch, stash, reflog and object, to
+&lt;common git dir&gt;/gc-rescued-modules/&lt;bead&gt;-&lt;rescue sha[:12]&gt; in one rename,
+and clears the dangling core.worktree in each so they open on their own.
 
 A write that lands after the final rescue is removed with the tree: the lock
 excludes other gc worktree operations, not editors or background processes.
