@@ -384,6 +384,27 @@ enabled = false
 		}
 	})
 
+	// Codex review of 788c73e33: a "//" formulas_dir is city-root relative,
+	// as the rig's formula layer resolves it, not an absolute path.
+	t.Run("city-root formulas_dir that is also its pack's formulas dir", func(t *testing.T) {
+		cityPath, cityLayer := orderDiscoveryCity(t)
+		packDir := filepath.Join(cityPath, "shared-pack")
+		writeOrderDiscoveryFile(t, filepath.Join(packDir, "orders"), "patrol", disabledPatrolOrder)
+		cfg := &config.City{
+			FormulaLayers: config.FormulaLayers{
+				City: []string{cityLayer},
+				Rigs: map[string][]string{"alpha": {cityLayer, filepath.Join(packDir, "formulas")}},
+			},
+			Rigs:        []config.Rig{{Name: "alpha", FormulasDir: "//shared-pack/formulas"}},
+			RigPackDirs: map[string][]string{"alpha": {packDir}},
+			Orders:      config.OrdersConfig{Overrides: []config.OrderOverride{{Name: "patrol", Rig: "alpha", Enabled: &on}}},
+		}
+		aa, err := ScanAll(cityPath, cfg, ScanOptions{})
+		if err == nil || !strings.Contains(err.Error(), `order "patrol" (rig "alpha") not found`) {
+			t.Fatalf("ScanAll = %+v, %v; want the override to stay unmatched", aa, err)
+		}
+	})
+
 	t.Run("city-local dir that is also a pack dir", func(t *testing.T) {
 		cityPath, cityLayer := orderDiscoveryCity(t)
 		writeOrderDiscoveryFile(t, filepath.Join(cityPath, "orders"), "patrol", disabledPatrolOrder)
