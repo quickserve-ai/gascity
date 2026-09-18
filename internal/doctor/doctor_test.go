@@ -1053,3 +1053,39 @@ func TestPanickingFixDoesNotCrashTheRun(t *testing.T) {
 }
 
 func (panickingFixCheck) WarmupEligible() bool { return false }
+
+// deadlineCheck records the CheckContext.Deadline its Run received.
+type deadlineCheck struct {
+	got time.Time
+}
+
+func (c *deadlineCheck) Name() string { return "deadline" }
+func (c *deadlineCheck) Run(ctx *CheckContext) *CheckResult {
+	c.got = ctx.Deadline
+	return &CheckResult{Name: c.Name(), Status: StatusOK}
+}
+func (c *deadlineCheck) CanFix() bool              { return false }
+func (c *deadlineCheck) Fix(_ *CheckContext) error { return nil }
+func (c *deadlineCheck) WarmupEligible() bool      { return false }
+
+// A check doing bounded work needs to know when the runner will abandon it,
+// so it can size its own budget to return a verdict first (pl-59k).
+func TestDoctor_RunPassesTheAbandonDeadlineToTheCheck(t *testing.T) {
+	c := &deadlineCheck{}
+	d := &Doctor{CheckTimeout: 5 * time.Second}
+	d.Register(c)
+	before := time.Now()
+	d.RunCollect(&CheckContext{}, false)
+	d.Wait()
+	if c.got.Before(before.Add(5*time.Second)) || c.got.After(time.Now().Add(5*time.Second)) {
+		t.Errorf("Deadline = %v, want the per-check timeout from when the check started (~%v)", c.got, before.Add(5*time.Second))
+	}
+
+	unbounded := &deadlineCheck{}
+	d = &Doctor{}
+	d.Register(unbounded)
+	d.RunCollect(&CheckContext{}, false)
+	if !unbounded.got.IsZero() {
+		t.Errorf("Deadline = %v with no per-check timeout, want zero", unbounded.got)
+	}
+}

@@ -152,7 +152,7 @@ func TestSweptSessionTransitionsWriteNoVersionedMetadata(t *testing.T) {
 		{"begin-drain", sessionpkg.BeginDrainPatch(now, "max-age")},
 		{"drain-ack-stop-pending", sessionpkg.DrainAckStopPendingPatch(now)},
 		{"request-wake", sessionpkg.RequestWakePatch("demand", now)},
-		{"complete-drain", sessionpkg.CompleteDrainPatch(now, "drain_complete", false)},
+		{"complete-drain", sessionpkg.CompleteDrainPatch(now, "drain_complete", "", false)},
 		{"acknowledge-drain", sessionpkg.AcknowledgeDrainPatch(now, false)},
 		{"quarantine", sessionpkg.QuarantinePatch(now.Add(time.Hour), 3)},
 		{"pre-wake", sessionpkg.PreWakePatch(sessionpkg.PreWakePatchInput{

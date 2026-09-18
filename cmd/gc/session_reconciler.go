@@ -910,6 +910,17 @@ func finalizeDrainAckStoppedSession(
 	if template == "" {
 		template = info.Template
 	}
+	if info.LivenessReadDegraded {
+		// The overlay read for this bead failed, so info carries committed
+		// metadata: a healthy session's sleep_intent and held_until live only in
+		// the liveness table and read as empty here. Completing now would relabel
+		// a parked seat idle and drop its standing intent, and the degraded write
+		// is fenced, so it would outlive the outage (fork PR #59 review, item 1).
+		// Leave the ack and the stop-pending row alone; a later tick finalizes on
+		// a real read.
+		fmt.Fprintf(stderr, "session reconciler: deferring drain-ack finalize of %s: session liveness read degraded\n", name) //nolint:errcheck
+		return drainAckFinalizeResult{}
+	}
 	recordStopped := func(performedStop bool) {
 		// gc.agent.stops.total counts the stop action, so only the observer
 		// that actually performs the stop transition records it. Under NDI
@@ -990,7 +1001,19 @@ func finalizeDrainAckStoppedSession(
 	}
 	batch := sessionpkg.AcknowledgeDrainPatch(clk.Now().UTC(), info.WakeMode == "fresh")
 	if hasAssignedWork {
-		batch = sessionpkg.CompleteDrainPatch(clk.Now().UTC(), string(sessionpkg.SleepReasonIdle), info.WakeMode == "fresh")
+		// A drain-acked seat sleeps as "idle" unless it carries a standing hold,
+		// in which case the hold IS the reason it slept. The distinction is not
+		// cosmetic: the pool-slot gate (isPoolSessionSlotFreeableInfo) reads only
+		// state + sleep_reason, so labeling a parked seat "idle" makes its slot
+		// freeable and lets the stranded repair unclaim its work and close its
+		// bead — destroying the park instead of honoring it
+		// (gastownhall/gascity#5561). The drain-timeout sibling already passes the
+		// drain's own reason, which for a held drain is this same intent.
+		drainReason := sessionpkg.SleepReasonIdle
+		if standing := sessionpkg.StandingSleepIntent(info.SleepIntent); standing != "" {
+			drainReason = standing
+		}
+		batch = sessionpkg.CompleteDrainPatch(clk.Now().UTC(), string(drainReason), info.SleepIntent, info.WakeMode == "fresh")
 	}
 	sessionpkg.StampPriorSessionKeyInfo(batch, info)
 	// An always-mode named session with wake_mode=fresh re-qualifies for wake
@@ -1001,10 +1024,20 @@ func finalizeDrainAckStoppedSession(
 	// (ga-kaei). Stamp a cooldown hold — held_until is already honored as a
 	// hard wake blocker and an explicit wake request (nudge/attach) clears it,
 	// so urgent demand still wakes the session immediately.
+	//
+	// The cooldown extends a hold and never shortens one. A held_until already
+	// past the cooldown is somebody else's hold — gc session suspend's
+	// indefinite sentinel, or an agent keep-alive — and overwriting it releases
+	// that hold early: a suspended always+fresh seat was respawned when the
+	// five-minute stamp expired, with no operator act (fork PR #59 review,
+	// item 3).
 	if !hasAssignedWork &&
 		info.WakeMode == "fresh" &&
 		strings.TrimSpace(info.ConfiguredNamedMode) == "always" {
-		batch["held_until"] = clk.Now().Add(freshWakeHeartbeatCooldown).UTC().Format(time.RFC3339)
+		cooldownUntil := clk.Now().Add(freshWakeHeartbeatCooldown).UTC()
+		if !metadataTimeInFuture(info.HeldUntil, cooldownUntil) {
+			batch["held_until"] = cooldownUntil.Format(time.RFC3339)
+		}
 	}
 	// A drain-ack that completes a restart-request cycle (gc session reset →
 	// agent drain-ack) must also consume restart_requested. The drain-ack
@@ -1834,8 +1867,16 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 	// fold advances rows[i].Info so the snapshot build below projects the healed
 	// values without re-reading the bead (the coherence the old raw mirror
 	// provided for the later re-projection).
+	//
+	// A row whose liveness read was degraded is not healed: its held_until and
+	// sleep_intent are committed values, and a clear written from them is fenced
+	// and would shadow the live table rows once the overlay recovers.
 	for i := range rows {
+		if rows[i].Info.LivenessReadDegraded {
+			continue
+		}
 		rows[i].Info = healExpiredTimersInfo(rows[i].Info, sessFront, clk)
+		rows[i].Info = healReleasedWaitHoldReasonInfo(rows[i].Info, sessFront)
 	}
 	// Phase 0b: retire duplicate configured-named sessions — Info twin over the
 	// rows, returning the folded row set (retired losers carry their retire batch).
@@ -4332,8 +4373,13 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		// (sleep_intent="user-hold") and config-suppressed sessions are excluded,
 		// and the respawn arm's own quarantine/circuit-breaker/provider-health
 		// gates still apply. See TestReconcileSessionBeads_HeartbeatHeldDeadSessionRespawns.
+		//
+		// An empty sleep_intent only proves a heartbeat hold when the overlay read
+		// succeeded: on a degraded read every liveness key is the committed value,
+		// and a suspend's intent reads as empty there (fork PR #59 review, item 1).
 		if !shouldWake && !target.alive && !eval.ConfigSuppressed &&
 			decision.HasAssignedWork && info.SleepIntent == "" &&
+			!info.LivenessReadDegraded &&
 			lifecycleTimerBlockerInfo(info, clk.Now()) == "user_hold" {
 			shouldWake = true
 		}

@@ -3636,7 +3636,7 @@ func TestBdStoreReleaseIfCurrentUsesGuardedSQL(t *testing.T) {
 	if len(gotArgs) != 3 || gotArgs[0] != "sql" || gotArgs[1] != "--json" {
 		t.Fatalf("args = %q, want bd sql --json <query>", gotArgs)
 	}
-	wantQuery := "UPDATE issues SET status = 'open', assignee = '', updated_at = CURRENT_TIMESTAMP, revision = <revision> WHERE id = 'bd-42' AND status = 'in_progress' AND assignee = 'worker-''1'"
+	wantQuery := "UPDATE issues SET status = 'open', assignee = '', updated_at = UTC_TIMESTAMP(), revision = <revision> WHERE id = 'bd-42' AND status = 'in_progress' AND assignee = 'worker-''1'"
 	if got := normalizeReleaseRevisionQuery(t, gotArgs[2]); got != wantQuery {
 		t.Fatalf("SQL query = %q, want %q", gotArgs[2], wantQuery)
 	}
@@ -3653,7 +3653,7 @@ func TestBdStoreReleaseIfCurrentSQLLiteralEscapesBackslash(t *testing.T) {
 	if _, err := s.ReleaseIfCurrent("bd-\\42", "worker-\\1"); err != nil {
 		t.Fatalf("ReleaseIfCurrent: %v", err)
 	}
-	wantQuery := "UPDATE issues SET status = 'open', assignee = '', updated_at = CURRENT_TIMESTAMP, revision = <revision> WHERE id = 'bd-\\\\42' AND status = 'in_progress' AND assignee = 'worker-\\\\1'"
+	wantQuery := "UPDATE issues SET status = 'open', assignee = '', updated_at = UTC_TIMESTAMP(), revision = <revision> WHERE id = 'bd-\\\\42' AND status = 'in_progress' AND assignee = 'worker-\\\\1'"
 	if got := normalizeReleaseRevisionQuery(t, gotArgs[2]); got != wantQuery {
 		t.Fatalf("SQL query = %q, want %q", gotArgs[2], wantQuery)
 	}
@@ -3869,8 +3869,8 @@ func TestBdStoreReleaseIfCurrentFallsBackWhenEmbeddedBdSQLUnsupported(t *testing
 		t.Fatal("ReleaseIfCurrent released = false, want true")
 	}
 	wantCalls := []string{
-		dir + ": bd sql --json UPDATE issues SET status = 'open', assignee = '', updated_at = CURRENT_TIMESTAMP, revision = <revision> WHERE id = 'bd-42' AND status = 'in_progress' AND assignee = 'worker-1'",
-		filepath.Join(dir, ".beads", "embeddeddolt", "demo") + ": dolt sql -r json -q UPDATE issues SET status = 'open', assignee = '', updated_at = CURRENT_TIMESTAMP, revision = <revision> WHERE id = 'bd-42' AND status = 'in_progress' AND assignee = 'worker-1'; SELECT ROW_COUNT() AS rows_affected",
+		dir + ": bd sql --json UPDATE issues SET status = 'open', assignee = '', updated_at = UTC_TIMESTAMP(), revision = <revision> WHERE id = 'bd-42' AND status = 'in_progress' AND assignee = 'worker-1'",
+		filepath.Join(dir, ".beads", "embeddeddolt", "demo") + ": dolt sql -r json -q UPDATE issues SET status = 'open', assignee = '', updated_at = UTC_TIMESTAMP(), revision = <revision> WHERE id = 'bd-42' AND status = 'in_progress' AND assignee = 'worker-1'; SELECT ROW_COUNT() AS rows_affected",
 	}
 	normalizedCalls := make([]string, len(calls))
 	for i, call := range calls {
@@ -5410,5 +5410,93 @@ func TestBdStoreReclaimStaleReportsNothingReclaimed(t *testing.T) {
 	}
 	if reclaimed {
 		t.Fatalf("ReclaimStale reclaimed = true, want false; previousOwner=%q", previousOwner)
+	}
+}
+
+// TestBdStoreReleaseIfCurrentLegacyQueryWritesUTC pins the bd-sql LEGACY
+// release query — the retry taken when the store has no revision column — to
+// UTC_TIMESTAMP(). bd stores UTC in updated_at; CURRENT_TIMESTAMP here wrote
+// the Dolt server's LOCAL clock, so a released bead read hours stale to every
+// UTC-treating consumer (bd list filters, dashboards), and will be reaped
+// off-by-the-host-offset once the reaper compares in UTC (pl-7jp) (pl-b53).
+// The revision-bearing query is pinned by TestBdStoreReleaseIfCurrentUsesGuardedSQL.
+// This test pins ONLY the bd-sql legacy site; the embedded-dolt legacy retry
+// is pinned by TestBdStoreReleaseIfCurrentEmbeddedLegacyQueryWritesUTC below.
+// Measured before either existed: reverting a legacy site failed nothing.
+func TestBdStoreReleaseIfCurrentLegacyQueryWritesUTC(t *testing.T) {
+	var queries []string
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		if len(args) == 3 && args[0] == "sql" && args[1] == "--json" {
+			queries = append(queries, args[2])
+			if strings.Contains(args[2], "revision = ") {
+				return nil, errors.New("Error 1054 (42S22): Unknown column 'revision' in 'field list'")
+			}
+			return []byte(`{"rows_affected":1,"schema_version":1}`), nil
+		}
+		return nil, fmt.Errorf("unexpected call: %v", args)
+	}
+	s := beads.NewBdStore("/city", legacyBdReleaseRunner(runner))
+
+	released, err := s.ReleaseIfCurrent("bd-42", "worker-1")
+	if err != nil {
+		t.Fatalf("ReleaseIfCurrent: %v", err)
+	}
+	if !released {
+		t.Fatal("ReleaseIfCurrent released = false, want true")
+	}
+	if len(queries) != 2 {
+		t.Fatalf("got %d sql calls (%q), want 2 (revision query, then legacy retry)", len(queries), queries)
+	}
+	wantLegacy := "UPDATE issues SET status = 'open', assignee = '', updated_at = UTC_TIMESTAMP()" +
+		" WHERE id = 'bd-42' AND status = 'in_progress' AND assignee = 'worker-1'"
+	if queries[1] != wantLegacy {
+		t.Fatalf("legacy SQL query = %q, want %q", queries[1], wantLegacy)
+	}
+}
+
+// TestBdStoreReleaseIfCurrentEmbeddedLegacyQueryWritesUTC pins the fourth and
+// last release-query site: the EMBEDDED-dolt legacy retry (no revision
+// column). Measured during the pl-b53 lens round: with the other three sites
+// pinned, reverting this one to CURRENT_TIMESTAMP still passed every test.
+func TestBdStoreReleaseIfCurrentEmbeddedLegacyQueryWritesUTC(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".beads"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".beads", "metadata.json"), []byte(`{"database":"dolt","backend":"dolt","dolt_mode":"embedded","dolt_database":"demo"}`), 0o644); err != nil {
+		t.Fatalf("WriteFile metadata: %v", err)
+	}
+	var doltQueries []string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		switch {
+		case name == "bd" && len(args) >= 1 && args[0] == "sql":
+			return nil, fmt.Errorf("exit status 1: Error: 'bd sql' is not yet supported in embedded mode")
+		case name == "dolt" && len(args) == 5 && args[0] == "sql" && args[3] == "-q":
+			doltQueries = append(doltQueries, args[4])
+			if strings.Contains(args[4], "revision = ") {
+				return nil, errors.New("Error 1054 (42S22): Unknown column 'revision' in 'field list'")
+			}
+			return []byte(`{"rows":[{"rows_affected":1}]}`), nil
+		default:
+			return nil, fmt.Errorf("unexpected call: %s %v", name, args)
+		}
+	}
+	s := beads.NewBdStore(dir, legacyBdReleaseRunner(runner))
+
+	released, err := s.ReleaseIfCurrent("bd-42", "worker-1")
+	if err != nil {
+		t.Fatalf("ReleaseIfCurrent: %v", err)
+	}
+	if !released {
+		t.Fatal("ReleaseIfCurrent released = false, want true")
+	}
+	if len(doltQueries) != 2 {
+		t.Fatalf("got %d dolt sql calls (%q), want 2 (revision query, then legacy retry)", len(doltQueries), doltQueries)
+	}
+	wantLegacy := "UPDATE issues SET status = 'open', assignee = '', updated_at = UTC_TIMESTAMP()" +
+		" WHERE id = 'bd-42' AND status = 'in_progress' AND assignee = 'worker-1'" +
+		"; SELECT ROW_COUNT() AS rows_affected"
+	if doltQueries[1] != wantLegacy {
+		t.Fatalf("embedded legacy SQL = %q, want %q", doltQueries[1], wantLegacy)
 	}
 }

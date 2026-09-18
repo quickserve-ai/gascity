@@ -36,6 +36,19 @@ import (
 // produced by the overlay from the table's own timestamps.
 const WrittenAtKey = beadmeta.LivenessWrittenAtMetadataKey
 
+// ReadDegradedKey is a SYNTHETIC metadata key the read overlay stamps, with the
+// value "true", onto a bead it could NOT overlay although the scope has a
+// liveness store: the store is retired or backing off after a transport
+// failure, or the read itself failed (a connection error or the op deadline).
+// Such a read is fail-open by design — the bead comes back with its committed
+// metadata — and for a healthy session that metadata holds none of the moved
+// keys. The marker lets a lifecycle decision tell "no hold" from "could not
+// read the hold" and defer instead of acting on the absence.
+//
+// Like WrittenAtKey it is produced only by the overlay and is never accepted as
+// an input: IsMarkerKey covers it, so Split drops it from any inbound patch.
+const ReadDegradedKey = beadmeta.LivenessReadDegradedMetadataKey
+
 // FencePrefix begins the VERSIONED marker keys that fence stale liveness rows
 // out of the overlay. There is ONE marker per fenced liveness key —
 // FenceKeyFor("state") is "gc.liveness_fence.state" — and its value is the
@@ -90,7 +103,48 @@ func FenceKeyFor(k string) string {
 // markers rather than session telemetry. Markers are never accepted as liveness
 // input and never routed to the table.
 func IsMarkerKey(key string) bool {
-	return key == WrittenAtKey || strings.HasPrefix(key, FencePrefix)
+	return key == WrittenAtKey || key == ReadDegradedKey || strings.HasPrefix(key, FencePrefix)
+}
+
+// IsReadSideKey reports whether key is one of the overlay's SYNTHETIC read-side
+// keys: the degraded marker and the freshness clock. Both are produced by a
+// read and are meaningless — actively harmful — in storage. A committed
+// ReadDegradedKey makes every later healthy read of that bead report itself
+// degraded, so the lifecycle guards defer on it forever; a committed
+// WrittenAtKey is a forged freshness clock that EffectiveUpdatedAt believes.
+//
+// Fence markers are deliberately NOT in this set. They are committed
+// infrastructure that must travel with the bead: they are what stops a stale
+// table row from shadowing a value a degraded or transactional write
+// committed.
+func IsReadSideKey(key string) bool {
+	return key == WrittenAtKey || key == ReadDegradedKey
+}
+
+// StripReadSideKeys returns meta without the synthetic read-side keys. It is
+// the create-path twin of Split, which drops them from every inbound patch:
+// a create assembled from metadata read off a bead carries whatever the
+// overlay stamped on that read. The input map is never mutated, and a map with
+// nothing to strip is returned as is, so the common path allocates nothing.
+func StripReadSideKeys(meta map[string]string) map[string]string {
+	stripped := false
+	for k := range meta {
+		if IsReadSideKey(k) {
+			stripped = true
+			break
+		}
+	}
+	if !stripped {
+		return meta
+	}
+	out := make(map[string]string, len(meta))
+	for k, v := range meta {
+		if IsReadSideKey(k) {
+			continue
+		}
+		out[k] = v
+	}
+	return out
 }
 
 // FenceStamp renders at as a fence-marker value.

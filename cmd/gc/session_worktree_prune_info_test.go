@@ -174,28 +174,26 @@ func TestPruneAgentHomeWorktreeIfSafeInfo_UnpushedProbeError(t *testing.T) {
 	assertNoWorktreeStaleMarker(t, fx.workerDir)
 }
 
-func TestPruneAgentHomeWorktreeIfSafeInfo_HasStashes(t *testing.T) {
-	fx := newPruneFixture(t)
-	fx.setProbe(fx.workerDir, &fakeGitProbe{isRepo: true, hasStashes: true, currentBranch: "builder/ga-ghi789"})
+func TestPruneAgentHomeWorktreeIfSafeInfo_RepoStashDoesNotVeto(t *testing.T) {
+	for _, probe := range []*fakeGitProbe{
+		{isRepo: true, hasStashes: true, currentBranch: "builder/ga-ghi789"},
+		{isRepo: true, stashesErr: errors.New("boom")},
+	} {
+		fx := newPruneFixture(t)
+		fx.setProbe(fx.workerDir, probe)
+		rigProbe := &fakeGitProbe{isRepo: true}
+		fx.setProbe(fx.rigRoot, rigProbe)
 
-	var stderr bytes.Buffer
-	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, nil, &stderr)
-	if !strings.Contains(stderr.String(), "stashed work") {
-		t.Errorf("expected stashes-reason log; got %q", stderr.String())
+		var stderr bytes.Buffer
+		pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, nil, &stderr)
+		if !rigProbe.removeInvoked || rigProbe.removedPath != fx.workerDir {
+			t.Fatalf("expected WorktreeRemove(%q) with a repo stash; got invoked=%v path=%q stderr=%s", fx.workerDir, rigProbe.removeInvoked, rigProbe.removedPath, stderr.String())
+		}
+		if strings.Contains(stderr.String(), "stash") {
+			t.Errorf("prune still consulted stashes; stderr=%q", stderr.String())
+		}
+		assertNoWorktreeStaleMarker(t, fx.workerDir)
 	}
-	assertWorktreeStaleMarker(t, fx.workerDir, "builder/ga-ghi789", "stashed-work")
-}
-
-func TestPruneAgentHomeWorktreeIfSafeInfo_StashProbeError(t *testing.T) {
-	fx := newPruneFixture(t)
-	fx.setProbe(fx.workerDir, &fakeGitProbe{isRepo: true, stashesErr: errors.New("boom")})
-
-	var stderr bytes.Buffer
-	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, nil, &stderr)
-	if !strings.Contains(stderr.String(), "stash probe failed") {
-		t.Errorf("expected stash-error log; got %q", stderr.String())
-	}
-	assertNoWorktreeStaleMarker(t, fx.workerDir)
 }
 
 func TestPruneAgentHomeWorktreeIfSafeInfo_RigPathUnresolved(t *testing.T) {
@@ -308,5 +306,31 @@ func TestPruneAgentHomeWorktreeIfSafeInfo_UnknownRuntimeLivenessNeverPruned(t *t
 	}
 	if !strings.Contains(stderr.String(), "runtime liveness unknown") {
 		t.Errorf("missing unknown-liveness refusal diagnostic, got: %q", stderr.String())
+	}
+}
+
+func TestPruneAgentHomeWorktreeIfSafeInfo_SedimentOnlyDoesNotVeto(t *testing.T) {
+	fx := newPruneFixture(t)
+	rigProbe := &fakeGitProbe{isRepo: true}
+	fx.setProbe(fx.workerDir, &fakeGitProbe{isRepo: true, porcelain: pruneSedimentOnly})
+	fx.setProbe(fx.rigRoot, rigProbe)
+
+	var stderr bytes.Buffer
+	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, nil, &stderr)
+	if !rigProbe.removeInvoked || rigProbe.removedPath != fx.workerDir {
+		t.Fatalf("sediment-only worker_dir not pruned (removed %q); stderr=%s", rigProbe.removedPath, stderr.String())
+	}
+}
+
+func TestPruneAgentHomeWorktreeIfSafeInfo_AuthoredChangeAmidSedimentVetoes(t *testing.T) {
+	fx := newPruneFixture(t)
+	rigProbe := &fakeGitProbe{isRepo: true}
+	fx.setProbe(fx.workerDir, &fakeGitProbe{isRepo: true, porcelain: pruneSedimentOnly + "?? notes.md\n"})
+	fx.setProbe(fx.rigRoot, rigProbe)
+
+	var stderr bytes.Buffer
+	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, nil, &stderr)
+	if rigProbe.removeInvoked {
+		t.Fatal("worker_dir with an untracked authored file was pruned")
 	}
 }
