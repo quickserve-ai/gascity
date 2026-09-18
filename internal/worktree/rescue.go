@@ -380,6 +380,17 @@ func requireLinkedWorktree(worktreePath string) error {
 	return nil
 }
 
+// pathUnder reports whether p lies strictly inside dir, comparing canonical
+// forms so /tmp and /private/tmp agree.
+func pathUnder(p, dir string) bool {
+	cp, errP := canonicalPathAllowMissing(p)
+	cd, errD := canonicalPathAllowMissing(dir)
+	if errP != nil || errD != nil {
+		return false
+	}
+	return strings.HasPrefix(cp, cd+string(filepath.Separator))
+}
+
 func samePathCanonical(a, b string) bool {
 	ca, errA := canonicalPathAllowMissing(a)
 	cb, errB := canonicalPathAllowMissing(b)
@@ -403,7 +414,11 @@ func rescueLocked(spec RescueSpec, common string) (RescueReport, error) {
 	// (.git/worktrees/<name>/modules/). Teardown moves those repositories
 	// aside verbatim; a submodule's uncommitted working-tree changes are in
 	// neither place, so refuse them.
-	if err := requireSubmodulesSecured(wt, ""); err != nil {
+	adminDir, err := gitTrimmed(wt, nil, "rev-parse", "--path-format=absolute", "--git-dir")
+	if err != nil {
+		return report, err
+	}
+	if err := requireSubmodulesSecured(wt, "", filepath.Join(adminDir, "modules")); err != nil {
 		return report, err
 	}
 	if err := requireNoNestedWorktrees(wt); err != nil {
@@ -430,13 +445,25 @@ func rescueLocked(spec RescueSpec, common string) (RescueReport, error) {
 			return report, err
 		}
 	}
-	if snap.tree != baseTree {
-		taint, err := taintedPaths(wt, baseTree, snap.tree)
+	// Taint covers everything the rescue keeps: the working state AND the
+	// index parent, where a staged-then-deleted secret survives alone.
+	taint := map[string]bool{}
+	for _, tree := range []string{snap.tree, snap.indexTree} {
+		if tree == "" || tree == baseTree {
+			continue
+		}
+		paths, err := taintedPaths(wt, baseTree, tree)
 		if err != nil {
 			return report, err
 		}
-		report.Taint = taint
+		for _, p := range paths {
+			taint[p] = true
+		}
 	}
+	for p := range taint {
+		report.Taint = append(report.Taint, p)
+	}
+	sort.Strings(report.Taint)
 
 	// Parents beyond HEAD keep reachable what the worktree holds nowhere
 	// else: the index when it differs from both HEAD and the working state
@@ -499,7 +526,7 @@ func rescueLocked(spec RescueSpec, common string) (RescueReport, error) {
 // requireSubmodulesSecured refuses a worktree holding a populated submodule
 // with uncommitted or untracked changes, which neither the rescue nor the
 // preserved submodule repository carries. It recurses into nested submodules.
-func requireSubmodulesSecured(dir, prefix string) error {
+func requireSubmodulesSecured(dir, prefix, modulesRoot string) error {
 	out, err := gitOutput(dir, nil, "ls-files", "--stage", "-z")
 	if err != nil {
 		return err
@@ -516,6 +543,17 @@ func requireSubmodulesSecured(dir, prefix string) error {
 		} else if err != nil {
 			return fmt.Errorf("inspecting submodule %s: %w", name, err)
 		}
+		// Only a repository under this worktree's modules/ is preserved by
+		// teardown. A gitlink whose repository lives anywhere else (an
+		// embedded clone someone `git add`ed, whose .git is inside the tree)
+		// would be deleted with the tree while the rescue keeps a pointer.
+		subGitDir, err := gitTrimmed(sub, nil, "rev-parse", "--path-format=absolute", "--git-dir")
+		if err != nil {
+			return fmt.Errorf("locating the repository of %s: %w", name, err)
+		}
+		if !pathUnder(subGitDir, modulesRoot) {
+			return fmt.Errorf("%s is a git repository stored at %s, not a submodule of this worktree; removal would delete it and a rescue records only a pointer, so move or push it first", name, subGitDir)
+		}
 		status, err := gitOutput(sub, nil, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")
 		if err != nil {
 			return fmt.Errorf("checking submodule %s: %w", name, err)
@@ -523,12 +561,15 @@ func requireSubmodulesSecured(dir, prefix string) error {
 		if strings.TrimSpace(status) != "" {
 			return fmt.Errorf("submodule %s has uncommitted or untracked changes; a rescue records only its gitlink and its repository is removed with the worktree, so commit and push them first", name)
 		}
-		if err := requireSubmodulesSecured(sub, name+"/"); err != nil {
+		if err := requireSubmodulesSecured(sub, name+"/", modulesRoot); err != nil {
 			return err
 		}
 	}
 	return nil
 }
+
+// todoCommitToken matches an object name in a sequencer or rebase todo line.
+var todoCommitToken = regexp.MustCompile(`^[0-9a-f]{7,64}$`)
 
 // perWorktreeRefDirs are the ref namespaces private to one worktree.
 var perWorktreeRefDirs = []string{"refs/worktree/", "refs/bisect/", "refs/rewritten/"}
@@ -567,6 +608,30 @@ func privateRootTips(wt, head, base string) ([]string, error) {
 	for _, name := range []string{"ORIG_HEAD", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD", "BISECT_HEAD"} {
 		if err := add(name); err != nil {
 			return nil, err
+		}
+	}
+	// A multi-commit cherry-pick, revert or interactive rebase that stopped
+	// keeps the commits it has not applied yet ONLY in its todo list, not in
+	// any pseudo-ref (Codex review of #97).
+	for _, file := range []string{"sequencer/todo", "sequencer/head", "rebase-merge/git-rebase-todo", "rebase-merge/done"} {
+		data, err := os.ReadFile(filepath.Join(gitDir, filepath.FromSlash(file)))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "#") {
+				continue
+			}
+			for _, tok := range strings.Fields(line) {
+				if todoCommitToken.MatchString(tok) {
+					if err := add(tok); err != nil {
+						return nil, err
+					}
+				}
+			}
 		}
 	}
 	for _, file := range []string{"rebase-merge/orig-head", "rebase-merge/stopped-sha", "rebase-apply/orig-head"} {
