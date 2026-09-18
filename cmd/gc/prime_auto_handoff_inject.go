@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/mail"
@@ -58,6 +60,7 @@ func primeHookContextSuffix(cityPath string, sessionStart *primeSessionStart, st
 		if !startMail.ownSessionClosed {
 			injection.text += primeUnreadMailInjectionFromInbox(startMail.autoHandoffIDs, startMail.ordinaryProvider, startMail.inbox)
 		}
+		injection.text += primeLaurelsInjection(strings.TrimSpace(os.Getenv("GC_DIR")))
 	}
 	return injection
 }
@@ -289,4 +292,40 @@ func sessionStartMailInjection(store beads.Store, live *session.Info, cityPath s
 		},
 	}
 	return startMail
+}
+
+// Laurels v0 (ga-9obb1h): a seat may keep a short laurels.md in its home dir,
+// holding praise about its work that a PERSON originated (the operator, a
+// customer, a partner). SessionStart surfaces it with nothing attached: no task,
+// no bead, no priority. It is read here, at hook time, and never rendered into
+// the prompt template, so adding a laurel changes no prompt hash and never
+// drifts or restarts a seat. An absent or empty file injects nothing.
+const (
+	laurelsFileName = "laurels.md"
+	// The spec bounds a seat's laurels at one paragraph; the cap keeps a file
+	// that outgrew it from taxing every boot.
+	laurelsMaxBytes = 1200
+)
+
+func primeLaurelsInjection(seatDir string) string {
+	if seatDir == "" {
+		return ""
+	}
+	data, err := os.ReadFile(filepath.Join(seatDir, laurelsFileName))
+	if err != nil {
+		return ""
+	}
+	text := strings.TrimSpace(string(data))
+	if text == "" {
+		return ""
+	}
+	if len(text) > laurelsMaxBytes {
+		cut := laurelsMaxBytes
+		for cut > 0 && !utf8.RuneStart(text[cut]) {
+			cut--
+		}
+		text = strings.TrimSpace(text[:cut]) + " [truncated]"
+	}
+	return "\n\n<laurels>\nRecognition from people this seat has worked for. It carries no task, no bead and no priority; nothing here asks you to do anything.\n\n" +
+		text + "\n</laurels>\n"
 }
