@@ -182,6 +182,7 @@ func (d *Doctor) boundedRun(c Check, ctx *CheckContext) *CheckResult {
 	abandoned := make(chan struct{})
 	checkCtx := *ctx
 	checkCtx.Output = &buf
+	checkCtx.Deadline = time.Now().Add(d.CheckTimeout)
 	checkCtx.Done = abandoned
 	done := make(chan *CheckResult, 1)
 	d.inFlight.Add(1)
