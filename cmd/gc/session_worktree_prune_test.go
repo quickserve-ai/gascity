@@ -314,32 +314,31 @@ func TestPruneAgentHomeWorktreeIfSafe_UnpushedProbeError(t *testing.T) {
 	assertNoWorktreeStaleMarker(t, fx.workerDir)
 }
 
-func TestPruneAgentHomeWorktreeIfSafe_HasStashes(t *testing.T) {
-	fx := newPruneFixture(t)
-	fx.setProbe(fx.workerDir, &fakeGitProbe{isRepo: true, hasStashes: true, currentBranch: "builder/ga-ghi789"})
+// A stash in the repo is not a veto (ga-bjenxa): `git stash list` is repo-global,
+// so it blocked every worktree of the repo, and WorktreeRemove never touches
+// refs/stash. Neither a stash nor a failing stash probe may stop the prune.
+func TestPruneAgentHomeWorktreeIfSafe_RepoStashDoesNotVeto(t *testing.T) {
+	for _, probe := range []*fakeGitProbe{
+		{isRepo: true, hasStashes: true, currentBranch: "builder/ga-ghi789"},
+		{isRepo: true, stashesErr: errors.New("boom")},
+	} {
+		fx := newPruneFixture(t)
+		fx.setProbe(fx.workerDir, probe)
+		rigProbe := &fakeGitProbe{isRepo: true}
+		fx.setProbe(fx.rigRoot, rigProbe)
 
-	var stderr bytes.Buffer
-	if pruneAgentHomeWorktreeIfSafe(fx.sessionBead(), fx.cityPath, fx.cfg, nil, &stderr) {
-		t.Fatal("prune returned true with stashes")
+		var stderr bytes.Buffer
+		if !pruneAgentHomeWorktreeIfSafe(fx.sessionBead(), fx.cityPath, fx.cfg, nil, &stderr) {
+			t.Fatalf("prune returned false with a repo stash; stderr=%s", stderr.String())
+		}
+		if !rigProbe.removeInvoked || rigProbe.removedPath != fx.workerDir {
+			t.Fatalf("expected WorktreeRemove(%q); got invoked=%v path=%q", fx.workerDir, rigProbe.removeInvoked, rigProbe.removedPath)
+		}
+		if strings.Contains(stderr.String(), "stash") {
+			t.Errorf("prune still consulted stashes; stderr=%q", stderr.String())
+		}
+		assertNoWorktreeStaleMarker(t, fx.workerDir)
 	}
-	if !strings.Contains(stderr.String(), "stashed work") {
-		t.Errorf("expected stashes-reason log; got %q", stderr.String())
-	}
-	assertWorktreeStaleMarker(t, fx.workerDir, "builder/ga-ghi789", "stashed-work")
-}
-
-func TestPruneAgentHomeWorktreeIfSafe_StashProbeError(t *testing.T) {
-	fx := newPruneFixture(t)
-	fx.setProbe(fx.workerDir, &fakeGitProbe{isRepo: true, stashesErr: errors.New("boom")})
-
-	var stderr bytes.Buffer
-	if pruneAgentHomeWorktreeIfSafe(fx.sessionBead(), fx.cityPath, fx.cfg, nil, &stderr) {
-		t.Fatal("prune returned true after stash probe error")
-	}
-	if !strings.Contains(stderr.String(), "stash probe failed") {
-		t.Errorf("expected stash-error log; got %q", stderr.String())
-	}
-	assertNoWorktreeStaleMarker(t, fx.workerDir)
 }
 
 func TestPruneAgentHomeWorktreeIfSafe_RigPathUnresolved(t *testing.T) {
