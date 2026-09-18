@@ -223,7 +223,9 @@
               "agent-is-foreign",
               "session-bind-cloud",
               "session-resume",
-              "worktree-gc"
+              "worktree-gc",
+              "worktree-rescue",
+              "worktree-teardown"
             ]
           },
           "event_id": {
