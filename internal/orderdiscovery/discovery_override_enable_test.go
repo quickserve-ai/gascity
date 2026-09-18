@@ -334,6 +334,26 @@ enabled = false
 		}
 	})
 
+	t.Run("rig formulas_dir that is also its pack's formulas dir", func(t *testing.T) {
+		cityPath, cityLayer := orderDiscoveryCity(t)
+		packDir := filepath.Join(t.TempDir(), "rig-pack")
+		writeOrderDiscoveryFile(t, filepath.Join(packDir, "orders"), "patrol", disabledPatrolOrder)
+		packFormulas := filepath.Join(packDir, "formulas")
+		cfg := &config.City{
+			FormulaLayers: config.FormulaLayers{
+				City: []string{cityLayer},
+				Rigs: map[string][]string{"alpha": {cityLayer, packFormulas}},
+			},
+			Rigs:        []config.Rig{{Name: "alpha", FormulasDir: packFormulas}},
+			RigPackDirs: map[string][]string{"alpha": {packDir}},
+			Orders:      config.OrdersConfig{Overrides: []config.OrderOverride{{Name: "patrol", Rig: "alpha", Enabled: &on}}},
+		}
+		aa, err := ScanAll(cityPath, cfg, ScanOptions{})
+		if err == nil || !strings.Contains(err.Error(), `order "patrol" (rig "alpha") not found`) {
+			t.Fatalf("ScanAll = %+v, %v; want the override to stay unmatched", aa, err)
+		}
+	})
+
 	t.Run("city-local dir that is also a pack dir", func(t *testing.T) {
 		cityPath, cityLayer := orderDiscoveryCity(t)
 		writeOrderDiscoveryFile(t, filepath.Join(cityPath, "orders"), "patrol", disabledPatrolOrder)
