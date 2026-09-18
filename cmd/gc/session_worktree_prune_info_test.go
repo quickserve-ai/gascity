@@ -308,3 +308,29 @@ func TestPruneAgentHomeWorktreeIfSafeInfo_UnknownRuntimeLivenessNeverPruned(t *t
 		t.Errorf("missing unknown-liveness refusal diagnostic, got: %q", stderr.String())
 	}
 }
+
+func TestPruneAgentHomeWorktreeIfSafeInfo_SedimentOnlyDoesNotVeto(t *testing.T) {
+	fx := newPruneFixture(t)
+	rigProbe := &fakeGitProbe{isRepo: true}
+	fx.setProbe(fx.workerDir, &fakeGitProbe{isRepo: true, porcelain: pruneSedimentOnly})
+	fx.setProbe(fx.rigRoot, rigProbe)
+
+	var stderr bytes.Buffer
+	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, nil, &stderr)
+	if !rigProbe.removeInvoked || rigProbe.removedPath != fx.workerDir {
+		t.Fatalf("sediment-only worker_dir not pruned (removed %q); stderr=%s", rigProbe.removedPath, stderr.String())
+	}
+}
+
+func TestPruneAgentHomeWorktreeIfSafeInfo_AuthoredChangeAmidSedimentVetoes(t *testing.T) {
+	fx := newPruneFixture(t)
+	rigProbe := &fakeGitProbe{isRepo: true}
+	fx.setProbe(fx.workerDir, &fakeGitProbe{isRepo: true, porcelain: pruneSedimentOnly + "?? notes.md\n"})
+	fx.setProbe(fx.rigRoot, rigProbe)
+
+	var stderr bytes.Buffer
+	pruneAgentHomeWorktreeIfSafeInfo(fx.sessionInfo(), fx.cityPath, fx.cfg, nil, &stderr)
+	if rigProbe.removeInvoked {
+		t.Fatal("worker_dir with an untracked authored file was pruned")
+	}
+}
