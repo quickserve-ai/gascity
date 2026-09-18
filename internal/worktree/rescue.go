@@ -706,6 +706,22 @@ func privateRootTips(wt, head, base string) ([]string, error) {
 			}
 		}
 	}
+	// Any other state git keeps for this worktree can name a commit only it
+	// reaches: a conflicted rebase's autostash, MERGE_AUTOSTASH, whatever a
+	// later git adds. Enumerating those files is how each earlier gap
+	// happened (Codex review of #97, rounds 4 and 6), so every full object
+	// name written in any file of the admin dir is a candidate; names that
+	// are not commits of this repository drop out, and the rest are only
+	// anchored, which costs nothing when they are reachable anyway.
+	named, err := adminDirObjectNames(gitDir)
+	if err != nil {
+		return nil, fmt.Errorf("scanning %s for commits: %w", gitDir, err)
+	}
+	commits, err := existingCommits(wt, named)
+	if err != nil {
+		return nil, err
+	}
+	cands = append(cands, commits...)
 	refs, err := gitOutput(wt, nil, append([]string{"for-each-ref", "--format=%(refname)"}, perWorktreeRefDirs...)...)
 	if err != nil {
 		return nil, err
@@ -728,6 +744,96 @@ func privateRootTips(wt, head, base string) ([]string, error) {
 		cands = append(cands, strings.Fields(out)...)
 	}
 	return privateTipsOf(wt, head, base, cands)
+}
+
+// adminScanMaxFile bounds one text file the admin-dir scan reads. A larger one
+// fails the rescue rather than being skipped, since skipping could drop the
+// only record of a commit.
+const adminScanMaxFile = 64 << 20
+
+// adminDirObjectNames returns every full object name (40 or 64 lowercase hex)
+// written in a text file of a worktree's admin dir. It skips the submodule
+// repositories under modules/, which teardown preserves whole, and binary
+// files (the index family), whose content the snapshot records.
+func adminDirObjectNames(gitDir string) ([]string, error) {
+	modules := filepath.Join(gitDir, "modules")
+	seen := map[string]bool{}
+	var names []string
+	err := filepath.WalkDir(gitDir, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if p == modules {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		data, binary, err := readAdminTextFile(p)
+		if err != nil || binary {
+			return err
+		}
+		for _, tok := range strings.FieldsFunc(data, func(r rune) bool {
+			return (r < '0' || r > '9') && (r < 'a' || r > 'f')
+		}) {
+			if (len(tok) == 40 || len(tok) == 64) && !seen[tok] {
+				seen[tok] = true
+				names = append(names, tok)
+			}
+		}
+		return nil
+	})
+	return names, err
+}
+
+// readAdminTextFile reads p unless its first 8000 bytes hold a NUL (binary,
+// git's own test), refusing a text file over adminScanMaxFile.
+func readAdminTextFile(p string) (data string, binary bool, err error) {
+	f, err := os.Open(p)
+	if err != nil {
+		return "", false, err
+	}
+	defer f.Close() //nolint:errcheck // read-only
+	head := make([]byte, 8000)
+	n, err := io.ReadFull(f, head)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+		return "", false, err
+	}
+	if bytes.IndexByte(head[:n], 0) >= 0 {
+		return "", true, nil
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return "", false, err
+	}
+	if info.Size() > adminScanMaxFile {
+		return "", false, fmt.Errorf("%s is %d bytes, too large to scan for commits; refusing rather than skipping it", p, info.Size())
+	}
+	all, err := os.ReadFile(p)
+	return string(all), false, err
+}
+
+// existingCommits returns the names that are commits in wt's repository. Lazy
+// fetching is off: a partial clone must not turn a rescue into a remote call.
+func existingCommits(wt string, names []string) ([]string, error) {
+	if len(names) == 0 {
+		return nil, nil
+	}
+	out, err := gitOutputStdin(wt, []string{"GIT_NO_LAZY_FETCH=1"}, strings.Join(names, "\n")+"\n",
+		"cat-file", "--batch-check=%(objectname) %(objecttype)")
+	if err != nil {
+		return nil, err
+	}
+	var commits []string
+	for _, line := range strings.Split(out, "\n") {
+		if name, typ, ok := strings.Cut(line, " "); ok && typ == "commit" {
+			commits = append(commits, name)
+		}
+	}
+	return commits, nil
 }
 
 // privateTipsOf reduces candidates to the independent tips of those not
@@ -879,7 +985,76 @@ func requireNoNestedRepos(wt, tree string) error {
 			return fmt.Errorf("%s holds its own git repository; a rescue records only a pointer to it and removal would delete it, so move or push it first", p)
 		}
 	}
-	return nil
+	// An IGNORED directory never reaches the snapshot, so a repository inside
+	// one shows no gitlink above, yet removal deletes it with everything it
+	// holds (Codex review of #97). Walk the tree itself, ignored paths
+	// included. Index gitlinks are submodule checkouts, secured by
+	// requireSubmodulesSecured, so the walk does not descend into them.
+	return filepath.WalkDir(wt, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if p == wt {
+			return nil
+		}
+		rel, err := filepath.Rel(wt, p)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		if d.IsDir() && known[rel] {
+			return filepath.SkipDir
+		}
+		if d.Name() != ".git" {
+			return nil
+		}
+		if rel == ".git" {
+			return nil // this worktree's own .git file
+		}
+		if d.IsDir() {
+			return fmt.Errorf("%s holds its own git repository (ignored or untracked); a rescue does not carry it and removal would delete it, so move or push it first", path.Dir(rel))
+		}
+		target, live := gitPointerTarget(p)
+		if !live {
+			// A pointer to nothing holds no git data. Packages ship these:
+			// temporalio's wheel carries its source tree's submodule .git file.
+			return nil
+		}
+		return fmt.Errorf("%s is a checkout of the repository at %s (ignored or untracked); removal would delete its working files, so move it or remove it first", path.Dir(rel), target)
+	})
+}
+
+// gitPointerTarget reports where a .git FILE (or symlink) points, and whether
+// that git dir exists. A file that is not a "gitdir:" pointer points nowhere,
+// as it does for git itself.
+func gitPointerTarget(p string) (string, bool) {
+	info, err := os.Lstat(p)
+	if err != nil {
+		return "", false
+	}
+	var target string
+	if info.Mode()&os.ModeSymlink != 0 {
+		if target, err = filepath.EvalSymlinks(p); err != nil {
+			return "", false
+		}
+	} else {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return "", false
+		}
+		rest, ok := strings.CutPrefix(strings.TrimSpace(string(data)), "gitdir:")
+		if !ok {
+			return "", false
+		}
+		target = strings.TrimSpace(rest)
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(p), target)
+		}
+	}
+	if st, err := os.Stat(target); err != nil || !st.IsDir() {
+		return target, false
+	}
+	return target, true
 }
 
 // resolveHead returns HEAD's commit, or "" for an unborn HEAD.
