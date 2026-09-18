@@ -66,6 +66,14 @@ type livenessBinding struct {
 	retryAfter  time.Duration
 	dialing     bool
 	warned      bool
+	// noEndpoint is true when the last COMPLETED dial found no liveness
+	// endpoint for this scope (errNoLivenessEndpoint). It is the one state in
+	// which a read without a pool is exact: the scope's committed metadata is
+	// the only copy. Every other pool-less read serves committed metadata that
+	// can lack the moved keys, and is degraded: the first dial still out (no
+	// result yet), a dial that could not reach or seed the endpoint, a retired
+	// pool, and a retry in progress after either.
+	noEndpoint bool
 	// clockOffset is the last known (server - local) skew, retained across a
 	// retired pool. Fallback stamps are minted exactly when the store is
 	// UNAVAILABLE, so falling back to the raw local clock at that moment would
@@ -129,18 +137,37 @@ func (b *livenessBinding) Mode() liveness.Mode {
 // it was routing goes to versioned metadata — a commit, which is exactly the
 // right trade while the endpoint is down.
 func (b *livenessBinding) Store() liveness.Store {
+	store, _ := b.acquireForRead()
+	return store
+}
+
+// acquireForRead is Store for a reader: it also reports whether a read made
+// without the returned handle is degraded, and it takes both answers from ONE
+// critical section (fork PR #59 review, round 2). The flag describes the handle
+// this call returned, not the binding a moment later. When the acquisition
+// launches a background retry, that retry can install a pool before the caller
+// looks again, and the caller's read has still served committed metadata; a
+// separate status check would then call it healthy. A first dial performed by
+// this call reports its own result.
+//
+// A nil binding, or a scope whose last completed dial found no endpoint, is
+// not degraded. Everything else without a pool is, including a read that
+// arrives while the first dial is still out: the endpoint's existence is not
+// known yet, and the read falls back to committed metadata either way.
+func (b *livenessBinding) acquireForRead() (liveness.Store, bool) {
 	if b == nil {
-		return nil
+		return nil, false
 	}
 	b.mu.Lock()
 	if b.store != nil {
 		store := b.store
 		b.mu.Unlock()
-		return store
+		return store, false
 	}
+	degraded := !b.noEndpoint
 	if b.dialing || (!b.lastAttempt.IsZero() && time.Since(b.lastAttempt) < b.retryAfter) {
 		b.mu.Unlock()
-		return nil
+		return nil, degraded
 	}
 	first := b.lastAttempt.IsZero()
 	b.dialing = true
@@ -148,11 +175,16 @@ func (b *livenessBinding) Store() liveness.Store {
 	b.mu.Unlock()
 
 	if !first {
-		go b.dial()
-		return nil
+		startLivenessRetry(func() { b.dial() })
+		return nil, degraded
 	}
 	return b.dial()
 }
+
+// startLivenessRetry launches a background re-dial. A package var so a test can
+// run the retry inline and pin the interleaving in which a retry installs the
+// pool before the caller that launched it has finished reading the binding.
+var startLivenessRetry = func(dial func()) { go dial() }
 
 // openScopeLivenessStoreFn is the dialer dial() calls. A package var so a test
 // can drive the REAL dial-and-install path — the one that has to capture the
@@ -161,8 +193,10 @@ func (b *livenessBinding) Store() liveness.Store {
 var openScopeLivenessStoreFn = openScopeLivenessStore
 
 // dial performs one open attempt and installs the result. It runs with the lock
-// released; b.dialing keeps a second attempt from starting alongside it.
-func (b *livenessBinding) dial() liveness.Store {
+// released; b.dialing keeps a second attempt from starting alongside it. It
+// returns the installed store, or nil and whether a read without it is
+// degraded, decided under the same lock that records the outcome.
+func (b *livenessBinding) dial() (liveness.Store, bool) {
 	store, err := openScopeLivenessStoreFn(b.cityPath, b.scopeRoot)
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -170,8 +204,9 @@ func (b *livenessBinding) dial() liveness.Store {
 	if err != nil {
 		// A scope with no endpoint cannot acquire one without a config change, so
 		// it backs off far harder than a server that is merely unreachable.
+		b.noEndpoint = errors.Is(err, errNoLivenessEndpoint)
 		b.retryAfter = livenessOpenRetryInterval
-		if errors.Is(err, errNoLivenessEndpoint) {
+		if b.noEndpoint {
 			b.retryAfter = livenessNoEndpointRetryInterval
 		}
 		// A scope with no Dolt endpoint at all — a file/doltlite provider, or any
@@ -183,7 +218,7 @@ func (b *livenessBinding) dial() liveness.Store {
 			b.warned = true
 			log.Printf("session liveness: %s unavailable (session telemetry keeps committing to bead metadata): %v", b.scopeRoot, err)
 		}
-		return nil
+		return nil, !b.noEndpoint
 	}
 	if b.store != nil {
 		// Another dial won the race; drop this handle rather than leaking it.
@@ -191,9 +226,10 @@ func (b *livenessBinding) dial() liveness.Store {
 		// from the handle that is actually installed, and this one is about to
 		// be closed.
 		_ = store.Close()
-		return b.store
+		return b.store, false
 	}
 	b.store = store
+	b.noEndpoint = false
 	// Record the skew from the store we are INSTALLING, while it is alive. This
 	// is the production path's only chance: after a pool retirement there is no
 	// store left to ask, and an unrecorded offset silently sends Now() — and so
@@ -201,7 +237,7 @@ func (b *livenessBinding) dial() liveness.Store {
 	// clock, in the wrong timebase for the server-minted written_at it fences.
 	b.rememberClockOffset(store)
 	b.warned = false
-	return b.store
+	return b.store, false
 }
 
 // Now reports the liveness endpoint's clock — the timebase fallback stamps must
@@ -260,6 +296,9 @@ func (b *livenessBinding) noteOpError(err error) {
 	b.lastAttempt = time.Now()
 	b.retryAfter = livenessOpenRetryInterval
 	b.warned = false
+	// A pool existed, so the scope has an endpoint: reads are degraded until a
+	// dial installs a new pool.
+	b.noEndpoint = false
 	b.mu.Unlock()
 	if store != nil {
 		_ = store.Close()
