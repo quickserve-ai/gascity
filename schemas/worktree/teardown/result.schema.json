@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "gc worktree teardown --json success result",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "ok",
+    "command",
+    "action",
+    "removed"
+  ],
+  "properties": {
+    "schema_version": { "const": "1" },
+    "ok": { "const": true },
+    "command": { "const": "worktree teardown" },
+    "action": { "const": "teardown" },
+    "removed": { "type": "boolean" },
+    "already_absent": { "type": "boolean" },
+    "rescue": {
+      "type": "object",
+      "required": ["path", "repo", "bead_id", "rescue_ref", "rescue_sha", "wip"],
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}
