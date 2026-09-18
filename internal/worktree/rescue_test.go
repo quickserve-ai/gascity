@@ -1133,3 +1133,94 @@ func TestRescueTaintSkipsCommitsARemoteAlreadyHas(t *testing.T) {
 		t.Fatalf("taint = %v, want none: the remote already has that commit", rep.Taint)
 	}
 }
+
+// Codex review of #97, round 6, P1: a conflicted `git rebase --autostash`
+// holds the pre-rebase WIP only in a commit named by rebase-merge/autostash.
+func TestRescueKeepsARebaseAutostash(t *testing.T) {
+	repo, wt, base := linkedWorktree(t)
+	id := []string{"-c", "user.name=t", "-c", "user.email=t@t"}
+	runGit(t, repo, "checkout", "-q", "-b", "up", base)
+	writeFile(t, filepath.Join(repo, "a.txt"), "upstream\n")
+	runGit(t, repo, append(id, "commit", "-qam", "up")...)
+	up := runGit(t, repo, "rev-parse", "HEAD")
+	runGit(t, repo, "checkout", "-q", "--detach", base)
+	writeFile(t, filepath.Join(wt, "a.txt"), "mine\n")
+	writeFile(t, filepath.Join(wt, "b.txt"), "b\n")
+	runGit(t, wt, "add", "a.txt", "b.txt")
+	runGit(t, wt, append(id, "commit", "-qm", "mine")...)
+	writeFile(t, filepath.Join(wt, "b.txt"), "wip\n") // the work autostash takes away
+	if runGitAllowFail(wt, append(id, "rebase", "--autostash", up)...) == nil {
+		t.Fatal("control: the rebase should stop on a conflict")
+	}
+	gitDir := runGit(t, wt, "rev-parse", "--path-format=absolute", "--git-dir")
+	data, err := os.ReadFile(filepath.Join(gitDir, "rebase-merge", "autostash"))
+	if err != nil {
+		t.Fatalf("control: no autostash recorded: %v", err)
+	}
+	autostash := strings.TrimSpace(string(data))
+	if got, _ := os.ReadFile(filepath.Join(wt, "b.txt")); string(got) != "b\n" {
+		t.Fatalf("control: b.txt = %q, want the WIP stashed away", got)
+	}
+	rep, err := Rescue(rescueSpec(wt))
+	if err != nil {
+		t.Fatalf("Rescue: %v", err)
+	}
+	assertReachableFromRescue(t, repo, rep.RescueRef, autostash)
+}
+
+// The rule the autostash case generalizes: ANY file in the admin dir that
+// names a commit keeps it, including state no git version writes yet.
+func TestRescueKeepsACommitNamedByAnyAdminDirFile(t *testing.T) {
+	repo, wt, base := linkedWorktree(t)
+	tree := runGit(t, wt, "rev-parse", "HEAD^{tree}")
+	private := runGit(t, wt, "-c", "user.name=t", "-c", "user.email=t@t", "commit-tree", tree, "-p", base, "-m", "private")
+	gitDir := runGit(t, wt, "rev-parse", "--path-format=absolute", "--git-dir")
+	writeFile(t, filepath.Join(gitDir, "SOME_FUTURE_STATE"), "state "+private+"\n")
+	rep, err := Rescue(rescueSpec(wt))
+	if err != nil {
+		t.Fatalf("Rescue: %v", err)
+	}
+	assertReachableFromRescue(t, repo, rep.RescueRef, private)
+}
+
+// Codex review of #97, round 6, P1: a repository under an IGNORED path never
+// reaches the snapshot, so no gitlink shows it, yet removal deletes it.
+func TestRescueRefusesARepositoryUnderAnIgnoredPath(t *testing.T) {
+	_, wt, _ := linkedWorktree(t)
+	writeFile(t, filepath.Join(wt, ".gitignore"), "vendor/\n")
+	lib := filepath.Join(wt, "vendor", "lib")
+	runGit(t, wt, "init", "-q", filepath.Join("vendor", "lib"))
+	writeFile(t, filepath.Join(lib, "x.txt"), "x\n")
+	runGit(t, lib, "add", "x.txt")
+	runGit(t, lib, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "only copy")
+	if out := runGit(t, wt, "status", "--porcelain", "--", "vendor"); out != "" {
+		t.Fatalf("control: vendor/ should be ignored, status shows %q", out)
+	}
+	if _, err := Rescue(rescueSpec(wt)); err == nil || !strings.Contains(err.Error(), "vendor/lib holds its own git repository") {
+		t.Fatalf("Rescue err = %v, want the ignored repository refused", err)
+	}
+}
+
+// A .git FILE that points nowhere holds no git data. Packages ship them (the
+// temporalio wheel in a q-converse virtualenv carries one), and refusing on
+// them would block every teardown of a worktree with that environment.
+func TestRescueIgnoresADanglingGitPointerUnderAnIgnoredPath(t *testing.T) {
+	_, wt, _ := linkedWorktree(t)
+	writeFile(t, filepath.Join(wt, ".gitignore"), ".venv/\n")
+	writeFile(t, filepath.Join(wt, ".venv", "site-packages", "pkg", "sdk-core", ".git"), "gitdir: ../../../.git/modules/sdk-core\n")
+	if _, err := Rescue(rescueSpec(wt)); err != nil {
+		t.Fatalf("Rescue: %v; a dangling .git pointer must not block the rescue", err)
+	}
+}
+
+// A live checkout of ANOTHER repository under an ignored path: its git dir is
+// outside this tree, but removal deletes its working files.
+func TestRescueRefusesAnotherRepositorysCheckoutUnderAnIgnoredPath(t *testing.T) {
+	_, wt, _ := linkedWorktree(t)
+	writeFile(t, filepath.Join(wt, ".gitignore"), "vendor/\n")
+	other, _ := initTestRepo(t)
+	runGit(t, other, "worktree", "add", "-q", "--detach", filepath.Join(wt, "vendor", "other"), "HEAD")
+	if _, err := Rescue(rescueSpec(wt)); err == nil || !strings.Contains(err.Error(), "vendor/other is a checkout of the repository at") {
+		t.Fatalf("Rescue err = %v, want the nested checkout refused", err)
+	}
+}
