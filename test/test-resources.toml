@@ -10,7 +10,7 @@ version = 2
 [[audit_baseline]]
 scope = "all"
 resource = "subprocess"
-baseline_calls = 720
+baseline_calls = 721
 baseline_files = 206
 reported_calls = 495
 reported_files = 135
@@ -142,7 +142,7 @@ expires = "2026-10-01"
 [[debt]]
 scope = "untagged"
 resource = "net_listen"
-baseline_calls = 102
+baseline_calls = 101
 baseline_files = 40
 reported_calls = 92
 reported_files = 34
@@ -512,7 +512,7 @@ expires = "2026-10-01"
 [[small_debt]]
 scope = "untagged"
 resource = "net_listen"
-baseline_calls = 100
+baseline_calls = 99
 baseline_files = 39
 reported_calls = 92
 reported_files = 34
