@@ -51,6 +51,8 @@ rolls back everything it created; --dry-run plans without mutating anything.`,
 	cmd.AddCommand(newWorktreeEnsureCmd(stdout, stderr))
 	cmd.AddCommand(newWorktreeVerifyCmd(stdout, stderr))
 	cmd.AddCommand(newWorktreeCleanupCmd(stdout, stderr))
+	cmd.AddCommand(newWorktreeRescueCmd(stdout, stderr))
+	cmd.AddCommand(newWorktreeTeardownCmd(stdout, stderr))
 	return cmd
 }
 
