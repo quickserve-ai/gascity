@@ -146,9 +146,22 @@ detect_loadavg() {
     return
   fi
 
-  local loadavg_file="/proc/loadavg"
-  [[ -r "$loadavg_file" ]] || return 1
-  awk '{ print $1; exit }' "$loadavg_file" 2>/dev/null
+  local loadavg_file="${GC_TEST_LOCAL_LOADAVG_FILE:-/proc/loadavg}"
+  if [[ -r "$loadavg_file" ]]; then
+    awk '{ print $1; exit }' "$loadavg_file" 2>/dev/null
+    return
+  fi
+
+  # macOS has no /proc. Without this fallback load-awareness was silently off
+  # there, and that is where the refinery runs the gate: at load ~100 on a
+  # 12-core laptop it still fanned out 8 shards (ga-ry1bra). vm.loadavg reads
+  # "{ 1.52 1.61 1.70 }"; an unparseable reading skips load-awareness as a
+  # missing /proc/loadavg does.
+  local reading
+  reading="$(sysctl -n vm.loadavg 2>/dev/null || true)"
+  reading="$(printf '%s\n' "$reading" | awk '{ gsub(/[{}]/, ""); print $1; exit }')"
+  [[ "$reading" =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 1
+  printf '%s\n' "$reading"
 }
 
 cpus="$(detect_cpus)"
