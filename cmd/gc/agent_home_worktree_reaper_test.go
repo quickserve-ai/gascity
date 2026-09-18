@@ -171,7 +171,8 @@ func TestEvaluateStoppedAgentHomeCandidateFailsClosed(t *testing.T) {
 		{name: "safe", candidate: candidate, git: healthy(), store: cityStore, want: stoppedAgentHomeRemove},
 		{name: "dirty", candidate: candidate, git: &fakeStoppedAgentHomeGit{isRepo: true, dirty: true, worktrees: []git.Worktree{{Path: home}}}, store: cityStore, want: stoppedAgentHomeSkip, contains: "uncommitted"},
 		{name: "unpushed", candidate: candidate, git: &fakeStoppedAgentHomeGit{isRepo: true, unpushed: true, worktrees: []git.Worktree{{Path: home}}}, store: cityStore, want: stoppedAgentHomeSkip, contains: "unpushed"},
-		{name: "stash", candidate: candidate, git: &fakeStoppedAgentHomeGit{isRepo: true, stashes: true, worktrees: []git.Worktree{{Path: home}}}, store: cityStore, want: stoppedAgentHomeSkip, contains: "stashed"},
+		// A repo stash is not a veto (ga-bjenxa): refs/stash is repo-global and `git worktree remove` never touches it.
+		{name: "repo stash does not veto", candidate: candidate, git: &fakeStoppedAgentHomeGit{isRepo: true, stashes: true, stashesErr: errors.New("boom"), worktrees: []git.Worktree{{Path: home}}}, store: cityStore, want: stoppedAgentHomeRemove},
 		{name: "probe error", candidate: candidate, git: &fakeStoppedAgentHomeGit{isRepo: true, unpushedErr: errors.New("boom"), worktrees: []git.Worktree{{Path: home}}}, store: cityStore, want: stoppedAgentHomeSkip, contains: "probe failed"},
 		{name: "runtime live", candidate: candidate, git: healthy(), running: map[string]bool{"qcore--refinery": true}, store: cityStore, want: stoppedAgentHomeSkip, contains: "runtime session is live"},
 		{name: "active path", candidate: candidate, git: healthy(), store: cityStore, active: []beads.Bead{{ID: "ga-live", Status: "open", Metadata: map[string]string{"work_dir": home}}}, want: stoppedAgentHomeSkip, contains: "active session"},
@@ -417,10 +418,13 @@ func TestReapStoppedAgentHomesDryRunReportsAllGateResults(t *testing.T) {
 	var out bytes.Buffer
 	stores := map[string]beads.Store{"qcore": beads.NewMemStore()}
 	reapStoppedAgentHomeWorktrees(cityPath, cfg, beads.NewMemStoreFrom(1, []beads.Bead{session}, nil), stores, runtime.NewFake(), nil, &out, true, []beads.Bead{session})
-	for _, gate := range []string{"runtime=pass", "ownership=pass", "assignments=pass", "containment=pass", "registration=pass", "nested=pass", "dirty=pass", "unpushed=pass", "stash=pass"} {
+	for _, gate := range []string{"runtime=pass", "ownership=pass", "assignments=pass", "containment=pass", "registration=pass", "nested=pass", "dirty=pass", "unpushed=pass"} {
 		if !strings.Contains(out.String(), gate) {
 			t.Fatalf("dry-run output %q missing gate %q", out.String(), gate)
 		}
+	}
+	if strings.Contains(out.String(), "stash=") {
+		t.Fatalf("dry-run output %q still reports a stash gate; a repo stash is not a veto (ga-bjenxa)", out.String())
 	}
 }
 
