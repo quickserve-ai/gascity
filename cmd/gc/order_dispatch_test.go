@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -7885,6 +7886,70 @@ interval = "30s"
 	// Verify stderr contains the "not found" warning from ApplyOverrides.
 	if !strings.Contains(stderr.String(), "not found") {
 		t.Errorf("expected stderr to contain 'not found' warning, got: %s", stderr.String())
+	}
+}
+
+// The dispatcher logs an override error and keeps going, so an unmatched
+// override must not cost it the overrides after it: here the disable below
+// the miss must still keep digest out of dispatch, and the enable must still
+// bring in patrol, which its pack ships disabled.
+func TestBuildOrderDispatcherAppliesOverridesBelowAMiss(t *testing.T) {
+	sysDir := t.TempDir()
+	sysLayer := filepath.Join(sysDir, "formulas")
+	sysOrderDir := filepath.Join(sysDir, "orders")
+	for _, dir := range []string{sysLayer, sysOrderDir} {
+		if err := mkdirAll(dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeFile(t, filepath.Join(sysOrderDir, "beads-health.toml"), `[order]
+exec = "scripts/beads-health.sh"
+trigger = "cooldown"
+interval = "30s"
+`)
+	writeFile(t, filepath.Join(sysOrderDir, "digest.toml"), `[order]
+exec = "scripts/digest.sh"
+trigger = "cooldown"
+interval = "1h"
+`)
+	writeFile(t, filepath.Join(sysOrderDir, "patrol.toml"), `[order]
+exec = "scripts/patrol.sh"
+trigger = "cooldown"
+interval = "15m"
+enabled = false
+`)
+
+	tenSec := "10s"
+	off, on := false, true
+	cfg := &config.City{
+		FormulaLayers: config.FormulaLayers{
+			City: []string{sysLayer},
+		},
+		PackDirs: []string{sysDir},
+		Orders: config.OrdersConfig{
+			Overrides: []config.OrderOverride{
+				{Name: "wasteland-poll", Interval: &tenSec},
+				{Name: "digest", Enabled: &off},
+				{Name: "patrol", Enabled: &on},
+			},
+		},
+	}
+
+	var stderr bytes.Buffer
+	ad := buildOrderDispatcher(nil, t.TempDir(), cfg, events.Discard, &stderr)
+	if ad == nil {
+		t.Fatalf("expected non-nil dispatcher; stderr: %s", stderr.String())
+	}
+	var got []string
+	for _, a := range ad.(*memoryOrderDispatcher).aa {
+		got = append(got, a.Name)
+	}
+	sort.Strings(got)
+	if strings.Join(got, ",") != "beads-health,patrol" {
+		t.Fatalf("dispatched orders = %v, want [beads-health patrol]; stderr: %s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), `order "wasteland-poll" not found`) {
+		t.Errorf("expected stderr to name the unmatched override, got: %s", stderr.String())
 	}
 }
 
