@@ -541,25 +541,65 @@ func TestRescueRefusesASubmoduleWithWorkItCannotCarry(t *testing.T) {
 			t.Fatalf("submodule work lost: %v", err)
 		}
 	})
-	t.Run("local-only commit is imported and survives teardown", func(t *testing.T) {
+	t.Run("its private state is preserved verbatim by teardown", func(t *testing.T) {
 		wt, sub := submoduleWorktree(t)
-		writeFile(t, filepath.Join(sub, "local.txt"), "local\n")
-		runGit(t, sub, "add", "local.txt")
-		runGit(t, sub, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "local only")
-		local := runGit(t, sub, "rev-parse", "HEAD")
+		git := func(args ...string) string {
+			return runGit(t, sub, append([]string{"-c", "user.name=t", "-c", "user.email=t@t"}, args...)...)
+		}
+		git("checkout", "-q", "-b", "feat")
+		writeFile(t, filepath.Join(sub, "feat.txt"), "feat\n")
+		git("add", "feat.txt")
+		git("commit", "-qm", "feat")
+		feat := git("rev-parse", "HEAD")
+		writeFile(t, filepath.Join(sub, "s.txt"), "stashed\n")
+		git("stash", "-q")
+		stash := git("rev-parse", "refs/stash")
+		writeFile(t, filepath.Join(sub, "away.txt"), "away\n")
+		git("add", "away.txt")
+		git("commit", "-qm", "away")
+		away := git("rev-parse", "HEAD")
+		git("reset", "-q", "--hard", "HEAD~1")
 		rep, err := Rescue(rescueSpec(wt))
 		if err != nil {
 			t.Fatalf("Rescue: %v", err)
 		}
-		repo := strings.TrimSuffix(rep.Repo, "/.git")
 		td, err := Teardown(TeardownSpec{RescueSpec: rescueSpec(wt), RescueSHA: rep.RescueSHA})
 		if err != nil || !td.Removed {
 			t.Fatalf("Teardown: %+v %v", td, err)
 		}
-		runGit(t, repo, "reflog", "expire", "--expire=now", "--all")
-		runGit(t, repo, "gc", "--prune=now", "--quiet")
-		if got := runGit(t, repo, "show", local+":local.txt"); got != "local" {
-			t.Fatalf("submodule's local-only commit after teardown + gc: %q", got)
+		if td.PreservedModules != PreservedModulesDir(rep.Repo, "qc-test.1", rep.RescueSHA) {
+			t.Fatalf("preserved at %q", td.PreservedModules)
+		}
+		kept := filepath.Join(td.PreservedModules, "sub")
+		for name, sha := range map[string]string{"branch feat": feat, "stash": stash, "reflog-only commit": away} {
+			cmd := exec.Command("git", "--git-dir="+kept, "cat-file", "-e", sha+"^{commit}")
+			if err := cmd.Run(); err != nil {
+				t.Errorf("submodule %s (%s) not preserved: %v", name, sha, err)
+			}
+		}
+		if got := strings.TrimSpace(runGitDir(t, kept, "rev-parse", "refs/heads/feat")); got != feat {
+			t.Errorf("preserved branch feat = %q, want %s", got, feat)
+		}
+	})
+	t.Run("a shallow submodule does not wedge teardown", func(t *testing.T) {
+		upstream, _ := initTestRepo(t)
+		for _, c := range []string{"one", "two"} {
+			writeFile(t, filepath.Join(upstream, "s.txt"), c+"\n")
+			runGit(t, upstream, "add", "s.txt")
+			runGit(t, upstream, "commit", "-qm", c)
+		}
+		repo, _, _ := linkedWorktree(t)
+		runGit(t, repo, "-c", "protocol.file.allow=always", "submodule", "add", "--depth", "1", "file://"+upstream, "sub")
+		runGit(t, repo, "commit", "-qm", "add shallow sub")
+		wt := filepath.Join(t.TempDir(), "wt-shallow")
+		runGit(t, repo, "worktree", "add", "--detach", wt, "HEAD")
+		runGit(t, wt, "-c", "protocol.file.allow=always", "submodule", "update", "--init", "--depth", "1")
+		rep, err := Rescue(rescueSpec(wt))
+		if err != nil {
+			t.Fatalf("Rescue: %v", err)
+		}
+		if td, err := Teardown(TeardownSpec{RescueSpec: rescueSpec(wt), RescueSHA: rep.RescueSHA}); err != nil || !td.Removed {
+			t.Fatalf("Teardown: %+v %v", td, err)
 		}
 	})
 }
@@ -859,4 +899,111 @@ func TestRescueDoesNotTrustRemoteTrackingRefs(t *testing.T) {
 	}
 	runGit(t, repo, "update-ref", "-d", "refs/remotes/origin/feature") // the remote branch went away
 	assertReachableFromRescue(t, repo, rep.RescueRef, pushed)
+}
+
+func runGitDir(t *testing.T, gitDir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"--git-dir=" + gitDir}, args...)...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git --git-dir=%s %v: %s: %v", gitDir, args, out, err)
+	}
+	return string(out)
+}
+
+// Opus round 3, finding 2: a directory whose .git names ANOTHER worktree's
+// admin dir must be refused, or that worktree's admin dir is removed.
+func TestTeardownRefusesATreeWhoseGitNamesAnotherAdminDir(t *testing.T) {
+	repo, wt, head := linkedWorktree(t)
+	other := filepath.Join(t.TempDir(), "other")
+	runGit(t, repo, "worktree", "add", "--detach", other, "HEAD")
+	otherAdmin := runGit(t, other, "rev-parse", "--path-format=absolute", "--git-dir")
+	if err := os.RemoveAll(wt); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.CopyFS(wt, os.DirFS(other)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Teardown(TeardownSpec{RescueSpec: rescueSpec(wt), RescueSHA: head}); err == nil ||
+		!strings.Contains(err.Error(), "belongs to") {
+		t.Fatalf("Teardown err = %v, want a back-pointer refusal", err)
+	}
+	if _, err := os.Stat(otherAdmin); err != nil {
+		t.Fatalf("the other worktree's admin dir was removed: %v", err)
+	}
+}
+
+// Opus round 3, finding 4: a stale registration nested under the target (its
+// directory already gone) must not block teardown forever.
+func TestTeardownIgnoresAStaleNestedRegistration(t *testing.T) {
+	repo, wt, head := linkedWorktree(t)
+	inner := filepath.Join(wt, "worktrees", "qc-gone")
+	runGit(t, repo, "worktree", "add", "--detach", inner, "HEAD")
+	if err := os.RemoveAll(filepath.Join(wt, "worktrees")); err != nil {
+		t.Fatal(err)
+	}
+	if td, err := Teardown(TeardownSpec{RescueSpec: rescueSpec(wt), RescueSHA: head}); err != nil || !td.Removed {
+		t.Fatalf("Teardown: %+v %v", td, err)
+	}
+}
+
+// Opus round 3, finding 5: a local branch deleted between rescue and teardown
+// (merged-branch cleanup) must not change the rescue.
+func TestTeardownIsStableAcrossLocalBranchDeletion(t *testing.T) {
+	repo, wt, _ := linkedWorktree(t)
+	writeFile(t, filepath.Join(wt, "side.txt"), "side\n")
+	runGit(t, wt, "add", "side.txt")
+	runGit(t, wt, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "side")
+	runGit(t, repo, "branch", "side", runGit(t, wt, "rev-parse", "HEAD"))
+	runGit(t, wt, "reset", "-q", "--hard", "HEAD~1")
+	rep, err := Rescue(rescueSpec(wt))
+	if err != nil {
+		t.Fatalf("Rescue: %v", err)
+	}
+	runGit(t, repo, "branch", "-D", "side")
+	if td, err := Teardown(TeardownSpec{RescueSpec: rescueSpec(wt), RescueSHA: rep.RescueSHA}); err != nil || !td.Removed {
+		t.Fatalf("Teardown after branch deletion: %+v %v", td, err)
+	}
+}
+
+// Parents go on the commit-tree command line, so a large private set is folded
+// into layers of anchors. Every tip must stay reachable, and the fold must be
+// deterministic or teardown's equality check never passes.
+func TestRescueFoldsManyPrivateCommitsDeterministically(t *testing.T) {
+	old := anchorBatch
+	anchorBatch = 3
+	t.Cleanup(func() { anchorBatch = old })
+	repo, wt, head := linkedWorktree(t)
+	var tips []string
+	for i := 0; i < 10; i++ {
+		out, err := gitOutputStdin(wt, []string{"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t"},
+			"private "+string(rune('a'+i))+"\n", "commit-tree", head+"^{tree}", "-p", head, "-F", "-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		sha := strings.TrimSpace(out)
+		runGit(t, wt, "update-ref", "refs/worktree/p"+string(rune('a'+i)), sha)
+		tips = append(tips, sha)
+	}
+	first, err := Rescue(rescueSpec(wt))
+	if err != nil {
+		t.Fatalf("Rescue: %v", err)
+	}
+	for _, tip := range tips {
+		assertReachableFromRescue(t, repo, first.RescueRef, tip)
+	}
+	// The rescue's parents are HEAD and the top anchor; no commit in the fold
+	// may carry more than anchorBatch parents.
+	parents := strings.Fields(runGit(t, repo, "log", "-1", "--format=%P", first.RescueSHA))
+	if len(parents) != 2 {
+		t.Fatalf("rescue parents = %v, want HEAD and one anchor", parents)
+	}
+	for _, line := range strings.Split(runGit(t, repo, "rev-list", "--parents", parents[1], "--not", head), "\n") {
+		if n := len(strings.Fields(line)) - 1; n > anchorBatch {
+			t.Fatalf("anchor commit %s has %d parents, want at most %d", strings.Fields(line)[0], n, anchorBatch)
+		}
+	}
+	if td, err := Teardown(TeardownSpec{RescueSpec: rescueSpec(wt), RescueSHA: first.RescueSHA}); err != nil || !td.Removed {
+		t.Fatalf("Teardown after a folded anchor: %+v %v", td, err)
+	}
 }
