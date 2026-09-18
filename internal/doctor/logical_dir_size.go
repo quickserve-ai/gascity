@@ -28,8 +28,11 @@ const (
 	// need; the cap keeps a city with many rigs from flooding one disk.
 	dirMeasureConcurrency = 4
 
-	// duWaitDelay bounds how long a stopped du may take to exit and release
-	// its output pipe before its result is taken as it stands.
+	// duWaitDelay is du's exec.Cmd.WaitDelay: once the deadline has killed
+	// du, output pipes still held open by a process that inherited them are
+	// closed after this long, and the output read so far is used. It does
+	// not bound the wait for a du that cannot be reaped at all (blocked in
+	// the kernel); measureDirsWithin's abandon timer covers that.
 	duWaitDelay = 2 * time.Second
 
 	// duComplaintsLimit caps how much of du's stderr is kept for the error
@@ -52,8 +55,9 @@ var (
 // sizingBudget is the time a size check may spend measuring: own (zero
 // means worktreeSizeBudget), cut to two thirds of the time left when the
 // runner will abandon the check sooner, so the walks, their abandon grace and
-// the verdict all land before ctx.Deadline. Rounded so the lower-bound label
-// reads "within 20s", not "within 19.99987s".
+// the verdict all land before ctx.Deadline, and zero once that deadline has
+// passed. Rounded so the lower-bound label reads "within 20s", not "within
+// 19.99987s".
 func sizingBudget(ctx *CheckContext, own time.Duration) time.Duration {
 	if own <= 0 {
 		own = worktreeSizeBudget
@@ -62,7 +66,7 @@ func sizingBudget(ctx *CheckContext, own time.Duration) time.Duration {
 		return own
 	}
 	if left := time.Until(ctx.Deadline) * 2 / 3; left < own {
-		own = left
+		own = max(left, 0)
 	}
 	if own >= 2*time.Second {
 		return own.Round(time.Second)
@@ -259,7 +263,10 @@ type duSubtreeTally struct {
 	// it>". du prints names raw, so a name containing a newline splits into
 	// a cut-off path and a stray fragment, and a cut-off path no longer
 	// matches the directory that contains it: the stack can then count a
-	// subtree twice, and its sum is no longer a lower bound.
+	// subtree twice, and its sum is no longer a lower bound. Detection is
+	// best effort: a name crafted so that every fragment reads as
+	// "<KiB>\t<path under root>" passes as ordinary lines, and a partial
+	// tally over such a tree can over- or under-count.
 	garbled bool
 }
 

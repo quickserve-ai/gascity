@@ -115,7 +115,7 @@ func (c *RigWorktreesCheck) Run(ctx *CheckContext) *CheckResult {
 		r.Status = StatusWarning
 		r.Message = fmt.Sprintf("%d per-bead worktree(s) under %s, size unmeasurable", count, root)
 		r.Details = []string{err.Error()}
-		var unmeasured unmeasuredRigs
+		unmeasured := unmeasuredRigs{budget: budget}
 		unmeasured.add(c.rig.Name, err)
 		r.FixHint = unmeasured.hint()
 		return r
@@ -150,7 +150,7 @@ func (c *RigWorktreesCheck) Run(ctx *CheckContext) *CheckResult {
 		r.Status = StatusWarning
 		r.Message = fmt.Sprintf("%d per-bead worktree(s) in %s using %s; full size UNKNOWN",
 			count, root, label)
-		var unmeasured unmeasuredRigs
+		unmeasured := unmeasuredRigs{budget: budget}
 		unmeasured.addLowerBound(rigSize{name: c.rig.Name, size: size})
 		r.FixHint = unmeasured.hint()
 	default:
