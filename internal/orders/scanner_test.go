@@ -155,6 +155,56 @@ enabled = false
 	}
 }
 
+func TestScanRootsRetainingKeepsOnlyNamedPackDisabledOrders(t *testing.T) {
+	fs := fsys.NewFake()
+	for _, name := range []string{"digest", "sweep"} {
+		fs.Files["/layer1/orders/"+name+".toml"] = []byte(`
+[order]
+formula = "mol-` + name + `"
+trigger = "cooldown"
+interval = "24h"
+enabled = false
+`)
+	}
+	roots := []ScanRoot{{Dir: "/layer1/orders", FormulaLayer: "/layer1/formulas", FromPack: true}}
+
+	plain, err := ScanRoots(fs, roots, nil)
+	if err != nil {
+		t.Fatalf("ScanRoots: %v", err)
+	}
+	if len(plain) != 0 {
+		t.Fatalf("ScanRoots returned %d orders, want 0 (both disabled)", len(plain))
+	}
+
+	retained, err := ScanRootsRetaining(fs, roots, nil, []string{"digest"})
+	if err != nil {
+		t.Fatalf("ScanRootsRetaining: %v", err)
+	}
+	if len(retained) != 1 || retained[0].Name != "digest" {
+		t.Fatalf("ScanRootsRetaining = %+v, want only digest", retained)
+	}
+	if retained[0].IsEnabled() {
+		t.Error("retained order came back enabled; retention must not change Enabled")
+	}
+
+	local := []ScanRoot{{Dir: "/layer1/orders", FormulaLayer: "/layer1/formulas"}}
+	notPack, err := ScanRootsRetaining(fs, local, nil, []string{"digest"})
+	if err != nil {
+		t.Fatalf("ScanRootsRetaining on a non-pack root: %v", err)
+	}
+	if len(notPack) != 0 {
+		t.Fatalf("got %+v, want nothing: a disabled order outside a pack is never retained", notPack)
+	}
+
+	skipped, err := ScanRootsRetaining(fs, roots, []string{"digest"}, []string{"digest"})
+	if err != nil {
+		t.Fatalf("ScanRootsRetaining with skip: %v", err)
+	}
+	if len(skipped) != 0 {
+		t.Fatalf("got %d orders, want 0: skip must win over retention", len(skipped))
+	}
+}
+
 func TestScanFormulaLayer(t *testing.T) {
 	fs := fsys.NewFake()
 	fs.Files["/pack/orders/health.toml"] = []byte(`
