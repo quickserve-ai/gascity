@@ -278,83 +278,62 @@ func TestCoreShippedAssetsAvoidNonexistentBDListSearchFlag(t *testing.T) {
 	}
 }
 
-// TestMolPolecatCommitResolvesRepoBeforeRemovingWorktree pins the fix for a
-// stranded-worktree bug: `git worktree remove` resolves the repo from cwd,
-// and this step `cd`s away from the worktree before removing it, so the bare
-// form exits 128 having unregistered nothing while `rm -rf` deletes the
-// directory anyway, leaving the registration behind forever. These are
-// bootstrap templates, so every city seeded by `gc city init` inherited the
-// defect (ga-x1u5cr; contributing cause of ga-lc9yx's 396 dead worktrees).
-func TestMolPolecatCommitResolvesRepoBeforeRemovingWorktree(t *testing.T) {
-	step := formulaStep(t, readFormula(t, "mol-polecat-commit.toml"), "commit-and-push")
-
-	if strings.Contains(step, `git worktree remove "$WORKTREE_PATH" --force`) {
-		t.Error("commit-and-push calls bare `git worktree remove` after `cd ..`; resolve the repo via --git-common-dir first and remove via `git -C \"$REPO\" worktree remove`")
+// assertSecureBeforeDestroy pins the teardown order for a formula-managed
+// worktree (ga-w805wc): the work is secured LOCALLY in a rescue ref, the bead
+// records the rescue, gc worktree teardown removes the tree only if it still
+// matches that rescue, and work_dir is cleared last. The teardown this
+// replaced tested remote containment with `git branch -r --contains` (a stale
+// cache that skipped the push and deleted anyway), pushed whatever
+// `git add -A` swept up to a branch that could be a live PR head, and fell
+// through to erasing work_dir after refusing to remove. The removal guards
+// themselves (main checkout, submodule, unregistered directory) are pinned by
+// internal/worktree's Teardown tests; this pins that the formula uses them.
+func assertSecureBeforeDestroy(t *testing.T, name, block, worktreeVar string) {
+	t.Helper()
+	order := []string{
+		`gc worktree rescue --path "` + worktreeVar + `" --bead "$WORK_BEAD_ID" --json`,
+		`--set-metadata rescue_sha="$RESCUE_SHA"`,
+		`gc worktree teardown --path "` + worktreeVar + `" --bead "$WORK_BEAD_ID" --rescue-sha "$RESCUE_SHA" || exit 1`,
+		`--unset-metadata work_dir || exit 1`,
 	}
-	if !strings.Contains(step, "--git-common-dir") {
-		t.Error("commit-and-push must resolve REPO via `git rev-parse --path-format=absolute --git-common-dir` before `cd ..`, so worktree removal does not depend on cwd")
+	last := -1
+	for _, want := range order {
+		at := strings.Index(block, want)
+		if at < 0 {
+			t.Fatalf("%s: teardown is missing %q", name, want)
+		}
+		if at < last {
+			t.Fatalf("%s: %q runs out of order; want rescue -> record on the bead -> teardown -> clear work_dir", name, want)
+		}
+		last = at
 	}
-	if !strings.Contains(step, `git -C "$REPO" worktree remove`) {
-		t.Error(`commit-and-push must remove the worktree via git -C "$REPO" worktree remove, not a bare invocation`)
+	for _, forbidden := range []string{"rm -rf", "git push", "git add -A", "git branch -r", "git worktree remove"} {
+		if strings.Contains(block, forbidden) {
+			t.Errorf("%s: teardown must not run %q; securing and removal belong to gc worktree rescue/teardown", name, forbidden)
+		}
 	}
-
-	// `git -C ""` is a no-op that silently resolves the repo from cwd, and this
-	// step has already `cd ..`'d away from the worktree by then. An unresolved
-	// REPO must short-circuit rather than degrade back to cwd-dependent removal.
-	if !strings.Contains(step, `[ -z "$REPO" ]`) {
-		t.Error(`commit-and-push must bail on an empty $REPO; git -C "" silently resolves from cwd, which is exactly the bug this step fixes`)
-	}
-
-	// WORKTREE_PATH is $(pwd), and `git worktree remove` exits 128 on a main
-	// working tree. Without the guard the failure path rm -rf's the whole repo.
-	guardAt := strings.Index(step, `[ -f "$WORKTREE_PATH/.git" ]`)
-	if guardAt < 0 {
-		t.Fatal(`commit-and-push must guard the rm -rf fallback with [ -f "$WORKTREE_PATH/.git" ]; a linked worktree's .git is a file, a main checkout's is a directory`)
-	}
-	// Match the delete command itself, not the word: the surrounding comment and
-	// the refusal message both mention `rm -rf` and would otherwise be found first.
-	if got := strings.Count(step, `rm -rf "$WORKTREE_PATH"`); got != 1 {
-		t.Fatalf(`commit-and-push must delete the worktree exactly once behind the guard; found %d occurrences of rm -rf "$WORKTREE_PATH"`, got)
-	}
-	removeAt := strings.Index(step, `rm -rf "$WORKTREE_PATH"`)
-	if guardAt > removeAt {
-		t.Error("commit-and-push runs rm -rf before the linked-worktree check; the check must gate the delete, not follow it")
+	if !strings.Contains(block, `--set-metadata rescue_taint="$RESCUE_TAINT" || exit 1`) {
+		t.Errorf("%s: a failed rescue record must stop the step before removal", name)
 	}
 }
 
-// TestMolScopedWorkResolvesRepoBeforeRemovingWorktree pins the same fix for
-// mol-scoped-work's cleanup step, which is worse than mol-polecat-commit's:
-// its `|| rm -rf` fallback makes the stranded git registration the designed
-// outcome of the bare form's failure path, not just an incidental risk.
-func TestMolScopedWorkResolvesRepoBeforeRemovingWorktree(t *testing.T) {
+func TestMolPolecatCommitSecuresBeforeRemovingWorktree(t *testing.T) {
+	step := formulaStep(t, readFormula(t, "mol-polecat-commit.toml"), "commit-and-push")
+	start := strings.Index(step, "**3. Clean up worktree")
+	end := strings.Index(step, "**4. Close the bead:**")
+	if start < 0 || end < start {
+		t.Fatal("commit-and-push lost its numbered cleanup section")
+	}
+	assertSecureBeforeDestroy(t, "commit-and-push", step[start:end], "$WORKTREE_PATH")
+}
+
+func TestMolScopedWorkSecuresBeforeRemovingWorktree(t *testing.T) {
 	step := formulaStep(t, readFormula(t, "mol-scoped-work.toml"), "cleanup-worktree")
+	assertSecureBeforeDestroy(t, "cleanup-worktree", step, "$WORKTREE")
 
-	if strings.Contains(step, `git worktree remove --force "$WORKTREE" || rm -rf "$WORKTREE"`) {
-		t.Error("cleanup-worktree calls bare `git worktree remove --force ... || rm -rf`; resolve the repo via --git-common-dir first and remove via `git -C \"$REPO\" worktree remove`")
-	}
-	if !strings.Contains(step, "--git-common-dir") {
-		t.Error(`cleanup-worktree must resolve REPO via git -C "$WORKTREE" rev-parse --path-format=absolute --git-common-dir; cwd is not guaranteed inside the repo at this step`)
-	}
-	if !strings.Contains(step, `git -C "$REPO" worktree remove`) {
-		t.Error(`cleanup-worktree must remove the worktree via git -C "$REPO" worktree remove, not a bare invocation`)
-	}
-
-	// A stale directory that still passes [ -d ], or a git too old for
-	// --path-format, leaves REPO empty; `git -C ""` then resolves from a cwd
-	// this step explicitly does not guarantee is inside the repo.
-	if !strings.Contains(step, `[ -z "$REPO" ]`) {
-		t.Error(`cleanup-worktree must bail on an empty $REPO; git -C "" silently resolves from cwd, which this step cannot assume`)
-	}
-
-	guardAt := strings.Index(step, `[ -f "$WORKTREE/.git" ]`)
-	if guardAt < 0 {
-		t.Fatal(`cleanup-worktree must guard the rm -rf fallback with [ -f "$WORKTREE/.git" ]; a linked worktree's .git is a file, a main checkout's is a directory`)
-	}
-	if got := strings.Count(step, `rm -rf "$WORKTREE"`); got != 1 {
-		t.Fatalf(`cleanup-worktree must delete the worktree exactly once behind the guard; found %d occurrences of rm -rf "$WORKTREE"`, got)
-	}
-	removeAt := strings.Index(step, `rm -rf "$WORKTREE"`)
-	if guardAt > removeAt {
-		t.Error("cleanup-worktree runs rm -rf before the linked-worktree check; the check must gate the delete, not follow it")
+	// A failed bead read yields an empty work_dir, which would read as
+	// "nothing to tear down" and erase the pointer to a live worktree.
+	if !strings.Contains(step, `BEAD_JSON=$(gc bd show "$WORK_BEAD_ID" --json) || exit 1`) {
+		t.Error("cleanup-worktree must stop on a failed bead read, not treat it as an empty work_dir")
 	}
 }
