@@ -8,11 +8,7 @@
     "command",
     "action",
     "path",
-    "repo",
-    "bead_id",
-    "rescue_ref",
-    "rescue_sha",
-    "wip"
+    "bead_id"
   ],
   "properties": {
     "schema_version": { "const": "1" },
@@ -23,9 +19,11 @@
     "repo": { "type": "string" },
     "bead_id": { "type": "string" },
     "head": { "type": "string" },
-    "rescue_ref": { "type": "string", "pattern": "^refs/rescue/" },
-    "rescue_sha": { "type": "string", "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$" },
+    "rescue_ref": { "type": "string", "pattern": "^(refs/rescue/.+)?$" },
+    "rescue_sha": { "type": "string", "pattern": "^([0-9a-f]{40}([0-9a-f]{24})?)?$" },
     "wip": { "type": "boolean" },
+    "absent": { "type": "boolean" },
+    "index_unmerged": { "type": "boolean" },
     "sediment": { "type": "array", "items": { "type": "string" } },
     "taint": { "type": "array", "items": { "type": "string" } }
   },
