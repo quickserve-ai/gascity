@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -20,6 +21,10 @@ import (
 var rawDoltSQLCallRe = regexp.MustCompile(`(?m)(^|[^A-Za-z0-9_-])dolt(?:[ \t]+|[ \t]*\\[ \t]*\r?\n[ \t]*)+sql([ \t]|$)`)
 
 var mailTableRe = regexp.MustCompile(`(?i)(?:FROM|UPDATE|INTO|JOIN|DELETE\s+FROM)\s+(?:\x60?[\w-]+\x60?\.)?\x60?mail\x60?\b`)
+
+// localClockSQLRe matches SQL that reads the Dolt server's local clock. bd
+// stores UTC in its timestamp columns, so the reaper must use UTC_TIMESTAMP().
+var localClockSQLRe = regexp.MustCompile(`(?i)\b(?:now|sysdate|curdate|curtime)\s*\(|\b(?:current_timestamp|current_date|current_time|localtime|localtimestamp)\b`)
 
 const (
 	reaperCloseCleanupEdgeSQL   = "(d.type = 'parent-child' OR (d.type = 'tracks' AND JSON_UNQUOTE(JSON_EXTRACT(w.metadata, '$.\"gc.root_bead_id\"')) = COALESCE(d.depends_on_issue_id, d.depends_on_wisp_id, d.depends_on_external)))"
@@ -3969,11 +3974,23 @@ func TestReaperScriptSQLReflectsCurrentSchema(t *testing.T) {
 	}
 	for _, required := range []string{
 		"issue_type NOT IN ('message')",
-		"created_at < DATE_SUB(NOW(), INTERVAL $MAX_AGE_H HOUR)",
+		"created_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL $MAX_AGE_H HOUR)",
 	} {
 		if !strings.Contains(script, required) {
 			t.Errorf("reaper script is missing stale-only query fragment %q", required)
 		}
+	}
+	if found := localClockSQLRe.FindAllString(script, -1); len(found) > 0 {
+		t.Errorf("reaper script reads the server-local clock (%q); timestamp columns hold UTC, use UTC_TIMESTAMP()", found)
+	}
+	if !strings.Contains(script, "AND NOT EXISTS (SELECT 1 FROM \\`$DB\\`.labels od WHERE od.issue_id = issues.id AND od.label = 'operator-directive')") {
+		t.Errorf("reaper stale-issue selection does not exempt beads labeled operator-directive")
+	}
+	// On Dolt 2.2.4 a second NOT IN subquery in step 5 turns the dependency
+	// guard's NOT IN into a plain IN, so step 5 selects exactly the beads that
+	// guard protects. TestReaperStaleIssueSkipsOperatorDirectiveRealDolt shows it.
+	if strings.Contains(script, "NOT IN (SELECT issue_id FROM \\`$DB\\`.labels") {
+		t.Errorf("reaper step 5 excludes labels with NOT IN; on Dolt that inverts the dependency guard, use NOT EXISTS")
 	}
 
 	if strings.Contains(script, "parent_id") {
@@ -5313,7 +5330,7 @@ exit 0
 		"WITH RECURSIVE workflow_issue_root_candidates",
 		"workflow_descendants(root_id, id)",
 		"roots_with_live_descendants",
-		"UPDATE `beads`.wisps SET status='closed', closed_at=NOW(), metadata = JSON_SET(COALESCE(metadata, JSON_OBJECT())",
+		"UPDATE `beads`.wisps SET status='closed', closed_at=UTC_TIMESTAMP(), updated_at=UTC_TIMESTAMP(), metadata = JSON_SET(COALESCE(metadata, JSON_OBJECT())",
 		"'$.\"gc.outcome\"', 'skipped'",
 		"'$.\"close_reason\"', 'stale inactive workflow root auto-closed by reaper'",
 		"JSON_UNQUOTE(JSON_EXTRACT(w.metadata, '$.\"gc.kind\"')) = 'workflow'",
@@ -5331,8 +5348,8 @@ exit 0
 		"JSON_UNQUOTE(JSON_EXTRACT(child_issue.metadata, '$.\"gc.root_bead_id\"')) = root.id",
 		"COALESCE(w.assignee, '') = ''",
 		"COALESCE(i.assignee, '') = ''",
-		"COALESCE(w.updated_at, w.created_at) < DATE_SUB(NOW(), INTERVAL",
-		"COALESCE(i.updated_at, i.created_at) < DATE_SUB(NOW(), INTERVAL",
+		"COALESCE(w.updated_at, w.created_at) < DATE_SUB(UTC_TIMESTAMP(), INTERVAL",
+		"COALESCE(i.updated_at, i.created_at) < DATE_SUB(UTC_TIMESTAMP(), INTERVAL",
 		"descendant_wisp.status, descendant_issue.status) IN ('open', 'hooked', 'in_progress', 'blocked', 'deferred', 'pinned', 'review', 'testing')",
 		"roots_with_recent_descendants",
 		"child_dep.type IN ('parent-child', 'tracks', 'blocks')",
@@ -5464,7 +5481,7 @@ exit 0
 			t.Fatalf("reaper workflow-root preserve guard missing %q:\n%s", want, log)
 		}
 	}
-	if strings.Contains(log, "UPDATE `beads`.wisps SET status='closed', closed_at=NOW(), metadata = JSON_SET") ||
+	if strings.Contains(log, "UPDATE `beads`.wisps SET status='closed', closed_at=UTC_TIMESTAMP(), updated_at=UTC_TIMESTAMP(), metadata = JSON_SET") ||
 		strings.Contains(log, "UPDATE `beads`.issues SET status='closed'") {
 		t.Fatalf("reaper closed workflow roots after live-descendant counts returned zero:\n%s", log)
 	}
@@ -5548,8 +5565,8 @@ exit 0
 	if err != nil {
 		t.Fatalf("ReadFile(dolt log): %v", err)
 	}
-	if strings.Contains(string(logData), "UPDATE `beads`.wisps SET status='closed', closed_at=NOW(), metadata = JSON_SET") ||
-		strings.Contains(string(logData), "UPDATE `beads`.issues SET status='closed', closed_at=NOW(), metadata = JSON_SET") {
+	if strings.Contains(string(logData), "UPDATE `beads`.wisps SET status='closed', closed_at=UTC_TIMESTAMP(), updated_at=UTC_TIMESTAMP(), metadata = JSON_SET") ||
+		strings.Contains(string(logData), "UPDATE `beads`.issues SET status='closed', closed_at=UTC_TIMESTAMP(), updated_at=UTC_TIMESTAMP(), metadata = JSON_SET") {
 		t.Fatalf("dry-run executed workflow-root update:\n%s", logData)
 	}
 
@@ -6186,6 +6203,91 @@ exit 0
 	}
 }
 
+// TestReaperDryRunListsWouldCloseStaleIssuesWithoutClosing pins step 5's dry
+// run: each city-store row it would close is printed with its close mode and
+// counted in would_close_stale, and nothing is closed. A rig-store row, which a
+// real run skips rather than closes, is counted as skipped and not listed.
+func TestReaperDryRunListsWouldCloseStaleIssuesWithoutClosing(t *testing.T) {
+	cityDir := t.TempDir()
+	writeCityBeadsMetadata(t, cityDir, "citydb")
+	binDir := t.TempDir()
+	bdLog := filepath.Join(t.TempDir(), "bd.log")
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+
+	writeExecutable(t, filepath.Join(binDir, "dolt"), `#!/bin/sh
+case "$*" in
+  *"SHOW TABLES FROM"*"LIKE 'wisps'"*)
+    printf 'Tables_in_db\nwisps\n'
+    ;;
+  *"SHOW DATABASES"*)
+    printf 'Database\ncitydb\nrigdb\n'
+    ;;
+  *"SELECT id, CASE WHEN COALESCE(assignee"*"citydb"*"issues"*)
+    printf 'id,close_mode\nga-assigned,force\nga-open,bare\n'
+    ;;
+  *"SELECT id, CASE WHEN COALESCE(assignee"*"rigdb"*"issues"*)
+    printf 'id,close_mode\nrig-stale,bare\n'
+    ;;
+  *"COUNT("*)
+    printf 'COUNT(*)\n0\n'
+    ;;
+esac
+exit 0
+`)
+	writeExecutable(t, filepath.Join(binDir, "bd"), `#!/bin/sh
+printf '%s\n' "$*" >> "$BD_CALL_LOG"
+exit 0
+`)
+	writeMaintenanceGCStub(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+exit 0
+`)
+
+	env := map[string]string{
+		"BD_CALL_LOG":       bdLog,
+		"GC_CALL_LOG":       gcLog,
+		"GC_CITY":           cityDir,
+		"GC_CITY_PATH":      cityDir,
+		"GC_DOLT_HOST":      "127.0.0.1",
+		"GC_DOLT_PORT":      "3307",
+		"GC_DOLT_USER":      "root",
+		"GC_DOLT_PASSWORD":  "",
+		"GC_REAPER_DRY_RUN": "1",
+		"PATH":              binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+
+	out, err := runScriptResult(t, coreScriptPath("reaper.sh"), env)
+	if err != nil {
+		t.Fatalf("reaper.sh failed: %v\n%s", err, out)
+	}
+	output := string(out)
+	lines := strings.Split(output, "\n")
+	for _, want := range []string{
+		"reaper: would-close-stale citydb ga-assigned force",
+		"reaper: would-close-stale citydb ga-open bare",
+	} {
+		if !slices.Contains(lines, want) {
+			t.Fatalf("dry run did not list %q:\n%s", want, output)
+		}
+	}
+	if strings.Contains(output, "rig-stale") {
+		t.Fatalf("dry run listed a rig-store row that a real run skips:\n%s", output)
+	}
+	for _, want := range []string{"would_close_stale:2", "closed:0", "skipped_non_city_issues:1", "(dry run)"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("dry-run summary missing %q:\n%s", want, output)
+		}
+	}
+
+	bdData, err := os.ReadFile(bdLog)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ReadFile(bd log): %v", err)
+	}
+	if strings.Contains(string(bdData), "close") {
+		t.Fatalf("dry run closed beads:\n%s", bdData)
+	}
+}
+
 func TestReaperDoesNotStaleCloseIssueWithFutureExpiresAt(t *testing.T) {
 	cityDir := t.TempDir()
 	writeCityBeadsMetadata(t, cityDir, "citydb")
@@ -6272,7 +6374,7 @@ func TestReaperClosesNudgeBeadWithElapsedExpiresAt(t *testing.T) {
 	bdLog := filepath.Join(t.TempDir(), "bd.log")
 	gcLog := filepath.Join(t.TempDir(), "gc.log")
 
-	// The Step 3 close query is the only one that compares against
+	// The Step 4 close query is the only gc:nudge query that compares against
 	// UTC_TIMESTAMP(); the gc:nudge-scoped anomaly pre-scan ends in IS NULL.
 	// Returning a row from the close query exercises the positive TTL-expiry
 	// path: an elapsed nudge bead is closed with reason "ttl:expired by reaper"
@@ -6286,7 +6388,7 @@ case "$*" in
   *"SHOW DATABASES"*)
     printf 'Database\ncitydb\n'
     ;;
-  *"UTC_TIMESTAMP()"*)
+  *"gc:nudge"*"UTC_TIMESTAMP()"*)
     printf 'id\nga-expired\n'
     ;;
   *"gc:nudge"*)
