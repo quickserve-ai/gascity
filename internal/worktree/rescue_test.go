@@ -2,7 +2,6 @@ package worktree
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -572,8 +571,7 @@ func TestRescueRefusesASubmoduleWithWorkItCannotCarry(t *testing.T) {
 		}
 		kept := filepath.Join(td.PreservedModules, "sub")
 		for name, sha := range map[string]string{"branch feat": feat, "stash": stash, "reflog-only commit": away} {
-			cmd := exec.Command("git", "--git-dir="+kept, "cat-file", "-e", sha+"^{commit}")
-			if err := cmd.Run(); err != nil {
+			if _, err := gitOutput("/", nil, "--git-dir="+kept, "cat-file", "-e", sha+"^{commit}"); err != nil {
 				t.Errorf("submodule %s (%s) not preserved: %v", name, sha, err)
 			}
 		}
@@ -675,10 +673,9 @@ func TestRescueKeepsAnInProgressMergeHeadReachable(t *testing.T) {
 // from the rescue ref after the worktree's private state is irrelevant.
 func assertReachableFromRescue(t *testing.T, repo, ref, commit string) {
 	t.Helper()
-	cmd := exec.Command("git", "merge-base", "--is-ancestor", commit, ref)
-	cmd.Dir = repo
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("%s is not reachable from %s: %v", commit, ref, err)
+	ok, err := isAncestor(repo, commit, ref)
+	if err != nil || !ok {
+		t.Fatalf("%s is not reachable from %s (err %v)", commit, ref, err)
 	}
 }
 
@@ -843,10 +840,11 @@ func TestTeardownRefusesASymlinkedPath(t *testing.T) {
 	}
 }
 
+// runGitAllowFail runs git through the package's own runner (no new test
+// subprocess sites for the resource census) and returns its error.
 func runGitAllowFail(dir string, args ...string) error {
-	cmd := exec.Command("git", args...)
-	cmd.Dir = dir
-	return cmd.Run()
+	_, err := gitOutput(dir, nil, args...)
+	return err
 }
 
 // A detached worktree with local commits: its reflog holds those commits,
@@ -903,12 +901,11 @@ func TestRescueDoesNotTrustRemoteTrackingRefs(t *testing.T) {
 
 func runGitDir(t *testing.T, gitDir string, args ...string) string {
 	t.Helper()
-	cmd := exec.Command("git", append([]string{"--git-dir=" + gitDir}, args...)...)
-	out, err := cmd.CombinedOutput()
+	out, err := gitOutput("/", nil, append([]string{"--git-dir=" + gitDir}, args...)...)
 	if err != nil {
-		t.Fatalf("git --git-dir=%s %v: %s: %v", gitDir, args, out, err)
+		t.Fatalf("git --git-dir=%s %v: %v", gitDir, args, err)
 	}
-	return string(out)
+	return out
 }
 
 // Opus round 3, finding 2: a directory whose .git names ANOTHER worktree's
@@ -1005,5 +1002,66 @@ func TestRescueFoldsManyPrivateCommitsDeterministically(t *testing.T) {
 	}
 	if td, err := Teardown(TeardownSpec{RescueSpec: rescueSpec(wt), RescueSHA: first.RescueSHA}); err != nil || !td.Removed {
 		t.Fatalf("Teardown after a folded anchor: %+v %v", td, err)
+	}
+}
+
+// Codex review of #97, P1: `git cherry-pick A B C` stopping on A keeps B and C
+// ONLY in the worktree's sequencer/todo.
+func TestRescueKeepsTheUnappliedCommitsOfAStoppedCherryPick(t *testing.T) {
+	repo, wt, base := linkedWorktree(t)
+	id := []string{"-c", "user.name=t", "-c", "user.email=t@t"}
+	runGit(t, repo, "checkout", "-q", "-b", "side", base)
+	var picks []string
+	for _, c := range []string{"side-a", "side-b", "side-c"} {
+		writeFile(t, filepath.Join(repo, "a.txt"), c+"\n")
+		runGit(t, repo, append(id, "commit", "-qam", c)...)
+		picks = append(picks, runGit(t, repo, "rev-parse", "HEAD"))
+	}
+	writeFile(t, filepath.Join(wt, "a.txt"), "conflicting\n")
+	runGit(t, wt, append(id, "commit", "-qam", "conflicting")...)
+	if runGitAllowFail(wt, append(id, "cherry-pick", picks[0], picks[1], picks[2])...) == nil {
+		t.Fatal("control: the cherry-pick should stop on a conflict")
+	}
+	runGit(t, repo, "checkout", "-q", "--detach", base)
+	runGit(t, repo, "branch", "-D", "side") // only the sequencer still names B and C
+	rep, err := Rescue(rescueSpec(wt))
+	if err != nil {
+		t.Fatalf("Rescue: %v", err)
+	}
+	for _, c := range picks {
+		assertReachableFromRescue(t, repo, rep.RescueRef, c)
+	}
+}
+
+// Codex review of #97, P1: an embedded repository that was `git add`ed is an
+// index gitlink, but its .git lives inside the tree, not under modules/.
+func TestRescueRefusesAStagedEmbeddedRepository(t *testing.T) {
+	_, wt, _ := linkedWorktree(t)
+	lib := filepath.Join(wt, "lib")
+	runGit(t, wt, "init", "-q", "lib")
+	writeFile(t, filepath.Join(lib, "x.txt"), "x\n")
+	runGit(t, lib, "add", "x.txt")
+	runGit(t, lib, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x")
+	runGit(t, wt, "add", "lib")
+	if _, err := Rescue(rescueSpec(wt)); err == nil || !strings.Contains(err.Error(), "not a submodule of this worktree") {
+		t.Fatalf("Rescue err = %v, want an embedded-repository refusal", err)
+	}
+}
+
+// Codex review of #97, P2: a secret staged and then deleted from the tree
+// survives only in the index parent; taint must still name it.
+func TestRescueTaintCoversTheIndexParent(t *testing.T) {
+	_, wt, _ := linkedWorktree(t)
+	writeFile(t, filepath.Join(wt, ".env"), "TOKEN=x\n")
+	runGit(t, wt, "add", ".env")
+	if err := os.Remove(filepath.Join(wt, ".env")); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := Rescue(rescueSpec(wt))
+	if err != nil {
+		t.Fatalf("Rescue: %v", err)
+	}
+	if !containsString(rep.Taint, ".env") {
+		t.Fatalf("taint = %v, want the staged-only .env", rep.Taint)
 	}
 }
