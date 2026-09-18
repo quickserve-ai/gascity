@@ -168,7 +168,39 @@ func Rescue(spec RescueSpec) (RescueReport, error) {
 		return RescueReport{}, err
 	}
 	defer lock.unlock()
+	if spec.AbsentOK {
+		if _, err := os.Lstat(spec.Path); errors.Is(err, os.ErrNotExist) {
+			return RescueReport{Path: spec.Path, BeadID: spec.BeadID, Absent: true}, nil
+		}
+	}
+	if common, err = revalidateLocked(spec, common); err != nil {
+		return RescueReport{}, err
+	}
 	return rescueLocked(spec, common)
+}
+
+// afterPathLock, when set by a test, runs as soon as a Rescue or Teardown
+// holds its path lock, standing in for another gc operation that changed the
+// path while this one waited.
+var afterPathLock func()
+
+// revalidateLocked repeats validateRescueTarget once the path lock is held.
+// The unlocked pass only finds the repository whose lock guards the path.
+// Another gc operation can replace the tree while this one waits for that
+// lock, so the tree that is rescued and removed must be the one validated
+// under it.
+func revalidateLocked(spec RescueSpec, common string) (string, error) {
+	if afterPathLock != nil {
+		afterPathLock()
+	}
+	again, err := validateRescueTarget(spec)
+	if err != nil {
+		return "", fmt.Errorf("%q changed while waiting for its lock: %w", spec.Path, err)
+	}
+	if !samePathCanonical(again, common) {
+		return "", fmt.Errorf("%q changed while waiting for its lock: its repository was %s and is now %s", spec.Path, common, again)
+	}
+	return again, nil
 }
 
 // Teardown removes a linked worktree, but only after securing its current
@@ -188,6 +220,12 @@ func Rescue(spec RescueSpec) (RescueReport, error) {
 // tree. Formula teardown runs after the body scope is terminal, from the
 // session that owned the work, which keeps that window small but does not
 // close it (ga-w805wc follow-up).
+//
+// The recorded sha binds the worktree's STATE, not its instance. Every check
+// runs again under the path lock, so a tree replaced while this call waited
+// is judged as it now is. But a replacement whose state secures to exactly
+// the recorded sha (a fresh, clean worktree at the same commit) passes and is
+// removed; it holds nothing the rescue does not.
 func Teardown(spec TeardownSpec) (TeardownReport, error) {
 	var report TeardownReport
 	if strings.TrimSpace(spec.RescueSHA) == "" {
@@ -206,6 +244,13 @@ func Teardown(spec TeardownSpec) (TeardownReport, error) {
 		return report, err
 	}
 	defer lock.unlock()
+	if _, err := os.Lstat(spec.Path); errors.Is(err, os.ErrNotExist) {
+		report.AlreadyAbsent = true // removed by the operation this one waited for
+		return report, nil
+	}
+	if common, err = revalidateLocked(spec.RescueSpec, common); err != nil {
+		return report, err
+	}
 
 	rescue, err := rescueLocked(spec.RescueSpec, common)
 	if err != nil {
@@ -445,8 +490,14 @@ func rescueLocked(spec RescueSpec, common string) (RescueReport, error) {
 			return report, err
 		}
 	}
-	// Taint covers everything the rescue keeps: the working state AND the
-	// index parent, where a staged-then-deleted secret survives alone.
+	tips, err := privateRootTips(wt, head, RescueRefPrefix+spec.BeadID)
+	if err != nil {
+		return report, fmt.Errorf("collecting commits private to the worktree (failing closed): %w", err)
+	}
+
+	// Taint covers everything the rescue keeps: the working state, the index
+	// parent (where a staged-then-deleted secret survives alone), and the
+	// commits it makes durable that no remote has.
 	taint := map[string]bool{}
 	for _, tree := range []string{snap.tree, snap.indexTree} {
 		if tree == "" || tree == baseTree {
@@ -459,6 +510,17 @@ func rescueLocked(spec RescueSpec, common string) (RescueReport, error) {
 		for _, p := range paths {
 			taint[p] = true
 		}
+	}
+	kept := tips
+	if head != "" {
+		kept = append([]string{head}, tips...)
+	}
+	committed, err := committedTaint(wt, kept)
+	if err != nil {
+		return report, fmt.Errorf("scanning the kept commits for credential paths (failing closed): %w", err)
+	}
+	for _, p := range committed {
+		taint[p] = true
 	}
 	for p := range taint {
 		report.Taint = append(report.Taint, p)
@@ -476,10 +538,6 @@ func rescueLocked(spec RescueSpec, common string) (RescueReport, error) {
 			return report, err
 		}
 		extra = append(extra, indexCommit)
-	}
-	tips, err := privateRootTips(wt, head, RescueRefPrefix+spec.BeadID)
-	if err != nil {
-		return report, fmt.Errorf("collecting commits private to the worktree (failing closed): %w", err)
 	}
 	if len(tips) > 0 {
 		anchor, err := commitAnchor(wt, spec.BeadID, head, tips)
@@ -1143,6 +1201,43 @@ func taintedPaths(wt, fromTree, toTree string) ([]string, error) {
 	var taint []string
 	for _, p := range strings.Split(out, "\x00") {
 		if p != "" && credentialNames.MatchString(path.Base(p)) {
+			taint = append(taint, p)
+		}
+	}
+	sort.Strings(taint)
+	return taint, nil
+}
+
+// committedTaint lists credential-shaped paths that the commits reachable from
+// tips add or modify, over the commits no remote-tracking ref reaches. A clean
+// worktree on a local-only commit has nothing beyond HEAD, yet the rescue makes
+// that commit durable, and whatever later pushes the rescue would publish it.
+// A tracking ref that lags its remote only widens the scan. One the remote has
+// since dropped excludes commits that were published once, which a later push
+// does not newly expose. With no remote-tracking refs at all, every reachable
+// commit is scanned.
+func committedTaint(wt string, tips []string) ([]string, error) {
+	if len(tips) == 0 {
+		return nil, nil
+	}
+	revs, err := gitOutput(wt, nil, append(append([]string{"rev-list"}, tips...), "--not", "--remotes")...)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(revs) == "" {
+		return nil, nil
+	}
+	// -m shows a merge against each parent and --root a root commit as a
+	// creation; each commit's id is printed among the names and never matches.
+	out, err := gitOutputStdin(wt, nil, revs, "diff-tree", "--stdin", "-r", "-m", "--root", "--no-renames", "--name-only", "-z", "--diff-filter=AM")
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	var taint []string
+	for _, p := range strings.Split(out, "\x00") {
+		if p != "" && !seen[p] && credentialNames.MatchString(path.Base(p)) {
+			seen[p] = true
 			taint = append(taint, p)
 		}
 	}
