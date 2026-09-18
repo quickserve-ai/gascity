@@ -291,7 +291,7 @@ func TestCoreShippedAssetsAvoidNonexistentBDListSearchFlag(t *testing.T) {
 func assertSecureBeforeDestroy(t *testing.T, name, block, worktreeVar string) {
 	t.Helper()
 	order := []string{
-		`gc worktree rescue --path "` + worktreeVar + `" --bead "$WORK_BEAD_ID" --json`,
+		`gc worktree rescue --path "` + worktreeVar + `" --bead "$WORK_BEAD_ID"`,
 		`--set-metadata rescue_sha="$RESCUE_SHA"`,
 		`gc worktree teardown --path "` + worktreeVar + `" --bead "$WORK_BEAD_ID" --rescue-sha "$RESCUE_SHA" || exit 1`,
 		`--unset-metadata work_dir || exit 1`,
@@ -324,7 +324,16 @@ func TestMolPolecatCommitSecuresBeforeRemovingWorktree(t *testing.T) {
 	if start < 0 || end < start {
 		t.Fatal("commit-and-push lost its numbered cleanup section")
 	}
-	assertSecureBeforeDestroy(t, "commit-and-push", step[start:end], "$WORKTREE_PATH")
+	block := step[start:end]
+	assertSecureBeforeDestroy(t, "commit-and-push", block, "$WORKTREE_PATH")
+	// Tearing down $(pwd) removes whatever worktree the session stands in,
+	// possibly another bead's, and orphans this bead's real one.
+	if strings.Contains(block, "WORKTREE_PATH=$(pwd)") {
+		t.Error("commit-and-push must tear down the bead's recorded work_dir, not $(pwd)")
+	}
+	if !strings.Contains(block, `.[0].metadata.work_dir`) {
+		t.Error("commit-and-push must read the worktree path from the bead's work_dir")
+	}
 }
 
 func TestMolScopedWorkSecuresBeforeRemovingWorktree(t *testing.T) {
@@ -335,5 +344,15 @@ func TestMolScopedWorkSecuresBeforeRemovingWorktree(t *testing.T) {
 	// "nothing to tear down" and erase the pointer to a live worktree.
 	if !strings.Contains(step, `BEAD_JSON=$(gc bd show "$WORK_BEAD_ID" --json) || exit 1`) {
 		t.Error("cleanup-worktree must stop on a failed bead read, not treat it as an empty work_dir")
+	}
+	// A shell existence test reads an unreadable path as absent and would
+	// clear the pointer to a live worktree; gc decides absence (ENOENT only).
+	if !strings.Contains(step, "--absent-ok --json") {
+		t.Error("cleanup-worktree must let gc worktree rescue --absent-ok decide whether the worktree is gone")
+	}
+	for _, shellTest := range []string{`[ -e "$WORKTREE" ]`, `[ -d "$WORKTREE" ]`} {
+		if strings.Contains(step, shellTest) {
+			t.Errorf("cleanup-worktree decides absence with %s, which also reads an unreadable path as absent", shellTest)
+		}
 	}
 }

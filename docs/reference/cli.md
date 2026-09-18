@@ -5388,12 +5388,31 @@ descendant; a divergent rescue is written beside it as
 refs/rescue/&lt;bead&gt;-&lt;sha12&gt;. Credential-shaped file names are reported as taint
 and recorded in the rescue commit's Rescue-Taint trailer.
 
+Removal also deletes everything private to the worktree, so the rescue keeps
+it reachable too: staged content that differs from both HEAD and the working
+tree (an index parent), and, through an anchor parent, every commit that only
+the worktree's own state reaches: its HEAD reflog, an in-progress rebase,
+merge, cherry-pick, revert or bisect, refs/worktree/*, and the HEADs of its
+submodules (imported into the shared object store, since a linked worktree's
+submodule repositories live in its admin dir). Remote-tracking refs are not
+trusted to keep anything: fetch --prune drops them. Index bits that make git
+skip real edits (assume-unchanged, skip-worktree on a present file) are
+ignored.
+
+Refused, because a rescue cannot carry them: a submodule with uncommitted or
+untracked changes, an untracked directory holding its own git repository,
+and another registered worktree nested inside this one.
+
+--absent-ok reports a path that does not exist (ENOENT only) as absent=true
+instead of failing, so a caller can tell "already gone" from "unreadable".
+
 ```
 gc worktree rescue [flags]
 ```
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
+| `--absent-ok` | bool |  | succeed with absent=true when --path does not exist (only ENOENT; an unreadable path still fails) |
 | `--bead` | string |  | work bead the rescue ref is named for (required) |
 | `--city-path` | string |  | city directory whose synced skill copies count as gc sediment (default: $GC_CITY_PATH) |
 | `--json` | bool |  | emit the report as JSON |
@@ -5409,10 +5428,16 @@ bead) after running gc worktree rescue. A worktree that changed in between is
 secured anew and left in place, and the error names the new rescue to record.
 
 It refuses anything that is not a registered linked worktree: a main checkout,
-a submodule checkout, a subdirectory, or an unregistered directory. A locked
-worktree is removed. If git cannot remove the tree (one holding submodules),
-the directory is deleted only after it is proven a registered linked worktree
-again, and the registration is pruned. A path that no longer exists succeeds.
+a submodule checkout, a subdirectory, a symlink, or an unregistered directory.
+A locked worktree is removed. If git cannot remove the tree (one holding
+submodules), the directory is deleted only after it is proven a registered
+linked worktree again, and then only THIS worktree's admin directory is
+removed. It never runs a repo-wide worktree prune, which would drop other
+worktrees' stale registrations and the commits they still keep alive. A path
+that no longer exists succeeds.
+
+A write that lands after the final rescue is removed with the tree: the lock
+excludes other gc worktree operations, not editors or background processes.
 
 ```
 gc worktree teardown [flags]

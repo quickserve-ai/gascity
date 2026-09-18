@@ -135,25 +135,34 @@ done
 
 **3. Clean up worktree (secure locally first, ga-w805wc):**
 
-`gc worktree rescue` makes everything still in the tree reachable from
-refs/rescue/<bead> in the shared ref store before anything is removed; the
-bead records it; `gc worktree teardown` removes the tree only if it still
+Tear down the worktree the BEAD records, never whatever the current directory
+happens to be. `gc worktree rescue` makes everything the tree holds reachable
+from refs/rescue/<bead> in the shared ref store before anything is removed;
+the bead records it; `gc worktree teardown` removes the tree only if it still
 matches that rescue, and refuses anything that is not a registered linked
 worktree. Any failure stops here with the worktree and work_dir intact.
 ```bash
-WORKTREE_PATH=$(pwd)
-RESCUE=$(gc worktree rescue --path "$WORKTREE_PATH" --bead "$WORK_BEAD_ID" --json) || {
-    echo "cleanup: REFUSING to remove $WORKTREE_PATH: its work could not be secured for $WORK_BEAD_ID" >&2
-    exit 1
-}
-RESCUE_REF=$(printf '%s' "$RESCUE" | jq -er '.rescue_ref') || exit 1
-RESCUE_SHA=$(printf '%s' "$RESCUE" | jq -er '.rescue_sha') || exit 1
-RESCUE_REPO=$(printf '%s' "$RESCUE" | jq -er '.repo') || exit 1
-RESCUE_TAINT=$(printf '%s' "$RESCUE" | jq -er '(.taint // []) | join(",")') || exit 1
-gc bd update "$WORK_BEAD_ID" --set-metadata rescue_ref="$RESCUE_REF" --set-metadata rescue_sha="$RESCUE_SHA" --set-metadata rescue_repo="$RESCUE_REPO" --set-metadata rescue_taint="$RESCUE_TAINT" || exit 1
-cd ..
-gc worktree teardown --path "$WORKTREE_PATH" --bead "$WORK_BEAD_ID" --rescue-sha "$RESCUE_SHA" || exit 1
-gc bd update "$WORK_BEAD_ID" --unset-metadata work_dir || exit 1
+BEAD_JSON=$(gc bd show "$WORK_BEAD_ID" --json) || exit 1
+WORKTREE_PATH=$(printf '%s' "$BEAD_JSON" | jq -er '.[0].metadata.work_dir // ""') || exit 1
+if [ -z "$WORKTREE_PATH" ]; then
+    echo "cleanup: $WORK_BEAD_ID records no work_dir; nothing to tear down"
+else
+    RESCUE=$(gc worktree rescue --path "$WORKTREE_PATH" --bead "$WORK_BEAD_ID" --absent-ok --json) || {
+        echo "cleanup: REFUSING to remove $WORKTREE_PATH: its work could not be secured for $WORK_BEAD_ID" >&2
+        exit 1
+    }
+    ABSENT=$(printf '%s' "$RESCUE" | jq -r '.absent == true') || exit 1
+    if [ "$ABSENT" != "true" ]; then
+        RESCUE_REF=$(printf '%s' "$RESCUE" | jq -er '.rescue_ref') || exit 1
+        RESCUE_SHA=$(printf '%s' "$RESCUE" | jq -er '.rescue_sha') || exit 1
+        RESCUE_REPO=$(printf '%s' "$RESCUE" | jq -er '.repo') || exit 1
+        RESCUE_TAINT=$(printf '%s' "$RESCUE" | jq -er '(.taint // []) | join(",")') || exit 1
+        gc bd update "$WORK_BEAD_ID" --set-metadata rescue_ref="$RESCUE_REF" --set-metadata rescue_sha="$RESCUE_SHA" --set-metadata rescue_repo="$RESCUE_REPO" --set-metadata rescue_taint="$RESCUE_TAINT" || exit 1
+        cd "$(dirname "$WORKTREE_PATH")" || exit 1
+        gc worktree teardown --path "$WORKTREE_PATH" --bead "$WORK_BEAD_ID" --rescue-sha "$RESCUE_SHA" || exit 1
+    fi
+    gc bd update "$WORK_BEAD_ID" --unset-metadata work_dir || exit 1
+fi
 ```
 
 **4. Close the bead:**
