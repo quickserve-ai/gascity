@@ -412,6 +412,10 @@ type Result struct {
 // materializer keeps inside each sink directory (gastownhall/gascity#4130).
 const ownershipManifestFile = ".gc-skill-ownership.json"
 
+// OwnershipManifestFile exports the manifest name for readers outside this
+// package: worktree rescue reads it to prove a skill symlink is gc's own.
+const OwnershipManifestFile = ownershipManifestFile
+
 // ownershipManifest durably records, per sink entry name, the last
 // canonicalized absolute target this materializer wrote a symlink to.
 // It exists solely so a symlink can still be recognized as gc's own once

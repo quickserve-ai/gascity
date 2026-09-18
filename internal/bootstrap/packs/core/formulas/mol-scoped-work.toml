@@ -195,104 +195,57 @@ needs = ["body"]
 description = """
 Remove the temporary worktree after the body reaches terminal state.
 
-The removal is SECURE-BEFORE-DESTROY (ga-6xehc5 / ga-8as9s3): the worktree may
-hold the only copy of the work — uncommitted WIP, or commits reachable from no
-remote ref. Teardown first commits any WIP (leaving out only what gc provably
-put there: manifest-recorded skill symlinks, city-synced skill copies,
-AGENTS-gc.md, .worktree-stale) and makes HEAD reachable from
-origin (branch push, falling back to refs/rescue/<bead-id>); if that cannot be
-done, the step FAILS instead of destroying the tree. A repeated failure
-surfaces through the step's retry policy (hard_fail) rather than silently
-deleting work — twice in one night on a peer city, a DB migration included,
-the only guard was an optional worker check.
+The worktree may hold the only copy of the work: uncommitted edits, untracked
+files, or commits on a detached HEAD that no ref reaches. Teardown therefore
+SECURES LOCALLY FIRST and removes second (ga-w805wc):
+
+1. `gc worktree rescue` snapshots everything that is not gitignored into
+   refs/rescue/<bead> in the repository's shared ref store, which removing the
+   worktree cannot touch. It contacts no remote, moves no branch, runs no
+   hook, and leaves out only what gc provably put in the tree.
+2. The bead records where the work went (rescue_ref, rescue_sha, rescue_repo,
+   rescue_taint) BEFORE anything is removed, so it swaps one pointer for
+   another and never forgets.
+3. `gc worktree teardown` rescues again and removes the tree only if the
+   result is exactly the recorded rescue. It refuses a main checkout, a
+   submodule, or any directory that is not a registered linked worktree.
+4. Only then is work_dir cleared.
+
+Every failure stops the step with the worktree and work_dir intact; the retry
+policy surfaces a repeated failure. Run the block as written: each line is a
+safety step, not a suggestion. To restore rescued work:
+`git -C <rescue_repo> worktree add <dir> <rescue_sha>`.
 
 ```bash
-CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json)
+CONVOY_STATUS=$(gc convoy status {{convoy_id}} --json) || exit 1
 WORK_BEAD_ID=$(printf '%s' "$CONVOY_STATUS" | jq -r 'if (.children | length) == 1 then .children[0].id else empty end')
 if [ -z "$WORK_BEAD_ID" ]; then
   echo "mol-scoped-work requires an input convoy with exactly one tracked member" >&2
   exit 1
 fi
-WORKTREE=$(gc bd show "$WORK_BEAD_ID" --json | jq -r '.[0].metadata.work_dir // empty')
-if [ -n "$WORKTREE" ] && [ -d "$WORKTREE" ]; then
-  (
-    cd "$WORKTREE" || exit 1
-    # Secure every change EXCEPT what gc itself put in the tree. Sediment must be
-    # PROVEN, never guessed from a path: tracked edits under .claude/ or .beads/
-    # are real work (qcore tracks skills and formulas there), and so are
-    # untracked authored files and symlinks. An untracked entry is sediment
-    # only when it is:
-    #  - a skill symlink <sink>/skills/<name> recorded in that sink's
-    #    .gc-skill-ownership.json (gc materializes skills as symlinks), or
-    #    that manifest itself;
-    #  - a regular file under a skills sink that is byte-identical to the same
-    #    path under $GC_CITY_PATH (city-synced copies, e.g. search-sessions);
-    #  - AGENTS-gc.md or .worktree-stale.
-    # Without this, a sediment-only tree (40 skill symlinks measured in a qcore
-    # worktree) committed the symlinks into the work branch and pushed it,
-    # usually a PR head.
-    SEDIMENT_LIST=$(mktemp) || exit 1
-    trap 'rm -f "$SEDIMENT_LIST"' EXIT
-    git status --porcelain -z -uall | while IFS= read -r -d '' entry; do
-      case "$entry" in
-        '?? '*) p=${entry#???} ;;
-        R*|C*|?R*|?C*) IFS= read -r -d '' _orig; continue ;;
-        *) continue ;;
-      esac
-      case "$p" in
-        AGENTS-gc.md|.worktree-stale|.claude/skills/.gc-skill-ownership.json|.omp/skills/.gc-skill-ownership.json)
-          printf '%s\\0' "$p" ;;
-        .claude/skills/*|.omp/skills/*)
-          sink=${p%%/skills/*}/skills
-          rest=${p#"$sink"/}
-          name=${rest%%/*}
-          if [ -L "$p" ] && [ "$rest" = "$name" ] \
-            && jq -e --arg n "$name" '.targets[$n] != null' "$sink/.gc-skill-ownership.json" >/dev/null 2>&1; then
-            printf '%s\\0' "$p"
-          elif [ -f "$p" ] && [ ! -L "$p" ] && [ -n "${GC_CITY_PATH:-}" ] \
-            && [ -f "$GC_CITY_PATH/$p" ] && cmp -s "$p" "$GC_CITY_PATH/$p"; then
-            printf '%s\\0' "$p"
-          fi ;;
-      esac
-    done > "$SEDIMENT_LIST"
-    git add -A || exit 1
-    if [ -s "$SEDIMENT_LIST" ]; then
-      GIT_LITERAL_PATHSPECS=1 git reset -q --pathspec-from-file="$SEDIMENT_LIST" --pathspec-file-nul || exit 1
-    fi
-    rm -f "$SEDIMENT_LIST"
-    if ! git diff --cached --quiet; then
-      git commit -m "rescue(${WORK_BEAD_ID}): WIP secured by cleanup-worktree before teardown" || exit 1
-    fi
-    # HEAD already reachable from a remote ref => nothing to secure.
-    if [ -z "$(git branch -r --contains HEAD 2>/dev/null | head -1)" ]; then
-      BRANCH=$(git rev-parse --abbrev-ref HEAD)
-      if [ "$BRANCH" != "HEAD" ]; then
-        git push origin "HEAD:refs/heads/${BRANCH}" \
-          || git push origin "HEAD:refs/rescue/${WORK_BEAD_ID}" \
-          || exit 1
-      else
-        git push origin "HEAD:refs/rescue/${WORK_BEAD_ID}" || exit 1
-      fi
-    fi
-  ) || {
-    echo "cleanup-worktree: REFUSING to remove $WORKTREE — could not secure WIP/HEAD to origin for $WORK_BEAD_ID; removal would destroy the only copy of the work" >&2
+# A failed read must stop the step: an empty work_dir from a failed read would
+# look like "nothing to tear down" and erase the pointer to a live worktree.
+BEAD_JSON=$(gc bd show "$WORK_BEAD_ID" --json) || exit 1
+WORKTREE=$(printf '%s' "$BEAD_JSON" | jq -er '.[0].metadata.work_dir // ""') || exit 1
+if [ -z "$WORKTREE" ]; then
+  echo "cleanup-worktree: $WORK_BEAD_ID records no work_dir; nothing to tear down"
+  exit 0
+fi
+if [ -e "$WORKTREE" ]; then
+  RESCUE=$(gc worktree rescue --path "$WORKTREE" --bead "$WORK_BEAD_ID" --json) || {
+    echo "cleanup-worktree: REFUSING to remove $WORKTREE: its work could not be secured for $WORK_BEAD_ID" >&2
     exit 1
   }
-  # cwd is not guaranteed to be inside the repo at this step, so resolve REPO
-  # off the worktree itself rather than off `pwd`.
-  REPO=$(git -C "$WORKTREE" rev-parse --path-format=absolute --git-common-dir)
-  if [ -z "$REPO" ]; then
-    echo "cleanup: could not resolve the owning repo for $WORKTREE; leaving it registered" >&2
-  elif ! git -C "$REPO" worktree remove --force "$WORKTREE"; then
-    if [ -f "$WORKTREE/.git" ]; then
-      rm -rf "$WORKTREE"
-      git -C "$REPO" worktree prune
-    else
-      echo "cleanup: refusing to rm -rf $WORKTREE: not a linked worktree" >&2
-    fi
-  fi
+  RESCUE_REF=$(printf '%s' "$RESCUE" | jq -er '.rescue_ref') || exit 1
+  RESCUE_SHA=$(printf '%s' "$RESCUE" | jq -er '.rescue_sha') || exit 1
+  RESCUE_REPO=$(printf '%s' "$RESCUE" | jq -er '.repo') || exit 1
+  RESCUE_TAINT=$(printf '%s' "$RESCUE" | jq -er '(.taint // []) | join(",")') || exit 1
+  gc bd update "$WORK_BEAD_ID" --set-metadata rescue_ref="$RESCUE_REF" --set-metadata rescue_sha="$RESCUE_SHA" --set-metadata rescue_repo="$RESCUE_REPO" --set-metadata rescue_taint="$RESCUE_TAINT" || exit 1
+  gc worktree teardown --path "$WORKTREE" --bead "$WORK_BEAD_ID" --rescue-sha "$RESCUE_SHA" || exit 1
+else
+  echo "cleanup-worktree: $WORKTREE is already gone; clearing work_dir"
 fi
-gc bd update "$WORK_BEAD_ID" --unset-metadata work_dir
+gc bd update "$WORK_BEAD_ID" --unset-metadata work_dir || exit 1
 ```
 """
 metadata = { "gc.kind" = "cleanup", "gc.scope_ref" = "body", "gc.scope_role" = "teardown" }
