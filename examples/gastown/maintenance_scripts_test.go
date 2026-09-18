@@ -14,11 +14,17 @@ import (
 	"testing"
 	"time"
 
+	"errors"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/extmsg"
+	"net"
 )
 
 var rawDoltSQLCallRe = regexp.MustCompile(`(?m)(^|[^A-Za-z0-9_-])dolt(?:[ \t]+|[ \t]*\\[ \t]*\r?\n[ \t]*)+sql([ \t]|$)`)
+
+// localClockSQLRe matches SQL that reads the Dolt server's local clock. bd
+// stores UTC in its timestamp columns, so the reaper must use UTC_TIMESTAMP().
+var localClockSQLRe = regexp.MustCompile(`(?i)\b(?:now|sysdate|curdate|curtime)\s*\(|\b(?:current_timestamp|current_date|current_time|localtime|localtimestamp)\b`)
 
 var mailTableRe = regexp.MustCompile(`(?i)(?:FROM|UPDATE|INTO|JOIN|DELETE\s+FROM)\s+(?:\x60?[\w-]+\x60?\.)?\x60?mail\x60?\b`)
 
@@ -3177,7 +3183,7 @@ func TestReaperScriptSQLReflectsCurrentSchema(t *testing.T) {
 	}
 	for _, required := range []string{
 		"issue_type NOT IN ('message')",
-		"created_at < DATE_SUB(NOW(), INTERVAL $MAX_AGE_H HOUR)",
+		"created_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL $MAX_AGE_H HOUR)",
 	} {
 		if !strings.Contains(script, required) {
 			t.Errorf("reaper script is missing stale-only query fragment %q", required)
@@ -3208,6 +3214,18 @@ func TestReaperScriptSQLReflectsCurrentSchema(t *testing.T) {
 		if strings.Contains(script, forbidden) {
 			t.Errorf("reaper script contains %q; mutations must go through bd verbs", forbidden)
 		}
+	}
+	if found := localClockSQLRe.FindAllString(script, -1); len(found) > 0 {
+		t.Errorf("reaper script reads the server-local clock (%q); timestamp columns hold UTC, use UTC_TIMESTAMP()", found)
+	}
+	if !strings.Contains(script, "AND NOT EXISTS (SELECT 1 FROM \\`$DB\\`.labels od WHERE od.issue_id = issues.id AND od.label = 'operator-directive')") {
+		t.Errorf("reaper stale-issue selection does not exempt beads labeled operator-directive")
+	}
+	// On Dolt 2.2.4 a second NOT IN subquery in step 5 turns the dependency
+	// guard's NOT IN into a plain IN, so step 5 selects exactly the beads that
+	// guard protects. TestReaperStaleIssueSkipsOperatorDirectiveRealDolt shows it.
+	if strings.Contains(script, "NOT IN (SELECT issue_id FROM \\`$DB\\`.labels") {
+		t.Errorf("reaper step 5 excludes labels with NOT IN; on Dolt that inverts the dependency guard, use NOT EXISTS")
 	}
 }
 
@@ -4255,8 +4273,8 @@ exit 0
 		"JSON_UNQUOTE(JSON_EXTRACT(child_issue.metadata, '$.\"gc.root_bead_id\"')) = root.id",
 		"COALESCE(w.assignee, '') = ''",
 		"COALESCE(i.assignee, '') = ''",
-		"COALESCE(w.updated_at, w.created_at) < DATE_SUB(NOW(), INTERVAL",
-		"COALESCE(i.updated_at, i.created_at) < DATE_SUB(NOW(), INTERVAL",
+		"COALESCE(w.updated_at, w.created_at) < DATE_SUB(UTC_TIMESTAMP(), INTERVAL",
+		"COALESCE(i.updated_at, i.created_at) < DATE_SUB(UTC_TIMESTAMP(), INTERVAL",
 		"descendant_wisp.status, descendant_issue.status) IN ('open', 'hooked', 'in_progress', 'blocked', 'deferred', 'pinned', 'review', 'testing')",
 		"roots_with_recent_descendants",
 		"child_dep.type IN ('parent-child', 'tracks', 'blocks')",
@@ -10448,5 +10466,90 @@ exit 0
 	want := "cross-rig-deps: resolved 4 cross-rig dependencies"
 	if !strings.Contains(string(out), want) {
 		t.Fatalf("cross-rig-deps summary missing or wrong (subshell counter regression?)\nwant substring: %q\ngot output:\n%s\nbd log:\n%s", want, out, logData)
+	}
+}
+
+// TestReaperDryRunListsWouldCloseStaleIssuesWithoutClosing pins step 5's dry
+// run: each city-store row it would close is printed with its close mode and
+// counted in would_close_stale, and nothing is closed. A rig-store row, which a
+// real run skips rather than closes, is counted as skipped and not listed.
+func TestReaperDryRunListsWouldCloseStaleIssuesWithoutClosing(t *testing.T) {
+	cityDir := t.TempDir()
+	writeCityBeadsMetadata(t, cityDir, "citydb")
+	binDir := t.TempDir()
+	bdLog := filepath.Join(t.TempDir(), "bd.log")
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+
+	writeExecutable(t, filepath.Join(binDir, "dolt"), `#!/bin/sh
+case "$*" in
+  *"SHOW TABLES FROM"*"LIKE 'wisps'"*)
+    printf 'Tables_in_db\nwisps\n'
+    ;;
+  *"SHOW DATABASES"*)
+    printf 'Database\ncitydb\nrigdb\n'
+    ;;
+  *"SELECT id, CASE WHEN COALESCE(assignee"*"citydb"*"issues"*)
+    printf 'id,close_mode\nga-assigned,force\nga-open,bare\n'
+    ;;
+  *"SELECT id, CASE WHEN COALESCE(assignee"*"rigdb"*"issues"*)
+    printf 'id,close_mode\nrig-stale,bare\n'
+    ;;
+  *"COUNT("*)
+    printf 'COUNT(*)\n0\n'
+    ;;
+esac
+exit 0
+`)
+	writeExecutable(t, filepath.Join(binDir, "bd"), `#!/bin/sh
+printf '%s\n' "$*" >> "$BD_CALL_LOG"
+exit 0
+`)
+	writeMaintenanceGCStub(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+exit 0
+`)
+
+	env := map[string]string{
+		"BD_CALL_LOG":       bdLog,
+		"GC_CALL_LOG":       gcLog,
+		"GC_CITY":           cityDir,
+		"GC_CITY_PATH":      cityDir,
+		"GC_DOLT_HOST":      "127.0.0.1",
+		"GC_DOLT_PORT":      "3307",
+		"GC_DOLT_USER":      "root",
+		"GC_DOLT_PASSWORD":  "",
+		"GC_REAPER_DRY_RUN": "1",
+		"PATH":              binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+
+	out, err := runScriptResult(t, coreScriptPath("reaper.sh"), env)
+	if err != nil {
+		t.Fatalf("reaper.sh failed: %v\n%s", err, out)
+	}
+	output := string(out)
+	lines := strings.Split(output, "\n")
+	for _, want := range []string{
+		"reaper: would-close-stale citydb ga-assigned force",
+		"reaper: would-close-stale citydb ga-open bare",
+	} {
+		if !slices.Contains(lines, want) {
+			t.Fatalf("dry run did not list %q:\n%s", want, output)
+		}
+	}
+	if strings.Contains(output, "rig-stale") {
+		t.Fatalf("dry run listed a rig-store row that a real run skips:\n%s", output)
+	}
+	for _, want := range []string{"would_close_stale:2", "closed:0", "skipped_non_city_issues:1", "(dry run)"} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("dry-run summary missing %q:\n%s", want, output)
+		}
+	}
+
+	bdData, err := os.ReadFile(bdLog)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ReadFile(bd log): %v", err)
+	}
+	if strings.Contains(string(bdData), "close") {
+		t.Fatalf("dry run closed beads:\n%s", bdData)
 	}
 }

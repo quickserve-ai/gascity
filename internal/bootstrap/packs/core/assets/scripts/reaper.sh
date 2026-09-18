@@ -127,6 +127,10 @@ TOTAL_WOULD_PURGE=0
 TOTAL_MAIL_WISPS=0
 TOTAL_WORKFLOW_ROOTS_CLOSED=0
 TOTAL_WOULD_CLOSE_WORKFLOW_ROOTS=0
+# bd stores UTC in every timestamp column, so each age cutoff and each
+# closed_at write below uses UTC_TIMESTAMP(). The server-local clock is off by
+# the host's UTC offset and shifts an hour at each DST change.
+TOTAL_WOULD_CLOSE_STALE=0
 TOTAL_WORKFLOW_ROOTS_STORE_REF_SKIPPED=0
 TOTAL_WORKFLOW_ISSUE_ROOTS_SKIPPED=0
 TOTAL_ISSUES_CLOSED=0
@@ -330,8 +334,8 @@ workflow_root_candidates_cte() {
             WHERE $alias.status IN ($WORKFLOW_ROOT_CLOSE_STATUSES)
             AND $alias.issue_type NOT IN ($issue_type_exclusions)
             AND COALESCE($alias.assignee, '') = ''
-            AND $alias.created_at < DATE_SUB(NOW(), INTERVAL $MAX_AGE_H HOUR)
-            AND COALESCE($alias.updated_at, $alias.created_at) < DATE_SUB(NOW(), INTERVAL $MAX_AGE_H HOUR)
+            AND $alias.created_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL $MAX_AGE_H HOUR)
+            AND COALESCE($alias.updated_at, $alias.created_at) < DATE_SUB(UTC_TIMESTAMP(), INTERVAL $MAX_AGE_H HOUR)
             AND (
                 JSON_UNQUOTE(JSON_EXTRACT($alias.metadata, '$."gc.kind"')) = 'workflow'
                 OR JSON_UNQUOTE(JSON_EXTRACT($alias.metadata, '$."gc.formula_contract"')) = 'graph.v2'
@@ -404,7 +408,7 @@ $(workflow_root_store_ref_local_condition "$db" "$alias")
                 descendant_wisp.created_at,
                 descendant_issue.updated_at,
                 descendant_issue.created_at
-            ) >= DATE_SUB(NOW(), INTERVAL $MAX_AGE_H HOUR)
+            ) >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL $MAX_AGE_H HOUR)
         )
 SQL
 }
@@ -485,7 +489,7 @@ stale_wisp_subtree_query() {
             LEFT JOIN \`$db\`.wisps parent_wisp ON d.depends_on_wisp_id = parent_wisp.id
             LEFT JOIN \`$db\`.issues parent_issue ON d.depends_on_issue_id = parent_issue.id
             WHERE w.status IN ('open', 'hooked', 'in_progress')
-            AND w.created_at < DATE_SUB(NOW(), INTERVAL $MAX_AGE_H HOUR)
+            AND w.created_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL $MAX_AGE_H HOUR)
             AND (
                 parent_wisp.status = 'closed'
                 OR parent_issue.status = 'closed'
@@ -515,7 +519,7 @@ stale_wisp_subtree_query() {
         SELECT t.id, t.owner_id, t.depth,
             CASE WHEN w.id IS NOT NULL
                 AND w.status IN ('open', 'hooked', 'in_progress')
-                AND w.created_at < DATE_SUB(NOW(), INTERVAL $MAX_AGE_H HOUR)
+                AND w.created_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL $MAX_AGE_H HOUR)
             THEN 'ok' ELSE 'keep' END,
             CASE WHEN COALESCE(w.assignee, '') = '' THEN 'bare' ELSE 'force' END
         FROM reap_tree t
@@ -614,7 +618,7 @@ reap_scope() {
         SELECT COUNT(*) FROM \`$DB\`.wisps
         WHERE status IN ('open', 'hooked', 'in_progress')
         AND issue_type NOT IN ('message')
-        AND created_at < DATE_SUB(NOW(), INTERVAL $MAX_AGE_H HOUR)
+        AND created_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL $MAX_AGE_H HOUR)
     " || true
     stale_wisp_count=$SQL_COUNT_RESULT
     TOTAL_STALE_WISPS=$((TOTAL_STALE_WISPS + stale_wisp_count))
@@ -794,14 +798,14 @@ reap_scope() {
     run_budget_exhausted && return 0
 
     # Step 5: auto-close stale issues (exclude P0/P1, epics, durable extmsg
-    # records, TTL-stamped beads and beads with an active dependency in either
-    # direction). Only the city scope's issues are auto-closed; stale rig
+    # records, TTL-stamped beads, operator directives and beads with an active
+    # dependency in either direction). A dry run lists each row it would close. Only the city scope's issues are auto-closed; stale rig
     # issues are counted as skipped.
     if get_sql_rows "stale issue" "
         SELECT id, CASE WHEN COALESCE(assignee, '') = '' THEN 'bare' ELSE 'force' END
         FROM \`$DB\`.issues
         WHERE status IN ('open', 'in_progress')
-        AND updated_at < DATE_SUB(NOW(), INTERVAL $STALE_AGE_H HOUR)
+        AND updated_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL $STALE_AGE_H HOUR)
         AND priority > 1
         AND issue_type != 'epic'
         AND (
@@ -831,12 +835,22 @@ reap_scope() {
             WHERE i.status IN ('open', 'in_progress')
             AND d.depends_on_issue_id IS NOT NULL
         )
+        -- A directive stays binding because its trigger is rare, so age alone must never close it.
+        -- NOT EXISTS, not a second NOT IN: Dolt 2.2.4 then drops the NOT from the dependency guard above.
+        AND NOT EXISTS (SELECT 1 FROM \`$DB\`.labels od WHERE od.issue_id = issues.id AND od.label = 'operator-directive')
     "; then
         rows=$SQL_ROWS_RESULT
         count=$(count_lines "$rows")
-        if [ "$count" -gt 0 ] && [ -z "$DRY_RUN" ]; then
+        if [ "$count" -gt 0 ]; then
             if [ "$SCOPE_KIND" != "city" ]; then
                 TOTAL_STALE_ISSUES_SKIPPED=$((TOTAL_STALE_ISSUES_SKIPPED + count))
+            elif [ -n "$DRY_RUN" ]; then
+                # A dry run lists each city-store row it would close, with its close mode.
+                while IFS=, read -r issue_id close_mode; do
+                    [ -z "$issue_id" ] && continue
+                    printf 'reaper: would-close-stale %s %s %s\n' "$DB" "$issue_id" "$close_mode"
+                    TOTAL_WOULD_CLOSE_STALE=$((TOTAL_WOULD_CLOSE_STALE + 1))
+                done <<< "$rows"
             else
                 # close_mode comes from the query's per-row CASE: 'force' when
                 # the row carried a non-empty assignee at select time and
@@ -854,7 +868,7 @@ reap_scope() {
         SELECT COUNT(*) FROM \`$DB\`.wisps
         WHERE status IN ('open', 'hooked', 'in_progress')
         AND issue_type NOT IN ('message')
-        AND created_at < DATE_SUB(NOW(), INTERVAL $MAX_AGE_H HOUR)
+        AND created_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL $MAX_AGE_H HOUR)
     "; then
         if [ "$SQL_COUNT_RESULT" -gt "$ALERT_THRESHOLD" ]; then
             scope_anomaly "$SQL_COUNT_RESULT stale open wisps (threshold: $ALERT_THRESHOLD, age: ${MAX_AGE})"
@@ -1129,7 +1143,7 @@ if [ -n "$CITY_DB" ] && [ -d "$CITY_BEADS_DIR" ]; then
                 SELECT COUNT(*) FROM \`$CITY_DB\`.issues
                 WHERE id LIKE '$_TYPE_GUARD_LIKE'
                 AND status = 'closed'
-                AND closed_at < DATE_SUB(NOW(), INTERVAL $_TYPE_GUARD_AGE_H HOUR)
+                AND closed_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL $_TYPE_GUARD_AGE_H HOUR)
                 AND issue_type != 'session'
             "; then
                 record_anomaly "$SESSION_PRUNE_ANOMALY_SCOPE" "bulk prune skipped: type-scope guard count could not be computed (type scope guard); set GC_REAPER_SESSION_BEAD_PATTERN=\"\" to use the type-safe session-only path"
@@ -1175,13 +1189,13 @@ if [ -n "$CITY_DB" ] && [ -d "$CITY_BEADS_DIR" ]; then
         SESSION_AGE_H=$(printf '%s' "$SESSION_PURGE_AGE" | sed 's/h$//')
         case "$SESSION_AGE_H" in ''|*[!0-9]*) SESSION_AGE_H=720 ;; esac
         if [ -n "$DRY_RUN" ]; then
-            if get_sql_count "type-safe session prune" "SELECT COUNT(*) FROM \`$CITY_DB\`.issues WHERE issue_type='session' AND status='closed' AND closed_at < DATE_SUB(NOW(), INTERVAL ${SESSION_AGE_H} HOUR)"; then
+            if get_sql_count "type-safe session prune" "SELECT COUNT(*) FROM \`$CITY_DB\`.issues WHERE issue_type='session' AND status='closed' AND closed_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ${SESSION_AGE_H} HOUR)"; then
                 TOTAL_SESSIONS_PRUNED=$SQL_COUNT_RESULT
             fi
         else
             TOTAL=0
             while true; do
-                get_sql_rows "type-safe session prune" "SELECT id FROM \`$CITY_DB\`.issues WHERE issue_type='session' AND status='closed' AND closed_at < DATE_SUB(NOW(), INTERVAL ${SESSION_AGE_H} HOUR) LIMIT 500" || break
+                get_sql_rows "type-safe session prune" "SELECT id FROM \`$CITY_DB\`.issues WHERE issue_type='session' AND status='closed' AND closed_at < DATE_SUB(UTC_TIMESTAMP(), INTERVAL ${SESSION_AGE_H} HOUR) LIMIT 500" || break
                 BATCH_COUNT=$(count_lines "$SQL_ROWS_RESULT")
                 [ "$BATCH_COUNT" -gt 0 ] || break
                 run_budget_exhausted && break
@@ -1243,7 +1257,7 @@ fi
 
 SUMMARY="reaper — scopes:$TOTAL_SCOPES, stale_wisps:$TOTAL_STALE_WISPS, closed_wisps:$TOTAL_CLOSED_WISPS, held_wisps:$TOTAL_HELD_WISPS, workflow_roots:$TOTAL_WORKFLOW_ROOTS_CLOSED, skipped_cross_store_workflow_roots:$TOTAL_WORKFLOW_ROOTS_STORE_REF_SKIPPED, skipped_non_city_workflow_issue_roots:$TOTAL_WORKFLOW_ISSUE_ROOTS_SKIPPED, purged:$TOTAL_PURGED, sessions-pruned:$TOTAL_SESSIONS_PRUNED, closed:$TOTAL_ISSUES_CLOSED, expired:$TOTAL_EXPIRED_ISSUES_CLOSED, expired_skipped:$TOTAL_EXPIRED_ISSUES_SKIPPED, skipped_non_city_issues:$TOTAL_STALE_ISSUES_SKIPPED, mail_wisps:$TOTAL_MAIL_WISPS"
 if [ -n "$DRY_RUN" ]; then
-    SUMMARY="$SUMMARY, would_close_wisps:$TOTAL_WOULD_CLOSE_WISPS, would_close_workflow_roots:$TOTAL_WOULD_CLOSE_WORKFLOW_ROOTS, would_purge:$TOTAL_WOULD_PURGE, would_expire:$TOTAL_WOULD_EXPIRE (dry run)"
+    SUMMARY="$SUMMARY, would_close_wisps:$TOTAL_WOULD_CLOSE_WISPS, would_close_workflow_roots:$TOTAL_WOULD_CLOSE_WORKFLOW_ROOTS, would_purge:$TOTAL_WOULD_PURGE, would_expire:$TOTAL_WOULD_EXPIRE, would_close_stale:$TOTAL_WOULD_CLOSE_STALE (dry run)"
 fi
 
 maintenance_done "$SUMMARY"
