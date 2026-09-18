@@ -1565,11 +1565,11 @@ func (s *BdStore) ReleaseIfCurrent(id, expectedAssignee string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("bd release-if-current: minting revision: %w", err)
 	}
-	legacyQuery := "UPDATE issues SET status = 'open', assignee = '', updated_at = CURRENT_TIMESTAMP" +
+	legacyQuery := "UPDATE issues SET status = 'open', assignee = '', updated_at = UTC_TIMESTAMP()" +
 		" WHERE id = " + bdSQLStringLiteral(id) +
 		" AND status = 'in_progress'" +
 		" AND assignee = " + bdSQLStringLiteral(expectedAssignee)
-	query := "UPDATE issues SET status = 'open', assignee = '', updated_at = CURRENT_TIMESTAMP, revision = " +
+	query := "UPDATE issues SET status = 'open', assignee = '', updated_at = UTC_TIMESTAMP(), revision = " +
 		strconv.FormatInt(revision, 10) +
 		" WHERE id = " + bdSQLStringLiteral(id) +
 		" AND status = 'in_progress'" +
@@ -1610,12 +1610,12 @@ func (s *BdStore) releaseIfCurrentViaEmbeddedDoltSQL(id, expectedAssignee string
 	if !ok {
 		return false, fmt.Errorf("bd release-if-current embedded fallback: %w", ErrConditionalReleaseUnsupported)
 	}
-	legacyQuery := "UPDATE issues SET status = 'open', assignee = '', updated_at = CURRENT_TIMESTAMP" +
+	legacyQuery := "UPDATE issues SET status = 'open', assignee = '', updated_at = UTC_TIMESTAMP()" +
 		" WHERE id = " + bdSQLStringLiteral(id) +
 		" AND status = 'in_progress'" +
 		" AND assignee = " + bdSQLStringLiteral(expectedAssignee) +
 		"; SELECT ROW_COUNT() AS rows_affected"
-	query := "UPDATE issues SET status = 'open', assignee = '', updated_at = CURRENT_TIMESTAMP, revision = " +
+	query := "UPDATE issues SET status = 'open', assignee = '', updated_at = UTC_TIMESTAMP(), revision = " +
 		strconv.FormatInt(revision, 10) +
 		" WHERE id = " + bdSQLStringLiteral(id) +
 		" AND status = 'in_progress'" +

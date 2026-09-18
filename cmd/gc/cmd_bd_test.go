@@ -2872,7 +2872,7 @@ prefix = "fe"
 	// The release mints a fresh revision so the pre-release token is stale, so
 	// the token itself is not pinnable — everything around it is.
 	gotQuery := strings.TrimSpace(string(query))
-	wantQuery := regexp.MustCompile(`^UPDATE issues SET status = 'open', assignee = '', updated_at = CURRENT_TIMESTAMP, revision = -?\d+ WHERE id = 'fe-abc' AND status = 'in_progress' AND assignee = 'worker-1'$`)
+	wantQuery := regexp.MustCompile(`^UPDATE issues SET status = 'open', assignee = '', updated_at = UTC_TIMESTAMP\(\), revision = -?\d+ WHERE id = 'fe-abc' AND status = 'in_progress' AND assignee = 'worker-1'$`)
 	if !wantQuery.MatchString(gotQuery) {
 		t.Fatalf("SQL query = %q, want match for %s", gotQuery, wantQuery)
 	}
