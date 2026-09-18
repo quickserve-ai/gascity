@@ -1033,7 +1033,7 @@ func ComputeFormulaLayers(cityTopoFormulas []string, cityLocalFormulas string, r
 			layers = append(layers, fds...)
 		}
 		if r.FormulasDir != "" {
-			rigLocalDir := resolveConfigPath(r.FormulasDir, cityRoot, cityRoot)
+			rigLocalDir := ResolveRigFormulasDir(r.FormulasDir, cityRoot)
 			layers = append(layers, rigLocalDir)
 		}
 		if len(layers) > 0 {
@@ -3259,4 +3259,12 @@ func LoadPackCommandEntries(fs fsys.FS, packDirs []string) []PackCommandInfo {
 	}
 
 	return result
+}
+
+// ResolveRigFormulasDir resolves a rig's formulas_dir exactly as its formula
+// layer is built: a "//" prefix is the city root and any other relative path
+// resolves against the city root. Anything that must recognize the rig's
+// formulas directory has to use this, or a "//" path lands outside the city.
+func ResolveRigFormulasDir(formulasDir, cityRoot string) string {
+	return resolveConfigPath(formulasDir, cityRoot, cityRoot)
 }
