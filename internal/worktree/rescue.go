@@ -70,6 +70,10 @@ type RescueSpec struct {
 	// SkillSinks lists sink directories (".claude/skills") whose
 	// manifest-recorded symlinks are gc's own and are left out of the rescue.
 	SkillSinks []string
+	// AbsentOK makes a Path that does not exist (ENOENT, and nothing else) a
+	// success reported as Absent, so a caller can tell "already gone" from
+	// "could not look" without a shell test that conflates the two.
+	AbsentOK bool
 }
 
 // RescueReport describes where a worktree's work was secured. RescueSHA is the
@@ -92,6 +96,17 @@ type RescueReport struct {
 	// plaintext was already on this disk; whatever later moves rescues off
 	// the box must not push a tainted one.
 	Taint []string `json:"taint,omitempty"`
+	// IndexUnmerged reports an index with conflicts. Its stages are not
+	// recorded; the conflicted working content is, and the in-progress
+	// operation's heads are kept as parents.
+	IndexUnmerged bool `json:"index_unmerged,omitempty"`
+	// PrivateCommits lists the commits only the worktree's private state
+	// reached (reflog, in-progress operations, per-worktree refs, submodule
+	// HEADs), kept reachable through an anchor parent of the rescue commit.
+	PrivateCommits []string `json:"private_commits,omitempty"`
+	// Absent reports, under AbsentOK, that Path does not exist. Nothing
+	// else in the report is set.
+	Absent bool `json:"absent,omitempty"`
 }
 
 // TeardownSpec names a worktree to remove once its current state is secured
@@ -123,6 +138,14 @@ type TeardownReport struct {
 // commit and ref. It never overwrites a rescue it does not descend from; a
 // divergent rescue is written beside the existing one.
 func Rescue(spec RescueSpec) (RescueReport, error) {
+	if spec.AbsentOK {
+		if err := validateRescueSpec(spec); err != nil {
+			return RescueReport{}, err
+		}
+		if _, err := os.Lstat(spec.Path); errors.Is(err, os.ErrNotExist) {
+			return RescueReport{Path: spec.Path, BeadID: spec.BeadID, Absent: true}, nil
+		}
+	}
 	common, err := validateRescueTarget(spec)
 	if err != nil {
 		return RescueReport{}, err
@@ -144,6 +167,14 @@ func Rescue(spec RescueSpec) (RescueReport, error) {
 // Removal refuses anything that is not a registered linked worktree: a main
 // checkout, a submodule, and an unregistered directory all fail before any
 // deletion.
+//
+// RESIDUAL, stated so nobody reads more into the check than it gives: the
+// final rescue and the removal are separate steps, and the path lock excludes
+// only other gc worktree operations, not editors, builds or background
+// processes. A write that lands after the final snapshot is removed with the
+// tree. Formula teardown runs after the body scope is terminal, from the
+// session that owned the work, which keeps that window small but does not
+// close it (ga-w805wc follow-up).
 func Teardown(spec TeardownSpec) (TeardownReport, error) {
 	var report TeardownReport
 	if strings.TrimSpace(spec.RescueSHA) == "" {
@@ -181,15 +212,25 @@ func Teardown(spec TeardownSpec) (TeardownReport, error) {
 	return report, nil
 }
 
-// validateRescueTarget checks the spec and proves spec.Path is the root of a
-// registered linked worktree, returning the repository's common git dir.
-func validateRescueTarget(spec RescueSpec) (string, error) {
+func validateRescueSpec(spec RescueSpec) error {
 	if !filepath.IsAbs(spec.Path) {
-		return "", fmt.Errorf("worktree path %q must be absolute", spec.Path)
+		return fmt.Errorf("worktree path %q must be absolute", spec.Path)
 	}
 	if !validRescueBeadID.MatchString(spec.BeadID) || strings.Contains(spec.BeadID, "..") ||
 		strings.HasSuffix(spec.BeadID, ".lock") || strings.HasSuffix(spec.BeadID, ".") {
-		return "", fmt.Errorf("bead id %q cannot name a rescue ref", spec.BeadID)
+		return fmt.Errorf("bead id %q cannot name a rescue ref", spec.BeadID)
+	}
+	return nil
+}
+
+// validateRescueTarget checks the spec and proves spec.Path is the root of a
+// registered linked worktree, returning the repository's common git dir.
+func validateRescueTarget(spec RescueSpec) (string, error) {
+	if err := validateRescueSpec(spec); err != nil {
+		return "", err
+	}
+	if info, err := os.Lstat(spec.Path); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("%q is a symlink; pass the worktree's real path", spec.Path)
 	}
 	if err := requireLinkedWorktree(spec.Path); err != nil {
 		return "", err
@@ -269,14 +310,27 @@ func rescueLocked(spec RescueSpec, common string) (RescueReport, error) {
 	}
 	report.Head = head
 
+	// A submodule's repository lives in this worktree's PRIVATE admin dir
+	// (.git/worktrees/<name>/modules/) and dies with it. Its commits are
+	// imported below; its uncommitted work cannot be, so refuse that.
+	if err := requireSubmodulesSecured(wt, ""); err != nil {
+		return report, err
+	}
+	if err := requireNoNestedWorktrees(wt); err != nil {
+		return report, err
+	}
+
 	sediment, err := classifySediment(spec)
 	if err != nil {
 		return report, fmt.Errorf("classifying gc sediment (failing closed): %w", err)
 	}
 	report.Sediment = sediment
 
-	tree, err := snapshotWorkTree(wt, head, sediment)
+	snap, err := snapshotWorkTree(wt, head, sediment)
 	if err != nil {
+		return report, err
+	}
+	if err := requireNoNestedRepos(wt, snap.tree); err != nil {
 		return report, err
 	}
 	baseTree := emptyTreeFor(wt)
@@ -286,22 +340,51 @@ func rescueLocked(spec RescueSpec, common string) (RescueReport, error) {
 			return report, err
 		}
 	}
-	if tree != baseTree {
-		taint, err := taintedPaths(wt, baseTree, tree)
+	if snap.tree != baseTree {
+		taint, err := taintedPaths(wt, baseTree, snap.tree)
 		if err != nil {
 			return report, err
 		}
 		report.Taint = taint
 	}
 
+	// Parents beyond HEAD keep reachable what the worktree holds nowhere
+	// else: the index when it differs from both HEAD and the working state
+	// (staged-only content), and an anchor over every commit that only this
+	// worktree's private state reaches.
+	var extra []string
+	if snap.indexTree != "" && snap.indexTree != baseTree && snap.indexTree != snap.tree {
+		indexCommit, err := commitIndex(wt, spec.BeadID, head, snap.indexTree)
+		if err != nil {
+			return report, err
+		}
+		extra = append(extra, indexCommit)
+	}
+	tips, err := privateRootTips(wt, common, head, RescueRefPrefix+spec.BeadID)
+	if err != nil {
+		return report, fmt.Errorf("collecting commits private to the worktree (failing closed): %w", err)
+	}
+	if len(tips) > 0 {
+		anchor, err := commitAnchor(wt, spec.BeadID, head, tips)
+		if err != nil {
+			return report, err
+		}
+		extra = append(extra, anchor)
+		report.PrivateCommits = tips
+	}
+	report.IndexUnmerged = snap.unmerged
+
 	base := RescueRefPrefix + spec.BeadID
 	var candidate string
-	switch {
-	case head != "" && tree == baseTree:
+	if head != "" && snap.tree == baseTree && len(extra) == 0 {
 		candidate = head
-	default:
+	} else {
 		report.WIP = true
-		reused, reuseRef, err := findReusableRescue(wt, base, head, tree)
+		parents := extra
+		if head != "" {
+			parents = append([]string{head}, extra...)
+		}
+		reused, reuseRef, err := findReusableRescue(wt, base, parents, snap.tree)
 		if err != nil {
 			return report, err
 		}
@@ -309,7 +392,7 @@ func rescueLocked(spec RescueSpec, common string) (RescueReport, error) {
 			report.RescueSHA, report.RescueRef = reused, reuseRef
 			return report, verifyFromCommonDir(common, report.RescueRef, report.RescueSHA)
 		}
-		candidate, err = commitSnapshot(wt, spec.BeadID, head, tree, report.Taint)
+		candidate, err = commitSnapshot(wt, spec.BeadID, parents, snap.tree, report.Taint)
 		if err != nil {
 			return report, err
 		}
@@ -321,6 +404,288 @@ func rescueLocked(spec RescueSpec, common string) (RescueReport, error) {
 	}
 	report.RescueSHA, report.RescueRef = candidate, ref
 	return report, verifyFromCommonDir(common, ref, candidate)
+}
+
+// requireSubmodulesSecured refuses a worktree holding a populated submodule
+// with uncommitted or untracked changes, which a rescue cannot carry (its
+// commits it can: importSubmoduleHeads). It recurses into nested submodules.
+func requireSubmodulesSecured(dir, prefix string) error {
+	out, err := gitOutput(dir, nil, "ls-files", "--stage", "-z")
+	if err != nil {
+		return err
+	}
+	for _, rec := range strings.Split(out, "\x00") {
+		meta, p, ok := strings.Cut(rec, "\t")
+		if !ok || !strings.HasPrefix(meta, "160000 ") {
+			continue
+		}
+		sub := filepath.Join(dir, filepath.FromSlash(p))
+		name := prefix + p
+		if _, err := os.Lstat(filepath.Join(sub, ".git")); errors.Is(err, os.ErrNotExist) {
+			continue // not populated: nothing of it is on disk
+		} else if err != nil {
+			return fmt.Errorf("inspecting submodule %s: %w", name, err)
+		}
+		status, err := gitOutput(sub, nil, "status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")
+		if err != nil {
+			return fmt.Errorf("checking submodule %s: %w", name, err)
+		}
+		if strings.TrimSpace(status) != "" {
+			return fmt.Errorf("submodule %s has uncommitted or untracked changes; a rescue records only its gitlink and its repository is removed with the worktree, so commit and push them first", name)
+		}
+		if err := requireSubmodulesSecured(sub, name+"/"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// perWorktreeRefDirs are the ref namespaces private to one worktree.
+var perWorktreeRefDirs = []string{"refs/worktree/", "refs/bisect/", "refs/rewritten/"}
+
+// privateRootTips returns the minimal set of commits that keep reachable
+// everything ONLY this worktree's private state reaches: its HEAD reflog, the
+// pseudo-refs and state files of an in-progress merge, cherry-pick, revert,
+// rebase or bisect, its per-worktree refs and their reflogs, and the HEADs of
+// its populated submodules (whose repositories live in its admin dir and are
+// imported into the shared object store first). Removal deletes all of it,
+// and git counts none of it as reachable once the registration is gone.
+//
+// A commit already reachable from a DURABLE local ref (a branch, a tag, a
+// rescue) is left out; HEAD is left out because the rescue commit's first
+// parent is HEAD. Remote-tracking refs do not count: they are the fetch
+// cache, and `fetch --prune` drops them when the remote branch goes. A commit
+// also reachable elsewhere is merely anchored twice, which costs nothing.
+func privateRootTips(wt, common, head, base string) ([]string, error) {
+	gitDir, err := gitTrimmed(wt, nil, "rev-parse", "--path-format=absolute", "--git-dir")
+	if err != nil {
+		return nil, err
+	}
+	var cands []string
+	add := func(rev string) error {
+		sha, err := resolveRef(wt, rev)
+		if err != nil {
+			return err
+		}
+		if sha != "" {
+			cands = append(cands, sha)
+		}
+		return nil
+	}
+	for _, name := range []string{"ORIG_HEAD", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD", "BISECT_HEAD"} {
+		if err := add(name); err != nil {
+			return nil, err
+		}
+	}
+	for _, file := range []string{"rebase-merge/orig-head", "rebase-merge/stopped-sha", "rebase-apply/orig-head"} {
+		data, err := os.ReadFile(filepath.Join(gitDir, filepath.FromSlash(file)))
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if rev := strings.TrimSpace(string(data)); rev != "" {
+			if err := add(rev); err != nil {
+				return nil, err
+			}
+		}
+	}
+	refs, err := gitOutput(wt, nil, append([]string{"for-each-ref", "--format=%(refname)"}, perWorktreeRefDirs...)...)
+	if err != nil {
+		return nil, err
+	}
+	logged := []string{"HEAD"}
+	for _, ref := range strings.Fields(refs) {
+		if err := add(ref); err != nil {
+			return nil, err
+		}
+		logged = append(logged, ref)
+	}
+	for _, ref := range logged {
+		if _, err := gitOutput(wt, nil, "reflog", "exists", ref); err != nil {
+			continue // no reflog for this ref
+		}
+		out, err := gitOutput(wt, nil, "reflog", "show", "--format=%H", ref, "--")
+		if err != nil {
+			return nil, err
+		}
+		cands = append(cands, strings.Fields(out)...)
+	}
+	subHeads, err := importSubmoduleHeads(wt, common)
+	if err != nil {
+		return nil, err
+	}
+	cands = append(cands, subHeads...)
+	return privateTipsOf(wt, head, base, cands)
+}
+
+// privateTipsOf reduces candidates to the independent tips of those not
+// reachable from HEAD (the rescue's first parent) or a durable local ref,
+// sorted so the anchor built on them is stable.
+//
+// This bead's OWN rescue refs do not count as durable. They exist because an
+// earlier rescue anchored these very commits; counting them would make the
+// next rescue of an unchanged worktree drop the anchor, mint a different
+// commit, and fail teardown's equality check forever.
+func privateTipsOf(wt, head, base string, cands []string) ([]string, error) {
+	seen := map[string]bool{}
+	var uniq []string
+	for _, c := range cands {
+		if c != "" && c != head && !seen[c] {
+			seen[c] = true
+			uniq = append(uniq, c)
+		}
+	}
+	if len(uniq) == 0 {
+		return nil, nil
+	}
+	// --stdin FIRST: a --not given before it would negate the stdin revisions.
+	args := []string{"rev-list", "--stdin", "--not", "--branches", "--tags"}
+	if head != "" {
+		args = append(args, head)
+	}
+	args = append(args, "--exclude="+base, "--exclude="+base+"-*", "--glob=refs/rescue/*")
+	out, err := gitOutputStdin(wt, nil, strings.Join(uniq, "\n")+"\n", args...)
+	if err != nil {
+		return nil, err
+	}
+	private := map[string]bool{}
+	for _, sha := range strings.Fields(out) {
+		private[sha] = true
+	}
+	var roots []string
+	for _, c := range uniq {
+		if private[c] {
+			roots = append(roots, c)
+		}
+	}
+	if len(roots) == 0 {
+		return nil, nil
+	}
+	if len(roots) > 1 {
+		out, err = gitOutput(wt, nil, append([]string{"merge-base", "--independent"}, roots...)...)
+		if err != nil {
+			return nil, err
+		}
+		roots = strings.Fields(out)
+	}
+	sort.Strings(roots)
+	return roots, nil
+}
+
+// importSubmoduleHeads copies each populated submodule's HEAD commit, with
+// its history, into the shared object store and returns the commits. The
+// submodule's own repository lives in this worktree's admin dir and goes
+// with it; importing is what lets the anchor keep its commits reachable
+// without trusting the submodule's remote-tracking cache.
+func importSubmoduleHeads(dir, common string) ([]string, error) {
+	out, err := gitOutput(dir, nil, "ls-files", "--stage", "-z")
+	if err != nil {
+		return nil, err
+	}
+	var heads []string
+	for _, rec := range strings.Split(out, "\x00") {
+		meta, p, ok := strings.Cut(rec, "\t")
+		if !ok || !strings.HasPrefix(meta, "160000 ") {
+			continue
+		}
+		sub := filepath.Join(dir, filepath.FromSlash(p))
+		if _, err := os.Lstat(filepath.Join(sub, ".git")); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return nil, err
+		}
+		head, err := resolveHead(sub)
+		if err != nil {
+			return nil, err
+		}
+		if head == "" {
+			continue
+		}
+		if _, err := gitOutput(common, nil, "--git-dir="+common, "fetch", "--quiet", "--no-tags",
+			"--no-write-fetch-head", "--no-recurse-submodules", sub, head); err != nil {
+			return nil, fmt.Errorf("importing submodule %s commits: %w", p, err)
+		}
+		heads = append(heads, head)
+		nested, err := importSubmoduleHeads(sub, common)
+		if err != nil {
+			return nil, err
+		}
+		heads = append(heads, nested...)
+	}
+	return heads, nil
+}
+
+// commitAnchor records the private tips as the parents of an empty-tree
+// commit dated like HEAD, so the same tips always yield the same anchor.
+func commitAnchor(wt, beadID, head string, tips []string) (string, error) {
+	date, err := headDate(wt, head)
+	if err != nil {
+		return "", err
+	}
+	msg := fmt.Sprintf("rescue(%s): commits only this worktree's private state reached\n", beadID)
+	return commitTree(wt, emptyTreeFor(wt), tips, msg, []string{"GIT_AUTHOR_DATE=" + date, "GIT_COMMITTER_DATE=" + date})
+}
+
+func headDate(wt, head string) (string, error) {
+	if head == "" {
+		return "1 +0000", nil
+	}
+	ts, err := gitTrimmed(wt, nil, "log", "-1", "--format=%ct", head)
+	if err != nil {
+		return "", err
+	}
+	return ts + " +0000", nil
+}
+
+// requireNoNestedWorktrees refuses when another registered worktree lives
+// beneath this one: removing this tree would delete it.
+func requireNoNestedWorktrees(wt string) error {
+	entries, err := git.New(wt).WorktreeList()
+	if err != nil {
+		return fmt.Errorf("listing registered worktrees: %w", err)
+	}
+	self, err := canonicalPathAllowMissing(wt)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		other, err := canonicalPathAllowMissing(e.Path)
+		if err != nil {
+			return fmt.Errorf("canonicalizing registered worktree %q: %w", e.Path, err)
+		}
+		if strings.HasPrefix(other, self+string(filepath.Separator)) {
+			return fmt.Errorf("registered worktree %s is nested inside %s; removing this worktree would delete it", e.Path, wt)
+		}
+	}
+	return nil
+}
+
+// requireNoNestedRepos refuses when the snapshot holds a gitlink the index
+// does not: an untracked directory with its own .git (a nested clone or
+// worktree), whose contents `git add` records only as a pointer.
+func requireNoNestedRepos(wt, tree string) error {
+	idx, err := gitOutput(wt, nil, "ls-files", "--stage", "-z")
+	if err != nil {
+		return err
+	}
+	known := map[string]bool{}
+	for _, rec := range strings.Split(idx, "\x00") {
+		if meta, p, ok := strings.Cut(rec, "\t"); ok && strings.HasPrefix(meta, "160000 ") {
+			known[p] = true
+		}
+	}
+	out, err := gitOutput(wt, nil, "ls-tree", "-r", "-z", tree)
+	if err != nil {
+		return err
+	}
+	for _, rec := range strings.Split(out, "\x00") {
+		if meta, p, ok := strings.Cut(rec, "\t"); ok && strings.HasPrefix(meta, "160000 ") && !known[p] {
+			return fmt.Errorf("%s holds its own git repository; a rescue records only a pointer to it and removal would delete it, so move or push it first", p)
+		}
+	}
+	return nil
 }
 
 // resolveHead returns HEAD's commit, or "" for an unborn HEAD.
@@ -436,7 +801,18 @@ func classifySediment(spec RescueSpec) ([]string, error) {
 			if err != nil {
 				return nil, err
 			}
-			if _, owned := targets[rest]; owned {
+			recorded, named := targets[rest]
+			if !named {
+				continue
+			}
+			// The name alone is not proof: a link someone repointed after
+			// the materializer recorded it is theirs. Compare the target the
+			// way the materializer records it (absolute, normalized).
+			link, err := os.Readlink(full)
+			if err != nil {
+				return nil, fmt.Errorf("reading symlink %s: %w", p, err)
+			}
+			if filepath.IsAbs(link) && pathutil.NormalizePathForCompare(link) == recorded {
 				sediment = append(sediment, p)
 			}
 			continue
@@ -490,21 +866,37 @@ func sameFileContent(a, b string) (bool, error) {
 	return bytes.Equal(aData, bData), nil
 }
 
-// snapshotWorkTree writes the worktree's full state, minus sediment, as a tree
-// object. It stages into a temporary COPY of the worktree's index, beside the
-// real one so a split index still resolves, and leaves the real index alone.
-// Starting from the index git itself uses keeps its skip-worktree bits and
-// staged state. (A sparse checkout's absent paths are not recorded as
-// deletions either way on current git, whose `add` refuses paths outside the
-// sparse definition; a test pins that outcome, not this mechanism.)
-func snapshotWorkTree(wt, head string, sediment []string) (string, error) {
+// workSnapshot is a worktree's state as tree objects.
+type workSnapshot struct {
+	// tree is the full working state, minus sediment.
+	tree string
+	// indexTree is the index exactly as git held it, or "" when it has
+	// unmerged entries (the conflicted content is in tree, and the operation's
+	// heads are kept as parents).
+	indexTree string
+	unmerged  bool
+}
+
+// snapshotWorkTree writes the worktree's state as tree objects. It stages into
+// a temporary COPY of the worktree's index, beside the real one so a split
+// index still resolves, and leaves the real index alone.
+//
+// Before staging it records the index as-is: content that is staged but no
+// longer in the working tree exists nowhere else. It then clears the two
+// index bits that make `git add` skip real edits (assume-unchanged on any
+// path; skip-worktree on a path that is present on disk) and stages with
+// --sparse, so an edited file outside a sparse-checkout definition is kept
+// while an absent one is not recorded as deleted. fsmonitor is bypassed so a
+// stale daemon cannot hide a change.
+func snapshotWorkTree(wt, head string, sediment []string) (workSnapshot, error) {
+	var snap workSnapshot
 	indexPath, err := gitTrimmed(wt, nil, "rev-parse", "--path-format=absolute", "--git-path", "index")
 	if err != nil {
-		return "", err
+		return snap, err
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(indexPath), "gc-rescue-index-*")
 	if err != nil {
-		return "", fmt.Errorf("creating temporary index: %w", err)
+		return snap, fmt.Errorf("creating temporary index: %w", err)
 	}
 	tmpPath := tmp.Name()
 	defer os.Remove(tmpPath) //nolint:errcheck // best-effort temp cleanup
@@ -519,37 +911,88 @@ func snapshotWorkTree(wt, head string, sediment []string) (string, error) {
 			copyErr = closeErr
 		}
 		if copyErr != nil {
-			return "", fmt.Errorf("copying index: %w", copyErr)
+			return snap, fmt.Errorf("copying index: %w", copyErr)
 		}
 	case errors.Is(err, os.ErrNotExist):
 		_ = tmp.Close()
 		// An empty file is not a valid index; git creates a fresh one only
 		// when the path does not exist.
 		if err := os.Remove(tmpPath); err != nil {
-			return "", fmt.Errorf("preparing temporary index: %w", err)
+			return snap, fmt.Errorf("preparing temporary index: %w", err)
 		}
 		if head != "" {
 			if _, err := gitOutput(wt, env, "read-tree", head); err != nil {
-				return "", err
+				return snap, err
 			}
 		}
 	default:
 		_ = tmp.Close()
-		return "", fmt.Errorf("opening index: %w", err)
+		return snap, fmt.Errorf("opening index: %w", err)
 	}
 
-	if _, err := gitOutput(wt, env, "add", "-A", "--", "."); err != nil {
-		return "", err
+	unmerged, err := gitOutput(wt, env, "ls-files", "--unmerged")
+	if err != nil {
+		return snap, err
+	}
+	if strings.TrimSpace(unmerged) != "" {
+		snap.unmerged = true
+	} else if snap.indexTree, err = gitTrimmed(wt, env, "write-tree"); err != nil {
+		return snap, err
+	}
+
+	if err := clearSkipBits(wt, env); err != nil {
+		return snap, err
+	}
+	if _, err := gitOutput(wt, env, "-c", "core.fsmonitor=false", "add", "-A", "--sparse", "--", "."); err != nil {
+		return snap, err
 	}
 	if len(sediment) > 0 {
 		unstage := append([]string{"GIT_LITERAL_PATHSPECS=1"}, env...)
 		list := strings.Join(sediment, "\x00") + "\x00"
 		if _, err := gitOutputStdin(wt, unstage, list,
 			"rm", "--cached", "-q", "--ignore-unmatch", "-r", "--pathspec-from-file=-", "--pathspec-file-nul"); err != nil {
-			return "", err
+			return snap, err
 		}
 	}
-	return gitTrimmed(wt, env, "write-tree")
+	snap.tree, err = gitTrimmed(wt, env, "write-tree")
+	return snap, err
+}
+
+// clearSkipBits clears, in the index env names, the assume-unchanged bit on
+// every entry and the skip-worktree bit on every entry whose file is present,
+// so `git add` compares their content instead of trusting the index.
+func clearSkipBits(wt string, env []string) error {
+	out, err := gitOutput(wt, env, "ls-files", "-v", "-z")
+	if err != nil {
+		return err
+	}
+	var assumed, skipped []string
+	for _, rec := range strings.Split(out, "\x00") {
+		if len(rec) < 3 {
+			continue
+		}
+		tag, p := rec[0], rec[2:]
+		if tag >= 'a' && tag <= 'z' {
+			assumed = append(assumed, p)
+		}
+		if tag == 'S' || tag == 's' {
+			if _, err := os.Lstat(filepath.Join(wt, filepath.FromSlash(p))); err == nil {
+				skipped = append(skipped, p)
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("inspecting %s: %w", p, err)
+			}
+		}
+	}
+	for flag, paths := range map[string][]string{"--no-assume-unchanged": assumed, "--no-skip-worktree": skipped} {
+		if len(paths) == 0 {
+			continue
+		}
+		list := strings.Join(paths, "\x00") + "\x00"
+		if _, err := gitOutputStdin(wt, env, list, "update-index", "-z", flag, "--stdin"); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // credentialNames matches file names that usually hold secrets.
@@ -572,39 +1015,67 @@ func taintedPaths(wt, fromTree, toTree string) ([]string, error) {
 }
 
 // findReusableRescue returns an existing rescue of exactly this state (same
-// tree, same parent) so a retry does not mint a second commit that differs
+// tree, same parents) so a retry does not mint a second commit that differs
 // only in its timestamp.
-func findReusableRescue(wt, base, head, tree string) (sha, ref string, err error) {
+func findReusableRescue(wt, base string, parents []string, tree string) (sha, ref string, err error) {
 	out, err := gitOutput(wt, nil, "for-each-ref", "--format=%(refname)%00%(objectname)%00%(tree)%00%(parent)", base, base+"-*")
 	if err != nil {
 		return "", "", err
 	}
+	want := strings.Join(parents, " ")
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		fields := strings.Split(line, "\x00")
-		if len(fields) != 4 {
-			continue
+		if len(fields) != 4 || !isOwnRescueRef(base, fields[0]) {
+			continue // the glob also matches bead <base>-x's refs
 		}
-		if fields[2] == tree && fields[3] == head {
+		if fields[2] == tree && fields[3] == want {
 			return fields[1], fields[0], nil
 		}
 	}
 	return "", "", nil
 }
 
-func commitSnapshot(wt, beadID, head, tree string, taint []string) (string, error) {
+// siblingSuffix matches the "-<sha12>" a divergent rescue ref carries.
+var siblingSuffix = regexp.MustCompile(`^-[0-9a-f]{12}$`)
+
+func isOwnRescueRef(base, ref string) bool {
+	return ref == base || (strings.HasPrefix(ref, base) && siblingSuffix.MatchString(ref[len(base):]))
+}
+
+func commitSnapshot(wt, beadID string, parents []string, tree string, taint []string) (string, error) {
 	msg := fmt.Sprintf("rescue(%s): work secured by gc worktree rescue before teardown\n\nRescue-Bead: %s\n", beadID, beadID)
 	if len(taint) > 0 {
 		msg += "Rescue-Taint: " + strings.Join(taint, ", ") + "\n"
 	}
-	args := []string{"commit-tree", tree, "-F", "-"}
-	if head != "" {
-		args = append(args, "-p", head)
+	return commitTree(wt, tree, parents, msg, nil)
+}
+
+// commitIndex records the index as a commit on HEAD. Its date is HEAD's, so
+// the same index always yields the same commit and a retry can reuse the
+// rescue that has it as a parent.
+func commitIndex(wt, beadID, head, tree string) (string, error) {
+	date, err := headDate(wt, head)
+	if err != nil {
+		return "", err
 	}
-	env := []string{
+	var parents []string
+	if head != "" {
+		parents = []string{head}
+	}
+	msg := fmt.Sprintf("rescue(%s): index as staged at teardown\n", beadID)
+	return commitTree(wt, tree, parents, msg, []string{"GIT_AUTHOR_DATE=" + date, "GIT_COMMITTER_DATE=" + date})
+}
+
+func commitTree(wt, tree string, parents []string, msg string, extraEnv []string) (string, error) {
+	args := []string{"-c", "commit.gpgSign=false", "commit-tree", tree, "-F", "-"}
+	for _, p := range parents {
+		args = append(args, "-p", p)
+	}
+	env := append([]string{
 		"GIT_AUTHOR_NAME=" + rescueIdentityName, "GIT_AUTHOR_EMAIL=" + rescueIdentityEmail,
 		"GIT_COMMITTER_NAME=" + rescueIdentityName, "GIT_COMMITTER_EMAIL=" + rescueIdentityEmail,
-	}
-	out, err := gitOutputStdin(wt, env, msg, append([]string{"-c", "commit.gpgSign=false"}, args...)...)
+	}, extraEnv...)
+	out, err := gitOutputStdin(wt, env, msg, args...)
 	if err != nil {
 		return "", err
 	}
@@ -686,10 +1157,28 @@ func verifyFromCommonDir(common, ref, sha string) error {
 }
 
 // removeLinkedWorktree removes a worktree its caller has already proven is a
-// registered linked worktree. The recursive delete is a fallback for trees git
-// refuses to remove (one containing submodules), and it re-proves the target
-// immediately before deleting.
+// registered linked worktree, and nothing else. It never runs a repo-wide
+// `git worktree prune`: another worktree's stale registration is still a
+// reachability root for git, and pruning it would finish off work lost to an
+// older teardown. The recursive delete is a fallback for trees git refuses to
+// remove (one containing submodules); it re-proves the target first and then
+// removes only THIS worktree's own admin directory.
 func removeLinkedWorktree(common, worktreePath string) error {
+	adminDir, err := gitTrimmed(worktreePath, nil, "rev-parse", "--path-format=absolute", "--git-dir")
+	if err != nil {
+		return err
+	}
+	worktreesDir := filepath.Join(common, "worktrees") + string(filepath.Separator)
+	if !strings.HasPrefix(adminDir, worktreesDir) {
+		if c, cerr := canonicalPathAllowMissing(adminDir); cerr == nil {
+			if w, werr := canonicalPathAllowMissing(filepath.Join(common, "worktrees")); werr == nil {
+				adminDir, worktreesDir = c, w+string(filepath.Separator)
+			}
+		}
+	}
+	if !strings.HasPrefix(adminDir, worktreesDir) || strings.Contains(strings.TrimPrefix(adminDir, worktreesDir), string(filepath.Separator)) {
+		return fmt.Errorf("admin dir %q of %q is not directly under %q; refusing to remove", adminDir, worktreePath, worktreesDir)
+	}
 	_, removeErr := gitOutput(common, nil, "worktree", "remove", "--force", "--force", worktreePath)
 	if removeErr != nil {
 		if err := requireLinkedWorktree(worktreePath); err != nil {
@@ -698,12 +1187,15 @@ func removeLinkedWorktree(common, worktreePath string) error {
 		if err := os.RemoveAll(worktreePath); err != nil {
 			return fmt.Errorf("git worktree remove failed (%w) and so did the recursive fallback: %w", removeErr, err)
 		}
-	}
-	if _, err := gitOutput(common, nil, "worktree", "prune"); err != nil {
-		return err
+		if err := os.RemoveAll(adminDir); err != nil {
+			return fmt.Errorf("removed %q but not its admin dir %q: %w", worktreePath, adminDir, err)
+		}
 	}
 	if _, err := os.Lstat(worktreePath); !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("worktree %q still exists after removal", worktreePath)
+	}
+	if _, err := os.Lstat(adminDir); !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("admin dir %q of removed worktree %q still exists", adminDir, worktreePath)
 	}
 	return nil
 }
