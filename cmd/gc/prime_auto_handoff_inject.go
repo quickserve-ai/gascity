@@ -148,16 +148,20 @@ func sessionStartAutoHandoffInjection(stderr io.Writer) (primeHookContextInjecti
 	}, ids
 }
 
-// Laurels v0 (ga-9obb1h): a seat may keep a short laurels.md in its home dir,
-// holding praise about its work that a PERSON originated (the operator, a
-// customer, a partner). SessionStart surfaces it with nothing attached: no task,
-// no bead, no priority. It is read here, at hook time, and never rendered into
-// the prompt template, so adding a laurel changes no prompt hash and never
-// drifts or restarts a seat. An absent or empty file injects nothing.
+// Laurels v0 (ga-9obb1h): a seat may keep a short laurels.md holding praise about
+// its work that a PERSON originated (the operator, a customer, a partner).
+// SessionStart surfaces it with nothing attached: no task, no bead, no priority.
+// It is read here, at hook time, and never rendered into the prompt template, so
+// adding a laurel changes no prompt hash and never drifts or restarts a seat. An
+// absent, empty or non-regular file injects nothing.
+//
+// Two homes, checked in order: $GC_DIR/seat/laurels.md, the upstream seat home
+// (gitignored as /seat/, #5776), then $GC_DIR/laurels.md, where a city seat whose
+// GC_DIR is its .gc/agents/<name> home keeps it.
 const (
 	laurelsFileName = "laurels.md"
 	// The spec bounds a seat's laurels at one paragraph; the cap keeps a file
-	// that outgrew it from taxing every boot.
+	// that outgrew it from taxing every boot, and bounds the read itself.
 	laurelsMaxBytes = 1200
 )
 
@@ -165,21 +169,45 @@ func primeLaurelsInjection(seatDir string) string {
 	if seatDir == "" {
 		return ""
 	}
-	data, err := os.ReadFile(filepath.Join(seatDir, laurelsFileName))
+	for _, path := range []string{
+		filepath.Join(seatDir, "seat", laurelsFileName),
+		filepath.Join(seatDir, laurelsFileName),
+	} {
+		if text := readLaurels(path); text != "" {
+			return "\n\n<laurels>\nRecognition from people this seat has worked for. It carries no task, no bead and no priority; nothing here asks you to do anything.\n\n" +
+				text + "\n</laurels>\n"
+		}
+	}
+	return ""
+}
+
+// readLaurels returns the trimmed, capped text of a REGULAR file, or "". The
+// regular-file check comes before the open, so a FIFO at the path cannot block
+// gc prime, and at most laurelsMaxBytes+1 bytes are ever read.
+func readLaurels(path string) string {
+	info, err := os.Lstat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return ""
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close() //nolint:errcheck // read-only
+	data, err := io.ReadAll(io.LimitReader(f, laurelsMaxBytes+1))
 	if err != nil {
 		return ""
 	}
 	text := strings.TrimSpace(string(data))
-	if text == "" {
-		return ""
-	}
-	if len(text) > laurelsMaxBytes {
-		cut := laurelsMaxBytes
+	if len(data) > laurelsMaxBytes {
+		cut := len(text)
+		if cut > laurelsMaxBytes {
+			cut = laurelsMaxBytes
+		}
 		for cut > 0 && !utf8.RuneStart(text[cut]) {
 			cut--
 		}
 		text = strings.TrimSpace(text[:cut]) + " [truncated]"
 	}
-	return "\n\n<laurels>\nRecognition from people this seat has worked for. It carries no task, no bead and no priority; nothing here asks you to do anything.\n\n" +
-		text + "\n</laurels>\n"
+	return text
 }

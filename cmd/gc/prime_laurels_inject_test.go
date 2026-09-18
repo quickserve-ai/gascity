@@ -53,6 +53,33 @@ func TestPrimeLaurelsInjectionCapsAtARuneBoundary(t *testing.T) {
 	}
 }
 
+func TestPrimeLaurelsInjectionReadsTheSeatHomeFirst(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "seat"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "seat", laurelsFileName), []byte("from the seat home"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, laurelsFileName), []byte("from the flat home"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := primeLaurelsInjection(dir); !strings.Contains(got, "from the seat home") || strings.Contains(got, "from the flat home") {
+		t.Fatalf("want seat/laurels.md to win: %q", got)
+	}
+}
+
+func TestPrimeLaurelsInjectionIgnoresANonRegularFile(t *testing.T) {
+	dir := t.TempDir()
+	// A directory stands in for any non-regular path (a FIFO would block a read).
+	if err := os.MkdirAll(filepath.Join(dir, laurelsFileName), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := primeLaurelsInjection(dir); got != "" {
+		t.Fatalf("non-regular laurels path: got %q, want nothing", got)
+	}
+}
+
 // The laurels ride SessionStart only: a UserPromptSubmit hook must not repeat
 // them on every turn.
 func TestPrimeHookContextSuffixCarriesLaurelsAtSessionStartOnly(t *testing.T) {
