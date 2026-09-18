@@ -408,6 +408,14 @@ type Info struct {
 	// SleepIntent is the RAW sleep_intent metadata. The sleep-intent branch reads
 	// it as != "" and == "idle-stop-pending".
 	SleepIntent string // sleep_intent (raw)
+	// LivenessReadDegraded is true when the session-liveness read overlay could
+	// not be applied to the read this Info was projected from
+	// (beadmeta.LivenessReadDegradedMetadataKey). Every liveness-backed field
+	// above — state, sleep_intent, held_until, wait_hold, sleep_reason — is then
+	// the committed metadata, which can be stale or absent, so an empty value
+	// does not mean "not set". Decisions that would act on such an absence defer.
+	// Read-side only; internal (absent from the HTTP wire).
+	LivenessReadDegraded bool
 	// InstanceToken is the RAW instance_token metadata. The wake path compares it
 	// against the live instance token to detect a superseded session.
 	InstanceToken string // instance_token (raw)

@@ -376,6 +376,14 @@ const FormulaVarPrefix = Namespace + "var."
 // and sole consumer: internal/liveness (which aliases this constant).
 const LivenessFencePrefix = Namespace + "liveness_fence."
 
+// LivenessReadDegradedMetadataKey is stamped by the session-liveness read
+// overlay on a bead it could not overlay although the scope has a liveness
+// store: the liveness fields on that read are committed metadata, which can be
+// stale or absent. Read-side only, never persisted. Producer: the overlay in
+// cmd/gc (via internal/liveness, which aliases this constant); consumer: the
+// session Info projection.
+const LivenessReadDegradedMetadataKey = Namespace + "liveness_read_degraded"
+
 // IdemPrefix is the key prefix for the remote rig-create idempotency record's
 // metadata (gc.idem.kind/city/request_id/digest/state/event_cursor/rig_name,
 // the open-world gc.idem.result.* success fields, and gc.idem.created_dir/dolt_db
@@ -582,6 +590,7 @@ var KnownMetadataKeys = []string{
 	LastFinalizeErrorMetadataKey,
 	LeaseOwnerMetadataKey,
 	LivenessWrittenAtMetadataKey,
+	LivenessReadDegradedMetadataKey,
 	LogicalBeadIDMetadataKey,
 	MaxAttemptsMetadataKey,
 	MissingRootBeadIDMetadataKey,
