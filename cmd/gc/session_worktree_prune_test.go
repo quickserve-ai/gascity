@@ -23,6 +23,8 @@ type fakeGitProbe struct {
 	currentBranch    string
 	currentBranchErr error
 	hasUncommitted   bool
+	porcelain        string
+	porcelainErr     error
 	hasUnpushed      bool
 	unpushedErr      error
 	hasStashes       bool
@@ -37,7 +39,25 @@ func (f *fakeGitProbe) IsRepo() bool { return f.isRepo }
 func (f *fakeGitProbe) CurrentBranch() (string, error) {
 	return f.currentBranch, f.currentBranchErr
 }
-func (f *fakeGitProbe) HasUncommittedWork() bool { return f.hasUncommitted }
+
+// HasUncommittedWork mirrors git: any porcelain line at all, sediment
+// included, reads as dirty. It is what the prune used to call.
+func (f *fakeGitProbe) HasUncommittedWork() bool {
+	return f.hasUncommitted || f.porcelain != "" || f.porcelainErr != nil
+}
+
+// StatusPorcelain reports porcelain when set; otherwise hasUncommitted stands
+// for one authored modification, so the older tests keep their meaning.
+func (f *fakeGitProbe) StatusPorcelain() (string, error) {
+	if f.porcelainErr != nil || f.porcelain != "" {
+		return f.porcelain, f.porcelainErr
+	}
+	if f.hasUncommitted {
+		return " M main.go\n", nil
+	}
+	return "", nil
+}
+
 func (f *fakeGitProbe) HasUnpushedCommitsResult() (bool, error) {
 	return f.hasUnpushed, f.unpushedErr
 }
@@ -525,5 +545,46 @@ func TestPruneAgentHomeWorktreeIfSafe_UnknownRuntimeLivenessNeverPruned(t *testi
 	}
 	if !strings.Contains(stderr.String(), "runtime liveness unknown") {
 		t.Errorf("missing unknown-liveness refusal diagnostic, got: %q", stderr.String())
+	}
+}
+
+// ga-bjenxa: gc's own provisioning sediment, and the .worktree-stale marker
+// this path writes when it skips a tree, are not authored work. Before, a
+// worker_dir skipped once read dirty forever on its own marker.
+const pruneSedimentOnly = "?? .worktree-stale\n?? .claude/\n?? .omp/\n M .beads/config.yaml\n?? AGENTS-gc.md\n"
+
+func TestPruneAgentHomeWorktreeIfSafe_SedimentOnlyDoesNotVeto(t *testing.T) {
+	fx := newPruneFixture(t)
+	rigProbe := &fakeGitProbe{isRepo: true}
+	fx.setProbe(fx.workerDir, &fakeGitProbe{isRepo: true, porcelain: pruneSedimentOnly})
+	fx.setProbe(fx.rigRoot, rigProbe)
+
+	var stderr bytes.Buffer
+	if !pruneAgentHomeWorktreeIfSafe(fx.sessionBead(), fx.cityPath, fx.cfg, nil, &stderr) {
+		t.Fatalf("prune refused a worker_dir whose only changes are gc sediment; stderr=%s", stderr.String())
+	}
+	if rigProbe.removedPath != fx.workerDir {
+		t.Errorf("WorktreeRemove path = %q, want %q", rigProbe.removedPath, fx.workerDir)
+	}
+}
+
+func TestPruneAgentHomeWorktreeIfSafe_AuthoredChangeAmidSedimentVetoes(t *testing.T) {
+	fx := newPruneFixture(t)
+	fx.setProbe(fx.workerDir, &fakeGitProbe{isRepo: true, porcelain: pruneSedimentOnly + " M internal/work.go\n", currentBranch: "builder/ga-abc123"})
+
+	var stderr bytes.Buffer
+	if pruneAgentHomeWorktreeIfSafe(fx.sessionBead(), fx.cityPath, fx.cfg, nil, &stderr) {
+		t.Fatal("prune removed a worker_dir with an authored change")
+	}
+	assertWorktreeStaleMarker(t, fx.workerDir, "builder/ga-abc123", "uncommitted-work")
+}
+
+func TestPruneAgentHomeWorktreeIfSafe_StatusProbeErrorVetoes(t *testing.T) {
+	fx := newPruneFixture(t)
+	fx.setProbe(fx.workerDir, &fakeGitProbe{isRepo: true, porcelainErr: errors.New("git status failed")})
+
+	var stderr bytes.Buffer
+	if pruneAgentHomeWorktreeIfSafe(fx.sessionBead(), fx.cityPath, fx.cfg, nil, &stderr) {
+		t.Fatal("prune removed a worker_dir whose status probe failed")
 	}
 }
