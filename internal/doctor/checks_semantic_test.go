@@ -1770,15 +1770,26 @@ func TestWorktreeDiskSizeCheck_ProductionMeasurerStopsDuAtBudget(t *testing.T) {
 *) printf '1024\t%s\n' "$2" ;;
 esac
 `)
+	// The check's own budget is the clock here, so both fake dus must start
+	// and print inside it. The first run of a newly written file is slow on
+	// macOS (seconds in the tail under load; later runs take ~10ms), so run
+	// the fake du once, down its finishing branch, before the clock starts.
+	if _, err := duDirSizeWithin(context.Background(), t.TempDir()); err != nil {
+		t.Fatalf("warming the fake du: %v", err)
+	}
 	c := NewWorktreeDiskSizeCheck(config.DoctorConfig{WorktreeRigWarnSize: "10GB", WorktreeRigErrorSize: "50GB"})
-	c.budget = 300 * time.Millisecond
+	// The test waits out this budget in full. Its eighth, the grace for a
+	// stopped walk to return before it is abandoned as stuck, is also the
+	// time qcore's killed du has to be reaped.
+	const budget = 3 * time.Second
+	c.budget = budget
 
 	r := c.Run(&CheckContext{CityPath: dir})
 	if r.Status != StatusWarning {
 		t.Fatalf("status = %d, want Warning; msg=%s details=%v", r.Status, r.Message, r.Details)
 	}
-	if !strings.Contains(r.Message, `"qcore" at least 2.0 GB logical (lower bound: the size walk did not finish within 300ms)`) {
-		t.Errorf("message must carry du's counted subtrees as the lower bound; got %q", r.Message)
+	if want := fmt.Sprintf(`"qcore" at least 2.0 GB logical (lower bound: the size walk did not finish within %s)`, budget); !strings.Contains(r.Message, want) {
+		t.Errorf("message must carry du's counted subtrees as the lower bound %q; got %q", want, r.Message)
 	}
 	if strings.Contains(r.Message, `"astro"`) {
 		t.Errorf("message presents another rig's size as the verdict; got %q", r.Message)
