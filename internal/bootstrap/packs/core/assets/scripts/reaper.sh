@@ -129,7 +129,8 @@ TOTAL_WORKFLOW_ROOTS_CLOSED=0
 TOTAL_WOULD_CLOSE_WORKFLOW_ROOTS=0
 # bd stores UTC in every timestamp column, so each age cutoff and each
 # closed_at write below uses UTC_TIMESTAMP(). The server-local clock is off by
-# the host's UTC offset and shifts an hour at each DST change.
+# the host's UTC offset and shifts an hour at each DST change. Closes also set
+# updated_at, because bd's ON UPDATE clause on that column uses the local clock.
 TOTAL_WOULD_CLOSE_STALE=0
 TOTAL_WORKFLOW_ROOTS_STORE_REF_SKIPPED=0
 TOTAL_WORKFLOW_ISSUE_ROOTS_SKIPPED=0
