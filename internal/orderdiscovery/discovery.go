@@ -433,17 +433,15 @@ func cityOperatorOrderDirs(cityPath string) []string {
 //
 // A rig's formulas_dir is the operator's even when it is the same directory
 // as one of the rig's pack formula layers, where rigLocalFormulaLayer cannot
-// see it. Relative paths resolve against the city directory.
+// see it. The path resolves exactly as the rig's formula layer does, so a
+// "//" prefix means the city root.
 func rigOperatorOrderDirs(cityPath string, cfg *config.City, cityLayers []string, rigName string) []string {
 	dirs := cityOperatorOrderDirs(cityPath)
 	for _, rig := range cfg.Rigs {
 		if rig.Name != rigName || rig.FormulasDir == "" {
 			continue
 		}
-		dir := rig.FormulasDir
-		if !filepath.IsAbs(dir) {
-			dir = filepath.Join(cityPath, dir)
-		}
+		dir := config.ResolveRigFormulasDir(rig.FormulasDir, cityPath)
 		dirs = append(dirs, formulaLayerRoot(dir).Dir)
 	}
 	exclusive := RigExclusiveLayers(cfg.FormulaLayers.Rigs[rigName], cityLayers)
