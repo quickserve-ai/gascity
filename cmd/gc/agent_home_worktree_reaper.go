@@ -58,7 +58,6 @@ type stoppedAgentHomeGitProbe interface {
 	IsRepo() bool
 	HasUncommittedWork() bool
 	HasUnpushedCommitsResult() (bool, error)
-	HasStashesResult() (bool, error)
 	CurrentBranch() (string, error)
 	WorktreeRemove(path string, force bool) error
 	WorktreeMove(oldPath, newPath string) error
@@ -409,18 +408,13 @@ func evaluateStoppedAgentHomeCandidate(
 		return decision
 	}
 	decision.gate("unpushed", true)
-	stashed, err := probe.HasStashesResult()
-	if err != nil {
-		decision.gate("stash", false)
-		decision.Reason = "stash probe failed: " + err.Error()
-		return decision
-	}
-	if stashed {
-		decision.gate("stash", false)
-		decision.Reason = "candidate has stashed work"
-		return decision
-	}
-	decision.gate("stash", true)
+	// No stash gate (ga-bjenxa, same argument as ga-gsfxag on gitSafetyReason).
+	// A stash lives in refs/stash of the COMMON repository and `git stash list`
+	// is repo-global, so a stash anywhere in the repo vetoed every home of that
+	// repo forever (qcore keeps deliberate salvage stashes). The removal below
+	// is `git worktree remove`, which never touches refs/stash and cannot remove
+	// a main worktree, so stashed work cannot be lost here. The dirty and
+	// unpushed gates above are the per-worktree signals that guard authored work.
 	decision.Action = stoppedAgentHomeRemove
 	decision.Reason = "closed, stopped, unassigned, and git-safe"
 	return decision
