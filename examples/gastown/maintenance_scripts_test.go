@@ -5330,7 +5330,7 @@ exit 0
 		"WITH RECURSIVE workflow_issue_root_candidates",
 		"workflow_descendants(root_id, id)",
 		"roots_with_live_descendants",
-		"UPDATE `beads`.wisps SET status='closed', closed_at=UTC_TIMESTAMP(), metadata = JSON_SET(COALESCE(metadata, JSON_OBJECT())",
+		"UPDATE `beads`.wisps SET status='closed', closed_at=UTC_TIMESTAMP(), updated_at=UTC_TIMESTAMP(), metadata = JSON_SET(COALESCE(metadata, JSON_OBJECT())",
 		"'$.\"gc.outcome\"', 'skipped'",
 		"'$.\"close_reason\"', 'stale inactive workflow root auto-closed by reaper'",
 		"JSON_UNQUOTE(JSON_EXTRACT(w.metadata, '$.\"gc.kind\"')) = 'workflow'",
@@ -5481,7 +5481,7 @@ exit 0
 			t.Fatalf("reaper workflow-root preserve guard missing %q:\n%s", want, log)
 		}
 	}
-	if strings.Contains(log, "UPDATE `beads`.wisps SET status='closed', closed_at=UTC_TIMESTAMP(), metadata = JSON_SET") ||
+	if strings.Contains(log, "UPDATE `beads`.wisps SET status='closed', closed_at=UTC_TIMESTAMP(), updated_at=UTC_TIMESTAMP(), metadata = JSON_SET") ||
 		strings.Contains(log, "UPDATE `beads`.issues SET status='closed'") {
 		t.Fatalf("reaper closed workflow roots after live-descendant counts returned zero:\n%s", log)
 	}
@@ -5565,8 +5565,8 @@ exit 0
 	if err != nil {
 		t.Fatalf("ReadFile(dolt log): %v", err)
 	}
-	if strings.Contains(string(logData), "UPDATE `beads`.wisps SET status='closed', closed_at=UTC_TIMESTAMP(), metadata = JSON_SET") ||
-		strings.Contains(string(logData), "UPDATE `beads`.issues SET status='closed', closed_at=UTC_TIMESTAMP(), metadata = JSON_SET") {
+	if strings.Contains(string(logData), "UPDATE `beads`.wisps SET status='closed', closed_at=UTC_TIMESTAMP(), updated_at=UTC_TIMESTAMP(), metadata = JSON_SET") ||
+		strings.Contains(string(logData), "UPDATE `beads`.issues SET status='closed', closed_at=UTC_TIMESTAMP(), updated_at=UTC_TIMESTAMP(), metadata = JSON_SET") {
 		t.Fatalf("dry-run executed workflow-root update:\n%s", logData)
 	}
 
