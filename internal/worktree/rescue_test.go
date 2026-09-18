@@ -2,6 +2,7 @@ package worktree
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -435,4 +436,427 @@ func TestTeardownRemovesALockedWorktree(t *testing.T) {
 	if err != nil || !td.Removed {
 		t.Fatalf("report %+v err %v, want a locked worktree removed after its rescue", td, err)
 	}
+}
+
+// Codex review of ga-w805wc, finding 2: content that is staged but no longer
+// in the working tree lives only in the index, and `add -A` overwrites it.
+func TestRescueKeepsStagedOnlyContent(t *testing.T) {
+	repo, wt, head := linkedWorktree(t)
+	writeFile(t, filepath.Join(wt, "a.txt"), "staged-only\n")
+	runGit(t, wt, "add", "a.txt")
+	writeFile(t, filepath.Join(wt, "a.txt"), "base\n") // working tree back to HEAD
+
+	rep, err := Rescue(rescueSpec(wt))
+	if err != nil {
+		t.Fatalf("Rescue: %v", err)
+	}
+	if rep.RescueSHA == head {
+		t.Fatal("rescue collapsed to HEAD and dropped the staged content")
+	}
+	parents := strings.Fields(runGit(t, repo, "log", "-1", "--format=%P", rep.RescueSHA))
+	if len(parents) != 2 || parents[0] != head {
+		t.Fatalf("rescue parents = %v, want HEAD plus an index commit", parents)
+	}
+	if got := runGit(t, repo, "show", parents[1]+":a.txt"); got != "staged-only" {
+		t.Fatalf("index commit a.txt = %q", got)
+	}
+	again, err := Rescue(rescueSpec(wt))
+	if err != nil || again.RescueSHA != rep.RescueSHA {
+		t.Fatalf("retry with the same index minted %s (was %s), err %v", again.RescueSHA, rep.RescueSHA, err)
+	}
+}
+
+// Codex finding 3: an assume-unchanged bit makes `git add` trust the index.
+func TestRescueSeesEditsBehindAssumeUnchanged(t *testing.T) {
+	repo, wt, _ := linkedWorktree(t)
+	runGit(t, wt, "update-index", "--assume-unchanged", "a.txt")
+	writeFile(t, filepath.Join(wt, "a.txt"), "hidden edit\n")
+
+	rep, err := Rescue(rescueSpec(wt))
+	if err != nil {
+		t.Fatalf("Rescue: %v", err)
+	}
+	if got := runGit(t, repo, "show", rep.RescueSHA+":a.txt"); got != "hidden edit" {
+		t.Fatalf("rescued a.txt = %q, want the edit behind assume-unchanged", got)
+	}
+	if got := runGit(t, wt, "ls-files", "-v", "a.txt"); !strings.HasPrefix(got, "h ") {
+		t.Fatalf("rescue changed the real index's flag: %q", got)
+	}
+}
+
+// Codex finding 3b: an edited file outside the sparse definition.
+func TestRescueKeepsEditsOutsideTheSparseDefinition(t *testing.T) {
+	repo, wt, _ := linkedWorktree(t)
+	writeFile(t, filepath.Join(wt, "keep", "k.txt"), "k\n")
+	writeFile(t, filepath.Join(wt, "drop", "d.txt"), "d\n")
+	runGit(t, wt, "add", ".")
+	runGit(t, wt, "commit", "-m", "two dirs")
+	runGit(t, wt, "sparse-checkout", "set", "--no-cone", "/keep/", "/a.txt")
+	writeFile(t, filepath.Join(wt, "drop", "d.txt"), "written outside the cone\n")
+
+	rep, err := Rescue(rescueSpec(wt))
+	if err != nil {
+		t.Fatalf("Rescue: %v", err)
+	}
+	if got := runGit(t, repo, "show", rep.RescueSHA+":drop/d.txt"); got != "written outside the cone" {
+		t.Fatalf("rescued drop/d.txt = %q", got)
+	}
+}
+
+func submoduleWorktree(t *testing.T) (wt, sub string) {
+	t.Helper()
+	upstream, _ := initTestRepo(t)
+	writeFile(t, filepath.Join(upstream, "s.txt"), "s\n")
+	runGit(t, upstream, "add", "s.txt")
+	runGit(t, upstream, "commit", "-m", "s")
+	repo, _, _ := linkedWorktree(t)
+	runGit(t, repo, "-c", "protocol.file.allow=always", "submodule", "add", upstream, "sub")
+	runGit(t, repo, "commit", "-m", "add sub")
+	wt = filepath.Join(t.TempDir(), "wt-sub")
+	runGit(t, repo, "worktree", "add", "--detach", wt, "HEAD")
+	runGit(t, wt, "-c", "protocol.file.allow=always", "submodule", "update", "--init")
+	return wt, filepath.Join(wt, "sub")
+}
+
+// Codex finding 1: a submodule's repository lives in the worktree's private
+// admin dir, so its uncommitted work and local-only commits die with it.
+func TestRescueRefusesASubmoduleWithWorkItCannotCarry(t *testing.T) {
+	t.Run("clean and pushed is fine", func(t *testing.T) {
+		wt, _ := submoduleWorktree(t)
+		if _, err := Rescue(rescueSpec(wt)); err != nil {
+			t.Fatalf("Rescue of a clean submodule: %v", err)
+		}
+	})
+	t.Run("uncommitted", func(t *testing.T) {
+		wt, sub := submoduleWorktree(t)
+		writeFile(t, filepath.Join(sub, "wip.txt"), "wip\n")
+		if _, err := Rescue(rescueSpec(wt)); err == nil || !strings.Contains(err.Error(), "submodule sub") {
+			t.Fatalf("Rescue err = %v, want a submodule refusal", err)
+		}
+		head := runGit(t, wt, "rev-parse", "HEAD")
+		if _, err := Teardown(TeardownSpec{RescueSpec: rescueSpec(wt), RescueSHA: head}); err == nil {
+			t.Fatal("teardown removed a worktree whose submodule held uncommitted work")
+		}
+		if _, err := os.Stat(filepath.Join(sub, "wip.txt")); err != nil {
+			t.Fatalf("submodule work lost: %v", err)
+		}
+	})
+	t.Run("local-only commit is imported and survives teardown", func(t *testing.T) {
+		wt, sub := submoduleWorktree(t)
+		writeFile(t, filepath.Join(sub, "local.txt"), "local\n")
+		runGit(t, sub, "add", "local.txt")
+		runGit(t, sub, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "local only")
+		local := runGit(t, sub, "rev-parse", "HEAD")
+		rep, err := Rescue(rescueSpec(wt))
+		if err != nil {
+			t.Fatalf("Rescue: %v", err)
+		}
+		repo := strings.TrimSuffix(rep.Repo, "/.git")
+		td, err := Teardown(TeardownSpec{RescueSpec: rescueSpec(wt), RescueSHA: rep.RescueSHA})
+		if err != nil || !td.Removed {
+			t.Fatalf("Teardown: %+v %v", td, err)
+		}
+		runGit(t, repo, "reflog", "expire", "--expire=now", "--all")
+		runGit(t, repo, "gc", "--prune=now", "--quiet")
+		if got := runGit(t, repo, "show", local+":local.txt"); got != "local" {
+			t.Fatalf("submodule's local-only commit after teardown + gc: %q", got)
+		}
+	})
+}
+
+// Codex finding 6: a manifest entry proves ownership only while the link
+// still points where the materializer recorded.
+func TestRescueSecuresARepointedSkillSymlink(t *testing.T) {
+	repo, wt, _ := linkedWorktree(t)
+	skills := filepath.Join(wt, ".claude", "skills")
+	writeFile(t, filepath.Join(skills, SkillOwnershipManifest), `{"targets":{"mine":"/original/gc/skill"}}`)
+	if err := os.Symlink("/authored/replacement/skill", filepath.Join(skills, "mine")); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := Rescue(rescueSpec(wt))
+	if err != nil {
+		t.Fatalf("Rescue: %v", err)
+	}
+	if containsString(rep.Sediment, ".claude/skills/mine") ||
+		!containsString(treePaths(t, repo, rep.RescueSHA), ".claude/skills/mine") {
+		t.Fatalf("a repointed symlink was treated as gc sediment: sediment=%v", rep.Sediment)
+	}
+}
+
+// Codex finding 5: absence is ENOENT only; an unreadable path is an error.
+func TestRescueAbsentOKDistinguishesGoneFromUnreadable(t *testing.T) {
+	spec := rescueSpec(filepath.Join(t.TempDir(), "gone"))
+	spec.AbsentOK = true
+	rep, err := Rescue(spec)
+	if err != nil || !rep.Absent {
+		t.Fatalf("absent path: report %+v err %v, want Absent", rep, err)
+	}
+
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions, so the unreadable case cannot be built")
+	}
+	_, wt, _ := linkedWorktree(t)
+	parent := filepath.Dir(wt)
+	if err := os.Chmod(parent, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(parent, 0o755) })
+	spec = rescueSpec(wt)
+	spec.AbsentOK = true
+	if rep, err := Rescue(spec); err == nil || rep.Absent {
+		t.Fatalf("unreadable path: report %+v err %v, want an error, not Absent", rep, err)
+	}
+}
+
+func TestRescueKeepsAnInProgressMergeHeadReachable(t *testing.T) {
+	repo, wt, head := linkedWorktree(t)
+	runGit(t, wt, "checkout", "-q", "--detach", head)
+	writeFile(t, filepath.Join(wt, "a.txt"), "theirs\n")
+	runGit(t, wt, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "theirs")
+	theirs := runGit(t, wt, "rev-parse", "HEAD")
+	runGit(t, wt, "checkout", "-q", "--detach", head)
+	writeFile(t, filepath.Join(wt, "a.txt"), "ours\n")
+	runGit(t, wt, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "ours")
+	cmdErr := runGitAllowFail(wt, "-c", "user.name=t", "-c", "user.email=t@t", "merge", theirs)
+	if cmdErr == nil {
+		t.Fatal("control: the merge should conflict")
+	}
+	rep, err := Rescue(rescueSpec(wt))
+	if err != nil {
+		t.Fatalf("Rescue: %v", err)
+	}
+	if !rep.IndexUnmerged {
+		t.Error("an unmerged index was not reported")
+	}
+	assertReachableFromRescue(t, repo, rep.RescueRef, theirs)
+}
+
+// assertReachableFromRescue proves commit survives the worktree: reachable
+// from the rescue ref after the worktree's private state is irrelevant.
+func assertReachableFromRescue(t *testing.T, repo, ref, commit string) {
+	t.Helper()
+	cmd := exec.Command("git", "merge-base", "--is-ancestor", commit, ref)
+	cmd.Dir = repo
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("%s is not reachable from %s: %v", commit, ref, err)
+	}
+}
+
+// Opus review finding 1: a rebase stopped on a conflict holds the commits not
+// yet replayed only in the worktree's private rebase state.
+func TestRescueKeepsTheUnreplayedCommitsOfAStoppedRebase(t *testing.T) {
+	repo, wt, base := linkedWorktree(t)
+	var mine []string
+	for i, content := range []string{"c1\n", "c2\n", "c3\n"} {
+		writeFile(t, filepath.Join(wt, "f.txt"), content)
+		if i == 0 {
+			runGit(t, wt, "add", "f.txt")
+		}
+		runGit(t, wt, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", content)
+		mine = append(mine, runGit(t, wt, "rev-parse", "HEAD"))
+	}
+	runGit(t, repo, "checkout", "-q", "-b", "upstream", base)
+	writeFile(t, filepath.Join(repo, "f.txt"), "upstream\n")
+	runGit(t, repo, "add", "f.txt")
+	runGit(t, repo, "commit", "-qm", "upstream")
+	if runGitAllowFail(wt, "-c", "user.name=t", "-c", "user.email=t@t", "rebase", "upstream") == nil {
+		t.Fatal("control: the rebase should stop on a conflict")
+	}
+	rep, err := Rescue(rescueSpec(wt))
+	if err != nil {
+		t.Fatalf("Rescue: %v", err)
+	}
+	for _, c := range mine {
+		assertReachableFromRescue(t, repo, rep.RescueRef, c)
+	}
+}
+
+// Opus finding 5: a commit reset away on a detached HEAD is reachable only
+// from the worktree's own HEAD reflog.
+func TestRescueKeepsReflogOnlyCommits(t *testing.T) {
+	repo, wt, _ := linkedWorktree(t)
+	writeFile(t, filepath.Join(wt, "gone.txt"), "reset away\n")
+	runGit(t, wt, "add", "gone.txt")
+	runGit(t, wt, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "reset away")
+	resetAway := runGit(t, wt, "rev-parse", "HEAD")
+	runGit(t, wt, "reset", "-q", "--hard", "HEAD~1")
+	runGit(t, wt, "update-ref", "refs/worktree/mark", resetAway)
+
+	rep, err := Rescue(rescueSpec(wt))
+	if err != nil {
+		t.Fatalf("Rescue: %v", err)
+	}
+	if len(rep.PrivateCommits) == 0 {
+		t.Fatal("no private commits reported")
+	}
+	assertReachableFromRescue(t, repo, rep.RescueRef, resetAway)
+}
+
+// Opus finding 2a: an untracked directory with its own .git is recorded by
+// `git add` as a bare pointer.
+func TestRescueRefusesANestedRepository(t *testing.T) {
+	_, wt, _ := linkedWorktree(t)
+	runGit(t, wt, "init", "-q", "lib")
+	writeFile(t, filepath.Join(wt, "lib", "x.txt"), "x\n")
+	runGit(t, filepath.Join(wt, "lib"), "add", "x.txt")
+	runGit(t, filepath.Join(wt, "lib"), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x")
+	if _, err := Rescue(rescueSpec(wt)); err == nil || !strings.Contains(err.Error(), "lib holds its own git repository") {
+		t.Fatalf("Rescue err = %v, want a nested-repository refusal", err)
+	}
+}
+
+// Opus finding 2b: another bead's worktree created beneath this one.
+func TestTeardownRefusesWhenAnotherWorktreeIsNestedInside(t *testing.T) {
+	repo, wt, head := linkedWorktree(t)
+	inner := filepath.Join(wt, "worktrees", "qc-other")
+	runGit(t, repo, "worktree", "add", "--detach", inner, "HEAD")
+	writeFile(t, filepath.Join(inner, "theirs.txt"), "another bead's work\n")
+	if _, err := Teardown(TeardownSpec{RescueSpec: rescueSpec(wt), RescueSHA: head}); err == nil ||
+		!strings.Contains(err.Error(), "nested inside") {
+		t.Fatalf("Teardown err = %v, want a nested-worktree refusal", err)
+	}
+	if _, err := os.Stat(filepath.Join(inner, "theirs.txt")); err != nil {
+		t.Fatalf("the nested worktree's work was deleted: %v", err)
+	}
+}
+
+// Opus finding 3: a repo-wide prune would drop another worktree's stale
+// registration, which git still treats as a reachability root.
+func TestTeardownLeavesOtherRegistrationsAlone(t *testing.T) {
+	repo, wt, head := linkedWorktree(t)
+	stale := filepath.Join(t.TempDir(), "stale")
+	runGit(t, repo, "worktree", "add", "--detach", stale, "HEAD")
+	if err := os.RemoveAll(stale); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Teardown(TeardownSpec{RescueSpec: rescueSpec(wt), RescueSHA: head}); err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+	if list := runGit(t, repo, "worktree", "list", "--porcelain"); !strings.Contains(list, "stale") {
+		t.Fatalf("teardown pruned another worktree's registration:\n%s", list)
+	}
+}
+
+// The recursive fallback: git refuses to remove a worktree holding a
+// submodule. Only this worktree's admin dir may go with it.
+func TestTeardownFallbackRemovesOnlyItsOwnAdminDir(t *testing.T) {
+	wt, _ := submoduleWorktree(t)
+	rep, err := Rescue(rescueSpec(wt))
+	if err != nil {
+		t.Fatalf("Rescue: %v", err)
+	}
+	repo := strings.TrimSuffix(rep.Repo, "/.git")
+	stale := filepath.Join(t.TempDir(), "stale")
+	runGit(t, repo, "worktree", "add", "--detach", stale, "HEAD")
+	if err := os.RemoveAll(stale); err != nil {
+		t.Fatal(err)
+	}
+	adminDir := runGit(t, wt, "rev-parse", "--path-format=absolute", "--git-dir")
+	td, err := Teardown(TeardownSpec{RescueSpec: rescueSpec(wt), RescueSHA: rep.RescueSHA})
+	if err != nil || !td.Removed {
+		t.Fatalf("Teardown: %+v %v", td, err)
+	}
+	if _, err := os.Lstat(adminDir); !os.IsNotExist(err) {
+		t.Fatalf("admin dir %s survived: %v", adminDir, err)
+	}
+	if list := runGit(t, repo, "worktree", "list", "--porcelain"); !strings.Contains(list, "stale") {
+		t.Fatalf("the fallback pruned another worktree's registration:\n%s", list)
+	}
+}
+
+// Opus finding 8: bead ga-1's reuse lookup must not adopt bead ga-1-2's ref.
+func TestRescueReuseIgnoresAnotherBeadsRefs(t *testing.T) {
+	repo, wt, _ := linkedWorktree(t)
+	writeFile(t, filepath.Join(wt, "wip.txt"), "wip\n")
+	other := rescueSpec(wt)
+	other.BeadID = "ga-1-2"
+	if _, err := Rescue(other); err != nil {
+		t.Fatalf("Rescue ga-1-2: %v", err)
+	}
+	mine := rescueSpec(wt)
+	mine.BeadID = "ga-1"
+	rep, err := Rescue(mine)
+	if err != nil {
+		t.Fatalf("Rescue ga-1: %v", err)
+	}
+	if rep.RescueRef != "refs/rescue/ga-1" {
+		t.Fatalf("ga-1's rescue landed at %s", rep.RescueRef)
+	}
+	if got := runGit(t, repo, "rev-parse", "refs/rescue/ga-1"); got == "" {
+		t.Fatal("refs/rescue/ga-1 was not written")
+	}
+}
+
+// Opus finding 9: a symlink to a worktree is refused rather than half-removed.
+func TestTeardownRefusesASymlinkedPath(t *testing.T) {
+	_, wt, head := linkedWorktree(t)
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(wt, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Teardown(TeardownSpec{RescueSpec: rescueSpec(link), RescueSHA: head}); err == nil ||
+		!strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("Teardown err = %v, want a symlink refusal", err)
+	}
+	if _, err := os.Stat(filepath.Join(wt, "a.txt")); err != nil {
+		t.Fatalf("worktree behind the symlink was removed: %v", err)
+	}
+}
+
+func runGitAllowFail(dir string, args ...string) error {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	return cmd.Run()
+}
+
+// A detached worktree with local commits: its reflog holds those commits,
+// and a second rescue must still produce the SAME commit, or teardown's
+// equality check can never pass.
+func TestRescueOfDetachedLocalCommitsIsStableAcrossRetries(t *testing.T) {
+	_, wt, _ := linkedWorktree(t)
+	for _, c := range []string{"one\n", "two\n"} {
+		writeFile(t, filepath.Join(wt, "f.txt"), c)
+		runGit(t, wt, "add", "f.txt")
+		runGit(t, wt, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", c)
+	}
+	// And one commit that is NOT an ancestor of HEAD: reset away, so only the
+	// reflog (then the anchor, then this bead's own rescue ref) reaches it.
+	writeFile(t, filepath.Join(wt, "f.txt"), "three\n")
+	runGit(t, wt, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "three")
+	runGit(t, wt, "reset", "-q", "--hard", "HEAD~1")
+	writeFile(t, filepath.Join(wt, "wip.txt"), "wip\n")
+	first, err := Rescue(rescueSpec(wt))
+	if err != nil {
+		t.Fatalf("first Rescue: %v", err)
+	}
+	if len(first.PrivateCommits) == 0 {
+		t.Fatal("control: the reset-away commit should be anchored")
+	}
+	second, err := Rescue(rescueSpec(wt))
+	if err != nil || second.RescueSHA != first.RescueSHA {
+		t.Fatalf("second rescue %s != first %s (err %v)", second.RescueSHA, first.RescueSHA, err)
+	}
+	td, err := Teardown(TeardownSpec{RescueSpec: rescueSpec(wt), RescueSHA: first.RescueSHA})
+	if err != nil || !td.Removed {
+		t.Fatalf("Teardown: %+v %v", td, err)
+	}
+}
+
+// A commit reachable only from a remote-tracking ref is NOT durable: the next
+// `fetch --prune` drops that ref. It is anchored like any private commit.
+func TestRescueDoesNotTrustRemoteTrackingRefs(t *testing.T) {
+	repo, wt, _ := linkedWorktree(t)
+	writeFile(t, filepath.Join(wt, "pushed.txt"), "pushed once\n")
+	runGit(t, wt, "add", "pushed.txt")
+	runGit(t, wt, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "pushed once")
+	pushed := runGit(t, wt, "rev-parse", "HEAD")
+	runGit(t, repo, "update-ref", "refs/remotes/origin/feature", pushed)
+	runGit(t, wt, "reset", "-q", "--hard", "HEAD~1")
+
+	rep, err := Rescue(rescueSpec(wt))
+	if err != nil {
+		t.Fatalf("Rescue: %v", err)
+	}
+	runGit(t, repo, "update-ref", "-d", "refs/remotes/origin/feature") // the remote branch went away
+	assertReachableFromRescue(t, repo, rep.RescueRef, pushed)
 }

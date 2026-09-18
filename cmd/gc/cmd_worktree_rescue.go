@@ -24,6 +24,7 @@ type worktreeRescueOpts struct {
 	BeadID    string
 	CityPath  string
 	RescueSHA string
+	AbsentOK  bool
 	JSON      bool
 }
 
@@ -36,7 +37,9 @@ func (o worktreeRescueOpts) spec() (worktree.RescueSpec, error) {
 	if city == "" {
 		city = os.Getenv("GC_CITY_PATH")
 	}
-	return worktree.RescueSpec{Path: p, BeadID: o.BeadID, CityPath: city, SkillSinks: rescueSkillSinks()}, nil
+	return worktree.RescueSpec{
+		Path: p, BeadID: o.BeadID, CityPath: city, SkillSinks: rescueSkillSinks(), AbsentOK: o.AbsentOK,
+	}, nil
 }
 
 // rescueSkillSinks lists every directory gc materializes skills into.
@@ -87,7 +90,25 @@ With no changes beyond HEAD the rescue is HEAD. Rerunning on an unchanged tree
 returns the same commit. An existing rescue ref is only ever advanced to a
 descendant; a divergent rescue is written beside it as
 refs/rescue/<bead>-<sha12>. Credential-shaped file names are reported as taint
-and recorded in the rescue commit's Rescue-Taint trailer.`,
+and recorded in the rescue commit's Rescue-Taint trailer.
+
+Removal also deletes everything private to the worktree, so the rescue keeps
+it reachable too: staged content that differs from both HEAD and the working
+tree (an index parent), and, through an anchor parent, every commit that only
+the worktree's own state reaches: its HEAD reflog, an in-progress rebase,
+merge, cherry-pick, revert or bisect, refs/worktree/*, and the HEADs of its
+submodules (imported into the shared object store, since a linked worktree's
+submodule repositories live in its admin dir). Remote-tracking refs are not
+trusted to keep anything: fetch --prune drops them. Index bits that make git
+skip real edits (assume-unchanged, skip-worktree on a present file) are
+ignored.
+
+Refused, because a rescue cannot carry them: a submodule with uncommitted or
+untracked changes, an untracked directory holding its own git repository,
+and another registered worktree nested inside this one.
+
+--absent-ok reports a path that does not exist (ENOENT only) as absent=true
+instead of failing, so a caller can tell "already gone" from "unreadable".`,
 		Args: cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
 			if runWorktreeRescue(opts, stdout, stderr) != 0 {
@@ -97,6 +118,8 @@ and recorded in the rescue commit's Rescue-Taint trailer.`,
 		},
 	}
 	worktreeRescueFlags(cmd, &opts)
+	cmd.Flags().BoolVar(&opts.AbsentOK, "absent-ok", false,
+		"succeed with absent=true when --path does not exist (only ENOENT; an unreadable path still fails)")
 	return cmd
 }
 
@@ -113,10 +136,16 @@ bead) after running gc worktree rescue. A worktree that changed in between is
 secured anew and left in place, and the error names the new rescue to record.
 
 It refuses anything that is not a registered linked worktree: a main checkout,
-a submodule checkout, a subdirectory, or an unregistered directory. A locked
-worktree is removed. If git cannot remove the tree (one holding submodules),
-the directory is deleted only after it is proven a registered linked worktree
-again, and the registration is pruned. A path that no longer exists succeeds.`,
+a submodule checkout, a subdirectory, a symlink, or an unregistered directory.
+A locked worktree is removed. If git cannot remove the tree (one holding
+submodules), the directory is deleted only after it is proven a registered
+linked worktree again, and then only THIS worktree's admin directory is
+removed. It never runs a repo-wide worktree prune, which would drop other
+worktrees' stale registrations and the commits they still keep alive. A path
+that no longer exists succeeds.
+
+A write that lands after the final rescue is removed with the tree: the lock
+excludes other gc worktree operations, not editors or background processes.`,
 		Args: cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
 			if runWorktreeTeardown(opts, stdout, stderr) != 0 {
@@ -159,6 +188,10 @@ func runWorktreeRescue(opts worktreeRescueOpts, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "gc worktree rescue: encoding report: %v\n", err) //nolint:errcheck
 			return 1
 		}
+		return 0
+	}
+	if rep.Absent {
+		fmt.Fprintf(stdout, "worktree %s does not exist; nothing to rescue\n", rep.Path) //nolint:errcheck
 		return 0
 	}
 	kind := "HEAD, no changes beyond it"
