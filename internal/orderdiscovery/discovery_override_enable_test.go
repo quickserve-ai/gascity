@@ -354,6 +354,36 @@ enabled = false
 		}
 	})
 
+	// Codex review of f93c41776: operator ownership is per SCOPE. Rig alpha's
+	// formulas_dir aliasing pack P's formulas dir makes P's orders alpha's
+	// own, but not beta's: beta imports P as a pack, so beta's enable override
+	// must still re-enable P's pack-disabled order for beta.
+	t.Run("another rig's formulas_dir aliasing a pack this rig imports", func(t *testing.T) {
+		cityPath, cityLayer := orderDiscoveryCity(t)
+		packDir := filepath.Join(t.TempDir(), "shared-pack")
+		writeOrderDiscoveryFile(t, filepath.Join(packDir, "orders"), "patrol", disabledPatrolOrder)
+		packFormulas := filepath.Join(packDir, "formulas")
+		cfg := &config.City{
+			FormulaLayers: config.FormulaLayers{
+				City: []string{cityLayer},
+				Rigs: map[string][]string{
+					"alpha": {cityLayer, packFormulas},
+					"beta":  {cityLayer, packFormulas},
+				},
+			},
+			Rigs:        []config.Rig{{Name: "alpha", FormulasDir: packFormulas}, {Name: "beta"}},
+			RigPackDirs: map[string][]string{"alpha": {packDir}, "beta": {packDir}},
+			Orders:      config.OrdersConfig{Overrides: []config.OrderOverride{{Name: "patrol", Rig: "beta", Enabled: &on}}},
+		}
+		aa, err := ScanAll(cityPath, cfg, ScanOptions{})
+		if err != nil {
+			t.Fatalf("ScanAll: %v; beta's override must find beta's pack-disabled patrol", err)
+		}
+		if got := enabledPatrolRigs(aa); strings.Join(got, ",") != "beta" {
+			t.Fatalf("enabled patrol rigs = %v, want only beta (alpha's own copy stays disabled)", got)
+		}
+	})
+
 	t.Run("city-local dir that is also a pack dir", func(t *testing.T) {
 		cityPath, cityLayer := orderDiscoveryCity(t)
 		writeOrderDiscoveryFile(t, filepath.Join(cityPath, "orders"), "patrol", disabledPatrolOrder)
