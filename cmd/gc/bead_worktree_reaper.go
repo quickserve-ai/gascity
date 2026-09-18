@@ -584,11 +584,20 @@ var provisioningSedimentStatus = regexp.MustCompile(
 
 // nonSedimentStatusLines returns the porcelain status lines that represent
 // authored work — everything except gc's own provisioning sediment.
+//
+// git.StatusPorcelain trims its output, which strips the FIRST line's leading
+// space: " M .beads/config.yaml" (unstaged) arrives as "M .beads/config.yaml"
+// and misses the two-column pattern. A porcelain v1 line is always "XY PATH",
+// so a status letter followed by ONE space and then a path can only be a
+// trimmed " Y PATH"; restore the column before matching.
 func nonSedimentStatusLines(porcelain string) []string {
 	var authored []string
 	for _, line := range strings.Split(porcelain, "\n") {
 		if strings.TrimSpace(line) == "" {
 			continue
+		}
+		if len(line) > 2 && line[0] != ' ' && line[1] == ' ' && line[2] != ' ' {
+			line = " " + line
 		}
 		if provisioningSedimentStatus.MatchString(line) {
 			continue
