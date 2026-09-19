@@ -517,6 +517,33 @@ func workerKillSessionTargetWithConfig(cityPath string, store beads.Store, sp ru
 	return handle.Kill(context.Background())
 }
 
+// workerKillSessionTargetWithTermination is workerKillSessionTargetWithConfig
+// for a caller that KNOWS WHY.
+//
+// THE KIND BELONGS TO THE CALLER, NOT TO THE MECHANISM. One handle.Kill serves
+// `gc session kill`, a drain force-stop, a city stop and a remote handoff, so a
+// kind chosen at the mechanism describes whichever caller its author pictured
+// and silently mislabels the rest. That already happened once here: every drain
+// recorded as operator-kill, and drain-timeout — the ratio's most important
+// bucket — could never appear at all, reading as a CONFIDENT ZERO on a fully
+// populated table. The Codex review of PR #106 then found two more kinds with no
+// producer at all, handoff and city-stop, which is the same failure one step
+// further out.
+//
+// A handle that does not implement the optional intent interface falls back to
+// plain Kill, whose unclassified is counted and budgeted — the honest answer, not
+// a silent one.
+func workerKillSessionTargetWithTermination(cityPath string, store beads.Store, sp runtime.Provider, cfg *config.City, target string, rec runtime.Termination) error {
+	handle, err := workerHandleForSessionTargetWithConfig(cityPath, store, sp, cfg, target)
+	if err != nil {
+		return err
+	}
+	if k, ok := handle.(worker.TerminationIntentKiller); ok {
+		return k.KillWithTermination(context.Background(), rec)
+	}
+	return handle.Kill(context.Background())
+}
+
 func workerStopSessionTargetWithConfig(cityPath string, store beads.Store, sp runtime.Provider, cfg *config.City, target string) error {
 	handle, err := workerHandleForSessionTargetWithConfig(cityPath, store, sp, cfg, target)
 	if err != nil {

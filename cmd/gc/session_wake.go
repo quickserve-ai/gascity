@@ -843,11 +843,32 @@ func advanceSessionDrainsWithSessionsTraced(
 		// Pending-interaction guards and wake-based cancellation run before this
 		// timeout path. Preserve that ordering if this block is refactored.
 		if clk.Now().After(ds.deadline) {
-			// Drain timed out — force stop. RequestedAt is the moment the
-			// drain was ASKED, which is what makes At - RequestedAt Timer B;
+			// Drain deadline reached — force stop. RequestedAt is the moment
+			// the drain began, which is what makes At - RequestedAt Timer B;
 			// the drain kinds are the ones katya's invariant requires it on.
+			//
+			// *** drain-timeout MEANS "WE ASKED AND NOBODY ANSWERED", AND FOR A
+			// NAMED SEAT TODAY NOBODY ASKS. *** The reconciler publishes its OWN
+			// ack marker (source=reconciler) a tick after the drain starts,
+			// acknowledging on the seat's behalf; GC_DRAIN is never set and no
+			// nudge is sent. Recording drain-timeout there claims the seat was
+			// given its chance and blew it, which is a checkable falsehood about
+			// a seat that was never told. Pool workers DO consent, through
+			// `gc runtime drain-ack`, and their ack lands with source=agent.
+			//
+			// So the kind is chosen by WHO ACKED. This also protects the measurement
+			// S3 exists to produce: the consent slice's whole visible effect is
+			// drain-silent falling toward zero while drain-handoff appears, and
+			// that transition is unreadable if today's silent drains already wear
+			// the timeout label. (Found by this branch's own producer guard —
+			// drain-silent, the kind documented as "today's behavior", had no
+			// producer at all.)
+			drainKind := runtime.KindDrainSilent
+			if drainAckCameFromTheAgent(sp, name) {
+				drainKind = runtime.KindDrainTimeout
+			}
 			if err := verifiedStop(info, store, sp, cfg, runtime.Termination{
-				Kind:        runtime.KindDrainTimeout,
+				Kind:        drainKind,
 				Actor:       "reconciler",
 				Reason:      ds.reason,
 				RequestedAt: ds.startedAt,
@@ -949,4 +970,22 @@ func verifiedInterrupt(session beads.Bead, store beads.Store, sp runtime.Provide
 		return err
 	}
 	return handle.Interrupt(context.Background(), worker.InterruptRequest{})
+}
+
+// drainAckCameFromTheAgent reports whether the drain ack on this session was
+// published by the AGENT rather than by the reconciler on its behalf.
+//
+// It is the discriminator between "asked and unanswered" (drain-timeout) and
+// "never asked" (drain-silent). An unreadable marker answers FALSE, because the
+// claim that needs evidence is that somebody asked: absent evidence, the honest
+// kind is the one that claims less.
+func drainAckCameFromTheAgent(sp runtime.Provider, name string) bool {
+	if sp == nil {
+		return false
+	}
+	source, err := sp.GetMeta(name, reconcilerDrainAckSourceKey)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(source) == drainAckSourceAgentValue
 }

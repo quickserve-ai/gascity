@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/beads"
@@ -286,6 +287,17 @@ func doHandoffWithOutcome(msgStore, sessStore beads.Store, rec events.Recorder, 
 		fmt.Fprintf(stderr, "gc handoff: setting restart flag: %v\n", err) //nolint:errcheck // best-effort stderr
 		return handoffOutcome{code: 1}
 	}
+	// STATE THE INTENT FOR WHOEVER PERFORMS THE STOP. A self-handoff does not
+	// stop its own runtime: it asks, and the reconciler stops it on a later
+	// tick in another process, where nothing distinguishes this from any other
+	// restart request. That is why KindHandoff — the ratio's entire NUMERATOR —
+	// had no producer anywhere in the tree until the Codex review of PR #106,
+	// and why the KPI would have read 0% on a fully populated table.
+	//
+	// The stamp also carries the request instant, which is what makes Timer B
+	// real for the good ending rather than a field awaiting a populator.
+	// Best-effort: a handoff must never fail because its bookkeeping did.
+	recordHandoffTerminationIntent(sessStore, sessionName, stderr)
 	// Pinned named sessions are kill-protected by the reconciler unless an
 	// explicit controller reset (continuation_reset_pending) is persisted
 	// through the worker boundary: without it, the reconciler's collateral-skip
@@ -492,7 +504,20 @@ func doHandoffRemoteWithForce(msgStore, sessStore beads.Store, rec events.Record
 	// still live. The metric label uses the agent identity (not the sanitized
 	// runtime session name) so handoff stops join the start/crash/kill counters.
 	agentIdentity := sessionAgentMetricIdentityByName(sessStore, sessionName)
-	if err := workerKillSessionTargetWithConfig("", sessStore, sp, nil, sessionName); err != nil {
+	// `gc handoff --target` is NOT an operator kill, and until the Codex review
+	// of PR #106 it recorded as one — KindHandoffTarget had no producer anywhere
+	// in the tree. It is reported on its own line rather than in the headline
+	// numerator, because a THIRD PARTY composed that note: whether it counts as
+	// a win is a judgment for whoever reads the ratio, not a default baked in
+	// here (katya, R3).
+	//
+	// RequestedAt stays ZERO: this is a synchronous CLI call with no request
+	// distinct from the action, and stamping time.Now() would mint a Timer B of
+	// ~0ms that reads as a measurement rather than an absence.
+	if err := workerKillSessionTargetWithTermination("", sessStore, sp, nil, sessionName, runtime.Termination{
+		Kind:   runtime.KindHandoffTarget,
+		Reason: "gc handoff --target",
+	}); err != nil {
 		fmt.Fprintf(stderr, "gc handoff: killing %s: %v\n", targetAddress, err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
@@ -521,4 +546,24 @@ func handoffThreadID() string {
 	b := make([]byte, 6)
 	rand.Read(b) //nolint:errcheck
 	return fmt.Sprintf("thread-%x", b)
+}
+
+// recordHandoffTerminationIntent stamps kind=handoff on the seat's session bead
+// so the reconciler's restart-consume records the ending as a handoff rather
+// than as a generic restart. Every failure is reported and then ignored: the
+// handoff itself is what matters, and a seat that could not write its intent
+// still needs to cycle.
+func recordHandoffTerminationIntent(sessStore beads.Store, sessionName string, stderr io.Writer) {
+	if sessStore == nil {
+		return
+	}
+	id, err := resolveSessionID(sessStore, sessionName)
+	if err != nil || strings.TrimSpace(id) == "" {
+		fmt.Fprintf(stderr, "gc handoff: recording handoff intent: resolving session %q: %v\n", sessionName, err) //nolint:errcheck // best-effort stderr
+		return
+	}
+	patch := session.TerminationIntentPatch(runtime.KindHandoff, time.Now().UTC())
+	if err := sessionFrontDoor(sessStore).ApplyPatch(id, patch); err != nil {
+		fmt.Fprintf(stderr, "gc handoff: recording handoff intent on %s: %v\n", id, err) //nolint:errcheck // best-effort stderr
+	}
 }

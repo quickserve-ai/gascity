@@ -358,6 +358,16 @@ type Info struct {
 	// the durable marker for when a restart handoff committed. resetPendingCommittedAtInfo
 	// parses it; the Info mirror keeps the raw value.
 	ResetCommittedAt string // reset_committed_at (raw)
+
+	// TerminationIntent and TerminationIntentAt are the RAW termination.intent
+	// and termination.intent_at metadata: a kind STATED by the path that asked
+	// for an ending, for the different path that performs it. `gc handoff` sets
+	// them; the reconciler's restart-consume reads them so the ending records as
+	// a handoff rather than as a generic restart, and so Timer B has a real
+	// request instant. See TerminationIntentPatch for the consumed-at-most-once
+	// rule.
+	TerminationIntent   string // termination.intent (raw)
+	TerminationIntentAt string // termination.intent_at (raw, RFC3339 or empty)
 	// Generation is the RAW generation metadata, verbatim. The drain/wake
 	// staleness checks read it BOTH as strconv.Atoi (numeric compare against the
 	// in-memory drain generation) AND strings.TrimSpace (string compare against

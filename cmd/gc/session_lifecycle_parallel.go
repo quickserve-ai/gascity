@@ -3678,7 +3678,14 @@ func stopTargetThroughWorkerBoundary(target stopTarget, store beads.Store, sp ru
 		targetID = strings.TrimSpace(target.name)
 	}
 	if cityStopSessionMarked(store, target.sessionID) {
-		if err := workerKillSessionTargetWithConfig("", store, sp, cfg, targetID); err != nil {
+		// This branch ALREADY KNOWS it is a city stop — that is what the marker
+		// means — and it was throwing that knowledge away at the kill, so every
+		// surviving seat recorded as unclassified. Intent belongs to the caller
+		// (Codex #106; KindCityStop had no producer).
+		if err := workerKillSessionTargetWithTermination("", store, sp, cfg, targetID, runtime.Termination{
+			Kind:   runtime.KindCityStop,
+			Reason: "city stop: force-stopped after the interrupt",
+		}); err != nil {
 			return err
 		}
 		markCityStopSessionAsAsleep(sessionFrontDoor(store), target.sessionID, nil)

@@ -1113,10 +1113,19 @@ func gracefulStopAllWithForceSignal(
 		if !running {
 			// Reached only when the session is NOT running — the agent has
 			// already exited and this is cleanup of what it left behind.
+			//
+			// KindCityStop, NOT observed-dead. Pass 1 above INTERRUPTED these
+			// agents; an agent that exited between that interrupt and this
+			// sweep exited BECAUSE of the city stop, and its context is as gone
+			// as any forced seat's. Recording it observed-dead put the single
+			// most common fleet-wide ending outside the denominator entirely —
+			// KindCityStop had no producer anywhere in the tree until the Codex
+			// review of PR #106 found it. observed-dead remains correct only for
+			// a runtime that died on its own, with nothing asked of it.
 			if err := runtime.StopRecorded(sp, name, runtime.Termination{
-				Kind:   runtime.KindObservedDead,
+				Kind:   runtime.KindCityStop,
 				Actor:  "controller",
-				Reason: "cleaning up after an agent that already exited",
+				Reason: "exited after the city-stop interrupt",
 			}); err != nil && !runtime.IsSessionGone(err) {
 				fmt.Fprintf(stderr, "cleaning exited agent '%s': %v\n", name, err) //nolint:errcheck // best-effort stderr
 			}

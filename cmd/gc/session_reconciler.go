@@ -3290,7 +3290,15 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					continue
 				}
 				if runtimeRunning {
-					if err := workerKillSessionTargetWithConfig("", store, sp, cfg, name); err != nil {
+					// THE KIND COMES FROM WHOEVER ASKED, NOT FROM THIS BRANCH.
+					// A self-handoff does not stop its own runtime — it sets the
+					// restart flag and this tick performs the stop — so without
+					// the intent stamp every handoff was recorded as a generic
+					// restart and KindHandoff, the ratio's entire NUMERATOR, had
+					// no producer at all (Codex #106). The stamp also carries the
+					// request instant, which is what makes Timer B real here.
+					if err := workerKillSessionTargetWithTermination("", store, sp, cfg, name,
+						restartRequestTermination(infoByID[id])); err != nil {
 						fmt.Fprintf(stderr, "session reconciler: stopping restart-requested %s: %v\n", name, err) //nolint:errcheck
 						continue
 					}
@@ -3315,6 +3323,14 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					batch["session_key"] = ""
 				}
 				sessionpkg.StampPriorSessionKeyInfo(batch, infoByID[id])
+				// CONSUMED AT MOST ONCE, whether or not it was used. A handoff
+				// whose restart never arrives is a live bug (ga-cctcju), and an
+				// intent left armed would relabel whatever stopped the seat next
+				// as a handoff — over-claiming the numerator, which is worse than
+				// missing it.
+				for k, v := range sessionpkg.ClearTerminationIntentPatch() {
+					batch[k] = v
+				}
 				if err := sessionFrontDoor(store).ApplyPatch(id, batch); err != nil {
 					fmt.Fprintf(stderr, "session reconciler: recording restart handoff for %s: %v\n", name, err) //nolint:errcheck
 					continue
@@ -7641,4 +7657,31 @@ func resolveResumeCommand(command, sessionKey string, rp *config.ResolvedProvide
 	default: // "flag"
 		return command + " " + rp.ResumeFlag + " " + sessionKey
 	}
+}
+
+// restartRequestTermination turns a session's STATED intent into the record for
+// the stop this tick is about to perform, falling back to the honest generic
+// kind when nothing was stated.
+//
+// The fallback is KindRestartInPlace rather than unclassified because this
+// branch does know something real: a restart was requested and the seat's
+// conversation is about to end. What it cannot know, without the stamp, is WHO
+// asked and why — and a kind that guesses "handoff" for every restart request
+// would inflate the numerator with drains, which is the failure mode the ratio
+// most needs to be immune to.
+func restartRequestTermination(info sessionpkg.Info) runtime.Termination {
+	rec := runtime.Termination{
+		Kind:      runtime.KindRestartInPlace,
+		Actor:     "reconciler",
+		Reason:    "restart requested",
+		SessionID: info.ID,
+	}
+	kind, at, ok := sessionpkg.ReadTerminationIntent(info.TerminationIntent, info.TerminationIntentAt)
+	if !ok {
+		return rec
+	}
+	rec.Kind = kind
+	rec.Reason = "restart requested (" + string(kind) + ")"
+	rec.RequestedAt = at
+	return rec
 }

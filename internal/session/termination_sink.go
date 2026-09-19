@@ -2,6 +2,7 @@ package session
 
 import (
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/runtime"
@@ -93,3 +94,65 @@ func (s *BeadTerminationSink) RecordTermination(_ string, t runtime.Termination)
 // Compile-time proof that this satisfies the seam's sink contract. Without it a
 // signature drift would only surface at the call site that wires them together.
 var _ runtime.TerminationSink = (*BeadTerminationSink)(nil)
+
+// TERMINATION INTENT: a kind STATED BY ONE PATH AND CONSUMED BY ANOTHER.
+//
+// Most endings are classified by the caller that performs the stop. `gc handoff`
+// is not: the seat asks for a restart and then the RECONCILER stops it, on a
+// later tick, in a different process. Without a handover the reconciler cannot
+// tell a handoff from any other restart request, so it records the generic kind
+// — which is why KindHandoff had no producer anywhere in the tree and the ratio's
+// NUMERATOR was structurally zero (found by the Codex review of PR #106).
+//
+// The intent is written on the session bead at request time and read by whoever
+// performs the stop. Its timestamp is what finally makes Timer B real for the
+// good ending: At - RequestedAt, measured rather than assumed. On 2026-09-19 a
+// handoff on this box took 56m32s from request to new pane and the only way to
+// know that was to reconstruct it by hand from a stall warning.
+//
+// CONSUMED AT MOST ONCE, deliberately. The reader CLEARS the intent whether or
+// not it used it, because a handoff whose restart never arrives — which happens,
+// and is its own open bug (ga-cctcju) — would otherwise leave the marker armed
+// for whatever stopped the seat next, and mislabel an unrelated ending as a
+// handoff. A kind that over-claims the numerator is worse than one that misses:
+// the ratio exists to be trusted when it says the factory is handing off.
+const (
+	TerminationIntentKey   = "termination.intent"
+	TerminationIntentAtKey = "termination.intent_at"
+)
+
+// TerminationIntentPatch states the kind a later stop should record.
+func TerminationIntentPatch(kind runtime.TerminationKind, at time.Time) MetadataPatch {
+	return MetadataPatch{
+		TerminationIntentKey:   string(kind),
+		TerminationIntentAtKey: at.UTC().Format(time.RFC3339),
+	}
+}
+
+// ClearTerminationIntentPatch retires a stated intent. See the consumed-at-most-
+// once note above: the consumer clears even when it declines to use it.
+func ClearTerminationIntentPatch() MetadataPatch {
+	return MetadataPatch{TerminationIntentKey: "", TerminationIntentAtKey: ""}
+}
+
+// ReadTerminationIntent returns the stated kind and the instant it was stated.
+// The second result is false when no intent is present or the kind is not in the
+// closed set — an unknown string must not become a bucket.
+func ReadTerminationIntent(rawKind, rawAt string) (runtime.TerminationKind, time.Time, bool) {
+	kind := runtime.TerminationKind(strings.TrimSpace(rawKind))
+	if !kind.Valid() {
+		return "", time.Time{}, false
+	}
+	return kind, parseRFC3339OrZero(rawAt), true
+}
+
+// parseRFC3339OrZero degrades an unreadable timestamp to the zero time rather
+// than to an error. A record whose clock cannot be parsed is still a record, and
+// every caller here would otherwise have to decide the same thing again.
+func parseRFC3339OrZero(raw string) time.Time {
+	t, err := time.Parse(time.RFC3339, strings.TrimSpace(raw))
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
