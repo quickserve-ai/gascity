@@ -64,6 +64,7 @@ controller
 supervisor-http-api
 supervisor-unit-ownership
 supervisor-binary
+supervisor-build-drift
 beads-cache-reconcile
 agent-sessions
 zombie-sessions
