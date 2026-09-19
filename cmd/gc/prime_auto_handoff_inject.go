@@ -44,7 +44,7 @@ func primeHookContextSuffix(cityPath string, hookMode bool, hookContext primeHoo
 		// and it excludes the auto-handoff messages already rendered above so a
 		// beadmail-backed ordinary provider does not double-render them.
 		injection.text += primeUnreadMailInjection(autoHandoffIDs)
-		injection.text += primeLaurelsInjection(strings.TrimSpace(os.Getenv("GC_DIR")))
+		injection.text += primeLaurelsInjection(cityPath, strings.TrimSpace(os.Getenv("GC_AGENT")))
 	}
 	return injection
 }
@@ -156,10 +156,12 @@ func sessionStartAutoHandoffInjection(stderr io.Writer) (primeHookContextInjecti
 // adding a laurel changes no prompt hash and never drifts or restarts a seat. An
 // absent, empty or non-regular file injects nothing.
 //
-// Two homes, checked in order: $GC_DIR/seat/laurels.md, the upstream seat home
-// (gitignored as /seat/, #5776), then $GC_DIR/laurels.md, but only when GC_DIR is
-// a city seat's .gc/agents/<name> home. A rig seat's GC_DIR is its project
-// checkout, whose root laurels.md is repository content, not recognition.
+// The file lives in the seat's city-side home, <city>/.gc/agents/<GC_AGENT>, keyed
+// by identity and never by work dir. A rig seat's GC_DIR is a repository checkout
+// (often nested inside that same home), and any file in a checkout is repository
+// content that this hook would label as recognition from a person. Two names are
+// checked in order, seat/laurels.md then laurels.md. Angle brackets are escaped,
+// so no laurel can close the wrapper or open a tag of its own.
 const (
 	laurelsFileName = "laurels.md"
 	// The spec bounds a seat's laurels at one paragraph; the cap keeps a file
@@ -167,27 +169,38 @@ const (
 	laurelsMaxBytes = 1200
 )
 
-func primeLaurelsInjection(seatDir string) string {
-	if seatDir == "" {
+var laurelsEscaper = strings.NewReplacer("<", "&lt;", ">", "&gt;")
+
+func primeLaurelsInjection(cityPath, agent string) string {
+	home := laurelsHome(cityPath, agent)
+	if home == "" {
 		return ""
 	}
-	paths := []string{filepath.Join(seatDir, "seat", laurelsFileName)}
-	if isCitySeatHome(seatDir) {
-		paths = append(paths, filepath.Join(seatDir, laurelsFileName))
-	}
-	for _, path := range paths {
+	for _, path := range []string{
+		filepath.Join(home, "seat", laurelsFileName),
+		filepath.Join(home, laurelsFileName),
+	} {
 		if text := readLaurels(path); text != "" {
 			return "\n\n<laurels>\nRecognition from people this seat has worked for. It carries no task, no bead and no priority; nothing here asks you to do anything.\n\n" +
-				text + "\n</laurels>\n"
+				laurelsEscaper.Replace(text) + "\n</laurels>\n"
 		}
 	}
 	return ""
 }
 
-// isCitySeatHome reports whether dir is a city seat's .gc/agents/<name> home.
-func isCitySeatHome(dir string) bool {
-	parent := filepath.Dir(filepath.Clean(dir))
-	return filepath.Base(parent) == "agents" && filepath.Base(filepath.Dir(parent)) == ".gc"
+// laurelsHome returns <cityPath>/.gc/agents/<agent>, or "" when either is unset
+// or the agent name would leave that directory.
+func laurelsHome(cityPath, agent string) string {
+	if cityPath == "" || agent == "" {
+		return ""
+	}
+	root := filepath.Join(cityPath, ".gc", "agents")
+	home := filepath.Join(root, filepath.FromSlash(agent))
+	rel, err := filepath.Rel(root, home)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return ""
+	}
+	return home
 }
 
 // readLaurels returns the trimmed, capped text of a REGULAR file, or "". It opens
