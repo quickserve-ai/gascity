@@ -6184,12 +6184,15 @@ func configDriftHandoffBody(agent string, driftedFields []string, at time.Time) 
 	if len(driftedFields) > 0 {
 		b.WriteString("  drifted: " + strings.Join(driftedFields, ", ") + "\n")
 	}
-	b.WriteString("\nRECOVER BEFORE YOU PICK UP ANYTHING NEW, in this order:\n")
-	b.WriteString("  1. gc bd list --assignee <you> --status in_progress   (your own work\n")
-	b.WriteString("     is the record; an in-progress bead under your name IS your task)\n")
-	b.WriteString("  2. gc mail inbox                                      (anything sent\n")
-	b.WriteString("     to you while you were down is still there)\n")
-	b.WriteString("  3. gc hook                                            (hooked work)\n")
+	b.WriteString("\nRECOVER BEFORE YOU PICK UP ANYTHING NEW. Use your pack's startup\n")
+	b.WriteString("protocol — on this runtime that is the hook, which is the ONE command:\n")
+	b.WriteString("  gc hook --claim --drain-ack --json\n")
+	b.WriteString("Do NOT substitute a gc bd list --assignee query. An unclaimed routed item\n")
+	b.WriteString("has NO assignee, an ephemeral wisp is hidden from that query by default,\n")
+	b.WriteString("and a claim is recorded under the session identity rather than the alias\n")
+	b.WriteString("you would guess — so it answers \"no work\" while your own work sits open.\n")
+	b.WriteString("That is how a maintenance order once went 41 hours unrun (ga-tmzjx6).\n")
+	b.WriteString("Then read gc mail inbox: mail sent while you were down is still there.\n")
 	return b.String()
 }
 

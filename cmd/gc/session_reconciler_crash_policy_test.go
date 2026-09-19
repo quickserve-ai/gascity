@@ -373,15 +373,33 @@ func TestConfigDriftHandoffBodyCarriesRecovery(t *testing.T) {
 		t.Fatal("config-drift handoff body is empty — the defect ga-68f9qa exists to prevent")
 	}
 	for _, want := range []string{
-		"qcore/worker",          // which seat
-		at.Format(time.RFC3339), // when
-		"model, prompt",         // what drifted
-		"in_progress",           // the first recovery step
-		"gc mail inbox",         // the second
-		"MECHANICAL",            // it must not read as a composed handoff
+		"qcore/worker",                // which seat
+		at.Format(time.RFC3339),       // when
+		"model, prompt",               // what drifted
+		"gc hook --claim --drain-ack", // the canonical claim protocol, not a hand-rolled query
+		"gc mail inbox",               // mail that arrived while it was down
+		"MECHANICAL",                  // it must not read as a composed handoff
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("config-drift handoff body missing %q\n--- body ---\n%s", want, body)
+		}
+	}
+	// The body must never DIRECT a restarted seat to a `gc bd list --assignee` lookup.
+	// The core claim protocol forbids it (claim-protocol.template.md): an unclaimed
+	// routed item has no assignee and an ephemeral wisp is hidden from that query, so
+	// it reports "no work" while the seat's own work sits open — the seat then
+	// concludes its persisted work is gone, which is the opposite of recovery.
+	// Codex review finding, PR #104.
+	//
+	// This checks the DIRECTIVE form, not the mere mention: the body is expected to
+	// name the query in order to warn against it, and a plain strings.Contains cannot
+	// tell "run this" from "never run this" (it flagged the warning itself when the
+	// guard was first written). A command the seat is meant to run stands alone on its
+	// line — that is the shape being forbidden here.
+	for _, line := range strings.Split(body, "\n") {
+		directive := strings.TrimLeft(strings.TrimSpace(line), "0123456789. ")
+		if strings.HasPrefix(directive, "gc bd list") || strings.HasPrefix(directive, "bd list") {
+			t.Errorf("config-drift handoff body directs the seat to the forbidden query: %q\n--- body ---\n%s", line, body)
 		}
 	}
 	// No drifted fields is legal and must not produce a dangling label.
