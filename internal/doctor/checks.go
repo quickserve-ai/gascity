@@ -24,12 +24,16 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/beads/contract"
 	"github.com/gastownhall/gascity/internal/citylayout"
+	"io"
+
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/doltversion"
+	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/pathutil"
 	"github.com/gastownhall/gascity/internal/pidutil"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/runtime/terminationevents"
 	"github.com/gastownhall/gascity/internal/workspacesvc"
 )
 
@@ -510,6 +514,32 @@ type ZombieSessionsCheck struct {
 	sessionTemplate string
 	sp              runtime.Provider
 	termSink        runtime.TerminationSink
+	noRecorder      bool
+}
+
+// resolveTerminationSink returns the sink this check should record through,
+// plus a closer. Precedence: an explicit refusal wins, then an explicitly
+// supplied sink, then the DERIVED city event recorder.
+//
+// DERIVED AT FIX TIME, not at construction, because CheckContext is where
+// CityPath lives and Fix is the only path that ends a session. That also keeps
+// the file handle open for the duration of one fix instead of the process.
+func resolveTerminationSink(ctx *CheckContext, explicit runtime.TerminationSink, noRecorder bool) (runtime.TerminationSink, func()) {
+	if noRecorder {
+		return nil, func() {}
+	}
+	if explicit != nil {
+		return explicit, func() {}
+	}
+	if ctx == nil || strings.TrimSpace(ctx.CityPath) == "" {
+		return nil, func() {}
+	}
+	rec, err := events.NewFileRecorder(filepath.Join(ctx.CityPath, ".gc", "events.jsonl"), io.Discard)
+	if err != nil {
+		// A bookkeeping sink must never fail the operation it observes.
+		return nil, func() {}
+	}
+	return terminationevents.New(rec, "doctor"), func() { _ = rec.Close() }
 }
 
 // CheckOption configures an optional capability on a session check. It is
@@ -518,13 +548,27 @@ type ZombieSessionsCheck struct {
 // change and a refactor.
 type CheckOption func(*sessionCheckOpts)
 
-type sessionCheckOpts struct{ termSink runtime.TerminationSink }
+type sessionCheckOpts struct {
+	termSink   runtime.TerminationSink
+	noRecorder bool
+}
 
-// WithTerminationSink wires the sink that records WHY a session the doctor
-// stops ended (ga-ksac39). Without it these checks still stop sessions exactly
-// as before and record nothing, which was the behaviour until now.
+// WithTerminationSink overrides the derived recorder with an explicit sink.
+// Mainly for tests that want to observe what was recorded.
 func WithTerminationSink(s runtime.TerminationSink) CheckOption {
 	return func(o *sessionCheckOpts) { o.termSink = s }
+}
+
+// WithNoTerminationRecorder is the ONLY way to make a doctor session-ending
+// silent, and it has to be said out loud (katya, ga-ksac39 S1 review).
+//
+// THE RECORDER IS DERIVED BY DEFAULT, NOT INJECTED, for the same reason the
+// Manager derives its bead sink: these are EVENT-ONLY sites, so a forgotten
+// option is not a missing corroboration, it is an UNCOUNTED DENOMINATOR ENTRY.
+// An opt-in would make the ratio's completeness depend on whether a future
+// caller remembered — and the callers who forget are never random.
+func WithNoTerminationRecorder() CheckOption {
+	return func(o *sessionCheckOpts) { o.noRecorder = true }
 }
 
 func applyCheckOptions(opts []CheckOption) sessionCheckOpts {
@@ -539,7 +583,8 @@ func applyCheckOptions(opts []CheckOption) sessionCheckOpts {
 
 // NewZombieSessionsCheck creates a check for zombie sessions.
 func NewZombieSessionsCheck(cfg *config.City, cityName, sessionTemplate string, sp runtime.Provider, opts ...CheckOption) *ZombieSessionsCheck {
-	return &ZombieSessionsCheck{cfg: cfg, cityName: cityName, sessionTemplate: sessionTemplate, sp: sp, termSink: applyCheckOptions(opts).termSink}
+	o := applyCheckOptions(opts)
+	return &ZombieSessionsCheck{cfg: cfg, cityName: cityName, sessionTemplate: sessionTemplate, sp: sp, termSink: o.termSink, noRecorder: o.noRecorder}
 }
 
 // Name returns the check identifier.
@@ -576,6 +621,8 @@ func (c *ZombieSessionsCheck) CanFix() bool { return true }
 // (GH#5742): the controller's own health patrol already reconciles zombie
 // sessions, and an uncoordinated Stop here would race it.
 func (c *ZombieSessionsCheck) Fix(ctx *CheckContext) error {
+	termSink, closeSink := resolveTerminationSink(ctx, c.termSink, c.noRecorder)
+	defer closeSink()
 	if IsControllerRunning(ctx.CityPath) {
 		return errControllerRunningFixSkipped
 	}
@@ -592,7 +639,7 @@ func (c *ZombieSessionsCheck) Fix(ctx *CheckContext) error {
 				Kind:   runtime.KindObservedDead,
 				Actor:  "doctor",
 				Reason: "zombie session: shell running, agent process dead",
-			}, c.termSink); err != nil {
+			}, termSink); err != nil {
 				return fmt.Errorf("killing zombie session %q: %w", sn, err)
 			}
 		}
@@ -607,11 +654,13 @@ type OrphanSessionsCheck struct {
 	sessionTemplate string
 	sp              runtime.Provider
 	termSink        runtime.TerminationSink
+	noRecorder      bool
 }
 
 // NewOrphanSessionsCheck creates a check for orphaned sessions.
 func NewOrphanSessionsCheck(cfg *config.City, cityName, sessionTemplate string, sp runtime.Provider, opts ...CheckOption) *OrphanSessionsCheck {
-	return &OrphanSessionsCheck{cfg: cfg, cityName: cityName, sessionTemplate: sessionTemplate, sp: sp, termSink: applyCheckOptions(opts).termSink}
+	o := applyCheckOptions(opts)
+	return &OrphanSessionsCheck{cfg: cfg, cityName: cityName, sessionTemplate: sessionTemplate, sp: sp, termSink: o.termSink, noRecorder: o.noRecorder}
 }
 
 // Name returns the check identifier.
@@ -670,6 +719,8 @@ func (c *OrphanSessionsCheck) CanFix() bool { return true }
 // (GH#5742): the controller's own health patrol already reconciles orphan
 // sessions, and an uncoordinated Stop here would race it.
 func (c *OrphanSessionsCheck) Fix(ctx *CheckContext) error {
+	termSink, closeSink := resolveTerminationSink(ctx, c.termSink, c.noRecorder)
+	defer closeSink()
 	if IsControllerRunning(ctx.CityPath) {
 		return errControllerRunningFixSkipped
 	}
@@ -696,7 +747,7 @@ func (c *OrphanSessionsCheck) Fix(ctx *CheckContext) error {
 				Kind:   runtime.KindOperatorKill,
 				Actor:  "doctor",
 				Reason: "reaping a session not present in city config",
-			}, c.termSink); err != nil {
+			}, termSink); err != nil {
 				return fmt.Errorf("killing orphan session %q: %w", s, err)
 			}
 		}

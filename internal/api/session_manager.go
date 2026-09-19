@@ -5,22 +5,26 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/runtime/terminationevents"
 	"github.com/gastownhall/gascity/internal/session"
 )
 
 func (s *Server) sessionManager(store beads.Store) *session.Manager {
 	cfg := s.state.Config()
-	if cfg == nil {
-		return session.NewManagerWithOptions(store, s.state.SessionProvider(), session.WithCityPath(s.state.CityPath()))
+	opts := []session.ManagerOption{session.WithCityPath(s.state.CityPath())}
+	// ga-ksac39: the event sink is the Manager's SECOND failure domain. The
+	// bead sink is on by default and rides Dolt; this one is a local append
+	// that survives the incidents the bead write does not.
+	if rec := s.state.EventProvider(); rec != nil {
+		opts = append(opts, session.WithTerminationSinks(terminationevents.New(rec, "api")))
 	}
-	return session.NewManagerWithOptions(
-		store,
-		s.state.SessionProvider(),
-		session.WithCityPath(s.state.CityPath()),
-		session.WithTransportPolicyResolver(func(template, provider string) (string, bool) {
-			return configuredSessionTransportResolution(cfg, template, provider)
-		}),
-	)
+	if cfg == nil {
+		return session.NewManagerWithOptions(store, s.state.SessionProvider(), opts...)
+	}
+	opts = append(opts, session.WithTransportPolicyResolver(func(template, provider string) (string, bool) {
+		return configuredSessionTransportResolution(cfg, template, provider)
+	}))
+	return session.NewManagerWithOptions(store, s.state.SessionProvider(), opts...)
 }
 
 func configuredSessionTransport(cfg *config.City, template, provider string) string {

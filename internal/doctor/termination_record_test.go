@@ -2,6 +2,8 @@ package doctor
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/agent"
@@ -71,16 +73,42 @@ func TestDoctorSessionEndingsAreRecorded(t *testing.T) {
 	}
 }
 
-// TestDoctorChecksStillBuildWithNoSink pins the variadic option's whole purpose:
-// the twelve existing test callers and the pre-wiring production caller must
-// keep working, recording nothing rather than failing.
-func TestDoctorChecksStillBuildWithNoSink(t *testing.T) {
-	sp := runtime.NewFake()
-	cfg := &config.City{}
-	if c := NewZombieSessionsCheck(cfg, "gastown", "", sp); c == nil || c.termSink != nil {
-		t.Error("zombie check without an option must carry a nil sink")
+// TestDoctorRecorderIsDerivedNotInjected is katya's derive-by-default ruling.
+//
+// THESE ARE EVENT-ONLY SITES, so a forgotten option is not a missing
+// corroboration — it is an UNCOUNTED DENOMINATOR ENTRY. Recording therefore
+// cannot be something a caller opts into; it must be what happens unless
+// someone says otherwise out loud.
+func TestDoctorRecorderIsDerivedNotInjected(t *testing.T) {
+	city := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(city, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	if c := NewOrphanSessionsCheck(cfg, "gastown", "", sp); c == nil || c.termSink != nil {
-		t.Error("orphan check without an option must carry a nil sink")
+	ctx := &CheckContext{CityPath: city}
+
+	// No option at all -> a sink is DERIVED.
+	got, closeFn := resolveTerminationSink(ctx, nil, false)
+	defer closeFn()
+	if got == nil {
+		t.Error("no option must still yield a derived recorder — that is the whole ruling")
+	}
+
+	// Silence requires saying so.
+	if s, c := resolveTerminationSink(ctx, nil, true); s != nil {
+		c()
+		t.Error("WithNoTerminationRecorder must yield silence")
+	}
+
+	// An explicit sink still wins, for tests that want to observe.
+	explicit := &capturingSink{}
+	if s, c := resolveTerminationSink(ctx, explicit, false); s != explicit {
+		c()
+		t.Error("an explicitly supplied sink must take precedence over the derived one")
+	}
+
+	// And a check built with no option carries the refusal flag unset, so it
+	// will derive at fix time rather than stay silent.
+	if c := NewZombieSessionsCheck(&config.City{}, "gastown", "", runtime.NewFake()); c.noRecorder {
+		t.Error("a check built with no option must NOT be in refusal mode")
 	}
 }

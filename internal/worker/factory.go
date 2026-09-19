@@ -9,6 +9,7 @@ import (
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/pricing"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/runtime/terminationevents"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/usage"
 )
@@ -73,6 +74,15 @@ func NewFactory(cfg FactoryConfig) (*Factory, error) {
 	}
 	if cfg.StaleKeyDetectionWaiter != nil {
 		opts = append(opts, sessionpkg.WithStaleKeyDetectionWaiter(cfg.StaleKeyDetectionWaiter))
+	}
+	// ga-ksac39: give the Manager's termination records their SECOND failure
+	// domain. The bead sink is wired by default and rides Dolt, so it fails
+	// during exactly the incidents that produce force-exits; this local append
+	// almost never does. Two sinks in one failure domain would be one sink with
+	// extra steps (katya, condition 2).
+	if cfg.Recorder != nil {
+		opts = append(opts, sessionpkg.WithTerminationSinks(
+			terminationevents.New(cfg.Recorder, "worker")))
 	}
 	manager := sessionpkg.NewManagerWithOptions(cfg.Store, cfg.Provider, opts...)
 	return newFactory(manager, cfg)

@@ -11,16 +11,13 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/beads/contract"
-	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/doctor"
-	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/materialize"
 	"github.com/gastownhall/gascity/internal/orders"
 	"github.com/gastownhall/gascity/internal/pathutil"
 	"github.com/gastownhall/gascity/internal/rollout"
-	"github.com/gastownhall/gascity/internal/runtime/terminationevents"
 	"github.com/gastownhall/gascity/internal/suspensionstate"
 	"github.com/spf13/cobra"
 )
@@ -357,12 +354,13 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 			// path. events.Discard is the honest fallback when the recorder
 			// cannot be opened: it records nothing rather than failing a doctor
 			// run over bookkeeping.
-			rec, closeRec := openDoctorTerminationRecorder(cityPath, opts.Stderr)
-			defer closeRec()
-			termSink := doctor.WithTerminationSink(terminationevents.New(rec, "doctor"))
+			// No sink is injected here: the checks DERIVE their recorder from
+			// the CheckContext at fix time (katya's derive-by-default ruling),
+			// so a caller cannot forget to record. Silence requires an explicit
+			// doctor.WithNoTerminationRecorder().
 			register(doctor.NewAgentSessionsCheck(cfg, cityName, st, sp))
-			register(doctor.NewZombieSessionsCheck(cfg, cityName, st, sp, termSink))
-			register(doctor.NewOrphanSessionsCheck(cfg, cityName, st, sp, termSink))
+			register(doctor.NewZombieSessionsCheck(cfg, cityName, st, sp))
+			register(doctor.NewOrphanSessionsCheck(cfg, cityName, st, sp))
 		}
 	}
 
@@ -995,25 +993,5 @@ func openStoreForCity(cityPath string) func(string) (beads.Store, error) {
 func openStoreResultForCity(cityPath string) func(string) (beads.StoreOpenResult, error) {
 	return func(dirPath string) (beads.StoreOpenResult, error) {
 		return openStoreResultAtForCity(dirPath, cityPath)
-	}
-}
-
-// openDoctorTerminationRecorder opens the city event log for the doctor's
-// session-ending records, falling back to events.Discard. Same shape as
-// openDeferredReleaseEventRecorder: a bookkeeping sink must never be able to
-// fail the operation it observes.
-func openDoctorTerminationRecorder(cityPath string, stderr io.Writer) (events.Recorder, func()) {
-	if strings.TrimSpace(cityPath) == "" {
-		return events.Discard, func() {}
-	}
-	rec, err := events.NewFileRecorder(filepath.Join(cityPath, citylayout.RuntimeRoot, "events.jsonl"), stderr)
-	if err != nil {
-		fmt.Fprintf(stderr, "gc doctor: warning: events recorder unavailable, session endings this run will not be recorded: %v\n", err) //nolint:errcheck // best-effort stderr
-		return events.Discard, func() {}
-	}
-	return rec, func() {
-		if cerr := rec.Close(); cerr != nil {
-			fmt.Fprintf(stderr, "gc doctor: warning: closing the events recorder: %v\n", cerr) //nolint:errcheck // best-effort stderr
-		}
 	}
 }

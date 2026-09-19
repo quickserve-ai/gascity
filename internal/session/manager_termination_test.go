@@ -254,3 +254,56 @@ func TestKillIntentComesFromTheCallerNotTheManager(t *testing.T) {
 		}
 	})
 }
+
+// TestBothSinksReceiveTheSameEnding pins katya's condition 2 at the Manager
+// boundary: two sinks in TWO failure domains, not one sink with extra steps.
+//
+// The bead sink rides Dolt and fails during exactly the incidents that produce
+// force-exits; the event sink is a local append that almost never does. This
+// asserts an ending reaches BOTH, and — more importantly — that ONE SINK FAILING
+// DOES NOT COST THE OTHER ITS RECORD, which is the entire reason there are two.
+func TestBothSinksReceiveTheSameEnding(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	extra := &recordingSink{}
+	mgr := NewManagerWithOptions(store, sp, WithTerminationSinks(extra))
+	info := liveSession(t, mgr, "two-domains")
+
+	if err := mgr.KillWithTermination(info.ID, runtime.Termination{
+		Kind: runtime.KindOperatorKill, Reason: "two-sink check",
+	}); err != nil {
+		t.Fatalf("Kill: %v", err)
+	}
+	// The explicitly supplied sink saw it...
+	if len(extra.got) != 1 || extra.got[0].Kind != runtime.KindOperatorKill {
+		t.Fatalf("supplied sink got %+v, want one operator-kill", extra.got)
+	}
+	// ...and so did the DEFAULT bead sink, which is not the same object.
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if b.Metadata[TerminationKindKey] != string(runtime.KindOperatorKill) {
+		t.Errorf("bead sink did not record: %s = %q",
+			TerminationKindKey, b.Metadata[TerminationKindKey])
+	}
+}
+
+// TestASickSinkDoesNotCostTheOtherItsRecord is the failure-domain claim itself.
+func TestASickSinkDoesNotCostTheOtherItsRecord(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	healthy := &recordingSink{}
+	mgr := NewManagerWithOptions(store, sp, WithTerminationSinks(panickingSink{}, healthy))
+	info := liveSession(t, mgr, "one-sick")
+
+	_ = mgr.KillWithTermination(info.ID, runtime.Termination{Kind: runtime.KindOperatorKill})
+
+	if len(healthy.got) != 1 {
+		t.Fatalf("the healthy sink recorded %d — a sick peer took its record with it",
+			len(healthy.got))
+	}
+	if sp.IsRunning(info.SessionName) {
+		t.Error("and the stop must still have happened")
+	}
+}
