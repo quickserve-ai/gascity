@@ -182,6 +182,6 @@ func TestSupervisorBuildDriftDoesNotProbeWhenItCannotDecide(t *testing.T) {
 // TestSupervisorBuildDriftSatisfiesCheck fails to compile if the check ever
 // stops implementing the doctor Check interface — the omission that would let
 // it be written, tested and never registered.
-func TestSupervisorBuildDriftSatisfiesCheck(t *testing.T) {
+func TestSupervisorBuildDriftSatisfiesCheck(_ *testing.T) {
 	var _ Check = NewSupervisorBuildDriftCheck(false, "", nil, nil)
 }
