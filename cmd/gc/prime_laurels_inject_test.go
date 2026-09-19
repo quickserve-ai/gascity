@@ -10,7 +10,7 @@ import (
 )
 
 func TestPrimeLaurelsInjection(t *testing.T) {
-	dir := t.TempDir()
+	dir := laurelsSeatHome(t)
 	if got := primeLaurelsInjection(dir); got != "" {
 		t.Fatalf("absent file: got %q, want nothing", got)
 	}
@@ -36,7 +36,7 @@ func TestPrimeLaurelsInjection(t *testing.T) {
 }
 
 func TestPrimeLaurelsInjectionCapsAtARuneBoundary(t *testing.T) {
-	dir := t.TempDir()
+	dir := laurelsSeatHome(t)
 	// 3-byte runes straddle the cap, so a byte cut would split one.
 	if err := os.WriteFile(filepath.Join(dir, laurelsFileName), []byte(strings.Repeat("✓", laurelsMaxBytes)), 0o644); err != nil {
 		t.Fatal(err)
@@ -56,7 +56,7 @@ func TestPrimeLaurelsInjectionCapsAtARuneBoundary(t *testing.T) {
 // Codex review of #102: a cap-sized paragraph with its customary trailing newline
 // made the old cut index one past the trimmed text and panic in SessionStart.
 func TestPrimeLaurelsInjectionCapSizedParagraphWithNewline(t *testing.T) {
-	dir := t.TempDir()
+	dir := laurelsSeatHome(t)
 	body := strings.Repeat("a", laurelsMaxBytes)
 	if err := os.WriteFile(filepath.Join(dir, laurelsFileName), []byte(body+"\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -71,7 +71,7 @@ func TestPrimeLaurelsInjectionCapSizedParagraphWithNewline(t *testing.T) {
 }
 
 func TestPrimeLaurelsInjectionReadsTheSeatHomeFirst(t *testing.T) {
-	dir := t.TempDir()
+	dir := laurelsSeatHome(t)
 	if err := os.MkdirAll(filepath.Join(dir, "seat"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestPrimeLaurelsInjectionReadsTheSeatHomeFirst(t *testing.T) {
 }
 
 func TestPrimeLaurelsInjectionIgnoresANonRegularFile(t *testing.T) {
-	dir := t.TempDir()
+	dir := laurelsSeatHome(t)
 	// A directory stands in for any non-regular path (a FIFO would block a read).
 	if err := os.MkdirAll(filepath.Join(dir, laurelsFileName), 0o755); err != nil {
 		t.Fatal(err)
@@ -100,8 +100,13 @@ func TestPrimeLaurelsInjectionIgnoresANonRegularFile(t *testing.T) {
 // The laurels ride SessionStart only: a UserPromptSubmit hook must not repeat
 // them on every turn.
 func TestPrimeHookContextSuffixCarriesLaurelsAtSessionStartOnly(t *testing.T) {
+	// seat/laurels.md is read in any GC_DIR. A .gc/agents home here would make
+	// the temp dir look like a city and start a dolt server for it.
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, laurelsFileName), []byte("A customer thanked this seat."), 0o644); err != nil {
+	if err := os.MkdirAll(filepath.Join(dir, "seat"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "seat", laurelsFileName), []byte("A customer thanked this seat."), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("GC_DIR", dir)
@@ -113,5 +118,60 @@ func TestPrimeHookContextSuffixCarriesLaurelsAtSessionStartOnly(t *testing.T) {
 	turn := primeHookContextSuffix(city, true, primeHookContext{HookEventName: "UserPromptSubmit"}, io.Discard, false)
 	if strings.Contains(turn.text, "<laurels>") {
 		t.Fatalf("a non-SessionStart hook carried the laurels: %q", turn.text)
+	}
+}
+
+// laurelsSeatHome makes a city seat's .gc/agents/<name> home, the only GC_DIR
+// where a flat laurels.md is read.
+func laurelsSeatHome(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), ".gc", "agents", "seat-under-test")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// Codex review of #102, round 3: opening the path followed a symlinked
+// laurels.md, so a rig could point it at a credential and have it sent to the
+// provider at SessionStart. Both homes must refuse a symlink.
+func TestPrimeLaurelsInjectionRefusesASymlink(t *testing.T) {
+	secret := filepath.Join(t.TempDir(), "credentials")
+	if err := os.WriteFile(secret, []byte("SECRET-TOKEN"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, rel := range []string{laurelsFileName, filepath.Join("seat", laurelsFileName)} {
+		dir := laurelsSeatHome(t)
+		link := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(secret, link); err != nil {
+			t.Fatal(err)
+		}
+		if got := primeLaurelsInjection(dir); got != "" {
+			t.Fatalf("%s is a symlink: got %q, want nothing", rel, got)
+		}
+	}
+}
+
+// Codex review of #102, round 3: a rig seat's GC_DIR is its project checkout,
+// whose root laurels.md is repository content. Only seat/laurels.md counts there.
+func TestPrimeLaurelsInjectionReadsTheFlatFileOnlyInACitySeatHome(t *testing.T) {
+	checkout := t.TempDir()
+	if err := os.WriteFile(filepath.Join(checkout, laurelsFileName), []byte("a repo file named laurels.md"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := primeLaurelsInjection(checkout); got != "" {
+		t.Fatalf("a checkout root laurels.md was injected: %q", got)
+	}
+	if err := os.MkdirAll(filepath.Join(checkout, "seat"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(checkout, "seat", laurelsFileName), []byte("from the seat home"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := primeLaurelsInjection(checkout); !strings.Contains(got, "from the seat home") {
+		t.Fatalf("seat/laurels.md in a checkout was not injected: %q", got)
 	}
 }
