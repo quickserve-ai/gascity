@@ -28,10 +28,23 @@ func primeHookContextSuffix(cityPath string, hookMode bool, hookContext primeHoo
 	}
 	injection := primeHookContextInjection{text: wispStepInjectionContent(cityPath)}
 	if primeHookSessionStart(hookContext) {
+		// FIRST, because it frames everything below it: a seat that was killed
+		// rather than finished has to know that before it reads a mailbox and
+		// starts inferring what it was doing (ga-ksac39 S2). It renders only
+		// when the previous ending composed no note, so in the ordinary
+		// handoff case this is empty and costs nothing.
+		notice := terminationNoticeForSessionStart(stderr)
+		injection.text += notice.text
+
 		autoHandoff, autoHandoffIDs := sessionStartAutoHandoffInjection(stderr)
 		injection.text += autoHandoff.text
 		if consumeHandoff {
-			injection.afterDelivery = autoHandoff.afterDelivery
+			// BOTH consumers, or the notice repeats on every boot forever. An
+			// earlier shape assigned autoHandoff.afterDelivery straight onto the
+			// field, so adding a second producer here silently dropped one of
+			// them — the kind of loss that only shows up as a seat being told
+			// the same thing three times.
+			injection.afterDelivery = composeAfterDelivery(autoHandoff.afterDelivery, notice.afterDelivery)
 		}
 		// dip-bj7pgj: an autonomous/promptless restart runs this SessionStart
 		// hook but never the UserPromptSubmit mail hook, so also surface ordinary
@@ -144,3 +157,37 @@ func sessionStartAutoHandoffInjection(stderr io.Writer) (primeHookContextInjecti
 		},
 	}, ids
 }
+
+// composeAfterDelivery folds the SessionStart consumers into one callback,
+// skipping nil producers. Each runs even if an earlier one panics: they are
+// independent consumptions (archiving injected mail, stamping the termination
+// notice) and one failing must not silently re-arm the other.
+func composeAfterDelivery(fns ...func()) func() {
+	live := make([]func(), 0, len(fns))
+	for _, fn := range fns {
+		if fn != nil {
+			live = append(live, fn)
+		}
+	}
+	if len(live) == 0 {
+		return nil
+	}
+	return func() {
+		for _, fn := range live {
+			func() {
+				defer func() { _ = recover() }()
+				fn()
+			}()
+		}
+	}
+}
+
+// terminationNoticeForSessionStart is the seam the wiring test swaps.
+//
+// A var rather than a direct call because the alternative is no coverage at all
+// of whether this producer is still WIRED: the real injector needs a city and a
+// GC_SESSION_ID, and with neither it returns empty — indistinguishable from
+// having been deleted. "Deleted default wiring" is precisely the mutant class
+// that has to stay killable here (ga-ksac39 S1 review), since the whole slice is
+// worthless if the notice is composed correctly and never rendered.
+var terminationNoticeForSessionStart = terminationNoticeInjection
