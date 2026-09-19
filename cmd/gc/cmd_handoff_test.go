@@ -423,7 +423,7 @@ func TestCmdHandoffAutoRejectsTarget(t *testing.T) {
 
 // seedOnDemandNamedSession plants an on-demand configured named session bead
 // named "mayor" for the self-handoff tests below.
-func seedOnDemandNamedSession(t *testing.T, store beads.Store) beads.Bead {
+func seedOnDemandNamedSession(t *testing.T, store beads.Store) {
 	t.Helper()
 	b, err := store.Create(beads.Bead{
 		Type:   sessionBeadType,
@@ -441,7 +441,6 @@ func seedOnDemandNamedSession(t *testing.T, store beads.Store) beads.Bead {
 			t.Fatalf("set %s: %v", k, err)
 		}
 	}
-	return b
 }
 
 // A self-handoff cycles an on-demand configured named seat (ga-cctcju). It
