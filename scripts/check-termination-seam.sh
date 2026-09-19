@@ -18,14 +18,23 @@
 #
 # WHAT IT SCANS: non-test .go under cmd/ and internal/, excluding the provider
 # IMPLEMENTATIONS themselves (internal/runtime/<provider>/ and the package's own
-# fake/adapter/conformance helpers), for a call to .Stop( on a runtime provider
-# handle. The vocabulary lives in scripts/termination-seam-patterns.txt.
+# fake/adapter/conformance helpers), for `.Stop(` WITH A NON-EMPTY ARGUMENT,
+# minus the shapes allowlisted in scripts/termination-seam-patterns.txt.
 #
-# grep cannot do type analysis, so the patterns match the RECEIVER NAMES that
-# actually hold a runtime.Provider in this tree (sp, provider, prov, h.provider,
-# c.sp, m.sp). That is deliberately narrow: a false NEGATIVE here costs one
-# uncounted site, which the unclassified budget then surfaces; a false POSITIVE
-# blocks unrelated work and teaches people to route around the guard.
+# THE DISCRIMINATOR IS THE SIGNATURE, NOT THE RECEIVER NAME, since 2026-09-19.
+# runtime.Provider.Stop takes one argument — the session name. A timer or ticker
+# is Stop() with none; a worker handle is Stop(ctx) and funnels through the seam
+# itself. Until this scan inverted, it matched a VOCABULARY of six receiver
+# spellings, which made the fence an enumeration of the very thing it was built
+# to catch: `runtimeProvider.Stop(name)` passed both the scan and its own
+# self-test, and a real provider delegation in cmd/gc/status_provider.go had gone
+# unseen since the fence was written. The Codex review of PR #106 named it.
+#
+# The old file also justified the narrowness with a claim that was FALSE: that a
+# false negative "costs one uncounted site, which the unclassified budget then
+# surfaces". An unrecorded call writes no row, so it cannot raise the unclassified
+# share — it is missing from every share, denominator included. Nothing catches
+# it but this fence. See the pattern file for the full note.
 #
 # EXIT: 0 no new violations. 1 new violations (they are printed). 2 the guard
 # could not run — NEVER "clean". A guard that cannot run must not answer "pass";
@@ -59,11 +68,15 @@ scan() {
 	local dir="$1" pat
 	pat=$(grep -vE '^\s*(#|$)' "$PATTERNS" | paste -sd'|' -) || return 2
 	[ -n "$pat" ] || return 2
-	(cd "$dir" && grep -rnE "$pat" --include='*.go' cmd internal 2>/dev/null) |
+	# Match every .Stop( with a non-empty argument, then SUBTRACT the allowlisted
+	# shapes. The subtraction is what makes a new provider receiver spelling a
+	# violation by default instead of an omission nobody notices.
+	(cd "$dir" && grep -rnE '\.Stop\([^)]' --include='*.go' cmd internal 2>/dev/null) |
 		grep -v '_test\.go:' |
 		grep -vE '^internal/runtime/(termination|fake|seam_adapter|beacon)\.go:' |
-		grep -vE '^internal/runtime/(tmux|subprocess|exec|ssh|k8s|acp|herdr|auto|t3bridge|runtimetest)/' |
+		grep -vE '^internal/runtime/(tmux|subprocess|exec|ssh|k8s|acp|herdr|auto|t3bridge|runtimetest|hybrid|registry|proctable|runtimecontract|runtimecapability|rppcheck)/' |
 		grep -vE ':[0-9]+:\s*//' |
+		grep -vE "$pat" |
 		sed -E 's/^([^:]+):([0-9]+):[[:space:]]*/\1:\2:/'
 }
 
@@ -75,11 +88,14 @@ if [ "$SELFTEST" = 1 ]; then
 	trap 'rm -rf "$tmp"' EXIT
 	mkdir -p "$tmp/scripts" "$tmp/cmd/gc" "$tmp/internal"
 	cp "$PATTERNS" "$tmp/scripts/" || exit 2
+	# The planted call uses a receiver spelling the OLD vocabulary-based fence
+	# did NOT know, so this control proves the widening rather than re-proving
+	# what the narrow version already caught.
 	cat > "$tmp/cmd/gc/planted.go" <<'PLANT'
 package main
 
 func planted() {
-	if err := sp.Stop(name); err != nil {
+	if err := runtimeProvider.Stop(name); err != nil {
 		_ = err
 	}
 }

@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -143,8 +144,23 @@ func TestManagerStopSurvivesASickSink(t *testing.T) {
 		t.Fatal("session still running after Kill with a panicking sink — the " +
 			"stop waited on bookkeeping")
 	}
-	if err == nil {
-		t.Error("sink panic was swallowed; StopRecorded rule 2 says it is reported")
+	// *** THIS ASSERTION WAS INVERTED ON 2026-09-19, and the inversion is the
+	// fix, not a weakening. *** It used to require Kill to RETURN the sink's
+	// error, reading rule 2's "reported, not swallowed" as "returned". That is
+	// what made Suspend and CloseDetailed abandon their lifecycle transitions
+	// when a sink failed, leaving a dead runtime behind a live bead — the
+	// Codex #106 finding. It is also the wrong contract for Kill itself: the
+	// reconciler's verifiedStop branches on this error, so a void event
+	// recorder (which cannot acknowledge a write, and is the ordinary
+	// configuration) would have made every successful kill look failed and
+	// earn a retry.
+	//
+	// Rule 2 is satisfied by the LOG LINE in Manager.stopRecorded. The seam
+	// still hands both errors back; the Manager chooses which question its
+	// callers are asking. worker.RuntimeHandle.stopRecorded made the same
+	// choice, for the same reason, one package over.
+	if err != nil {
+		t.Errorf("Kill returned %v — a sink panic is a bookkeeping failure and must not read as a failed stop", err)
 	}
 }
 
@@ -306,5 +322,82 @@ func TestASickSinkDoesNotCostTheOtherItsRecord(t *testing.T) {
 	}
 	if sp.IsRunning(info.SessionName) {
 		t.Error("and the stop must still have happened")
+	}
+}
+
+// failingSink is a sink whose write always fails — the ALLOWED case. The whole
+// five-second budget exists because this is expected during an incident.
+type failingSink struct{ calls int }
+
+func (f *failingSink) RecordTermination(string, runtime.Termination) error {
+	f.calls++
+	return errors.New("store is sick")
+}
+
+// TestASinkFailureDoesNotAbortTheLifecycleTransition is the Codex #106 finding.
+//
+// Suspend and CloseDetailed branch on the stop's result to decide whether to
+// persist the session's new state. While Manager.stopRecorded returned the
+// JOINED error, a failing sink made both of them return before writing that
+// state — so a runtime that really had stopped was left behind a bead that still
+// read live, and the reconciler would see it as recoverable. A recording problem
+// turned into a stranded session.
+func TestASinkFailureDoesNotAbortTheLifecycleTransition(t *testing.T) {
+	// Each case asserts the transition IN ITS OWN TERMS: Suspend writes the
+	// metadata state, CloseDetailed closes the bead's status. Asserting one
+	// shape for both would have let the Close case pass for the wrong reason.
+	for _, tc := range []struct {
+		name      string
+		act       func(*Manager, Info) error
+		persisted func(beads.Bead) (string, string)
+	}{
+		{
+			"Suspend", func(m *Manager, info Info) error { return m.Suspend(info.ID) },
+			func(b beads.Bead) (string, string) { return b.Metadata["state"], string(StateSuspended) },
+		},
+		{"CloseDetailed", func(m *Manager, info Info) error {
+			_, err := m.CloseDetailed(info.ID)
+			return err
+		}, func(b beads.Bead) (string, string) { return b.Status, "closed" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sink := &failingSink{}
+			store := beads.NewMemStore()
+			mgr := NewManagerWithOptions(store, runtime.NewFake(), WithTerminationSinks(sink))
+			info := liveSession(t, mgr, "sink-failure")
+
+			if err := tc.act(mgr, info); err != nil {
+				t.Fatalf("%s returned %v — a sink failure is ALLOWED and must not read as a failed stop", tc.name, err)
+			}
+			if sink.calls == 0 {
+				t.Fatal("the sink was never called, so this test proves nothing about sink failures")
+			}
+			b, err := store.Get(info.ID)
+			if err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+			if got, want := tc.persisted(b); got != want {
+				t.Errorf("persisted state = %q, want %q — the lifecycle transition was abandoned because BOOKKEEPING failed", got, want)
+			}
+		})
+	}
+}
+
+// TestARealStopFailureStillFails — the other side, so the fix above cannot be
+// "ignore every error". A provider that cannot stop must still be an error.
+func TestARealStopFailureStillFails(t *testing.T) {
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(beads.NewMemStore(), sp)
+	info := liveSession(t, mgr, "stop-failure")
+	// Key the failure off the name the Fake actually saw, rather than
+	// re-deriving the Manager's naming rule in the test and getting a pass from
+	// a Stop that was never attempted.
+	names, err := sp.ListRunning("")
+	if err != nil || len(names) != 1 {
+		t.Fatalf("ListRunning = %v, %v; want exactly one live fake session", names, err)
+	}
+	sp.StopErrors[names[0]] = errors.New("provider wedged")
+	if err := mgr.Suspend(info.ID); err == nil {
+		t.Error("a genuine stop failure must still surface: the fix separates the two questions, it does not silence one")
 	}
 }

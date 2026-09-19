@@ -828,11 +828,41 @@ func (m *Manager) routeACPIfNeeded(provider, transport, sessName string) func() 
 // terminal from a seat, when both have GC_AGENT set — so "human" is never
 // claimed here. Naming a wrong actor is worse than naming none: a checkable but
 // wrong attribution is harder to unwind than a missing one.
+// *** ONLY THE STOP'S OWN FAILURE IS THIS METHOD'S ERROR. *** Every caller here
+// branches on the result to decide whether to persist the session's new
+// lifecycle state, and a sink failure is EXPLICITLY ALLOWED — that is what the
+// five-second TerminationSinkBudget is for. Returning the joined error made
+// Suspend and CloseDetailed abort BEFORE writing the suspended/closed state, so
+// an unreachable event log or a sick Dolt turned a successful stop into a dead
+// runtime behind a live bead: the exact strand this seam was built to prevent,
+// caused by the seam. Found by the Codex review of PR #106, and the shape was
+// already written down one package over — worker.RuntimeHandle.stopRecorded
+// carries this same comment and does the right thing.
+//
+// THE RECORD FAILURE IS NOT SWALLOWED INTO NOTHING, it is reported where
+// bookkeeping belongs. There are two sinks with independent failure domains, so
+// one failing usually still leaves a record; and where a bead record is missing
+// but the event exists, the reconciliation rule has the event fill the hole and
+// FLAGS the week rather than silently patching it (katya, condition 2). A
+// missing record surfaces in that weekly read. It must not surface as a close
+// that refused to close.
+//
+// Returning it instead would also break in the COMMON configuration rather than
+// a rare one: the event sink reports "emitted to a recorder that cannot
+// acknowledge it" through any plain void Recorder, so every ordinary close on an
+// unacknowledged recorder would come back an error.
 func (m *Manager) stopRecorded(sessName string, rec runtime.Termination) error {
 	if rec.Actor == "" {
 		rec.Actor = strings.TrimSpace(os.Getenv("GC_AGENT"))
 	}
-	return runtime.StopRecorded(m.sp, sessName, rec, m.terminationSinks...)
+	stopErr, recErr := runtime.StopRecordedDetailed(m.sp, sessName, rec, m.terminationSinks...)
+	if recErr != nil {
+		// REPORTED, NOT SWALLOWED — rule 2 — but to the log, not to the caller.
+		// The caller's question is "did the session end", and answering it with a
+		// bookkeeping failure is what caused the strand above.
+		log.Printf("session %s: ended (%s) but the termination record failed: %v", sessName, rec.Kind, recErr)
+	}
+	return stopErr
 }
 
 // ManagerOption configures an optional Manager capability. It is the single
