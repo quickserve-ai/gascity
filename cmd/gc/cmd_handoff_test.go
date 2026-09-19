@@ -420,19 +420,10 @@ func TestCmdHandoffAutoRejectsTarget(t *testing.T) {
 	}
 }
 
-// Regression for gastownhall/gascity#744:
-// gc handoff on a named (human-attended) session used to call
-// setRestartRequested unconditionally. The controller cannot respawn a
-// user-started session, so the PreCompact hook crashed the user to their shell
-// on every context compaction. doHandoff must recognize the named-session
-// case, still send the handoff mail, and skip both the tmux and bead restart
-// flags.
-func TestDoHandoff_Regression744_NamedSessionSkipsRestart(t *testing.T) {
-	store := beads.NewMemStore()
-	rec := events.NewFake()
-	dops := newFakeDrainOps()
-	var stdout, stderr bytes.Buffer
-
+// seedOnDemandNamedSession plants an on-demand configured named session bead
+// named "mayor" for the self-handoff tests below.
+func seedOnDemandNamedSession(t *testing.T, store beads.Store) {
+	t.Helper()
 	b, err := store.Create(beads.Bead{
 		Type:   sessionBeadType,
 		Labels: []string{"gc:session"},
@@ -440,22 +431,31 @@ func TestDoHandoff_Regression744_NamedSessionSkipsRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seeding session bead: %v", err)
 	}
-	if err := store.SetMetadata(b.ID, "session_name", "mayor"); err != nil {
-		t.Fatalf("set session_name: %v", err)
+	for k, v := range map[string]string{
+		"session_name":             "mayor",
+		"configured_named_session": "true",
+		"configured_named_mode":    "on_demand",
+	} {
+		if err := store.SetMetadata(b.ID, k, v); err != nil {
+			t.Fatalf("set %s: %v", k, err)
+		}
 	}
-	if err := store.SetMetadata(b.ID, "configured_named_session", "true"); err != nil {
-		t.Fatalf("set configured_named_session: %v", err)
-	}
-	if err := store.SetMetadata(b.ID, "configured_named_mode", "on_demand"); err != nil {
-		t.Fatalf("set configured_named_mode: %v", err)
-	}
-	if err := store.SetMetadata(b.ID, "restart_requested", "true"); err != nil {
-		t.Fatalf("set restart_requested: %v", err)
-	}
-	if err := store.SetMetadata(b.ID, "continuation_reset_pending", "true"); err != nil {
-		t.Fatalf("set continuation_reset_pending: %v", err)
-	}
-	dops.restartRequested["mayor"] = true
+}
+
+// A self-handoff cycles an on-demand configured named seat (ga-cctcju). It
+// used to send the mail and skip the restart: gastownhall/gascity#744, where a
+// PreCompact hook running bare `gc handoff` crashed a human-attended session to
+// its shell on every compaction. PreCompact now runs `gc handoff --auto`, which
+// never restarts (and gc-flp1 flags a hook that does not), while a handoff the
+// seat asks for itself is the authorization to cycle it. The reconciler's
+// restart consume lands the reset-pending marker that wakes the seat again
+// (TestReconcileSessionBeads_RestartRequestOnDemandWakesFromResetMarker).
+func TestDoHandoff_OnDemandNamedSessionRequestsRestart(t *testing.T) {
+	store := beads.NewMemStore()
+	rec := events.NewFake()
+	dops := newFakeDrainOps()
+	var stdout, stderr bytes.Buffer
+	seedOnDemandNamedSession(t, store)
 
 	persistCalled := false
 	outcome := doHandoffWithOutcome(store, store, rec, dops, func() error {
@@ -465,71 +465,43 @@ func TestDoHandoff_Regression744_NamedSessionSkipsRestart(t *testing.T) {
 	if outcome.code != 0 {
 		t.Fatalf("code = %d, want 0; stderr: %s", outcome.code, stderr.String())
 	}
-	if outcome.restartRequested {
-		t.Fatal("restartRequested = true, want false for on-demand named session")
+	if !outcome.restartRequested {
+		t.Fatal("restartRequested = false, want true: a self-handoff cycles an on-demand named seat")
 	}
-
 	mailFound := false
-	all := listOpenMessagesBothTiers(t, store)
-	for _, got := range all {
+	for _, got := range listOpenMessagesBothTiers(t, store) {
 		if got.Title == "HANDOFF: context full" && got.Type == "message" {
 			mailFound = true
 			break
 		}
 	}
 	if !mailFound {
-		t.Fatalf("handoff mail not created; beads=%v", all)
+		t.Fatal("handoff mail not created")
 	}
-	if dops.restartRequested["mayor"] {
-		t.Errorf("restart-requested flag is still set; named sessions must skip restart")
+	if !dops.restartRequested["mayor"] {
+		t.Error("runtime restart flag not set")
 	}
-	if persistCalled {
-		t.Error("persistRestart was called; named sessions must skip persisted restart requests")
+	if !persistCalled {
+		t.Error("persistRestart not called; the bead restart request is the durable backup")
 	}
-	refreshed, err := store.Get(b.ID)
-	if err != nil {
-		t.Fatalf("fetching seeded bead: %v", err)
+	if !strings.Contains(stdout.String(), "requesting restart") {
+		t.Errorf("stdout = %q, want the restart request reported", stdout.String())
 	}
-	if refreshed.Metadata["restart_requested"] != "" {
-		t.Errorf("bead restart_requested = %q, want cleared for named session", refreshed.Metadata["restart_requested"])
+	if strings.Contains(stdout.String(), "restart skipped") {
+		t.Errorf("stdout = %q, must not report the old on-demand skip", stdout.String())
 	}
-	if refreshed.Metadata["continuation_reset_pending"] != "" {
-		t.Errorf("continuation_reset_pending = %q, want cleared for named session", refreshed.Metadata["continuation_reset_pending"])
-	}
-	if strings.Contains(stdout.String(), "requesting restart") {
-		t.Errorf("stdout = %q, must not promise a restart for named sessions", stdout.String())
-	}
-	if len(rec.Events) != 1 {
-		t.Fatalf("got %d events, want 1", len(rec.Events))
-	}
-	if rec.Events[0].Type != events.MailSent {
-		t.Fatalf("event[0].Type = %q, want %q", rec.Events[0].Type, events.MailSent)
+	if len(rec.Events) != 2 || rec.Events[0].Type != events.MailSent || rec.Events[1].Type != events.SessionDraining {
+		t.Fatalf("events = %v, want MailSent then SessionDraining", rec.Events)
 	}
 }
 
-func TestDoHandoff_NamedSessionClearRestartFailureReturnsError(t *testing.T) {
+func TestDoHandoff_OnDemandNamedSessionRestartFlagFailureReturnsError(t *testing.T) {
 	store := beads.NewMemStore()
 	rec := events.NewFake()
 	dops := newFakeDrainOps()
 	dops.err = errors.New("tmux borked")
 	var stdout, stderr bytes.Buffer
-
-	b, err := store.Create(beads.Bead{
-		Type:   sessionBeadType,
-		Labels: []string{"gc:session"},
-	})
-	if err != nil {
-		t.Fatalf("seeding session bead: %v", err)
-	}
-	if err := store.SetMetadata(b.ID, "session_name", "mayor"); err != nil {
-		t.Fatalf("set session_name: %v", err)
-	}
-	if err := store.SetMetadata(b.ID, "configured_named_session", "true"); err != nil {
-		t.Fatalf("set configured_named_session: %v", err)
-	}
-	if err := store.SetMetadata(b.ID, "configured_named_mode", "on_demand"); err != nil {
-		t.Fatalf("set configured_named_mode: %v", err)
-	}
+	seedOnDemandNamedSession(t, store)
 
 	outcome := doHandoffWithOutcome(store, store, rec, dops, nil, "mayor", "mayor",
 		[]string{"HANDOFF: context full"}, &stdout, &stderr)
@@ -539,11 +511,11 @@ func TestDoHandoff_NamedSessionClearRestartFailureReturnsError(t *testing.T) {
 	if outcome.restartRequested {
 		t.Fatal("restartRequested = true, want false")
 	}
-	if !strings.Contains(stderr.String(), "clearing stale restart request") {
-		t.Fatalf("stderr = %q, want stale restart cleanup error", stderr.String())
+	if !strings.Contains(stderr.String(), "setting restart flag") {
+		t.Fatalf("stderr = %q, want the restart-flag error", stderr.String())
 	}
-	if strings.Contains(stdout.String(), "restart skipped") {
-		t.Fatalf("stdout = %q, must not report success when cleanup fails", stdout.String())
+	if strings.Contains(stdout.String(), "requesting restart") {
+		t.Fatalf("stdout = %q, must not promise a restart that was not requested", stdout.String())
 	}
 }
 
@@ -690,6 +662,7 @@ func TestCmdHandoff_Regression744_NamedSessionReturnsWithoutBlocking(t *testing.
 	t.Setenv("GC_CITY_PATH", cityDir)
 	t.Setenv("GC_ALIAS", "mayor")
 	t.Setenv("GC_SESSION_NAME", "mayor")
+	t.Setenv("GC_SESSION", "fake") // the restart flag is a runtime write; no tmux server in tests
 
 	store, err := openCityStoreAt(cityDir)
 	if err != nil {
@@ -718,16 +691,19 @@ func TestCmdHandoff_Regression744_NamedSessionReturnsWithoutBlocking(t *testing.
 		done <- cmdHandoffWithForce([]string{"HANDOFF: context full"}, "", false, "", false, &stdout, &stderr)
 	}()
 
+	// The #744 invariant this test keeps: the command never blocks on the
+	// controller. With no controller running, the poke fails AFTER the restart
+	// request is durably set, which is exit 1 with that diagnostic, not a hang.
 	select {
 	case code := <-done:
-		if code != 0 {
-			t.Fatalf("code = %d, want 0; stderr: %s", code, stderr.String())
+		if code != 0 && !strings.Contains(stderr.String(), "remains durably set") {
+			t.Fatalf("code = %d; want 0, or 1 only for the unreachable-controller poke; stderr: %s", code, stderr.String())
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("cmdHandoff blocked for named on-demand session")
 	}
-	if !strings.Contains(stdout.String(), "restart skipped") {
-		t.Fatalf("stdout = %q, want restart skipped confirmation", stdout.String())
+	if !strings.Contains(stdout.String(), "requesting restart") {
+		t.Fatalf("stdout = %q, want the restart request reported (ga-cctcju: on-demand seats cycle)", stdout.String())
 	}
 }
 
@@ -1058,17 +1034,21 @@ func TestHandoffMailWritesTheBindingOnAMigratedCity(t *testing.T) {
 // routed store is a parameter to both, which is exactly the shape that lets a
 // later edit route one arm and not the other.
 //
-// A named on-demand session is the drivable shape: restartable is false, so the
-// command sends the mail and returns without waiting on a controller.
+// The mail is created before any restart work, so the only thing this row needs
+// from the restart arm is that it does not stop the command early: a fake
+// runtime takes the restart flag, and with no controller running the poke fails
+// AFTER the request is durably set (exit 1 with that diagnostic).
 func TestHandoffLocalArmMailLandsInTheBindingOnAMigratedCity(t *testing.T) {
 	cityPath, cfg := migratedOneShotCLICity(t)
 	captureCLIStorageStderr(t)
 	t.Setenv("GC_ALIAS", "mayor")
 	t.Setenv("GC_SESSION_NAME", "mayor")
+	t.Setenv("GC_SESSION", "fake")
 	seedNamedOnDemandSession(t, cityPath, cfg, "mayor")
 
 	var stdout, stderr bytes.Buffer
-	if code := cmdHandoffWithForce([]string{"context cycle"}, "", false, "", false, &stdout, &stderr); code != 0 {
+	if code := cmdHandoffWithForce([]string{"context cycle"}, "", false, "", false, &stdout, &stderr); code != 0 &&
+		!strings.Contains(stderr.String(), "remains durably set") {
 		t.Fatalf("gc handoff exited %d: %s", code, stderr.String())
 	}
 	id := handoffMailIDFromOutput(t, stdout.String(), "sent mail ")
@@ -1167,6 +1147,8 @@ func handoffMailIDFromOutput(t *testing.T, out, marker string) string {
 		t.Fatalf("gc handoff printed no mail id (marker %q): %q", marker, out)
 	}
 	id, _, _ := strings.Cut(strings.TrimSpace(out[i+len(marker):]), " ")
+	// "sent mail <id>, requesting restart..." puts a comma after the id.
+	id = strings.TrimRight(id, ",")
 	if id == "" {
 		t.Fatalf("gc handoff printed an empty mail id: %q", out)
 	}
