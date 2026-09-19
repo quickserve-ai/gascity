@@ -1,0 +1,17 @@
+# Receiver names that hold a runtime.Provider in this tree, for
+# scripts/check-termination-seam.sh. grep cannot do type analysis, so this is a
+# vocabulary, not a type check.
+#
+# DELIBERATELY NARROW. A false NEGATIVE costs one uncounted call site, which the
+# unclassified budget then surfaces as instrument health. A false POSITIVE blocks
+# unrelated work and teaches people to route around the guard, which costs the
+# guard itself. When in doubt, leave it out and let the budget catch it.
+#
+# Each line is an extended-regex alternative. Anchored on a word boundary so
+# `stopwatch.Stop(` and `ticker.Stop(` do not match.
+\bsp\.Stop\(
+\bprovider\.Stop\(
+\bprov\.Stop\(
+\bh\.provider\.Stop\(
+\bc\.sp\.Stop\(
+\bm\.sp\.Stop\(
