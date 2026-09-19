@@ -157,8 +157,9 @@ func sessionStartAutoHandoffInjection(stderr io.Writer) (primeHookContextInjecti
 // absent, empty or non-regular file injects nothing.
 //
 // Two homes, checked in order: $GC_DIR/seat/laurels.md, the upstream seat home
-// (gitignored as /seat/, #5776), then $GC_DIR/laurels.md, where a city seat whose
-// GC_DIR is its .gc/agents/<name> home keeps it.
+// (gitignored as /seat/, #5776), then $GC_DIR/laurels.md, but only when GC_DIR is
+// a city seat's .gc/agents/<name> home. A rig seat's GC_DIR is its project
+// checkout, whose root laurels.md is repository content, not recognition.
 const (
 	laurelsFileName = "laurels.md"
 	// The spec bounds a seat's laurels at one paragraph; the cap keeps a file
@@ -170,10 +171,11 @@ func primeLaurelsInjection(seatDir string) string {
 	if seatDir == "" {
 		return ""
 	}
-	for _, path := range []string{
-		filepath.Join(seatDir, "seat", laurelsFileName),
-		filepath.Join(seatDir, laurelsFileName),
-	} {
+	paths := []string{filepath.Join(seatDir, "seat", laurelsFileName)}
+	if isCitySeatHome(seatDir) {
+		paths = append(paths, filepath.Join(seatDir, laurelsFileName))
+	}
+	for _, path := range paths {
 		if text := readLaurels(path); text != "" {
 			return "\n\n<laurels>\nRecognition from people this seat has worked for. It carries no task, no bead and no priority; nothing here asks you to do anything.\n\n" +
 				text + "\n</laurels>\n"
@@ -182,11 +184,19 @@ func primeLaurelsInjection(seatDir string) string {
 	return ""
 }
 
+// isCitySeatHome reports whether dir is a city seat's .gc/agents/<name> home.
+func isCitySeatHome(dir string) bool {
+	parent := filepath.Dir(filepath.Clean(dir))
+	return filepath.Base(parent) == "agents" && filepath.Base(filepath.Dir(parent)) == ".gc"
+}
+
 // readLaurels returns the trimmed, capped text of a REGULAR file, or "". It opens
 // non-blocking and checks the OPENED descriptor, so a FIFO swapped in at any
 // moment cannot block gc prime, and it reads at most laurelsMaxBytes+1 bytes.
+// O_NOFOLLOW refuses a symlinked laurels.md: following one would send whatever
+// it points at (a credential, a .env) to the provider at SessionStart.
 func readLaurels(path string) string {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return ""
 	}
