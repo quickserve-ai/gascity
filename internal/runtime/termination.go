@@ -1,9 +1,9 @@
 package runtime
 
 import (
+	"errors"
 	"fmt"
 	"sort"
-	"strings"
 	"time"
 )
 
@@ -195,30 +195,62 @@ type TerminationSink interface {
 //     means; callers that only care whether the session is gone should use
 //     IsSessionGone on it as before.
 func StopRecorded(p Provider, name string, rec Termination, sinks ...TerminationSink) error {
+	stopErr, recErr := StopRecordedDetailed(p, name, rec, sinks...)
+	if recErr == nil {
+		return stopErr
+	}
+	if stopErr != nil {
+		return fmt.Errorf("%w (termination record: %w)", stopErr, recErr)
+	}
+	return fmt.Errorf("stopped, but the termination record failed: %w", recErr)
+}
+
+// ErrTerminationRecord wraps every sink failure StopRecordedDetailed reports,
+// so a caller can ask whether a non-nil error is ONLY a bookkeeping problem.
+var ErrTerminationRecord = errors.New("termination record")
+
+// StopRecordedDetailed is StopRecorded with the two outcomes kept APART:
+// stopErr is whether the session is gone, recErr is whether the ending was
+// written down. They are separate questions and a caller usually only has a
+// contract about the first.
+//
+// THIS EXISTS BECAUSE CONFLATING THEM BREAKS CALLERS, which is not theoretical:
+// wiring the event sink into worker.RuntimeHandle immediately turned every
+// successful Kill into a non-nil error, because the event sink deliberately
+// reports "emitted to a recorder that cannot acknowledge it" through a plain
+// void Recorder — the common configuration. A handle whose contract is `Kill
+// returns an error when the kill failed` must not start failing because
+// bookkeeping was merely unconfirmable. That is a worse outcome than an
+// uncounted ending: it makes a working stop look broken.
+//
+// SINK ERRORS KEEP THEIR IDENTITY. They are joined with errors.Join and
+// wrapped with %w, not stringified, so terminationevents.IsUnacknowledgedEvent
+// and any other sentinel still answer through the returned error. The previous
+// implementation joined err.Error() strings, which silently made every such
+// sentinel untestable through this function — the sentinels existed and could
+// never fire.
+func StopRecordedDetailed(p Provider, name string, rec Termination, sinks ...TerminationSink) (stopErr, recErr error) {
 	if !rec.Kind.Valid() {
 		rec.Kind = KindUnclassified
 	}
 	if rec.At.IsZero() {
 		rec.At = time.Now().UTC()
 	}
-	var sinkErrs []string
+	var sinkErrs []error
 	for _, s := range sinks {
 		if s == nil {
 			continue
 		}
 		if err := recordSafely(s, name, rec); err != nil {
-			sinkErrs = append(sinkErrs, err.Error())
+			sinkErrs = append(sinkErrs, err)
 		}
 	}
 	// The stop happens whatever the sinks did.
-	stopErr := p.Stop(name)
-	if len(sinkErrs) == 0 {
-		return stopErr
+	stopErr = p.Stop(name)
+	if len(sinkErrs) > 0 {
+		recErr = fmt.Errorf("%w: %w", ErrTerminationRecord, errors.Join(sinkErrs...))
 	}
-	if stopErr != nil {
-		return fmt.Errorf("%w (termination record: %s)", stopErr, strings.Join(sinkErrs, "; "))
-	}
-	return fmt.Errorf("stopped, but the termination record failed: %s", strings.Join(sinkErrs, "; "))
+	return stopErr, recErr
 }
 
 // recordSafely contains a sink that panics. A bookkeeping sink must not be able

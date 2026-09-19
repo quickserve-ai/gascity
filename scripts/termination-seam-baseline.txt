@@ -10,6 +10,3 @@ internal/session/chat.go:655:_ = m.sp.Stop(sessName)
 internal/session/submit.go:177:if err := m.sp.Stop(sessName); err != nil {
 internal/session/submit.go:198:if stopErr := m.sp.Stop(sessName); stopErr != nil {
 internal/session/submit.go:204:if stopErr := m.sp.Stop(sessName); stopErr != nil {
-internal/worker/runtime_handle.go:136:err = h.provider.Stop(h.sessionName)
-internal/worker/runtime_handle.go:145:err = h.provider.Stop(h.sessionName)
-internal/worker/runtime_handle.go:154:err = h.provider.Stop(h.sessionName)

@@ -232,3 +232,57 @@ func TestMultipleSinksAllRunEvenWhenOneFails(t *testing.T) {
 		t.Errorf("the failing sink was not reported: %v", err)
 	}
 }
+
+// TestStopRecordedPreservesSinkErrorIdentity pins the fix for a latent bug: the
+// first implementation joined sink errors as STRINGS, so every sentinel a sink
+// defined became untestable through StopRecorded. The sentinels existed and
+// could never fire, which is the worst shape for a guard — present, documented,
+// and permanently false.
+func TestStopRecordedPreservesSinkErrorIdentity(t *testing.T) {
+	sentinel := errors.New("a sink sentinel")
+	p := NewFake()
+	err := StopRecorded(p, "seat", Termination{Kind: KindHandoff}, errSink{sentinel})
+	if err == nil {
+		t.Fatal("a sink failure must be reported")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Errorf("sink error identity lost through StopRecorded: %v", err)
+	}
+	if !errors.Is(err, ErrTerminationRecord) {
+		t.Errorf("a record failure must be tagged with ErrTerminationRecord: %v", err)
+	}
+}
+
+// TestStopRecordedDetailedKeepsTheTwoQuestionsApart — "is the session gone" and
+// "was the ending written down" are different questions, and a caller usually
+// only has a contract about the first.
+func TestStopRecordedDetailedKeepsTheTwoQuestionsApart(t *testing.T) {
+	sentinel := errors.New("bookkeeping is unconfirmable")
+	p := NewFake()
+	stopErr, recErr := StopRecordedDetailed(p, "seat", Termination{Kind: KindHandoff}, errSink{sentinel})
+	if stopErr != nil {
+		t.Errorf("stopErr = %v, want nil — the stop succeeded", stopErr)
+	}
+	if !errors.Is(recErr, sentinel) {
+		t.Errorf("recErr lost the sink's identity: %v", recErr)
+	}
+	if len(stoppedNames(p)) != 1 {
+		t.Error("the stop must still have happened")
+	}
+
+	// And when BOTH fail, both survive as themselves.
+	boom := errors.New("tmux refused")
+	p2 := NewFake()
+	p2.StopErrors = map[string]error{"seat": boom}
+	stopErr2, recErr2 := StopRecordedDetailed(p2, "seat", Termination{Kind: KindHandoff}, errSink{sentinel})
+	if !errors.Is(stopErr2, boom) {
+		t.Errorf("stop error lost: %v", stopErr2)
+	}
+	if !errors.Is(recErr2, sentinel) {
+		t.Errorf("record error lost: %v", recErr2)
+	}
+}
+
+type errSink struct{ err error }
+
+func (e errSink) RecordTermination(string, Termination) error { return e.err }
