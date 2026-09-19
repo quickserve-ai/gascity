@@ -3785,7 +3785,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 								// Record a handoff BEFORE the drain so the rebuilt
 								// session can recover its context (hq-wi4ka). Best-effort.
 								sendConfigDriftHandoffMailWithStores(reconcilerMailStore(cityPath, cfg, store, rec), store, rec, tp.DisplayName(),
-								configDriftHandoffBody(tp.DisplayName(), driftedFields, clk.Now()), stderr)
+									configDriftHandoffBody(tp.DisplayName(), driftedFields, clk.Now()), stderr)
 								fmt.Fprintf(stdout, "Draining session '%s': config-drift\n", name) //nolint:errcheck
 								if trace != nil {
 									trace.RecordDecision(TraceSiteReconcilerConfigDrift, TraceReasonConfigDrift, TraceOutcomeDrain, tp.TemplateName, name, configDriftTracePayload(storedHash, currentHash, driftedFields, nil))

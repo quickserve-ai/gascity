@@ -373,12 +373,12 @@ func TestConfigDriftHandoffBodyCarriesRecovery(t *testing.T) {
 		t.Fatal("config-drift handoff body is empty — the defect ga-68f9qa exists to prevent")
 	}
 	for _, want := range []string{
-		"qcore/worker",                 // which seat
-		at.Format(time.RFC3339),        // when
-		"model, prompt",                // what drifted
-		"in_progress",                  // the first recovery step
-		"gc mail inbox",                // the second
-		"MECHANICAL",                   // it must not read as a composed handoff
+		"qcore/worker",          // which seat
+		at.Format(time.RFC3339), // when
+		"model, prompt",         // what drifted
+		"in_progress",           // the first recovery step
+		"gc mail inbox",         // the second
+		"MECHANICAL",            // it must not read as a composed handoff
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("config-drift handoff body missing %q\n--- body ---\n%s", want, body)
