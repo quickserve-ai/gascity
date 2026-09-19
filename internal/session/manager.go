@@ -817,7 +817,7 @@ func (m *Manager) routeACPIfNeeded(provider, transport, sessName string) func() 
 // WHY A METHOD AND NOT A DIRECT StopRecorded CALL AT EACH SITE. Two fields are
 // the same at every Manager site and getting either wrong is silent: the sinks
 // (always m.terminationSinks) and the actor (always whoever is driving this
-// process). Centralising them here means a new Manager stop site inherits both
+// process). Centralizing them here means a new Manager stop site inherits both
 // by construction rather than by the author remembering.
 //
 // THE ACTOR IS READ FROM $GC_AGENT AND IS DELIBERATELY ALLOWED TO BE EMPTY.
@@ -849,7 +849,7 @@ func WithCityPath(cityPath string) ManagerOption {
 // WithTerminationSinks wires the sinks that record why a session ended.
 //
 // ADDITIVE ON PURPOSE. A Manager built without it still stops sessions exactly
-// as before and simply records nothing — which is today's behaviour for every
+// as before and simply records nothing — which is today's behavior for every
 // one of these paths, so wiring can land rig by rig instead of in one
 // flag-day change. What it must never become is a REQUIRED dependency: see
 // StopRecorded rule 1, the stop never waits on the record.

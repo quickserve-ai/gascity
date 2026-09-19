@@ -19,12 +19,13 @@ func (r *recordingSink) RecordTermination(_ string, t runtime.Termination) error
 	return nil
 }
 
-func newRecordedManager(t *testing.T) (*Manager, *runtime.Fake, beads.Store, *recordingSink) {
+// newRecordedManager returns only the manager and the sink: every caller
+// discarded the provider and the store, and unparam is right that an unused
+// return is a claim the helper does not make good on.
+func newRecordedManager(t *testing.T) (*Manager, *recordingSink) {
 	t.Helper()
-	store := beads.NewMemStore()
-	sp := runtime.NewFake()
 	sink := &recordingSink{}
-	return NewManagerWithOptions(store, sp, WithTerminationSinks(sink)), sp, store, sink
+	return NewManagerWithOptions(beads.NewMemStore(), runtime.NewFake(), WithTerminationSinks(sink)), sink
 }
 
 func liveSession(t *testing.T, mgr *Manager, title string) Info {
@@ -75,7 +76,7 @@ func TestManagerTerminationsAreRecorded(t *testing.T) {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			ran++
-			mgr, _, _, sink := newRecordedManager(t)
+			mgr, sink := newRecordedManager(t)
 			info := liveSession(t, mgr, tc.name)
 			if err := tc.act(t, mgr, info.ID); err != nil {
 				t.Fatalf("%s: %v", tc.name, err)
@@ -154,7 +155,7 @@ func (panickingSink) RecordTermination(string, runtime.Termination) error {
 }
 
 // TestManagerWritesTheRecordToTheBeadByDefault is the difference between
-// "migrated" and "collecting". The Manager funnelling through the seam records
+// "migrated" and "collecting". The Manager funneling through the seam records
 // nothing unless a sink is attached; the authoritative bead sink is therefore a
 // DEFAULT, and this pins that it stays one. A regression here is silent: every
 // stop still works, the ratio just quietly loses its denominator.
@@ -200,7 +201,7 @@ func TestManagerWritesTheRecordToTheBeadByDefault(t *testing.T) {
 // direction.
 func TestKillIntentComesFromTheCallerNotTheManager(t *testing.T) {
 	t.Run("a caller that states intent gets it recorded", func(t *testing.T) {
-		mgr, _, _, sink := newRecordedManager(t)
+		mgr, sink := newRecordedManager(t)
 		info := liveSession(t, mgr, "drain")
 		asked := time.Now().UTC().Add(-90 * time.Second)
 
@@ -237,7 +238,7 @@ func TestKillIntentComesFromTheCallerNotTheManager(t *testing.T) {
 	})
 
 	t.Run("a caller that states nothing gets unclassified, never a guess", func(t *testing.T) {
-		mgr, _, _, sink := newRecordedManager(t)
+		mgr, sink := newRecordedManager(t)
 		info := liveSession(t, mgr, "no-intent")
 		if err := mgr.Kill(info.ID); err != nil {
 			t.Fatalf("Kill: %v", err)

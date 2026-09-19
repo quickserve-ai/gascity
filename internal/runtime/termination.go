@@ -7,6 +7,11 @@ import (
 	"time"
 )
 
+// Termination records WHY a session ended, for every ending including the good
+// one (ga-ksac39, Cherub 2026-09-18). The ratio it feeds — handoffs over all
+// endings — only means something if the denominator is complete, so the record
+// is written on `kind=handoff` exactly as it is on a force-kill.
+//
 // *** termination.* RECORDS THE ATTEMPT, NOT THE CONFIRMED OUTCOME. ***
 //
 // The sink pass runs BEFORE p.Stop returns — deliberately, so the record
@@ -25,11 +30,6 @@ import (
 // — the same field that makes Timer B measurable is what makes the retries
 // collapse to one ending. A writer that "helpfully" refreshed RequestedAt per
 // attempt would break the dedup and inflate the denominator.
-//
-// Termination records WHY a session ended, for every ending including the good
-// one (ga-ksac39, Cherub 2026-09-18). The ratio it feeds — handoffs over all
-// endings — only means something if the denominator is complete, so the record
-// is written on `kind=handoff` exactly as it is on a force-kill.
 //
 // WHY THIS TYPE EXISTS RATHER THAN A map[string]string AT EACH CALL SITE: a
 // census of the tree found no termination chokepoint at all. Twelve-plus
@@ -102,17 +102,19 @@ const (
 	// KindDrainTimeout — the controller asked, the seat did not answer, forced.
 	KindDrainTimeout TerminationKind = "drain-timeout"
 	// KindDrainSilent — a controller drain with no ask. This is today's
-	// behaviour and is expected to disappear when consent (S3) ships; it is a
+	// behavior and is expected to disappear when consent (S3) ships; it is a
 	// named kind so that disappearance is VISIBLE rather than assumed.
 	KindDrainSilent TerminationKind = "drain-silent"
 	// KindRestartInPlace — the reconciler's config-drift restart-in-place
 	// branch. It was missing from the v1 census entirely and was the dominant
 	// forced ending for named seats during the 2026-09-14/15 drift waves.
 	KindRestartInPlace TerminationKind = "restart-in-place"
-	// KindOperatorKill / Close / Suspend — an operator acting through the CLI
-	// or API.
-	KindOperatorKill    TerminationKind = "operator-kill"
-	KindOperatorClose   TerminationKind = "operator-close"
+	// KindOperatorKill — an operator ended the session through `gc session
+	// kill` or the API, without asking it first.
+	KindOperatorKill TerminationKind = "operator-kill"
+	// KindOperatorClose — an operator closed the session for good.
+	KindOperatorClose TerminationKind = "operator-close"
+	// KindOperatorSuspend — an operator suspended the session.
 	KindOperatorSuspend TerminationKind = "operator-suspend"
 	// KindHandoffTarget — `gc handoff --target` stopped another seat. Reported
 	// on its own line, OUT of the headline numerator: a third party composed
@@ -209,7 +211,7 @@ func (k TerminationKind) Valid() bool { return terminationKinds[k] }
 
 // CountsInDenominator reports whether an ending of this kind belongs in the
 // handoff ratio's denominator. TWO kinds are excluded, on one principle: no
-// handoff policy could have prevented either, so counting them would penalise
+// handoff policy could have prevented either, so counting them would penalize
 // the ratio for endings it does not govern. KindObservedDead is a runtime that
 // was already gone — nothing could have been asked of it. KindInterruptRestart
 // is not an ending at all — the session restarts in place and the conversation
@@ -249,6 +251,10 @@ func (k TerminationKind) CountsInNumerator() bool {
 //
 // Frozen here BEFORE the baseline week so ga-fbzz9u's reader and this writer
 // cannot drift into disagreeing about what an empty field means.
+func (k TerminationKind) MustCarryRequestedAt() bool {
+	return k == KindDrainHandoff || k == KindDrainTimeout
+}
+
 // ReportedSeparately reports whether a kind that is OUT of the headline ratio
 // must still be shown on its own line.
 //
@@ -258,10 +264,6 @@ func (k TerminationKind) CountsInNumerator() bool {
 // (katya, condition 1; the precedent is KindHandoffTarget).
 func (k TerminationKind) ReportedSeparately() bool {
 	return k == KindHandoffTarget || k == KindInterruptRestart || k == KindObservedDead
-}
-
-func (k TerminationKind) MustCarryRequestedAt() bool {
-	return k == KindDrainHandoff || k == KindDrainTimeout
 }
 
 // TerminationKinds returns the closed set, sorted, for reporting code that
@@ -367,11 +369,11 @@ func StopRecordedDetailed(p Provider, name string, rec Termination, sinks ...Ter
 	// and reported. Past it, the stop proceeds and the timeout is reported AS a
 	// sink error — rule 2 intact, reported and not swallowed.
 	//
-	// THE LATE WRITE IS LEFT TO LAND. A timed-out sink is not cancelled: the
+	// THE LATE WRITE IS LEFT TO LAND. A timed-out sink is not canceled: the
 	// goroutine keeps running and its write arrives whenever the store
 	// recovers. That is safe because TerminationPatch is idempotent for the
 	// same values, so a late landing writes what a timely one would have. The
-	// alternative — cancelling — would turn "slow store" into "lost record",
+	// alternative — canceling — would turn "slow store" into "lost record",
 	// which is the outcome this whole seam exists to prevent.
 	done := make(chan []error, 1)
 	go func() {

@@ -373,8 +373,10 @@ func TestRequestedAtInvariantIsByKindNotBySentinel(t *testing.T) {
 	}
 	// The operator kinds this branch migrated must be in the "never" half, or
 	// their deliberate zero would read as an instrument defect.
-	for _, k := range []TerminationKind{KindOperatorKill, KindOperatorClose,
-		KindOperatorSuspend, KindObservedDead, KindCityStop, KindInterruptRestart} {
+	for _, k := range []TerminationKind{
+		KindOperatorKill, KindOperatorClose,
+		KindOperatorSuspend, KindObservedDead, KindCityStop, KindInterruptRestart,
+	} {
 		if k.MustCarryRequestedAt() {
 			t.Errorf("%q must NOT require requested_at — its zero is by design", k)
 		}

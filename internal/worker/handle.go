@@ -43,7 +43,6 @@ type LifecycleHandle interface {
 	StateHandle
 }
 
-// MessagingHandle exposes live input delivery operations.
 // TerminationIntentKiller is the optional capability of ending a session WITH a
 // stated reason. Callers that know why they are killing type-assert for it; the
 // rest use Kill, which records the counted, budgeted "unclassified".
@@ -51,6 +50,7 @@ type TerminationIntentKiller interface {
 	KillWithTermination(context.Context, runtime.Termination) error
 }
 
+// MessagingHandle exposes live input delivery operations.
 type MessagingHandle interface {
 	Message(context.Context, MessageRequest) (MessageResult, error)
 	Interrupt(context.Context, InterruptRequest) error

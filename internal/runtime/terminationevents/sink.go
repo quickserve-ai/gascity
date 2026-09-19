@@ -1,3 +1,9 @@
+// Package terminationevents holds the session.terminated event sink.
+//
+// It is a SUBDIRECTORY of internal/runtime rather than a file inside it because
+// the runtime contract package is stdlib-only by RUNTIME-INV-001 and this sink
+// imports internal/events. The boundary test skips subdirectories, which is the
+// sanctioned escape.
 package terminationevents
 
 import (
@@ -102,7 +108,7 @@ func (s *Sink) RecordTermination(sessionName string, t runtime.Termination) erro
 	if err != nil {
 		// Cannot happen for this struct, but a silent drop here would be the
 		// one case where the "almost never fails" sink fails invisibly.
-		return fmt.Errorf("marshalling the termination payload: %w", err)
+		return fmt.Errorf("marshaling the termination payload: %w", err)
 	}
 	actor := t.Actor
 	if actor == "" {
