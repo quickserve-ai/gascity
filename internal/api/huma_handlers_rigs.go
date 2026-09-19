@@ -16,6 +16,7 @@ import (
 	"github.com/gastownhall/gascity/internal/configedit"
 	"github.com/gastownhall/gascity/internal/rig"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/runtime/terminationevents"
 	"github.com/gastownhall/gascity/internal/ssrf"
 	workdirutil "github.com/gastownhall/gascity/internal/workdir"
 )
@@ -584,6 +585,20 @@ func (s *Server) humaHandleRigRestart(name string) (*RigActionResponse, error) {
 	// convergence mechanism — survivors will be caught on its next tick.
 	killed := make([]string, 0)
 	failed := make([]string, 0)
+	// ga-ksac39: this rig-kill is an operator force-exit of LIVE sessions, so it
+	// COUNTS in the handoff ratio's denominator and used to write nowhere.
+	//
+	// THE EVENT SINK IS THE ONLY ONE THAT CAN SERVE HERE, and that is a property
+	// of the handler rather than an omission. It kills by SESSION NAME, having
+	// never loaded a session bead, so the authoritative bead sink has no id to
+	// address. Resolving name -> id would put a store READ on the stop path,
+	// which is the one place a slow store must not reach (force-exits cluster in
+	// exactly the windows where the store is sick). Built ONCE outside the loop:
+	// events.Provider embeds events.Recorder, so no extra plumbing is needed.
+	var termSink runtime.TerminationSink
+	if rec := s.state.EventProvider(); rec != nil {
+		termSink = terminationevents.New(rec, "api")
+	}
 	for _, a := range cfg.Agents {
 		if workdirutil.ConfiguredRigName(s.state.CityPath(), a, cfg.Rigs) != name {
 			continue
@@ -591,15 +606,12 @@ func (s *Server) humaHandleRigRestart(name string) (*RigActionResponse, error) {
 		expanded := expandAgent(a, cityName, cfg.Workspace.SessionTemplate, sp)
 		for _, ea := range expanded {
 			sessionName := agentSessionName(cityName, ea.qualifiedName, cfg.Workspace.SessionTemplate)
-			// An operator killing a rig's agents through the API. This COUNTS
-			// in the ratio's denominator and is not yet written anywhere: the
-			// handler has no sink wired. Classified here so it starts
-			// recording the moment one is.
+			// An operator killing a rig's agents through the API.
 			if err := runtime.StopRecorded(sp, sessionName, runtime.Termination{
 				Kind:   runtime.KindOperatorKill,
 				Actor:  "api",
 				Reason: "rig-scoped kill of all agents",
-			}); err != nil {
+			}, termSink); err != nil {
 				// "session gone" is benign — agent wasn't running.
 				if !runtime.IsSessionGone(err) {
 					failed = append(failed, ea.qualifiedName)

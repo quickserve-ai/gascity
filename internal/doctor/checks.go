@@ -509,11 +509,37 @@ type ZombieSessionsCheck struct {
 	cityName        string
 	sessionTemplate string
 	sp              runtime.Provider
+	termSink        runtime.TerminationSink
+}
+
+// CheckOption configures an optional capability on a session check. It is
+// VARIADIC so that adding one does not touch the existing constructor callers —
+// one in cmd/gc and twelve in tests — which is the difference between a wiring
+// change and a refactor.
+type CheckOption func(*sessionCheckOpts)
+
+type sessionCheckOpts struct{ termSink runtime.TerminationSink }
+
+// WithTerminationSink wires the sink that records WHY a session the doctor
+// stops ended (ga-ksac39). Without it these checks still stop sessions exactly
+// as before and record nothing, which was the behaviour until now.
+func WithTerminationSink(s runtime.TerminationSink) CheckOption {
+	return func(o *sessionCheckOpts) { o.termSink = s }
+}
+
+func applyCheckOptions(opts []CheckOption) sessionCheckOpts {
+	var o sessionCheckOpts
+	for _, fn := range opts {
+		if fn != nil {
+			fn(&o)
+		}
+	}
+	return o
 }
 
 // NewZombieSessionsCheck creates a check for zombie sessions.
-func NewZombieSessionsCheck(cfg *config.City, cityName, sessionTemplate string, sp runtime.Provider) *ZombieSessionsCheck {
-	return &ZombieSessionsCheck{cfg: cfg, cityName: cityName, sessionTemplate: sessionTemplate, sp: sp}
+func NewZombieSessionsCheck(cfg *config.City, cityName, sessionTemplate string, sp runtime.Provider, opts ...CheckOption) *ZombieSessionsCheck {
+	return &ZombieSessionsCheck{cfg: cfg, cityName: cityName, sessionTemplate: sessionTemplate, sp: sp, termSink: applyCheckOptions(opts).termSink}
 }
 
 // Name returns the check identifier.
@@ -566,7 +592,7 @@ func (c *ZombieSessionsCheck) Fix(ctx *CheckContext) error {
 				Kind:   runtime.KindObservedDead,
 				Actor:  "doctor",
 				Reason: "zombie session: shell running, agent process dead",
-			}); err != nil {
+			}, c.termSink); err != nil {
 				return fmt.Errorf("killing zombie session %q: %w", sn, err)
 			}
 		}
@@ -580,11 +606,12 @@ type OrphanSessionsCheck struct {
 	cityName        string
 	sessionTemplate string
 	sp              runtime.Provider
+	termSink        runtime.TerminationSink
 }
 
 // NewOrphanSessionsCheck creates a check for orphaned sessions.
-func NewOrphanSessionsCheck(cfg *config.City, cityName, sessionTemplate string, sp runtime.Provider) *OrphanSessionsCheck {
-	return &OrphanSessionsCheck{cfg: cfg, cityName: cityName, sessionTemplate: sessionTemplate, sp: sp}
+func NewOrphanSessionsCheck(cfg *config.City, cityName, sessionTemplate string, sp runtime.Provider, opts ...CheckOption) *OrphanSessionsCheck {
+	return &OrphanSessionsCheck{cfg: cfg, cityName: cityName, sessionTemplate: sessionTemplate, sp: sp, termSink: applyCheckOptions(opts).termSink}
 }
 
 // Name returns the check identifier.
@@ -669,7 +696,7 @@ func (c *OrphanSessionsCheck) Fix(ctx *CheckContext) error {
 				Kind:   runtime.KindOperatorKill,
 				Actor:  "doctor",
 				Reason: "reaping a session not present in city config",
-			}); err != nil {
+			}, c.termSink); err != nil {
 				return fmt.Errorf("killing orphan session %q: %w", s, err)
 			}
 		}
