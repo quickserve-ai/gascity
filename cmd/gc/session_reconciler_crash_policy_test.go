@@ -354,6 +354,23 @@ func TestSendConfigDriftHandoffMail(t *testing.T) {
 	if len(msgs) != 1 {
 		t.Fatalf("expected 1 handoff message to qcore/worker, got %d (stderr=%s)", len(msgs), env.stderr.String())
 	}
+	// THE ASSERTION THE COMMENT ABOVE PROMISED. It was missing until Codex
+	// review round 4 on PR #104 pointed out that the comment described a
+	// guarantee the test did not implement — which is worse than no comment,
+	// because the next reader trusts it and does not add the check.
+	//
+	// Counting beads cannot see ga-68f9qa. The original defect was
+	// createHandoffMail(..., []string{"HANDOFF: config-drift restart"}) with no
+	// args[1], so cmd_handoff.go's `if len(args) > 1` left the body EMPTY while
+	// the bead, its labels and its subject all looked correct. Only comparing
+	// the PERSISTED body against the generated one can fail on that.
+	if got := msgs[0].Description; got != body {
+		t.Errorf("persisted handoff body does not match the generated body — this is ga-68f9qa itself\n--- persisted (%d bytes) ---\n%s\n--- generated (%d bytes) ---\n%s",
+			len(got), got, len(body), body)
+	}
+	if strings.TrimSpace(msgs[0].Description) == "" {
+		t.Error("the persisted handoff body is EMPTY — a seat would receive a subject line and nothing else, and it would still be counted as a handoff in the ratio (ga-ksac39)")
+	}
 	// Nil store / empty recipient are silent no-ops.
 	sendConfigDriftHandoffMail(nil, env.rec, "qcore/worker", body, &env.stderr)
 	sendConfigDriftHandoffMail(env.store, env.rec, "", body, &env.stderr)
