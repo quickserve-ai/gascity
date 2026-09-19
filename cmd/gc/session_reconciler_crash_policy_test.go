@@ -341,18 +341,122 @@ func findMessageBeads(t *testing.T, store beads.Store, assignee string) []beads.
 // TestSendConfigDriftHandoffMail exercises the helper directly: it must
 // create a type=message handoff bead addressed to the recipient, and must be a
 // no-op (no panic, no bead) on nil store or empty recipient.
+//
+// THIS TEST USED TO ASSERT ONLY THAT A BEAD EXISTED, which is how ga-68f9qa
+// survived: the helper mailed a SUBJECT AND AN EMPTY BODY for as long as it has
+// existed, and a count-the-beads assertion cannot see that. The body assertion
+// below is the guarantee that was missing, not an extra.
 func TestSendConfigDriftHandoffMail(t *testing.T) {
 	env := newReconcilerTestEnv()
-	sendConfigDriftHandoffMail(env.store, env.rec, "qcore/worker", &env.stderr)
+	body := configDriftHandoffBody("qcore/worker", []string{"model", "prompt"}, time.Unix(1700000000, 0).UTC())
+	sendConfigDriftHandoffMail(env.store, env.rec, "qcore/worker", body, &env.stderr)
 	msgs := findMessageBeads(t, env.store, "qcore/worker")
 	if len(msgs) != 1 {
 		t.Fatalf("expected 1 handoff message to qcore/worker, got %d (stderr=%s)", len(msgs), env.stderr.String())
 	}
+	// THE ASSERTION THE COMMENT ABOVE PROMISED. It was missing until Codex
+	// review round 4 on PR #104 pointed out that the comment described a
+	// guarantee the test did not implement — which is worse than no comment,
+	// because the next reader trusts it and does not add the check.
+	//
+	// Counting beads cannot see ga-68f9qa. The original defect was
+	// createHandoffMail(..., []string{"HANDOFF: config-drift restart"}) with no
+	// args[1], so cmd_handoff.go's `if len(args) > 1` left the body EMPTY while
+	// the bead, its labels and its subject all looked correct. Only comparing
+	// the PERSISTED body against the generated one can fail on that.
+	if got := msgs[0].Description; got != body {
+		t.Errorf("persisted handoff body does not match the generated body — this is ga-68f9qa itself\n--- persisted (%d bytes) ---\n%s\n--- generated (%d bytes) ---\n%s",
+			len(got), got, len(body), body)
+	}
+	if strings.TrimSpace(msgs[0].Description) == "" {
+		t.Error("the persisted handoff body is EMPTY — a seat would receive a subject line and nothing else, and it would still be counted as a handoff in the ratio (ga-ksac39)")
+	}
 	// Nil store / empty recipient are silent no-ops.
-	sendConfigDriftHandoffMail(nil, env.rec, "qcore/worker", &env.stderr)
-	sendConfigDriftHandoffMail(env.store, env.rec, "", &env.stderr)
+	sendConfigDriftHandoffMail(nil, env.rec, "qcore/worker", body, &env.stderr)
+	sendConfigDriftHandoffMail(env.store, env.rec, "", body, &env.stderr)
 	if got := len(findMessageBeads(t, env.store, "qcore/worker")); got != 1 {
 		t.Fatalf("no-op guards created extra beads: got %d, want 1", got)
+	}
+}
+
+// TestConfigDriftHandoffBodyCarriesRecovery is the guard for ga-68f9qa: the
+// note the restarted seat reads must actually say something. A handoff bead
+// that wears AutoHandoffLabel while carrying nothing is worse than no handoff —
+// it is counted as a clean ending by anything reading the ratio (ga-ksac39).
+func TestConfigDriftHandoffBodyCarriesRecovery(t *testing.T) {
+	at := time.Unix(1700000000, 0).UTC()
+	body := configDriftHandoffBody("qcore/worker", []string{"model", "prompt"}, at)
+	if strings.TrimSpace(body) == "" {
+		t.Fatal("config-drift handoff body is empty — the defect ga-68f9qa exists to prevent")
+	}
+	for _, want := range []string{
+		"qcore/worker",          // which seat
+		at.Format(time.RFC3339), // when
+		"model, prompt",         // what drifted
+		"MECHANICAL",            // it must not read as a composed handoff
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("config-drift handoff body missing %q\n--- body ---\n%s", want, body)
+		}
+	}
+
+	// The body must make NO claim about the seat's own context. The reset
+	// PRESERVES the conversation: resetConfiguredNamedSessionForConfigDriftInfo's
+	// preserveResume gate is true for StateStartPending — the very state this
+	// branch passes — so the successor resumes with `--resume <prior-key>`.
+	// Telling that agent its recollection is LOST would make it discard exactly
+	// what the restart path deliberately kept. Codex review finding, PR #104.
+	for _, forbidden := range []string{"LOST", "recollection", "as summarized", "start fresh"} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("config-drift handoff body asserts something about the seat's context (%q) that the controller does not know — the reset may have RESUMED the conversation\n--- body ---\n%s", forbidden, body)
+		}
+	}
+	// The body must never DIRECT a restarted seat to a `gc bd list --assignee` lookup.
+	// The core claim protocol forbids it (claim-protocol.template.md): an unclaimed
+	// routed item has no assignee and an ephemeral wisp is hidden from that query, so
+	// it reports "no work" while the seat's own work sits open — the seat then
+	// concludes its persisted work is gone, which is the opposite of recovery.
+	// Codex review finding, PR #104.
+	//
+	// This checks the DIRECTIVE form, not the mere mention: the body is expected to
+	// name the query in order to warn against it, and a plain strings.Contains cannot
+	// tell "run this" from "never run this" (it flagged the warning itself when the
+	// guard was first written). A command the seat is meant to run stands alone on its
+	// line — that is the shape being forbidden here.
+	// The body must not PRESCRIBE a work-lookup or claim procedure at all. Two
+	// separate defects sit behind this, both found by Codex review on PR #104:
+	//
+	//   `gc bd list --assignee` is forbidden outright by the core claim protocol
+	//   (claim-protocol.template.md): an unclaimed routed item has no assignee and
+	//   an ephemeral wisp is hidden from that query, so it reports "no work" while
+	//   the seat's own work sits open (ga-tmzjx6, 41 hours unrun).
+	//
+	//   `gc hook --claim --drain-ack` is the POOL WORKER protocol, and this mail
+	//   goes to NAMED seats (it is sent beside resetConfiguredNamedSessionForConfigDrift).
+	//   Under that protocol an `action: drain` result means "your session is done —
+	//   exit". Prescribing it here could tell a freshly restarted named seat to quit.
+	//
+	// The controller does not know which protocol a given pack defines, so it names
+	// none: `gc prime` re-renders the seat's own pack-rendered role prompt. Checks
+	// the DIRECTIVE position, not the mention — a plain substring check cannot tell
+	// "run this" from "never run this", which is how the first version of this guard
+	// flagged its own warning text.
+	for _, line := range strings.Split(body, "\n") {
+		directive := strings.TrimLeft(strings.TrimSpace(line), "0123456789.-* ")
+		// `gc prime` is here too: for a named agent whose pack intentionally omits
+		// prompt_template (a SUPPORTED minimal config, cmd_prime.go:88-94), prime
+		// falls through to defaultPrimePrompt, which itself says "1. Claim work:
+		// gc hook --claim --json". So prescribing prime reaches the pool protocol
+		// one indirection later. Codex review finding, PR #104.
+		for _, forbidden := range []string{"gc bd list", "bd list", "gc hook", "gc bd ready", "gc prime"} {
+			if strings.HasPrefix(directive, forbidden) {
+				t.Errorf("config-drift handoff body prescribes %q, overriding whatever protocol the seat's pack defines: %q\n--- body ---\n%s", forbidden, line, body)
+			}
+		}
+	}
+	// No drifted fields is legal and must not produce a dangling label.
+	if got := configDriftHandoffBody("qcore/worker", nil, at); strings.Contains(got, "drifted:") {
+		t.Errorf("empty drifted-field list still emitted a drifted: line\n--- body ---\n%s", got)
 	}
 }
 
