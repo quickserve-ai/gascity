@@ -31,16 +31,14 @@ func newHandoffCmd(stdout, stderr io.Writer) *cobra.Command {
 		Short: "Send handoff mail and restart controller-managed sessions",
 		Long: `Convenience command for context handoff.
 
-Self-handoff (default): sends mail to self. If the current session is
-controller-restartable, requests a restart, pokes the controller for an
-immediate reconcile tick, and returns without waiting for the controller to
-act. For on-demand configured named sessions, sends mail and returns without
-requesting restart: handoff intentionally leaves the user-attended session
-running instead of restarting it out from under the user. The controller can
-restart such a session via gc runtime request-restart; handoff deliberately
-does not.
+Self-handoff (default): sends mail to self, requests a restart, pokes the
+controller for an immediate reconcile tick, and returns without waiting for the
+controller to act. This covers every session class, on-demand configured named
+sessions included (ga-cctcju): the seat asking to be cycled is the
+authorization, and the reconciler's restart consume records the reset-pending
+marker that wakes the seat fresh on the next tick without other demand.
 
-For controller-restartable sessions, equivalent to:
+Equivalent to:
 
   gc mail send $GC_ALIAS <subject> [message]
   gc runtime request-restart
@@ -58,7 +56,8 @@ the context compaction lifecycle.
 Remote handoff (--target): sends mail to a target session. If the target is
 controller-restartable, kills it so the reconciler restarts it with the handoff
 mail waiting. For on-demand configured named targets, sends mail and returns
-without killing the session.
+without killing the session: another seat does not restart a user-attended
+session out from under the user.
 
 For controller-restartable targets, equivalent to:
 
@@ -270,18 +269,17 @@ func doHandoffWithOutcome(msgStore, sessStore beads.Store, rec events.Recorder, 
 		return handoffOutcome{code: 1}
 	}
 
-	restartable, pinned, err := sessionRestartableByController(sessStore, sessionName)
+	// Every session class cycles on a self-handoff, on-demand configured named
+	// seats included (ga-cctcju). The old on-demand skip dates from #744, when
+	// handoff blocked until the controller stopped the session; handoff no longer
+	// blocks, and the restart consume's RestartRequestPatch lands the
+	// reset-pending marker that wakes a demand-less on-demand seat on the next
+	// tick (TestReconcileSessionBeads_RestartRequestOnDemandWakesFromResetMarker).
+	// Only a remote handoff still declines to cycle an on-demand target.
+	_, pinned, err := sessionRestartableByController(sessStore, sessionName)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc handoff: checking session type: %v\n", err) //nolint:errcheck // best-effort stderr
 		return handoffOutcome{code: 1}
-	}
-	if !restartable {
-		if err := clearRestartRequest(sessStore, dops, sessionName); err != nil {
-			fmt.Fprintf(stderr, "gc handoff: clearing stale restart request: %v\n", err) //nolint:errcheck // best-effort stderr
-			return handoffOutcome{code: 1}
-		}
-		fmt.Fprintf(stdout, "Handoff: sent mail %s (named session; restart skipped).\n", b.ID) //nolint:errcheck // best-effort stdout
-		return handoffOutcome{code: 0}
 	}
 
 	if err := dops.setRestartRequested(sessionName); err != nil {
