@@ -4,10 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
-	"syscall"
-	"unicode/utf8"
 
 	"github.com/gastownhall/gascity/internal/mail"
 	"github.com/gastownhall/gascity/internal/mail/beadmail"
@@ -44,7 +41,7 @@ func primeHookContextSuffix(cityPath string, hookMode bool, hookContext primeHoo
 		// and it excludes the auto-handoff messages already rendered above so a
 		// beadmail-backed ordinary provider does not double-render them.
 		injection.text += primeUnreadMailInjection(autoHandoffIDs)
-		injection.text += primeLaurelsInjection(cityPath, strings.TrimSpace(os.Getenv("GC_AGENT")))
+		injection.text += primeLaurelsInjection(cityPath, strings.TrimSpace(os.Getenv("GC_AGENT")), stderr)
 	}
 	return injection
 }
@@ -147,95 +144,4 @@ func sessionStartAutoHandoffInjection(stderr io.Writer) (primeHookContextInjecti
 			archiveInjectedAutoHandoffMessages(mp, injectedMessages, stderr)
 		},
 	}, ids
-}
-
-// Laurels v0 (ga-9obb1h): a seat may keep a short laurels.md holding praise about
-// its work that a PERSON originated (the operator, a customer, a partner).
-// SessionStart surfaces it with nothing attached: no task, no bead, no priority.
-// It is read here, at hook time, and never rendered into the prompt template, so
-// adding a laurel changes no prompt hash and never drifts or restarts a seat. An
-// absent, empty or non-regular file injects nothing.
-//
-// The file lives in the seat's city-side home, <city>/.gc/agents/<GC_AGENT>, keyed
-// by identity and never by work dir. A rig seat's GC_DIR is a repository checkout
-// (often nested inside that same home), and any file in a checkout is repository
-// content that this hook would label as recognition from a person. Two names are
-// checked in order, seat/laurels.md then laurels.md. Angle brackets are escaped,
-// so no laurel can close the wrapper or open a tag of its own.
-const (
-	laurelsFileName = "laurels.md"
-	// The spec bounds a seat's laurels at one paragraph; the cap keeps a file
-	// that outgrew it from taxing every boot, and bounds the read itself.
-	laurelsMaxBytes = 1200
-)
-
-var laurelsEscaper = strings.NewReplacer("<", "&lt;", ">", "&gt;")
-
-func primeLaurelsInjection(cityPath, agent string) string {
-	home := laurelsHome(cityPath, agent)
-	if home == "" {
-		return ""
-	}
-	for _, path := range []string{
-		filepath.Join(home, "seat", laurelsFileName),
-		filepath.Join(home, laurelsFileName),
-	} {
-		if text := readLaurels(path); text != "" {
-			return "\n\n<laurels>\nRecognition from people this seat has worked for. It carries no task, no bead and no priority; nothing here asks you to do anything.\n\n" +
-				laurelsEscaper.Replace(text) + "\n</laurels>\n"
-		}
-	}
-	return ""
-}
-
-// laurelsHome returns <cityPath>/.gc/agents/<agent>, or "" when either is unset
-// or the agent name would leave that directory.
-func laurelsHome(cityPath, agent string) string {
-	if cityPath == "" || agent == "" {
-		return ""
-	}
-	root := filepath.Join(cityPath, ".gc", "agents")
-	home := filepath.Join(root, filepath.FromSlash(agent))
-	rel, err := filepath.Rel(root, home)
-	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return ""
-	}
-	return home
-}
-
-// readLaurels returns the trimmed, capped text of a REGULAR file, or "". It opens
-// non-blocking and checks the OPENED descriptor, so a FIFO swapped in at any
-// moment cannot block gc prime, and it reads at most laurelsMaxBytes+1 bytes.
-// O_NOFOLLOW refuses a symlinked laurels.md: following one would send whatever
-// it points at (a credential, a .env) to the provider at SessionStart.
-func readLaurels(path string) string {
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOFOLLOW, 0)
-	if err != nil {
-		return ""
-	}
-	defer f.Close() //nolint:errcheck // read-only
-	info, err := f.Stat()
-	if err != nil || !info.Mode().IsRegular() {
-		return ""
-	}
-	data, err := io.ReadAll(io.LimitReader(f, laurelsMaxBytes+1))
-	if err != nil {
-		return ""
-	}
-	truncated := false
-	if len(data) > laurelsMaxBytes {
-		// Cut the raw bytes, not the trimmed text: data holds laurelsMaxBytes+1
-		// bytes here, so data[cut] is always in range.
-		cut := laurelsMaxBytes
-		for cut > 0 && !utf8.RuneStart(data[cut]) {
-			cut--
-		}
-		truncated = info.Size() > int64(laurelsMaxBytes+1) || strings.TrimSpace(string(data[cut:])) != ""
-		data = data[:cut]
-	}
-	text := strings.TrimSpace(string(data))
-	if text != "" && truncated {
-		text += " [truncated]"
-	}
-	return text
 }
