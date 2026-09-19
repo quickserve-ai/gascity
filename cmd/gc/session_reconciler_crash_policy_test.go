@@ -376,11 +376,22 @@ func TestConfigDriftHandoffBodyCarriesRecovery(t *testing.T) {
 		"qcore/worker",          // which seat
 		at.Format(time.RFC3339), // when
 		"model, prompt",         // what drifted
-		"gc prime",              // recovery resolved from the seat's OWN pack, not prescribed here
 		"MECHANICAL",            // it must not read as a composed handoff
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("config-drift handoff body missing %q\n--- body ---\n%s", want, body)
+		}
+	}
+
+	// The body must make NO claim about the seat's own context. The reset
+	// PRESERVES the conversation: resetConfiguredNamedSessionForConfigDriftInfo's
+	// preserveResume gate is true for StateStartPending — the very state this
+	// branch passes — so the successor resumes with `--resume <prior-key>`.
+	// Telling that agent its recollection is LOST would make it discard exactly
+	// what the restart path deliberately kept. Codex review finding, PR #104.
+	for _, forbidden := range []string{"LOST", "recollection", "as summarized", "start fresh"} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("config-drift handoff body asserts something about the seat's context (%q) that the controller does not know — the reset may have RESUMED the conversation\n--- body ---\n%s", forbidden, body)
 		}
 	}
 	// The body must never DIRECT a restarted seat to a `gc bd list --assignee` lookup.
@@ -415,7 +426,12 @@ func TestConfigDriftHandoffBodyCarriesRecovery(t *testing.T) {
 	// flagged its own warning text.
 	for _, line := range strings.Split(body, "\n") {
 		directive := strings.TrimLeft(strings.TrimSpace(line), "0123456789.-* ")
-		for _, forbidden := range []string{"gc bd list", "bd list", "gc hook", "gc bd ready"} {
+		// `gc prime` is here too: for a named agent whose pack intentionally omits
+		// prompt_template (a SUPPORTED minimal config, cmd_prime.go:88-94), prime
+		// falls through to defaultPrimePrompt, which itself says "1. Claim work:
+		// gc hook --claim --json". So prescribing prime reaches the pool protocol
+		// one indirection later. Codex review finding, PR #104.
+		for _, forbidden := range []string{"gc bd list", "bd list", "gc hook", "gc bd ready", "gc prime"} {
 			if strings.HasPrefix(directive, forbidden) {
 				t.Errorf("config-drift handoff body prescribes %q, overriding whatever protocol the seat's pack defines: %q\n--- body ---\n%s", forbidden, line, body)
 			}

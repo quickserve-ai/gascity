@@ -6175,22 +6175,22 @@ func sendConfigDriftHandoffMail(store beads.Store, rec events.Recorder, recipien
 // that fails open.
 func configDriftHandoffBody(agent string, driftedFields []string, at time.Time) string {
 	var b strings.Builder
-	b.WriteString("You were restarted by the controller because your configuration drifted.\n")
-	b.WriteString("This note is MECHANICAL — the controller wrote it, not your previous\n")
-	b.WriteString("session, so it carries no reasoning and no plan. Treat your recollection\n")
-	b.WriteString("of what you were doing as LOST, not as summarized.\n\n")
+	b.WriteString("You were restarted by the controller because your configuration drifted.\n\n")
 	b.WriteString("  agent:   " + agent + "\n")
 	b.WriteString("  when:    " + at.UTC().Format(time.RFC3339) + "\n")
 	if len(driftedFields) > 0 {
 		b.WriteString("  drifted: " + strings.Join(driftedFields, ", ") + "\n")
 	}
-	b.WriteString("\nRECOVER BEFORE YOU PICK UP ANYTHING NEW:\n")
-	b.WriteString("  gc prime\n")
-	b.WriteString("It re-renders YOUR role and YOUR pack's own startup protocol, and its\n")
-	b.WriteString("hooks surface the mail that arrived while you were down. Follow what it\n")
-	b.WriteString("gives you — this note deliberately does not tell you how to find your\n")
-	b.WriteString("work, because the controller does not know which protocol your pack\n")
-	b.WriteString("defines, and guessing wrong is worse than saying nothing.\n")
+	b.WriteString("\nThis note is MECHANICAL: the controller wrote it, not your previous\n")
+	b.WriteString("session. It carries no reasoning, no plan, and no summary of what you\n")
+	b.WriteString("were doing — only the facts above, which are the only things the\n")
+	b.WriteString("controller actually knows.\n\n")
+	b.WriteString("It deliberately does not tell you how to recover, and does not tell you\n")
+	b.WriteString("what to assume about your own context. The controller does not know\n")
+	b.WriteString("which startup protocol your pack defines, and it is not the right place\n")
+	b.WriteString("to find out whether your conversation was resumed or started fresh.\n")
+	b.WriteString("Follow your own role prompt; a confident wrong instruction from here is\n")
+	b.WriteString("worse than none.\n")
 	return b.String()
 }
 
