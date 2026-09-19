@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -330,6 +331,22 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 	register(doctor.NewControllerCheck(cityPath, controllerRunning))
 	register(doctor.NewSupervisorHTTPCheck(opts.SupervisorRunning))
 	register(doctor.NewSupervisorUnitOwnershipCheck(opts.SupervisorRunning, opts.SupervisorPID, opts.SupervisorUnitOwnership))
+	// ga-7qkj: reachability is not currency. supervisor-http-api above answers
+	// from the HTTP status code alone, so a supervisor that has served a stale
+	// build for days reads green. This check asks /health what build is
+	// ACTUALLY serving and compares it against the binary on disk, reusing the
+	// same DetectBinaryDrift that `gc start` uses so drift has one definition.
+	// The probe is a closure, not a gathered value: the check is not
+	// warmup-eligible, so an eager fetch would spend a round-trip on every
+	// warm-up scan that filters it out.
+	register(doctor.NewSupervisorBuildDriftCheck(
+		opts.SupervisorRunning,
+		commit,
+		servingSupervisorBuildID,
+		func(local, serving string) bool {
+			return DetectBinaryDrift(local, SupervisorStatus{BuildID: serving})
+		},
+	))
 	// Beads-cache reconcile watch: alarms on the ABSENCE of a reconcile
 	// heartbeat. Registered next to the controller checks because it is a
 	// statement about the RUNNING controller, and it self-skips when none is.
@@ -994,4 +1011,33 @@ func openStoreResultForCity(cityPath string) func(string) (beads.StoreOpenResult
 	return func(dirPath string) (beads.StoreOpenResult, error) {
 		return openStoreResultAtForCity(dirPath, cityPath)
 	}
+}
+
+// servingSupervisorBuildIDTimeout bounds the /health probe behind the
+// supervisor-build-drift check. It is deliberately shorter than the drift
+// client's own 5s default: doctor runs this check among many, and a supervisor
+// that cannot answer a localhost health probe in two seconds has already told
+// us something the check reports as not-assessed rather than waiting on.
+const servingSupervisorBuildIDTimeout = 2 * time.Second
+
+// servingSupervisorBuildID reports the build identity the RUNNING supervisor
+// says it is serving, read from /health.
+//
+// An error is returned rather than an empty string whenever the question could
+// not be put to the supervisor, because the caller renders those two states
+// differently: "it answered and reported no identity" is a different fact from
+// "it could not be asked", and collapsing them is how a health check starts
+// reassuring the operator about something it never measured.
+func servingSupervisorBuildID() (string, error) {
+	baseURL, err := supervisorAPIBaseURLHook()
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), servingSupervisorBuildIDTimeout)
+	defer cancel()
+	status, err := newHTTPSupervisorClient(baseURL).Status(ctx)
+	if err != nil {
+		return "", err
+	}
+	return status.BuildID, nil
 }
