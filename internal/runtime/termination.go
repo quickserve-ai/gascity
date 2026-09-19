@@ -46,6 +46,13 @@ type Termination struct {
 	// returns, never by a caller.
 	At time.Time
 
+	// SessionID is the session bead's id, carried in the record rather than
+	// looked up by the sink. A sink that resolved name->id would put a store
+	// READ on the stop path, which is the one place a slow store must not
+	// reach: force-exits cluster in the windows where the store is sick.
+	// Callers already hold the Info or the id at every funneled site.
+	SessionID string
+
 	// RequestedAt is when the ending was REQUESTED: the drain ask, or the
 	// seat's own `gc handoff` invocation for KindHandoff. Zero when the ending
 	// had no distinct request (an observed-dead runtime was never asked).
