@@ -918,6 +918,22 @@ func NewManagerWithOptions(store beads.Store, sp runtime.Provider, opts ...Manag
 	for _, opt := range opts {
 		opt(m)
 	}
+	// THE AUTHORITATIVE SINK IS A DEFAULT, NOT AN OPT-IN (ga-ksac39). Every
+	// Manager already holds the store the record is written to, so requiring
+	// each construction site to remember WithTerminationSinks would mean the
+	// ratio silently under-counts wherever someone forgot — and a denominator
+	// with quiet holes is worse than no ratio, which is the whole premise of
+	// this work. Wiring it here makes recording the default and leaves
+	// WithTerminationSinks for the sinks the Manager CANNOT derive, chiefly the
+	// event sink, which needs a recorder it has no handle on.
+	//
+	// It is appended AFTER the options so an explicitly supplied sink is never
+	// displaced, and NewBeadTerminationSink returns a nil sink for a nil store,
+	// which StopRecorded skips — so a Manager built without a store still
+	// stops sessions exactly as before.
+	if bs := NewBeadTerminationSink(NewStore(beads.SessionStore{Store: store})); bs != nil {
+		m.terminationSinks = append(m.terminationSinks, bs)
+	}
 	return m
 }
 

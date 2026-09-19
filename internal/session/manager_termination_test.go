@@ -146,3 +146,36 @@ type panickingSink struct{}
 func (panickingSink) RecordTermination(string, runtime.Termination) error {
 	panic("sink is sick")
 }
+
+// TestManagerWritesTheRecordToTheBeadByDefault is the difference between
+// "migrated" and "collecting". The Manager funnelling through the seam records
+// nothing unless a sink is attached; the authoritative bead sink is therefore a
+// DEFAULT, and this pins that it stays one. A regression here is silent: every
+// stop still works, the ratio just quietly loses its denominator.
+func TestManagerWritesTheRecordToTheBeadByDefault(t *testing.T) {
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	mgr := NewManagerWithOptions(store, sp) // NO WithTerminationSinks
+	info := liveSession(t, mgr, "default-sink")
+
+	if err := mgr.Kill(info.ID); err != nil {
+		t.Fatalf("Kill: %v", err)
+	}
+	b, err := store.Get(info.ID)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	if got := b.Metadata[TerminationKindKey]; got != string(runtime.KindOperatorKill) {
+		t.Errorf("%s = %q, want %q", TerminationKindKey, got, runtime.KindOperatorKill)
+	}
+	if b.Metadata[TerminationAtKey] == "" {
+		t.Errorf("%s is empty — the record landed without a timestamp", TerminationAtKey)
+	}
+	// RequestedAt is zero on this path, and the patch writes an EMPTY STRING
+	// rather than omitting the key, so a re-terminated bead cannot show a stale
+	// value from a previous ending beside a fresh kind.
+	if _, present := b.Metadata[TerminationRequestedAtKey]; !present {
+		t.Errorf("%s is absent; it must be present-and-empty, not missing",
+			TerminationRequestedAtKey)
+	}
+}
