@@ -6184,15 +6184,13 @@ func configDriftHandoffBody(agent string, driftedFields []string, at time.Time) 
 	if len(driftedFields) > 0 {
 		b.WriteString("  drifted: " + strings.Join(driftedFields, ", ") + "\n")
 	}
-	b.WriteString("\nRECOVER BEFORE YOU PICK UP ANYTHING NEW. Use your pack's startup\n")
-	b.WriteString("protocol — on this runtime that is the hook, which is the ONE command:\n")
-	b.WriteString("  gc hook --claim --drain-ack --json\n")
-	b.WriteString("Do NOT substitute a gc bd list --assignee query. An unclaimed routed item\n")
-	b.WriteString("has NO assignee, an ephemeral wisp is hidden from that query by default,\n")
-	b.WriteString("and a claim is recorded under the session identity rather than the alias\n")
-	b.WriteString("you would guess — so it answers \"no work\" while your own work sits open.\n")
-	b.WriteString("That is how a maintenance order once went 41 hours unrun (ga-tmzjx6).\n")
-	b.WriteString("Then read gc mail inbox: mail sent while you were down is still there.\n")
+	b.WriteString("\nRECOVER BEFORE YOU PICK UP ANYTHING NEW:\n")
+	b.WriteString("  gc prime\n")
+	b.WriteString("It re-renders YOUR role and YOUR pack's own startup protocol, and its\n")
+	b.WriteString("hooks surface the mail that arrived while you were down. Follow what it\n")
+	b.WriteString("gives you — this note deliberately does not tell you how to find your\n")
+	b.WriteString("work, because the controller does not know which protocol your pack\n")
+	b.WriteString("defines, and guessing wrong is worse than saying nothing.\n")
 	return b.String()
 }
 

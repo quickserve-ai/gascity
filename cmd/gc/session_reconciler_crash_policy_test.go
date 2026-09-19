@@ -373,12 +373,11 @@ func TestConfigDriftHandoffBodyCarriesRecovery(t *testing.T) {
 		t.Fatal("config-drift handoff body is empty — the defect ga-68f9qa exists to prevent")
 	}
 	for _, want := range []string{
-		"qcore/worker",                // which seat
-		at.Format(time.RFC3339),       // when
-		"model, prompt",               // what drifted
-		"gc hook --claim --drain-ack", // the canonical claim protocol, not a hand-rolled query
-		"gc mail inbox",               // mail that arrived while it was down
-		"MECHANICAL",                  // it must not read as a composed handoff
+		"qcore/worker",          // which seat
+		at.Format(time.RFC3339), // when
+		"model, prompt",         // what drifted
+		"gc prime",              // recovery resolved from the seat's OWN pack, not prescribed here
+		"MECHANICAL",            // it must not read as a composed handoff
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("config-drift handoff body missing %q\n--- body ---\n%s", want, body)
@@ -396,10 +395,30 @@ func TestConfigDriftHandoffBodyCarriesRecovery(t *testing.T) {
 	// tell "run this" from "never run this" (it flagged the warning itself when the
 	// guard was first written). A command the seat is meant to run stands alone on its
 	// line — that is the shape being forbidden here.
+	// The body must not PRESCRIBE a work-lookup or claim procedure at all. Two
+	// separate defects sit behind this, both found by Codex review on PR #104:
+	//
+	//   `gc bd list --assignee` is forbidden outright by the core claim protocol
+	//   (claim-protocol.template.md): an unclaimed routed item has no assignee and
+	//   an ephemeral wisp is hidden from that query, so it reports "no work" while
+	//   the seat's own work sits open (ga-tmzjx6, 41 hours unrun).
+	//
+	//   `gc hook --claim --drain-ack` is the POOL WORKER protocol, and this mail
+	//   goes to NAMED seats (it is sent beside resetConfiguredNamedSessionForConfigDrift).
+	//   Under that protocol an `action: drain` result means "your session is done —
+	//   exit". Prescribing it here could tell a freshly restarted named seat to quit.
+	//
+	// The controller does not know which protocol a given pack defines, so it names
+	// none: `gc prime` re-renders the seat's own pack-rendered role prompt. Checks
+	// the DIRECTIVE position, not the mention — a plain substring check cannot tell
+	// "run this" from "never run this", which is how the first version of this guard
+	// flagged its own warning text.
 	for _, line := range strings.Split(body, "\n") {
-		directive := strings.TrimLeft(strings.TrimSpace(line), "0123456789. ")
-		if strings.HasPrefix(directive, "gc bd list") || strings.HasPrefix(directive, "bd list") {
-			t.Errorf("config-drift handoff body directs the seat to the forbidden query: %q\n--- body ---\n%s", line, body)
+		directive := strings.TrimLeft(strings.TrimSpace(line), "0123456789.-* ")
+		for _, forbidden := range []string{"gc bd list", "bd list", "gc hook", "gc bd ready"} {
+			if strings.HasPrefix(directive, forbidden) {
+				t.Errorf("config-drift handoff body prescribes %q, overriding whatever protocol the seat's pack defines: %q\n--- body ---\n%s", forbidden, line, body)
+			}
 		}
 	}
 	// No drifted fields is legal and must not produce a dangling label.
