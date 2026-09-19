@@ -1,4 +1,4 @@
-package runtime
+package terminationevents
 
 import (
 	"encoding/json"
@@ -7,9 +7,10 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/runtime"
 )
 
-// EventTerminationSink writes a `session.terminated` event for every ending.
+// Sink writes a `session.terminated` event for every ending.
 //
 // THIS IS THE SECOND OF THE TWO SINKS, AND ITS WHOLE VALUE IS THAT IT FAILS
 // INDEPENDENTLY OF THE FIRST. The bead sink rides Dolt and can fail during
@@ -23,23 +24,23 @@ import (
 // the hole and the week is FLAGGED — never silently patched. An event stream
 // that quietly repaired the authoritative record would make the instrument
 // unfalsifiable.
-type EventTerminationSink struct {
+type Sink struct {
 	rec events.Recorder
-	// actor is the fallback event actor when a Termination carries none.
+	// actor is the fallback event actor when a runtime.Termination carries none.
 	actor string
 }
 
-// NewEventTerminationSink returns a sink writing to rec. A nil rec yields a nil
+// New returns a sink writing to rec. A nil rec yields a nil
 // sink, which StopRecorded skips — callers that have not wired events yet must
 // still be able to stop.
-func NewEventTerminationSink(rec events.Recorder, actor string) *EventTerminationSink {
+func New(rec events.Recorder, actor string) *Sink {
 	if rec == nil {
 		return nil
 	}
 	if actor == "" {
 		actor = "controller"
 	}
-	return &EventTerminationSink{rec: rec, actor: actor}
+	return &Sink{rec: rec, actor: actor}
 }
 
 // TerminationEventType is the event type the ratio reads.
@@ -76,7 +77,7 @@ type terminationPayload struct {
 // hole") would be resting on a record that may not exist. So when the recorder
 // implements AckRecorder we use RecordAck and surface its verdict; when it does
 // not, we say so rather than implying durability we cannot observe.
-func (s *EventTerminationSink) RecordTermination(sessionName string, t Termination) error {
+func (s *Sink) RecordTermination(sessionName string, t runtime.Termination) error {
 	if s == nil || s.rec == nil {
 		return nil
 	}

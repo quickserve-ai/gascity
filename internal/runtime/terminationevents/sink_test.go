@@ -1,4 +1,4 @@
-package runtime
+package terminationevents
 
 import (
 	"encoding/json"
@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/runtime"
 )
 
 // voidRecorder implements only events.Recorder — the best-effort, cannot-confirm
@@ -32,11 +33,11 @@ func (a *ackRecorder) RecordAck(e events.Event) error {
 
 func TestEventSinkWritesEveryRatioFieldWithoutAJoin(t *testing.T) {
 	rec := &ackRecorder{}
-	s := NewEventTerminationSink(rec, "controller")
+	s := New(rec, "controller")
 	req := time.Unix(1700000000, 0).UTC()
 	at := req.Add(9 * time.Minute)
-	err := s.RecordTermination("qcore/worker-3", Termination{
-		Kind: KindDrainTimeout, Actor: "controller", Reason: "config-drift",
+	err := s.RecordTermination("qcore/worker-3", runtime.Termination{
+		Kind: runtime.KindDrainTimeout, Actor: "controller", Reason: "config-drift",
 		At: at, RequestedAt: req, SessionID: "ga-abc123",
 	})
 	if err != nil {
@@ -59,7 +60,7 @@ func TestEventSinkWritesEveryRatioFieldWithoutAJoin(t *testing.T) {
 	// Every field the ratio needs must be on the row: a reader that has to join
 	// back to the bead to bucket a row cannot compute the ratio from the stream
 	// alone, which is the stream's only job.
-	if p.Kind != string(KindDrainTimeout) || p.Reason != "config-drift" ||
+	if p.Kind != string(runtime.KindDrainTimeout) || p.Reason != "config-drift" ||
 		p.SessionName != "qcore/worker-3" || p.At == "" || p.RequestedAt == "" {
 		t.Errorf("payload is missing ratio fields: %+v", p)
 	}
@@ -75,8 +76,8 @@ func TestEventSinkWritesEveryRatioFieldWithoutAJoin(t *testing.T) {
 // bead record is filled by the event. That rests on knowing the event landed.
 func TestEventSinkReportsADroppedEvent(t *testing.T) {
 	boom := errors.New("ENOSPC")
-	s := NewEventTerminationSink(&ackRecorder{fail: boom}, "controller")
-	err := s.RecordTermination("seat", Termination{Kind: KindHandoff})
+	s := New(&ackRecorder{fail: boom}, "controller")
+	err := s.RecordTermination("seat", runtime.Termination{Kind: runtime.KindHandoff})
 	if err == nil {
 		t.Fatal("a dropped event must be REPORTED — otherwise the reconciliation rule rests on a record that may not exist")
 	}
@@ -92,8 +93,8 @@ func TestEventSinkReportsADroppedEvent(t *testing.T) {
 // void. Returning nil would assert a durable record that may not exist.
 func TestEventSinkDoesNotClaimDurabilityItCannotObserve(t *testing.T) {
 	v := &voidRecorder{}
-	s := NewEventTerminationSink(v, "controller")
-	err := s.RecordTermination("seat", Termination{Kind: KindHandoff})
+	s := New(v, "controller")
+	err := s.RecordTermination("seat", runtime.Termination{Kind: runtime.KindHandoff})
 	if err == nil {
 		t.Fatal("emitting through a void Recorder must not report success: Record is best-effort and silently drops")
 	}
@@ -107,16 +108,16 @@ func TestEventSinkDoesNotClaimDurabilityItCannotObserve(t *testing.T) {
 
 // TestEventSinkNilIsSafe — a caller that has not wired events must still stop.
 func TestEventSinkNilIsSafe(t *testing.T) {
-	if s := NewEventTerminationSink(nil, ""); s != nil {
+	if s := New(nil, ""); s != nil {
 		t.Fatal("a nil recorder must yield a nil sink")
 	}
-	var s *EventTerminationSink
-	if err := s.RecordTermination("seat", Termination{Kind: KindHandoff}); err != nil {
+	var s *Sink
+	if err := s.RecordTermination("seat", runtime.Termination{Kind: runtime.KindHandoff}); err != nil {
 		t.Errorf("a nil sink must be a silent no-op, got %v", err)
 	}
 	// And StopRecorded must tolerate it end to end.
-	p := NewFake()
-	if err := StopRecorded(p, "seat", Termination{Kind: KindHandoff}, s); err != nil {
+	p := runtime.NewFake()
+	if err := runtime.StopRecorded(p, "seat", runtime.Termination{Kind: runtime.KindHandoff}, s); err != nil {
 		t.Errorf("StopRecorded with a nil typed sink: %v", err)
 	}
 	if len(stoppedNames(p)) != 1 {
@@ -124,12 +125,25 @@ func TestEventSinkNilIsSafe(t *testing.T) {
 	}
 }
 
+// stoppedNames mirrors the parent package's test helper. It is duplicated
+// rather than exported: a test-only accessor on the contract package would be
+// public API that only tests want, and this is nine lines.
+func stoppedNames(f *runtime.Fake) []string {
+	var out []string
+	for _, c := range f.Calls {
+		if c.Method == "Stop" {
+			out = append(out, c.Name)
+		}
+	}
+	return out
+}
+
 // TestEventSinkStopStillHappensWhenTheEventIsDropped is the end-to-end form of
 // the contract: the record is bookkeeping, the stop is the operation.
 func TestEventSinkStopStillHappensWhenTheEventIsDropped(t *testing.T) {
-	s := NewEventTerminationSink(&ackRecorder{fail: errors.New("disk full")}, "controller")
-	p := NewFake()
-	err := StopRecorded(p, "seat", Termination{Kind: KindCityStop}, s)
+	s := New(&ackRecorder{fail: errors.New("disk full")}, "controller")
+	p := runtime.NewFake()
+	err := runtime.StopRecorded(p, "seat", runtime.Termination{Kind: runtime.KindCityStop}, s)
 	if len(stoppedNames(p)) != 1 {
 		t.Fatalf("the stop must happen even when the event is dropped: %v", err)
 	}

@@ -7,11 +7,6 @@ internal/api/huma_handlers_rigs.go:594:if err := sp.Stop(sessionName); err != ni
 internal/doctor/checks.go:562:if err := c.sp.Stop(sn); err != nil {
 internal/doctor/checks.go:657:if err := c.sp.Stop(s); err != nil {
 internal/session/chat.go:655:_ = m.sp.Stop(sessName)
-internal/session/manager.go:1082:if stopErr := m.sp.Stop(sessName); stopErr != nil {
-internal/session/manager.go:1305:_ = m.sp.Stop(sessName) // best-effort: tear down any leaked runtime
-internal/session/manager.go:1322:err := m.sp.Stop(sessName)
-internal/session/manager.go:1408:if err := m.sp.Stop(sessName); err != nil {
-internal/session/manager.go:1494:return m.sp.Stop(sessName)
 internal/session/submit.go:177:if err := m.sp.Stop(sessName); err != nil {
 internal/session/submit.go:198:if stopErr := m.sp.Stop(sessName); stopErr != nil {
 internal/session/submit.go:204:if stopErr := m.sp.Stop(sessName); stopErr != nil {
