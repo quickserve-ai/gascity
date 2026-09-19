@@ -341,18 +341,52 @@ func findMessageBeads(t *testing.T, store beads.Store, assignee string) []beads.
 // TestSendConfigDriftHandoffMail exercises the helper directly: it must
 // create a type=message handoff bead addressed to the recipient, and must be a
 // no-op (no panic, no bead) on nil store or empty recipient.
+//
+// THIS TEST USED TO ASSERT ONLY THAT A BEAD EXISTED, which is how ga-68f9qa
+// survived: the helper mailed a SUBJECT AND AN EMPTY BODY for as long as it has
+// existed, and a count-the-beads assertion cannot see that. The body assertion
+// below is the guarantee that was missing, not an extra.
 func TestSendConfigDriftHandoffMail(t *testing.T) {
 	env := newReconcilerTestEnv()
-	sendConfigDriftHandoffMail(env.store, env.rec, "qcore/worker", &env.stderr)
+	body := configDriftHandoffBody("qcore/worker", []string{"model", "prompt"}, time.Unix(1700000000, 0).UTC())
+	sendConfigDriftHandoffMail(env.store, env.rec, "qcore/worker", body, &env.stderr)
 	msgs := findMessageBeads(t, env.store, "qcore/worker")
 	if len(msgs) != 1 {
 		t.Fatalf("expected 1 handoff message to qcore/worker, got %d (stderr=%s)", len(msgs), env.stderr.String())
 	}
 	// Nil store / empty recipient are silent no-ops.
-	sendConfigDriftHandoffMail(nil, env.rec, "qcore/worker", &env.stderr)
-	sendConfigDriftHandoffMail(env.store, env.rec, "", &env.stderr)
+	sendConfigDriftHandoffMail(nil, env.rec, "qcore/worker", body, &env.stderr)
+	sendConfigDriftHandoffMail(env.store, env.rec, "", body, &env.stderr)
 	if got := len(findMessageBeads(t, env.store, "qcore/worker")); got != 1 {
 		t.Fatalf("no-op guards created extra beads: got %d, want 1", got)
+	}
+}
+
+// TestConfigDriftHandoffBodyCarriesRecovery is the guard for ga-68f9qa: the
+// note the restarted seat reads must actually say something. A handoff bead
+// that wears AutoHandoffLabel while carrying nothing is worse than no handoff —
+// it is counted as a clean ending by anything reading the ratio (ga-ksac39).
+func TestConfigDriftHandoffBodyCarriesRecovery(t *testing.T) {
+	at := time.Unix(1700000000, 0).UTC()
+	body := configDriftHandoffBody("qcore/worker", []string{"model", "prompt"}, at)
+	if strings.TrimSpace(body) == "" {
+		t.Fatal("config-drift handoff body is empty — the defect ga-68f9qa exists to prevent")
+	}
+	for _, want := range []string{
+		"qcore/worker",                 // which seat
+		at.Format(time.RFC3339),        // when
+		"model, prompt",                // what drifted
+		"in_progress",                  // the first recovery step
+		"gc mail inbox",                // the second
+		"MECHANICAL",                   // it must not read as a composed handoff
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("config-drift handoff body missing %q\n--- body ---\n%s", want, body)
+		}
+	}
+	// No drifted fields is legal and must not produce a dangling label.
+	if got := configDriftHandoffBody("qcore/worker", nil, at); strings.Contains(got, "drifted:") {
+		t.Errorf("empty drifted-field list still emitted a drifted: line\n--- body ---\n%s", got)
 	}
 }
 

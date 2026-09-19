@@ -3693,7 +3693,8 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							// the rebuilt named session can recover its context
 							// (hq-wi4ka: config-drift restart with no handoff
 							// destroys the conversation). Best-effort.
-							sendConfigDriftHandoffMailWithStores(reconcilerMailStore(cityPath, cfg, store, rec), store, rec, tp.DisplayName(), stderr)
+							sendConfigDriftHandoffMailWithStores(reconcilerMailStore(cityPath, cfg, store, rec), store, rec, tp.DisplayName(),
+								configDriftHandoffBody(tp.DisplayName(), driftedFields, clk.Now()), stderr)
 							if trace != nil {
 								trace.RecordDecision(TraceSiteReconcilerConfigDrift, TraceReasonConfigDrift, TraceOutcomeRestartInPlace, tp.TemplateName, name, configDriftTracePayload(storedHash, currentHash, driftedFields, nil))
 							}
@@ -3783,7 +3784,8 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							if beginSessionDrainInfo(infoByID[id], sp, dt, "config-drift", clk, ddt) {
 								// Record a handoff BEFORE the drain so the rebuilt
 								// session can recover its context (hq-wi4ka). Best-effort.
-								sendConfigDriftHandoffMailWithStores(reconcilerMailStore(cityPath, cfg, store, rec), store, rec, tp.DisplayName(), stderr)
+								sendConfigDriftHandoffMailWithStores(reconcilerMailStore(cityPath, cfg, store, rec), store, rec, tp.DisplayName(),
+								configDriftHandoffBody(tp.DisplayName(), driftedFields, clk.Now()), stderr)
 								fmt.Fprintf(stdout, "Draining session '%s': config-drift\n", name) //nolint:errcheck
 								if trace != nil {
 									trace.RecordDecision(TraceSiteReconcilerConfigDrift, TraceReasonConfigDrift, TraceOutcomeDrain, tp.TemplateName, name, configDriftTracePayload(storedHash, currentHash, driftedFields, nil))
@@ -6150,8 +6152,45 @@ func sendConfigDriftWaveMail(store beads.Store, rec events.Recorder, recipient, 
 // This single-store form serves a city whose messaging and session classes
 // share one store; the reconciler sends through
 // sendConfigDriftHandoffMailWithStores with the resolved mail-class store.
-func sendConfigDriftHandoffMail(store beads.Store, rec events.Recorder, recipient string, stderr io.Writer) {
-	sendConfigDriftHandoffMailWithStores(store, store, rec, recipient, stderr)
+func sendConfigDriftHandoffMail(store beads.Store, rec events.Recorder, recipient, body string, stderr io.Writer) {
+	sendConfigDriftHandoffMailWithStores(store, store, rec, recipient, body, stderr)
+}
+
+// configDriftHandoffBody is what the restarted seat actually reads (ga-68f9qa).
+//
+// This mail used to be sent with a SUBJECT AND NOTHING ELSE: createHandoffMail
+// takes the body as args[1] and the call site passed a one-element slice, so
+// `message` stayed "". The seat was restarted, the note was injected, and it
+// carried no information at all — while still wearing AutoHandoffLabel and a
+// "HANDOFF:" subject, so anything counting handoffs scored it as a clean one.
+// An empty handoff is worse than no handoff: no handoff is at least visible as
+// a gap (ga-ksac39, katya's R3).
+//
+// SCOPE, deliberately narrow: only what the reconciler already holds at the
+// call site. No store query for the seat's in-progress beads — that is
+// ga-ksac39 S2, and this is a BEST-EFFORT path on the drift-restart critical
+// line, where a new failure mode would cost more than the extra context buys.
+// No pane tail, now or later, by decision rather than omission: argv on this
+// box has carried live provider keys (ga-icxer4), and a redactor is a denylist
+// that fails open.
+func configDriftHandoffBody(agent string, driftedFields []string, at time.Time) string {
+	var b strings.Builder
+	b.WriteString("You were restarted by the controller because your configuration drifted.\n")
+	b.WriteString("This note is MECHANICAL — the controller wrote it, not your previous\n")
+	b.WriteString("session, so it carries no reasoning and no plan. Treat your recollection\n")
+	b.WriteString("of what you were doing as LOST, not as summarized.\n\n")
+	b.WriteString("  agent:   " + agent + "\n")
+	b.WriteString("  when:    " + at.UTC().Format(time.RFC3339) + "\n")
+	if len(driftedFields) > 0 {
+		b.WriteString("  drifted: " + strings.Join(driftedFields, ", ") + "\n")
+	}
+	b.WriteString("\nRECOVER BEFORE YOU PICK UP ANYTHING NEW, in this order:\n")
+	b.WriteString("  1. gc bd list --assignee <you> --status in_progress   (your own work\n")
+	b.WriteString("     is the record; an in-progress bead under your name IS your task)\n")
+	b.WriteString("  2. gc mail inbox                                      (anything sent\n")
+	b.WriteString("     to you while you were down is still there)\n")
+	b.WriteString("  3. gc hook                                            (hooked work)\n")
+	return b.String()
 }
 
 // sendConfigDriftHandoffMailWithStores is sendConfigDriftHandoffMail over the
@@ -6159,12 +6198,12 @@ func sendConfigDriftHandoffMail(store beads.Store, rec events.Recorder, recipien
 // bead is MESSAGING-class (msgStore) and beadmail's addressing reads are
 // SESSIONS-class (sessStore). On a split city the two differ, and minting the
 // handoff into the session store would write it where nothing delivers from.
-func sendConfigDriftHandoffMailWithStores(msgStore, sessStore beads.Store, rec events.Recorder, recipient string, stderr io.Writer) {
+func sendConfigDriftHandoffMailWithStores(msgStore, sessStore beads.Store, rec events.Recorder, recipient, body string, stderr io.Writer) {
 	if msgStore == nil || sessStore == nil || recipient == "" {
 		return
 	}
 	createHandoffMail(msgStore, sessStore, rec, controllerMailIdentity, recipient,
-		[]string{"HANDOFF: config-drift restart"}, "HANDOFF: config-drift restart",
+		[]string{"HANDOFF: config-drift restart", body}, "HANDOFF: config-drift restart",
 		[]string{mail.AutoHandoffLabel, mail.ArchiveAfterInjectLabel, "priority:1"}, stderr)
 }
 
