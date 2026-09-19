@@ -6,7 +6,3 @@ cmd/gc/session_lifecycle_parallel.go:2167:stopErr := sp.Stop(name)
 internal/api/huma_handlers_rigs.go:594:if err := sp.Stop(sessionName); err != nil {
 internal/doctor/checks.go:562:if err := c.sp.Stop(sn); err != nil {
 internal/doctor/checks.go:657:if err := c.sp.Stop(s); err != nil {
-internal/session/chat.go:655:_ = m.sp.Stop(sessName)
-internal/session/submit.go:177:if err := m.sp.Stop(sessName); err != nil {
-internal/session/submit.go:198:if stopErr := m.sp.Stop(sessName); stopErr != nil {
-internal/session/submit.go:204:if stopErr := m.sp.Stop(sessName); stopErr != nil {

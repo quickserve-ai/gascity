@@ -98,6 +98,23 @@ const (
 	// KindObservedDead — zombie recycle, stale reap, async-start cleanup. There
 	// was nothing to ask; excluded from the ratio's denominator.
 	KindObservedDead TerminationKind = "observed-dead"
+	// KindInterruptRestart — the runtime was stopped so it could be restarted
+	// IMMEDIATELY AND IN PLACE, mid-conversation, with the seat's work resumed
+	// on the other side: a hard-restart interrupt, or the fallback when an
+	// interrupt's idle or boundary wait times out (internal/session/submit.go).
+	//
+	// IT IS EXCLUDED FROM THE DENOMINATOR, for the same reason KindObservedDead
+	// is: no handoff policy could have prevented it, because it is not a seat
+	// ENDING at all — the conversation continues across it. Counting these
+	// would be actively misleading rather than merely noisy: interrupts are
+	// routine and high-traffic, so a busy day of them would read as a day of
+	// force-exits and the ratio would fall for a reason that has nothing to do
+	// with handoff discipline.
+	//
+	// DISTINCT FROM KindRestartInPlace, which is the reconciler's config-drift
+	// restart. That one really does end a seat's session without asking, and
+	// belongs in the denominator.
+	KindInterruptRestart TerminationKind = "interrupt-restart"
 
 	// KindUnclassified is what a caller passes when it genuinely cannot say.
 	//
@@ -123,18 +140,22 @@ var terminationKinds = map[TerminationKind]bool{
 	KindHandoff: true, KindDrainHandoff: true, KindDrainTimeout: true,
 	KindDrainSilent: true, KindRestartInPlace: true, KindOperatorKill: true,
 	KindOperatorClose: true, KindOperatorSuspend: true, KindHandoffTarget: true,
-	KindCityStop: true, KindObservedDead: true, KindUnclassified: true,
+	KindCityStop: true, KindObservedDead: true, KindInterruptRestart: true,
+	KindUnclassified: true,
 }
 
 // Valid reports whether k is in the closed set.
 func (k TerminationKind) Valid() bool { return terminationKinds[k] }
 
 // CountsInDenominator reports whether an ending of this kind belongs in the
-// handoff ratio's denominator. Only KindObservedDead is excluded: nothing could
-// have been asked of a runtime that was already gone, so counting it would
-// penalise the ratio for deaths no handoff policy could have prevented.
+// handoff ratio's denominator. TWO kinds are excluded, on one principle: no
+// handoff policy could have prevented either, so counting them would penalise
+// the ratio for endings it does not govern. KindObservedDead is a runtime that
+// was already gone — nothing could have been asked of it. KindInterruptRestart
+// is not an ending at all — the session restarts in place and the conversation
+// continues across it.
 func (k TerminationKind) CountsInDenominator() bool {
-	return k.Valid() && k != KindObservedDead
+	return k.Valid() && k != KindObservedDead && k != KindInterruptRestart
 }
 
 // CountsInNumerator reports whether an ending of this kind is a handoff for

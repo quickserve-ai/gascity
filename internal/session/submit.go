@@ -174,7 +174,14 @@ func (m *Manager) interruptAndSubmitLocked(ctx context.Context, id string, b bea
 		if err != nil {
 			return err
 		}
-		if err := m.sp.Stop(sessName); err != nil {
+		// Stopped only so it can be restarted in place below; the seat's work
+		// resumes on the other side, so this is not an ENDING and is excluded
+		// from the ratio's denominator.
+		if err := m.stopRecorded(sessName, runtime.Termination{
+			Kind:      runtime.KindInterruptRestart,
+			Reason:    "hard-restart interrupt replacement",
+			SessionID: id,
+		}); err != nil {
 			return fmt.Errorf("stopping session for interrupt replacement: %w", err)
 		}
 		if err := discardPiPendingTurn(piTranscriptPath, hints); err != nil {
@@ -195,13 +202,21 @@ func (m *Manager) interruptAndSubmitLocked(ctx context.Context, id string, b bea
 	if err := m.waitForInterruptIdleLocked(ctx, b, sessName); err != nil {
 		// Idle wait failed (e.g. timeout). Fall back to hard
 		// restart so the session isn't left in limbo.
-		if stopErr := m.sp.Stop(sessName); stopErr != nil {
+		if stopErr := m.stopRecorded(sessName, runtime.Termination{
+			Kind:      runtime.KindInterruptRestart,
+			Reason:    "interrupt idle wait timed out; falling back to hard restart",
+			SessionID: id,
+		}); stopErr != nil {
 			return fmt.Errorf("stopping session after idle timeout: %w", stopErr)
 		}
 		return m.restartAndSendLocked(ctx, id, b, sessName, message, resumeCommand, hints)
 	}
 	if err := m.waitForInterruptBoundaryLocked(ctx, b, sessName, interruptStartedAt); err != nil {
-		if stopErr := m.sp.Stop(sessName); stopErr != nil {
+		if stopErr := m.stopRecorded(sessName, runtime.Termination{
+			Kind:      runtime.KindInterruptRestart,
+			Reason:    "interrupt boundary wait timed out; falling back to hard restart",
+			SessionID: id,
+		}); stopErr != nil {
 			return fmt.Errorf("stopping session after interrupt boundary timeout: %w", stopErr)
 		}
 		return m.restartAndSendLocked(ctx, id, b, sessName, message, resumeCommand, hints)

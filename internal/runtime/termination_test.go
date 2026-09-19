@@ -179,8 +179,20 @@ func TestRatioBuckets(t *testing.T) {
 	if KindObservedDead.CountsInDenominator() {
 		t.Error("observed-dead must be OUT of the denominator: nothing could have been asked of a dead runtime")
 	}
+	if KindInterruptRestart.CountsInDenominator() {
+		t.Error("interrupt-restart must be OUT of the denominator: the session restarts in place and the conversation continues, so it is not an ending")
+	}
+	// THE EXCLUSION LIST IS ENUMERATED, NOT INFERRED. Every kind outside it
+	// must count, so adding a THIRD exclusion trips this test and has to be
+	// argued for here. Writing the loop as "skip anything excluded" would make
+	// the guard vacuous — it would pass for any future exclusion, silently,
+	// which is the exact failure it exists to prevent.
+	excluded := map[TerminationKind]bool{
+		KindObservedDead:     true,
+		KindInterruptRestart: true,
+	}
 	for _, k := range TerminationKinds() {
-		if k == KindObservedDead {
+		if excluded[k] {
 			continue
 		}
 		if !k.CountsInDenominator() {
