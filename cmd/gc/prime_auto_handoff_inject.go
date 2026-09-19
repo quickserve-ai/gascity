@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"unicode/utf8"
 
 	"github.com/gastownhall/gascity/internal/mail"
@@ -181,33 +182,37 @@ func primeLaurelsInjection(seatDir string) string {
 	return ""
 }
 
-// readLaurels returns the trimmed, capped text of a REGULAR file, or "". The
-// regular-file check comes before the open, so a FIFO at the path cannot block
-// gc prime, and at most laurelsMaxBytes+1 bytes are ever read.
+// readLaurels returns the trimmed, capped text of a REGULAR file, or "". It opens
+// non-blocking and checks the OPENED descriptor, so a FIFO swapped in at any
+// moment cannot block gc prime, and it reads at most laurelsMaxBytes+1 bytes.
 func readLaurels(path string) string {
-	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() {
-		return ""
-	}
-	f, err := os.Open(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return ""
 	}
 	defer f.Close() //nolint:errcheck // read-only
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return ""
+	}
 	data, err := io.ReadAll(io.LimitReader(f, laurelsMaxBytes+1))
 	if err != nil {
 		return ""
 	}
-	text := strings.TrimSpace(string(data))
+	truncated := false
 	if len(data) > laurelsMaxBytes {
-		cut := len(text)
-		if cut > laurelsMaxBytes {
-			cut = laurelsMaxBytes
-		}
-		for cut > 0 && !utf8.RuneStart(text[cut]) {
+		// Cut the raw bytes, not the trimmed text: data holds laurelsMaxBytes+1
+		// bytes here, so data[cut] is always in range.
+		cut := laurelsMaxBytes
+		for cut > 0 && !utf8.RuneStart(data[cut]) {
 			cut--
 		}
-		text = strings.TrimSpace(text[:cut]) + " [truncated]"
+		truncated = info.Size() > int64(laurelsMaxBytes+1) || strings.TrimSpace(string(data[cut:])) != ""
+		data = data[:cut]
+	}
+	text := strings.TrimSpace(string(data))
+	if text != "" && truncated {
+		text += " [truncated]"
 	}
 	return text
 }

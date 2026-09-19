@@ -53,6 +53,23 @@ func TestPrimeLaurelsInjectionCapsAtARuneBoundary(t *testing.T) {
 	}
 }
 
+// Codex review of #102: a cap-sized paragraph with its customary trailing newline
+// made the old cut index one past the trimmed text and panic in SessionStart.
+func TestPrimeLaurelsInjectionCapSizedParagraphWithNewline(t *testing.T) {
+	dir := t.TempDir()
+	body := strings.Repeat("a", laurelsMaxBytes)
+	if err := os.WriteFile(filepath.Join(dir, laurelsFileName), []byte(body+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := primeLaurelsInjection(dir)
+	if !strings.Contains(got, body) {
+		t.Fatal("a cap-sized paragraph must survive whole")
+	}
+	if strings.Contains(got, "[truncated]") {
+		t.Fatal("only a trailing newline was dropped; nothing was truncated")
+	}
+}
+
 func TestPrimeLaurelsInjectionReadsTheSeatHomeFirst(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, "seat"), 0o755); err != nil {
