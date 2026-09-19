@@ -7,6 +7,25 @@ import (
 	"time"
 )
 
+// *** termination.* RECORDS THE ATTEMPT, NOT THE CONFIRMED OUTCOME. ***
+//
+// The sink pass runs BEFORE p.Stop returns — deliberately, so the record
+// survives a stop that then wedges — which means a termination record asserts
+// "an ending of this kind was attempted at this moment", never "the session is
+// definitely gone". In production the reconciler's unavailable-probe window is
+// exactly the case where the stop's outcome is UNKNOWN, and a record there
+// legitimately disagrees with a session that turns out to still be running.
+// Stated here because the next reader will otherwise call that disagreement
+// corruption and go looking for a bug that is not there (katya, S1 review).
+//
+// RETRY INFLATION FOLLOWS FROM THE SAME WINDOW: a drain that cannot confirm
+// completion retries, so ONE ending can write N history rows. The reader
+// deduplicates on (SessionID, Kind, RequestedAt). That key works because
+// RequestedAt is the drain's stable startedAt rather than a per-attempt clock
+// — the same field that makes Timer B measurable is what makes the retries
+// collapse to one ending. A writer that "helpfully" refreshed RequestedAt per
+// attempt would break the dedup and inflate the denominator.
+//
 // Termination records WHY a session ended, for every ending including the good
 // one (ga-ksac39, Cherub 2026-09-18). The ratio it feeds — handoffs over all
 // endings — only means something if the denominator is complete, so the record
@@ -33,8 +52,15 @@ type Termination struct {
 	// new free-text string appearing in some future call site.
 	Kind TerminationKind
 
-	// Actor is who caused the ending: $GC_AGENT when a seat runs the CLI,
-	// "human" for an operator, "controller"/"supervisor" for gc itself.
+	// Actor is who caused the ending: $GC_AGENT when a seat runs the CLI, or
+	// "controller"/"supervisor"/"reconciler"/"doctor"/"api" for gc itself.
+	//
+	// IT IS NEVER "human", DELIBERATELY. Nothing on this path can distinguish a
+	// human at a terminal from a seat running the same command — both arrive
+	// with the same environment — so asserting it would be a checkable but
+	// wrong attribution, which is harder to unwind than a missing one. EMPTY is
+	// a legitimate value: the sink applies the default that knows which process
+	// it is running in, and the ga-fbzz9u reader reports empty on its own line.
 	Actor string
 
 	// Reason carries the existing drain/sleep reason verbatim ("config-drift",
@@ -103,13 +129,29 @@ const (
 	// on the other side: a hard-restart interrupt, or the fallback when an
 	// interrupt's idle or boundary wait times out (internal/session/submit.go).
 	//
-	// IT IS EXCLUDED FROM THE DENOMINATOR, for the same reason KindObservedDead
-	// is: no handoff policy could have prevented it, because it is not a seat
-	// ENDING at all — the conversation continues across it. Counting these
-	// would be actively misleading rather than merely noisy: interrupts are
-	// routine and high-traffic, so a busy day of them would read as a day of
-	// force-exits and the ratio would fall for a reason that has nothing to do
-	// with handoff discipline.
+	// EXCLUDED FROM THE DENOMINATOR ON CONTEXT SURVIVAL, which is the sharper
+	// principle katya named in S1 review and is NOT observed-dead's
+	// nothing-to-ask. The kind table has two axes — did the seat's CONTEXT end,
+	// and was a handoff POSSIBLE — and this kind is the case where context
+	// survives. That is also why KindRestartInPlace stays IN: the reconciler's
+	// config-drift restart really does end the context.
+	//
+	// Counting these would be actively misleading rather than merely noisy:
+	// interrupts are routine and high-traffic, so a busy day of them would read
+	// as a day of force-exits and the ratio would fall for a reason that has
+	// nothing to do with handoff discipline.
+	//
+	// EXCLUDED BUT REPORTED, on its own line like KindHandoffTarget. A bucket
+	// that leaves the ratio must still be visible, or the exclusion becomes
+	// indistinguishable from the events never happening.
+	//
+	// *** NAMED CAVEAT: THIS KIND ASSUMES THE RESUME SUCCEEDS, AND THE SEAM
+	// CANNOT VERIFY THAT. *** The exclusion is only sound while the restart
+	// actually restores the seat's context. A restart that silently fails to
+	// resume IS a lost context wearing this label, and it would be excluded
+	// from the denominator precisely when it should count. Nothing on the stop
+	// path can observe the other side of the restart, so this is recorded as an
+	// assumption rather than defended as a fact (katya, condition 2).
 	//
 	// DISTINCT FROM KindRestartInPlace, which is the reconciler's config-drift
 	// restart. That one really does end a seat's session without asking, and
@@ -133,6 +175,24 @@ const (
 // is INSTRUMENT-INSUFFICIENT for the handoff KPI and must say so, rather than
 // feed a ratio with quiet holes.
 const UnclassifiedBudget = 0.05
+
+// TerminationSinkBudget is the WALL-CLOCK ceiling on the whole sink pass before
+// StopRecorded proceeds to the stop regardless.
+//
+// PRE-REGISTERED 2026-09-19 beside UnclassifiedBudget, and it exists because
+// rule 1 below was ASPIRATIONAL without it (katya, S1 review). "The stop never
+// waits on the record" was enforced against sink FAILURE and sink PANIC, but
+// not against a sink that simply does not return. The bead sink's write is
+// store.ApplyPatch riding the Dolt pool, whose natural bound under load is the
+// mysql driver's ~2-minute silent read timeout — measured on this box at ~118s
+// giving up on a ~176s write (ga-pz7oqg). So `gc session kill`, which is an
+// INCIDENT REMEDY run precisely when the store is sick, would block up to two
+// minutes before killing anything, and `gc stop` would pay it once per session.
+//
+// FAILURE-TOLERATED IS NOT LATENCY-BOUNDED. That distinction is the whole
+// defect: every sink here is allowed to fail, and none was allowed to take its
+// time, and only one of those was actually enforced.
+const TerminationSinkBudget = 5 * time.Second
 
 // terminationKinds is the closed set, for validation and for the reader that
 // wants to enumerate buckets without scraping the consts above.
@@ -163,6 +223,45 @@ func (k TerminationKind) CountsInDenominator() bool {
 // on its own line (katya, R3).
 func (k TerminationKind) CountsInNumerator() bool {
 	return k == KindHandoff || k == KindDrainHandoff
+}
+
+// MustCarryRequestedAt reports whether an ending of this kind is REQUIRED to
+// carry a RequestedAt, so a zero there is an instrument defect rather than a
+// design choice.
+//
+// THE AMBIGUITY IS RESOLVED BY KIND, NOT BY A SENTINEL VALUE (katya, S1
+// review). A sentinel inside a timestamp field is a trap for every future
+// parser: it reads as a real instant to anything that does not know the
+// convention, and there is no way to tell a parser that does not know. So zero
+// stays zero and MEANS different things depending on the kind, which this
+// function makes checkable instead of conventional.
+//
+//	drain-handoff, drain-timeout  MUST carry it — the controller asked at a
+//	                              distinct earlier moment, and At - RequestedAt
+//	                              is Timer B. Zero here is a DEFECT and counts
+//	                              against the instrument's health budget
+//	                              alongside unclassified.
+//	handoff                       carries the seat's own invocation time.
+//	operator-*, city-stop,        NEVER carry it — a synchronous call has no
+//	observed-dead, and the rest   request distinct from the action, and a
+//	                              stamped "now" would mint a Timer B of ~0ms
+//	                              that reads as a measurement.
+//
+// Frozen here BEFORE the baseline week so ga-fbzz9u's reader and this writer
+// cannot drift into disagreeing about what an empty field means.
+// ReportedSeparately reports whether a kind that is OUT of the headline ratio
+// must still be shown on its own line.
+//
+// A BUCKET THAT LEAVES THE RATIO MUST NOT LEAVE THE REPORT. Otherwise the
+// exclusion is indistinguishable from the events never having happened, which
+// is the same quiet-hole failure the denominator rules exist to prevent
+// (katya, condition 1; the precedent is KindHandoffTarget).
+func (k TerminationKind) ReportedSeparately() bool {
+	return k == KindHandoffTarget || k == KindInterruptRestart || k == KindObservedDead
+}
+
+func (k TerminationKind) MustCarryRequestedAt() bool {
+	return k == KindDrainHandoff || k == KindDrainTimeout
 }
 
 // TerminationKinds returns the closed set, sorted, for reporting code that
@@ -226,6 +325,12 @@ func StopRecorded(p Provider, name string, rec Termination, sinks ...Termination
 	return fmt.Errorf("stopped, but the termination record failed: %w", recErr)
 }
 
+// ErrTerminationSinkTimeout marks a sink pass that outlived
+// TerminationSinkBudget. It is a sentinel so a reader can tell "the store was
+// slow" from "the record failed" — those are different diagnoses and the first
+// one clusters in exactly the incident windows that produce force-exits.
+var ErrTerminationSinkTimeout = errors.New("termination record timed out")
+
 // ErrTerminationRecord wraps every sink failure StopRecordedDetailed reports,
 // so a caller can ask whether a non-nil error is ONLY a bookkeeping problem.
 var ErrTerminationRecord = errors.New("termination record")
@@ -257,15 +362,39 @@ func StopRecordedDetailed(p Provider, name string, rec Termination, sinks ...Ter
 	if rec.At.IsZero() {
 		rec.At = time.Now().UTC()
 	}
+	// THE SINK PASS RUNS UNDER A WALL-CLOCK BUDGET. Within it the semantics are
+	// exactly what they were: every sink is attempted, failures are collected
+	// and reported. Past it, the stop proceeds and the timeout is reported AS a
+	// sink error — rule 2 intact, reported and not swallowed.
+	//
+	// THE LATE WRITE IS LEFT TO LAND. A timed-out sink is not cancelled: the
+	// goroutine keeps running and its write arrives whenever the store
+	// recovers. That is safe because TerminationPatch is idempotent for the
+	// same values, so a late landing writes what a timely one would have. The
+	// alternative — cancelling — would turn "slow store" into "lost record",
+	// which is the outcome this whole seam exists to prevent.
+	done := make(chan []error, 1)
+	go func() {
+		var errs []error
+		for _, s := range sinks {
+			if s == nil {
+				continue
+			}
+			if err := recordSafely(s, name, rec); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		done <- errs
+	}()
+
 	var sinkErrs []error
-	for _, s := range sinks {
-		if s == nil {
-			continue
-		}
-		if err := recordSafely(s, name, rec); err != nil {
-			sinkErrs = append(sinkErrs, err)
-		}
+	select {
+	case sinkErrs = <-done:
+	case <-time.After(TerminationSinkBudget):
+		sinkErrs = []error{fmt.Errorf("%w after %s; the write is left to land late",
+			ErrTerminationSinkTimeout, TerminationSinkBudget)}
 	}
+
 	// The stop happens whatever the sinks did.
 	stopErr = p.Stop(name)
 	if len(sinkErrs) > 0 {

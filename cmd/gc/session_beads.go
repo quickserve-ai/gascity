@@ -3242,7 +3242,13 @@ func cleanupDeadRuntimeSessionCorpses(
 		if !dead {
 			continue
 		}
-		if err := sp.Stop(name); err != nil {
+		// The runtime was already CONFIRMED dead above, so there was never
+		// anything to ask: observed-dead, outside the ratio's denominator.
+		if err := runtime.StopRecorded(sp, name, runtime.Termination{
+			Kind:   runtime.KindObservedDead,
+			Actor:  "reconciler",
+			Reason: "cleaning a confirmed-dead runtime session",
+		}); err != nil {
 			if runtime.IsSessionGone(err) {
 				continue
 			}
@@ -3364,7 +3370,15 @@ func reapRuntimesBoundToClosedBeads(
 			continue
 		}
 
-		if err := sp.Stop(name); err != nil {
+		// A runtime still occupying a name whose session bead is already
+		// CLOSED — a stale reap, not an ending anyone could have been asked
+		// about.
+		if err := runtime.StopRecorded(sp, name, runtime.Termination{
+			Kind:      runtime.KindObservedDead,
+			Actor:     "reconciler",
+			Reason:    "reaping a runtime bound to a closed session bead",
+			SessionID: liveID,
+		}); err != nil {
 			if runtime.IsSessionGone(err) {
 				continue
 			}

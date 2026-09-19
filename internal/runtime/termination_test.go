@@ -298,3 +298,107 @@ func TestStopRecordedDetailedKeepsTheTwoQuestionsApart(t *testing.T) {
 type errSink struct{ err error }
 
 func (e errSink) RecordTermination(string, Termination) error { return e.err }
+
+// TestStopRecordedDoesNotWaitOnAHangingSink is the defect katya found in S1
+// review: rule 1 said "the stop never waits on the record", and the code
+// enforced that against sink FAILURE and sink PANIC but not against a sink that
+// simply never returns.
+//
+// WHY IT MATTERED MORE THAN A FAILURE WOULD. The bead sink's write rides the
+// Dolt pool, whose natural bound under load is the mysql driver's ~2-minute
+// silent read timeout. `gc session kill` is an INCIDENT REMEDY — the command
+// you reach for when a seat is wedged and the store is sick — so the unbounded
+// version blocked the fix for up to two minutes at exactly the moment it was
+// needed. A hang, not an error.
+func TestStopRecordedDoesNotWaitOnAHangingSink(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+
+	p := NewFake()
+	start := time.Now()
+	stopErr, recErr := StopRecordedDetailed(p, "wedged-seat",
+		Termination{Kind: KindOperatorKill}, hangingSink{release})
+	elapsed := time.Since(start)
+
+	if len(stoppedNames(p)) != 1 {
+		t.Fatal("the stop did not happen — a hanging sink held up an incident remedy")
+	}
+	if stopErr != nil {
+		t.Errorf("stopErr = %v, want nil", stopErr)
+	}
+	if !errors.Is(recErr, ErrTerminationSinkTimeout) {
+		t.Errorf("recErr = %v, want the timeout sentinel so a reader can tell "+
+			"'the store was slow' from 'the record failed'", recErr)
+	}
+	// Generous upper bound: the assertion is "bounded", not "exactly 5s".
+	if elapsed > TerminationSinkBudget+3*time.Second {
+		t.Errorf("stop took %v, want bounded by TerminationSinkBudget (%v)",
+			elapsed, TerminationSinkBudget)
+	}
+}
+
+// TestStopRecordedStillWaitsForAPromptSink — the budget must not turn every
+// sink into a race. A sink that returns quickly keeps today's exact semantics,
+// including rule 2's reported failure.
+func TestStopRecordedStillWaitsForAPromptSink(t *testing.T) {
+	sentinel := errors.New("prompt failure")
+	p := NewFake()
+	stopErr, recErr := StopRecordedDetailed(p, "seat",
+		Termination{Kind: KindOperatorKill}, errSink{sentinel})
+	if stopErr != nil {
+		t.Errorf("stopErr = %v, want nil", stopErr)
+	}
+	if !errors.Is(recErr, sentinel) {
+		t.Errorf("a prompt sink's own error must survive: %v", recErr)
+	}
+	if errors.Is(recErr, ErrTerminationSinkTimeout) {
+		t.Error("a prompt sink must not be reported as a timeout")
+	}
+}
+
+// TestRequestedAtInvariantIsByKindNotBySentinel freezes the semantics katya
+// asked to fix before the baseline week: zero means DIFFERENT things per kind,
+// and which kinds must carry the field is checkable rather than conventional.
+func TestRequestedAtInvariantIsByKindNotBySentinel(t *testing.T) {
+	must := map[TerminationKind]bool{KindDrainHandoff: true, KindDrainTimeout: true}
+	ran := 0
+	for _, k := range TerminationKinds() {
+		ran++
+		if got := k.MustCarryRequestedAt(); got != must[k] {
+			t.Errorf("%q MustCarryRequestedAt = %v, want %v", k, got, must[k])
+		}
+	}
+	if ran != len(TerminationKinds()) {
+		t.Fatalf("checked %d kinds of %d", ran, len(TerminationKinds()))
+	}
+	// The operator kinds this branch migrated must be in the "never" half, or
+	// their deliberate zero would read as an instrument defect.
+	for _, k := range []TerminationKind{KindOperatorKill, KindOperatorClose,
+		KindOperatorSuspend, KindObservedDead, KindCityStop, KindInterruptRestart} {
+		if k.MustCarryRequestedAt() {
+			t.Errorf("%q must NOT require requested_at — its zero is by design", k)
+		}
+	}
+}
+
+type hangingSink struct{ release <-chan struct{} }
+
+func (h hangingSink) RecordTermination(string, Termination) error {
+	<-h.release
+	return nil
+}
+
+// TestExcludedKindsAreStillReported — katya's condition 1. A bucket that leaves
+// the headline ratio must not leave the report, or its exclusion becomes
+// indistinguishable from the events never having happened.
+func TestExcludedKindsAreStillReported(t *testing.T) {
+	for _, k := range TerminationKinds() {
+		if !k.CountsInDenominator() && !k.ReportedSeparately() {
+			t.Errorf("kind %q is excluded from the denominator AND not reported "+
+				"separately — it would vanish entirely", k)
+		}
+	}
+	if !KindHandoffTarget.ReportedSeparately() {
+		t.Error("handoff-target is the precedent for excluded-but-reported")
+	}
+}

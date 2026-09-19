@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/runtime"
@@ -52,7 +53,12 @@ func TestManagerTerminationsAreRecorded(t *testing.T) {
 		want runtime.TerminationKind
 		act  func(t *testing.T, mgr *Manager, id string) error
 	}{
-		{"Kill", runtime.KindOperatorKill, func(_ *testing.T, m *Manager, id string) error {
+		// Bare Kill records UNCLASSIFIED, not operator-kill. This assertion
+		// was the other way round until the full cmd/gc suite proved it wrong:
+		// the drain path reaches this same method, so a fixed operator-kind
+		// here relabels every drain. See
+		// TestKillIntentComesFromTheCallerNotTheManager.
+		{"Kill", runtime.KindUnclassified, func(_ *testing.T, m *Manager, id string) error {
 			return m.Kill(id)
 		}},
 		{"Suspend", runtime.KindOperatorSuspend, func(_ *testing.T, m *Manager, id string) error {
@@ -165,8 +171,10 @@ func TestManagerWritesTheRecordToTheBeadByDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("store.Get: %v", err)
 	}
-	if got := b.Metadata[TerminationKindKey]; got != string(runtime.KindOperatorKill) {
-		t.Errorf("%s = %q, want %q", TerminationKindKey, got, runtime.KindOperatorKill)
+	// Unclassified, because this calls bare Kill and states no intent — what
+	// matters for THIS test is that a record LANDED, not which kind it carries.
+	if got := b.Metadata[TerminationKindKey]; got != string(runtime.KindUnclassified) {
+		t.Errorf("%s = %q, want %q", TerminationKindKey, got, runtime.KindUnclassified)
 	}
 	if b.Metadata[TerminationAtKey] == "" {
 		t.Errorf("%s is empty — the record landed without a timestamp", TerminationAtKey)
@@ -178,4 +186,71 @@ func TestManagerWritesTheRecordToTheBeadByDefault(t *testing.T) {
 		t.Errorf("%s is absent; it must be present-and-empty, not missing",
 			TerminationRequestedAtKey)
 	}
+}
+
+// TestKillIntentComesFromTheCallerNotTheManager is the regression that the full
+// cmd/gc suite caught and a targeted run would not have.
+//
+// Manager.Kill is a SHARED MECHANISM: the same method serves `gc session kill`
+// and the reconciler's drain-timeout force stop. S1 first hardcoded
+// operator-kill here, which silently relabelled every drain as an operator
+// action — so drain-timeout and drain-handoff could never appear in the ratio,
+// and its most important category would have read ZERO while looking healthy.
+// A metric that is confidently wrong beats no metric only in the wrong
+// direction.
+func TestKillIntentComesFromTheCallerNotTheManager(t *testing.T) {
+	t.Run("a caller that states intent gets it recorded", func(t *testing.T) {
+		mgr, _, _, sink := newRecordedManager(t)
+		info := liveSession(t, mgr, "drain")
+		asked := time.Now().UTC().Add(-90 * time.Second)
+
+		err := mgr.KillWithTermination(info.ID, runtime.Termination{
+			Kind:        runtime.KindDrainTimeout,
+			Actor:       "reconciler",
+			Reason:      "pool-excess",
+			RequestedAt: asked,
+		})
+		if err != nil {
+			t.Fatalf("KillWithTermination: %v", err)
+		}
+		if len(sink.got) != 1 {
+			t.Fatalf("recorded %d, want 1", len(sink.got))
+		}
+		rec := sink.got[0]
+		if rec.Kind != runtime.KindDrainTimeout {
+			t.Errorf("Kind = %q, want drain-timeout — a drain must not read as an operator kill", rec.Kind)
+		}
+		if rec.Actor != "reconciler" {
+			t.Errorf("Actor = %q, want reconciler", rec.Actor)
+		}
+		// Timer B only exists because the caller passed the moment the drain
+		// was ASKED. The drain kinds are the ones required to carry it.
+		if !rec.Kind.MustCarryRequestedAt() {
+			t.Error("drain-timeout must be in the must-carry-requested_at set")
+		}
+		if rec.RequestedAt.IsZero() {
+			t.Fatal("RequestedAt lost — Timer B is unmeasurable")
+		}
+		if b := rec.At.Sub(rec.RequestedAt); b < 80*time.Second {
+			t.Errorf("Timer B = %v, want ~90s", b)
+		}
+	})
+
+	t.Run("a caller that states nothing gets unclassified, never a guess", func(t *testing.T) {
+		mgr, _, _, sink := newRecordedManager(t)
+		info := liveSession(t, mgr, "no-intent")
+		if err := mgr.Kill(info.ID); err != nil {
+			t.Fatalf("Kill: %v", err)
+		}
+		if len(sink.got) != 1 {
+			t.Fatalf("recorded %d, want 1", len(sink.got))
+		}
+		if got := sink.got[0].Kind; got != runtime.KindUnclassified {
+			t.Errorf("Kind = %q, want unclassified: the Manager cannot know who "+
+				"called it, and a guess here corrupts the ratio silently", got)
+		}
+		if !sink.got[0].Kind.CountsInDenominator() {
+			t.Error("unclassified must still count — it is the instrument's own health metric")
+		}
+	})
 }

@@ -2545,6 +2545,17 @@ func outputLineCount(output string) int {
 }
 
 // newSessionKillCmd creates the "gc session kill <id-or-alias>" command.
+// killWithOperatorIntent kills through the intent-carrying capability when the
+// handle has it, so the ending is recorded as the operator action it is rather
+// than as Manager.Kill's honest "unclassified".
+func killWithOperatorIntent(handle worker.Handle, reason string) error {
+	rec := runtime.Termination{Kind: runtime.KindOperatorKill, Reason: reason}
+	if k, ok := handle.(worker.TerminationIntentKiller); ok {
+		return k.KillWithTermination(context.Background(), rec)
+	}
+	return handle.Kill(context.Background())
+}
+
 func newSessionKillCmd(stdout, stderr io.Writer) *cobra.Command {
 	var jsonOutput bool
 	var force bool
@@ -2637,7 +2648,10 @@ func cmdSessionKillWithForce(args []string, stdout, stderr io.Writer, asJSON, fo
 		return 1
 	}
 
-	killErr := handle.Kill(context.Background())
+	// `gc session kill` IS the operator path, and it is the one place on this
+	// shared mechanism that can honestly say so. RequestedAt stays zero: the
+	// command is the request.
+	killErr := killWithOperatorIntent(handle, "gc session kill")
 	if killErr != nil && (identity == "" || !runtimeAlreadyInactive) {
 		fmt.Fprintf(stderr, "gc session kill: %v\n", killErr) //nolint:errcheck // best-effort stderr
 		return 1

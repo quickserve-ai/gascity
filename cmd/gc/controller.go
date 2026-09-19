@@ -1111,7 +1111,13 @@ func gracefulStopAllWithForceSignal(
 			running, _ = workerSessionTargetRunningWithConfig("", nil, sp, nil, name)
 		}
 		if !running {
-			if err := sp.Stop(name); err != nil && !runtime.IsSessionGone(err) {
+			// Reached only when the session is NOT running — the agent has
+			// already exited and this is cleanup of what it left behind.
+			if err := runtime.StopRecorded(sp, name, runtime.Termination{
+				Kind:   runtime.KindObservedDead,
+				Actor:  "controller",
+				Reason: "cleaning up after an agent that already exited",
+			}); err != nil && !runtime.IsSessionGone(err) {
 				fmt.Fprintf(stderr, "cleaning exited agent '%s': %v\n", name, err) //nolint:errcheck // best-effort stderr
 			}
 			fmt.Fprintf(stdout, "Agent '%s' exited gracefully\n", name) //nolint:errcheck // best-effort stdout

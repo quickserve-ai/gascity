@@ -559,7 +559,14 @@ func (c *ZombieSessionsCheck) Fix(ctx *CheckContext) error {
 		}
 		sn := agent.SessionNameFor(c.cityName, a.QualifiedName(), c.sessionTemplate)
 		if c.sp.IsRunning(sn) && !c.sp.ProcessAlive(sn, a.ProcessNames) {
-			if err := c.sp.Stop(sn); err != nil {
+			// Reached only when IsRunning is true but ProcessAlive is false:
+			// the session shell outlived its agent process. A zombie by
+			// definition — nothing could have been asked of it.
+			if err := runtime.StopRecorded(c.sp, sn, runtime.Termination{
+				Kind:   runtime.KindObservedDead,
+				Actor:  "doctor",
+				Reason: "zombie session: shell running, agent process dead",
+			}); err != nil {
 				return fmt.Errorf("killing zombie session %q: %w", sn, err)
 			}
 		}
@@ -654,7 +661,15 @@ func (c *OrphanSessionsCheck) Fix(ctx *CheckContext) error {
 	}
 	for _, s := range running {
 		if !expected[s] {
-			if err := c.sp.Stop(s); err != nil {
+			// An orphan is LIVE — it simply is not in config. Killing it is an
+			// operator force-exit of a running session, not an observed death,
+			// so it COUNTS in the ratio's denominator. It is not yet written
+			// anywhere: doctor checks carry no store or recorder.
+			if err := runtime.StopRecorded(c.sp, s, runtime.Termination{
+				Kind:   runtime.KindOperatorKill,
+				Actor:  "doctor",
+				Reason: "reaping a session not present in city config",
+			}); err != nil {
 				return fmt.Errorf("killing orphan session %q: %w", s, err)
 			}
 		}

@@ -2075,7 +2075,13 @@ func stopStaleAsyncStartRuntime(result startResult, sp runtime.Provider, stderr 
 	if !runningSessionMatchesPendingCreateInfo(result.prepared.candidate.info, name, sp) {
 		return
 	}
-	if err := sp.Stop(name); err != nil && !runtime.IsSessionGone(err) {
+	// Async-start cleanup, named explicitly in KindObservedDead's contract.
+	if err := runtime.StopRecorded(sp, name, runtime.Termination{
+		Kind:      runtime.KindObservedDead,
+		Actor:     "reconciler",
+		Reason:    "stopping a stale async-start runtime",
+		SessionID: result.prepared.candidate.info.ID,
+	}); err != nil && !runtime.IsSessionGone(err) {
 		fmt.Fprintf(stderr, "session reconciler: stopping stale async start runtime %s: %v\n", name, err) //nolint:errcheck
 	}
 }
@@ -2164,7 +2170,14 @@ func startPreparedStartCandidate(
 			// zombie — so recycle it: stop the stale session and fall
 			// through to a fresh start.
 			recycleBegin := time.Now()
-			stopErr := sp.Stop(name)
+			// Zombie recycle: the agent process is dead and the comment above
+			// spells out that there is nothing left to preserve.
+			stopErr := runtime.StopRecorded(sp, name, runtime.Termination{
+				Kind:      runtime.KindObservedDead,
+				Actor:     "reconciler",
+				Reason:    "recycling a session whose agent process is dead",
+				SessionID: item.candidate.info.ID,
+			})
 			if phases != nil {
 				phases.ZombieRecycle = time.Since(recycleBegin)
 			}

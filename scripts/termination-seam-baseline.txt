@@ -1,8 +1,0 @@
-cmd/gc/controller.go:1114:if err := sp.Stop(name); err != nil && !runtime.IsSessionGone(err) {
-cmd/gc/session_beads.go:3245:if err := sp.Stop(name); err != nil {
-cmd/gc/session_beads.go:3367:if err := sp.Stop(name); err != nil {
-cmd/gc/session_lifecycle_parallel.go:2078:if err := sp.Stop(name); err != nil && !runtime.IsSessionGone(err) {
-cmd/gc/session_lifecycle_parallel.go:2167:stopErr := sp.Stop(name)
-internal/api/huma_handlers_rigs.go:594:if err := sp.Stop(sessionName); err != nil {
-internal/doctor/checks.go:562:if err := c.sp.Stop(sn); err != nil {
-internal/doctor/checks.go:657:if err := c.sp.Stop(s); err != nil {

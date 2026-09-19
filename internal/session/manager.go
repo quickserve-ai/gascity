@@ -931,10 +931,28 @@ func NewManagerWithOptions(store beads.Store, sp runtime.Provider, opts ...Manag
 	// displaced, and NewBeadTerminationSink returns a nil sink for a nil store,
 	// which StopRecorded skips — so a Manager built without a store still
 	// stops sessions exactly as before.
-	if bs := NewBeadTerminationSink(NewStore(beads.SessionStore{Store: store})); bs != nil {
-		m.terminationSinks = append(m.terminationSinks, bs)
+	//
+	// The already-have-one guard is katya's nit: without it, a caller that
+	// explicitly supplied a bead sink would get a second one appended here and
+	// every ending would be written twice — two commits with identical values.
+	// Harmless, but harmless-and-wrong is how a store's write volume stops
+	// being explainable.
+	if !hasBeadTerminationSink(m.terminationSinks) {
+		if bs := NewBeadTerminationSink(NewStore(beads.SessionStore{Store: store})); bs != nil {
+			m.terminationSinks = append(m.terminationSinks, bs)
+		}
 	}
 	return m
+}
+
+// hasBeadTerminationSink reports whether a bead sink was already supplied.
+func hasBeadTerminationSink(sinks []runtime.TerminationSink) bool {
+	for _, s := range sinks {
+		if _, ok := s.(*BeadTerminationSink); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // CreateSession is the single entry point for creating a session. It reads a
@@ -1557,7 +1575,29 @@ func (m *Manager) retireConfiguredNamedSessionIdentifiers(id string, b beads.Bea
 // Kill force-kills the runtime process for a session without changing bead
 // state. This is intended for manual intervention; the reconciler will detect
 // the dead process and restart it according to the session's lifecycle rules.
+// Kill ends a session without the caller stating WHY.
+//
+// IT RECORDS UNCLASSIFIED, AND THAT IS DELIBERATE RATHER THAN LAZY. This method
+// is a SHARED MECHANISM: the same call serves `gc session kill` (an operator)
+// and the reconciler's drain-timeout force stop (a drain). Hardcoding
+// operator-kill here — which is what S1 did at first — silently relabelled
+// every drain as an operator action, so drain-timeout and drain-handoff could
+// never appear in the ratio at all and the ratio's most important category
+// would have read as zero while looking healthy.
+//
+// Intent belongs to the CALLER, so callers that know it use KillWithTermination
+// and the honest answer here is the counted, budgeted "I don't know". If this
+// bucket grows, the UnclassifiedBudget is what will say the threading is
+// incomplete.
 func (m *Manager) Kill(id string) error {
+	return m.KillWithTermination(id, runtime.Termination{})
+}
+
+// KillWithTermination ends a session with a caller-supplied record. The caller
+// states Kind, Reason and — for the drain kinds, which katya's invariant
+// requires it on — RequestedAt, the moment the drain was ASKED, so that
+// At - RequestedAt is Timer B.
+func (m *Manager) KillWithTermination(id string, rec runtime.Termination) error {
 	b, sessName, err := m.sessionBead(id)
 	if err != nil {
 		return err
@@ -1574,11 +1614,20 @@ func (m *Manager) Kill(id string) error {
 			return fmt.Errorf("session %s is not active", id)
 		}
 	}
-	return m.stopRecorded(sessName, runtime.Termination{
-		// RequestedAt stays ZERO — see the note in Suspend.
-		Kind:      runtime.KindOperatorKill,
-		SessionID: b.ID,
-	})
+	return m.stopRecorded(sessName, mergeKillTermination(rec, b.ID))
+}
+
+// mergeKillTermination fills in what only the Manager knows (the bead id) and
+// defaults what the caller declined to state.
+func mergeKillTermination(rec runtime.Termination, sessionID string) runtime.Termination {
+	if !rec.Kind.Valid() {
+		rec.Kind = runtime.KindUnclassified
+		if rec.Reason == "" {
+			rec.Reason = "killed through Manager.Kill without a stated intent"
+		}
+	}
+	rec.SessionID = sessionID
+	return rec
 }
 
 // BeginDrain transitions a session to the draining state. The caller is

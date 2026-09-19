@@ -723,7 +723,7 @@ func TestVerifiedStop_MatchingToken(t *testing.T) {
 		t.Fatalf("store.Get: %v", err)
 	}
 
-	err = verifiedStop(sessiontest.SeedBead(t, session), store, sp, nil)
+	err = verifiedStop(sessiontest.SeedBead(t, session), store, sp, nil, runtime.Termination{Kind: runtime.KindDrainTimeout})
 	if err != nil {
 		t.Errorf("verifiedStop with matching token: %v", err)
 	}
@@ -751,7 +751,7 @@ func TestVerifiedStop_MismatchedToken(t *testing.T) {
 		t.Fatalf("store.Get: %v", err)
 	}
 
-	err = verifiedStop(sessiontest.SeedBead(t, session), store, sp, nil)
+	err = verifiedStop(sessiontest.SeedBead(t, session), store, sp, nil, runtime.Termination{Kind: runtime.KindDrainTimeout})
 	if err == nil {
 		t.Error("expected error for mismatched token")
 	}
@@ -776,7 +776,7 @@ func TestVerifiedStop_NoToken(t *testing.T) {
 		t.Fatalf("store.Get: %v", err)
 	}
 
-	err = verifiedStop(sessiontest.SeedBead(t, session), store, sp, nil)
+	err = verifiedStop(sessiontest.SeedBead(t, session), store, sp, nil, runtime.Termination{Kind: runtime.KindDrainTimeout})
 	if err != nil {
 		t.Errorf("verifiedStop with no token: %v", err)
 	}

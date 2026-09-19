@@ -139,6 +139,25 @@ func (h *SessionHandle) Kill(ctx context.Context) (err error) {
 	return err
 }
 
+// KillWithTermination is Kill with the caller's statement of WHY.
+//
+// ADDITIVE, NOT AN INTERFACE CHANGE. Handle is implemented by fakes and by
+// RuntimeHandle; widening Kill would touch all of them for the benefit of the
+// two call sites that actually know their intent. Callers type-assert for
+// TerminationIntentKiller and fall back to Kill, whose honest unclassified is
+// the correct answer when nobody stated anything.
+func (h *SessionHandle) KillWithTermination(ctx context.Context, rec runtime.Termination) (err error) {
+	event := h.beginOperationEvent(ctx, workerOperationKill)
+	defer func() { event.finish(err) }()
+
+	id := h.currentSessionID()
+	if id == "" {
+		return nil
+	}
+	err = h.manager.KillWithTermination(id, rec)
+	return err
+}
+
 // Close permanently ends the worker session.
 func (h *SessionHandle) Close(ctx context.Context) (err error) {
 	_, err = h.CloseDetailed(ctx)

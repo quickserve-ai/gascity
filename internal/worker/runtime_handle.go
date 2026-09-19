@@ -167,6 +167,20 @@ func (h *RuntimeHandle) Kill(ctx context.Context) (err error) {
 	return err
 }
 
+// KillWithTermination is Kill with the caller's statement of WHY, overriding
+// this handle's default operator-kill.
+func (h *RuntimeHandle) KillWithTermination(ctx context.Context, rec runtime.Termination) (err error) {
+	event := h.beginOperationEvent(ctx, workerOperationKill)
+	defer func() { event.finish(err) }()
+
+	kind, reason := rec.Kind, rec.Reason
+	if !kind.Valid() {
+		kind, reason = runtime.KindOperatorKill, "worker RuntimeHandle.Kill"
+	}
+	err = h.stopRecorded(kind, reason)
+	return err
+}
+
 // Close asks the provider to close the live runtime session.
 func (h *RuntimeHandle) Close(ctx context.Context) (err error) {
 	event := h.beginOperationEvent(ctx, workerOperationClose)

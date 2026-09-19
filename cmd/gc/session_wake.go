@@ -843,8 +843,15 @@ func advanceSessionDrainsWithSessionsTraced(
 		// Pending-interaction guards and wake-based cancellation run before this
 		// timeout path. Preserve that ordering if this block is refactored.
 		if clk.Now().After(ds.deadline) {
-			// Drain timed out — force stop.
-			if err := verifiedStop(info, store, sp, cfg); err != nil {
+			// Drain timed out — force stop. RequestedAt is the moment the
+			// drain was ASKED, which is what makes At - RequestedAt Timer B;
+			// the drain kinds are the ones katya's invariant requires it on.
+			if err := verifiedStop(info, store, sp, cfg, runtime.Termination{
+				Kind:        runtime.KindDrainTimeout,
+				Actor:       "reconciler",
+				Reason:      ds.reason,
+				RequestedAt: ds.startedAt,
+			}); err != nil {
 				if errors.Is(err, errTokenMismatch) {
 					// Session was re-woken by a different incarnation.
 					// This drain is stale — cancel it.
@@ -904,7 +911,7 @@ func completeDrain(info sessions.Info, sessFront *sessions.Store, ds *drainState
 // to different backends if the route table is stale. This is a pre-existing
 // routing limitation — when the reconciler is wired in, consider a
 // provider-level VerifiedStop that atomically verifies+stops on the same backend.
-func verifiedStop(info sessions.Info, store beads.Store, sp runtime.Provider, cfg *config.City) error {
+func verifiedStop(info sessions.Info, store beads.Store, sp runtime.Provider, cfg *config.City, rec runtime.Termination) error {
 	name := info.SessionNameMetadata
 	expectedToken := info.InstanceToken
 	if expectedToken != "" {
@@ -916,6 +923,13 @@ func verifiedStop(info sessions.Info, store beads.Store, sp runtime.Provider, cf
 	handle, err := workerHandleForSessionWithConfig("", store, sp, cfg, info.ID)
 	if err != nil {
 		return err
+	}
+	// THE INTENT COMES FROM THE CALLER, NEVER FROM Manager.Kill. The same
+	// handle.Kill serves `gc session kill` and this drain force-stop, so a kind
+	// fixed at the Manager relabels every drain as an operator action — the
+	// ratio's most important category would read ZERO while looking healthy.
+	if k, ok := handle.(worker.TerminationIntentKiller); ok {
+		return k.KillWithTermination(context.Background(), rec)
 	}
 	return handle.Kill(context.Background())
 }

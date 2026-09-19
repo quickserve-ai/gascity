@@ -591,7 +591,15 @@ func (s *Server) humaHandleRigRestart(name string) (*RigActionResponse, error) {
 		expanded := expandAgent(a, cityName, cfg.Workspace.SessionTemplate, sp)
 		for _, ea := range expanded {
 			sessionName := agentSessionName(cityName, ea.qualifiedName, cfg.Workspace.SessionTemplate)
-			if err := sp.Stop(sessionName); err != nil {
+			// An operator killing a rig's agents through the API. This COUNTS
+			// in the ratio's denominator and is not yet written anywhere: the
+			// handler has no sink wired. Classified here so it starts
+			// recording the moment one is.
+			if err := runtime.StopRecorded(sp, sessionName, runtime.Termination{
+				Kind:   runtime.KindOperatorKill,
+				Actor:  "api",
+				Reason: "rig-scoped kill of all agents",
+			}); err != nil {
 				// "session gone" is benign — agent wasn't running.
 				if !runtime.IsSessionGone(err) {
 					failed = append(failed, ea.qualifiedName)
