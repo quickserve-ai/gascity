@@ -81,6 +81,28 @@ func (c *importStateDoctorCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult
 		r.Message = fmt.Sprintf("%d remote import(s) installed", report.CheckedSources)
 		return r
 	}
+	// Notice-only: every finding is a reached verdict that leaves the import
+	// state USABLE — today that means a pinned pack whose executing content
+	// differs from this binary's embedded copy, which is what deliberately
+	// pinning a fork of a bundled pack looks like. This check's subject is
+	// whether the declared imports are correctly installed, and they are, so
+	// the status is OK and the count goes in the MESSAGE (which always prints)
+	// rather than only in Details (which print under --verbose).
+	//
+	// Deliberately not StatusWarning: CheckStatus.IsFailure() counts a warning,
+	// so `gc doctor --fix` would run syncImports + installLockedImports against
+	// a city where nothing is broken, and an install cannot change a pin. It
+	// would also make `gc doctor` non-green for a supported configuration,
+	// which is how a check gets ignored. `gc import check` itemizes these.
+	if report.ErrorCount() == 0 {
+		r.Status = doctor.StatusOK
+		r.Message = fmt.Sprintf("%d remote import(s) installed; %d finding(s) worth reading — see \"gc import check\"",
+			report.CheckedSources, len(report.Issues))
+		for _, issue := range report.Issues {
+			r.Details = append(r.Details, formatImportStateDoctorDetail(issue))
+		}
+		return r
+	}
 
 	r.Status = doctor.StatusError
 	r.Message = fmt.Sprintf("%d import state issue(s)", len(report.Issues))

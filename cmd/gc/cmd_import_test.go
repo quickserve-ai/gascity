@@ -1251,6 +1251,65 @@ version = "^1.0"
 	}
 }
 
+// TestDoImportCheckPrintsNoticesWithoutFailing covers the operator-facing half
+// of the content-divergence leg. A notice must not change the exit code — a
+// city may legitimately pin a fork of a bundled pack, and failing this command
+// for a supported configuration is how a check gets switched off — but it must
+// also NOT render as the bare "Import state OK" line. That line printed over a
+// 24-day-stale executing pack while three other checks agreed all was well,
+// which is the whole of ga-rvvji2.
+func TestDoImportCheckPrintsNoticesWithoutFailing(t *testing.T) {
+	clearGCEnv(t)
+	dir := t.TempDir()
+	writeCityToml(t, dir, "[workspace]\nname = \"demo\"\n")
+	writePackToml(t, dir, `[pack]
+name = "demo"
+schema = 1
+
+[imports.core]
+source = "https://github.com/quickserve-ai/gascity.git//internal/bootstrap/packs/core"
+version = "sha:ab3ed836ac6f08586ea691e58257f18acc0586d9"
+`)
+
+	prevCheck := checkInstalledImports
+	t.Cleanup(func() { checkInstalledImports = prevCheck })
+	checkInstalledImports = func(_ string, _ map[string]config.Import) (*packman.CheckReport, error) {
+		return &packman.CheckReport{
+			CheckedSources: 1,
+			Issues: []packman.CheckIssue{{
+				Severity:   packman.CheckSeverityNotice,
+				Code:       "bundled-pack-content-diverged",
+				ImportName: "core",
+				Source:     "https://github.com/quickserve-ai/gascity.git//internal/bootstrap/packs/core",
+				Commit:     "ab3ed836ac6f08586ea691e58257f18acc0586d9",
+				Path:       filepath.Join(dir, "cache", "core"),
+				Message:    `content that executes differs from this binary's embedded "core" pack: 1 differ (orders/renudge-stale-human-gates.toml)`,
+				RepairHint: "a pinned import is frozen and no gc install refreshes it",
+			}},
+		}, nil
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := doImportCheck(dir, &stdout, &stderr, false)
+	if code != 0 {
+		t.Fatalf("code = %d, want 0 — a notice must never fail the command; stderr = %s", code, stderr.String())
+	}
+	out := stdout.String()
+	if strings.Contains(out, "Import state OK") {
+		t.Fatalf("stdout still prints the all-clear line over a finding:\n%s", out)
+	}
+	for _, want := range []string{
+		"Import state usable: 1 remote import(s) checked, 1 finding(s) worth reading:",
+		"[notice] bundled-pack-content-diverged core",
+		"orders/renudge-stale-human-gates.toml",
+		"no gc install refreshes it",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("stdout missing %q:\n%s\nstderr:\n%s", want, out, stderr.String())
+		}
+	}
+}
+
 func TestDoImportUpgradeTargetedMergesPreservedImports(t *testing.T) {
 	clearGCEnv(t)
 	dir := t.TempDir()
