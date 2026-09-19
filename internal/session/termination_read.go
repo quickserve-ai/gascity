@@ -7,16 +7,25 @@ import (
 	"github.com/gastownhall/gascity/internal/runtime"
 )
 
-// TerminationSurfacedAtKey is the READER'S BOOKMARK, not part of the record.
+// TerminationNoticeCheckedAtKey is the READER'S mark, not part of the record,
+// and it does two jobs with one key: it is the bookmark that stops a notice
+// repeating, AND it is the seat's LAST-BOOT marker.
+//
+// THE SECOND JOB IS WHY IT IS STAMPED ON EVERY SessionStart CHECK, not only when
+// a notice renders (katya, S2 review). The bead sink is allowed to FAIL at death
+// by design — five-second budget, sick store — so the newest record on a bead is
+// not necessarily the newest ENDING. Without a boot marker, a seat whose last
+// ending failed to record would be served the PREVIOUS ending's record as though
+// it described the session that just died. Stamping every check turns the
+// comparison into "did this ending happen since I last looked", which is the
+// window that makes the claim true.
 //
 // It is deliberately absent from TerminationPatch. TerminationPatch writes the
 // whole record on every ending, empty fields included, so a re-terminated bead
 // cannot carry half of a previous ending; this key must NOT join that set,
 // because clearing it on each ending would be a second write on the stop path
-// buying nothing. The comparison does the work instead: a fresh ending stamps a
-// NEWER termination.at than the bookmark, so the notice is owed again without
-// anyone having to reset anything. Monotonic beats cleared.
-const TerminationSurfacedAtKey = "termination.surfaced_at"
+// buying nothing. Monotonic beats cleared.
+const TerminationNoticeCheckedAtKey = "termination.notice_checked_at"
 
 // TerminationRecord is the inverse of TerminationPatch: the record as the NEXT
 // boot reads it back off the session bead.
@@ -28,9 +37,9 @@ const TerminationSurfacedAtKey = "termination.surfaced_at"
 // is what makes it one.
 type TerminationRecord struct {
 	runtime.Termination
-	// SurfacedAt is when a previous boot already showed this record to the
-	// seat. Zero when it never has been.
-	SurfacedAt time.Time
+	// CheckedAt is when this seat last ran the SessionStart notice check —
+	// in practice, when it last booted. Zero when it never has.
+	CheckedAt time.Time
 }
 
 // ReadTerminationRecord parses the termination.* keys out of a session bead's
@@ -55,32 +64,43 @@ func ReadTerminationRecord(meta map[string]string) (TerminationRecord, bool) {
 		At:          parseRFC3339OrZero(meta[TerminationAtKey]),
 		RequestedAt: parseRFC3339OrZero(meta[TerminationRequestedAtKey]),
 	}}
-	rec.SurfacedAt = parseRFC3339OrZero(meta[TerminationSurfacedAtKey])
+	rec.CheckedAt = parseRFC3339OrZero(meta[TerminationNoticeCheckedAtKey])
 	return rec, true
 }
 
-// NoticeOwed reports whether this record should be shown to the seat that is
-// booting now: the kind must be one nobody wrote a note for, and a previous
-// boot must not have shown it already.
+// NoticeOwed reports whether this record should be shown to the seat booting
+// now. Two conditions: the kind must be one nobody wrote a note for, and the
+// ending must have happened SINCE THIS SEAT LAST LOOKED.
 //
-// A RECORD WITH NO PARSEABLE At IS SHOWN ONCE AND THEN NEVER AGAIN, because the
-// bookmark comparison cannot order it. Showing it is the right side to err on
-// (the ending really did happen); the stamp written afterwards is what stops it
-// repeating, since the next comparison has a zero At against a real bookmark.
+// THE SECOND CONDITION IS A FRESHNESS GUARD, NOT JUST DE-DUPLICATION (katya, S2
+// review). The bead sink may fail at death, so the newest record on a bead can
+// be older than the newest ending. Serving it anyway would tell a seat "your
+// previous session did not hand off" on the strength of an ending two or ten
+// restarts ago — a claim the record cannot support, in a notice whose entire
+// value is that the seat can trust it. Bounding it to the window since the last
+// check makes the claim exactly as strong as the evidence.
+//
+// A RECORD WITH NO PARSEABLE At CANNOT BE ORDERED, so it is shown only to a seat
+// that has never checked before. After the first check there is a real mark to
+// compare against and a zero At loses — deliberately: an unorderable record is
+// not evidence about THIS boot, and "I cannot place this in time" is a reason to
+// stay quiet rather than to assert.
 func (r TerminationRecord) NoticeOwed() bool {
 	if !r.Kind.NeedsFallbackNote() {
 		return false
 	}
-	if r.SurfacedAt.IsZero() {
+	if r.CheckedAt.IsZero() {
 		return true
 	}
-	return r.At.After(r.SurfacedAt)
+	return r.At.After(r.CheckedAt)
 }
 
-// TerminationSurfacedPatch stamps the bookmark. It runs at BOOT, on the seat's
-// own bead, nowhere near a stop path.
-func TerminationSurfacedPatch(at time.Time) MetadataPatch {
-	return MetadataPatch{TerminationSurfacedAtKey: at.UTC().Format(time.RFC3339)}
+// TerminationNoticeCheckedPatch stamps the mark. It runs at BOOT on every
+// SessionStart check, whether or not a notice rendered, on the seat's own bead
+// and nowhere near a stop path. Stamping only on render would leave the window
+// frozen at the last notice, which is the stale-record hole this closes.
+func TerminationNoticeCheckedPatch(at time.Time) MetadataPatch {
+	return MetadataPatch{TerminationNoticeCheckedAtKey: at.UTC().Format(time.RFC3339)}
 }
 
 func parseRFC3339OrZero(raw string) time.Time {

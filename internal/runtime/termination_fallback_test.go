@@ -67,7 +67,7 @@ func TestInterruptRestartIsExemptOnContextSurvival(t *testing.T) {
 // the set of endings that destroy context in silence.
 func TestUnknownKindFailsTowardTellingTheSeat(t *testing.T) {
 	if !TerminationKind("some-future-kind").NeedsFallbackNote() {
-		t.Error("an unrecognised kind must be owed a note; silence is the dangerous default here")
+		t.Error("an unrecognized kind must be owed a note; silence is the dangerous default here")
 	}
 	if TerminationKind("").NeedsFallbackNote() {
 		t.Error("the empty kind means there is NO record, not an ending of unknown type")

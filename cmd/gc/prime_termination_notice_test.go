@@ -75,7 +75,7 @@ func TestTerminationNoticeOmitsWhatItDoesNotHave(t *testing.T) {
 }
 
 // TestTerminationNoticeSanitizesAttackerReachableFields. `reason` carries an
-// operator's free-text --reason verbatim, so without sanitising, a crafted
+// operator's free-text --reason verbatim, so without sanitizing, a crafted
 // reason closes the block and speaks to the seat in gc's own voice
 // (gastownhall/gascity#2195).
 func TestTerminationNoticeSanitizesAttackerReachableFields(t *testing.T) {
@@ -169,5 +169,64 @@ func TestSessionStartRendersTheTerminationNotice(t *testing.T) {
 	other := primeHookContextSuffix(t.TempDir(), true, primeHookContext{HookEventName: "UserPromptSubmit"}, io.Discard, true)
 	if strings.Contains(other.text, "NOTICE-SENTINEL") {
 		t.Error("the notice belongs to SessionStart only")
+	}
+}
+
+// TestTerminationNoticeTextIsSilentWhenNothingIsOwed — the other arm of the
+// decision. Paired with the injector's single return path, this is what makes
+// "the mark is stamped on every check" true: the quiet case is a "" text, not a
+// skipped code path.
+func TestTerminationNoticeTextIsSilentWhenNothingIsOwed(t *testing.T) {
+	now := time.Date(2026, 9, 19, 22, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name string
+		meta map[string]string
+	}{
+		{"no record at all", map[string]string{"gc.session_name": "woodhouse"}},
+		{"the seat handed off itself", map[string]string{
+			sessionpkg.TerminationKindKey: string(runtime.KindHandoff),
+			sessionpkg.TerminationAtKey:   "2026-09-19T21:00:00Z",
+		}},
+		{"already seen at the last check", map[string]string{
+			sessionpkg.TerminationKindKey:            string(runtime.KindOperatorKill),
+			sessionpkg.TerminationAtKey:              "2026-09-19T21:00:00Z",
+			sessionpkg.TerminationNoticeCheckedAtKey: "2026-09-19T21:30:00Z",
+		}},
+		{"stale: the record predates the last boot", map[string]string{
+			sessionpkg.TerminationKindKey:            string(runtime.KindOperatorKill),
+			sessionpkg.TerminationAtKey:              "2026-09-12T08:00:00Z",
+			sessionpkg.TerminationNoticeCheckedAtKey: "2026-09-19T08:00:00Z",
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := terminationNoticeText(tc.meta, now); got != "" {
+				t.Errorf("expected silence, got:\n%s", got)
+			}
+		})
+	}
+	if len(cases) != 4 {
+		t.Fatalf("table has %d cases, want 4", len(cases))
+	}
+	// And the positive control: an ending since the last check DOES speak. An
+	// all-negative table proves only that the function can return "".
+	spoke := terminationNoticeText(map[string]string{
+		sessionpkg.TerminationKindKey:            string(runtime.KindOperatorKill),
+		sessionpkg.TerminationAtKey:              "2026-09-19T21:00:00Z",
+		sessionpkg.TerminationNoticeCheckedAtKey: "2026-09-19T08:00:00Z",
+	}, now)
+	if spoke == "" {
+		t.Error("an ending since the last check must render — without this the table above passes for a function that always returns \"\"")
+	}
+}
+
+// TestTerminationNoticeDeclaresTheBeadListAbsence (katya, S2 review): the note
+// omits the seat's in-progress work, so it must SAY it omits it, or a seat reads
+// the notice as a complete account of what it was doing.
+func TestTerminationNoticeDeclaresTheBeadListAbsence(t *testing.T) {
+	at := time.Date(2026, 9, 19, 21, 0, 0, 0, time.UTC)
+	got := renderTerminationNotice(testRecord(runtime.KindDrainSilent, "reconciler", "idle", at, time.Time{}), at.Add(time.Minute))
+	if !strings.Contains(got, "does NOT list the work you had in progress") {
+		t.Errorf("the notice must declare the omission it makes:\n%s", got)
 	}
 }

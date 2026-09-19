@@ -48,9 +48,10 @@ func TestNoRecordIsNotAnEmptyRecord(t *testing.T) {
 	}
 }
 
-// TestUnparseableTimestampDoesNotDiscardTheRecord. A notice with a missing clock
-// is worth more to a booting seat than no notice at all, so a bad At degrades to
-// zero rather than failing the read.
+// TestUnparseableTimestampDoesNotDiscardTheRecord. A bad At degrades to zero
+// rather than failing the read — but an unorderable record is only shown to a
+// seat that has never checked before, because after that there is a real mark to
+// compare against and "I cannot place this in time" is a reason to stay quiet.
 func TestUnparseableTimestampDoesNotDiscardTheRecord(t *testing.T) {
 	rec, ok := ReadTerminationRecord(map[string]string{
 		TerminationKindKey: string(runtime.KindOperatorKill),
@@ -63,7 +64,11 @@ func TestUnparseableTimestampDoesNotDiscardTheRecord(t *testing.T) {
 		t.Error("an unparseable At must come back zero, not guessed")
 	}
 	if !rec.NoticeOwed() {
-		t.Error("a record with no readable clock is still an ending the seat should hear about")
+		t.Error("a first-ever check with no readable clock should still surface the ending")
+	}
+	rec.CheckedAt = time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
+	if rec.NoticeOwed() {
+		t.Error("once the seat has checked before, an unorderable record must not be claimed as THIS boot's ending")
 	}
 }
 
@@ -75,9 +80,9 @@ func TestNoticeOwedGatesOnKindAndOnTheBookmark(t *testing.T) {
 		surfaced time.Time
 		want     bool
 	}{
-		{"forced ending, never surfaced", runtime.KindOperatorKill, time.Time{}, true},
-		{"forced ending, surfaced before it happened", runtime.KindOperatorKill, at.Add(-time.Hour), true},
-		{"forced ending, already surfaced after it happened", runtime.KindOperatorKill, at.Add(time.Minute), false},
+		{"forced ending, seat has never checked", runtime.KindOperatorKill, time.Time{}, true},
+		{"forced ending, happened since the last check", runtime.KindOperatorKill, at.Add(-time.Hour), true},
+		{"forced ending, already seen at the last check", runtime.KindOperatorKill, at.Add(time.Minute), false},
 		{"the seat handed off itself", runtime.KindHandoff, time.Time{}, false},
 		{"the sender wrote the note", runtime.KindHandoffTarget, time.Time{}, false},
 		{"context survived the restart", runtime.KindInterruptRestart, time.Time{}, false},
@@ -87,7 +92,7 @@ func TestNoticeOwedGatesOnKindAndOnTheBookmark(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			rec := TerminationRecord{
 				Termination: runtime.Termination{Kind: tc.kind, At: at},
-				SurfacedAt:  tc.surfaced,
+				CheckedAt:   tc.surfaced,
 			}
 			if got := rec.NoticeOwed(); got != tc.want {
 				t.Errorf("NoticeOwed() = %v, want %v", got, tc.want)
@@ -101,20 +106,48 @@ func TestNoticeOwedGatesOnKindAndOnTheBookmark(t *testing.T) {
 	}
 }
 
-// TestSurfacedBookmarkIsNotPartOfTheRecord guards the placement decision: if
-// TerminationPatch ever started writing the bookmark, each new ending would
-// stamp "already surfaced" at the moment it happened and the notice would never
-// fire again.
-func TestSurfacedBookmarkIsNotPartOfTheRecord(t *testing.T) {
+// TestCheckedMarkIsNotPartOfTheRecord guards the placement decision: if
+// TerminationPatch ever started writing the mark, each new ending would stamp
+// "already checked" at the moment it happened and the notice would never fire
+// again.
+func TestCheckedMarkIsNotPartOfTheRecord(t *testing.T) {
 	patch := TerminationPatch(runtime.Termination{Kind: runtime.KindOperatorKill, SessionID: "ga-1"})
-	if _, present := patch[TerminationSurfacedAtKey]; present {
+	if _, present := patch[TerminationNoticeCheckedAtKey]; present {
 		t.Error("TerminationPatch must NOT write termination.surfaced_at: the record is the writer's, the bookmark is the reader's")
 	}
-	stamp := TerminationSurfacedPatch(time.Date(2026, 9, 19, 22, 0, 0, 0, time.UTC))
-	if stamp[TerminationSurfacedAtKey] != "2026-09-19T22:00:00Z" {
-		t.Errorf("stamp = %q", stamp[TerminationSurfacedAtKey])
+	stamp := TerminationNoticeCheckedPatch(time.Date(2026, 9, 19, 22, 0, 0, 0, time.UTC))
+	if stamp[TerminationNoticeCheckedAtKey] != "2026-09-19T22:00:00Z" {
+		t.Errorf("stamp = %q", stamp[TerminationNoticeCheckedAtKey])
 	}
 	if len(stamp) != 1 {
 		t.Errorf("the stamp must touch exactly one key, got %d", len(stamp))
+	}
+}
+
+// TestAStaleRecordIsNotServedAsThisBootsEnding is katya's S2 pre-merge condition.
+// The bead sink may FAIL at death by design (five-second budget, sick store), so
+// the newest record on a bead is not necessarily the newest ENDING. Without the
+// boot marker, a seat whose last ending failed to record would be told "your
+// previous session did not hand off" on the strength of an ending several
+// restarts ago — a claim the record cannot support, in a notice whose whole value
+// is that the seat can trust it.
+func TestAStaleRecordIsNotServedAsThisBootsEnding(t *testing.T) {
+	lastWeek := time.Date(2026, 9, 12, 8, 0, 0, 0, time.UTC)
+	lastBoot := time.Date(2026, 9, 19, 8, 0, 0, 0, time.UTC)
+
+	stale := TerminationRecord{
+		Termination: runtime.Termination{Kind: runtime.KindOperatorKill, At: lastWeek},
+		CheckedAt:   lastBoot,
+	}
+	if stale.NoticeOwed() {
+		t.Error("a record predating the last boot describes an older session and must not be claimed as this boot's ending")
+	}
+
+	// And the guard must not swallow a REAL one: an ending after the last check
+	// is exactly what the notice is for.
+	fresh := stale
+	fresh.At = lastBoot.Add(3 * time.Hour)
+	if !fresh.NoticeOwed() {
+		t.Error("an ending since the last check is the case this whole slice exists to report")
 	}
 }

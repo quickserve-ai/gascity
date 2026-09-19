@@ -50,7 +50,7 @@ var fallbackNoteNotOwed = map[TerminationKind]bool{
 // NeedsFallbackNote reports whether a seat ending this way is owed a MECHANICAL
 // notice on its next boot, because its context ended and nobody composed one.
 //
-// AN UNRECOGNISED KIND IS OWED A NOTE. This fails toward telling the seat rather
+// AN UNRECOGNIZED KIND IS OWED A NOTE. This fails toward telling the seat rather
 // than toward silence, which is the direction that matters: a kind added later
 // without updating the map above gets a notice it might not need, instead of
 // silently joining the set of endings that destroy context invisibly. The empty

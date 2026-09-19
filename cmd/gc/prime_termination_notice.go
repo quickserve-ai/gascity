@@ -83,27 +83,41 @@ func terminationNoticeInjection(stderr io.Writer) primeHookContextInjection {
 		fmt.Fprintf(stderr, "gc prime: reading termination record: %v\n", err) //nolint:errcheck // best-effort hook diagnostics
 		return primeHookContextInjection{}
 	}
-	rec, ok := sessionpkg.ReadTerminationRecord(bead.Metadata)
-	if !ok || !rec.NoticeOwed() {
-		return primeHookContextInjection{}
-	}
+	// THE MARK IS STAMPED WHETHER OR NOT A NOTICE RENDERS, and that is enforced
+	// by there being ONE return path rather than by a test. The mark doubles as
+	// this seat's last-boot marker; a marker that only advanced when a notice
+	// fired would leave the freshness window frozen at the last notice, which is
+	// the exact hole it exists to close (katya, S2 review). Two return paths here
+	// would make forgetting it a one-line edit.
 	return primeHookContextInjection{
-		text: renderTerminationNotice(rec, time.Now().UTC()),
-		afterDelivery: func() {
-			stampTerminationNoticeSurfaced(sessStore, sessionID, stderr)
-		},
+		text:          terminationNoticeText(bead.Metadata, time.Now().UTC()),
+		afterDelivery: func() { stampTerminationNoticeChecked(sessStore, sessionID, stderr) },
 	}
 }
 
-// stampTerminationNoticeSurfaced records that the seat has now been told, so the
-// next boot does not repeat a notice about an ending two restarts ago.
-func stampTerminationNoticeSurfaced(sessStore beads.Store, sessionID string, stderr io.Writer) {
-	patch := sessionpkg.TerminationSurfacedPatch(time.Now().UTC())
+// terminationNoticeText is the whole decision, pure: metadata in, notice or ""
+// out. Separated from the store reads so both arms are testable without a city,
+// and so the injector above has nothing left to branch on.
+func terminationNoticeText(meta map[string]string, now time.Time) string {
+	rec, ok := sessionpkg.ReadTerminationRecord(meta)
+	if !ok || !rec.NoticeOwed() {
+		return ""
+	}
+	return renderTerminationNotice(rec, now)
+}
+
+// stampTerminationNoticeChecked records that this seat has now looked. It closes
+// the freshness window: the next boot serves a notice only for an ending that
+// happened after this instant.
+func stampTerminationNoticeChecked(sessStore beads.Store, sessionID string, stderr io.Writer) {
+	patch := sessionpkg.TerminationNoticeCheckedPatch(time.Now().UTC())
 	if err := sessionpkg.NewStore(beads.SessionStore{Store: sessStore}).ApplyPatch(sessionID, patch); err != nil {
-		// Worth one line: an unstamped notice re-renders on every boot, which is
-		// noise rather than loss — so it degrades in the safe direction, but a
-		// seat seeing the same ending three times should be able to find out why.
-		fmt.Fprintf(stderr, "gc prime: stamping termination notice as surfaced: %v\n", err) //nolint:errcheck // best-effort hook diagnostics
+		// Worth one line. A failed stamp degrades in the SAFE direction — the
+		// window stays where it was, so the next boot may re-render a notice it
+		// has already shown, which is noise rather than loss or a false claim.
+		// But a seat seeing the same ending three times should be able to find
+		// out why.
+		fmt.Fprintf(stderr, "gc prime: stamping the termination notice check: %v\n", err) //nolint:errcheck // best-effort hook diagnostics
 	}
 }
 
@@ -114,7 +128,7 @@ func stampTerminationNoticeSurfaced(sessStore beads.Store, sessionID string, std
 // `--reason` verbatim by design, so it is attacker-reachable in exactly the way
 // mail bodies are: without this, a crafted reason could close the
 // <system-reminder> block and speak to the seat in its own voice
-// (gastownhall/gascity#2195, the same defence formatInjectOutput applies).
+// (gastownhall/gascity#2195, the same defense formatInjectOutput applies).
 func renderTerminationNotice(rec sessionpkg.TerminationRecord, now time.Time) string {
 	var b strings.Builder
 	b.WriteString("<system-reminder>\n")
@@ -140,7 +154,10 @@ func renderTerminationNotice(rec sessionpkg.TerminationRecord, now time.Time) st
 	b.WriteString("Treat your recall of that session as ABSENT rather than lossy. It\n")
 	b.WriteString("deliberately does not tell you how to recover: your own role prompt\n")
 	b.WriteString("defines your startup protocol, and a confident wrong instruction from\n")
-	b.WriteString("here is worse than none.\n")
+	b.WriteString("here is worse than none.\n\n")
+	b.WriteString("It also does NOT list the work you had in progress. That omission is\n")
+	b.WriteString("deliberate, and it is stated here so that you do not read this notice\n")
+	b.WriteString("as a complete account of what you were doing.\n")
 	b.WriteString("</system-reminder>\n")
 	return b.String()
 }
