@@ -41,6 +41,7 @@ func primeHookContextSuffix(cityPath string, hookMode bool, hookContext primeHoo
 		// and it excludes the auto-handoff messages already rendered above so a
 		// beadmail-backed ordinary provider does not double-render them.
 		injection.text += primeUnreadMailInjection(autoHandoffIDs)
+		injection.text += primeLaurelsInjection(cityPath, strings.TrimSpace(os.Getenv("GC_AGENT")), stderr)
 	}
 	return injection
 }
