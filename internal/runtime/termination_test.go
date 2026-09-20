@@ -3,6 +3,7 @@ package runtime
 import (
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -403,4 +404,59 @@ func TestExcludedKindsAreStillReported(t *testing.T) {
 	if !KindHandoffTarget.ReportedSeparately() {
 		t.Error("handoff-target is the precedent for excluded-but-reported")
 	}
+}
+
+// TestAHangingSinkDoesNotStarveTheOther is the two-failure-domain property,
+// checked rather than assumed.
+//
+// The two sinks exist BECAUSE they fail differently: the bead write rides Dolt
+// and hangs during the incidents that produce force-exits, the event append is
+// local and does not. The bead sink is wired first at every reconciler site, so
+// while the pass ran sequentially a hung store consumed the whole budget before
+// the event sink was attempted — and if the process died in that window both
+// records were lost. The independence was a property of the design and not of
+// the code (Codex, PR #106).
+func TestAHangingSinkDoesNotStarveTheOther(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	hanging := sinkFunc(func(string, Termination) error {
+		<-release
+		return nil
+	})
+	fast := &recordingTestSink{}
+
+	p := NewFake()
+	start := time.Now()
+	// Hanging sink FIRST, exactly as the bead sink is wired in production.
+	err := StopRecorded(p, "s1", Termination{Kind: KindOperatorKill}, hanging, fast)
+	elapsed := time.Since(start)
+
+	if len(fast.got) != 1 {
+		t.Errorf("the second sink recorded %d terminations, want 1 — a hung first sink starved the domain that exists to survive it", len(fast.got))
+	}
+	if elapsed < TerminationSinkBudget {
+		t.Errorf("returned after %s, before the %s budget — the hang was not actually exercised", elapsed, TerminationSinkBudget)
+	}
+	if err == nil || !errors.Is(err, ErrTerminationSinkTimeout) {
+		t.Errorf("err = %v, want the timeout reported rather than swallowed", err)
+	}
+	if p.IsRunning("s1") {
+		t.Error("the stop did not happen")
+	}
+}
+
+type sinkFunc func(string, Termination) error
+
+func (f sinkFunc) RecordTermination(name string, rec Termination) error { return f(name, rec) }
+
+type recordingTestSink struct {
+	mu  sync.Mutex
+	got []Termination
+}
+
+func (r *recordingTestSink) RecordTermination(_ string, rec Termination) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.got = append(r.got, rec)
+	return nil
 }

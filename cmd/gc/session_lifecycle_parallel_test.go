@@ -5696,11 +5696,16 @@ func TestGracefulStopAll_UsesLogicalSubjectForGracefulExit(t *testing.T) {
 
 	gracefulStopAll([]string{"custom-worker"}, sp, 50*time.Millisecond, rec, cfg, beads.SessionStore{Store: store}, &stdout, &stderr)
 
-	if len(rec.Events) != 1 {
-		t.Fatalf("got %d events, want 1", len(rec.Events))
+	// FILTER BY TYPE rather than counting every event. gracefulStopAll also
+	// emits session.terminated now (ga-ksac39), and a bare count made these
+	// subject assertions brittle to any event the sweep gains — which is not
+	// what they are about.
+	stopped := eventsOfType(rec.Events, events.SessionStopped)
+	if len(stopped) != 1 {
+		t.Fatalf("got %d session.stopped events, want 1 (of %d total)", len(stopped), len(rec.Events))
 	}
-	if rec.Events[0].Subject != "frontend/worker" {
-		t.Fatalf("event subject = %q, want %q", rec.Events[0].Subject, "frontend/worker")
+	if stopped[0].Subject != "frontend/worker" {
+		t.Fatalf("event subject = %q, want %q", stopped[0].Subject, "frontend/worker")
 	}
 }
 
@@ -5728,11 +5733,16 @@ func TestGracefulStopAll_ReconstructsPoolSubjectFromLegacyBead(t *testing.T) {
 
 	gracefulStopAll([]string{"custom-worker-2"}, sp, 50*time.Millisecond, rec, cfg, beads.SessionStore{Store: store}, &stdout, &stderr)
 
-	if len(rec.Events) != 1 {
-		t.Fatalf("got %d events, want 1", len(rec.Events))
+	// FILTER BY TYPE rather than counting every event. gracefulStopAll also
+	// emits session.terminated now (ga-ksac39), and a bare count made these
+	// subject assertions brittle to any event the sweep gains — which is not
+	// what they are about.
+	stopped := eventsOfType(rec.Events, events.SessionStopped)
+	if len(stopped) != 1 {
+		t.Fatalf("got %d session.stopped events, want 1 (of %d total)", len(stopped), len(rec.Events))
 	}
-	if rec.Events[0].Subject != "frontend/worker-2" {
-		t.Fatalf("event subject = %q, want %q", rec.Events[0].Subject, "frontend/worker-2")
+	if stopped[0].Subject != "frontend/worker-2" {
+		t.Fatalf("event subject = %q, want %q", stopped[0].Subject, "frontend/worker-2")
 	}
 }
 
@@ -5760,11 +5770,16 @@ func TestGracefulStopAll_UsesLegacyAgentLabelForPoolSubject(t *testing.T) {
 
 	gracefulStopAll([]string{"custom-worker-4"}, sp, 50*time.Millisecond, rec, cfg, beads.SessionStore{Store: store}, &stdout, &stderr)
 
-	if len(rec.Events) != 1 {
-		t.Fatalf("got %d events, want 1", len(rec.Events))
+	// FILTER BY TYPE rather than counting every event. gracefulStopAll also
+	// emits session.terminated now (ga-ksac39), and a bare count made these
+	// subject assertions brittle to any event the sweep gains — which is not
+	// what they are about.
+	stopped := eventsOfType(rec.Events, events.SessionStopped)
+	if len(stopped) != 1 {
+		t.Fatalf("got %d session.stopped events, want 1 (of %d total)", len(stopped), len(rec.Events))
 	}
-	if rec.Events[0].Subject != "frontend/worker-4" {
-		t.Fatalf("event subject = %q, want %q", rec.Events[0].Subject, "frontend/worker-4")
+	if stopped[0].Subject != "frontend/worker-4" {
+		t.Fatalf("event subject = %q, want %q", stopped[0].Subject, "frontend/worker-4")
 	}
 }
 

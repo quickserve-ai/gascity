@@ -606,14 +606,38 @@ func (s *Server) humaHandleRigRestart(name string) (*RigActionResponse, error) {
 		expanded := expandAgent(a, cityName, cfg.Workspace.SessionTemplate, sp)
 		for _, ea := range expanded {
 			sessionName := agentSessionName(cityName, ea.qualifiedName, cfg.Workspace.SessionTemplate)
+			// RECORD ONLY WHAT ACTUALLY ENDED. expandAgent statically enumerates
+			// CONFIGURED seats — including suspended and on-demand ones with no
+			// runtime at all — and most providers return nil when Stop targets a
+			// missing session. Recording unconditionally therefore minted an
+			// operator-kill DENOMINATOR row for every inactive seat a rig restart
+			// swept over, inflating the ratio's denominator with endings that
+			// never happened (Codex, PR #106).
+			//
+			// A liveness probe is affordable here in a way it is not on the
+			// reconciler's hot path: this is one operator action, not a tick.
+			if !sp.IsRunning(sessionName) {
+				continue
+			}
 			// An operator killing a rig's agents through the API.
-			if err := runtime.StopRecorded(sp, sessionName, runtime.Termination{
+			//
+			// killed/failed follow the STOP, never the record. The event sink
+			// returns errUnacknowledgedEvent through any plain void Recorder —
+			// the ordinary configuration — so the joined error would have listed
+			// every successfully killed agent under Failed. Same shape as the
+			// Manager strand this branch already fixed; the two questions have to
+			// stay apart at every caller, not just the one that was reviewed.
+			stopErr, recErr := runtime.StopRecordedDetailed(sp, sessionName, runtime.Termination{
 				Kind:   runtime.KindOperatorKill,
 				Actor:  "api",
 				Reason: "rig-scoped kill of all agents",
-			}, termSink); err != nil {
+			}, termSink)
+			if recErr != nil {
+				log.Printf("api: rig restart: killed %s but the termination record failed: %v", ea.qualifiedName, recErr)
+			}
+			if stopErr != nil {
 				// "session gone" is benign — agent wasn't running.
-				if !runtime.IsSessionGone(err) {
+				if !runtime.IsSessionGone(stopErr) {
 					failed = append(failed, ea.qualifiedName)
 				}
 			} else {

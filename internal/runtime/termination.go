@@ -375,26 +375,50 @@ func StopRecordedDetailed(p Provider, name string, rec Termination, sinks ...Ter
 	// same values, so a late landing writes what a timely one would have. The
 	// alternative — canceling — would turn "slow store" into "lost record",
 	// which is the outcome this whole seam exists to prevent.
-	done := make(chan []error, 1)
-	go func() {
-		var errs []error
-		for _, s := range sinks {
-			if s == nil {
-				continue
-			}
-			if err := recordSafely(s, name, rec); err != nil {
-				errs = append(errs, err)
-			}
+	// EACH SINK RUNS INDEPENDENTLY, SHARING ONE WALL-CLOCK BUDGET. They used to
+	// run SEQUENTIALLY inside a single goroutine, which quietly defeated the
+	// reason there are two of them.
+	//
+	// The sinks exist to have DIFFERENT FAILURE DOMAINS: the bead write rides
+	// Dolt and can hang during exactly the incidents that produce force-exits,
+	// while the event append is a local write that almost never does. But the
+	// bead sink is wired FIRST at every reconciler and city-stop site, so a
+	// hanging store consumed the entire budget before the event sink was even
+	// attempted — and if the process died in that window, BOTH records were
+	// lost. The independence was a property of the design and not of the code
+	// (Codex, PR #106).
+	//
+	// A sink still running at the deadline is not cancelled: its write lands
+	// late, which is harmless because TerminationPatch is idempotent for the
+	// same values. The timeout names how many were outstanding, because "one
+	// sink was slow" and "every sink was slow" are different incidents.
+	type sinkOutcome struct{ err error }
+	outcomes := make(chan sinkOutcome, len(sinks))
+	live := 0
+	for _, s := range sinks {
+		if s == nil {
+			continue
 		}
-		done <- errs
-	}()
+		live++
+		go func(s TerminationSink) {
+			outcomes <- sinkOutcome{err: recordSafely(s, name, rec)}
+		}(s)
+	}
 
 	var sinkErrs []error
-	select {
-	case sinkErrs = <-done:
-	case <-time.After(TerminationSinkBudget):
-		sinkErrs = []error{fmt.Errorf("%w after %s; the write is left to land late",
-			ErrTerminationSinkTimeout, TerminationSinkBudget)}
+	deadline := time.After(TerminationSinkBudget)
+	for returned := 0; returned < live; {
+		select {
+		case out := <-outcomes:
+			returned++
+			if out.err != nil {
+				sinkErrs = append(sinkErrs, out.err)
+			}
+		case <-deadline:
+			sinkErrs = append(sinkErrs, fmt.Errorf("%w after %s; %d of %d sinks had not returned, and their writes are left to land late",
+				ErrTerminationSinkTimeout, TerminationSinkBudget, live-returned, live))
+			returned = live
+		}
 	}
 
 	// The stop happens whatever the sinks did.
