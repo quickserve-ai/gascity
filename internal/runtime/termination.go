@@ -388,7 +388,7 @@ func StopRecordedDetailed(p Provider, name string, rec Termination, sinks ...Ter
 	// lost. The independence was a property of the design and not of the code
 	// (Codex, PR #106).
 	//
-	// A sink still running at the deadline is not cancelled: its write lands
+	// A sink still running at the deadline is not canceled: its write lands
 	// late, which is harmless because TerminationPatch is idempotent for the
 	// same values. The timeout names how many were outstanding, because "one
 	// sink was slow" and "every sink was slow" are different incidents.
