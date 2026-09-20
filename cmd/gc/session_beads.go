@@ -16,9 +16,11 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/extmsg"
 	"github.com/gastownhall/gascity/internal/hostboot"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/runtime/terminationevents"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/storeref"
 )
@@ -3248,7 +3250,10 @@ func cleanupDeadRuntimeSessionCorpses(
 			Kind:   runtime.KindObservedDead,
 			Actor:  "reconciler",
 			Reason: "cleaning a confirmed-dead runtime session",
-		}); err != nil {
+			// The id is already in hand from the snapshot this loop walks, so
+			// the sink never has to resolve a name.
+			SessionID: info.ID,
+		}, reconcilerTerminationSinks(store, nil)...); err != nil {
 			if runtime.IsSessionGone(err) {
 				continue
 			}
@@ -3378,7 +3383,7 @@ func reapRuntimesBoundToClosedBeads(
 			Actor:     "reconciler",
 			Reason:    "reaping a runtime bound to a closed session bead",
 			SessionID: liveID,
-		}); err != nil {
+		}, reconcilerTerminationSinks(store, nil)...); err != nil {
 			if runtime.IsSessionGone(err) {
 				continue
 			}
@@ -3853,4 +3858,38 @@ func resolvePoolSlot(agentName, template string) int {
 		return slot
 	}
 	return 0
+}
+
+// reconcilerTerminationActor names the process these sinks record for.
+const reconcilerTerminationActor = "reconciler"
+
+// reconcilerTerminationSinks builds the sinks for a reconciler-side ending.
+//
+// WHY THIS EXISTS AT ALL: routing a call through the seam makes the fence read
+// clean and the census read complete, and an EMPTY SINK LIST then writes nothing
+// anywhere. "Migrated" and "collecting" are different properties and only the
+// first was being checked (Codex #106). These particular endings are
+// observed-dead and therefore outside the ratio's denominator — but excluded is
+// not the same as invisible: a bucket that leaves the ratio must still be
+// reportable on its own line (katya, condition 1), and an unrecorded ending is
+// not reportable at all.
+//
+// A nil store yields no bead sink rather than a panic, and the bead sink itself
+// refuses a record with no SessionID rather than resolving one — a name->id
+// lookup belongs nowhere near a stop.
+//
+// The actor is fixed rather than a parameter: every caller of this helper IS the
+// reconciler, and a parameter that only ever receives one value is a knob that
+// invites a wrong answer later.
+func reconcilerTerminationSinks(store beads.Store, rec events.Recorder) []runtime.TerminationSink {
+	var sinks []runtime.TerminationSink
+	if store != nil {
+		if bead := session.NewBeadTerminationSink(session.NewStore(beads.SessionStore{Store: store})); bead != nil {
+			sinks = append(sinks, bead)
+		}
+	}
+	if rec != nil {
+		sinks = append(sinks, terminationevents.New(rec, reconcilerTerminationActor))
+	}
+	return sinks
 }

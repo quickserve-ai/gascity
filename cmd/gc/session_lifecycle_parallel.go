@@ -1967,7 +1967,7 @@ func commitAsyncStartResultWithContext(
 		// start_call / post_start_observe; only commit_refresh was
 		// stamped above. No restore needed.
 		if cleanupRuntime && !startOutcomeDefersCommit(result.outcome) {
-			stopStaleAsyncStartRuntime(result, sp, stderr)
+			stopStaleAsyncStartRuntime(result, sp, store, rec, stderr)
 		}
 		outcome := "stale_async_start"
 		if releaseInFlight {
@@ -1990,7 +1990,7 @@ func commitAsyncStartResultWithContext(
 			return commitStartResultTraced(refreshed, sessFront, clk, rec, wave, stdout, stderr, trace)
 		}
 		if refreshed.err == nil && shouldRollbackPendingCreateInfo(refreshed.prepared.candidate.info) {
-			stopStaleAsyncStartRuntime(refreshed, sp, stderr)
+			stopStaleAsyncStartRuntime(refreshed, sp, store, rec, stderr)
 			rollbackPendingCreate(refreshed.prepared.candidate.info, sessFront, clk.Now().UTC(), stderr)
 		}
 		logLifecycleOutcome(stderr, "start", wave, name, template, "context_canceled", refreshed.started, time.Now(), ctx.Err(), refreshed.phases)
@@ -2067,7 +2067,7 @@ func clearPendingStartInFlightLease(handle string, sessFront *sessionpkg.Store, 
 	setMeta(sessFront, handle, "last_woke_at", "", stderr) //nolint:errcheck
 }
 
-func stopStaleAsyncStartRuntime(result startResult, sp runtime.Provider, stderr io.Writer) {
+func stopStaleAsyncStartRuntime(result startResult, sp runtime.Provider, store beads.Store, rec events.Recorder, stderr io.Writer) {
 	if sp == nil || strings.TrimSpace(result.prepared.candidate.info.ID) == "" {
 		return
 	}
@@ -2081,7 +2081,7 @@ func stopStaleAsyncStartRuntime(result startResult, sp runtime.Provider, stderr 
 		Actor:     "reconciler",
 		Reason:    "stopping a stale async-start runtime",
 		SessionID: result.prepared.candidate.info.ID,
-	}); err != nil && !runtime.IsSessionGone(err) {
+	}, reconcilerTerminationSinks(store, rec)...); err != nil && !runtime.IsSessionGone(err) {
 		fmt.Fprintf(stderr, "session reconciler: stopping stale async start runtime %s: %v\n", name, err) //nolint:errcheck
 	}
 }
@@ -2177,7 +2177,7 @@ func startPreparedStartCandidate(
 				Actor:     "reconciler",
 				Reason:    "recycling a session whose agent process is dead",
 				SessionID: item.candidate.info.ID,
-			})
+			}, reconcilerTerminationSinks(store, nil)...)
 			if phases != nil {
 				phases.ZombieRecycle = time.Since(recycleBegin)
 			}

@@ -31,6 +31,7 @@ import (
 	"github.com/gastownhall/gascity/internal/packman"
 	"github.com/gastownhall/gascity/internal/pathutil"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/runtime/terminationevents"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/supervisor"
 	"github.com/gastownhall/gascity/internal/telemetry"
@@ -1122,11 +1123,18 @@ func gracefulStopAllWithForceSignal(
 			// KindCityStop had no producer anywhere in the tree until the Codex
 			// review of PR #106 found it. observed-dead remains correct only for
 			// a runtime that died on its own, with nothing asked of it.
+			// SINKS, or this records NOWHERE. Routing through the seam makes
+			// the fence read clean and the census read complete while an empty
+			// sink list writes nothing at all — "migrated" and "collecting" are
+			// different properties and only one of them was checked (Codex
+			// #106). This ending is IN the denominator, so the hole was the
+			// expensive kind.
 			if err := runtime.StopRecorded(sp, name, runtime.Termination{
-				Kind:   runtime.KindCityStop,
-				Actor:  "controller",
-				Reason: "exited after the city-stop interrupt",
-			}); err != nil && !runtime.IsSessionGone(err) {
+				Kind:      runtime.KindCityStop,
+				Actor:     "controller",
+				Reason:    "exited after the city-stop interrupt",
+				SessionID: cityStopSessionIDForName(targetByName, name),
+			}, cityStopTerminationSinks(store, rec)...); err != nil && !runtime.IsSessionGone(err) {
 				fmt.Fprintf(stderr, "cleaning exited agent '%s': %v\n", name, err) //nolint:errcheck // best-effort stderr
 			}
 			fmt.Fprintf(stdout, "Agent '%s' exited gracefully\n", name) //nolint:errcheck // best-effort stdout
@@ -1559,4 +1567,31 @@ func (r *singleCityStateResolver) CityState(name string) api.State {
 		return r.state
 	}
 	return nil
+}
+
+// cityStopTerminationSinks builds the pair for the city-stop sweep: the
+// authoritative bead write and the local event append, the two independent
+// failure domains katya's condition 2 requires. A nil store or recorder yields
+// the ones that can be built, never a silent none-of-them.
+func cityStopTerminationSinks(store beads.SessionStore, rec events.Recorder) []runtime.TerminationSink {
+	var sinks []runtime.TerminationSink
+	if store.Store != nil {
+		if bead := sessionpkg.NewBeadTerminationSink(sessionpkg.NewStore(store)); bead != nil {
+			sinks = append(sinks, bead)
+		}
+	}
+	if rec != nil {
+		sinks = append(sinks, terminationevents.New(rec, "controller"))
+	}
+	return sinks
+}
+
+// cityStopSessionIDForName resolves the bead id the sweep already holds. The
+// bead sink REFUSES without one rather than looking it up, because a name->id
+// resolution would put a store read on the stop path.
+func cityStopSessionIDForName(targetByName map[string]stopTarget, name string) string {
+	if target, ok := targetByName[name]; ok {
+		return strings.TrimSpace(target.sessionID)
+	}
+	return ""
 }
