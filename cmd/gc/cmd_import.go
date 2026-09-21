@@ -782,9 +782,18 @@ func doImportCheck(cityPath string, stdout, stderr io.Writer, verifySource bool)
 		fmt.Fprintf(stderr, "gc import check: %v\n", err) //nolint:errcheck
 		return 1
 	}
-	if !report.HasIssues() {
+	switch {
+	case !report.HasIssues():
 		fmt.Fprintf(stdout, "Import state OK: %d remote import(s) checked\n", report.CheckedSources) //nolint:errcheck
-	} else {
+	case report.ErrorCount() == 0:
+		// Notice-only: the import state is usable, so this stays an exit-0
+		// report — but it must not render as the bare "Import state OK" line,
+		// which is exactly what printed over a 24-day-stale executing pack
+		// while three other checks agreed everything was fine (ga-rvvji2).
+		fmt.Fprintf(stdout, "Import state usable: %d remote import(s) checked, %d finding(s) worth reading:\n", //nolint:errcheck
+			report.CheckedSources, len(report.Issues))
+		writeImportCheckIssues(stdout, report.Issues)
+	default:
 		fmt.Fprintf(stdout, "Import state has %d issue(s):\n", len(report.Issues)) //nolint:errcheck
 		writeImportCheckIssues(stdout, report.Issues)
 	}
