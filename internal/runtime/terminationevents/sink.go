@@ -74,14 +74,13 @@ func (s *Sink) RecordTermination(sessionName string, t runtime.Termination) erro
 		at = time.Now().UTC()
 	}
 	payload := events.SessionTerminatedPayload{
-		Kind:              string(t.Kind),
-		Actor:             t.Actor,
-		Reason:            t.Reason,
-		At:                at.UTC().Format(time.RFC3339),
-		SessionName:       sessionName,
-		SessionID:         t.SessionID,
-		CountsNumerator:   t.Kind.CountsInNumerator(),
-		CountsDenominator: t.Kind.CountsInDenominator(),
+		Kind:        string(t.Kind),
+		Actor:       t.Actor,
+		Reason:      t.Reason,
+		At:          at.UTC().Format(time.RFC3339),
+		SessionName: sessionName,
+		SessionID:   t.SessionID,
+		EventID:     t.EventID,
 	}
 	if !t.RequestedAt.IsZero() {
 		payload.RequestedAt = t.RequestedAt.UTC().Format(time.RFC3339)

@@ -837,6 +837,56 @@ func TestBeginSessionDrain(t *testing.T) {
 	if ds.deadline != now.Add(30*time.Second) {
 		t.Errorf("deadline = %v, want %v", ds.deadline, now.Add(30*time.Second))
 	}
+	if ds.terminationEventID == "" {
+		t.Error("terminationEventID is empty: the drain must mint its ending's id once, at the request, so its retries dedup")
+	}
+}
+
+// TestAdvanceSessionDrains_TimeoutRecordsTheDrainsEventID — the drain is the
+// one ending that retries, so its stop must carry the id minted at drain
+// start rather than a fresh one per attempt. A fresh id per attempt would turn
+// one ending into N rows in the reader's (SessionID, EventID) dedup.
+func TestAdvanceSessionDrains_TimeoutRecordsTheDrainsEventID(t *testing.T) {
+	now := time.Date(2026, 3, 8, 12, 0, 0, 0, time.UTC)
+	clk := &clock.Fake{Time: now}
+	sp := runtime.NewFake()
+	store := beads.NewMemStore()
+	dt := newDrainTracker()
+	_ = sp.Start(context.Background(), "test-session", runtime.Config{})
+	b, _ := store.Create(beads.Bead{
+		Title:  "test",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name": "test-session",
+			"template":     "worker",
+			"provider":     "claude",
+			"work_dir":     t.TempDir(),
+			"generation":   "3",
+			"state":        "active",
+		},
+	})
+	pinned := runtime.NewTerminationEventID(now.Add(-60 * time.Second))
+	dt.set(b.ID, &drainState{
+		startedAt:          now.Add(-60 * time.Second),
+		terminationEventID: pinned,
+		deadline:           now.Add(-10 * time.Second),
+		reason:             "pool-excess",
+		generation:         3,
+	})
+
+	advanceSessionDrainsWithSessionsTraced(dt, sp, store, infoLookupFromBeadLookup(func(id string) *beads.Bead {
+		got, _ := store.Get(id)
+		return &got
+	}), map[string]wakeEvaluation{}, &config.City{}, clk, nil)
+
+	after, err := store.Get(b.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got := after.Metadata[sessionpkg.TerminationEventIDKey]; got != pinned {
+		t.Errorf("%s = %q, want the drain's own %q", sessionpkg.TerminationEventIDKey, got, pinned)
+	}
 }
 
 func TestBeginSessionDrain_AlreadyDraining(t *testing.T) {

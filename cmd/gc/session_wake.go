@@ -194,11 +194,13 @@ func beginSessionDrainInfo(
 	}
 	gen, _ := strconv.Atoi(info.Generation)
 
+	startedAt := clk.Now()
 	dt.set(info.ID, &drainState{
-		startedAt:  clk.Now(),
-		deadline:   clk.Now().Add(timeout),
-		reason:     reason,
-		generation: gen,
+		startedAt:          startedAt,
+		terminationEventID: runtime.NewTerminationEventID(startedAt),
+		deadline:           startedAt.Add(timeout),
+		reason:             reason,
+		generation:         gen,
 	})
 
 	if os.Getenv("GC_TMUX_TRACE") == "1" {
@@ -872,6 +874,7 @@ func advanceSessionDrainsWithSessionsTraced(
 				Actor:       "reconciler",
 				Reason:      ds.reason,
 				RequestedAt: ds.startedAt,
+				EventID:     ds.terminationEventID,
 			}); err != nil {
 				if errors.Is(err, errTokenMismatch) {
 					// Session was re-woken by a different incarnation.

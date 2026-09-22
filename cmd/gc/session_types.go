@@ -52,12 +52,16 @@ type ExecSpec struct {
 // drainState tracks an in-progress async drain. Ephemeral (in-memory only).
 // Lost on controller crash — safe because NDI reconverges.
 type drainState struct {
-	startedAt  time.Time
-	deadline   time.Time
-	reason     string // "idle", "pool-excess", "config-drift", "user"
-	generation int    // generation at drain start — fence for Stop
-	ackSet     bool   // true after GC_DRAIN_ACK has been set by the reconciler
-	followUp   bool   // true when the controller should trigger one more immediate tick
+	startedAt time.Time
+	// terminationEventID is minted ONCE, with startedAt, so every retry of
+	// this drain's stop carries the same runtime.Termination.EventID and the
+	// reader's (SessionID, EventID) dedup collapses the retries to one ending.
+	terminationEventID string
+	deadline           time.Time
+	reason             string // "idle", "pool-excess", "config-drift", "user"
+	generation         int    // generation at drain start — fence for Stop
+	ackSet             bool   // true after GC_DRAIN_ACK has been set by the reconciler
+	followUp           bool   // true when the controller should trigger one more immediate tick
 }
 
 // idleProbeState tracks an async WaitForIdle probe for interactive idle sleep.

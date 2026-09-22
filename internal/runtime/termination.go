@@ -1,9 +1,11 @@
 package runtime
 
 import (
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -25,11 +27,15 @@ import (
 //
 // RETRY INFLATION FOLLOWS FROM THE SAME WINDOW: a drain that cannot confirm
 // completion retries, so ONE ending can write N history rows. The reader
-// deduplicates on (SessionID, Kind, RequestedAt). That key works because
-// RequestedAt is the drain's stable startedAt rather than a per-attempt clock
-// — the same field that makes Timer B measurable is what makes the retries
-// collapse to one ending. A writer that "helpfully" refreshed RequestedAt per
-// attempt would break the dedup and inflate the denominator.
+// deduplicates on (SessionID, EventID), and EventID is MINTED AT THE REQUEST,
+// never derived from the record's attributes (katya, PR #106 finding 4). The
+// earlier key, (SessionID, Kind, RequestedAt), collapsed REAL twins: a
+// suspend, resume, suspend carries a zero RequestedAt both times, so two
+// endings read as one, and the loss landed on the denominator, on exactly the
+// forced endings this record exists to count. No attribute set can fix that.
+// Any such set either merges real twins or splits one retried write. So a
+// retry of one ending reuses its id (the drain mints it once, beside
+// startedAt), and two real endings carry two ids.
 //
 // WHY THIS TYPE EXISTS RATHER THAN A map[string]string AT EACH CALL SITE: a
 // census of the tree found no termination chokepoint at all. Twelve-plus
@@ -86,7 +92,86 @@ type Termination struct {
 	// Timer B = At - RequestedAt. This field is here FROM BIRTH deliberately:
 	// retrofitting a timestamp into a mandatory argument later means touching
 	// every funneled caller a second time (katya, R2/condition 4).
+	//
+	// ZERO MEANS UNKNOWN, AND IT STAYS ZERO. It is not part of any identity
+	// key, so there is no reason to backfill it with an observed time, and
+	// doing so would fabricate a fact to serve a mechanism.
 	RequestedAt time.Time
+
+	// EventID identifies this ENDING, and it is the reader's dedup key together
+	// with SessionID. It is a ULID, so ids sort by mint time. A caller that can
+	// retry one ending (the drain) mints it ONCE with NewTerminationEventID and
+	// passes the same value on every attempt. Every other caller leaves it
+	// empty and the seam mints one, because a synchronous ending cannot retry.
+	EventID string
+}
+
+// NewTerminationEventID mints a ULID stamped at t: 48 bits of Unix
+// milliseconds then 80 bits of entropy, in Crockford base32, so ids sort by
+// mint time. Within one millisecond the entropy is incremented rather than
+// redrawn, which keeps same-millisecond ids distinct and in mint order.
+//
+// Hand-rolled because this package is stdlib-only by contract
+// (TestRuntimeContractPackageStaysStdlibOnly).
+func NewTerminationEventID(t time.Time) string {
+	ms := uint64(t.UnixMilli())
+	eventIDMu.Lock()
+	defer eventIDMu.Unlock()
+	if ms == eventIDLastMs && incrementEntropy(&eventIDEntropy) {
+		// Same millisecond and no overflow: keep the incremented entropy.
+	} else {
+		if _, err := rand.Read(eventIDEntropy[:]); err != nil {
+			panic(fmt.Sprintf("termination event id: crypto/rand failed: %v", err))
+		}
+		eventIDLastMs = ms
+	}
+	var b [16]byte
+	for i := 0; i < 6; i++ {
+		b[i] = byte(ms >> (40 - 8*i))
+	}
+	copy(b[6:], eventIDEntropy[:])
+	return encodeULID(b)
+}
+
+var (
+	eventIDMu      sync.Mutex
+	eventIDLastMs  uint64
+	eventIDEntropy [10]byte
+)
+
+// incrementEntropy adds one to the big-endian entropy and reports false on
+// overflow, in which case the caller redraws.
+func incrementEntropy(e *[10]byte) bool {
+	for i := len(e) - 1; i >= 0; i-- {
+		e[i]++
+		if e[i] != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+const crockford = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+// encodeULID renders 128 bits as 26 Crockford base32 characters. The first
+// character carries only the top 3 bits (26*5 = 130 = 128 + 2 pad bits).
+func encodeULID(b [16]byte) string {
+	var out [26]byte
+	var acc uint64
+	var bits uint
+	pos := 0
+	// Two leading zero pad bits, so the encoding is left-aligned on 130 bits.
+	bits = 2
+	for _, c := range b {
+		acc = acc<<8 | uint64(c)
+		bits += 8
+		for bits >= 5 {
+			bits -= 5
+			out[pos] = crockford[(acc>>bits)&31]
+			pos++
+		}
+	}
+	return string(out[:])
 }
 
 // TerminationKind is the closed vocabulary of endings.
@@ -209,23 +294,13 @@ var terminationKinds = map[TerminationKind]bool{
 // Valid reports whether k is in the closed set.
 func (k TerminationKind) Valid() bool { return terminationKinds[k] }
 
-// CountsInDenominator reports whether an ending of this kind belongs in the
-// handoff ratio's denominator. TWO kinds are excluded, on one principle: no
-// handoff policy could have prevented either, so counting them would penalize
-// the ratio for endings it does not govern. KindObservedDead is a runtime that
-// was already gone — nothing could have been asked of it. KindInterruptRestart
-// is not an ending at all — the session restarts in place and the conversation
-// continues across it.
-func (k TerminationKind) CountsInDenominator() bool {
-	return k.Valid() && k != KindObservedDead && k != KindInterruptRestart
-}
-
-// CountsInNumerator reports whether an ending of this kind is a handoff for
-// ratio purposes. KindHandoffTarget is deliberately NOT here — it is reported
-// on its own line (katya, R3).
-func (k TerminationKind) CountsInNumerator() bool {
-	return k == KindHandoff || k == KindDrainHandoff
-}
+// THE BUCKET RULES DO NOT LIVE HERE. Which kinds count in the handoff
+// ratio's numerator and denominator, and which leave the ratio but stay in the
+// report, is the READER's classifier, pre-registered and versioned on
+// ga-fbzz9u (katya, PR #106 finding 5). The writer records facts only: the
+// closed Kind set plus timestamps. A rule baked into every row would mix rule
+// populations mid-series whenever the rule changed. A rule kept in the reader
+// can be re-run over all history and diffed against its previous version.
 
 // MustCarryRequestedAt reports whether an ending of this kind is REQUIRED to
 // carry a RequestedAt, so a zero there is an instrument defect rather than a
@@ -253,17 +328,6 @@ func (k TerminationKind) CountsInNumerator() bool {
 // cannot drift into disagreeing about what an empty field means.
 func (k TerminationKind) MustCarryRequestedAt() bool {
 	return k == KindDrainHandoff || k == KindDrainTimeout
-}
-
-// ReportedSeparately reports whether a kind that is OUT of the headline ratio
-// must still be shown on its own line.
-//
-// A BUCKET THAT LEAVES THE RATIO MUST NOT LEAVE THE REPORT. Otherwise the
-// exclusion is indistinguishable from the events never having happened, which
-// is the same quiet-hole failure the denominator rules exist to prevent
-// (katya, condition 1; the precedent is KindHandoffTarget).
-func (k TerminationKind) ReportedSeparately() bool {
-	return k == KindHandoffTarget || k == KindInterruptRestart || k == KindObservedDead
 }
 
 // TerminationKinds returns the closed set, sorted, for reporting code that
@@ -363,6 +427,9 @@ func StopRecordedDetailed(p Provider, name string, rec Termination, sinks ...Ter
 	}
 	if rec.At.IsZero() {
 		rec.At = time.Now().UTC()
+	}
+	if rec.EventID == "" {
+		rec.EventID = NewTerminationEventID(rec.At)
 	}
 	// THE SINK PASS RUNS UNDER A WALL-CLOCK BUDGET. Within it the semantics are
 	// exactly what they were: every sink is attempted, failures are collected

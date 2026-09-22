@@ -14,7 +14,7 @@ func TestTerminationPatchCarriesEveryField(t *testing.T) {
 	at := req.Add(4 * time.Minute)
 	p := TerminationPatch(runtime.Termination{
 		Kind: runtime.KindDrainHandoff, Actor: "controller", Reason: "config-drift",
-		At: at, RequestedAt: req,
+		At: at, RequestedAt: req, EventID: "01JABCDEFGHJKMNPQRSTVWXYZ0",
 	})
 	want := map[string]string{
 		TerminationKindKey:        "drain-handoff",
@@ -22,6 +22,7 @@ func TestTerminationPatchCarriesEveryField(t *testing.T) {
 		TerminationReasonKey:      "config-drift",
 		TerminationAtKey:          at.Format(time.RFC3339),
 		TerminationRequestedAtKey: req.Format(time.RFC3339),
+		TerminationEventIDKey:     "01JABCDEFGHJKMNPQRSTVWXYZ0",
 	}
 	for k, v := range want {
 		if p[k] != v {
@@ -36,7 +37,7 @@ func TestTerminationPatchCarriesEveryField(t *testing.T) {
 // obviously missing field.
 func TestTerminationPatchClearsStaleOptionalFields(t *testing.T) {
 	p := TerminationPatch(runtime.Termination{Kind: runtime.KindObservedDead})
-	for _, k := range []string{TerminationActorKey, TerminationReasonKey, TerminationRequestedAtKey} {
+	for _, k := range []string{TerminationActorKey, TerminationReasonKey, TerminationRequestedAtKey, TerminationEventIDKey} {
 		v, present := p[k]
 		if !present {
 			t.Errorf("%s is absent; it must be written as empty so it OVERWRITES a previous ending's value", k)

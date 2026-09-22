@@ -39,6 +39,7 @@ func TestEventSinkWritesEveryRatioFieldWithoutAJoin(t *testing.T) {
 	err := s.RecordTermination("qcore/worker-3", runtime.Termination{
 		Kind: runtime.KindDrainTimeout, Actor: "controller", Reason: "config-drift",
 		At: at, RequestedAt: req, SessionID: "ga-abc123",
+		EventID: "01JABCDEFGHJKMNPQRSTVWXYZ0",
 	})
 	if err != nil {
 		t.Fatalf("RecordTermination: %v", err)
@@ -64,11 +65,19 @@ func TestEventSinkWritesEveryRatioFieldWithoutAJoin(t *testing.T) {
 		p.SessionName != "qcore/worker-3" || p.At == "" || p.RequestedAt == "" {
 		t.Errorf("payload is missing ratio fields: %+v", p)
 	}
-	if p.CountsNumerator {
-		t.Error("drain-timeout must not count in the numerator")
+	if p.EventID != "01JABCDEFGHJKMNPQRSTVWXYZ0" {
+		t.Errorf("event_id = %q, want the record's: it is the reader's dedup key", p.EventID)
 	}
-	if !p.CountsDenominator {
-		t.Error("drain-timeout must count in the denominator")
+	// Facts only: the bucket judgement belongs to the reader's versioned
+	// classifier, so it must not ride on the row (katya, PR #106 finding 5).
+	var shape map[string]any
+	if err := json.Unmarshal(ev.Payload, &shape); err != nil {
+		t.Fatalf("payload: %v", err)
+	}
+	for _, k := range []string{"counts_numerator", "counts_denominator"} {
+		if _, ok := shape[k]; ok {
+			t.Errorf("payload carries %q; the ratio rule belongs to the reader, not the row", k)
+		}
 	}
 }
 

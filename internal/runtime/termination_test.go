@@ -168,40 +168,54 @@ func TestRequestedAtSurvives(t *testing.T) {
 	}
 }
 
-// TestRatioBuckets pins the two judgement calls so a later edit has to argue
-// with a test rather than quietly change the KPI's meaning.
-func TestRatioBuckets(t *testing.T) {
-	if !KindHandoff.CountsInNumerator() || !KindDrainHandoff.CountsInNumerator() {
-		t.Error("handoff and drain-handoff are the numerator")
+// TestEventIDIsMintedAtTheSeamAndKeptWhenSupplied — the dedup key is
+// (SessionID, EventID), so every record must carry one, and a caller that
+// retries one ending must be able to pin it (katya, PR #106 finding 4).
+func TestEventIDIsMintedAtTheSeamAndKeptWhenSupplied(t *testing.T) {
+	sink := &recordingSink{}
+	if err := StopRecorded(NewFake(), "seat", Termination{Kind: KindOperatorSuspend}, sink); err != nil {
+		t.Fatal(err)
 	}
-	if KindHandoffTarget.CountsInNumerator() {
-		t.Error("handoff-target must NOT be in the headline numerator (katya R3): a third party wrote that note")
+	minted := sink.got[0].EventID
+	if !isULID(minted) {
+		t.Fatalf("seam-minted EventID %q is not a ULID", minted)
 	}
-	if KindObservedDead.CountsInDenominator() {
-		t.Error("observed-dead must be OUT of the denominator: nothing could have been asked of a dead runtime")
-	}
-	if KindInterruptRestart.CountsInDenominator() {
-		t.Error("interrupt-restart must be OUT of the denominator: the session restarts in place and the conversation continues, so it is not an ending")
-	}
-	// THE EXCLUSION LIST IS ENUMERATED, NOT INFERRED. Every kind outside it
-	// must count, so adding a THIRD exclusion trips this test and has to be
-	// argued for here. Writing the loop as "skip anything excluded" would make
-	// the guard vacuous — it would pass for any future exclusion, silently,
-	// which is the exact failure it exists to prevent.
-	excluded := map[TerminationKind]bool{
-		KindObservedDead:     true,
-		KindInterruptRestart: true,
-	}
-	for _, k := range TerminationKinds() {
-		if excluded[k] {
-			continue
-		}
-		if !k.CountsInDenominator() {
-			t.Errorf("kind %q silently left the denominator — that is how a ratio grows quiet holes", k)
+
+	pinned := NewTerminationEventID(time.Unix(1700000000, 0))
+	sink2 := &recordingSink{}
+	for i := 0; i < 3; i++ {
+		if err := StopRecorded(NewFake(), "seat", Termination{Kind: KindDrainTimeout, EventID: pinned}, sink2); err != nil {
+			t.Fatal(err)
 		}
 	}
-	if !KindUnclassified.CountsInDenominator() {
-		t.Error("unclassified MUST count in the denominator; excluding it would hide the instrument's own blind spot")
+	for i, rec := range sink2.got {
+		if rec.EventID != pinned {
+			t.Errorf("attempt %d EventID = %q, want the caller's %q: a retried ending must dedup to one row", i, rec.EventID, pinned)
+		}
+	}
+}
+
+// TestRealTwinsGetDistinctEventIDs is the case the old attribute key lost.
+// Suspend, resume, suspend: same session, same kind, zero RequestedAt both
+// times. Those are two real endings, and they must not collapse to one row.
+func TestRealTwinsGetDistinctEventIDs(t *testing.T) {
+	sink := &recordingSink{}
+	at := time.Unix(1700000000, 0).UTC()
+	for i := 0; i < 2; i++ {
+		rec := Termination{Kind: KindOperatorSuspend, SessionID: "ga-wisp-x", At: at}
+		if err := StopRecorded(NewFake(), "seat", rec, sink); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if sink.got[0].EventID == sink.got[1].EventID {
+		t.Fatalf("two real endings with identical attributes share EventID %q: the dedup would count them as one", sink.got[0].EventID)
+	}
+	if !sink.got[0].RequestedAt.IsZero() || !sink.got[1].RequestedAt.IsZero() {
+		t.Error("RequestedAt must stay zero (unknown) rather than be backfilled to serve a key")
+	}
+	// Minted in the same millisecond, the ids must still sort in mint order.
+	if !(sink.got[0].EventID < sink.got[1].EventID) {
+		t.Errorf("EventIDs %q, %q are not in mint order", sink.got[0].EventID, sink.got[1].EventID)
 	}
 }
 
@@ -391,21 +405,6 @@ func (h hangingSink) RecordTermination(string, Termination) error {
 	return nil
 }
 
-// TestExcludedKindsAreStillReported — katya's condition 1. A bucket that leaves
-// the headline ratio must not leave the report, or its exclusion becomes
-// indistinguishable from the events never having happened.
-func TestExcludedKindsAreStillReported(t *testing.T) {
-	for _, k := range TerminationKinds() {
-		if !k.CountsInDenominator() && !k.ReportedSeparately() {
-			t.Errorf("kind %q is excluded from the denominator AND not reported "+
-				"separately — it would vanish entirely", k)
-		}
-	}
-	if !KindHandoffTarget.ReportedSeparately() {
-		t.Error("handoff-target is the precedent for excluded-but-reported")
-	}
-}
-
 // TestAHangingSinkDoesNotStarveTheOther is the two-failure-domain property,
 // checked rather than assumed.
 //
@@ -459,4 +458,33 @@ func (r *recordingTestSink) RecordTermination(_ string, rec Termination) error {
 	defer r.mu.Unlock()
 	r.got = append(r.got, rec)
 	return nil
+}
+
+func isULID(s string) bool {
+	if len(s) != 26 || s[0] > '7' {
+		return false
+	}
+	for _, c := range s {
+		if !strings.ContainsRune(crockford, c) {
+			return false
+		}
+	}
+	return true
+}
+
+// TestNewTerminationEventIDEncodesTheTimestamp pins the encoding against a
+// known vector: the ULID spec's own example timestamp 1469918176385 ms
+// encodes to the prefix "01ARYZ6S41".
+func TestNewTerminationEventIDEncodesTheTimestamp(t *testing.T) {
+	id := NewTerminationEventID(time.UnixMilli(1469918176385))
+	if !isULID(id) {
+		t.Fatalf("%q is not a ULID", id)
+	}
+	if got := id[:10]; got != "01ARYZ6S41" {
+		t.Errorf("timestamp prefix = %q, want 01ARYZ6S41 (the ULID spec vector)", got)
+	}
+	later := NewTerminationEventID(time.UnixMilli(1469918176386))
+	if !(id < later) {
+		t.Errorf("%q !< %q: ids must sort by mint time", id, later)
+	}
 }

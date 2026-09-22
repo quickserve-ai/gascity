@@ -31,15 +31,14 @@ func TestSessionTerminatedPayloadRoundTrips(t *testing.T) {
 	t.Parallel()
 
 	want := SessionTerminatedPayload{
-		Kind:              "handoff",
-		Actor:             "woodhouse",
-		Reason:            "context 71%",
-		At:                "2026-09-22T03:10:00Z",
-		RequestedAt:       "2026-09-22T03:09:12Z",
-		SessionName:       "woodhouse",
-		SessionID:         "ga-wisp-abc123",
-		CountsNumerator:   true,
-		CountsDenominator: true,
+		Kind:        "handoff",
+		Actor:       "woodhouse",
+		Reason:      "context 71%",
+		At:          "2026-09-22T03:10:00Z",
+		RequestedAt: "2026-09-22T03:09:12Z",
+		SessionName: "woodhouse",
+		SessionID:   "ga-wisp-abc123",
+		EventID:     "01JABCDEFGHJKMNPQRSTVWXYZ0",
 	}
 	raw, err := json.Marshal(want)
 	if err != nil {
@@ -67,9 +66,16 @@ func TestSessionTerminatedPayloadRoundTrips(t *testing.T) {
 	if err := json.Unmarshal(raw, &shape); err != nil {
 		t.Fatalf("unmarshal payload: %v", err)
 	}
-	for _, key := range []string{"kind", "actor", "reason", "at", "requested_at", "session_name", "session_id", "counts_numerator", "counts_denominator"} {
+	for _, key := range []string{"kind", "actor", "reason", "at", "requested_at", "session_name", "session_id", "event_id"} {
 		if _, ok := shape[key]; !ok {
 			t.Fatalf("payload JSON is missing %q: %s", key, raw)
+		}
+	}
+	// Facts only (katya, PR #106 finding 5): the bucket judgement is the
+	// reader's versioned classifier and must not be baked into the row.
+	for _, key := range []string{"counts_numerator", "counts_denominator"} {
+		if _, ok := shape[key]; ok {
+			t.Fatalf("payload JSON carries %q, a reader-side judgement: %s", key, raw)
 		}
 	}
 }

@@ -266,8 +266,8 @@ func TestKillIntentComesFromTheCallerNotTheManager(t *testing.T) {
 			t.Errorf("Kind = %q, want unclassified: the Manager cannot know who "+
 				"called it, and a guess here corrupts the ratio silently", got)
 		}
-		if !sink.got[0].Kind.CountsInDenominator() {
-			t.Error("unclassified must still count — it is the instrument's own health metric")
+		if sink.got[0].EventID == "" {
+			t.Error("EventID is empty: the seam must mint one, or the reader cannot dedup this ending")
 		}
 	})
 }

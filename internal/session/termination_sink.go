@@ -24,6 +24,7 @@ const (
 	TerminationReasonKey      = "termination.reason"
 	TerminationAtKey          = "termination.at"
 	TerminationRequestedAtKey = "termination.requested_at"
+	TerminationEventIDKey     = "termination.event_id"
 )
 
 // TerminationPatch builds the metadata patch for one ending.
@@ -42,6 +43,9 @@ func TerminationPatch(t runtime.Termination) MetadataPatch {
 		TerminationActorKey:  t.Actor,
 		TerminationReasonKey: t.Reason,
 		TerminationAtKey:     at.UTC().Format(time.RFC3339),
+		// Written unconditionally, like the rest: a stale id beside a fresh
+		// kind would join this bead to the wrong event row.
+		TerminationEventIDKey: t.EventID,
 	}
 	if t.RequestedAt.IsZero() {
 		p[TerminationRequestedAtKey] = ""
