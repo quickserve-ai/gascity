@@ -73,6 +73,7 @@ type readyBead struct {
 	NoHistory    bool              `json:"no_history,omitempty"`
 	DeferUntil   *time.Time        `json:"defer_until,omitempty"`
 	IsBlocked    *bool             `json:"is_blocked,omitempty"`
+	AwaitType    string            `json:"await_type,omitempty"`
 	// BlockedBy carries the row's OPEN-or-not blocking dependencies, in bd's
 	// `bd ready --json` shape. It is populated only on the --status in_progress
 	// arm, which is the crash-recovery read: a resumed holder must be told
@@ -141,6 +142,7 @@ func toReadyBead(b beads.Bead) readyBead {
 		NoHistory:    b.NoHistory,
 		DeferUntil:   b.DeferUntil,
 		IsBlocked:    b.IsBlocked,
+		AwaitType:    b.AwaitType,
 	}
 }
 
