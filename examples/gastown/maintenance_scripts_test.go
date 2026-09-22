@@ -11602,14 +11602,14 @@ func wispCompactEnvWithShow(t *testing.T, beadsJSON, showJSON string) (bdLog str
 case "$1" in
   list)
     case "$*" in
-      *"--json"*"--all"*"-n 0"*)
+      *"--json"*"--all"*"--include-infra"*"-n 0"*)
         cat <<'EOF'
 %s
 EOF
         exit 0
         ;;
       *)
-        echo "bd list called with unexpected args: $*" >&2
+        echo "bd list called without --include-infra (v66 returns no wisps): $*" >&2
         exit 2
         ;;
     esac
@@ -11656,9 +11656,13 @@ esac
 }
 
 func TestWispCompactDeletesClosedPastTTL(t *testing.T) {
+	// The real v66 majority row shape: no_history:true, NO ephemeral key
+	// (59,815 of 65,177 live wisps at the measurement on ga-rogz4o). A
+	// fixture carrying ephemeral:true is kinder than production here and
+	// proved nothing when the selector read only .ephemeral.
 	pastTTL := time.Now().Add(-48 * time.Hour).UTC().Format(wispTimestampLayout)
 	beads := fmt.Sprintf(`[
-  {"id":"ga-old","status":"closed","ephemeral":true,"updated_at":%q,"comment_count":0,"labels":[]}
+  {"id":"ga-old","status":"closed","no_history":true,"updated_at":%q,"comment_count":0,"labels":[]}
 ]`, pastTTL)
 
 	bdLog, env := wispCompactEnv(t, beads)
@@ -11819,10 +11823,10 @@ func TestWispCompactSkipsNonEphemeralBeads(t *testing.T) {
 func TestWispCompactRederivesBeforeDelete(t *testing.T) {
 	pastTTL := time.Now().Add(-48 * time.Hour).UTC().Format(wispTimestampLayout)
 	snapshot := fmt.Sprintf(`[
-  {"id":"ga-raced","status":"closed","ephemeral":true,"updated_at":%q,"comment_count":0,"labels":[]}
+  {"id":"ga-raced","status":"closed","no_history":true,"updated_at":%q,"comment_count":0,"labels":[]}
 ]`, pastTTL)
 	fresh := fmt.Sprintf(`[
-  {"id":"ga-raced","status":"closed","ephemeral":true,"updated_at":%q,"comment_count":1,"labels":[]}
+  {"id":"ga-raced","status":"closed","no_history":true,"updated_at":%q,"comment_count":1,"labels":[]}
 ]`, pastTTL)
 
 	bdLog, env := wispCompactEnvWithShow(t, snapshot, fresh)
@@ -11847,13 +11851,43 @@ func TestWispCompactRederivesBeforeDelete(t *testing.T) {
 	}
 }
 
+// The selector fix arms a delete path against a ~65k-row closed backlog;
+// GC_WISP_COMPACT_DELETE_CAP bounds each run so the hourly cadence drains
+// it in slices instead of one storm. Rows past the cap are reported, not
+// silently left.
+func TestWispCompactBoundsDeletesPerRun(t *testing.T) {
+	pastTTL := time.Now().Add(-48 * time.Hour).UTC().Format(wispTimestampLayout)
+	beads := fmt.Sprintf(`[
+  {"id":"ga-bulk-1","status":"closed","no_history":true,"updated_at":%q,"comment_count":0,"labels":[]},
+  {"id":"ga-bulk-2","status":"closed","no_history":true,"updated_at":%q,"comment_count":0,"labels":[]},
+  {"id":"ga-bulk-3","status":"closed","ephemeral":true,"updated_at":%q,"comment_count":0,"labels":[]}
+]`, pastTTL, pastTTL, pastTTL)
+
+	bdLog, env := wispCompactEnv(t, beads)
+	env["GC_WISP_COMPACT_DELETE_CAP"] = "2"
+	out, err := runScriptResult(t, coreScriptPath("wisp-compact.sh"), env)
+	if err != nil {
+		t.Fatalf("wisp-compact.sh failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "deleted=2") || !strings.Contains(string(out), "delete_capped=1") {
+		t.Fatalf("cap of 2 over 3 candidates must report deleted=2 delete_capped=1; got:\n%s", out)
+	}
+	log, readErr := os.ReadFile(bdLog)
+	if readErr != nil {
+		t.Fatalf("ReadFile(bd log): %v", readErr)
+	}
+	if got := strings.Count(string(log), "delete ga-bulk"); got != 2 {
+		t.Fatalf("expected exactly 2 delete attempts under cap, saw %d; bd log:\n%s", got, log)
+	}
+}
+
 // The counter must follow the outcome, not the attempt: a delete that fails
 // is reported as a failure and fails the run, never counted as a deletion
 // (ga-rogz4o defect 1 — the order-history row must not read success).
 func TestWispCompactCountsOnlyConfirmedDeletions(t *testing.T) {
 	pastTTL := time.Now().Add(-48 * time.Hour).UTC().Format(wispTimestampLayout)
 	beads := fmt.Sprintf(`[
-  {"id":"ga-doomed","status":"closed","ephemeral":true,"updated_at":%q,"comment_count":0,"labels":[]}
+  {"id":"ga-doomed","status":"closed","no_history":true,"updated_at":%q,"comment_count":0,"labels":[]}
 ]`, pastTTL)
 
 	bdLog, env := wispCompactEnv(t, beads)
@@ -12087,7 +12121,7 @@ exit 0
 	if err != nil {
 		t.Fatalf("ReadFile(bd log): %v", err)
 	}
-	if !strings.Contains(string(logData), "list --json --all -n 0") {
+	if !strings.Contains(string(logData), "list --json --all --include-infra -n 0") {
 		t.Fatalf("bd list call not observed:\n%s", logData)
 	}
 
