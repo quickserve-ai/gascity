@@ -7545,6 +7545,59 @@ func TestCleanupDeadRuntimeSessionCorpsesReleasesAliasOnBeadClose(t *testing.T) 
 	}
 }
 
+// terminationRecordFailingStore fails only the termination record's write, so
+// the stop succeeds while its bookkeeping does not.
+type terminationRecordFailingStore struct{ beads.Store }
+
+func (s terminationRecordFailingStore) SetMetadataBatch(id string, kvs map[string]string) error {
+	if _, ok := kvs[session.TerminationKindKey]; ok {
+		return errors.New("termination sink unavailable")
+	}
+	return s.Store.SetMetadataBatch(id, kvs)
+}
+
+// TestCleanupDeadRuntimeSessionCorpsesClosesBeadWhenOnlyTheRecordFails pins
+// Codex PR #106 r7: a sink failure after a SUCCESSFUL stop must not leave the
+// confirmed-dead bead open. Left open, it keeps its alias and its assigned
+// work, which blocks the replacement this cleanup exists to unblock.
+func TestCleanupDeadRuntimeSessionCorpsesClosesBeadWhenOnlyTheRecordFails(t *testing.T) {
+	mem := beads.NewMemStore()
+	bead, err := mem.Create(beads.Bead{
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name": "codex-gc-230516",
+			"alias":        "gascity-packs/codex-2",
+			"template":     "gascity-packs/codex",
+			"state":        string(session.StateActive),
+		},
+	})
+	if err != nil {
+		t.Fatalf("create session bead: %v", err)
+	}
+	store := terminationRecordFailingStore{Store: mem}
+
+	sp := newDeadRuntimeArtifactProvider()
+	sp.visible["codex-gc-230516"] = true
+	sp.dead["codex-gc-230516"] = true
+
+	var stderr bytes.Buffer
+	got := cleanupDeadRuntimeSessionCorpses(store, nil, nil, newSessionBeadSnapshot([]beads.Bead{bead}), nil, sp, nil, &stderr)
+	if got != 1 {
+		t.Fatalf("cleanupDeadRuntimeSessionCorpses() = %d, want 1; stderr=%q", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "termination record failed") {
+		t.Errorf("stderr = %q, want the record failure reported", stderr.String())
+	}
+	after, err := mem.Get(bead.ID)
+	if err != nil {
+		t.Fatalf("re-fetch bead: %v", err)
+	}
+	if after.Status != "closed" {
+		t.Fatalf("bead status = %q, want closed: a record failure after a successful stop stranded the dead bead", after.Status)
+	}
+}
+
 // TestCleanupDeadRuntimeSessionCorpsesToleratesNilStore protects the
 // existing call-site contract: tests and any future callers that don't
 // wire a real store still get the runtime-Stop side effect without

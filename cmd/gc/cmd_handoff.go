@@ -316,7 +316,33 @@ func doHandoffWithOutcome(msgStore, sessStore beads.Store, rec events.Recorder, 
 		return handoffOutcome{code: 1}
 	}
 	recordHandoffTerminationIntent(sessStore, sessionName, stderr)
-	if err := dops.setRestartRequested(sessionName); err != nil {
+	if pinned {
+		// PINNED: PERSIST THE RESET BEFORE EXPOSING THE FLAG (Codex #106 r7).
+		// The reconciler reads the provider flag LIVE but the reset from a
+		// snapshot. With the flag first, a tick could see the flag, find no
+		// reset in its snapshot, re-read before the reset landed, and clear the
+		// flag and the intent; the reset then landed and the next tick stopped
+		// the seat as a plain restart-in-place. The r5/r6 re-read only narrowed
+		// that window. Persisting first closes it: RequestFreshRestart writes
+		// restart_requested and continuation_reset_pending in one batch, so any
+		// tick that can see a request, by flag or by bead, also finds the reset,
+		// on its snapshot or on the guard's re-read.
+		if err := persistRestart(); err != nil {
+			// Nothing was armed, so the intent must not outlive this call: left
+			// behind, it would relabel whatever restarts this seat next as a
+			// handoff, over-claiming the numerator (consumed-at-most-once).
+			unwindHandoffRestart(dops, sessStore, sessionName, stderr)
+			fmt.Fprintf(stderr, "gc handoff: could not persist restart marker for pinned session %q; not requesting restart: %v\n", sessionName, err) //nolint:errcheck // best-effort stderr
+			return handoffOutcome{code: 1}
+		}
+		if err := dops.setRestartRequested(sessionName); err != nil {
+			// The persisted request alone restarts the seat: the bead carries
+			// the explicit reset the pinned guard honors. The intent therefore
+			// STAYS, because that restart is this handoff, and unwinding it
+			// would drop a real handoff from the numerator.
+			fmt.Fprintf(stderr, "gc handoff: setting restart flag (restart still requested via the session bead): %v\n", err) //nolint:errcheck // best-effort stderr
+		}
+	} else if err := dops.setRestartRequested(sessionName); err != nil {
 		// UNWIND IT. The restart was never armed, so an intent left behind would
 		// be consumed by whatever restarts this seat next and would relabel an
 		// unrelated ending as a handoff — over-claiming the numerator, which the
@@ -324,17 +350,6 @@ func doHandoffWithOutcome(msgStore, sessStore beads.Store, rec events.Recorder, 
 		unwindHandoffRestart(dops, sessStore, sessionName, stderr)
 		fmt.Fprintf(stderr, "gc handoff: setting restart flag: %v\n", err) //nolint:errcheck // best-effort stderr
 		return handoffOutcome{code: 1}
-	}
-	if pinned {
-		if err := persistRestart(); err != nil {
-			// The flag is armed but the reconciler's pinned guard will CLEAR it
-			// without consuming it, so no restart is coming. Retire both
-			// markers here; the guard also clears the intent when it clears
-			// the flag, so a failed unwind is not left armed (Codex #106 r4).
-			unwindHandoffRestart(dops, sessStore, sessionName, stderr)
-			fmt.Fprintf(stderr, "gc handoff: could not persist restart marker for pinned session %q; not requesting restart: %v\n", sessionName, err) //nolint:errcheck // best-effort stderr
-			return handoffOutcome{code: 1}
-		}
 	} else if persistRestart != nil {
 		if err := persistRestart(); err != nil {
 			fmt.Fprintf(stderr, "gc handoff: setting bead restart flag: %v\n", err) //nolint:errcheck // best-effort stderr

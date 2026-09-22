@@ -16,10 +16,12 @@
 # (session_lifecycle_parallel.go x2, doctor/checks.go x2, api/huma_handlers_rigs.go).
 # An enumerated guarantee undercovers its surface. Growth is the violation.
 #
-# WHAT IT SCANS: non-test .go under cmd/ and internal/, excluding the provider
-# IMPLEMENTATIONS themselves (internal/runtime/<provider>/ and the package's own
-# fake/adapter/conformance helpers), for `.Stop(` WITH A NON-EMPTY ARGUMENT,
-# minus the shapes allowlisted in scripts/termination-seam-patterns.txt.
+# WHAT IT SCANS: non-test .go under cmd/ and internal/, provider directories
+# included, for `.Stop(` WITH A NON-EMPTY ARGUMENT, minus the shapes allowlisted
+# in scripts/termination-seam-patterns.txt, a provider's own Stop forwarding,
+# and lines marked `termination-seam:not-an-ending <reason>`. Whole provider
+# directories used to be excluded, which hid the exec provider's Relaunch
+# ending a live session unrecorded (Codex, PR #106 r9).
 #
 # THE DISCRIMINATOR IS THE SIGNATURE, NOT THE RECEIVER NAME, since 2026-09-19.
 # runtime.Provider.Stop takes one argument — the session name. A timer or ticker
@@ -61,9 +63,46 @@ PATTERNS="$ROOT/scripts/termination-seam-patterns.txt"
 BASELINE="$ROOT/scripts/termination-seam-baseline.txt"
 [ -f "$PATTERNS" ] || { printf 'missing pattern file: %s\n' "$PATTERNS" >&2; exit 2; }
 
+# forwarding_or_exempt reads "<path>:<line>:<src>" hits on stdin (paths relative
+# to $1) and drops two shapes, printing the rest:
+#   - a PROVIDER's forwarding: a hit under internal/runtime/ whose enclosing func
+#     is itself a Stop method or a place's Teardown (the where-half of Stop). That
+#     call IS the provider's Stop; its caller is what the fence polices.
+#   - an explicit exemption: the line carries "termination-seam:not-an-ending"
+#     followed by a reason. It is visible in review and greppable; it replaces
+#     the old whole-directory exclusion, which also hid real endings, such as a
+#     provider's Relaunch doing Stop+Start (Codex, PR #106 r9).
+forwarding_or_exempt() {
+	local dir="$1" hit path line fn
+	while IFS= read -r hit; do
+		[ -n "$hit" ] || continue
+		path=${hit%%:*}
+		line=${hit#*:}; line=${line%%:*}
+		if printf '%s' "$hit" | grep -qE 'termination-seam:not-an-ending[[:space:]]+[^[:space:]]'; then
+			continue
+		fi
+		case "$path" in
+		internal/runtime/*/*)
+			# The enclosing func is the last `func` line at or above the hit,
+			# reset at each top-level closing brace, so a package-level closure
+			# after a Stop method is not credited to that method.
+			fn=$(awk -v n="$line" 'NR<=n && /^func /{f=$0} NR<n && /^}/{f=""} NR==n{print f; exit}' "$dir/$path")
+			if printf '%s' "$fn" | grep -qE '\) (Stop|Teardown)\('; then
+				continue
+			fi
+			;;
+		esac
+		printf '%s\n' "$hit"
+	done
+}
+
 # scan prints "<path>:<line>:<trimmed source>" for every candidate call.
-# Excluded: _test.go; the provider implementations (they ARE Stop); the seam
-# file itself; and the conformance/fake helpers that drive providers directly.
+# Excluded: _test.go; the seam file itself and the package's fake/adapter
+# helpers; the conformance harness (internal/runtime/runtimetest/), which drives
+# providers directly by design; and, via forwarding_or_exempt, a provider's own
+# Stop forwarding plus explicitly exempted lines. Provider directories are
+# otherwise SCANNED: a new provider, or a new Stop inside an existing one, is a
+# violation by default.
 scan() {
 	local dir="$1" pat
 	pat=$(grep -vE '^\s*(#|$)' "$PATTERNS" | paste -sd'|' -) || return 2
@@ -78,9 +117,10 @@ scan() {
 	(cd "$dir" && grep -rnE '\.Stop\(([^)]|$)' --include='*.go' cmd internal 2>/dev/null) |
 		grep -v '_test\.go:' |
 		grep -vE '^internal/runtime/(termination|fake|seam_adapter|beacon)\.go:' |
-		grep -vE '^internal/runtime/(tmux|subprocess|exec|ssh|k8s|acp|herdr|auto|t3bridge|runtimetest|hybrid|registry|proctable|runtimecontract|runtimecapability|rppcheck)/' |
+		grep -vE '^internal/runtime/runtimetest/' |
 		grep -vE ':[0-9]+:\s*//' |
 		grep -vE "$pat" |
+		forwarding_or_exempt "$dir" |
 		sed -E 's/^([^:]+):([0-9]+):[[:space:]]*/\1:\2:/'
 }
 
@@ -147,8 +187,10 @@ say WHY the session is ending. If you genuinely cannot classify it, pass
 Kind: runtime.KindUnclassified — that is counted and budgeted, and it is the
 honest answer. What it must not do is end silently.
 
-If this call is genuinely not a session termination, add its receiver to the
-exclusions in scripts/check-termination-seam.sh and say why in the commit.
+If this call is genuinely not a session termination (for example, tearing down
+a start that never came up), mark the line with a trailing
+`// termination-seam:not-an-ending <reason>` so the exemption and its reason
+are visible in review.
 WHY
 	exit 1
 fi

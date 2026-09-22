@@ -3276,9 +3276,10 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 				explicitControllerReset := strings.TrimSpace(infoByID[id].ContinuationResetPending) == "true"
 				if runtimeRunning && pinnedConfiguredNamedSessionKillProtected(infoByID[id]) && !explicitControllerReset {
 					// THE SNAPSHOT MAY BE STALE (Codex #106 r5, r6). A pinned handoff
-					// stamps the intent and arms the flag, THEN persists its explicit
-					// reset. If that reset (or a request this snapshot did not hold)
-					// has landed since, this tick's premise, "no explicit reset", is
+					// stamps the intent, persists its explicit reset, and only THEN
+					// arms the flag (r7), so a flag this tick read live implies a
+					// reset this snapshot may predate. If that reset (or a request
+					// this snapshot did not hold) has landed, this tick's premise, "no explicit reset", is
 					// false: touch NOTHING and let the next tick act on fresh state.
 					// Clearing anything here would either drop a real handoff from the
 					// numerator (clear the intent) or strand it (clear the request and

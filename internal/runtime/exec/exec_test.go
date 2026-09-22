@@ -185,6 +185,23 @@ func TestSeparableLaunch_WeldedPackUsesStartOnly(t *testing.T) {
 	}
 }
 
+// A welded pack must DECLINE Relaunch rather than Stop+Start the live session
+// itself: that stop recorded no termination. The reconciler's full restart
+// handles it (Codex, PR #106 r9).
+func TestRelaunch_WeldedPackDeclinesWithoutStopping(t *testing.T) {
+	dir := t.TempDir()
+	logf := filepath.Join(dir, "ops.log")
+	p := NewProvider(writeScript(t, dir, weldedScript(logf)))
+
+	err := p.Relaunch(context.Background(), "s", runtime.Config{Command: "agent --resume"})
+	if !errors.Is(err, runtime.ErrRelaunchUnsupported) {
+		t.Fatalf("Relaunch error = %v, want ErrRelaunchUnsupported", err)
+	}
+	if b, readErr := os.ReadFile(logf); readErr == nil && strings.TrimSpace(string(b)) != "" {
+		t.Errorf("welded Relaunch must not run any op (no stop, no start):\n%s", b)
+	}
+}
+
 // Relaunch on a separable pack respawns/launches the agent over the exec op
 // (warm-box relaunch) — it does NOT reprovision the box (no provision/start op).
 func TestRelaunch_SeparablePackLaunchesOverExec(t *testing.T) {

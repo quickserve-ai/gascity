@@ -642,6 +642,111 @@ func TestDoHandoff_PinnedAlwaysSessionRequiresPersistRestart(t *testing.T) {
 	}
 }
 
+// flagObservingDrainOps records what the session bead held at the instant the
+// provider restart flag was set: the moment an independently polling
+// reconciler can first see the request.
+type flagObservingDrainOps struct {
+	*fakeDrainOps
+	store       beads.Store
+	beadID      string
+	setErr      error
+	resetAtFlag string
+	flagCalls   int
+}
+
+func (f *flagObservingDrainOps) setRestartRequested(sessionName string) error {
+	f.flagCalls++
+	if b, err := f.store.Get(f.beadID); err == nil {
+		f.resetAtFlag = b.Metadata["continuation_reset_pending"]
+	}
+	if f.setErr != nil {
+		return f.setErr
+	}
+	return f.fakeDrainOps.setRestartRequested(sessionName)
+}
+
+func seedPinnedMayorBead(t *testing.T, store beads.Store) beads.Bead {
+	t.Helper()
+	b, err := store.Create(beads.Bead{Type: sessionBeadType, Labels: []string{"gc:session"}})
+	if err != nil {
+		t.Fatalf("seeding session bead: %v", err)
+	}
+	for k, v := range map[string]string{
+		"session_name":             "mayor",
+		"configured_named_session": "true",
+		"configured_named_mode":    "always",
+		"pin_awake":                "true",
+	} {
+		if err := store.SetMetadata(b.ID, k, v); err != nil {
+			t.Fatalf("set %s: %v", k, err)
+		}
+	}
+	return b
+}
+
+// TestDoHandoff_PinnedPersistsResetBeforeExposingFlag covers Codex #106 r7:
+// the pinned guard reads the flag live and the reset from a snapshot, so the
+// reset must already be on the bead when the flag becomes visible. Otherwise a
+// tick can clear the flag and the intent before the reset lands, and the
+// handoff is then stopped as a plain restart-in-place.
+func TestDoHandoff_PinnedPersistsResetBeforeExposingFlag(t *testing.T) {
+	store := beads.NewMemStore()
+	b := seedPinnedMayorBead(t, store)
+	dops := &flagObservingDrainOps{fakeDrainOps: newFakeDrainOps(), store: store, beadID: b.ID}
+	persist := func() error {
+		return store.SetMetadataBatch(b.ID, map[string]string{
+			"restart_requested":          "true",
+			"continuation_reset_pending": "true",
+		})
+	}
+	var stdout, stderr bytes.Buffer
+
+	outcome := doHandoffWithOutcome(store, store, events.NewFake(), dops, persist, "mayor", "mayor",
+		[]string{"HANDOFF: context full"}, &stdout, &stderr)
+	if outcome.code != 0 || !outcome.restartRequested {
+		t.Fatalf("outcome = %+v, want success; stderr: %s", outcome, stderr.String())
+	}
+	if dops.flagCalls != 1 {
+		t.Fatalf("setRestartRequested calls = %d, want 1", dops.flagCalls)
+	}
+	if dops.resetAtFlag != "true" {
+		t.Fatalf("continuation_reset_pending = %q when the flag was exposed, want \"true\" (reset must be persisted first)", dops.resetAtFlag)
+	}
+}
+
+// TestDoHandoff_PinnedFlagFailureAfterPersistKeepsIntent: once the reset is
+// persisted, the bead alone restarts the seat, so a failed flag write must not
+// unwind the intent. Unwinding it would record this handoff as a generic
+// restart and drop it from the numerator.
+func TestDoHandoff_PinnedFlagFailureAfterPersistKeepsIntent(t *testing.T) {
+	store := beads.NewMemStore()
+	b := seedPinnedMayorBead(t, store)
+	dops := &flagObservingDrainOps{fakeDrainOps: newFakeDrainOps(), store: store, beadID: b.ID, setErr: errors.New("tmux unavailable")}
+	persist := func() error {
+		return store.SetMetadataBatch(b.ID, map[string]string{
+			"restart_requested":          "true",
+			"continuation_reset_pending": "true",
+		})
+	}
+	var stdout, stderr bytes.Buffer
+
+	outcome := doHandoffWithOutcome(store, store, events.NewFake(), dops, persist, "mayor", "mayor",
+		[]string{"HANDOFF: context full"}, &stdout, &stderr)
+	if outcome.code != 0 || !outcome.restartRequested {
+		t.Fatalf("outcome = %+v, want success (the persisted request restarts the seat); stderr: %s", outcome, stderr.String())
+	}
+	got, err := store.Get(b.ID)
+	if err != nil {
+		t.Fatalf("re-reading session bead: %v", err)
+	}
+	if v := got.Metadata[session.TerminationIntentKey]; v != string(runtime.KindHandoff) {
+		t.Fatalf("%s = %q, want %q: the restart the bead will drive IS this handoff", session.TerminationIntentKey, v, runtime.KindHandoff)
+	}
+	if got.Metadata["continuation_reset_pending"] != "true" {
+		t.Fatal("continuation_reset_pending was cleared; the persisted restart must stand")
+	}
+}
+
 func TestHandoffWithMessage(t *testing.T) {
 	store := beads.NewMemStore()
 	rec := events.NewFake()

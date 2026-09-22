@@ -3246,18 +3246,27 @@ func cleanupDeadRuntimeSessionCorpses(
 		}
 		// The runtime was already CONFIRMED dead above, so there was never
 		// anything to ask: observed-dead, outside the ratio's denominator.
-		if err := runtime.StopRecorded(sp, name, runtime.Termination{
+		// Only the STOP's failure may skip the close below. A failed termination
+		// record after a successful stop used to leave a confirmed-dead bead open,
+		// holding its alias and its assigned work, which blocks exactly the
+		// replacement this cleanup exists to unblock (Codex, PR #106 r7). The
+		// record failure is reported on its own.
+		stopErr, recErr := runtime.StopRecordedDetailed(sp, name, runtime.Termination{
 			Kind:   runtime.KindObservedDead,
 			Actor:  "reconciler",
 			Reason: "cleaning a confirmed-dead runtime session",
 			// The id is already in hand from the snapshot this loop walks, so
 			// the sink never has to resolve a name.
 			SessionID: info.ID,
-		}, reconcilerTerminationSinks(store, nil)...); err != nil {
-			if runtime.IsSessionGone(err) {
+		}, reconcilerTerminationSinks(store, nil)...)
+		if recErr != nil {
+			fmt.Fprintf(stderr, "session reconciler: dead runtime session %s: termination record failed: %v\n", name, recErr) //nolint:errcheck
+		}
+		if stopErr != nil {
+			if runtime.IsSessionGone(stopErr) {
 				continue
 			}
-			fmt.Fprintf(stderr, "session reconciler: cleaning dead runtime session %s: %v\n", name, err) //nolint:errcheck
+			fmt.Fprintf(stderr, "session reconciler: cleaning dead runtime session %s: %v\n", name, stopErr) //nolint:errcheck
 			continue
 		}
 		fmt.Fprintf(stderr, "session reconciler: cleaned dead runtime session %s\n", name) //nolint:errcheck
