@@ -385,9 +385,9 @@ func (r *FileRecorder) lockActiveLocked() (int, error) {
 			_ = syscall.Flock(fd, syscall.LOCK_UN)
 			return 0, fmt.Errorf("stat active log path: %w", cerr)
 		}
-		// Rotated away (or mid-rotation, path not yet recreated): follow it.
+		// Rotated away: follow the path to the new active log.
 		_ = syscall.Flock(fd, syscall.LOCK_UN)
-		newF, err := os.OpenFile(r.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		newF, err := openRotatedActiveLog(r.path)
 		if err != nil {
 			return 0, fmt.Errorf("reopening rotated active log: %w", err)
 		}
@@ -396,6 +396,71 @@ func (r *FileRecorder) lockActiveLocked() (int, error) {
 		_ = old.Close()
 	}
 	return 0, fmt.Errorf("active log at %s moved %d times under the lock", r.path, attempts)
+}
+
+// openRotatedActiveLog opens the active log a rotation left behind WITHOUT
+// creating it. Between rotateLocked's rename and its link the path is briefly
+// absent, and only the rotator may create the replacement: it publishes that
+// file already locked, so a follower that created its own would write ahead
+// of the anchor with a seq read from an empty file (Codex, PR #111 r4). An
+// absent path is therefore waited on for the flock budget. After that the
+// rotator is presumed dead mid-rotation and the path is created, as
+// NewFileRecorder would.
+func openRotatedActiveLog(path string) (*os.File, error) {
+	deadline := time.Now().Add(recordFlockTimeout)
+	for {
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+		if err == nil || !os.IsNotExist(err) {
+			return f, err
+		}
+		if time.Now().After(deadline) {
+			return os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		}
+		time.Sleep(recordFlockRetryInterval)
+	}
+}
+
+// rotateBeforeAnchorHook, when set by a test, runs inside rotateLocked after
+// the rotated inode has been released and before the anchor is written: the
+// window in which a writer released from the old inode reaches the new one.
+var rotateBeforeAnchorHook func()
+
+// publishLockedActiveLog creates the replacement active log and returns it
+// already locked. The file is created and flocked under a staging name that no
+// other writer knows, then linked to path. A link, unlike a rename, refuses to
+// replace a file, so a recorder that NewFileRecorder opened in the rename gap
+// (and may already have written to) is not unlinked out from under it. In that
+// case the file it created becomes the active log and is locked like any other.
+func publishLockedActiveLog(path string) (*os.File, error) {
+	staging := filepath.Join(filepath.Dir(path),
+		fmt.Sprintf(".%s.next-%d-%d", filepath.Base(path), os.Getpid(), time.Now().UnixNano()))
+	f, err := os.OpenFile(staging, os.O_APPEND|os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("creating staged active log: %w", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		_ = os.Remove(staging)
+		return nil, fmt.Errorf("locking staged active log: %w", err)
+	}
+	linkErr := os.Link(staging, path)
+	_ = os.Remove(staging)
+	if linkErr == nil {
+		return f, nil
+	}
+	_ = f.Close()
+	if !os.IsExist(linkErr) {
+		return nil, fmt.Errorf("publishing active log: %w", linkErr)
+	}
+	existing, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("opening active log created during rotation: %w", err)
+	}
+	if err := lockRecorderFile(int(existing.Fd()), path); err != nil {
+		_ = existing.Close()
+		return nil, fmt.Errorf("locking active log created during rotation: %w", err)
+	}
+	return existing, nil
 }
 
 func lockRecorderFile(fd int, path string) error {
@@ -570,7 +635,8 @@ func (r *FileRecorder) rotateLocked() (RotationResult, error) {
 	// the seq window below was read and after the rename, landing a row the
 	// archive does not advertise. With it, in-flight appends finish first, and
 	// later ones find the path moved (lockActiveLocked) and follow it. Closing
-	// the fd after the rename releases the lock.
+	// the fd after the rename releases the lock, and only once the replacement
+	// is published already locked (below).
 	lockFd, err := r.lockActiveLocked()
 	if err != nil {
 		return RotationResult{}, fmt.Errorf("locking active log for rotation: %w", err)
@@ -593,23 +659,40 @@ func (r *FileRecorder) rotateLocked() (RotationResult, error) {
 		return RotationResult{}, fmt.Errorf("renaming active log: %w", err)
 	}
 
-	// Closing the renamed file releases the lock; writers waiting on it find
-	// the path moved and follow it to the new active log.
+	// LOCK THE REPLACEMENT BEFORE RELEASING THE ROTATED INODE, and hold it
+	// through the anchor (Codex, PR #111 r4). Closing the renamed file releases
+	// its lock, and a writer waiting there follows the path. Had the new log
+	// been unlocked, or not yet created, that writer would append first, taking
+	// its seq from an empty file: a duplicate of the anchor's, ahead of it.
+	newFile, newErr := publishLockedActiveLog(r.path)
 	old := r.file
 	r.file = nil
 	if err := old.Close(); err != nil {
 		fmt.Fprintf(r.stderr, "events: rotation: closing rotated log: %v\n", err) //nolint:errcheck // best-effort stderr
 	}
-	newFile, err := os.OpenFile(r.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
+	if newErr != nil {
 		// Mark the recorder closed so subsequent Record calls drop cleanly
 		// instead of dereferencing a nil file under maybeAutoRotateLocked.
 		r.closed = true
-		return RotationResult{}, fmt.Errorf("opening new active log: %w", err)
+		return RotationResult{}, fmt.Errorf("opening new active log: %w", newErr)
 	}
 	r.file = newFile
+	defer func() {
+		if err := syscall.Flock(int(newFile.Fd()), syscall.LOCK_UN); err != nil {
+			fmt.Fprintf(r.stderr, "events: rotation: unlock new active log: %v\n", err) //nolint:errcheck // best-effort stderr
+		}
+	}()
 	r.recordCount = 0
 	r.lastSizeCheck = time.Now()
+	// The new log is empty, so the anchor's seq comes from memory. Another
+	// process may have appended past this recorder's counter; the archived
+	// window read under the lock is authoritative.
+	if last > r.seq {
+		r.seq = last
+	}
+	if rotateBeforeAnchorHook != nil {
+		rotateBeforeAnchorHook()
+	}
 
 	payload := RotatedPayload{
 		PriorArchive:  archiveBase,
