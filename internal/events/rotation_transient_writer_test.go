@@ -2,11 +2,13 @@ package events
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
-	"time"
 )
 
 // A recorder opened BEFORE another recorder rotated the log must write into
@@ -65,8 +67,13 @@ func TestTransientWriterOpenedBeforeRotationFollowsTheActiveLog(t *testing.T) {
 // A writer that is released from the rotated inode must not append to the new
 // active log ahead of the rotation anchor (Codex, PR #111 r4). Before the fix,
 // closing the rotated file released its lock while the replacement was
-// unlocked: the released writer followed the path, read its seq from the empty
+// unlocked: a released writer followed the path, read its seq from the empty
 // new file, and wrote a row whose seq duplicated the anchor's, before it.
+//
+// The property is checked directly rather than by racing a writer against a
+// timer: at the instant the rotated inode is released, the new active log must
+// already exist at the path and already be locked, so any writer that reaches
+// it waits for the anchor.
 func TestWriterReleasedByRotationWaitsForTheAnchor(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "events.jsonl")
@@ -86,14 +93,22 @@ func TestWriterReleasedByRotationWaitsForTheAnchor(t *testing.T) {
 	}
 	defer transient.Close() //nolint:errcheck // test cleanup
 
-	ackErr := make(chan error, 1)
+	var probeErr error
+	probed := false
 	rotateBeforeAnchorHook = func() {
-		go func() {
-			ackErr <- transient.RecordAck(Event{Type: SessionNudged, Actor: "t", Subject: "released"})
-		}()
-		// Long enough for the writer to reach the new log and try its lock;
-		// well inside the writer's flock budget.
-		time.Sleep(60 * time.Millisecond)
+		probed = true
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			probeErr = fmt.Errorf("new active log is not at the path when the rotated inode is released: %w", err)
+			return
+		}
+		defer f.Close() //nolint:errcheck // test probe
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+			probeErr = errors.New("new active log is UNLOCKED when the rotated inode is released; a waiting writer would append ahead of the anchor")
+		} else if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+			probeErr = fmt.Errorf("probing the new active log's lock: %w", err)
+		}
 	}
 	defer func() { rotateBeforeAnchorHook = nil }()
 
@@ -101,19 +116,23 @@ func TestWriterReleasedByRotationWaitsForTheAnchor(t *testing.T) {
 	if err != nil || !res.Rotated {
 		t.Fatalf("ForceRotate = %+v, %v", res, err)
 	}
-	if err := <-ackErr; err != nil {
-		t.Fatalf("RecordAck: %v", err)
+	if !probed {
+		t.Fatal("rotateBeforeAnchorHook never ran")
+	}
+	if probeErr != nil {
+		t.Fatal(probeErr)
 	}
 
+	// And the writer that follows lands after the anchor, with a higher seq.
+	if err := transient.RecordAck(Event{Type: SessionNudged, Actor: "t", Subject: "released"}); err != nil {
+		t.Fatalf("RecordAck: %v", err)
+	}
 	active, _, err := ReadFrom(path, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(active) != 2 {
-		t.Fatalf("active log has %d rows, want anchor + released row: %+v", len(active), active)
-	}
-	if active[0].Type != EventsRotated {
-		t.Fatalf("first row of the new log is %q (seq %d), want the %s anchor", active[0].Type, active[0].Seq, EventsRotated)
+	if len(active) != 2 || active[0].Type != EventsRotated {
+		t.Fatalf("new active log = %+v, want the %s anchor then the released row", active, EventsRotated)
 	}
 	if active[1].Subject != "released" || active[1].Seq <= active[0].Seq {
 		t.Fatalf("released row = %q seq %d, anchor seq %d; want it after the anchor with a higher seq",
