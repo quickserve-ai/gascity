@@ -298,7 +298,7 @@ func (s *auditFailingUpdateStore) Update(string, beads.UpdateOpts) error {
 var errUpdateRefused = fmt.Errorf("update refused")
 
 // TestWorkAssignmentReleaseWorkBead_EmitsAuditLine is the ga-9n8hjv acceptance-4
-// behaviour check: a SUCCESSFUL release must be observable on BOTH tiers. Before
+// behavior check: a SUCCESSFUL release must be observable on BOTH tiers. Before
 // this, only the error branch at each call site logged, so a release that
 // stripped a named agent's whole portfolio left nothing to grep and needed
 // dolt_diff_issues forensics after the fact. The asserts are on the facts a
