@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"os/exec"
@@ -25,6 +26,19 @@ var mailTableRe = regexp.MustCompile(`(?i)(?:FROM|UPDATE|INTO|JOIN|DELETE\s+FROM
 // localClockSQLRe matches SQL that reads the Dolt server's local clock. bd
 // stores UTC in its timestamp columns, so the reaper must use UTC_TIMESTAMP().
 var localClockSQLRe = regexp.MustCompile(`(?i)\b(?:now|sysdate|curdate|curtime)\s*\(|\b(?:current_timestamp|current_date|current_time|localtime|localtimestamp)\b`)
+
+// notInSubqueryRe matches a NOT IN predicate whose right side is a subquery,
+// including a parenthesized or CTE-shaped one. A literal list
+// (NOT IN ('message')) or an interpolated list (NOT IN ($TYPES)) is planned
+// correctly and is out of scope. See doubleNotInSubqueryStatements.
+var notInSubqueryRe = regexp.MustCompile(`(?i)\bNOT\s+IN\s*\((?:[(\s])*(?:SELECT|WITH)\b`)
+
+var sqlAndKeywordRe = regexp.MustCompile(`(?i)\bAND\b`)
+
+// sqlChunkBoundaryRe separates scan units for the double-NOT-IN lint: a ';',
+// or a closing double quote at end of line (consecutive SQL strings embedded
+// in shell commands).
+var sqlChunkBoundaryRe = regexp.MustCompile(`;|"[ \t]*\r?\n`)
 
 const (
 	reaperCloseCleanupEdgeSQL   = "(d.type = 'parent-child' OR (d.type = 'tracks' AND JSON_UNQUOTE(JSON_EXTRACT(w.metadata, '$.\"gc.root_bead_id\"')) = COALESCE(d.depends_on_issue_id, d.depends_on_wisp_id, d.depends_on_external)))"
@@ -4010,6 +4024,181 @@ func TestReaperScriptSQLReflectsCurrentSchema(t *testing.T) {
 	}
 	if !containsReaperPurgeProtectEdgePredicate(script) {
 		t.Fatalf("reaper script does not include the purge-protection predicate:\n%s", script)
+	}
+}
+
+// doubleNotInHit locates one flagged statement: line is 1-based in the
+// scanned text, snippet starts at the first offending predicate.
+type doubleNotInHit struct {
+	line    int
+	snippet string
+}
+
+// sqlScanChunks splits text into scan units at statement boundaries — a ';',
+// or a double quote at end of line, which is how consecutive SQL strings
+// embedded in shell commands separate when no ';' intervenes. Each chunk is
+// returned with its byte offset in text so hits can be reported by line.
+func sqlScanChunks(text string) (chunks []string, offsets []int) {
+	prev := 0
+	for _, b := range sqlChunkBoundaryRe.FindAllStringIndex(text, -1) {
+		chunks = append(chunks, text[prev:b[0]])
+		offsets = append(offsets, prev)
+		prev = b[1]
+	}
+	chunks = append(chunks, text[prev:])
+	offsets = append(offsets, prev)
+	return chunks, offsets
+}
+
+// topLevelAndBetween reports whether an AND joins the two predicates rather
+// than appearing inside a subquery: starting inside the first NOT IN's
+// parens, it walks to the second predicate tracking paren depth and matches
+// AND only against the text at depth zero.
+func topLevelAndBetween(chunk string, firstStart, firstEnd, secondStart int) bool {
+	depth := strings.Count(chunk[firstStart:firstEnd], "(")
+	var topLevel strings.Builder
+	for _, r := range chunk[firstEnd:secondStart] {
+		switch r {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		default:
+			if depth == 0 {
+				topLevel.WriteRune(r)
+			}
+		}
+	}
+	return sqlAndKeywordRe.MatchString(topLevel.String())
+}
+
+// doubleNotInSubqueryStatements returns a hit for every scan chunk in text
+// where an AND joins two NOT IN (subquery) predicates at top level. On Dolt
+// 2.2.4 that pair is planned as an anti-join plus a plain InSubquery with the
+// first NOT dropped when the first subquery is a UNION (pl-chi), so the
+// statement returns exactly the rows the first guard should exclude. Keep at
+// most one NOT IN (subquery) per statement; write further exclusions as
+// correlated NOT EXISTS.
+//
+// This is a text lint, not a SQL parser. Known limits, each a possible false
+// negative: a pair assembled at runtime from separate Go strings (the class
+// recorded on ga-6fcxcs); a ';' inside a SQL string literal or '--' comment
+// between the predicates, which splits the chunk; a SQL comment between the
+// NOT IN tokens or between '(' and SELECT; and two quoted statements on one
+// line where the closing quote is not at end of line, which merges chunks.
+func doubleNotInSubqueryStatements(text string) []doubleNotInHit {
+	var hits []doubleNotInHit
+	chunks, offsets := sqlScanChunks(text)
+	for ci, chunk := range chunks {
+		locs := notInSubqueryRe.FindAllStringIndex(chunk, -1)
+		if len(locs) < 2 {
+			continue
+		}
+		for i := 1; i < len(locs); i++ {
+			if !topLevelAndBetween(chunk, locs[i-1][0], locs[i-1][1], locs[i][0]) {
+				continue
+			}
+			start := locs[i-1][0]
+			snippet := []rune(strings.Join(strings.Fields(chunk[start:]), " "))
+			if len(snippet) > 220 {
+				snippet = append(snippet[:220], []rune("...")...)
+			}
+			hits = append(hits, doubleNotInHit{
+				line:    1 + strings.Count(text[:offsets[ci]+start], "\n"),
+				snippet: string(snippet),
+			})
+			break
+		}
+	}
+	return hits
+}
+
+// plChiReproSQL is the minimal reproduction from pl-chi: the first NOT IN is
+// over a UNION, the second is ANDed. Dolt 2.2.4 drops the first NOT. The lint
+// must always flag this shape; it is the known-positive control.
+const plChiReproSQL = `SELECT id FROM issues
+WHERE id NOT IN (SELECT DISTINCT d.issue_id FROM dependencies d INNER JOIN issues i ON d.depends_on_issue_id = i.id WHERE i.status IN ('open','in_progress')
+UNION SELECT DISTINCT d.depends_on_issue_id FROM dependencies d INNER JOIN issues i ON d.issue_id = i.id WHERE i.status IN ('open','in_progress'))
+AND id NOT IN (SELECT issue_id FROM labels WHERE label = 'operator-directive')`
+
+func TestDoubleNotInSubqueryLintFlagsKnownPositive(t *testing.T) {
+	hits := doubleNotInSubqueryStatements(plChiReproSQL)
+	if len(hits) != 1 {
+		t.Fatalf("lint must flag the pl-chi repro exactly once, got %d hits: %v", len(hits), hits)
+	}
+	if hits[0].line != 2 {
+		t.Errorf("pl-chi repro's first predicate is on line 2, reported line %d", hits[0].line)
+	}
+	if !strings.HasPrefix(hits[0].snippet, "NOT IN (SELECT DISTINCT d.issue_id") {
+		t.Errorf("snippet must start at the offending predicate, got %q", hits[0].snippet)
+	}
+
+	// Nested parens and a CTE are still subqueries.
+	for _, positive := range []string{
+		`DELETE FROM a WHERE id NOT IN ((SELECT x FROM u UNION SELECT y FROM v)) AND id NOT IN (SELECT z FROM w)`,
+		`DELETE FROM a WHERE id NOT IN (WITH z AS (SELECT x FROM u) SELECT x FROM z UNION SELECT y FROM v) AND id NOT IN (SELECT q FROM w)`,
+	} {
+		if hits := doubleNotInSubqueryStatements(positive); len(hits) != 1 {
+			t.Errorf("lint must flag nested/CTE subquery pair, got %d hits for: %s", len(hits), positive)
+		}
+	}
+
+	for name, negative := range map[string]string{
+		"single NOT IN over a UNION (reaper step 5 today)": `DELETE FROM issues WHERE id NOT IN (SELECT d.issue_id FROM dependencies d UNION SELECT d.depends_on_issue_id FROM dependencies d) AND status = 'open'`,
+		"correlated NOT EXISTS rewrite": `SELECT id FROM issues
+WHERE id NOT IN (SELECT d.issue_id FROM dependencies d UNION SELECT d.depends_on_issue_id FROM dependencies d)
+AND NOT EXISTS (SELECT 1 FROM labels od WHERE od.issue_id = issues.id AND od.label = 'operator-directive')`,
+		"literal NOT IN list paired with one subquery": `DELETE FROM wisps WHERE issue_type NOT IN ('message') AND id NOT IN (SELECT depends_on_wisp_id FROM dependencies)`,
+		"two statements split by ';'":                  `DELETE FROM a WHERE id NOT IN (SELECT id FROM b); DELETE FROM c WHERE id NOT IN (SELECT id FROM d) AND x = 1`,
+		// The AND inside the first subquery's own WHERE must not join the
+		// pair: only a top-level AND makes the Dolt 2.2.4 shape.
+		"OR-joined predicates with an AND inside the first subquery": `SELECT id FROM a WHERE id NOT IN (SELECT x FROM u WHERE p = 1 AND q = 2) OR id NOT IN (SELECT y FROM v)`,
+		"one guard per UNION branch":                                 `SELECT id FROM a WHERE id NOT IN (SELECT x FROM u WHERE p = 1 AND q = 2) UNION SELECT id FROM b WHERE id NOT IN (SELECT y FROM v)`,
+		// Consecutive quoted SQL commands in a shell script, no ';' between
+		// them: the closing quote at end of line is the chunk boundary.
+		"adjacent shell-quoted statements": `dolt sql -q "DELETE FROM a WHERE id NOT IN (SELECT id FROM b) AND s = 'open'"
+dolt sql -q "DELETE FROM c WHERE id NOT IN (SELECT id FROM d) AND s = 'open'"`,
+	} {
+		if hits := doubleNotInSubqueryStatements(negative); len(hits) != 0 {
+			t.Errorf("lint flagged %s: %v", name, hits)
+		}
+	}
+}
+
+func TestMaintenanceScriptsHaveNoDoubleNotInSubquery(t *testing.T) {
+	root := filepath.Clean(filepath.Join(exampleDir(), "..", ".."))
+	scanExt := map[string]bool{".sh": true, ".sql": true, ".py": true, ".toml": true}
+	scanned := 0
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if name := d.Name(); name == ".git" || name == "node_modules" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !scanExt[filepath.Ext(path)] {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		scanned++
+		for _, hit := range doubleNotInSubqueryStatements(string(data)) {
+			t.Errorf("%s:%d: statement ANDs two NOT IN (subquery) predicates; Dolt 2.2.4 drops the first NOT when its subquery is a UNION (pl-chi) — rewrite one side as correlated NOT EXISTS: %s", path, hit.line, hit.snippet)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %s: %v", root, err)
+	}
+	if scanned == 0 {
+		t.Fatalf("sweep scanned zero files under %s — the lint is not looking at anything", root)
 	}
 }
 
