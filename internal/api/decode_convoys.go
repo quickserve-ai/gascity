@@ -72,6 +72,9 @@ func beadFromGen(g genclient.Bead) beads.Bead {
 	if g.CloseReason != nil {
 		out.CloseReason = *g.CloseReason
 	}
+	if g.AwaitType != nil {
+		out.AwaitType = *g.AwaitType
+	}
 	if g.Needs != nil {
 		out.Needs = append([]string(nil), *g.Needs...)
 	}
