@@ -357,3 +357,27 @@ func assertSQLiteGraphApplyDep(t *testing.T, deps []Dep, issueID, dependsOnID, d
 	}
 	t.Fatalf("dependencies = %#v, missing %s -> %s (%s)", deps, issueID, dependsOnID, depType)
 }
+
+// ga-knhu61: a graph node's await_type must survive the sqlite staging copy.
+// SQLite applies no create-seam default, so a dropped field lands "" — the
+// pre-ga-knhu61 state this PR exists to eliminate: invisible to every
+// await_type-keyed notifier arm.
+func TestSQLiteStoreApplyGraphPlanPersistsNodeAwaitType(t *testing.T) {
+	store := newSQLiteGraphApplyStore(t, t.TempDir())
+	result, err := store.ApplyGraphPlan(context.Background(), &GraphApplyPlan{
+		Nodes: []GraphApplyNode{
+			{Key: "gate", Title: "gate", Type: "gate", AwaitType: AwaitBead},
+			{Key: "plain", Title: "plain"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ApplyGraphPlan: %v", err)
+	}
+	gate, err := store.Get(result.IDs["gate"])
+	if err != nil {
+		t.Fatalf("Get gate: %v", err)
+	}
+	if gate.AwaitType != AwaitBead {
+		t.Fatalf("gate AwaitType = %q, want %q", gate.AwaitType, AwaitBead)
+	}
+}

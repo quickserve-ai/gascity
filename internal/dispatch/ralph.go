@@ -709,6 +709,7 @@ func appendRalphRetryLegacy(store beads.Store, logicalID string, prevSubject, pr
 		Assignee:    "",
 		Labels:      removeAttemptPoolLabels(prevSubject.Labels),
 		Metadata:    subjectMeta,
+		AwaitType:   prevSubject.AwaitType,
 	})
 	if err != nil {
 		return nil, err
@@ -746,6 +747,7 @@ func appendRalphRetryLegacy(store beads.Store, logicalID string, prevSubject, pr
 			Assignee:    "",
 			Labels:      removeAttemptPoolLabels(old.Labels),
 			Metadata:    meta,
+			AwaitType:   old.AwaitType,
 		})
 		if err != nil {
 			return nil, err
@@ -963,6 +965,7 @@ func buildRalphRetryGraphNode(old beads.Bead, logicalID, oldScopeRef, newScopeRe
 		MetadataRefs:      metadataRefs,
 		ParentKey:         parentKey,
 		ParentID:          parentID,
+		AwaitType:         old.AwaitType,
 	}
 }
 
