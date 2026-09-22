@@ -154,7 +154,7 @@ func (h *RuntimeHandle) Stop(ctx context.Context) (err error) {
 	event := h.beginOperationEvent(ctx, workerOperationStop)
 	defer func() { event.finish(err) }()
 
-	err = h.stopRecorded(runtime.KindUnclassified, "worker RuntimeHandle.Stop")
+	err = h.stopRecorded(runtime.Termination{Kind: runtime.KindUnclassified, Reason: "worker RuntimeHandle.Stop"})
 	return err
 }
 
@@ -163,7 +163,7 @@ func (h *RuntimeHandle) Kill(ctx context.Context) (err error) {
 	event := h.beginOperationEvent(ctx, workerOperationKill)
 	defer func() { event.finish(err) }()
 
-	err = h.stopRecorded(runtime.KindOperatorKill, "worker RuntimeHandle.Kill")
+	err = h.stopRecorded(runtime.Termination{Kind: runtime.KindOperatorKill, Reason: "worker RuntimeHandle.Kill"})
 	return err
 }
 
@@ -173,11 +173,14 @@ func (h *RuntimeHandle) KillWithTermination(ctx context.Context, rec runtime.Ter
 	event := h.beginOperationEvent(ctx, workerOperationKill)
 	defer func() { event.finish(err) }()
 
-	kind, reason := rec.Kind, rec.Reason
-	if !kind.Valid() {
-		kind, reason = runtime.KindOperatorKill, "worker RuntimeHandle.Kill"
+	// The caller's record passes through WHOLE. EventID and RequestedAt in
+	// particular: a retrying caller pins EventID so its attempts dedup, and a
+	// handle that rebuilt the record would mint a fresh id per attempt (Codex,
+	// PR #106 r7). Only an invalid Kind falls back to this handle's default.
+	if !rec.Kind.Valid() {
+		rec.Kind, rec.Reason = runtime.KindOperatorKill, "worker RuntimeHandle.Kill"
 	}
-	err = h.stopRecorded(kind, reason)
+	err = h.stopRecorded(rec)
 	return err
 }
 
@@ -186,20 +189,22 @@ func (h *RuntimeHandle) Close(ctx context.Context) (err error) {
 	event := h.beginOperationEvent(ctx, workerOperationClose)
 	defer func() { event.finish(err) }()
 
-	err = h.stopRecorded(runtime.KindOperatorClose, "worker RuntimeHandle.Close")
+	err = h.stopRecorded(runtime.Termination{Kind: runtime.KindOperatorClose, Reason: "worker RuntimeHandle.Close"})
 	return err
 }
 
-// stopRecorded funnels this handle's three endings through the termination
-// seam. SessionID is deliberately left EMPTY: a runtime-only handle has no
-// bead, and inventing an id — or resolving one by name — would either falsify
-// the record or put a store read on the stop path.
-func (h *RuntimeHandle) stopRecorded(kind runtime.TerminationKind, reason string) error {
-	stopErr, recErr := runtime.StopRecordedDetailed(h.provider, h.sessionName, runtime.Termination{
-		Kind:   kind,
-		Actor:  "worker",
-		Reason: reason,
-	}, h.termSink)
+// stopRecorded funnels this handle's endings through the termination seam.
+// It fills only the defaults a runtime-only handle owns: Actor "worker" when
+// the caller named none. Everything else the caller set is kept. The handle
+// never INVENTS a SessionID: it has no bead, and inventing an id (or resolving
+// one by name) would either falsify the record or put a store read on the stop
+// path. A SessionID the caller already held passes through.
+func (h *RuntimeHandle) stopRecorded(rec runtime.Termination) error {
+	if rec.Actor == "" {
+		rec.Actor = "worker"
+	}
+	kind := rec.Kind
+	stopErr, recErr := runtime.StopRecordedDetailed(h.provider, h.sessionName, rec, h.termSink)
 	// ONLY THE STOP'S OWN FAILURE IS THIS METHOD'S ERROR. Stop/Kill/Close on a
 	// Handle mean "did the session end", and callers branch on that. Returning
 	// a bookkeeping problem here would make a working stop look broken — and

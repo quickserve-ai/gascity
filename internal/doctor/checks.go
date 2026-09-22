@@ -542,6 +542,29 @@ func resolveTerminationSink(ctx *CheckContext, explicit runtime.TerminationSink,
 	return terminationevents.New(rec, "doctor"), func() { _ = rec.Close() }
 }
 
+// stopForCleanup stops one session for a doctor sweep. Only the STOP's failure
+// aborts the sweep. A failed termination record is collected and the sweep goes
+// on, because bookkeeping must never block cleanup: one events.jsonl ENOSPC used
+// to leave every later zombie or orphan untouched (Codex, PR #106 r7). The
+// unacknowledged-recorder sentinel is benign by the seam's own definition and is
+// not collected.
+func stopForCleanup(sp runtime.Provider, name string, rec runtime.Termination, sink runtime.TerminationSink, recFailures *[]error) error {
+	stopErr, recErr := runtime.StopRecordedDetailed(sp, name, rec, sink)
+	if recErr != nil && !terminationevents.IsUnacknowledgedEvent(recErr) {
+		*recFailures = append(*recFailures, fmt.Errorf("%s: %w", name, recErr))
+	}
+	return stopErr
+}
+
+// cleanupRecordError reports a sweep that finished its stops but lost records.
+func cleanupRecordError(what string, recFailures []error) error {
+	if len(recFailures) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s: every stop was attempted, but %d termination record(s) failed: %w",
+		what, len(recFailures), errors.Join(recFailures...))
+}
+
 // CheckOption configures an optional capability on a session check. It is
 // VARIADIC so that adding one does not touch the existing constructor callers —
 // one in cmd/gc and twelve in tests — which is the difference between a wiring
@@ -626,6 +649,7 @@ func (c *ZombieSessionsCheck) Fix(ctx *CheckContext) error {
 	if IsControllerRunning(ctx.CityPath) {
 		return errControllerRunningFixSkipped
 	}
+	var recFailures []error
 	for _, a := range c.cfg.Agents {
 		if a.Suspended || len(a.ProcessNames) == 0 {
 			continue
@@ -635,16 +659,16 @@ func (c *ZombieSessionsCheck) Fix(ctx *CheckContext) error {
 			// Reached only when IsRunning is true but ProcessAlive is false:
 			// the session shell outlived its agent process. A zombie by
 			// definition — nothing could have been asked of it.
-			if err := runtime.StopRecorded(c.sp, sn, runtime.Termination{
+			if err := stopForCleanup(c.sp, sn, runtime.Termination{
 				Kind:   runtime.KindObservedDead,
 				Actor:  "doctor",
 				Reason: "zombie session: shell running, agent process dead",
-			}, termSink); err != nil {
+			}, termSink, &recFailures); err != nil {
 				return fmt.Errorf("killing zombie session %q: %w", sn, err)
 			}
 		}
 	}
-	return nil
+	return cleanupRecordError("killing zombie sessions", recFailures)
 }
 
 // OrphanSessionsCheck finds sessions with the city prefix not in config.
@@ -737,22 +761,23 @@ func (c *OrphanSessionsCheck) Fix(ctx *CheckContext) error {
 		sn := agent.SessionNameFor(c.cityName, a.QualifiedName(), c.sessionTemplate)
 		expected[sn] = true
 	}
+	var recFailures []error
 	for _, s := range running {
 		if !expected[s] {
 			// An orphan is LIVE — it simply is not in config. Killing it is an
 			// operator force-exit of a running session, not an observed death,
 			// so it COUNTS in the ratio's denominator. It is not yet written
 			// anywhere: doctor checks carry no store or recorder.
-			if err := runtime.StopRecorded(c.sp, s, runtime.Termination{
+			if err := stopForCleanup(c.sp, s, runtime.Termination{
 				Kind:   runtime.KindOperatorKill,
 				Actor:  "doctor",
 				Reason: "reaping a session not present in city config",
-			}, termSink); err != nil {
+			}, termSink, &recFailures); err != nil {
 				return fmt.Errorf("killing orphan session %q: %w", s, err)
 			}
 		}
 	}
-	return nil
+	return cleanupRecordError("killing orphan sessions", recFailures)
 }
 
 // --- Data checks ---

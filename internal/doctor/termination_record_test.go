@@ -2,8 +2,10 @@ package doctor
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/agent"
@@ -110,5 +112,43 @@ func TestDoctorRecorderIsDerivedNotInjected(t *testing.T) {
 	// will derive at fix time rather than stay silent.
 	if c := NewZombieSessionsCheck(&config.City{}, "gastown", "", runtime.NewFake()); c.noRecorder {
 		t.Error("a check built with no option must NOT be in refusal mode")
+	}
+}
+
+type failingSink struct{ calls int }
+
+func (f *failingSink) RecordTermination(string, runtime.Termination) error {
+	f.calls++
+	return errors.New("events.jsonl: no space left on device")
+}
+
+// TestCleanupSweepsContinuePastARecordingFailure — Codex, PR #106 r7. A record
+// failure after a SUCCESSFUL stop used to abort the sweep, so one ENOSPC on
+// events.jsonl left every later orphan or zombie running. Every stop must be
+// attempted, and the lost records must still be reported.
+func TestCleanupSweepsContinuePastARecordingFailure(t *testing.T) {
+	sp := runtime.NewFake()
+	for _, n := range []string{"mayor", "orphan-a", "orphan-b"} {
+		if err := sp.Start(context.Background(), n, runtime.Config{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sink := &failingSink{}
+	c := NewOrphanSessionsCheck(&config.City{Agents: []config.Agent{{Name: "mayor"}}}, "test", "", sp, WithTerminationSink(sink))
+	err := c.Fix(&CheckContext{})
+	if sp.IsRunning("orphan-a") || sp.IsRunning("orphan-b") {
+		t.Fatal("a recording failure stopped the sweep: an orphan is still running")
+	}
+	if !sp.IsRunning("mayor") {
+		t.Fatal("the configured session was killed")
+	}
+	if err == nil || !errors.Is(err, runtime.ErrTerminationRecord) {
+		t.Fatalf("Fix() = %v, want the lost records reported as ErrTerminationRecord", err)
+	}
+	if !strings.Contains(err.Error(), "2 termination record(s) failed") {
+		t.Errorf("Fix() = %v, want both lost records counted", err)
+	}
+	if sink.calls != 2 {
+		t.Errorf("sink saw %d records, want 2", sink.calls)
 	}
 }

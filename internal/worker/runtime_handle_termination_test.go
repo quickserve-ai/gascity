@@ -2,8 +2,11 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
+	"time"
 
+	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/runtime/terminationevents"
 )
@@ -100,5 +103,52 @@ func TestRuntimeHandleStopsWhenTheRecorderIsAbsent(t *testing.T) {
 	}
 	if stops != 1 {
 		t.Errorf("provider saw %d Stop calls, want 1 — the stop must not depend on recording", stops)
+	}
+}
+
+// TestRuntimeHandleKillWithTerminationKeepsTheWholeRecord — Codex, PR #106 r7.
+// The handle used to rebuild the record from Kind and Reason alone, so a
+// caller's pinned EventID was replaced on every attempt (breaking the reader's
+// retry dedup) and RequestedAt was lost. Everything the caller set must reach
+// the sink, and only an empty Actor gets the handle's default.
+func TestRuntimeHandleKillWithTerminationKeepsTheWholeRecord(t *testing.T) {
+	rec := &recordingEventRecorder{}
+	h, err := NewRuntimeHandle(RuntimeHandleConfig{
+		Provider: runtime.NewFake(), SessionName: "legacy-target", Recorder: rec,
+	})
+	if err != nil {
+		t.Fatalf("NewRuntimeHandle: %v", err)
+	}
+	req := time.Unix(1700000000, 0).UTC()
+	pinned := runtime.NewTerminationEventID(req)
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := h.KillWithTermination(context.Background(), runtime.Termination{
+			Kind: runtime.KindDrainTimeout, Reason: "idle", RequestedAt: req, EventID: pinned,
+		}); err != nil {
+			t.Fatalf("KillWithTermination: %v", err)
+		}
+	}
+	var seen int
+	for _, ev := range rec.events {
+		if ev.Type != terminationevents.TerminationEventType {
+			continue
+		}
+		seen++
+		var p events.SessionTerminatedPayload
+		if err := json.Unmarshal(ev.Payload, &p); err != nil {
+			t.Fatalf("payload: %v", err)
+		}
+		if p.EventID != pinned {
+			t.Errorf("event_id = %q, want the caller's %q on every attempt", p.EventID, pinned)
+		}
+		if p.RequestedAt != req.Format(time.RFC3339) {
+			t.Errorf("requested_at = %q, want %q", p.RequestedAt, req.Format(time.RFC3339))
+		}
+		if p.Actor != "worker" || p.Kind != string(runtime.KindDrainTimeout) {
+			t.Errorf("actor/kind = %q/%q, want worker/drain-timeout", p.Actor, p.Kind)
+		}
+	}
+	if seen != 2 {
+		t.Fatalf("saw %d termination events, want 2", seen)
 	}
 }

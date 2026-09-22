@@ -71,7 +71,11 @@ scan() {
 	# Match every .Stop( with a non-empty argument, then SUBTRACT the allowlisted
 	# shapes. The subtraction is what makes a new provider receiver spelling a
 	# violation by default instead of an omission nobody notices.
-	(cd "$dir" && grep -rnE '\.Stop\([^)]' --include='*.go' cmd internal 2>/dev/null) |
+	# `.Stop(` at END OF LINE is matched too: gofmt allows the argument on the
+	# next line, and the same-line-only pattern let a multi-line direct stop
+	# through while reporting clean (Codex, PR #106 r7). Its first line carries
+	# no argument shape, so the allowlist cannot subtract it: flagged by default.
+	(cd "$dir" && grep -rnE '\.Stop\(([^)]|$)' --include='*.go' cmd internal 2>/dev/null) |
 		grep -v '_test\.go:' |
 		grep -vE '^internal/runtime/(termination|fake|seam_adapter|beacon)\.go:' |
 		grep -vE '^internal/runtime/(tmux|subprocess|exec|ssh|k8s|acp|herdr|auto|t3bridge|runtimetest|hybrid|registry|proctable|runtimecontract|runtimecapability|rppcheck)/' |
@@ -98,11 +102,14 @@ func planted() {
 	if err := runtimeProvider.Stop(name); err != nil {
 		_ = err
 	}
+	_ = runtimeProvider.Stop(
+		name,
+	)
 }
 PLANT
 	got=$(scan "$tmp") || { echo "SELF-TEST: scan failed" >&2; exit 2; }
-	if printf '%s' "$got" | grep -q 'cmd/gc/planted.go:4:'; then
-		echo "SELF-TEST PASS: the guard sees a planted direct Provider.Stop call"
+	if printf '%s' "$got" | grep -q 'cmd/gc/planted.go:4:' && printf '%s' "$got" | grep -q 'cmd/gc/planted.go:7:'; then
+		echo "SELF-TEST PASS: the guard sees both planted direct Provider.Stop calls (single-line and multi-line)"
 		exit 0
 	fi
 	echo "SELF-TEST FAIL: the guard did NOT see a planted violation — it is blind, and a 'clean' result from it means nothing" >&2
