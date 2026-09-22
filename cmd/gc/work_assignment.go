@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"strings"
+	"time"
 
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 
@@ -255,8 +256,8 @@ func (w workAssignment) ReleaseWorkBead(item beads.Bead, runTargetFallback strin
 			// and the status swapped, whatever happens to the metadata follow-up
 			// below. Tier 1 only engages for an in_progress bead with no route to
 			// stamp, so the transition and route note are fixed.
-			fmt.Fprintf(audit, "session beads: RELEASED work %s: assignee %q -> \"\", status in_progress -> open, run_target unchanged, path=%s\n", //nolint:errcheck // best-effort audit; the release itself already landed
-				item.ID, item.Assignee, releasePath)
+			fmt.Fprintf(audit, "%s session beads: RELEASED work %s: assignee %q -> \"\", status in_progress -> open, run_target unchanged, path=%s\n", //nolint:errcheck // best-effort audit; the release itself already landed
+				time.Now().UTC().Format(time.RFC3339), item.ID, item.Assignee, releasePath)
 			// If this metadata clear fails the error propagates, but no retry
 			// follows: the bead is already unassigned, so the next tick's
 			// OpenAssignedTo sweep will not see it again. A bead whose SNAPSHOT
@@ -302,8 +303,8 @@ func (w workAssignment) ReleaseWorkBead(item beads.Bead, runTargetFallback strin
 	if stampFallbackRoute {
 		routeNote = "run_target=" + runTargetFallback
 	}
-	fmt.Fprintf(audit, "session beads: RELEASED work %s: assignee %q -> \"\", status %s -> %s, %s, path=%s\n", //nolint:errcheck // best-effort audit; the release itself already landed
-		item.ID, item.Assignee, item.Status, newStatus, routeNote, releasePath)
+	fmt.Fprintf(audit, "%s session beads: RELEASED work %s: assignee %q -> \"\", status %s -> %s, %s, path=%s\n", //nolint:errcheck // best-effort audit; the release itself already landed
+		time.Now().UTC().Format(time.RFC3339), item.ID, item.Assignee, item.Status, newStatus, routeNote, releasePath)
 	return nil
 }
 
