@@ -1407,6 +1407,7 @@ func (s *NativeDoltStore) applyGraphPlanOverCapInTransaction(ctx context.Context
 				Metadata:    metadata,
 				Ephemeral:   ephemeral,
 				NoHistory:   noHistory,
+				AwaitType:   node.AwaitType,
 			}
 			if node.Assignee != "" {
 				if node.AssignAfterCreate {
@@ -3372,6 +3373,7 @@ func nativeIssueFromBead(b Bead) (*beadslib.Issue, error) {
 		Status:      beadslib.Status(status),
 		IssueType:   beadslib.IssueType(issueType),
 		Assignee:    b.Assignee,
+		AwaitType:   b.AwaitType,
 		Sender:      b.From,
 		CreatedAt:   b.CreatedAt,
 		Labels:      append([]string(nil), b.Labels...),
@@ -3438,6 +3440,7 @@ func beadFromNativeIssue(issue *beadslib.Issue) (Bead, error) {
 		Priority:             nativePriorityFromIssue(issue),
 		CreatedAt:            issue.CreatedAt,
 		Assignee:             issue.Assignee,
+		AwaitType:            issue.AwaitType,
 		From:                 issue.Sender,
 		Description:          issue.Description,
 		Labels:               append([]string(nil), issue.Labels...),
