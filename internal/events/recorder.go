@@ -276,8 +276,8 @@ func (r *FileRecorder) RecordAck(e Event) error {
 	// in-process callers, so this loop never spins for an in-process peer.
 	// The bounded wait drops the recorder if a dead writer is holding the
 	// lock instead of blocking forever and piling up processes.
-	fd := int(r.file.Fd())
-	if err := lockRecorderFile(fd, r.path); err != nil {
+	fd, err := r.lockActiveLocked()
+	if err != nil {
 		return fmt.Errorf("lock: %w", err)
 	}
 	defer func() {
@@ -314,8 +314,8 @@ func (r *FileRecorder) AppendBatch(batch []Event) (resultErr error) {
 		return nil
 	}
 
-	fd := int(r.file.Fd())
-	if err := lockRecorderFile(fd, r.path); err != nil {
+	fd, err := r.lockActiveLocked()
+	if err != nil {
 		return fmt.Errorf("lock: %w", err)
 	}
 	unlockPending := true
@@ -354,6 +354,48 @@ func (r *FileRecorder) AppendBatch(batch []Event) (resultErr error) {
 		return fmt.Errorf("unlock: %w", err)
 	}
 	return nil
+}
+
+// lockActiveLocked takes the cross-process lock on the file that is CURRENTLY
+// at r.path and returns its fd. A recorder opened before another process
+// rotated the log still holds the renamed inode: locking that and appending
+// would put the row into a file the compressor is reading, outside the
+// archive's advertised sequence window (Codex, PR #111 r3). So after the lock
+// is held, the fd is checked against the path, and on a mismatch the recorder
+// reopens the path and locks again. Rotation holds the same lock across its
+// rename (rotateLocked), so a writer can never pass this check on the old
+// inode and then have it renamed under its write. Caller holds r.mu.
+func (r *FileRecorder) lockActiveLocked() (int, error) {
+	const attempts = 3
+	for i := 0; i < attempts; i++ {
+		fd := int(r.file.Fd())
+		if err := lockRecorderFile(fd, r.path); err != nil {
+			return 0, err
+		}
+		held, herr := r.file.Stat()
+		cur, cerr := os.Stat(r.path)
+		if herr == nil && cerr == nil && os.SameFile(held, cur) {
+			return fd, nil
+		}
+		if herr != nil {
+			_ = syscall.Flock(fd, syscall.LOCK_UN)
+			return 0, fmt.Errorf("stat locked active log: %w", herr)
+		}
+		if cerr != nil && !os.IsNotExist(cerr) {
+			_ = syscall.Flock(fd, syscall.LOCK_UN)
+			return 0, fmt.Errorf("stat active log path: %w", cerr)
+		}
+		// Rotated away (or mid-rotation, path not yet recreated): follow it.
+		_ = syscall.Flock(fd, syscall.LOCK_UN)
+		newF, err := os.OpenFile(r.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			return 0, fmt.Errorf("reopening rotated active log: %w", err)
+		}
+		old := r.file
+		r.file = newF
+		_ = old.Close()
+	}
+	return 0, fmt.Errorf("active log at %s moved %d times under the lock", r.path, attempts)
 }
 
 func lockRecorderFile(fd int, path string) error {
@@ -523,8 +565,19 @@ func (r *FileRecorder) rotateLocked() (RotationResult, error) {
 		return RotationResult{Rotated: false, Reason: "active log is empty"}, nil
 	}
 
+	// HOLD THE APPEND LOCK ACROSS THE RENAME (Codex, PR #111 r3). Without it,
+	// a transient writer in another process could append to this inode after
+	// the seq window below was read and after the rename, landing a row the
+	// archive does not advertise. With it, in-flight appends finish first, and
+	// later ones find the path moved (lockActiveLocked) and follow it. Closing
+	// the fd after the rename releases the lock.
+	lockFd, err := r.lockActiveLocked()
+	if err != nil {
+		return RotationResult{}, fmt.Errorf("locking active log for rotation: %w", err)
+	}
 	first, last, err := readSeqWindow(r.path)
 	if err != nil {
+		_ = syscall.Flock(lockFd, syscall.LOCK_UN)
 		return RotationResult{}, fmt.Errorf("reading seq window: %w", err)
 	}
 
@@ -534,26 +587,24 @@ func (r *FileRecorder) rotateLocked() (RotationResult, error) {
 	archivePath := filepath.Join(dir, archiveBase)
 	rotatingPath := filepath.Join(dir, formatRotatingBasename(ts, first, last))
 
-	if err := r.file.Close(); err != nil {
-		return RotationResult{}, fmt.Errorf("closing active log: %w", err)
-	}
-	r.file = nil
-
 	if err := os.Rename(r.path, rotatingPath); err != nil {
-		// Try to recover: re-open the original path. If that also
-		// fails, mark the recorder closed so subsequent Record calls
-		// drop cleanly instead of dereferencing a nil file under
-		// maybeAutoRotateLocked.
-		if newF, openErr := os.OpenFile(r.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); openErr == nil {
-			r.file = newF
-		} else {
-			r.closed = true
-		}
+		// Nothing moved: the still-open file is still the active log.
+		_ = syscall.Flock(lockFd, syscall.LOCK_UN)
 		return RotationResult{}, fmt.Errorf("renaming active log: %w", err)
 	}
 
+	// Closing the renamed file releases the lock; writers waiting on it find
+	// the path moved and follow it to the new active log.
+	old := r.file
+	r.file = nil
+	if err := old.Close(); err != nil {
+		fmt.Fprintf(r.stderr, "events: rotation: closing rotated log: %v\n", err) //nolint:errcheck // best-effort stderr
+	}
 	newFile, err := os.OpenFile(r.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
+		// Mark the recorder closed so subsequent Record calls drop cleanly
+		// instead of dereferencing a nil file under maybeAutoRotateLocked.
+		r.closed = true
 		return RotationResult{}, fmt.Errorf("opening new active log: %w", err)
 	}
 	r.file = newFile
