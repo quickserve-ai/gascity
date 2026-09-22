@@ -214,7 +214,7 @@ func TestRealTwinsGetDistinctEventIDs(t *testing.T) {
 		t.Error("RequestedAt must stay zero (unknown) rather than be backfilled to serve a key")
 	}
 	// Minted in the same millisecond, the ids must still sort in mint order.
-	if !(sink.got[0].EventID < sink.got[1].EventID) {
+	if sink.got[0].EventID >= sink.got[1].EventID {
 		t.Errorf("EventIDs %q, %q are not in mint order", sink.got[0].EventID, sink.got[1].EventID)
 	}
 }
@@ -484,7 +484,7 @@ func TestNewTerminationEventIDEncodesTheTimestamp(t *testing.T) {
 		t.Errorf("timestamp prefix = %q, want 01ARYZ6S41 (the ULID spec vector)", got)
 	}
 	later := NewTerminationEventID(time.UnixMilli(1469918176386))
-	if !(id < later) {
+	if id >= later {
 		t.Errorf("%q !< %q: ids must sort by mint time", id, later)
 	}
 }

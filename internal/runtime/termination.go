@@ -117,9 +117,9 @@ func NewTerminationEventID(t time.Time) string {
 	ms := uint64(t.UnixMilli())
 	eventIDMu.Lock()
 	defer eventIDMu.Unlock()
-	if ms == eventIDLastMs && incrementEntropy(&eventIDEntropy) {
-		// Same millisecond and no overflow: keep the incremented entropy.
-	} else {
+	// Same millisecond: increment the previous entropy. A new millisecond, or an
+	// increment that overflowed, draws fresh entropy instead.
+	if ms != eventIDLastMs || !incrementEntropy(&eventIDEntropy) {
 		if _, err := rand.Read(eventIDEntropy[:]); err != nil {
 			panic(fmt.Sprintf("termination event id: crypto/rand failed: %v", err))
 		}
