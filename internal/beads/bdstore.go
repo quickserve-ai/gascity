@@ -1285,6 +1285,14 @@ func (s *BdStore) CreateWithStorage(b Bead, storage StorageClass) (Bead, error) 
 	if typ == "" {
 		typ = "task"
 	}
+	// KNOWN RESIDUAL (ga-knhu61): b.AwaitType cannot be forwarded — the
+	// fleet bd's create verb has no --await-type flag (only update does), and
+	// a create-then-update would expose a window where a machinery gate reads
+	// "human" and the on-creation notifier fires. So on THIS degraded path a
+	// gate create lands with the seam default ("human"); the notify plane's
+	// machinery-marker exclusions (gc.deferred_type / gc:wait, woodhouse
+	// 2026-09-22) are the guard. Exit path: bd create grows --await-type in
+	// the next fleet tag and this maps it like the update path does.
 	args := []string{"create", "--json", b.Title, "-t", typ}
 	hasStableID := false
 	if id := strings.TrimSpace(b.ID); id != "" {
