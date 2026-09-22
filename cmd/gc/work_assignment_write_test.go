@@ -287,6 +287,11 @@ type auditFailingUpdateStore struct {
 
 var _ beads.ConditionalAssignmentReleaser = (*auditFailingUpdateStore)(nil)
 
+// Pins that the tier-1 audit subtest really exercises tier 1: it relies on
+// MemStore satisfying the conditional-release verb, and if that ever drifted
+// the subtest would silently re-route onto tier 2 and still report green.
+var _ beads.ConditionalAssignmentReleaser = (*beads.MemStore)(nil)
+
 func (s *auditFailingUpdateStore) ReleaseIfCurrent(string, string) (bool, error) {
 	return false, beads.ErrConditionalReleaseUnsupported
 }
