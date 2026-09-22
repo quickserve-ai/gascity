@@ -244,10 +244,19 @@ const (
 	// Emitted by the session reconciler's start-result commit path; the
 	// envelope's Subject carries the session name.
 	SessionColdStartTimeout = "session.cold_start_timeout"
-	ConvoyCreated           = "convoy.created"
-	ConvoyClosed            = "convoy.closed"
-	ControllerStarted       = "controller.started"
-	ControllerStopped       = "controller.stopped"
+	// SessionNudged records one nudge DELIVERED LIVE into a running session:
+	// who it targeted, how, whether it landed, and who claims to have sent it
+	// (provenance only; the sender is honest-reporting and unauthenticated).
+	// Queued nudges already leave a nudge:<id> wisp; before this event a live
+	// delivery, the ordinary case for an idle target, left no target-attributed
+	// record, so "what was injected into session X at time T" could not be
+	// answered (ga-qbc7d2). The payload carries the text's length and SHA-256,
+	// never the text: a known payload can be matched without the log holding it.
+	SessionNudged     = "session.nudged"
+	ConvoyCreated     = "convoy.created"
+	ConvoyClosed      = "convoy.closed"
+	ControllerStarted = "controller.started"
+	ControllerStopped = "controller.stopped"
 	// ControlStalled fires once, when a control bead's bounded semantic-refusal
 	// retry budget expires and the control dispatcher quarantines it. Before
 	// this event the control plane had no control.* vocabulary at all, so a
@@ -461,6 +470,7 @@ var KnownEventTypes = []string{
 	SessionDrainFenceUnavailable,
 	SessionDemandClaimDivergence,
 	SessionColdStartTimeout,
+	SessionNudged,
 	BeadCreated, BeadClosed, BeadDeleted, BeadUpdated,
 	BeadWorktreeReaped, BeadWorktreeReapSkipped,
 	BeadClaimRejected, BeadClaimReleased,

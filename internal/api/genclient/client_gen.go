@@ -3728,6 +3728,21 @@ type SessionMessageSucceededPayload struct {
 	SessionId string `json:"session_id"`
 }
 
+// SessionNudgedPayload defines model for SessionNudgedPayload.
+type SessionNudgedPayload struct {
+	Delivery      string  `json:"delivery"`
+	Error         *string `json:"error,omitempty"`
+	Outcome       string  `json:"outcome"`
+	Sender        *string `json:"sender,omitempty"`
+	SenderSession *string `json:"sender_session,omitempty"`
+	SessionId     *string `json:"session_id,omitempty"`
+	SessionName   *string `json:"session_name,omitempty"`
+	Source        *string `json:"source,omitempty"`
+	TargetAgent   string  `json:"target_agent"`
+	TextBytes     int64   `json:"text_bytes"`
+	TextSha256    string  `json:"text_sha256"`
+}
+
 // SessionPatchBody defines model for SessionPatchBody.
 type SessionPatchBody struct {
 	// Alias Session alias. Empty string clears the alias.
@@ -6668,6 +6683,22 @@ type TypedEventStreamEnvelopeSessionMaxAgeKilled struct {
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
 }
 
+// TypedEventStreamEnvelopeSessionNudged defines model for TypedEventStreamEnvelopeSessionNudged.
+type TypedEventStreamEnvelopeSessionNudged struct {
+	Actor            string                   `json:"actor"`
+	DependsOnStepIds *[]string                `json:"depends_on_step_ids,omitempty"`
+	Message          *string                  `json:"message,omitempty"`
+	Payload          SessionNudgedPayload     `json:"payload"`
+	RunId            *string                  `json:"run_id,omitempty"`
+	Seq              int64                    `json:"seq"`
+	SessionId        *string                  `json:"session_id,omitempty"`
+	StepId           *string                  `json:"step_id,omitempty"`
+	Subject          *string                  `json:"subject,omitempty"`
+	Ts               time.Time                `json:"ts"`
+	Type             string                   `json:"type"`
+	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
+}
+
 // TypedEventStreamEnvelopeSessionQuarantined defines model for TypedEventStreamEnvelopeSessionQuarantined.
 type TypedEventStreamEnvelopeSessionQuarantined struct {
 	Actor            string                   `json:"actor"`
@@ -8373,6 +8404,23 @@ type TypedTaggedEventStreamEnvelopeSessionMaxAgeKilled struct {
 	DependsOnStepIds *[]string                `json:"depends_on_step_ids,omitempty"`
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
+	RunId            *string                  `json:"run_id,omitempty"`
+	Seq              int64                    `json:"seq"`
+	SessionId        *string                  `json:"session_id,omitempty"`
+	StepId           *string                  `json:"step_id,omitempty"`
+	Subject          *string                  `json:"subject,omitempty"`
+	Ts               time.Time                `json:"ts"`
+	Type             string                   `json:"type"`
+	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
+}
+
+// TypedTaggedEventStreamEnvelopeSessionNudged defines model for TypedTaggedEventStreamEnvelopeSessionNudged.
+type TypedTaggedEventStreamEnvelopeSessionNudged struct {
+	Actor            string                   `json:"actor"`
+	City             string                   `json:"city"`
+	DependsOnStepIds *[]string                `json:"depends_on_step_ids,omitempty"`
+	Message          *string                  `json:"message,omitempty"`
+	Payload          SessionNudgedPayload     `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
@@ -11376,6 +11424,32 @@ func (t *EventPayload) FromSessionMessageSucceededPayload(v SessionMessageSuccee
 
 // MergeSessionMessageSucceededPayload performs a merge with any union data inside the EventPayload, using the provided SessionMessageSucceededPayload
 func (t *EventPayload) MergeSessionMessageSucceededPayload(v SessionMessageSucceededPayload) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsSessionNudgedPayload returns the union data inside the EventPayload as a SessionNudgedPayload
+func (t EventPayload) AsSessionNudgedPayload() (SessionNudgedPayload, error) {
+	var body SessionNudgedPayload
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromSessionNudgedPayload overwrites any union data inside the EventPayload as the provided SessionNudgedPayload
+func (t *EventPayload) FromSessionNudgedPayload(v SessionNudgedPayload) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeSessionNudgedPayload performs a merge with any union data inside the EventPayload, using the provided SessionNudgedPayload
+func (t *EventPayload) MergeSessionNudgedPayload(v SessionNudgedPayload) error {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
@@ -15711,6 +15785,34 @@ func (t *TypedEventStreamEnvelope) MergeTypedEventStreamEnvelopeSessionMaxAgeKil
 	return err
 }
 
+// AsTypedEventStreamEnvelopeSessionNudged returns the union data inside the TypedEventStreamEnvelope as a TypedEventStreamEnvelopeSessionNudged
+func (t TypedEventStreamEnvelope) AsTypedEventStreamEnvelopeSessionNudged() (TypedEventStreamEnvelopeSessionNudged, error) {
+	var body TypedEventStreamEnvelopeSessionNudged
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedEventStreamEnvelopeSessionNudged overwrites any union data inside the TypedEventStreamEnvelope as the provided TypedEventStreamEnvelopeSessionNudged
+func (t *TypedEventStreamEnvelope) FromTypedEventStreamEnvelopeSessionNudged(v TypedEventStreamEnvelopeSessionNudged) error {
+	v.Type = "session.nudged"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedEventStreamEnvelopeSessionNudged performs a merge with any union data inside the TypedEventStreamEnvelope, using the provided TypedEventStreamEnvelopeSessionNudged
+func (t *TypedEventStreamEnvelope) MergeTypedEventStreamEnvelopeSessionNudged(v TypedEventStreamEnvelopeSessionNudged) error {
+	v.Type = "session.nudged"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsTypedEventStreamEnvelopeSessionQuarantined returns the union data inside the TypedEventStreamEnvelope as a TypedEventStreamEnvelopeSessionQuarantined
 func (t TypedEventStreamEnvelope) AsTypedEventStreamEnvelopeSessionQuarantined() (TypedEventStreamEnvelopeSessionQuarantined, error) {
 	var body TypedEventStreamEnvelopeSessionQuarantined
@@ -16581,6 +16683,8 @@ func (t TypedEventStreamEnvelope) ValueByDiscriminator() (interface{}, error) {
 		return t.AsTypedEventStreamEnvelopeSessionIdleKilled()
 	case "session.max_age_killed":
 		return t.AsTypedEventStreamEnvelopeSessionMaxAgeKilled()
+	case "session.nudged":
+		return t.AsTypedEventStreamEnvelopeSessionNudged()
 	case "session.quarantined":
 		return t.AsTypedEventStreamEnvelopeSessionQuarantined()
 	case "session.release_deferred":
@@ -18800,6 +18904,34 @@ func (t *TypedTaggedEventStreamEnvelope) MergeTypedTaggedEventStreamEnvelopeSess
 	return err
 }
 
+// AsTypedTaggedEventStreamEnvelopeSessionNudged returns the union data inside the TypedTaggedEventStreamEnvelope as a TypedTaggedEventStreamEnvelopeSessionNudged
+func (t TypedTaggedEventStreamEnvelope) AsTypedTaggedEventStreamEnvelopeSessionNudged() (TypedTaggedEventStreamEnvelopeSessionNudged, error) {
+	var body TypedTaggedEventStreamEnvelopeSessionNudged
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedTaggedEventStreamEnvelopeSessionNudged overwrites any union data inside the TypedTaggedEventStreamEnvelope as the provided TypedTaggedEventStreamEnvelopeSessionNudged
+func (t *TypedTaggedEventStreamEnvelope) FromTypedTaggedEventStreamEnvelopeSessionNudged(v TypedTaggedEventStreamEnvelopeSessionNudged) error {
+	v.Type = "session.nudged"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedTaggedEventStreamEnvelopeSessionNudged performs a merge with any union data inside the TypedTaggedEventStreamEnvelope, using the provided TypedTaggedEventStreamEnvelopeSessionNudged
+func (t *TypedTaggedEventStreamEnvelope) MergeTypedTaggedEventStreamEnvelopeSessionNudged(v TypedTaggedEventStreamEnvelopeSessionNudged) error {
+	v.Type = "session.nudged"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsTypedTaggedEventStreamEnvelopeSessionQuarantined returns the union data inside the TypedTaggedEventStreamEnvelope as a TypedTaggedEventStreamEnvelopeSessionQuarantined
 func (t TypedTaggedEventStreamEnvelope) AsTypedTaggedEventStreamEnvelopeSessionQuarantined() (TypedTaggedEventStreamEnvelopeSessionQuarantined, error) {
 	var body TypedTaggedEventStreamEnvelopeSessionQuarantined
@@ -19670,6 +19802,8 @@ func (t TypedTaggedEventStreamEnvelope) ValueByDiscriminator() (interface{}, err
 		return t.AsTypedTaggedEventStreamEnvelopeSessionIdleKilled()
 	case "session.max_age_killed":
 		return t.AsTypedTaggedEventStreamEnvelopeSessionMaxAgeKilled()
+	case "session.nudged":
+		return t.AsTypedTaggedEventStreamEnvelopeSessionNudged()
 	case "session.quarantined":
 		return t.AsTypedTaggedEventStreamEnvelopeSessionQuarantined()
 	case "session.release_deferred":
