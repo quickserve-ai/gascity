@@ -278,8 +278,16 @@ note_skip() {
 carry_forward() {
     local key="$1" prev
     prev="$(echo "$STATE" | jq -c --arg k "$key" '.[$k] // empty' 2>/dev/null || true)"
-    [ -n "$prev" ] || return 0
-    NEXT_STATE="$(echo "$NEXT_STATE" | jq -c --arg k "$key" --argjson v "$prev" '.[$k] = $v' 2>/dev/null || echo "$NEXT_STATE")"
+    if [ -n "$prev" ]; then
+        NEXT_STATE="$(echo "$NEXT_STATE" | jq -c --arg k "$key" --argjson v "$prev" '.[$k] = $v' 2>/dev/null || echo "$NEXT_STATE")"
+    fi
+    # The cross-store mail latch rides under a companion key; an UNKNOWN read
+    # must preserve it too, or a flapping PR read re-mails an unchanged stall
+    # on every recovery (its own doctrine: a latch may only suppress a repeat).
+    local xkey="silentwork-xstore:$key" xprev
+    xprev="$(echo "$STATE" | jq -c --arg k "$xkey" '.[$k] // empty' 2>/dev/null || true)"
+    [ -n "$xprev" ] || return 0
+    NEXT_STATE="$(echo "$NEXT_STATE" | jq -c --arg k "$xkey" --argjson v "$xprev" '.[$k] = $v' 2>/dev/null || echo "$NEXT_STATE")"
 }
 
 # Episode key — the identity of ONE stall: (bead, PR identity, state). A
@@ -505,11 +513,25 @@ repo_for_scope() {
 
 while IFS= read -r scope; do
     RIG1=""; RIG2=""
-    [ -n "$scope" ] && { RIG1="--rig"; RIG2="$scope"; }
-    SCOPE_LABEL="${scope:-hq}"
+    CP1=""; CP2=""
+    if [ -n "$scope" ]; then
+        RIG1="--rig"; RIG2="$scope"
+    else
+        # The empty scope MUST be pinned too: a bare `gc bd list` is subject to
+        # the same GC_RIG / cwd / bead-prefix store auto-detection the gate
+        # verbs are pinned against, and an unpinned city sweep that lands on a
+        # rig store would hand that rig's beads to the town-local carve-out —
+        # "ours by construction" asserted about the shared store (codex review
+        # finding, 2026-09-22).
+        CP1="--city"; CP2="$CITY_ABS"
+    fi
+    # "@city" cannot collide with a rig name the way "hq" can (a rig named hq
+    # would share the reconciliation partition and the two sweeps would resolve
+    # each other's live gates in a mint/resolve loop — codex review finding).
+    SCOPE_LABEL="${scope:-@city}"
     SCOPE_REPO="$(repo_for_scope "$scope")"
 
-    BEADS_JSON="$(gc bd list ${RIG1:+"$RIG1" "$RIG2"} --limit 0 --json 2>/dev/null)" || {
+    BEADS_JSON="$(gc bd ${CP1:+"$CP1" "$CP2"} list ${RIG1:+"$RIG1" "$RIG2"} --limit 0 --json 2>/dev/null)" || {
         echo "detect-silent-published-work: scope $SCOPE_LABEL: cannot list beads (UNKNOWN, skipped)" >&2
         UNKNOWN=$((UNKNOWN + 1)); continue
     }
@@ -751,7 +773,11 @@ while IFS= read -r scope; do
             # very next write because NEXT_STATE is rebuilt from {}, and state
             # loss costs at most one duplicate mail. It can never suppress a
             # detection, only a repeat of one inside the remind window.
-            XKEY="$EP"
+            # Keyed on (scope, bead) — NOT the full episode — so every UNKNOWN
+            # path can carry it forward knowing only $KEY (a transient PR-read
+            # failure must not erase the latch and re-mail an unchanged stall
+            # on recovery), and a cls flap inside the window stays one mail.
+            XKEY="silentwork-xstore:$KEY"
             xprev="$(echo "$STATE" | jq -c --arg k "$XKEY" '.[$k] // empty' 2>/dev/null || true)"
             xfirst="$NOW_ISO"; xmailed=""
             if [ -n "$xprev" ]; then
