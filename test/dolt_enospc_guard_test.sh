@@ -19,6 +19,9 @@
 #   5. No refusal output contains "--force".
 #   6. Both callers act on the guard's verdict; gc-beads-bd without its sibling
 #      helper fails closed instead of running a second copy of the detector.
+#   7. Nothing that goes wrong inside the guard lets a restart through: an
+#      invalid or overflowing setting, an unmeasurable disk, a NUL byte in the
+#      log, and a here-document the shell cannot write all refuse.
 #
 # Run in CI by TestDoltENOSPCGuardShellHarness (examples/bd/dolt).
 
@@ -49,16 +52,18 @@ unset GC_DOLT_HOST GC_DOLT_DATA_DIR GC_DOLT_LOG_FILE GC_PACK_STATE_DIR GC_CITY_R
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
-# Stub df: reports FAKE_DF_AVAIL_KB available. The mount point carries a space
-# so the harness proves the guard reads the Available column by position from
-# the left. FAKE_DF_AVAIL_KB=fail reproduces a df that cannot measure.
+# Stub df: reports FAKE_DF_AVAIL_KB available. The mount point carries a space,
+# and FAKE_DF_FS can give the filesystem name one too (an SMB share), so the
+# harness proves the guard finds the Available column from the capacity field
+# rather than by a fixed position. FAKE_DF_AVAIL_KB=fail reproduces a df that
+# cannot measure.
 STUB_BIN="$WORK/bin"
 mkdir -p "$STUB_BIN"
 cat > "$STUB_BIN/df" <<'EOF'
 #!/bin/sh
 [ "${FAKE_DF_AVAIL_KB:?}" = fail ] && exit 1
 printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
-printf '/dev/fake 104857600 1000 %s 1%% /Volumes/Fake Disk\n' "$FAKE_DF_AVAIL_KB"
+printf '%s 104857600 1000 %s 1%% /Volumes/Fake Disk\n' "${FAKE_DF_FS:-/dev/fake}" "$FAKE_DF_AVAIL_KB"
 EOF
 chmod +x "$STUB_BIN/df"
 
@@ -123,11 +128,24 @@ LOG_MANY_RECENT=$(write_log many-recent \
     "$(enospc_line "$(stamp "$TEN_MIN_AGO")")" \
     "$(enospc_line "$(stamp "$TEN_MIN_AGO")")")
 LOG_UTC_FRAC=$(write_log utc-frac "$(enospc_line "$(stamp_utc_frac "$TEN_MIN_AGO")")")
+NOW_STAMP=$(stamp "$NOW")
 {
     enospc_line "$(stamp "$TEN_MIN_AGO")"
-    for _ in $(seq 1 1001); do quiet_line "$(stamp "$NOW")"; done
+    for _ in $(seq 1 1001); do quiet_line "$NOW_STAMP"; done
 } > "$WORK/logs/buried.log"
 LOG_BURIED="$WORK/logs/buried.log"
+# A NUL byte makes grep treat the log as binary: GNU grep then hides the lines
+# after it and BSD grep reports one phantom match.
+{
+    enospc_line "$(stamp "$EIGHT_DAYS_AGO")"
+    printf 'time="%s" level=warning msg="torn write \000 recovered"\n' "$NOW_STAMP"
+} > "$WORK/logs/nul-old.log"
+LOG_NUL_OLD="$WORK/logs/nul-old.log"
+{
+    printf 'time="%s" level=warning msg="torn write \000 recovered"\n' "$NOW_STAMP"
+    enospc_line "$(stamp "$TEN_MIN_AGO")"
+} > "$WORK/logs/nul-recent.log"
+LOG_NUL_RECENT="$WORK/logs/nul-recent.log"
 
 # run_guard <log> <avail_kb> [VAR=value...]: the helper alone under POSIX sh.
 # Prints VERDICT=refuse|proceed, then the reason and detail lines.
@@ -229,6 +247,9 @@ EOF
 
 has() { printf '%s' "$1" | grep -qF -- "$2"; }
 
+# rc_is <output> <code>: the exit code a run_restart/run_recover call recorded.
+rc_is() { [ "$(printf '%s\n' "$1" | sed -n 's/^RC=//p')" = "$2" ]; }
+
 # ops_are <output> <ops>: the recorded backend ops, exactly.
 ops_are() { [ "$(printf '%s\n' "$1" | sed -n 's/^OPS=//p' | sed 's/ *$//')" = "$2" ]; }
 # no_ops <output>: nothing reached the backend.
@@ -263,7 +284,8 @@ fi
 # T2: 10-minute-old ENOSPC -> refuse with the count and the stamp.
 out=$(run_guard "$LOG_RECENT" "$HEALTHY_KB")
 if has "$out" "VERDICT=refuse" \
-    && has "$out" "ENOSPC log lines stamped within the last 60 min: 1 (newest $TEN_MIN_STAMP, 10 min ago; oldest $TEN_MIN_STAMP, 10 min ago)" \
+    && has "$out" "ENOSPC log lines stamped within the last 60 min: 1 (newest $TEN_MIN_STAMP, " \
+    && has "$out" "; oldest $TEN_MIN_STAMP, " && has "$out" " min ago)" \
     && has "$out" "live free space: 51200 MB"; then
     pass "T2: ENOSPC line 10 min old -> refuses, prints count, stamp and free space"
 else
@@ -298,7 +320,8 @@ check_no_force T4 "$out"
 # and ignore the 8-day-old line.
 out=$(run_guard "$LOG_MANY_RECENT" "$HEALTHY_KB")
 if has "$out" "VERDICT=refuse" \
-    && has "$out" "within the last 60 min: 3 (newest $TEN_MIN_STAMP, 10 min ago; oldest $TWENTY_MIN_STAMP, 20 min ago)" \
+    && has "$out" "within the last 60 min: 3 (newest $TEN_MIN_STAMP, " \
+    && has "$out" "; oldest $TWENTY_MIN_STAMP, " \
     && ! has "$out" "$OLD_STAMP"; then
     pass "T5: 3 recent ENOSPC lines + 1 stale -> counts 3, newest/oldest correct"
 else
@@ -330,11 +353,13 @@ fi
 
 # T8: an unusable tunable or an unmeasurable disk refuses and says why.
 out=$(run_guard "$LOG_NONE" "$HEALTHY_KB" GC_DOLT_RESTART_MIN_FREE_MB=2G)
-if has "$out" "VERDICT=refuse" && has "$out" "invalid GC_DOLT_RESTART_MIN_FREE_MB=2G"; then
-    pass "T8: invalid GC_DOLT_RESTART_MIN_FREE_MB -> refuses, names the setting"
+if has "$out" "VERDICT=refuse" && has "$out" "invalid GC_DOLT_RESTART_MIN_FREE_MB=2G" \
+    && has "$out" "live free space: 51200 MB"; then
+    pass "T8: invalid GC_DOLT_RESTART_MIN_FREE_MB -> refuses, names it, still reads the disk"
 else
-    fail "T8: invalid tunable -> expected refusal naming it; got: $out"
+    fail "T8: invalid tunable -> expected refusal naming it with the free-space reading; got: $out"
 fi
+check_no_force T8 "$out"
 out=$(run_guard "$LOG_NONE" fail)
 if has "$out" "VERDICT=refuse" && has "$out" "live free space: unmeasurable"; then
     pass "T8: df cannot measure the data volume -> refuses, says unmeasurable"
@@ -359,17 +384,79 @@ else
     fail "T10: absent log -> expected proceed; got: $out"
 fi
 
+# T11: settings too long for shell arithmetic refuse instead of erroring open.
+out=$(run_guard "$LOG_NONE" "$HEALTHY_KB" GC_DOLT_RESTART_MIN_FREE_MB=99999999999999999999)
+if has "$out" "VERDICT=refuse" && has "$out" "invalid GC_DOLT_RESTART_MIN_FREE_MB=99999999999999999999"; then
+    pass "T11: 20-digit GC_DOLT_RESTART_MIN_FREE_MB -> refuses, names the setting"
+else
+    fail "T11: overflowing minimum -> expected refusal; got: $out"
+fi
+check_no_force T11 "$out"
+out=$(run_guard "$LOG_RECENT" "$HEALTHY_KB" GC_DOLT_RESTART_ENOSPC_WINDOW_MIN=300000000000000000)
+if has "$out" "VERDICT=refuse" && has "$out" "invalid GC_DOLT_RESTART_ENOSPC_WINDOW_MIN=300000000000000000" \
+    && has "$out" "live free space: 51200 MB"; then
+    pass "T11: overflowing GC_DOLT_RESTART_ENOSPC_WINDOW_MIN -> refuses, still reads the disk"
+else
+    fail "T11: overflowing window -> expected refusal; got: $out"
+fi
+check_no_force T11 "$out"
+
+# T12: a NUL byte in the log neither hides a recent line nor invents one.
+out=$(run_guard "$LOG_NUL_OLD" "$HEALTHY_KB")
+if has "$out" "VERDICT=proceed"; then
+    pass "T12: NUL byte + only 8-day-old ENOSPC -> proceeds (no phantom match)"
+else
+    fail "T12: NUL byte + stale ENOSPC -> expected proceed; got: $out"
+fi
+out=$(run_guard "$LOG_NUL_RECENT" "$HEALTHY_KB")
+if has "$out" "VERDICT=refuse" && has "$out" "within the last 60 min: 1 (newest $TEN_MIN_STAMP, "; then
+    pass "T12: NUL byte before a 10-min-old ENOSPC -> still refuses on it"
+else
+    fail "T12: NUL byte + recent ENOSPC -> expected refusal; got: $out"
+fi
+
+# T13: a filesystem name with a space does not shift the Available column.
+out=$(run_guard "$LOG_NONE" "$LOW_KB" FAKE_DF_FS="//user@nas/dolt share")
+if has "$out" "VERDICT=refuse" && has "$out" "live free space: 512 MB"; then
+    pass "T13: spaced filesystem name -> reads the Available column correctly"
+else
+    fail "T13: spaced filesystem name -> expected a 512 MB reading; got: $out"
+fi
+
+# T14: a here-document the shell cannot write fails closed. Shells that spool
+# here-documents to a temp file (bash 3.2, macOS /bin/sh) hit the write error;
+# shells that use a pipe read the line and refuse on it. Both must refuse.
+# shellcheck disable=SC2016 # the child sh expands these, not this shell
+out=$(env PATH="$STUB_BIN:$PATH" FAKE_DF_AVAIL_KB="$HEALTHY_KB" \
+    LOG_FILE="$LOG_RECENT" DATA_DIR="$DATA_DIR_FIXTURE" \
+    sh -c '
+        trap "" XFSZ
+        ulimit -f 0
+        . "$1"
+        if recovery_should_skip_due_to_enospc; then
+            echo "VERDICT=refuse"
+        else
+            echo "VERDICT=proceed"
+        fi
+        printf "%s\n" "$ENOSPC_REFUSAL_DETAIL"
+    ' guard "$HELPER" 2>&1) || true
+if has "$out" "VERDICT=refuse"; then
+    pass "T14: here-document write failure -> still refuses"
+else
+    fail "T14: here-document write failure -> expected refusal; got: $out"
+fi
+
 # --- Caller 1: gc dolt restart ---
 
 out=$(run_restart "$LOG_OLD" "$HEALTHY_KB")
-if has "$out" "RC=0" && ops_are "$out" "stop start"; then
+if rc_is "$out" 0 && ops_are "$out" "stop start"; then
     pass "R1: restart with 8-day-old ENOSPC + healthy disk -> stops and starts"
 else
     fail "R1: restart with stale ENOSPC -> expected stop start; got: $out"
 fi
 
 out=$(run_restart "$LOG_RECENT" "$HEALTHY_KB")
-if has "$out" "RC=1" && no_ops "$out" \
+if rc_is "$out" 1 && no_ops "$out" \
     && has "$out" "gc dolt restart: refusing restart: Dolt log shows 1 ENOSPC line(s) stamped within the last 60 min" \
     && has "$out" "newest $TEN_MIN_STAMP" && has "$out" "live free space: 51200 MB"; then
     pass "R2: restart with 10-min-old ENOSPC -> refuses before stop, prints evidence"
@@ -379,7 +466,7 @@ fi
 check_no_force R2 "$out"
 
 out=$(run_restart "$LOG_NONE" "$LOW_KB")
-if has "$out" "RC=1" && no_ops "$out" && has "$out" "live free space: 512 MB"; then
+if rc_is "$out" 1 && no_ops "$out" && has "$out" "live free space: 512 MB"; then
     pass "R3: restart with low disk -> refuses before stop, prints free space"
 else
     fail "R3: restart with low disk -> expected refusal; got: $out"
@@ -387,7 +474,7 @@ fi
 check_no_force R3 "$out"
 
 out=$(run_restart "$LOG_UNPARSEABLE" "$HEALTHY_KB")
-if has "$out" "RC=1" && no_ops "$out" && has "$out" "unparseable timestamp"; then
+if rc_is "$out" 1 && no_ops "$out" && has "$out" "unparseable timestamp"; then
     pass "R4: restart with unparseable ENOSPC stamp -> refuses, says unparseable"
 else
     fail "R4: restart with unparseable stamp -> expected refusal; got: $out"
@@ -395,7 +482,7 @@ fi
 check_no_force R4 "$out"
 
 out=$(run_restart "$LOG_RECENT" "$HEALTHY_KB" --force)
-if has "$out" "RC=0" && ops_are "$out" "stop start" && has "$out" "--force set; restarting despite the ENOSPC guard"; then
+if rc_is "$out" 0 && ops_are "$out" "stop start" && has "$out" "--force set; restarting despite the ENOSPC guard"; then
     pass "R5: restart --force with recent ENOSPC -> operator override still restarts"
 else
     fail "R5: restart --force -> expected stop start; got: $out"
@@ -404,14 +491,14 @@ fi
 # --- Caller 2: gc-beads-bd op_recover (auto-recovery) ---
 
 out=$(run_recover "$LOG_OLD" "$HEALTHY_KB")
-if has "$out" "RC=0" && ops_are "$out" "recover_managed"; then
+if rc_is "$out" 0 && ops_are "$out" "recover_managed"; then
     pass "A1: auto-recovery with 8-day-old ENOSPC + healthy disk -> recovers"
 else
     fail "A1: auto-recovery with stale ENOSPC -> expected recovery; got: $out"
 fi
 
 out=$(run_recover "$LOG_RECENT" "$HEALTHY_KB")
-if has "$out" "RC=1" && no_ops "$out" \
+if rc_is "$out" 1 && no_ops "$out" \
     && has "$out" "skipping dolt recovery: Dolt log shows 1 ENOSPC line(s) stamped within the last 60 min" \
     && has "$out" "newest $TEN_MIN_STAMP" && has "$out" "live free space: 51200 MB" \
     && has "$out" "dolt recovery skipped: ENOSPC guard"; then
@@ -422,7 +509,7 @@ fi
 check_no_force A2 "$out"
 
 out=$(run_recover "$LOG_NONE" "$LOW_KB")
-if has "$out" "RC=1" && no_ops "$out" && has "$out" "live free space: 512 MB"; then
+if rc_is "$out" 1 && no_ops "$out" && has "$out" "live free space: 512 MB"; then
     pass "A3: auto-recovery with low disk -> skipped, prints free space"
 else
     fail "A3: auto-recovery with low disk -> expected skip; got: $out"
@@ -430,7 +517,7 @@ fi
 check_no_force A3 "$out"
 
 out=$(run_recover "$LOG_UNPARSEABLE" "$HEALTHY_KB")
-if has "$out" "RC=1" && no_ops "$out" && has "$out" "unparseable timestamp"; then
+if rc_is "$out" 1 && no_ops "$out" && has "$out" "unparseable timestamp"; then
     pass "A4: auto-recovery with unparseable ENOSPC stamp -> skipped, says unparseable"
 else
     fail "A4: auto-recovery with unparseable stamp -> expected skip; got: $out"
@@ -438,7 +525,7 @@ fi
 check_no_force A4 "$out"
 
 out=$(run_recover "$LOG_OLD" "$HEALTHY_KB" without-helper)
-if has "$out" "RC=1" && no_ops "$out" && has "$out" "ENOSPC guard helper not found"; then
+if rc_is "$out" 1 && no_ops "$out" && has "$out" "ENOSPC guard helper not found"; then
     pass "A5: gc-beads-bd without its sibling helper -> recovery fails closed"
 else
     fail "A5: missing helper -> expected fail-closed skip; got: $out"
