@@ -3,15 +3,18 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/agent"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/materialize"
 	"github.com/gastownhall/gascity/internal/processenv"
 	"github.com/gastownhall/gascity/internal/runtime"
@@ -88,7 +91,43 @@ func workerFactoryWithStaleKeyDetectionWaiter(
 		ResolveSessionRuntime:   workerSessionRuntimeResolverWithConfig(cityPath, cfg),
 		StaleKeyDetectionWaiter: waiter,
 		Pricing:                 cfg.PricingRegistry(),
+		TerminationRecorder:     sharedWorkerEventsRecorder(cityPath),
 	})
+}
+
+// workerEventsRecorders holds ONE events recorder per city for the life of the
+// process. The factory is built per command, and inside the supervisor per API
+// call (the session catalog), so opening a recorder per build would leak a file
+// handle each time. FileRecorder re-reads the latest seq from the file before
+// every write, so sharing one here with the supervisor's own recorder cannot
+// mint duplicate seqs.
+var workerEventsRecorders sync.Map // cityPath -> events.Recorder
+
+// sharedWorkerEventsRecorder is the termination record's local-append sink for
+// the worker factory (Codex, PR #106 r8). Without it every runtime-only handle
+// the CLI resolves wrote its ONLY termination record to events.Discard: a
+// runtime-only target has no bead sink, so those endings were missing from the
+// ratio's denominator despite passing through the seam. It also gives the
+// Manager's endings their second failure domain. Returns nil (no recorder, the
+// old behavior) when there is no city to write into.
+func sharedWorkerEventsRecorder(cityPath string) events.Recorder {
+	if strings.TrimSpace(cityPath) == "" {
+		return nil
+	}
+	if rec, ok := workerEventsRecorders.Load(cityPath); ok {
+		return rec.(events.Recorder)
+	}
+	rec := openCityRecorderAt(cityPath, io.Discard)
+	if rec == events.Discard {
+		return nil
+	}
+	actual, loaded := workerEventsRecorders.LoadOrStore(cityPath, rec)
+	if loaded {
+		if c, ok := rec.(io.Closer); ok {
+			_ = c.Close()
+		}
+	}
+	return actual.(events.Recorder)
 }
 
 func workerSessionRuntimeResolverWithConfig(cityPath string, cfg *config.City) worker.SessionRuntimeResolver {

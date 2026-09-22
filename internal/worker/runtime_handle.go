@@ -28,6 +28,11 @@ type RuntimeHandleConfig struct {
 	Transport    string
 	ProcessNames []string
 	Recorder     events.Recorder
+	// TerminationRecorder, when set, receives ONLY this handle's termination
+	// record. Unlike Recorder it does not switch on worker operation events,
+	// so a caller can make endings countable without changing anything else
+	// the handle emits (Codex, PR #106 r8). Defaults to Recorder.
+	TerminationRecorder events.Recorder
 }
 
 // RuntimeHandle adapts a legacy runtime session name to the canonical worker
@@ -66,6 +71,10 @@ func NewRuntimeHandle(cfg RuntimeHandleConfig) (*RuntimeHandle, error) {
 	if recorder == nil {
 		recorder = events.Discard
 	}
+	termRecorder := cfg.TerminationRecorder
+	if termRecorder == nil {
+		termRecorder = recorder
+	}
 	return &RuntimeHandle{
 		provider:     cfg.Provider,
 		sessionName:  strings.TrimSpace(cfg.SessionName),
@@ -73,7 +82,7 @@ func NewRuntimeHandle(cfg RuntimeHandleConfig) (*RuntimeHandle, error) {
 		transport:    strings.TrimSpace(cfg.Transport),
 		processNames: append([]string(nil), cfg.ProcessNames...),
 		recorder:     recorder,
-		termSink:     terminationevents.New(recorder, "worker"),
+		termSink:     terminationevents.New(termRecorder, "worker"),
 	}, nil
 }
 

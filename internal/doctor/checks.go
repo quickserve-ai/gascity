@@ -524,22 +524,32 @@ type ZombieSessionsCheck struct {
 // DERIVED AT FIX TIME, not at construction, because CheckContext is where
 // CityPath lives and Fix is the only path that ends a session. That also keeps
 // the file handle open for the duration of one fix instead of the process.
-func resolveTerminationSink(ctx *CheckContext, explicit runtime.TerminationSink, noRecorder bool) (runtime.TerminationSink, func()) {
+// resolveTerminationSink returns the sink, its closer, and the error from
+// OPENING it. An open failure is not an opt-out: the caller still cleans up,
+// because a bookkeeping sink must never fail the operation it observes, but
+// it reports the failure afterward so a sweep whose endings went unrecorded
+// does not read as a clean one (Codex, PR #106 r8).
+//
+// THE CLOSER NEVER WAITS. A sink write that outlived TerminationSinkBudget is
+// left running by the seam and holds the FileRecorder's mutex; a synchronous
+// Close would block on that mutex and hang the command past the seam's
+// wall-clock bound. So the close runs in the background and lands after any
+// outstanding write.
+func resolveTerminationSink(ctx *CheckContext, explicit runtime.TerminationSink, noRecorder bool) (runtime.TerminationSink, func(), error) {
 	if noRecorder {
-		return nil, func() {}
+		return nil, func() {}, nil
 	}
 	if explicit != nil {
-		return explicit, func() {}
+		return explicit, func() {}, nil
 	}
 	if ctx == nil || strings.TrimSpace(ctx.CityPath) == "" {
-		return nil, func() {}
+		return nil, func() {}, nil
 	}
 	rec, err := events.NewFileRecorder(filepath.Join(ctx.CityPath, ".gc", "events.jsonl"), io.Discard)
 	if err != nil {
-		// A bookkeeping sink must never fail the operation it observes.
-		return nil, func() {}
+		return nil, func() {}, fmt.Errorf("%w: opening the events recorder: %w", runtime.ErrTerminationRecord, err)
 	}
-	return terminationevents.New(rec, "doctor"), func() { _ = rec.Close() }
+	return terminationevents.New(rec, "doctor"), func() { go func() { _ = rec.Close() }() }, nil
 }
 
 // stopForCleanup stops one session for a doctor sweep. Only the STOP's failure
@@ -644,12 +654,15 @@ func (c *ZombieSessionsCheck) CanFix() bool { return true }
 // (GH#5742): the controller's own health patrol already reconciles zombie
 // sessions, and an uncoordinated Stop here would race it.
 func (c *ZombieSessionsCheck) Fix(ctx *CheckContext) error {
-	termSink, closeSink := resolveTerminationSink(ctx, c.termSink, c.noRecorder)
+	termSink, closeSink, openErr := resolveTerminationSink(ctx, c.termSink, c.noRecorder)
 	defer closeSink()
 	if IsControllerRunning(ctx.CityPath) {
 		return errControllerRunningFixSkipped
 	}
 	var recFailures []error
+	if openErr != nil {
+		recFailures = append(recFailures, openErr)
+	}
 	for _, a := range c.cfg.Agents {
 		if a.Suspended || len(a.ProcessNames) == 0 {
 			continue
@@ -743,7 +756,7 @@ func (c *OrphanSessionsCheck) CanFix() bool { return true }
 // (GH#5742): the controller's own health patrol already reconciles orphan
 // sessions, and an uncoordinated Stop here would race it.
 func (c *OrphanSessionsCheck) Fix(ctx *CheckContext) error {
-	termSink, closeSink := resolveTerminationSink(ctx, c.termSink, c.noRecorder)
+	termSink, closeSink, openErr := resolveTerminationSink(ctx, c.termSink, c.noRecorder)
 	defer closeSink()
 	if IsControllerRunning(ctx.CityPath) {
 		return errControllerRunningFixSkipped
@@ -762,6 +775,9 @@ func (c *OrphanSessionsCheck) Fix(ctx *CheckContext) error {
 		expected[sn] = true
 	}
 	var recFailures []error
+	if openErr != nil {
+		recFailures = append(recFailures, openErr)
+	}
 	for _, s := range running {
 		if !expected[s] {
 			// An orphan is LIVE — it simply is not in config. Killing it is an

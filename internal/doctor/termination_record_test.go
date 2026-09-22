@@ -89,21 +89,24 @@ func TestDoctorRecorderIsDerivedNotInjected(t *testing.T) {
 	ctx := &CheckContext{CityPath: city}
 
 	// No option at all -> a sink is DERIVED.
-	got, closeFn := resolveTerminationSink(ctx, nil, false)
+	got, closeFn, openErr := resolveTerminationSink(ctx, nil, false)
+	if openErr != nil {
+		t.Fatalf("open: %v", openErr)
+	}
 	defer closeFn()
 	if got == nil {
 		t.Error("no option must still yield a derived recorder — that is the whole ruling")
 	}
 
 	// Silence requires saying so.
-	if s, c := resolveTerminationSink(ctx, nil, true); s != nil {
+	if s, c, _ := resolveTerminationSink(ctx, nil, true); s != nil {
 		c()
 		t.Error("WithNoTerminationRecorder must yield silence")
 	}
 
 	// An explicit sink still wins, for tests that want to observe.
 	explicit := &capturingSink{}
-	if s, c := resolveTerminationSink(ctx, explicit, false); s != explicit {
+	if s, c, _ := resolveTerminationSink(ctx, explicit, false); s != explicit {
 		c()
 		t.Error("an explicitly supplied sink must take precedence over the derived one")
 	}
@@ -150,5 +153,31 @@ func TestCleanupSweepsContinuePastARecordingFailure(t *testing.T) {
 	}
 	if sink.calls != 2 {
 		t.Errorf("sink saw %d records, want 2", sink.calls)
+	}
+}
+
+// TestCleanupReportsAnUnopenableRecorderAfterSweeping — Codex, PR #106 r8. An
+// events recorder that cannot be opened used to become a nil sink, so the
+// sweep ran and reported success while every ending went unrecorded. The sweep
+// must still run in full, and the open failure must be reported after it.
+func TestCleanupReportsAnUnopenableRecorderAfterSweeping(t *testing.T) {
+	city := t.TempDir()
+	// A FILE where the .gc directory should be makes the recorder unopenable.
+	if err := os.WriteFile(filepath.Join(city, ".gc"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sp := runtime.NewFake()
+	for _, n := range []string{"mayor", "orphan-a"} {
+		if err := sp.Start(context.Background(), n, runtime.Config{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := NewOrphanSessionsCheck(&config.City{Agents: []config.Agent{{Name: "mayor"}}}, "test", "", sp)
+	err := c.Fix(&CheckContext{CityPath: city})
+	if sp.IsRunning("orphan-a") {
+		t.Fatal("an unopenable recorder stopped the sweep")
+	}
+	if err == nil || !errors.Is(err, runtime.ErrTerminationRecord) {
+		t.Fatalf("Fix() = %v, want the unrecorded sweep reported as ErrTerminationRecord", err)
 	}
 }

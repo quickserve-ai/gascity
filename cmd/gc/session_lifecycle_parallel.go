@@ -2172,12 +2172,19 @@ func startPreparedStartCandidate(
 			recycleBegin := time.Now()
 			// Zombie recycle: the agent process is dead and the comment above
 			// spells out that there is nothing left to preserve.
-			stopErr := runtime.StopRecorded(sp, name, runtime.Termination{
+			// Only the STOP's failure may abort the fresh start. A failed
+			// termination record after a successful stop used to turn a good
+			// recycle into a failed start, delaying the replacement to a later
+			// reconcile (Codex, PR #106 r8). The record failure is logged.
+			stopErr, recErr := runtime.StopRecordedDetailed(sp, name, runtime.Termination{
 				Kind:      runtime.KindObservedDead,
 				Actor:     "reconciler",
 				Reason:    "recycling a session whose agent process is dead",
 				SessionID: item.candidate.info.ID,
 			}, reconcilerTerminationSinks(store, nil)...)
+			if recErr != nil {
+				log.Printf("session %s: zombie recycle stopped the runtime but its termination record failed: %v", name, recErr)
+			}
 			if phases != nil {
 				phases.ZombieRecycle = time.Since(recycleBegin)
 			}
