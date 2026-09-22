@@ -4151,11 +4151,11 @@ func TestDoubleNotInSubqueryLintFlagsKnownPositive(t *testing.T) {
 WHERE id NOT IN (SELECT d.issue_id FROM dependencies d UNION SELECT d.depends_on_issue_id FROM dependencies d)
 AND NOT EXISTS (SELECT 1 FROM labels od WHERE od.issue_id = issues.id AND od.label = 'operator-directive')`,
 		"literal NOT IN list paired with one subquery": `DELETE FROM wisps WHERE issue_type NOT IN ('message') AND id NOT IN (SELECT depends_on_wisp_id FROM dependencies)`,
-		"two statements split by ';'":                   `DELETE FROM a WHERE id NOT IN (SELECT id FROM b); DELETE FROM c WHERE id NOT IN (SELECT id FROM d) AND x = 1`,
+		"two statements split by ';'":                  `DELETE FROM a WHERE id NOT IN (SELECT id FROM b); DELETE FROM c WHERE id NOT IN (SELECT id FROM d) AND x = 1`,
 		// The AND inside the first subquery's own WHERE must not join the
 		// pair: only a top-level AND makes the Dolt 2.2.4 shape.
 		"OR-joined predicates with an AND inside the first subquery": `SELECT id FROM a WHERE id NOT IN (SELECT x FROM u WHERE p = 1 AND q = 2) OR id NOT IN (SELECT y FROM v)`,
-		"one guard per UNION branch": `SELECT id FROM a WHERE id NOT IN (SELECT x FROM u WHERE p = 1 AND q = 2) UNION SELECT id FROM b WHERE id NOT IN (SELECT y FROM v)`,
+		"one guard per UNION branch":                                 `SELECT id FROM a WHERE id NOT IN (SELECT x FROM u WHERE p = 1 AND q = 2) UNION SELECT id FROM b WHERE id NOT IN (SELECT y FROM v)`,
 		// Consecutive quoted SQL commands in a shell script, no ';' between
 		// them: the closing quote at end of line is the chunk boundary.
 		"adjacent shell-quoted statements": `dolt sql -q "DELETE FROM a WHERE id NOT IN (SELECT id FROM b) AND s = 'open'"
