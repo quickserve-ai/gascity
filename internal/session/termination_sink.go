@@ -128,8 +128,10 @@ const (
 // TerminationIntentPatch states the kind a later stop should record.
 func TerminationIntentPatch(kind runtime.TerminationKind, at time.Time) MetadataPatch {
 	return MetadataPatch{
-		TerminationIntentKey:   string(kind),
-		TerminationIntentAtKey: at.UTC().Format(time.RFC3339),
+		TerminationIntentKey: string(kind),
+		// Nanosecond stamp: the stamp is the intent's identity for the pinned
+		// guard's compare-and-set, so two handoffs must never share one.
+		TerminationIntentAtKey: at.UTC().Format(time.RFC3339Nano),
 	}
 }
 
@@ -140,14 +142,21 @@ func ClearTerminationIntentPatch() MetadataPatch {
 }
 
 // ReadTerminationIntent returns the stated kind and the instant it was stated.
-// The second result is false when no intent is present or the kind is not in the
-// closed set — an unknown string must not become a bucket.
+// The third result is false when no intent is present, the kind is not in the
+// closed set (an unknown string must not become a bucket), or the intent has no
+// readable stamp. Every writer stamps it (TerminationIntentPatch); an unstamped
+// intent is one whose stamp was retired (the pinned guard clears only the stamp,
+// by compare-and-set), so it must read as absent.
 func ReadTerminationIntent(rawKind, rawAt string) (runtime.TerminationKind, time.Time, bool) {
 	kind := runtime.TerminationKind(strings.TrimSpace(rawKind))
 	if !kind.Valid() {
 		return "", time.Time{}, false
 	}
-	return kind, parseRFC3339OrZero(rawAt), true
+	at := parseRFC3339OrZero(rawAt)
+	if at.IsZero() {
+		return "", time.Time{}, false
+	}
+	return kind, at, true
 }
 
 // parseRFC3339OrZero degrades an unreadable timestamp to the zero time rather

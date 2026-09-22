@@ -102,3 +102,18 @@ func TestTerminationKeysAreNotLivenessKeys(t *testing.T) {
 		}
 	}
 }
+
+// An intent without a readable stamp is RETIRED, not live: the pinned guard
+// retires an intent by clearing only its stamp, by compare-and-set on the
+// stamp (Codex #106 r12), so it must read as absent.
+func TestReadTerminationIntentRejectsAMissingStamp(t *testing.T) {
+	if _, _, ok := ReadTerminationIntent("handoff", ""); ok {
+		t.Fatal("ReadTerminationIntent(handoff, \"\") ok=true, want false: an unstamped intent is retired")
+	}
+	if _, _, ok := ReadTerminationIntent("handoff", "not-a-time"); ok {
+		t.Fatal("ReadTerminationIntent(handoff, junk) ok=true, want false")
+	}
+	if _, _, ok := ReadTerminationIntent("handoff", "2026-09-22T17:00:00.123456789Z"); !ok {
+		t.Fatal("a nanosecond stamp must read as valid")
+	}
+}

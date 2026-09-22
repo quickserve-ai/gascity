@@ -15,6 +15,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/runtime"
+	sessionpkg "github.com/gastownhall/gascity/internal/session"
 )
 
 type restartRequestTestEnv struct {
@@ -780,11 +781,13 @@ func TestReconcileSessionBeads_PinnedGuardClearsAPairedTerminationIntent(t *test
 	if got.Metadata["restart_requested"] != "" {
 		t.Fatalf("restart_requested = %q, want cleared", got.Metadata["restart_requested"])
 	}
-	if v := got.Metadata["termination.intent"]; v != "" {
-		t.Fatalf("termination.intent = %q after the guard dropped its restart unconsumed, want cleared", v)
-	}
+	// The guard retires the intent by clearing its STAMP, by compare-and-set
+	// (Codex #106 r12); an unstamped intent reads as absent.
 	if v := got.Metadata["termination.intent_at"]; v != "" {
-		t.Fatalf("termination.intent_at = %q, want cleared with the intent", v)
+		t.Fatalf("termination.intent_at = %q after the guard dropped its restart unconsumed, want retired", v)
+	}
+	if _, _, ok := sessionpkg.ReadTerminationIntent(got.Metadata["termination.intent"], got.Metadata["termination.intent_at"]); ok {
+		t.Fatalf("the retired intent still reads as valid: %q / %q", got.Metadata["termination.intent"], got.Metadata["termination.intent_at"])
 	}
 }
 
@@ -947,11 +950,14 @@ func TestReconcileSessionBeads_PinnedGuardDefersWhenHandoffLandsOnACollateralSna
 	}
 }
 
-// TestReconcileSessionBeads_PinnedGuardReArmsWhenHandoffLandsDuringItsClear
+// TestReconcileSessionBeads_PinnedGuardLeavesARequestlessHandoffForTheNextTick
 // covers the interleaving the re-read cannot see: the batch lands after the
-// re-read and before the clear. The clear then removes the handoff's request;
-// the guard's post-clear verify must find the explicit reset and re-arm it.
-func TestReconcileSessionBeads_PinnedGuardReArmsWhenHandoffLandsDuringItsClear(t *testing.T) {
+// re-read and before the clear, so the clear strips the handoff's request. The
+// guard does NOT re-arm in-tick (Codex #106 r12: a re-read or re-arm write can
+// fail, and a generic reset marker is not handoff identity). It leaves the
+// reset and the stamped intent untouched, and the next tick's derivedHandoff
+// backstop restarts the seat from them.
+func TestReconcileSessionBeads_PinnedGuardLeavesARequestlessHandoffForTheNextTick(t *testing.T) {
 	env, sessionName, session, snapshot := pinnedCollateralRequestEnv(t)
 	pinnedGuardAfterReReadHook = func() { landHandoffBatch(t, env, session.ID) }
 	defer func() { pinnedGuardAfterReReadHook = nil }()
@@ -963,24 +969,91 @@ func TestReconcileSessionBeads_PinnedGuardReArmsWhenHandoffLandsDuringItsClear(t
 	if err != nil {
 		t.Fatalf("store.Get(%s): %v", session.ID, err)
 	}
-	if v := got.Metadata["restart_requested"]; v != "true" {
-		t.Fatalf("restart_requested = %q, want re-armed: the reset landed during the clear, and without a request it never restarts the seat", v)
+	if v := got.Metadata["restart_requested"]; v != "" {
+		t.Fatalf("restart_requested = %q; this tick must not re-arm (the backstop owns recovery)", v)
 	}
-	if v := got.Metadata["continuation_reset_pending"]; v != "true" {
-		t.Fatalf("continuation_reset_pending = %q, want the landed reset untouched", v)
+	if got.Metadata["continuation_reset_pending"] != "true" || got.Metadata["termination.intent_at"] == "" {
+		t.Fatalf("reset=%q intent_at=%q: the guard must leave the landed reset and the intent's stamp alone",
+			got.Metadata["continuation_reset_pending"], got.Metadata["termination.intent_at"])
 	}
-	if !strings.Contains(env.stderr.String(), "re-armed restart for pinned named session") {
-		t.Fatalf("stderr = %q, want the re-arm diagnostic", env.stderr.String())
+	if !env.sp.IsRunning(sessionName) {
+		t.Fatal("the guard killed the seat on a stale snapshot")
 	}
 
-	// And the next tick, on fresh state, performs the restart.
 	fresh, err := env.store.Get(session.ID)
 	if err != nil {
 		t.Fatalf("store.Get(%s): %v", session.ID, err)
 	}
 	env.reconcile([]beads.Bead{fresh})
 	if env.sp.IsRunning(sessionName) {
-		t.Fatal("the re-armed handoff did not stop the seat on the next tick")
+		t.Fatal("the next tick did not restart the requestless handoff")
+	}
+	if !strings.Contains(env.stderr.String(), "restarting it as that handoff") {
+		t.Fatalf("stderr = %q, want the derivedHandoff diagnostic", env.stderr.String())
+	}
+}
+
+// TestReconcileSessionBeads_PinnedGuardDoesNotRestartOnANonHandoffReset is Codex
+// #106 r12's first P1: a NON-handoff writer (e.g. stale-resume recovery) sets
+// continuation_reset_pending in the window. With no stamped intent that is not
+// a handoff, and no tick may turn it into a restart of a running seat.
+func TestReconcileSessionBeads_PinnedGuardDoesNotRestartOnANonHandoffReset(t *testing.T) {
+	env, sessionName, session, snapshot := pinnedCollateralRequestEnv(t)
+	pinnedGuardAfterReReadHook = func() {
+		if err := env.store.SetMetadata(session.ID, "continuation_reset_pending", "true"); err != nil {
+			t.Fatalf("SetMetadata: %v", err)
+		}
+	}
+	defer func() { pinnedGuardAfterReReadHook = nil }()
+
+	env.reconcile([]beads.Bead{snapshot})
+	pinnedGuardAfterReReadHook = nil
+
+	fresh, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("store.Get(%s): %v", session.ID, err)
+	}
+	if v := fresh.Metadata["restart_requested"]; v != "" {
+		t.Fatalf("restart_requested = %q: a non-handoff reset must not be turned into a restart request", v)
+	}
+	env.reconcile([]beads.Bead{fresh})
+	if !env.sp.IsRunning(sessionName) {
+		t.Fatal("a generic reset marker with no handoff intent restarted a running pinned seat")
+	}
+}
+
+// TestReconcileSessionBeads_PinnedGuardRetiresOnlyTheIntentItSaw: the snapshot
+// holds a stale intent stamped T0; a handoff's batch lands after the re-read
+// with a new intent stamped T1. The guard's retire is a compare-and-set on the
+// stamp, so T1 survives and the next tick restarts the seat as that handoff.
+func TestReconcileSessionBeads_PinnedGuardRetiresOnlyTheIntentItSaw(t *testing.T) {
+	env, sessionName, session, _ := pinnedCollateralRequestEnv(t)
+	env.setSessionMetadata(&session, map[string]string{
+		"termination.intent":    "handoff",
+		"termination.intent_at": "2026-09-22T03:00:00Z",
+	})
+	snapshot := session
+	snapshot.Metadata = make(map[string]string, len(session.Metadata))
+	for k, v := range session.Metadata {
+		snapshot.Metadata[k] = v
+	}
+	// The re-read must see the OLD state, so the batch lands after it.
+	pinnedGuardAfterReReadHook = func() { landHandoffBatch(t, env, session.ID) }
+	defer func() { pinnedGuardAfterReReadHook = nil }()
+
+	env.reconcile([]beads.Bead{snapshot})
+	pinnedGuardAfterReReadHook = nil
+
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("store.Get(%s): %v", session.ID, err)
+	}
+	if v := got.Metadata["termination.intent_at"]; v != "2026-09-22T17:00:00Z" {
+		t.Fatalf("termination.intent_at = %q, want the NEW handoff's stamp kept (only the snapshot's stamp may be retired)", v)
+	}
+	env.reconcile([]beads.Bead{got})
+	if env.sp.IsRunning(sessionName) {
+		t.Fatal("the next tick did not restart the handoff whose intent survived")
 	}
 }
 
