@@ -3284,11 +3284,16 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					// Clearing anything here would either drop a real handoff from the
 					// numerator (clear the intent) or strand it (clear the request and
 					// flag, so the seat never stops while its intent stays armed).
-					// Scoped to a present intent: the re-read is the rare path's cost,
-					// and without an intent this guard behaves exactly as before.
-					if strings.TrimSpace(infoByID[id].TerminationIntent) != "" && persistedRestartPendingSince(store, id, beadRequested) {
+					// NOT scoped to an intent in the snapshot (Codex #106 r11): the
+					// atomic handoff batch can land on a seat whose snapshot holds only
+					// a collateral request, and clearing that request then strands the
+					// handoff exactly as clearing the intent would.
+					if persistedRestartPendingSince(store, id, beadRequested) {
 						fmt.Fprintf(stderr, "session reconciler: deferring pinned restart guard for %s (bead %s): a restart was persisted after this tick's snapshot\n", name, id) //nolint:errcheck
 						continue
+					}
+					if pinnedGuardAfterReReadHook != nil {
+						pinnedGuardAfterReReadHook()
 					}
 					if tmuxRequested && dops != nil {
 						if err := dops.clearRestartRequested(name); err != nil && !runtime.IsSessionGone(err) {
@@ -3314,6 +3319,24 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						// the fold correctly does not advance past a rejected write —
 						// this entry is not read again this tick (we continue below).
 						tick.applyStore(id, sessFront, skipClear)
+					}
+					// VERIFY AFTER THE CLEAR (Codex #106 r11). The re-read above and
+					// the clears are two steps, and a handoff's batch can land between
+					// them; the store offers no cross-key conditional write to fence
+					// them. This guard never clears continuation_reset_pending, so a
+					// reset that landed at any point is still visible here. If it did
+					// and its request is gone, re-arm the request: next tick sees an
+					// explicit reset and performs the restart, as it would have after
+					// a deferral. Residual, stated: if the snapshot already held a
+					// stale intent, the new handoff's intent may have been cleared with
+					// it, so that restart records as restart-in-place. That is an
+					// undercount of the numerator, never a stranded seat.
+					if landed, err := persistedResetLandedWithoutRequest(store, id); err != nil {
+						fmt.Fprintf(stderr, "session reconciler: re-reading pinned session %s (bead %s) after the restart guard's clear: %v\n", name, id, err) //nolint:errcheck
+					} else if landed {
+						tick.applyStore(id, sessFront, sessionpkg.MetadataPatch{"restart_requested": "true"})
+						fmt.Fprintf(stderr, "session reconciler: re-armed restart for pinned named session %s (bead %s): an explicit reset landed during the restart guard's clear\n", name, id) //nolint:errcheck
+						continue
 					}
 					fmt.Fprintf(stderr, "session reconciler: skipping abrupt restart-requested kill for pinned named session %s (bead %s)\n", name, id) //nolint:errcheck
 					continue
@@ -7726,6 +7749,27 @@ func restartRequestTermination(info sessionpkg.Info) runtime.Termination {
 // A failed read answers false, so the intent is cleared: over-claiming the
 // handoff numerator is worse than missing one ending (the rule this branch
 // applies throughout).
+// pinnedGuardAfterReReadHook, when set by a test, runs in the pinned restart
+// guard between its live re-read and its clears: the window in which a
+// handoff's atomic batch can still land unseen by the re-read.
+var pinnedGuardAfterReReadHook func()
+
+// persistedResetLandedWithoutRequest reports whether the live bead carries an
+// explicit reset whose restart request is gone: the state the pinned guard's
+// clear leaves behind when a handoff's batch landed between its re-read and its
+// write. Neither marker alone restarts a pinned seat, so that state never ends.
+func persistedResetLandedWithoutRequest(store beads.Store, id string) (bool, error) {
+	if store == nil || strings.TrimSpace(id) == "" {
+		return false, nil
+	}
+	b, err := store.Get(id)
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(b.Metadata["continuation_reset_pending"]) == "true" &&
+		strings.TrimSpace(b.Metadata["restart_requested"]) != "true", nil
+}
+
 func persistedRestartPendingSince(store beads.Store, id string, snapshotRequested bool) bool {
 	if store == nil || strings.TrimSpace(id) == "" {
 		return false

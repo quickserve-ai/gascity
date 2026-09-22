@@ -858,6 +858,132 @@ func TestReconcileSessionBeads_PinnedGuardKeepsIntentWhenResetLandsAfterSnapshot
 	}
 }
 
+// pinnedCollateralRequestEnv builds a pinned, running named seat whose bead
+// carries only a COLLATERAL restart request: no intent, no explicit reset. It
+// returns the env, the seat's runtime name, and a snapshot copy of the bead
+// taken before anything else lands.
+func pinnedCollateralRequestEnv(t *testing.T) (*restartRequestTestEnv, string, beads.Bead, beads.Bead) {
+	t.Helper()
+	env := newRestartRequestTestEnv()
+	env.cfg = &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Agents:        []config.Agent{{Name: "worker", StartCommand: "true", MaxActiveSessions: restartRequestTestIntPtr(1)}},
+		NamedSessions: []config.NamedSession{{Template: "worker", Mode: "always"}},
+	}
+	sessionName := config.NamedSessionRuntimeName(env.cfg.Workspace.Name, env.cfg.Workspace, "worker")
+	env.desiredState[sessionName] = TemplateParams{
+		Command:      "true",
+		SessionName:  sessionName,
+		TemplateName: "worker",
+		ResolvedProvider: &config.ResolvedProvider{
+			SessionIDFlag: "--session-id",
+		},
+	}
+	session := env.createSessionBead(sessionName)
+	env.setSessionMetadata(&session, map[string]string{
+		namedSessionMetadataKey:      "true",
+		namedSessionIdentityMetadata: "worker",
+		namedSessionModeMetadata:     "always",
+		"state":                      "active",
+		"pin_awake":                  "true",
+		"restart_requested":          "true",
+	})
+	snapshot := session
+	snapshot.Metadata = make(map[string]string, len(session.Metadata))
+	for k, v := range session.Metadata {
+		snapshot.Metadata[k] = v
+	}
+	if err := env.sp.Start(context.Background(), sessionName, runtime.Config{Command: "true"}); err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	if err := env.sp.SetMeta(sessionName, "GC_SESSION_ID", session.ID); err != nil {
+		t.Fatalf("SetMeta(GC_SESSION_ID): %v", err)
+	}
+	return env, sessionName, session, snapshot
+}
+
+// landHandoffBatch writes what RequestFreshRestartWithIntent writes, in one batch.
+func landHandoffBatch(t *testing.T, env *restartRequestTestEnv, id string) {
+	t.Helper()
+	if err := env.store.SetMetadataBatch(id, map[string]string{
+		"restart_requested":          "true",
+		"continuation_reset_pending": "true",
+		"termination.intent":         "handoff",
+		"termination.intent_at":      "2026-09-22T17:00:00Z",
+	}); err != nil {
+		t.Fatalf("landing the handoff batch: %v", err)
+	}
+}
+
+// TestReconcileSessionBeads_PinnedGuardDefersWhenHandoffLandsOnACollateralSnapshot
+// is Codex #106 r11. The snapshot holds a collateral request and NO intent, so
+// the r5 re-read (then scoped to a snapshot intent) was skipped, and the guard
+// cleared the request the handoff's atomic batch had just written. The seat was
+// left with only the reset and the intent, which never restart a pinned seat.
+func TestReconcileSessionBeads_PinnedGuardDefersWhenHandoffLandsOnACollateralSnapshot(t *testing.T) {
+	env, sessionName, session, snapshot := pinnedCollateralRequestEnv(t)
+	landHandoffBatch(t, env, session.ID)
+
+	env.reconcile([]beads.Bead{snapshot})
+
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("store.Get(%s): %v", session.ID, err)
+	}
+	if v := got.Metadata["restart_requested"]; v != "true" {
+		t.Fatalf("restart_requested = %q, want still true: a stale collateral snapshot must not clear a handoff's request", v)
+	}
+	if v := got.Metadata["termination.intent"]; v != "handoff" {
+		t.Fatalf("termination.intent = %q, want handoff kept", v)
+	}
+	if !env.sp.IsRunning(sessionName) {
+		t.Fatal("the guard killed the seat on a stale snapshot; deferring means doing nothing this tick")
+	}
+	// The re-read must catch this BEFORE any clear. The post-clear verify would
+	// repair the request, but only after clearing the runtime flag and the
+	// request; a deferral touches nothing.
+	if stderr := env.stderr.String(); !strings.Contains(stderr, "deferring pinned restart guard") || strings.Contains(stderr, "re-armed restart") {
+		t.Fatalf("stderr = %q, want a deferral before any clear, not a clear-and-re-arm", stderr)
+	}
+}
+
+// TestReconcileSessionBeads_PinnedGuardReArmsWhenHandoffLandsDuringItsClear
+// covers the interleaving the re-read cannot see: the batch lands after the
+// re-read and before the clear. The clear then removes the handoff's request;
+// the guard's post-clear verify must find the explicit reset and re-arm it.
+func TestReconcileSessionBeads_PinnedGuardReArmsWhenHandoffLandsDuringItsClear(t *testing.T) {
+	env, sessionName, session, snapshot := pinnedCollateralRequestEnv(t)
+	pinnedGuardAfterReReadHook = func() { landHandoffBatch(t, env, session.ID) }
+	defer func() { pinnedGuardAfterReReadHook = nil }()
+
+	env.reconcile([]beads.Bead{snapshot})
+	pinnedGuardAfterReReadHook = nil
+
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("store.Get(%s): %v", session.ID, err)
+	}
+	if v := got.Metadata["restart_requested"]; v != "true" {
+		t.Fatalf("restart_requested = %q, want re-armed: the reset landed during the clear, and without a request it never restarts the seat", v)
+	}
+	if v := got.Metadata["continuation_reset_pending"]; v != "true" {
+		t.Fatalf("continuation_reset_pending = %q, want the landed reset untouched", v)
+	}
+	if !strings.Contains(env.stderr.String(), "re-armed restart for pinned named session") {
+		t.Fatalf("stderr = %q, want the re-arm diagnostic", env.stderr.String())
+	}
+
+	// And the next tick, on fresh state, performs the restart.
+	fresh, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("store.Get(%s): %v", session.ID, err)
+	}
+	env.reconcile([]beads.Bead{fresh})
+	if env.sp.IsRunning(sessionName) {
+		t.Fatal("the re-armed handoff did not stop the seat on the next tick")
+	}
+}
+
 func TestReconcileSessionBeads_RestartRequestAllowsExplicitResetForPinnedNamedSession(t *testing.T) {
 	env := newRestartRequestTestEnv()
 	env.cfg = &config.City{
