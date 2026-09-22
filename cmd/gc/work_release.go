@@ -118,7 +118,7 @@ var releaseAuditPaths = map[releaseWhy]string{
 	releaseKilledSeat:     "killed-seat-unexecuted-claim",
 	releaseDrainAck:       "draining-session-unexecuted-claim",
 	releaseCloseCascade:   "closing-session-release",
-	releaseStrandedRepair: "stranded-repair",
+	releaseStrandedRepair: "stranded-pool-worker-repair",
 	releaseOrphan:         "orphan",
 	releaseRetired:        "retired-session-unclaim",
 }
