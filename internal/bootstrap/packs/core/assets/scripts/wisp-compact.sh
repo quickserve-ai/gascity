@@ -27,9 +27,13 @@ __SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 CITY="${GC_CITY:-.}"
 
-# Get all ephemeral beads.
-ALL=$(gc bd list --json --all -n 0 2>/dev/null) || exit 0
-EPHEMERALS=$(echo "$ALL" | jq '[.[] | select(.ephemeral == true)]' 2>/dev/null) || exit 0
+# Get all wisp rows. bd list omits wisps unless --include-infra is passed
+# (measured at bd 1.3.0-rc.2: 0 wisp rows without it, 65k with), and a wisp
+# row carries ephemeral:true OR no_history:true depending on which route
+# created it — never reliably one of them. Selecting on .ephemeral alone
+# over a wispless list is how this order ran as a silent no-op (ga-rogz4o).
+ALL=$(gc bd list --json --all --include-infra -n 0 2>/dev/null) || exit 0
+EPHEMERALS=$(echo "$ALL" | jq '[.[] | select(.ephemeral == true or .no_history == true)]' 2>/dev/null) || exit 0
 
 if [ -z "$EPHEMERALS" ] || [ "$EPHEMERALS" = "[]" ]; then
     exit 0
@@ -42,6 +46,15 @@ SKIPPED=0
 RECHECK_SKIPPED=0
 PROMOTE_FAILED=0
 DELETE_FAILED=0
+DELETE_CAPPED=0
+
+# Per-run delete bound. The selector fix above arms a delete path that had
+# silently selected nothing, against a backlog of ~65k closed wisps; the
+# hourly cadence drains it a bounded slice at a time instead of one storm.
+DELETE_CAP="${GC_WISP_COMPACT_DELETE_CAP:-500}"
+case "$DELETE_CAP" in
+    ''|*[!0-9]*) DELETE_CAP=500 ;;
+esac
 
 # Process each ephemeral bead. Capturing jq output into BEADS first
 # (instead of piping into the loop) preserves the original pipefail
@@ -107,11 +120,15 @@ while IFS= read -r bead; do
     # the age can only have grown, so the TTL verdict still holds; comments
     # do NOT bump updated_at, which is why comment_count is re-checked
     # explicitly rather than inferred from the timestamp.
+    if [ "$DELETED" -ge "$DELETE_CAP" ]; then
+        DELETE_CAPPED=$((DELETE_CAPPED + 1))
+        continue
+    fi
     FRESH=$(gc bd show "$id" --json 2>/dev/null) || FRESH=""
     STILL=$(echo "$FRESH" | jq -r --arg u "$updated_at" '
         (if type == "array" then .[0] else . end) as $b
         | if $b == null then "no"
-          elif $b.ephemeral == true and $b.status == "closed"
+          elif ($b.ephemeral == true or $b.no_history == true) and $b.status == "closed"
                and (($b.comment_count // 0) == 0)
                and ((($b.labels // []) | index("keep")) == null)
                and (($b.updated_at // $b.created_at) == $u)
@@ -128,11 +145,14 @@ while IFS= read -r bead; do
     fi
 done <<< "$BEADS"
 
-TOTAL=$((PROMOTED + DELETED + RECHECK_SKIPPED + PROMOTE_FAILED + DELETE_FAILED))
+TOTAL=$((PROMOTED + DELETED + RECHECK_SKIPPED + PROMOTE_FAILED + DELETE_FAILED + DELETE_CAPPED))
 if [ "$TOTAL" -gt 0 ]; then
     SUMMARY="wisp-compact: promoted=$PROMOTED deleted=$DELETED skipped=$SKIPPED"
     if [ "$RECHECK_SKIPPED" -gt 0 ]; then
         SUMMARY="$SUMMARY recheck_skipped=$RECHECK_SKIPPED"
+    fi
+    if [ "$DELETE_CAPPED" -gt 0 ]; then
+        SUMMARY="$SUMMARY delete_capped=$DELETE_CAPPED"
     fi
     if [ "$PROMOTE_FAILED" -gt 0 ]; then
         SUMMARY="$SUMMARY promote_failed=$PROMOTE_FAILED"
