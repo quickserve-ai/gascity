@@ -255,8 +255,8 @@ func (w workAssignment) ReleaseWorkBead(item beads.Bead, runTargetFallback strin
 			// and the status swapped, whatever happens to the metadata follow-up
 			// below. Tier 1 only engages for an in_progress bead with no route to
 			// stamp, so the transition and route note are fixed.
-			fmt.Fprintf(audit, "session beads: RELEASED work %s: assignee %q -> \"\", status in_progress -> open, run_target unchanged, path=%s\n",
-				item.ID, item.Assignee, releasePath) //nolint:errcheck
+			fmt.Fprintf(audit, "session beads: RELEASED work %s: assignee %q -> \"\", status in_progress -> open, run_target unchanged, path=%s\n", //nolint:errcheck // best-effort audit; the release itself already landed
+				item.ID, item.Assignee, releasePath)
 			// If this metadata clear fails the error propagates, but no retry
 			// follows: the bead is already unassigned, so the next tick's
 			// OpenAssignedTo sweep will not see it again. A bead whose SNAPSHOT
@@ -302,8 +302,8 @@ func (w workAssignment) ReleaseWorkBead(item beads.Bead, runTargetFallback strin
 	if stampFallbackRoute {
 		routeNote = "run_target=" + runTargetFallback
 	}
-	fmt.Fprintf(audit, "session beads: RELEASED work %s: assignee %q -> \"\", status %s -> %s, %s, path=%s\n",
-		item.ID, item.Assignee, item.Status, newStatus, routeNote, releasePath) //nolint:errcheck
+	fmt.Fprintf(audit, "session beads: RELEASED work %s: assignee %q -> \"\", status %s -> %s, %s, path=%s\n", //nolint:errcheck // best-effort audit; the release itself already landed
+		item.ID, item.Assignee, item.Status, newStatus, routeNote, releasePath)
 	return nil
 }
 
