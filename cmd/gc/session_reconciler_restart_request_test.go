@@ -847,6 +847,15 @@ func TestReconcileSessionBeads_PinnedGuardKeepsIntentWhenResetLandsAfterSnapshot
 	if v := got.Metadata["termination.intent"]; v != "handoff" {
 		t.Fatalf("termination.intent = %q, want it KEPT: a reset persisted after the snapshot means its restart is still coming", v)
 	}
+	// And the restart itself must survive (Codex #106 r6): clearing the request
+	// while keeping the intent would strand the seat, never stopping, with an
+	// intent armed to relabel some later ending.
+	if v := got.Metadata["restart_requested"]; v != "true" {
+		t.Fatalf("restart_requested = %q, want still true: the guard must touch nothing on a stale snapshot", v)
+	}
+	if !env.sp.IsRunning(sessionName) {
+		t.Fatal("the guard killed the seat; deferring means doing nothing this tick")
+	}
 }
 
 func TestReconcileSessionBeads_RestartRequestAllowsExplicitResetForPinnedNamedSession(t *testing.T) {

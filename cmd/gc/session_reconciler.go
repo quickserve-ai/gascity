@@ -3275,6 +3275,20 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 				// still proceed so planned graceful recycle remains possible.
 				explicitControllerReset := strings.TrimSpace(infoByID[id].ContinuationResetPending) == "true"
 				if runtimeRunning && pinnedConfiguredNamedSessionKillProtected(infoByID[id]) && !explicitControllerReset {
+					// THE SNAPSHOT MAY BE STALE (Codex #106 r5, r6). A pinned handoff
+					// stamps the intent and arms the flag, THEN persists its explicit
+					// reset. If that reset (or a request this snapshot did not hold)
+					// has landed since, this tick's premise, "no explicit reset", is
+					// false: touch NOTHING and let the next tick act on fresh state.
+					// Clearing anything here would either drop a real handoff from the
+					// numerator (clear the intent) or strand it (clear the request and
+					// flag, so the seat never stops while its intent stays armed).
+					// Scoped to a present intent: the re-read is the rare path's cost,
+					// and without an intent this guard behaves exactly as before.
+					if strings.TrimSpace(infoByID[id].TerminationIntent) != "" && persistedRestartPendingSince(store, id, beadRequested) {
+						fmt.Fprintf(stderr, "session reconciler: deferring pinned restart guard for %s (bead %s): a restart was persisted after this tick's snapshot\n", name, id) //nolint:errcheck
+						continue
+					}
 					if tmuxRequested && dops != nil {
 						if err := dops.clearRestartRequested(name); err != nil && !runtime.IsSessionGone(err) {
 							fmt.Fprintf(stderr, "session reconciler: clearing deferred restart-requested marker for pinned named session %s (bead %s): %v\n", name, id, err) //nolint:errcheck
@@ -3289,15 +3303,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					if beadRequested {
 						skipClear["restart_requested"] = ""
 					}
-					// BUT NOT FROM A STALE SNAPSHOT (Codex #106 r5). A pinned handoff
-					// stamps the intent and arms the flag, THEN persists its explicit
-					// reset. A tick that snapshotted in between would clear an intent
-					// whose restart is about to be consumed next tick, dropping a
-					// real handoff from the numerator. Re-read the persisted bead:
-					// if a reset or restart request has landed since, the pairing is
-					// live and the intent stays. This path is rare (pinned seat with
-					// an unconsumed flag), so one read is affordable here.
-					if strings.TrimSpace(infoByID[id].TerminationIntent) != "" && !persistedRestartPendingSince(store, id, beadRequested) {
+					if strings.TrimSpace(infoByID[id].TerminationIntent) != "" {
 						for k, v := range sessionpkg.ClearTerminationIntentPatch() {
 							skipClear[k] = v
 						}
