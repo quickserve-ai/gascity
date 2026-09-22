@@ -49,28 +49,10 @@ func New(rec events.Recorder, actor string) *Sink {
 	return &Sink{rec: rec, actor: actor}
 }
 
-// TerminationEventType is the event type the ratio reads.
-const TerminationEventType = "session.terminated"
-
-// terminationPayload is the event's payload. Field names are snake_case to match
-// the rest of the event log, and every field the ratio needs is present so a
-// reader never has to join back to the bead to bucket a row.
-type terminationPayload struct {
-	Kind        string `json:"kind"`
-	Actor       string `json:"actor,omitempty"`
-	Reason      string `json:"reason,omitempty"`
-	At          string `json:"at"`
-	RequestedAt string `json:"requested_at,omitempty"`
-	SessionName string `json:"session_name"`
-	SessionID   string `json:"session_id,omitempty"`
-	// Numerator/Denominator are written out rather than recomputed by readers.
-	// The bucket rules are a JUDGEMENT (handoff-target reports on its own line;
-	// observed-dead is out of the denominator), and a judgement re-derived
-	// independently by every consumer drifts. Recording the decision makes a
-	// later change to it visible as a change in the data.
-	CountsNumerator   bool `json:"counts_numerator"`
-	CountsDenominator bool `json:"counts_denominator"`
-}
+// TerminationEventType is the event type the ratio reads. It aliases the
+// events package constant so the type is registered once, with its typed
+// payload, where every other event type is (events.KnownEventTypes).
+const TerminationEventType = events.SessionTerminated
 
 // RecordTermination emits the event. It returns an error ONLY when the recorder
 // can tell us the event was dropped.
@@ -91,7 +73,7 @@ func (s *Sink) RecordTermination(sessionName string, t runtime.Termination) erro
 	if at.IsZero() {
 		at = time.Now().UTC()
 	}
-	payload := terminationPayload{
+	payload := events.SessionTerminatedPayload{
 		Kind:              string(t.Kind),
 		Actor:             t.Actor,
 		Reason:            t.Reason,

@@ -4744,6 +4744,19 @@ type SessionSubmitSucceededPayload struct {
 	SessionId string `json:"session_id"`
 }
 
+// SessionTerminatedPayload defines model for SessionTerminatedPayload.
+type SessionTerminatedPayload struct {
+	Actor             *string `json:"actor,omitempty"`
+	At                string  `json:"at"`
+	CountsDenominator bool    `json:"counts_denominator"`
+	CountsNumerator   bool    `json:"counts_numerator"`
+	Kind              string  `json:"kind"`
+	Reason            *string `json:"reason,omitempty"`
+	RequestedAt       *string `json:"requested_at,omitempty"`
+	SessionId         *string `json:"session_id,omitempty"`
+	SessionName       string  `json:"session_name"`
+}
+
 // SessionTranscriptConversationResponse defines model for SessionTranscriptConversationResponse.
 type SessionTranscriptConversationResponse struct {
 	// Format Conversation or text transcript format.
@@ -6764,6 +6777,22 @@ type TypedEventStreamEnvelopeSessionSuspended struct {
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
 }
 
+// TypedEventStreamEnvelopeSessionTerminated defines model for TypedEventStreamEnvelopeSessionTerminated.
+type TypedEventStreamEnvelopeSessionTerminated struct {
+	Actor            string                   `json:"actor"`
+	DependsOnStepIds *[]string                `json:"depends_on_step_ids,omitempty"`
+	Message          *string                  `json:"message,omitempty"`
+	Payload          SessionTerminatedPayload `json:"payload"`
+	RunId            *string                  `json:"run_id,omitempty"`
+	Seq              int64                    `json:"seq"`
+	SessionId        *string                  `json:"session_id,omitempty"`
+	StepId           *string                  `json:"step_id,omitempty"`
+	Subject          *string                  `json:"subject,omitempty"`
+	Ts               time.Time                `json:"ts"`
+	Type             string                   `json:"type"`
+	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
+}
+
 // TypedEventStreamEnvelopeSessionUndrained defines model for TypedEventStreamEnvelopeSessionUndrained.
 type TypedEventStreamEnvelopeSessionUndrained struct {
 	Actor            string                   `json:"actor"`
@@ -8475,6 +8504,23 @@ type TypedTaggedEventStreamEnvelopeSessionSuspended struct {
 	DependsOnStepIds *[]string                `json:"depends_on_step_ids,omitempty"`
 	Message          *string                  `json:"message,omitempty"`
 	Payload          NoPayload                `json:"payload"`
+	RunId            *string                  `json:"run_id,omitempty"`
+	Seq              int64                    `json:"seq"`
+	SessionId        *string                  `json:"session_id,omitempty"`
+	StepId           *string                  `json:"step_id,omitempty"`
+	Subject          *string                  `json:"subject,omitempty"`
+	Ts               time.Time                `json:"ts"`
+	Type             string                   `json:"type"`
+	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
+}
+
+// TypedTaggedEventStreamEnvelopeSessionTerminated defines model for TypedTaggedEventStreamEnvelopeSessionTerminated.
+type TypedTaggedEventStreamEnvelopeSessionTerminated struct {
+	Actor            string                   `json:"actor"`
+	City             string                   `json:"city"`
+	DependsOnStepIds *[]string                `json:"depends_on_step_ids,omitempty"`
+	Message          *string                  `json:"message,omitempty"`
+	Payload          SessionTerminatedPayload `json:"payload"`
 	RunId            *string                  `json:"run_id,omitempty"`
 	Seq              int64                    `json:"seq"`
 	SessionId        *string                  `json:"session_id,omitempty"`
@@ -11480,6 +11526,32 @@ func (t *EventPayload) FromSessionSubmitSucceededPayload(v SessionSubmitSucceede
 
 // MergeSessionSubmitSucceededPayload performs a merge with any union data inside the EventPayload, using the provided SessionSubmitSucceededPayload
 func (t *EventPayload) MergeSessionSubmitSucceededPayload(v SessionSubmitSucceededPayload) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsSessionTerminatedPayload returns the union data inside the EventPayload as a SessionTerminatedPayload
+func (t EventPayload) AsSessionTerminatedPayload() (SessionTerminatedPayload, error) {
+	var body SessionTerminatedPayload
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromSessionTerminatedPayload overwrites any union data inside the EventPayload as the provided SessionTerminatedPayload
+func (t *EventPayload) FromSessionTerminatedPayload(v SessionTerminatedPayload) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeSessionTerminatedPayload performs a merge with any union data inside the EventPayload, using the provided SessionTerminatedPayload
+func (t *EventPayload) MergeSessionTerminatedPayload(v SessionTerminatedPayload) error {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
@@ -15879,6 +15951,34 @@ func (t *TypedEventStreamEnvelope) MergeTypedEventStreamEnvelopeSessionSuspended
 	return err
 }
 
+// AsTypedEventStreamEnvelopeSessionTerminated returns the union data inside the TypedEventStreamEnvelope as a TypedEventStreamEnvelopeSessionTerminated
+func (t TypedEventStreamEnvelope) AsTypedEventStreamEnvelopeSessionTerminated() (TypedEventStreamEnvelopeSessionTerminated, error) {
+	var body TypedEventStreamEnvelopeSessionTerminated
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedEventStreamEnvelopeSessionTerminated overwrites any union data inside the TypedEventStreamEnvelope as the provided TypedEventStreamEnvelopeSessionTerminated
+func (t *TypedEventStreamEnvelope) FromTypedEventStreamEnvelopeSessionTerminated(v TypedEventStreamEnvelopeSessionTerminated) error {
+	v.Type = "session.terminated"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedEventStreamEnvelopeSessionTerminated performs a merge with any union data inside the TypedEventStreamEnvelope, using the provided TypedEventStreamEnvelopeSessionTerminated
+func (t *TypedEventStreamEnvelope) MergeTypedEventStreamEnvelopeSessionTerminated(v TypedEventStreamEnvelopeSessionTerminated) error {
+	v.Type = "session.terminated"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsTypedEventStreamEnvelopeSessionUndrained returns the union data inside the TypedEventStreamEnvelope as a TypedEventStreamEnvelopeSessionUndrained
 func (t TypedEventStreamEnvelope) AsTypedEventStreamEnvelopeSessionUndrained() (TypedEventStreamEnvelopeSessionUndrained, error) {
 	var body TypedEventStreamEnvelopeSessionUndrained
@@ -16593,6 +16693,8 @@ func (t TypedEventStreamEnvelope) ValueByDiscriminator() (interface{}, error) {
 		return t.AsTypedEventStreamEnvelopeSessionStranded()
 	case "session.suspended":
 		return t.AsTypedEventStreamEnvelopeSessionSuspended()
+	case "session.terminated":
+		return t.AsTypedEventStreamEnvelopeSessionTerminated()
 	case "session.undrained":
 		return t.AsTypedEventStreamEnvelopeSessionUndrained()
 	case "session.unknown_state":
@@ -18968,6 +19070,34 @@ func (t *TypedTaggedEventStreamEnvelope) MergeTypedTaggedEventStreamEnvelopeSess
 	return err
 }
 
+// AsTypedTaggedEventStreamEnvelopeSessionTerminated returns the union data inside the TypedTaggedEventStreamEnvelope as a TypedTaggedEventStreamEnvelopeSessionTerminated
+func (t TypedTaggedEventStreamEnvelope) AsTypedTaggedEventStreamEnvelopeSessionTerminated() (TypedTaggedEventStreamEnvelopeSessionTerminated, error) {
+	var body TypedTaggedEventStreamEnvelopeSessionTerminated
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedTaggedEventStreamEnvelopeSessionTerminated overwrites any union data inside the TypedTaggedEventStreamEnvelope as the provided TypedTaggedEventStreamEnvelopeSessionTerminated
+func (t *TypedTaggedEventStreamEnvelope) FromTypedTaggedEventStreamEnvelopeSessionTerminated(v TypedTaggedEventStreamEnvelopeSessionTerminated) error {
+	v.Type = "session.terminated"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedTaggedEventStreamEnvelopeSessionTerminated performs a merge with any union data inside the TypedTaggedEventStreamEnvelope, using the provided TypedTaggedEventStreamEnvelopeSessionTerminated
+func (t *TypedTaggedEventStreamEnvelope) MergeTypedTaggedEventStreamEnvelopeSessionTerminated(v TypedTaggedEventStreamEnvelopeSessionTerminated) error {
+	v.Type = "session.terminated"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsTypedTaggedEventStreamEnvelopeSessionUndrained returns the union data inside the TypedTaggedEventStreamEnvelope as a TypedTaggedEventStreamEnvelopeSessionUndrained
 func (t TypedTaggedEventStreamEnvelope) AsTypedTaggedEventStreamEnvelopeSessionUndrained() (TypedTaggedEventStreamEnvelopeSessionUndrained, error) {
 	var body TypedTaggedEventStreamEnvelopeSessionUndrained
@@ -19682,6 +19812,8 @@ func (t TypedTaggedEventStreamEnvelope) ValueByDiscriminator() (interface{}, err
 		return t.AsTypedTaggedEventStreamEnvelopeSessionStranded()
 	case "session.suspended":
 		return t.AsTypedTaggedEventStreamEnvelopeSessionSuspended()
+	case "session.terminated":
+		return t.AsTypedTaggedEventStreamEnvelopeSessionTerminated()
 	case "session.undrained":
 		return t.AsTypedTaggedEventStreamEnvelopeSessionUndrained()
 	case "session.unknown_state":

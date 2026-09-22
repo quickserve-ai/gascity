@@ -53,7 +53,7 @@ func TestEventSinkWritesEveryRatioFieldWithoutAJoin(t *testing.T) {
 	if ev.Subject != "qcore/worker-3" || ev.SessionID != "ga-abc123" {
 		t.Errorf("subject/session = %q/%q, want qcore/worker-3/ga-abc123", ev.Subject, ev.SessionID)
 	}
-	var p terminationPayload
+	var p events.SessionTerminatedPayload
 	if err := json.Unmarshal(ev.Payload, &p); err != nil {
 		t.Fatalf("payload: %v", err)
 	}

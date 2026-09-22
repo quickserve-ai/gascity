@@ -441,6 +441,13 @@ const (
 	StorageBindingUnconverged   = "storage.binding.unconverged"
 	StorageBindingUncheckable   = "storage.binding.uncheckable"
 	StorageBindingNotConfigured = "storage.binding.not_configured"
+
+	// SessionTerminated records one session ending through the termination
+	// seam: its kind (handoff, drain, operator kill, reconciler recreate, ...),
+	// who ended it and why. It is the corroborating half of the handoff ratio;
+	// the session bead's termination metadata is the source of record. Emitted
+	// by internal/runtime/terminationevents (ga-ksac39).
+	SessionTerminated = "session.terminated"
 )
 
 // KnownEventTypes lists every event-type constant this package defines.
@@ -501,6 +508,7 @@ var KnownEventTypes = []string{
 	StorageBindingConverged, StorageBindingGenesis,
 	StorageBindingUnconverged, StorageBindingUncheckable,
 	StorageBindingNotConfigured,
+	SessionTerminated,
 	// ProviderHealthGateAlert is intentionally omitted from KnownEventTypes.
 	// The event is emitted by the reconciler but its typed SSE payload is not
 	// yet registered in internal/api (the payload registration lives in a
