@@ -119,11 +119,11 @@ type doltServerIdentity struct {
 }
 
 func (c *doltServersCheck) identify(p DoltProcInfo) doltServerIdentity {
-	if cfg := extractConfigPath(p.Argv); cfg != "" {
+	if cfg := trimFlattenedDoltArgs(extractConfigPath(p.Argv)); cfg != "" {
 		return doltServerIdentity{path: cfg, source: "config"}
 	}
 	if dd, ok := argvFlagValue(p.Argv); ok && dd != "" {
-		return doltServerIdentity{path: dd, source: "data-dir"}
+		return doltServerIdentity{path: trimFlattenedDoltArgs(dd), source: "data-dir"}
 	}
 	if cwd, ok := c.cwd(p.PID); ok && cwd != "" {
 		return doltServerIdentity{path: cwd, source: "cwd"}
@@ -159,13 +159,13 @@ func (c *doltServersCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 		switch {
 		case id.path == "":
 			unidentified = append(unidentified, p)
-		case layoutErr == nil && c.servesManagedLayout(p, id, layout):
+		case layoutErr == nil && servesDoltLayout(p, id, layout):
 			managed = append(managed, p)
 		default:
 			root, hq, ok := deepestDoltScopeOwner(id.path, cityScopes)
 			switch {
 			case ok && !hq:
-				key := root + "\x00" + normalizePathForCompare(id.path)
+				key := c.rigStoreKey(root, p, id)
 				rigLocal[key] = append(rigLocal[key], p)
 				rigLocalCount++
 			case ok && hq:
@@ -268,14 +268,32 @@ func (c *doltServersCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 	return r
 }
 
-// servesManagedLayout matches by argv (doltProcMatchesManagedLayout) or, for a
-// server identified only by its working directory, by that directory being
-// the managed data dir — the shape `bd dolt start` produces.
-func (c *doltServersCheck) servesManagedLayout(p DoltProcInfo, id doltServerIdentity, layout managedDoltRuntimeLayout) bool {
+// servesDoltLayout reports whether a server serves the store a layout
+// describes: by argv (doltProcMatchesManagedLayout), or by its identity path —
+// which is already cut free of flattened trailing flags, and which for a
+// `bd dolt start` server is its working directory, the data dir itself.
+func servesDoltLayout(p DoltProcInfo, id doltServerIdentity, layout managedDoltRuntimeLayout) bool {
 	if doltProcMatchesManagedLayout(p, layout) {
 		return true
 	}
-	return id.source == "cwd" && strings.TrimSpace(layout.DataDir) != "" && samePath(id.path, layout.DataDir)
+	switch id.source {
+	case "config":
+		return strings.TrimSpace(layout.ConfigFile) != "" && samePath(id.path, layout.ConfigFile)
+	case "data-dir", "cwd":
+		return strings.TrimSpace(layout.DataDir) != "" && samePath(id.path, layout.DataDir)
+	}
+	return false
+}
+
+// rigStoreKey groups rig-local servers by the store they serve, so a gc-launched
+// server (identified by its config) and a `bd dolt start` server (identified by
+// its cwd) on the same rig store land in ONE group and count as a split-brain.
+// A server that does not serve the rig's own layout keys on its identity path.
+func (c *doltServersCheck) rigStoreKey(root string, p DoltProcInfo, id doltServerIdentity) string {
+	if layout, err := c.layout(root); err == nil && servesDoltLayout(p, id, layout) {
+		return root + "\x00store"
+	}
+	return root + "\x00" + normalizePathForCompare(id.path)
 }
 
 // scopeRigs returns the city (HQ) and its rigs with resolved paths. A nil
@@ -395,16 +413,17 @@ func (c *doltServersCheck) describe(p DoltProcInfo) string {
 		fmt.Fprintf(&b, ", port %s", strings.Join(strs, ","))
 	}
 	if id := c.identify(p); id.path != "" {
-		fmt.Fprintf(&b, ", %s %s", id.source, displayDoltPath(id.path))
+		fmt.Fprintf(&b, ", %s %s", id.source, id.path)
 	}
 	return b.String()
 }
 
-// displayDoltPath cuts a path at the first " -". On hosts without /proc the
-// --config value is recovered from a flat ps command line and can swallow the
-// flags after it (`--config x.yaml -u root -p <password>`); those must never
-// reach doctor output.
-func displayDoltPath(path string) string {
+// trimFlattenedDoltArgs cuts a path at the first " -". On hosts without /proc
+// the --config value is recovered from a flat ps command line and can swallow
+// the flags after it (`--config x.yaml -u root -p <password>`). Cut before
+// classification, not only before display: the tail both defeats a path match
+// against the managed layout and must never reach doctor output.
+func trimFlattenedDoltArgs(path string) string {
 	if i := strings.Index(path, " -"); i >= 0 {
 		return path[:i]
 	}
