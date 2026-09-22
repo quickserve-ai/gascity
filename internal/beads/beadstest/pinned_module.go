@@ -38,7 +38,67 @@ const PinnedBeadsModulePath = "github.com/steveyegge/beads"
 // instead.
 func PinnedBeadsModuleDir(t *testing.T) string {
 	t.Helper()
-	return pinnedBeadsModuleDirOrFatal(t, goModuleCache(t), PinnedBeadsVersion(t))
+	modulePath, version := PinnedBeadsModule(t)
+	return pinnedModuleDirOrFatal(t, goModuleCache(t), modulePath, version)
+}
+
+// PinnedBeadsModule returns the module path and version the build links for
+// the beads dependency: the go.mod require, unless a go.mod replace points the
+// module at another path or version, in which case the replacement — that is
+// the code the test binary links, and the module cache unpacks that one, not
+// the required version. A directory replace (a relative or absolute path) is
+// not a module-cache module and fails here, as it must: the drift check needs
+// the module's own migration directories.
+func PinnedBeadsModule(t *testing.T) (modulePath, version string) {
+	t.Helper()
+	version = PinnedBeadsVersion(t)
+	if rPath, rVersion, ok := pinnedBeadsReplacement(t); ok {
+		if rVersion == "" {
+			t.Fatalf("go.mod replaces %s with the directory %q; the pinned-cursor drift check needs a module-cache module", PinnedBeadsModulePath, rPath)
+		}
+		return rPath, rVersion
+	}
+	return PinnedBeadsModulePath, version
+}
+
+// pinnedBeadsReplacement reads the single-line go.mod replace directive for the
+// beads module, if any: "replace <path> [version] => <newpath> [newversion]",
+// with newversion empty for a directory replacement.
+func pinnedBeadsReplacement(t *testing.T) (newPath, newVersion string, ok bool) {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(RepositoryRoot(t), "go.mod"))
+	if err != nil {
+		t.Fatalf("read go.mod: %v", err)
+	}
+	return parseBeadsReplacement(string(data))
+}
+
+func parseBeadsReplacement(gomod string) (newPath, newVersion string, ok bool) {
+	for _, line := range strings.Split(gomod, "\n") {
+		line = strings.TrimSpace(line)
+		if i := strings.Index(line, "//"); i >= 0 {
+			line = strings.TrimSpace(line[:i])
+		}
+		if !strings.HasPrefix(line, "replace ") {
+			continue
+		}
+		lhs, rhs, found := strings.Cut(strings.TrimPrefix(line, "replace "), "=>")
+		if !found {
+			continue
+		}
+		lf := strings.Fields(lhs)
+		if len(lf) == 0 || lf[0] != PinnedBeadsModulePath {
+			continue
+		}
+		rf := strings.Fields(rhs)
+		switch len(rf) {
+		case 1:
+			return rf[0], "", true
+		case 2:
+			return rf[0], rf[1], true
+		}
+	}
+	return "", "", false
 }
 
 // moduleDirReporter is the subset of *testing.T the seam below uses.
@@ -60,14 +120,19 @@ type moduleDirReporter interface {
 // failure. See PinnedBeadsModuleDir for why it cannot be a skip.
 func pinnedBeadsModuleDirOrFatal(t moduleDirReporter, cache, version string) string {
 	t.Helper()
-	dir, err := pinnedBeadsModuleDir(cache, version)
+	return pinnedModuleDirOrFatal(t, cache, PinnedBeadsModulePath, version)
+}
+
+func pinnedModuleDirOrFatal(t moduleDirReporter, cache, modulePath, version string) string {
+	t.Helper()
+	dir, err := pinnedModuleDir(cache, modulePath, version)
 	if err != nil {
 		t.Fatalf("%v\n"+
 			"The test binary links %s, so the go command resolved it; this resolution did not. "+
 			"Check GOMODCACHE, GOPATH and GOENV (resolved cache: %s), and whether go.mod gained a "+
 			"replace or the build moved to vendor mode — the pinned-cursor drift check cannot run "+
 			"without the module's own migration directories, and it must not pass without running.",
-			err, PinnedBeadsModulePath, cache)
+			err, modulePath, cache)
 	}
 	return dir
 }
@@ -75,7 +140,11 @@ func pinnedBeadsModuleDirOrFatal(t moduleDirReporter, cache, version string) str
 // pinnedBeadsModuleDir is the resolution itself, separated from the test so that
 // the failure path has a test of its own.
 func pinnedBeadsModuleDir(cache, version string) (string, error) {
-	dir := filepath.Join(cache, filepath.FromSlash(PinnedBeadsModulePath)+"@"+version)
+	return pinnedModuleDir(cache, PinnedBeadsModulePath, version)
+}
+
+func pinnedModuleDir(cache, modulePath, version string) (string, error) {
+	dir := filepath.Join(cache, filepath.FromSlash(modulePath)+"@"+version)
 	info, err := os.Stat(dir)
 	switch {
 	case err != nil:
