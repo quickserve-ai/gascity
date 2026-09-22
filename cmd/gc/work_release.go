@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"slices"
 	"strings"
 	"sync"
@@ -108,6 +109,18 @@ var releasePolicies = map[releaseWhy]releasePolicy{
 	releaseOrphan:         {statuses: openOrStarted, lane: laneDirect, pool: true},
 	releaseRetired:        {statuses: openOrStarted, lane: laneCarried, seatRoute: true},
 	releaseLadder:         {statuses: startedOnly, lane: laneCarried, seatRoute: true},
+}
+
+// releaseAuditPaths labels each release path on the audit line a landed
+// release writes (ReleaseWorkBead, ga-9n8hjv), so a successful release is never
+// silent. The orphan paths write through releaseOrphanedPoolAssignment instead.
+var releaseAuditPaths = map[releaseWhy]string{
+	releaseKilledSeat:     "killed-seat-unexecuted-claim",
+	releaseDrainAck:       "draining-session-unexecuted-claim",
+	releaseCloseCascade:   "closing-session-release",
+	releaseStrandedRepair: "stranded-repair",
+	releaseOrphan:         "orphan",
+	releaseRetired:        "retired-session-unclaim",
 }
 
 // Why a claim was kept or failed.
@@ -334,7 +347,7 @@ func releaseListed(claims []seatWorkHit, why releaseWhy, seat releaseSeat, cfg *
 				keep(c, keptMoved)
 				continue
 			}
-		} else if err := workAssignmentForStore(beads.WorkStore{Store: c.store}).ReleaseWorkBead(c.bead, fallback); err != nil {
+		} else if err := workAssignmentForStore(beads.WorkStore{Store: c.store}).ReleaseWorkBead(c.bead, fallback, log.Writer(), releaseAuditPaths[why]); err != nil {
 			out.Failed = append(out.Failed, c)
 			out.Why[c.bead.ID] = err.Error()
 			continue
