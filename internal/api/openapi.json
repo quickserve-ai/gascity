@@ -10986,11 +10986,8 @@
           "at": {
             "type": "string"
           },
-          "counts_denominator": {
-            "type": "boolean"
-          },
-          "counts_numerator": {
-            "type": "boolean"
+          "event_id": {
+            "type": "string"
           },
           "kind": {
             "type": "string"
@@ -11012,8 +11009,7 @@
           "kind",
           "at",
           "session_name",
-          "counts_numerator",
-          "counts_denominator"
+          "event_id"
         ],
         "type": "object"
       },

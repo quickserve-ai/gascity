@@ -4746,15 +4746,14 @@ type SessionSubmitSucceededPayload struct {
 
 // SessionTerminatedPayload defines model for SessionTerminatedPayload.
 type SessionTerminatedPayload struct {
-	Actor             *string `json:"actor,omitempty"`
-	At                string  `json:"at"`
-	CountsDenominator bool    `json:"counts_denominator"`
-	CountsNumerator   bool    `json:"counts_numerator"`
-	Kind              string  `json:"kind"`
-	Reason            *string `json:"reason,omitempty"`
-	RequestedAt       *string `json:"requested_at,omitempty"`
-	SessionId         *string `json:"session_id,omitempty"`
-	SessionName       string  `json:"session_name"`
+	Actor       *string `json:"actor,omitempty"`
+	At          string  `json:"at"`
+	EventId     string  `json:"event_id"`
+	Kind        string  `json:"kind"`
+	Reason      *string `json:"reason,omitempty"`
+	RequestedAt *string `json:"requested_at,omitempty"`
+	SessionId   *string `json:"session_id,omitempty"`
+	SessionName string  `json:"session_name"`
 }
 
 // SessionTranscriptConversationResponse defines model for SessionTranscriptConversationResponse.

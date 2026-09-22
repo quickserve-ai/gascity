@@ -2731,8 +2731,7 @@ export const zSessionSubmitSucceededPayload = z.object({
 export const zSessionTerminatedPayload = z.object({
     actor: z.string().optional(),
     at: z.string(),
-    counts_denominator: z.boolean(),
-    counts_numerator: z.boolean(),
+    event_id: z.string(),
     kind: z.string(),
     reason: z.string().optional(),
     requested_at: z.string().optional(),

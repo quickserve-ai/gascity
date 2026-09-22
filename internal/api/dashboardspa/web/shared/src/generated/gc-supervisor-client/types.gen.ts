@@ -4515,8 +4515,7 @@ export type SessionSubmitSucceededPayload = {
 export type SessionTerminatedPayload = {
     actor?: string;
     at: string;
-    counts_denominator: boolean;
-    counts_numerator: boolean;
+    event_id: string;
     kind: string;
     reason?: string;
     requested_at?: string;
