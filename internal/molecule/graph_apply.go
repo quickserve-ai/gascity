@@ -582,6 +582,7 @@ func recipeStepToGraphNode(step formula.RecipeStep, vars map[string]string, prio
 		From:        b.From,
 		Labels:      slices.Clone(b.Labels),
 		Metadata:    maps.Clone(b.Metadata),
+		AwaitType:   b.AwaitType,
 	}, nil
 }
 
