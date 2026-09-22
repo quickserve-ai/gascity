@@ -434,6 +434,10 @@ func (s *Store) RetryClosedWait(id, nextAttempt string, now time.Time) (WaitInfo
 		Description: wait.Description,
 		Labels:      append([]string(nil), wait.Labels...),
 		Metadata:    meta,
+		// Re-derived, not copied: a wait minted before await_type existed
+		// carries "" (or "human", from the create seam's default), and copying
+		// that forward would page a human for machinery on every retry.
+		AwaitType: waitAwaitType(w.Kind),
 	})
 	if err != nil {
 		return WaitInfo{}, err
