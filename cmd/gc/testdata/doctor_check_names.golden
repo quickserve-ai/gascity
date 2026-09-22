@@ -19,6 +19,7 @@ deprecated-attachment-fields
 nudge-unconfirmed
 dolt-topology
 dolt-drift
+dolt-servers
 config-valid
 legacy-suspended-field
 rollout:beads.conditional_writes
