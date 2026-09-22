@@ -1552,7 +1552,7 @@ func unclaimWorkAssignedToRetiredSessionInfo(
 					// detached: ReleaseWorkBead clears the assignee, resets in_progress
 					// to open, and stamps fallbackRoute run_target only when otherwise
 					// unrouted — identical to the raw retirement path.
-					if err := wa.ReleaseWorkBead(item, fallbackRoute, stderr, "retired-session-sweep"); err != nil {
+					if err := wa.ReleaseWorkBead(item, fallbackRoute, stderr, "stranded-pool-worker-repair"); err != nil {
 						fmt.Fprintf(stderr, "session beads: unclaiming work %s assigned to retired session %s: %v\n", item.ID, retiredSession.ID, err) //nolint:errcheck
 						res.Failed++
 						continue
