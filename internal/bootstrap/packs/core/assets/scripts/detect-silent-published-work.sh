@@ -94,8 +94,9 @@
 #       another town's human.
 #
 #       The roster read obeys this file's own read-failure rule. A failed read
-#       is UNKNOWN, never "not ours" and never "ours": the whole alarm leg is
-#       skipped for the sweep, loudly and non-zero. A ONE-SHOT CONTROL settles
+#       is UNKNOWN, never "not ours" and never "ours": the RIG-scope alarm leg
+#       is skipped for the sweep, loudly and non-zero — the city scope needs no
+#       roster (ours by construction) and keeps alarming and reconciling. A ONE-SHOT CONTROL settles
 #       that before the sweep starts — an identity no roster can contain must
 #       come back `foreign`, and the roster must report more than zero agents,
 #       because a roster resolving ZERO is a config failure wearing a successful
@@ -290,6 +291,19 @@ carry_forward() {
     NEXT_STATE="$(echo "$NEXT_STATE" | jq -c --arg k "$xkey" --argjson v "$xprev" '.[$k] = $v' 2>/dev/null || echo "$NEXT_STATE")"
 }
 
+# Carry ONLY the cross-store mail latch forward. The roster-skip branches write
+# their own fresh clock record before they branch, so a full carry_forward there
+# would revert the clock to the prior sweep; but NEXT_STATE is rebuilt from {}
+# each sweep, so a skip that does not re-write the latch DELETES it — and a
+# flapping roster then turns the 24h latch into a mail-per-sweep flood on
+# recovery (claude review BLOCKER 1, 2026-09-22).
+carry_latch() {
+    local xkey="silentwork-xstore:$1" xprev
+    xprev="$(echo "$STATE" | jq -c --arg k "$xkey" '.[$k] // empty' 2>/dev/null || true)"
+    [ -n "$xprev" ] || return 0
+    NEXT_STATE="$(echo "$NEXT_STATE" | jq -c --arg k "$xkey" --argjson v "$xprev" '.[$k] = $v' 2>/dev/null || echo "$NEXT_STATE")"
+}
+
 # Episode key — the identity of ONE stall: (bead, PR identity, state). A
 # recurrence after resolution is a NEW episode; concurrent sweeps of the same
 # stall converge on one gate.
@@ -442,6 +456,14 @@ subject_roster_verdict() {
         if [ "$verdict" = "local" ] && roster_reason_is_match "$reason"; then printf 'ours'; return 0; fi
         if [ "$verdict" = "unknown" ]; then printf 'unknown'; return 0; fi
     fi
+    case "$verdict" in
+        local|foreign) : ;;
+        *)
+            # Decodable JSON whose verdict is not a contract word is a DEGRADED
+            # READ, not a decision — falling through to "theirs" would count a
+            # fault in the decision bucket (claude review finding 4).
+            printf 'unknown'; return 0 ;;
+    esac
     printf 'theirs'
 }
 
@@ -701,6 +723,7 @@ while IFS= read -r scope; do
             SKIPPED_ROSTER_BLIND=$((SKIPPED_ROSTER_BLIND + 1))
             LIVE_EPISODES="$LIVE_EPISODES$EP
 "
+            carry_latch "$KEY"
             continue
         else
             case "$(subject_roster_verdict "$assignee" "$scope")" in
@@ -713,6 +736,7 @@ while IFS= read -r scope; do
 "
                     UNKNOWN=$((UNKNOWN + 1)); SKIPPED_UNKNOWN=$((SKIPPED_UNKNOWN + 1))
                     note_skip "$bead(${assignee:-<unassigned>}: roster unreadable)"
+                    carry_latch "$KEY"
                     continue ;;
                 *)
                     # NOT THIS CITY'S. No paging artifact, and deliberately NOT
@@ -848,11 +872,16 @@ CANDIDATE_EOF
     # the rig-store gates were all closed during the 2026-09-22 containment and
     # the city store held no silentwork gate at all, verified that day.)
     #
-    # SKIPPED ENTIRELY when the roster could not be read. With the alarm leg off
-    # for the sweep, LIVE_EPISODES is empty for a reason that has nothing to do
-    # with the gates being stale, and resolving them would be a read failure
-    # acting as absence — this file's first rule, applied to its own output.
-    if [ "$ROSTER_OK" -eq 0 ]; then
+    # CITY PASS ONLY. Gates are minted only for city-store subjects, so every
+    # gate key carries the "@city" partition and a rig pass can never match one
+    # — running the (city-wide) gate list once per rig was pure noise, and each
+    # rig-pass read failure inflated UNKNOWN for no information. And the city
+    # pass does NOT need the roster: the town-local carve-out classifies city
+    # candidates and fills LIVE_EPISODES with no roster read, so gating this on
+    # ROSTER_OK disabled auto-resolve for the only scope that has gates — a
+    # persistent probe failure would leak an open human gate per cleared stall,
+    # the 2026-09-22 cleanup reproduced town-locally (claude review BLOCKER 2).
+    if [ -n "$scope" ]; then
         :
     elif ! GATES="$(list_episode_gates)"; then
         UNKNOWN=$((UNKNOWN + 1))
@@ -988,9 +1017,16 @@ fi
 # TOWN LOCALITY (a), COUNTED. A subject-scope narrowing that nobody can see is a
 # fresh instance of the class this detector exists to catch: an alarm leg that
 # has quietly stopped alarming is indistinguishable from a city with no stalled
-# work. So the skips are named and counted every sweep they happen, split by
-# WHY — "not ours" is a decision, "roster unreadable" is a fault, and they call
-# for different operator responses.
+# work. The skips are named and counted, split by WHY — "not ours" is a
+# decision, "roster unreadable" is a fault — and the FAULT shapes always reach
+# the operator because they ride UNKNOWN into the non-zero exit below, whose
+# output the controller retains. BE HONEST ABOUT THE DECISION shape: on a sweep
+# that is otherwise clean this order exits 0 and the controller discards stdout
+# entirely (order stdout is stored nowhere), so the routine "not ours" count is
+# NOT a per-sweep record — reading its steady state means running the order by
+# hand or the ga-hwk3r9 noise review, and any claim stronger than that here
+# would be the very invisibility this comment warns about (claude review
+# finding 5, 2026-09-22).
 if [ "$SKIPPED_TOTAL" -gt 0 ]; then
     echo "detect-silent-published-work: subject scope skipped $SKIPPED_TOTAL candidate(s) past threshold: $SKIPPED_NOTOURS not on this city's roster, $SKIPPED_UNKNOWN with an unreadable identity, $SKIPPED_ROSTER_BLIND with the roster itself unreadable${SKIP_SAMPLE:+ — e.g. $SKIP_SAMPLE}" >&2
 fi
