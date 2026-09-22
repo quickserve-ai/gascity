@@ -32,7 +32,7 @@ func TestSessionNudgedPayloadCarriesNoTextField(t *testing.T) {
 
 	raw, err := json.Marshal(SessionNudgedPayload{
 		TargetAgent: "cheryl", Delivery: "immediate", Outcome: "delivered",
-		TextBytes: 5, TextSHA256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+		ErrorClass: "error", TextBytes: 5, TextSHA256: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
 	})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -46,7 +46,7 @@ func TestSessionNudgedPayloadCarriesNoTextField(t *testing.T) {
 			t.Fatalf("payload JSON is missing %q: %s", key, raw)
 		}
 	}
-	for _, forbidden := range []string{"text", "message", "body", "content"} {
+	for _, forbidden := range []string{"text", "message", "body", "content", "error"} {
 		if _, ok := shape[forbidden]; ok {
 			t.Fatalf("payload JSON carries %q; the nudge text must never be recorded: %s", forbidden, raw)
 		}

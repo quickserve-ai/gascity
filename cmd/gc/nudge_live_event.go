@@ -1,15 +1,18 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"path/filepath"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/runtime"
 )
 
 // Live-nudge outcomes recorded on session.nudged. "not_delivered" is a live
@@ -65,7 +68,7 @@ func recordLiveNudgeEvent(target nudgeTarget, text, delivery, source, outcome st
 		TextSHA256:    hex.EncodeToString(sum[:]),
 	}
 	if deliverErr != nil {
-		payload.Error = deliverErr.Error()
+		payload.ErrorClass = liveNudgeErrorClass(deliverErr)
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -87,5 +90,24 @@ func recordLiveNudgeEvent(target nudgeTarget, text, delivery, source, outcome st
 	})
 	if closer, ok := rec.(io.Closer); ok {
 		_ = closer.Close() //nolint:errcheck // best-effort audit record; the nudge outcome stands
+	}
+}
+
+// liveNudgeErrorClass reduces a delivery error to a bounded code. The raw
+// error is never recorded: the herdr provider, for one, formats its argv, the
+// nudge text included, into returned errors (Codex #111), which would put the
+// body the payload promises to omit into a widely readable log.
+func liveNudgeErrorClass(err error) string {
+	switch {
+	case err == nil:
+		return ""
+	case runtime.IsSessionGone(err):
+		return "session_gone"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	default:
+		return "error"
 	}
 }

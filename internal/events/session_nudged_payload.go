@@ -15,14 +15,18 @@ package events
 //
 // THE TEXT IS NEVER RECORDED. Nudge bodies can carry anything, and the event
 // log is widely readable. TextSHA256 (hex) and TextBytes let an investigator
-// match a KNOWN payload against the log without the log holding it.
+// match a KNOWN payload against the log without the log holding it. For the
+// same reason a failure carries only ErrorClass, never the error text.
 type SessionNudgedPayload struct {
-	TargetAgent   string `json:"target_agent"`
-	SessionID     string `json:"session_id,omitempty"`
-	SessionName   string `json:"session_name,omitempty"`
-	Delivery      string `json:"delivery"`
-	Outcome       string `json:"outcome"`
-	Error         string `json:"error,omitempty"`
+	TargetAgent string `json:"target_agent"`
+	SessionID   string `json:"session_id,omitempty"`
+	SessionName string `json:"session_name,omitempty"`
+	Delivery    string `json:"delivery"`
+	Outcome     string `json:"outcome"`
+	// ErrorClass is a bounded code for a failed attempt (session_gone,
+	// timeout, canceled, error), NEVER the provider's error string: some
+	// providers format their argv, nudge text included, into errors.
+	ErrorClass    string `json:"error_class,omitempty"`
 	Sender        string `json:"sender,omitempty"`
 	SenderSession string `json:"sender_session,omitempty"`
 	Source        string `json:"source,omitempty"`

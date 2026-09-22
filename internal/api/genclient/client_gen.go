@@ -3731,7 +3731,7 @@ type SessionMessageSucceededPayload struct {
 // SessionNudgedPayload defines model for SessionNudgedPayload.
 type SessionNudgedPayload struct {
 	Delivery      string  `json:"delivery"`
-	Error         *string `json:"error,omitempty"`
+	ErrorClass    *string `json:"error_class,omitempty"`
 	Outcome       string  `json:"outcome"`
 	Sender        *string `json:"sender,omitempty"`
 	SenderSession *string `json:"sender_session,omitempty"`

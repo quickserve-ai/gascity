@@ -3288,7 +3288,7 @@ export type SessionMessageSucceededPayload = {
 
 export type SessionNudgedPayload = {
     delivery: string;
-    error?: string;
+    error_class?: string;
     outcome: string;
     sender?: string;
     sender_session?: string;

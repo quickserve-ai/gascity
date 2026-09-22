@@ -7756,7 +7756,7 @@
           "delivery": {
             "type": "string"
           },
-          "error": {
+          "error_class": {
             "type": "string"
           },
           "outcome": {

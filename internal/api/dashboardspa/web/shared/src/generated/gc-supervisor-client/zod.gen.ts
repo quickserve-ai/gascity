@@ -1718,7 +1718,7 @@ export const zSessionMessageSucceededPayload = z.object({
 
 export const zSessionNudgedPayload = z.object({
     delivery: z.string(),
-    error: z.string().optional(),
+    error_class: z.string().optional(),
     outcome: z.string(),
     sender: z.string().optional(),
     sender_session: z.string().optional(),

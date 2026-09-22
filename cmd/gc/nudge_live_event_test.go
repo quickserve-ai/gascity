@@ -30,7 +30,9 @@ func TestLiveNudgeIsFindableByTargetAfterwards(t *testing.T) {
 		wantOutcome string
 	}{
 		{name: "delivered", wantCode: 0, wantOutcome: liveNudgeDelivered},
-		{name: "failed attempt is recorded too", nudgeErr: errors.New("pane gone"), wantCode: 1, wantOutcome: liveNudgeFailed},
+		// The provider error QUOTES the nudge text, as herdr's does: the record
+		// must carry the failure, never the text inside it.
+		{name: "failed attempt is recorded too", nudgeErr: errors.New("agent prompt [check deploy status]: exit 1"), wantCode: 1, wantOutcome: liveNudgeFailed},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("GC_BEADS", "file")
@@ -94,8 +96,8 @@ func TestLiveNudgeIsFindableByTargetAfterwards(t *testing.T) {
 			if p.Sender != "woodhouse" || p.SenderSession != "ga-sender-session" {
 				t.Errorf("sender = %q/%q, want the self-reported woodhouse/ga-sender-session", p.Sender, p.SenderSession)
 			}
-			if tc.nudgeErr != nil && !strings.Contains(p.Error, tc.nudgeErr.Error()) {
-				t.Errorf("error = %q, want it to carry %q", p.Error, tc.nudgeErr)
+			if tc.nudgeErr != nil && p.ErrorClass != "error" {
+				t.Errorf("error_class = %q, want %q", p.ErrorClass, "error")
 			}
 		})
 	}
