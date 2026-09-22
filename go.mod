@@ -260,4 +260,4 @@ require (
 // different dependency -- every import path, every other bd pin and the
 // module graph itself still reason about github.com/steveyegge/beads.
 // scripts/beads_fleet_replace_test.go checks the two stay in step.
-replace github.com/steveyegge/beads => github.com/quickserve-ai/beads v1.3.0-rc.2-fleet.20260915.3
+replace github.com/steveyegge/beads => github.com/quickserve-ai/beads v1.3.0-rc.2-fleet.20260922.1
