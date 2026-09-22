@@ -23,7 +23,7 @@
 #      invalid or overflowing setting, an unmeasurable disk, a NUL byte in the
 #      log, and a here-document the shell cannot write all refuse.
 #
-# Run in CI by TestDoltENOSPCGuardShellHarness (examples/bd/dolt).
+# Run in CI by TestDoltENOSPCGuardShellHarness (examples/bd/dolt/restart_test.go).
 
 set -euo pipefail
 
