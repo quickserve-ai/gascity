@@ -7,9 +7,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/gastownhall/gascity/internal/citylayout"
+	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/notify"
 	"github.com/gastownhall/gascity/internal/runtime"
@@ -151,5 +156,67 @@ func TestLiveNotificationAttemptIsRecorded(t *testing.T) {
 	}
 	if (outcome == notify.OutcomeDelivered) != (got[0].Outcome == liveNudgeDelivered) {
 		t.Fatalf("recorded outcome %q disagrees with the caller's outcome %q", got[0].Outcome, outcome)
+	}
+}
+
+// TestOpenLiveNudgeRecorderUsesConfiguredProvider pins Codex #111 r2: a city
+// whose [events].provider (or GC_EVENTS) selects a non-file backend must get
+// its session.nudged records there, where the controller and API read, not in
+// a .gc/events.jsonl nobody consults.
+func TestOpenLiveNudgeRecorderUsesConfiguredProvider(t *testing.T) {
+	dir := t.TempDir()
+	rec := openLiveNudgeRecorder(dir, config.EventsConfig{Provider: "fake"})
+	if _, ok := rec.(*events.Fake); !ok {
+		t.Fatalf("recorder = %T, want *events.Fake for provider \"fake\"", rec)
+	}
+	if _, err := os.Stat(filepath.Join(dir, citylayout.RuntimeRoot, "events.jsonl")); !os.IsNotExist(err) {
+		t.Fatalf("events.jsonl stat err = %v, want not-exist: a non-file provider must not touch the file log", err)
+	}
+}
+
+// TestOpenLiveNudgeRecorderIsTransient pins Codex #111 r2: the per-nudge file
+// recorder must neither sweep orphaned rotating-* files nor rotate the live log.
+// Both belong to the supervisor's long-lived recorder, and a per-nudge copy of
+// either races its compressor through the shared .gz.tmp path.
+func TestOpenLiveNudgeRecorderIsTransient(t *testing.T) {
+	t.Setenv("GC_EVENTS_ROTATION_MAX_SIZE_BYTES", "1")
+	dir := t.TempDir()
+	runtimeDir := filepath.Join(dir, citylayout.RuntimeRoot)
+	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	live := filepath.Join(runtimeDir, "events.jsonl")
+	if err := os.WriteFile(live, []byte(`{"seq":1,"type":"seed","ts":"2026-09-22T00:00:00Z","actor":"t"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	orphan := filepath.Join(runtimeDir, "events.jsonl.rotating-20260922T000000Z")
+	if err := os.WriteFile(orphan, []byte(`{"seq":0,"type":"old","ts":"2026-09-21T00:00:00Z","actor":"t"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := openLiveNudgeRecorder(dir, config.EventsConfig{})
+	rec.Record(events.Event{Type: events.SessionNudged, Actor: "t", Subject: "worker"})
+	if closer, ok := rec.(io.Closer); ok {
+		_ = closer.Close()
+	}
+
+	if _, err := os.Stat(orphan); err != nil {
+		t.Fatalf("orphaned rotating file was swept by a per-nudge recorder: %v", err)
+	}
+	entries, err := os.ReadDir(runtimeDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".gz") || strings.HasSuffix(e.Name(), ".gz.tmp") {
+			t.Fatalf("per-nudge recorder rotated or compressed the log: found %s", e.Name())
+		}
+	}
+	data, err := os.ReadFile(live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), string(events.SessionNudged)) {
+		t.Fatalf("live log does not hold the nudge event; the recorder rotated it away or wrote elsewhere:\n%s", data)
 	}
 }
