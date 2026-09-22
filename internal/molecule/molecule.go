@@ -1380,6 +1380,23 @@ func preservesGraphActionTypes(recipe *formula.Recipe) bool {
 	return root.Metadata[beadmeta.AttemptMetadataKey] != "" && root.Metadata[beadmeta.StepRefMetadataKey] != ""
 }
 
+// gateAwaitTypeForStep maps a formula gate step onto bd's await_type
+// vocabulary, AT CREATE (see Bead.AwaitType for why create-then-update is
+// not an option). A formula gate's own Type ("all-children", "timer", ...)
+// is a different vocabulary: pass it through only when it happens to be a
+// bd await_type, else it is machinery waiting on graph state — AwaitBead.
+// Never "human" by default: a formula that truly wants a human gate says so
+// with an in-vocabulary gate type.
+func gateAwaitTypeForStep(stepType string, gate *formula.RecipeGate) string {
+	if stepType != "gate" {
+		return ""
+	}
+	if gate != nil && beads.IsGateAwaitType(gate.Type) {
+		return gate.Type
+	}
+	return beads.AwaitBead
+}
+
 // stepToBead converts a RecipeStep to a Bead with variable substitution.
 func stepToBead(step formula.RecipeStep, vars map[string]string, priorityOverride *int) beads.Bead {
 	stepType := step.Type
@@ -1394,6 +1411,7 @@ func stepToBead(step formula.RecipeStep, vars map[string]string, priorityOverrid
 		Priority:    resolveStepPriority(step, priorityOverride),
 		Labels:      substituteLabels(step.Labels, vars),
 		Assignee:    formula.Substitute(step.Assignee, vars),
+		AwaitType:   gateAwaitTypeForStep(stepType, step.Gate),
 	}
 
 	// Merge step metadata + notes into bead metadata.
@@ -1464,6 +1482,14 @@ func deferBeadRouting(b *beads.Bead) {
 		ensureBeadMetadata(b)
 		b.Metadata[DeferredTypeMetadataKey] = beadType
 		b.Type = "gate"
+		// A parked step waits on its deps/routing — a BEAD wait. Set AT
+		// CREATE: the beads create seam defaults an empty await_type to
+		// "human" and the on-creation notifier would page per parked step
+		// (~2600 live instances measured, ga-knhu61 2026-09-22). Deliberate
+		// residue: reactivation restores Type but leaves await_type="bead"
+		// on the non-gate row — inert, since every notifier arm filters
+		// issue_type=="gate" first.
+		b.AwaitType = beads.AwaitBead
 	}
 	if b.Assignee != "" {
 		ensureBeadMetadata(b)

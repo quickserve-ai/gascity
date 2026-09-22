@@ -67,19 +67,22 @@ type EphemeralGraphApplyStore interface {
 
 // GraphApplyNode describes a single bead to create.
 type GraphApplyNode struct {
-	Key               string            `json:"key"`
-	Title             string            `json:"title"`
-	Type              string            `json:"type,omitempty"`
-	Priority          *int              `json:"priority,omitempty"`
-	Description       string            `json:"description,omitempty"`
-	Assignee          string            `json:"assignee,omitempty"`
-	AssignAfterCreate bool              `json:"assign_after_create,omitempty"`
-	From              string            `json:"from,omitempty"`
-	Labels            []string          `json:"labels,omitempty"`
-	Metadata          map[string]string `json:"metadata,omitempty"`
-	MetadataRefs      map[string]string `json:"metadata_refs,omitempty"`
-	ParentKey         string            `json:"parent_key,omitempty"`
-	ParentID          string            `json:"parent_id,omitempty"`
+	Key               string   `json:"key"`
+	Title             string   `json:"title"`
+	Type              string   `json:"type,omitempty"`
+	Priority          *int     `json:"priority,omitempty"`
+	Description       string   `json:"description,omitempty"`
+	Assignee          string   `json:"assignee,omitempty"`
+	AssignAfterCreate bool     `json:"assign_after_create,omitempty"`
+	From              string   `json:"from,omitempty"`
+	Labels            []string `json:"labels,omitempty"`
+	// AwaitType: see Bead.AwaitType — a gate node created without it is
+	// defaulted to "human" by the beads create seam and starts paging.
+	AwaitType    string            `json:"await_type,omitempty"`
+	Metadata     map[string]string `json:"metadata,omitempty"`
+	MetadataRefs map[string]string `json:"metadata_refs,omitempty"`
+	ParentKey    string            `json:"parent_key,omitempty"`
+	ParentID     string            `json:"parent_id,omitempty"`
 }
 
 // GraphApplyEdge describes a dependency edge. At least one of FromKey/FromID
