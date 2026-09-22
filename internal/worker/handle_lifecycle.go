@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
@@ -110,6 +111,24 @@ func (h *SessionHandle) Reset(ctx context.Context) (err error) {
 		return err
 	}
 	err = h.manager.RequestFreshRestart(id)
+	return err
+}
+
+// ResetWithTerminationIntent is Reset with a termination intent persisted in
+// the same batch as the reset markers (see
+// session.Manager.RequestFreshRestartWithIntent). `gc handoff` uses it for
+// pinned seats, whose kill-protection guard would otherwise clear an intent
+// that landed before its reset.
+func (h *SessionHandle) ResetWithTerminationIntent(ctx context.Context, kind runtime.TerminationKind, at time.Time) (err error) {
+	event := h.beginOperationEvent(ctx, workerOperationReset)
+	defer func() { event.finish(err) }()
+
+	id := h.currentSessionID()
+	if id == "" {
+		err = fmt.Errorf("%w: reset requires an existing bead-backed session", ErrOperationUnsupported)
+		return err
+	}
+	err = h.manager.RequestFreshRestartWithIntent(id, sessionpkg.TerminationIntentPatch(kind, at))
 	return err
 }
 

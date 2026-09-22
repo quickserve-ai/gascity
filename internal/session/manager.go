@@ -1497,14 +1497,30 @@ func (m *Manager) Suspend(id string) error {
 // controller, commitPendingContinuationReset for Submit/Send/Attach/Start), so
 // the epoch advances once per reset however the reset was asked for.
 func (m *Manager) RequestFreshRestart(id string) error {
+	return m.RequestFreshRestartWithIntent(id, nil)
+}
+
+// RequestFreshRestartWithIntent is RequestFreshRestart plus a termination
+// intent written in the SAME batch. A pinned seat's handoff needs the two to
+// land together (Codex #106 r10). If the intent is a separate write before the
+// reset, a reconciler tick that already sees a collateral restart flag can run
+// its pinned guard in the gap. It finds the intent but no reset yet, clears
+// both, and the reset that lands next is then consumed as a plain
+// restart-in-place. One batch leaves no gap: any snapshot or re-read that sees
+// the intent also sees the reset. A nil intent is exactly RequestFreshRestart.
+func (m *Manager) RequestFreshRestartWithIntent(id string, intent MetadataPatch) error {
 	return withSessionMutationLock(id, func() error {
 		if _, _, err := m.sessionBead(id); err != nil {
 			return err
 		}
-		return m.store.SetMetadataBatch(id, map[string]string{
+		batch := map[string]string{
 			"restart_requested":          "true",
 			"continuation_reset_pending": "true",
-		})
+		}
+		for k, v := range intent {
+			batch[k] = v
+		}
+		return m.store.SetMetadataBatch(id, batch)
 	})
 }
 

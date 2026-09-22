@@ -50,6 +50,14 @@ type TerminationIntentKiller interface {
 	KillWithTermination(context.Context, runtime.Termination) error
 }
 
+// TerminationIntentResetter is implemented by handles that can persist a reset
+// and a termination intent in one batch (SessionHandle). Additive, like
+// TerminationIntentKiller: a caller type-asserts and falls back to writing the
+// intent separately and then calling Reset.
+type TerminationIntentResetter interface {
+	ResetWithTerminationIntent(context.Context, runtime.TerminationKind, time.Time) error
+}
+
 // MessagingHandle exposes live input delivery operations.
 type MessagingHandle interface {
 	Message(context.Context, MessageRequest) (MessageResult, error)

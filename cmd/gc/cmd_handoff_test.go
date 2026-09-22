@@ -684,6 +684,57 @@ func seedPinnedMayorBead(t *testing.T, store beads.Store) beads.Bead {
 	return b
 }
 
+// atomicHandoffPersist models handoffRestartPersister's contract: the reset
+// markers and the handoff intent land in ONE batch.
+func atomicHandoffPersist(store beads.Store, id string) func() error {
+	return func() error {
+		batch := map[string]string{
+			"restart_requested":          "true",
+			"continuation_reset_pending": "true",
+		}
+		for k, v := range session.TerminationIntentPatch(runtime.KindHandoff, time.Now().UTC()) {
+			batch[k] = v
+		}
+		return store.SetMetadataBatch(id, batch)
+	}
+}
+
+// TestDoHandoff_PinnedWritesNoIntentBeforeTheAtomicPersist covers Codex #106
+// r10: a pinned seat may already carry a COLLATERAL restart flag, so an intent
+// written on its own before the reset gives the pinned guard a window to see
+// the intent without the reset and clear both. The pinned path must leave the
+// intent to the persister's single batch.
+func TestDoHandoff_PinnedWritesNoIntentBeforeTheAtomicPersist(t *testing.T) {
+	store := beads.NewMemStore()
+	b := seedPinnedMayorBead(t, store)
+	dops := &flagObservingDrainOps{fakeDrainOps: newFakeDrainOps(), store: store, beadID: b.ID}
+	intentBeforePersist := "unset"
+	atomic := atomicHandoffPersist(store, b.ID)
+	persist := func() error {
+		if got, err := store.Get(b.ID); err == nil {
+			intentBeforePersist = got.Metadata[session.TerminationIntentKey]
+		}
+		return atomic()
+	}
+	var stdout, stderr bytes.Buffer
+
+	outcome := doHandoffWithOutcome(store, store, events.NewFake(), dops, persist, "mayor", "mayor",
+		[]string{"HANDOFF: context full"}, &stdout, &stderr)
+	if outcome.code != 0 {
+		t.Fatalf("outcome = %+v; stderr: %s", outcome, stderr.String())
+	}
+	if intentBeforePersist != "" {
+		t.Fatalf("intent = %q on the bead BEFORE the atomic persist; the pinned guard can clear it in that gap", intentBeforePersist)
+	}
+	got, err := store.Get(b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Metadata[session.TerminationIntentKey] != string(runtime.KindHandoff) || got.Metadata["continuation_reset_pending"] != "true" {
+		t.Fatalf("after persist: intent=%q reset=%q, want both set together", got.Metadata[session.TerminationIntentKey], got.Metadata["continuation_reset_pending"])
+	}
+}
+
 // TestDoHandoff_PinnedPersistsResetBeforeExposingFlag covers Codex #106 r7:
 // the pinned guard reads the flag live and the reset from a snapshot, so the
 // reset must already be on the bead when the flag becomes visible. Otherwise a
@@ -693,12 +744,7 @@ func TestDoHandoff_PinnedPersistsResetBeforeExposingFlag(t *testing.T) {
 	store := beads.NewMemStore()
 	b := seedPinnedMayorBead(t, store)
 	dops := &flagObservingDrainOps{fakeDrainOps: newFakeDrainOps(), store: store, beadID: b.ID}
-	persist := func() error {
-		return store.SetMetadataBatch(b.ID, map[string]string{
-			"restart_requested":          "true",
-			"continuation_reset_pending": "true",
-		})
-	}
+	persist := atomicHandoffPersist(store, b.ID)
 	var stdout, stderr bytes.Buffer
 
 	outcome := doHandoffWithOutcome(store, store, events.NewFake(), dops, persist, "mayor", "mayor",
@@ -722,12 +768,7 @@ func TestDoHandoff_PinnedFlagFailureAfterPersistKeepsIntent(t *testing.T) {
 	store := beads.NewMemStore()
 	b := seedPinnedMayorBead(t, store)
 	dops := &flagObservingDrainOps{fakeDrainOps: newFakeDrainOps(), store: store, beadID: b.ID, setErr: errors.New("tmux unavailable")}
-	persist := func() error {
-		return store.SetMetadataBatch(b.ID, map[string]string{
-			"restart_requested":          "true",
-			"continuation_reset_pending": "true",
-		})
-	}
+	persist := atomicHandoffPersist(store, b.ID)
 	var stdout, stderr bytes.Buffer
 
 	outcome := doHandoffWithOutcome(store, store, events.NewFake(), dops, persist, "mayor", "mayor",

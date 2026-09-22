@@ -66,8 +66,10 @@ BASELINE="$ROOT/scripts/termination-seam-baseline.txt"
 # forwarding_or_exempt reads "<path>:<line>:<src>" hits on stdin (paths relative
 # to $1) and drops two shapes, printing the rest:
 #   - a PROVIDER's forwarding: a hit under internal/runtime/ whose enclosing func
-#     is itself a Stop method or a place's Teardown (the where-half of Stop). That
-#     call IS the provider's Stop; its caller is what the fence polices.
+#     is a Stop(name string) method or a place's Teardown (the where-half of
+#     Stop), AND whose call forwards that same identity (.Stop(name) or
+#     .Stop(pl.name)). That call IS the provider's Stop; its caller is what the
+#     fence polices.
 #   - an explicit exemption: the line carries "termination-seam:not-an-ending"
 #     followed by a reason. It is visible in review and greppable; it replaces
 #     the old whole-directory exclusion, which also hid real endings, such as a
@@ -87,7 +89,13 @@ forwarding_or_exempt() {
 			# reset at each top-level closing brace, so a package-level closure
 			# after a Stop method is not credited to that method.
 			fn=$(awk -v n="$line" 'NR<=n && /^func /{f=$0} NR<n && /^}/{f=""} NR==n{print f; exit}' "$dir/$path")
-			if printf '%s' "$fn" | grep -qE '\) (Stop|Teardown)\('; then
+			# A forward is BOTH halves: the enclosing func is a provider's own
+			# Stop(name string) or a place's Teardown, AND the call passes that
+			# identity through unchanged (.Stop(name) / .Stop(pl.name)). The name
+			# alone is not enough: any method spelled Stop that ends some OTHER
+			# session would pass on its spelling (Codex, PR #106 r10).
+			if printf '%s' "$fn" | grep -qE '\) (Stop\(name string\)|Teardown\()' &&
+				printf '%s' "$hit" | grep -qE '\.Stop\((name|[a-z]+\.name)\)'; then
 				continue
 			fi
 			;;

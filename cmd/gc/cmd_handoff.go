@@ -18,6 +18,7 @@ import (
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/telemetry"
+	"github.com/gastownhall/gascity/internal/worker"
 	"github.com/spf13/cobra"
 )
 
@@ -176,7 +177,7 @@ func cmdHandoffWithForce(args []string, target string, auto bool, hookFormat str
 	}
 	dops := newDrainOps(sp)
 	cfg, _ := loadCityConfig(current.cityPath, stderr)
-	persistRestart := sessionRestartPersister(current.cityPath, sessStore, sp, cfg, current.sessionName)
+	persistRestart := handoffRestartPersister(current.cityPath, sessStore, sp, cfg, current.sessionName, stderr)
 
 	outcome := doHandoffWithOutcome(msgStore, sessStore, rec, dops, persistRestart, current.display, current.sessionName, args, stdout, stderr)
 	if outcome.code != 0 {
@@ -236,7 +237,12 @@ func cmdHandoffRemoteWithForce(args []string, target string, force bool, stdout,
 	return doHandoffRemoteWithForce(msgStore, sessStore, rec, sp, targetInfo.sessionName, targetInfo.display, sender, args, force, stdout, stderr)
 }
 
-func sessionRestartPersister(cityPath string, sessStore beads.Store, sp runtime.Provider, cfg *config.City, target string) func() error {
+// handoffRestartPersister persists a self-handoff's restart request: the
+// reset markers and the handoff termination intent land in ONE session-owned
+// batch (worker.TerminationIntentResetter), which the pinned path depends on
+// (Codex #106 r10). A handle without the atomic method degrades to intent then
+// Reset, which is the pre-r10 behavior and is reported, not silent.
+func handoffRestartPersister(cityPath string, sessStore beads.Store, sp runtime.Provider, cfg *config.City, target string, stderr io.Writer) func() error {
 	if sessStore == nil {
 		return nil
 	}
@@ -245,6 +251,11 @@ func sessionRestartPersister(cityPath string, sessStore beads.Store, sp runtime.
 		if err != nil {
 			return err
 		}
+		if r, ok := handle.(worker.TerminationIntentResetter); ok {
+			return r.ResetWithTerminationIntent(context.Background(), runtime.KindHandoff, time.Now().UTC())
+		}
+		fmt.Fprintf(stderr, "gc handoff: worker handle for %q cannot persist the intent with its reset; writing them separately\n", target) //nolint:errcheck // best-effort stderr
+		recordHandoffTerminationIntent(sessStore, target, stderr)
 		return handle.Reset(context.Background())
 	}
 }
@@ -315,22 +326,20 @@ func doHandoffWithOutcome(msgStore, sessStore beads.Store, rec events.Recorder, 
 		fmt.Fprintf(stderr, "gc handoff: pinned session %q has no restart persistence available; not requesting restart\n", sessionName) //nolint:errcheck // best-effort stderr
 		return handoffOutcome{code: 1}
 	}
-	recordHandoffTerminationIntent(sessStore, sessionName, stderr)
 	if pinned {
-		// PINNED: PERSIST THE RESET BEFORE EXPOSING THE FLAG (Codex #106 r7).
-		// The reconciler reads the provider flag LIVE but the reset from a
-		// snapshot. With the flag first, a tick could see the flag, find no
-		// reset in its snapshot, re-read before the reset landed, and clear the
-		// flag and the intent; the reset then landed and the next tick stopped
-		// the seat as a plain restart-in-place. The r5/r6 re-read only narrowed
-		// that window. Persisting first closes it: RequestFreshRestart writes
-		// restart_requested and continuation_reset_pending in one batch, so any
-		// tick that can see a request, by flag or by bead, also finds the reset,
-		// on its snapshot or on the guard's re-read.
+		// PINNED: ONE BATCH, THEN THE FLAG (Codex #106 r7, r10). The pinned guard
+		// reads the provider flag live but the reset from a snapshot, and a pinned
+		// seat can already carry a COLLATERAL flag. So any gap between the intent
+		// and the reset is a window in which the guard sees the intent without
+		// the reset, and clears both. The reset that lands next is then consumed
+		// as a plain restart-in-place. persistRestart for a handoff writes
+		// restart_requested, continuation_reset_pending and the handoff intent in
+		// one session-owned batch (handoffRestartPersister), so a tick that can
+		// see the intent always sees the reset. Only then is the flag exposed.
 		if err := persistRestart(); err != nil {
-			// Nothing was armed, so the intent must not outlive this call: left
-			// behind, it would relabel whatever restarts this seat next as a
-			// handoff, over-claiming the numerator (consumed-at-most-once).
+			// Nothing was armed. Retire any intent a degraded (non-atomic)
+			// persister got as far as writing, so it cannot relabel whatever
+			// restarts this seat next (consumed-at-most-once).
 			unwindHandoffRestart(dops, sessStore, sessionName, stderr)
 			fmt.Fprintf(stderr, "gc handoff: could not persist restart marker for pinned session %q; not requesting restart: %v\n", sessionName, err) //nolint:errcheck // best-effort stderr
 			return handoffOutcome{code: 1}
@@ -342,17 +351,23 @@ func doHandoffWithOutcome(msgStore, sessStore beads.Store, rec events.Recorder, 
 			// would drop a real handoff from the numerator.
 			fmt.Fprintf(stderr, "gc handoff: setting restart flag (restart still requested via the session bead): %v\n", err) //nolint:errcheck // best-effort stderr
 		}
-	} else if err := dops.setRestartRequested(sessionName); err != nil {
-		// UNWIND IT. The restart was never armed, so an intent left behind would
-		// be consumed by whatever restarts this seat next and would relabel an
-		// unrelated ending as a handoff — over-claiming the numerator, which the
-		// consumed-at-most-once rule exists to prevent.
-		unwindHandoffRestart(dops, sessStore, sessionName, stderr)
-		fmt.Fprintf(stderr, "gc handoff: setting restart flag: %v\n", err) //nolint:errcheck // best-effort stderr
-		return handoffOutcome{code: 1}
-	} else if persistRestart != nil {
-		if err := persistRestart(); err != nil {
-			fmt.Fprintf(stderr, "gc handoff: setting bead restart flag: %v\n", err) //nolint:errcheck // best-effort stderr
+	} else {
+		// Unpinned seats have no kill-protection guard to race, so the intent is
+		// stated first and the runtime flag is primary.
+		recordHandoffTerminationIntent(sessStore, sessionName, stderr)
+		if err := dops.setRestartRequested(sessionName); err != nil {
+			// UNWIND IT. The restart was never armed, so an intent left behind
+			// would be consumed by whatever restarts this seat next and would
+			// relabel an unrelated ending as a handoff — over-claiming the
+			// numerator, which the consumed-at-most-once rule exists to prevent.
+			unwindHandoffRestart(dops, sessStore, sessionName, stderr)
+			fmt.Fprintf(stderr, "gc handoff: setting restart flag: %v\n", err) //nolint:errcheck // best-effort stderr
+			return handoffOutcome{code: 1}
+		}
+		if persistRestart != nil {
+			if err := persistRestart(); err != nil {
+				fmt.Fprintf(stderr, "gc handoff: setting bead restart flag: %v\n", err) //nolint:errcheck // best-effort stderr
+			}
 		}
 	}
 	rec.Record(events.Event{
