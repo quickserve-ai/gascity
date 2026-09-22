@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"strings"
 
@@ -176,10 +177,34 @@ func excludeMailMessageBeads(items []beads.Bead) []beads.Bead {
 // ReleaseIfCurrent swaps status/assignee itself, so when that tier applies the
 // metadata clear rides a second write — which is also why it does not always
 // apply (see singleWriteRequired below).
-func (w workAssignment) ReleaseWorkBead(item beads.Bead, runTargetFallback string) error {
+//
+// A SUCCESSFUL release writes one audit line to audit naming the bead, the
+// assignee it stripped, the status transition, any stamped fallback route, and
+// releasePath (which of the four release paths ran). Before ga-9n8hjv only the
+// ERROR branch at each call site logged, so a release that worked was
+// indistinguishable from one that never ran: reconstructing the 2026-09-14 wave
+// that stripped 50 beads off a named agent needed hq.dolt_diff_issues forensics
+// after the fact. The line is emitted only once the release WRITE has landed —
+// after ReleaseIfCurrent returns released on tier 1 (before the affinity-metadata
+// follow-up, whose independent failure does not un-release the bead), and after
+// the single Update returns nil on tier 2 — so it never announces a release that
+// did not happen. Both skip exits already log their own line.
+//
+// audit and releasePath are REQUIRED parameters rather than optional façade
+// state on purpose: a release path added later cannot silently inherit
+// no-observability. A nil audit degrades to io.Discard so a caller with no
+// writer still releases.
+//
+// This is deliberately a log line and not a bead event: gc-layer bead writes are
+// systematically eventless (measured ~4% evented), so an events-table row would
+// be an observability guarantee that is absent exactly when it is needed.
+func (w workAssignment) ReleaseWorkBead(item beads.Bead, runTargetFallback string, audit io.Writer, releasePath string) error {
 	store := w.unwrapped()
 	if store == nil {
 		return nil
+	}
+	if audit == nil {
+		audit = io.Discard
 	}
 	metadata := clearedSessionAffinityMetadata()
 	stampFallbackRoute := runTargetFallback != "" &&
@@ -226,6 +251,12 @@ func (w workAssignment) ReleaseWorkBead(item beads.Bead, runTargetFallback strin
 			if !released {
 				return nil
 			}
+			// The conditional release itself has landed: the assignee is stripped
+			// and the status swapped, whatever happens to the metadata follow-up
+			// below. Tier 1 only engages for an in_progress bead with no route to
+			// stamp, so the transition and route note are fixed.
+			fmt.Fprintf(audit, "session beads: RELEASED work %s: assignee %q -> \"\", status in_progress -> open, run_target unchanged, path=%s\n",
+				item.ID, item.Assignee, releasePath) //nolint:errcheck
 			// If this metadata clear fails the error propagates, but no retry
 			// follows: the bead is already unassigned, so the next tick's
 			// OpenAssignedTo sweep will not see it again. A bead whose SNAPSHOT
@@ -258,11 +289,22 @@ func (w workAssignment) ReleaseWorkBead(item beads.Bead, runTargetFallback strin
 		Assignee: &empty,
 		Metadata: metadata,
 	}
+	newStatus := item.Status
 	if item.Status == "in_progress" {
 		open := "open"
 		update.Status = &open
+		newStatus = open
 	}
-	return store.Update(item.ID, update)
+	if err := store.Update(item.ID, update); err != nil {
+		return err
+	}
+	routeNote := "run_target unchanged"
+	if stampFallbackRoute {
+		routeNote = "run_target=" + runTargetFallback
+	}
+	fmt.Fprintf(audit, "session beads: RELEASED work %s: assignee %q -> \"\", status %s -> %s, %s, path=%s\n",
+		item.ID, item.Assignee, item.Status, newStatus, routeNote, releasePath) //nolint:errcheck
+	return nil
 }
 
 // releaseWorkAssignmentIfCurrent attempts the store's atomic conditional
