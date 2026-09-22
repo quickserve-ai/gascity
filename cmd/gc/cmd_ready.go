@@ -76,6 +76,7 @@ type readyBead struct {
 	// CloseReason follows beads.Bead onto the wire so the field set stays the
 	// HTTP Bead shape. Ready rows are open, so it is normally absent.
 	CloseReason string `json:"close_reason,omitempty"`
+	AwaitType   string `json:"await_type,omitempty"`
 	// BlockedBy carries the row's OPEN-or-not blocking dependencies, in bd's
 	// `bd ready --json` shape. It is populated only on the --status in_progress
 	// arm, which is the crash-recovery read: a resumed holder must be told
@@ -145,6 +146,7 @@ func toReadyBead(b beads.Bead) readyBead {
 		DeferUntil:   b.DeferUntil,
 		IsBlocked:    b.IsBlocked,
 		CloseReason:  b.CloseReason,
+		AwaitType:    b.AwaitType,
 	}
 }
 
