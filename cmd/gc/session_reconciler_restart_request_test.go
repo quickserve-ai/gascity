@@ -788,6 +788,67 @@ func TestReconcileSessionBeads_PinnedGuardClearsAPairedTerminationIntent(t *test
 	}
 }
 
+// TestReconcileSessionBeads_PinnedGuardKeepsIntentWhenResetLandsAfterSnapshot
+// is the race Codex #106 r5 named. A pinned handoff stamps the intent, arms
+// the flag and THEN persists its explicit reset. A tick whose snapshot predates
+// that persist must not clear the intent: the reset is consumed next tick, and
+// without the intent that ending would record as restart-in-place, dropping a
+// real handoff from the numerator.
+func TestReconcileSessionBeads_PinnedGuardKeepsIntentWhenResetLandsAfterSnapshot(t *testing.T) {
+	env := newRestartRequestTestEnv()
+	env.cfg = &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Agents:        []config.Agent{{Name: "worker", StartCommand: "true", MaxActiveSessions: restartRequestTestIntPtr(1)}},
+		NamedSessions: []config.NamedSession{{Template: "worker", Mode: "always"}},
+	}
+	sessionName := config.NamedSessionRuntimeName(env.cfg.Workspace.Name, env.cfg.Workspace, "worker")
+	env.desiredState[sessionName] = TemplateParams{
+		Command:      "true",
+		SessionName:  sessionName,
+		TemplateName: "worker",
+		ResolvedProvider: &config.ResolvedProvider{
+			SessionIDFlag: "--session-id",
+		},
+	}
+
+	session := env.createSessionBead(sessionName)
+	env.setSessionMetadata(&session, map[string]string{
+		namedSessionMetadataKey:      "true",
+		namedSessionIdentityMetadata: "worker",
+		namedSessionModeMetadata:     "always",
+		"state":                      "active",
+		"pin_awake":                  "true",
+		"restart_requested":          "true",
+		"termination.intent":         "handoff",
+		"termination.intent_at":      "2026-09-22T03:00:00Z",
+	})
+	// The tick's snapshot is taken HERE, before the handoff's persist lands.
+	snapshot := session
+	snapshot.Metadata = make(map[string]string, len(session.Metadata))
+	for k, v := range session.Metadata {
+		snapshot.Metadata[k] = v
+	}
+	if err := env.store.SetMetadata(session.ID, "continuation_reset_pending", "true"); err != nil {
+		t.Fatalf("persisting the reset after the snapshot: %v", err)
+	}
+	if err := env.sp.Start(context.Background(), sessionName, runtime.Config{Command: "true"}); err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	if err := env.sp.SetMeta(sessionName, "GC_SESSION_ID", session.ID); err != nil {
+		t.Fatalf("SetMeta(GC_SESSION_ID): %v", err)
+	}
+
+	env.reconcile([]beads.Bead{snapshot})
+
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("store.Get(%s): %v", session.ID, err)
+	}
+	if v := got.Metadata["termination.intent"]; v != "handoff" {
+		t.Fatalf("termination.intent = %q, want it KEPT: a reset persisted after the snapshot means its restart is still coming", v)
+	}
+}
+
 func TestReconcileSessionBeads_RestartRequestAllowsExplicitResetForPinnedNamedSession(t *testing.T) {
 	env := newRestartRequestTestEnv()
 	env.cfg = &config.City{

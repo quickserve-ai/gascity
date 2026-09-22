@@ -3289,7 +3289,15 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					if beadRequested {
 						skipClear["restart_requested"] = ""
 					}
-					if strings.TrimSpace(infoByID[id].TerminationIntent) != "" {
+					// BUT NOT FROM A STALE SNAPSHOT (Codex #106 r5). A pinned handoff
+					// stamps the intent and arms the flag, THEN persists its explicit
+					// reset. A tick that snapshotted in between would clear an intent
+					// whose restart is about to be consumed next tick, dropping a
+					// real handoff from the numerator. Re-read the persisted bead:
+					// if a reset or restart request has landed since, the pairing is
+					// live and the intent stays. This path is rare (pinned seat with
+					// an unconsumed flag), so one read is affordable here.
+					if strings.TrimSpace(infoByID[id].TerminationIntent) != "" && !persistedRestartPendingSince(store, id, beadRequested) {
 						for k, v := range sessionpkg.ClearTerminationIntentPatch() {
 							skipClear[k] = v
 						}
@@ -7698,4 +7706,29 @@ func restartRequestTermination(info sessionpkg.Info) runtime.Termination {
 	rec.Reason = "restart requested (" + string(kind) + ")"
 	rec.RequestedAt = at
 	return rec
+}
+
+// persistedRestartPendingSince re-reads a session bead and reports whether a
+// restart has been PERSISTED on it since the tick's snapshot: an explicit
+// controller reset (the guard only runs when the snapshot had none), or a bead
+// restart request the snapshot did not have. A request the snapshot already
+// saw is the one the guard itself is dropping, so it is not evidence of a new
+// one. The pinned guard uses this so it does not retire a termination intent
+// whose restart is about to be consumed.
+//
+// A failed read answers false, so the intent is cleared: over-claiming the
+// handoff numerator is worse than missing one ending (the rule this branch
+// applies throughout).
+func persistedRestartPendingSince(store beads.Store, id string, snapshotRequested bool) bool {
+	if store == nil || strings.TrimSpace(id) == "" {
+		return false
+	}
+	b, err := store.Get(id)
+	if err != nil {
+		return false
+	}
+	if strings.TrimSpace(b.Metadata["continuation_reset_pending"]) == "true" {
+		return true
+	}
+	return !snapshotRequested && strings.TrimSpace(b.Metadata["restart_requested"]) == "true"
 }
