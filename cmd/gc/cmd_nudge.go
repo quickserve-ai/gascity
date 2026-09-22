@@ -1034,10 +1034,11 @@ func deliverSessionNudgeWithWorker(target nudgeTarget, store beads.Store, sp run
 		return 1
 	}
 	directSender, _ := nudgeSenderIdentity()
+	liveSource := nudgeSourceLabel("session", directSender)
 	result, err := handle.Nudge(context.Background(), worker.NudgeRequest{
 		Text:     message,
 		Delivery: delivery,
-		Source:   nudgeSourceLabel("session", directSender),
+		Source:   liveSource,
 	})
 	if err != nil && errors.Is(err, tmux.ErrNudgeSubmitDeliveredUnobserved) {
 		// The submit Enter was delivered and the composer drained; only the
@@ -1051,6 +1052,9 @@ func deliverSessionNudgeWithWorker(target nudgeTarget, store beads.Store, sp run
 		err = nil
 	}
 	if err != nil {
+		// Every live attempt leaves a record, the failed ones included: "was
+		// anything injected into X at T" needs the attempts, not just the hits.
+		recordLiveNudgeEvent(target, message, string(mode), liveSource, liveNudgeFailed, err)
 		if errors.Is(err, runtime.ErrSessionNotFound) && target.sessionTransport() == "acp" {
 			if mode == nudgeDeliveryWaitIdle {
 				return queueSessionNudgeWithWorker(target, store, sp, message, mode, jsonOutput, "", stdout, stderr)
@@ -1064,8 +1068,10 @@ func deliverSessionNudgeWithWorker(target nudgeTarget, store beads.Store, sp run
 		return 1
 	}
 	if mode == nudgeDeliveryWaitIdle && !result.Delivered {
+		recordLiveNudgeEvent(target, message, string(mode), liveSource, liveNudgeNotDelivered, nil)
 		return queueSessionNudgeWithWorker(target, store, sp, message, mode, jsonOutput, result.Undelivered, stdout, stderr)
 	}
+	recordLiveNudgeEvent(target, message, string(mode), liveSource, liveNudgeDelivered, nil)
 	if jsonOutput {
 		return writeCLIJSONLineOrExit(stdout, stderr, "gc session nudge", sessionNudgeJSON{
 			SchemaVersion: "1",
@@ -1585,6 +1591,7 @@ func deliverSessionNotification(target nudgeTarget, store beads.Store, sp runtim
 			unobservedButDelivered := errors.Is(nudgeErr, tmux.ErrNudgeSubmitDeliveredUnobserved)
 			if delivered || unobservedButDelivered {
 				telemetry.RecordNudge(context.Background(), target.agentKey(), nil)
+				recordLiveNudgeEvent(target, msg, string(nudgeDeliveryWaitIdle), source, liveNudgeDelivered, nil)
 				var sessFront *session.Store
 				if store != nil {
 					sessFront = sessionFrontDoor(sessStore)
@@ -1592,6 +1599,13 @@ func deliverSessionNotification(target nudgeTarget, store beads.Store, sp runtim
 				stampLastNudgeDeliveredAt(sessFront, target.sessionID, time.Now())
 				return notify.OutcomeDelivered, nil
 			}
+			// A live attempt that did not land falls through to the queue below;
+			// record the attempt so the queued wisp is not the only trace.
+			outcome := liveNudgeNotDelivered
+			if nudgeErr != nil {
+				outcome = liveNudgeFailed
+			}
+			recordLiveNudgeEvent(target, msg, string(nudgeDeliveryWaitIdle), source, outcome, nudgeErr)
 		}
 	}
 	if !obs.Running && canRequestManagedNudgeWake(target, store) {
