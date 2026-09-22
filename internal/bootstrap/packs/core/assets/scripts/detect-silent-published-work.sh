@@ -59,6 +59,83 @@
 # act is indistinguishable from one that is switched off, and it becomes
 # permanent. The tunable is the THRESHOLD.
 #
+# ── TOWN LOCALITY (2026-09-22 incident, ga-g2at7f) ───────────────────────────
+# A PAGING ARTIFACT'S ROUTE IS A PROPERTY OF THE STORE IT LANDS IN, NOT OF WHO
+# MINTED IT. On 2026-09-22 this detector minted 30 human gates on the SHARED
+# qcore store in a post-resume burst (04:29-05:39Z). That store's notifier plane
+# routes to whoever watches THERE, so ANOTHER TOWN'S human inbox was paged with
+# our town's detections; the order was held at 05:38Z and all 30 gates closed by
+# 05:45Z. Scoping to "our own PRs" would NOT have prevented the class — a
+# shared-store artifact about OUR bead still pages THEIR human.
+#
+# Two rules, and the second is the load-bearing one.
+#
+#   (a) SUBJECT SCOPE. The alarm leg runs only for a candidate whose assignee
+#       POSITIVELY resolves against THIS city's live roster, read through
+#       `gc agent is-foreign` — the same in-process predicate the pool sweeper
+#       applies, exposed to shell callers precisely so a second implementation
+#       cannot drift from it (ga-7dr90m). Never a hardcoded seat list.
+#
+#       A "local" verdict with reason `not_qualified` IS NOT A RESOLUTION: it is
+#       the verb DECLINING to answer about a bare alias, and reading a decline
+#       as "ours" is how one town's detector adopts another town's work. Only
+#       the reasons that name a MATCHED roster entry count. A bare alias is
+#       re-asked once in its scope-qualified form, which is how gc addresses
+#       that seat anyway. Everything else — foreign, still unqualified, no
+#       assignee at all — is NOT OURS and is skipped for alarming, counted and
+#       sampled in a per-sweep line so the narrowing can never be silent.
+#
+#       ONE CARVE-OUT (katya ruling, 2026-09-22): a subject on THIS city's own
+#       town-local store is OURS BY CONSTRUCTION, unassigned and bare-alias
+#       subjects included, because rule (b)'s own premise is that this store
+#       routes to this town's inbox — a gate about its beads can page nobody
+#       else. Every RIG-store scope keeps the strict positive resolution: an
+#       unowned shared-store bead is exactly the ambiguous shape that paged
+#       another town's human.
+#
+#       The roster read obeys this file's own read-failure rule. A failed read
+#       is UNKNOWN, never "not ours" and never "ours": the RIG-scope alarm leg
+#       is skipped for the sweep, loudly and non-zero — the city scope needs no
+#       roster (ours by construction) and keeps alarming and reconciling. A ONE-SHOT CONTROL settles
+#       that before the sweep starts — an identity no roster can contain must
+#       come back `foreign`, and the roster must report more than zero agents,
+#       because a roster resolving ZERO is a config failure wearing a successful
+#       load and would read every one of our own seats as foreign.
+#
+#   (b) ARTIFACT LOCALITY. Every gate this detector mints lands on the
+#       TOWN-LOCAL city store, whatever store the SUBJECT lives in.
+#
+#       THAT TAKES AN EXPLICIT `--city` PIN, NOT MERELY DROPPING `--rig`. `gc bd`
+#       also auto-detects the store FROM THE BEAD ID, so `gc bd gate create
+#       --blocks qc-…` routes ITSELF straight back to the shared store and
+#       rebuilds the incident with the rig flags removed. `--city` is the
+#       documented true scope override: it forces the city store and disables
+#       GC_RIG, cwd AND bead-prefix detection.
+#
+#       DEDUP FOLLOWS THE MINT, as part of the same invariant. Episode dedup and
+#       auto-resolve are city-pinned too. A lookup left on the rig store would
+#       find nothing, every sweep would re-mint, and the paging burst would be
+#       rebuilt town-locally. The episode key therefore CARRIES THE SCOPE: one
+#       store now holds every scope's gates, and reconciliation still has to
+#       partition by the scope whose live episode set it just derived, or
+#       sweeping rig A resolves the gates raised for rig B.
+#
+#       A CROSS-STORE SUBJECT CANNOT BE GATED AT ALL. `gate create` requires
+#       --blocks and resolves it with a GetIssue against the store it is running
+#       in, so a city-pinned gate cannot block a qc- bead — there is no
+#       cross-store dependency edge to be had, and a gate that could block one
+#       would have to be minted on the shared store, which is the incident.
+#       Those subjects get the design's other sanctioned artifact: a TOWN-LOCAL
+#       MAIL, latched on a state record exactly like the beadless orphan arm and
+#       for the same reason — nothing on this store to hang a gate on. The
+#       condition is still re-derived live from the store and gh every sweep;
+#       only the nagging is rate-limited.
+#
+# The bead-attached comment and the metadata stamp are NOT paging rows, and they
+# stay on the SUBJECT'S OWN store. They are the record that stops the next person
+# rebuilding the work — the reason this detector exists — and following the mint
+# to the city store would put them where that person will never read them.
+#
 # Runs as a 5m cooldown exec order — mechanical, no LLM, loud-fail.
 set -euo pipefail
 
@@ -81,6 +158,17 @@ if ! command -v gh >/dev/null 2>&1; then
 fi
 
 CITY="${GC_CITY:-.}"
+# The TOWN-LOCAL pin (TOWN LOCALITY (b)). Every gate call is made with
+# `--city "$CITY_ABS"`, which is the one argument that disables gc bd's
+# bead-prefix store auto-detection; without it a `--blocks qc-…` re-routes the
+# mint onto the shared store. Resolved to an absolute path once, here, because
+# the pin is what makes the artifact town-local and a pin that fails to resolve
+# must stop the sweep rather than silently fall back to prefix routing.
+CITY_ABS="$(cd "$CITY" 2>/dev/null && pwd || true)"
+if [ -z "$CITY_ABS" ]; then
+    echo "detect-silent-published-work: cannot resolve the city directory '$CITY' — without it no gate can be pinned town-local, and an unpinned gate routes by bead prefix onto a SHARED store (ga-g2at7f). Refusing to sweep." >&2
+    exit 1
+fi
 # How long a bead may sit in a silent state with NO progress before it alarms.
 # 2h was chosen over a safer 4-6h deliberately: all four exhibits ran 5.5h to 30
 # days so 4h would have caught every one, and 2h buys only the first exhibit's
@@ -95,6 +183,12 @@ ORPHAN_RECIPIENT="${GC_SILENT_WORK_ORPHAN_RECIPIENT:-mayor}"
 # orphan CONDITION is re-derived live from gh every sweep; only the MAIL is
 # rate-limited by this.
 ORPHAN_REMIND="${GC_SILENT_WORK_ORPHAN_REMIND:-24h}"
+# Where a CROSS-STORE subject's alarm is delivered, and how long one delivery
+# stays latched. Town-local by construction (TOWN LOCALITY (b)): a subject on
+# another store has no bead HERE to gate on, so the paging artifact is a mail to
+# a seat of this town, rate-limited the way the orphan arm's mail is.
+XSTORE_RECIPIENT="${GC_SILENT_WORK_XSTORE_RECIPIENT:-mayor}"
+XSTORE_REMIND="${GC_SILENT_WORK_XSTORE_REMIND:-24h}"
 ESCALATION_RECIPIENT="${GC_ESCALATION_RECIPIENT:-human}"
 BRANCH_PATTERNS="${GC_SILENT_WORK_BRANCH_PATTERNS:-polecat/ fix/ nux/ integration/}"
 
@@ -135,6 +229,7 @@ iso_to_epoch() {
 
 THRESHOLD_S="$(duration_to_seconds "$THRESHOLD")"
 ORPHAN_REMIND_S="$(duration_to_seconds "$ORPHAN_REMIND")"
+XSTORE_REMIND_S="$(duration_to_seconds "$XSTORE_REMIND")"
 # A garbage duration must fail LOUDLY, not fail open: an unparseable
 # ORPHAN_REMIND would make the -lt test error out false and the orphan mail
 # would re-send every sweep with the controller none the wiser — the exact
@@ -147,6 +242,10 @@ case "$ORPHAN_REMIND_S" in ''|*[!0-9]*)
     echo "detect-silent-published-work: GC_SILENT_WORK_ORPHAN_REMIND is not a duration: $ORPHAN_REMIND" >&2
     exit 1 ;;
 esac
+case "$XSTORE_REMIND_S" in ''|*[!0-9]*)
+    echo "detect-silent-published-work: GC_SILENT_WORK_XSTORE_REMIND is not a duration: $XSTORE_REMIND" >&2
+    exit 1 ;;
+esac
 NOW_EPOCH="$(date -u +%s)"
 NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -155,6 +254,23 @@ echo "$STATE" | jq -e 'type == "object"' >/dev/null 2>&1 || STATE='{}'
 NEXT_STATE='{}'
 
 ALARMED=0; RESOLVED=0; UNKNOWN=0; ORPHANS=0; FAILED=0
+# TOWN LOCALITY (a). SKIPPED_NOTOURS is a decision, SKIPPED_UNKNOWN is a failed
+# read (and also counts into UNKNOWN, so the sweep exits non-zero). Both are
+# counted because a narrowing nobody can see is a fresh instance of the class
+# this detector exists to catch — the gate that silently stops alarming is
+# indistinguishable from a city with no stalled work.
+SKIPPED_NOTOURS=0; SKIPPED_UNKNOWN=0; SKIPPED_ROSTER_BLIND=0; OURS_BY_STORE=0
+SKIP_SAMPLE=""; SKIP_SAMPLE_N=0
+SKIP_SAMPLE_LIMIT=5
+
+# One bounded sample of the skipped candidates, so a single leaking identity
+# cannot turn the per-sweep line into something nobody reads. The COUNTS above
+# are always exact; only the names are sampled.
+note_skip() {
+    [ "$SKIP_SAMPLE_N" -lt "$SKIP_SAMPLE_LIMIT" ] || return 0
+    SKIP_SAMPLE="${SKIP_SAMPLE:+$SKIP_SAMPLE, }$1"
+    SKIP_SAMPLE_N=$((SKIP_SAMPLE_N + 1))
+}
 
 # Carry a prior observation forward untouched. Used on every UNKNOWN path: a read
 # that could not be made must neither start nor advance nor DISCARD a clock.
@@ -163,13 +279,40 @@ ALARMED=0; RESOLVED=0; UNKNOWN=0; ORPHANS=0; FAILED=0
 carry_forward() {
     local key="$1" prev
     prev="$(echo "$STATE" | jq -c --arg k "$key" '.[$k] // empty' 2>/dev/null || true)"
-    [ -n "$prev" ] || return 0
-    NEXT_STATE="$(echo "$NEXT_STATE" | jq -c --arg k "$key" --argjson v "$prev" '.[$k] = $v' 2>/dev/null || echo "$NEXT_STATE")"
+    if [ -n "$prev" ]; then
+        NEXT_STATE="$(echo "$NEXT_STATE" | jq -c --arg k "$key" --argjson v "$prev" '.[$k] = $v' 2>/dev/null || echo "$NEXT_STATE")"
+    fi
+    # The cross-store mail latch rides under a companion key; an UNKNOWN read
+    # must preserve it too, or a flapping PR read re-mails an unchanged stall
+    # on every recovery (its own doctrine: a latch may only suppress a repeat).
+    local xkey="silentwork-xstore:$key" xprev
+    xprev="$(echo "$STATE" | jq -c --arg k "$xkey" '.[$k] // empty' 2>/dev/null || true)"
+    [ -n "$xprev" ] || return 0
+    NEXT_STATE="$(echo "$NEXT_STATE" | jq -c --arg k "$xkey" --argjson v "$xprev" '.[$k] = $v' 2>/dev/null || echo "$NEXT_STATE")"
+}
+
+# Carry ONLY the cross-store mail latch forward. The roster-skip branches write
+# their own fresh clock record before they branch, so a full carry_forward there
+# would revert the clock to the prior sweep; but NEXT_STATE is rebuilt from {}
+# each sweep, so a skip that does not re-write the latch DELETES it — and a
+# flapping roster then turns the 24h latch into a mail-per-sweep flood on
+# recovery (claude review BLOCKER 1, 2026-09-22).
+carry_latch() {
+    local xkey="silentwork-xstore:$1" xprev
+    xprev="$(echo "$STATE" | jq -c --arg k "$xkey" '.[$k] // empty' 2>/dev/null || true)"
+    [ -n "$xprev" ] || return 0
+    NEXT_STATE="$(echo "$NEXT_STATE" | jq -c --arg k "$xkey" --argjson v "$xprev" '.[$k] = $v' 2>/dev/null || echo "$NEXT_STATE")"
 }
 
 # Episode key — the identity of ONE stall: (bead, PR identity, state). A
 # recurrence after resolution is a NEW episode; concurrent sweeps of the same
 # stall converge on one gate.
+#
+# The bead-arm callers pass "$SCOPE_LABEL|$bead" as the first field, so the key
+# is SCOPE-QUALIFIED. That is required by TOWN LOCALITY (b): every scope's gates
+# now live on the one city store, and the reconciliation pass must be able to
+# tell the gates of the scope it just swept from the gates of a scope it did
+# not, or one rig's sweep resolves another rig's live gates.
 episode_key() { printf 'silentwork:%s:%s:%s' "$1" "$2" "$3"; }
 
 # Open gates carrying a silentwork episode key, as "<gate-id><US><episode-key>".
@@ -181,10 +324,15 @@ episode_key() { printf 'silentwork:%s:%s:%s' "$1" "$2" "$3"; }
 # treating an outage as "no gate exists" and creating a duplicate. The explicit
 # `|| return 1` is load-bearing: inside a command substitution under `set -e`, a
 # bare failing pipeline here would abort the ENTIRE sweep on one unreachable rig.
+#
+# CITY-PINNED, AND IT TAKES NO SCOPE (TOWN LOCALITY (b)). Dedup has to look
+# where the mint lands. Left on the rig store it would find nothing, read that
+# as "no gate for this episode", and re-mint every five minutes — the paging
+# burst rebuilt town-locally, which is why dedup-follows-mint is part of the
+# same invariant rather than a tidy-up after it.
 list_episode_gates() {
-    local scope="$1" rig1="" rig2="" out
-    [ -n "$scope" ] && { rig1="--rig"; rig2="$scope"; }
-    out="$(gc bd gate list ${rig1:+"$rig1" "$rig2"} --limit 0 --json 2>/dev/null)" || return 1
+    local out
+    out="$(gc bd --city "$CITY_ABS" gate list --limit 0 --json 2>/dev/null)" || return 1
     [ -n "$out" ] && [ "$out" != "null" ] || return 0
     printf '%s' "$out" | jq -r --arg us "$US" '
         (if type == "array" then . else [.] end)[]
@@ -209,6 +357,144 @@ resolve_addressee() {
     [ -n "$scope" ] && { printf '%s/oversight.project-lead' "$scope"; return 0; }
     printf '%s' "$ESCALATION_RECIPIENT"
 }
+
+# ── B4(i): the record ON THE BEAD, the primary artifact ──────────────────────
+# Emitted exactly when a new alarm artifact was raised for the episode — a state
+# query, not a "have I commented before" flag. A metadata stamp read back as
+# dedup evidence would be action-log reasoning, and it breaks in both
+# directions: stamp-succeeds-comment-fails never retries, and a later episode
+# never comments because the field is merely non-empty.
+#
+# THIS IS THE ONE ARTIFACT THAT DOES NOT FOLLOW THE MINT TO THE CITY STORE. It
+# is not a paging row; it is the record the next person to pick up the bead
+# reads, and it is worthless anywhere but on that bead's own store. Subject
+# scope (a) already confines it to beads this city's seats own, so it cannot
+# land on another town's work.
+#
+# It reads the candidate loop's variables directly rather than taking a dozen
+# positionals; it is called only from inside that loop, once per raised alarm.
+# $1 names the paging artifact that was raised, $2 the addressee it names.
+attach_bead_record() {
+    local artifact="$1" addr="$2" bead_note=""
+    [ "$bstatus" = "closed" ] && bead_note="  <-- bead is CLOSED but its PR is still open"
+    if ! gc bd comment "$bead" ${RIG1:+"$RIG1" "$RIG2"} \
+        "THIS WORK EXISTS — DO NOT RESTART IT.
+Published work waiting on nobody, detected by absence of progress.
+  PR:      ${pr_url:-https://github.com/$pr_repo/pull/$pr_number}
+  Head:    $live_head  (base $live_base)
+  State:   $cls
+  Bead:    ${bstatus:-?}${bead_note}
+  Silent:  ${age_h}h${age_m}m with no observed progress
+  Alarm:   $artifact   addressee: $addr
+Progress means a push, a re-render of the gate sticky, a merge/close, a change of
+publish state, or a reroute of this bead. Comments, CI runs and review activity
+are NOT progress and do not clear this.
+Raised by detect-silent-published-work (ga-krso22 / ga-mmvpq1 Half B)." >/dev/null 2>&1; then
+        echo "detect-silent-published-work: FAILED to attach evidence comment to $bead" >&2
+        return 1
+    fi
+    # Best-effort convenience stamp for humans and dashboards. NOT used as dedup
+    # evidence anywhere.
+    gc bd update "$bead" ${RIG1:+"$RIG1" "$RIG2"} \
+        --set-metadata "gc.silent_work_alarm=$NOW_ISO/$cls" >/dev/null 2>&1 || true
+    return 0
+}
+
+# ── The roster read (TOWN LOCALITY (a)) ──────────────────────────────────────
+# `gc agent is-foreign` is the pool sweeper's own foreign-identity predicate,
+# exposed to shell callers for exactly this kind of use (ga-7dr90m). We ASK it
+# rather than re-deriving the answer from `gc agent list`, because a second
+# implementation of "whose seat is this" drifts from the one the sweeper
+# enforces, and the obvious hand-rolled version — strip the binding prefix and
+# compare — is what made another town's canonical "qcore/pool.omp-1" resolve
+# against our "qcore/omp" (ga-8yi7ne).
+#
+# roster_ask echoes "<verdict> <reason>" and returns non-zero when the verb
+# could not be asked at all (absent, or output that will not decode). Its own
+# documented contract is that a caller must treat a missing verb, exit 2 or
+# unparseable output as "protect", never as "local" — which is this file's
+# read-failure rule under another name.
+roster_ask() {
+    local out
+    # is-foreign signals its VERDICT in the exit code (1 = foreign), so the exit
+    # code cannot also carry "the command ran". The JSON is the answer; its
+    # absence is the failure.
+    out="$(gc agent is-foreign "$1" --json 2>/dev/null || true)"
+    [ -n "$out" ] || return 1
+    printf '%s' "$out" | jq -r '"\(.verdict // "") \(.reason // "")"' 2>/dev/null || return 1
+}
+
+# The reasons that name a MATCHED roster entry. Everything else the verb can
+# say while still reporting "local" is a DECLINE, not a match — see (a).
+roster_reason_is_match() {
+    case "$1" in
+        named_session|agent_template|configured_agent|namepool_instance|agent_instance) return 0 ;;
+    esac
+    return 1
+}
+
+# "ours" | "theirs" | "unknown" for one candidate's assignee.
+subject_roster_verdict() {
+    local assignee="$1" scope="$2" ans verdict reason
+    # An EMPTY assignee is a DEFINITE answer, not a failed read: nothing names
+    # this bead as one of ours. It is answered here rather than passed to the
+    # verb, which reports bad usage with the SAME exit 2 it uses for "I cannot
+    # read the roster" — folding a known not-ours into a sweep-blinding UNKNOWN.
+    [ -n "$assignee" ] || { printf 'theirs'; return 0; }
+    ans="$(roster_ask "$assignee")" || { printf 'unknown'; return 0; }
+    verdict="${ans%% *}"; reason="${ans#* }"
+    if [ "$verdict" = "local" ] && roster_reason_is_match "$reason"; then printf 'ours'; return 0; fi
+    if [ "$verdict" = "unknown" ]; then printf 'unknown'; return 0; fi
+    # A DECLINE ("local" for a bare alias the verb will not reason about) gets
+    # ONE re-ask, qualified into the scope the bead was read from: "barry" on
+    # rig qcore is "qcore/barry", which is how gc addresses that seat. The
+    # re-ask is a NAME COMPOSITION, not a second roster implementation — the
+    # verdict still comes from the verb.
+    if [ "$reason" = "not_qualified" ] && [ -n "$scope" ]; then
+        ans="$(roster_ask "$scope/$assignee")" || { printf 'unknown'; return 0; }
+        verdict="${ans%% *}"; reason="${ans#* }"
+        if [ "$verdict" = "local" ] && roster_reason_is_match "$reason"; then printf 'ours'; return 0; fi
+        if [ "$verdict" = "unknown" ]; then printf 'unknown'; return 0; fi
+    fi
+    case "$verdict" in
+        local|foreign) : ;;
+        *)
+            # Decodable JSON whose verdict is not a contract word is a DEGRADED
+            # READ, not a decision — falling through to "theirs" would count a
+            # fault in the decision bucket (claude review finding 4).
+            printf 'unknown'; return 0 ;;
+    esac
+    printf 'theirs'
+}
+
+# THE CONTROL, once per sweep. An identity no roster can contain must come back
+# `foreign`: that is the reading a working roster produces and a broken one
+# cannot. `unknown`, a missing verb or undecodable output all mean the city
+# config did not resolve. A roster reporting ZERO agents is the third failure
+# and the quiet one — a config-resolution failure wearing a successful load,
+# which would read every one of our own seats as foreign and switch the alarm
+# leg off while reporting clean sweeps forever.
+#
+# Both readings come from ONE invocation: two calls could disagree, and a
+# control that is not the same read as the thing it certifies certifies nothing.
+ROSTER_PROBE_IDENTITY="gcrosterprobe/gcrosterprobe"
+ROSTER_OK=0
+ROSTER_PROBE_JSON="$(gc agent is-foreign "$ROSTER_PROBE_IDENTITY" --json 2>/dev/null || true)"
+ROSTER_PROBE="$(printf '%s' "$ROSTER_PROBE_JSON" | jq -r '.verdict // ""' 2>/dev/null || true)"
+ROSTER_AGENTS="$(printf '%s' "$ROSTER_PROBE_JSON" | jq -r '.roster_source // ""' 2>/dev/null \
+    | sed -nE 's/.*resolved: ([0-9]+) agents.*/\1/p' || true)"
+case "$ROSTER_PROBE" in
+    foreign)
+        case "$ROSTER_AGENTS" in
+            ''|*[!0-9]*) : ;;
+            *) [ "$ROSTER_AGENTS" -gt 0 ] && ROSTER_OK=1 ;;
+        esac ;;
+    *) : ;;
+esac
+if [ "$ROSTER_OK" -eq 0 ]; then
+    echo "detect-silent-published-work: cannot read this city's agent roster (probe verdict '${ROSTER_PROBE:-<none>}', agents '${ROSTER_AGENTS:-<none>}') — a failed roster read is UNKNOWN, never 'not ours' and never 'ours', so NO alarm artifact is raised or auto-resolved this sweep (ga-g2at7f)" >&2
+    UNKNOWN=$((UNKNOWN + 1))
+fi
 
 # ── Scopes ───────────────────────────────────────────────────────────────────
 # HQ plus every non-HQ rig. A rig-discovery FAILURE IS NOT AN EMPTY RIG LIST: the
@@ -249,11 +535,25 @@ repo_for_scope() {
 
 while IFS= read -r scope; do
     RIG1=""; RIG2=""
-    [ -n "$scope" ] && { RIG1="--rig"; RIG2="$scope"; }
-    SCOPE_LABEL="${scope:-hq}"
+    CP1=""; CP2=""
+    if [ -n "$scope" ]; then
+        RIG1="--rig"; RIG2="$scope"
+    else
+        # The empty scope MUST be pinned too: a bare `gc bd list` is subject to
+        # the same GC_RIG / cwd / bead-prefix store auto-detection the gate
+        # verbs are pinned against, and an unpinned city sweep that lands on a
+        # rig store would hand that rig's beads to the town-local carve-out —
+        # "ours by construction" asserted about the shared store (codex review
+        # finding, 2026-09-22).
+        CP1="--city"; CP2="$CITY_ABS"
+    fi
+    # "@city" cannot collide with a rig name the way "hq" can (a rig named hq
+    # would share the reconciliation partition and the two sweeps would resolve
+    # each other's live gates in a mint/resolve loop — codex review finding).
+    SCOPE_LABEL="${scope:-@city}"
     SCOPE_REPO="$(repo_for_scope "$scope")"
 
-    BEADS_JSON="$(gc bd list ${RIG1:+"$RIG1" "$RIG2"} --limit 0 --json 2>/dev/null)" || {
+    BEADS_JSON="$(gc bd ${CP1:+"$CP1" "$CP2"} list ${RIG1:+"$RIG1" "$RIG2"} --limit 0 --json 2>/dev/null)" || {
         echo "detect-silent-published-work: scope $SCOPE_LABEL: cannot list beads (UNKNOWN, skipped)" >&2
         UNKNOWN=$((UNKNOWN + 1)); continue
     }
@@ -396,59 +696,159 @@ while IFS= read -r scope; do
         [ "$age" -ge "$THRESHOLD_S" ] || continue
         age_h=$(( age / 3600 )); age_m=$(( (age % 3600) / 60 ))
 
-        EP="$(episode_key "$bead" "$pr_number" "$cls")"
+        # SCOPE-QUALIFIED (TOWN LOCALITY (b)): one store now holds every scope's
+        # gates, so the key has to say which scope's live set reconciles it.
+        EP="$(episode_key "$SCOPE_LABEL|$bead" "$pr_number" "$cls")"
+
+        # ── TOWN LOCALITY (a): whose work is this? ──────────────────────────
+        # Asked HERE, after the threshold, so the question is only put about
+        # candidates that would otherwise alarm — and so the counted line below
+        # reports skipped ALARMS, not skipped reads.
+        if [ -z "$scope" ]; then
+            # TOWN-LOCAL CARVE-OUT (katya ruling, 2026-09-22): a subject on
+            # THIS city's own store is OURS BY CONSTRUCTION — no roster read,
+            # unassigned and bare-alias subjects included. Rule (b)'s premise
+            # cuts both ways: this store routes to this town's inbox, so a
+            # gate about its beads can page nobody else — and "published work
+            # waiting on NOBODY" on our own store is this detector's founding
+            # case, which the strict rule below would have skipped.
+            # RESIDUAL, deliberate: a LOCAL rig's unassigned beads (e.g. the
+            # platform rig's) still skip under the strict rule and are loudly
+            # counted — refinable later if the skip counts say so.
+            OURS_BY_STORE=$((OURS_BY_STORE + 1))
+        elif [ "$ROSTER_OK" -eq 0 ]; then
+            # The roster could not be read at all. Protect this episode's
+            # existing gate (an unreadable roster is not evidence the stall
+            # cleared) and raise nothing. Reported once, at the probe.
+            SKIPPED_ROSTER_BLIND=$((SKIPPED_ROSTER_BLIND + 1))
+            LIVE_EPISODES="$LIVE_EPISODES$EP
+"
+            carry_latch "$KEY"
+            continue
+        else
+            case "$(subject_roster_verdict "$assignee" "$scope")" in
+                ours) : ;;
+                unknown)
+                    # A roster read that did not answer is NOT a verdict of
+                    # "theirs". Keep the episode live so any gate it already has
+                    # survives, and report the sweep as partially blind.
+                    LIVE_EPISODES="$LIVE_EPISODES$EP
+"
+                    UNKNOWN=$((UNKNOWN + 1)); SKIPPED_UNKNOWN=$((SKIPPED_UNKNOWN + 1))
+                    note_skip "$bead(${assignee:-<unassigned>}: roster unreadable)"
+                    carry_latch "$KEY"
+                    continue ;;
+                *)
+                    # NOT THIS CITY'S. No paging artifact, and deliberately NOT
+                    # added to LIVE_EPISODES, so any gate an earlier build left for
+                    # it is auto-resolved by the reconciliation phase below.
+                    SKIPPED_NOTOURS=$((SKIPPED_NOTOURS + 1))
+                    note_skip "$bead(${assignee:-<unassigned>})"
+                    continue ;;
+            esac
+        fi
+
         LIVE_EPISODES="$LIVE_EPISODES$EP
 "
-        # ── B4(ii): gate upsert, keyed on the episode ───────────────────────
-        # Existence is a live query. Two concurrent sweeps can still both observe
-        # "absent" and both create — atomicity is not available at this seam — so
-        # the loop CONVERGES instead: any extra gate for the same episode is
-        # resolved on the next sweep by the reconciliation phase below.
-        if ! GATES="$(list_episode_gates "$scope")"; then
-            UNKNOWN=$((UNKNOWN + 1)); continue
-        fi
-        gid="$(printf '%s' "$GATES" | awk -F"$US" -v k="$EP" '$2 == k {print $1; exit}')"
-        if [ -z "$gid" ]; then
-            if gc bd gate create ${RIG1:+"$RIG1" "$RIG2"} --type human --blocks "$bead" \
-                --title "Silent work: $bead stalled ${age_h}h${age_m}m in $cls [$EP]" \
-                --reason "Published work waiting on nobody. PR ${pr_url:-https://github.com/$pr_repo/pull/$pr_number} has shown no progress for ${age_h}h${age_m}m (state: $cls). THE WORK EXISTS — do not restart it." \
-                >/dev/null 2>&1; then
-                GATES="$(list_episode_gates "$scope" || true)"
-                gid="$(printf '%s' "$GATES" | awk -F"$US" -v k="$EP" '$2 == k {print $1; exit}')"
-            else
-                echo "detect-silent-published-work: FAILED to raise gate for $bead episode $EP (will retry next sweep)" >&2
-                FAILED=$((FAILED + 1)); continue
+        ADDR="$(resolve_addressee "$assignee" "$scope")"
+
+        if [ -z "$scope" ]; then
+            # ── B4(ii): gate upsert, keyed on the episode ───────────────────
+            # The subject lives on the city store, so a town-local gate can
+            # block it. Existence is a live query. Two concurrent sweeps can
+            # still both observe "absent" and both create — atomicity is not
+            # available at this seam — so the loop CONVERGES instead: any extra
+            # gate for the same episode is resolved on the next sweep by the
+            # reconciliation phase below.
+            if ! GATES="$(list_episode_gates)"; then
+                UNKNOWN=$((UNKNOWN + 1)); continue
             fi
-            # ── B4(i): the record ON THE BEAD, the primary artifact ─────────
-            # Emitted exactly when the EPISODE GATE was created — a state query,
-            # not a "have I commented before" flag. A metadata stamp read back as
-            # dedup evidence would be action-log reasoning, and it breaks in both
-            # directions: stamp-succeeds-comment-fails never retries, and a later
-            # episode never comments because the field is merely non-empty.
-            ADDR="$(resolve_addressee "$assignee" "$scope")"
-            bead_note=""
-            [ "$bstatus" = "closed" ] && bead_note="  <-- bead is CLOSED but its PR is still open"
-            if ! gc bd comment "$bead" ${RIG1:+"$RIG1" "$RIG2"} \
-                "THIS WORK EXISTS — DO NOT RESTART IT.
-Published work waiting on nobody, detected by absence of progress.
+            gid="$(printf '%s' "$GATES" | awk -F"$US" -v k="$EP" '$2 == k {print $1; exit}')"
+            if [ -z "$gid" ]; then
+                if gc bd --city "$CITY_ABS" gate create --type human --blocks "$bead" \
+                    --title "Silent work: $bead stalled ${age_h}h${age_m}m in $cls [$EP]" \
+                    --reason "Published work waiting on nobody. PR ${pr_url:-https://github.com/$pr_repo/pull/$pr_number} has shown no progress for ${age_h}h${age_m}m (state: $cls). THE WORK EXISTS — do not restart it." \
+                    >/dev/null 2>&1; then
+                    GATES="$(list_episode_gates || true)"
+                    gid="$(printf '%s' "$GATES" | awk -F"$US" -v k="$EP" '$2 == k {print $1; exit}')"
+                else
+                    echo "detect-silent-published-work: FAILED to raise gate for $bead episode $EP (will retry next sweep)" >&2
+                    FAILED=$((FAILED + 1)); continue
+                fi
+                attach_bead_record "gate ${gid:-<pending>}" "$ADDR" || FAILED=$((FAILED + 1))
+                ALARMED=$((ALARMED + 1))
+            fi
+        else
+            # ── CROSS-STORE SUBJECT (TOWN LOCALITY (b)) ─────────────────────
+            # `gate create` REQUIRES --blocks and resolves it with a GetIssue
+            # against the store it is running in, so a city-pinned gate cannot
+            # block this bead: there is no cross-store dependency edge to be
+            # had. The only gate that could block it is one minted on the shared
+            # store, which is the 2026-09-22 incident. So the design's other
+            # sanctioned artifact is used — a TOWN-LOCAL mail, carrying the
+            # subject id and the episode as the link the gate would have been.
+            #
+            # It LATCHES on a state record, exactly like the beadless orphan arm
+            # and for the same reason: there is no bead on this store to hang a
+            # gate on, so there is no state QUERY that could dedup it. The
+            # carve-out is honest here on the same terms (ga-vh6cbz) — the
+            # CONDITION is re-derived live from the store and gh every sweep, a
+            # record for an episode that stops being silent is dropped at the
+            # very next write because NEXT_STATE is rebuilt from {}, and state
+            # loss costs at most one duplicate mail. It can never suppress a
+            # detection, only a repeat of one inside the remind window.
+            # Keyed on (scope, bead) — NOT the full episode — so every UNKNOWN
+            # path can carry it forward knowing only $KEY (a transient PR-read
+            # failure must not erase the latch and re-mail an unchanged stall
+            # on recovery), and a cls flap inside the window stays one mail.
+            XKEY="silentwork-xstore:$KEY"
+            xprev="$(echo "$STATE" | jq -c --arg k "$XKEY" '.[$k] // empty' 2>/dev/null || true)"
+            xfirst="$NOW_ISO"; xmailed=""
+            if [ -n "$xprev" ]; then
+                pf="$(echo "$xprev" | jq -r '.first_observed_in_state_at // ""' 2>/dev/null || true)"
+                [ -n "$pf" ] && xfirst="$pf"
+                xmailed="$(echo "$xprev" | jq -r '.xstore_mailed_at // ""' 2>/dev/null || true)"
+            fi
+            if [ -n "$xmailed" ]; then
+                xm_epoch="$(iso_to_epoch "$xmailed")"
+                if [ -n "$xm_epoch" ] && [ $(( NOW_EPOCH - xm_epoch )) -lt "$XSTORE_REMIND_S" ]; then
+                    # Mailed within the remind window: keep the record alive
+                    # (still silent) and stay quiet.
+                    NEXT_STATE="$(echo "$NEXT_STATE" | jq -c --arg k "$XKEY" --argjson v "$xprev" '.[$k] = $v' 2>/dev/null || echo "$NEXT_STATE")"
+                    continue
+                fi
+            fi
+            if gc mail send "$XSTORE_RECIPIENT" --notify \
+                -s "Silent work: $bead stalled ${age_h}h${age_m}m ($cls)" \
+                -m "Published work waiting on nobody, detected by absence of progress.
+
+  Bead:    $bead   (rig $SCOPE_LABEL, ${bstatus:-?})
   PR:      ${pr_url:-https://github.com/$pr_repo/pull/$pr_number}
   Head:    $live_head  (base $live_base)
   State:   $cls
-  Bead:    ${bstatus:-?}${bead_note}
   Silent:  ${age_h}h${age_m}m with no observed progress
-  Gate:    ${gid:-<pending>}   addressee: $ADDR
-Progress means a push, a re-render of the gate sticky, a merge/close, a change of
-publish state, or a reroute of this bead. Comments, CI runs and review activity
-are NOT progress and do not clear this.
-Raised by detect-silent-published-work (ga-krso22 / ga-mmvpq1 Half B)." >/dev/null 2>&1; then
-                echo "detect-silent-published-work: FAILED to attach evidence comment to $bead" >&2
+  Owner:   ${assignee:-<unassigned>}   addressee: $ADDR
+
+THE WORK EXISTS — do not restart it. The evidence comment is on the bead itself.
+
+This arrives as MAIL rather than as a human gate because the bead lives on
+another store: a gate must block an issue in the store it is created in, and the
+only gate that could block this one would have to be minted on the SHARED store,
+where it would page whichever town watches there (ga-g2at7f, 2026-09-22).
+
+Raised by detect-silent-published-work (ga-krso22 / ga-mmvpq1 Half B).
+Episode: $EP" >/dev/null 2>&1; then
+                # Stamp the latch ONLY on a delivered mail; a failed send leaves
+                # the prior record (or none) in place so the next sweep retries.
+                NEXT_STATE="$(echo "$NEXT_STATE" | jq -c --arg k "$XKEY" --arg f "$xfirst" --arg m "$NOW_ISO" \
+                    '.[$k] = {first_observed_in_state_at: $f, xstore_mailed_at: $m}' 2>/dev/null || echo "$NEXT_STATE")"
+                attach_bead_record "mail to $XSTORE_RECIPIENT" "$ADDR" || FAILED=$((FAILED + 1))
+                ALARMED=$((ALARMED + 1))
+            else
+                echo "detect-silent-published-work: FAILED to raise the town-local alarm mail for $bead episode $EP (will retry next sweep)" >&2
                 FAILED=$((FAILED + 1))
+                [ -n "$xprev" ] && NEXT_STATE="$(echo "$NEXT_STATE" | jq -c --arg k "$XKEY" --argjson v "$xprev" '.[$k] = $v' 2>/dev/null || echo "$NEXT_STATE")"
             fi
-            # Best-effort convenience stamp for humans and dashboards. NOT used
-            # as dedup evidence anywhere.
-            gc bd update "$bead" ${RIG1:+"$RIG1" "$RIG2"} \
-                --set-metadata "gc.silent_work_alarm=$NOW_ISO/$cls" >/dev/null 2>&1 || true
-            ALARMED=$((ALARMED + 1))
         fi
     done <<CANDIDATE_EOF
 $CANDIDATES
@@ -462,10 +862,34 @@ CANDIDATE_EOF
     # from the candidate query), and duplicate gates from a concurrent create.
     # It is derived from what is true NOW, never from having previously emitted a
     # resolve.
-    if GATES="$(list_episode_gates "$scope")"; then
+    #
+    # CITY-PINNED AND SCOPE-PARTITIONED (TOWN LOCALITY (b)). The dedup read
+    # follows the mint, so this pass now sees EVERY scope's gates and must
+    # consider only the ones belonging to the scope whose live episode set it
+    # just derived — otherwise sweeping rig A resolves every gate raised for rig
+    # B. That partition is why the scope is in the episode key. (A key from an
+    # earlier build carries no scope and so matches no partition. None exist:
+    # the rig-store gates were all closed during the 2026-09-22 containment and
+    # the city store held no silentwork gate at all, verified that day.)
+    #
+    # CITY PASS ONLY. Gates are minted only for city-store subjects, so every
+    # gate key carries the "@city" partition and a rig pass can never match one
+    # — running the (city-wide) gate list once per rig was pure noise, and each
+    # rig-pass read failure inflated UNKNOWN for no information. And the city
+    # pass does NOT need the roster: the town-local carve-out classifies city
+    # candidates and fills LIVE_EPISODES with no roster read, so gating this on
+    # ROSTER_OK disabled auto-resolve for the only scope that has gates — a
+    # persistent probe failure would leak an open human gate per cleared stall,
+    # the 2026-09-22 cleanup reproduced town-locally (claude review BLOCKER 2).
+    if [ -n "$scope" ]; then
+        :
+    elif ! GATES="$(list_episode_gates)"; then
+        UNKNOWN=$((UNKNOWN + 1))
+    else
         seen_eps=""
         while IFS="$US" read -r g_id g_key; do
             [ -n "$g_id" ] && [ -n "$g_key" ] || continue
+            case "$g_key" in "silentwork:$SCOPE_LABEL|"*) : ;; *) continue ;; esac
             keep=0
             printf '%s' "$LIVE_EPISODES" | grep -Fxq "$g_key" && keep=1
             # A duplicate of an episode already kept in this pass is resolved too.
@@ -473,7 +897,7 @@ CANDIDATE_EOF
                 case "$seen_eps" in *"[$g_key]"*) keep=0 ;; *) seen_eps="${seen_eps}[${g_key}]" ;; esac
             fi
             [ "$keep" -eq 1 ] && continue
-            if gc bd gate resolve "$g_id" ${RIG1:+"$RIG1" "$RIG2"} >/dev/null 2>&1; then
+            if gc bd --city "$CITY_ABS" gate resolve "$g_id" >/dev/null 2>&1; then
                 RESOLVED=$((RESOLVED + 1))
             else
                 echo "detect-silent-published-work: FAILED to auto-resolve gate $g_id ($g_key)" >&2
@@ -482,8 +906,6 @@ CANDIDATE_EOF
         done <<GATE_EOF
 $GATES
 GATE_EOF
-    else
-        UNKNOWN=$((UNKNOWN + 1))
     fi
 
     # ── B1 arm (ii): an open factory PR no bead points at ───────────────────
@@ -587,8 +1009,26 @@ TMP="$(mktemp "$PACK_STATE_DIR/.detect-silent-published-work-state.XXXXXX")"
 printf '%s\n' "$NEXT_STATE" > "$TMP"
 mv -f "$TMP" "$STATE_FILE"
 
-if [ "$ALARMED" -gt 0 ] || [ "$RESOLVED" -gt 0 ] || [ "$ORPHANS" -gt 0 ]; then
-    echo "detect-silent-published-work: $ALARMED alarm(s), $RESOLVED gate(s) auto-resolved, $ORPHANS orphan PR(s)"
+SKIPPED_TOTAL=$(( SKIPPED_NOTOURS + SKIPPED_UNKNOWN + SKIPPED_ROSTER_BLIND ))
+if [ "$ALARMED" -gt 0 ] || [ "$RESOLVED" -gt 0 ] || [ "$ORPHANS" -gt 0 ] || [ "$SKIPPED_TOTAL" -gt 0 ] || [ "$OURS_BY_STORE" -gt 0 ]; then
+    echo "detect-silent-published-work: $ALARMED alarm(s), $RESOLVED gate(s) auto-resolved, $ORPHANS orphan PR(s), $SKIPPED_TOTAL past-threshold candidate(s) not alarmed on subject scope, $OURS_BY_STORE town-local (ours by store)"
+fi
+
+# TOWN LOCALITY (a), COUNTED. A subject-scope narrowing that nobody can see is a
+# fresh instance of the class this detector exists to catch: an alarm leg that
+# has quietly stopped alarming is indistinguishable from a city with no stalled
+# work. The skips are named and counted, split by WHY — "not ours" is a
+# decision, "roster unreadable" is a fault — and the FAULT shapes always reach
+# the operator because they ride UNKNOWN into the non-zero exit below, whose
+# output the controller retains. BE HONEST ABOUT THE DECISION shape: on a sweep
+# that is otherwise clean this order exits 0 and the controller discards stdout
+# entirely (order stdout is stored nowhere), so the routine "not ours" count is
+# NOT a per-sweep record — reading its steady state means running the order by
+# hand or the ga-hwk3r9 noise review, and any claim stronger than that here
+# would be the very invisibility this comment warns about (claude review
+# finding 5, 2026-09-22).
+if [ "$SKIPPED_TOTAL" -gt 0 ]; then
+    echo "detect-silent-published-work: subject scope skipped $SKIPPED_TOTAL candidate(s) past threshold: $SKIPPED_NOTOURS not on this city's roster, $SKIPPED_UNKNOWN with an unreadable identity, $SKIPPED_ROSTER_BLIND with the roster itself unreadable${SKIP_SAMPLE:+ — e.g. $SKIP_SAMPLE}" >&2
 fi
 
 # A BLIND SWEEP MUST NOT LOOK LIKE A CLEAN ONE. The controller retains an exec
