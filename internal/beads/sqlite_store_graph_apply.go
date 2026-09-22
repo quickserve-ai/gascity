@@ -77,6 +77,7 @@ func (s *SQLiteStore) ApplyGraphPlanWithStorage(ctx context.Context, plan *Graph
 			Metadata:    maps.Clone(node.Metadata),
 			Ephemeral:   ephemeral,
 			NoHistory:   noHistory,
+			AwaitType:   node.AwaitType,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("sqlite graph apply: %w", err)
