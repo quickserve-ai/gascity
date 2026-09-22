@@ -288,6 +288,10 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 		if workspaceUsesManagedBdStoreContract(cityPath, cfg.Rigs) {
 			register(newDoltTopologyCheck(cityPath, cfg))
 			register(newDoltDriftCheck(cityPath, cfg))
+			// ga-7qkj: dolt-drift and the managed-dolt probes read marker files;
+			// this one starts from the process table, so a server that never
+			// wrote a marker (the field orphans) is visible too.
+			register(newDoltServersCheck(cityPath, cfg))
 		}
 		register(doctor.NewConfigValidCheck(cfg))
 		register(doctor.NewLegacySuspendedFieldCheck(cfg))
