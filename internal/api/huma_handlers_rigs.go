@@ -616,9 +616,14 @@ func (s *Server) humaHandleRigRestart(name string) (*RigActionResponse, error) {
 			//
 			// A liveness probe is affordable here in a way it is not on the
 			// reconciler's hot path: this is one operator action, not a tick.
-			if !sp.IsRunning(sessionName) {
-				continue
-			}
+			//
+			// THE PROBE GATES THE RECORD, NEVER THE STOP. IsRunning is narrower
+			// than what Stop cleans up: the k8s provider's Stop deletes
+			// label-matched pods in EVERY phase (Pending, Failed, Running before
+			// tmux appears), and tmux dead panes have the same shape. Skipping
+			// Stop on a false probe left those resources behind while the
+			// restart reported success (Codex #106 r4).
+			running := sp.IsRunning(sessionName)
 			// An operator killing a rig's agents through the API.
 			//
 			// killed/failed follow the STOP, never the record. The event sink
@@ -627,11 +632,23 @@ func (s *Server) humaHandleRigRestart(name string) (*RigActionResponse, error) {
 			// every successfully killed agent under Failed. Same shape as the
 			// Manager strand this branch already fixed; the two questions have to
 			// stay apart at every caller, not just the one that was reviewed.
-			stopErr, recErr := runtime.StopRecordedDetailed(sp, sessionName, runtime.Termination{
+			//
+			// A seat that was not running still goes through the seam, as
+			// observed-dead: it is out of the denominator, and it says what
+			// happened (cleanup of whatever runtime was left) instead of
+			// claiming an operator ended a live session. Routing it around the
+			// seam would need a fence exemption, and the fence's value is that
+			// it has none.
+			term := runtime.Termination{
 				Kind:   runtime.KindOperatorKill,
 				Actor:  "api",
 				Reason: "rig-scoped kill of all agents",
-			}, termSink)
+			}
+			if !running {
+				term.Kind = runtime.KindObservedDead
+				term.Reason = "rig-scoped kill: not running at probe; cleanup stop of any leftover runtime"
+			}
+			stopErr, recErr := runtime.StopRecordedDetailed(sp, sessionName, term, termSink)
 			if recErr != nil {
 				log.Printf("api: rig restart: killed %s but the termination record failed: %v", ea.qualifiedName, recErr)
 			}

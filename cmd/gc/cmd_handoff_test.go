@@ -624,6 +624,20 @@ func TestDoHandoff_PinnedAlwaysSessionRequiresPersistRestart(t *testing.T) {
 			if rec.Events[0].Type != events.MailSent {
 				t.Fatalf("event[0].Type = %q, want %q", rec.Events[0].Type, events.MailSent)
 			}
+			// NOTHING MAY BE LEFT ARMED (Codex #106 r4). No restart is coming,
+			// so a leftover intent would relabel the next unrelated ending as a
+			// handoff, and a leftover flag would restart the seat as a generic
+			// restart the reconciler's pinned guard then drops.
+			got, err := store.Get(b.ID)
+			if err != nil {
+				t.Fatalf("re-reading session bead: %v", err)
+			}
+			if v := got.Metadata[session.TerminationIntentKey]; v != "" {
+				t.Errorf("%s = %q after a refused pinned handoff, want empty", session.TerminationIntentKey, v)
+			}
+			if dops.restartRequested["mayor"] {
+				t.Error("restart-requested flag still set after a refused pinned handoff")
+			}
 		})
 	}
 }

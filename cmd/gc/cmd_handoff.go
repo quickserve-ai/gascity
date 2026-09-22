@@ -302,29 +302,36 @@ func doHandoffWithOutcome(msgStore, sessStore beads.Store, rec events.Recorder, 
 	// The stamp also carries the request instant, which is what makes Timer B
 	// real for the good ending rather than a field awaiting a populator.
 	// Best-effort: a handoff must never fail because its bookkeeping did.
+	//
+	// Pinned named sessions are kill-protected by the reconciler unless an
+	// explicit controller reset (continuation_reset_pending) is persisted
+	// through the worker boundary: without it, the reconciler's collateral-skip
+	// clears the runtime flag and leaves the session running indefinitely.
+	// Persisting is therefore mandatory for pinned sessions; for everything
+	// else the runtime flag is primary and the bead write stays best-effort
+	// backup. A pinned session with no persistence is refused BEFORE anything
+	// is written, so that refusal has nothing to unwind.
+	if pinned && persistRestart == nil {
+		fmt.Fprintf(stderr, "gc handoff: pinned session %q has no restart persistence available; not requesting restart\n", sessionName) //nolint:errcheck // best-effort stderr
+		return handoffOutcome{code: 1}
+	}
 	recordHandoffTerminationIntent(sessStore, sessionName, stderr)
 	if err := dops.setRestartRequested(sessionName); err != nil {
 		// UNWIND IT. The restart was never armed, so an intent left behind would
 		// be consumed by whatever restarts this seat next and would relabel an
 		// unrelated ending as a handoff — over-claiming the numerator, which the
 		// consumed-at-most-once rule exists to prevent.
-		clearHandoffTerminationIntent(sessStore, sessionName, stderr)
+		unwindHandoffRestart(dops, sessStore, sessionName, stderr)
 		fmt.Fprintf(stderr, "gc handoff: setting restart flag: %v\n", err) //nolint:errcheck // best-effort stderr
 		return handoffOutcome{code: 1}
 	}
-	// Pinned named sessions are kill-protected by the reconciler unless an
-	// explicit controller reset (continuation_reset_pending) is persisted
-	// through the worker boundary: without it, the reconciler's collateral-skip
-	// clears the runtime flag set above and leaves the session running
-	// indefinitely. Persisting is therefore mandatory for pinned sessions; for
-	// everything else the runtime flag is primary and the bead write stays
-	// best-effort backup.
 	if pinned {
-		if persistRestart == nil {
-			fmt.Fprintf(stderr, "gc handoff: pinned session %q has no restart persistence available; not requesting restart\n", sessionName) //nolint:errcheck // best-effort stderr
-			return handoffOutcome{code: 1}
-		}
 		if err := persistRestart(); err != nil {
+			// The flag is armed but the reconciler's pinned guard will CLEAR it
+			// without consuming it, so no restart is coming. Retire both
+			// markers here; the guard also clears the intent when it clears
+			// the flag, so a failed unwind is not left armed (Codex #106 r4).
+			unwindHandoffRestart(dops, sessStore, sessionName, stderr)
 			fmt.Fprintf(stderr, "gc handoff: could not persist restart marker for pinned session %q; not requesting restart: %v\n", sessionName, err) //nolint:errcheck // best-effort stderr
 			return handoffOutcome{code: 1}
 		}
@@ -597,4 +604,20 @@ func clearHandoffTerminationIntent(sessStore beads.Store, sessionName string, st
 	if err := sessionFrontDoor(sessStore).ApplyPatch(id, session.ClearTerminationIntentPatch()); err != nil {
 		fmt.Fprintf(stderr, "gc handoff: clearing handoff intent on %s: %v\n", id, err) //nolint:errcheck // best-effort stderr
 	}
+}
+
+// unwindHandoffRestart retires BOTH markers a failed handoff may have written:
+// the termination intent and the provider restart flag. Either one alone is a
+// hazard — an armed flag restarts the seat as a generic restart, and a lone
+// intent relabels the next unrelated ending as a handoff. Clearing a flag that
+// was never set is harmless, so this runs on every failure after the intent is
+// stamped. It stays best-effort; the reconciler's pinned guard is the backstop
+// that clears the intent whenever it clears an unconsumed flag.
+func unwindHandoffRestart(dops drainOps, sessStore beads.Store, sessionName string, stderr io.Writer) {
+	if dops != nil {
+		if err := dops.clearRestartRequested(sessionName); err != nil && !runtime.IsSessionGone(err) {
+			fmt.Fprintf(stderr, "gc handoff: clearing restart flag on %s: %v\n", sessionName, err) //nolint:errcheck // best-effort stderr
+		}
+	}
+	clearHandoffTerminationIntent(sessStore, sessionName, stderr)
 }

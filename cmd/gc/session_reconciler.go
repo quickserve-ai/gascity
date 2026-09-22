@@ -3280,11 +3280,25 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							fmt.Fprintf(stderr, "session reconciler: clearing deferred restart-requested marker for pinned named session %s (bead %s): %v\n", name, id, err) //nolint:errcheck
 						}
 					}
+					// The flag is being dropped UNCONSUMED, so no restart follows it.
+					// A termination intent paired with it must die with it: left
+					// armed, it relabels the next unrelated ending (a handoff whose
+					// pinned persist failed, Codex #106 r4). This is the backstop for
+					// the handoff's own best-effort unwind.
+					skipClear := sessionpkg.MetadataPatch{}
 					if beadRequested {
+						skipClear["restart_requested"] = ""
+					}
+					if strings.TrimSpace(infoByID[id].TerminationIntent) != "" {
+						for k, v := range sessionpkg.ClearTerminationIntentPatch() {
+							skipClear[k] = v
+						}
+					}
+					if len(skipClear) > 0 {
 						// applyStore: the clear is persisted and folded in one call, and
 						// the fold correctly does not advance past a rejected write —
 						// this entry is not read again this tick (we continue below).
-						tick.applyStore(id, sessFront, sessionpkg.MetadataPatch{"restart_requested": ""})
+						tick.applyStore(id, sessFront, skipClear)
 					}
 					fmt.Fprintf(stderr, "session reconciler: skipping abrupt restart-requested kill for pinned named session %s (bead %s)\n", name, id) //nolint:errcheck
 					continue

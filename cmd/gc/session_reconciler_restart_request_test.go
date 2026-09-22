@@ -728,6 +728,66 @@ func TestReconcileSessionBeads_RestartRequestSkipsCollateralKillForPinnedNamedSe
 	}
 }
 
+// TestReconcileSessionBeads_PinnedGuardClearsAPairedTerminationIntent is the
+// backstop for a handoff whose pinned persist failed (Codex #106 r4). The guard
+// drops the restart flag UNCONSUMED, so no restart follows; an intent left
+// behind would relabel the seat's next unrelated ending as a handoff. The
+// handoff's own unwind is best-effort, so the guard must retire the intent too.
+func TestReconcileSessionBeads_PinnedGuardClearsAPairedTerminationIntent(t *testing.T) {
+	env := newRestartRequestTestEnv()
+	env.cfg = &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Agents:        []config.Agent{{Name: "worker", StartCommand: "true", MaxActiveSessions: restartRequestTestIntPtr(1)}},
+		NamedSessions: []config.NamedSession{{Template: "worker", Mode: "always"}},
+	}
+	sessionName := config.NamedSessionRuntimeName(env.cfg.Workspace.Name, env.cfg.Workspace, "worker")
+	env.desiredState[sessionName] = TemplateParams{
+		Command:      "true",
+		SessionName:  sessionName,
+		TemplateName: "worker",
+		ResolvedProvider: &config.ResolvedProvider{
+			SessionIDFlag: "--session-id",
+		},
+	}
+
+	session := env.createSessionBead(sessionName)
+	env.setSessionMetadata(&session, map[string]string{
+		namedSessionMetadataKey:      "true",
+		namedSessionIdentityMetadata: "worker",
+		namedSessionModeMetadata:     "always",
+		"state":                      "active",
+		"pin_awake":                  "true",
+		"restart_requested":          "true",
+		"termination.intent":         "handoff",
+		"termination.intent_at":      "2026-09-22T03:00:00Z",
+	})
+	if err := env.sp.Start(context.Background(), sessionName, runtime.Config{Command: "true"}); err != nil {
+		t.Fatalf("start session: %v", err)
+	}
+	if err := env.sp.SetMeta(sessionName, "GC_SESSION_ID", session.ID); err != nil {
+		t.Fatalf("SetMeta(GC_SESSION_ID): %v", err)
+	}
+
+	env.reconcile([]beads.Bead{session})
+
+	if !env.sp.IsRunning(sessionName) {
+		t.Fatalf("pinned named session %q was killed; the guard must still defer the kill", sessionName)
+	}
+	got, err := env.store.Get(session.ID)
+	if err != nil {
+		t.Fatalf("store.Get(%s): %v", session.ID, err)
+	}
+	if got.Metadata["restart_requested"] != "" {
+		t.Fatalf("restart_requested = %q, want cleared", got.Metadata["restart_requested"])
+	}
+	if v := got.Metadata["termination.intent"]; v != "" {
+		t.Fatalf("termination.intent = %q after the guard dropped its restart unconsumed, want cleared", v)
+	}
+	if v := got.Metadata["termination.intent_at"]; v != "" {
+		t.Fatalf("termination.intent_at = %q, want cleared with the intent", v)
+	}
+}
+
 func TestReconcileSessionBeads_RestartRequestAllowsExplicitResetForPinnedNamedSession(t *testing.T) {
 	env := newRestartRequestTestEnv()
 	env.cfg = &config.City{
