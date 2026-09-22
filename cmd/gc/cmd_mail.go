@@ -47,13 +47,13 @@ const (
 func classifyMailWriteFailure(stderr io.Writer, cmdLabel string, err error) int {
 	switch {
 	case errors.Is(err, beadmail.ErrNotPersisted):
-		fmt.Fprintf(stderr, "%s: NOT DELIVERED — %v\n", cmdLabel, err)
-		fmt.Fprintln(stderr, "hint: no message bead exists for this send; re-send the message.")
+		fmt.Fprintf(stderr, "%s: NOT DELIVERED — %v\n", cmdLabel, err)                           //nolint:errcheck // best-effort stderr
+		fmt.Fprintln(stderr, "hint: no message bead exists for this send; re-send the message.") //nolint:errcheck // best-effort stderr
 		return mailSendNotPersistedExit
 	case errors.Is(err, beadmail.ErrUnconfirmed):
-		fmt.Fprintf(stderr, "%s: DELIVERY UNCONFIRMED — %v\n", cmdLabel, err)
-		fmt.Fprintln(stderr, "hint: the write may have landed. Confirm with \"gc bd show <message-id>\" before")
-		fmt.Fprintln(stderr, "      re-sending; gc bd show answers correctly whether or not it was archived.")
+		fmt.Fprintf(stderr, "%s: DELIVERY UNCONFIRMED — %v\n", cmdLabel, err)                                    //nolint:errcheck // best-effort stderr
+		fmt.Fprintln(stderr, "hint: the write may have landed. Confirm with \"gc bd show <message-id>\" before") //nolint:errcheck // best-effort stderr
+		fmt.Fprintln(stderr, "      re-sending; gc bd show answers correctly whether or not it was archived.")   //nolint:errcheck // best-effort stderr
 		return mailSendUnconfirmedExit
 	}
 	return 0
