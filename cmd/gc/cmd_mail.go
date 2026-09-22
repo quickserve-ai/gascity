@@ -1267,8 +1267,20 @@ func resolveLiveConfiguredNamedMailTargetCached(sessStore beads.Store, identifie
 	case 1:
 		return matches[order[0]], true, nil
 	default:
-		return resolvedMailTarget{}, true, fmt.Errorf("%w: %q matches %d live configured named sessions: %s",
-			session.ErrAmbiguous, identifier, len(order), strings.Join(order, ", "))
+		// Name each candidate in a form that resolves from any cwd: a
+		// city-scoped mailbox is rooted ("/barry"), a rig-scoped one is already
+		// qualified (ga-mk8tp4). A bare list left the city seat unaddressable
+		// from inside a rig.
+		addressable := make([]string, 0, len(order))
+		for _, display := range order {
+			if strings.Contains(display, "/") {
+				addressable = append(addressable, display)
+			} else {
+				addressable = append(addressable, session.CityScopePrefix+display)
+			}
+		}
+		return resolvedMailTarget{}, true, fmt.Errorf("%w: %q matches %d live configured named sessions; address one of: %s",
+			session.ErrAmbiguous, identifier, len(order), strings.Join(addressable, ", "))
 	}
 }
 

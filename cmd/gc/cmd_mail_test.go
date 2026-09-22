@@ -1548,6 +1548,64 @@ func TestResolveMailRecipientIdentity_BareRigScopedNamedRejectsAmbiguousLiveConf
 	}
 }
 
+// ga-mk8tp4: a city seat and a rig seat share the bare name "barry". From inside
+// the rig, "/barry" must reach the city seat, and bare "barry" must refuse while
+// naming an address for each candidate. Both seats are LIVE, so the send path's
+// live-session matcher (which runs before the config resolver) is exercised too.
+func TestResolveMailRecipientIdentity_RootedAddressReachesTheCitySeatFromARigCwd(t *testing.T) {
+	t.Setenv("GC_SESSION", "fake")
+	rigDir := t.TempDir()
+	t.Setenv("GC_DIR", rigDir)
+
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Rigs:      []config.Rig{{Name: "qcore", Path: rigDir}},
+		Agents: []config.Agent{
+			{Name: "barry", StartCommand: "true"},
+			{Name: "barry", Dir: "qcore", StartCommand: "true"},
+		},
+		NamedSessions: []config.NamedSession{
+			{Template: "barry", Mode: "always"},
+			{Template: "barry", Dir: "qcore", Mode: "always"},
+		},
+	}
+	for _, identity := range []string{"barry", "qcore/barry"} {
+		if _, err := store.Create(beads.Bead{
+			Type:   session.BeadType,
+			Labels: []string{session.LabelSession},
+			Metadata: map[string]string{
+				"alias":                     identity,
+				"session_name":              strings.ReplaceAll(identity, "/", "--"),
+				"configured_named_session":  "true",
+				"configured_named_identity": identity,
+				"configured_named_mode":     "always",
+			},
+		}); err != nil {
+			t.Fatalf("Create(%s): %v", identity, err)
+		}
+	}
+	if got := currentRigContext(cfg); got != "qcore" {
+		t.Fatalf("currentRigContext = %q, want qcore (the test must run from inside the rig)", got)
+	}
+
+	address, err := resolveMailRecipientIdentity(t.TempDir(), cfg, store, "/barry")
+	if err != nil {
+		t.Fatalf("resolveMailRecipientIdentity(/barry) from the qcore rig: %v", err)
+	}
+	if address != "barry" {
+		t.Fatalf("address = %q, want the city seat barry", address)
+	}
+
+	_, err = resolveMailRecipientIdentity(t.TempDir(), cfg, store, "barry")
+	if !errors.Is(err, session.ErrAmbiguous) {
+		t.Fatalf("resolveMailRecipientIdentity(barry) = %v, want ErrAmbiguous", err)
+	}
+	if !strings.Contains(err.Error(), "/barry") || !strings.Contains(err.Error(), "qcore/barry") {
+		t.Fatalf("error = %q, want it to name /barry and qcore/barry", err)
+	}
+}
+
 // --- gc mail inbox ---
 
 type recordingMailInboxReader struct {
