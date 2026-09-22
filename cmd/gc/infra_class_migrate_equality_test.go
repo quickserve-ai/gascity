@@ -105,6 +105,7 @@ func beadCopyFieldMutations() map[string]func(beads.Bead) beads.Bead {
 		"From":      func(b beads.Bead) beads.Bead { b.From = ""; return b },
 		"ParentID":  func(b beads.Bead) beads.Bead { b.ParentID = ""; return b },
 		"Ref":       func(b beads.Bead) beads.Bead { b.Ref = ""; return b },
+		"AwaitType": func(b beads.Bead) beads.Bead { b.AwaitType = "human"; return b },
 		"Description": func(b beads.Bead) beads.Bead {
 			b.Description = ""
 			return b
