@@ -24,13 +24,13 @@ func doltServersFixture(t *testing.T, procs []DoltProcInfo, discoverErr, layoutE
 		cityPath: city,
 		cfg:      cfg,
 		discover: func() ([]DoltProcInfo, error) { return procs, discoverErr },
-		layout: func(string) (managedDoltRuntimeLayout, error) {
+		layout: func(scope string) (managedDoltRuntimeLayout, error) {
 			if layoutErr != nil {
 				return managedDoltRuntimeLayout{}, layoutErr
 			}
 			return managedDoltRuntimeLayout{
-				ConfigFile: filepath.Join(city, ".gc", "runtime", "packs", "dolt", "dolt-config.yaml"),
-				DataDir:    filepath.Join(city, ".beads", "dolt"),
+				ConfigFile: filepath.Join(scope, ".gc", "runtime", "packs", "dolt", "dolt-config.yaml"),
+				DataDir:    filepath.Join(scope, ".beads", "dolt"),
 			}, nil
 		},
 		otherScopes:     func(string) ([]string, error) { return []string{"/other-city"}, nil },
@@ -282,8 +282,8 @@ func TestDoltServersCheck_RecordedPIDOutsideManagedIsWarning(t *testing.T) {
 	}
 }
 
-func TestDisplayDoltPath_NeverCarriesTrailingFlags(t *testing.T) {
-	got := displayDoltPath("/city/x.yaml -u root -p hunter2")
+func TestTrimFlattenedDoltArgs_NeverCarriesTrailingFlags(t *testing.T) {
+	got := trimFlattenedDoltArgs("/city/x.yaml -u root -p hunter2")
 	if got != "/city/x.yaml" {
 		t.Fatalf("displayDoltPath = %q", got)
 	}
@@ -294,5 +294,40 @@ func TestDoltServersCheck_AgeFallsBackToPSWhenDiscoveryLeftItEmpty(t *testing.T)
 	c.startIdentity = func(int) string { return "Tue Sep 22 09:00:00 2026" }
 	if got := c.describe(gcDoltProc(1, "/x")); !strings.Contains(got, "up 3h") {
 		t.Fatalf("describe = %q, want up 3h", got)
+	}
+}
+
+// A gc-launched rig server (config) and a `bd dolt start` server (cwd on the
+// rig's data dir) serve ONE store through different identities.
+func TestDoltServersCheck_RigSplitBrainAcrossIdentitiesIsError(t *testing.T) {
+	bdStarted := DoltProcInfo{PID: 502, Argv: []string{"dolt", "sql-server"}}
+	c := doltServersFixture(t, []DoltProcInfo{
+		gcDoltProc(100, "/city", 51361),
+		gcDoltProc(500, "/city/rigs/app", 40000),
+		bdStarted,
+	}, nil, nil)
+	c.cwd = func(pid int) (string, bool) {
+		if pid == 502 {
+			return "/city/rigs/app/.beads/dolt", true
+		}
+		return "", false
+	}
+	if r := c.Run(nil); r.Status != doctor.StatusError {
+		t.Fatalf("status = %v, want Error: %q %v", r.Status, r.Message, r.Details)
+	}
+}
+
+// macOS ps discovery flattens the command line: the recovered --config can
+// carry the flags after it. That must not defeat the managed-layout match.
+func TestDoltServersCheck_FlattenedConfigStillMatchesManagedLayout(t *testing.T) {
+	flat := gcDoltProc(200, "/city")
+	flat.Argv[len(flat.Argv)-1] += " -u root -p hunter2"
+	c := doltServersFixture(t, []DoltProcInfo{gcDoltProc(100, "/city", 51361), flat}, nil, nil)
+	r := c.Run(nil)
+	if r.Status != doctor.StatusError {
+		t.Fatalf("status = %v, want Error (a duplicate managed server): %q %v", r.Status, r.Message, r.Details)
+	}
+	if strings.Contains(r.Message+strings.Join(r.Details, "\n"), "hunter2") {
+		t.Fatalf("credential reached doctor output: %q", r.Message)
 	}
 }
