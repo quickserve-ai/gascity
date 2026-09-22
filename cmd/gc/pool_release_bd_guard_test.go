@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -265,7 +266,7 @@ func TestReleaseWorkBead_BdStoreGuardedRelease(t *testing.T) {
 		store := beads.NewBdStoreWithPrefix(t.TempDir(), ledger.run, "bd")
 		wa := workAssignmentForStore(beads.WorkStore{Store: store})
 
-		if err := wa.ReleaseWorkBead(ledger.row(), ""); err != nil {
+		if err := wa.ReleaseWorkBead(ledger.row(), "", io.Discard, "test"); err != nil {
 			t.Fatalf("ReleaseWorkBead: %v", err)
 		}
 		if len(ledger.updates) != 1 || testFlagValue(ledger.updates[0], "--if-status") != "open" || testFlagValue(ledger.updates[0], "--if-assignee") != "retired-session" {
@@ -281,7 +282,7 @@ func TestReleaseWorkBead_BdStoreGuardedRelease(t *testing.T) {
 		store := beads.NewBdStoreWithPrefix(t.TempDir(), ledger.run, "bd")
 		wa := workAssignmentForStore(beads.WorkStore{Store: store})
 
-		if err := wa.ReleaseWorkBead(ledger.row(), ""); err != nil {
+		if err := wa.ReleaseWorkBead(ledger.row(), "", io.Discard, "test"); err != nil {
 			t.Fatalf("ReleaseWorkBead = %v, want nil: the bead moved on, as with tier 1's lost race", err)
 		}
 		if got := ledger.row(); got.Assignee != "fresh-worker" || got.Status != "in_progress" {
@@ -294,7 +295,7 @@ func TestReleaseWorkBead_BdStoreGuardedRelease(t *testing.T) {
 		store := beads.NewBdStoreWithPrefix(t.TempDir(), ledger.run, "bd")
 		wa := workAssignmentForStore(beads.WorkStore{Store: store})
 
-		err := wa.ReleaseWorkBead(ledger.row(), "")
+		err := wa.ReleaseWorkBead(ledger.row(), "", io.Discard, "test")
 		if !errors.Is(err, beads.ErrConditionalWriteUnsupported) {
 			t.Fatalf("ReleaseWorkBead = %v, want an error wrapping ErrConditionalWriteUnsupported so a caller does not close over the bead", err)
 		}
