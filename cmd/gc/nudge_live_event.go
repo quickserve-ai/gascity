@@ -68,7 +68,7 @@ func openLiveNudgeRecorder(cityPath string, eventsCfg config.EventsConfig) event
 	// exactly what a transient writer must not open.
 	if v := strings.TrimSpace(eventsCfg.Provider); strings.HasPrefix(v, "exec:") || v == "fake" || v == "fail" {
 		prov, err := newEventsProviderForNameWithConfig(v, eventsPath, io.Discard, eventsCfg)
-		if err != nil || prov == nil {
+		if err != nil {
 			return events.Discard
 		}
 		return prov
