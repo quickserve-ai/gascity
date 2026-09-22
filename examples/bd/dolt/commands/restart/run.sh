@@ -9,7 +9,14 @@
 # `gc dolt recover` command only handles the read-only failure mode;
 # this command is the deliberate forced-restart counterpart.
 #
-# Environment: GC_CITY_PATH
+# Before stopping anything, restart consults the ENOSPC guard shared with
+# gc-beads-bd auto-recovery (assets/scripts/dolt-enospc.sh in the bd pack): it
+# refuses while the Dolt data volume is below GC_DOLT_RESTART_MIN_FREE_MB free
+# or the Dolt log shows ENOSPC stamped within GC_DOLT_RESTART_ENOSPC_WINDOW_MIN
+# minutes, and prints the evidence it is refusing on.
+#
+# Environment: GC_CITY_PATH (also GC_DOLT_DATA_DIR, GC_DOLT_LOG_FILE,
+# GC_DOLT_RESTART_MIN_FREE_MB, GC_DOLT_RESTART_ENOSPC_WINDOW_MIN)
 set -e
 
 : "${GC_CITY_PATH:?GC_CITY_PATH must be set}"
@@ -51,7 +58,12 @@ esac
 
 CITY_RUNTIME_DIR="${GC_CITY_RUNTIME_DIR:-$GC_CITY_PATH/.gc/runtime}"
 PACK_STATE_DIR="${GC_PACK_STATE_DIR:-$CITY_RUNTIME_DIR/packs/dolt}"
+# LOG_FILE and DATA_DIR are inputs to the sourced dolt-enospc.sh guard.
+# shellcheck disable=SC2034
 LOG_FILE="${GC_DOLT_LOG_FILE:-$PACK_STATE_DIR/dolt.log}"
+# Same default gc-beads-bd start/stop use for the managed data directory.
+# shellcheck disable=SC2034
+DATA_DIR="${GC_DOLT_DATA_DIR:-$GC_CITY_PATH/.beads/dolt}"
 BD_SCRIPT_DIR="$(CDPATH= cd -- "$(dirname "$GC_BEADS_BD_SCRIPT")" && pwd)"
 if [ ! -f "$BD_SCRIPT_DIR/dolt-enospc.sh" ]; then
   # GC_BEADS_BD_SCRIPT may be the stable city shim; the helper ships next
@@ -63,11 +75,12 @@ fi
 
 if recovery_should_skip_due_to_enospc; then
   if [ "$force_restart" != "true" ]; then
-    echo "gc dolt restart: recent Dolt log shows ENOSPC; refusing restart because it can amplify recovery writes" >&2
-    echo "  free disk space, then run gc dolt restart --force only if a restart is still required" >&2
+    echo "gc dolt restart: refusing restart: $ENOSPC_REFUSAL_REASON" >&2
+    printf '%s\n' "$ENOSPC_REFUSAL_DETAIL" >&2
+    echo "  restarting Dolt under disk exhaustion amplifies recovery writes; free disk space on the Dolt data volume, then re-run gc dolt restart" >&2
     exit 1
   fi
-  echo "gc dolt restart: --force set; restarting despite recent ENOSPC evidence" >&2
+  echo "gc dolt restart: --force set; restarting despite the ENOSPC guard: $ENOSPC_REFUSAL_REASON" >&2
 fi
 
 # Stop. Exit 2 from gc-beads-bd stop means "nothing was running" — a
