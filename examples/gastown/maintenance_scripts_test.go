@@ -4013,6 +4013,107 @@ func TestReaperScriptSQLReflectsCurrentSchema(t *testing.T) {
 	}
 }
 
+// notInSubqueryRe matches a NOT IN predicate whose right side is a subquery.
+// A literal list (NOT IN ('message')) or an interpolated list (NOT IN
+// ($TYPES)) is planned correctly and is out of scope.
+var notInSubqueryRe = regexp.MustCompile(`(?is)\bNOT\s+IN\s*\(\s*SELECT\b`)
+
+var sqlAndKeywordRe = regexp.MustCompile(`(?i)\bAND\b`)
+
+// doubleNotInSubqueryStatements returns a snippet for every SQL statement in
+// text that ANDs two or more NOT IN (subquery) predicates. On Dolt 2.2.4 that
+// pair is planned as an anti-join plus a plain InSubquery with the first NOT
+// dropped when the first subquery is a UNION (pl-chi), so the statement
+// returns exactly the rows the first guard should exclude. Keep at most one
+// NOT IN (subquery) per statement; write further exclusions as correlated
+// NOT EXISTS. Statements are split on ';', so a pair assembled at runtime from
+// separate strings is not visible here — that class stays on ga-6fcxcs.
+func doubleNotInSubqueryStatements(text string) []string {
+	var hits []string
+	for _, stmt := range strings.Split(text, ";") {
+		locs := notInSubqueryRe.FindAllStringIndex(stmt, -1)
+		if len(locs) < 2 {
+			continue
+		}
+		for i := 1; i < len(locs); i++ {
+			if sqlAndKeywordRe.MatchString(stmt[locs[i-1][1]:locs[i][0]]) {
+				snippet := strings.Join(strings.Fields(stmt), " ")
+				if len(snippet) > 220 {
+					snippet = snippet[:220] + "..."
+				}
+				hits = append(hits, snippet)
+				break
+			}
+		}
+	}
+	return hits
+}
+
+// plChiReproSQL is the minimal reproduction from pl-chi: the first NOT IN is
+// over a UNION, the second is ANDed. Dolt 2.2.4 drops the first NOT. The lint
+// must always flag this shape; it is the known-positive control.
+const plChiReproSQL = `SELECT id FROM issues
+WHERE id NOT IN (SELECT DISTINCT d.issue_id FROM dependencies d INNER JOIN issues i ON d.depends_on_issue_id = i.id WHERE i.status IN ('open','in_progress')
+UNION SELECT DISTINCT d.depends_on_issue_id FROM dependencies d INNER JOIN issues i ON d.issue_id = i.id WHERE i.status IN ('open','in_progress'))
+AND id NOT IN (SELECT issue_id FROM labels WHERE label = 'operator-directive')`
+
+func TestDoubleNotInSubqueryLintFlagsKnownPositive(t *testing.T) {
+	if hits := doubleNotInSubqueryStatements(plChiReproSQL); len(hits) != 1 {
+		t.Fatalf("lint must flag the pl-chi repro exactly once, got %d hits: %v", len(hits), hits)
+	}
+
+	singleGuard := `DELETE FROM issues WHERE id NOT IN (SELECT d.issue_id FROM dependencies d UNION SELECT d.depends_on_issue_id FROM dependencies d) AND status = 'open'`
+	if hits := doubleNotInSubqueryStatements(singleGuard); len(hits) != 0 {
+		t.Fatalf("lint flagged a single NOT IN (subquery), the shape reaper step 5 uses today: %v", hits)
+	}
+
+	rewritten := `SELECT id FROM issues
+WHERE id NOT IN (SELECT d.issue_id FROM dependencies d UNION SELECT d.depends_on_issue_id FROM dependencies d)
+AND NOT EXISTS (SELECT 1 FROM labels od WHERE od.issue_id = issues.id AND od.label = 'operator-directive')`
+	if hits := doubleNotInSubqueryStatements(rewritten); len(hits) != 0 {
+		t.Fatalf("lint flagged the correlated NOT EXISTS rewrite: %v", hits)
+	}
+
+	literalList := `DELETE FROM wisps WHERE issue_type NOT IN ('message') AND id NOT IN (SELECT depends_on_wisp_id FROM dependencies)`
+	if hits := doubleNotInSubqueryStatements(literalList); len(hits) != 0 {
+		t.Fatalf("lint flagged a literal NOT IN list paired with one subquery: %v", hits)
+	}
+
+	separateStatements := `DELETE FROM a WHERE id NOT IN (SELECT id FROM b); DELETE FROM c WHERE id NOT IN (SELECT id FROM d) AND x = 1`
+	if hits := doubleNotInSubqueryStatements(separateStatements); len(hits) != 0 {
+		t.Fatalf("lint paired NOT IN predicates across a statement boundary: %v", hits)
+	}
+}
+
+func TestMaintenanceScriptsHaveNoDoubleNotInSubquery(t *testing.T) {
+	roots := []string{
+		filepath.Clean(filepath.Join(exampleDir(), "..", "..", "internal", "bootstrap", "packs")),
+		exampleDir(),
+	}
+	scanExt := map[string]bool{".sh": true, ".sql": true, ".py": true, ".toml": true}
+	for _, root := range roots {
+		err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if info.IsDir() || !scanExt[filepath.Ext(path)] {
+				return nil
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			for _, hit := range doubleNotInSubqueryStatements(string(data)) {
+				t.Errorf("%s: statement ANDs two NOT IN (subquery) predicates; Dolt 2.2.4 drops the first NOT when its subquery is a UNION (pl-chi) — rewrite one side as correlated NOT EXISTS: %s", path, hit)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("walk %s: %v", root, err)
+		}
+	}
+}
+
 func TestReaperParentIDIsParentChildDependencyProjection(t *testing.T) {
 	runner := func(_, name string, args ...string) ([]byte, error) {
 		call := name + " " + strings.Join(args, " ")
