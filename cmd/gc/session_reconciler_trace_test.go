@@ -1028,3 +1028,71 @@ func TestTraceFlushCurrentBatchWaitBudgetDegrades(t *testing.T) {
 		t.Fatalf("stderr = %q, want slow_storage_degraded", stderr.String())
 	}
 }
+
+// TestTraceAutoArmOnDrainKeepsTheDrainDecision pins ga-p4q1of: stopping a live
+// session is the reconciler's most destructive routine action, and its decision
+// record used to be stashed and DROPPED because no drain reason or outcome
+// armed detail tracing. A pool worker drained as "orphaned" mid-claim
+// (ga-rht4v5) left only baseline awake->draining records and no reason. A drain
+// decision must now arm detail for its template, so the drain record and the
+// buffered decision before it both survive.
+func TestTraceAutoArmOnDrainKeepsTheDrainDecision(t *testing.T) {
+	cityDir := t.TempDir()
+	tracer := newSessionReconcilerTracer(cityDir, "trace-town", io.Discard)
+	if !tracer.Enabled() {
+		t.Fatal("tracer should be enabled")
+	}
+
+	cycle := tracer.BeginCycle(TraceTickTriggerPatrol, "", time.Now().UTC(), &config.City{})
+	if cycle == nil {
+		t.Fatal("BeginCycle returned nil")
+	}
+	cycle.RecordDecision(
+		TraceSiteDesiredStateBuild,
+		TraceReasonNoDemand,
+		TraceOutcomeNoChange,
+		"repo/polecat",
+		"polecat-1",
+		map[string]any{"step": "before"},
+	)
+	cycle.RecordDecision(
+		TraceSiteReconcilerOrphaned,
+		TraceReasonCode("orphaned"),
+		TraceOutcomeDrain,
+		"repo/polecat",
+		"polecat-1",
+		map[string]any{"step": "drain"},
+	)
+	if err := cycle.End(TraceCompletionCompleted, map[string]any{}); err != nil {
+		t.Fatalf("End: %v", err)
+	}
+	if err := tracer.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	records, err := ReadTraceRecords(traceCityRuntimeDir(cityDir), TraceFilter{})
+	if err != nil {
+		t.Fatalf("ReadTraceRecords: %v", err)
+	}
+	var beforeFound, drainFound, controlFound bool
+	for _, rec := range records {
+		if rec.RecordType == TraceRecordDecision && rec.Fields["step"] == "before" {
+			beforeFound = true
+		}
+		if rec.RecordType == TraceRecordDecision && rec.Fields["step"] == "drain" {
+			drainFound = true
+		}
+		if rec.RecordType == TraceRecordTraceControl && rec.Fields["action"] == "start" {
+			controlFound = true
+		}
+	}
+	if !drainFound {
+		t.Fatal("drain decision was dropped: a drain did not arm detail tracing for its template")
+	}
+	if !beforeFound {
+		t.Fatal("buffered pre-drain decision was not promoted")
+	}
+	if !controlFound {
+		t.Fatal("auto-arm trace control record missing for the drain")
+	}
+}
