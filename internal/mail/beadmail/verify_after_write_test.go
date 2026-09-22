@@ -128,7 +128,7 @@ func TestSendToleratesReadVisibilityLag(t *testing.T) {
 }
 
 // TestSendSucceedsWhenVerificationSeesTheRow pins the happy path: one
-// verification read, no retries, no behaviour change for a healthy send.
+// verification read, no retries, no behavior change for a healthy send.
 func TestSendSucceedsWhenVerificationSeesTheRow(t *testing.T) {
 	fastVerify(t)
 	baseline := &verifyStore{Store: beads.NewMemStore()}
@@ -185,7 +185,7 @@ func (s lostWriteStore) Create(b beads.Bead) (beads.Bead, error) {
 		return created, err
 	}
 	// Persist nothing — hand back only what the caller would have believed.
-	_ = s.Store.Delete(created.ID)
+	_ = s.Delete(created.ID)
 	return created, nil
 }
 

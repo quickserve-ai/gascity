@@ -364,11 +364,11 @@ func (p *Provider) verifyMessageBeadPersisted(id string) error {
 			}
 			time.Sleep(messageVerifyBackoff[attempt-1])
 		}
-		if _, err := reader.Get(id); err == nil {
+		_, err := reader.Get(id)
+		if err == nil {
 			return nil
-		} else {
-			lastErr = err
 		}
+		lastErr = err
 	}
 	// Classify on the FINAL reading. A definitive not-found means we looked and
 	// the row is absent. Anything else — an indeterminate wisp lookup, or a
@@ -815,7 +815,7 @@ func (p *Provider) Reply(id, from, subject, body string) (mail.Message, error) {
 	labels := []string{"thread:" + threadID, "reply-to:" + id}
 
 	// Reply used to build its own message bead here, which meant it skipped the
-	// confined edge its neighbours use — so the read-after-write guard did not
+	// confined edge its neighbors use — so the read-after-write guard did not
 	// cover replies, and createMessageBead's "every mail-creating method funnels
 	// through here" was not true. "to" is the sender we are replying back to.
 	b, err := p.createMessageBead(deriveReplyTitle(subject, original.Title, body), body, from, to, labels, metadata)
