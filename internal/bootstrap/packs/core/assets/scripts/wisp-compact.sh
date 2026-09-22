@@ -27,7 +27,7 @@ __SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 CITY="${GC_CITY:-.}"
 
-# Get all wisp rows. bd list omits wisps unless --include-infra is passed
+# Get all wisp rows. gc bd list omits wisps unless --include-infra is passed
 # (measured at bd 1.3.0-rc.2: 0 wisp rows without it, 65k with), and a wisp
 # row carries ephemeral:true OR no_history:true depending on which route
 # created it — never reliably one of them. Selecting on .ephemeral alone
