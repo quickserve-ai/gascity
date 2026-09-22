@@ -3320,14 +3320,14 @@ enospc_helper="$(CDPATH= cd -- "$(dirname "$0")" && pwd)/dolt-enospc.sh"
 if [ -r "$enospc_helper" ]; then
     . "$enospc_helper"
 else
-    # Some focused shell harnesses execute gc-beads-bd's prelude as a single
-    # temporary file without sibling assets. Keep the production helper as the
-    # canonical copy, but preserve the same detector behavior for those harnesses.
+    # The bd pack always ships the helper beside this script (the city shim
+    # execs the real script, so $0 resolves into the pack). Only focused shell
+    # harnesses that run this prelude as a lone temporary file land here. The
+    # helper is the guard's only implementation, so without it recovery fails
+    # closed instead of running a second copy that could drift from it.
     recovery_should_skip_due_to_enospc() {
-        [ -n "${LOG_FILE:-}" ] && [ -r "$LOG_FILE" ] || return 1
-        tail -n 1000 "$LOG_FILE" 2>/dev/null \
-            | grep -qE 'no space left on device|copy_file_range:.*no space|ENOSPC' \
-            || return 1
+        ENOSPC_REFUSAL_REASON="ENOSPC guard helper not found at $enospc_helper"
+        ENOSPC_REFUSAL_DETAIL="  the bd pack ships dolt-enospc.sh beside gc-beads-bd.sh; reinstall the pack"
         return 0
     }
 fi
@@ -3340,16 +3340,17 @@ op_recover() {
         die "recovery not supported for remote dolt servers"
     fi
 
-    # Skip auto-recovery when dolt has been failing due to disk exhaustion.
-    # Restarting dolt does not free disk space, and the recovery cycle
-    # itself amplifies the failure: each restart triggers a conjoin/backup
-    # sync that writes another partial table file to the backup remote.
-    # Require manual intervention (free disk space) before recovery
-    # resumes. See gastownhall/gascity#2158.
+    # Skip auto-recovery when the Dolt data volume is short of space now or
+    # the Dolt log shows recent ENOSPC. Restarting dolt does not free disk
+    # space, and the recovery cycle itself amplifies the failure: each restart
+    # triggers a conjoin/backup sync that writes another partial table file to
+    # the backup remote. Require manual intervention (free disk space) before
+    # recovery resumes. See gastownhall/gascity#2158.
     if recovery_should_skip_due_to_enospc; then
-        echo "skipping dolt recovery: recent dolt log shows ENOSPC — manual intervention required" >&2
-        echo "  free disk space, then re-run health checks" >&2
-        die "dolt recovery skipped: ENOSPC detected"
+        echo "skipping dolt recovery: $ENOSPC_REFUSAL_REASON — manual intervention required" >&2
+        printf '%s\n' "$ENOSPC_REFUSAL_DETAIL" >&2
+        echo "  free disk space on the Dolt data volume, then re-run health checks" >&2
+        die "dolt recovery skipped: ENOSPC guard"
     fi
 
     if load_recover_managed_from_gc; then
