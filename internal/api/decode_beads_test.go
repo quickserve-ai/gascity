@@ -16,6 +16,7 @@ func TestBeadsFromGenList_Valid(t *testing.T) {
 	updatedAt := createdAt.Add(5 * time.Minute)
 	deferUntil := createdAt.Add(2 * time.Hour)
 	ephemeral := true
+	awaitType := "bead"
 	items := []genclient.Bead{
 		{
 			Id:          "gc-1",
@@ -30,6 +31,7 @@ func TestBeadsFromGenList_Valid(t *testing.T) {
 			Labels:      &labels,
 			DeferUntil:  &deferUntil,
 			Ephemeral:   &ephemeral,
+			AwaitType:   &awaitType,
 		},
 		{Id: "gc-2", Title: "second", IssueType: "task", Status: "closed"},
 	}
@@ -63,6 +65,9 @@ func TestBeadsFromGenList_Valid(t *testing.T) {
 	}
 	if !got[0].Ephemeral {
 		t.Errorf("got[0].Ephemeral = false, want true")
+	}
+	if got[0].AwaitType != "bead" {
+		t.Errorf("got[0].AwaitType = %q, want bead — a controller-routed read must not drop a gate's await_type", got[0].AwaitType)
 	}
 	if len(got[0].Labels) != 2 || got[0].Labels[0] != "ready-to-build" {
 		t.Errorf("got[0].Labels = %v", got[0].Labels)
