@@ -33,7 +33,14 @@ func doltServersFixture(t *testing.T, procs []DoltProcInfo, discoverErr, layoutE
 				DataDir:    filepath.Join(city, ".beads", "dolt"),
 			}, nil
 		},
-		now: func() time.Time { return time.Date(2026, 9, 22, 12, 0, 0, 0, time.Local) },
+		otherScopes:     func(string) ([]string, error) { return []string{"/other-city"}, nil },
+		cwd:             func(int) (string, bool) { return "", false },
+		recordedPID:     func(managedDoltRuntimeLayout) int { return 0 },
+		activeTestRoots: func() []string { return nil },
+		startIdentity:   func(int) string { return "" },
+		homeDir:         "/home/me",
+		tempDir:         "/var/folders/T",
+		now:             func() time.Time { return time.Date(2026, 9, 22, 12, 0, 0, 0, time.Local) },
 	}
 }
 
@@ -163,5 +170,129 @@ func TestDoltServersCheck_UnparseableStartIdentityOmitsAge(t *testing.T) {
 	p.StartIdentity = "not a date"
 	if got := c.describe(p); strings.Contains(got, "up ") {
 		t.Fatalf("describe guessed an age from garbage: %q", got)
+	}
+}
+
+// A multi-city host runs one managed server per registered city. Those are
+// not orphans.
+func TestDoltServersCheck_OtherRegisteredCityIsCountedNotWarned(t *testing.T) {
+	c := doltServersFixture(t, []DoltProcInfo{gcDoltProc(100, "/city", 51361), gcDoltProc(700, "/other-city", 51362)}, nil, nil)
+	r := c.Run(nil)
+	if r.Status != doctor.StatusOK {
+		t.Fatalf("status = %v, want OK: %q %v", r.Status, r.Message, r.Details)
+	}
+	if !strings.Contains(strings.Join(r.Details, "\n"), "1 other registered city") {
+		t.Fatalf("want it counted as another city: %v", r.Details)
+	}
+}
+
+// An unreadable registry must fail toward visible: the server is still
+// warned about, and the output says why the verdict may over-report.
+func TestDoltServersCheck_UnreadableRegistryStillWarns(t *testing.T) {
+	c := doltServersFixture(t, []DoltProcInfo{gcDoltProc(100, "/city", 51361), gcDoltProc(700, "/other-city", 51362)}, nil, nil)
+	c.otherScopes = func(string) ([]string, error) { return nil, errors.New("lock held") }
+	r := c.Run(nil)
+	if r.Status != doctor.StatusWarning {
+		t.Fatalf("status = %v, want Warning: %q", r.Status, r.Message)
+	}
+	if !strings.Contains(strings.Join(r.Details, "\n"), "registry unreadable") {
+		t.Fatalf("details must say the registry was unreadable: %v", r.Details)
+	}
+}
+
+// `bd dolt start` launches `dolt sql-server -H .. -P ..` from the data dir:
+// no --config, no --data-dir. Identified by cwd, on the managed data dir, it
+// is a second server on the city's store.
+func TestDoltServersCheck_BdDoltStartOnManagedStoreIsError(t *testing.T) {
+	bdStarted := DoltProcInfo{PID: 800, Argv: []string{"dolt", "sql-server"}}
+	c := doltServersFixture(t, []DoltProcInfo{gcDoltProc(100, "/city", 51361), bdStarted}, nil, nil)
+	c.cwd = func(pid int) (string, bool) {
+		if pid == 800 {
+			return "/city/.beads/dolt", true
+		}
+		return "", false
+	}
+	r := c.Run(nil)
+	if r.Status != doctor.StatusError {
+		t.Fatalf("status = %v, want Error: %q %v", r.Status, r.Message, r.Details)
+	}
+	if !strings.Contains(r.Message, "cwd /city/.beads/dolt") {
+		t.Fatalf("message must show how pid 800 was identified: %q", r.Message)
+	}
+}
+
+// With no flags and no readable cwd the check cannot rule out the city's
+// store, so it must not count the server as someone else's.
+func TestDoltServersCheck_UnidentifiableServerIsWarningNotOK(t *testing.T) {
+	bare := DoltProcInfo{PID: 801, Argv: []string{"dolt", "sql-server"}}
+	c := doltServersFixture(t, []DoltProcInfo{gcDoltProc(100, "/city", 51361), bare}, nil, nil)
+	r := c.Run(nil)
+	if r.Status != doctor.StatusWarning {
+		t.Fatalf("status = %v, want Warning: %q %v", r.Status, r.Message, r.Details)
+	}
+	if !strings.Contains(strings.Join(r.Details, "\n"), "cannot rule out") {
+		t.Fatalf("details must say why: %v", r.Details)
+	}
+}
+
+// dolt-drift judges rig-local servers from .dolt/sql-server.info, a marker
+// file. Two servers on one rig store must be caught here.
+func TestDoltServersCheck_TwoServersOnOneRigStoreIsError(t *testing.T) {
+	c := doltServersFixture(t, []DoltProcInfo{
+		gcDoltProc(100, "/city", 51361),
+		gcDoltProc(500, "/city/rigs/app", 40000),
+		gcDoltProc(501, "/city/rigs/app"),
+	}, nil, nil)
+	r := c.Run(nil)
+	if r.Status != doctor.StatusError {
+		t.Fatalf("status = %v, want Error: %q", r.Status, r.Message)
+	}
+	if !strings.Contains(r.Message, "one rig store") {
+		t.Fatalf("message must name the rig split-brain: %q", r.Message)
+	}
+}
+
+func TestDoltServersCheck_TestServersActiveCountedOrphanWarned(t *testing.T) {
+	active := gcDoltProc(900, "/tmp/TestLive123/city")
+	orphan := gcDoltProc(901, "/tmp/TestDead456/city")
+	c := doltServersFixture(t, []DoltProcInfo{gcDoltProc(100, "/city", 51361), active, orphan}, nil, nil)
+	c.activeTestRoots = func() []string { return []string{"/tmp/TestLive123"} }
+	r := c.Run(nil)
+	if r.Status != doctor.StatusWarning {
+		t.Fatalf("status = %v, want Warning: %q", r.Status, r.Message)
+	}
+	joined := strings.Join(r.Details, "\n")
+	if strings.Contains(joined, "pid 900") || !strings.Contains(joined, "pid 901") {
+		t.Fatalf("want only the orphan (901) warned:\n%s", joined)
+	}
+	if !strings.Contains(r.FixHint, "gc dolt cleanup") {
+		t.Fatalf("orphan test servers are cleanup's job; hint = %q", r.FixHint)
+	}
+}
+
+// If the pid the runtime recorded is alive but did not match the layout, a
+// duplicate of it is undetectable. Say so instead of reading OK.
+func TestDoltServersCheck_RecordedPIDOutsideManagedIsWarning(t *testing.T) {
+	odd := DoltProcInfo{PID: 150, Argv: []string{"dolt", "sql-server", "--config", "/elsewhere/dolt.yaml"}}
+	c := doltServersFixture(t, []DoltProcInfo{odd}, nil, nil)
+	c.recordedPID = func(managedDoltRuntimeLayout) int { return 150 }
+	r := c.Run(nil)
+	if r.Status == doctor.StatusOK {
+		t.Fatalf("status = OK although the recorded managed pid matched no layout: %v", r.Details)
+	}
+}
+
+func TestDisplayDoltPath_NeverCarriesTrailingFlags(t *testing.T) {
+	got := displayDoltPath("/city/x.yaml -u root -p hunter2")
+	if got != "/city/x.yaml" {
+		t.Fatalf("displayDoltPath = %q", got)
+	}
+}
+
+func TestDoltServersCheck_AgeFallsBackToPSWhenDiscoveryLeftItEmpty(t *testing.T) {
+	c := doltServersFixture(t, nil, nil, nil)
+	c.startIdentity = func(int) string { return "Tue Sep 22 09:00:00 2026" }
+	if got := c.describe(gcDoltProc(1, "/x")); !strings.Contains(got, "up 3h") {
+		t.Fatalf("describe = %q, want up 3h", got)
 	}
 }
