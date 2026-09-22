@@ -11251,8 +11251,14 @@ const wispTimestampLayout = "2006-01-02T15:04:05"
 // `bd list --json --all -n 0` and logs all other bd subcommands to BD_LOG.
 // BD_LOG is pre-created empty so skip-path tests can still assert on its
 // (empty) contents. TZ=UTC is pinned for cross-platform date parsing — see
-// wispTimestampLayout. jq is whatever is on PATH.
+// wispTimestampLayout. jq is whatever is on PATH. `bd show <id> --json`
+// answers from the same rows; use wispCompactEnvWithShow to serve a fresh
+// state that diverges from the list snapshot.
 func wispCompactEnv(t *testing.T, beadsJSON string) (bdLog string, env map[string]string) {
+	return wispCompactEnvWithShow(t, beadsJSON, beadsJSON)
+}
+
+func wispCompactEnvWithShow(t *testing.T, beadsJSON, showJSON string) (bdLog string, env map[string]string) {
 	t.Helper()
 	binDir := t.TempDir()
 	bdLog = filepath.Join(t.TempDir(), "bd.log")
@@ -11281,16 +11287,35 @@ EOF
         ;;
     esac
     ;;
-  update|comment|delete)
+  show)
+    case "$*" in
+      *"--json"*)
+        printf '%%s\n' "$*" >> "$BD_LOG"
+        cat <<'EOF' | jq --arg id "$2" '[.[] | select(.id == $id)]'
+%s
+EOF
+        exit 0
+        ;;
+      *)
+        echo "bd show called with unexpected args: $*" >&2
+        exit 2
+        ;;
+    esac
+    ;;
+  update|comment)
     printf '%%s\n' "$*" >> "$BD_LOG"
     exit 0
+    ;;
+  delete)
+    printf '%%s\n' "$*" >> "$BD_LOG"
+    exit "${BD_DELETE_EXIT:-0}"
     ;;
   *)
     echo "bd called with unexpected subcommand: $*" >&2
     exit 2
     ;;
 esac
-`, beadsJSON))
+`, beadsJSON, showJSON))
 	writeMaintenanceGCStub(t, filepath.Join(binDir, "gc"), "#!/bin/sh\nexit 0\n")
 
 	env = map[string]string{
@@ -11456,6 +11481,73 @@ func TestWispCompactSkipsNonEphemeralBeads(t *testing.T) {
 		if strings.Contains(s, banned) {
 			t.Fatalf("non-ephemeral bead must be ignored; saw %q in bd log:\n%s", banned, s)
 		}
+	}
+}
+
+// The list snapshot at the top of the script can be arbitrarily old by the
+// time the loop reaches a row, and a wisp delete has no DOLT_COMMIT leg to
+// recover from (ga-rogz4o). The delete must be re-derived from a fresh read
+// immediately before the write: a comment that landed mid-run (which does
+// NOT bump updated_at) must veto it.
+func TestWispCompactRederivesBeforeDelete(t *testing.T) {
+	pastTTL := time.Now().Add(-48 * time.Hour).UTC().Format(wispTimestampLayout)
+	snapshot := fmt.Sprintf(`[
+  {"id":"ga-raced","status":"closed","ephemeral":true,"updated_at":%q,"comment_count":0,"labels":[]}
+]`, pastTTL)
+	fresh := fmt.Sprintf(`[
+  {"id":"ga-raced","status":"closed","ephemeral":true,"updated_at":%q,"comment_count":1,"labels":[]}
+]`, pastTTL)
+
+	bdLog, env := wispCompactEnvWithShow(t, snapshot, fresh)
+	out, err := runScriptResult(t, coreScriptPath("wisp-compact.sh"), env)
+	if err != nil {
+		t.Fatalf("wisp-compact.sh failed: %v\n%s", err, out)
+	}
+
+	log, readErr := os.ReadFile(bdLog)
+	if readErr != nil {
+		t.Fatalf("ReadFile(bd log): %v", readErr)
+	}
+	s := string(log)
+	if !strings.Contains(s, "show ga-raced --json") {
+		t.Fatalf("expected a fresh `bd show` read before the delete; bd log:\n%s", s)
+	}
+	if strings.Contains(s, "delete ga-raced") {
+		t.Fatalf("stale snapshot must not authorize the delete once the fresh read differs; bd log:\n%s", s)
+	}
+	if !strings.Contains(string(out), "recheck_skipped=1") {
+		t.Fatalf("vetoed delete must be visible in the summary; got:\n%s", out)
+	}
+}
+
+// The counter must follow the outcome, not the attempt: a delete that fails
+// is reported as a failure and fails the run, never counted as a deletion
+// (ga-rogz4o defect 1 — the order-history row must not read success).
+func TestWispCompactCountsOnlyConfirmedDeletions(t *testing.T) {
+	pastTTL := time.Now().Add(-48 * time.Hour).UTC().Format(wispTimestampLayout)
+	beads := fmt.Sprintf(`[
+  {"id":"ga-doomed","status":"closed","ephemeral":true,"updated_at":%q,"comment_count":0,"labels":[]}
+]`, pastTTL)
+
+	bdLog, env := wispCompactEnv(t, beads)
+	env["BD_DELETE_EXIT"] = "1"
+
+	out, err := runScriptResult(t, coreScriptPath("wisp-compact.sh"), env)
+	if err == nil {
+		t.Fatalf("a run with a failed delete must exit non-zero; got success:\n%s", out)
+	}
+	if !strings.Contains(string(out), "deleted=0") || !strings.Contains(string(out), "delete_failed=1") {
+		t.Fatalf("failed delete must be reported as delete_failed, not counted; got:\n%s", out)
+	}
+	if !strings.Contains(string(out), "FAILED delete ga-doomed") {
+		t.Fatalf("expected a per-id FAILED line; got:\n%s", out)
+	}
+	log, readErr := os.ReadFile(bdLog)
+	if readErr != nil {
+		t.Fatalf("ReadFile(bd log): %v", readErr)
+	}
+	if !strings.Contains(string(log), "delete ga-doomed --force") {
+		t.Fatalf("delete was expected to be attempted; bd log:\n%s", log)
 	}
 }
 
@@ -11633,15 +11725,20 @@ func TestWispCompactReportsNonZeroCounters(t *testing.T) {
 
 	writeExecutable(t, filepath.Join(binDir, "bd"), fmt.Sprintf(`#!/bin/sh
 printf '%%s\n' "$*" >> "$BD_LOG"
-case "$1 $2" in
-  "list --json")
+case "$1" in
+  list)
     cat <<'JSON'
+%s
+JSON
+    ;;
+  show)
+    cat <<'JSON' | jq --arg id "$2" '[.[] | select(.id == $id)]'
 %s
 JSON
     ;;
 esac
 exit 0
-`, beadsJSON))
+`, beadsJSON, beadsJSON))
 	writeMaintenanceGCStub(t, filepath.Join(binDir, "gc"), "#!/bin/sh\nexit 0\n")
 
 	env := map[string]string{
