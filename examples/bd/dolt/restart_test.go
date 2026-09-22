@@ -48,11 +48,17 @@ func runRestart(t *testing.T, cityPath, root string, port int) ([]byte, error) {
 	return runRestartWithEnv(t, cityPath, root, []string{fmt.Sprintf("GC_DOLT_PORT=%d", port)})
 }
 
+// runShellScript runs script under interpreter with exactly env and returns
+// its combined output. The restart tests and the ENOSPC guard harness share it.
+func runShellScript(interpreter string, env []string, script string, args ...string) ([]byte, error) {
+	cmd := exec.Command(interpreter, append([]string{script}, args...)...)
+	cmd.Env = env
+	return cmd.CombinedOutput()
+}
+
 func runRestartWithEnv(t *testing.T, cityPath, root string, extraEnv []string, args ...string) ([]byte, error) {
 	t.Helper()
-	script := filepath.Join(root, restartScript)
-	cmd := exec.Command("sh", append([]string{script}, args...)...)
-	cmd.Env = append(filteredEnv(
+	env := append(filteredEnv(
 		"PATH", "GC_DOLT_HOST", "GC_DOLT_PORT", "GC_DOLT_USER",
 		"GC_DOLT_PASSWORD", "GC_DOLT_DATA_DIR", "GC_CITY_PATH", "GC_PACK_DIR",
 		"GC_CITY_RUNTIME_DIR", "GC_PACK_STATE_DIR", "GC_DOLT_LOG_FILE",
@@ -68,8 +74,8 @@ func runRestartWithEnv(t *testing.T, cityPath, root string, extraEnv []string, a
 		// without making these tests depend on the runner's free space.
 		"GC_DOLT_RESTART_MIN_FREE_MB=1",
 	)
-	cmd.Env = append(cmd.Env, extraEnv...)
-	return cmd.CombinedOutput()
+	env = append(env, extraEnv...)
+	return runShellScript("sh", env, filepath.Join(root, restartScript), args...)
 }
 
 func TestRestartCallsStopThenStart_HappyPath(t *testing.T) {
@@ -303,6 +309,29 @@ func TestRestartRefusesENOSPCLineWithoutTimestamp(t *testing.T) {
 	if data, err := os.ReadFile(bdLog); err == nil && strings.TrimSpace(string(data)) != "" {
 		t.Fatalf("restart invoked gc-beads-bd despite ENOSPC refusal; ops log:\n%s\noutput:\n%s", data, out)
 	}
+}
+
+// TestDoltENOSPCGuardShellHarness runs test/dolt_enospc_guard_test.sh, the
+// shell harness for the Dolt ENOSPC restart guard (assets/scripts/
+// dolt-enospc.sh in the bd pack) and both of its callers: gc dolt restart and
+// gc-beads-bd op_recover. The harness drives them with a fake Dolt log and a
+// stubbed df, including the control that the pre-fix detector refuses on an
+// 8-day-old log the current guard lets through. Running it from here puts it
+// in the unit sweep CI already runs.
+func TestDoltENOSPCGuardShellHarness(t *testing.T) {
+	harness := filepath.Join(repoRoot(t), "..", "..", "..", "test", "dolt_enospc_guard_test.sh")
+	if _, err := os.Stat(harness); err != nil {
+		t.Fatalf("stat ENOSPC guard harness: %v", err)
+	}
+	env := append(filteredEnv("PATH", "TMPDIR"),
+		"PATH="+os.Getenv("PATH"),
+		"TMPDIR="+t.TempDir(),
+	)
+	out, err := runShellScript("bash", env, harness)
+	if err != nil {
+		t.Fatalf("ENOSPC guard harness failed: %v\n%s", err, out)
+	}
+	t.Logf("ENOSPC guard harness:\n%s", out)
 }
 
 // TestRestartTreatsLoopbackAndWildcardHostsAsLocalManaged pins the P0.5
