@@ -241,7 +241,6 @@ type Bead struct {
 	ClaimFence int64 `json:"-"`
 }
 
-// UpdateOpts specifies which fields to change. Nil pointers are skipped.
 // Gate await_type vocabulary, mirroring bd update's accepted set
 // (cmd/bd/update.go in the fleet tag): what a gate bead awaits.
 const (
@@ -273,6 +272,7 @@ func IsGateAwaitType(s string) bool {
 	return false
 }
 
+// UpdateOpts specifies which fields to change. Nil pointers are skipped.
 type UpdateOpts struct {
 	Title        *string // set title (nil = no change)
 	Status       *string // set status (nil = no change)

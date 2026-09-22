@@ -1161,6 +1161,7 @@ type BackendCredentialResolvedPayload struct {
 // Bead defines model for Bead.
 type Bead struct {
 	Assignee     *string            `json:"assignee,omitempty"`
+	AwaitType    *string            `json:"await_type,omitempty"`
 	CreatedAt    time.Time          `json:"created_at"`
 	DeferUntil   *time.Time         `json:"defer_until,omitempty"`
 	Dependencies *[]Dep             `json:"dependencies,omitempty"`
