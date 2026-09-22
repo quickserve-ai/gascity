@@ -97,17 +97,23 @@ func TestWriterReleasedByRotationWaitsForTheAnchor(t *testing.T) {
 	probed := false
 	rotateBeforeAnchorHook = func() {
 		probed = true
-		f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o644)
-		if err != nil {
+		if _, err := os.Stat(path); err != nil {
 			probeErr = fmt.Errorf("new active log is not at the path when the rotated inode is released: %w", err)
+			return
+		}
+		// Every append takes the sidecar lock first, so while the rotator
+		// holds it no writer can reach the new log ahead of the anchor.
+		f, err := os.OpenFile(path+".lock", os.O_RDWR, 0o644)
+		if err != nil {
+			probeErr = fmt.Errorf("opening the sidecar lock: %w", err)
 			return
 		}
 		defer f.Close() //nolint:errcheck // test probe
 		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
 			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-			probeErr = errors.New("new active log is UNLOCKED when the rotated inode is released; a waiting writer would append ahead of the anchor")
+			probeErr = errors.New("the append lock is FREE when the rotated inode is released; a waiting writer would append ahead of the anchor")
 		} else if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
-			probeErr = fmt.Errorf("probing the new active log's lock: %w", err)
+			probeErr = fmt.Errorf("probing the sidecar lock: %w", err)
 		}
 	}
 	defer func() { rotateBeforeAnchorHook = nil }()
@@ -137,5 +143,71 @@ func TestWriterReleasedByRotationWaitsForTheAnchor(t *testing.T) {
 	if active[1].Subject != "released" || active[1].Seq <= active[0].Seq {
 		t.Fatalf("released row = %q seq %d, anchor seq %d; want it after the anchor with a higher seq",
 			active[1].Subject, active[1].Seq, active[0].Seq)
+	}
+}
+
+// A recorder CONSTRUCTED in the rename gap (a transient per-invocation writer
+// starting at the wrong instant) creates the active path itself. It must still
+// not append before the rotation anchor, and its rows must not reuse archived
+// sequence numbers (Codex, PR #111 r5): its own ReadLatestSeq ran while the
+// active path was absent and cannot see the in-flight rotating file.
+func TestRecorderConstructedInTheRenameGapCannotAppendBeforeTheAnchor(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+	var stderr bytes.Buffer
+
+	rotator, err := NewFileRecorder(path, &stderr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rotator.Close() //nolint:errcheck // test cleanup
+	for i := 0; i < 3; i++ {
+		rotator.Record(Event{Type: BeadCreated, Actor: "human", Subject: "before"})
+	}
+
+	var gap *FileRecorder
+	var inGapErr error
+	rotateAfterRenameHook = func() {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("active path should be absent right after the rename, stat err = %v", err)
+		}
+		g, err := NewFileRecorder(path, &stderr, WithoutStartupSweep())
+		if err != nil {
+			t.Errorf("NewFileRecorder in the gap: %v", err)
+			return
+		}
+		gap = g
+		// The rotator holds the append lock, so this must fail (bounded wait),
+		// not land a row ahead of the anchor.
+		inGapErr = gap.RecordAck(Event{Type: SessionNudged, Actor: "t", Subject: "in-gap"})
+	}
+	defer func() { rotateAfterRenameHook = nil }()
+
+	res, err := rotator.ForceRotate()
+	rotateAfterRenameHook = nil
+	if err != nil || !res.Rotated {
+		t.Fatalf("ForceRotate = %+v, %v", res, err)
+	}
+	if gap == nil {
+		t.Fatal("the gap recorder was never constructed")
+	}
+	defer gap.Close() //nolint:errcheck // test cleanup
+	if inGapErr == nil {
+		t.Fatal("a recorder constructed mid-rotation appended while the rotation held the lock")
+	}
+
+	if err := gap.RecordAck(Event{Type: SessionNudged, Actor: "t", Subject: "after"}); err != nil {
+		t.Fatalf("RecordAck after the rotation: %v", err)
+	}
+	active, _, err := ReadFrom(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 2 || active[0].Type != EventsRotated || active[1].Subject != "after" {
+		t.Fatalf("new active log = %+v, want the anchor then the gap recorder's row", active)
+	}
+	if active[1].Seq <= active[0].Seq || active[1].Seq <= res.LastSeq {
+		t.Fatalf("gap row seq %d, anchor seq %d, archived last %d: want the row after both",
+			active[1].Seq, active[0].Seq, res.LastSeq)
 	}
 }
