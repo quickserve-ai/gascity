@@ -578,6 +578,23 @@ func TestDetectSilentPublishedWorkScriptContract(t *testing.T) {
 			t.Errorf("detect-silent-published-work.sh must pin %q to the town-local city store; dedup and auto-resolve follow the mint or every sweep re-mints", want)
 		}
 	}
+	// The CANDIDATE list is pinned too: a bare `gc bd list` on the empty scope
+	// is subject to the same GC_RIG / cwd / bead-prefix auto-detection, and an
+	// unpinned city sweep landing on a rig store hands that rig's beads to the
+	// town-local carve-out — "ours by construction" asserted about the SHARED
+	// store (codex review, 2026-09-22).
+	if !strings.Contains(body, `CP1="--city"; CP2="$CITY_ABS"`) {
+		t.Error("detect-silent-published-work.sh must pin the empty-scope candidate list to the city store; bead-prefix auto-detection otherwise re-routes it")
+	}
+	// The city partition label must not be spellable as a rig name: a rig
+	// named "hq" would share the reconciliation partition and the two sweeps
+	// would resolve each other's live gates in a mint/resolve loop.
+	if !strings.Contains(body, `SCOPE_LABEL="${scope:-@city}"`) {
+		t.Error(`detect-silent-published-work.sh must label the city scope "@city"; a rig-nameable label collides in the reconciliation partition`)
+	}
+	if strings.Contains(body, `SCOPE_LABEL="${scope:-hq}"`) {
+		t.Error(`detect-silent-published-work.sh labels the city scope "hq", which a rig can be named (partition collision)`)
+	}
 	// No gate call may carry rig-store routing. These are the exact shapes the
 	// incident shipped.
 	for _, forbidden := range []string{
