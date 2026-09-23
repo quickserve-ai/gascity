@@ -15,6 +15,7 @@ import (
 type fakeHeartbeatStore struct {
 	rows    map[string][]beads.Bead // assignee -> in_progress rows
 	listErr error
+	partial error            // when set, List returns rows AND a PartialResultError wrapping it
 	hbErr   map[string]error // bead id -> scripted refusal
 	beats   [][2]string      // {id, actor} in invocation order
 }
@@ -31,7 +32,48 @@ func (f *fakeHeartbeatStore) List(q beads.ListQuery) ([]beads.Bead, error) {
 	if q.Status != "in_progress" {
 		return nil, nil
 	}
+	if f.partial != nil {
+		return f.rows[q.Assignee], &beads.PartialResultError{Op: "bd list", Err: f.partial}
+	}
 	return f.rows[q.Assignee], nil
+}
+
+// TestCmdHookHeartbeatBeatsRowsReturnedBesideAPartialListError pins the
+// codex round-3 P1: mergeListTierResults (and a single malformed entry)
+// return usable rows WITH a PartialResultError. Those rows are healthy claims
+// and must still be refreshed; the partial failure is counted, not swallowed,
+// and not allowed to discard the rows it came with.
+func TestCmdHookHeartbeatBeatsRowsReturnedBesideAPartialListError(t *testing.T) {
+	store := &fakeHeartbeatStore{
+		rows:    map[string][]beads.Bead{"katya": {{ID: "ga-1", Assignee: "katya"}, {ID: "ga-2", Assignee: "katya"}}},
+		partial: errors.New("ephemeral tier: parse row 7"),
+		hbErr:   map[string]error{},
+	}
+	withHeartbeatStore(t, store, nil)
+	withHeartbeatIdentities(t, []string{"katya"}, nil)
+	t.Setenv("GC_SESSION_ID", "ga-sess")
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdHookHeartbeat("", false, &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdHookHeartbeat = %d, want 0 (lenient); stderr=%s", code, stderr.String())
+	}
+	if len(store.beats) != 2 {
+		t.Fatalf("beats = %v, want both rows refreshed beside the partial error", store.beats)
+	}
+	if !strings.Contains(stdout.String(), "2 refreshed, 1 refused") {
+		t.Fatalf("stdout = %q, want the partial failure counted as 1 refused", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "parse row 7") {
+		t.Fatalf("stderr = %q, want the partial error surfaced", stderr.String())
+	}
+	// A total list failure still yields no beats — the partial path is the
+	// only one that carries rows.
+	store.partial, store.listErr, store.beats = nil, errors.New("bd list: connection refused"), nil
+	stdout.Reset()
+	stderr.Reset()
+	if code := cmdHookHeartbeat("", false, &stdout, &stderr); code != 0 || len(store.beats) != 0 {
+		t.Fatalf("total failure: code=%d beats=%v, want 0 and none", code, store.beats)
+	}
 }
 
 func (f *fakeHeartbeatStore) Heartbeat(id, actor string) error {

@@ -49,10 +49,16 @@ import (
 // the stage-2 both-cities proof, where "the heartbeat happened" is the
 // measurement and must fail loudly.
 //
-// NOT WIRED to any hook template yet: placement per the consult is a
-// detached, throttled call inside the mail-check --inject path (start of
-// turn, the only per-turn event every managed provider traverses — gc
-// installs no Stop hook anywhere), landing as its own change.
+// WIRING: a detached, throttled call inside the mail-check --inject path
+// (cmd_mail.go, maybeSpawnLeaseHeartbeat) — the start-of-turn leg. gc
+// installs no Stop hook anywhere, and this is the per-turn seam the managed
+// overlays share: claude, codex, cursor, copilot, gemini, antigravity, kiro,
+// opencode, mimocode, pi and omp all run `gc mail check --inject` (or the
+// equivalent plugin call) before each turn. KNOWN GAP: the kimi overlay
+// registers only a SessionStart hook (gc prime --hook) and no per-turn
+// event, so an armed kimi seat's claims get NO turn-driven refresh; its
+// leases lapse at the TTL like an unattended seat's. Stage 2 must not reap
+// on expiry for a provider with no heartbeat seam (see SESSION-RUNTIME-012).
 
 // hookHeartbeatTimeout bounds the whole run. The command is invoked detached
 // from the turn (never synchronously — a bd invocation costs seconds and a
@@ -198,9 +204,17 @@ func cmdHookHeartbeat(beadID string, strict bool, stdout, stderr io.Writer) int 
 		// beating exactly as much as a durable one's.
 		rows, err := store.List(beads.ListQuery{Assignee: identity, Status: "in_progress", TierMode: beads.TierBoth})
 		if err != nil {
+			// A PartialResultError carries USABLE rows: one tier failed
+			// after the other matched, or one entry failed to parse. The
+			// healthy claims must still be refreshed — dropping them here
+			// would let every lease under this identity lapse over a
+			// single malformed row. Count the partial failure as a refusal
+			// so it is never silent, then beat what came back.
 			fmt.Fprintf(stderr, "gc hook heartbeat: listing %q: %v\n", identity, err) //nolint:errcheck
 			refused++
-			continue
+			if !beads.IsPartialResult(err) {
+				continue
+			}
 		}
 		for _, row := range rows {
 			if seen[row.ID] {
