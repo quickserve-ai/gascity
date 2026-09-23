@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/session"
 )
 
 // fakeHeartbeatStore scripts the row listing and records every heartbeat with
@@ -94,13 +95,81 @@ func withHeartbeatStore(t *testing.T, store hookHeartbeatBeadStore, openErr erro
 	}
 }
 
-// withHeartbeatIdentities installs a fixed identity set for one test.
+// withHeartbeatIdentities installs a fixed identity set for one test, and
+// pins the start offset to 0 so row order in assertions is deterministic
+// (production rotates it by wall clock; TestCmdHookHeartbeatRotatesTheStartRow
+// covers that seam explicitly).
 func withHeartbeatIdentities(t *testing.T, identities []string, err error) {
 	t.Helper()
 	restore := hookHeartbeatIdentities
 	t.Cleanup(func() { hookHeartbeatIdentities = restore })
 	hookHeartbeatIdentities = func(string) ([]string, error) {
 		return identities, err
+	}
+	withHeartbeatStartOffset(t, 0)
+}
+
+// withHeartbeatStartOffset pins the rotation seam for one test.
+func withHeartbeatStartOffset(t *testing.T, off int) {
+	t.Helper()
+	restore := hookHeartbeatStartOffset
+	t.Cleanup(func() { hookHeartbeatStartOffset = restore })
+	hookHeartbeatStartOffset = func(int) int { return off }
+}
+
+// TestHookHeartbeatEligibleIdentitiesFencesStaleIncarnations pins the codex
+// round-6 P1: the write-authorizing identity set is empty (an error) for a
+// closed session bead and for an instance token that is missing or does not
+// match the bead — the same fence the claim path applies — and non-empty for
+// the live incarnation.
+func TestHookHeartbeatEligibleIdentitiesFencesStaleIncarnations(t *testing.T) {
+	live := session.Info{ID: "ga-sess", SessionName: "katya", InstanceToken: "tok-live", MetadataState: "active"}
+	ids, err := hookHeartbeatEligibleIdentities(live, "tok-live")
+	if err != nil || len(ids) == 0 {
+		t.Fatalf("live incarnation: ids=%v err=%v, want identities and no error", ids, err)
+	}
+	cases := map[string]struct {
+		info  session.Info
+		token string
+	}{
+		"closed bead":      {session.Info{ID: "ga-sess", SessionName: "katya", InstanceToken: "tok-live", MetadataState: "active", Closed: true}, "tok-live"},
+		"superseded token": {live, "tok-old"},
+		"empty token":      {live, ""},
+		"bead token empty": {session.Info{ID: "ga-sess", SessionName: "katya", MetadataState: "active"}, "tok-live"},
+	}
+	for name, tc := range cases {
+		ids, err := hookHeartbeatEligibleIdentities(tc.info, tc.token)
+		if err == nil || len(ids) != 0 {
+			t.Fatalf("%s: ids=%v err=%v, want no identities and an error", name, ids, err)
+		}
+		if !strings.Contains(err.Error(), "not heartbeat-eligible") {
+			t.Fatalf("%s: err = %q, want the fence diagnostic", name, err)
+		}
+	}
+}
+
+// TestCmdHookHeartbeatRotatesTheStartRow pins the codex round-6 P2: the
+// deduplicated row list is rotated by the start offset, so a run that times
+// out mid-list does not starve the same tail every tick.
+func TestCmdHookHeartbeatRotatesTheStartRow(t *testing.T) {
+	t.Setenv("GC_SESSION_ID", "ga-sess")
+	withHeartbeatIdentities(t, []string{"katya"}, nil)
+	withHeartbeatStartOffset(t, 1)
+	store := &fakeHeartbeatStore{
+		rows:  map[string][]beads.Bead{"katya": {{ID: "ga-1", Assignee: "katya"}, {ID: "ga-2", Assignee: "katya"}, {ID: "ga-3", Assignee: "katya"}}},
+		hbErr: map[string]error{},
+	}
+	withHeartbeatStore(t, store, nil)
+	var stdout, stderr bytes.Buffer
+	if code := cmdHookHeartbeat("", false, &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdHookHeartbeat = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	got := []string{store.beats[0][0], store.beats[1][0], store.beats[2][0]}
+	want := []string{"ga-2", "ga-3", "ga-1"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("beat order = %v, want rotated %v", got, want)
+		}
 	}
 }
 
