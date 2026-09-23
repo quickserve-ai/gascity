@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -38,7 +39,7 @@ func doltServersFixture(t *testing.T, procs []DoltProcInfo, discoverErr, layoutE
 		args:            func(int) (string, error) { return "", errors.New("no full command line in this fixture") },
 		recordedPID:     func(managedDoltRuntimeLayout) (int, time.Time) { return 0, time.Time{} },
 		exactArgv:       func(int) bool { return false },
-		readFile:        func(string) ([]byte, error) { return nil, errors.New("no config files in this fixture") },
+		readFile:        func(string) ([]byte, error) { return []byte("log_level: info\n"), nil },
 		activeTestRoots: func() []string { return nil },
 		startIdentity:   func(int) string { return "" },
 		homeDir:         "/home/me",
@@ -703,6 +704,36 @@ func TestDoltServersCheck_ConfigCopyNamingTheManagedStoreIsSplitBrain(t *testing
 	r := c.Run(nil)
 	if r.Status != doctor.StatusError {
 		t.Fatalf("status = %v, want Error (two servers on the managed store): %q %v", r.Status, r.Message, r.Details)
+	}
+}
+
+// Codex round 10 on #120: a config-only server whose YAML can no longer be
+// read may serve this city's store; it is unresolved, never "not gc".
+func TestDoltServersCheck_UnreadableConfigOnlyServerIsWarningNotOK(t *testing.T) {
+	gone := DoltProcInfo{PID: 220, Argv: []string{"dolt", "sql-server", "--config", "/tmp/deleted.yaml"}}
+	c := doltServersFixture(t, []DoltProcInfo{gcDoltProc(100, "/city", 51361), gone}, nil, nil)
+	c.readFile = func(path string) ([]byte, error) {
+		if path == "/tmp/deleted.yaml" {
+			return nil, os.ErrNotExist
+		}
+		return []byte("log_level: info\n"), nil
+	}
+	r := c.Run(nil)
+	if r.Status != doctor.StatusWarning || !strings.Contains(strings.Join(r.Details, "\n"), "can no longer be read") {
+		t.Fatalf("want a Warning naming the unreadable config: %v %q %v", r.Status, r.Message, r.Details)
+	}
+
+	// Control: the same server with a readable config naming another store
+	// is a not-gc server and the check stays OK.
+	c = doltServersFixture(t, []DoltProcInfo{gcDoltProc(100, "/city", 51361), gone}, nil, nil)
+	c.readFile = func(path string) ([]byte, error) {
+		if path == "/tmp/deleted.yaml" {
+			return []byte("data_dir: /elsewhere/store\n"), nil
+		}
+		return []byte("log_level: info\n"), nil
+	}
+	if r := c.Run(nil); r.Status != doctor.StatusOK {
+		t.Fatalf("control: want OK for a readable foreign config, got %v %q %v", r.Status, r.Message, r.Details)
 	}
 }
 
