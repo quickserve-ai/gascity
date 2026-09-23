@@ -255,13 +255,13 @@ func (c *OrderOutcomeHealthyCheck) Run(ctx *CheckContext) *CheckResult {
 	worst := StatusOK
 	failing := 0
 	var firstFailingHint string
-	cronIntervals := map[string]time.Duration{}
+	cronSpans := map[string]time.Duration{}
 
 	for _, order := range scheduled {
 		streak, lastMessage, sawOutcome, skipped := consecutiveOrderFailures(outcomes, order.ScopedName(), starts, c.grace)
 		status, detail := classifyOrderOutcome(order, streak, c.threshold, lastMessage, sawOutcome, skipped)
 		if status == StatusOK && streak > 0 && !orderSucceededIn(outcomes, order.ScopedName()) &&
-			tooRareForLookback(order, c.threshold, cronIntervals) {
+			tooRareForLookback(order, c.threshold, cronSpans) {
 			status, detail = StatusWarning, fmt.Sprintf(
 				"%s: every run in the last %s failed (%d), and it fires too rarely for %d runs to fit; older runs not read",
 				orderDisplayName(order), formatOrderFiringDuration(orderOutcomeLookback), streak, c.threshold)
@@ -304,15 +304,77 @@ func orderSucceededIn(outcomes []events.Event, subject string) bool {
 	return false
 }
 
-// tooRareForLookback reports whether threshold runs of order cannot fit in
-// orderOutcomeLookback, so a streak that long can never be seen. An interval
-// that cannot be computed counts as too rare: the check cannot vouch for it.
-func tooRareForLookback(order orders.Order, threshold int, cronCache map[string]time.Duration) bool {
-	interval, err := expectedIntervalForOrder(order, cronCache)
-	if err != nil {
+// tooRareForLookback reports whether threshold consecutive runs of order can
+// span more than orderOutcomeLookback, so a streak that long may not be seen.
+// For cron that is the LONGEST span of threshold consecutive fires, not the
+// smallest gap between two: `0 0 1-3 * *` fires a day apart, but its runs on
+// the 2nd, 3rd and next month's 1st span four weeks. A schedule that cannot be
+// evaluated counts as too rare: the check cannot vouch for it.
+func tooRareForLookback(order orders.Order, threshold int, spanCache map[string]time.Duration) bool {
+	switch order.Trigger {
+	case "cooldown":
+		interval, err := time.ParseDuration(order.Interval)
+		if err != nil || interval <= 0 {
+			return true
+		}
+		return time.Duration(threshold)*interval > orderOutcomeLookback
+	case "cron":
+		span, ok := spanCache[order.Schedule]
+		if !ok {
+			var err error
+			span, err = cronLongestRunSpan(order.Schedule, threshold)
+			if err != nil {
+				return true
+			}
+			spanCache[order.Schedule] = span
+		}
+		return span > orderOutcomeLookback
+	default:
 		return true
 	}
-	return time.Duration(threshold)*interval > orderOutcomeLookback
+}
+
+// cronLongestRunSpan is the longest time spanned by runs consecutive fires of
+// schedule over a leap year plus the lookback (so a span crossing the year
+// boundary is seen), scanned minute by minute in UTC. It stops as soon as a
+// span exceeds orderOutcomeLookback, and a schedule with fewer than runs fires
+// in that horizon returns the whole horizon. Only an order already failing at
+// every visible run reaches this, so the scan is rare.
+func cronLongestRunSpan(schedule string, runs int) (time.Duration, error) {
+	fields := strings.Fields(schedule)
+	if len(fields) != orders.CronFieldCount {
+		return 0, fmt.Errorf("invalid cron schedule: want %d fields, got %d", orders.CronFieldCount, len(fields))
+	}
+	if runs < 1 {
+		runs = 1
+	}
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	horizon := 366*24*time.Hour + orderOutcomeLookback
+	var fires []time.Time
+	var longest time.Duration
+	for m := time.Duration(0); m < horizon; m += time.Minute {
+		ts := base.Add(m)
+		matched, err := orders.CronScheduleMatchesAt(fields, ts)
+		if err != nil {
+			return 0, fmt.Errorf("invalid cron schedule: %w", err)
+		}
+		if !matched {
+			continue
+		}
+		fires = append(fires, ts)
+		if len(fires) >= runs {
+			if span := ts.Sub(fires[len(fires)-runs]); span > longest {
+				longest = span
+				if longest > orderOutcomeLookback {
+					return longest, nil
+				}
+			}
+		}
+	}
+	if len(fires) < runs {
+		return horizon, nil
+	}
+	return longest, nil
 }
 
 // readOrderOutcomeWindow returns order.completed and order.failed at or after
