@@ -308,6 +308,10 @@ func (p *Parser) Resolve(formula *Formula) (*Formula, error) {
 		}
 		if merged.Requires == nil {
 			merged.Requires = cloneRequirements(parent.Requires)
+		} else if merged.Requires.DisabledReason == "" && parent.Requires != nil {
+			// A parent's unsatisfiable requirement propagates to the child
+			// through compilerConstraints, so its disabled_reason does too.
+			merged.Requires.DisabledReason = parent.Requires.DisabledReason
 		}
 
 		// Phase cascades from the first parent that declares one; child
