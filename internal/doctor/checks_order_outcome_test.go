@@ -1,6 +1,11 @@
 package doctor
 
 import (
+	"bytes"
+	"compress/gzip"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -564,7 +569,9 @@ func TestOrderOutcomeHealthy_WeekdayCronStreakAcrossTheWeekend(t *testing.T) {
 	}
 }
 
-func TestOrderOutcomeHealthy_TooRareOrderFailingEveryVisibleRunWarns(t *testing.T) {
+// With no success in view, the look-back reads the whole (short) log: two
+// failures in all of history are under threshold, exactly as a full read says.
+func TestOrderOutcomeHealthy_RareOrderWithTwoFailuresInAllOfHistoryIsUnderThreshold(t *testing.T) {
 	now := time.Date(2026, 9, 21, 12, 0, 0, 0, time.UTC)
 	cityPath, cfg := orderFiringTestCity(t)
 	ordersDir := filepath.Join(cityPath, "orders")
@@ -573,20 +580,16 @@ func TestOrderOutcomeHealthy_TooRareOrderFailingEveryVisibleRunWarns(t *testing.
 	writeOrderFiringTestEvents(t, cityPath,
 		events.Event{Type: events.OrderFailed, Ts: now.Add(-7 * 24 * time.Hour), Subject: "weekly", Message: "boom"},
 		events.Event{Type: events.OrderFailed, Ts: now.Add(-time.Hour), Subject: "weekly", Message: "boom"},
-		// A fast order with one failure and no success in view stays under
-		// threshold: it can fit threshold runs, so it is judged normally.
 		events.Event{Type: events.OrderFailed, Ts: now.Add(-time.Hour), Subject: "hourly", Message: "boom"},
 	)
 	result := runOutcomeCheckAt(t, cityPath, cfg, now)
 	joined := strings.Join(result.Details, "\n")
-	if result.Status != StatusWarning || !strings.Contains(joined, "weekly: every run in the last") {
-		t.Fatalf("a too-rare order failing every visible run must warn: %v %q %v", result.Status, result.Message, result.Details)
-	}
-	if !strings.Contains(joined, "hourly: 1 consecutive failure(s), under threshold 3") {
-		t.Fatalf("a fast order stays under threshold: %v", result.Details)
+	if result.Status != StatusOK || !strings.Contains(joined, "weekly: 2 consecutive failure(s), under threshold 3") ||
+		!strings.Contains(joined, "hourly: 1 consecutive failure(s), under threshold 3") {
+		t.Fatalf("with all of history read, both orders are under threshold: %v %q %v", result.Status, result.Message, result.Details)
 	}
 
-	// Control: one success in view clears the too-rare order.
+	// Control: one success in view clears the rare order.
 	cityPath, cfg = orderFiringTestCity(t)
 	writeOrderFiringTestOrderInDir(t, filepath.Join(cityPath, "orders"), "weekly", "cooldown", "168h")
 	writeOrderFiringTestEvents(t, cityPath,
@@ -619,29 +622,6 @@ func TestOrderOutcomeHealthy_WindowEdgeFailureKeepsItsGrace(t *testing.T) {
 	}
 }
 
-func TestCronLongestRunSpan(t *testing.T) {
-	for schedule, want := range map[string]struct {
-		atMost, over time.Duration
-	}{
-		"*/5 * * * *":    {atMost: 10 * time.Minute},
-		"0 9 * * 1-5":    {atMost: 4 * 24 * time.Hour}, // Thu, Fri, Mon
-		"0 0 1-3 * *":    {over: orderOutcomeLookback}, // 2nd, 3rd, next 1st
-		"0 16 * * 5":     {over: orderOutcomeLookback}, // weekly
-		"0 18 * * 1,3,5": {atMost: 5 * 24 * time.Hour}, // Wed, Fri, Mon
-	} {
-		got, err := cronLongestRunSpan(schedule, 3)
-		if err != nil {
-			t.Fatalf("%s: %v", schedule, err)
-		}
-		if want.atMost > 0 && got > want.atMost {
-			t.Errorf("%s: span %v, want <= %v", schedule, got, want.atMost)
-		}
-		if want.over > 0 && got <= want.over {
-			t.Errorf("%s: span %v, want > %v", schedule, got, want.over)
-		}
-	}
-}
-
 // Codex on #136: a bursty cron's smallest gap (a day) said three runs fit in
 // the window, so a streak split by the month boundary read "under threshold".
 func TestOrderOutcomeHealthy_BurstyCronStreakIsNotHiddenByItsSmallestGap(t *testing.T) {
@@ -654,7 +634,7 @@ func TestOrderOutcomeHealthy_BurstyCronStreakIsNotHiddenByItsSmallestGap(t *test
 		events.Event{Type: events.OrderFailed, Ts: time.Date(2026, 9, 3, 0, 0, 0, 0, time.UTC), Subject: "month-start", Message: "boom"},
 	)
 	result := runOutcomeCheckAt(t, cityPath, cfg, now)
-	if result.Status != StatusWarning || !strings.Contains(strings.Join(result.Details, "\n"), "month-start: every run in the last") {
+	if result.Status != StatusWarning || !strings.Contains(strings.Join(result.Details, "\n"), "month-start: 3 consecutive failures") {
 		t.Fatalf("a bursty cron failing every visible run must warn: %v %q %v", result.Status, result.Message, result.Details)
 	}
 }
@@ -673,13 +653,12 @@ func TestOrderOutcomeHealthy_CronWindowCountsTheLeadingGap(t *testing.T) {
 		events.Event{Type: events.OrderFailed, Ts: time.Date(2026, 9, 14, 0, 0, 0, 0, time.UTC), Subject: "mon-thu", Message: "boom"},
 		events.Event{Type: events.OrderFailed, Ts: time.Date(2026, 9, 17, 0, 0, 0, 0, time.UTC), Subject: "mon-thu", Message: "boom"},
 		events.Event{Type: events.OrderFailed, Ts: time.Date(2026, 9, 21, 0, 0, 0, 0, time.UTC), Subject: "mon-thu", Message: "boom"},
-		// A daily cron fits threshold runs wherever the window opens, so one
-		// failure with no success in view is judged normally.
+		// One failure in all of history is under threshold.
 		events.Event{Type: events.OrderFailed, Ts: time.Date(2026, 9, 23, 0, 0, 0, 0, time.UTC), Subject: "daily", Message: "boom"},
 	)
 	result := runOutcomeCheckAt(t, cityPath, cfg, now)
 	joined := strings.Join(result.Details, "\n")
-	if result.Status != StatusWarning || !strings.Contains(joined, "mon-thu: every run in the last") {
+	if result.Status != StatusWarning || !strings.Contains(joined, "mon-thu: 3 consecutive failures") {
 		t.Fatalf("a Mon/Thu cron failing every visible run must warn: %v %q %v", result.Status, result.Message, result.Details)
 	}
 	if !strings.Contains(joined, "daily: 1 consecutive failure(s), under threshold 3") {
@@ -687,18 +666,240 @@ func TestOrderOutcomeHealthy_CronWindowCountsTheLeadingGap(t *testing.T) {
 	}
 }
 
-func TestTooRareForLookbackCountsTheLeadingGap(t *testing.T) {
-	for schedule, want := range map[string]bool{
-		"0 0 * * 1,4":    true,  // Mon, Thu, Mon, Thu spans 10 days
-		"0 16 * * 5":     true,  // weekly
-		"0 18 * * 1,3,5": false, // Fri, Mon, Wed, Fri spans 7 days
-		"0 9 * * 1-5":    false, // Thu, Fri, Mon, Tue spans 5 days
-		"0 0 * * *":      false,
-		"0 * * * *":      false,
-	} {
-		order := orders.Order{Name: "o", Trigger: "cron", Schedule: schedule}
-		if got := tooRareForLookback(order, 3, map[string]time.Duration{}); got != want {
-			t.Errorf("%s: tooRareForLookback = %v, want %v", schedule, got, want)
+// Codex r3 on #136: look back past the window.
+
+// countLookBacks wraps the check's newest-first walk so a test sees whether
+// the look-back ran and how many log sources it read.
+func countLookBacks(check *OrderOutcomeHealthyCheck) (walks, sources *int) {
+	walks, sources = new(int), new(int)
+	check.walkBack = func(path string, filter events.Filter, types []string, fn func([]events.Event, time.Time) bool) error {
+		*walks++
+		return events.WalkFilteredTypesNewestFirst(path, filter, types, func(evts []events.Event, through time.Time) bool {
+			*sources++
+			return fn(evts, through)
+		})
+	}
+	return walks, sources
+}
+
+func outcomeCheckAt(cityPath string, cfg *config.City, now time.Time) *OrderOutcomeHealthyCheck {
+	check := NewOrderOutcomeHealthyCheck(cfg, cityPath)
+	check.now = func() time.Time { return now }
+	return check
+}
+
+// writeOutcomeLog writes evts, which carry their own seqs, as the active log.
+func writeOutcomeLog(t *testing.T, cityPath string, evts ...events.Event) {
+	t.Helper()
+	var b strings.Builder
+	for _, e := range evts {
+		line, err := json.Marshal(e)
+		if err != nil {
+			t.Fatal(err)
 		}
+		b.Write(line)
+		b.WriteByte('\n')
+	}
+	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, ".gc", "events.jsonl"), []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// writeOutcomeArchive writes evts, which carry their own seqs, as an archive
+// rotated at stamp.
+func writeOutcomeArchive(t *testing.T, cityPath string, stamp time.Time, evts ...events.Event) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	name := fmt.Sprintf("events.jsonl.archive-%s-seq-%d-%d.gz",
+		stamp.UTC().Format("20060102T150405Z"), evts[0].Seq, evts[len(evts)-1].Seq)
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	for _, e := range evts {
+		line, err := json.Marshal(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := gw.Write(append(line, '\n')); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityPath, ".gc", name), buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Codex's exact case: a daily cron whose outcomes came only weekly. The window
+// sees two failures; the third is a week before it.
+func TestOrderOutcomeHealthy_LooksBackPastTheWindowForAnAllFailureOrder(t *testing.T) {
+	now := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrderInDir(t, filepath.Join(cityPath, "orders"), "daily", "cron", "0 0 * * *")
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.OrderFailed, Ts: now.Add(-14 * 24 * time.Hour), Subject: "daily", Message: "boom"},
+		events.Event{Type: events.OrderFailed, Ts: now.Add(-7 * 24 * time.Hour), Subject: "daily", Message: "boom"},
+		events.Event{Type: events.OrderFailed, Ts: now, Subject: "daily", Message: "boom"},
+	)
+	check := outcomeCheckAt(cityPath, cfg, now)
+	walks, _ := countLookBacks(check)
+	result := check.Run(&CheckContext{CityPath: cityPath})
+	if result.Status != StatusWarning || !strings.Contains(strings.Join(result.Details, "\n"), "daily: 3 consecutive failures") {
+		t.Fatalf("failures at -14d, -7d and now must warn with 3 consecutive failures: %v %q %v", result.Status, result.Message, result.Details)
+	}
+	if *walks != 1 {
+		t.Fatalf("look-backs = %d, want 1", *walks)
+	}
+}
+
+func TestOrderOutcomeHealthy_LookBackStopsAtASuccessBeforeTheWindow(t *testing.T) {
+	now := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrderInDir(t, filepath.Join(cityPath, "orders"), "daily", "cron", "0 0 * * *")
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.OrderFailed, Ts: now.Add(-21 * 24 * time.Hour), Subject: "daily", Message: "boom"},
+		events.Event{Type: events.OrderFailed, Ts: now.Add(-14 * 24 * time.Hour), Subject: "daily", Message: "boom"},
+		events.Event{Type: events.OrderCompleted, Ts: now.Add(-orderOutcomeLookback - time.Hour), Subject: "daily"},
+		events.Event{Type: events.OrderFailed, Ts: now.Add(-7 * 24 * time.Hour), Subject: "daily", Message: "boom"},
+		events.Event{Type: events.OrderFailed, Ts: now, Subject: "daily", Message: "boom"},
+	)
+	check := outcomeCheckAt(cityPath, cfg, now)
+	walks, _ := countLookBacks(check)
+	result := check.Run(&CheckContext{CityPath: cityPath})
+	if result.Status != StatusOK || !strings.Contains(strings.Join(result.Details, "\n"), "daily: 2 consecutive failure(s), under threshold 3") {
+		t.Fatalf("a success just before the window ends the streak at 2: %v %q %v", result.Status, result.Message, result.Details)
+	}
+	if *walks != 1 {
+		t.Fatalf("look-backs = %d, want 1", *walks)
+	}
+}
+
+// The fast path: every order is settled by the window (a success in view, a
+// streak already at threshold, or no outcome at all), so nothing more is read.
+func TestOrderOutcomeHealthy_WindowSettledOrdersSkipTheLookBack(t *testing.T) {
+	now := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	ordersDir := filepath.Join(cityPath, "orders")
+	writeOrderFiringTestOrderInDir(t, ordersDir, "healthy", "cooldown", "1h")
+	writeOrderFiringTestOrderInDir(t, ordersDir, "flaky", "cooldown", "1h")
+	writeOrderFiringTestOrderInDir(t, ordersDir, "broken", "cooldown", "1h")
+	writeOrderFiringTestOrderInDir(t, ordersDir, "quiet", "cooldown", "1h")
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.OrderCompleted, Ts: now.Add(-3 * time.Hour), Subject: "healthy"},
+		events.Event{Type: events.OrderCompleted, Ts: now.Add(-3 * time.Hour), Subject: "flaky"},
+		events.Event{Type: events.OrderFailed, Ts: now.Add(-2 * time.Hour), Subject: "flaky", Message: "boom"},
+		events.Event{Type: events.OrderFailed, Ts: now.Add(-3 * time.Hour), Subject: "broken", Message: "boom"},
+		events.Event{Type: events.OrderFailed, Ts: now.Add(-2 * time.Hour), Subject: "broken", Message: "boom"},
+		events.Event{Type: events.OrderFailed, Ts: now.Add(-time.Hour), Subject: "broken", Message: "boom"},
+	)
+	check := outcomeCheckAt(cityPath, cfg, now)
+	walks, _ := countLookBacks(check)
+	result := check.Run(&CheckContext{CityPath: cityPath})
+	joined := strings.Join(result.Details, "\n")
+	for _, want := range []string{
+		"healthy: last run succeeded",
+		"flaky: 1 consecutive failure(s), under threshold 3",
+		"broken: 3 consecutive failures",
+		"quiet: no completed runs in the lookback window",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("details = %v, want %q", result.Details, want)
+		}
+	}
+	if *walks != 0 {
+		t.Fatalf("look-backs = %d, want 0: the window settles every order", *walks)
+	}
+}
+
+// The walk stops at the first log source that settles the order: the oldest
+// archive, whose extra failure would make the streak 4, is never opened.
+func TestOrderOutcomeHealthy_LookBackStopsOnceSettled(t *testing.T) {
+	now := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrderInDir(t, filepath.Join(cityPath, "orders"), "daily", "cron", "0 0 * * *")
+	day := 24 * time.Hour
+	writeOutcomeArchive(t, cityPath, now.Add(-20*day),
+		events.Event{Seq: 1, Type: events.OrderFailed, Ts: now.Add(-21 * day), Subject: "daily", Message: "boom"})
+	writeOutcomeArchive(t, cityPath, now.Add(-10*day),
+		events.Event{Seq: 2, Type: events.OrderFailed, Ts: now.Add(-14 * day), Subject: "daily", Message: "boom"})
+	writeOutcomeLog(t, cityPath,
+		events.Event{Seq: 3, Type: events.OrderFailed, Ts: now.Add(-7 * day), Subject: "daily", Message: "boom"},
+		events.Event{Seq: 4, Type: events.OrderFailed, Ts: now, Subject: "daily", Message: "boom"},
+	)
+	check := outcomeCheckAt(cityPath, cfg, now)
+	_, sources := countLookBacks(check)
+	result := check.Run(&CheckContext{CityPath: cityPath})
+	if result.Status != StatusWarning || !strings.Contains(strings.Join(result.Details, "\n"), "daily: 3 consecutive failures") {
+		t.Fatalf("want 3 consecutive failures, read no further: %v %q %v", result.Status, result.Message, result.Details)
+	}
+	if *sources != 2 {
+		t.Fatalf("sources read = %d, want 2 (active log, then the -10d archive)", *sources)
+	}
+}
+
+// A failure just after a log-source boundary may be graced by a controller
+// start just before it, in the next older source. The walk must not stop on a
+// count that start could lower.
+func TestOrderOutcomeHealthy_LookBackReadsTheStartThatGracesABoundaryFailure(t *testing.T) {
+	now := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrderInDir(t, filepath.Join(cityPath, "orders"), "daily", "cron", "0 0 * * *")
+	start := now.Add(-12 * 24 * time.Hour)
+	writeOutcomeArchive(t, cityPath, start.Add(time.Minute),
+		events.Event{Seq: 1, Type: events.ControllerStarted, Ts: start})
+	writeOutcomeArchive(t, cityPath, start.Add(time.Hour),
+		events.Event{Seq: 2, Type: events.OrderFailed, Ts: start.Add(2 * time.Minute), Subject: "daily", Message: "spurious"})
+	writeOutcomeLog(t, cityPath,
+		events.Event{Seq: 3, Type: events.OrderFailed, Ts: now.Add(-7 * 24 * time.Hour), Subject: "daily", Message: "boom"},
+		events.Event{Seq: 4, Type: events.OrderFailed, Ts: now, Subject: "daily", Message: "boom"},
+	)
+	result := outcomeCheckAt(cityPath, cfg, now).Run(&CheckContext{CityPath: cityPath})
+	if result.Status != StatusOK || !strings.Contains(strings.Join(result.Details, "\n"), "daily: 2 consecutive failure(s), under threshold 3") {
+		t.Fatalf("the graced boundary failure must not count: %v %q %v", result.Status, result.Message, result.Details)
+	}
+}
+
+// An order the look-back cannot settle is a Warning, never a silent OK.
+func TestOrderOutcomeHealthy_UnsettledLookBackWarns(t *testing.T) {
+	now := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrderInDir(t, filepath.Join(cityPath, "orders"), "daily", "cron", "0 0 * * *")
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.OrderFailed, Ts: now, Subject: "daily", Message: "boom"},
+	)
+
+	// Out of time: the runner's deadline has passed, so nothing more is read.
+	check := outcomeCheckAt(cityPath, cfg, now)
+	walks, _ := countLookBacks(check)
+	result := check.Run(&CheckContext{CityPath: cityPath, Deadline: time.Now().Add(-time.Second)})
+	if result.Status != StatusWarning || !strings.Contains(strings.Join(result.Details, "\n"),
+		"daily: every run read failed (1 counted); older runs were not read within the time budget") {
+		t.Fatalf("an out-of-budget look-back must warn: %v %q %v", result.Status, result.Message, result.Details)
+	}
+	if *walks != 0 {
+		t.Fatalf("look-backs = %d, want 0 past the deadline", *walks)
+	}
+
+	// The read fails.
+	check = outcomeCheckAt(cityPath, cfg, now)
+	check.walkBack = func(string, events.Filter, []string, func([]events.Event, time.Time) bool) error {
+		return errors.New("disk on fire")
+	}
+	result = check.Run(&CheckContext{CityPath: cityPath})
+	if result.Status != StatusWarning || !strings.Contains(strings.Join(result.Details, "\n"), "could not be read (disk on fire)") {
+		t.Fatalf("a failed look-back must warn: %v %q %v", result.Status, result.Message, result.Details)
+	}
+
+	// Control: with time and a readable log, one failure in all of history is
+	// under threshold.
+	result = outcomeCheckAt(cityPath, cfg, now).Run(&CheckContext{CityPath: cityPath})
+	if result.Status != StatusOK || !strings.Contains(strings.Join(result.Details, "\n"), "daily: 1 consecutive failure(s), under threshold 3") {
+		t.Fatalf("control: %v %q %v", result.Status, result.Message, result.Details)
 	}
 }
