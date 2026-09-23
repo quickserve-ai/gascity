@@ -19,8 +19,9 @@ type FormulaRequirementsCheck struct {
 	cfg *config.City
 	// compile compiles a formula by name the way dispatch does. It settles a
 	// disabled_reason whose own requirement is satisfiable: expansions and
-	// aspects add their requirements only at compile time.
-	compile func(name string, searchPaths []string) error
+	// aspects add their requirements only at compile time. formulaV2Enabled is
+	// the city's [daemon] formula_v2, not the process-wide flag.
+	compile func(name string, searchPaths []string, formulaV2Enabled bool) error
 }
 
 // NewFormulaRequirementsCheck creates a formula requirements doctor check.
@@ -28,8 +29,8 @@ func NewFormulaRequirementsCheck(cfg *config.City, _ string) *FormulaRequirement
 	return &FormulaRequirementsCheck{cfg: cfg, compile: compileFormulaForRequirements}
 }
 
-func compileFormulaForRequirements(name string, searchPaths []string) error {
-	_, err := formula.CompileWithoutRuntimeVarValidation(context.Background(), name, searchPaths, nil)
+func compileFormulaForRequirements(name string, searchPaths []string, formulaV2Enabled bool) error {
+	_, err := formula.CompileWithoutRuntimeVarValidationForHost(context.Background(), name, searchPaths, nil, formulaV2Enabled)
 	return err
 }
 
@@ -145,17 +146,13 @@ func (c *FormulaRequirementsCheck) collectIssues() ([]formulaRequirementIssue, [
 			if resolved.Requires != nil {
 				reason = strings.TrimSpace(resolved.Requires.DisabledReason)
 			}
-			ownReason := ""
-			if f.Requires != nil {
-				ownReason = strings.TrimSpace(f.Requires.DisabledReason)
-			}
 			v2 := c.cfg.Daemon.FormulaV2Enabled()
 			hostErr := formula.ValidateHostRequirements(resolved, v2)
-			// A reason inherited through extends excuses only what the parent
-			// made unsatisfiable: if the formula's OWN requirement is unmet, it
-			// must carry its own reason.
-			ownUnexcused := ownReason == "" && formula.IsUnsatisfiedRequirement(formula.ValidateHostRequirements(f, v2))
-			intentionallyDisabled := reason != "" && formula.IsUnsatisfiedRequirement(hostErr) && !ownUnexcused
+			var disabledReasons []string
+			intentionallyDisabled := false
+			if formula.IsUnsatisfiedRequirement(hostErr) {
+				disabledReasons, intentionallyDisabled = coveringDisabledReasons(parser, f, v2)
+			}
 			// A deliberately unsatisfiable requirement also fails the explicit
 			// graph-declaration rule (">=999.0.0" does not accept the graph
 			// compiler), so that derivative error is not reported for it.
@@ -172,7 +169,7 @@ func (c *FormulaRequirementsCheck) collectIssues() ([]formulaRequirementIssue, [
 			}
 			switch {
 			case intentionallyDisabled:
-				note := fmt.Sprintf("intentionally disabled %s formula %q (%s): %s", scope.name, resolved.Formula, path, reason)
+				note := fmt.Sprintf("intentionally disabled %s formula %q (%s): %s", scope.name, resolved.Formula, path, strings.Join(disabledReasons, "; "))
 				if _, ok := seenDisabled[note]; !ok {
 					seenDisabled[note] = struct{}{}
 					disabled = append(disabled, note)
@@ -191,7 +188,7 @@ func (c *FormulaRequirementsCheck) collectIssues() ([]formulaRequirementIssue, [
 				// can say whether dispatch would refuse it.
 				var compileErr error
 				if c.compile != nil {
-					compileErr = c.compile(resolved.Formula, scope.paths)
+					compileErr = c.compile(resolved.Formula, scope.paths, v2)
 				}
 				switch {
 				case formula.IsUnsatisfiedRequirement(compileErr):
@@ -221,6 +218,50 @@ func (c *FormulaRequirementsCheck) collectIssues() ([]formulaRequirementIssue, [
 		}
 	}
 	return issues, disabled
+}
+
+// coveringDisabledReasons reports whether every unmet compiler requirement of
+// f is declared deliberate by the formula that states it. Resolve merges the
+// constraints of all parents but keeps only the first disabled_reason, so one
+// parent's stale marker could otherwise excuse another parent's genuine
+// requirement. Each formula in the extends tree is instead checked on its OWN
+// constraints, and an unmet one is covered only by a reason on that formula.
+func coveringDisabledReasons(parser *formula.Parser, f *formula.Formula, v2 bool) ([]string, bool) {
+	var reasons []string
+	visited := make(map[string]struct{})
+	var covered func(n *formula.Formula) bool
+	covered = func(n *formula.Formula) bool {
+		if _, ok := visited[n.Formula]; ok {
+			return true
+		}
+		visited[n.Formula] = struct{}{}
+		if err := formula.ValidateHostRequirements(n, v2); err != nil {
+			if !formula.IsUnsatisfiedRequirement(err) {
+				return false
+			}
+			reason := ""
+			if n.Requires != nil {
+				reason = strings.TrimSpace(n.Requires.DisabledReason)
+			}
+			if reason == "" {
+				return false
+			}
+			if !slices.Contains(reasons, reason) {
+				reasons = append(reasons, reason)
+			}
+		}
+		for _, name := range n.Extends {
+			parent, err := parser.LoadByName(name)
+			if err != nil || !covered(parent) {
+				return false
+			}
+		}
+		return true
+	}
+	if !covered(f) {
+		return nil, false
+	}
+	return reasons, len(reasons) > 0
 }
 
 func (c *FormulaRequirementsCheck) formulaScopes() []formulaRequirementScope {
