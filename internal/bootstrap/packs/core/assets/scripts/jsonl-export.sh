@@ -737,6 +737,7 @@ commit_archive_snapshot() {
     local git_dir
     local gc_log
     local gc_log_head
+    local gc_holder
     read_loose_count() {
         count_out=$(git count-objects -v 2>&1) || count_out="count-objects failed: $count_out"
         loose=$(printf '%s\n' "$count_out" | awk '/^count:/ {print $2}')
@@ -745,6 +746,16 @@ commit_archive_snapshot() {
     repack_err=$(git -c gc.auto=256 -c gc.autoDetach=false gc --auto --quiet 2>&1 >/dev/null) || repack_rc=$?
     read_loose_count
     if [ "$repack_rc" -eq 0 ] && [ -n "$loose" ] && [ "$loose" -gt "$REPACK_LOOSE_CEILING" ]; then
+        # gc --auto also exits 0 when ANOTHER git gc holds the repository
+        # (.git/gc.pid), and an explicit repack never looks at that lock:
+        # running it now would race the other gc's pack writes and deletes
+        # (codex round 12 on #138). Defer instead. The next commit retries,
+        # and a deferral is neither a success nor a failure.
+        git_dir=$(git rev-parse --git-dir 2>/dev/null) || git_dir=".git"
+        if gc_holder=$(git_gc_holder "$git_dir"); then
+            echo "jsonl-export: archive repack deferred: another git gc holds $git_dir/gc.pid ($gc_holder); the next commit retries" >&2
+            return 0
+        fi
         # An incremental repack cannot write a bitmap index: an inherited
         # repack.writeBitmaps / pack.writeBitmaps makes it exit 128 on every
         # snapshot, and the loose objects grow unbounded again.
@@ -770,6 +781,31 @@ $count_out"
     record_archive_repack_failure "step=$repack_step exit=$repack_rc loose_objects=${loose:-unknown} (ceiling $REPACK_LOOSE_CEILING)
 $repack_err"
     return 0
+}
+
+# Print who holds git gc's repository lock and succeed, or fail when nobody
+# does. git serializes gc through $GIT_DIR/gc.pid ("<pid> <host>") and treats
+# it as held while the file is younger than 12 hours and its host is another
+# machine or its pid is alive here (builtin/gc.c). This mirrors that test.
+# Liveness is read with ps, which, like git's EPERM rule, counts another
+# user's live process as alive, where kill -0 would call it dead.
+git_gc_holder() {
+    local pid_file="$1/gc.pid"
+    local pid=""
+    local host=""
+    [ -f "$pid_file" ] || return 1
+    [ -n "$(find "$pid_file" -mmin -720 2>/dev/null)" ] || return 1
+    read -r pid host < "$pid_file" 2>/dev/null || [ -n "$pid" ] || return 1
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    if [ -n "$host" ] && [ "$host" != "$(hostname 2>/dev/null)" ]; then
+        printf 'pid %s on %s' "$pid" "$host"
+        return 0
+    fi
+    if [ -n "$(ps -p "$pid" -o pid= 2>/dev/null)" ]; then
+        printf 'pid %s' "$pid"
+        return 0
+    fi
+    return 1
 }
 
 # Clear the repack failure streak. Writes state only when there is a streak

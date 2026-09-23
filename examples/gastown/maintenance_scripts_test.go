@@ -9085,6 +9085,126 @@ exec '%s' "$@"
 	}
 }
 
+// gcLockStub makes `git gc` exit 0 after writing $GIT_DIR/gc.pid for holderPID
+// on holderHost, the state a concurrently running git gc leaves. `git repack`
+// is real, but each call is logged to repackLog first.
+func gcLockStub(t *testing.T, binDir, repackLog string, holderPID int, holderHost string) {
+	t.Helper()
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("LookPath(git): %v", err)
+	}
+	writeExecutable(t, filepath.Join(binDir, "git"), fmt.Sprintf(`#!/bin/sh
+for arg in "$@"; do
+    if [ "$arg" = "gc" ]; then
+        printf '%%s %%s\n' '%d' '%s' > "$('%s' rev-parse --git-dir)/gc.pid"
+        exit 0
+    fi
+    if [ "$arg" = "repack" ]; then
+        echo repack >> '%s'
+    fi
+done
+exec '%s' "$@"
+`, holderPID, holderHost, realGit, repackLog, realGit))
+}
+
+// gc --auto also exits 0 when ANOTHER git gc holds the repository, and an
+// explicit repack ignores that lock. With a live gc.pid holder on this host
+// the fallback must defer: no repack, and no failure counted (codex round 12
+// on #138).
+func TestJsonlExportExplicitRepackDefersToARunningGC(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+	mailLog := filepath.Join(t.TempDir(), "gc-mail.log")
+	archiveRepo := filepath.Join(cityDir, "archive")
+	stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
+	repackLog := filepath.Join(t.TempDir(), "repack.log")
+
+	holder := exec.Command("sleep", "120")
+	if err := holder.Start(); err != nil {
+		t.Fatalf("start holder: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = holder.Process.Kill()
+		_ = holder.Wait()
+	})
+	host, err := os.Hostname()
+	if err != nil {
+		t.Fatalf("Hostname: %v", err)
+	}
+	gcLockStub(t, binDir, repackLog, holder.Process.Pid, host)
+	writeJsonlExportGCStub(t, binDir)
+	writeMultiRecordDoltStub(t, binDir, 3)
+
+	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
+	env["GC_JSONL_REPACK_LOOSE_CEILING"] = "0"
+
+	runScript(t, coreScriptPath("jsonl-export.sh"), env)
+
+	if data, err := os.ReadFile(repackLog); err == nil {
+		t.Fatalf("the explicit repack must not run while another git gc holds gc.pid; repack calls:\n%s", data)
+	}
+	data, err := os.ReadFile(stateFile)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("ReadFile(state file): %v", err)
+	}
+	if strings.Contains(string(data), "consecutive_repack_failures") {
+		t.Fatalf("a deferral to a running gc must not count as a repack failure\nstate: %s", data)
+	}
+	out := runGitOut(t, archiveRepo, "count-objects", "-v")
+	if strings.Contains("\n"+out+"\n", "\ncount: 0\n") {
+		t.Fatalf("nothing should have packed the loose objects while the gc lock was held; count-objects:\n%s", out)
+	}
+}
+
+// A gc.pid whose pid is dead on this host is a stale lock (a crashed gc), not
+// a running one: git ignores it, and so must the fallback. The explicit
+// repack runs and packs the loose objects.
+func TestJsonlExportExplicitRepackRunsPastAStaleGCLock(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+	mailLog := filepath.Join(t.TempDir(), "gc-mail.log")
+	archiveRepo := filepath.Join(cityDir, "archive")
+	stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
+	repackLog := filepath.Join(t.TempDir(), "repack.log")
+
+	gone := exec.Command("true")
+	if err := gone.Run(); err != nil {
+		t.Fatalf("run short-lived process: %v", err)
+	}
+	host, err := os.Hostname()
+	if err != nil {
+		t.Fatalf("Hostname: %v", err)
+	}
+	gcLockStub(t, binDir, repackLog, gone.Process.Pid, host)
+	writeJsonlExportGCStub(t, binDir)
+	writeMultiRecordDoltStub(t, binDir, 3)
+
+	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
+	env["GC_JSONL_REPACK_LOOSE_CEILING"] = "0"
+
+	runScript(t, coreScriptPath("jsonl-export.sh"), env)
+
+	if _, err := os.ReadFile(repackLog); err != nil {
+		t.Fatalf("a stale gc.pid (dead pid) must not block the explicit repack: %v", err)
+	}
+	data, err := os.ReadFile(stateFile)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("ReadFile(state file): %v", err)
+	}
+	if strings.Contains(string(data), "consecutive_repack_failures") {
+		t.Fatalf("the repack past a stale lock must succeed\nstate: %s", data)
+	}
+	out := runGitOut(t, archiveRepo, "count-objects", "-v")
+	if !strings.Contains("\n"+out+"\n", "\ncount: 0\n") {
+		t.Fatalf("the explicit repack must pack the loose objects past a stale lock; count-objects:\n%s", out)
+	}
+}
+
 // A failed escalation DELIVERY must be distinguishable from the repack failure
 // it reports: it is kept in state, and the escalated marker stays unset so the
 // next failing commit retries the delivery.
