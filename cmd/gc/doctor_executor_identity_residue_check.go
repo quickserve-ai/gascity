@@ -44,7 +44,11 @@ import (
 //  3. A work_dir disagreement whose gc.work_dir or legacy work_dir path still
 //     exists on disk is not residue: that path may be the only pointer to
 //     unpushed work.
-//  4. A stat here proves a path absent only on THIS machine. A work_dir
+//  4. This machine can judge only what is provably its own. A
+//     gc.session_name is cleared only if it names a session this city has
+//     run (any session bead, open or closed); another town's session under a
+//     route both towns configure is reported, never cleared. And a stat here
+//     proves a path absent only on THIS machine. A work_dir
 //     disagreement is cleared only when the bead is provably this city's: a
 //     locally configured route, and both paths absolute and under this
 //     city's root or one of its rig paths. Otherwise (an empty route, a
@@ -112,7 +116,7 @@ func (f executorIdentityResidueFinding) describe() string {
 			strings.Join(f.unconfirmed, ", "), f.judge.openSessions.err))
 	}
 	if len(f.reportOnly) > 0 {
-		parts = append(parts, fmt.Sprintf("has disagreeing %s that this machine cannot judge (empty route, or a path not under this city's root or rig paths); REPORTED ONLY, gc doctor --fix never clears it",
+		parts = append(parts, fmt.Sprintf("has %s that this machine cannot judge (an empty route, a path outside this city's root and rig paths, or a session name this city never ran); REPORTED ONLY, gc doctor --fix never clears it",
 			strings.Join(f.reportOnly, ", ")))
 	}
 	return fmt.Sprintf("%s bead %s %s", f.label, f.beadID, strings.Join(parts, "; "))
@@ -157,8 +161,8 @@ func (c *executorIdentityResidueCheck) Run(_ *doctor.CheckContext) *doctor.Check
 		hints = append(hints, "fix session bead store access (--fix will not clear an unconfirmed gc.session_name)")
 	}
 	if reportOnly > 0 {
-		summary = append(summary, fmt.Sprintf("%d work_dir finding(s) reported only: locality not provable on this machine", reportOnly))
-		hints = append(hints, "review report-only work_dir stamps from the machine that owns them (--fix never clears them)")
+		summary = append(summary, fmt.Sprintf("%d finding(s) reported only: not provably this city's", reportOnly))
+		hints = append(hints, "review report-only stamps from the town that owns them (--fix never clears them)")
 	}
 	if len(skipped) > 0 {
 		summary = append(summary, fmt.Sprintf("%d scope(s) skipped", len(skipped)))
@@ -470,6 +474,20 @@ func buildExecutorRouteIdentityIndex(store beads.Store) (executorRouteIdentityIn
 	return idx, nil
 }
 
+// knows reports whether identity names any session bead in the index, under
+// any route, open or closed: a session this city itself ran at some point.
+func (idx executorRouteIdentityIndex) knows(identity string) bool {
+	if identity == "" {
+		return false
+	}
+	for _, identities := range idx {
+		if _, ok := identities[identity]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 func (idx executorRouteIdentityIndex) legitimate(route, identity string) bool {
 	if route == "" || identity == "" {
 		return false
@@ -536,6 +554,8 @@ func (j *executorIdentityResidueJudge) staleKeys(bd beads.Bead) (keys, unconfirm
 		keys = append(keys, beadmeta.SessionNameMetadataKey)
 	case residueUnconfirmed:
 		unconfirmed = append(unconfirmed, beadmeta.SessionNameMetadataKey)
+	case residueSessionNameReportOnly:
+		reportOnly = append(reportOnly, beadmeta.SessionNameMetadataKey)
 	}
 	return keys, unconfirmed, reportOnly
 }
@@ -713,6 +733,11 @@ const (
 	// residueUnconfirmed: every config/index rule calls the stamp stale, but
 	// the open session beads could not be listed to rule out a live holder.
 	residueUnconfirmed
+	// residueSessionNameReportOnly: every rule calls the stamp stale, but it
+	// names no session this city has ever run. On a store shared with other
+	// towns that is likely another town's live session under a route both
+	// towns configure, so this machine cannot judge it (rule 4).
+	residueSessionNameReportOnly
 )
 
 // staleSessionNameStamp reports whether bd carries a stale gc.session_name:
@@ -748,6 +773,9 @@ func (j *executorIdentityResidueJudge) staleSessionNameStamp(bd beads.Bead) resi
 	}
 	if j.identities.legitimate(routedTo, sessionName) {
 		return residueNotStale
+	}
+	if !j.identities.knows(sessionName) {
+		return residueSessionNameReportOnly
 	}
 	open, err := j.openSessions.get()
 	if err != nil {
