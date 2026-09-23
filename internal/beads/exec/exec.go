@@ -212,6 +212,7 @@ func (w *beadWire) toBead() beads.Bead {
 		NoHistory:   w.NoHistory,
 		DeferUntil:  cloneTimePtr(w.DeferUntil),
 		CloseReason: closeReasonFor(status, w.CloseReason),
+		AwaitType:   w.AwaitType,
 	}
 }
 

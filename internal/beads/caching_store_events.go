@@ -630,6 +630,9 @@ func mergeCacheEventPatch(base, patch Bead, fields map[string]json.RawMessage) B
 	if merged.Status != "closed" {
 		merged.CloseReason = ""
 	}
+	if hasCacheEventField(fields, "await_type") {
+		merged.AwaitType = patch.AwaitType
+	}
 	return merged
 }
 
@@ -681,6 +684,9 @@ func cacheEventConflictsCurrent(current, patch Bead, fields map[string]json.RawM
 		return true
 	}
 	if hasCacheEventField(fields, "close_reason") && current.CloseReason != patch.CloseReason {
+		return true
+	}
+	if hasCacheEventField(fields, "await_type") && current.AwaitType != patch.AwaitType {
 		return true
 	}
 	return false
