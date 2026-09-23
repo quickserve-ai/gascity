@@ -689,6 +689,20 @@ type Rig struct {
 	// a warning, for a rig that shares the city's proxy root: one proxy serves
 	// every scope on that root and carries the city's value.
 	BeadsProxiedIdleTimeout *string `toml:"beads_proxied_idle_timeout,omitempty"`
+	// Doctor holds rig-scoped gc doctor policy ([rigs.doctor]).
+	Doctor RigDoctorConfig `toml:"doctor,omitempty"`
+}
+
+// RigDoctorConfig holds gc doctor policy that applies to one rig.
+type RigDoctorConfig struct {
+	// CensusOwnerNamespace declares that this rig's resource-census ledger
+	// (test/test-resources.toml) names owner_bead values from ANOTHER
+	// tracker, e.g. "gastownhall/gascity" for a fork of Gas City whose ledger
+	// comes from upstream. The census-owner-liveness check then reports an
+	// owner_bead missing from this city as owned in that namespace instead of
+	// dangling. The cost: a missing owner on this rig that is genuinely this
+	// city's is not detected. Empty means every missing owner is dangling.
+	CensusOwnerNamespace string `toml:"census_owner_namespace,omitempty"`
 }
 
 // AgentOverride modifies a pack-stamped agent for a specific rig.
