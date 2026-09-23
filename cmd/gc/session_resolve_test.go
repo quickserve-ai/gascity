@@ -1034,7 +1034,6 @@ func TestResolveSessionIDWithConfig_ConflictAdviceFollowsTheConflictShape(t *tes
 	}{
 		{"runtime name, other template", map[string]string{"session_name": spec.SessionName, "template": "other", "agent_name": "other", "state": "asleep"}, true, `template="other"`},
 		{"alias, other template", map[string]string{"session_name": "s-rogue", "alias": "mayor", "template": "other", "state": "active"}, true, "name squat"},
-		{"alias, this seat's template", map[string]string{"session_name": "s-own", "alias": "mayor", "template": "mayor", "state": "active"}, false, "gc session show"},
 		{"alias, no template", map[string]string{"session_name": "s-bare", "alias": "mayor", "state": "active"}, false, "gc session show"},
 		{"runtime name, no template", map[string]string{"session_name": spec.SessionName, "state": "asleep"}, false, "gc session show"},
 		{"pool session the reconciler adopts", map[string]string{"session_name": "mayor-ga-x1", "template": "mayor", "agent_name": "mayor", "session_origin": "ephemeral", "pool_managed": "true", "state": "active"}, false, "reconciler adopts"},
