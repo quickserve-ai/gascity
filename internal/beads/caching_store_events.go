@@ -538,6 +538,9 @@ func mergeCacheEventPatch(base, patch Bead, fields map[string]json.RawMessage) B
 	if hasCacheEventField(fields, "is_blocked") {
 		merged.IsBlocked = cloneBoolPtr(patch.IsBlocked)
 	}
+	if hasCacheEventField(fields, "await_type") {
+		merged.AwaitType = patch.AwaitType
+	}
 	return merged
 }
 
@@ -586,6 +589,9 @@ func cacheEventConflictsCurrent(current, patch Bead, fields map[string]json.RawM
 		return true
 	}
 	if hasCacheEventField(fields, "is_blocked") && !boolPtrEqual(current.IsBlocked, patch.IsBlocked) {
+		return true
+	}
+	if hasCacheEventField(fields, "await_type") && current.AwaitType != patch.AwaitType {
 		return true
 	}
 	return false
@@ -805,7 +811,8 @@ func beadChanged(old, fresh Bead, skipLabels bool) bool {
 		old.Ephemeral != fresh.Ephemeral ||
 		old.IndefinitelyDeferred != fresh.IndefinitelyDeferred ||
 		!timePtrEqual(old.DeferUntil, fresh.DeferUntil) ||
-		!boolPtrEqual(old.IsBlocked, fresh.IsBlocked) {
+		!boolPtrEqual(old.IsBlocked, fresh.IsBlocked) ||
+		old.AwaitType != fresh.AwaitType {
 		return true
 	}
 	if !maps.Equal(old.Metadata, fresh.Metadata) {
