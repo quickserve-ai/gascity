@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -155,5 +156,80 @@ func TestMailInboxCrossCityServesCityQualifiedDelivery(t *testing.T) {
 	}
 	if inbox.Items[0].To != "test-city/myrig/worker" {
 		t.Errorf("To = %q, want %q", inbox.Items[0].To, "test-city/myrig/worker")
+	}
+}
+
+// flakyGetMailProvider answers Get for the provider lookup, then fails every
+// later Get, so the reply handler's own origin read fails while Reply would
+// still succeed — the fail-open shape the cross-city rules must refuse.
+type flakyGetMailProvider struct {
+	mail.Provider
+	okGets int
+	gets   int
+}
+
+func (p *flakyGetMailProvider) Get(id string) (mail.Message, error) {
+	p.gets++
+	if p.gets <= p.okGets {
+		return p.Provider.Get(id)
+	}
+	return mail.Message{}, fmt.Errorf("store_slow: transient read failure")
+}
+
+// With the roster enabled, a reply whose thread origin cannot be read fails
+// closed on the API exactly as on the CLI: never a reply across cities with
+// a bare sender.
+func TestMailReplyCrossCityFailsClosedWhenOriginUnreadable(t *testing.T) {
+	state := newFakeState(t)
+	enableCrossCity(state)
+	seeded, err := state.cityMailProv.Send("gastown/mayor", "myrig/worker", "cutover", "leg is green")
+	if err != nil {
+		t.Fatalf("seed Send: %v", err)
+	}
+	flaky := &flakyGetMailProvider{Provider: state.cityMailProv, okGets: 1}
+	state.cityMailProv = flaky
+	h := newTestCityHandler(t, state)
+
+	body := `{"from":"worker","subject":"re: cutover","body":"received"}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, newPostRequest(cityURL(state, "/mail/")+seeded.ID+"/reply", bytes.NewBufferString(body)))
+	if rec.Code == http.StatusCreated || rec.Code == http.StatusOK {
+		t.Fatalf("reply status = %d, want refusal when the origin cannot be read; body: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "cross_city_origin_unverified") {
+		t.Errorf("body = %q, want the cross_city_origin_unverified refusal", rec.Body.String())
+	}
+	inbox, _ := flaky.Provider.Inbox("gastown/mayor")
+	for _, m := range inbox {
+		if m.ID != seeded.ID {
+			t.Errorf("a reply %q was written despite the refusal", m.ID)
+		}
+	}
+}
+
+// A reply into a thread whose origin names a city outside the roster is
+// refused with the typed unknown-city message, never written to a literal
+// mailbox nobody polls.
+func TestMailReplyCrossCityUnknownOriginRefused(t *testing.T) {
+	state := newFakeState(t)
+	enableCrossCity(state)
+	h := newTestCityHandler(t, state)
+
+	seeded, err := state.cityMailProv.Send("gastwn/mayor", "myrig/worker", "cutover", "typo city")
+	if err != nil {
+		t.Fatalf("seed Send: %v", err)
+	}
+	body := `{"from":"worker","subject":"re: cutover","body":"received"}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, newPostRequest(cityURL(state, "/mail/")+seeded.ID+"/reply", bytes.NewBufferString(body)))
+	if rec.Code == http.StatusCreated || rec.Code == http.StatusOK {
+		t.Fatalf("reply status = %d, want unknown-city refusal; body: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "unknown city") || !strings.Contains(rec.Body.String(), "gastwn") {
+		t.Errorf("body = %q, want typed unknown-city refusal naming gastwn", rec.Body.String())
+	}
+	inbox, _ := state.cityMailProv.Inbox("gastwn/mayor")
+	if len(inbox) != 0 {
+		t.Errorf("reply written to the literal mailbox gastwn/mayor: %+v", inbox)
 	}
 }
