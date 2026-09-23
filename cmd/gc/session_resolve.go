@@ -74,11 +74,7 @@ func resolveConfiguredNamedSessionID(
 		}
 	}
 	if lookup.HasConflict {
-		// A live bead holds this name without being its configured session: a
-		// name squat. Every by-name verb refuses here, kill included, and kill
-		// could not clear it anyway (it stops a runtime; an asleep bead is still
-		// live). Name the verb that does, addressed by bead ID (ga-lm5coj).
-		return "", true, fmt.Errorf("%w: %q conflicts with configured named session %q via live bead %s; if that bead is stale, close it with 'gc session close %s' to free the name for %s", errNamedSessionConflict, identifier, spec.Identity, lookup.Conflict.ID, lookup.Conflict.ID, spec.Identity)
+		return "", true, namedSessionConflictError(identifier, spec, lookup.Conflict)
 	}
 	if !opts.materialize {
 		return "", false, fmt.Errorf("%w: %q", session.ErrSessionNotFound, identifier)
@@ -87,6 +83,39 @@ func resolveConfiguredNamedSessionID(
 		materializeMetadata: opts.materializeMetadata,
 	})
 	return id, true, err
+}
+
+// namedSessionConflictError explains a named-session conflict well enough to
+// act on. Every by-name verb refuses on a conflict, kill included, and kill
+// could not clear one anyway: it stops a runtime, and an asleep bead is still
+// live. The verb that frees the name is close, addressed by bead ID. But close
+// stops the runtime, ends the bead for good and releases its work, and two of
+// the three conflict kinds can be the seat's own live session. So the error
+// prints what it takes to tell the kinds apart and recommends close only for
+// the runtime-name squat (ga-lm5coj).
+func namedSessionConflictError(identifier string, spec namedSessionSpec, b beads.Bead) error {
+	head := fmt.Sprintf("%q conflicts with configured named session %q via live bead %s (state=%q template=%q pool_managed=%q)",
+		identifier, spec.Identity, b.ID,
+		strings.TrimSpace(b.Metadata["state"]), strings.TrimSpace(b.Metadata["template"]), strings.TrimSpace(b.Metadata["pool_managed"]))
+	// A squat needs positive evidence that the bead runs something else: a
+	// recorded template or agent that is not this seat's. A bead that records
+	// neither could be the seat's own session, never stamped with its
+	// identity (ga-1ycmli).
+	foreign := (strings.TrimSpace(b.Metadata["template"]) != "" || strings.TrimSpace(b.Metadata["agent_name"]) != "") &&
+		!session.NamedSessionBeadMatchesSpec(b, spec)
+	var advice string
+	switch kind := session.ClassifyNamedSessionConflict(b, spec); {
+	case kind == session.NamedSessionConflictAdoptablePool:
+		advice = fmt.Sprintf("it is a pool-managed session of this seat's template that the reconciler adopts as %s; do not close it: retry after the next reconcile, or check 'gc session show %s'",
+			spec.Identity, b.ID)
+	case foreign && (kind == session.NamedSessionConflictRuntimeName || kind == session.NamedSessionConflictAlias):
+		advice = fmt.Sprintf("it holds this seat's name for a different template (a name squat); if it is stale, close it with 'gc session close %s' to free the name for %s",
+			b.ID, spec.Identity)
+	default:
+		advice = fmt.Sprintf("it records no template that rules it out as this seat's own running session; check 'gc session show %s' first, and do not close a session the seat is using",
+			b.ID)
+	}
+	return fmt.Errorf("%w: %s; %s", errNamedSessionConflict, head, advice)
 }
 
 func resolveSessionIDWithConfig(cityPath string, cfg *config.City, store beads.Store, identifier string) (string, error) {
