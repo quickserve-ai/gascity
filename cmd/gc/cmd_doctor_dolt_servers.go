@@ -64,6 +64,10 @@ type doltServersCheck struct {
 	otherScopes func(cityPath string) ([]string, error)
 	// cwd resolves a process's working directory; ok=false when unreadable.
 	cwd func(pid int) (string, bool)
+	// args reads a process's FULL command line (/proc, else `ps -o args`).
+	// Discovery's macOS ps fallback keeps only --config, so a --data-dir-only
+	// server is re-read here rather than identified by its cwd.
+	args func(pid int) (string, error)
 	// recordedPID reads the managed runtime's pid file without side effects.
 	recordedPID func(layout managedDoltRuntimeLayout) int
 	// activeTestRoots lists test roots whose owning test process is alive.
@@ -90,6 +94,7 @@ func newDoltServersCheck(cityPath string, cfg *config.City) *doltServersCheck {
 		layout:          resolveManagedDoltRuntimeLayoutStrict,
 		otherScopes:     registeredScopeRootsExcept,
 		cwd:             processCWD,
+		args:            processArgs,
 		recordedPID:     readManagedDoltPIDFile,
 		activeTestRoots: func() []string { return discoverActiveTestRoots(home, temp) },
 		startIdentity:   readProcStartIdentity,
@@ -116,19 +121,48 @@ var gcDoltConfigMarker = filepath.Join(".gc", "runtime", "packs", "dolt") + stri
 type doltServerIdentity struct {
 	path   string // config, data-dir, or cwd; "" when none is known
 	source string // "config", "data-dir", "cwd"
+	// relative is set when the path was a relative --config/--data-dir whose
+	// anchor (the server's cwd) could not be read: unidentifiable, not "not gc".
+	relative bool
 }
 
 func (c *doltServersCheck) identify(p DoltProcInfo) doltServerIdentity {
 	if cfg := trimFlattenedDoltArgs(extractConfigPath(p.Argv)); cfg != "" {
-		return doltServerIdentity{path: cfg, source: "config"}
+		return c.anchored(p.PID, cfg, "config")
 	}
-	if dd, ok := argvFlagValue(p.Argv); ok && dd != "" {
-		return doltServerIdentity{path: trimFlattenedDoltArgs(dd), source: "data-dir"}
+	dd, hasDD := argvFlagValue(p.Argv)
+	if !hasDD && c.args != nil {
+		// The ps fallback kept only --config (parseDoltPSCommandLine), so a
+		// --data-dir server would otherwise be identified by an unrelated cwd.
+		// Re-read the full command line here; the shared parser stays as is
+		// because `gc dolt cleanup` reaps by what it returns.
+		if full, err := c.args(p.PID); err == nil {
+			if v := extractFlagValue(full, "--data-dir"); v != "" {
+				dd, hasDD = v, true
+			}
+		}
+	}
+	if hasDD && dd != "" {
+		return c.anchored(p.PID, trimFlattenedDoltArgs(dd), "data-dir")
 	}
 	if cwd, ok := c.cwd(p.PID); ok && cwd != "" {
 		return doltServerIdentity{path: cwd, source: "cwd"}
 	}
 	return doltServerIdentity{}
+}
+
+// anchored resolves a --config/--data-dir value the way the SERVER did: a
+// relative path is relative to the server's working directory, not doctor's.
+// Unreadable cwd -> unidentifiable (a Warning), never classified as "not gc".
+func (c *doltServersCheck) anchored(pid int, path, source string) doltServerIdentity {
+	if filepath.IsAbs(path) {
+		return doltServerIdentity{path: path, source: source}
+	}
+	cwd, ok := c.cwd(pid)
+	if !ok || cwd == "" {
+		return doltServerIdentity{source: source, relative: true}
+	}
+	return doltServerIdentity{path: filepath.Join(cwd, path), source: source}
 }
 
 func (c *doltServersCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
@@ -151,12 +185,14 @@ func (c *doltServersCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 	var testRoots []string
 	testRootsLoaded := false
 
-	var managed, strays, foreign, orphanTests, unidentified []DoltProcInfo
+	var managed, strays, foreign, orphanTests, unidentified, unanchored []DoltProcInfo
 	rigLocal := map[string][]DoltProcInfo{}
 	var rigLocalCount, otherCity, activeTests, notGC int
 	for _, p := range procs {
 		id := c.identify(p)
 		switch {
+		case id.path == "" && id.relative:
+			unanchored = append(unanchored, p)
 		case id.path == "":
 			unidentified = append(unidentified, p)
 		case layoutErr == nil && servesDoltLayout(p, id, layout):
@@ -216,13 +252,16 @@ func (c *doltServersCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 	for _, p := range unidentified {
 		warns = append(warns, "dolt server with no --config, no --data-dir and an unreadable working directory (cannot rule out this city's store): "+c.describe(p))
 	}
+	for _, p := range unanchored {
+		warns = append(warns, "dolt server with a relative --config/--data-dir and an unreadable working directory to resolve it against (cannot rule out this city's store): "+c.describe(p))
+	}
 	for _, p := range strays {
 		warns = append(warns, "dolt server under the city root that is not the managed server: "+c.describe(p))
 	}
 	for _, p := range foreign {
 		warns = append(warns, "gc-launched dolt server that belongs to no registered city or rig: "+c.describe(p))
 	}
-	if len(unidentified)+len(strays)+len(foreign) > 0 {
+	if len(unidentified)+len(unanchored)+len(strays)+len(foreign) > 0 {
 		hints = append(hints, "confirm the owning scope is no longer in use, then stop the server (`kill <pid>`); `gc dolt cleanup` deliberately protects these")
 	}
 	for _, p := range orphanTests {
@@ -241,7 +280,7 @@ func (c *doltServersCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 	}
 	details = append(details, fmt.Sprintf(
 		"%d dolt sql-server process(es) on host: %d managed, %d rig-local, %d city-stray, %d other registered city, %d active test, %d orphan test, %d foreign gc-launched, %d not gc-launched, %d unidentifiable",
-		len(procs), len(managed), rigLocalCount, len(strays), otherCity, activeTests, len(orphanTests), len(foreign), notGC, len(unidentified)))
+		len(procs), len(managed), rigLocalCount, len(strays), otherCity, activeTests, len(orphanTests), len(foreign), notGC, len(unidentified)+len(unanchored)))
 
 	switch {
 	case len(errs) > 0:
