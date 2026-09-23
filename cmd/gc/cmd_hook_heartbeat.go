@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"os"
 	"strings"
 	"time"
@@ -105,7 +106,7 @@ var _ hookHeartbeatBeadStore = (*beads.BdStore)(nil)
 // a prior alias can be reused by a later live session, and a heartbeat
 // matched through history would keep the successor's claims looking alive
 // after the successor dies. Overridable in tests.
-var hookHeartbeatIdentities = func(sessionID string) ([]string, error) {
+var hookHeartbeatIdentities = func(sessionID, instanceToken string) ([]string, error) {
 	front, err := hookCurrentSessionFrontDoor()
 	if err != nil {
 		return nil, err
@@ -114,7 +115,7 @@ var hookHeartbeatIdentities = func(sessionID string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return hookHeartbeatEligibleIdentities(info, os.Getenv("GC_INSTANCE_TOKEN"))
+	return hookHeartbeatEligibleIdentities(info, instanceToken)
 }
 
 // hookHeartbeatEligibleIdentities fences the write-authorizing identity set
@@ -136,17 +137,21 @@ func hookHeartbeatEligibleIdentities(info session.Info, instanceToken string) ([
 }
 
 // hookHeartbeatStartOffset picks where in the deduplicated row list a run
-// starts beating (codex round-6 P2). The rows are gathered in a deterministic
-// order, and a board large enough for the sequential bd invocations to
-// outrun hookHeartbeatTimeout would otherwise cancel the SAME tail on every
-// run, so those claims could expire while the session keeps taking turns.
-// Rotating the start by wall-clock seconds makes each run begin elsewhere, so
-// every row is refreshed within a few ticks. Overridable in tests.
+// starts beating (codex round-6 P2, sharpened in round 7). The rows are
+// gathered in a deterministic order, and a board large enough for the
+// sequential bd invocations to outrun hookHeartbeatTimeout would otherwise
+// cancel the SAME tail on every run, so those claims could expire while the
+// session keeps taking turns. A wall-clock offset (Unix() % n) repeats under a
+// regular turn cadence and a persisted cursor would be a state file, so the
+// start is drawn at random: every row is equally likely to lead each run,
+// and no tail is starved by construction. Boards that need more than the
+// budget every tick are stage 2's batching problem, not a scheduling one.
+// Overridable in tests.
 var hookHeartbeatStartOffset = func(n int) int {
-	if n <= 0 {
+	if n <= 1 {
 		return 0
 	}
-	return int(time.Now().Unix() % int64(n))
+	return rand.IntN(n)
 }
 
 func newHookHeartbeatCmd(stdout, stderr io.Writer) *cobra.Command {
@@ -214,7 +219,10 @@ func cmdHookHeartbeat(beadID string, strict bool, stdout, stderr io.Writer) int 
 	if sessionID == "" {
 		return miss("no session identity (set $GC_SESSION_ID) and no --id; nothing to heartbeat")
 	}
-	identities, err := hookHeartbeatIdentities(sessionID)
+	// The instance token is read here, in the command body, never in a
+	// top-level initializer: GC_INSTANCE_TOKEN is a leak-vector variable and
+	// the init-time guard (internal/testenv) forbids package-init reads.
+	identities, err := hookHeartbeatIdentities(sessionID, strings.TrimSpace(os.Getenv("GC_INSTANCE_TOKEN")))
 	if err != nil {
 		return miss("resolving session identities: %v", err)
 	}

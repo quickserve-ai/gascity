@@ -16,7 +16,7 @@ func withLeaseHeartbeatSpawnCounter(t *testing.T) *int {
 	restore := leaseHeartbeatSpawn
 	t.Cleanup(func() { leaseHeartbeatSpawn = restore })
 	count := 0
-	leaseHeartbeatSpawn = func(string) { count++ }
+	leaseHeartbeatSpawn = func(string) bool { count++; return true }
 	return &count
 }
 
@@ -65,6 +65,67 @@ func TestLeaseHeartbeatLogRotatesPastTheCap(t *testing.T) {
 	appendLeaseHeartbeatLog(logPath, "second cap")
 	if _, err := os.Stat(logPath + ".1.1"); !os.IsNotExist(err) {
 		t.Fatalf("rotation must keep ONE generation; .1.1 stat err = %v", err)
+	}
+}
+
+// TestLeaseHeartbeatThrottleFailsOpen pins the codex round-7 P1: the stamp is
+// a cadence hint whose every failure mode fails OPEN. A future-dated stamp
+// (host clock stepped back, city restored from a newer snapshot) must not
+// suppress the refresher, a missing stamp never throttles, and a fresh
+// past-dated stamp is the one and only case that does.
+func TestLeaseHeartbeatThrottleFailsOpen(t *testing.T) {
+	stamp := filepath.Join(t.TempDir(), "s.stamp")
+	now := time.Now()
+	if leaseHeartbeatThrottled(stamp, now) {
+		t.Fatal("missing stamp must not throttle")
+	}
+	if err := os.WriteFile(stamp, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	future := now.Add(2 * time.Hour)
+	if err := os.Chtimes(stamp, future, future); err != nil {
+		t.Fatal(err)
+	}
+	if leaseHeartbeatThrottled(stamp, now) {
+		t.Fatal("a future-dated stamp must fail open (spawn), not suppress the refresher")
+	}
+	recent := now.Add(-10 * time.Second)
+	if err := os.Chtimes(stamp, recent, recent); err != nil {
+		t.Fatal(err)
+	}
+	if !leaseHeartbeatThrottled(stamp, now) {
+		t.Fatal("a stamp inside the window must throttle")
+	}
+	old := now.Add(-leaseHeartbeatThrottle - time.Second)
+	if err := os.Chtimes(stamp, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if leaseHeartbeatThrottled(stamp, now) {
+		t.Fatal("a stamp past the window must not throttle")
+	}
+}
+
+// TestMaybeSpawnLeaseHeartbeatStampsOnlyAfterASuccessfulSpawn pins the other
+// half of the round-7 P1: a spawn that fails to start leaves no stamp, so the
+// next turn retries instead of sitting behind a throttle window for a child
+// that never ran.
+func TestMaybeSpawnLeaseHeartbeatStampsOnlyAfterASuccessfulSpawn(t *testing.T) {
+	cityPath := t.TempDir()
+	t.Setenv("GC_SESSION_ID", "ga-stamp")
+	restore := leaseHeartbeatSpawn
+	t.Cleanup(func() { leaseHeartbeatSpawn = restore })
+	leaseHeartbeatSpawn = func(string) bool { return false }
+	cfg := &config.City{}
+	cfg.Beads.LeaseHeartbeat = true
+	maybeSpawnLeaseHeartbeat(cityPath, cfg)
+	stamp := filepath.Join(cityPath, ".gc", "runtime", "lease-heartbeat", leaseHeartbeatStampName("ga-stamp"))
+	if _, err := os.Stat(stamp); !os.IsNotExist(err) {
+		t.Fatalf("failed spawn must leave no stamp; stat err = %v", err)
+	}
+	leaseHeartbeatSpawn = func(string) bool { return true }
+	maybeSpawnLeaseHeartbeat(cityPath, cfg)
+	if _, err := os.Stat(stamp); err != nil {
+		t.Fatalf("successful spawn must stamp: %v", err)
 	}
 }
 
