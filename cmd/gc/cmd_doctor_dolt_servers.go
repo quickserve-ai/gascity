@@ -226,24 +226,47 @@ func (c *doltServersCheck) configDataDir(configPath string) string {
 }
 
 // yamlTopLevelScalar returns an unindented `key: value` scalar, unquoted. It
-// covers what gc writes (data_dir: %q) and plain or single-quoted values.
+// covers what gc writes (data_dir: %q) and plain or single-quoted values, each
+// optionally followed by a " #" comment.
 func yamlTopLevelScalar(data []byte, key string) string {
 	for _, line := range strings.Split(string(data), "\n") {
 		if !strings.HasPrefix(line, key+":") {
 			continue
 		}
 		v := strings.TrimSpace(strings.TrimPrefix(line, key+":"))
-		if i := strings.Index(v, " #"); i >= 0 && !strings.HasPrefix(v, "\"") && !strings.HasPrefix(v, "'") {
-			v = strings.TrimSpace(v[:i])
-		}
 		switch {
 		case strings.HasPrefix(v, "\""):
-			if u, err := strconv.Unquote(v); err == nil {
-				return u
+			// The quoted scalar ends at the first unescaped closing quote;
+			// anything after it can only be a comment.
+			for i := 1; i < len(v); i++ {
+				if v[i] == '\\' {
+					i++
+					continue
+				}
+				if v[i] == '"' {
+					if u, err := strconv.Unquote(v[:i+1]); err == nil {
+						return u
+					}
+					return ""
+				}
 			}
 			return ""
-		case strings.HasPrefix(v, "'") && strings.HasSuffix(v, "'") && len(v) >= 2:
-			return strings.ReplaceAll(v[1:len(v)-1], "''", "'")
+		case strings.HasPrefix(v, "'"):
+			// '' is an escaped quote; the scalar ends at a lone '.
+			for i := 1; i < len(v); i++ {
+				if v[i] != '\'' {
+					continue
+				}
+				if i+1 < len(v) && v[i+1] == '\'' {
+					i++
+					continue
+				}
+				return strings.ReplaceAll(v[1:i], "''", "'")
+			}
+			return ""
+		}
+		if i := strings.Index(v, " #"); i >= 0 {
+			v = strings.TrimSpace(v[:i])
 		}
 		return v
 	}
@@ -393,7 +416,17 @@ func (c *doltServersCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 			continue
 		}
 		rp, ok := policy.rigs[rigRootOf[k]]
-		if !ok || rp.expectsLocal {
+		if !ok {
+			continue
+		}
+		if rp.expectsLocal {
+			// A --self rig accounts for ONE server: the one on its own store.
+			// A server elsewhere under the rig is not that server.
+			if !strings.HasSuffix(k, rigStoreKeySuffix) {
+				warns = append(warns, fmt.Sprintf(
+					"dolt server under rig %q that does not serve the rig's configured store: %s",
+					rp.name, c.describeAll(group)))
+			}
 			continue
 		}
 		if strings.HasSuffix(k, rigStoreKeySuffix) {
@@ -560,6 +593,8 @@ func localServerPolicy(cityPath string, cfg *config.City) (doltLocalPolicy, erro
 	switch {
 	case !scopeUsesManagedBdStoreContract(cityPath, cityPath):
 		pol.city = doltScopeLocal{name: "city", reason: "the city store is not bd/dolt"}
+	case scopeBackendIsDoltlite(cityPath, cityPath):
+		pol.city = doltScopeLocal{name: "city", reason: "the city store backend is doltlite"}
 	case cityState.EndpointOrigin != contract.EndpointOriginManagedCity:
 		pol.city = doltScopeLocal{name: "city", reason: "city endpoint origin " + string(cityState.EndpointOrigin)}
 	}
@@ -573,6 +608,10 @@ func localServerPolicy(cityPath string, cfg *config.City) (doltLocalPolicy, erro
 		root := normalizePathForCompare(strings.TrimSpace(rig.Path))
 		if !rigUsesManagedBdStoreContract(cityPath, rig) {
 			pol.rigs[root] = doltScopeLocal{name: rig.Name, reason: "the rig store is not bd/dolt"}
+			continue
+		}
+		if scopeBackendIsDoltlite(cityPath, rig.Path) {
+			pol.rigs[root] = doltScopeLocal{name: rig.Name, reason: "the rig store backend is doltlite"}
 			continue
 		}
 		st, err := resolveDesiredRigEndpointState(cityPath, rig, cityState)
