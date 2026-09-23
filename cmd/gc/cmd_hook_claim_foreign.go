@@ -41,21 +41,31 @@ const declinedForeignSampleLimit = 5
 // whose GC_HOME lies outside $HOME (westeros: GC_HOME=/data/gc-home) the user
 // home does not cover it, and without this root every locally poured molecule
 // was declined as foreign, bricking the pool (2026-09-23 17:02Z). The
-// read-only resolver is used so computing the roots creates nothing on disk.
-// Empty and duplicate entries are dropped.
+// read-only resolver is used so computing the roots creates nothing on disk,
+// and only a STABLE provenance (explicit GC_HOME or the user-home default) is
+// a root: the process-unique temp fallback (`<tmp>/gc-home-<pid>`) never is,
+// because nothing was instantiated under it and another host's source could
+// match the string by coincidence. Roots are cleaned (`/data/gc-home/.` is
+// `/data/gc-home`), and empty and duplicate entries are dropped.
 func hookClaimHostRoots() []string {
 	var roots []string
 	seen := map[string]bool{}
 	add := func(p string) {
 		p = strings.TrimSpace(p)
-		if p == "" || seen[p] {
+		if p == "" {
+			return
+		}
+		p = filepath.Clean(p)
+		if seen[p] {
 			return
 		}
 		seen[p] = true
 		roots = append(roots, p)
 	}
 	add(os.Getenv("GC_CITY_PATH"))
-	add(gchome.ResolveReadOnly().Path())
+	if h := gchome.ResolveReadOnly(); h.Provenance().Stable() {
+		add(h.Path())
+	}
 	if h, err := os.UserHomeDir(); err == nil {
 		add(h)
 	}
