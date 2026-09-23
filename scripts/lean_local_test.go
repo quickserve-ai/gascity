@@ -260,10 +260,12 @@ func TestLeanLocalJudgesDeletedEmbedPathBySiblingsOfItsOwnPattern(t *testing.T) 
 	}
 }
 
-// The sibling check must decide exactly what cmd/go embeds, because an
-// over-match forges the evidence that a pattern still resolves. Each fixture
-// package declares one pattern over the same tree, so go list reports that
-// pattern's own files, and the selector's matcher must agree on every file.
+// The sibling check must decide what cmd/go embeds, because an over-match
+// forges the evidence that a pattern still resolves. Each fixture package
+// declares one pattern over the same tree, so go list reports that pattern's
+// own files, and the selector's matcher must agree on every file. The tree
+// holds a symlink and go list runs with GODEBUG=embedfollowsymlinks=1, so a
+// pattern naming the link embeds it while a directory walk still skips it.
 func TestLeanLocalEmbedSiblingMatcherAgreesWithGoEmbed(t *testing.T) {
 	patterns := []string{
 		"data", "all:data", "data/*", "data/**", "data/*.txt", "all:data/*.txt",
@@ -276,18 +278,26 @@ func TestLeanLocalEmbedSiblingMatcherAgreesWithGoEmbed(t *testing.T) {
 		"x.txt/inner.js", "x.txt/_inner.js",
 	}
 	files := map[string]string{}
+	var links []string
 	for index, pattern := range patterns {
 		dir := fmt.Sprintf("p%02d", index)
 		files[dir+"/p.go"] = fmt.Sprintf("package %s\n\nimport \"embed\"\n\n//go:embed %s\nvar Files embed.FS\n", dir, pattern)
+		files[dir+"/target.txt"] = "target\n"
 		for _, name := range tree {
 			files[dir+"/data/"+name] = name + "\n"
 		}
+		links = append(links, dir+"/data/link.txt")
 	}
 	fixture := newPRStaticScopeFixture(t, files)
+	for _, link := range links {
+		if err := os.Symlink("../target.txt", filepath.Join(fixture.repoRoot, link)); err != nil {
+			t.Fatalf("create embed oracle symlink: %v", err)
+		}
+	}
 
 	list := testCommand(fixture.realGo, "list", "-json", "./...")
 	list.Dir = fixture.repoRoot
-	list.Env = fixture.commandEnv()
+	list.Env = append(fixture.commandEnv(), "GODEBUG=embedfollowsymlinks=1")
 	var stderr bytes.Buffer
 	list.Stderr = &stderr
 	raw, err := list.Output()
@@ -323,12 +333,16 @@ func TestLeanLocalEmbedSiblingMatcherAgreesWithGoEmbed(t *testing.T) {
 		t.Fatalf("go list reported %d oracle packages, want %d", len(packages), len(patterns))
 	}
 
-	candidates := []string{"go.mod"}
+	candidates := append([]string{"go.mod"}, links...)
 	for name := range files {
 		candidates = append(candidates, name)
 	}
 	slices.Sort(candidates)
-	request, err := json.Marshal(map[string]any{"packages": packages, "files": candidates})
+	request, err := json.Marshal(map[string]any{
+		"root":     fixture.repoRoot,
+		"packages": packages,
+		"files":    candidates,
+	})
 	if err != nil {
 		t.Fatalf("encode matcher request: %v", err)
 	}
@@ -345,7 +359,11 @@ json.dump(
         package["dir"]: sorted(
             path
             for path in request["files"]
-            if embeds(embed_pattern("owner", package["dir"], package["pattern"]), path)
+            if embeds(
+                embed_pattern("owner", package["dir"], package["pattern"]),
+                path,
+                request["root"],
+            )
         )
         for package in request["packages"]
     },
