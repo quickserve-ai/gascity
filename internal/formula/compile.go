@@ -35,7 +35,7 @@ import (
 //  10. ApplyRalph — expand inline Ralph run/check steps
 //  11. toRecipe — flatten step tree to Recipe
 func Compile(_ context.Context, name string, searchPaths []string, vars map[string]string) (*Recipe, error) {
-	return compileFormula(name, searchPaths, vars, true)
+	return compileFormula(name, searchPaths, vars, true, IsFormulaV2Enabled())
 }
 
 // CompileWithoutRuntimeVarValidation compiles a formula while deferring
@@ -45,14 +45,21 @@ func Compile(_ context.Context, name string, searchPaths []string, vars map[stri
 // preserve idempotency or report residual title placeholders alongside missing
 // vars.
 func CompileWithoutRuntimeVarValidation(_ context.Context, name string, searchPaths []string, vars map[string]string) (*Recipe, error) {
-	return compileFormula(name, searchPaths, vars, false)
+	return compileFormula(name, searchPaths, vars, false, IsFormulaV2Enabled())
+}
+
+// CompileWithoutRuntimeVarValidationForHost is CompileWithoutRuntimeVarValidation
+// judged against an explicit formula_v2 setting instead of the process-wide
+// flag, for callers (gc doctor) that must evaluate a city's configuration
+// regardless of what the process last applied.
+func CompileWithoutRuntimeVarValidationForHost(_ context.Context, name string, searchPaths []string, vars map[string]string, v2Enabled bool) (*Recipe, error) {
+	return compileFormula(name, searchPaths, vars, false, v2Enabled)
 }
 
 const explicitGraphRequirementError = `requires: formulas that use graph-only constructs must declare [requires] formula_compiler = ">=2.0.0" or the deprecated contract = "graph.v2" explicitly`
 
-func compileFormula(name string, searchPaths []string, vars map[string]string, validateRuntimeVars bool) (*Recipe, error) {
+func compileFormula(name string, searchPaths []string, vars map[string]string, validateRuntimeVars, v2Enabled bool) (*Recipe, error) {
 	parser := NewParser(searchPaths...).SetSource(SourceFromEnv())
-	v2Enabled := IsFormulaV2Enabled()
 	var composedRequirements []formulaCompilerConstraint
 	collectComposedRequirements := func(f *Formula) error {
 		constraints, err := formulaCompilerConstraints(f)
