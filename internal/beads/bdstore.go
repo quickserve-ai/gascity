@@ -909,10 +909,11 @@ type bdIssue struct {
 	NoHistory       bool         `json:"no_history,omitempty"`
 	DeferUntil      *time.Time   `json:"defer_until,omitempty"`
 	IsBlocked       optionalBool `json:"is_blocked,omitempty"`
-	// AwaitType must decode here or every proxied read (Get/List/Ready)
-	// silently blanks it — including the `gc bd show --json` read the
-	// notify-on-human-gate-creation backstop keys on, which would then skip
-	// every gate on this route ("" != "human").
+	// AwaitType must decode here or every BdStore read (Get/List/Ready)
+	// silently blanks it for gc's own Go consumers — session-wait resume,
+	// cache backing reads, hook work-query rows. (The notify backstop is NOT
+	// affected: `gc bd show --json` is a passthrough verb, so the script
+	// reads bd's own JSON, which carries the field.)
 	AwaitType string `json:"await_type,omitempty"`
 	// Revision carries bd's optimistic-concurrency token for ConditionalWriter.
 	// Older bd versions omit it, so it decodes to 0; toBead stamps it onto the

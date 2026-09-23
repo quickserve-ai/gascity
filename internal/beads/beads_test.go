@@ -509,10 +509,10 @@ func TestBdIssueRejectsInvalidRevision(t *testing.T) {
 	}
 }
 
-// ga-knhu61: the bd decode envelope must carry await_type, or every proxied
-// read (Get/List/Ready) blanks it — including the `gc bd show --json` read
-// the notify-on-human-gate-creation backstop keys on, which would then skip
-// every gate on the proxied route ("" != "human").
+// ga-knhu61: the bd decode envelope must carry await_type, or every BdStore
+// read (Get/List/Ready) blanks it for gc's own Go consumers — session-wait
+// resume, cache backing reads, hook work-query rows. (The notify backstop is
+// unaffected: `gc bd show --json` passes through to bd's own JSON.)
 func TestBdIssueDecodesAwaitType(t *testing.T) {
 	for _, tc := range []struct {
 		name, raw, want string
