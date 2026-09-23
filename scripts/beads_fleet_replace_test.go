@@ -18,7 +18,7 @@ const (
 	// beadsFleetPath is the fork the fleet cuts its beads builds from.
 	beadsFleetPath = "github.com/quickserve-ai/beads"
 	// beadsFleetTag is the fleet build gc is pinned to (gc-1c2b).
-	beadsFleetTag = "v1.3.0-rc.2-fleet.20260922.1"
+	beadsFleetTag = "v1.3.0-fleet.20260923.2"
 	// beadsFleetTagMarker separates the upstream release a fleet tag was cut
 	// from (vX.Y.Z[-rc.N]) from its fleet date and serial.
 	beadsFleetTagMarker = "-fleet."
