@@ -629,7 +629,7 @@ func TestOrderFiringCurrent_OverdueIsNotBuriedAmongCurrent(t *testing.T) {
 	if strings.Join(result.Details, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("details = %q, want exactly %q", result.Details, want)
 	}
-	// Control: the old behaviour printed all three order lines — the two
+	// Control: the old behavior printed all three order lines — the two
 	// dropped ones exist, they are just not printed.
 	if got := len(routine) + 1; got != 3 {
 		t.Fatalf("old output would have had %d order lines, want 3 (routine = %v)", got, routine)
