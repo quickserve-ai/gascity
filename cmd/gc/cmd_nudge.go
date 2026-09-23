@@ -1655,7 +1655,7 @@ func enqueueManagedNudgeThenWake(target nudgeTarget, store beads.Store, item que
 	}
 	outcome, err := requestManagedNudgeWake(target, cliSessionFrontDoor(store, target.cfg, target.cityPath))
 	if err != nil {
-		if rollbackErr := rollbackQueuedNudge(target.cityPath, nudges, item, "managed wake failed: "+err.Error()); rollbackErr != nil {
+		if rollbackErr := rollbackQueuedNudge(target.cityPath, nudges, item, nudgeManagedWakeRollbackCause+err.Error()); rollbackErr != nil {
 			return 0, errors.Join(err, fmt.Errorf("rolling back queued nudge %q after managed wake failure: %w", item.ID, rollbackErr))
 		}
 		return 0, err
