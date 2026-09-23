@@ -46,6 +46,34 @@ func AssigneeIdentities(i Info) []string {
 	return identities
 }
 
+// CurrentAssigneeIdentities is AssigneeIdentities WITHOUT alias_history: only
+// the identifiers this session answers to right now.
+//
+// The two sets exist because readers and writers need opposite conservatism.
+// A READER deciding whether to strip work (orphan release) must enumerate
+// every form the session ever answered to — missing a prior alias resets live
+// work. A WRITER vouching for work (the lease heartbeat, ga-56nq1a) must
+// enumerate only forms the session still owns: a prior alias can be reused by
+// a LATER live session, and a heartbeat matched through alias_history would
+// keep the successor's claims looking alive after the successor dies —
+// exactly the wedge a lease exists to expose.
+func CurrentAssigneeIdentities(i Info) []string {
+	identities := make([]string, 0, 4)
+	if id := strings.TrimSpace(i.ID); id != "" {
+		identities = append(identities, id)
+	}
+	if sn := strings.TrimSpace(i.SessionNameMetadata); sn != "" {
+		identities = append(identities, sn)
+	}
+	if ni := strings.TrimSpace(i.ConfiguredNamedIdentity); ni != "" {
+		identities = append(identities, ni)
+	}
+	if al := strings.TrimSpace(i.Alias); al != "" {
+		identities = append(identities, al)
+	}
+	return identities
+}
+
 // AssigneeIdentifier returns the durable agent-facing ownership identity of a
 // session: its current public alias, configured named identity, or runtime
 // session name, falling back to the bead ID when no name metadata is present.

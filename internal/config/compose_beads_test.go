@@ -254,3 +254,59 @@ func TestGuardedReleaseParseAndValidate(t *testing.T) {
 		t.Fatalf("expected an error for an out-of-enum guarded_release value")
 	}
 }
+
+// TestLoadWithIncludesPreservesLeaseHeartbeatAcrossBeadsFragment mirrors the
+// conditional_writes regression for the lease refresher's arming flag
+// (ga-56nq1a): a fragment defining only an unrelated [beads] key must not
+// silently disarm an explicitly armed lease_heartbeat — arming is a per-city
+// act that reap ordering depends on, so a silent true→false here would leave
+// a city that believes it is refreshing leases armed for nothing.
+func TestLoadWithIncludesPreservesLeaseHeartbeatAcrossBeadsFragment(t *testing.T) {
+	fs := fsys.NewFake()
+	fs.Files["/city/city.toml"] = []byte(`
+include = ["fragment.toml"]
+
+[workspace]
+name = "test"
+
+[beads]
+lease_heartbeat = true
+`)
+	fs.Files["/city/fragment.toml"] = []byte(`
+[beads]
+bd_compatibility = "bd-1.0.5"
+`)
+	cfg, _, err := LoadWithIncludes(fs, "/city/city.toml")
+	if err != nil {
+		t.Fatalf("LoadWithIncludes: %v", err)
+	}
+	if !cfg.Beads.LeaseHeartbeat {
+		t.Fatal("LeaseHeartbeat = false, want root's explicit arming to survive a [beads] fragment")
+	}
+}
+
+// TestLoadWithIncludesFragmentOverridesLeaseHeartbeat: LWW companion — a
+// fragment that DOES set lease_heartbeat wins.
+func TestLoadWithIncludesFragmentOverridesLeaseHeartbeat(t *testing.T) {
+	fs := fsys.NewFake()
+	fs.Files["/city/city.toml"] = []byte(`
+include = ["fragment.toml"]
+
+[workspace]
+name = "test"
+
+[beads]
+lease_heartbeat = false
+`)
+	fs.Files["/city/fragment.toml"] = []byte(`
+[beads]
+lease_heartbeat = true
+`)
+	cfg, _, err := LoadWithIncludes(fs, "/city/city.toml")
+	if err != nil {
+		t.Fatalf("LoadWithIncludes: %v", err)
+	}
+	if !cfg.Beads.LeaseHeartbeat {
+		t.Fatal("LeaseHeartbeat = false, want the fragment's true to win")
+	}
+}

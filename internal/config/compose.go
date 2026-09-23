@@ -1142,12 +1142,19 @@ func mergeFragment(base, fragment *City, fragMeta toml.MetaData, fragPath string
 		// field still wins.
 		conditionalWrites := base.Beads.ConditionalWrites
 		guardedRelease := base.Beads.GuardedRelease
+		leaseHeartbeat := base.Beads.LeaseHeartbeat
 		base.Beads = fragment.Beads
 		if !fragMeta.IsDefined("beads", "conditional_writes") {
 			base.Beads.ConditionalWrites = conditionalWrites
 		}
 		if !fragMeta.IsDefined("beads", "guarded_release") {
 			base.Beads.GuardedRelease = guardedRelease
+		}
+		if !fragMeta.IsDefined("beads", "lease_heartbeat") {
+			// Same preservation as above: the lease refresher's arming is an
+			// explicit per-city act (ga-56nq1a), and a fragment touching any
+			// other [beads] key must not silently disarm it.
+			base.Beads.LeaseHeartbeat = leaseHeartbeat
 		}
 	}
 	if fragMeta.IsDefined("dolt") {

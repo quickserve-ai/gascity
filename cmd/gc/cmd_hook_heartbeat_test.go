@@ -19,14 +19,19 @@ type fakeHeartbeatStore struct {
 	beats   [][2]string      // {id, actor} in invocation order
 }
 
-func (f *fakeHeartbeatStore) ListByAssignee(assignee, status string, _ int) ([]beads.Bead, error) {
+func (f *fakeHeartbeatStore) List(q beads.ListQuery) ([]beads.Bead, error) {
 	if f.listErr != nil {
 		return nil, f.listErr
 	}
-	if status != "in_progress" {
+	// Pin the codex P1 fix: the durable-issue default tier filters out
+	// ephemeral rows, so the tick must ask for both tiers.
+	if q.TierMode != beads.TierBoth {
+		return nil, errors.New("tick listed without TierBoth; ephemeral in_progress rows would never be heartbeated")
+	}
+	if q.Status != "in_progress" {
 		return nil, nil
 	}
-	return f.rows[assignee], nil
+	return f.rows[q.Assignee], nil
 }
 
 func (f *fakeHeartbeatStore) Heartbeat(id, actor string) error {
