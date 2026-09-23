@@ -35,6 +35,7 @@ SPIKE_THRESHOLD="${GC_JSONL_SPIKE_THRESHOLD:-20}"  # percentage (0-100)
 MIN_PREV_FOR_SPIKE_CHECK="${GC_JSONL_MIN_PREV_FOR_SPIKE:-100}"
 MAX_PUSH_FAILURES="${GC_JSONL_MAX_PUSH_FAILURES:-3}"
 MAX_REPACK_FAILURES="${GC_JSONL_MAX_REPACK_FAILURES:-3}"
+REPACK_LOOSE_CEILING="${GC_JSONL_REPACK_LOOSE_CEILING:-512}"
 PUSH_RETRY_DELAY_MIN="${GC_JSONL_PUSH_RETRY_DELAY_MIN:-1}"
 PUSH_RETRY_DELAY_SPAN="${GC_JSONL_PUSH_RETRY_DELAY_SPAN:-4}"
 SCRUB="${GC_JSONL_SCRUB:-true}"
@@ -712,12 +713,29 @@ commit_archive_snapshot() {
     # committed, and a failed repack costs disk, not data. Never silent either:
     # a repack that keeps failing is exactly the unbounded growth this call
     # exists to stop, so failures are counted in state and escalated.
+    # Exit status alone is not proof: gc --auto returns 0 without packing when
+    # a previous auto-gc left .git/gc.log (it then skips for gc.logExpiry), or
+    # when the pack directory is unusable. So the post-condition is checked
+    # too: after gc, loose objects must be at or below REPACK_LOOSE_CEILING
+    # (default twice the gc.auto trigger, so a correctly skipped gc below the
+    # trigger never counts as a failure).
     local repack_err
-    if repack_err=$(git -c gc.auto=256 -c gc.autoDetach=false gc --auto --quiet 2>&1 >/dev/null); then
+    local repack_rc=0
+    local loose
+    local gc_log
+    repack_err=$(git -c gc.auto=256 -c gc.autoDetach=false gc --auto --quiet 2>&1 >/dev/null) || repack_rc=$?
+    loose=$(git count-objects -v 2>/dev/null | awk '/^count:/ {print $2}')
+    if [ "$repack_rc" -eq 0 ] && [ -n "$loose" ] && [ "$loose" -le "$REPACK_LOOSE_CEILING" ]; then
         record_archive_repack_success
-    else
-        record_archive_repack_failure "$repack_err"
+        return 0
     fi
+    gc_log="$(git rev-parse --git-dir 2>/dev/null)/gc.log"
+    if [ -f "$gc_log" ]; then
+        repack_err="$repack_err
+.git/gc.log: $(head -c 400 "$gc_log")"
+    fi
+    record_archive_repack_failure "exit=$repack_rc loose_objects=${loose:-unknown} (ceiling $REPACK_LOOSE_CEILING)
+$repack_err"
     return 0
 }
 

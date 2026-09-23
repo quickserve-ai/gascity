@@ -8936,6 +8936,56 @@ func TestJsonlExportRepackFailureIsCountedEscalatedAndCleared(t *testing.T) {
 	}
 }
 
+// gc --auto exits 0 without packing when a stale .git/gc.log makes it skip,
+// or when the pack directory is unusable. Exit status is not proof of a
+// repack: a gc that returns 0 but leaves the loose objects above the ceiling
+// is a failure.
+func TestJsonlExportRepackThatLeavesLooseObjectsIsAFailure(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+	mailLog := filepath.Join(t.TempDir(), "gc-mail.log")
+	archiveRepo := filepath.Join(cityDir, "archive")
+	stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("LookPath(git): %v", err)
+	}
+	// `git gc` succeeds and does nothing; every other subcommand is real.
+	writeExecutable(t, filepath.Join(binDir, "git"), fmt.Sprintf(`#!/bin/sh
+for arg in "$@"; do
+    if [ "$arg" = "gc" ]; then
+        exit 0
+    fi
+done
+exec '%s' "$@"
+`, realGit))
+	writeJsonlExportGCStub(t, binDir)
+	writeMultiRecordDoltStub(t, binDir, 3)
+
+	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
+	env["GC_JSONL_REPACK_LOOSE_CEILING"] = "0"
+
+	runScript(t, coreScriptPath("jsonl-export.sh"), env)
+
+	data, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("ReadFile(state file): %v", err)
+	}
+	var state map[string]any
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("Unmarshal(state file): %v\n%s", err, data)
+	}
+	if got := state["consecutive_repack_failures"]; got != float64(1) {
+		t.Fatalf("consecutive_repack_failures = %v, want 1: a gc that left loose objects must count\nstate: %s", got, data)
+	}
+	if got, _ := state["last_repack_stderr"].(string); !strings.Contains(got, "loose_objects=") {
+		t.Fatalf("last_repack_stderr = %q, want the loose-object reading that failed the post-condition", got)
+	}
+}
+
 func TestJsonlExportSkipsSpikeCheckBelowMinPrev(t *testing.T) {
 	// Bug 2 (#1547): percent-delta with no absolute floor escalates on tiny
 	// counts. prev=2, current=1 → 50% delta would cross the 20% threshold.
