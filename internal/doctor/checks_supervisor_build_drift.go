@@ -1,6 +1,9 @@
 package doctor
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // unknownBuildID is the placeholder cmd/gc stamps when neither the ldflags
 // nor the embedded VCS info yielded a commit. It is a STRING, not an empty
@@ -41,12 +44,21 @@ type SupervisorBuildDriftCheck struct {
 	// run: this check is not warmup-eligible, and gathering at construction
 	// would spend a round-trip on every `gc start` warm-up scan that then
 	// filters it out.
-	fetchServing func() (string, error)
+	fetchServing func() (ServingBuild, error)
 	// drifted is the comparison itself, injected so there is exactly ONE
 	// definition of what drift means. cmd/gc passes DetectBinaryDrift; this
 	// check never reimplements it, it only decides whether a comparison was
 	// possible at all.
 	drifted func(local, serving string) bool
+}
+
+// ServingBuild is what the running supervisor's /health reports about itself.
+// UptimeSec belongs next to the build: a stale build with days of uptime says
+// no restart has happened since, which is the operator's next question
+// (ga-y903). Zero means not reported.
+type ServingBuild struct {
+	BuildID   string
+	UptimeSec int
 }
 
 // NewSupervisorBuildDriftCheck returns a check comparing the serving build
@@ -56,7 +68,7 @@ type SupervisorBuildDriftCheck struct {
 func NewSupervisorBuildDriftCheck(
 	supervisorRunning bool,
 	localBuildID string,
-	fetchServing func() (string, error),
+	fetchServing func() (ServingBuild, error),
 	drifted func(local, serving string) bool,
 ) *SupervisorBuildDriftCheck {
 	return &SupervisorBuildDriftCheck{
@@ -113,7 +125,8 @@ func (c *SupervisorBuildDriftCheck) Run(_ *CheckContext) *CheckResult {
 		return r
 	}
 
-	serving, err := c.fetchServing()
+	sb, err := c.fetchServing()
+	serving := sb.BuildID
 	if err != nil {
 		r.Status = StatusSkipped
 		r.Message = fmt.Sprintf("cannot read supervisor /health, so the serving build is unknown: %v", err)
@@ -128,11 +141,27 @@ func (c *SupervisorBuildDriftCheck) Run(_ *CheckContext) *CheckResult {
 	if c.drifted(c.localBuildID, serving) {
 		r.Status = StatusWarning
 		r.Message = fmt.Sprintf(
-			"supervisor is serving build %s but the gc binary on disk is %s — installing gc does not restart the supervisor; run 'gc start' to pick it up",
-			serving, c.localBuildID)
+			"supervisor is serving build %s%s but the gc binary on disk is %s — installing gc does not restart the supervisor; run 'gc start' to pick it up",
+			serving, uptimeSuffix(sb.UptimeSec), c.localBuildID)
 		return r
 	}
 	r.Status = StatusOK
-	r.Message = fmt.Sprintf("supervisor is serving the installed build %s", serving)
+	r.Message = fmt.Sprintf("supervisor is serving the installed build %s%s", serving, uptimeSuffix(sb.UptimeSec))
 	return r
+}
+
+// uptimeSuffix renders a reported uptime, or nothing when none was reported.
+func uptimeSuffix(sec int) string {
+	if sec <= 0 {
+		return ""
+	}
+	d := time.Duration(sec) * time.Second
+	switch {
+	case d >= 48*time.Hour:
+		return fmt.Sprintf(" (up %dd, no restart since)", int(d/(24*time.Hour)))
+	case d >= time.Hour:
+		return fmt.Sprintf(" (up %dh, no restart since)", int(d/time.Hour))
+	default:
+		return fmt.Sprintf(" (up %dm)", int(d/time.Minute))
+	}
 }
