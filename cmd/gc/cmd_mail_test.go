@@ -5553,8 +5553,10 @@ func TestResolveMailRecipientIdentity_SquatWithOnlyTheSeatsOwnArchivedBeadStillR
 		t.Fatal("findNamedSessionSpec(qcore/barry) = false")
 	}
 	for _, md := range []map[string]string{
-		{session.NamedSessionMetadataKey: "true", session.NamedSessionIdentityMetadata: spec.Identity, "alias": spec.Identity,
-			"session_name": "old-runtime", "state": "archived", "continuity_eligible": "false"},
+		{
+			session.NamedSessionMetadataKey: "true", session.NamedSessionIdentityMetadata: spec.Identity, "alias": spec.Identity,
+			"session_name": "old-runtime", "state": "archived", "continuity_eligible": "false",
+		},
 		{"session_name": spec.SessionName, "template": "other", "agent_name": "other", "state": "asleep"},
 	} {
 		if _, err := store.Create(beads.Bead{Type: session.BeadType, Labels: []string{session.LabelSession}, Metadata: md}); err != nil {

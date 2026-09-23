@@ -133,7 +133,7 @@ func (s *Server) mailNamedSessionSquatRefusal(store beads.Store, identifier stri
 	}
 	answering, answered, scanErr := session.NonSeatSessionAnsweringToMailbox(store, spec, lookup.Conflict)
 	if scanErr != nil {
-		return fmt.Errorf("%w (and checking which sessions read mailbox %q failed: %v)", err, spec.Identity, scanErr)
+		return fmt.Errorf("%w (and checking which sessions read mailbox %q failed: %w)", err, spec.Identity, scanErr)
 	}
 	if answered {
 		return fmt.Errorf("%w; not storing: session bead %s also answers to mailbox %q and would read it", err, answering.ID, spec.Identity)
