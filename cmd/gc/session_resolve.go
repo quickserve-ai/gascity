@@ -74,7 +74,11 @@ func resolveConfiguredNamedSessionID(
 		}
 	}
 	if lookup.HasConflict {
-		return "", true, fmt.Errorf("%w: %q conflicts with configured named session %q via live bead %s", errNamedSessionConflict, identifier, spec.Identity, lookup.Conflict.ID)
+		// A live bead holds this name without being its configured session: a
+		// name squat. Every by-name verb refuses here, kill included, and kill
+		// could not clear it anyway (it stops a runtime; an asleep bead is still
+		// live). Name the verb that does, addressed by bead ID (ga-lm5coj).
+		return "", true, fmt.Errorf("%w: %q conflicts with configured named session %q via live bead %s; if that bead is stale, close it with 'gc session close %s' and the reconciler rebuilds %s", errNamedSessionConflict, identifier, spec.Identity, lookup.Conflict.ID, lookup.Conflict.ID, spec.Identity)
 	}
 	if !opts.materialize {
 		return "", false, fmt.Errorf("%w: %q", session.ErrSessionNotFound, identifier)
@@ -177,7 +181,35 @@ func resolveSessionIDWithOptions(
 			return "", err
 		}
 	}
+	if identity := namedSessionIdentityForConfigName(cfg, identifier); identity != "" {
+		// Sessions are addressed by named-session identity, never by agent
+		// config name (#666 keeps template names unresolved on this surface).
+		// Say which name is wanted instead of a bare not-found (ga-lm5coj).
+		return "", fmt.Errorf("%w: %q is an agent config name; its configured named session is %q", session.ErrSessionNotFound, identifier, identity)
+	}
 	return "", fmt.Errorf("%w: %q", session.ErrSessionNotFound, identifier)
+}
+
+// namedSessionIdentityForConfigName returns the identity of the one configured
+// named session backed by the agent config name target (e.g.
+// "qcore/cherub-law.archer" -> "qcore/archer"), or "" when none or several are.
+func namedSessionIdentityForConfigName(cfg *config.City, target string) string {
+	if cfg == nil {
+		return ""
+	}
+	target = normalizeNamedSessionTarget(target)
+	identity := ""
+	for i := range cfg.NamedSessions {
+		ns := &cfg.NamedSessions[i]
+		if ns.TemplateQualifiedName() != target || ns.QualifiedName() == target {
+			continue
+		}
+		if identity != "" && identity != ns.QualifiedName() {
+			return ""
+		}
+		identity = ns.QualifiedName()
+	}
+	return identity
 }
 
 func resolveOpenQualifiedAliasBasename(store beads.Store, identifier string) (string, error) {

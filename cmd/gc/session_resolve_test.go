@@ -996,6 +996,44 @@ func TestResolveSessionIDMaterializingNamed_RuntimeSessionNameWrongTemplateConfl
 			other.ID,
 		)
 	}
+	// ga-lm5coj: the conflict is a name squat, and every by-name verb refuses on
+	// it — kill included. The error must name the verb that clears it, and that
+	// verb must be able to address the squatter by its bead ID.
+	if !errors.Is(err, errNamedSessionConflict) {
+		t.Fatalf("err = %v, want errNamedSessionConflict in the chain", err)
+	}
+	if want := "gc session close " + other.ID; !strings.Contains(err.Error(), want) {
+		t.Fatalf("err = %q, want the remedy %q", err, want)
+	}
+	if got, err := resolveSessionIDWithConfig(cityPath, cfg, store, other.ID); err != nil || got != other.ID {
+		t.Fatalf("resolve squatter by bead ID = %q, %v; want %q (the remedy must be addressable)", got, err, other.ID)
+	}
+}
+
+func TestResolveSessionIDWithConfig_ConfigNameNotFoundNamesTheSessionIdentity(t *testing.T) {
+	// ga-lm5coj: a session is addressed by its named-session identity, never by
+	// its agent config name — the session surface deliberately does not resolve
+	// template names (#666). The refusal must say which name is wanted.
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents:    []config.Agent{{Name: "cherub-law.archer", Dir: "qcore", StartCommand: "true"}},
+		NamedSessions: []config.NamedSession{
+			{Name: "archer", Template: "cherub-law.archer", Dir: "qcore"},
+		},
+	}
+	_, err := resolveSessionIDWithConfig(t.TempDir(), cfg, store, "qcore/cherub-law.archer")
+	if !errors.Is(err, session.ErrSessionNotFound) {
+		t.Fatalf("err = %v, want ErrSessionNotFound (config names stay unresolved)", err)
+	}
+	if !strings.Contains(err.Error(), `"qcore/archer"`) {
+		t.Fatalf("err = %q, want it to name the session identity qcore/archer", err)
+	}
+
+	_, err = resolveSessionIDWithConfig(t.TempDir(), cfg, store, "qcore/nobody")
+	if !errors.Is(err, session.ErrSessionNotFound) || strings.Contains(err.Error(), "named session is") {
+		t.Fatalf("err = %v, want a plain not-found for a name that is no config name", err)
+	}
 }
 
 func TestResolveSessionIDMaterializingNamed_RecreatesClosedConfiguredNamedSession(t *testing.T) {
