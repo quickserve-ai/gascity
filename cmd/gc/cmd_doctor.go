@@ -1012,16 +1012,16 @@ const servingSupervisorBuildIDTimeout = 2 * time.Second
 // differently: "it answered and reported no identity" is a different fact from
 // "it could not be asked", and collapsing them is how a health check starts
 // reassuring the operator about something it never measured.
-func servingSupervisorBuildID() (string, error) {
+func servingSupervisorBuildID() (doctor.ServingBuild, error) {
 	baseURL, err := supervisorAPIBaseURLHook()
 	if err != nil {
-		return "", err
+		return doctor.ServingBuild{}, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), servingSupervisorBuildIDTimeout)
 	defer cancel()
 	status, err := newHTTPSupervisorClient(baseURL).Status(ctx)
 	if err != nil {
-		return "", err
+		return doctor.ServingBuild{}, err
 	}
-	return status.BuildID, nil
+	return doctor.ServingBuild{BuildID: status.BuildID, UptimeSec: status.UptimeSec}, nil
 }
