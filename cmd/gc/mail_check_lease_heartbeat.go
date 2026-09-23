@@ -97,6 +97,6 @@ func appendLeaseHeartbeatLog(logPath, message string) {
 	if err != nil {
 		return
 	}
-	defer f.Close() //nolint:errcheck
+	defer f.Close()                                                           //nolint:errcheck
 	fmt.Fprintf(f, "%s %s\n", time.Now().UTC().Format(time.RFC3339), message) //nolint:errcheck
 }
