@@ -23,12 +23,13 @@ var witnessEpoch = time.Date(2026, 3, 4, 5, 6, 7, 8, time.UTC)
 // witnessSeed is one logical bead, pinned end to end so two independently
 // built stores are genuinely the same graph rather than merely similar.
 type witnessSeed struct {
-	id       string
-	title    string
-	beadType string
-	labels   []string
-	metadata map[string]string
-	parent   string
+	id        string
+	title     string
+	beadType  string
+	labels    []string
+	metadata  map[string]string
+	parent    string
+	awaitType string
 }
 
 func seedWitnessGraph(t *testing.T, front storebinding.GraphStore, seeds []witnessSeed, edges [][3]string) {
@@ -41,6 +42,7 @@ func seedWitnessGraph(t *testing.T, front storebinding.GraphStore, seeds []witne
 			Labels:    seed.labels,
 			Metadata:  seed.metadata,
 			ParentID:  seed.parent,
+			AwaitType: seed.awaitType,
 			CreatedAt: witnessEpoch,
 			UpdatedAt: witnessEpoch,
 		}
@@ -569,5 +571,26 @@ func TestSemanticWitnessValidationRejectsMalformedValues(t *testing.T) {
 				t.Fatalf("Validate accepted a witness with a broken %s", name)
 			}
 		})
+	}
+}
+
+// ga-knhu61 / witness v2: two graphs identical except for one gate's
+// await_type are different graphs. A migration that flipped a machinery gate
+// to "human" (or dropped the field) must not hash equal to its source.
+func TestGraphWitnessMovesForAwaitType(t *testing.T) {
+	floors := GraphAllocatorFloors{CrossClassMaximum: 900, PersistedFloor: 900}
+	digestFor := func(awaitType string) string {
+		front := openGraphFrontDoor(t)
+		seeds := canonicalWitnessSeeds()
+		seeds[2].beadType = "gate"
+		seeds[2].awaitType = awaitType
+		seedWitnessGraph(t, front, seeds, canonicalWitnessEdges())
+		return witnessOf(t, front, floors).Digest
+	}
+	machinery := digestFor("bead")
+	human := digestFor("human")
+	dropped := digestFor("")
+	if machinery == human || machinery == dropped {
+		t.Fatalf("await_type does not move the witness digest (machinery=%s human=%s dropped=%s)", machinery, human, dropped)
 	}
 }
