@@ -97,7 +97,9 @@ func (s *Server) resolveMailSendRecipientWithContext(ctx context.Context, recipi
 			return "", fmt.Errorf("session %q has no mailbox identity", recipient)
 		}
 		return address, nil
-	} else if !errors.Is(err, session.ErrSessionNotFound) {
+	} else if !errors.Is(err, session.ErrSessionNotFound) && !s.mailSafeThroughNamedSessionSquat(store, recipient, err) {
+		// A name squat the squatter cannot read through falls through to the
+		// configured mailbox below and is stored (ga-isa3j4, same rule as the CLI).
 		return "", err
 	}
 	if address, ok, err := s.configuredMailRecipientAddress(store, recipient); err != nil {
@@ -106,6 +108,33 @@ func (s *Server) resolveMailSendRecipientWithContext(ctx context.Context, recipi
 		return address, nil
 	}
 	return "", s.mailRecipientNotFound(recipient)
+}
+
+// mailSafeThroughNamedSessionSquat reports whether a configured named-session
+// conflict may still resolve to the configured mailbox. A squat on the
+// session's RUNTIME name is a runtime problem; the mailbox identity comes from
+// config, so refusing loses the message (ga-isa3j4). It is safe only when the
+// squatting bead does not itself answer to that mailbox address: one holding
+// the identity as its alias lists it in its own inbox and would read the
+// configured seat's mail. Mirrors cmd/gc mailSafeThroughNamedSessionSquat.
+func (s *Server) mailSafeThroughNamedSessionSquat(store beads.Store, identifier string, err error) bool {
+	if !errors.Is(err, errConfiguredNamedSessionConflict) || store == nil {
+		return false
+	}
+	spec, ok, specErr := s.findNamedSessionSpecForTarget(store, identifier)
+	if specErr != nil || !ok {
+		return false
+	}
+	lookup, lookupErr := session.LookupConfiguredNamedSession(store, spec)
+	if lookupErr != nil || !lookup.HasConflict {
+		return false
+	}
+	for _, addr := range session.MailboxAddressesIncludingRuntimeName(lookup.Conflict) {
+		if apiNormalizeSessionTarget(addr) == apiNormalizeSessionTarget(spec.Identity) {
+			return false
+		}
+	}
+	return true
 }
 
 // mailRecipientNotFound is the send refusal for a recipient nothing resolved.
