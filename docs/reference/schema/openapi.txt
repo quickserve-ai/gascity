@@ -6993,6 +6993,21 @@
         ],
         "type": "object"
       },
+      "RigDoctorPatch": {
+        "additionalProperties": false,
+        "properties": {
+          "CensusOwnerNamespace": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "CensusOwnerNamespace"
+        ],
+        "type": "object"
+      },
       "RigPatch": {
         "additionalProperties": false,
         "properties": {
@@ -7001,6 +7016,9 @@
               "string",
               "null"
             ]
+          },
+          "Doctor": {
+            "$ref": "#/components/schemas/RigDoctorPatch"
           },
           "FormulaVars": {
             "additionalProperties": {
@@ -7043,7 +7061,8 @@
           "DefaultBranch",
           "Suspended",
           "SuspendedOnStart",
-          "FormulaVars"
+          "FormulaVars",
+          "Doctor"
         ],
         "type": "object"
       },
