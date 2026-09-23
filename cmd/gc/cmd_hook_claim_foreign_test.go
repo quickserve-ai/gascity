@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -156,17 +157,29 @@ func TestHookClaimCandidateWithoutFormulaSourceIsUnaffected(t *testing.T) {
 	}
 }
 
-// gcHomeOutsideUserHome returns a GC_HOME candidate that is NOT under the
-// user's home, mirroring westeros (GC_HOME=/data/gc-home). t.TempDir lands
-// under the system temp dir; if that happens to sit under $HOME the case
-// cannot distinguish the fix from the old behavior and is skipped.
-func gcHomeOutsideUserHome(t *testing.T) string {
+// pinHostHomes models westeros (GC_HOME=/data/gc-home, outside $HOME) with
+// three disjoint temp dirs: HOME (os.UserHomeDir reads $HOME on darwin and
+// linux), GC_HOME and GC_CITY_PATH. Pinning HOME means the cases never depend
+// on where the system temp dir lives and never skip.
+func pinHostHomes(t *testing.T) (userHome, gcHome, cityPath string) {
 	t.Helper()
-	dir := t.TempDir()
-	if home, err := os.UserHomeDir(); err == nil && !formulaSourceForeignToHost(dir, []string{home}) {
-		t.Skipf("temp dir %s sits under user home %s; cannot model a GC_HOME outside $HOME here", dir, home)
+	userHome, gcHome, cityPath = t.TempDir(), t.TempDir(), t.TempDir()
+	t.Setenv("HOME", userHome)
+	t.Setenv("GC_HOME", gcHome)
+	t.Setenv("GC_CITY_PATH", cityPath)
+	return userHome, gcHome, cityPath
+}
+
+func assertHostRoots(t *testing.T, got, want []string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("hookClaimHostRoots() = %v, want exactly %v", got, want)
 	}
-	return dir
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("hookClaimHostRoots()[%d] = %q, want %q (full = %v)", i, got[i], want[i], got)
+		}
+	}
 }
 
 // gc-m61x: formula-instantiated roots are stamped with a gc.formula_source
@@ -175,47 +188,69 @@ func gcHomeOutsideUserHome(t *testing.T) string {
 // host roots must include it, or every locally poured molecule is declined as
 // foreign and the pool bricks (2026-09-23 17:02Z).
 func TestHookClaimHostRootsIncludeGCHome(t *testing.T) {
-	gcHome := gcHomeOutsideUserHome(t)
+	userHome, gcHome, cityPath := pinHostHomes(t)
+
+	assertHostRoots(t, hookClaimHostRoots(), []string{cityPath, gcHome, userHome})
+}
+
+func TestHookClaimHostRootsDefaultGCHomeUnderUserHome(t *testing.T) {
+	userHome, _, cityPath := pinHostHomes(t)
+	t.Setenv("GC_HOME", "")
+
+	assertHostRoots(t, hookClaimHostRoots(), []string{cityPath, filepath.Join(userHome, ".gc"), userHome})
+}
+
+// Unstable provenance is never a root. With no GC_HOME and no resolvable user
+// home, gchome.ResolveReadOnly falls back to the process-unique
+// `<tmp>/gc-home-<pid>` candidate: nothing was instantiated under it, and a
+// foreign source could match the string by coincidence.
+func TestHookClaimHostRootsIgnoreLastResortGCHome(t *testing.T) {
 	cityPath := t.TempDir()
-	t.Setenv("GC_HOME", gcHome)
 	t.Setenv("GC_CITY_PATH", cityPath)
-	userHome, err := os.UserHomeDir()
-	if err != nil {
-		t.Fatalf("UserHomeDir: %v", err)
+	t.Setenv("GC_HOME", "")
+	t.Setenv("HOME", "") // os.UserHomeDir fails on darwin/linux with an empty $HOME
+
+	if _, err := os.UserHomeDir(); err == nil {
+		t.Fatalf("precondition: os.UserHomeDir still resolves with HOME empty; the last-resort branch is not reached")
 	}
+	lastResort := filepath.Join(os.TempDir(), fmt.Sprintf("gc-home-%d", os.Getpid()))
 
 	roots := hookClaimHostRoots()
 
-	want := []string{cityPath, gcHome, userHome}
-	if len(roots) != len(want) {
-		t.Fatalf("hookClaimHostRoots() = %v, want exactly %v (city path, gc home, user home)", roots, want)
-	}
-	for i := range want {
-		if roots[i] != want[i] {
-			t.Errorf("hookClaimHostRoots()[%d] = %q, want %q (full = %v)", i, roots[i], want[i], roots)
+	assertHostRoots(t, roots, []string{cityPath})
+	for _, r := range roots {
+		if r == lastResort || strings.Contains(r, "gc-home-") {
+			t.Errorf("hookClaimHostRoots() = %v, must not include the last-resort fallback %q", roots, lastResort)
 		}
 	}
 }
 
-func TestHookClaimHostRootsDropEmptyAndDuplicate(t *testing.T) {
-	userHome, err := os.UserHomeDir()
-	if err != nil {
-		t.Fatalf("UserHomeDir: %v", err)
+func TestHookClaimHostRootsCleanAndDeduplicate(t *testing.T) {
+	userHome, gcHome, cityPath := pinHostHomes(t)
+	cases := []struct {
+		name   string
+		gcHome string
+		city   string
+		want   []string
+	}{
+		{"trailing /. is cleaned", gcHome + "/.", cityPath, []string{cityPath, gcHome, userHome}},
+		{"trailing / is cleaned", gcHome + "/", cityPath, []string{cityPath, gcHome, userHome}},
+		{"city path cleaned too", gcHome, cityPath + "/./", []string{cityPath, gcHome, userHome}},
+		{"gc home equal to user home appears once", userHome + "/.", cityPath, []string{cityPath, userHome}},
+		{"empty city path dropped", gcHome, "", []string{gcHome, userHome}},
+		{"blank city path dropped", gcHome, "  ", []string{gcHome, userHome}},
 	}
-	t.Setenv("GC_CITY_PATH", "")
-	t.Setenv("GC_HOME", userHome)
-
-	roots := hookClaimHostRoots()
-
-	if len(roots) != 1 || roots[0] != userHome {
-		t.Fatalf("hookClaimHostRoots() = %v, want just %q (empty city path dropped, gc home == user home deduplicated)", roots, userHome)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("GC_HOME", tc.gcHome)
+			t.Setenv("GC_CITY_PATH", tc.city)
+			assertHostRoots(t, hookClaimHostRoots(), tc.want)
+		})
 	}
 }
 
 func TestHookClaimLocalMoleculeUnderGCHomeIsClaimed(t *testing.T) {
-	gcHome := gcHomeOutsideUserHome(t)
-	t.Setenv("GC_HOME", gcHome)
-	t.Setenv("GC_CITY_PATH", t.TempDir())
+	_, gcHome, _ := pinHostHomes(t)
 	src := filepath.Join(gcHome, "cache", "repos", "abc", "internal", "bootstrap", "packs", "core", "formulas", "mol-scoped-work.toml")
 
 	spy := &foreignClaimSpy{}
