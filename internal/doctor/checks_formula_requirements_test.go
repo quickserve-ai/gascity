@@ -385,6 +385,19 @@ func TestFormulaRequirementsCheckIntentionallyDisabled(t *testing.T) {
 		}
 	})
 
+	t.Run("a reason on a satisfiable requirement is honored when a composed expansion is unsatisfiable", func(t *testing.T) {
+		dir := t.TempDir()
+		writeDoctorFormula(t, dir, "mol-shadowed", "\nformula = \"mol-shadowed\"\n\n[requires]\nformula_compiler = \">=1.0.0\"\ndisabled_reason = \"disabled through its expansion\"\n\n[[steps]]\nid = \"work\"\ntitle = \"Work\"\n\n[compose]\n[[compose.expand]]\ntarget = \"work\"\nwith = \"never-expansion\"\n")
+		writeDoctorFormula(t, dir, "never-expansion", "\nformula = \"never-expansion\"\ntype = \"expansion\"\n\n[requires]\nformula_compiler = \">=999.0.0\"\ndisabled_reason = \"never compiles\"\n\n[[template]]\nid = \"{target}.child\"\ntitle = \"Child\"\n")
+		r := NewFormulaRequirementsCheck(&config.City{
+			Daemon:        config.DaemonConfig{FormulaV2: boolPtr(true)},
+			FormulaLayers: config.FormulaLayers{City: []string{dir}},
+		}, t.TempDir()).Run(&CheckContext{})
+		if r.Status != StatusOK || !strings.Contains(strings.Join(r.Details, "\n"), "by a composed requirement: disabled through its expansion") {
+			t.Fatalf("a composed unsatisfiable requirement must honor the marker, not warn DISPATCHABLE: %v %q %v", r.Status, r.Message, r.Details)
+		}
+	})
+
 	t.Run("a reason never excuses an INVALID requirement", func(t *testing.T) {
 		content := "\nformula = \"mol-shadowed\"\n\n[requires]\nformula_compiler = \"not-a-version\"\ndisabled_reason = \"x\"\n\n[[steps]]\nid = \"commit\"\ntitle = \"Commit\"\n"
 		if r := run(t, content); r.Status != StatusError {
