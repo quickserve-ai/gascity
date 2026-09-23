@@ -1119,14 +1119,17 @@ func TestWispGC_ReapSkipsRootlessMessageWisp(t *testing.T) {
 	}
 }
 
-// TestWispGC_ReapDryRunBoundsRootlessProbes pins the probe cap on the rootless
-// branch. The delete batch cap is gated on enforcement, so under the shipped
-// DRY-RUN default (GC_WISP_GC_REAP_ORPHANS unset) nothing bounded the leaf-ness
-// probes: every aged rootless candidate cost a Children read per controller
-// tick — a bd subprocess apiece in production — against precisely the backlog
-// this reaper exists to drain. The cap must bound those reads with no delete
-// ever attempted, and the sweep must say the dry-run estimate is now a floor.
-func TestWispGC_ReapDryRunBoundsRootlessProbes(t *testing.T) {
+// TestWispGC_ReapDryRunSkipsRootlessProbes pins the ga-q17a2k contract, which
+// SUPERSEDES the earlier bounded-probes one: a dry-run sweep performs ZERO
+// leaf-ness probes on rootless candidates, not "up to the cap". The cap fix
+// bounded the reads, and the field then showed even the capped prefix
+// re-walking every controller tick forever — 500 probe-pairs at ~370ms
+// apiece, p50 13s -> 223-290s per sweep, ~25% of dispatch wall time on a
+// store where every closed task wisp is rootless and nothing ever leaves the
+// candidate set. Leaf-ness is worth two reads per row only when enforcement
+// can spend the answer on a delete, so the dry run reports the unprobed
+// candidate count and pays nothing.
+func TestWispGC_ReapDryRunSkipsRootlessProbes(t *testing.T) {
 	withReapOrphansEnforced(t, false)
 	withReapOrphanProbeCap(t, 2)
 	now := time.Now()
@@ -1153,14 +1156,14 @@ func TestWispGC_ReapDryRunBoundsRootlessProbes(t *testing.T) {
 	if len(store.deleteAttempts) != 0 {
 		t.Fatalf("delete attempts = %v, want none in dry-run", store.deleteAttempts)
 	}
-	if store.childrenCalls > 2 {
-		t.Fatalf("childrenCalls = %d, want <= 2; the probe cap must bound leaf-ness reads in dry-run too", store.childrenCalls)
+	if store.childrenCalls != 0 || store.depListCalls != 0 {
+		t.Fatalf("probe reads = %d children + %d deps, want zero of each: dry-run must not pay per-candidate backend reads (ga-q17a2k)", store.childrenCalls, store.depListCalls)
 	}
-	if store.childrenCalls == 0 {
-		t.Fatal("childrenCalls = 0; the sweep must still probe up to the cap")
+	if !strings.Contains(output, "not probed for leaf-ness") {
+		t.Fatalf("log = %q, want the unprobed-candidate count so the dry run still reports the backlog it declined to probe", output)
 	}
-	if !strings.Contains(output, "rootless-orphan scan stopped after") {
-		t.Fatalf("log = %q, want the truncation notice so the dry-run estimate is not silently reported as the full backlog", output)
+	if !strings.Contains(output, "6 aged rootless candidate(s)") {
+		t.Fatalf("log = %q, want all 6 aged rootless candidates counted (the count is cheap; only the probes are enforcement-only)", output)
 	}
 }
 
@@ -2066,3 +2069,34 @@ func assertDeletedIDs(t *testing.T, deleted []string, want ...string) {
 }
 
 var _ beads.Store = (*gcTestStore)(nil)
+
+// TestCarryWispGCLastRunSurvivesConfigRebuild pins the ga-q17a2k run
+// amplifier: a config reload rebuilds the tracker, and without carrying
+// lastRun the fresh zero value re-armed an immediate in-tick sweep on EVERY
+// applied reload (~76% of one day's runs, each a full dispatch freeze). The
+// carried position must suppress the immediate run, honor the NEW interval,
+// and keep the prompt first run when the tracker was previously disabled.
+func TestCarryWispGCLastRunSurvivesConfigRebuild(t *testing.T) {
+	now := time.Now()
+	prev := &memoryWispGC{interval: 30 * time.Minute, ttl: time.Hour, lastRun: now.Add(-5 * time.Minute)}
+
+	rebuilt := carryWispGCLastRun(prev, newWispGC(30*time.Minute, time.Hour, 0))
+	if rebuilt.shouldRun(now) {
+		t.Fatal("rebuilt tracker shouldRun = true 5 min after the previous run; the reload re-armed the amplifier")
+	}
+	if !rebuilt.shouldRun(now.Add(26 * time.Minute)) {
+		t.Fatal("rebuilt tracker refused the on-schedule run; the carry must move the position, not freeze the tracker")
+	}
+
+	// A reload that SHORTENS the interval governs against the carried position.
+	shortened := carryWispGCLastRun(prev, newWispGC(2*time.Minute, time.Hour, 0))
+	if !shortened.shouldRun(now) {
+		t.Fatal("shortened-interval rebuild refused to run 5 min past lastRun; the new config's interval must govern")
+	}
+
+	// Previously disabled (nil prev): the prompt first run is preserved.
+	enabled := carryWispGCLastRun(nil, newWispGC(30*time.Minute, time.Hour, 0))
+	if !enabled.shouldRun(now) {
+		t.Fatal("first-enable tracker refused its prompt first run")
+	}
+}
