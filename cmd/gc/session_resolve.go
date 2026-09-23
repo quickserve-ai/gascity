@@ -74,7 +74,7 @@ func resolveConfiguredNamedSessionID(
 		}
 	}
 	if lookup.HasConflict {
-		return "", true, namedSessionConflictError(identifier, spec, lookup.Conflict)
+		return "", true, namedSessionConflictError(cfg, identifier, spec, lookup.Conflict)
 	}
 	if !opts.materialize {
 		return "", false, fmt.Errorf("%w: %q", session.ErrSessionNotFound, identifier)
@@ -94,8 +94,9 @@ func resolveConfiguredNamedSessionID(
 // prints what it takes to tell the kinds apart and recommends close only for
 // a squat: a bead that records a template or agent other than this seat's
 // (ga-lm5coj).
-func namedSessionConflictError(identifier string, spec namedSessionSpec, b beads.Bead) error {
+func namedSessionConflictError(cfg *config.City, identifier string, spec namedSessionSpec, b beads.Bead) error {
 	d := session.DescribeNamedSessionConflict(b, spec)
+	squat := d.Squat && !namedSessionConflictMayBeSelf(cfg, spec, d)
 	head := fmt.Sprintf("%q conflicts with configured named session %q via live bead %s (state=%q template=%q pool_managed=%q)",
 		identifier, spec.Identity, b.ID, d.State, d.Template, d.PoolManaged)
 	var advice string
@@ -103,14 +104,34 @@ func namedSessionConflictError(identifier string, spec namedSessionSpec, b beads
 	case d.Kind == session.NamedSessionConflictAdoptablePool:
 		advice = fmt.Sprintf("it is a pool-managed session of this seat's template that the reconciler adopts as %s; do not close it: retry after the next reconcile, or check 'gc session show %s'",
 			spec.Identity, b.ID)
-	case d.Squat:
+	case squat:
 		advice = fmt.Sprintf("it holds this seat's name for a different template (a name squat); if it is stale, close it with 'gc session close %s' to free the name for %s",
 			b.ID, spec.Identity)
 	default:
-		advice = fmt.Sprintf("it records no template that rules it out as this seat's own running session; check 'gc session show %s' first, and do not close a session the seat is using",
-			b.ID)
+		// Still name the remedy: a genuine squat that records no template
+		// would otherwise leave every by-name verb refusing with no way out.
+		advice = fmt.Sprintf("it may be this seat's own running session (it records no template, or this seat's under another spelling); check 'gc session show %s' first, and only if it is NOT this seat's session, 'gc session close %s' frees the name for %s",
+			b.ID, b.ID, spec.Identity)
 	}
 	return fmt.Errorf("%w: %s; %s", errNamedSessionConflict, head, advice)
+}
+
+// namedSessionConflictMayBeSelf reports config-aware evidence that a bead the
+// session package called a squat is the seat's own session under an older
+// spelling: its template or agent_name is the seat's identity, or resolves
+// (findAgentByTemplate's legacy and binding forms) to the seat's backing
+// template (#127 review round 2).
+func namedSessionConflictMayBeSelf(cfg *config.City, spec namedSessionSpec, d session.NamedSessionConflictDetail) bool {
+	backing := session.NamedSessionBackingTemplate(spec)
+	for _, name := range []string{d.Template, d.AgentName} {
+		if name == "" {
+			continue
+		}
+		if name == spec.Identity || (backing != "" && agentTemplateIdentitiesEquivalent(cfg, name, backing)) {
+			return true
+		}
+	}
+	return false
 }
 
 func resolveSessionIDWithConfig(cityPath string, cfg *config.City, store beads.Store, identifier string) (string, error) {
