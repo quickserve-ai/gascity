@@ -89,10 +89,31 @@ func leaseHeartbeatStampName(sessionID string) string {
 	return sanitized + ".stamp"
 }
 
+// leaseHeartbeatLogMaxBytes bounds the tick's log file. Every eligible tick
+// appends a spawn line and the child's whole output, at the 90 s cadence, for
+// every active session, for the life of the city — unrotated that is an
+// unbounded file on the same disk the store lives on (codex round-5 P2).
+// One rotated generation (<log>.1) keeps the previous window of evidence, so
+// the pair is bounded at ~2x this size per city.
+const leaseHeartbeatLogMaxBytes = 1 << 20
+
+// rotateLeaseHeartbeatLog renames the log to <log>.1 once it exceeds
+// leaseHeartbeatLogMaxBytes, replacing any earlier .1. Best-effort: a stat or
+// rename failure leaves the current file in place and the next append
+// proceeds against it — the log must never block the tick.
+func rotateLeaseHeartbeatLog(logPath string) {
+	info, err := os.Stat(logPath)
+	if err != nil || info.Size() < leaseHeartbeatLogMaxBytes {
+		return
+	}
+	_ = os.Rename(logPath, logPath+".1")
+}
+
 // appendLeaseHeartbeatLog best-effort appends one stamped line to the tick's
 // log file — the countable trace for spawn-side failures, which have no other
 // observer (the turn must stay clean and the child does not exist yet).
 func appendLeaseHeartbeatLog(logPath, message string) {
+	rotateLeaseHeartbeatLog(logPath)
 	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return
