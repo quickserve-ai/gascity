@@ -3006,3 +3006,34 @@ func TestWispGC_ReapResolvesRootsLive(t *testing.T) {
 		t.Fatalf("reaped %d; a step of a root the store has reopened was deleted on the cache's word", reaped)
 	}
 }
+
+// TestCarryWispGCLastRunSurvivesConfigRebuild pins the ga-q17a2k run
+// amplifier: a config reload rebuilds the tracker, and without carrying
+// lastRun the fresh zero value re-armed an immediate in-tick sweep on EVERY
+// applied reload (~76% of one day's runs, each a full dispatch freeze). The
+// carried position must suppress the immediate run, honor the NEW interval,
+// and keep the prompt first run when the tracker was previously disabled.
+func TestCarryWispGCLastRunSurvivesConfigRebuild(t *testing.T) {
+	now := time.Now()
+	prev := &memoryWispGC{interval: 30 * time.Minute, ttl: time.Hour, lastRun: now.Add(-5 * time.Minute)}
+
+	rebuilt := carryWispGCLastRun(prev, newWispGC(30*time.Minute, time.Hour, 0))
+	if rebuilt.shouldRun(now) {
+		t.Fatal("rebuilt tracker shouldRun = true 5 min after the previous run; the reload re-armed the amplifier")
+	}
+	if !rebuilt.shouldRun(now.Add(26 * time.Minute)) {
+		t.Fatal("rebuilt tracker refused the on-schedule run; the carry must move the position, not freeze the tracker")
+	}
+
+	// A reload that SHORTENS the interval governs against the carried position.
+	shortened := carryWispGCLastRun(prev, newWispGC(2*time.Minute, time.Hour, 0))
+	if !shortened.shouldRun(now) {
+		t.Fatal("shortened-interval rebuild refused to run 5 min past lastRun; the new config's interval must govern")
+	}
+
+	// Previously disabled (nil prev): the prompt first run is preserved.
+	enabled := carryWispGCLastRun(nil, newWispGC(30*time.Minute, time.Hour, 0))
+	if !enabled.shouldRun(now) {
+		t.Fatal("first-enable tracker refused its prompt first run")
+	}
+}
