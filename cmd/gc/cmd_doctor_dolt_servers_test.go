@@ -554,7 +554,7 @@ func TestDoltServersCheck_PSFallbackKeepsSpacedDataDir(t *testing.T) {
 		return l, err
 	}
 	c.cwd = func(int) (string, bool) { return "/elsewhere", true }
-	c.args = func(pid int) (string, error) {
+	c.args = func(int) (string, error) {
 		return "/usr/local/bin/dolt sql-server --data-dir /city/My Store/dolt -u root -p secret", nil
 	}
 	r := c.Run(nil)
@@ -669,5 +669,21 @@ func TestDoltServersCheck_ExpectedLocalServersStayOK(t *testing.T) {
 	c.localPolicy = rigPolicy(doltScopeLocal{name: "app", expectsLocal: true})
 	if r := c.Run(nil); r.Status != doctor.StatusOK {
 		t.Fatalf("status = %v, want OK: %q %v", r.Status, r.Message, r.Details)
+	}
+}
+
+// Codex round 7 on #120: without a clean city.toml the census still runs,
+// but whether a scope should run a local server is unknown — a lone managed
+// server is "not checked" (Warning), never silently expected.
+func TestLocalServerPolicy_NoConfigIsAnErrorNotExpectsLocal(t *testing.T) {
+	if _, err := localServerPolicy("/city", nil); err == nil {
+		t.Fatal("localServerPolicy(nil cfg) must return an error, not assume a local server is expected")
+	}
+	c := doltServersFixture(t, []DoltProcInfo{gcDoltProc(100, "/city", 51361)}, nil, nil)
+	c.cfg = nil
+	c.localPolicy = func() (doltLocalPolicy, error) { return localServerPolicy("/city", nil) }
+	r := c.Run(nil)
+	if r.Status != doctor.StatusWarning || !strings.Contains(strings.Join(r.Details, "\n"), "not checked") {
+		t.Fatalf("want Warning with a not-checked line: %v %q %v", r.Status, r.Message, r.Details)
 	}
 }

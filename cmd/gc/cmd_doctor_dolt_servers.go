@@ -496,8 +496,9 @@ type doltScopeLocal struct {
 func localServerPolicy(cityPath string, cfg *config.City) (doltLocalPolicy, error) {
 	pol := doltLocalPolicy{rigs: map[string]doltScopeLocal{}}
 	if cfg == nil {
-		pol.city = doltScopeLocal{name: "city", expectsLocal: true}
-		return pol, nil
+		// No clean city.toml: whether any scope should run a local server is
+		// unknown, and assuming "yes" would read a stale server as expected.
+		return doltLocalPolicy{}, fmt.Errorf("city config unavailable")
 	}
 	cityState, _, err := resolveDesiredCityEndpointState(cityPath, cfg.Dolt, config.EffectiveHQPrefix(cfg))
 	if err != nil {
