@@ -2050,11 +2050,12 @@ gc hook current [flags]
 ## gc hook heartbeat
 
 Refreshes the claim lease on every in_progress bead assigned to the calling
-session under an identity it answers to right now (session bead id, session
-name, configured named identity, current alias — never alias history, which a
-later session may have reused). Each row is heartbeated under its own assignee
-spelling, because bd's owner check is exact and a cross-spelling heartbeat is
-refused.
+session under an identity it may vouch for right now: session bead id, session
+name, configured named identity, current alias, and any prior alias that no
+other live session currently answers to (a rebranded session keeps the work it
+was assigned under its old name; an alias a later session took is excluded).
+Each row is heartbeated under its own assignee spelling, because bd's owner
+check is exact and a cross-spelling heartbeat is refused.
 
 Intended to run detached from a per-turn hook event so leases track a session
 that is still taking turns and expire when it stops. bd self-heals a missing
