@@ -2,7 +2,6 @@ package events
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -47,7 +46,7 @@ func readFilteredTrackedContext(ctx context.Context, path string, filter Filter)
 			continue
 		}
 		archivePath := filepath.Join(dir, info.Basename)
-		err := streamArchive(archivePath, filter, func(e Event) bool {
+		err := streamArchive(archivePath, filter, typeNeedles(filter, nil), func(e Event) bool {
 			if !matchesFilter(e, filter) {
 				return true
 			}
@@ -74,11 +73,11 @@ func readFilteredTrackedContext(ctx context.Context, path string, filter Filter)
 	}
 	defer f.Close() //nolint:errcheck // read-only file
 
-	needle := typeNeedle(filter)
+	needles := typeNeedles(filter, nil)
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024) // handle lines up to 1MB
 	for scanner.Scan() {
-		if needle != nil && !bytes.Contains(scanner.Bytes(), needle) {
+		if !lineMayMatch(scanner.Bytes(), needles) {
 			continue
 		}
 		var e Event

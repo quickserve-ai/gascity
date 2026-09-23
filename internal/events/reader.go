@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"time"
 )
@@ -218,6 +219,34 @@ type eventSeqWindow struct {
 // reopening stable archives (including later windows after a Limit is reached)
 // while still detecting an archive promoted after this scan.
 func readFilteredTracked(path string, filter Filter) ([]Event, map[eventSeqWindow]struct{}, error) {
+	return readFilteredTrackedTypes(path, filter, nil)
+}
+
+// ReadFilteredTypes is ReadFiltered for the events whose Type is any of types,
+// read in ONE walk of the log and its archives instead of one walk per type.
+// filter.Type must be empty; every other filter field applies as in
+// ReadFiltered. Results are in log (seq) order.
+func ReadFilteredTypes(path string, filter Filter, types ...string) ([]Event, error) {
+	if filter.Type != "" {
+		return nil, fmt.Errorf("ReadFilteredTypes: filter.Type %q must be empty; pass the types as arguments", filter.Type)
+	}
+	if len(types) == 0 {
+		return nil, fmt.Errorf("ReadFilteredTypes: no types given")
+	}
+	result, _, err := readFilteredTrackedTypes(path, filter, types)
+	return result, err
+}
+
+// readFilteredTrackedTypes is readFilteredTracked, additionally restricted to
+// events whose Type is one of types when types is non-empty.
+func readFilteredTrackedTypes(path string, filter Filter, types []string) ([]Event, map[eventSeqWindow]struct{}, error) {
+	needles := typeNeedles(filter, types)
+	matches := func(e Event) bool {
+		if !matchesFilter(e, filter) {
+			return false
+		}
+		return len(types) == 0 || slices.Contains(types, e.Type)
+	}
 	dir := filepath.Dir(path)
 	archives, err := archiveFilesIn(dir)
 	if err != nil {
@@ -237,8 +266,8 @@ func readFilteredTracked(path string, filter Filter) ([]Event, map[eventSeqWindo
 			continue
 		}
 		archivePath := filepath.Join(dir, info.Basename)
-		err := streamArchive(archivePath, filter, func(e Event) bool {
-			if !matchesFilter(e, filter) {
+		err := streamArchive(archivePath, filter, needles, func(e Event) bool {
+			if !matches(e) {
 				return true
 			}
 			result = append(result, e)
@@ -275,18 +304,17 @@ func readFilteredTracked(path string, filter Filter) ([]Event, map[eventSeqWindo
 		return result, listed, fmt.Errorf("seeking events: %w", err)
 	}
 
-	needle := typeNeedle(filter)
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024) // handle lines up to 1MB
 	for scanner.Scan() {
-		if needle != nil && !bytes.Contains(scanner.Bytes(), needle) {
+		if !lineMayMatch(scanner.Bytes(), needles) {
 			continue
 		}
 		var e Event
 		if err := json.Unmarshal(scanner.Bytes(), &e); err != nil {
 			continue // skip malformed lines
 		}
-		if !matchesFilter(e, filter) {
+		if !matches(e) {
 			continue
 		}
 		result = append(result, e)
@@ -466,25 +494,50 @@ func archiveSeq(line []byte) (uint64, bool) {
 	return seq, true
 }
 
-// typeNeedle returns the bytes every encoded event of filter.Type contains:
-// the type as a quoted JSON string. A line without them cannot match, so the
-// forward reads skip it before json.Unmarshal, which is where a typed read of
-// a large log spends its time (ga-4mu4k5: an 8-day order.failed read decoded
-// ~2.4 GB of archived lines in 54s; gunzip alone took 5s). nil means no
-// prefilter: no Type, or a Type that encoding/json would not write verbatim
-// (quotes, backslashes, control or non-ASCII bytes, and the HTML-escaped
-// <, > and &), so the needle could miss a real match.
-func typeNeedle(filter Filter) []byte {
-	if filter.Type == "" {
-		return nil
-	}
-	for i := 0; i < len(filter.Type); i++ {
-		switch c := filter.Type[i]; {
-		case c < 0x20, c >= 0x7f, c == '"', c == '\\', c == '<', c == '>', c == '&':
+// typeNeedles returns, for each wanted type, the bytes every encoded event of
+// that type contains: the type as a quoted JSON string. The wanted types are
+// types when given, else filter.Type. A line holding none of them cannot
+// match, so the forward reads skip it before json.Unmarshal, which is where a
+// typed read of a large log spends its time (ga-4mu4k5: an 8-day order.failed
+// read decoded ~2.4 GB of archived lines in 54s; gunzip alone took 5s). nil
+// means no prefilter: no wanted type, or one that encoding/json would not write
+// verbatim (quotes, backslashes, control or non-ASCII bytes, and the
+// HTML-escaped <, > and &), so its needle could miss a real match.
+func typeNeedles(filter Filter, types []string) [][]byte {
+	if len(types) == 0 {
+		if filter.Type == "" {
 			return nil
 		}
+		types = []string{filter.Type}
 	}
-	return []byte(`"` + filter.Type + `"`)
+	needles := make([][]byte, 0, len(types))
+	for _, typ := range types {
+		if typ == "" {
+			return nil
+		}
+		for i := 0; i < len(typ); i++ {
+			switch c := typ[i]; {
+			case c < 0x20, c >= 0x7f, c == '"', c == '\\', c == '<', c == '>', c == '&':
+				return nil
+			}
+		}
+		needles = append(needles, []byte(`"`+typ+`"`))
+	}
+	return needles
+}
+
+// lineMayMatch reports whether line can hold one of the needles' types. With
+// no needles every line may match.
+func lineMayMatch(line []byte, needles [][]byte) bool {
+	if needles == nil {
+		return true
+	}
+	for _, needle := range needles {
+		if bytes.Contains(line, needle) {
+			return true
+		}
+	}
+	return false
 }
 
 // streamArchive gunzip-streams the file at path, decoding each line
@@ -502,8 +555,8 @@ func typeNeedle(filter Filter) []byte {
 // a monotonic log and should be seq-ordered, but `continue` saves the same
 // decode without depending on that.
 //
-// Lines that cannot hold filter.Type are skipped the same way (typeNeedle).
-func streamArchive(path string, filter Filter, fn func(Event) bool) error {
+// Lines that cannot hold a wanted type are skipped the same way (typeNeedles).
+func streamArchive(path string, filter Filter, needles [][]byte, fn func(Event) bool) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -516,12 +569,11 @@ func streamArchive(path string, filter Filter, fn func(Event) bool) error {
 	}
 	defer gr.Close() //nolint:errcheck // read-only stream
 
-	needle := typeNeedle(filter)
 	scanner := bufio.NewScanner(gr)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		line := scanner.Bytes()
-		if needle != nil && !bytes.Contains(line, needle) {
+		if !lineMayMatch(line, needles) {
 			continue
 		}
 		if seq, ok := archiveSeq(line); ok {
@@ -582,7 +634,7 @@ func LatestArchivedMatch(path string, filter Filter) (Event, bool, error) {
 		)
 		// Events within one archive are ordered oldest-first, so the scan runs
 		// to the end of this archive and keeps the last match.
-		err := streamArchive(filepath.Join(dir, info.Basename), filter, func(e Event) bool {
+		err := streamArchive(filepath.Join(dir, info.Basename), filter, typeNeedles(filter, nil), func(e Event) bool {
 			if !matchesFilter(e, filter) {
 				return true
 			}
