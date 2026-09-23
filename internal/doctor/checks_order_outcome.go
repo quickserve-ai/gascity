@@ -48,8 +48,9 @@ const (
 	// failed, fewer than threshold times: how often an order ran is not
 	// bounded by its schedule (a controller that was down, or a run holding
 	// the single-flight gate), so its streak can reach back past any fixed
-	// window. Those orders, and only those, are looked back past the window
-	// for (lookBack).
+	// window. Nor can it settle an order with no outcome in it: a monthly
+	// order's whole streak lies before the window. Those orders, and only
+	// those, are looked back past the window for (lookBack).
 	orderOutcomeLookback = 8 * 24 * time.Hour
 
 	// orderOutcomeLookBackBudget bounds the look-back past the window, cut to
@@ -92,7 +93,9 @@ func nearControllerStart(ts time.Time, starts []time.Time, grace time.Duration) 
 // on every restart, which is the opposite of what this check is for.
 //
 // sawOutcome distinguishes "ran and succeeded" from "never produced an outcome";
-// order-firing-current already owns the never-fired case.
+// order-firing-current already owns the never-fired case. The caller looks
+// back past the window for an order with none there (lookBack), so a false
+// sawOutcome means none in the retained log, or an unsettled look-back.
 //
 // skipped counts trailing failures that were inside the post-start grace
 // window and therefore excluded from streak. Callers need this to avoid
@@ -279,9 +282,15 @@ func (c *OrderOutcomeHealthyCheck) Run(ctx *CheckContext) *CheckResult {
 			if lookErr != nil {
 				why = fmt.Sprintf("could not be read (%v)", lookErr)
 			}
-			status, detail = StatusWarning, fmt.Sprintf(
-				"%s: every run read failed (%d counted); older runs %s, so the streak may reach threshold %d",
-				orderDisplayName(order), streak, why, c.threshold)
+			if sawOutcome {
+				status, detail = StatusWarning, fmt.Sprintf(
+					"%s: every run read failed (%d counted); older runs %s, so the streak may reach threshold %d",
+					orderDisplayName(order), streak, why, c.threshold)
+			} else {
+				status, detail = StatusWarning, fmt.Sprintf(
+					"%s: no run in the lookback window; older runs %s, so a failure streak there may reach threshold %d",
+					orderDisplayName(order), why, c.threshold)
+			}
 			if strings.TrimSpace(lastMessage) != "" {
 				detail = fmt.Sprintf("%s, last %q", detail, lastMessage)
 			}
@@ -324,14 +333,18 @@ func orderSucceededIn(outcomes []events.Event, subject string) bool {
 // lookBack extends outcomes and starts past the window for the orders the
 // window cannot settle, and returns the subjects it could not settle either.
 //
-// Only an order whose every outcome in the window failed, fewer than threshold
-// times, needs it (Codex r3 on #136: a daily order that ran only weekly failed
-// at -14d, -7d and now, and the window saw two). Older outcomes cannot change
-// any other verdict: a success in the window ends the streak, a streak at
-// threshold already warns, and an order with no outcome in the window is
-// reported as having none there, not as succeeding (whether it should have run
-// is order-firing-current's question). When no order needs the look-back,
-// nothing more is read, so the common case costs the window read alone.
+// Two kinds of order need it. One whose every outcome in the window failed,
+// fewer than threshold times (Codex r3 on #136: a daily order that ran only
+// weekly failed at -14d, -7d and now, and the window saw two). And one with no
+// outcome in the window at all (Codex r5 on #136: a monthly `0 0 1 * *` order
+// that failed Jun 1, Jul 1 and Aug 1 has none in the window on Aug 20, while
+// order-firing-current still calls its Aug 1 firing current), whose walk runs
+// to its newest outcome and on only as far as its trailing streak needs.
+// Older outcomes cannot change any other verdict: a success in the window
+// ends the streak and a streak at threshold already warns. When no order
+// needs the look-back, nothing more is read, so the common case costs the
+// window read alone. An order with no outcome in the whole retained log walks
+// all of it; one the budget cuts off warns rather than reads OK.
 //
 // The walk goes newest-first, one log source at a time, and stops as soon as
 // every such order is settled (settledOrder), the log is exhausted, or the
@@ -344,7 +357,7 @@ func (c *OrderOutcomeHealthyCheck) lookBack(ctx *CheckContext, eventPath string,
 	for _, order := range scheduled {
 		subject := order.ScopedName()
 		streak, _, sawOutcome, _ := consecutiveOrderFailures(outcomes, subject, starts, c.grace)
-		if sawOutcome && streak < c.threshold && !orderSucceededIn(outcomes, subject) {
+		if !sawOutcome || (streak < c.threshold && !orderSucceededIn(outcomes, subject)) {
 			unresolved[subject] = true
 		}
 	}
@@ -361,12 +374,18 @@ func (c *OrderOutcomeHealthyCheck) lookBack(ctx *CheckContext, eventPath string,
 	for subject := range unresolved {
 		pending[subject] = true
 	}
-	// outcomes is seq-ordered and, with an unresolved order, non-empty: every
-	// outcome before the window has a lower seq than its first.
-	filter := events.Filter{BeforeSeq: outcomes[0].Seq}
+	// outcomes is seq-ordered: every outcome before the window has a lower seq
+	// than its first. With none in the window the walk is unbounded, which
+	// re-reads only the window, where no pending order has an outcome.
+	var filter events.Filter
+	if len(outcomes) > 0 {
+		filter.BeforeSeq = outcomes[0].Seq
+	}
 	var older []events.Event
+	sawSource := false
 	err := c.walkBack(eventPath, filter, []string{events.OrderCompleted, events.OrderFailed, events.ControllerStarted},
 		func(evts []events.Event, through time.Time) bool {
+			sawSource = true
 			var batch []events.Event
 			for _, e := range evts {
 				if e.Type == events.ControllerStarted {
@@ -386,6 +405,11 @@ func (c *OrderOutcomeHealthyCheck) lookBack(ctx *CheckContext, eventPath string,
 			}
 			return len(unresolved) > 0 && time.Now().Before(stopAt)
 		})
+	if err == nil && !sawSource {
+		// No log source at all, as in a fresh city: there is nothing older to
+		// read, so every order is settled.
+		clear(unresolved)
+	}
 	return append(older, outcomes...), starts, unresolved, err
 }
 
