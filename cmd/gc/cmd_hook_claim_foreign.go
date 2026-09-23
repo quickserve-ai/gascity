@@ -9,6 +9,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/gchome"
 )
 
 // Cross-town shared-pool invariant (ga-h4iqzr, agreed cross-town as R2a on
@@ -29,15 +30,34 @@ import (
 const declinedForeignSampleLimit = 5
 
 // hookClaimHostRoots returns the filesystem roots this host instantiates
-// formulas under: the city path and the invoking user's home. Molecules whose
-// gc.formula_source lies outside every root were poured by another host.
+// formulas under, in order: the city path, the gc home, and the invoking
+// user's home. Molecules whose gc.formula_source lies outside every root were
+// poured by another host.
+//
+// The gc home is the root that matters most (gc-m61x): a formula-instantiated
+// molecule root is stamped with a gc.formula_source under the gc home's cache
+// (`<gc home>/cache/repos/<hash>/.../formulas/<f>.toml`), and gc resolves that
+// home through internal/gchome — GC_HOME first, then $HOME/.gc. On a host
+// whose GC_HOME lies outside $HOME (westeros: GC_HOME=/data/gc-home) the user
+// home does not cover it, and without this root every locally poured molecule
+// was declined as foreign, bricking the pool (2026-09-23 17:02Z). The
+// read-only resolver is used so computing the roots creates nothing on disk.
+// Empty and duplicate entries are dropped.
 func hookClaimHostRoots() []string {
 	var roots []string
-	if p := strings.TrimSpace(os.Getenv("GC_CITY_PATH")); p != "" {
+	seen := map[string]bool{}
+	add := func(p string) {
+		p = strings.TrimSpace(p)
+		if p == "" || seen[p] {
+			return
+		}
+		seen[p] = true
 		roots = append(roots, p)
 	}
-	if h, err := os.UserHomeDir(); err == nil && strings.TrimSpace(h) != "" {
-		roots = append(roots, h)
+	add(os.Getenv("GC_CITY_PATH"))
+	add(gchome.ResolveReadOnly().Path())
+	if h, err := os.UserHomeDir(); err == nil {
+		add(h)
 	}
 	return roots
 }
