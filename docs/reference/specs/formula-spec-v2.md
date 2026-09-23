@@ -989,9 +989,17 @@ formula_compiler = ">=2.0.0"
 `formula_compiler` is the only `[requires]` axis. The value must be a
 semver comparator; violations fail with
 `formula.compiler_requirement_invalid: formula_compiler must be a semver
-comparator, for example ">=2.0.0"`, and unknown axes fail with
+comparator, for example ">=2.0.0"`, and unknown keys fail with
 `formula.requirement_unknown: unknown formula requirement "<key>";
-supported requirements: formula_compiler`.
+supported requirements: formula_compiler, disabled_reason`.
+
+`disabled_reason` is not an axis. It is a non-empty string that marks an
+unsatisfiable `formula_compiler` requirement as deliberate, for example
+`formula_compiler = ">=999.0.0"` to shadow a formula so it can never be
+cooked. `gc doctor` reports such a formula as intentionally disabled
+instead of as a defect, and warns when the requirement is satisfiable.
+Cook and dispatch ignore it. A formula that `extends` a disabled parent
+inherits the parent's reason unless it declares its own.
 
 ### Explicit declaration rule
 
