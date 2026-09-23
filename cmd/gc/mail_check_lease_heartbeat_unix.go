@@ -19,6 +19,7 @@ func spawnDetachedLeaseHeartbeat(logPath string) {
 		appendLeaseHeartbeatLog(logPath, "spawn: resolving executable: "+err.Error())
 		return
 	}
+	rotateLeaseHeartbeatLog(logPath)
 	logf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return
