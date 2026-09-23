@@ -35,10 +35,15 @@ func (c *FormulaRequirementsCheck) Run(_ *CheckContext) *CheckResult {
 		return r
 	}
 
-	issues := c.collectIssues()
+	issues, disabled := c.collectIssues()
+	slices.Sort(disabled)
 	if len(issues) == 0 {
 		r.Status = StatusOK
 		r.Message = "formula compiler requirements are consistent"
+		if len(disabled) > 0 {
+			r.Message = fmt.Sprintf("formula compiler requirements are consistent (%d intentionally disabled)", len(disabled))
+			r.Details = disabled
+		}
 		return r
 	}
 
@@ -48,6 +53,7 @@ func (c *FormulaRequirementsCheck) Run(_ *CheckContext) *CheckResult {
 	for _, issue := range issues {
 		r.Details = append(r.Details, issue.detail())
 	}
+	r.Details = append(r.Details, disabled...)
 	errors, warnings := countFormulaRequirementIssues(issues)
 	switch {
 	case errors > 0:
@@ -67,8 +73,13 @@ func (c *FormulaRequirementsCheck) CanFix() bool { return false }
 // Fix is a no-op because formula requirement migrations need author review.
 func (c *FormulaRequirementsCheck) Fix(_ *CheckContext) error { return nil }
 
-func (c *FormulaRequirementsCheck) collectIssues() []formulaRequirementIssue {
+// collectIssues returns the findings, plus one note per formula whose
+// unsatisfiable requirement is declared deliberate (disabled_reason) — those
+// are reported, never counted as defects (ga-2h3isb).
+func (c *FormulaRequirementsCheck) collectIssues() ([]formulaRequirementIssue, []string) {
 	var issues []formulaRequirementIssue
+	var disabled []string
+	seenDisabled := make(map[string]struct{})
 	seen := make(map[formulaRequirementIssueKey]struct{})
 	addIssue := func(issue formulaRequirementIssue) {
 		key := issue.dedupeKey()
@@ -129,18 +140,38 @@ func (c *FormulaRequirementsCheck) collectIssues() []formulaRequirementIssue {
 					message:  err.Error(),
 				})
 			}
-			if err := formula.ValidateHostRequirements(resolved, c.cfg.Daemon.FormulaV2Enabled()); err != nil {
+			reason := ""
+			if resolved.Requires != nil {
+				reason = strings.TrimSpace(resolved.Requires.DisabledReason)
+			}
+			hostErr := formula.ValidateHostRequirements(resolved, c.cfg.Daemon.FormulaV2Enabled())
+			switch {
+			case hostErr != nil && reason != "" && formula.IsUnsatisfiedRequirement(hostErr):
+				note := fmt.Sprintf("intentionally disabled %s formula %q (%s): %s", scope.name, resolved.Formula, path, reason)
+				if _, ok := seenDisabled[note]; !ok {
+					seenDisabled[note] = struct{}{}
+					disabled = append(disabled, note)
+				}
+			case hostErr != nil:
 				addIssue(formulaRequirementIssue{
 					severity: StatusError,
 					scope:    scope.name,
 					formula:  resolved.Formula,
 					path:     path,
-					message:  err.Error(),
+					message:  hostErr.Error(),
+				})
+			case reason != "":
+				addIssue(formulaRequirementIssue{
+					severity: StatusWarning,
+					scope:    scope.name,
+					formula:  resolved.Formula,
+					path:     path,
+					message:  fmt.Sprintf("declares disabled_reason %q but its requirement is satisfiable here, so the formula is DISPATCHABLE; make the requirement unsatisfiable or remove the marker", reason),
 				})
 			}
 		}
 	}
-	return issues
+	return issues, disabled
 }
 
 func (c *FormulaRequirementsCheck) formulaScopes() []formulaRequirementScope {
