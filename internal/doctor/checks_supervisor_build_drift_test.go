@@ -88,7 +88,7 @@ func TestSupervisorBuildDrift(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			serving, probeErr := tc.serving, tc.probeErr
-			fetch := func() (string, error) { return serving, probeErr }
+			fetch := func() (ServingBuild, error) { return ServingBuild{BuildID: serving}, probeErr }
 			drifted := func(_, _ string) bool { return tc.drifted }
 			c := NewSupervisorBuildDriftCheck(tc.running, tc.local, fetch, drifted)
 			got := c.Run(nil)
@@ -121,7 +121,7 @@ func TestSupervisorBuildDriftNeverVacuouslyOK(t *testing.T) {
 				for _, probeErr := range probes {
 					for _, drifted := range []bool{true, false} {
 						serving, probeErr, drifted := serving, probeErr, drifted
-						fetch := func() (string, error) { return serving, probeErr }
+						fetch := func() (ServingBuild, error) { return ServingBuild{BuildID: serving}, probeErr }
 						cmp := func(_, _ string) bool { return drifted }
 						c := NewSupervisorBuildDriftCheck(running, local, fetch, cmp)
 						got := c.Run(nil)
@@ -163,9 +163,9 @@ func TestSupervisorBuildDriftDoesNotProbeWhenItCannotDecide(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			probed := false
-			fetch := func() (string, error) {
+			fetch := func() (ServingBuild, error) {
 				probed = true
-				return "f1f5cd76c", nil
+				return ServingBuild{BuildID: "f1f5cd76c"}, nil
 			}
 			c := NewSupervisorBuildDriftCheck(tc.running, tc.local, fetch, func(_, _ string) bool { return false })
 
@@ -184,4 +184,33 @@ func TestSupervisorBuildDriftDoesNotProbeWhenItCannotDecide(t *testing.T) {
 // it be written, tested and never registered.
 func TestSupervisorBuildDriftSatisfiesCheck(_ *testing.T) {
 	var _ Check = NewSupervisorBuildDriftCheck(false, "", nil, nil)
+}
+
+// ga-y903: the uptime rides next to the build. A stale build with days of
+// uptime says no restart has happened since (the westeros hub served a build
+// cut before a fix for 61h, 2026-09-19); an unreported uptime adds nothing.
+func TestSupervisorBuildDrift_ReportsUptimeNextToTheBuild(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		sb      ServingBuild
+		drifted bool
+		want    string
+	}{
+		{"stale for days", ServingBuild{BuildID: "0d312c706", UptimeSec: 220197}, true, "serving build 0d312c706 (up 2d, no restart since) but the gc binary on disk is f1f5cd76c"},
+		{"current, hours", ServingBuild{BuildID: "f1f5cd76c", UptimeSec: 55440}, false, "installed build f1f5cd76c (up 15h, no restart since)"},
+		{"current, minutes", ServingBuild{BuildID: "f1f5cd76c", UptimeSec: 300}, false, "installed build f1f5cd76c (up 5m)"},
+		{"uptime not reported", ServingBuild{BuildID: "f1f5cd76c"}, false, "installed build f1f5cd76c"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sb, drifted := tc.sb, tc.drifted
+			c := NewSupervisorBuildDriftCheck(true, "f1f5cd76c", func() (ServingBuild, error) { return sb, nil }, func(_, _ string) bool { return drifted })
+			got := c.Run(nil)
+			if !strings.Contains(got.Message, tc.want) {
+				t.Fatalf("message = %q, want it to contain %q", got.Message, tc.want)
+			}
+			if tc.sb.UptimeSec == 0 && strings.Contains(got.Message, "(up") {
+				t.Fatalf("an unreported uptime must not render: %q", got.Message)
+			}
+		})
+	}
 }
