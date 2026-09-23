@@ -199,6 +199,36 @@ func TestCmdHookHeartbeatStrictFailsOnAnyRefusal(t *testing.T) {
 	}
 }
 
+// TestCmdHookHeartbeatStrictTreatsZeroRefreshAsAMiss pins the codex round-4
+// P1: every list succeeds but no row matches, so refused stays 0 — under
+// --strict that is a miss (the mode exists to prove a heartbeat happened),
+// while the lenient default still exits 0 and prints the same diagnostic.
+func TestCmdHookHeartbeatStrictTreatsZeroRefreshAsAMiss(t *testing.T) {
+	t.Setenv("GC_SESSION_ID", "ga-sess")
+	withHeartbeatIdentities(t, []string{"katya", "qcore/cherub-law.katya"}, nil)
+	store := &fakeHeartbeatStore{rows: map[string][]beads.Bead{}, hbErr: map[string]error{}}
+	withHeartbeatStore(t, store, nil)
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdHookHeartbeat("", true, &stdout, &stderr); code != 1 {
+		t.Fatalf("strict zero-refresh = exit %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "refreshed nothing") {
+		t.Fatalf("stderr = %q, want the zero-refresh diagnostic", stderr.String())
+	}
+	if len(store.beats) != 0 {
+		t.Fatalf("beats = %v, want none", store.beats)
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := cmdHookHeartbeat("", false, &stdout, &stderr); code != 0 {
+		t.Fatalf("lenient zero-refresh = exit %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "0 refreshed, 0 refused") || !strings.Contains(stderr.String(), "refreshed nothing") {
+		t.Fatalf("lenient run must still report: stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
 // TestCmdHookHeartbeatIDOverrideSkipsSessionResolution pins the canary arm:
 // --id heartbeats the named bead under the ambient actor without touching
 // session identity or listing anything.
