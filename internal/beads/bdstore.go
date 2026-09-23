@@ -909,6 +909,12 @@ type bdIssue struct {
 	NoHistory       bool         `json:"no_history,omitempty"`
 	DeferUntil      *time.Time   `json:"defer_until,omitempty"`
 	IsBlocked       optionalBool `json:"is_blocked,omitempty"`
+	// AwaitType must decode here or every BdStore read (Get/List/Ready)
+	// silently blanks it for gc's own Go consumers — session-wait resume,
+	// cache backing reads, hook work-query rows. (The notify backstop is NOT
+	// affected: `gc bd show --json` is a passthrough verb, so the script
+	// reads bd's own JSON, which carries the field.)
+	AwaitType string `json:"await_type,omitempty"`
 	// Revision carries bd's optimistic-concurrency token for ConditionalWriter.
 	// Older bd versions omit it, so it decodes to 0; toBead stamps it onto the
 	// otherwise json:"-" Bead.Revision field.
@@ -1125,6 +1131,7 @@ func (b *bdIssue) toBead() Bead {
 		IsBlocked:            b.IsBlocked.ptr(),
 		IndefinitelyDeferred: indefinitelyDeferred,
 		Revision:             int64(b.Revision),
+		AwaitType:            b.AwaitType,
 	}
 }
 
@@ -1285,6 +1292,17 @@ func (s *BdStore) CreateWithStorage(b Bead, storage StorageClass) (Bead, error) 
 	if typ == "" {
 		typ = "task"
 	}
+	// KNOWN RESIDUAL (ga-knhu61): b.AwaitType cannot be forwarded — the
+	// fleet bd's create verb has no --await-type flag (only update does), and
+	// a create-then-update would expose a window where a machinery gate reads
+	// "human" and the on-creation notifier fires. So on THIS degraded path a
+	// gate create lands with the seam default ("human") and the notifier MAY
+	// page for it: the notify script filters only on await_type=="human" +
+	// status=="open" (no machinery-marker exclusion exists there today; its
+	// addressee resolution merely prefers gc.deferred_assignee over the human
+	// fallback). Machinery exclusion is ga-2essre; the exit path is
+	// ga-1gacvo — bd create grows --await-type in the next fleet tag and this
+	// maps it like the update path does.
 	args := []string{"create", "--json", b.Title, "-t", typ}
 	hasStableID := false
 	if id := strings.TrimSpace(b.ID); id != "" {
