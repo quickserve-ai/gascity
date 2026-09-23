@@ -207,12 +207,16 @@ func TestOrderFiringCurrent_FiredRecently(t *testing.T) {
 		events.Event{Type: events.OrderFired, Subject: "cleanup-cooldown", Ts: now.Add(-1 * time.Hour)},
 	)
 
-	result := runOrderFiringCurrentTest(t, cfg, cityPath, now)
+	result, routine := runOrderFiringCurrentTestRoutine(t, cfg, cityPath, now)
 	if result.Status != StatusOK {
 		t.Fatalf("status = %v, want OK; msg = %s; details = %v", result.Status, result.Message, result.Details)
 	}
-	if !strings.Contains(strings.Join(result.Details, "\n"), "last fired 1h ago, expected every 4h") {
-		t.Fatalf("details = %v, want recent-fire detail", result.Details)
+	// ga-k3ieg3: an all-healthy result prints nothing, not even a count line.
+	if len(result.Details) != 0 {
+		t.Fatalf("details = %v, want none for an all-current result", result.Details)
+	}
+	if !strings.Contains(strings.Join(routine, "\n"), "last fired 1h ago, expected every 4h") {
+		t.Fatalf("routine = %v, want recent-fire detail", routine)
 	}
 }
 
@@ -255,8 +259,8 @@ func TestOrderFiringCurrent_UsesNewestOrderRunHistory(t *testing.T) {
 	if result.Status != StatusOK {
 		t.Fatalf("status = %v, want OK; msg = %s; details = %v", result.Status, result.Message, result.Details)
 	}
-	if !strings.Contains(strings.Join(result.Details, "\n"), "last fired 1h ago, expected every 4h") {
-		t.Fatalf("details = %v, want newest order-run bead to win over stale event", result.Details)
+	if !strings.Contains(strings.Join(check.routineDetails, "\n"), "last fired 1h ago, expected every 4h") {
+		t.Fatalf("routine = %v, want newest order-run bead to win over stale event", check.routineDetails)
 	}
 }
 
@@ -278,12 +282,12 @@ func TestOrderFiringCurrent_ArchivedHistoryDoesNotChangeVerdict(t *testing.T) {
 		events.Event{Seq: 1, Type: events.OrderFired, Subject: "cleanup-cooldown", Ts: now.Add(-6 * time.Hour)},
 	)
 
-	result := runOrderFiringCurrentTest(t, cfg, cityPath, now)
+	result, routine := runOrderFiringCurrentTestRoutine(t, cfg, cityPath, now)
 	if result.Status != StatusOK {
 		t.Fatalf("status = %v, want OK; msg = %s; details = %v", result.Status, result.Message, result.Details)
 	}
-	if !strings.Contains(strings.Join(result.Details, "\n"), "last fired 30m ago, expected every 1h") {
-		t.Fatalf("details = %v, want the active log's newest firing to decide the verdict", result.Details)
+	if !strings.Contains(strings.Join(routine, "\n"), "last fired 30m ago, expected every 1h") {
+		t.Fatalf("routine = %v, want the active log's newest firing to decide the verdict", routine)
 	}
 }
 
@@ -320,8 +324,8 @@ func TestOrderFiringCurrent_ArchivedFiringResolvedByOrderRunStore(t *testing.T) 
 	if result.Status != StatusOK {
 		t.Fatalf("status = %v, want OK; msg = %s; details = %v", result.Status, result.Message, result.Details)
 	}
-	if !strings.Contains(strings.Join(result.Details, "\n"), "last fired 30m ago, expected every 1h") {
-		t.Fatalf("details = %v, want the order-run store to carry the archived firing", result.Details)
+	if !strings.Contains(strings.Join(check.routineDetails, "\n"), "last fired 30m ago, expected every 1h") {
+		t.Fatalf("routine = %v, want the order-run store to carry the archived firing", check.routineDetails)
 	}
 }
 
@@ -538,13 +542,13 @@ CUSTOM_ORDER_FLAG = "enabled"
 		events.Event{Type: events.OrderFired, Subject: "cleanup-cooldown", Ts: now.Add(-1 * time.Hour)},
 	)
 
-	result := runOrderFiringCurrentTest(t, cfg, cityPath, now)
+	result, routine := runOrderFiringCurrentTestRoutine(t, cfg, cityPath, now)
 	if result.Status != StatusOK {
 		t.Fatalf("status = %v, want OK; msg = %s; details = %v", result.Status, result.Message, result.Details)
 	}
-	details := strings.Join(result.Details, "\n")
+	details := strings.Join(routine, "\n")
 	if !strings.Contains(details, "cleanup-cooldown: last fired 1h ago, expected every 4h") {
-		t.Fatalf("details = %v, want valid order firing detail", result.Details)
+		t.Fatalf("routine = %v, want valid order firing detail", routine)
 	}
 	if strings.Contains(details, "invalid-env-on-formula") {
 		t.Fatalf("details = %v, want invalid order skipped", result.Details)
@@ -568,13 +572,13 @@ GC_CITY = "shadow-city"
 		events.Event{Type: events.OrderFired, Subject: "cleanup-cooldown", Ts: now.Add(-1 * time.Hour)},
 	)
 
-	result := runOrderFiringCurrentTest(t, cfg, cityPath, now)
+	result, routine := runOrderFiringCurrentTestRoutine(t, cfg, cityPath, now)
 	if result.Status != StatusOK {
 		t.Fatalf("status = %v, want OK; msg = %s; details = %v", result.Status, result.Message, result.Details)
 	}
-	details := strings.Join(result.Details, "\n")
+	details := strings.Join(routine, "\n")
 	if !strings.Contains(details, "cleanup-cooldown: last fired 1h ago, expected every 4h") {
-		t.Fatalf("details = %v, want valid order firing detail", result.Details)
+		t.Fatalf("routine = %v, want valid order firing detail", routine)
 	}
 	if strings.Contains(details, "invalid-reserved-env") {
 		t.Fatalf("details = %v, want reserved-env order skipped", result.Details)
@@ -596,6 +600,64 @@ func TestOrderFiringCurrent_Overdue(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(result.Details, "\n"), "(overdue)") {
 		t.Fatalf("details = %v, want overdue detail", result.Details)
+	}
+}
+
+// ga-k3ieg3: an overdue order must not be buried among healthy ones. The
+// healthy lines are dropped and counted; caveats and findings stay.
+func TestOrderFiringCurrent_OverdueIsNotBuriedAmongCurrent(t *testing.T) {
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrder(t, cityPath, "mol-dog-stale-db", "cron", "0 */4 * * *")
+	writeOrderFiringTestOrder(t, cityPath, "cleanup-cooldown", "cooldown", "4h")
+	writeOrderFiringTestOrder(t, cityPath, "sweep-cooldown", "cooldown", "4h")
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.ControllerStarted, Ts: now.Add(-8 * time.Hour)},
+		events.Event{Type: events.OrderFired, Subject: "mol-dog-stale-db", Ts: now.Add(-7 * time.Hour)},
+		events.Event{Type: events.OrderFired, Subject: "cleanup-cooldown", Ts: now.Add(-1 * time.Hour)},
+		events.Event{Type: events.OrderFired, Subject: "sweep-cooldown", Ts: now.Add(-1 * time.Hour)},
+	)
+
+	result, routine := runOrderFiringCurrentTestRoutine(t, cfg, cityPath, now)
+	if result.Status != StatusWarning {
+		t.Fatalf("status = %v, want warning; details = %v", result.Status, result.Details)
+	}
+	want := []string{
+		"mol-dog-stale-db: last fired 7h ago, expected every 4h (overdue)",
+		"2 other scheduled order(s) current",
+	}
+	if strings.Join(result.Details, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("details = %q, want exactly %q", result.Details, want)
+	}
+	// Control: the old behaviour printed all three order lines — the two
+	// dropped ones exist, they are just not printed.
+	if got := len(routine) + 1; got != 3 {
+		t.Fatalf("old output would have had %d order lines, want 3 (routine = %v)", got, routine)
+	}
+	if result.Message != "scheduled orders are overdue" {
+		t.Fatalf("message changed: %q", result.Message)
+	}
+}
+
+// A caveated OK (never fired, within the first cycle) is not routine: it says
+// the check could not fully judge, so it stays printed.
+func TestOrderFiringCurrent_CaveatedOKIsNotRoutine(t *testing.T) {
+	order := orders.Order{Name: "o", Trigger: "cooldown"}
+	now := time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name             string
+		lastFired, start time.Time
+		wantRoutine      bool
+	}{
+		{"fired within interval", now.Add(-time.Hour), now.Add(-8 * time.Hour), true},
+		{"never fired, start unknown", time.Time{}, time.Time{}, false},
+		{"never fired, first cycle", time.Time{}, now.Add(-time.Hour), false},
+	}
+	for _, tc := range cases {
+		status, _, _, routine := classifyOrderFiring(order, now, 4*time.Hour, tc.lastFired, tc.start, false)
+		if status != StatusOK || routine != tc.wantRoutine {
+			t.Errorf("%s: status=%v routine=%v, want OK routine=%v", tc.name, status, routine, tc.wantRoutine)
+		}
 	}
 }
 
@@ -866,9 +928,19 @@ func writeOrderFiringArchivedEvents(t *testing.T, cityPath string, firstSeq, las
 
 func runOrderFiringCurrentTest(t *testing.T, cfg *config.City, cityPath string, now time.Time) *CheckResult {
 	t.Helper()
+	result, _ := runOrderFiringCurrentTestRoutine(t, cfg, cityPath, now)
+	return result
+}
+
+// runOrderFiringCurrentTestRoutine also returns the plain healthy lines the
+// check counted instead of printing — the observation channel for tests that
+// assert WHICH firing decided a healthy verdict.
+func runOrderFiringCurrentTestRoutine(t *testing.T, cfg *config.City, cityPath string, now time.Time) (*CheckResult, []string) {
+	t.Helper()
 	check := NewOrderFiringCurrentCheck(cfg, cityPath)
 	check.clock = func() time.Time { return now }
-	return check.Run(&CheckContext{CityPath: cityPath})
+	result := check.Run(&CheckContext{CityPath: cityPath})
+	return result, check.routineDetails
 }
 
 func TestLatestOrderFiredAt_RecentEventSkipsLastRun(t *testing.T) {
