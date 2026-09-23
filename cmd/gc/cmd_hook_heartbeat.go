@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand/v2"
@@ -128,12 +129,27 @@ var hookHeartbeatIdentities = func(sessionID, instanceToken string) ([]string, e
 // (hookClaimSessionEligibility) gates every heartbeat: a closed bead, a
 // missing or superseded token, or a non-eligible state yields NO identities
 // and an error the caller reports as a miss.
+//
+// The STATE rule differs from the claim path's (codex round-8 P1): a
+// DRAINING session may not take new claims but is explicitly allowed to
+// finish the work it holds (cmd_runtime_drain.go), and that work's lease must
+// keep being refreshed for the length of the graceful-drain timeout or it
+// expires mid-finish. So the closed and token checks are the claim path's
+// verbatim, and the eligible state set is the claim path's plus draining.
 func hookHeartbeatEligibleIdentities(info session.Info, instanceToken string) ([]string, error) {
-	verdict, reason, _ := hookClaimSessionEligibility(info, strings.TrimSpace(instanceToken))
-	if verdict != hookClaimSessionEligible {
-		return nil, fmt.Errorf("session is not heartbeat-eligible: %s (a stale incarnation must not refresh a successor's claims)", reason)
+	if info.Closed {
+		return nil, errors.New("session is not heartbeat-eligible: session bead is closed (a stale incarnation must not refresh a successor's claims)")
 	}
-	return session.CurrentAssigneeIdentities(info), nil
+	storedToken := strings.TrimSpace(info.InstanceToken)
+	if storedToken == "" || storedToken != strings.TrimSpace(instanceToken) {
+		return nil, errors.New("session is not heartbeat-eligible: runtime instance token does not match the session bead (a stale incarnation must not refresh a successor's claims)")
+	}
+	switch state := session.State(strings.TrimSpace(info.MetadataState)); state {
+	case session.StateNone, session.StateActive, session.StateAwake, session.StateCreating, session.StateStartPending, session.StateDraining:
+		return session.CurrentAssigneeIdentities(info), nil
+	default:
+		return nil, fmt.Errorf("session is not heartbeat-eligible: session state %q holds no live work", state)
+	}
 }
 
 // hookHeartbeatStartOffset picks where in the deduplicated row list a run
