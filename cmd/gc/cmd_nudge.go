@@ -3549,8 +3549,37 @@ func sortQueuedNudges(state *nudgeQueueState) {
 	nudgequeue.SortState(state)
 }
 
+// withNudgeQueueState runs fn under the queue lock and, once the state write
+// has committed and the lock is released, reports every item that fn moved
+// into Dead to its sender (reportDeadLetteredNudges). Newly dead items are
+// found by ID, not by position, because maintenance passes rewrite Dead
+// wholesale (retention prune, repair). Nothing is reported when fn or the
+// state write fails: the transition did not commit.
 func withNudgeQueueState(cityPath string, fn func(*nudgeQueueState) error) error {
-	return nudgequeue.WithState(cityPath, fn)
+	var newlyDead []queuedNudge
+	err := nudgequeue.WithState(cityPath, func(state *nudgeQueueState) error {
+		newlyDead = nil
+		deadBefore := make(map[string]struct{}, len(state.Dead))
+		for _, item := range state.Dead {
+			deadBefore[item.ID] = struct{}{}
+		}
+		if err := fn(state); err != nil {
+			return err
+		}
+		for _, item := range state.Dead {
+			if _, ok := deadBefore[item.ID]; !ok {
+				newlyDead = append(newlyDead, item)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if len(newlyDead) > 0 {
+		reportDeadLetteredNudges(cityPath, newlyDead)
+	}
+	return nil
 }
 
 func nudgePollerPIDPath(cityPath, sessionName, agentName string) string {
