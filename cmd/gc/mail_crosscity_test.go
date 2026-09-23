@@ -568,3 +568,126 @@ func TestCmdMailSendStorelessCrossCityForeignRules(t *testing.T) {
 		t.Errorf("exec send payload = %s, want the canonical foreign recipient", rec)
 	}
 }
+
+// Exec-provider reads with a live city store: a mailbox the store resolves
+// also serves its city-qualified deliveries (<local>/<addr>), and a
+// local-qualified identifier is that same mailbox. Red before the fix: the
+// resolved path returned the bare recipients only.
+func TestResolveRawMailTargetStorelessProviderExpandsResolvedLocalRoster(t *testing.T) {
+	cityPath := writeCrossCityTestCity(t)
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Type: "session", Title: "mayor session", Status: "open",
+		Metadata: map[string]string{"session_name": "qlandia-mayor", "alias": "mayor"},
+	}); err != nil {
+		t.Fatalf("Create(session bead): %v", err)
+	}
+	script, _ := writeExecSendScript(t)
+	t.Setenv("GC_MAIL", "exec:"+script)
+
+	for _, identifier := range []string{"mayor", "qlandia/mayor"} {
+		var stderr bytes.Buffer
+		target, ok := resolveRawMailTargetForStorelessProvider(identifier, &stderr, "gc mail inbox")
+		if !ok {
+			t.Fatalf("%s: resolve failed: %s", identifier, stderr.String())
+		}
+		want := map[string]bool{"mayor": false, "qlandia/mayor": false}
+		for _, r := range target.recipients {
+			if _, present := want[r]; present {
+				want[r] = true
+			}
+		}
+		for addr, found := range want {
+			if !found {
+				t.Errorf("%s: recipients %v must include %q", identifier, target.recipients, addr)
+			}
+		}
+	}
+}
+
+// A storeless send to this city's own qualified form strips to the local
+// mailbox: <local>/mayor and mayor are one mailbox on the exec provider too.
+func TestCmdMailSendStorelessCrossCityLocalQualifiedStrips(t *testing.T) {
+	_, recordPath := storelessCrossCity(t)
+
+	// --notify on a storeless LOCAL send warns (no store, no wake) and still
+	// writes: the warning is the proof this ran on the storeless path.
+	var stdout, stderr bytes.Buffer
+	if code := cmdMailSend(nil, true, false, "human", "qlandia/mayor", "s", "b", &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdMailSend = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "no city store available") {
+		t.Fatalf("stderr = %q: this test must run on the STORELESS send path", stderr.String())
+	}
+	rec, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatalf("exec provider recorded nothing: %v", err)
+	}
+	if !strings.HasPrefix(string(rec), `{"to":"mayor"}`) {
+		t.Errorf("exec send recipient = %s, want the local form mayor", rec)
+	}
+}
+
+// storelessMailTarget: the raw read target when no store can resolve the
+// identifier. Local-qualified expands to the mailbox and its alias, a peer
+// city stays an open-world literal, an unknown city stays literal too.
+func TestStorelessMailTargetRosterShapes(t *testing.T) {
+	writeCrossCityTestCity(t)
+
+	local := storelessMailTarget("qlandia/mayor")
+	if local.display != "mayor" {
+		t.Errorf("local display = %q, want mayor", local.display)
+	}
+	if !crossCityContainsAll(local.recipients, "mayor", "qlandia/mayor") {
+		t.Errorf("local recipients = %v, want mayor and qlandia/mayor", local.recipients)
+	}
+	foreign := storelessMailTarget("gastown/mayor")
+	if foreign.display != "gastown/mayor" || len(foreign.recipients) != 1 || foreign.recipients[0] != "gastown/mayor" {
+		t.Errorf("foreign target = %+v, want the literal gastown/mayor only", foreign)
+	}
+	unknown := storelessMailTarget("gastwn/mayor")
+	if unknown.display != "gastwn/mayor" || !crossCityContainsAll(unknown.recipients, "gastwn/mayor") {
+		t.Errorf("unknown-city target = %+v, want the literal kept", unknown)
+	}
+}
+
+func crossCityContainsAll(have []string, want ...string) bool {
+	seen := make(map[string]bool, len(have))
+	for _, h := range have {
+		seen[h] = true
+	}
+	for _, w := range want {
+		if !seen[w] {
+			return false
+		}
+	}
+	return true
+}
+
+// The cloud-wake guard rail never runs for a foreign recipient: the
+// classification happens first, so a cross-city send cannot be turned into
+// a cloud-wake refusal by a colliding local alias.
+func TestCloudWakeGuardAppliesSkipsForeign(t *testing.T) {
+	cases := []struct {
+		name      string
+		foreign   bool
+		hasNudge  bool
+		canonical string
+		ref       string
+		wantApply bool
+	}{
+		{"foreign never", true, true, "gastown/mayor", "", false},
+		{"local notified no ref", false, true, "mayor", "", true},
+		{"local notified with ref", false, true, "mayor", "https://github.com/x/y", false},
+		{"local not notified", false, false, "mayor", "", false},
+		{"human", false, true, "human", "", false},
+	}
+	for _, tc := range cases {
+		if got := cloudWakeGuardApplies(tc.foreign, tc.hasNudge, tc.canonical, tc.ref); got != tc.wantApply {
+			t.Errorf("%s: cloudWakeGuardApplies = %v, want %v", tc.name, got, tc.wantApply)
+		}
+	}
+}
