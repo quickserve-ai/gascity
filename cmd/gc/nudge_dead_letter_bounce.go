@@ -1,15 +1,19 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode"
 
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/mail/beadmail"
+	"github.com/gastownhall/gascity/internal/rollout/gate"
 	"github.com/gastownhall/gascity/internal/session"
 )
 
@@ -85,10 +89,24 @@ func reportDeadLetteredNudges(cityPath string, items []queuedNudge) {
 	if len(candidates) == 0 {
 		return
 	}
-	cfg, err := loadCityConfigWithoutBuiltinPackRefresh(cityPath, io.Discard)
+	// The controller's dispatch tick and the drain hook both reach here, so
+	// the load must never wait: the repo-cache lock is held across a network
+	// clone, and a blocking load would stall them for minutes (#146 review
+	// round 2). A busy cache skips this round's bounces with a warning. Not
+	// loadCityConfigAdvisory: it swaps the process-wide logger, which in the
+	// long-lived controller would drop other goroutines' logs, and two
+	// overlapping swaps can leave the logger silenced for good.
+	cfg, err := loadPrematerializedCityConfig(fsys.OSFS{}, filepath.Join(cityPath, "city.toml"), advisoryLoad, io.Discard)
 	if err != nil || cfg == nil {
 		// No readable config means no sender can be confirmed as a mailbox;
 		// skip rather than mail an address nothing may ever read.
+		if errors.Is(err, config.ErrRepoCacheBusy) {
+			skipped := make([]nudgeDeadLetterBounce, 0, len(candidates))
+			for _, item := range candidates {
+				skipped = append(skipped, nudgeDeadLetterBounce{item: item})
+			}
+			warnUnbouncedDeadLetters(skipped, "the repo cache is busy, so config was not loaded")
+		}
 		return
 	}
 	cityName := loadedCityName(cfg, cityPath)
@@ -232,6 +250,8 @@ func truncateNudgeDeadLetterCause(s string, limit int) string {
 
 // openCityNudgeDeadLetterMailer opens the city's mail sender from cityPath,
 // reusing the caller's already-loaded cfg instead of loading config again.
+// Delivery is at most once: a process that exits between the committed queue
+// write and this send loses the notice, and nothing retries it.
 // Message beads route through resolveMailMessagesStore, as in
 // openCityMailProvider. The beadmail provider gets no session directory: Send
 // then records the "gc" sender literally instead of resolving it against
@@ -249,7 +269,12 @@ func openCityNudgeDeadLetterMailer(cityPath string, cfg *config.City) (nudgeDead
 			return err
 		}, nil, nil
 	}
-	store, err := openStoreAtForCity(cityPath, cityPath)
+	// Reuse cfg: a nil config makes the open load the whole city config again,
+	// builtin-pack refresh and a blocking repo-cache wait included. Skip the
+	// builtin-asset readiness pass too; a best-effort notice must not rewrite
+	// pack artifacts (#146 review round 2).
+	result, err := openStoreResultAtForCityWithConfigOptions(cityPath, cityPath, cfg, gate.ModeUnset, false, false, false, false)
+	store := result.Store
 	if err != nil {
 		return nil, nil, fmt.Errorf("opening the city store at %q: %w", cityPath, err)
 	}
