@@ -811,7 +811,8 @@ func beadChanged(old, fresh Bead, skipLabels bool) bool {
 		old.Ephemeral != fresh.Ephemeral ||
 		old.IndefinitelyDeferred != fresh.IndefinitelyDeferred ||
 		!timePtrEqual(old.DeferUntil, fresh.DeferUntil) ||
-		!boolPtrEqual(old.IsBlocked, fresh.IsBlocked) {
+		!boolPtrEqual(old.IsBlocked, fresh.IsBlocked) ||
+		old.AwaitType != fresh.AwaitType {
 		return true
 	}
 	if !maps.Equal(old.Metadata, fresh.Metadata) {

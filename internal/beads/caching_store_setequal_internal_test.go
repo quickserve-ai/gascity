@@ -121,4 +121,7 @@ func TestCacheEventCarriesAwaitType(t *testing.T) {
 	if merged := mergeCacheEventPatch(current, patch, map[string]json.RawMessage{"title": json.RawMessage(`"g"`)}); merged.AwaitType != AwaitHuman {
 		t.Fatalf("merge without await_type field mutated AwaitType to %q; want untouched %q", merged.AwaitType, AwaitHuman)
 	}
+	if !beadChanged(current, patch, false) {
+		t.Fatal("beadChanged = false for an await_type-only change; applyEvent would drop the update")
+	}
 }
