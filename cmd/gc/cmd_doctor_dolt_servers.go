@@ -29,11 +29,12 @@ import (
 //
 // So this check starts from the process table (discoverDoltProcesses — the same
 // enumeration `gc dolt cleanup` reaps from). Each server gets an identity
-// path: its --config, else its --data-dir, else its working directory (a
-// `bd dolt start` server carries neither flag and runs from its data dir; and
-// the ps-based discovery used on hosts without /proc keeps only --config). A
-// server with both flags also carries its --data-dir, the store it actually
-// serves, and is owned by the deepest scope either path falls under. It is
+// path, anchored at the server's working directory when relative: its
+// --data-dir (the store it actually serves), else its --config, else its
+// working directory (a `bd dolt start` server carries neither flag and runs
+// from its data dir; the ps-based discovery used on hosts without /proc keeps
+// only --config, so a --data-dir is re-read from the full command line). A
+// --config beside a --data-dir is kept only for the gc-launched marker. It is
 // then sorted into:
 //
 //   - managed: serves this city's managed runtime layout. More than one is a
@@ -135,9 +136,9 @@ var gcDoltConfigMarker = filepath.Join(".gc", "runtime", "packs", "dolt") + stri
 type doltServerIdentity struct {
 	path   string // config, data-dir, or cwd; "" when none is known
 	source string // "config", "data-dir", "cwd"
-	// dataDir is the anchored --data-dir of a server identified by its
-	// --config: the store it serves, which can sit in another scope.
-	dataDir string
+	// config is the anchored --config of a server identified by its
+	// --data-dir; it decides only whether the server is gc-launched.
+	config string
 	// relative is set when the path was a relative --config/--data-dir whose
 	// anchor (the server's cwd) could not be read: unidentifiable, not "not gc".
 	relative bool
@@ -167,20 +168,19 @@ func (c *doltServersCheck) identifyUncached(p DoltProcInfo) doltServerIdentity {
 			}
 		}
 	}
-	var ddID doltServerIdentity
+	cfg := trimFlattenedDoltArgs(extractConfigPath(p.Argv))
 	if hasDD && dd != "" {
-		ddID = c.anchored(p.PID, trimFlattenedDoltArgs(dd), "data-dir")
-	}
-	if cfg := trimFlattenedDoltArgs(extractConfigPath(p.Argv)); cfg != "" {
-		id := c.anchored(p.PID, cfg, "config")
-		if id.path == "" && ddID.path != "" {
-			return ddID
+		// The data dir is the store served; a --config beside it does not
+		// override that. An unanchorable relative data dir stays
+		// unidentifiable rather than falling back to the config.
+		id := c.anchored(p.PID, trimFlattenedDoltArgs(dd), "data-dir")
+		if cfg != "" {
+			id.config = c.anchored(p.PID, cfg, "config").path
 		}
-		id.dataDir = ddID.path
 		return id
 	}
-	if hasDD && dd != "" {
-		return ddID
+	if cfg != "" {
+		return c.anchored(p.PID, cfg, "config")
 	}
 	if cwd, ok := c.cwd(p.PID); ok && cwd != "" {
 		return doltServerIdentity{path: cwd, source: "cwd"}
@@ -257,18 +257,13 @@ func (c *doltServersCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 			unanchored = append(unanchored, p)
 		case id.path == "":
 			unidentified = append(unidentified, p)
-		case layoutErr == nil && servesDoltLayout(p, id, layout):
+		case layoutErr == nil && servesDoltLayout(id, layout):
 			managed = append(managed, p)
 		default:
 			root, hq, ok := deepestDoltScopeOwner(id.path, cityScopes)
-			if id.dataDir != "" {
-				if r2, hq2, ok2 := deepestDoltScopeOwner(id.dataDir, cityScopes); ok2 && (!ok || len(r2) > len(root)) {
-					root, hq, ok = r2, hq2, ok2
-				}
-			}
 			switch {
 			case ok && !hq:
-				key := c.rigStoreKey(root, p, id)
+				key := c.rigStoreKey(root, id)
 				rigLocal[key] = append(rigLocal[key], p)
 				rigRootOf[key] = root
 				rigLocalCount++
@@ -285,7 +280,7 @@ func (c *doltServersCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 				} else {
 					orphanTests = append(orphanTests, p)
 				}
-			case id.source == "config" && strings.Contains(id.path, gcDoltConfigMarker):
+			case strings.Contains(id.configPath(), gcDoltConfigMarker):
 				foreign = append(foreign, p)
 			default:
 				notGC++
@@ -405,16 +400,10 @@ func (c *doltServersCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 }
 
 // servesDoltLayout reports whether a server serves the store a layout
-// describes: by argv (doltProcMatchesManagedLayout), or by its identity path —
-// which is already cut free of flattened trailing flags, and which for a
-// `bd dolt start` server is its working directory, the data dir itself.
-func servesDoltLayout(p DoltProcInfo, id doltServerIdentity, layout managedDoltRuntimeLayout) bool {
-	if doltProcMatchesManagedLayout(p, layout) {
-		return true
-	}
-	if id.dataDir != "" && strings.TrimSpace(layout.DataDir) != "" && samePath(id.dataDir, layout.DataDir) {
-		return true
-	}
+// describes, judged ONLY by its anchored identity: a raw argv value would be
+// resolved against doctor's working directory, not the server's. A data dir,
+// when known, decides alone; a config is compared only when there is none.
+func servesDoltLayout(id doltServerIdentity, layout managedDoltRuntimeLayout) bool {
 	switch id.source {
 	case "config":
 		return strings.TrimSpace(layout.ConfigFile) != "" && samePath(id.path, layout.ConfigFile)
@@ -424,20 +413,24 @@ func servesDoltLayout(p DoltProcInfo, id doltServerIdentity, layout managedDoltR
 	return false
 }
 
+// configPath is the server's anchored --config, whichever identity it has.
+func (id doltServerIdentity) configPath() string {
+	if id.source == "config" {
+		return id.path
+	}
+	return id.config
+}
+
 // rigStoreKey groups rig-local servers by the store they serve, so a gc-launched
 // server (identified by its config) and a `bd dolt start` server (identified by
 // its cwd) on the same rig store land in ONE group and count as a split-brain.
-// A server that does not serve the rig's own layout keys on the store it
-// serves: its --data-dir when known, else its identity path.
-func (c *doltServersCheck) rigStoreKey(root string, p DoltProcInfo, id doltServerIdentity) string {
-	if layout, err := c.layout(root); err == nil && servesDoltLayout(p, id, layout) {
+// A server that does not serve the rig's own layout keys on its identity path,
+// which is its data dir whenever one is known.
+func (c *doltServersCheck) rigStoreKey(root string, id doltServerIdentity) string {
+	if layout, err := c.layout(root); err == nil && servesDoltLayout(id, layout) {
 		return root + rigStoreKeySuffix
 	}
-	store := id.path
-	if id.dataDir != "" {
-		store = id.dataDir
-	}
-	return root + "\x00" + normalizePathForCompare(store)
+	return root + "\x00" + normalizePathForCompare(id.path)
 }
 
 const rigStoreKeySuffix = "\x00store"
