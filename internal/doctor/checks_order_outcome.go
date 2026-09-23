@@ -304,12 +304,16 @@ func orderSucceededIn(outcomes []events.Event, subject string) bool {
 	return false
 }
 
-// tooRareForLookback reports whether threshold consecutive runs of order can
-// span more than orderOutcomeLookback, so a streak that long may not be seen.
-// For cron that is the LONGEST span of threshold consecutive fires, not the
-// smallest gap between two: `0 0 1-3 * *` fires a day apart, but its runs on
-// the 2nd, 3rd and next month's 1st span four weeks. A schedule that cannot be
-// evaluated counts as too rare: the check cannot vouch for it.
+// tooRareForLookback reports whether a window of orderOutcomeLookback, starting
+// anywhere, can miss part of a threshold-run streak. The window opens between
+// two fires, so the gap before its first visible fire counts too: it is sure to
+// hold threshold consecutive runs only if every threshold+1 consecutive fires
+// span at most the lookback (Codex r2 on #136: `0 0 * * 1,4` fires three times
+// in seven days, but read on a Wednesday the window opens after Monday and
+// holds only Thursday and Monday). For cron that is the LONGEST such span, not
+// the smallest gap between two: `0 0 1-3 * *` fires a day apart, but its runs
+// on the 2nd, 3rd and next month's 1st span four weeks. A schedule that cannot
+// be evaluated counts as too rare: the check cannot vouch for it.
 func tooRareForLookback(order orders.Order, threshold int, spanCache map[string]time.Duration) bool {
 	switch order.Trigger {
 	case "cooldown":
@@ -322,7 +326,7 @@ func tooRareForLookback(order orders.Order, threshold int, spanCache map[string]
 		span, ok := spanCache[order.Schedule]
 		if !ok {
 			var err error
-			span, err = cronLongestRunSpan(order.Schedule, threshold)
+			span, err = cronLongestRunSpan(order.Schedule, threshold+1)
 			if err != nil {
 				return true
 			}
