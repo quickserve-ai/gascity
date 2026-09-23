@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/beads/contract"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/doctor"
 	"github.com/gastownhall/gascity/internal/supervisor"
@@ -27,16 +28,21 @@ import (
 // passes while the thing it guards is open.
 //
 // So this check starts from the process table (discoverDoltProcesses — the same
-// enumeration `gc dolt cleanup` reaps from). Each server gets ONE identity
+// enumeration `gc dolt cleanup` reaps from). Each server gets an identity
 // path: its --config, else its --data-dir, else its working directory (a
 // `bd dolt start` server carries neither flag and runs from its data dir; and
-// the ps-based discovery used on hosts without /proc keeps only --config). It
-// is then sorted into:
+// the ps-based discovery used on hosts without /proc keeps only --config). A
+// server with both flags also carries its --data-dir, the store it actually
+// serves, and is owned by the deepest scope either path falls under. It is
+// then sorted into:
 //
 //   - managed: serves this city's managed runtime layout. More than one is a
 //     split-brain on the city's own store -> Error.
-//   - rig-local: under a non-HQ rig root. Two on the same identity is a
-//     split-brain on that rig's store -> Error; one is dolt-drift's call.
+//   - rig-local: under a non-HQ rig root. Two on the same store is a
+//     split-brain on that rig's store -> Error. On a rig whose endpoint origin
+//     is inherited_city even ONE is unaccounted for: on the rig's own store ->
+//     Error, elsewhere under the rig -> Warning. dolt-drift finds such a
+//     server only when it wrote .dolt/sql-server.info.
 //   - city-stray: under the city root, not the managed layout -> Warning.
 //   - other-city: under a city or rig registered with the supervisor on this
 //     host (~/.gc/cities.toml). Counted: a multi-city host runs one managed
@@ -70,6 +76,10 @@ type doltServersCheck struct {
 	args func(pid int) (string, error)
 	// recordedPID reads the managed runtime's pid file without side effects.
 	recordedPID func(layout managedDoltRuntimeLayout) int
+	// inheritedRigs maps the normalized root of every rig whose endpoint
+	// origin is inherited_city to its name. Such a rig should run no
+	// rig-local server at all.
+	inheritedRigs func() (map[string]string, error)
 	// activeTestRoots lists test roots whose owning test process is alive.
 	activeTestRoots func() []string
 	// startIdentity is the ps lstart fallback when discovery left it empty.
@@ -77,6 +87,9 @@ type doltServersCheck struct {
 	homeDir       string
 	tempDir       string
 	now           func() time.Time
+
+	// ids memoizes identify per Run: on hosts without /proc it can shell out.
+	ids map[int]doltServerIdentity
 }
 
 var _ doctor.Check = (*doltServersCheck)(nil)
@@ -96,6 +109,7 @@ func newDoltServersCheck(cityPath string, cfg *config.City) *doltServersCheck {
 		cwd:             processCWD,
 		args:            processArgs,
 		recordedPID:     readManagedDoltPIDFile,
+		inheritedRigs:   func() (map[string]string, error) { return inheritedCityRigRoots(cityPath, cfg) },
 		activeTestRoots: func() []string { return discoverActiveTestRoots(home, temp) },
 		startIdentity:   readProcStartIdentity,
 		homeDir:         home,
@@ -121,34 +135,80 @@ var gcDoltConfigMarker = filepath.Join(".gc", "runtime", "packs", "dolt") + stri
 type doltServerIdentity struct {
 	path   string // config, data-dir, or cwd; "" when none is known
 	source string // "config", "data-dir", "cwd"
+	// dataDir is the anchored --data-dir of a server identified by its
+	// --config: the store it serves, which can sit in another scope.
+	dataDir string
 	// relative is set when the path was a relative --config/--data-dir whose
 	// anchor (the server's cwd) could not be read: unidentifiable, not "not gc".
 	relative bool
 }
 
 func (c *doltServersCheck) identify(p DoltProcInfo) doltServerIdentity {
-	if cfg := trimFlattenedDoltArgs(extractConfigPath(p.Argv)); cfg != "" {
-		return c.anchored(p.PID, cfg, "config")
+	if id, ok := c.ids[p.PID]; ok {
+		return id
 	}
+	id := c.identifyUncached(p)
+	if c.ids != nil {
+		c.ids[p.PID] = id
+	}
+	return id
+}
+
+func (c *doltServersCheck) identifyUncached(p DoltProcInfo) doltServerIdentity {
 	dd, hasDD := argvFlagValue(p.Argv)
 	if !hasDD && c.args != nil {
 		// The ps fallback kept only --config (parseDoltPSCommandLine), so a
-		// --data-dir server would otherwise be identified by an unrelated cwd.
-		// Re-read the full command line here; the shared parser stays as is
-		// because `gc dolt cleanup` reaps by what it returns.
+		// --data-dir would otherwise be lost. Re-read the full command line
+		// here; the shared parser stays as is because `gc dolt cleanup` reaps
+		// by what it returns.
 		if full, err := c.args(p.PID); err == nil {
-			if v := extractFlagValue(full, "--data-dir"); v != "" {
+			if v := flattenedFlagValue(full, "--data-dir"); v != "" {
 				dd, hasDD = v, true
 			}
 		}
 	}
+	var ddID doltServerIdentity
 	if hasDD && dd != "" {
-		return c.anchored(p.PID, trimFlattenedDoltArgs(dd), "data-dir")
+		ddID = c.anchored(p.PID, trimFlattenedDoltArgs(dd), "data-dir")
+	}
+	if cfg := trimFlattenedDoltArgs(extractConfigPath(p.Argv)); cfg != "" {
+		id := c.anchored(p.PID, cfg, "config")
+		if id.path == "" && ddID.path != "" {
+			return ddID
+		}
+		id.dataDir = ddID.path
+		return id
+	}
+	if hasDD && dd != "" {
+		return ddID
 	}
 	if cwd, ok := c.cwd(p.PID); ok && cwd != "" {
 		return doltServerIdentity{path: cwd, source: "cwd"}
 	}
 	return doltServerIdentity{}
+}
+
+// flattenedFlagValue recovers a flag's value from a flat command line
+// (`ps -o args`), where a path may contain spaces. The value runs to the next
+// " -" flag boundary, the same cut trimFlattenedDoltArgs applies to --config.
+func flattenedFlagValue(args, flag string) string {
+	for from := 0; from < len(args); {
+		j := strings.Index(args[from:], flag)
+		if j < 0 {
+			return ""
+		}
+		j += from
+		end := j + len(flag)
+		if (j == 0 || args[j-1] == ' ') && end < len(args) && (args[end] == ' ' || args[end] == '=') {
+			v := strings.TrimLeft(args[end+1:], " ")
+			if strings.HasPrefix(v, "-") {
+				return ""
+			}
+			return strings.TrimSpace(trimFlattenedDoltArgs(v))
+		}
+		from = end
+	}
+	return ""
 }
 
 // anchored resolves a --config/--data-dir value the way the SERVER did: a
@@ -167,6 +227,7 @@ func (c *doltServersCheck) anchored(pid int, path, source string) doltServerIden
 
 func (c *doltServersCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 	r := &doctor.CheckResult{Name: c.Name()}
+	c.ids = map[int]doltServerIdentity{}
 
 	procs, err := c.discover()
 	if err != nil {
@@ -187,6 +248,7 @@ func (c *doltServersCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 
 	var managed, strays, foreign, orphanTests, unidentified, unanchored []DoltProcInfo
 	rigLocal := map[string][]DoltProcInfo{}
+	rigRootOf := map[string]string{}
 	var rigLocalCount, otherCity, activeTests, notGC int
 	for _, p := range procs {
 		id := c.identify(p)
@@ -199,10 +261,16 @@ func (c *doltServersCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 			managed = append(managed, p)
 		default:
 			root, hq, ok := deepestDoltScopeOwner(id.path, cityScopes)
+			if id.dataDir != "" {
+				if r2, hq2, ok2 := deepestDoltScopeOwner(id.dataDir, cityScopes); ok2 && (!ok || len(r2) > len(root)) {
+					root, hq, ok = r2, hq2, ok2
+				}
+			}
 			switch {
 			case ok && !hq:
 				key := c.rigStoreKey(root, p, id)
 				rigLocal[key] = append(rigLocal[key], p)
+				rigRootOf[key] = root
 				rigLocalCount++
 			case ok && hq:
 				strays = append(strays, p)
@@ -236,12 +304,41 @@ func (c *doltServersCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 		rigKeys = append(rigKeys, k)
 	}
 	sort.Strings(rigKeys)
+	inherited, inheritedErr := map[string]string(nil), error(nil)
+	if len(rigKeys) > 0 && c.inheritedRigs != nil {
+		inherited, inheritedErr = c.inheritedRigs()
+	}
+	var inheritedUnchecked int
 	for _, k := range rigKeys {
-		if group := rigLocal[k]; len(group) > 1 {
+		group := rigLocal[k]
+		if len(group) > 1 {
 			errs = append(errs, fmt.Sprintf(
 				"%d dolt servers serve one rig store — split-brain; at most one may: %s",
 				len(group), c.describeAll(group)))
+			continue
 		}
+		if inheritedErr != nil {
+			inheritedUnchecked++
+			continue
+		}
+		name, ok := inherited[rigRootOf[k]]
+		if !ok {
+			continue
+		}
+		if strings.HasSuffix(k, rigStoreKeySuffix) {
+			errs = append(errs, fmt.Sprintf(
+				"rig %q inherits the city's dolt endpoint, but a rig-local dolt server serves its store — split-brain with the city server: %s",
+				name, c.describeAll(group)))
+		} else {
+			warns = append(warns, fmt.Sprintf(
+				"dolt server under rig %q, which inherits the city's dolt endpoint and should run none: %s",
+				name, c.describeAll(group)))
+		}
+	}
+	if inheritedUnchecked > 0 {
+		warns = append(warns, fmt.Sprintf(
+			"rig endpoint origins unresolvable (%v); %d single rig-local dolt server(s) not checked against rigs that inherit the city endpoint",
+			inheritedErr, inheritedUnchecked))
 	}
 	if layoutErr == nil {
 		if pid := c.recordedPID(layout); pid > 0 && !doltPIDIn(pid, managed) && doltPIDIn(pid, procs) {
@@ -315,6 +412,9 @@ func servesDoltLayout(p DoltProcInfo, id doltServerIdentity, layout managedDoltR
 	if doltProcMatchesManagedLayout(p, layout) {
 		return true
 	}
+	if id.dataDir != "" && strings.TrimSpace(layout.DataDir) != "" && samePath(id.dataDir, layout.DataDir) {
+		return true
+	}
 	switch id.source {
 	case "config":
 		return strings.TrimSpace(layout.ConfigFile) != "" && samePath(id.path, layout.ConfigFile)
@@ -327,12 +427,49 @@ func servesDoltLayout(p DoltProcInfo, id doltServerIdentity, layout managedDoltR
 // rigStoreKey groups rig-local servers by the store they serve, so a gc-launched
 // server (identified by its config) and a `bd dolt start` server (identified by
 // its cwd) on the same rig store land in ONE group and count as a split-brain.
-// A server that does not serve the rig's own layout keys on its identity path.
+// A server that does not serve the rig's own layout keys on the store it
+// serves: its --data-dir when known, else its identity path.
 func (c *doltServersCheck) rigStoreKey(root string, p DoltProcInfo, id doltServerIdentity) string {
 	if layout, err := c.layout(root); err == nil && servesDoltLayout(p, id, layout) {
-		return root + "\x00store"
+		return root + rigStoreKeySuffix
 	}
-	return root + "\x00" + normalizePathForCompare(id.path)
+	store := id.path
+	if id.dataDir != "" {
+		store = id.dataDir
+	}
+	return root + "\x00" + normalizePathForCompare(store)
+}
+
+const rigStoreKeySuffix = "\x00store"
+
+// inheritedCityRigRoots maps each bd-store rig whose endpoint origin is
+// inherited_city to its name, keyed by the normalized root
+// deepestDoltScopeOwner returns. The resolution is dolt-drift's.
+func inheritedCityRigRoots(cityPath string, cfg *config.City) (map[string]string, error) {
+	out := map[string]string{}
+	if cfg == nil {
+		return out, nil
+	}
+	cityState, _, err := resolveDesiredCityEndpointState(cityPath, cfg.Dolt, config.EffectiveHQPrefix(cfg))
+	if err != nil {
+		return nil, fmt.Errorf("resolve city endpoint state: %w", err)
+	}
+	rigs := make([]config.Rig, len(cfg.Rigs))
+	copy(rigs, cfg.Rigs)
+	resolveRigPaths(cityPath, rigs)
+	for _, rig := range rigs {
+		if strings.TrimSpace(rig.Path) == "" || !rigUsesManagedBdStoreContract(cityPath, rig) {
+			continue
+		}
+		st, err := resolveDesiredRigEndpointState(cityPath, rig, cityState)
+		if err != nil {
+			return nil, fmt.Errorf("rig %q: %w", rig.Name, err)
+		}
+		if st.EndpointOrigin == contract.EndpointOriginInheritedCity {
+			out[normalizePathForCompare(strings.TrimSpace(rig.Path))] = rig.Name
+		}
+	}
+	return out, nil
 }
 
 // scopeRigs returns the city (HQ) and its rigs with resolved paths. A nil
