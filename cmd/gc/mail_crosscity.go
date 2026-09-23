@@ -32,3 +32,12 @@ func crossCityNotifyRefusal(cmdName, recipient string) string {
 // address is a known scope (roster city, local city, or rig) or carries no
 // city segment at all.
 var errUnknownCityOrigin = errors.New("origin city unknown")
+
+// cloudWakeGuardApplies says whether the cloud-wake --ref guard rail runs
+// for a send. A foreign (peer-city) recipient is classified BEFORE the
+// guard and never enters local wake resolution: its wake belongs to its own
+// city's mail sweep, so a local alias that happens to share the slash form
+// cannot turn a cross-city send into a cloud-wake refusal.
+func cloudWakeGuardApplies(foreign bool, hasNudge bool, canonicalTo, ref string) bool {
+	return !foreign && hasNudge && canonicalTo != "human" && strings.TrimSpace(ref) == ""
+}
