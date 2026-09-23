@@ -13,6 +13,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/doctor"
 	"github.com/gastownhall/gascity/internal/supervisor"
+	"gopkg.in/yaml.v3"
 )
 
 // doltServersCheck enumerates every live `dolt sql-server` on the host from the
@@ -201,15 +202,15 @@ func (c *doltServersCheck) identifyUncached(p DoltProcInfo) doltServerIdentity {
 		// The config names the store: gc's own writer makes its data_dir
 		// authoritative (cmd_dolt_config.go). A copied config pointing at this
 		// city's store is that store's server, whatever the file is called.
-		dd, readOK := c.configDataDir(id.path)
+		dd, resolved := c.configDataDir(id.path)
 		if dd != "" {
+			// A relative data_dir with an unreadable cwd stays unanchored
+			// (a Warning), never the config filename.
 			ddID := c.anchored(p.PID, dd, "data-dir")
-			if ddID.path != "" {
-				ddID.config = id.path
-				return ddID
-			}
+			ddID.config = id.path
+			return ddID
 		}
-		id.configUnread = !readOK
+		id.configUnread = !resolved
 		return id
 	}
 	if cwd, ok := c.cwd(p.PID); ok && cwd != "" {
@@ -218,10 +219,13 @@ func (c *doltServersCheck) identifyUncached(p DoltProcInfo) doltServerIdentity {
 	return doltServerIdentity{}
 }
 
-// configDataDir reads the top-level data_dir from a dolt config YAML. A parse
-// miss returns "" and the config path stays the identity; readOK is false when
-// the file itself could not be read (deleted or unreadable since startup).
-func (c *doltServersCheck) configDataDir(configPath string) (dataDir string, readOK bool) {
+// configDataDir reads the top-level data_dir from a dolt config YAML with the
+// YAML parser, so anchors, aliases and block scalars resolve as dolt would read
+// them. A config naming no data_dir returns ("", true) and the config path
+// stays the identity. resolved is false when the file cannot be read (deleted
+// or unreadable since startup) or cannot be decoded, or data_dir is not a
+// string: the store the server was started on is then unknown.
+func (c *doltServersCheck) configDataDir(configPath string) (dataDir string, resolved bool) {
 	if configPath == "" || c.readFile == nil {
 		return "", true
 	}
@@ -229,55 +233,16 @@ func (c *doltServersCheck) configDataDir(configPath string) (dataDir string, rea
 	if err != nil {
 		return "", false
 	}
-	return yamlTopLevelScalar(data, "data_dir"), true
-}
-
-// yamlTopLevelScalar returns an unindented `key: value` scalar, unquoted. It
-// covers what gc writes (data_dir: %q) and plain or single-quoted values, each
-// optionally followed by a " #" comment.
-func yamlTopLevelScalar(data []byte, key string) string {
-	for _, line := range strings.Split(string(data), "\n") {
-		if !strings.HasPrefix(line, key+":") {
-			continue
-		}
-		v := strings.TrimSpace(strings.TrimPrefix(line, key+":"))
-		switch {
-		case strings.HasPrefix(v, "\""):
-			// The quoted scalar ends at the first unescaped closing quote;
-			// anything after it can only be a comment.
-			for i := 1; i < len(v); i++ {
-				if v[i] == '\\' {
-					i++
-					continue
-				}
-				if v[i] == '"' {
-					if u, err := strconv.Unquote(v[:i+1]); err == nil {
-						return u
-					}
-					return ""
-				}
-			}
-			return ""
-		case strings.HasPrefix(v, "'"):
-			// '' is an escaped quote; the scalar ends at a lone '.
-			for i := 1; i < len(v); i++ {
-				if v[i] != '\'' {
-					continue
-				}
-				if i+1 < len(v) && v[i+1] == '\'' {
-					i++
-					continue
-				}
-				return strings.ReplaceAll(v[1:i], "''", "'")
-			}
-			return ""
-		}
-		if i := strings.Index(v, " #"); i >= 0 {
-			v = strings.TrimSpace(v[:i])
-		}
-		return v
+	var doc struct {
+		DataDir *string `yaml:"data_dir"`
 	}
-	return ""
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return "", false
+	}
+	if doc.DataDir == nil {
+		return "", true
+	}
+	return strings.TrimSpace(*doc.DataDir), true
 }
 
 // flattenedFlagValue recovers a flag's value from a flat command line
@@ -354,6 +319,11 @@ func (c *doltServersCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 		default:
 			root, hq, ok := deepestDoltScopeOwner(id.path, cityScopes)
 			switch {
+			// An unresolved config may have named this city's store, so no
+			// path-based ownership may account for it; only a match to a
+			// rig's own layout (above: the managed one) identifies it.
+			case id.configUnread && !(ok && !hq && strings.HasSuffix(c.rigStoreKey(root, id), rigStoreKeySuffix)):
+				unreadConfig = append(unreadConfig, p)
 			case ok && !hq:
 				key := c.rigStoreKey(root, id)
 				rigLocal[key] = append(rigLocal[key], p)
@@ -374,8 +344,6 @@ func (c *doltServersCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 				}
 			case strings.Contains(id.configPath(), gcDoltConfigMarker):
 				foreign = append(foreign, p)
-			case id.configUnread:
-				unreadConfig = append(unreadConfig, p)
 			default:
 				notGC++
 			}
@@ -480,7 +448,7 @@ func (c *doltServersCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 		warns = append(warns, "dolt server with a relative --config/--data-dir and an unreadable working directory to resolve it against (cannot rule out this city's store): "+c.describe(p))
 	}
 	for _, p := range unreadConfig {
-		warns = append(warns, "dolt server whose --config can no longer be read, so the store it serves is unknown (cannot rule out this city's store): "+c.describe(p))
+		warns = append(warns, "dolt server whose --config can no longer be read or decoded, so the store it serves is unknown (cannot rule out this city's store): "+c.describe(p))
 	}
 	for _, p := range strays {
 		warns = append(warns, "dolt server under the city root that is not the managed server: "+c.describe(p))
