@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -60,6 +62,25 @@ func waitCertParkReadSlotsFree(t *testing.T) {
 		}
 	}
 }
+
+// certParkSkipGate opens gate the first time the probe logs a skipped read.
+// With every Get blocked on gate, that moment is one where each launched read
+// still holds its slot, so a slot freed by a finished read cannot hand the
+// owner past the cap a read it should not get. Without the gate a fast store
+// frees slots mid-loop and the cap reads as cap+1 (ga-isk41m).
+type certParkSkipGate struct {
+	once sync.Once
+	gate chan struct{}
+}
+
+func (g *certParkSkipGate) Write(p []byte) (int, error) {
+	if strings.Contains(string(p), "skipped") {
+		g.open()
+	}
+	return len(p), nil
+}
+
+func (g *certParkSkipGate) open() { g.once.Do(func() { close(g.gate) }) }
 
 // certParkMarkInProgress moves a freshly created bead to in_progress (stores
 // create beads open) and returns the stored row.
@@ -367,8 +388,14 @@ func TestCertParkReadsAreCapped(t *testing.T) {
 		sources = append(sources, n-1)
 	}
 	store.gets.Store(0)
+	skip := &certParkSkipGate{gate: make(chan struct{})}
+	store.stall = skip.gate
+	// A regression that gives the owner past the cap a read never logs a skip;
+	// open the gate anyway so the reads return and the count fails the test.
+	t.Cleanup(skip.open)
 
-	result := computeAwakeSetWithCertParks(&input, sources, newLiveCertParkedWorkProbe(rows, stores, io.Discard))
+	result := computeAwakeSetWithCertParks(&input, sources, newLiveCertParkedWorkProbe(rows, stores, skip))
+	skip.open()
 
 	if got := int(store.gets.Load()); got != limit {
 		t.Fatalf("live label reads = %d, want the cap %d", got, limit)
