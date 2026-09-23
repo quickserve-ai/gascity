@@ -723,15 +723,17 @@ commit_archive_snapshot() {
     # too: after gc, loose objects must be at or below REPACK_LOOSE_CEILING
     # (default twice the gc.auto trigger, so a correctly skipped gc below the
     # trigger never counts as a failure).
-    # Every read below is guarded: under set -euo pipefail an unguarded
-    # failing substitution would end the whole export here, before the
-    # failure is recorded and before the snapshot is marked for push.
+    # Both callers run this function as the left operand of ||, where bash
+    # ignores errexit for the whole body, so a failing command here cannot
+    # end the export. Every failure below is still handled explicitly, so
+    # the snapshot is marked for push even if a caller drops the ||.
     local repack_err
     local repack_rc=0
     local count_out
     local loose
     local git_dir
     local gc_log
+    local gc_log_head
     repack_err=$(git -c gc.auto=256 -c gc.autoDetach=false gc --auto --quiet 2>&1 >/dev/null) || repack_rc=$?
     count_out=$(git count-objects -v 2>&1) || count_out="count-objects failed: $count_out"
     loose=$(printf '%s\n' "$count_out" | awk '/^count:/ {print $2}')
@@ -747,8 +749,9 @@ $count_out"
     git_dir=$(git rev-parse --git-dir 2>/dev/null) || git_dir=".git"
     gc_log="$git_dir/gc.log"
     if [ -f "$gc_log" ]; then
+        gc_log_head=$(head -c 400 "$gc_log" 2>&1) || gc_log_head="(unreadable: $gc_log_head)"
         repack_err="$repack_err
-.git/gc.log: $(head -c 400 "$gc_log")"
+.git/gc.log: $gc_log_head"
     fi
     record_archive_repack_failure "exit=$repack_rc loose_objects=${loose:-unknown} (ceiling $REPACK_LOOSE_CEILING)
 $repack_err"
@@ -836,14 +839,18 @@ ESCALATION
     if escalate_err=$("$ESCALATE_SCRIPT" \
         --subject "ESCALATION: JSONL archive repack failing [HIGH]" \
         --message "$body" 2>&1 >/dev/null); then
-        write_state_json "$(read_state_json | jq -c --argjson now "$(date +%s)" '.repack_failure_escalated = $now | del(.last_repack_escalation_error)')" || true
+        if ! write_state_json "$(read_state_json | jq -c --argjson now "$(date +%s)" '.repack_failure_escalated = $now | del(.last_repack_escalation_error)')"; then
+            echo "jsonl-export: repack escalation delivered but its dedupe marker did not persist; the next failing commit re-sends it" >&2
+        fi
     else
         echo "jsonl-export: repack failure escalation delivery failed (retrying on the next failing commit)" >&2
-        write_state_json "$(
+        if ! write_state_json "$(
             read_state_json \
                 | jq -c --arg err "$(truncate_push_stderr_for_state "${escalate_err:-(no stderr)}")" \
                     '.last_repack_escalation_error = $err'
-        )"
+        )"; then
+            echo "jsonl-export: could not record the escalation delivery failure in state" >&2
+        fi
     fi
     return 0
 }

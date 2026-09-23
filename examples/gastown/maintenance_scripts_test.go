@@ -9130,9 +9130,8 @@ exec '%s' "$@"
 	}
 }
 
-// The post-condition read must not be able to end the export: under
-// set -euo pipefail an unguarded failing `git count-objects` would exit
-// before the failure is recorded and before the snapshot is marked for push.
+// A failing post-condition read is a recorded repack failure, and the export
+// still reaches its summary with the snapshot marked for push.
 func TestJsonlExportCountObjectsFailureIsRecordedNotFatal(t *testing.T) {
 	cityDir := t.TempDir()
 	binDir := t.TempDir()
@@ -9175,6 +9174,69 @@ func TestJsonlExportCountObjectsFailureIsRecordedNotFatal(t *testing.T) {
 	}
 	if !strings.Contains(string(gcData), "MAINTENANCE_DONE: jsonl") {
 		t.Fatalf("the export must reach its summary after a count-objects failure; gc log:\n%s", gcData)
+	}
+}
+
+// A .git/gc.log that exists but cannot be read is diagnostic context, not a
+// second failure: the repack failure is still recorded, naming the unreadable
+// log, and the export still reaches its summary.
+func TestJsonlExportUnreadableGCLogIsRecordedNotFatal(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a mode-000 file; the unreadable case cannot be staged")
+	}
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+	mailLog := filepath.Join(t.TempDir(), "gc-mail.log")
+	archiveRepo := filepath.Join(cityDir, "archive")
+	stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("LookPath(git): %v", err)
+	}
+	// `git gc` leaves an unreadable .git/gc.log and does nothing, as a
+	// previous auto-gc that died on a permission error would.
+	writeExecutable(t, filepath.Join(binDir, "git"), fmt.Sprintf(`#!/bin/sh
+for arg in "$@"; do
+    if [ "$arg" = "gc" ]; then
+        printf 'error: previous auto-gc failed\n' > .git/gc.log
+        chmod 000 .git/gc.log
+        exit 0
+    fi
+done
+exec '%s' "$@"
+`, realGit))
+	writeJsonlExportGCStub(t, binDir)
+	writeMultiRecordDoltStub(t, binDir, 3)
+
+	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
+	env["GC_JSONL_REPACK_LOOSE_CEILING"] = "0"
+
+	// runScript fails the test on a non-zero exit: the export must complete.
+	runScript(t, coreScriptPath("jsonl-export.sh"), env)
+
+	data, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("ReadFile(state file): %v", err)
+	}
+	var state map[string]any
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("Unmarshal(state file): %v\n%s", err, data)
+	}
+	if got := state["consecutive_repack_failures"]; got != float64(1) {
+		t.Fatalf("consecutive_repack_failures = %v, want 1\nstate: %s", got, data)
+	}
+	if got, _ := state["last_repack_stderr"].(string); !strings.Contains(got, "gc.log: (unreadable") {
+		t.Fatalf("last_repack_stderr = %q, want the gc.log read failure named as unreadable", got)
+	}
+	gcData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	if !strings.Contains(string(gcData), "MAINTENANCE_DONE: jsonl") {
+		t.Fatalf("the export must reach its summary after an unreadable gc.log; gc log:\n%s", gcData)
 	}
 }
 
