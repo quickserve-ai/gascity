@@ -180,6 +180,18 @@ type Bead struct {
 	// means the store did not provide it and cached ready falls back to
 	// dependency-derived readiness for backward compatibility.
 	IsBlocked *bool `json:"is_blocked,omitempty"`
+
+	// AwaitType is what a GATE bead is waiting on, in bd's vocabulary
+	// (GateAwaitTypes). It exists on the wire for every bead but is
+	// meaningful only when Type is "gate": the notify plane keys on it
+	// (await_type=="human" pages), and beads v1.3.0-rc.2-fleet.20260922.1
+	// DEFAULTS an empty await_type to "human" at the create seam. So every
+	// gc MACHINERY gate creator must set this explicitly AT CREATE — a
+	// create that leaves it empty mints a human-paging gate, and a
+	// create-then-update exposes a window where the on-creation notifier
+	// fires (ga-knhu61, 2026-09-22: 2601 formula-step gates would have begun
+	// paging per step).
+	AwaitType string `json:"await_type,omitempty"`
 	// IndefinitelyDeferred preserves bd's status-based indefinite deferral
 	// after richer statuses normalize to Gas City's three-state model. Cache
 	// notifications restore status="deferred" on the event wire so another
@@ -221,6 +233,37 @@ type Bead struct {
 	// maintain it per bead and FileStore persists it out of band. A bd-backed
 	// store leaves it 0 until the pinned bd emits claim_fence.
 	ClaimFence int64 `json:"-"`
+}
+
+// Gate await_type vocabulary, mirroring bd update's accepted set
+// (cmd/bd/update.go in the fleet tag): what a gate bead awaits.
+const (
+	// AwaitHuman pages: the notify plane's on-creation and renudge orders
+	// both filter await_type=="human". Machinery never sets it.
+	AwaitHuman = "human"
+	// AwaitTimer marks a timed wait.
+	AwaitTimer = "timer"
+	// AwaitMail marks a wait on a mail delivery.
+	AwaitMail = "mail"
+	// AwaitBead marks a wait on other beads (deps/routing/children) — the
+	// default for gc machinery gates, which wait on graph state, not people.
+	AwaitBead = "bead"
+	// AwaitGHRun / AwaitGHPR mark waits on GitHub state.
+	AwaitGHRun = "gh:run"
+	AwaitGHPR  = "gh:pr"
+)
+
+// IsGateAwaitType reports whether s is in bd's await_type vocabulary. Callers
+// mapping a foreign vocabulary (e.g. a formula gate's own type) onto
+// await_type must check membership and fall back to AwaitBead — passing an
+// out-of-vocabulary value through would fail bd-side validation or, worse,
+// be preserved as an unclassifiable string no notifier arm owns.
+func IsGateAwaitType(s string) bool {
+	switch s {
+	case AwaitHuman, AwaitTimer, AwaitMail, AwaitBead, AwaitGHRun, AwaitGHPR:
+		return true
+	}
+	return false
 }
 
 // UpdateOpts specifies which fields to change. Nil pointers are skipped.

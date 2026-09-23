@@ -508,3 +508,27 @@ func TestBdIssueRejectsInvalidRevision(t *testing.T) {
 		})
 	}
 }
+
+// ga-knhu61: the bd decode envelope must carry await_type, or every BdStore
+// read (Get/List/Ready) blanks it for gc's own Go consumers — session-wait
+// resume, cache backing reads, hook work-query rows. (The notify backstop is
+// unaffected: `gc bd show --json` passes through to bd's own JSON.)
+func TestBdIssueDecodesAwaitType(t *testing.T) {
+	for _, tc := range []struct {
+		name, raw, want string
+	}{
+		{name: "human gate", raw: `{"id":"gc-1","await_type":"human"}`, want: AwaitHuman},
+		{name: "machinery gate", raw: `{"id":"gc-1","await_type":"bead"}`, want: AwaitBead},
+		{name: "absent stays empty", raw: `{"id":"gc-1"}`, want: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var issue bdIssue
+			if err := json.Unmarshal([]byte(tc.raw), &issue); err != nil {
+				t.Fatalf("json.Unmarshal: %v", err)
+			}
+			if got := issue.toBead().AwaitType; got != tc.want {
+				t.Fatalf("toBead().AwaitType = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
