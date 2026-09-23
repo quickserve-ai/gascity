@@ -3405,6 +3405,17 @@ func classifyOverlaySession(
 	if agentInSuspendedRig(cityPath, cfgAgent, cfg.Rigs, suspendedRigPaths) {
 		return overlayVerdict{}
 	}
+	// A suspended agent's NAMED session stays out of desired state, as the
+	// primary named-spec loop already keeps it; the reconciler then stops
+	// it as "suspended" (still in configuredNames, so never "orphaned").
+	// Rediscovering it here put a named session that a nudge or claim
+	// backstop had materialized straight back into desired, and the
+	// reconciler STARTED it (ga-9qanni). A suspended agent's other
+	// existing sessions keep their long-standing treatment: suspension
+	// stops new spawns, not a session already running.
+	if cfgAgent.Suspended && isNamedSessionInfo(info) {
+		return overlayVerdict{}
+	}
 	v := overlayVerdict{template: template, agent: cfgAgent, root: true}
 	if !sessionAlreadyDesired && !isManualSessionInfoForAgent(info, cfgAgent) && !isNamedSessionInfo(info) &&
 		desiredHasCanonicalNonExpandingPoolSession(desired, template, cfgAgent) && staleNonExpandingPoolSessionBeadInfo(cfgAgent, info) {
