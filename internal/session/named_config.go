@@ -581,11 +581,14 @@ type NamedSessionConflictDetail struct {
 	Kind        NamedSessionConflictKind
 	State       string
 	Template    string
+	AgentName   string
 	PoolManaged string
 	// Squat is true only with positive evidence that the bead runs something
-	// else: it records a template or agent that is not this seat's. A bead
-	// recording neither could be the seat's own session, never stamped with
-	// its identity (ga-1ycmli), and is never called a squat.
+	// else: it records a template or agent that is not this seat's, compared
+	// exactly. A bead recording neither could be the seat's own session,
+	// never stamped with its identity (ga-1ycmli), and is never called a
+	// squat. Callers holding the city config must also rule out an older
+	// spelling of the seat's own template before acting on it.
 	Squat bool
 }
 
@@ -594,11 +597,13 @@ type NamedSessionConflictDetail struct {
 func DescribeNamedSessionConflict(b beads.Bead, spec NamedSessionSpec) NamedSessionConflictDetail {
 	kind := ClassifyNamedSessionConflict(b, spec)
 	template := strings.TrimSpace(b.Metadata["template"])
-	recordsRunner := template != "" || strings.TrimSpace(b.Metadata["agent_name"]) != ""
+	agentName := strings.TrimSpace(b.Metadata["agent_name"])
+	recordsRunner := template != "" || agentName != ""
 	return NamedSessionConflictDetail{
 		Kind:        kind,
 		State:       strings.TrimSpace(b.Metadata["state"]),
 		Template:    template,
+		AgentName:   agentName,
 		PoolManaged: strings.TrimSpace(b.Metadata["pool_managed"]),
 		Squat: recordsRunner && !NamedSessionBeadMatchesSpec(b, spec) &&
 			(kind == NamedSessionConflictRuntimeName || kind == NamedSessionConflictAlias),
