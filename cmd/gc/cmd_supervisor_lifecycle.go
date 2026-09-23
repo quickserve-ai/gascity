@@ -52,6 +52,16 @@ var (
 	// deadlines shorter than it.
 	supervisorLaunchdStopTimeout      = 45 * time.Second
 	supervisorLaunchdStopPollInterval = 250 * time.Millisecond
+	// supervisorLaunchdUnknownProbeBudget bounds how long an unload wait keeps
+	// polling a job it has NEVER seen loaded while the probe itself fails
+	// (launchctl absent, a non-service error, the acceptance harness's exit-1
+	// shim). Three polls is enough to ride out a transient launchctl error;
+	// a probe that cannot see launchd at all learns nothing more on the 300th
+	// poll than on the 3rd, and every darwin `gc init` used to pay the full
+	// launchdRefreshWaitTimeout for it (gc-pk1x). A job the probe has
+	// confirmed LOADED keeps the whole deadline, which must outlast
+	// supervisorLaunchdExitTimeout. A var so tests can shorten it.
+	supervisorLaunchdUnknownProbeBudget = 3 * supervisorLaunchdStopPollInterval
 	// launchdRefreshWaitTimeout bounds each wait inside a launchd refresh:
 	// a booted-out job leaving launchd, and the refreshed supervisor proving
 	// it serves the new build.
@@ -1145,6 +1155,8 @@ func verifySupervisorServiceStopped(deadline time.Time) error {
 func waitForSupervisorLaunchdAbsent(label, target string, deadline time.Time) error {
 	var lastDetail string
 	var lastLoaded bool
+	var seenLoaded bool
+	var unknownSince time.Time
 	for {
 		loaded, absent, detail := supervisorLaunchdLoaded(label)
 		if absent {
@@ -1154,7 +1166,24 @@ func waitForSupervisorLaunchdAbsent(label, target string, deadline time.Time) er
 		if detail != "" {
 			lastDetail = detail
 		}
-		if !time.Now().Before(deadline) {
+		// Neither loaded nor absent: the probe failed. Until the job has been
+		// seen loaded there is no unload to wait for, so the failing probe
+		// gets supervisorLaunchdUnknownProbeBudget, not the unload deadline.
+		// Once loaded has been observed the deadline stands: a transient
+		// probe error during a real unload must not abort the refresh.
+		unknownExpired := false
+		switch {
+		case loaded:
+			seenLoaded = true
+			unknownSince = time.Time{}
+		case seenLoaded:
+		default:
+			if unknownSince.IsZero() {
+				unknownSince = time.Now()
+			}
+			unknownExpired = time.Since(unknownSince) >= supervisorLaunchdUnknownProbeBudget
+		}
+		if unknownExpired || !time.Now().Before(deadline) {
 			var err error
 			if lastLoaded {
 				err = fmt.Errorf("launchd target %s is still loaded after stop", target)
@@ -1909,6 +1938,11 @@ func supervisorLaunchdServiceTarget(label string) string {
 func bootoutSupervisorLaunchdJob(label string) error {
 	target := supervisorLaunchdServiceTarget(label)
 	bootoutErr := supervisorLaunchctlRun("bootout", target)
+	if errors.Is(bootoutErr, exec.ErrNotFound) {
+		// No launchctl on PATH at all: nothing to poll, report the unknown
+		// state now so the caller's bare-start fallback runs at once.
+		return fmt.Errorf("launchd job %s state is unknown after bootout (%w)", target, bootoutErr)
+	}
 	if waitErr := waitSupervisorLaunchdUnloaded(label, launchdRefreshWaitTimeout); waitErr != nil {
 		// Split on bootoutErr rather than formatting it unconditionally: bootout
 		// can SUCCEED (nil error) while the unload wait still times out, and a
@@ -1929,8 +1963,15 @@ func bootoutSupervisorLaunchdJob(label string) error {
 // stop` disables it (#5334) and launchd refuses to bootstrap a disabled
 // service.
 func loadAndStartSupervisorLaunchd(path, label string) error {
-	if err := bootoutSupervisorLaunchdJob(legacyGastownLaunchdLabel); err != nil {
-		return err
+	if legacyGastownLaunchdPlistPresent() {
+		// Only a machine that ever installed the legacy gastown agent has a
+		// job to boot out; on every other machine the bootout is a launchctl
+		// call plus an unload wait for a label launchd never saw (gc-pk1x).
+		// A loaded legacy job with no plist is left to the drift path, which
+		// boots it out unconditionally.
+		if err := bootoutSupervisorLaunchdJob(legacyGastownLaunchdLabel); err != nil {
+			return err
+		}
 	}
 	if err := bootoutSupervisorLaunchdJob(label); err != nil {
 		return err
@@ -1954,6 +1995,18 @@ func loadAndStartSupervisorLaunchd(path, label string) error {
 // so rather than report a restored install.
 func loadAndStartSupervisorLaunchdForRollback(path, label string, _ io.Writer) error {
 	return loadAndStartSupervisorLaunchd(path, label)
+}
+
+// legacyGastownLaunchdPlistPresent reports whether the legacy gastown launchd
+// agent's plist exists for this user, the cheapest positive signal that the
+// legacy job may be loaded. A var so tests can force either answer.
+var legacyGastownLaunchdPlistPresent = func() bool {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false
+	}
+	_, statErr := os.Stat(filepath.Join(home, "Library", "LaunchAgents", legacyGastownLaunchdLabel+".plist"))
+	return statErr == nil
 }
 
 func legacySupervisorLaunchdPlistPath() string {
