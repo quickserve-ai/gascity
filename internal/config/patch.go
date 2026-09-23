@@ -238,6 +238,16 @@ type RigPatch struct {
 	FormulaVars map[string]string `toml:"formula_vars,omitempty"`
 	// BeadsProxiedIdleTimeout overrides the rig's beads_proxied_idle_timeout.
 	BeadsProxiedIdleTimeout *string `toml:"beads_proxied_idle_timeout,omitempty"`
+	// Doctor overrides fields of the rig's [rigs.doctor] table.
+	Doctor *RigDoctorPatch `toml:"doctor,omitempty"`
+}
+
+// RigDoctorPatch overrides fields of a rig's [rigs.doctor] table. Nil
+// fields leave the rig's value unchanged.
+type RigDoctorPatch struct {
+	// CensusOwnerNamespace overrides Rig.Doctor.CensusOwnerNamespace; an
+	// empty string clears the declaration.
+	CensusOwnerNamespace *string `toml:"census_owner_namespace,omitempty"`
 }
 
 // ProviderPatch modifies an existing provider identified by Name.
@@ -809,6 +819,9 @@ func applyRigPatch(cfg *City, patch *RigPatch) error {
 				for k, v := range patch.FormulaVars {
 					r.FormulaVars[k] = v
 				}
+			}
+			if patch.Doctor != nil && patch.Doctor.CensusOwnerNamespace != nil {
+				r.Doctor.CensusOwnerNamespace = *patch.Doctor.CensusOwnerNamespace
 			}
 			return nil
 		}
