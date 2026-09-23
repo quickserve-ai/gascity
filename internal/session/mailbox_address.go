@@ -187,3 +187,31 @@ func (s *Store) ExtmsgHandleSource(id string) (string, bool) {
 	}
 	return ExtmsgHandleSource(b), true
 }
+
+// LiveSessionAnsweringToMailbox returns a non-closed session bead that lists
+// address among its mailbox addresses (alias, alias history, runtime name), so
+// mail stored under address would show in that bead's inbox. It scans every
+// session bead because alias history is a list no exact metadata query can
+// match; callers use it only on the rare named-session squat path, never on
+// ordinary sends (ga-isa3j4).
+func LiveSessionAnsweringToMailbox(store beads.Store, address string) (beads.Bead, bool, error) {
+	target := NormalizeNamedSessionTarget(address)
+	if store == nil || target == "" {
+		return beads.Bead{}, false, nil
+	}
+	items, err := store.List(beads.ListQuery{Label: LabelSession})
+	if err != nil {
+		return beads.Bead{}, false, err
+	}
+	for _, b := range items {
+		if !IsSessionBeadOrRepairable(b) || b.Status == "closed" {
+			continue
+		}
+		for _, addr := range MailboxAddressesIncludingRuntimeName(b) {
+			if NormalizeNamedSessionTarget(addr) == target {
+				return b, true, nil
+			}
+		}
+	}
+	return beads.Bead{}, false, nil
+}

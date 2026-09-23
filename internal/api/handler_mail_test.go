@@ -1569,3 +1569,40 @@ func TestMailSendThroughAliasSquatStillRefuses(t *testing.T) {
 		t.Fatalf("alias squat stored %d messages, want 0", len(inbox))
 	}
 }
+
+func TestMailSendTwoSquattersOneHoldingTheAliasStillRefuses(t *testing.T) {
+	// Review 2026-09-23 (second round): one bead on the runtime name, another
+	// holding the identity as its alias. The conflict lookup reports only the
+	// first, so a guard checking only it stored mail the alias holder reads.
+	state := newSessionFakeState(t)
+	srv := New(state)
+	spec, ok, err := srv.findNamedSessionSpecForTarget(state.cityBeadStore, "myrig/worker")
+	if err != nil || !ok {
+		t.Fatalf("fixture: findNamedSessionSpecForTarget(myrig/worker) = %v, %v", ok, err)
+	}
+	createTestSessionBead(t, state.cityBeadStore, map[string]string{
+		"session_name": spec.SessionName,
+		"template":     "other",
+		"agent_name":   "other",
+		"state":        "asleep",
+	}, "")
+	createTestSessionBead(t, state.cityBeadStore, map[string]string{
+		"session_name": "rogue-runtime",
+		"alias":        spec.Identity,
+		"state":        "active",
+	}, "")
+	h := newTestCityHandler(t, state)
+	body := `{"from":"mayor","to":"myrig/worker","subject":"must refuse","body":"x"}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, newPostRequest(cityURL(state, "/mail"), bytes.NewBufferString(body)))
+	if rec.Code < 400 || rec.Code >= 500 {
+		t.Fatalf("status = %d, want 4xx refusal with an alias holder live; body = %s", rec.Code, rec.Body.String())
+	}
+	inbox, err := state.cityMailProv.Inbox(spec.Identity)
+	if err != nil {
+		t.Fatalf("Inbox: %v", err)
+	}
+	if len(inbox) != 0 {
+		t.Fatalf("stored %d messages under %s with an alias holder live, want 0", len(inbox), spec.Identity)
+	}
+}
