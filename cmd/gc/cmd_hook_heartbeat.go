@@ -114,7 +114,39 @@ var hookHeartbeatIdentities = func(sessionID string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	return hookHeartbeatEligibleIdentities(info, os.Getenv("GC_INSTANCE_TOKEN"))
+}
+
+// hookHeartbeatEligibleIdentities fences the write-authorizing identity set
+// to the CURRENT incarnation of the session (codex round-6 P1). A provider
+// process that survived a restart or adoption keeps GC_SESSION_ID but carries
+// a stale GC_INSTANCE_TOKEN; resolving identities by ID alone would let it
+// enumerate the replacement incarnation's identities and heartbeat that
+// session's work indefinitely, masking the replacement's death. So the same
+// closed-and-instance-token fence the claim path applies
+// (hookClaimSessionEligibility) gates every heartbeat: a closed bead, a
+// missing or superseded token, or a non-eligible state yields NO identities
+// and an error the caller reports as a miss.
+func hookHeartbeatEligibleIdentities(info session.Info, instanceToken string) ([]string, error) {
+	verdict, reason, _ := hookClaimSessionEligibility(info, strings.TrimSpace(instanceToken))
+	if verdict != hookClaimSessionEligible {
+		return nil, fmt.Errorf("session is not heartbeat-eligible: %s (a stale incarnation must not refresh a successor's claims)", reason)
+	}
 	return session.CurrentAssigneeIdentities(info), nil
+}
+
+// hookHeartbeatStartOffset picks where in the deduplicated row list a run
+// starts beating (codex round-6 P2). The rows are gathered in a deterministic
+// order, and a board large enough for the sequential bd invocations to
+// outrun hookHeartbeatTimeout would otherwise cancel the SAME tail on every
+// run, so those claims could expire while the session keeps taking turns.
+// Rotating the start by wall-clock seconds makes each run begin elsewhere, so
+// every row is refreshed within a few ticks. Overridable in tests.
+var hookHeartbeatStartOffset = func(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	return int(time.Now().Unix() % int64(n))
 }
 
 func newHookHeartbeatCmd(stdout, stderr io.Writer) *cobra.Command {
@@ -198,11 +230,12 @@ func cmdHookHeartbeat(beadID string, strict bool, stdout, stderr io.Writer) int 
 	// bead, and one bead must be heartbeated once, under its own assignee.
 	seen := make(map[string]bool)
 	var beat, refused int
+	var rows []beads.Bead
 	for _, identity := range identities {
 		// TierBoth: the durable-issue default (TierIssues) filters out
 		// ephemeral rows, and an ephemeral in_progress bead's lease needs
 		// beating exactly as much as a durable one's.
-		rows, err := store.List(beads.ListQuery{Assignee: identity, Status: "in_progress", TierMode: beads.TierBoth})
+		listed, err := store.List(beads.ListQuery{Assignee: identity, Status: "in_progress", TierMode: beads.TierBoth})
 		if err != nil {
 			// A PartialResultError carries USABLE rows: one tier failed
 			// after the other matched, or one entry failed to parse. The
@@ -216,20 +249,27 @@ func cmdHookHeartbeat(beadID string, strict bool, stdout, stderr io.Writer) int 
 				continue
 			}
 		}
-		for _, row := range rows {
+		for _, row := range listed {
 			if seen[row.ID] {
 				continue
 			}
 			seen[row.ID] = true
-			if err := store.Heartbeat(row.ID, row.Assignee); err != nil {
-				// COUNTABLE, never silent (hook-seam consult gap 4): the
-				// per-row diagnostic is this leg's whole observability.
-				fmt.Fprintf(stderr, "gc hook heartbeat: %v\n", err) //nolint:errcheck
-				refused++
-				continue
-			}
-			beat++
+			rows = append(rows, row)
 		}
+	}
+	// Rotate the start so a timeout never starves the same tail twice.
+	if off := hookHeartbeatStartOffset(len(rows)); off > 0 && off < len(rows) {
+		rows = append(rows[off:], rows[:off]...)
+	}
+	for _, row := range rows {
+		if err := store.Heartbeat(row.ID, row.Assignee); err != nil {
+			// COUNTABLE, never silent (hook-seam consult gap 4): the
+			// per-row diagnostic is this leg's whole observability.
+			fmt.Fprintf(stderr, "gc hook heartbeat: %v\n", err) //nolint:errcheck
+			refused++
+			continue
+		}
+		beat++
 	}
 	fmt.Fprintf(stdout, "heartbeat: %d refreshed, %d refused, session %s\n", beat, refused, sessionID) //nolint:errcheck
 	if beat == 0 {
