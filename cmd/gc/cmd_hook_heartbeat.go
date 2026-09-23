@@ -29,12 +29,15 @@ import (
 // KEYED ON ASSIGNED ROWS, NOT THE CLAIM STAMP (hook-seam consult, ga-56nq1a
 // 2026-09-23): `gc hook current` only sees `gc hook --claim` records, so
 // hand-dole, adoption and hand-claim — most of a named seat's board — are
-// invisible to it. The identity set here is session.AssigneeIdentities, the
-// same set orphan-detection protects: what that reader would refuse to strip,
-// this writer keeps leased. Each row is heartbeated with the row's OWN
-// assignee spelling as actor, because bd's owner check is exact string
-// equality and a cross-spelling heartbeat is refused (measured; the refusal
-// would otherwise be swallowed by the lenient exit and look armed).
+// invisible to it. The identity set here is
+// session.CurrentAssigneeIdentities: the orphan-release reader's set MINUS
+// alias_history, because a reader avoiding a wrong strip must cast wide while
+// a writer vouching for liveness must not vouch through a name a later
+// session may have reused (the asymmetry is documented on that function).
+// Each row is heartbeated with the row's OWN assignee spelling as actor,
+// because bd's owner check is exact string equality and a cross-spelling
+// heartbeat is refused (measured; the refusal would otherwise be swallowed by
+// the lenient exit and look armed).
 //
 // bd's heartbeat self-heals a missing lease for the current assignee, so this
 // single tick both ARMS unleased claims (paths that deliberately arm nothing
@@ -83,16 +86,19 @@ var hookHeartbeatStore = func(ctx context.Context) (hookHeartbeatBeadStore, erro
 
 // hookHeartbeatBeadStore is the store capability set this command needs.
 type hookHeartbeatBeadStore interface {
-	ListByAssignee(assignee, status string, limit int) ([]beads.Bead, error)
+	List(beads.ListQuery) ([]beads.Bead, error)
 	Heartbeat(id, actor string) error
 }
 
 var _ hookHeartbeatBeadStore = (*beads.BdStore)(nil)
 
-// hookHeartbeatIdentities resolves the calling session's assignment
-// identities: the session bead's own identity set (session bead id,
-// session_name, configured_named_identity, alias, alias history) — the same
-// set every liveness reader consults. Overridable in tests.
+// hookHeartbeatIdentities resolves the identifiers the calling session
+// answers to RIGHT NOW (session bead id, session_name,
+// configured_named_identity, current alias) — deliberately WITHOUT
+// alias_history, which orphan-release must include but a heartbeat must not:
+// a prior alias can be reused by a later live session, and a heartbeat
+// matched through history would keep the successor's claims looking alive
+// after the successor dies. Overridable in tests.
 var hookHeartbeatIdentities = func(sessionID string) ([]string, error) {
 	front, err := hookCurrentSessionFrontDoor()
 	if err != nil {
@@ -102,7 +108,7 @@ var hookHeartbeatIdentities = func(sessionID string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return session.AssigneeIdentities(info), nil
+	return session.CurrentAssigneeIdentities(info), nil
 }
 
 func newHookHeartbeatCmd(stdout, stderr io.Writer) *cobra.Command {
@@ -112,10 +118,11 @@ func newHookHeartbeatCmd(stdout, stderr io.Writer) *cobra.Command {
 		Use:   "heartbeat",
 		Short: "Refresh the claim leases on this session's in-progress work",
 		Long: `Refreshes the claim lease on every in_progress bead assigned to the calling
-session under any of its identities (session bead id, session name, configured
-named identity, alias and alias history — the same set orphan-detection
-protects). Each row is heartbeated under its own assignee spelling, because
-bd's owner check is exact and a cross-spelling heartbeat is refused.
+session under an identity it answers to right now (session bead id, session
+name, configured named identity, current alias — never alias history, which a
+later session may have reused). Each row is heartbeated under its own assignee
+spelling, because bd's owner check is exact and a cross-spelling heartbeat is
+refused.
 
 Intended to run detached from a per-turn hook event so leases track a session
 that is still taking turns and expire when it stops. bd self-heals a missing
@@ -186,7 +193,10 @@ func cmdHookHeartbeat(beadID string, strict bool, stdout, stderr io.Writer) int 
 	seen := make(map[string]bool)
 	var beat, refused int
 	for _, identity := range identities {
-		rows, err := store.ListByAssignee(identity, "in_progress", 0)
+		// TierBoth: the durable-issue default (TierIssues) filters out
+		// ephemeral rows, and an ephemeral in_progress bead's lease needs
+		// beating exactly as much as a durable one's.
+		rows, err := store.List(beads.ListQuery{Assignee: identity, Status: "in_progress", TierMode: beads.TierBoth})
 		if err != nil {
 			fmt.Fprintf(stderr, "gc hook heartbeat: listing %q: %v\n", identity, err) //nolint:errcheck
 			refused++
