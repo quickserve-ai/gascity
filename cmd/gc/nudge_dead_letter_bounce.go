@@ -125,7 +125,10 @@ func nudgeDeadLetterNotice(item queuedNudge) (subject, body string) {
 	fmt.Fprintf(&b, "Attempts: %d\n", item.Attempts)
 	fmt.Fprintf(&b, "Created: %s\n", nudgeDeadLetterTime(item.CreatedAt))
 	fmt.Fprintf(&b, "Dead: %s\n\n", nudgeDeadLetterTime(item.DeadAt))
-	fmt.Fprintf(&b, "Read it: gc nudge status %s\n\n", item.Agent)
+	// Point at the queue file, not `gc nudge status <agent>`: that command
+	// resolves its target through a MATERIALIZING resolver, so following the
+	// advice could create a session. Reading the file has no side effects.
+	fmt.Fprintf(&b, "Read it: .gc/nudges/state.json, the \"dead\" list, id %s\n\n", item.ID)
 	fmt.Fprintf(&b, "The nudge was not delivered. If it mattered, re-send it or mail it.\n")
 	return subject, b.String()
 }
