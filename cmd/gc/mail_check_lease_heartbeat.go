@@ -32,10 +32,16 @@ import (
 // a throttled PostToolUse leg), parked in_progress work between turns, and a
 // seat whose portfolio spans the other store.
 
-// leaseHeartbeatThrottle is the minimum interval between spawns per session:
-// one third of the ~30-minute lease TTL, so an ordinarily-turning session
-// refreshes about three times per TTL window.
-const leaseHeartbeatThrottle = 10 * time.Minute
+// leaseHeartbeatThrottle is the minimum interval between spawns per session.
+// It is derived from bd's DEFAULT lease TTL (5 minutes), not from the ~30m
+// TTL the ga-56nq1a plan raises cities to at arming time: a city that arms
+// beads.lease_heartbeat without also raising lease.ttl must still refresh
+// faster than its leases expire, or the feature strands the very claims it
+// exists to keep alive (codex round-2 P1 on PR #128). 90s gives three beats
+// per default TTL window; under a raised 30m TTL it is simply generous
+// margin. A follow-up may read the effective lease.ttl and relax the cadence;
+// the floor here must always assume the DEFAULT.
+const leaseHeartbeatThrottle = 90 * time.Second
 
 // leaseHeartbeatSpawn forks the detached heartbeat; platform-specific
 // (spawn requires setsid), overridable in tests.
