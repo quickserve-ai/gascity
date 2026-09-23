@@ -1,5 +1,0 @@
-<<<<<<<< HEAD:internal/api/dashboardspa/dist/assets/Field-CJeW8Q-v.js
-import{j as e}from"./index-x-Dd42me.js";function i({label:t,children:s,variant:a="definition"}){return a==="form"?e.jsxs("label",{className:"block space-y-1.5",children:[e.jsx("span",{className:"text-label uppercase tracking-wider text-fg-muted",children:t}),s]}):e.jsxs("div",{children:[e.jsx("dt",{className:"text-label uppercase tracking-wider text-fg-faint mb-1",children:t}),e.jsx("dd",{className:"text-body text-fg",children:s})]})}export{i as F};
-========
-import{j as e}from"./index-OU4AC0En.js";function i({label:t,children:s,variant:a="definition"}){return a==="form"?e.jsxs("label",{className:"block space-y-1.5",children:[e.jsx("span",{className:"text-label uppercase tracking-wider text-fg-muted",children:t}),s]}):e.jsxs("div",{children:[e.jsx("dt",{className:"text-label uppercase tracking-wider text-fg-faint mb-1",children:t}),e.jsx("dd",{className:"text-body text-fg",children:s})]})}export{i as F};
->>>>>>>> c13a6bb98 (review round: rebuild the committed dashboard dist after the client regen):internal/api/dashboardspa/dist/assets/Field-Ei7FXPAl.js
