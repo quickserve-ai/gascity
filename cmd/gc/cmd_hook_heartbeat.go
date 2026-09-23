@@ -1,0 +1,212 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/spf13/cobra"
+
+	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/session"
+)
+
+// gc hook heartbeat — the turn-driven lease refresher (ga-56nq1a stage 1).
+//
+// A claim carries a lease; today nothing refreshes it, so every lease in the
+// fleet expires ~5 minutes after claim and "expired" says nothing about
+// liveness (measured 2026-08-27 and re-verified 2026-09-23: heartbeat_at ==
+// granted_at on every live lease row). This command is the missing refresh
+// leg: it heartbeats every in_progress bead assigned to the calling session
+// under any of its identities, so leases track the one thing a lease is for —
+// a session that is still taking turns. It is driven by turns, not by a
+// timer, so it stops exactly when the work stops (the ga-clzquf constraint:
+// an alive-but-wedged process must not keep its claims fresh forever).
+//
+// KEYED ON ASSIGNED ROWS, NOT THE CLAIM STAMP (hook-seam consult, ga-56nq1a
+// 2026-09-23): `gc hook current` only sees `gc hook --claim` records, so
+// hand-dole, adoption and hand-claim — most of a named seat's board — are
+// invisible to it. The identity set here is session.AssigneeIdentities, the
+// same set orphan-detection protects: what that reader would refuse to strip,
+// this writer keeps leased. Each row is heartbeated with the row's OWN
+// assignee spelling as actor, because bd's owner check is exact string
+// equality and a cross-spelling heartbeat is refused (measured; the refusal
+// would otherwise be swallowed by the lenient exit and look armed).
+//
+// bd's heartbeat self-heals a missing lease for the current assignee, so this
+// single tick both ARMS unleased claims (paths that deliberately arm nothing
+// at v59) and REFRESHES armed ones.
+//
+// Protocol contract: this is a hook leg, so by default it NEVER fails the
+// turn — no session identity, no rows, store trouble, a lost lease: each
+// prints a diagnostic and exits 0. --strict inverts that for canaries and
+// the stage-2 both-cities proof, where "the heartbeat happened" is the
+// measurement and must fail loudly.
+//
+// NOT WIRED to any hook template yet: placement per the consult is a
+// detached, throttled call inside the mail-check --inject path (start of
+// turn, the only per-turn event every managed provider traverses — gc
+// installs no Stop hook anywhere), landing as its own change.
+
+// hookHeartbeatTimeout bounds the whole run. The command is invoked detached
+// from the turn (never synchronously — a bd invocation costs seconds and a
+// board can hold many rows), so this budget protects the system from a stuck
+// child, not the turn from the tick.
+const hookHeartbeatTimeout = 120 * time.Second
+
+// hookHeartbeatStore opens the bead store the calling seat's work lives in,
+// resolved the same way the seat's own bd commands resolve it: the rig store
+// when the working directory sits inside a rig, the city store otherwise.
+// Portfolios spanning BOTH stores are a recorded stage-2 gap: rows in the
+// other store are not reached from here. Overridable in tests.
+var hookHeartbeatStore = func(ctx context.Context) (hookHeartbeatBeadStore, error) {
+	cityPath, err := resolveCity()
+	if err != nil {
+		return nil, err
+	}
+	cfg, err := loadCityConfigWithoutBuiltinPackRefresh(cityPath, io.Discard)
+	if err != nil {
+		return nil, err
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+	if rig, ok := rigForDir(cfg, cityPath, cwd); ok {
+		return scopedBdStoreForRig(ctx, cityPath, cfg, rig.Path)
+	}
+	return scopedBdStoreForCity(ctx, cityPath)
+}
+
+// hookHeartbeatBeadStore is the store capability set this command needs.
+type hookHeartbeatBeadStore interface {
+	ListByAssignee(assignee, status string, limit int) ([]beads.Bead, error)
+	Heartbeat(id, actor string) error
+}
+
+var _ hookHeartbeatBeadStore = (*beads.BdStore)(nil)
+
+// hookHeartbeatIdentities resolves the calling session's assignment
+// identities: the session bead's own identity set (session bead id,
+// session_name, configured_named_identity, alias, alias history) — the same
+// set every liveness reader consults. Overridable in tests.
+var hookHeartbeatIdentities = func(sessionID string) ([]string, error) {
+	front, err := hookCurrentSessionFrontDoor()
+	if err != nil {
+		return nil, err
+	}
+	info, err := front.Get(sessionID)
+	if err != nil {
+		return nil, err
+	}
+	return session.AssigneeIdentities(info), nil
+}
+
+func newHookHeartbeatCmd(stdout, stderr io.Writer) *cobra.Command {
+	var strict bool
+	var beadID string
+	cmd := &cobra.Command{
+		Use:   "heartbeat",
+		Short: "Refresh the claim leases on this session's in-progress work",
+		Long: `Refreshes the claim lease on every in_progress bead assigned to the calling
+session under any of its identities (session bead id, session name, configured
+named identity, alias and alias history — the same set orphan-detection
+protects). Each row is heartbeated under its own assignee spelling, because
+bd's owner check is exact and a cross-spelling heartbeat is refused.
+
+Intended to run detached from a per-turn hook event so leases track a session
+that is still taking turns and expire when it stops. bd self-heals a missing
+lease for the current assignee, so this both arms unleased claims and
+refreshes armed ones.
+
+By default this never exits nonzero: a hook leg must not fail the turn, so
+every miss (no session identity, store trouble, a lease lost to another
+owner) prints a diagnostic and exits 0. Pass --strict when the heartbeat
+itself is the thing under test.`,
+		Args: cobra.NoArgs,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return exitForCode(cmdHookHeartbeat(beadID, strict, stdout, stderr))
+		},
+	}
+	cmd.Flags().BoolVar(&strict, "strict", false, "exit 1 when any heartbeat does not happen, instead of the lenient hook-leg default")
+	cmd.Flags().StringVar(&beadID, "id", "", "heartbeat only this bead, under the ambient actor (canary/proof use)")
+	return cmd
+}
+
+// cmdHookHeartbeat resolves the calling session's in_progress rows and
+// heartbeats each under its own assignee spelling. Lenient exit-0-on-miss
+// unless strict.
+func cmdHookHeartbeat(beadID string, strict bool, stdout, stderr io.Writer) int {
+	code := func(failed bool) int {
+		if strict && failed {
+			return 1
+		}
+		return 0
+	}
+	miss := func(format string, a ...any) int {
+		fmt.Fprintf(stderr, "gc hook heartbeat: "+format+"\n", a...) //nolint:errcheck
+		return code(true)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), hookHeartbeatTimeout)
+	defer cancel()
+
+	if beadID = strings.TrimSpace(beadID); beadID != "" {
+		store, err := hookHeartbeatStore(ctx)
+		if err != nil {
+			return miss("opening store: %v", err)
+		}
+		if err := store.Heartbeat(beadID, ""); err != nil {
+			return miss("%v", err)
+		}
+		fmt.Fprintf(stdout, "heartbeat %s\n", beadID) //nolint:errcheck
+		return 0
+	}
+
+	sessionID := strings.TrimSpace(os.Getenv("GC_SESSION_ID"))
+	if sessionID == "" {
+		return miss("no session identity (set $GC_SESSION_ID) and no --id; nothing to heartbeat")
+	}
+	identities, err := hookHeartbeatIdentities(sessionID)
+	if err != nil {
+		return miss("resolving session identities: %v", err)
+	}
+	if len(identities) == 0 {
+		return miss("session %s has no assignment identities; nothing to heartbeat", sessionID)
+	}
+	store, err := hookHeartbeatStore(ctx)
+	if err != nil {
+		return miss("opening store: %v", err)
+	}
+
+	// Union the rows across identities: several identities can name the same
+	// bead, and one bead must be heartbeated once, under its own assignee.
+	seen := make(map[string]bool)
+	var beat, refused int
+	for _, identity := range identities {
+		rows, err := store.ListByAssignee(identity, "in_progress", 0)
+		if err != nil {
+			fmt.Fprintf(stderr, "gc hook heartbeat: listing %q: %v\n", identity, err) //nolint:errcheck
+			refused++
+			continue
+		}
+		for _, row := range rows {
+			if seen[row.ID] {
+				continue
+			}
+			seen[row.ID] = true
+			if err := store.Heartbeat(row.ID, row.Assignee); err != nil {
+				// COUNTABLE, never silent (hook-seam consult gap 4): the
+				// per-row diagnostic is this leg's whole observability.
+				fmt.Fprintf(stderr, "gc hook heartbeat: %v\n", err) //nolint:errcheck
+				refused++
+				continue
+			}
+			beat++
+		}
+	}
+	fmt.Fprintf(stdout, "heartbeat: %d refreshed, %d refused, session %s\n", beat, refused, sessionID) //nolint:errcheck
+	return code(refused > 0)
+}

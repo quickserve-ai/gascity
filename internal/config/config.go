@@ -1434,6 +1434,15 @@ type BeadsConfig struct {
 	// (leaving git hooks untouched) and stops reinstalling them, clearing the
 	// per-write churn and the native-store gate.
 	EventHooks *bool `toml:"event_hooks,omitempty" jsonschema:"default=true"`
+	// LeaseHeartbeat arms the turn-driven lease refresher (ga-56nq1a stage
+	// 1): a managed session's start-of-turn mail check forks a detached,
+	// throttled `gc hook heartbeat`, which refreshes the claim lease on every
+	// in_progress bead assigned to that session so leases track sessions that
+	// are still taking turns. Defaults to false: each city arms it
+	// deliberately, because the refresher must be observed live in a city
+	// before anything there may key on lease expiry (reap ordering,
+	// ga-56nq1a).
+	LeaseHeartbeat bool `toml:"lease_heartbeat,omitempty"`
 	// BDCompatibility selects the bd CLI semantics Gas City may rely on.
 	// Empty defaults to "bd-1.0.4", which keeps claimable work history-backed
 	// and avoids bd ready/list flags that are unavailable or incomplete in bd

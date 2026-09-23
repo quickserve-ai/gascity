@@ -2015,6 +2015,7 @@ gc hook [agent] [flags]
 | Subcommand | Description |
 |------------|-------------|
 | [gc hook current](#gc-hook-current) | Print the work bead this session most recently claimed |
+| [gc hook heartbeat](#gc-hook-heartbeat) | Refresh the claim leases on this session's in-progress work |
 | [gc hook run](#gc-hook-run) | Run a managed hook command with a hard timeout |
 
 ## gc hook current
@@ -2045,6 +2046,33 @@ gc hook current [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--id-only` | bool |  | print only the bead id, with no surrounding context |
+
+## gc hook heartbeat
+
+Refreshes the claim lease on every in_progress bead assigned to the calling
+session under any of its identities (session bead id, session name, configured
+named identity, alias and alias history — the same set orphan-detection
+protects). Each row is heartbeated under its own assignee spelling, because
+bd's owner check is exact and a cross-spelling heartbeat is refused.
+
+Intended to run detached from a per-turn hook event so leases track a session
+that is still taking turns and expire when it stops. bd self-heals a missing
+lease for the current assignee, so this both arms unleased claims and
+refreshes armed ones.
+
+By default this never exits nonzero: a hook leg must not fail the turn, so
+every miss (no session identity, store trouble, a lease lost to another
+owner) prints a diagnostic and exits 0. Pass --strict when the heartbeat
+itself is the thing under test.
+
+```
+gc hook heartbeat [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--id` | string |  | heartbeat only this bead, under the ambient actor (canary/proof use) |
+| `--strict` | bool |  | exit 1 when any heartbeat does not happen, instead of the lenient hook-leg default |
 
 ## gc hook run
 
