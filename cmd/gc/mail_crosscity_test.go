@@ -180,6 +180,10 @@ cities = ["gastown", "westeros"]
 [[agent]]
 name = "x"
 dir = "tools"
+
+[[agent]]
+name = "y"
+dir = "projects/backend"
 `
 	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(cityTOML), 0o644); err != nil {
 		t.Fatalf("WriteFile(city.toml): %v", err)
@@ -308,6 +312,50 @@ func TestCmdMailStorelessSendAndReplyKeepAgentDirScope(t *testing.T) {
 	}
 	if !strings.Contains(string(rec), `"tools/x"`) {
 		t.Errorf("exec send payload = %s, want the local agent address tools/x", rec)
+	}
+}
+
+// A nested agent dir ("projects/backend") is addressed by its LEADING
+// segment ("projects/backend/worker" starts with "projects"): the local-scope
+// exemption must compare that segment, not the whole dir, or a storeless send
+// and a reply-origin probe refuse a local address as an unknown city.
+func TestCmdMailStorelessSendKeepsNestedAgentDirScope(t *testing.T) {
+	_, recordPath := storelessCrossCity(t)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend(nil, false, false, "human", "projects/backend/worker", "s", "b", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("storeless send to projects/backend/worker = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "unknown city") {
+		t.Errorf("stderr = %q: a nested agent-dir address was refused as an unknown city", stderr.String())
+	}
+	rec, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatalf("exec provider recorded nothing: %v", err)
+	}
+	if !strings.Contains(string(rec), `"projects/backend/worker"`) {
+		t.Errorf("exec send payload = %s, want the local agent address projects/backend/worker", rec)
+	}
+}
+
+func TestCmdMailReplyKeepsNestedAgentDirScope(t *testing.T) {
+	cityPath := writeCrossCityTestCity(t)
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	seeded, err := beadmail.New(store).Send("projects/backend/worker", "human", "hello", "from a nested agent dir")
+	if err != nil {
+		t.Fatalf("seed Send: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := cmdMailReply([]string{seeded.ID, "received"}, "", "", false, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdMailReply = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stderr.String(), "unknown city") {
+		t.Errorf("stderr = %q: a reply to a nested agent-dir origin was refused as an unknown city", stderr.String())
 	}
 }
 

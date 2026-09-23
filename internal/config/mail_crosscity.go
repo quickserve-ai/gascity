@@ -90,11 +90,27 @@ func ValidateMailCrossCity(cfg *City, cityRoot string) error {
 		if dir == "" {
 			continue
 		}
-		if seen[dir] || dir == local {
+		// A nested dir ("projects/backend") is addressed by its LEADING
+		// segment ("projects/backend/worker" starts with "projects"), and
+		// that segment is what city classification reads, so the collision
+		// is between the leading segment and a city name.
+		segment := LeadingAddressSegment(dir)
+		if seen[segment] || segment == local {
 			return fmt.Errorf("agent %q dir %q collides with a [mail.crosscity] city of the same name: the first mail-address segment must name either a local agent directory or a city, never both", cfg.Agents[i].Name, dir)
 		}
 	}
 	return nil
+}
+
+// LeadingAddressSegment returns the first "/"-delimited segment of a local
+// address prefix (a rig name or an agent dir): the part a mail address
+// starts with, and the only part city classification ever compares.
+func LeadingAddressSegment(prefix string) string {
+	prefix = strings.TrimSpace(prefix)
+	if segment, _, found := strings.Cut(prefix, "/"); found {
+		return segment
+	}
+	return prefix
 }
 
 // RigNames returns the configured rig names. Cross-city mail resolution uses
