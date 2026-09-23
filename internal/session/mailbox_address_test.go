@@ -242,3 +242,62 @@ func TestStoreMailboxAddressNotFound(t *testing.T) {
 		t.Errorf("err = %v, want beads.ErrNotFound", err)
 	}
 }
+
+func TestNonSeatSessionAnsweringToMailbox(t *testing.T) {
+	// ga-isa3j4 review round 3. The scan decides whether mail for a squatted
+	// named seat may be stored under its configured identity.
+	spec := NamedSessionSpec{Identity: "myrig/worker", SessionName: "myrig--worker"}
+	create := func(t *testing.T, store beads.Store, labels []string, md map[string]string) beads.Bead {
+		t.Helper()
+		b, err := store.Create(beads.Bead{Type: BeadType, Labels: labels, Metadata: md})
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		return b
+	}
+
+	t.Run("label-lost alias holder is found", func(t *testing.T) {
+		store := beads.NewMemStore()
+		holder := create(t, store, nil, map[string]string{"alias": spec.Identity, "session_name": "rogue", "state": "active"})
+		got, ok, err := NonSeatSessionAnsweringToMailbox(store, spec, beads.Bead{})
+		if err != nil || !ok || got.ID != holder.ID {
+			t.Fatalf("got (%q, %v, %v), want the label-lost holder %q", got.ID, ok, err, holder.ID)
+		}
+	})
+
+	t.Run("the seat's own archived bead is exempt", func(t *testing.T) {
+		store := beads.NewMemStore()
+		create(t, store, []string{LabelSession}, map[string]string{
+			NamedSessionMetadataKey:      "true",
+			NamedSessionIdentityMetadata: spec.Identity,
+			"alias":                      spec.Identity,
+			"session_name":               "old-runtime",
+			"state":                      "archived",
+		})
+		create(t, store, []string{LabelSession}, map[string]string{"session_name": spec.SessionName, "template": "other", "state": "asleep"})
+		if got, ok, err := NonSeatSessionAnsweringToMailbox(store, spec, beads.Bead{}); err != nil || ok {
+			t.Fatalf("got (%q, %v, %v), want no answer: the archived bead IS the seat", got.ID, ok, err)
+		}
+	})
+
+	t.Run("the reported conflict is always checked", func(t *testing.T) {
+		store := beads.NewMemStore()
+		// Not in the store at all: only the caller's lookup saw it.
+		conflict := beads.Bead{ID: "gc-ghost", Type: BeadType, Metadata: map[string]string{"alias": spec.Identity}}
+		got, ok, err := NonSeatSessionAnsweringToMailbox(store, spec, conflict)
+		if err != nil || !ok || got.ID != conflict.ID {
+			t.Fatalf("got (%q, %v, %v), want the reported conflict", got.ID, ok, err)
+		}
+	})
+
+	t.Run("closed beads do not answer", func(t *testing.T) {
+		store := beads.NewMemStore()
+		b := create(t, store, []string{LabelSession}, map[string]string{"alias": spec.Identity, "session_name": "rogue"})
+		if err := store.Close(b.ID); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		if got, ok, err := NonSeatSessionAnsweringToMailbox(store, spec, beads.Bead{}); err != nil || ok {
+			t.Fatalf("got (%q, %v, %v), want no answer from a closed bead", got.ID, ok, err)
+		}
+	})
+}
