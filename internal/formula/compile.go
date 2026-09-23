@@ -52,8 +52,8 @@ func CompileWithoutRuntimeVarValidation(_ context.Context, name string, searchPa
 // judged against an explicit formula_v2 setting instead of the process-wide
 // flag, for callers (gc doctor) that must evaluate a city's configuration
 // regardless of what the process last applied.
-func CompileWithoutRuntimeVarValidationForHost(_ context.Context, name string, searchPaths []string, vars map[string]string, formulaV2Enabled bool) (*Recipe, error) {
-	return compileFormula(name, searchPaths, vars, false, formulaV2Enabled)
+func CompileWithoutRuntimeVarValidationForHost(_ context.Context, name string, searchPaths []string, vars map[string]string, v2Enabled bool) (*Recipe, error) {
+	return compileFormula(name, searchPaths, vars, false, v2Enabled)
 }
 
 const explicitGraphRequirementError = `requires: formulas that use graph-only constructs must declare [requires] formula_compiler = ">=2.0.0" or the deprecated contract = "graph.v2" explicitly`
