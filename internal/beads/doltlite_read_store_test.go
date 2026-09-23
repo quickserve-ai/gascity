@@ -2259,3 +2259,75 @@ func TestDoltliteDependencySnapshotCompletenessIsGuarded(t *testing.T) {
 		t.Fatalf("cached DepList = %#v, want the snapshot's gc-child -> gc-parent", cached)
 	}
 }
+
+// ga-knhu61: the fast reader must surface await_type when the snapshot carries
+// the column, and stay serving (empty field, no error) on snapshots from
+// before it existed — same contract as the storage-flag columns.
+func TestDoltliteReadStoreReadsAwaitType(t *testing.T) {
+	openFixture := func(t *testing.T, withColumn bool) (*DoltliteReadStore, func()) {
+		t.Helper()
+		dir := t.TempDir()
+		beadsDir := filepath.Join(dir, ".beads")
+		if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+			t.Fatalf("mkdir beads dir: %v", err)
+		}
+		meta := []byte(`{"backend":"doltlite","database":"doltlite","dolt_database":"hq"}`)
+		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), meta, 0o600); err != nil {
+			t.Fatalf("write metadata: %v", err)
+		}
+		dbDir := filepath.Join(beadsDir, "doltlite")
+		if err := os.MkdirAll(dbDir, 0o755); err != nil {
+			t.Fatalf("mkdir doltlite dir: %v", err)
+		}
+		db, err := sql.Open("sqlite", filepath.Join(dbDir, "hq.db")+"?_busy_timeout=10000")
+		if err != nil {
+			t.Fatalf("open doltlite fixture db: %v", err)
+		}
+		defer db.Close() //nolint:errcheck // test cleanup
+		columns := `,
+			ephemeral INTEGER DEFAULT 0,
+			no_history INTEGER DEFAULT 0`
+		if withColumn {
+			columns += `,
+			await_type TEXT`
+		}
+		createTestDoltliteSchemaWithRowColumns(t, db, columns)
+		insertTestDoltliteIssue(t, db, "issues", "labels", "dependencies", testDoltliteIssue{
+			ID: "gc-gate", Title: "gate", Status: "open", IssueType: "gate", CreatedAt: time.Now().UTC(),
+		})
+		if withColumn {
+			if _, err := db.Exec(`UPDATE issues SET await_type = 'bead' WHERE id = 'gc-gate'`); err != nil {
+				t.Fatalf("seed await_type: %v", err)
+			}
+		}
+		backing := NewBdStore(dir, func(string, string, ...string) ([]byte, error) {
+			t.Fatal("backing bd runner should not be called")
+			return nil, nil
+		})
+		store, err := NewDoltliteReadStore(dir, backing)
+		if err != nil {
+			t.Fatalf("NewDoltliteReadStore: %v", err)
+		}
+		return store, func() { _ = store.CloseStore() }
+	}
+
+	store, closeStore := openFixture(t, true)
+	got, err := store.Get("gc-gate")
+	closeStore()
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.AwaitType != AwaitBead {
+		t.Fatalf("Get AwaitType = %q, want %q", got.AwaitType, AwaitBead)
+	}
+
+	legacy, closeLegacy := openFixture(t, false)
+	got, err = legacy.Get("gc-gate")
+	closeLegacy()
+	if err != nil {
+		t.Fatalf("Get (legacy schema): %v", err)
+	}
+	if got.AwaitType != "" {
+		t.Fatalf("legacy Get AwaitType = %q, want empty", got.AwaitType)
+	}
+}

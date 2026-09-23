@@ -1349,7 +1349,7 @@ func (s *DoltliteReadStore) queryIssueTable(query ListQuery, tables doltliteTabl
 	parentColumn := doltliteQualifiedDependsOnExpr("pc")
 	sqlText := `SELECT i.id, COALESCE(i.title, ''), COALESCE(i.status, ''), COALESCE(i.issue_type, ''), i.priority, i.created_at,
 		COALESCE(i.updated_at, ''), COALESCE(i.assignee, ''), COALESCE(i.description, ''), COALESCE(i.metadata, '{}'),
-		` + parentColumn + `, ` + tq.flags.ephemeral + `, ` + tq.flags.noHistory + `
+		` + parentColumn + `, ` + tq.flags.ephemeral + `, ` + tq.flags.noHistory + `, ` + tq.flags.awaitType + `
 		FROM ` + tables.issues + ` i` + tq.parentJoin
 	if len(tq.where) > 0 {
 		sqlText += " WHERE " + strings.Join(tq.where, " AND ")
@@ -1400,6 +1400,10 @@ func (s *DoltliteReadStore) queryIssueTable(query ListQuery, tables doltliteTabl
 type doltliteStorageFlagExprs struct {
 	ephemeral string
 	noHistory string
+	// awaitType is the SELECT expression for the gate await_type column
+	// (constant '' on snapshots predating it). Not a tier flag — it does not
+	// participate in hasColumns.
+	awaitType string
 	// hasColumns reports whether the table carries at least one storage-flag
 	// column, i.e. whether per-row tier classification is possible.
 	hasColumns bool
@@ -1431,6 +1435,14 @@ func (s *DoltliteReadStore) storageFlagExprsFor(tables doltliteTableSet) (doltli
 	if hasNoHistory {
 		flags.noHistory = "COALESCE(i.no_history, 0)"
 		flags.hasColumns = true
+	}
+	flags.awaitType = "''"
+	hasAwaitType, err := s.tableHasColumn(tables.issues, "await_type")
+	if err != nil {
+		return doltliteStorageFlagExprs{}, err
+	}
+	if hasAwaitType {
+		flags.awaitType = "COALESCE(i.await_type, '')"
 	}
 	return flags, nil
 }
@@ -1499,7 +1511,7 @@ func scanBead(rows interface{ Scan(...any) error }) (Bead, error) {
 		ephemeral   int64
 		noHistory   int64
 	)
-	if err := rows.Scan(&b.ID, &b.Title, &b.Status, &b.Type, &priority, &createdRaw, &updatedRaw, &b.Assignee, &b.Description, &metadataRaw, &b.ParentID, &ephemeral, &noHistory); err != nil {
+	if err := rows.Scan(&b.ID, &b.Title, &b.Status, &b.Type, &priority, &createdRaw, &updatedRaw, &b.Assignee, &b.Description, &metadataRaw, &b.ParentID, &ephemeral, &noHistory, &b.AwaitType); err != nil {
 		return b, err
 	}
 	if priority.Valid {
