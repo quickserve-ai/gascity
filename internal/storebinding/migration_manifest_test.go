@@ -577,7 +577,7 @@ func TestClassWitnessRecordRejectsEveryComparisonFailure(t *testing.T) {
 		})
 	}
 
-	if err := valid.Validate("gascity.storage-semantic-witness.v2"); err == nil {
+	if err := valid.Validate("gascity.storage-semantic-witness.v1"); err == nil {
 		t.Fatal("witnesses from one algorithm validated against another; digests across versions never compare")
 	}
 }
