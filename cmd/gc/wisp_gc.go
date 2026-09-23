@@ -28,9 +28,11 @@ const closeAbandonedEnv = "GC_WISP_GC_CLOSE_ABANDONED"
 
 // reapOrphansEnv is the opt-in environment variable that enables reaping of
 // orphaned closed wisp descendants. Like closeAbandonedEnv it DEFAULTS TO
-// DRY-RUN: with the variable unset (or not truthy) reapOrphanedClosedWisps only
-// counts/logs the descendants it WOULD reap and never mutates the store. Set it
-// to a truthy value ("1", "true", "yes", "on") to actually delete them.
+// DRY-RUN: with the variable unset (or not truthy) reapOrphanedClosedWisps
+// mutates nothing and performs no per-candidate leaf-ness probes; it counts
+// the aged rootless candidates it would have probed (an UNVERIFIED count, not
+// a deletion-safe one) and logs that. Set it to a truthy value ("1", "true",
+// "yes", "on") to probe and actually delete.
 const reapOrphansEnv = "GC_WISP_GC_REAP_ORPHANS"
 
 // abandonedRootCloseReason is the close_reason stamped on open workflow roots
@@ -61,12 +63,11 @@ var closeAbandonedEnforced = func() bool {
 // unbounded amount of deletion work. Package var so tests can shrink it.
 var wispGCReapOrphanBatchCap = 500
 
-// wispGCReapOrphanProbeCap bounds how many rootless candidates one sweep will
-// probe for leaf-ness (Children/DepList). Unlike wispGCReapOrphanBatchCap it
-// applies in DRY-RUN TOO: the dry run performs no deletes but still pays one
-// backend read per aged rootless candidate, so without this bound the default
-// config does unbounded reads per tick against the very backlog this reaps.
-// Package var so tests can shrink it.
+// wispGCReapOrphanProbeCap bounds how many rootless candidates one ENFORCED
+// sweep will probe for leaf-ness (Children/DepList). The dry run performs no
+// probes at all (ga-q17a2k), so the cap is enforcement-only: without it an
+// enforced sweep would pay unbounded backend reads per tick against the very
+// backlog it reaps. Package var so tests can shrink it.
 var wispGCReapOrphanProbeCap = 500
 
 // wispGCClosurePurgeBatchCap bounds how many closed-root ownership closures a
@@ -148,6 +149,24 @@ func newWispGCForConfig(cfg *config.City) wispGC {
 		mailRetentionTTL = 0
 	}
 	return newWispGC(cfg.Daemon.WispGCIntervalDuration(), cfg.Daemon.WispTTLDuration(), mailRetentionTTL)
+}
+
+// carryWispGCLastRun preserves the previous tracker's cadence position when a
+// config reload rebuilds it. Without this, every APPLIED reload re-armed an
+// immediate wisp_gc at the next tick regardless of wisp_gc_interval — measured
+// 2026-09-23: 16 of 21 runs (~76%) were reload-driven, each paying the full
+// in-tick sweep, so config churn multiplied the ga-q17a2k dispatch freezes and
+// raising the interval could not mitigate (the applying reload re-armed a run
+// itself). A previously-disabled tracker (nil prev) keeps the prompt first
+// run, same as process start; the NEW config's interval still governs, so a
+// reload that shortens the cadence takes effect against the carried position.
+func carryWispGCLastRun(prev, next wispGC) wispGC {
+	p, pok := prev.(*memoryWispGC)
+	n, nok := next.(*memoryWispGC)
+	if pok && nok && p != nil && n != nil {
+		n.lastRun = p.lastRun
+	}
+	return next
 }
 
 func (m *memoryWispGC) shouldRun(now time.Time) bool {
@@ -344,12 +363,14 @@ func closedWispGCEntries(store beads.Store) ([]beads.Bead, error) {
 // path could reach again, and one that is a subtree MEMBER stays SKIPPED rather
 // than being stripped from a live parent. A rootless row that is not a plain
 // task is an unrecognized shape and also stays SKIPPED. The leaf-ness probes
-// cost backend reads even in dry-run, so wispGCReapOrphanProbeCap bounds how
-// many of them one sweep performs regardless of enforcement.
+// cost backend reads, so wispGCReapOrphanProbeCap bounds how many of them one
+// enforced sweep performs.
 //
 // With reapOrphansEnforced() false (the dry-run default, GC_WISP_GC_REAP_ORPHANS
-// unset) the function mutates nothing: it counts the would-be reaps and logs a
-// dry-run notice. Per-bead delete errors are joined and never abort the sweep.
+// unset) the function mutates nothing AND probes nothing: it counts the aged
+// rootless candidates it left unprobed and logs that count as unverified —
+// not as rows it would reap, since leaf-ness was never determined. Per-bead
+// delete errors are joined and never abort the sweep.
 // The batch cap bounds reaps per sweep so the backlog drains over multiple ticks.
 func reapOrphanedClosedWisps(store beads.Store, cutoff time.Time, batchCap int) (int, error) {
 	if store == nil {
@@ -378,6 +399,10 @@ func reapOrphanedClosedWisps(store beads.Store, cutoff time.Time, batchCap int) 
 	// no deletes but still pays those backend reads per aged rootless candidate.
 	probed := 0
 	probeTruncated := false
+	// rootlessUnprobed counts the aged rootless leaf-candidates a DRY-RUN
+	// sweep declined to probe (ga-q17a2k): the dry run's report of this
+	// population is a candidate count, not a proven-leaf count.
+	rootlessUnprobed := 0
 	var deleteErr error
 	for _, c := range candidates {
 		// The batch cap bounds DELETION ATTEMPTS per sweep — counting failed
@@ -416,10 +441,25 @@ func reapOrphanedClosedWisps(store beads.Store, cutoff time.Time, batchCap int) 
 			if strings.TrimSpace(c.ParentID) != "" {
 				continue
 			}
-			// Every remaining rootless candidate costs backend reads whether or
-			// not this sweep enforces, so the probe budget is checked before the
-			// first of them. break, not continue: the rest of the candidate
-			// slice cannot be probed either, so walking it buys nothing.
+			// DRY-RUN PAYS NO PROBES (ga-q17a2k). The leaf-ness probes below
+			// are two backend reads per candidate, and on a store where every
+			// closed task wisp is rootless (51k of 51k on hq, 2026-09-23) a
+			// probe-cap-sized prefix of them re-walks EVERY sweep — nothing
+			// leaves the candidate set, so the same rows are re-probed
+			// forever. Measured: p50 13s -> 223-290s per sweep at the swap
+			// that introduced the probes, ~25% of dispatch wall time, buying
+			// only a dry-run counter. Precision about leaf-ness is worth two
+			// reads per row only when enforcement can spend it on a delete;
+			// the dry run reports how many rootless candidates it left
+			// unprobed instead.
+			if !enforce {
+				rootlessUnprobed++
+				continue
+			}
+			// Every remaining rootless candidate costs backend reads, so the
+			// probe budget is checked before the first of them. break, not
+			// continue: the rest of the candidate slice cannot be probed
+			// either, so walking it buys nothing.
 			if wispGCReapOrphanProbeCap > 0 && probed >= wispGCReapOrphanProbeCap {
 				probeTruncated = true
 				break
@@ -514,6 +554,10 @@ func reapOrphanedClosedWisps(store beads.Store, cutoff time.Time, batchCap int) 
 
 	if probeTruncated {
 		log.Printf("wisp gc: rootless-orphan scan stopped after %d probes (cap); the reported count is a floor, not the full eligible backlog", probed)
+	}
+
+	if rootlessUnprobed > 0 {
+		log.Printf("wisp gc: %d aged rootless candidate(s) not probed for leaf-ness (dry-run performs no per-candidate reads; set %s=1 to probe and reap)", rootlessUnprobed, reapOrphansEnv)
 	}
 
 	if !enforce {

@@ -122,6 +122,7 @@ unless the row names how they map to the canonical projection.
 | SESSION-START-007 | Template override safety | Template overrides are rejected for running sessions, recent wake-in-flight sessions, and pending create claims. Suspended sessions, old wake timestamps, and failed-create states can be updated where tests allow. | `internal/session/manager_test.go` |
 | SESSION-START-008 | Parallel lifecycle start | Independent start candidates can begin in the same wave before dependent sessions. A failed dependency blocks its dependent but not unrelated siblings. | `cmd/gc/session_lifecycle_parallel_test.go` |
 | SESSION-START-009 | Empty resume identity recovery | When startup dies after the persisted `session_key` clears but the launch command still carries a resume shape, normal and runtime-only starts strip that shape and retry once as fresh. If the command has no resume shape, they do not relaunch it and return the original startup error. | `internal/session/chat_empty_session_key_test.go` |
+| SESSION-START-010 | Machinery wait await_type | A session wait bead declares a non-human `await_type` on the create itself (timer kinds map to `timer`, every other kind to `bead`), and a retried closed wait re-derives it from the wait kind rather than copying the stored value, so waits minted before the field existed cannot page a human on retry. | `internal/session/wait_awaittype_test.go` |
 
 ### Reconciler, Pools, And Scaling
 
