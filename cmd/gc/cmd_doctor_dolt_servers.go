@@ -322,7 +322,7 @@ func (c *doltServersCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 			// An unresolved config may have named this city's store, so no
 			// path-based ownership may account for it; only a match to a
 			// rig's own layout (above: the managed one) identifies it.
-			case id.configUnread && !(ok && !hq && strings.HasSuffix(c.rigStoreKey(root, id), rigStoreKeySuffix)):
+			case id.configUnread && (!ok || hq || !strings.HasSuffix(c.rigStoreKey(root, id), rigStoreKeySuffix)):
 				unreadConfig = append(unreadConfig, p)
 			case ok && !hq:
 				key := c.rigStoreKey(root, id)
