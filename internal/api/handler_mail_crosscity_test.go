@@ -193,8 +193,8 @@ func TestMailReplyCrossCityFailsClosedWhenOriginUnreadable(t *testing.T) {
 	body := `{"from":"worker","subject":"re: cutover","body":"received"}`
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, newPostRequest(cityURL(state, "/mail/")+seeded.ID+"/reply", bytes.NewBufferString(body)))
-	if rec.Code == http.StatusCreated || rec.Code == http.StatusOK {
-		t.Fatalf("reply status = %d, want refusal when the origin cannot be read; body: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("reply status = %d, want 500 (origin unreadable is an internal fail-closed, not a client error); body: %s", rec.Code, rec.Body.String())
 	}
 	if !strings.Contains(rec.Body.String(), "cross_city_origin_unverified") {
 		t.Errorf("body = %q, want the cross_city_origin_unverified refusal", rec.Body.String())
@@ -222,8 +222,8 @@ func TestMailReplyCrossCityUnknownOriginRefused(t *testing.T) {
 	body := `{"from":"worker","subject":"re: cutover","body":"received"}`
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, newPostRequest(cityURL(state, "/mail/")+seeded.ID+"/reply", bytes.NewBufferString(body)))
-	if rec.Code == http.StatusCreated || rec.Code == http.StatusOK {
-		t.Fatalf("reply status = %d, want unknown-city refusal; body: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("reply status = %d, want 400 (a reply the roster disallows is a client error); body: %s", rec.Code, rec.Body.String())
 	}
 	if !strings.Contains(rec.Body.String(), "unknown city") || !strings.Contains(rec.Body.String(), "gastwn") {
 		t.Errorf("body = %q, want typed unknown-city refusal naming gastwn", rec.Body.String())
