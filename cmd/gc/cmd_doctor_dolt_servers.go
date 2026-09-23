@@ -79,6 +79,8 @@ type doltServersCheck struct {
 	// recordedPID reads the managed runtime's pid file without side effects,
 	// with the time the file was written (zero when unknown).
 	recordedPID func(layout managedDoltRuntimeLayout) (int, time.Time)
+	// readFile reads a server's --config YAML to find the store it names.
+	readFile func(path string) ([]byte, error)
 	// exactArgv reports whether a process's argv came from an exact source
 	// (/proc cmdline) rather than a flattened `ps` line whose values can
 	// swallow the flags after them.
@@ -116,6 +118,7 @@ func newDoltServersCheck(cityPath string, cfg *config.City) *doltServersCheck {
 		args:            processArgs,
 		recordedPID:     readManagedDoltPIDFile,
 		exactArgv:       argvIsExact,
+		readFile:        os.ReadFile,
 		localPolicy:     func() (doltLocalPolicy, error) { return localServerPolicy(cityPath, cfg) },
 		activeTestRoots: func() []string { return discoverActiveTestRoots(home, temp) },
 		startIdentity:   readProcStartIdentity,
@@ -190,12 +193,61 @@ func (c *doltServersCheck) identifyUncached(p DoltProcInfo) doltServerIdentity {
 		return id
 	}
 	if cfg != "" {
-		return c.anchored(p.PID, cfg, "config")
+		id := c.anchored(p.PID, cfg, "config")
+		// The config names the store: gc's own writer makes its data_dir
+		// authoritative (cmd_dolt_config.go). A copied config pointing at this
+		// city's store is that store's server, whatever the file is called.
+		if dd := c.configDataDir(id.path); dd != "" {
+			ddID := c.anchored(p.PID, dd, "data-dir")
+			if ddID.path != "" {
+				ddID.config = id.path
+				return ddID
+			}
+		}
+		return id
 	}
 	if cwd, ok := c.cwd(p.PID); ok && cwd != "" {
 		return doltServerIdentity{path: cwd, source: "cwd"}
 	}
 	return doltServerIdentity{}
+}
+
+// configDataDir reads the top-level data_dir from a dolt config YAML. Any read
+// or parse failure returns "" and the config path stays the identity.
+func (c *doltServersCheck) configDataDir(configPath string) string {
+	if configPath == "" || c.readFile == nil {
+		return ""
+	}
+	data, err := c.readFile(configPath)
+	if err != nil {
+		return ""
+	}
+	return yamlTopLevelScalar(data, "data_dir")
+}
+
+// yamlTopLevelScalar returns an unindented `key: value` scalar, unquoted. It
+// covers what gc writes (data_dir: %q) and plain or single-quoted values.
+func yamlTopLevelScalar(data []byte, key string) string {
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.HasPrefix(line, key+":") {
+			continue
+		}
+		v := strings.TrimSpace(strings.TrimPrefix(line, key+":"))
+		if i := strings.Index(v, " #"); i >= 0 && !strings.HasPrefix(v, "\"") && !strings.HasPrefix(v, "'") {
+			v = strings.TrimSpace(v[:i])
+		}
+		switch {
+		case strings.HasPrefix(v, "\""):
+			if u, err := strconv.Unquote(v); err == nil {
+				return u
+			}
+			return ""
+		case strings.HasPrefix(v, "'") && strings.HasSuffix(v, "'") && len(v) >= 2:
+			return strings.ReplaceAll(v[1:len(v)-1], "''", "'")
+		}
+		return v
+	}
+	return ""
 }
 
 // flattenedFlagValue recovers a flag's value from a flat command line
