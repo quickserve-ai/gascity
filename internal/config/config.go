@@ -1860,6 +1860,9 @@ type MailConfig struct {
 	// purge. The sweep distinguishes the two: empty leaves it at its own
 	// 60-minute default, while "0" disables its mail-close phase.
 	RetentionTTL string `toml:"retention_ttl,omitempty"`
+	// CrossCity enables city-qualified mail addressing (<city>/<address>).
+	// Absent means disabled: every recipient resolves exactly as today.
+	CrossCity *MailCrossCityConfig `toml:"crosscity,omitempty"`
 }
 
 // RetentionTTLDuration parses RetentionTTL as a Go time.Duration. Empty or
