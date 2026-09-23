@@ -1143,7 +1143,41 @@ func resolveBdScopeTarget(cfg *config.City, cityPath, rigName string, args []str
 	if gcRigDiscarded != "" {
 		fmt.Fprintf(stderr, "gc bd: warning: GC_RIG=%q does not name a bound rig in this city; ignoring it and answering from the %s store instead (the same value via --rig would exit 1)\n", gcRigDiscarded, scopeLabel(target)) //nolint:errcheck // best-effort stderr
 	}
+	if target.ScopeKind != "rig" {
+		dir := extractBdDirectoryFlag(args)
+		if dir == "" {
+			dir, _ = os.Getwd()
+		}
+		if rigName, ok := bdRigAgentDirFor(cfg, cityPath, dir); ok {
+			fmt.Fprintf(stderr, "gc bd: warning: %s is a %q agent dir, not a rig dir — this answers from the %s store, so a %s bead reads as NOT FOUND or an empty list here. Pass --rig %s for that rig's beads (ga-8n4zpl)\n", dir, rigName, scopeLabel(target), rigName, rigName) //nolint:errcheck // best-effort stderr
+		}
+	}
 	return target, nil
+}
+
+// bdRigAgentDirFor reports the bound rig whose agent work dir contains dir,
+// under the <city>/.gc/agents/<rig>/<name> layout. That path looks like the
+// rig to anyone standing in it, yet nothing routes by it: an agent dir is not
+// a rig dir, so bd from there resolves to the city store and a rig-prefixed
+// query answers a confident EMPTY (ga-8n4zpl: twice on 2026-09-15, one of them
+// "no live park" against 37 parked beads). Only the WARNING keys on this
+// layout; routing is untouched, so a city laid out differently just gets no
+// warning.
+func bdRigAgentDirFor(cfg *config.City, cityPath, dir string) (string, bool) {
+	if strings.TrimSpace(dir) == "" {
+		return "", false
+	}
+	agentsRoot := normalizePathForCompare(filepath.Join(cityPath, ".gc", "agents"))
+	dir = normalizePathForCompare(dir)
+	if !pathWithinScope(dir, agentsRoot) || dir == agentsRoot {
+		return "", false
+	}
+	first, _, _ := strings.Cut(strings.TrimPrefix(dir[len(agentsRoot):], "/"), "/")
+	rig, ok := rigByName(cfg, first)
+	if !ok || strings.TrimSpace(rig.Path) == "" {
+		return "", false
+	}
+	return rig.Name, true
 }
 
 // bdScopeDisclosureVerbs are the bd read-only passthrough verbs whose
