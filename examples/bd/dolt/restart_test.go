@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 const restartScript = "commands/restart/run.sh"
@@ -14,6 +15,11 @@ const restartScript = "commands/restart/run.sh"
 // writeFakeBeadsBDForRestart writes a stub gc-beads-bd that records each
 // invocation's first argument and exits with the code specified for that
 // op. ops that aren't in opExitCodes exit 0.
+//
+// No ENOSPC helper is written beside the stub, so run.sh resolves the real
+// assets/scripts/dolt-enospc.sh from the bd pack (via GC_PACK_DIR), exactly as
+// it does behind the city shim. A hand-copied fixture here could drift from
+// the guard it stands in for.
 func writeFakeBeadsBDForRestart(t *testing.T, cityPath string, opExitCodes map[string]int) string {
 	t.Helper()
 	scriptDir := filepath.Join(cityPath, ".gc", "scripts")
@@ -34,18 +40,6 @@ esac
 	if err := os.WriteFile(filepath.Join(scriptDir, "gc-beads-bd.sh"), []byte(body), 0o755); err != nil {
 		t.Fatalf("write fake bd script: %v", err)
 	}
-	enospcHelper := `#!/bin/sh
-recovery_should_skip_due_to_enospc() {
-  [ -n "${LOG_FILE:-}" ] && [ -r "$LOG_FILE" ] || return 1
-  tail -n 1000 "$LOG_FILE" 2>/dev/null \
-    | grep -qE 'no space left on device|copy_file_range:.*no space|ENOSPC' \
-    || return 1
-  return 0
-}
-`
-	if err := os.WriteFile(filepath.Join(scriptDir, "dolt-enospc.sh"), []byte(enospcHelper), 0o644); err != nil {
-		t.Fatalf("write fake enospc helper: %v", err)
-	}
 	return logPath
 }
 
@@ -54,11 +48,17 @@ func runRestart(t *testing.T, cityPath, root string, port int) ([]byte, error) {
 	return runRestartWithEnv(t, cityPath, root, []string{fmt.Sprintf("GC_DOLT_PORT=%d", port)})
 }
 
+// runShellScript runs script under interpreter with exactly env and returns
+// its combined output. The restart tests and the ENOSPC guard harness share it.
+func runShellScript(interpreter string, env []string, script string, args ...string) ([]byte, error) {
+	cmd := exec.Command(interpreter, append([]string{script}, args...)...)
+	cmd.Env = env
+	return cmd.CombinedOutput()
+}
+
 func runRestartWithEnv(t *testing.T, cityPath, root string, extraEnv []string, args ...string) ([]byte, error) {
 	t.Helper()
-	script := filepath.Join(root, restartScript)
-	cmd := exec.Command("sh", append([]string{script}, args...)...)
-	cmd.Env = append(filteredEnv(
+	env := append(filteredEnv(
 		"PATH", "GC_DOLT_HOST", "GC_DOLT_PORT", "GC_DOLT_USER",
 		"GC_DOLT_PASSWORD", "GC_DOLT_DATA_DIR", "GC_CITY_PATH", "GC_PACK_DIR",
 		"GC_CITY_RUNTIME_DIR", "GC_PACK_STATE_DIR", "GC_DOLT_LOG_FILE",
@@ -69,9 +69,13 @@ func runRestartWithEnv(t *testing.T, cityPath, root string, extraEnv []string, a
 		"GC_PACK_DIR="+root,
 		"GC_DOLT_USER=root",
 		"GC_DOLT_PASSWORD=",
+		// The ENOSPC guard measures the temp volume with the real df. A 1 MB
+		// floor still exercises that measurement (an unreadable df refuses)
+		// without making these tests depend on the runner's free space.
+		"GC_DOLT_RESTART_MIN_FREE_MB=1",
 	)
-	cmd.Env = append(cmd.Env, extraEnv...)
-	return cmd.CombinedOutput()
+	env = append(env, extraEnv...)
+	return runShellScript("sh", env, filepath.Join(root, restartScript), args...)
 }
 
 func TestRestartCallsStopThenStart_HappyPath(t *testing.T) {
@@ -193,6 +197,25 @@ func TestRestartPropagatesStartFailureWithDiagnostic(t *testing.T) {
 	}
 }
 
+// writeDoltLogForRestart writes the fake Dolt server log restart consults, at
+// the default pack-state path.
+func writeDoltLogForRestart(t *testing.T, cityPath, content string) {
+	t.Helper()
+	logPath := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "dolt.log")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		t.Fatalf("mkdir dolt log dir: %v", err)
+	}
+	if err := os.WriteFile(logPath, []byte(content), 0o644); err != nil {
+		t.Fatalf("write dolt log: %v", err)
+	}
+}
+
+// doltENOSPCLogLine renders a Dolt logrus ENOSPC line stamped at ts, in the
+// RFC3339-with-offset form Dolt writes.
+func doltENOSPCLogLine(ts time.Time) string {
+	return fmt.Sprintf("time=%q level=error msg=\"error writing chunk\" error=\"write journal.idx: no space left on device\"\n", ts.Format(time.RFC3339))
+}
+
 func TestRestartRefusesRecentENOSPCUnlessForced(t *testing.T) {
 	root := repoRoot(t)
 	port, cleanup := startReachableTCPListener(t)
@@ -200,20 +223,24 @@ func TestRestartRefusesRecentENOSPCUnlessForced(t *testing.T) {
 
 	cityPath := t.TempDir()
 	bdLog := writeFakeBeadsBDForRestart(t, cityPath, map[string]int{"stop": 0, "start": 0})
-	logPath := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "dolt.log")
-	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
-		t.Fatalf("mkdir dolt log dir: %v", err)
-	}
-	if err := os.WriteFile(logPath, []byte("fatal: no space left on device\n"), 0o644); err != nil {
-		t.Fatalf("write dolt log: %v", err)
-	}
+	recent := time.Now().Add(-10 * time.Minute).Truncate(time.Second)
+	writeDoltLogForRestart(t, cityPath, doltENOSPCLogLine(recent))
 
 	out, err := runRestart(t, cityPath, root, port)
 	if err == nil {
 		t.Fatalf("gc dolt restart unexpectedly ignored recent ENOSPC:\n%s", out)
 	}
-	if !strings.Contains(string(out), "recent Dolt log shows ENOSPC") {
-		t.Fatalf("restart did not explain ENOSPC refusal; output:\n%s", out)
+	for _, want := range []string{
+		"gc dolt restart: refusing restart: Dolt log shows 1 ENOSPC line(s) stamped within the last 60 min",
+		"newest " + recent.Format(time.RFC3339),
+		"live free space: ",
+	} {
+		if !strings.Contains(string(out), want) {
+			t.Fatalf("restart refusal missing %q; output:\n%s", want, out)
+		}
+	}
+	if strings.Contains(string(out), "--force") {
+		t.Fatalf("restart refusal must not advertise --force; output:\n%s", out)
 	}
 	if data, err := os.ReadFile(bdLog); err == nil && strings.TrimSpace(string(data)) != "" {
 		t.Fatalf("restart invoked gc-beads-bd despite ENOSPC refusal; ops log:\n%s\noutput:\n%s", data, out)
@@ -231,6 +258,80 @@ func TestRestartRefusesRecentENOSPCUnlessForced(t *testing.T) {
 	if got != "stop start" {
 		t.Fatalf("expected forced restart to call stop then start, got %q\noutput:\n%s", got, out)
 	}
+}
+
+// TestRestartProceedsPastStaleENOSPCEvidence pins the time bound: ENOSPC lines
+// from 8 days ago on a healthy disk must not block a restart. The pre-fix
+// guard counted any ENOSPC in the last 1000 log lines, which a quiet log
+// stretched across 8 days.
+func TestRestartProceedsPastStaleENOSPCEvidence(t *testing.T) {
+	root := repoRoot(t)
+	port, cleanup := startReachableTCPListener(t)
+	defer cleanup()
+
+	cityPath := t.TempDir()
+	bdLog := writeFakeBeadsBDForRestart(t, cityPath, map[string]int{"stop": 0, "start": 0})
+	writeDoltLogForRestart(t, cityPath, doltENOSPCLogLine(time.Now().Add(-8*24*time.Hour)))
+
+	out, err := runRestart(t, cityPath, root, port)
+	if err != nil {
+		t.Fatalf("gc dolt restart refused on 8-day-old ENOSPC evidence: %v\n%s", err, out)
+	}
+	data, err := os.ReadFile(bdLog)
+	if err != nil {
+		t.Fatalf("read fake bd log: %v", err)
+	}
+	got := strings.Join(strings.Fields(string(data)), " ")
+	if got != "stop start" {
+		t.Fatalf("expected ops in order 'stop start' past stale ENOSPC, got %q\noutput:\n%s", got, out)
+	}
+}
+
+// TestRestartRefusesENOSPCLineWithoutTimestamp pins the fail-closed rule: an
+// ENOSPC line whose stamp cannot be parsed counts as recent, and the refusal
+// says so rather than passing it silently.
+func TestRestartRefusesENOSPCLineWithoutTimestamp(t *testing.T) {
+	root := repoRoot(t)
+	port, cleanup := startReachableTCPListener(t)
+	defer cleanup()
+
+	cityPath := t.TempDir()
+	bdLog := writeFakeBeadsBDForRestart(t, cityPath, map[string]int{"stop": 0, "start": 0})
+	writeDoltLogForRestart(t, cityPath, "fatal: no space left on device\n")
+
+	out, err := runRestart(t, cityPath, root, port)
+	if err == nil {
+		t.Fatalf("gc dolt restart passed an unstamped ENOSPC line:\n%s", out)
+	}
+	if !strings.Contains(string(out), "unparseable timestamp") {
+		t.Fatalf("restart refusal did not name the unparseable timestamp; output:\n%s", out)
+	}
+	if data, err := os.ReadFile(bdLog); err == nil && strings.TrimSpace(string(data)) != "" {
+		t.Fatalf("restart invoked gc-beads-bd despite ENOSPC refusal; ops log:\n%s\noutput:\n%s", data, out)
+	}
+}
+
+// TestDoltENOSPCGuardShellHarness runs test/dolt_enospc_guard_test.sh, the
+// shell harness for the Dolt ENOSPC restart guard (assets/scripts/
+// dolt-enospc.sh in the bd pack) and both of its callers: gc dolt restart and
+// gc-beads-bd op_recover. The harness drives them with a fake Dolt log and a
+// stubbed df, including the control that the pre-fix detector refuses on an
+// 8-day-old log the current guard lets through. Running it from here puts it
+// in the unit sweep CI already runs.
+func TestDoltENOSPCGuardShellHarness(t *testing.T) {
+	harness := filepath.Join(repoRoot(t), "..", "..", "..", "test", "dolt_enospc_guard_test.sh")
+	if _, err := os.Stat(harness); err != nil {
+		t.Fatalf("stat ENOSPC guard harness: %v", err)
+	}
+	env := append(filteredEnv("PATH", "TMPDIR"),
+		"PATH="+os.Getenv("PATH"),
+		"TMPDIR="+t.TempDir(),
+	)
+	out, err := runShellScript("bash", env, harness)
+	if err != nil {
+		t.Fatalf("ENOSPC guard harness failed: %v\n%s", err, out)
+	}
+	t.Logf("ENOSPC guard harness:\n%s", out)
 }
 
 // TestRestartTreatsLoopbackAndWildcardHostsAsLocalManaged pins the P0.5
