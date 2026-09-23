@@ -1,6 +1,7 @@
 package doctor
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -16,11 +17,20 @@ import (
 // compatibility diagnostics across the visible city and rig formula layers.
 type FormulaRequirementsCheck struct {
 	cfg *config.City
+	// compile compiles a formula by name the way dispatch does. It settles a
+	// disabled_reason whose own requirement is satisfiable: expansions and
+	// aspects add their requirements only at compile time.
+	compile func(name string, searchPaths []string) error
 }
 
 // NewFormulaRequirementsCheck creates a formula requirements doctor check.
 func NewFormulaRequirementsCheck(cfg *config.City, _ string) *FormulaRequirementsCheck {
-	return &FormulaRequirementsCheck{cfg: cfg}
+	return &FormulaRequirementsCheck{cfg: cfg, compile: compileFormulaForRequirements}
+}
+
+func compileFormulaForRequirements(name string, searchPaths []string) error {
+	_, err := formula.CompileWithoutRuntimeVarValidation(context.Background(), name, searchPaths, nil)
+	return err
 }
 
 // Name returns the check identifier shown by gc doctor.
@@ -161,13 +171,37 @@ func (c *FormulaRequirementsCheck) collectIssues() ([]formulaRequirementIssue, [
 					message:  hostErr.Error(),
 				})
 			case reason != "":
-				addIssue(formulaRequirementIssue{
-					severity: StatusWarning,
-					scope:    scope.name,
-					formula:  resolved.Formula,
-					path:     path,
-					message:  fmt.Sprintf("declares disabled_reason %q but its requirement is satisfiable here, so the formula is DISPATCHABLE; make the requirement unsatisfiable or remove the marker", reason),
-				})
+				// Its own requirement is satisfiable, but an expansion or
+				// aspect it composes may add one that is not: only a compile
+				// can say whether dispatch would refuse it.
+				var compileErr error
+				if c.compile != nil {
+					compileErr = c.compile(resolved.Formula, scope.paths)
+				}
+				switch {
+				case formula.IsUnsatisfiedRequirement(compileErr):
+					note := fmt.Sprintf("intentionally disabled %s formula %q (%s), by a composed requirement: %s", scope.name, resolved.Formula, path, reason)
+					if _, ok := seenDisabled[note]; !ok {
+						seenDisabled[note] = struct{}{}
+						disabled = append(disabled, note)
+					}
+				case compileErr != nil:
+					addIssue(formulaRequirementIssue{
+						severity: StatusWarning,
+						scope:    scope.name,
+						formula:  resolved.Formula,
+						path:     path,
+						message:  fmt.Sprintf("declares disabled_reason %q; its own requirement is satisfiable here, and compiling it to check composed requirements failed: %v", reason, compileErr),
+					})
+				default:
+					addIssue(formulaRequirementIssue{
+						severity: StatusWarning,
+						scope:    scope.name,
+						formula:  resolved.Formula,
+						path:     path,
+						message:  fmt.Sprintf("declares disabled_reason %q but it compiles here, so the formula is DISPATCHABLE; make the requirement unsatisfiable or remove the marker", reason),
+					})
+				}
 			}
 		}
 	}
