@@ -17,9 +17,9 @@ expanded-config-load
 implicit-import-cache
 deprecated-attachment-fields
 nudge-unconfirmed
+dolt-servers
 dolt-topology
 dolt-drift
-dolt-servers
 config-valid
 legacy-suspended-field
 rollout:beads.conditional_writes
