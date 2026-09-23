@@ -1030,6 +1030,21 @@ func TestResolveSessionIDWithConfig_ConfigNameNotFoundNamesTheSessionIdentity(t 
 		t.Fatalf("err = %q, want it to name the session identity qcore/archer", err)
 	}
 
+	// Review 2026-09-23: a target that IS a configured named-session identity
+	// (not materialized) must not be pointed at a sibling on the same template.
+	shared := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents:    []config.Agent{{Name: "worker", StartCommand: "true"}},
+		NamedSessions: []config.NamedSession{
+			{Template: "worker"},
+			{Name: "w2", Template: "worker"},
+		},
+	}
+	_, err = resolveSessionIDWithConfig(t.TempDir(), shared, store, "worker")
+	if err == nil || strings.Contains(err.Error(), "agent config name") {
+		t.Fatalf("err = %v, want no config-name hint for a configured named-session identity", err)
+	}
+
 	_, err = resolveSessionIDWithConfig(t.TempDir(), cfg, store, "qcore/nobody")
 	if !errors.Is(err, session.ErrSessionNotFound) || strings.Contains(err.Error(), "named session is") {
 		t.Fatalf("err = %v, want a plain not-found for a name that is no config name", err)
