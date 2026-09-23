@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -107,5 +108,29 @@ func TestReadFilteredTypesReadsSeveralTypesInOneWalk(t *testing.T) {
 	}
 	if _, err := ReadFilteredTypes(path, Filter{}); err == nil {
 		t.Error("no types must be refused, not read as every type")
+	}
+}
+
+// Codex on #136: a writer other than encoding/json may escape a plain type.
+// Such a line must still be decoded, not rejected by the literal needle.
+func TestReadFilteredTypePrefilterKeepsEscapedTypes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+	// "order" + backslash + "u002efailed": the dot spelled as a JSON escape.
+	escapedType := "order" + string(rune(92)) + "u002efailed"
+	if !strings.ContainsRune(escapedType, 92) {
+		t.Fatal("fixture lost its escape")
+	}
+	active := `{"seq":1,"type":"` + escapedType + `","ts":"2026-09-21T00:00:00Z","actor":"t"}` + "\n" +
+		`{"seq":2,"type":"order.completed","ts":"2026-09-21T00:00:00Z","actor":"t"}` + "\n"
+	if err := os.WriteFile(path, []byte(active), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadFiltered(path, Filter{Type: OrderFailed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Seq != 1 {
+		t.Fatalf("escaped order.failed must match, got %+v", got)
 	}
 }
