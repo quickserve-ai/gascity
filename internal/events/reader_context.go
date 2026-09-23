@@ -2,6 +2,7 @@ package events
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -73,9 +74,13 @@ func readFilteredTrackedContext(ctx context.Context, path string, filter Filter)
 	}
 	defer f.Close() //nolint:errcheck // read-only file
 
+	needle := typeNeedle(filter)
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024) // handle lines up to 1MB
 	for scanner.Scan() {
+		if needle != nil && !bytes.Contains(scanner.Bytes(), needle) {
+			continue
+		}
 		var e Event
 		if err := json.Unmarshal(scanner.Bytes(), &e); err != nil {
 			continue // skip malformed lines
