@@ -44,11 +44,19 @@ const (
 	// three passes, so it was abandoned at a 5-minute budget at load ~30.
 	// Eight days in one prefiltered walk measured 19-21s at load ~19.
 	//
-	// An order that fires too rarely for threshold runs to fit in the window,
-	// and failed at every run the window holds, is reported as such (a
-	// Warning) rather than as under threshold: the check cannot see the
-	// streak it would need.
+	// The window alone cannot settle an order whose every outcome in it
+	// failed, fewer than threshold times: how often an order ran is not
+	// bounded by its schedule (a controller that was down, or a run holding
+	// the single-flight gate), so its streak can reach back past any fixed
+	// window. Those orders, and only those, are looked back past the window
+	// for (lookBack).
 	orderOutcomeLookback = 8 * 24 * time.Hour
+
+	// orderOutcomeLookBackBudget bounds the look-back past the window, cut to
+	// two thirds of the time left when the runner will abandon the check
+	// sooner (sizingBudget). An order the look-back cannot settle in time is
+	// reported as undetermined, a Warning, never as OK.
+	orderOutcomeLookBackBudget = 20 * time.Second
 )
 
 // nearControllerStart reports whether ts falls within grace after any controller
@@ -158,6 +166,9 @@ type OrderOutcomeHealthyCheck struct {
 	threshold int
 	grace     time.Duration
 	now       func() time.Time
+	// walkBack reads the log newest-first for the look-back past the window;
+	// a seam so tests can observe whether the look-back ran.
+	walkBack func(path string, filter events.Filter, types []string, fn func([]events.Event, time.Time) bool) error
 }
 
 // NewOrderOutcomeHealthyCheck creates the repeated-order-failure check.
@@ -168,6 +179,7 @@ func NewOrderOutcomeHealthyCheck(cfg *config.City, cityPath string) *OrderOutcom
 		threshold: orderOutcomeFailureThreshold,
 		grace:     orderOutcomeStartGrace,
 		now:       time.Now,
+		walkBack:  events.WalkFilteredTypesNewestFirst,
 	}
 }
 
@@ -185,8 +197,9 @@ func (c *OrderOutcomeHealthyCheck) Fix(_ *CheckContext) error { return nil }
 //
 // Unlike order-firing-current this needs no goroutine-plus-timeout guard: that
 // check wraps its work because the order-history resolver opens the beads/Dolt
-// store without accepting a context. This one reads only the event log, and
-// only the last orderOutcomeLookback of it.
+// store without accepting a context. This one reads only the event log: the
+// last orderOutcomeLookback of it, and further back only for the orders that
+// window cannot settle, within orderOutcomeLookBackBudget.
 func (c *OrderOutcomeHealthyCheck) Run(ctx *CheckContext) *CheckResult {
 	// This check is advisory on every path: a failing order must not gate gc doctor.
 	// Blocking would fail gc doctor outright and gate every clean-doctor dependency
@@ -252,19 +265,23 @@ func (c *OrderOutcomeHealthyCheck) Run(ctx *CheckContext) *CheckResult {
 		return result
 	}
 
+	outcomes, starts, unresolved, lookErr := c.lookBack(ctx, eventPath, scheduled, outcomes, starts)
+
 	worst := StatusOK
 	failing := 0
 	var firstFailingHint string
-	cronSpans := map[string]time.Duration{}
 
 	for _, order := range scheduled {
 		streak, lastMessage, sawOutcome, skipped := consecutiveOrderFailures(outcomes, order.ScopedName(), starts, c.grace)
 		status, detail := classifyOrderOutcome(order, streak, c.threshold, lastMessage, sawOutcome, skipped)
-		if status == StatusOK && streak > 0 && !orderSucceededIn(outcomes, order.ScopedName()) &&
-			tooRareForLookback(order, c.threshold, cronSpans) {
+		if status == StatusOK && unresolved[order.ScopedName()] {
+			why := "were not read within the time budget"
+			if lookErr != nil {
+				why = fmt.Sprintf("could not be read (%v)", lookErr)
+			}
 			status, detail = StatusWarning, fmt.Sprintf(
-				"%s: every run in the last %s failed (%d), and it fires too rarely for %d runs to fit; older runs not read",
-				orderDisplayName(order), formatOrderFiringDuration(orderOutcomeLookback), streak, c.threshold)
+				"%s: every run read failed (%d counted); older runs %s, so the streak may reach threshold %d",
+				orderDisplayName(order), streak, why, c.threshold)
 			if strings.TrimSpace(lastMessage) != "" {
 				detail = fmt.Sprintf("%s, last %q", detail, lastMessage)
 			}
@@ -304,81 +321,98 @@ func orderSucceededIn(outcomes []events.Event, subject string) bool {
 	return false
 }
 
-// tooRareForLookback reports whether a window of orderOutcomeLookback, starting
-// anywhere, can miss part of a threshold-run streak. The window opens between
-// two fires, so the gap before its first visible fire counts too: it is sure to
-// hold threshold consecutive runs only if every threshold+1 consecutive fires
-// span at most the lookback (Codex r2 on #136: `0 0 * * 1,4` fires three times
-// in seven days, but read on a Wednesday the window opens after Monday and
-// holds only Thursday and Monday). For cron that is the LONGEST such span, not
-// the smallest gap between two: `0 0 1-3 * *` fires a day apart, but its runs
-// on the 2nd, 3rd and next month's 1st span four weeks. A schedule that cannot
-// be evaluated counts as too rare: the check cannot vouch for it.
-func tooRareForLookback(order orders.Order, threshold int, spanCache map[string]time.Duration) bool {
-	switch order.Trigger {
-	case "cooldown":
-		interval, err := time.ParseDuration(order.Interval)
-		if err != nil || interval <= 0 {
-			return true
+// lookBack extends outcomes and starts past the window for the orders the
+// window cannot settle, and returns the subjects it could not settle either.
+//
+// Only an order whose every outcome in the window failed, fewer than threshold
+// times, needs it (Codex r3 on #136: a daily order that ran only weekly failed
+// at -14d, -7d and now, and the window saw two). Older outcomes cannot change
+// any other verdict: a success in the window ends the streak, a streak at
+// threshold already warns, and an order with no outcome in the window is
+// reported as having none there, not as succeeding (whether it should have run
+// is order-firing-current's question). When no order needs the look-back,
+// nothing more is read, so the common case costs the window read alone.
+//
+// The walk goes newest-first, one log source at a time, and stops as soon as
+// every such order is settled (settledOrder), the log is exhausted, or the
+// budget is spent. Sizing the read from the schedule instead cannot work: a
+// schedule bounds how often an order may run, not how often it did.
+func (c *OrderOutcomeHealthyCheck) lookBack(ctx *CheckContext, eventPath string, scheduled []orders.Order,
+	outcomes []events.Event, starts []time.Time,
+) ([]events.Event, []time.Time, map[string]bool, error) {
+	unresolved := map[string]bool{}
+	for _, order := range scheduled {
+		subject := order.ScopedName()
+		streak, _, sawOutcome, _ := consecutiveOrderFailures(outcomes, subject, starts, c.grace)
+		if sawOutcome && streak < c.threshold && !orderSucceededIn(outcomes, subject) {
+			unresolved[subject] = true
 		}
-		return time.Duration(threshold)*interval > orderOutcomeLookback
-	case "cron":
-		span, ok := spanCache[order.Schedule]
-		if !ok {
-			var err error
-			span, err = cronLongestRunSpan(order.Schedule, threshold+1)
-			if err != nil {
-				return true
-			}
-			spanCache[order.Schedule] = span
-		}
-		return span > orderOutcomeLookback
-	default:
-		return true
 	}
-}
+	if len(unresolved) == 0 {
+		return outcomes, starts, nil, nil
+	}
+	budget := sizingBudget(ctx, orderOutcomeLookBackBudget)
+	if budget <= 0 {
+		return outcomes, starts, unresolved, nil
+	}
+	stopAt := time.Now().Add(budget)
 
-// cronLongestRunSpan is the longest time spanned by runs consecutive fires of
-// schedule over a leap year plus the lookback (so a span crossing the year
-// boundary is seen), scanned minute by minute in UTC. It stops as soon as a
-// span exceeds orderOutcomeLookback, and a schedule with fewer than runs fires
-// in that horizon returns the whole horizon. Only an order already failing at
-// every visible run reaches this, so the scan is rare.
-func cronLongestRunSpan(schedule string, runs int) (time.Duration, error) {
-	fields := strings.Fields(schedule)
-	if len(fields) != orders.CronFieldCount {
-		return 0, fmt.Errorf("invalid cron schedule: want %d fields, got %d", orders.CronFieldCount, len(fields))
+	pending := make(map[string]bool, len(unresolved))
+	for subject := range unresolved {
+		pending[subject] = true
 	}
-	if runs < 1 {
-		runs = 1
-	}
-	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
-	horizon := 366*24*time.Hour + orderOutcomeLookback
-	var fires []time.Time
-	var longest time.Duration
-	for m := time.Duration(0); m < horizon; m += time.Minute {
-		ts := base.Add(m)
-		matched, err := orders.CronScheduleMatchesAt(fields, ts)
-		if err != nil {
-			return 0, fmt.Errorf("invalid cron schedule: %w", err)
-		}
-		if !matched {
-			continue
-		}
-		fires = append(fires, ts)
-		if len(fires) >= runs {
-			if span := ts.Sub(fires[len(fires)-runs]); span > longest {
-				longest = span
-				if longest > orderOutcomeLookback {
-					return longest, nil
+	// outcomes is seq-ordered and, with an unresolved order, non-empty: every
+	// outcome before the window has a lower seq than its first.
+	filter := events.Filter{BeforeSeq: outcomes[0].Seq}
+	var older []events.Event
+	err := c.walkBack(eventPath, filter, []string{events.OrderCompleted, events.OrderFailed, events.ControllerStarted},
+		func(evts []events.Event, through time.Time) bool {
+			var batch []events.Event
+			for _, e := range evts {
+				if e.Type == events.ControllerStarted {
+					starts = append(starts, e.Ts)
+				} else if pending[e.Subject] {
+					batch = append(batch, e)
 				}
 			}
+			older = append(batch, older...)
+			merged := append(older[:len(older):len(older)], outcomes...)
+			for subject := range unresolved {
+				if c.settledOrder(merged, subject, starts, through) {
+					delete(unresolved, subject)
+				}
+			}
+			return len(unresolved) > 0 && time.Now().Before(stopAt)
+		})
+	return append(older, outcomes...), starts, unresolved, err
+}
+
+// settledOrder reports whether outcomes older than those read can no longer
+// change subject's verdict. through is from the newest-first walk: every
+// outcome and start at or after it has been read, and zero means all of them.
+//
+// A failure at or after through+grace is counted whatever older starts hold,
+// since a start that could grace it would already have been read; so threshold
+// such failures in a row settle the order as failing. A success read settles
+// it as under threshold when fewer than threshold failures follow it, since a
+// start not yet read can only grace, and so remove, one of them.
+func (c *OrderOutcomeHealthyCheck) settledOrder(outcomes []events.Event, subject string, starts []time.Time, through time.Time) bool {
+	if through.IsZero() {
+		return true
+	}
+	streak, _, _, _ := consecutiveOrderFailures(outcomes, subject, starts, c.grace)
+	if streak < c.threshold && orderSucceededIn(outcomes, subject) {
+		return true
+	}
+	confirmedFrom := through.Add(c.grace)
+	var confirmed []events.Event
+	for _, e := range outcomes {
+		if e.Subject == subject && !e.Ts.Before(confirmedFrom) {
+			confirmed = append(confirmed, e)
 		}
 	}
-	if len(fires) < runs {
-		return horizon, nil
-	}
-	return longest, nil
+	streak, _, _, _ = consecutiveOrderFailures(confirmed, subject, starts, c.grace)
+	return streak >= c.threshold
 }
 
 // readOrderOutcomeWindow returns order.completed and order.failed at or after
