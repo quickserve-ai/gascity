@@ -110,12 +110,31 @@ func doCosts(stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "No usage facts recorded yet (%s).\n", usagePath) //nolint:errcheck
 		return 0
 	}
+	renderRunCosts(stdout, rows)
+	return 0
+}
+
+// renderRunCosts prints the per-run table. A run that did work (compute facts)
+// but recorded NO model usage is NOT MEASURED: its cost is unknown, not zero.
+// Printing $0.0000 there was the ga-hrto3i defect: an omp run, whose provider
+// family has no invocation telemetry, looked like work that cost nothing and did
+// not even enter the UNPRICED count. It is kept out of EST_USD and named in its
+// own trailer, never folded into the priced or unpriced lines.
+func renderRunCosts(stdout io.Writer, rows []runCost) {
 	tw := tabwriter.NewWriter(stdout, 0, 2, 2, ' ', 0)
 	fmt.Fprintln(tw, "RUN\tINVOCATIONS\tIN\tOUT\tCACHE_R\tCACHE_C\tWALL_S\tEST_USD\tUNPRICED") //nolint:errcheck
 	var tot runCost
+	notMeasured := 0
+	notMeasuredWall := 0.0
 	for _, r := range rows {
-		fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%d\t%d\t%.1f\t%.4f\t%d\n", //nolint:errcheck
-			truncRunID(r.RunID), r.Invocations, r.InputTokens, r.OutputTokens, r.CacheReadTokens, r.CacheCreationTokens, r.WallSeconds, r.CostUSDEstimate, r.Unpriced)
+		cost := fmt.Sprintf("%.4f", r.CostUSDEstimate)
+		if r.Invocations == 0 && r.ComputeFacts > 0 {
+			cost = "NOT-MEASURED"
+			notMeasured++
+			notMeasuredWall += r.WallSeconds
+		}
+		fmt.Fprintf(tw, "%s\t%d\t%d\t%d\t%d\t%d\t%.1f\t%s\t%d\n", //nolint:errcheck
+			truncRunID(r.RunID), r.Invocations, r.InputTokens, r.OutputTokens, r.CacheReadTokens, r.CacheCreationTokens, r.WallSeconds, cost, r.Unpriced)
 		tot.Invocations += r.Invocations
 		tot.InputTokens += r.InputTokens
 		tot.OutputTokens += r.OutputTokens
@@ -131,8 +150,10 @@ func doCosts(stdout, stderr io.Writer) int {
 	if tot.Unpriced > 0 {
 		fmt.Fprintf(stdout, "\nNote: %d invocation(s) had no pricing and are excluded from EST_USD.\n", tot.Unpriced) //nolint:errcheck
 	}
+	if notMeasured > 0 {
+		fmt.Fprintf(stdout, "\nNOT MEASURED: %d run(s) did %.0f wall-seconds of work but recorded no model usage, so their cost is unknown, not zero, and is absent from EST_USD. The usual cause is a provider family with no invocation telemetry (omp; ga-hrto3i).\n", notMeasured, notMeasuredWall) //nolint:errcheck
+	}
 	fmt.Fprintf(stdout, "Estimates are list-price decision-support, not authoritative charges.\n") //nolint:errcheck
-	return 0
 }
 
 func truncRunID(s string) string {
