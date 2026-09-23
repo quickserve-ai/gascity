@@ -531,18 +531,17 @@ func NamedSessionContinuityEligible(b beads.Bead) bool {
 type NamedSessionConflictKind int
 
 const (
-	// NamedSessionNoConflict: the bead does not block the named session.
+	// NamedSessionNoConflict means the bead does not block the named session.
 	NamedSessionNoConflict NamedSessionConflictKind = iota
-	// NamedSessionConflictRuntimeName: the bead holds the named session's
-	// runtime session_name but runs a different template: a name squat.
+	// NamedSessionConflictRuntimeName means the bead holds the named
+	// session's runtime session_name but is not its session.
 	NamedSessionConflictRuntimeName
-	// NamedSessionConflictAlias: the bead claims the identity as its alias
-	// without the configured identity stamp. It may be the seat's own running
-	// session that was never stamped (ga-1ycmli).
+	// NamedSessionConflictAlias means the bead claims the identity as its
+	// alias without the configured identity stamp.
 	NamedSessionConflictAlias
-	// NamedSessionConflictAdoptablePool: an ephemeral pool-managed session of
-	// a singleton's backing template, which the reconciler adopts as the
-	// named session.
+	// NamedSessionConflictAdoptablePool means the bead is an ephemeral
+	// pool-managed session of a singleton's backing template, which the
+	// reconciler adopts as the named session.
 	NamedSessionConflictAdoptablePool
 )
 
@@ -574,6 +573,36 @@ func ClassifyNamedSessionConflict(b beads.Bead, spec NamedSessionSpec) NamedSess
 // BeadConflictsWithNamedSession reports whether a bead blocks a configured named session identity.
 func BeadConflictsWithNamedSession(b beads.Bead, spec NamedSessionSpec) bool {
 	return ClassifyNamedSessionConflict(b, spec) != NamedSessionNoConflict
+}
+
+// NamedSessionConflictDetail is what an operator needs to judge a conflicting
+// bead before acting on it.
+type NamedSessionConflictDetail struct {
+	Kind        NamedSessionConflictKind
+	State       string
+	Template    string
+	PoolManaged string
+	// Squat is true only with positive evidence that the bead runs something
+	// else: it records a template or agent that is not this seat's. A bead
+	// recording neither could be the seat's own session, never stamped with
+	// its identity (ga-1ycmli), and is never called a squat.
+	Squat bool
+}
+
+// DescribeNamedSessionConflict classifies how b blocks spec and returns the
+// fields that tell a squat from the seat's own live work (ga-lm5coj).
+func DescribeNamedSessionConflict(b beads.Bead, spec NamedSessionSpec) NamedSessionConflictDetail {
+	kind := ClassifyNamedSessionConflict(b, spec)
+	template := strings.TrimSpace(b.Metadata["template"])
+	recordsRunner := template != "" || strings.TrimSpace(b.Metadata["agent_name"]) != ""
+	return NamedSessionConflictDetail{
+		Kind:        kind,
+		State:       strings.TrimSpace(b.Metadata["state"]),
+		Template:    template,
+		PoolManaged: strings.TrimSpace(b.Metadata["pool_managed"]),
+		Squat: recordsRunner && !NamedSessionBeadMatchesSpec(b, spec) &&
+			(kind == NamedSessionConflictRuntimeName || kind == NamedSessionConflictAlias),
+	}
 }
 
 // ConfiguredNamedSessionLookup is the bounded lookup result for a configured named session.
