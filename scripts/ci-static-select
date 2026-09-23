@@ -200,9 +200,11 @@ def deleted_path_embed_owners(
 
     The inventory is the post-change tree, so a deleted path is absent from it.
     Selecting its pattern owners is complete only while each owner still embeds,
-    through that same pattern, a file in the deleted path's directory: the
+    through that same pattern, another file in the deleted path's directory: the
     pattern demonstrably still resolves there. Otherwise the path may be
-    absent from the current embed inventory, and selection is refused.
+    absent from the current embed inventory, and selection is refused. A path
+    removed only from the index stays on disk and in the inventory, so it never
+    counts as its own sibling.
     """
     matched = [
         (pattern, owner)
@@ -212,7 +214,8 @@ def deleted_path_embed_owners(
     siblings = embedded_by_dir.get(posixpath.dirname(path), [])
     for pattern, owner in matched:
         if not any(
-            owner in embed_owners[sibling]
+            sibling != path
+            and owner in embed_owners[sibling]
             and deleted_path_may_match_embed_pattern(sibling, pattern)
             for sibling in siblings
         ):
