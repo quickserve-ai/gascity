@@ -1,6 +1,7 @@
 package events
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -21,9 +22,19 @@ func TestTypeNeedle(t *testing.T) {
 		"tab\there":    "",
 		"plain.type-1": `"plain.type-1"`,
 	} {
-		if got := string(typeNeedle(Filter{Type: typ})); got != want {
-			t.Errorf("typeNeedle(%q) = %q, want %q", typ, got, want)
+		var got string
+		if needles := typeNeedles(Filter{Type: typ}, nil); len(needles) == 1 {
+			got = string(needles[0])
 		}
+		if got != want {
+			t.Errorf("typeNeedles(%q) = %q, want %q", typ, got, want)
+		}
+	}
+	if typeNeedles(Filter{}, []string{OrderFailed, "a&b"}) != nil {
+		t.Error("one unencodable type must turn the whole prefilter off")
+	}
+	if n := typeNeedles(Filter{}, []string{OrderFailed, OrderCompleted}); len(n) != 2 {
+		t.Errorf("two plain types want two needles, got %d", len(n))
 	}
 }
 
@@ -59,5 +70,42 @@ func TestReadFilteredTypePrefilterKeepsEveryMatch(t *testing.T) {
 	}
 	if len(seqs) != 3 || seqs[0] != 2 || seqs[1] != 4 || seqs[2] != 5 {
 		t.Fatalf("ReadFiltered(order.failed) seqs = %v, want [2 4 5]", seqs)
+	}
+}
+
+func TestReadFilteredTypesReadsSeveralTypesInOneWalk(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+	ts := time.Date(2026, 9, 20, 0, 0, 0, 0, time.UTC)
+	writeArchiveWithEvents(t, dir, "20260920T000000Z", 1, 4,
+		Event{Seq: 1, Type: OrderCompleted, Ts: ts},
+		Event{Seq: 2, Type: OrderFired, Ts: ts},
+		Event{Seq: 3, Type: ControllerStarted, Ts: ts},
+		Event{Seq: 4, Type: OrderFailed, Ts: ts},
+	)
+	active := `{"seq":5,"type":"order.fired","ts":"2026-09-21T00:00:00Z","actor":"t","message":"\"order.failed\""}
+{"seq":6,"type":"order.failed","ts":"2026-09-21T00:00:00Z","actor":"t"}
+`
+	if err := os.WriteFile(path, []byte(active), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := ReadFilteredTypes(path, Filter{}, OrderCompleted, OrderFailed, ControllerStarted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seqs []uint64
+	for _, e := range got {
+		seqs = append(seqs, e.Seq)
+	}
+	if fmt.Sprint(seqs) != "[1 3 4 6]" {
+		t.Fatalf("seqs = %v, want [1 3 4 6] (in log order, decoys excluded)", seqs)
+	}
+
+	if _, err := ReadFilteredTypes(path, Filter{Type: OrderFailed}, OrderCompleted); err == nil {
+		t.Error("a filter.Type alongside types must be refused, not silently ANDed")
+	}
+	if _, err := ReadFilteredTypes(path, Filter{}); err == nil {
+		t.Error("no types must be refused, not read as every type")
 	}
 }
