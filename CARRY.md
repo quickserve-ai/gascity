@@ -411,7 +411,7 @@ Fork-specific notes that still hold:
 Overseer rule, 2026-09-15: `carry/operational` is re-synced onto upstream main at least every
 seven days. The clock is the carry's merge base with upstream main. Once that base is seven days
 old, everything else waits until the re-sync lands: no upstream PRs, fork picks, reviews or
-investigations. This stack's base is 2026-09-22 (`42d46228d`); re-sync #3 landed <LANDED-DATE>, and the next re-sync is due seven days after that, by <LANDED-DATE+7>.
+investigations. This stack's base is 2026-09-22 (`42d46228d`); re-sync #3 landed 2026-09-23 14:08Z (`1dae2e6ee`), and the next re-sync is due seven days after that, by 2026-09-30 14:08Z.
 
 Check the clock at every boot and before any fork or upstream work:
 
