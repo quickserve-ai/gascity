@@ -766,7 +766,7 @@ jobs:
       - changes
     if: needs.changes.outputs.cmd_gc_process == 'true'
     runs-on: ${{ needs.runner-policy.outputs.runner_32vcpu }}
-    timeout-minutes: 10
+    timeout-minutes: 15  # 10 killed shard 9 in its post-test cache save, 2026-09-23 (ga-ltftwy)
     strategy:
       fail-fast: false
       matrix:
@@ -952,10 +952,10 @@ jobs:
             timeout_minutes: 15
             command: make test-integration-bdstore
           - shard_name: rest-smoke-1-of-2
-            timeout_minutes: 15
+            timeout_minutes: 25  # a cold Go cache spends ~8.5m compiling; 15 cancelled passing runs (ga-ltftwy)
             command: ./scripts/test-integration-shard rest-smoke-1-of-2
           - shard_name: rest-smoke-2-of-2
-            timeout_minutes: 15
+            timeout_minutes: 25  # a cold Go cache spends ~8.5m compiling; 15 cancelled passing runs (ga-ltftwy)
             command: ./scripts/test-integration-shard rest-smoke-2-of-2
     env:
       DOLT_VERSION: "2.1.7"
