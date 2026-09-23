@@ -35,6 +35,7 @@ func doltServersFixture(t *testing.T, procs []DoltProcInfo, discoverErr, layoutE
 		},
 		otherScopes:     func(string) ([]string, error) { return []string{"/other-city"}, nil },
 		cwd:             func(int) (string, bool) { return "", false },
+		args:            func(int) (string, error) { return "", errors.New("no full command line in this fixture") },
 		recordedPID:     func(managedDoltRuntimeLayout) int { return 0 },
 		activeTestRoots: func() []string { return nil },
 		startIdentity:   func(int) string { return "" },
@@ -329,5 +330,75 @@ func TestDoltServersCheck_FlattenedConfigStillMatchesManagedLayout(t *testing.T)
 	}
 	if strings.Contains(r.Message+strings.Join(r.Details, "\n"), "hunter2") {
 		t.Fatalf("credential reached doctor output: %q", r.Message)
+	}
+}
+
+// Codex round 2 on #120 (a): a relative --config/--data-dir is relative to the
+// SERVER's working directory, not doctor's. A second server started as
+// `--config dolt-config.yaml` from the managed pack dir is on this city's store.
+func TestDoltServersCheck_RelativeConfigResolvesAgainstServerCWD(t *testing.T) {
+	second := DoltProcInfo{PID: 200, Argv: []string{"dolt", "sql-server", "--config", "dolt-config.yaml"}}
+	c := doltServersFixture(t, []DoltProcInfo{gcDoltProc(100, "/city", 51361), second}, nil, nil)
+	c.cwd = func(pid int) (string, bool) {
+		if pid == 200 {
+			return filepath.Join("/city", ".gc", "runtime", "packs", "dolt"), true
+		}
+		return "", false
+	}
+	r := c.Run(nil)
+	if r.Status != doctor.StatusError {
+		t.Fatalf("status = %v, want Error (split-brain via a relative --config): %q %v", r.Status, r.Message, r.Details)
+	}
+}
+
+func TestDoltServersCheck_RelativeDataDirResolvesAgainstServerCWD(t *testing.T) {
+	second := DoltProcInfo{PID: 200, Argv: []string{"dolt", "sql-server", "--data-dir", filepath.Join(".beads", "dolt")}}
+	c := doltServersFixture(t, []DoltProcInfo{gcDoltProc(100, "/city", 51361), second}, nil, nil)
+	c.cwd = func(pid int) (string, bool) {
+		if pid == 200 {
+			return "/city", true
+		}
+		return "", false
+	}
+	r := c.Run(nil)
+	if r.Status != doctor.StatusError {
+		t.Fatalf("status = %v, want Error (split-brain via a relative --data-dir): %q %v", r.Status, r.Message, r.Details)
+	}
+}
+
+// A relative path whose anchor cannot be read is UNIDENTIFIABLE, never
+// "not gc": the check cannot rule out this city's store.
+func TestDoltServersCheck_RelativePathWithUnreadableCWDIsWarningNotOK(t *testing.T) {
+	second := DoltProcInfo{PID: 200, Argv: []string{"dolt", "sql-server", "--config", "dolt-config.yaml"}}
+	c := doltServersFixture(t, []DoltProcInfo{gcDoltProc(100, "/city", 51361), second}, nil, nil)
+	r := c.Run(nil)
+	if r.Status != doctor.StatusWarning {
+		t.Fatalf("status = %v, want Warning: %q %v", r.Status, r.Message, r.Details)
+	}
+	joined := strings.Join(r.Details, "\n")
+	if !strings.Contains(joined, "relative") {
+		t.Fatalf("the warning must say the path was relative, got %v", r.Details)
+	}
+}
+
+// Codex round 2 on #120 (b): the macOS ps fallback keeps only --config, so a
+// server started with --data-dir from an unrelated cwd must be re-read from
+// its full command line, not identified by that cwd.
+func TestDoltServersCheck_PSFallbackRecoversDataDirFromFullArgs(t *testing.T) {
+	second := DoltProcInfo{PID: 200, Argv: []string{"dolt", "sql-server"}}
+	c := doltServersFixture(t, []DoltProcInfo{gcDoltProc(100, "/city", 51361), second}, nil, nil)
+	c.cwd = func(int) (string, bool) { return "/elsewhere", true }
+	c.args = func(pid int) (string, error) {
+		if pid == 200 {
+			return "/usr/local/bin/dolt sql-server --data-dir /city/.beads/dolt -u root -p secret", nil
+		}
+		return "", errors.New("unexpected pid")
+	}
+	r := c.Run(nil)
+	if r.Status != doctor.StatusError {
+		t.Fatalf("status = %v, want Error (managed store found via the full command line): %q %v", r.Status, r.Message, r.Details)
+	}
+	if strings.Contains(r.Message+strings.Join(r.Details, " "), "secret") {
+		t.Fatalf("doctor output must never carry the command line's trailing flags: %q %v", r.Message, r.Details)
 	}
 }
