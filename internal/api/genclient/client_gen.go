@@ -3354,9 +3354,15 @@ type RigCreateSucceededPayload struct {
 	Rig string `json:"rig"`
 }
 
+// RigDoctorPatch defines model for RigDoctorPatch.
+type RigDoctorPatch struct {
+	CensusOwnerNamespace *string `json:"CensusOwnerNamespace"`
+}
+
 // RigPatch defines model for RigPatch.
 type RigPatch struct {
 	DefaultBranch    *string           `json:"DefaultBranch"`
+	Doctor           RigDoctorPatch    `json:"Doctor"`
 	FormulaVars      map[string]string `json:"FormulaVars"`
 	Name             string            `json:"Name"`
 	Path             *string           `json:"Path"`

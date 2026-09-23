@@ -2822,8 +2822,13 @@ export type RigCreateSucceededPayload = {
     rig: string;
 };
 
+export type RigDoctorPatch = {
+    CensusOwnerNamespace: string | null;
+};
+
 export type RigPatch = {
     DefaultBranch: string | null;
+    Doctor: RigDoctorPatch;
     FormulaVars: {
         [key: string]: string;
     };
