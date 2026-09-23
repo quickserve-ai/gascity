@@ -108,7 +108,10 @@ type GraphTx interface {
 // attempt uses for every class (the witness contract). Any change to
 // the canonical stream layout is a NEW algorithm string; digests produced
 // under different algorithms never compare.
-const SemanticWitnessAlgorithm = "gascity.storage-semantic-witness.v1"
+//
+// v2: await_type joined the bead stream (ga-knhu61) — a gate whose await
+// classification changed in migration must not hash equal to its source.
+const SemanticWitnessAlgorithm = "gascity.storage-semantic-witness.v2"
 
 // WitnessFamilyCount surfaces one hashed record-family count for diagnostics.
 // The authority is the count inside the hashed stream; this is the copy

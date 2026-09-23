@@ -4,13 +4,15 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
+import functools
 import json
 import os
 import posixpath
+import re
 import stat
 import subprocess
 import sys
-from typing import Any, Iterable
+from typing import Any, Iterable, NamedTuple
 
 
 GO_BUILD_INPUT_SUFFIXES = frozenset(
@@ -57,6 +59,16 @@ NATIVE_SOURCE_FIELDS = (
 
 class SelectionError(Exception):
     """The changed scope could not be selected without losing coverage."""
+
+
+class EmbedPattern(NamedTuple):
+    """One //go:embed pattern of one package, as go list reports it."""
+
+    owner: str
+    package_dir: str
+    glob: str
+    all_files: bool
+    repo_pattern: str
 
 
 def command_output(args: list[str]) -> bytes:
@@ -169,12 +181,6 @@ def embedded_repo_path(relative_dir: str, embedded: str) -> str:
     return posixpath.join(relative_dir, normalized)
 
 
-def embedded_repo_pattern(relative_dir: str, pattern: str) -> str:
-    if pattern.startswith("all:"):
-        pattern = pattern.removeprefix("all:")
-    return embedded_repo_path(relative_dir, pattern)
-
-
 def deleted_path_may_match_embed_pattern(path: str, pattern: str) -> bool:
     meta_index = next(
         (index for index, character in enumerate(pattern) if character in "*?[\\"),
@@ -188,6 +194,164 @@ def deleted_path_may_match_embed_pattern(path: str, pattern: str) -> bool:
 
 def path_is_beneath_package(path: str, package_dir: str) -> bool:
     return package_dir == "." or path.startswith(package_dir + "/")
+
+
+def embed_pattern(owner: str, package_dir: str, pattern: str) -> EmbedPattern:
+    glob = pattern.removeprefix("all:")
+    return EmbedPattern(
+        owner=owner,
+        package_dir=package_dir,
+        glob=glob,
+        all_files=glob != pattern,
+        repo_pattern=embedded_repo_path(package_dir, glob),
+    )
+
+
+def invalid_embed_element(element: str) -> SelectionError:
+    return SelectionError(f"go list emitted invalid embed pattern element {element!r}")
+
+
+def go_class_character(element: str, index: int) -> tuple[str, int]:
+    """Read one character of a class, as path.Match's getEsc does."""
+    if index == len(element) or element[index] in "-]":
+        raise invalid_embed_element(element)
+    if element[index] == "\\":
+        index += 1
+    # getEsc also requires the pattern to continue after this character.
+    if index + 1 >= len(element):
+        raise invalid_embed_element(element)
+    return element[index], index + 1
+
+
+@functools.cache
+def go_element_regex(element: str) -> re.Pattern[str]:
+    """Compile one path.Match pattern element with Go's syntax.
+
+    Go differs from fnmatch: '^' negates a class, '!' is an ordinary
+    character, and a backslash escapes the next character.
+    """
+    parts: list[str] = []
+    index = 0
+    while index < len(element):
+        character = element[index]
+        index += 1
+        if character == "*":
+            parts.append(".*")
+        elif character == "?":
+            parts.append(".")
+        elif character == "\\":
+            if index == len(element):
+                raise invalid_embed_element(element)
+            parts.append(re.escape(element[index]))
+            index += 1
+        elif character == "[":
+            negated = element.startswith("^", index)
+            if negated:
+                index += 1
+            ranges: list[str] = []
+            parsed = 0
+            while parsed == 0 or not element.startswith("]", index):
+                low, index = go_class_character(element, index)
+                high = low
+                if element.startswith("-", index):
+                    high, index = go_class_character(element, index + 1)
+                if low <= high:
+                    ranges.append(f"{re.escape(low)}-{re.escape(high)}")
+                parsed += 1
+            index += 1
+            if ranges:
+                parts.append(f"[{'^' if negated else ''}{''.join(ranges)}]")
+            else:
+                parts.append("." if negated else "(?!)")
+        else:
+            parts.append(re.escape(character))
+    return re.compile("".join(parts), re.DOTALL)
+
+
+def embed_pattern_embeds_file(pattern: EmbedPattern, path: str, repo_root: str) -> bool:
+    """Report whether cmd/go embeds the file at path through this one pattern.
+
+    This is the strict counterpart of deleted_path_may_match_embed_pattern, for
+    a file the inventory already embeds, so the module and file-name rules
+    cmd/go applies to every pattern already hold. Each pattern element is
+    matched against one path element with path.Match syntax, so a wildcard
+    never crosses a slash. A matched directory embeds only the regular files
+    beneath it, and skips any name below the match that begins with '.' or '_'
+    unless the pattern carries "all:".
+
+    It never reports a file cmd/go would not embed. Go's '*' can also resume
+    inside a multi-byte character, where this reports no match; that can only
+    refuse a selection.
+    """
+    if pattern.package_dir == ".":
+        relative = path
+    elif path.startswith(pattern.package_dir + "/"):
+        relative = path[len(pattern.package_dir) + 1 :]
+    else:
+        return False
+    pattern_elements = pattern.glob.split("/")
+    path_elements = relative.split("/")
+    if len(path_elements) < len(pattern_elements):
+        return False
+    if not all(
+        go_element_regex(pattern_element).fullmatch(path_element)
+        for pattern_element, path_element in zip(pattern_elements, path_elements)
+    ):
+        return False
+    beneath = path_elements[len(pattern_elements) :]
+    if not beneath:
+        return True
+    if not pattern.all_files and any(name.startswith((".", "_")) for name in beneath):
+        return False
+    # The directory walk skips symlinks. cmd/go embeds one only when a pattern
+    # names it directly and GODEBUG=embedfollowsymlinks=1.
+    try:
+        return stat.S_ISREG(os.lstat(os.path.join(repo_root, path)).st_mode)
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise SelectionError(f"cannot inspect embedded path {path!r}: {error}") from error
+
+
+def deleted_path_embed_owners(
+    path: str,
+    embed_patterns: list[EmbedPattern],
+    embed_owners: dict[str, set[str]],
+    embedded_by_dir: dict[str, list[str]],
+    repo_root: str,
+) -> set[str]:
+    """Return every package whose embed pattern may have matched a deleted path.
+
+    The inventory is the post-change tree, so a deleted path is absent from it.
+    Selecting its pattern owners is complete only while each owner still embeds,
+    through that same pattern, another file in the deleted path's directory: the
+    pattern demonstrably still resolves there. Otherwise the path may be
+    absent from the current embed inventory, and selection is refused. A path
+    removed only from the index stays on disk and in the inventory, so it never
+    counts as its own sibling.
+
+    Which patterns may have matched the deleted path is over-approximated,
+    which can only add owners or refusals. Whether a sibling still matches is
+    decided strictly, because an over-match there would forge the evidence that
+    the pattern still resolves.
+    """
+    matched = [
+        pattern
+        for pattern in embed_patterns
+        if deleted_path_may_match_embed_pattern(path, pattern.repo_pattern)
+    ]
+    siblings = embedded_by_dir.get(posixpath.dirname(path), [])
+    for pattern in matched:
+        if not any(
+            sibling != path
+            and pattern.owner in embed_owners[sibling]
+            and embed_pattern_embeds_file(pattern, sibling, repo_root)
+            for sibling in siblings
+        ):
+            raise SelectionError(
+                f"deleted path {path!r} may be absent from the current embed inventory"
+            )
+    return {pattern.owner for pattern in matched}
 
 
 def affected_package_args(
@@ -219,7 +383,7 @@ def affected_package_args(
     import_by_dir: dict[str, str] = {}
     arg_by_import: dict[str, str] = {}
     embed_owners: dict[str, set[str]] = defaultdict(set)
-    embed_patterns: list[str] = []
+    embed_patterns: list[EmbedPattern] = []
     native_imports: set[str] = set()
 
     for package in package_records:
@@ -253,7 +417,7 @@ def affected_package_args(
                 embed_owners[embedded_repo_path(relative_dir, embedded)].add(import_path)
         for field in EMBED_PATTERN_FIELDS:
             for pattern in string_list(package, field):
-                embed_patterns.append(embedded_repo_pattern(relative_dir, pattern))
+                embed_patterns.append(embed_pattern(import_path, relative_dir, pattern))
 
         native_sources: list[str] = []
         for field in NATIVE_SOURCE_FIELDS:
@@ -266,17 +430,18 @@ def affected_package_args(
         if native_sources or any(ignored_native_sources):
             native_imports.add(import_path)
 
+    embedded_by_dir: dict[str, list[str]] = defaultdict(list)
+    for embedded in embed_owners:
+        embedded_by_dir[posixpath.dirname(embedded)].append(embedded)
+
     seeds: set[str] = set()
     for status, path in changed:
         owners = embed_owners.get(path, set())
-        seeds.update(owners)
-        if status == "D" and any(
-            deleted_path_may_match_embed_pattern(path, pattern)
-            for pattern in embed_patterns
-        ):
-            raise SelectionError(
-                f"deleted path {path!r} may be absent from the current embed inventory"
+        if status == "D":
+            owners = owners | deleted_path_embed_owners(
+                path, embed_patterns, embed_owners, embedded_by_dir, repo_root
             )
+        seeds.update(owners)
         # Native compilers can consume inputs with arbitrary names and from
         # shared directories. The Go package inventory does not expose that
         # dependency graph, so every native package is the smallest safe scope
