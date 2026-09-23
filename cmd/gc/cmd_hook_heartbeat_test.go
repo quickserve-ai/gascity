@@ -103,7 +103,7 @@ func withHeartbeatIdentities(t *testing.T, identities []string, err error) {
 	t.Helper()
 	restore := hookHeartbeatIdentities
 	t.Cleanup(func() { hookHeartbeatIdentities = restore })
-	hookHeartbeatIdentities = func(string) ([]string, error) {
+	hookHeartbeatIdentities = func(string, string) ([]string, error) {
 		return identities, err
 	}
 	withHeartbeatStartOffset(t, 0)
