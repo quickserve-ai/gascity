@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -25,3 +26,9 @@ func crossCityNotifyRefusal(cmdName, recipient string) string {
 	return fmt.Sprintf("%s: --notify does not cross cities: %q is in city %q; its wake is that city's own mail sweep. Retry without --notify.",
 		cmdName, recipient, strings.SplitN(recipient, "/", 2)[0])
 }
+
+// errUnknownCityOrigin is the sentinel RefuseUnknownCity upgrades when an
+// address names a city outside the roster; returned unchanged, it means the
+// address is a known scope (roster city, local city, or rig) or carries no
+// city segment at all.
+var errUnknownCityOrigin = errors.New("origin city unknown")
