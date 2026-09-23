@@ -697,6 +697,19 @@ commit_archive_snapshot() {
         echo "jsonl-export: $context commit failed" >&2
         return 1
     fi
+    # Every snapshot commit leaves one new loose blob per exported store (a
+    # full issues.jsonl, tens of MiB each) and nothing in this script ever
+    # repacked the archive; git only runs its own gc --auto from commands this
+    # script never calls (merge, rebase, receive-pack). Measured 2026-09-23 on
+    # the Cherub town: 5,333 loose objects, 7.48 GiB, against a 160 MiB pack
+    # last written 20 days earlier — the archive was the city's largest disk
+    # consumer while its packed content was a few hundred MiB. Repack on the
+    # commit path, bounded: gc.auto=256 fires roughly every ~128 commits, so
+    # each repack handles a few hundred MiB, not the whole history; autoDetach
+    # off so the repack finishes inside this order's own run instead of a
+    # detached child that outlives it. Never fatal: the snapshot is already
+    # committed, and a failed repack costs disk, not data.
+    git -c gc.auto=256 -c gc.autoDetach=false gc --auto --quiet 2>/dev/null || true
 }
 
 discard_failed_db_outputs() {
