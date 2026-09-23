@@ -5398,3 +5398,51 @@ func TestCmdMailSendAllFlagBodyWinsOverPositional(t *testing.T) {
 		t.Errorf("Description = %q, want %q (--all -m flag body should win over positional)", msg.Description, "flag body")
 	}
 }
+
+func TestResolveMailRecipientIdentity_NameSquatStillResolvesTheConfiguredMailbox(t *testing.T) {
+	// ga-isa3j4: a live bead that holds a configured named session's runtime
+	// name without being that session (a name squat, ga-lm5coj) made mail
+	// resolution fail with the session conflict, so `gc mail send` refused and
+	// STORED NOTHING. The mailbox identity comes from config and does not
+	// depend on the runtime session: the mail must resolve to it and be stored.
+	store := beads.NewMemStore()
+	cityPath := t.TempDir()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:         "mayor",
+			StartCommand: "true",
+		}},
+		NamedSessions: []config.NamedSession{{
+			Template: "mayor",
+		}},
+	}
+	spec, ok := findNamedSessionSpec(cfg, config.EffectiveCityName(cfg, filepath.Base(cityPath)), "mayor")
+	if !ok {
+		t.Fatal("findNamedSessionSpec(mayor) = false")
+	}
+	if _, err := store.Create(beads.Bead{
+		Title:  "squatter",
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"session_name": spec.SessionName,
+			"template":     "other",
+			"agent_name":   "other",
+			"state":        "asleep",
+		},
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := resolveSessionIDWithConfig(cityPath, cfg, store, "mayor"); !errors.Is(err, errNamedSessionConflict) {
+		t.Fatalf("fixture: resolveSessionIDWithConfig(mayor) err = %v, want the squat conflict", err)
+	}
+
+	got, err := resolveMailRecipientIdentity(cityPath, cfg, store, "mayor")
+	if err != nil {
+		t.Fatalf("resolveMailRecipientIdentity(mayor) = %v, want the configured mailbox despite the squat", err)
+	}
+	if got != spec.Identity {
+		t.Fatalf("recipient = %q, want configured identity %q", got, spec.Identity)
+	}
+}

@@ -1080,7 +1080,13 @@ func resolveMailIdentityWithConfigCached(cityPath string, cfg *config.City, sess
 			}
 			return address, nil
 		}
-		if !errors.Is(err, session.ErrSessionNotFound) {
+		// A name squat (a live bead holding the configured session's name
+		// without being that session, ga-lm5coj) is a RUNTIME problem. The
+		// mailbox identity comes from config and does not depend on it, so
+		// mail falls through to the configured address below and is stored.
+		// Refusing here was the ga-isa3j4 loss: the send failed and wrote
+		// nothing. The wake may still fail after the store, loudly.
+		if !errors.Is(err, session.ErrSessionNotFound) && !errors.Is(err, errNamedSessionConflict) {
 			return "", err
 		}
 	}
