@@ -11,10 +11,13 @@ import (
 // the remainder is that city's own address form. Authoring the section is the
 // feature flag; omitting it keeps every recipient resolving exactly as today.
 type MailCrossCityConfig struct {
-	// City is this city's own segment in city-qualified addresses. Empty
-	// defaults to the effective city name (workspace name, else the city
-	// directory's base name). <City>/<address> and <address> are one mailbox.
-	City string `toml:"city,omitempty"`
+	// City is this city's own segment in city-qualified addresses, and it is
+	// REQUIRED when the section is present: the CLI and the API derive the
+	// effective city name differently (site binding, workspace name, the
+	// supervisor's registered name), so a defaulted name could stamp two
+	// spellings of this city on mail and strand replies. <City>/<address> and
+	// <address> are one mailbox.
+	City string `toml:"city"`
 	// Cities lists the peer cities addressable as <city>/<address>. A
 	// recipient naming a listed city resolves against the roster and is never
 	// looked up in the local session store.
@@ -39,9 +42,9 @@ func (c *City) MailCityRoster(fallbackCityName string) (string, []string) {
 }
 
 // ValidateMailCrossCity validates the [mail.crosscity] section of a composed
-// config: a present section must list at least one syntactically valid,
-// duplicate-free peer city; the local city must not list itself; and no rig
-// may share a name with a listed city — the first mail-address segment must
+// config: a present section must name this city explicitly (city) and list at
+// least one syntactically valid, duplicate-free peer city; the local city must
+// not list itself; and no rig or agent directory may share a name with a listed city — the first mail-address segment must
 // bind unambiguously to either a rig or a city, never both (a collision here
 // would silently rebind existing rig-qualified mail). cityRoot supplies the
 // directory-derived fallback for the effective local city name.
@@ -50,6 +53,9 @@ func ValidateMailCrossCity(cfg *City, cityRoot string) error {
 		return nil
 	}
 	cc := cfg.Mail.CrossCity
+	if strings.TrimSpace(cc.City) == "" {
+		return fmt.Errorf("[mail.crosscity] city is required: name this city's own address segment explicitly (the CLI and the API must agree on it)")
+	}
 	if len(cc.Cities) == 0 {
 		return fmt.Errorf("[mail.crosscity] cities must list at least one peer city")
 	}
@@ -77,6 +83,15 @@ func ValidateMailCrossCity(cfg *City, cityRoot string) error {
 	for i := range cfg.Rigs {
 		if seen[cfg.Rigs[i].Name] || cfg.Rigs[i].Name == local {
 			return fmt.Errorf("rig %q collides with a [mail.crosscity] city of the same name: the first mail-address segment must name either a rig or a city, never both", cfg.Rigs[i].Name)
+		}
+	}
+	for i := range cfg.Agents {
+		dir := cfg.Agents[i].Dir
+		if dir == "" {
+			continue
+		}
+		if seen[dir] || dir == local {
+			return fmt.Errorf("agent %q dir %q collides with a [mail.crosscity] city of the same name: the first mail-address segment must name either a local agent directory or a city, never both", cfg.Agents[i].Name, dir)
 		}
 	}
 	return nil
