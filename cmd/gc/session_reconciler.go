@@ -3265,7 +3265,25 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 				tmuxRequested, _ = dops.isRestartRequested(name)
 			}
 			beadRequested := infoByID[id].RestartRequested == "true"
-			if tmuxRequested || beadRequested {
+			// A PINNED HANDOFF WHOSE REQUEST WAS LOST still restarts (Codex #106
+			// r11, r12). The handoff writes restart_requested,
+			// continuation_reset_pending and a stamped intent in ONE batch
+			// (RequestFreshRestartWithIntent). If a stale tick of the guard below
+			// strips the request after that batch lands, the seat keeps the reset
+			// and the intent, and neither alone ever entered this branch: the
+			// handoff was stranded. A valid, stamped intent is handoff-only (no
+			// other writer sets it), so reset + intent without a request can only
+			// be that. It is read from this tick's snapshot, so it needs no extra
+			// read or write and self-heals whatever interleaving or write failure
+			// dropped the request.
+			derivedHandoff := !tmuxRequested && !beadRequested && runtimeRunning &&
+				pinnedConfiguredNamedSessionKillProtected(infoByID[id]) &&
+				strings.TrimSpace(infoByID[id].ContinuationResetPending) == "true" &&
+				pinnedHandoffIntentValid(infoByID[id])
+			if derivedHandoff {
+				fmt.Fprintf(stderr, "session reconciler: pinned named session %s (bead %s) carries a handoff reset and intent but no request; restarting it as that handoff\n", name, id) //nolint:errcheck
+			}
+			if tmuxRequested || beadRequested || derivedHandoff {
 				// A pinned configured named session is an operator-declared
 				// critical conversation (for example, the mayor). Do not let
 				// collateral reconciler restart flags (progress-stall, stale
@@ -3275,22 +3293,64 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 				// still proceed so planned graceful recycle remains possible.
 				explicitControllerReset := strings.TrimSpace(infoByID[id].ContinuationResetPending) == "true"
 				if runtimeRunning && pinnedConfiguredNamedSessionKillProtected(infoByID[id]) && !explicitControllerReset {
+					// THE SNAPSHOT MAY BE STALE (Codex #106 r5, r6). A pinned handoff
+					// stamps the intent, persists its explicit reset, and only THEN
+					// arms the flag (r7), so a flag this tick read live implies a
+					// reset this snapshot may predate. If that reset (or a request
+					// this snapshot did not hold) has landed, this tick's premise, "no explicit reset", is
+					// false: touch NOTHING and let the next tick act on fresh state.
+					// Clearing anything here would either drop a real handoff from the
+					// numerator (clear the intent) or strand it (clear the request and
+					// flag, so the seat never stops while its intent stays armed).
+					// NOT scoped to an intent in the snapshot (Codex #106 r11): the
+					// atomic handoff batch can land on a seat whose snapshot holds only
+					// a collateral request, and clearing that request then strands the
+					// handoff exactly as clearing the intent would.
+					if persistedRestartPendingSince(store, id, beadRequested) {
+						fmt.Fprintf(stderr, "session reconciler: deferring pinned restart guard for %s (bead %s): a restart was persisted after this tick's snapshot\n", name, id) //nolint:errcheck
+						continue
+					}
+					if pinnedGuardAfterReReadHook != nil {
+						pinnedGuardAfterReReadHook()
+					}
 					if tmuxRequested && dops != nil {
 						if err := dops.clearRestartRequested(name); err != nil && !runtime.IsSessionGone(err) {
 							fmt.Fprintf(stderr, "session reconciler: clearing deferred restart-requested marker for pinned named session %s (bead %s): %v\n", name, id, err) //nolint:errcheck
 						}
 					}
+					// The request is dropped UNCONSUMED, so no restart follows it. If a
+					// handoff's batch landed after the re-read above, this clear strips
+					// its request too; the derivedHandoff backstop at the top of this
+					// block restarts it on the next tick from the reset and intent,
+					// which this guard never touches here (Codex #106 r11, r12).
 					if beadRequested {
-						// applyStore: the clear is persisted and folded in one call, and
-						// the fold correctly does not advance past a rejected write —
-						// this entry is not read again this tick (we continue below).
-						tick.applyStore(id, sessFront, sessionpkg.MetadataPatch{"restart_requested": ""})
+						// applyStore does not fold past a rejected write, so a request
+						// that still reads "true" afterwards is a failed clear: say so.
+						if next := tick.applyStore(id, sessFront, sessionpkg.MetadataPatch{"restart_requested": ""}); next.RestartRequested == "true" {
+							fmt.Fprintf(stderr, "session reconciler: clearing collateral restart_requested for pinned named session %s (bead %s) FAILED; the next tick re-evaluates it\n", name, id) //nolint:errcheck
+						}
 					}
+					// RETIRE ONLY THE INTENT THIS TICK SAW (Codex #106 r4, r12). A
+					// paired intent must die with an unconsumed request, or it relabels
+					// the next unrelated ending. But a new handoff may have replaced it
+					// since the snapshot, so the retire is a compare-and-set on the
+					// intent's stamp: it succeeds only if the stamp is still the one
+					// this tick read. An intent without a stamp is unreadable
+					// (ReadTerminationIntent), so clearing the stamp retires it.
+					retirePinnedIntentIfUnchanged(store, id, name, infoByID[id].TerminationIntentAt, stderr)
 					fmt.Fprintf(stderr, "session reconciler: skipping abrupt restart-requested kill for pinned named session %s (bead %s)\n", name, id) //nolint:errcheck
 					continue
 				}
 				if runtimeRunning {
-					if err := workerKillSessionTargetWithConfig("", store, sp, cfg, name); err != nil {
+					// THE KIND COMES FROM WHOEVER ASKED, NOT FROM THIS BRANCH.
+					// A self-handoff does not stop its own runtime — it sets the
+					// restart flag and this tick performs the stop — so without
+					// the intent stamp every handoff was recorded as a generic
+					// restart and KindHandoff, the ratio's entire NUMERATOR, had
+					// no producer at all (Codex #106). The stamp also carries the
+					// request instant, which is what makes Timer B real here.
+					if err := workerKillSessionTargetWithTermination("", store, sp, cfg, name,
+						restartRequestTermination(infoByID[id])); err != nil {
 						fmt.Fprintf(stderr, "session reconciler: stopping restart-requested %s: %v\n", name, err) //nolint:errcheck
 						continue
 					}
@@ -3315,6 +3375,14 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					batch["session_key"] = ""
 				}
 				sessionpkg.StampPriorSessionKeyInfo(batch, infoByID[id])
+				// CONSUMED AT MOST ONCE, whether or not it was used. A handoff
+				// whose restart never arrives is a live bug (ga-cctcju), and an
+				// intent left armed would relabel whatever stopped the seat next
+				// as a handoff — over-claiming the numerator, which is worse than
+				// missing it.
+				for k, v := range sessionpkg.ClearTerminationIntentPatch() {
+					batch[k] = v
+				}
 				if err := sessionFrontDoor(store).ApplyPatch(id, batch); err != nil {
 					fmt.Fprintf(stderr, "session reconciler: recording restart handoff for %s: %v\n", name, err) //nolint:errcheck
 					continue
@@ -7641,4 +7709,94 @@ func resolveResumeCommand(command, sessionKey string, rp *config.ResolvedProvide
 	default: // "flag"
 		return command + " " + rp.ResumeFlag + " " + sessionKey
 	}
+}
+
+// restartRequestTermination turns a session's STATED intent into the record for
+// the stop this tick is about to perform, falling back to the honest generic
+// kind when nothing was stated.
+//
+// The fallback is KindRestartInPlace rather than unclassified because this
+// branch does know something real: a restart was requested and the seat's
+// conversation is about to end. What it cannot know, without the stamp, is WHO
+// asked and why — and a kind that guesses "handoff" for every restart request
+// would inflate the numerator with drains, which is the failure mode the ratio
+// most needs to be immune to.
+func restartRequestTermination(info sessionpkg.Info) runtime.Termination {
+	rec := runtime.Termination{
+		Kind:      runtime.KindRestartInPlace,
+		Actor:     "reconciler",
+		Reason:    "restart requested",
+		SessionID: info.ID,
+	}
+	kind, at, ok := sessionpkg.ReadTerminationIntent(info.TerminationIntent, info.TerminationIntentAt)
+	if !ok {
+		return rec
+	}
+	rec.Kind = kind
+	rec.Reason = "restart requested (" + string(kind) + ")"
+	rec.RequestedAt = at
+	return rec
+}
+
+// persistedRestartPendingSince re-reads a session bead and reports whether a
+// restart has been PERSISTED on it since the tick's snapshot: an explicit
+// controller reset (the guard only runs when the snapshot had none), or a bead
+// restart request the snapshot did not have. A request the snapshot already
+// saw is the one the guard itself is dropping, so it is not evidence of a new
+// one. The pinned guard uses this so it does not retire a termination intent
+// whose restart is about to be consumed.
+//
+// A failed read answers false, so the intent is cleared: over-claiming the
+// handoff numerator is worse than missing one ending (the rule this branch
+// applies throughout).
+// pinnedGuardAfterReReadHook, when set by a test, runs in the pinned restart
+// guard between its live re-read and its clears: the window in which a
+// handoff's atomic batch can still land unseen by the re-read.
+var pinnedGuardAfterReReadHook func()
+
+// pinnedHandoffIntentValid reports whether info carries a readable, STAMPED
+// termination intent. Only handoff paths write one, so on a pinned seat it is
+// the handoff's identity (see derivedHandoff).
+func pinnedHandoffIntentValid(info sessionpkg.Info) bool {
+	_, _, ok := sessionpkg.ReadTerminationIntent(info.TerminationIntent, info.TerminationIntentAt)
+	return ok
+}
+
+// retirePinnedIntentIfUnchanged clears termination.intent_at iff it still holds
+// snapshotAt, the stamp this tick read. A single-key compare-and-set is the
+// only conditional write the store offers everywhere, and the stamp is the key
+// that distinguishes the intent this tick saw from one a handoff wrote since.
+// Every outcome is logged as what it is; nothing here is load-bearing for the
+// restart itself (derivedHandoff is).
+func retirePinnedIntentIfUnchanged(store beads.Store, id, name, snapshotAt string, stderr io.Writer) {
+	snapshotAt = strings.TrimSpace(snapshotAt)
+	if snapshotAt == "" {
+		return
+	}
+	writer, ok := beads.MetadataCASWriterFor(store)
+	if !ok {
+		fmt.Fprintf(stderr, "session reconciler: pinned named session %s (bead %s): store offers no compare-and-set; leaving its unconsumed termination intent for the consume path\n", name, id) //nolint:errcheck
+		return
+	}
+	swapped, err := writer.CompareAndSetMetadataKey(id, sessionpkg.TerminationIntentAtKey, snapshotAt, "")
+	switch {
+	case err != nil:
+		fmt.Fprintf(stderr, "session reconciler: retiring the unconsumed termination intent of pinned named session %s (bead %s): %v\n", name, id, err) //nolint:errcheck
+	case !swapped:
+		fmt.Fprintf(stderr, "session reconciler: pinned named session %s (bead %s): its termination intent was renewed since this tick's snapshot; left for the next tick\n", name, id) //nolint:errcheck
+	}
+}
+
+func persistedRestartPendingSince(store beads.Store, id string, snapshotRequested bool) bool {
+	if store == nil || strings.TrimSpace(id) == "" {
+		return false
+	}
+	b, err := store.Get(id)
+	if err != nil {
+		return false
+	}
+	if strings.TrimSpace(b.Metadata["continuation_reset_pending"]) == "true" {
+		return true
+	}
+	return !snapshotRequested && strings.TrimSpace(b.Metadata["restart_requested"]) == "true"
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"os"
@@ -24,12 +25,15 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/beads/contract"
 	"github.com/gastownhall/gascity/internal/citylayout"
+
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/doltversion"
+	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/pathutil"
 	"github.com/gastownhall/gascity/internal/pidutil"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/runtime/terminationevents"
 	"github.com/gastownhall/gascity/internal/workspacesvc"
 )
 
@@ -509,11 +513,111 @@ type ZombieSessionsCheck struct {
 	cityName        string
 	sessionTemplate string
 	sp              runtime.Provider
+	termSink        runtime.TerminationSink
+	noRecorder      bool
+}
+
+// resolveTerminationSink returns the sink this check should record through,
+// plus a closer. Precedence: an explicit refusal wins, then an explicitly
+// supplied sink, then the DERIVED city event recorder.
+//
+// DERIVED AT FIX TIME, not at construction, because CheckContext is where
+// CityPath lives and Fix is the only path that ends a session. That also keeps
+// the file handle open for the duration of one fix instead of the process.
+// resolveTerminationSink returns the sink, its closer, and the error from
+// OPENING it. An open failure is not an opt-out: the caller still cleans up,
+// because a bookkeeping sink must never fail the operation it observes, but
+// it reports the failure afterward so a sweep whose endings went unrecorded
+// does not read as a clean one (Codex, PR #106 r8).
+//
+// THE CLOSER NEVER WAITS. A sink write that outlived TerminationSinkBudget is
+// left running by the seam and holds the FileRecorder's mutex; a synchronous
+// Close would block on that mutex and hang the command past the seam's
+// wall-clock bound. So the close runs in the background and lands after any
+// outstanding write.
+func resolveTerminationSink(ctx *CheckContext, explicit runtime.TerminationSink, noRecorder bool) (runtime.TerminationSink, func(), error) {
+	if noRecorder {
+		return nil, func() {}, nil
+	}
+	if explicit != nil {
+		return explicit, func() {}, nil
+	}
+	if ctx == nil || strings.TrimSpace(ctx.CityPath) == "" {
+		return nil, func() {}, nil
+	}
+	rec, err := events.NewFileRecorder(filepath.Join(ctx.CityPath, ".gc", "events.jsonl"), io.Discard)
+	if err != nil {
+		return nil, func() {}, fmt.Errorf("%w: opening the events recorder: %w", runtime.ErrTerminationRecord, err)
+	}
+	return terminationevents.New(rec, "doctor"), func() { go func() { _ = rec.Close() }() }, nil
+}
+
+// stopForCleanup stops one session for a doctor sweep. Only the STOP's failure
+// aborts the sweep. A failed termination record is collected and the sweep goes
+// on, because bookkeeping must never block cleanup: one events.jsonl ENOSPC used
+// to leave every later zombie or orphan untouched (Codex, PR #106 r7). The
+// unacknowledged-recorder sentinel is benign by the seam's own definition and is
+// not collected.
+func stopForCleanup(sp runtime.Provider, name string, rec runtime.Termination, sink runtime.TerminationSink, recFailures *[]error) error {
+	stopErr, recErr := runtime.StopRecordedDetailed(sp, name, rec, sink)
+	if recErr != nil && !terminationevents.IsUnacknowledgedEvent(recErr) {
+		*recFailures = append(*recFailures, fmt.Errorf("%s: %w", name, recErr))
+	}
+	return stopErr
+}
+
+// cleanupRecordError reports a sweep that finished its stops but lost records.
+func cleanupRecordError(what string, recFailures []error) error {
+	if len(recFailures) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s: every stop was attempted, but %d termination record(s) failed: %w",
+		what, len(recFailures), errors.Join(recFailures...))
+}
+
+// CheckOption configures an optional capability on a session check. It is
+// VARIADIC so that adding one does not touch the existing constructor callers —
+// one in cmd/gc and twelve in tests — which is the difference between a wiring
+// change and a refactor.
+type CheckOption func(*sessionCheckOpts)
+
+type sessionCheckOpts struct {
+	termSink   runtime.TerminationSink
+	noRecorder bool
+}
+
+// WithTerminationSink overrides the derived recorder with an explicit sink.
+// Mainly for tests that want to observe what was recorded.
+func WithTerminationSink(s runtime.TerminationSink) CheckOption {
+	return func(o *sessionCheckOpts) { o.termSink = s }
+}
+
+// WithNoTerminationRecorder is the ONLY way to make a doctor session-ending
+// silent, and it has to be said out loud (katya, ga-ksac39 S1 review).
+//
+// THE RECORDER IS DERIVED BY DEFAULT, NOT INJECTED, for the same reason the
+// Manager derives its bead sink: these are EVENT-ONLY sites, so a forgotten
+// option is not a missing corroboration, it is an UNCOUNTED DENOMINATOR ENTRY.
+// An opt-in would make the ratio's completeness depend on whether a future
+// caller remembered — and the callers who forget are never random.
+func WithNoTerminationRecorder() CheckOption {
+	return func(o *sessionCheckOpts) { o.noRecorder = true }
+}
+
+func applyCheckOptions(opts []CheckOption) sessionCheckOpts {
+	var o sessionCheckOpts
+	for _, fn := range opts {
+		if fn != nil {
+			fn(&o)
+		}
+	}
+	return o
 }
 
 // NewZombieSessionsCheck creates a check for zombie sessions.
-func NewZombieSessionsCheck(cfg *config.City, cityName, sessionTemplate string, sp runtime.Provider) *ZombieSessionsCheck {
-	return &ZombieSessionsCheck{cfg: cfg, cityName: cityName, sessionTemplate: sessionTemplate, sp: sp}
+func NewZombieSessionsCheck(cfg *config.City, cityName, sessionTemplate string, sp runtime.Provider, opts ...CheckOption) *ZombieSessionsCheck {
+	o := applyCheckOptions(opts)
+	return &ZombieSessionsCheck{cfg: cfg, cityName: cityName, sessionTemplate: sessionTemplate, sp: sp, termSink: o.termSink, noRecorder: o.noRecorder}
 }
 
 // Name returns the check identifier.
@@ -550,8 +654,14 @@ func (c *ZombieSessionsCheck) CanFix() bool { return true }
 // (GH#5742): the controller's own health patrol already reconciles zombie
 // sessions, and an uncoordinated Stop here would race it.
 func (c *ZombieSessionsCheck) Fix(ctx *CheckContext) error {
+	termSink, closeSink, openErr := resolveTerminationSink(ctx, c.termSink, c.noRecorder)
+	defer closeSink()
 	if IsControllerRunning(ctx.CityPath) {
 		return errControllerRunningFixSkipped
+	}
+	var recFailures []error
+	if openErr != nil {
+		recFailures = append(recFailures, openErr)
 	}
 	for _, a := range c.cfg.Agents {
 		if a.Suspended || len(a.ProcessNames) == 0 {
@@ -559,12 +669,19 @@ func (c *ZombieSessionsCheck) Fix(ctx *CheckContext) error {
 		}
 		sn := agent.SessionNameFor(c.cityName, a.QualifiedName(), c.sessionTemplate)
 		if c.sp.IsRunning(sn) && !c.sp.ProcessAlive(sn, a.ProcessNames) {
-			if err := c.sp.Stop(sn); err != nil {
+			// Reached only when IsRunning is true but ProcessAlive is false:
+			// the session shell outlived its agent process. A zombie by
+			// definition — nothing could have been asked of it.
+			if err := stopForCleanup(c.sp, sn, runtime.Termination{
+				Kind:   runtime.KindObservedDead,
+				Actor:  "doctor",
+				Reason: "zombie session: shell running, agent process dead",
+			}, termSink, &recFailures); err != nil {
 				return fmt.Errorf("killing zombie session %q: %w", sn, err)
 			}
 		}
 	}
-	return nil
+	return cleanupRecordError("killing zombie sessions", recFailures)
 }
 
 // OrphanSessionsCheck finds sessions with the city prefix not in config.
@@ -573,11 +690,14 @@ type OrphanSessionsCheck struct {
 	cityName        string
 	sessionTemplate string
 	sp              runtime.Provider
+	termSink        runtime.TerminationSink
+	noRecorder      bool
 }
 
 // NewOrphanSessionsCheck creates a check for orphaned sessions.
-func NewOrphanSessionsCheck(cfg *config.City, cityName, sessionTemplate string, sp runtime.Provider) *OrphanSessionsCheck {
-	return &OrphanSessionsCheck{cfg: cfg, cityName: cityName, sessionTemplate: sessionTemplate, sp: sp}
+func NewOrphanSessionsCheck(cfg *config.City, cityName, sessionTemplate string, sp runtime.Provider, opts ...CheckOption) *OrphanSessionsCheck {
+	o := applyCheckOptions(opts)
+	return &OrphanSessionsCheck{cfg: cfg, cityName: cityName, sessionTemplate: sessionTemplate, sp: sp, termSink: o.termSink, noRecorder: o.noRecorder}
 }
 
 // Name returns the check identifier.
@@ -636,6 +756,8 @@ func (c *OrphanSessionsCheck) CanFix() bool { return true }
 // (GH#5742): the controller's own health patrol already reconciles orphan
 // sessions, and an uncoordinated Stop here would race it.
 func (c *OrphanSessionsCheck) Fix(ctx *CheckContext) error {
+	termSink, closeSink, openErr := resolveTerminationSink(ctx, c.termSink, c.noRecorder)
+	defer closeSink()
 	if IsControllerRunning(ctx.CityPath) {
 		return errControllerRunningFixSkipped
 	}
@@ -652,14 +774,26 @@ func (c *OrphanSessionsCheck) Fix(ctx *CheckContext) error {
 		sn := agent.SessionNameFor(c.cityName, a.QualifiedName(), c.sessionTemplate)
 		expected[sn] = true
 	}
+	var recFailures []error
+	if openErr != nil {
+		recFailures = append(recFailures, openErr)
+	}
 	for _, s := range running {
 		if !expected[s] {
-			if err := c.sp.Stop(s); err != nil {
+			// An orphan is LIVE — it simply is not in config. Killing it is an
+			// operator force-exit of a running session, not an observed death,
+			// so it COUNTS in the ratio's denominator. It is not yet written
+			// anywhere: doctor checks carry no store or recorder.
+			if err := stopForCleanup(c.sp, s, runtime.Termination{
+				Kind:   runtime.KindOperatorKill,
+				Actor:  "doctor",
+				Reason: "reaping a session not present in city config",
+			}, termSink, &recFailures); err != nil {
 				return fmt.Errorf("killing orphan session %q: %w", s, err)
 			}
 		}
 	}
-	return nil
+	return cleanupRecordError("killing orphan sessions", recFailures)
 }
 
 // --- Data checks ---

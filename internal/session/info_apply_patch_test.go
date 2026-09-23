@@ -37,6 +37,7 @@ var allProjectedMetadataKeys = []string{
 	aliasHistoryMetadataKey, "continuity_eligible", "last_woke_at", "slept_at", "awake_started_at", "usage_compute_emitted_at", "state_reason",
 	"creation_complete_at", "continuation_reset_pending", SessionCircuitStateMetadataKey,
 	ResetCommittedAtKey,
+	TerminationIntentKey, TerminationIntentAtKey,
 	"generation", "started_config_hash", resumeSeededKey, "pin_awake", "held_until", "wait_hold",
 	"churn_count", "wake_mode", "sleep_intent", "instance_token", "detached_at",
 	beadmeta.LivenessReadDegradedMetadataKey,

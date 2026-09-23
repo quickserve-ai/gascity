@@ -9,6 +9,7 @@ import (
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/pricing"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/runtime/terminationevents"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/usage"
 )
@@ -20,11 +21,15 @@ type SessionRuntimeResolver func(info sessionpkg.Info, sessionKind string, metad
 // FactoryConfig constructs worker-owned session handles and catalogs without
 // leaking session.Manager setup into higher layers.
 type FactoryConfig struct {
-	Store                 beads.Store
-	Provider              runtime.Provider
-	CityPath              string
-	SearchPaths           []string
-	Recorder              events.Recorder
+	Store       beads.Store
+	Provider    runtime.Provider
+	CityPath    string
+	SearchPaths []string
+	Recorder    events.Recorder
+	// TerminationRecorder receives termination records ONLY (the Manager's
+	// second sink and runtime-only handles' only one) without enabling worker
+	// operation events the way Recorder does. Defaults to Recorder.
+	TerminationRecorder   events.Recorder
 	UsageSink             usage.Sink
 	ResolveTransport      func(template, provider string) string
 	ResolveSessionRuntime SessionRuntimeResolver
@@ -51,6 +56,7 @@ type Factory struct {
 	provider              runtime.Provider
 	searchPaths           []string
 	recorder              events.Recorder
+	termRecorder          events.Recorder
 	usageSink             usage.Sink
 	resolveSessionRuntime SessionRuntimeResolver
 	pricing               *pricing.Registry
@@ -73,6 +79,19 @@ func NewFactory(cfg FactoryConfig) (*Factory, error) {
 	}
 	if cfg.StaleKeyDetectionWaiter != nil {
 		opts = append(opts, sessionpkg.WithStaleKeyDetectionWaiter(cfg.StaleKeyDetectionWaiter))
+	}
+	// ga-ksac39: give the Manager's termination records their SECOND failure
+	// domain. The bead sink is wired by default and rides Dolt, so it fails
+	// during exactly the incidents that produce force-exits; this local append
+	// almost never does. Two sinks in one failure domain would be one sink with
+	// extra steps (katya, condition 2).
+	termRecorder := cfg.TerminationRecorder
+	if termRecorder == nil {
+		termRecorder = cfg.Recorder
+	}
+	if termRecorder != nil {
+		opts = append(opts, sessionpkg.WithTerminationSinks(
+			terminationevents.New(termRecorder, "worker")))
 	}
 	manager := sessionpkg.NewManagerWithOptions(cfg.Store, cfg.Provider, opts...)
 	return newFactory(manager, cfg)
@@ -102,6 +121,7 @@ func newFactory(manager *sessionpkg.Manager, cfg FactoryConfig) (*Factory, error
 		provider:              cfg.Provider,
 		searchPaths:           append([]string(nil), cfg.SearchPaths...),
 		recorder:              cfg.Recorder,
+		termRecorder:          cfg.TerminationRecorder,
 		usageSink:             usageSink,
 		resolveSessionRuntime: cfg.ResolveSessionRuntime,
 		pricing:               cfg.Pricing,
@@ -247,12 +267,13 @@ func (f *Factory) RuntimeHandle(sessionName, providerName, transport string, pro
 		return nil, sessionpkg.ErrSessionNotFound
 	}
 	return NewRuntimeHandle(RuntimeHandleConfig{
-		Provider:     f.provider,
-		SessionName:  sessionName,
-		ProviderName: providerName,
-		Transport:    transport,
-		ProcessNames: append([]string(nil), processNames...),
-		Recorder:     f.recorder,
+		Provider:            f.provider,
+		SessionName:         sessionName,
+		ProviderName:        providerName,
+		Transport:           transport,
+		ProcessNames:        append([]string(nil), processNames...),
+		Recorder:            f.recorder,
+		TerminationRecorder: f.termRecorder,
 	})
 }
 

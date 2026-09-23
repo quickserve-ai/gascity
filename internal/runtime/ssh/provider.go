@@ -204,7 +204,7 @@ func (p *Provider) Start(ctx context.Context, name string, cfg runtime.Config) e
 			}
 		}
 		if !p.hasSession(ctx, name) {
-			_ = p.Stop(name)
+			_ = p.Stop(name) // termination-seam:not-an-ending cleanup of a session that died during startup
 			return fmt.Errorf("%w: ssh session %q died immediately after startup", runtime.ErrSessionDiedDuringStartup, name)
 		}
 	}

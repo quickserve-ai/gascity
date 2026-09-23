@@ -16,6 +16,7 @@ import (
 	"github.com/gastownhall/gascity/internal/configedit"
 	"github.com/gastownhall/gascity/internal/rig"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/runtime/terminationevents"
 	"github.com/gastownhall/gascity/internal/ssrf"
 	workdirutil "github.com/gastownhall/gascity/internal/workdir"
 )
@@ -584,6 +585,20 @@ func (s *Server) humaHandleRigRestart(name string) (*RigActionResponse, error) {
 	// convergence mechanism — survivors will be caught on its next tick.
 	killed := make([]string, 0)
 	failed := make([]string, 0)
+	// ga-ksac39: this rig-kill is an operator force-exit of LIVE sessions, so it
+	// COUNTS in the handoff ratio's denominator and used to write nowhere.
+	//
+	// THE EVENT SINK IS THE ONLY ONE THAT CAN SERVE HERE, and that is a property
+	// of the handler rather than an omission. It kills by SESSION NAME, having
+	// never loaded a session bead, so the authoritative bead sink has no id to
+	// address. Resolving name -> id would put a store READ on the stop path,
+	// which is the one place a slow store must not reach (force-exits cluster in
+	// exactly the windows where the store is sick). Built ONCE outside the loop:
+	// events.Provider embeds events.Recorder, so no extra plumbing is needed.
+	var termSink runtime.TerminationSink
+	if rec := s.state.EventProvider(); rec != nil {
+		termSink = terminationevents.New(rec, "api")
+	}
 	for _, a := range cfg.Agents {
 		if workdirutil.ConfiguredRigName(s.state.CityPath(), a, cfg.Rigs) != name {
 			continue
@@ -591,9 +606,55 @@ func (s *Server) humaHandleRigRestart(name string) (*RigActionResponse, error) {
 		expanded := expandAgent(a, cityName, cfg.Workspace.SessionTemplate, sp)
 		for _, ea := range expanded {
 			sessionName := agentSessionName(cityName, ea.qualifiedName, cfg.Workspace.SessionTemplate)
-			if err := sp.Stop(sessionName); err != nil {
+			// RECORD ONLY WHAT ACTUALLY ENDED. expandAgent statically enumerates
+			// CONFIGURED seats — including suspended and on-demand ones with no
+			// runtime at all — and most providers return nil when Stop targets a
+			// missing session. Recording unconditionally therefore minted an
+			// operator-kill DENOMINATOR row for every inactive seat a rig restart
+			// swept over, inflating the ratio's denominator with endings that
+			// never happened (Codex, PR #106).
+			//
+			// A liveness probe is affordable here in a way it is not on the
+			// reconciler's hot path: this is one operator action, not a tick.
+			//
+			// THE PROBE GATES THE RECORD, NEVER THE STOP. IsRunning is narrower
+			// than what Stop cleans up: the k8s provider's Stop deletes
+			// label-matched pods in EVERY phase (Pending, Failed, Running before
+			// tmux appears), and tmux dead panes have the same shape. Skipping
+			// Stop on a false probe left those resources behind while the
+			// restart reported success (Codex #106 r4).
+			running := sp.IsRunning(sessionName)
+			// An operator killing a rig's agents through the API.
+			//
+			// killed/failed follow the STOP, never the record. The event sink
+			// returns errUnacknowledgedEvent through any plain void Recorder —
+			// the ordinary configuration — so the joined error would have listed
+			// every successfully killed agent under Failed. Same shape as the
+			// Manager strand this branch already fixed; the two questions have to
+			// stay apart at every caller, not just the one that was reviewed.
+			//
+			// A seat that was not running still goes through the seam, as
+			// observed-dead: it is out of the denominator, and it says what
+			// happened (cleanup of whatever runtime was left) instead of
+			// claiming an operator ended a live session. Routing it around the
+			// seam would need a fence exemption, and the fence's value is that
+			// it has none.
+			term := runtime.Termination{
+				Kind:   runtime.KindOperatorKill,
+				Actor:  "api",
+				Reason: "rig-scoped kill of all agents",
+			}
+			if !running {
+				term.Kind = runtime.KindObservedDead
+				term.Reason = "rig-scoped kill: not running at probe; cleanup stop of any leftover runtime"
+			}
+			stopErr, recErr := runtime.StopRecordedDetailed(sp, sessionName, term, termSink)
+			if recErr != nil {
+				log.Printf("api: rig restart: killed %s but the termination record failed: %v", ea.qualifiedName, recErr)
+			}
+			if stopErr != nil {
 				// "session gone" is benign — agent wasn't running.
-				if !runtime.IsSessionGone(err) {
+				if !runtime.IsSessionGone(stopErr) {
 					failed = append(failed, ea.qualifiedName)
 				}
 			} else {

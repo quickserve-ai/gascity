@@ -16,9 +16,11 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/extmsg"
 	"github.com/gastownhall/gascity/internal/hostboot"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/runtime/terminationevents"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/storeref"
 )
@@ -3242,11 +3244,29 @@ func cleanupDeadRuntimeSessionCorpses(
 		if !dead {
 			continue
 		}
-		if err := sp.Stop(name); err != nil {
-			if runtime.IsSessionGone(err) {
+		// The runtime was already CONFIRMED dead above, so there was never
+		// anything to ask: observed-dead, outside the ratio's denominator.
+		// Only the STOP's failure may skip the close below. A failed termination
+		// record after a successful stop used to leave a confirmed-dead bead open,
+		// holding its alias and its assigned work, which blocks exactly the
+		// replacement this cleanup exists to unblock (Codex, PR #106 r7). The
+		// record failure is reported on its own.
+		stopErr, recErr := runtime.StopRecordedDetailed(sp, name, runtime.Termination{
+			Kind:   runtime.KindObservedDead,
+			Actor:  "reconciler",
+			Reason: "cleaning a confirmed-dead runtime session",
+			// The id is already in hand from the snapshot this loop walks, so
+			// the sink never has to resolve a name.
+			SessionID: info.ID,
+		}, reconcilerTerminationSinks(store, nil)...)
+		if recErr != nil {
+			fmt.Fprintf(stderr, "session reconciler: dead runtime session %s: termination record failed: %v\n", name, recErr) //nolint:errcheck
+		}
+		if stopErr != nil {
+			if runtime.IsSessionGone(stopErr) {
 				continue
 			}
-			fmt.Fprintf(stderr, "session reconciler: cleaning dead runtime session %s: %v\n", name, err) //nolint:errcheck
+			fmt.Fprintf(stderr, "session reconciler: cleaning dead runtime session %s: %v\n", name, stopErr) //nolint:errcheck
 			continue
 		}
 		fmt.Fprintf(stderr, "session reconciler: cleaned dead runtime session %s\n", name) //nolint:errcheck
@@ -3364,7 +3384,15 @@ func reapRuntimesBoundToClosedBeads(
 			continue
 		}
 
-		if err := sp.Stop(name); err != nil {
+		// A runtime still occupying a name whose session bead is already
+		// CLOSED — a stale reap, not an ending anyone could have been asked
+		// about.
+		if err := runtime.StopRecorded(sp, name, runtime.Termination{
+			Kind:      runtime.KindObservedDead,
+			Actor:     "reconciler",
+			Reason:    "reaping a runtime bound to a closed session bead",
+			SessionID: liveID,
+		}, reconcilerTerminationSinks(store, nil)...); err != nil {
 			if runtime.IsSessionGone(err) {
 				continue
 			}
@@ -3839,4 +3867,38 @@ func resolvePoolSlot(agentName, template string) int {
 		return slot
 	}
 	return 0
+}
+
+// reconcilerTerminationActor names the process these sinks record for.
+const reconcilerTerminationActor = "reconciler"
+
+// reconcilerTerminationSinks builds the sinks for a reconciler-side ending.
+//
+// WHY THIS EXISTS AT ALL: routing a call through the seam makes the fence read
+// clean and the census read complete, and an EMPTY SINK LIST then writes nothing
+// anywhere. "Migrated" and "collecting" are different properties and only the
+// first was being checked (Codex #106). These particular endings are
+// observed-dead and therefore outside the ratio's denominator — but excluded is
+// not the same as invisible: a bucket that leaves the ratio must still be
+// reportable on its own line (katya, condition 1), and an unrecorded ending is
+// not reportable at all.
+//
+// A nil store yields no bead sink rather than a panic, and the bead sink itself
+// refuses a record with no SessionID rather than resolving one — a name->id
+// lookup belongs nowhere near a stop.
+//
+// The actor is fixed rather than a parameter: every caller of this helper IS the
+// reconciler, and a parameter that only ever receives one value is a knob that
+// invites a wrong answer later.
+func reconcilerTerminationSinks(store beads.Store, rec events.Recorder) []runtime.TerminationSink {
+	var sinks []runtime.TerminationSink
+	if store != nil {
+		if bead := session.NewBeadTerminationSink(session.NewStore(beads.SessionStore{Store: store})); bead != nil {
+			sinks = append(sinks, bead)
+		}
+	}
+	if rec != nil {
+		sinks = append(sinks, terminationevents.New(rec, reconcilerTerminationActor))
+	}
+	return sinks
 }

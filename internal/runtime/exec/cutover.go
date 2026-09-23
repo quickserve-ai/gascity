@@ -54,7 +54,8 @@ func (s *seamBackedProvider) CheckImage(image string) error {
 
 // Relaunch passes through to the underlying provider's warm-box relaunch (B2,
 // RelaunchProvider): for a separable pack it respawns the agent over the exec op;
-// for a welded pack it degrades to a reprovision.
+// a welded pack declines with ErrRelaunchUnsupported and the reconciler performs
+// its recorded full restart.
 func (s *seamBackedProvider) Relaunch(ctx context.Context, name string, cfg runtime.Config) error {
 	return s.raw.Relaunch(ctx, name, cfg)
 }

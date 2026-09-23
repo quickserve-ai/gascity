@@ -1967,7 +1967,7 @@ func commitAsyncStartResultWithContext(
 		// start_call / post_start_observe; only commit_refresh was
 		// stamped above. No restore needed.
 		if cleanupRuntime && !startOutcomeDefersCommit(result.outcome) {
-			stopStaleAsyncStartRuntime(result, sp, stderr)
+			stopStaleAsyncStartRuntime(result, sp, store, rec, stderr)
 		}
 		outcome := "stale_async_start"
 		if releaseInFlight {
@@ -1990,7 +1990,7 @@ func commitAsyncStartResultWithContext(
 			return commitStartResultTraced(refreshed, sessFront, clk, rec, wave, stdout, stderr, trace)
 		}
 		if refreshed.err == nil && shouldRollbackPendingCreateInfo(refreshed.prepared.candidate.info) {
-			stopStaleAsyncStartRuntime(refreshed, sp, stderr)
+			stopStaleAsyncStartRuntime(refreshed, sp, store, rec, stderr)
 			rollbackPendingCreate(refreshed.prepared.candidate.info, sessFront, clk.Now().UTC(), stderr)
 		}
 		logLifecycleOutcome(stderr, "start", wave, name, template, "context_canceled", refreshed.started, time.Now(), ctx.Err(), refreshed.phases)
@@ -2067,7 +2067,7 @@ func clearPendingStartInFlightLease(handle string, sessFront *sessionpkg.Store, 
 	setMeta(sessFront, handle, "last_woke_at", "", stderr) //nolint:errcheck
 }
 
-func stopStaleAsyncStartRuntime(result startResult, sp runtime.Provider, stderr io.Writer) {
+func stopStaleAsyncStartRuntime(result startResult, sp runtime.Provider, store beads.Store, rec events.Recorder, stderr io.Writer) {
 	if sp == nil || strings.TrimSpace(result.prepared.candidate.info.ID) == "" {
 		return
 	}
@@ -2075,7 +2075,13 @@ func stopStaleAsyncStartRuntime(result startResult, sp runtime.Provider, stderr 
 	if !runningSessionMatchesPendingCreateInfo(result.prepared.candidate.info, name, sp) {
 		return
 	}
-	if err := sp.Stop(name); err != nil && !runtime.IsSessionGone(err) {
+	// Async-start cleanup, named explicitly in KindObservedDead's contract.
+	if err := runtime.StopRecorded(sp, name, runtime.Termination{
+		Kind:      runtime.KindObservedDead,
+		Actor:     "reconciler",
+		Reason:    "stopping a stale async-start runtime",
+		SessionID: result.prepared.candidate.info.ID,
+	}, reconcilerTerminationSinks(store, rec)...); err != nil && !runtime.IsSessionGone(err) {
 		fmt.Fprintf(stderr, "session reconciler: stopping stale async start runtime %s: %v\n", name, err) //nolint:errcheck
 	}
 }
@@ -2164,7 +2170,21 @@ func startPreparedStartCandidate(
 			// zombie — so recycle it: stop the stale session and fall
 			// through to a fresh start.
 			recycleBegin := time.Now()
-			stopErr := sp.Stop(name)
+			// Zombie recycle: the agent process is dead and the comment above
+			// spells out that there is nothing left to preserve.
+			// Only the STOP's failure may abort the fresh start. A failed
+			// termination record after a successful stop used to turn a good
+			// recycle into a failed start, delaying the replacement to a later
+			// reconcile (Codex, PR #106 r8). The record failure is logged.
+			stopErr, recErr := runtime.StopRecordedDetailed(sp, name, runtime.Termination{
+				Kind:      runtime.KindObservedDead,
+				Actor:     "reconciler",
+				Reason:    "recycling a session whose agent process is dead",
+				SessionID: item.candidate.info.ID,
+			}, reconcilerTerminationSinks(store, nil)...)
+			if recErr != nil {
+				log.Printf("session %s: zombie recycle stopped the runtime but its termination record failed: %v", name, recErr)
+			}
 			if phases != nil {
 				phases.ZombieRecycle = time.Since(recycleBegin)
 			}
@@ -3665,7 +3685,14 @@ func stopTargetThroughWorkerBoundary(target stopTarget, store beads.Store, sp ru
 		targetID = strings.TrimSpace(target.name)
 	}
 	if cityStopSessionMarked(store, target.sessionID) {
-		if err := workerKillSessionTargetWithConfig("", store, sp, cfg, targetID); err != nil {
+		// This branch ALREADY KNOWS it is a city stop — that is what the marker
+		// means — and it was throwing that knowledge away at the kill, so every
+		// surviving seat recorded as unclassified. Intent belongs to the caller
+		// (Codex #106; KindCityStop had no producer).
+		if err := workerKillSessionTargetWithTermination("", store, sp, cfg, targetID, runtime.Termination{
+			Kind:   runtime.KindCityStop,
+			Reason: "city stop: force-stopped after the interrupt",
+		}); err != nil {
 			return err
 		}
 		markCityStopSessionAsAsleep(sessionFrontDoor(store), target.sessionID, nil)

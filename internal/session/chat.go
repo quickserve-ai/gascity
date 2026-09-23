@@ -652,7 +652,14 @@ func (m *Manager) ensureRunning(ctx context.Context, id string, b beads.Bead, se
 	}
 	if err := m.confirmLiveSessionState(id, &b); err != nil {
 		if started && !errors.Is(err, ErrStateSync) {
-			_ = m.sp.Stop(sessName)
+			// The runtime came up but its live state never confirmed, so the
+			// start is being rolled back. Nothing was ever asked of this
+			// session — the same shape as createStarted's rollback.
+			_ = m.stopRecorded(sessName, runtime.Termination{
+				Kind:      runtime.KindObservedDead,
+				Reason:    "start rollback: live session state not confirmed",
+				SessionID: id,
+			})
 		}
 		return err
 	}

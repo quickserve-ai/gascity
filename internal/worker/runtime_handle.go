@@ -11,6 +11,7 @@ import (
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/promptsafe"
 	"github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/runtime/terminationevents"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 )
 
@@ -27,6 +28,11 @@ type RuntimeHandleConfig struct {
 	Transport    string
 	ProcessNames []string
 	Recorder     events.Recorder
+	// TerminationRecorder, when set, receives ONLY this handle's termination
+	// record. Unlike Recorder it does not switch on worker operation events,
+	// so a caller can make endings countable without changing anything else
+	// the handle emits (Codex, PR #106 r8). Defaults to Recorder.
+	TerminationRecorder events.Recorder
 }
 
 // RuntimeHandle adapts a legacy runtime session name to the canonical worker
@@ -39,6 +45,16 @@ type RuntimeHandle struct {
 	transport    string
 	processNames []string
 	recorder     events.Recorder
+	// termSink records WHY this runtime session ended (ga-ksac39).
+	//
+	// THE EVENT SINK IS THE ONLY ONE POSSIBLE HERE, and that is a property of
+	// the handle, not an omission. A RuntimeHandle is a legacy runtime-only
+	// target with NO bead-backed session identity — that is its whole
+	// definition — so the authoritative bead sink has nothing to address and
+	// would return ErrNoSessionID on every call. The corroborating event is
+	// the entire record for these endings. It is built from the recorder the
+	// handle already carries.
+	termSink *terminationevents.Sink
 }
 
 var _ Handle = (*RuntimeHandle)(nil)
@@ -55,6 +71,10 @@ func NewRuntimeHandle(cfg RuntimeHandleConfig) (*RuntimeHandle, error) {
 	if recorder == nil {
 		recorder = events.Discard
 	}
+	termRecorder := cfg.TerminationRecorder
+	if termRecorder == nil {
+		termRecorder = recorder
+	}
 	return &RuntimeHandle{
 		provider:     cfg.Provider,
 		sessionName:  strings.TrimSpace(cfg.SessionName),
@@ -62,6 +82,7 @@ func NewRuntimeHandle(cfg RuntimeHandleConfig) (*RuntimeHandle, error) {
 		transport:    strings.TrimSpace(cfg.Transport),
 		processNames: append([]string(nil), cfg.ProcessNames...),
 		recorder:     recorder,
+		termSink:     terminationevents.New(termRecorder, "worker"),
 	}, nil
 }
 
@@ -129,11 +150,20 @@ func (h *RuntimeHandle) Reset(ctx context.Context) (err error) {
 }
 
 // Stop asks the provider to stop the live runtime session.
+//
+// KindUnclassified IS THE HONEST ANSWER HERE, not a placeholder. The closed
+// vocabulary has no "operator-stop", because a generic Stop through the
+// LifecycleHandle interface carries no statement of intent: the same call
+// serves a drain, a recycle and an operator. Guessing one would put a WRONG
+// value in the ratio, which is worse than an absent one — so it goes to the
+// bucket that is counted and budgeted (UnclassifiedBudget, 5%), and its share
+// is the instrument's own health metric. If this path ever carries real
+// traffic, the budget is what will say so.
 func (h *RuntimeHandle) Stop(ctx context.Context) (err error) {
 	event := h.beginOperationEvent(ctx, workerOperationStop)
 	defer func() { event.finish(err) }()
 
-	err = h.provider.Stop(h.sessionName)
+	err = h.stopRecorded(runtime.Termination{Kind: runtime.KindUnclassified, Reason: "worker RuntimeHandle.Stop"})
 	return err
 }
 
@@ -142,7 +172,24 @@ func (h *RuntimeHandle) Kill(ctx context.Context) (err error) {
 	event := h.beginOperationEvent(ctx, workerOperationKill)
 	defer func() { event.finish(err) }()
 
-	err = h.provider.Stop(h.sessionName)
+	err = h.stopRecorded(runtime.Termination{Kind: runtime.KindOperatorKill, Reason: "worker RuntimeHandle.Kill"})
+	return err
+}
+
+// KillWithTermination is Kill with the caller's statement of WHY, overriding
+// this handle's default operator-kill.
+func (h *RuntimeHandle) KillWithTermination(ctx context.Context, rec runtime.Termination) (err error) {
+	event := h.beginOperationEvent(ctx, workerOperationKill)
+	defer func() { event.finish(err) }()
+
+	// The caller's record passes through WHOLE. EventID and RequestedAt in
+	// particular: a retrying caller pins EventID so its attempts dedup, and a
+	// handle that rebuilt the record would mint a fresh id per attempt (Codex,
+	// PR #106 r7). Only an invalid Kind falls back to this handle's default.
+	if !rec.Kind.Valid() {
+		rec.Kind, rec.Reason = runtime.KindOperatorKill, "worker RuntimeHandle.Kill"
+	}
+	err = h.stopRecorded(rec)
 	return err
 }
 
@@ -151,8 +198,54 @@ func (h *RuntimeHandle) Close(ctx context.Context) (err error) {
 	event := h.beginOperationEvent(ctx, workerOperationClose)
 	defer func() { event.finish(err) }()
 
-	err = h.provider.Stop(h.sessionName)
+	err = h.stopRecorded(runtime.Termination{Kind: runtime.KindOperatorClose, Reason: "worker RuntimeHandle.Close"})
 	return err
+}
+
+// stopRecorded funnels this handle's endings through the termination seam.
+// It fills only the defaults a runtime-only handle owns: Actor "worker" when
+// the caller named none. Everything else the caller set is kept. The handle
+// never INVENTS a SessionID: it has no bead, and inventing an id (or resolving
+// one by name) would either falsify the record or put a store read on the stop
+// path. A SessionID the caller already held passes through.
+func (h *RuntimeHandle) stopRecorded(rec runtime.Termination) error {
+	if rec.Actor == "" {
+		rec.Actor = "worker"
+	}
+	kind := rec.Kind
+	stopErr, recErr := runtime.StopRecordedDetailed(h.provider, h.sessionName, rec, h.termSink)
+	// ONLY THE STOP'S OWN FAILURE IS THIS METHOD'S ERROR. Stop/Kill/Close on a
+	// Handle mean "did the session end", and callers branch on that. Returning
+	// a bookkeeping problem here would make a working stop look broken — and
+	// it would do so in the COMMON configuration, because the event sink
+	// reports "emitted to a recorder that cannot acknowledge it" through any
+	// plain void Recorder, which is what most callers pass. That is strictly
+	// worse than an uncounted ending.
+	//
+	// The record problem is not swallowed into nothing: it rides the worker
+	// operation event this method is already wrapped in, so it stays visible
+	// where bookkeeping belongs rather than in the lifecycle's error path.
+	if recErr != nil {
+		h.recordTerminationRecordFailure(kind, recErr)
+	}
+	return stopErr
+}
+
+// recordTerminationRecordFailure notes that an ending happened but was not
+// provably written down. It is deliberately quiet about the unacknowledged
+// case, which is a legitimate configuration rather than a fault: a void
+// Recorder cannot confirm anything, and treating that as an incident would
+// train people to ignore the signal that matters.
+func (h *RuntimeHandle) recordTerminationRecordFailure(kind runtime.TerminationKind, recErr error) {
+	if terminationevents.IsUnacknowledgedEvent(recErr) {
+		return
+	}
+	h.recorder.Record(events.Event{
+		Type:    events.WorkerOperation,
+		Actor:   "worker",
+		Subject: h.sessionName,
+		Message: fmt.Sprintf("termination record failed for a %s ending: %v", kind, recErr),
+	})
 }
 
 // CloseDetailed asks the provider to close the live runtime session and

@@ -17,6 +17,40 @@ import (
 	"github.com/gastownhall/gascity/internal/runtime"
 )
 
+// metadataUnchangedIgnoringTerminationRecord reports whether the session's
+// LIFECYCLE metadata is untouched, ignoring the termination.* record.
+//
+// THE INVARIANT THESE TESTS GUARD IS "DO NOT DRAW A CONCLUSION YOU CANNOT
+// SUPPORT" — do not complete a drain, flip state, or clear a claim when the
+// post-stop liveness probe came back unavailable. It is NOT "write nothing".
+// The termination record says a stop HAPPENED, which is exactly what the
+// provider call log independently confirms in these same tests; suppressing it
+// would mean the one ending we are surest about is the one we refuse to count
+// (ga-ksac39).
+//
+// AND THE RECORD IS AN ATTEMPT, NOT A CONFIRMED OUTCOME. In production this
+// same unavailable-probe window is precisely where the stop's result is
+// UNKNOWN, so a termination.* row here may legitimately disagree with a
+// session that turns out to still be running. That is not corruption; the sink
+// pass runs before p.Stop returns by design.
+//
+// It is written as an ALLOW-LIST OF ONE PREFIX rather than a loosened
+// comparison: every other key still has to match exactly, so the guard keeps
+// its teeth against the mutations it was written to catch.
+func metadataUnchangedIgnoringTerminationRecord(before, after beads.StringMap) bool {
+	strip := func(m beads.StringMap) map[string]string {
+		out := make(map[string]string, len(m))
+		for k, v := range m {
+			if strings.HasPrefix(k, "termination.") {
+				continue
+			}
+			out[k] = v
+		}
+		return out
+	}
+	return maps.Equal(strip(before), strip(after))
+}
+
 // sequencedRuntimeObservationProvider makes a secondary observation fail while
 // leaving the primary liveness probe authoritative. This exercises the actual
 // reconciler boundaries rather than a helper-only approximation.
@@ -86,7 +120,7 @@ func assertObservationDeferralPreservedSession(t *testing.T, env *reconcilerTest
 	if err != nil {
 		t.Fatalf("Get(%s) after reconcile: %v", before.ID, err)
 	}
-	if after.Status != before.Status || !maps.Equal(after.Metadata, before.Metadata) {
+	if after.Status != before.Status || !metadataUnchangedIgnoringTerminationRecord(before.Metadata, after.Metadata) {
 		t.Fatalf("runtime-observation deferral mutated session:\n before: status=%q metadata=%#v\n  after: status=%q metadata=%#v", before.Status, before.Metadata, after.Status, after.Metadata)
 	}
 	if got := env.sp.CountCalls("Start", sessionName); got != startsBefore {
@@ -396,7 +430,7 @@ func TestAdvanceSessionDrains_LivenessUnavailableAfterVerifiedStopDefersCompleti
 	if err != nil {
 		t.Fatalf("Get after drain advance: %v", err)
 	}
-	if !maps.Equal(after.Metadata, before.Metadata) {
+	if !metadataUnchangedIgnoringTerminationRecord(before.Metadata, after.Metadata) {
 		t.Fatalf("metadata mutated after unavailable post-stop probe: before=%#v after=%#v", before.Metadata, after.Metadata)
 	}
 	if got := sp.CountCalls("Stop", "test-session"); got != 1 {

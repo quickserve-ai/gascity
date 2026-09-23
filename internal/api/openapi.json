@@ -2698,6 +2698,9 @@
             "$ref": "#/components/schemas/SessionSubmitSucceededPayload"
           },
           {
+            "$ref": "#/components/schemas/SessionTerminatedPayload"
+          },
+          {
             "$ref": "#/components/schemas/SessionUnknownStatePayload"
           },
           {
@@ -10974,6 +10977,42 @@
         ],
         "type": "object"
       },
+      "SessionTerminatedPayload": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "at": {
+            "type": "string"
+          },
+          "event_id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "requested_at": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "session_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "at",
+          "session_name",
+          "event_id"
+        ],
+        "type": "object"
+      },
       "SessionTranscriptConversationResponse": {
         "additionalProperties": false,
         "properties": {
@@ -12546,6 +12585,7 @@
             "session.stopped": "#/components/schemas/TypedEventStreamEnvelopeSessionStopped",
             "session.stranded": "#/components/schemas/TypedEventStreamEnvelopeSessionStranded",
             "session.suspended": "#/components/schemas/TypedEventStreamEnvelopeSessionSuspended",
+            "session.terminated": "#/components/schemas/TypedEventStreamEnvelopeSessionTerminated",
             "session.undrained": "#/components/schemas/TypedEventStreamEnvelopeSessionUndrained",
             "session.unknown_state": "#/components/schemas/TypedEventStreamEnvelopeSessionUnknownState",
             "session.updated": "#/components/schemas/TypedEventStreamEnvelopeSessionUpdated",
@@ -12816,6 +12856,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionSuspended"
+          },
+          {
+            "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionTerminated"
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionUndrained"
@@ -14214,7 +14257,8 @@
                 "storage.binding.genesis",
                 "storage.binding.unconverged",
                 "storage.binding.uncheckable",
-                "storage.binding.not_configured"
+                "storage.binding.not_configured",
+                "session.terminated"
               ]
             },
             "type": "string"
@@ -17767,6 +17811,63 @@
         "title": "TypedEventStreamEnvelope session.suspended",
         "type": "object"
       },
+      "TypedEventStreamEnvelopeSessionTerminated": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/SessionTerminatedPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.terminated",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload"
+        ],
+        "title": "TypedEventStreamEnvelope session.terminated",
+        "type": "object"
+      },
       "TypedEventStreamEnvelopeSessionUndrained": {
         "additionalProperties": false,
         "properties": {
@@ -18880,6 +18981,7 @@
             "session.stopped": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionStopped",
             "session.stranded": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionStranded",
             "session.suspended": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionSuspended",
+            "session.terminated": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionTerminated",
             "session.undrained": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionUndrained",
             "session.unknown_state": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionUnknownState",
             "session.updated": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionUpdated",
@@ -19150,6 +19252,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionSuspended"
+          },
+          {
+            "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionTerminated"
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionUndrained"
@@ -20635,7 +20740,8 @@
                 "storage.binding.genesis",
                 "storage.binding.unconverged",
                 "storage.binding.uncheckable",
-                "storage.binding.not_configured"
+                "storage.binding.not_configured",
+                "session.terminated"
               ]
             },
             "type": "string"
@@ -24435,6 +24541,67 @@
           "city"
         ],
         "title": "TypedTaggedEventStreamEnvelope session.suspended",
+        "type": "object"
+      },
+      "TypedTaggedEventStreamEnvelopeSessionTerminated": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/SessionTerminatedPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.terminated",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload",
+          "city"
+        ],
+        "title": "TypedTaggedEventStreamEnvelope session.terminated",
         "type": "object"
       },
       "TypedTaggedEventStreamEnvelopeSessionUndrained": {

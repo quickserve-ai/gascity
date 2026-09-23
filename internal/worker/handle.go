@@ -43,6 +43,21 @@ type LifecycleHandle interface {
 	StateHandle
 }
 
+// TerminationIntentKiller is the optional capability of ending a session WITH a
+// stated reason. Callers that know why they are killing type-assert for it; the
+// rest use Kill, which records the counted, budgeted "unclassified".
+type TerminationIntentKiller interface {
+	KillWithTermination(context.Context, runtime.Termination) error
+}
+
+// TerminationIntentResetter is implemented by handles that can persist a reset
+// and a termination intent in one batch (SessionHandle). Additive, like
+// TerminationIntentKiller: a caller type-asserts and falls back to writing the
+// intent separately and then calling Reset.
+type TerminationIntentResetter interface {
+	ResetWithTerminationIntent(context.Context, runtime.TerminationKind, time.Time) error
+}
+
 // MessagingHandle exposes live input delivery operations.
 type MessagingHandle interface {
 	Message(context.Context, MessageRequest) (MessageResult, error)

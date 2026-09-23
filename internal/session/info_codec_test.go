@@ -114,6 +114,8 @@ func infoFromPersistedBeadFrozen(b beads.Bead) Info {
 		ContinuationResetPending:   b.Metadata["continuation_reset_pending"],
 		SessionCircuitState:        b.Metadata[SessionCircuitStateMetadataKey],
 		ResetCommittedAt:           b.Metadata[ResetCommittedAtKey],
+		TerminationIntent:          b.Metadata[TerminationIntentKey],
+		TerminationIntentAt:        b.Metadata[TerminationIntentAtKey],
 		Generation:                 b.Metadata["generation"],
 		StartedConfigHash:          b.Metadata["started_config_hash"],
 		ResumeSeeded:               b.Metadata[resumeSeededKey],

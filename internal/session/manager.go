@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"time"
 
@@ -357,6 +358,16 @@ type Info struct {
 	// the durable marker for when a restart handoff committed. resetPendingCommittedAtInfo
 	// parses it; the Info mirror keeps the raw value.
 	ResetCommittedAt string // reset_committed_at (raw)
+
+	// TerminationIntent and TerminationIntentAt are the RAW termination.intent
+	// and termination.intent_at metadata: a kind STATED by the path that asked
+	// for an ending, for the different path that performs it. `gc handoff` sets
+	// them; the reconciler's restart-consume reads them so the ending records as
+	// a handoff rather than as a generic restart, and so Timer B has a real
+	// request instant. See TerminationIntentPatch for the consumed-at-most-once
+	// rule.
+	TerminationIntent   string // termination.intent (raw)
+	TerminationIntentAt string // termination.intent_at (raw, RFC3339 or empty)
 	// Generation is the RAW generation metadata, verbatim. The drain/wake
 	// staleness checks read it BOTH as strconv.Atoi (numeric compare against the
 	// in-memory drain generation) AND strings.TrimSpace (string compare against
@@ -627,6 +638,12 @@ type Manager struct {
 	transportResolver       func(template, provider string) transportResolution
 	clk                     clock.Clock
 	staleKeyDetectionWaiter StaleKeyDetectionWaiter
+	// terminationSinks receive a record for every session ending the Manager
+	// causes. Nil is legal and means "record nowhere": the Manager is
+	// constructed in tests and in tools that have no store, and a stop must
+	// never depend on bookkeeping being wired up (ga-ksac39, StopRecorded
+	// rule 1).
+	terminationSinks []runtime.TerminationSink
 }
 
 // PruneResult reports which sessions were pruned and which queued wait nudges
@@ -804,6 +821,60 @@ func (m *Manager) routeACPIfNeeded(provider, transport, sessName string) func() 
 	return func() { router.Unroute(sessName) }
 }
 
+// stopRecorded funnels every Manager-caused session ending through the
+// termination seam (ga-ksac39 S1).
+//
+// WHY A METHOD AND NOT A DIRECT StopRecorded CALL AT EACH SITE. Two fields are
+// the same at every Manager site and getting either wrong is silent: the sinks
+// (always m.terminationSinks) and the actor (always whoever is driving this
+// process). Centralizing them here means a new Manager stop site inherits both
+// by construction rather than by the author remembering.
+//
+// THE ACTOR IS READ FROM $GC_AGENT AND IS DELIBERATELY ALLOWED TO BE EMPTY.
+// When a seat runs `gc session kill`, GC_AGENT names that seat and the record
+// is exact. When the supervisor or an API handler drives the Manager, GC_AGENT
+// is unset and the sink applies its own default, which is the one that knows
+// which process it is running in. What this CANNOT distinguish is a human at a
+// terminal from a seat, when both have GC_AGENT set — so "human" is never
+// claimed here. Naming a wrong actor is worse than naming none: a checkable but
+// wrong attribution is harder to unwind than a missing one.
+// *** ONLY THE STOP'S OWN FAILURE IS THIS METHOD'S ERROR. *** Every caller here
+// branches on the result to decide whether to persist the session's new
+// lifecycle state, and a sink failure is EXPLICITLY ALLOWED — that is what the
+// five-second TerminationSinkBudget is for. Returning the joined error made
+// Suspend and CloseDetailed abort BEFORE writing the suspended/closed state, so
+// an unreachable event log or a sick Dolt turned a successful stop into a dead
+// runtime behind a live bead: the exact strand this seam was built to prevent,
+// caused by the seam. Found by the Codex review of PR #106, and the shape was
+// already written down one package over — worker.RuntimeHandle.stopRecorded
+// carries this same comment and does the right thing.
+//
+// THE RECORD FAILURE IS NOT SWALLOWED INTO NOTHING, it is reported where
+// bookkeeping belongs. There are two sinks with independent failure domains, so
+// one failing usually still leaves a record; and where a bead record is missing
+// but the event exists, the reconciliation rule has the event fill the hole and
+// FLAGS the week rather than silently patching it (katya, condition 2). A
+// missing record surfaces in that weekly read. It must not surface as a close
+// that refused to close.
+//
+// Returning it instead would also break in the COMMON configuration rather than
+// a rare one: the event sink reports "emitted to a recorder that cannot
+// acknowledge it" through any plain void Recorder, so every ordinary close on an
+// unacknowledged recorder would come back an error.
+func (m *Manager) stopRecorded(sessName string, rec runtime.Termination) error {
+	if rec.Actor == "" {
+		rec.Actor = strings.TrimSpace(os.Getenv("GC_AGENT"))
+	}
+	stopErr, recErr := runtime.StopRecordedDetailed(m.sp, sessName, rec, m.terminationSinks...)
+	if recErr != nil {
+		// REPORTED, NOT SWALLOWED — rule 2 — but to the log, not to the caller.
+		// The caller's question is "did the session end", and answering it with a
+		// bookkeeping failure is what caused the strand above.
+		log.Printf("session %s: ended (%s) but the termination record failed: %v", sessName, rec.Kind, recErr)
+	}
+	return stopErr
+}
+
 // ManagerOption configures an optional Manager capability. It is the single
 // knob form behind NewManagerWithOptions; the named NewManager* constructors
 // are thin presets over it.
@@ -813,6 +884,17 @@ type ManagerOption func(*Manager)
 // nudge queue rooted at cityPath.
 func WithCityPath(cityPath string) ManagerOption {
 	return func(m *Manager) { m.cityPath = cityPath }
+}
+
+// WithTerminationSinks wires the sinks that record why a session ended.
+//
+// ADDITIVE ON PURPOSE. A Manager built without it still stops sessions exactly
+// as before and simply records nothing — which is today's behavior for every
+// one of these paths, so wiring can land rig by rig instead of in one
+// flag-day change. What it must never become is a REQUIRED dependency: see
+// StopRecorded rule 1, the stop never waits on the record.
+func WithTerminationSinks(sinks ...runtime.TerminationSink) ManagerOption {
+	return func(m *Manager) { m.terminationSinks = append(m.terminationSinks, sinks...) }
 }
 
 // WithTransportResolver lets the Manager infer session transport from template
@@ -876,7 +958,41 @@ func NewManagerWithOptions(store beads.Store, sp runtime.Provider, opts ...Manag
 	for _, opt := range opts {
 		opt(m)
 	}
+	// THE AUTHORITATIVE SINK IS A DEFAULT, NOT AN OPT-IN (ga-ksac39). Every
+	// Manager already holds the store the record is written to, so requiring
+	// each construction site to remember WithTerminationSinks would mean the
+	// ratio silently under-counts wherever someone forgot — and a denominator
+	// with quiet holes is worse than no ratio, which is the whole premise of
+	// this work. Wiring it here makes recording the default and leaves
+	// WithTerminationSinks for the sinks the Manager CANNOT derive, chiefly the
+	// event sink, which needs a recorder it has no handle on.
+	//
+	// It is appended AFTER the options so an explicitly supplied sink is never
+	// displaced, and NewBeadTerminationSink returns a nil sink for a nil store,
+	// which StopRecorded skips — so a Manager built without a store still
+	// stops sessions exactly as before.
+	//
+	// The already-have-one guard is katya's nit: without it, a caller that
+	// explicitly supplied a bead sink would get a second one appended here and
+	// every ending would be written twice — two commits with identical values.
+	// Harmless, but harmless-and-wrong is how a store's write volume stops
+	// being explainable.
+	if !hasBeadTerminationSink(m.terminationSinks) {
+		if bs := NewBeadTerminationSink(NewStore(beads.SessionStore{Store: store})); bs != nil {
+			m.terminationSinks = append(m.terminationSinks, bs)
+		}
+	}
 	return m
+}
+
+// hasBeadTerminationSink reports whether a bead sink was already supplied.
+func hasBeadTerminationSink(sinks []runtime.TerminationSink) bool {
+	for _, s := range sinks {
+		if _, ok := s.(*BeadTerminationSink); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // CreateSession is the single entry point for creating a session. It reads a
@@ -1079,7 +1195,15 @@ func (m *Manager) createStarted(ctx context.Context, spec CreateOptions) (Info, 
 			return fmt.Errorf("starting session: %w", err)
 		}
 		if metaErr := m.confirmStartedRuntimeMetadata(b.ID, &b); metaErr != nil {
-			if stopErr := m.sp.Stop(sessName); stopErr != nil {
+			// The runtime started but its metadata never confirmed, so the
+			// create is rolling back. Nothing was ever asked of this session
+			// — it is async-start cleanup, which is what KindObservedDead
+			// covers, and it is excluded from the ratio's denominator.
+			if stopErr := m.stopRecorded(sessName, runtime.Termination{
+				Kind:      runtime.KindObservedDead,
+				Reason:    "create rollback: runtime metadata not confirmed",
+				SessionID: b.ID,
+			}); stopErr != nil {
 				metaErr = errors.Join(metaErr, fmt.Errorf("stopping runtime after metadata failure: %w", stopErr))
 			}
 			if rbErr := rollbackFailedCreate(); rbErr != nil {
@@ -1302,7 +1426,14 @@ func (m *Manager) Suspend(id string) error {
 		// is tracked as follow-up.
 		if current == StateFailedCreate {
 			if strings.TrimSpace(sessName) != "" {
-				_ = m.sp.Stop(sessName) // best-effort: tear down any leaked runtime
+				// Best-effort: tear down any leaked runtime. Same shape as the
+				// create rollback above — a failed create's leftovers, not a
+				// suspend of anything that was ever asked.
+				_ = m.stopRecorded(sessName, runtime.Termination{
+					Kind:      runtime.KindObservedDead,
+					Reason:    "failed-create cleanup: leaked runtime",
+					SessionID: b.ID,
+				})
 			}
 			return nil
 		}
@@ -1319,7 +1450,13 @@ func (m *Manager) Suspend(id string) error {
 		// can be non-running but still need their session artifact removed.
 		if strings.TrimSpace(sessName) != "" {
 			running := m.sp.IsRunning(sessName)
-			err := m.sp.Stop(sessName)
+			err := m.stopRecorded(sessName, runtime.Termination{
+				// RequestedAt stays ZERO: a synchronous operator suspend has no
+				// request distinct from the action, and stamping time.Now() here
+				// would mint a Timer B of ~0ms that reads as a measurement.
+				Kind:      runtime.KindOperatorSuspend,
+				SessionID: b.ID,
+			})
 			if err != nil && !running {
 				// Preserve historical Suspend semantics for already-dead
 				// sessions: cleanup is best-effort when the runtime did not
@@ -1360,14 +1497,30 @@ func (m *Manager) Suspend(id string) error {
 // controller, commitPendingContinuationReset for Submit/Send/Attach/Start), so
 // the epoch advances once per reset however the reset was asked for.
 func (m *Manager) RequestFreshRestart(id string) error {
+	return m.RequestFreshRestartWithIntent(id, nil)
+}
+
+// RequestFreshRestartWithIntent is RequestFreshRestart plus a termination
+// intent written in the SAME batch. A pinned seat's handoff needs the two to
+// land together (Codex #106 r10). If the intent is a separate write before the
+// reset, a reconciler tick that already sees a collateral restart flag can run
+// its pinned guard in the gap. It finds the intent but no reset yet, clears
+// both, and the reset that lands next is then consumed as a plain
+// restart-in-place. One batch leaves no gap: any snapshot or re-read that sees
+// the intent also sees the reset. A nil intent is exactly RequestFreshRestart.
+func (m *Manager) RequestFreshRestartWithIntent(id string, intent MetadataPatch) error {
 	return withSessionMutationLock(id, func() error {
 		if _, _, err := m.sessionBead(id); err != nil {
 			return err
 		}
-		return m.store.SetMetadataBatch(id, map[string]string{
+		batch := map[string]string{
 			"restart_requested":          "true",
 			"continuation_reset_pending": "true",
-		})
+		}
+		for k, v := range intent {
+			batch[k] = v
+		}
+		return m.store.SetMetadataBatch(id, batch)
 	})
 }
 
@@ -1405,7 +1558,11 @@ func (m *Manager) CloseDetailed(id string) (CloseResult, error) {
 		// A genuine terminate failure must propagate and leave the bead open
 		// rather than report a "closed but still running" session — swallowing
 		// it here previously masked exactly that wedge.
-		if err := m.sp.Stop(sessName); err != nil {
+		if err := m.stopRecorded(sessName, runtime.Termination{
+			// RequestedAt stays ZERO — see the note in Suspend.
+			Kind:      runtime.KindOperatorClose,
+			SessionID: b.ID,
+		}); err != nil {
 			return fmt.Errorf("stopping runtime for session %s: %w", id, err)
 		}
 		nudgeIDs, capped, err := NewStore(beads.SessionStore{Store: m.store}).CancelWaits(id, time.Now().UTC())
@@ -1474,7 +1631,29 @@ func (m *Manager) retireConfiguredNamedSessionIdentifiers(id string, b beads.Bea
 // Kill force-kills the runtime process for a session without changing bead
 // state. This is intended for manual intervention; the reconciler will detect
 // the dead process and restart it according to the session's lifecycle rules.
+// Kill ends a session without the caller stating WHY.
+//
+// IT RECORDS UNCLASSIFIED, AND THAT IS DELIBERATE RATHER THAN LAZY. This method
+// is a SHARED MECHANISM: the same call serves `gc session kill` (an operator)
+// and the reconciler's drain-timeout force stop (a drain). Hardcoding
+// operator-kill here — which is what S1 did at first — silently relabelled
+// every drain as an operator action, so drain-timeout and drain-handoff could
+// never appear in the ratio at all and the ratio's most important category
+// would have read as zero while looking healthy.
+//
+// Intent belongs to the CALLER, so callers that know it use KillWithTermination
+// and the honest answer here is the counted, budgeted "I don't know". If this
+// bucket grows, the UnclassifiedBudget is what will say the threading is
+// incomplete.
 func (m *Manager) Kill(id string) error {
+	return m.KillWithTermination(id, runtime.Termination{})
+}
+
+// KillWithTermination ends a session with a caller-supplied record. The caller
+// states Kind, Reason and — for the drain kinds, which katya's invariant
+// requires it on — RequestedAt, the moment the drain was ASKED, so that
+// At - RequestedAt is Timer B.
+func (m *Manager) KillWithTermination(id string, rec runtime.Termination) error {
 	b, sessName, err := m.sessionBead(id)
 	if err != nil {
 		return err
@@ -1491,7 +1670,20 @@ func (m *Manager) Kill(id string) error {
 			return fmt.Errorf("session %s is not active", id)
 		}
 	}
-	return m.sp.Stop(sessName)
+	return m.stopRecorded(sessName, mergeKillTermination(rec, b.ID))
+}
+
+// mergeKillTermination fills in what only the Manager knows (the bead id) and
+// defaults what the caller declined to state.
+func mergeKillTermination(rec runtime.Termination, sessionID string) runtime.Termination {
+	if !rec.Kind.Valid() {
+		rec.Kind = runtime.KindUnclassified
+		if rec.Reason == "" {
+			rec.Reason = "killed through Manager.Kill without a stated intent"
+		}
+	}
+	rec.SessionID = sessionID
+	return rec
 }
 
 // BeginDrain transitions a session to the draining state. The caller is

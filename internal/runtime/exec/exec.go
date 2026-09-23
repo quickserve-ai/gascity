@@ -242,7 +242,7 @@ func (p *Provider) cleanupAfterStartFailure(name string, startErr error, foreign
 	if foreignBox || errors.Is(startErr, runtime.ErrSessionExists) {
 		return startErr
 	}
-	if stopErr := p.Stop(name); stopErr != nil {
+	if stopErr := p.Stop(name); stopErr != nil { // termination-seam:not-an-ending tears down a start that failed; no live session ended
 		return errors.Join(startErr, fmt.Errorf("exec provider: cleanup after startup failure: %w", stopErr))
 	}
 	return startErr
@@ -306,17 +306,19 @@ func (p *Provider) launchAgent(ctx context.Context, name string, cfg runtime.Con
 
 // Relaunch re-launches the agent for the reconciler's launch-only-drift path
 // ([runtime.RelaunchProvider]). For a separable pack (proc.provision) it respawns
-// the agent in the warm box over the exec op (launchAgent) — no reprovision. A
-// welded pack has no in-place relaunch (the agent is welded into `start`), so it
-// degrades to a full reprovision (Stop+Start), which is still correct.
+// the agent in the warm box over the exec op (launchAgent) — no reprovision.
+//
+// A welded pack has no in-place relaunch (the agent is welded into `start`), so
+// it DECLINES with ErrRelaunchUnsupported and the reconciler performs its own
+// full restart. It used to do Stop+Start here, which ended the live session
+// with no termination record and out of sight of the seam fence (Codex, PR
+// #106 r9). The reconciler's full restart is the same reprovision, done where
+// the ending is recorded.
 func (p *Provider) Relaunch(ctx context.Context, name string, cfg runtime.Config) error {
 	if p.supportsSeparableLaunch() {
 		return p.launchAgent(ctx, name, cfg)
 	}
-	if err := p.Stop(name); err != nil {
-		return err
-	}
-	return p.Start(ctx, name, cfg)
+	return fmt.Errorf("exec provider: welded pack cannot relaunch %q in place: %w", name, runtime.ErrRelaunchUnsupported)
 }
 
 func (p *Provider) dismissStartupDialogs(ctx context.Context, name string, cfg runtime.Config) error {

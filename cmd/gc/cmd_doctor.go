@@ -370,6 +370,22 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 		if err != nil {
 			register(doctor.ErrorCheck("session-provider", err.Error()))
 		} else {
+			// ga-ksac39: doctor's zombie recycle and orphan reap are session
+			// ENDINGS, and the orphan reap in particular force-exits a LIVE
+			// session, so it counts in the handoff ratio's denominator. Both
+			// wrote nowhere until now.
+			//
+			// THE EVENT SINK IS THE ONLY ONE AVAILABLE HERE. A doctor check
+			// holds config and a provider, never a store, and it stops sessions
+			// it has resolved by NAME — so the authoritative bead sink has no id
+			// to address, and resolving one would put a store read on the stop
+			// path. events.Discard is the honest fallback when the recorder
+			// cannot be opened: it records nothing rather than failing a doctor
+			// run over bookkeeping.
+			// No sink is injected here: the checks DERIVE their recorder from
+			// the CheckContext at fix time (katya's derive-by-default ruling),
+			// so a caller cannot forget to record. Silence requires an explicit
+			// doctor.WithNoTerminationRecorder().
 			register(doctor.NewAgentSessionsCheck(cfg, cityName, st, sp))
 			register(doctor.NewZombieSessionsCheck(cfg, cityName, st, sp))
 			register(doctor.NewOrphanSessionsCheck(cfg, cityName, st, sp))

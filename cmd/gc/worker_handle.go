@@ -3,15 +3,18 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/agent"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/materialize"
 	"github.com/gastownhall/gascity/internal/processenv"
 	"github.com/gastownhall/gascity/internal/runtime"
@@ -88,7 +91,43 @@ func workerFactoryWithStaleKeyDetectionWaiter(
 		ResolveSessionRuntime:   workerSessionRuntimeResolverWithConfig(cityPath, cfg),
 		StaleKeyDetectionWaiter: waiter,
 		Pricing:                 cfg.PricingRegistry(),
+		TerminationRecorder:     sharedWorkerEventsRecorder(cityPath),
 	})
+}
+
+// workerEventsRecorders holds ONE events recorder per city for the life of the
+// process. The factory is built per command, and inside the supervisor per API
+// call (the session catalog), so opening a recorder per build would leak a file
+// handle each time. FileRecorder re-reads the latest seq from the file before
+// every write, so sharing one here with the supervisor's own recorder cannot
+// mint duplicate seqs.
+var workerEventsRecorders sync.Map // cityPath -> events.Recorder
+
+// sharedWorkerEventsRecorder is the termination record's local-append sink for
+// the worker factory (Codex, PR #106 r8). Without it every runtime-only handle
+// the CLI resolves wrote its ONLY termination record to events.Discard: a
+// runtime-only target has no bead sink, so those endings were missing from the
+// ratio's denominator despite passing through the seam. It also gives the
+// Manager's endings their second failure domain. Returns nil (no recorder, the
+// old behavior) when there is no city to write into.
+func sharedWorkerEventsRecorder(cityPath string) events.Recorder {
+	if strings.TrimSpace(cityPath) == "" {
+		return nil
+	}
+	if rec, ok := workerEventsRecorders.Load(cityPath); ok {
+		return rec.(events.Recorder)
+	}
+	rec := openCityRecorderAt(cityPath, io.Discard)
+	if rec == events.Discard {
+		return nil
+	}
+	actual, loaded := workerEventsRecorders.LoadOrStore(cityPath, rec)
+	if loaded {
+		if c, ok := rec.(io.Closer); ok {
+			_ = c.Close()
+		}
+	}
+	return actual.(events.Recorder)
 }
 
 func workerSessionRuntimeResolverWithConfig(cityPath string, cfg *config.City) worker.SessionRuntimeResolver {
@@ -513,6 +552,33 @@ func workerKillSessionTargetWithConfig(cityPath string, store beads.Store, sp ru
 	handle, err := workerHandleForSessionTargetWithConfig(cityPath, store, sp, cfg, target)
 	if err != nil {
 		return err
+	}
+	return handle.Kill(context.Background())
+}
+
+// workerKillSessionTargetWithTermination is workerKillSessionTargetWithConfig
+// for a caller that KNOWS WHY.
+//
+// THE KIND BELONGS TO THE CALLER, NOT TO THE MECHANISM. One handle.Kill serves
+// `gc session kill`, a drain force-stop, a city stop and a remote handoff, so a
+// kind chosen at the mechanism describes whichever caller its author pictured
+// and silently mislabels the rest. That already happened once here: every drain
+// recorded as operator-kill, and drain-timeout — the ratio's most important
+// bucket — could never appear at all, reading as a CONFIDENT ZERO on a fully
+// populated table. The Codex review of PR #106 then found two more kinds with no
+// producer at all, handoff and city-stop, which is the same failure one step
+// further out.
+//
+// A handle that does not implement the optional intent interface falls back to
+// plain Kill, whose unclassified is counted and budgeted — the honest answer, not
+// a silent one.
+func workerKillSessionTargetWithTermination(cityPath string, store beads.Store, sp runtime.Provider, cfg *config.City, target string, rec runtime.Termination) error {
+	handle, err := workerHandleForSessionTargetWithConfig(cityPath, store, sp, cfg, target)
+	if err != nil {
+		return err
+	}
+	if k, ok := handle.(worker.TerminationIntentKiller); ok {
+		return k.KillWithTermination(context.Background(), rec)
 	}
 	return handle.Kill(context.Background())
 }

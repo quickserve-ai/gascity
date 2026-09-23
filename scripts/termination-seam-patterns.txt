@@ -1,0 +1,53 @@
+# Argument shapes whose `.Stop(...)` is NOT a runtime.Provider stop, for
+# scripts/check-termination-seam.sh.
+#
+# THIS FILE INVERTED ON 2026-09-19 AND THE INVERSION IS THE POINT. It used to
+# list the RECEIVER names that hold a provider (sp, provider, prov, h.provider,
+# c.sp, m.sp), which made the fence an enumeration of the thing it was supposed
+# to catch: `runtimeProvider.Stop(name)` or `h.runtime.Stop(name)` passed both
+# the scan and its own self-test, and a real provider delegation in
+# cmd/gc/status_provider.go had been sitting unseen the whole time. The Codex
+# review of PR #106 named it.
+#
+# *** AND THE JUSTIFICATION FOR KEEPING IT NARROW WAS FALSE. *** This file used
+# to say a false negative "costs one uncounted site, which the unclassified
+# budget then surfaces as instrument health". It does not. An unrecorded call
+# writes NO ROW AT ALL, so it cannot raise the unclassified share — it is absent
+# from every share, including the denominator. The budget is structurally blind
+# to exactly the failure this fence exists to prevent. A checkable but wrong
+# safety argument is worse than none, because it reads as having been thought
+# about.
+#
+# THE DISCRIMINATOR IS NOW THE SIGNATURE, NOT THE NAME. runtime.Provider.Stop
+# takes one argument, the session name. A timer or ticker is Stop() with none. A
+# worker handle is Stop(ctx), and it funnels through the seam itself. So the scan
+# matches `.Stop(` with a NON-EMPTY argument and subtracts the shapes below.
+# Receiver names change with every refactor; these argument shapes do not, and a
+# new provider receiver spelling is caught by DEFAULT rather than by remembering
+# to add it here.
+#
+# Each line is an extended-regex alternative, matched against the whole source
+# line. Adding one is a visible claim that this call cannot end a session.
+
+# os/signal.Stop(ch) — unregisters a signal channel; nothing to do with sessions.
+\bsignal\.Stop\(
+# A context argument is never a session name: worker handles take Stop(ctx) and
+# route through worker.RuntimeHandle.stopRecorded, which IS the seam.
+\.Stop\(ctx\)
+\.Stop\(context\.[A-Za-z]+\(\)\)
+\.Stop\([A-Za-z_][A-Za-z0-9_.]*\.Context\(\)\)
+
+# --- SECOND CATEGORY, and it is NOT the same claim as the lines above ---
+#
+# The lines above say "this call cannot end a session". These say something
+# weaker and more specific: "this call is INSIDE a runtime.Provider
+# implementation, so recording happens at the seam that WRAPS it, not here."
+# A decorator's forward genuinely can end a session; it is exempt because the
+# caller reached it through StopRecorded(decorator, ...), which already recorded.
+#
+# The script excludes provider implementations by DIRECTORY
+# (internal/runtime/<provider>/). A decorator living outside those directories —
+# cmd/gc/status_provider.go wraps a provider to add a call timeout — is not
+# covered by that rule and lands here instead. Keep this list to actual
+# forwarding methods on a type that implements runtime.Provider.
+\.base\.Stop\(name\)

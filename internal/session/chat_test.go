@@ -533,3 +533,49 @@ func TestResumeInjectsSSHKeepalive(t *testing.T) {
 		})
 	}
 }
+
+// batchCountingStore counts SetMetadataBatch calls so a test can assert the
+// intent and the reset landed in ONE write.
+type batchCountingStore struct {
+	beads.Store
+	batches int
+}
+
+func (s *batchCountingStore) SetMetadataBatch(id string, kvs map[string]string) error {
+	s.batches++
+	return s.Store.SetMetadataBatch(id, kvs)
+}
+
+// Codex #106 r10: a pinned handoff's intent must land in the SAME batch as the
+// reset markers. A separate earlier write leaves a window in which the pinned
+// guard sees the intent without the reset and clears it.
+func TestRequestFreshRestartWithIntentWritesOneBatch(t *testing.T) {
+	store := &batchCountingStore{Store: beads.NewMemStore()}
+	m := NewManagerWithOptions(store, runtime.NewFake())
+	b, err := store.Create(beads.Bead{Title: "session", Type: BeadType, Metadata: map[string]string{"state": string(StateActive)}})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	store.batches = 0
+	at := time.Date(2026, 9, 22, 11, 0, 0, 0, time.UTC)
+	if err := m.RequestFreshRestartWithIntent(b.ID, TerminationIntentPatch(runtime.KindHandoff, at)); err != nil {
+		t.Fatalf("RequestFreshRestartWithIntent: %v", err)
+	}
+	if store.batches != 1 {
+		t.Fatalf("SetMetadataBatch calls = %d, want exactly 1", store.batches)
+	}
+	got, err := store.Get(b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for k, want := range map[string]string{
+		"restart_requested":          "true",
+		"continuation_reset_pending": "true",
+		TerminationIntentKey:         string(runtime.KindHandoff),
+		TerminationIntentAtKey:       at.Format(time.RFC3339),
+	} {
+		if got.Metadata[k] != want {
+			t.Errorf("%s = %q, want %q", k, got.Metadata[k], want)
+		}
+	}
+}

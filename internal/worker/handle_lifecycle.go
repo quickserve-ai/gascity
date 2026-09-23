@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
@@ -113,6 +114,24 @@ func (h *SessionHandle) Reset(ctx context.Context) (err error) {
 	return err
 }
 
+// ResetWithTerminationIntent is Reset with a termination intent persisted in
+// the same batch as the reset markers (see
+// session.Manager.RequestFreshRestartWithIntent). `gc handoff` uses it for
+// pinned seats, whose kill-protection guard would otherwise clear an intent
+// that landed before its reset.
+func (h *SessionHandle) ResetWithTerminationIntent(ctx context.Context, kind runtime.TerminationKind, at time.Time) (err error) {
+	event := h.beginOperationEvent(ctx, workerOperationReset)
+	defer func() { event.finish(err) }()
+
+	id := h.currentSessionID()
+	if id == "" {
+		err = fmt.Errorf("%w: reset requires an existing bead-backed session", ErrOperationUnsupported)
+		return err
+	}
+	err = h.manager.RequestFreshRestartWithIntent(id, sessionpkg.TerminationIntentPatch(kind, at))
+	return err
+}
+
 // Stop suspends the worker runtime while preserving conversation state.
 func (h *SessionHandle) Stop(ctx context.Context) (err error) {
 	event := h.beginOperationEvent(ctx, workerOperationStop)
@@ -136,6 +155,25 @@ func (h *SessionHandle) Kill(ctx context.Context) (err error) {
 		return nil
 	}
 	err = h.manager.Kill(id)
+	return err
+}
+
+// KillWithTermination is Kill with the caller's statement of WHY.
+//
+// ADDITIVE, NOT AN INTERFACE CHANGE. Handle is implemented by fakes and by
+// RuntimeHandle; widening Kill would touch all of them for the benefit of the
+// two call sites that actually know their intent. Callers type-assert for
+// TerminationIntentKiller and fall back to Kill, whose honest unclassified is
+// the correct answer when nobody stated anything.
+func (h *SessionHandle) KillWithTermination(ctx context.Context, rec runtime.Termination) (err error) {
+	event := h.beginOperationEvent(ctx, workerOperationKill)
+	defer func() { event.finish(err) }()
+
+	id := h.currentSessionID()
+	if id == "" {
+		return nil
+	}
+	err = h.manager.KillWithTermination(id, rec)
 	return err
 }
 

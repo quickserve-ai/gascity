@@ -87,6 +87,8 @@ var infoKeyCodec = []infoKeySpec{
 
 	// identity / pool / named-session cluster
 	{NamedSessionIdentityMetadata, func(i *Info, v string) { i.ConfiguredNamedIdentity = v }},
+	{TerminationIntentKey, func(i *Info, v string) { i.TerminationIntent = v }},
+	{TerminationIntentAtKey, func(i *Info, v string) { i.TerminationIntentAt = v }},
 	{NamedSessionMetadataKey, func(i *Info, v string) { i.ConfiguredNamedSession = strings.TrimSpace(v) == "true" }},
 	{NamedSessionModeMetadata, func(i *Info, v string) { i.ConfiguredNamedMode = v }},
 	{"common_name", func(i *Info, v string) { i.CommonName = v }},
