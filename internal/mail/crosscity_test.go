@@ -1,10 +1,13 @@
 package mail
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/gastownhall/gascity/internal/session"
 )
 
 func enabledRoster() CityRoster {
@@ -94,8 +97,8 @@ func TestUnknownCityErrorMessage(t *testing.T) {
 
 func TestRefuseUnknownCity(t *testing.T) {
 	roster := enabledRoster()
-	base := fmt.Errorf("unknown recipient %q", "x")
-	rigs := []string{"qcore", "gascity"}
+	base := fmt.Errorf("unknown recipient %q: %w", "x", session.ErrSessionNotFound)
+	rigs := []string{"qcore", "gascity", "tools"}
 
 	tests := []struct {
 		name      string
@@ -107,6 +110,10 @@ func TestRefuseUnknownCity(t *testing.T) {
 		{"known rig segment keeps the original error", roster, "qcore/nobody", ""},
 		{"local city segment keeps the original error", roster, "qlandia/nobody", ""},
 		{"peer city segment keeps the original error", roster, "gastown/mayor", ""},
+		{"agent dir scope keeps the original error", roster, "tools/x", ""},
+		{"template: session-target form keeps the original error", roster, "template:qcore/worker", ""},
+		{"controller keeps the original error", roster, "controller/x", ""},
+		{"human keeps the original error", roster, "human/x", ""},
 		{"no slash keeps the original error", roster, "nobody", ""},
 		{"disabled roster keeps the original error", CityRoster{}, "gastwn/mayor", ""},
 	}
@@ -133,10 +140,37 @@ func TestRefuseUnknownCity(t *testing.T) {
 // The unknown-city refusal must replace the fall-through resolution error so a
 // stale roster can never be spelled "session not found".
 func TestRefuseUnknownCityDoesNotUnwrapToOriginal(t *testing.T) {
-	sentinel := errors.New("session not found")
-	got := RefuseUnknownCity(sentinel, "gastwn/mayor", enabledRoster(), nil)
-	if errors.Is(got, sentinel) {
+	got := RefuseUnknownCity(session.ErrSessionNotFound, "gastwn/mayor", enabledRoster(), nil)
+	if errors.Is(got, session.ErrSessionNotFound) {
 		t.Errorf("unknown-city error must not unwrap to the resolution error it replaces")
+	}
+}
+
+// Only a not-found is upgraded: a store timeout, a name-squat refusal, or any
+// other failure keeps its own text — re-spelling it "unknown city" would hide
+// the real fault behind a roster message.
+func TestRefuseUnknownCityLeavesNonNotFoundErrorsAlone(t *testing.T) {
+	timeout := fmt.Errorf("mail read: %w", context.DeadlineExceeded)
+	got := RefuseUnknownCity(timeout, "gastwn/mayor", enabledRoster(), nil)
+	if !errors.Is(got, context.DeadlineExceeded) || got.Error() != timeout.Error() {
+		t.Errorf("got %v, want the timeout error unchanged", got)
+	}
+	squat := errors.New("mailbox name squats a live session")
+	if got := RefuseUnknownCity(squat, "gastwn/mayor", enabledRoster(), nil); got != squat {
+		t.Errorf("got %v, want the squat refusal unchanged", got)
+	}
+}
+
+// ErrUnresolvedCityProbe lets a caller with no resolution failure of its own
+// (a reply's thread origin, a storeless send) classify an address: unknown
+// city upgrades, a known scope returns the probe unchanged.
+func TestRefuseUnknownCityProbe(t *testing.T) {
+	var unknownCity *UnknownCityError
+	if got := RefuseUnknownCity(ErrUnresolvedCityProbe, "gastwn/mayor", enabledRoster(), nil); !errors.As(got, &unknownCity) {
+		t.Errorf("probe on an unknown city = %v, want *UnknownCityError", got)
+	}
+	if got := RefuseUnknownCity(ErrUnresolvedCityProbe, "gastown/mayor", enabledRoster(), nil); !errors.Is(got, ErrUnresolvedCityProbe) {
+		t.Errorf("probe on a peer city = %v, want the probe unchanged", got)
 	}
 }
 

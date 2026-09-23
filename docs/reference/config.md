@@ -554,7 +554,7 @@ MailCrossCityConfig enables city-qualified mail addressing: recipients of the fo
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `city` | string |  |  | City is this city's own segment in city-qualified addresses. Empty defaults to the effective city name (workspace name, else the city directory's base name). &lt;City&gt;/&lt;address&gt; and &lt;address&gt; are one mailbox. |
+| `city` | string | **yes** |  | City is this city's own segment in city-qualified addresses, and it is REQUIRED when the section is present: the CLI and the API derive the effective city name differently (site binding, workspace name, the supervisor's registered name), so a defaulted name could stamp two spellings of this city on mail and strand replies. &lt;City&gt;/&lt;address&gt; and &lt;address&gt; are one mailbox. |
 | `cities` | []string | **yes** |  | Cities lists the peer cities addressable as &lt;city&gt;/&lt;address&gt;. A recipient naming a listed city resolves against the roster and is never looked up in the local session store. |
 
 ## MaintenanceConfig

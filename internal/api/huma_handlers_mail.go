@@ -655,11 +655,6 @@ func (s *Server) humaHandleMailArchive(ctx context.Context, input *MailArchiveIn
 	return resp, nil
 }
 
-// errUnknownCityOrigin is the sentinel RefuseUnknownCity upgrades when a reply
-// thread's origin names a city outside the roster; returned unchanged, it
-// means the origin is a known scope and the reply may proceed.
-var errUnknownCityOrigin = errors.New("origin city unknown")
-
 // humaHandleMailReply is the Huma-typed handler for POST /v0/mail/{id}/reply.
 func (s *Server) humaHandleMailReply(ctx context.Context, input *MailReplyInput) (*IndexOutput[mail.Message], error) {
 	id := input.ID
@@ -697,7 +692,7 @@ func (s *Server) humaHandleMailReply(ctx context.Context, input *MailReplyInput)
 				// A thread whose origin names a city this roster does not
 				// know is refused, never written to a literal mailbox nobody
 				// polls.
-				if refuse := mail.RefuseUnknownCity(errUnknownCityOrigin, orig.From, roster, s.state.Config().RigNames()); refuse != nil && !errors.Is(refuse, errUnknownCityOrigin) {
+				if refuse := mail.RefuseUnknownCity(mail.ErrUnresolvedCityProbe, orig.From, roster, s.state.Config().LocalAddressPrefixes()); refuse != nil && !errors.Is(refuse, mail.ErrUnresolvedCityProbe) {
 					return mail.Message{}, apierr.InvalidRequest.Msg("reply origin " + refuse.Error())
 				}
 				if kind, _ := roster.ResolveCityAddress(orig.From); kind == mail.CityAddressForeign {

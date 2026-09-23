@@ -19,9 +19,11 @@ func crossCityTestConfig() *config.City {
 	return &config.City{
 		Workspace: config.Workspace{Name: "qlandia"},
 		Mail: config.MailConfig{CrossCity: &config.MailCrossCityConfig{
+			City:   "qlandia",
 			Cities: []string{"gastown", "westeros"},
 		}},
-		Rigs: []config.Rig{{Name: "qcore", Path: "rigs/qcore"}},
+		Rigs:   []config.Rig{{Name: "qcore", Path: "rigs/qcore"}},
+		Agents: []config.Agent{{Name: "x", Dir: "tools"}},
 	}
 }
 
@@ -172,7 +174,12 @@ func writeCrossCityTestCity(t *testing.T) string {
 name = "qlandia"
 
 [mail.crosscity]
+city = "qlandia"
 cities = ["gastown", "westeros"]
+
+[[agent]]
+name = "x"
+dir = "tools"
 `
 	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(cityTOML), 0o644); err != nil {
 		t.Fatalf("WriteFile(city.toml): %v", err)
@@ -218,6 +225,109 @@ func TestCmdMailSendCrossCityForeignRecipient(t *testing.T) {
 	}
 	if msg.From != "qlandia/human" {
 		t.Errorf("From = %q, want city-qualified %q", msg.From, "qlandia/human")
+	}
+	// Phase 1 moves no store: the send was written HERE, and the sender is
+	// told so once, on stderr, with the way to reach the peer.
+	if !strings.Contains(stderr.String(), "stored locally for gastown/mayor") || !strings.Contains(stderr.String(), "--context") {
+		t.Errorf("stderr = %q, want the local-write warning naming gastown/mayor and --context", stderr.String())
+	}
+}
+
+// A local send carries no local-write warning: the message has a reader here.
+func TestCmdMailSendCrossCityLocalSendHasNoLocalWriteWarning(t *testing.T) {
+	writeCrossCityTestCity(t)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend(nil, false, false, "human", "qlandia/human", "s", "b", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdMailSend = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "stored locally") {
+		t.Errorf("stderr = %q: a local send must not carry the local-write warning", stderr.String())
+	}
+}
+
+// The notify-on-by-default rule for direct local sends never applies to a
+// peer-city recipient: a plain send to a foreign address must not be refused
+// for a --notify the user never passed. Pinned through the cobra layer, where
+// the default is decided, so a test that bypasses RunE cannot hide it.
+func TestMailSendRunEDefaultNotifySkipsForeign(t *testing.T) {
+	cityPath := writeCrossCityTestCity(t)
+
+	var stdout, stderr bytes.Buffer
+	cmd := newMailSendCmd(&stdout, &stderr)
+	cmd.SetArgs([]string{"gastown/mayor", "-s", "cutover", "-m", "leg is green"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("plain foreign send failed: %v; stderr=%s", err, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "--notify does not cross cities") {
+		t.Fatalf("stderr = %q: the defaulted --notify was applied to a foreign recipient", stderr.String())
+	}
+	if _, found := findMessageBead(t, cityPath); !found {
+		t.Fatal("message bead not found after a plain foreign send")
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	cmd = newMailSendCmd(&stdout, &stderr)
+	cmd.SetArgs([]string{"gastown/mayor", "-s", "cutover", "-m", "leg is green", "--notify"})
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("explicit --notify to a foreign recipient must be refused")
+	}
+	if !strings.Contains(stderr.String(), "--notify does not cross cities") {
+		t.Errorf("stderr = %q, want the cross-city notify refusal", stderr.String())
+	}
+}
+
+// The pure default decision: foreign never defaults on, local keeps the default.
+func TestDefaultMailSendNotify(t *testing.T) {
+	if defaultMailSendNotify(true) {
+		t.Error("foreign recipient must not receive the notify default")
+	}
+	if !defaultMailSendNotify(false) {
+		t.Error("local recipient must keep the notify default")
+	}
+}
+
+// A local agent whose dir is not a rig (tools/x) is a local scope: neither
+// the storeless send nor a reply to it is refused as an unknown city.
+func TestCmdMailStorelessSendAndReplyKeepAgentDirScope(t *testing.T) {
+	_, recordPath := storelessCrossCity(t)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend(nil, false, false, "human", "tools/x", "s", "b", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("storeless send to tools/x = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "unknown city") {
+		t.Errorf("stderr = %q: an agent-dir address was refused as an unknown city", stderr.String())
+	}
+	rec, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatalf("exec provider recorded nothing: %v", err)
+	}
+	if !strings.Contains(string(rec), `"tools/x"`) {
+		t.Errorf("exec send payload = %s, want the local agent address tools/x", rec)
+	}
+}
+
+func TestCmdMailReplyKeepsAgentDirScope(t *testing.T) {
+	cityPath := writeCrossCityTestCity(t)
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	seeded, err := beadmail.New(store).Send("tools/x", "human", "hello", "from a local agent dir")
+	if err != nil {
+		t.Fatalf("seed Send: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := cmdMailReply([]string{seeded.ID, "received"}, "", "", false, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdMailReply = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stderr.String(), "unknown city") {
+		t.Errorf("stderr = %q: a reply to an agent-dir origin was refused as an unknown city", stderr.String())
 	}
 }
 

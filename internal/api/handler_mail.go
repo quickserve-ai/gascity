@@ -91,10 +91,16 @@ func (s *Server) resolveMailSendRecipientWithContext(ctx context.Context, recipi
 	}
 	resolved, err := s.resolveLocalMailSendRecipientWithContext(ctx, recipient)
 	if err != nil {
-		// A slash-form recipient whose first segment names neither a rig nor
-		// a roster city refuses as unknown-city, so a stale roster is never
-		// spelled as a session lookup failure.
-		return "", mail.RefuseUnknownCity(err, recipient, roster, s.state.Config().RigNames())
+		// A slash-form recipient whose first segment names neither a local
+		// scope nor a roster city refuses as unknown-city, so a stale roster
+		// is never spelled as a session lookup failure. Only a not-found
+		// upgrades; with no store the roster alone decides.
+		if errors.Is(err, errMailNoBeadStore) {
+			if probe := mail.RefuseUnknownCity(mail.ErrUnresolvedCityProbe, recipient, roster, s.state.Config().LocalAddressPrefixes()); !errors.Is(probe, mail.ErrUnresolvedCityProbe) {
+				return "", probe
+			}
+		}
+		return "", mail.RefuseUnknownCity(err, recipient, roster, s.state.Config().LocalAddressPrefixes())
 	}
 	return resolved, nil
 }

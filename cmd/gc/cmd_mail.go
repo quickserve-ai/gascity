@@ -1136,10 +1136,17 @@ func resolveMailRecipientIdentityCached(cityPath string, cfg *config.City, sessS
 	}
 	resolved, err := resolveMailIdentityWithConfigCached(cityPath, cfg, sessStore, identifier, cache)
 	if err != nil {
-		// A slash-form recipient whose first segment names neither a rig nor
-		// a roster city refuses as unknown-city, so a stale roster is never
-		// spelled "session not found".
-		return "", mail.RefuseUnknownCity(err, identifier, roster, cfg.RigNames())
+		// A slash-form recipient whose first segment names neither a local
+		// scope nor a roster city refuses as unknown-city, so a stale roster
+		// is never spelled "session not found". Only a not-found upgrades;
+		// with no store at all the roster alone decides, since an unknown
+		// city needs no lookup to be one.
+		if sessStore == nil {
+			if probe := mail.RefuseUnknownCity(mail.ErrUnresolvedCityProbe, identifier, roster, cfg.LocalAddressPrefixes()); !errors.Is(probe, mail.ErrUnresolvedCityProbe) {
+				return "", probe
+			}
+		}
+		return "", mail.RefuseUnknownCity(err, identifier, roster, cfg.LocalAddressPrefixes())
 	}
 	return resolved, nil
 }
@@ -1319,7 +1326,7 @@ func resolveMailTargetsWithConfigCached(cityPath string, cfg *config.City, sessS
 	}
 	target, err := resolveLocalMailTargetsWithConfigCached(cityPath, cfg, sessStore, identifier, cache)
 	if err != nil {
-		return target, mail.RefuseUnknownCity(err, identifier, roster, cfg.RigNames())
+		return target, mail.RefuseUnknownCity(err, identifier, roster, cfg.LocalAddressPrefixes())
 	}
 	// Delivery addressed to <local city>/<addr> is a read on <addr>'s inbox.
 	target.recipients = roster.ExpandLocalRecipients(target.recipients)
@@ -1659,7 +1666,7 @@ not cross cities: the recipient's wake belongs to its own city's mail sweep.`,
 			// recipient is skipped at the invocation site as before.
 			if !notify && !noNotify && !all {
 				if _, isRemote, _, rerr := resolveWriteTarget(); rerr == nil && !isRemote {
-					notify = true
+					notify = defaultMailSendNotify(mailSendRecipientIsForeign(args, to))
 				}
 			}
 			code := cmdMailSendJSONRef(args, notify, all, from, to, subject, message, ref, jsonOut, stdout, stderr)
@@ -2055,6 +2062,9 @@ func cmdMailSendJSONRef(args []string, notify bool, all bool, from string, to st
 			args = []string{args[0], subject, body}
 		}
 	}
+	// foreign marks a send addressed to a peer city. Phase 1 moves no store,
+	// so such a send is written HERE; the warning after the write says so.
+	foreign := false
 	if !all && len(args) > 0 && store != nil {
 		canonicalTo, err := resolveMailRecipientIdentityCached(cityPath, cfg, sessStore, args[0], idCache)
 		if err != nil {
@@ -2074,7 +2084,6 @@ func cmdMailSendJSONRef(args []string, notify bool, all bool, from string, to st
 		// foreign recipient never reaches resolveNudgeTarget, so a local
 		// alias that happens to share a peer's address shape cannot turn a
 		// cross-city send into a cloud-wake refusal.
-		foreign := false
 		if kind, _ := roster.ResolveCityAddress(canonicalTo); kind == mail.CityAddressForeign {
 			foreign = true
 			if notify {
@@ -2111,6 +2120,7 @@ func cmdMailSendJSONRef(args []string, notify bool, all bool, from string, to st
 		switch kind {
 		case mail.CityAddressForeign:
 			args[0] = addr
+			foreign = true
 			if notify {
 				msg := crossCityNotifyRefusal("gc mail send", addr)
 				if jsonOut {
@@ -2123,7 +2133,7 @@ func cmdMailSendJSONRef(args []string, notify bool, all bool, from string, to st
 		case mail.CityAddressLocal:
 			args[0] = addr
 		default:
-			if refuse := mail.RefuseUnknownCity(errUnknownCityOrigin, args[0], roster, cfg.RigNames()); refuse != nil && !errors.Is(refuse, errUnknownCityOrigin) {
+			if refuse := mail.RefuseUnknownCity(mail.ErrUnresolvedCityProbe, args[0], roster, cfg.LocalAddressPrefixes()); refuse != nil && !errors.Is(refuse, mail.ErrUnresolvedCityProbe) {
 				msg := fmt.Sprintf("gc mail send: unknown recipient %q: %v", args[0], refuse)
 				if jsonOut {
 					return writeJSONError(stdout, stderr, "cross_city_unknown_city", msg, 1)
@@ -2140,7 +2150,11 @@ func cmdMailSendJSONRef(args []string, notify bool, all bool, from string, to st
 	}
 
 	rec := openCityRecorder(stderr)
-	return doMailSendJSON(mp, rec, validRecipients, sender, args, nf, jsonOut, stdout, stderr)
+	sendCode := doMailSendJSON(mp, rec, validRecipients, sender, args, nf, jsonOut, stdout, stderr)
+	if sendCode == 0 && foreign && len(args) > 0 {
+		fmt.Fprintln(stderr, localForeignSendWarning(args[0])) //nolint:errcheck // best-effort stderr
+	}
+	return sendCode
 }
 
 // doMailSend creates a message addressed to a recipient. args is [to, subject, body]
@@ -2596,7 +2610,7 @@ func cmdMailReplyJSON(args []string, subject, message string, notify bool, jsonO
 		}
 		// A thread whose origin names a city this roster does not know is
 		// refused, never written to a literal mailbox nobody polls.
-		if refuse := mail.RefuseUnknownCity(errUnknownCityOrigin, orig.From, roster, cfg.RigNames()); refuse != nil && !errors.Is(refuse, errUnknownCityOrigin) {
+		if refuse := mail.RefuseUnknownCity(mail.ErrUnresolvedCityProbe, orig.From, roster, cfg.LocalAddressPrefixes()); refuse != nil && !errors.Is(refuse, mail.ErrUnresolvedCityProbe) {
 			msg := "gc mail reply: reply origin " + refuse.Error()
 			if jsonOut {
 				return writeJSONError(stdout, stderr, "cross_city_unknown_origin", msg, 1)

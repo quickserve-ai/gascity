@@ -15,6 +15,7 @@ import (
 
 func enableCrossCity(state *fakeState) {
 	state.cfg.Mail.CrossCity = &config.MailCrossCityConfig{
+		City:   "test-city",
 		Cities: []string{"gastown", "westeros"},
 	}
 }
@@ -231,5 +232,19 @@ func TestMailReplyCrossCityUnknownOriginRefused(t *testing.T) {
 	inbox, _ := state.cityMailProv.Inbox("gastwn/mayor")
 	if len(inbox) != 0 {
 		t.Errorf("reply written to the literal mailbox gastwn/mayor: %+v", inbox)
+	}
+}
+
+// The API roster names this city from the configured [mail.crosscity] city,
+// never from the supervisor's registered workspace name, so the CLI (which
+// reads the same field) and the API stamp one spelling on cross-city mail.
+func TestMailCityRosterUsesConfiguredCity(t *testing.T) {
+	state := newFakeState(t)
+	enableCrossCity(state)
+	state.cfg.ResolvedWorkspaceName = "registered-name"
+	state.cfg.Workspace.Name = "workspace-name"
+	srv := &Server{state: state}
+	if got := srv.mailCityRoster().Local; got != "test-city" {
+		t.Errorf("roster.Local = %q, want the configured city %q", got, "test-city")
 	}
 }
