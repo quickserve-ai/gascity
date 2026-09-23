@@ -1211,9 +1211,16 @@ if [ "$HALTED" -eq 1 ]; then
             discard_staged_archive_outputs
             exit 1
         }
-        set_pending_archive_push
+        # A full disk (the repack above can cause one) must not end the
+        # run before the spike alert: the next run re-detects the snapshot
+        # as a local-only commit.
+        if ! set_pending_archive_push; then
+            echo "jsonl-export: could not mark the HALT snapshot pending for push; the next run re-detects it as a local-only commit" >&2
+        fi
     fi
-    set_pending_spike_alert "$HALT_DB" "$HALT_PREV_COUNT" "$HALT_CURRENT_COUNT" "$HALT_DELTA" "$SPIKE_THRESHOLD"
+    if ! set_pending_spike_alert "$HALT_DB" "$HALT_PREV_COUNT" "$HALT_CURRENT_COUNT" "$HALT_DELTA" "$SPIKE_THRESHOLD"; then
+        echo "jsonl-export: could not record the spike alert in state; sending it now, but a failed send cannot be retried from state" >&2
+    fi
     if send_spike_alert "$HALT_DB" "$HALT_PREV_COUNT" "$HALT_CURRENT_COUNT" "$HALT_DELTA" "$SPIKE_THRESHOLD"; then
         clear_pending_spike_alert "$HALT_DB"
     else
@@ -1262,7 +1269,12 @@ commit_archive_snapshot \
     discard_staged_archive_outputs
     exit 1
 }
-set_pending_archive_push
+# A full disk (the repack above can cause one) must not end the run before
+# the push and the summary: the next run re-detects the snapshot as a
+# local-only commit.
+if ! set_pending_archive_push; then
+    echo "jsonl-export: could not mark the snapshot pending for push; pushing now, and the next run re-detects it as a local-only commit" >&2
+fi
 
 if should_attempt_push; then
     PUSH_STATUS="ok"

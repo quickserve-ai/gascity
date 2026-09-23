@@ -9178,6 +9178,18 @@ exec '%s' "$@"
 	if !strings.Contains(string(mailData), "ESCALATION: JSONL archive repack failing") {
 		t.Fatalf("an unpersistable streak must escalate on the FIRST failure (threshold 3); run err=%v\noutput:\n%s\nmail log:\n%s", runErr, out, mailData)
 	}
+	// The full disk must not end the export after the snapshot commit: the
+	// pending-push write fails too, and the run still reaches its summary.
+	if runErr != nil {
+		t.Fatalf("the export must complete when state writes fail after the commit; run err=%v\noutput:\n%s", runErr, out)
+	}
+	gcData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	if !strings.Contains(string(gcData), "MAINTENANCE_DONE: jsonl") {
+		t.Fatalf("the export must reach its summary on a full disk; gc log:\n%s", gcData)
+	}
 }
 
 // A failing post-condition read is a recorded repack failure, and the export
