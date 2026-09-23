@@ -416,6 +416,23 @@ type WorkQueryRunner func(command, dir string) (string, error)
 // follow-up work after slow paths are identified and optimized.
 var hookWorkQueryTimeout = 30 * time.Second
 
+// hookWorkQueryTimeoutValue resolves the work-query subprocess cap. It honors
+// the GC_HOOK_WORK_QUERY_TIMEOUT env override (a Go duration string, e.g. "45s")
+// when set and valid, otherwise falls back to the hookWorkQueryTimeout default
+// (30s). This is defense-in-depth for ga-2s6k: the ephemeral scans on the claim
+// path are now assignee-filtered server-side so mild Dolt latency no longer
+// blows the cap, but the override lets an operator widen it under exceptional
+// store load without a rebuild. A non-positive or unparseable value is ignored
+// so a typo cannot silently disable the cap.
+func hookWorkQueryTimeoutValue() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("GC_HOOK_WORK_QUERY_TIMEOUT")); raw != "" {
+		if d, err := time.ParseDuration(raw); err == nil && d > 0 {
+			return d
+		}
+	}
+	return hookWorkQueryTimeout
+}
+
 // shellWorkQueryWithEnv runs a work query command via sh -c and returns
 // stdout. If env is non-nil it is used as the subprocess environment
 // (including any rig-scoped BEADS_DIR / GC_RIG_ROOT overrides); otherwise
@@ -423,7 +440,8 @@ var hookWorkQueryTimeout = 30 * time.Second
 // short bounded interval so startup hooks cannot strand sessions behind a
 // wedged data-plane command.
 func shellWorkQueryWithEnv(command, dir string, env []string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), hookWorkQueryTimeout)
+	timeout := hookWorkQueryTimeoutValue()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "sh", "-c", command)
 	cmd.WaitDelay = 2 * time.Second
@@ -444,9 +462,9 @@ func shellWorkQueryWithEnv(command, dir string, env []string) (string, error) {
 		// "timed out after" text is preserved.
 		msg := strings.TrimSpace(string(out))
 		if msg != "" {
-			return string(out), fmt.Errorf("running work query %q: timed out after %s with partial stdout %q: %w", command, hookWorkQueryTimeout, msg, context.DeadlineExceeded)
+			return string(out), fmt.Errorf("running work query %q: timed out after %s with partial stdout %q: %w", command, timeout, msg, context.DeadlineExceeded)
 		}
-		return "", fmt.Errorf("running work query %q: timed out after %s: %w", command, hookWorkQueryTimeout, context.DeadlineExceeded)
+		return "", fmt.Errorf("running work query %q: timed out after %s: %w", command, timeout, context.DeadlineExceeded)
 	}
 	if err != nil {
 		msg := strings.TrimSpace(stderr.String())

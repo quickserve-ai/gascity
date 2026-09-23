@@ -1848,6 +1848,84 @@ func TestEffectiveWorkQueryDefault(t *testing.T) {
 	}
 }
 
+// TestEffectiveWorkQueryEphemeralScansAreAssigneeFiltered is the ga-2s6k
+// regression guard. The claim/work-query hot path must never run an
+// assignee-UNFILTERED, unbounded ephemeral table scan: each such scan runs
+// ~7-9s under Dolt latency, and several of them serially inside the 30s hook
+// cap (cmd/gc hookWorkQueryTimeout) blew the budget for every session and took
+// down the qcore worker pool. Every ephemeral scan on this path must push a
+// predicate into bd — the tier's assignee for the assigned tiers, assignee=none
+// for the pool-demand fallback — so bd returns only the rows the downstream jq
+// would have kept anyway.
+func TestEffectiveWorkQueryEphemeralScansAreAssigneeFiltered(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		a           Agent
+		assignedVar string // shell variable the assigned tiers iterate over
+	}{
+		{name: "standard", a: Agent{Name: "worker", Dir: "hello-world"}, assignedVar: "id"},
+		{name: "control-dispatcher", a: Agent{Name: ControlDispatcherAgentName, Dir: "gascity"}, assignedVar: "cand"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.a.EffectiveWorkQuery()
+
+			// No assignee-unfiltered unbounded ephemeral scan may survive.
+			for _, bad := range []string{
+				`'ephemeral=true AND status=in_progress' --limit=0`,
+				`'ephemeral=true AND status=open' --limit=0`,
+			} {
+				if strings.Contains(got, bad) {
+					t.Fatalf("work query still contains unfiltered unbounded ephemeral scan %q (ga-2s6k regression): %q", bad, got)
+				}
+			}
+
+			// Assigned tiers scope the ephemeral scan by the tier's assignee,
+			// quoted so qualified names containing '/' parse under bd's grammar.
+			for _, want := range []string{
+				`ephemeral=true AND status=in_progress AND assignee=\"$` + tc.assignedVar + `\"`,
+				`ephemeral=true AND status=open AND assignee=\"$` + tc.assignedVar + `\"`,
+			} {
+				if !strings.Contains(got, want) {
+					t.Fatalf("work query missing assignee-filtered ephemeral scan %q: %q", want, got)
+				}
+			}
+
+			// The pool-demand fallback scopes its ephemeral scan to unassigned rows.
+			if want := `ephemeral=true AND status=open AND assignee=none`; !strings.Contains(got, want) {
+				t.Fatalf("work query missing unassigned-filtered pool-demand ephemeral scan %q: %q", want, got)
+			}
+		})
+	}
+}
+
+// TestEffectiveWorkQueryFindsOwnWispViaServerSideAssigneeFilter proves the
+// ga-2s6k narrowing does not cause a session to miss its own wisp. The fake bd
+// honors the server-side assignee predicate — it surfaces the wisp ONLY when
+// the query names this session — yet the session still claims it, confirming
+// the predicate pushed into bd matches the jq filter it replaced input for.
+func TestEffectiveWorkQueryFindsOwnWispViaServerSideAssigneeFilter(t *testing.T) {
+	a := Agent{Name: "dog", Dir: "hello-world"}
+	out := runEffectiveWorkQuery(t, a, map[string]string{
+		"GC_SESSION_NAME": "hello-world/dog",
+	}, `#!/bin/sh
+set -eu
+case "$1" in
+  list) printf '[]' ;;
+  ready) printf '[]' ;;
+  query)
+    case "$*" in
+      *'ephemeral=true AND status=open AND assignee="hello-world/dog"'*)
+        printf '[{"id":"my-open-wisp","assignee":"hello-world/dog","status":"open","ephemeral":true,"created_at":"2026-05-01T00:00:00Z"}]' ;;
+      *) printf '[]' ;;
+    esac ;;
+  *) printf '[]' ;;
+esac
+`)
+	if !strings.Contains(out, "my-open-wisp") {
+		t.Fatalf("EffectiveWorkQuery() did not claim the session's own wisp via server-side assignee filter: %q", out)
+	}
+}
+
 func TestEffectiveWorkQueryBD105CompatibilityOptIn(t *testing.T) {
 	a := Agent{Name: "mayor"}
 	got := a.EffectiveWorkQueryForBeads(BeadsConfig{BDCompatibility: BeadsBDCompatibility105})

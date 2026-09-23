@@ -118,6 +118,35 @@ func TestShellWorkQueryTimeoutClassifiesTransient(t *testing.T) {
 	}
 }
 
+// TestHookWorkQueryTimeoutValueHonorsEnvOverride guards the ga-2s6k
+// defense-in-depth override: GC_HOOK_WORK_QUERY_TIMEOUT widens or narrows the
+// work-query cap when set to a valid positive Go duration, and an unset,
+// unparseable, or non-positive value falls back to the hookWorkQueryTimeout
+// default so a typo cannot silently disable the cap.
+func TestHookWorkQueryTimeoutValueHonorsEnvOverride(t *testing.T) {
+	prev := hookWorkQueryTimeout
+	hookWorkQueryTimeout = 30 * time.Second
+	t.Cleanup(func() { hookWorkQueryTimeout = prev })
+
+	for _, tc := range []struct {
+		name string
+		env  string
+		want time.Duration
+	}{
+		{name: "unset falls back to default", env: "", want: 30 * time.Second},
+		{name: "valid override wins", env: "45s", want: 45 * time.Second},
+		{name: "unparseable ignored", env: "not-a-duration", want: 30 * time.Second},
+		{name: "non-positive ignored", env: "0s", want: 30 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("GC_HOOK_WORK_QUERY_TIMEOUT", tc.env)
+			if got := hookWorkQueryTimeoutValue(); got != tc.want {
+				t.Fatalf("hookWorkQueryTimeoutValue() with GC_HOOK_WORK_QUERY_TIMEOUT=%q = %s, want %s", tc.env, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCmdHookQueryKillEmitsCurrentSessionTemplate(t *testing.T) {
 	clearGCEnv(t)
 	disableManagedDoltRecoveryForTest(t)

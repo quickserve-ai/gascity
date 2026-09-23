@@ -3377,12 +3377,57 @@ func poolDemandMigrationFilterJQ(limit int) string {
 	return shellquote.Join([]string{"jq", filter})
 }
 
+// bdQueryEphemeralStatusShell is the raw, assignee-unfiltered ephemeral scan.
+// It returns EVERY ephemeral row of a status and is unbounded on purpose: the
+// on_death reopen path needs the full in-progress set to recover a dead
+// session's wisps. The claim/work-query hot path must NOT use this form — under
+// Dolt latency a full ephemeral table scan runs ~7-9s, and running several
+// serially inside the 30s hook cap (cmd/gc hookWorkQueryTimeout) exhausts the
+// budget before the routed-pool probe runs (ga-2s6k). Claim-path callers use
+// the assignee-filtered variants below, which push the same predicate the
+// downstream jq applies down into bd so the scan returns only this session's
+// rows.
 func bdQueryEphemeralStatusShell(status string) string {
 	return `bd query --json ` + shellquote.Quote("ephemeral=true AND status="+status) + ` --limit=0`
 }
 
 func bdQueryEphemeralStatusQuietShell(status string) string {
 	return bdQueryEphemeralStatusShell(status) + ` 2>/dev/null`
+}
+
+// bdQueryEphemeralStatusAssigneeShell returns a bd query that filters the
+// ephemeral (wisp) tier server-side by BOTH status and assignee, where the
+// assignee is the value of shell variable shellVar (e.g. "id" or "cand"). The
+// value is interpolated inside bd's quoted-value grammar (assignee="...") so
+// qualified names containing '/' parse correctly — bd rejects an unquoted '/'.
+//
+// This is correctness-preserving relative to the old full scan: the downstream
+// jq still applies select((.assignee // "") == $id), and server-side
+// assignee=<value> is the same exact-string-equality predicate, so no row the
+// caller would have kept is dropped. The result set is bounded by how many
+// wisps that assignee holds (typically 0-1), so the scan can no longer blow the
+// hook deadline even when the ephemeral table is large (ga-2s6k).
+func bdQueryEphemeralStatusAssigneeShell(status, shellVar string) string {
+	return `bd query --json "ephemeral=true AND status=` + status +
+		` AND assignee=\"$` + shellVar + `\"" --limit=0`
+}
+
+func bdQueryEphemeralStatusAssigneeQuietShell(status, shellVar string) string {
+	return bdQueryEphemeralStatusAssigneeShell(status, shellVar) + ` 2>/dev/null`
+}
+
+// bdQueryEphemeralStatusUnassignedShell returns a bd query that filters the
+// ephemeral tier server-side by status and unassigned (assignee=none), matching
+// the jq (.assignee // "") == "" predicate the pool-demand fallback applies.
+// bd's assignee=none matches both NULL and cleared/empty-string assignees, so
+// this drops no unassigned row the pool-demand jq would keep; the downstream jq
+// still applies the routed_to / epic / dependency filters (ga-2s6k).
+func bdQueryEphemeralStatusUnassignedShell(status string) string {
+	return `bd query --json ` + shellquote.Quote("ephemeral=true AND status="+status+" AND assignee=none") + ` --limit=0`
+}
+
+func bdQueryEphemeralStatusUnassignedQuietShell(status string) string {
+	return bdQueryEphemeralStatusUnassignedShell(status) + ` 2>/dev/null`
 }
 
 func legacyEphemeralReadyFilterJQ(selector string, limit int) string {
@@ -3407,9 +3452,9 @@ func legacyEphemeralPoolDemandShell(limit int, includeEphemeralReady, quiet bool
 			` | select(((.metadata["gc.routed_to"] // "") == $target) or (((.metadata["gc.routed_to"] // "") == "") and ((.metadata["gc.run_target"] // "") == $target) and ((.metadata["gc.kind"] // "") == "workflow")))`,
 		limit,
 	)
-	query := bdQueryEphemeralStatusShell("open")
+	query := bdQueryEphemeralStatusUnassignedShell("open")
 	if quiet {
-		query = bdQueryEphemeralStatusQuietShell("open")
+		query = bdQueryEphemeralStatusUnassignedQuietShell("open")
 	}
 	jqStderr := ""
 	if quiet {
@@ -3529,7 +3574,7 @@ func legacyControlAssignedReadyWorkQueryScript(includeEphemeralReady bool) strin
 
 func ephemeralAssignedInProgressProbeScript(shellVar string, includeEphemeralReady bool) string {
 	_ = includeEphemeralReady
-	return `r=$(` + bdQueryEphemeralStatusQuietShell("in_progress") + ` | ` +
+	return `r=$(` + bdQueryEphemeralStatusAssigneeQuietShell("in_progress", shellVar) + ` | ` +
 		`jq --arg id "$` + shellVar + `" '[.[] | select((.assignee // "") == $id)] | .[:1]' 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
 }
@@ -3539,7 +3584,7 @@ func ephemeralAssignedReadyProbeScript(shellVar string, includeEphemeralReady bo
 		return ""
 	}
 	filter := legacyEphemeralReadyFilterJQ(`select((.assignee // "") == $id)`, 1)
-	return `r=$(` + bdQueryEphemeralStatusQuietShell("open") + ` | ` +
+	return `r=$(` + bdQueryEphemeralStatusAssigneeQuietShell("open", shellVar) + ` | ` +
 		`jq --arg id "$` + shellVar + `" ` + shellquote.Quote(filter) + ` 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; `
 }
