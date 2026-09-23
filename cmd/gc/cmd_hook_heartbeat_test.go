@@ -214,6 +214,7 @@ func TestHookHeartbeatIdentitiesUnionsCurrentAndUnreusedHistory(t *testing.T) {
 	hookHeartbeatSessionFrontDoor = func(ctx context.Context) (*session.Store, error) {
 		sawCtx = ctx
 		store := beads.NewMemStore()
+		store.HonorExplicitIDs = true // the seam is keyed on the session bead id the env carries
 		if _, err := store.Create(beads.Bead{
 			ID: "ga-sess", Title: "polecat", Type: sessionBeadType, Status: "open", Labels: []string{sessionBeadLabel},
 			Metadata: map[string]string{"session_name": "polecat-gc-1", "alias": "rictus", "alias_history": "nux", "instance_token": "tok-live", "state": "active"},
