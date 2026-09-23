@@ -8884,11 +8884,7 @@ func TestJsonlExportRepackFailureIsCountedEscalatedAndCleared(t *testing.T) {
 	}
 	head := func() string {
 		t.Helper()
-		out, err := exec.Command(realGit, "-C", archiveRepo, "rev-parse", "HEAD").CombinedOutput()
-		if err != nil {
-			t.Fatalf("git rev-parse HEAD: %v\n%s", err, out)
-		}
-		return strings.TrimSpace(string(out))
+		return runGitOut(t, archiveRepo, "rev-parse", "HEAD")
 	}
 
 	// Run 1: the repack fails. The export still succeeds and commits.
