@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -103,7 +105,7 @@ func withHeartbeatIdentities(t *testing.T, identities []string, err error) {
 	t.Helper()
 	restore := hookHeartbeatIdentities
 	t.Cleanup(func() { hookHeartbeatIdentities = restore })
-	hookHeartbeatIdentities = func(string, string) ([]string, error) {
+	hookHeartbeatIdentities = func(context.Context, string, string, io.Writer) ([]string, error) {
 		return identities, err
 	}
 	withHeartbeatStartOffset(t, 0)
@@ -157,6 +159,94 @@ func TestHookHeartbeatEligibleIdentitiesFencesStaleIncarnations(t *testing.T) {
 		if !strings.Contains(err.Error(), "not heartbeat-eligible") {
 			t.Fatalf("%s: err = %q, want the fence diagnostic", name, err)
 		}
+	}
+}
+
+// TestHookHeartbeatUnreusedPriorAliasesVouchesOnlyThroughUnclaimedHistory pins
+// the codex round-8 P1-b writer set: a prior alias joins the identity set when
+// nobody live answers to it (or it resolves back to this session), and is
+// excluded — with a diagnostic — when a different live session has taken it,
+// when it is ambiguous, or when the lookup fails. Entries already in the
+// current set are not duplicated.
+func TestHookHeartbeatUnreusedPriorAliasesVouchesOnlyThroughUnclaimedHistory(t *testing.T) {
+	info := session.Info{ID: "ga-sess", Alias: "rictus", AliasHistory: []string{"nux", "toast", "capable", "rictus", "  ", "slit", "furiosa"}}
+	current := []string{"ga-sess", "rictus"}
+	resolve := func(alias string) (string, error) {
+		switch alias {
+		case "nux":
+			return "", session.ErrSessionNotFound // retired name: keep
+		case "toast":
+			return "ga-other", nil // reused by a live successor: exclude
+		case "capable":
+			return "ga-sess", nil // resolves to this session: keep
+		case "slit":
+			return "", session.ErrAmbiguous // two claimants: exclude
+		case "furiosa":
+			return "", errors.New("store: connection refused") // lookup failed: exclude
+		}
+		t.Fatalf("unexpected lookup of %q (already-current entries must not be resolved)", alias)
+		return "", nil
+	}
+	var diag bytes.Buffer
+	got := hookHeartbeatUnreusedPriorAliases(info, current, resolve, &diag)
+	if want := []string{"nux", "capable"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("kept prior aliases = %v, want %v", got, want)
+	}
+	for _, excluded := range []string{`prior alias "toast" is now answered to by live session ga-other`, `prior alias "slit": ambiguous session identifier`, `prior alias "furiosa": store: connection refused`} {
+		if !strings.Contains(diag.String(), excluded) {
+			t.Errorf("diag = %q, want %q", diag.String(), excluded)
+		}
+	}
+	if strings.Contains(diag.String(), `"nux"`) || strings.Contains(diag.String(), `"capable"`) {
+		t.Errorf("diag = %q, must not report a kept alias", diag.String())
+	}
+}
+
+// TestHookHeartbeatIdentitiesUnionsCurrentAndUnreusedHistory drives the
+// production resolver through the front-door seam: a rebranded session whose
+// old alias nobody live holds vouches for both names, and the front door is
+// opened with the run's own context (codex round-8 P2), not a background one.
+func TestHookHeartbeatIdentitiesUnionsCurrentAndUnreusedHistory(t *testing.T) {
+	type ctxKey struct{}
+	restore := hookHeartbeatSessionFrontDoor
+	t.Cleanup(func() { hookHeartbeatSessionFrontDoor = restore })
+	var sawCtx context.Context
+	hookHeartbeatSessionFrontDoor = func(ctx context.Context) (*session.Store, error) {
+		sawCtx = ctx
+		store := beads.NewMemStore()
+		if _, err := store.Create(beads.Bead{
+			ID: "ga-sess", Title: "polecat", Type: sessionBeadType, Status: "open", Labels: []string{sessionBeadLabel},
+			Metadata: map[string]string{"session_name": "polecat-gc-1", "alias": "rictus", "alias_history": "nux", "instance_token": "tok-live", "state": "active"},
+		}); err != nil {
+			t.Fatalf("Create session bead: %v", err)
+		}
+		return sessionFrontDoor(store), nil
+	}
+	ctx := context.WithValue(context.Background(), ctxKey{}, "run")
+	var diag bytes.Buffer
+	got, err := hookHeartbeatIdentities(ctx, "ga-sess", "tok-live", &diag)
+	if err != nil {
+		t.Fatalf("hookHeartbeatIdentities: %v (diag=%s)", err, diag.String())
+	}
+	if want := []string{"ga-sess", "polecat-gc-1", "rictus", "nux"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("identities = %v, want %v", got, want)
+	}
+	if sawCtx == nil || sawCtx.Value(ctxKey{}) != "run" {
+		t.Fatalf("front door opened with %v, want the run's context", sawCtx)
+	}
+	if diag.Len() != 0 {
+		t.Fatalf("diag = %q, want nothing for an unreused alias", diag.String())
+	}
+}
+
+// TestSessionCurrentClaimFrontDoorContextHonorsCancellation pins the round-8
+// P2 shape at the opener: a context already cancelled opens nothing.
+func TestSessionCurrentClaimFrontDoorContextHonorsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	front, err := sessionCurrentClaimFrontDoorContext(ctx)
+	if front != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("sessionCurrentClaimFrontDoorContext(cancelled) = %v, %v; want nil and context.Canceled", front, err)
 	}
 }
 
