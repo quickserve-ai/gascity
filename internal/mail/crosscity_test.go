@@ -98,7 +98,7 @@ func TestUnknownCityErrorMessage(t *testing.T) {
 func TestRefuseUnknownCity(t *testing.T) {
 	roster := enabledRoster()
 	base := fmt.Errorf("unknown recipient %q: %w", "x", session.ErrSessionNotFound)
-	rigs := []string{"qcore", "gascity", "tools"}
+	rigs := []string{"qcore", "gascity", "tools", "projects/backend"}
 
 	tests := []struct {
 		name      string
@@ -111,6 +111,7 @@ func TestRefuseUnknownCity(t *testing.T) {
 		{"local city segment keeps the original error", roster, "qlandia/nobody", ""},
 		{"peer city segment keeps the original error", roster, "gastown/mayor", ""},
 		{"agent dir scope keeps the original error", roster, "tools/x", ""},
+		{"nested agent dir scope keeps the original error by its leading segment", roster, "projects/backend/worker", ""},
 		{"template: session-target form keeps the original error", roster, "template:qcore/worker", ""},
 		{"controller keeps the original error", roster, "controller/x", ""},
 		{"human keeps the original error", roster, "human/x", ""},
