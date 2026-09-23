@@ -999,7 +999,8 @@ unsatisfiable `formula_compiler` requirement as deliberate, for example
 cooked. `gc doctor` reports such a formula as intentionally disabled
 instead of as a defect, and warns when the formula compiles anyway (a composed expansion or aspect may carry the unsatisfiable requirement).
 Cook and dispatch ignore it. A formula that `extends` a disabled parent
-inherits the parent's reason unless it declares its own.
+inherits the parent's reason unless it declares its own; an inherited reason never
+excuses the formula's own unsatisfiable requirement.
 
 ### Explicit declaration rule
 
