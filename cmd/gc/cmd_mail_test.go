@@ -5500,3 +5500,37 @@ func TestResolveMailRecipientIdentity_AliasSquatStillRefuses(t *testing.T) {
 		t.Fatal("alias squat resolved a recipient; want the refusal (the squatter would read the mail)")
 	}
 }
+
+func TestResolveMailRecipientIdentity_TwoSquattersOneHoldingTheAliasStillRefuses(t *testing.T) {
+	// Review 2026-09-23 (second round): the conflict lookup reports ONE bead.
+	// With one bead on the runtime name and another holding the identity as
+	// its alias, checking only the reported bead let the mail through to an
+	// address the alias holder reads. Any live bead answering to the mailbox
+	// must keep the refusal.
+	store := beads.NewMemStore()
+	cityPath := t.TempDir()
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Rigs:          []config.Rig{{Name: "qcore", Path: filepath.Join(cityPath, "qcore")}},
+		Agents:        []config.Agent{{Name: "barry", Dir: "qcore", StartCommand: "true"}},
+		NamedSessions: []config.NamedSession{{Template: "barry", Dir: "qcore"}},
+	}
+	spec, ok := findNamedSessionSpec(cfg, config.EffectiveCityName(cfg, filepath.Base(cityPath)), "qcore/barry")
+	if !ok {
+		t.Fatal("findNamedSessionSpec(qcore/barry) = false")
+	}
+	for _, md := range []map[string]string{
+		{"session_name": spec.SessionName, "template": "other", "agent_name": "other", "state": "asleep"},
+		{"session_name": "rogue-runtime", "alias": spec.Identity, "template": "other", "agent_name": "other", "state": "active"},
+	} {
+		if _, err := store.Create(beads.Bead{Type: session.BeadType, Labels: []string{session.LabelSession}, Metadata: md}); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+	}
+	if _, err := resolveSessionIDWithConfig(cityPath, cfg, store, "qcore/barry"); !errors.Is(err, errNamedSessionConflict) {
+		t.Fatalf("fixture: resolveSessionIDWithConfig err = %v, want the squat conflict", err)
+	}
+	if got, err := resolveMailRecipientIdentity(cityPath, cfg, store, "qcore/barry"); err == nil {
+		t.Fatalf("resolved %q with an alias holder live; want the refusal (it would read the mail)", got)
+	}
+}
