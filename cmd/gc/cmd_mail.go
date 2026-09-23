@@ -1086,7 +1086,7 @@ func resolveMailIdentityWithConfigCached(cityPath string, cfg *config.City, sess
 		// mail falls through to the configured address below and is stored.
 		// Refusing here was the ga-isa3j4 loss: the send failed and wrote
 		// nothing. The wake may still fail after the store, loudly.
-		if !errors.Is(err, session.ErrSessionNotFound) && !errors.Is(err, errNamedSessionConflict) {
+		if !errors.Is(err, session.ErrSessionNotFound) && !mailSafeThroughNamedSessionSquat(cityPath, cfg, sessStore, identifier, err) {
 			return "", err
 		}
 	}
@@ -1099,6 +1099,32 @@ func resolveMailIdentityWithConfigCached(cityPath string, cfg *config.City, sess
 		return address, nil
 	}
 	return resolveMailIdentityCached(sessStore, identifier, cache)
+}
+
+// mailSafeThroughNamedSessionSquat reports whether a named-session conflict
+// may be resolved to the configured mailbox anyway. It may only when the
+// squatting bead does NOT itself answer to that mailbox address: a bead that
+// holds the identity as its alias (or runtime name) lists it in its own inbox,
+// so storing under that address would hand the configured seat's mail to the
+// squatter (review of ga-isa3j4, 2026-09-23). Those keep the loud refusal.
+func mailSafeThroughNamedSessionSquat(cityPath string, cfg *config.City, sessStore beads.Store, identifier string, err error) bool {
+	if !errors.Is(err, errNamedSessionConflict) || cfg == nil || sessStore == nil {
+		return false
+	}
+	spec, ok, specErr := findNamedSessionSpecForTarget(cfg, loadedCityName(cfg, cityPath), identifier)
+	if specErr != nil || !ok {
+		return false
+	}
+	lookup, lookupErr := session.LookupConfiguredNamedSession(sessStore, spec)
+	if lookupErr != nil || !lookup.HasConflict {
+		return false
+	}
+	for _, addr := range session.MailboxAddressesIncludingRuntimeName(lookup.Conflict) {
+		if normalizeNamedSessionTarget(addr) == normalizeNamedSessionTarget(spec.Identity) {
+			return false
+		}
+	}
+	return true
 }
 
 func resolveMailRecipientIdentity(cityPath string, cfg *config.City, sessStore beads.Store, identifier string) (string, error) {
