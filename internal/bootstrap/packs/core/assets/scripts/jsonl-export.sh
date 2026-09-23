@@ -745,8 +745,11 @@ commit_archive_snapshot() {
     repack_err=$(git -c gc.auto=256 -c gc.autoDetach=false gc --auto --quiet 2>&1 >/dev/null) || repack_rc=$?
     read_loose_count
     if [ "$repack_rc" -eq 0 ] && [ -n "$loose" ] && [ "$loose" -gt "$REPACK_LOOSE_CEILING" ]; then
-        repack_step="repack -d -l"
-        repack_err=$(git repack -d -l -q 2>&1 >/dev/null) || repack_rc=$?
+        # An incremental repack cannot write a bitmap index: an inherited
+        # repack.writeBitmaps / pack.writeBitmaps makes it exit 128 on every
+        # snapshot, and the loose objects grow unbounded again.
+        repack_step="repack -d -l --no-write-bitmap-index"
+        repack_err=$(git repack -d -l -q --no-write-bitmap-index 2>&1 >/dev/null) || repack_rc=$?
         read_loose_count
     fi
     if [ "$repack_rc" -eq 0 ] && [ -n "$loose" ] && [ "$loose" -le "$REPACK_LOOSE_CEILING" ]; then

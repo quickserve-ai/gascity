@@ -8992,6 +8992,56 @@ exec '%s' "$@"
 // without packing while the exact loose count is above the ceiling. That skip
 // is legitimate, not a failure: the explicit repack packs the loose objects,
 // and no failure is recorded.
+// An inherited repack.writeBitmaps must not break the explicit fallback: an
+// incremental repack cannot write a bitmap index, and git exits 128 on it
+// (codex round 11 on #138; reproduced on git 2.50.1).
+func TestJsonlExportExplicitRepackIgnoresInheritedBitmapConfig(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+	mailLog := filepath.Join(t.TempDir(), "gc-mail.log")
+	archiveRepo := filepath.Join(cityDir, "archive")
+	stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("LookPath(git): %v", err)
+	}
+	writeExecutable(t, filepath.Join(binDir, "git"), fmt.Sprintf(`#!/bin/sh
+for arg in "$@"; do
+    if [ "$arg" = "gc" ]; then
+        exit 0
+    fi
+done
+exec '%s' "$@"
+`, realGit))
+	writeJsonlExportGCStub(t, binDir)
+	writeMultiRecordDoltStub(t, binDir, 3)
+	globalConfig := filepath.Join(t.TempDir(), "gitconfig")
+	if err := os.WriteFile(globalConfig, []byte("[repack]\n\twriteBitmaps = true\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(gitconfig): %v", err)
+	}
+
+	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
+	env["GC_JSONL_REPACK_LOOSE_CEILING"] = "0"
+	env["GIT_CONFIG_GLOBAL"] = globalConfig
+
+	runScript(t, coreScriptPath("jsonl-export.sh"), env)
+
+	data, err := os.ReadFile(stateFile)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("ReadFile(state file): %v", err)
+	}
+	if strings.Contains(string(data), "consecutive_repack_failures") {
+		t.Fatalf("an inherited writeBitmaps must not make the explicit repack fail\nstate: %s", data)
+	}
+	out := runGitOut(t, archiveRepo, "count-objects", "-v")
+	if !strings.Contains("\n"+out+"\n", "\ncount: 0\n") {
+		t.Fatalf("the explicit repack must pack every loose object despite writeBitmaps; count-objects:\n%s", out)
+	}
+}
+
 func TestJsonlExportSkippedAutoGCIsPackedExplicitly(t *testing.T) {
 	cityDir := t.TempDir()
 	binDir := t.TempDir()
