@@ -1010,6 +1010,56 @@ func TestResolveSessionIDMaterializingNamed_RuntimeSessionNameWrongTemplateConfl
 	}
 }
 
+func TestResolveSessionIDWithConfig_ConflictAdviceFollowsTheConflictShape(t *testing.T) {
+	// ga-lm5coj review: close stops the runtime, ends the bead and releases its
+	// work. The conflict error may recommend it only for a squat: a bead that
+	// records a template or agent other than this seat's. A pool session the
+	// reconciler adopts, or a bead that could be the seat's own unstamped
+	// session (ga-1ycmli), must never be pointed at close.
+	cityPath := filepath.Join(t.TempDir(), "city")
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Agents:        []config.Agent{{Name: "mayor", StartCommand: "true", MaxActiveSessions: intPtr(1)}},
+		NamedSessions: []config.NamedSession{{Template: "mayor"}},
+	}
+	spec, ok := findNamedSessionSpec(cfg, config.EffectiveCityName(cfg, filepath.Base(cityPath)), "mayor")
+	if !ok {
+		t.Fatal("findNamedSessionSpec(mayor) = false")
+	}
+	for _, tc := range []struct {
+		name      string
+		metadata  map[string]string
+		wantClose bool
+		want      string
+	}{
+		{"runtime name, other template", map[string]string{"session_name": spec.SessionName, "template": "other", "agent_name": "other", "state": "asleep"}, true, `template="other"`},
+		{"alias, other template", map[string]string{"session_name": "s-rogue", "alias": "mayor", "template": "other", "state": "active"}, true, "name squat"},
+		{"alias, this seat's template", map[string]string{"session_name": "s-own", "alias": "mayor", "template": "mayor", "state": "active"}, false, "gc session show"},
+		{"alias, no template", map[string]string{"session_name": "s-bare", "alias": "mayor", "state": "active"}, false, "gc session show"},
+		{"runtime name, no template", map[string]string{"session_name": spec.SessionName, "state": "asleep"}, false, "gc session show"},
+		{"pool session the reconciler adopts", map[string]string{"session_name": "mayor-ga-x1", "template": "mayor", "agent_name": "mayor", "session_origin": "ephemeral", "pool_managed": "true", "state": "active"}, false, "reconciler adopts"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := beads.NewMemStore()
+			b, err := store.Create(beads.Bead{Type: session.BeadType, Labels: []string{session.LabelSession}, Metadata: tc.metadata})
+			if err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			_, err = resolveSessionIDWithConfig(cityPath, cfg, store, "mayor")
+			if !errors.Is(err, errNamedSessionConflict) {
+				t.Fatalf("err = %v, want errNamedSessionConflict", err)
+			}
+			msg := err.Error()
+			if got := strings.Contains(msg, "gc session close "+b.ID); got != tc.wantClose {
+				t.Fatalf("recommends close = %v, want %v: %q", got, tc.wantClose, msg)
+			}
+			if !strings.Contains(msg, tc.want) || !strings.Contains(msg, "state=") || !strings.Contains(msg, "pool_managed=") {
+				t.Fatalf("err = %q, want %q and the bead's state/template/pool_managed", msg, tc.want)
+			}
+		})
+	}
+}
+
 func TestResolveSessionIDWithConfig_ConfigNameNotFoundNamesTheSessionIdentity(t *testing.T) {
 	// ga-lm5coj: a session is addressed by its named-session identity, never by
 	// its agent config name — the session surface deliberately does not resolve
