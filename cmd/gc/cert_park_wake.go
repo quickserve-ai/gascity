@@ -49,7 +49,10 @@ const certParkReadBudget = 2 * time.Second
 // certParkReadSlots bounds the cert-park reads outstanding at once, across
 // ticks. A read abandoned at the budget keeps its slot until its subprocess
 // returns, so a stalled store caps the leaked reads at this number instead of
-// adding a batch every tick; it is also the per-tick read cap.
+// adding a batch every tick. It caps a tick's reads only while they outlast
+// the launch loop: a read that returns first frees its slot for a later row,
+// so a fast store can serve more than this many rows in one tick. That is
+// harmless, since the bound exists for the slow store (ga-isk41m).
 var certParkReadSlots = make(chan struct{}, 8)
 
 // certParkedWorkProbe reports which of the given assignedWorkBeads indexes are,
