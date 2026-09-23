@@ -1483,8 +1483,24 @@ func resolveRawMailTargetForStorelessProvider(identifier string, stderr io.Write
 	}
 	if err == nil && store != nil {
 		cityPath, cfg := ambientMailTargetConfig()
-		target, resolveErr := resolveMailTargets(cliSessionStore(store, cfg, cityPath), identifier)
+		roster := mailCityRosterFor(cfg, cityPath)
+		lookup := identifier
+		if roster.Enabled() {
+			// The roster classifies before any session lookup, as the
+			// store-backed resolver does: a peer city's mailbox reads
+			// open-world, and <local>/<addr> is <addr>'s own inbox.
+			switch kind, addr := roster.ResolveCityAddress(identifier); kind {
+			case mail.CityAddressForeign:
+				return resolvedMailTarget{display: addr, recipients: []string{addr}}, true
+			case mail.CityAddressLocal:
+				lookup = addr
+			}
+		}
+		target, resolveErr := resolveMailTargets(cliSessionStore(store, cfg, cityPath), lookup)
 		if resolveErr == nil {
+			// A resolved local mailbox also serves its city-qualified
+			// deliveries, exactly as on the store-backed read path.
+			target.recipients = roster.ExpandLocalRecipients(target.recipients)
 			return target, true
 		}
 		if !errors.Is(resolveErr, session.ErrSessionNotFound) {
@@ -2109,7 +2125,7 @@ func cmdMailSendJSONFull(args []string, notify bool, all bool, from string, to s
 		// happens BEFORE any bead is written so the sender just re-runs
 		// with --ref. Resolution failures fall through — the nudge path
 		// surfaces them after the send exactly as before.
-		if !foreign && nf != nil && canonicalTo != "human" && strings.TrimSpace(ref) == "" {
+		if cloudWakeGuardApplies(foreign, nf != nil, canonicalTo, ref) {
 			if target, terr := resolveNudgeTarget(canonicalTo, io.Discard); terr == nil &&
 				strings.TrimSpace(target.agent.WakeTransport) == config.WakeTransportClaudeCloud {
 				fmt.Fprintf(stderr, "gc mail send: recipient %q is a cloud-wake seat (wake_transport=%s); pass --ref <https URL into its GitHub working surface> so its wake hint points at content it can reach (its sandbox cannot read bead:// refs), or --no-notify to send mail without a wake\n", canonicalTo, config.WakeTransportClaudeCloud) //nolint:errcheck // best-effort stderr
