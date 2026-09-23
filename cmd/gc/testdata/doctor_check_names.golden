@@ -17,6 +17,7 @@ expanded-config-load
 implicit-import-cache
 deprecated-attachment-fields
 nudge-unconfirmed
+dolt-servers
 dolt-topology
 dolt-drift
 config-valid

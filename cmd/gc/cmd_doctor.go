@@ -247,6 +247,17 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 	// Reads only ctx.CityPath, so it stays outside the config gate: a broken
 	// city.toml is precisely when session diagnostics need to be visible.
 	register(doctor.NewNudgeUnconfirmedCheck())
+	// ga-7qkj: dolt-drift and the managed-dolt probes read marker files; this
+	// census starts from the process table, so a server that never wrote a
+	// marker (the field orphans) is visible too. It stays outside both gates:
+	// a stale server left after a move to file-backed stores, or behind a
+	// broken city.toml, is exactly when the configuration says none should
+	// exist. Without a clean config only its per-scope policy degrades.
+	var doltServersCfg *config.City
+	if cfgErr == nil {
+		doltServersCfg = cfg
+	}
+	register(newDoltServersCheck(cityPath, doltServersCfg))
 
 	// Config-dependent checks run only when city.toml loaded cleanly. If it
 	// fails, the core config check above reports the parse error.
