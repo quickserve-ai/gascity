@@ -2514,7 +2514,10 @@ func (cr *CityRuntime) reloadConfigTraced(
 	cr.mat = buildMaxSessionAgeTracker(nextCfg, cr.cityName, nextSp)
 	cr.adt = buildAssignedWorkDeferTracker(nextCfg, cr.cityName, nextSp)
 
-	cr.wg = newWispGCForConfig(nextCfg)
+	// Carry the cadence position: a rebuilt tracker with lastRun=0 re-arms
+	// an immediate in-tick sweep on every applied reload (ga-q17a2k's ~76%
+	// run amplifier).
+	cr.wg = carryWispGCLastRun(cr.wg, newWispGCForConfig(nextCfg))
 
 	if outgoingOD != nil && !outgoingODDrained {
 		cr.retiredOrderDispatchers = append(cr.retiredOrderDispatchers, outgoingOD)
