@@ -1086,8 +1086,10 @@ func resolveMailIdentityWithConfigCached(cityPath string, cfg *config.City, sess
 		// mail falls through to the configured address below and is stored.
 		// Refusing here was the ga-isa3j4 loss: the send failed and wrote
 		// nothing. The wake may still fail after the store, loudly.
-		if !errors.Is(err, session.ErrSessionNotFound) && !mailSafeThroughNamedSessionSquat(cityPath, cfg, sessStore, identifier, err) {
-			return "", err
+		if !errors.Is(err, session.ErrSessionNotFound) {
+			if refusal := mailNamedSessionSquatRefusal(cityPath, cfg, sessStore, identifier, err); refusal != nil {
+				return "", refusal
+			}
 		}
 	}
 	if target, matched, targetErr := resolveLiveConfiguredNamedMailTargetCached(sessStore, identifier, cache); targetErr != nil {
@@ -1101,29 +1103,33 @@ func resolveMailIdentityWithConfigCached(cityPath string, cfg *config.City, sess
 	return resolveMailIdentityCached(sessStore, identifier, cache)
 }
 
-// mailSafeThroughNamedSessionSquat reports whether a named-session conflict
-// may be resolved to the configured mailbox anyway. It may only when NO live
-// session bead answers to that mailbox address: a bead that holds the
-// identity as its alias (or runtime name) lists it in its own inbox,
-// so storing under that address would hand the configured seat's mail to the
-// squatter (review of ga-isa3j4, 2026-09-23). Those keep the loud refusal.
-func mailSafeThroughNamedSessionSquat(cityPath string, cfg *config.City, sessStore beads.Store, identifier string, err error) bool {
+// mailNamedSessionSquatRefusal returns nil when a named-session conflict may
+// resolve to the configured mailbox anyway, and otherwise the error to refuse
+// with. Falling through is safe only when no session bead other than the
+// seat's own answers to that mailbox address: one holding the identity as its
+// alias (or runtime name) lists it in its own inbox and would read the seat's
+// mail (ga-isa3j4 reviews, 2026-09-23). A refusal names the bead that
+// answered, which need not be the one the conflict error names.
+func mailNamedSessionSquatRefusal(cityPath string, cfg *config.City, sessStore beads.Store, identifier string, err error) error {
 	if !errors.Is(err, errNamedSessionConflict) || cfg == nil || sessStore == nil {
-		return false
+		return err
 	}
 	spec, ok, specErr := findNamedSessionSpecForTarget(cfg, loadedCityName(cfg, cityPath), identifier)
 	if specErr != nil || !ok {
-		return false
+		return err
 	}
 	lookup, lookupErr := session.LookupConfiguredNamedSession(sessStore, spec)
 	if lookupErr != nil || !lookup.HasConflict {
-		return false
+		return err
 	}
-	// Check EVERY live bead, not just lookup.Conflict: that is one bead, and
-	// a second squatter holding the identity as its alias would be missed
-	// while the first holds the runtime name (review, 2026-09-23).
-	_, answered, answerErr := session.LiveSessionAnsweringToMailbox(sessStore, spec.Identity)
-	return answerErr == nil && !answered
+	answering, answered, scanErr := session.NonSeatSessionAnsweringToMailbox(sessStore, spec, lookup.Conflict)
+	if scanErr != nil {
+		return fmt.Errorf("%w (and checking which sessions read mailbox %q failed: %v)", err, spec.Identity, scanErr)
+	}
+	if answered {
+		return fmt.Errorf("%w; not storing: session bead %s also answers to mailbox %q and would read it", err, answering.ID, spec.Identity)
+	}
+	return nil
 }
 
 func resolveMailRecipientIdentity(cityPath string, cfg *config.City, sessStore beads.Store, identifier string) (string, error) {

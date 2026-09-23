@@ -5534,3 +5534,41 @@ func TestResolveMailRecipientIdentity_TwoSquattersOneHoldingTheAliasStillRefuses
 		t.Fatalf("resolved %q with an alias holder live; want the refusal (it would read the mail)", got)
 	}
 }
+
+func TestResolveMailRecipientIdentity_SquatWithOnlyTheSeatsOwnArchivedBeadStillResolves(t *testing.T) {
+	// ga-isa3j4 review round 3: the seat's own archived bead keeps its alias
+	// and is not canonical. It is the seat, not a squatter; treating it as an
+	// alias holder re-creates the lost-mail bug for exactly the field shape
+	// (a drained seat whose runtime name another bead took).
+	store := beads.NewMemStore()
+	cityPath := t.TempDir()
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Rigs:          []config.Rig{{Name: "qcore", Path: filepath.Join(cityPath, "qcore")}},
+		Agents:        []config.Agent{{Name: "barry", Dir: "qcore", StartCommand: "true"}},
+		NamedSessions: []config.NamedSession{{Template: "barry", Dir: "qcore"}},
+	}
+	spec, ok := findNamedSessionSpec(cfg, config.EffectiveCityName(cfg, filepath.Base(cityPath)), "qcore/barry")
+	if !ok {
+		t.Fatal("findNamedSessionSpec(qcore/barry) = false")
+	}
+	for _, md := range []map[string]string{
+		{session.NamedSessionMetadataKey: "true", session.NamedSessionIdentityMetadata: spec.Identity, "alias": spec.Identity,
+			"session_name": "old-runtime", "state": "archived", "continuity_eligible": "false"},
+		{"session_name": spec.SessionName, "template": "other", "agent_name": "other", "state": "asleep"},
+	} {
+		if _, err := store.Create(beads.Bead{Type: session.BeadType, Labels: []string{session.LabelSession}, Metadata: md}); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+	}
+	if _, err := resolveSessionIDWithConfig(cityPath, cfg, store, "qcore/barry"); !errors.Is(err, errNamedSessionConflict) {
+		t.Fatalf("fixture: resolveSessionIDWithConfig err = %v, want the squat conflict", err)
+	}
+	got, err := resolveMailRecipientIdentity(cityPath, cfg, store, "qcore/barry")
+	if err != nil {
+		t.Fatalf("resolveMailRecipientIdentity = %v, want the configured mailbox (the archived bead is the seat)", err)
+	}
+	if got != spec.Identity {
+		t.Fatalf("recipient = %q, want %q", got, spec.Identity)
+	}
+}

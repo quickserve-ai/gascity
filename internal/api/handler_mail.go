@@ -97,10 +97,12 @@ func (s *Server) resolveMailSendRecipientWithContext(ctx context.Context, recipi
 			return "", fmt.Errorf("session %q has no mailbox identity", recipient)
 		}
 		return address, nil
-	} else if !errors.Is(err, session.ErrSessionNotFound) && !s.mailSafeThroughNamedSessionSquat(store, recipient, err) {
-		// A name squat the squatter cannot read through falls through to the
+	} else if !errors.Is(err, session.ErrSessionNotFound) {
+		// A name squat nobody else can read through falls through to the
 		// configured mailbox below and is stored (ga-isa3j4, same rule as the CLI).
-		return "", err
+		if refusal := s.mailNamedSessionSquatRefusal(store, recipient, err); refusal != nil {
+			return "", refusal
+		}
 	}
 	if address, ok, err := s.configuredMailRecipientAddress(store, recipient); err != nil {
 		return "", err
@@ -110,29 +112,33 @@ func (s *Server) resolveMailSendRecipientWithContext(ctx context.Context, recipi
 	return "", s.mailRecipientNotFound(recipient)
 }
 
-// mailSafeThroughNamedSessionSquat reports whether a configured named-session
-// conflict may still resolve to the configured mailbox. A squat on the
-// session's RUNTIME name is a runtime problem; the mailbox identity comes from
-// config, so refusing loses the message (ga-isa3j4). It is safe only when no
-// live session bead answers to that mailbox address: one holding the identity
-// as its alias lists it in its own inbox and would read the configured seat's
-// mail. Mirrors cmd/gc mailSafeThroughNamedSessionSquat.
-func (s *Server) mailSafeThroughNamedSessionSquat(store beads.Store, identifier string, err error) bool {
+// mailNamedSessionSquatRefusal returns nil when a configured named-session
+// conflict may still resolve to the configured mailbox, and otherwise the
+// error to refuse with. A squat on the session's RUNTIME name is a runtime
+// problem; the mailbox identity comes from config, so refusing loses the
+// message (ga-isa3j4). Falling through is safe only when no session bead other
+// than the seat's own answers to that address. Mirrors cmd/gc
+// mailNamedSessionSquatRefusal.
+func (s *Server) mailNamedSessionSquatRefusal(store beads.Store, identifier string, err error) error {
 	if !errors.Is(err, errConfiguredNamedSessionConflict) || store == nil {
-		return false
+		return err
 	}
 	spec, ok, specErr := s.findNamedSessionSpecForTarget(store, identifier)
 	if specErr != nil || !ok {
-		return false
+		return err
 	}
 	lookup, lookupErr := session.LookupConfiguredNamedSession(store, spec)
 	if lookupErr != nil || !lookup.HasConflict {
-		return false
+		return err
 	}
-	// Every live bead, not just lookup.Conflict: a second squatter holding
-	// the identity as its alias would otherwise read the mail.
-	_, answered, answerErr := session.LiveSessionAnsweringToMailbox(store, spec.Identity)
-	return answerErr == nil && !answered
+	answering, answered, scanErr := session.NonSeatSessionAnsweringToMailbox(store, spec, lookup.Conflict)
+	if scanErr != nil {
+		return fmt.Errorf("%w (and checking which sessions read mailbox %q failed: %v)", err, spec.Identity, scanErr)
+	}
+	if answered {
+		return fmt.Errorf("%w; not storing: session bead %s also answers to mailbox %q and would read it", err, answering.ID, spec.Identity)
+	}
+	return nil
 }
 
 // mailRecipientNotFound is the send refusal for a recipient nothing resolved.
