@@ -378,6 +378,10 @@ func reapOrphanedClosedWisps(store beads.Store, cutoff time.Time, batchCap int) 
 	// no deletes but still pays those backend reads per aged rootless candidate.
 	probed := 0
 	probeTruncated := false
+	// rootlessUnprobed counts the aged rootless leaf-candidates a DRY-RUN
+	// sweep declined to probe (ga-q17a2k): the dry run's report of this
+	// population is a candidate count, not a proven-leaf count.
+	rootlessUnprobed := 0
 	var deleteErr error
 	for _, c := range candidates {
 		// The batch cap bounds DELETION ATTEMPTS per sweep — counting failed
@@ -416,10 +420,25 @@ func reapOrphanedClosedWisps(store beads.Store, cutoff time.Time, batchCap int) 
 			if strings.TrimSpace(c.ParentID) != "" {
 				continue
 			}
-			// Every remaining rootless candidate costs backend reads whether or
-			// not this sweep enforces, so the probe budget is checked before the
-			// first of them. break, not continue: the rest of the candidate
-			// slice cannot be probed either, so walking it buys nothing.
+			// DRY-RUN PAYS NO PROBES (ga-q17a2k). The leaf-ness probes below
+			// are two backend reads per candidate, and on a store where every
+			// closed task wisp is rootless (51k of 51k on hq, 2026-09-23) a
+			// probe-cap-sized prefix of them re-walks EVERY sweep — nothing
+			// leaves the candidate set, so the same rows are re-probed
+			// forever. Measured: p50 13s -> 223-290s per sweep at the swap
+			// that introduced the probes, ~25% of dispatch wall time, buying
+			// only a dry-run counter. Precision about leaf-ness is worth two
+			// reads per row only when enforcement can spend it on a delete;
+			// the dry run reports how many rootless candidates it left
+			// unprobed instead.
+			if !enforce {
+				rootlessUnprobed++
+				continue
+			}
+			// Every remaining rootless candidate costs backend reads, so the
+			// probe budget is checked before the first of them. break, not
+			// continue: the rest of the candidate slice cannot be probed
+			// either, so walking it buys nothing.
 			if wispGCReapOrphanProbeCap > 0 && probed >= wispGCReapOrphanProbeCap {
 				probeTruncated = true
 				break
@@ -514,6 +533,10 @@ func reapOrphanedClosedWisps(store beads.Store, cutoff time.Time, batchCap int) 
 
 	if probeTruncated {
 		log.Printf("wisp gc: rootless-orphan scan stopped after %d probes (cap); the reported count is a floor, not the full eligible backlog", probed)
+	}
+
+	if rootlessUnprobed > 0 {
+		log.Printf("wisp gc: %d aged rootless candidate(s) not probed for leaf-ness (dry-run performs no per-candidate reads; set %s=1 to probe and reap)", rootlessUnprobed, reapOrphansEnv)
 	}
 
 	if !enforce {
