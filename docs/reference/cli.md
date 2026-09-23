@@ -2680,6 +2680,13 @@ if it has a session whose alias equals that string (a rig named after the
 sending city) the message binds to that session — do not name a rig after a
 city that mails you. --all and --notify are refused for a remote city.
 
+When [mail.crosscity] is configured, a recipient may be city-qualified:
+&lt;city&gt;/&lt;address&gt;, split on the first "/". This city's own name strips to the
+local form (&lt;city&gt;/mayor and mayor are one mailbox); a listed peer city's
+address is stored canonical as written, with no local session lookup, and the
+sender is stored city-qualified so a plain reply resolves back. --notify does
+not cross cities: the recipient's wake belongs to its own city's mail sweep.
+
 ```
 gc mail send [<to>] [<body>] [flags]
 ```

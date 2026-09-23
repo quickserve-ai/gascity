@@ -1149,6 +1149,20 @@ func resolveMailRecipientIdentityCached(cityPath string, cfg *config.City, sessS
 	if normalized := normalizeNamedSessionTarget(identifier); normalized == "" || normalized == "human" {
 		return "human", nil
 	}
+	roster := mailCityRosterFor(cfg, cityPath)
+	switch kind, addr := roster.ResolveCityAddress(identifier); kind {
+	case mail.CityAddressForeign:
+		// A peer city's address is canonical as written; its identity can
+		// only be checked by that city, so the session store is never
+		// consulted.
+		return addr, nil
+	case mail.CityAddressLocal:
+		// <local city>/<addr> and <addr> are one mailbox.
+		identifier = addr
+		if normalized := normalizeNamedSessionTarget(identifier); normalized == "" || normalized == "human" {
+			return "human", nil
+		}
+	}
 	if sessStore != nil {
 		sessionID, err := session.ResolveSessionIDByExactID(sessStore, identifier)
 		if err == nil {
@@ -1166,7 +1180,21 @@ func resolveMailRecipientIdentityCached(cityPath string, cfg *config.City, sessS
 	if normalizeNamedSessionTarget(identifier) == controllerMailIdentity {
 		return "", session.ErrSessionNotFound
 	}
-	return resolveMailIdentityWithConfigCached(cityPath, cfg, sessStore, identifier, cache)
+	resolved, err := resolveMailIdentityWithConfigCached(cityPath, cfg, sessStore, identifier, cache)
+	if err != nil {
+		// A slash-form recipient whose first segment names neither a local
+		// scope nor a roster city refuses as unknown-city, so a stale roster
+		// is never spelled "session not found". Only a not-found upgrades;
+		// with no store at all the roster alone decides, since an unknown
+		// city needs no lookup to be one.
+		if sessStore == nil {
+			if probe := mail.RefuseUnknownCity(mail.ErrUnresolvedCityProbe, identifier, roster, cfg.LocalAddressPrefixes()); !errors.Is(probe, mail.ErrUnresolvedCityProbe) {
+				return "", probe
+			}
+		}
+		return "", mail.RefuseUnknownCity(err, identifier, roster, cfg.LocalAddressPrefixes())
+	}
+	return resolved, nil
 }
 
 func configuredMailboxAddress(identifier string) (string, bool) {
@@ -1327,9 +1355,31 @@ func resolveMailTargetsWithConfig(cityPath string, cfg *config.City, sessStore b
 }
 
 func resolveMailTargetsWithConfigCached(cityPath string, cfg *config.City, sessStore beads.Store, identifier string, cache *mailIdentitySessionCache) (resolvedMailTarget, error) {
+	roster := mailCityRosterFor(cfg, cityPath)
 	if normalized := normalizeNamedSessionTarget(identifier); normalized == "" || normalized == "human" {
-		return resolvedMailTarget{display: "human", recipients: []string{"human"}}, nil
+		return resolvedMailTarget{display: "human", recipients: roster.ExpandLocalRecipients([]string{"human"})}, nil
 	}
+	switch kind, addr := roster.ResolveCityAddress(identifier); kind {
+	case mail.CityAddressForeign:
+		// Reads are open-world: a peer city's mailbox is readable with no
+		// session lookup, exactly as an unresolved bare recipient is today.
+		return resolvedMailTarget{display: addr, recipients: []string{addr}}, nil
+	case mail.CityAddressLocal:
+		identifier = addr
+		if normalized := normalizeNamedSessionTarget(identifier); normalized == "" || normalized == "human" {
+			return resolvedMailTarget{display: "human", recipients: roster.ExpandLocalRecipients([]string{"human"})}, nil
+		}
+	}
+	target, err := resolveLocalMailTargetsWithConfigCached(cityPath, cfg, sessStore, identifier, cache)
+	if err != nil {
+		return target, mail.RefuseUnknownCity(err, identifier, roster, cfg.LocalAddressPrefixes())
+	}
+	// Delivery addressed to <local city>/<addr> is a read on <addr>'s inbox.
+	target.recipients = roster.ExpandLocalRecipients(target.recipients)
+	return target, nil
+}
+
+func resolveLocalMailTargetsWithConfigCached(cityPath string, cfg *config.City, sessStore beads.Store, identifier string, cache *mailIdentitySessionCache) (resolvedMailTarget, error) {
 	if sessStore != nil && cfg != nil {
 		sessionID, err := resolveSessionIDWithConfig(cityPath, cfg, sessStore, identifier)
 		if err == nil {
@@ -1386,7 +1436,11 @@ func resolveMailTargetsCached(sessStore beads.Store, identifier string, cache *m
 
 func resolveMailTargetsForCommand(identifier string, stderr io.Writer, cmdName string) (resolvedMailTarget, bool) {
 	if normalized := normalizeNamedSessionTarget(identifier); normalized == "" || normalized == "human" {
-		return resolvedMailTarget{display: "human", recipients: []string{"human"}}, true
+		// The operator's box serves city-qualified deliveries too: mail
+		// addressed to <local city>/human is a read on human's inbox.
+		cityPath, cfg := ambientMailTargetConfig()
+		roster := mailCityRosterFor(cfg, cityPath)
+		return resolvedMailTarget{display: "human", recipients: roster.ExpandLocalRecipients([]string{"human"})}, true
 	}
 	if isStorelessMailProvider() {
 		return resolveRawMailTargetForStorelessProvider(identifier, stderr, cmdName)
@@ -1472,15 +1526,31 @@ func resolveRawMailTargetForStorelessProvider(identifier string, stderr io.Write
 	store, err := openMailTargetStore()
 	if err != nil {
 		if isNoCityStoreError(err) {
-			return resolvedMailTarget{display: identifier, recipients: []string{identifier}}, true
+			return storelessMailTarget(identifier), true
 		}
 		fmt.Fprintf(stderr, "%s: %v\n", cmdName, err) //nolint:errcheck // best-effort stderr
 		return resolvedMailTarget{}, false
 	}
 	if err == nil && store != nil {
 		cityPath, cfg := ambientMailTargetConfig()
-		target, resolveErr := resolveMailTargets(cliSessionStore(store, cfg, cityPath), identifier)
+		roster := mailCityRosterFor(cfg, cityPath)
+		lookup := identifier
+		if roster.Enabled() {
+			// The roster classifies before any session lookup, as the
+			// store-backed resolver does: a peer city's mailbox reads
+			// open-world, and <local>/<addr> is <addr>'s own inbox.
+			switch kind, addr := roster.ResolveCityAddress(identifier); kind {
+			case mail.CityAddressForeign:
+				return resolvedMailTarget{display: addr, recipients: []string{addr}}, true
+			case mail.CityAddressLocal:
+				lookup = addr
+			}
+		}
+		target, resolveErr := resolveMailTargets(cliSessionStore(store, cfg, cityPath), lookup)
 		if resolveErr == nil {
+			// A resolved local mailbox also serves its city-qualified
+			// deliveries, exactly as on the store-backed read path.
+			target.recipients = roster.ExpandLocalRecipients(target.recipients)
 			return target, true
 		}
 		if !errors.Is(resolveErr, session.ErrSessionNotFound) {
@@ -1488,7 +1558,28 @@ func resolveRawMailTargetForStorelessProvider(identifier string, stderr io.Write
 			return resolvedMailTarget{}, false
 		}
 	}
-	return resolvedMailTarget{display: identifier, recipients: []string{identifier}}, true
+	return storelessMailTarget(identifier), true
+}
+
+// storelessMailTarget is the raw read target when no store can resolve the
+// identifier. With a roster the read still serves city-qualified delivery:
+// <local>/<addr> reads <addr>'s inbox, and a bare <addr> also reads its
+// <local>/<addr> alias; a foreign or unknown form stays an open-world literal.
+func storelessMailTarget(identifier string) resolvedMailTarget {
+	cityPath, cfg := ambientMailTargetConfig()
+	roster := mailCityRosterFor(cfg, cityPath)
+	if !roster.Enabled() {
+		return resolvedMailTarget{display: identifier, recipients: []string{identifier}}
+	}
+	kind, addr := roster.ResolveCityAddress(identifier)
+	switch kind {
+	case mail.CityAddressLocal:
+		return resolvedMailTarget{display: addr, recipients: roster.ExpandLocalRecipients([]string{addr})}
+	case mail.CityAddressForeign:
+		return resolvedMailTarget{display: addr, recipients: []string{addr}}
+	default:
+		return resolvedMailTarget{display: identifier, recipients: roster.ExpandLocalRecipients([]string{identifier})}
+	}
 }
 
 func isNoCityStoreError(err error) bool {
@@ -1608,7 +1699,14 @@ far side knows which city to answer with 'gc --context <city> mail send';
 --from overrides it. The remote city stores an unknown sender literally, but
 if it has a session whose alias equals that string (a rig named after the
 sending city) the message binds to that session — do not name a rig after a
-city that mails you. --all and --notify are refused for a remote city.`,
+city that mails you. --all and --notify are refused for a remote city.
+
+When [mail.crosscity] is configured, a recipient may be city-qualified:
+<city>/<address>, split on the first "/". This city's own name strips to the
+local form (<city>/mayor and mayor are one mailbox); a listed peer city's
+address is stored canonical as written, with no local session lookup, and the
+sender is stored city-qualified so a plain reply resolves back. --notify does
+not cross cities: the recipient's wake belongs to its own city's mail sweep.`,
 		Example: `  gc mail send mayor "Build is green"
   gc mail send mayor -s "Build is green"
   gc mail send myrig/reviewer -s "Need investigation" -m "Attach logs from the last failed run"
@@ -1629,7 +1727,7 @@ city that mails you. --all and --notify are refused for a remote city.`,
 			// recipient is skipped at the invocation site as before.
 			if !notify && !noNotify && !all {
 				if _, isRemote, _, rerr := resolveWriteTarget(); rerr == nil && !isRemote {
-					notify = true
+					notify = defaultMailSendNotify(mailSendRecipientIsForeign(args, to))
 				}
 			}
 			code := cmdMailSendJSONFull(args, notify, all, from, to, subject, message, dedupKey, ref, jsonOut, stdout, stderr)
@@ -1960,6 +2058,7 @@ func cmdMailSendJSONFull(args []string, notify bool, all bool, from string, to s
 	// recipient + listLiveSessionMailboxes) shares one broad scan instead of
 	// issuing one per call site (ga-q6ct Layer 3).
 	idCache := &mailIdentitySessionCache{}
+	roster := mailCityRosterFor(cfg, cityPath)
 	if store != nil {
 		validRecipients, err = listLiveSessionMailboxesCached(sessStore, idCache)
 		if err != nil {
@@ -1980,10 +2079,24 @@ func cmdMailSendJSONFull(args []string, notify bool, all bool, from string, to s
 			sender = defaultMailIdentity()
 		}
 	} else if sender != "human" && store != nil {
-		sender, err = resolveMailIdentityWithConfigCached(cityPath, cfg, sessStore, sender, idCache)
-		if err != nil {
-			fmt.Fprintf(stderr, "gc mail send: invalid sender %q: %v\n", sender, err) //nolint:errcheck // best-effort stderr
-			return 1
+		// A --from carrying a peer city's segment is accepted verbatim: only
+		// its own city can check that identity. A local-city qualifier strips
+		// to the bare form, which stays identity-checked here — the local
+		// city is the one place identity can and must be checked.
+		if kind, addr := roster.ResolveCityAddress(sender); kind == mail.CityAddressForeign {
+			sender = addr
+		} else {
+			if kind == mail.CityAddressLocal {
+				sender = addr
+			}
+			if sender != "human" {
+				given := sender
+				sender, err = resolveMailIdentityWithConfigCached(cityPath, cfg, sessStore, sender, idCache)
+				if err != nil {
+					fmt.Fprintf(stderr, "gc mail send: invalid sender %q: %v\n", given, err) //nolint:errcheck // best-effort stderr
+					return 1
+				}
+			}
 		}
 	}
 
@@ -2023,6 +2136,9 @@ func cmdMailSendJSONFull(args []string, notify bool, all bool, from string, to s
 			args = []string{args[0], subject, body}
 		}
 	}
+	// foreign marks a send addressed to a peer city. Phase 1 moves no store,
+	// so such a send is written HERE; the warning after the write says so.
+	foreign := false
 	if !all && len(args) > 0 && store != nil {
 		canonicalTo, err := resolveMailRecipientIdentityCached(cityPath, cfg, sessStore, args[0], idCache)
 		if err != nil {
@@ -2038,15 +2154,65 @@ func cmdMailSendJSONFull(args []string, notify bool, all bool, from string, to s
 		if validRecipients != nil {
 			validRecipients[canonicalTo] = true
 		}
+		// Cross-city classification runs BEFORE local wake resolution: a
+		// foreign recipient never reaches resolveNudgeTarget, so a local
+		// alias that happens to share a peer's address shape cannot turn a
+		// cross-city send into a cloud-wake refusal.
+		if kind, _ := roster.ResolveCityAddress(canonicalTo); kind == mail.CityAddressForeign {
+			foreign = true
+			if notify {
+				msg := crossCityNotifyRefusal("gc mail send", canonicalTo)
+				if jsonOut {
+					return writeJSONError(stdout, stderr, "cross_city_notify", msg, 1)
+				}
+				fmt.Fprintln(stderr, msg) //nolint:errcheck // best-effort stderr
+				return 1
+			}
+			// Qualify the stored sender so the recipient's plain reply
+			// resolves back to this city.
+			sender = roster.QualifySender(sender)
+		}
 		// Cloud-wake guard rail (design §5.3): a notified recipient whose
 		// seat selects claude-cloud needs a reachable ref, and the refusal
 		// happens BEFORE any bead is written so the sender just re-runs
 		// with --ref. Resolution failures fall through — the nudge path
 		// surfaces them after the send exactly as before.
-		if nf != nil && canonicalTo != "human" && strings.TrimSpace(ref) == "" {
+		if cloudWakeGuardApplies(foreign, nf != nil, canonicalTo, ref) {
 			if target, terr := resolveNudgeTarget(canonicalTo, io.Discard); terr == nil &&
 				strings.TrimSpace(target.agent.WakeTransport) == config.WakeTransportClaudeCloud {
 				fmt.Fprintf(stderr, "gc mail send: recipient %q is a cloud-wake seat (wake_transport=%s); pass --ref <https URL into its GitHub working surface> so its wake hint points at content it can reach (its sandbox cannot read bead:// refs), or --no-notify to send mail without a wake\n", canonicalTo, config.WakeTransportClaudeCloud) //nolint:errcheck // best-effort stderr
+				return 1
+			}
+		}
+	} else if !all && len(args) > 0 && roster.Enabled() {
+		// Storeless send (exec: provider, no city store): the roster still
+		// classifies the recipient. Without a store nothing can be
+		// session-resolved, so an unknown city is refused here (never
+		// written to a literal mailbox), --notify keeps its cross-city
+		// refusal, and a foreign send still stores a qualified sender.
+		kind, addr := roster.ResolveCityAddress(args[0])
+		switch kind {
+		case mail.CityAddressForeign:
+			args[0] = addr
+			foreign = true
+			if notify {
+				msg := crossCityNotifyRefusal("gc mail send", addr)
+				if jsonOut {
+					return writeJSONError(stdout, stderr, "cross_city_notify", msg, 1)
+				}
+				fmt.Fprintln(stderr, msg) //nolint:errcheck // best-effort stderr
+				return 1
+			}
+			sender = roster.QualifySender(sender)
+		case mail.CityAddressLocal:
+			args[0] = addr
+		default:
+			if refuse := mail.RefuseUnknownCity(mail.ErrUnresolvedCityProbe, args[0], roster, cfg.LocalAddressPrefixes()); refuse != nil && !errors.Is(refuse, mail.ErrUnresolvedCityProbe) {
+				msg := fmt.Sprintf("gc mail send: unknown recipient %q: %v", args[0], refuse)
+				if jsonOut {
+					return writeJSONError(stdout, stderr, "cross_city_unknown_city", msg, 1)
+				}
+				fmt.Fprintln(stderr, msg) //nolint:errcheck // best-effort stderr
 				return 1
 			}
 		}
@@ -2069,7 +2235,11 @@ func cmdMailSendJSONFull(args []string, notify bool, all bool, from string, to s
 	}
 
 	rec := openCityRecorder(stderr)
-	return doMailSendJSON(mp, rec, validRecipients, sender, args, nf, dedupKey, jsonOut, stdout, stderr)
+	sendCode := doMailSendJSON(mp, rec, validRecipients, sender, args, nf, dedupKey, jsonOut, stdout, stderr)
+	if sendCode == 0 && foreign && len(args) > 0 {
+		fmt.Fprintln(stderr, localForeignSendWarning(args[0])) //nolint:errcheck // best-effort stderr
+	}
+	return sendCode
 }
 
 // doMailSend creates a message addressed to a recipient. args is [to, subject, body]
@@ -2590,6 +2760,47 @@ func cmdMailReplyJSON(args []string, subject, message string, notify bool, jsonO
 	body := message
 	if body == "" && len(args) > 1 {
 		body = strings.Join(args[1:], " ")
+	}
+
+	// A reply into a foreign-origin thread crosses cities: refuse --notify
+	// before any write, and store this city's sender city-qualified so
+	// the far side's plain reply resolves back here.
+	if cfg == nil {
+		cityPath, cfg = ambientMailTargetConfig()
+	}
+	if roster := mailCityRosterFor(cfg, cityPath); roster.Enabled() {
+		orig, getErr := mp.Get(args[0])
+		if getErr != nil {
+			// Fail closed: without the thread origin the cross-city rules
+			// (notify refusal, sender qualification) cannot be applied.
+			msg := fmt.Sprintf("gc mail reply: cannot verify thread origin for cross-city rules: %v", getErr)
+			if jsonOut {
+				return writeJSONError(stdout, stderr, "cross_city_origin_unverified", msg, 1)
+			}
+			fmt.Fprintln(stderr, msg) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		// A thread whose origin names a city this roster does not know is
+		// refused, never written to a literal mailbox nobody polls.
+		if refuse := mail.RefuseUnknownCity(mail.ErrUnresolvedCityProbe, orig.From, roster, cfg.LocalAddressPrefixes()); refuse != nil && !errors.Is(refuse, mail.ErrUnresolvedCityProbe) {
+			msg := "gc mail reply: reply origin " + refuse.Error()
+			if jsonOut {
+				return writeJSONError(stdout, stderr, "cross_city_unknown_origin", msg, 1)
+			}
+			fmt.Fprintln(stderr, msg) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		if kind, _ := roster.ResolveCityAddress(orig.From); kind == mail.CityAddressForeign {
+			if notify {
+				msg := crossCityNotifyRefusal("gc mail reply", orig.From)
+				if jsonOut {
+					return writeJSONError(stdout, stderr, "cross_city_notify", msg, 1)
+				}
+				fmt.Fprintln(stderr, msg) //nolint:errcheck // best-effort stderr
+				return 1
+			}
+			sender = roster.QualifySender(sender)
+		}
 	}
 
 	var nf nudgeFunc
