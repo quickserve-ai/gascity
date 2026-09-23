@@ -618,3 +618,43 @@ func TestOrderOutcomeHealthy_WindowEdgeFailureKeepsItsGrace(t *testing.T) {
 		t.Fatalf("the graced edge failure must not count: %v %q %v", result.Status, result.Message, result.Details)
 	}
 }
+
+func TestCronLongestRunSpan(t *testing.T) {
+	for schedule, want := range map[string]struct {
+		atMost, over time.Duration
+	}{
+		"*/5 * * * *":    {atMost: 10 * time.Minute},
+		"0 9 * * 1-5":    {atMost: 4 * 24 * time.Hour}, // Thu, Fri, Mon
+		"0 0 1-3 * *":    {over: orderOutcomeLookback}, // 2nd, 3rd, next 1st
+		"0 16 * * 5":     {over: orderOutcomeLookback}, // weekly
+		"0 18 * * 1,3,5": {atMost: 5 * 24 * time.Hour}, // Wed, Fri, Mon
+	} {
+		got, err := cronLongestRunSpan(schedule, 3)
+		if err != nil {
+			t.Fatalf("%s: %v", schedule, err)
+		}
+		if want.atMost > 0 && got > want.atMost {
+			t.Errorf("%s: span %v, want <= %v", schedule, got, want.atMost)
+		}
+		if want.over > 0 && got <= want.over {
+			t.Errorf("%s: span %v, want > %v", schedule, got, want.over)
+		}
+	}
+}
+
+// Codex on #136: a bursty cron's smallest gap (a day) said three runs fit in
+// the window, so a streak split by the month boundary read "under threshold".
+func TestOrderOutcomeHealthy_BurstyCronStreakIsNotHiddenByItsSmallestGap(t *testing.T) {
+	now := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrderInDir(t, filepath.Join(cityPath, "orders"), "month-start", "cron", "0 0 1-3 * *")
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.OrderFailed, Ts: time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC), Subject: "month-start", Message: "boom"},
+		events.Event{Type: events.OrderFailed, Ts: time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC), Subject: "month-start", Message: "boom"},
+		events.Event{Type: events.OrderFailed, Ts: time.Date(2026, 9, 3, 0, 0, 0, 0, time.UTC), Subject: "month-start", Message: "boom"},
+	)
+	result := runOutcomeCheckAt(t, cityPath, cfg, now)
+	if result.Status != StatusWarning || !strings.Contains(strings.Join(result.Details, "\n"), "month-start: every run in the last") {
+		t.Fatalf("a bursty cron failing every visible run must warn: %v %q %v", result.Status, result.Message, result.Details)
+	}
+}
