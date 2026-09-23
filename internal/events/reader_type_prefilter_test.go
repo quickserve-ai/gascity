@@ -134,3 +134,35 @@ func TestReadFilteredTypePrefilterKeepsEscapedTypes(t *testing.T) {
 		t.Fatalf("escaped order.failed must match, got %+v", got)
 	}
 }
+
+// Codex r3 on #136: a foreign writer may escape a type's solidus
+// ("custom\/event"), which decodes to custom/event but holds neither the
+// literal needle nor a \u escape. Both the archive and the active-log scans
+// must decode such a line rather than skip it.
+func TestReadFilteredTypePrefilterKeepsEscapedSolidus(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+	escapedType := "custom" + string(rune(92)) + "/event"
+	if escapedType != `custom\/event` {
+		t.Fatalf("fixture = %q, want a backslash before the solidus", escapedType)
+	}
+	line := func(seq int) string {
+		return fmt.Sprintf(`{"seq":%d,"type":"%s","ts":"2026-09-21T00:00:00Z","actor":"t"}`, seq, escapedType) + "\n"
+	}
+	writeGzipFile(t, filepath.Join(dir, "events.jsonl.archive-20260921T000000Z-seq-1-2.gz"),
+		line(1)+`{"seq":2,"type":"custom.other","ts":"2026-09-21T00:00:00Z","actor":"t"}`+"\n")
+	if err := os.WriteFile(path, []byte(line(3)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadFiltered(path, Filter{Type: "custom/event"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seqs []uint64
+	for _, e := range got {
+		seqs = append(seqs, e.Seq)
+	}
+	if fmt.Sprint(seqs) != "[1 3]" {
+		t.Fatalf("custom/event seqs = %v, want [1 3] (archived and active escaped-solidus lines)", seqs)
+	}
+}

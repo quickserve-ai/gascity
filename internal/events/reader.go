@@ -527,11 +527,15 @@ func typeNeedles(filter Filter, types []string) [][]byte {
 }
 
 // lineMayMatch reports whether line can hold one of the needles' types. With
-// no needles every line may match, and so does any line holding a \u escape:
-// a writer other than encoding/json may spell a plain type with escapes
-// ("order\u002efailed"), which decodes to a match the needle would miss.
+// no needles every line may match, and so does any line holding an escape
+// that can decode to a byte a needle may contain: a writer other than
+// encoding/json may spell a plain type with \u escapes ("order\u002efailed")
+// or escape its solidus ("custom\/event"), and either decodes to a match the
+// needle would miss. typeNeedles admits only printable ASCII other than `"`,
+// `\`, `<`, `>` and `&`, and of JSON's escapes only \u and \/ decode to such a
+// byte, so every other escape (\n, \", \\ ...) keeps the prefilter on.
 func lineMayMatch(line []byte, needles [][]byte) bool {
-	if needles == nil || bytes.Contains(line, []byte(`\u`)) {
+	if needles == nil || bytes.Contains(line, []byte(`\u`)) || bytes.Contains(line, []byte(`\/`)) {
 		return true
 	}
 	for _, needle := range needles {
