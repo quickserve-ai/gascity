@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"io"
 	"log"
 	"strings"
@@ -28,6 +29,33 @@ func sessionCurrentClaimFrontDoor() (*session.Store, error) {
 		return nil, err
 	}
 	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		return nil, err
+	}
+	cfg, _ := loadCityConfigWithoutBuiltinPackRefresh(cityPath, io.Discard)
+	return cliSessionFrontDoor(store, cfg, cityPath), nil
+}
+
+// sessionCurrentClaimFrontDoorContext is sessionCurrentClaimFrontDoor over a
+// store whose bd subprocess is bound to ctx (scopedBdStoreForCity): the
+// shared opener's runner is fixed to context.Background() at construction, so
+// a caller with its own budget — the detached lease heartbeat, whose whole
+// run is bounded by hookHeartbeatTimeout — cannot otherwise cancel a session
+// read that stalls during a store outage, and its children pile up for the
+// length of the outage (codex round-8 P2). Same city resolution, same
+// no-refresh config load, same routed cliSessionFrontDoor, so a
+// [beads.classes.sessions] relocation reaches this door too. It is bd-only by
+// construction, like every scoped store; the heartbeat's work-store opener
+// makes the same choice.
+func sessionCurrentClaimFrontDoorContext(ctx context.Context) (*session.Store, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	cityPath, err := resolveCity()
+	if err != nil {
+		return nil, err
+	}
+	store, err := scopedBdStoreForCity(ctx, cityPath)
 	if err != nil {
 		return nil, err
 	}
