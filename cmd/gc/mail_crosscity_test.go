@@ -1,0 +1,851 @@
+package main
+
+import (
+	"bytes"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/mail"
+	"github.com/gastownhall/gascity/internal/mail/beadmail"
+	"github.com/gastownhall/gascity/internal/session"
+)
+
+func crossCityTestConfig() *config.City {
+	return &config.City{
+		Workspace: config.Workspace{Name: "qlandia"},
+		Mail: config.MailConfig{CrossCity: &config.MailCrossCityConfig{
+			City:   "qlandia",
+			Cities: []string{"gastown", "westeros"},
+		}},
+		Rigs:   []config.Rig{{Name: "qcore", Path: "rigs/qcore"}},
+		Agents: []config.Agent{{Name: "x", Dir: "tools"}},
+	}
+}
+
+// A foreign-city recipient resolves from the roster alone. The nil session
+// store makes the guard structural: a regression that consults the
+// session store cannot pass.
+func TestResolveMailRecipientIdentityCrossCityForeignWithoutSessionStore(t *testing.T) {
+	got, err := resolveMailRecipientIdentity("", crossCityTestConfig(), nil, "gastown/mayor")
+	if err != nil {
+		t.Fatalf("resolveMailRecipientIdentity: %v", err)
+	}
+	if got != "gastown/mayor" {
+		t.Errorf("got %q, want canonical %q", got, "gastown/mayor")
+	}
+}
+
+func TestResolveMailRecipientIdentityCrossCityLocalStripHuman(t *testing.T) {
+	got, err := resolveMailRecipientIdentity("", crossCityTestConfig(), nil, "qlandia/human")
+	if err != nil {
+		t.Fatalf("resolveMailRecipientIdentity: %v", err)
+	}
+	if got != "human" {
+		t.Errorf("got %q, want %q", got, "human")
+	}
+}
+
+// <local city>/<addr> and <addr> are one mailbox: both spellings resolve to
+// the same canonical identity.
+func TestResolveMailRecipientIdentityCrossCityLocalQualifiedAliasIsOneMailbox(t *testing.T) {
+	store := beads.NewMemStore()
+	if _, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "mayor",
+			"session_name": "mayor-session",
+		},
+	}); err != nil {
+		t.Fatalf("Create session bead: %v", err)
+	}
+	cfg := crossCityTestConfig()
+	bare, err := resolveMailRecipientIdentity("", cfg, store, "mayor")
+	if err != nil {
+		t.Fatalf("resolve bare: %v", err)
+	}
+	qualified, err := resolveMailRecipientIdentity("", cfg, store, "qlandia/mayor")
+	if err != nil {
+		t.Fatalf("resolve qualified: %v", err)
+	}
+	if bare != qualified {
+		t.Errorf("qualified %q and bare %q must resolve to one mailbox", qualified, bare)
+	}
+}
+
+// An address whose first segment names no rig and no roster city refuses as a
+// typed unknown-city error — never as a session lookup failure; the two
+// failures must never be spelled the same.
+func TestResolveMailRecipientIdentityUnknownCityTypedError(t *testing.T) {
+	_, err := resolveMailRecipientIdentity("", crossCityTestConfig(), nil, "gastwn/mayor")
+	if err == nil {
+		t.Fatal("expected unknown-city error")
+	}
+	var unknownCity *mail.UnknownCityError
+	if !errors.As(err, &unknownCity) {
+		t.Fatalf("err = %v (%T), want *mail.UnknownCityError", err, err)
+	}
+	if unknownCity.City != "gastwn" {
+		t.Errorf("City = %q, want %q", unknownCity.City, "gastwn")
+	}
+	if errors.Is(err, session.ErrSessionNotFound) {
+		t.Errorf("unknown-city refusal must not be a session-not-found error")
+	}
+}
+
+// A rig-qualified name keeps today's failure shape even when the roster is
+// active: the rig segment is a local scope, not a candidate city.
+func TestResolveMailRecipientIdentityRigSegmentKeepsTodayError(t *testing.T) {
+	_, err := resolveMailRecipientIdentity("", crossCityTestConfig(), nil, "qcore/nobody")
+	if err == nil {
+		t.Fatal("expected resolution failure")
+	}
+	var unknownCity *mail.UnknownCityError
+	if errors.As(err, &unknownCity) {
+		t.Errorf("rig-qualified failure must not be an unknown-city error: %v", err)
+	}
+}
+
+// Without [mail.crosscity], a city-shaped recipient keeps today's behavior.
+func TestResolveMailRecipientIdentityNoRosterUnchanged(t *testing.T) {
+	cfg := &config.City{Workspace: config.Workspace{Name: "qlandia"}}
+	_, err := resolveMailRecipientIdentity("", cfg, nil, "gastown/mayor")
+	if err == nil {
+		t.Fatal("expected resolution failure without a roster")
+	}
+	var unknownCity *mail.UnknownCityError
+	if errors.As(err, &unknownCity) {
+		t.Errorf("no roster: failure must not be an unknown-city error: %v", err)
+	}
+}
+
+// Read-side: resolving a local mail target expands its recipients with the
+// city-qualified alias, so delivery addressed either way is one read.
+func TestResolveMailTargetsCrossCityExpandsQualifiedAliases(t *testing.T) {
+	target, err := resolveMailTargetsWithConfig("", crossCityTestConfig(), nil, "human")
+	if err != nil {
+		t.Fatalf("resolveMailTargetsWithConfig: %v", err)
+	}
+	if target.display != "human" {
+		t.Errorf("display = %q, want %q", target.display, "human")
+	}
+	want := map[string]bool{"human": false, "qlandia/human": false}
+	for _, r := range target.recipients {
+		if _, ok := want[r]; ok {
+			want[r] = true
+		}
+	}
+	for addr, found := range want {
+		if !found {
+			t.Errorf("recipients %v must include %q", target.recipients, addr)
+		}
+	}
+}
+
+// Read-side: a foreign-city mailbox reads open-world, with no session lookup.
+func TestResolveMailTargetsCrossCityForeignReadsOpenWorld(t *testing.T) {
+	target, err := resolveMailTargetsWithConfig("", crossCityTestConfig(), nil, "gastown/mayor")
+	if err != nil {
+		t.Fatalf("resolveMailTargetsWithConfig: %v", err)
+	}
+	if target.display != "gastown/mayor" {
+		t.Errorf("display = %q, want %q", target.display, "gastown/mayor")
+	}
+	if len(target.recipients) != 1 || target.recipients[0] != "gastown/mayor" {
+		t.Errorf("recipients = %v, want [gastown/mayor]", target.recipients)
+	}
+}
+
+func writeCrossCityTestCity(t *testing.T) string {
+	t.Helper()
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_MAIL", "")
+	t.Setenv("GC_ALIAS", "")
+	t.Setenv("GC_SESSION_ID", "")
+	t.Setenv("GC_AGENT", "")
+	cityPath := t.TempDir()
+	cityTOML := `
+[workspace]
+name = "qlandia"
+
+[mail.crosscity]
+city = "qlandia"
+cities = ["gastown", "westeros"]
+
+[[agent]]
+name = "x"
+dir = "tools"
+
+[[agent]]
+name = "y"
+dir = "projects/backend"
+`
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte(cityTOML), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	t.Setenv("GC_CITY", cityPath)
+	return cityPath
+}
+
+func findMessageBead(t *testing.T, cityPath string) (beads.Bead, bool) {
+	t.Helper()
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	all, err := store.List(beads.ListQuery{Type: "message", Status: "open", TierMode: beads.TierBoth})
+	if err != nil {
+		t.Fatalf("List messages: %v", err)
+	}
+	for _, b := range all {
+		if b.Type == "message" {
+			return b, true
+		}
+	}
+	return beads.Bead{}, false
+}
+
+// A fresh send to a peer city succeeds with no session for the recipient, and
+// the stored sender is city-qualified so a plain reply crosses back.
+func TestCmdMailSendCrossCityForeignRecipient(t *testing.T) {
+	cityPath := writeCrossCityTestCity(t)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend(nil, false, false, "human", "gastown/mayor", "cutover status", "leg is green", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdMailSend = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	msg, found := findMessageBead(t, cityPath)
+	if !found {
+		t.Fatal("message bead not found")
+	}
+	if msg.Assignee != "gastown/mayor" {
+		t.Errorf("Assignee = %q, want %q", msg.Assignee, "gastown/mayor")
+	}
+	if msg.From != "qlandia/human" {
+		t.Errorf("From = %q, want city-qualified %q", msg.From, "qlandia/human")
+	}
+	// Phase 1 moves no store: the send was written HERE, and the sender is
+	// told so once, on stderr, with the way to reach the peer.
+	if !strings.Contains(stderr.String(), "stored locally for gastown/mayor") || !strings.Contains(stderr.String(), "--context") {
+		t.Errorf("stderr = %q, want the local-write warning naming gastown/mayor and --context", stderr.String())
+	}
+}
+
+// A local send carries no local-write warning: the message has a reader here.
+func TestCmdMailSendCrossCityLocalSendHasNoLocalWriteWarning(t *testing.T) {
+	writeCrossCityTestCity(t)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend(nil, false, false, "human", "qlandia/human", "s", "b", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdMailSend = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "stored locally") {
+		t.Errorf("stderr = %q: a local send must not carry the local-write warning", stderr.String())
+	}
+}
+
+// The notify-on-by-default rule for direct local sends never applies to a
+// peer-city recipient: a plain send to a foreign address must not be refused
+// for a --notify the user never passed. Pinned through the cobra layer, where
+// the default is decided, so a test that bypasses RunE cannot hide it.
+func TestMailSendRunEDefaultNotifySkipsForeign(t *testing.T) {
+	cityPath := writeCrossCityTestCity(t)
+
+	var stdout, stderr bytes.Buffer
+	cmd := newMailSendCmd(&stdout, &stderr)
+	cmd.SetArgs([]string{"gastown/mayor", "-s", "cutover", "-m", "leg is green"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("plain foreign send failed: %v; stderr=%s", err, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "--notify does not cross cities") {
+		t.Fatalf("stderr = %q: the defaulted --notify was applied to a foreign recipient", stderr.String())
+	}
+	if _, found := findMessageBead(t, cityPath); !found {
+		t.Fatal("message bead not found after a plain foreign send")
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	cmd = newMailSendCmd(&stdout, &stderr)
+	cmd.SetArgs([]string{"gastown/mayor", "-s", "cutover", "-m", "leg is green", "--notify"})
+	if err := cmd.Execute(); err == nil {
+		t.Fatal("explicit --notify to a foreign recipient must be refused")
+	}
+	if !strings.Contains(stderr.String(), "--notify does not cross cities") {
+		t.Errorf("stderr = %q, want the cross-city notify refusal", stderr.String())
+	}
+}
+
+// The pure default decision: foreign never defaults on, local keeps the default.
+func TestDefaultMailSendNotify(t *testing.T) {
+	if defaultMailSendNotify(true) {
+		t.Error("foreign recipient must not receive the notify default")
+	}
+	if !defaultMailSendNotify(false) {
+		t.Error("local recipient must keep the notify default")
+	}
+}
+
+// A local agent whose dir is not a rig (tools/x) is a local scope: neither
+// the storeless send nor a reply to it is refused as an unknown city.
+func TestCmdMailStorelessSendAndReplyKeepAgentDirScope(t *testing.T) {
+	_, recordPath := storelessCrossCity(t)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend(nil, false, false, "human", "tools/x", "s", "b", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("storeless send to tools/x = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "unknown city") {
+		t.Errorf("stderr = %q: an agent-dir address was refused as an unknown city", stderr.String())
+	}
+	rec, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatalf("exec provider recorded nothing: %v", err)
+	}
+	if !strings.Contains(string(rec), `"tools/x"`) {
+		t.Errorf("exec send payload = %s, want the local agent address tools/x", rec)
+	}
+}
+
+// A nested agent dir ("projects/backend") is addressed by its LEADING
+// segment ("projects/backend/worker" starts with "projects"): the local-scope
+// exemption must compare that segment, not the whole dir, or a storeless send
+// and a reply-origin probe refuse a local address as an unknown city.
+func TestCmdMailStorelessSendKeepsNestedAgentDirScope(t *testing.T) {
+	_, recordPath := storelessCrossCity(t)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend(nil, false, false, "human", "projects/backend/worker", "s", "b", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("storeless send to projects/backend/worker = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "unknown city") {
+		t.Errorf("stderr = %q: a nested agent-dir address was refused as an unknown city", stderr.String())
+	}
+	rec, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatalf("exec provider recorded nothing: %v", err)
+	}
+	if !strings.Contains(string(rec), `"projects/backend/worker"`) {
+		t.Errorf("exec send payload = %s, want the local agent address projects/backend/worker", rec)
+	}
+}
+
+func TestCmdMailReplyKeepsNestedAgentDirScope(t *testing.T) {
+	cityPath := writeCrossCityTestCity(t)
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	seeded, err := beadmail.New(store).Send("projects/backend/worker", "human", "hello", "from a nested agent dir")
+	if err != nil {
+		t.Fatalf("seed Send: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := cmdMailReply([]string{seeded.ID, "received"}, "", "", false, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdMailReply = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stderr.String(), "unknown city") {
+		t.Errorf("stderr = %q: a reply to a nested agent-dir origin was refused as an unknown city", stderr.String())
+	}
+}
+
+func TestCmdMailReplyKeepsAgentDirScope(t *testing.T) {
+	cityPath := writeCrossCityTestCity(t)
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	seeded, err := beadmail.New(store).Send("tools/x", "human", "hello", "from a local agent dir")
+	if err != nil {
+		t.Fatalf("seed Send: %v", err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := cmdMailReply([]string{seeded.ID, "received"}, "", "", false, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdMailReply = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stderr.String(), "unknown city") {
+		t.Errorf("stderr = %q: a reply to an agent-dir origin was refused as an unknown city", stderr.String())
+	}
+}
+
+// --notify on a foreign recipient is a typed refusal at the sender, before
+// any write: the recipient's wake belongs to its own city's sweep.
+func TestCmdMailSendCrossCityNotifyRefused(t *testing.T) {
+	cityPath := writeCrossCityTestCity(t)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend(nil, true, false, "human", "gastown/mayor", "s", "b", &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("cmdMailSend = %d, want 1; stdout=%s", code, stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "--notify") || !strings.Contains(stderr.String(), "gastown") {
+		t.Errorf("stderr = %q, want typed cross-city --notify refusal naming the city", stderr.String())
+	}
+	if _, found := findMessageBead(t, cityPath); found {
+		t.Error("refusal must happen before the message is written")
+	}
+}
+
+// --from carrying a foreign city segment is accepted verbatim: the sender's
+// identity can only be checked by its own city.
+func TestCmdMailSendCrossCityForeignFromAccepted(t *testing.T) {
+	cityPath := writeCrossCityTestCity(t)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend(nil, false, false, "westeros/mayor", "human", "relayed", "body", &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdMailSend = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	msg, found := findMessageBead(t, cityPath)
+	if !found {
+		t.Fatal("message bead not found")
+	}
+	if msg.From != "westeros/mayor" {
+		t.Errorf("From = %q, want verbatim %q", msg.From, "westeros/mayor")
+	}
+}
+
+// Delivery is a read on the operator's surface too: mail addressed to
+// <local city>/human is served by the plain `gc mail inbox` human default.
+// This drives the full command, not the resolver helper — the human
+// fast-path in resolveMailTargetsForCommand must route through the roster.
+func TestCmdMailInboxCrossCityServesCityQualifiedHumanDelivery(t *testing.T) {
+	cityPath := writeCrossCityTestCity(t)
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	if _, err := beadmail.New(store).Send("gastown/mayor", "qlandia/human", "for the operator", "cutover done"); err != nil {
+		t.Fatalf("seed Send: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailInbox(nil, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdMailInbox = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "for the operator") {
+		t.Errorf("inbox output %q must serve mail addressed to the city-qualified human form", stdout.String())
+	}
+
+	stdout.Reset()
+	code = cmdMailCountWithJSON([]string{"human"}, false, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdMailCount = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "1") {
+		t.Errorf("count output %q must include the city-qualified delivery", stdout.String())
+	}
+}
+
+func seedForeignOriginMessage(t *testing.T, cityPath string) string {
+	t.Helper()
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	seeded, err := beadmail.New(store).Send("gastown/mayor", "human", "cutover", "leg is green")
+	if err != nil {
+		t.Fatalf("seed Send: %v", err)
+	}
+	return seeded.ID
+}
+
+// A reply that crosses cities stores this city's sender city-qualified, so
+// the far side's plain reply resolves back here.
+func TestCmdMailReplyCrossCityQualifiesSender(t *testing.T) {
+	cityPath := writeCrossCityTestCity(t)
+	id := seedForeignOriginMessage(t, cityPath)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailReply([]string{id, "received, thank you"}, "", "", false, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("cmdMailReply = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	all, err := store.List(beads.ListQuery{Type: "message", Status: "open", TierMode: beads.TierBoth})
+	if err != nil {
+		t.Fatalf("List messages: %v", err)
+	}
+	var reply beads.Bead
+	found := false
+	for _, b := range all {
+		if b.Type == "message" && b.ID != id {
+			reply = b
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("reply bead not found")
+	}
+	if reply.Assignee != "gastown/mayor" {
+		t.Errorf("reply Assignee = %q, want %q", reply.Assignee, "gastown/mayor")
+	}
+	if reply.From != "qlandia/human" {
+		t.Errorf("reply From = %q, want city-qualified %q", reply.From, "qlandia/human")
+	}
+}
+
+// --notify on a reply whose thread crosses cities is a typed refusal at the
+// sender, before any write.
+func TestCmdMailReplyCrossCityNotifyRefused(t *testing.T) {
+	cityPath := writeCrossCityTestCity(t)
+	id := seedForeignOriginMessage(t, cityPath)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailReply([]string{id, "body"}, "", "", true, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("cmdMailReply = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "--notify") || !strings.Contains(stderr.String(), "gastown") {
+		t.Errorf("stderr = %q, want typed cross-city --notify refusal naming the city", stderr.String())
+	}
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	all, err := store.List(beads.ListQuery{Type: "message", TierMode: beads.TierBoth})
+	if err != nil {
+		t.Fatalf("List messages: %v", err)
+	}
+	count := 0
+	for _, b := range all {
+		if b.Type == "message" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("message count = %d, want 1 (refusal must happen before the reply is written)", count)
+	}
+}
+
+// --from naming an unknown agent within the local city stays refused, with or
+// without the city qualifier: the local city is the one place identity can
+// and must be checked.
+func TestCmdMailSendCrossCityLocalFromStillChecked(t *testing.T) {
+	writeCrossCityTestCity(t)
+
+	for _, from := range []string{"qlandia/nobody", "nobody"} {
+		var stdout, stderr bytes.Buffer
+		code := cmdMailSend(nil, false, false, from, "human", "s", "b", &stdout, &stderr)
+		if code != 1 {
+			t.Errorf("cmdMailSend --from %q = %d, want 1", from, code)
+		}
+		if !strings.Contains(stderr.String(), `invalid sender "nobody"`) {
+			t.Errorf("--from %q stderr = %q, want the refused sender named", from, stderr.String())
+		}
+	}
+}
+
+// The invalid-sender refusal names the sender the caller gave. (Previously
+// the message printed the zeroed resolution result: `invalid sender ""`.)
+func TestCmdMailSendInvalidFromNamesTheGivenSender(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_MAIL", "")
+	t.Setenv("GC_ALIAS", "")
+	t.Setenv("GC_SESSION_ID", "")
+	t.Setenv("GC_AGENT", "")
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"plain-city\"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	t.Setenv("GC_CITY", cityPath)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend(nil, false, false, "nobody", "human", "s", "b", &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("cmdMailSend = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), `invalid sender "nobody"`) {
+		t.Errorf("stderr = %q, want the refused sender named", stderr.String())
+	}
+}
+
+// With the roster enabled, a reply whose thread origin cannot be read fails
+// closed: the cross-city rules (notify refusal, sender qualification) cannot
+// be applied to an unverifiable thread.
+func TestCmdMailReplyCrossCityFailsClosedWhenOriginUnreadable(t *testing.T) {
+	writeCrossCityTestCity(t)
+	t.Setenv("GC_MAIL", "fail")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailReply([]string{"gc-999", "body"}, "", "", false, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("cmdMailReply = %d, want 1; stdout=%s", code, stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "thread origin") {
+		t.Errorf("stderr = %q, want the fail-closed origin-verification refusal", stderr.String())
+	}
+}
+
+// The JSON surface refuses cross-city --notify with a typed error code.
+func TestCmdMailSendCrossCityNotifyRefusedJSON(t *testing.T) {
+	writeCrossCityTestCity(t)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSendJSON(nil, true, false, "human", "gastown/mayor", "s", "b", "", true, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("cmdMailSendJSON = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "cross_city_notify") {
+		t.Errorf("json output %q must carry the cross_city_notify error code", stdout.String())
+	}
+}
+
+// A reply into a thread whose origin names a city outside the roster is
+// refused with the typed unknown-city message and writes nothing.
+func TestCmdMailReplyCrossCityUnknownOriginRefused(t *testing.T) {
+	cityPath := writeCrossCityTestCity(t)
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	seeded, err := beadmail.New(store).Send("gastwn/mayor", "human", "cutover", "typo city")
+	if err != nil {
+		t.Fatalf("seed Send: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailReply([]string{seeded.ID, "received"}, "", "", false, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("cmdMailReply = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "unknown city") || !strings.Contains(stderr.String(), "gastwn") {
+		t.Errorf("stderr = %q, want typed unknown-city refusal naming gastwn", stderr.String())
+	}
+	all, err := store.List(beads.ListQuery{Type: "message", Status: "open", TierMode: beads.TierBoth})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	for _, b := range all {
+		if b.Type == "message" && b.ID != seeded.ID {
+			t.Errorf("reply bead %s written despite the refusal (to %q)", b.ID, b.Assignee)
+		}
+	}
+}
+
+// writeExecSendScript is an exec: mail provider that records the send it was
+// given (from/to as JSON on stdin) to a file the test reads back.
+func writeExecSendScript(t *testing.T) (script, recordPath string) {
+	t.Helper()
+	dir := t.TempDir()
+	script = filepath.Join(dir, "mail-exec")
+	recordPath = filepath.Join(dir, "sent.json")
+	data := `#!/bin/sh
+case "$1" in
+  ensure-running) exit 0 ;;
+  send)
+    { /usr/bin/printf '{"to":"%s"}\n' "$2"; /bin/cat; } > "` + recordPath + `"
+    /usr/bin/printf '{"id":"exec-send-1","from":"human","to":"x","subject":"s","body":"b","created_at":"2026-04-28T00:00:00Z","read":false}\n'
+    exit 0 ;;
+  *) exit 2 ;;
+esac
+`
+	if err := os.WriteFile(script, []byte(data), 0o755); err != nil {
+		t.Fatalf("WriteFile(exec script): %v", err)
+	}
+	return script, recordPath
+}
+
+// storelessCrossCity: a city with a roster but whose store cannot be opened,
+// on an exec: mail provider — the storeless send path.
+func storelessCrossCity(t *testing.T) (script, recordPath string) {
+	t.Helper()
+	writeCrossCityTestCity(t)
+	// The bd provider opens through the bd binary; with no binary on PATH
+	// the city store cannot open, which is the storeless shape (a city with
+	// config, an exec: mail provider, no store).
+	t.Setenv("GC_BEADS", "bd")
+	t.Setenv("PATH", t.TempDir())
+	script, recordPath = writeExecSendScript(t)
+	t.Setenv("GC_MAIL", "exec:"+script)
+	return script, recordPath
+}
+
+// A storeless send to an unknown city is refused, never handed to the
+// provider as a literal address.
+func TestCmdMailSendStorelessCrossCityUnknownCityRefused(t *testing.T) {
+	_, recordPath := storelessCrossCity(t)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend(nil, false, false, "human", "gastwn/mayor", "s", "b", &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("cmdMailSend = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "unknown city") || !strings.Contains(stderr.String(), "gastwn") {
+		t.Errorf("stderr = %q, want typed unknown-city refusal naming gastwn", stderr.String())
+	}
+	if _, err := os.Stat(recordPath); err == nil {
+		t.Errorf("the exec provider received a send despite the refusal")
+	}
+}
+
+// A storeless send to a peer city keeps the cross-city rules: --notify is
+// refused, and a plain send stores the sender city-qualified.
+func TestCmdMailSendStorelessCrossCityForeignRules(t *testing.T) {
+	_, recordPath := storelessCrossCity(t)
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdMailSend(nil, true, false, "human", "gastown/mayor", "s", "b", &stdout, &stderr); code != 1 {
+		t.Fatalf("--notify: cmdMailSend = %d, want 1; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "--notify does not cross cities") {
+		t.Errorf("--notify stderr = %q, want the cross-city notify refusal", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "no city store available") {
+		t.Fatalf("stderr = %q: this test must run on the STORELESS send path (no city store); the harness did not reach it", stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := cmdMailSend(nil, false, false, "human", "gastown/mayor", "s", "b", &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdMailSend = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	rec, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatalf("exec provider recorded nothing: %v", err)
+	}
+	if !strings.Contains(string(rec), `"qlandia/human"`) {
+		t.Errorf("exec send payload = %s, want the sender city-qualified as qlandia/human", rec)
+	}
+	if !strings.Contains(string(rec), `"gastown/mayor"`) {
+		t.Errorf("exec send payload = %s, want the canonical foreign recipient", rec)
+	}
+}
+
+// Exec-provider reads with a live city store: a mailbox the store resolves
+// also serves its city-qualified deliveries (<local>/<addr>), and a
+// local-qualified identifier is that same mailbox. Red before the fix: the
+// resolved path returned the bare recipients only.
+func TestResolveRawMailTargetStorelessProviderExpandsResolvedLocalRoster(t *testing.T) {
+	cityPath := writeCrossCityTestCity(t)
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Type: "session", Title: "mayor session", Status: "open",
+		Metadata: map[string]string{"session_name": "qlandia-mayor", "alias": "mayor"},
+	}); err != nil {
+		t.Fatalf("Create(session bead): %v", err)
+	}
+	script, _ := writeExecSendScript(t)
+	t.Setenv("GC_MAIL", "exec:"+script)
+
+	for _, identifier := range []string{"mayor", "qlandia/mayor"} {
+		var stderr bytes.Buffer
+		target, ok := resolveRawMailTargetForStorelessProvider(identifier, &stderr, "gc mail inbox")
+		if !ok {
+			t.Fatalf("%s: resolve failed: %s", identifier, stderr.String())
+		}
+		want := map[string]bool{"mayor": false, "qlandia/mayor": false}
+		for _, r := range target.recipients {
+			if _, present := want[r]; present {
+				want[r] = true
+			}
+		}
+		for addr, found := range want {
+			if !found {
+				t.Errorf("%s: recipients %v must include %q", identifier, target.recipients, addr)
+			}
+		}
+	}
+}
+
+// A storeless send to this city's own qualified form strips to the local
+// mailbox: <local>/mayor and mayor are one mailbox on the exec provider too.
+func TestCmdMailSendStorelessCrossCityLocalQualifiedStrips(t *testing.T) {
+	_, recordPath := storelessCrossCity(t)
+
+	// --notify on a storeless LOCAL send warns (no store, no wake) and still
+	// writes: the warning is the proof this ran on the storeless path.
+	var stdout, stderr bytes.Buffer
+	if code := cmdMailSend(nil, true, false, "human", "qlandia/mayor", "s", "b", &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdMailSend = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "no city store available") {
+		t.Fatalf("stderr = %q: this test must run on the STORELESS send path", stderr.String())
+	}
+	rec, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatalf("exec provider recorded nothing: %v", err)
+	}
+	if !strings.HasPrefix(string(rec), `{"to":"mayor"}`) {
+		t.Errorf("exec send recipient = %s, want the local form mayor", rec)
+	}
+}
+
+// storelessMailTarget: the raw read target when no store can resolve the
+// identifier. Local-qualified expands to the mailbox and its alias, a peer
+// city stays an open-world literal, an unknown city stays literal too.
+func TestStorelessMailTargetRosterShapes(t *testing.T) {
+	writeCrossCityTestCity(t)
+
+	local := storelessMailTarget("qlandia/mayor")
+	if local.display != "mayor" {
+		t.Errorf("local display = %q, want mayor", local.display)
+	}
+	if !crossCityContainsAll(local.recipients, "mayor", "qlandia/mayor") {
+		t.Errorf("local recipients = %v, want mayor and qlandia/mayor", local.recipients)
+	}
+	foreign := storelessMailTarget("gastown/mayor")
+	if foreign.display != "gastown/mayor" || len(foreign.recipients) != 1 || foreign.recipients[0] != "gastown/mayor" {
+		t.Errorf("foreign target = %+v, want the literal gastown/mayor only", foreign)
+	}
+	unknown := storelessMailTarget("gastwn/mayor")
+	if unknown.display != "gastwn/mayor" || !crossCityContainsAll(unknown.recipients, "gastwn/mayor") {
+		t.Errorf("unknown-city target = %+v, want the literal kept", unknown)
+	}
+}
+
+func crossCityContainsAll(have []string, want ...string) bool {
+	seen := make(map[string]bool, len(have))
+	for _, h := range have {
+		seen[h] = true
+	}
+	for _, w := range want {
+		if !seen[w] {
+			return false
+		}
+	}
+	return true
+}
+
+// The cloud-wake guard rail never runs for a foreign recipient: the
+// classification happens first, so a cross-city send cannot be turned into
+// a cloud-wake refusal by a colliding local alias.
+func TestCloudWakeGuardAppliesSkipsForeign(t *testing.T) {
+	cases := []struct {
+		name      string
+		foreign   bool
+		hasNudge  bool
+		canonical string
+		ref       string
+		wantApply bool
+	}{
+		{"foreign never", true, true, "gastown/mayor", "", false},
+		{"local notified no ref", false, true, "mayor", "", true},
+		{"local notified with ref", false, true, "mayor", "https://github.com/x/y", false},
+		{"local not notified", false, false, "mayor", "", false},
+		{"human", false, true, "human", "", false},
+	}
+	for _, tc := range cases {
+		if got := cloudWakeGuardApplies(tc.foreign, tc.hasNudge, tc.canonical, tc.ref); got != tc.wantApply {
+			t.Errorf("%s: cloudWakeGuardApplies = %v, want %v", tc.name, got, tc.wantApply)
+		}
+	}
+}
