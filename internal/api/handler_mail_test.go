@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -1489,5 +1490,82 @@ func TestMailSendUnresolvedForeignTownRecipientNamesTheHubLeg(t *testing.T) {
 		if strings.Contains(got, "cross-town routing address") {
 			t.Errorf("send to %q got the cross-town hint, want none; detail: %s", to, got)
 		}
+	}
+}
+
+func TestMailSendThroughRuntimeNameSquatStoresForTheConfiguredMailbox(t *testing.T) {
+	// ga-isa3j4 on the API leg: a live bead squats the RUNTIME name of the
+	// configured myrig/worker named session without being it. Resolution used
+	// to surface the conflict and the send stored nothing. The squatter does
+	// not answer to myrig/worker, so the mail is stored for the configured
+	// mailbox.
+	state := newSessionFakeState(t)
+	srv := New(state)
+	spec, ok, err := srv.findNamedSessionSpecForTarget(state.cityBeadStore, "myrig/worker")
+	if err != nil || !ok {
+		t.Fatalf("fixture: findNamedSessionSpecForTarget(myrig/worker) = %v, %v", ok, err)
+	}
+	if spec.SessionName == spec.Identity {
+		t.Fatalf("fixture: session_name %q must differ from identity %q", spec.SessionName, spec.Identity)
+	}
+	createTestSessionBead(t, state.cityBeadStore, map[string]string{
+		"session_name": spec.SessionName,
+		"template":     "other",
+		"agent_name":   "other",
+		"state":        "asleep",
+	}, "")
+	if _, err := srv.resolveSessionIDWithConfig(state.cityBeadStore, "myrig/worker"); !errors.Is(err, errConfiguredNamedSessionConflict) {
+		t.Fatalf("fixture: resolution err = %v, want the squat conflict", err)
+	}
+
+	h := newTestCityHandler(t, state)
+	body := `{"from":"mayor","to":"myrig/worker","subject":"through the squat","body":"x"}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, newPostRequest(cityURL(state, "/mail"), bytes.NewBufferString(body)))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body = %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var msg mail.Message
+	if err := json.NewDecoder(rec.Body).Decode(&msg); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if msg.To != spec.Identity {
+		t.Fatalf("To = %q, want configured identity %q", msg.To, spec.Identity)
+	}
+	inbox, err := state.cityMailProv.Inbox(spec.Identity)
+	if err != nil {
+		t.Fatalf("Inbox(%s): %v", spec.Identity, err)
+	}
+	if len(inbox) != 1 || inbox[0].ID != msg.ID {
+		t.Fatalf("inbox for %s = %d messages, want exactly the sent %s", spec.Identity, len(inbox), msg.ID)
+	}
+}
+
+func TestMailSendThroughAliasSquatStillRefuses(t *testing.T) {
+	// A squatter holding the configured identity as its ALIAS lists that
+	// address in its own inbox. Falling through would store the configured
+	// seat's mail where the squatter reads it, so the refusal stays.
+	state := newSessionFakeState(t)
+	createTestSessionBead(t, state.cityBeadStore, map[string]string{
+		"session_name": "rogue-runtime",
+		"alias":        "myrig/worker",
+		"state":        "active",
+	}, "")
+	h := newTestCityHandler(t, state)
+	body := `{"from":"mayor","to":"myrig/worker","subject":"must refuse","body":"x"}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, newPostRequest(cityURL(state, "/mail"), bytes.NewBufferString(body)))
+	if rec.Code < 400 || rec.Code >= 500 {
+		t.Fatalf("status = %d, want 4xx refusal; body = %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "conflicts with configured named session") {
+		t.Fatalf("refusal should name the conflict; body = %s", rec.Body.String())
+	}
+	inbox, err := state.cityMailProv.Inbox("myrig/worker")
+	if err != nil {
+		t.Fatalf("Inbox: %v", err)
+	}
+	if len(inbox) != 0 {
+		t.Fatalf("alias squat stored %d messages, want 0", len(inbox))
 	}
 }
