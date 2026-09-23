@@ -32,10 +32,11 @@ import (
 // 2026-09-23): `gc hook current` only sees `gc hook --claim` records, so
 // hand-dole, adoption and hand-claim — most of a named seat's board — are
 // invisible to it. The identity set here is
-// session.CurrentAssigneeIdentities: the orphan-release reader's set MINUS
-// alias_history, because a reader avoiding a wrong strip must cast wide while
-// a writer vouching for liveness must not vouch through a name a later
-// session may have reused (the asymmetry is documented on that function).
+// session.CurrentAssigneeIdentities PLUS the prior aliases no other live
+// session answers to (hookHeartbeatUnreusedPriorAliases): the orphan-release
+// reader casts over the whole alias history so it never strips live work,
+// while a writer vouching for liveness must not vouch through a name a later
+// live session has taken (SESSION-RUNTIME-010).
 // Each row is heartbeated with the row's OWN assignee spelling as actor,
 // because bd's owner check is exact string equality and a cross-spelling
 // heartbeat is refused (measured; the refusal would otherwise be swallowed by
@@ -100,15 +101,21 @@ type hookHeartbeatBeadStore interface {
 
 var _ hookHeartbeatBeadStore = (*beads.BdStore)(nil)
 
-// hookHeartbeatIdentities resolves the identifiers the calling session
-// answers to RIGHT NOW (session bead id, session_name,
-// configured_named_identity, current alias) — deliberately WITHOUT
-// alias_history, which orphan-release must include but a heartbeat must not:
-// a prior alias can be reused by a later live session, and a heartbeat
-// matched through history would keep the successor's claims looking alive
-// after the successor dies. Overridable in tests.
-var hookHeartbeatIdentities = func(sessionID, instanceToken string) ([]string, error) {
-	front, err := hookCurrentSessionFrontDoor()
+// hookHeartbeatIdentities resolves the identifiers the calling session may
+// vouch for RIGHT NOW: the current set (session bead id, session_name,
+// configured_named_identity, current alias) plus every PRIOR alias from
+// alias_history that no OTHER live session currently answers to (codex
+// round-8 P1-b). A rebranded pool session keeps ownership of work assigned
+// under its previous alias — orphan release deliberately skips that work
+// (TestReleaseOrphanedPoolAssignments_SkipsLiveSessionAssignedByAliasHistory)
+// — so a writer set that stops at the current alias lets exactly that work's
+// lease expire while its owner is still taking turns. A prior alias that a
+// later live session has taken is still excluded: vouching through it would
+// keep the successor's claims looking alive after the successor dies.
+// Overridable in tests. diag receives one line per excluded prior alias, so
+// an alias the run declined to vouch through is never silent.
+var hookHeartbeatIdentities = func(ctx context.Context, sessionID, instanceToken string, diag io.Writer) ([]string, error) {
+	front, err := hookHeartbeatSessionFrontDoor(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -116,11 +123,74 @@ var hookHeartbeatIdentities = func(sessionID, instanceToken string) ([]string, e
 	if err != nil {
 		return nil, err
 	}
-	return hookHeartbeatEligibleIdentities(info, instanceToken)
+	current, err := hookHeartbeatEligibleIdentities(info, instanceToken)
+	if err != nil {
+		return nil, err
+	}
+	return append(current, hookHeartbeatUnreusedPriorAliases(info, current, front.ResolveID, diag)...), nil
 }
 
-// hookHeartbeatEligibleIdentities fences the write-authorizing identity set
-// to the CURRENT incarnation of the session (codex round-6 P1). A provider
+// hookHeartbeatSessionFrontDoor opens the session-class front door the
+// heartbeat resolves its identities through, bound to the run's context
+// (codex round-8 P2): sessionCurrentClaimFrontDoor's store runner is fixed to
+// context.Background(), so a heartbeat whose session read stalled during a
+// store outage would outlive hookHeartbeatTimeout and overlapping detached
+// children would accumulate for the length of the outage. Overridable in
+// tests.
+var hookHeartbeatSessionFrontDoor = func(ctx context.Context) (*session.Store, error) {
+	return sessionCurrentClaimFrontDoorContext(ctx)
+}
+
+// hookHeartbeatUnreusedPriorAliases returns the entries of info's alias
+// history that the session may still vouch for: those already in current
+// are dropped (already vouched), and each remaining alias is resolved
+// against LIVE sessions through resolveLive (session.Store.ResolveID: exact
+// bead id, then live session_name, then live current alias — never alias
+// history, so a history-only match cannot answer here). An alias nobody
+// live answers to, or that resolves back to this session, is kept. One a
+// DIFFERENT live session answers to has been reused and is excluded; an
+// ambiguous alias or a failed lookup is excluded too, because the writer
+// side fails toward NOT vouching. Every exclusion is written to diag.
+//
+// The residual asymmetry with the orphan-release reader is deliberate and
+// bounded: the reader attributes history-assigned work to this session
+// whether or not a successor once held the alias; this writer refreshes it
+// only while no live successor holds the alias. Work a since-closed
+// successor left under the alias therefore reads as this session's and is
+// refreshed as this session's — the same attribution the reader already
+// makes, not a new one.
+func hookHeartbeatUnreusedPriorAliases(info session.Info, current []string, resolveLive func(string) (string, error), diag io.Writer) []string {
+	if diag == nil {
+		diag = io.Discard
+	}
+	have := make(map[string]bool, len(current)+len(info.AliasHistory))
+	for _, id := range current {
+		have[id] = true
+	}
+	var kept []string
+	for _, prior := range info.AliasHistory {
+		prior = strings.TrimSpace(prior)
+		if prior == "" || have[prior] {
+			continue
+		}
+		have[prior] = true
+		owner, err := resolveLive(prior)
+		switch {
+		case err == nil && strings.TrimSpace(owner) == strings.TrimSpace(info.ID):
+			kept = append(kept, prior)
+		case err == nil:
+			fmt.Fprintf(diag, "gc hook heartbeat: prior alias %q is now answered to by live session %s; not vouching through it\n", prior, owner) //nolint:errcheck
+		case errors.Is(err, session.ErrSessionNotFound):
+			kept = append(kept, prior)
+		default:
+			fmt.Fprintf(diag, "gc hook heartbeat: prior alias %q: %v; not vouching through it\n", prior, err) //nolint:errcheck
+		}
+	}
+	return kept
+}
+
+// hookHeartbeatEligibleIdentities fences the CURRENT write-authorizing identity
+// set (prior aliases are decided separately, above) to the CURRENT incarnation of the session (codex round-6 P1). A provider
 // process that survived a restart or adoption keeps GC_SESSION_ID but carries
 // a stale GC_INSTANCE_TOKEN; resolving identities by ID alone would let it
 // enumerate the replacement incarnation's identities and heartbeat that
@@ -177,11 +247,12 @@ func newHookHeartbeatCmd(stdout, stderr io.Writer) *cobra.Command {
 		Use:   "heartbeat",
 		Short: "Refresh the claim leases on this session's in-progress work",
 		Long: `Refreshes the claim lease on every in_progress bead assigned to the calling
-session under an identity it answers to right now (session bead id, session
-name, configured named identity, current alias — never alias history, which a
-later session may have reused). Each row is heartbeated under its own assignee
-spelling, because bd's owner check is exact and a cross-spelling heartbeat is
-refused.
+session under an identity it may vouch for right now: session bead id, session
+name, configured named identity, current alias, and any prior alias that no
+other live session currently answers to (a rebranded session keeps the work it
+was assigned under its old name; an alias a later session took is excluded).
+Each row is heartbeated under its own assignee spelling, because bd's owner
+check is exact and a cross-spelling heartbeat is refused.
 
 Intended to run detached from a per-turn hook event so leases track a session
 that is still taking turns and expire when it stops. bd self-heals a missing
@@ -238,7 +309,7 @@ func cmdHookHeartbeat(beadID string, strict bool, stdout, stderr io.Writer) int 
 	// The instance token is read here, in the command body, never in a
 	// top-level initializer: GC_INSTANCE_TOKEN is a leak-vector variable and
 	// the init-time guard (internal/testenv) forbids package-init reads.
-	identities, err := hookHeartbeatIdentities(sessionID, strings.TrimSpace(os.Getenv("GC_INSTANCE_TOKEN")))
+	identities, err := hookHeartbeatIdentities(ctx, sessionID, strings.TrimSpace(os.Getenv("GC_INSTANCE_TOKEN")), stderr)
 	if err != nil {
 		return miss("resolving session identities: %v", err)
 	}
