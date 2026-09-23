@@ -655,6 +655,11 @@ func (s *Server) humaHandleMailArchive(ctx context.Context, input *MailArchiveIn
 	return resp, nil
 }
 
+// errUnknownCityOrigin is the sentinel RefuseUnknownCity upgrades when a reply
+// thread's origin names a city outside the roster; returned unchanged, it
+// means the origin is a known scope and the reply may proceed.
+var errUnknownCityOrigin = errors.New("origin city unknown")
+
 // humaHandleMailReply is the Huma-typed handler for POST /v0/mail/{id}/reply.
 func (s *Server) humaHandleMailReply(ctx context.Context, input *MailReplyInput) (*IndexOutput[mail.Message], error) {
 	id := input.ID
@@ -682,10 +687,21 @@ func (s *Server) humaHandleMailReply(ctx context.Context, input *MailReplyInput)
 			// reply resolves back here.
 			from := input.Body.From
 			if roster := s.mailCityRoster(); roster.Enabled() {
-				if orig, getErr := mp.Get(id); getErr == nil {
-					if kind, _ := roster.ResolveCityAddress(orig.From); kind == mail.CityAddressForeign {
-						from = roster.QualifySender(from)
-					}
+				// Fail closed: without the thread origin the cross-city
+				// rules (unknown-city refusal, sender qualification) cannot
+				// be applied, and a reply must never cross with a bare sender.
+				orig, getErr := mp.Get(id)
+				if getErr != nil {
+					return mail.Message{}, apierr.Internal.Msg("cross_city_origin_unverified: cannot verify thread origin for cross-city rules: " + getErr.Error())
+				}
+				// A thread whose origin names a city this roster does not
+				// know is refused, never written to a literal mailbox nobody
+				// polls.
+				if refuse := mail.RefuseUnknownCity(errUnknownCityOrigin, orig.From, roster, s.state.Config().RigNames()); refuse != nil && !errors.Is(refuse, errUnknownCityOrigin) {
+					return mail.Message{}, apierr.InvalidRequest.Msg("reply origin " + refuse.Error())
+				}
+				if kind, _ := roster.ResolveCityAddress(orig.From); kind == mail.CityAddressForeign {
+					from = roster.QualifySender(from)
 				}
 			}
 			sent, replyErr := mp.Reply(id, from, input.Body.Subject, input.Body.Body)

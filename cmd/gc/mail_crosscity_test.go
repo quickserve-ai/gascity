@@ -448,3 +448,123 @@ func TestCmdMailSendCrossCityNotifyRefusedJSON(t *testing.T) {
 		t.Errorf("json output %q must carry the cross_city_notify error code", stdout.String())
 	}
 }
+
+// A reply into a thread whose origin names a city outside the roster is
+// refused with the typed unknown-city message and writes nothing.
+func TestCmdMailReplyCrossCityUnknownOriginRefused(t *testing.T) {
+	cityPath := writeCrossCityTestCity(t)
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	seeded, err := beadmail.New(store).Send("gastwn/mayor", "human", "cutover", "typo city")
+	if err != nil {
+		t.Fatalf("seed Send: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailReply([]string{seeded.ID, "received"}, "", "", false, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("cmdMailReply = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "unknown city") || !strings.Contains(stderr.String(), "gastwn") {
+		t.Errorf("stderr = %q, want typed unknown-city refusal naming gastwn", stderr.String())
+	}
+	all, err := store.List(beads.ListQuery{Type: "message", Status: "open", TierMode: beads.TierBoth})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	for _, b := range all {
+		if b.Type == "message" && b.ID != seeded.ID {
+			t.Errorf("reply bead %s written despite the refusal (to %q)", b.ID, b.Assignee)
+		}
+	}
+}
+
+// writeExecSendScript is an exec: mail provider that records the send it was
+// given (from/to as JSON on stdin) to a file the test reads back.
+func writeExecSendScript(t *testing.T) (script, recordPath string) {
+	t.Helper()
+	dir := t.TempDir()
+	script = filepath.Join(dir, "mail-exec")
+	recordPath = filepath.Join(dir, "sent.json")
+	data := `#!/bin/sh
+case "$1" in
+  ensure-running) exit 0 ;;
+  send)
+    { /usr/bin/printf '{"to":"%s"}\n' "$2"; /bin/cat; } > "` + recordPath + `"
+    /usr/bin/printf '{"id":"exec-send-1","from":"human","to":"x","subject":"s","body":"b","created_at":"2026-04-28T00:00:00Z","read":false}\n'
+    exit 0 ;;
+  *) exit 2 ;;
+esac
+`
+	if err := os.WriteFile(script, []byte(data), 0o755); err != nil {
+		t.Fatalf("WriteFile(exec script): %v", err)
+	}
+	return script, recordPath
+}
+
+// storelessCrossCity: a city with a roster but whose store cannot be opened,
+// on an exec: mail provider — the storeless send path.
+func storelessCrossCity(t *testing.T) (script, recordPath string) {
+	t.Helper()
+	writeCrossCityTestCity(t)
+	// The bd provider opens through the bd binary; with no binary on PATH
+	// the city store cannot open, which is the storeless shape (a city with
+	// config, an exec: mail provider, no store).
+	t.Setenv("GC_BEADS", "bd")
+	t.Setenv("PATH", t.TempDir())
+	script, recordPath = writeExecSendScript(t)
+	t.Setenv("GC_MAIL", "exec:"+script)
+	return script, recordPath
+}
+
+// A storeless send to an unknown city is refused, never handed to the
+// provider as a literal address.
+func TestCmdMailSendStorelessCrossCityUnknownCityRefused(t *testing.T) {
+	_, recordPath := storelessCrossCity(t)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend(nil, false, false, "human", "gastwn/mayor", "s", "b", &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("cmdMailSend = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "unknown city") || !strings.Contains(stderr.String(), "gastwn") {
+		t.Errorf("stderr = %q, want typed unknown-city refusal naming gastwn", stderr.String())
+	}
+	if _, err := os.Stat(recordPath); err == nil {
+		t.Errorf("the exec provider received a send despite the refusal")
+	}
+}
+
+// A storeless send to a peer city keeps the cross-city rules: --notify is
+// refused, and a plain send stores the sender city-qualified.
+func TestCmdMailSendStorelessCrossCityForeignRules(t *testing.T) {
+	_, recordPath := storelessCrossCity(t)
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdMailSend(nil, true, false, "human", "gastown/mayor", "s", "b", &stdout, &stderr); code != 1 {
+		t.Fatalf("--notify: cmdMailSend = %d, want 1; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "--notify does not cross cities") {
+		t.Errorf("--notify stderr = %q, want the cross-city notify refusal", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "no city store available") {
+		t.Fatalf("stderr = %q: this test must run on the STORELESS send path (no city store); the harness did not reach it", stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if code := cmdMailSend(nil, false, false, "human", "gastown/mayor", "s", "b", &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdMailSend = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	rec, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatalf("exec provider recorded nothing: %v", err)
+	}
+	if !strings.Contains(string(rec), `"qlandia/human"`) {
+		t.Errorf("exec send payload = %s, want the sender city-qualified as qlandia/human", rec)
+	}
+	if !strings.Contains(string(rec), `"gastown/mayor"`) {
+		t.Errorf("exec send payload = %s, want the canonical foreign recipient", rec)
+	}
+}
