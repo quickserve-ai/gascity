@@ -324,3 +324,59 @@ func TestPoolIdleRoutedWorkCheckReadsBothTiers(t *testing.T) {
 		t.Fatalf("details missing wisp-tier routed bead:\n%s", details)
 	}
 }
+
+// poolIdleSessionQueryCounter counts the session-list queries a check sends,
+// and how many of them ask for closed rows.
+type poolIdleSessionQueryCounter struct {
+	beads.Store
+	sessionQueries, closedQueries *int
+}
+
+func (s poolIdleSessionQueryCounter) List(q beads.ListQuery) ([]beads.Bead, error) {
+	if len(q.Metadata) == 0 {
+		*s.sessionQueries++
+		if q.IncludeClosed {
+			*s.closedQueries++
+		}
+	}
+	return s.Store.List(q)
+}
+
+// ga-4mu4k5: the session read is one open-only list per store, not one scan of
+// every session ever (closed included) per pool template. It was that per-template
+// scan that abandoned the check at a 5-minute budget under load.
+func TestPoolIdleRoutedWorkCheckReadsOpenSessionsOncePerStore(t *testing.T) {
+	cityDir := t.TempDir()
+	run := func(templates int) (sessionQueries, closedQueries int, result *doctor.CheckResult) {
+		cfg := &config.City{}
+		for i := 0; i < templates; i++ {
+			cfg.Agents = append(cfg.Agents, config.Agent{Name: fmt.Sprintf("builder%d", i), Dir: "gascity"})
+		}
+		closedIdle := poolIdleWorkSessionBead("gascity/builder0", "active", "")
+		closedIdle.ID, closedIdle.Status = "SESS-CLOSED", "closed"
+		store := poolIdleSessionQueryCounter{
+			Store: beads.NewMemStoreFrom(0, []beads.Bead{
+				closedIdle,
+				poolIdleWorkRoutedBead("gascity/builder0", ""),
+			}, nil),
+			sessionQueries: &sessionQueries,
+			closedQueries:  &closedQueries,
+		}
+		result = newPoolIdleRoutedWorkCheck(cfg, cityDir, func(string) (beads.Store, error) {
+			return store, nil
+		}).Run(&doctor.CheckContext{})
+		return sessionQueries, closedQueries, result
+	}
+
+	oneQ, oneClosed, result := run(1)
+	if result.Status != doctor.StatusOK {
+		t.Fatalf("a CLOSED idle session is no idle capacity: status = %v %#v", result.Status, result)
+	}
+	threeQ, threeClosed, _ := run(3)
+	if oneClosed != 0 || threeClosed != 0 {
+		t.Fatalf("session reads asked for closed rows (%d, %d); the check needs open sessions only", oneClosed, threeClosed)
+	}
+	if oneQ == 0 || threeQ != oneQ {
+		t.Fatalf("session queries = %d for 1 template, %d for 3; want the same nonzero count (one list per store)", oneQ, threeQ)
+	}
+}
