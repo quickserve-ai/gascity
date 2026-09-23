@@ -26,6 +26,13 @@ type formulaCompilerConstraint struct {
 // Requirements declares minimum host capabilities needed by a formula.
 type Requirements struct {
 	FormulaCompiler string `json:"formula_compiler,omitempty" toml:"formula_compiler,omitempty"`
+	// DisabledReason marks an UNSATISFIABLE requirement as deliberate: the
+	// formula is disabled on purpose (e.g. formula_compiler = ">=999.0.0" to
+	// shadow a formula so it can never be cooked). It changes only how doctor
+	// reports the formula; the requirement is still enforced at cook and
+	// dispatch time. Doctor warns when it sits on a satisfiable requirement,
+	// because then the formula it claims is disabled is dispatchable.
+	DisabledReason string `json:"disabled_reason,omitempty" toml:"disabled_reason,omitempty"`
 }
 
 // UnmarshalTOML decodes the top-level [requires] table and rejects unknown
@@ -43,6 +50,12 @@ func (r *Requirements) UnmarshalTOML(data interface{}) error {
 				return fmt.Errorf("formula.compiler_requirement_invalid: formula_compiler must be a semver comparator, for example %q", graphV2Requirement)
 			}
 			r.FormulaCompiler = text
+		case "disabled_reason":
+			text, ok := value.(string)
+			if !ok || strings.TrimSpace(text) == "" {
+				return fmt.Errorf("formula.requirement_invalid: disabled_reason must be a non-empty string saying why the formula is disabled")
+			}
+			r.DisabledReason = text
 		default:
 			return unknownRequirementError(key)
 		}
@@ -64,11 +77,24 @@ func (r *Requirements) UnmarshalJSON(data []byte) error {
 				return fmt.Errorf("formula.compiler_requirement_invalid: formula_compiler must be a semver comparator, for example %q", graphV2Requirement)
 			}
 			r.FormulaCompiler = text
+		case "disabled_reason":
+			var text string
+			if err := json.Unmarshal(value, &text); err != nil || strings.TrimSpace(text) == "" {
+				return fmt.Errorf("formula.requirement_invalid: disabled_reason must be a non-empty string saying why the formula is disabled")
+			}
+			r.DisabledReason = text
 		default:
 			return unknownRequirementError(key)
 		}
 	}
 	return nil
+}
+
+// IsUnsatisfiedRequirement reports whether err is ValidateHostRequirements'
+// "requirement is valid but this host cannot meet it" error — the only kind a
+// disabled_reason may explain. Invalid comparators and conflicts stay errors.
+func IsUnsatisfiedRequirement(err error) bool {
+	return err != nil && strings.HasPrefix(err.Error(), "formula.compiler_requirement_unsatisfied:")
 }
 
 // ValidateHostRequirements verifies that the active city capability satisfies
