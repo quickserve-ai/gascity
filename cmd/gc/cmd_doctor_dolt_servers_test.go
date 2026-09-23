@@ -36,7 +36,8 @@ func doltServersFixture(t *testing.T, procs []DoltProcInfo, discoverErr, layoutE
 		otherScopes:     func(string) ([]string, error) { return []string{"/other-city"}, nil },
 		cwd:             func(int) (string, bool) { return "", false },
 		args:            func(int) (string, error) { return "", errors.New("no full command line in this fixture") },
-		recordedPID:     func(managedDoltRuntimeLayout) int { return 0 },
+		recordedPID:     func(managedDoltRuntimeLayout) (int, time.Time) { return 0, time.Time{} },
+		exactArgv:       func(int) bool { return false },
 		activeTestRoots: func() []string { return nil },
 		startIdentity:   func(int) string { return "" },
 		homeDir:         "/home/me",
@@ -272,21 +273,78 @@ func TestDoltServersCheck_TestServersActiveCountedOrphanWarned(t *testing.T) {
 }
 
 // If the pid the runtime recorded is alive but did not match the layout, a
-// duplicate of it is undetectable. Say so instead of reading OK.
+// duplicate of it is undetectable. Say so instead of reading OK — but only when
+// that process was running when the pid file was written (it can be the writer).
 func TestDoltServersCheck_RecordedPIDOutsideManagedIsWarning(t *testing.T) {
-	odd := DoltProcInfo{PID: 150, Argv: []string{"dolt", "sql-server", "--config", "/elsewhere/dolt.yaml"}}
+	odd := DoltProcInfo{PID: 150, Argv: []string{"dolt", "sql-server", "--config", "/elsewhere/dolt.yaml"}, StartIdentity: "Mon Sep 21 10:00:00 2026"}
 	c := doltServersFixture(t, []DoltProcInfo{odd}, nil, nil)
-	c.recordedPID = func(managedDoltRuntimeLayout) int { return 150 }
+	c.recordedPID = func(managedDoltRuntimeLayout) (int, time.Time) {
+		return 150, time.Date(2026, 9, 21, 10, 0, 3, 0, time.Local)
+	}
 	r := c.Run(nil)
-	if r.Status == doctor.StatusOK {
-		t.Fatalf("status = OK although the recorded managed pid matched no layout: %v", r.Details)
+	if r.Status != doctor.StatusWarning {
+		t.Fatalf("status = %v, want Warning (the recorded managed pid matched no layout): %q %v", r.Status, r.Message, r.Details)
+	}
+}
+
+// Codex round 5 on #120 (a): the pid file survives crashes and pids are
+// reused. A dolt server that started AFTER the file was written cannot have
+// written it: a stale file, a Detail, never a Warning.
+func TestDoltServersCheck_ReusedRecordedPIDIsStaleNotWarning(t *testing.T) {
+	reused := DoltProcInfo{PID: 150, Argv: []string{"dolt", "sql-server", "--config", "/elsewhere/dolt.yaml"}, StartIdentity: "Tue Sep 22 09:00:00 2026"}
+	c := doltServersFixture(t, []DoltProcInfo{gcDoltProc(100, "/city", 51361), reused}, nil, nil)
+	c.recordedPID = func(managedDoltRuntimeLayout) (int, time.Time) {
+		return 150, time.Date(2026, 9, 21, 10, 0, 3, 0, time.Local)
+	}
+	r := c.Run(nil)
+	if r.Status != doctor.StatusOK {
+		t.Fatalf("status = %v, want OK (stale pid file, reused pid): %q %v", r.Status, r.Message, r.Details)
+	}
+	if !strings.Contains(strings.Join(r.Details, "\n"), "pid file is stale") {
+		t.Fatalf("the stale pid file must be named in Details: %v", r.Details)
+	}
+}
+
+func TestDoltServersCheck_UnknownStartTimeDoesNotJudgeRecordedPID(t *testing.T) {
+	odd := DoltProcInfo{PID: 150, Argv: []string{"dolt", "sql-server", "--config", "/elsewhere/dolt.yaml"}}
+	c := doltServersFixture(t, []DoltProcInfo{gcDoltProc(100, "/city", 51361), odd}, nil, nil)
+	c.recordedPID = func(managedDoltRuntimeLayout) (int, time.Time) { return 150, time.Now() }
+	r := c.Run(nil)
+	if r.Status != doctor.StatusOK || !strings.Contains(strings.Join(r.Details, "\n"), "not judged") {
+		t.Fatalf("want OK with a not-judged Detail: %v %q %v", r.Status, r.Message, r.Details)
 	}
 }
 
 func TestTrimFlattenedDoltArgs_NeverCarriesTrailingFlags(t *testing.T) {
-	got := trimFlattenedDoltArgs("/city/x.yaml -u root -p hunter2")
-	if got != "/city/x.yaml" {
-		t.Fatalf("displayDoltPath = %q", got)
+	for in, want := range map[string]string{
+		"/city/x.yaml -u root -p hunter2":     "/city/x.yaml",
+		"/city/x.yaml -p=hunter2":             "/city/x.yaml",
+		"/city/x.yaml --loglevel debug":       "/city/x.yaml",
+		"/srv/Gas - City/.beads/dolt":         "/srv/Gas - City/.beads/dolt",
+		"/srv/Gas - City/.beads/dolt -u root": "/srv/Gas - City/.beads/dolt",
+		"/srv/a -b/dolt":                      "/srv/a -b/dolt",
+		"/srv/-u/dolt":                        "/srv/-u/dolt",
+	} {
+		if got := trimFlattenedDoltArgs(in); got != want {
+			t.Errorf("trimFlattenedDoltArgs(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// Codex round 5 on #120 (b): a value from an exact /proc argv is the path,
+// whatever it contains; only flattened ps values are trimmed.
+func TestDoltServersCheck_ExactArgvIsNeverTrimmed(t *testing.T) {
+	raw := "/srv/odd -u dir/.beads/dolt"
+	p := DoltProcInfo{PID: 300, Argv: []string{"dolt", "sql-server", "--data-dir", raw}}
+	c := doltServersFixture(t, nil, nil, nil)
+	c.exactArgv = func(int) bool { return true }
+	if got := c.identify(p).path; got != raw {
+		t.Fatalf("exact argv identity = %q, want %q", got, raw)
+	}
+	c.ids = nil
+	c.exactArgv = func(int) bool { return false }
+	if got := c.identify(p).path; got != "/srv/odd" {
+		t.Fatalf("flattened identity = %q, want the value cut at the flag", got)
 	}
 }
 
