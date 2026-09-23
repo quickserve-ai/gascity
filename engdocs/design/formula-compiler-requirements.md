@@ -156,7 +156,7 @@ formula.compiler_requirement_unsatisfied: formula requires formula_compiler >=2.
 Example unknown requirement:
 
 ```text
-formula.requirement_unknown: unknown formula requirement "state_store"; supported requirements: formula_compiler
+formula.requirement_unknown: unknown formula requirement "state_store"; supported requirements: formula_compiler, disabled_reason
 ```
 
 Example invalid comparator:
