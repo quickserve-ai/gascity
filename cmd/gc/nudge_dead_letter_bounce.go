@@ -6,7 +6,10 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode"
 
+	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/mail/beadmail"
 	"github.com/gastownhall/gascity/internal/session"
 )
 
@@ -29,21 +32,49 @@ import (
 //   - Recipient resolution is read-only: the sender must name a configured
 //     named session, looked up in config alone. The mail CLI's recipient
 //     resolver is not used, because it can materialize or claim a session
-//     (ga-isa3j4); beadmail's Send stores the recipient string verbatim.
+//     (ga-isa3j4); beadmail's Send stores the recipient string verbatim, and
+//     the provider is built with no session directory, so Send does not read
+//     sessions at all.
+//
+// The report can run inside the controller loop (nudgeDispatchTick reaches
+// runNudgeQueueMaintenanceSweep), so one call loads config once, opens the
+// mail store once, and sends at most nudgeDeadLetterBouncesPerCall notices;
+// the rest are named in one warning. It stays synchronous after the queue
+// lock is released: a goroutine could be cut off by a CLI process exiting.
 
-// nudgeDeadLetterBounceFrom is the From address of a dead-letter notice.
-const nudgeDeadLetterBounceFrom = "gc"
+const (
+	// nudgeDeadLetterBounceFrom is the From address of a dead-letter notice.
+	nudgeDeadLetterBounceFrom = "gc"
+	// nudgeDeadLetterSubjectCauseMax bounds the cause quoted in the subject.
+	nudgeDeadLetterSubjectCauseMax = 80
+	// nudgeDeadLetterCauseMax bounds the cause quoted anywhere in a notice.
+	// Provider error text can echo the prompt, and the notice promises no
+	// payload.
+	nudgeDeadLetterCauseMax = 160
+	// nudgeDeadLetterBouncesPerCall caps the notices one queue operation
+	// sends, so a burst of deaths cannot stall the controller loop.
+	nudgeDeadLetterBouncesPerCall = 10
+	// nudgeManagedWakeRollbackCause prefixes the LastError that
+	// rollbackQueuedNudge records when a managed wake fails. The enqueuing
+	// command already exited 1 with that error, so the death is not bounced.
+	nudgeManagedWakeRollbackCause = "managed wake failed: "
+)
 
-// nudgeDeadLetterSubjectCauseMax bounds the cause quoted in the subject line.
-const nudgeDeadLetterSubjectCauseMax = 80
+// nudgeDeadLetterSendFunc sends one notice through an already-open mailer.
+type nudgeDeadLetterSendFunc func(to, subject, body string) error
 
-// nudgeDeadLetterBouncer sends one dead-letter notice. It is a package var so
-// tests can capture notices instead of writing mail beads.
-var nudgeDeadLetterBouncer = sendNudgeDeadLetterMail
+// openNudgeDeadLetterMailer opens the city's mail sender once per report. It
+// is a package var so tests can count opens and capture notices.
+var openNudgeDeadLetterMailer = openCityNudgeDeadLetterMailer
+
+type nudgeDeadLetterBounce struct {
+	item queuedNudge
+	to   string
+}
 
 // reportDeadLetteredNudges mails each eligible item's sender one notice. It is
-// best-effort: a failure writes one warning and never reaches the queue
-// operation that dead-lettered the item. Callers must not hold the queue lock.
+// best-effort: failures write warnings and never reach the queue operation
+// that dead-lettered the items. Callers must not hold the queue lock.
 func reportDeadLetteredNudges(cityPath string, items []queuedNudge) {
 	candidates := make([]queuedNudge, 0, len(items))
 	for _, item := range items {
@@ -70,6 +101,7 @@ func reportDeadLetteredNudges(cityPath string, items []queuedNudge) {
 		}
 		return strings.TrimSpace(spec.Identity)
 	}
+	var bounces []nudgeDeadLetterBounce
 	for _, item := range candidates {
 		to := configuredMailbox(item.Sender)
 		if to == "" {
@@ -78,16 +110,49 @@ func reportDeadLetteredNudges(cityPath string, items []queuedNudge) {
 		if to == strings.TrimSpace(item.Agent) || to == configuredMailbox(item.Agent) {
 			continue
 		}
-		subject, body := nudgeDeadLetterNotice(item)
-		if err := nudgeDeadLetterBouncer(cityPath, to, subject, body); err != nil && nudgeWarningWriter != nil {
-			fmt.Fprintf(nudgeWarningWriter, "gc nudge: warning: notifying %q that nudge %q dead-lettered: %v\n", to, item.ID, err) //nolint:errcheck // best-effort warning
+		bounces = append(bounces, nudgeDeadLetterBounce{item: item, to: to})
+	}
+	if len(bounces) == 0 {
+		return
+	}
+	var overflow []nudgeDeadLetterBounce
+	if len(bounces) > nudgeDeadLetterBouncesPerCall {
+		bounces, overflow = bounces[:nudgeDeadLetterBouncesPerCall], bounces[nudgeDeadLetterBouncesPerCall:]
+	}
+	defer warnUnbouncedDeadLetters(overflow, fmt.Sprintf("over the cap of %d per queue operation", nudgeDeadLetterBouncesPerCall))
+
+	send, closeMailer, err := openNudgeDeadLetterMailer(cityPath, cfg)
+	if err != nil {
+		warnUnbouncedDeadLetters(bounces, fmt.Sprintf("the mail store did not open: %v", err))
+		return
+	}
+	if closeMailer != nil {
+		defer closeMailer()
+	}
+	for _, bounce := range bounces {
+		subject, body := nudgeDeadLetterNotice(bounce.item)
+		if err := send(bounce.to, subject, body); err != nil && nudgeWarningWriter != nil {
+			fmt.Fprintf(nudgeWarningWriter, "gc nudge: warning: notifying %q that nudge %q dead-lettered: %v\n", bounce.to, bounce.item.ID, err) //nolint:errcheck // best-effort warning
 		}
 	}
 }
 
+// warnUnbouncedDeadLetters writes one warning naming dead-lettered nudges
+// whose senders were not notified.
+func warnUnbouncedDeadLetters(bounces []nudgeDeadLetterBounce, why string) {
+	if len(bounces) == 0 || nudgeWarningWriter == nil {
+		return
+	}
+	ids := make([]string, 0, len(bounces))
+	for _, bounce := range bounces {
+		ids = append(ids, bounce.item.ID)
+	}
+	fmt.Fprintf(nudgeWarningWriter, "gc nudge: warning: %d dead-lettered nudges not bounced to their senders (%s): %s\n", len(ids), why, strings.Join(ids, ", ")) //nolint:errcheck // best-effort warning
+}
+
 // nudgeDeadLetterWorthBouncing applies the config-free filters: a sender to
 // notify, one that is not a person reading a terminal, not the target itself,
-// and a loss worth reporting.
+// and a loss the sender has not already seen.
 func nudgeDeadLetterWorthBouncing(item queuedNudge) bool {
 	sender := strings.TrimSpace(item.Sender)
 	if sender == "" || sender == "human" {
@@ -104,18 +169,35 @@ func nudgeDeadLetterWorthBouncing(item queuedNudge) bool {
 	if item.Source == "mail" {
 		return false
 	}
+	cause := strings.TrimSpace(item.LastError)
 	// A superseded nudge was replaced by a newer one for the same reference.
 	// Telling the sender to re-send it would only duplicate the newer one.
-	if strings.TrimSpace(item.LastError) == "superseded" {
+	if cause == "superseded" {
+		return false
+	}
+	// A managed-wake rollback failed the enqueuing command with exit 1.
+	if strings.HasPrefix(cause, nudgeManagedWakeRollbackCause) {
 		return false
 	}
 	return true
 }
 
+// nudgeDeadLetterCause renders an item's cause on one line, with control
+// characters removed, bounded to nudgeDeadLetterCauseMax runes.
+func nudgeDeadLetterCause(item queuedNudge) string {
+	cleaned := strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, deadReason(item))
+	return truncateNudgeDeadLetterCause(strings.Join(strings.Fields(cleaned), " "), nudgeDeadLetterCauseMax)
+}
+
 // nudgeDeadLetterNotice renders the notice. The nudge's message text is
 // deliberately absent (see the package comment above).
 func nudgeDeadLetterNotice(item queuedNudge) (subject, body string) {
-	cause := strings.Join(strings.Fields(deadReason(item)), " ")
+	cause := nudgeDeadLetterCause(item)
 	subject = fmt.Sprintf("[nudge dead-lettered] to %s: %s", item.Agent, truncateNudgeDeadLetterCause(cause, nudgeDeadLetterSubjectCauseMax))
 	var b strings.Builder
 	fmt.Fprintf(&b, "A nudge you queued was dead-lettered.\n\n")
@@ -148,30 +230,34 @@ func truncateNudgeDeadLetterCause(s string, limit int) string {
 	return string(r[:limit-3]) + "..."
 }
 
-// sendNudgeDeadLetterMail sends the notice through the city's mail provider,
-// opened from cityPath rather than the process cwd. It mirrors
-// openCityMailProvider's class-store routing: message beads through
-// resolveMailMessagesStore, session reads through cliSessionStore. Send is
-// called with an exact configured mailbox and no notification, so it neither
-// resolves the recipient through a session-materializing path nor wakes one.
-func sendNudgeDeadLetterMail(cityPath, to, subject, body string) error {
+// openCityNudgeDeadLetterMailer opens the city's mail sender from cityPath,
+// reusing the caller's already-loaded cfg instead of loading config again.
+// Message beads route through resolveMailMessagesStore, as in
+// openCityMailProvider. The beadmail provider gets no session directory: Send
+// then records the "gc" sender literally instead of resolving it against
+// session beads, and it never resolves the recipient, so no session is read,
+// created, or claimed. Send is plain mail; nothing is notified or nudged.
+func openCityNudgeDeadLetterMailer(cityPath string, cfg *config.City) (nudgeDeadLetterSendFunc, func(), error) {
 	name := os.Getenv("GC_MAIL")
-	if name == "" {
-		name = mailProviderNameForCity(cityPath)
+	if name == "" && cfg != nil {
+		name = cfg.Mail.Provider
 	}
 	if strings.HasPrefix(name, "exec:") || name == "fake" || name == "fail" {
-		_, err := newMailProviderNamed(name, nil, false).Send(nudgeDeadLetterBounceFrom, to, subject, body)
-		return err
+		mp := newMailProviderNamed(name, nil, false)
+		return func(to, subject, body string) error {
+			_, err := mp.Send(nudgeDeadLetterBounceFrom, to, subject, body)
+			return err
+		}, nil, nil
 	}
 	store, err := openStoreAtForCity(cityPath, cityPath)
 	if err != nil {
-		return fmt.Errorf("opening the city store at %q: %w", cityPath, err)
+		return nil, nil, fmt.Errorf("opening the city store at %q: %w", cityPath, err)
 	}
-	defer closeBeadStoreHandle(store) //nolint:errcheck // best-effort
-	cfg, _ := loadCityConfigWithoutBuiltinPackRefresh(cityPath, io.Discard)
 	msgStore := resolveMailMessagesStore(cliStorageRoutes(cityPath), store, cfg, cityPath, nil)
-	sessStore := cliSessionStore(store, cfg, cityPath)
-	mp := newMailProviderNamedWithSessionStore(name, msgStore, sessStore, false)
-	_, err = mp.Send(nudgeDeadLetterBounceFrom, to, subject, body)
-	return err
+	mp := beadmail.NewWithSessionDirectory(msgStore, nil)
+	send := func(to, subject, body string) error {
+		_, err := mp.Send(nudgeDeadLetterBounceFrom, to, subject, body)
+		return err
+	}
+	return send, func() { _ = closeBeadStoreHandle(store) }, nil
 }
