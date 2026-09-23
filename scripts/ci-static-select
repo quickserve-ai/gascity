@@ -190,6 +190,38 @@ def path_is_beneath_package(path: str, package_dir: str) -> bool:
     return package_dir == "." or path.startswith(package_dir + "/")
 
 
+def deleted_path_embed_owners(
+    path: str,
+    embed_patterns: list[tuple[str, str]],
+    embed_owners: dict[str, set[str]],
+    embedded_by_dir: dict[str, list[str]],
+) -> set[str]:
+    """Return every package whose embed pattern may have matched a deleted path.
+
+    The inventory is the post-change tree, so a deleted path is absent from it.
+    Selecting its pattern owners is complete only while each owner still embeds,
+    through that same pattern, a file in the deleted path's directory: the
+    pattern demonstrably still resolves there. Otherwise the path may be
+    absent from the current embed inventory, and selection is refused.
+    """
+    matched = [
+        (pattern, owner)
+        for pattern, owner in embed_patterns
+        if deleted_path_may_match_embed_pattern(path, pattern)
+    ]
+    siblings = embedded_by_dir.get(posixpath.dirname(path), [])
+    for pattern, owner in matched:
+        if not any(
+            owner in embed_owners[sibling]
+            and deleted_path_may_match_embed_pattern(sibling, pattern)
+            for sibling in siblings
+        ):
+            raise SelectionError(
+                f"deleted path {path!r} may be absent from the current embed inventory"
+            )
+    return {owner for _, owner in matched}
+
+
 def affected_package_args(
     records: Iterable[tuple[str, str]], go_tool: str
 ) -> list[str]:
@@ -219,7 +251,7 @@ def affected_package_args(
     import_by_dir: dict[str, str] = {}
     arg_by_import: dict[str, str] = {}
     embed_owners: dict[str, set[str]] = defaultdict(set)
-    embed_patterns: list[str] = []
+    embed_patterns: list[tuple[str, str]] = []
     native_imports: set[str] = set()
 
     for package in package_records:
@@ -253,7 +285,9 @@ def affected_package_args(
                 embed_owners[embedded_repo_path(relative_dir, embedded)].add(import_path)
         for field in EMBED_PATTERN_FIELDS:
             for pattern in string_list(package, field):
-                embed_patterns.append(embedded_repo_pattern(relative_dir, pattern))
+                embed_patterns.append(
+                    (embedded_repo_pattern(relative_dir, pattern), import_path)
+                )
 
         native_sources: list[str] = []
         for field in NATIVE_SOURCE_FIELDS:
@@ -266,17 +300,18 @@ def affected_package_args(
         if native_sources or any(ignored_native_sources):
             native_imports.add(import_path)
 
+    embedded_by_dir: dict[str, list[str]] = defaultdict(list)
+    for embedded in embed_owners:
+        embedded_by_dir[posixpath.dirname(embedded)].append(embedded)
+
     seeds: set[str] = set()
     for status, path in changed:
         owners = embed_owners.get(path, set())
-        seeds.update(owners)
-        if status == "D" and any(
-            deleted_path_may_match_embed_pattern(path, pattern)
-            for pattern in embed_patterns
-        ):
-            raise SelectionError(
-                f"deleted path {path!r} may be absent from the current embed inventory"
+        if status == "D":
+            owners = owners | deleted_path_embed_owners(
+                path, embed_patterns, embed_owners, embedded_by_dir
             )
+        seeds.update(owners)
         # Native compilers can consume inputs with arbitrary names and from
         # shared directories. The Go package inventory does not expose that
         # dependency graph, so every native package is the smallest safe scope
