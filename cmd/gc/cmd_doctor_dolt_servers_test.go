@@ -38,6 +38,7 @@ func doltServersFixture(t *testing.T, procs []DoltProcInfo, discoverErr, layoutE
 		args:            func(int) (string, error) { return "", errors.New("no full command line in this fixture") },
 		recordedPID:     func(managedDoltRuntimeLayout) (int, time.Time) { return 0, time.Time{} },
 		exactArgv:       func(int) bool { return false },
+		readFile:        func(string) ([]byte, error) { return nil, errors.New("no config files in this fixture") },
 		activeTestRoots: func() []string { return nil },
 		startIdentity:   func(int) string { return "" },
 		homeDir:         "/home/me",
@@ -685,5 +686,38 @@ func TestLocalServerPolicy_NoConfigIsAnErrorNotExpectsLocal(t *testing.T) {
 	r := c.Run(nil)
 	if r.Status != doctor.StatusWarning || !strings.Contains(strings.Join(r.Details, "\n"), "not checked") {
 		t.Fatalf("want Warning with a not-checked line: %v %q %v", r.Status, r.Message, r.Details)
+	}
+}
+
+// Codex round 8 on #120: a copied config whose data_dir is this city's store
+// makes its server a second server on that store, whatever the file is named.
+func TestDoltServersCheck_ConfigCopyNamingTheManagedStoreIsSplitBrain(t *testing.T) {
+	copyCfg := DoltProcInfo{PID: 210, Argv: []string{"dolt", "sql-server", "--config", "/tmp/copy.yaml"}}
+	c := doltServersFixture(t, []DoltProcInfo{gcDoltProc(100, "/city", 51361), copyCfg}, nil, nil)
+	c.readFile = func(path string) ([]byte, error) {
+		if path == "/tmp/copy.yaml" {
+			return []byte("log_level: info\nlistener:\n  port: 40000\ndata_dir: \"/city/.beads/dolt\"\n"), nil
+		}
+		return nil, errors.New("not found")
+	}
+	r := c.Run(nil)
+	if r.Status != doctor.StatusError {
+		t.Fatalf("status = %v, want Error (two servers on the managed store): %q %v", r.Status, r.Message, r.Details)
+	}
+}
+
+func TestYAMLTopLevelScalar(t *testing.T) {
+	for in, want := range map[string]string{
+		"data_dir: \"/a b/c\"\n":    "/a b/c",
+		"data_dir: /plain/path\n":   "/plain/path",
+		"data_dir: '/it''s'\n":      "/it's",
+		"data_dir: /p # comment\n":  "/p",
+		"x:\n  data_dir: /nested\n": "",
+		"data_dirx: /no\n":          "",
+		"log: 1\n":                  "",
+	} {
+		if got := yamlTopLevelScalar([]byte(in), "data_dir"); got != want {
+			t.Errorf("yamlTopLevelScalar(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
