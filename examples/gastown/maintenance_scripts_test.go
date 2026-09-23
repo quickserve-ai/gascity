@@ -9465,6 +9465,76 @@ func TestJsonlExportCommitsOnHaltToAdvanceBaseline(t *testing.T) {
 	}
 }
 
+// A spike HALT whose snapshot commit fills the disk (the repack on the
+// commit path can) must still deliver the spike alert and reach its summary.
+// Every state write fails after the repack: the pending-alert record is never
+// persisted, so clearing it after a successful send must not run, and could
+// not succeed; under errexit it used to end the run before
+// MAINTENANCE_DONE (codex round 10 on #138).
+func TestJsonlExportHaltOnFullDiskStillAlertsAndCompletes(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+	mailLog := filepath.Join(t.TempDir(), "gc-mail.log")
+	archiveRepo := filepath.Join(cityDir, "archive")
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("LookPath(git): %v", err)
+	}
+	realMktemp, err := exec.LookPath("mktemp")
+	if err != nil {
+		t.Fatalf("LookPath(mktemp): %v", err)
+	}
+	diskFull := filepath.Join(t.TempDir(), "disk-full")
+	writeExecutable(t, filepath.Join(binDir, "git"), fmt.Sprintf(`#!/bin/sh
+for arg in "$@"; do
+    if [ "$arg" = "gc" ]; then
+        : > '%s'
+        echo "fatal: No space left on device" >&2
+        exit 1
+    fi
+done
+exec '%s' "$@"
+`, diskFull, realGit))
+	writeExecutable(t, filepath.Join(binDir, "mktemp"), fmt.Sprintf(`#!/bin/sh
+if [ -e '%s' ]; then
+    for arg in "$@"; do
+        case "$arg" in *jsonl-export-state.json*) echo "simulated ENOSPC" >&2; exit 1 ;; esac
+    done
+fi
+exec '%s' "$@"
+`, diskFull, realMktemp))
+
+	initSeedArchive(t, archiveRepo, 100)
+	writeMultiRecordDoltStub(t, binDir, 10) // 90% drop: a spike HALT
+	writeJsonlExportGCStub(t, binDir)
+
+	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
+	out, runErr := runScriptResult(t, coreScriptPath("jsonl-export.sh"), env)
+	if runErr != nil {
+		t.Fatalf("a full disk on the HALT path must not fail the export; run err=%v\noutput:\n%s", runErr, out)
+	}
+	if _, err := os.Stat(diskFull); err != nil {
+		t.Fatalf("precondition: the repack must have run and filled the disk: %v", err)
+	}
+	mailData, err := os.ReadFile(mailLog)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("ReadFile(mail log): %v", err)
+	}
+	if !strings.Contains(string(mailData), "ESCALATION: JSONL spike") {
+		t.Fatalf("the spike alert must still be sent on a full disk; mail log:\n%s", mailData)
+	}
+	gcData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	if !strings.Contains(string(gcData), "HALTED on spike detection") {
+		t.Fatalf("the HALT run must reach its summary on a full disk; gc log:\n%s\noutput:\n%s", gcData, out)
+	}
+}
+
 func TestJsonlExportFirstRunWithDisabledFloorSkipsSpikeCheck(t *testing.T) {
 	// Regression: GC_JSONL_MIN_PREV_FOR_SPIKE=0 is documented as "disable the
 	// floor", but combined with a first run (no archive yet → PREV_COUNT=0)

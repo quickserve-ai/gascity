@@ -1218,13 +1218,22 @@ if [ "$HALTED" -eq 1 ]; then
             echo "jsonl-export: could not mark the HALT snapshot pending for push; the next run re-detects it as a local-only commit" >&2
         fi
     fi
+    spike_alert_recorded=1
     if ! set_pending_spike_alert "$HALT_DB" "$HALT_PREV_COUNT" "$HALT_CURRENT_COUNT" "$HALT_DELTA" "$SPIKE_THRESHOLD"; then
+        spike_alert_recorded=0
         echo "jsonl-export: could not record the spike alert in state; sending it now, but a failed send cannot be retried from state" >&2
     fi
     if send_spike_alert "$HALT_DB" "$HALT_PREV_COUNT" "$HALT_CURRENT_COUNT" "$HALT_DELTA" "$SPIKE_THRESHOLD"; then
-        clear_pending_spike_alert "$HALT_DB"
-    else
+        # Nothing to clear when the record never landed, and on a full disk
+        # the clear is one more failing write: under errexit it would end the
+        # run before maintenance_done.
+        if [ "$spike_alert_recorded" -eq 1 ] && ! clear_pending_spike_alert "$HALT_DB"; then
+            echo "jsonl-export: the spike alert was sent but could not be cleared from state; the next run may send it once more" >&2
+        fi
+    elif [ "$spike_alert_recorded" -eq 1 ]; then
         echo "jsonl-export: spike alert delivery failed; will retry from state" >&2
+    else
+        echo "jsonl-export: spike alert delivery failed and was never recorded in state; it will not be retried" >&2
     fi
     maintenance_done "jsonl — HALTED on spike detection"
     exit 0
