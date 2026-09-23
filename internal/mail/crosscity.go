@@ -119,7 +119,11 @@ func RefuseUnknownCity(err error, recipient string, roster CityRoster, localScop
 		return err
 	}
 	for _, scope := range localScopes {
-		if strings.TrimSpace(scope) == segment {
+		// A scope may be a nested agent dir ("projects/backend"); the
+		// address starts with its leading segment, which is what the
+		// config-side collision check compares too.
+		leading, _, _ := strings.Cut(strings.TrimSpace(scope), "/")
+		if leading == segment {
 			return err
 		}
 	}
