@@ -38,12 +38,13 @@ import (
 // then sorted into:
 //
 //   - managed: serves this city's managed runtime layout. More than one is a
-//     split-brain on the city's own store -> Error.
+//     split-brain on the city's own store -> Error. One, on a city that is not
+//     configured to run a local server, is unaccounted for -> Warning.
 //   - rig-local: under a non-HQ rig root. Two on the same store is a
-//     split-brain on that rig's store -> Error. On a rig whose endpoint origin
-//     is inherited_city even ONE is unaccounted for: on the rig's own store ->
-//     Error, elsewhere under the rig -> Warning. dolt-drift finds such a
-//     server only when it wrote .dolt/sql-server.info.
+//     split-brain on that rig's store -> Error. On a rig configured to run NO
+//     local server (see localServerPolicy) even ONE is unaccounted for: on the
+//     rig's own store -> Error, elsewhere under the rig -> Warning. dolt-drift
+//     finds such a server only when it wrote .dolt/sql-server.info.
 //   - city-stray: under the city root, not the managed layout -> Warning.
 //   - other-city: under a city or rig registered with the supervisor on this
 //     host (~/.gc/cities.toml). Counted: a multi-city host runs one managed
@@ -82,10 +83,9 @@ type doltServersCheck struct {
 	// (/proc cmdline) rather than a flattened `ps` line whose values can
 	// swallow the flags after them.
 	exactArgv func(pid int) bool
-	// inheritedRigs maps the normalized root of every rig whose endpoint
-	// origin is inherited_city to its name. Such a rig should run no
-	// rig-local server at all.
-	inheritedRigs func() (map[string]string, error)
+	// localPolicy resolves, per scope, whether the city's configuration
+	// expects a local dolt server there at all.
+	localPolicy func() (doltLocalPolicy, error)
 	// activeTestRoots lists test roots whose owning test process is alive.
 	activeTestRoots func() []string
 	// startIdentity is the ps lstart fallback when discovery left it empty.
@@ -116,7 +116,7 @@ func newDoltServersCheck(cityPath string, cfg *config.City) *doltServersCheck {
 		args:            processArgs,
 		recordedPID:     readManagedDoltPIDFile,
 		exactArgv:       argvIsExact,
-		inheritedRigs:   func() (map[string]string, error) { return inheritedCityRigRoots(cityPath, cfg) },
+		localPolicy:     func() (doltLocalPolicy, error) { return localServerPolicy(cityPath, cfg) },
 		activeTestRoots: func() []string { return discoverActiveTestRoots(home, temp) },
 		startIdentity:   readProcStartIdentity,
 		homeDir:         home,
@@ -309,11 +309,22 @@ func (c *doltServersCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 		rigKeys = append(rigKeys, k)
 	}
 	sort.Strings(rigKeys)
-	inherited, inheritedErr := map[string]string(nil), error(nil)
-	if len(rigKeys) > 0 && c.inheritedRigs != nil {
-		inherited, inheritedErr = c.inheritedRigs()
+	var policy doltLocalPolicy
+	var policyErr error
+	if (len(rigKeys) > 0 || len(managed) > 0) && c.localPolicy != nil {
+		policy, policyErr = c.localPolicy()
 	}
-	var inheritedUnchecked int
+	unchecked := 0
+	if len(managed) == 1 && c.localPolicy != nil {
+		switch {
+		case policyErr != nil:
+			unchecked++
+		case !policy.city.expectsLocal:
+			warns = append(warns, fmt.Sprintf(
+				"dolt server on this city's managed store, but the city runs no local server (%s): %s",
+				policy.city.reason, c.describe(managed[0])))
+		}
+	}
 	for _, k := range rigKeys {
 		group := rigLocal[k]
 		if len(group) > 1 {
@@ -322,28 +333,31 @@ func (c *doltServersCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 				len(group), c.describeAll(group)))
 			continue
 		}
-		if inheritedErr != nil {
-			inheritedUnchecked++
+		if c.localPolicy == nil {
 			continue
 		}
-		name, ok := inherited[rigRootOf[k]]
-		if !ok {
+		if policyErr != nil {
+			unchecked++
+			continue
+		}
+		rp, ok := policy.rigs[rigRootOf[k]]
+		if !ok || rp.expectsLocal {
 			continue
 		}
 		if strings.HasSuffix(k, rigStoreKeySuffix) {
 			errs = append(errs, fmt.Sprintf(
-				"rig %q inherits the city's dolt endpoint, but a rig-local dolt server serves its store — split-brain with the city server: %s",
-				name, c.describeAll(group)))
+				"rig %q runs no local dolt server (%s), but one serves its store — split-brain with the store it is configured for: %s",
+				rp.name, rp.reason, c.describeAll(group)))
 		} else {
 			warns = append(warns, fmt.Sprintf(
-				"dolt server under rig %q, which inherits the city's dolt endpoint and should run none: %s",
-				name, c.describeAll(group)))
+				"dolt server under rig %q, which runs no local server (%s): %s",
+				rp.name, rp.reason, c.describeAll(group)))
 		}
 	}
-	if inheritedUnchecked > 0 {
+	if unchecked > 0 {
 		warns = append(warns, fmt.Sprintf(
-			"rig endpoint origins unresolvable (%v); %d single rig-local dolt server(s) not checked against rigs that inherit the city endpoint",
-			inheritedErr, inheritedUnchecked))
+			"endpoint configuration unresolvable (%v); %d single local dolt server(s) not checked against whether their scope should run one",
+			policyErr, unchecked))
 	}
 	var pidNotes []string
 	if layoutErr == nil {
@@ -460,34 +474,68 @@ func (c *doltServersCheck) rigStoreKey(root string, id doltServerIdentity) strin
 
 const rigStoreKeySuffix = "\x00store"
 
-// inheritedCityRigRoots maps each bd-store rig whose endpoint origin is
-// inherited_city to its name, keyed by the normalized root
-// deepestDoltScopeOwner returns. The resolution is dolt-drift's.
-func inheritedCityRigRoots(cityPath string, cfg *config.City) (map[string]string, error) {
-	out := map[string]string{}
+// doltLocalPolicy says, per scope, whether the city's configuration expects
+// a local dolt server there. Rigs are keyed by the normalized root
+// deepestDoltScopeOwner returns.
+type doltLocalPolicy struct {
+	city doltScopeLocal
+	rigs map[string]doltScopeLocal
+}
+
+type doltScopeLocal struct {
+	name         string
+	expectsLocal bool
+	reason       string // why no local server is expected; "" when one is
+}
+
+// localServerPolicy resolves each scope's store provider and endpoint origin
+// the way dolt-drift does. A local server is expected only for a bd-store
+// city whose origin is managed_city, and a bd-store rig with an explicit
+// endpoint on a local host (`gc rig set-endpoint --self`). Everything else —
+// file-backed, city_canonical, inherited_city, explicit external — runs none.
+func localServerPolicy(cityPath string, cfg *config.City) (doltLocalPolicy, error) {
+	pol := doltLocalPolicy{rigs: map[string]doltScopeLocal{}}
 	if cfg == nil {
-		return out, nil
+		pol.city = doltScopeLocal{name: "city", expectsLocal: true}
+		return pol, nil
 	}
 	cityState, _, err := resolveDesiredCityEndpointState(cityPath, cfg.Dolt, config.EffectiveHQPrefix(cfg))
 	if err != nil {
-		return nil, fmt.Errorf("resolve city endpoint state: %w", err)
+		return doltLocalPolicy{}, fmt.Errorf("resolve city endpoint state: %w", err)
+	}
+	pol.city = doltScopeLocal{name: "city", expectsLocal: true}
+	switch {
+	case !scopeUsesManagedBdStoreContract(cityPath, cityPath):
+		pol.city = doltScopeLocal{name: "city", reason: "the city store is not bd/dolt"}
+	case cityState.EndpointOrigin != contract.EndpointOriginManagedCity:
+		pol.city = doltScopeLocal{name: "city", reason: "city endpoint origin " + string(cityState.EndpointOrigin)}
 	}
 	rigs := make([]config.Rig, len(cfg.Rigs))
 	copy(rigs, cfg.Rigs)
 	resolveRigPaths(cityPath, rigs)
 	for _, rig := range rigs {
-		if strings.TrimSpace(rig.Path) == "" || !rigUsesManagedBdStoreContract(cityPath, rig) {
+		if strings.TrimSpace(rig.Path) == "" {
+			continue
+		}
+		root := normalizePathForCompare(strings.TrimSpace(rig.Path))
+		if !rigUsesManagedBdStoreContract(cityPath, rig) {
+			pol.rigs[root] = doltScopeLocal{name: rig.Name, reason: "the rig store is not bd/dolt"}
 			continue
 		}
 		st, err := resolveDesiredRigEndpointState(cityPath, rig, cityState)
 		if err != nil {
-			return nil, fmt.Errorf("rig %q: %w", rig.Name, err)
+			return doltLocalPolicy{}, fmt.Errorf("rig %q: %w", rig.Name, err)
 		}
-		if st.EndpointOrigin == contract.EndpointOriginInheritedCity {
-			out[normalizePathForCompare(strings.TrimSpace(rig.Path))] = rig.Name
+		switch {
+		case st.EndpointOrigin == contract.EndpointOriginExplicit && contract.DoltHostIsLocal(st.DoltHost):
+			pol.rigs[root] = doltScopeLocal{name: rig.Name, expectsLocal: true}
+		case st.EndpointOrigin == contract.EndpointOriginExplicit:
+			pol.rigs[root] = doltScopeLocal{name: rig.Name, reason: "explicit endpoint on " + st.DoltHost}
+		default:
+			pol.rigs[root] = doltScopeLocal{name: rig.Name, reason: "endpoint origin " + string(st.EndpointOrigin)}
 		}
 	}
-	return out, nil
+	return pol, nil
 }
 
 // scopeRigs returns the city (HQ) and its rigs with resolved paths. A nil
