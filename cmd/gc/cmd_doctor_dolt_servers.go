@@ -75,8 +75,13 @@ type doltServersCheck struct {
 	// Discovery's macOS ps fallback keeps only --config, so a --data-dir-only
 	// server is re-read here rather than identified by its cwd.
 	args func(pid int) (string, error)
-	// recordedPID reads the managed runtime's pid file without side effects.
-	recordedPID func(layout managedDoltRuntimeLayout) int
+	// recordedPID reads the managed runtime's pid file without side effects,
+	// with the time the file was written (zero when unknown).
+	recordedPID func(layout managedDoltRuntimeLayout) (int, time.Time)
+	// exactArgv reports whether a process's argv came from an exact source
+	// (/proc cmdline) rather than a flattened `ps` line whose values can
+	// swallow the flags after them.
+	exactArgv func(pid int) bool
 	// inheritedRigs maps the normalized root of every rig whose endpoint
 	// origin is inherited_city to its name. Such a rig should run no
 	// rig-local server at all.
@@ -110,6 +115,7 @@ func newDoltServersCheck(cityPath string, cfg *config.City) *doltServersCheck {
 		cwd:             processCWD,
 		args:            processArgs,
 		recordedPID:     readManagedDoltPIDFile,
+		exactArgv:       argvIsExact,
 		inheritedRigs:   func() (map[string]string, error) { return inheritedCityRigRoots(cityPath, cfg) },
 		activeTestRoots: func() []string { return discoverActiveTestRoots(home, temp) },
 		startIdentity:   readProcStartIdentity,
@@ -168,12 +174,16 @@ func (c *doltServersCheck) identifyUncached(p DoltProcInfo) doltServerIdentity {
 			}
 		}
 	}
-	cfg := trimFlattenedDoltArgs(extractConfigPath(p.Argv))
+	trim := func(v string) string { return v }
+	if c.exactArgv == nil || !c.exactArgv(p.PID) {
+		trim = trimFlattenedDoltArgs
+	}
+	cfg := trim(extractConfigPath(p.Argv))
 	if hasDD && dd != "" {
 		// The data dir is the store served; a --config beside it does not
 		// override that. An unanchorable relative data dir stays
 		// unidentifiable rather than falling back to the config.
-		id := c.anchored(p.PID, trimFlattenedDoltArgs(dd), "data-dir")
+		id := c.anchored(p.PID, trim(dd), "data-dir")
 		if cfg != "" {
 			id.config = c.anchored(p.PID, cfg, "config").path
 		}
@@ -335,10 +345,24 @@ func (c *doltServersCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 			"rig endpoint origins unresolvable (%v); %d single rig-local dolt server(s) not checked against rigs that inherit the city endpoint",
 			inheritedErr, inheritedUnchecked))
 	}
+	var pidNotes []string
 	if layoutErr == nil {
-		if pid := c.recordedPID(layout); pid > 0 && !doltPIDIn(pid, managed) && doltPIDIn(pid, procs) {
-			warns = append(warns, fmt.Sprintf(
-				"the runtime-recorded managed dolt pid %d does not match the managed layout; a duplicate of it would not be detected", pid))
+		if pid, written := c.recordedPID(layout); pid > 0 && !doltPIDIn(pid, managed) {
+			if p, ok := doltProcByPID(pid, procs); ok {
+				// The pid file survives crashes, and pids are reused: only a
+				// process that was already running when the file was written
+				// can be the one that wrote it.
+				started, known := c.startedAt(p)
+				switch {
+				case !known || written.IsZero():
+					pidNotes = append(pidNotes, fmt.Sprintf("runtime-recorded managed dolt pid %d is a dolt server outside the managed layout, but its start time or the pid file's age is unknown; not judged", pid))
+				case started.After(written.Add(time.Second)):
+					pidNotes = append(pidNotes, fmt.Sprintf("runtime pid file is stale: pid %d now belongs to a dolt server started after the file was written", pid))
+				default:
+					warns = append(warns, fmt.Sprintf(
+						"the runtime-recorded managed dolt pid %d does not match the managed layout; a duplicate of it would not be detected", pid))
+				}
+			}
 		}
 	}
 	for _, p := range unidentified {
@@ -370,6 +394,7 @@ func (c *doltServersCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 	if layoutErr != nil {
 		details = append(details, fmt.Sprintf("managed dolt layout unresolvable (%v); duplicate-managed analysis skipped", layoutErr))
 	}
+	details = append(details, pidNotes...)
 	details = append(details, fmt.Sprintf(
 		"%d dolt sql-server process(es) on host: %d managed, %d rig-local, %d city-stray, %d other registered city, %d active test, %d orphan test, %d foreign gc-launched, %d not gc-launched, %d unidentifiable",
 		len(procs), len(managed), rigLocalCount, len(strays), otherCity, activeTests, len(orphanTests), len(foreign), notGC, len(unidentified)+len(unanchored)))
@@ -498,12 +523,24 @@ func doltPathUnderAny(path string, scopes []resolverRig) bool {
 }
 
 func doltPIDIn(pid int, procs []DoltProcInfo) bool {
+	_, ok := doltProcByPID(pid, procs)
+	return ok
+}
+
+func doltProcByPID(pid int, procs []DoltProcInfo) (DoltProcInfo, bool) {
 	for _, p := range procs {
 		if p.PID == pid {
-			return true
+			return p, true
 		}
 	}
-	return false
+	return DoltProcInfo{}, false
+}
+
+// argvIsExact reports whether pid's argv is readable from /proc, the source
+// discovery uses when present; elsewhere argv came from a flattened ps line.
+func argvIsExact(pid int) bool {
+	_, err := os.Stat(filepath.Join("/proc", strconv.Itoa(pid), "cmdline"))
+	return err == nil
 }
 
 // registeredScopeRootsExcept lists the supervisor registry's city and rig
@@ -539,21 +576,26 @@ func processCWD(pid int) (string, bool) {
 	return processCWDFromLsof(pid)
 }
 
-// readManagedDoltPIDFile reads the managed runtime's pid file. Unlike
-// managedPIDFromPIDFile it never removes a stale file: doctor is read-only.
-func readManagedDoltPIDFile(layout managedDoltRuntimeLayout) int {
+// readManagedDoltPIDFile reads the managed runtime's pid file and when it was
+// written. Unlike managedPIDFromPIDFile it never removes a stale file: doctor
+// is read-only.
+func readManagedDoltPIDFile(layout managedDoltRuntimeLayout) (int, time.Time) {
 	if strings.TrimSpace(layout.PIDFile) == "" {
-		return 0
+		return 0, time.Time{}
 	}
 	data, err := os.ReadFile(layout.PIDFile)
 	if err != nil {
-		return 0
+		return 0, time.Time{}
 	}
 	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
 	if err != nil || pid <= 0 {
-		return 0
+		return 0, time.Time{}
 	}
-	return pid
+	var written time.Time
+	if st, err := os.Stat(layout.PIDFile); err == nil {
+		written = st.ModTime()
+	}
+	return pid, written
 }
 
 func (c *doltServersCheck) describeAll(ps []DoltProcInfo) string {
@@ -587,31 +629,57 @@ func (c *doltServersCheck) describe(p DoltProcInfo) string {
 	return b.String()
 }
 
-// trimFlattenedDoltArgs cuts a path at the first " -". On hosts without /proc
-// the --config value is recovered from a flat ps command line and can swallow
-// the flags after it (`--config x.yaml -u root -p <password>`). Cut before
-// classification, not only before display: the tail both defeats a path match
-// against the managed layout and must never reach doctor output.
+// trimFlattenedDoltArgs cuts a value recovered from a flattened ps line at the
+// first RECOGNIZED dolt sql-server flag after it (`--config x.yaml -u root -p
+// <password>`). The ps parser already cuts at " --"; the short flags are the
+// ones that survive it. A bare " -" is not a boundary: "/srv/Gas - City" is a
+// path. Cut before classification, not only before display: the tail both
+// defeats a path match against the managed layout and must never reach doctor
+// output. Values from an exact /proc argv are never passed through here.
 func trimFlattenedDoltArgs(path string) string {
-	if i := strings.Index(path, " -"); i >= 0 {
-		return path[:i]
+	for i := 0; i+1 < len(path); i++ {
+		if path[i] != ' ' || path[i+1] != '-' {
+			continue
+		}
+		tok := path[i+1:]
+		if j := strings.IndexAny(tok, " ="); j >= 0 {
+			tok = tok[:j]
+		}
+		if doltSQLServerFlags[tok] || (strings.HasPrefix(tok, "--") && len(tok) > 2) {
+			return strings.TrimRight(path[:i], " ")
+		}
 	}
 	return path
 }
 
-// age derives uptime from the ps lstart identity. Unparseable or absent -> no
-// age, never a guessed one.
-func (c *doltServersCheck) age(p DoltProcInfo) (string, bool) {
+// doltSQLServerFlags are the short flags of `dolt sql-server`; any "--word"
+// is treated as a boundary as well.
+var doltSQLServerFlags = map[string]bool{
+	"-H": true, "-P": true, "-u": true, "-p": true, "-t": true, "-r": true, "-l": true,
+}
+
+// startedAt parses the ps lstart identity. Absent or unparseable -> unknown.
+func (c *doltServersCheck) startedAt(p DoltProcInfo) (time.Time, bool) {
 	s := p.StartIdentity
 	if s == "" && c.startIdentity != nil {
 		s = c.startIdentity(p.PID)
 	}
 	s = strings.Join(strings.Fields(s), " ")
 	if s == "" {
-		return "", false
+		return time.Time{}, false
 	}
 	started, err := time.ParseInLocation("Mon Jan 2 15:04:05 2006", s, time.Local)
 	if err != nil {
+		return time.Time{}, false
+	}
+	return started, true
+}
+
+// age derives uptime from the ps lstart identity. Unparseable or absent -> no
+// age, never a guessed one.
+func (c *doltServersCheck) age(p DoltProcInfo) (string, bool) {
+	started, ok := c.startedAt(p)
+	if !ok {
 		return "", false
 	}
 	d := c.now().Sub(started)
