@@ -708,16 +708,31 @@ func TestDoltServersCheck_ConfigCopyNamingTheManagedStoreIsSplitBrain(t *testing
 
 func TestYAMLTopLevelScalar(t *testing.T) {
 	for in, want := range map[string]string{
-		"data_dir: \"/a b/c\"\n":    "/a b/c",
-		"data_dir: /plain/path\n":   "/plain/path",
-		"data_dir: '/it''s'\n":      "/it's",
-		"data_dir: /p # comment\n":  "/p",
-		"x:\n  data_dir: /nested\n": "",
-		"data_dirx: /no\n":          "",
-		"log: 1\n":                  "",
+		"data_dir: \"/a b/c\"\n":           "/a b/c",
+		"data_dir: /plain/path\n":          "/plain/path",
+		"data_dir: '/it''s'\n":             "/it's",
+		"data_dir: /p # comment\n":         "/p",
+		"data_dir: \"/q\" # managed\n":     "/q",
+		"data_dir: \"/a \\\"b\\\"\" # c\n": "/a \"b\"",
+		"data_dir: '/s' # c\n":             "/s",
+		"x:\n  data_dir: /nested\n":        "",
+		"data_dirx: /no\n":                 "",
+		"log: 1\n":                         "",
 	} {
 		if got := yamlTopLevelScalar([]byte(in), "data_dir"); got != want {
 			t.Errorf("yamlTopLevelScalar(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// Codex round 9 on #120 (b): a --self rig accounts for the server on ITS
+// store only; a server on another store under the rig is not that server.
+func TestDoltServersCheck_SelfRigServerOnAnotherStoreIsWarning(t *testing.T) {
+	stray := DoltProcInfo{PID: 520, Argv: []string{"dolt", "sql-server", "--data-dir", "/city/rigs/app/old-store"}}
+	c := doltServersFixture(t, []DoltProcInfo{gcDoltProc(100, "/city", 51361), gcDoltProc(500, "/city/rigs/app", 40000), stray}, nil, nil)
+	c.localPolicy = rigPolicy(doltScopeLocal{name: "app", expectsLocal: true})
+	r := c.Run(nil)
+	if r.Status != doctor.StatusWarning || !strings.Contains(strings.Join(r.Details, "\n"), "does not serve the rig's configured store") {
+		t.Fatalf("want a Warning naming the stray store: %v %q %v", r.Status, r.Message, r.Details)
 	}
 }
