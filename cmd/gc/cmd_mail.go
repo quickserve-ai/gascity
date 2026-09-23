@@ -1130,6 +1130,12 @@ func mailNamedSessionSquatRefusal(cityPath string, cfg *config.City, sessStore b
 		return fmt.Errorf("%w (and checking which sessions read mailbox %q failed: %w)", err, spec.Identity, scanErr)
 	}
 	if answered {
+		if answering.ID != lookup.Conflict.ID {
+			// The conflict's own advice is about the other bead; acting on it
+			// alone leaves this reader in place (ga-lm5coj).
+			return fmt.Errorf("%w; not storing: session bead %s (not %s) also answers to mailbox %q and would read it, so resolving %s alone will not unblock this send",
+				err, answering.ID, lookup.Conflict.ID, spec.Identity, lookup.Conflict.ID)
+		}
 		return fmt.Errorf("%w; not storing: session bead %s also answers to mailbox %q and would read it", err, answering.ID, spec.Identity)
 	}
 	return nil

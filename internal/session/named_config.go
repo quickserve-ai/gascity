@@ -524,25 +524,56 @@ func NamedSessionContinuityEligible(b beads.Bead) bool {
 	}
 }
 
-// BeadConflictsWithNamedSession reports whether a bead blocks a configured named session identity.
-func BeadConflictsWithNamedSession(b beads.Bead, spec NamedSessionSpec) bool {
+// NamedSessionConflictKind names the way a bead blocks a configured named
+// session. The kinds call for different remedies: only a runtime-name squat
+// is safe to close on sight, while the other two can be the seat's own live
+// work (ga-lm5coj).
+type NamedSessionConflictKind int
+
+const (
+	// NamedSessionNoConflict: the bead does not block the named session.
+	NamedSessionNoConflict NamedSessionConflictKind = iota
+	// NamedSessionConflictRuntimeName: the bead holds the named session's
+	// runtime session_name but runs a different template: a name squat.
+	NamedSessionConflictRuntimeName
+	// NamedSessionConflictAlias: the bead claims the identity as its alias
+	// without the configured identity stamp. It may be the seat's own running
+	// session that was never stamped (ga-1ycmli).
+	NamedSessionConflictAlias
+	// NamedSessionConflictAdoptablePool: an ephemeral pool-managed session of
+	// a singleton's backing template, which the reconciler adopts as the
+	// named session.
+	NamedSessionConflictAdoptablePool
+)
+
+// ClassifyNamedSessionConflict reports how a bead blocks a configured named
+// session identity, or NamedSessionNoConflict when it does not.
+func ClassifyNamedSessionConflict(b beads.Bead, spec NamedSessionSpec) NamedSessionConflictKind {
 	if IsNamedSessionBead(b) && NamedSessionIdentity(b) == spec.Identity {
-		return false
+		return NamedSessionNoConflict
 	}
 	if strings.TrimSpace(b.Metadata["session_name"]) == spec.SessionName {
-		return !NamedSessionBeadMatchesSpec(b, spec)
+		if NamedSessionBeadMatchesSpec(b, spec) {
+			return NamedSessionNoConflict
+		}
+		return NamedSessionConflictRuntimeName
 	}
 	if strings.TrimSpace(b.Metadata["alias"]) == spec.Identity {
-		return true
+		return NamedSessionConflictAlias
 	}
 	backing := NamedSessionBackingTemplate(spec)
 	if backing != "" && spec.Agent != nil && !spec.Agent.SupportsMultipleSessions() &&
 		strings.TrimSpace(b.Metadata["session_origin"]) == "ephemeral" &&
 		strings.TrimSpace(b.Metadata["pool_managed"]) == "true" &&
 		NormalizeNamedSessionTarget(b.Metadata["template"]) == backing {
-		return true
+		return NamedSessionConflictAdoptablePool
 	}
-	return false
+	return NamedSessionNoConflict
+}
+
+// BeadConflictsWithNamedSession reports whether a bead blocks a configured named session identity.
+func BeadConflictsWithNamedSession(b beads.Bead, spec NamedSessionSpec) bool {
+	return ClassifyNamedSessionConflict(b, spec) != NamedSessionNoConflict
 }
 
 // ConfiguredNamedSessionLookup is the bounded lookup result for a configured named session.
