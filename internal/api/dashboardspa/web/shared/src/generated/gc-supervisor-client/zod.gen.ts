@@ -403,6 +403,7 @@ export const zDep = z.object({
 
 export const zBead = z.object({
     assignee: z.string().optional(),
+    await_type: z.string().optional(),
     created_at: z.iso.datetime(),
     defer_until: z.iso.datetime().optional(),
     dependencies: z.array(zDep).nullish(),

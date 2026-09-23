@@ -178,7 +178,7 @@ import _ "example.com/static-scope/missing"
 		fixture.requireNoCalls(t)
 	})
 
-	t.Run("deleted nested Go file beneath ancestor embed falls back to full", func(t *testing.T) {
+	t.Run("deleted nested Go file beneath ancestor embed selects the embed owner and its package", func(t *testing.T) {
 		fixture := newPRStaticScopeFixture(t, map[string]string{
 			"alpha/alpha.go": `package alpha
 
@@ -196,10 +196,10 @@ var Data embed.FS
 
 		fixture.resetCalls(t)
 		if output, err := fixture.runMakeTarget("lint-affected"); err != nil {
-			t.Errorf("lint-affected did not fail closed for a deleted nested embedded Go file: %v\n%s", err, output)
+			t.Errorf("lint-affected failed for a deleted nested embedded Go file: %v\n%s", err, output)
 		}
-		fixture.requireCalls(t, []string{"run", "./..."})
-		fixture.requireGoCalls(t, []string{"vet", "./..."})
+		fixture.requireSingleRunCallWithUnorderedTail(t, "./alpha", "./alpha/child")
+		fixture.requireGoCalls(t, []string{"vet", "./alpha", "./alpha/child"})
 	})
 
 	t.Run("cross-package rename with a spaced file name", func(t *testing.T) {
@@ -545,7 +545,7 @@ var Data string
 		fixture.requireGoCalls(t, []string{"vet", "./..."})
 	})
 
-	t.Run("deleted embedded glob member falls back to full", func(t *testing.T) {
+	t.Run("deleted embedded glob member with a surviving sibling selects its owner", func(t *testing.T) {
 		fixture := newPRStaticScopeFixture(t, map[string]string{
 			"alpha/alpha.go": `package alpha
 
@@ -563,13 +563,13 @@ var Data embed.FS
 
 		fixture.resetCalls(t)
 		if output, err := fixture.runMakeTarget("lint-affected"); err != nil {
-			t.Errorf("lint-affected did not fail closed for a deleted embed glob member: %v\n%s", err, output)
+			t.Errorf("lint-affected failed for a deleted embed glob member: %v\n%s", err, output)
 		}
-		fixture.requireCalls(t, []string{"run", "./..."})
-		fixture.requireGoCalls(t, []string{"vet", "./..."})
+		fixture.requireCalls(t, []string{"run", "./alpha"})
+		fixture.requireGoCalls(t, []string{"vet", "./alpha"})
 	})
 
-	t.Run("deleted recognized embedded glob member falls back before native shortcut", func(t *testing.T) {
+	t.Run("deleted recognized embedded glob member keeps its owner through the native shortcut", func(t *testing.T) {
 		fixture := newPRStaticScopeFixture(t, map[string]string{
 			"alpha/alpha.go": `package alpha
 
@@ -595,10 +595,10 @@ var Data = alpha.Data
 
 		fixture.resetCalls(t)
 		if output, err := fixture.runMakeTarget("lint-affected"); err != nil {
-			t.Errorf("lint-affected did not fail closed before the native shortcut: %v\n%s", err, output)
+			t.Errorf("lint-affected lost the embed owner to the native shortcut: %v\n%s", err, output)
 		}
-		fixture.requireCalls(t, []string{"run", "./..."})
-		fixture.requireGoCalls(t, []string{"vet", "./..."})
+		fixture.requireSingleRunCallWithUnorderedTail(t, "./alpha", "./consumer", "./native")
+		fixture.requireGoCalls(t, []string{"vet", "./alpha", "./consumer", "./native"})
 	})
 
 	t.Run("changed Go symlink is not formatted", func(t *testing.T) {
