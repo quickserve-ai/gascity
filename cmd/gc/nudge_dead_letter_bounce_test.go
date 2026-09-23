@@ -371,8 +371,17 @@ func TestNudgeDeadLetterBounceDefaultSendsPlainMailWithoutSessions(t *testing.T)
 
 	item := newBounceTestNudge("n-real", "mayor", "deacon", "session", now)
 	enqueueNearlyExhausted(t, dir, store, item)
+	// #146 review round 2: this is the one test that runs the REAL opener,
+	// so it is where a hidden full config load shows. The bounce loads
+	// config once, non-blocking, and the store open must reuse it; a nil
+	// config there reloads everything, builtin-pack refresh and a blocking
+	// repo-cache wait included, on the controller's dispatch tick.
+	loadsBefore := loadCityConfigCalls.Load()
 	if _, err := recordQueuedNudgeFailureDetailed(dir, store, []string{item.ID}, errors.New("unresolved target"), now); err != nil {
 		t.Fatalf("recordQueuedNudgeFailureDetailed: %v", err)
+	}
+	if grew := loadCityConfigCalls.Load() - loadsBefore; grew != 0 {
+		t.Fatalf("the dead-letter operation ran %d full city config load(s), want 0", grew)
 	}
 
 	cityStore, err := openStoreAtForCity(dir, dir)
