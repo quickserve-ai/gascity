@@ -473,14 +473,12 @@ func TestDoltServersCheck_SingletonOnInheritedRigStoreIsError(t *testing.T) {
 		}
 		return "", false
 	}
-	c.inheritedRigs = func() (map[string]string, error) {
-		return map[string]string{"/city/rigs/app": "app"}, nil
-	}
+	c.localPolicy = rigPolicy(doltScopeLocal{name: "app", reason: "endpoint origin inherited_city"})
 	r := c.Run(nil)
 	if r.Status != doctor.StatusError {
 		t.Fatalf("status = %v, want Error: %q %v", r.Status, r.Message, r.Details)
 	}
-	if !strings.Contains(r.Message, `rig "app" inherits`) {
+	if !strings.Contains(r.Message, `rig "app" runs no local dolt server (endpoint origin inherited_city)`) {
 		t.Fatalf("message must name the inherited rig: %q", r.Message)
 	}
 }
@@ -490,9 +488,7 @@ func TestDoltServersCheck_SingletonElsewhereUnderInheritedRigIsWarning(t *testin
 		gcDoltProc(100, "/city", 51361),
 		{PID: 503, Argv: []string{"dolt", "sql-server", "--data-dir", "/city/rigs/app/scratch/db"}},
 	}, nil, nil)
-	c.inheritedRigs = func() (map[string]string, error) {
-		return map[string]string{"/city/rigs/app": "app"}, nil
-	}
+	c.localPolicy = rigPolicy(doltScopeLocal{name: "app", reason: "endpoint origin inherited_city"})
 	if r := c.Run(nil); r.Status != doctor.StatusWarning {
 		t.Fatalf("status = %v, want Warning: %q %v", r.Status, r.Message, r.Details)
 	}
@@ -501,7 +497,7 @@ func TestDoltServersCheck_SingletonElsewhereUnderInheritedRigIsWarning(t *testin
 // The control: the same singleton on an EXPLICIT rig is that rig's own server.
 func TestDoltServersCheck_SingletonOnExplicitRigIsOK(t *testing.T) {
 	c := doltServersFixture(t, []DoltProcInfo{gcDoltProc(100, "/city", 51361), gcDoltProc(500, "/city/rigs/app", 40000)}, nil, nil)
-	c.inheritedRigs = func() (map[string]string, error) { return map[string]string{}, nil }
+	c.localPolicy = rigPolicy(doltScopeLocal{name: "app", expectsLocal: true})
 	if r := c.Run(nil); r.Status != doctor.StatusOK {
 		t.Fatalf("status = %v, want OK: %q %v", r.Status, r.Message, r.Details)
 	}
@@ -509,7 +505,7 @@ func TestDoltServersCheck_SingletonOnExplicitRigIsOK(t *testing.T) {
 
 func TestDoltServersCheck_UnresolvableEndpointOriginIsWarningNotOK(t *testing.T) {
 	c := doltServersFixture(t, []DoltProcInfo{gcDoltProc(100, "/city", 51361), gcDoltProc(500, "/city/rigs/app", 40000)}, nil, nil)
-	c.inheritedRigs = func() (map[string]string, error) { return nil, errors.New("bad config.yaml") }
+	c.localPolicy = func() (doltLocalPolicy, error) { return doltLocalPolicy{}, errors.New("bad config.yaml") }
 	r := c.Run(nil)
 	if r.Status != doctor.StatusWarning {
 		t.Fatalf("status = %v, want Warning: %q %v", r.Status, r.Message, r.Details)
@@ -624,5 +620,54 @@ func TestDoltServersCheck_DataDirTakesPrecedenceOverManagedConfig(t *testing.T) 
 	}
 	if !strings.Contains(r.Message, "1 managed, 1 rig-local") {
 		t.Fatalf("the data dir must decide the store: %q", r.Message)
+	}
+}
+
+// rigPolicy is a local-server policy where the city runs its managed server
+// and the fixture's one rig (/city/rigs/app) has the given expectation.
+func rigPolicy(app doltScopeLocal) func() (doltLocalPolicy, error) {
+	return func() (doltLocalPolicy, error) {
+		return doltLocalPolicy{
+			city: doltScopeLocal{name: "city", expectsLocal: true},
+			rigs: map[string]doltScopeLocal{"/city/rigs/app": app},
+		}, nil
+	}
+}
+
+// Codex round 6 on #120 (a): a city on an external canonical endpoint runs no
+// local server, so a lone server on its managed layout is not "the managed
+// server" — it is unaccounted for.
+func TestDoltServersCheck_ManagedServerOnNonManagedCityIsWarning(t *testing.T) {
+	c := doltServersFixture(t, []DoltProcInfo{gcDoltProc(100, "/city", 51361)}, nil, nil)
+	c.localPolicy = func() (doltLocalPolicy, error) {
+		return doltLocalPolicy{city: doltScopeLocal{name: "city", reason: "city endpoint origin city_canonical"}}, nil
+	}
+	r := c.Run(nil)
+	if r.Status != doctor.StatusWarning {
+		t.Fatalf("status = %v, want Warning: %q %v", r.Status, r.Message, r.Details)
+	}
+	if !strings.Contains(strings.Join(r.Details, "\n"), "city_canonical") {
+		t.Fatalf("the warning must say why no local server is expected: %v", r.Details)
+	}
+}
+
+// Codex round 6 on #120 (b): an explicitly EXTERNAL rig (or a file-backed
+// one) runs no local server either; a lone server on its store is the orphan.
+func TestDoltServersCheck_SingletonOnExplicitExternalRigIsError(t *testing.T) {
+	c := doltServersFixture(t, []DoltProcInfo{gcDoltProc(100, "/city", 51361), gcDoltProc(500, "/city/rigs/app", 40000)}, nil, nil)
+	c.localPolicy = rigPolicy(doltScopeLocal{name: "app", reason: "explicit endpoint on hub.example"})
+	r := c.Run(nil)
+	if r.Status != doctor.StatusError || !strings.Contains(r.Message, "explicit endpoint on hub.example") {
+		t.Fatalf("status = %v, want Error naming the external endpoint: %q %v", r.Status, r.Message, r.Details)
+	}
+}
+
+// Control for both: the managed city with its one managed server, and a
+// --self rig with its one server, stay OK.
+func TestDoltServersCheck_ExpectedLocalServersStayOK(t *testing.T) {
+	c := doltServersFixture(t, []DoltProcInfo{gcDoltProc(100, "/city", 51361), gcDoltProc(500, "/city/rigs/app", 40000)}, nil, nil)
+	c.localPolicy = rigPolicy(doltScopeLocal{name: "app", expectsLocal: true})
+	if r := c.Run(nil); r.Status != doctor.StatusOK {
+		t.Fatalf("status = %v, want OK: %q %v", r.Status, r.Message, r.Details)
 	}
 }
