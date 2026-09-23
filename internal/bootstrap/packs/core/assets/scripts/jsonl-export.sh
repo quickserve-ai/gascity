@@ -756,10 +756,10 @@ $repack_err"
 record_archive_repack_success() {
     local state_json
     state_json=$(read_state_json)
-    if [ "$(printf '%s\n' "$state_json" | jq -r '(.consecutive_repack_failures // 0) > 0 or has("last_repack_stderr") or has("repack_failure_escalated")')" != "true" ]; then
+    if [ "$(printf '%s\n' "$state_json" | jq -r '(.consecutive_repack_failures // 0) > 0 or has("last_repack_stderr") or has("repack_failure_escalated") or has("last_repack_escalation_error")')" != "true" ]; then
         return 0
     fi
-    write_state_json "$(printf '%s\n' "$state_json" | jq -c 'del(.consecutive_repack_failures) | del(.last_repack_stderr) | del(.repack_failure_escalated)')"
+    write_state_json "$(printf '%s\n' "$state_json" | jq -c 'del(.consecutive_repack_failures) | del(.last_repack_stderr) | del(.repack_failure_escalated) | del(.last_repack_escalation_error)')"
 }
 
 # Count a failed repack and escalate once per failure streak when the count
@@ -810,11 +810,22 @@ Remediation:
 - Temporarily suppress: export GC_JSONL_MAX_REPACK_FAILURES=99
 ESCALATION
 )
-    if "$ESCALATE_SCRIPT" \
+    # A failed delivery must be distinguishable from the repack failure it
+    # reports: log it like the spike-alert path does, and keep it in state
+    # (order stderr is persisted nowhere). The marker stays unset, so the next
+    # failing commit retries the escalation.
+    local escalate_err
+    if escalate_err=$("$ESCALATE_SCRIPT" \
         --subject "ESCALATION: JSONL archive repack failing [HIGH]" \
-        --message "$body" \
-        2>/dev/null; then
-        write_state_json "$(read_state_json | jq -c '.repack_failure_escalated = true')"
+        --message "$body" 2>&1 >/dev/null); then
+        write_state_json "$(read_state_json | jq -c '.repack_failure_escalated = true | del(.last_repack_escalation_error)')"
+    else
+        echo "jsonl-export: repack failure escalation delivery failed (retrying on the next failing commit)" >&2
+        write_state_json "$(
+            read_state_json \
+                | jq -c --arg err "$(truncate_push_stderr_for_state "${escalate_err:-(no stderr)}")" \
+                    '.last_repack_escalation_error = $err'
+        )"
     fi
     return 0
 }

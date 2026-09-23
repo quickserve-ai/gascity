@@ -8986,6 +8986,54 @@ exec '%s' "$@"
 	}
 }
 
+// A failed escalation DELIVERY must be distinguishable from the repack failure
+// it reports: it is kept in state, and the escalated marker stays unset so the
+// next failing commit retries the delivery.
+func TestJsonlExportRepackEscalationDeliveryFailureIsRecorded(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+	mailLog := filepath.Join(t.TempDir(), "gc-mail.log")
+	archiveRepo := filepath.Join(cityDir, "archive")
+	stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("LookPath(git): %v", err)
+	}
+	writeGitSubcommandFailureStub(t, binDir, realGit, "gc")
+	writeJsonlExportGCStubWithMailExitCode(t, binDir, 1)
+	writeMultiRecordDoltStub(t, binDir, 3)
+
+	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
+	env["GC_JSONL_MAX_REPACK_FAILURES"] = "1"
+
+	runScript(t, coreScriptPath("jsonl-export.sh"), env)
+
+	data, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("ReadFile(state file): %v", err)
+	}
+	var state map[string]any
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("Unmarshal(state file): %v\n%s", err, data)
+	}
+	if _, ok := state["last_repack_escalation_error"]; !ok {
+		t.Fatalf("a failed escalation delivery must be kept in state\nstate: %s", data)
+	}
+	if got, ok := state["repack_failure_escalated"]; ok {
+		t.Fatalf("repack_failure_escalated = %v after a FAILED delivery; it must stay unset so the next failure retries\nstate: %s", got, data)
+	}
+	mailData, err := os.ReadFile(mailLog)
+	if err != nil {
+		t.Fatalf("ReadFile(mail log): %v", err)
+	}
+	if !strings.Contains(string(mailData), "ESCALATION: JSONL archive repack failing") {
+		t.Fatalf("the escalation must have been attempted; mail log:\n%s", mailData)
+	}
+}
+
 // The post-condition read must not be able to end the export: under
 // set -euo pipefail an unguarded failing `git count-objects` would exit
 // before the failure is recorded and before the snapshot is marked for push.
