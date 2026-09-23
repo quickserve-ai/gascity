@@ -1049,13 +1049,49 @@ func TestResolveSessionIDWithConfig_ConflictAdviceFollowsTheConflictShape(t *tes
 				t.Fatalf("err = %v, want errNamedSessionConflict", err)
 			}
 			msg := err.Error()
-			if got := strings.Contains(msg, "gc session close "+b.ID); got != tc.wantClose {
-				t.Fatalf("recommends close = %v, want %v: %q", got, tc.wantClose, msg)
+			if got := strings.Contains(msg, "a name squat"); got != tc.wantClose {
+				t.Fatalf("calls it a squat = %v, want %v: %q", got, tc.wantClose, msg)
+			}
+			// Every kind but the adoptable pool session names the remedy, at
+			// least conditionally, so no conflict leaves the seat with no way
+			// out (the ga-lm5coj deadlock).
+			if got, want := strings.Contains(msg, "gc session close "+b.ID), tc.want != "reconciler adopts"; got != want {
+				t.Fatalf("names the close remedy = %v, want %v: %q", got, want, msg)
 			}
 			if !strings.Contains(msg, tc.want) || !strings.Contains(msg, "state=") || !strings.Contains(msg, "pool_managed=") {
 				t.Fatalf("err = %q, want %q and the bead's state/template/pool_managed", msg, tc.want)
 			}
 		})
+	}
+}
+
+func TestResolveSessionIDWithConfig_ConflictUnderALegacyTemplateSpellingIsNotASquat(t *testing.T) {
+	// #127 review round 2: the runtime treats a pre-binding template spelling
+	// ("qcore/archer") as the bound agent ("qcore/cherub-law.archer"), so a
+	// seat's own unstamped bead carrying it must not be called a squat. The
+	// same holds for a bead whose agent_name is the seat's identity.
+	cityPath := filepath.Join(t.TempDir(), "city")
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Agents:        []config.Agent{{Name: "archer", Dir: "qcore", BindingName: "cherub-law", StartCommand: "true", MaxActiveSessions: intPtr(1)}},
+		NamedSessions: []config.NamedSession{{Name: "archer", Template: "cherub-law.archer", Dir: "qcore"}},
+	}
+	for _, md := range []map[string]string{
+		{"session_name": "s-legacy", "alias": "qcore/archer", "template": "qcore/archer", "state": "active"},
+		{"session_name": "s-named", "alias": "qcore/archer", "template": "qcore/drifted", "agent_name": "qcore/archer", "state": "active"},
+	} {
+		store := beads.NewMemStore()
+		b, err := store.Create(beads.Bead{Type: session.BeadType, Labels: []string{session.LabelSession}, Metadata: md})
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		_, err = resolveSessionIDWithConfig(cityPath, cfg, store, "qcore/archer")
+		if !errors.Is(err, errNamedSessionConflict) {
+			t.Fatalf("%v: err = %v, want errNamedSessionConflict", md, err)
+		}
+		if strings.Contains(err.Error(), "a name squat") || !strings.Contains(err.Error(), "gc session show "+b.ID) {
+			t.Fatalf("%v: err = %q, want the check-first advice, not a squat", md, err)
+		}
 	}
 }
 
