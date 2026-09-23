@@ -12,6 +12,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/doctor"
 	"github.com/gastownhall/gascity/internal/fsys"
+	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/suspensionstate"
 )
 
@@ -209,12 +210,20 @@ func (c *poolIdleRoutedWorkCheck) poolTemplateRigs() map[string]string {
 
 // collectIdleInstances enumerates one store's sessions in a single list and
 // records, per pool template, every live instance that holds no trigger bead.
+//
+// The list excludes closed sessions in the query. session.Store.List loads
+// every session bead, closed ones included, and filters in memory; over a
+// store holding every session that ever ran, that cost abandoned the check at
+// a 5-minute budget under load (ga-4mu4k5).
 func (c *poolIdleRoutedWorkCheck) collectIdleInstances(store beads.Store, pools map[string]string, idle map[string]map[string]bool) error {
-	sessions, err := cliSessionFrontDoor(store, c.cfg, c.cityPath).List("", "")
+	sessions, err := cliSessionFrontDoor(store, c.cfg, c.cityPath).ListAll(sessionpkg.ListAllOptions{})
 	if err != nil {
 		return fmt.Errorf("listing sessions: %w", err)
 	}
 	for _, info := range sessions {
+		if info.Closed {
+			continue
+		}
 		if _, ok := pools[info.Template]; !ok {
 			continue
 		}

@@ -315,7 +315,7 @@ func TestClassifyOrderOutcomeNoOutcomesYet(t *testing.T) {
 	if status != StatusOK {
 		t.Fatalf("status = %v, want StatusOK — order-firing-current owns the never-fired case", status)
 	}
-	if !strings.Contains(detail, "no completed runs yet") {
+	if !strings.Contains(detail, "no completed runs in the lookback window") {
 		t.Fatalf("detail = %q, want it to distinguish never-ran from succeeded", detail)
 	}
 }
@@ -442,7 +442,9 @@ func TestOrderOutcomeHealthy_FlagsRigScopedOrderFailureStreak(t *testing.T) {
 		events.Event{Type: events.OrderFailed, Ts: now.Add(-6 * time.Hour), Subject: scopedSubject, Message: "exit status 128"},
 	)
 
-	result := NewOrderOutcomeHealthyCheck(cfg, cityPath).Run(&CheckContext{CityPath: cityPath})
+	check := NewOrderOutcomeHealthyCheck(cfg, cityPath)
+	check.now = func() time.Time { return now }
+	result := check.Run(&CheckContext{CityPath: cityPath})
 
 	if result.Status != StatusWarning {
 		t.Fatalf("status = %v, want StatusWarning; msg=%s details=%v", result.Status, result.Message, result.Details)
@@ -515,4 +517,55 @@ func orderOutcomeTestDetailNames(details []string) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// ga-4mu4k5: the check reads only the window its orders need, so it finishes
+// under load instead of gunzipping every retained archive.
+func TestOrderOutcomeLookback(t *testing.T) {
+	grace := 10 * time.Minute
+	sixHourly := orders.Order{Name: "a", Trigger: "cooldown", Interval: "6h"}
+	fiveMin := orders.Order{Name: "b", Trigger: "cooldown", Interval: "5m"}
+	weekly := orders.Order{Name: "c", Trigger: "cooldown", Interval: "168h"}
+	broken := orders.Order{Name: "d", Trigger: "cooldown", Interval: "nonsense"}
+
+	for _, tc := range []struct {
+		name string
+		in   []orders.Order
+		want time.Duration
+	}{
+		{"longest order sets the window", []orders.Order{fiveMin, sixHourly}, 4*6*time.Hour + grace},
+		{"fast orders only", []orders.Order{fiveMin}, 4*5*time.Minute + grace},
+		{"a slow order is capped", []orders.Order{fiveMin, weekly}, orderOutcomeLookbackCap},
+		{"an unparseable interval reads the cap", []orders.Order{fiveMin, broken}, orderOutcomeLookbackCap},
+	} {
+		if got := orderOutcomeLookback(tc.in, 3, grace); got != tc.want {
+			t.Errorf("%s: lookback = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestOrderOutcomeHealthy_IgnoresOutcomesOlderThanTheLookback(t *testing.T) {
+	now := time.Date(2026, 8, 4, 12, 0, 0, 0, time.UTC)
+	cityPath, cfg := orderFiringTestCity(t)
+	writeOrderFiringTestOrderInDir(t, filepath.Join(cityPath, "orders"), "hourly", "cooldown", "1h")
+
+	// Window for a 1h order: 4h + grace. Three failures well before it, none since.
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.OrderFailed, Ts: now.Add(-30 * time.Hour), Subject: "hourly", Message: "boom"},
+		events.Event{Type: events.OrderFailed, Ts: now.Add(-29 * time.Hour), Subject: "hourly", Message: "boom"},
+		events.Event{Type: events.OrderFailed, Ts: now.Add(-28 * time.Hour), Subject: "hourly", Message: "boom"},
+	)
+	check := NewOrderOutcomeHealthyCheck(cfg, cityPath)
+	check.now = func() time.Time { return now }
+	result := check.Run(&CheckContext{CityPath: cityPath})
+	if result.Status != StatusOK || !strings.Contains(strings.Join(result.Details, "\n"), "no completed runs in the lookback window") {
+		t.Fatalf("stale streak outside the window must not be read: %v %q %v", result.Status, result.Message, result.Details)
+	}
+
+	// Control: the same streak inside the window is flagged.
+	check.now = func() time.Time { return now.Add(-26 * time.Hour) }
+	result = check.Run(&CheckContext{CityPath: cityPath})
+	if result.Status != StatusWarning {
+		t.Fatalf("control: a streak inside the window must be flagged: %v %q %v", result.Status, result.Message, result.Details)
+	}
 }
