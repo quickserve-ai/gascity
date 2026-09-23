@@ -8986,6 +8986,54 @@ exec '%s' "$@"
 	}
 }
 
+// The post-condition read must not be able to end the export: under
+// set -euo pipefail an unguarded failing `git count-objects` would exit
+// before the failure is recorded and before the snapshot is marked for push.
+func TestJsonlExportCountObjectsFailureIsRecordedNotFatal(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+	mailLog := filepath.Join(t.TempDir(), "gc-mail.log")
+	archiveRepo := filepath.Join(cityDir, "archive")
+	stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("LookPath(git): %v", err)
+	}
+	writeGitSubcommandFailureStub(t, binDir, realGit, "count-objects")
+	writeJsonlExportGCStub(t, binDir)
+	writeMultiRecordDoltStub(t, binDir, 3)
+
+	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
+
+	// runScript fails the test on a non-zero exit: the export must complete.
+	runScript(t, coreScriptPath("jsonl-export.sh"), env)
+
+	data, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("ReadFile(state file): %v", err)
+	}
+	var state map[string]any
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("Unmarshal(state file): %v\n%s", err, data)
+	}
+	if got := state["consecutive_repack_failures"]; got != float64(1) {
+		t.Fatalf("consecutive_repack_failures = %v, want 1: an unreadable loose count is a failure\nstate: %s", got, data)
+	}
+	if got, _ := state["last_repack_stderr"].(string); !strings.Contains(got, "count-objects failed") {
+		t.Fatalf("last_repack_stderr = %q, want the count-objects failure", got)
+	}
+	gcData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	if !strings.Contains(string(gcData), "MAINTENANCE_DONE: jsonl") {
+		t.Fatalf("the export must reach its summary after a count-objects failure; gc log:\n%s", gcData)
+	}
+}
+
 func TestJsonlExportSkipsSpikeCheckBelowMinPrev(t *testing.T) {
 	// Bug 2 (#1547): percent-delta with no absolute floor escalates on tiny
 	// counts. prev=2, current=1 → 50% delta would cross the 20% threshold.

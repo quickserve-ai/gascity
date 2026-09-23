@@ -719,17 +719,29 @@ commit_archive_snapshot() {
     # too: after gc, loose objects must be at or below REPACK_LOOSE_CEILING
     # (default twice the gc.auto trigger, so a correctly skipped gc below the
     # trigger never counts as a failure).
+    # Every read below is guarded: under set -euo pipefail an unguarded
+    # failing substitution would end the whole export here, before the
+    # failure is recorded and before the snapshot is marked for push.
     local repack_err
     local repack_rc=0
+    local count_out
     local loose
+    local git_dir
     local gc_log
     repack_err=$(git -c gc.auto=256 -c gc.autoDetach=false gc --auto --quiet 2>&1 >/dev/null) || repack_rc=$?
-    loose=$(git count-objects -v 2>/dev/null | awk '/^count:/ {print $2}')
+    count_out=$(git count-objects -v 2>&1) || count_out="count-objects failed: $count_out"
+    loose=$(printf '%s\n' "$count_out" | awk '/^count:/ {print $2}')
+    case "$loose" in ''|*[!0-9]*) loose="" ;; esac
     if [ "$repack_rc" -eq 0 ] && [ -n "$loose" ] && [ "$loose" -le "$REPACK_LOOSE_CEILING" ]; then
         record_archive_repack_success
         return 0
     fi
-    gc_log="$(git rev-parse --git-dir 2>/dev/null)/gc.log"
+    if [ -z "$loose" ]; then
+        repack_err="$repack_err
+$count_out"
+    fi
+    git_dir=$(git rev-parse --git-dir 2>/dev/null) || git_dir=".git"
+    gc_log="$git_dir/gc.log"
     if [ -f "$gc_log" ]; then
         repack_err="$repack_err
 .git/gc.log: $(head -c 400 "$gc_log")"
