@@ -9029,11 +9029,8 @@ exec '%s' "$@"
 	if strings.Contains(string(data), "consecutive_repack_failures") {
 		t.Fatalf("a skipped gc --auto followed by a successful explicit repack must not count as a failure\nstate: %s", data)
 	}
-	out, err := exec.Command(realGit, "-C", archiveRepo, "count-objects", "-v").CombinedOutput()
-	if err != nil {
-		t.Fatalf("git count-objects: %v\n%s", err, out)
-	}
-	if !strings.Contains(string(out), "count: 0\n") {
+	out := runGitOut(t, archiveRepo, "count-objects", "-v")
+	if !strings.Contains("\n"+out+"\n", "\ncount: 0\n") {
 		t.Fatalf("the explicit repack must pack the loose objects; count-objects:\n%s", out)
 	}
 }
