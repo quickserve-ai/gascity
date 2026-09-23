@@ -43,8 +43,9 @@ import (
 // the floor here must always assume the DEFAULT.
 const leaseHeartbeatThrottle = 90 * time.Second
 
-// leaseHeartbeatSpawn forks the detached heartbeat; platform-specific
-// (spawn requires setsid), overridable in tests.
+// leaseHeartbeatSpawn forks the detached heartbeat and reports whether the
+// child STARTED; platform-specific (spawn requires setsid), overridable in
+// tests.
 var leaseHeartbeatSpawn = spawnDetachedLeaseHeartbeat
 
 // maybeSpawnLeaseHeartbeat is the whole tick: gated on the city-level
@@ -65,16 +66,36 @@ func maybeSpawnLeaseHeartbeat(cityPath string, cfg *config.City) {
 		return
 	}
 	stamp := filepath.Join(dir, leaseHeartbeatStampName(sessionID))
-	if fi, err := os.Stat(stamp); err == nil && time.Since(fi.ModTime()) < leaseHeartbeatThrottle {
+	if leaseHeartbeatThrottled(stamp, time.Now()) {
 		return
 	}
-	// Stamp BEFORE spawning: a racing pair of turns costs one duplicate
-	// heartbeat, while stamping only after a successful spawn would let a
-	// persistently failing spawn retry every turn at full frequency.
-	if err := os.WriteFile(stamp, []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o644); err != nil {
+	if !leaseHeartbeatSpawn(filepath.Join(dir, "heartbeat.log")) {
+		// No stamp on a failed spawn: the next turn retries. A persistently
+		// failing spawn therefore retries every turn, which is the loud
+		// outcome — each attempt lands a line in the log.
 		return
 	}
-	leaseHeartbeatSpawn(filepath.Join(dir, "heartbeat.log"))
+	// Stamp AFTER a successful spawn (codex round-7 P1): stamping first left a
+	// throttle window behind a child that never started.
+	_ = os.WriteFile(stamp, []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o644)
+}
+
+// leaseHeartbeatThrottled reports whether the stamp says a heartbeat was
+// spawned less than leaseHeartbeatThrottle ago. The stamp is a CADENCE HINT,
+// never a liveness claim (AGENTS.md: no status files — this file tracks no
+// process and nothing reads it as "running"), and every way it can be wrong
+// fails OPEN toward spawning: missing or unreadable -> spawn; mtime in the
+// future (host clock stepped back, a city restored from a newer snapshot) ->
+// spawn, because time.Since would otherwise read negative and suppress the
+// refresher until wall time caught up while the session's leases expired.
+// The only state it can ever suppress is one extra spawn inside the window.
+func leaseHeartbeatThrottled(stamp string, now time.Time) bool {
+	fi, err := os.Stat(stamp)
+	if err != nil {
+		return false
+	}
+	since := now.Sub(fi.ModTime())
+	return since >= 0 && since < leaseHeartbeatThrottle
 }
 
 // leaseHeartbeatStampName maps a session id to a safe stamp filename.
