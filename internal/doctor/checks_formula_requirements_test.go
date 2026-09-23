@@ -541,7 +541,7 @@ func TestFormulaRequirementsCheckEvaluatesTheDiscoveredFileByResolverKey(t *test
 	wantComposedDisable := func(t *testing.T, r *CheckResult, dir string) {
 		t.Helper()
 		file := filepath.Join(dir, "mol-file.toml")
-		want := fmt.Sprintf("intentionally disabled city formula %q (%s), by a composed requirement: needs v2 through its expansion", "mol-field", file)
+		want := fmt.Sprintf("intentionally disabled city formula %q (%s), by a composed requirement: needs v2 through its expansion (disabled_reason declared on %q in %s)", "mol-field", file, "mol-file", file)
 		var about []string
 		for _, d := range r.Details {
 			if strings.Contains(d, "("+file+")") {
@@ -578,6 +578,56 @@ func TestFormulaRequirementsCheckEvaluatesTheDiscoveredFileByResolverKey(t *test
 		if r.Status != StatusError || strings.Contains(joined, "intentionally disabled city formula \"multi-child\"") ||
 			!strings.Contains(joined, "error city formula \"multi-child\"") {
 			t.Fatalf("p-unmarked's unmarked requirement must keep multi-child an error: %v %q %v", r.Status, r.Message, r.Details)
+		}
+	})
+}
+
+// Codex r7 (#134): an inherited disabled_reason must not excuse a COMPOSED
+// requirement. The parent's own requirement is satisfiable, so its marker is
+// stale; the child adds an unmarked expansion this host cannot compile. Only a
+// reason on the composing formula's own file may excuse that mismatch.
+func TestFormulaRequirementsCheckComposedRequirementNeedsTheComposersOwnReason(t *testing.T) {
+	const staleParent = "\nformula = \"stale-parent\"\n\n[requires]\nformula_compiler = \">=1.0.0\"\ndisabled_reason = \"stale\"\n\n[[steps]]\nid = \"work\"\ntitle = \"Work\"\n"
+	const unmarkedExpansion = "\nformula = \"never-expansion\"\ntype = \"expansion\"\n\n[requires]\nformula_compiler = \">=999.0.0\"\n\n[[template]]\nid = \"{target}.child\"\ntitle = \"Child\"\n"
+	const compose = "\n[compose]\n[[compose.expand]]\ntarget = \"work\"\nwith = \"never-expansion\"\n"
+	run := func(t *testing.T, child string) (*CheckResult, string) {
+		t.Helper()
+		dir := t.TempDir()
+		writeDoctorFormula(t, dir, "stale-parent", staleParent)
+		writeDoctorFormula(t, dir, "never-expansion", unmarkedExpansion)
+		writeDoctorFormula(t, dir, "composed-child", child)
+		r := NewFormulaRequirementsCheck(&config.City{
+			Daemon:        config.DaemonConfig{FormulaV2: boolPtr(true)},
+			FormulaLayers: config.FormulaLayers{City: []string{dir}},
+		}, t.TempDir()).Run(&CheckContext{})
+		return r, filepath.Join(dir, "composed-child.toml")
+	}
+	about := func(r *CheckResult, file string) []string {
+		var lines []string
+		for _, d := range r.Details {
+			if strings.Contains(d, "("+file+")") {
+				lines = append(lines, d)
+			}
+		}
+		return lines
+	}
+
+	t.Run("an inherited stale reason leaves the composed mismatch an error", func(t *testing.T) {
+		r, file := run(t, "\nformula = \"composed-child\"\nextends = [\"stale-parent\"]\n"+compose)
+		lines := about(r, file)
+		if r.Status != StatusError || len(lines) != 1 ||
+			!strings.HasPrefix(lines[0], "error city formula \"composed-child\"") ||
+			!strings.Contains(lines[0], "compiler_requirement_unsatisfied") ||
+			!strings.Contains(lines[0], "declare disabled_reason on the formula that composes it") {
+			t.Fatalf("stale-parent's inherited reason must not excuse composed-child's composed requirement: %v %q\nabout composed-child: %q", r.Status, r.Message, lines)
+		}
+	})
+
+	t.Run("the composing formula's own reason disables it", func(t *testing.T) {
+		r, file := run(t, "\nformula = \"composed-child\"\nextends = [\"stale-parent\"]\n\n[requires]\nformula_compiler = \">=1.0.0\"\ndisabled_reason = \"parked through never-expansion\"\n"+compose)
+		want := fmt.Sprintf("intentionally disabled city formula %q (%s), by a composed requirement: parked through never-expansion (disabled_reason declared on %q in %s)", "composed-child", file, "composed-child", file)
+		if lines := about(r, file); !slices.Equal(lines, []string{want}) {
+			t.Fatalf("composed-child's own reason must cover its composed requirement:\nwant only %q\ngot %q", want, lines)
 		}
 	})
 }
