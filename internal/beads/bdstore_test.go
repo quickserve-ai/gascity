@@ -5500,3 +5500,48 @@ func TestBdStoreReleaseIfCurrentEmbeddedLegacyQueryWritesUTC(t *testing.T) {
 		t.Fatalf("embedded legacy SQL = %q, want %q", doltQueries[1], wantLegacy)
 	}
 }
+
+// TestBdStoreHeartbeatInvokesBdHeartbeat pins the ga-56nq1a stage-1 wiring:
+// Heartbeat must delegate lease refresh entirely to bd's own verb — exactly
+// `bd heartbeat <id> --json`, no TTL or staleness judgment of its own — the
+// same no-judgment contract ReclaimStale carries (ga-7rj87d NFR3).
+func TestBdStoreHeartbeatInvokesBdHeartbeat(t *testing.T) {
+	var gotArgs []string
+	runner := func(_, name string, args ...string) ([]byte, error) {
+		if name != "bd" {
+			t.Fatalf("name = %q, want bd", name)
+		}
+		gotArgs = append([]string(nil), args...)
+		return []byte(`{"id":"bd-42","lease_expires_at":"2026-09-23T02:00:00Z"}`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+	if err := s.Heartbeat("bd-42", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(gotArgs, " "); got != "heartbeat bd-42 --json" {
+		t.Fatalf("args = %q, want plain single-id heartbeat args", got)
+	}
+	if err := s.Heartbeat("bd-42", "gastown.katya"); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(gotArgs, " "); got != "heartbeat bd-42 --json --actor gastown.katya" {
+		t.Fatalf("args = %q, want the row's own assignee passed verbatim as --actor", got)
+	}
+}
+
+// TestBdStoreHeartbeatSurfacesRefusal covers the owner-lost arm: bd refuses a
+// heartbeat from a non-owner (reclaimed or closed bead) and Heartbeat must
+// surface that refusal — it is how a worker learns to stop — never swallow it.
+func TestBdStoreHeartbeatSurfacesRefusal(t *testing.T) {
+	runner := func(_, _ string, _ ...string) ([]byte, error) {
+		return []byte("lease not found for holder"), errors.New("exit status 1")
+	}
+	s := beads.NewBdStore("/city", runner)
+	err := s.Heartbeat("bd-42", "")
+	if err == nil {
+		t.Fatal("Heartbeat = nil, want the refusal surfaced")
+	}
+	if !strings.Contains(err.Error(), "lease not found for holder") {
+		t.Fatalf("err = %v, want bd's refusal message included", err)
+	}
+}

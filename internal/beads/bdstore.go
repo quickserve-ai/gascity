@@ -1820,6 +1820,44 @@ func (s *BdStore) Claim(id string) (Bead, bool, error) {
 	return claimed, true, nil
 }
 
+// Heartbeat refreshes the claim lease on a bead this store's actor holds
+// in_progress, via `bd heartbeat <id>`. bd's HeartbeatIssueInTx pushes
+// lease_expires_at forward, stamps heartbeat_at, and SELF-HEALS a missing
+// lease for the current assignee — so one heartbeat both arms and refreshes,
+// whatever path originally claimed the bead (CAS self-claim, hand-dole,
+// adoption, continuation). Only the current owner may heartbeat: a bead
+// reclaimed or closed under the caller fails here, which is how a worker
+// learns to stop (ga-56nq1a stage 1).
+//
+// bd's owner check is EXACT STRING equality between the acting identity and
+// the bead's assignee (measured 2026-09-23 on a scratch store: actor "katya"
+// vs assignee "gastown.katya" refuses in BOTH directions with "issue already
+// claimed by ..."). A seat's beads carry whichever spelling the assigning
+// path wrote, so a caller iterating its own rows passes each row's assignee
+// verbatim as actor; empty actor defers to the subprocess environment
+// (BEADS_ACTOR). The caller must only ever pass identities it owns.
+func (s *BdStore) Heartbeat(id, actor string) error {
+	if err := s.guardRelocatedClassIDs("heartbeat "+id, id); err != nil {
+		return err
+	}
+	args := []string{"heartbeat", id, "--json"}
+	if strings.TrimSpace(actor) != "" {
+		args = append(args, "--actor", actor)
+	}
+	out, err := s.runBDTransientWriteOutput(args...)
+	if err != nil {
+		msg := strings.TrimSpace(string(out))
+		if isBdNotFound(err) {
+			return fmt.Errorf("heartbeating bead %q: %w", id, ErrNotFound)
+		}
+		if msg != "" {
+			return fmt.Errorf("heartbeating bead %q: %w: %s", id, err, msg)
+		}
+		return fmt.Errorf("heartbeating bead %q: %w", id, err)
+	}
+	return nil
+}
+
 // ReclaimStale attempts a scoped stale-lease reclaim for exactly the given
 // bead ID via `bd reclaim --id <id> --json`. It reports whether a reclaim
 // happened and, if so, the previous owner. Staleness itself is decided

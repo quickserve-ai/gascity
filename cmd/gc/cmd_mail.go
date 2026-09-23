@@ -592,12 +592,22 @@ func cmdMailCheckWithFormat(args []string, inject bool, hookFormat string, stdou
 	}
 	cityPath, cityPathErr := resolveCity()
 	if cityPathErr == nil {
-		if cfg, err := loadCityConfig(cityPath, stderr); err == nil && citySuspended(cfg) {
-			if inject {
-				return 0
+		if cfg, err := loadCityConfig(cityPath, stderr); err == nil {
+			if citySuspended(cfg) {
+				if inject {
+					return 0
+				}
+				fmt.Fprintln(stderr, "gc mail check: city is suspended") //nolint:errcheck // best-effort stderr
+				return 1
 			}
-			fmt.Fprintln(stderr, "gc mail check: city is suspended") //nolint:errcheck // best-effort stderr
-			return 1
+			if inject {
+				// The turn-driven lease refresher rides the start-of-turn
+				// leg every managed overlay EXCEPT kimi traverses (kimi has
+				// only a SessionStart hook; SESSION-RUNTIME-012). Detached
+				// and throttled; writes nothing to the injected stream
+				// (ga-56nq1a stage 1).
+				maybeSpawnLeaseHeartbeat(cityPath, cfg)
+			}
 		}
 	}
 	if cityPathErr != nil {

@@ -1079,6 +1079,10 @@
           "description": "EventHooks controls installation of the bead event-forwarding hooks\n(.beads/hooks/on_create,on_update,on_close) that shell out to\n`gc event emit` on every bead write. Defaults to true. Set to false\nonce the controller's native cache-events already observe bead changes\n(the bd_hooks doctor gate): the lifecycle then removes the event hooks\n(leaving git hooks untouched) and stops reinstalling them, clearing the\nper-write churn and the native-store gate.",
           "default": true
         },
+        "lease_heartbeat": {
+          "type": "boolean",
+          "description": "LeaseHeartbeat arms the turn-driven lease refresher (ga-56nq1a stage\n1): a managed session's start-of-turn mail check forks a detached,\nthrottled `gc hook heartbeat`, which refreshes the claim lease on every\nin_progress bead assigned to that session so leases track sessions that\nare still taking turns. Defaults to false: each city arms it\ndeliberately, because the refresher must be observed live in a city\nbefore anything there may key on lease expiry (reap ordering,\nga-56nq1a)."
+        },
         "bd_compatibility": {
           "type": "string",
           "enum": [
