@@ -9034,6 +9034,63 @@ func TestJsonlExportRepackEscalationDeliveryFailureIsRecorded(t *testing.T) {
 	}
 }
 
+// When the streak cannot be persisted (a full or unwritable state dir, the
+// same conditions that fail a repack), the counter can never reach the
+// threshold, so the failure must escalate on the spot.
+func TestJsonlExportRepackEscalatesAtOnceWhenStreakCannotBePersisted(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+	mailLog := filepath.Join(t.TempDir(), "gc-mail.log")
+	archiveRepo := filepath.Join(cityDir, "archive")
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("LookPath(git): %v", err)
+	}
+	realMktemp, err := exec.LookPath("mktemp")
+	if err != nil {
+		t.Fatalf("LookPath(mktemp): %v", err)
+	}
+	// The repack itself exhausts the disk: `git gc` fails and leaves a marker,
+	// and from then on every state-file write fails. Writes earlier in the
+	// run succeed, as they would before the disk filled.
+	diskFull := filepath.Join(t.TempDir(), "disk-full")
+	writeExecutable(t, filepath.Join(binDir, "git"), fmt.Sprintf(`#!/bin/sh
+for arg in "$@"; do
+    if [ "$arg" = "gc" ]; then
+        : > '%s'
+        echo "fatal: No space left on device" >&2
+        exit 1
+    fi
+done
+exec '%s' "$@"
+`, diskFull, realGit))
+	writeExecutable(t, filepath.Join(binDir, "mktemp"), fmt.Sprintf(`#!/bin/sh
+if [ -e '%s' ]; then
+    for arg in "$@"; do
+        case "$arg" in *jsonl-export-state.json*) echo "simulated ENOSPC" >&2; exit 1 ;; esac
+    done
+fi
+exec '%s' "$@"
+`, diskFull, realMktemp))
+	writeJsonlExportGCStub(t, binDir)
+	writeMultiRecordDoltStub(t, binDir, 3)
+
+	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
+	env["GC_JSONL_MAX_REPACK_FAILURES"] = "3"
+
+	out, runErr := runScriptResult(t, coreScriptPath("jsonl-export.sh"), env)
+	mailData, err := os.ReadFile(mailLog)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("ReadFile(mail log): %v", err)
+	}
+	if !strings.Contains(string(mailData), "ESCALATION: JSONL archive repack failing") {
+		t.Fatalf("an unpersistable streak must escalate on the FIRST failure (threshold 3); run err=%v\noutput:\n%s\nmail log:\n%s", runErr, out, mailData)
+	}
+}
+
 // The post-condition read must not be able to end the export: under
 // set -euo pipefail an unguarded failing `git count-objects` would exit
 // before the failure is recorded and before the snapshot is marked for push.

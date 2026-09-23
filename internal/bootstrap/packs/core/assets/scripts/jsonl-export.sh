@@ -776,18 +776,28 @@ record_archive_repack_failure() {
     echo "jsonl-export: archive repack failed (non-fatal; loose objects keep accumulating until it succeeds)" >&2
     consecutive=$(read_state_json | jq -r '.consecutive_repack_failures // 0' || echo "0")
     consecutive=$((consecutive + 1))
-    write_state_json "$(
+    # The streak is the only durable record, and the conditions that fail a
+    # repack (full or unwritable disk) also fail this write. If it cannot be
+    # persisted, the count can never reach the threshold, so escalate NOW
+    # instead of waiting on a counter that will not move.
+    local state_persisted=1
+    if ! write_state_json "$(
         read_state_json \
             | jq -c \
                 --argjson count "$consecutive" \
                 --arg stderr "$(truncate_push_stderr_for_state "$stderr_context")" \
                 '.consecutive_repack_failures = $count
                  | if $stderr == "" then del(.last_repack_stderr) else .last_repack_stderr = $stderr end'
-    )"
+    )"; then
+        state_persisted=0
+        echo "jsonl-export: could not persist the repack failure streak; escalating now" >&2
+    fi
 
-    already_escalated=$(read_state_json | jq -r '.repack_failure_escalated // false' || echo "false")
-    if [ "$consecutive" -lt "$MAX_REPACK_FAILURES" ] || [ "$already_escalated" = "true" ]; then
-        return 0
+    if [ "$state_persisted" = 1 ]; then
+        already_escalated=$(read_state_json | jq -r '.repack_failure_escalated // false' || echo "false")
+        if [ "$consecutive" -lt "$MAX_REPACK_FAILURES" ] || [ "$already_escalated" = "true" ]; then
+            return 0
+        fi
     fi
     stderr_display=$(truncate_stderr_context "$stderr_context")
     if [ -z "$stderr_display" ]; then
