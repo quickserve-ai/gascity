@@ -216,13 +216,31 @@ func (c *FormulaRequirementsCheck) collectIssues(v2 bool) ([]formulaRequirementI
 				if c.compile != nil {
 					compileErr = c.compile(name, scope.paths, v2)
 				}
+				// A composed mismatch is excused only by a disabled_reason on
+				// the root's OWN file (f, parsed unresolved from the file its
+				// resolver key names), the formula that composes it. Resolve
+				// fills reason from the first parent that has one, and that
+				// parent's own requirement is satisfiable here, so an inherited
+				// reason says nothing about this composition (Codex r7, #134).
+				ownReason := ""
+				if f.Requires != nil {
+					ownReason = strings.TrimSpace(f.Requires.DisabledReason)
+				}
 				switch {
-				case formula.IsUnsatisfiedRequirement(compileErr):
-					note := fmt.Sprintf("intentionally disabled %s formula %q (%s), by a composed requirement: %s", scope.name, resolved.Formula, path, reason)
+				case formula.IsUnsatisfiedRequirement(compileErr) && ownReason != "":
+					note := fmt.Sprintf("intentionally disabled %s formula %q (%s), by a composed requirement: %s (disabled_reason declared on %q in %s)", scope.name, resolved.Formula, path, ownReason, name, path)
 					if _, ok := seenDisabled[note]; !ok {
 						seenDisabled[note] = struct{}{}
 						disabled = append(disabled, note)
 					}
+				case formula.IsUnsatisfiedRequirement(compileErr):
+					addIssue(formulaRequirementIssue{
+						severity: StatusError,
+						scope:    scope.name,
+						formula:  resolved.Formula,
+						path:     path,
+						message:  fmt.Sprintf("%v; the inherited disabled_reason %q does not cover a composed requirement: declare disabled_reason on the formula that composes it (%s)", compileErr, reason, path),
+					})
 				case compileErr != nil:
 					addIssue(formulaRequirementIssue{
 						severity: StatusWarning,
