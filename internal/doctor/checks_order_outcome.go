@@ -376,7 +376,9 @@ func (c *OrderOutcomeHealthyCheck) lookBack(ctx *CheckContext, eventPath string,
 				}
 			}
 			older = append(batch, older...)
-			merged := append(older[:len(older):len(older)], outcomes...)
+			merged := make([]events.Event, 0, len(older)+len(outcomes))
+			merged = append(merged, older...)
+			merged = append(merged, outcomes...)
 			for subject := range unresolved {
 				if c.settledOrder(merged, subject, starts, through) {
 					delete(unresolved, subject)
