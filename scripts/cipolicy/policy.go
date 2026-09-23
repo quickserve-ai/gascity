@@ -51,7 +51,12 @@ const (
 	//
 	// Bumped for the carry's go-mod-warm composite step (ga-azybk8): one
 	// deterministic module warm per job ahead of every go command.
-	expectedCIExecutionHash      = "0e08ea3013c399c87d34eaebcb2debb1568724d7337c42f50428a749c7f53c9a"
+	//
+	// Bumped for two job budgets (ga-ltftwy), and nothing else in the shape:
+	// cmd/gc process 10 -> 15 min (shard 9 was killed 166s into its post-test
+	// cache save) and rest-smoke 15 -> 25 min (a cold Go cache spent ~8.5 min
+	// compiling and the job was cancelled after its tests passed).
+	expectedCIExecutionHash      = "b3cbeb1941b85b9011b39b44fdd1d67891ba1f8a24c7336d3cbee24a71278443"
 	expectedNightlyTriggersHash  = "0a4400a09ac567e90adf8be1232eef1f14e36efd8dba3e143aa6e36f5b7a36f5"
 	expectedNightlyExecutionHash = "6112cdb386602a604767a6d77c21a6ff90ec60587fb0b021105d982fe30c006a" // reviewed delta: Beads v1.3.0-rc.2 -> v1.3.0
 	expectedSetupActionHash      = "12920621ee8af83820e2a89d8b3f216030c1e58559b2650a705e224df23ed3de"
