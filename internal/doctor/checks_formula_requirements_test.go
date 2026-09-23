@@ -398,6 +398,28 @@ func TestFormulaRequirementsCheckIntentionallyDisabled(t *testing.T) {
 		}
 	})
 
+	t.Run("a disabled formula with graph-only constructs is still just disabled", func(t *testing.T) {
+		content := "\nformula = \"mol-shadowed\"\n\n[requires]\nformula_compiler = \">=999.0.0\"\ndisabled_reason = \"shadowed v2 formula\"\n\n[[steps]]\nid = \"commit\"\ntitle = \"Commit\"\n\n[steps.retry]\nmax_attempts = 2\n"
+		r := run(t, content)
+		if r.Status != StatusOK || !strings.Contains(strings.Join(r.Details, "\n"), "shadowed v2 formula") {
+			t.Fatalf("the graph-declaration error must not outlive the marker: %v %q %v", r.Status, r.Message, r.Details)
+		}
+	})
+
+	t.Run("an inherited reason does not excuse the formula's own unmet requirement", func(t *testing.T) {
+		dir := t.TempDir()
+		writeDoctorFormula(t, dir, "stale-parent", "\nformula = \"stale-parent\"\n\n[requires]\nformula_compiler = \">=1.0.0\"\ndisabled_reason = \"stale\"\n\n[[steps]]\nid = \"a\"\ntitle = \"A\"\n")
+		writeDoctorFormula(t, dir, "own-unmet", "\nformula = \"own-unmet\"\nextends = [\"stale-parent\"]\n\n[requires]\nformula_compiler = \">=999.0.0\"\n")
+		r := NewFormulaRequirementsCheck(&config.City{
+			Daemon:        config.DaemonConfig{FormulaV2: boolPtr(true)},
+			FormulaLayers: config.FormulaLayers{City: []string{dir}},
+		}, t.TempDir()).Run(&CheckContext{})
+		joined := strings.Join(r.Details, "\n")
+		if r.Status != StatusError || strings.Contains(joined, "intentionally disabled city formula \"own-unmet\"") {
+			t.Fatalf("own-unmet's own requirement must stay an error: %v %q %v", r.Status, r.Message, r.Details)
+		}
+	})
+
 	t.Run("a reason never excuses an INVALID requirement", func(t *testing.T) {
 		content := "\nformula = \"mol-shadowed\"\n\n[requires]\nformula_compiler = \"not-a-version\"\ndisabled_reason = \"x\"\n\n[[steps]]\nid = \"commit\"\ntitle = \"Commit\"\n"
 		if r := run(t, content); r.Status != StatusError {

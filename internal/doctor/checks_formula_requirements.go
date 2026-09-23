@@ -141,22 +141,37 @@ func (c *FormulaRequirementsCheck) collectIssues() ([]formulaRequirementIssue, [
 				})
 				continue
 			}
-			if err := formula.ValidateExplicitGraphCompilerRequirement(resolved); err != nil {
-				addIssue(formulaRequirementIssue{
-					severity: StatusError,
-					scope:    scope.name,
-					formula:  resolved.Formula,
-					path:     path,
-					message:  err.Error(),
-				})
-			}
 			reason := ""
 			if resolved.Requires != nil {
 				reason = strings.TrimSpace(resolved.Requires.DisabledReason)
 			}
-			hostErr := formula.ValidateHostRequirements(resolved, c.cfg.Daemon.FormulaV2Enabled())
+			ownReason := ""
+			if f.Requires != nil {
+				ownReason = strings.TrimSpace(f.Requires.DisabledReason)
+			}
+			v2 := c.cfg.Daemon.FormulaV2Enabled()
+			hostErr := formula.ValidateHostRequirements(resolved, v2)
+			// A reason inherited through extends excuses only what the parent
+			// made unsatisfiable: if the formula's OWN requirement is unmet, it
+			// must carry its own reason.
+			ownUnexcused := ownReason == "" && formula.IsUnsatisfiedRequirement(formula.ValidateHostRequirements(f, v2))
+			intentionallyDisabled := reason != "" && formula.IsUnsatisfiedRequirement(hostErr) && !ownUnexcused
+			// A deliberately unsatisfiable requirement also fails the explicit
+			// graph-declaration rule (">=999.0.0" does not accept the graph
+			// compiler), so that derivative error is not reported for it.
+			if !intentionallyDisabled {
+				if err := formula.ValidateExplicitGraphCompilerRequirement(resolved); err != nil {
+					addIssue(formulaRequirementIssue{
+						severity: StatusError,
+						scope:    scope.name,
+						formula:  resolved.Formula,
+						path:     path,
+						message:  err.Error(),
+					})
+				}
+			}
 			switch {
-			case hostErr != nil && reason != "" && formula.IsUnsatisfiedRequirement(hostErr):
+			case intentionallyDisabled:
 				note := fmt.Sprintf("intentionally disabled %s formula %q (%s): %s", scope.name, resolved.Formula, path, reason)
 				if _, ok := seenDisabled[note]; !ok {
 					seenDisabled[note] = struct{}{}
