@@ -19,6 +19,7 @@ func TestExecutorIdentityResidueCheckFlagsAndFixesStaleStamp(t *testing.T) {
 	cityDir := t.TempDir()
 	cfg := residueTestCity()
 	cityStore := beads.NewMemStoreFrom(0, []beads.Bead{
+		residueRanSession("RAN-1", "gascity--builder"),
 		{ID: "CITY-1", Title: "stale stamp", Type: "task", Status: "open", Metadata: map[string]string{
 			"gc.routed_to":    "gascity/reviewer",
 			"gc.session_name": "gascity--builder",
@@ -106,6 +107,7 @@ func TestExecutorIdentityResidueCheckFixIsIdempotent(t *testing.T) {
 	cityDir := t.TempDir()
 	cfg := residueTestCity()
 	cityStore := &residueSetMetadataBatchSpyStore{Store: beads.NewMemStoreFrom(0, []beads.Bead{
+		residueRanSession("RAN-1", "gascity--builder"),
 		{ID: "CITY-1", Title: "stale stamp", Type: "task", Status: "open", Metadata: map[string]string{
 			"gc.routed_to":    "gascity/reviewer",
 			"gc.session_name": "gascity--builder",
@@ -290,6 +292,7 @@ func TestExecutorIdentityResidueCheckDescribeNamesTriggeringKeys(t *testing.T) {
 	cityDir := t.TempDir()
 	cfg := residueTestCity()
 	cityStore := beads.NewMemStoreFrom(0, []beads.Bead{
+		residueRanSession("RAN-1", "gascity--builder"),
 		{ID: "CITY-1", Title: "session-name residue", Type: "task", Status: "open", Metadata: map[string]string{
 			"gc.routed_to":    "gascity/reviewer",
 			"gc.session_name": "gascity--builder",
@@ -553,6 +556,7 @@ func TestExecutorIdentityResidueCheckPreservesWorkDirOnWorktreeOwningBead(t *tes
 	cityDir := t.TempDir()
 	cfg := residueTestCity()
 	cityStore := beads.NewMemStoreFrom(0, []beads.Bead{
+		residueRanSession("RAN-1", "gascity--builder-9"),
 		{ID: "CITY-1", Title: "worktree-owning bead, retired-slot session_name", Type: "task", Status: "open", Metadata: map[string]string{
 			"gc.routed_to":      "gascity/reviewer",
 			"gc.session_name":   "gascity--builder-9",
@@ -826,6 +830,17 @@ func residueTestCity() *config.City {
 	return &config.City{Agents: residueTestAgents()}
 }
 
+// residueRanSession is a closed session bead showing this city once ran
+// sessionName. Rule 4 clears a stale gc.session_name only when this city has
+// run that session; without one, the stamp could be another town's live
+// session under a route both towns configure.
+func residueRanSession(id, sessionName string) beads.Bead {
+	return beads.Bead{ID: id, Type: sessionBeadType, Status: "closed", Labels: []string{sessionBeadLabel}, Metadata: map[string]string{
+		"session_name": sessionName,
+		"template":     "qcore/elsewhere",
+	}}
+}
+
 // newResidueTestCheck builds the check with a stat that reports every path
 // absent, so no fixture touches the real filesystem (rule 3). Tests that
 // exercise rule 3 replace statPath themselves.
@@ -885,15 +900,19 @@ func TestExecutorIdentityResidueCheckSparesStampOfOpenSession(t *testing.T) {
 		sessionName string
 		// sessionStatus is the status of a session bead whose runtime name is
 		// sessionName; "" means no such session bead exists.
-		sessionStatus string
-		wantFlagged   bool
+		sessionStatus  string
+		wantFlagged    bool
+		wantReportOnly bool
 	}{
 		{name: "local route, open session", route: "gascity/reviewer", sessionName: "qcore--mallory", sessionStatus: "open"},
 		{name: "pseudo-route cert-wait, open session", route: "cert-wait", sessionName: "qcore--ray", sessionStatus: "open"},
 		{name: "foreign route, open session", route: "qcore/rock", sessionName: "qcore--rock", sessionStatus: "open"},
 		// Controls: rule 2 is what spares the local-route row, not something
 		// else about the fixture.
-		{name: "local route, no session bead", route: "gascity/reviewer", sessionName: "qcore--mallory", wantFlagged: true},
+		// #123 review round 2: a name no session bead of this city ever held
+		// is likely another town's live session under a route both towns
+		// configure. It is reported, never cleared.
+		{name: "local route, no session bead", route: "gascity/reviewer", sessionName: "qcore--mallory", wantFlagged: true, wantReportOnly: true},
 		{name: "local route, session bead closed", route: "gascity/reviewer", sessionName: "qcore--mallory", sessionStatus: "closed", wantFlagged: true},
 	}
 	for _, tc := range cases {
@@ -926,8 +945,11 @@ func TestExecutorIdentityResidueCheckSparesStampOfOpenSession(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Get: %v", err)
 			}
+			if reportOnly := strings.Contains(strings.Join(result.Details, "\n"), "REPORTED ONLY"); reportOnly != tc.wantReportOnly {
+				t.Fatalf("reported only = %v, want %v: %#v", reportOnly, tc.wantReportOnly, result)
+			}
 			want := tc.sessionName
-			if tc.wantFlagged {
+			if tc.wantFlagged && !tc.wantReportOnly {
 				want = ""
 			}
 			if got := bd.Metadata["gc.session_name"]; got != want {
@@ -1114,6 +1136,8 @@ func TestExecutorIdentityResidueCheckDefaultStatSeesRealDirectory(t *testing.T) 
 func TestExecutorIdentityResidueCheckFailsClosedWhenOpenSessionsUnavailable(t *testing.T) {
 	cityDir := t.TempDir()
 	store := &residueRecordingStore{Store: beads.NewMemStoreFrom(0, []beads.Bead{
+		residueRanSession("RAN-1", "gascity--builder"),
+		residueRanSession("RAN-2", "gascity--deployer"),
 		{ID: "CITY-1", Title: "session_name candidate", Type: "task", Status: "open", Metadata: map[string]string{
 			"gc.routed_to":    "gascity/reviewer",
 			"gc.session_name": "gascity--builder",
@@ -1181,6 +1205,7 @@ func TestExecutorIdentityResidueCheckFailsClosedWhenOpenSessionsUnavailable(t *t
 func TestExecutorIdentityResidueCheckLoadsOpenSessionsOnlyForACandidate(t *testing.T) {
 	cityDir := t.TempDir()
 	store := beads.NewMemStoreFrom(0, []beads.Bead{
+		residueRanSession("RAN-1", "qcore--rock"),
 		{ID: "CITY-1", Title: "canonical stamp", Type: "task", Status: "open", Metadata: map[string]string{
 			"gc.routed_to":    "gascity/builder",
 			"gc.session_name": "gascity--builder",
@@ -1209,6 +1234,7 @@ func TestExecutorIdentityResidueCheckLoadsOpenSessionsOnlyForACandidate(t *testi
 func TestExecutorIdentityResidueCheckFixClearsExactlyAGenuineStaleStampsKeys(t *testing.T) {
 	cityDir := t.TempDir()
 	store := &residueRecordingStore{Store: beads.NewMemStoreFrom(0, []beads.Bead{
+		residueRanSession("RAN-1", "gascity--builder-7"),
 		{ID: "SESSION-1", Type: sessionBeadType, Status: "open", Labels: []string{sessionBeadLabel}, Metadata: map[string]string{
 			"session_name": "gascity--mayor",
 			"template":     "gascity/mayor",
