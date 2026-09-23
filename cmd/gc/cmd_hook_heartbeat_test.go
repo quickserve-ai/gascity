@@ -128,6 +128,18 @@ func TestHookHeartbeatEligibleIdentitiesFencesStaleIncarnations(t *testing.T) {
 	if err != nil || len(ids) == 0 {
 		t.Fatalf("live incarnation: ids=%v err=%v, want identities and no error", ids, err)
 	}
+	// Codex round-8 P1: a DRAINING session is finishing the work it holds and
+	// must keep refreshing it, unlike the claim path which refuses new claims.
+	draining := live
+	draining.MetadataState = string(session.StateDraining)
+	if ids, err := hookHeartbeatEligibleIdentities(draining, "tok-live"); err != nil || len(ids) == 0 {
+		t.Fatalf("draining incarnation: ids=%v err=%v, want identities and no error", ids, err)
+	}
+	stopped := live
+	stopped.MetadataState = "stopped"
+	if ids, err := hookHeartbeatEligibleIdentities(stopped, "tok-live"); err == nil || len(ids) != 0 {
+		t.Fatalf("stopped state: ids=%v err=%v, want refusal", ids, err)
+	}
 	cases := map[string]struct {
 		info  session.Info
 		token string
