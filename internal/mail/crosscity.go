@@ -1,10 +1,20 @@
 package mail
 
 import (
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
+
+	"github.com/gastownhall/gascity/internal/session"
 )
+
+// ErrUnresolvedCityProbe is the error a caller passes to RefuseUnknownCity
+// when it has no resolution failure of its own to upgrade — a reply's thread
+// origin, or a storeless send — and only wants the address classified.
+// Returned unchanged, it means the address names a known scope or carries no
+// city segment.
+var ErrUnresolvedCityProbe = errors.New("origin city unknown")
 
 // CityRoster names the local city and the peer cities addressable with
 // city-qualified mail addresses of the form <city>/<address>. The first path
@@ -82,21 +92,36 @@ func (e *UnknownCityError) Error() string {
 	return fmt.Sprintf("unknown city %q (known cities: %s)", e.City, strings.Join(e.Known, ", "))
 }
 
-// RefuseUnknownCity upgrades a resolution failure into an
+// RefuseUnknownCity upgrades a NOT-FOUND resolution failure into an
 // *UnknownCityError when the failed recipient's first segment names neither a
-// known city nor a local scope (a rig, or the local city itself). Every other
-// failure — no roster, no "/", a local scope the resolver already understood —
-// returns err unchanged.
+// known city nor a local scope: the local city, a rig or agent directory
+// (config.City.LocalAddressPrefixes), or the session-target forms
+// "template:<rig>/<name>", "controller" and "human". Every other case returns
+// err unchanged: no roster, no "/", a known scope — and, above all, an error
+// that is not a not-found (a store timeout, a name-squat refusal), which must
+// keep its own text rather than be re-spelled as "unknown city". Only
+// session.ErrSessionNotFound and ErrUnresolvedCityProbe are upgraded.
 func RefuseUnknownCity(err error, recipient string, roster CityRoster, localScopes []string) error {
 	if err == nil || !roster.Enabled() {
+		return err
+	}
+	if !errors.Is(err, session.ErrSessionNotFound) && !errors.Is(err, ErrUnresolvedCityProbe) {
 		return err
 	}
 	segment, rest, found := strings.Cut(strings.TrimSpace(recipient), "/")
 	if !found || rest == "" || segment == roster.Local {
 		return err
 	}
-	if slices.Contains(roster.Peers, segment) || slices.Contains(localScopes, segment) {
+	if strings.HasPrefix(segment, "template:") || segment == "controller" || segment == "human" {
 		return err
+	}
+	if slices.Contains(roster.Peers, segment) {
+		return err
+	}
+	for _, scope := range localScopes {
+		if strings.TrimSpace(scope) == segment {
+			return err
+		}
 	}
 	known := make([]string, 0, 1+len(roster.Peers))
 	known = append(known, roster.Local)
