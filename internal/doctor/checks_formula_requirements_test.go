@@ -337,3 +337,58 @@ func doctorRunGit(t *testing.T, dir string, args ...string) {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
 	}
 }
+
+// ga-2h3isb: the platform rig shadows mol-polecat-commit with an unsatisfiable
+// requirement ON PURPOSE. With a disabled_reason, doctor reports it as
+// intentionally disabled instead of as a blocking defect a patrol "fixes".
+func TestFormulaRequirementsCheckIntentionallyDisabled(t *testing.T) {
+	stub := func(reason string) string {
+		s := "\nformula = \"mol-polecat-commit\"\n\n[requires]\nformula_compiler = \">=999.0.0\"\n"
+		if reason != "" {
+			s += "disabled_reason = \"" + reason + "\"\n"
+		}
+		return s + "\n[[steps]]\nid = \"commit\"\ntitle = \"Commit\"\n"
+	}
+	run := func(t *testing.T, content string) *CheckResult {
+		t.Helper()
+		dir := t.TempDir()
+		writeDoctorFormula(t, dir, "mol-polecat-commit", content)
+		return NewFormulaRequirementsCheck(&config.City{
+			Daemon:        config.DaemonConfig{FormulaV2: boolPtr(true)},
+			FormulaLayers: config.FormulaLayers{City: []string{dir}},
+		}, t.TempDir()).Run(&CheckContext{})
+	}
+
+	t.Run("declared disabled reads as disabled, not a defect", func(t *testing.T) {
+		r := run(t, stub("closes direct-push-to-base on the platform rig (ga-82cffd)"))
+		if r.Status != StatusOK {
+			t.Fatalf("Status = %v, want OK; details:\n%s", r.Status, strings.Join(r.Details, "\n"))
+		}
+		if !strings.Contains(r.Message, "1 intentionally disabled") ||
+			!strings.Contains(strings.Join(r.Details, "\n"), "intentionally disabled city formula \"mol-polecat-commit\"") ||
+			!strings.Contains(strings.Join(r.Details, "\n"), "ga-82cffd") {
+			t.Fatalf("the disabled formula and its reason must be reported: %q %v", r.Message, r.Details)
+		}
+	})
+
+	t.Run("control: the same stub without a reason is still an error", func(t *testing.T) {
+		if r := run(t, stub("")); r.Status != StatusError {
+			t.Fatalf("Status = %v, want Error; details:\n%s", r.Status, strings.Join(r.Details, "\n"))
+		}
+	})
+
+	t.Run("a reason on a satisfiable requirement warns: the formula is dispatchable", func(t *testing.T) {
+		content := "\nformula = \"mol-polecat-commit\"\n\n[requires]\nformula_compiler = \">=2.0.0\"\ndisabled_reason = \"stale marker\"\n\n[[steps]]\nid = \"commit\"\ntitle = \"Commit\"\n"
+		r := run(t, content)
+		if r.Status != StatusWarning || !strings.Contains(strings.Join(r.Details, "\n"), "DISPATCHABLE") {
+			t.Fatalf("want a Warning naming the dispatchable formula: %v %q %v", r.Status, r.Message, r.Details)
+		}
+	})
+
+	t.Run("a reason never excuses an INVALID requirement", func(t *testing.T) {
+		content := "\nformula = \"mol-polecat-commit\"\n\n[requires]\nformula_compiler = \"not-a-version\"\ndisabled_reason = \"x\"\n\n[[steps]]\nid = \"commit\"\ntitle = \"Commit\"\n"
+		if r := run(t, content); r.Status != StatusError {
+			t.Fatalf("Status = %v, want Error; details:\n%s", r.Status, strings.Join(r.Details, "\n"))
+		}
+	})
+}
