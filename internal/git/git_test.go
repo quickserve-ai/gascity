@@ -923,3 +923,120 @@ func TestParseWorktreeListUnquotesCQuotedPaths(t *testing.T) {
 		t.Errorf("Path = %q, want %q", got[0].Path, "/tmp/café")
 	}
 }
+
+// resetLiveTips clears the ls-remote cache so a test sees the remote's
+// current state, not an answer cached by an earlier probe in the same process.
+func resetLiveTips(t *testing.T) {
+	t.Helper()
+	liveTipsMu.Lock()
+	liveTipsCache = map[string]liveTipsEntry{}
+	liveTipsMu.Unlock()
+}
+
+// pushedClone returns a bare remote and a clone whose HEAD is pushed to main.
+func pushedClone(t *testing.T) (bare, clone string) {
+	t.Helper()
+	bare = t.TempDir()
+	runGit(t, bare, "init", "--bare")
+	clone = t.TempDir()
+	runGit(t, clone, "clone", bare, ".")
+	runGit(t, clone, "config", "user.email", "test@test.com")
+	runGit(t, clone, "config", "user.name", "Test")
+	runGit(t, clone, "commit", "--allow-empty", "-m", "init")
+	runGit(t, clone, "push", "origin", "HEAD:refs/heads/main")
+	return bare, clone
+}
+
+// The ga-hdedew hazard: a tracking ref that outlived its remote branch. The old
+// `--not --remotes` probe credited it and read the only copy as pushed.
+func TestHasUnpushedCommits_StaleTrackingRefIsNotCredit(t *testing.T) {
+	resetLiveTips(t)
+	bare, clone := pushedClone(t)
+	runGit(t, clone, "checkout", "-b", "feature")
+	runGit(t, clone, "commit", "--allow-empty", "-m", "feature work")
+	runGit(t, clone, "push", "origin", "feature")
+	// The branch is deleted ON THE REMOTE; the clone's origin/feature survives.
+	runGit(t, bare, "branch", "-D", "feature")
+	if out := runGit(t, clone, "branch", "-r", "--contains", "HEAD"); !strings.Contains(out, "origin/feature") {
+		t.Fatalf("fixture broken: stale tracking ref missing, branch -r --contains = %q", out)
+	}
+	has, err := New(clone).HasUnpushedCommitsResult()
+	if err != nil {
+		t.Fatalf("HasUnpushedCommitsResult() error = %v", err)
+	}
+	if !has {
+		t.Error("HasUnpushedCommitsResult() = false: a stale tracking ref was credited as a remote copy")
+	}
+}
+
+func TestHasUnpushedCommits_LiveBranchIsCredit(t *testing.T) {
+	resetLiveTips(t)
+	_, clone := pushedClone(t)
+	has, err := New(clone).HasUnpushedCommitsResult()
+	if err != nil || has {
+		t.Errorf("HasUnpushedCommitsResult() = %v, %v; want false, nil for a tip on a live branch", has, err)
+	}
+}
+
+func TestHasUnpushedCommits_RescueRefIsCredit(t *testing.T) {
+	resetLiveTips(t)
+	_, clone := pushedClone(t)
+	runGit(t, clone, "checkout", "--detach")
+	runGit(t, clone, "commit", "--allow-empty", "-m", "salvage")
+	runGit(t, clone, "push", "origin", "HEAD:refs/rescue/seat/x")
+	has, err := New(clone).HasUnpushedCommitsResult()
+	if err != nil || has {
+		t.Errorf("HasUnpushedCommitsResult() = %v, %v; want false, nil for a tip under refs/rescue/*", has, err)
+	}
+}
+
+func TestHasUnpushedCommits_AnnotatedTagIsCredit(t *testing.T) {
+	resetLiveTips(t)
+	_, clone := pushedClone(t)
+	runGit(t, clone, "checkout", "--detach")
+	runGit(t, clone, "commit", "--allow-empty", "-m", "tagged")
+	runGit(t, clone, "tag", "-a", "v9", "-m", "v9")
+	runGit(t, clone, "push", "origin", "refs/tags/v9")
+	has, err := New(clone).HasUnpushedCommitsResult()
+	if err != nil || has {
+		t.Errorf("HasUnpushedCommitsResult() = %v, %v; want false, nil for a tip under an annotated tag", has, err)
+	}
+}
+
+// A remote that cannot be read is never credited: error, and the bool form
+// fails closed.
+func TestHasUnpushedCommits_UnreachableRemoteIsError(t *testing.T) {
+	resetLiveTips(t)
+	bare, clone := pushedClone(t)
+	if err := os.RemoveAll(bare); err != nil {
+		t.Fatal(err)
+	}
+	g := New(clone)
+	if _, err := g.HasUnpushedCommitsResult(); err == nil {
+		t.Error("HasUnpushedCommitsResult() error = nil with the remote gone, want an error")
+	}
+	if !g.HasUnpushedCommits() {
+		t.Error("HasUnpushedCommits() should fail closed when no remote answers")
+	}
+}
+
+// One ls-remote per repository per TTL, failures included, so an offline host
+// pays one timeout per repo instead of one per worktree per tick.
+func TestHasUnpushedCommits_LiveTipsAreCachedPerRepo(t *testing.T) {
+	resetLiveTips(t)
+	bare, clone := pushedClone(t)
+	g := New(clone)
+	if has, err := g.HasUnpushedCommitsResult(); err != nil || has {
+		t.Fatalf("first probe = %v, %v; want false, nil", has, err)
+	}
+	if err := os.RemoveAll(bare); err != nil {
+		t.Fatal(err)
+	}
+	if has, err := g.HasUnpushedCommitsResult(); err != nil || has {
+		t.Errorf("second probe within TTL = %v, %v; want the cached false, nil", has, err)
+	}
+	resetLiveTips(t)
+	if _, err := g.HasUnpushedCommitsResult(); err == nil {
+		t.Error("after the cache is cleared the vanished remote must be an error")
+	}
+}
