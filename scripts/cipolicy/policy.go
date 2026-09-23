@@ -55,7 +55,7 @@ const (
 	// Bumped for two job budgets (ga-ltftwy), and nothing else in the shape:
 	// cmd/gc process 10 -> 15 min (shard 9 was killed 166s into its post-test
 	// cache save) and rest-smoke 15 -> 25 min (a cold Go cache spent ~8.5 min
-	// compiling and the job was cancelled after its tests passed).
+	// compiling and the job was canceled after its tests passed).
 	expectedCIExecutionHash      = "b3cbeb1941b85b9011b39b44fdd1d67891ba1f8a24c7336d3cbee24a71278443"
 	expectedNightlyTriggersHash  = "0a4400a09ac567e90adf8be1232eef1f14e36efd8dba3e143aa6e36f5b7a36f5"
 	expectedNightlyExecutionHash = "6112cdb386602a604767a6d77c21a6ff90ec60587fb0b021105d982fe30c006a" // reviewed delta: Beads v1.3.0-rc.2 -> v1.3.0
