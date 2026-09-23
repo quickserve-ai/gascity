@@ -527,3 +527,44 @@ func TestFlattenedFlagValue(t *testing.T) {
 		}
 	}
 }
+
+// Codex round 4 on #120 (a): a relative --data-dir is the SERVER's, not
+// doctor's. Run from the city root, `--data-dir .beads/dolt` from a server
+// started elsewhere must not read as a second managed server.
+func TestDoltServersCheck_RelativeDataDirNeverMatchesAgainstDoctorCWD(t *testing.T) {
+	city := t.TempDir()
+	t.Chdir(city)
+	elsewhere := DoltProcInfo{PID: 200, Argv: []string{"dolt", "sql-server", "--data-dir", filepath.Join(".beads", "dolt")}}
+	c := doltServersFixture(t, []DoltProcInfo{gcDoltProc(100, city, 51361), elsewhere}, nil, nil)
+	c.cityPath = city
+	c.cfg = &config.City{Workspace: config.Workspace{Name: "demo"}}
+	c.cwd = func(pid int) (string, bool) {
+		if pid == 200 {
+			return "/elsewhere", true
+		}
+		return "", false
+	}
+	r := c.Run(nil)
+	if r.Status == doctor.StatusError {
+		t.Fatalf("a server on /elsewhere/.beads/dolt was counted as this city's managed server: %q %v", r.Message, r.Details)
+	}
+	if !strings.Contains(strings.Join(r.Details, "\n"), "1 managed") {
+		t.Fatalf("want exactly 1 managed: %v", r.Details)
+	}
+}
+
+// Codex round 4 on #120 (b): an explicit --data-dir names the store served,
+// even beside the managed --config. That server is the rig's, not a second
+// managed server.
+func TestDoltServersCheck_DataDirTakesPrecedenceOverManagedConfig(t *testing.T) {
+	onRig := gcDoltProc(200, "/city")
+	onRig.Argv = append(onRig.Argv, "--data-dir", "/city/rigs/app/.beads/dolt")
+	c := doltServersFixture(t, []DoltProcInfo{gcDoltProc(100, "/city", 51361), onRig}, nil, nil)
+	r := c.Run(nil)
+	if r.Status != doctor.StatusOK {
+		t.Fatalf("status = %v, want OK (1 managed + 1 rig-local): %q %v", r.Status, r.Message, r.Details)
+	}
+	if !strings.Contains(r.Message, "1 managed, 1 rig-local") {
+		t.Fatalf("the data dir must decide the store: %q", r.Message)
+	}
+}
