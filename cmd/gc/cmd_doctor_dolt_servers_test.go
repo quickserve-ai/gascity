@@ -737,22 +737,64 @@ func TestDoltServersCheck_UnreadableConfigOnlyServerIsWarningNotOK(t *testing.T)
 	}
 }
 
-func TestYAMLTopLevelScalar(t *testing.T) {
-	for in, want := range map[string]string{
-		"data_dir: \"/a b/c\"\n":           "/a b/c",
-		"data_dir: /plain/path\n":          "/plain/path",
-		"data_dir: '/it''s'\n":             "/it's",
-		"data_dir: /p # comment\n":         "/p",
-		"data_dir: \"/q\" # managed\n":     "/q",
-		"data_dir: \"/a \\\"b\\\"\" # c\n": "/a \"b\"",
-		"data_dir: '/s' # c\n":             "/s",
-		"x:\n  data_dir: /nested\n":        "",
-		"data_dirx: /no\n":                 "",
-		"log: 1\n":                         "",
+func TestDoltServersCheck_ConfigDataDirUsesTheYAMLParser(t *testing.T) {
+	c := &doltServersCheck{}
+	for in, want := range map[string]struct {
+		dir      string
+		resolved bool
+	}{
+		"data_dir: \"/a b/c\"\n":                      {"/a b/c", true},
+		"data_dir: /plain/path\n":                     {"/plain/path", true},
+		"data_dir: '/it''s'\n":                        {"/it's", true},
+		"data_dir: /p # comment\n":                    {"/p", true},
+		"data_dir: \"/q\" # managed\n":                {"/q", true},
+		"store: &s /city/.beads/dolt\ndata_dir: *s\n": {"/city/.beads/dolt", true},
+		"data_dir: >-\n  /folded/path\n":              {"/folded/path", true},
+		"x:\n  data_dir: /nested\n":                   {"", true},
+		"log: 1\n":                                    {"", true},
+		"data_dir: [not, a, string]\n":                {"", false},
+		"data_dir: \"unterminated\n":                  {"", false},
 	} {
-		if got := yamlTopLevelScalar([]byte(in), "data_dir"); got != want {
-			t.Errorf("yamlTopLevelScalar(%q) = %q, want %q", in, got, want)
+		c.readFile = func(string) ([]byte, error) { return []byte(in), nil }
+		dir, resolved := c.configDataDir("/cfg.yaml")
+		if dir != want.dir || resolved != want.resolved {
+			t.Errorf("configDataDir(%q) = (%q, %v), want (%q, %v)", in, dir, resolved, want.dir, want.resolved)
 		}
+	}
+}
+
+// Codex round 11 on #120 (a): a relative data_dir in an absolute config, with
+// the server's cwd unreadable, is unanchored (a Warning), not the config path.
+func TestDoltServersCheck_UnanchorableConfigDataDirIsWarning(t *testing.T) {
+	rel := DoltProcInfo{PID: 230, Argv: []string{"dolt", "sql-server", "--config", "/tmp/rel.yaml"}}
+	c := doltServersFixture(t, []DoltProcInfo{gcDoltProc(100, "/city", 51361), rel}, nil, nil)
+	c.readFile = func(path string) ([]byte, error) {
+		if path == "/tmp/rel.yaml" {
+			return []byte("data_dir: .beads/dolt\n"), nil
+		}
+		return []byte("log_level: info\n"), nil
+	}
+	r := c.Run(nil)
+	if r.Status != doctor.StatusWarning || !strings.Contains(strings.Join(r.Details, "\n"), "relative --config/--data-dir") {
+		t.Fatalf("want the unanchored Warning: %v %q %v", r.Status, r.Message, r.Details)
+	}
+}
+
+// Codex round 11 on #120 (b): an unreadable config under another registered
+// city's path may still have named this city's store; it is unresolved, not
+// "other registered city".
+func TestDoltServersCheck_UnreadableConfigUnderOtherCityIsWarning(t *testing.T) {
+	gone := DoltProcInfo{PID: 240, Argv: []string{"dolt", "sql-server", "--config", "/other-city/copy.yaml"}}
+	c := doltServersFixture(t, []DoltProcInfo{gcDoltProc(100, "/city", 51361), gone}, nil, nil)
+	c.readFile = func(path string) ([]byte, error) {
+		if path == "/other-city/copy.yaml" {
+			return nil, os.ErrPermission
+		}
+		return []byte("log_level: info\n"), nil
+	}
+	r := c.Run(nil)
+	if r.Status != doctor.StatusWarning || !strings.Contains(strings.Join(r.Details, "\n"), "can no longer be read") {
+		t.Fatalf("want a Warning naming the unreadable config: %v %q %v", r.Status, r.Message, r.Details)
 	}
 }
 
