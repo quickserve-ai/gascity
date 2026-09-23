@@ -8938,10 +8938,9 @@ func TestJsonlExportRepackFailureIsCountedEscalatedAndCleared(t *testing.T) {
 	}
 }
 
-// gc --auto exits 0 without packing when a stale .git/gc.log makes it skip,
-// or when the pack directory is unusable. Exit status is not proof of a
-// repack: a gc that returns 0 but leaves the loose objects above the ceiling
-// is a failure.
+// When the pack directory is unusable, gc --auto and the explicit repack both
+// exit 0 without packing. Exit status is not proof of a repack: loose objects
+// left above the ceiling after both steps are a failure.
 func TestJsonlExportRepackThatLeavesLooseObjectsIsAFailure(t *testing.T) {
 	cityDir := t.TempDir()
 	binDir := t.TempDir()
@@ -8955,10 +8954,11 @@ func TestJsonlExportRepackThatLeavesLooseObjectsIsAFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LookPath(git): %v", err)
 	}
-	// `git gc` succeeds and does nothing; every other subcommand is real.
+	// `git gc` and `git repack` succeed and do nothing; every other
+	// subcommand is real.
 	writeExecutable(t, filepath.Join(binDir, "git"), fmt.Sprintf(`#!/bin/sh
 for arg in "$@"; do
-    if [ "$arg" = "gc" ]; then
+    if [ "$arg" = "gc" ] || [ "$arg" = "repack" ]; then
         exit 0
     fi
 done
@@ -8985,6 +8985,56 @@ exec '%s' "$@"
 	}
 	if got, _ := state["last_repack_stderr"].(string); !strings.Contains(got, "loose_objects=") {
 		t.Fatalf("last_repack_stderr = %q, want the loose-object reading that failed the post-condition", got)
+	}
+}
+
+// gc --auto decides from a sample of one fan-out directory, so it can exit 0
+// without packing while the exact loose count is above the ceiling. That skip
+// is legitimate, not a failure: the explicit repack packs the loose objects,
+// and no failure is recorded.
+func TestJsonlExportSkippedAutoGCIsPackedExplicitly(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+	mailLog := filepath.Join(t.TempDir(), "gc-mail.log")
+	archiveRepo := filepath.Join(cityDir, "archive")
+	stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("LookPath(git): %v", err)
+	}
+	// `git gc` skips (succeeds and does nothing); `git repack` is real.
+	writeExecutable(t, filepath.Join(binDir, "git"), fmt.Sprintf(`#!/bin/sh
+for arg in "$@"; do
+    if [ "$arg" = "gc" ]; then
+        exit 0
+    fi
+done
+exec '%s' "$@"
+`, realGit))
+	writeJsonlExportGCStub(t, binDir)
+	writeMultiRecordDoltStub(t, binDir, 3)
+
+	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
+	env["GC_JSONL_REPACK_LOOSE_CEILING"] = "0"
+
+	runScript(t, coreScriptPath("jsonl-export.sh"), env)
+
+	data, err := os.ReadFile(stateFile)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("ReadFile(state file): %v", err)
+	}
+	if strings.Contains(string(data), "consecutive_repack_failures") {
+		t.Fatalf("a skipped gc --auto followed by a successful explicit repack must not count as a failure\nstate: %s", data)
+	}
+	out, err := exec.Command(realGit, "-C", archiveRepo, "count-objects", "-v").CombinedOutput()
+	if err != nil {
+		t.Fatalf("git count-objects: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "count: 0\n") {
+		t.Fatalf("the explicit repack must pack the loose objects; count-objects:\n%s", out)
 	}
 }
 
@@ -9197,12 +9247,16 @@ func TestJsonlExportUnreadableGCLogIsRecordedNotFatal(t *testing.T) {
 		t.Fatalf("LookPath(git): %v", err)
 	}
 	// `git gc` leaves an unreadable .git/gc.log and does nothing, as a
-	// previous auto-gc that died on a permission error would.
+	// previous auto-gc that died on a permission error would, and the
+	// explicit repack packs nothing either.
 	writeExecutable(t, filepath.Join(binDir, "git"), fmt.Sprintf(`#!/bin/sh
 for arg in "$@"; do
     if [ "$arg" = "gc" ]; then
         printf 'error: previous auto-gc failed\n' > .git/gc.log
         chmod 000 .git/gc.log
+        exit 0
+    fi
+    if [ "$arg" = "repack" ]; then
         exit 0
     fi
 done

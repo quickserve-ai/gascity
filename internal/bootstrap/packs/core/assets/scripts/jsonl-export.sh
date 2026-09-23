@@ -718,26 +718,37 @@ commit_archive_snapshot() {
     # a repack that keeps failing is exactly the unbounded growth this call
     # exists to stop, so failures are counted in state and escalated.
     # Exit status alone is not proof: gc --auto returns 0 without packing when
-    # a previous auto-gc left .git/gc.log (it then skips for gc.logExpiry), or
-    # when the pack directory is unusable. So the post-condition is checked
-    # too: after gc, loose objects must be at or below REPACK_LOOSE_CEILING
-    # (default twice the gc.auto trigger, so a correctly skipped gc below the
-    # trigger never counts as a failure).
+    # its sampled estimate (one of the 256 loose-object fan-out directories)
+    # misses the trigger, when a previous auto-gc left .git/gc.log (it then
+    # skips for gc.logExpiry), or when the pack directory is unusable. So the
+    # loose count is checked exactly: above REPACK_LOOSE_CEILING (default
+    # twice the gc.auto trigger) after a gc --auto that exited 0, the loose
+    # objects are packed explicitly with the incremental repack gc --auto
+    # would have run, and only that result is judged.
     # Both callers run this function as the left operand of ||, where bash
     # ignores errexit for the whole body, so a failing command here cannot
     # end the export. Every failure below is still handled explicitly, so
     # the snapshot is marked for push even if a caller drops the ||.
     local repack_err
     local repack_rc=0
+    local repack_step="gc --auto"
     local count_out
     local loose
     local git_dir
     local gc_log
     local gc_log_head
+    read_loose_count() {
+        count_out=$(git count-objects -v 2>&1) || count_out="count-objects failed: $count_out"
+        loose=$(printf '%s\n' "$count_out" | awk '/^count:/ {print $2}')
+        case "$loose" in ''|*[!0-9]*) loose="" ;; esac
+    }
     repack_err=$(git -c gc.auto=256 -c gc.autoDetach=false gc --auto --quiet 2>&1 >/dev/null) || repack_rc=$?
-    count_out=$(git count-objects -v 2>&1) || count_out="count-objects failed: $count_out"
-    loose=$(printf '%s\n' "$count_out" | awk '/^count:/ {print $2}')
-    case "$loose" in ''|*[!0-9]*) loose="" ;; esac
+    read_loose_count
+    if [ "$repack_rc" -eq 0 ] && [ -n "$loose" ] && [ "$loose" -gt "$REPACK_LOOSE_CEILING" ]; then
+        repack_step="repack -d -l"
+        repack_err=$(git repack -d -l -q 2>&1 >/dev/null) || repack_rc=$?
+        read_loose_count
+    fi
     if [ "$repack_rc" -eq 0 ] && [ -n "$loose" ] && [ "$loose" -le "$REPACK_LOOSE_CEILING" ]; then
         record_archive_repack_success
         return 0
@@ -753,7 +764,7 @@ $count_out"
         repack_err="$repack_err
 .git/gc.log: $gc_log_head"
     fi
-    record_archive_repack_failure "exit=$repack_rc loose_objects=${loose:-unknown} (ceiling $REPACK_LOOSE_CEILING)
+    record_archive_repack_failure "step=$repack_step exit=$repack_rc loose_objects=${loose:-unknown} (ceiling $REPACK_LOOSE_CEILING)
 $repack_err"
     return 0
 }
