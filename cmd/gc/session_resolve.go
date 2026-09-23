@@ -92,23 +92,18 @@ func resolveConfiguredNamedSessionID(
 // stops the runtime, ends the bead for good and releases its work, and two of
 // the three conflict kinds can be the seat's own live session. So the error
 // prints what it takes to tell the kinds apart and recommends close only for
-// the runtime-name squat (ga-lm5coj).
+// a squat: a bead that records a template or agent other than this seat's
+// (ga-lm5coj).
 func namedSessionConflictError(identifier string, spec namedSessionSpec, b beads.Bead) error {
+	d := session.DescribeNamedSessionConflict(b, spec)
 	head := fmt.Sprintf("%q conflicts with configured named session %q via live bead %s (state=%q template=%q pool_managed=%q)",
-		identifier, spec.Identity, b.ID,
-		strings.TrimSpace(b.Metadata["state"]), strings.TrimSpace(b.Metadata["template"]), strings.TrimSpace(b.Metadata["pool_managed"]))
-	// A squat needs positive evidence that the bead runs something else: a
-	// recorded template or agent that is not this seat's. A bead that records
-	// neither could be the seat's own session, never stamped with its
-	// identity (ga-1ycmli).
-	foreign := (strings.TrimSpace(b.Metadata["template"]) != "" || strings.TrimSpace(b.Metadata["agent_name"]) != "") &&
-		!session.NamedSessionBeadMatchesSpec(b, spec)
+		identifier, spec.Identity, b.ID, d.State, d.Template, d.PoolManaged)
 	var advice string
-	switch kind := session.ClassifyNamedSessionConflict(b, spec); {
-	case kind == session.NamedSessionConflictAdoptablePool:
+	switch {
+	case d.Kind == session.NamedSessionConflictAdoptablePool:
 		advice = fmt.Sprintf("it is a pool-managed session of this seat's template that the reconciler adopts as %s; do not close it: retry after the next reconcile, or check 'gc session show %s'",
 			spec.Identity, b.ID)
-	case foreign && (kind == session.NamedSessionConflictRuntimeName || kind == session.NamedSessionConflictAlias):
+	case d.Squat:
 		advice = fmt.Sprintf("it holds this seat's name for a different template (a name squat); if it is stale, close it with 'gc session close %s' to free the name for %s",
 			b.ID, spec.Identity)
 	default:
