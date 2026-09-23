@@ -14,6 +14,7 @@ func TestLoadParsesMailCrossCity(t *testing.T) {
 name = "qlandia"
 
 [mail.crosscity]
+city = "qlandia"
 cities = ["gastown", "westeros"]
 `)
 	cfg, err := Load(fs, "/city/city.toml")
@@ -24,8 +25,8 @@ cities = ["gastown", "westeros"]
 	if cc == nil {
 		t.Fatal("Mail.CrossCity = nil, want parsed section")
 	}
-	if cc.City != "" {
-		t.Errorf("City = %q, want empty (defaults to effective city name)", cc.City)
+	if cc.City != "qlandia" {
+		t.Errorf("City = %q, want %q", cc.City, "qlandia")
 	}
 	if len(cc.Cities) != 2 || cc.Cities[0] != "gastown" || cc.Cities[1] != "westeros" {
 		t.Errorf("Cities = %v, want [gastown westeros]", cc.Cities)
@@ -58,6 +59,20 @@ func TestMailCityRoster(t *testing.T) {
 			name: "explicit city wins over workspace name",
 			cfg: &City{
 				Workspace: Workspace{Name: "workspace-name"},
+				Mail: MailConfig{CrossCity: &MailCrossCityConfig{
+					City:   "qlandia",
+					Cities: []string{"gastown"},
+				}},
+			},
+			fallback:  "dir-name",
+			wantLocal: "qlandia",
+			wantPeers: []string{"gastown"},
+		},
+		{
+			name: "configured city wins over the supervisor's registered name",
+			cfg: &City{
+				Workspace:             Workspace{Name: "workspace-name"},
+				ResolvedWorkspaceName: "registered-name",
 				Mail: MailConfig{CrossCity: &MailCrossCityConfig{
 					City:   "qlandia",
 					Cities: []string{"gastown"},
@@ -114,8 +129,10 @@ func TestValidateMailCrossCity(t *testing.T) {
 		return &City{
 			Workspace: Workspace{Name: "qlandia"},
 			Mail: MailConfig{CrossCity: &MailCrossCityConfig{
+				City:   "qlandia",
 				Cities: []string{"gastown", "westeros"},
 			}},
+			Agents: []Agent{{Name: "x", Dir: "tools"}},
 		}
 	}
 	tests := []struct {
@@ -130,6 +147,21 @@ func TestValidateMailCrossCity(t *testing.T) {
 		{
 			name:   "absent section passes",
 			mutate: func(c *City) { c.Mail.CrossCity = nil },
+		},
+		{
+			name:    "missing city is refused",
+			mutate:  func(c *City) { c.Mail.CrossCity.City = "" },
+			wantErr: "city is required",
+		},
+		{
+			name:    "agent dir named like a peer city is refused",
+			mutate:  func(c *City) { c.Agents = []Agent{{Name: "x", Dir: "gastown"}} },
+			wantErr: "agent",
+		},
+		{
+			name:    "agent dir named like the local city is refused",
+			mutate:  func(c *City) { c.Agents = []Agent{{Name: "x", Dir: "qlandia"}} },
+			wantErr: "agent",
 		},
 		{
 			name:    "empty cities list is refused",
@@ -162,8 +194,8 @@ func TestValidateMailCrossCity(t *testing.T) {
 			wantErr: "own city",
 		},
 		{
-			name:    "directory-derived local city listed as a peer is refused",
-			mutate:  func(c *City) { c.Workspace.Name = ""; c.Mail.CrossCity.Cities = []string{"cityroot"} },
+			name:    "directory-named local city listed as a peer is refused",
+			mutate:  func(c *City) { c.Mail.CrossCity.City = "cityroot"; c.Mail.CrossCity.Cities = []string{"cityroot"} },
 			wantErr: "own city",
 		},
 		{
@@ -208,6 +240,7 @@ func TestLoadWithIncludesRejectsRigNamedLikeRosterCity(t *testing.T) {
 name = "qlandia"
 
 [mail.crosscity]
+city = "qlandia"
 cities = ["gastown"]
 
 [[rigs]]
