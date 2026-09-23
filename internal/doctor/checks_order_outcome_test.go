@@ -658,3 +658,47 @@ func TestOrderOutcomeHealthy_BurstyCronStreakIsNotHiddenByItsSmallestGap(t *test
 		t.Fatalf("a bursty cron failing every visible run must warn: %v %q %v", result.Status, result.Message, result.Details)
 	}
 }
+
+// Codex r2 on #136: `0 0 * * 1,4` fires three times in seven days, so sizing
+// the window from the first visible fire called eight days enough. Read on
+// Wednesday Sep 23 the window opens Tuesday Sep 15 and holds only Thu 17 and
+// Mon 21; the streak's Mon 14 failure falls before it.
+func TestOrderOutcomeHealthy_CronWindowCountsTheLeadingGap(t *testing.T) {
+	now := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC) // a Wednesday
+	cityPath, cfg := orderFiringTestCity(t)
+	ordersDir := filepath.Join(cityPath, "orders")
+	writeOrderFiringTestOrderInDir(t, ordersDir, "mon-thu", "cron", "0 0 * * 1,4")
+	writeOrderFiringTestOrderInDir(t, ordersDir, "daily", "cron", "0 0 * * *")
+	writeOrderFiringTestEvents(t, cityPath,
+		events.Event{Type: events.OrderFailed, Ts: time.Date(2026, 9, 14, 0, 0, 0, 0, time.UTC), Subject: "mon-thu", Message: "boom"},
+		events.Event{Type: events.OrderFailed, Ts: time.Date(2026, 9, 17, 0, 0, 0, 0, time.UTC), Subject: "mon-thu", Message: "boom"},
+		events.Event{Type: events.OrderFailed, Ts: time.Date(2026, 9, 21, 0, 0, 0, 0, time.UTC), Subject: "mon-thu", Message: "boom"},
+		// A daily cron fits threshold runs wherever the window opens, so one
+		// failure with no success in view is judged normally.
+		events.Event{Type: events.OrderFailed, Ts: time.Date(2026, 9, 23, 0, 0, 0, 0, time.UTC), Subject: "daily", Message: "boom"},
+	)
+	result := runOutcomeCheckAt(t, cityPath, cfg, now)
+	joined := strings.Join(result.Details, "\n")
+	if result.Status != StatusWarning || !strings.Contains(joined, "mon-thu: every run in the last") {
+		t.Fatalf("a Mon/Thu cron failing every visible run must warn: %v %q %v", result.Status, result.Message, result.Details)
+	}
+	if !strings.Contains(joined, "daily: 1 consecutive failure(s), under threshold 3") {
+		t.Fatalf("a daily cron stays under threshold: %v", result.Details)
+	}
+}
+
+func TestTooRareForLookbackCountsTheLeadingGap(t *testing.T) {
+	for schedule, want := range map[string]bool{
+		"0 0 * * 1,4":    true,  // Mon, Thu, Mon, Thu spans 10 days
+		"0 16 * * 5":     true,  // weekly
+		"0 18 * * 1,3,5": false, // Fri, Mon, Wed, Fri spans 7 days
+		"0 9 * * 1-5":    false, // Thu, Fri, Mon, Tue spans 5 days
+		"0 0 * * *":      false,
+		"0 * * * *":      false,
+	} {
+		order := orders.Order{Name: "o", Trigger: "cron", Schedule: schedule}
+		if got := tooRareForLookback(order, 3, map[string]time.Duration{}); got != want {
+			t.Errorf("%s: tooRareForLookback = %v, want %v", schedule, got, want)
+		}
+	}
+}
