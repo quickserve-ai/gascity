@@ -178,7 +178,7 @@ declaration as an error.
 |---|---|---|
 | `formula` | string | Required. Unique formula name used by `gc formula cook`, `gc sling --formula`, and `molecule.Cook`/`CookOn` |
 | `description` | string | Human-readable description; supports `{{var}}` substitution |
-| `requires` | table | Host capability requirements. `formula_compiler` (a semver comparator) is the only axis; unknown axes fail with `formula.requirement_unknown` (section 5) |
+| `requires` | table | Host capability requirements. `formula_compiler` (a semver comparator) is the only axis; unknown axes fail with `formula.requirement_unknown` (section 5). `disabled_reason` (a non-empty string) marks an unsatisfiable requirement as deliberate, e.g. `formula_compiler = ">=999.0.0"` to shadow a formula so it can never be cooked: `gc doctor` then reports the formula as intentionally disabled instead of as a defect, and warns if the requirement is satisfiable. It never changes cook or dispatch, where the requirement is still enforced |
 | `contract` | string | Deprecated v2 opt-in. Only valid value: `"graph.v2"`; anything else fails validation. Prefer `[requires]` (section 5) |
 | `extends` | []string | Parent formulas to compose from (section 1.7) |
 | `vars` | table | Template variable declarations (section 1.4) |
