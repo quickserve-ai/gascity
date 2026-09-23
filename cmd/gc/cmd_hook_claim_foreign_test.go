@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -151,5 +153,86 @@ func TestHookClaimCandidateWithoutFormulaSourceIsUnaffected(t *testing.T) {
 	}
 	if len(spy.ids) != 1 || spy.ids[0] != "ga-plain" {
 		t.Fatalf("claim mutations = %v, want the plain candidate claimed", spy.ids)
+	}
+}
+
+// gcHomeOutsideUserHome returns a GC_HOME candidate that is NOT under the
+// user's home, mirroring westeros (GC_HOME=/data/gc-home). t.TempDir lands
+// under the system temp dir; if that happens to sit under $HOME the case
+// cannot distinguish the fix from the old behavior and is skipped.
+func gcHomeOutsideUserHome(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if home, err := os.UserHomeDir(); err == nil && !formulaSourceForeignToHost(dir, []string{home}) {
+		t.Skipf("temp dir %s sits under user home %s; cannot model a GC_HOME outside $HOME here", dir, home)
+	}
+	return dir
+}
+
+// gc-m61x: formula-instantiated roots are stamped with a gc.formula_source
+// under the gc home's cache (internal/gchome: GC_HOME first, then $HOME/.gc).
+// On a host whose GC_HOME lies outside $HOME (westeros: /data/gc-home) the
+// host roots must include it, or every locally poured molecule is declined as
+// foreign and the pool bricks (2026-09-23 17:02Z).
+func TestHookClaimHostRootsIncludeGCHome(t *testing.T) {
+	gcHome := gcHomeOutsideUserHome(t)
+	cityPath := t.TempDir()
+	t.Setenv("GC_HOME", gcHome)
+	t.Setenv("GC_CITY_PATH", cityPath)
+	userHome, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("UserHomeDir: %v", err)
+	}
+
+	roots := hookClaimHostRoots()
+
+	want := []string{cityPath, gcHome, userHome}
+	if len(roots) != len(want) {
+		t.Fatalf("hookClaimHostRoots() = %v, want exactly %v (city path, gc home, user home)", roots, want)
+	}
+	for i := range want {
+		if roots[i] != want[i] {
+			t.Errorf("hookClaimHostRoots()[%d] = %q, want %q (full = %v)", i, roots[i], want[i], roots)
+		}
+	}
+}
+
+func TestHookClaimHostRootsDropEmptyAndDuplicate(t *testing.T) {
+	userHome, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("UserHomeDir: %v", err)
+	}
+	t.Setenv("GC_CITY_PATH", "")
+	t.Setenv("GC_HOME", userHome)
+
+	roots := hookClaimHostRoots()
+
+	if len(roots) != 1 || roots[0] != userHome {
+		t.Fatalf("hookClaimHostRoots() = %v, want just %q (empty city path dropped, gc home == user home deduplicated)", roots, userHome)
+	}
+}
+
+func TestHookClaimLocalMoleculeUnderGCHomeIsClaimed(t *testing.T) {
+	gcHome := gcHomeOutsideUserHome(t)
+	t.Setenv("GC_HOME", gcHome)
+	t.Setenv("GC_CITY_PATH", t.TempDir())
+	src := filepath.Join(gcHome, "cache", "repos", "abc", "internal", "bootstrap", "packs", "core", "formulas", "mol-scoped-work.toml")
+
+	spy := &foreignClaimSpy{}
+	ops, opts := foreignGuardOpsOpts(
+		`[{"id":"ga-local-gchome","status":"open","metadata":{"gc.routed_to":"worker","gc.formula_source":"`+src+`"}}]`,
+		spy,
+	)
+	opts.HostRoots = nil // the default resolver must run
+
+	var stdout, stderr bytes.Buffer
+	if code := doHookClaim("bd ready --json", "/tmp/work", opts, ops, &stdout, &stderr); code != 0 {
+		t.Fatalf("doHookClaim = %d, want 0 (molecule poured under this host's GC_HOME is local); stderr=%s", code, stderr.String())
+	}
+	if len(spy.ids) != 1 || spy.ids[0] != "ga-local-gchome" {
+		t.Fatalf("claim mutations = %v, want the GC_HOME-instantiated candidate claimed, not declined-foreign; stderr=%s", spy.ids, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "declined-foreign") {
+		t.Errorf("stderr = %q, want no declined-foreign report for a locally instantiated molecule", stderr.String())
 	}
 }
