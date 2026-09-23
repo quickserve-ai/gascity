@@ -44,6 +44,12 @@ import (
 //  3. A work_dir disagreement whose gc.work_dir or legacy work_dir path still
 //     exists on disk is not residue: that path may be the only pointer to
 //     unpushed work.
+//  4. A stat here proves a path absent only on THIS machine. A work_dir
+//     disagreement is cleared only when the bead is provably this city's: a
+//     locally configured route, and both paths absolute and under this
+//     city's root or one of its rig paths. Otherwise (an empty route, a
+//     relative, ~ or $VAR spelling, or another machine's path) it is
+//     reported and never cleared (#123 review, 2026-09-23).
 type executorIdentityResidueCheck struct {
 	cfg      *config.City
 	cityPath string
@@ -84,6 +90,10 @@ type executorIdentityResidueFinding struct {
 	// confirm (today only gc.session_name, when the open session beads could
 	// not be listed). They are reported, never cleared.
 	unconfirmed []string
+	// reportOnly names work_dir keys whose disagreement this machine cannot
+	// judge because it cannot prove the bead is local (rule 4). They are
+	// reported, never cleared.
+	reportOnly []string
 	// judge is the verdict context this finding was judged against (the
 	// executor-identity index, the open-session set, the stat), carried so
 	// Fix() can re-run the same predicate on the live bead without rebuilding
@@ -101,18 +111,25 @@ func (f executorIdentityResidueFinding) describe() string {
 		parts = append(parts, fmt.Sprintf("may carry stale %s, UNCONFIRMED (open session beads could not be listed: %v); gc doctor --fix will not clear it",
 			strings.Join(f.unconfirmed, ", "), f.judge.openSessions.err))
 	}
+	if len(f.reportOnly) > 0 {
+		parts = append(parts, fmt.Sprintf("has disagreeing %s that this machine cannot judge (empty route, or a path not under this city's root or rig paths); REPORTED ONLY, gc doctor --fix never clears it",
+			strings.Join(f.reportOnly, ", ")))
+	}
 	return fmt.Sprintf("%s bead %s %s", f.label, f.beadID, strings.Join(parts, "; "))
 }
 
 func (c *executorIdentityResidueCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 	findings, skipped := c.collect()
-	var confirmed, unconfirmed int
+	var confirmed, unconfirmed, reportOnly int
 	for _, f := range findings {
 		if len(f.keys) > 0 {
 			confirmed++
 		}
 		if len(f.unconfirmed) > 0 {
 			unconfirmed++
+		}
+		if len(f.reportOnly) > 0 {
+			reportOnly++
 		}
 	}
 	if len(findings) == 0 && len(skipped) == 0 {
@@ -138,6 +155,10 @@ func (c *executorIdentityResidueCheck) Run(_ *doctor.CheckContext) *doctor.Check
 	if unconfirmed > 0 {
 		summary = append(summary, fmt.Sprintf("%d gc.session_name finding(s) unconfirmed: open session beads could not be listed", unconfirmed))
 		hints = append(hints, "fix session bead store access (--fix will not clear an unconfirmed gc.session_name)")
+	}
+	if reportOnly > 0 {
+		summary = append(summary, fmt.Sprintf("%d work_dir finding(s) reported only: locality not provable on this machine", reportOnly))
+		hints = append(hints, "review report-only work_dir stamps from the machine that owns them (--fix never clears them)")
 	}
 	if len(skipped) > 0 {
 		summary = append(summary, fmt.Sprintf("%d scope(s) skipped", len(skipped)))
@@ -174,7 +195,7 @@ func (c *executorIdentityResidueCheck) Fix(_ *doctor.CheckContext) error {
 			errs = append(errs, fmt.Errorf("%s bead %s: re-read before clearing executor-identity stamp: %w", f.label, f.beadID, getErr))
 			continue
 		}
-		liveKeys, _ := f.judge.staleKeys(live)
+		liveKeys, _, _ := f.judge.staleKeys(live)
 		if len(liveKeys) == 0 {
 			continue
 		}
@@ -316,11 +337,11 @@ func (c *executorIdentityResidueCheck) collectStoreFindings(store beads.Store, l
 	}
 	var findings []executorIdentityResidueFinding
 	for _, bd := range items {
-		keys, unconfirmed := judge.staleKeys(bd)
-		if len(keys) == 0 && len(unconfirmed) == 0 {
+		keys, unconfirmed, reportOnly := judge.staleKeys(bd)
+		if len(keys) == 0 && len(unconfirmed) == 0 && len(reportOnly) == 0 {
 			continue
 		}
-		findings = append(findings, executorIdentityResidueFinding{label: label, store: store, beadID: bd.ID, keys: keys, unconfirmed: unconfirmed, judge: judge})
+		findings = append(findings, executorIdentityResidueFinding{label: label, store: store, beadID: bd.ID, keys: keys, unconfirmed: unconfirmed, reportOnly: reportOnly, judge: judge})
 	}
 	return findings, nil
 }
@@ -490,22 +511,25 @@ type executorIdentityResidueJudge struct {
 // staleSessionNameStamp for the trigger conditions and stand-downs. Keeping
 // the two disjoint is load-bearing: Fix() clears exactly the returned keys,
 // so a trigger that did not fire can never lose state it never inspected.
-func (j *executorIdentityResidueJudge) staleKeys(bd beads.Bead) (keys, unconfirmed []string) {
+func (j *executorIdentityResidueJudge) staleKeys(bd beads.Bead) (keys, unconfirmed, reportOnly []string) {
 	if bd.Status == "closed" {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if bd.Status == "in_progress" {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if graphroute.IsWorkflowTopologyKind(bd.Metadata[beadmeta.KindMetadataKey]) {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if routedTo := strings.TrimSpace(bd.Metadata[beadmeta.RoutedToMetadataKey]); routedTo != "" && !residueRouteConfiguredLocally(j.cfg, routedTo) {
-		return nil, nil
+		return nil, nil, nil
 	}
 
-	if j.staleWorkDirStamp(bd) {
+	switch j.staleWorkDirStamp(bd) {
+	case residueWorkDirStale:
 		keys = append(keys, beadmeta.WorkDirMetadataKey, beadmeta.LegacyWorkDirMetadataKey)
+	case residueWorkDirReportOnly:
+		reportOnly = append(reportOnly, beadmeta.WorkDirMetadataKey, beadmeta.LegacyWorkDirMetadataKey)
 	}
 	switch j.staleSessionNameStamp(bd) {
 	case residueStale:
@@ -513,7 +537,7 @@ func (j *executorIdentityResidueJudge) staleKeys(bd beads.Bead) (keys, unconfirm
 	case residueUnconfirmed:
 		unconfirmed = append(unconfirmed, beadmeta.SessionNameMetadataKey)
 	}
-	return keys, unconfirmed
+	return keys, unconfirmed, reportOnly
 }
 
 // residueRouteConfiguredLocally reports whether route resolves to an agent or
@@ -560,22 +584,89 @@ func residueRouteConfiguredLocally(cfg *config.City, route string) bool {
 //   - rule 3: either path still exists on disk (or cannot be proven absent).
 //     A legacy per-bead worktree that is still there may hold unpushed
 //     work, and its work_dir key is the only pointer to it (ga-n2f1ph).
-func (j *executorIdentityResidueJudge) staleWorkDirStamp(bd beads.Bead) bool {
+//
+// A disagreement that survives those is residue only if this machine can
+// judge it (rule 4): otherwise it is residueWorkDirReportOnly.
+func (j *executorIdentityResidueJudge) staleWorkDirStamp(bd beads.Bead) residueWorkDirVerdict {
 	workDir := strings.TrimSpace(bd.Metadata[beadmeta.WorkDirMetadataKey])
 	legacyWorkDir := strings.TrimSpace(bd.Metadata[beadmeta.LegacyWorkDirMetadataKey])
 	if workDir == "" || legacyWorkDir == "" || workDir == legacyWorkDir {
-		return false
+		return residueWorkDirNotStale
 	}
 	if hasWorktreeOwnershipEvidence(bd) {
-		return false
+		return residueWorkDirNotStale
 	}
 	if poolSlotWorkDirRepairFor(j.cfg, bd) != nil {
-		return false
+		return residueWorkDirNotStale
 	}
 	if j.workDirMayExist(workDir) || j.workDirMayExist(legacyWorkDir) {
+		return residueWorkDirNotStale
+	}
+	// An empty route is ordinary on a store shared with other towns (a
+	// post-claim or detached bead), so it says nothing about whose bead this
+	// is. Only a locally configured route (rule 1 already refused any other)
+	// with both paths under this city's roots is this machine's to clear.
+	if strings.TrimSpace(bd.Metadata[beadmeta.RoutedToMetadataKey]) == "" ||
+		!j.pathProvablyLocal(workDir) || !j.pathProvablyLocal(legacyWorkDir) {
+		return residueWorkDirReportOnly
+	}
+	return residueWorkDirStale
+}
+
+// residueWorkDirVerdict is staleWorkDirStamp's three-way answer.
+type residueWorkDirVerdict int
+
+const (
+	residueWorkDirNotStale residueWorkDirVerdict = iota
+	residueWorkDirStale
+	// residueWorkDirReportOnly: every rule calls the pair stale, but this
+	// machine cannot prove the bead or its paths are local (rule 4).
+	residueWorkDirReportOnly
+)
+
+// pathProvablyLocal reports whether path is absolute and lies under this
+// city's root or one of its rig paths. Only then does a stat on this machine
+// say anything about it: a relative, ~ or $VAR spelling, or another machine's
+// worktree path, stats absent here whether or not it exists where it was
+// stamped (#123 review, 2026-09-23).
+func (j *executorIdentityResidueJudge) pathProvablyLocal(path string) bool {
+	if !filepath.IsAbs(path) {
 		return false
 	}
-	return true
+	path = filepath.Clean(path)
+	for _, root := range j.localRoots() {
+		rel, err := filepath.Rel(root, path)
+		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+// localRoots returns this city's root and its rig paths, absolute and clean.
+func (j *executorIdentityResidueJudge) localRoots() []string {
+	cityPath := strings.TrimSpace(j.cityPath)
+	var roots []string
+	if filepath.IsAbs(cityPath) {
+		roots = append(roots, filepath.Clean(cityPath))
+	}
+	if j.cfg == nil {
+		return roots
+	}
+	for _, rig := range j.cfg.Rigs {
+		p := strings.TrimSpace(rig.Path)
+		if p == "" {
+			continue
+		}
+		if !filepath.IsAbs(p) {
+			if !filepath.IsAbs(cityPath) {
+				continue
+			}
+			p = filepath.Join(cityPath, p)
+		}
+		roots = append(roots, filepath.Clean(p))
+	}
+	return roots
 }
 
 // workDirMayExist reports whether path could still exist on disk. Only a

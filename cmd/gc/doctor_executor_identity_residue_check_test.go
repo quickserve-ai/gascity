@@ -22,8 +22,8 @@ func TestExecutorIdentityResidueCheckFlagsAndFixesStaleStamp(t *testing.T) {
 		{ID: "CITY-1", Title: "stale stamp", Type: "task", Status: "open", Metadata: map[string]string{
 			"gc.routed_to":    "gascity/reviewer",
 			"gc.session_name": "gascity--builder",
-			"gc.work_dir":     "/worktrees/gascity/builder-1",
-			"work_dir":        "/legacy/worktrees/gascity/builder-1",
+			"gc.work_dir":     filepath.Join(cityDir, "worktrees/gascity/builder-1"),
+			"work_dir":        filepath.Join(cityDir, "legacy/worktrees/gascity/builder-1"),
 		}},
 	}, nil)
 
@@ -295,8 +295,9 @@ func TestExecutorIdentityResidueCheckDescribeNamesTriggeringKeys(t *testing.T) {
 			"gc.session_name": "gascity--builder",
 		}},
 		{ID: "CITY-2", Title: "work_dir residue", Type: "task", Status: "open", Metadata: map[string]string{
-			"gc.work_dir": "/worktrees/gascity/builder-1",
-			"work_dir":    "/legacy/worktrees/gascity/builder-1",
+			"gc.routed_to": "gascity/builder",
+			"gc.work_dir":  filepath.Join(cityDir, "worktrees/gascity/builder-1"),
+			"work_dir":     filepath.Join(cityDir, "legacy/worktrees/gascity/builder-1"),
 		}},
 	}, nil)
 
@@ -500,8 +501,8 @@ func TestExecutorIdentityResidueCheckFlagsLegacyCanonicalWorkDirDisagreement(t *
 		{ID: "CITY-1", Title: "work_dir disagreement, session_name current", Type: "task", Status: "open", Metadata: map[string]string{
 			"gc.routed_to":    "gascity/builder",
 			"gc.session_name": "gascity--builder",
-			"gc.work_dir":     "/worktrees/gascity/builder-1",
-			"work_dir":        "/legacy/worktrees/gascity/builder-1",
+			"gc.work_dir":     filepath.Join(cityDir, "worktrees/gascity/builder-1"),
+			"work_dir":        filepath.Join(cityDir, "legacy/worktrees/gascity/builder-1"),
 		}},
 	}, nil)
 
@@ -979,27 +980,51 @@ func TestExecutorIdentityResidueCheckSkipsBeadsNotRoutedToALocalAgent(t *testing
 }
 
 func TestExecutorIdentityResidueCheckStandsDownOnWorkDirThatExists(t *testing.T) {
-	const canonical = "/worktrees/gascity/builder-1"
-	const legacy = "/legacy/worktrees/gascity/builder-1"
+	// Paths are relative to the city dir unless a case gives its own. Rule 4
+	// (#123 review): a pair this machine cannot prove local -- an empty
+	// route, a path outside the city's roots, a ~ spelling -- is reported
+	// but never cleared, because a stat here says nothing about a worktree
+	// on another town's machine.
+	const canonical = "worktrees/gascity/builder-1"
+	const legacy = "legacy/worktrees/gascity/builder-1"
 	cases := []struct {
-		name        string
-		route       string
-		stat        map[string]error
-		wantFlagged bool
+		name                     string
+		route                    string
+		canonical, legacy        string // absolute or ~ overrides; "" = under the city dir
+		stat                     map[string]string
+		wantFlagged, wantCleared bool
+		wantReportOnly           bool
 	}{
-		{name: "legacy exists", route: "gascity/builder", stat: map[string]error{legacy: nil}},
-		{name: "canonical exists", route: "gascity/builder", stat: map[string]error{canonical: nil}},
-		{name: "legacy stat permission error", route: "gascity/builder", stat: map[string]error{legacy: fs.ErrPermission}},
-		{name: "empty route, legacy exists", route: "", stat: map[string]error{legacy: nil}},
-		{name: "both absent", route: "gascity/builder", wantFlagged: true},
-		{name: "empty route, both absent", route: "", wantFlagged: true},
+		{name: "legacy exists", route: "gascity/builder", stat: map[string]string{legacy: "exists"}},
+		{name: "canonical exists", route: "gascity/builder", stat: map[string]string{canonical: "exists"}},
+		{name: "legacy stat permission error", route: "gascity/builder", stat: map[string]string{legacy: "denied"}},
+		{name: "empty route, legacy exists", route: "", stat: map[string]string{legacy: "exists"}},
+		{name: "both absent", route: "gascity/builder", wantFlagged: true, wantCleared: true},
+		{name: "empty route, both absent", route: "", wantFlagged: true, wantReportOnly: true},
+		{name: "another machine's paths", route: "gascity/builder", canonical: "/Users/alex/worktrees/gascity/builder-1", legacy: "/Users/alex/legacy/builder-1", wantFlagged: true, wantReportOnly: true},
+		{name: "tilde path", route: "gascity/builder", legacy: "~/legacy/builder-1", wantFlagged: true, wantReportOnly: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			cityDir := t.TempDir()
+			resolve := func(override, rel string) string {
+				if override != "" {
+					return override
+				}
+				return filepath.Join(cityDir, rel)
+			}
+			canonicalPath, legacyPath := resolve(tc.canonical, canonical), resolve(tc.legacy, legacy)
+			stat := map[string]error{}
+			for rel, outcome := range tc.stat {
+				err := error(nil)
+				if outcome == "denied" {
+					err = fs.ErrPermission
+				}
+				stat[filepath.Join(cityDir, rel)] = err
+			}
 			md := map[string]string{
-				"gc.work_dir": canonical,
-				"work_dir":    legacy,
+				"gc.work_dir": canonicalPath,
+				"work_dir":    legacyPath,
 			}
 			if tc.route != "" {
 				md["gc.routed_to"] = tc.route
@@ -1008,12 +1033,15 @@ func TestExecutorIdentityResidueCheckStandsDownOnWorkDirThatExists(t *testing.T)
 				{ID: "CITY-1", Title: "work_dir disagreement", Type: "task", Status: "open", Metadata: md},
 			}, nil)}
 			check := newResidueTestCheck(residueTestCity(), cityDir, residueSingleStoreFactory(t, cityDir, store))
-			check.statPath = residueFakeStat(tc.stat)
+			check.statPath = residueFakeStat(stat)
 
 			result := check.Run(&doctor.CheckContext{})
-			flagged := strings.Contains(strings.Join(result.Details, "\n"), "CITY-1")
-			if flagged != tc.wantFlagged {
+			details := strings.Join(result.Details, "\n")
+			if flagged := strings.Contains(details, "CITY-1"); flagged != tc.wantFlagged {
 				t.Fatalf("flagged = %v, want %v: %#v", flagged, tc.wantFlagged, result)
+			}
+			if reportOnly := strings.Contains(details, "REPORTED ONLY"); reportOnly != tc.wantReportOnly {
+				t.Fatalf("reported only = %v, want %v: %#v", reportOnly, tc.wantReportOnly, result)
 			}
 			if err := check.Fix(&doctor.CheckContext{}); err != nil {
 				t.Fatalf("Fix returned error: %v", err)
@@ -1023,10 +1051,41 @@ func TestExecutorIdentityResidueCheckStandsDownOnWorkDirThatExists(t *testing.T)
 				t.Fatalf("Get: %v", err)
 			}
 			cleared := bd.Metadata["gc.work_dir"] == "" && bd.Metadata["work_dir"] == ""
-			if cleared != tc.wantFlagged {
-				t.Fatalf("work_dir keys cleared = %v, want %v (metadata %+v)", cleared, tc.wantFlagged, bd.Metadata)
+			if cleared != tc.wantCleared {
+				t.Fatalf("work_dir keys cleared = %v, want %v (metadata %+v)", cleared, tc.wantCleared, bd.Metadata)
+			}
+			if !tc.wantCleared && len(store.writes) != 0 {
+				t.Fatalf("Fix wrote %v, want no write", store.writes)
 			}
 		})
+	}
+}
+
+func TestExecutorIdentityResidueJudgePathProvablyLocal(t *testing.T) {
+	cityDir := t.TempDir()
+	rigDir := t.TempDir()
+	judge := &executorIdentityResidueJudge{
+		cfg:      &config.City{Rigs: []config.Rig{{Name: "qcore", Path: rigDir}, {Name: "rel", Path: "rigs/rel"}}},
+		cityPath: cityDir,
+	}
+	for _, tc := range []struct {
+		path string
+		want bool
+	}{
+		{filepath.Join(cityDir, ".gc/worktrees/x"), true},
+		{filepath.Join(rigDir, ".worktrees/x"), true},
+		{filepath.Join(cityDir, "rigs/rel/x"), true},
+		{cityDir, true},
+		{filepath.Join(cityDir, "../elsewhere/x"), false},
+		{cityDir + "-sibling/x", false},
+		{"/Users/alex/worktrees/x", false},
+		{"~/worktrees/x", false},
+		{"$HOME/worktrees/x", false},
+		{"worktrees/x", false},
+	} {
+		if got := judge.pathProvablyLocal(tc.path); got != tc.want {
+			t.Errorf("pathProvablyLocal(%q) = %v, want %v", tc.path, got, tc.want)
+		}
 	}
 }
 
@@ -1062,8 +1121,8 @@ func TestExecutorIdentityResidueCheckFailsClosedWhenOpenSessionsUnavailable(t *t
 		{ID: "CITY-2", Title: "second session_name candidate, plus work_dir residue", Type: "task", Status: "open", Metadata: map[string]string{
 			"gc.routed_to":    "gascity/reviewer",
 			"gc.session_name": "gascity--deployer",
-			"gc.work_dir":     "/worktrees/gascity/deployer-1",
-			"work_dir":        "/legacy/worktrees/gascity/deployer-1",
+			"gc.work_dir":     filepath.Join(cityDir, "worktrees/gascity/deployer-1"),
+			"work_dir":        filepath.Join(cityDir, "legacy/worktrees/gascity/deployer-1"),
 		}},
 	}, nil)}
 	check := newResidueTestCheck(residueTestCity(), cityDir, residueSingleStoreFactory(t, cityDir, store))
@@ -1157,8 +1216,8 @@ func TestExecutorIdentityResidueCheckFixClearsExactlyAGenuineStaleStampsKeys(t *
 		{ID: "CITY-1", Title: "genuinely stale", Type: "task", Status: "open", Metadata: map[string]string{
 			"gc.routed_to":    "gascity/reviewer",
 			"gc.session_name": "gascity--builder-7",
-			"gc.work_dir":     "/worktrees/gascity/builder-7",
-			"work_dir":        "/legacy/worktrees/gascity/builder-7",
+			"gc.work_dir":     filepath.Join(cityDir, "worktrees/gascity/builder-7"),
+			"work_dir":        filepath.Join(cityDir, "legacy/worktrees/gascity/builder-7"),
 			"gc.work_branch":  "builder/ga-abc123",
 		}},
 	}, nil)}
