@@ -191,7 +191,11 @@ func setFormulaCompilerConstraints(f *Formula, constraints []formulaCompilerCons
 	for _, constraint := range constraints {
 		parts = append(parts, constraint.Raw)
 	}
-	f.Requires = &Requirements{FormulaCompiler: strings.Join(parts, ", ")}
+	reason := ""
+	if f.Requires != nil {
+		reason = f.Requires.DisabledReason
+	}
+	f.Requires = &Requirements{FormulaCompiler: strings.Join(parts, ", "), DisabledReason: reason}
 }
 
 func addFormulaCompilerConstraints(f *Formula, extra []formulaCompilerConstraint) error {
@@ -369,7 +373,7 @@ func cloneRequirements(req *Requirements) *Requirements {
 	if req == nil {
 		return nil
 	}
-	return &Requirements{FormulaCompiler: req.FormulaCompiler}
+	return &Requirements{FormulaCompiler: req.FormulaCompiler, DisabledReason: req.DisabledReason}
 }
 
 func invalidFormulaCompilerRequirement(raw string, err error) error {
@@ -388,5 +392,5 @@ func unsatisfiedFormulaCompilerRequirement(raw, source, hostVersion string, form
 }
 
 func unknownRequirementError(key string) error {
-	return fmt.Errorf("formula.requirement_unknown: unknown formula requirement %q; supported requirements: formula_compiler", key)
+	return fmt.Errorf("formula.requirement_unknown: unknown formula requirement %q; supported requirements: formula_compiler, disabled_reason", key)
 }
