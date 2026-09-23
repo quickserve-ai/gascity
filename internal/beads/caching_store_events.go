@@ -600,6 +600,9 @@ func mergeCacheEventPatch(base, patch Bead, fields map[string]json.RawMessage) B
 	if hasCacheEventField(fields, "is_blocked") {
 		merged.IsBlocked = cloneBoolPtr(patch.IsBlocked)
 	}
+	if hasCacheEventField(fields, "await_type") {
+		merged.AwaitType = patch.AwaitType
+	}
 	return merged
 }
 
@@ -648,6 +651,9 @@ func cacheEventConflictsCurrent(current, patch Bead, fields map[string]json.RawM
 		return true
 	}
 	if hasCacheEventField(fields, "is_blocked") && !boolPtrEqual(current.IsBlocked, patch.IsBlocked) {
+		return true
+	}
+	if hasCacheEventField(fields, "await_type") && current.AwaitType != patch.AwaitType {
 		return true
 	}
 	return false
