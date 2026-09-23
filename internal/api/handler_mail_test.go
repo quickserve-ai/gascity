@@ -1586,7 +1586,7 @@ func TestMailSendTwoSquattersOneHoldingTheAliasStillRefuses(t *testing.T) {
 		"agent_name":   "other",
 		"state":        "asleep",
 	}, "")
-	createTestSessionBead(t, state.cityBeadStore, map[string]string{
+	holder := createTestSessionBead(t, state.cityBeadStore, map[string]string{
 		"session_name": "rogue-runtime",
 		"alias":        spec.Identity,
 		"state":        "active",
@@ -1598,11 +1598,61 @@ func TestMailSendTwoSquattersOneHoldingTheAliasStillRefuses(t *testing.T) {
 	if rec.Code < 400 || rec.Code >= 500 {
 		t.Fatalf("status = %d, want 4xx refusal with an alias holder live; body = %s", rec.Code, rec.Body.String())
 	}
+	// The conflict error names the runtime squatter; the refusal must also
+	// name the bead that actually reads the mailbox, or the operator clears
+	// the wrong one and the send still fails.
+	if !strings.Contains(rec.Body.String(), "session bead "+holder.ID+" also answers") {
+		t.Fatalf("refusal does not name the alias holder %s; body = %s", holder.ID, rec.Body.String())
+	}
 	inbox, err := state.cityMailProv.Inbox(spec.Identity)
 	if err != nil {
 		t.Fatalf("Inbox: %v", err)
 	}
 	if len(inbox) != 0 {
 		t.Fatalf("stored %d messages under %s with an alias holder live, want 0", len(inbox), spec.Identity)
+	}
+}
+
+func TestMailSendThroughSquatStoresWhenTheOnlyAliasHolderIsTheSeatsOwnArchivedBead(t *testing.T) {
+	// ga-isa3j4 review round 3: an archived seat bead keeps its alias (ArchivePatch
+	// does not clear it) and is not canonical once continuity-ineligible. It IS the
+	// seat, not a squatter, so it must not block storing the seat's mail while
+	// another bead squats the runtime name. Blocking here re-creates the bug.
+	state := newSessionFakeState(t)
+	srv := New(state)
+	spec, ok, err := srv.findNamedSessionSpecForTarget(state.cityBeadStore, "myrig/worker")
+	if err != nil || !ok {
+		t.Fatalf("fixture: findNamedSessionSpecForTarget(myrig/worker) = %v, %v", ok, err)
+	}
+	createTestSessionBead(t, state.cityBeadStore, map[string]string{
+		session.NamedSessionMetadataKey:      "true",
+		session.NamedSessionIdentityMetadata: spec.Identity,
+		"alias":                              spec.Identity,
+		"session_name":                       "old-runtime",
+		"state":                              "archived",
+		"continuity_eligible":                "false",
+	}, "")
+	createTestSessionBead(t, state.cityBeadStore, map[string]string{
+		"session_name": spec.SessionName,
+		"template":     "other",
+		"agent_name":   "other",
+		"state":        "asleep",
+	}, "")
+	if _, err := srv.resolveSessionIDWithConfig(state.cityBeadStore, "myrig/worker"); !errors.Is(err, errConfiguredNamedSessionConflict) {
+		t.Fatalf("fixture: resolution err = %v, want the squat conflict (the archived seat bead must not be canonical)", err)
+	}
+	h := newTestCityHandler(t, state)
+	body := `{"from":"mayor","to":"myrig/worker","subject":"to the seat","body":"x"}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, newPostRequest(cityURL(state, "/mail"), bytes.NewBufferString(body)))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d; body = %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	inbox, err := state.cityMailProv.Inbox(spec.Identity)
+	if err != nil {
+		t.Fatalf("Inbox: %v", err)
+	}
+	if len(inbox) != 1 {
+		t.Fatalf("inbox for %s = %d messages, want 1", spec.Identity, len(inbox))
 	}
 }

@@ -188,23 +188,37 @@ func (s *Store) ExtmsgHandleSource(id string) (string, bool) {
 	return ExtmsgHandleSource(b), true
 }
 
-// LiveSessionAnsweringToMailbox returns a non-closed session bead that lists
-// address among its mailbox addresses (alias, alias history, runtime name), so
-// mail stored under address would show in that bead's inbox. It scans every
-// session bead because alias history is a list no exact metadata query can
-// match; callers use it only on the rare named-session squat path, never on
-// ordinary sends (ga-isa3j4).
-func LiveSessionAnsweringToMailbox(store beads.Store, address string) (beads.Bead, bool, error) {
-	target := NormalizeNamedSessionTarget(address)
+// NonSeatSessionAnsweringToMailbox returns a non-closed session bead, other
+// than one of the configured seat's own named beads, that lists spec.Identity
+// among its mailbox addresses (alias, alias history, runtime name). Mail
+// stored under that address would show in the returned bead's inbox, so a
+// caller must not fall through to the configured mailbox while one exists
+// (ga-isa3j4).
+//
+// It scans type AND label (ListAllSessionBeads), because a label-lost session
+// bead still answers by ID, and always checks conflict, the bead the named
+// lookup reported, so the scan can never miss what the lookup found. The
+// seat's own beads (named, same identity; e.g. an archived one that kept its
+// alias) are the seat, not squatters. Alias history is a list no exact
+// metadata query can match, hence the scan; callers use it only on the rare
+// squat path.
+func NonSeatSessionAnsweringToMailbox(store beads.Store, spec NamedSessionSpec, conflict beads.Bead) (beads.Bead, bool, error) {
+	target := NormalizeNamedSessionTarget(spec.Identity)
 	if store == nil || target == "" {
 		return beads.Bead{}, false, nil
 	}
-	items, err := store.List(beads.ListQuery{Label: LabelSession})
+	items, err := ListAllSessionBeads(store, beads.ListQuery{})
 	if err != nil {
 		return beads.Bead{}, false, err
 	}
+	if conflict.ID != "" {
+		items = append([]beads.Bead{conflict}, items...)
+	}
 	for _, b := range items {
-		if !IsSessionBeadOrRepairable(b) || b.Status == "closed" {
+		if b.Status == "closed" {
+			continue
+		}
+		if IsNamedSessionBead(b) && NormalizeNamedSessionTarget(NamedSessionIdentity(b)) == target {
 			continue
 		}
 		for _, addr := range MailboxAddressesIncludingRuntimeName(b) {
