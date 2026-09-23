@@ -200,7 +200,7 @@ func TestMailReplyCrossCityFailsClosedWhenOriginUnreadable(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "cross_city_origin_unverified") {
 		t.Errorf("body = %q, want the cross_city_origin_unverified refusal", rec.Body.String())
 	}
-	inbox, _ := flaky.Provider.Inbox("gastown/mayor")
+	inbox, _ := flaky.Inbox("gastown/mayor")
 	for _, m := range inbox {
 		if m.ID != seeded.ID {
 			t.Errorf("a reply %q was written despite the refusal", m.ID)

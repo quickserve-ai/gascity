@@ -157,7 +157,7 @@ func TestRefuseUnknownCityLeavesNonNotFoundErrorsAlone(t *testing.T) {
 		t.Errorf("got %v, want the timeout error unchanged", got)
 	}
 	squat := errors.New("mailbox name squats a live session")
-	if got := RefuseUnknownCity(squat, "gastwn/mayor", enabledRoster(), nil); got != squat {
+	if got := RefuseUnknownCity(squat, "gastwn/mayor", enabledRoster(), nil); !errors.Is(got, squat) {
 		t.Errorf("got %v, want the squat refusal unchanged", got)
 	}
 }
