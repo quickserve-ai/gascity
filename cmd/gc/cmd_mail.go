@@ -104,6 +104,9 @@ type mailActionResult struct {
 	AlreadyDone   bool                 `json:"already_done,omitempty"`
 	Notified      bool                 `json:"notified,omitempty"`
 	DryRun        bool                 `json:"dry_run,omitempty"`
+	// Unreached lists configured named seats a --all broadcast did NOT reach
+	// because they had no open session (ga-dwgz52).
+	Unreached []string `json:"unreached,omitempty"`
 }
 
 type mailMessageSummary struct {
@@ -1080,8 +1083,16 @@ func resolveMailIdentityWithConfigCached(cityPath string, cfg *config.City, sess
 			}
 			return address, nil
 		}
+		// A name squat (a live bead holding the configured session's name
+		// without being that session, ga-lm5coj) is a RUNTIME problem. The
+		// mailbox identity comes from config and does not depend on it, so
+		// mail falls through to the configured address below and is stored.
+		// Refusing here was the ga-isa3j4 loss: the send failed and wrote
+		// nothing. The wake may still fail after the store, loudly.
 		if !errors.Is(err, session.ErrSessionNotFound) {
-			return "", err
+			if refusal := mailNamedSessionSquatRefusal(cityPath, cfg, sessStore, identifier, err); refusal != nil {
+				return "", refusal
+			}
 		}
 	}
 	if target, matched, targetErr := resolveLiveConfiguredNamedMailTargetCached(sessStore, identifier, cache); targetErr != nil {
@@ -1093,6 +1104,35 @@ func resolveMailIdentityWithConfigCached(cityPath string, cfg *config.City, sess
 		return address, nil
 	}
 	return resolveMailIdentityCached(sessStore, identifier, cache)
+}
+
+// mailNamedSessionSquatRefusal returns nil when a named-session conflict may
+// resolve to the configured mailbox anyway, and otherwise the error to refuse
+// with. Falling through is safe only when no session bead other than the
+// seat's own answers to that mailbox address: one holding the identity as its
+// alias (or runtime name) lists it in its own inbox and would read the seat's
+// mail (ga-isa3j4 reviews, 2026-09-23). A refusal names the bead that
+// answered, which need not be the one the conflict error names.
+func mailNamedSessionSquatRefusal(cityPath string, cfg *config.City, sessStore beads.Store, identifier string, err error) error {
+	if !errors.Is(err, errNamedSessionConflict) || cfg == nil || sessStore == nil {
+		return err
+	}
+	spec, ok, specErr := findNamedSessionSpecForTarget(cfg, loadedCityName(cfg, cityPath), identifier)
+	if specErr != nil || !ok {
+		return err
+	}
+	lookup, lookupErr := session.LookupConfiguredNamedSession(sessStore, spec)
+	if lookupErr != nil || !lookup.HasConflict {
+		return err
+	}
+	answering, answered, scanErr := session.NonSeatSessionAnsweringToMailbox(sessStore, spec, lookup.Conflict)
+	if scanErr != nil {
+		return fmt.Errorf("%w (and checking which sessions read mailbox %q failed: %w)", err, spec.Identity, scanErr)
+	}
+	if answered {
+		return fmt.Errorf("%w; not storing: session bead %s also answers to mailbox %q and would read it", err, answering.ID, spec.Identity)
+	}
+	return nil
 }
 
 func resolveMailRecipientIdentity(cityPath string, cfg *config.City, sessStore beads.Store, identifier string) (string, error) {
@@ -1540,7 +1580,10 @@ a non-running recipient. Unread mail alone does not request a wake.
 Use --from to override the sender identity.
 Use --to as an alternative to the positional <to> argument.
 Use -s/--subject for the summary line and -m/--message for the body text.
-Use --all to broadcast to all live sessions (excluding sender and "human").
+Use --all to broadcast to every OPEN session (excluding sender and "human").
+Configured seats with no open session get nothing; --all names them on stderr
+(and in --json "unreached"). For a policy-bearing broadcast, mail those seats
+by address, which materializes them.
 
 Use --dedup <key> for repeating notifications (patrol and cooldown orders
 that re-detect the same condition every run): the send is suppressed while
@@ -1594,7 +1637,7 @@ city that mails you. --all and --notify are refused for a remote city.`,
 	cmd.Flags().BoolVar(&notify, "nudge", false, "alias for --notify")
 	_ = cmd.Flags().MarkHidden("nudge")
 	cmd.Flags().BoolVar(&noNotify, "no-notify", false, "suppress the default recipient nudge for a direct local send")
-	cmd.Flags().BoolVar(&all, "all", false, "broadcast to all live sessions (excludes sender and human)")
+	cmd.Flags().BoolVar(&all, "all", false, "broadcast to every open session (excludes sender and human); names configured seats it could not reach")
 	cmd.Flags().StringVar(&from, "from", "", "sender identity (default: $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or \"human\")")
 	cmd.Flags().StringVar(&to, "to", "", "recipient address (alternative to positional argument)")
 	cmd.Flags().StringVarP(&subject, "subject", "s", "", "message subject line")
@@ -2005,7 +2048,18 @@ func cmdMailSendJSONFull(args []string, notify bool, all bool, from string, to s
 
 	if all {
 		rec := openCityRecorder(stderr)
-		return doMailSendAllJSON(mp, rec, validRecipients, sender, args, nf, jsonOut, stdout, stderr)
+		var cov *broadcastCoverage
+		if cfg != nil && sessStore != nil {
+			if open, oerr := listMailIdentitySessions(sessStore, idCache); oerr == nil {
+				cov = &broadcastCoverage{open: open}
+				for i := range cfg.NamedSessions {
+					if q := strings.TrimSpace(cfg.NamedSessions[i].QualifiedName()); q != "" {
+						cov.configured = append(cov.configured, q)
+					}
+				}
+			}
+		}
+		return doMailSendAllCoverage(mp, rec, validRecipients, sender, args, nf, jsonOut, cov, stdout, stderr)
 	}
 
 	rec := openCityRecorder(stderr)
@@ -2109,6 +2163,57 @@ func doMailSendAll(mp mail.Provider, rec events.Recorder, validRecipients map[st
 }
 
 func doMailSendAllJSON(mp mail.Provider, rec events.Recorder, validRecipients map[string]bool, sender string, args []string, nudgeFn nudgeFunc, jsonOut bool, stdout, stderr io.Writer) int {
+	return doMailSendAllCoverage(mp, rec, validRecipients, sender, args, nudgeFn, jsonOut, nil, stdout, stderr)
+}
+
+// broadcastCoverage carries what --all needs to name the configured seats it
+// did not reach: the configured named-session identities and the open session
+// Infos the recipient set was built from.
+type broadcastCoverage struct {
+	configured []string
+	open       []session.Info
+}
+
+// unreachedConfiguredSeats returns the configured named-session identities that
+// no sent broadcast copy reached, sorted. A seat is reached when an open session
+// bound to it (by configured-named identity, or whose mailbox address IS the
+// identity) received a copy. The join goes through the session's
+// configured_named_identity metadata, never by string-comparing the identity to
+// the mailbox alias: the two can differ ("qcore/cherub-law.pam" vs "qcore/pam"),
+// and a string compare would report a seat that got the mail as skipped. The
+// sender's own seat is excluded, not unreached.
+func unreachedConfiguredSeats(cov *broadcastCoverage, sent map[string]bool, sender string) []string {
+	if cov == nil {
+		return nil
+	}
+	reached := map[string]bool{}
+	for _, info := range cov.open {
+		if info.Closed {
+			continue
+		}
+		addr := session.MailboxAddressFromInfo(info)
+		if !sent[addr] && addr != sender {
+			continue
+		}
+		if id := strings.TrimSpace(info.ConfiguredNamedIdentity); id != "" {
+			reached[id] = true
+		}
+		reached[addr] = true
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, q := range cov.configured {
+		if q == "" || seen[q] || q == sender || reached[q] {
+			continue
+		}
+		seen[q] = true
+		out = append(out, q)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func doMailSendAllCoverage(mp mail.Provider, rec events.Recorder, validRecipients map[string]bool, sender string, args []string, nudgeFn nudgeFunc, jsonOut bool, cov *broadcastCoverage, stdout, stderr io.Writer) int {
 	if len(args) < 1 {
 		fmt.Fprintln(stderr, "gc mail send --all: usage: gc mail send --all <body>") //nolint:errcheck // best-effort stderr
 		return 1
@@ -2138,6 +2243,7 @@ func doMailSendAllJSON(mp mail.Provider, rec events.Recorder, validRecipients ma
 	}
 
 	var sent []mailMessageSummary
+	sentTo := map[string]bool{}
 	notified := false
 	for _, to := range recipients {
 		m, err := mp.Send(sender, to, subject, body)
@@ -2153,6 +2259,7 @@ func doMailSendAllJSON(mp mail.Provider, rec events.Recorder, validRecipients ma
 			Payload: mailEventPayload(&m),
 		})
 		sent = append(sent, summarizeMailMessage(m))
+		sentTo[to] = true
 		if !jsonOut {
 			fmt.Fprintf(stdout, "Sent message %s to %s\n", m.ID, to) //nolint:errcheck // best-effort stdout
 		}
@@ -2165,8 +2272,14 @@ func doMailSendAllJSON(mp mail.Provider, rec events.Recorder, validRecipients ma
 			}
 		}
 	}
+	// Under-delivery is loud, never silent (ga-dwgz52): a policy broadcast that
+	// reaches a minority must say so, and name who got nothing.
+	unreached := unreachedConfiguredSeats(cov, sentTo, sender)
+	if len(unreached) > 0 {
+		fmt.Fprintf(stderr, "gc mail send --all: WARNING: reached %d open mailbox(es); %d configured named seat(s) had no open session and got NOTHING: %s. --all covers open sessions only; mail each by address to reach it.\n", len(sent), len(unreached), strings.Join(unreached, ", ")) //nolint:errcheck // best-effort stderr
+	}
 	if jsonOut {
-		return writeCLIJSONLineOrExit(stdout, stderr, "gc mail send", mailActionResult{SchemaVersion: "1", OK: true, Command: "mail.send", Action: "send", Messages: sent, Count: intRef(len(sent)), Notified: notified})
+		return writeCLIJSONLineOrExit(stdout, stderr, "gc mail send", mailActionResult{SchemaVersion: "1", OK: true, Command: "mail.send", Action: "send", Messages: sent, Count: intRef(len(sent)), Notified: notified, Unreached: unreached})
 	}
 	return 0
 }
