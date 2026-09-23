@@ -30,7 +30,7 @@ func TestStreamArchiveHonorsAfterSeq(t *testing.T) {
 	}
 
 	var seen []uint64
-	if err := streamArchive(archive, Filter{AfterSeq: 3}, func(e Event) bool {
+	if err := streamArchive(archive, Filter{AfterSeq: 3}, nil, func(e Event) bool {
 		seen = append(seen, e.Seq)
 		return true
 	}); err != nil {
@@ -55,7 +55,7 @@ func TestStreamArchiveSkipsAtBeforeSeq(t *testing.T) {
 	}
 
 	var seen []uint64
-	if err := streamArchive(archive, Filter{BeforeSeq: 3}, func(e Event) bool {
+	if err := streamArchive(archive, Filter{BeforeSeq: 3}, nil, func(e Event) bool {
 		seen = append(seen, e.Seq)
 		return true
 	}); err != nil {
@@ -83,7 +83,7 @@ func TestStreamArchiveZeroFilterDeliversAll(t *testing.T) {
 	}
 
 	var seen []uint64
-	if err := streamArchive(archive, Filter{}, func(e Event) bool {
+	if err := streamArchive(archive, Filter{}, nil, func(e Event) bool {
 		seen = append(seen, e.Seq)
 		return true
 	}); err != nil {
@@ -112,7 +112,7 @@ func TestStreamArchiveFallsBackWhenSeqNotFirst(t *testing.T) {
 	}
 
 	var seen []uint64
-	if err := streamArchive(archive, Filter{AfterSeq: 3}, func(e Event) bool {
+	if err := streamArchive(archive, Filter{AfterSeq: 3}, nil, func(e Event) bool {
 		seen = append(seen, e.Seq)
 		return true
 	}); err != nil {

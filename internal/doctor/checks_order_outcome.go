@@ -240,17 +240,10 @@ func (c *OrderOutcomeHealthyCheck) Run(ctx *CheckContext) *CheckResult {
 	}
 	since := now.Add(-orderOutcomeLookback(scheduled, c.threshold, c.grace))
 	eventPath := filepath.Join(cityPath, citylayout.RuntimeRoot, "events.jsonl")
-	outcomes, err := readOrderOutcomeEvents(eventPath, since)
+	outcomes, starts, err := readOrderOutcomeWindow(eventPath, since, c.grace)
 	if err != nil {
 		result.Status = StatusError
-		result.Message = fmt.Sprintf("read order outcome events: %v", err)
-		return result
-	}
-	// A start just before the window can still grace a failure just inside it.
-	starts, err := controllerStartTimes(eventPath, since.Add(-c.grace))
-	if err != nil {
-		result.Status = StatusError
-		result.Message = fmt.Sprintf("read controller start events: %v", err)
+		result.Message = err.Error()
 		return result
 	}
 
@@ -308,38 +301,31 @@ func orderOutcomeLookback(scheduled []orders.Order, threshold int, grace time.Du
 	return longest
 }
 
-// readOrderOutcomeEvents returns order.completed and order.failed at or after
-// since, merged in Seq order. events.Filter matches a single Type, hence two
-// reads. since also lets the reader skip every archive rotated before it.
-func readOrderOutcomeEvents(eventPath string, since time.Time) ([]events.Event, error) {
-	completed, err := events.ReadFiltered(eventPath, events.Filter{Type: events.OrderCompleted, Since: since})
+// readOrderOutcomeWindow returns order.completed and order.failed in Seq
+// order, and the controller start times that can grace them, in ONE walk of
+// the log from grace before since: a start up to grace before the window can
+// still cover a failure just inside it, and a few extra outcomes at the edge
+// only extend what the streak walk may read. One walk matters because the
+// cost of a walk is gunzipping each archive in the window; a walk per type
+// paid it three times (ga-4mu4k5). since also lets the reader skip every
+// archive rotated before the window.
+func readOrderOutcomeWindow(eventPath string, since time.Time, grace time.Duration) ([]events.Event, []time.Time, error) {
+	evts, err := events.ReadFilteredTypes(eventPath, events.Filter{Since: since.Add(-grace)},
+		events.OrderCompleted, events.OrderFailed, events.ControllerStarted)
 	if err != nil {
-		return nil, err
+		return nil, nil, fmt.Errorf("read order outcome and controller start events: %w", err)
 	}
-	failed, err := events.ReadFiltered(eventPath, events.Filter{Type: events.OrderFailed, Since: since})
-	if err != nil {
-		return nil, err
+	var outcomes []events.Event
+	var starts []time.Time
+	for _, e := range evts {
+		if e.Type == events.ControllerStarted {
+			starts = append(starts, e.Ts)
+			continue
+		}
+		outcomes = append(outcomes, e)
 	}
-	merged := make([]events.Event, 0, len(completed)+len(failed))
-	merged = append(merged, completed...)
-	merged = append(merged, failed...)
 	// Seq, not Ts: the log is append-only and seq-ordered, and two events in the
 	// same second would otherwise sort arbitrarily.
-	sort.Slice(merged, func(i, j int) bool { return merged[i].Seq < merged[j].Seq })
-	return merged, nil
-}
-
-// controllerStartTimes returns every controller.started timestamp at or after
-// since. The sibling check's latestControllerStartedAt returns only the newest,
-// which is not enough here — see nearControllerStart.
-func controllerStartTimes(eventPath string, since time.Time) ([]time.Time, error) {
-	startEvents, err := events.ReadFiltered(eventPath, events.Filter{Type: events.ControllerStarted, Since: since})
-	if err != nil {
-		return nil, err
-	}
-	out := make([]time.Time, 0, len(startEvents))
-	for _, event := range startEvents {
-		out = append(out, event.Ts)
-	}
-	return out, nil
+	sort.Slice(outcomes, func(i, j int) bool { return outcomes[i].Seq < outcomes[j].Seq })
+	return outcomes, starts, nil
 }
