@@ -135,25 +135,51 @@ func TestLeanLocalSelectsEmbedOwnerForHashedAssetRename(t *testing.T) {
 // A deletion that leaves its directory without any file the pattern still
 // embeds is not evidence the pattern resolves there any more; refuse it.
 func TestLeanLocalRefusesDeletedEmbedPathInEmptiedDirectory(t *testing.T) {
-	fixture := newDirectoryEmbedFixture(t, map[string]string{
-		"index.html":    "<script type=\"module\" src=\"/assets/app.js\"></script>\n",
-		"assets/app.js": hashedAssetBody,
-		"sub/only.js":   "export const only = 1;\n",
-	})
-	if err := os.Remove(filepath.Join(fixture.repoRoot, "alpha", "dist", "sub", "only.js")); err != nil {
-		t.Fatalf("delete the only embedded file in a subdirectory: %v", err)
-	}
+	for _, testCase := range []struct {
+		name   string
+		delete func(*testing.T, prStaticScopeFixture)
+	}{
+		{
+			name: "removed from disk",
+			delete: func(t *testing.T, fixture prStaticScopeFixture) {
+				if err := os.Remove(filepath.Join(fixture.repoRoot, "alpha", "dist", "sub", "only.js")); err != nil {
+					t.Fatalf("delete the only embedded file in a subdirectory: %v", err)
+				}
+			},
+		},
+		{
+			// go list still inventories a file left on disk, so the deleted
+			// path must not count as its own surviving sibling.
+			name: "removed from the index only",
+			delete: func(t *testing.T, fixture prStaticScopeFixture) {
+				runGitFixtureCommands(t, fixture.repoRoot, fixture.commandEnv(), "git rm -q --cached alpha/dist/sub/only.js")
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			fixture := newDirectoryEmbedFixture(t, map[string]string{
+				"index.html":    "<script type=\"module\" src=\"/assets/app.js\"></script>\n",
+				"assets/app.js": hashedAssetBody,
+				"sub/only.js":   "export const only = 1;\n",
+			})
+			testCase.delete(t, fixture)
+			status := runGitFixtureCommands(t, fixture.repoRoot, fixture.commandEnv(), "git diff --name-status HEAD --")
+			if status != "D\talpha/dist/sub/only.js\n" {
+				t.Fatalf("fixture is not a single tracked deletion:\n%s", status)
+			}
 
-	fixture.resetCalls(t)
-	if output, err := fixture.runMakeTarget("lint-affected"); err != nil {
-		t.Errorf("lint-affected did not fail closed for an emptied embedded directory: %v\n%s", err, output)
-	}
-	fixture.requireCalls(t, []string{"run", "./..."})
-	fixture.requireGoCalls(t, []string{"vet", "./..."})
+			fixture.resetCalls(t)
+			if output, err := fixture.runMakeTarget("lint-affected"); err != nil {
+				t.Errorf("lint-affected did not fail closed for an emptied embedded directory: %v\n%s", err, output)
+			}
+			fixture.requireCalls(t, []string{"run", "./..."})
+			fixture.requireGoCalls(t, []string{"vet", "./..."})
 
-	output, err := fixture.runMakeTargetWithGo("check-lean-local", fixture.realGo)
-	if err == nil || !strings.Contains(output, "may be absent from the current embed inventory") {
-		t.Fatalf("local profile did not refuse an emptied embedded directory: err=%v\n%s", err, output)
+			output, err := fixture.runMakeTargetWithGo("check-lean-local", fixture.realGo)
+			if err == nil || !strings.Contains(output, "may be absent from the current embed inventory") {
+				t.Fatalf("local profile did not refuse an emptied embedded directory: err=%v\n%s", err, output)
+			}
+		})
 	}
 }
 
