@@ -232,5 +232,13 @@ func cmdHookHeartbeat(beadID string, strict bool, stdout, stderr io.Writer) int 
 		}
 	}
 	fmt.Fprintf(stdout, "heartbeat: %d refreshed, %d refused, session %s\n", beat, refused, sessionID) //nolint:errcheck
+	if beat == 0 {
+		// Nothing was refreshed: every list succeeded but matched no row (a
+		// claim resolved in another store, an identity or routing regression
+		// hiding it), or every row was refused. --strict exists to PROVE a
+		// heartbeat happened, so a zero-refresh run is a strict miss with its
+		// own diagnostic — never a false-green canary. Lenient stays exit 0.
+		return miss("session %s refreshed nothing (%d refused); no live claim was heartbeated", sessionID, refused)
+	}
 	return code(refused > 0)
 }
