@@ -78,7 +78,7 @@ func resolveConfiguredNamedSessionID(
 		// name squat. Every by-name verb refuses here, kill included, and kill
 		// could not clear it anyway (it stops a runtime; an asleep bead is still
 		// live). Name the verb that does, addressed by bead ID (ga-lm5coj).
-		return "", true, fmt.Errorf("%w: %q conflicts with configured named session %q via live bead %s; if that bead is stale, close it with 'gc session close %s' and the reconciler rebuilds %s", errNamedSessionConflict, identifier, spec.Identity, lookup.Conflict.ID, lookup.Conflict.ID, spec.Identity)
+		return "", true, fmt.Errorf("%w: %q conflicts with configured named session %q via live bead %s; if that bead is stale, close it with 'gc session close %s' to free the name for %s", errNamedSessionConflict, identifier, spec.Identity, lookup.Conflict.ID, lookup.Conflict.ID, spec.Identity)
 	}
 	if !opts.materialize {
 		return "", false, fmt.Errorf("%w: %q", session.ErrSessionNotFound, identifier)
@@ -181,7 +181,7 @@ func resolveSessionIDWithOptions(
 			return "", err
 		}
 	}
-	if identity := namedSessionIdentityForConfigName(cfg, identifier); identity != "" {
+	if identity := namedSessionIdentityForConfigName(cityPath, cfg, identifier); identity != "" {
 		// Sessions are addressed by named-session identity, never by agent
 		// config name (#666 keeps template names unresolved on this surface).
 		// Say which name is wanted instead of a bare not-found (ga-lm5coj).
@@ -192,9 +192,14 @@ func resolveSessionIDWithOptions(
 
 // namedSessionIdentityForConfigName returns the identity of the one configured
 // named session backed by the agent config name target (e.g.
-// "qcore/cherub-law.archer" -> "qcore/archer"), or "" when none or several are.
-func namedSessionIdentityForConfigName(cfg *config.City, target string) string {
+// "qcore/cherub-law.archer" -> "qcore/archer"), or "" when none or several
+// are, or when target is itself a configured named-session identity (then it
+// is the right name, merely not materialized, and pointing elsewhere is wrong).
+func namedSessionIdentityForConfigName(cityPath string, cfg *config.City, target string) string {
 	if cfg == nil {
+		return ""
+	}
+	if _, ok, err := findNamedSessionSpecForTarget(cfg, config.EffectiveCityName(cfg, filepath.Base(cityPath)), target); ok || err != nil {
 		return ""
 	}
 	target = normalizeNamedSessionTarget(target)
