@@ -36,6 +36,10 @@ MIN_PREV_FOR_SPIKE_CHECK="${GC_JSONL_MIN_PREV_FOR_SPIKE:-100}"
 MAX_PUSH_FAILURES="${GC_JSONL_MAX_PUSH_FAILURES:-3}"
 MAX_REPACK_FAILURES="${GC_JSONL_MAX_REPACK_FAILURES:-3}"
 REPACK_LOOSE_CEILING="${GC_JSONL_REPACK_LOOSE_CEILING:-512}"
+# An escalation suppresses repeats for this long, then re-alerts. Bounding the
+# silence by TIME, not by a marker, means a stale marker (a clear that failed
+# to persist) can never mute a later streak for more than this window.
+REPACK_REESCALATE_SECONDS="${GC_JSONL_REPACK_REESCALATE_SECONDS:-86400}"
 PUSH_RETRY_DELAY_MIN="${GC_JSONL_PUSH_RETRY_DELAY_MIN:-1}"
 PUSH_RETRY_DELAY_SPAN="${GC_JSONL_PUSH_RETRY_DELAY_SPAN:-4}"
 SCRUB="${GC_JSONL_SCRUB:-true}"
@@ -759,7 +763,10 @@ record_archive_repack_success() {
     if [ "$(printf '%s\n' "$state_json" | jq -r '(.consecutive_repack_failures // 0) > 0 or has("last_repack_stderr") or has("repack_failure_escalated") or has("last_repack_escalation_error")')" != "true" ]; then
         return 0
     fi
-    write_state_json "$(printf '%s\n' "$state_json" | jq -c 'del(.consecutive_repack_failures) | del(.last_repack_stderr) | del(.repack_failure_escalated) | del(.last_repack_escalation_error)')"
+    if ! write_state_json "$(printf '%s\n' "$state_json" | jq -c 'del(.consecutive_repack_failures) | del(.last_repack_stderr) | del(.repack_failure_escalated) | del(.last_repack_escalation_error)')"; then
+        echo "jsonl-export: repack succeeded but clearing the failure streak did not persist; the next successful commit retries, and escalation dedupe is time-bounded" >&2
+    fi
+    return 0
 }
 
 # Count a failed repack and escalate once per failure streak when the count
@@ -794,7 +801,8 @@ record_archive_repack_failure() {
     fi
 
     if [ "$state_persisted" = 1 ]; then
-        already_escalated=$(read_state_json | jq -r '.repack_failure_escalated // false' || echo "false")
+        already_escalated=$(read_state_json | jq -r --argjson now "$(date +%s)" --argjson win "$REPACK_REESCALATE_SECONDS" \
+            '(.repack_failure_escalated // null) as $e | if ($e | type) == "number" then (($now - $e) < $win) else false end' || echo "false")
         if [ "$consecutive" -lt "$MAX_REPACK_FAILURES" ] || [ "$already_escalated" = "true" ]; then
             return 0
         fi
@@ -828,7 +836,7 @@ ESCALATION
     if escalate_err=$("$ESCALATE_SCRIPT" \
         --subject "ESCALATION: JSONL archive repack failing [HIGH]" \
         --message "$body" 2>&1 >/dev/null); then
-        write_state_json "$(read_state_json | jq -c '.repack_failure_escalated = true | del(.last_repack_escalation_error)')"
+        write_state_json "$(read_state_json | jq -c --argjson now "$(date +%s)" '.repack_failure_escalated = $now | del(.last_repack_escalation_error)')" || true
     else
         echo "jsonl-export: repack failure escalation delivery failed (retrying on the next failing commit)" >&2
         write_state_json "$(

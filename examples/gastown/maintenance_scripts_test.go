@@ -8912,8 +8912,10 @@ func TestJsonlExportRepackFailureIsCountedEscalatedAndCleared(t *testing.T) {
 	if got := state["consecutive_repack_failures"]; got != float64(2) {
 		t.Fatalf("after run 2: consecutive_repack_failures = %v, want 2\nstate: %v", got, state)
 	}
-	if got := state["repack_failure_escalated"]; got != true {
-		t.Fatalf("after run 2: repack_failure_escalated = %v, want true\nstate: %v", got, state)
+	// The marker is the escalation time (epoch seconds): dedupe is bounded by
+	// GC_JSONL_REPACK_REESCALATE_SECONDS, never by a marker that can go stale.
+	if got, ok := state["repack_failure_escalated"].(float64); !ok || got <= 0 {
+		t.Fatalf("after run 2: repack_failure_escalated = %v, want the escalation epoch\nstate: %v", state["repack_failure_escalated"], state)
 	}
 	if n := repackEscalations(); n != 1 {
 		t.Fatalf("after run 2: %d repack escalations, want exactly 1", n)
@@ -9031,6 +9033,43 @@ func TestJsonlExportRepackEscalationDeliveryFailureIsRecorded(t *testing.T) {
 	}
 	if !strings.Contains(string(mailData), "ESCALATION: JSONL archive repack failing") {
 		t.Fatalf("the escalation must have been attempted; mail log:\n%s", mailData)
+	}
+}
+
+// A marker left behind by a clear that failed to persist must not mute a
+// later streak: dedupe is bounded by time, so a stale marker (here a legacy
+// boolean, and an escalation older than the window) does not suppress.
+func TestJsonlExportStaleRepackEscalationMarkerDoesNotMuteANewStreak(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+	mailLog := filepath.Join(t.TempDir(), "gc-mail.log")
+	archiveRepo := filepath.Join(cityDir, "archive")
+	stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("LookPath(git): %v", err)
+	}
+	writeGitSubcommandFailureStub(t, binDir, realGit, "gc")
+	writeJsonlExportGCStub(t, binDir)
+	writeMultiRecordDoltStub(t, binDir, 3)
+	for i, marker := range []string{`true`, `1000`} { // legacy bool; an epoch far outside the window
+		if err := os.WriteFile(stateFile, []byte(`{"consecutive_repack_failures":5,"repack_failure_escalated":`+marker+`}`+"\n"), 0o644); err != nil {
+			t.Fatalf("WriteFile(state): %v", err)
+		}
+		_ = os.Remove(mailLog)
+		env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
+		writeMultiRecordDoltStub(t, binDir, 3+i) // a new count each pass, so every pass commits
+		runScript(t, coreScriptPath("jsonl-export.sh"), env)
+		mailData, err := os.ReadFile(mailLog)
+		if err != nil && !os.IsNotExist(err) {
+			t.Fatalf("ReadFile(mail log): %v", err)
+		}
+		if !strings.Contains(string(mailData), "ESCALATION: JSONL archive repack failing") {
+			t.Fatalf("stale marker %s muted a new failing streak; mail log:\n%s", marker, mailData)
+		}
 	}
 }
 
