@@ -150,6 +150,24 @@ func newWispGCForConfig(cfg *config.City) wispGC {
 	return newWispGC(cfg.Daemon.WispGCIntervalDuration(), cfg.Daemon.WispTTLDuration(), mailRetentionTTL)
 }
 
+// carryWispGCLastRun preserves the previous tracker's cadence position when a
+// config reload rebuilds it. Without this, every APPLIED reload re-armed an
+// immediate wisp_gc at the next tick regardless of wisp_gc_interval — measured
+// 2026-09-23: 16 of 21 runs (~76%) were reload-driven, each paying the full
+// in-tick sweep, so config churn multiplied the ga-q17a2k dispatch freezes and
+// raising the interval could not mitigate (the applying reload re-armed a run
+// itself). A previously-disabled tracker (nil prev) keeps the prompt first
+// run, same as process start; the NEW config's interval still governs, so a
+// reload that shortens the cadence takes effect against the carried position.
+func carryWispGCLastRun(prev, next wispGC) wispGC {
+	p, pok := prev.(*memoryWispGC)
+	n, nok := next.(*memoryWispGC)
+	if pok && nok && p != nil && n != nil {
+		n.lastRun = p.lastRun
+	}
+	return next
+}
+
 func (m *memoryWispGC) shouldRun(now time.Time) bool {
 	return now.Sub(m.lastRun) >= m.interval
 }
