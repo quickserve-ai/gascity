@@ -159,6 +159,25 @@ func TestValidateMailCrossCity(t *testing.T) {
 			wantErr: "agent",
 		},
 		{
+			name: "peer city equal to the leading segment of a nested agent dir is refused",
+			mutate: func(c *City) {
+				c.Agents = []Agent{{Name: "y", Dir: "projects/backend"}}
+				c.Mail.CrossCity.Cities = []string{"projects", "westeros"}
+			},
+			wantErr: "agent",
+		},
+		{
+			name: "local city equal to the leading segment of a nested agent dir is refused",
+			mutate: func(c *City) {
+				c.Agents = []Agent{{Name: "y", Dir: "qlandia/backend"}}
+			},
+			wantErr: "agent",
+		},
+		{
+			name:   "nested agent dir with an unrelated leading segment passes",
+			mutate: func(c *City) { c.Agents = []Agent{{Name: "y", Dir: "projects/backend"}} },
+		},
+		{
 			name:    "agent dir named like the local city is refused",
 			mutate:  func(c *City) { c.Agents = []Agent{{Name: "x", Dir: "qlandia"}} },
 			wantErr: "agent",
