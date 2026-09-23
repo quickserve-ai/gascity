@@ -10,6 +10,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/doctor"
 	"github.com/gastownhall/gascity/internal/fsys"
+	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/suspensionstate"
 )
 
@@ -117,13 +118,20 @@ func (c *poolIdleRoutedWorkCheck) collect() (findings []poolIdleRoutedWorkFindin
 }
 
 // collectStoreFindings checks every generic-ephemeral pool template in cfg
-// against one store: a targeted session-class list for idle live instances,
-// and (only when at least one is idle) a targeted gc.routed_to metadata
-// lookup for unclaimed work — never a full-store scan.
+// against one store: ONE open-session list for idle live instances, grouped
+// by template, and (only for a template with an idle instance) a targeted
+// gc.routed_to metadata lookup for unclaimed work — never a full-store scan.
+//
+// The session list is read once per store with closed sessions excluded in
+// the query. The per-template session.Store.List it replaces loads every
+// session bead, closed ones included, and filters in memory; paid once per
+// template per scope over a store holding every session that ever ran, that
+// abandoned the check at a 5-minute budget under load (ga-4mu4k5).
 func (c *poolIdleRoutedWorkCheck) collectStoreFindings(store beads.Store, label string) ([]poolIdleRoutedWorkFinding, error) {
 	sessStore := cliSessionFrontDoor(store, c.cfg, c.cityPath)
 
 	var findings []poolIdleRoutedWorkFinding
+	var openByTemplate map[string][]sessionpkg.Info
 	for i := range c.cfg.Agents {
 		agent := &c.cfg.Agents[i]
 		if agent.Suspended || !agent.SupportsGenericEphemeralSessions() {
@@ -134,12 +142,21 @@ func (c *poolIdleRoutedWorkCheck) collectStoreFindings(store beads.Store, label 
 			continue
 		}
 
-		sessions, err := sessStore.List("", template)
-		if err != nil {
-			return findings, fmt.Errorf("listing sessions for %s: %w", template, err)
+		if openByTemplate == nil {
+			open, err := sessStore.ListAll(sessionpkg.ListAllOptions{})
+			if err != nil {
+				return findings, fmt.Errorf("listing sessions: %w", err)
+			}
+			openByTemplate = map[string][]sessionpkg.Info{}
+			for _, info := range open {
+				if info.Closed {
+					continue
+				}
+				openByTemplate[info.Template] = append(openByTemplate[info.Template], info)
+			}
 		}
 		var idle []string
-		for _, info := range sessions {
+		for _, info := range openByTemplate[template] {
 			if !poolSessionIsLiveInfo(info) || strings.TrimSpace(info.TriggerBeadID) != "" {
 				continue
 			}

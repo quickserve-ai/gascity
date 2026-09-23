@@ -198,3 +198,69 @@ func TestBuildRalphRetryGraphNodeAdvancesIterationAndResetsNestedCounters(t *tes
 	assertClonedCounters(t, "attempt.1 run", node(attemptRun), "1")
 	assertClonedCounters(t, "plain member", node(plainMember), "2")
 }
+
+// ga-knhu61: a formula gate's await_type is set AT CREATE, so every path that
+// re-mints an attempt-set bead for the next Ralph iteration must carry it, or
+// the clone lands empty and the beads create seam defaults it to "human" —
+// paging a human for machinery once per retry.
+func TestRalphRetryPathsPreserveAwaitType(t *testing.T) {
+	t.Parallel()
+
+	gate := beads.Bead{
+		ID:        "gate-1",
+		Ref:       ralphIterOnePlainMember.stepRef,
+		Type:      "gate",
+		AwaitType: beads.AwaitBead,
+		Metadata:  ralphIterOnePlainMember.metadata("workflow"),
+	}
+
+	node := buildRalphRetryGraphNode(gate, "logical",
+		"review-loop.iteration.1", "review-loop.iteration.2", 1, 2,
+		map[string]bool{gate.ID: true}, nil)
+	if node.AwaitType != beads.AwaitBead {
+		t.Fatalf("buildRalphRetryGraphNode dropped AwaitType: got %q, want %q", node.AwaitType, beads.AwaitBead)
+	}
+
+	store := beads.NewMemStore()
+	workflow := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:    "workflow",
+		Type:     "task",
+		Metadata: map[string]string{beadmeta.KindMetadataKey: beadmeta.KindWorkflow},
+	})
+	subject := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:     ralphIterOneSubject.title,
+		Type:      "task",
+		AwaitType: beads.AwaitBead,
+		Metadata:  ralphIterOneSubject.metadata(workflow.ID),
+	})
+	member := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:     ralphIterOnePlainMember.title,
+		Type:      "gate",
+		AwaitType: beads.AwaitTimer,
+		Metadata:  ralphIterOnePlainMember.metadata(workflow.ID),
+	})
+	check := mustCreateWorkflowBead(t, store, beads.Bead{
+		Title:    ralphIterOneCheck.title,
+		Type:     "task",
+		Metadata: ralphIterOneCheck.metadata(workflow.ID),
+	})
+	attemptSet := map[string]beads.Bead{subject.ID: subject, member.ID: member}
+
+	mapping, err := appendRalphRetryLegacy(store, subject.ID, subject, check, attemptSet,
+		1, 2, "review-loop.iteration.1", "review-loop.iteration.2", nil)
+	if err != nil {
+		t.Fatalf("appendRalphRetryLegacy: %v", err)
+	}
+	for name, tc := range map[string]struct {
+		oldID string
+		want  string
+	}{
+		"subject": {subject.ID, beads.AwaitBead},
+		"member":  {member.ID, beads.AwaitTimer},
+	} {
+		clone := mustGetBead(t, store, mapping[tc.oldID])
+		if clone.AwaitType != tc.want {
+			t.Fatalf("%s clone AwaitType = %q, want %q", name, clone.AwaitType, tc.want)
+		}
+	}
+}

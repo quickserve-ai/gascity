@@ -13493,9 +13493,15 @@ func TestGcBeadsBdProviderOwnedRealLifecycleStopsOwnedProcesses(t *testing.T) {
 				t.Fatal("provider-owned lifecycle did not publish a process identity")
 			}
 			run(ctx, "stop")
+			// Poll to a bound rather than sample once (ga-ijivu8): a single
+			// kill(pid, 0) the instant stop returns races the SIGTERM->SIGKILL
+			// exit and init's reaping of the reparented daemon (a zombie still
+			// answers signal 0). It failed CI / required on ~7 unrelated branches
+			// on 2026-09-23. A real leak still fails, 10s later, and the
+			// process-table sweep below is unchanged.
 			for _, pid := range pids {
-				if processStillAlive(pid) {
-					t.Fatalf("provider-owned process %d remained alive after stop", pid)
+				if !waitForProcessExit(pid, 10*time.Second) {
+					t.Fatalf("provider-owned process %d remained alive 10s after stop", pid)
 				}
 			}
 			// The PID records above prove bd's own children are gone. Sweep the
