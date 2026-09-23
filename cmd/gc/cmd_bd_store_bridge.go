@@ -26,6 +26,7 @@ type bdStoreBridgeCreateRequest struct {
 	Assignee    string            `json:"assignee,omitempty"`
 	From        string            `json:"from,omitempty"`
 	Metadata    map[string]string `json:"metadata,omitempty"`
+	AwaitType   string            `json:"await_type,omitempty"`
 }
 
 type bdStoreBridgeUpdateRequest struct {
@@ -56,6 +57,7 @@ type bdStoreBridgeBead struct {
 	Description string            `json:"description,omitempty"`
 	Labels      []string          `json:"labels,omitempty"`
 	Metadata    map[string]string `json:"metadata,omitempty"`
+	AwaitType   string            `json:"await_type,omitempty"`
 }
 
 func newBdStoreBridgeCmd(stdout, stderr io.Writer) *cobra.Command {
@@ -172,6 +174,7 @@ func runBdStoreBridge(op string, args []string, dir, host, port, user string, st
 			Assignee:    req.Assignee,
 			From:        req.From,
 			Metadata:    req.Metadata,
+			AwaitType:   req.AwaitType,
 		})
 		if err != nil {
 			return err
@@ -427,5 +430,6 @@ func bridgeBead(item beads.Bead) bdStoreBridgeBead {
 		Description: item.Description,
 		Labels:      item.Labels,
 		Metadata:    item.Metadata,
+		AwaitType:   item.AwaitType,
 	}
 }
