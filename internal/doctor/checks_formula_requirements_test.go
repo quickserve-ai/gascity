@@ -1,14 +1,18 @@
 package doctor
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/config"
-	"github.com/gastownhall/gascity/internal/formulatest"
+	"github.com/gastownhall/gascity/internal/formula"
+	"github.com/gastownhall/gascity/internal/rollout"
 )
 
 func TestFormulaRequirementsCheckOK(t *testing.T) {
@@ -469,8 +473,8 @@ func TestFormulaRequirementsCheckIntentionallyDisabled(t *testing.T) {
 }
 
 // Codex r5 (#134): the composition probe must compile under the city's
-// [daemon] formula_v2, whatever the process-wide flag was left at by earlier
-// checks (or none, when only this check runs).
+// daemon.formula_v2 rollout gate, not the process-wide compile setting that
+// earlier checks may have left behind (or none, when only this check runs).
 func TestFormulaRequirementsCheckCompositionProbeHonorsConfiguredV2(t *testing.T) {
 	write := func(t *testing.T) string {
 		t.Helper()
@@ -479,28 +483,101 @@ func TestFormulaRequirementsCheckCompositionProbeHonorsConfiguredV2(t *testing.T
 		writeDoctorFormula(t, dir, "v2-expansion", "\nformula = \"v2-expansion\"\ntype = \"expansion\"\n\n[requires]\nformula_compiler = \">=2.0.0\"\n\n[[template]]\nid = \"{target}.child\"\ntitle = \"Child\"\n")
 		return dir
 	}
-	run := func(t *testing.T, cityV2 bool) *CheckResult {
-		t.Helper()
+	check := func(dir string, cityV2 bool) *FormulaRequirementsCheck {
 		return NewFormulaRequirementsCheck(&config.City{
 			Daemon:        config.DaemonConfig{FormulaV2: boolPtr(cityV2)},
-			FormulaLayers: config.FormulaLayers{City: []string{write(t)}},
-		}, t.TempDir()).Run(&CheckContext{})
+			FormulaLayers: config.FormulaLayers{City: []string{dir}},
+		}, t.TempDir())
 	}
-
-	t.Run("formula_v2 = false with the global left true: not DISPATCHABLE", func(t *testing.T) {
-		formulatest.SetV2ForTest(t, true)
-		r := run(t, false)
+	notDispatchable := func(t *testing.T, r *CheckResult) {
+		t.Helper()
 		joined := strings.Join(r.Details, "\n")
 		if strings.Contains(joined, "DISPATCHABLE") || !strings.Contains(joined, "by a composed requirement: needs v2 through its expansion") {
 			t.Fatalf("under formula_v2 = false the v2 expansion disables the formula: %v %q %v", r.Status, r.Message, r.Details)
 		}
+	}
+
+	t.Run("formula_v2 = false while the process compiles v2: not DISPATCHABLE", func(t *testing.T) {
+		dir := write(t)
+		// Precondition: the process-wide compile path accepts v2 here, so
+		// only the city's gate can make the probe refuse the expansion.
+		if _, err := formula.CompileWithoutRuntimeVarValidation(context.Background(), "mol-v2-composed", []string{dir}, nil); err != nil {
+			t.Fatalf("precondition: the process-wide compile must accept v2 here: %v", err)
+		}
+		notDispatchable(t, check(dir, false).Run(&CheckContext{}))
 	})
 
-	t.Run("formula_v2 = true with the global left false: DISPATCHABLE", func(t *testing.T) {
-		formulatest.SetV2ForTest(t, false)
-		r := run(t, true)
+	t.Run("the rollout gate decides: gate false over config true is not DISPATCHABLE", func(t *testing.T) {
+		c := check(write(t), true)
+		flags := rollout.ForTest(rollout.WithFormulaV2(false))
+		c.rolloutFlags = &flags
+		notDispatchable(t, c.Run(&CheckContext{}))
+	})
+
+	t.Run("the rollout gate decides: gate true over config false is DISPATCHABLE", func(t *testing.T) {
+		c := check(write(t), false)
+		flags := rollout.ForTest(rollout.WithFormulaV2(true))
+		c.rolloutFlags = &flags
+		r := c.Run(&CheckContext{})
 		if r.Status != StatusWarning || !strings.Contains(strings.Join(r.Details, "\n"), "DISPATCHABLE") {
 			t.Fatalf("under formula_v2 = true the formula compiles, so its marker is stale: %v %q %v", r.Status, r.Message, r.Details)
+		}
+	})
+}
+
+// Codex r6 (#134): discovery and compilation key a formula by its FILENAME,
+// which may differ from its formula field. The probe and the extends walk must
+// evaluate the discovered file, not whatever the field's value resolves to.
+func TestFormulaRequirementsCheckEvaluatesTheDiscoveredFileByResolverKey(t *testing.T) {
+	const composed = "\nformula = \"mol-field\"\n\n[requires]\nformula_compiler = \">=1.0.0\"\ndisabled_reason = \"needs v2 through its expansion\"\n\n[[steps]]\nid = \"work\"\ntitle = \"Work\"\n\n[compose]\n[[compose.expand]]\ntarget = \"work\"\nwith = \"v2-expansion\"\n"
+	const expansion = "\nformula = \"v2-expansion\"\ntype = \"expansion\"\n\n[requires]\nformula_compiler = \">=2.0.0\"\n\n[[template]]\nid = \"{target}.child\"\ntitle = \"Child\"\n"
+	run := func(t *testing.T, dir string, cityV2 bool) *CheckResult {
+		t.Helper()
+		return NewFormulaRequirementsCheck(&config.City{
+			Daemon:        config.DaemonConfig{FormulaV2: boolPtr(cityV2)},
+			FormulaLayers: config.FormulaLayers{City: []string{dir}},
+		}, t.TempDir()).Run(&CheckContext{})
+	}
+	wantComposedDisable := func(t *testing.T, r *CheckResult, dir string) {
+		t.Helper()
+		file := filepath.Join(dir, "mol-file.toml")
+		want := fmt.Sprintf("intentionally disabled city formula %q (%s), by a composed requirement: needs v2 through its expansion", "mol-field", file)
+		var about []string
+		for _, d := range r.Details {
+			if strings.Contains(d, "("+file+")") {
+				about = append(about, d)
+			}
+		}
+		if !slices.Equal(about, []string{want}) {
+			t.Fatalf("the probe must compile mol-file.toml by its resolver key:\nwant only %q\ngot %q", want, about)
+		}
+	}
+
+	t.Run("no file answers to the formula field", func(t *testing.T) {
+		dir := t.TempDir()
+		writeDoctorFormula(t, dir, "mol-file", composed)
+		writeDoctorFormula(t, dir, "v2-expansion", expansion)
+		wantComposedDisable(t, run(t, dir, false), dir)
+	})
+
+	t.Run("a different file answers to the formula field", func(t *testing.T) {
+		dir := t.TempDir()
+		writeDoctorFormula(t, dir, "mol-file", composed)
+		writeDoctorFormula(t, dir, "v2-expansion", expansion)
+		writeDoctorFormula(t, dir, "mol-field", "\nformula = \"mol-field\"\n\n[requires]\nformula_compiler = \">=1.0.0\"\n\n[[steps]]\nid = \"decoy\"\ntitle = \"Decoy\"\n")
+		wantComposedDisable(t, run(t, dir, false), dir)
+	})
+
+	t.Run("two parents sharing a formula field are each checked", func(t *testing.T) {
+		dir := t.TempDir()
+		writeDoctorFormula(t, dir, "p-marked", "\nformula = \"shared-parent\"\n\n[requires]\nformula_compiler = \">=999.0.0\"\ndisabled_reason = \"parked on purpose\"\n\n[[steps]]\nid = \"a\"\ntitle = \"A\"\n")
+		writeDoctorFormula(t, dir, "p-unmarked", "\nformula = \"shared-parent\"\n\n[requires]\nformula_compiler = \">=999.0.0\"\n\n[[steps]]\nid = \"b\"\ntitle = \"B\"\n")
+		writeDoctorFormula(t, dir, "multi-child", "\nformula = \"multi-child\"\nextends = [\"p-marked\", \"p-unmarked\"]\n")
+		r := run(t, dir, true)
+		joined := strings.Join(r.Details, "\n")
+		if r.Status != StatusError || strings.Contains(joined, "intentionally disabled city formula \"multi-child\"") ||
+			!strings.Contains(joined, "error city formula \"multi-child\"") {
+			t.Fatalf("p-unmarked's unmarked requirement must keep multi-child an error: %v %q %v", r.Status, r.Message, r.Details)
 		}
 	})
 }
