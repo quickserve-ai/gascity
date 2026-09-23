@@ -151,6 +151,10 @@ type doltServerIdentity struct {
 	// relative is set when the path was a relative --config/--data-dir whose
 	// anchor (the server's cwd) could not be read: unidentifiable, not "not gc".
 	relative bool
+	// configUnread is set when a config-only server's YAML could not be read,
+	// so the store it serves is unknown. Such a server is never counted as
+	// "not gc": its config may name this city's store.
+	configUnread bool
 }
 
 func (c *doltServersCheck) identify(p DoltProcInfo) doltServerIdentity {
@@ -197,13 +201,15 @@ func (c *doltServersCheck) identifyUncached(p DoltProcInfo) doltServerIdentity {
 		// The config names the store: gc's own writer makes its data_dir
 		// authoritative (cmd_dolt_config.go). A copied config pointing at this
 		// city's store is that store's server, whatever the file is called.
-		if dd := c.configDataDir(id.path); dd != "" {
+		dd, readOK := c.configDataDir(id.path)
+		if dd != "" {
 			ddID := c.anchored(p.PID, dd, "data-dir")
 			if ddID.path != "" {
 				ddID.config = id.path
 				return ddID
 			}
 		}
+		id.configUnread = !readOK
 		return id
 	}
 	if cwd, ok := c.cwd(p.PID); ok && cwd != "" {
@@ -212,17 +218,18 @@ func (c *doltServersCheck) identifyUncached(p DoltProcInfo) doltServerIdentity {
 	return doltServerIdentity{}
 }
 
-// configDataDir reads the top-level data_dir from a dolt config YAML. Any read
-// or parse failure returns "" and the config path stays the identity.
-func (c *doltServersCheck) configDataDir(configPath string) string {
+// configDataDir reads the top-level data_dir from a dolt config YAML. A parse
+// miss returns "" and the config path stays the identity; readOK is false when
+// the file itself could not be read (deleted or unreadable since startup).
+func (c *doltServersCheck) configDataDir(configPath string) (dataDir string, readOK bool) {
 	if configPath == "" || c.readFile == nil {
-		return ""
+		return "", true
 	}
 	data, err := c.readFile(configPath)
 	if err != nil {
-		return ""
+		return "", false
 	}
-	return yamlTopLevelScalar(data, "data_dir")
+	return yamlTopLevelScalar(data, "data_dir"), true
 }
 
 // yamlTopLevelScalar returns an unindented `key: value` scalar, unquoted. It
@@ -331,7 +338,7 @@ func (c *doltServersCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 	var testRoots []string
 	testRootsLoaded := false
 
-	var managed, strays, foreign, orphanTests, unidentified, unanchored []DoltProcInfo
+	var managed, strays, foreign, orphanTests, unidentified, unanchored, unreadConfig []DoltProcInfo
 	rigLocal := map[string][]DoltProcInfo{}
 	rigRootOf := map[string]string{}
 	var rigLocalCount, otherCity, activeTests, notGC int
@@ -367,6 +374,8 @@ func (c *doltServersCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 				}
 			case strings.Contains(id.configPath(), gcDoltConfigMarker):
 				foreign = append(foreign, p)
+			case id.configUnread:
+				unreadConfig = append(unreadConfig, p)
 			default:
 				notGC++
 			}
@@ -470,13 +479,16 @@ func (c *doltServersCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 	for _, p := range unanchored {
 		warns = append(warns, "dolt server with a relative --config/--data-dir and an unreadable working directory to resolve it against (cannot rule out this city's store): "+c.describe(p))
 	}
+	for _, p := range unreadConfig {
+		warns = append(warns, "dolt server whose --config can no longer be read, so the store it serves is unknown (cannot rule out this city's store): "+c.describe(p))
+	}
 	for _, p := range strays {
 		warns = append(warns, "dolt server under the city root that is not the managed server: "+c.describe(p))
 	}
 	for _, p := range foreign {
 		warns = append(warns, "gc-launched dolt server that belongs to no registered city or rig: "+c.describe(p))
 	}
-	if len(unidentified)+len(unanchored)+len(strays)+len(foreign) > 0 {
+	if len(unidentified)+len(unanchored)+len(unreadConfig)+len(strays)+len(foreign) > 0 {
 		hints = append(hints, "confirm the owning scope is no longer in use, then stop the server (`kill <pid>`); `gc dolt cleanup` deliberately protects these")
 	}
 	for _, p := range orphanTests {
@@ -496,7 +508,7 @@ func (c *doltServersCheck) Run(_ *doctor.CheckContext) *doctor.CheckResult {
 	details = append(details, pidNotes...)
 	details = append(details, fmt.Sprintf(
 		"%d dolt sql-server process(es) on host: %d managed, %d rig-local, %d city-stray, %d other registered city, %d active test, %d orphan test, %d foreign gc-launched, %d not gc-launched, %d unidentifiable",
-		len(procs), len(managed), rigLocalCount, len(strays), otherCity, activeTests, len(orphanTests), len(foreign), notGC, len(unidentified)+len(unanchored)))
+		len(procs), len(managed), rigLocalCount, len(strays), otherCity, activeTests, len(orphanTests), len(foreign), notGC, len(unidentified)+len(unanchored)+len(unreadConfig)))
 
 	switch {
 	case len(errs) > 0:
