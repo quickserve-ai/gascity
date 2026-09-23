@@ -134,7 +134,7 @@ func TestNudgeDeadLetterBounceRetryExhaustion(t *testing.T) {
 		"Attempts: 5",
 		"Created: " + now.UTC().Format(time.RFC3339),
 		"Dead: " + now.UTC().Format(time.RFC3339),
-		"Read it: gc nudge status mayor",
+		"Read it: .gc/nudges/state.json, the \"dead\" list, id n-exhaust",
 		"The nudge was not delivered. If it mattered, re-send it or mail it.",
 	} {
 		if !strings.Contains(b.body, want) {
