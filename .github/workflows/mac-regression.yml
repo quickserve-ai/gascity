@@ -194,8 +194,12 @@ jobs:
             echo "reason=$reason"
           } >>"$GITHUB_OUTPUT"
 
-  # Fast quality gates that Linux runs on every PR. Keep these cheap so a
-  # Mac-parity loop stays interactive.
+  # Quality checks that Linux `CI / required` already runs on every PR.
+  # Informational on Mac: nothing waits on this job and the summary does not
+  # fail on it. Its golangci-lint cache is exact-key-only and on an active
+  # branch the cold run never finishes inside the timeout, so the cache never
+  # saves and every run is cold again (gc-atwr). The job keeps running so a
+  # quiet run can finally save that cache.
   mac-quality:
     name: Mac / quality (lint, fmt, vet, docs)
     needs:
@@ -383,7 +387,6 @@ jobs:
     needs:
       - runner-policy
       - gate
-      - mac-quality
       - mac-unit
       - mac-acceptance
     if: needs.gate.outputs.run_full == 'true'
@@ -447,7 +450,6 @@ jobs:
     needs:
       - runner-policy
       - gate
-      - mac-quality
       - mac-unit
       - mac-acceptance
     if: needs.gate.outputs.run_full == 'true'
@@ -488,7 +490,6 @@ jobs:
     needs:
       - runner-policy
       - gate
-      - mac-quality
       - mac-unit
       - mac-acceptance
     if: needs.gate.outputs.run_full == 'true'
@@ -555,7 +556,6 @@ jobs:
     needs:
       - runner-policy
       - gate
-      - mac-quality
       - mac-unit
       - mac-acceptance
     if: needs.gate.outputs.run_review_formulas == 'true'
@@ -662,7 +662,7 @@ jobs:
 
           | Job | Result |
           | --- | --- |
-          | Mac / quality | ${QUALITY} |
+          | Mac / quality (informational) | ${QUALITY} |
           | Mac / make test-mac | ${UNIT} |
           | Mac / cmd-gc process | ${CMD_GC} |
           | Mac / acceptance (Tier A) | ${ACCEPTANCE} |
@@ -674,7 +674,7 @@ jobs:
           EOF
 
           fail=0
-          for result in "$QUALITY" "$UNIT" "$CMD_GC" "$ACCEPTANCE" "$INT_PACKAGES" "$INT_REST"; do
+          for result in "$UNIT" "$CMD_GC" "$ACCEPTANCE" "$INT_PACKAGES" "$INT_REST"; do
             # Skipped is acceptable (e.g. when run outside the needs-mac trigger set)
             case "$result" in
               success|skipped|"") ;;
