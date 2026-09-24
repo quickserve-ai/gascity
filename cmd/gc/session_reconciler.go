@@ -4672,7 +4672,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 				reason = "suspended"
 			case configuredNames[name] && sessionAgentSuspendedInfo(cfg, cityPath, info, suspState):
 				// The same for one agent patched suspended=true. As
-				// "no-wake-reason" the drain was cancelled by the seat's own
+				// "no-wake-reason" the drain was canceled by the seat's own
 				// assigned work every other tick, so a suspended refinery holding
 				// a patrol wisp was never stopped (ga-9qanni). "suspended" is not
 				// cancelable by work or by a returning wake reason, and its

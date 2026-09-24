@@ -85,7 +85,7 @@ func TestReconcileSessionBeads_SuspendedAgentsMaterializedNamedSessionIsNotStart
 }
 
 // The live refinery held its own in-progress patrol step. As a
-// "no-wake-reason" drain its ack was cancelled by that assigned work every
+// "no-wake-reason" drain its ack was canceled by that assigned work every
 // other tick, so it was never stopped. With the real drain-ack path (non-nil
 // drain ops), a suspended seat holding work must stop within a few ticks and
 // keep its bead (#6307); the not-suspended control keeps running.
@@ -114,30 +114,41 @@ func TestReconcileSessionBeads_SuspendedAgentHoldingWorkIsStopped(t *testing.T) 
 			t.Fatalf("Create(work): %v", err)
 		}
 		dops := newDrainOps(env.sp)
-		stopped := false
-		for tick := 0; tick < 6 && !stopped; tick++ {
+		tick := func() {
 			got, err := env.store.Get(sess.ID)
 			if err != nil {
 				t.Fatalf("Get: %v", err)
 			}
 			env.reconcileWithPoolDesiredAndDrainOps([]beads.Bead{got}, nil, dops)
 			env.clk.Advance(30 * time.Second)
-			deadline := time.Now().Add(200 * time.Millisecond)
-			for time.Now().Before(deadline) {
-				if !env.sp.IsRunning(name) {
-					stopped = true
-					break
-				}
-				time.Sleep(10 * time.Millisecond)
+		}
+		for i := 0; i < 6; i++ {
+			tick()
+		}
+		if !suspended {
+			if !env.sp.IsRunning(name) {
+				t.Fatal("control: not-suspended seat holding work was stopped")
 			}
+			continue
 		}
-		if stopped != suspended {
-			t.Fatalf("session stopped = %v with agent suspended=%v and its own work in progress", stopped, suspended)
+		waitForProviderStopped(t, env.sp, name)
+		// Past the stop, finalize runs on the following ticks; it is the only
+		// step that could close the bead, so assert #6307 after it.
+		for i := 0; i < 3; i++ {
+			tick()
 		}
-		if final, err := env.store.Get(sess.ID); err != nil {
+		if env.sp.IsRunning(name) {
+			t.Fatal("suspended seat restarted after it was stopped")
+		}
+		final, err := env.store.Get(sess.ID)
+		if err != nil {
 			t.Fatalf("Get final: %v", err)
-		} else if final.Status == "closed" {
-			t.Fatalf("suspended=%v: session bead closed, want it kept for resume (#6307)", suspended)
+		}
+		if final.Status == "closed" {
+			t.Fatal("session bead closed after finalize, want it kept for resume (#6307)")
+		}
+		if st := final.Metadata["state"]; st != "asleep" && st != "drained" {
+			t.Fatalf("session state after finalize = %q, want asleep or drained", st)
 		}
 	}
 }
