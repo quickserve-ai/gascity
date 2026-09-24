@@ -3,6 +3,7 @@ package main
 import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
+	sessionpkg "github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/suspensionstate"
 )
 
@@ -79,4 +80,16 @@ func buildEffectiveSuspendedRigNames(cfg *config.City, st suspensionstate.State)
 		}
 	}
 	return names
+}
+
+// sessionAgentSuspendedInfo reports whether the agent behind a session is
+// effectively suspended: the agent itself, its rig, or the city. A session
+// whose template resolves to no configured agent reads as not suspended; the
+// orphan path owns that case.
+func sessionAgentSuspendedInfo(cfg *config.City, cityPath string, info sessionpkg.Info, st suspensionstate.State) bool {
+	a := findAgentByTemplate(cfg, normalizedSessionTemplateInfo(info, cfg))
+	if a == nil {
+		return false
+	}
+	return isAgentEffectivelySuspendedWith(cfg, cityPath, a, st)
 }
