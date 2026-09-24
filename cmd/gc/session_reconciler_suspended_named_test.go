@@ -45,11 +45,14 @@ func TestReconcileSessionBeads_SuspendedAgentsRunningNamedSessionIsDrained(t *te
 		}
 		ds := env.dt.get(sess.ID)
 		if suspended {
-			// The bead is preserved (#6307), so the drain comes through the
-			// no-wake path, not the "suspended" close; what matters is that
-			// nothing keeps it awake.
+			// The bead is preserved (#6307), so the !desired "suspended" close
+			// is never reached; the awake-set drain carries the "suspended"
+			// reason instead, which neither work nor a wake reason can cancel.
 			if ds == nil {
 				t.Fatal("suspended agent's running on-demand named session was kept awake, want it drained")
+			}
+			if ds.reason != "suspended" {
+				t.Fatalf("drain reason = %q, want \"suspended\" (not cancelable by the seat's own work)", ds.reason)
 			}
 		} else if ds != nil {
 			t.Fatalf("control: not-suspended named session was drained (reason %q)", ds.reason)
@@ -77,6 +80,64 @@ func TestReconcileSessionBeads_SuspendedAgentsMaterializedNamedSessionIsNotStart
 		}
 		if running := env.sp.IsRunning(name); running == suspended {
 			t.Fatalf("materialized named session running = %v with agent suspended=%v", running, suspended)
+		}
+	}
+}
+
+// The live refinery held its own in-progress patrol step. As a
+// "no-wake-reason" drain its ack was cancelled by that assigned work every
+// other tick, so it was never stopped. With the real drain-ack path (non-nil
+// drain ops), a suspended seat holding work must stop within a few ticks and
+// keep its bead (#6307); the not-suspended control keeps running.
+func TestReconcileSessionBeads_SuspendedAgentHoldingWorkIsStopped(t *testing.T) {
+	for _, suspended := range []bool{true, false} {
+		env := newReconcilerTestEnv()
+		env.cfg = suspendedNamedTestCity(suspended)
+		name := "refinery"
+		if err := env.sp.Start(context.Background(), name, runtime.Config{Command: "true"}); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		sess := env.createSessionBead(name, "refinery")
+		env.setSessionMetadata(&sess, map[string]string{
+			namedSessionMetadataKey:      "true",
+			namedSessionIdentityMetadata: "refinery",
+			namedSessionModeMetadata:     "on_demand",
+			"state":                      "active",
+			"last_woke_at":               env.clk.Now().UTC().Format(time.RFC3339),
+		})
+		if _, err := env.store.Create(beads.Bead{
+			Title:    "patrol step",
+			Type:     "task",
+			Status:   "in_progress",
+			Assignee: sess.ID,
+		}); err != nil {
+			t.Fatalf("Create(work): %v", err)
+		}
+		dops := newDrainOps(env.sp)
+		stopped := false
+		for tick := 0; tick < 6 && !stopped; tick++ {
+			got, err := env.store.Get(sess.ID)
+			if err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+			env.reconcileWithPoolDesiredAndDrainOps([]beads.Bead{got}, nil, dops)
+			env.clk.Advance(30 * time.Second)
+			deadline := time.Now().Add(200 * time.Millisecond)
+			for time.Now().Before(deadline) {
+				if !env.sp.IsRunning(name) {
+					stopped = true
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+		if stopped != suspended {
+			t.Fatalf("session stopped = %v with agent suspended=%v and its own work in progress", stopped, suspended)
+		}
+		if final, err := env.store.Get(sess.ID); err != nil {
+			t.Fatalf("Get final: %v", err)
+		} else if final.Status == "closed" {
+			t.Fatalf("suspended=%v: session bead closed, want it kept for resume (#6307)", suspended)
 		}
 	}
 }
