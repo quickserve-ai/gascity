@@ -1670,7 +1670,9 @@ func TestIdleSleep_SuspendedTemplateAssignedWorkDoesNotVetoWaitReadySleep(t *tes
 		Now:             now,
 	})
 	assertAsleep(t, result, "polecat-mc-sctve")
-	assertReason(t, result, "polecat-mc-sctve", "idle-sleep")
+	// A ready wait no longer wakes a suspended agent at all (ga-9qanni), so
+	// there is no wake for idle-sleep to undo: no reason is recorded.
+	assertReason(t, result, "polecat-mc-sctve", "")
 	if result["polecat-mc-sctve"].HasAssignedWork {
 		t.Fatal("suspended-template work must not set HasAssignedWork")
 	}
