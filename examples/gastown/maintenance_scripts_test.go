@@ -9228,7 +9228,7 @@ exec '%[1]s' "$@"
 
 // A failing pre-auto-gc hook vetoes auto-gc: git gc --auto exits 0 and
 // collects nothing. The explicit repack stands in for that auto-gc, so it
-// must honour the same veto, found through core.hooksPath as git finds it
+// must honor the same veto, found through core.hooksPath as git finds it
 // (codex round 14 on #138).
 func TestJsonlExportExplicitRepackHonorsPreAutoGCVeto(t *testing.T) {
 	cityDir := t.TempDir()
@@ -9365,7 +9365,9 @@ func TestJsonlExportRepackEscalationDeliveryFailureIsRecorded(t *testing.T) {
 
 // A marker left behind by a clear that failed to persist must not mute a
 // later streak: dedupe is bounded by time, so a stale marker (here a legacy
-// boolean, and an escalation older than the window) does not suppress.
+// boolean, an escalation older than the window, and one stamped in the
+// future because the clock moved back, codex round 16 on #138) does not
+// suppress.
 func TestJsonlExportStaleRepackEscalationMarkerDoesNotMuteANewStreak(t *testing.T) {
 	cityDir := t.TempDir()
 	binDir := t.TempDir()
@@ -9382,7 +9384,7 @@ func TestJsonlExportStaleRepackEscalationMarkerDoesNotMuteANewStreak(t *testing.
 	writeGitSubcommandFailureStub(t, binDir, realGit, "gc")
 	writeJsonlExportGCStub(t, binDir)
 	writeMultiRecordDoltStub(t, binDir, 3)
-	for i, marker := range []string{`true`, `1000`} { // legacy bool; an epoch far outside the window
+	for i, marker := range []string{`true`, `1000`, `99999999999`} { // legacy bool; an epoch far outside the window; a future epoch
 		if err := os.WriteFile(stateFile, []byte(`{"consecutive_repack_failures":5,"repack_failure_escalated":`+marker+`}`+"\n"), 0o644); err != nil {
 			t.Fatalf("WriteFile(state): %v", err)
 		}

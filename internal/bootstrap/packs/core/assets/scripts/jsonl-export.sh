@@ -738,6 +738,7 @@ commit_archive_snapshot() {
     local gc_log
     local gc_log_head
     local gc_holder
+    local pre_auto_gc
     read_loose_count() {
         count_out=$(git count-objects -v 2>&1) || count_out="count-objects failed: $count_out"
         loose=$(printf '%s\n' "$count_out" | awk '/^count:/ {print $2}')
@@ -751,12 +752,16 @@ commit_archive_snapshot() {
         # nor a failure; the next commit retries.
         # 1. The pre-auto-gc hook can veto it: git gc --auto runs that hook
         #    and exits 0 without collecting when the hook fails (codex round
-        #    14 on #138). `git hook run` finds the hook the way git does,
-        #    core.hooksPath included. A git older than 2.36 has no `git hook`
-        #    and lands here too, which keeps the gc --auto-only behaviour.
+        #    14 on #138). The hook is found the way git finds it (rev-parse
+        #    --git-path resolves core.hooksPath, relative paths included) and
+        #    run directly. `git hook run` needs Git 2.36, and on an older git
+        #    its "not a git command" would read as a veto on every snapshot
+        #    while nothing is counted (codex round 16). If the path cannot be
+        #    resolved there is no veto to honor, and the repack proceeds.
         git_dir=$(git rev-parse --git-dir 2>/dev/null) || git_dir=".git"
-        if ! git hook run --ignore-missing pre-auto-gc >/dev/null 2>&1; then
-            echo "jsonl-export: archive repack deferred: the pre-auto-gc hook declined it (or this git cannot run hooks); the next commit retries" >&2
+        pre_auto_gc=$(git rev-parse --git-path hooks/pre-auto-gc 2>/dev/null) || pre_auto_gc=""
+        if [ -n "$pre_auto_gc" ] && [ -f "$pre_auto_gc" ] && [ -x "$pre_auto_gc" ] && ! "$pre_auto_gc" >/dev/null 2>&1; then
+            echo "jsonl-export: archive repack deferred: the pre-auto-gc hook ($pre_auto_gc) declined it; the next commit retries" >&2
             return 0
         fi
         # 2. It defers to a git gc that holds the repository: gc --auto also
@@ -875,7 +880,7 @@ record_archive_repack_failure() {
 
     if [ "$state_persisted" = 1 ]; then
         already_escalated=$(read_state_json | jq -r --argjson now "$(date +%s)" --argjson win "$REPACK_REESCALATE_SECONDS" \
-            '(.repack_failure_escalated // null) as $e | if ($e | type) == "number" then (($now - $e) < $win) else false end' || echo "false")
+            '(.repack_failure_escalated // null) as $e | if ($e | type) == "number" then ($e <= $now and ($now - $e) < $win) else false end' || echo "false")
         if [ "$consecutive" -lt "$MAX_REPACK_FAILURES" ] || [ "$already_escalated" = "true" ]; then
             return 0
         fi
