@@ -746,14 +746,25 @@ commit_archive_snapshot() {
     repack_err=$(git -c gc.auto=256 -c gc.autoDetach=false gc --auto --quiet 2>&1 >/dev/null) || repack_rc=$?
     read_loose_count
     if [ "$repack_rc" -eq 0 ] && [ -n "$loose" ] && [ "$loose" -gt "$REPACK_LOOSE_CEILING" ]; then
-        # gc --auto also exits 0 when ANOTHER git gc holds the repository
-        # (.git/gc.pid), and an explicit repack never looks at that lock:
-        # running it now would race the other gc's pack writes and deletes
-        # (codex round 12 on #138). Defer instead. The next commit retries,
-        # and a deferral is neither a success nor a failure.
+        # The explicit repack stands in for the auto-gc that did not fire, so
+        # it keeps auto-gc's two courtesies. A deferral is neither a success
+        # nor a failure; the next commit retries.
+        # 1. The pre-auto-gc hook can veto it: git gc --auto runs that hook
+        #    and exits 0 without collecting when the hook fails (codex round
+        #    14 on #138). `git hook run` finds the hook the way git does,
+        #    core.hooksPath included. A git older than 2.36 has no `git hook`
+        #    and lands here too, which keeps the gc --auto-only behaviour.
         git_dir=$(git rev-parse --git-dir 2>/dev/null) || git_dir=".git"
-        if gc_holder=$(git_gc_holder "$git_dir"); then
-            echo "jsonl-export: archive repack deferred: another git gc holds $git_dir/gc.pid ($gc_holder); the next commit retries" >&2
+        if ! git hook run --ignore-missing pre-auto-gc >/dev/null 2>&1; then
+            echo "jsonl-export: archive repack deferred: the pre-auto-gc hook declined it (or this git cannot run hooks); the next commit retries" >&2
+            return 0
+        fi
+        # 2. It holds git gc's repository lock for its whole run, so another
+        #    git gc neither runs under it nor starts during it (codex rounds
+        #    12 and 14 on #138). Only observing gc.pid left a window between
+        #    the check and the repack.
+        if ! gc_holder=$(claim_git_gc_lock "$git_dir"); then
+            echo "jsonl-export: archive repack deferred: another git gc holds the repository ($gc_holder); the next commit retries" >&2
             return 0
         fi
         # An incremental repack cannot write a bitmap index: an inherited
@@ -761,6 +772,7 @@ commit_archive_snapshot() {
         # snapshot, and the loose objects grow unbounded again.
         repack_step="repack -d -l --no-write-bitmap-index"
         repack_err=$(git repack -d -l -q --no-write-bitmap-index 2>&1 >/dev/null) || repack_rc=$?
+        release_git_gc_lock "$git_dir"
         read_loose_count
     fi
     if [ "$repack_rc" -eq 0 ] && [ -n "$loose" ] && [ "$loose" -le "$REPACK_LOOSE_CEILING" ]; then
@@ -780,6 +792,45 @@ $count_out"
     fi
     record_archive_repack_failure "step=$repack_step exit=$repack_rc loose_objects=${loose:-unknown} (ceiling $REPACK_LOOSE_CEILING)
 $repack_err"
+    return 0
+}
+
+# Take git gc's repository lock the way builtin/gc.c does: create
+# gc.pid.lock exclusively, test for a live holder while holding it, then
+# commit it as gc.pid ("<pid> <host>", this script's pid). From then on a
+# git gc on this repository sees a live holder and skips. On failure, print
+# why and leave every lock that is not ours in place. A lock file left by a
+# crashed git gc also makes git gc --auto itself fail, and that failure is
+# counted, so it cannot hide behind endless deferrals.
+claim_git_gc_lock() {
+    local git_dir="$1"
+    local lock="$git_dir/gc.pid.lock"
+    local holder
+    if ! (set -o noclobber; printf '%s %s' "$$" "$(hostname 2>/dev/null)" > "$lock") 2>/dev/null; then
+        printf '%s' "$lock exists"
+        return 1
+    fi
+    if holder=$(git_gc_holder "$git_dir"); then
+        rm -f "$lock"
+        printf '%s' "$git_dir/gc.pid: $holder"
+        return 1
+    fi
+    if ! mv -f "$lock" "$git_dir/gc.pid"; then
+        rm -f "$lock"
+        printf '%s' "could not commit $lock to gc.pid"
+        return 1
+    fi
+    return 0
+}
+
+# Remove gc.pid only while it still names this process.
+release_git_gc_lock() {
+    local pid=""
+    local host=""
+    read -r pid host < "$1/gc.pid" 2>/dev/null || [ -n "$pid" ] || return 0
+    if [ "$pid" = "$$" ]; then
+        rm -f "$1/gc.pid"
+    fi
     return 0
 }
 
