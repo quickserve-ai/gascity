@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -246,5 +249,156 @@ func TestMailCityRosterUsesConfiguredCity(t *testing.T) {
 	srv := &Server{state: state}
 	if got := srv.mailCityRoster().Local; got != "test-city" {
 		t.Errorf("roster.Local = %q, want the configured city %q", got, "test-city")
+	}
+}
+
+// enableCrossCityRoster is the hub's shape: peer qlandia maps to town alex,
+// whose rendered roster lists neutral seats; peer gastown maps to town
+// cherub, whose roster is absent.
+func enableCrossCityRoster(t *testing.T, state *fakeState) {
+	t.Helper()
+	rosterRoot := t.TempDir()
+	alexDir := filepath.Join(rosterRoot, "cities", "alex")
+	if err := os.MkdirAll(alexDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	roster := `{"town":"alex","agents":[
+	  {"address":"alex/steward","nudge":"steward","rig":"town"},
+	  {"address":"navani","nudge":"gascity/navani","rig":"gascity","type":"crew"}]}`
+	if err := os.WriteFile(filepath.Join(alexDir, "agents.json"), []byte(roster), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	state.cfg.Mail.CrossCity = &config.MailCrossCityConfig{
+		City:       "test-city",
+		Cities:     []string{"qlandia", "gastown"},
+		Towns:      map[string]string{"qlandia": "alex", "gastown": "cherub"},
+		RosterRoot: rosterRoot,
+	}
+}
+
+// (f) The API send path — what a laptop's --context send posts to the hub —
+// applies the hub's list for the target town: an absent seat is refused
+// with the same text and nothing is stored.
+func TestMailSendCrossCityRosterRefusesAbsentSeat(t *testing.T) {
+	state := newFakeState(t)
+	enableCrossCityRoster(t, state)
+	h := newTestCityHandler(t, state)
+
+	body := `{"from":"worker","to":"qlandia/qcore/lyft","subject":"x","body":"y"}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, newPostRequest(cityURL(state, "/mail"), bytes.NewBufferString(body)))
+	if rec.Code == http.StatusCreated {
+		t.Fatalf("send status = %d, want refusal; body: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "unknown seat qlandia/qcore/lyft in town alex") ||
+		!strings.Contains(rec.Body.String(), "cities/alex/agents.json @ unknown (2 known seats). Nothing sent.") {
+		t.Errorf("body = %q, want the absent-seat refusal text", rec.Body.String())
+	}
+	msgs, err := state.cityMailProv.Inbox("qlandia/qcore/lyft")
+	if err != nil {
+		t.Fatalf("Inbox: %v", err)
+	}
+	if len(msgs) != 0 {
+		t.Errorf("stored %d messages, want 0 (nothing sent)", len(msgs))
+	}
+
+	// A listed seat still sends.
+	body = `{"from":"worker","to":"qlandia/gascity/navani","subject":"x","body":"y"}`
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, newPostRequest(cityURL(state, "/mail"), bytes.NewBufferString(body)))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("listed seat: send status = %d, want %d; body: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+
+	// A mapped town whose roster is missing fails closed with its own text.
+	body = `{"from":"worker","to":"gastown/qcore/tessa","subject":"x","body":"y"}`
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, newPostRequest(cityURL(state, "/mail"), bytes.NewBufferString(body)))
+	if rec.Code == http.StatusCreated {
+		t.Fatalf("missing roster: send status = %d, want refusal; body: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "roster for town cherub could not be read at") {
+		t.Errorf("body = %q, want the missing-roster refusal", rec.Body.String())
+	}
+}
+
+// The API reply exception: a reply into a foreign-origin thread is written
+// even when the roster disagrees with the peer id.
+func TestMailReplyCrossCityRosterMismatchStillReplies(t *testing.T) {
+	state := newFakeState(t)
+	enableCrossCityRoster(t, state)
+	h := newTestCityHandler(t, state)
+	var logged bytes.Buffer
+	prevOut := log.Writer()
+	log.SetOutput(&logged)
+	t.Cleanup(func() { log.SetOutput(prevOut) })
+
+	seeded, err := state.cityMailProv.Send("qlandia/qcore/lyft", "myrig/worker", "cutover", "leg is green")
+	if err != nil {
+		t.Fatalf("seed Send: %v", err)
+	}
+	body := `{"from":"worker","subject":"re: cutover","body":"received"}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, newPostRequest(cityURL(state, "/mail/"+seeded.ID+"/reply"), bytes.NewBufferString(body)))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("reply status = %d, want %d; body: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	if !strings.Contains(logged.String(), "roster mismatch for the thread's peer: unknown seat qlandia/qcore/lyft in town alex") ||
+		!strings.Contains(logged.String(), "the reply is written into the existing thread") || strings.Contains(logged.String(), "Nothing sent") {
+		t.Errorf("log = %q, want the mismatch named, the reply reported written, and no \"Nothing sent.\"", logged.String())
+	}
+}
+
+// The API strips the local prefix before local resolution; the stripped
+// foreign string must never be stored unlisted.
+func TestMailSendCrossCityRosterLocalPrefixedForeignRefused(t *testing.T) {
+	state := newFakeState(t)
+	enableCrossCityRoster(t, state)
+	h := newTestCityHandler(t, state)
+
+	body := `{"from":"worker","to":"test-city/qlandia/qcore/lyft","subject":"x","body":"y"}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, newPostRequest(cityURL(state, "/mail"), bytes.NewBufferString(body)))
+	if rec.Code == http.StatusCreated {
+		t.Fatalf("send status = %d, want refusal; body: %s", rec.Code, rec.Body.String())
+	}
+	inbox, err := state.cityMailProv.Inbox("qlandia/qcore/lyft")
+	if err != nil {
+		t.Fatalf("Inbox: %v", err)
+	}
+	if len(inbox) != 0 {
+		t.Errorf("stored %d messages for the absent seat, want 0", len(inbox))
+	}
+}
+
+// Finding 2a: a recipient given as a session bead id resolves LOCALLY to
+// that session's mailbox address — its free-form alias — and that final
+// string is what gets stored. An alias shaped like an absent peer-city seat
+// must meet the same gate as a directly addressed one.
+func TestMailSendCrossCityRosterGatesLocallyResolvedForeignAlias(t *testing.T) {
+	state := newSessionFakeState(t)
+	enableCrossCityRoster(t, state)
+	rogue := createTestSessionBead(t, state.cityBeadStore, map[string]string{
+		"session_name": "rogue-runtime",
+		"alias":        "qlandia/qcore/absent",
+		"state":        "active",
+	}, "")
+	h := newTestCityHandler(t, state)
+
+	body := `{"from":"worker","to":"` + rogue.ID + `","subject":"x","body":"y"}`
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, newPostRequest(cityURL(state, "/mail"), bytes.NewBufferString(body)))
+	if rec.Code == http.StatusCreated {
+		t.Fatalf("send status = %d, want refusal; body: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "unknown seat qlandia/qcore/absent in town alex") {
+		t.Errorf("body = %q, want the resolved alias refused as an absent seat", rec.Body.String())
+	}
+	inbox, err := state.cityMailProv.Inbox("qlandia/qcore/absent")
+	if err != nil {
+		t.Fatalf("Inbox: %v", err)
+	}
+	if len(inbox) != 0 {
+		t.Errorf("stored %d messages for the absent seat, want 0", len(inbox))
 	}
 }
