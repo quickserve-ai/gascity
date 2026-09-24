@@ -3512,7 +3512,12 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			storedHash := infoByID[id].StartedConfigHash
 			if template != "" && storedHash != "" {
 				cfgAgent := findAgentByTemplate(cfg, template)
-				if cfgAgent != nil {
+				// A suspended agent's session is being stopped, not restarted.
+				// A drift reset would kill it and stamp pending-create, which
+				// the awake set no longer launches for a suspended agent, so
+				// the lease would expire and the bead close as a failed create,
+				// losing it (#6307). Leave drift to the resume (ga-9qanni).
+				if cfgAgent != nil && !isAgentEffectivelySuspendedWith(cfg, cityPath, cfgAgent, suspState) {
 					agentCfg := sessionCoreConfigForHashInfo(tp, infoByID[id])
 					currentHash := runtime.CoreFingerprint(agentCfg)
 					if storedHash != currentHash {
@@ -4664,6 +4669,15 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 				// downstream identity-preservation and drainReasonCancelable
 				// treat this drain as suspend-class/revertible instead of a
 				// generic non-wake close.
+				reason = "suspended"
+			case configuredNames[name] && sessionAgentSuspendedInfo(cfg, cityPath, info, suspState):
+				// The same for one agent patched suspended=true. As
+				// "no-wake-reason" the drain was canceled by the seat's own
+				// assigned work every other tick, so a suspended refinery holding
+				// a patrol wisp was never stopped (ga-9qanni). "suspended" is not
+				// cancelable by work or by a returning wake reason, and its
+				// completion parks the bead asleep, which keeps it for resume
+				// (#6307).
 				reason = "suspended"
 			default:
 				reason = "no-wake-reason"
