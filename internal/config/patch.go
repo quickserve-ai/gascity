@@ -239,7 +239,7 @@ type RigPatch struct {
 	// BeadsProxiedIdleTimeout overrides the rig's beads_proxied_idle_timeout.
 	BeadsProxiedIdleTimeout *string `toml:"beads_proxied_idle_timeout,omitempty"`
 	// Doctor overrides fields of the rig's [rigs.doctor] table.
-	Doctor *RigDoctorPatch `toml:"doctor,omitempty"`
+	Doctor *RigDoctorPatch `toml:"doctor,omitempty" json:"Doctor,omitempty"`
 }
 
 // RigDoctorPatch overrides fields of a rig's [rigs.doctor] table. Nil
