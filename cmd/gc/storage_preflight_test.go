@@ -225,7 +225,7 @@ func TestPreflightReportsALiveControllerWithoutBlocking(t *testing.T) {
 		t.Fatalf("preflight blocked on a live controller, so it can only be run from inside the window it exists to plan: exit %d stdout=%q", code, stdout.String())
 	}
 	out := stdout.String()
-	if !strings.Contains(out, "4242") {
+	if !strings.Contains(out, "controller: PID 4242 ") {
 		t.Errorf("preflight does not name the live controller's PID: %q", out)
 	}
 	if !strings.Contains(out, storageStopCommand) {
@@ -243,7 +243,10 @@ func TestPreflightSaysSoWhenNoControllerIsLive(t *testing.T) {
 	if code := doStoragePreflight(request, &stdout, &stderr); code != 0 {
 		t.Fatalf("preflight refused a ready city: exit %d stderr=%q", code, stderr.String())
 	}
-	if strings.Contains(stdout.String(), "4242") {
+	// Match the controller line, not the bare number: the fixture's temp paths
+	// are printed too, and a runner temp dir named gcx24242-... made a bare
+	// "4242" match (ga-b1kggv).
+	if strings.Contains(stdout.String(), "controller: PID ") {
 		t.Fatalf("the fixture leaked a PID: %q", stdout.String())
 	}
 	if !strings.Contains(stdout.String(), "controller: nothing answered") {

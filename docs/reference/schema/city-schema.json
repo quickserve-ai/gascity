@@ -1977,6 +1977,17 @@
           },
           "type": "array",
           "description": "Cities lists the peer cities addressable as \u003ccity\u003e/\u003caddress\u003e. A\nrecipient naming a listed city resolves against the roster and is never\nlooked up in the local session store."
+        },
+        "towns": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object",
+          "description": "Towns maps a listed peer city to the town whose rendered roster\n(cities/\u003ctown\u003e/agents.json) lists that city's seats. A send to a\nmapped city is refused unless the seat is in that list; a peer city\nwith no mapping keeps the city-level rules only."
+        },
+        "roster_root": {
+          "type": "string",
+          "description": "RosterRoot points at the directory holding cities/\u003ctown\u003e/agents.json\nand overrides discovery. Unset, the roster is the pack-cache clone of\nthe imported repository that ships cities/, at its packs.lock commit;\nwith no such import there is no list and sends behave exactly as\nbefore this knob existed."
         }
       },
       "additionalProperties": false,

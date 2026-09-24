@@ -556,6 +556,8 @@ MailCrossCityConfig enables city-qualified mail addressing: recipients of the fo
 |-------|------|----------|---------|-------------|
 | `city` | string | **yes** |  | City is this city's own segment in city-qualified addresses, and it is REQUIRED when the section is present: the CLI and the API derive the effective city name differently (site binding, workspace name, the supervisor's registered name), so a defaulted name could stamp two spellings of this city on mail and strand replies. &lt;City&gt;/&lt;address&gt; and &lt;address&gt; are one mailbox. |
 | `cities` | []string | **yes** |  | Cities lists the peer cities addressable as &lt;city&gt;/&lt;address&gt;. A recipient naming a listed city resolves against the roster and is never looked up in the local session store. |
+| `towns` | map[string]string |  |  | Towns maps a listed peer city to the town whose rendered roster (cities/&lt;town&gt;/agents.json) lists that city's seats. A send to a mapped city is refused unless the seat is in that list; a peer city with no mapping keeps the city-level rules only. |
+| `roster_root` | string |  |  | RosterRoot points at the directory holding cities/&lt;town&gt;/agents.json and overrides discovery. Unset, the roster is the pack-cache clone of the imported repository that ships cities/, at its packs.lock commit; with no such import there is no list and sends behave exactly as before this knob existed. |
 
 ## MaintenanceConfig
 
