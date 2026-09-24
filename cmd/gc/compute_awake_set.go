@@ -190,6 +190,12 @@ func ComputeAwakeSet(input AwakeInput) map[string]AwakeDecision {
 		if !bead.PendingCreate {
 			continue
 		}
+		// Not for a suspended agent, like every other wake cause here: a
+		// nudge-materialized bead for the suspended platform refinery was
+		// launched through this path (ga-9qanni).
+		if agent, ok := lookupAgent(bead.Template); ok && agent.Suspended {
+			continue
+		}
 		desired[bead.SessionName] = "pending-create"
 	}
 	for _, bead := range input.SessionBeads {
@@ -417,6 +423,11 @@ func ComputeAwakeSet(input AwakeInput) map[string]AwakeDecision {
 		if !bead.ContinuationResetPending || bead.RestartRequested || bead.WaitHold || bead.Drained {
 			continue
 		}
+		// A handoff or restart request does not relaunch a suspended agent
+		// (ga-9qanni); the reset stays pending for the resume.
+		if agent, ok := lookupAgent(bead.Template); ok && agent.Suspended {
+			continue
+		}
 		switch desired[bead.SessionName] {
 		case "pending-create", "explicit-wake":
 			continue
@@ -472,10 +483,14 @@ func ComputeAwakeSet(input AwakeInput) map[string]AwakeDecision {
 			decision.Reason = "pending"
 		}
 
-		// Ready wait — durable wait deadline passed, resume session
+		// Ready wait — durable wait deadline passed, resume session. Not for
+		// a suspended agent: a wait that resolves after the suspension would
+		// relaunch the seat (ga-9qanni). The wait stays ready for the resume.
 		if input.ReadyWaitSet[bead.ID] {
-			decision.ShouldWake = true
-			decision.Reason = "wait-ready"
+			if agent, ok := lookupAgent(bead.Template); !ok || !agent.Suspended {
+				decision.ShouldWake = true
+				decision.Reason = "wait-ready"
+			}
 		}
 
 		// On-demand running override — on-demand sessions that are
@@ -488,8 +503,13 @@ func ComputeAwakeSet(input AwakeInput) map[string]AwakeDecision {
 		if !decision.ShouldWake && !bead.Drained && !bead.WaitHold &&
 			bead.SleepReason != string(sessionpkg.SleepReasonIdleTimeout) {
 			if input.RunningSessions[name] && isOnDemandSession(input.NamedSessions, bead) {
-				decision.ShouldWake = true
-				decision.Reason = "on-demand:running"
+				// A suspended agent's running on-demand session is not kept
+				// awake: suspension stops it, and #6307 keeps its bead for
+				// resume (ga-9qanni).
+				if agent, ok := lookupAgent(bead.Template); !ok || !agent.Suspended {
+					decision.ShouldWake = true
+					decision.Reason = "on-demand:running"
+				}
 			}
 		}
 

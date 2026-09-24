@@ -2686,6 +2686,10 @@ local form (&lt;city&gt;/mayor and mayor are one mailbox); a listed peer city's
 address is stored canonical as written, with no local session lookup, and the
 sender is stored city-qualified so a plain reply resolves back. --notify does
 not cross cities: the recipient's wake belongs to its own city's mail sweep.
+A peer city mapped to a town under [mail.crosscity.towns] is also checked
+against that town's rendered roster (cities/&lt;town&gt;/agents.json, read from the
+local pack cache at its pinned commit): a seat absent from the list, or a
+list that cannot be read, refuses the send before anything is stored.
 
 ```
 gc mail send [<to>] [<body>] [flags]
