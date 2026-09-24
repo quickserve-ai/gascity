@@ -2,8 +2,12 @@ package config
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+
+	"github.com/BurntSushi/toml"
 )
 
 // MailCrossCityConfig enables city-qualified mail addressing: recipients of
@@ -22,6 +26,139 @@ type MailCrossCityConfig struct {
 	// recipient naming a listed city resolves against the roster and is never
 	// looked up in the local session store.
 	Cities []string `toml:"cities"`
+	// Towns maps a listed peer city to the town whose rendered roster
+	// (cities/<town>/agents.json) lists that city's seats. A send to a
+	// mapped city is refused unless the seat is in that list; a peer city
+	// with no mapping keeps the city-level rules only.
+	Towns map[string]string `toml:"towns,omitempty"`
+	// RosterRoot points at the directory holding cities/<town>/agents.json
+	// and overrides discovery. Unset, the roster is the pack-cache clone of
+	// the imported repository that ships cities/, at its packs.lock commit;
+	// with no such import there is no list and sends behave exactly as
+	// before this knob existed.
+	RosterRoot string `toml:"roster_root,omitempty"`
+}
+
+// RosterPinUnknown is the pin reported for a hand-pointed roster_root, for
+// which no rendered commit is known.
+const RosterPinUnknown = "unknown"
+
+// MailCrossCityTowns returns the peer-city to town mapping for cross-city
+// mail address lists, or nil when the section is absent.
+func (c *City) MailCrossCityTowns() map[string]string {
+	if c == nil || c.Mail.CrossCity == nil {
+		return nil
+	}
+	return c.Mail.CrossCity.Towns
+}
+
+// MailCrossCityRosterSource returns the directory that holds
+// cities/<town>/agents.json and the commit it was rendered at. A configured
+// roster_root wins, with RosterPinUnknown as its pin. Otherwise the source
+// is discovered from the city's pinned imports: the pack-cache clone
+// (<GC_HOME>/cache/repos/<key>) of the one imported repository whose clone
+// ships a cities/ directory, at the commit packs.lock records — read from
+// disk, never fetched. No such import means no list: ("", "", nil), which
+// keeps today's send behavior. More than one such repository is ambiguous
+// and is an error, never resolved by map order.
+func (c *City) MailCrossCityRosterSource(cityRoot string) (root, pin string, err error) {
+	if c == nil || c.Mail.CrossCity == nil {
+		return "", "", nil
+	}
+	if explicit := strings.TrimSpace(c.Mail.CrossCity.RosterRoot); explicit != "" {
+		return explicit, RosterPinUnknown, nil
+	}
+	lock, err := readRemoteImportLock(cityRoot)
+	if err != nil {
+		return "", "", err
+	}
+	if len(lock.Packs) == 0 {
+		return "", "", nil
+	}
+	gcHome := ImplicitGCHome()
+	if gcHome == "" {
+		return "", "", fmt.Errorf("resolving the cross-city roster: no GC_HOME available to locate the pack cache")
+	}
+	type candidate struct{ root, commit string }
+	found := map[string]candidate{}
+	for _, imp := range c.allPinnedImports() {
+		entry, ok := lock.Packs[imp.Source]
+		if !ok || entry.Commit == "" {
+			continue
+		}
+		key := NormalizeRemoteSource(imp.Source) + "@" + entry.Commit
+		if _, seen := found[key]; seen {
+			continue
+		}
+		clone := GlobalRepoCachePath(gcHome, imp.Source, entry.Commit)
+		info, statErr := os.Stat(filepath.Join(clone, "cities"))
+		if statErr != nil {
+			// Absent is simply "not a candidate". Anything else (a
+			// permission or I/O failure) is a discovery FAILURE: a mapped
+			// town must then refuse, and a second readable repository
+			// must never be chosen in its place.
+			if os.IsNotExist(statErr) {
+				continue
+			}
+			return "", "", fmt.Errorf("resolving the cross-city roster: checking %s: %w", clone, statErr)
+		}
+		if !info.IsDir() {
+			continue
+		}
+		found[key] = candidate{root: clone, commit: entry.Commit}
+	}
+	switch len(found) {
+	case 0:
+		return "", "", nil
+	case 1:
+		for _, cand := range found {
+			return cand.root, cand.commit, nil
+		}
+	}
+	keys := make([]string, 0, len(found))
+	for key := range found {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return "", "", fmt.Errorf("resolving the cross-city roster: ambiguous, %d imported repositories ship cities/ (%s); set [mail.crosscity] roster_root", len(keys), strings.Join(keys, ", "))
+}
+
+// allPinnedImports lists the city-scoped imports and every rig-scoped
+// import, in a stable order, for roster discovery.
+func (c *City) allPinnedImports() []Import {
+	var out []Import
+	appendSorted := func(m map[string]Import) {
+		names := make([]string, 0, len(m))
+		for name := range m {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			out = append(out, m[name])
+		}
+	}
+	appendSorted(c.Imports)
+	for i := range c.Rigs {
+		appendSorted(c.Rigs[i].Imports)
+	}
+	return out
+}
+
+// readRemoteImportLock reads <cityRoot>/packs.lock; a missing file is an
+// empty lock, not an error.
+func readRemoteImportLock(cityRoot string) (remoteImportLockfile, error) {
+	var lock remoteImportLockfile
+	data, err := os.ReadFile(filepath.Join(cityRoot, "packs.lock"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return lock, nil
+		}
+		return lock, fmt.Errorf("reading packs.lock: %w", err)
+	}
+	if _, err := toml.Decode(string(data), &lock); err != nil {
+		return lock, fmt.Errorf("parsing packs.lock: %w", err)
+	}
+	return lock, nil
 }
 
 // MailCityRoster returns the local city name and peer cities for
@@ -78,6 +215,14 @@ func ValidateMailCrossCity(cfg *City, cityRoot string) error {
 		seen[city] = true
 		if city == local {
 			return fmt.Errorf("[mail.crosscity] cities must not list this city's own city %q", city)
+		}
+	}
+	for city, town := range cc.Towns {
+		if !seen[city] {
+			return fmt.Errorf("[mail.crosscity.towns] %q is not a listed peer city", city)
+		}
+		if err := validateMailCityName(strings.TrimSpace(town)); err != nil {
+			return fmt.Errorf("[mail.crosscity.towns] %s: town: %w", city, err)
 		}
 	}
 	for i := range cfg.Rigs {
