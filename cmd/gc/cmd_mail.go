@@ -1700,7 +1700,11 @@ When [mail.crosscity] is configured, a recipient may be city-qualified:
 local form (<city>/mayor and mayor are one mailbox); a listed peer city's
 address is stored canonical as written, with no local session lookup, and the
 sender is stored city-qualified so a plain reply resolves back. --notify does
-not cross cities: the recipient's wake belongs to its own city's mail sweep.`,
+not cross cities: the recipient's wake belongs to its own city's mail sweep.
+A peer city mapped to a town under [mail.crosscity.towns] is also checked
+against that town's rendered roster (cities/<town>/agents.json, read from the
+local pack cache at its pinned commit): a seat absent from the list, or a
+list that cannot be read, refuses the send before anything is stored.`,
 		Example: `  gc mail send mayor "Build is green"
   gc mail send mayor -s "Build is green"
   gc mail send myrig/reviewer -s "Need investigation" -m "Attach logs from the last failed run"
@@ -2154,6 +2158,12 @@ func cmdMailSendJSONFull(args []string, notify bool, all bool, from string, to s
 		// cross-city send into a cloud-wake refusal.
 		if kind, _ := roster.ResolveCityAddress(canonicalTo); kind == mail.CityAddressForeign {
 			foreign = true
+			// The target town's rendered roster decides whether the seat
+			// exists there; an absent seat or an unreadable list refuses
+			// before any write. canonicalTo is the stored form.
+			if refused, code := crossCitySendGate(roster, canonicalTo, jsonOut, stdout, stderr); refused {
+				return code
+			}
 			if notify {
 				msg := crossCityNotifyRefusal("gc mail send", canonicalTo)
 				if jsonOut {
@@ -2184,11 +2194,25 @@ func cmdMailSendJSONFull(args []string, notify bool, all bool, from string, to s
 		// session-resolved, so an unknown city is refused here (never
 		// written to a literal mailbox), --notify keeps its cross-city
 		// refusal, and a foreign send still stores a qualified sender.
+		// A local-city prefix is stripped FIRST (<local>/<addr> is <addr>,
+		// single-level, as the store-backed resolver does) and the
+		// remainder — the exact string the provider receives — is what
+		// gets classified and gated.
 		kind, addr := roster.ResolveCityAddress(args[0])
+		if kind == mail.CityAddressLocal {
+			args[0] = addr
+			kind, addr = roster.ResolveCityAddress(args[0])
+			if kind == mail.CityAddressLocal {
+				kind = mail.CityAddressNone
+			}
+		}
 		switch kind {
 		case mail.CityAddressForeign:
 			args[0] = addr
 			foreign = true
+			if refused, code := crossCitySendGate(roster, addr, jsonOut, stdout, stderr); refused {
+				return code
+			}
 			if notify {
 				msg := crossCityNotifyRefusal("gc mail send", addr)
 				if jsonOut {
@@ -2198,8 +2222,6 @@ func cmdMailSendJSONFull(args []string, notify bool, all bool, from string, to s
 				return 1
 			}
 			sender = roster.QualifySender(sender)
-		case mail.CityAddressLocal:
-			args[0] = addr
 		default:
 			if refuse := mail.RefuseUnknownCity(mail.ErrUnresolvedCityProbe, args[0], roster, cfg.LocalAddressPrefixes()); refuse != nil && !errors.Is(refuse, mail.ErrUnresolvedCityProbe) {
 				msg := fmt.Sprintf("gc mail send: unknown recipient %q: %v", args[0], refuse)
@@ -2225,7 +2247,7 @@ func cmdMailSendJSONFull(args []string, notify bool, all bool, from string, to s
 				}
 			}
 		}
-		return doMailSendAllCoverage(mp, rec, validRecipients, sender, args, nf, jsonOut, cov, stdout, stderr)
+		return doMailSendAllCoverage(mp, rec, crossCityBroadcastRecipients(roster, validRecipients, stderr), sender, args, nf, jsonOut, cov, stdout, stderr)
 	}
 
 	rec := openCityRecorder(stderr)
@@ -2785,6 +2807,12 @@ func cmdMailReplyJSON(args []string, subject, message string, notify bool, jsonO
 			return 1
 		}
 		if kind, _ := roster.ResolveCityAddress(orig.From); kind == mail.CityAddressForeign {
+			// The one exception to the roster refusal: the thread's peer id
+			// already resolved once, so the reply is written; a roster that
+			// now disagrees is named, not obeyed.
+			if seatErr := roster.CheckForeignSeat(orig.From); seatErr != nil {
+				fmt.Fprintln(stderr, crossCityReplyRosterWarning(seatErr)) //nolint:errcheck // best-effort stderr
+			}
 			if notify {
 				msg := crossCityNotifyRefusal("gc mail reply", orig.From)
 				if jsonOut {

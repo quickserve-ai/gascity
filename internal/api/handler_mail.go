@@ -80,8 +80,9 @@ func (s *Server) resolveMailSendRecipientWithContext(ctx context.Context, recipi
 	case mail.CityAddressForeign:
 		// A peer city's address is canonical as written; its identity can
 		// only be checked by that city, so the session store is never
-		// consulted.
-		return addr, nil
+		// consulted. What CAN be checked here is that city's rendered
+		// roster (PROP-027 1.4), below, on the final string.
+		return gateMailSendRecipient(roster, addr)
 	case mail.CityAddressLocal:
 		// <local city>/<addr> and <addr> are one mailbox.
 		recipient = addr
@@ -90,7 +91,13 @@ func (s *Server) resolveMailSendRecipientWithContext(ctx context.Context, recipi
 		}
 	}
 	resolved, err := s.resolveLocalMailSendRecipientWithContext(ctx, recipient)
-	if err != nil {
+	if err == nil {
+		// A locally resolved recipient is a session's mailbox address —
+		// its free-form alias — and that alias may be shaped like a peer
+		// seat. The stored string meets the same gate either way.
+		return gateMailSendRecipient(roster, resolved)
+	}
+	{
 		// A slash-form recipient whose first segment names neither a local
 		// scope nor a roster city refuses as unknown-city, so a stale roster
 		// is never spelled as a session lookup failure. Only a not-found
@@ -102,7 +109,17 @@ func (s *Server) resolveMailSendRecipientWithContext(ctx context.Context, recipi
 		}
 		return "", mail.RefuseUnknownCity(err, recipient, roster, s.state.Config().LocalAddressPrefixes())
 	}
-	return resolved, nil
+}
+
+// gateMailSendRecipient is the one place a send's FINAL recipient string —
+// the exact form that will be stored, whether it was addressed foreign or
+// resolved locally to a session alias — meets the target town's rendered
+// roster. An absent seat or an unreadable list refuses before any write.
+func gateMailSendRecipient(roster mail.CityRoster, final string) (string, error) {
+	if err := roster.CheckForeignSeat(final); err != nil {
+		return "", err
+	}
+	return final, nil
 }
 
 func (s *Server) resolveLocalMailSendRecipientWithContext(ctx context.Context, recipient string) (string, error) {
@@ -209,7 +226,11 @@ func (s *Server) mailCityRoster() mail.CityRoster {
 		fallback = filepath.Base(filepath.Clean(p))
 	}
 	local, peers := cfg.MailCityRoster(fallback)
-	return mail.CityRoster{Local: local, Peers: peers}
+	roster := mail.CityRoster{Local: local, Peers: peers, Towns: cfg.MailCrossCityTowns()}
+	if roster.Enabled() {
+		roster.RosterRoot, roster.RosterPin, roster.RosterSourceErr = cfg.MailCrossCityRosterSource(s.state.CityPath())
+	}
+	return roster
 }
 
 func (s *Server) resolveMailQueryRecipientsWithContext(ctx context.Context, recipient string) []string {
