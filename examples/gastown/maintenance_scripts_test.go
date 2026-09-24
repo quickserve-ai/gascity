@@ -8994,7 +8994,7 @@ exec '%s' "$@"
 // and no failure is recorded.
 // An inherited repack.writeBitmaps must not break the explicit fallback: an
 // incremental repack cannot write a bitmap index, and git exits 128 on it
-// (codex round 11 on #138; reproduced on git 2.50.1).
+// (reproduced on git 2.50.1).
 func TestJsonlExportExplicitRepackIgnoresInheritedBitmapConfig(t *testing.T) {
 	cityDir := t.TempDir()
 	binDir := t.TempDir()
@@ -9110,8 +9110,7 @@ exec '%s' "$@"
 
 // gc --auto also exits 0 when ANOTHER git gc holds the repository, and an
 // explicit repack ignores that lock. With a live gc.pid holder on this host
-// the fallback must defer: no repack, and no failure counted (codex round 12
-// on #138).
+// the fallback must defer: no repack, and no failure counted.
 func TestJsonlExportExplicitRepackDefersToARunningGC(t *testing.T) {
 	cityDir := t.TempDir()
 	binDir := t.TempDir()
@@ -9228,55 +9227,71 @@ exec '%[1]s' "$@"
 
 // A failing pre-auto-gc hook vetoes auto-gc: git gc --auto exits 0 and
 // collects nothing. The explicit repack stands in for that auto-gc, so it
-// must honor the same veto, found through core.hooksPath as git finds it
-// (codex round 14 on #138).
+// must honor the same veto, found through core.hooksPath as git finds it.
+// The control: a hook that exits 0 lets the repack run.
 func TestJsonlExportExplicitRepackHonorsPreAutoGCVeto(t *testing.T) {
-	cityDir := t.TempDir()
-	binDir := t.TempDir()
-	stateDir := t.TempDir()
-	gcLog := filepath.Join(t.TempDir(), "gc.log")
-	mailLog := filepath.Join(t.TempDir(), "gc-mail.log")
-	archiveRepo := filepath.Join(cityDir, "archive")
-	stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
-	probeLog := filepath.Join(t.TempDir(), "repack.log")
+	for _, tt := range []struct {
+		name     string
+		hookExit int
+		repacks  bool
+	}{
+		{name: "veto", hookExit: 1, repacks: false},
+		{name: "allow", hookExit: 0, repacks: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cityDir := t.TempDir()
+			binDir := t.TempDir()
+			stateDir := t.TempDir()
+			gcLog := filepath.Join(t.TempDir(), "gc.log")
+			mailLog := filepath.Join(t.TempDir(), "gc-mail.log")
+			archiveRepo := filepath.Join(cityDir, "archive")
+			stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
+			probeLog := filepath.Join(t.TempDir(), "repack.log")
 
-	hooksDir := t.TempDir()
-	writeExecutable(t, filepath.Join(hooksDir, "pre-auto-gc"), "#!/bin/sh\nexit 1\n")
-	globalConfig := filepath.Join(t.TempDir(), "gitconfig")
-	if err := os.WriteFile(globalConfig, []byte("[core]\n\thooksPath = "+hooksDir+"\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile(gitconfig): %v", err)
-	}
-	gcScriptedStub(t, binDir, probeLog, ":")
-	writeJsonlExportGCStub(t, binDir)
-	writeMultiRecordDoltStub(t, binDir, 3)
+			hooksDir := t.TempDir()
+			writeExecutable(t, filepath.Join(hooksDir, "pre-auto-gc"), fmt.Sprintf("#!/bin/sh\nexit %d\n", tt.hookExit))
+			globalConfig := filepath.Join(t.TempDir(), "gitconfig")
+			if err := os.WriteFile(globalConfig, []byte("[core]\n\thooksPath = "+hooksDir+"\n"), 0o644); err != nil {
+				t.Fatalf("WriteFile(gitconfig): %v", err)
+			}
+			gcScriptedStub(t, binDir, probeLog, ":")
+			writeJsonlExportGCStub(t, binDir)
+			writeMultiRecordDoltStub(t, binDir, 3)
 
-	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
-	env["GC_JSONL_REPACK_LOOSE_CEILING"] = "0"
-	env["GIT_CONFIG_GLOBAL"] = globalConfig
+			env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
+			env["GC_JSONL_REPACK_LOOSE_CEILING"] = "0"
+			env["GIT_CONFIG_GLOBAL"] = globalConfig
 
-	runScript(t, coreScriptPath("jsonl-export.sh"), env)
+			runScript(t, coreScriptPath("jsonl-export.sh"), env)
 
-	if data, err := os.ReadFile(probeLog); err == nil {
-		t.Fatalf("a failing pre-auto-gc hook must veto the explicit repack; repack calls:\n%s", data)
-	}
-	data, err := os.ReadFile(stateFile)
-	if err != nil && !os.IsNotExist(err) {
-		t.Fatalf("ReadFile(state file): %v", err)
-	}
-	if strings.Contains(string(data), "consecutive_repack_failures") {
-		t.Fatalf("a vetoed repack is a deferral, not a failure\nstate: %s", data)
-	}
-	out := runGitOut(t, archiveRepo, "count-objects", "-v")
-	if strings.Contains("\n"+out+"\n", "\ncount: 0\n") {
-		t.Fatalf("nothing should have packed the loose objects under the veto; count-objects:\n%s", out)
+			data, err := os.ReadFile(probeLog)
+			if tt.repacks && err != nil {
+				t.Fatalf("a pre-auto-gc hook that exits 0 must let the explicit repack run: %v", err)
+			}
+			if !tt.repacks && err == nil {
+				t.Fatalf("a failing pre-auto-gc hook must veto the explicit repack; repack calls:\n%s", data)
+			}
+			state, err := os.ReadFile(stateFile)
+			if err != nil && !os.IsNotExist(err) {
+				t.Fatalf("ReadFile(state file): %v", err)
+			}
+			if strings.Contains(string(state), "consecutive_repack_failures") {
+				t.Fatalf("neither a veto nor an allowed repack is a failure\nstate: %s", state)
+			}
+			out := runGitOut(t, archiveRepo, "count-objects", "-v")
+			packed := strings.Contains("\n"+out+"\n", "\ncount: 0\n")
+			if packed != tt.repacks {
+				t.Fatalf("loose objects packed = %v, want %v; count-objects:\n%s", packed, tt.repacks, out)
+			}
+		})
 	}
 }
 
 // The explicit repack observes git gc's lock and never writes it: gc.pid and
 // gc.pid.lock are PID/lock status files, which AGENTS.md forbids, and one
-// left by a crash would defer every snapshot for up to 12 hours (codex round
-// 15 on #138). With no holder, the repack runs without either file present
-// and packs the loose objects.
+// left by a crash would defer every snapshot for up to 12 hours. With no
+// holder, the repack runs without either file present and packs the loose
+// objects.
 func TestJsonlExportExplicitRepackWritesNoGitLockFiles(t *testing.T) {
 	cityDir := t.TempDir()
 	binDir := t.TempDir()
@@ -9366,8 +9381,7 @@ func TestJsonlExportRepackEscalationDeliveryFailureIsRecorded(t *testing.T) {
 // A marker left behind by a clear that failed to persist must not mute a
 // later streak: dedupe is bounded by time, so a stale marker (here a legacy
 // boolean, an escalation older than the window, and one stamped in the
-// future because the clock moved back, codex round 16 on #138) does not
-// suppress.
+// future because the clock moved back) does not suppress.
 func TestJsonlExportStaleRepackEscalationMarkerDoesNotMuteANewStreak(t *testing.T) {
 	cityDir := t.TempDir()
 	binDir := t.TempDir()
@@ -9399,6 +9413,49 @@ func TestJsonlExportStaleRepackEscalationMarkerDoesNotMuteANewStreak(t *testing.
 		if !strings.Contains(string(mailData), "ESCALATION: JSONL archive repack failing") {
 			t.Fatalf("stale marker %s muted a new failing streak; mail log:\n%s", marker, mailData)
 		}
+	}
+}
+
+// The other half of the dedupe: an escalation inside the window mutes the
+// next one. A continuing streak is still counted, but no second HIGH mail
+// goes out until the window has passed.
+func TestJsonlExportRecentRepackEscalationMarkerMutesReescalation(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+	mailLog := filepath.Join(t.TempDir(), "gc-mail.log")
+	archiveRepo := filepath.Join(cityDir, "archive")
+	stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
+
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("LookPath(git): %v", err)
+	}
+	writeGitSubcommandFailureStub(t, binDir, realGit, "gc")
+	writeJsonlExportGCStub(t, binDir)
+	writeMultiRecordDoltStub(t, binDir, 3)
+	recent := strconv.FormatInt(time.Now().Unix()-60, 10)
+	if err := os.WriteFile(stateFile, []byte(`{"consecutive_repack_failures":5,"repack_failure_escalated":`+recent+`}`+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(state): %v", err)
+	}
+	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
+
+	runScript(t, coreScriptPath("jsonl-export.sh"), env)
+
+	mailData, err := os.ReadFile(mailLog)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("ReadFile(mail log): %v", err)
+	}
+	if strings.Contains(string(mailData), "ESCALATION: JSONL archive repack failing") {
+		t.Fatalf("an escalation 60s ago must mute the next one; mail log:\n%s", mailData)
+	}
+	data, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("ReadFile(state file): %v", err)
+	}
+	if !strings.Contains(string(data), `"consecutive_repack_failures":6`) {
+		t.Fatalf("the muted failure must still be counted\nstate: %s", data)
 	}
 }
 
@@ -9751,8 +9808,8 @@ func TestJsonlExportCommitsOnHaltToAdvanceBaseline(t *testing.T) {
 // commit path can) must still deliver the spike alert and reach its summary.
 // Every state write fails after the repack: the pending-alert record is never
 // persisted, so clearing it after a successful send must not run, and could
-// not succeed; under errexit it used to end the run before
-// MAINTENANCE_DONE (codex round 10 on #138).
+// not succeed, and under errexit it must not end the run before
+// MAINTENANCE_DONE.
 func TestJsonlExportHaltOnFullDiskStillAlertsAndCompletes(t *testing.T) {
 	cityDir := t.TempDir()
 	binDir := t.TempDir()

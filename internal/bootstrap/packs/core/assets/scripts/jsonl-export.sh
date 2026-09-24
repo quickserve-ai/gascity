@@ -704,24 +704,23 @@ commit_archive_snapshot() {
         return 1
     fi
     # Every snapshot commit leaves one new loose blob per exported store (a
-    # full issues.jsonl, tens of MiB each) and nothing in this script ever
-    # repacked the archive; git only runs its own gc --auto from commands this
-    # script never calls (merge, rebase, receive-pack). Measured 2026-09-23 on
-    # the Cherub town: 5,333 loose objects, 7.48 GiB, against a 160 MiB pack
-    # last written 20 days earlier — the archive was the city's largest disk
-    # consumer while its packed content was a few hundred MiB. Repack on the
-    # commit path, bounded: gc.auto=256 fires roughly every ~128 commits, so
-    # each repack handles a few hundred MiB, not the whole history; autoDetach
-    # off so the repack finishes inside this order's own run instead of a
-    # detached child that outlives it. Never fatal: the snapshot is already
-    # committed, and a failed repack costs disk, not data. Never silent either:
-    # a repack that keeps failing is exactly the unbounded growth this call
-    # exists to stop, so failures are counted in state and escalated.
+    # full issues.jsonl, tens of MiB each). The auto-maintenance that `git
+    # commit` starts packs only past gc.auto's default of 6700 loose objects,
+    # which at this blob size is several GiB of loose data. Repack on the
+    # commit path with a much lower trigger: gc.auto=256 fires roughly every
+    # ~128 commits, so each repack handles a few hundred MiB, not the whole
+    # history; autoDetach off so the repack finishes inside this order's run
+    # instead of a detached child that outlives it. The first run against an
+    # archive that is already far behind packs the whole backlog at once,
+    # which is why the order's timeout is 30m. Never fatal: the snapshot is
+    # already committed, and a failed repack costs disk, not data. Never
+    # silent either: a repack that keeps failing lets loose objects pile up
+    # toward git's own trigger, so failures are counted in state and escalated.
     # Exit status alone is not proof: gc --auto returns 0 without packing when
     # its sampled estimate (one of the 256 loose-object fan-out directories)
-    # misses the trigger, when a previous auto-gc left .git/gc.log (it then
-    # skips for gc.logExpiry), or when the pack directory is unusable. So the
-    # loose count is checked exactly: above REPACK_LOOSE_CEILING (default
+    # misses the trigger, when another git gc holds the repository, when the
+    # pre-auto-gc hook declines, or when the pack directory is unusable. So
+    # the loose count is checked exactly: above REPACK_LOOSE_CEILING (default
     # twice the gc.auto trigger) after a gc --auto that exited 0, the loose
     # objects are packed explicitly with the incremental repack gc --auto
     # would have run, and only that result is judged.
@@ -734,58 +733,59 @@ commit_archive_snapshot() {
     local repack_step="gc --auto"
     local count_out
     local loose
-    local git_dir
+    local gc_pid
     local gc_log
     local gc_log_head
     local gc_holder
     local pre_auto_gc
+    local fallback_err
+    local summary
     read_loose_count() {
         count_out=$(git count-objects -v 2>&1) || count_out="count-objects failed: $count_out"
         loose=$(printf '%s\n' "$count_out" | awk '/^count:/ {print $2}')
         case "$loose" in ''|*[!0-9]*) loose="" ;; esac
     }
+    read_loose_count
+    if [ -n "$loose" ] && [ "$loose" -gt "$REPACK_LOOSE_CEILING" ]; then
+        echo "jsonl-export: archive holds $loose loose objects (ceiling $REPACK_LOOSE_CEILING); packing them now, which takes minutes on a large backlog" >&2
+    fi
     repack_err=$(git -c gc.auto=256 -c gc.autoDetach=false gc --auto --quiet 2>&1 >/dev/null) || repack_rc=$?
     read_loose_count
     if [ "$repack_rc" -eq 0 ] && [ -n "$loose" ] && [ "$loose" -gt "$REPACK_LOOSE_CEILING" ]; then
         # The explicit repack stands in for the auto-gc that did not fire, so
         # it keeps auto-gc's two courtesies. A deferral is neither a success
         # nor a failure; the next commit retries.
-        # 1. The pre-auto-gc hook can veto it: git gc --auto runs that hook
-        #    and exits 0 without collecting when the hook fails (codex round
-        #    14 on #138). The hook is found the way git finds it (rev-parse
-        #    --git-path resolves core.hooksPath, relative paths included) and
-        #    run directly. `git hook run` needs Git 2.36, and on an older git
-        #    its "not a git command" would read as a veto on every snapshot
-        #    while nothing is counted (codex round 16). If the path cannot be
-        #    resolved there is no veto to honor, and the repack proceeds.
-        git_dir=$(git rev-parse --git-dir 2>/dev/null) || git_dir=".git"
+        # 1. A failing pre-auto-gc hook vetoes it, as it vetoes gc --auto.
+        #    The hook is found the way git finds it (rev-parse --git-path
+        #    resolves core.hooksPath) and run directly, which needs no
+        #    particular git version; an unresolvable path means no veto. When
+        #    gc --auto was due and the hook already declined, the hook runs a
+        #    second time here, and a consistent hook declines again.
         pre_auto_gc=$(git rev-parse --git-path hooks/pre-auto-gc 2>/dev/null) || pre_auto_gc=""
         if [ -n "$pre_auto_gc" ] && [ -f "$pre_auto_gc" ] && [ -x "$pre_auto_gc" ] && ! "$pre_auto_gc" >/dev/null 2>&1; then
             echo "jsonl-export: archive repack deferred: the pre-auto-gc hook ($pre_auto_gc) declined it; the next commit retries" >&2
             return 0
         fi
-        # 2. It defers to a git gc that holds the repository: gc --auto also
-        #    exits 0 when another gc holds $GIT_DIR/gc.pid, and an explicit
-        #    repack never looks at that lock (codex round 12 on #138). It
-        #    OBSERVES the lock and never takes it. Writing gc.pid or
-        #    gc.pid.lock ourselves would be a PID/lock status file, which
-        #    AGENTS.md forbids ("No status files"), and a crash between claim
-        #    and release would leave a holder that defers every snapshot for
-        #    up to 12 hours (codex round 15). Accepted limit: a gc that starts
-        #    between this check and the repack can still race it. The archive
-        #    is private to this script, so that takes a human's gc or a second
-        #    export overlapping this one. If this repack fails in that race,
-        #    it is judged below like any other repack failure, counted rather
-        #    than silent.
-        if gc_holder=$(git_gc_holder "$git_dir"); then
-            echo "jsonl-export: archive repack deferred: another git gc holds $git_dir/gc.pid ($gc_holder); the next commit retries" >&2
+        # 2. It defers to a git gc that holds the repository. It only reads
+        #    gc.pid (in the common git dir); this script writes no lock or
+        #    PID file. A gc that starts between this check and the repack can
+        #    still race it. The archive is private to this script, so that
+        #    takes a human's gc or an overlapping export, and a repack that
+        #    fails in the race is judged below like any other failure.
+        gc_pid=$(git rev-parse --git-path gc.pid 2>/dev/null) || gc_pid=".git/gc.pid"
+        if gc_holder=$(git_gc_holder "$gc_pid"); then
+            echo "jsonl-export: archive repack deferred: another git gc holds $gc_pid ($gc_holder); the next commit retries" >&2
             return 0
         fi
         # An incremental repack cannot write a bitmap index: an inherited
         # repack.writeBitmaps / pack.writeBitmaps makes it exit 128 on every
-        # snapshot, and the loose objects grow unbounded again.
+        # snapshot, and the loose objects would never be packed.
         repack_step="repack -d -l --no-write-bitmap-index"
-        repack_err=$(git repack -d -l -q --no-write-bitmap-index 2>&1 >/dev/null) || repack_rc=$?
+        fallback_err=$(git repack -d -l -q --no-write-bitmap-index 2>&1 >/dev/null) || repack_rc=$?
+        # Keep gc --auto's stderr too: its warnings (unreachable loose
+        # objects, for one) explain why the fallback was needed.
+        repack_err="${repack_err:+$repack_err
+}$fallback_err"
         read_loose_count
     fi
     if [ "$repack_rc" -eq 0 ] && [ -n "$loose" ] && [ "$loose" -le "$REPACK_LOOSE_CEILING" ]; then
@@ -796,26 +796,34 @@ commit_archive_snapshot() {
         repack_err="$repack_err
 $count_out"
     fi
-    git_dir=$(git rev-parse --git-dir 2>/dev/null) || git_dir=".git"
-    gc_log="$git_dir/gc.log"
+    gc_log=$(git rev-parse --git-path gc.log 2>/dev/null) || gc_log=".git/gc.log"
     if [ -f "$gc_log" ]; then
         gc_log_head=$(head -c 400 "$gc_log" 2>&1) || gc_log_head="(unreadable: $gc_log_head)"
         repack_err="$repack_err
-.git/gc.log: $gc_log_head"
+gc.log: $gc_log_head"
     fi
-    record_archive_repack_failure "step=$repack_step exit=$repack_rc loose_objects=${loose:-unknown} (ceiling $REPACK_LOOSE_CEILING)
-$repack_err"
+    # The summary goes first and last: the state file keeps the first 512
+    # bytes and the escalation mail keeps the last 20 lines.
+    summary="step=$repack_step exit=$repack_rc loose_objects=${loose:-unknown} (ceiling $REPACK_LOOSE_CEILING)"
+    if [ -n "$repack_err" ]; then
+        record_archive_repack_failure "$summary
+$repack_err
+$summary"
+    else
+        record_archive_repack_failure "$summary"
+    fi
     return 0
 }
 
 # Print who holds git gc's repository lock and succeed, or fail when nobody
-# does. git serializes gc through $GIT_DIR/gc.pid ("<pid> <host>") and treats
+# does. $1 is the gc.pid path (rev-parse --git-path gc.pid, which is in the
+# common git dir). git serializes gc through gc.pid ("<pid> <host>") and treats
 # it as held while the file is younger than 12 hours and its host is another
 # machine or its pid is alive here (builtin/gc.c). This mirrors that test.
 # Liveness is read with ps, which, like git's EPERM rule, counts another
 # user's live process as alive, where kill -0 would call it dead.
 git_gc_holder() {
-    local pid_file="$1/gc.pid"
+    local pid_file="$1"
     local pid=""
     local host=""
     [ -f "$pid_file" ] || return 1
@@ -860,6 +868,7 @@ record_archive_repack_failure() {
 
     echo "jsonl-export: archive repack failed (non-fatal; loose objects keep accumulating until it succeeds)" >&2
     consecutive=$(read_state_json | jq -r '.consecutive_repack_failures // 0' || echo "0")
+    case "$consecutive" in ''|*[!0-9]*) consecutive=0 ;; esac
     consecutive=$((consecutive + 1))
     # The streak is the only durable record, and the conditions that fail a
     # repack (full or unwritable disk) also fail this write. If it cannot be
