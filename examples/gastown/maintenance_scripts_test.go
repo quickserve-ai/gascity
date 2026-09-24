@@ -9272,11 +9272,12 @@ func TestJsonlExportExplicitRepackHonorsPreAutoGCVeto(t *testing.T) {
 	}
 }
 
-// The explicit repack holds git gc's own lock for its whole run: gc.pid names
-// this host and a live pid while the repack runs, so a git gc that starts
-// meanwhile skips instead of racing it. The lock is released afterwards
-// (codex round 14 on #138).
-func TestJsonlExportExplicitRepackHoldsTheGCLockWhileItRuns(t *testing.T) {
+// The explicit repack observes git gc's lock and never writes it: gc.pid and
+// gc.pid.lock are PID/lock status files, which AGENTS.md forbids, and one
+// left by a crash would defer every snapshot for up to 12 hours (codex round
+// 15 on #138). With no holder, the repack runs without either file present
+// and packs the loose objects.
+func TestJsonlExportExplicitRepackWritesNoGitLockFiles(t *testing.T) {
 	cityDir := t.TempDir()
 	binDir := t.TempDir()
 	stateDir := t.TempDir()
@@ -9285,10 +9286,6 @@ func TestJsonlExportExplicitRepackHoldsTheGCLockWhileItRuns(t *testing.T) {
 	archiveRepo := filepath.Join(cityDir, "archive")
 	probeLog := filepath.Join(t.TempDir(), "repack.log")
 
-	host, err := os.Hostname()
-	if err != nil {
-		t.Fatalf("Hostname: %v", err)
-	}
 	gcScriptedStub(t, binDir, probeLog, ":")
 	writeJsonlExportGCStub(t, binDir)
 	writeMultiRecordDoltStub(t, binDir, 3)
@@ -9302,54 +9299,19 @@ func TestJsonlExportExplicitRepackHoldsTheGCLockWhileItRuns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the explicit repack should have run: %v", err)
 	}
-	fields := strings.Fields(strings.TrimSpace(string(data)))
-	if len(fields) != 3 || fields[0] != "repack" || fields[2] != host {
-		t.Fatalf("during the repack gc.pid must name this host and the export's pid; probe:\n%s", data)
-	}
-	if pid, err := strconv.Atoi(fields[1]); err != nil || pid <= 0 || pid == os.Getpid() {
-		t.Fatalf("gc.pid must name the export script's own pid; probe:\n%s", data)
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if line != "repack none" {
+			t.Fatalf("no gc.pid may exist while the script's own repack runs; probe:\n%s", data)
+		}
 	}
 	for _, name := range []string{"gc.pid", "gc.pid.lock"} {
 		if _, err := os.Stat(filepath.Join(archiveRepo, ".git", name)); !os.IsNotExist(err) {
-			t.Fatalf("%s must be released after the repack (stat err: %v)", name, err)
+			t.Fatalf("the script must never leave %s behind (stat err: %v)", name, err)
 		}
 	}
-}
-
-// A gc.pid.lock that is not ours means another git gc is claiming the
-// repository right now. The fallback defers and leaves that lock alone.
-func TestJsonlExportExplicitRepackDefersToAnotherClaimInProgress(t *testing.T) {
-	cityDir := t.TempDir()
-	binDir := t.TempDir()
-	stateDir := t.TempDir()
-	gcLog := filepath.Join(t.TempDir(), "gc.log")
-	mailLog := filepath.Join(t.TempDir(), "gc-mail.log")
-	archiveRepo := filepath.Join(cityDir, "archive")
-	stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
-	probeLog := filepath.Join(t.TempDir(), "repack.log")
-
-	gcScriptedStub(t, binDir, probeLog, `printf 'someone else' > "$gd/gc.pid.lock"`)
-	writeJsonlExportGCStub(t, binDir)
-	writeMultiRecordDoltStub(t, binDir, 3)
-
-	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
-	env["GC_JSONL_REPACK_LOOSE_CEILING"] = "0"
-
-	runScript(t, coreScriptPath("jsonl-export.sh"), env)
-
-	if data, err := os.ReadFile(probeLog); err == nil {
-		t.Fatalf("the explicit repack must not run while another claim holds gc.pid.lock; repack calls:\n%s", data)
-	}
-	data, err := os.ReadFile(stateFile)
-	if err != nil && !os.IsNotExist(err) {
-		t.Fatalf("ReadFile(state file): %v", err)
-	}
-	if strings.Contains(string(data), "consecutive_repack_failures") {
-		t.Fatalf("a deferral to another claim must not count as a repack failure\nstate: %s", data)
-	}
-	lock, err := os.ReadFile(filepath.Join(archiveRepo, ".git", "gc.pid.lock"))
-	if err != nil || string(lock) != "someone else" {
-		t.Fatalf("another process's gc.pid.lock must be left in place (got %q, err %v)", lock, err)
+	out := runGitOut(t, archiveRepo, "count-objects", "-v")
+	if !strings.Contains("\n"+out+"\n", "\ncount: 0\n") {
+		t.Fatalf("the explicit repack should have packed the loose objects; count-objects:\n%s", out)
 	}
 }
 

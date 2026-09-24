@@ -759,12 +759,21 @@ commit_archive_snapshot() {
             echo "jsonl-export: archive repack deferred: the pre-auto-gc hook declined it (or this git cannot run hooks); the next commit retries" >&2
             return 0
         fi
-        # 2. It holds git gc's repository lock for its whole run, so another
-        #    git gc neither runs under it nor starts during it (codex rounds
-        #    12 and 14 on #138). Only observing gc.pid left a window between
-        #    the check and the repack.
-        if ! gc_holder=$(claim_git_gc_lock "$git_dir"); then
-            echo "jsonl-export: archive repack deferred: another git gc holds the repository ($gc_holder); the next commit retries" >&2
+        # 2. It defers to a git gc that holds the repository: gc --auto also
+        #    exits 0 when another gc holds $GIT_DIR/gc.pid, and an explicit
+        #    repack never looks at that lock (codex round 12 on #138). It
+        #    OBSERVES the lock and never takes it. Writing gc.pid or
+        #    gc.pid.lock ourselves would be a PID/lock status file, which
+        #    AGENTS.md forbids ("No status files"), and a crash between claim
+        #    and release would leave a holder that defers every snapshot for
+        #    up to 12 hours (codex round 15). Accepted limit: a gc that starts
+        #    between this check and the repack can still race it. The archive
+        #    is private to this script, so that takes a human's gc or a second
+        #    export overlapping this one. If this repack fails in that race,
+        #    it is judged below like any other repack failure, counted rather
+        #    than silent.
+        if gc_holder=$(git_gc_holder "$git_dir"); then
+            echo "jsonl-export: archive repack deferred: another git gc holds $git_dir/gc.pid ($gc_holder); the next commit retries" >&2
             return 0
         fi
         # An incremental repack cannot write a bitmap index: an inherited
@@ -772,7 +781,6 @@ commit_archive_snapshot() {
         # snapshot, and the loose objects grow unbounded again.
         repack_step="repack -d -l --no-write-bitmap-index"
         repack_err=$(git repack -d -l -q --no-write-bitmap-index 2>&1 >/dev/null) || repack_rc=$?
-        release_git_gc_lock "$git_dir"
         read_loose_count
     fi
     if [ "$repack_rc" -eq 0 ] && [ -n "$loose" ] && [ "$loose" -le "$REPACK_LOOSE_CEILING" ]; then
@@ -792,45 +800,6 @@ $count_out"
     fi
     record_archive_repack_failure "step=$repack_step exit=$repack_rc loose_objects=${loose:-unknown} (ceiling $REPACK_LOOSE_CEILING)
 $repack_err"
-    return 0
-}
-
-# Take git gc's repository lock the way builtin/gc.c does: create
-# gc.pid.lock exclusively, test for a live holder while holding it, then
-# commit it as gc.pid ("<pid> <host>", this script's pid). From then on a
-# git gc on this repository sees a live holder and skips. On failure, print
-# why and leave every lock that is not ours in place. A lock file left by a
-# crashed git gc also makes git gc --auto itself fail, and that failure is
-# counted, so it cannot hide behind endless deferrals.
-claim_git_gc_lock() {
-    local git_dir="$1"
-    local lock="$git_dir/gc.pid.lock"
-    local holder
-    if ! (set -o noclobber; printf '%s %s' "$$" "$(hostname 2>/dev/null)" > "$lock") 2>/dev/null; then
-        printf '%s' "$lock exists"
-        return 1
-    fi
-    if holder=$(git_gc_holder "$git_dir"); then
-        rm -f "$lock"
-        printf '%s' "$git_dir/gc.pid: $holder"
-        return 1
-    fi
-    if ! mv -f "$lock" "$git_dir/gc.pid"; then
-        rm -f "$lock"
-        printf '%s' "could not commit $lock to gc.pid"
-        return 1
-    fi
-    return 0
-}
-
-# Remove gc.pid only while it still names this process.
-release_git_gc_lock() {
-    local pid=""
-    local host=""
-    read -r pid host < "$1/gc.pid" 2>/dev/null || [ -n "$pid" ] || return 0
-    if [ "$pid" = "$$" ]; then
-        rm -f "$1/gc.pid"
-    fi
     return 0
 }
 
