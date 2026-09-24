@@ -67,6 +67,32 @@ if [ "$go_changed" -eq 0 ]; then
   exit 0
 fi
 
+# One heavy Go build per host (ga-wirl8l.2): where the host runs the
+# go-build-admit gate, the suite goes THROUGH it, serialized and capped. The
+# default fan-out ran ~5 compile processes at ~6 GB each and thrashed a shared
+# host (2026-09-24). Opt-in per clone and never guessed from $HOME:
+#   git config gascity.buildAdmit /path/to/go-build-admit.py
+# or GO_BUILD_ADMIT=/path for one push. The caps travel through
+# EXTRA_TEST_ENV because the Makefile's TEST_ENV is env -i.
+admit="${GO_BUILD_ADMIT:-$(git config --get gascity.buildAdmit 2>/dev/null || true)}"
+if [ -n "$admit" ]; then
+  if [ ! -x "$admit" ]; then
+    echo "pre-push: the build gate $admit is missing or not executable; refusing the push." >&2
+    echo "pre-push: fix the path, or unset gascity.buildAdmit / GO_BUILD_ADMIT." >&2
+    exit 1
+  fi
+  set +e
+  "$admit" --wait-s "${GO_BUILD_ADMIT_WAIT_S:-1800}" -- \
+    make test-fast-parallel LOCAL_TEST_JOBS=1 EXTRA_TEST_ENV="GOMAXPROCS=2 GC_TEST_INNER_P=2"
+  rc=$?
+  set -e
+  case "$rc" in
+    75) echo "pre-push: the build gate did not admit the suite (another heavy build, or low disk); nothing ran and the push is refused. Retry later." >&2 ;;
+    74) echo "pre-push: the build gate aborted the suite for low disk; the push is refused. Retry once space recovers." >&2 ;;
+  esac
+  exit "$rc"
+fi
+
 # The Makefile and direct sharded runner share scripts/test-local-job-count as
 # their default policy. Do not shadow it here; an explicit override still wins.
 exec make test-fast-parallel
