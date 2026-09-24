@@ -1450,7 +1450,7 @@ export const zRigDoctorPatch = z.object({
 
 export const zRigPatch = z.object({
     DefaultBranch: z.string().nullable(),
-    Doctor: zRigDoctorPatch,
+    Doctor: zRigDoctorPatch.optional(),
     FormulaVars: z.record(z.string(), z.string()),
     Name: z.string(),
     Path: z.string().nullable(),
