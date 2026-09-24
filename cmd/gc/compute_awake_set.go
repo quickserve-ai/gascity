@@ -257,6 +257,12 @@ func computeAwakeSetKeyed(input AwakeInput, keyBy awakeKey) map[string]AwakeDeci
 		if !bead.PendingCreate {
 			continue
 		}
+		// Not for a suspended agent, like every other wake cause here: a
+		// nudge-materialized bead for the suspended platform refinery was
+		// launched through this path (ga-9qanni).
+		if agent, ok := lookupAgent(bead.Template); ok && agent.Suspended {
+			continue
+		}
 		desired[key(bead)] = "pending-create"
 	}
 	for _, bead := range input.SessionBeads {
@@ -583,8 +589,13 @@ func computeAwakeSetKeyed(input AwakeInput, keyBy awakeKey) map[string]AwakeDeci
 		if !decision.ShouldWake && !bead.Drained && !bead.WaitHold &&
 			bead.SleepReason != string(sessionpkg.SleepReasonIdleTimeout) {
 			if input.RunningSessions[name] && isOnDemandSession(input.NamedSessions, bead) {
-				decision.ShouldWake = true
-				decision.Reason = "on-demand:running"
+				// A suspended agent's running on-demand session is not kept
+				// awake: suspension stops it, and #6307 keeps its bead for
+				// resume (ga-9qanni).
+				if agent, ok := lookupAgent(bead.Template); !ok || !agent.Suspended {
+					decision.ShouldWake = true
+					decision.Reason = "on-demand:running"
+				}
 			}
 		}
 
