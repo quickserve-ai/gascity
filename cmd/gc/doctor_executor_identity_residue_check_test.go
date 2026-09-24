@@ -402,6 +402,9 @@ func TestExecutorIdentityResidueCheckDistinguishesLegitimatePoolInstanceFromStal
 			"gc.routed_to":    "gascity/reviewer",
 			"gc.session_name": "gascity--deployer",
 		}},
+		// This city once ran gascity--deployer, so CITY-2's stamp is this
+		// city's to judge (rule 4) and is a fixable true positive.
+		residueRanSession("RAN-1", "gascity--deployer"),
 	}, nil)
 
 	check := newResidueTestCheck(cfg, cityDir, func(path string) (beads.Store, error) {
@@ -419,8 +422,8 @@ func TestExecutorIdentityResidueCheckDistinguishesLegitimatePoolInstanceFromStal
 	if strings.Contains(details, "CITY-1") {
 		t.Fatalf("CITY-1 carries a legitimate pool-instance identity (session bead SESSION-1 records gascity--builder-2 as a real member of gascity/builder's route) and must not be flagged:\n%s", details)
 	}
-	if !strings.Contains(details, "CITY-2") {
-		t.Fatalf("CITY-2's session name matches no session bead and no route encoding; it must still be flagged as a true positive:\n%s", details)
+	if !strings.Contains(details, "CITY-2") || strings.Contains(residueDetailFor(t, result.Details, "CITY-2"), "REPORTED ONLY") {
+		t.Fatalf("CITY-2's session name is a closed session of this city, matching no live identity or route encoding; it must be flagged as a FIXABLE true positive:\n%s", details)
 	}
 }
 
