@@ -307,6 +307,7 @@ func TestPreCommitReachesDashboardBlockWhenOnlySpecFileStaged(t *testing.T) {
 		t.Fatalf("mkdir .githooks/lib: %v", err)
 	}
 	writeExecutable(t, chainPath, string(chain))
+	installBuildAdmitLibForTempRepo(t, repoRoot, tmpRepo)
 
 	runGit("init")
 	writeTestFile(t, specPath, "{}\n")
@@ -616,6 +617,7 @@ func installBeadsChainForTempRepo(t *testing.T, repoRoot, tmpRepo string) {
 		t.Fatalf("mkdir .githooks/lib: %v", err)
 	}
 	writeExecutable(t, chainPath, string(chain))
+	installBuildAdmitLibForTempRepo(t, repoRoot, tmpRepo)
 }
 
 func TestNativeDoltliteBeadsTargetRunsTaggedSuite(t *testing.T) {
@@ -702,4 +704,16 @@ func writeTestFile(t *testing.T, path, content string) {
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("write %s: %v", path, err)
 	}
+}
+
+// installBuildAdmitLibForTempRepo copies the hooks' shared build-gate library
+// (ga-wirl8l.2) beside the beads forwarder: the real hooks source it
+// unconditionally, so a fixture that installs only beads-chain.sh fails.
+func installBuildAdmitLibForTempRepo(t *testing.T, repoRoot, tmpRepo string) {
+	t.Helper()
+	lib, err := os.ReadFile(filepath.Join(repoRoot, ".githooks", "lib", "build-admit.sh"))
+	if err != nil {
+		t.Fatalf("read build-admit.sh: %v", err)
+	}
+	writeExecutable(t, filepath.Join(tmpRepo, ".githooks", "lib", "build-admit.sh"), string(lib))
 }

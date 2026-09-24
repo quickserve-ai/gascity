@@ -1151,6 +1151,8 @@ install_guard_hook() {
     # hook itself is copied rather than re-implemented.
     cp "$REPO_ROOT/.githooks/lib/beads-chain.sh" "$repo/.githooks/lib/beads-chain.sh"
     chmod +x "$repo/.githooks/lib/beads-chain.sh"
+    # pre-push sources the shared build-gate library (ga-wirl8l.2).
+    cp "$REPO_ROOT/.githooks/lib/build-admit.sh" "$repo/.githooks/lib/build-admit.sh"
     printf 'test-fast-parallel:\n\t@true\n' > "$repo/Makefile"
     git -C "$repo" config core.hooksPath .githooks
 }
