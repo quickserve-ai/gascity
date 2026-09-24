@@ -116,8 +116,22 @@ func (f executorIdentityResidueFinding) describe() string {
 			strings.Join(f.unconfirmed, ", "), f.judge.openSessions.err))
 	}
 	if len(f.reportOnly) > 0 {
-		parts = append(parts, fmt.Sprintf("has %s that this machine cannot judge (an empty route, a path outside this city's root and rig paths, or a session name this city never ran); REPORTED ONLY, gc doctor --fix never clears it",
-			strings.Join(f.reportOnly, ", ")))
+		var sessionKeys, pathKeys []string
+		for _, key := range f.reportOnly {
+			if key == beadmeta.SessionNameMetadataKey {
+				sessionKeys = append(sessionKeys, key)
+			} else {
+				pathKeys = append(pathKeys, key)
+			}
+		}
+		if len(pathKeys) > 0 {
+			parts = append(parts, fmt.Sprintf("has disagreeing %s that this machine cannot judge (an empty route, or a path outside this city's root and rig paths); REPORTED ONLY, gc doctor --fix never clears it",
+				strings.Join(pathKeys, ", ")))
+		}
+		if len(sessionKeys) > 0 {
+			parts = append(parts, fmt.Sprintf("has a %s naming a session this city never ran (it may be another town's live session); REPORTED ONLY, gc doctor --fix never clears it",
+				strings.Join(sessionKeys, ", ")))
+		}
 	}
 	return fmt.Sprintf("%s bead %s %s", f.label, f.beadID, strings.Join(parts, "; "))
 }
