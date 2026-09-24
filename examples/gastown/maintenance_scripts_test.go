@@ -9122,19 +9122,13 @@ func TestJsonlExportExplicitRepackDefersToARunningGC(t *testing.T) {
 	stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
 	repackLog := filepath.Join(t.TempDir(), "repack.log")
 
-	holder := exec.Command("sleep", "120")
-	if err := holder.Start(); err != nil {
-		t.Fatalf("start holder: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = holder.Process.Kill()
-		_ = holder.Wait()
-	})
+	// The test process itself is the live holder: it outlives the script
+	// run, and using it keeps this test from spawning a process of its own.
 	host, err := os.Hostname()
 	if err != nil {
 		t.Fatalf("Hostname: %v", err)
 	}
-	gcLockStub(t, binDir, repackLog, holder.Process.Pid, host)
+	gcLockStub(t, binDir, repackLog, os.Getpid(), host)
 	writeJsonlExportGCStub(t, binDir)
 	writeMultiRecordDoltStub(t, binDir, 3)
 
@@ -9159,6 +9153,12 @@ func TestJsonlExportExplicitRepackDefersToARunningGC(t *testing.T) {
 	}
 }
 
+// deadGCLockPID can never name a live process: Linux pids stay below
+// pid_max, which is at most 4194304 (PID_MAX_LIMIT), and macOS pids stay
+// below 99999. A constant avoids spawning and reaping a process only to
+// learn a dead pid.
+const deadGCLockPID = 4194304
+
 // A gc.pid whose pid is dead on this host is a stale lock (a crashed gc), not
 // a running one: git ignores it, and so must the fallback. The explicit
 // repack runs and packs the loose objects.
@@ -9172,15 +9172,11 @@ func TestJsonlExportExplicitRepackRunsPastAStaleGCLock(t *testing.T) {
 	stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
 	repackLog := filepath.Join(t.TempDir(), "repack.log")
 
-	gone := exec.Command("true")
-	if err := gone.Run(); err != nil {
-		t.Fatalf("run short-lived process: %v", err)
-	}
 	host, err := os.Hostname()
 	if err != nil {
 		t.Fatalf("Hostname: %v", err)
 	}
-	gcLockStub(t, binDir, repackLog, gone.Process.Pid, host)
+	gcLockStub(t, binDir, repackLog, deadGCLockPID, host)
 	writeJsonlExportGCStub(t, binDir)
 	writeMultiRecordDoltStub(t, binDir, 3)
 
