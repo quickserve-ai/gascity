@@ -1095,6 +1095,34 @@ func TestResolveSessionIDWithConfig_ConflictUnderALegacyTemplateSpellingIsNotASq
 	}
 }
 
+func TestResolveSessionIDWithConfig_LegacyTemplateSpellingIsNotASquatWhenTheSeatNameDiffers(t *testing.T) {
+	// #127 round-3 review: the case above is vetoed by the plain identity
+	// match (the seat is qcore/archer, and so is the legacy template). Here
+	// the seat is qcore/lead, so ONLY the template equivalence
+	// (findAgentByTemplate's legacy form: qcore/archer is the bound
+	// qcore/cherub-law.archer) can tell that this bead is the seat's own.
+	cityPath := filepath.Join(t.TempDir(), "city")
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Agents:        []config.Agent{{Name: "archer", Dir: "qcore", BindingName: "cherub-law", StartCommand: "true", MaxActiveSessions: intPtr(1)}},
+		NamedSessions: []config.NamedSession{{Name: "lead", Template: "cherub-law.archer", Dir: "qcore"}},
+	}
+	store := beads.NewMemStore()
+	b, err := store.Create(beads.Bead{Type: session.BeadType, Labels: []string{session.LabelSession}, Metadata: map[string]string{
+		"session_name": "s-lead-legacy", "alias": "qcore/lead", "template": "qcore/archer", "state": "active",
+	}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	_, err = resolveSessionIDWithConfig(cityPath, cfg, store, "qcore/lead")
+	if !errors.Is(err, errNamedSessionConflict) {
+		t.Fatalf("err = %v, want errNamedSessionConflict", err)
+	}
+	if strings.Contains(err.Error(), "a name squat") || !strings.Contains(err.Error(), "gc session show "+b.ID) {
+		t.Fatalf("err = %q, want the check-first advice, not a squat", err)
+	}
+}
+
 func TestResolveSessionIDWithConfig_ConfigNameNotFoundNamesTheSessionIdentity(t *testing.T) {
 	// ga-lm5coj: a session is addressed by its named-session identity, never by
 	// its agent config name — the session surface deliberately does not resolve
