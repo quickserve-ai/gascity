@@ -233,7 +233,7 @@ type RigPatch struct {
 	// keys are preserved.
 	FormulaVars map[string]string `toml:"formula_vars,omitempty"`
 	// Doctor overrides fields of the rig's [rigs.doctor] table.
-	Doctor *RigDoctorPatch `toml:"doctor,omitempty"`
+	Doctor *RigDoctorPatch `toml:"doctor,omitempty" json:"Doctor,omitempty"`
 }
 
 // RigDoctorPatch overrides fields of a rig's [rigs.doctor] table. Nil

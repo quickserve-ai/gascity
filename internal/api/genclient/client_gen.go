@@ -3362,7 +3362,7 @@ type RigDoctorPatch struct {
 // RigPatch defines model for RigPatch.
 type RigPatch struct {
 	DefaultBranch    *string           `json:"DefaultBranch"`
-	Doctor           RigDoctorPatch    `json:"Doctor"`
+	Doctor           *RigDoctorPatch   `json:"Doctor,omitempty"`
 	FormulaVars      map[string]string `json:"FormulaVars"`
 	Name             string            `json:"Name"`
 	Path             *string           `json:"Path"`

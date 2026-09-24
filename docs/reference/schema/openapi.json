@@ -6970,8 +6970,7 @@
           "DefaultBranch",
           "Suspended",
           "SuspendedOnStart",
-          "FormulaVars",
-          "Doctor"
+          "FormulaVars"
         ],
         "type": "object"
       },

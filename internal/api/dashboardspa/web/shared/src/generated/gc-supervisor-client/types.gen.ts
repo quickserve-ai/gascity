@@ -2828,7 +2828,7 @@ export type RigDoctorPatch = {
 
 export type RigPatch = {
     DefaultBranch: string | null;
-    Doctor: RigDoctorPatch;
+    Doctor?: RigDoctorPatch;
     FormulaVars: {
         [key: string]: string;
     };
