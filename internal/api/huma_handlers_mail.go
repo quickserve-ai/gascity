@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/url"
 	"strings"
 	"time"
@@ -696,6 +697,13 @@ func (s *Server) humaHandleMailReply(ctx context.Context, input *MailReplyInput)
 					return mail.Message{}, apierr.InvalidRequest.Msg("reply origin " + refuse.Error())
 				}
 				if kind, _ := roster.ResolveCityAddress(orig.From); kind == mail.CityAddressForeign {
+					// The one exception to the roster refusal: the
+					// thread's peer id already resolved once, so the
+					// reply is written; a roster that now disagrees is
+					// logged, not obeyed.
+					if seatErr := roster.CheckForeignSeat(orig.From); seatErr != nil {
+						log.Printf("mail reply %s: warning: roster mismatch for the thread's peer: %s; the reply is written into the existing thread", id, mail.RosterMismatchDetail(seatErr))
+					}
 					from = roster.QualifySender(from)
 				}
 			}
