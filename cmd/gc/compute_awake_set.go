@@ -423,6 +423,11 @@ func ComputeAwakeSet(input AwakeInput) map[string]AwakeDecision {
 		if !bead.ContinuationResetPending || bead.RestartRequested || bead.WaitHold || bead.Drained {
 			continue
 		}
+		// A handoff or restart request does not relaunch a suspended agent
+		// (ga-9qanni); the reset stays pending for the resume.
+		if agent, ok := lookupAgent(bead.Template); ok && agent.Suspended {
+			continue
+		}
 		switch desired[bead.SessionName] {
 		case "pending-create", "explicit-wake":
 			continue
@@ -478,10 +483,14 @@ func ComputeAwakeSet(input AwakeInput) map[string]AwakeDecision {
 			decision.Reason = "pending"
 		}
 
-		// Ready wait — durable wait deadline passed, resume session
+		// Ready wait — durable wait deadline passed, resume session. Not for
+		// a suspended agent: a wait that resolves after the suspension would
+		// relaunch the seat (ga-9qanni). The wait stays ready for the resume.
 		if input.ReadyWaitSet[bead.ID] {
-			decision.ShouldWake = true
-			decision.Reason = "wait-ready"
+			if agent, ok := lookupAgent(bead.Template); !ok || !agent.Suspended {
+				decision.ShouldWake = true
+				decision.Reason = "wait-ready"
+			}
 		}
 
 		// On-demand running override — on-demand sessions that are
