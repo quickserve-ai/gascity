@@ -67,6 +67,21 @@ if [ "$go_changed" -eq 0 ]; then
   exit 0
 fi
 
+# One heavy Go build per host (ga-wirl8l.2): where the clone opts in to the
+# go-build-admit gate (see lib/build-admit.sh), the suite goes THROUGH it and
+# runs serialized: one shard at a time at -p 2. The caps travel through
+# EXTRA_TEST_ENV because the Makefile's TEST_ENV is env -i.
+# shellcheck source=lib/build-admit.sh disable=SC1091
+. "$repo_root/.githooks/lib/build-admit.sh"
+if [ -n "$(build_admit_path)" ]; then
+  build_admit_check || exit 1
+  set +e
+  gated make test-fast-parallel LOCAL_TEST_JOBS=1 EXTRA_TEST_ENV="GOMAXPROCS=2 GC_TEST_INNER_P=2"
+  rc=$?
+  set -e
+  exit "$rc"
+fi
+
 # The Makefile and direct sharded runner share scripts/test-local-job-count as
 # their default policy. Do not shadow it here; an explicit override still wins.
 exec make test-fast-parallel
