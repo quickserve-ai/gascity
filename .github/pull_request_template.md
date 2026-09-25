@@ -1,3 +1,13 @@
+freeze: a|b|c|d — <why>
+
+<!-- Fork freeze (ga-gsr09s, armed 2026-09-25). Keep exactly one letter on the
+line above and say why. A PR that cannot name one is deferred, not merged.
+  a  outage, data-loss or security fix (an upstream cherry-pick of a FIX counts; say so)
+  b  takes REVIEWS out of the Gas City ecosystem (review v2 and its feeder)
+  c  stands up SEATS outside Gas City
+  d  operational carry a frozen version needs to keep serving (existing pin/pack/config plumbing)
+No new platform features and no upstream pulls. -->
+
 <!-- Link an issue when there is one (`Closes #123`); it is recommended for
 user-visible bugs and changes worth discussing, and optional for small,
 self-explanatory fixes. Either way, say why the change is needed below. See
