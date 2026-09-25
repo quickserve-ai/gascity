@@ -247,6 +247,23 @@ dolt_stop_timeout = "300ms"
 name = "mayor"
 `
 
+// fakeManagedDoltGracefulStopCityTOML gives a stand-in that DOES answer SIGTERM
+// all the time it needs. Its trap runs only after the current `sleep 0.05`
+// returns and then forks `cp`, and on a loaded runner that has taken longer
+// than 300ms: the stop's grace ran out, it escalated to SIGKILL, and the
+// capture never existed (the 0.34s failure on #154). The stop returns as soon
+// as the pid exits, so a long grace costs at most one 500ms poll.
+const fakeManagedDoltGracefulStopCityTOML = `
+[workspace]
+name = "test"
+
+[daemon]
+dolt_stop_timeout = "30s"
+
+[[agent]]
+name = "mayor"
+`
+
 // TestStopManagedDoltProcessWritesTheStopIntentThroughTheProductionPath is the
 // ga-drkbcd D9 regression: the marker that decides whether a status-0 exit
 // alarms must be written by stopManagedDoltProcessWithOptions itself. The
@@ -255,7 +272,7 @@ name = "mayor"
 // not one the test wrote, and not one reconstructed afterwards (the stop clears
 // it on success, which is asserted too).
 func TestStopManagedDoltProcessWritesTheStopIntentThroughTheProductionPath(t *testing.T) {
-	cityPath, layout := newManagedDoltStopFixture(t, fakeManagedDoltStopCityTOML)
+	cityPath, layout := newManagedDoltStopFixture(t, fakeManagedDoltGracefulStopCityTOML)
 	capturePath := filepath.Join(t.TempDir(), "intent-at-signal.json")
 	readyPath := filepath.Join(t.TempDir(), "ready")
 
@@ -276,6 +293,9 @@ func TestStopManagedDoltProcessWritesTheStopIntentThroughTheProductionPath(t *te
 	}
 	if !report.HadPID || report.PID != pid {
 		t.Fatalf("stop report = %+v; expected it to target pid %d", report, pid)
+	}
+	if report.Forced {
+		t.Fatalf("the stop escalated to SIGKILL (report %+v): the stand-in did not exit inside its grace, so its trap may never have captured the marker and the checks below prove nothing", report)
 	}
 
 	captured, err := os.ReadFile(capturePath)
