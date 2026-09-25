@@ -405,7 +405,12 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 		} else {
 			register(doctor.NewAgentSessionsCheck(cfg, cityName, st, sp))
 			register(doctor.NewZombieSessionsCheck(cfg, cityName, st, sp))
-			register(doctor.NewOrphanSessionsCheck(cfg, cityName, st, sp))
+			// ga-n2f1ph: a running session is an orphan only when neither a
+			// configured template NOR an open session bead claims its runtime
+			// name. The lister is lazy (no store read unless a running session is
+			// not template-derived) and a failure makes Fix refuse.
+			register(doctor.NewOrphanSessionsCheck(cfg, cityName, st, sp).
+				WithManagedSessionNames(doctorManagedSessionNames(cityPath, cfg, openStoreForCity(cityPath))))
 		}
 	}
 
