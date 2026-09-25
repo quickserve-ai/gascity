@@ -74,7 +74,7 @@ func resolveConfiguredNamedSessionID(
 		}
 	}
 	if lookup.HasConflict {
-		return "", true, fmt.Errorf("%w: %q conflicts with configured named session %q via live bead %s", errNamedSessionConflict, identifier, spec.Identity, lookup.Conflict.ID)
+		return "", true, namedSessionConflictError(cfg, identifier, spec, lookup.Conflict)
 	}
 	if !opts.materialize {
 		return "", false, fmt.Errorf("%w: %q", session.ErrSessionNotFound, identifier)
@@ -83,6 +83,55 @@ func resolveConfiguredNamedSessionID(
 		materializeMetadata: opts.materializeMetadata,
 	})
 	return id, true, err
+}
+
+// namedSessionConflictError explains a named-session conflict well enough to
+// act on. Every by-name verb refuses on a conflict, kill included, and kill
+// could not clear one anyway: it stops a runtime, and an asleep bead is still
+// live. The verb that frees the name is close, addressed by bead ID. But close
+// stops the runtime, ends the bead for good and releases its work, and two of
+// the three conflict kinds can be the seat's own live session. So the error
+// prints what it takes to tell the kinds apart and recommends close only for
+// a squat: a bead that records a template or agent other than this seat's
+// (ga-lm5coj).
+func namedSessionConflictError(cfg *config.City, identifier string, spec namedSessionSpec, b beads.Bead) error {
+	d := session.DescribeNamedSessionConflict(b, spec)
+	squat := d.Squat && !namedSessionConflictMayBeSelf(cfg, spec, d)
+	head := fmt.Sprintf("%q conflicts with configured named session %q via live bead %s (state=%q template=%q pool_managed=%q)",
+		identifier, spec.Identity, b.ID, d.State, d.Template, d.PoolManaged)
+	var advice string
+	switch {
+	case d.Kind == session.NamedSessionConflictAdoptablePool:
+		advice = fmt.Sprintf("it is a pool-managed session of this seat's template that the reconciler adopts as %s; do not close it: retry after the next reconcile, or check 'gc session show %s'",
+			spec.Identity, b.ID)
+	case squat:
+		advice = fmt.Sprintf("it holds this seat's name for a different template (a name squat); if it is stale, close it with 'gc session close %s' to free the name for %s",
+			b.ID, spec.Identity)
+	default:
+		// Still name the remedy: a genuine squat that records no template
+		// would otherwise leave every by-name verb refusing with no way out.
+		advice = fmt.Sprintf("it may be this seat's own running session (it records no template, or this seat's under another spelling); check 'gc session show %s' first, and only if it is NOT this seat's session, 'gc session close %s' frees the name for %s",
+			b.ID, b.ID, spec.Identity)
+	}
+	return fmt.Errorf("%w: %s; %s", errNamedSessionConflict, head, advice)
+}
+
+// namedSessionConflictMayBeSelf reports config-aware evidence that a bead the
+// session package called a squat is the seat's own session under an older
+// spelling: its template or agent_name is the seat's identity, or resolves
+// (findAgentByTemplate's legacy and binding forms) to the seat's backing
+// template (#127 review round 2).
+func namedSessionConflictMayBeSelf(cfg *config.City, spec namedSessionSpec, d session.NamedSessionConflictDetail) bool {
+	backing := session.NamedSessionBackingTemplate(spec)
+	for _, name := range []string{d.Template, d.AgentName} {
+		if name == "" {
+			continue
+		}
+		if name == spec.Identity || (backing != "" && agentTemplateIdentitiesEquivalent(cfg, name, backing)) {
+			return true
+		}
+	}
+	return false
 }
 
 func resolveSessionIDWithConfig(cityPath string, cfg *config.City, store beads.Store, identifier string) (string, error) {
@@ -177,7 +226,40 @@ func resolveSessionIDWithOptions(
 			return "", err
 		}
 	}
+	if identity := namedSessionIdentityForConfigName(cityPath, cfg, identifier); identity != "" {
+		// Sessions are addressed by named-session identity, never by agent
+		// config name (#666 keeps template names unresolved on this surface).
+		// Say which name is wanted instead of a bare not-found (ga-lm5coj).
+		return "", fmt.Errorf("%w: %q is an agent config name; its configured named session is %q", session.ErrSessionNotFound, identifier, identity)
+	}
 	return "", fmt.Errorf("%w: %q", session.ErrSessionNotFound, identifier)
+}
+
+// namedSessionIdentityForConfigName returns the identity of the one configured
+// named session backed by the agent config name target (e.g.
+// "qcore/cherub-law.archer" -> "qcore/archer"), or "" when none or several
+// are, or when target is itself a configured named-session identity (then it
+// is the right name, merely not materialized, and pointing elsewhere is wrong).
+func namedSessionIdentityForConfigName(cityPath string, cfg *config.City, target string) string {
+	if cfg == nil {
+		return ""
+	}
+	if _, ok, err := findNamedSessionSpecForTarget(cfg, config.EffectiveCityName(cfg, filepath.Base(cityPath)), target); ok || err != nil {
+		return ""
+	}
+	target = normalizeNamedSessionTarget(target)
+	identity := ""
+	for i := range cfg.NamedSessions {
+		ns := &cfg.NamedSessions[i]
+		if ns.TemplateQualifiedName() != target || ns.QualifiedName() == target {
+			continue
+		}
+		if identity != "" && identity != ns.QualifiedName() {
+			return ""
+		}
+		identity = ns.QualifiedName()
+	}
+	return identity
 }
 
 func resolveOpenQualifiedAliasBasename(store beads.Store, identifier string) (string, error) {

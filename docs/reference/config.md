@@ -556,6 +556,8 @@ MailCrossCityConfig enables city-qualified mail addressing: recipients of the fo
 |-------|------|----------|---------|-------------|
 | `city` | string | **yes** |  | City is this city's own segment in city-qualified addresses, and it is REQUIRED when the section is present: the CLI and the API derive the effective city name differently (site binding, workspace name, the supervisor's registered name), so a defaulted name could stamp two spellings of this city on mail and strand replies. &lt;City&gt;/&lt;address&gt; and &lt;address&gt; are one mailbox. |
 | `cities` | []string | **yes** |  | Cities lists the peer cities addressable as &lt;city&gt;/&lt;address&gt;. A recipient naming a listed city resolves against the roster and is never looked up in the local session store. |
+| `towns` | map[string]string |  |  | Towns maps a listed peer city to the town whose rendered roster (cities/&lt;town&gt;/agents.json) lists that city's seats. A send to a mapped city is refused unless the seat is in that list; a peer city with no mapping keeps the city-level rules only. |
+| `roster_root` | string |  |  | RosterRoot points at the directory holding cities/&lt;town&gt;/agents.json and overrides discovery. Unset, the roster is the pack-cache clone of the imported repository that ships cities/, at its packs.lock commit; with no such import there is no list and sends behave exactly as before this knob existed. |
 
 ## MaintenanceConfig
 
@@ -783,6 +785,23 @@ Rig defines an external project registered in the city.
 | `dolt_host` | string |  |  | DoltHost overrides the city-level Dolt host for this rig's beads. Use when the rig's database lives on a different Dolt server (e.g., shared from another city). |
 | `dolt_port` | string |  |  | DoltPort overrides the city-level Dolt port for this rig's beads. When set, controller commands (scale_check, work_query) prefix their shell invocations with BEADS_DOLT_SERVER_PORT=&lt;port&gt; so bd connects to the correct server instead of the city-level default. |
 | `formula_vars` | map[string]string |  |  | FormulaVars provides rig-scoped defaults for formula vars. Keys match var names declared in formula `[vars.&lt;name&gt;]` blocks. Values are used when a formula runs in this rig and the caller did not pass an explicit --var override. Takes precedence over formula-level defaults but loses to --var flags. |
+| `doctor` | RigDoctorConfig |  |  | Doctor holds rig-scoped gc doctor policy ([rigs.doctor]). |
+
+## RigDoctorConfig
+
+RigDoctorConfig holds gc doctor policy that applies to one rig.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `census_owner_namespace` | string |  |  | CensusOwnerNamespace declares that this rig's resource-census ledger (test/test-resources.toml) names owner_bead values from ANOTHER tracker, e.g. "gastownhall/gascity" for a fork of Gas City whose ledger comes from upstream. The census-owner-liveness check then reports an owner_bead missing from this city as owned in that namespace instead of dangling. The cost: a missing owner on this rig that is genuinely this city's is not detected. Empty means every missing owner is dangling. |
+
+## RigDoctorPatch
+
+RigDoctorPatch overrides fields of a rig's [rigs.doctor] table.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `census_owner_namespace` | string |  |  | CensusOwnerNamespace overrides Rig.Doctor.CensusOwnerNamespace; an empty string clears the declaration. |
 
 ## RigPatch
 
@@ -797,6 +816,7 @@ RigPatch modifies an existing rig identified by Name.
 | `suspended` | boolean |  |  | Suspended is the deprecated, pre-runtime-state suspension override. Parsed for backwards compatibility; `gc doctor` surfaces it as a warning and recommends the rename to SuspendedOnStart. No behavioral code path reads it. |
 | `suspended_on_start` | boolean |  |  | SuspendedOnStart overrides the rig's desired suspension state at city start. Mirrors Rig.SuspendedOnStart. |
 | `formula_vars` | map[string]string |  |  | FormulaVars adds or overrides rig-scoped formula var defaults. Additive merge: patch keys win over existing rig keys, unspecified keys are preserved. |
+| `doctor` | RigDoctorPatch |  |  | Doctor overrides fields of the rig's [rigs.doctor] table. |
 
 ## Service
 

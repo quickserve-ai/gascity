@@ -319,6 +319,37 @@ default_branch = "master"
 	}
 }
 
+func TestParseRigDoctorCensusOwnerNamespace(t *testing.T) {
+	data := []byte(`
+[workspace]
+name = "lights"
+
+[[rigs]]
+name = "gascity"
+path = "/gascity"
+
+[rigs.doctor]
+census_owner_namespace = "gastownhall/gascity"
+
+[[rigs]]
+name = "scamper"
+path = "/scamper"
+`)
+	cfg, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(cfg.Rigs) != 2 {
+		t.Fatalf("len(Rigs) = %d, want 2", len(cfg.Rigs))
+	}
+	if got := cfg.Rigs[0].Doctor.CensusOwnerNamespace; got != "gastownhall/gascity" {
+		t.Errorf("Rigs[0].Doctor.CensusOwnerNamespace = %q, want %q", got, "gastownhall/gascity")
+	}
+	if got := cfg.Rigs[1].Doctor.CensusOwnerNamespace; got != "" {
+		t.Errorf("Rigs[1].Doctor.CensusOwnerNamespace = %q, want empty when [rigs.doctor] is absent", got)
+	}
+}
+
 func TestEffectiveDefaultBranch_EmptyWhenUnset(t *testing.T) {
 	r := Rig{Name: "rig"}
 	if got := r.EffectiveDefaultBranch(); got != "" {

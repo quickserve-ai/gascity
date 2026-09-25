@@ -1977,6 +1977,17 @@
           },
           "type": "array",
           "description": "Cities lists the peer cities addressable as \u003ccity\u003e/\u003caddress\u003e. A\nrecipient naming a listed city resolves against the roster and is never\nlooked up in the local session store."
+        },
+        "towns": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object",
+          "description": "Towns maps a listed peer city to the town whose rendered roster\n(cities/\u003ctown\u003e/agents.json) lists that city's seats. A send to a\nmapped city is refused unless the seat is in that list; a peer city\nwith no mapping keeps the city-level rules only."
+        },
+        "roster_root": {
+          "type": "string",
+          "description": "RosterRoot points at the directory holding cities/\u003ctown\u003e/agents.json\nand overrides discovery. Unset, the roster is the pack-cache clone of\nthe imported repository that ships cities/, at its packs.lock commit;\nwith no such import there is no list and sends behave exactly as\nbefore this knob existed."
         }
       },
       "additionalProperties": false,
@@ -2733,6 +2744,10 @@
           },
           "type": "object",
           "description": "FormulaVars provides rig-scoped defaults for formula vars. Keys match\nvar names declared in formula `[vars.\u003cname\u003e]` blocks. Values are used\nwhen a formula runs in this rig and the caller did not pass an\nexplicit --var override. Takes precedence over formula-level defaults\nbut loses to --var flags."
+        },
+        "doctor": {
+          "$ref": "#/$defs/RigDoctorConfig",
+          "description": "Doctor holds rig-scoped gc doctor policy ([rigs.doctor])."
         }
       },
       "additionalProperties": false,
@@ -2741,6 +2756,28 @@
         "name"
       ],
       "description": "Rig defines an external project registered in the city."
+    },
+    "RigDoctorConfig": {
+      "properties": {
+        "census_owner_namespace": {
+          "type": "string",
+          "description": "CensusOwnerNamespace declares that this rig's resource-census ledger\n(test/test-resources.toml) names owner_bead values from ANOTHER\ntracker, e.g. \"gastownhall/gascity\" for a fork of Gas City whose ledger\ncomes from upstream. The census-owner-liveness check then reports an\nowner_bead missing from this city as owned in that namespace instead of\ndangling. The cost: a missing owner on this rig that is genuinely this\ncity's is not detected. Empty means every missing owner is dangling."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "RigDoctorConfig holds gc doctor policy that applies to one rig."
+    },
+    "RigDoctorPatch": {
+      "properties": {
+        "census_owner_namespace": {
+          "type": "string",
+          "description": "CensusOwnerNamespace overrides Rig.Doctor.CensusOwnerNamespace; an\nempty string clears the declaration."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "RigDoctorPatch overrides fields of a rig's [rigs.doctor] table."
     },
     "RigPatch": {
       "properties": {
@@ -2774,6 +2811,10 @@
           },
           "type": "object",
           "description": "FormulaVars adds or overrides rig-scoped formula var defaults.\nAdditive merge: patch keys win over existing rig keys, unspecified\nkeys are preserved."
+        },
+        "doctor": {
+          "$ref": "#/$defs/RigDoctorPatch",
+          "description": "Doctor overrides fields of the rig's [rigs.doctor] table."
         }
       },
       "additionalProperties": false,

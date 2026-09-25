@@ -5519,19 +5519,30 @@ func TestResolveMailRecipientIdentity_TwoSquattersOneHoldingTheAliasStillRefuses
 	if !ok {
 		t.Fatal("findNamedSessionSpec(qcore/barry) = false")
 	}
+	var ids []string
 	for _, md := range []map[string]string{
 		{"session_name": spec.SessionName, "template": "other", "agent_name": "other", "state": "asleep"},
 		{"session_name": "rogue-runtime", "alias": spec.Identity, "template": "other", "agent_name": "other", "state": "active"},
 	} {
-		if _, err := store.Create(beads.Bead{Type: session.BeadType, Labels: []string{session.LabelSession}, Metadata: md}); err != nil {
+		b, err := store.Create(beads.Bead{Type: session.BeadType, Labels: []string{session.LabelSession}, Metadata: md})
+		if err != nil {
 			t.Fatalf("Create: %v", err)
 		}
+		ids = append(ids, b.ID)
 	}
 	if _, err := resolveSessionIDWithConfig(cityPath, cfg, store, "qcore/barry"); !errors.Is(err, errNamedSessionConflict) {
 		t.Fatalf("fixture: resolveSessionIDWithConfig err = %v, want the squat conflict", err)
 	}
-	if got, err := resolveMailRecipientIdentity(cityPath, cfg, store, "qcore/barry"); err == nil {
+	got, err := resolveMailRecipientIdentity(cityPath, cfg, store, "qcore/barry")
+	if err == nil {
 		t.Fatalf("resolved %q with an alias holder live; want the refusal (it would read the mail)", got)
+	}
+	// ga-lm5coj: the conflict error advises closing the runtime-name holder,
+	// but the reader is the other bead. The refusal must say that acting on
+	// the named bead alone will not unblock the send.
+	if want := "session bead " + ids[1] + " (not " + ids[0] + ")"; !strings.Contains(err.Error(), want) ||
+		!strings.Contains(err.Error(), "will not unblock this send") {
+		t.Fatalf("err = %q, want it to name the reader %s apart from the conflict bead %s", err, ids[1], ids[0])
 	}
 }
 
