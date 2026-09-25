@@ -382,6 +382,110 @@ func TestResolveBdScopeTargetUsesRedirectedWorktreeRig(t *testing.T) {
 // the controller on every rig agent) was silently ignored, causing gc bd list to
 // hit the city HQ database and return empty results instead of rig-scoped results.
 // See gastownhall/gascity#gcy-6ul.
+func TestResolveBdScopeTargetWarnsFromARigAgentDir(t *testing.T) {
+	// ga-8n4zpl: .gc/agents/<rig>/<name> LOOKS like the rig but resolves to the
+	// city store, and a rig-prefixed filter there returns a confident EMPTY.
+	// Routing stays as it is; the answer must say what it is not.
+	origProbe := bdBeadExists
+	defer func() { bdBeadExists = origProbe }()
+	bdBeadExists = func(_ string, _ *config.City, _ execStoreTarget, _ string) bool { return false }
+	t.Setenv("GC_RIG", "")
+
+	cityDir := filepath.Join(t.TempDir(), "city")
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "gascity"},
+		Rigs: []config.Rig{
+			{Name: "qcore", Path: filepath.Join("rigs", "qcore"), Prefix: "qc"},
+			{Name: "unbound", Prefix: "ub"},
+		},
+	}
+	agentDir := filepath.Join(cityDir, ".gc", "agents", "qcore", "brett")
+	if err := os.MkdirAll(agentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{
+		filepath.Join(cityDir, ".gc", "agents", "unbound", "x"),
+		filepath.Join(cityDir, ".gc", "agents", "woodhouse"),
+	} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("cwd in a rig agent dir warns and still answers from the city", func(t *testing.T) {
+		setCwd(t, agentDir)
+		var stderr bytes.Buffer
+		got, err := resolveBdScopeTarget(cfg, cityDir, "", []string{"list", "--label", "hold:cert-wait"}, false, &stderr)
+		if err != nil {
+			t.Fatalf("resolveBdScopeTarget() error = %v", err)
+		}
+		if got.ScopeKind == "rig" {
+			t.Fatalf("routing changed to %#v; this fix only warns", got)
+		}
+		warn := stderr.String()
+		for _, want := range []string{`"qcore" agent dir`, "--rig qcore", "ga-8n4zpl"} {
+			if !strings.Contains(warn, want) {
+				t.Fatalf("stderr = %q, want it to mention %q", warn, want)
+			}
+		}
+	})
+
+	t.Run("-C into a rig agent dir warns too", func(t *testing.T) {
+		setCwd(t, t.TempDir())
+		var stderr bytes.Buffer
+		if _, err := resolveBdScopeTarget(cfg, cityDir, "", []string{"list", "-C", agentDir}, false, &stderr); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(stderr.String(), "--rig qcore") {
+			t.Fatalf("stderr = %q, want the agent-dir warning", stderr.String())
+		}
+	})
+
+	t.Run("quiet when something explicit chose the scope", func(t *testing.T) {
+		setCwd(t, agentDir)
+		for name, run := range map[string]func(io.Writer) error{
+			"--rig": func(w io.Writer) error {
+				_, err := resolveBdScopeTarget(cfg, cityDir, "qcore", []string{"list"}, false, w)
+				return err
+			},
+			"--city": func(w io.Writer) error {
+				_, err := resolveBdScopeTarget(cfg, cityDir, "", []string{"list"}, true, w)
+				return err
+			},
+			"GC_RIG": func(w io.Writer) error {
+				t.Setenv("GC_RIG", "qcore")
+				defer t.Setenv("GC_RIG", "")
+				_, err := resolveBdScopeTarget(cfg, cityDir, "", []string{"list"}, false, w)
+				return err
+			},
+		} {
+			var stderr bytes.Buffer
+			if err := run(&stderr); err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("%s: stderr = %q, want silence", name, stderr.String())
+			}
+		}
+	})
+
+	t.Run("quiet in a city agent dir and an unbound rig's dir", func(t *testing.T) {
+		for _, dir := range []string{
+			filepath.Join(cityDir, ".gc", "agents", "woodhouse"),
+			filepath.Join(cityDir, ".gc", "agents", "unbound", "x"),
+		} {
+			setCwd(t, dir)
+			var stderr bytes.Buffer
+			if _, err := resolveBdScopeTarget(cfg, cityDir, "", []string{"list"}, false, &stderr); err != nil {
+				t.Fatal(err)
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("cwd %s: stderr = %q, want silence", dir, stderr.String())
+			}
+		}
+	})
+}
+
 func TestResolveBdScopeTargetUsesGCRIGEnv(t *testing.T) {
 	setCwd(t, t.TempDir())
 	origProbe := bdBeadExists
