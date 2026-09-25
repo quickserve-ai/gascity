@@ -32,7 +32,7 @@
     },
     "reason": {
       "type": "string",
-      "description": "The narrowing that decided the verdict. 'foreign_binding' (another city's canonical naming, ga-8yi7ne) and 'absent_from_roster' (possibly one of ours, decommissioned) call for different operator responses, so callers should report this per protected identity.",
+      "description": "The narrowing that decided the verdict. 'foreign_binding' (another city's canonical naming, ga-8yi7ne), 'foreign_store_prefix' (a bare session bead ID minted by a store this city does not own, ga-x1f77i; 'detail' names the prefix) and 'absent_from_roster' (possibly one of ours, decommissioned) call for different operator responses, so callers should report this per protected identity.",
       "enum": [
         "not_qualified",
         "named_session",
@@ -42,6 +42,7 @@
         "agent_instance",
         "foreign_binding",
         "absent_from_roster",
+        "foreign_store_prefix",
         "no_config"
       ]
     },
