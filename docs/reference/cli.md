@@ -153,7 +153,8 @@ merely SEES in a shared rig store?
 
 Exit codes:
   0  local    this city can answer this identity's liveness
-  1  foreign  well-formed identity absent from this city's roster — protect it
+  1  foreign  well-formed identity absent from this city's roster, or a session
+             bead ID minted by a store this city does not own — protect it
   2  unknown  this city cannot answer (no config, bad usage) — protect it
 
 "local" is not a claim that the identity is ALIVE. Liveness is a separate
