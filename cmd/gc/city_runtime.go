@@ -198,6 +198,7 @@ type CityRuntime struct {
 	inOrderPassConfig func(*ordersLane)
 
 	orderSweepWatchdogLast             time.Time
+	orderWispWatchdogLast              time.Time
 	orderTrackingRetentionWatchdogLast time.Time
 	nudgeMailSweepWatchdogLast         time.Time
 	wispIndexMigrationApplied          bool

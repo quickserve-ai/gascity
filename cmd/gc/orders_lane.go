@@ -311,6 +311,7 @@ func (cr *CityRuntime) dispatchOrdersLocked(ctx context.Context, cityRoot string
 	// against the outgoing dispatcher.
 	cr.installPendingOrderDispatcherLocked(ctx)
 	cr.runOrderTrackingSweepWatchdog(cfg, now)
+	cr.runOrderWispWatchdog(cfg, now)
 	if bootDispatch {
 		// #6429: skip without stamping orderTrackingRetentionWatchdogLast, so the
 		// first lane pass still finds the watchdog due.
