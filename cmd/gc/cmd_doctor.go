@@ -352,7 +352,9 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 				storeGate.OrderLastRun(cityPath, cfg, doctorOrderFiringCurrentLastRunFunc(cityPath, cfg, opts.Stderr))),
 			doctor.WithOrderFiringCurrentInapplicableFunc(func(a orders.Order) (string, bool) {
 				return orderInapplicableBackend(cityPath, cfg, a)
-			})))
+			}),
+			doctor.WithOrderFiringCurrentOpenWorkFunc(
+				storeGate.OrderOpenWork(cityPath, cfg, doctorOrderFiringCurrentOpenWorkFunc(cityPath, cfg, opts.Stderr)))))
 		register(doctor.NewOrderOutcomeHealthyCheck(cfg, cityPath))
 		register(doctor.NewOrderExecTargetCheck(cfg, cityPath))
 		register(newCodexHooksDriftCheck(cityPath, codexHookWorkDirs(cityPath, cfg)))
