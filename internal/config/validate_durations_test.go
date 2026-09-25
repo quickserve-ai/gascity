@@ -548,3 +548,30 @@ func TestValidateDurationsBadChatSessionsGracePeriod(t *testing.T) {
 		t.Errorf("warning should mention bad value: %s", warnings[0])
 	}
 }
+
+func TestValidateDurationsOrderOverrideRunStaleAfter(t *testing.T) {
+	// A zero/negative or unit-less run_stale_after override parses into the
+	// watchdog's 6h default at dispatch, so config load must warn about it.
+	for _, bad := range []string{"12", "0s"} {
+		value := bad
+		cfg := &City{
+			Orders: OrdersConfig{
+				Overrides: []OrderOverride{
+					{Name: "digest-generate", RunStaleAfter: &value},
+				},
+			},
+		}
+		warnings := ValidateDurations(cfg, "city.toml")
+		if len(warnings) != 1 {
+			t.Fatalf("run_stale_after %q: expected 1 warning, got %d: %v", bad, len(warnings), warnings)
+		}
+		if !strings.Contains(warnings[0], "digest-generate") || !strings.Contains(warnings[0], "run_stale_after") {
+			t.Errorf("run_stale_after %q: warning should name the override and field: %s", bad, warnings[0])
+		}
+	}
+	good := "18h"
+	cfg := &City{Orders: OrdersConfig{Overrides: []OrderOverride{{Name: "digest-generate", RunStaleAfter: &good}}}}
+	if warnings := ValidateDurations(cfg, "city.toml"); len(warnings) != 0 {
+		t.Errorf("expected no warnings for a valid run_stale_after override, got: %v", warnings)
+	}
+}

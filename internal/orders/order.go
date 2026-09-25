@@ -63,6 +63,14 @@ type Order struct {
 	// 1-2s per read): a check killed before it can prove its condition holds
 	// makes the order silently never fire (gastownhall/gascity ga-ocypq2).
 	CheckTimeout string `toml:"check_timeout,omitempty"`
+	// RunStaleAfter is how long a formula order's run may stay open before the
+	// controller's order wisp watchdog judges it stale. Go duration string.
+	// Defaults to 6h. A stale run is closed only when the session holding its
+	// claim is this city's own and no longer live; an unclaimed run, a live
+	// holder, or a holder this city cannot prove is its own is left open and
+	// reported. Raise it for an order whose runs legitimately outlast the
+	// default.
+	RunStaleAfter string `toml:"run_stale_after,omitempty"`
 	// Enabled controls whether the order is active. Defaults to true.
 	Enabled *bool `toml:"enabled,omitempty"`
 	// Idempotent marks an order whose dispatch is safe to repeat (a sweep/
@@ -154,6 +162,7 @@ type orderDecode struct {
 	Pool             string                `toml:"pool,omitempty"`
 	Timeout          string                `toml:"timeout,omitempty"`
 	CheckTimeout     string                `toml:"check_timeout,omitempty"`
+	RunStaleAfter    string                `toml:"run_stale_after,omitempty"`
 	Enabled          *bool                 `toml:"enabled,omitempty"`
 	Idempotent       bool                  `toml:"idempotent,omitempty"`
 	NoWorkGate       bool                  `toml:"no_work_gate,omitempty"`
@@ -182,6 +191,7 @@ func (d orderDecode) normalized() Order {
 		Pool:             d.Pool,
 		Timeout:          d.Timeout,
 		CheckTimeout:     d.CheckTimeout,
+		RunStaleAfter:    d.RunStaleAfter,
 		Enabled:          d.Enabled,
 		Idempotent:       d.Idempotent,
 		NoWorkGate:       d.NoWorkGate,
@@ -258,6 +268,23 @@ func (a *Order) CheckTimeoutOrDefault() time.Duration {
 	return defaultConditionCheckTimeout
 }
 
+// DefaultRunStaleAfter is the order wisp watchdog's cutoff for a formula order
+// that does not set run_stale_after. It is long on purpose: a run that is
+// merely slow must never read as abandoned, and the watchdog's liveness check,
+// not this number, is what separates a working run from a dead one.
+const DefaultRunStaleAfter = 6 * time.Hour
+
+// RunStaleAfterOrDefault returns the parsed run_stale_after, or
+// DefaultRunStaleAfter when it is unset or not a positive duration.
+func (a *Order) RunStaleAfterOrDefault() time.Duration {
+	if a.RunStaleAfter != "" {
+		if d, err := time.ParseDuration(a.RunStaleAfter); err == nil && d > 0 {
+			return d
+		}
+	}
+	return DefaultRunStaleAfter
+}
+
 // Parse decodes TOML data into an Order.
 func Parse(data []byte) (Order, error) {
 	var af orderFile
@@ -308,20 +335,8 @@ func Validate(a Order) error {
 			return fmt.Errorf("order %q: invalid timeout %q: %w", a.Name, a.Timeout, err)
 		}
 	}
-	// Validate check_timeout if set. Unlike timeout, a non-positive value is
-	// also rejected: CheckTimeoutOrDefault silently reverts a zero or negative
-	// check_timeout to defaultConditionCheckTimeout, which would re-create the
-	// fixed-deadline condition starvation this field exists to prevent, so a
-	// typo like "60" (missing unit) or "0s" must fail at load instead of
-	// passing silently.
-	if a.CheckTimeout != "" {
-		d, err := time.ParseDuration(a.CheckTimeout)
-		if err != nil {
-			return fmt.Errorf("order %q: invalid check_timeout %q: %w", a.Name, a.CheckTimeout, err)
-		}
-		if d <= 0 {
-			return fmt.Errorf("order %q: check_timeout %q must be a positive duration", a.Name, a.CheckTimeout)
-		}
+	if err := validatePositiveDurationFields(a); err != nil {
+		return err
 	}
 	// Validate tz if set. A bad zone must fail loudly at load time; a silent
 	// fallback would move the order's schedule to a different wall clock.
@@ -369,6 +384,33 @@ func Validate(a Order) error {
 		return fmt.Errorf("order %q: trigger is required", a.Name)
 	default:
 		return fmt.Errorf("order %q: unknown trigger type %q", a.Name, a.Trigger)
+	}
+	return nil
+}
+
+// validatePositiveDurationFields validates the duration fields whose accessor
+// silently reverts a zero, negative or unparseable value to a default. Unlike
+// timeout, a non-positive value is rejected too. CheckTimeoutOrDefault
+// reverting check_timeout would re-create the fixed-deadline condition
+// starvation that field exists to prevent. RunStaleAfterOrDefault reverting
+// run_stale_after would hand a long-running order back the cutoff it was set
+// to escape. So a typo like "60" (missing unit) or "0s" must fail at load
+// instead of passing silently.
+func validatePositiveDurationFields(a Order) error {
+	for _, field := range []struct{ key, value string }{
+		{"check_timeout", a.CheckTimeout},
+		{"run_stale_after", a.RunStaleAfter},
+	} {
+		if field.value == "" {
+			continue
+		}
+		d, err := time.ParseDuration(field.value)
+		if err != nil {
+			return fmt.Errorf("order %q: invalid %s %q: %w", a.Name, field.key, field.value, err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("order %q: %s %q must be a positive duration", a.Name, field.key, field.value)
+		}
 	}
 	return nil
 }

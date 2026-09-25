@@ -326,7 +326,8 @@ schedule = "0 6 * * *"
 ```
 
 Overrides match by order name and can change `enabled`, `trigger`, `interval`,
-`schedule`, `check`, `on`, `pool`, `timeout`, `idempotent`, and `env`. An
+`schedule`, `check`, `on`, `pool`, `timeout`, `check_timeout`,
+`run_stale_after`, `idempotent`, and `env`. An
 override targeting a nonexistent order is an error, not a silent no-op — `gc
 order` commands fail; `gc start` logs the error and continues with the unmatched
 override skipped.
@@ -399,6 +400,28 @@ is so contended that the check times out, the order is skipped — it fails
 closed. Orders whose dispatch is safe to repeat (sweeps and feeders where a
 duplicate run is a no-op) can set `idempotent = true` to fail open instead:
 on a gate timeout they dispatch anyway rather than starve.
+
+Open work does not hold the gate forever. When a formula order's run has been
+open longer than the order's `run_stale_after` (a Go duration, default `6h`),
+the orchestrator checks who claimed it:
+
+| The run is | What happens |
+| --- | --- |
+| claimed by a session of this city that is no longer running | closed, and the order fires on its next evaluation |
+| claimed by a session that is still running | left open: a long run is not a dead one |
+| not claimed by anyone | left open and logged: it is queued work waiting for an agent |
+| claimed by an identity this city does not recognize | left open and logged: on a rig whose store another city shares, that city's agents claim runs this city cannot see |
+
+Raise `run_stale_after` for an order whose runs legitimately take longer than
+the default:
+
+```toml
+[order]
+formula = "mol-digest-generate"
+trigger = "cooldown"
+interval = "24h"
+run_stale_after = "18h"
+```
 
 A third option exists for orders that consume **no bead work at all** — pure
 probes and sweeps that track nothing. `no_work_gate = true` skips the open-work
