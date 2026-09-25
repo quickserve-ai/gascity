@@ -336,3 +336,37 @@ func TestPoolAssigneeObservability_ReasonsMatchTheNarrowingThatFired(t *testing.
 		})
 	}
 }
+
+// TestAgentIsForeign_BareSessionBeadIDFromAnotherStore is ga-x1f77i through the
+// verb, where the field measurement was taken: a session bead ID minted under a
+// store prefix this city does not own exits 1 foreign, naming the prefix, while
+// one under this city's HQ or rig prefix keeps today's exit-0 not_qualified
+// answer.
+func TestAgentIsForeign_BareSessionBeadIDFromAnotherStore(t *testing.T) {
+	cityPath := isForeignTestCity(t)
+
+	cases := []struct {
+		name       string
+		identity   string
+		wantCode   int
+		wantVerd   string
+		wantWhy    string
+		wantDetail string
+	}{
+		{"westeros session bead", "we-wisp-126vyfx", agentIsForeignExitForeign, agentIsForeignVerdictForeign, string(poolRosterReasonForeignStorePrefix), "we"},
+		{"session bead under the HQ prefix", "tc-wisp-lkjjkry", agentIsForeignExitLocal, agentIsForeignVerdictLocal, string(poolRosterReasonNotQualified), ""},
+		{"session bead under the rig prefix", "rp-wisp-89ytnk", agentIsForeignExitLocal, agentIsForeignVerdictLocal, string(poolRosterReasonNotQualified), ""},
+		{"runtime session name", "repo--worker", agentIsForeignExitLocal, agentIsForeignVerdictLocal, string(poolRosterReasonNotQualified), ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			code, out, raw, stderr := runIsForeign(t, cityPath, tc.identity)
+			if code != tc.wantCode {
+				t.Fatalf("exit = %d, want %d\nstdout: %s\nstderr: %s", code, tc.wantCode, raw, stderr)
+			}
+			if out.Verdict != tc.wantVerd || out.Reason != tc.wantWhy || out.Detail != tc.wantDetail {
+				t.Fatalf("verdict/reason/detail = %q/%q/%q, want %q/%q/%q (raw: %s)", out.Verdict, out.Reason, out.Detail, tc.wantVerd, tc.wantWhy, tc.wantDetail, raw)
+			}
+		})
+	}
+}
