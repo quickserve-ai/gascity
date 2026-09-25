@@ -363,11 +363,42 @@ func TestBundledPiHookUsesCurrentExtensionAPI(t *testing.T) {
 	}
 }
 
+// A raised BLOCKED attention entry must outlive the omp events that clear or
+// replace ordinary entries (input, approval resolution, ask end, a new ask or
+// approval). The hook recognizes it by the sidecar's kind and event_id, the
+// same test the Claude-side attention hooks apply.
+func TestBundledOmpHookKeepsRaisedBlockedEntry(t *testing.T) {
+	data := readBundledPackFileForTest(t, "core", "overlay/per-provider/omp/.omp/hooks/gc-hook.ts")
+	for _, want := range []string{
+		"function attentionBlocked(): boolean",
+		".attn.json`",
+		`meta?.kind === "blocked"`,
+		"meta.event_id === entry.event_id",
+	} {
+		if !strings.Contains(data, want) {
+			t.Errorf("bundled OMP hook missing raised-BLOCKED guard %q", want)
+		}
+	}
+	for _, fn := range []string{"function attentionWrite(", "function attentionClear("} {
+		start := strings.Index(data, fn)
+		if start < 0 {
+			t.Fatalf("bundled OMP hook has no %s", fn)
+		}
+		body := data[start:]
+		if end := strings.Index(body[1:], "\nfunction "); end >= 0 {
+			body = body[:end+1]
+		}
+		if !strings.Contains(body, "attentionBlocked()") {
+			t.Errorf("%s does not consult attentionBlocked(); a raised BLOCKED would be overwritten or cleared", fn)
+		}
+	}
+}
+
 func TestBundledOmpHookPublishesProviderSessionID(t *testing.T) {
 	data := readBundledPackFileForTest(t, "core", "overlay/per-provider/omp/.omp/hooks/gc-hook.ts")
 	for _, want := range []string{
 		`import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent"`,
-		`const GC_OMP_HOOK_VERSION = 5`,
+		`const GC_OMP_HOOK_VERSION = 6`,
 		`${process.env.HOME}/go/bin:${process.env.HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:`,
 		`export default function gascityOmpExtension(pi: ExtensionAPI)`,
 		`pi.on("session_start"`,
