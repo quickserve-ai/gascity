@@ -91,6 +91,7 @@ type OrderFiringCurrentCheck struct {
 	clock          func() time.Time
 	lastRun        OrderFiringCurrentLastRunFunc
 	inapplicable   OrderFiringCurrentInapplicableFunc
+	openWork       OrderFiringCurrentOpenWorkFunc
 	historyTimeout time.Duration
 	readEvents     orderFiringEventReadFunc
 }
@@ -231,6 +232,9 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 	// non-OK result still shows the check looked at every order.
 	routineCurrent := 0
 	c.routineDetails = nil
+	// Orders judged not OK, with their detail line, for the open-work
+	// attribution after the loop (ga-puy7n0).
+	var nonOK []orderFiringNonOK
 	suspendedRigs := orderFiringCurrentSuspendedRigs(c.cfg, cityPath)
 
 	// Resolve every order-run lookup the loop below will need up front and in
@@ -276,6 +280,8 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 			result.Details = append(result.Details, detail)
 		}
 		if status != StatusOK {
+			// A non-OK line is never routine, so it is the last detail appended.
+			nonOK = append(nonOK, orderFiringNonOK{order: order, detail: len(result.Details) - 1})
 			if firstNonOK == "" {
 				firstNonOK = orderHistoryHintTarget(order)
 			}
@@ -313,6 +319,7 @@ func (c *OrderFiringCurrentCheck) run(ctx *CheckContext) *CheckResult {
 	if firstNonOK != "" {
 		result.FixHint = fmt.Sprintf(orderFiringInspectHintFmt, firstNonOK)
 	}
+	c.attributeOpenWork(result, nonOK, now)
 	return result
 }
 
