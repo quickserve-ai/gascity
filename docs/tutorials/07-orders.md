@@ -412,8 +412,9 @@ the orchestrator checks who claimed it:
 | not claimed by anyone | left open and logged: it is queued work waiting for an agent |
 | claimed by an identity this city does not recognize | left open and logged: on a rig whose store another city shares, that city's agents claim runs this city cannot see |
 
-Raise `run_stale_after` for an order whose runs legitimately take longer than
-the default:
+`gc doctor` names the run holding each stale order, so a run left open is one
+command away from being inspected. Raise `run_stale_after` for an order whose
+runs legitimately take longer than the default:
 
 ```toml
 [order]
