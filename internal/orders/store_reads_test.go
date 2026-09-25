@@ -510,3 +510,69 @@ func TestClosedRunsForRetentionBestEffortName(t *testing.T) {
 		t.Fatalf("ClosedRunsForRetention() returned %d runs, want 2 (including the unresolvable-name bead)", len(runs))
 	}
 }
+
+// TestOpenWorkNamesTheGatingBead proves OpenWork returns the bead HasOpenWork
+// counts, so a caller naming the blocker (gc doctor's order-firing check)
+// names the one the gate refuses on. The newer root, listed first, is one the
+// predicate rejects: it must be skipped rather than named.
+func TestOpenWorkNamesTheGatingBead(t *testing.T) {
+	now := time.Now()
+	gating := beads.Bead{
+		ID:        "gc-1",
+		Title:     "wisp: digest",
+		Type:      "molecule",
+		Status:    "open",
+		CreatedAt: now.Add(-time.Hour),
+		Labels:    []string{"order-run:digest"},
+	}
+	finished := beads.Bead{
+		ID:        "gc-2",
+		Title:     "finished molecule",
+		Type:      "task",
+		Status:    "open",
+		CreatedAt: now,
+		Labels:    []string{"order-run:digest"},
+	}
+	ordersLeg := beads.NewMemStore()
+	graphLeg := beads.NewMemStoreFrom(2, []beads.Bead{gating, finished}, nil)
+	st := NewStoreWithGraph(beads.OrdersStore{Store: ordersLeg}, beads.GraphStore{Store: graphLeg})
+	moleculeIsOpenWork := func(_ beads.Store, root beads.Bead) (bool, error) {
+		return beads.IsMoleculeType(root.Type), nil
+	}
+
+	got, found, err := st.OpenWork("digest", moleculeIsOpenWork)
+	if err != nil {
+		t.Fatalf("OpenWork(): %v", err)
+	}
+	if !found || got.ID != gating.ID {
+		t.Fatalf("OpenWork() = %q, %v; want %q, true", got.ID, found, gating.ID)
+	}
+	if open, err := st.HasOpenWork("digest", moleculeIsOpenWork); err != nil || !open {
+		t.Fatalf("HasOpenWork() = %v, %v; want true, nil (the two must agree)", open, err)
+	}
+}
+
+// TestOpenWorkReportsNothingWhenUngated covers the not-found half: no open
+// order-run bead means found is false and HasOpenWork agrees.
+func TestOpenWorkReportsNothingWhenUngated(t *testing.T) {
+	mem := beads.NewMemStore()
+	closed, err := mem.Create(beads.Bead{Title: "order:digest", Labels: []string{"order-run:digest", "order-tracking"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := mem.Close(closed.ID); err != nil {
+		t.Fatal(err)
+	}
+	st := NewStore(beads.OrdersStore{Store: mem})
+
+	got, found, err := st.OpenWork("digest", nil)
+	if err != nil {
+		t.Fatalf("OpenWork(): %v", err)
+	}
+	if found || got.ID != "" {
+		t.Fatalf("OpenWork() = %q, %v; want nothing", got.ID, found)
+	}
+	if open, err := st.HasOpenWork("digest", nil); err != nil || open {
+		t.Fatalf("HasOpenWork() = %v, %v; want false, nil", open, err)
+	}
+}
