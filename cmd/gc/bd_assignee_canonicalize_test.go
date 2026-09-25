@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -61,9 +62,20 @@ func bdAssigneeTestSessionBeads() []beads.Bead {
 
 func runBdAssigneeCanonicalize(t *testing.T, args []string) ([]string, string) {
 	t.Helper()
+	got, warn, err := runBdAssigneeCanonicalizeErr(t, args)
+	if err != nil {
+		t.Fatalf("canonicalize %v refused: %v", args, err)
+	}
+	return got, warn
+}
+
+func runBdAssigneeCanonicalizeErr(t *testing.T, args []string) ([]string, string, error) {
+	t.Helper()
 	var stderr strings.Builder
-	got := canonicalizeBdAssigneeArgs(args, t.TempDir(), bdAssigneeTestConfig(), &stderr)
-	return got, stderr.String()
+	// The doBd order: strip gc's flag, then canonicalize.
+	args, allowUnknown := stripBdAllowUnknownAssignee(args)
+	got, err := canonicalizeBdAssigneeArgs(args, allowUnknown, t.TempDir(), bdAssigneeTestConfig(), &stderr)
+	return got, stderr.String(), err
 }
 
 func TestCanonicalizeBdAssigneeRewritesCrewFormToAlias(t *testing.T) {
@@ -129,14 +141,90 @@ func TestCanonicalizeBdAssigneeWarnsPoolTemplateWithoutRewriting(t *testing.T) {
 	}
 }
 
-func TestCanonicalizeBdAssigneeWarnsUnknownWithoutRewriting(t *testing.T) {
+func TestCanonicalizeBdAssigneeRefusesUnknown(t *testing.T) {
 	stubBdAssigneeSessionBeads(t, bdAssigneeTestSessionBeads(), nil)
-	got, warn := runBdAssigneeCanonicalize(t, []string{"update", "qc-1", "--assignee", "q_core/crew/jasnah"})
-	if got[3] != "q_core/crew/jasnah" {
-		t.Fatalf("cross-town assignee rewritten to %q, want untouched", got[3])
+	// ga-6sm0d7: the 2026-09-06 ghost shape. "qcore/crew.lana" matches no live
+	// identity; the write is refused and the refusal names the live form.
+	for _, args := range [][]string{
+		{"update", "qc-1", "--assignee", "qcore/crew.lana"},
+		{"update", "qc-1", "--assignee=qcore/crew.lana"},
+		{"create", "fix things", "-a", "qcore/crew.lana"},
+		// One unknown among several tokens refuses the whole write.
+		{"update", "qc-1", "-a", "qcore/lana", "--assignee", "qcore/crew.lana"},
+	} {
+		_, _, err := runBdAssigneeCanonicalizeErr(t, args)
+		if err == nil {
+			t.Fatalf("args %v: unknown assignee accepted, want refusal", args)
+		}
+		for _, want := range []string{`"qcore/crew.lana"`, "qcore/lana", bdAllowUnknownAssigneeFlag, "ga-i44k"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("args %v: refusal %q does not mention %q", args, err, want)
+			}
+		}
 	}
-	if !strings.Contains(warn, "WARNING") || !strings.Contains(warn, "find-work") {
-		t.Fatalf("stderr = %q, want unknown-assignee warning", warn)
+}
+
+func TestCanonicalizeBdAssigneeRefusalWithNoNearMatchSaysSo(t *testing.T) {
+	stubBdAssigneeSessionBeads(t, bdAssigneeTestSessionBeads(), nil)
+	_, _, err := runBdAssigneeCanonicalizeErr(t, []string{"update", "qc-1", "--assignee", "q_core/crew/jasnah"})
+	if err == nil || !strings.Contains(err.Error(), "no near match") {
+		t.Fatalf("err = %v, want a refusal that says no near match", err)
+	}
+}
+
+func TestCanonicalizeBdAssigneeAllowUnknownPassesCrossTownAndStripsFlag(t *testing.T) {
+	stubBdAssigneeSessionBeads(t, bdAssigneeTestSessionBeads(), nil)
+	for _, args := range [][]string{
+		{"update", "qc-1", bdAllowUnknownAssigneeFlag, "--assignee", "q_core/crew/jasnah"},
+		{"update", "qc-1", "--assignee", "q_core/crew/jasnah", bdAllowUnknownAssigneeFlag},
+	} {
+		got, warn, err := runBdAssigneeCanonicalizeErr(t, args)
+		if err != nil {
+			t.Fatalf("args %v: refused despite %s: %v", args, bdAllowUnknownAssigneeFlag, err)
+		}
+		want := []string{"update", "qc-1", "--assignee", "q_core/crew/jasnah"}
+		if strings.Join(got, " ") != strings.Join(want, " ") {
+			t.Fatalf("args %v forwarded as %v, want %v (gc-side flag must not reach bd)", args, got, want)
+		}
+		if !strings.Contains(warn, "WARNING") || !strings.Contains(warn, "find-work") {
+			t.Fatalf("stderr = %q, want the unknown-assignee warning to stay loud", warn)
+		}
+	}
+}
+
+func TestDoBdStripsAllowUnknownAssigneeBeforeAnyArm(t *testing.T) {
+	// The flag is gc's, not bd's. doBd strips it on its first line, ahead of
+	// scope detection, the by-id door and the relocated-class checks, so no
+	// arm parses it and bd never receives it — whatever the subcommand and
+	// whether or not canonicalization runs.
+	src, err := os.ReadFile("cmd_bd.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(src)
+	start := strings.Index(body, "func doBd(")
+	strip := strings.Index(body, "stripBdAllowUnknownAssignee(bdArgs)")
+	firstUse := strings.Index(body, "rewriteBdHeartbeatArgs(bdArgs)")
+	if start < 0 || strip < start || firstUse < strip {
+		t.Fatalf("doBd must strip %s before the first bdArgs consumer", bdAllowUnknownAssigneeFlag)
+	}
+	for _, args := range [][]string{
+		{"list", bdAllowUnknownAssigneeFlag},
+		{"update", "qc-1", "--status", "open", bdAllowUnknownAssigneeFlag},
+	} {
+		got, found := stripBdAllowUnknownAssignee(args)
+		if !found || strings.Contains(strings.Join(got, " "), bdAllowUnknownAssigneeFlag) {
+			t.Fatalf("args %v stripped to %v (found=%v)", args, got, found)
+		}
+	}
+}
+
+func TestCanonicalizeBdAssigneeLeavesAllowFlagAfterDoubleDash(t *testing.T) {
+	stubBdAssigneeSessionBeads(t, bdAssigneeTestSessionBeads(), nil)
+	args := []string{"create", "--", bdAllowUnknownAssigneeFlag}
+	got, _ := runBdAssigneeCanonicalize(t, args)
+	if strings.Join(got, " ") != strings.Join(args, " ") {
+		t.Fatalf("positional text after -- was rewritten: %v", got)
 	}
 }
 
@@ -161,13 +249,17 @@ func TestCanonicalizeBdAssigneeSkipsOtherSubcommandsAndEmptyValues(t *testing.T)
 
 func TestCanonicalizeBdAssigneeFailsOpenOnStoreError(t *testing.T) {
 	stubBdAssigneeSessionBeads(t, nil, errBdAssigneeTestStore)
-	args := []string{"update", "qc-1", "--assignee", "qcore/crew/lana"}
-	got, warn := runBdAssigneeCanonicalize(t, args)
-	if got[3] != "qcore/crew/lana" {
-		t.Fatalf("assignee = %q, want untouched on store error", got[3])
-	}
-	if warn != "" {
-		t.Fatalf("stderr = %q, want silence on store error", warn)
+	// An unknown-looking assignee included: without an index nothing is
+	// known to be unknown, so an index hiccup never blocks a write.
+	for _, raw := range []string{"qcore/crew/lana", "q_core/crew/jasnah"} {
+		args := []string{"update", "qc-1", "--assignee", raw}
+		got, warn := runBdAssigneeCanonicalize(t, args)
+		if got[3] != raw {
+			t.Fatalf("assignee = %q, want untouched on store error", got[3])
+		}
+		if warn != "" {
+			t.Fatalf("stderr = %q, want silence on store error", warn)
+		}
 	}
 }
 

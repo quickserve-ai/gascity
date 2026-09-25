@@ -425,6 +425,8 @@ func bdRigQualifiedMetadataRefusal(cfg *config.City, bdArgs []string) (string, b
 
 func doBd(args []string, stdout, stderr io.Writer) int {
 	cityName, rigName, bdArgs := extractBdScopeFlags(args)
+	// gc's own flag, stripped before any arm below parses bdArgs (ga-6sm0d7).
+	bdArgs, allowUnknownAssignee := stripBdAllowUnknownAssignee(bdArgs)
 
 	bdArgs, err := rewriteBdHeartbeatArgs(bdArgs)
 	if err != nil {
@@ -565,10 +567,14 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 
 	// Canonicalize hand-written assignees before forwarding (ga-i44k): known
 	// non-canonical spellings are rewritten to the alias form the find-work
-	// read paths actually match; unrecognized shapes warn but pass through
-	// (cross-town assignees are legitimate). Fail-open — never blocks the
-	// write.
-	bdArgs = canonicalizeBdAssigneeArgs(bdArgs, cityPath, cfg, stderr)
+	// read paths actually match; an assignee matching no live identity is
+	// refused unless --allow-unknown-assignee names it deliberate (cross-town,
+	// offline) — ga-6sm0d7. An identity-index failure still fails open.
+	bdArgs, err = canonicalizeBdAssigneeArgs(bdArgs, allowUnknownAssignee, cityPath, cfg, stderr)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc bd: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
 
 	// Pre-flight exact-ID guard for write-mutating subcommands (gcy-g4o).
 	// bd's fuzzy/substring resolver can silently match a longer ID that
