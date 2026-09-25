@@ -29,9 +29,11 @@ import (
 //
 // TWO THINGS THIS GATE DELIBERATELY DOES NOT DO.
 //
-// It does not test the RIG PREFIX. qcore is precisely the SHARED rig, so a
-// prefix test protects nothing — the discriminator has to be the agent
-// identity against the local roster.
+// It does not test the RIG PREFIX of the work bead. qcore is precisely the
+// SHARED rig, so a prefix test protects nothing — the discriminator has to be
+// the agent identity against the local roster. (The store prefix of a bare
+// session bead ID named AS the assignee is a different question, and is
+// tested: see poolRosterReasonForeignStorePrefix.)
 //
 // It does not test pool CAPACITY. "<local agent>-<slot>" is an instance
 // identity of a local agent family whatever the current max_active_sessions
@@ -50,10 +52,13 @@ import (
 // whose liveness this city is in a position to answer.
 //
 // Anything that is not a well-formed <rig>/<name> identity returns true: bare
-// aliases, session bead IDs and runtime session names ("gastown__dog-ga-up143",
-// "claude-mc-xyz") are this city's own naming and were never the cross-city
-// hazard. Keeping them on the existing path is what preserves current
-// behavior for every local assignee shape.
+// aliases, runtime session names ("gastown__dog-ga-up143", "claude-mc-xyz")
+// and session bead IDs minted by THIS city's own stores are this city's own
+// naming and were never the cross-city hazard. Keeping them on the existing
+// path is what preserves current behavior for every local assignee shape. The
+// one bare shape that returns false is a session bead ID minted by a store
+// this city does not own ("we-wisp-126vyfx", ga-x1f77i): it names another
+// city's session.
 func poolAssigneeIsLocallyObservable(cfg *config.City, cityName, assignee string) bool {
 	return poolAssigneeObservability(cfg, cityName, assignee).Local
 }
@@ -69,9 +74,22 @@ type poolRosterReason string
 // unmatched ones name why none could.
 const (
 	// poolRosterReasonNotQualified: not a <rig>/<name> identity at all — a bare
-	// alias, a session bead ID, a runtime session name. This city's own naming,
-	// never the cross-city hazard, so it stays on the existing liveness path.
+	// alias, a runtime session name, a session bead ID under one of this city's
+	// own store prefixes. This city's own naming, never the cross-city hazard,
+	// so it stays on the existing liveness path.
 	poolRosterReasonNotQualified poolRosterReason = "not_qualified"
+
+	// poolRosterReasonForeignStorePrefix: a bare session bead ID
+	// ("<prefix>-wisp-<id>") whose store prefix is neither this city's HQ
+	// prefix nor any rig's (ga-x1f77i). Before it existed every bare string
+	// read not_qualified/local, so on 2026-09-24 `gc agent is-foreign
+	// we-wisp-126vyfx` answered local for a westeros hub session holding claims
+	// on qcore beads in the shared store — six such sessions were live, and only
+	// an unrelated later fail-safe kept the sweeper from reaping their claims.
+	// A session bead lives in the store that minted it, so a prefix this city
+	// does not own names a session whose liveness this city cannot observe.
+	// Detail carries the prefix.
+	poolRosterReasonForeignStorePrefix poolRosterReason = "foreign_store_prefix"
 
 	poolRosterReasonNamedSession     poolRosterReason = "named_session"
 	poolRosterReasonAgentTemplate    poolRosterReason = "agent_template"
@@ -103,7 +121,8 @@ type poolRosterVerdict struct {
 	// Reason names the narrowing that fired.
 	Reason poolRosterReason
 	// Detail carries the narrowing's subject when there is one — the matched
-	// candidate, or the foreign binding that blocked every candidate.
+	// candidate, the foreign binding that blocked every candidate, or the
+	// foreign store prefix of a bare session bead ID.
 	Detail string
 }
 
@@ -124,9 +143,66 @@ func poolAssigneeObservability(cfg *config.City, cityName, assignee string) pool
 	}
 	rig, local := config.ParseQualifiedName(assignee)
 	if strings.TrimSpace(rig) == "" || strings.TrimSpace(local) == "" {
+		if prefix, ok := sessionBeadIDStorePrefix(assignee); ok && !cityOwnsStorePrefix(cfg, prefix) {
+			return poolRosterVerdict{Reason: poolRosterReasonForeignStorePrefix, Detail: prefix}
+		}
 		return poolRosterVerdict{Local: true, Reason: poolRosterReasonNotQualified}
 	}
 	return poolIdentityLocalRosterVerdict(cfg, cityName, assignee)
+}
+
+// sessionBeadIDWispInfix separates a session bead's store prefix from its id.
+// Session beads are wisps, and a wisp id reads "<store prefix>-wisp-<id>".
+const sessionBeadIDWispInfix = "-wisp-"
+
+// sessionBeadIDStorePrefix returns the lowercased store prefix of an assignee
+// shaped exactly like a session bead ID — "<prefix>-wisp-<id>", both parts
+// ASCII letters and digits only — and false for anything else.
+//
+// The shape is matched strictly because a false match PROTECTS a claim this
+// city could have reaped. Bare aliases ("platform-lead") and runtime session
+// names ("qcore--refinery") carry no "-wisp-" infix; a runtime name that EMBEDS
+// a wisp id ("polecat-we-wisp-3nvj3yx") has a dash in what would be its prefix.
+// Neither is a store prefix, so both stay on the not_qualified path.
+func sessionBeadIDStorePrefix(assignee string) (string, bool) {
+	id := strings.ToLower(strings.TrimSpace(assignee))
+	prefix, tail, ok := strings.Cut(id, sessionBeadIDWispInfix)
+	if !ok || !isLowerAlnum(prefix) || !isLowerAlnum(tail) {
+		return "", false
+	}
+	return prefix, true
+}
+
+func isLowerAlnum(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if (s[i] < 'a' || s[i] > 'z') && (s[i] < '0' || s[i] > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+// cityOwnsStorePrefix reports whether prefix names one of this city's own bead
+// stores: the HQ store or any configured rig's, including the prefix a rig
+// DERIVES from its name when it declares none. Compared case-insensitively,
+// matching rig prefix validation.
+func cityOwnsStorePrefix(cfg *config.City, prefix string) bool {
+	prefix = strings.ToLower(strings.TrimSpace(prefix))
+	if cfg == nil || prefix == "" {
+		return false
+	}
+	if strings.ToLower(strings.TrimSpace(config.EffectiveHQPrefix(cfg))) == prefix {
+		return true
+	}
+	for i := range cfg.Rigs {
+		if strings.ToLower(strings.TrimSpace(cfg.Rigs[i].EffectivePrefix())) == prefix {
+			return true
+		}
+	}
+	return false
 }
 
 // poolIdentityLocalRosterVerdict resolves a <rig>/<name> identity against local
