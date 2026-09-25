@@ -14,7 +14,8 @@
 //                       → operator-attention registry entry + desktop notify
 //                         (ga-s0fn27 slice 2; .gc/runtime/attention/<seat>.json)
 //   input / tool_approval_resolved / tool_execution_end(ask)
-//                       → clear the seat's attention entry
+//                       → clear the seat's attention entry, unless it is a
+//                         raised BLOCKED (P0), which none of these may clear
 //
 // gc launches this file via --hook, which omp merges into the EXTENSION
 // loader (main.ts cliExtensionPaths), so it runs with the full ExtensionAPI —
@@ -22,11 +23,11 @@
 // here (verified against omp 18.1.10 source, ga-s0fn27 feasibility probe).
 
 import { execFileSync } from "node:child_process";
-import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
-const GC_OMP_HOOK_VERSION = 5;
+const GC_OMP_HOOK_VERSION = 6;
 const PATH_PREFIX =
   `${process.env.HOME}/go/bin:${process.env.HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:`;
 
@@ -93,6 +94,22 @@ const ATTENTION_DIR = process.env.GC_CITY_PATH
   : "";
 const ATTENTION_SAFE_SEAT = ATTENTION_SEAT.replace(/[^A-Za-z0-9._-]/g, "_");
 
+// A raised BLOCKED (P0, written by the city's attention-raise) holds the seat
+// until its gate closes or it is explicitly cleared; a prompt, an answer or a
+// nudge landing as input must not wipe it, and a question or approval must
+// not overwrite it. It is recognized exactly as the Claude-side hooks do: the
+// dotfile sidecar says kind=blocked and carries the entry's event_id. Any
+// unreadable file reads as "not blocked" (non-fatal by design).
+function attentionBlocked(): boolean {
+  try {
+    const entry = JSON.parse(readFileSync(`${ATTENTION_DIR}/${ATTENTION_SAFE_SEAT}.json`, "utf8"));
+    const meta = JSON.parse(readFileSync(`${ATTENTION_DIR}/.${ATTENTION_SAFE_SEAT}.attn.json`, "utf8"));
+    return meta?.kind === "blocked" && Boolean(entry?.event_id) && meta.event_id === entry.event_id;
+  } catch {
+    return false;
+  }
+}
+
 function attentionWrite(
   reason: "question" | "permission",
   summary: string,
@@ -101,23 +118,25 @@ function attentionWrite(
   if (!ATTENTION_SEAT || !ATTENTION_DIR) {
     return;
   }
-  try {
-    mkdirSync(ATTENTION_DIR, { recursive: true });
-    const entry = {
-      seat: ATTENTION_SEAT,
-      runtime: "omp",
-      event_id: randomUUID(),
-      reason,
-      state: "waiting_user",
-      since: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
-      summary: summary.slice(0, 200),
-      session_id: ctx.sessionManager?.getSessionId?.() || "",
-    };
-    const tmp = `${ATTENTION_DIR}/.${ATTENTION_SAFE_SEAT}.json.tmp`;
-    writeFileSync(tmp, JSON.stringify(entry));
-    renameSync(tmp, `${ATTENTION_DIR}/${ATTENTION_SAFE_SEAT}.json`);
-  } catch {
-    // Non-fatal by design.
+  if (!attentionBlocked()) {
+    try {
+      mkdirSync(ATTENTION_DIR, { recursive: true });
+      const entry = {
+        seat: ATTENTION_SEAT,
+        runtime: "omp",
+        event_id: randomUUID(),
+        reason,
+        state: "waiting_user",
+        since: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
+        summary: summary.slice(0, 200),
+        session_id: ctx.sessionManager?.getSessionId?.() || "",
+      };
+      const tmp = `${ATTENTION_DIR}/.${ATTENTION_SAFE_SEAT}.json.tmp`;
+      writeFileSync(tmp, JSON.stringify(entry));
+      renameSync(tmp, `${ATTENTION_DIR}/${ATTENTION_SAFE_SEAT}.json`);
+    } catch {
+      // Non-fatal by design.
+    }
   }
   try {
     const title = `${ATTENTION_SEAT} needs you`.replace(/"/g, "'");
@@ -137,8 +156,9 @@ function attentionClear(): void {
     return;
   }
   try {
-    // Unconditional clear, single writer per seat (v1 semantics, matching
-    // the Claude-side attention-clear hook).
+    if (attentionBlocked()) {
+      return;
+    }
     rmSync(`${ATTENTION_DIR}/${ATTENTION_SAFE_SEAT}.json`, { force: true });
   } catch {
     // Non-fatal by design.
