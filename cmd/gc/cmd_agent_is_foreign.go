@@ -36,7 +36,8 @@ import (
 //
 //	0  local     — this city can answer this identity's liveness; caller may
 //	               apply its own liveness check and reap if genuinely dead
-//	1  foreign   — well-formed identity NOT in this city's roster; PROTECT
+//	1  foreign   — well-formed identity NOT in this city's roster, or a bare
+//	               session bead ID from a store this city does not own; PROTECT
 //	2  unknown   — this city cannot answer (no config, unresolvable city, bad
 //	               usage); PROTECT, and count as protected-unknown
 //
@@ -60,8 +61,9 @@ type AgentIsForeignJSON struct {
 	// "absent_from_roster" (possibly one of ours, decommissioned) call for
 	// different operator responses.
 	Reason string `json:"reason"`
-	// Detail is the narrowing's subject: the matched roster candidate, or the
-	// foreign binding that blocked every candidate.
+	// Detail is the narrowing's subject: the matched roster candidate, the
+	// foreign binding that blocked every candidate, or the foreign store prefix
+	// of a bare session bead ID.
 	Detail string `json:"detail,omitempty"`
 	// RosterSource names where the roster came from, so a verdict is
 	// reproducible from the JSON alone.
@@ -98,7 +100,8 @@ merely SEES in a shared rig store?
 
 Exit codes:
   0  local    this city can answer this identity's liveness
-  1  foreign  well-formed identity absent from this city's roster — protect it
+  1  foreign  well-formed identity absent from this city's roster, or a session
+             bead ID minted by a store this city does not own — protect it
   2  unknown  this city cannot answer (no config, bad usage) — protect it
 
 "local" is not a claim that the identity is ALIVE. Liveness is a separate
