@@ -55,12 +55,31 @@ func TestCreateHandoffMail_UnconfirmedNoteNamesTheIDAndDoesNotInviteABlindRetry(
 		t.Fatalf("no note bead was created")
 	}
 	out := stderr.String()
-	for _, want := range []string{"UNCONFIRMED", id, "NOT restarted", "gc bd show " + id, "second copy"} {
+	for _, want := range []string{"UNCONFIRMED", id, "NOT restarted", "GC_NO_API=1 gc mail peek " + id, "second copy"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("stderr missing %q:\n%s", want, out)
 		}
 	}
 	if strings.Contains(out, "creating mail:") {
 		t.Errorf("stderr reports an unconfirmed note as a plain failure:\n%s", out)
+	}
+}
+
+// ga-0ejdbv round 3, finding 2: the controller's config-drift handoff restarts
+// the session whatever the note's fate, so it must not print the CLI's
+// "NOT restarted ... re-run gc handoff" advice.
+func TestConfigDriftHandoffUnconfirmedDoesNotClaimTheRestartStopped(t *testing.T) {
+	base := beads.NewMemStore()
+	msgStore := &indeterminateReadStore{Store: base}
+	var stderr bytes.Buffer
+	sendConfigDriftHandoffMailWithStores(msgStore, base, events.Discard, "woodhouse", "drift note", &stderr)
+	out := stderr.String()
+	if !strings.Contains(out, "config-drift handoff") || !strings.Contains(out, "UNCONFIRMED") || !strings.Contains(out, "GC_NO_API=1 gc mail peek ") {
+		t.Fatalf("stderr does not report the unconfirmed drift note with its check:\n%s", out)
+	}
+	for _, bad := range []string{"NOT restarted", "re-run gc handoff", "gc handoff:"} {
+		if strings.Contains(out, bad) {
+			t.Fatalf("stderr carries CLI-only advice %q on the controller path:\n%s", bad, out)
+		}
 	}
 }
