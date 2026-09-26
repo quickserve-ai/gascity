@@ -1067,32 +1067,66 @@ func finalizeDrainAckStoppedSession(
 	// ga-x99xh0: a pool seat that drain-acked while holding claimable or
 	// in_progress work is torn down and its work released in the same act (see
 	// session_drain_ack_teardown.go), instead of sleeping with the work and being
-	// resumed by it. The classification runs first because the release empties
-	// it; the event it found is the observation and is recorded either way.
+	// resumed by it. Reason reporting is separate from teardown permission: every
+	// drain-ack with assigned work logs what the seat is retained for, but only a
+	// pool seat at a call site that permits closing is mutated.
+	//
+	// For a teardown-eligible seat the work is classified first, because the
+	// release empties the classifier; the bead it found is the observation, and
+	// the drain_acked_with_assigned_work event is recorded from it exactly once
+	// (at the teardown close, or at the shared emit below). Non-eligible seats
+	// are not classified here at all — they reach the shared
+	// recordDrainAckAssignedWorkEvent below, as before.
 	var ackedWork *beads.Bead
-	if hasAssignedWork && closeIfUnassigned {
-		anomaly, found, anomalyErr := drainAckClaimableAnomalyBead(cityPath, cfg, store, rigStores, info, clk.Now().UTC())
-		if anomalyErr != nil {
-			fmt.Fprintf(stderr, "session reconciler: classifying drain-acked work for %s: %v\n", name, anomalyErr) //nolint:errcheck
+	classified := false
+	if hasAssignedWork {
+		eligible := closeIfUnassigned && drainAckTeardownEligible(info)
+		outcome := drainAckTeardownOutcome{retainedFor: drainAckRetainedNotPoolSeat}
+		if drainAckTeardownEligible(info) && !closeIfUnassigned {
+			outcome.retainedFor = drainAckRetainedCloseNotPermitted
 		}
-		if found {
-			ackedWork = &anomaly
-			outcome := tearDownDrainAckedPoolSeat(cityPath, cfg, store, rigStores, info, clk.Now().UTC(), stderr)
-			if outcome.closed {
-				if dops != nil {
-					_ = dops.clearDrain(name)
-				}
-				if dt != nil {
-					dt.clearIdleProbe(info.ID)
-					dt.remove(info.ID)
-				}
-				recordStopped(true)
-				emitDrainAckAssignedWorkEvent(rec, info, template, template, anomaly)
-				fmt.Fprintf(stderr, "session reconciler: drain-acked %s held work %s: released its assigned work and closed the seat\n", name, anomaly.ID) //nolint:errcheck
-				return drainAckFinalizeResult{batch: sessionpkg.ClosePatch(clk.Now().UTC(), drainAckTeardownCloseReason), closed: true}
+		observed := "assigned work"
+		if eligible {
+			anomaly, found, anomalyErr := drainAckClaimableAnomalyBead(cityPath, cfg, store, rigStores, info, clk.Now().UTC())
+			classified = true
+			if anomalyErr != nil {
+				fmt.Fprintf(stderr, "session reconciler: classifying drain-acked work for %s: %v\n", name, anomalyErr) //nolint:errcheck
 			}
+			if found {
+				ackedWork = &anomaly
+				observed = "assigned work " + anomaly.ID
+				outcome = tearDownDrainAckedPoolSeat(cityPath, cfg, store, rigStores, info, clk.Now().UTC(), stderr)
+				if outcome.closed {
+					if dops != nil {
+						_ = dops.clearDrain(name)
+					}
+					if dt != nil {
+						dt.clearIdleProbe(info.ID)
+						dt.remove(info.ID)
+					}
+					recordStopped(true)
+					emitDrainAckAssignedWorkEvent(rec, info, template, template, anomaly)
+					fmt.Fprintf(stderr, "session reconciler: drain-acked %s: observed %s; released %d of %d; seat closed\n", name, observed, outcome.released, outcome.attempted) //nolint:errcheck
+					return drainAckFinalizeResult{batch: sessionpkg.ClosePatch(clk.Now().UTC(), drainAckTeardownCloseReason), closed: true}
+				}
+			} else {
+				// hasAssignedWork held but nothing claimable or in_progress was
+				// found: only provably non-claimable work (blocked/deferred), or
+				// work another observer already released. Not torn down here.
+				outcome.retainedFor = "no_claimable_work"
+			}
+		}
+		if closeIfUnassigned {
+			// Witness re-read whenever the teardown did not close, found or not:
+			// a concurrent observer may have read the same ack, released the work
+			// and closed the seat after this one read hasAssignedWork. Writing
+			// the asleep patch and a performed stop onto that closed bead would be
+			// wrong. The winner already recorded the event, so the witness emits
+			// no second drain_acked_with_assigned_work; the SessionStopped
+			// re-emit keeps parity with the no-work witness above. A per-ack
+			// idempotency key for full cross-observer dedupe is out of scope
+			// (ga-x99xh0 freeze ruling).
 			if witnessInfo, err := sessionFrontDoor(store).Get(info.ID); err == nil && witnessInfo.Closed {
-				// Another observer closed the seat (and released its work) first.
 				if dops != nil {
 					_ = dops.clearDrain(name)
 				}
@@ -1101,11 +1135,13 @@ func finalizeDrainAckStoppedSession(
 					dt.remove(info.ID)
 				}
 				recordStopped(false)
-				emitDrainAckAssignedWorkEvent(rec, info, template, template, anomaly)
 				return drainAckFinalizeResult{witnessInfo: &witnessInfo}
 			}
-			fmt.Fprintf(stderr, "session reconciler: drain-acked %s retained holding work %s: retained for %s\n", name, anomaly.ID, outcome.retainedFor) //nolint:errcheck
 		}
+		// Observation and outcome are logged separately: the seat was OBSERVED
+		// holding work, the sweep released N of M, and the seat was kept for the
+		// named reason. No claim is made about what it holds now.
+		fmt.Fprintf(stderr, "session reconciler: drain-acked %s: observed %s; released %d of %d; seat kept: %s\n", name, observed, outcome.released, outcome.attempted, outcome.retainedFor) //nolint:errcheck
 	}
 	batch := sessionpkg.AcknowledgeDrainPatch(clk.Now().UTC(), info.WakeMode == "fresh")
 	if hasAssignedWork {
@@ -1180,7 +1216,7 @@ func finalizeDrainAckStoppedSession(
 	recordStopped(true)
 	if ackedWork != nil {
 		emitDrainAckAssignedWorkEvent(rec, info, template, template, *ackedWork)
-	} else if hasAssignedWork {
+	} else if hasAssignedWork && !classified {
 		recordDrainAckAssignedWorkEvent(cityPath, cfg, store, rigStores, info, template, template, name, clk.Now().UTC(), rec, stderr)
 	}
 	// Non-close drain-ack: the snapshot fold is the ApplyPatchInfo result above.
