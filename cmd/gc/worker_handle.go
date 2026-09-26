@@ -16,6 +16,7 @@ import (
 	"github.com/gastownhall/gascity/internal/processenv"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
+	workdirutil "github.com/gastownhall/gascity/internal/workdir"
 	"github.com/gastownhall/gascity/internal/worker"
 )
 
@@ -613,7 +614,12 @@ func resolvedWorkerRuntimeWithConfigAndMetadata(cityPath string, cfg *config.Cit
 	if cfg == nil {
 		return nil, nil
 	}
-	resolved, configuredTransport := resolveWorkerRuntimeProviderWithConfigAndMetadata(cfg, info, sessionKind, metadata)
+	resolved, configuredTransport, resolvedAgent := resolveWorkerRuntimeProviderAndAgent(cfg, info, sessionKind, metadata)
+	// Render a templated start_command for this session before anything
+	// compares against it, so a stored (already rendered) command is
+	// recognized as current and the raw template is never launched
+	// (ga-b1u4yg).
+	resolved = renderResolvedCommandForSession(cityPath, cfg, resolvedAgent, info, info.WorkDir, resolved)
 	if resolved == nil {
 		// The provider can no longer be resolved (removed or renamed since the
 		// session was stored). Returning nil here used to mean "no override",
@@ -943,14 +949,23 @@ func resolveWorkerRuntimeProviderWithConfig(cfg *config.City, info session.Info,
 }
 
 func resolveWorkerRuntimeProviderWithConfigAndMetadata(cfg *config.City, info session.Info, sessionKind string, metadata map[string]string) (*config.ResolvedProvider, string) {
+	resolved, transport, _ := resolveWorkerRuntimeProviderAndAgent(cfg, info, sessionKind, metadata)
+	return resolved, transport
+}
+
+// resolveWorkerRuntimeProviderAndAgent is resolveWorkerRuntimeProviderWithConfigAndMetadata
+// that also reports the agent the provider was resolved through (nil when it
+// came from the provider-only fallback), so callers can render that agent's
+// templated start_command for the target session (ga-b1u4yg).
+func resolveWorkerRuntimeProviderAndAgent(cfg *config.City, info session.Info, sessionKind string, metadata map[string]string) (*config.ResolvedProvider, string, *config.Agent) {
 	if cfg == nil {
-		return nil, ""
+		return nil, "", nil
 	}
 	found, foundAgent := resolveAgentIdentity(cfg, info.Template, "")
 	if session.UseAgentTemplateForProviderResolution(sessionKind, metadata, info.Provider, found.Provider, foundAgent) {
 		if foundAgent {
 			if resolved, err := config.ResolveProvider(&found, &cfg.Workspace, cfg.Providers, exec.LookPath); err == nil {
-				return resolved, config.ResolveSessionCreateTransport(found.Session, resolved)
+				return resolved, config.ResolveSessionCreateTransport(found.Session, resolved), &found
 			}
 		}
 	}
@@ -961,7 +976,7 @@ func resolveWorkerRuntimeProviderWithConfigAndMetadata(cfg *config.City, info se
 		}
 		resolved, err := config.ResolveProvider(&config.Agent{Provider: providerName}, &cfg.Workspace, cfg.Providers, exec.LookPath)
 		if err == nil {
-			return resolved, strings.TrimSpace(resolved.ProviderSessionCreateTransport())
+			return resolved, strings.TrimSpace(resolved.ProviderSessionCreateTransport()), nil
 		}
 	}
 	// Permissive retry: the strict passes above also fail on
@@ -976,7 +991,7 @@ func resolveWorkerRuntimeProviderWithConfigAndMetadata(cfg *config.City, info se
 	permissive := func(name string) (string, error) { return name, nil }
 	if session.UseAgentTemplateForProviderResolution(sessionKind, metadata, info.Provider, found.Provider, foundAgent) && foundAgent {
 		if resolved, err := config.ResolveProvider(&found, &cfg.Workspace, cfg.Providers, permissive); err == nil {
-			return resolved, config.ResolveSessionCreateTransport(found.Session, resolved)
+			return resolved, config.ResolveSessionCreateTransport(found.Session, resolved), &found
 		}
 	}
 	for _, providerName := range []string{info.Provider, info.Template} {
@@ -986,10 +1001,55 @@ func resolveWorkerRuntimeProviderWithConfigAndMetadata(cfg *config.City, info se
 		}
 		resolved, err := config.ResolveProvider(&config.Agent{Provider: providerName}, &cfg.Workspace, cfg.Providers, permissive)
 		if err == nil {
-			return resolved, strings.TrimSpace(resolved.ProviderSessionCreateTransport())
+			return resolved, strings.TrimSpace(resolved.ProviderSessionCreateTransport()), nil
 		}
 	}
-	return nil, ""
+	return nil, "", nil
+}
+
+// renderResolvedCommandForSession renders the templated launch command
+// (start_command) of a provider resolved through agentCfg for the TARGET
+// session, with the same renderer and SessionSetupContext fields the
+// reconciler's create path uses (resolveTemplate Step 11). The Agent identity
+// comes from sessionRenderIdentity, the reconciler's own rediscovery chain for
+// a session bead. Without it, resume paths launched the raw template — the
+// control dispatcher's `--follow {{.Agent}}` — and died (ga-b1u4yg). The
+// context is built from the session record and the city config, never from
+// the caller's environment.
+func renderResolvedCommandForSession(cityPath string, cfg *config.City, agentCfg *config.Agent, info session.Info, workDir string, resolved *config.ResolvedProvider) *config.ResolvedProvider {
+	if cfg == nil || agentCfg == nil || resolved == nil {
+		return resolved
+	}
+	renderAgent, qualifiedName := sessionRenderIdentity(cityPath, cfg, agentCfg, info)
+	return renderResolvedCommandForNewSession(cityPath, cfg, renderAgent, qualifiedName, info.SessionName, firstNonEmptyGCString(workDir, info.WorkDir), resolved)
+}
+
+// sessionRenderIdentity returns the (agent, qualified name) pair the
+// reconciler renders an existing session bead's templates with — the same
+// branch buildDesiredState's session-bead rediscovery takes: manual sessions
+// keep their persisted concrete identity, named sessions their configured
+// identity, pool sessions their canonical instance identity.
+func sessionRenderIdentity(cityPath string, cfg *config.City, agentCfg *config.Agent, info session.Info) (*config.Agent, string) {
+	if isManualSessionInfoForAgent(info, agentCfg) {
+		qualifiedName := sessionBeadQualifiedNameInfo(cityPath, agentCfg, cfg.Rigs, info)
+		return sessionBeadConfigAgent(agentCfg, qualifiedName), qualifiedName
+	}
+	renderAgent, qualifiedName := canonicalSessionIdentityWithConfigInfo(cfg, agentCfg, info)
+	if renderAgent == nil {
+		renderAgent = agentCfg
+	}
+	return renderAgent, qualifiedName
+}
+
+// renderResolvedCommandForNewSession renders a resolved provider's templated
+// launch command for a session the CLI is about to create (and possibly start
+// directly, when no controller is running), under the concrete identity,
+// session name, and work dir the create path already computed (ga-b1u4yg).
+func renderResolvedCommandForNewSession(cityPath string, cfg *config.City, agentCfg *config.Agent, qualifiedName, sessionName, workDir string, resolved *config.ResolvedProvider) *config.ResolvedProvider {
+	if cfg == nil || agentCfg == nil || resolved == nil {
+		return resolved
+	}
+	return workdirutil.RenderResolvedProviderCommandForSession(resolved, cityPath, workdirutil.CityName(cityPath, cfg), qualifiedName, *agentCfg, cfg.Rigs, sessionName, workDir)
 }
 
 func workerDeliveryIntentForSubmitIntent(intent session.SubmitIntent) worker.DeliveryIntent {
