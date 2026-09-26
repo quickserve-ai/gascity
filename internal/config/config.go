@@ -683,6 +683,20 @@ type Rig struct {
 	// explicit --var override. Takes precedence over formula-level defaults
 	// but loses to --var flags.
 	FormulaVars map[string]string `toml:"formula_vars,omitempty"`
+	// Doctor holds rig-scoped gc doctor policy ([rigs.doctor]).
+	Doctor RigDoctorConfig `toml:"doctor,omitempty"`
+}
+
+// RigDoctorConfig holds gc doctor policy that applies to one rig.
+type RigDoctorConfig struct {
+	// CensusOwnerNamespace declares that this rig's resource-census ledger
+	// (test/test-resources.toml) names owner_bead values from ANOTHER
+	// tracker, e.g. "gastownhall/gascity" for a fork of Gas City whose ledger
+	// comes from upstream. The census-owner-liveness check then reports an
+	// owner_bead missing from this city as owned in that namespace instead of
+	// dangling. The cost: a missing owner on this rig that is genuinely this
+	// city's is not detected. Empty means every missing owner is dangling.
+	CensusOwnerNamespace string `toml:"census_owner_namespace,omitempty"`
 }
 
 // AgentOverride modifies a pack-stamped agent for a specific rig.
@@ -1860,6 +1874,9 @@ type MailConfig struct {
 	// purge. The sweep distinguishes the two: empty leaves it at its own
 	// 60-minute default, while "0" disables its mail-close phase.
 	RetentionTTL string `toml:"retention_ttl,omitempty"`
+	// CrossCity enables city-qualified mail addressing (<city>/<address>).
+	// Absent means disabled: every recipient resolves exactly as today.
+	CrossCity *MailCrossCityConfig `toml:"crosscity,omitempty"`
 }
 
 // RetentionTTLDuration parses RetentionTTL as a Go time.Duration. Empty or
@@ -2215,6 +2232,12 @@ type OrderOverride struct {
 	// shared-pack order (e.g. a slow-store queue check) without editing the
 	// pack source.
 	CheckTimeout *string `toml:"check_timeout,omitempty"`
+	// RunStaleAfter overrides how long the order's formula runs may stay open
+	// before the controller reports them as stale, naming who holds each one.
+	// The report closes nothing. Go duration string; default 6h. Lets a
+	// deployment raise it for a scanned shared-pack order whose runs
+	// legitimately take longer, without editing the pack source.
+	RunStaleAfter *string `toml:"run_stale_after,omitempty"`
 	// Idempotent overrides whether the order's dispatch is safe to repeat.
 	// Idempotent orders fail open when the open-work gate times out (#2893).
 	Idempotent *bool `toml:"idempotent,omitempty"`

@@ -178,7 +178,7 @@ declaration as an error.
 |---|---|---|
 | `formula` | string | Required. Unique formula name used by `gc formula cook`, `gc sling --formula`, and `molecule.Cook`/`CookOn` |
 | `description` | string | Human-readable description; supports `{{var}}` substitution |
-| `requires` | table | Host capability requirements. `formula_compiler` (a semver comparator) is the only axis; unknown axes fail with `formula.requirement_unknown` (section 5) |
+| `requires` | table | Host capability requirements. `formula_compiler` (a semver comparator) is the only axis; unknown axes fail with `formula.requirement_unknown` (section 5). `disabled_reason` (a non-empty string) marks an unsatisfiable requirement as deliberate, e.g. `formula_compiler = ">=999.0.0"` to shadow a formula so it can never be cooked: `gc doctor` then reports the formula as intentionally disabled instead of as a defect, and warns if the formula compiles anyway (its own and every composed requirement satisfiable). It never changes cook or dispatch, where the requirement is still enforced |
 | `contract` | string | Deprecated v2 opt-in. Only valid value: `"graph.v2"`; anything else fails validation. Prefer `[requires]` (section 5) |
 | `extends` | []string | Parent formulas to compose from (section 1.7) |
 | `vars` | table | Template variable declarations (section 1.4) |
@@ -989,9 +989,18 @@ formula_compiler = ">=2.0.0"
 `formula_compiler` is the only `[requires]` axis. The value must be a
 semver comparator; violations fail with
 `formula.compiler_requirement_invalid: formula_compiler must be a semver
-comparator, for example ">=2.0.0"`, and unknown axes fail with
+comparator, for example ">=2.0.0"`, and unknown keys fail with
 `formula.requirement_unknown: unknown formula requirement "<key>";
-supported requirements: formula_compiler`.
+supported requirements: formula_compiler, disabled_reason`.
+
+`disabled_reason` is not an axis. It is a non-empty string that marks an
+unsatisfiable `formula_compiler` requirement as deliberate, for example
+`formula_compiler = ">=999.0.0"` to shadow a formula so it can never be
+cooked. `gc doctor` reports such a formula as intentionally disabled
+instead of as a defect, and warns when the formula compiles anyway (a composed expansion or aspect may carry the unsatisfiable requirement).
+Cook and dispatch ignore it. A formula that `extends` a disabled parent
+inherits the parent's reason unless it declares its own; an inherited reason never
+excuses the formula's own unsatisfiable requirement.
 
 ### Explicit declaration rule
 

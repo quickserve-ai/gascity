@@ -34,6 +34,12 @@ SPIKE_THRESHOLD="${GC_JSONL_SPIKE_THRESHOLD:-20}"  # percentage (0-100)
 # data while suppressing stand-up flares. Set to 0 to disable.
 MIN_PREV_FOR_SPIKE_CHECK="${GC_JSONL_MIN_PREV_FOR_SPIKE:-100}"
 MAX_PUSH_FAILURES="${GC_JSONL_MAX_PUSH_FAILURES:-3}"
+MAX_REPACK_FAILURES="${GC_JSONL_MAX_REPACK_FAILURES:-3}"
+REPACK_LOOSE_CEILING="${GC_JSONL_REPACK_LOOSE_CEILING:-512}"
+# An escalation suppresses repeats for this long, then re-alerts. Bounding the
+# silence by TIME, not by a marker, means a stale marker (a clear that failed
+# to persist) can never mute a later streak for more than this window.
+REPACK_REESCALATE_SECONDS="${GC_JSONL_REPACK_REESCALATE_SECONDS:-86400}"
 PUSH_RETRY_DELAY_MIN="${GC_JSONL_PUSH_RETRY_DELAY_MIN:-1}"
 PUSH_RETRY_DELAY_SPAN="${GC_JSONL_PUSH_RETRY_DELAY_SPAN:-4}"
 SCRUB="${GC_JSONL_SCRUB:-true}"
@@ -697,6 +703,240 @@ commit_archive_snapshot() {
         echo "jsonl-export: $context commit failed" >&2
         return 1
     fi
+    # Every snapshot commit leaves one new loose blob per exported store (a
+    # full issues.jsonl, tens of MiB each). The auto-maintenance that `git
+    # commit` starts packs only past gc.auto's default of 6700 loose objects,
+    # which at this blob size is several GiB of loose data. Repack on the
+    # commit path with a much lower trigger: gc.auto=256 fires roughly every
+    # ~128 commits, so each repack handles a few hundred MiB, not the whole
+    # history; autoDetach off so the repack finishes inside this order's run
+    # instead of a detached child that outlives it. The first run against an
+    # archive that is already far behind packs the whole backlog at once,
+    # which is why the order's timeout is 30m. Never fatal: the snapshot is
+    # already committed, and a failed repack costs disk, not data. Never
+    # silent either: a repack that keeps failing lets loose objects pile up
+    # toward git's own trigger, so failures are counted in state and escalated.
+    # Exit status alone is not proof: gc --auto returns 0 without packing when
+    # its sampled estimate (one of the 256 loose-object fan-out directories)
+    # misses the trigger, when another git gc holds the repository, when the
+    # pre-auto-gc hook declines, or when the pack directory is unusable. So
+    # the loose count is checked exactly: above REPACK_LOOSE_CEILING (default
+    # twice the gc.auto trigger) after a gc --auto that exited 0, the loose
+    # objects are packed explicitly with the incremental repack gc --auto
+    # would have run, and only that result is judged.
+    # Both callers run this function as the left operand of ||, where bash
+    # ignores errexit for the whole body, so a failing command here cannot
+    # end the export. Every failure below is still handled explicitly, so
+    # the snapshot is marked for push even if a caller drops the ||.
+    local repack_err
+    local repack_rc=0
+    local repack_step="gc --auto"
+    local count_out
+    local loose
+    local gc_pid
+    local gc_log
+    local gc_log_head
+    local gc_holder
+    local pre_auto_gc
+    local fallback_err
+    local summary
+    read_loose_count() {
+        count_out=$(git count-objects -v 2>&1) || count_out="count-objects failed: $count_out"
+        loose=$(printf '%s\n' "$count_out" | awk '/^count:/ {print $2}')
+        case "$loose" in ''|*[!0-9]*) loose="" ;; esac
+    }
+    read_loose_count
+    if [ -n "$loose" ] && [ "$loose" -gt "$REPACK_LOOSE_CEILING" ]; then
+        echo "jsonl-export: archive holds $loose loose objects (ceiling $REPACK_LOOSE_CEILING); packing them now, which takes minutes on a large backlog" >&2
+    fi
+    repack_err=$(git -c gc.auto=256 -c gc.autoDetach=false gc --auto --quiet 2>&1 >/dev/null) || repack_rc=$?
+    read_loose_count
+    if [ "$repack_rc" -eq 0 ] && [ -n "$loose" ] && [ "$loose" -gt "$REPACK_LOOSE_CEILING" ]; then
+        # The explicit repack stands in for the auto-gc that did not fire, so
+        # it keeps auto-gc's two courtesies. A deferral is neither a success
+        # nor a failure; the next commit retries.
+        # 1. A failing pre-auto-gc hook vetoes it, as it vetoes gc --auto.
+        #    The hook is found the way git finds it (rev-parse --git-path
+        #    resolves core.hooksPath) and run directly, which needs no
+        #    particular git version; an unresolvable path means no veto. When
+        #    gc --auto was due and the hook already declined, the hook runs a
+        #    second time here, and a consistent hook declines again.
+        pre_auto_gc=$(git rev-parse --git-path hooks/pre-auto-gc 2>/dev/null) || pre_auto_gc=""
+        if [ -n "$pre_auto_gc" ] && [ -f "$pre_auto_gc" ] && [ -x "$pre_auto_gc" ] && ! "$pre_auto_gc" >/dev/null 2>&1; then
+            echo "jsonl-export: archive repack deferred: the pre-auto-gc hook ($pre_auto_gc) declined it; the next commit retries" >&2
+            return 0
+        fi
+        # 2. It defers to a git gc that holds the repository. It only reads
+        #    gc.pid (in the common git dir); this script writes no lock or
+        #    PID file. A gc that starts between this check and the repack can
+        #    still race it. The archive is private to this script, so that
+        #    takes a human's gc or an overlapping export, and a repack that
+        #    fails in the race is judged below like any other failure.
+        gc_pid=$(git rev-parse --git-path gc.pid 2>/dev/null) || gc_pid=".git/gc.pid"
+        if gc_holder=$(git_gc_holder "$gc_pid"); then
+            echo "jsonl-export: archive repack deferred: another git gc holds $gc_pid ($gc_holder); the next commit retries" >&2
+            return 0
+        fi
+        # An incremental repack cannot write a bitmap index: an inherited
+        # repack.writeBitmaps / pack.writeBitmaps makes it exit 128 on every
+        # snapshot, and the loose objects would never be packed.
+        repack_step="repack -d -l --no-write-bitmap-index"
+        fallback_err=$(git repack -d -l -q --no-write-bitmap-index 2>&1 >/dev/null) || repack_rc=$?
+        # Keep gc --auto's stderr too: its warnings (unreachable loose
+        # objects, for one) explain why the fallback was needed.
+        repack_err="${repack_err:+$repack_err
+}$fallback_err"
+        read_loose_count
+    fi
+    if [ "$repack_rc" -eq 0 ] && [ -n "$loose" ] && [ "$loose" -le "$REPACK_LOOSE_CEILING" ]; then
+        record_archive_repack_success
+        return 0
+    fi
+    if [ -z "$loose" ]; then
+        repack_err="$repack_err
+$count_out"
+    fi
+    gc_log=$(git rev-parse --git-path gc.log 2>/dev/null) || gc_log=".git/gc.log"
+    if [ -f "$gc_log" ]; then
+        gc_log_head=$(head -c 400 "$gc_log" 2>&1) || gc_log_head="(unreadable: $gc_log_head)"
+        repack_err="$repack_err
+gc.log: $gc_log_head"
+    fi
+    # The summary goes first and last: the state file keeps the first 512
+    # bytes and the escalation mail keeps the last 20 lines.
+    summary="step=$repack_step exit=$repack_rc loose_objects=${loose:-unknown} (ceiling $REPACK_LOOSE_CEILING)"
+    if [ -n "$repack_err" ]; then
+        record_archive_repack_failure "$summary
+$repack_err
+$summary"
+    else
+        record_archive_repack_failure "$summary"
+    fi
+    return 0
+}
+
+# Print who holds git gc's repository lock and succeed, or fail when nobody
+# does. $1 is the gc.pid path (rev-parse --git-path gc.pid, which is in the
+# common git dir). git serializes gc through gc.pid ("<pid> <host>") and treats
+# it as held while the file is younger than 12 hours and its host is another
+# machine or its pid is alive here (builtin/gc.c). This mirrors that test.
+# Liveness is read with ps, which, like git's EPERM rule, counts another
+# user's live process as alive, where kill -0 would call it dead.
+git_gc_holder() {
+    local pid_file="$1"
+    local pid=""
+    local host=""
+    [ -f "$pid_file" ] || return 1
+    [ -n "$(find "$pid_file" -mmin -720 2>/dev/null)" ] || return 1
+    read -r pid host < "$pid_file" 2>/dev/null || [ -n "$pid" ] || return 1
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    if [ -n "$host" ] && [ "$host" != "$(hostname 2>/dev/null)" ]; then
+        printf 'pid %s on %s' "$pid" "$host"
+        return 0
+    fi
+    if [ -n "$(ps -p "$pid" -o pid= 2>/dev/null)" ]; then
+        printf 'pid %s' "$pid"
+        return 0
+    fi
+    return 1
+}
+
+# Clear the repack failure streak. Writes state only when there is a streak
+# to clear, so the common path (gc --auto finds nothing to do) costs no write.
+record_archive_repack_success() {
+    local state_json
+    state_json=$(read_state_json)
+    if [ "$(printf '%s\n' "$state_json" | jq -r '(.consecutive_repack_failures // 0) > 0 or has("last_repack_stderr") or has("repack_failure_escalated") or has("last_repack_escalation_error")')" != "true" ]; then
+        return 0
+    fi
+    if ! write_state_json "$(printf '%s\n' "$state_json" | jq -c 'del(.consecutive_repack_failures) | del(.last_repack_stderr) | del(.repack_failure_escalated) | del(.last_repack_escalation_error)')"; then
+        echo "jsonl-export: repack succeeded but clearing the failure streak did not persist; the next successful commit retries, and escalation dedupe is time-bounded" >&2
+    fi
+    return 0
+}
+
+# Count a failed repack and escalate once per failure streak when the count
+# reaches MAX_REPACK_FAILURES. gc --auto is a no-op below the loose-object
+# threshold, so a failure only happens when a repack was actually due, and
+# every later commit retries it: a streak means the archive is growing.
+record_archive_repack_failure() {
+    local stderr_context="$1"
+    local consecutive
+    local already_escalated
+    local stderr_display
+    local body
+
+    echo "jsonl-export: archive repack failed (non-fatal; loose objects keep accumulating until it succeeds)" >&2
+    consecutive=$(read_state_json | jq -r '.consecutive_repack_failures // 0' || echo "0")
+    case "$consecutive" in ''|*[!0-9]*) consecutive=0 ;; esac
+    consecutive=$((consecutive + 1))
+    # The streak is the only durable record, and the conditions that fail a
+    # repack (full or unwritable disk) also fail this write. If it cannot be
+    # persisted, the count can never reach the threshold, so escalate NOW
+    # instead of waiting on a counter that will not move.
+    local state_persisted=1
+    if ! write_state_json "$(
+        read_state_json \
+            | jq -c \
+                --argjson count "$consecutive" \
+                --arg stderr "$(truncate_push_stderr_for_state "$stderr_context")" \
+                '.consecutive_repack_failures = $count
+                 | if $stderr == "" then del(.last_repack_stderr) else .last_repack_stderr = $stderr end'
+    )"; then
+        state_persisted=0
+        echo "jsonl-export: could not persist the repack failure streak; escalating now" >&2
+    fi
+
+    if [ "$state_persisted" = 1 ]; then
+        already_escalated=$(read_state_json | jq -r --argjson now "$(date +%s)" --argjson win "$REPACK_REESCALATE_SECONDS" \
+            '(.repack_failure_escalated // null) as $e | if ($e | type) == "number" then ($e <= $now and ($now - $e) < $win) else false end' || echo "false")
+        if [ "$consecutive" -lt "$MAX_REPACK_FAILURES" ] || [ "$already_escalated" = "true" ]; then
+            return 0
+        fi
+    fi
+    stderr_display=$(truncate_stderr_context "$stderr_context")
+    if [ -z "$stderr_display" ]; then
+        stderr_display="(no stderr captured)"
+    fi
+    body=$(cat <<ESCALATION
+Order: jsonl-export
+Archive: $ARCHIVE_REPO
+Consecutive repack failures: $consecutive (threshold: $MAX_REPACK_FAILURES)
+
+Last git gc stderr:
+$stderr_display
+
+Every snapshot commit adds full-size loose blobs; until a repack succeeds the
+archive grows by tens of MiB per commit.
+
+Remediation:
+- Check free disk and the loose-object count: git -C $ARCHIVE_REPO count-objects -vH
+- Run the repack by hand to see the full error: git -C $ARCHIVE_REPO gc
+- Temporarily suppress: export GC_JSONL_MAX_REPACK_FAILURES=99
+ESCALATION
+)
+    # A failed delivery must be distinguishable from the repack failure it
+    # reports: log it like the spike-alert path does, and keep it in state
+    # (order stderr is persisted nowhere). The marker stays unset, so the next
+    # failing commit retries the escalation.
+    local escalate_err
+    if escalate_err=$("$ESCALATE_SCRIPT" \
+        --subject "ESCALATION: JSONL archive repack failing [HIGH]" \
+        --message "$body" 2>&1 >/dev/null); then
+        if ! write_state_json "$(read_state_json | jq -c --argjson now "$(date +%s)" '.repack_failure_escalated = $now | del(.last_repack_escalation_error)')"; then
+            echo "jsonl-export: repack escalation delivered but its dedupe marker did not persist; the next failing commit re-sends it" >&2
+        fi
+    else
+        echo "jsonl-export: repack failure escalation delivery failed (retrying on the next failing commit)" >&2
+        if ! write_state_json "$(
+            read_state_json \
+                | jq -c --arg err "$(truncate_push_stderr_for_state "${escalate_err:-(no stderr)}")" \
+                    '.last_repack_escalation_error = $err'
+        )"; then
+            echo "jsonl-export: could not record the escalation delivery failure in state" >&2
+        fi
+    fi
+    return 0
 }
 
 discard_failed_db_outputs() {
@@ -1044,13 +1284,29 @@ if [ "$HALTED" -eq 1 ]; then
             discard_staged_archive_outputs
             exit 1
         }
-        set_pending_archive_push
+        # A full disk (the repack above can cause one) must not end the
+        # run before the spike alert: the next run re-detects the snapshot
+        # as a local-only commit.
+        if ! set_pending_archive_push; then
+            echo "jsonl-export: could not mark the HALT snapshot pending for push; the next run re-detects it as a local-only commit" >&2
+        fi
     fi
-    set_pending_spike_alert "$HALT_DB" "$HALT_PREV_COUNT" "$HALT_CURRENT_COUNT" "$HALT_DELTA" "$SPIKE_THRESHOLD"
+    spike_alert_recorded=1
+    if ! set_pending_spike_alert "$HALT_DB" "$HALT_PREV_COUNT" "$HALT_CURRENT_COUNT" "$HALT_DELTA" "$SPIKE_THRESHOLD"; then
+        spike_alert_recorded=0
+        echo "jsonl-export: could not record the spike alert in state; sending it now, but a failed send cannot be retried from state" >&2
+    fi
     if send_spike_alert "$HALT_DB" "$HALT_PREV_COUNT" "$HALT_CURRENT_COUNT" "$HALT_DELTA" "$SPIKE_THRESHOLD"; then
-        clear_pending_spike_alert "$HALT_DB"
-    else
+        # Nothing to clear when the record never landed, and on a full disk
+        # the clear is one more failing write: under errexit it would end the
+        # run before maintenance_done.
+        if [ "$spike_alert_recorded" -eq 1 ] && ! clear_pending_spike_alert "$HALT_DB"; then
+            echo "jsonl-export: the spike alert was sent but could not be cleared from state; the next run may send it once more" >&2
+        fi
+    elif [ "$spike_alert_recorded" -eq 1 ]; then
         echo "jsonl-export: spike alert delivery failed; will retry from state" >&2
+    else
+        echo "jsonl-export: spike alert delivery failed and was never recorded in state; it will not be retried" >&2
     fi
     maintenance_done "jsonl — HALTED on spike detection"
     exit 0
@@ -1095,7 +1351,12 @@ commit_archive_snapshot \
     discard_staged_archive_outputs
     exit 1
 }
-set_pending_archive_push
+# A full disk (the repack above can cause one) must not end the run before
+# the push and the summary: the next run re-detects the snapshot as a
+# local-only commit.
+if ! set_pending_archive_push; then
+    echo "jsonl-export: could not mark the snapshot pending for push; pushing now, and the next run re-detects it as a local-only commit" >&2
+fi
 
 if should_attempt_push; then
     PUSH_STATUS="ok"

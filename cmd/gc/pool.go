@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"text/template"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/agent"
@@ -246,47 +245,15 @@ func parseScaleCheckCount(agentName, check, out string) (int, error) {
 	return n, nil
 }
 
-// SessionSetupContext holds template variables for session_setup command expansion.
-type SessionSetupContext struct {
-	Session   string // tmux session name
-	Agent     string // qualified agent name
-	AgentBase string // unqualified agent name or pool instance name
-	Rig       string // rig name (empty for city-scoped)
-	RigRoot   string // absolute path to the rig root (empty for city-scoped)
-	CityRoot  string // city directory path
-	CityName  string // workspace name
-	WorkDir   string // agent working directory
-	ConfigDir string // source directory where agent config was defined
-	// DefaultBranch mirrors workdir.PathContext.DefaultBranch: the rig's
-	// configured mainline branch, empty for city-scoped agents and for rigs
-	// with no default_branch. Configured value only — prompts'
-	// {{.DefaultBranch}} additionally falls back to a live origin/HEAD probe,
-	// but setup-command expansion runs on reconciler hot paths and must not
-	// spawn git. Setup scripts should keep their own probe fallback.
-	DefaultBranch string
-}
+// SessionSetupContext holds template variables for session_setup command
+// expansion. It is the shared workdir type so the API resume path renders
+// start_command through the same context (ga-b1u4yg).
+type SessionSetupContext = workdirutil.SessionSetupContext
 
 // expandSessionSetup expands Go text/template strings in session_setup commands.
 // On parse or execute error, the raw command is kept (graceful fallback).
 func expandSessionSetup(cmds []string, ctx SessionSetupContext) []string {
-	if len(cmds) == 0 {
-		return nil
-	}
-	result := make([]string, len(cmds))
-	for i, raw := range cmds {
-		tmpl, err := template.New("setup").Parse(raw)
-		if err != nil {
-			result[i] = raw
-			continue
-		}
-		var buf bytes.Buffer
-		if err := tmpl.Execute(&buf, ctx); err != nil {
-			result[i] = raw
-			continue
-		}
-		result[i] = buf.String()
-	}
-	return result
+	return workdirutil.ExpandSessionTemplates(cmds, ctx)
 }
 
 // deepCopyAgent creates a deep copy of a config.Agent with a new name and dir.

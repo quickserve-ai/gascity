@@ -401,6 +401,7 @@ func encodeWitnessBead(stream *canonicalStream, bead beads.Bead) error {
 	stream.text(bead.ParentID)
 	stream.text(bead.Ref)
 	stream.text(bead.Description)
+	stream.text(bead.AwaitType)
 	stream.list("needs", bead.Needs)
 	stream.list("labels", labels)
 	stream.text(witnessStorageTier(bead))

@@ -403,6 +403,7 @@ export const zDep = z.object({
 
 export const zBead = z.object({
     assignee: z.string().optional(),
+    await_type: z.string().optional(),
     created_at: z.iso.datetime(),
     defer_until: z.iso.datetime().optional(),
     dependencies: z.array(zDep).nullish(),
@@ -1431,8 +1432,13 @@ export const zRigCreateSucceededPayload = z.object({
     rig: z.string()
 });
 
+export const zRigDoctorPatch = z.object({
+    CensusOwnerNamespace: z.string().nullable()
+});
+
 export const zRigPatch = z.object({
     DefaultBranch: z.string().nullable(),
+    Doctor: zRigDoctorPatch.optional(),
     FormulaVars: z.record(z.string(), z.string()),
     Name: z.string(),
     Path: z.string().nullable(),

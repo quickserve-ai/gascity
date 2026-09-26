@@ -607,6 +607,61 @@ func TestApplyRigPatchFormulaVars(t *testing.T) {
 	})
 }
 
+func TestApplyRigPatchDoctorCensusOwnerNamespace(t *testing.T) {
+	t.Run("patch sets the namespace", func(t *testing.T) {
+		cfg := &City{Rigs: []Rig{{Name: "gascity", Path: "/gascity"}}}
+		err := ApplyPatches(cfg, Patches{
+			Rigs: []RigPatch{{
+				Name:   "gascity",
+				Doctor: &RigDoctorPatch{CensusOwnerNamespace: ptrStr("gastownhall/gascity")},
+			}},
+		})
+		if err != nil {
+			t.Fatalf("ApplyPatches: %v", err)
+		}
+		if got := cfg.Rigs[0].Doctor.CensusOwnerNamespace; got != "gastownhall/gascity" {
+			t.Errorf("Doctor.CensusOwnerNamespace = %q, want %q", got, "gastownhall/gascity")
+		}
+	})
+
+	t.Run("patch can clear the namespace", func(t *testing.T) {
+		cfg := &City{Rigs: []Rig{{
+			Name:   "gascity",
+			Path:   "/gascity",
+			Doctor: RigDoctorConfig{CensusOwnerNamespace: "gastownhall/gascity"},
+		}}}
+		err := ApplyPatches(cfg, Patches{
+			Rigs: []RigPatch{{
+				Name:   "gascity",
+				Doctor: &RigDoctorPatch{CensusOwnerNamespace: ptrStr("")},
+			}},
+		})
+		if err != nil {
+			t.Fatalf("ApplyPatches: %v", err)
+		}
+		if got := cfg.Rigs[0].Doctor.CensusOwnerNamespace; got != "" {
+			t.Errorf("Doctor.CensusOwnerNamespace = %q, want empty", got)
+		}
+	})
+
+	t.Run("patch without a doctor table leaves the namespace unchanged", func(t *testing.T) {
+		cfg := &City{Rigs: []Rig{{
+			Name:   "gascity",
+			Path:   "/gascity",
+			Doctor: RigDoctorConfig{CensusOwnerNamespace: "gastownhall/gascity"},
+		}}}
+		err := ApplyPatches(cfg, Patches{
+			Rigs: []RigPatch{{Name: "gascity", Suspended: ptrBool(true)}},
+		})
+		if err != nil {
+			t.Fatalf("ApplyPatches: %v", err)
+		}
+		if got := cfg.Rigs[0].Doctor.CensusOwnerNamespace; got != "gastownhall/gascity" {
+			t.Errorf("Doctor.CensusOwnerNamespace = %q, want %q (untouched)", got, "gastownhall/gascity")
+		}
+	})
+}
+
 func TestApplyPatches_RigNotFound(t *testing.T) {
 	cfg := &City{
 		Rigs: []Rig{{Name: "hw", Path: "/path"}},

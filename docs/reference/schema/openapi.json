@@ -911,6 +911,9 @@
           "assignee": {
             "type": "string"
           },
+          "await_type": {
+            "type": "string"
+          },
           "created_at": {
             "format": "date-time",
             "type": "string"
@@ -6899,6 +6902,21 @@
         ],
         "type": "object"
       },
+      "RigDoctorPatch": {
+        "additionalProperties": false,
+        "properties": {
+          "CensusOwnerNamespace": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "CensusOwnerNamespace"
+        ],
+        "type": "object"
+      },
       "RigPatch": {
         "additionalProperties": false,
         "properties": {
@@ -6907,6 +6925,9 @@
               "string",
               "null"
             ]
+          },
+          "Doctor": {
+            "$ref": "#/components/schemas/RigDoctorPatch"
           },
           "FormulaVars": {
             "additionalProperties": {

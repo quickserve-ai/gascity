@@ -1161,6 +1161,7 @@ type BackendCredentialResolvedPayload struct {
 // Bead defines model for Bead.
 type Bead struct {
 	Assignee     *string            `json:"assignee,omitempty"`
+	AwaitType    *string            `json:"await_type,omitempty"`
 	CreatedAt    time.Time          `json:"created_at"`
 	DeferUntil   *time.Time         `json:"defer_until,omitempty"`
 	Dependencies *[]Dep             `json:"dependencies,omitempty"`
@@ -3353,9 +3354,15 @@ type RigCreateSucceededPayload struct {
 	Rig string `json:"rig"`
 }
 
+// RigDoctorPatch defines model for RigDoctorPatch.
+type RigDoctorPatch struct {
+	CensusOwnerNamespace *string `json:"CensusOwnerNamespace"`
+}
+
 // RigPatch defines model for RigPatch.
 type RigPatch struct {
 	DefaultBranch    *string           `json:"DefaultBranch"`
+	Doctor           *RigDoctorPatch   `json:"Doctor,omitempty"`
 	FormulaVars      map[string]string `json:"FormulaVars"`
 	Name             string            `json:"Name"`
 	Path             *string           `json:"Path"`

@@ -282,6 +282,7 @@ export type BackendCredentialResolvedPayload = {
 
 export type Bead = {
     assignee?: string;
+    await_type?: string;
     created_at: string;
     defer_until?: string;
     dependencies?: Array<Dep> | null;
@@ -2821,8 +2822,13 @@ export type RigCreateSucceededPayload = {
     rig: string;
 };
 
+export type RigDoctorPatch = {
+    CensusOwnerNamespace: string | null;
+};
+
 export type RigPatch = {
     DefaultBranch: string | null;
+    Doctor?: RigDoctorPatch;
     FormulaVars: {
         [key: string]: string;
     };

@@ -695,11 +695,14 @@ func (s *Server) resolveSessionRuntimeWithMetadata(info session.Info, metadata m
 				if err == nil {
 					candidateWorkDir, workDirErr := s.resolveSessionWorkDir(agentCfg, agentCfg.QualifiedName())
 					if workDirErr == nil {
-						resolved = candidate
 						workDir = candidateWorkDir
 						if info.WorkDir != "" {
 							workDir = info.WorkDir
 						}
+						// Render a templated start_command for this session
+						// the way the reconciler's create path does, before
+						// anything compares against it (ga-b1u4yg).
+						resolved = s.renderResolvedCommandForSession(cfg, agentCfg, info, workDir, candidate)
 						configuredTransport = config.ResolveSessionCreateTransport(agentCfg.Session, resolved)
 					}
 				}
@@ -727,6 +730,43 @@ func (s *Server) resolveSessionRuntimeWithMetadata(info session.Info, metadata m
 		transport = "acp"
 	}
 	return resolved, workDir, transport, transport == "" && legacyACPTransportAmbiguous(resolved, configuredTransport, info.Command, metadata)
+}
+
+// renderResolvedCommandForSession renders the templated launch command
+// (start_command) of a provider resolved through agentCfg for the TARGET
+// session, with the same renderer and SessionSetupContext fields the
+// reconciler's create path uses (cmd/gc resolveTemplate Step 11). Without it
+// the API resume path launched the raw template — the control dispatcher's
+// `--follow {{.Agent}}` — and the runtime died (ga-b1u4yg).
+func (s *Server) renderResolvedCommandForSession(cfg *config.City, agentCfg config.Agent, info session.Info, workDir string, resolved *config.ResolvedProvider) *config.ResolvedProvider {
+	return s.renderResolvedCommandForNewSession(cfg, agentCfg, sessionRenderQualifiedName(info, agentCfg), info.SessionName, firstNonEmptyString(workDir, info.WorkDir), resolved)
+}
+
+// renderResolvedCommandForNewSession renders a resolved provider's templated
+// launch command for a session under the concrete identity, session name, and
+// work dir the caller computed — the create paths' form of
+// renderResolvedCommandForSession (ga-b1u4yg).
+func (s *Server) renderResolvedCommandForNewSession(cfg *config.City, agentCfg config.Agent, qualifiedName, sessionName, workDir string, resolved *config.ResolvedProvider) *config.ResolvedProvider {
+	if cfg == nil || resolved == nil {
+		return resolved
+	}
+	cityPath := s.state.CityPath()
+	return workdirutil.RenderResolvedProviderCommandForSession(resolved, cityPath, workdirutil.CityName(cityPath, cfg), qualifiedName, agentCfg, cfg.Rigs, sessionName, workDir)
+}
+
+// sessionRenderQualifiedName is the qualified identity a stored session's
+// templates render with: a configured named session's identity, else the
+// persisted agent_name (which the reconciler stamps with the named identity or
+// the canonical pool-instance identity), else the stored template. It mirrors
+// the precedence of cmd/gc's reconciler rediscovery chain, which this package
+// cannot import.
+func sessionRenderQualifiedName(info session.Info, agentCfg config.Agent) string {
+	if info.ConfiguredNamedSession {
+		if identity := session.NamedSessionIdentityInfo(info); identity != "" {
+			return identity
+		}
+	}
+	return firstNonEmptyString(info.AgentName, info.Template, agentCfg.QualifiedName())
 }
 
 // resolveBareProvider resolves a provider by name without an agent template.

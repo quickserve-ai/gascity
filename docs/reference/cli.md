@@ -153,7 +153,8 @@ merely SEES in a shared rig store?
 
 Exit codes:
   0  local    this city can answer this identity's liveness
-  1  foreign  well-formed identity absent from this city's roster — protect it
+  1  foreign  well-formed identity absent from this city's roster, or a session
+             bead ID minted by a store this city does not own — protect it
   2  unknown  this city cannot answer (no config, bad usage) — protect it
 
 "local" is not a claim that the identity is ALIVE. Liveness is a separate
@@ -2656,7 +2657,10 @@ a non-running recipient. Unread mail alone does not request a wake.
 Use --from to override the sender identity.
 Use --to as an alternative to the positional &lt;to&gt; argument.
 Use -s/--subject for the summary line and -m/--message for the body text.
-Use --all to broadcast to all live sessions (excluding sender and "human").
+Use --all to broadcast to every OPEN session (excluding sender and "human").
+Configured seats with no open session get nothing; --all names them on stderr
+(and in --json "unreached"). For a policy-bearing broadcast, mail those seats
+by address, which materializes them.
 
 Use --dedup &lt;key&gt; for repeating notifications (patrol and cooldown orders
 that re-detect the same condition every run): the send is suppressed while
@@ -2677,6 +2681,17 @@ if it has a session whose alias equals that string (a rig named after the
 sending city) the message binds to that session — do not name a rig after a
 city that mails you. --all and --notify are refused for a remote city.
 
+When [mail.crosscity] is configured, a recipient may be city-qualified:
+&lt;city&gt;/&lt;address&gt;, split on the first "/". This city's own name strips to the
+local form (&lt;city&gt;/mayor and mayor are one mailbox); a listed peer city's
+address is stored canonical as written, with no local session lookup, and the
+sender is stored city-qualified so a plain reply resolves back. --notify does
+not cross cities: the recipient's wake belongs to its own city's mail sweep.
+A peer city mapped to a town under [mail.crosscity.towns] is also checked
+against that town's rendered roster (cities/&lt;town&gt;/agents.json, read from the
+local pack cache at its pinned commit): a seat absent from the list, or a
+list that cannot be read, refuses the send before anything is stored.
+
 ```
 gc mail send [<to>] [<body>] [flags]
 ```
@@ -2696,7 +2711,7 @@ gc mail send worker -s "disk warning" --dedup "disk-warn:hq"
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--all` | bool |  | broadcast to all live sessions (excludes sender and human) |
+| `--all` | bool |  | broadcast to every open session (excludes sender and human); names configured seats it could not reach |
 | `--dedup` | string |  | suppress the send while a live message with this dedup key is in the same mailbox (provider permitting) |
 | `--from` | string |  | sender identity (default: $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human") |
 | `--json` | bool |  | emit JSONL result |
