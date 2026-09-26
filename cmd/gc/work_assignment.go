@@ -374,21 +374,36 @@ func liveWorkAssignmentAssigneeMatches(store beads.Store, id, expectedStatus, ex
 	if store == nil || id == "" || expectedStatus == "" {
 		return false, nil
 	}
+	wb, found, err := liveWorkAssignmentRow(store, id, expectedStatus)
+	if err != nil || !found {
+		return false, err
+	}
+	return strings.TrimSpace(wb.Assignee) == strings.TrimSpace(expectedAssignee), nil
+}
+
+// liveWorkAssignmentRow returns the live row for id when it still holds
+// expectedStatus. found is false when the bead has left that status (or no
+// longer exists); a read failure is returned as an error, never as a verdict.
+func liveWorkAssignmentRow(store beads.Store, id, expectedStatus string) (beads.Bead, bool, error) {
+	id = strings.TrimSpace(id)
+	expectedStatus = strings.TrimSpace(expectedStatus)
+	if store == nil || id == "" || expectedStatus == "" {
+		return beads.Bead{}, false, nil
+	}
 	work, err := store.List(beads.ListQuery{
 		Status:   expectedStatus,
 		Live:     true,
 		TierMode: beads.TierBoth,
 	})
 	if err != nil {
-		return false, fmt.Errorf("live work-assignment verification of %q: %w", id, err)
+		return beads.Bead{}, false, fmt.Errorf("live work-assignment verification of %q: %w", id, err)
 	}
 	for _, wb := range work {
-		if wb.ID != id {
-			continue
+		if wb.ID == id {
+			return wb, true, nil
 		}
-		return strings.TrimSpace(wb.Assignee) == strings.TrimSpace(expectedAssignee), nil
 	}
-	return false, nil
+	return beads.Bead{}, false, nil
 }
 
 // ReassignWorkBead re-homes one WORK bead onto a new session identity, emitting
