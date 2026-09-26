@@ -195,13 +195,35 @@ func mailWakeRef(target nudgeTarget, ref, mailBeadID string) string {
 	return notifyBeadRefPrefix + mailBeadID
 }
 
+// resolveMailWakeTarget resolves the session to wake for a stored mailbox.
+// A mailbox with no rig qualifier belongs to a city-scoped seat: rig-scoped
+// mailboxes are stored qualified ("qcore/barry"). From inside a rig the bare
+// name also matches that rig's seat of the same name, so when it is ambiguous
+// the wake retries the rooted form, which names the city seat from any cwd.
+// Without this, "/barry" stored as "barry" and then failed its own wake
+// (ga-mk8tp4, review finding 1).
+func resolveMailWakeTarget(recipient string, resolve func(string) (nudgeTarget, error)) (nudgeTarget, error) {
+	target, err := resolve(recipient)
+	if errors.Is(err, session.ErrAmbiguous) && !strings.Contains(recipient, "/") {
+		return resolve(session.CityScopePrefix + recipient)
+	}
+	return target, err
+}
+
+func discardNudgeTargetResolver(identifier string) (nudgeTarget, error) {
+	return resolveNudgeTarget(identifier, io.Discard)
+}
+
 // newMailNudgeFunc notifies a mail recipient from sender, passing the mail
 // message id as the notice's cause (sendMailNotifyRecorded). Under require a
 // notice the op journal cannot record is refused before the recipient
 // resolves, so it materializes no configured named session's row.
 func newMailNudgeFunc(sender, ref string) nudgeFunc {
 	return func(recipient, messageID string) (string, error) {
-		target, err := resolveMessageOpTarget(recipient, mailNotifyOpRequest(mailNotifyText(sender), messageID), io.Discard)
+		req := mailNotifyOpRequest(mailNotifyText(sender), messageID)
+		target, err := resolveMailWakeTarget(recipient, func(identifier string) (nudgeTarget, error) {
+			return resolveMessageOpTarget(identifier, req, io.Discard)
+		})
 		if errors.Is(err, errMessageOpRefused) {
 			return "", mailNotifyRefusedError(messageID)
 		}
@@ -2456,7 +2478,7 @@ func cmdMailSendJSONFull(args []string, notify bool, all bool, from string, to s
 		// with --ref. Resolution failures fall through — the nudge path
 		// surfaces them after the send exactly as before.
 		if cloudWakeGuardApplies(foreign, nf != nil, canonicalTo, ref) {
-			if target, terr := resolveNudgeTarget(canonicalTo, io.Discard); terr == nil &&
+			if target, terr := resolveMailWakeTarget(canonicalTo, discardNudgeTargetResolver); terr == nil &&
 				strings.TrimSpace(target.agent.WakeTransport) == config.WakeTransportClaudeCloud {
 				fmt.Fprintf(stderr, "gc mail send: recipient %q is a cloud-wake seat (wake_transport=%s); pass --ref <https URL into its GitHub working surface> so its wake hint points at content it can reach (its sandbox cannot read bead:// refs), or --no-notify to send mail without a wake\n", canonicalTo, config.WakeTransportClaudeCloud) //nolint:errcheck // best-effort stderr
 				return 1
