@@ -3711,6 +3711,15 @@ func TestInstallSupervisorLaunchdBootsOutGastownDaemonBeforeBootstrap(t *testing
 	gcHome := filepath.Join(t.TempDir(), "isolated-home")
 	t.Setenv("HOME", homeDir)
 	t.Setenv("GC_HOME", gcHome)
+	// The legacy gastown agent is booted out only when it was ever installed
+	// (gc-pk1x): this test is the installed case, so its plist exists.
+	legacyPlist := filepath.Join(homeDir, "Library", "LaunchAgents", legacyGastownLaunchdLabel+".plist")
+	if err := os.MkdirAll(filepath.Dir(legacyPlist), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyPlist, []byte("<plist/>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	gcPath := filepath.Join(t.TempDir(), "gc")
 	if err := os.WriteFile(gcPath, []byte("#!/bin/sh\nprintf 'gc version test\\n'\n"), 0o700); err != nil {

@@ -6,4 +6,9 @@ description = "Export Dolt databases to JSONL git archive"
 exec = "$PACK_DIR/assets/scripts/jsonl-export.sh"
 trigger = "cooldown"
 interval = "15m"
+# The script repacks the archive on its commit path. The first run against an
+# archive that is already far behind packs the whole backlog (minutes; about
+# nine for 7.5 GiB of loose blobs at a loaded host), and the exec default of
+# 300s would kill it before anything is recorded or pushed, on every run.
+timeout = "30m"
 skip_aliases = ["mol-dog-jsonl"]

@@ -18,12 +18,14 @@ import (
 // / session.State / session.MetadataPatch, and beads.Bead / SetMetadataBatch /
 // Update / Close are confined inside the impl.
 //
-// PHASE 0 STATUS: these write methods are the skeleton front door. Their
-// SIGNATURES are the contract Phase 4 routes call sites through; the bodies
-// already emit byte-identical bead writes to the raw ops they replace
-// (ApplyPatch == setMetaBatch == store.SetMetadataBatch with empty-skip), so a
-// recording-fake store can prove parity now. No production caller is routed
-// through them yet — that is Phase 4/5.
+// STATUS: these write methods are the session front door and are WIRED:
+// production reconciler, wait, soft-reload and CLI paths call ApplyPatch /
+// ApplyPatchInfo. The bodies emit byte-identical bead writes to the raw ops
+// they replaced (ApplyPatch == setMetaBatch == store.SetMetadataBatch with
+// empty-skip). The migration is NOT complete: raw SetMetadata /
+// SetMetadataBatch calls on session beads remain in cmd/gc, so "single write
+// chokepoint" below describes the design, not a guarantee. Before relying on
+// it, grep cmd/gc for raw SetMetadata* on session beads (ga-1wq7u5).
 
 // ApplyPatch applies a MetadataPatch to the session bead identified by id. It is
 // the single write chokepoint for session metadata transitions: every typed

@@ -7301,6 +7301,55 @@ func TestBuildDesiredState_SuspendedNamedSession_DoesNotMaterialize(t *testing.T
 	}
 }
 
+func TestBuildDesiredState_SuspendedAgentsExistingNamedSessionBeadIsNotRediscovered(t *testing.T) {
+	// ga-9qanni: a nudge or claim backstop materialized an on-demand named
+	// session bead for an agent patched suspended=true, and the session-bead
+	// rediscovery backfill put it back into desired state, so the reconciler
+	// STARTED it (platform/gastown.refinery, 2026-09-23 22:52:24Z). The
+	// backfill already skipped a suspended RIG; a suspended AGENT must be
+	// skipped the same way, so the reconciler stops it as "suspended".
+	for _, suspended := range []bool{true, false} {
+		t.Run(fmt.Sprintf("suspended=%v", suspended), func(t *testing.T) {
+			cityPath := t.TempDir()
+			store := beads.NewMemStore()
+			if _, err := store.Create(beads.Bead{
+				Title:  "platform/gastown.refinery",
+				Type:   sessionBeadType,
+				Labels: []string{sessionBeadLabel, "template:refinery"},
+				Metadata: map[string]string{
+					"template":                  "refinery",
+					"agent_name":                "refinery",
+					"alias":                     "refinery",
+					"session_name":              "refinery",
+					"session_origin":            "named",
+					"configured_named_session":  "true",
+					"configured_named_identity": "refinery",
+					"configured_named_mode":     "on_demand",
+					"state":                     "start-pending",
+					"pending_create_claim":      "true",
+				},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			cfg := &config.City{
+				Workspace: config.Workspace{Name: "test-city"},
+				Agents: []config.Agent{{
+					Name:              "refinery",
+					StartCommand:      "true",
+					MaxActiveSessions: intPtr(1),
+					Suspended:         suspended,
+				}},
+				NamedSessions: []config.NamedSession{{Template: "refinery", Mode: "on_demand"}},
+			}
+			dsResult := buildDesiredState("test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), store, io.Discard)
+			_, desired := dsResult.State["refinery"]
+			if desired == suspended {
+				t.Fatalf("existing named-session bead in desired state = %v with agent suspended=%v, want %v", desired, suspended, !suspended)
+			}
+		})
+	}
+}
+
 func TestBuildDesiredState_ProductionDemandSkipsSuspendedAgentScaleCheck(t *testing.T) {
 	cityPath := t.TempDir()
 	store := beads.NewMemStore()

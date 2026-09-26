@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/url"
 	"strings"
 	"time"
@@ -398,12 +399,21 @@ func (s *Server) humaHandleMailSend(ctx context.Context, input *MailSendInput) (
 		return nil, apierr.InvalidRequest.Msg("no mail provider available")
 	}
 
+	// A message that crosses cities stores this city's sender city-qualified
+	// so the recipient's plain reply resolves back here.
+	from := input.Body.From
+	if roster := s.mailCityRoster(); roster.Enabled() {
+		if kind, _ := roster.ResolveCityAddress(resolved); kind == mail.CityAddressForeign {
+			from = roster.QualifySender(from)
+		}
+	}
+
 	// Idempotency: send at most once per Idempotency-Key. On replay the closure
 	// is skipped entirely, so no duplicate Send, telemetry op, or MailSent event
 	// fires. The helper guarantees the reservation is released on a send error.
 	msg, err := withIdempotency(s.idem, "/v0/mail", input.IdempotencyKey, input.Body,
 		func() (mail.Message, error) {
-			sent, sendErr := mp.Send(input.Body.From, resolved, input.Body.Subject, input.Body.Body)
+			sent, sendErr := mp.Send(from, resolved, input.Body.Subject, input.Body.Body)
 			telemetry.RecordMailOp(ctx, "send", sendErr)
 			if sendErr != nil {
 				return mail.Message{}, apierr.Internal.Msg(sendErr.Error())
@@ -668,7 +678,36 @@ func (s *Server) humaHandleMailReply(ctx context.Context, input *MailReplyInput)
 				return mail.Message{}, apierr.MailNotFound.Msg("message " + id + " not found")
 			}
 
-			sent, replyErr := mp.Reply(id, input.Body.From, input.Body.Subject, input.Body.Body)
+			// A reply into a foreign-origin thread crosses cities: store
+			// this city's sender city-qualified so the far side's plain
+			// reply resolves back here.
+			from := input.Body.From
+			if roster := s.mailCityRoster(); roster.Enabled() {
+				// Fail closed: without the thread origin the cross-city
+				// rules (unknown-city refusal, sender qualification) cannot
+				// be applied, and a reply must never cross with a bare sender.
+				orig, getErr := mp.Get(id)
+				if getErr != nil {
+					return mail.Message{}, apierr.Internal.Msg("cross_city_origin_unverified: cannot verify thread origin for cross-city rules: " + getErr.Error())
+				}
+				// A thread whose origin names a city this roster does not
+				// know is refused, never written to a literal mailbox nobody
+				// polls.
+				if refuse := mail.RefuseUnknownCity(mail.ErrUnresolvedCityProbe, orig.From, roster, s.state.Config().LocalAddressPrefixes()); refuse != nil && !errors.Is(refuse, mail.ErrUnresolvedCityProbe) {
+					return mail.Message{}, apierr.InvalidRequest.Msg("reply origin " + refuse.Error())
+				}
+				if kind, _ := roster.ResolveCityAddress(orig.From); kind == mail.CityAddressForeign {
+					// The one exception to the roster refusal: the
+					// thread's peer id already resolved once, so the
+					// reply is written; a roster that now disagrees is
+					// logged, not obeyed.
+					if seatErr := roster.CheckForeignSeat(orig.From); seatErr != nil {
+						log.Printf("mail reply %s: warning: roster mismatch for the thread's peer: %s; the reply is written into the existing thread", id, mail.RosterMismatchDetail(seatErr))
+					}
+					from = roster.QualifySender(from)
+				}
+			}
+			sent, replyErr := mp.Reply(id, from, input.Body.Subject, input.Body.Body)
 			telemetry.RecordMailOp(ctx, "reply", replyErr)
 			if replyErr != nil {
 				return mail.Message{}, apierr.Internal.Msg(replyErr.Error())

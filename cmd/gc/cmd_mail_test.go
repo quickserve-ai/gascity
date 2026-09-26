@@ -1548,6 +1548,141 @@ func TestResolveMailRecipientIdentity_BareRigScopedNamedRejectsAmbiguousLiveConf
 	}
 }
 
+// ga-mk8tp4: a city seat and a rig seat share the bare name "barry". From inside
+// the rig, "/barry" must reach the city seat, and bare "barry" must refuse while
+// naming an address for each candidate. Both seats are LIVE, so the send path's
+// live-session matcher (which runs before the config resolver) is exercised too.
+func TestResolveMailRecipientIdentity_RootedAddressReachesTheCitySeatFromARigCwd(t *testing.T) {
+	t.Setenv("GC_SESSION", "fake")
+	rigDir := t.TempDir()
+	t.Setenv("GC_DIR", rigDir)
+
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Rigs:      []config.Rig{{Name: "qcore", Path: rigDir}},
+		Agents: []config.Agent{
+			{Name: "barry", StartCommand: "true"},
+			{Name: "barry", Dir: "qcore", StartCommand: "true"},
+		},
+		NamedSessions: []config.NamedSession{
+			{Template: "barry", Mode: "always"},
+			{Template: "barry", Dir: "qcore", Mode: "always"},
+		},
+	}
+	for _, identity := range []string{"barry", "qcore/barry"} {
+		if _, err := store.Create(beads.Bead{
+			Type:   session.BeadType,
+			Labels: []string{session.LabelSession},
+			Metadata: map[string]string{
+				"alias":                     identity,
+				"session_name":              strings.ReplaceAll(identity, "/", "--"),
+				"configured_named_session":  "true",
+				"configured_named_identity": identity,
+				"configured_named_mode":     "always",
+			},
+		}); err != nil {
+			t.Fatalf("Create(%s): %v", identity, err)
+		}
+	}
+	if got := currentRigContext(cfg); got != "qcore" {
+		t.Fatalf("currentRigContext = %q, want qcore (the test must run from inside the rig)", got)
+	}
+
+	address, err := resolveMailRecipientIdentity(t.TempDir(), cfg, store, "/barry")
+	if err != nil {
+		t.Fatalf("resolveMailRecipientIdentity(/barry) from the qcore rig: %v", err)
+	}
+	if address != "barry" {
+		t.Fatalf("address = %q, want the city seat barry", address)
+	}
+
+	_, err = resolveMailRecipientIdentity(t.TempDir(), cfg, store, "barry")
+	if !errors.Is(err, session.ErrAmbiguous) {
+		t.Fatalf("resolveMailRecipientIdentity(barry) = %v, want ErrAmbiguous", err)
+	}
+	if !strings.Contains(err.Error(), "/barry") || !strings.Contains(err.Error(), "qcore/barry") {
+		t.Fatalf("error = %q, want it to name /barry and qcore/barry", err)
+	}
+}
+
+// ga-mk8tp4 (review finding 1): "/barry" from inside the rig is stored under
+// the bare mailbox "barry", and the send's wake step (newMailNudgeFunc, and the
+// cloud-wake guard) resolves that stored mailbox again. In rig context bare
+// "barry" is ambiguous, so the send printed "Sent message" and then "nudge
+// failed". The wake must reach the city seat. The resolver here is the real
+// session-ID resolution chain resolveNudgeTarget runs, over an in-memory city.
+func TestResolveMailWakeTarget_StoredCityMailboxWakesTheCitySeatFromARigCwd(t *testing.T) {
+	t.Setenv("GC_SESSION", "fake")
+	rigDir := t.TempDir()
+	t.Setenv("GC_DIR", rigDir)
+	cityPath := t.TempDir()
+
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Rigs:      []config.Rig{{Name: "qcore", Path: rigDir}},
+		Agents: []config.Agent{
+			{Name: "barry", StartCommand: "true"},
+			{Name: "barry", Dir: "qcore", StartCommand: "true"},
+		},
+		NamedSessions: []config.NamedSession{
+			{Template: "barry", Mode: "always"},
+			{Template: "barry", Dir: "qcore", Mode: "always"},
+		},
+	}
+	ids := map[string]string{}
+	for _, identity := range []string{"barry", "qcore/barry"} {
+		b, err := store.Create(beads.Bead{
+			Type:   session.BeadType,
+			Labels: []string{session.LabelSession},
+			Metadata: map[string]string{
+				"alias":                     identity,
+				"session_name":              strings.ReplaceAll(identity, "/", "--"),
+				"configured_named_session":  "true",
+				"configured_named_identity": identity,
+				"configured_named_mode":     "always",
+			},
+		})
+		if err != nil {
+			t.Fatalf("Create(%s): %v", identity, err)
+		}
+		ids[identity] = b.ID
+	}
+	if got := currentRigContext(cfg); got != "qcore" {
+		t.Fatalf("currentRigContext = %q, want qcore (the test must run from inside the rig)", got)
+	}
+	resolve := func(identifier string) (nudgeTarget, error) {
+		id, err := resolveSessionIDWithConfig(cityPath, cfg, store, identifier)
+		return nudgeTarget{sessionID: id}, err
+	}
+
+	// Preflight: the stored mailbox, re-resolved bare in rig context, is
+	// ambiguous. Without this the test below could pass vacuously.
+	if _, err := resolve("barry"); !errors.Is(err, session.ErrAmbiguous) {
+		t.Fatalf("bare barry from the rig = %v, want ErrAmbiguous", err)
+	}
+
+	address, err := resolveMailRecipientIdentity(cityPath, cfg, store, "/barry")
+	if err != nil {
+		t.Fatalf("resolveMailRecipientIdentity(/barry): %v", err)
+	}
+	target, err := resolveMailWakeTarget(address, resolve)
+	if err != nil {
+		t.Fatalf("resolveMailWakeTarget(%q) from the qcore rig: %v", address, err)
+	}
+	if target.sessionID != ids["barry"] {
+		t.Fatalf("wake target = %q, want the city seat %q (rig seat is %q)", target.sessionID, ids["barry"], ids["qcore/barry"])
+	}
+
+	// A rig-qualified mailbox still wakes the rig seat and never takes the
+	// rooted retry.
+	target, err = resolveMailWakeTarget("qcore/barry", resolve)
+	if err != nil || target.sessionID != ids["qcore/barry"] {
+		t.Fatalf("resolveMailWakeTarget(qcore/barry) = %q, %v; want %q", target.sessionID, err, ids["qcore/barry"])
+	}
+}
+
 // --- gc mail inbox ---
 
 type recordingMailInboxReader struct {
@@ -5396,5 +5531,192 @@ func TestCmdMailSendAllFlagBodyWinsOverPositional(t *testing.T) {
 	msg := mailSendTestFindMessage(t, cityPath)
 	if msg.Description != "flag body" {
 		t.Errorf("Description = %q, want %q (--all -m flag body should win over positional)", msg.Description, "flag body")
+	}
+}
+
+func TestResolveMailRecipientIdentity_NameSquatStillResolvesTheConfiguredMailbox(t *testing.T) {
+	// ga-isa3j4, the field shape (krieger 2026-09-19): a live bead holds a
+	// rig-scoped named session's RUNTIME name (qcore--barry) without being that
+	// session. Mail resolution failed on the conflict, so `gc mail send`
+	// refused and STORED NOTHING. The squatter does not answer to the mailbox
+	// address (qcore/barry), so the mail resolves to the configured mailbox and
+	// is stored.
+	store := beads.NewMemStore()
+	cityPath := t.TempDir()
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Rigs:          []config.Rig{{Name: "qcore", Path: filepath.Join(cityPath, "qcore")}},
+		Agents:        []config.Agent{{Name: "barry", Dir: "qcore", StartCommand: "true"}},
+		NamedSessions: []config.NamedSession{{Template: "barry", Dir: "qcore"}},
+	}
+	spec, ok := findNamedSessionSpec(cfg, config.EffectiveCityName(cfg, filepath.Base(cityPath)), "qcore/barry")
+	if !ok {
+		t.Fatal("findNamedSessionSpec(qcore/barry) = false")
+	}
+	if spec.SessionName == spec.Identity {
+		t.Fatalf("fixture: session_name %q must differ from identity %q", spec.SessionName, spec.Identity)
+	}
+	if _, err := store.Create(beads.Bead{
+		Title:  "squatter",
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"session_name": spec.SessionName,
+			"template":     "other",
+			"agent_name":   "other",
+			"state":        "asleep",
+		},
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := resolveSessionIDWithConfig(cityPath, cfg, store, "qcore/barry"); !errors.Is(err, errNamedSessionConflict) {
+		t.Fatalf("fixture: resolveSessionIDWithConfig err = %v, want the squat conflict", err)
+	}
+	got, err := resolveMailRecipientIdentity(cityPath, cfg, store, "qcore/barry")
+	if err != nil {
+		t.Fatalf("resolveMailRecipientIdentity(qcore/barry) = %v, want the configured mailbox despite the squat", err)
+	}
+	if got != spec.Identity {
+		t.Fatalf("recipient = %q, want configured identity %q", got, spec.Identity)
+	}
+}
+
+func TestResolveMailRecipientIdentity_RuntimeNameEqualToIdentityStillRefuses(t *testing.T) {
+	// When the runtime name IS the mailbox address (city-scoped default
+	// template: session_name "mayor"), the squatter's API inbox lists it, so
+	// delivery would leak. Refuse, as before.
+	store := beads.NewMemStore()
+	cityPath := t.TempDir()
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Agents:        []config.Agent{{Name: "mayor", StartCommand: "true"}},
+		NamedSessions: []config.NamedSession{{Template: "mayor"}},
+	}
+	spec, _ := findNamedSessionSpec(cfg, config.EffectiveCityName(cfg, filepath.Base(cityPath)), "mayor")
+	if _, err := store.Create(beads.Bead{
+		Type:     session.BeadType,
+		Labels:   []string{session.LabelSession},
+		Metadata: map[string]string{"session_name": spec.SessionName, "template": "other", "agent_name": "other", "state": "asleep"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveMailRecipientIdentity(cityPath, cfg, store, "mayor"); err == nil {
+		t.Fatal("runtime-name squat on the mailbox address resolved; want the refusal")
+	}
+}
+
+func TestResolveMailRecipientIdentity_AliasSquatStillRefuses(t *testing.T) {
+	// Review 2026-09-23: a squatter holding the configured identity as its
+	// ALIAS lists that address in its own inbox. Falling through would store
+	// the configured seat's mail where the squatter reads it, so this shape
+	// keeps the loud refusal.
+	store := beads.NewMemStore()
+	cityPath := t.TempDir()
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Agents:        []config.Agent{{Name: "mayor", StartCommand: "true"}},
+		NamedSessions: []config.NamedSession{{Template: "mayor"}},
+	}
+	if _, err := store.Create(beads.Bead{
+		Title:  "alias squatter",
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "mayor",
+			"session_name": "other-runtime",
+			"template":     "other",
+			"agent_name":   "other",
+			"state":        "asleep",
+		},
+	}); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if _, err := resolveMailRecipientIdentity(cityPath, cfg, store, "mayor"); err == nil {
+		t.Fatal("alias squat resolved a recipient; want the refusal (the squatter would read the mail)")
+	}
+}
+
+func TestResolveMailRecipientIdentity_TwoSquattersOneHoldingTheAliasStillRefuses(t *testing.T) {
+	// Review 2026-09-23 (second round): the conflict lookup reports ONE bead.
+	// With one bead on the runtime name and another holding the identity as
+	// its alias, checking only the reported bead let the mail through to an
+	// address the alias holder reads. Any live bead answering to the mailbox
+	// must keep the refusal.
+	store := beads.NewMemStore()
+	cityPath := t.TempDir()
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Rigs:          []config.Rig{{Name: "qcore", Path: filepath.Join(cityPath, "qcore")}},
+		Agents:        []config.Agent{{Name: "barry", Dir: "qcore", StartCommand: "true"}},
+		NamedSessions: []config.NamedSession{{Template: "barry", Dir: "qcore"}},
+	}
+	spec, ok := findNamedSessionSpec(cfg, config.EffectiveCityName(cfg, filepath.Base(cityPath)), "qcore/barry")
+	if !ok {
+		t.Fatal("findNamedSessionSpec(qcore/barry) = false")
+	}
+	var ids []string
+	for _, md := range []map[string]string{
+		{"session_name": spec.SessionName, "template": "other", "agent_name": "other", "state": "asleep"},
+		{"session_name": "rogue-runtime", "alias": spec.Identity, "template": "other", "agent_name": "other", "state": "active"},
+	} {
+		b, err := store.Create(beads.Bead{Type: session.BeadType, Labels: []string{session.LabelSession}, Metadata: md})
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		ids = append(ids, b.ID)
+	}
+	if _, err := resolveSessionIDWithConfig(cityPath, cfg, store, "qcore/barry"); !errors.Is(err, errNamedSessionConflict) {
+		t.Fatalf("fixture: resolveSessionIDWithConfig err = %v, want the squat conflict", err)
+	}
+	got, err := resolveMailRecipientIdentity(cityPath, cfg, store, "qcore/barry")
+	if err == nil {
+		t.Fatalf("resolved %q with an alias holder live; want the refusal (it would read the mail)", got)
+	}
+	// ga-lm5coj: the conflict error advises closing the runtime-name holder,
+	// but the reader is the other bead. The refusal must say that acting on
+	// the named bead alone will not unblock the send.
+	if want := "session bead " + ids[1] + " (not " + ids[0] + ")"; !strings.Contains(err.Error(), want) ||
+		!strings.Contains(err.Error(), "will not unblock this send") {
+		t.Fatalf("err = %q, want it to name the reader %s apart from the conflict bead %s", err, ids[1], ids[0])
+	}
+}
+
+func TestResolveMailRecipientIdentity_SquatWithOnlyTheSeatsOwnArchivedBeadStillResolves(t *testing.T) {
+	// ga-isa3j4 review round 3: the seat's own archived bead keeps its alias
+	// and is not canonical. It is the seat, not a squatter; treating it as an
+	// alias holder re-creates the lost-mail bug for exactly the field shape
+	// (a drained seat whose runtime name another bead took).
+	store := beads.NewMemStore()
+	cityPath := t.TempDir()
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Rigs:          []config.Rig{{Name: "qcore", Path: filepath.Join(cityPath, "qcore")}},
+		Agents:        []config.Agent{{Name: "barry", Dir: "qcore", StartCommand: "true"}},
+		NamedSessions: []config.NamedSession{{Template: "barry", Dir: "qcore"}},
+	}
+	spec, ok := findNamedSessionSpec(cfg, config.EffectiveCityName(cfg, filepath.Base(cityPath)), "qcore/barry")
+	if !ok {
+		t.Fatal("findNamedSessionSpec(qcore/barry) = false")
+	}
+	for _, md := range []map[string]string{
+		{
+			session.NamedSessionMetadataKey: "true", session.NamedSessionIdentityMetadata: spec.Identity, "alias": spec.Identity,
+			"session_name": "old-runtime", "state": "archived", "continuity_eligible": "false",
+		},
+		{"session_name": spec.SessionName, "template": "other", "agent_name": "other", "state": "asleep"},
+	} {
+		if _, err := store.Create(beads.Bead{Type: session.BeadType, Labels: []string{session.LabelSession}, Metadata: md}); err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+	}
+	if _, err := resolveSessionIDWithConfig(cityPath, cfg, store, "qcore/barry"); !errors.Is(err, errNamedSessionConflict) {
+		t.Fatalf("fixture: resolveSessionIDWithConfig err = %v, want the squat conflict", err)
+	}
+	got, err := resolveMailRecipientIdentity(cityPath, cfg, store, "qcore/barry")
+	if err != nil {
+		t.Fatalf("resolveMailRecipientIdentity = %v, want the configured mailbox (the archived bead is the seat)", err)
+	}
+	if got != spec.Identity {
+		t.Fatalf("recipient = %q, want %q", got, spec.Identity)
 	}
 }

@@ -354,3 +354,20 @@ func TestApplyOverrides_ReportsEveryBadOverride(t *testing.T) {
 		t.Errorf("patrol Interval = %q, want %q", aa[0].Interval, "5m")
 	}
 }
+
+func TestApplyOverridesRunStaleAfter(t *testing.T) {
+	t.Parallel()
+
+	// A shared-pack formula order whose runs legitimately outlast the watchdog's
+	// 6h default must be tunable from the deployment, not only in pack source.
+	aa := []Order{{Name: "digest-generate", Formula: "mol-digest-generate", Trigger: "cooldown", Interval: "24h"}}
+	if err := ApplyOverrides(aa, []Override{{Name: "digest-generate", RunStaleAfter: strPtr("18h")}}); err != nil {
+		t.Fatalf("ApplyOverrides: %v", err)
+	}
+	if aa[0].RunStaleAfter != "18h" {
+		t.Errorf("override run_stale_after not applied: RunStaleAfter = %q, want %q", aa[0].RunStaleAfter, "18h")
+	}
+	if got := aa[0].RunStaleAfterOrDefault(); got != 18*time.Hour {
+		t.Errorf("RunStaleAfterOrDefault() = %v, want %v", got, 18*time.Hour)
+	}
+}

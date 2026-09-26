@@ -195,8 +195,18 @@ func workflowTraceWarnOpenFailure(path string, err error) {
 }
 
 func workflowTraceWarnf(writer io.Writer, dedupeKey, format string, args ...any) {
-	if writer == nil {
+	if !claimWorkflowTraceWarning(writer, dedupeKey) {
 		return
+	}
+	fmt.Fprintf(writer, format, args...) //nolint:errcheck // best-effort stderr
+}
+
+// claimWorkflowTraceWarning reports whether dedupeKey has not yet been warned
+// about in writer's warning scope (see useWorkflowTraceWarnings), marking it
+// warned. Outside any scope every claim succeeds. A nil writer never claims.
+func claimWorkflowTraceWarning(writer io.Writer, dedupeKey string) bool {
+	if writer == nil {
+		return false
 	}
 	workflowTraceWarnings.mu.Lock()
 	warned := workflowTraceWarnings.warned
@@ -212,12 +222,12 @@ func workflowTraceWarnf(writer io.Writer, dedupeKey, format string, args ...any)
 	if warned != nil {
 		if _, alreadyWarned := warned[dedupeKey]; alreadyWarned {
 			workflowTraceWarnings.mu.Unlock()
-			return
+			return false
 		}
 		warned[dedupeKey] = struct{}{}
 	}
 	workflowTraceWarnings.mu.Unlock()
-	fmt.Fprintf(writer, format, args...) //nolint:errcheck // best-effort stderr
+	return true
 }
 
 // useWorkflowTraceWarnings installs a per-command warning sink. Nested callers
@@ -454,9 +464,20 @@ func drainWorkflowServeWork(agentCfg config.Agent, cityPath, storePath, workQuer
 		idlePolls = 0
 		processedThisCycle := false
 		pendingCount := 0
+		notControlCount := 0
 		for _, candidate := range queue {
 			beadID := candidate.ID
 			kind := strings.TrimSpace(candidate.Metadata[beadmeta.KindMetadataKey])
+			// A listed gc.kind outside the control set is definitive: skip
+			// it without dispatching (ga-k74enr). A row listed with no
+			// gc.kind still goes to the dispatcher, which reads the bead
+			// itself and refuses it with errNotControlBead if it is not a
+			// control bead -- the listing alone is not trusted to say so.
+			if listed := candidate.Metadata[beadmeta.KindMetadataKey]; listed != "" && !beadmeta.IsControlKind(listed) {
+				notControlCount++
+				reportWorkflowServeNotControlKind(stderr, candidate, listed)
+				continue
+			}
 			workflowTracef("serve process bead=%s kind=%s store=%s", beadID, kind, storePath)
 			// controlDispatcherServe currently returns nil both when it
 			// successfully advanced a control bead AND when ProcessControl
@@ -468,6 +489,11 @@ func drainWorkflowServeWork(agentCfg config.Agent, cityPath, storePath, workQuer
 			// `process-control ... skip reason=bead_not_open` line inside
 			// ProcessControl itself; see runtime.go.
 			if err := controlDispatcherServe(cityPath, storePath, beadID, io.Discard, stderr); err != nil {
+				if errors.Is(err, errNotControlBead) {
+					notControlCount++
+					reportWorkflowServeNotControlKind(stderr, candidate, candidate.Metadata[beadmeta.KindMetadataKey])
+					continue
+				}
 				if errors.Is(err, dispatch.ErrControlPending) {
 					pendingCount++
 					result.pendingAny = true
@@ -507,7 +533,32 @@ func drainWorkflowServeWork(agentCfg config.Agent, cityPath, storePath, workQuer
 			workflowTracef("serve pending-queue agent=%s count=%d", agentCfg.QualifiedName(), pendingCount)
 			return result, nil
 		}
+		if notControlCount > 0 {
+			// Only beads this dispatcher must not execute are left; they stay
+			// ready, so re-querying now would spin on them.
+			workflowTracef("serve not-control-kind-queue agent=%s count=%d", agentCfg.QualifiedName(), notControlCount)
+			return result, nil
+		}
 	}
+}
+
+// reportWorkflowServeNotControlKind records that the serve loop skipped a bead
+// whose gc.kind is not a control kind, leaving it untouched: never processed,
+// never quarantined. It reports once per bead per serve invocation, to both
+// stderr and the workflow trace, naming the route the bead was listed under.
+func reportWorkflowServeNotControlKind(stderr io.Writer, candidate hookBead, kind string) {
+	if !claimWorkflowTraceWarning(stderr, "not-control-kind:"+candidate.ID) {
+		return
+	}
+	route := ""
+	for _, key := range []string{beadmeta.RunTargetMetadataKey, beadmeta.RoutedToMetadataKey} {
+		if value := candidate.Metadata[key]; value != "" {
+			route = key + "=" + value
+			break
+		}
+	}
+	workflowTracef("serve skip bead=%s kind=%s matched=%s reason=not_control_kind", candidate.ID, kind, route)
+	fmt.Fprintf(stderr, "gc convoy control --serve: skipped bead=%s kind=%q reason=not_control_kind (left open, not quarantined)\n", candidate.ID, kind) //nolint:errcheck // best-effort stderr
 }
 
 func runWorkflowServeFollow(agentCfg config.Agent, cityPath, storePath, workQuery string, workEnv map[string]string, stderr io.Writer) error {
@@ -786,14 +837,25 @@ func workflowServeControlReadyQueryForBeads(agentCfg config.Agent, beadsCfg conf
 	if beadsCfg.UsesBD105ReadySemantics() {
 		includeEphemeral = " --include-ephemeral"
 	}
-	// Keep these two conditions in lockstep with mergeControlReadyGroups: mid-
+	// Keep these conditions in lockstep with mergeControlReadyGroups: mid-
 	// instantiation beads are hidden, and so are the steps of a pour that
 	// aborted partway (molecule_failed), which are unworkable and can only emit
-	// one escalation per step (ga-033u0e).
+	// one escalation per step (ga-033u0e), and so is any bead whose gc.kind is
+	// not a control kind, which ProcessControl cannot execute (ga-k74enr).
+	// Unlike the in-process path (evaluateControlReady), this shell form can
+	// only apply them after each bd call's --limit; it is the never-executed
+	// twin (TestWorkflowServeControlReadyQueryShellFallbackUnreachable).
+	quotedControlKinds := make([]string, len(beadmeta.ControlKinds))
+	for i, kind := range beadmeta.ControlKinds {
+		quotedControlKinds[i] = fmt.Sprintf("%q", kind)
+	}
+	controlKinds := "[" + strings.Join(quotedControlKinds, ",") + "]"
 	jqFilter := fmt.Sprintf(
-		`reduce add[] as $item ([]; if (($item.metadata // {})[%q] // "") != "" then . elif (($item.metadata // {})[%q] // "") == "true" then . elif any(.[]; .id == $item.id) then . else . + [$item] end)`,
+		`reduce add[] as $item ([]; if (($item.metadata // {})[%q] // "") != "" then . elif (($item.metadata // {})[%q] // "") == "true" then . elif (%s | any(.[]; . == (($item.metadata // {})[%q] // "")) | not) then . elif any(.[]; .id == $item.id) then . else . + [$item] end)`,
 		beadmeta.InstantiatingMetadataKey,
 		beadmeta.MoleculeFailedMetadataKey,
+		controlKinds,
+		beadmeta.KindMetadataKey,
 	)
 	jqFilter = strings.ReplaceAll(jqFilter, `\`, `\\`)
 	jqFilter = strings.ReplaceAll(jqFilter, `"`, `\"`)

@@ -153,7 +153,8 @@ merely SEES in a shared rig store?
 
 Exit codes:
   0  local    this city can answer this identity's liveness
-  1  foreign  well-formed identity absent from this city's roster — protect it
+  1  foreign  well-formed identity absent from this city's roster, or a session
+             bead ID minted by a store this city does not own — protect it
   2  unknown  this city cannot answer (no config, bad usage) — protect it
 
 "local" is not a claim that the identity is ALIVE. Liveness is a separate
@@ -2679,6 +2680,17 @@ far side knows which city to answer with 'gc --context &lt;city&gt; mail send';
 if it has a session whose alias equals that string (a rig named after the
 sending city) the message binds to that session — do not name a rig after a
 city that mails you. --all and --notify are refused for a remote city.
+
+When [mail.crosscity] is configured, a recipient may be city-qualified:
+&lt;city&gt;/&lt;address&gt;, split on the first "/". This city's own name strips to the
+local form (&lt;city&gt;/mayor and mayor are one mailbox); a listed peer city's
+address is stored canonical as written, with no local session lookup, and the
+sender is stored city-qualified so a plain reply resolves back. --notify does
+not cross cities: the recipient's wake belongs to its own city's mail sweep.
+A peer city mapped to a town under [mail.crosscity.towns] is also checked
+against that town's rendered roster (cities/&lt;town&gt;/agents.json, read from the
+local pack cache at its pinned commit): a seat absent from the list, or a
+list that cannot be read, refuses the send before anything is stored.
 
 ```
 gc mail send [<to>] [<body>] [flags]

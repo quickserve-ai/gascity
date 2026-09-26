@@ -254,8 +254,12 @@ func filterReadyByRoute(ready []beads.Bead, metadataKey, route string) []beads.B
 // ready either -- the next cook of the same graph.v2 root key closes the failed
 // subtree outright rather than re-dispatching it.
 //
+// It drops beads whose gc.kind is not a control kind (ga-k74enr) for the same
+// lockstep reason; evaluateControlReady has already removed them before the
+// per-tier caps, so on the Go path this check never fires.
+//
 // Both dispatch surfaces must agree: the jq fallback in dispatch_runtime.go
-// encodes this same pair of conditions. A filter that lands on only one of them
+// encodes these same conditions. A filter that lands on only one of them
 // leaves the defect live on whichever path the city happens to take.
 func mergeControlReadyGroups(groups ...[]beads.Bead) []beads.Bead {
 	seen := make(map[string]struct{})
@@ -271,6 +275,9 @@ func mergeControlReadyGroups(groups ...[]beads.Bead) []beads.Bead {
 			if beadmeta.MoleculeFailed(b.Metadata[beadmeta.MoleculeFailedMetadataKey]) {
 				continue
 			}
+			if !isControlKindBead(b.Metadata) {
+				continue
+			}
 			seen[b.ID] = struct{}{}
 			merged = append(merged, b)
 		}
@@ -283,16 +290,120 @@ func mergeControlReadyGroups(groups ...[]beads.Bead) []beads.Bead {
 // fallback), applying the exact candidate precedence, legacy/bare route
 // aliasing, and instantiating-metadata dedup that
 // workflowServeControlReadyQueryForBeads encodes as shell.
+//
+// Beads whose gc.kind is not a control kind are dropped from the whole ready
+// set BEFORE any tier applies its workflowServeScanLimit cap (ga-k74enr). The
+// dispatcher cannot execute them -- ProcessControl refuses any kind outside
+// beadmeta.ControlKinds -- and when they were admitted, a workflow root routed
+// to the control target was quarantined (closed hard-failed). Dropping them
+// only after the cap would still let a backlog of such beads fill the
+// oldest-N window and starve the real control beads behind it.
 func evaluateControlReady(ready []beads.Bead, parsed parsedControlReadyQuery, envList []string) []beads.Bead {
+	candidates := controlReadyCandidates(parsed, envList)
+	routes := controlReadyRoutes(parsed)
+	ready = dropNonControlKindReady(ready, candidates, routes)
 	var groups [][]beads.Bead
-	for _, cand := range controlReadyCandidates(parsed, envList) {
+	for _, cand := range candidates {
 		groups = append(groups, filterReadyByAssignee(ready, cand, workflowServeScanLimit))
 	}
-	for _, route := range controlReadyRoutes(parsed) {
+	for _, route := range routes {
 		groups = append(groups, filterReadyByRoute(ready, beadmeta.RunTargetMetadataKey, route))
 		groups = append(groups, filterReadyByRoute(ready, beadmeta.RoutedToMetadataKey, route))
 	}
 	return mergeControlReadyGroups(groups...)
+}
+
+// isControlKindBead reports whether a bead's gc.kind is one the control
+// dispatcher can execute. beadmeta.IsControlKind is the authoritative set; the
+// value is compared exactly, as dispatch.ProcessControl's switch compares it.
+func isControlKindBead(metadata map[string]string) bool {
+	return beadmeta.IsControlKind(metadata[beadmeta.KindMetadataKey])
+}
+
+// notControlKindTraced remembers which bead IDs the readiness scan has
+// already reported as dropped, so a bead that stays ready and routed is
+// traced once per process instead of on every tick.
+var notControlKindTraced = struct {
+	mu  sync.Mutex
+	ids map[string]struct{}
+}{ids: map[string]struct{}{}}
+
+// notControlKindTracedCap bounds notControlKindTraced; past it the set is
+// reset, which at worst re-traces a bead once more.
+const notControlKindTracedCap = 4096
+
+func claimNotControlKindTrace(beadID string) bool {
+	notControlKindTraced.mu.Lock()
+	defer notControlKindTraced.mu.Unlock()
+	if _, ok := notControlKindTraced.ids[beadID]; ok {
+		return false
+	}
+	if len(notControlKindTraced.ids) >= notControlKindTracedCap {
+		notControlKindTraced.ids = map[string]struct{}{}
+	}
+	notControlKindTraced.ids[beadID] = struct{}{}
+	return true
+}
+
+// dropNonControlKindReady returns ready without the beads whose gc.kind is
+// not a control kind. A dropped bead that this dispatcher would otherwise
+// have matched -- assigned to one of its candidates, or unassigned and routed
+// to one of its routes -- is traced (once per bead ID per process) with the
+// assignee or route it matched, so it does not vanish silently.
+//
+// The per-bead line is deduped, so a misrouted bead that stays open and ready
+// would otherwise be visible exactly once per dispatcher process. Every scan
+// that drops at least one matched bead therefore also writes one undeduped
+// count line, so a trace read at any later time still shows that misrouted
+// work is sitting on this dispatcher's routes.
+func dropNonControlKindReady(ready []beads.Bead, candidates, routes []string) []beads.Bead {
+	kept := make([]beads.Bead, 0, len(ready))
+	dropped := 0
+	for _, b := range ready {
+		if isControlKindBead(b.Metadata) {
+			kept = append(kept, b)
+			continue
+		}
+		matched := controlReadyMatch(b, candidates, routes)
+		if matched == "" {
+			continue
+		}
+		dropped++
+		if !claimNotControlKindTrace(b.ID) {
+			continue
+		}
+		workflowTracef("serve control-ready skip bead=%s kind=%s matched=%s reason=not_control_kind",
+			b.ID, b.Metadata[beadmeta.KindMetadataKey], matched)
+	}
+	if dropped > 0 {
+		workflowTracef("serve control-ready dropped-non-control count=%d", dropped)
+	}
+	return kept
+}
+
+// controlReadyMatch names the assignee or route through which b would reach
+// this control dispatcher's readiness scan, or "" when it would not.
+func controlReadyMatch(b beads.Bead, candidates, routes []string) string {
+	if b.Assignee != "" {
+		for _, cand := range candidates {
+			if b.Assignee == cand {
+				return "assignee=" + cand
+			}
+		}
+		return ""
+	}
+	for _, key := range []string{beadmeta.RunTargetMetadataKey, beadmeta.RoutedToMetadataKey} {
+		value := b.Metadata[key]
+		if value == "" {
+			continue
+		}
+		for _, route := range routes {
+			if value == route {
+				return key + "=" + route
+			}
+		}
+	}
+	return ""
 }
 
 func beadsToHookBeads(items []beads.Bead) []hookBead {
