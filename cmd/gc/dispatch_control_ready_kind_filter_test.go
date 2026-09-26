@@ -112,6 +112,7 @@ func TestEvaluateControlReadyAssigneeTierDropsNonControlKindBeforeCap(t *testing
 // vanish silently, and a bead that stays ready must not spam the trace on
 // every tick.
 func TestEvaluateControlReadyTracesNonControlKindOnce(t *testing.T) {
+	resetNotControlKindTracedForTest(t)
 	tracePath := filepath.Join(t.TempDir(), "workflow-trace.log")
 	t.Setenv("GC_WORKFLOW_TRACE", tracePath)
 	t.Setenv("GC_SLING_TRACE", "")
@@ -131,10 +132,23 @@ func TestEvaluateControlReadyTracesNonControlKindOnce(t *testing.T) {
 	if err != nil && !os.IsNotExist(err) {
 		t.Fatalf("read trace: %v", err)
 	}
-	var skipLines []string
+	var skipLines, countLines []string
 	for _, line := range strings.Split(string(raw), "\n") {
 		if strings.Contains(line, "reason=not_control_kind") {
 			skipLines = append(skipLines, line)
+		}
+		if strings.Contains(line, "serve control-ready dropped-non-control count=") {
+			countLines = append(countLines, line)
+		}
+	}
+	// The per-tick count line is NOT deduped: a misrouted bead that stays
+	// ready stays visible on every scan, counting only beads on our routes.
+	if len(countLines) != 3 {
+		t.Fatalf("dropped-non-control count lines = %d, want 1 per tick (3); trace:\n%s", len(countLines), raw)
+	}
+	for _, line := range countLines {
+		if !strings.Contains(line, "count=1") {
+			t.Fatalf("count line %q, want count=1 (the bead routed elsewhere is not ours)", line)
 		}
 	}
 	if len(skipLines) != 1 {
@@ -371,4 +385,18 @@ func TestRunWorkflowServeSkipsNonControlKindWithoutQuarantine(t *testing.T) {
 	if strings.Contains(stderr.String(), "quarantined bead=") {
 		t.Fatalf("stderr = %q, want no quarantine", stderr.String())
 	}
+}
+
+// resetNotControlKindTracedForTest empties the process-global once-per-bead
+// trace set before and after the calling test, so the "traced once" assertion
+// holds under -count=N and does not depend on test order.
+func resetNotControlKindTracedForTest(t *testing.T) {
+	t.Helper()
+	reset := func() {
+		notControlKindTraced.mu.Lock()
+		notControlKindTraced.ids = map[string]struct{}{}
+		notControlKindTraced.mu.Unlock()
+	}
+	reset()
+	t.Cleanup(reset)
 }
