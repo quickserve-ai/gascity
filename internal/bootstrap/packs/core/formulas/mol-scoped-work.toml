@@ -195,6 +195,20 @@ needs = ["body"]
 description = """
 Remove the temporary worktree after the body reaches terminal state.
 
+The body reaching a terminal state does not mean the work is finished with its
+tree. After a hand-off submit the work bead is still open and its convoy still
+live, and the tree can be a running session's working directory. So the step
+first DECLINES (ga-6xehc5): while the work bead is not closed, the convoy is
+not closed, and work_dir names a tree that exists and is not empty, nothing is
+rescued or removed and work_dir is kept. The decline comments once on the work
+bead (a repeat decline for the same tree does not comment again), emits a
+`mol-scoped-work.cleanup-declined` event, and stops with a line beginning
+`DECLINED:`. Close a declined step as a HARD failure (gc.outcome=fail,
+gc.failure_class=hard, gc.failure_reason set to that line): attempts run back
+to back, so a retry sees the same state, and the retry runner has no outcome
+for "not an attempt". A status or tree that cannot be read counts as in use,
+so the step stops rather than tears down.
+
 The worktree may hold the only copy of the work: uncommitted edits, untracked
 files, or commits on a detached HEAD that no ref reaches. Teardown therefore
 SECURES LOCALLY FIRST and removes second (ga-w805wc):
@@ -230,6 +244,39 @@ WORKTREE=$(printf '%s' "$BEAD_JSON" | jq -er '.[0].metadata.work_dir // ""') || 
 if [ -z "$WORKTREE" ]; then
   echo "cleanup-worktree: $WORK_BEAD_ID records no work_dir; nothing to tear down"
   exit 0
+fi
+# Decline while the work may still be in use. A failed status read stops the
+# step; only a closed bead or a closed convoy lets teardown go ahead.
+BEAD_STATE=$(printf '%s' "$BEAD_JSON" | jq -er '.[0].status | strings') || exit 1
+CONVOY_STATE=$(printf '%s' "$CONVOY_STATUS" | jq -er '.convoy.status | strings') || exit 1
+# The tree is in use unless ls proves it empty or absent (ENOENT); an
+# unreadable tree counts as in use. gc worktree rescue --absent-ok, not this
+# probe, still decides whether an absent tree's pointer may be cleared.
+TREE_LS=$(LC_ALL=C command ls -A -- "$WORKTREE" 2>&1)
+TREE_RC=$?
+TREE_IN_USE=yes
+if [ "$TREE_RC" -eq 0 ] && [ -z "$TREE_LS" ]; then
+  TREE_IN_USE=no
+elif [ "$TREE_RC" -ne 0 ]; then
+  case "$TREE_LS" in
+    *": No such file or directory") TREE_IN_USE=no ;;
+  esac
+fi
+if [ "$BEAD_STATE" != "closed" ] && [ "$CONVOY_STATE" != "closed" ] && [ "$TREE_IN_USE" = "yes" ]; then
+  DECLINED="DECLINED: work bead $WORK_BEAD_ID open with live convoy {{convoy_id}}; worktree preserved"
+  NOTE_HEAD="cleanup-worktree declined to tear down $WORKTREE:"
+  # A failed lookup is not proof the comment is missing: skip it, still decline.
+  COMMENTS=$(gc bd comments "$WORK_BEAD_ID" --json) &&
+    SEEN=$(printf '%s' "$COMMENTS" | jq -r --arg head "$NOTE_HEAD" 'any((. // [])[]; (.text // "") | startswith($head))') ||
+    SEEN=unknown
+  if [ "$SEEN" = "false" ]; then
+    gc bd comment "$WORK_BEAD_ID" "$NOTE_HEAD work bead $WORK_BEAD_ID is $BEAD_STATE and convoy {{convoy_id}} is $CONVOY_STATE, so the tree may still be in use. No rescue, no teardown; work_dir is kept." || echo "cleanup-worktree: could not comment on $WORK_BEAD_ID" >&2
+  elif [ "$SEEN" != "true" ]; then
+    echo "cleanup-worktree: could not read comments on $WORK_BEAD_ID; not commenting" >&2
+  fi
+  gc event emit mol-scoped-work.cleanup-declined --subject "$WORK_BEAD_ID" --message "$DECLINED" --payload "$(jq -cn --arg bead "$WORK_BEAD_ID" --arg convoy "{{convoy_id}}" --arg worktree "$WORKTREE" '{bead: $bead, convoy: $convoy, worktree: $worktree}')"
+  echo "$DECLINED" >&2
+  exit 1
 fi
 # Whether the worktree is gone is decided by gc (ENOENT only): a shell
 # existence test also reads an UNREADABLE path as absent and would clear the
