@@ -2586,14 +2586,26 @@ func doMailSendAllCoverage(mp mail.Provider, rec events.Recorder, validRecipient
 	var sent []mailMessageSummary
 	sentTo := map[string]bool{}
 	notified := false
+	// A failure for one recipient does not stop the broadcast. Stopping at
+	// recipient k told the operator to re-send, and the re-run duplicated to
+	// recipients 1..k-1 (ga-0ejdbv review finding 3). Every recipient is
+	// attempted and the summary names exactly who needs what.
+	var lost, failed, unconfirmed []string
 	for _, to := range recipients {
 		m, err := mp.Send(sender, to, subject, body)
 		if err != nil {
-			if code := classifyMailWriteFailure(stderr, fmt.Sprintf("gc mail send --all: sending to %s", to), err); code != 0 {
-				return code
+			switch id, isUnconfirmed := mail.UnconfirmedMessageID(err); {
+			case isUnconfirmed:
+				fmt.Fprintf(stderr, "gc mail send --all: sending to %s: DELIVERY UNCONFIRMED as %s: %v\n", to, id, err) //nolint:errcheck // best-effort stderr
+				unconfirmed = append(unconfirmed, fmt.Sprintf("%s (%s)", to, id))
+			case errors.Is(err, beadmail.ErrNotPersisted):
+				fmt.Fprintf(stderr, "gc mail send --all: sending to %s: NOT DELIVERED: %v\n", to, err) //nolint:errcheck // best-effort stderr
+				lost = append(lost, to)
+			default:
+				fmt.Fprintf(stderr, "gc mail send --all: sending to %s: %v\n", to, err) //nolint:errcheck // best-effort stderr
+				failed = append(failed, to)
 			}
-			fmt.Fprintf(stderr, "gc mail send --all: sending to %s: %v\n", to, err) //nolint:errcheck // best-effort stderr
-			return 1
+			continue
 		}
 		rec.Record(events.Event{
 			Type:    events.MailSent,
@@ -2622,10 +2634,42 @@ func doMailSendAllCoverage(mp mail.Provider, rec events.Recorder, validRecipient
 	if len(unreached) > 0 {
 		fmt.Fprintf(stderr, "gc mail send --all: WARNING: reached %d open mailbox(es); %d configured named seat(s) had no open session and got NOTHING: %s. --all covers open sessions only; mail each by address to reach it.\n", len(sent), len(unreached), strings.Join(unreached, ", ")) //nolint:errcheck // best-effort stderr
 	}
+	if code := reportMailSendAllFailures(stderr, len(sent), lost, failed, unconfirmed); code != 0 {
+		return code
+	}
 	if jsonOut {
 		return writeCLIJSONLineOrExit(stdout, stderr, "gc mail send", mailActionResult{SchemaVersion: "1", OK: true, Command: "mail.send", Action: "send", Messages: sent, Count: intRef(len(sent)), Notified: notified, Unreached: unreached})
 	}
 	return 0
+}
+
+// reportMailSendAllFailures summarizes a broadcast's per-recipient failures
+// so a follow-up touches only the recipients that need it: a verified-absent
+// message is re-sent to exactly those recipients, an unconfirmed one is
+// checked by ID first. The exit code is the most actionable verdict present:
+// verified loss (5), then any other failure (1), then unconfirmed (6).
+func reportMailSendAllFailures(stderr io.Writer, delivered int, lost, failed, unconfirmed []string) int {
+	if len(lost)+len(failed)+len(unconfirmed) == 0 {
+		return 0
+	}
+	fmt.Fprintf(stderr, "gc mail send --all: delivered to %d recipient(s); do NOT re-run --all, which would send them a second copy.\n", delivered) //nolint:errcheck // best-effort stderr
+	if len(lost) > 0 {
+		fmt.Fprintf(stderr, "  NOT DELIVERED, re-send to each by address: %s\n", strings.Join(lost, ", ")) //nolint:errcheck // best-effort stderr
+	}
+	if len(failed) > 0 {
+		fmt.Fprintf(stderr, "  FAILED (see the errors above), re-send to each by address: %s\n", strings.Join(failed, ", ")) //nolint:errcheck // best-effort stderr
+	}
+	if len(unconfirmed) > 0 {
+		fmt.Fprintf(stderr, "  UNCONFIRMED, may have landed; check each ID with \"gc bd show <id>\" before re-sending: %s\n", strings.Join(unconfirmed, ", ")) //nolint:errcheck // best-effort stderr
+	}
+	switch {
+	case len(lost) > 0:
+		return mailSendNotPersistedExit
+	case len(failed) > 0:
+		return 1
+	default:
+		return mailSendUnconfirmedExit
+	}
 }
 
 // cmdMailInbox is the CLI entry point for checking the inbox.
