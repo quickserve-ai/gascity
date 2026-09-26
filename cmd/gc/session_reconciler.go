@@ -930,6 +930,18 @@ func recordDrainAckAssignedWorkEvent(
 	if !found {
 		return
 	}
+	emitDrainAckAssignedWorkEvent(rec, info, subject, template, strandedBead)
+}
+
+// emitDrainAckAssignedWorkEvent records SessionDrainAckedWithAssignedWork for a
+// bead drainAckClaimableAnomalyBead already found. It is split from the
+// classification so the drain-ack teardown can classify BEFORE it releases the
+// work (after the release the classifier finds nothing) and still record the
+// observation.
+func emitDrainAckAssignedWorkEvent(rec events.Recorder, info sessionpkg.Info, subject, template string, strandedBead beads.Bead) {
+	if rec == nil {
+		return
+	}
 	rec.Record(events.Event{
 		Type:      events.SessionDrainAckedWithAssignedWork,
 		Actor:     "gc",
@@ -1211,6 +1223,49 @@ func finalizeDrainAckStoppedSession(
 			choice = finalizePatch(facts)
 		}
 	}
+	// ga-x99xh0: a pool seat that drain-acked while holding claimable or
+	// in_progress work is torn down and its work released in the same act (see
+	// session_drain_ack_teardown.go), instead of sleeping with the work and being
+	// resumed by it. The classification runs first because the release empties
+	// it; the event it found is the observation and is recorded either way.
+	var ackedWork *beads.Bead
+	if hasAssignedWork && closeIfUnassigned {
+		anomaly, found, anomalyErr := drainAckClaimableAnomalyBead(evidence, info, clk.Now().UTC())
+		if anomalyErr != nil {
+			fmt.Fprintf(stderr, "session reconciler: classifying drain-acked work for %s: %v\n", name, anomalyErr) //nolint:errcheck
+		}
+		if found {
+			ackedWork = &anomaly
+			outcome := tearDownDrainAckedPoolSeat(store, evidence, info, clk.Now().UTC(), stderr)
+			if outcome.closed {
+				if dops != nil {
+					_ = dops.clearDrain(name)
+				}
+				if dt != nil {
+					dt.clearIdleProbe(info.ID)
+					dt.remove(info.ID)
+				}
+				recordStopped(true)
+				emitDrainAckAssignedWorkEvent(rec, info, template, template, anomaly)
+				fmt.Fprintf(stderr, "session reconciler: drain-acked %s held work %s: released its assigned work and closed the seat\n", name, anomaly.ID) //nolint:errcheck
+				return drainAckFinalizeResult{batch: sessionpkg.ClosePatch(clk.Now().UTC(), drainAckTeardownCloseReason), closed: true}
+			}
+			if witnessInfo, err := sessionFrontDoor(store).Get(info.ID); err == nil && witnessInfo.Closed {
+				// Another observer closed the seat (and released its work) first.
+				if dops != nil {
+					_ = dops.clearDrain(name)
+				}
+				if dt != nil {
+					dt.clearIdleProbe(info.ID)
+					dt.remove(info.ID)
+				}
+				recordStopped(false)
+				emitDrainAckAssignedWorkEvent(rec, info, template, template, anomaly)
+				return drainAckFinalizeResult{witnessInfo: &witnessInfo}
+			}
+			fmt.Fprintf(stderr, "session reconciler: drain-acked %s retained holding work %s: retained for %s\n", name, anomaly.ID, outcome.retainedFor) //nolint:errcheck
+		}
+	}
 	// finalizePatch clears restart_requested: a drain-ack that completes a
 	// restart-request cycle (gc session reset → agent drain-ack) must
 	// consume it, or a later cache-reconcile re-emission resurrects it as a
@@ -1279,7 +1334,9 @@ func finalizeDrainAckStoppedSession(
 		dt.remove(info.ID)
 	}
 	recordStopped(true)
-	if hasAssignedWork {
+	if ackedWork != nil {
+		emitDrainAckAssignedWorkEvent(rec, info, template, template, *ackedWork)
+	} else if hasAssignedWork {
 		recordDrainAckAssignedWorkEvent(evidence, info, template, template, name, clk.Now().UTC(), rec, stderr)
 	}
 	// Non-close drain-ack: the snapshot fold is the ApplyPatchInfo result above.
