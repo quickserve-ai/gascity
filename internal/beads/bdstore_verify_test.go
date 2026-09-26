@@ -128,8 +128,9 @@ func TestBdStoreGetConsultsWispsWhenBdShowReturnsEmptySet(t *testing.T) {
 // has not proven the requested ID absent from it — but this branch is also
 // reached by ReleaseIfCurrent's exact-ID guard, which must issue nothing
 // further to bd once it refuses. Covering a marginal case here would put a
-// subprocess on a conditional-release hot path; mail verification resolves
-// through the other two exits and never needs this one. If this test starts
+// subprocess on a conditional-release hot path. Mail verification does not
+// need the lookup either: beadmail reads a collision on its fresh ID as
+// UNCONFIRMED, never as lost (ga-0ejdbv round 2). If this test starts
 // failing because someone added a wisp lookup here, read
 // TestReleaseIfCurrentRefusesAFuzzyIDCollision before "fixing" it.
 func TestBdStoreGetLeavesASubstringCollisionAlone(t *testing.T) {
