@@ -382,6 +382,18 @@ func (s *Server) humaHandleMailGet(ctx context.Context, input *MailGetInput) (*I
 	}, nil
 }
 
+// mailWriteError keeps an UNCONFIRMED mail write distinguishable from a lost
+// one at the API. Both stay 500s (the documented contract; a 202 for
+// unconfirmed is ga-0ejdbv's follow-up), but an unconfirmed write names the
+// message ID and tells the caller to check before retrying, because the
+// message may have landed and a blind retry sends a duplicate.
+func mailWriteError(err error) error {
+	if id, ok := mail.UnconfirmedMessageID(err); ok {
+		return apierr.Internal.Msg("mail_unconfirmed: message " + id + " may have landed but could not be read back; GET it before retrying, a blind retry may send a duplicate: " + err.Error())
+	}
+	return apierr.Internal.Msg(err.Error())
+}
+
 // humaHandleMailSend is the Huma-typed handler for POST /v0/mail.
 // Body validation (To and Subject required, minLength:"1") is enforced by
 // the framework from MailSendInput's struct tags.
@@ -416,7 +428,7 @@ func (s *Server) humaHandleMailSend(ctx context.Context, input *MailSendInput) (
 			sent, sendErr := mp.Send(from, resolved, input.Body.Subject, input.Body.Body)
 			telemetry.RecordMailOp(ctx, "send", sendErr)
 			if sendErr != nil {
-				return mail.Message{}, apierr.Internal.Msg(sendErr.Error())
+				return mail.Message{}, mailWriteError(sendErr)
 			}
 			sent.Rig = input.Body.Rig
 			s.recordMailEvent(events.MailSent, sent.From, sent.ID, input.Body.Rig, &sent)
@@ -710,7 +722,7 @@ func (s *Server) humaHandleMailReply(ctx context.Context, input *MailReplyInput)
 			sent, replyErr := mp.Reply(id, from, input.Body.Subject, input.Body.Body)
 			telemetry.RecordMailOp(ctx, "reply", replyErr)
 			if replyErr != nil {
-				return mail.Message{}, apierr.Internal.Msg(replyErr.Error())
+				return mail.Message{}, mailWriteError(replyErr)
 			}
 			sent.Rig = resolvedRig
 			s.recordMailEvent(events.MailReplied, sent.From, sent.ID, resolvedRig, &sent)

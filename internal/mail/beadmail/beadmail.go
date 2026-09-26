@@ -376,7 +376,7 @@ func (p *Provider) verifyMessageBeadPersisted(id string) error {
 	// loss on that would fail healthy sends under exactly the load that causes
 	// it.
 	if errors.Is(lastErr, beads.ErrVerifyIndeterminate) || !errors.Is(lastErr, beads.ErrNotFound) {
-		return fmt.Errorf("%w: %s: %w", ErrUnconfirmed, id, lastErr)
+		return fmt.Errorf("%w: %w", ErrUnconfirmed, &mail.DeliveryUnconfirmedError{ID: id, Cause: lastErr})
 	}
 	return fmt.Errorf("%w: %s", ErrNotPersisted, id)
 }
