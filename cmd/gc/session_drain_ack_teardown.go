@@ -64,20 +64,35 @@ type drainAckTeardownOutcome struct {
 	attempted   int
 }
 
-// drainAckRetainedNotPoolSeat and drainAckRetainedCloseNotPermitted are the
-// retained_for reasons for a drain-ack with assigned work that the teardown is
-// not allowed to act on: the seat is not a disposable pool seat, or the call site
-// did not grant permission to close it.
+// The retained_for reasons for a drain-ack with assigned work that the teardown
+// is not allowed to act on: the seat is not a disposable pool seat, it is a
+// canonical singleton pool's stable identity, or the call site did not grant
+// permission to close it.
 const (
 	drainAckRetainedNotPoolSeat       = "not_pool_seat"
+	drainAckRetainedSingletonIdentity = "singleton_identity"
 	drainAckRetainedCloseNotPermitted = "close_not_permitted"
 )
 
-// drainAckTeardownEligible reports whether a drain-acked seat is one the teardown
-// may retire: a pool-managed, non-named seat. It is checked BEFORE the work is
-// classified, so a seat the teardown will never act on costs no extra store read.
-func drainAckTeardownEligible(info sessionpkg.Info) bool {
-	return isPoolManagedSessionInfo(info) && !isNamedSessionInfo(info)
+// drainAckTeardownRefusal returns "" when a drain-acked seat is one the teardown
+// may retire — a pool-managed, non-named seat whose agent does not use a
+// canonical singleton identity — and otherwise the retained_for reason. It is
+// checked BEFORE the work is classified, so a seat the teardown will never act
+// on costs no extra store read.
+//
+// A canonical singleton pool (config.Agent.UsesCanonicalSingletonPoolIdentity:
+// max_active_sessions = 1, no namepool) is pool-managed but deliberately keeps
+// one stable configured identity, its bead and its conversation; it is not a
+// disposable seat. A seat whose agent cannot be resolved from config is judged
+// by its bead markers alone.
+func drainAckTeardownRefusal(cfg *config.City, info sessionpkg.Info) string {
+	if !isPoolManagedSessionInfo(info) || isNamedSessionInfo(info) {
+		return drainAckRetainedNotPoolSeat
+	}
+	if agent := sessionAgentConfigInfo(cfg, info); agent != nil && agent.UsesCanonicalSingletonPoolIdentity() {
+		return drainAckRetainedSingletonIdentity
+	}
+	return ""
 }
 
 // tearDownDrainAckedPoolSeat releases the work a drain-acked pool seat still
@@ -98,8 +113,8 @@ func tearDownDrainAckedPoolSeat(
 	if store == nil || info.ID == "" {
 		return drainAckTeardownOutcome{retainedFor: "no_store"}
 	}
-	if !drainAckTeardownEligible(info) {
-		return drainAckTeardownOutcome{retainedFor: drainAckRetainedNotPoolSeat}
+	if refusal := drainAckTeardownRefusal(cfg, info); refusal != "" {
+		return drainAckTeardownOutcome{retainedFor: refusal}
 	}
 	if standing := sessionpkg.StandingSleepIntent(info.SleepIntent); standing != "" {
 		return drainAckTeardownOutcome{retainedFor: "standing_hold:" + string(standing)}
