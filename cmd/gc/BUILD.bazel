@@ -1032,6 +1032,7 @@ go_test(
         "bead_worktree_reaper_integration_test.go",
         "bead_worktree_reaper_lazy_liveness_test.go",
         "bead_worktree_reaper_merged_branch_test.go",
+        "bead_worktree_reaper_quiet_period_test.go",
         "bead_worktree_reaper_skip_dedupe_test.go",
         "bead_worktree_reaper_stash_gate_test.go",
         "bead_worktree_reaper_symlink_test.go",

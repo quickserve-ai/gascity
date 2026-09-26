@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
@@ -44,6 +45,7 @@ func TestReapClosedBeadWorktrees_RepoStashDoesNotProtectCleanWorktree(t *testing
 	if err := os.WriteFile(filepath.Join(dirtyWT, "scratch.txt"), []byte("uncommitted\n"), 0o644); err != nil {
 		t.Fatalf("dirty the worktree: %v", err)
 	}
+	backdateWorktreeActivity(t, dirtyWT, 24*time.Hour) // the write above is not recent use under test
 
 	store := beads.NewMemStoreFrom(1, []beads.Bead{
 		{ID: "ga-clean001", Status: "closed"},
