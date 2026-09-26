@@ -375,7 +375,10 @@ func (p *Provider) verifyMessageBeadPersisted(id string) error {
 	// transport error — means we never got a trustworthy answer, and claiming
 	// loss on that would fail healthy sends under exactly the load that causes
 	// it.
-	if errors.Is(lastErr, beads.ErrVerifyIndeterminate) || !errors.Is(lastErr, beads.ErrNotFound) {
+	// An ID collision (bd resolved a DIFFERENT bead for our fresh ID) is not
+	// proof of absence either: it says only that the lookup did not answer for
+	// this ID, so reporting it as lost would duplicate a message that exists.
+	if errors.Is(lastErr, beads.ErrVerifyIndeterminate) || errors.Is(lastErr, beads.ErrIDCollision) || !errors.Is(lastErr, beads.ErrNotFound) {
 		return fmt.Errorf("%w: %w", ErrUnconfirmed, &mail.DeliveryUnconfirmedError{ID: id, Cause: lastErr})
 	}
 	return fmt.Errorf("%w: %s", ErrNotPersisted, id)
