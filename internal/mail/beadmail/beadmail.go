@@ -47,6 +47,7 @@ type Provider struct {
 	store        beads.Store
 	sessions     session.AddressDirectory
 	sessionCache *sessionInfoCache
+	now          func() time.Time
 }
 
 type sessionInfoCache struct {
@@ -448,8 +449,8 @@ func (p *Provider) Archive(id string) error {
 // ArchiveCandidates returns open messages that match filter without archiving
 // them.
 func (p *Provider) ArchiveCandidates(filter ArchiveFilter) ([]mail.Message, error) {
-	routes := p.recipientRoutesForAll(filter.Recipients)
-	candidates, err := p.messageCandidatesForRoutes(routes)
+	mailbox := p.inboxRoutesForAll(filter.Recipients)
+	candidates, err := p.messageCandidatesForRoutes(mailbox.routes)
 	if err != nil {
 		return nil, fmt.Errorf("beadmail archive matching: %w", err)
 	}
@@ -458,7 +459,7 @@ func (p *Provider) ArchiveCandidates(filter ArchiveFilter) ([]mail.Message, erro
 		if b.Status != "open" {
 			continue
 		}
-		if len(routes) > 0 && !matchesRecipientRoute(routes, b.Assignee) {
+		if !mailbox.admits(b) {
 			continue
 		}
 		msg := beadToMessage(b)
@@ -859,8 +860,8 @@ func (p *Provider) CountRecipients(recipients []string) (int, int, error) {
 	if len(recipients) == 0 {
 		return 0, 0, nil
 	}
-	routes := p.recipientRoutesForAll(recipients)
-	candidates, err := p.messageCandidatesForRoutes(routes)
+	mailbox := p.inboxRoutesForAll(recipients)
+	candidates, err := p.messageCandidatesForRoutes(mailbox.routes)
 	if err != nil {
 		return 0, 0, fmt.Errorf("listing messages: %w", err)
 	}
@@ -869,7 +870,7 @@ func (p *Provider) CountRecipients(recipients []string) (int, int, error) {
 		if b.Status != "open" {
 			continue
 		}
-		if len(routes) > 0 && !matchesRecipientRoute(routes, b.Assignee) {
+		if !mailbox.admits(b) {
 			continue
 		}
 		total++
@@ -887,10 +888,12 @@ func (p *Provider) filterMessages(recipient string, includeRead bool) ([]mail.Me
 }
 
 // filterMessagesForRecipients returns open message beads assigned to any
-// recipient route represented by recipients. Empty recipients mean all routes.
+// recipient route represented by recipients, plus a named seat's recent mail
+// left on its own closed sessions (see inboxRoutes). Empty recipients mean all
+// routes.
 func (p *Provider) filterMessagesForRecipients(recipients []string, includeRead bool) ([]mail.Message, error) {
-	routes := p.recipientRoutesForAll(recipients)
-	candidates, err := p.messageCandidatesForRoutes(routes)
+	mailbox := p.inboxRoutesForAll(recipients)
+	candidates, err := p.messageCandidatesForRoutes(mailbox.routes)
 	if err != nil {
 		return nil, fmt.Errorf("beadmail: listing beads: %w", err)
 	}
@@ -899,7 +902,7 @@ func (p *Provider) filterMessagesForRecipients(recipients []string, includeRead 
 		if b.Status != "open" {
 			continue
 		}
-		if len(routes) > 0 && !matchesRecipientRoute(routes, b.Assignee) {
+		if !mailbox.admits(b) {
 			continue
 		}
 		if !includeRead && hasLabel(b.Labels, "read") {
@@ -1147,44 +1150,51 @@ func restoreMessageWispDeps(store beads.Store, downDeps, upDeps []beads.Dep) err
 // recipient, so mail lands where it was addressed instead of in one of two
 // mailboxes chosen by lookup order.
 func (p *Provider) recipientRoutes(recipient string) []string {
+	routes, _, _ := p.recipientMailbox(recipient)
+	return routes
+}
+
+// recipientMailbox is recipientRoutes that also returns the live session owning
+// the mailbox when the live pass resolved one; live is false otherwise.
+func (p *Provider) recipientMailbox(recipient string) (routes []string, owner session.Info, live bool) {
 	recipient = strings.TrimSpace(recipient)
 	if recipient == "" {
-		return nil
+		return nil, session.Info{}, false
 	}
-	routes := make([]string, 0, 4)
+	routes = make([]string, 0, 4)
 	routes = appendRecipientRoute(routes, recipient)
 	if recipient == "human" || p.sessions == nil {
-		return routes
+		return routes, session.Info{}, false
 	}
 
 	info, err := p.sessions.ResolveMailboxAddress(recipient, false)
 	switch {
 	case err == nil:
-		return appendSessionRecipientRoutes(routes, info)
+		return appendSessionRecipientRoutes(routes, info), info, true
 	case errors.Is(err, session.ErrAmbiguous):
-		return []string{recipient}
+		return []string{recipient}, session.Info{}, false
 	case !errors.Is(err, session.ErrSessionNotFound):
 		log.Printf("beadmail: resolving current session route %q: %v", recipient, err)
-		return routes
+		return routes, session.Info{}, false
 	}
 
 	info, err = p.sessions.ResolveMailboxAddress(recipient, true)
 	switch {
 	case err == nil:
-		return appendSessionRecipientRoutes(routes, info)
+		return appendSessionRecipientRoutes(routes, info), session.Info{}, false
 	case errors.Is(err, session.ErrAmbiguous):
-		return []string{recipient}
+		return []string{recipient}, session.Info{}, false
 	case !errors.Is(err, session.ErrSessionNotFound):
 		log.Printf("beadmail: resolving closed session route %q: %v", recipient, err)
-		return routes
+		return routes, session.Info{}, false
 	}
 
 	all, err := p.cachedSessionBeads()
 	if err != nil {
 		log.Printf("beadmail: listing sessions for historical recipient route %q: %v", recipient, err)
-		return routes
+		return routes, session.Info{}, false
 	}
-	return recipientRoutesByHistoricalAlias(all, recipient, routes)
+	return recipientRoutesByHistoricalAlias(all, recipient, routes), session.Info{}, false
 }
 
 func appendSessionRecipientRoutes(routes []string, info session.Info) []string {
