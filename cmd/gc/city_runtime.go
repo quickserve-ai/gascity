@@ -3138,6 +3138,7 @@ func (cr *CityRuntime) recordReconcileTraceInputs(
 	phaseStart := time.Now()
 	templateNames := make(map[string]struct{})
 	openCounts := make(map[string]int)
+	retainedFor := make(map[string]map[string]int)
 	desiredCounts := make(map[string]int)
 	// Pre-tick baseline: openInfos is the tick's input row feed projected to Info,
 	// captured before the reconciler runs, so these reads are the pre-tick values
@@ -3149,6 +3150,10 @@ func (cr *CityRuntime) recordReconcileTraceInputs(
 		}
 		templateNames[template] = struct{}{}
 		openCounts[template]++
+		if retainedFor[template] == nil {
+			retainedFor[template] = make(map[string]int)
+		}
+		retainedFor[template][openSeatRetentionLabel(info)]++
 		trace.RecordSessionBaseline(template, info.SessionNameMetadata, map[string]any{
 			"state":        info.MetadataState,
 			"sleep_reason": info.SleepReason,
@@ -3171,18 +3176,17 @@ func (cr *CityRuntime) recordReconcileTraceInputs(
 		templateNames[template] = struct{}{}
 	}
 	for _, template := range traceSetStrings(templateNames) {
-		status := TraceEvaluationEligible
-		reason := TraceReasonRetained
-		if desiredCounts[template] == 0 && poolDesired[template] == 0 && openCounts[template] == 0 {
-			status = TraceEvaluationSkipped
-			reason = TraceReasonNoDemand
-		}
-		trace.RecordTemplateSummary(template, "", status, reason, map[string]any{
+		status, reason := templateTickSummaryVerdict(desiredCounts[template], poolDesired[template], openCounts[template])
+		fields := map[string]any{
 			"desired_count":  desiredCounts[template],
 			"open_count":     openCounts[template],
 			"pool_desired":   poolDesired[template],
 			"work_requested": traceWorkRequested[template],
-		})
+		}
+		if held := retainedFor[template]; len(held) > 0 {
+			fields["retained_for"] = held
+		}
+		trace.RecordTemplateSummary(template, "", status, reason, fields)
 	}
 	trace.RecordCycleInputSnapshot(map[string]any{
 		"desired_session_count":               len(desiredState),
