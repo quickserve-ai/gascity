@@ -74,11 +74,48 @@ func classifyMailWriteFailure(stderr io.Writer, cmdLabel string, err error) int 
 		if !ok {
 			id = "<message-id>"
 		}
-		fmt.Fprintf(stderr, "%s: DELIVERY UNCONFIRMED — %v\n", cmdLabel, err)                                                         //nolint:errcheck // best-effort stderr
-		fmt.Fprintf(stderr, "hint: the write may have landed. Confirm with \"%s\" before re-sending.\n", mailStorageCheckCommand(id)) //nolint:errcheck // best-effort stderr
+		fmt.Fprintf(stderr, "%s: DELIVERY UNCONFIRMED — %v\n", cmdLabel, err)                                                       //nolint:errcheck // best-effort stderr
+		fmt.Fprintf(stderr, "hint: the write may have landed. Check with \"%s\" before re-sending.\n", mailStorageCheckCommand(id)) //nolint:errcheck // best-effort stderr
+		fmt.Fprintln(stderr, "      "+mailStorageCheckReading)                                                                      //nolint:errcheck // best-effort stderr
 		return mailSendUnconfirmedExit
 	}
 	return 0
+}
+
+// mailStorageCheckReading tells the operator how to read the check's answer.
+// "absence unproven" means the lookup itself did not finish (check again
+// later), and a plain "not found" can also mean the recipient already
+// archived it, so neither is proof the send was lost (ga-0ejdbv round 4).
+const mailStorageCheckReading = `A message shown = it landed. "absence unproven" = the lookup did not finish; check again later. "not found" = it did not land, or it was already archived.`
+
+// writeMailVerdictJSON writes the JSON failure record for a read-after-write
+// verdict (5 lost, 6 unconfirmed) in the shared failure shape (ok=false plus
+// error{code,message,exit_code}), carrying the message ID to check when the
+// verdict is unconfirmed. It returns code, or 1 if the write failed. For any
+// other code it writes nothing and returns code, leaving the caller's own
+// failure handling (and run()'s generic record) in place.
+func writeMailVerdictJSON(stdout, stderr io.Writer, context, command, action string, code int, err error) int {
+	var errCode string
+	switch code {
+	case mailSendNotPersistedExit:
+		errCode = "mail_not_delivered"
+	case mailSendUnconfirmedExit:
+		errCode = "mail_unconfirmed"
+	default:
+		return code
+	}
+	id, _ := mail.UnconfirmedMessageID(err)
+	if w := writeCLIJSONLineOrExit(stdout, stderr, context, mailActionResult{
+		SchemaVersion: "1",
+		OK:            false,
+		Command:       command,
+		Action:        action,
+		ID:            id,
+		Error:         &jsonSchemaErrorDetail{Code: errCode, Message: err.Error(), ExitCode: code},
+	}); w != 0 {
+		return w
+	}
+	return code
 }
 
 // nudgeFunc is an optional callback for nudging an agent after sending or
@@ -162,6 +199,8 @@ type mailActionResult struct {
 	// Lost, Failed and Unconfirmed are a --all broadcast's per-recipient
 	// failures (ok=false): re-send to Lost and Failed by address, check each
 	// Unconfirmed ID first. Never re-run --all (ga-0ejdbv).
+	// Error is set on a failure record (ok=false), in the shared failure shape.
+	Error       *jsonSchemaErrorDetail     `json:"error,omitempty"`
 	Lost        []string                   `json:"lost,omitempty"`
 	Failed      []string                   `json:"failed,omitempty"`
 	Unconfirmed []mailUnconfirmedRecipient `json:"unconfirmed,omitempty"`
@@ -2412,6 +2451,9 @@ func doMailSendJSON(mp mail.Provider, rec events.Recorder, validRecipients map[s
 	telemetry.RecordMailOp(context.Background(), "send", err)
 	if err != nil {
 		if code := classifyMailWriteFailure(stderr, "gc mail send", err); code != 0 {
+			if jsonOut {
+				return writeMailVerdictJSON(stdout, stderr, "gc mail send", "mail.send", "send", code, err)
+			}
 			return code
 		}
 		fmt.Fprintf(stderr, "gc mail send: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -2609,7 +2651,13 @@ func doMailSendAllCoverage(mp mail.Provider, rec events.Recorder, validRecipient
 		// Written on failure too: a JSON caller must learn which recipients
 		// already have the message, or it re-runs --all and duplicates to
 		// them (ga-0ejdbv round 3). The exit code still carries the verdict.
-		if w := writeCLIJSONLineOrExit(stdout, stderr, "gc mail send", mailActionResult{SchemaVersion: "1", OK: code == 0, Command: "mail.send", Action: "send", Messages: sent, Count: intRef(len(sent)), Notified: notified, Unreached: unreached, Lost: lost, Failed: failed, Unconfirmed: unconfirmedRecipients}); w != 0 {
+		res := mailActionResult{SchemaVersion: "1", OK: code == 0, Command: "mail.send", Action: "send", Messages: sent, Count: intRef(len(sent)), Notified: notified, Unreached: unreached, Lost: lost, Failed: failed, Unconfirmed: unconfirmedRecipients}
+		if code != 0 {
+			// The shared failure shape (ok=false + error), so a consumer that
+			// reads error.exit_code keeps working (ga-0ejdbv round 4).
+			res.Error = &jsonSchemaErrorDetail{Code: "mail_send_all_partial", Message: fmt.Sprintf("delivered to %d; lost %d, failed %d, unconfirmed %d; do not re-run --all", len(sent), len(lost), len(failed), len(unconfirmed)), ExitCode: code}
+		}
+		if w := writeCLIJSONLineOrExit(stdout, stderr, "gc mail send", res); w != 0 && code == 0 {
 			return w
 		}
 	}
@@ -2634,6 +2682,7 @@ func reportMailSendAllFailures(stderr io.Writer, delivered int, lost, failed, un
 	}
 	if len(unconfirmed) > 0 {
 		fmt.Fprintf(stderr, "  UNCONFIRMED, may have landed; check each ID with \""+mailStorageCheckCommand("<id>")+"\" before re-sending: %s\n", strings.Join(unconfirmed, ", ")) //nolint:errcheck // best-effort stderr
+		fmt.Fprintln(stderr, "  "+mailStorageCheckReading)                                                                                                                         //nolint:errcheck // best-effort stderr
 	}
 	switch {
 	case len(lost) > 0:
@@ -3014,6 +3063,9 @@ func doMailReplyJSON(mp mail.Provider, rec events.Recorder, id, sender, subject,
 	telemetry.RecordMailOp(context.Background(), "reply", err)
 	if err != nil {
 		if code := classifyMailWriteFailure(stderr, "gc mail reply", err); code != 0 {
+			if jsonOut {
+				return writeMailVerdictJSON(stdout, stderr, "gc mail reply", "mail.reply", "reply", code, err)
+			}
 			return code
 		}
 		fmt.Fprintf(stderr, "gc mail reply: %v\n", err) //nolint:errcheck // best-effort stderr
