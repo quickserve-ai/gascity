@@ -37,6 +37,15 @@ const (
 	mailSendUnconfirmedExit  = 6
 )
 
+// The send and reply commands call their runners through these variables so a
+// test can drive the cobra command and check the exit code it returns (the
+// verdict codes were once collapsed to 1 at this layer, ga-0ejdbv).
+var (
+	mailSendRunner      = cmdMailSendJSONFull
+	mailReplyRunner     = cmdMailReply
+	mailReplyJSONRunner = cmdMailReplyJSON
+)
+
 // classifyMailWriteFailure turns a read-after-write verdict into an exit code
 // and the guidance that verdict deserves. The two verdicts stay distinct on
 // purpose: a VERIFIED-ABSENT message must be re-sent, while an UNCONFIRMED one
@@ -51,9 +60,13 @@ func classifyMailWriteFailure(stderr io.Writer, cmdLabel string, err error) int 
 		fmt.Fprintln(stderr, "hint: no message bead exists for this send; re-send the message.") //nolint:errcheck // best-effort stderr
 		return mailSendNotPersistedExit
 	case errors.Is(err, beadmail.ErrUnconfirmed):
-		fmt.Fprintf(stderr, "%s: DELIVERY UNCONFIRMED — %v\n", cmdLabel, err)                                    //nolint:errcheck // best-effort stderr
-		fmt.Fprintln(stderr, "hint: the write may have landed. Confirm with \"gc bd show <message-id>\" before") //nolint:errcheck // best-effort stderr
-		fmt.Fprintln(stderr, "      re-sending; gc bd show answers correctly whether or not it was archived.")   //nolint:errcheck // best-effort stderr
+		id, ok := mail.UnconfirmedMessageID(err)
+		if !ok {
+			id = "<message-id>"
+		}
+		fmt.Fprintf(stderr, "%s: DELIVERY UNCONFIRMED — %v\n", cmdLabel, err)                                           //nolint:errcheck // best-effort stderr
+		fmt.Fprintf(stderr, "hint: the write may have landed. Confirm with \"gc bd show %s\" before re-sending;\n", id) //nolint:errcheck // best-effort stderr
+		fmt.Fprintln(stderr, "      gc bd show answers correctly whether or not it was archived.")                      //nolint:errcheck // best-effort stderr
 		return mailSendUnconfirmedExit
 	}
 	return 0
@@ -1871,11 +1884,9 @@ list that cannot be read, refuses the send before anything is stored.`,
 					notify = defaultMailSendNotify(mailSendRecipientIsForeign(args, to))
 				}
 			}
-			code := cmdMailSendJSONFull(args, notify, all, from, to, subject, message, dedupKey, ref, jsonOut, stdout, stderr)
-			if code != 0 {
-				return errExit
-			}
-			return nil
+			// exitForCode, not errExit: the read-after-write verdicts
+			// (5 lost, 6 unconfirmed) must reach the shell (ga-0ejdbv).
+			return exitForCode(mailSendRunner(args, notify, all, from, to, subject, message, dedupKey, ref, jsonOut, stdout, stderr))
 		},
 	}
 	cmd.Flags().BoolVar(&notify, "notify", false, "request a recipient turn (including a managed wake if not running), even with earlier unread mail (the default for direct local sends; see --no-notify)")
@@ -1985,14 +1996,11 @@ is addressed by that city to the original sender); the sender is
 		RunE: func(_ *cobra.Command, args []string) error {
 			code := 0
 			if jsonOut {
-				code = cmdMailReplyJSON(args, subject, message, notify, true, stdout, stderr)
+				code = mailReplyJSONRunner(args, subject, message, notify, true, stdout, stderr)
 			} else {
-				code = cmdMailReply(args, subject, message, notify, stdout, stderr)
+				code = mailReplyRunner(args, subject, message, notify, stdout, stderr)
 			}
-			if code != 0 {
-				return errExit
-			}
-			return nil
+			return exitForCode(code)
 		},
 	}
 	cmd.Flags().StringVarP(&subject, "subject", "s", "", "reply subject line")
@@ -2590,10 +2598,11 @@ func doMailSendAllCoverage(mp mail.Provider, rec events.Recorder, validRecipient
 	// recipient k told the operator to re-send, and the re-run duplicated to
 	// recipients 1..k-1 (ga-0ejdbv review finding 3). Every recipient is
 	// attempted and the summary names exactly who needs what.
-	var lost, failed, unconfirmed []string
+	var lost, failed, unconfirmed, attemptedFailed []string
 	for _, to := range recipients {
 		m, err := mp.Send(sender, to, subject, body)
 		if err != nil {
+			attemptedFailed = append(attemptedFailed, to)
 			switch id, isUnconfirmed := mail.UnconfirmedMessageID(err); {
 			case isUnconfirmed:
 				fmt.Fprintf(stderr, "gc mail send --all: sending to %s: DELIVERY UNCONFIRMED as %s: %v\n", to, id, err) //nolint:errcheck // best-effort stderr
@@ -2630,7 +2639,17 @@ func doMailSendAllCoverage(mp mail.Provider, rec events.Recorder, validRecipient
 	}
 	// Under-delivery is loud, never silent (ga-dwgz52): a policy broadcast that
 	// reaches a minority must say so, and name who got nothing.
-	unreached := unreachedConfiguredSeats(cov, sentTo, sender)
+	// A recipient whose send failed or is unconfirmed WAS attempted: it is
+	// named in the failure summary below, never in the "got NOTHING, mail each
+	// by address" warning, whose advice would be a blind re-send.
+	attempted := make(map[string]bool, len(sentTo)+len(attemptedFailed))
+	for to := range sentTo {
+		attempted[to] = true
+	}
+	for _, to := range attemptedFailed {
+		attempted[to] = true
+	}
+	unreached := unreachedConfiguredSeats(cov, attempted, sender)
 	if len(unreached) > 0 {
 		fmt.Fprintf(stderr, "gc mail send --all: WARNING: reached %d open mailbox(es); %d configured named seat(s) had no open session and got NOTHING: %s. --all covers open sessions only; mail each by address to reach it.\n", len(sent), len(unreached), strings.Join(unreached, ", ")) //nolint:errcheck // best-effort stderr
 	}
