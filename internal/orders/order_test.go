@@ -856,3 +856,68 @@ func TestValidateCronBadTZ(t *testing.T) {
 		t.Errorf("error = %q, want it to name the invalid tz", err)
 	}
 }
+
+func TestValidateRunStaleAfter(t *testing.T) {
+	a := Order{Name: "t", Formula: "mol-t", Trigger: "cooldown", Interval: "1h", RunStaleAfter: "12h"}
+	if err := Validate(a); err != nil {
+		t.Errorf("Validate: %v", err)
+	}
+}
+
+func TestValidateRunStaleAfterRejectsUnparseableAndNonPositive(t *testing.T) {
+	// RunStaleAfterOrDefault reverts a bad value to the 6h default, so a typo
+	// like "12" (missing unit) or "0s" must fail at load instead of quietly
+	// giving a long-running order the cutoff it was set to escape.
+	for _, v := range []string{"12", "0s", "-1h"} {
+		a := Order{Name: "t", Formula: "mol-t", Trigger: "cooldown", Interval: "1h", RunStaleAfter: v}
+		err := Validate(a)
+		if err == nil {
+			t.Errorf("Validate should fail for run_stale_after %q", v)
+			continue
+		}
+		if !strings.Contains(err.Error(), "run_stale_after") {
+			t.Errorf("Validate(%q) error = %v, want it to name run_stale_after", v, err)
+		}
+	}
+}
+
+func TestRunStaleAfterOrDefault(t *testing.T) {
+	tests := []struct {
+		name string
+		a    Order
+		want time.Duration
+	}{
+		{"unset uses the default", Order{Formula: "mol-x"}, DefaultRunStaleAfter},
+		{"custom cutoff", Order{Formula: "mol-x", RunStaleAfter: "90m"}, 90 * time.Minute},
+		{"invalid falls back to the default", Order{Formula: "mol-x", RunStaleAfter: "bad"}, DefaultRunStaleAfter},
+		{"non-positive falls back to the default", Order{Formula: "mol-x", RunStaleAfter: "0s"}, DefaultRunStaleAfter},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.a.RunStaleAfterOrDefault(); got != tt.want {
+				t.Errorf("RunStaleAfterOrDefault() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+	if DefaultRunStaleAfter != 6*time.Hour {
+		t.Errorf("DefaultRunStaleAfter = %v, want 6h", DefaultRunStaleAfter)
+	}
+}
+
+func TestParseOrderRunStaleAfter(t *testing.T) {
+	a, err := Parse([]byte(`[order]
+trigger = "cooldown"
+interval = "24h"
+formula = "mol-digest-generate"
+run_stale_after = "18h"
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if a.RunStaleAfter != "18h" {
+		t.Errorf("RunStaleAfter = %q, want %q", a.RunStaleAfter, "18h")
+	}
+	if got := a.RunStaleAfterOrDefault(); got != 18*time.Hour {
+		t.Errorf("RunStaleAfterOrDefault() = %v, want %v", got, 18*time.Hour)
+	}
+}
