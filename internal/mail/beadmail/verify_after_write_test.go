@@ -2,6 +2,7 @@ package beadmail
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -274,4 +275,20 @@ func (s noIDStore) Create(b beads.Bead) (beads.Bead, error) {
 	created, err := s.Store.Create(b)
 	created.ID = ""
 	return created, err
+}
+
+// ga-0ejdbv round 2, finding 4: bd's fuzzy resolver can answer the read-back
+// of a fresh message ID with a DIFFERENT bead (ErrIDCollision, which wraps
+// ErrNotFound). That proves nothing about our message, so it must read as
+// unconfirmed, never as a definite loss that invites a duplicate send.
+func TestSendReadsAnIDCollisionAsUnconfirmedNotLost(t *testing.T) {
+	fastVerify(t)
+	store := &verifyStore{Store: beads.NewMemStore(), getErrs: []error{fmt.Errorf("getting bead %q (resolved to %q): %w", "x", "y", beads.ErrIDCollision)}}
+	_, err := New(store).Send("woodhouse", "katya", "subject", "body")
+	if !errors.Is(err, ErrUnconfirmed) || errors.Is(err, ErrNotPersisted) {
+		t.Fatalf("err = %v, want ErrUnconfirmed and not ErrNotPersisted", err)
+	}
+	if _, ok := mail.UnconfirmedMessageID(err); !ok {
+		t.Fatalf("an unconfirmed collision does not carry the message ID: %v", err)
+	}
 }
