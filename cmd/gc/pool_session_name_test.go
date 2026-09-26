@@ -2633,3 +2633,54 @@ func TestDirectSessionBeadIDCandidates_SkipsFlagLikeCandidates(t *testing.T) {
 		}
 	}
 }
+
+// ga-91tu1o: the sweep's routing inputs (the routed template that picks the
+// named/ephemeral session guards, the canonical-root shape, the detached-probe
+// spec) come from the cached assigned-work snapshot. When the live row has moved
+// on, the release must be skipped rather than decided on the stale copy; the
+// live status+assignee match alone does not cover it.
+func TestReleaseOrphanedPoolAssignments_SkipsWhenLiveRoutingDivergesFromSnapshot(t *testing.T) {
+	cases := []struct {
+		name string
+		meta map[string]string
+	}{
+		{name: "routed_to moved", meta: map[string]string{"gc.routed_to": "mayor"}},
+		{name: "detached probe armed", meta: map[string]string{detachedProbeMetadataKey: "pid:1"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store, snapshot := newConditionalReleaseProbeStore(t)
+			if err := store.mem.Update(snapshot.ID, beads.UpdateOpts{Metadata: tc.meta}); err != nil {
+				t.Fatalf("diverge live row: %v", err)
+			}
+
+			released := releaseProbeAssignments(store, snapshot)
+			if len(released) != 0 {
+				t.Fatalf("released = %v, want none: the live row diverged from the cached snapshot", released)
+			}
+			if len(store.releaseCalls) != 0 || len(store.assignmentUpdates) != 0 {
+				t.Fatalf("release writes = %v / %+v, want none", store.releaseCalls, store.assignmentUpdates)
+			}
+			got, err := store.Get(snapshot.ID)
+			if err != nil {
+				t.Fatalf("Get work bead: %v", err)
+			}
+			if got.Status != "in_progress" || got.Assignee != "worker-dead" {
+				t.Fatalf("work = status %q assignee %q, want the claim untouched", got.Status, got.Assignee)
+			}
+		})
+	}
+}
+
+// Control for the test above: live metadata that the release decision does not
+// read may change freely without holding the release.
+func TestReleaseOrphanedPoolAssignments_UnrelatedLiveMetadataStillReleases(t *testing.T) {
+	store, snapshot := newConditionalReleaseProbeStore(t)
+	if err := store.mem.Update(snapshot.ID, beads.UpdateOpts{Metadata: map[string]string{"gc.note": "touched"}}); err != nil {
+		t.Fatalf("touch live row: %v", err)
+	}
+	released := releaseProbeAssignments(store, snapshot)
+	if len(released) != 1 || released[0].ID != snapshot.ID {
+		t.Fatalf("released = %v, want [%s]", released, snapshot.ID)
+	}
+}
