@@ -2191,6 +2191,10 @@
           "type": "string",
           "description": "CheckTimeout overrides the condition trigger's check-command deadline.\nGo duration string. Lets a deployment tune check_timeout for a scanned\nshared-pack order (e.g. a slow-store queue check) without editing the\npack source."
         },
+        "run_stale_after": {
+          "type": "string",
+          "description": "RunStaleAfter overrides how long the order's formula runs may stay open\nbefore the controller reports them as stale, naming who holds each one.\nThe report closes nothing. Go duration string; default 6h. Lets a\ndeployment raise it for a scanned shared-pack order whose runs\nlegitimately take longer, without editing the pack source."
+        },
         "idempotent": {
           "type": "boolean",
           "description": "Idempotent overrides whether the order's dispatch is safe to repeat.\nIdempotent orders fail open when the open-work gate times out (#2893)."
