@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
@@ -177,6 +178,7 @@ func TestReapClosedBeadWorktrees_GitProtectedCandidateSkipsStoreAndProcessScans(
 	if err := os.WriteFile(filepath.Join(wt, "scratch.txt"), []byte("uncommitted\n"), 0o644); err != nil {
 		t.Fatalf("dirty the worktree: %v", err)
 	}
+	backdateWorktreeActivity(t, wt, 24*time.Hour) // the write above is not recent use under test
 	store := &reapListCountingStore{Store: beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-dirty001", Status: "closed"}}, nil)}
 	cfg := reapTestConfig(rigRoot)
 	calls := injectCountingLiveness(t, liveWorktreeState{scanned: true})
@@ -211,6 +213,7 @@ func TestReapClosedBeadWorktrees_GitGateOnlyDropsItsOwnCandidates(t *testing.T) 
 	if err := os.WriteFile(filepath.Join(dirty, "scratch.txt"), []byte("uncommitted\n"), 0o644); err != nil {
 		t.Fatalf("dirty the worktree: %v", err)
 	}
+	backdateWorktreeActivity(t, dirty, 24*time.Hour) // the write above is not recent use under test
 	store := &reapListCountingStore{Store: beads.NewMemStoreFrom(1, []beads.Bead{
 		{ID: "ga-mixd0001", Status: "closed"},
 		{ID: "ga-mixc0002", Status: "closed"},
