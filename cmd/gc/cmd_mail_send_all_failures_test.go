@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/mail"
 	"github.com/gastownhall/gascity/internal/mail/beadmail"
+	"github.com/gastownhall/gascity/internal/session"
 )
 
 // failingSendProvider fails Send for chosen recipients with a staged error and
@@ -79,5 +81,70 @@ func TestMailSendAll_OnlyUnconfirmedExitsUnconfirmed(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "bravo (gc-b1)") {
 		t.Fatalf("stderr does not name the ID to check:\n%s", stderr.String())
+	}
+}
+
+// ga-0ejdbv round 2, finding 1: the send and reply commands returned errExit
+// for every non-zero code, so the shell saw 1 for "lost" (5) and
+// "unconfirmed" (6) alike. Drive the cobra commands and read the exit code
+// the process would use.
+func TestMailSendAndReplyCommandsCarryTheVerdictExitCode(t *testing.T) {
+	savedSend, savedReply, savedReplyJSON := mailSendRunner, mailReplyRunner, mailReplyJSONRunner
+	t.Cleanup(func() { mailSendRunner, mailReplyRunner, mailReplyJSONRunner = savedSend, savedReply, savedReplyJSON })
+	for _, want := range []int{0, 1, mailSendNotPersistedExit, mailSendUnconfirmedExit} {
+		mailSendRunner = func([]string, bool, bool, string, string, string, string, string, string, bool, io.Writer, io.Writer) int {
+			return want
+		}
+		mailReplyRunner = func([]string, string, string, bool, io.Writer, io.Writer) int { return want }
+		var out, errOut bytes.Buffer
+		send := newMailSendCmd(&out, &errOut)
+		send.SetArgs([]string{"--no-notify", "bob", "hi"})
+		send.SilenceErrors, send.SilenceUsage = true, true
+		if got := commandExitCode(send.Execute()); got != want {
+			t.Errorf("gc mail send exit = %d, want %d", got, want)
+		}
+		reply := newMailReplyCmd(&out, &errOut)
+		reply.SetArgs([]string{"gc-1", "-m", "hi"})
+		reply.SilenceErrors, reply.SilenceUsage = true, true
+		if got := commandExitCode(reply.Execute()); got != want {
+			t.Errorf("gc mail reply exit = %d, want %d", got, want)
+		}
+	}
+}
+
+// ga-0ejdbv round 2, finding 2: a configured seat with an open session whose
+// send was unconfirmed was also listed as "had no open session and got
+// NOTHING ... mail each by address", which is advice to blind-re-send.
+func TestMailSendAll_AttemptedSeatsAreNotListedAsUnreached(t *testing.T) {
+	unconfirmedErr := fmt.Errorf("beadmail send: %w: %w", beadmail.ErrUnconfirmed, &mail.DeliveryUnconfirmedError{ID: "gc-w1", Cause: errors.New("i/o timeout")})
+	mp := &failingSendProvider{
+		Provider: beadmail.New(beads.NewMemStore()),
+		fail:     map[string]error{"woodhouse": unconfirmedErr},
+	}
+	recipients := map[string]bool{"gastown.mayor": true, "woodhouse": true, "katya": true}
+	cov := &broadcastCoverage{
+		configured: []string{"woodhouse", "katya", "qcore/archer", "gastown.mayor"},
+		open: []session.Info{
+			{ID: "ga-1", Alias: "woodhouse", ConfiguredNamedIdentity: "woodhouse"},
+			{ID: "ga-2", Alias: "katya", ConfiguredNamedIdentity: "katya"},
+			{ID: "ga-3", Alias: "gastown.mayor", ConfiguredNamedIdentity: "gastown.mayor"},
+		},
+	}
+	var stdout, stderr bytes.Buffer
+	code := doMailSendAllCoverage(mp, events.Discard, recipients, "gastown.mayor", []string{"s", "b"}, nil, false, cov, &stdout, &stderr)
+	if code != mailSendUnconfirmedExit {
+		t.Fatalf("exit = %d, want %d; stderr:\n%s", code, mailSendUnconfirmedExit, stderr.String())
+	}
+	errOut := stderr.String()
+	if !strings.Contains(errOut, "qcore/archer") {
+		t.Fatalf("the genuinely unreached seat is not named:\n%s", errOut)
+	}
+	for _, line := range strings.Split(errOut, "\n") {
+		if strings.Contains(line, "got NOTHING") && strings.Contains(line, "woodhouse") {
+			t.Fatalf("an attempted (unconfirmed) seat is listed as unreached: %q", line)
+		}
+	}
+	if !strings.Contains(errOut, "woodhouse (gc-w1)") {
+		t.Fatalf("the unconfirmed seat is not named with its ID:\n%s", errOut)
 	}
 }

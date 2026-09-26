@@ -1526,8 +1526,9 @@ func (s *BdStore) Get(id string) (Bead, error) {
 		//    guard lands here too, and that path must issue nothing further to
 		//    bd once it has refused (TestReleaseIfCurrentRefusesAFuzzyIDCollision
 		//    pins it). Adding a lookup here puts a subprocess on a conditional-
-		//    release hot path to cover a case the mail guard never meets — mail
-		//    verification resolves through the two exits above.
+		//    release hot path. The mail guard does not need it: beadmail reads a
+		//    collision on its fresh message ID as UNCONFIRMED (absence not
+		//    proven), never as lost.
 		//
 		// So a collision stays a plain collision. If a caller ever needs the
 		// wisp tier consulted on this path, it wants its own verb, not a

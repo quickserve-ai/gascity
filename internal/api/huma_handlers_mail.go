@@ -389,7 +389,10 @@ func (s *Server) humaHandleMailGet(ctx context.Context, input *MailGetInput) (*I
 // message may have landed and a blind retry sends a duplicate.
 func mailWriteError(err error) error {
 	if id, ok := mail.UnconfirmedMessageID(err); ok {
-		return apierr.Internal.Msg("mail_unconfirmed: message " + id + " may have landed but could not be read back; GET it before retrying, a blind retry may send a duplicate: " + err.Error())
+		// Not "GET it": this API's read of a just-created bead can be served
+		// by the cache that absorbed the create, which answers 200 whether or
+		// not the row landed. gc bd show reads storage.
+		return apierr.Internal.Msg("mail_unconfirmed: message " + id + " may have landed but could not be read back; check storage with \"gc bd show " + id + "\" before retrying (this API's GET may be answered from cache), a blind retry may send a duplicate: " + err.Error())
 	}
 	return apierr.Internal.Msg(err.Error())
 }

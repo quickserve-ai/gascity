@@ -16,7 +16,7 @@ import (
 func TestMailWriteErrorKeepsUnconfirmedDistinct(t *testing.T) {
 	unconfirmed := fmt.Errorf("beadmail send: message bead could not be confirmed: %w", &mail.DeliveryUnconfirmedError{ID: "gc-42", Cause: errors.New("i/o timeout")})
 	msg := mailWriteError(unconfirmed).Error()
-	for _, want := range []string{"mail_unconfirmed", "gc-42", "blind retry may send a duplicate"} {
+	for _, want := range []string{"mail_unconfirmed", "gc-42", "gc bd show gc-42", "blind retry may send a duplicate"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("unconfirmed error %q missing %q", msg, want)
 		}
