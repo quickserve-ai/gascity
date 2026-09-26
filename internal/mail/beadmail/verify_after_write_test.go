@@ -3,6 +3,7 @@ package beadmail
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -290,5 +291,35 @@ func TestSendReadsAnIDCollisionAsUnconfirmedNotLost(t *testing.T) {
 	}
 	if _, ok := mail.UnconfirmedMessageID(err); !ok {
 		t.Fatalf("an unconfirmed collision does not carry the message ID: %v", err)
+	}
+}
+
+// getErrStore answers every Get with a fixed error.
+type getErrStore struct {
+	beads.Store
+	err error
+}
+
+func (s getErrStore) Get(string) (beads.Bead, error) { return beads.Bead{}, s.err }
+
+// ga-0ejdbv round 4, finding 1: Get is what the unconfirmed check
+// (GC_NO_API=1 gc mail peek <id>) runs, and it turned "the lookup did not
+// finish" and "bd answered with a different bead" into a bare "message not
+// found", which reads as "lost, re-send". It must still be mail.ErrNotFound
+// to its callers, but say absence is unproven, and must not leak
+// beads.ErrNotFound. A definite absence stays a plain not-found.
+func TestGetSaysAbsenceUnprovenWhenTheLookupDidNotFinish(t *testing.T) {
+	for name, cause := range map[string]error{
+		"indeterminate": fmt.Errorf("getting bead %q: %w", "gc-1", beads.ErrVerifyIndeterminate),
+		"collision":     fmt.Errorf("getting bead %q (resolved to %q): %w", "gc-1", "gc-11", beads.ErrIDCollision),
+	} {
+		_, err := New(getErrStore{Store: beads.NewMemStore(), err: cause}).Get("gc-1")
+		if !errors.Is(err, mail.ErrNotFound) || errors.Is(err, beads.ErrNotFound) || !strings.Contains(err.Error(), "absence unproven") {
+			t.Errorf("%s: Get err = %v; want mail.ErrNotFound saying absence unproven, without beads.ErrNotFound", name, err)
+		}
+	}
+	_, err := New(getErrStore{Store: beads.NewMemStore(), err: fmt.Errorf("getting bead %q: %w", "gc-1", beads.ErrNotFound)}).Get("gc-1")
+	if !errors.Is(err, mail.ErrNotFound) || strings.Contains(err.Error(), "unproven") {
+		t.Errorf("definite absence: Get err = %v; want a plain mail.ErrNotFound", err)
 	}
 }

@@ -837,6 +837,15 @@ func (p *Provider) Reply(id, from, subject, body string) (mail.Message, error) {
 // both errors; callers above beadmail must key on mail.ErrNotFound.
 func beadmailError(operation string, err error) error {
 	if errors.Is(err, beads.ErrNotFound) {
+		// A lookup that did not finish, or that bd answered with a different
+		// bead, still reads as not-found to mail callers, but its text must
+		// say absence is unproven: this is the check an operator runs to
+		// decide whether to re-send an unconfirmed message, and a bare "not
+		// found" there reads as "lost" (ga-0ejdbv round 4). The cause is
+		// rendered with %v so beads.ErrNotFound still does not leak.
+		if errors.Is(err, beads.ErrVerifyIndeterminate) || errors.Is(err, beads.ErrIDCollision) {
+			return fmt.Errorf("beadmail %s: %w (absence unproven: %v)", operation, mail.ErrNotFound, err)
+		}
 		err = mail.ErrNotFound
 	}
 	return fmt.Errorf("beadmail %s: %w", operation, err)
