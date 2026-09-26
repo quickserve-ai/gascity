@@ -3136,10 +3136,6 @@ func (cr *CityRuntime) recordReconcileTraceInputs(
 		return
 	}
 	phaseStart := time.Now()
-	templateNames := make(map[string]struct{})
-	openCounts := make(map[string]int)
-	retainedFor := make(map[string]map[string]int)
-	desiredCounts := make(map[string]int)
 	// Pre-tick baseline: openInfos is the tick's input row feed projected to Info,
 	// captured before the reconciler runs, so these reads are the pre-tick values
 	// (byte-equivalent to the raw open-bead read they replace).
@@ -3148,45 +3144,15 @@ func (cr *CityRuntime) recordReconcileTraceInputs(
 		if template == "" {
 			continue
 		}
-		templateNames[template] = struct{}{}
-		openCounts[template]++
-		if retainedFor[template] == nil {
-			retainedFor[template] = make(map[string]int)
-		}
-		retainedFor[template][openSeatRetentionLabel(info)]++
 		trace.RecordSessionBaseline(template, info.SessionNameMetadata, map[string]any{
 			"state":        info.MetadataState,
 			"sleep_reason": info.SleepReason,
 		})
 	}
-	for _, tp := range desiredState {
-		if tp.TemplateName == "" {
-			continue
-		}
-		templateNames[tp.TemplateName] = struct{}{}
-		desiredCounts[tp.TemplateName]++
-	}
-	for template := range poolDesired {
-		templateNames[template] = struct{}{}
-	}
-	for template := range workSet {
-		templateNames[template] = struct{}{}
-	}
-	for template := range traceWorkRequested {
-		templateNames[template] = struct{}{}
-	}
-	for _, template := range traceSetStrings(templateNames) {
-		status, reason := templateTickSummaryVerdict(desiredCounts[template], poolDesired[template], openCounts[template])
-		fields := map[string]any{
-			"desired_count":  desiredCounts[template],
-			"open_count":     openCounts[template],
-			"pool_desired":   poolDesired[template],
-			"work_requested": traceWorkRequested[template],
-		}
-		if held := retainedFor[template]; len(held) > 0 {
-			fields["retained_for"] = held
-		}
-		trace.RecordTemplateSummary(template, "", status, reason, fields)
+	templateNames, summaries := buildTemplateTickSummaries(cr.cfg, openInfos, desiredState, poolDesired, workSet, traceWorkRequested)
+	for _, template := range templateNames {
+		sum := summaries[template]
+		trace.RecordTemplateSummary(template, "", sum.status, sum.reason, sum.fields)
 	}
 	trace.RecordCycleInputSnapshot(map[string]any{
 		"desired_session_count":               len(desiredState),
