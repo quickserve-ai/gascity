@@ -322,11 +322,13 @@ func doHandoffWithOutcome(msgStore, sessStore beads.Store, rec events.Recorder, 
 
 // doHandoffAuto sends handoff mail to self without requesting restart.
 func doHandoffAuto(msgStore, sessStore beads.Store, rec events.Recorder, sessionAddress string, args []string, hookFormat string, stdout, stderr io.Writer) int {
-	b, ok := createHandoffMail(msgStore, sessStore, rec, sessionAddress, sessionAddress, args, "context cycle", []string{
+	// --auto never requests a restart, so the CLI's "NOT restarted, re-run"
+	// advice does not fit it (ga-0ejdbv round 4).
+	b, ok := createHandoffMailReporting(msgStore, sessStore, rec, sessionAddress, sessionAddress, args, "context cycle", []string{
 		mail.AutoHandoffLabel,
 		mail.ArchiveAfterInjectLabel,
 		"priority:1",
-	}, stderr)
+	}, stderr, "gc handoff --auto", "hint: if that check shows it, the note is saved; if it does not, run gc handoff --auto again.")
 	if !ok {
 		return 1
 	}

@@ -20,8 +20,16 @@ import (
 // delegates every other call to a real provider.
 type failingSendProvider struct {
 	mail.Provider
-	fail  map[string]error
-	calls []string
+	fail      map[string]error
+	failReply error
+	calls     []string
+}
+
+func (p *failingSendProvider) Reply(id, from, subject, body string) (mail.Message, error) {
+	if p.failReply != nil {
+		return mail.Message{}, p.failReply
+	}
+	return p.Provider.Reply(id, from, subject, body)
 }
 
 func (p *failingSendProvider) Send(from, to, subject, body string) (mail.Message, error) {
@@ -170,13 +178,67 @@ func TestMailSendAll_JSONFailureStillReportsDeliveredAndFailed(t *testing.T) {
 	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &res); err != nil {
 		t.Fatalf("stdout is not one JSON result: %v\n%s", err, stdout.String())
 	}
-	if res.OK {
-		t.Fatalf("ok = true on a partial failure: %+v", res)
+	if res.OK || res.Error == nil || res.Error.ExitCode != mailSendNotPersistedExit {
+		t.Fatalf("record = %+v (error %+v), want ok=false with error.exit_code=%d (the shared failure shape)", res, res.Error, mailSendNotPersistedExit)
 	}
 	if len(res.Messages) != 1 || res.Messages[0].To != "alpha" {
 		t.Fatalf("messages = %+v, want the one delivered to alpha", res.Messages)
 	}
 	if strings.Join(res.Lost, ",") != "bravo" || len(res.Unconfirmed) != 1 || res.Unconfirmed[0] != (mailUnconfirmedRecipient{To: "charlie", ID: "gc-c1"}) {
 		t.Fatalf("lost=%v unconfirmed=%+v, want lost [bravo] and unconfirmed charlie/gc-c1", res.Lost, res.Unconfirmed)
+	}
+}
+
+// ga-0ejdbv round 4, finding 3: nothing drove the single send or reply with a
+// real verdict, so dropping classifyMailWriteFailure (back to exit 1) failed
+// no test. Both verdicts, both commands, text and JSON.
+func TestMailSendAndReplyVerdictsEndToEnd(t *testing.T) {
+	lostErr := fmt.Errorf("beadmail send: %w: gc-l1", beadmail.ErrNotPersisted)
+	unconfirmedErr := fmt.Errorf("beadmail send: %w: %w", beadmail.ErrUnconfirmed, &mail.DeliveryUnconfirmedError{ID: "gc-u1", Cause: beads.ErrVerifyIndeterminate})
+	cases := []struct {
+		name     string
+		err      error
+		wantCode int
+		wantErr  string
+		wantID   string
+	}{
+		{"lost", lostErr, mailSendNotPersistedExit, "mail_not_delivered", ""},
+		{"unconfirmed", unconfirmedErr, mailSendUnconfirmedExit, "mail_unconfirmed", "gc-u1"},
+	}
+	for _, tc := range cases {
+		for _, jsonOut := range []bool{false, true} {
+			mp := &failingSendProvider{Provider: beadmail.New(beads.NewMemStore()), fail: map[string]error{"bob": tc.err}, failReply: tc.err}
+			var stdout, stderr bytes.Buffer
+			code := doMailSendJSON(mp, events.Discard, map[string]bool{"bob": true}, "alice", []string{"bob", "hi"}, nil, "", jsonOut, &stdout, &stderr)
+			if code != tc.wantCode {
+				t.Fatalf("%s send json=%v: exit %d, want %d; stderr:\n%s", tc.name, jsonOut, code, tc.wantCode, stderr.String())
+			}
+			if tc.wantID != "" && !strings.Contains(stderr.String(), "GC_NO_API=1 gc mail peek "+tc.wantID) {
+				t.Errorf("%s send: stderr does not name the check for %s:\n%s", tc.name, tc.wantID, stderr.String())
+			}
+			if jsonOut {
+				assertMailVerdictJSON(t, tc.name+" send", stdout.Bytes(), tc.wantErr, tc.wantCode, tc.wantID)
+			}
+			stdout.Reset()
+			stderr.Reset()
+			code = doMailReplyJSON(mp, events.Discard, "gc-orig", "alice", "re", "hi", nil, jsonOut, &stdout, &stderr)
+			if code != tc.wantCode {
+				t.Fatalf("%s reply json=%v: exit %d, want %d; stderr:\n%s", tc.name, jsonOut, code, tc.wantCode, stderr.String())
+			}
+			if jsonOut {
+				assertMailVerdictJSON(t, tc.name+" reply", stdout.Bytes(), tc.wantErr, tc.wantCode, tc.wantID)
+			}
+		}
+	}
+}
+
+func assertMailVerdictJSON(t *testing.T, label string, out []byte, wantErr string, wantCode int, wantID string) {
+	t.Helper()
+	var res mailActionResult
+	if err := json.Unmarshal(bytes.TrimSpace(out), &res); err != nil {
+		t.Fatalf("%s: stdout is not one JSON record: %v\n%s", label, err, out)
+	}
+	if res.OK || res.Error == nil || res.Error.Code != wantErr || res.Error.ExitCode != wantCode || res.ID != wantID {
+		t.Fatalf("%s: record = %+v (error %+v), want ok=false error{%s,%d} id=%q", label, res, res.Error, wantErr, wantCode, wantID)
 	}
 }
