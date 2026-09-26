@@ -86,7 +86,7 @@ func classifyMailWriteFailure(stderr io.Writer, cmdLabel string, err error) int 
 // "absence unproven" means the lookup itself did not finish (check again
 // later), and a plain "not found" can also mean the recipient already
 // archived it, so neither is proof the send was lost (ga-0ejdbv round 4).
-const mailStorageCheckReading = `A message shown = it landed. "absence unproven" = the lookup did not finish; check again later. "not found" = it did not land, or it was already archived.`
+const mailStorageCheckReading = `A message shown = it landed. "absence unproven" = the lookup did not finish; check again later, and if it persists (a bd ID collision never resolves) ask the recipient or re-send marked as a possible duplicate. "not found" = it did not land, or it was already archived.`
 
 // writeMailVerdictJSON writes the JSON failure record for a read-after-write
 // verdict (5 lost, 6 unconfirmed) in the shared failure shape (ok=false plus
@@ -113,7 +113,9 @@ func writeMailVerdictJSON(stdout, stderr io.Writer, context, command, action str
 		ID:            id,
 		Error:         &jsonSchemaErrorDetail{Code: errCode, Message: err.Error(), ExitCode: code},
 	}); w != 0 {
-		return w
+		// The verdict code still wins: exit 1 reads as "failed, re-send",
+		// which duplicates an unconfirmed message.
+		return code
 	}
 	return code
 }
