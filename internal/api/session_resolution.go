@@ -295,6 +295,10 @@ func (s *Server) materializeNamedSessionWithContext(ctx context.Context, store b
 	if err != nil {
 		return "", err
 	}
+	// Render a templated start_command for the named identity the way the
+	// reconciler's named-session loop does; this create starts the runtime
+	// directly (ga-b1u4yg).
+	resolved = s.renderResolvedCommandForNewSession(s.state.Config(), *spec.Agent, spec.Identity, spec.SessionName, workDir, resolved)
 	launchCommand, err := config.BuildProviderLaunchCommand(s.state.CityPath(), resolved, nil, transport)
 	if err != nil {
 		return "", err

@@ -140,6 +140,9 @@ func (s *Server) handleSessionCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	alias = createCtx.Alias
 	workDir = createCtx.WorkDir
+	// Store the start_command rendered for the new session's own identity,
+	// as the reconciler's create path renders it (ga-b1u4yg).
+	resolved = s.renderResolvedCommandForNewSession(s.state.Config(), createCtx.Agent, createCtx.Identity, createCtx.ExplicitName, workDir, resolved)
 
 	mcpServers, err := s.sessionMCPServers(template, resolved.Name, createCtx.Identity, workDir, transport, kind, nil)
 	if err != nil {

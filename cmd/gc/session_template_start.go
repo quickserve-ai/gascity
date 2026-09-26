@@ -150,12 +150,16 @@ func materializeSessionForTemplateWithOptions(
 		if err := validateResolvedSessionTransport(resolved, sessionTransport, sp); err != nil {
 			return "", err
 		}
-		sessionCommand, err := resolvedSessionCommand(cityPath, resolved, nil, sessionTransport)
+		workDirQualifiedName := workdirutil.SessionQualifiedName(cityPath, *spec.Agent, cfg.Rigs, spec.Identity, "")
+		workDir, err := resolveWorkDirForQualifiedName(cityPath, cfg, spec.Agent, workDirQualifiedName)
 		if err != nil {
 			return "", err
 		}
-		workDirQualifiedName := workdirutil.SessionQualifiedName(cityPath, *spec.Agent, cfg.Rigs, spec.Identity, "")
-		workDir, err := resolveWorkDirForQualifiedName(cityPath, cfg, spec.Agent, workDirQualifiedName)
+		// Render a templated start_command for the named identity the way the
+		// reconciler's named-session loop does: without a controller this
+		// create starts the runtime directly (ga-b1u4yg).
+		resolved = renderResolvedCommandForNewSession(cityPath, cfg, spec.Agent, spec.Identity, spec.SessionName, workDir, resolved)
+		sessionCommand, err := resolvedSessionCommand(cityPath, resolved, nil, sessionTransport)
 		if err != nil {
 			return "", err
 		}
@@ -310,10 +314,6 @@ func materializeSessionForAgentConfig(cityPath string, cfg *config.City, store b
 	if err := validateResolvedSessionTransport(resolved, sessionTransport, sp); err != nil {
 		return "", err
 	}
-	sessionCommand, err := resolvedSessionCommand(cityPath, resolved, nil, sessionTransport)
-	if err != nil {
-		return "", err
-	}
 	cityName := config.EffectiveCityName(cfg, filepath.Base(cityPath))
 	explicitName, err := sessionExplicitNameForNewSession(cityPath, cityName, cfg.Rigs, agentCfg, "")
 	if err != nil {
@@ -326,6 +326,14 @@ func materializeSessionForAgentConfig(cityPath string, cfg *config.City, store b
 		agentCfg,
 		sessionQualifiedName,
 	)
+	if err != nil {
+		return "", err
+	}
+	// Render a templated start_command for this session's own identity the
+	// way the reconciler's create path does: without a controller this create
+	// starts the runtime directly (ga-b1u4yg).
+	resolved = renderResolvedCommandForNewSession(cityPath, cfg, agentCfg, sessionQualifiedName, explicitName, workDir, resolved)
+	sessionCommand, err := resolvedSessionCommand(cityPath, resolved, nil, sessionTransport)
 	if err != nil {
 		return "", err
 	}
