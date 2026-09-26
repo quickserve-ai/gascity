@@ -121,6 +121,10 @@ func (s *Server) humaHandleSessionCreate(ctx context.Context, input *SessionCrea
 	explicitName := createCtx.ExplicitName
 	workDirQualifiedName := createCtx.Identity
 	workDir = createCtx.WorkDir
+	// Render a templated start_command for the new session's own identity the
+	// way the reconciler's create path does; a started create launches this
+	// command directly (ga-b1u4yg).
+	resolved = s.renderResolvedCommandForNewSession(cfg, agentCfg, workDirQualifiedName, explicitName, workDir, resolved)
 
 	command, err := s.agentTemplateLaunchCommand(agentCfg, resolved, transport)
 	if err != nil {
