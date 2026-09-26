@@ -30,8 +30,8 @@ type Override struct {
 	Pool         *string
 	Timeout      *string
 	CheckTimeout *string
-	// RunStaleAfter overrides the order wisp watchdog's cutoff for the order's
-	// runs.
+	// RunStaleAfter overrides the order wisp watchdog's report threshold for
+	// the order's runs.
 	RunStaleAfter *string
 	Idempotent    *bool
 	Env           map[string]string
