@@ -355,4 +355,14 @@ func TestMolScopedWorkSecuresBeforeRemovingWorktree(t *testing.T) {
 			t.Errorf("cleanup-worktree decides absence with %s, which also reads an unreadable path as absent", shellTest)
 		}
 	}
+	// An open work bead with a live convoy is the normal state after a
+	// hand-off submit, and its tree can be a running session's cwd
+	// (ga-6xehc5). The decline must stop the step before anything is secured
+	// or removed. scripts/test-mol-scoped-work-teardown.sh runs the rendered
+	// block for the behavior; this pins the order.
+	decline := strings.Index(step, `DECLINED: work bead $WORK_BEAD_ID open with live convoy {{convoy_id}}; worktree preserved`)
+	rescue := strings.Index(step, `gc worktree rescue --path "$WORKTREE"`)
+	if decline < 0 || decline > rescue {
+		t.Error("cleanup-worktree must decline an open work bead with a live convoy before gc worktree rescue")
+	}
 }

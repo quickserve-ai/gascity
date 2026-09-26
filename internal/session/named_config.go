@@ -102,14 +102,61 @@ func FindNamedSessionSpecsByBackingTemplate(cfg *config.City, cityName, template
 	return specs
 }
 
+// CityScopePrefix roots a session target at the city: "/barry" names the
+// city-scoped seat "barry" and is never expanded into the caller's rig. A bare
+// "barry" typed from a rig cwd also matches that rig's "<rig>/barry", and when
+// both exist it is ambiguous; the rooted form is how the city seat stays
+// addressable from inside a rig (ga-mk8tp4, mayor decision 2026-09-22).
+const CityScopePrefix = "/"
+
+// SplitCityScopedTarget strips a single leading CityScopePrefix and reports
+// whether it was present.
+func SplitCityScopedTarget(target string) (string, bool) {
+	target = NormalizeNamedSessionTarget(target)
+	if strings.HasPrefix(target, CityScopePrefix) {
+		return strings.TrimPrefix(target, CityScopePrefix), true
+	}
+	return target, false
+}
+
+// RootedNamedSessionIdentity is the form of a resolved identity that resolves
+// back to the same seat from any cwd. A city-scoped identity carries no rig
+// qualifier, so it is rooted; a rig identity is returned as is. Code that
+// resolves a target and then hands spec.Identity to another resolver must pass
+// this form: the bare leaf re-resolved in a rig context also matches
+// "<rig>/<leaf>" and comes back ambiguous (ga-elylrw).
+func RootedNamedSessionIdentity(identity string) string {
+	if identity == "" || strings.Contains(identity, "/") {
+		return identity
+	}
+	return CityScopePrefix + identity
+}
+
+// namedSessionAddress is the form of spec's identity that resolves to it from
+// ANY cwd: a city-scoped seat is rooted, a rig-scoped identity is already
+// qualified by its rig.
+func namedSessionAddress(ns *config.NamedSession, identity string) string {
+	if ns != nil && ns.Dir == "" && !strings.Contains(identity, "/") {
+		return CityScopePrefix + identity
+	}
+	return identity
+}
+
 // ResolveNamedSessionSpecForConfigTarget resolves a config-facing token to a named session spec when possible.
 func ResolveNamedSessionSpecForConfigTarget(cfg *config.City, cityName, target, rigContext string) (NamedSessionSpec, bool, error) {
-	target = NormalizeNamedSessionTarget(target)
+	target, cityScoped := SplitCityScopedTarget(target)
 	if cfg == nil || target == "" {
 		return NamedSessionSpec{}, false, nil
 	}
-
 	qualified := strings.Contains(target, "/")
+	if cityScoped {
+		// Rooted at the city: no rig expansion, and rig-scoped seats are not
+		// reachable by their bare leaf. A rooted QUALIFIED target is a path
+		// from the city root, so "/qcore/barry" is qcore/barry, the way an
+		// absolute path names the same file from any cwd (ga-elylrw).
+		rigContext = ""
+	}
+
 	identities := map[string]bool{target: true}
 	if !qualified && rigContext != "" {
 		identities[rigContext+"/"+target] = true
@@ -124,6 +171,7 @@ func ResolveNamedSessionSpecForConfigTarget(cfg *config.City, cityName, target, 
 	// winning.
 	matched := NamedSessionSpec{}
 	found := false
+	var candidates []string
 	for i := range cfg.NamedSessions {
 		ns := &cfg.NamedSessions[i]
 		identity := ns.QualifiedName()
@@ -145,14 +193,25 @@ func ResolveNamedSessionSpecForConfigTarget(cfg *config.City, cityName, target, 
 				match = true
 			}
 		}
+		if cityScoped && !qualified && ns.Dir != "" {
+			match = false
+		}
 		if !match {
 			continue
 		}
-		if found && matched.Identity != spec.Identity {
-			return NamedSessionSpec{}, false, fmt.Errorf("%w: %q matches multiple configured named sessions", ErrAmbiguous, target)
+		if found && matched.Identity == spec.Identity {
+			continue
 		}
+		candidates = append(candidates, namedSessionAddress(ns, spec.Identity))
 		matched = spec
 		found = true
+	}
+	if len(candidates) > 1 {
+		// NAME the candidates in a form that resolves from anywhere, so the
+		// caller can pick one instead of being left with no reachable address
+		// (ga-mk8tp4).
+		return NamedSessionSpec{}, false, fmt.Errorf("%w: %q matches multiple configured named sessions; address one of: %s",
+			ErrAmbiguous, target, strings.Join(candidates, ", "))
 	}
 	if found {
 		return matched, true, nil

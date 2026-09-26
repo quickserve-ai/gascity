@@ -79,7 +79,11 @@ func resolveConfiguredNamedSessionID(
 	if !opts.materialize {
 		return "", false, fmt.Errorf("%w: %q", session.ErrSessionNotFound, identifier)
 	}
-	id, err := ensureSessionIDForTemplateWithOptions(cityPath, cfg, store, spec.Identity, io.Discard, ensureSessionForTemplateOptions{
+	// The materialize step re-resolves its target in the caller's rig
+	// context, where a city seat's bare identity also matches the rig's seat
+	// of the same leaf. The rooted form names this seat from any cwd
+	// (ga-elylrw).
+	id, err := ensureSessionIDForTemplateWithOptions(cityPath, cfg, store, session.RootedNamedSessionIdentity(spec.Identity), io.Discard, ensureSessionForTemplateOptions{
 		materializeMetadata: opts.materializeMetadata,
 	})
 	return id, true, err
