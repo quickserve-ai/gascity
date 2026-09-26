@@ -859,6 +859,13 @@ func shouldAutoArmForTrace(reason TraceReasonCode, outcome TraceOutcomeCode) boo
 	switch outcome {
 	case TraceOutcomeFailed, TraceOutcomeProviderError, TraceOutcomeDeadlineExceeded:
 		return true
+	// Stopping a live session is the most destructive routine decision the
+	// reconciler makes, and without an arm its detail record is stashed and
+	// dropped, leaving only baseline awake->draining with no reason
+	// (ga-p4q1of, ga-rht4v5). The auto-arm cap and 10-minute expiry bound the
+	// cost of routine idle drains.
+	case TraceOutcomeDrain:
+		return true
 	}
 	return false
 }
