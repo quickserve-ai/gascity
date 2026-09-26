@@ -2107,7 +2107,7 @@ export default {
 		t.Fatal("legacy OMP object-export hook was preserved; expected managed upgrade")
 	}
 	for _, want := range []string{
-		"const GC_OMP_HOOK_VERSION = 5",
+		"const GC_OMP_HOOK_VERSION = 6",
 		`export default function gascityOmpExtension(pi: ExtensionAPI)`,
 		`pi.on("session_start"`,
 		`pi.on("session_compact"`,
@@ -2147,7 +2147,7 @@ func TestInstallOMPHookPrioritizesManagedGCBinariesOverHomebrew(t *testing.T) {
 
 func TestOMPHookNeedsUpgradeComparesParsedVersion(t *testing.T) {
 	current := []byte(`// Gas City hooks for Oh My Pi (OMP).
-const GC_OMP_HOOK_VERSION = 5;
+const GC_OMP_HOOK_VERSION = 6;
 function logRunFailure(args: string[], cwd: string | undefined, err: unknown) {}
 function providerSessionEnv(ctx: { sessionManager?: { getSessionId?: () => string } }): Record<string, string> {}
 export default function gascityOmpExtension(pi: ExtensionAPI) {
@@ -2159,8 +2159,8 @@ GC_PROVIDER_SESSION_ID;
 GC_PROVIDER_SESSION_ID_REQUIRED;
 stdio: ["ignore", "pipe", "inherit"];
 `)
-	stale := bytes.Replace(current, []byte("GC_OMP_HOOK_VERSION = 5"), []byte("GC_OMP_HOOK_VERSION = 4"), 1)
-	future := bytes.Replace(current, []byte("GC_OMP_HOOK_VERSION = 5"), []byte("GC_OMP_HOOK_VERSION = 6"), 1)
+	stale := bytes.Replace(current, []byte("GC_OMP_HOOK_VERSION = 6"), []byte("GC_OMP_HOOK_VERSION = 5"), 1)
+	future := bytes.Replace(current, []byte("GC_OMP_HOOK_VERSION = 6"), []byte("GC_OMP_HOOK_VERSION = 7"), 1)
 	missingRequiredProvider := bytes.Replace(current, []byte("GC_PROVIDER_SESSION_ID_REQUIRED;\n"), nil, 1)
 
 	if !ompHookNeedsUpgrade(stale) {
