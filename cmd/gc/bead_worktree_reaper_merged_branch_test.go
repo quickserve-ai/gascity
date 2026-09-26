@@ -28,7 +28,7 @@ func addMergedBranchWorktree(t *testing.T, rigRoot, cityPath, agentHome, beadID 
 	mustGit(t, wtPath, "push", "origin", branch)
 	mustGit(t, rigRoot, "push", "origin", "--delete", branch)
 	mustGit(t, rigRoot, "fetch", "--prune", "origin")
-	backdateWorktreeGitFile(t, wtPath, 24*time.Hour)
+	backdateWorktreeActivity(t, wtPath, 24*time.Hour)
 	return wtPath
 }
 
@@ -73,7 +73,7 @@ func TestReapClosedBeadWorktrees_ProtectsDetachedHEADWithOrphanCommits(t *testin
 	}
 	mustGit(t, rigRoot, "worktree", "add", "--detach", wt)
 	mustGit(t, wt, "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "orphan work")
-	backdateWorktreeGitFile(t, wt, 24*time.Hour)
+	backdateWorktreeActivity(t, wt, 24*time.Hour)
 
 	store := beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-orphan1", Status: "closed"}}, nil)
 	cfg := reapTestConfig(rigRoot)
@@ -108,7 +108,7 @@ func TestReapClosedBeadWorktrees_ReapsWorktreeNestedUnderBeadNamedParent(t *test
 		t.Fatalf("mkdir worktree parent: %v", err)
 	}
 	mustGit(t, rigRoot, "worktree", "add", "-b", "polecat/ga-nested1", wt)
-	backdateWorktreeGitFile(t, wt, 24*time.Hour)
+	backdateWorktreeActivity(t, wt, 24*time.Hour)
 
 	store := beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-nested1", Status: "closed"}}, nil)
 	cfg := reapTestConfig(rigRoot)
@@ -140,7 +140,7 @@ func TestReapClosedBeadWorktrees_IgnoresWorktreeWithNoResolvableBead(t *testing.
 		t.Fatalf("mkdir worktree parent: %v", err)
 	}
 	mustGit(t, rigRoot, "worktree", "add", "-b", "scratch", wt)
-	backdateWorktreeGitFile(t, wt, 24*time.Hour)
+	backdateWorktreeActivity(t, wt, 24*time.Hour)
 
 	store := beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-nested1", Status: "closed"}}, nil)
 	cfg := reapTestConfig(rigRoot)
@@ -176,6 +176,11 @@ func TestReapClosedBeadWorktrees_ProtectsOnGitProbeError(t *testing.T) {
 
 	store := beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-broken1", Status: "closed"}}, nil)
 	cfg := reapTestConfig(rigRoot)
+	// The broken pointer also leaves the quiet-period gate no gitdir to read,
+	// and it would protect first as indeterminate; this test is about the git
+	// probe, so turn that gate off.
+	noQuiet := 0
+	cfg.Daemon.AutoReapClosedBeadWorktreesQuietPeriodMinutes = &noQuiet
 	injectLiveness(t, liveWorktreeState{scanned: true})
 
 	var stderr bytes.Buffer

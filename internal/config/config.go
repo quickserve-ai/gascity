@@ -2906,6 +2906,14 @@ type DaemonConfig struct {
 	// quarantine entirely (every closed-bead worktree is immediately
 	// eligible for the rest of the gate chain, regardless of age).
 	AutoReapClosedBeadWorktreesMinAgeMinutes *int `toml:"auto_reap_closed_bead_worktrees_min_age_minutes,omitempty" jsonschema:"default=10"`
+	// AutoReapClosedBeadWorktreesQuietPeriodMinutes is how long, in minutes,
+	// a closed-bead worktree must go unused (no commit, checkout, `git add` or
+	// file creation in its root) before it becomes eligible for reap
+	// classification. It protects a tree a seat works in through short-lived
+	// shell calls, which the liveness gate cannot see, and is separate from
+	// the creation-age quarantine above. Nil (unset) defaults to
+	// DefaultAutoReapClosedBeadWorktreesQuietPeriodMinutes. Zero disables it.
+	AutoReapClosedBeadWorktreesQuietPeriodMinutes *int `toml:"auto_reap_closed_bead_worktrees_quiet_period_minutes,omitempty" jsonschema:"default=360"`
 	// AutoReapStoppedAgentHomes controls whether the reconciler removes closed,
 	// stopped configured named/namepool worktree homes. The reaper fails closed
 	// unless runtime/session and assignment snapshots are available, and requires
@@ -2993,6 +3001,21 @@ func (d *DaemonConfig) AutoReapClosedBeadWorktreesMinAge() time.Duration {
 		return time.Duration(DefaultAutoReapClosedBeadWorktreesMinAgeMinutes) * time.Minute
 	}
 	return time.Duration(*d.AutoReapClosedBeadWorktreesMinAgeMinutes) * time.Minute
+}
+
+// DefaultAutoReapClosedBeadWorktreesQuietPeriodMinutes is the last-use quiet
+// period applied when AutoReapClosedBeadWorktreesQuietPeriodMinutes is unset.
+const DefaultAutoReapClosedBeadWorktreesQuietPeriodMinutes = 360
+
+// AutoReapClosedBeadWorktreesQuietPeriod returns how long a closed-bead
+// worktree must go unused before it is eligible for reap classification.
+// Defaults to DefaultAutoReapClosedBeadWorktreesQuietPeriodMinutes when unset;
+// an explicit zero disables the gate.
+func (d *DaemonConfig) AutoReapClosedBeadWorktreesQuietPeriod() time.Duration {
+	if d.AutoReapClosedBeadWorktreesQuietPeriodMinutes == nil {
+		return time.Duration(DefaultAutoReapClosedBeadWorktreesQuietPeriodMinutes) * time.Minute
+	}
+	return time.Duration(*d.AutoReapClosedBeadWorktreesQuietPeriodMinutes) * time.Minute
 }
 
 // AutoReapStoppedAgentHomesEnabled reports whether stopped configured
