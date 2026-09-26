@@ -55,9 +55,9 @@ func TestEvaluateControlReadyExcludesDispatchHoldLabels(t *testing.T) {
 		"GC_ALIAS=gascity/control-dispatcher",
 	}
 	ready := []beads.Bead{
-		{ID: "ga-routed", Metadata: map[string]string{beadmeta.RunTargetMetadataKey: "gascity/control-dispatcher"}},
-		{ID: "ga-routed-held", Metadata: map[string]string{beadmeta.RunTargetMetadataKey: "gascity/control-dispatcher"}, Labels: []string{beadmeta.HoldMayorLabel}},
-		{ID: "ga-routed-held-both", Metadata: map[string]string{beadmeta.RunTargetMetadataKey: "gascity/control-dispatcher"}, Labels: []string{beadmeta.HoldMayorLabel, beadmeta.HoldExternalLabel}},
+		{ID: "ga-routed", Metadata: map[string]string{beadmeta.KindMetadataKey: beadmeta.KindCheck, beadmeta.RunTargetMetadataKey: "gascity/control-dispatcher"}},
+		{ID: "ga-routed-held", Metadata: map[string]string{beadmeta.KindMetadataKey: beadmeta.KindCheck, beadmeta.RunTargetMetadataKey: "gascity/control-dispatcher"}, Labels: []string{beadmeta.HoldMayorLabel}},
+		{ID: "ga-routed-held-both", Metadata: map[string]string{beadmeta.KindMetadataKey: beadmeta.KindCheck, beadmeta.RunTargetMetadataKey: "gascity/control-dispatcher"}, Labels: []string{beadmeta.HoldMayorLabel, beadmeta.HoldExternalLabel}},
 	}
 	got := evaluateControlReady(ready, parsed, envList)
 	want := []string{"ga-routed"}
@@ -77,19 +77,19 @@ func TestTryControlReadyFromCacheOrFallbackExcludesDispatchHoldLabelsFromCache(t
 	noBDOnPathForTest(t)
 
 	target := "gascity/control-dispatcher"
-	routed, err := store.Create(beads.Bead{Metadata: map[string]string{beadmeta.RoutedToMetadataKey: target}})
+	routed, err := store.Create(beads.Bead{Metadata: map[string]string{beadmeta.RoutedToMetadataKey: target, beadmeta.KindMetadataKey: beadmeta.KindCheck}})
 	if err != nil {
 		t.Fatalf("create routed bead: %v", err)
 	}
 	heldMayor, err := store.Create(beads.Bead{
-		Metadata: map[string]string{beadmeta.RoutedToMetadataKey: target},
+		Metadata: map[string]string{beadmeta.RoutedToMetadataKey: target, beadmeta.KindMetadataKey: beadmeta.KindCheck},
 		Labels:   []string{beadmeta.HoldMayorLabel},
 	})
 	if err != nil {
 		t.Fatalf("create %s routed bead: %v", beadmeta.HoldMayorLabel, err)
 	}
 	heldExternal, err := store.Create(beads.Bead{
-		Metadata: map[string]string{beadmeta.RoutedToMetadataKey: target},
+		Metadata: map[string]string{beadmeta.RoutedToMetadataKey: target, beadmeta.KindMetadataKey: beadmeta.KindCheck},
 		Labels:   []string{beadmeta.HoldExternalLabel},
 	})
 	if err != nil {
@@ -142,7 +142,7 @@ case "$1" in
     exit 7
     ;;
 esac
-printf '[{"id":"ga-fallback-routed","metadata":{"gc.routed_to":"%s"}},{"id":"ga-fallback-held-mayor","metadata":{"gc.routed_to":"%s"},"labels":["hold:mayor"]},{"id":"ga-fallback-held-external","metadata":{"gc.routed_to":"%s"},"labels":["hold:external"]}]'
+printf '[{"id":"ga-fallback-routed","metadata":{"gc.routed_to":"%s","gc.kind":"check"}},{"id":"ga-fallback-held-mayor","metadata":{"gc.routed_to":"%s","gc.kind":"check"},"labels":["hold:mayor"]},{"id":"ga-fallback-held-external","metadata":{"gc.routed_to":"%s","gc.kind":"check"},"labels":["hold:external"]}]'
 `, target, target, target)
 	if err := os.WriteFile(bdPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake bd: %v", err)
