@@ -334,7 +334,10 @@ func releaseListed(claims []seatWorkHit, why releaseWhy, seat releaseSeat, cfg *
 		}
 		if p.pool {
 			assignee := strings.TrimSpace(c.bead.Assignee)
-			if !liveWorkAssignmentStillReleasable(c.store, c.bead.ID, c.bead.Status, assignee) {
+			// The live re-read also requires the snapshot's routing inputs (the
+			// routed template, the canonical-root shape, gc.detached) to match, so a
+			// re-route the cache missed cannot release a live claim (ga-91tu1o).
+			if !liveWorkRowStillReleasable(c.store, c.bead, assignee) {
 				keep(c, keptMoved)
 				continue
 			}
