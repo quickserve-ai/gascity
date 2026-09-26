@@ -162,7 +162,13 @@ func mailWakeRef(target nudgeTarget, ref, mailBeadID string) string {
 func resolveMailWakeTarget(recipient string, resolve func(string) (nudgeTarget, error)) (nudgeTarget, error) {
 	target, err := resolve(recipient)
 	if errors.Is(err, session.ErrAmbiguous) && !strings.Contains(recipient, "/") {
-		return resolve(session.CityScopePrefix + recipient)
+		rooted, rootedErr := resolve(session.CityScopePrefix + recipient)
+		if errors.Is(rootedErr, session.ErrSessionNotFound) {
+			// No city seat by that name: the ambiguity was between rig
+			// seats, and its error lists them. Keep it (ga-elylrw N1).
+			return target, err
+		}
+		return rooted, rootedErr
 	}
 	return target, err
 }
