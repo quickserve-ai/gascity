@@ -374,8 +374,8 @@ func createHandoffMail(msgStore, sessStore beads.Store, rec events.Recorder, sen
 		// and what a re-run would do, instead of implying a plain retry
 		// (ga-0ejdbv review finding 2).
 		if id, ok := mail.UnconfirmedMessageID(err); ok {
-			fmt.Fprintf(stderr, "gc handoff: handoff note UNCONFIRMED: it may have landed as %s, but it could not be read back: %v\n", id, err)                                                                                 //nolint:errcheck // best-effort stderr
-			fmt.Fprintf(stderr, "hint: this session was NOT restarted. Check with \"gc bd show %s\": if it exists, the note is saved and a re-run of gc handoff sends a second copy; if it does not, re-run gc handoff.\n", id) //nolint:errcheck // best-effort stderr
+			fmt.Fprintf(stderr, "gc handoff: handoff note UNCONFIRMED: it may have landed as %s, but it could not be read back: %v\n", id, err)                                                                                //nolint:errcheck // best-effort stderr
+			fmt.Fprintf(stderr, "hint: the session was NOT restarted. Check with \"gc bd show %s\": if it exists, the note is saved and a re-run of gc handoff sends a second copy; if it does not, re-run gc handoff.\n", id) //nolint:errcheck // best-effort stderr
 			return mail.Message{}, false
 		}
 		fmt.Fprintf(stderr, "gc handoff: creating mail: %v\n", err) //nolint:errcheck // best-effort stderr
