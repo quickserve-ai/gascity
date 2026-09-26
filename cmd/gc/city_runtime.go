@@ -149,6 +149,7 @@ type CityRuntime struct {
 	detachedOrphanOnce sync.Once
 
 	orderSweepWatchdogLast             time.Time
+	orderWispWatchdogLast              time.Time
 	orderTrackingRetentionWatchdogLast time.Time
 	nudgeMailSweepWatchdogLast         time.Time
 	wispIndexMigrationApplied          bool
@@ -1652,6 +1653,7 @@ func (cr *CityRuntime) dispatchOrders(ctx context.Context, cityRoot string, boot
 	}
 	cr.rescanOrderDispatcherIfDue(ctx, cityRoot, now)
 	cr.runOrderTrackingSweepWatchdog(now)
+	cr.runOrderWispWatchdog(now)
 	if bootDispatch {
 		// #6429: skip without stamping orderTrackingRetentionWatchdogLast, so the
 		// first steady-state dispatch still finds the watchdog due.

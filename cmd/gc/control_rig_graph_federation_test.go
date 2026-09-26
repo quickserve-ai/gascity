@@ -741,7 +741,8 @@ func TestControlReadyScanRigScopeFederatesTheBindingOnBothArms(t *testing.T) {
 	agentCfg := config.Agent{Name: config.ControlDispatcherAgentName}
 	route := agentCfg.QualifiedName()
 	rigResident := `[{"id":"ga-rig-resident","title":"rig check","issue_type":"task","status":"open",` +
-		`"metadata":{"` + beadmeta.RunTargetMetadataKey + `":"` + route + `"}}]`
+		`"metadata":{"` + beadmeta.RunTargetMetadataKey + `":"` + route + `","` +
+		beadmeta.KindMetadataKey + `":"` + beadmeta.KindCheck + `"}}]` // a control kind: non-control beads are filtered (ga-k74enr)
 
 	for _, tc := range []struct {
 		name  string

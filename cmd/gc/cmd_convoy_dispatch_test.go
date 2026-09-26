@@ -3525,10 +3525,14 @@ func TestRunControlDispatcherQuarantineReconcilesScopedControlFailure(t *testing
 		t.Fatalf("create scope body: %v", err)
 	}
 	control, err := store.Create(beads.Bead{
-		Title: "unsupported scoped control",
+		Title: "failing scoped control",
 		Type:  "task",
 		Metadata: map[string]string{
-			"gc.kind":         "unknown-control-kind",
+			// A real control kind: an unknown kind is now refused before the
+			// quarantine path (errNotControlBead, ga-k74enr), so the failure is
+			// injected at the handler instead, as in
+			// TestRunControlDispatcherQuarantinesGenericControlFailure.
+			"gc.kind":         "scope-check",
 			"gc.root_bead_id": workflow.ID,
 			"gc.scope_ref":    "review-loop.iteration.1",
 			"gc.scope_role":   "member",
@@ -3539,9 +3543,9 @@ func TestRunControlDispatcherQuarantineReconcilesScopedControlFailure(t *testing
 	}
 
 	var stderr bytes.Buffer
-	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
-	if err := runControlDispatcherWithStoreAndConfig(t.TempDir(), t.TempDir(), store, control.ID, cfg, io.Discard, &stderr); err != nil {
-		t.Fatalf("runControlDispatcherWithStoreAndConfig: %v", err)
+	cause := fmt.Errorf("%s: unsupported control bead kind %q", control.ID, "unknown-control-kind")
+	if err := handleControlDispatchError(t.TempDir(), t.TempDir(), store, control, control.ID, cause, &stderr); err != nil {
+		t.Fatalf("handleControlDispatchError: %v", err)
 	}
 
 	afterControl, err := store.Get(control.ID)
@@ -4533,23 +4537,23 @@ func TestWorkflowServeControlReadyQueryIgnoresInProgressAssigned(t *testing.T) {
 set -eu
 case "$*" in
   "list --status in_progress --assignee=gascity--control-dispatcher --json --limit=20")
-    printf '[{"id":"ga-in-progress"}]'
+    printf '[{"id":"ga-in-progress","metadata":{"gc.kind":"retry"}}]'
     ;;
   "--readonly --sandbox ready --assignee=gascity--control-dispatcher --json --limit=20")
-    printf '[{"id":"ga-epic-leak"}]'
+    printf '[{"id":"ga-epic-leak","metadata":{"gc.kind":"retry"}}]'
     ;;
   "--readonly --sandbox ready --assignee=gascity--control-dispatcher --exclude-type=epic --json --limit=20")
-    printf '[{"id":"ga-ready"}]'
+    printf '[{"id":"ga-ready","metadata":{"gc.kind":"retry"}}]'
     ;;
   "--readonly --sandbox ready --metadata-field gc.run_target=gascity/control-dispatcher --unassigned --exclude-type=epic --exclude-label hold:mayor --exclude-label hold:external --json --sort oldest --limit=20")
-    printf '[{"id":"ga-routed"}]'
+    printf '[{"id":"ga-routed","metadata":{"gc.kind":"retry"}}]'
     ;;
   *)
     printf '[]'
     ;;
 esac
 `)
-	assertJSONEqual(t, out, `[{"id":"ga-ready"},{"id":"ga-routed"}]`)
+	assertJSONEqual(t, out, `[{"id":"ga-ready","metadata":{"gc.kind":"retry"}},{"id":"ga-routed","metadata":{"gc.kind":"retry"}}]`)
 }
 
 func TestWorkflowServeControlReadyQueryIncludesMetadataRoutedWorkAfterAssignedPending(t *testing.T) {
@@ -4624,20 +4628,20 @@ func TestWorkflowServeControlReadyQueryPreservesQueryPriorityWhenMerging(t *test
 set -eu
 case "$*" in
   "--readonly --sandbox ready --assignee=gascity--control-dispatcher --exclude-type=epic --json --limit=20")
-    printf '[{"id":"ga-z-assigned"},{"id":"ga-dup","source":"assigned"}]'
+    printf '[{"id":"ga-z-assigned","metadata":{"gc.kind":"retry"}},{"id":"ga-dup","source":"assigned","metadata":{"gc.kind":"retry"}}]'
     ;;
   "--readonly --sandbox ready --metadata-field gc.run_target=gascity/control-dispatcher --unassigned --exclude-type=epic --exclude-label hold:mayor --exclude-label hold:external --json --sort oldest --limit=20")
-    printf '[{"id":"ga-a-routed"},{"id":"ga-route-dup","source":"run-target"}]'
+    printf '[{"id":"ga-a-routed","metadata":{"gc.kind":"retry"}},{"id":"ga-route-dup","source":"run-target","metadata":{"gc.kind":"retry"}}]'
     ;;
   "--readonly --sandbox ready --metadata-field gc.routed_to=gascity/control-dispatcher --unassigned --exclude-type=epic --exclude-label hold:mayor --exclude-label hold:external --json --sort oldest --limit=20")
-    printf '[{"id":"ga-route-dup","source":"routed-to"}]'
+    printf '[{"id":"ga-route-dup","source":"routed-to","metadata":{"gc.kind":"retry"}}]'
     ;;
   *)
     printf '[]'
     ;;
 esac
 `)
-	assertJSONEqual(t, out, `[{"id":"ga-z-assigned"},{"id":"ga-dup","source":"assigned"},{"id":"ga-a-routed"},{"id":"ga-route-dup","source":"run-target"}]`)
+	assertJSONEqual(t, out, `[{"id":"ga-z-assigned","metadata":{"gc.kind":"retry"}},{"id":"ga-dup","source":"assigned","metadata":{"gc.kind":"retry"}},{"id":"ga-a-routed","metadata":{"gc.kind":"retry"}},{"id":"ga-route-dup","source":"run-target","metadata":{"gc.kind":"retry"}}]`)
 }
 
 func TestWorkflowServeControlReadyQueryUsesConfiguredRuntimeNameWhenEnvIsManualSession(t *testing.T) {
@@ -4654,14 +4658,14 @@ func TestWorkflowServeControlReadyQueryUsesConfiguredRuntimeNameWhenEnvIsManualS
 set -eu
 case "$*" in
   "--readonly --sandbox ready --assignee=gascity--control-dispatcher --exclude-type=epic --json --limit=20")
-    printf '[{"id":"ga-control-ready"}]'
+    printf '[{"id":"ga-control-ready","metadata":{"gc.kind":"retry"}}]'
     ;;
   *)
     printf '[]'
     ;;
 esac
 `)
-	assertJSONEqual(t, out, `[{"id":"ga-control-ready"}]`)
+	assertJSONEqual(t, out, `[{"id":"ga-control-ready","metadata":{"gc.kind":"retry"}}]`)
 }
 
 func TestWorkflowServeControlReadyQueryFailsFastOnBDReadyError(t *testing.T) {
@@ -4718,7 +4722,7 @@ set -eu
 printf '%s\n' "$*" >> "$BD_LOG"
 case "$*" in
   "--readonly --sandbox ready --assignee=gascity--control-dispatcher --exclude-type=epic --json --limit=20")
-    printf '[{"id":"ga-control-ready"}]'
+    printf '[{"id":"ga-control-ready","metadata":{"gc.kind":"retry"}}]'
     printf 'notice: refreshed export metadata\n' >&2
     ;;
   *)
@@ -4737,7 +4741,7 @@ esac
 	if err != nil {
 		t.Fatalf("run workflow serve query: %v", err)
 	}
-	assertJSONEqual(t, out, `[{"id":"ga-control-ready"}]`)
+	assertJSONEqual(t, out, `[{"id":"ga-control-ready","metadata":{"gc.kind":"retry"}}]`)
 }
 
 func TestWorkflowServeControlReadyQueryFailsOnMalformedBDJSON(t *testing.T) {
@@ -4787,7 +4791,7 @@ set -eu
 printf '%s\n' "$*" >> "$BD_LOG"
 case "$*" in
   "--readonly --sandbox ready --assignee=gascity--control-dispatcher --exclude-type=epic --json --limit=20")
-    printf '[{"id":"ga-control-ready"}]'
+    printf '[{"id":"ga-control-ready","metadata":{"gc.kind":"retry"}}]'
     ;;
   *)
     printf '[]'
@@ -4807,7 +4811,7 @@ esac
 	if err != nil {
 		t.Fatalf("run workflow serve query: %v", err)
 	}
-	assertJSONEqual(t, out, `[{"id":"ga-control-ready"}]`)
+	assertJSONEqual(t, out, `[{"id":"ga-control-ready","metadata":{"gc.kind":"retry"}}]`)
 	logData, err := os.ReadFile(logPath)
 	if err != nil {
 		t.Fatalf("read bd log: %v", err)
@@ -4831,7 +4835,7 @@ set -eu
 printf '%s\n' "$*" >> "$BD_LOG"
 case "$*" in
   "--readonly --sandbox ready --assignee=gascity--control-dispatcher --exclude-type=epic --json --limit=20")
-    printf '[{"id":"ga-control-ready"}]'
+    printf '[{"id":"ga-control-ready","metadata":{"gc.kind":"retry"}}]'
     ;;
   *)
     printf '[]'
@@ -4850,7 +4854,7 @@ esac
 	if err != nil {
 		t.Fatalf("run workflow serve query: %v", err)
 	}
-	assertJSONEqual(t, out, `[{"id":"ga-control-ready"}]`)
+	assertJSONEqual(t, out, `[{"id":"ga-control-ready","metadata":{"gc.kind":"retry"}}]`)
 	logData, err := os.ReadFile(logPath)
 	if err != nil {
 		t.Fatalf("read bd log: %v", err)
@@ -4888,12 +4892,12 @@ if [ "$#" -eq 15 ] &&
    [ "${14}" = "oldest" ] &&
    [ "${15}" = "--limit=20" ]; then
   printf '%s\n' "$@" > "$BD_MATCHED_ARGS"
-  printf '[{"id":"ga-routed"}]'
+  printf '[{"id":"ga-routed","metadata":{"gc.kind":"retry"}}]'
   exit 0
 fi
 printf '[]'
 `)
-	assertJSONEqual(t, out, `[{"id":"ga-routed"}]`)
+	assertJSONEqual(t, out, `[{"id":"ga-routed","metadata":{"gc.kind":"retry"}}]`)
 	argsData, err := os.ReadFile(argsPath)
 	if err != nil {
 		t.Fatalf("read matched args: %v", err)
@@ -4915,14 +4919,14 @@ func TestWorkflowServeControlReadyQueryUsesLegacyRouteForNamedSessions(t *testin
 set -eu
 case "$*" in
   "--readonly --sandbox ready --metadata-field gc.run_target=gascity/workflow-control --unassigned --exclude-type=epic --exclude-label hold:mayor --exclude-label hold:external --json --sort oldest --limit=20")
-    printf '[{"id":"ga-legacy-route"}]'
+    printf '[{"id":"ga-legacy-route","metadata":{"gc.kind":"retry"}}]'
     ;;
   *)
     printf '[]'
     ;;
 esac
 `)
-	assertJSONEqual(t, out, `[{"id":"ga-legacy-route"}]`)
+	assertJSONEqual(t, out, `[{"id":"ga-legacy-route","metadata":{"gc.kind":"retry"}}]`)
 }
 
 func runWorkflowServeShellQueryForTest(t *testing.T, query string, env map[string]string, bdScript string) string {
@@ -5689,7 +5693,11 @@ func TestRunWorkflowServeDispatchesUnexpectedNonControlOnly(t *testing.T) {
 	}
 }
 
-func TestRunWorkflowServeQuarantinesUnexpectedNonControlBead(t *testing.T) {
+// TestRunWorkflowServeLeavesUnexpectedNonControlBeadUntouched: a misrouted
+// workflow root reaching the serve loop used to be dispatched and quarantined
+// (closed hard-failed). Since ga-k74enr it is skipped and left exactly as it
+// was; the skip is reported on stderr and in the workflow trace instead.
+func TestRunWorkflowServeLeavesUnexpectedNonControlBeadUntouched(t *testing.T) {
 	clearGCEnv(t)
 	disableManagedDoltRecoveryForTest(t)
 
@@ -5745,21 +5753,9 @@ func TestRunWorkflowServeQuarantinesUnexpectedNonControlBead(t *testing.T) {
 		t.Fatalf("runWorkflowServe: %v", err)
 	}
 
-	after, err := store.Get(nonControl.ID)
-	if err != nil {
-		t.Fatalf("get non-control bead: %v", err)
-	}
-	if after.Status != "closed" {
-		t.Fatalf("status = %q, want closed", after.Status)
-	}
-	if got := after.Metadata["gc.control_quarantined"]; got != "true" {
-		t.Fatalf("gc.control_quarantined = %q, want true", got)
-	}
-	if got := after.Metadata["gc.final_disposition"]; got != "control_quarantined" {
-		t.Fatalf("gc.final_disposition = %q, want control_quarantined", got)
-	}
-	if got := stderr.String(); !strings.Contains(got, "control dispatch: quarantined bead="+nonControl.ID) {
-		t.Fatalf("stderr = %q, want quarantine message", got)
+	assertBeadUntouched(t, store, nonControl)
+	if got := stderr.String(); !strings.Contains(got, "skipped bead="+nonControl.ID) || strings.Contains(got, "quarantined bead=") {
+		t.Fatalf("stderr = %q, want a skip message and no quarantine", got)
 	}
 }
 
@@ -6082,19 +6078,38 @@ func TestRunControlDispatcherQuarantinesRalphControlMissingIteration(t *testing.
 	}
 }
 
+// TestRunControlDispatcherQuarantinesGenericControlFailure pins the generic
+// (unclassified) refusal arm of handleControlDispatchError, driven end to end
+// through the dispatcher. It used to reach that arm through an unknown gc.kind,
+// but the dispatcher now refuses any non-control kind before ProcessControl
+// without touching the bead (ga-k74enr;
+// TestRunControlDispatcherRefusesNonControlKindWithoutQuarantine). So the
+// failure is a real handler refusal on a real control kind: a scope-check
+// whose blocking subject resolves but which carries no gc.root_bead_id.
 func TestRunControlDispatcherQuarantinesGenericControlFailure(t *testing.T) {
 	clearGCEnv(t)
 
 	store := beads.NewMemStore()
+	subject, err := store.Create(beads.Bead{Title: "closed subject", Type: "task"})
+	if err != nil {
+		t.Fatalf("create subject: %v", err)
+	}
+	if err := store.Close(subject.ID); err != nil {
+		t.Fatalf("close subject: %v", err)
+	}
 	control, err := store.Create(beads.Bead{
-		Title: "Unsupported control",
+		Title: "Failing control",
 		Type:  "task",
 		Metadata: map[string]string{
-			"gc.kind": "unknown-control-kind",
+			"gc.kind":      "scope-check",
+			"gc.scope_ref": "review-loop.iteration.1",
 		},
 	})
 	if err != nil {
 		t.Fatalf("create control: %v", err)
+	}
+	if err := store.DepAdd(control.ID, subject.ID, "blocks"); err != nil {
+		t.Fatalf("add control dependency: %v", err)
 	}
 
 	var stderr bytes.Buffer
@@ -6119,8 +6134,8 @@ func TestRunControlDispatcherQuarantinesGenericControlFailure(t *testing.T) {
 	if got := after.Metadata["gc.control_quarantined"]; got != "true" {
 		t.Fatalf("gc.control_quarantined = %q, want true", got)
 	}
-	if got := after.Metadata["gc.controller_error"]; !strings.Contains(got, "unsupported control bead kind") {
-		t.Fatalf("gc.controller_error = %q, want unsupported control bead kind", got)
+	if got := after.Metadata["gc.controller_error"]; !strings.Contains(got, "missing gc.root_bead_id") {
+		t.Fatalf("gc.controller_error = %q, want the handler's missing gc.root_bead_id refusal", got)
 	}
 	if got := after.Metadata["gc.final_disposition"]; got != "control_quarantined" {
 		t.Fatalf("gc.final_disposition = %q, want control_quarantined", got)

@@ -630,6 +630,7 @@ OrderOverride modifies a scanned order's scheduling fields and exec env.
 | `pool` | string |  |  | Pool overrides the target session config. |
 | `timeout` | string |  |  | Timeout overrides the per-order timeout. Go duration string. |
 | `check_timeout` | string |  |  | CheckTimeout overrides the condition trigger's check-command deadline. Go duration string. Lets a deployment tune check_timeout for a scanned shared-pack order (e.g. a slow-store queue check) without editing the pack source. |
+| `run_stale_after` | string |  |  | RunStaleAfter overrides how long the order's formula runs may stay open before the controller reports them as stale, naming who holds each one. The report closes nothing. Go duration string; default 6h. Lets a deployment raise it for a scanned shared-pack order whose runs legitimately take longer, without editing the pack source. |
 | `idempotent` | boolean |  |  | Idempotent overrides whether the order's dispatch is safe to repeat. Idempotent orders fail open when the open-work gate times out (#2893). |
 | `env` | map[string]string |  |  | Env adds or overrides environment variables exported into an exec order's child process. |
 
