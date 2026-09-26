@@ -126,8 +126,8 @@ func TestSetsidDoesNotPreventOrphanSelection(t *testing.T) {
 	// parallel test run another test's "sleep 300" matches too, and it may
 	// already be killed and reaped (ga-79814p). A non-interactive sh has no job
 	// control, so the background job is not a group leader, setsid execs in
-	// place, and $! is the sleep itself. The sid check below catches a setsid
-	// that forked instead.
+	// place, and $! is the sleep itself. A setsid that forked instead would
+	// still fail loudly below: $! would name the exited setsid parent.
 	launcher := exec.Command("sh", "-c", "setsid sleep 300 >/dev/null 2>&1 & p=$!; sleep 0.2; echo $p")
 	launcher.Env = append(os.Environ(), "GC_SESSION_ID="+sessionID)
 	out, err := launcher.Output()
