@@ -1497,16 +1497,7 @@ func resolveAgentDir(cityPath, dir string) (string, error) {
 }
 
 func sessionSetupContextForAgent(cityPath, cityName, qualifiedName string, a *config.Agent, rigs []config.Rig) SessionSetupContext {
-	ctx := workdirutil.PathContextForQualifiedName(cityPath, cityName, qualifiedName, *a, rigs)
-	return SessionSetupContext{
-		Agent:         qualifiedName,
-		AgentBase:     ctx.AgentBase,
-		Rig:           ctx.Rig,
-		RigRoot:       ctx.RigRoot,
-		CityRoot:      cityPath,
-		CityName:      cityName,
-		DefaultBranch: ctx.DefaultBranch,
-	}
+	return workdirutil.SessionSetupContextForAgent(cityPath, cityName, qualifiedName, *a, rigs)
 }
 
 // resolveConfiguredWorkDirPath resolves an agent's working directory without
