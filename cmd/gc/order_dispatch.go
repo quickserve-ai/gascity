@@ -3496,13 +3496,14 @@ func sweepStaleOrderWispSubtreesMode(store beads.Store, cutoff time.Time, onlyOr
 	return closeStaleOrderWispIDs(store, ordered, initiator)
 }
 
-// staleOrderWispRootSubtree returns the subtree of one order wisp root that the
-// stale sweep would close at cutoff, or nil when the root is not closable: it
-// is closed, an order-tracking bead, not a wisp/molecule root, a molecule root
-// whose descendants are all closed (the gate already ignores it), or a subtree
-// holding an open bead created at or after cutoff. Both the operator sweep and
-// the controller's order wisp watchdog select subtrees through here, so they
-// cannot disagree about what a stale subtree is.
+// staleOrderWispRootSubtree returns the subtree of one order wisp root that is
+// stale at cutoff, or nil when it is not: the root is closed, an
+// order-tracking bead, not a wisp/molecule root, a molecule root whose
+// descendants are all closed (the gate already ignores it), or the subtree
+// holds an open bead created at or after cutoff. The operator sweep closes what
+// this selects and the controller's order wisp watchdog only reports it, but
+// both select through here, so they cannot disagree about what a stale subtree
+// is.
 func staleOrderWispRootSubtree(store beads.Store, root beads.Bead, cutoff time.Time) ([]beads.Bead, error) {
 	if root.ID == "" || root.Status == "closed" {
 		return nil, nil
@@ -3537,13 +3538,6 @@ func staleOrderWispRootSubtree(store beads.Store, root beads.Bead, cutoff time.T
 // 0). That flag, pinned by TestBdCloseArgsAlwaysForce, is what keeps the
 // unordered batch correct on stores that enforce blocks dependencies.
 func closeStaleOrderWispIDs(store beads.Store, ids []string, initiator string) (int, error) {
-	return closeStaleOrderWispIDsWithMetadata(store, ids, initiator, nil)
-}
-
-// closeStaleOrderWispIDsWithMetadata is closeStaleOrderWispIDs with extra audit
-// metadata laid over the sweep's own keys. The order wisp watchdog uses it to
-// name the order, the cutoff and the holder in the close reason bd shows.
-func closeStaleOrderWispIDsWithMetadata(store beads.Store, ids []string, initiator string, extra map[string]string) (int, error) {
 	metadata := map[string]string{
 		"order_tracking_sweep": orderTrackingSweepMetadataReason,
 		"order_wisp_sweep":     "stale-order-wisp",
@@ -3551,9 +3545,6 @@ func closeStaleOrderWispIDsWithMetadata(store beads.Store, ids []string, initiat
 	}
 	if initiator != "" {
 		metadata["order_tracking_sweep_by"] = initiator
-	}
-	for key, value := range extra {
-		metadata[key] = value
 	}
 	n, err := store.CloseAll(ids, metadata)
 	if err != nil {

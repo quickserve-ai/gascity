@@ -2193,7 +2193,7 @@
         },
         "run_stale_after": {
           "type": "string",
-          "description": "RunStaleAfter overrides how long the order's formula runs may stay open\nbefore they count as stale, when a stale run whose claiming session of\nthis city has ended is closed so the order can fire again. Go duration\nstring; default 6h. Lets a deployment raise it for a scanned shared-pack\norder whose runs legitimately take longer, without editing the pack\nsource."
+          "description": "RunStaleAfter overrides how long the order's formula runs may stay open\nbefore the controller reports them as stale, naming who holds each one.\nThe report closes nothing. Go duration string; default 6h. Lets a\ndeployment raise it for a scanned shared-pack order whose runs\nlegitimately take longer, without editing the pack source."
         },
         "idempotent": {
           "type": "boolean",

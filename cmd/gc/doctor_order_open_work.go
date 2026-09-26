@@ -20,10 +20,9 @@ import (
 // predicate through orders.Store.OpenWork, the evidence form of HasOpenWork, so
 // the bead doctor names is the bead the gate is refusing on.
 //
-// The holder verdict comes from the order wisp watchdog's resolver, so the
-// detail line also says why the watchdog has not closed the bead: a live
-// holder, a claim this city cannot prove is its own, or an unclaimed run the
-// watchdog never closes.
+// The holder verdict is the order wisp watchdog's own judgment of the whole
+// run, root and open members alike (judgeOrderWispRun), so the detail line and
+// the watchdog's report name the same verdict for the same run.
 //
 // Nothing is resolved or opened until the check asks about its first non-OK
 // order, so a healthy city pays nothing for the lookup (ga-9ymvnl).
@@ -57,8 +56,8 @@ func doctorOrderFiringCurrentOpenWorkFunc(cityPath string, cfg *config.City, std
 				return doctor.OrderFiringOpenWork{}, false, err
 			}
 			if found {
-				return describeOrderFiringOpenWork(b, order, func(b beads.Bead) (orderWispOwnerVerdict, error) {
-					return sessions.verdict(store, b)
+				return describeOrderFiringOpenWork(b, func(root beads.Bead) (orderWispOwnerVerdict, error) {
+					return sessions.judgeRun(store, root)
 				}), true, nil
 			}
 		}
@@ -67,9 +66,10 @@ func doctorOrderFiringCurrentOpenWorkFunc(cityPath string, cfg *config.City, std
 }
 
 // describeOrderFiringOpenWork renders the gating bead for doctor's detail line.
-// judge is consulted only for a run root: an order-tracking bead holds the gate
-// because a dispatch is in flight, and has no claim to judge.
-func describeOrderFiringOpenWork(b beads.Bead, order orders.Order, judge func(beads.Bead) (orderWispOwnerVerdict, error)) doctor.OrderFiringOpenWork {
+// judge is consulted only for a run root, and judges the whole run under it:
+// an order-tracking bead holds the gate because a dispatch is in flight, and
+// has no claim to judge.
+func describeOrderFiringOpenWork(b beads.Bead, judge func(root beads.Bead) (orderWispOwnerVerdict, error)) doctor.OrderFiringOpenWork {
 	work := doctor.OrderFiringOpenWork{ID: b.ID, CreatedAt: b.CreatedAt}
 	if beadLabelsContain(b.Labels, labelOrderTracking) {
 		work.Note = "order-tracking bead: a dispatch is in flight"
@@ -84,14 +84,7 @@ func describeOrderFiringOpenWork(b beads.Bead, order orders.Order, judge func(be
 		return work
 	}
 	work.Holder = verdict.Owner
-	switch verdict.State {
-	case orderWispHeld:
-		work.Note = verdict.Reason
-	case orderWispUnobservable:
-		work.Note = verdict.Reason + "; the watchdog never closes a claim this city cannot prove is its own"
-	case orderWispAbandoned:
-		work.Note = fmt.Sprintf("%s; the watchdog closes it once it is %s old", verdict.Reason, orderWispDurationText(order.RunStaleAfterOrDefault()))
-	}
+	work.Note = verdict.String()
 	return work
 }
 
@@ -108,11 +101,12 @@ type doctorOrderWispSessions struct {
 	err   error
 }
 
-// verdict judges who holds b, reading the session store and beadStore, the
-// store b lives in (where a graph-resident session bead would be). Each call
-// builds its own resolver because a resolver is single-use and the check's
-// lookups run in parallel.
-func (s *doctorOrderWispSessions) verdict(beadStore beads.Store, b beads.Bead) (orderWispOwnerVerdict, error) {
+// judgeRun judges who holds the run under root, which lives in runStore. The
+// session store proves liveness and locality; runStore, where a graph-resident
+// session bead would sit, proves liveness only. Each call builds its own
+// resolver because a resolver is single-use and the check's lookups run in
+// parallel.
+func (s *doctorOrderWispSessions) judgeRun(runStore beads.Store, root beads.Bead) (orderWispOwnerVerdict, error) {
 	s.once.Do(func() {
 		cityStore, err := openStoreAtForCity(s.cityPath, s.cityPath)
 		if err != nil {
@@ -124,5 +118,5 @@ func (s *doctorOrderWispSessions) verdict(beadStore beads.Store, b beads.Bead) (
 	if s.err != nil {
 		return orderWispOwnerVerdict{}, s.err
 	}
-	return newOrderWispOwnerResolver(s.cfg, s.cityPath, s.store).forStore(beadStore).verdict(b)
+	return judgeOrderWispRun(runStore, root, newOrderWispOwnerResolver(s.cfg, s.cityPath, s.store).forRunStore(runStore))
 }

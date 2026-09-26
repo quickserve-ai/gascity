@@ -401,20 +401,24 @@ closed. Orders whose dispatch is safe to repeat (sweeps and feeders where a
 duplicate run is a no-op) can set `idempotent = true` to fail open instead:
 on a gate timeout they dispatch anyway rather than starve.
 
-Open work does not hold the gate forever. When a formula order's run has been
-open longer than the order's `run_stale_after` (a Go duration, default `6h`),
-the orchestrator checks who claimed it:
+A run whose worker died keeps its order's gate shut until someone closes it.
+The orchestrator does not decide that for you, but it does tell you. When a
+formula order's run has been open longer than the order's `run_stale_after` (a
+Go duration, default `6h`), every orchestrator pass that looks (one every ten
+minutes) logs the run and who holds it, and closes nothing. It judges the whole
+run, root and open steps alike:
 
-| The run is | What happens |
+| Verdict | Meaning |
 | --- | --- |
-| claimed by a session of this city that is no longer running | closed, and the order fires on its next evaluation |
-| claimed by a session that is still running | left open: a long run is not a dead one |
-| not claimed by anyone | left open and logged: it is queued work waiting for an agent |
-| claimed by an identity this city does not recognize | left open and logged: on a rig whose store another city shares, that city's agents claim runs this city cannot see |
+| `held` | a session that is still running holds a claim on the run, or a configured named session does: a long run is not a dead one |
+| `unobservable` | a claim names an identity or session this city cannot prove is its own: on a rig whose store another city shares, that city's agents claim runs this city cannot see |
+| `holder-gone` | every claim names this city's own session or agent, and none of them is running |
+| `unclaimed` | nothing in the run is claimed: it is queued work waiting for an agent |
 
-`gc doctor` names the run holding each stale order, so a run left open is one
-command away from being inspected. Raise `run_stale_after` for an order whose
-runs legitimately take longer than the default:
+`gc doctor` prints the same verdict for the run holding each stale order, so a
+stuck order is one command away from the bead to inspect. Closing the run, or
+leaving it, is your call (or a patrol agent's). Raise `run_stale_after` for an
+order whose runs legitimately take longer than the default:
 
 ```toml
 [order]

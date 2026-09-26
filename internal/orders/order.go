@@ -64,12 +64,10 @@ type Order struct {
 	// makes the order silently never fire (gastownhall/gascity ga-ocypq2).
 	CheckTimeout string `toml:"check_timeout,omitempty"`
 	// RunStaleAfter is how long a formula order's run may stay open before the
-	// controller's order wisp watchdog judges it stale. Go duration string.
-	// Defaults to 6h. A stale run is closed only when the session holding its
-	// claim is this city's own and no longer live; an unclaimed run, a live
-	// holder, or a holder this city cannot prove is its own is left open and
-	// reported. Raise it for an order whose runs legitimately outlast the
-	// default.
+	// controller's order wisp watchdog reports it as stale, with a verdict on
+	// who holds it. Go duration string. Defaults to 6h. The watchdog only
+	// reports: it closes nothing, whatever the verdict. Raise it for an order
+	// whose runs legitimately outlast the default.
 	RunStaleAfter string `toml:"run_stale_after,omitempty"`
 	// Enabled controls whether the order is active. Defaults to true.
 	Enabled *bool `toml:"enabled,omitempty"`
@@ -268,10 +266,11 @@ func (a *Order) CheckTimeoutOrDefault() time.Duration {
 	return defaultConditionCheckTimeout
 }
 
-// DefaultRunStaleAfter is the order wisp watchdog's cutoff for a formula order
-// that does not set run_stale_after. It is long on purpose: a run that is
-// merely slow must never read as abandoned, and the watchdog's liveness check,
-// not this number, is what separates a working run from a dead one.
+// DefaultRunStaleAfter is the order wisp watchdog's report threshold for a
+// formula order that does not set run_stale_after. It is long on purpose: a
+// report every pass about a run that is merely slow is noise, and the
+// watchdog's liveness verdict, not this number, is what separates a working run
+// from a dead one.
 const DefaultRunStaleAfter = 6 * time.Hour
 
 // RunStaleAfterOrDefault returns the parsed run_stale_after, or
@@ -393,9 +392,9 @@ func Validate(a Order) error {
 // timeout, a non-positive value is rejected too. CheckTimeoutOrDefault
 // reverting check_timeout would re-create the fixed-deadline condition
 // starvation that field exists to prevent. RunStaleAfterOrDefault reverting
-// run_stale_after would hand a long-running order back the cutoff it was set
-// to escape. So a typo like "60" (missing unit) or "0s" must fail at load
-// instead of passing silently.
+// run_stale_after would hand a long-running order back the report threshold it
+// was set to escape. So a typo like "60" (missing unit) or "0s" must fail at
+// load instead of passing silently.
 func validatePositiveDurationFields(a Order) error {
 	for _, field := range []struct{ key, value string }{
 		{"check_timeout", a.CheckTimeout},
