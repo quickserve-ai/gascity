@@ -152,9 +152,28 @@ func mailWakeRef(target nudgeTarget, ref, mailBeadID string) string {
 	return notifyBeadRefPrefix + mailBeadID
 }
 
+// resolveMailWakeTarget resolves the session to wake for a stored mailbox.
+// A mailbox with no rig qualifier belongs to a city-scoped seat: rig-scoped
+// mailboxes are stored qualified ("qcore/barry"). From inside a rig the bare
+// name also matches that rig's seat of the same name, so when it is ambiguous
+// the wake retries the rooted form, which names the city seat from any cwd.
+// Without this, "/barry" stored as "barry" and then failed its own wake
+// (ga-mk8tp4, review finding 1).
+func resolveMailWakeTarget(recipient string, resolve func(string) (nudgeTarget, error)) (nudgeTarget, error) {
+	target, err := resolve(recipient)
+	if errors.Is(err, session.ErrAmbiguous) && !strings.Contains(recipient, "/") {
+		return resolve(session.CityScopePrefix + recipient)
+	}
+	return target, err
+}
+
+func discardNudgeTargetResolver(identifier string) (nudgeTarget, error) {
+	return resolveNudgeTarget(identifier, io.Discard)
+}
+
 func newMailNudgeFunc(sender, ref string) nudgeFunc {
 	return func(recipient, messageID string) error {
-		target, err := resolveNudgeTarget(recipient, io.Discard)
+		target, err := resolveMailWakeTarget(recipient, discardNudgeTargetResolver)
 		if err != nil {
 			return err
 		}
@@ -1341,8 +1360,20 @@ func resolveLiveConfiguredNamedMailTargetCached(sessStore beads.Store, identifie
 	case 1:
 		return matches[order[0]], true, nil
 	default:
-		return resolvedMailTarget{}, true, fmt.Errorf("%w: %q matches %d live configured named sessions: %s",
-			session.ErrAmbiguous, identifier, len(order), strings.Join(order, ", "))
+		// Name each candidate in a form that resolves from any cwd: a
+		// city-scoped mailbox is rooted ("/barry"), a rig-scoped one is already
+		// qualified (ga-mk8tp4). A bare list left the city seat unaddressable
+		// from inside a rig.
+		addressable := make([]string, 0, len(order))
+		for _, display := range order {
+			if strings.Contains(display, "/") {
+				addressable = append(addressable, display)
+			} else {
+				addressable = append(addressable, session.CityScopePrefix+display)
+			}
+		}
+		return resolvedMailTarget{}, true, fmt.Errorf("%w: %q matches %d live configured named sessions; address one of: %s",
+			session.ErrAmbiguous, identifier, len(order), strings.Join(addressable, ", "))
 	}
 }
 
@@ -2188,7 +2219,7 @@ func cmdMailSendJSONFull(args []string, notify bool, all bool, from string, to s
 		// with --ref. Resolution failures fall through — the nudge path
 		// surfaces them after the send exactly as before.
 		if cloudWakeGuardApplies(foreign, nf != nil, canonicalTo, ref) {
-			if target, terr := resolveNudgeTarget(canonicalTo, io.Discard); terr == nil &&
+			if target, terr := resolveMailWakeTarget(canonicalTo, discardNudgeTargetResolver); terr == nil &&
 				strings.TrimSpace(target.agent.WakeTransport) == config.WakeTransportClaudeCloud {
 				fmt.Fprintf(stderr, "gc mail send: recipient %q is a cloud-wake seat (wake_transport=%s); pass --ref <https URL into its GitHub working surface> so its wake hint points at content it can reach (its sandbox cannot read bead:// refs), or --no-notify to send mail without a wake\n", canonicalTo, config.WakeTransportClaudeCloud) //nolint:errcheck // best-effort stderr
 				return 1

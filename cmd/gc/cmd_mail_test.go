@@ -1548,6 +1548,141 @@ func TestResolveMailRecipientIdentity_BareRigScopedNamedRejectsAmbiguousLiveConf
 	}
 }
 
+// ga-mk8tp4: a city seat and a rig seat share the bare name "barry". From inside
+// the rig, "/barry" must reach the city seat, and bare "barry" must refuse while
+// naming an address for each candidate. Both seats are LIVE, so the send path's
+// live-session matcher (which runs before the config resolver) is exercised too.
+func TestResolveMailRecipientIdentity_RootedAddressReachesTheCitySeatFromARigCwd(t *testing.T) {
+	t.Setenv("GC_SESSION", "fake")
+	rigDir := t.TempDir()
+	t.Setenv("GC_DIR", rigDir)
+
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Rigs:      []config.Rig{{Name: "qcore", Path: rigDir}},
+		Agents: []config.Agent{
+			{Name: "barry", StartCommand: "true"},
+			{Name: "barry", Dir: "qcore", StartCommand: "true"},
+		},
+		NamedSessions: []config.NamedSession{
+			{Template: "barry", Mode: "always"},
+			{Template: "barry", Dir: "qcore", Mode: "always"},
+		},
+	}
+	for _, identity := range []string{"barry", "qcore/barry"} {
+		if _, err := store.Create(beads.Bead{
+			Type:   session.BeadType,
+			Labels: []string{session.LabelSession},
+			Metadata: map[string]string{
+				"alias":                     identity,
+				"session_name":              strings.ReplaceAll(identity, "/", "--"),
+				"configured_named_session":  "true",
+				"configured_named_identity": identity,
+				"configured_named_mode":     "always",
+			},
+		}); err != nil {
+			t.Fatalf("Create(%s): %v", identity, err)
+		}
+	}
+	if got := currentRigContext(cfg); got != "qcore" {
+		t.Fatalf("currentRigContext = %q, want qcore (the test must run from inside the rig)", got)
+	}
+
+	address, err := resolveMailRecipientIdentity(t.TempDir(), cfg, store, "/barry")
+	if err != nil {
+		t.Fatalf("resolveMailRecipientIdentity(/barry) from the qcore rig: %v", err)
+	}
+	if address != "barry" {
+		t.Fatalf("address = %q, want the city seat barry", address)
+	}
+
+	_, err = resolveMailRecipientIdentity(t.TempDir(), cfg, store, "barry")
+	if !errors.Is(err, session.ErrAmbiguous) {
+		t.Fatalf("resolveMailRecipientIdentity(barry) = %v, want ErrAmbiguous", err)
+	}
+	if !strings.Contains(err.Error(), "/barry") || !strings.Contains(err.Error(), "qcore/barry") {
+		t.Fatalf("error = %q, want it to name /barry and qcore/barry", err)
+	}
+}
+
+// ga-mk8tp4 (review finding 1): "/barry" from inside the rig is stored under
+// the bare mailbox "barry", and the send's wake step (newMailNudgeFunc, and the
+// cloud-wake guard) resolves that stored mailbox again. In rig context bare
+// "barry" is ambiguous, so the send printed "Sent message" and then "nudge
+// failed". The wake must reach the city seat. The resolver here is the real
+// session-ID resolution chain resolveNudgeTarget runs, over an in-memory city.
+func TestResolveMailWakeTarget_StoredCityMailboxWakesTheCitySeatFromARigCwd(t *testing.T) {
+	t.Setenv("GC_SESSION", "fake")
+	rigDir := t.TempDir()
+	t.Setenv("GC_DIR", rigDir)
+	cityPath := t.TempDir()
+
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Rigs:      []config.Rig{{Name: "qcore", Path: rigDir}},
+		Agents: []config.Agent{
+			{Name: "barry", StartCommand: "true"},
+			{Name: "barry", Dir: "qcore", StartCommand: "true"},
+		},
+		NamedSessions: []config.NamedSession{
+			{Template: "barry", Mode: "always"},
+			{Template: "barry", Dir: "qcore", Mode: "always"},
+		},
+	}
+	ids := map[string]string{}
+	for _, identity := range []string{"barry", "qcore/barry"} {
+		b, err := store.Create(beads.Bead{
+			Type:   session.BeadType,
+			Labels: []string{session.LabelSession},
+			Metadata: map[string]string{
+				"alias":                     identity,
+				"session_name":              strings.ReplaceAll(identity, "/", "--"),
+				"configured_named_session":  "true",
+				"configured_named_identity": identity,
+				"configured_named_mode":     "always",
+			},
+		})
+		if err != nil {
+			t.Fatalf("Create(%s): %v", identity, err)
+		}
+		ids[identity] = b.ID
+	}
+	if got := currentRigContext(cfg); got != "qcore" {
+		t.Fatalf("currentRigContext = %q, want qcore (the test must run from inside the rig)", got)
+	}
+	resolve := func(identifier string) (nudgeTarget, error) {
+		id, err := resolveSessionIDWithConfig(cityPath, cfg, store, identifier)
+		return nudgeTarget{sessionID: id}, err
+	}
+
+	// Preflight: the stored mailbox, re-resolved bare in rig context, is
+	// ambiguous. Without this the test below could pass vacuously.
+	if _, err := resolve("barry"); !errors.Is(err, session.ErrAmbiguous) {
+		t.Fatalf("bare barry from the rig = %v, want ErrAmbiguous", err)
+	}
+
+	address, err := resolveMailRecipientIdentity(cityPath, cfg, store, "/barry")
+	if err != nil {
+		t.Fatalf("resolveMailRecipientIdentity(/barry): %v", err)
+	}
+	target, err := resolveMailWakeTarget(address, resolve)
+	if err != nil {
+		t.Fatalf("resolveMailWakeTarget(%q) from the qcore rig: %v", address, err)
+	}
+	if target.sessionID != ids["barry"] {
+		t.Fatalf("wake target = %q, want the city seat %q (rig seat is %q)", target.sessionID, ids["barry"], ids["qcore/barry"])
+	}
+
+	// A rig-qualified mailbox still wakes the rig seat and never takes the
+	// rooted retry.
+	target, err = resolveMailWakeTarget("qcore/barry", resolve)
+	if err != nil || target.sessionID != ids["qcore/barry"] {
+		t.Fatalf("resolveMailWakeTarget(qcore/barry) = %q, %v; want %q", target.sessionID, err, ids["qcore/barry"])
+	}
+}
+
 // --- gc mail inbox ---
 
 type recordingMailInboxReader struct {
