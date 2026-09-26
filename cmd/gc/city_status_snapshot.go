@@ -367,7 +367,9 @@ func namedSessionStatusForCity(
 	// coordination-class store so a [beads.classes.sessions] relocation reaches
 	// this named-session status lookup. Identity to store at the default backend.
 	sessStore := cliSessionStore(store, cfg, cityPath)
-	id, err := resolveSessionIDWithConfig(cityPath, cfg, sessStore, identity)
+	// Rooted: a city seat's bare identity re-resolved from a rig cwd also
+	// matches that rig's seat of the same leaf (ga-pml0rv).
+	id, err := resolveSessionIDWithConfig(cityPath, cfg, sessStore, session.RootedNamedSessionIdentity(identity))
 	if err != nil {
 		if errors.Is(err, session.ErrSessionNotFound) {
 			return status
