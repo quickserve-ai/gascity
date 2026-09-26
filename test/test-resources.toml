@@ -332,6 +332,17 @@ expires = "2026-10-31"
 [[medium]]
 package_dir = "scripts"
 package_name = "scripts_test"
+owner = "TestMolScopedWorkTeardownScript"
+resources = ["subprocess"]
+owner_bead = "pl-4k0"
+invariant = "the mol-scoped-work cleanup-worktree behaviour proof is a checked Medium subprocess owner"
+resource_owner = "the one bash subprocess is confined to TestMolScopedWorkTeardownScript, which runs scripts/test-mol-scoped-work-teardown.sh: the step under test is agent-executed shell rendered from formula TOML, so only running that shell against a stub gc can prove what it does"
+migration_target = "P0.4b"
+expires = "2026-10-01"
+
+[[medium]]
+package_dir = "scripts"
+package_name = "scripts_test"
 owner = "TestProviderOverridesAndSuiteContractsCrossMakeIsolation"
 resources = ["subprocess"]
 owner_bead = "ga-cp3hwi"
@@ -383,6 +394,17 @@ invariant = "the nested-git-worktree walk-skip regression proof is a checked Med
 resource_owner = "the one go run subprocess is confined to TestAddTestenvImportSkipsNestedGitWorktrees, which exists to exercise add-testenv-import.go end to end: the script is package main, so only a real subprocess run can prove its directory walk skips linked git worktrees"
 migration_target = "P0.4b"
 expires = "2026-10-31"
+
+[[medium]]
+package_dir = "scripts"
+package_name = "scripts_test"
+owner = "TestMolScopedWorkTeardownScript"
+resources = ["subprocess"]
+owner_bead = "pl-4k0"
+invariant = "the mol-scoped-work cleanup-worktree behaviour proof is a checked Medium subprocess owner"
+resource_owner = "the one bash subprocess is confined to TestMolScopedWorkTeardownScript, which runs scripts/test-mol-scoped-work-teardown.sh: the step under test is agent-executed shell rendered from formula TOML, so only running that shell against a stub gc can prove what it does"
+migration_target = "P0.4b"
+expires = "2026-10-01"
 
 # A reviewed-hermetic-body row is narrower than a Small test declaration. It
 # proves that the exact untagged test body and statically reachable
