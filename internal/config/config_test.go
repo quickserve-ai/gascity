@@ -3955,6 +3955,32 @@ func TestDaemonAutoReapClosedBeadWorktreesMinAgeMinutesExplicitZeroDisables(t *t
 	}
 }
 
+func TestDaemonAutoReapClosedBeadWorktreesQuietPeriodMinutesDefault(t *testing.T) {
+	d := DaemonConfig{}
+	got := d.AutoReapClosedBeadWorktreesQuietPeriod()
+	if got != 6*time.Hour {
+		t.Errorf("AutoReapClosedBeadWorktreesQuietPeriod() = %v, want 6h (default)", got)
+	}
+}
+
+func TestDaemonAutoReapClosedBeadWorktreesQuietPeriodMinutesExplicitValue(t *testing.T) {
+	v := 90
+	d := DaemonConfig{AutoReapClosedBeadWorktreesQuietPeriodMinutes: &v}
+	got := d.AutoReapClosedBeadWorktreesQuietPeriod()
+	if got != 90*time.Minute {
+		t.Errorf("AutoReapClosedBeadWorktreesQuietPeriod() = %v, want 90m", got)
+	}
+}
+
+func TestDaemonAutoReapClosedBeadWorktreesQuietPeriodMinutesExplicitZeroDisables(t *testing.T) {
+	v := 0
+	d := DaemonConfig{AutoReapClosedBeadWorktreesQuietPeriodMinutes: &v}
+	got := d.AutoReapClosedBeadWorktreesQuietPeriod()
+	if got != 0 {
+		t.Errorf("AutoReapClosedBeadWorktreesQuietPeriod() = %v, want 0 (gate disabled)", got)
+	}
+}
+
 func TestDaemonAutoReapStoppedAgentHomesDefaultsOffAndHonorsFlag(t *testing.T) {
 	d := DaemonConfig{}
 	if d.AutoReapStoppedAgentHomesEnabled() {

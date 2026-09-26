@@ -47,19 +47,21 @@ func initReapRig(t *testing.T) (cityPath, rigRoot string) {
 // directory (depth-2: .gc/worktrees/<rig>/<agentHome>/<beadID>), matching the
 // real do-work layout the reaper must now discover. It branches from HEAD (on
 // origin/main), so the tree is clean with no unpushed commits. The worktree's
-// creation time is backdated well past the freshness-quarantine default (FR-5)
-// so existing callers exercise the liveness/git-safety/borrow-veto gates
-// without incidentally tripping quarantine; tests of the quarantine gate
-// itself use addClosedWorktreeWithAge directly.
+// creation time and every last-use signal are backdated well past the
+// freshness-quarantine and quiet-period defaults, so existing callers exercise
+// the liveness/git-safety/borrow-veto gates without incidentally tripping
+// either; tests of those gates themselves use addClosedWorktreeWithAge or
+// backdateWorktreeActivity directly. A caller that writes into the tree after
+// this returns ages it again with backdateWorktreeActivity.
 func addClosedWorktree(t *testing.T, rigRoot, cityPath, agentHome, beadID string) string {
 	t.Helper()
 	return addClosedWorktreeWithAge(t, rigRoot, cityPath, agentHome, beadID, 24*time.Hour)
 }
 
 // addClosedWorktreeWithAge is addClosedWorktree with an explicit backdated
-// age for the worktree's on-disk creation signal, letting freshness-gate
-// tests place a worktree on either side of the quarantine boundary. age == 0
-// leaves the real (just-created) mtime in place.
+// age for the worktree's on-disk creation and last-use signals, letting
+// freshness-gate tests place a worktree on either side of the quarantine
+// boundary. age == 0 leaves the real (just-created) mtimes in place.
 func addClosedWorktreeWithAge(t *testing.T, rigRoot, cityPath, agentHome, beadID string, age time.Duration) string {
 	t.Helper()
 	wtPath := filepath.Join(cityPath, ".gc", "worktrees", reapTestRigName, agentHome, beadID)
@@ -68,9 +70,45 @@ func addClosedWorktreeWithAge(t *testing.T, rigRoot, cityPath, agentHome, beadID
 	}
 	mustGit(t, rigRoot, "worktree", "add", "-b", "wt-"+beadID, wtPath)
 	if age > 0 {
-		backdateWorktreeGitFile(t, wtPath, age)
+		backdateWorktreeActivity(t, wtPath, age)
 	}
 	return wtPath
+}
+
+// backdateWorktreeActivity sets every last-use signal of a worktree — its root
+// directory and its private gitdir's HEAD, index and logs/HEAD — plus the
+// ".git" creation pointer and the working files back by age, modeling a tree
+// that was created AND last touched age ago. The gitdir is resolved through git itself, not the
+// reaper's pointer parsing, so the helper does not share the code under test.
+func backdateWorktreeActivity(t *testing.T, worktreePath string, age time.Duration) {
+	t.Helper()
+	gitDir := strings.TrimSpace(runGit(t, worktreePath, "rev-parse", "--absolute-git-dir"))
+	backdated := time.Now().Add(-age)
+	// The checked-out files age too, and to an instant before the index, as
+	// they do in a tree nobody touches. An index older than the files it
+	// describes marks every entry racily clean, and the reaper's own
+	// `git status` probe would then rewrite the index — making the tree look
+	// freshly used on the next pass, which no real idle tree does.
+	fileTime := backdated.Add(-time.Minute)
+	for _, rel := range strings.Fields(runGit(t, worktreePath, "ls-files", "--cached", "--others", "--exclude-standard")) {
+		if err := os.Chtimes(filepath.Join(worktreePath, rel), fileTime, fileTime); err != nil {
+			t.Fatalf("backdate %s: %v", rel, err)
+		}
+	}
+	// Re-record the files' new stat data in the index, as the last git command
+	// run in the tree would have, before the index itself is aged below.
+	runGit(t, worktreePath, "update-index", "-q", "--refresh")
+	for _, p := range []string{
+		worktreePath,
+		filepath.Join(worktreePath, ".git"),
+		filepath.Join(gitDir, "HEAD"),
+		filepath.Join(gitDir, "index"),
+		filepath.Join(gitDir, "logs", "HEAD"),
+	} {
+		if err := os.Chtimes(p, backdated, backdated); err != nil {
+			t.Fatalf("backdate %s: %v", p, err)
+		}
+	}
 }
 
 // backdateWorktreeGitFile sets the mtime of a worktree's .git pointer file

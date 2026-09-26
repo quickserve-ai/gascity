@@ -72,6 +72,9 @@ func TestReapClosedBeadWorktrees_ZeroMinAgeDisablesQuarantine(t *testing.T) {
 	cfg := reapTestConfig(rigRoot)
 	zero := 0
 	cfg.Daemon.AutoReapClosedBeadWorktreesMinAgeMinutes = &zero
+	// A just-created tree is also just-used; the quiet-period gate would
+	// protect it on its own, so it is off to isolate the quarantine.
+	cfg.Daemon.AutoReapClosedBeadWorktreesQuietPeriodMinutes = &zero
 	injectLiveness(t, liveWorktreeState{scanned: true})
 
 	var stderr bytes.Buffer

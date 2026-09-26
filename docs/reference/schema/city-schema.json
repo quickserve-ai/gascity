@@ -1474,6 +1474,11 @@
           "description": "AutoReapClosedBeadWorktreesMinAgeMinutes is the minimum worktree age,\nin minutes, before a closed-bead worktree becomes eligible for reap\nclassification at all (borrow-veto scan and beyond). This quarantines\na worktree against the race between its creation and its owning\nbead's gc.work_dir/work_dir metadata being stamped by the next\nreconcile pass — without it, a just-created worktree could look\nunclaimed to the borrow-veto scan before the metadata that would\nprotect it has been written. Nil (unset) defaults to\nDefaultAutoReapClosedBeadWorktreesMinAgeMinutes. Zero disables the\nquarantine entirely (every closed-bead worktree is immediately\neligible for the rest of the gate chain, regardless of age).",
           "default": 10
         },
+        "auto_reap_closed_bead_worktrees_quiet_period_minutes": {
+          "type": "integer",
+          "description": "AutoReapClosedBeadWorktreesQuietPeriodMinutes is how long, in minutes,\na closed-bead worktree must go unused before it becomes eligible for\nreap classification. Use is the newest mtime among the worktree's root\ndirectory and its private gitdir's HEAD, index and logs/HEAD, which a\ncommit, checkout, `git add` or file creation in the root refreshes. This\nprotects a tree a seat works in through short-lived shell calls while\nits resident process sits elsewhere, which the liveness gate cannot see.\nIt is separate from the creation-age quarantine above. Nil (unset)\ndefaults to DefaultAutoReapClosedBeadWorktreesQuietPeriodMinutes. Zero\ndisables the gate.",
+          "default": 360
+        },
         "auto_reap_stopped_agent_homes": {
           "type": "boolean",
           "description": "AutoReapStoppedAgentHomes controls whether the reconciler removes closed,\nstopped configured named/namepool worktree homes. The reaper fails closed\nunless runtime/session and assignment snapshots are available, and requires\na clean registered worktree with no unpushed commits or nested registered\nworktrees. A repository stash is not a gate: it lives in the common repo,\nwhich removing a worktree never touches. Defaults to false.",

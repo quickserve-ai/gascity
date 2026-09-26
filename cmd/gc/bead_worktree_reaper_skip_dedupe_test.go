@@ -126,6 +126,7 @@ func TestReapSkipTracker_ReemitsWhenReasonChanges(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wt, "dirty.txt"), []byte("wip\n"), 0o644); err != nil {
 		t.Fatalf("write uncommitted file: %v", err)
 	}
+	backdateWorktreeActivity(t, wt, 24*time.Hour) // the write above is not recent use under test
 	reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, fake, skips, &stderr)
 
 	reasons := skipReasonsFor(t, fake, wt)
@@ -244,6 +245,7 @@ func TestReapSkipTracker_TracksPathsIndependently(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(changing, "dirty.txt"), []byte("wip\n"), 0o644); err != nil {
 		t.Fatalf("write uncommitted file: %v", err)
 	}
+	backdateWorktreeActivity(t, changing, 24*time.Hour) // the write above is not recent use under test
 	reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, fake, skips, &stderr)
 
 	if reasons := skipReasonsFor(t, fake, stable); len(reasons) != 1 {

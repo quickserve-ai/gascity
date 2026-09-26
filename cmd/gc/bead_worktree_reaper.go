@@ -35,8 +35,9 @@ type reapDecision struct {
 // reapReport is the outcome of one reapClosedBeadWorktrees pass. Reaped holds
 // the worktrees removed (or, in dry-run, the ones that would be removed);
 // Protected holds worktrees left in place with the reason (too young/quarantined,
-// referenced by a non-terminal bead in another molecule, live process, active
-// session, unsafe git state, or an indeterminate age/liveness/borrow-veto scan).
+// used within the quiet period, referenced by a non-terminal bead in another
+// molecule, live process, active session, unsafe git state, or an
+// indeterminate age/last-use/liveness/borrow-veto scan).
 type reapReport struct {
 	Reaped    []reapDecision
 	Protected []reapDecision
@@ -64,7 +65,15 @@ type reapReport struct {
 //     against the race between worktree creation and its owning bead's
 //     work-dir metadata being stamped by the next reconcile pass. An
 //     indeterminate age (the ".git" pointer file cannot be stat'd) protects.
-//  4. Git state: no authored uncommitted changes and no commits that removing
+//  4. Quiet period: a worktree used more recently than
+//     cfg.Daemon.AutoReapClosedBeadWorktreesQuietPeriod is exempt. Use is the
+//     newest mtime among the root directory and the private gitdir's HEAD,
+//     index and logs/HEAD (worktreeLastActivity), a few stats and never a
+//     tree walk. This covers what gate 7 cannot see: a seat whose resident
+//     process sits in its home and works in the tree through short-lived
+//     shell calls, so no process cwd is inside it when the scan runs
+//     (pl-4fj). An indeterminate last use protects.
+//  5. Git state: no authored uncommitted changes and no commits that removing
 //     the worktree would orphan — commits reachable from no branch, tag, or
 //     remote-tracking ref (git.HasUnreachableCommitsResult). The test is
 //     deliberately reachability, not push state: `git worktree remove`
@@ -78,14 +87,14 @@ type reapReport struct {
 //     This is the CHEAP, LOCAL gate (two git subprocesses against the
 //     worktree itself), so it runs before the two expensive signals below;
 //     a candidate it protects never triggers them (ga-singc6).
-//  5. Borrow-veto scan: batched once per rig per tick over the candidates
-//     that survived gate 4, this finds any non-terminal bead — in any
+//  6. Borrow-veto scan: batched once per rig per tick over the candidates
+//     that survived gate 5, this finds any non-terminal bead — in any
 //     molecule — whose gc.work_dir/work_dir metadata still points at the
 //     worktree's path and protects it if so. It is a full List of the rig's
 //     store (for a hub-backed rig, a remote scan of every open issue and
 //     wisp). A query error protects every remaining candidate in that rig's
 //     tick.
-//  6. Liveness: no live process cwd and no active-session working directory may
+//  7. Liveness: no live process cwd and no active-session working directory may
 //     sit at or beneath the worktree. If the liveness scan is indeterminate
 //     (no /proc and no usable fallback), NOTHING is reaped this pass — the
 //     reaper cannot prove any tree is idle (root cause B: closed-bead !=
@@ -212,11 +221,12 @@ func reapClosedBeadWorktrees(
 			continue
 		}
 
-		// Pass 1: discover reap-eligible candidates — closed bead, and old
-		// enough to be past the freshness quarantine (FR-5). Every other gate
-		// (git safety, borrow-veto, liveness) waits until the rig's candidates
-		// are known, so the borrow-veto scan below can run as a single batched
-		// query per rig (FR-3) instead of once per worktree.
+		// Pass 1: discover reap-eligible candidates — closed bead, old enough
+		// to be past the freshness quarantine (FR-5), and unused for the quiet
+		// period (pl-4fj). Every other gate (git safety, borrow-veto,
+		// liveness) waits until the rig's candidates are known, so the
+		// borrow-veto scan below can run as a single batched query per rig
+		// (FR-3) instead of once per worktree.
 		var candidates []reapCandidate
 		for _, wt := range worktrees {
 			worktreePath := wt.Path
@@ -257,7 +267,9 @@ func reapClosedBeadWorktrees(
 			// configured minimum age is exempt from reaping, protecting
 			// against the race between worktree creation and its owning
 			// bead's work-dir metadata being stamped by the next reconcile
-			// pass. Age is fail-closed — an indeterminate age protects.
+			// pass. Age is fail-closed — an indeterminate age protects. A tree
+			// past quarantine then faces the quiet-period gate: recent use
+			// protects it, and so does an indeterminate last use.
 			minAge := cfg.Daemon.AutoReapClosedBeadWorktreesMinAge()
 			age, ok := computeWorktreeAge(worktreePath)
 			reason := ""
@@ -266,6 +278,8 @@ func reapClosedBeadWorktrees(
 				reason = "worktree age indeterminate (failing closed)"
 			case minAge > 0 && age < minAge:
 				reason = fmt.Sprintf("worktree too young to reap (quarantine): min_age=%s", minAge)
+			default:
+				reason = quietPeriodReason(worktreePath, cfg.Daemon.AutoReapClosedBeadWorktreesQuietPeriod())
 			}
 			if reason != "" {
 				branch, _ := git.New(worktreePath).CurrentBranch()
@@ -438,8 +452,8 @@ func reapClosedBeadWorktrees(
 	return report
 }
 
-// reapCandidate is a worktree that survived the closed-bead check and the
-// freshness quarantine in pass 1, awaiting the git-safety gate, the batched
+// reapCandidate is a worktree that survived the closed-bead check, the
+// freshness quarantine and the quiet-period gate in pass 1, awaiting the git-safety gate, the batched
 // borrow-veto scan, and the liveness gate.
 type reapCandidate struct {
 	beadID       string
@@ -532,7 +546,7 @@ func (t *reapSkipTracker) endPass() {
 // Uncommitted work is judged on authored lines only: gc's own provisioning
 // sediment is filtered out first (nonSedimentStatusLines, ga-pi0rzc), because
 // raw `git status --porcelain` output reads every provisioned worktree as dirty
-// forever. Commits are judged by reachability, not push state — see gate 4 on
+// forever. Commits are judged by reachability, not push state — see gate 5 on
 // reapClosedBeadWorktrees (ga-uh1m).
 //
 // Stashes are deliberately NOT a veto here (ga-gsfxag), even though "protect
@@ -618,6 +632,94 @@ func computeWorktreeAge(worktreePath string) (age time.Duration, ok bool) {
 		return 0, false
 	}
 	return time.Since(info.ModTime()), true
+}
+
+// quietPeriodReason applies the last-use gate to one worktree and returns the
+// protecting reason, or "" when the tree has gone unused for at least quiet
+// (or quiet is zero, which disables the gate). An indeterminate last use
+// protects.
+//
+// The reason names the configured period, never the last-activity time or an
+// elapsed age: either would change on every pass in which the tree is used, and
+// reapSkipTracker keys on the reason, so a tree in active use would emit an
+// event per tick instead of one.
+func quietPeriodReason(worktreePath string, quiet time.Duration) string {
+	if quiet <= 0 {
+		return ""
+	}
+	last, ok := worktreeLastActivity(worktreePath)
+	switch {
+	case !ok:
+		return "worktree last activity indeterminate (failing closed)"
+	case time.Since(last) < quiet:
+		return fmt.Sprintf("worktree used within the quiet period: quiet_period=%s", quiet)
+	}
+	return ""
+}
+
+// worktreeLastActivity returns when worktreePath was last used: the newest
+// mtime among its root directory and its private gitdir's HEAD, index and
+// logs/HEAD. A commit writes the index and logs/HEAD, a checkout also rewrites
+// HEAD, `git add` writes the index, and creating or removing a file in the root
+// touches the directory. These are a handful of stats, never a tree walk, because the
+// reaper runs inside the controller tick.
+//
+// This is the signal the liveness gate lacks for a seat whose resident process
+// sits in its home and reaches the worktree only through short-lived shell
+// calls: no process cwd is ever inside the tree when the scan runs, but every
+// commit it makes there leaves a fresh mtime (pl-4fj: a seat's tree reaped
+// six minutes after its last commit).
+//
+// ok is false when the gitdir cannot be resolved from the ".git" pointer or
+// the root or HEAD cannot be stat'd. The index and logs/HEAD may legitimately
+// be absent and are skipped then; any other error on them is indeterminate.
+func worktreeLastActivity(worktreePath string) (time.Time, bool) {
+	gitDir, ok := worktreeGitDir(worktreePath)
+	if !ok {
+		return time.Time{}, false
+	}
+	var newest time.Time
+	for _, sig := range [...]struct {
+		path     string
+		optional bool
+	}{
+		{worktreePath, false},
+		{filepath.Join(gitDir, "HEAD"), false},
+		{filepath.Join(gitDir, "index"), true},
+		{filepath.Join(gitDir, "logs", "HEAD"), true},
+	} {
+		info, err := os.Stat(sig.path)
+		if err != nil {
+			if sig.optional && os.IsNotExist(err) {
+				continue
+			}
+			return time.Time{}, false
+		}
+		if info.ModTime().After(newest) {
+			newest = info.ModTime()
+		}
+	}
+	return newest, true
+}
+
+// worktreeGitDir resolves a linked worktree's private gitdir from the
+// "gitdir: <path>" line of its ".git" pointer file, resolving a relative path
+// against the worktree root. ok is false when the pointer is missing, is a
+// directory (a main worktree, never a reap candidate), or is malformed.
+func worktreeGitDir(worktreePath string) (string, bool) {
+	raw, err := os.ReadFile(filepath.Join(worktreePath, ".git"))
+	if err != nil {
+		return "", false
+	}
+	dir, found := strings.CutPrefix(strings.TrimSpace(string(raw)), "gitdir:")
+	dir = strings.TrimSpace(dir)
+	if !found || dir == "" {
+		return "", false
+	}
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(worktreePath, dir)
+	}
+	return dir, true
 }
 
 // scanBorrowVetoReferences issues one batched beads.Store.List query and
