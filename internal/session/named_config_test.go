@@ -1504,3 +1504,32 @@ func TestResolveNamedSessionSpecForConfigTarget_AmbiguityNamesAnAddressForEachCa
 		}
 	}
 }
+
+// ga-elylrw (finding 3): "/qcore/barry" matched qcore/barry and was then
+// dropped as rig-scoped, so a rooted path to a rig seat read as "not found".
+// A rooted qualified target is a path from the city root.
+func TestResolveNamedSessionSpecForConfigTarget_RootedQualifiedTargetIsThatRigSeat(t *testing.T) {
+	for _, rigContext := range []string{"", "qcore", "other"} {
+		spec, ok, err := ResolveNamedSessionSpecForConfigTarget(barryCityAndRigConfig(), "test-city", "/qcore/barry", rigContext)
+		if err != nil || !ok || spec.Identity != "qcore/barry" {
+			t.Fatalf("ResolveNamedSessionSpecForConfigTarget(/qcore/barry, rig %q) = %q ok=%v err=%v, want qcore/barry", rigContext, spec.Identity, ok, err)
+		}
+	}
+	// A rooted path that names no seat stays a plain miss, not an error.
+	if _, ok, err := ResolveNamedSessionSpecForConfigTarget(barryCityAndRigConfig(), "test-city", "/nope/barry", "qcore"); ok || err != nil {
+		t.Fatalf("ResolveNamedSessionSpecForConfigTarget(/nope/barry) ok=%v err=%v, want not found", ok, err)
+	}
+}
+
+func TestRootedNamedSessionIdentity(t *testing.T) {
+	for in, want := range map[string]string{
+		"barry":         "/barry",
+		"gastown.mayor": "/gastown.mayor",
+		"qcore/barry":   "qcore/barry",
+		"":              "",
+	} {
+		if got := RootedNamedSessionIdentity(in); got != want {
+			t.Fatalf("RootedNamedSessionIdentity(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

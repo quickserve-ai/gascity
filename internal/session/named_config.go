@@ -119,6 +119,19 @@ func SplitCityScopedTarget(target string) (string, bool) {
 	return target, false
 }
 
+// RootedNamedSessionIdentity is the form of a resolved identity that resolves
+// back to the same seat from any cwd. A city-scoped identity carries no rig
+// qualifier, so it is rooted; a rig identity is returned as is. Code that
+// resolves a target and then hands spec.Identity to another resolver must pass
+// this form: the bare leaf re-resolved in a rig context also matches
+// "<rig>/<leaf>" and comes back ambiguous (ga-elylrw).
+func RootedNamedSessionIdentity(identity string) string {
+	if identity == "" || strings.Contains(identity, "/") {
+		return identity
+	}
+	return CityScopePrefix + identity
+}
+
 // namedSessionAddress is the form of spec's identity that resolves to it from
 // ANY cwd: a city-scoped seat is rooted, a rig-scoped identity is already
 // qualified by its rig.
@@ -135,13 +148,15 @@ func ResolveNamedSessionSpecForConfigTarget(cfg *config.City, cityName, target, 
 	if cfg == nil || target == "" {
 		return NamedSessionSpec{}, false, nil
 	}
+	qualified := strings.Contains(target, "/")
 	if cityScoped {
 		// Rooted at the city: no rig expansion, and rig-scoped seats are not
-		// reachable by their bare leaf.
+		// reachable by their bare leaf. A rooted QUALIFIED target is a path
+		// from the city root, so "/qcore/barry" is qcore/barry, the way an
+		// absolute path names the same file from any cwd (ga-elylrw).
 		rigContext = ""
 	}
 
-	qualified := strings.Contains(target, "/")
 	identities := map[string]bool{target: true}
 	if !qualified && rigContext != "" {
 		identities[rigContext+"/"+target] = true
@@ -178,7 +193,7 @@ func ResolveNamedSessionSpecForConfigTarget(cfg *config.City, cityName, target, 
 				match = true
 			}
 		}
-		if cityScoped && ns.Dir != "" {
+		if cityScoped && !qualified && ns.Dir != "" {
 			match = false
 		}
 		if !match {

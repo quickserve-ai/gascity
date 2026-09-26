@@ -735,7 +735,9 @@ func cliDirectSessionResolver(store beads.Store, cityName, cityPath string, cfg 
 	if !ok {
 		return "", false, nil
 	}
-	id, err := resolveSessionIDMaterializingNamed(cityPath, cfg, store, spec.Identity)
+	// Rooted, so a city seat is not re-resolved as ambiguous from a rig cwd
+	// (ga-elylrw).
+	id, err := resolveSessionIDMaterializingNamed(cityPath, cfg, store, session.RootedNamedSessionIdentity(spec.Identity))
 	if err != nil {
 		return "", false, err
 	}
