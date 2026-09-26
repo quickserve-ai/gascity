@@ -208,9 +208,20 @@ func TestDrainAckWithAssignedWork_PoolSeatsTornDownAndReplaced(t *testing.T) {
 	}
 
 	// The next tick: nothing is retained, and the two released beads are demand
-	// for two fresh seats.
+	// for two fresh seats. The summary is read BEFORE the desired-state build,
+	// because that build mints the replacement seats' beads.
 	if got := f.openSeatCount(t); got != 0 {
 		t.Fatalf("open_count after the drain acks = %d, want 0", got)
+	}
+	sum, ok := f.tickSummary(t, map[string]int{drainAckTeardownTemplate: 2})
+	if !ok {
+		t.Fatalf("no tick summary for %s", drainAckTeardownTemplate)
+	}
+	if sum.reason != TraceReasonNoMatchingSession || sum.fields["open_count"] != 0 {
+		t.Errorf("tick summary after teardown = reason %s open_count %v, want %s / 0", sum.reason, sum.fields["open_count"], TraceReasonNoMatchingSession)
+	}
+	if held, present := sum.fields["retained_for"]; present {
+		t.Errorf("tick summary after teardown carries retained_for=%v, want it omitted with no open seats", held)
 	}
 	ds := buildDesiredState("trace-town", f.cityDir, f.clk.Now(), f.cfg, f.sp, f.store, io.Discard)
 	desired := 0
@@ -222,17 +233,17 @@ func TestDrainAckWithAssignedWork_PoolSeatsTornDownAndReplaced(t *testing.T) {
 	if desired != 2 {
 		t.Fatalf("desired %s seats after the drain acks = %d, want 2 (a replacement per released bead)", drainAckTeardownTemplate, desired)
 	}
-	// The trace's tick summary: no open seat, so nothing is retained and no
-	// retained_for is recorded.
-	sum, ok := f.tickSummary(t, map[string]int{drainAckTeardownTemplate: 2})
-	if !ok {
-		t.Fatalf("no tick summary for %s", drainAckTeardownTemplate)
+	// The replacements are NEW seats, not the torn-down ones reopened.
+	snap, err := loadSessionBeadSnapshot(f.store)
+	if err != nil {
+		t.Fatalf("loadSessionBeadSnapshot: %v", err)
 	}
-	if sum.reason != TraceReasonNoMatchingSession || sum.fields["open_count"] != 0 {
-		t.Errorf("tick summary after teardown = reason %s open_count %v, want %s / 0", sum.reason, sum.fields["open_count"], TraceReasonNoMatchingSession)
-	}
-	if held, present := sum.fields["retained_for"]; present {
-		t.Errorf("tick summary after teardown carries retained_for=%v, want it omitted with no open seats", held)
+	for _, info := range snap.OpenInfos() {
+		for _, old := range f.sessions {
+			if info.ID == old.ID {
+				t.Fatalf("torn-down seat %s is open again", old.ID)
+			}
+		}
 	}
 }
 
