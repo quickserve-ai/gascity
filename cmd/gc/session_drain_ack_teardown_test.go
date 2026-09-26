@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +15,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/runtime"
+	sessionpkg "github.com/gastownhall/gascity/internal/session"
 )
 
 // drainAckTeardownFixture is the ga-x99xh0 replay shape: a max-2 pool whose two
@@ -26,6 +30,7 @@ type drainAckTeardownFixture struct {
 	dops     *fakeDrainOps
 	dt       *drainTracker
 	clk      *clock.Fake
+	stderr   bytes.Buffer
 	sessions []beads.Bead
 	work     []beads.Bead
 }
@@ -89,8 +94,32 @@ func (f *drainAckTeardownFixture) tick(t *testing.T, dops drainOps) {
 	reconcileSessionBeads(
 		context.Background(), current, ds.State, map[string]bool{drainAckTeardownTemplate: true},
 		f.cfg, f.sp, f.store, dops, nil, nil, f.dt, ds.PoolDesiredCounts, false, nil, "trace-town",
-		nil, f.clk, f.rec, 0, 0, io.Discard, io.Discard,
+		nil, f.clk, f.rec, 0, 0, io.Discard, &f.stderr,
 	)
+}
+
+// tickSummary is the template tick summary the trace would record for the pool
+// template, built from the fixture's current open seats and the given pool demand.
+func (f *drainAckTeardownFixture) tickSummary(t *testing.T, poolDesired map[string]int) (templateTickSummary, bool) {
+	t.Helper()
+	snap, err := loadSessionBeadSnapshot(f.store)
+	if err != nil {
+		t.Fatalf("loadSessionBeadSnapshot: %v", err)
+	}
+	_, summaries := buildTemplateTickSummaries(f.cfg, snap.OpenInfos(), nil, poolDesired, nil, nil)
+	sum, ok := summaries[drainAckTeardownTemplate]
+	return sum, ok
+}
+
+// drainAckedEventCount counts SessionDrainAckedWithAssignedWork events recorded.
+func drainAckedEventCount(rec *events.Fake) int {
+	n := 0
+	for _, ev := range rec.Events {
+		if ev.Type == events.SessionDrainAckedWithAssignedWork {
+			n++
+		}
+	}
+	return n
 }
 
 // openSeatCount is the template's open_count as the tick-summary trace reads it:
@@ -141,20 +170,18 @@ func TestDrainAckWithAssignedWork_PoolSeatsTornDownAndReplaced(t *testing.T) {
 	// Tick 2: runtimes gone -> finalize the acks.
 	f.tick(t, f.dops)
 
-	acked := 0
-	for _, ev := range f.rec.Events {
-		if ev.Type == events.SessionDrainAckedWithAssignedWork {
-			acked++
-		}
-	}
-	if acked != 2 {
+	if acked := drainAckedEventCount(f.rec); acked != 2 {
 		t.Fatalf("%s events = %d, want 2 (the observation must still be recorded)", events.SessionDrainAckedWithAssignedWork, acked)
 	}
+	logged := f.stderr.String()
 	for _, s := range f.sessions {
 		got := mustGetBead(t, f.store, s.ID)
 		if got.Status != "closed" {
 			t.Errorf("seat %s: status=%q state=%q sleep_reason=%q, want closed — a seat that acked a drain while assigned must be torn down, not retained",
 				s.ID, got.Status, got.Metadata["state"], got.Metadata["sleep_reason"])
+		}
+		if want := sessionpkg.CanonicalCloseReason(drainAckTeardownCloseReason); got.Metadata["close_reason"] != want {
+			t.Errorf("seat %s close_reason = %q, want %q", s.ID, got.Metadata["close_reason"], want)
 		}
 	}
 	for _, w := range f.work {
@@ -167,6 +194,9 @@ func TestDrainAckWithAssignedWork_PoolSeatsTornDownAndReplaced(t *testing.T) {
 		}
 		if route := got.Metadata[beadmeta.RoutedToMetadataKey]; route != drainAckTeardownTemplate {
 			t.Errorf("work %s gc.routed_to = %q, want %q kept", w.ID, route, drainAckTeardownTemplate)
+		}
+		if !drainAckTeardownAudited(logged, w.ID) {
+			t.Errorf("no release audit line for %s with path=%s; stderr=%s", w.ID, drainAckTeardownReleasePath, logged)
 		}
 	}
 
@@ -185,12 +215,61 @@ func TestDrainAckWithAssignedWork_PoolSeatsTornDownAndReplaced(t *testing.T) {
 	if desired != 2 {
 		t.Fatalf("desired %s seats after the drain acks = %d, want 2 (a replacement per released bead)", drainAckTeardownTemplate, desired)
 	}
+	// The trace's tick summary: no open seat, so nothing is retained and no
+	// retained_for is recorded.
+	sum, ok := f.tickSummary(t, map[string]int{drainAckTeardownTemplate: 2})
+	if !ok {
+		t.Fatalf("no tick summary for %s", drainAckTeardownTemplate)
+	}
+	if sum.reason != TraceReasonNoMatchingSession || sum.fields["open_count"] != 0 {
+		t.Errorf("tick summary after teardown = reason %s open_count %v, want %s / 0", sum.reason, sum.fields["open_count"], TraceReasonNoMatchingSession)
+	}
+	if held, present := sum.fields["retained_for"]; present {
+		t.Errorf("tick summary after teardown carries retained_for=%v, want it omitted with no open seats", held)
+	}
 }
 
-// TestDrainAckTeardown_WorkingSeatStillCounted is the control: a seat that is
-// genuinely working (runtime alive, bead in_progress, no drain) is capacity. A
-// reconcile tick must leave it open, keep its assignment, and keep counting it.
-func TestDrainAckTeardown_WorkingSeatStillCounted(t *testing.T) {
+// drainAckTeardownAudited reports whether the release audit line for id names
+// the drain-ack teardown as its path.
+func drainAckTeardownAudited(logged, id string) bool {
+	for _, line := range strings.Split(logged, "\n") {
+		if strings.Contains(line, "RELEASED work "+id+":") && strings.Contains(line, "path="+drainAckTeardownReleasePath) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestDrainAckTeardown_TickSummaryNamesRetainedSeats pins the trace wiring in the
+// incident's retained shape: two open seats asleep/idle, each holding a bead, is
+// what the tick summary used to call a bare "retained". It must now say what the
+// seats are retained FOR.
+func TestDrainAckTeardown_TickSummaryNamesRetainedSeats(t *testing.T) {
+	f := newDrainAckTeardownFixture(t)
+	for _, s := range f.sessions {
+		for k, v := range map[string]string{"state": "asleep", "sleep_reason": "idle"} {
+			if err := f.store.SetMetadata(s.ID, k, v); err != nil {
+				t.Fatalf("SetMetadata(%s=%s): %v", k, v, err)
+			}
+		}
+	}
+	sum, ok := f.tickSummary(t, map[string]int{drainAckTeardownTemplate: 2})
+	if !ok {
+		t.Fatalf("no tick summary for %s", drainAckTeardownTemplate)
+	}
+	if sum.reason != TraceReasonRetained || sum.fields["open_count"] != 2 {
+		t.Fatalf("tick summary = reason %s open_count %v, want retained / 2", sum.reason, sum.fields["open_count"])
+	}
+	if got, want := sum.fields["retained_for"], map[string]int{"asleep:idle": 2}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("retained_for = %#v, want %#v", got, want)
+	}
+}
+
+// TestDrainAckTeardown_RegressionGuardWorkingSeatStillCounted is a regression
+// guard, not a test of the teardown: it never drains, so it never reaches the new
+// code. It pins that a genuinely working seat (runtime alive, bead in_progress, no
+// drain) is untouched by the ticks around it — open, assigned, and counted.
+func TestDrainAckTeardown_RegressionGuardWorkingSeatStillCounted(t *testing.T) {
 	f := newDrainAckTeardownFixture(t)
 	f.tick(t, newFakeDrainOps())
 	f.tick(t, newFakeDrainOps())
@@ -241,5 +320,132 @@ func TestDrainAckTeardown_CertParkedWorkIsRetained(t *testing.T) {
 	w := mustGetBead(t, f.store, parked.ID)
 	if w.Assignee != f.sessions[0].ID {
 		t.Fatalf("cert-parked bead assignee = %q, want %q (the park's owner must be kept)", w.Assignee, f.sessions[0].ID)
+	}
+	if n := drainAckedEventCount(f.rec); n != 1 {
+		t.Fatalf("%s events = %d, want exactly 1", events.SessionDrainAckedWithAssignedWork, n)
+	}
+	if want := "seat kept: cert_parked_work:" + parked.ID; !strings.Contains(f.stderr.String(), want) {
+		t.Fatalf("stderr does not name the retention reason %q: %s", want, f.stderr.String())
+	}
+}
+
+// staleLabelCacheStore serves a cached Get for staleID that predates its labels,
+// while its LIVE handle reads the backing store — the CachingStore shape in which
+// a cert hold exists only in the backing store.
+type staleLabelCacheStore struct {
+	beads.Store
+	staleID string
+}
+
+func (s staleLabelCacheStore) Get(id string) (beads.Bead, error) {
+	b, err := s.Store.Get(id)
+	if err == nil && id == s.staleID {
+		b.Labels = nil
+	}
+	return b, err
+}
+
+func (s staleLabelCacheStore) Handles() beads.StoreHandles {
+	backing := beads.HandlesFor(s.Store)
+	return beads.StoreHandles{Cached: backing.Cached, Live: backing.Live, Writer: s}
+}
+
+// TestDrainAckTeardown_CertParkReadsLiveLabelsNotCache: a cached row without the
+// hold label must not license the release when the live row carries it.
+func TestDrainAckTeardown_CertParkReadsLiveLabelsNotCache(t *testing.T) {
+	mem := beads.NewMemStore()
+	seat, err := mem.Create(beads.Bead{
+		Title:    "worker session",
+		Type:     sessionBeadType,
+		Status:   "open",
+		Metadata: map[string]string{"session_name": "worker-1", "pool_managed": "true", "pool_slot": "1"},
+	})
+	if err != nil {
+		t.Fatalf("create seat: %v", err)
+	}
+	work, err := mem.Create(beads.Bead{
+		Title:    "parked PR carrier",
+		Type:     "task",
+		Assignee: seat.ID,
+		Labels:   []string{beadmeta.CertWaitHoldLabel},
+		Metadata: map[string]string{beadmeta.RoutedToMetadataKey: "worker"},
+	})
+	if err != nil {
+		t.Fatalf("create work: %v", err)
+	}
+	inProgress := "in_progress"
+	if err := mem.Update(work.ID, beads.UpdateOpts{Status: &inProgress}); err != nil {
+		t.Fatalf("set work in_progress: %v", err)
+	}
+	store := staleLabelCacheStore{Store: mem, staleID: work.ID}
+	if cached, _ := store.Get(work.ID); beadmeta.CertParkSuppressesAssignedWake(cached.Labels) {
+		t.Fatal("precondition: the cached row must NOT show the hold, or the test proves nothing")
+	}
+
+	var stderr bytes.Buffer
+	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	outcome := tearDownDrainAckedPoolSeat("", nil, store, nil, seedSessionInfo(mustGetBead(t, mem, seat.ID)), now, &stderr)
+	if outcome.closed || outcome.retainedFor != "cert_parked_work:"+work.ID {
+		t.Fatalf("outcome = %+v, want retained for cert_parked_work:%s (the live row carries the hold); stderr=%s", outcome, work.ID, stderr.String())
+	}
+	if got := mustGetBead(t, mem, work.ID); got.Assignee != seat.ID || got.Status != "in_progress" {
+		t.Fatalf("parked work assignee=%q status=%q, want %q/in_progress", got.Assignee, got.Status, seat.ID)
+	}
+	if got := mustGetBead(t, mem, seat.ID); got.Status == "closed" {
+		t.Fatal("the park's owner was closed on a stale cached row")
+	}
+}
+
+// TestDrainAckTeardown_NonPoolSeatsKeptWithReason is the control for seats the
+// teardown may not mutate: a plain (non-pool) seat and a configured named seat
+// that drain-ack holding work stay open and keep the work, the observation fires
+// exactly once, and the log names why the seat was kept.
+func TestDrainAckTeardown_NonPoolSeatsKeptWithReason(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		meta map[string]string
+	}{
+		{name: "plain seat", meta: nil},
+		{name: "named seat", meta: map[string]string{namedSessionMetadataKey: "true", "pool_managed": "true"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newReconcilerTestEnv()
+			env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+			env.addDesired("worker", "worker", true)
+			fake := events.NewFake()
+			env.rec = fake
+			seat := env.createSessionBead("worker", "worker")
+			env.markSessionActive(&seat)
+			if tc.meta != nil {
+				env.setSessionMetadata(&seat, tc.meta)
+			}
+			work, err := env.store.Create(beads.Bead{Title: "task", Type: "task", Status: "in_progress", Assignee: seat.ID})
+			if err != nil {
+				t.Fatalf("Create(work): %v", err)
+			}
+			dops := newFakeDrainOps()
+			if err := dops.setDrainAck("worker"); err != nil {
+				t.Fatalf("setDrainAck: %v", err)
+			}
+			cfgNames := map[string]bool{"worker": true}
+			reconcileSessionBeads(
+				context.Background(), []beads.Bead{seat}, env.desiredState, cfgNames, env.cfg, env.sp,
+				env.store, dops, nil, nil, env.dt, nil, false, nil, "",
+				nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr,
+			)
+			got := env.reconcileStopPendingToTerminal(t, env.sp, seat, dops, cfgNames)
+			if got.Status == "closed" {
+				t.Fatalf("%s was closed; a non-pool seat must be kept", tc.name)
+			}
+			if w := mustGetBead(t, env.store, work.ID); w.Assignee != seat.ID {
+				t.Fatalf("work assignee = %q, want %q kept", w.Assignee, seat.ID)
+			}
+			if n := drainAckedEventCount(fake); n != 1 {
+				t.Fatalf("%s events = %d, want exactly 1", events.SessionDrainAckedWithAssignedWork, n)
+			}
+			if !strings.Contains(env.stderr.String(), "seat kept: ") {
+				t.Fatalf("stderr does not name why the seat was kept: %s", env.stderr.String())
+			}
+		})
 	}
 }
