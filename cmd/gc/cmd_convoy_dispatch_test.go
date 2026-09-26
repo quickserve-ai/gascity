@@ -6079,30 +6079,43 @@ func TestRunControlDispatcherQuarantinesRalphControlMissingIteration(t *testing.
 }
 
 // TestRunControlDispatcherQuarantinesGenericControlFailure pins the generic
-// (unclassified) refusal arm of handleControlDispatchError. It used to reach
-// that arm through an unknown gc.kind, but the dispatcher now refuses any
-// non-control kind before ProcessControl without touching the bead
-// (TestRunControlDispatcherRefusesNonControlKindWithoutQuarantine), so the
-// generic refusal is fed to the handler directly for a real control bead.
+// (unclassified) refusal arm of handleControlDispatchError, driven end to end
+// through the dispatcher. It used to reach that arm through an unknown gc.kind,
+// but the dispatcher now refuses any non-control kind before ProcessControl
+// without touching the bead (ga-k74enr;
+// TestRunControlDispatcherRefusesNonControlKindWithoutQuarantine). So the
+// failure is a real handler refusal on a real control kind: a scope-check
+// whose blocking subject resolves but which carries no gc.root_bead_id.
 func TestRunControlDispatcherQuarantinesGenericControlFailure(t *testing.T) {
 	clearGCEnv(t)
 
 	store := beads.NewMemStore()
+	subject, err := store.Create(beads.Bead{Title: "closed subject", Type: "task"})
+	if err != nil {
+		t.Fatalf("create subject: %v", err)
+	}
+	if err := store.Close(subject.ID); err != nil {
+		t.Fatalf("close subject: %v", err)
+	}
 	control, err := store.Create(beads.Bead{
 		Title: "Failing control",
 		Type:  "task",
 		Metadata: map[string]string{
-			"gc.kind": "scope-check",
+			"gc.kind":      "scope-check",
+			"gc.scope_ref": "review-loop.iteration.1",
 		},
 	})
 	if err != nil {
 		t.Fatalf("create control: %v", err)
 	}
+	if err := store.DepAdd(control.ID, subject.ID, "blocks"); err != nil {
+		t.Fatalf("add control dependency: %v", err)
+	}
 
 	var stderr bytes.Buffer
-	cause := fmt.Errorf("%s: unsupported control bead kind %q", control.ID, "unknown-control-kind")
-	if err := handleControlDispatchError(t.TempDir(), t.TempDir(), store, control, control.ID, cause, &stderr); err != nil {
-		t.Fatalf("handleControlDispatchError: %v", err)
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	if err := runControlDispatcherWithStoreAndConfig(t.TempDir(), t.TempDir(), store, control.ID, cfg, io.Discard, &stderr); err != nil {
+		t.Fatalf("runControlDispatcherWithStoreAndConfig: %v", err)
 	}
 
 	after, err := store.Get(control.ID)
@@ -6121,8 +6134,8 @@ func TestRunControlDispatcherQuarantinesGenericControlFailure(t *testing.T) {
 	if got := after.Metadata["gc.control_quarantined"]; got != "true" {
 		t.Fatalf("gc.control_quarantined = %q, want true", got)
 	}
-	if got := after.Metadata["gc.controller_error"]; !strings.Contains(got, "unsupported control bead kind") {
-		t.Fatalf("gc.controller_error = %q, want unsupported control bead kind", got)
+	if got := after.Metadata["gc.controller_error"]; !strings.Contains(got, "missing gc.root_bead_id") {
+		t.Fatalf("gc.controller_error = %q, want the handler's missing gc.root_bead_id refusal", got)
 	}
 	if got := after.Metadata["gc.final_disposition"]; got != "control_quarantined" {
 		t.Fatalf("gc.final_disposition = %q, want control_quarantined", got)

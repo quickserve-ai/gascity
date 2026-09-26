@@ -350,19 +350,33 @@ func claimNotControlKindTrace(beadID string) bool {
 // have matched -- assigned to one of its candidates, or unassigned and routed
 // to one of its routes -- is traced (once per bead ID per process) with the
 // assignee or route it matched, so it does not vanish silently.
+//
+// The per-bead line is deduped, so a misrouted bead that stays open and ready
+// would otherwise be visible exactly once per dispatcher process. Every scan
+// that drops at least one matched bead therefore also writes one undeduped
+// count line, so a trace read at any later time still shows that misrouted
+// work is sitting on this dispatcher's routes.
 func dropNonControlKindReady(ready []beads.Bead, candidates, routes []string) []beads.Bead {
 	kept := make([]beads.Bead, 0, len(ready))
+	dropped := 0
 	for _, b := range ready {
 		if isControlKindBead(b.Metadata) {
 			kept = append(kept, b)
 			continue
 		}
 		matched := controlReadyMatch(b, candidates, routes)
-		if matched == "" || !claimNotControlKindTrace(b.ID) {
+		if matched == "" {
+			continue
+		}
+		dropped++
+		if !claimNotControlKindTrace(b.ID) {
 			continue
 		}
 		workflowTracef("serve control-ready skip bead=%s kind=%s matched=%s reason=not_control_kind",
 			b.ID, b.Metadata[beadmeta.KindMetadataKey], matched)
+	}
+	if dropped > 0 {
+		workflowTracef("serve control-ready dropped-non-control count=%d", dropped)
 	}
 	return kept
 }
