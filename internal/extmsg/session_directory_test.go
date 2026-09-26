@@ -40,6 +40,13 @@ func (d *switchableSessionDirectory) ListAddresses(includeClosed bool) ([]sessio
 	return d.delegate.ListAddresses(includeClosed)
 }
 
+func (d *switchableSessionDirectory) ListClosedByNamedIdentity(identity string) ([]session.Info, error) {
+	if d.err != nil {
+		return nil, d.err
+	}
+	return d.delegate.ListClosedByNamedIdentity(identity)
+}
+
 func TestSessionDirectorySplitKeepsExtmsgRecordsInMessaging(t *testing.T) {
 	freezeTestClock(t)
 	messaging := beads.NewMemStore()
