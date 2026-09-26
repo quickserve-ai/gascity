@@ -166,6 +166,10 @@ func resolveMailWakeTarget(recipient string, resolve func(string) (nudgeTarget, 
 		if errors.Is(rootedErr, session.ErrSessionNotFound) {
 			// No city seat by that name: the ambiguity was between rig
 			// seats, and its error lists them. Keep it (ga-elylrw N1).
+			// Known edge: a city seat that exists but fails to
+			// materialize also reads as not-found here (the materialize
+			// error wraps ErrSessionNotFound), so it reports this
+			// ambiguity instead of that failure (ga-pml0rv).
 			return target, err
 		}
 		return rooted, rootedErr
