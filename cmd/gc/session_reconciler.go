@@ -6501,9 +6501,12 @@ func sendConfigDriftHandoffMailWithStores(msgStore, sessStore beads.Store, rec e
 	if msgStore == nil || sessStore == nil || recipient == "" {
 		return
 	}
-	createHandoffMail(msgStore, sessStore, rec, controllerMailIdentity, recipient,
+	// No restart hint: this restart proceeds whatever the note's fate, so the
+	// "NOT restarted, re-run gc handoff" advice would be false here.
+	createHandoffMailReporting(msgStore, sessStore, rec, controllerMailIdentity, recipient,
 		[]string{"HANDOFF: config-drift restart", body}, "HANDOFF: config-drift restart",
-		[]string{mail.AutoHandoffLabel, mail.ArchiveAfterInjectLabel, "priority:1"}, stderr)
+		[]string{mail.AutoHandoffLabel, mail.ArchiveAfterInjectLabel, "priority:1"}, stderr,
+		"session reconciler: config-drift handoff", "")
 }
 
 // reconcilerMailStore resolves the MESSAGING-class store for the mail the
