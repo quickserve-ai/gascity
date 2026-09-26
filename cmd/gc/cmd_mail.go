@@ -46,6 +46,16 @@ var (
 	mailReplyJSONRunner = cmdMailReplyJSON
 )
 
+// mailStorageCheckCommand is the command that tells whether an unconfirmed
+// message actually landed. Not gc bd show: mail beads are wisps, which bd show
+// does not read. Not a plain gc mail peek either: with a controller up it is
+// answered by the API's cache, which absorbed the create whether or not the row
+// landed. GC_NO_API=1 forces the local, uncached mail provider, whose Get falls
+// back to the wisp tier (ga-0ejdbv round 3).
+func mailStorageCheckCommand(id string) string {
+	return "GC_NO_API=1 gc mail peek " + id
+}
+
 // classifyMailWriteFailure turns a read-after-write verdict into an exit code
 // and the guidance that verdict deserves. The two verdicts stay distinct on
 // purpose: a VERIFIED-ABSENT message must be re-sent, while an UNCONFIRMED one
@@ -64,9 +74,8 @@ func classifyMailWriteFailure(stderr io.Writer, cmdLabel string, err error) int 
 		if !ok {
 			id = "<message-id>"
 		}
-		fmt.Fprintf(stderr, "%s: DELIVERY UNCONFIRMED — %v\n", cmdLabel, err)                                           //nolint:errcheck // best-effort stderr
-		fmt.Fprintf(stderr, "hint: the write may have landed. Confirm with \"gc bd show %s\" before re-sending;\n", id) //nolint:errcheck // best-effort stderr
-		fmt.Fprintln(stderr, "      gc bd show answers correctly whether or not it was archived.")                      //nolint:errcheck // best-effort stderr
+		fmt.Fprintf(stderr, "%s: DELIVERY UNCONFIRMED — %v\n", cmdLabel, err)                                                         //nolint:errcheck // best-effort stderr
+		fmt.Fprintf(stderr, "hint: the write may have landed. Confirm with \"%s\" before re-sending.\n", mailStorageCheckCommand(id)) //nolint:errcheck // best-effort stderr
 		return mailSendUnconfirmedExit
 	}
 	return 0
@@ -150,6 +159,19 @@ type mailActionResult struct {
 	// Unreached lists configured named seats a --all broadcast did NOT reach
 	// because they had no open session (ga-dwgz52).
 	Unreached []string `json:"unreached,omitempty"`
+	// Lost, Failed and Unconfirmed are a --all broadcast's per-recipient
+	// failures (ok=false): re-send to Lost and Failed by address, check each
+	// Unconfirmed ID first. Never re-run --all (ga-0ejdbv).
+	Lost        []string                   `json:"lost,omitempty"`
+	Failed      []string                   `json:"failed,omitempty"`
+	Unconfirmed []mailUnconfirmedRecipient `json:"unconfirmed,omitempty"`
+}
+
+// mailUnconfirmedRecipient names a --all recipient whose message may have
+// landed as ID but could not be read back.
+type mailUnconfirmedRecipient struct {
+	To string `json:"to"`
+	ID string `json:"id"`
 }
 
 type mailMessageSummary struct {
@@ -2599,6 +2621,7 @@ func doMailSendAllCoverage(mp mail.Provider, rec events.Recorder, validRecipient
 	// recipients 1..k-1 (ga-0ejdbv review finding 3). Every recipient is
 	// attempted and the summary names exactly who needs what.
 	var lost, failed, unconfirmed, attemptedFailed []string
+	var unconfirmedRecipients []mailUnconfirmedRecipient
 	for _, to := range recipients {
 		m, err := mp.Send(sender, to, subject, body)
 		if err != nil {
@@ -2607,6 +2630,7 @@ func doMailSendAllCoverage(mp mail.Provider, rec events.Recorder, validRecipient
 			case isUnconfirmed:
 				fmt.Fprintf(stderr, "gc mail send --all: sending to %s: DELIVERY UNCONFIRMED as %s: %v\n", to, id, err) //nolint:errcheck // best-effort stderr
 				unconfirmed = append(unconfirmed, fmt.Sprintf("%s (%s)", to, id))
+				unconfirmedRecipients = append(unconfirmedRecipients, mailUnconfirmedRecipient{To: to, ID: id})
 			case errors.Is(err, beadmail.ErrNotPersisted):
 				fmt.Fprintf(stderr, "gc mail send --all: sending to %s: NOT DELIVERED: %v\n", to, err) //nolint:errcheck // best-effort stderr
 				lost = append(lost, to)
@@ -2653,13 +2677,16 @@ func doMailSendAllCoverage(mp mail.Provider, rec events.Recorder, validRecipient
 	if len(unreached) > 0 {
 		fmt.Fprintf(stderr, "gc mail send --all: WARNING: reached %d open mailbox(es); %d configured named seat(s) had no open session and got NOTHING: %s. --all covers open sessions only; mail each by address to reach it.\n", len(sent), len(unreached), strings.Join(unreached, ", ")) //nolint:errcheck // best-effort stderr
 	}
-	if code := reportMailSendAllFailures(stderr, len(sent), lost, failed, unconfirmed); code != 0 {
-		return code
-	}
+	code := reportMailSendAllFailures(stderr, len(sent), lost, failed, unconfirmed)
 	if jsonOut {
-		return writeCLIJSONLineOrExit(stdout, stderr, "gc mail send", mailActionResult{SchemaVersion: "1", OK: true, Command: "mail.send", Action: "send", Messages: sent, Count: intRef(len(sent)), Notified: notified, Unreached: unreached})
+		// Written on failure too: a JSON caller must learn which recipients
+		// already have the message, or it re-runs --all and duplicates to
+		// them (ga-0ejdbv round 3). The exit code still carries the verdict.
+		if w := writeCLIJSONLineOrExit(stdout, stderr, "gc mail send", mailActionResult{SchemaVersion: "1", OK: code == 0, Command: "mail.send", Action: "send", Messages: sent, Count: intRef(len(sent)), Notified: notified, Unreached: unreached, Lost: lost, Failed: failed, Unconfirmed: unconfirmedRecipients}); w != 0 {
+			return w
+		}
 	}
-	return 0
+	return code
 }
 
 // reportMailSendAllFailures summarizes a broadcast's per-recipient failures
@@ -2679,7 +2706,7 @@ func reportMailSendAllFailures(stderr io.Writer, delivered int, lost, failed, un
 		fmt.Fprintf(stderr, "  FAILED (see the errors above), re-send to each by address: %s\n", strings.Join(failed, ", ")) //nolint:errcheck // best-effort stderr
 	}
 	if len(unconfirmed) > 0 {
-		fmt.Fprintf(stderr, "  UNCONFIRMED, may have landed; check each ID with \"gc bd show <id>\" before re-sending: %s\n", strings.Join(unconfirmed, ", ")) //nolint:errcheck // best-effort stderr
+		fmt.Fprintf(stderr, "  UNCONFIRMED, may have landed; check each ID with \""+mailStorageCheckCommand("<id>")+"\" before re-sending: %s\n", strings.Join(unconfirmed, ", ")) //nolint:errcheck // best-effort stderr
 	}
 	switch {
 	case len(lost) > 0:

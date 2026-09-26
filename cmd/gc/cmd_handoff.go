@@ -344,6 +344,16 @@ func doHandoffAuto(msgStore, sessStore beads.Store, rec events.Recorder, session
 // confined inside beadmail.Provider.SendHandoff. The returned mail.Message
 // carries the assigned ID for the caller's confirmation output.
 func createHandoffMail(msgStore, sessStore beads.Store, rec events.Recorder, senderAddress, recipientAddress string, args []string, defaultSubject string, extraLabels []string, stderr io.Writer) (mail.Message, bool) {
+	return createHandoffMailReporting(msgStore, sessStore, rec, senderAddress, recipientAddress, args, defaultSubject, extraLabels, stderr, "gc handoff",
+		"hint: the session was NOT restarted. If that check shows it, the note is saved and a re-run of gc handoff sends a second copy; if not, re-run gc handoff.")
+}
+
+// createHandoffMailReporting is createHandoffMail with the caller's own error
+// label and the restart hint an UNCONFIRMED note should carry. The hint is the
+// caller's because only the caller knows what happens next: gc handoff stops
+// before the restart, while the controller's config-drift handoff restarts the
+// session regardless and must not print "re-run gc handoff" (ga-0ejdbv round 3).
+func createHandoffMailReporting(msgStore, sessStore beads.Store, rec events.Recorder, senderAddress, recipientAddress string, args []string, defaultSubject string, extraLabels []string, stderr io.Writer, label, unconfirmedHint string) (mail.Message, bool) {
 	subject := defaultSubject
 	if len(args) > 0 {
 		subject = args[0]
@@ -374,11 +384,14 @@ func createHandoffMail(msgStore, sessStore beads.Store, rec events.Recorder, sen
 		// and what a re-run would do, instead of implying a plain retry
 		// (ga-0ejdbv review finding 2).
 		if id, ok := mail.UnconfirmedMessageID(err); ok {
-			fmt.Fprintf(stderr, "gc handoff: handoff note UNCONFIRMED: it may have landed as %s, but it could not be read back: %v\n", id, err)                                                                                //nolint:errcheck // best-effort stderr
-			fmt.Fprintf(stderr, "hint: the session was NOT restarted. Check with \"gc bd show %s\": if it exists, the note is saved and a re-run of gc handoff sends a second copy; if it does not, re-run gc handoff.\n", id) //nolint:errcheck // best-effort stderr
+			fmt.Fprintf(stderr, "%s: handoff note UNCONFIRMED: it may have landed as %s, but it could not be read back: %v\n", label, id, err) //nolint:errcheck // best-effort stderr
+			fmt.Fprintf(stderr, "check: %s\n", mailStorageCheckCommand(id))                                                                    //nolint:errcheck // best-effort stderr
+			if unconfirmedHint != "" {
+				fmt.Fprintln(stderr, unconfirmedHint) //nolint:errcheck // best-effort stderr
+			}
 			return mail.Message{}, false
 		}
-		fmt.Fprintf(stderr, "gc handoff: creating mail: %v\n", err) //nolint:errcheck // best-effort stderr
+		fmt.Fprintf(stderr, "%s: creating mail: %v\n", label, err) //nolint:errcheck // best-effort stderr
 		return mail.Message{}, false
 	}
 	rec.Record(events.Event{
