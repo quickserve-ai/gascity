@@ -39,6 +39,13 @@ const drainAckTeardownTemplate = "repo/worker"
 
 func newDrainAckTeardownFixture(t *testing.T) *drainAckTeardownFixture {
 	t.Helper()
+	return newDrainAckTeardownFixtureSized(t, 2, 2)
+}
+
+// newDrainAckTeardownFixtureSized is the fixture with max_active_sessions =
+// maxActive and `seats` seats, each holding one routed in_progress bead.
+func newDrainAckTeardownFixtureSized(t *testing.T, maxActive, seats int) *drainAckTeardownFixture {
+	t.Helper()
 	now := time.Date(2026, 9, 25, 23, 19, 33, 0, time.UTC)
 	cityDir := t.TempDir()
 	writeCityTOML(t, cityDir, "trace-town", "worker")
@@ -53,7 +60,7 @@ func newDrainAckTeardownFixture(t *testing.T) *drainAckTeardownFixture {
 				Dir:               "repo",
 				StartCommand:      "true",
 				MinActiveSessions: intPtr(0),
-				MaxActiveSessions: intPtr(2),
+				MaxActiveSessions: intPtr(maxActive),
 			}},
 		},
 		store: beads.NewMemStore(),
@@ -64,7 +71,7 @@ func newDrainAckTeardownFixture(t *testing.T) *drainAckTeardownFixture {
 		clk:   &clock.Fake{Time: now},
 	}
 	inProgress := "in_progress"
-	for slot := 1; slot <= 2; slot++ {
+	for slot := 1; slot <= seats; slot++ {
 		work := createRoutedReadyBeadForReplacement(t, f.store, drainAckTeardownTemplate, "platform leg")
 		seat := createCanonicalPoolSession(t, f.store, &f.cfg.Agents[0], now, slot)
 		setPoolSessionActive(t, f.store, seat.ID)
@@ -447,5 +454,39 @@ func TestDrainAckTeardown_NonPoolSeatsKeptWithReason(t *testing.T) {
 				t.Fatalf("stderr does not name why the seat was kept: %s", env.stderr.String())
 			}
 		})
+	}
+}
+
+// TestDrainAckTeardown_SingletonPoolIdentityKept: an agent with
+// max_active_sessions = 1 and no namepool runs a canonical singleton pool — its
+// seat is pool-managed but keeps one stable configured identity, bead and
+// conversation (config.Agent.UsesCanonicalSingletonPoolIdentity). A drain ack
+// while it holds work must not tear it down: it stays open, keeps its bead, the
+// observation fires exactly once, and the log names singleton_identity.
+func TestDrainAckTeardown_SingletonPoolIdentityKept(t *testing.T) {
+	f := newDrainAckTeardownFixtureSized(t, 1, 1)
+	if !f.cfg.Agents[0].UsesCanonicalSingletonPoolIdentity() {
+		t.Fatal("precondition: the fixture agent must use a canonical singleton identity")
+	}
+	seat := f.sessions[0]
+	name := seat.Metadata["session_name"]
+	if err := f.dops.setDrainAck(name); err != nil {
+		t.Fatalf("setDrainAck(%s): %v", name, err)
+	}
+	f.tick(t, f.dops)
+	waitForProviderStopped(t, f.sp, name)
+	f.tick(t, f.dops)
+
+	if got := mustGetBead(t, f.store, seat.ID); got.Status == "closed" {
+		t.Fatalf("singleton seat was torn down; close_reason=%q", got.Metadata["close_reason"])
+	}
+	if w := mustGetBead(t, f.store, f.work[0].ID); w.Assignee != seat.ID {
+		t.Fatalf("singleton seat's bead assignee = %q, want %q kept", w.Assignee, seat.ID)
+	}
+	if n := drainAckedEventCount(f.rec); n != 1 {
+		t.Fatalf("%s events = %d, want exactly 1", events.SessionDrainAckedWithAssignedWork, n)
+	}
+	if want := "seat kept: " + drainAckRetainedSingletonIdentity; !strings.Contains(f.stderr.String(), want) {
+		t.Fatalf("stderr does not name %q: %s", want, f.stderr.String())
 	}
 }
