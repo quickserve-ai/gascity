@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/mail"
 )
 
 // verifyStore drives the read-after-write guard: Create delegates to the real
@@ -170,6 +171,49 @@ func TestReplyAndHandoffAreGuardedToo(t *testing.T) {
 	p := New(store)
 	if _, err := p.Reply(original.ID, "woodhouse", "re", "body"); !errors.Is(err, ErrNotPersisted) {
 		t.Errorf("Reply err = %v, want ErrNotPersisted", err)
+	}
+	// SendHandoff funnels through the same edge (review round 1, finding 4:
+	// the test used to exercise only Reply).
+	if _, err := p.SendHandoff(mail.HandoffIntent{From: "woodhouse", To: "woodhouse", Subject: "HANDOFF", Body: "note", ThreadID: "handoff-t"}); !errors.Is(err, ErrNotPersisted) {
+		t.Errorf("SendHandoff err = %v, want ErrNotPersisted", err)
+	}
+}
+
+// An unconfirmed verdict names the message it could not confirm, through the
+// provider-neutral mail.UnconfirmedMessageID, so the CLI and the API can tell
+// the caller exactly which ID to check instead of inviting a duplicate send.
+func TestUnconfirmedVerdictCarriesTheMessageID(t *testing.T) {
+	fastVerify(t)
+	base := beads.NewMemStore()
+	store := &verifyStore{Store: base, getErrs: []error{beads.ErrVerifyIndeterminate}}
+	p := New(store)
+
+	_, err := p.Send("woodhouse", "katya", "subject", "body")
+	if !errors.Is(err, ErrUnconfirmed) {
+		t.Fatalf("Send err = %v, want ErrUnconfirmed", err)
+	}
+	id, ok := mail.UnconfirmedMessageID(err)
+	if !ok || id == "" {
+		t.Fatalf("UnconfirmedMessageID(%v) = %q, %v; want the created message's ID", err, id, ok)
+	}
+	if _, getErr := base.Get(id); getErr != nil {
+		t.Fatalf("the named ID %q is not the bead the send created: %v", id, getErr)
+	}
+	for _, intent := range []mail.HandoffIntent{{From: "woodhouse", To: "woodhouse", Subject: "HANDOFF", Body: "note", ThreadID: "handoff-u"}} {
+		_, err := p.SendHandoff(intent)
+		if hid, ok := mail.UnconfirmedMessageID(err); !ok || hid == "" {
+			t.Fatalf("SendHandoff unconfirmed err = %v; want it to carry the note's ID", err)
+		}
+	}
+	// A verified-absent write is NOT unconfirmed: the ID must not be offered
+	// as something to check.
+	lost := New(&verifyStore{Store: beads.NewMemStore(), getErrs: []error{beads.ErrNotFound}})
+	if _, err := lost.Send("woodhouse", "katya", "s", "b"); errors.Is(err, ErrNotPersisted) {
+		if _, ok := mail.UnconfirmedMessageID(err); ok {
+			t.Fatalf("a verified-absent write reported an unconfirmed ID: %v", err)
+		}
+	} else {
+		t.Fatalf("lost send err = %v, want ErrNotPersisted", err)
 	}
 }
 
