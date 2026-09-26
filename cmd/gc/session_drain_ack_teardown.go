@@ -34,6 +34,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
@@ -52,10 +53,31 @@ const drainAckTeardownCloseReason = "drained"
 
 // drainAckTeardownOutcome is what tearDownDrainAckedPoolSeat did. Exactly one of
 // closed or retainedFor is set: closed when the work was released and the seat's
-// bead closed, retainedFor naming why the seat was kept otherwise.
+// bead closed, retainedFor naming why the seat was kept otherwise. released and
+// attempted count the release sweep's work (attempted = released + failed), so a
+// seat kept AFTER the sweep ran (release_failed, close_failed) reports how much
+// of its work it no longer holds instead of implying it still holds all of it.
 type drainAckTeardownOutcome struct {
 	closed      bool
 	retainedFor string
+	released    int
+	attempted   int
+}
+
+// drainAckRetainedNotPoolSeat and drainAckRetainedCloseNotPermitted are the
+// retained_for reasons for a drain-ack with assigned work that the teardown is
+// not allowed to act on: the seat is not a disposable pool seat, or the call site
+// did not grant permission to close it.
+const (
+	drainAckRetainedNotPoolSeat       = "not_pool_seat"
+	drainAckRetainedCloseNotPermitted = "close_not_permitted"
+)
+
+// drainAckTeardownEligible reports whether a drain-acked seat is one the teardown
+// may retire: a pool-managed, non-named seat. It is checked BEFORE the work is
+// classified, so a seat the teardown will never act on costs no extra store read.
+func drainAckTeardownEligible(info sessionpkg.Info) bool {
+	return isPoolManagedSessionInfo(info) && !isNamedSessionInfo(info)
 }
 
 // tearDownDrainAckedPoolSeat releases the work a drain-acked pool seat still
@@ -76,8 +98,8 @@ func tearDownDrainAckedPoolSeat(
 	if store == nil || info.ID == "" {
 		return drainAckTeardownOutcome{retainedFor: "no_store"}
 	}
-	if !isPoolManagedSessionInfo(info) || isNamedSessionInfo(info) {
-		return drainAckTeardownOutcome{retainedFor: "not_pool_seat"}
+	if !drainAckTeardownEligible(info) {
+		return drainAckTeardownOutcome{retainedFor: drainAckRetainedNotPoolSeat}
 	}
 	if standing := sessionpkg.StandingSleepIntent(info.SleepIntent); standing != "" {
 		return drainAckTeardownOutcome{retainedFor: "standing_hold:" + string(standing)}
@@ -93,20 +115,30 @@ func tearDownDrainAckedPoolSeat(
 		fmt.Fprintf(stderr, "session reconciler: drain-ack teardown of %s: cert-park scan incomplete: %v\n", info.ID, scanErr) //nolint:errcheck
 		return drainAckTeardownOutcome{retainedFor: "cert_park_scan_failed"}
 	}
-	res := unclaimWorkAssignedToSessionInfo(cityPath, cfg, store, rigStores, info, retiredSessionFallbackRouteInfo(info), drainAckTeardownReleasePath, stderr)
+	// The seat's own mol-do-work drain step is skipped: the close gate and the
+	// classifier already treat it as not-work, and this sweep must not do more to
+	// it than a no-work drain ack does. That path leaves the step to closeBead's
+	// post-close release (closing-session-release), which the closeBead below
+	// applies here too — so the step is disposed of exactly as a no-work ack
+	// disposes of it, not reopened a second time by this sweep.
+	res := unclaimWorkAssignedToSessionInfo(cityPath, cfg, store, rigStores, info, retiredSessionFallbackRouteInfo(info), drainAckTeardownReleasePath, true, stderr)
+	attempted := res.Released + res.Failed
 	if res.Failed > 0 {
-		fmt.Fprintf(stderr, "session reconciler: drain-ack teardown of %s deferred: %d of %d release(s) failed; keeping the seat open\n", info.ID, res.Failed, res.Failed+res.Released) //nolint:errcheck
-		return drainAckTeardownOutcome{retainedFor: "release_failed"}
+		return drainAckTeardownOutcome{retainedFor: "release_failed", released: res.Released, attempted: attempted}
 	}
 	if !closeBead(store, cfg, info.ID, drainAckTeardownCloseReason, now, stderr) {
-		return drainAckTeardownOutcome{retainedFor: "close_failed"}
+		return drainAckTeardownOutcome{retainedFor: "close_failed", released: res.Released, attempted: attempted}
 	}
-	return drainAckTeardownOutcome{closed: true}
+	return drainAckTeardownOutcome{closed: true, released: res.Released, attempted: attempted}
 }
 
 // drainAckedSeatCertParkedBead returns the ID of an in_progress bead the seat
 // holds that is parked on a certification wait, or "" when it holds none. Labels
-// are read live: cached work rows can carry empty labels (see cert_park_wake.go).
+// are read through the store's LIVE handle, as the wake-side probe reads them
+// (cert_park_wake.go): a CachingStore's Get can serve a cached row that predates
+// the hold label, and releasing on that row would orphan a real park. A live row
+// that is no longer in_progress under the same assignee has changed hands and is
+// not this seat's park (the release sweep is conditional on the assignee too).
 // A non-nil error means the scan did not see every row.
 func drainAckedSeatCertParkedBead(
 	cityPath string,
@@ -124,6 +156,7 @@ func drainAckedSeatCertParkedBead(
 			return
 		}
 		wa := workAssignmentForStore(beads.WorkStore{Store: owner})
+		live := beads.HandlesFor(owner).Live
 		for _, assignee := range identifiers {
 			rows, err := wa.OpenAssignedTo(assignee, "in_progress", beads.TierBoth, true)
 			if err != nil {
@@ -134,12 +167,15 @@ func drainAckedSeatCertParkedBead(
 				if sessionpkg.IsSessionBeadOrRepairable(row) {
 					continue
 				}
-				live, err := owner.Get(row.ID)
+				fresh, err := live.Get(row.ID)
 				if err != nil {
 					scanErr = errors.Join(scanErr, fmt.Errorf("reading labels of %s: %w", row.ID, err))
 					continue
 				}
-				if beadmeta.CertParkSuppressesAssignedWake(live.Labels) {
+				if fresh.Status != "in_progress" || strings.TrimSpace(fresh.Assignee) != strings.TrimSpace(row.Assignee) {
+					continue
+				}
+				if beadmeta.CertParkSuppressesAssignedWake(fresh.Labels) {
 					parkedID = row.ID
 					return
 				}
