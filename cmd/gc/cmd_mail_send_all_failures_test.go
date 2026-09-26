@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -146,5 +147,36 @@ func TestMailSendAll_AttemptedSeatsAreNotListedAsUnreached(t *testing.T) {
 	}
 	if !strings.Contains(errOut, "woodhouse (gc-w1)") {
 		t.Fatalf("the unconfirmed seat is not named with its ID:\n%s", errOut)
+	}
+}
+
+// ga-0ejdbv round 3, finding 3: with --json and any failure, the result was
+// never written, so a JSON caller could not learn who already has the message
+// and would re-run --all, duplicating to them.
+func TestMailSendAll_JSONFailureStillReportsDeliveredAndFailed(t *testing.T) {
+	lostErr := fmt.Errorf("beadmail send: %w: gc-x", beadmail.ErrNotPersisted)
+	unconfirmedErr := fmt.Errorf("beadmail send: %w: %w", beadmail.ErrUnconfirmed, &mail.DeliveryUnconfirmedError{ID: "gc-c1", Cause: beads.ErrVerifyIndeterminate})
+	mp := &failingSendProvider{
+		Provider: beadmail.New(beads.NewMemStore()),
+		fail:     map[string]error{"bravo": lostErr, "charlie": unconfirmedErr},
+	}
+	recipients := map[string]bool{"alpha": true, "bravo": true, "charlie": true, "sender": true}
+	var stdout, stderr bytes.Buffer
+	code := doMailSendAllCoverage(mp, events.Discard, recipients, "sender", []string{"s", "b"}, nil, true, nil, &stdout, &stderr)
+	if code != mailSendNotPersistedExit {
+		t.Fatalf("exit = %d, want %d; stderr:\n%s", code, mailSendNotPersistedExit, stderr.String())
+	}
+	var res mailActionResult
+	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &res); err != nil {
+		t.Fatalf("stdout is not one JSON result: %v\n%s", err, stdout.String())
+	}
+	if res.OK {
+		t.Fatalf("ok = true on a partial failure: %+v", res)
+	}
+	if len(res.Messages) != 1 || res.Messages[0].To != "alpha" {
+		t.Fatalf("messages = %+v, want the one delivered to alpha", res.Messages)
+	}
+	if strings.Join(res.Lost, ",") != "bravo" || len(res.Unconfirmed) != 1 || res.Unconfirmed[0] != (mailUnconfirmedRecipient{To: "charlie", ID: "gc-c1"}) {
+		t.Fatalf("lost=%v unconfirmed=%+v, want lost [bravo] and unconfirmed charlie/gc-c1", res.Lost, res.Unconfirmed)
 	}
 }
