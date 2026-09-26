@@ -55,7 +55,7 @@ func TestCreateHandoffMail_UnconfirmedNoteNamesTheIDAndDoesNotInviteABlindRetry(
 		t.Fatalf("no note bead was created")
 	}
 	out := stderr.String()
-	for _, want := range []string{"UNCONFIRMED", id, "NOT restarted", "GC_NO_API=1 gc mail peek " + id, "second copy"} {
+	for _, want := range []string{"UNCONFIRMED", id, "NOT restarted", "GC_NO_API=1 gc mail peek " + id, "second copy", `plain "not found"`, `"absence unproven" = the lookup did not finish`} {
 		if !strings.Contains(out, want) {
 			t.Errorf("stderr missing %q:\n%s", want, out)
 		}
