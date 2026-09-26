@@ -328,7 +328,7 @@ func doHandoffAuto(msgStore, sessStore beads.Store, rec events.Recorder, session
 		mail.AutoHandoffLabel,
 		mail.ArchiveAfterInjectLabel,
 		"priority:1",
-	}, stderr, "gc handoff --auto", "hint: if that check shows it, the note is saved; if it does not, run gc handoff --auto again.")
+	}, stderr, "gc handoff --auto", "hint: if that check shows the note, it is saved; only on a plain \"not found\" (not \"absence unproven\") run gc handoff --auto again.")
 	if !ok {
 		return 1
 	}
@@ -347,7 +347,7 @@ func doHandoffAuto(msgStore, sessStore beads.Store, rec events.Recorder, session
 // carries the assigned ID for the caller's confirmation output.
 func createHandoffMail(msgStore, sessStore beads.Store, rec events.Recorder, senderAddress, recipientAddress string, args []string, defaultSubject string, extraLabels []string, stderr io.Writer) (mail.Message, bool) {
 	return createHandoffMailReporting(msgStore, sessStore, rec, senderAddress, recipientAddress, args, defaultSubject, extraLabels, stderr, "gc handoff",
-		"hint: the session was NOT restarted. If that check shows it, the note is saved and a re-run of gc handoff sends a second copy; if not, re-run gc handoff.")
+		"hint: the session was NOT restarted. If that check shows the note, it is saved and a re-run of gc handoff sends a second copy; only on a plain \"not found\" (not \"absence unproven\") re-run gc handoff.")
 }
 
 // createHandoffMailReporting is createHandoffMail with the caller's own error
@@ -388,6 +388,7 @@ func createHandoffMailReporting(msgStore, sessStore beads.Store, rec events.Reco
 		if id, ok := mail.UnconfirmedMessageID(err); ok {
 			fmt.Fprintf(stderr, "%s: handoff note UNCONFIRMED: it may have landed as %s, but it could not be read back: %v\n", label, id, err) //nolint:errcheck // best-effort stderr
 			fmt.Fprintf(stderr, "check: %s\n", mailStorageCheckCommand(id))                                                                    //nolint:errcheck // best-effort stderr
+			fmt.Fprintf(stderr, "       %s\n", mailStorageCheckReading)                                                                        //nolint:errcheck // best-effort stderr
 			if unconfirmedHint != "" {
 				fmt.Fprintln(stderr, unconfirmedHint) //nolint:errcheck // best-effort stderr
 			}
