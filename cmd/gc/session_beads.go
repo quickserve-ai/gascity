@@ -1664,6 +1664,23 @@ func unclaimWorkAssignedToRetiredSessionInfo(
 	retiredSession session.Info,
 	stderr io.Writer,
 ) unclaimResult {
+	return unclaimWorkAssignedToSessionInfo(cityPath, cfg, store, rigStores, retiredSession, fallbackRoute, "stranded-pool-worker-repair", stderr)
+}
+
+// unclaimWorkAssignedToSessionInfo is the release sweep behind
+// unclaimWorkAssignedToRetiredSessionInfo, with the caller naming itself as the
+// releasePath that ReleaseWorkBead's audit line records. The stranded repair and
+// the drain-ack teardown both retire a pool seat through it.
+func unclaimWorkAssignedToSessionInfo(
+	cityPath string,
+	cfg *config.City,
+	store beads.Store,
+	rigStores map[string]beads.Store,
+	retiredSession session.Info,
+	fallbackRoute string,
+	releasePath string,
+	stderr io.Writer,
+) unclaimResult {
 	var res unclaimResult
 	if store == nil || strings.TrimSpace(retiredSession.ID) == "" {
 		return res
