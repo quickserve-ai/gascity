@@ -841,10 +841,10 @@ func beadmailError(operation string, err error) error {
 		// bead, still reads as not-found to mail callers, but its text must
 		// say absence is unproven: this is the check an operator runs to
 		// decide whether to re-send an unconfirmed message, and a bare "not
-		// found" there reads as "lost" (ga-0ejdbv round 4). The cause is
-		// rendered with %v so beads.ErrNotFound still does not leak.
+		// found" there reads as "lost" (ga-0ejdbv round 4). The cause goes in
+		// as text, not %w, so beads.ErrNotFound still does not leak.
 		if errors.Is(err, beads.ErrVerifyIndeterminate) || errors.Is(err, beads.ErrIDCollision) {
-			return fmt.Errorf("beadmail %s: %w (absence unproven: %v)", operation, mail.ErrNotFound, err)
+			return fmt.Errorf("beadmail %s: %w (absence unproven: %s)", operation, mail.ErrNotFound, err.Error())
 		}
 		err = mail.ErrNotFound
 	}
