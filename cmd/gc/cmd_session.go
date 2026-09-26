@@ -301,6 +301,10 @@ func cmdSessionNew(args []string, alias, title, titleHint string, noAttach, json
 	if err != nil {
 		titleProvider = nil
 	}
+	// Render a templated start_command for this session's own identity the
+	// way the reconciler's create path does: the direct-start fallback below
+	// launches this command itself (ga-b1u4yg).
+	resolved = renderResolvedCommandForNewSession(cityPath, cfg, &found, sessionQualifiedName, explicitName, workDir, resolved)
 	sessionCommand, err := resolvedSessionCommand(cityPath, resolved, nil, sessionTransport)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session new: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -1702,7 +1706,9 @@ func buildResumeCommand(cityPath string, cfg *config.City, info session.Info, se
 	if session.UseAgentTemplateForProviderResolution(sessionKind, metadata, info.Provider, found.Provider, foundAgent) {
 		if foundAgent {
 			if resolved, err := config.ResolveProvider(&found, &cfg.Workspace, cfg.Providers, exec.LookPath); err == nil {
-				return buildResolved(resolved)
+				// Render a templated start_command for this session the way
+				// the reconciler's create path does (ga-b1u4yg).
+				return buildResolved(renderResolvedCommandForSession(cityPath, cfg, &found, info, info.WorkDir, resolved))
 			}
 		}
 	}
