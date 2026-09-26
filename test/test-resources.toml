@@ -332,6 +332,17 @@ expires = "2026-10-31"
 [[medium]]
 package_dir = "scripts"
 package_name = "scripts_test"
+owner = "TestMolScopedWorkTeardownScript"
+resources = ["subprocess"]
+owner_bead = "pl-4k0"
+invariant = "the mol-scoped-work cleanup-worktree behaviour proof is a checked Medium subprocess owner"
+resource_owner = "the one bash subprocess is confined to TestMolScopedWorkTeardownScript, which runs scripts/test-mol-scoped-work-teardown.sh: the step under test is agent-executed shell rendered from formula TOML, so only running that shell against a stub gc can prove what it does"
+migration_target = "P0.4b"
+expires = "2026-10-01"
+
+[[medium]]
+package_dir = "scripts"
+package_name = "scripts_test"
 owner = "TestProviderOverridesAndSuiteContractsCrossMakeIsolation"
 resources = ["subprocess"]
 owner_bead = "ga-cp3hwi"
@@ -427,6 +438,17 @@ invariant = "the anonymous-cache zstd probe's behavior proof is a checked Medium
 resource_owner = "the loopback TLS HTTP/2 servers are confined to TestCacheZstdProbe, which exists to run tools/rbe/cache-zstd-probe.sh against a stand-in rbe-cache GetCapabilities (zstd advertised or not, gRPC and HTTP errors, malformed answers, a timeout): the probe is curl's HTTP/2 and gRPC trailers, so only a real server can prove when fork-cache asks for zstd"
 migration_target = "P0.4b"
 expires = "2026-10-31"
+
+[[medium]]
+package_dir = "scripts"
+package_name = "scripts_test"
+owner = "TestMolScopedWorkTeardownScript"
+resources = ["subprocess"]
+owner_bead = "pl-4k0"
+invariant = "the mol-scoped-work cleanup-worktree behaviour proof is a checked Medium subprocess owner"
+resource_owner = "the one bash subprocess is confined to TestMolScopedWorkTeardownScript, which runs scripts/test-mol-scoped-work-teardown.sh: the step under test is agent-executed shell rendered from formula TOML, so only running that shell against a stub gc can prove what it does"
+migration_target = "P0.4b"
+expires = "2026-10-01"
 
 # A reviewed-hermetic-body row is narrower than a Small test declaration. It
 # proves that the exact untagged test body and statically reachable
