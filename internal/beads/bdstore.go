@@ -1419,15 +1419,13 @@ func (s *BdStore) Get(id string) (Bead, error) {
 		// that look like bead IDs are eligible: callers also pass through
 		// non-bead names (e.g. slash-qualified session recipients), which
 		// must not leak into a supplemental wisp query.
-		if isWispQueryableID(id) {
-			wisps, queryErr := s.getEphemeralByID(id)
-			if queryErr == nil {
-				for _, b := range wisps {
-					if b.ID == id {
-						return b, nil
-					}
-				}
-			}
+		if b, found, ferr := s.wispFallback(id); ferr != nil {
+			// Absence is UNPROVEN. ErrVerifyIndeterminate still satisfies
+			// errors.Is(ErrNotFound), so callers that only ask "is it missing?"
+			// are unchanged.
+			return Bead{}, fmt.Errorf("getting bead %q: %w: %w", id, ErrVerifyIndeterminate, ferr)
+		} else if found {
+			return b, nil
 		}
 		return Bead{}, fmt.Errorf("getting bead %q: %w", id, ErrNotFound)
 	}
@@ -1436,6 +1434,15 @@ func (s *BdStore) Get(id string) (Bead, error) {
 		return Bead{}, fmt.Errorf("bd show: parsing JSON: %w", err)
 	}
 	if len(issues) == 0 {
+		// bd show returning an empty set is evidence about the ISSUES table
+		// only — it never looks at wisps. Consult the wisp tier before
+		// concluding absence, or an ephemeral bead that exists reads as gone
+		// (ga-0ejdbv).
+		if b, found, ferr := s.wispFallback(id); ferr != nil {
+			return Bead{}, fmt.Errorf("getting bead %q: %w: %w", id, ErrVerifyIndeterminate, ferr)
+		} else if found {
+			return b, nil
+		}
 		return Bead{}, fmt.Errorf("getting bead %q: %w", id, ErrNotFound)
 	}
 	bead := issues[0].toBead()
@@ -1450,6 +1457,23 @@ func (s *BdStore) Get(id string) (Bead, error) {
 		// Return ErrIDCollision so mutation guards can distinguish this from a
 		// plain absent bead. ErrIDCollision wraps ErrNotFound so existing
 		// errors.Is(err, ErrNotFound) callers remain unaffected.
+		// DELIBERATELY NO WISP FALLBACK HERE, though bd show did not consult the
+		// wisp tier and so has not proven this ID absent from it. Two reasons,
+		// and the second is the binding one:
+		//
+		//  - the case is marginal: it needs a wisp whose ID is a strict
+		//    substring of a real issue ID, and the requested bead to be that
+		//    wisp rather than the resolved issue;
+		//  - this branch is NOT reached only by Get. ReleaseIfCurrent's exact-ID
+		//    guard lands here too, and that path must issue nothing further to
+		//    bd once it has refused (TestReleaseIfCurrentRefusesAFuzzyIDCollision
+		//    pins it). Adding a lookup here puts a subprocess on a conditional-
+		//    release hot path to cover a case the mail guard never meets — mail
+		//    verification resolves through the two exits above.
+		//
+		// So a collision stays a plain collision. If a caller ever needs the
+		// wisp tier consulted on this path, it wants its own verb, not a
+		// widening of this one.
 		return Bead{}, fmt.Errorf("getting bead %q (resolved to %q): %w", id, bead.ID, ErrIDCollision)
 	}
 	return bead, nil
@@ -3025,13 +3049,45 @@ func isWispQueryableID(id string) bool {
 	return true
 }
 
+// wispFallback resolves id against the wisp tier, which bd show cannot see.
+// It reports (bead, true, nil) on a hit, (_, false, nil) when the lookup
+// COMPLETED and the row is absent, and (_, false, err) when the lookup could
+// not be completed at all. Keeping those three outcomes distinct is the whole
+// point: a caller that cannot tell "looked and found nothing" from "could not
+// look" will eventually report one as the other (ga-0ejdbv). Every not-found
+// exit in Get routes through here so none of them can conclude absence from a
+// table that was never queried.
+// The returned error is the RAW lookup failure, not a finished Get error: each
+// not-found exit composes its own, so an exit that owes the caller a more
+// specific sentinel (ErrIDCollision) can carry both.
+func (s *BdStore) wispFallback(id string) (Bead, bool, error) {
+	if !isWispQueryableID(id) {
+		return Bead{}, false, nil
+	}
+	wisps, queryErr := s.getEphemeralByID(id)
+	if queryErr != nil {
+		return Bead{}, false, queryErr
+	}
+	for _, b := range wisps {
+		if b.ID == id {
+			return b, true, nil
+		}
+	}
+	return Bead{}, false, nil
+}
+
 func (s *BdStore) getEphemeralByID(id string) ([]Bead, error) {
 	clause := "ephemeral=true AND id=" + id
 	args := []string{"query", "--json", clause, "--all", "--limit", "1"}
 	out, err := s.runner(s.dir, "bd", args...)
 	if err != nil {
 		if isBdQueryUnsupported(err) {
-			return nil, nil
+			// A bd without "query" cannot answer the wisp question at all. This
+			// used to return (nil, nil), which the caller read as an empty —
+			// i.e. authoritative — result set, turning "I never looked" into
+			// "it is not there". Report it as an error so Get can classify the
+			// lookup as indeterminate (ga-0ejdbv). Get is the only caller.
+			return nil, fmt.Errorf("bd query (wisp by id): unsupported by this bd: %w", err)
 		}
 		return nil, fmt.Errorf("bd query (wisp by id): %w", err)
 	}

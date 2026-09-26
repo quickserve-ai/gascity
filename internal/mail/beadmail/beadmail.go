@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -268,7 +269,7 @@ func (p *Provider) SendHandoff(intent mail.HandoffIntent) (mail.Message, error) 
 // funnels its already-resolved fields through here so the bead shape stays in
 // one place.
 func (p *Provider) createMessageBead(title, body, from, to string, labels []string, metadata map[string]string) (beads.Bead, error) {
-	return p.store.Create(beads.Bead{
+	b, err := p.store.Create(beads.Bead{
 		Title:       title,
 		Description: body,
 		Type:        messageBeadType,
@@ -278,6 +279,106 @@ func (p *Provider) createMessageBead(title, body, from, to string, labels []stri
 		Metadata:    metadata,
 		Ephemeral:   true,
 	})
+	if err != nil {
+		return b, err
+	}
+	// Read-after-write. Neither store Create verifies: BdStore returns a bead
+	// parsed from bd's own response and NativeDoltStore returns the issue it
+	// constructed in memory, so a write that did not durably land is reported
+	// as success all the way up to "Sent message <id> to <addr>" and exit 0.
+	// Mail is ephemeral (the wisps table), which skips DOLT_COMMIT and is
+	// dolt_ignore'd, so a lost message leaves no version, no diff and no log —
+	// nothing to recover it from and no way to prove it ever existed. That is
+	// why this channel gets verification the other bead classes can go without
+	// (ga-0ejdbv).
+	if err := p.verifyMessageBeadPersisted(b.ID); err != nil {
+		return b, err
+	}
+	return b, nil
+}
+
+// ErrNotPersisted reports a message bead that was VERIFIED ABSENT after the
+// store said the create succeeded. The message did not land; the caller should
+// re-send.
+var ErrNotPersisted = errors.New("message bead was not persisted")
+
+// ErrUnconfirmed reports a message bead whose existence could NOT be
+// established either way — the verification lookup itself did not complete.
+// The message may or may not have landed, so the caller should CHECK before
+// re-sending rather than blindly duplicating control-channel traffic. Kept
+// distinct from ErrNotPersisted because the two want different operator
+// actions.
+var ErrUnconfirmed = errors.New("message bead could not be confirmed")
+
+// verifyDisabled lets a deployment whose store cannot read back a freshly
+// written wisp turn the guard off rather than lose mail entirely.
+// Verification is ON unless this is explicitly set to "0" or "false".
+func verifyDisabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("GC_MAIL_VERIFY"))) {
+	case "0", "false", "no", "off":
+		return true
+	}
+	return false
+}
+
+// messageVerifyBackoff is the delay before each retry after the first attempt.
+// The retry absorbs read-visibility LAG, which a backing that is briefly behind
+// recovers from within a few short waits. It does NOT prove lag has ended: a
+// write that stays invisible past the budget below is still reported as lost.
+// That residual is deliberate — the alternative is never reporting loss at all.
+var messageVerifyBackoff = []time.Duration{
+	50 * time.Millisecond,
+	150 * time.Millisecond,
+}
+
+// messageVerifyBudget caps the WALL CLOCK spent verifying, not just the sleeps.
+// A verification read is not necessarily cheap: on the bd-backed store a wisp
+// lookup is two subprocesses, and a bd query can sit on its own multi-second
+// timeout. Without this, three retries of a timing-out lookup would add minutes
+// to an interactive send under exactly the load that triggers it. Retries stop
+// once the budget is spent; the verdict is then formed from what we have.
+var messageVerifyBudget = 10 * time.Second
+
+func (p *Provider) verifyMessageBeadPersisted(id string) error {
+	if verifyDisabled() || p.store == nil {
+		return nil
+	}
+	if strings.TrimSpace(id) == "" {
+		// A create that reported success without an ID cannot be verified and
+		// must not pass silently — that is the same exit-0-with-nothing-behind-it
+		// shape this guard exists to close.
+		return fmt.Errorf("%w: store returned no bead ID", ErrUnconfirmed)
+	}
+	// Read through the LIVE handle. A CachingStore's own Get can serve the bead
+	// its Create just absorbed into the cache — including one absorbed after an
+	// unverified create (see CachingStore.createWith) — which would let the
+	// cache confirm a write that never reached storage. HandlesFor is identity
+	// for a plain store, so this costs nothing on the CLI path.
+	reader := beads.HandlesFor(p.store).Live
+	started := time.Now()
+	var lastErr error
+	for attempt := 0; attempt <= len(messageVerifyBackoff); attempt++ {
+		if attempt > 0 {
+			if time.Since(started) >= messageVerifyBudget {
+				break
+			}
+			time.Sleep(messageVerifyBackoff[attempt-1])
+		}
+		_, err := reader.Get(id)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+	}
+	// Classify on the FINAL reading. A definitive not-found means we looked and
+	// the row is absent. Anything else — an indeterminate wisp lookup, or a
+	// transport error — means we never got a trustworthy answer, and claiming
+	// loss on that would fail healthy sends under exactly the load that causes
+	// it.
+	if errors.Is(lastErr, beads.ErrVerifyIndeterminate) || !errors.Is(lastErr, beads.ErrNotFound) {
+		return fmt.Errorf("%w: %s: %w", ErrUnconfirmed, id, lastErr)
+	}
+	return fmt.Errorf("%w: %s", ErrNotPersisted, id)
 }
 
 func (p *Provider) resolveSenderRoute(from string) (string, map[string]string, error) {
@@ -713,16 +814,11 @@ func (p *Provider) Reply(id, from, subject, body string) (mail.Message, error) {
 
 	labels := []string{"thread:" + threadID, "reply-to:" + id}
 
-	b, err := p.store.Create(beads.Bead{
-		Title:       deriveReplyTitle(subject, original.Title, body),
-		Description: body,
-		Type:        messageBeadType,
-		Assignee:    to, // reply goes back to sender
-		From:        from,
-		Labels:      labels,
-		Metadata:    metadata,
-		Ephemeral:   true,
-	})
+	// Reply used to build its own message bead here, which meant it skipped the
+	// confined edge its neighbors use — so the read-after-write guard did not
+	// cover replies, and createMessageBead's "every mail-creating method funnels
+	// through here" was not true. "to" is the sender we are replying back to.
+	b, err := p.createMessageBead(deriveReplyTitle(subject, original.Title, body), body, from, to, labels, metadata)
 	if err != nil {
 		return mail.Message{}, fmt.Errorf("beadmail reply: %w", err)
 	}
