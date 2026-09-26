@@ -247,6 +247,16 @@ func runControlDispatcherDeferringEmits(cityPath, storePath string, store beads.
 	if err != nil {
 		return err
 	}
+	// Refuse anything the control dispatcher cannot execute BEFORE
+	// ProcessControl, whose unsupported-kind refusal routes into the
+	// quarantine path and closes the bead hard-failed. A workflow root or an
+	// ordinary step reaching here is a caller error (ga-k74enr: a serve loop
+	// run inside a worker seat fed it that seat's own work), not a broken
+	// control bead, so it is left exactly as it was.
+	if kind := bead.Metadata[beadmeta.KindMetadataKey]; !beadmeta.IsControlKind(kind) {
+		workflowTracef("control-dispatch refuse bead=%s kind=%s reason=not_control_kind", beadID, kind)
+		return fmt.Errorf("%w: %s kind=%q", errNotControlBead, beadID, kind)
+	}
 
 	opts := dispatch.ProcessOptions{CityPath: cityPath, StorePath: storePath}
 	opts.Tracef = workflowTracef
@@ -403,6 +413,11 @@ func recycleDispatchSubjectSession(cityPath string, store beads.Store, cfg *conf
 		return workerKillSessionTargetWithConfig(cityPath, store, sp, cfg, subject.Assignee)
 	}
 }
+
+// errNotControlBead reports that a bead handed to the control dispatcher has a
+// gc.kind outside beadmeta.ControlKinds. The dispatcher returns it without
+// writing to the bead: it is never quarantined, and the serve loop skips it.
+var errNotControlBead = errors.New("not a control bead")
 
 // handleControlDispatchError resolves a failed ProcessControl call into the
 // error the dispatcher should return. It is the Tier-B semantic-refusal budget
