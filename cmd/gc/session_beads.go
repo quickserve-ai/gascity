@@ -1664,13 +1664,15 @@ func unclaimWorkAssignedToRetiredSessionInfo(
 	retiredSession session.Info,
 	stderr io.Writer,
 ) unclaimResult {
-	return unclaimWorkAssignedToSessionInfo(cityPath, cfg, store, rigStores, retiredSession, fallbackRoute, "stranded-pool-worker-repair", stderr)
+	return unclaimWorkAssignedToSessionInfo(cityPath, cfg, store, rigStores, retiredSession, fallbackRoute, "stranded-pool-worker-repair", false, stderr)
 }
 
 // unclaimWorkAssignedToSessionInfo is the release sweep behind
 // unclaimWorkAssignedToRetiredSessionInfo, with the caller naming itself as the
 // releasePath that ReleaseWorkBead's audit line records. The stranded repair and
-// the drain-ack teardown both retire a pool seat through it.
+// the drain-ack teardown both retire a pool seat through it. skipOwnDrainStep
+// leaves the session's own mol-do-work drain step (isSessionOwnDrainStepBead)
+// out of the sweep, for the drain-ack path that already treats it as not-work.
 func unclaimWorkAssignedToSessionInfo(
 	cityPath string,
 	cfg *config.City,
@@ -1679,6 +1681,7 @@ func unclaimWorkAssignedToSessionInfo(
 	retiredSession session.Info,
 	fallbackRoute string,
 	releasePath string,
+	skipOwnDrainStep bool,
 	stderr io.Writer,
 ) unclaimResult {
 	var res unclaimResult

@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 
+	"github.com/gastownhall/gascity/internal/config"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 )
 
@@ -46,4 +47,74 @@ func openSeatRetentionLabel(info sessionpkg.Info) string {
 		return state + ":" + reason
 	}
 	return state
+}
+
+// templateTickSummary is one template's tick-summary record: the verdict and the
+// fields the trace records verbatim.
+type templateTickSummary struct {
+	status TraceEvaluationStatus
+	reason TraceReasonCode
+	fields map[string]any
+}
+
+// buildTemplateTickSummaries computes the per-template tick summaries from the
+// tick's pre-reconcile inputs, returning the template names in record order and
+// each template's summary. retained_for is present only when the template has
+// open seats; it counts them by openSeatRetentionLabel.
+func buildTemplateTickSummaries(
+	cfg *config.City,
+	openInfos []sessionpkg.Info,
+	desiredState map[string]TemplateParams,
+	poolDesired map[string]int,
+	workSet map[string]bool,
+	workRequested map[string]bool,
+) ([]string, map[string]templateTickSummary) {
+	templateNames := make(map[string]struct{})
+	openCounts := make(map[string]int)
+	retainedFor := make(map[string]map[string]int)
+	desiredCounts := make(map[string]int)
+	for _, info := range openInfos {
+		template := normalizedSessionTemplateInfo(info, cfg)
+		if template == "" {
+			continue
+		}
+		templateNames[template] = struct{}{}
+		openCounts[template]++
+		if retainedFor[template] == nil {
+			retainedFor[template] = make(map[string]int)
+		}
+		retainedFor[template][openSeatRetentionLabel(info)]++
+	}
+	for _, tp := range desiredState {
+		if tp.TemplateName == "" {
+			continue
+		}
+		templateNames[tp.TemplateName] = struct{}{}
+		desiredCounts[tp.TemplateName]++
+	}
+	for template := range poolDesired {
+		templateNames[template] = struct{}{}
+	}
+	for template := range workSet {
+		templateNames[template] = struct{}{}
+	}
+	for template := range workRequested {
+		templateNames[template] = struct{}{}
+	}
+	names := traceSetStrings(templateNames)
+	summaries := make(map[string]templateTickSummary, len(names))
+	for _, template := range names {
+		status, reason := templateTickSummaryVerdict(desiredCounts[template], poolDesired[template], openCounts[template])
+		fields := map[string]any{
+			"desired_count":  desiredCounts[template],
+			"open_count":     openCounts[template],
+			"pool_desired":   poolDesired[template],
+			"work_requested": workRequested[template],
+		}
+		if held := retainedFor[template]; len(held) > 0 {
+			fields["retained_for"] = held
+		}
+		summaries[template] = templateTickSummary{status: status, reason: reason, fields: fields}
+	}
+	return names, summaries
 }
