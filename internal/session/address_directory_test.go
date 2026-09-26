@@ -3,6 +3,7 @@ package session
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -160,6 +161,65 @@ func TestStoreResolveMailboxAddressSeparatesLivenessPasses(t *testing.T) {
 	}
 	if got, err := directory.ResolveMailboxAddress("retired-one", true); err != nil || got.ID != retired.ID {
 		t.Fatalf("ResolveMailboxAddress(retired, closed pass) = (%q, %v), want %q", got.ID, err, retired.ID)
+	}
+}
+
+// TestStoreListClosedByNamedIdentityReturnsOnlyThatSeatsClosedSessions pins
+// the seat-history probe mail uses to reach a named seat's earlier sessions:
+// the closed rows of exactly that configured_named_identity, never the live
+// incarnation, another seat's history, or a pool session that reused the alias.
+func TestStoreListClosedByNamedIdentityReturnsOnlyThatSeatsClosedSessions(t *testing.T) {
+	store := beads.NewMemStore()
+	seat := map[string]string{
+		"alias":                      "rig/seat",
+		"session_name":               "rig--seat",
+		NamedSessionIdentityMetadata: "rig/seat",
+	}
+	closeSession := func(b beads.Bead) {
+		t.Helper()
+		if err := store.Close(b.ID); err != nil {
+			t.Fatalf("Close session: %v", err)
+		}
+	}
+	first := mustCreateAddressed(t, store, seat)
+	closeSession(first)
+	second := mustCreateAddressed(t, store, seat)
+	closeSession(second)
+	mustCreateAddressed(t, store, seat)
+	closeSession(mustCreateAddressed(t, store, map[string]string{
+		"alias":                      "rig/other",
+		NamedSessionIdentityMetadata: "rig/other",
+	}))
+	closeSession(mustCreateAddressed(t, store, map[string]string{
+		"alias":        "rig/seat",
+		"pool_managed": "true",
+	}))
+
+	for name, directory := range map[string]*Store{
+		"exact metadata filter": NewStore(beads.SessionStore{Store: store}),
+		"loose metadata filter": NewStore(beads.SessionStore{Store: looseMetadataStore{Store: store}}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := directory.ListClosedByNamedIdentity("rig/seat")
+			if err != nil {
+				t.Fatalf("ListClosedByNamedIdentity: %v", err)
+			}
+			ids := make([]string, 0, len(got))
+			for _, info := range got {
+				ids = append(ids, info.ID)
+			}
+			slices.Sort(ids)
+			want := []string{first.ID, second.ID}
+			slices.Sort(want)
+			if !slices.Equal(ids, want) {
+				t.Fatalf("ListClosedByNamedIdentity(rig/seat) = %v, want the seat's closed sessions %v", ids, want)
+			}
+
+			blank, err := directory.ListClosedByNamedIdentity("  ")
+			if err != nil || len(blank) != 0 {
+				t.Fatalf("ListClosedByNamedIdentity(blank) = (%v, %v), want no sessions", blank, err)
+			}
+		})
 	}
 }
 
