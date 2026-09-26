@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,6 +24,81 @@ func orderWispWatchdogTestCity(t *testing.T) *config.City {
 	cfg.Agents = append(cfg.Agents, config.Agent{Name: "lead", Dir: "repo"})
 	cfg.NamedSessions = []config.NamedSession{{Template: "lead", Dir: "repo", Mode: "on_demand"}}
 	return cfg
+}
+
+// writeForbiddingStore fails every write. The order wisp watchdog is report
+// only, so a pass over this store must attempt none: each attempt is recorded,
+// fails the test, and returns an error so the caller cannot carry on as if it
+// had landed. It embeds only the beads.Store interface, so no optional write
+// interface (CreateWithStorage, ApplyGraphPlanWithStorage) is promoted through
+// it: a caller that asserts one falls back to a Store method, and every Store
+// method that writes is overridden below.
+type writeForbiddingStore struct {
+	beads.Store
+	t *testing.T
+
+	mu     sync.Mutex
+	writes []string
+}
+
+func newWriteForbiddingStore(t *testing.T, store beads.Store) *writeForbiddingStore {
+	return &writeForbiddingStore{Store: store, t: t}
+}
+
+func (s *writeForbiddingStore) forbid(op string) error {
+	s.mu.Lock()
+	s.writes = append(s.writes, op)
+	s.mu.Unlock()
+	s.t.Errorf("store write attempted: %s", op)
+	return fmt.Errorf("write forbidden in this test: %s", op)
+}
+
+func (s *writeForbiddingStore) attempted() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.writes...)
+}
+
+func (s *writeForbiddingStore) Create(beads.Bead) (beads.Bead, error) {
+	return beads.Bead{}, s.forbid("Create")
+}
+
+func (s *writeForbiddingStore) Update(id string, _ beads.UpdateOpts) error {
+	return s.forbid("Update " + id)
+}
+
+func (s *writeForbiddingStore) Close(id string) error { return s.forbid("Close " + id) }
+
+func (s *writeForbiddingStore) Reopen(id string) error { return s.forbid("Reopen " + id) }
+
+func (s *writeForbiddingStore) CloseAll(ids []string, _ map[string]string) (int, error) {
+	return 0, s.forbid("CloseAll " + strings.Join(ids, ","))
+}
+
+func (s *writeForbiddingStore) SetMetadata(id, key, _ string) error {
+	return s.forbid("SetMetadata " + id + " " + key)
+}
+
+func (s *writeForbiddingStore) SetMetadataBatch(id string, _ map[string]string) error {
+	return s.forbid("SetMetadataBatch " + id)
+}
+
+func (s *writeForbiddingStore) SetLocalString(id, key, _ string) error {
+	return s.forbid("SetLocalString " + id + " " + key)
+}
+
+func (s *writeForbiddingStore) Tx(commitMsg string, _ func(beads.Tx) error) error {
+	return s.forbid("Tx " + commitMsg)
+}
+
+func (s *writeForbiddingStore) Delete(id string) error { return s.forbid("Delete " + id) }
+
+func (s *writeForbiddingStore) DepAdd(issueID, dependsOnID, _ string) error {
+	return s.forbid("DepAdd " + issueID + " " + dependsOnID)
+}
+
+func (s *writeForbiddingStore) DepRemove(issueID, dependsOnID string) error {
+	return s.forbid("DepRemove " + issueID + " " + dependsOnID)
 }
 
 // seedOrderWisp creates a root-only order-run wisp for order and applies the
@@ -75,28 +152,56 @@ func seedOrderWispSession(t *testing.T, store beads.Store, open bool, metadata m
 	return sb
 }
 
-// runOrderWispWatchdogForTest runs one pass over store for the named orders at
-// the default cutoff, with store as both the wisp store and the session store.
-func runOrderWispWatchdogForTest(t *testing.T, cfg *config.City, store beads.Store, now time.Time, orderNames ...string) orderWispWatchdogResult {
+// seedOrderMolecule creates a molecule root for the digest order with one step
+// carrying the given claim. status "" leaves the step open.
+func seedOrderMolecule(t *testing.T, store beads.Store, stepAssignee, stepStatus string) (beads.Bead, beads.Bead) {
 	t.Helper()
-	return runOrderWispWatchdogWithSessionsForTest(t, cfg, store, store, now, orderNames...)
+	root, err := store.Create(beads.Bead{Title: "mol-digest", Type: "molecule", Labels: []string{"order-run:digest"}})
+	if err != nil {
+		t.Fatalf("Create(molecule root): %v", err)
+	}
+	step, err := store.Create(beads.Bead{Title: "step", ParentID: root.ID, Assignee: stepAssignee})
+	if err != nil {
+		t.Fatalf("Create(step): %v", err)
+	}
+	if stepStatus != "" {
+		if err := store.Update(step.ID, beads.UpdateOpts{Status: stringPtr(stepStatus)}); err != nil {
+			t.Fatalf("Update(step status): %v", err)
+		}
+	}
+	return root, step
 }
 
-func runOrderWispWatchdogWithSessionsForTest(t *testing.T, cfg *config.City, store, sessions beads.Store, now time.Time, orderNames ...string) orderWispWatchdogResult {
+// reportOrderWispsForTest runs one pass over runs for the named orders at the
+// default cutoff, judging holders against sessions.
+func reportOrderWispsForTest(t *testing.T, cfg *config.City, runs, sessions beads.Store, now time.Time, orderNames ...string) orderWispWatchdogResult {
 	t.Helper()
 	watch := make([]orderWispWatchdogOrder, 0, len(orderNames))
 	for _, name := range orderNames {
 		watch = append(watch, orderWispWatchdogOrder{order: orders.Order{Name: name}, scoped: name, staleAfter: orders.DefaultRunStaleAfter})
 	}
-	result, err := sweepStaleOrderWisps(
-		[]orderWispWatchdogLeg{{store: store, orders: watch}},
+	result, err := reportStaleOrderWisps(
+		[]orderWispWatchdogLeg{{store: runs, orders: watch}},
 		now,
 		newOrderWispOwnerResolver(cfg, t.TempDir(), sessions),
 	)
 	if err != nil {
-		t.Fatalf("sweepStaleOrderWisps: %v", err)
+		t.Fatalf("reportStaleOrderWisps: %v", err)
 	}
 	return result
+}
+
+// staleRunByID returns the reported run with rootID, failing when the pass did
+// not report it.
+func staleRunByID(t *testing.T, result orderWispWatchdogResult, rootID string) orderWispStaleRun {
+	t.Helper()
+	for _, run := range result.stale {
+		if run.rootID == rootID {
+			return run
+		}
+	}
+	t.Fatalf("stale runs = %+v, want one rooted at %s", result.stale, rootID)
+	return orderWispStaleRun{}
 }
 
 func requireBeadStatus(t *testing.T, store beads.Store, id, want string) beads.Bead {
@@ -111,12 +216,100 @@ func requireBeadStatus(t *testing.T, store beads.Store, id, want string) beads.B
 	return got
 }
 
-// TestOrderWispWatchdogSparesRootOnlyWispHeldByLiveSession is the liveness
-// mutant (ga-puy7n0 test a). Every case is a stale root-only wisp whose claim
-// names this city's own identity, so the locality check passes it: only the
-// liveness predicate keeps it open. Delete the `if live` return in
-// refVerdict and every case closes.
-func TestOrderWispWatchdogSparesRootOnlyWispHeldByLiveSession(t *testing.T) {
+func requireVerdict(t *testing.T, run orderWispStaleRun, state orderWispOwnerState, reason string) {
+	t.Helper()
+	if run.verdict.State != state || !strings.Contains(run.verdict.Reason, reason) {
+		t.Fatalf("run %s verdict = %s, want %s with reason containing %q", run.rootID, run.verdict, state, reason)
+	}
+}
+
+// TestOrderWispWatchdogWritesNothing is condition (a) of the report-only
+// scope: no code path from the watchdog writes to any store. Every holder
+// shape the watchdog distinguishes is stale here, the session store and the
+// run store both fail on write, and the pass must still report every run.
+// Put any close, reopen or metadata write back on the path and this fails.
+func TestOrderWispWatchdogWritesNothing(t *testing.T) {
+	runBacking := beads.NewMemStore()
+	runBacking.IDPrefix = "rg"
+	sessionBacking := beads.NewMemStore()
+	live := seedOrderWispSession(t, sessionBacking, true, map[string]string{"session_name": "worker-sess-live"})
+	dead := seedOrderWispSession(t, sessionBacking, false, map[string]string{"session_name": "worker-sess-dead"})
+	held := seedOrderWisp(t, runBacking, "digest", "in_progress", "", map[string]string{"gc.session_id": live.ID})
+	gone := seedOrderWisp(t, runBacking, "digest", "in_progress", "", map[string]string{"gc.session_id": dead.ID})
+	foreign := seedOrderWisp(t, runBacking, "digest", "in_progress", "repo/dalinar", nil)
+	queued := seedOrderWisp(t, runBacking, "digest", "", "", nil)
+	molRoot, molStep := seedOrderMolecule(t, runBacking, "", "")
+	runs := newWriteForbiddingStore(t, runBacking)
+	sessions := newWriteForbiddingStore(t, sessionBacking)
+
+	result := reportOrderWispsForTest(t, orderWispWatchdogTestCity(t), runs, sessions, held.CreatedAt.Add(7*time.Hour), "digest")
+
+	if got := append(runs.attempted(), sessions.attempted()...); len(got) != 0 {
+		t.Fatalf("the watchdog attempted store writes %v; it must write nothing", got)
+	}
+	requireVerdict(t, staleRunByID(t, result, held.ID), orderWispHeld, "its session is live")
+	requireVerdict(t, staleRunByID(t, result, gone.ID), orderWispHolderGone, "closed")
+	requireVerdict(t, staleRunByID(t, result, foreign.ID), orderWispUnobservable, "absent_from_roster")
+	requireVerdict(t, staleRunByID(t, result, queued.ID), orderWispUnclaimed, "no open member")
+	requireVerdict(t, staleRunByID(t, result, molRoot.ID), orderWispUnclaimed, "no open member")
+	requireBeadStatus(t, runBacking, gone.ID, "in_progress")
+	requireBeadStatus(t, runBacking, molStep.ID, "open")
+}
+
+// TestOrderWispWatchdogReportsEveryStaleRunWithItsVerdict is condition (b):
+// every stale run is reported, held ones included, each with its holder, its
+// verdict and the reason. Eight unclaimed runs are more than any sample would
+// show, so a report that samples fails here. (Runs under the cutoff are not
+// stale: TestOrderWispWatchdogLeavesYoungRunsUnreported.)
+func TestOrderWispWatchdogReportsEveryStaleRunWithItsVerdict(t *testing.T) {
+	store := beads.NewMemStore()
+	sb := seedOrderWispSession(t, store, true, map[string]string{"session_name": "worker-sess-live"})
+	held := seedOrderWisp(t, store, "digest", "in_progress", "", map[string]string{"gc.session_id": sb.ID})
+	gone := seedOrderWisp(t, store, "digest", "in_progress", "repo/worker-1", nil)
+	var queued []beads.Bead
+	for i := 0; i < 8; i++ {
+		queued = append(queued, seedOrderWisp(t, store, "digest", "", "", nil))
+	}
+	now := held.CreatedAt.Add(7 * time.Hour)
+
+	result := reportOrderWispsForTest(t, orderWispWatchdogTestCity(t), store, store, now, "digest")
+
+	if want := 2 + len(queued); len(result.stale) != want {
+		t.Fatalf("stale runs = %d, want %d: every stale run, held ones included", len(result.stale), want)
+	}
+	lines := result.reportLines(now)
+	report := strings.Join(lines, "\n")
+	if len(lines) != 1+len(result.stale) {
+		t.Fatalf("report = %q, want a header and one line per stale run", report)
+	}
+	if !strings.Contains(lines[0], "10 stale order run(s)") || !strings.Contains(lines[0], "1 held, 0 unobservable, 1 holder-gone, 8 unclaimed") || !strings.Contains(lines[0], "nothing is closed") {
+		t.Fatalf("header = %q, want per-verdict counts and the report-only statement", lines[0])
+	}
+	for _, want := range []string{
+		held.ID, `holder "` + sb.ID + `"`, "held: its session is live",
+		gone.ID, `holder "repo/worker-1"`, "holder-gone: agent of this city",
+		"run_stale_after=6h",
+	} {
+		if !strings.Contains(report, want) {
+			t.Fatalf("report = %q, want it to contain %q", report, want)
+		}
+	}
+	for _, q := range queued {
+		if !strings.Contains(report, q.ID) {
+			t.Fatalf("report = %q, want it to name unclaimed run %s", report, q.ID)
+		}
+	}
+	if !strings.Contains(report, `holder "unassigned", unclaimed: no open member of the run is claimed`) {
+		t.Fatalf("report = %q, want unclaimed runs reported with their verdict", report)
+	}
+}
+
+// TestOrderWispWatchdogReportsLiveHolderAsHeld is the liveness mutant
+// (ga-puy7n0 test a). Every case is a stale root-only wisp whose claim names
+// this city's own identity, so the locality step would call it holder-gone:
+// only the liveness step reports it held. Delete the `if live` return in
+// refVerdict and every case reports holder-gone.
+func TestOrderWispWatchdogReportsLiveHolderAsHeld(t *testing.T) {
 	cases := []struct {
 		name     string
 		assignee string
@@ -154,25 +347,19 @@ func TestOrderWispWatchdogSparesRootOnlyWispHeldByLiveSession(t *testing.T) {
 			}
 			wisp := seedOrderWisp(t, store, "digest", "in_progress", tc.assignee, meta)
 
-			result := runOrderWispWatchdogForTest(t, orderWispWatchdogTestCity(t), store, wisp.CreatedAt.Add(7*time.Hour), "digest")
+			result := reportOrderWispsForTest(t, orderWispWatchdogTestCity(t), store, store, wisp.CreatedAt.Add(7*time.Hour), "digest")
 
-			requireBeadStatus(t, store, wisp.ID, "in_progress")
-			if result.closed != 0 {
-				t.Fatalf("closed = %d, want 0: a live session holds this wisp", result.closed)
-			}
-			if len(result.left) != 0 {
-				t.Fatalf("left = %+v, want none: a held wisp is not an anomaly to report", result.left)
-			}
+			requireVerdict(t, staleRunByID(t, result, wisp.ID), orderWispHeld, "its session is live")
 		})
 	}
 }
 
-// TestOrderWispWatchdogLeavesUnobservableClaimOpen is the locality mutant
-// (woodhouse amendment A1). No case has a live session, so the liveness
-// predicate lets every one through: only the locality check keeps another
-// city's claim open. Make localityVerdict return abandoned unconditionally and
-// every case closes.
-func TestOrderWispWatchdogLeavesUnobservableClaimOpen(t *testing.T) {
+// TestOrderWispWatchdogReportsForeignClaimUnobservable is the locality mutant
+// (woodhouse amendment A1). No case has a live session, so the liveness step
+// lets every one through: only the locality step keeps another city's claim
+// from being reported as this city's gone holder. Make localityVerdict return
+// holder-gone unconditionally and every case fails.
+func TestOrderWispWatchdogReportsForeignClaimUnobservable(t *testing.T) {
 	cases := []struct {
 		name       string
 		assignee   string
@@ -182,6 +369,7 @@ func TestOrderWispWatchdogLeavesUnobservableClaimOpen(t *testing.T) {
 		{name: "identity absent from the roster", assignee: "repo/dalinar", wantReason: "absent_from_roster"},
 		{name: "binding this city does not mint", assignee: "repo/review.omp-1", wantReason: "foreign_binding"},
 		{name: "session name no session bead carries", assignee: "their__dog-1-pool", wantReason: "names no session"},
+		{name: "session bead ID from a store this city does not own", assignee: "we-wisp-126vyfx", wantReason: "foreign_store_prefix"},
 		{name: "session bead ID this city does not hold", meta: map[string]string{"gc.session_id": "hq-wisp-elsewhere"}, wantReason: "no session bead with that ID"},
 		{
 			// A local-looking assignee beside a foreign session back-reference
@@ -198,41 +386,82 @@ func TestOrderWispWatchdogLeavesUnobservableClaimOpen(t *testing.T) {
 			store := beads.NewMemStore()
 			wisp := seedOrderWisp(t, store, "digest", "in_progress", tc.assignee, tc.meta)
 
-			result := runOrderWispWatchdogForTest(t, orderWispWatchdogTestCity(t), store, wisp.CreatedAt.Add(7*time.Hour), "digest")
+			result := reportOrderWispsForTest(t, orderWispWatchdogTestCity(t), store, store, wisp.CreatedAt.Add(7*time.Hour), "digest")
 
-			requireBeadStatus(t, store, wisp.ID, "in_progress")
-			if result.closed != 0 {
-				t.Fatalf("closed = %d, want 0: this city cannot prove the claim is its own", result.closed)
-			}
-			summary := result.leftSummary()
-			if !strings.Contains(summary, wisp.ID) || !strings.Contains(summary, tc.wantReason) {
-				t.Fatalf("left summary = %q, want it to name %s and %q", summary, wisp.ID, tc.wantReason)
-			}
+			requireVerdict(t, staleRunByID(t, result, wisp.ID), orderWispUnobservable, tc.wantReason)
 		})
 	}
 }
 
-// TestOrderWispWatchdogClosesAbandonedLocalClaimAndReleasesTheGate is
-// ga-puy7n0 test b: a stale root-only wisp whose claim names this city's own
-// session or agent, none of it live, is closed with an audit trail naming the
-// order and the cutoff, and the order's gate opens on the next evaluation.
-func TestOrderWispWatchdogClosesAbandonedLocalClaimAndReleasesTheGate(t *testing.T) {
+// TestOrderWispWatchdogRunStoreSessionBeadIsNotLocality is condition (c): a
+// session bead found in the swept rig store is not evidence that a claim is
+// this city's. On a rig store shared with another city, that city's session
+// beads sit there too, so a closed one must read unobservable, never
+// holder-gone. An open one still proves the run is held. The control, the same
+// closed session bead in this city's session store, is holder-gone. Let the
+// locality step read the run store and the first two cases fail.
+func TestOrderWispWatchdogRunStoreSessionBeadIsNotLocality(t *testing.T) {
 	cases := []struct {
-		name     string
-		assignee string
-		session  map[string]string
-		wispMeta func(sessionID string) map[string]string
+		name        string
+		inRunStore  bool
+		sessionOpen bool
+		byName      bool
+		wantState   orderWispOwnerState
+		wantReason  string
 	}{
-		{name: "configured pool instance with no session", assignee: "repo/worker-1"},
+		{name: "closed session bead in the rig store, by ID", inRunStore: true, wantState: orderWispUnobservable, wantReason: "no session bead with that ID in this city's session store"},
+		{name: "closed session bead in the rig store, by name", inRunStore: true, byName: true, wantState: orderWispUnobservable, wantReason: "names no session in this city's session store"},
+		{name: "open session bead in the rig store", inRunStore: true, sessionOpen: true, wantState: orderWispHeld, wantReason: "its session is live"},
+		{name: "closed session bead in this city's session store", wantState: orderWispHolderGone, wantReason: "its session bead in this city's session store is closed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := beads.NewMemStore()
+			rig.IDPrefix = "rg"
+			sessions := beads.NewMemStore()
+			sessions.IDPrefix = "ct"
+			home := sessions
+			if tc.inRunStore {
+				home = rig
+			}
+			sb := seedOrderWispSession(t, home, tc.sessionOpen, map[string]string{"session_name": "their__dog-1-pool"})
+			assignee, meta := "", map[string]string{"gc.session_id": sb.ID}
+			if tc.byName {
+				assignee, meta = "their__dog-1-pool", nil
+			}
+			wisp := seedOrderWisp(t, rig, "digest", "in_progress", assignee, meta)
+
+			result := reportOrderWispsForTest(t, orderWispWatchdogTestCity(t), rig, sessions, wisp.CreatedAt.Add(7*time.Hour), "digest")
+
+			requireVerdict(t, staleRunByID(t, result, wisp.ID), tc.wantState, tc.wantReason)
+		})
+	}
+}
+
+// TestOrderWispWatchdogReportsGoneLocalHolderAndLeavesTheGateHeld is
+// ga-puy7n0 test b under the report-only scope: a stale root-only wisp whose
+// claim names this city's own session or agent, none of it live, is reported
+// holder-gone and left exactly as it was, so it still gates its order.
+func TestOrderWispWatchdogReportsGoneLocalHolderAndLeavesTheGateHeld(t *testing.T) {
+	cases := []struct {
+		name       string
+		assignee   string
+		session    map[string]string
+		wispMeta   func(sessionID string) map[string]string
+		wantReason string
+	}{
+		{name: "configured pool instance with no session", assignee: "repo/worker-1", wantReason: "agent of this city"},
 		{
-			name:     "runtime session name of a closed session",
-			assignee: "worker-sess-dead",
-			session:  map[string]string{"session_name": "worker-sess-dead"},
+			name:       "runtime session name of a closed session",
+			assignee:   "worker-sess-dead",
+			session:    map[string]string{"session_name": "worker-sess-dead"},
+			wantReason: "its session in this city has ended",
 		},
 		{
-			name:     "gc.session_id of a closed session",
-			session:  map[string]string{"session_name": "worker-sess-gone"},
-			wispMeta: func(id string) map[string]string { return map[string]string{"gc.session_id": id} },
+			name:       "gc.session_id of a closed session",
+			session:    map[string]string{"session_name": "worker-sess-gone"},
+			wispMeta:   func(id string) map[string]string { return map[string]string{"gc.session_id": id} },
+			wantReason: "is closed",
 		},
 	}
 	for _, tc := range cases {
@@ -246,55 +475,41 @@ func TestOrderWispWatchdogClosesAbandonedLocalClaimAndReleasesTheGate(t *testing
 				}
 			}
 			wisp := seedOrderWisp(t, store, "digest", "in_progress", tc.assignee, meta)
+
+			result := reportOrderWispsForTest(t, orderWispWatchdogTestCity(t), store, store, wisp.CreatedAt.Add(7*time.Hour), "digest")
+
+			requireVerdict(t, staleRunByID(t, result, wisp.ID), orderWispHolderGone, tc.wantReason)
+			got := requireBeadStatus(t, store, wisp.ID, "in_progress")
+			if got.Assignee != wisp.Assignee || len(got.Metadata) != len(wisp.Metadata) {
+				t.Fatalf("wisp after the pass = %+v, want it untouched (%+v)", got, wisp)
+			}
 			gate := &memoryOrderDispatcher{}
 			if gated, err := gate.hasOpenWorkStrict(store, "digest"); err != nil || !gated {
-				t.Fatalf("hasOpenWorkStrict before the sweep = %v, %v; want true: the wisp must be gating the order", gated, err)
-			}
-
-			result := runOrderWispWatchdogForTest(t, orderWispWatchdogTestCity(t), store, wisp.CreatedAt.Add(7*time.Hour), "digest")
-
-			got := requireBeadStatus(t, store, wisp.ID, "closed")
-			if result.closed != 1 || len(result.closedRoots) != 1 || result.closedRoots[0] != wisp.ID {
-				t.Fatalf("result = %+v, want exactly %s closed", result, wisp.ID)
-			}
-			reason := got.Metadata["close_reason"]
-			if !strings.Contains(reason, "digest") || !strings.Contains(reason, "run_stale_after=6h") {
-				t.Fatalf("close_reason = %q, want it to name the order and the cutoff", reason)
-			}
-			if got.Metadata["order_wisp_sweep_order"] != "digest" || got.Metadata["order_wisp_sweep_stale_after"] != "6h0m0s" {
-				t.Fatalf("audit metadata = %v, want order_wisp_sweep_order=digest and order_wisp_sweep_stale_after=6h0m0s", got.Metadata)
-			}
-			if got.Metadata["order_tracking_sweep_by"] != orderWispWatchdogMetadataInitiator {
-				t.Fatalf("order_tracking_sweep_by = %q, want %q", got.Metadata["order_tracking_sweep_by"], orderWispWatchdogMetadataInitiator)
-			}
-			if gated, err := gate.hasOpenWorkStrict(store, "digest"); err != nil || gated {
-				t.Fatalf("hasOpenWorkStrict after the sweep = %v, %v; want false: the order must fire on its next evaluation", gated, err)
+				t.Fatalf("hasOpenWorkStrict after the pass = %v, %v; want true: a report-only pass leaves the gate held", gated, err)
 			}
 		})
 	}
 }
 
-// TestOrderWispWatchdogLeavesYoungWispsAloneWhateverTheirHolder is ga-puy7n0
-// test c: under the cutoff, neither a dead holder nor a live one moves the
-// watchdog, and neither is reported.
-func TestOrderWispWatchdogLeavesYoungWispsAloneWhateverTheirHolder(t *testing.T) {
+// TestOrderWispWatchdogLeavesYoungRunsUnreported is ga-puy7n0 test c: under
+// the cutoff, neither a gone holder nor a live one is stale, and neither is
+// reported.
+func TestOrderWispWatchdogLeavesYoungRunsUnreported(t *testing.T) {
 	store := beads.NewMemStore()
 	seedOrderWispSession(t, store, true, map[string]string{"session_name": "worker-sess-live"})
-	abandoned := seedOrderWisp(t, store, "digest", "in_progress", "repo/worker-1", nil)
-	held := seedOrderWisp(t, store, "digest", "in_progress", "worker-sess-live", nil)
+	gone := seedOrderWisp(t, store, "digest", "in_progress", "repo/worker-1", nil)
+	seedOrderWisp(t, store, "digest", "in_progress", "worker-sess-live", nil)
 
-	result := runOrderWispWatchdogForTest(t, orderWispWatchdogTestCity(t), store, abandoned.CreatedAt.Add(time.Hour), "digest")
+	result := reportOrderWispsForTest(t, orderWispWatchdogTestCity(t), store, store, gone.CreatedAt.Add(time.Hour), "digest")
 
-	requireBeadStatus(t, store, abandoned.ID, "in_progress")
-	requireBeadStatus(t, store, held.ID, "in_progress")
-	if result.closed != 0 || len(result.left) != 0 {
-		t.Fatalf("result = %+v, want nothing closed or reported under the cutoff", result)
+	if len(result.stale) != 0 || result.reportLines(gone.CreatedAt.Add(time.Hour)) != nil {
+		t.Fatalf("result = %+v, want nothing reported under the cutoff", result)
 	}
 }
 
 // TestOrderWispWatchdogHonorsPerOrderStaleAfter is ga-puy7n0 test d: an order's
-// run_stale_after sets its own cutoff, and an order that sets none gets the
-// default.
+// run_stale_after sets its own report threshold, and an order that sets none
+// gets the default.
 func TestOrderWispWatchdogHonorsPerOrderStaleAfter(t *testing.T) {
 	store := beads.NewMemStore()
 	fast := seedOrderWisp(t, store, "fast", "in_progress", "repo/worker-1", nil)
@@ -317,137 +532,111 @@ func TestOrderWispWatchdogHonorsPerOrderStaleAfter(t *testing.T) {
 			t.Fatalf("%s staleAfter = %s, want %s", o.scoped, o.staleAfter, want)
 		}
 	}
-	result, err := sweepStaleOrderWisps(
+	now := fast.CreatedAt.Add(3 * time.Hour)
+	result, err := reportStaleOrderWisps(
 		[]orderWispWatchdogLeg{{store: store, orders: watch}},
-		fast.CreatedAt.Add(3*time.Hour),
+		now,
 		newOrderWispOwnerResolver(orderWispWatchdogTestCity(t), t.TempDir(), store),
 	)
 	if err != nil {
-		t.Fatalf("sweepStaleOrderWisps: %v", err)
+		t.Fatalf("reportStaleOrderWisps: %v", err)
 	}
 
-	got := requireBeadStatus(t, store, fast.ID, "closed")
-	if !strings.Contains(got.Metadata["close_reason"], "run_stale_after=2h") {
-		t.Fatalf("close_reason = %q, want the order's own 2h cutoff", got.Metadata["close_reason"])
+	if len(result.stale) != 1 || result.stale[0].rootID != fast.ID {
+		t.Fatalf("stale runs = %+v, want only %s (slow %s is under the 6h default)", result.stale, fast.ID, slow.ID)
 	}
-	requireBeadStatus(t, store, slow.ID, "in_progress")
-	if result.closed != 1 {
-		t.Fatalf("closed = %d, want 1", result.closed)
-	}
-}
-
-// TestOrderWispWatchdogLeavesUnclaimedWispOpenAndReportsIt pins the queued-
-// demand rule: an unclaimed stale wisp is not closed, because a slow pool is
-// not a dead one, but it is named every pass because it still gates its order.
-// A session back-reference left behind by a released claim does not make it
-// claimed.
-func TestOrderWispWatchdogLeavesUnclaimedWispOpenAndReportsIt(t *testing.T) {
-	store := beads.NewMemStore()
-	dead := seedOrderWispSession(t, store, false, map[string]string{"session_name": "worker-sess-released"})
-	unclaimed := seedOrderWisp(t, store, "digest", "", "", nil)
-	released := seedOrderWisp(t, store, "digest", "", "", map[string]string{"gc.session_id": dead.ID})
-
-	result := runOrderWispWatchdogForTest(t, orderWispWatchdogTestCity(t), store, unclaimed.CreatedAt.Add(7*time.Hour), "digest")
-
-	requireBeadStatus(t, store, unclaimed.ID, "open")
-	requireBeadStatus(t, store, released.ID, "open")
-	if result.closed != 0 {
-		t.Fatalf("closed = %d, want 0: unclaimed work is queued demand", result.closed)
-	}
-	summary := result.leftSummary()
-	for _, id := range []string{unclaimed.ID, released.ID} {
-		if !strings.Contains(summary, id) {
-			t.Fatalf("left summary = %q, want it to name %s", summary, id)
-		}
-	}
-	if !strings.Contains(summary, `"unclaimed"`) {
-		t.Fatalf("left summary = %q, want the holder reported as unclaimed", summary)
+	if report := strings.Join(result.reportLines(now), "\n"); !strings.Contains(report, "run_stale_after=2h") {
+		t.Fatalf("report = %q, want the order's own 2h threshold", report)
 	}
 }
 
 // TestOrderWispWatchdogResolvesOwnersWithoutMaterializingSessions is woodhouse
 // amendment A2: judging owners that have no session bead must not create one.
 // A resolver that materializes the session it is checking would read every
-// dead owner as alive, so the session store must end the pass with exactly the
-// beads it started with. The named seat is the shape a materializing resolver
-// creates a bead for; the pool instance and the bare name are the shapes a
-// lookup-by-identity reads.
+// gone owner as alive. The session store fails on any write, so a
+// materializing lookup fails the test outright. The named seat is the shape a
+// materializing resolver creates a bead for; the pool instance and the bare
+// name are the shapes a lookup-by-identity reads.
 func TestOrderWispWatchdogResolvesOwnersWithoutMaterializingSessions(t *testing.T) {
 	wisps := beads.NewMemStore()
-	sessions := beads.NewMemStore()
-	seedOrderWispSession(t, sessions, false, map[string]string{"session_name": "unrelated-sess"})
+	wisps.IDPrefix = "rg"
+	sessionBacking := beads.NewMemStore()
+	seedOrderWispSession(t, sessionBacking, false, map[string]string{"session_name": "unrelated-sess"})
+	sessions := newWriteForbiddingStore(t, sessionBacking)
 	named := seedOrderWisp(t, wisps, "digest", "in_progress", "repo/lead", nil)
 	pool := seedOrderWisp(t, wisps, "digest", "in_progress", "repo/worker-2", nil)
 	bare := seedOrderWisp(t, wisps, "digest", "in_progress", "ghost-sess", nil)
-	before := countAllBeadsForTest(t, sessions)
 
-	result := runOrderWispWatchdogWithSessionsForTest(t, orderWispWatchdogTestCity(t), wisps, sessions, named.CreatedAt.Add(7*time.Hour), "digest")
+	result := reportOrderWispsForTest(t, orderWispWatchdogTestCity(t), wisps, sessions, named.CreatedAt.Add(7*time.Hour), "digest")
 
-	if after := countAllBeadsForTest(t, sessions); after != before {
-		t.Fatalf("session store holds %d beads after the sweep, want %d: owner resolution must never create a session", after, before)
+	if got := sessions.attempted(); len(got) != 0 {
+		t.Fatalf("owner resolution attempted session-store writes %v; it must never create a session", got)
 	}
-	requireBeadStatus(t, wisps, named.ID, "in_progress")
-	requireBeadStatus(t, wisps, pool.ID, "closed")
-	requireBeadStatus(t, wisps, bare.ID, "in_progress")
-	if result.closed != 1 {
-		t.Fatalf("closed = %d, want 1 (only the configured pool instance with no session)", result.closed)
-	}
+	requireVerdict(t, staleRunByID(t, result, named.ID), orderWispHeld, "configured named session")
+	requireVerdict(t, staleRunByID(t, result, pool.ID), orderWispHolderGone, "agent of this city")
+	requireVerdict(t, staleRunByID(t, result, bare.ID), orderWispUnobservable, "names no session")
 }
 
-func countAllBeadsForTest(t *testing.T, store beads.Store) int {
-	t.Helper()
-	all, err := store.List(beads.ListQuery{AllowScan: true, IncludeClosed: true, TierMode: beads.TierBoth})
-	if err != nil {
-		t.Fatalf("List(all): %v", err)
-	}
-	return len(all)
-}
-
-// TestOrderWispWatchdogSparesMoleculeWithLiveClaimedStep carries amendment A1
-// into the subtree case: a stale molecule whose open step a live session holds
-// stays open, while a stale molecule whose open steps nobody claims keeps the
-// stale-subtree close the operator sweep always performed.
-func TestOrderWispWatchdogSparesMoleculeWithLiveClaimedStep(t *testing.T) {
+// TestOrderWispWatchdogJudgesTheWholeMolecule pins the subtree verdict, which
+// is what woodhouse's block was about: a stale molecule whose open members
+// nobody claims is reported unclaimed and left open (it is queued work, not a
+// dead run), and a stale molecule with an open step a live session holds is
+// reported held, naming that step.
+func TestOrderWispWatchdogJudgesTheWholeMolecule(t *testing.T) {
 	store := beads.NewMemStore()
 	seedOrderWispSession(t, store, true, map[string]string{"session_name": "worker-sess-live"})
-	seedMolecule := func(stepAssignee, stepStatus string) (beads.Bead, beads.Bead) {
-		root, err := store.Create(beads.Bead{Title: "mol-digest", Type: "molecule", Labels: []string{"order-run:digest"}})
-		if err != nil {
-			t.Fatalf("Create(molecule root): %v", err)
-		}
-		step, err := store.Create(beads.Bead{Title: "step", ParentID: root.ID, Assignee: stepAssignee})
-		if err != nil {
-			t.Fatalf("Create(step): %v", err)
-		}
-		if stepStatus != "" {
-			if err := store.Update(step.ID, beads.UpdateOpts{Status: stringPtr(stepStatus)}); err != nil {
-				t.Fatalf("Update(step status): %v", err)
-			}
-		}
-		return root, step
-	}
-	liveRoot, liveStep := seedMolecule("worker-sess-live", "in_progress")
-	idleRoot, idleStep := seedMolecule("", "")
+	liveRoot, liveStep := seedOrderMolecule(t, store, "worker-sess-live", "in_progress")
+	idleRoot, idleStep := seedOrderMolecule(t, store, "", "")
 
-	result := runOrderWispWatchdogForTest(t, orderWispWatchdogTestCity(t), store, liveRoot.CreatedAt.Add(7*time.Hour), "digest")
+	result := reportOrderWispsForTest(t, orderWispWatchdogTestCity(t), store, store, liveRoot.CreatedAt.Add(7*time.Hour), "digest")
 
-	requireBeadStatus(t, store, liveRoot.ID, "open")
-	requireBeadStatus(t, store, liveStep.ID, "in_progress")
-	requireBeadStatus(t, store, idleRoot.ID, "closed")
-	requireBeadStatus(t, store, idleStep.ID, "closed")
-	if result.closed != 2 {
-		t.Fatalf("closed = %d, want 2 (the unclaimed molecule's root and step)", result.closed)
+	requireVerdict(t, staleRunByID(t, result, liveRoot.ID), orderWispHeld, "open member "+liveStep.ID+": its session is live")
+	requireVerdict(t, staleRunByID(t, result, idleRoot.ID), orderWispUnclaimed, "no open member of the run is claimed")
+	requireBeadStatus(t, store, idleRoot.ID, "open")
+	requireBeadStatus(t, store, idleStep.ID, "open")
+}
+
+// TestOrderWispDoctorNoteAgreesWithTheWatchdog is condition (d): gc doctor's
+// note on the bead gating an order judges the whole run, as the watchdog's
+// report does, so the two print the same verdict. The molecule's root is
+// unclaimed and only its step is held: a doctor that judged the root alone
+// would call the run unclaimed while the watchdog calls it held. The note goes
+// through doctor's own judgeRun, with only its session-store open stubbed.
+func TestOrderWispDoctorNoteAgreesWithTheWatchdog(t *testing.T) {
+	store := beads.NewMemStore()
+	cfg := orderWispWatchdogTestCity(t)
+	seedOrderWispSession(t, store, true, map[string]string{"session_name": "worker-sess-live"})
+	heldRoot, _ := seedOrderMolecule(t, store, "worker-sess-live", "in_progress")
+	idleRoot, _ := seedOrderMolecule(t, store, "", "")
+	goneWisp := seedOrderWisp(t, store, "digest", "in_progress", "repo/worker-1", nil)
+	now := heldRoot.CreatedAt.Add(7 * time.Hour)
+
+	result := reportOrderWispsForTest(t, cfg, store, store, now, "digest")
+	sessions := &doctorOrderWispSessions{cityPath: t.TempDir(), cfg: cfg}
+	sessions.once.Do(func() { sessions.store = store })
+
+	for _, root := range []beads.Bead{heldRoot, idleRoot, goneWisp} {
+		run := staleRunByID(t, result, root.ID)
+		work := describeOrderFiringOpenWork(root, func(root beads.Bead) (orderWispOwnerVerdict, error) {
+			return sessions.judgeRun(store, root)
+		})
+		if work.Note != run.verdict.String() || work.Holder != run.verdict.Owner {
+			t.Fatalf("doctor on %s = (holder %q, note %q), watchdog = (holder %q, %q); want them to agree",
+				root.ID, work.Holder, work.Note, run.verdict.Owner, run.verdict)
+		}
 	}
 }
 
-// TestOrderWispWatchdogRuntimeWaitsOneIntervalThenSweeps pins the controller
+// TestOrderWispWatchdogRuntimeWaitsOneIntervalThenReports pins the controller
 // wiring: the first pass is spent arming the clock, never on the boot path,
-// and a pass one interval later closes an abandoned wisp and says so. The city
-// has no rigs, so the pass reads only the city store it is handed.
-func TestOrderWispWatchdogRuntimeWaitsOneIntervalThenSweeps(t *testing.T) {
-	store := beads.NewMemStore()
-	seedOrderWispSession(t, store, false, map[string]string{"session_name": "worker-sess-dead"})
-	wisp := seedOrderWisp(t, store, "digest", "in_progress", "worker-sess-dead", nil)
+// and a pass one interval later reports the stale run on stderr and writes
+// nothing. The city has no rigs, so the pass reads only the city store it is
+// handed, which fails on write.
+func TestOrderWispWatchdogRuntimeWaitsOneIntervalThenReports(t *testing.T) {
+	backing := beads.NewMemStore()
+	seedOrderWispSession(t, backing, false, map[string]string{"session_name": "worker-sess-dead"})
+	wisp := seedOrderWisp(t, backing, "digest", "in_progress", "worker-sess-dead", nil)
+	store := newWriteForbiddingStore(t, backing)
 	var stderr bytes.Buffer
 	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
 	cr := &CityRuntime{
@@ -462,16 +651,20 @@ func TestOrderWispWatchdogRuntimeWaitsOneIntervalThenSweeps(t *testing.T) {
 	first := wisp.CreatedAt.Add(7 * time.Hour)
 
 	cr.runOrderWispWatchdog(first)
-	requireBeadStatus(t, store, wisp.ID, "in_progress")
-
 	cr.runOrderWispWatchdog(first.Add(orderWispWatchdogInterval - time.Second))
-	requireBeadStatus(t, store, wisp.ID, "in_progress")
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q before the first interval elapsed, want nothing", stderr.String())
+	}
 
 	cr.runOrderWispWatchdog(first.Add(orderWispWatchdogInterval))
-	requireBeadStatus(t, store, wisp.ID, "closed")
-	if !strings.Contains(stderr.String(), "order wisp watchdog closed 1 bead(s)") || !strings.Contains(stderr.String(), wisp.ID) {
-		t.Fatalf("stderr = %q, want the close line naming %s", stderr.String(), wisp.ID)
+	out := stderr.String()
+	if !strings.Contains(out, "1 stale order run(s)") || !strings.Contains(out, wisp.ID) || !strings.Contains(out, "holder-gone: its session in this city has ended") {
+		t.Fatalf("stderr = %q, want the report naming %s and its verdict", out, wisp.ID)
 	}
+	if got := store.attempted(); len(got) != 0 {
+		t.Fatalf("the runtime pass attempted store writes %v; it must write nothing", got)
+	}
+	requireBeadStatus(t, backing, wisp.ID, "in_progress")
 }
 
 // TestOrderWispWatchdogSeesWispsWrittenBehindTheCache is the ga-v5vnyp lesson
@@ -489,12 +682,9 @@ func TestOrderWispWatchdogSeesWispsWrittenBehindTheCache(t *testing.T) {
 	store := wrapStoreWithBeadPolicies(cached, cfg)
 	wisp := seedOrderWisp(t, backing, "digest", "in_progress", "repo/worker-1", nil)
 
-	result := runOrderWispWatchdogForTest(t, cfg, store, wisp.CreatedAt.Add(7*time.Hour), "digest")
+	result := reportOrderWispsForTest(t, cfg, store, store, wisp.CreatedAt.Add(7*time.Hour), "digest")
 
-	requireBeadStatus(t, backing, wisp.ID, "closed")
-	if result.closed != 1 {
-		t.Fatalf("closed = %d, want 1: the watchdog read a cached snapshot that never held this wisp", result.closed)
-	}
+	requireVerdict(t, staleRunByID(t, result, wisp.ID), orderWispHolderGone, "agent of this city")
 }
 
 func TestOrderWispClaimRefs(t *testing.T) {
