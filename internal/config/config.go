@@ -2232,6 +2232,12 @@ type OrderOverride struct {
 	// shared-pack order (e.g. a slow-store queue check) without editing the
 	// pack source.
 	CheckTimeout *string `toml:"check_timeout,omitempty"`
+	// RunStaleAfter overrides how long the order's formula runs may stay open
+	// before the controller reports them as stale, naming who holds each one.
+	// The report closes nothing. Go duration string; default 6h. Lets a
+	// deployment raise it for a scanned shared-pack order whose runs
+	// legitimately take longer, without editing the pack source.
+	RunStaleAfter *string `toml:"run_stale_after,omitempty"`
 	// Idempotent overrides whether the order's dispatch is safe to repeat.
 	// Idempotent orders fail open when the open-work gate times out (#2893).
 	Idempotent *bool `toml:"idempotent,omitempty"`
