@@ -1239,11 +1239,12 @@ func finalizeDrainAckStoppedSession(
 	var ackedWork *beads.Bead
 	classified := false
 	if hasAssignedWork {
-		eligible := closeIfUnassigned && drainAckTeardownEligible(info)
-		outcome := drainAckTeardownOutcome{retainedFor: drainAckRetainedNotPoolSeat}
-		if drainAckTeardownEligible(info) && !closeIfUnassigned {
-			outcome.retainedFor = drainAckRetainedCloseNotPermitted
+		refusal := drainAckTeardownRefusal(cfg, info)
+		if refusal == "" && !closeIfUnassigned {
+			refusal = drainAckRetainedCloseNotPermitted
 		}
+		eligible := refusal == ""
+		outcome := drainAckTeardownOutcome{retainedFor: refusal}
 		observed := "assigned work"
 		if eligible {
 			anomaly, found, anomalyErr := drainAckClaimableAnomalyBead(evidence, info, clk.Now().UTC())
