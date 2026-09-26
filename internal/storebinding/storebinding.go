@@ -183,11 +183,13 @@ func (w SemanticWitness) Validate() error {
 // The semantics are session.AddressDirectory's: ResolveAddress answers session
 // targeting (bool = include closed sessions), ResolveMailboxAddress answers
 // mailbox ownership in ONE liveness pass (bool = the closed pass) and reports
-// a contended address as ambiguous rather than picking a mailbox.
+// a contended address as ambiguous rather than picking a mailbox, and
+// ListClosedByNamedIdentity returns a named seat's closed sessions.
 type SessionsAddressDirectory interface {
 	ResolveAddress(selector string, includeClosed bool) (session.Info, error)
 	ResolveMailboxAddress(selector string, closed bool) (session.Info, error)
 	ListAddresses(includeClosed bool) ([]session.Info, error)
+	ListClosedByNamedIdentity(identity string) ([]session.Info, error)
 }
 
 // SessionsStore is the closed typed sessions and durable-waits contract.
