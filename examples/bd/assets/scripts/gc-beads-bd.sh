@@ -2822,6 +2822,40 @@ EOF
     server_sql_retry "USE \`$dolt_database\`; CALL DOLT_COMMIT('--skip-empty', '-m', 'gc: checkpoint partial bd init schema')" >/dev/null
 }
 
+# export_created_database_migrate_consent gives bd consent to finish migrating
+# a server-mode database, but only one this invocation proved it created
+# (database_created_by_gc: backing store absent before its own CREATE
+# DATABASE). bd init --reinit-local's preflight opens the store writable under
+# a 5-second cap; on a database with no schema yet that open starts bd's
+# migrations and can stop part-way (v41..v46 of v66 in fork CI, ga-zyvj2k,
+# gastownhall/beads#6746). bd's real open then takes its own half-done
+# migration for a co-resident client's and refuses it (#5920), so init dies on
+# a store nobody else has seen. Creating the database is consent to its
+# schema. A database that already existed may have clients on an older bd,
+# which is what the refusal protects, so it never gets consent here. Call it
+# only inside the subshell that runs bd, so the consent cannot leak into the
+# rest of this script.
+#
+# bd reads the consent once for the whole process. In bd's shared-server mode,
+# init also opens beads_global, a database that may already exist, and the
+# consent would reach it too. So an environment that asks for shared-server
+# mode (BEADS_DOLT_SHARED_SERVER as bd's IsSharedServerMode reads it, or
+# BD_DOLT_SHARED_SERVER as bd's config reads a bool) gets no consent, and in
+# every other case the consented call runs with BD_DOLT_SHARED_SERVER=false,
+# which outranks a dolt.shared-server line in bd's config.yaml.
+export_created_database_migrate_consent() {
+    [ "${1:-false}" = "true" ] || return 0
+    case "${BEADS_DOLT_SHARED_SERVER:-}" in
+        1|[Tt][Rr][Uu][Ee]) return 0 ;;
+    esac
+    case "${BD_DOLT_SHARED_SERVER:-}" in
+        1|t|T|true|TRUE|True) return 0 ;;
+    esac
+    BD_DOLT_SHARED_SERVER=false
+    BD_ALLOW_REMOTE_MIGRATE=1
+    export BD_DOLT_SHARED_SERVER BD_ALLOW_REMOTE_MIGRATE
+}
+
 run_bd_init_pinned() {
     local dir="$1"
     local prefix="$2"
@@ -2831,13 +2865,15 @@ run_bd_init_pinned() {
     local database_created_for_init="${6:-false}"
     local init_output
     if [ "$reinit_local" = "true" ]; then
-        if init_output=$(run_bd_pinned "$dir" init --reinit-local --quiet --server -p "$prefix" --database "$dolt_database" --skip-hooks --skip-agents \
+        if init_output=$(export_created_database_migrate_consent "$database_created_for_init"
+            run_bd_pinned "$dir" init --reinit-local --quiet --server -p "$prefix" --database "$dolt_database" --skip-hooks --skip-agents \
             --server-host "$host" --server-port "$DOLT_PORT" "$dir" 2>&1); then
             [ -z "$init_output" ] || printf '%s\n' "$init_output"
             return 0
         fi
     else
-        if init_output=$(run_bd_pinned "$dir" init --quiet --server -p "$prefix" --database "$dolt_database" --skip-hooks --skip-agents \
+        if init_output=$(export_created_database_migrate_consent "$database_created_for_init"
+            run_bd_pinned "$dir" init --quiet --server -p "$prefix" --database "$dolt_database" --skip-hooks --skip-agents \
             --server-host "$host" --server-port "$DOLT_PORT" "$dir" 2>&1); then
             [ -z "$init_output" ] || printf '%s\n' "$init_output"
             return 0
@@ -2869,8 +2905,11 @@ run_bd_init_pinned() {
     # then retry the supported local-reinit path on a clean working set.
     echo "warning: bd init left a dirty partial schema; checkpointing and retrying" >&2
     checkpoint_partial_bd_init_schema "$dolt_database" || die "failed to checkpoint partial bd init schema for $dolt_database"
-    run_bd_pinned "$dir" init --reinit-local --quiet --server -p "$prefix" --database "$dolt_database" --skip-hooks --skip-agents \
-        --server-host "$host" --server-port "$DOLT_PORT" "$dir" || die "bd init retry failed for $dir"
+    (
+        export_created_database_migrate_consent "$database_created_for_init"
+        run_bd_pinned "$dir" init --reinit-local --quiet --server -p "$prefix" --database "$dolt_database" --skip-hooks --skip-agents \
+            --server-host "$host" --server-port "$DOLT_PORT" "$dir"
+    ) || die "bd init retry failed for $dir"
 }
 
 # run_bd_init_proxied initializes a local workspace through beads RC's
