@@ -541,7 +541,10 @@ func tryHookClaim(workQuery, dir string, opts *hookClaimOptions, ops *hookClaimO
 	// ends. Roots are resolved NOW, before either tier opens its
 	// claim-mutation context, in tier order, and only up to the first row the
 	// guard would serve — so dead molecules never spend the claim budget or
-	// the invocation window a live row needs.
+	// the invocation window a live row needs. The tiers themselves only ever
+	// ask the cache: when the first servable row yields no claim, a tier stops
+	// at the next unresolved row, resolves onward outside its claim context,
+	// and re-enters with a fresh one.
 	if ops.rootGate == nil && ops.ReadRoot != nil {
 		ops.rootGate = newHookClosedRootGate(*ops, *opts, stderr)
 		defer ops.rootGate.report()
@@ -766,18 +769,50 @@ func refuseExpiredHookClaimWindow(candidateID string, ops hookClaimOps, stderr i
 // claimsErrored flag carries the skip to the shared drain. Every other claim
 // error still fails closed: ownership is unresolved on a bead this session
 // already owns, and claiming unrelated fresh work would strand it.
+//
+// Closed-root verdicts (qc-z0fmn0n) are resolved between passes, never inside a
+// pass's claim-mutation context: a pass stops at the first row whose root has
+// no cached verdict, this driver resolves onward, and the next pass opens a
+// fresh context. A lost race on the first servable row therefore cannot let
+// the dead molecules behind it spend the budget the next live row needs.
 func claimFirstReadyHookAssignment(candidates []beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string, stdout, stderr io.Writer) hookClaimResult {
+	claimsErrored := false
+	rest := candidates
+	for {
+		result, resumeAt := claimReadyHookAssignmentPass(rest, opts, ops, dir, stdout, stderr)
+		if result.terminal {
+			return result
+		}
+		claimsErrored = claimsErrored || result.claimsErrored
+		if resumeAt < 0 {
+			return hookClaimResult{claimsErrored: claimsErrored}
+		}
+		rest = rest[resumeAt:]
+		admit := func(b beads.Bead) bool { return hookCandidateReadyForPromotion(b, opts, ops.nowOrWallClock()) }
+		ops.rootGate.resolveRemaining(rest, admit, dir, opts.Env)
+	}
+}
+
+// claimReadyHookAssignmentPass is one pass of the ready-assignment tier under
+// one claim-mutation context. resumeAt >= 0 (with a non-terminal result) names
+// the row whose closed-root verdict is not cached yet; nothing at or after it
+// was tried.
+func claimReadyHookAssignmentPass(candidates []beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string, stdout, stderr io.Writer) (hookClaimResult, int) {
 	ctx, cancel := ops.claimMutationContext()
 	defer cancel()
 	claimsErrored := false
 	now := ops.nowOrWallClock()
-	for _, candidate := range candidates {
+	for i, candidate := range candidates {
 		if strings.TrimSpace(candidate.ID) == "" ||
 			hookClaimCandidateIsMessage(candidate) ||
 			!strings.EqualFold(strings.TrimSpace(candidate.Status), "open") ||
 			!hookClaimHasIdentity(candidate.Assignee, opts.IdentityCandidates) ||
-			hookCandidateBudgetDeferred(candidate, now) ||
-			ops.rootGate.skip(candidate, dir, opts.Env) {
+			hookCandidateBudgetDeferred(candidate, now) {
+			continue
+		}
+		if skip, resolved := ops.rootGate.skip(candidate, dir, opts.Env); !resolved {
+			return hookClaimResult{claimsErrored: claimsErrored}, i
+		} else if skip {
 			continue
 		}
 		// F-B. Promoting a ready assignment is a status CAS — a mutation — so it
@@ -785,11 +820,11 @@ func claimFirstReadyHookAssignment(candidates []beads.Bead, opts hookClaimOption
 		// runs earlier, in hookClaimExistingAssignment, and is deliberately
 		// exempt: it mints no new obligation.
 		if ops.claimWindowSpent() {
-			return refuseExpiredHookClaimWindow(candidate.ID, ops, stderr)
+			return refuseExpiredHookClaimWindow(candidate.ID, ops, stderr), -1
 		}
 		if ctx.Err() != nil {
 			fmt.Fprintf(stderr, "gc hook --claim: ready assignment %s claim deadline exhausted: %v\n", candidate.ID, ctx.Err()) //nolint:errcheck
-			return hookClaimResult{terminal: true, code: 1}
+			return hookClaimResult{terminal: true, code: 1}, -1
 		}
 		// Use the bead's current own-identity assignee as the claim actor.
 		// BEADS_ACTOR may be represented by the runtime name, session bead id,
@@ -823,7 +858,7 @@ func claimFirstReadyHookAssignment(candidates []beads.Bead, opts hookClaimOption
 			}
 			// This session already owns the bead. Do not skip it and claim
 			// unrelated fresh work after an operational mutation failure.
-			return hookClaimResult{terminal: true, code: 1}
+			return hookClaimResult{terminal: true, code: 1}, -1
 		}
 		// Deliberately unlike the err != nil branch above: a rejected claim is a
 		// lost race, not an operational failure. Another claimant genuinely owns
@@ -843,7 +878,7 @@ func claimFirstReadyHookAssignment(candidates []beads.Bead, opts hookClaimOption
 				claimed.Status,
 				claimed.Assignee,
 			)
-			return hookClaimResult{terminal: true, code: 1}
+			return hookClaimResult{terminal: true, code: 1}, -1
 		}
 		// The claim ran as the bead's stored spelling (bd's idempotent --claim
 		// requires it), so a ready bead assigned to a legacy spelling of this
@@ -876,9 +911,9 @@ func claimFirstReadyHookAssignment(candidates []beads.Bead, opts hookClaimOption
 		if result.Assignee == "" {
 			result.Assignee = claimActor
 		}
-		return hookClaimResult{terminal: true, code: writeHookClaimWorkResultForBead(result, claimed, opts, ops, dir, true, stdout, stderr)}
+		return hookClaimResult{terminal: true, code: writeHookClaimWorkResultForBead(result, claimed, opts, ops, dir, true, stdout, stderr)}, -1
 	}
-	return hookClaimResult{claimsErrored: claimsErrored}
+	return hookClaimResult{claimsErrored: claimsErrored}, -1
 }
 
 // hookClaimBeadIsElsewhere reports whether a failed claim proves the bead is not
@@ -906,14 +941,47 @@ func hookClaimBeadIsElsewhere(err error) bool {
 // non-terminal result (no output written) so a federated caller can try a later
 // store before the shared no-work drain; the result's claimsErrored flag records
 // whether any skip was an error so that drain stays distinguishable from idle.
+//
+// Like the ready tier, it runs in passes: closed-root verdicts are resolved
+// between passes, outside any claim-mutation context (qc-z0fmn0n), and the
+// declines and claim errors of every pass feed one report and one result.
 func claimFirstEligibleHookCandidate(candidates []beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string, stdout, stderr io.Writer) hookClaimResult {
+	var carry hookClaimTierCarry
+	rest := candidates
+	for {
+		result, resumeAt := claimEligibleHookCandidatePass(rest, &carry, opts, ops, dir, stdout, stderr)
+		if result.terminal {
+			return result
+		}
+		if resumeAt < 0 {
+			break
+		}
+		rest = rest[resumeAt:]
+		admit := func(b beads.Bead) bool { return hookCandidateEligibleForClaim(b, opts, ops.nowOrWallClock()) }
+		ops.rootGate.resolveRemaining(rest, admit, dir, opts.Env)
+	}
+	reportDeclinedForeign(stderr, carry.declinedForeign)
+	reportDeclinedLiveOwner(stderr, carry.declinedLiveOwner)
+	return hookClaimResult{claimsErrored: carry.claimsErrored, declinedForeign: len(carry.declinedForeign)}
+}
+
+// hookClaimTierCarry is what one routed-tier pass hands the next: the claim
+// errors and declines already seen, reported once when the tier ends.
+type hookClaimTierCarry struct {
+	claimsErrored     bool
+	declinedForeign   []string
+	declinedLiveOwner []string
+}
+
+// claimEligibleHookCandidatePass is one pass of the routed tier under one
+// claim-mutation context. resumeAt >= 0 (with a non-terminal result) names the
+// row whose closed-root verdict is not cached yet; nothing at or after it was
+// tried. A terminal result has already reported carry's declines.
+func claimEligibleHookCandidatePass(candidates []beads.Bead, carry *hookClaimTierCarry, opts hookClaimOptions, ops hookClaimOps, dir string, stdout, stderr io.Writer) (hookClaimResult, int) {
 	ctx, cancel := ops.claimMutationContext()
 	defer cancel()
-	claimsErrored := false
 	now := ops.nowOrWallClock()
-	var declinedForeign []string
-	var declinedLiveOwner []string
-	for _, candidate := range candidates {
+	for i, candidate := range candidates {
 		// ga-7rj87d FR1/FR2: a route-matched candidate whose ONLY claim blocker
 		// is an existing (possibly stale) assignee gets a scoped, opt-in reclaim
 		// attempt before the claim below. Off by default (NFR4/NFR5): the flag
@@ -929,7 +997,9 @@ func claimFirstEligibleHookCandidate(candidates []beads.Bead, opts hookClaimOpti
 		// A step whose molecule root was observed closed is not served
 		// (qc-z0fmn0n). Like the declines below it mutates nothing, so it runs
 		// before either the reclaim or the claim.
-		if ops.rootGate.skip(candidate, dir, opts.Env) {
+		if skip, resolved := ops.rootGate.skip(candidate, dir, opts.Env); !resolved {
+			return hookClaimResult{}, i
+		} else if skip {
 			continue
 		}
 		// The two declines below mutate nothing, so they run before EITHER
@@ -942,7 +1012,7 @@ func claimFirstEligibleHookCandidate(candidates []beads.Bead, opts hookClaimOpti
 		// instantiated for another host unless its formula declares
 		// path_agnostic. Declined loudly and counted — never a silent skip.
 		if src, foreign := hookCandidateForeignSource(candidate, opts.HostRoots); foreign {
-			declinedForeign = append(declinedForeign, candidate.ID+"="+src)
+			carry.declinedForeign = append(carry.declinedForeign, candidate.ID+"="+src)
 			continue
 		}
 		// Live-owner invariant (ga-pzop1c): a bead can read as unassigned (a
@@ -956,16 +1026,16 @@ func claimFirstEligibleHookCandidate(candidates []beads.Bead, opts hookClaimOpti
 		// live session is declined here rather than reclaimed.
 		if owner := hookCandidateRecordedSession(candidate, hookClaimSessionID(opts.Env)); owner != "" && ops.OwnerSessionLive != nil {
 			if verdict, reason := ops.OwnerSessionLive(owner); verdict != hookOwnerSessionGone {
-				declinedLiveOwner = append(declinedLiveOwner, fmt.Sprintf("%s=%s (%s)", candidate.ID, owner, reason))
+				carry.declinedLiveOwner = append(carry.declinedLiveOwner, fmt.Sprintf("%s=%s (%s)", candidate.ID, owner, reason))
 				continue
 			}
 		}
 		reclaimedFrom := ""
 		if reclaim {
 			if ops.claimWindowSpent() {
-				reportDeclinedForeign(stderr, declinedForeign)
-				reportDeclinedLiveOwner(stderr, declinedLiveOwner)
-				return refuseExpiredHookClaimWindow(candidate.ID, ops, stderr)
+				reportDeclinedForeign(stderr, carry.declinedForeign)
+				reportDeclinedLiveOwner(stderr, carry.declinedLiveOwner)
+				return refuseExpiredHookClaimWindow(candidate.ID, ops, stderr), -1
 			}
 			if ctx.Err() != nil {
 				break
@@ -984,9 +1054,9 @@ func claimFirstEligibleHookCandidate(candidates []beads.Bead, opts hookClaimOpti
 		// declines above mutate nothing, so they run first and are still
 		// reported when the window refuses.
 		if ops.claimWindowSpent() {
-			reportDeclinedForeign(stderr, declinedForeign)
-			reportDeclinedLiveOwner(stderr, declinedLiveOwner)
-			return refuseExpiredHookClaimWindow(candidate.ID, ops, stderr)
+			reportDeclinedForeign(stderr, carry.declinedForeign)
+			reportDeclinedLiveOwner(stderr, carry.declinedLiveOwner)
+			return refuseExpiredHookClaimWindow(candidate.ID, ops, stderr), -1
 		}
 		if ctx.Err() != nil {
 			// The shared claim budget is spent (an earlier slow-failing claim
@@ -1003,7 +1073,7 @@ func claimFirstEligibleHookCandidate(candidates []beads.Bead, opts hookClaimOpti
 				// Stop immediately: trying another candidate or draining would strand
 				// the assignment while falsely reporting idle work.
 				fmt.Fprintf(stderr, "gc hook --claim: claimed %s but loading canonical bead failed: %v\n", candidate.ID, err) //nolint:errcheck
-				return hookClaimResult{terminal: true, code: 1}
+				return hookClaimResult{terminal: true, code: 1}, -1
 			}
 			// A single unclaimable candidate (a routed id whose bead was deleted,
 			// one that no longer resolves in the store this context can reach, or a
@@ -1012,7 +1082,7 @@ func claimFirstEligibleHookCandidate(candidates []beads.Bead, opts hookClaimOpti
 			// drain report claims_errored instead of a healthy no_work so the write
 			// failure stays visible; the work is reclaimed next tick (NDI) either way.
 			fmt.Fprintf(stderr, "gc hook --claim: skipping %s: %v\n", candidate.ID, err) //nolint:errcheck
-			claimsErrored = true
+			carry.claimsErrored = true
 			continue
 		}
 		if !ok {
@@ -1042,7 +1112,7 @@ func claimFirstEligibleHookCandidate(candidates []beads.Bead, opts hookClaimOpti
 				claimed.Assignee,
 				opts.Assignee,
 			)
-			return hookClaimResult{terminal: true, code: 1}
+			return hookClaimResult{terminal: true, code: 1}, -1
 		}
 		claimed = mergeHookClaimCandidateMetadata(candidate, claimed)
 		result := hookClaimJSONResult{
@@ -1067,14 +1137,12 @@ func claimFirstEligibleHookCandidate(candidates []beads.Bead, opts hookClaimOpti
 			// since the bead was never ours to begin with.
 			ops.EmitHookClaimReclaimedStale(result.BeadID, reclaimedFrom, result.Assignee)
 		}
-		reportDeclinedForeign(stderr, declinedForeign)
-		reportDeclinedLiveOwner(stderr, declinedLiveOwner)
-		return hookClaimResult{terminal: true, code: writeHookClaimWorkResultForBead(result, claimed, opts, ops, dir, true, stdout, stderr)}
+		reportDeclinedForeign(stderr, carry.declinedForeign)
+		reportDeclinedLiveOwner(stderr, carry.declinedLiveOwner)
+		return hookClaimResult{terminal: true, code: writeHookClaimWorkResultForBead(result, claimed, opts, ops, dir, true, stdout, stderr)}, -1
 	}
 
-	reportDeclinedForeign(stderr, declinedForeign)
-	reportDeclinedLiveOwner(stderr, declinedLiveOwner)
-	return hookClaimResult{claimsErrored: claimsErrored, declinedForeign: len(declinedForeign)}
+	return hookClaimResult{}, -1
 }
 
 // mergeHookClaimCandidateMetadata retains work-query metadata when bd update
