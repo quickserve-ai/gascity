@@ -2773,7 +2773,8 @@ func TestDirectSessionBeadIDCandidates_SkipsFlagLikeCandidates(t *testing.T) {
 
 // ga-91tu1o: the sweep's routing inputs (the routed template that picks the
 // named/ephemeral session guards, the canonical-root shape, the detached-probe
-// spec) come from the cached assigned-work snapshot. When the live row has moved
+// spec, the continuation group that picks the release path) come from the
+// cached assigned-work snapshot. When the live row has moved
 // on, the release must be skipped rather than decided on the stale copy; the
 // live status+assignee match alone does not cover it.
 func TestReleaseOrphanedPoolAssignments_SkipsWhenLiveRoutingDivergesFromSnapshot(t *testing.T) {
@@ -2783,6 +2784,8 @@ func TestReleaseOrphanedPoolAssignments_SkipsWhenLiveRoutingDivergesFromSnapshot
 	}{
 		{name: "routed_to moved", meta: map[string]string{"gc.routed_to": "mayor"}},
 		{name: "detached probe armed", meta: map[string]string{detachedProbeMetadataKey: "pid:1"}},
+		{name: "became canonical workflow root", meta: map[string]string{beadmeta.KindMetadataKey: beadmeta.KindWorkflow}},
+		{name: "continuation group set", meta: map[string]string{beadmeta.ContinuationGroupMetadataKey: "grp-1"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
