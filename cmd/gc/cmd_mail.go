@@ -29,6 +29,97 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// Exit codes for the mail read-after-write guard. Distinct from the generic 1
+// so scripts can tell "definitely lost, re-send" from "unknown, go check"
+// without parsing stderr (ga-0ejdbv).
+const (
+	mailSendNotPersistedExit = 5
+	mailSendUnconfirmedExit  = 6
+)
+
+// The send and reply commands call their runners through these variables so a
+// test can drive the cobra command and check the exit code it returns (the
+// verdict codes were once collapsed to 1 at this layer, ga-0ejdbv).
+var (
+	mailSendRunner      = cmdMailSendJSONFull
+	mailReplyRunner     = cmdMailReply
+	mailReplyJSONRunner = cmdMailReplyJSON
+)
+
+// mailStorageCheckCommand is the command that tells whether an unconfirmed
+// message actually landed. Not gc bd show: mail beads are wisps, which bd show
+// does not read. Not a plain gc mail peek either: with a controller up it is
+// answered by the API's cache, which absorbed the create whether or not the row
+// landed. GC_NO_API=1 forces the local, uncached mail provider, whose Get falls
+// back to the wisp tier (ga-0ejdbv round 3).
+func mailStorageCheckCommand(id string) string {
+	return "GC_NO_API=1 gc mail peek " + id
+}
+
+// classifyMailWriteFailure turns a read-after-write verdict into an exit code
+// and the guidance that verdict deserves. The two verdicts stay distinct on
+// purpose: a VERIFIED-ABSENT message must be re-sent, while an UNCONFIRMED one
+// may well have landed and must be CHECKED first — collapsing them would turn
+// every slow verification into duplicate control-channel traffic under exactly
+// the load that causes it. Returns 0 when err is not one of these verdicts, so
+// the caller keeps its own handling.
+func classifyMailWriteFailure(stderr io.Writer, cmdLabel string, err error) int {
+	switch {
+	case errors.Is(err, beadmail.ErrNotPersisted):
+		fmt.Fprintf(stderr, "%s: NOT DELIVERED — %v\n", cmdLabel, err)                           //nolint:errcheck // best-effort stderr
+		fmt.Fprintln(stderr, "hint: no message bead exists for this send; re-send the message.") //nolint:errcheck // best-effort stderr
+		return mailSendNotPersistedExit
+	case errors.Is(err, beadmail.ErrUnconfirmed):
+		id, ok := mail.UnconfirmedMessageID(err)
+		if !ok {
+			id = "<message-id>"
+		}
+		fmt.Fprintf(stderr, "%s: DELIVERY UNCONFIRMED — %v\n", cmdLabel, err)                                                       //nolint:errcheck // best-effort stderr
+		fmt.Fprintf(stderr, "hint: the write may have landed. Check with \"%s\" before re-sending.\n", mailStorageCheckCommand(id)) //nolint:errcheck // best-effort stderr
+		fmt.Fprintln(stderr, "      "+mailStorageCheckReading)                                                                      //nolint:errcheck // best-effort stderr
+		return mailSendUnconfirmedExit
+	}
+	return 0
+}
+
+// mailStorageCheckReading tells the operator how to read the check's answer.
+// "absence unproven" means the lookup itself did not finish (check again
+// later), and a plain "not found" can also mean the recipient already
+// archived it, so neither is proof the send was lost (ga-0ejdbv round 4).
+const mailStorageCheckReading = `A message shown = it landed. "absence unproven" = the lookup did not finish; check again later, and if it persists (a bd ID collision never resolves) ask the recipient or re-send marked as a possible duplicate. "not found" = it did not land, or it was already archived.`
+
+// writeMailVerdictJSON writes the JSON failure record for a read-after-write
+// verdict (5 lost, 6 unconfirmed) in the shared failure shape (ok=false plus
+// error{code,message,exit_code}), carrying the message ID to check when the
+// verdict is unconfirmed. It returns code, or 1 if the write failed. For any
+// other code it writes nothing and returns code, leaving the caller's own
+// failure handling (and run()'s generic record) in place.
+func writeMailVerdictJSON(stdout, stderr io.Writer, context, command, action string, code int, err error) int {
+	var errCode string
+	switch code {
+	case mailSendNotPersistedExit:
+		errCode = "mail_not_delivered"
+	case mailSendUnconfirmedExit:
+		errCode = "mail_unconfirmed"
+	default:
+		return code
+	}
+	id, _ := mail.UnconfirmedMessageID(err)
+	if w := writeCLIJSONLineOrExit(stdout, stderr, context, mailActionResult{
+		SchemaVersion: "1",
+		OK:            false,
+		Command:       command,
+		Action:        action,
+		ID:            id,
+		Error:         &jsonSchemaErrorDetail{Code: errCode, Message: err.Error(), ExitCode: code},
+	}); w != 0 {
+		// The verdict code still wins: exit 1 reads as "failed, re-send",
+		// which duplicates an unconfirmed message.
+		return code
+	}
+	return code
+}
+
 // nudgeFunc is an optional callback for nudging an agent after sending or
 // replying to mail. When non-nil, it is called with the recipient name and
 // the ID of the message the nudge announces. messageID lets the queued nudge
@@ -107,6 +198,21 @@ type mailActionResult struct {
 	// Unreached lists configured named seats a --all broadcast did NOT reach
 	// because they had no open session (ga-dwgz52).
 	Unreached []string `json:"unreached,omitempty"`
+	// Lost, Failed and Unconfirmed are a --all broadcast's per-recipient
+	// failures (ok=false): re-send to Lost and Failed by address, check each
+	// Unconfirmed ID first. Never re-run --all (ga-0ejdbv).
+	// Error is set on a failure record (ok=false), in the shared failure shape.
+	Error       *jsonSchemaErrorDetail     `json:"error,omitempty"`
+	Lost        []string                   `json:"lost,omitempty"`
+	Failed      []string                   `json:"failed,omitempty"`
+	Unconfirmed []mailUnconfirmedRecipient `json:"unconfirmed,omitempty"`
+}
+
+// mailUnconfirmedRecipient names a --all recipient whose message may have
+// landed as ID but could not be read back.
+type mailUnconfirmedRecipient struct {
+	To string `json:"to"`
+	ID string `json:"id"`
 }
 
 type mailMessageSummary struct {
@@ -152,9 +258,38 @@ func mailWakeRef(target nudgeTarget, ref, mailBeadID string) string {
 	return notifyBeadRefPrefix + mailBeadID
 }
 
+// resolveMailWakeTarget resolves the session to wake for a stored mailbox.
+// A mailbox with no rig qualifier belongs to a city-scoped seat: rig-scoped
+// mailboxes are stored qualified ("qcore/barry"). From inside a rig the bare
+// name also matches that rig's seat of the same name, so when it is ambiguous
+// the wake retries the rooted form, which names the city seat from any cwd.
+// Without this, "/barry" stored as "barry" and then failed its own wake
+// (ga-mk8tp4, review finding 1).
+func resolveMailWakeTarget(recipient string, resolve func(string) (nudgeTarget, error)) (nudgeTarget, error) {
+	target, err := resolve(recipient)
+	if errors.Is(err, session.ErrAmbiguous) && !strings.Contains(recipient, "/") {
+		rooted, rootedErr := resolve(session.CityScopePrefix + recipient)
+		if errors.Is(rootedErr, session.ErrSessionNotFound) {
+			// No city seat by that name: the ambiguity was between rig
+			// seats, and its error lists them. Keep it (ga-elylrw N1).
+			// Known edge: a city seat that exists but fails to
+			// materialize also reads as not-found here (the materialize
+			// error wraps ErrSessionNotFound), so it reports this
+			// ambiguity instead of that failure (ga-pml0rv).
+			return target, err
+		}
+		return rooted, rootedErr
+	}
+	return target, err
+}
+
+func discardNudgeTargetResolver(identifier string) (nudgeTarget, error) {
+	return resolveNudgeTarget(identifier, io.Discard)
+}
+
 func newMailNudgeFunc(sender, ref string) nudgeFunc {
 	return func(recipient, messageID string) error {
-		target, err := resolveNudgeTarget(recipient, io.Discard)
+		target, err := resolveMailWakeTarget(recipient, discardNudgeTargetResolver)
 		if err != nil {
 			return err
 		}
@@ -1341,8 +1476,20 @@ func resolveLiveConfiguredNamedMailTargetCached(sessStore beads.Store, identifie
 	case 1:
 		return matches[order[0]], true, nil
 	default:
-		return resolvedMailTarget{}, true, fmt.Errorf("%w: %q matches %d live configured named sessions: %s",
-			session.ErrAmbiguous, identifier, len(order), strings.Join(order, ", "))
+		// Name each candidate in a form that resolves from any cwd: a
+		// city-scoped mailbox is rooted ("/barry"), a rig-scoped one is already
+		// qualified (ga-mk8tp4). A bare list left the city seat unaddressable
+		// from inside a rig.
+		addressable := make([]string, 0, len(order))
+		for _, display := range order {
+			if strings.Contains(display, "/") {
+				addressable = append(addressable, display)
+			} else {
+				addressable = append(addressable, session.CityScopePrefix+display)
+			}
+		}
+		return resolvedMailTarget{}, true, fmt.Errorf("%w: %q matches %d live configured named sessions; address one of: %s",
+			session.ErrAmbiguous, identifier, len(order), strings.Join(addressable, ", "))
 	}
 }
 
@@ -1734,11 +1881,9 @@ list that cannot be read, refuses the send before anything is stored.`,
 					notify = defaultMailSendNotify(mailSendRecipientIsForeign(args, to))
 				}
 			}
-			code := cmdMailSendJSONFull(args, notify, all, from, to, subject, message, dedupKey, ref, jsonOut, stdout, stderr)
-			if code != 0 {
-				return errExit
-			}
-			return nil
+			// exitForCode, not errExit: the read-after-write verdicts
+			// (5 lost, 6 unconfirmed) must reach the shell (ga-0ejdbv).
+			return exitForCode(mailSendRunner(args, notify, all, from, to, subject, message, dedupKey, ref, jsonOut, stdout, stderr))
 		},
 	}
 	cmd.Flags().BoolVar(&notify, "notify", false, "request a recipient turn (including a managed wake if not running), even with earlier unread mail (the default for direct local sends; see --no-notify)")
@@ -1848,14 +1993,11 @@ is addressed by that city to the original sender); the sender is
 		RunE: func(_ *cobra.Command, args []string) error {
 			code := 0
 			if jsonOut {
-				code = cmdMailReplyJSON(args, subject, message, notify, true, stdout, stderr)
+				code = mailReplyJSONRunner(args, subject, message, notify, true, stdout, stderr)
 			} else {
-				code = cmdMailReply(args, subject, message, notify, stdout, stderr)
+				code = mailReplyRunner(args, subject, message, notify, stdout, stderr)
 			}
-			if code != 0 {
-				return errExit
-			}
-			return nil
+			return exitForCode(code)
 		},
 	}
 	cmd.Flags().StringVarP(&subject, "subject", "s", "", "reply subject line")
@@ -2188,7 +2330,7 @@ func cmdMailSendJSONFull(args []string, notify bool, all bool, from string, to s
 		// with --ref. Resolution failures fall through — the nudge path
 		// surfaces them after the send exactly as before.
 		if cloudWakeGuardApplies(foreign, nf != nil, canonicalTo, ref) {
-			if target, terr := resolveNudgeTarget(canonicalTo, io.Discard); terr == nil &&
+			if target, terr := resolveMailWakeTarget(canonicalTo, discardNudgeTargetResolver); terr == nil &&
 				strings.TrimSpace(target.agent.WakeTransport) == config.WakeTransportClaudeCloud {
 				fmt.Fprintf(stderr, "gc mail send: recipient %q is a cloud-wake seat (wake_transport=%s); pass --ref <https URL into its GitHub working surface> so its wake hint points at content it can reach (its sandbox cannot read bead:// refs), or --no-notify to send mail without a wake\n", canonicalTo, config.WakeTransportClaudeCloud) //nolint:errcheck // best-effort stderr
 				return 1
@@ -2314,6 +2456,12 @@ func doMailSendJSON(mp mail.Provider, rec events.Recorder, validRecipients map[s
 	}
 	telemetry.RecordMailOp(context.Background(), "send", err)
 	if err != nil {
+		if code := classifyMailWriteFailure(stderr, "gc mail send", err); code != 0 {
+			if jsonOut {
+				return writeMailVerdictJSON(stdout, stderr, "gc mail send", "mail.send", "send", code, err)
+			}
+			return code
+		}
 		fmt.Fprintf(stderr, "gc mail send: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
@@ -2443,11 +2591,29 @@ func doMailSendAllCoverage(mp mail.Provider, rec events.Recorder, validRecipient
 	var sent []mailMessageSummary
 	sentTo := map[string]bool{}
 	notified := false
+	// A failure for one recipient does not stop the broadcast. Stopping at
+	// recipient k told the operator to re-send, and the re-run duplicated to
+	// recipients 1..k-1 (ga-0ejdbv review finding 3). Every recipient is
+	// attempted and the summary names exactly who needs what.
+	var lost, failed, unconfirmed, attemptedFailed []string
+	var unconfirmedRecipients []mailUnconfirmedRecipient
 	for _, to := range recipients {
 		m, err := mp.Send(sender, to, subject, body)
 		if err != nil {
-			fmt.Fprintf(stderr, "gc mail send --all: sending to %s: %v\n", to, err) //nolint:errcheck // best-effort stderr
-			return 1
+			attemptedFailed = append(attemptedFailed, to)
+			switch id, isUnconfirmed := mail.UnconfirmedMessageID(err); {
+			case isUnconfirmed:
+				fmt.Fprintf(stderr, "gc mail send --all: sending to %s: DELIVERY UNCONFIRMED as %s: %v\n", to, id, err) //nolint:errcheck // best-effort stderr
+				unconfirmed = append(unconfirmed, fmt.Sprintf("%s (%s)", to, id))
+				unconfirmedRecipients = append(unconfirmedRecipients, mailUnconfirmedRecipient{To: to, ID: id})
+			case errors.Is(err, beadmail.ErrNotPersisted):
+				fmt.Fprintf(stderr, "gc mail send --all: sending to %s: NOT DELIVERED: %v\n", to, err) //nolint:errcheck // best-effort stderr
+				lost = append(lost, to)
+			default:
+				fmt.Fprintf(stderr, "gc mail send --all: sending to %s: %v\n", to, err) //nolint:errcheck // best-effort stderr
+				failed = append(failed, to)
+			}
+			continue
 		}
 		rec.Record(events.Event{
 			Type:    events.MailSent,
@@ -2472,14 +2638,66 @@ func doMailSendAllCoverage(mp mail.Provider, rec events.Recorder, validRecipient
 	}
 	// Under-delivery is loud, never silent (ga-dwgz52): a policy broadcast that
 	// reaches a minority must say so, and name who got nothing.
-	unreached := unreachedConfiguredSeats(cov, sentTo, sender)
+	// A recipient whose send failed or is unconfirmed WAS attempted: it is
+	// named in the failure summary below, never in the "got NOTHING, mail each
+	// by address" warning, whose advice would be a blind re-send.
+	attempted := make(map[string]bool, len(sentTo)+len(attemptedFailed))
+	for to := range sentTo {
+		attempted[to] = true
+	}
+	for _, to := range attemptedFailed {
+		attempted[to] = true
+	}
+	unreached := unreachedConfiguredSeats(cov, attempted, sender)
 	if len(unreached) > 0 {
 		fmt.Fprintf(stderr, "gc mail send --all: WARNING: reached %d open mailbox(es); %d configured named seat(s) had no open session and got NOTHING: %s. --all covers open sessions only; mail each by address to reach it.\n", len(sent), len(unreached), strings.Join(unreached, ", ")) //nolint:errcheck // best-effort stderr
 	}
+	code := reportMailSendAllFailures(stderr, len(sent), lost, failed, unconfirmed)
 	if jsonOut {
-		return writeCLIJSONLineOrExit(stdout, stderr, "gc mail send", mailActionResult{SchemaVersion: "1", OK: true, Command: "mail.send", Action: "send", Messages: sent, Count: intRef(len(sent)), Notified: notified, Unreached: unreached})
+		// Written on failure too: a JSON caller must learn which recipients
+		// already have the message, or it re-runs --all and duplicates to
+		// them (ga-0ejdbv round 3). The exit code still carries the verdict.
+		res := mailActionResult{SchemaVersion: "1", OK: code == 0, Command: "mail.send", Action: "send", Messages: sent, Count: intRef(len(sent)), Notified: notified, Unreached: unreached, Lost: lost, Failed: failed, Unconfirmed: unconfirmedRecipients}
+		if code != 0 {
+			// The shared failure shape (ok=false + error), so a consumer that
+			// reads error.exit_code keeps working (ga-0ejdbv round 4).
+			res.Error = &jsonSchemaErrorDetail{Code: "mail_send_all_partial", Message: fmt.Sprintf("delivered to %d; lost %d, failed %d, unconfirmed %d; do not re-run --all", len(sent), len(lost), len(failed), len(unconfirmed)), ExitCode: code}
+		}
+		if w := writeCLIJSONLineOrExit(stdout, stderr, "gc mail send", res); w != 0 && code == 0 {
+			return w
+		}
 	}
-	return 0
+	return code
+}
+
+// reportMailSendAllFailures summarizes a broadcast's per-recipient failures
+// so a follow-up touches only the recipients that need it: a verified-absent
+// message is re-sent to exactly those recipients, an unconfirmed one is
+// checked by ID first. The exit code is the most actionable verdict present:
+// verified loss (5), then any other failure (1), then unconfirmed (6).
+func reportMailSendAllFailures(stderr io.Writer, delivered int, lost, failed, unconfirmed []string) int {
+	if len(lost)+len(failed)+len(unconfirmed) == 0 {
+		return 0
+	}
+	fmt.Fprintf(stderr, "gc mail send --all: delivered to %d recipient(s); do NOT re-run --all, which would send them a second copy.\n", delivered) //nolint:errcheck // best-effort stderr
+	if len(lost) > 0 {
+		fmt.Fprintf(stderr, "  NOT DELIVERED, re-send to each by address: %s\n", strings.Join(lost, ", ")) //nolint:errcheck // best-effort stderr
+	}
+	if len(failed) > 0 {
+		fmt.Fprintf(stderr, "  FAILED (see the errors above), re-send to each by address: %s\n", strings.Join(failed, ", ")) //nolint:errcheck // best-effort stderr
+	}
+	if len(unconfirmed) > 0 {
+		fmt.Fprintf(stderr, "  UNCONFIRMED, may have landed; check each ID with \""+mailStorageCheckCommand("<id>")+"\" before re-sending: %s\n", strings.Join(unconfirmed, ", ")) //nolint:errcheck // best-effort stderr
+		fmt.Fprintln(stderr, "  "+mailStorageCheckReading)                                                                                                                         //nolint:errcheck // best-effort stderr
+	}
+	switch {
+	case len(lost) > 0:
+		return mailSendNotPersistedExit
+	case len(failed) > 0:
+		return 1
+	default:
+		return mailSendUnconfirmedExit
+	}
 }
 
 // cmdMailInbox is the CLI entry point for checking the inbox.
@@ -2850,6 +3068,12 @@ func doMailReplyJSON(mp mail.Provider, rec events.Recorder, id, sender, subject,
 	reply, err := mp.Reply(id, sender, subject, body)
 	telemetry.RecordMailOp(context.Background(), "reply", err)
 	if err != nil {
+		if code := classifyMailWriteFailure(stderr, "gc mail reply", err); code != 0 {
+			if jsonOut {
+				return writeMailVerdictJSON(stdout, stderr, "gc mail reply", "mail.reply", "reply", code, err)
+			}
+			return code
+		}
 		fmt.Fprintf(stderr, "gc mail reply: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
