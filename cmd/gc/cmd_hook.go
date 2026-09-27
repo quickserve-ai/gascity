@@ -724,6 +724,9 @@ func claimHookWork(cityPath, workQuery, workDir string, queryEnv []string, store
 		return 1
 	}
 	ops = classRoutedHookClaimOps(ops, route)
+	// Armed AFTER the class route so the closed-root guard reads roots through
+	// the routed ReadWorkMeta (qc-z0fmn0n).
+	ops = withClosedRootGuard(ops)
 	return claimHookWorkWithRunner(workQuery, workDir, queryEnv, stores, claimOpts, ops, shellWorkQueryWithEnv, emitFailure, stdout, stderr)
 }
 
