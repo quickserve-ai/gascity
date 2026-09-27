@@ -104,7 +104,11 @@ func hookClaimTeardownTailWithBdStore(ctx context.Context, dir string, env []str
 // runWithDeadline runs fn and returns its result, or ctx's error once ctx is
 // done — for store calls that take no context of their own (the relocated class
 // binding). fn keeps running to completion in the background; its late result
-// is discarded.
+// is discarded. Because of that, a caller may issue the next call on the same
+// store while an abandoned fn is still inside it: every store handed to this
+// helper (the relocated class binding's graph and its holds probe) must be
+// safe for concurrent use, and any memo is written by the caller, never by fn
+// (see holdsWithin). Round-4 read, qc-z0fmn0n.
 func runWithDeadline[T any](ctx context.Context, fn func() (T, error)) (T, error) {
 	type result struct {
 		v   T
