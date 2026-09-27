@@ -14,6 +14,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/storebinding"
 )
 
 // Pins the closed-root router skip (qc-z0fmn0n). On 2026-09-23 two molecule
@@ -846,5 +847,159 @@ func TestRunWithDeadlineReturnsOnContextExpiry(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("returned after %s, want promptly at the deadline", elapsed)
+	}
+}
+
+// Round 4, N1: the first servable row is CONTESTED — its claim CAS loses the
+// race (ok=false) — and twenty dead molecules sit behind it, ahead of a live
+// row. The pre-tier resolve stopped at the contested row, so those twenty roots
+// are still unresolved when the tier reaches them. They must be resolved
+// OUTSIDE the tier's claim-mutation context: resolved inside it, 20 reads x
+// 20ms spend the 200ms claim budget, the live row is never tried, and the seat
+// writes a false no_work drain.
+func TestHookClaimRootReadsAfterALostRaceDoNotSpendTheClaimBudget(t *testing.T) {
+	old := hookClaimMutationTimeout
+	hookClaimMutationTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { hookClaimMutationTimeout = old })
+
+	existing := []beads.Bead{closedRootWorkflowRoot("qc-live-root", "open")}
+	rows := []string{routedStepJSON("qc-contested", "")}
+	for i := 1; i <= 20; i++ {
+		rootID := fmt.Sprintf("qc-behind-%02d", i)
+		existing = append(existing, closedRootWorkflowRoot(rootID, "closed"))
+		rows = append(rows, routedStepWithIDJSON(rootID+".impl", rootID, "implement"))
+	}
+	rows = append(rows, routedStepWithIDJSON("qc-live-root.step", "qc-live-root", "implement"))
+	reader := newClosedRootStoreReader(existing...)
+	reader.delay = 20 * time.Millisecond // 21 reads = 420ms > the 200ms claim budget
+	spy := &closedRootClaimSpy{}
+	ops, opts := closedRootOpsOpts(`[`+strings.Join(rows, ",")+`]`, spy, reader)
+	var attempts []string
+	ops.Claim = func(ctx context.Context, dir string, env []string, id, assignee string) (beads.Bead, bool, error) {
+		attempts = append(attempts, id)
+		if id == "qc-contested" {
+			// Lost CAS race: another live claimant owns it.
+			return beads.Bead{ID: id, Status: "in_progress", Assignee: "worker-2", Metadata: map[string]string{}}, false, nil
+		}
+		return spy.fn(ctx, dir, env, id, assignee)
+	}
+	ops.EmitClaimRejected = func(string, string, string) {}
+
+	var stdout, stderr bytes.Buffer
+	if code := doHookClaim("bd ready --json", "/tmp/work", opts, ops, &stdout, &stderr); code != 0 {
+		t.Fatalf("doHookClaim = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if len(attempts) != 2 || attempts[0] != "qc-contested" || attempts[1] != "qc-live-root.step" {
+		t.Fatalf("claim attempts = %v, want the contested row then the live row", attempts)
+	}
+	if result := decodeClosedRootResult(t, stdout.String()); result.Action != "work" || result.BeadID != "qc-live-root.step" {
+		t.Fatalf("result = %+v, want work on the live row, not a no_work drain; stderr=%s", result, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "skipped: root qc-behind-01 closed") {
+		t.Errorf("stderr = %q, want the dead molecules still reported as skipped", stderr.String())
+	}
+}
+
+// Round 4, N2: on a federated city the drain classifies with the invocation's
+// work dir and env, while the closed-root verdict was cached under the leg that
+// read it (/rig-b). The classifier must still find that established verdict and
+// file the trigger under closed_root — not a plain (false-alarm) divergence.
+func TestDemandDivergenceFindsTheClosedRootVerdictOfAnotherLeg(t *testing.T) {
+	const rootID = "qc-fed-root"
+	trigger := beads.Bead{ID: "qc-fed-root.step", Title: "step", Status: "open",
+		Metadata: map[string]string{"gc.routed_to": "worker", "gc.root_bead_id": rootID, "gc.step_id": "implement"}}
+	rigB := beads.NewMemStoreFrom(0, []beads.Bead{closedRootWorkflowRoot(rootID, "closed"), trigger}, nil)
+	reader := newClosedRootStoreReader()
+	reader.byDir = map[string]*beads.MemStore{
+		"/rig-a": beads.NewMemStoreFrom(0, nil, nil),
+		"/rig-b": rigB,
+	}
+	spy := &closedRootClaimSpy{}
+	ops, opts := closedRootOpsOpts("", spy, reader)
+	ops.Runner = nil
+	// The trigger read is city-wide: it answers from the ledger that holds it.
+	ops.ReadWorkMeta = func(_ context.Context, _ string, _ []string, id, _ string) (beads.Bead, error) { return rigB.Get(id) }
+	ops.ConfirmBlocked = func(context.Context, string, []string, string, string) (bool, error) { return false, nil }
+	legs := []hookStore{
+		{dir: "/rig-a", env: []string{"BEADS_DIR=/rig-a"}},
+		{dir: "/rig-b", env: []string{"BEADS_DIR=/rig-b"}},
+	}
+	run := func(_ string, dir string, _ []string) (string, error) {
+		if dir == "/rig-b" {
+			return `[` + stepJSON(trigger) + `]`, nil
+		}
+		return `[]`, nil
+	}
+
+	calls := 0
+	var classification string
+	prev := hookRecordDemandClaimDivergence
+	hookRecordDemandClaimDivergence = func(_ string, dir string, opts hookClaimOptions, ops hookClaimOps, _ io.Writer) {
+		calls++
+		_, classification = classifyDemandTrigger(trigger.ID, dir, opts, ops)
+	}
+	t.Cleanup(func() { hookRecordDemandClaimDivergence = prev })
+
+	var stdout, stderr bytes.Buffer
+	claimHookWorkWithRunner("query", "/city", nil, legs, opts, ops, run, func(string, error) {}, &stdout, &stderr)
+
+	if len(spy.ids) != 0 || calls != 1 {
+		t.Fatalf("claims = %v, divergence calls = %d; want a no_work drain that reaches the classifier once; stderr=%s", spy.ids, calls, stderr.String())
+	}
+	if classification != events.DemandClaimClosedRoot {
+		t.Fatalf("classification = %q, want %q: /rig-b established the closed root and its tail", classification, events.DemandClaimClosedRoot)
+	}
+}
+
+// Round 4, N3: a store is its dir AND its whole env (sameHookStore's notion),
+// so two legs sharing a dir and BEADS_DIR but reaching different ledgers keep
+// separate verdicts.
+func TestHookRootStoreKeyIsTheWholeStoreIdentity(t *testing.T) {
+	a := []string{"BEADS_DIR=/x", "GC_DOLT_PORT=3307"}
+	b := []string{"BEADS_DIR=/x", "GC_DOLT_PORT=51361"}
+	if hookRootStoreKey("/d", a, "qc-r") == hookRootStoreKey("/d", b, "qc-r") {
+		t.Fatal("legs differing only outside BEADS_DIR share a verdict key")
+	}
+	if !sameHookStore(hookStore{dir: "/d", env: a}, hookStore{dir: "/d", env: append([]string(nil), a...)}) ||
+		hookRootStoreKey("/d", a, "qc-r") != hookRootStoreKey("/d", append([]string(nil), a...), "qc-r") {
+		t.Fatal("the same store must key the same")
+	}
+	// Unambiguous serialization: moving a boundary is a different store.
+	if hookRootStoreKey("/d", []string{"A=1", "B=2"}, "r") == hookRootStoreKey("/d", []string{"A=1\x00B=2"}, "r") {
+		t.Fatal("env serialization is ambiguous")
+	}
+}
+
+// slowGetGraph is a binding graph whose Get blocks until released.
+type slowGetGraph struct {
+	storebinding.GraphStore
+	release chan struct{}
+}
+
+func (g slowGetGraph) Get(id string) (beads.Bead, error) {
+	<-g.release
+	return g.GraphStore.Get(id)
+}
+
+// Round 4, N4: the relocated root read takes no context of its own; the class
+// route bounds it by the caller's ctx, so a slow binding cannot hold a root
+// read (and with it the claim window) past its deadline.
+func TestClassRoutedRootReadIsBoundedByItsContext(t *testing.T) {
+	route := newCapabilityRefusingRoute(t, "gcg-root")
+	release := make(chan struct{})
+	defer close(release)
+	route.graph = slowGetGraph{GraphStore: route.graph, release: release}
+	route.resident["gcg-root"] = true
+	ops := classRoutedHookClaimOps(hookFanoutBaseOps(nil), route)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := ops.ReadWorkMeta(ctx, "city", nil, "gcg-root", "worker-1")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded from the bounded relocated read", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("relocated root read returned after %s, want promptly at the deadline", elapsed)
 	}
 }
