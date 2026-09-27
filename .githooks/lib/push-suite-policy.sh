@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # push-suite-policy.sh: may this host run the full unit suite at push time?
 #
-# Exit 0: yes, run it (every host without the marker; unchanged behaviour).
+# Exit 0: yes, run it (every host without the marker; unchanged behavior).
 # Exit 3: no. This host runs full test suites in CI only, and CI is the gate.
 #
 # Some hosts cannot afford the suite. On a shared 36 GiB laptop running ~26
