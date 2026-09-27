@@ -46,7 +46,7 @@ for f in "$HELPER" "$BEADS_BD" "$RESTART"; do
 done
 
 # The guard's tunables must come from each case, never from the caller's shell.
-unset GC_DOLT_RESTART_MIN_FREE_MB GC_DOLT_RESTART_ENOSPC_WINDOW_MIN
+unset GC_DOLT_RESTART_MIN_FREE_MB GC_DOLT_RESTART_ENOSPC_WINDOW_MIN GC_DOLT_RESTART_ENOSPC_SKEW_MAX_S
 unset GC_DOLT_HOST GC_DOLT_DATA_DIR GC_DOLT_LOG_FILE GC_PACK_STATE_DIR GC_CITY_RUNTIME_DIR
 
 WORK=$(mktemp -d)
@@ -164,6 +164,11 @@ chmod +x "$BROKEN_GREP_BIN/grep"
 # counts; 2 h is a clock that ran ahead and was corrected, and must not block.
 LOG_AHEAD_5M=$(write_log ahead-5m "$(enospc_line "$(stamp $((NOW + 300)))")")
 LOG_AHEAD_2H=$(write_log ahead-2h "$(enospc_line "$(stamp $((NOW + 7200)))")")
+# Malformed stamps BSD date normalizes into the future instead of refusing (the
+# cross-family read of ga-b56n0m): an offset of -00:99 (99 min ahead) and Feb 30
+# of next year. Both must stay unparseable, which refuses.
+LOG_BAD_OFFSET=$(write_log bad-offset "$(enospc_line "$(date -u +%Y-%m-%dT%H:%M:%S)-00:99")")
+LOG_BAD_DAY=$(write_log bad-day "$(enospc_line "$(( $(date -u +%Y) + 1 ))-02-30T00:00:00Z")")
 
 # run_guard <log> <avail_kb> [VAR=value...]: the helper alone under POSIX sh.
 # Prints VERDICT=refuse|proceed, then the reason and detail lines.
@@ -537,6 +542,17 @@ else
     fail "T21: invalid skew setting -> expected refusal; got: $out"
 fi
 check_no_force T21 "$out"
+
+# T22: a malformed stamp is never ignored as "future": it refuses as unparseable.
+for bad in "$LOG_BAD_OFFSET" "$LOG_BAD_DAY"; do
+    out=$(run_guard "$bad" "$HEALTHY_KB")
+    if has "$out" "VERDICT=refuse" && has "$out" "unparseable timestamp"; then
+        pass "T22: malformed stamp ($(basename "$bad" .log)) -> refuses as unparseable, never ignored as future"
+    else
+        fail "T22: malformed stamp ($(basename "$bad" .log)) -> expected unparseable refusal; got: $out"
+    fi
+    check_no_force T22 "$out"
+done
 
 # --- Caller 1: gc dolt restart ---
 

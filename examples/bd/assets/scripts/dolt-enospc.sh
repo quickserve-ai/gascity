@@ -344,9 +344,52 @@ _enospc_stamp_epoch() {
         [+-][0-9][0-9][0-9][0-9]) _enospc_offset=$_enospc_rest ;;
         *) return 1 ;;
     esac
+    _enospc_fields_valid "$_enospc_base" "$_enospc_offset" || return 1
     _enospc_parsed=$(_enospc_parse_normalized "$_enospc_date_style" "$_enospc_base$_enospc_offset") || return 1
     _enospc_is_whole "$_enospc_parsed" || return 1
     printf '%s\n' "$_enospc_parsed"
+}
+
+# _enospc_fields_valid <YYYY-MM-DDTHH:MM:SS> <+HHMM> succeeds only when every field is in
+# range. BSD date -j -f NORMALIZES instead of refusing (2026-09-31 becomes Oct 1, an offset
+# of -00:99 becomes -01:39), so a malformed stamp parsed to an instant; since a stamp far
+# ahead of the clock is ignored as untrusted, such a stamp would have let a restart through.
+# Checked here, it stays unparseable, which refuses (ga-b56n0m, cross-family review).
+_enospc_fields_valid() {
+    _enospc_f_y=${1%%-*}
+    _enospc_f_r=${1#*-}
+    _enospc_f_mo=${_enospc_f_r%%-*}
+    _enospc_f_r=${_enospc_f_r#*-}
+    _enospc_f_d=${_enospc_f_r%%T*}
+    _enospc_f_r=${_enospc_f_r#*T}
+    _enospc_f_h=${_enospc_f_r%%:*}
+    _enospc_f_r=${_enospc_f_r#*:}
+    _enospc_f_mi=${_enospc_f_r%%:*}
+    _enospc_f_s=${_enospc_f_r#*:}
+    _enospc_f_oh=${2#?}
+    _enospc_f_om=${_enospc_f_oh#??}
+    _enospc_f_oh=${_enospc_f_oh%??}
+    # Strip leading zeros: shell arithmetic reads a leading 0 as octal.
+    for _enospc_f_v in y mo d h mi s oh om; do
+        eval "_enospc_f_x=\$_enospc_f_$_enospc_f_v"
+        _enospc_f_x=${_enospc_f_x#"${_enospc_f_x%%[!0]*}"}
+        eval "_enospc_f_$_enospc_f_v=\${_enospc_f_x:-0}"
+    done
+    [ "$_enospc_f_mo" -ge 1 ] && [ "$_enospc_f_mo" -le 12 ] || return 1
+    [ "$_enospc_f_h" -le 23 ] && [ "$_enospc_f_mi" -le 59 ] && [ "$_enospc_f_s" -le 59 ] || return 1
+    [ "$_enospc_f_oh" -le 14 ] && [ "$_enospc_f_om" -le 59 ] || return 1
+    case $_enospc_f_mo in
+        4 | 6 | 9 | 11) _enospc_f_dim=30 ;;
+        2)
+            if [ $((_enospc_f_y % 4)) -eq 0 ] && { [ $((_enospc_f_y % 100)) -ne 0 ] || [ $((_enospc_f_y % 400)) -eq 0 ]; }; then
+                _enospc_f_dim=29
+            else
+                _enospc_f_dim=28
+            fi
+            ;;
+        *) _enospc_f_dim=31 ;;
+    esac
+    [ "$_enospc_f_d" -ge 1 ] && [ "$_enospc_f_d" -le "$_enospc_f_dim" ]
 }
 
 # _enospc_age renders how long ago an epoch was, for the refusal detail.
