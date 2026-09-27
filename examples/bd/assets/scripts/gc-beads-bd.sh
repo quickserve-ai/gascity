@@ -3880,6 +3880,9 @@ op_recover() {
         echo "  free disk space on the Dolt data volume, then re-run health checks" >&2
         die "dolt recovery skipped: ENOSPC guard"
     fi
+    if [ -n "${ENOSPC_NOTE:-}" ]; then
+        echo "dolt recovery: $ENOSPC_NOTE" >&2
+    fi
 
     if load_recover_managed_from_gc; then
         if [ "$GC_RECOVER_DIAGNOSED_READ_ONLY" = "true" ]; then
