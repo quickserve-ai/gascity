@@ -982,7 +982,7 @@ type hookClaimTierCarry struct {
 // tried. A terminal result from a claim outcome has reported carry's declines;
 // the readback-failure terminals (canonical readback failed, readback named a
 // different assignee) return before that report, so carry may still hold
-// unreported declines there (round-3 behaviour, noted by the round-4 read).
+// unreported declines there (round-3 behavior, noted by the round-4 read).
 func claimEligibleHookCandidatePass(candidates []beads.Bead, carry *hookClaimTierCarry, opts hookClaimOptions, ops hookClaimOps, dir string, stdout, stderr io.Writer) (hookClaimResult, int) {
 	ctx, cancel := ops.claimMutationContext()
 	defer cancel()

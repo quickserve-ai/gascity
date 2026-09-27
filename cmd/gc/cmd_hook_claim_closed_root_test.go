@@ -81,12 +81,12 @@ func (r *closedRootStoreReader) tail(_ context.Context, dir string, _ []string, 
 // under was opened: its deadline less the flat mutation budget. It is exact
 // when the claim window is far longer than hookClaimMutationTimeout (callers
 // set one), because claimMutationContext then grants exactly that budget.
-func claimContextOpenedAt(ctx context.Context) (time.Time, bool) {
+func claimContextOpenedAt(ctx context.Context) time.Time {
 	deadline, ok := ctx.Deadline()
 	if !ok {
-		return time.Time{}, false
+		return time.Time{}
 	}
-	return deadline.Add(-hookClaimMutationTimeout), true
+	return deadline.Add(-hookClaimMutationTimeout)
 }
 
 // assertRootReadsPrecedeClaimContext proves, without spending wall time, that
@@ -455,7 +455,7 @@ func TestHookClaimRootReadsDoNotSpendTheClaimBudget(t *testing.T) {
 	var servedOpened time.Time
 	ops.Claim = func(ctx context.Context, dir string, env []string, id, assignee string) (beads.Bead, bool, error) {
 		if id == "qc-open-root.step" {
-			servedOpened, _ = claimContextOpenedAt(ctx)
+			servedOpened = claimContextOpenedAt(ctx)
 		}
 		return spy.fn(ctx, dir, env, id, assignee)
 	}
@@ -938,7 +938,7 @@ func TestHookClaimRootReadsAfterALostRaceDoNotSpendTheClaimBudget(t *testing.T) 
 			// Lost CAS race: another live claimant owns it.
 			return beads.Bead{ID: id, Status: "in_progress", Assignee: "worker-2", Metadata: map[string]string{}}, false, nil
 		}
-		servedOpened, _ = claimContextOpenedAt(ctx)
+		servedOpened = claimContextOpenedAt(ctx)
 		return spy.fn(ctx, dir, env, id, assignee)
 	}
 	ops.EmitClaimRejected = func(string, string, string) {}
