@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1445,6 +1446,11 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
 	if !query.HasFilter() && !query.AllowScan {
 		return nil, fmt.Errorf("listing beads: %w", ErrQueryRequiresScan)
 	}
+	// The backing IssueFilter takes one assignee; a plural query is answered
+	// one predicated search per route rather than one unfiltered search.
+	if routes := assigneeFanOutRoutes(query); routes != nil {
+		return listPerAssignee("listing beads", query, routes, s.List)
+	}
 	var out []Bead
 	err := s.withReadRetry(func(ctx context.Context, storage beadslib.Storage) error {
 		filter := nativeIssueFilterFromListQuery(query)
@@ -1465,12 +1471,31 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
 		}
 		s.noteRows(len(issues))
 		out = ApplyListQuery(beads, query)
+		TraceListRows(TraceSourceNativeListRows, "", nativeListTraceArgs(query), len(issues), len(out))
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+// nativeListTraceArgs names a native List read in the rows trace by the
+// filter terms it pushed to the backing search.
+func nativeListTraceArgs(query ListQuery) []string {
+	args := []string{"list", "tier=" + strconv.Itoa(int(query.TierMode))}
+	for _, term := range []struct{ field, value string }{
+		{"type", query.Type},
+		{"status", query.Status},
+		{"assignee", query.Assignee},
+		{"label", query.Label},
+		{"parent", query.ParentID},
+	} {
+		if term.value != "" {
+			args = append(args, term.field+"="+term.value)
+		}
+	}
+	return args
 }
 
 // ListOpen returns non-closed beads by default, or beads with the given status.
@@ -2691,12 +2716,14 @@ func nativeCreatedLimitPushdown(query ListQuery) int {
 	if query.TierMode == TierWisps {
 		return 0
 	}
-	// SeekAfter, UpdatedBefore, and plural Assignees are enforced only Go-side in
-	// ApplyListQuery (q.Matches); they are not pushed to the backing search, so a
-	// backing limit applied before them would cut rows before the residual filter
-	// runs and silently drop page rows. Fetch the full candidate set for those
-	// shapes, mirroring the sibling gates (doltliteCanSelectBoundedTopN,
-	// exec.go, bdstore canApplyWispsServerLimit).
+	// SeekAfter and UpdatedBefore are enforced only Go-side in ApplyListQuery
+	// (q.Matches); they are not pushed to the backing search, so a backing limit
+	// applied before them would cut rows before the residual filter runs and
+	// silently drop page rows. Fetch the full candidate set for those shapes,
+	// mirroring the sibling gates (doltliteCanSelectBoundedTopN, exec.go, bdstore
+	// canApplyWispsServerLimit). List answers plural Assignees one route per
+	// search (listPerAssignee), so they do not reach here from List; the guard
+	// stays for any caller that passes them through unsplit.
 	if query.SeekAfter != nil || !query.UpdatedBefore.IsZero() || len(query.Assignees) > 0 {
 		return 0
 	}

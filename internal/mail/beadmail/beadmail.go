@@ -1396,8 +1396,10 @@ func (p *Provider) messageCandidatesAll(routes []string) ([]beads.Bead, error) {
 	}
 	out := make([]beads.Bead, 0, len(all))
 	for _, b := range all {
-		// matchesRecipientRoute is defense-in-depth: HQStore returns exact
-		// matches from the index; BdStore multi-route fallback may return excess.
+		// matchesRecipientRoute is defense-in-depth: stores answer a
+		// multi-route query with only the listed routes' rows (the bd and
+		// native stores read one predicated query per route); this keeps a
+		// store that ever returned more from widening the inbox.
 		if matchesRecipientRoute(routes, b.Assignee) {
 			out = append(out, b)
 		}

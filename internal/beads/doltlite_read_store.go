@@ -719,20 +719,6 @@ func (s *DoltliteReadStore) probeConditionalWriteCapability() (bool, string) {
 	return false, "doltlite read store supplies no bead revision (SQL read path, pre-#4682); conditional writes degrade"
 }
 
-func compactStrings(values []string) []string {
-	out := make([]string, 0, len(values))
-	seen := map[string]bool{}
-	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if value == "" || seen[value] {
-			continue
-		}
-		seen[value] = true
-		out = append(out, value)
-	}
-	return out
-}
-
 func cloneBeads(values []Bead) []Bead {
 	if len(values) == 0 {
 		return nil

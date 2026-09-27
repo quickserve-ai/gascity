@@ -941,6 +941,44 @@ func TestDoltliteReadStoreFiltersPluralAssigneesAcrossTiers(t *testing.T) {
 	}
 }
 
+// The doltlite store already sends the plural predicate to SQL (assignee IN
+// (...)). Pin that it answers a multi-route query with exactly the union of
+// its single-route answers — the same contract the fanned-out stores keep —
+// so the stores cannot drift apart on what a multi-route read returns.
+func TestDoltliteReadStorePluralAssigneesEqualUnionOfSingleRouteReads(t *testing.T) {
+	store, closeStore := newTestDoltliteReadStore(t)
+	defer closeStore()
+
+	routes := []string{"rig/ready-worker", "rig/wisp-worker", "rig/no-such-route", "rig/ready-worker"}
+	plural, err := store.List(ListQuery{Assignees: routes, TierMode: TierBoth})
+	if err != nil {
+		t.Fatalf("List plural: %v", err)
+	}
+	union := map[string]bool{}
+	for _, route := range routes {
+		single, err := store.List(ListQuery{Assignee: route, TierMode: TierBoth})
+		if err != nil {
+			t.Fatalf("List %s: %v", route, err)
+		}
+		for _, b := range single {
+			union[b.ID] = true
+		}
+	}
+	got := testBeadIDs(plural)
+	slices.Sort(got)
+	want := make([]string, 0, len(union))
+	for id := range union {
+		want = append(want, id)
+	}
+	slices.Sort(want)
+	if len(want) == 0 {
+		t.Fatal("fixture has no rows for the routes; the parity check would be vacuous")
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("plural ids = %v, want union of single-route reads %v", got, want)
+	}
+}
+
 // TestDoltliteReadStoreLimitCutsDeterministicPrefixOnCreatedAtTies pins the
 // (created_at, id) total order at the SQL layer (#3208): when rows share a
 // created_at timestamp, a LIMIT-bounded read must cut the same prefix on

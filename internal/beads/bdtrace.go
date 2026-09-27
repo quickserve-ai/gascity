@@ -328,3 +328,59 @@ func TraceBDCall(source, dir string, args []string, start time.Time, exitCode in
 	data = append(data, '\n')
 	_, _ = f.Write(data) //nolint:errcheck // best-effort trace log
 }
+
+// Source tags of the per-read row records TraceListRows appends to the
+// GC_BD_TRACE_JSON trace: one for BdStore's bd list / bd query reads, one for
+// NativeDoltStore's backing searches.
+const (
+	TraceSourceBDListRows     = "go:bdstore.list-rows"
+	TraceSourceNativeListRows = "go:native.list-rows"
+)
+
+// TraceListRows appends one JSONL record to the GC_BD_TRACE_JSON trace for a
+// single store read a List issued: args naming the read (the bd argv, or the
+// native store's filter terms), the rows the backing returned — every one of
+// them hydrated and parsed — and the rows the query kept after its Go-side
+// filters. rows far above kept is a read the backing did not predicate. A mail
+// inbox read shows up as one record per route (per storage tier on bd), scope
+// "mail-routing"; summing rows over them is what the read cost.
+//
+// Like TraceBDCall it is a no-op when GC_BD_TRACE_JSON is unset, and
+// best-effort: a broken trace path never fails the read.
+func TraceListRows(source, dir string, args []string, rows, kept int) {
+	path := strings.TrimSpace(os.Getenv("GC_BD_TRACE_JSON"))
+	if path == "" {
+		return
+	}
+	f, openErr := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if openErr != nil {
+		return
+	}
+	defer f.Close() //nolint:errcheck // best-effort trace log
+
+	rec := struct {
+		TS     string   `json:"ts"`
+		Source string   `json:"source"`
+		Scope  string   `json:"scope"`
+		Args   []string `json:"args"`
+		Dir    string   `json:"dir,omitempty"`
+		Rows   int      `json:"rows"`
+		Kept   int      `json:"kept"`
+		PID    int      `json:"pid"`
+	}{
+		TS:     time.Now().UTC().Format(time.RFC3339Nano),
+		Source: source,
+		Scope:  classifyTraceScope(captureBDTraceCallers()),
+		Args:   args,
+		Dir:    dir,
+		Rows:   rows,
+		Kept:   kept,
+		PID:    os.Getpid(),
+	}
+	data, marshalErr := json.Marshal(rec)
+	if marshalErr != nil {
+		return
+	}
+	data = append(data, '\n')
+	_, _ = f.Write(data) //nolint:errcheck // best-effort trace log
+}
