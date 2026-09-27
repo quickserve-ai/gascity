@@ -200,10 +200,12 @@ jobs:
   # Informational on Mac: nothing waits on this job and the summary does not
   # fail on it (gc-atwr).
   #
-  # Lint's wall time on the Mac runner is compiling the package graph into an
-  # empty Go build cache (setup-gascity-macos runs setup-go with cache: false),
-  # not analysis: a golangci-lint cache hit left Lint at ~46 min (pl-yxp). This
-  # job therefore keeps its own Go build cache. The build cache is
+  # A cold Lint on the Mac runner measured 45m43s: 16m46s loading packages
+  # into an empty Go build cache (setup-gascity-macos runs setup-go with
+  # cache: false) and 28m51s of analysis (pl-yxp, run 36345117142). A
+  # golangci-lint cache hit does not shorten either. This job therefore keeps
+  # its own Go build cache: restored warm, Lint measured 14m21s (loading 6s,
+  # analysis 14m11s; run 36348415554). The build cache is
   # content-addressed, so an older or partial copy can only save work, never
   # change a result, which is why it may restore by prefix and save after a
   # failed or timed-out Lint. The golangci-lint cache below is the opposite and
