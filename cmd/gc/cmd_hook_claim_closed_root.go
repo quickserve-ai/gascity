@@ -38,10 +38,13 @@ import (
 //     teardown-scoped steps plus every attempt sharing their gc.step_id (retry
 //     expansion strips gc.scope_role from the first attempt) — the rule of
 //     molecule.TeardownTailExclusion — built from ONE narrow query per root.
-//   - Roots are resolved lazily in tier order, before either tier opens its
+//   - Roots are resolved lazily in tier order, never inside a tier's
 //     claim-mutation context, and resolution stops at the first candidate that
-//     can be served. Dead molecules behind a live row cost nothing; dead
-//     molecules ahead of it cost O(1) store reads each.
+//     can be served. When that candidate then fails to produce a claim (a lost
+//     race, a decline, a not-found), the tier stops at the next unresolved row
+//     and its driver resolves onward before re-entering with a fresh context.
+//     Dead molecules behind a live row cost nothing; dead molecules ahead of it
+//     cost O(1) store reads each, all outside the claim budget.
 
 // closedRootSkipSampleLimit caps the step ids listed on one skip line.
 const closedRootSkipSampleLimit = 5
@@ -125,6 +128,9 @@ func runWithDeadline[T any](ctx context.Context, fn func() (T, error)) (T, error
 type hookRootVerdict struct {
 	// closed is set only when the read returned the root with status=closed.
 	closed bool
+	// open is set when the read returned the root in any other status; a failed
+	// read sets neither.
+	open bool
 	// tailTried/tail: the closed root's teardown-tail predicate, built on first
 	// need; tail stays nil when the tail query failed.
 	tailTried bool
@@ -140,7 +146,8 @@ type hookClosedRootGate struct {
 	assignee string
 	stderr   io.Writer
 
-	verdicts map[string]*hookRootVerdict // keyed by hookRootStoreKey
+	verdicts map[string]*hookRootVerdict   // keyed by hookRootStoreKey
+	byRoot   map[string][]*hookRootVerdict // every store's verdict for a root id
 	order    []string
 	skipped  map[string][]string
 	seen     map[string]map[string]struct{}
@@ -160,16 +167,30 @@ func newHookClosedRootGate(ops hookClaimOps, opts hookClaimOptions, stderr io.Wr
 		assignee: opts.Assignee,
 		stderr:   stderr,
 		verdicts: map[string]*hookRootVerdict{},
+		byRoot:   map[string][]*hookRootVerdict{},
 		skipped:  map[string][]string{},
 		seen:     map[string]map[string]struct{}{},
 	}
 }
 
-// hookRootStoreKey identifies a root within the store a leg reads: the leg's
-// directory and its BEADS_DIR selector, which together are what hookClaimEnvMap
-// hands the bd child.
+// hookRootStoreKey identifies a root within the store a leg reads. A store's
+// identity is its directory AND its whole env — the notion sameHookStore uses
+// to tell federated legs apart — not BEADS_DIR alone: two legs sharing a
+// BEADS_DIR can still reach different ledgers (a different Dolt port, host or
+// scope var), and must not share a verdict. The env is serialized in order,
+// length-prefixed and NUL-separated (an env entry cannot contain NUL), so the
+// key is unambiguous and equal exactly when sameHookStore would say equal.
 func hookRootStoreKey(dir string, env []string, rootID string) string {
-	return strings.TrimSpace(dir) + "\x00" + hookClaimEnvValue(env, "BEADS_DIR") + "\x00" + rootID
+	var b strings.Builder
+	b.WriteString(strings.TrimSpace(dir))
+	fmt.Fprintf(&b, "\x00%d", len(env))
+	for _, kv := range env {
+		b.WriteByte(0)
+		b.WriteString(kv)
+	}
+	b.WriteByte(0)
+	b.WriteString(rootID)
+	return b.String()
 }
 
 // candidateRoot returns the root a candidate must be checked against, or "" when
@@ -208,6 +229,7 @@ func (g *hookClosedRootGate) verdict(rootID, dir string, env []string) *hookRoot
 	}
 	v := g.lookup(rootID, dir, env)
 	g.verdicts[key] = v
+	g.byRoot[rootID] = append(g.byRoot[rootID], v)
 	return v
 }
 
@@ -219,7 +241,8 @@ func (g *hookClosedRootGate) lookup(rootID, dir string, env []string) *hookRootV
 		fmt.Fprintf(g.stderr, "gc hook --claim: root %s not readable here (%v); serving its steps unguarded\n", rootID, err) //nolint:errcheck
 		return &hookRootVerdict{}
 	}
-	return &hookRootVerdict{closed: strings.EqualFold(strings.TrimSpace(root.Status), "closed")}
+	closed := strings.EqualFold(strings.TrimSpace(root.Status), "closed")
+	return &hookRootVerdict{closed: closed, open: !closed}
 }
 
 // ensureTail builds a closed root's teardown-tail predicate once per store. When
@@ -244,11 +267,19 @@ func (g *hookClosedRootGate) ensureTail(rootID string, v *hookRootVerdict, dir s
 
 // skip reports whether candidate must not be served because its molecule root
 // was observed closed in this leg's store and the candidate is not in that
-// root's teardown tail, and records the skip.
-func (g *hookClosedRootGate) skip(candidate beads.Bead, dir string, env []string) bool {
-	rootID, closed := g.closedRootOf(candidate, dir, env)
-	if !closed {
-		return false
+// root's teardown tail, and records the skip. It answers ONLY from verdicts
+// already cached — it never reads — because the tiers call it inside their
+// claim-mutation context, and a root read there spends the budget the claim
+// CAS needs. resolved=false means the candidate's root (or its teardown tail)
+// has no verdict for this store yet: the tier must stop, let its driver resolve
+// the remaining rows outside the claim context, and re-enter.
+func (g *hookClosedRootGate) skip(candidate beads.Bead, dir string, env []string) (skip, resolved bool) {
+	rootID, blocked, known := g.cachedClosedRootOf(candidate, dir, env)
+	if !known {
+		return false, false
+	}
+	if !blocked {
+		return false, true
 	}
 	seen := g.seen[rootID]
 	if seen == nil {
@@ -260,12 +291,60 @@ func (g *hookClosedRootGate) skip(candidate beads.Bead, dir string, env []string
 		seen[candidate.ID] = struct{}{}
 		g.skipped[rootID] = append(g.skipped[rootID], candidate.ID)
 	}
-	return true
+	return true, true
+}
+
+// cachedClosedRootOf is closedRootOf without any read: known=false when the
+// answer needs a root read or a teardown-tail query this store has not run.
+func (g *hookClosedRootGate) cachedClosedRootOf(candidate beads.Bead, dir string, env []string) (rootID string, blocked, known bool) {
+	if g == nil {
+		return "", false, true
+	}
+	rootID = candidateRoot(candidate)
+	if rootID == "" {
+		return "", false, true
+	}
+	v, ok := g.verdicts[hookRootStoreKey(dir, env, rootID)]
+	if !ok {
+		return "", false, false
+	}
+	if !v.closed {
+		return "", false, true
+	}
+	if strings.TrimSpace(candidate.Metadata[beadmeta.StepIDMetadataKey]) != "" {
+		if !v.tailTried {
+			return "", false, false
+		}
+		if v.tail != nil && v.tail(candidate) {
+			return "", false, true
+		}
+	}
+	return rootID, true, true
+}
+
+// resolveRemaining resolves roots for the rows a tier has not yet tried, in
+// order, up to the first servable one — always including rest[0], the row whose
+// verdict the tier found missing, so every re-entry makes progress. admit is the
+// tier's own cheap admission check, so rows the tier would never try cost no
+// read. It runs between tier passes, outside any claim-mutation context.
+func (g *hookClosedRootGate) resolveRemaining(rest []beads.Bead, admit func(beads.Bead) bool, dir string, env []string) {
+	if g == nil || len(rest) == 0 {
+		return
+	}
+	ordered := make([]beads.Bead, 0, len(rest))
+	ordered = append(ordered, rest[0])
+	for _, candidate := range rest[1:] {
+		if admit(candidate) {
+			ordered = append(ordered, candidate)
+		}
+	}
+	g.resolveUntilServable(ordered, dir, env)
 }
 
 // closedRootOf reports the root a candidate is blocked by in the leg's store,
-// if any. A root with no verdict for this store yet is read (resolve normally
-// answered it already, before the tier's claim budget opened).
+// if any, reading the root (and its teardown tail) when this store has no
+// verdict yet. Only the resolve path calls it, never a tier: tiers ask skip,
+// which answers from the cache alone.
 func (g *hookClosedRootGate) closedRootOf(candidate beads.Bead, dir string, env []string) (string, bool) {
 	if g == nil {
 		return "", false
@@ -287,11 +366,20 @@ func (g *hookClosedRootGate) closedRootOf(candidate beads.Bead, dir string, env 
 	return rootID, true
 }
 
-// observedClosedRootOf answers from this store's cached verdicts only, never
-// reading: the root this invocation observed closed for bead, when an
-// ESTABLISHED teardown tail says bead is outside it. With no tail built for that
-// root, the answer is "no" — a retry attempt the query never returned could be
-// in the tail. Used by the drain's divergence classifier.
+// observedClosedRootOf answers from cached verdicts only, never reading: the
+// root this invocation observed closed for bead, when an ESTABLISHED teardown
+// tail says bead is outside it. With no tail built for that root, the answer is
+// "no" — a retry attempt the query never returned could be in the tail. Used by
+// the drain's divergence classifier.
+//
+// The drain runs with the invocation's work dir and env, while verdicts are
+// keyed by the leg that produced them — on a federated city a different store.
+// So the verdict for (dir, env) is used when that store actually read the root;
+// when it has none, or its read failed (a rig leg's not-found), every
+// store's verdict for that root is consulted, and the answer is "closed_root"
+// only when some store established it and NO store observed the root open (a
+// same-named root live in another ledger keeps the plain divergence). Either
+// way a wrong answer here moves one metric bucket, never a claim.
 func (g *hookClosedRootGate) observedClosedRootOf(bead beads.Bead, dir string, env []string) (string, bool) {
 	if g == nil {
 		return "", false
@@ -300,11 +388,28 @@ func (g *hookClosedRootGate) observedClosedRootOf(bead beads.Bead, dir string, e
 	if rootID == "" {
 		return "", false
 	}
-	v, ok := g.verdicts[hookRootStoreKey(dir, env, rootID)]
-	if !ok || !v.closed || v.tail == nil || v.tail(bead) {
+	excludes := func(v *hookRootVerdict) bool {
+		return v.closed && v.tail != nil && !v.tail(bead)
+	}
+	if v, ok := g.verdicts[hookRootStoreKey(dir, env, rootID)]; ok && (v.open || v.closed) {
+		if excludes(v) {
+			return rootID, true
+		}
 		return "", false
 	}
-	return rootID, true
+	established := false
+	for _, v := range g.byRoot[rootID] {
+		if v.open {
+			return "", false
+		}
+		if excludes(v) {
+			established = true
+		}
+	}
+	if established {
+		return rootID, true
+	}
+	return "", false
 }
 
 // report writes one line per closed root that had steps skipped.
