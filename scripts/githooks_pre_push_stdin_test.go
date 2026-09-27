@@ -15,6 +15,7 @@ type prePushFixture struct {
 	binDir    string
 	bdStdin   string
 	makeRuns  string
+	policyDir string
 	commitOld string
 	commitNew string
 	env       []string
@@ -31,12 +32,18 @@ func newPrePushFixture(t *testing.T) *prePushFixture {
 	recordDir := t.TempDir()
 
 	f := &prePushFixture{
-		repo:     repo,
-		binDir:   binDir,
-		bdStdin:  filepath.Join(recordDir, "bd-stdin"),
-		makeRuns: filepath.Join(recordDir, "make-runs"),
+		repo:      repo,
+		binDir:    binDir,
+		bdStdin:   filepath.Join(recordDir, "bd-stdin"),
+		makeRuns:  filepath.Join(recordDir, "make-runs"),
+		policyDir: filepath.Join(recordDir, "host-policy"),
 	}
+	// HOME and GC_HOST_POLICY_DIR are the fixture's own, so a host that runs
+	// full suites in CI only (a real marker under the caller's HOME) cannot
+	// change what these tests observe.
 	f.env = append(os.Environ(),
+		"HOME="+t.TempDir(),
+		"GC_HOST_POLICY_DIR="+f.policyDir,
 		"PATH="+binDir+":/usr/bin:/bin",
 		"GIT_CONFIG_GLOBAL="+filepath.Join(recordDir, "gitconfig"),
 		"GIT_CONFIG_SYSTEM="+filepath.Join(recordDir, "gitconfig-system"),
@@ -60,7 +67,7 @@ printf '%s\n' "$*" >> "$MAKE_RECORD"
 			t.Fatalf("mkdir %s: %v", dir, err)
 		}
 	}
-	for _, rel := range []string{".githooks/pre-push", ".githooks/lib/beads-chain.sh", ".githooks/lib/push-suite.sh"} {
+	for _, rel := range []string{".githooks/pre-push", ".githooks/lib/beads-chain.sh", ".githooks/lib/push-suite.sh", ".githooks/lib/push-suite-policy.sh"} {
 		body, err := os.ReadFile(filepath.Join(root, rel))
 		if err != nil {
 			t.Fatalf("read %s: %v", rel, err)
