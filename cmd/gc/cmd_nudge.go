@@ -925,7 +925,23 @@ func cmdNudgeDrainWithFormat(args []string, inject bool, hookFormat string, stdo
 
 	var out string
 	if inject {
+		// Size the payload so the provider attaches it whole (pl-7tq): the
+		// packer keeps the queued items that fit around the clock/context
+		// prefix and drops the active-step reminder before any item; items
+		// that do not fit go back to the queue for the next prompt. out
+		// carries the items alone, because the write below and the lane pass
+		// compose injectPrefix+out(+lane notices)+wispExtra themselves.
+		var packed string
+		var deferred []queuedNudge
+		packed, items, deferred = packNudgeInjectForHookBudget(injectPrefix, items, wispExtra, hookContextBudget(hookFormat))
 		out = formatNudgeInjectOutput(items)
+		if packed != injectPrefix+out+wispExtra {
+			wispExtra = "" // the packer dropped the reminder to fit the budget
+		}
+		if err := releaseQueuedNudgeClaims(target.cityPath, queuedNudgeIDs(deferred)); err != nil {
+			// The claim lease expires and returns them to pending anyway.
+			fmt.Fprintf(stderr, "gc nudge drain: returning %d nudges that did not fit the hook output: %v\n", len(deferred), err) //nolint:errcheck
+		}
 	} else {
 		out = formatNudgeRuntimeMessage(items)
 	}
@@ -1343,8 +1359,14 @@ type sessionNudgeResult struct {
 // outcome without delivering again. The delivered text is the message,
 // unchanged in every ops.content mode. When [ops] authoritative lists message
 // and a lane host can type into the session, the nudge is a conversation-lane
-// op instead (deliverSessionNudgeLane), which ops.content does not govern.
+// op instead (deliverSessionNudgeLane), which ops.content does not govern. A
+// message the target cannot receive whole is refused first (pl-7tq): nothing
+// is sent, so no lane op or op records it.
 func deliverSessionNudgeKeyed(target nudgeTarget, store beads.Store, sp runtime.Provider, message string, mode nudgeDeliveryMode, key string, jsonOutput bool, stdout, stderr io.Writer) int {
+	if err := checkNudgeMessageSize(target, message); err != nil {
+		fmt.Fprintf(stderr, "gc session nudge: %v\n", err) //nolint:errcheck
+		return 1
+	}
 	if handled, code := deliverSessionNudgeLane(target, store, sp, message, mode, key, jsonOutput, stdout, stderr); handled {
 		return code
 	}
@@ -1584,6 +1606,39 @@ func refuseOrQueueNudgeBehindPendingInteraction(target nudgeTarget, store beads.
 		return queueSessionNudgeWithWorker(target, store, sp, message, worker.NudgeUndeliveredPendingInteraction)
 	}
 	return sessionNudgeResult{}, &cliMessageRefusal{why: cliOpRefusedPendingInteraction, err: fmt.Errorf("%s is waiting on a permission prompt (%s); typing now would answer it. Approve or deny it first (POST .../session/{id}/respond), or retry with --delivery=wait-idle or --delivery=queue to deliver after it is answered", target.agentKey(), what)}
+}
+
+// maxClaudeNudgeMessageBytes is the largest nudge a claude-family seat is sent.
+// Any nudge can reach a seat through the queued path (a busy seat is queued,
+// an asleep one is queued and woken), which hands it to Claude Code as
+// UserPromptSubmit hook output capped at claudeHookContextMaxChars. 8 KB
+// arrived whole on every measured path (pl-7tq) and leaves the rest of that
+// budget for the reminder wrapper and the clock and context lines.
+const maxClaudeNudgeMessageBytes = 8192
+
+// checkNudgeMessageSize refuses a message the target's provider family cannot
+// receive whole, naming the limit, so an oversize send fails loudly at the
+// sender instead of being reported as queued or delivered.
+func checkNudgeMessageSize(target nudgeTarget, message string) error {
+	if target.providerFamily() != "claude" || len(message) <= maxClaudeNudgeMessageBytes {
+		return nil
+	}
+	return fmt.Errorf("nudge is %d bytes; a claude session receives at most %d bytes of nudge whole (longer ones are cut in delivery). Send it as mail (gc mail send --notify) and nudge a pointer to it",
+		len(message), maxClaudeNudgeMessageBytes)
+}
+
+// providerFamily returns the built-in provider family of the target (e.g.
+// "claude" for a custom provider based on claude), or "" when it cannot be
+// determined.
+func (t nudgeTarget) providerFamily() string {
+	if t.resolved != nil {
+		return resolvedProviderLaunchFamily(t.resolved)
+	}
+	var providers map[string]config.ProviderSpec
+	if t.cfg != nil {
+		providers = t.cfg.Providers
+	}
+	return config.BuiltinFamily(t.providerName(), providers)
 }
 
 func shouldQueueManagedNudgeWake(target nudgeTarget, store beads.Store, sp runtime.Provider) (bool, error) {
@@ -3151,6 +3206,52 @@ func formatNudgeInjectOutput(items []queuedNudge) string {
 	sb.WriteString("\nHandle them after this turn.\n")
 	sb.WriteString("</system-reminder>\n")
 	return sb.String()
+}
+
+// claudeHookContextMaxChars is the most hook output Claude Code attaches to a
+// prompt whole. Measured on Claude Code 2.1.283 (pl-7tq): a UserPromptSubmit
+// hook that prints 10,000 characters is attached intact, and one that prints
+// 10,001 is replaced by a ~2 KB head preview inside <persisted-output> plus
+// the path of a file holding the rest. Every byte is at most one character,
+// so budgeting bytes against this limit is conservative.
+const claudeHookContextMaxChars = 10000
+
+// hookContextBudget returns the hook output budget for hookFormat, or 0 for no
+// budget. The raw format ("") is the one Claude seats use; the JSON formats go
+// to providers whose limits have not been measured.
+func hookContextBudget(hookFormat string) int {
+	if strings.TrimSpace(hookFormat) == "" {
+		return claudeHookContextMaxChars
+	}
+	return 0
+}
+
+// packNudgeInjectForHookBudget builds one hook output from prefix (the clock
+// and context lines), as many queued items as fit, and suffix (the active-step
+// reminder), keeping the whole within budget bytes. It returns the output, the
+// items it carries and the items that must wait for the next prompt.
+//
+// Items keep their queue order and only a trailing run is deferred. The
+// suffix is dropped before any item is: it is re-emitted on every prompt,
+// while a queued nudge is delivered once. The first item always goes, even
+// alone over the budget, so the queue makes progress; Claude Code then keeps
+// it in a file and tells the agent where, which is loud. The sender refuses
+// such a message before it is queued (maxClaudeNudgeMessageBytes).
+//
+// budget <= 0 means unbounded.
+func packNudgeInjectForHookBudget(prefix string, items []queuedNudge, suffix string, budget int) (string, []queuedNudge, []queuedNudge) {
+	if budget <= 0 {
+		return prefix + formatNudgeInjectOutput(items) + suffix, items, nil
+	}
+	n := len(items)
+	for n > 1 && len(prefix)+len(formatNudgeInjectOutput(items[:n])) > budget {
+		n--
+	}
+	content := prefix + formatNudgeInjectOutput(items[:n])
+	if len(content)+len(suffix) <= budget {
+		content += suffix
+	}
+	return content, items[:n], items[n:]
 }
 
 func formatNudgeRuntimeMessage(items []queuedNudge) string {

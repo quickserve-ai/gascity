@@ -625,8 +625,8 @@ func TestNudgeDeadLetterBounceSkipsManagedWakeRollback(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	if code := deliverSessionNudgeWithWorker(target, store, fake, nudgeBounceSecret, nudgeDeliveryImmediate, false, &stdout, &stderr); code != 1 {
-		t.Fatalf("deliverSessionNudgeWithWorker = %d, want 1 (the caller sees the failure)", code)
+	if code := deliverSessionNudgeKeyed(target, store, fake, nudgeBounceSecret, nudgeDeliveryImmediate, "", false, &stdout, &stderr); code != 1 {
+		t.Fatalf("deliverSessionNudgeKeyed = %d, want 1 (the caller sees the failure)", code)
 	}
 	state, err := nudgequeue.LoadState(dir)
 	if err != nil {
