@@ -886,6 +886,9 @@ func claimHookWork(city *hookCity, workQuery, workDir string, queryEnv []string,
 	if !proceed {
 		return 1
 	}
+	// Armed AFTER the class route so the closed-root guard reads roots through
+	// the routed ReadWorkMeta (qc-z0fmn0n).
+	ops = withClosedRootGuard(ops)
 	// A kept claim is announced before its result is written; this announces
 	// whatever is left on the way out (a release, a reclaim, a claim that
 	// stopped on an error).
