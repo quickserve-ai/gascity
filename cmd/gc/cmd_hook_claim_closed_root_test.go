@@ -38,7 +38,7 @@ func (s *closedRootClaimSpy) fn(_ context.Context, _ string, _ []string, id, ass
 }
 
 // closedRootStoreReader counts root reads so the cache is observable, and
-// reads through a real MemStore. It honours the leg: byDir maps a leg's dir to
+// reads through a real MemStore. It honors the leg: byDir maps a leg's dir to
 // the store that leg reads, and any other dir reads store.
 type closedRootStoreReader struct {
 	mu      sync.Mutex
@@ -47,7 +47,9 @@ type closedRootStoreReader struct {
 	reads   []string
 	readsAt []string
 	tails   int
-	delay   time.Duration
+	// lastRead is the wall time of the latest root read. It is only read,
+	// never waited on: tests compare it with when a claim context opened.
+	lastRead time.Time
 }
 
 func (r *closedRootStoreReader) storeFor(dir string) *beads.MemStore {
@@ -58,12 +60,10 @@ func (r *closedRootStoreReader) storeFor(dir string) *beads.MemStore {
 }
 
 func (r *closedRootStoreReader) fn(_ context.Context, dir string, _ []string, id, _ string) (beads.Bead, error) {
-	if r.delay > 0 {
-		time.Sleep(r.delay)
-	}
 	r.mu.Lock()
 	r.reads = append(r.reads, id)
 	r.readsAt = append(r.readsAt, dir+"|"+id)
+	r.lastRead = time.Now()
 	r.mu.Unlock()
 	return r.storeFor(dir).Get(id)
 }
@@ -75,6 +75,38 @@ func (r *closedRootStoreReader) tail(_ context.Context, dir string, _ []string, 
 	r.tails++
 	r.mu.Unlock()
 	return hookClaimTeardownTail(r.storeFor(dir), rootID)
+}
+
+// claimContextOpenedAt is when the claim-mutation context a Claim call runs
+// under was opened: its deadline less the flat mutation budget. It is exact
+// when the claim window is far longer than hookClaimMutationTimeout (callers
+// set one), because claimMutationContext then grants exactly that budget.
+func claimContextOpenedAt(ctx context.Context) (time.Time, bool) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return time.Time{}, false
+	}
+	return deadline.Add(-hookClaimMutationTimeout), true
+}
+
+// assertRootReadsPrecedeClaimContext proves, without spending wall time, that
+// every root read ran before the claim context the served row was claimed under
+// was opened — so no read could have spent that context's budget. A read
+// resolved inside the tier would land after the context opened.
+func assertRootReadsPrecedeClaimContext(t *testing.T, reader *closedRootStoreReader, opened time.Time) {
+	t.Helper()
+	if opened.IsZero() {
+		t.Fatal("the served row was never claimed under a claim context with a deadline")
+	}
+	reader.mu.Lock()
+	lastRead := reader.lastRead
+	reader.mu.Unlock()
+	if lastRead.IsZero() {
+		t.Fatal("no root reads observed; the test would prove nothing")
+	}
+	if lastRead.After(opened) {
+		t.Fatalf("a root read ran %s after the served row's claim context opened; reads must resolve outside the claim-mutation context", lastRead.Sub(opened))
+	}
 }
 
 func newClosedRootStoreReader(existing ...beads.Bead) *closedRootStoreReader {
@@ -403,14 +435,11 @@ func TestHookClaimServesTeardownRetryAttemptWithoutScopeRole(t *testing.T) {
 }
 
 // Review item 3: root reads must not spend the claim tier's mutation budget.
-// Fifteen steps on distinct closed roots ahead of one open-root step, with a
-// root read slower than the budget allows in aggregate: the open-root step is
-// still claimed, and the seat does not report a false no_work.
+// Fifteen steps on distinct closed roots ahead of one open-root step: the
+// open-root step is still claimed, the seat does not report a false no_work,
+// and every root read ran before the claim context the step was claimed under
+// opened — so however slow the reads, they cannot spend its budget.
 func TestHookClaimRootReadsDoNotSpendTheClaimBudget(t *testing.T) {
-	old := hookClaimMutationTimeout
-	hookClaimMutationTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { hookClaimMutationTimeout = old })
-
 	existing := []beads.Bead{closedRootWorkflowRoot("qc-open-root", "open")}
 	rows := make([]string, 0, 16)
 	for i := 1; i <= 15; i++ {
@@ -420,9 +449,16 @@ func TestHookClaimRootReadsDoNotSpendTheClaimBudget(t *testing.T) {
 	}
 	rows = append(rows, routedStepWithIDJSON("qc-open-root.step", "qc-open-root", "implement"))
 	reader := newClosedRootStoreReader(existing...)
-	reader.delay = 20 * time.Millisecond // 16 reads = 320ms > the 200ms claim budget
 	spy := &closedRootClaimSpy{}
 	ops, opts := closedRootOpsOpts(`[`+strings.Join(rows, ",")+`]`, spy, reader)
+	ops.ClaimWindow = time.Hour // far past the mutation budget: claimContextOpenedAt is exact
+	var servedOpened time.Time
+	ops.Claim = func(ctx context.Context, dir string, env []string, id, assignee string) (beads.Bead, bool, error) {
+		if id == "qc-open-root.step" {
+			servedOpened, _ = claimContextOpenedAt(ctx)
+		}
+		return spy.fn(ctx, dir, env, id, assignee)
+	}
 
 	var stdout, stderr bytes.Buffer
 	if code := doHookClaim("bd ready --json", "/tmp/work", opts, ops, &stdout, &stderr); code != 0 {
@@ -434,6 +470,7 @@ func TestHookClaimRootReadsDoNotSpendTheClaimBudget(t *testing.T) {
 	if result := decodeClosedRootResult(t, stdout.String()); result.Action != "work" {
 		t.Fatalf("result = %+v, want work, not a no_work drain", result)
 	}
+	assertRootReadsPrecedeClaimContext(t, reader, servedOpened)
 }
 
 // Brief (iv), review item 4: replay of the qc-4al798r shape through the
@@ -557,8 +594,10 @@ func TestHookClaimSkipsStepWhoseRootIsClosedInTheRelocatedStore(t *testing.T) {
 // closed_root bucket — not divergence ("still claimable"), and not benign.
 func TestDemandDivergenceClassifiesAClosedRootTriggerAsClosedRoot(t *testing.T) {
 	const rootID = "qc-dead-root"
-	trigger := beads.Bead{ID: "qc-dead-root.step", Title: "step", Status: "open",
-		Metadata: map[string]string{"gc.routed_to": "worker", "gc.root_bead_id": rootID, "gc.step_id": "implement"}}
+	trigger := beads.Bead{
+		ID: "qc-dead-root.step", Title: "step", Status: "open",
+		Metadata: map[string]string{"gc.routed_to": "worker", "gc.root_bead_id": rootID, "gc.step_id": "implement"},
+	}
 	reader := newClosedRootStoreReader(closedRootWorkflowRoot(rootID, "closed"), trigger)
 	spy := &closedRootClaimSpy{}
 	ops, opts := closedRootOpsOpts(`[`+stepJSON(trigger)+`]`, spy, reader)
@@ -588,12 +627,18 @@ func TestDemandDivergenceClassifiesAClosedRootTriggerAsClosedRoot(t *testing.T) 
 // served.
 func TestDemandDivergenceWithoutAnEstablishedTailStaysDivergence(t *testing.T) {
 	const rootID = "qc-td2"
-	sibling := beads.Bead{ID: "qc-td2.s", Title: "s", Status: "open",
-		Metadata: map[string]string{"gc.routed_to": "worker", "gc.root_bead_id": rootID}}
-	teardown := beads.Bead{ID: "qc-td2.cleanup", Title: "cleanup", Status: "closed",
-		Metadata: map[string]string{"gc.root_bead_id": rootID, "gc.step_id": "cleanup-worktree", "gc.scope_role": "teardown"}}
-	retry := beads.Bead{ID: "qc-td2.cleanup.1", Title: "retry", Status: "open",
-		Metadata: map[string]string{"gc.routed_to": "worker", "gc.root_bead_id": rootID, "gc.step_id": "cleanup-worktree"}}
+	sibling := beads.Bead{
+		ID: "qc-td2.s", Title: "s", Status: "open",
+		Metadata: map[string]string{"gc.routed_to": "worker", "gc.root_bead_id": rootID},
+	}
+	teardown := beads.Bead{
+		ID: "qc-td2.cleanup", Title: "cleanup", Status: "closed",
+		Metadata: map[string]string{"gc.root_bead_id": rootID, "gc.step_id": "cleanup-worktree", "gc.scope_role": "teardown"},
+	}
+	retry := beads.Bead{
+		ID: "qc-td2.cleanup.1", Title: "retry", Status: "open",
+		Metadata: map[string]string{"gc.routed_to": "worker", "gc.root_bead_id": rootID, "gc.step_id": "cleanup-worktree"},
+	}
 	reader := newClosedRootStoreReader(closedRootWorkflowRoot(rootID, "closed"), sibling, teardown, retry)
 	spy := &closedRootClaimSpy{}
 	ops, opts := closedRootOpsOpts(`[`+stepJSON(sibling)+`]`, spy, reader)
@@ -756,7 +801,6 @@ func TestHookClaimClosedRootCostIsConstantBdCallsPerRoot(t *testing.T) {
 	var mu sync.Mutex
 	shows, total := 0, 0
 	runner := func(_ string, _ string, args ...string) ([]byte, error) {
-		time.Sleep(2 * time.Millisecond)
 		mu.Lock()
 		defer mu.Unlock()
 		total++
@@ -809,8 +853,9 @@ func TestHookClaimSlowRootsBehindReadyAssignmentDoNotSpendTheWindow(t *testing.T
 		rows = append(rows, routedStepWithIDJSON(rootID+".impl", rootID, "implement"))
 	}
 	rows = append(rows, `{"id":"qc-mine","status":"open","assignee":"worker-1","metadata":{"gc.routed_to":"worker"}}`)
+	// No read may run at all: the zero-reads assertion below is the proof, so
+	// the reads need no simulated latency to make a regression visible.
 	reader := newClosedRootStoreReader(existing...)
-	reader.delay = 100 * time.Millisecond // 10 reads = 1s, over the 400ms window
 	spy := &closedRootClaimSpy{}
 	ops, opts := closedRootOpsOpts(`[`+strings.Join(rows, ",")+`]`, spy, reader)
 	ops.ClaimWindow = 400 * time.Millisecond
@@ -854,14 +899,12 @@ func TestRunWithDeadlineReturnsOnContextExpiry(t *testing.T) {
 // race (ok=false) — and twenty dead molecules sit behind it, ahead of a live
 // row. The pre-tier resolve stopped at the contested row, so those twenty roots
 // are still unresolved when the tier reaches them. They must be resolved
-// OUTSIDE the tier's claim-mutation context: resolved inside it, 20 reads x
-// 20ms spend the 200ms claim budget, the live row is never tried, and the seat
-// writes a false no_work drain.
+// OUTSIDE the tier's claim-mutation context: resolved inside it, slow reads
+// spend the claim budget, the live row is never tried, and the seat writes a
+// false no_work drain. Proven without wall-clock latency: the context the
+// contested claim ran under is already done when any later root is read, and
+// the live row is claimed under a context opened after the last read.
 func TestHookClaimRootReadsAfterALostRaceDoNotSpendTheClaimBudget(t *testing.T) {
-	old := hookClaimMutationTimeout
-	hookClaimMutationTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { hookClaimMutationTimeout = old })
-
 	existing := []beads.Bead{closedRootWorkflowRoot("qc-live-root", "open")}
 	rows := []string{routedStepJSON("qc-contested", "")}
 	for i := 1; i <= 20; i++ {
@@ -871,16 +914,31 @@ func TestHookClaimRootReadsAfterALostRaceDoNotSpendTheClaimBudget(t *testing.T) 
 	}
 	rows = append(rows, routedStepWithIDJSON("qc-live-root.step", "qc-live-root", "implement"))
 	reader := newClosedRootStoreReader(existing...)
-	reader.delay = 20 * time.Millisecond // 21 reads = 420ms > the 200ms claim budget
 	spy := &closedRootClaimSpy{}
 	ops, opts := closedRootOpsOpts(`[`+strings.Join(rows, ",")+`]`, spy, reader)
-	var attempts []string
+	ops.ClaimWindow = time.Hour // far past the mutation budget: claimContextOpenedAt is exact
+	var (
+		attempts     []string
+		contestedCtx context.Context
+		servedOpened time.Time
+		readsInside  []string
+	)
+	ops.ReadRoot = func(ctx context.Context, dir string, env []string, id, assignee string) (beads.Bead, error) {
+		// A read while the contested claim's context is still open is a read
+		// inside the tier's claim-mutation context: the regression under test.
+		if contestedCtx != nil && contestedCtx.Err() == nil {
+			readsInside = append(readsInside, id)
+		}
+		return reader.fn(ctx, dir, env, id, assignee)
+	}
 	ops.Claim = func(ctx context.Context, dir string, env []string, id, assignee string) (beads.Bead, bool, error) {
 		attempts = append(attempts, id)
 		if id == "qc-contested" {
+			contestedCtx = ctx
 			// Lost CAS race: another live claimant owns it.
 			return beads.Bead{ID: id, Status: "in_progress", Assignee: "worker-2", Metadata: map[string]string{}}, false, nil
 		}
+		servedOpened, _ = claimContextOpenedAt(ctx)
 		return spy.fn(ctx, dir, env, id, assignee)
 	}
 	ops.EmitClaimRejected = func(string, string, string) {}
@@ -898,6 +956,10 @@ func TestHookClaimRootReadsAfterALostRaceDoNotSpendTheClaimBudget(t *testing.T) 
 	if !strings.Contains(stderr.String(), "skipped: root qc-behind-01 closed") {
 		t.Errorf("stderr = %q, want the dead molecules still reported as skipped", stderr.String())
 	}
+	if len(readsInside) != 0 {
+		t.Errorf("root reads inside the contested claim's context = %v, want none", readsInside)
+	}
+	assertRootReadsPrecedeClaimContext(t, reader, servedOpened)
 }
 
 // Round 4, N2: on a federated city the drain classifies with the invocation's
@@ -906,8 +968,10 @@ func TestHookClaimRootReadsAfterALostRaceDoNotSpendTheClaimBudget(t *testing.T) 
 // file the trigger under closed_root — not a plain (false-alarm) divergence.
 func TestDemandDivergenceFindsTheClosedRootVerdictOfAnotherLeg(t *testing.T) {
 	const rootID = "qc-fed-root"
-	trigger := beads.Bead{ID: "qc-fed-root.step", Title: "step", Status: "open",
-		Metadata: map[string]string{"gc.routed_to": "worker", "gc.root_bead_id": rootID, "gc.step_id": "implement"}}
+	trigger := beads.Bead{
+		ID: "qc-fed-root.step", Title: "step", Status: "open",
+		Metadata: map[string]string{"gc.routed_to": "worker", "gc.root_bead_id": rootID, "gc.step_id": "implement"},
+	}
 	rigB := beads.NewMemStoreFrom(0, []beads.Bead{closedRootWorkflowRoot(rootID, "closed"), trigger}, nil)
 	reader := newClosedRootStoreReader()
 	reader.byDir = map[string]*beads.MemStore{
