@@ -234,9 +234,9 @@ func TestNudgeSendPathPastesOnlyWhenPaneBracketPasteFlagIsOn(t *testing.T) {
 		wantPaste bool
 	}{
 		{name: "flag 1 pastes", flag: "1", wantPaste: true},
-		{name: "flag 0 keeps send-keys", flag: "0"},
-		{name: "empty flag (tmux before 3.7 lacks the format) with no live agent keeps send-keys", flag: ""},
-		{name: "flag read error with no live agent keeps send-keys", flagErr: errors.New("can't find pane: %1")},
+		{name: "flag 0 refuses", flag: "0"},
+		{name: "empty flag (tmux before 3.7 lacks the format) with no live agent refuses", flag: ""},
+		{name: "flag read error with no live agent refuses", flagErr: errors.New("can't find pane: %1")},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -244,8 +244,12 @@ func TestNudgeSendPathPastesOnlyWhenPaneBracketPasteFlagIsOn(t *testing.T) {
 			tm := NewTmuxWithConfig(DefaultConfig())
 			tm.exec = fe
 
-			if err := tm.sendKeysLiteralWithRetry("%1", text, time.Second); err != nil {
+			err := tm.sendKeysLiteralWithRetry("%1", text, time.Second)
+			if tt.wantPaste && err != nil {
 				t.Fatalf("sendKeysLiteralWithRetry() = %v, want nil", err)
+			}
+			if !tt.wantPaste && !errors.Is(err, ErrNudgeUnbracketedTooLong) {
+				t.Fatalf("flag %q (err %v): sendKeysLiteralWithRetry() = %v, want ErrNudgeUnbracketedTooLong (pl-7tq)", tt.flag, tt.flagErr, err)
 			}
 
 			literal := fe.literalSends()
@@ -258,8 +262,8 @@ func TestNudgeSendPathPastesOnlyWhenPaneBracketPasteFlagIsOn(t *testing.T) {
 				if len(pastes) != 0 || len(fe.callsWith("load-buffer")) != 0 {
 					t.Fatalf("flag %q (err %v): nudge used the paste buffer into a pane without bracketed paste, which submits it line by line; calls: %q", tt.flag, tt.flagErr, fe.calls)
 				}
-				if len(literal) != 1 || literal[0] != text {
-					t.Fatalf("flag %q (err %v): send-keys -l texts = %d call(s), want exactly one carrying the whole text; calls: %q", tt.flag, tt.flagErr, len(literal), fe.calls)
+				if len(literal) != 0 {
+					t.Fatalf("flag %q (err %v): refused nudge was typed anyway (%d send-keys -l call(s)); calls: %q", tt.flag, tt.flagErr, len(literal), fe.calls)
 				}
 			}
 
