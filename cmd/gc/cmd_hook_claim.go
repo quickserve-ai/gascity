@@ -250,7 +250,7 @@ type hookClaimOps struct {
 	// root is resolved through the same class-routed read seam as the claim.
 	ReadRoot func(context.Context, string, []string, string, string) (beads.Bead, error)
 	// TeardownTail builds a closed root's teardown-tail predicate
-	// (molecule.TeardownTailExclusion) so the guard keeps serving the teardown
+	// (the rule of molecule.TeardownTailExclusion, one narrow query) so the guard keeps serving the teardown
 	// work that by contract runs after the root closes. Defaulted to the leg's
 	// bd store; the class route wraps it like ReadWorkMeta.
 	TeardownTail func(context.Context, string, []string, string, string) (func(beads.Bead) bool, error)
@@ -507,16 +507,17 @@ func tryHookClaim(workQuery, dir string, opts *hookClaimOptions, ops *hookClaimO
 	// neither may serve a step whose molecule root was observed closed (its
 	// teardown tail excepted). The federated caller owns one gate for the whole
 	// invocation; a direct caller gets one here, reported when this attempt
-	// ends. Verdicts are resolved NOW, before either tier opens its
-	// claim-mutation context, so root reads never spend the claim budget.
+	// ends. Roots are resolved NOW, before either tier opens its
+	// claim-mutation context, in tier order, and only up to the first row the
+	// guard would serve — so dead molecules never spend the claim budget or
+	// the invocation window a live row needs.
 	if ops.rootGate == nil && ops.ReadRoot != nil {
 		ops.rootGate = newHookClosedRootGate(*ops, *opts, stderr)
 		defer ops.rootGate.report()
 	}
-	resolvedAt := now()
-	ops.rootGate.resolve(candidates, dir, opts.Env, func(candidate beads.Bead) bool {
-		return hookCandidateMayBeServed(candidate, *opts, resolvedAt)
-	})
+	if ops.rootGate != nil {
+		ops.rootGate.resolveUntilServable(hookClaimTierOrder(candidates, *opts, now()), dir, opts.Env)
+	}
 
 	readyResult := claimFirstReadyHookAssignment(candidates, *opts, *ops, dir, stdout, stderr)
 	if readyResult.terminal {
