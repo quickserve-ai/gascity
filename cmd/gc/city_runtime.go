@@ -3098,9 +3098,6 @@ func (cr *CityRuntime) recordReconcileTraceInputs(
 		return
 	}
 	phaseStart := time.Now()
-	templateNames := make(map[string]struct{})
-	openCounts := make(map[string]int)
-	desiredCounts := make(map[string]int)
 	// Pre-tick baseline: openInfos is the tick's input row feed projected to Info,
 	// captured before the reconciler runs, so these reads are the pre-tick values
 	// (byte-equivalent to the raw open-bead read they replace).
@@ -3109,42 +3106,15 @@ func (cr *CityRuntime) recordReconcileTraceInputs(
 		if template == "" {
 			continue
 		}
-		templateNames[template] = struct{}{}
-		openCounts[template]++
 		trace.RecordSessionBaseline(template, info.SessionNameMetadata, map[string]any{
 			"state":        info.MetadataState,
 			"sleep_reason": info.SleepReason,
 		})
 	}
-	for _, tp := range desiredState {
-		if tp.TemplateName == "" {
-			continue
-		}
-		templateNames[tp.TemplateName] = struct{}{}
-		desiredCounts[tp.TemplateName]++
-	}
-	for template := range poolDesired {
-		templateNames[template] = struct{}{}
-	}
-	for template := range workSet {
-		templateNames[template] = struct{}{}
-	}
-	for template := range traceWorkRequested {
-		templateNames[template] = struct{}{}
-	}
-	for _, template := range traceSetStrings(templateNames) {
-		status := TraceEvaluationEligible
-		reason := TraceReasonRetained
-		if desiredCounts[template] == 0 && poolDesired[template] == 0 && openCounts[template] == 0 {
-			status = TraceEvaluationSkipped
-			reason = TraceReasonNoDemand
-		}
-		trace.RecordTemplateSummary(template, "", status, reason, map[string]any{
-			"desired_count":  desiredCounts[template],
-			"open_count":     openCounts[template],
-			"pool_desired":   poolDesired[template],
-			"work_requested": traceWorkRequested[template],
-		})
+	templateNames, summaries := buildTemplateTickSummaries(cr.cfg, openInfos, desiredState, poolDesired, workSet, traceWorkRequested)
+	for _, template := range templateNames {
+		sum := summaries[template]
+		trace.RecordTemplateSummary(template, "", sum.status, sum.reason, sum.fields)
 	}
 	trace.RecordCycleInputSnapshot(map[string]any{
 		"desired_session_count":               len(desiredState),

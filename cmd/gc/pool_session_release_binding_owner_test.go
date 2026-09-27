@@ -92,6 +92,49 @@ func TestReleaseConfirmedOrphanSessionWork_ReleasesBindingResidentClaimThroughAl
 	}
 }
 
+// ga-91tu1o, second decision site: the orphan-close tie-break chooses its
+// guards from the same cached snapshot as the sweep, so a live row whose
+// routing inputs moved on must be skipped here too. The ReleasesBindingResident
+// test above is the control: the identical claim with no divergence releases.
+func TestReleaseConfirmedOrphanSessionWork_SkipsWhenLiveRoutingDivergesFromSnapshot(t *testing.T) {
+	cases := []struct {
+		name string
+		meta map[string]string
+	}{
+		{name: "routed_to moved", meta: map[string]string{beadmeta.RoutedToMetadataKey: "mayor"}},
+		{name: "continuation group set", meta: map[string]string{beadmeta.ContinuationGroupMetadataKey: "grp-1"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := bindingOrphanConfig(t)
+			snapshot := bindingOrphanClaim()
+			// Seed the store with its OWN copy: NewMemStoreFrom copies the
+			// slice shallowly, so seeding it with `snapshot` would share the
+			// Metadata map and the live-row update below would rewrite the
+			// cached snapshot too, leaving nothing to diverge.
+			binding := beads.NewMemStoreFrom(1, []beads.Bead{bindingOrphanClaim()}, nil)
+			if err := binding.Update(snapshot.ID, beads.UpdateOpts{Metadata: tc.meta}); err != nil {
+				t.Fatalf("diverge live row: %v", err)
+			}
+
+			released := releaseConfirmedOrphanSessionWork(
+				cfg, binding, map[string]beads.Store{"beads": beads.NewMemStore()}, []beads.Bead{snapshot}, []beads.Store{binding}, nil, bindingOrphanSessionInfo(),
+			)
+
+			if len(released) != 0 {
+				t.Fatalf("released = %#v, want none: the live row diverged from the cached snapshot", released)
+			}
+			got, err := binding.Get(snapshot.ID)
+			if err != nil {
+				t.Fatalf("binding.Get(%s): %v", snapshot.ID, err)
+			}
+			if got.Status != "in_progress" || got.Assignee != bindingOrphanSeat {
+				t.Fatalf("claim = status %q assignee %q, want it untouched", got.Status, got.Assignee)
+			}
+		})
+	}
+}
+
 // TestReleaseConfirmedOrphanSessionWork_NilAlignedStoresKeepsRoutedFallback is
 // the mutation probe for the test above AND the compatibility contract: with no
 // aligned slice the resolver falls back to the gc.routed_to prefix exactly as it

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log"
 	"path"
 	"strings"
@@ -478,7 +479,7 @@ func releaseOrphanedPoolAssignments(
 			}
 			continue
 		}
-		if !liveWorkAssignmentStillReleasable(ownerStore, wb.ID, wb.Status, assignee) {
+		if !liveWorkRowStillReleasable(ownerStore, wb, assignee) {
 			continue
 		}
 		allowsRelease, clearDetached := detachedProbeAllowsOrphanRelease(wb)
@@ -519,7 +520,7 @@ func releaseOrphanedPoolAssignments(
 // is actually alive is data loss, not recovery (ga-g3pf0).
 //
 // Every per-bead gate from releaseOrphanedPoolAssignments applies unchanged,
-// including the live re-read in liveWorkAssignmentStillReleasable — the tick
+// including the live re-read in liveWorkRowStillReleasable — the tick
 // snapshot names candidates but never by itself justifies a release.
 //
 // assignedWorkStores is the index-aligned snapshot of the legs the census read
@@ -624,7 +625,7 @@ func releaseConfirmedOrphanSessionWork(
 			}
 			continue
 		}
-		if !liveWorkAssignmentStillReleasable(ownerStore, wb.ID, wb.Status, assignee) {
+		if !liveWorkRowStillReleasable(ownerStore, wb, assignee) {
 			continue
 		}
 		allowsRelease, clearDetached := detachedProbeAllowsOrphanRelease(wb)
@@ -1106,6 +1107,52 @@ func liveWorkAssignmentStillReleasable(store beads.Store, id, expectedStatus, as
 		return false
 	}
 	return matches
+}
+
+// liveWorkRowStillReleasable is liveWorkAssignmentStillReleasable for the two
+// sweep decision sites (ga-91tu1o). Both choose their guards from the cached
+// assigned-work snapshot: the routed template picks the named- and
+// ephemeral-session guards and the rig gate, the canonical-root shape exempts
+// workflow roots, the gc.detached spec decides whether a probe runs, and
+// gc.continuation_group picks the single-write recheck release over the
+// two-write CAS path. A live status+assignee match does not cover those inputs.
+// The cache heals a missed event on its periodic full rescan (every 30-120s,
+// CachingStore reconcile), but a sweep inside that window decides on the stale
+// snapshot. The live row must therefore carry the same inputs; any divergence
+// skips the release for this pass, logged, and a later pass decides once the
+// snapshot agrees with the row. This can only withhold a release.
+func liveWorkRowStillReleasable(store beads.Store, snapshot beads.Bead, assignee string) bool {
+	live, found, err := liveWorkAssignmentRow(store, snapshot.ID, snapshot.Status)
+	if err != nil {
+		log.Printf("releaseOrphanedPoolAssignments: live work validation failed for %q: %v", snapshot.ID, err)
+		return false
+	}
+	if !found || strings.TrimSpace(live.Assignee) != strings.TrimSpace(assignee) {
+		return false
+	}
+	if diff := orphanReleaseInputsDiff(snapshot, live); diff != "" {
+		log.Printf("releaseOrphanedPoolAssignments: skipping release for %s: cached snapshot diverges from the live row (%s)", snapshot.ID, diff)
+		return false
+	}
+	return true
+}
+
+// orphanReleaseInputsDiff names the release-decision inputs that differ between
+// the cached snapshot and the live row, or "" when they agree.
+func orphanReleaseInputsDiff(snapshot, live beads.Bead) string {
+	var diffs []string
+	if a, b := routedToOrLegacyWorkflowTarget(snapshot), routedToOrLegacyWorkflowTarget(live); a != b {
+		diffs = append(diffs, fmt.Sprintf("routed target %q -> %q", a, b))
+	}
+	if a, b := isCanonicalWorkflowRoot(snapshot), isCanonicalWorkflowRoot(live); a != b {
+		diffs = append(diffs, fmt.Sprintf("canonical workflow root %t -> %t", a, b))
+	}
+	for _, key := range []string{detachedProbeMetadataKey, beadmeta.ContinuationGroupMetadataKey} {
+		if a, b := strings.TrimSpace(snapshot.Metadata[key]), strings.TrimSpace(live.Metadata[key]); a != b {
+			diffs = append(diffs, fmt.Sprintf("%s %q -> %q", key, a, b))
+		}
+	}
+	return strings.Join(diffs, "; ")
 }
 
 func assigneePreservesNamedSessionRoute(cfg *config.City, cityPath, template, assignee, workStoreRef string, storeRefAware bool) bool {
