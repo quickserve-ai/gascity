@@ -238,6 +238,12 @@ var (
 	// failure mode (up to 5 copies of one reminder, 1201 occurrences in 5
 	// days of production logs).
 	ErrNudgeSubmitDeliveredUnobserved = errors.New("nudge: submit Enter delivered and composer drained but busy state was never observed")
+	// ErrNudgeUnbracketedTooLong indicates a claude nudge longer than
+	// claudeMaxUnbracketedNudgeBytes was refused because the pane's
+	// bracketed-paste mode could not be confirmed. Typed as keystrokes
+	// instead, such a nudge reaches Claude Code split, head-cut or reduced to
+	// a few stray bytes (pl-7tq), so nothing is sent.
+	ErrNudgeUnbracketedTooLong = errors.New("nudge: too long to type into a claude pane whose bracketed-paste mode cannot be confirmed")
 	// ErrServerDegraded indicates the tmux server bound to SocketName is
 	// reachable on the filesystem but unresponsive. Creating a new session
 	// in this state would let tmux's own (very short) liveness probe time
@@ -2427,9 +2433,15 @@ func (t *Tmux) sendLiteralTextConfirmingMode(target, text string, confirmByAgent
 	if len(text) > maxSendKeysLiteralLen {
 		return t.pasteLiteralText(target, text)
 	}
-	if claudeNeedsBracketedPaste(text) && t.targetIsClaudeFamily(target) &&
-		t.paneBracketsPaste(target, confirmByAgent) {
-		return t.pasteLiteralText(target, text)
+	if claudeNeedsBracketedPaste(text) && t.targetIsClaudeFamily(target) {
+		if t.paneBracketsPaste(target, confirmByAgent) {
+			return t.pasteLiteralText(target, text)
+		}
+		// Only the nudge path refuses: the startup path types its prompt
+		// before the agent (and its bracketed-paste mode) is up by design.
+		if confirmByAgent && len(text) > claudeMaxUnbracketedNudgeBytes {
+			return fmt.Errorf("%w: %d bytes, limit %d", ErrNudgeUnbracketedTooLong, len(text), claudeMaxUnbracketedNudgeBytes)
+		}
 	}
 	_, err := t.run("send-keys", "-t", paneTarget(target), "-l", text)
 	if isCommandTooLongError(err) {
