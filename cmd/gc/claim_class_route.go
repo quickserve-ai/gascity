@@ -129,6 +129,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/executionevent"
+	"github.com/gastownhall/gascity/internal/molecule"
 	"github.com/gastownhall/gascity/internal/storebinding"
 	"github.com/gastownhall/gascity/internal/storeref"
 )
@@ -573,6 +574,15 @@ func classRoutedHookClaimOps(ops hookClaimOps, route *hookClaimClassRoute) hookC
 		default:
 			return bead, err
 		}
+	}
+
+	// The closed-root guard's teardown tail lives with the root: a root the
+	// route already proved binding-resident has its subtree read there.
+	ops.TeardownTail = func(ctx context.Context, dir string, env []string, rootID, assignee string) (func(beads.Bead) bool, error) {
+		if route.knownResident(rootID) {
+			return molecule.TeardownTailExclusion(route.class, rootID)
+		}
+		return base.TeardownTail(ctx, dir, env, rootID, assignee)
 	}
 
 	// A continuation LIST is the one claim-time call with no not-found to

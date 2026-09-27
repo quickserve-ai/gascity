@@ -1745,6 +1745,12 @@ esac
 	if !strings.Contains(logText, "actor=worker-1 args=show --json hw-claim") {
 		t.Fatalf("bd canonical read did not use BEADS_ACTOR=worker-1; log:\n%s", logText)
 	}
+	// The production entry point armed the closed-root guard (qc-z0fmn0n): the
+	// step's molecule root was read through the claim's bd context. Deleting
+	// withClosedRootGuard from claimHookWork makes this fail.
+	if !strings.Contains(logText, "args=show --json root-1") {
+		t.Fatalf("the closed-root guard never read the step's root root-1; log:\n%s", logText)
+	}
 	// The claim itself is actored and assigned as worker-1 (the alias read paths
 	// query through GC_AGENT), but the continuation pin is a session binding: the
 	// sibling must name GC_SESSION_ID so wake demand and the continuation

@@ -249,8 +249,13 @@ type hookClaimOps struct {
 	// entry point arms it through ReadWorkMeta (withClosedRootGuard), so the
 	// root is resolved through the same class-routed read seam as the claim.
 	ReadRoot func(context.Context, string, []string, string, string) (beads.Bead, error)
-	// rootGate is the per-claim-attempt closed-root cache tryHookClaim builds
-	// from ReadRoot. Nil (no ReadRoot, or a tier driven directly) never skips.
+	// TeardownTail builds a closed root's teardown-tail predicate
+	// (molecule.TeardownTailExclusion) so the guard keeps serving the teardown
+	// work that by contract runs after the root closes. Defaulted to the leg's
+	// bd store; the class route wraps it like ReadWorkMeta.
+	TeardownTail func(context.Context, string, []string, string, string) (func(beads.Bead) bool, error)
+	// rootGate is the closed-root cache for one claim invocation, shared by
+	// every federated leg (the ops copies share the pointer). Nil never skips.
 	rootGate *hookClosedRootGate
 	// ConfirmBlocked re-derives whether a bead is really blocked, from its live
 	// dependencies rather than bd's denormalized is_blocked projection (which
@@ -499,11 +504,19 @@ func tryHookClaim(workQuery, dir string, opts *hookClaimOptions, ops *hookClaimO
 	}
 
 	// Closed-root guard (qc-z0fmn0n): both tiers below mint a claim, and
-	// neither may serve a step whose molecule root is closed or absent. One
-	// gate per attempt caches each root's verdict, and the skip is reported
-	// once per root whichever way the attempt ends.
-	ops.rootGate = newHookClosedRootGate(*ops, *opts, dir, stderr)
-	defer ops.rootGate.report()
+	// neither may serve a step whose molecule root was observed closed (its
+	// teardown tail excepted). The federated caller owns one gate for the whole
+	// invocation; a direct caller gets one here, reported when this attempt
+	// ends. Verdicts are resolved NOW, before either tier opens its
+	// claim-mutation context, so root reads never spend the claim budget.
+	if ops.rootGate == nil && ops.ReadRoot != nil {
+		ops.rootGate = newHookClosedRootGate(*ops, *opts, stderr)
+		defer ops.rootGate.report()
+	}
+	resolvedAt := now()
+	ops.rootGate.resolve(candidates, dir, opts.Env, func(candidate beads.Bead) bool {
+		return hookCandidateMayBeServed(candidate, *opts, resolvedAt)
+	})
 
 	readyResult := claimFirstReadyHookAssignment(candidates, *opts, *ops, dir, stdout, stderr)
 	if readyResult.terminal {
@@ -558,6 +571,9 @@ func (ops *hookClaimOps) applyDefaults() {
 	}
 	if ops.ReadWorkMeta == nil {
 		ops.ReadWorkMeta = hookReadClaimedBeadWithBdStore
+	}
+	if ops.TeardownTail == nil {
+		ops.TeardownTail = hookClaimTeardownTailWithBdStore
 	}
 	if ops.ConfirmBlocked == nil {
 		ops.ConfirmBlocked = hookConfirmBeadBlockedWithBdStore
@@ -699,7 +715,7 @@ func claimFirstReadyHookAssignment(candidates []beads.Bead, opts hookClaimOption
 			!strings.EqualFold(strings.TrimSpace(candidate.Status), "open") ||
 			!hookClaimHasIdentity(candidate.Assignee, opts.IdentityCandidates) ||
 			hookCandidateBudgetDeferred(candidate, now) ||
-			ops.rootGate.skip(candidate) {
+			ops.rootGate.skip(candidate, dir, opts.Env) {
 			continue
 		}
 		// F-B. Promoting a ready assignment is a status CAS — a mutation — so it
@@ -834,10 +850,10 @@ func claimFirstEligibleHookCandidate(candidates []beads.Bead, opts hookClaimOpti
 			}
 			reclaim = true
 		}
-		// A step whose molecule root is closed or absent is not served
+		// A step whose molecule root was observed closed is not served
 		// (qc-z0fmn0n). Like the declines below it mutates nothing, so it runs
 		// before either the reclaim or the claim.
-		if ops.rootGate.skip(candidate) {
+		if ops.rootGate.skip(candidate, dir, opts.Env) {
 			continue
 		}
 		// The two declines below mutate nothing, so they run before EITHER
@@ -2143,8 +2159,10 @@ func hookStampWorkMetaWithBdStore(_ context.Context, dir string, env []string, b
 	return store.Update(beadID, beads.UpdateOpts{Metadata: patch})
 }
 
-func hookReadClaimedBeadWithBdStore(_ context.Context, dir string, env []string, beadID, assignee string) (beads.Bead, error) {
-	return hookClaimBdStore(dir, env, assignee).Get(beadID)
+func hookReadClaimedBeadWithBdStore(ctx context.Context, dir string, env []string, beadID, assignee string) (beads.Bead, error) {
+	// The caller's deadline is bound into the bd child, so a read given a
+	// budget (the closed-root guard's root lookup among them) cannot outlive it.
+	return hookClaimBdStoreContext(ctx, dir, env, assignee).Get(beadID)
 }
 
 // hookConfirmBeadBlockedWithBdStore is the production ConfirmBlocked seam. It
