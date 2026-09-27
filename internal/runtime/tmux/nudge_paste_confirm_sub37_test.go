@@ -1,6 +1,7 @@
 package tmux
 
 import (
+	"errors"
 	"os/exec"
 	"strconv"
 	"testing"
@@ -39,7 +40,8 @@ func startProcessNamedArgv0(t *testing.T, name string) string {
 // AGENT IS ALIVE: a running claude sits at its prompt with bracketed paste on,
 // while the pane that reports no agent is the bare-shell pane where raw
 // CR-separated lines would RUN. So a live agent is confirmation enough to
-// paste, and no agent is a refusal.
+// paste, and no agent is a refusal: the nudge is not pasted, and since it is
+// too long to type whole (pl-7tq) it is not sent at all.
 func TestNudgeSendPathConfirmsBracketedPasteByAgentLiveness(t *testing.T) {
 	text := multiLineNudge(900)
 	tests := []struct {
@@ -57,7 +59,7 @@ func TestNudgeSendPathConfirmsBracketedPasteByAgentLiveness(t *testing.T) {
 			wantProbe: true,
 		},
 		{
-			name:      "unreadable flag with a bare shell keeps send-keys",
+			name:      "unreadable flag with a bare shell refuses",
 			flag:      "",
 			argv0:     "bash",
 			wantPaste: false,
@@ -87,8 +89,12 @@ func TestNudgeSendPathConfirmsBracketedPasteByAgentLiveness(t *testing.T) {
 			tm := NewTmuxWithConfig(DefaultConfig())
 			tm.exec = fe
 
-			if err := tm.sendKeysLiteralWithRetry("%1", text, time.Second); err != nil {
+			err := tm.sendKeysLiteralWithRetry("%1", text, time.Second)
+			if tt.wantPaste && err != nil {
 				t.Fatalf("sendKeysLiteralWithRetry() = %v, want nil", err)
+			}
+			if !tt.wantPaste && !errors.Is(err, ErrNudgeUnbracketedTooLong) {
+				t.Fatalf("sendKeysLiteralWithRetry() = %v, want ErrNudgeUnbracketedTooLong: typed as keystrokes, a %d-byte nudge reaches claude cut (pl-7tq)", err, len(text))
 			}
 
 			pastes := fe.callsWith("paste-buffer")
@@ -108,8 +114,8 @@ func TestNudgeSendPathConfirmsBracketedPasteByAgentLiveness(t *testing.T) {
 					t.Fatalf("flag %q, pane argv[0] %q: nudge pasted into a pane that was not confirmed to bracket it, which submits it line by line; calls: %q",
 						tt.flag, tt.argv0, fe.calls)
 				}
-				if len(literal) != 1 || literal[0] != text {
-					t.Fatalf("flag %q, pane argv[0] %q: send-keys -l texts = %d call(s), want exactly one carrying the whole text; calls: %q",
+				if len(literal) != 0 {
+					t.Fatalf("flag %q, pane argv[0] %q: refused nudge was typed anyway (%d send-keys -l call(s)); calls: %q",
 						tt.flag, tt.argv0, len(literal), fe.calls)
 				}
 			}
