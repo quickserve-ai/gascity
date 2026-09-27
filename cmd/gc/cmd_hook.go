@@ -791,6 +791,13 @@ func claimHookWorkWithRunner(workQuery, workDir string, queryEnv []string, store
 	// report claims_errored instead of laundering a write failure into no_work.
 	claimsErrored := false
 	declinedForeign := 0
+	// One closed-root gate for the whole invocation (qc-z0fmn0n): every leg's
+	// tryHookClaim shares it through the copied ops, so a root is read once and
+	// reported once however many legs serve its steps.
+	if ops.rootGate == nil && ops.ReadRoot != nil {
+		ops.rootGate = newHookClosedRootGate(ops, claimOpts, stderr)
+		defer ops.rootGate.report()
+	}
 	for len(remaining) > 0 {
 		discovered, selected, err := selectStoreWithWorkRetrying(workQuery, remaining, primary, run, &ops)
 		if err != nil {
