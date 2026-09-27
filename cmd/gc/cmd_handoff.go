@@ -320,11 +320,13 @@ func doHandoffWithOutcome(msgStore, sessStore beads.Store, rec events.Recorder, 
 
 // doHandoffAuto sends handoff mail to self without requesting restart.
 func doHandoffAuto(msgStore, sessStore beads.Store, rec events.Recorder, sessionAddress string, args []string, hookFormat string, stdout, stderr io.Writer) int {
-	b, ok := createHandoffMail(msgStore, sessStore, rec, sessionAddress, sessionAddress, args, "context cycle", []string{
+	// --auto never requests a restart, so the CLI's "NOT restarted, re-run"
+	// advice does not fit it (ga-0ejdbv round 4).
+	b, ok := createHandoffMailReporting(msgStore, sessStore, rec, sessionAddress, sessionAddress, args, "context cycle", []string{
 		mail.AutoHandoffLabel,
 		mail.ArchiveAfterInjectLabel,
 		"priority:1",
-	}, stderr)
+	}, stderr, "gc handoff --auto", "hint: if that check shows the note, it is saved; only on a plain \"not found\" (not \"absence unproven\") run gc handoff --auto again.")
 	if !ok {
 		return 1
 	}
@@ -342,6 +344,16 @@ func doHandoffAuto(msgStore, sessStore beads.Store, rec events.Recorder, session
 // confined inside beadmail.Provider.SendHandoff. The returned mail.Message
 // carries the assigned ID for the caller's confirmation output.
 func createHandoffMail(msgStore, sessStore beads.Store, rec events.Recorder, senderAddress, recipientAddress string, args []string, defaultSubject string, extraLabels []string, stderr io.Writer) (mail.Message, bool) {
+	return createHandoffMailReporting(msgStore, sessStore, rec, senderAddress, recipientAddress, args, defaultSubject, extraLabels, stderr, "gc handoff",
+		"hint: the session was NOT restarted. If that check shows the note, it is saved and a re-run of gc handoff sends a second copy; only on a plain \"not found\" (not \"absence unproven\") re-run gc handoff.")
+}
+
+// createHandoffMailReporting is createHandoffMail with the caller's own error
+// label and the restart hint an UNCONFIRMED note should carry. The hint is the
+// caller's because only the caller knows what happens next: gc handoff stops
+// before the restart, while the controller's config-drift handoff restarts the
+// session regardless and must not print "re-run gc handoff" (ga-0ejdbv round 3).
+func createHandoffMailReporting(msgStore, sessStore beads.Store, rec events.Recorder, senderAddress, recipientAddress string, args []string, defaultSubject string, extraLabels []string, stderr io.Writer, label, unconfirmedHint string) (mail.Message, bool) {
 	subject := defaultSubject
 	if len(args) > 0 {
 		subject = args[0]
@@ -367,7 +379,20 @@ func createHandoffMail(msgStore, sessStore beads.Store, rec events.Recorder, sen
 		ExtraLabels: extraLabels,
 	})
 	if err != nil {
-		fmt.Fprintf(stderr, "gc handoff: creating mail: %v\n", err) //nolint:errcheck // best-effort stderr
+		// An UNCONFIRMED note may well have landed. Still stop before the
+		// restart (this session keeps its context), but say which ID to check,
+		// and what a re-run would do, instead of implying a plain retry
+		// (ga-0ejdbv review finding 2).
+		if id, ok := mail.UnconfirmedMessageID(err); ok {
+			fmt.Fprintf(stderr, "%s: handoff note UNCONFIRMED: it may have landed as %s, but it could not be read back: %v\n", label, id, err) //nolint:errcheck // best-effort stderr
+			fmt.Fprintf(stderr, "check: %s\n", mailStorageCheckCommand(id))                                                                    //nolint:errcheck // best-effort stderr
+			fmt.Fprintf(stderr, "       %s\n", mailStorageCheckReading)                                                                        //nolint:errcheck // best-effort stderr
+			if unconfirmedHint != "" {
+				fmt.Fprintln(stderr, unconfirmedHint) //nolint:errcheck // best-effort stderr
+			}
+			return mail.Message{}, false
+		}
+		fmt.Fprintf(stderr, "%s: creating mail: %v\n", label, err) //nolint:errcheck // best-effort stderr
 		return mail.Message{}, false
 	}
 	rec.Record(events.Event{
