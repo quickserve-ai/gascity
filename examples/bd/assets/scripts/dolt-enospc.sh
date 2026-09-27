@@ -20,9 +20,18 @@
 #   GC_DOLT_RESTART_ENOSPC_WINDOW_MIN  an ENOSPC log line blocks only while its
 #                                      time= stamp is within this many minutes
 #                                      of now (default 60)
+#   GC_DOLT_RESTART_ENOSPC_SKEW_MAX_S  a stamp more than this many seconds
+#                                      AHEAD of now is untrusted, not recent:
+#                                      it does not block, and the live disk
+#                                      reading decides (default 900)
 
 ENOSPC_DEFAULT_MIN_FREE_MB=1024
 ENOSPC_DEFAULT_WINDOW_MIN=60
+# A clock that ran ahead and was corrected leaves stamps in the future. Counted
+# as recent, each one blocked recovery until wall time passed it plus the
+# window: the stale-evidence outage again, from the other side. Within this
+# bound it is ordinary NTP-scale skew and still counts (ga-b56n0m).
+ENOSPC_DEFAULT_SKEW_MAX_S=900
 # Settings longer than this overflow shell arithmetic or test(1) comparisons,
 # which would make the guard proceed on an error instead of refusing.
 ENOSPC_SETTING_MAX_DIGITS=9
@@ -54,6 +63,7 @@ ENOSPC_PROBE_STAMP=1970-01-01T00:00:00+0000
 recovery_should_skip_due_to_enospc() {
     ENOSPC_REFUSAL_REASON=""
     ENOSPC_REFUSAL_DETAIL=""
+    ENOSPC_NOTE=""
     _enospc_refuse=false
 
     _enospc_min_mb=${GC_DOLT_RESTART_MIN_FREE_MB:-$ENOSPC_DEFAULT_MIN_FREE_MB}
@@ -64,7 +74,14 @@ recovery_should_skip_due_to_enospc() {
         _enospc_refuse=true
         _enospc_add_reason "invalid GC_DOLT_RESTART_MIN_FREE_MB=$_enospc_min_mb (want a whole number of at most $ENOSPC_SETTING_MAX_DIGITS digits)"
     fi
+    # Either log setting invalid leaves the log unevaluated (the verdict is already refuse).
     _enospc_window_valid=true
+    _enospc_skew_s=${GC_DOLT_RESTART_ENOSPC_SKEW_MAX_S:-$ENOSPC_DEFAULT_SKEW_MAX_S}
+    if ! _enospc_is_setting "$_enospc_skew_s"; then
+        _enospc_window_valid=false
+        _enospc_refuse=true
+        _enospc_add_reason "invalid GC_DOLT_RESTART_ENOSPC_SKEW_MAX_S=$_enospc_skew_s (want a whole number of at most $ENOSPC_SETTING_MAX_DIGITS digits)"
+    fi
     if ! _enospc_is_setting "$_enospc_window_min"; then
         _enospc_window_valid=false
         _enospc_refuse=true
@@ -101,6 +118,7 @@ _enospc_check_log() {
     _enospc_unevaluated=0
     _enospc_parser_missing=false
     _enospc_scan_failed=false
+    _enospc_future=0
     if [ -n "${LOG_FILE:-}" ] && [ -r "$LOG_FILE" ]; then
         _enospc_scan_log
         _enospc_log_line="log: $LOG_FILE (last $ENOSPC_LOG_TAIL_LINES lines scanned)"
@@ -134,6 +152,10 @@ _enospc_check_log() {
         _enospc_refuse=true
         _enospc_add_reason "the Dolt log could not be scanned for ENOSPC lines"
         _enospc_add_detail "ENOSPC log scan failed (grep error), counted as recent"
+    fi
+    if [ "$_enospc_future" -gt 0 ]; then
+        ENOSPC_NOTE="$_enospc_future ENOSPC log line(s) stamped more than $_enospc_skew_s s ahead of the local clock ignored as untrusted (newest $_enospc_future_stamp, $(_enospc_age "$_enospc_future_epoch")); the live disk reading decides"
+        _enospc_add_detail "$ENOSPC_NOTE"
     fi
     _enospc_add_detail "$_enospc_log_line"
 }
@@ -230,6 +252,9 @@ _enospc_scan_log() {
 
     _enospc_now=$(date +%s)
     _enospc_cutoff=$((_enospc_now - _enospc_window_min * 60))
+    _enospc_skew_limit=$((_enospc_now + _enospc_skew_s))
+    _enospc_future_epoch=""
+    _enospc_future_stamp=""
     _enospc_date_style=$(_enospc_probe_date_style)
     [ -n "$_enospc_date_style" ] || _enospc_parser_missing=true
 
@@ -241,6 +266,14 @@ _enospc_scan_log() {
         _enospc_is_whole "$_enospc_count" || continue
         _enospc_seen=$((_enospc_seen + _enospc_count))
         if _enospc_epoch=$(_enospc_stamp_epoch "$_enospc_stamp"); then
+            if [ "$_enospc_epoch" -gt "$_enospc_skew_limit" ]; then
+                _enospc_future=$((_enospc_future + _enospc_count))
+                if [ -z "$_enospc_future_epoch" ] || [ "$_enospc_epoch" -gt "$_enospc_future_epoch" ]; then
+                    _enospc_future_epoch=$_enospc_epoch
+                    _enospc_future_stamp=$_enospc_stamp
+                fi
+                continue
+            fi
             [ "$_enospc_epoch" -ge "$_enospc_cutoff" ] || continue
             _enospc_recent=$((_enospc_recent + _enospc_count))
             if [ -z "$_enospc_newest_epoch" ] || [ "$_enospc_epoch" -gt "$_enospc_newest_epoch" ]; then
@@ -311,16 +344,59 @@ _enospc_stamp_epoch() {
         [+-][0-9][0-9][0-9][0-9]) _enospc_offset=$_enospc_rest ;;
         *) return 1 ;;
     esac
+    _enospc_fields_valid "$_enospc_base" "$_enospc_offset" || return 1
     _enospc_parsed=$(_enospc_parse_normalized "$_enospc_date_style" "$_enospc_base$_enospc_offset") || return 1
     _enospc_is_whole "$_enospc_parsed" || return 1
     printf '%s\n' "$_enospc_parsed"
+}
+
+# _enospc_fields_valid <YYYY-MM-DDTHH:MM:SS> <+HHMM> succeeds only when every field is in
+# range. BSD date -j -f NORMALIZES instead of refusing (2026-09-31 becomes Oct 1, an offset
+# of -00:99 becomes -01:39), so a malformed stamp parsed to an instant; since a stamp far
+# ahead of the clock is ignored as untrusted, such a stamp would have let a restart through.
+# Checked here, it stays unparseable, which refuses (ga-b56n0m, cross-family review).
+_enospc_fields_valid() {
+    _enospc_f_y=${1%%-*}
+    _enospc_f_r=${1#*-}
+    _enospc_f_mo=${_enospc_f_r%%-*}
+    _enospc_f_r=${_enospc_f_r#*-}
+    _enospc_f_d=${_enospc_f_r%%T*}
+    _enospc_f_r=${_enospc_f_r#*T}
+    _enospc_f_h=${_enospc_f_r%%:*}
+    _enospc_f_r=${_enospc_f_r#*:}
+    _enospc_f_mi=${_enospc_f_r%%:*}
+    _enospc_f_s=${_enospc_f_r#*:}
+    _enospc_f_oh=${2#?}
+    _enospc_f_om=${_enospc_f_oh#??}
+    _enospc_f_oh=${_enospc_f_oh%??}
+    # Strip leading zeros: shell arithmetic reads a leading 0 as octal.
+    for _enospc_f_v in y mo d h mi s oh om; do
+        eval "_enospc_f_x=\$_enospc_f_$_enospc_f_v"
+        _enospc_f_x=${_enospc_f_x#"${_enospc_f_x%%[!0]*}"}
+        eval "_enospc_f_$_enospc_f_v=\${_enospc_f_x:-0}"
+    done
+    [ "$_enospc_f_mo" -ge 1 ] && [ "$_enospc_f_mo" -le 12 ] || return 1
+    [ "$_enospc_f_h" -le 23 ] && [ "$_enospc_f_mi" -le 59 ] && [ "$_enospc_f_s" -le 59 ] || return 1
+    [ "$_enospc_f_oh" -le 14 ] && [ "$_enospc_f_om" -le 59 ] || return 1
+    case $_enospc_f_mo in
+        4 | 6 | 9 | 11) _enospc_f_dim=30 ;;
+        2)
+            if [ $((_enospc_f_y % 4)) -eq 0 ] && { [ $((_enospc_f_y % 100)) -ne 0 ] || [ $((_enospc_f_y % 400)) -eq 0 ]; }; then
+                _enospc_f_dim=29
+            else
+                _enospc_f_dim=28
+            fi
+            ;;
+        *) _enospc_f_dim=31 ;;
+    esac
+    [ "$_enospc_f_d" -ge 1 ] && [ "$_enospc_f_d" -le "$_enospc_f_dim" ]
 }
 
 # _enospc_age renders how long ago an epoch was, for the refusal detail.
 _enospc_age() {
     _enospc_elapsed=$((_enospc_now - $1))
     if [ "$_enospc_elapsed" -lt 0 ]; then
-        printf 'ahead of the local clock'
+        printf '%s min ahead of the local clock' "$(((0 - _enospc_elapsed) / 60))"
     else
         printf '%s min ago' "$((_enospc_elapsed / 60))"
     fi
