@@ -76,6 +76,10 @@ if recovery_should_skip_due_to_enospc; then
   fi
   echo "gc dolt restart: --force set; restarting despite the ENOSPC guard: $ENOSPC_REFUSAL_REASON" >&2
 fi
+# Proceeding past a future-dated disk-full stamp is said out loud (ga-b56n0m).
+if [ -n "${ENOSPC_NOTE:-}" ]; then
+  echo "gc dolt restart: $ENOSPC_NOTE" >&2
+fi
 
 # Stop. Exit 2 from gc-beads-bd stop means "nothing was running" — a
 # recoverable state for restart. Any other non-zero exit is a real
