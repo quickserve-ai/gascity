@@ -269,6 +269,7 @@ jobs:
         timeout-minutes: 50
         env:
           GOLANGCI_LINT_CACHE: ${{ github.workspace }}/.cache/golangci-lint
+          LINT_FLAGS: -v
         run: make lint
       - name: Format
         run: make fmt-check
