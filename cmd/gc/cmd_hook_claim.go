@@ -976,7 +976,10 @@ type hookClaimTierCarry struct {
 // claimEligibleHookCandidatePass is one pass of the routed tier under one
 // claim-mutation context. resumeAt >= 0 (with a non-terminal result) names the
 // row whose closed-root verdict is not cached yet; nothing at or after it was
-// tried. A terminal result has already reported carry's declines.
+// tried. A terminal result from a claim outcome has reported carry's declines;
+// the readback-failure terminals (canonical readback failed, readback named a
+// different assignee) return before that report, so carry may still hold
+// unreported declines there (round-3 behaviour, noted by the round-4 read).
 func claimEligibleHookCandidatePass(candidates []beads.Bead, carry *hookClaimTierCarry, opts hookClaimOptions, ops hookClaimOps, dir string, stdout, stderr io.Writer) (hookClaimResult, int) {
 	ctx, cancel := ops.claimMutationContext()
 	defer cancel()
