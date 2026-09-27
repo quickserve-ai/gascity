@@ -146,6 +146,20 @@ LOG_NUL_OLD="$WORK/logs/nul-old.log"
     enospc_line "$(stamp "$TEN_MIN_AGO")"
 } > "$WORK/logs/nul-recent.log"
 LOG_NUL_RECENT="$WORK/logs/nul-recent.log"
+# A byte that is not valid UTF-8 ahead of a recent line: under a UTF-8 locale BSD
+# tr stopped there, and the recent line never reached grep.
+{
+    printf 'time="%s" level=warning msg="torn write \377 recovered"\n' "$NOW_STAMP"
+    enospc_line "$(stamp "$TEN_MIN_AGO")"
+} > "$WORK/logs/badbyte-recent.log"
+LOG_BADBYTE_RECENT="$WORK/logs/badbyte-recent.log"
+# An empty stamp extracted to an empty line, which command substitution dropped.
+LOG_EMPTY_STAMP=$(write_log empty-stamp "$(enospc_line "")")
+# A grep that fails (status 2) for the guard alone.
+BROKEN_GREP_BIN="$WORK/broken-grep-bin"
+mkdir -p "$BROKEN_GREP_BIN"
+printf '#!/bin/sh\necho "grep: simulated read error" >&2\nexit 2\n' > "$BROKEN_GREP_BIN/grep"
+chmod +x "$BROKEN_GREP_BIN/grep"
 
 # run_guard <log> <avail_kb> [VAR=value...]: the helper alone under POSIX sh.
 # Prints VERDICT=refuse|proceed, then the reason and detail lines.
@@ -445,6 +459,43 @@ if has "$out" "VERDICT=refuse"; then
 else
     fail "T14: here-document write failure -> expected refusal; got: $out"
 fi
+
+# T15: an invalid UTF-8 byte under a UTF-8 locale does not hide a recent line.
+out=$(run_guard "$LOG_BADBYTE_RECENT" "$HEALTHY_KB" LC_ALL=en_US.UTF-8)
+if has "$out" "VERDICT=refuse" && has "$out" "within the last 60 min: 1 (newest $TEN_MIN_STAMP, "; then
+    pass "T15: invalid UTF-8 byte before a 10-min-old ENOSPC -> still refuses on it"
+else
+    fail "T15: invalid byte + recent ENOSPC -> expected refusal; got: $out"
+fi
+check_no_force T15 "$out"
+
+# T16: an empty stamp is unparseable, not absent.
+out=$(run_guard "$LOG_EMPTY_STAMP" "$HEALTHY_KB")
+if has "$out" "VERDICT=refuse" && has "$out" "unparseable timestamp"; then
+    pass "T16: ENOSPC line with time=\"\" -> refuses, says unparseable"
+else
+    fail "T16: empty stamp -> expected refusal; got: $out"
+fi
+check_no_force T16 "$out"
+
+# T17: a grep that errors is a failed scan, never "no evidence".
+out=$(env PATH="$BROKEN_GREP_BIN:$STUB_BIN:$PATH" FAKE_DF_AVAIL_KB="$HEALTHY_KB" \
+    LOG_FILE="$LOG_NONE" DATA_DIR="$DATA_DIR_FIXTURE" \
+    sh -c '
+        . "$1"
+        if recovery_should_skip_due_to_enospc; then
+            echo "VERDICT=refuse"
+        else
+            echo "VERDICT=proceed"
+        fi
+        echo "REASON=$ENOSPC_REFUSAL_REASON"
+    ' guard "$HELPER" 2>/dev/null)
+if has "$out" "VERDICT=refuse" && has "$out" "could not be scanned"; then
+    pass "T17: grep error while scanning the log -> refuses, says the scan failed"
+else
+    fail "T17: grep error -> expected refusal; got: $out"
+fi
+check_no_force T17 "$out"
 
 # --- Caller 1: gc dolt restart ---
 
