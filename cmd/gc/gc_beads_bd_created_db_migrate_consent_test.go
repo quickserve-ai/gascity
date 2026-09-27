@@ -27,21 +27,29 @@ import (
 // pre-existing database may have co-resident clients on an older bd, which is
 // exactly what the refusal protects.
 //
-// bd reads the consent once for the whole process, and in shared-server mode
-// init also opens beads_global, which may already exist. So an environment
-// that asks for shared-server mode gets no consent, and the consented call
-// runs with BD_DOLT_SHARED_SERVER=false so a config.yaml setting cannot turn
-// the mode back on.
+// bd reads the consent once for the whole process, so every database that
+// process opens must be the created one: the preflight opens the database
+// metadata.json (or BEADS_DOLT_SERVER_DATABASE) names, not --database, and
+// shared-server mode also opens beads_global. So a mismatch there, or an
+// environment that asks for shared-server mode, gets no consent, and the
+// consented call runs with BD_DOLT_SHARED_SERVER=false so a config.yaml
+// setting cannot turn the mode back on. The checkpoint retry after a dirty
+// partial schema gets the same consent as the first attempt.
 //
 // The fake bd below behaves like the real one on the half-migrated database:
 // it refuses without consent and succeeds with it. It records
 // "<BD_ALLOW_REMOTE_MIGRATE>/<BD_DOLT_SHARED_SERVER>" for every init call.
 func TestGcBeadsBdInitConsentsToMigrateOnlyADatabaseItCreated(t *testing.T) {
+	// The #4566 wording gc-beads-bd.sh matches to checkpoint a partial schema.
+	const dirtyRefusal = "Error: failed to initialize schema: schema migration: pending schema migrations alter pre-existing dirty tables: issues; run 'bd dolt commit' to commit the working set at the current schema, then re-run the migration (gastownhall/beads#4566)"
 	const refusal = "refusing to auto-apply 20 pending schema migrations to a shared server database (v46 -> v66): migrating would lock out every co-resident bd client still on the old schema (#5920)"
 
 	tests := []struct {
 		name                string
 		databasePreexisting bool
+		backingStoreOnly    bool
+		metadataDatabase    string
+		firstInitDirty      bool
 		env                 []string
 		wantSuccess         bool
 		wantConsent         string
@@ -66,6 +74,27 @@ func TestGcBeadsBdInitConsentsToMigrateOnlyADatabaseItCreated(t *testing.T) {
 			env:         []string{"BD_DOLT_SHARED_SERVER=t"},
 			wantConsent: "unset/t",
 		},
+		{
+			name:             "metadata naming another database gets no consent",
+			metadataDatabase: "old",
+			wantConsent:      "unset/unset",
+		},
+		{
+			name:        "BEADS_DOLT_SERVER_DATABASE naming another database gets no consent",
+			env:         []string{"BEADS_DOLT_SERVER_DATABASE=old"},
+			wantConsent: "unset/unset",
+		},
+		{
+			name:             "adopted backing store is not a created database",
+			backingStoreOnly: true,
+			wantConsent:      "unset/unset",
+		},
+		{
+			name:           "checkpoint retry after a dirty partial schema keeps the consent",
+			firstInitDirty: true,
+			wantSuccess:    true,
+			wantConsent:    "1/false",
+		},
 	}
 
 	for _, tt := range tests {
@@ -79,8 +108,12 @@ func TestGcBeadsBdInitConsentsToMigrateOnlyADatabaseItCreated(t *testing.T) {
 			}
 			// gc pre-seeds metadata.json before it calls the script, so even a
 			// brand-new database takes the existing-metadata branch.
+			metadataDatabase := tt.metadataDatabase
+			if metadataDatabase == "" {
+				metadataDatabase = "hq"
+			}
 			if err := os.WriteFile(filepath.Join(cityPath, ".beads", "metadata.json"),
-				[]byte(`{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"hq"}`), 0o644); err != nil {
+				[]byte(`{"database":"dolt","backend":"dolt","dolt_mode":"server","dolt_database":"`+metadataDatabase+`"}`), 0o644); err != nil {
 				t.Fatal(err)
 			}
 
@@ -93,6 +126,7 @@ func TestGcBeadsBdInitConsentsToMigrateOnlyADatabaseItCreated(t *testing.T) {
 
 			stateDir := t.TempDir()
 			consentFile := filepath.Join(stateDir, "bd-init-consent")
+			dirtyOnceFile := filepath.Join(stateDir, "first-init-dirty")
 			schemaReadyFile := filepath.Join(stateDir, "schema-ready")
 			databaseFile := filepath.Join(stateDir, "database-exists")
 			dataDir := filepath.Join(stateDir, "dolt-data")
@@ -103,7 +137,14 @@ func TestGcBeadsBdInitConsentsToMigrateOnlyADatabaseItCreated(t *testing.T) {
 				if err := os.WriteFile(databaseFile, nil, 0o600); err != nil {
 					t.Fatal(err)
 				}
+			}
+			if tt.databasePreexisting || tt.backingStoreOnly {
 				if err := os.MkdirAll(filepath.Join(dataDir, "hq"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tt.firstInitDirty {
+				if err := os.WriteFile(dirtyOnceFile, nil, 0o600); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -117,6 +158,11 @@ case "${1:-}" in
     ;;
   init)
     printf '%%s/%%s\n' "${BD_ALLOW_REMOTE_MIGRATE:-unset}" "${BD_DOLT_SHARED_SERVER:-unset}" >> %q
+    if [ -f %q ]; then
+      rm -f %q
+      printf '%%s\n' %q >&2
+      exit 1
+    fi
     if [ "${BD_ALLOW_REMOTE_MIGRATE:-}" != 1 ]; then
       printf '%%s\n' %q >&2
       exit 1
@@ -128,7 +174,7 @@ case "${1:-}" in
     exit 0
     ;;
 esac
-`, consentFile, refusal, schemaReadyFile)
+`, consentFile, dirtyOnceFile, dirtyOnceFile, dirtyRefusal, refusal, schemaReadyFile)
 			if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(fakeBd), 0o755); err != nil {
 				t.Fatal(err)
 			}
@@ -156,6 +202,9 @@ case "$query" in
     ;;
   *information_schema.tables*)
     printf 'cnt\n0\n'
+    ;;
+  *'FROM dolt_status'*)
+    printf 'table_name\nissues\n'
     ;;
   *'FROM config'*)
     [ -f %q ]

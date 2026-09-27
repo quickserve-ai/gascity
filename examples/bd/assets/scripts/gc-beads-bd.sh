@@ -2832,19 +2832,33 @@ EOF
 # migration for a co-resident client's and refuses it (#5920), so init dies on
 # a store nobody else has seen. Creating the database is consent to its
 # schema. A database that already existed may have clients on an older bd,
-# which is what the refusal protects, so it never gets consent here. Call it
-# only inside the subshell that runs bd, so the consent cannot leak into the
-# rest of this script.
+# which is what the refusal protects, so this script never grants it consent
+# (an operator who exports BD_ALLOW_REMOTE_MIGRATE themselves still reaches
+# every init). Call it only inside the subshell that runs bd init
+# --reinit-local, so the consent cannot leak into the rest of this script; a
+# plain init has no preflight, and there consent would also unlock migrating
+# a remote-backed clone.
 #
-# bd reads the consent once for the whole process. In bd's shared-server mode,
-# init also opens beads_global, a database that may already exist, and the
-# consent would reach it too. So an environment that asks for shared-server
-# mode (BEADS_DOLT_SHARED_SERVER as bd's IsSharedServerMode reads it, or
-# BD_DOLT_SHARED_SERVER as bd's config reads a bool) gets no consent, and in
-# every other case the consented call runs with BD_DOLT_SHARED_SERVER=false,
-# which outranks a dolt.shared-server line in bd's config.yaml.
+# bd reads the consent once for the whole process, so every database that
+# process opens must be the one created here:
+# - the preflight opens BEADS_DOLT_SERVER_DATABASE if set, else the database
+#   metadata.json names (not --database), so both must name this database;
+# - bd's shared-server mode also opens beads_global, which may already exist.
+#   An environment that asks for that mode (BEADS_DOLT_SHARED_SERVER as bd's
+#   IsSharedServerMode reads it, BD_DOLT_SHARED_SERVER as bd's config reads a
+#   bool) gets no consent, and the consented call runs with
+#   BD_DOLT_SHARED_SERVER=false, which outranks a dolt.shared-server line in
+#   bd's config.yaml. A gc city never sets that line; if one did, this call
+#   would also skip the global_* metadata that mode writes.
+# Args: <database_created_for_init> <dir> <dolt_database>
 export_created_database_migrate_consent() {
     [ "${1:-false}" = "true" ] || return 0
+    [ -n "${3:-}" ] || return 0
+    [ "$(read_existing_dolt_database "$2/.beads/metadata.json")" = "$3" ] || return 0
+    case "${BEADS_DOLT_SERVER_DATABASE:-}" in
+        ""|"$3") ;;
+        *) return 0 ;;
+    esac
     case "${BEADS_DOLT_SHARED_SERVER:-}" in
         1|[Tt][Rr][Uu][Ee]) return 0 ;;
     esac
@@ -2865,15 +2879,14 @@ run_bd_init_pinned() {
     local database_created_for_init="${6:-false}"
     local init_output
     if [ "$reinit_local" = "true" ]; then
-        if init_output=$(export_created_database_migrate_consent "$database_created_for_init"
+        if init_output=$(export_created_database_migrate_consent "$database_created_for_init" "$dir" "$dolt_database"
             run_bd_pinned "$dir" init --reinit-local --quiet --server -p "$prefix" --database "$dolt_database" --skip-hooks --skip-agents \
             --server-host "$host" --server-port "$DOLT_PORT" "$dir" 2>&1); then
             [ -z "$init_output" ] || printf '%s\n' "$init_output"
             return 0
         fi
     else
-        if init_output=$(export_created_database_migrate_consent "$database_created_for_init"
-            run_bd_pinned "$dir" init --quiet --server -p "$prefix" --database "$dolt_database" --skip-hooks --skip-agents \
+        if init_output=$(run_bd_pinned "$dir" init --quiet --server -p "$prefix" --database "$dolt_database" --skip-hooks --skip-agents \
             --server-host "$host" --server-port "$DOLT_PORT" "$dir" 2>&1); then
             [ -z "$init_output" ] || printf '%s\n' "$init_output"
             return 0
@@ -2906,7 +2919,7 @@ run_bd_init_pinned() {
     echo "warning: bd init left a dirty partial schema; checkpointing and retrying" >&2
     checkpoint_partial_bd_init_schema "$dolt_database" || die "failed to checkpoint partial bd init schema for $dolt_database"
     (
-        export_created_database_migrate_consent "$database_created_for_init"
+        export_created_database_migrate_consent "$database_created_for_init" "$dir" "$dolt_database"
         run_bd_pinned "$dir" init --reinit-local --quiet --server -p "$prefix" --database "$dolt_database" --skip-hooks --skip-agents \
             --server-host "$host" --server-port "$DOLT_PORT" "$dir"
     ) || die "bd init retry failed for $dir"
