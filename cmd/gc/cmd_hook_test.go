@@ -1681,6 +1681,11 @@ case "$*" in
   *"show --json hw-claim"*)
     printf '[{"id":"hw-claim","status":"in_progress","assignee":"%%s","metadata":{"gc.routed_to":"worker","gc.root_bead_id":"root-1","gc.continuation_group":"body"}}]' "${BEADS_ACTOR:-}"
     ;;
+  *"show --json root-1"*)
+    # The molecule root the steps name. The claim path reads it (closed-root
+    # guard, qc-z0fmn0n); an open root is served exactly as before.
+    printf '[{"id":"root-1","status":"open","issue_type":"task","metadata":{"gc.kind":"workflow"}}]'
+    ;;
   *"list --json --status=open"*"gc.continuation_group=body"*"gc.root_bead_id=root-1"*)
     printf '[{"id":"hw-claim","status":"open","metadata":{"gc.routed_to":"worker","gc.root_bead_id":"root-1","gc.continuation_group":"body"}},{"id":"hw-next","status":"open","metadata":{"gc.routed_to":"worker","gc.root_bead_id":"root-1","gc.continuation_group":"body"}},{"id":"hw-other","status":"open","metadata":{"gc.routed_to":"other","gc.root_bead_id":"root-1","gc.continuation_group":"body"}}]'
     ;;
@@ -1739,6 +1744,12 @@ esac
 	}
 	if !strings.Contains(logText, "actor=worker-1 args=show --json hw-claim") {
 		t.Fatalf("bd canonical read did not use BEADS_ACTOR=worker-1; log:\n%s", logText)
+	}
+	// The production entry point armed the closed-root guard (qc-z0fmn0n): the
+	// step's molecule root was read through the claim's bd context. Deleting
+	// withClosedRootGuard from claimHookWork makes this fail.
+	if !strings.Contains(logText, "args=show --json root-1") {
+		t.Fatalf("the closed-root guard never read the step's root root-1; log:\n%s", logText)
 	}
 	// The claim itself is actored and assigned as worker-1 (the alias read paths
 	// query through GC_AGENT), but the continuation pin is a session binding: the

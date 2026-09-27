@@ -249,6 +249,12 @@ const (
 	// either: a routed row the controller keeps counting while nobody can take it
 	// is worth seeing on its own.
 	DemandClaimBlocked = "blocked"
+	// DemandClaimClosedRoot: the trigger row is a step of a molecule whose root
+	// the claim path observed closed, outside that root's teardown tail, so the
+	// closed-root guard declined it (qc-z0fmn0n). Dead work the controller is
+	// still counting: not a divergence, and not folded into benign either, so
+	// the spawn-then-drain churn it causes stays visible.
+	DemandClaimClosedRoot = "closed_root"
 	// DemandClaimUnknown: the classification read could not be made (no trigger
 	// recorded, or the row could not be read). Never counted as either.
 	DemandClaimUnknown = "unknown"
@@ -275,7 +281,7 @@ type SessionDemandClaimDivergencePayload struct {
 	// ("open"/"in_progress"/"closed"), "unreadable" when the classification read
 	// failed, or empty when there was no row to read.
 	TriggerStatusAtDrain string `json:"trigger_status_at_drain,omitempty"`
-	// Classification is the verdict: benign, divergence, blocked, or unknown. It
+	// Classification is the verdict: benign, divergence, blocked, closed_root, or unknown. It
 	// is carried rather than left to be re-derived, because the divergence count
 	// IS the rollout metric for the agreement fix.
 	Classification string `json:"classification"`
