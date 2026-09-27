@@ -68,20 +68,34 @@ func TestPushSuitePolicyHonoursThePolicyDirOverride(t *testing.T) {
 	}
 }
 
-// The hook must consult the policy BEFORE it hands off to the suite, and only
-// exit 3 may skip: any other policy failure still runs the suite.
-func TestPrePushConsultsThePolicyBeforeTheSuite(t *testing.T) {
-	data, err := os.ReadFile(filepath.Join(repoRoot(t), ".githooks", "pre-push"))
-	if err != nil {
-		t.Fatal(err)
+// The real hook, run in the pre-push fixture: on a CI-only host the suite is
+// never reached and the push is not refused.
+func TestPrePushSkipsTheSuiteOnACIOnlyHost(t *testing.T) {
+	f := newPrePushFixture(t)
+	writeCIOnlyMarker(t, f.policyDir, "fixture ruling\n")
+	code, out := f.run(t, "refs/heads/main "+f.commitNew+" refs/heads/main "+f.commitOld+"\n")
+	if code != 0 {
+		t.Fatalf("pre-push exit = %d, want 0 (skip is not a refusal)\n%s", code, out)
 	}
-	hook := string(data)
-	policy := strings.Index(hook, "push-suite-policy.sh")
-	suite := strings.Index(hook, "exec make test-fast-parallel")
-	if policy < 0 || suite < 0 || policy > suite {
-		t.Fatalf("pre-push must call push-suite-policy.sh before exec make test-fast-parallel (policy at %d, suite at %d)", policy, suite)
+	if got := f.read(t, f.makeRuns); got != "" {
+		t.Fatalf("suite reached on a CI-only host (make invocations = %q)", got)
 	}
-	if !strings.Contains(hook, `if [ "$policy_rc" -eq 3 ]; then`) {
-		t.Fatal("pre-push must skip the suite only on policy exit 3")
+	if !strings.Contains(out, "SKIPPED") || !strings.Contains(out, "fixture ruling") {
+		t.Fatalf("skip is silent or lacks the reason:\n%s", out)
+	}
+}
+
+// A policy script that fails for any reason other than exit 3 must not disable
+// the suite: the hook runs it as before.
+func TestPrePushRunsTheSuiteWhenThePolicyFails(t *testing.T) {
+	f := newPrePushFixture(t)
+	writeCIOnlyMarker(t, f.policyDir, "")
+	writeExecutable(t, filepath.Join(f.repo, pushSuitePolicyPath), "#!/usr/bin/env bash\nexit 1\n")
+	code, out := f.run(t, "refs/heads/main "+f.commitNew+" refs/heads/main "+f.commitOld+"\n")
+	if code != 0 {
+		t.Fatalf("pre-push exit = %d, want 0\n%s", code, out)
+	}
+	if got := f.read(t, f.makeRuns); !strings.Contains(got, "test-fast-parallel") {
+		t.Fatalf("a failing policy disabled the suite (make invocations = %q)", got)
 	}
 }
