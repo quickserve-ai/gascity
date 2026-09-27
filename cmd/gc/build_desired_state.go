@@ -1781,7 +1781,7 @@ func collectAssignedWorkBeadsWithStores(
 			// bead captured here is not counted as demand regardless:
 			// appendOpenRoutedWorkUnique never markReadyAssigned (see the
 			// skipReadyAssignees note below), and releaseOrphanedPoolAssignments'
-			// own live re-read (liveWorkAssignmentStillReleasable) skips it.
+			// own live re-read (liveWorkRowStillReleasable) skips it.
 			start = pass.now()
 			openRouted, err := reads.Cached(source.store, beads.ListQuery{Status: "open"})
 			pass.read(read("list_open", demandReadTierCached), start, len(openRouted), err)
