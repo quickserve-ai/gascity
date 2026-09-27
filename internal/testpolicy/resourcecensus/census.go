@@ -399,6 +399,17 @@ var bootstrapPolicy = Ledger{
 			Expires:         "2026-10-31",
 		},
 		{
+			PackageDir:      "cmd/gc",
+			PackageName:     "main",
+			Owner:           "TestGcBeadsBdInitConsentsToMigrateOnlyADatabaseItCreated",
+			Resources:       []Resource{ResourceSubprocess},
+			OwnerBead:       "ga-zyvj2k",
+			Invariant:       "the created-database migrate-consent proof is a checked Medium subprocess owner",
+			ResourceOwner:   "the test executes the shipped provider script once per case with a test-owned bd, dolt and sleep on PATH and a scope built from files alone, so no Dolt, no bd and no host service are involved",
+			MigrationTarget: "P0.4b",
+			Expires:         "2026-10-01",
+		},
+		{
 			PackageDir:      "internal/runtime/herdr",
 			PackageName:     "herdr",
 			Owner:           "TestServerAliveRejectsStaleSocket",
