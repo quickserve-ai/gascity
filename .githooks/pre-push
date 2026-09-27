@@ -67,6 +67,15 @@ if [ "$go_changed" -eq 0 ]; then
   exit 0
 fi
 
+# A host that runs full test suites in CI only skips the suite here (exit 3
+# from the policy; ga-wirl8l.2). Any other policy failure runs the suite as
+# before, so a broken policy script never silently disables it.
+policy_rc=0
+"$repo_root/.githooks/lib/push-suite-policy.sh" || policy_rc=$?
+if [ "$policy_rc" -eq 3 ]; then
+  exit 0
+fi
+
 # The Makefile and direct sharded runner share scripts/test-local-job-count as
 # their default policy. Do not shadow it here; an explicit override still wins.
 exec make test-fast-parallel
