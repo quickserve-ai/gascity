@@ -1681,6 +1681,11 @@ case "$*" in
   *"show --json hw-claim"*)
     printf '[{"id":"hw-claim","status":"in_progress","assignee":"%%s","metadata":{"gc.routed_to":"worker","gc.root_bead_id":"root-1","gc.continuation_group":"body"}}]' "${BEADS_ACTOR:-}"
     ;;
+  *"show --json root-1"*)
+    # The molecule root the steps name. The claim path reads it (closed-root
+    # guard, qc-z0fmn0n); an open root is served exactly as before.
+    printf '[{"id":"root-1","status":"open","issue_type":"task","metadata":{"gc.kind":"workflow"}}]'
+    ;;
   *"list --json --status=open"*"gc.continuation_group=body"*"gc.root_bead_id=root-1"*)
     printf '[{"id":"hw-claim","status":"open","metadata":{"gc.routed_to":"worker","gc.root_bead_id":"root-1","gc.continuation_group":"body"}},{"id":"hw-next","status":"open","metadata":{"gc.routed_to":"worker","gc.root_bead_id":"root-1","gc.continuation_group":"body"}},{"id":"hw-other","status":"open","metadata":{"gc.routed_to":"other","gc.root_bead_id":"root-1","gc.continuation_group":"body"}}]'
     ;;

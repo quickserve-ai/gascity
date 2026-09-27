@@ -255,6 +255,14 @@ type hookClaimOps struct {
 	// ReadWorkMeta is the post-stamp authoritative readback used only to
 	// establish the durable lifecycle-start emission point.
 	ReadWorkMeta func(context.Context, string, []string, string, string) (beads.Bead, error)
+	// ReadRoot reads a candidate step's molecule root (gc.root_bead_id) for the
+	// closed-root guard (qc-z0fmn0n). Nil disables the guard; the production
+	// entry point arms it through ReadWorkMeta (withClosedRootGuard), so the
+	// root is resolved through the same class-routed read seam as the claim.
+	ReadRoot func(context.Context, string, []string, string, string) (beads.Bead, error)
+	// rootGate is the per-claim-attempt closed-root cache tryHookClaim builds
+	// from ReadRoot. Nil (no ReadRoot, or a tier driven directly) never skips.
+	rootGate *hookClosedRootGate
 	// ConfirmBlocked re-derives whether a bead is really blocked, from its live
 	// dependencies rather than bd's denormalized is_blocked projection (which
 	// production reads do not carry). Diagnostics-only: the demand/claim
@@ -524,6 +532,13 @@ func tryHookClaim(workQuery, dir string, opts *hookClaimOptions, ops *hookClaimO
 		// recovery command restampHookAdoption printed.
 	}
 
+	// Closed-root guard (qc-z0fmn0n): both tiers below mint a claim, and
+	// neither may serve a step whose molecule root is closed or absent. One
+	// gate per attempt caches each root's verdict, and the skip is reported
+	// once per root whichever way the attempt ends.
+	ops.rootGate = newHookClosedRootGate(*ops, *opts, dir, stderr)
+	defer ops.rootGate.report()
+
 	readyResult := claimFirstReadyHookAssignment(candidates, *opts, *ops, dir, stdout, stderr)
 	if readyResult.terminal {
 		return readyResult
@@ -747,7 +762,8 @@ func claimFirstReadyHookAssignment(candidates []beads.Bead, opts hookClaimOption
 			hookClaimCandidateIsMessage(candidate) ||
 			!strings.EqualFold(strings.TrimSpace(candidate.Status), "open") ||
 			!hookClaimHasIdentity(candidate.Assignee, opts.IdentityCandidates) ||
-			hookCandidateBudgetDeferred(candidate, now) {
+			hookCandidateBudgetDeferred(candidate, now) ||
+			ops.rootGate.skip(candidate) {
 			continue
 		}
 		// F-B. Promoting a ready assignment is a status CAS — a mutation — so it
@@ -895,6 +911,12 @@ func claimFirstEligibleHookCandidate(candidates []beads.Bead, opts hookClaimOpti
 				continue
 			}
 			reclaim = true
+		}
+		// A step whose molecule root is closed or absent is not served
+		// (qc-z0fmn0n). Like the declines below it mutates nothing, so it runs
+		// before either the reclaim or the claim.
+		if ops.rootGate.skip(candidate) {
+			continue
 		}
 		// The two declines below mutate nothing, so they run before EITHER
 		// mutation — the reclaim as much as the claim. A reclaim is itself a
