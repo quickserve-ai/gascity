@@ -6,6 +6,7 @@ import (
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/gastownhall/gascity/internal/api/apierr"
+	"github.com/gastownhall/gascity/internal/mail"
 	"github.com/gastownhall/gascity/internal/runtime"
 )
 
@@ -221,13 +222,32 @@ func (sm *SupervisorMux) registerCityRoutes() {
 	// enumerates the error statuses it can return (Huma adds auto 422/500);
 	// mutations declare 403 for the CSRF/read-only middleware.
 	cityGet(sm, "/mail", (*Server).humaHandleMailList, errorStatuses(http.StatusBadRequest, http.StatusNotFound, http.StatusServiceUnavailable), listOrder("(created_at DESC, id DESC) — newest messages first"))
+	// send-mail and reply-mail answer 201 for a write read back from storage
+	// and 202 for an UNCONFIRMED one: the store reported it created but the
+	// read-back did not complete, so the message may or may not have landed
+	// (ga-nee27h). A LOST write (verified absent) stays a 500. Both success
+	// codes carry the same Message schema. The explicit 202 entry does not
+	// cost the default error response the way create-rig's union does:
+	// these ops declare Errors, which Huma documents regardless.
+	mailMessageRef := sm.humaAPI.OpenAPI().Components.Schemas.Schema(
+		reflect.TypeOf(mail.Message{}), true, "Message")
+	mailUnconfirmedResponse := func(verb string) map[string]*huma.Response {
+		return map[string]*huma.Response{
+			"202": {
+				Description: "Delivery unconfirmed: the store reported the " + verb + " created but it could not be read back, so it may or may not have landed. The body carries its id; check storage for that id before re-sending (a blind re-send may duplicate it). A retry with the same Idempotency-Key replays this 202 without writing again.",
+				Content:     map[string]*huma.MediaType{"application/json": {Schema: mailMessageRef}},
+			},
+		}
+	}
 	cityRegister(sm, huma.Operation{
 		OperationID:   "send-mail",
 		Method:        http.MethodPost,
 		Path:          "/mail",
 		Summary:       "Send a mail message",
+		Description:   "Send a mail message. Returns 201 with the stored message, or 202 when the write is unconfirmed (see the 202 response). A message verified NOT stored is a 500; re-send it.",
 		DefaultStatus: http.StatusCreated,
 		Errors:        []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusConflict},
+		Responses:     mailUnconfirmedResponse("message"),
 	}, (*Server).humaHandleMailSend)
 	cityGet(sm, "/mail/count", (*Server).humaHandleMailCount, errorStatuses(http.StatusNotFound, http.StatusServiceUnavailable))
 	cityGet(sm, "/mail/thread/{id}", (*Server).humaHandleMailThread, errorStatuses(http.StatusNotFound, http.StatusServiceUnavailable))
@@ -240,9 +260,11 @@ func (sm *SupervisorMux) registerCityRoutes() {
 		Method:        http.MethodPost,
 		Path:          "/mail/{id}/reply",
 		Summary:       "Reply to a mail message",
+		Description:   "Reply to a mail message. Returns 201 with the stored reply, or 202 when the write is unconfirmed (see the 202 response). A reply verified NOT stored is a 500; re-send it.",
 		DefaultStatus: http.StatusCreated,
 		// 409: a concurrent repeat of the same Idempotency-Key (idempotency-in-flight).
-		Errors: []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusConflict},
+		Errors:    []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound, http.StatusConflict},
+		Responses: mailUnconfirmedResponse("reply"),
 	}, (*Server).humaHandleMailReply)
 	cityDelete(sm, "/mail/{id}", (*Server).humaHandleMailDelete, errorStatuses(http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound))
 

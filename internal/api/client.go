@@ -1375,10 +1375,29 @@ func (c *Client) SendMail(req MailSendRequest) (mail.Message, error) {
 	if err := apiErrorFromResponse(resp.StatusCode(), pdOf(resp)); err != nil {
 		return mail.Message{}, err
 	}
+	if resp.JSON202 != nil {
+		return mailUnconfirmedFromGen(*resp.JSON202)
+	}
 	if resp.JSON201 == nil {
 		return mail.Message{}, fmt.Errorf("API returned %d with no body", resp.StatusCode())
 	}
 	return mailMessageFromGen(*resp.JSON201), nil
+}
+
+// errMailAcceptedUnconfirmed is the cause a 202 from send-mail or reply-mail
+// carries: the server's store reported the write created but it could not be
+// read back.
+var errMailAcceptedUnconfirmed = errors.New("server answered 202: the write was reported created but could not be read back")
+
+// mailUnconfirmedFromGen turns a 202 (UNCONFIRMED write) into the same error
+// shape a local provider returns for one: a *mail.DeliveryUnconfirmedError
+// naming the message ID, so a caller can tell "check before re-sending" from
+// "re-send" (ga-nee27h). The message is returned too, for callers that want
+// the ID without unwrapping the error.
+func mailUnconfirmedFromGen(g genclient.Message) (mail.Message, error) {
+	m := mailMessageFromGen(g)
+	return m, fmt.Errorf("delivery unconfirmed: message %s may have landed; check storage with \"GC_NO_API=1 gc mail peek %s\" on the serving city before re-sending (a blind re-send may duplicate it): %w",
+		m.ID, m.ID, &mail.DeliveryUnconfirmedError{ID: m.ID, Cause: errMailAcceptedUnconfirmed})
 }
 
 // MailReplyRequest carries the parameters of a mail reply for Client.ReplyMail.
@@ -1413,6 +1432,9 @@ func (c *Client) ReplyMail(id string, req MailReplyRequest) (mail.Message, error
 	}
 	if err := apiErrorFromResponse(resp.StatusCode(), pdOf(resp)); err != nil {
 		return mail.Message{}, err
+	}
+	if resp.JSON202 != nil {
+		return mailUnconfirmedFromGen(*resp.JSON202)
 	}
 	if resp.JSON201 == nil {
 		return mail.Message{}, fmt.Errorf("API returned %d with no body", resp.StatusCode())
