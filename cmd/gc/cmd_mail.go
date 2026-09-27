@@ -152,8 +152,9 @@ const (
 // a degraded notice; the injection and its archive side effects happen on the
 // local path after it.
 //
-// It is deliberately independent of the mail read deadlines (25s server
-// defaultMailReadDeadline, 30s client mailReadClientTimeout, ga-x49mfh). Those
+// It is deliberately independent of the mail read deadlines (by default 25s on
+// the server and 30s on the client, both set by [mail] read_timeout; ga-x49mfh,
+// pl-lzd). Those
 // are sized so a slow store reaches `gc mail check`, `gc mail inbox` and the
 // pollers as a typed store_slow error, and both exceed the whole hook: a probe
 // that inherited them held the hook until it was killed, stalling prompt
@@ -758,12 +759,7 @@ func cmdMailCheckWithFormat(args []string, inject bool, hookFormat string, stdou
 // or (nil, reason) when the caller should fall back. Indirected through a
 // var so tests inject a client pointed at httptest.Server or force a
 // specific fallback reason without spinning up a real controller.
-var mailCheckAPIClient = func(cityPath string) (*api.Client, string) {
-	if c := apiClient(cityPath); c != nil {
-		return c, ""
-	}
-	return nil, apiClientFallbackReason(cityPath)
-}
+var mailCheckAPIClient = mailReadAPIClient
 
 // routeMailCheck dispatches non-injecting `mail check` to the supervisor API
 // when a controller is up; otherwise falls back to the local mail-provider path.
@@ -2855,12 +2851,7 @@ func cmdMailPeekWithJSON(args []string, jsonOut bool, stdout, stderr io.Writer) 
 // mailPeekAPIClient returns (client, "") when the API path is available,
 // or (nil, reason) when the caller should fall back. Indirected through a
 // var so tests inject a client pointed at httptest.Server.
-var mailPeekAPIClient = func(cityPath string) (*api.Client, string) {
-	if c := apiClient(cityPath); c != nil {
-		return c, ""
-	}
-	return nil, apiClientFallbackReason(cityPath)
-}
+var mailPeekAPIClient = mailReadAPIClient
 
 // routeMailPeek dispatches `mail peek` to the supervisor API when a
 // controller is up; otherwise falls back to the local mail-provider path.
@@ -3411,12 +3402,7 @@ func cmdMailCountWithJSON(args []string, jsonOut bool, stdout, stderr io.Writer)
 // mailCountAPIClient returns (client, "") when the API path is available,
 // or (nil, reason) when the caller should fall back. Indirected through a
 // var so tests inject a client pointed at httptest.Server.
-var mailCountAPIClient = func(cityPath string) (*api.Client, string) {
-	if c := apiClient(cityPath); c != nil {
-		return c, ""
-	}
-	return nil, apiClientFallbackReason(cityPath)
-}
+var mailCountAPIClient = mailReadAPIClient
 
 // routeMailCount dispatches `mail count` to the supervisor API when a
 // controller is up; otherwise falls back to the local mail-provider path.

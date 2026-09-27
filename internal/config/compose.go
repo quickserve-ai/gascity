@@ -802,6 +802,9 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 	if err := ValidateMailCrossCity(root, cityRoot); err != nil {
 		return nil, nil, err
 	}
+	if err := ValidateMailReadTimeout(root, path); err != nil {
+		return nil, nil, err
+	}
 
 	// Validate cross-entity semantic constraints.
 	if !opts.AllowMissingProviderReferences {

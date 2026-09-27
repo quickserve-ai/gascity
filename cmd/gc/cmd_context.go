@@ -94,6 +94,7 @@ remote city name (defaults to <name>). At most one credential technique applies:
 	f.StringVar(&c.TLSServerName, "tls-server-name", "", "override the TLS SNI / certificate name")
 	f.BoolVar(&c.InsecureSkipVerify, "insecure-skip-verify", false, "skip TLS verification (dev only)")
 	f.StringVar(&c.Timeout, "timeout", "", "REST request timeout, e.g. 120s (never applied to SSE streams)")
+	f.StringVar(&c.MailReadTimeout, "mail-read-timeout", "", "budget for one mail read, e.g. 55s; set it above the remote city's [mail] read_timeout minus 5s (default 30s)")
 	return cmd
 }
 
@@ -320,6 +321,9 @@ func doContextShow(name string, jsonOut bool, stdout, stderr io.Writer) int {
 	}
 	if c.Timeout != "" {
 		fmt.Fprintf(tw, "timeout:\t%s\n", c.Timeout) //nolint:errcheck
+	}
+	if c.MailReadTimeout != "" {
+		fmt.Fprintf(tw, "mail_read_timeout:\t%s\n", c.MailReadTimeout) //nolint:errcheck
 	}
 	tw.Flush() //nolint:errcheck
 	return 0

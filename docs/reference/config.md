@@ -547,6 +547,7 @@ MailConfig holds mail provider settings.
 |-------|------|----------|---------|-------------|
 | `provider` | string |  |  | Provider selects the mail backend: "fake", "fail", "exec:&lt;script&gt;", or "" (default: beadmail). |
 | `retention_ttl` | string |  |  | RetentionTTL has two consumers: it is how long read messages are retained before purge, and how long a read mail bead stays open before the nudge-mail sweep closes it. Empty or "0" disables read-message purge. The sweep distinguishes the two: empty leaves it at its own 60-minute default, while "0" disables its mail-close phase. |
+| `read_timeout` | string |  | `30s` | ReadTimeout is how long a client waits for one mail read through the API (a Go duration, default 30s, at most 60s). The server's own deadline for the store read behind it is derived from this value, 5s shorter, so its typed store_slow answer arrives first. Raise it when a slow mail store makes reads time out; a client reaching this city through a named context sets that context's mail_read_timeout to match. |
 | `crosscity` | MailCrossCityConfig |  |  | CrossCity enables city-qualified mail addressing (&lt;city&gt;/&lt;address&gt;). Absent means disabled: every recipient resolves exactly as today. |
 
 ## MailCrossCityConfig

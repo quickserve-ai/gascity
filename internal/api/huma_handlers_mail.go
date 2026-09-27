@@ -11,23 +11,32 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/api/apierr"
+	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/mail"
 	"github.com/gastownhall/gascity/internal/mail/beadmail"
 	"github.com/gastownhall/gascity/internal/telemetry"
 )
 
-// defaultMailReadDeadline bounds a mail store read on the server (list, get,
-// count, thread). It must stay strictly shorter than mailReadClientTimeout
-// (25s vs 30s) so a typed store_slow problem detail reaches the CLI before the
-// client gives up on the transport; TestMailReadDeadlineShorterThanClientTimeout
-// enforces the ordering. It was 8s until ga-x49mfh: a hub's mail list query
-// measured 7.4-8.4s over the API on 2026-09-15/16, so 8s failed ~92% of
-// cross-town mailbox reads (~1,400 of ~1,530) with store_slow.
-const defaultMailReadDeadline = 25 * time.Second
+// mailReadDeadlineOverride, when positive, replaces the configured server
+// deadline for mail store reads; tests shorten it.
+var mailReadDeadlineOverride time.Duration
 
-// mailReadDeadline is the live server deadline; tests shorten it.
-var mailReadDeadline = defaultMailReadDeadline
+// mailReadDeadline bounds a mail store read on the server (list, get, count,
+// thread). It is derived from the city's [mail] read_timeout, the client's
+// budget for the whole request, minus config.MailReadDeadlineMargin, so a
+// typed store_slow problem detail reaches the CLI before the client gives up
+// on the transport (pl-lzd; 25s by default, ga-x49mfh).
+func (s *Server) mailReadDeadline() time.Duration {
+	if mailReadDeadlineOverride > 0 {
+		return mailReadDeadlineOverride
+	}
+	cfg := s.state.Config()
+	if cfg == nil {
+		return config.MailConfig{}.ReadDeadline()
+	}
+	return cfg.Mail.ReadDeadline()
+}
 
 type mailReadTimeoutError struct {
 	d time.Duration
@@ -63,9 +72,8 @@ type mailProviderReadResult[T any] struct {
 // no context parameter. If the deadline fires, the provider goroutine may keep
 // running until the store call returns; its result is discarded through the
 // buffered channel.
-func withMailReadDeadline[T any](ctx context.Context, fn func() (T, error)) (T, error) {
+func withMailReadDeadline[T any](ctx context.Context, deadline time.Duration, fn func() (T, error)) (T, error) {
 	var zero T
-	deadline := mailReadDeadline
 	if deadline <= 0 {
 		return fn()
 	}
@@ -93,7 +101,7 @@ func withMailReadDeadline[T any](ctx context.Context, fn func() (T, error)) (T, 
 
 // withMailProviderReadDeadline runs aggregate provider reads under one shared
 // deadline, keeping all-rig API responses inside the API client's timeout.
-func withMailProviderReadDeadline[T any](ctx context.Context, providers map[string]mail.Provider, fn func(mail.Provider) (T, error)) []mailProviderReadResult[T] {
+func withMailProviderReadDeadline[T any](ctx context.Context, deadline time.Duration, providers map[string]mail.Provider, fn func(mail.Provider) (T, error)) []mailProviderReadResult[T] {
 	names := sortedProviderNames(providers)
 	if len(names) == 0 {
 		return nil
@@ -120,7 +128,6 @@ func withMailProviderReadDeadline[T any](ctx context.Context, providers map[stri
 		pending[name] = struct{}{}
 	}
 
-	deadline := mailReadDeadline
 	var timer *time.Timer
 	var timeout <-chan time.Time
 	if deadline > 0 {
@@ -242,7 +249,7 @@ func (s *Server) humaHandleMailList(ctx context.Context, input *MailListInput) (
 					Body:      MailListBody{Items: []mail.Message{}, Total: 0},
 				}, nil
 			}
-			msgs, err := withMailReadDeadline(ctx, func() ([]mail.Message, error) {
+			msgs, err := withMailReadDeadline(ctx, s.mailReadDeadline(), func() ([]mail.Message, error) {
 				return mailInboxForRecipients(mp, agents)
 			})
 			if err != nil {
@@ -263,7 +270,7 @@ func (s *Server) humaHandleMailList(ctx context.Context, input *MailListInput) (
 		var allMsgs []mail.Message
 		var partialErrs []string
 		partialStoreSlow := false
-		for _, res := range withMailProviderReadDeadline(ctx, providers, func(provider mail.Provider) ([]mail.Message, error) {
+		for _, res := range withMailProviderReadDeadline(ctx, s.mailReadDeadline(), providers, func(provider mail.Provider) ([]mail.Message, error) {
 			return mailInboxForRecipients(provider, agents)
 		}) {
 			if res.err != nil {
@@ -296,7 +303,7 @@ func (s *Server) humaHandleMailList(ctx context.Context, input *MailListInput) (
 					Body:      MailListBody{Items: []mail.Message{}, Total: 0},
 				}, nil
 			}
-			msgs, err := withMailReadDeadline(ctx, func() ([]mail.Message, error) {
+			msgs, err := withMailReadDeadline(ctx, s.mailReadDeadline(), func() ([]mail.Message, error) {
 				return mailAllForRecipients(mp, agents)
 			})
 			if err != nil {
@@ -317,7 +324,7 @@ func (s *Server) humaHandleMailList(ctx context.Context, input *MailListInput) (
 		var allMsgs []mail.Message
 		var partialErrs []string
 		partialStoreSlow := false
-		for _, res := range withMailProviderReadDeadline(ctx, providers, func(provider mail.Provider) ([]mail.Message, error) {
+		for _, res := range withMailProviderReadDeadline(ctx, s.mailReadDeadline(), providers, func(provider mail.Provider) ([]mail.Message, error) {
 			return mailAllForRecipients(provider, agents)
 		}) {
 			if res.err != nil {
@@ -353,7 +360,7 @@ func (s *Server) humaHandleMailGet(ctx context.Context, input *MailGetInput) (*I
 	}
 	id := input.ID
 	rig := input.Rig
-	result, err := withMailReadDeadline(ctx, func() (mailGetResult, error) {
+	result, err := withMailReadDeadline(ctx, s.mailReadDeadline(), func() (mailGetResult, error) {
 		mp, resolvedRig, err := s.findMailProviderForMessage(id, rig)
 		if err != nil {
 			return mailGetResult{}, err
@@ -523,7 +530,7 @@ func (s *Server) humaHandleMailCount(ctx context.Context, input *MailCountInput)
 			resp.Body.Unread = 0
 			return resp, nil
 		}
-		counts, err := withMailReadDeadline(ctx, func() (mailReadCounts, error) {
+		counts, err := withMailReadDeadline(ctx, s.mailReadDeadline(), func() (mailReadCounts, error) {
 			total, unread, err := mailCountForRecipients(mp, agents)
 			return mailReadCounts{Total: total, Unread: unread}, err
 		})
@@ -543,7 +550,7 @@ func (s *Server) humaHandleMailCount(ctx context.Context, input *MailCountInput)
 	var totalAll, unreadAll int
 	var partialErrs []string
 	partialStoreSlow := false
-	for _, res := range withMailProviderReadDeadline(ctx, providers, func(provider mail.Provider) (mailReadCounts, error) {
+	for _, res := range withMailProviderReadDeadline(ctx, s.mailReadDeadline(), providers, func(provider mail.Provider) (mailReadCounts, error) {
 		total, unread, err := mailCountForRecipients(provider, agents)
 		return mailReadCounts{Total: total, Unread: unread}, err
 	}) {
@@ -578,7 +585,7 @@ func (s *Server) humaHandleMailThread(ctx context.Context, input *MailThreadInpu
 		if mp == nil {
 			return nil, apierr.RigNotFound.Msg("rig " + rig + " not found")
 		}
-		msgs, err := withMailReadDeadline(ctx, func() ([]mail.Message, error) {
+		msgs, err := withMailReadDeadline(ctx, s.mailReadDeadline(), func() ([]mail.Message, error) {
 			return mp.Thread(threadID)
 		})
 		if err != nil {
@@ -601,7 +608,7 @@ func (s *Server) humaHandleMailThread(ctx context.Context, input *MailThreadInpu
 	var allMsgs []mail.Message
 	var partialErrs []string
 	partialStoreSlow := false
-	for _, res := range withMailProviderReadDeadline(ctx, providers, func(provider mail.Provider) ([]mail.Message, error) {
+	for _, res := range withMailProviderReadDeadline(ctx, s.mailReadDeadline(), providers, func(provider mail.Provider) ([]mail.Message, error) {
 		return provider.Thread(threadID)
 	}) {
 		if res.err != nil {

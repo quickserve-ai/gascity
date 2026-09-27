@@ -17,6 +17,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/api/genclient"
 	"github.com/gastownhall/gascity/internal/citywriteauth"
+	"github.com/gastownhall/gascity/internal/config"
 )
 
 // Remote-client transport budgets. A remote city is reached over a WAN, so the
@@ -89,6 +90,12 @@ type RemoteOptions struct {
 	// RESTTimeout overrides the overall REST timeout; 0 uses remoteRESTTimeout.
 	// It is never applied to the SSE stream client.
 	RESTTimeout time.Duration
+	// MailReadTimeout is the budget for one mail read against the remote city;
+	// 0 uses config.DefaultMailReadTimeout. It should exceed the remote city's
+	// server-side mail read deadline (its [mail] read_timeout minus 5s) so that
+	// city's typed store_slow answer arrives first. The transport's response
+	// header timeout widens to match, and it may not exceed the REST timeout.
+	MailReadTimeout time.Duration
 }
 
 // NewRemoteCityScopedClient builds a client that operates a REMOTE city at
@@ -108,6 +115,8 @@ func NewRemoteCityScopedClient(baseURL, cityName string, opts RemoteOptions) (*C
 		streamClient: stream,
 		tokenSource:  opts.Token,
 		grantSource:  opts.Grant,
+
+		mailReadTimeout: opts.MailReadTimeout,
 	}
 	cw, err := genclient.NewClientWithResponses(
 		baseURL,
@@ -257,6 +266,10 @@ func newRemoteHTTPClients(opts RemoteOptions) (rest, stream *http.Client, err er
 	if err != nil {
 		return nil, nil, err
 	}
+	headerTimeout, err := remoteHeaderTimeout(opts)
+	if err != nil {
+		return nil, nil, err
+	}
 	newTransport := func() *http.Transport {
 		return &http.Transport{
 			Proxy: http.ProxyFromEnvironment,
@@ -266,16 +279,13 @@ func newRemoteHTTPClients(opts RemoteOptions) (rest, stream *http.Client, err er
 			}).DialContext,
 			TLSClientConfig:       tlsCfg,
 			TLSHandshakeTimeout:   remoteTLSHandshakeTimeout,
-			ResponseHeaderTimeout: remoteResponseHeaderTimeout,
+			ResponseHeaderTimeout: headerTimeout,
 			ForceAttemptHTTP2:     true,
 			ExpectContinueTimeout: 1 * time.Second,
 			IdleConnTimeout:       90 * time.Second,
 		}
 	}
-	restTimeout := opts.RESTTimeout
-	if restTimeout <= 0 {
-		restTimeout = remoteRESTTimeout
-	}
+	restTimeout := opts.effectiveRESTTimeout()
 	// Wrap both transports so a 401 triggers one bearer re-mint + retry when a
 	// RefreshToken is supplied (no-op otherwise).
 	wrap := func(base http.RoundTripper) http.RoundTripper {
@@ -295,6 +305,33 @@ func newRemoteHTTPClients(opts RemoteOptions) (rest, stream *http.Client, err er
 		CheckRedirect: remoteCheckRedirect,
 	}
 	return rest, stream, nil
+}
+
+// effectiveRESTTimeout returns RESTTimeout, or remoteRESTTimeout when unset.
+func (o RemoteOptions) effectiveRESTTimeout() time.Duration {
+	if o.RESTTimeout > 0 {
+		return o.RESTTimeout
+	}
+	return remoteRESTTimeout
+}
+
+// remoteHeaderTimeout returns the transport's response header timeout for a
+// remote client: remoteResponseHeaderTimeout, widened to the mail read budget
+// when that is longer, because the server sends no headers until a mail read
+// finishes and a shorter header timeout would cut the read before the remote
+// city's store_slow answer could arrive. An explicit mail read budget longer
+// than the REST timeout is refused: the REST timeout would cut every such read
+// first. An unset budget is never refused, so a context with a short REST
+// timeout keeps working as before.
+func remoteHeaderTimeout(opts RemoteOptions) (time.Duration, error) {
+	mailRead := opts.MailReadTimeout
+	if mailRead <= 0 {
+		return max(remoteResponseHeaderTimeout, config.DefaultMailReadTimeout), nil
+	}
+	if restTimeout := opts.effectiveRESTTimeout(); mailRead > restTimeout {
+		return 0, fmt.Errorf("remote client: mail read timeout %s exceeds the REST timeout %s, which would cut every mail read first", mailRead, restTimeout)
+	}
+	return max(remoteResponseHeaderTimeout, mailRead), nil
 }
 
 // reauthRoundTripper retries one bearer-authenticated, safe, replayable non-SSE
