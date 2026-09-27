@@ -41,7 +41,7 @@ func writeCIOnlyMarker(t *testing.T, dir, reason string) {
 func TestPushSuitePolicyRunsTheSuiteWithoutAMarker(t *testing.T) {
 	code, out := runPushSuitePolicy(t, []string{"HOME=" + t.TempDir()})
 	if code != 0 || out != "" {
-		t.Fatalf("no marker: exit %d, output %q; want 0 and silence (unchanged behaviour)", code, out)
+		t.Fatalf("no marker: exit %d, output %q; want 0 and silence (unchanged behavior)", code, out)
 	}
 }
 
@@ -59,7 +59,7 @@ func TestPushSuitePolicySkipsTheSuiteOnACIOnlyHost(t *testing.T) {
 	}
 }
 
-func TestPushSuitePolicyHonoursThePolicyDirOverride(t *testing.T) {
+func TestPushSuitePolicyHonorsThePolicyDirOverride(t *testing.T) {
 	dir := t.TempDir()
 	writeCIOnlyMarker(t, dir, "")
 	code, out := runPushSuitePolicy(t, []string{"HOME=" + t.TempDir(), "GC_HOST_POLICY_DIR=" + dir})
