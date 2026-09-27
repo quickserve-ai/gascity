@@ -100,6 +100,7 @@ _enospc_check_log() {
     _enospc_unparseable=0
     _enospc_unevaluated=0
     _enospc_parser_missing=false
+    _enospc_scan_failed=false
     if [ -n "${LOG_FILE:-}" ] && [ -r "$LOG_FILE" ]; then
         _enospc_scan_log
         _enospc_log_line="log: $LOG_FILE (last $ENOSPC_LOG_TAIL_LINES lines scanned)"
@@ -128,6 +129,11 @@ _enospc_check_log() {
         _enospc_refuse=true
         _enospc_add_reason "$_enospc_unevaluated ENOSPC log line(s) could not be evaluated"
         _enospc_add_detail "ENOSPC log lines the shell could not evaluate, counted as recent: $_enospc_unevaluated"
+    fi
+    if [ "$_enospc_scan_failed" = true ]; then
+        _enospc_refuse=true
+        _enospc_add_reason "the Dolt log could not be scanned for ENOSPC lines"
+        _enospc_add_detail "ENOSPC log scan failed (grep error), counted as recent"
     fi
     _enospc_add_detail "$_enospc_log_line"
 }
@@ -203,14 +209,23 @@ _enospc_scan_log() {
     _enospc_oldest_stamp=""
     # Dolt's logrus lines open with an RFC3339 stamp:
     #   time="2026-09-18T07:06:15-07:00" level=error msg="..."
-    # A line without one becomes "-", which never parses. NUL bytes are
-    # dropped first: grep treats input containing one as binary, which hides
-    # the matching lines on GNU grep and fabricates one on BSD grep.
-    _enospc_stamps=$(tail -n "$ENOSPC_LOG_TAIL_LINES" "$LOG_FILE" 2>/dev/null \
-        | tr -d '\000' \
-        | grep -E "$ENOSPC_LOG_SIGNATURE" \
-        | sed -e 's/^[[:space:]]*time="\([^"]*\)".*$/\1/' -e 't' -e 's/.*/-/')
-    [ -n "$_enospc_stamps" ] || return 0
+    # A line without one, or with an empty one, becomes "-", which never
+    # parses. NUL bytes are dropped first: grep treats input containing one as
+    # binary, which hides the matching lines on GNU grep and fabricates one on
+    # BSD grep. The scan runs in the C locale: under UTF-8, BSD tr stops at the
+    # first invalid byte ("Illegal byte sequence") and every line after it,
+    # a recent ENOSPC among them, never reaches grep. A grep error (status 2)
+    # is a failed scan, never "no evidence".
+    _enospc_matches=$(tail -n "$ENOSPC_LOG_TAIL_LINES" "$LOG_FILE" 2>/dev/null \
+        | LC_ALL=C tr -d '\000' \
+        | LC_ALL=C grep -E "$ENOSPC_LOG_SIGNATURE")
+    if [ "$?" -gt 1 ]; then
+        _enospc_scan_failed=true
+        return 0
+    fi
+    [ -n "$_enospc_matches" ] || return 0
+    _enospc_stamps=$(printf '%s\n' "$_enospc_matches" \
+        | LC_ALL=C sed -e 's/^[[:space:]]*time="\([^"][^"]*\)".*$/\1/' -e 't' -e 's/.*/-/')
     _enospc_total=$(printf '%s\n' "$_enospc_stamps" | grep -c '')
 
     _enospc_now=$(date +%s)
