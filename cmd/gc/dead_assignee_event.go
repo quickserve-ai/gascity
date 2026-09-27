@@ -14,7 +14,7 @@ import (
 // for each work bead releaseOrphanedPoolAssignments just reopened because its
 // assignee resolved to no open session bead. The destructive reopen (clear
 // assignee, reset in_progress→open) already ran and is gated on confirmed
-// non-liveness (snapshot-complete deferral + liveWorkAssignmentStillReleasable
+// non-liveness (snapshot-complete deferral + liveWorkRowStillReleasable
 // re-validation + liveOpenSessionAssignmentExists); this only makes the
 // otherwise-silent repair observable, so it never mutates a bead.
 //
