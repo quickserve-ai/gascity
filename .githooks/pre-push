@@ -67,6 +67,15 @@ if [ "$go_changed" -eq 0 ]; then
   exit 0
 fi
 
+# A host that runs full test suites in CI only skips the suite here (exit 3
+# from the policy; ga-wirl8l.2). Any other policy failure runs the suite as
+# before, so a broken policy script never silently disables it.
+policy_rc=0
+"$repo_root/.githooks/lib/push-suite-policy.sh" || policy_rc=$?
+if [ "$policy_rc" -eq 3 ]; then
+  exit 0
+fi
+
 # bazel test //... with CI's action keys (read-only cache, or remote execution
 # when any rc file names an executor: a maintainer's .bazelrc.local, an agent
 # host's ~/.bazelrc); make test-fast-parallel without bazel or with
