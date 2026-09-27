@@ -901,6 +901,7 @@ gc context add <name> [flags]
 | `--credential-required-scopes` | string |  | JSON array of required credential scopes (provider mode) |
 | `--grant-command` | string |  | command that mints an X-GC-City-Write grant (direct hardened self-host) |
 | `--insecure-skip-verify` | bool |  | skip TLS verification (dev only) |
+| `--mail-read-timeout` | string |  | budget for one mail read, e.g. 55s; set it above the remote city's [mail] read_timeout minus 5s (default 30s) |
 | `--timeout` | string |  | REST request timeout, e.g. 120s (never applied to SSE streams) |
 | `--tls-server-name` | string |  | override the TLS SNI / certificate name |
 | `--url` | string |  | remote city base URL (https required for non-loopback) |
