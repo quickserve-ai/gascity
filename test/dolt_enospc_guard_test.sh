@@ -160,6 +160,10 @@ BROKEN_GREP_BIN="$WORK/broken-grep-bin"
 mkdir -p "$BROKEN_GREP_BIN"
 printf '#!/bin/sh\necho "grep: simulated read error" >&2\nexit 2\n' > "$BROKEN_GREP_BIN/grep"
 chmod +x "$BROKEN_GREP_BIN/grep"
+# Stamps AHEAD of the local clock (ga-b56n0m): 5 min is NTP-scale skew and still
+# counts; 2 h is a clock that ran ahead and was corrected, and must not block.
+LOG_AHEAD_5M=$(write_log ahead-5m "$(enospc_line "$(stamp $((NOW + 300)))")")
+LOG_AHEAD_2H=$(write_log ahead-2h "$(enospc_line "$(stamp $((NOW + 7200)))")")
 
 # run_guard <log> <avail_kb> [VAR=value...]: the helper alone under POSIX sh.
 # Prints VERDICT=refuse|proceed, then the reason and detail lines.
@@ -497,6 +501,43 @@ else
 fi
 check_no_force T17 "$out"
 
+# T18: a stamp 5 min ahead is ordinary skew: it still counts as recent.
+out=$(run_guard "$LOG_AHEAD_5M" "$HEALTHY_KB")
+if has "$out" "VERDICT=refuse" && has "$out" "within the last 60 min: 1"; then
+    pass "T18: ENOSPC stamp 5 min ahead of the clock -> still recent, refuses"
+else
+    fail "T18: 5 min ahead -> expected refusal; got: $out"
+fi
+check_no_force T18 "$out"
+
+# T19: a stamp 2 h ahead is untrusted, not recent: the live disk decides.
+out=$(run_guard "$LOG_AHEAD_2H" "$HEALTHY_KB")
+if has "$out" "VERDICT=proceed" && has "$out" "ahead of the local clock ignored as untrusted" \
+    && has "$out" "min ahead of the local clock"; then
+    pass "T19: ENOSPC stamp 2 h ahead + healthy disk -> proceeds, names the skew"
+else
+    fail "T19: 2 h ahead + healthy disk -> expected proceed with a skew note; got: $out"
+fi
+
+# T20: ignoring a future stamp never overrides a low disk.
+out=$(run_guard "$LOG_AHEAD_2H" "$LOW_KB")
+if has "$out" "VERDICT=refuse" && has "$out" "below the 1024 MB minimum" \
+    && has "$out" "ignored as untrusted"; then
+    pass "T20: ENOSPC stamp 2 h ahead + low disk -> refuses on the disk, notes the skew"
+else
+    fail "T20: 2 h ahead + low disk -> expected refusal; got: $out"
+fi
+check_no_force T20 "$out"
+
+# T21: an unusable skew setting refuses instead of erroring open.
+out=$(run_guard "$LOG_NONE" "$HEALTHY_KB" GC_DOLT_RESTART_ENOSPC_SKEW_MAX_S=soon)
+if has "$out" "VERDICT=refuse" && has "$out" "invalid GC_DOLT_RESTART_ENOSPC_SKEW_MAX_S=soon"; then
+    pass "T21: invalid GC_DOLT_RESTART_ENOSPC_SKEW_MAX_S -> refuses, names the setting"
+else
+    fail "T21: invalid skew setting -> expected refusal; got: $out"
+fi
+check_no_force T21 "$out"
+
 # --- Caller 1: gc dolt restart ---
 
 out=$(run_restart "$LOG_OLD" "$HEALTHY_KB")
@@ -538,6 +579,14 @@ if rc_is "$out" 0 && ops_are "$out" "stop start" && has "$out" "--force set; res
 else
     fail "R5: restart --force -> expected stop start; got: $out"
 fi
+
+out=$(run_restart "$LOG_AHEAD_2H" "$HEALTHY_KB")
+if rc_is "$out" 0 && ops_are "$out" "stop start" && has "$out" "gc dolt restart: 1 ENOSPC log line(s) stamped more than 900 s ahead"; then
+    pass "R6: restart with an ENOSPC stamp 2 h ahead + healthy disk -> restarts, says why"
+else
+    fail "R6: restart past a future stamp -> expected stop start with a note; got: $out"
+fi
+check_no_force R6 "$out"
 
 # --- Caller 2: gc-beads-bd op_recover (auto-recovery) ---
 
@@ -582,5 +631,13 @@ else
     fail "A5: missing helper -> expected fail-closed skip; got: $out"
 fi
 check_no_force A5 "$out"
+
+out=$(run_recover "$LOG_AHEAD_2H" "$HEALTHY_KB")
+if rc_is "$out" 0 && ops_are "$out" "recover_managed" && has "$out" "dolt recovery: 1 ENOSPC log line(s) stamped more than 900 s ahead"; then
+    pass "A6: auto-recovery with an ENOSPC stamp 2 h ahead + healthy disk -> recovers, says why"
+else
+    fail "A6: recovery past a future stamp -> expected recovery with a note; got: $out"
+fi
+check_no_force A6 "$out"
 
 [ "$FAILED" -eq 0 ] && exit 0 || exit 1
