@@ -110,6 +110,13 @@ func classifyDemandTrigger(triggerID, dir string, opts hookClaimOptions, ops hoo
 		return "unreadable", events.DemandClaimUnknown
 	}
 	status = strings.ToLower(strings.TrimSpace(bead.Status))
+	// A trigger this invocation declined because its molecule root was observed
+	// closed (qc-z0fmn0n) is not the agreement invariant breaking: the step is
+	// dead work the controller is still counting. Answered from the verdict the
+	// claim path already observed — never a fresh read.
+	if _, closed := ops.rootGate.observedClosedRootOf(bead); closed {
+		return status, events.DemandClaimBenign
+	}
 	// The invariant is about a row that is STILL claimable by a worker for this
 	// template: open, unassigned, route-matching, and not excluded by the shared
 	// serving rules. Anything else — a row that moved on, a sibling claim — is
