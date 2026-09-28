@@ -1288,6 +1288,10 @@ func sweepAssignedWorkLegs(legs WorkLegs, stderr io.Writer, visit func(index int
 // not land, so a stale-assignee item is not masked behind a "repaired" close.
 type unclaimResult struct {
 	Released int
+	// Withheld counts beads the named-release guard kept on their assignee and
+	// PROPOSED for release instead (ga-9n8hjv). They are neither released nor
+	// failed: the work is still owned, by a named agent.
+	Withheld int
 	Failed   int
 }
 
@@ -1588,6 +1592,12 @@ func reassignWorkAssignedToRetiredSessionBead(
 						continue
 					}
 					seen[key] = struct{}{}
+					// Work on a named agent's durable identity stays there: the
+					// winner serves that identity, and re-homing it onto a session
+					// bead ID would make it releasable by the next close (ga-9n8hjv).
+					if assigneeIsDurableNamedIdentity(cfg, namedSessionIdentity(retiredSession), item.Assignee) {
+						continue
+					}
 					if err := wa.ReassignWorkBead(item, newSessionID); err != nil {
 						fmt.Fprintf(stderr, "session beads: reassigning work %s from retired session %s to %s: %v\n", item.ID, retiredSession.ID, newSessionID, err) //nolint:errcheck
 					}
@@ -1640,6 +1650,12 @@ func reassignWorkAssignedToRetiredSessionInfo(
 						continue
 					}
 					seen[key] = struct{}{}
+					// Work on a named agent's durable identity stays there: the
+					// winner serves that identity, and re-homing it onto a session
+					// bead ID would make it releasable by the next close (ga-9n8hjv).
+					if assigneeIsDurableNamedIdentity(cfg, namedSessionIdentityInfo(retiredSession), item.Assignee) {
+						continue
+					}
 					if err := wa.ReassignWorkBead(item, newSessionID); err != nil {
 						fmt.Fprintf(stderr, "session beads: reassigning work %s from retired session %s to %s: %v\n", item.ID, retiredSession.ID, newSessionID, err) //nolint:errcheck
 					}
@@ -1787,7 +1803,7 @@ func repairStrandedPoolWorkerBead(
 		// re-attempts (episode marker still aged, session still not-alive).
 		// The denominator counts every attempt, including releases that correctly
 		// no-oped because the work had already moved to a live worker.
-		fmt.Fprintf(stderr, "session beads: stranded-repair for %s deferred: %d of %d unassign(s) failed; leaving session bead open for retry\n", info.ID, res.Failed, res.Failed+res.Released) //nolint:errcheck
+		fmt.Fprintf(stderr, "session beads: stranded-repair for %s deferred: %d of %d unassign(s) failed; leaving session bead open for retry\n", info.ID, res.Failed, res.Failed+res.Released+res.Withheld) //nolint:errcheck
 		return false
 	}
 	// A claim no lane serves stayed assigned (O5): the close completes, and
@@ -2075,7 +2091,15 @@ func syncSessionBeadsWithSnapshotAndRigStores(
 			// bounded exactly as poolRuntimeSessionName bounds it.
 			carveOut := spec.Agent != nil && spec.Agent.UsesCanonicalSingletonPoolIdentity() && beadSessionName == boundSessionNameLength(spec.SessionName+poolRuntimeNameSuffix)
 			if !closeSeatIfRuntimeStopped(store, sw, sp, sessionInfoFromBead(b), closeWhy{reason: "reconfigured", gate: closeGated}, now, stderr) {
-				if !carveOut {
+				// Only a bead that can still CONTINUE the identity blocks a fresh
+				// one. An archived, continuity-ineligible bead (a removed named
+				// session) has already given up its alias and session_name; it
+				// stays open only because it still holds work, which since
+				// ga-9n8hjv is the named agent's withheld, proposed work. Blocking
+				// on it would keep the re-added agent from ever coming back, with no
+				// log line. Mint the fresh bead beside it instead (the phase0 spec's
+				// "archived history stays, a fresh canonical bead is created").
+				if !carveOut && namedSessionContinuityEligible(b) {
 					blockedReconfiguredNamedIdentities[identity] = true
 				}
 				continue

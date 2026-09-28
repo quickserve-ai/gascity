@@ -178,10 +178,43 @@ func TestSessionCloseKeepsConfiguredCrewWorkInCityStore(t *testing.T) {
 	}
 }
 
-// TestSessionCloseStillReleasesRetiredNamedSessionWork is the companion that
-// keeps the guard honest: an identity that is NOT in the config is genuinely
-// retired, so its work must still be released.
-func TestSessionCloseStillReleasesRetiredNamedSessionWork(t *testing.T) {
+// assertProposedNotReleased is fence #1's signature (ga-9n8hjv): a named agent's
+// bead keeps its assignee AND its status across a session teardown, and carries
+// the release PROPOSAL (label + first-sight metadata naming the release path)
+// for a judge instead.
+func assertProposedNotReleased(t *testing.T, got beads.Bead, wantAssignee, wantStatus, wantPath, what string) {
+	t.Helper()
+	if got.Assignee != wantAssignee {
+		t.Fatalf("%s Assignee = %q, want %q kept — session teardown never unassigns a named agent's work (ga-9n8hjv)", what, got.Assignee, wantAssignee)
+	}
+	if got.Status != wantStatus {
+		t.Fatalf("%s Status = %q, want %q kept", what, got.Status, wantStatus)
+	}
+	hasLabel := false
+	for _, l := range got.Labels {
+		if l == beadmeta.ReleaseProposedLabel {
+			hasLabel = true
+		}
+	}
+	if !hasLabel {
+		t.Fatalf("%s labels = %v, want %q: a withheld release must leave a proposal a judge can find", what, got.Labels, beadmeta.ReleaseProposedLabel)
+	}
+	if got.Metadata[beadmeta.ReleaseProposedAtMetadataKey] == "" {
+		t.Fatalf("%s has no %s stamp", what, beadmeta.ReleaseProposedAtMetadataKey)
+	}
+	if got.Metadata[beadmeta.ReleaseProposedPathMetadataKey] != wantPath {
+		t.Fatalf("%s %s = %q, want %q", what, beadmeta.ReleaseProposedPathMetadataKey, got.Metadata[beadmeta.ReleaseProposedPathMetadataKey], wantPath)
+	}
+	if got.Metadata[beadmeta.ReleaseProposedAssigneeMetadataKey] != wantAssignee {
+		t.Fatalf("%s %s = %q, want %q", what, beadmeta.ReleaseProposedAssigneeMetadataKey, got.Metadata[beadmeta.ReleaseProposedAssigneeMetadataKey], wantAssignee)
+	}
+}
+
+// TestSessionCloseProposesRetiredNamedSessionWork: an identity that is NOT in
+// the config any more still belonged to a named agent. Before ga-9n8hjv its work
+// was released here; under fence #1 (Cherub's typed Q12 re-ruling, 2026-09-27)
+// teardown keeps it and proposes the release for a judge.
+func TestSessionCloseProposesRetiredNamedSessionWork(t *testing.T) {
 	cityStore := beads.NewMemStore()
 	rigStore := beads.NewMemStore()
 	work, err := rigStore.Create(beads.Bead{
@@ -210,22 +243,17 @@ func TestSessionCloseStillReleasesRetiredNamedSessionWork(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get work: %v", err)
 	}
-	if got.Assignee != "" {
-		t.Fatalf("retired-agent work Assignee = %q, want cleared — a real retirement must still release its work", got.Assignee)
-	}
-	if got.Status != "open" {
-		t.Fatalf("retired-agent work Status = %q, want %q", got.Status, "open")
-	}
-	if got.Metadata[beadmeta.RunTargetMetadataKey] != "qcore/fallback-route" {
-		t.Fatalf("retired-agent work run_target = %q, want the fallback route stamped", got.Metadata[beadmeta.RunTargetMetadataKey])
+	assertProposedNotReleased(t, got, crewRuntimeIdentity, "in_progress", "retired-session-unclaim", "retired-agent work")
+	if got.Metadata[beadmeta.RunTargetMetadataKey] != "" {
+		t.Fatalf("retired-agent work run_target = %q, want untouched: a proposal re-routes nothing", got.Metadata[beadmeta.RunTargetMetadataKey])
 	}
 }
 
-// TestSessionCloseStillReleasesSuspendedAgentWork pins the suspension carve-out
-// that isConfiguredNamedSessionIdentity already encodes: a suspended agent's
-// tier never claims, so keeping its assignee would orphan the bead with neither
-// side picking it up.
-func TestSessionCloseStillReleasesSuspendedAgentWork(t *testing.T) {
+// TestSessionCloseProposesSuspendedAgentWork: a suspended agent's tier never
+// claims, which is why this used to release. It is still a named agent's work,
+// so under fence #1 the release is proposed, not made (ga-9n8hjv); the judge
+// decides whether to wait for the agent or hand the work on.
+func TestSessionCloseProposesSuspendedAgentWork(t *testing.T) {
 	cityStore := beads.NewMemStore()
 	rigStore := beads.NewMemStore()
 	work, err := rigStore.Create(beads.Bead{
@@ -250,16 +278,15 @@ func TestSessionCloseStillReleasesSuspendedAgentWork(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get work: %v", err)
 	}
-	if got.Assignee != "" {
-		t.Fatalf("suspended-agent work Assignee = %q, want cleared", got.Assignee)
-	}
+	assertProposedNotReleased(t, got, crewRuntimeIdentity, "open", "retired-session-unclaim", "suspended-agent work")
 }
 
-// TestSessionCloseStillReleasesEphemeralIdentifierWork pins the other edge: even
-// for a still-configured crew agent, work pinned to an identifier that DIES with
-// this session (the session bead ID, the "rig--agent" session_name form) must
-// still be released, or it strands on an address nothing will ever answer to.
-func TestSessionCloseStillReleasesEphemeralIdentifierWork(t *testing.T) {
+// TestSessionCloseProposesEphemeralIdentifierWork pins the other edge: work a
+// named session holds under an identifier that DIES with it (the session bead
+// ID, the "rig--agent" session_name form) is still the named agent's work. It is
+// not released (ga-9n8hjv); it is proposed, and the label is what keeps it from
+// stranding silently on an address nothing answers to.
+func TestSessionCloseProposesEphemeralIdentifierWork(t *testing.T) {
 	cityStore := beads.NewMemStore()
 	rigStore := beads.NewMemStore()
 
@@ -292,17 +319,11 @@ func TestSessionCloseStillReleasesEphemeralIdentifierWork(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get bead-ID work: %v", err)
 	}
-	if gotByID.Assignee != "" {
-		t.Fatalf("bead-ID work Assignee = %q, want cleared — that identifier dies with the session", gotByID.Assignee)
-	}
-	assertNotStranded(t, gotByID, "bead-ID work")
+	assertProposedNotReleased(t, gotByID, sessionBead.ID, "open", "retired-session-unclaim", "bead-ID work")
 
 	gotByName, err := rigStore.Get(bySessionName.ID)
 	if err != nil {
 		t.Fatalf("get session-name work: %v", err)
 	}
-	if gotByName.Assignee != "" {
-		t.Fatalf("session-name work Assignee = %q, want cleared", gotByName.Assignee)
-	}
-	assertNotStranded(t, gotByName, "session-name work")
+	assertProposedNotReleased(t, gotByName, crewSessionName, "open", "retired-session-unclaim", "session-name work")
 }
