@@ -69,7 +69,7 @@ func classifyMailWriteFailure(stderr io.Writer, cmdLabel string, err error) int 
 		fmt.Fprintf(stderr, "%s: NOT DELIVERED — %v\n", cmdLabel, err)                           //nolint:errcheck // best-effort stderr
 		fmt.Fprintln(stderr, "hint: no message bead exists for this send; re-send the message.") //nolint:errcheck // best-effort stderr
 		return mailSendNotPersistedExit
-	case errors.Is(err, beadmail.ErrUnconfirmed):
+	case errors.Is(err, beadmail.ErrUnconfirmed), isUnconfirmedMailWrite(err):
 		id, ok := mail.UnconfirmedMessageID(err)
 		if !ok {
 			id = "<message-id>"
@@ -80,6 +80,15 @@ func classifyMailWriteFailure(stderr io.Writer, cmdLabel string, err error) int 
 		return mailSendUnconfirmedExit
 	}
 	return 0
+}
+
+// isUnconfirmedMailWrite reports an unconfirmed write that arrived without
+// beadmail's sentinel: the remote client turns the API's 202 into a bare
+// *mail.DeliveryUnconfirmedError naming the ID (ga-nee27h), and it earns the
+// same verdict as a local unconfirmed write.
+func isUnconfirmedMailWrite(err error) bool {
+	_, ok := mail.UnconfirmedMessageID(err)
+	return ok
 }
 
 // mailStorageCheckReading tells the operator how to read the check's answer.
