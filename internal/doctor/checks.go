@@ -567,52 +567,176 @@ func (c *ZombieSessionsCheck) Fix(ctx *CheckContext) error {
 	return nil
 }
 
-// OrphanSessionsCheck finds sessions with the city prefix not in config.
+// OrphanSessionsCheck finds running sessions that nothing in this city claims.
+//
+// A session is an orphan only when NEITHER a configured agent template, NOR a
+// configured named session, NOR an OPEN session bead claims its runtime name.
+// The template-derived name (agent.SessionNameFor) is not the only name the
+// supervisor runs a session under: a named session whose alias differs from
+// its template (alias "qcore/archer" runs as "qcore--archer" while its
+// template is "qcore/cherub-law.archer") and a namepool-themed pool instance
+// ("platform--gastown__furiosa") are supervisor-managed yet never
+// template-derived. Their open session bead records the runtime name in its
+// session_name metadata, so the optional managed-name lister
+// (WithManagedSessionNames) supplies those names. Without it, the check once
+// reported 12 live, supervisor-managed seats as orphans and its Fix would have
+// stopped every one of them (ga-n2f1ph).
 type OrphanSessionsCheck struct {
 	cfg             *config.City
 	cityName        string
 	sessionTemplate string
 	sp              runtime.Provider
+	// managedNames, when non-nil, returns the runtime names of every session
+	// an OPEN session bead claims. A nil lister keeps the template-only
+	// behavior; a lister that errors, or that returns no names at all, makes
+	// the check fail closed (Run warns the candidates are unconfirmed, Fix
+	// refuses and stops nothing).
+	managedNames func() (map[string]struct{}, error)
 }
+
+// errEmptyManagedSessionSet is the scan's verdict on a managed-name listing
+// that succeeded but named nothing while unclaimed sessions are running. A
+// live city always has open session beads, so an empty set is far likelier a
+// read of the wrong or an empty store than proof that every candidate is an
+// orphan; it is treated like a listing failure (ga-n2f1ph).
+var errEmptyManagedSessionSet = errors.New("listing managed sessions returned no open session bead, which a live city always has, so the empty set cannot rule any candidate out")
+
+// HasManagedSessionNames reports whether a managed-name lister is installed.
+// It lets the production wiring be pinned: without the lister the check is
+// template-only and would report every non-template-derived seat as an orphan.
+func (c *OrphanSessionsCheck) HasManagedSessionNames() bool { return c.managedNames != nil }
 
 // NewOrphanSessionsCheck creates a check for orphaned sessions.
 func NewOrphanSessionsCheck(cfg *config.City, cityName, sessionTemplate string, sp runtime.Provider) *OrphanSessionsCheck {
 	return &OrphanSessionsCheck{cfg: cfg, cityName: cityName, sessionTemplate: sessionTemplate, sp: sp}
 }
 
+// WithManagedSessionNames installs the lister that returns the runtime names
+// claimed by open session beads. Those names count as expected alongside the
+// template-derived ones, so a supervisor-managed session whose runtime name is
+// not template-derived is never reported (or stopped) as an orphan. The lister
+// is only called when at least one running session is not template-derived.
+// It returns c for chaining.
+func (c *OrphanSessionsCheck) WithManagedSessionNames(fn func() (map[string]struct{}, error)) *OrphanSessionsCheck {
+	c.managedNames = fn
+	return c
+}
+
 // Name returns the check identifier.
 func (c *OrphanSessionsCheck) Name() string { return "orphan-sessions" }
 
-// Run finds sessions with the city prefix that don't match any configured agent.
-func (c *OrphanSessionsCheck) Run(_ *CheckContext) *CheckResult {
-	r := &CheckResult{Name: c.Name()}
+// orphanScan is the single orphan computation Run and Fix share, so the two
+// can never disagree about which sessions are orphans.
+type orphanScan struct {
+	// orphans are running sessions claimed by neither a configured template,
+	// nor a configured named session, nor (when a lister is installed and
+	// succeeded) an open session bead.
+	// When managedErr is non-nil they are template-only candidates that could
+	// NOT be confirmed.
+	orphans []string
+	// partialErr is the runtime's partial-list error, if the running-session
+	// listing only partially succeeded.
+	partialErr error
+	// managedErr is the managed-name lister's error, or
+	// errEmptyManagedSessionSet when it listed nothing. Non-nil means orphans
+	// are unconfirmed and must not be stopped.
+	managedErr error
+}
+
+// scan lists running sessions and computes the orphan set. The returned error
+// is a hard (non-partial) ListRunning failure; a partial listing is reported
+// through orphanScan.partialErr with the visible sessions still scanned.
+func (c *OrphanSessionsCheck) scan() (orphanScan, error) {
 	prefix := "" // per-city socket isolation: all sessions belong to this city
 	running, err := c.sp.ListRunning(prefix)
-	partialList := runtime.IsPartialListError(err)
-	if err != nil && !partialList {
-		r.Status = StatusError
-		r.Message = fmt.Sprintf("listing sessions: %v", err)
-		return r
+	var s orphanScan
+	if err != nil {
+		if !runtime.IsPartialListError(err) {
+			return s, err
+		}
+		s.partialErr = err
 	}
 
-	// Build set of expected session names.
+	// Template-derived names: every configured agent.
 	expected := make(map[string]bool)
 	for _, a := range c.cfg.Agents {
 		sn := agent.SessionNameFor(c.cityName, a.QualifiedName(), c.sessionTemplate)
 		expected[sn] = true
 	}
-
-	var orphans []string
-	for _, s := range running {
-		if !expected[s] {
-			orphans = append(orphans, s)
+	// Configured named sessions are managed from config alone, so a named
+	// seat whose session bead is closed or missing is never stopped.
+	for i := range c.cfg.NamedSessions {
+		identity := c.cfg.NamedSessions[i].QualifiedName()
+		if identity == "" {
+			continue
 		}
+		expected[config.NamedSessionRuntimeName(c.cityName, c.cfg.Workspace, identity)] = true
+	}
+	var candidates []string
+	for _, name := range running {
+		if !expected[name] {
+			candidates = append(candidates, name)
+		}
+	}
+	if len(candidates) == 0 || c.managedNames == nil {
+		s.orphans = candidates
+		return s, nil
+	}
+
+	// Names claimed by open session beads. Consulted only when a candidate
+	// exists, so a clean city never pays for a store read.
+	managed, merr := c.managedNames()
+	if merr != nil {
+		s.orphans = candidates
+		s.managedErr = fmt.Errorf("listing managed sessions failed: %w", merr)
+		return s, nil
+	}
+	if len(managed) == 0 {
+		s.orphans = candidates
+		s.managedErr = errEmptyManagedSessionSet
+		return s, nil
+	}
+	for _, name := range candidates {
+		if _, ok := managed[name]; !ok {
+			s.orphans = append(s.orphans, name)
+		}
+	}
+	return s, nil
+}
+
+// Run finds running sessions claimed by neither a configured agent template
+// nor an open session bead. If the managed-name lister fails, the template-only
+// candidates are reported as unconfirmed rather than as orphans.
+func (c *OrphanSessionsCheck) Run(_ *CheckContext) *CheckResult {
+	r := &CheckResult{Name: c.Name()}
+	s, err := c.scan()
+	if err != nil {
+		r.Status = StatusError
+		r.Message = fmt.Sprintf("listing sessions: %v", err)
+		return r
+	}
+	orphans := s.orphans
+
+	if s.managedErr != nil {
+		r.Status = StatusWarning
+		r.Message = fmt.Sprintf("cannot confirm orphaned sessions: %v (%d unconfirmed candidate(s))", s.managedErr, len(orphans))
+		if s.partialErr != nil {
+			r.Message += fmt.Sprintf("; listing sessions partially failed: %v", s.partialErr)
+		}
+		why := "open session beads could not be listed"
+		if errors.Is(s.managedErr, errEmptyManagedSessionSet) {
+			why = "open session beads listed empty"
+		}
+		for _, name := range orphans {
+			r.Details = append(r.Details, name+" (unconfirmed: not template-derived; "+why+")")
+		}
+		return r
 	}
 
 	if len(orphans) == 0 {
-		if partialList {
+		if s.partialErr != nil {
 			r.Status = StatusWarning
-			r.Message = fmt.Sprintf("listing sessions partially failed: %v", err)
+			r.Message = fmt.Sprintf("listing sessions partially failed: %v", s.partialErr)
 			return r
 		}
 		r.Status = StatusOK
@@ -620,8 +744,8 @@ func (c *OrphanSessionsCheck) Run(_ *CheckContext) *CheckResult {
 		return r
 	}
 	r.Status = StatusWarning
-	if partialList {
-		r.Message = fmt.Sprintf("listing sessions partially failed: %v (%d visible orphaned session(s))", err, len(orphans))
+	if s.partialErr != nil {
+		r.Message = fmt.Sprintf("listing sessions partially failed: %v (%d visible orphaned session(s))", s.partialErr, len(orphans))
 	} else {
 		r.Message = fmt.Sprintf("%d orphaned session(s)", len(orphans))
 	}
@@ -634,29 +758,29 @@ func (c *OrphanSessionsCheck) CanFix() bool { return true }
 
 // Fix kills all orphaned sessions. It refuses while a controller is running
 // (GH#5742): the controller's own health patrol already reconciles orphan
-// sessions, and an uncoordinated Stop here would race it.
+// sessions, and an uncoordinated Stop here would race it. It also fails
+// closed when it cannot tell a managed session from an orphan: a partial
+// runtime listing, a managed-name lister error, or an empty managed set
+// returns an error and stops nothing, because a session is an orphan only
+// when neither config nor an open session bead claims it, and a failed or
+// empty listing cannot rule the second out (ga-n2f1ph).
 func (c *OrphanSessionsCheck) Fix(ctx *CheckContext) error {
 	if IsControllerRunning(ctx.CityPath) {
 		return errControllerRunningFixSkipped
 	}
-	prefix := "" // per-city socket isolation: all sessions belong to this city
-	running, err := c.sp.ListRunning(prefix)
-	if runtime.IsPartialListError(err) {
-		return fmt.Errorf("listing sessions partially failed: %w", err)
-	}
+	s, err := c.scan()
 	if err != nil {
 		return err
 	}
-	expected := make(map[string]bool)
-	for _, a := range c.cfg.Agents {
-		sn := agent.SessionNameFor(c.cityName, a.QualifiedName(), c.sessionTemplate)
-		expected[sn] = true
+	if s.partialErr != nil {
+		return fmt.Errorf("listing sessions partially failed: %w", s.partialErr)
 	}
-	for _, s := range running {
-		if !expected[s] {
-			if err := c.sp.Stop(s); err != nil {
-				return fmt.Errorf("killing orphan session %q: %w", s, err)
-			}
+	if s.managedErr != nil {
+		return fmt.Errorf("refusing to stop %d unconfirmed orphan candidate(s): %w", len(s.orphans), s.managedErr)
+	}
+	for _, name := range s.orphans {
+		if err := c.sp.Stop(name); err != nil {
+			return fmt.Errorf("killing orphan session %q: %w", name, err)
 		}
 	}
 	return nil
