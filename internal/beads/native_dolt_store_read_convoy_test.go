@@ -30,6 +30,12 @@ import (
 // The contract under test: R2 returns within its read budget (plus a margin),
 // whatever R1 and R3 are doing. The test releases R1 itself, so it cannot hang
 // past its hard timeout.
+//
+// R2 is issued once R3's failure has visibly reached the reconnect path, by
+// whichever of three signals comes first: a writer pending on s.mu (the convoy
+// state the unfixed store enters), the reopen hook having been called (a store
+// whose reconnect does not queue behind R1 gets that far), or R3 having
+// returned. The test logs which one fired.
 func TestNativeDoltStoreReadBudgetBoundsStorageLockBehindPendingReconnect(t *testing.T) {
 	const (
 		budget      = 200 * time.Millisecond
@@ -76,7 +82,12 @@ func TestNativeDoltStoreReadBudgetBoundsStorageLockBehindPendingReconnect(t *tes
 	}
 	store := newNativeDoltStoreForTest(storage)
 	store.readRetryBudgetOverride = budget
-	store.reopen = func(context.Context) (beadslib.Storage, error) { return storage, nil }
+	reopenCalled := make(chan struct{})
+	var reopenCalledOnce sync.Once
+	store.reopen = func(context.Context) (beadslib.Storage, error) {
+		reopenCalledOnce.Do(func() { close(reopenCalled) })
+		return storage, nil
+	}
 
 	type result struct {
 		err  error
@@ -93,7 +104,7 @@ func TestNativeDoltStoreReadBudgetBoundsStorageLockBehindPendingReconnect(t *tes
 		return ch
 	}
 
-	// R1: holds RLock across a read that ignores its ctx.
+	// R1: holds its storage acquisition across a read that ignores its ctx.
 	r1 := run("gc-r1")
 	select {
 	case <-r1Entered:
@@ -104,34 +115,38 @@ func TestNativeDoltStoreReadBudgetBoundsStorageLockBehindPendingReconnect(t *tes
 	// R3: fails transiently and heads into reconnect.
 	r3 := run("gc-r3")
 
-	// Wait until a writer is pending on s.mu. TryRLock fails only while a
-	// writer holds or waits for the lock (readerCount < 0), so this observes
-	// the queued Lock() directly rather than guessing from a sleep.
-	writerDeadline := time.Now().Add(margin)
-	writerPending := false
-	for time.Now().Before(writerDeadline) {
-		if store.mu.TryRLock() {
-			store.mu.RUnlock()
-			select {
-			case res := <-r3:
-				t.Logf("R3 returned without leaving a writer queued on s.mu: took=%s err=%v", res.took, res.err)
-				r3 = nil
-			default:
-			}
-			time.Sleep(time.Millisecond)
-			continue
+	// Wait until R3's failure has reached the reconnect path. TryRLock fails
+	// only while a writer holds or waits for the lock (readerCount < 0), so
+	// the first signal observes the queued Lock() directly rather than
+	// guessing from a sleep.
+	var r3Res result
+	r3Returned := false
+	syncDeadline := time.Now().Add(margin)
+	syncCondition := ""
+	for syncCondition == "" && time.Now().Before(syncDeadline) {
+		if !store.mu.TryRLock() {
+			syncCondition = "writer pending on s.mu (R1 still in its read)"
+			break
 		}
-		writerPending = true
-		break
+		store.mu.RUnlock()
+		select {
+		case <-reopenCalled:
+			syncCondition = "reopen hook called (reconnect did not queue behind R1)"
+		case r3Res = <-r3:
+			r3Returned = true
+			syncCondition = fmt.Sprintf("R3 returned (took=%s err=%v)", r3Res.took, r3Res.err)
+		default:
+			time.Sleep(time.Millisecond)
+		}
 	}
-	writerPendingAt := time.Since(testStart)
-	if !writerPending {
+	syncAt := time.Since(testStart)
+	if syncCondition == "" {
 		release()
-		t.Fatalf("no writer queued on s.mu within %s while R1 held RLock: the reconnect path did not take Lock behind R1 (lead CLEARED for this path)", margin)
+		t.Fatalf("within %s of R3 starting, no writer queued on s.mu, the reopen hook was not called, and R3 did not return: R3's transient failure never reached the reconnect path", margin)
 	}
-	t.Logf("writer pending on s.mu at %s (R1 still holding RLock)", writerPendingAt)
+	t.Logf("sync point at %s: %s", syncAt, syncCondition)
 
-	// R2: an unrelated read issued while the writer waits.
+	// R2: an unrelated read issued while R1 is still hung.
 	r2Start := time.Since(testStart)
 	r2 := run("gc-r2")
 
@@ -157,13 +172,13 @@ func TestNativeDoltStoreReadBudgetBoundsStorageLockBehindPendingReconnect(t *tes
 			t.Fatal("R2 did not return even after R1 was released (hard timeout)")
 		}
 	}
-	var r1Res, r3Res result
+	var r1Res result
 	select {
 	case r1Res = <-r1:
 	case <-hard:
 		t.Fatal("R1 did not return after release (hard timeout)")
 	}
-	if r3 != nil {
+	if !r3Returned {
 		select {
 		case r3Res = <-r3:
 		case <-hard:
@@ -171,14 +186,14 @@ func TestNativeDoltStoreReadBudgetBoundsStorageLockBehindPendingReconnect(t *tes
 		}
 	}
 
-	t.Logf("timings (since test start): writerPending=%s r2Issued=%s r1Released=%s", writerPendingAt, r2Start, releasedAt)
+	t.Logf("timings (since test start): syncPoint=%s r2Issued=%s r1Released=%s", syncAt, r2Start, releasedAt)
 	t.Logf("R1: took=%s returnedAt=%s err=%v", r1Res.took, r1Res.at, r1Res.err)
 	t.Logf("R3: took=%s returnedAt=%s err=%v", r3Res.took, r3Res.at, r3Res.err)
 	t.Logf("R2: took=%s returnedAt=%s err=%v", r2Res.took, r2Res.at, r2Res.err)
 
 	if !r2Bounded {
-		t.Fatalf("CONVOY: R2 (budget %s) did not return within %s while a writer waited on s.mu behind R1's read; it returned only after R1 was released (R2 took %s, returned %s after R1 release) with err=%v",
-			budget, budget+margin, r2Res.took, r2Res.at-releasedAt, r2Res.err)
+		t.Fatalf("CONVOY: R2 (budget %s) did not return within %s while R1's read was hung (sync point: %s); it returned only after R1 was released (R2 took %s, returned %s after R1 release) with err=%v",
+			budget, budget+margin, syncCondition, r2Res.took, r2Res.at-releasedAt, r2Res.err)
 	}
 }
 
