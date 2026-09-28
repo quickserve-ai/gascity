@@ -87,14 +87,14 @@ func (c *CachingStore) startReconcileWatchdog(ctx context.Context) {
 // checkReconcileOverdue records the overdue condition on its own counters and
 // its own log window.
 //
-// IT MUST NOT ROUTE THROUGH recordProblemLocked, tempting as that is. That
-// helper stamps stats.LastProblemAt, and nextReconcileDelay uses LastProblemAt
-// as the RETRY-BACKOFF ANCHOR: dueAt = LastProblemAt + backoff. A watchdog
-// ticking every minute would therefore push the retry deadline out by a minute
-// every minute, and a store already in backoff — which is exactly the store
-// this watchdog fires on — would never retry again. The alarm would convert a
-// recoverable stall into a permanent one. So the watchdog keeps its own
-// counters and never touches the reconciler's clocks.
+// It keeps its own counters rather than reporting through recordProblemLocked,
+// and it never touches the reconciler's clocks. Until ga-yarqx9 the second rule
+// was load-bearing: nextReconcileDelay anchored the retry on
+// stats.LastProblemAt, which recordProblemLocked stamps, so a watchdog ticking
+// every minute would have pushed the retry of a store already in backoff out
+// forever. The anchor is now lastSyncFailureAt, written only by a failed
+// reconcile, so no problem report can starve the retry; the rule stays so the
+// watchdog's signal is not diluted into ProblemCount.
 func (c *CachingStore) checkReconcileOverdue(now time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

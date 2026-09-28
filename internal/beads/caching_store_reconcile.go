@@ -265,12 +265,12 @@ func (c *CachingStore) nextReconcileDelay(now time.Time) time.Duration {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	if c.syncFailures > 0 && !c.stats.LastProblemAt.IsZero() {
+	if c.syncFailures > 0 && !c.lastSyncFailureAt.IsZero() {
 		backoff := cacheReconcileBaseBackoff << uint(c.syncFailures)
 		if backoff > cacheReconcileMaxBackoff || backoff <= 0 {
 			backoff = cacheReconcileMaxBackoff
 		}
-		dueAt := c.stats.LastProblemAt.Add(backoff)
+		dueAt := c.lastSyncFailureAt.Add(backoff)
 		if !now.Before(dueAt) {
 			return 0
 		}
@@ -314,6 +314,7 @@ func (c *CachingStore) runReconciliation() {
 		bdLatency := time.Since(bdStart)
 		c.mu.Lock()
 		c.syncFailures++
+		c.lastSyncFailureAt = time.Now()
 		if (IsPartialResult(err) || c.syncFailures >= maxCacheSyncFailures) && (c.state == cacheLive || c.state == cachePartial) {
 			c.state = cacheDegraded
 			if !c.circuitTripped {
