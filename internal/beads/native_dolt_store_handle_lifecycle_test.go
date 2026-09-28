@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,34 +16,57 @@ import (
 
 // These tests extend native_dolt_store_handle_drain_test.go to the cases a
 // single outstanding use cannot tell apart: several uses on a retired handle,
-// a release called twice, writes that span a reconnect, and CloseStore racing
-// operations that are running on a handle a reconnect already retired
-// (ga-yuiof4.1 review round 2).
+// a release called twice, writes that span a reconnect, CloseStore racing
+// operations that are running on a handle a reconnect already retired, and a
+// read that panics (ga-yuiof4.1 review rounds 2 and 3).
+//
+// Where a test asserts that a CloseStore has NOT returned, it first waits for
+// the store's test-only checkpoint (beforeCloseDrain / beforeCloseWaitForFirst)
+// so the closer is known to have reached the wait under test, and it checks
+// the ordering that matters with a reading taken on the closer's own goroutine
+// the moment it returns, not with a timing window alone.
 
 // lifecycleSpy is a spy storage that records what the handle lifecycle tests
 // assert on. A read of failID fails with a transient connection error, which
-// sends the read through reconnect; every other read succeeds. With holdTx set,
-// every transaction parks until releaseTx. It counts Close calls, and counts
-// any operation that started or finished after Close had been called on it.
+// sends the read through reconnect; every other read succeeds. A transaction
+// for which shouldHold reports true parks until releaseTx; txResult, when set,
+// decides the n-th transaction's result. With blockClose set, Close parks until
+// releaseClose. It counts Close calls, and counts any operation that started
+// or finished after Close had been called on it.
 type lifecycleSpy struct {
 	*nativeDoltStorageSpy
-	closes    atomic.Int32
-	reads     atomic.Int32
-	txs       atomic.Int32
-	active    atomic.Int32 // operations currently running on this spy
-	ranClosed atomic.Int32 // operations that overlapped a Close of this spy
-	// delay, when set, runs inside every operation, to widen the window in
-	// which a use is outstanding.
-	delay func()
+	closes        atomic.Int32
+	closeReturned atomic.Int32 // Close calls that have returned
+	reads         atomic.Int32
+	txs           atomic.Int32
+	active        atomic.Int32 // operations currently running on this spy
+	ranClosed     atomic.Int32 // operations that overlapped a Close of this spy
 
-	txEntered   chan struct{}
-	txRelease   chan struct{}
-	enterOnce   sync.Once
-	releaseOnce sync.Once
+	// The fields below are set before the spy is handed to a store.
+	shouldHold func(commitMsg string) bool
+	txResult   func(n int32) error
+	delay      func() // runs inside every operation, to widen its window
+	onClose    func() // runs at the start of Close, to take a reading
+	blockClose bool
+
+	txEntered    chan struct{}
+	txRelease    chan struct{}
+	closeEntered chan struct{}
+	closeRelease chan struct{}
+	enterOnce    sync.Once
+	releaseOnce  sync.Once
+	closeOnce    sync.Once
+	unblockOnce  sync.Once
 }
 
 func newLifecycleSpy(failID string, holdTx bool) *lifecycleSpy {
-	l := &lifecycleSpy{txEntered: make(chan struct{}), txRelease: make(chan struct{})}
+	l := &lifecycleSpy{
+		shouldHold:   func(string) bool { return holdTx },
+		txEntered:    make(chan struct{}),
+		txRelease:    make(chan struct{}),
+		closeEntered: make(chan struct{}),
+		closeRelease: make(chan struct{}),
+	}
 	l.nativeDoltStorageSpy = &nativeDoltStorageSpy{
 		searchIssues: func(_ context.Context, _ string, f beadslib.IssueFilter) ([]*beadslib.Issue, error) {
 			defer l.enter()()
@@ -56,17 +80,28 @@ func newLifecycleSpy(failID string, holdTx bool) *lifecycleSpy {
 			}
 			return []*beadslib.Issue{spyIssue(id)}, nil
 		},
-		runInTransaction: func(context.Context, string, func(beadslib.Transaction) error) error {
+		runInTransaction: func(_ context.Context, commitMsg string, _ func(beadslib.Transaction) error) error {
 			defer l.enter()()
-			l.txs.Add(1)
-			if holdTx {
+			n := l.txs.Add(1)
+			if l.shouldHold(commitMsg) {
 				l.enterOnce.Do(func() { close(l.txEntered) })
 				<-l.txRelease
+			}
+			if l.txResult != nil {
+				return l.txResult(n)
 			}
 			return nil
 		},
 		close: func() error {
 			l.closes.Add(1)
+			if l.onClose != nil {
+				l.onClose()
+			}
+			if l.blockClose {
+				l.closeOnce.Do(func() { close(l.closeEntered) })
+				<-l.closeRelease
+			}
+			l.closeReturned.Add(1)
 			return nil
 		},
 	}
@@ -92,7 +127,8 @@ func (l *lifecycleSpy) enter() func() {
 	}
 }
 
-func (l *lifecycleSpy) releaseTx() { l.releaseOnce.Do(func() { close(l.txRelease) }) }
+func (l *lifecycleSpy) releaseTx()    { l.releaseOnce.Do(func() { close(l.txRelease) }) }
+func (l *lifecycleSpy) releaseClose() { l.unblockOnce.Do(func() { close(l.closeRelease) }) }
 
 // storeReopeningTo builds a test store on old whose reopen hook hands back
 // fresh.
@@ -102,22 +138,55 @@ func storeReopeningTo(old, fresh beadslib.Storage) *NativeDoltStore {
 	return store
 }
 
-// getWithin runs store.Get(id) and fails the test if it does not return
-// within the bound, so a regression that parks it cannot hang the suite.
-func getWithin(t *testing.T, store *NativeDoltStore, id string, within time.Duration) error {
+// newCheckpoint returns a hook for one of the store's test-only checkpoints
+// and a channel closed the first time the hook runs.
+func newCheckpoint() (func(), <-chan struct{}) {
+	reached := make(chan struct{})
+	var once sync.Once
+	return func() { once.Do(func() { close(reached) }) }, reached
+}
+
+// waitErr waits for one result from done and fails the test if none arrives
+// within the bound, so a regression that parks the operation fails the test
+// instead of hanging it until the go test timeout. Tests that park an
+// operation register its release with t.Cleanup, so a failure here also lets
+// the parked goroutine finish.
+func waitErr(t *testing.T, done <-chan error, within time.Duration, what string) error {
 	t.Helper()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(within):
+		t.Fatalf("%s did not return within %s", what, within)
+		return nil
+	}
+}
+
+func startGet(store *NativeDoltStore, id string) <-chan error {
 	done := make(chan error, 1)
 	go func() {
 		_, err := store.Get(id)
 		done <- err
 	}()
-	select {
-	case err := <-done:
-		return err
-	case <-time.After(within):
-		t.Fatalf("Get(%q) did not return within %s", id, within)
-		return nil
-	}
+	return done
+}
+
+func startUpdate(store *NativeDoltStore, id string) <-chan error {
+	done := make(chan error, 1)
+	go func() { done <- store.Update(id, UpdateOpts{}) }()
+	return done
+}
+
+// getWithin runs store.Get(id) under a bound; see waitErr.
+func getWithin(t *testing.T, store *NativeDoltStore, id string, within time.Duration) error {
+	t.Helper()
+	return waitErr(t, startGet(store, id), within, fmt.Sprintf("Get(%q)", id))
+}
+
+// updateWithin runs store.Update(id) under a bound; see waitErr.
+func updateWithin(t *testing.T, store *NativeDoltStore, id string, within time.Duration) error {
+	t.Helper()
+	return waitErr(t, startUpdate(store, id), within, fmt.Sprintf("Update(%q)", id))
 }
 
 // waitForCloseLatch waits until CloseStore has latched the store closed. It
@@ -146,6 +215,36 @@ func startCloseStore(store *NativeDoltStore) <-chan error {
 	return done
 }
 
+// closeStoreResult is what one CloseStore call returned, plus a reading taken on
+// the closer's own goroutine the moment it returned.
+type closeStoreResult struct {
+	err      error
+	observed int32
+}
+
+// startCloseStoreObserving runs CloseStore on its own goroutine and, as soon
+// as it returns, records observe(). Taking the reading there, rather than on
+// the test goroutine later, pins what was true when CloseStore returned.
+func startCloseStoreObserving(store *NativeDoltStore, observe func() int32) <-chan closeStoreResult {
+	done := make(chan closeStoreResult, 1)
+	go func() {
+		err := store.CloseStore()
+		done <- closeStoreResult{err: err, observed: observe()}
+	}()
+	return done
+}
+
+func waitCloseResult(t *testing.T, done <-chan closeStoreResult, within time.Duration, what string) closeStoreResult {
+	t.Helper()
+	select {
+	case res := <-done:
+		return res
+	case <-time.After(within):
+		t.Fatalf("%s did not return within %s", what, within)
+		return closeStoreResult{}
+	}
+}
+
 // TestNativeDoltStoreRetiredHandleStaysOpenUntilEveryUseReleases: with two
 // uses outstanding on a handle a reconnect retires, releasing the first must
 // not close it; releasing the second closes it exactly once.
@@ -158,10 +257,12 @@ func TestNativeDoltStoreRetiredHandleStaysOpenUntilEveryUseReleases(t *testing.T
 	if err != nil {
 		t.Fatalf("acquire A: %v", err)
 	}
+	t.Cleanup(releaseA)
 	_, _, releaseB, err := store.acquireStorageGen()
 	if err != nil {
 		t.Fatalf("acquire B: %v", err)
 	}
+	t.Cleanup(releaseB)
 	if err := getWithin(t, store, "gc-fail", 5*time.Second); err != nil {
 		t.Fatalf("Get across reconnect: %v", err)
 	}
@@ -197,10 +298,12 @@ func TestNativeDoltStoreDoubleReleaseDoesNotDrainAnotherUse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("acquire A: %v", err)
 	}
+	t.Cleanup(releaseA)
 	_, _, releaseB, err := store.acquireStorageGen()
 	if err != nil {
 		t.Fatalf("acquire B: %v", err)
 	}
+	t.Cleanup(releaseB)
 	if err := getWithin(t, store, "gc-fail", 5*time.Second); err != nil {
 		t.Fatalf("Get across reconnect: %v", err)
 	}
@@ -223,17 +326,23 @@ func TestNativeDoltStoreDoubleReleaseDoesNotDrainAnotherUse(t *testing.T) {
 }
 
 // TestNativeDoltStoreWriteSpanningReconnectCompletesOnItsOriginalHandle: a
-// write that is running when a reconnect swaps the handle finishes on the
-// handle it started on, that handle closes only after the write, and later
-// writes go to the fresh handle.
+// write whose first attempt loses a serialization race after a reconnect has
+// swapped in a fresh handle retries on the handle it started on (the
+// transaction it repeats belongs to that handle), that handle closes only
+// after the write, and later writes go to the fresh handle.
 func TestNativeDoltStoreWriteSpanningReconnectCompletesOnItsOriginalHandle(t *testing.T) {
 	old := newLifecycleSpy("gc-fail", true)
+	old.txResult = func(n int32) error {
+		if n == 1 {
+			return errors.New("Error 1213 (40001): serialization failure: this transaction conflicts with a committed transaction")
+		}
+		return nil
+	}
 	t.Cleanup(old.releaseTx)
 	fresh := newLifecycleSpy("", false)
 	store := storeReopeningTo(old, fresh)
 
-	writeDone := make(chan error, 1)
-	go func() { writeDone <- store.Update("gc-w", UpdateOpts{}) }()
+	writeDone := startUpdate(store, "gc-w")
 	select {
 	case <-old.txEntered:
 	case <-time.After(5 * time.Second):
@@ -248,20 +357,17 @@ func TestNativeDoltStoreWriteSpanningReconnectCompletesOnItsOriginalHandle(t *te
 		t.Fatalf("original handle Close calls while a write is running on it = %d, want 0", got)
 	}
 
+	// The first attempt now fails with a serialization conflict; the retry
+	// must run on the original handle, not the fresh one now current.
 	old.releaseTx()
-	select {
-	case err := <-writeDone:
-		if err != nil {
-			t.Fatalf("write spanning the reconnect: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("write did not return after release")
+	if err := waitErr(t, writeDone, 5*time.Second, "write spanning the reconnect"); err != nil {
+		t.Fatalf("write spanning the reconnect: %v", err)
 	}
-	if got := old.txs.Load(); got != 1 {
-		t.Fatalf("transactions on the original handle = %d, want 1", got)
+	if got := old.txs.Load(); got != 2 {
+		t.Fatalf("transactions on the original handle = %d, want 2 (the conflicting attempt and its retry)", got)
 	}
 	if got := fresh.txs.Load(); got != 0 {
-		t.Fatalf("transactions on the fresh handle = %d, want 0 (the write must not move handles)", got)
+		t.Fatalf("transactions on the fresh handle = %d, want 0 (the retry must stay on the original handle)", got)
 	}
 	if got := waitForCount(old.closes.Load, 1, 5*time.Second); got != 1 {
 		t.Fatalf("original handle Close calls after the write released it = %d, want 1", got)
@@ -270,29 +376,34 @@ func TestNativeDoltStoreWriteSpanningReconnectCompletesOnItsOriginalHandle(t *te
 		t.Fatalf("operations that overlapped a Close of the original handle = %d, want 0", got)
 	}
 
-	if err := store.Update("gc-w2", UpdateOpts{}); err != nil {
+	if err := updateWithin(t, store, "gc-w2", 5*time.Second); err != nil {
 		t.Fatalf("write after reconnect: %v", err)
 	}
 	if got := fresh.txs.Load(); got != 1 {
 		t.Fatalf("transactions on the fresh handle after reconnect = %d, want 1", got)
 	}
-	if got := old.txs.Load(); got != 1 {
-		t.Fatalf("transactions on the retired handle = %d, want still 1", got)
+	if got := old.txs.Load(); got != 2 {
+		t.Fatalf("transactions on the retired handle = %d, want still 2", got)
 	}
 }
 
 // TestNativeDoltStoreCloseStoreWaitsForWriteOnRetiredHandle: CloseStore must
 // not return while any operation that started before it is still running,
-// including one running on a handle a reconnect has already retired. Before
-// the store-wide wait, CloseStore waited only for uses of the current handle.
+// including one running on a handle a reconnect has already retired.
 func TestNativeDoltStoreCloseStoreWaitsForWriteOnRetiredHandle(t *testing.T) {
 	old := newLifecycleSpy("gc-fail", true)
 	t.Cleanup(old.releaseTx)
 	fresh := newLifecycleSpy("", false)
+	// Taken when the current handle is closed: the write on the retired handle
+	// must have finished by then.
+	var oldActiveAtFreshClose atomic.Int32
+	oldActiveAtFreshClose.Store(-1)
+	fresh.onClose = func() { oldActiveAtFreshClose.Store(old.active.Load()) }
 	store := storeReopeningTo(old, fresh)
+	atDrain, reachedDrain := newCheckpoint()
+	store.beforeCloseDrain = atDrain
 
-	writeDone := make(chan error, 1)
-	go func() { writeDone <- store.Update("gc-w", UpdateOpts{}) }()
+	writeDone := startUpdate(store, "gc-w")
 	select {
 	case <-old.txEntered:
 	case <-time.After(5 * time.Second):
@@ -302,33 +413,38 @@ func TestNativeDoltStoreCloseStoreWaitsForWriteOnRetiredHandle(t *testing.T) {
 		t.Fatalf("Get across reconnect: %v", err)
 	}
 
-	closeDone := startCloseStore(store)
-	waitForCloseLatch(t, store, 5*time.Second)
-	if _, err := store.Get("gc-new"); !errors.Is(err, ErrStoreClosed) {
-		t.Fatalf("Get after the close latch = %v, want ErrStoreClosed", err)
-	}
+	closeDone := startCloseStoreObserving(store, old.active.Load)
 	select {
-	case err := <-closeDone:
-		t.Fatalf("CloseStore returned (%v) while a write that started before it was still running on the handle a reconnect retired", err)
+	case <-reachedDrain:
+	case res := <-closeDone:
+		t.Fatalf("CloseStore returned (err=%v, operations still running on the retired handle=%d) without reaching its wait for operations in flight", res.err, res.observed)
+	case <-time.After(5 * time.Second):
+		t.Fatal("CloseStore never reached its wait for operations in flight")
+	}
+	// Past the checkpoint the closer is in its wait, which the running write
+	// must hold open.
+	select {
+	case res := <-closeDone:
+		t.Fatalf("CloseStore returned (%v) while a write that started before it was still running on the handle a reconnect retired", res.err)
 	case <-time.After(closeSettle):
+	}
+	if err := getWithin(t, store, "gc-new", 5*time.Second); !errors.Is(err, ErrStoreClosed) {
+		t.Fatalf("Get after the close latch = %v, want ErrStoreClosed", err)
 	}
 
 	old.releaseTx()
-	select {
-	case err := <-writeDone:
-		if err != nil {
-			t.Fatalf("write: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("write did not return after release")
+	if err := waitErr(t, writeDone, 5*time.Second, "write"); err != nil {
+		t.Fatalf("write: %v", err)
 	}
-	select {
-	case err := <-closeDone:
-		if err != nil {
-			t.Fatalf("CloseStore: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("CloseStore did not return after the write released")
+	res := waitCloseResult(t, closeDone, 5*time.Second, "CloseStore after the write released")
+	if res.err != nil {
+		t.Fatalf("CloseStore: %v", res.err)
+	}
+	if res.observed != 0 {
+		t.Fatalf("operations running on the retired handle when CloseStore returned = %d, want 0", res.observed)
+	}
+	if got := oldActiveAtFreshClose.Load(); got != 0 {
+		t.Fatalf("operations running on the retired handle when CloseStore closed the current one = %d, want 0", got)
 	}
 	if got := fresh.closes.Load(); got != 1 {
 		t.Fatalf("current handle Close calls when CloseStore returned = %d, want 1", got)
@@ -343,49 +459,77 @@ func TestNativeDoltStoreCloseStoreWaitsForWriteOnRetiredHandle(t *testing.T) {
 
 // TestNativeDoltStoreSecondCloseStoreWaitsForTheFirstToFinish: a CloseStore
 // that finds the store already closing must not return until the first one
-// has finished, which is after every operation that started before the latch
-// has released.
+// has finished: after every operation in flight has released, and after the
+// first closer's Close of the handle has itself returned.
 func TestNativeDoltStoreSecondCloseStoreWaitsForTheFirstToFinish(t *testing.T) {
 	spy := newLifecycleSpy("", true)
+	spy.blockClose = true
 	t.Cleanup(spy.releaseTx)
+	t.Cleanup(spy.releaseClose)
 	store := newNativeDoltStoreForTest(spy)
+	atDrain, reachedDrain := newCheckpoint()
+	store.beforeCloseDrain = atDrain
+	atWaitForFirst, reachedWaitForFirst := newCheckpoint()
+	store.beforeCloseWaitForFirst = atWaitForFirst
 
-	writeDone := make(chan error, 1)
-	go func() { writeDone <- store.Update("gc-w", UpdateOpts{}) }()
+	writeDone := startUpdate(store, "gc-w")
 	select {
 	case <-spy.txEntered:
 	case <-time.After(5 * time.Second):
 		t.Fatal("write never reached the handle")
 	}
 
-	first := startCloseStore(store)
-	waitForCloseLatch(t, store, 5*time.Second)
-	second := startCloseStore(store)
+	first := startCloseStoreObserving(store, spy.closeReturned.Load)
 	select {
-	case err := <-second:
-		t.Fatalf("second CloseStore returned (%v) while the first was still waiting for a write in flight", err)
-	case err := <-first:
-		t.Fatalf("first CloseStore returned (%v) while a write was in flight", err)
+	case <-reachedDrain:
+	case res := <-first:
+		t.Fatalf("first CloseStore returned (%v) without reaching its wait for operations in flight", res.err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("first CloseStore never reached its wait for operations in flight")
+	}
+	second := startCloseStoreObserving(store, spy.closeReturned.Load)
+	select {
+	case <-reachedWaitForFirst:
+	case res := <-second:
+		t.Fatalf("second CloseStore returned (%v) without waiting for the first, which was still waiting for a write in flight", res.err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("second CloseStore never reached its wait for the first")
+	}
+	select {
+	case res := <-second:
+		t.Fatalf("second CloseStore returned (%v) while the first was still waiting for a write in flight", res.err)
+	case res := <-first:
+		t.Fatalf("first CloseStore returned (%v) while a write was in flight", res.err)
 	case <-time.After(closeSettle):
 	}
 
+	// Let the write finish: the first closer goes on to Close the handle,
+	// which parks until the test releases it.
 	spy.releaseTx()
-	select {
-	case err := <-writeDone:
-		if err != nil {
-			t.Fatalf("write: %v", err)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("write did not return after release")
+	if err := waitErr(t, writeDone, 5*time.Second, "write"); err != nil {
+		t.Fatalf("write: %v", err)
 	}
-	for name, done := range map[string]<-chan error{"first": first, "second": second} {
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Fatalf("%s CloseStore: %v", name, err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatalf("%s CloseStore did not return after the write released", name)
+	select {
+	case <-spy.closeEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first CloseStore never called Close on the handle after the write released")
+	}
+	select {
+	case res := <-second:
+		t.Fatalf("second CloseStore returned (%v) while the first was still inside the handle's Close", res.err)
+	case res := <-first:
+		t.Fatalf("first CloseStore returned (%v) while the handle's Close had not returned", res.err)
+	case <-time.After(closeSettle):
+	}
+
+	spy.releaseClose()
+	for name, done := range map[string]<-chan closeStoreResult{"first": first, "second": second} {
+		res := waitCloseResult(t, done, 5*time.Second, name+" CloseStore")
+		if res.err != nil {
+			t.Fatalf("%s CloseStore: %v", name, res.err)
+		}
+		if res.observed != 1 {
+			t.Fatalf("%s CloseStore returned when the handle's Close had returned %d times, want 1", name, res.observed)
 		}
 	}
 	if got := spy.closes.Load(); got != 1 {
@@ -393,37 +537,92 @@ func TestNativeDoltStoreSecondCloseStoreWaitsForTheFirstToFinish(t *testing.T) {
 	}
 }
 
+// TestNativeDoltStoreReadPanicReleasesItsStorageUse: a read that panics
+// (recovered further up, as an HTTP handler does) must still release its
+// storage use, or CloseStore would wait for it forever.
+func TestNativeDoltStoreReadPanicReleasesItsStorageUse(t *testing.T) {
+	spy := newLifecycleSpy("", false)
+	store := newNativeDoltStoreForTest(spy)
+
+	recovered := func() (r any) {
+		defer func() { r = recover() }()
+		_ = store.withReadRetry(func(context.Context, beadslib.Storage) error {
+			panic("read blew up")
+		})
+		return nil
+	}()
+	if recovered == nil {
+		t.Fatal("withReadRetry did not propagate the read's panic")
+	}
+
+	if err := waitErr(t, startCloseStore(store), 5*time.Second, "CloseStore after a read panicked"); err != nil {
+		t.Fatalf("CloseStore: %v", err)
+	}
+	if got := spy.closes.Load(); got != 1 {
+		t.Fatalf("handle Close calls = %d, want 1", got)
+	}
+}
+
 // TestNativeDoltStoreHandleLifecycleStress runs reads, writes and
-// reconnect-triggering reads on many goroutines, then two concurrent
-// CloseStore calls while they are still running. By the end every storage
-// handle the store ever opened is closed exactly once, and no operation ran
-// on a closed handle. Bounded to well under two seconds.
+// reconnect-forcing reads on many goroutines, with one write parked on the
+// initial handle while reconnects retire it, then shuts down with two
+// concurrent CloseStore calls while everything is still running. Neither
+// CloseStore may return while any operation is still running, on any handle;
+// by the end every handle the store opened is closed exactly once and no
+// operation ran on a closed handle.
 func TestNativeDoltStoreHandleLifecycleStress(t *testing.T) {
+	const parkedID = "gc-parked"
 	var spiesMu sync.Mutex
 	var spies []*lifecycleSpy
+	snapshot := func() []*lifecycleSpy {
+		spiesMu.Lock()
+		defer spiesMu.Unlock()
+		return append([]*lifecycleSpy(nil), spies...)
+	}
+	totalActive := func() int32 {
+		var n int32
+		for _, l := range snapshot() {
+			n += l.active.Load()
+		}
+		return n
+	}
 	newSpy := func() *lifecycleSpy {
 		l := newLifecycleSpy("gc-fail", false)
+		l.shouldHold = func(commitMsg string) bool { return strings.Contains(commitMsg, parkedID) }
 		l.delay = func() { time.Sleep(time.Duration(rand.IntN(300)) * time.Microsecond) }
 		spiesMu.Lock()
 		spies = append(spies, l)
 		spiesMu.Unlock()
 		return l
 	}
-	store := newNativeDoltStoreForTest(newSpy())
+	initial := newSpy()
+	t.Cleanup(initial.releaseTx)
+	store := newNativeDoltStoreForTest(initial)
 	store.readRetryBudgetOverride = 50 * time.Millisecond
-	var reopens atomic.Int32
-	store.reopen = func(context.Context) (beadslib.Storage, error) {
-		reopens.Add(1)
-		return newSpy(), nil
+	store.reopen = func(context.Context) (beadslib.Storage, error) { return newSpy(), nil }
+	atDrain, reachedDrain := newCheckpoint()
+	store.beforeCloseDrain = atDrain
+	atWaitForFirst, reachedWaitForFirst := newCheckpoint()
+	store.beforeCloseWaitForFirst = atWaitForFirst
+
+	// One write parks on the initial handle; the reconnects below retire that
+	// handle while the write is still running on it.
+	parkedDone := startUpdate(store, parkedID)
+	select {
+	case <-initial.txEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("parked write never reached the initial handle")
 	}
 
+	var stop atomic.Bool
+	t.Cleanup(func() { stop.Store(true) })
 	const workers = 16
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
-			for i := 0; ; i++ {
+			for i := 0; !stop.Load(); i++ {
 				var err error
 				switch (w + i) % 4 {
 				case 0:
@@ -440,28 +639,84 @@ func TestNativeDoltStoreHandleLifecycleStress(t *testing.T) {
 		}(w)
 	}
 
-	time.Sleep(300 * time.Millisecond)
-	first := startCloseStore(store)
-	second := startCloseStore(store)
-	for name, done := range map[string]<-chan error{"first": first, "second": second} {
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Fatalf("%s CloseStore: %v", name, err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatalf("%s CloseStore did not return", name)
+	// Shut down only once activity is observed: a reconnect has installed a
+	// fresh handle (retiring the initial one under the parked write), and
+	// reads and writes have run.
+	generation := func() uint64 {
+		store.mu.RLock()
+		defer store.mu.RUnlock()
+		return store.generation
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var reads, txs int32
+		for _, l := range snapshot() {
+			reads += l.reads.Load()
+			txs += l.txs.Load()
 		}
+		if generation() >= 1 && reads >= 50 && txs >= 10 {
+			t.Logf("activity before shutdown: generation=%d reads=%d txs=%d", generation(), reads, txs)
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no activity within 5s: generation=%d reads=%d txs=%d", generation(), reads, txs)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := initial.active.Load(); got < 1 {
+		t.Fatalf("operations running on the retired initial handle at shutdown = %d, want at least the parked write", got)
 	}
 
-	// Every operation that acquired storage before the latch has released it,
-	// and none can start after it, so nothing is running on any handle now.
-	spiesMu.Lock()
-	snapshot := append([]*lifecycleSpy(nil), spies...)
-	spiesMu.Unlock()
-	for i, l := range snapshot {
-		if got := l.active.Load(); got != 0 {
-			t.Errorf("handle %d: %d operations still running after CloseStore returned", i, got)
+	// Two concurrent closers. Whichever latches waits for the operations in
+	// flight; the other waits for it. Each records how many operations were
+	// still running, on any handle, the moment it returned.
+	type namedResult struct {
+		name string
+		closeStoreResult
+	}
+	results := make(chan namedResult, 2)
+	for _, name := range []string{"closer A", "closer B"} {
+		go func(name string) {
+			err := store.CloseStore()
+			results <- namedResult{name: name, closeStoreResult: closeStoreResult{err: err, observed: totalActive()}}
+		}(name)
+	}
+	var got []namedResult
+	drainReached, waitReached := reachedDrain, reachedWaitForFirst
+	waitDeadline := time.After(5 * time.Second)
+	for drainReached != nil || (waitReached != nil && len(got) == 0) {
+		select {
+		case <-drainReached:
+			drainReached = nil
+		case <-waitReached:
+			waitReached = nil
+		case r := <-results:
+			got = append(got, r)
+		case <-waitDeadline:
+			t.Fatalf("closers did not reach their waits within 5s (drain reached=%v, wait-for-first reached=%v, returned=%d)",
+				drainReached == nil, waitReached == nil, len(got))
+		}
+	}
+	for _, r := range got {
+		t.Errorf("%s returned (err=%v) while the parked write was still running on the retired handle (%d operations running)", r.name, r.err, r.observed)
+	}
+
+	initial.releaseTx()
+	if err := waitErr(t, parkedDone, 5*time.Second, "parked write"); err != nil {
+		t.Fatalf("parked write: %v", err)
+	}
+	for len(got) < 2 {
+		select {
+		case r := <-results:
+			got = append(got, r)
+			if r.err != nil {
+				t.Errorf("%s: %v", r.name, r.err)
+			}
+			if r.observed != 0 {
+				t.Errorf("%s returned with %d operations still running", r.name, r.observed)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("CloseStore did not return within 5s after the parked write released (%d of 2 returned)", len(got))
 		}
 	}
 
@@ -476,16 +731,14 @@ func TestNativeDoltStoreHandleLifecycleStress(t *testing.T) {
 		t.Fatal("workers did not stop after CloseStore")
 	}
 
-	spiesMu.Lock()
-	snapshot = append([]*lifecycleSpy(nil), spies...)
-	spiesMu.Unlock()
-	deadline := time.Now().Add(2 * time.Second)
-	for _, l := range snapshot {
-		for l.closes.Load() != 1 && time.Now().Before(deadline) {
+	all := snapshot()
+	closeDeadline := time.Now().Add(2 * time.Second)
+	for _, l := range all {
+		for l.closes.Load() != 1 && time.Now().Before(closeDeadline) {
 			time.Sleep(time.Millisecond)
 		}
 	}
-	for i, l := range snapshot {
+	for i, l := range all {
 		if got := l.closes.Load(); got != 1 {
 			t.Errorf("handle %d Close calls = %d, want exactly 1", i, got)
 		}
@@ -493,8 +746,5 @@ func TestNativeDoltStoreHandleLifecycleStress(t *testing.T) {
 			t.Errorf("handle %d: %d operations overlapped its Close", i, got)
 		}
 	}
-	t.Logf("handles opened: %d (reopens: %d)", len(snapshot), reopens.Load())
-	if len(snapshot) < 2 {
-		t.Errorf("handles opened = %d, want at least one reconnect during the run", len(snapshot))
-	}
+	t.Logf("handles opened: %d", len(all))
 }

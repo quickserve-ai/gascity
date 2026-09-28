@@ -528,6 +528,14 @@ type NativeDoltStore struct {
 	// should demote to the bd leaf in seconds rather than hold a caller
 	// through a minute and a half of mysql i/o timeouts.
 	readRetryBudgetOverride time.Duration
+	// beforeCloseDrain, when set, runs in the CloseStore that latched the
+	// store closed, just before it waits for operations in flight.
+	// beforeCloseWaitForFirst, when set, runs in a CloseStore that found the
+	// store already closing, just before it waits for that first CloseStore.
+	// Only tests set them, to know a closer has reached its wait before
+	// asserting that it has not returned.
+	beforeCloseDrain        func()
+	beforeCloseWaitForFirst func()
 
 	// readOnlyReason, when non-empty, latches this handle read-only: every
 	// mutating method refuses with ErrProxiedNativeReadOnly before it reaches
@@ -1350,6 +1358,9 @@ func (s *NativeDoltStore) CloseStore() error {
 		done := s.closeDone
 		s.mu.Unlock()
 		if done != nil {
+			if s.beforeCloseWaitForFirst != nil {
+				s.beforeCloseWaitForFirst()
+			}
 			<-done
 		}
 		return nil
@@ -1381,6 +1392,9 @@ func (s *NativeDoltStore) CloseStore() error {
 	// use can register after the latch, so the count only falls. Then close
 	// the current handle here and report the result: no operation ever runs
 	// on a closed handle.
+	if s.beforeCloseDrain != nil {
+		s.beforeCloseDrain()
+	}
 	s.inflight.Wait()
 	if handle == nil {
 		return nil
