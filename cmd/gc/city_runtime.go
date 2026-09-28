@@ -199,16 +199,12 @@ type CityRuntime struct {
 	fsPressureConsecutiveSkips int
 	fsPressureEpisodeLogged    bool
 
-	// reapSkips carries worktree-reaper skip history between ticks so an
-	// unchanged skip is reported once instead of on every sweep. Owned by the
-	// serial tick, like the other per-tick state above.
-	reapSkips *reapSkipTracker
-
-	// Cross-tick memo of bead-status Get verdicts for the worktree reaper —
-	// pass-1 discovery otherwise pays one remote hub round trip per
-	// bead-shaped worktree on every tick (ga-singc6). Lazily initialized at
-	// the reap call site.
-	reapBeadStatuses *beadStatusCache
+	// worktreeReaper is the single-flight background lane the closed-bead
+	// worktree reaper runs on (ga-yuiof4 item 3). It owns the reaper-only
+	// state that used to sit here — the skip tracker and the cross-tick
+	// bead-status memo (ga-singc6) — and hands it to one pass at a time.
+	worktreeReaper     *worktreeReaperLane
+	worktreeReaperOnce sync.Once
 
 	convScopes          map[string]*convergenceScope // nil until bead store available; keyed by rig name ("" = city/HQ)
 	convScopesMu        sync.RWMutex                 // guards convScopes map pointer
@@ -448,7 +444,6 @@ func newCityRuntime(p CityRuntimeParams) (*CityRuntime, error) {
 		orderRescanLast:         time.Now(),
 		trace:                   newSessionReconcilerTraceManager(p.CityPath, p.CityName, p.Stderr),
 		rec:                     p.Rec,
-		reapSkips:               newReapSkipTracker(),
 		poolSessions:            p.PoolSessions,
 		poolDeathHandlers:       p.PoolDeathHandlers,
 		forceStopShutdown:       p.ForceStopShutdown,
@@ -1425,37 +1420,19 @@ func (cr *CityRuntime) tick(
 	reapEnabled := cr.cfg.Daemon.AutoReapClosedBeadWorktreesEnabled()
 	reapDryRun := cr.cfg.Daemon.AutoReapClosedBeadWorktreesDryRunEnabled()
 	if reapEnabled || reapDryRun {
+		// The closed-bead worktree reaper (and, under real reaping, the
+		// agent-home cleanup) runs OFF the tick on a single-flight background
+		// lane: this only triggers a pass and never waits on one. A pass
+		// wedged in a context-free rig-store call once held this tick — and
+		// with it the next tick's order dispatch — for 45 minutes (ga-yuiof4
+		// item 3). A trigger that finds a pass still running skips and says
+		// so in this phase record (skipped_inflight, inflight_age_ms). Real
+		// removal supersedes dry-run when both flags are set, as before. See
+		// worktree_reaper_lane.go for what is snapshotted here and why the
+		// liveness gate stays honest when the pass runs off-tick.
 		phaseStart = time.Now()
-		// Cross-check the liveness gate against the current open-session set in
-		// addition to the authoritative /proc cwd scan. Real removal supersedes
-		// dry-run when both flags are set.
-		liveSessionDirs := liveSessionWorktreeDirs(sessionBeads)
-		// Memoize pass-1 bead-status Gets across ticks: for hub-backed rigs
-		// each Get is a remote multi-statement hydration, and the statuses
-		// the reaper discovers against change roughly never. Every safety
-		// gate (git, borrow-veto List, liveness) still runs fresh per pass —
-		// see reapBeadStatusCacheTTL for the staleness analysis (ga-singc6).
-		if cr.reapBeadStatuses == nil {
-			cr.reapBeadStatuses = newBeadStatusCache(reapBeadStatusCacheTTL)
-		}
-		rigStores := cr.rigBeadStores()
-		cachedStores := make(map[string]beads.Store, len(rigStores))
-		for rigName, rigStore := range rigStores {
-			cachedStores[rigName] = cr.reapBeadStatuses.wrap(rigName, rigStore)
-		}
-		report := reapClosedBeadWorktrees(cr.cityPath, cr.cfg, cachedStores, liveSessionDirs, !reapEnabled, cr.rec, cr.reapSkips, cr.stderr)
-		recordPhase(TraceSiteControllerTickPhase, "reap_closed_bead_worktrees", phaseStart, map[string]any{
-			"reaped":    len(report.Reaped),
-			"protected": len(report.Protected),
-			"dry_run":   !reapEnabled,
-		})
-		// Agent-home worktree cleanup performs real removals, so it runs only
-		// when real reaping is enabled — never under dry-run.
-		if reapEnabled {
-			phaseStart = time.Now()
-			agentHomesReset := cleanupClosedBeadAgentHomeWorktrees(cr.cityPath, cr.cfg, cr.rigBeadStores(), cr.stderr)
-			recordPhase(TraceSiteControllerTickPhase, "cleanup_agent_home_worktrees", phaseStart, map[string]any{"reset": agentHomesReset})
-		}
+		reapTrigger := cr.triggerWorktreeReaperPass(ctx, cr.cfg, reapEnabled, sessionBeads)
+		recordPhase(TraceSiteControllerTickPhase, "reap_closed_bead_worktrees", phaseStart, reapTrigger.fields())
 	}
 	if cr.cfg.Daemon.AutoReapStoppedAgentHomesEnabled() {
 		phaseStart = time.Now()
@@ -2194,7 +2171,7 @@ func (cr *CityRuntime) reloadConfigTraced(
 			cr.cs.update(result.Cfg, cr.sp)
 			// The reap status memo may hold verdicts read from the replaced
 			// backends; a same-named rig can now be a different store.
-			cr.reapBeadStatuses = nil
+			cr.worktreeReaperLaneOf().invalidateStatusCache()
 			message := fmt.Sprintf("Config reloaded: bead store metadata changed (rev %s)", shortRev(result.Revision))
 			if ordersChanged {
 				message = fmt.Sprintf("Config reloaded: bead store metadata changed; orders reloaded: %s (rev %s)", orderSummary, shortRev(result.Revision))
@@ -2489,7 +2466,7 @@ func (cr *CityRuntime) reloadConfigTraced(
 		cr.standaloneRigStores = buildStandaloneRigStores(nextCfg, cr.cityPath, cr.stderr)
 		// Rebuilt stores invalidate the reap status memo (see the cs.update
 		// branch above).
-		cr.reapBeadStatuses = nil
+		cr.worktreeReaperLaneOf().invalidateStatusCache()
 	}
 
 	// Rebuild convergence scopes against the reloaded config so rigs added,

@@ -464,9 +464,10 @@ type reapCandidate struct {
 // reading the report (the dry-run summary, the tick's phase counters) see the
 // full picture on every pass.
 //
-// The tracker is owned by the controller runtime and touched only from the
-// serial reconciler tick, so it carries no lock, matching the other per-tick
-// state on CityRuntime. A nil *reapSkipTracker surfaces every skip, preserving
+// The tracker is owned by the worktree-reaper lane (worktree_reaper_lane.go),
+// whose single flight hands it to exactly one background pass at a time, with
+// the handoff ordered through the lane's mutex; it therefore carries no lock of
+// its own. A nil *reapSkipTracker surfaces every skip, preserving
 // the unsuppressed behavior for one-shot callers that have no pass history to
 // compare against.
 type reapSkipTracker struct {
