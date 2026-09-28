@@ -322,28 +322,48 @@ func sameRuntimeProvider(a, b runtime.Provider) bool {
 
 // registerSessionStartFence brackets every runtime start any
 // internal/session Manager makes through sp with this runtime's session-start
-// fence. Idempotent per provider. Called on the run goroutine: at run start
-// for cr.sp, and on reload for a replacement provider BEFORE it is published
-// to the controller state (so no in-process API wake on it is unfenced).
-func (cr *CityRuntime) registerSessionStartFence(sp runtime.Provider) {
+// fence, and reports whether this call added the registration (false when sp
+// was already registered or cannot be keyed). Called on the run goroutine: at
+// run start for cr.sp, and on reload for a replacement provider BEFORE it is
+// published to the controller state (so no in-process API wake on it is
+// unfenced). Registrations live until run() returns — see run() for why a
+// reload never drops one.
+func (cr *CityRuntime) registerSessionStartFence(sp runtime.Provider) bool {
 	if sp == nil {
-		return
+		return false
 	}
 	for _, reg := range cr.startFenceRegs {
 		if sameRuntimeProvider(reg.sp, sp) {
-			return
+			return false
 		}
 	}
 	unregister, ok := sessionpkg.RegisterStartFence(sp, cr.sessionStartFenceOf())
 	if !ok {
 		fmt.Fprintf(cr.stderr, "%s: worktree reaper: session provider %T cannot carry the session-start fence; only reconciler starts are fenced\n", cr.logPrefix, sp) //nolint:errcheck // best-effort stderr
-		return
+		return false
 	}
 	cr.startFenceRegs = append(cr.startFenceRegs, startFenceRegistration{sp: sp, unregister: unregister})
+	return true
+}
+
+// unregisterSessionStartFence drops the registration for sp. Only a failed
+// reload uses it, for a replacement provider it registered but never
+// published — no consumer can hold a handle on that provider.
+func (cr *CityRuntime) unregisterSessionStartFence(sp runtime.Provider) {
+	kept := cr.startFenceRegs[:0]
+	for _, reg := range cr.startFenceRegs {
+		if sameRuntimeProvider(reg.sp, sp) {
+			reg.unregister()
+			continue
+		}
+		kept = append(kept, reg)
+	}
+	cr.startFenceRegs = kept
 }
 
 // retireSessionStartFencesExcept unregisters the fence from every provider but
-// keep (nil keep retires all).
+// keep (nil keep retires all). run() calls it with nil on return; nothing
+// retires a registration mid-run.
 func (cr *CityRuntime) retireSessionStartFencesExcept(keep runtime.Provider) {
 	kept := cr.startFenceRegs[:0]
 	for _, reg := range cr.startFenceRegs {

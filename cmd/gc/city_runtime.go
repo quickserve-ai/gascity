@@ -208,6 +208,9 @@ type CityRuntime struct {
 	// startFenceRegs are the providers the lane's session-start fence is
 	// registered on (internal/session.RegisterStartFence). Run goroutine only.
 	startFenceRegs []startFenceRegistration
+	// startFenceActive is set by run() once it has registered the fence on
+	// cr.sp; reload registers replacement providers only while it is set.
+	startFenceActive bool
 
 	convScopes          map[string]*convergenceScope // nil until bead store available; keyed by rig name ("" = city/HQ)
 	convScopesMu        sync.RWMutex                 // guards convScopes map pointer
@@ -566,6 +569,13 @@ func (cr *CityRuntime) run(ctx context.Context) {
 	// city's provider — reconcile, control dispatcher, in-process API wakes —
 	// is bracketed by the worktree reaper lane's session-start fence
 	// (ga-yuiof4 item 3). Registered before anything here can start a session.
+	//
+	// Registrations are NEVER dropped mid-run, not even for a provider a
+	// reload replaced: an in-process API wake may already hold a worker handle
+	// built on the old provider and start through it after the swap. All of
+	// them are unregistered here when run() returns. Their number is bounded
+	// by the provider-changing reloads in one controller lifetime.
+	cr.startFenceActive = true
 	cr.registerSessionStartFence(cr.sp)
 	defer cr.retireSessionStartFencesExcept(nil)
 	cr.sweepOrphanedOrderTracking()
@@ -2252,6 +2262,10 @@ func (cr *CityRuntime) reloadConfigTraced(
 	nextSp := cr.sp
 	nextDops := cr.dops
 	providerChanged := false
+	// nextSpPublished is set once a replacement provider has been handed to a
+	// consumer (the controller state, or cr.sp). Until then no one can hold a
+	// handle on it, so a failed reload drops its fence registration.
+	nextSpPublished := false
 
 	// Detect session provider change. A pack-declared runtime binds its
 	// command into the provider at construction time, so a changed (or
@@ -2271,8 +2285,17 @@ func (cr *CityRuntime) reloadConfigTraced(
 			providerChanged = true
 			nextSp = newSp
 			// Fence the replacement provider before it is published to the
-			// controller state (and so to in-process API wakes).
-			cr.registerSessionStartFence(nextSp)
+			// controller state (and so to in-process API wakes). If this
+			// reload fails before publishing it, nothing holds it: drop the
+			// registration on the way out (only one this call added).
+			if cr.startFenceActive && cr.registerSessionStartFence(nextSp) {
+				unpublishedSp := nextSp
+				defer func() {
+					if !nextSpPublished {
+						cr.unregisterSessionStartFence(unpublishedSp)
+					}
+				}()
+			}
 			nextDops = newDrainOps(nextSp)
 			pendingProviderName = newProviderName
 		}
@@ -2355,6 +2378,9 @@ func (cr *CityRuntime) reloadConfigTraced(
 	// Publish through the canonical revision-aware path immediately before any
 	// provider stop. Its publishing store open is the authoritative schema gate.
 	if cr.cs != nil {
+		// From here the controller state (and so the in-process API server)
+		// may hand out handles on nextSp; its fence registration must stay.
+		nextSpPublished = true
 		cr.cs.updateFromRuntime(nextCfg, nextSp, result.Revision)
 		if cr.cs.Config() != nextCfg {
 			err := errors.New("config reload superseded by a concurrent config mutation")
@@ -2447,9 +2473,11 @@ func (cr *CityRuntime) reloadConfigTraced(
 	cr.sp = nextSp
 	cr.dops = nextDops
 	cr.serviceStateMu.Unlock()
-	if cr.startFenceRegs != nil {
+	nextSpPublished = true
+	if cr.startFenceActive {
+		// Idempotent. The replaced provider's registration is deliberately
+		// kept until run() returns (see run()).
 		cr.registerSessionStartFence(nextSp)
-		cr.retireSessionStartFencesExcept(nextSp)
 	}
 	cr.demandSnapshot = nil
 
