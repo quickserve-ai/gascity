@@ -205,6 +205,9 @@ type CityRuntime struct {
 	// bead-status memo (ga-singc6) — and hands it to one pass at a time.
 	worktreeReaper     *worktreeReaperLane
 	worktreeReaperOnce sync.Once
+	// startFenceRegs are the providers the lane's session-start fence is
+	// registered on (internal/session.RegisterStartFence). Run goroutine only.
+	startFenceRegs []startFenceRegistration
 
 	convScopes          map[string]*convergenceScope // nil until bead store available; keyed by rig name ("" = city/HQ)
 	convScopesMu        sync.RWMutex                 // guards convScopes map pointer
@@ -559,6 +562,12 @@ func (cr *CityRuntime) run(ctx context.Context) {
 	// one allowed to tear the provider's shared server down.
 	cr.ownedCity.Store(true)
 	defer cr.shutdown()
+	// Every runtime start any internal/session Manager makes through this
+	// city's provider — reconcile, control dispatcher, in-process API wakes —
+	// is bracketed by the worktree reaper lane's session-start fence
+	// (ga-yuiof4 item 3). Registered before anything here can start a session.
+	cr.registerSessionStartFence(cr.sp)
+	defer cr.retireSessionStartFencesExcept(nil)
 	cr.sweepOrphanedOrderTracking()
 	if cr.svc != nil {
 		if err := cr.svc.Reload(); err != nil {
@@ -2261,6 +2270,9 @@ func (cr *CityRuntime) reloadConfigTraced(
 		} else {
 			providerChanged = true
 			nextSp = newSp
+			// Fence the replacement provider before it is published to the
+			// controller state (and so to in-process API wakes).
+			cr.registerSessionStartFence(nextSp)
 			nextDops = newDrainOps(nextSp)
 			pendingProviderName = newProviderName
 		}
@@ -2435,6 +2447,10 @@ func (cr *CityRuntime) reloadConfigTraced(
 	cr.sp = nextSp
 	cr.dops = nextDops
 	cr.serviceStateMu.Unlock()
+	if cr.startFenceRegs != nil {
+		cr.registerSessionStartFence(nextSp)
+		cr.retireSessionStartFencesExcept(nextSp)
+	}
 	cr.demandSnapshot = nil
 
 	// Re-point the session-event pump at the new provider's stream (or
@@ -3707,6 +3723,10 @@ func (cr *CityRuntime) controlDispatcherTick(ctx context.Context) {
 		cr.cfg.Daemon.DriftDrainTimeoutDuration(),
 		cr.stdout,
 		cr.stderr,
+		// Its Manager starts are already fenced through the provider
+		// registration; the option also fences its reconciler starts that
+		// bypass a Manager and its launch-drift Relaunch (ga-yuiof4 item 3).
+		withSessionStartFence(cr.sessionStartFenceOf()),
 	)
 	cr.requestDeferredDrainFollowUpTick()
 }

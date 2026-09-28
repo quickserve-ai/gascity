@@ -3764,7 +3764,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 								continue
 							}
 							if launchOnlyDrift {
-								relaunched, launchBatch := relaunchAgentForLaunchDrift(ctx, sp, sessFront, infoByID[id], name,
+								relaunched, launchBatch := relaunchAgentForLaunchDrift(ctx, reconcileOpts.sessionStartFence, sp, sessFront, infoByID[id], name,
 									tp, cityPath, cfg, store, storedHash, currentHash, storedProvision, storedLaunch,
 									driftedFields, rec, trace, stdout, stderr)
 								// Fold the returned batch unconditionally (Step 6d write-returns-Info).
@@ -3857,7 +3857,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 								continue
 							}
 							if launchOnlyDrift {
-								relaunched, launchBatch := relaunchAgentForLaunchDrift(ctx, sp, sessFront, infoByID[id], name,
+								relaunched, launchBatch := relaunchAgentForLaunchDrift(ctx, reconcileOpts.sessionStartFence, sp, sessFront, infoByID[id], name,
 									tp, cityPath, cfg, store, storedHash, currentHash, storedProvision, storedLaunch,
 									driftedFields, rec, trace, stdout, stderr)
 								// Fold the returned batch unconditionally (Step 6d write-returns-Info).
@@ -7531,6 +7531,7 @@ func silentRebaselineSessionHashes(id string, sessFront *sessionpkg.Store, agent
 // protection.
 func relaunchAgentForLaunchDrift(
 	ctx context.Context,
+	startFence *sessionStartFence,
 	sp runtime.Provider,
 	sessFront *sessionpkg.Store,
 	info sessionpkg.Info,
@@ -7609,7 +7610,15 @@ func relaunchAgentForLaunchDrift(
 		fmt.Fprintf(stderr, "session reconciler: launch-drift relaunch for %s minted a speculative resume key (no prior conversation); falling back to full restart\n", name) //nolint:errcheck
 		return false, relaunchAbortResidueFold(preparedInfo, sessFront, hadResumeKeyBeforePrepare)
 	}
-	if err := r.Relaunch(ctx, name, prepared.cfg); err != nil {
+	// The relaunch respawns the agent process in its work_dir: bracket it in
+	// the worktree reaper's session-start fence like any start (ga-yuiof4
+	// item 3), deferred so a panic or error cannot leave it counted in flight.
+	relaunchErr := func() error {
+		startFence.beginStart()
+		defer startFence.endStart()
+		return r.Relaunch(ctx, name, prepared.cfg)
+	}()
+	if err := relaunchErr; err != nil {
 		// ErrRelaunchUnsupported (a wrapper whose backend cannot relaunch) or a
 		// genuine failure (e.g. the warm box vanished → ErrSessionNotFound). Fall
 		// back to the full restart so the launch change is still applied.

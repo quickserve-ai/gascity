@@ -76,12 +76,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"sync"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/runtime"
+	sessionpkg "github.com/gastownhall/gascity/internal/session"
 )
 
 // worktreeReaperSlowPassThreshold is how old a pass must be before the lane
@@ -244,12 +247,24 @@ func (cr *CityRuntime) sessionStartFenceOf() *sessionStartFence {
 // liveness scan and its removal — a tick may start a session in the tree in
 // between — but exclusion can.
 //
-// The start path brackets every runtime start: beginStart (gen++, inflight++)
-// before it and endStart (gen++, inflight--) after it, each a short critical
-// section holding nothing else. The bracket sits on runPreparedStartCandidate,
-// the one function every controller start runs through, sync or async — so it
-// covers starts the tick launches that outlive the tick, which a bump at the
-// start of the tick's reconcile phase would not.
+// Every in-process runtime creation is bracketed: beginStart (gen++,
+// inflight++) before it and endStart (gen++, inflight--, deferred) after it,
+// each a short critical section holding nothing else. The brackets:
+//   - internal/session.Manager.startRuntime, the one place a Manager asks its
+//     provider to start a runtime. The controller registers this fence for its
+//     provider (registerSessionStartFence → session.RegisterStartFence), so
+//     every Manager built on that provider is covered: the reconcile tick, the
+//     control-dispatcher tick, and the in-process API server's session wakes
+//     (its worker factory is built on cs.SessionProvider(), the same object).
+//   - runFencedPreparedStartCandidate, around every reconciler start, sync or
+//     async (async ones outlive the tick). It also covers the runtime-only
+//     worker handle (internal/worker RuntimeHandle), which starts through the
+//     provider without a Manager. Where both apply the start is bracketed
+//     twice, which only over-protects.
+//   - the launch-drift Relaunch in relaunchAgentForLaunchDrift.
+//
+// The source ratchet TestSessionStartFenceRatchet fails on any new
+// runtime-creating call that is in none of these brackets and not allowlisted.
 //
 // A removal reads gen when its liveness scan STARTS (genAtScan). After every
 // pre-removal read, it takes the lock, and removes only if gen == genAtScan
@@ -277,6 +292,68 @@ type sessionStartFence struct {
 	mu       sync.Mutex
 	gen      uint64
 	inflight int
+}
+
+// BeginStart and EndStart make the fence a session.StartFence.
+func (f *sessionStartFence) BeginStart() { f.beginStart() }
+
+// EndStart ends a start bracket begun with BeginStart.
+func (f *sessionStartFence) EndStart() { f.endStart() }
+
+var _ sessionpkg.StartFence = (*sessionStartFence)(nil)
+
+// startFenceRegistration is one provider this runtime registered its
+// session-start fence for.
+type startFenceRegistration struct {
+	sp         runtime.Provider
+	unregister func()
+}
+
+func sameRuntimeProvider(a, b runtime.Provider) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	ta, tb := reflect.TypeOf(a), reflect.TypeOf(b)
+	if ta != tb || !ta.Comparable() {
+		return false
+	}
+	return a == b
+}
+
+// registerSessionStartFence brackets every runtime start any
+// internal/session Manager makes through sp with this runtime's session-start
+// fence. Idempotent per provider. Called on the run goroutine: at run start
+// for cr.sp, and on reload for a replacement provider BEFORE it is published
+// to the controller state (so no in-process API wake on it is unfenced).
+func (cr *CityRuntime) registerSessionStartFence(sp runtime.Provider) {
+	if sp == nil {
+		return
+	}
+	for _, reg := range cr.startFenceRegs {
+		if sameRuntimeProvider(reg.sp, sp) {
+			return
+		}
+	}
+	unregister, ok := sessionpkg.RegisterStartFence(sp, cr.sessionStartFenceOf())
+	if !ok {
+		fmt.Fprintf(cr.stderr, "%s: worktree reaper: session provider %T cannot carry the session-start fence; only reconciler starts are fenced\n", cr.logPrefix, sp) //nolint:errcheck // best-effort stderr
+		return
+	}
+	cr.startFenceRegs = append(cr.startFenceRegs, startFenceRegistration{sp: sp, unregister: unregister})
+}
+
+// retireSessionStartFencesExcept unregisters the fence from every provider but
+// keep (nil keep retires all).
+func (cr *CityRuntime) retireSessionStartFencesExcept(keep runtime.Provider) {
+	kept := cr.startFenceRegs[:0]
+	for _, reg := range cr.startFenceRegs {
+		if keep != nil && sameRuntimeProvider(reg.sp, keep) {
+			kept = append(kept, reg)
+			continue
+		}
+		reg.unregister()
+	}
+	cr.startFenceRegs = kept
 }
 
 func (f *sessionStartFence) beginStart() {
