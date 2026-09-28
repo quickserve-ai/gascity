@@ -389,6 +389,14 @@ type NativeDoltStore struct {
 	// metadata merge attempt, before its checked write. Only tests set it, to
 	// land a competing write in the window the compare-and-swap protects.
 	afterMetadataMergeRead func(id string)
+	// beforeCloseDrain, when set, runs in the CloseStore that latched the
+	// store closed, just before it waits for operations in flight.
+	// beforeCloseWaitForFirst, when set, runs in a CloseStore that found the
+	// store already closing, just before it waits for that first CloseStore.
+	// Only tests set them, to know a closer has reached its wait before
+	// asserting that it has not returned.
+	beforeCloseDrain        func()
+	beforeCloseWaitForFirst func()
 
 	// condWritesStamp carries the factory-stamped conditional-writes mode. The
 	// pinned upstream Storage contract requires row-version checked update and
@@ -971,6 +979,9 @@ func (s *NativeDoltStore) CloseStore() error {
 		done := s.closeDone
 		s.mu.Unlock()
 		if done != nil {
+			if s.beforeCloseWaitForFirst != nil {
+				s.beforeCloseWaitForFirst()
+			}
 			<-done
 		}
 		return nil
@@ -1002,6 +1013,9 @@ func (s *NativeDoltStore) CloseStore() error {
 	// use can register after the latch, so the count only falls. Then close
 	// the current handle here and report the result: no operation ever runs
 	// on a closed handle.
+	if s.beforeCloseDrain != nil {
+		s.beforeCloseDrain()
+	}
 	s.inflight.Wait()
 	if handle == nil {
 		return nil
