@@ -194,26 +194,8 @@ func TestNativeDoltStoreCloseStoreWaitsForInFlightReadThenClosesOnce(t *testing.
 		t.Fatal("held read never reached the handle")
 	}
 
-	closeDone := make(chan error, 1)
-	go func() { closeDone <- store.CloseStore() }()
-
-	// Observe the latch without blocking on s.mu: a store whose CloseStore
-	// queues a writer behind the in-flight read would otherwise park this
-	// check too, and the test would hang instead of failing.
-	latched := false
-	deadline := time.Now().Add(5 * time.Second)
-	for !latched && time.Now().Before(deadline) {
-		if store.mu.TryRLock() {
-			latched = store.closed
-			store.mu.RUnlock()
-		}
-		if !latched {
-			time.Sleep(time.Millisecond)
-		}
-	}
-	if !latched {
-		t.Fatal("CloseStore did not latch the store closed within 5s while a read was in flight")
-	}
+	closeDone := startCloseStore(store)
+	waitForCloseLatch(t, store, 5*time.Second)
 
 	// New operations after the latch fail fast rather than waiting.
 	if _, err := store.Get("gc-new"); !errors.Is(err, ErrStoreClosed) {
