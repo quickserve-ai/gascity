@@ -6,7 +6,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gastownhall/gascity/internal/api/apierr"
 	"github.com/gastownhall/gascity/internal/mail"
+	"github.com/gastownhall/gascity/internal/mail/beadmail"
 )
 
 // ga-0ejdbv review finding 1: the API returned the same bare 500 for a lost
@@ -24,5 +26,25 @@ func TestMailWriteErrorKeepsUnconfirmedDistinct(t *testing.T) {
 	lost := mailWriteError(errors.New("beadmail send: message bead was not persisted: gc-43")).Error()
 	if strings.Contains(lost, "mail_unconfirmed") {
 		t.Errorf("a lost write reported as unconfirmed: %q", lost)
+	}
+}
+
+// ga-th31cy: a write VERIFIED absent carries the mail-not-persisted code, so a
+// remote client can give the local verdict (exit 5, re-send). An error that is
+// not the sentinel keeps the generic internal code.
+func TestMailWriteErrorCodesAVerifiedLostWrite(t *testing.T) {
+	var lost *apierr.ErrorModel
+	if !errors.As(mailWriteError(fmt.Errorf("beadmail send: %w: gc-43", beadmail.ErrNotPersisted)), &lost) {
+		t.Fatalf("lost write is not an *apierr.ErrorModel")
+	}
+	if lost.Code != apierr.MailNotPersisted.Code || !strings.Contains(lost.Error(), "gc-43") {
+		t.Errorf("lost write code=%q err=%q, want code %q naming gc-43", lost.Code, lost.Error(), apierr.MailNotPersisted.Code)
+	}
+	var plain *apierr.ErrorModel
+	if !errors.As(mailWriteError(errors.New("dolt: connection refused")), &plain) {
+		t.Fatalf("server fault is not an *apierr.ErrorModel")
+	}
+	if plain.Code == apierr.MailNotPersisted.Code {
+		t.Errorf("a server fault was coded as a lost write: %+v", plain)
 	}
 }
