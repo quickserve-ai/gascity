@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -36,7 +37,7 @@ func (f *fakeAgentWorktreeGit) CurrentBranch() (string, error) {
 
 func (f *fakeAgentWorktreeGit) HasUncommittedWork() bool { return f.hasUncommitted }
 
-func (f *fakeAgentWorktreeGit) CheckoutDetach(ref string) error {
+func (f *fakeAgentWorktreeGit) CheckoutDetachNoHooksCtx(_ context.Context, ref string) error {
 	f.checkoutDetachRef = ref
 	return f.checkoutDetachErr
 }
