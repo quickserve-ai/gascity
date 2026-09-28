@@ -38,6 +38,11 @@ package main
 //     to the lane, and single flight hands it to exactly one pass at a time. The
 //     handoff is ordered through lane.mu, so no pass ever sees another's
 //     half-written tracker.
+//   - Gate verdicts are as old as the pass, so each real removal is preceded
+//     by a fresh re-verification (see the comment at the pre-removal wiring
+//     in triggerWorktreeReaperPass), including the LIVE reap flag, read under
+//     serviceStateMu, so a reload that disables reaping stops the next
+//     removal of an in-flight pass.
 //   - cr.rec and cr.stderr are shared with every other lane already;
 //     events.Recorder implementations serialize Record.
 //
@@ -47,12 +52,14 @@ package main
 // (scheduleCloseReplacedBeadStoreHandles); CloseStore on a native store is a
 // one-way latch (gascity#3157). An inline pass could never straddle a tick-side
 // reload; a background pass can. Every store the pass reads is therefore
-// wrapped in a fence (reaperFencedStore) that refuses the read once the
-// controller ctx is done or the handle is no longer the one the controller
-// state publishes for that rig. A refused read is an error, and every store
-// read in the reaper fails CLOSED on error — a Get error skips the candidate, a
-// borrow-veto List error protects every remaining candidate in the rig, and
-// cleanupClosedBeadAgentHomeWorktrees skips on a Get error — so a pass that
+// wrapped in a fence (reaperFencedStore) checked before AND after every read:
+// the read is refused, or its answer discarded, once the controller ctx is
+// done or the handle is no longer the one the controller state publishes for
+// that rig. A refused read is an error, and every store read in the reaper
+// fails CLOSED on error — a Get error skips the candidate (and, in the
+// pre-removal re-check, protects it), a borrow-veto List error protects every
+// remaining candidate in the rig, and cleanupClosedBeadAgentHomeWorktrees
+// skips on a Get error — so a pass that
 // outlives its handles protects everything for the rest of its run instead of
 // acting on answers from a closed or replaced store. The next trigger snapshots
 // the fresh handles.
@@ -107,6 +114,11 @@ type worktreeReaperPassInput struct {
 	rec             events.Recorder
 	skips           *reapSkipTracker
 	stderr          io.Writer
+	// pre is the pre-removal re-verification the reaper runs immediately
+	// before each real removal; stillEnabled is its live reap-flag read, also
+	// consulted before each agent-home reset. See reapPreRemoval.
+	pre          *reapPreRemoval
+	stillEnabled func() bool
 }
 
 // worktreeReaperPassResult is one completed pass, in the terms the tick trace
@@ -128,13 +140,13 @@ var runWorktreeReaperPassFn = runWorktreeReaperPass
 func runWorktreeReaperPass(in worktreeReaperPassInput) worktreeReaperPassResult {
 	var res worktreeReaperPassResult
 	started := time.Now()
-	res.report = reapClosedBeadWorktrees(in.cityPath, in.cfg, in.cachedStores, in.liveSessionDirs, !in.reapEnabled, in.rec, in.skips, in.stderr)
+	res.report = reapClosedBeadWorktreesGuarded(in.cityPath, in.cfg, in.cachedStores, in.liveSessionDirs, !in.reapEnabled, in.rec, in.skips, in.stderr, in.pre)
 	res.reapDuration = time.Since(started)
 	// Agent-home worktree cleanup performs real removals, so it runs only
 	// when real reaping is enabled — never under dry-run.
 	if in.reapEnabled {
 		started = time.Now()
-		res.agentHomesReset = cleanupClosedBeadAgentHomeWorktrees(in.cityPath, in.cfg, in.rawStores, in.stderr)
+		res.agentHomesReset = cleanupClosedBeadAgentHomeWorktreesGuarded(in.cityPath, in.cfg, in.rawStores, in.stderr, in.stillEnabled)
 		res.agentHomesRan = true
 		res.agentDuration = time.Since(started)
 	}
@@ -158,6 +170,13 @@ type worktreeReaperLane struct {
 
 	seq          uint64
 	skippedTotal uint64
+
+	// latestSessionDirs is the open-session working-dir set from the most
+	// recent tick that reached the reap phase — published by EVERY trigger,
+	// including one that skips because a pass is in flight — so an in-flight
+	// pass's pre-removal check can see sessions opened after it started
+	// without reading any store.
+	latestSessionDirs []string
 
 	lastDone     bool
 	lastSeq      uint64
@@ -189,6 +208,12 @@ func (cr *CityRuntime) worktreeReaperLaneOf() *worktreeReaperLane {
 // store backends were replaced. A pass already in flight keeps the memo it was
 // handed — it also keeps the handles it was handed, and its fence refuses those
 // once they are retired — so the memo and the stores it describes stay paired.
+func (l *worktreeReaperLane) currentSessionDirs() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.latestSessionDirs...)
+}
+
 func (l *worktreeReaperLane) invalidateStatusCache() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -255,8 +280,12 @@ func (t worktreeReaperTrigger) fields() map[string]any {
 func (cr *CityRuntime) triggerWorktreeReaperPass(ctx context.Context, cfg *config.City, reapEnabled bool, sessionBeads *sessionBeadSnapshot) worktreeReaperTrigger {
 	lane := cr.worktreeReaperLaneOf()
 	now := time.Now()
+	// Computed before the single-flight check so a skipping trigger still
+	// publishes it to the in-flight pass (see latestSessionDirs).
+	liveSessionDirs := liveSessionWorktreeDirs(sessionBeads)
 
 	lane.mu.Lock()
+	lane.latestSessionDirs = liveSessionDirs
 	trig := worktreeReaperTrigger{
 		dryRun:       !reapEnabled,
 		lastDone:     lane.lastDone,
@@ -300,23 +329,33 @@ func (cr *CityRuntime) triggerWorktreeReaperPass(ctx context.Context, cfg *confi
 	trig.started = true
 	trig.seq = seq
 
-	// Liveness gate inputs. liveSessionDirs is the open-session working-dir
-	// set from THIS tick's session snapshot, taken now, immediately before the
-	// pass starts — the same snapshot age at the gate as when the pass ran
-	// inline right after the snapshot load. It is a cross-check only. The
-	// authoritative signal is the host process-table cwd scan, which the
-	// reaper gathers FRESH inside the pass, lazily, at the moment the first
-	// candidate reaches the liveness gate (collectLiveWorktreeStateFn in
-	// reapClosedBeadWorktrees' liveness closure, bead_worktree_reaper.go),
-	// after the git-safety and borrow-veto gates. Running the pass later than
-	// the snapshot therefore cannot hide a live process in a worktree: a
-	// session that started since the snapshot has a process whose cwd is in
-	// the tree, and the fresh scan sees it; an indeterminate scan still
-	// protects everything. The borrow-veto List also runs fresh inside the
-	// pass (the status memo wraps Get only).
-	liveSessionDirs := liveSessionWorktreeDirs(sessionBeads)
-
+	// What is fresh and what is not. A pass can run as long as its slowest
+	// store call, and ticks keep running (and starting sessions) meanwhile,
+	// so the pass's GATE verdicts can be stale by the time a candidate is
+	// removed:
+	//   - liveSessionDirs is THIS tick's session snapshot, fixed for the pass.
+	//   - the process-table cwd scan is gathered once per pass, lazily, at the
+	//     first candidate to reach the liveness gate
+	//     (reapClosedBeadWorktreesGuarded's liveness closure).
+	//   - the pass-1 bead status may be a memo hit up to reapBeadStatusCacheTTL
+	//     old; the borrow-veto List is read uncached, once per rig per pass.
+	// So immediately before EACH removal the reaper re-verifies (reapPreRemoval,
+	// preRemovalReason in bead_worktree_reaper.go): an uncached fenced Get
+	// that must still say closed; a process scan no older than
+	// reapPreRemovalLivenessMaxAge (re-gathered if older); the pass's session
+	// dirs PLUS the latest set any tick has published to the lane since
+	// (latestSessionDirs — at most one tick old, read without touching a
+	// store; the live session snapshot itself is a store read that could
+	// block, so it is not consulted); and the live reap flag. Any error or
+	// indeterminate answer protects.
+	//
+	// NOT re-verified before removal: the borrow-veto scan (a full rig List
+	// per candidate would multiply the pass's heaviest read). A different bead
+	// that starts borrowing the tree mid-pass is caught when its session's
+	// process has a cwd in the tree (the fresh scan) or its session is in a
+	// tick's published dirs; one that has done neither yet is the residual.
 	rawStores, cachedStores := cr.fencedReaperStores(ctx, statusCache)
+	stillEnabled := cr.reapStillEnabled
 	in := worktreeReaperPassInput{
 		cityPath:        cr.cityPath,
 		cfg:             cfg,
@@ -327,6 +366,13 @@ func (cr *CityRuntime) triggerWorktreeReaperPass(ctx context.Context, cfg *confi
 		rec:             cr.rec,
 		skips:           skips,
 		stderr:          cr.stderr,
+		stillEnabled:    stillEnabled,
+		pre: &reapPreRemoval{
+			freshStores:        rawStores,
+			stillEnabled:       stillEnabled,
+			currentSessionDirs: lane.currentSessionDirs,
+			livenessMaxAge:     reapPreRemovalLivenessMaxAge,
+		},
 	}
 	go func() {
 		// close(done) is registered first so it runs last, after finish has
@@ -343,6 +389,15 @@ func (cr *CityRuntime) triggerWorktreeReaperPass(ctx context.Context, cfg *confi
 		}
 	}()
 	return trig
+}
+
+// reapStillEnabled reads the LIVE real-reap flag from the published config,
+// under the lock a reload writes it with, so it is safe from the pass
+// goroutine. A reload that turns real reaping off (or leaves only dry-run)
+// stops an in-flight pass's next removal.
+func (cr *CityRuntime) reapStillEnabled() bool {
+	cfg := cr.serviceConfigSnapshot()
+	return cfg != nil && cfg.Daemon.AutoReapClosedBeadWorktreesEnabled()
 }
 
 // finish records a completed pass and releases the single-flight latch.
@@ -416,8 +471,13 @@ func reaperStoreFence(ctx context.Context, cs *controllerState, rigName string, 
 }
 
 // reaperFencedStore refuses the two reads the reaper issues — Get (pass-1
-// bead status, agent-home bead status) and List (the borrow-veto scan) — once
-// its fence trips. Every other method passes through; the reaper calls none.
+// bead status, pre-removal re-check, agent-home bead status) and List (the
+// borrow-veto scan) — once its fence trips. The fence is checked BEFORE the
+// call and again AFTER it returns: a call that entered the handle, blocked
+// across a reload or shutdown, and then came back is discarded — its answer
+// may have come from a handle that has since been retired and closed — and the
+// fence error is returned in its place. Every other method passes through; the
+// reaper calls none.
 type reaperFencedStore struct {
 	beads.Store
 	fence func() error
@@ -427,12 +487,20 @@ func (s *reaperFencedStore) Get(id string) (beads.Bead, error) {
 	if err := s.fence(); err != nil {
 		return beads.Bead{}, err
 	}
-	return s.Store.Get(id)
+	bead, err := s.Store.Get(id)
+	if fenceErr := s.fence(); fenceErr != nil {
+		return beads.Bead{}, fenceErr
+	}
+	return bead, err
 }
 
 func (s *reaperFencedStore) List(query beads.ListQuery) ([]beads.Bead, error) {
 	if err := s.fence(); err != nil {
 		return nil, err
 	}
-	return s.Store.List(query)
+	rows, err := s.Store.List(query)
+	if fenceErr := s.fence(); fenceErr != nil {
+		return nil, fenceErr
+	}
+	return rows, err
 }

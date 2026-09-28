@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"os"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	sessionpkg "github.com/gastownhall/gascity/internal/session"
 )
 
 // wedgedGetStore is a rig store whose Get blocks until release is closed —
@@ -268,9 +268,10 @@ func TestReaperStoreFence(t *testing.T) {
 }
 
 // TestWorktreeReaperLane_ReloadMidPassFailsClosed is the end-to-end safety
-// case for running off-tick: a pass that passed pass-1 on a handle, then saw a
-// reload replace that handle, must not reap — its borrow-veto List is refused
-// by the fence and the reaper protects the worktree.
+// case for running off-tick: a pass whose pass-1 Get was already inside the
+// handle when a reload replaced it must not reap. The fence re-checks after
+// the call returns, discards the answer, and the Get error drops the worktree
+// from the candidate set for this pass.
 func TestWorktreeReaperLane_ReloadMidPassFailsClosed(t *testing.T) {
 	cityPath, rigRoot := initReapRig(t)
 	wt := addClosedWorktree(t, rigRoot, cityPath, "builder", "ga-abc123")
@@ -300,17 +301,10 @@ func TestWorktreeReaperLane_ReloadMidPassFailsClosed(t *testing.T) {
 	waitWorktreeReaperIdle(t, cr)
 
 	if _, err := os.Stat(wt); err != nil {
-		t.Fatalf("worktree %s was removed by a pass whose store was retired mid-pass (stat err=%v), want it protected", wt, err)
+		t.Fatalf("worktree %s was removed by a pass whose store was retired mid-pass (stat err=%v), want it kept", wt, err)
 	}
-	lane := cr.worktreeReaperLaneOf()
-	lane.mu.Lock()
-	res := lane.lastResult
-	lane.mu.Unlock()
-	if len(res.report.Reaped) != 0 || len(res.report.Protected) != 1 {
-		t.Fatalf("report reaped=%d protected=%d, want 0 reaped and 1 protected", len(res.report.Reaped), len(res.report.Protected))
-	}
-	if reason := res.report.Protected[0].Reason; !strings.Contains(reason, "borrow-veto scan failed") || !strings.Contains(reason, errReaperStoreRetired.Error()) {
-		t.Fatalf("protect reason = %q, want the borrow-veto scan refused by the retired-store fence", reason)
+	if res := lastReaperResult(cr); len(res.report.Reaped) != 0 {
+		t.Fatalf("report reaped=%d, want 0", len(res.report.Reaped))
 	}
 }
 
@@ -325,5 +319,93 @@ func waitForReaperCond(t *testing.T, cond func() bool, what string) {
 		case <-deadline:
 			t.Fatalf("timed out waiting for %s", what)
 		}
+	}
+}
+
+// TestCleanupClosedBeadAgentHomeWorktreesGuarded_StopsWhenDisabledOrBranchMoved
+// covers the agent-home half of the round: the reset is skipped when real
+// reaping was turned off mid-pass, and when the home's branch changed after
+// its bead was read.
+func TestCleanupClosedBeadAgentHomeWorktreesGuarded_StopsWhenDisabledOrBranchMoved(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		enabled      bool
+		branchAfter  string
+		wantDetached bool
+	}{
+		{name: "enabled and unchanged resets", enabled: true, branchAfter: "builder/ga-abc123", wantDetached: true},
+		{name: "disabled by reload skips", enabled: false, branchAfter: "builder/ga-abc123"},
+		{name: "branch moved skips", enabled: true, branchAfter: "builder/ga-zzz999"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cityPath, builderWTPath, _ := setupAgentHomeWorktreeCleanupTest(t)
+			store := beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-abc123", Status: "closed"}}, nil)
+			if err := os.WriteFile(builderWTPath+"/"+worktreeStaleFileName, []byte("branch=builder/ga-abc123\n"), 0o644); err != nil {
+				t.Fatalf("write stale marker: %v", err)
+			}
+			probe := &branchSequenceProbe{fakeAgentWorktreeGit: fakeAgentWorktreeGit{isRepo: true}, branches: []string{"builder/ga-abc123", tc.branchAfter}}
+			orig := newAgentWorktreeGitProbe
+			newAgentWorktreeGitProbe = func(string) agentWorktreeGitProbe { return probe }
+			t.Cleanup(func() { newAgentWorktreeGitProbe = orig })
+
+			cleaned := cleanupClosedBeadAgentHomeWorktreesGuarded(cityPath, agentHomeConfig(), map[string]beads.Store{"ga-rig": store}, io.Discard, func() bool { return tc.enabled })
+			if detached := probe.checkoutDetachRef != ""; detached != tc.wantDetached || (cleaned == 1) != tc.wantDetached {
+				t.Fatalf("cleaned=%d detached=%t, want detached=%t", cleaned, detached, tc.wantDetached)
+			}
+		})
+	}
+}
+
+// branchSequenceProbe answers CurrentBranch from a sequence, repeating the
+// last entry, so a test can move the branch between two reads.
+type branchSequenceProbe struct {
+	fakeAgentWorktreeGit
+	branches []string
+	reads    int
+}
+
+func (p *branchSequenceProbe) CurrentBranch() (string, error) {
+	i := p.reads
+	if i >= len(p.branches) {
+		i = len(p.branches) - 1
+	}
+	p.reads++
+	return p.branches[i], nil
+}
+
+// TestWorktreeReaperLane_SessionDirsReachThePass: the trigger-time session
+// snapshot reaches the pass input, and a later tick's snapshot — published by
+// a trigger that SKIPS because the pass is in flight — reaches the pass's
+// pre-removal check.
+func TestWorktreeReaperLane_SessionDirsReachThePass(t *testing.T) {
+	first, second := t.TempDir(), t.TempDir()
+	got := make(chan worktreeReaperPassInput, 1)
+	block := make(chan struct{})
+	prev := runWorktreeReaperPassFn
+	runWorktreeReaperPassFn = func(in worktreeReaperPassInput) worktreeReaperPassResult {
+		got <- in
+		<-block
+		return worktreeReaperPassResult{}
+	}
+	cr := newReapTickRuntime(t.TempDir(), &config.City{}, beads.NewMemStore(), io.Discard)
+	t.Cleanup(func() {
+		close(block)
+		waitWorktreeReaperIdle(t, cr)
+		runWorktreeReaperPassFn = prev
+	})
+
+	cr.triggerWorktreeReaperPass(context.Background(), cr.cfg, true, newSessionBeadSnapshotFromInfos([]sessionpkg.Info{{ID: "s1", WorkDir: first}}))
+	in := <-got
+	if len(in.liveSessionDirs) != 1 || in.liveSessionDirs[0] != first {
+		t.Fatalf("pass liveSessionDirs = %v, want [%s]", in.liveSessionDirs, first)
+	}
+	if skip := cr.triggerWorktreeReaperPass(context.Background(), cr.cfg, true, newSessionBeadSnapshotFromInfos([]sessionpkg.Info{{ID: "s2", WorkDir: second}})); !skip.skippedInflight {
+		t.Fatalf("second trigger = %+v, want a skip", skip)
+	}
+	if in.pre == nil || in.pre.currentSessionDirs == nil {
+		t.Fatal("pass input carries no pre-removal session-dir source")
+	}
+	if cur := in.pre.currentSessionDirs(); len(cur) != 1 || cur[0] != second {
+		t.Fatalf("pre-removal session dirs = %v, want the later tick's [%s]", cur, second)
 	}
 }

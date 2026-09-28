@@ -1443,7 +1443,7 @@ func (cr *CityRuntime) tick(
 			if historyErr != nil {
 				fmt.Fprintf(cr.stderr, "reapStoppedAgentHomes: skipping pass: session history unavailable: %v\n", historyErr) //nolint:errcheck
 			} else {
-				agentHomesReaped := reapStoppedAgentHomeWorktrees(cr.cityPath, cr.cfg, cr.cityBeadStore(), cr.rigBeadStores(), cr.sp, cr.rec, cr.stderr, false, candidateSessions, activeSessionBeads(sessionBeads.OpenInfos())) // residency:allow — fail-closed safety census over every rig store (unreachable rig or open assigned work keeps the home), the same enumeration as cleanupClosedBeadAgentHomeWorktrees above; resolves no residency
+				agentHomesReaped := reapStoppedAgentHomeWorktrees(cr.cityPath, cr.cfg, cr.cityBeadStore(), cr.rigBeadStores(), cr.sp, cr.rec, cr.stderr, false, candidateSessions, activeSessionBeads(sessionBeads.OpenInfos())) // residency:allow — fail-closed safety census over every rig store (unreachable rig or open assigned work keeps the home), the same enumeration the closed-bead reaper lane's fencedReaperStores wraps for cleanupClosedBeadAgentHomeWorktrees (worktree_reaper_lane.go); resolves no residency
 				recordPhase(TraceSiteControllerTickPhase, "reap_stopped_agent_homes", phaseStart, map[string]any{"reaped": agentHomesReaped})
 			}
 		}

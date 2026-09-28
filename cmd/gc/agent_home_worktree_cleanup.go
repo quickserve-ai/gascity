@@ -55,6 +55,29 @@ func cleanupClosedBeadAgentHomeWorktrees(
 	rigStores map[string]beads.Store,
 	stderr io.Writer,
 ) int {
+	return cleanupClosedBeadAgentHomeWorktreesGuarded(cityPath, cfg, rigStores, stderr, nil)
+}
+
+// cleanupClosedBeadAgentHomeWorktreesGuarded is
+// cleanupClosedBeadAgentHomeWorktrees for a caller whose pass runs off the tick
+// (the background reaper lane, ga-yuiof4 item 3). When stillEnabled is non-nil,
+// immediately before each reset it (1) re-checks that real reaping is still
+// configured — a reload may have disabled it mid-pass — and (2) re-reads the
+// home's branch and requires it unchanged, so a session the tick dispatched
+// into the home after the bead Get (which may have blocked for a long time)
+// is not detached out from under it. Both fail closed (skip the home).
+//
+// No liveness gate is added: this cleanup never had one inline, because an
+// agent home is expected to host its own live session; its safety rests on
+// the bead being closed (read uncached) and the tree holding no uncommitted
+// work (read immediately before the reset), both of which are unchanged.
+func cleanupClosedBeadAgentHomeWorktreesGuarded(
+	cityPath string,
+	cfg *config.City,
+	rigStores map[string]beads.Store,
+	stderr io.Writer,
+	stillEnabled func() bool,
+) int {
 	if stderr == nil {
 		stderr = io.Discard
 	}
@@ -140,6 +163,16 @@ func cleanupClosedBeadAgentHomeWorktrees(
 				defaultBranch = "main"
 			}
 			resetRef := "origin/" + defaultBranch
+			if stillEnabled != nil {
+				if !stillEnabled() {
+					fmt.Fprintf(stderr, "cleanupClosedBeadAgentHomeWorktrees: skipping %s: real reaping no longer enabled (reload)\n", worktreePath) //nolint:errcheck
+					continue
+				}
+				if now, err := wg.CurrentBranch(); err != nil || now != branch {
+					fmt.Fprintf(stderr, "cleanupClosedBeadAgentHomeWorktrees: skipping %s: branch changed since bead %s was read (now %q, err=%v)\n", worktreePath, beadID, now, err) //nolint:errcheck
+					continue
+				}
+			}
 			if err := wg.CheckoutDetach(resetRef); err != nil {
 				fmt.Fprintf(stderr, "cleanupClosedBeadAgentHomeWorktrees: resetting %s to %s: %v\n", worktreePath, resetRef, err) //nolint:errcheck
 				continue
