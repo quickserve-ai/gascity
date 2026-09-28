@@ -366,8 +366,14 @@ func OpenNativeDoltStoreAtWithoutAmbientEnvWithCredentialCommand(ctx context.Con
 // library over Dolt. It is constructed by the store factory after native-store
 // preflight gates pass.
 type NativeDoltStore struct {
-	mu      sync.RWMutex
-	storage beadslib.Storage
+	// mu guards which storage handle is current, generation, closed and
+	// reopen. It is held only for short reads and swaps of those fields, never
+	// across I/O: an operation registers a use on the current handle under mu
+	// and runs its I/O after releasing it (see nativeStorageHandle).
+	mu sync.RWMutex
+	// handle is the current storage handle; nil once the store is closed, and
+	// for a zero-value store.
+	handle *nativeStorageHandle
 	// generation increments on every successful reconnect. A read that fails
 	// with a transient connection error records the generation it observed and
 	// asks reconnect to swap the dead handle only if no other reader already did.
@@ -457,8 +463,10 @@ type NativeDoltStore struct {
 	reopen NativeReopenFunc
 	// reconnectGate is a single token used to serialize reconnects. Readers wait
 	// on it with their retry context, so a reconnect already in progress cannot
-	// make another read outlive its wall-clock budget.
-	reconnectGate chan struct{}
+	// make another read outlive its wall-clock budget. It is created once by
+	// reconnectGateOnce (see reconnectToken), never under mu.
+	reconnectGate     chan struct{}
+	reconnectGateOnce sync.Once
 	// closed is the one-way terminal latch. CloseStore sets it (under mu) so an
 	// in-flight reconnect's post-reopen re-check discards its fresh handle instead
 	// of installing it after the store is permanently closed.
@@ -588,7 +596,7 @@ func newNativeDoltStoreWithStorage(storage beadslib.Storage, actor string) *Nati
 	if actor == "" {
 		actor = nativeDoltStoreActor
 	}
-	return &NativeDoltStore{storage: storage, actor: actor, localStrings: newLocalSidecar("")}
+	return &NativeDoltStore{handle: newNativeStorageHandle(storage), actor: actor, localStrings: newLocalSidecar("")}
 }
 
 func newNativeDoltStoreWithStorageAndPrefix(storage beadslib.Storage, actor, idPrefix string) *NativeDoltStore {
@@ -729,31 +737,106 @@ func (s *NativeDoltStore) listIncludesCompleteDependencies() bool {
 	return true
 }
 
+// nativeStorageHandle is one open upstream storage handle and the number of
+// store operations currently running against it.
+//
+// The store's mu decides which handle is current and is held only while an
+// operation picks the handle and registers its use, never across the
+// operation's I/O. A handle that a reconnect or CloseStore swaps out is
+// retired: it stays open for the operations already running on it, and its
+// drain action (closing it) runs exactly once, when the last of them releases
+// it, or at once if none is running. No use can register on a retired handle:
+// registration happens under the store's mu, and the swap that retires the
+// handle holds mu exclusively. A handle whose operation never returns (a read
+// hung on a dead connection) is never closed; it is dead already.
+type nativeStorageHandle struct {
+	storage beadslib.Storage // immutable after construction
+
+	mu        sync.Mutex
+	uses      int    // operations running on storage
+	retired   bool   // swapped out of the store; set once, by retire
+	onDrained func() // pending drain action while retired with uses > 0
+}
+
+// newNativeStorageHandle wraps storage for use as a store's current handle. A
+// nil storage yields a nil handle, which the store treats as closed.
+func newNativeStorageHandle(storage beadslib.Storage) *nativeStorageHandle {
+	if storage == nil {
+		return nil
+	}
+	return &nativeStorageHandle{storage: storage}
+}
+
+// acquire registers one in-flight use of h and returns its release. The
+// caller must hold the store's mu and have read h as the current handle. The
+// release is idempotent, so a caller that releases twice cannot drop another
+// operation's use.
+func (h *nativeStorageHandle) acquire() func() {
+	h.mu.Lock()
+	h.uses++
+	h.mu.Unlock()
+	var once sync.Once
+	return func() { once.Do(h.release) }
+}
+
+// release drops one in-flight use and, when it was the last use of a retired
+// handle, runs the drain action on the releasing goroutine.
+func (h *nativeStorageHandle) release() {
+	h.mu.Lock()
+	h.uses--
+	var drained func()
+	if h.retired && h.uses == 0 {
+		drained, h.onDrained = h.onDrained, nil
+	}
+	h.mu.Unlock()
+	if drained != nil {
+		drained()
+	}
+}
+
+// retire marks h as no longer current and runs onDrained exactly once, when h
+// has no in-flight use: at once on the caller's goroutine if none is running,
+// otherwise on the goroutine of the last releaser. Only the caller that
+// swapped h out of the store (under the store's exclusive mu) may retire it,
+// and it does so once.
+func (h *nativeStorageHandle) retire(onDrained func()) {
+	h.mu.Lock()
+	h.retired = true
+	if h.uses > 0 {
+		h.onDrained = onDrained
+		h.mu.Unlock()
+		return
+	}
+	h.mu.Unlock()
+	onDrained()
+}
+
+// acquireStorage returns the current storage handle and a release the caller
+// must call when its operation is done. See acquireStorageGen.
 func (s *NativeDoltStore) acquireStorage() (beadslib.Storage, func(), error) {
-	if s == nil {
-		return nil, nil, fmt.Errorf("native Dolt store: %w", ErrStoreClosed)
-	}
-	s.mu.RLock()
-	if s.closed || s.storage == nil {
-		s.mu.RUnlock()
-		return nil, nil, fmt.Errorf("native Dolt store: %w", ErrStoreClosed)
-	}
-	return s.storage, s.mu.RUnlock, nil
+	storage, _, release, err := s.acquireStorageGen()
+	return storage, release, err
 }
 
 // acquireStorageGen is acquireStorage plus the current reconnect generation, so
 // the read-retry path can ask reconnect to swap only the exact handle it saw
 // fail (single-flight across concurrent readers).
+//
+// s.mu is held only while the handle is picked and the use registered, not
+// across the caller's operation, so an operation hung on a dead connection
+// cannot make a reconnect, CloseStore, or any other operation wait on s.mu.
+// A handle swapped out while the caller still uses it stays open until the
+// caller releases it.
 func (s *NativeDoltStore) acquireStorageGen() (beadslib.Storage, uint64, func(), error) {
 	if s == nil {
 		return nil, 0, nil, fmt.Errorf("native Dolt store: %w", ErrStoreClosed)
 	}
 	s.mu.RLock()
-	if s.closed || s.storage == nil {
-		s.mu.RUnlock()
+	defer s.mu.RUnlock()
+	if s.closed || s.handle == nil {
 		return nil, 0, nil, fmt.Errorf("native Dolt store: %w", ErrStoreClosed)
 	}
-	return s.storage, s.generation, s.mu.RUnlock, nil
+	return s.handle.storage, s.generation, s.handle.acquire(), nil
 }
 
 const (
@@ -1001,20 +1084,24 @@ func (s *NativeDoltStore) reopenState() (NativeReopenFunc, bool) {
 	return s.reopen, s.closed
 }
 
+// reconnectToken returns the reconnect gate, creating it with its one token on
+// first use. sync.Once rather than s.mu keeps zero-value test stores safe
+// without making a reconnect take s.mu before its context-aware gate wait.
+func (s *NativeDoltStore) reconnectToken() chan struct{} {
+	s.reconnectGateOnce.Do(func() {
+		s.reconnectGate = make(chan struct{}, 1)
+		s.reconnectGate <- struct{}{}
+	})
+	return s.reconnectGate
+}
+
 // acquireReconnectGate waits for the single reconnect token or the caller's
-// deadline. Lazy initialization keeps zero-value test stores safe without a
-// second constructor-only invariant.
+// deadline.
 func (s *NativeDoltStore) acquireReconnectGate(ctx context.Context) (chan struct{}, error) {
 	if s == nil {
 		return nil, fmt.Errorf("native Dolt store: %w", ErrStoreClosed)
 	}
-	s.mu.Lock()
-	if s.reconnectGate == nil {
-		s.reconnectGate = make(chan struct{}, 1)
-		s.reconnectGate <- struct{}{}
-	}
-	gate := s.reconnectGate
-	s.mu.Unlock()
+	gate := s.reconnectToken()
 
 	select {
 	case <-ctx.Done():
@@ -1080,7 +1167,6 @@ func (s *NativeDoltStore) reconnect(ctx context.Context, observedGen uint64) err
 	s.mu.RLock()
 	curGen := s.generation
 	closed := s.closed
-	old := s.storage
 	reopen := s.reopen
 	s.mu.RUnlock()
 
@@ -1125,22 +1211,27 @@ func (s *NativeDoltStore) reconnect(ctx context.Context, observedGen uint64) err
 		closeStorageQuietly(fresh)
 		return nil
 	}
-	s.storage = fresh
+	old := s.handle
+	s.handle = newNativeStorageHandle(fresh)
 	s.generation++
 	// Advanced under the lock, with the install, so no reader can acquire the
 	// fresh storage and still see the marks this reopen covered as owed.
 	s.notePoolServiced(coversMarks)
 	s.mu.Unlock()
 
-	closeStorageQuietly(old)
+	// Operations still running on the old handle keep it; the last of them to
+	// release it closes it.
+	if old != nil {
+		old.retire(func() { closeStorageQuietly(old.storage) })
+	}
 	return nil
 }
 
 // closeStorageQuietly closes a (possibly dead) storage handle without blocking
 // the caller: a handle whose server was hard-killed can wedge on Close, so it is
-// closed on a detached goroutine and any error is ignored. The handle is
-// unreferenced by the time this is called (the swap took the write lock, so no
-// reader still holds it), making the detached close safe.
+// closed on a detached goroutine and any error is ignored. It is called only on
+// a handle no operation is using: a fresh handle that was never installed, or
+// a retired handle whose last use has released it.
 func closeStorageQuietly(storage beadslib.Storage) {
 	if storage == nil {
 		return
@@ -1151,7 +1242,9 @@ func closeStorageQuietly(storage beadslib.Storage) {
 // CloseStore permanently releases the underlying native beads storage handle.
 // It is a one-way terminal latch that must win any race with an in-flight
 // reconnect: after it returns no reconnect may install a fresh handle (which
-// would resurrect a closed store and leak a live Dolt connection).
+// would resurrect a closed store and leak a live Dolt connection). It waits
+// for the operations already running on the current handle to release it,
+// then closes that handle and returns its Close error.
 func (s *NativeDoltStore) CloseStore() error {
 	if s == nil {
 		return nil
@@ -1176,17 +1269,24 @@ func (s *NativeDoltStore) CloseStore() error {
 		return err
 	}
 	s.mu.Lock()
-	storage := s.storage
-	s.storage = nil
+	handle := s.handle
+	s.handle = nil
 	s.reopen = nil
 	s.generation++
 	s.mu.Unlock()
 	s.releaseReconnectGate(gate)
 
-	if storage == nil {
+	if handle == nil {
 		return nil
 	}
-	return storage.Close()
+	// Phase 3 — wait for the operations already running on the handle to
+	// release it, then close it here and report the result, so no operation
+	// ever runs on a closed handle. New operations already fail on the phase-1
+	// latch, so the wait covers only those in flight.
+	drained := make(chan struct{})
+	handle.retire(func() { close(drained) })
+	<-drained
+	return handle.storage.Close()
 }
 
 // ApplyGraphPlan creates a bead graph atomically through the native beads
@@ -1916,9 +2016,10 @@ func (s *NativeDoltStore) Ready(queries ...ReadyQuery) ([]Bead, error) {
 // for the full rationale, which applies identically here.
 //
 // It takes the caller's already-open ctx/storage directly instead of calling
-// s.DepList/s.List (each of which reacquire s.withReadRetry's lock): this
-// method runs INSIDE Ready's withReadRetry closure, so nesting another
-// withReadRetry call would risk a sync.RWMutex RLock reentrancy hazard.
+// s.DepList/s.List (each of which runs its own withReadRetry): this method
+// runs INSIDE Ready's withReadRetry closure, so nesting another withReadRetry
+// call would start a second retry budget, and possibly a second reconnect,
+// inside the first.
 //
 // The read is batched when the storage can batch it: one source-keyed edge
 // read for every candidate (GetDependencyRecordsForIssues) and one issue read
