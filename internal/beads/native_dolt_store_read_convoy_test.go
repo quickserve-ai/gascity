@@ -38,7 +38,9 @@ import (
 //
 // The contract under test: R2 returns within its read budget (plus a margin),
 // and without error, whatever R1 and R3 are doing. The test releases R1
-// itself, so it cannot hang past its hard timeout.
+// itself, so it cannot hang: every other wait in it is a real-clock hang
+// detector bounded by the package's hang budget (beadsHangBudget), which no
+// assertion depends on.
 //
 // R2 is issued once R3's failure has visibly reached the reconnect path, by
 // whichever of three signals comes first: the reopen hook having been called
@@ -51,12 +53,15 @@ import (
 // fired.
 func TestNativeDoltStoreReadBudgetBoundsStorageLockBehindPendingReconnect(t *testing.T) {
 	const (
-		budget      = 200 * time.Millisecond
-		margin      = 2 * time.Second
-		hardTimeout = 10 * time.Second
+		// budget is the read budget fed to the store: the scenario itself.
+		budget = 200 * time.Millisecond
+		// margin is the slack on R2's contract, R2 returning within
+		// budget+margin while R1 is hung. That bound is the subject under
+		// test (TESTING.md "Test deadline rule" exception), not a scheduling
+		// deadline, so it stays short.
+		margin = 2 * time.Second
 	)
 	testStart := time.Now()
-	hard := time.After(hardTimeout)
 
 	r1Entered := make(chan struct{})
 	var r1EnteredOnce sync.Once
@@ -121,8 +126,8 @@ func TestNativeDoltStoreReadBudgetBoundsStorageLockBehindPendingReconnect(t *tes
 	r1 := run("gc-r1")
 	select {
 	case <-r1Entered:
-	case <-hard:
-		t.Fatal("R1 never entered its read")
+	case <-time.After(beadsHangBudget):
+		t.Fatalf("R1 never entered its read within %s", beadsHangBudget)
 	}
 
 	// R3: fails transiently and heads into reconnect.
@@ -137,7 +142,7 @@ func TestNativeDoltStoreReadBudgetBoundsStorageLockBehindPendingReconnect(t *tes
 	var r3Res result
 	r3Returned := false
 	const reopenCalledLabel = "reopen hook called (R3's reconnect did not queue behind R1)"
-	syncCtx, cancelSync := context.WithTimeout(context.Background(), margin)
+	syncCtx, cancelSync := context.WithTimeout(context.Background(), beadsHangBudget)
 	defer cancelSync()
 	syncCondition, synced := pollBoundary(syncCtx, func() (string, bool) {
 		select {
@@ -166,7 +171,7 @@ func TestNativeDoltStoreReadBudgetBoundsStorageLockBehindPendingReconnect(t *tes
 	syncAt := time.Since(testStart)
 	if !synced {
 		release()
-		t.Fatalf("within %s of R3 starting, last observation: %s: R3's transient failure never reached the reconnect path", margin, syncCondition)
+		t.Fatalf("within %s of R3 starting, last observation: %s: R3's transient failure never reached the reconnect path", beadsHangBudget, syncCondition)
 	}
 	t.Logf("sync point at %s: %s", syncAt, syncCondition)
 
@@ -180,33 +185,32 @@ func TestNativeDoltStoreReadBudgetBoundsStorageLockBehindPendingReconnect(t *tes
 	case r2Res = <-r2:
 		r2Bounded = true
 	case <-time.After(budget + margin):
+		// The contract bound: the assertion below depends on it.
 		t.Logf("R2 still blocked %s after issue (budget %s); goroutine stacks in the store:\n%s",
 			budget+margin, budget, storeLockStacks())
-	case <-hard:
-		t.Fatal("hard timeout waiting on R2")
 	}
 
-	// Release R1 in every case, then collect everyone under the hard timeout.
+	// Release R1 in every case, then collect everyone under the hang budget.
 	releasedAt := time.Since(testStart)
 	release()
 	if !r2Bounded {
 		select {
 		case r2Res = <-r2:
-		case <-hard:
-			t.Fatal("R2 did not return even after R1 was released (hard timeout)")
+		case <-time.After(beadsHangBudget):
+			t.Fatalf("R2 did not return within %s even after R1 was released", beadsHangBudget)
 		}
 	}
 	var r1Res result
 	select {
 	case r1Res = <-r1:
-	case <-hard:
-		t.Fatal("R1 did not return after release (hard timeout)")
+	case <-time.After(beadsHangBudget):
+		t.Fatalf("R1 did not return within %s after release", beadsHangBudget)
 	}
 	if !r3Returned {
 		select {
 		case r3Res = <-r3:
-		case <-hard:
-			t.Fatal("R3 did not return after R1 release (hard timeout)")
+		case <-time.After(beadsHangBudget):
+			t.Fatalf("R3 did not return within %s after R1 release", beadsHangBudget)
 		}
 	}
 
