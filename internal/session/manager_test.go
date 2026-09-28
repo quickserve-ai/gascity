@@ -788,7 +788,10 @@ func TestRuntimeStartCallSitesCleanOrphansFirst(t *testing.T) {
 			lines := strings.Split(string(data), "\n")
 			starts := 0
 			for i, line := range lines {
-				if !strings.Contains(line, "m.sp.Start(ctx, sessName, cfg)") {
+				// Every Manager runtime start goes through m.startRuntime, which
+				// wraps the provider call in the session-start fence
+				// (start_fence.go, ga-yuiof4 item 3).
+				if !strings.Contains(line, "m.startRuntime(ctx, sessName, cfg)") {
 					continue
 				}
 				starts++
@@ -801,7 +804,7 @@ func TestRuntimeStartCallSitesCleanOrphansFirst(t *testing.T) {
 				}
 			}
 			if starts == 0 {
-				t.Fatalf("%s contains no m.sp.Start(ctx, sessName, cfg) call sites", tt.file)
+				t.Fatalf("%s contains no m.startRuntime(ctx, sessName, cfg) call sites", tt.file)
 			}
 		})
 	}
