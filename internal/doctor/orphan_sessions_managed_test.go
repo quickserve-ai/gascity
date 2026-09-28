@@ -132,6 +132,22 @@ func TestOrphanSessionsCheckManagedNamesRun(t *testing.T) {
 			wantCalls: 1,
 		},
 		{
+			name:       "empty managed set warns that candidates are unconfirmed",
+			running:    []string{orphanTestTemplateSession, orphanTestManagedSession, orphanTestStraySession},
+			lister:     &orphanTestLister{names: managedNameSet()},
+			wantStatus: StatusWarning,
+			wantMessage: []string{
+				"cannot confirm orphaned sessions",
+				"no open session bead",
+				"2 unconfirmed candidate(s)",
+			},
+			wantDetails: []string{
+				orphanTestManagedSession + " (unconfirmed: not template-derived; open session beads listed empty)",
+				orphanTestStraySession + " (unconfirmed: not template-derived; open session beads listed empty)",
+			},
+			wantCalls: 1,
+		},
+		{
 			name:        "no template-only candidate never calls the lister",
 			running:     []string{orphanTestTemplateSession},
 			lister:      &orphanTestLister{err: listErr},
@@ -199,6 +215,13 @@ func TestOrphanSessionsCheckManagedNamesFix(t *testing.T) {
 			wantCalls: 1,
 		},
 		{
+			name:      "empty managed set refuses and stops nothing",
+			lister:    &orphanTestLister{names: managedNameSet()},
+			wantErr:   []string{"refusing to stop 2 unconfirmed", "no open session bead"},
+			wantStops: nil,
+			wantCalls: 1,
+		},
+		{
 			name:         "controller running refuses before consulting the lister",
 			lister:       &orphanTestLister{names: managedNameSet(orphanTestManagedSession)},
 			controllerUp: true,
@@ -254,5 +277,40 @@ func TestOrphanSessionsCheckManagedNamesFix(t *testing.T) {
 				t.Errorf("lister calls = %d, want %d", tt.lister.calls, tt.wantCalls)
 			}
 		})
+	}
+}
+
+// TestOrphanSessionsCheckConfiguredNamedSessionIsManaged: a configured named
+// session is managed from config alone, so a named seat whose session bead is
+// closed or missing (the lister does not name it) is neither reported nor
+// stopped, with or without a lister installed.
+func TestOrphanSessionsCheckConfiguredNamedSessionIsManaged(t *testing.T) {
+	const namedSeat = "qcore--warden" // runtime name of named session qcore/warden
+	for _, lister := range []*orphanTestLister{
+		nil,
+		{names: managedNameSet(orphanTestManagedSession)},
+	} {
+		sp := orphanTestProvider(t, orphanTestTemplateSession, namedSeat, orphanTestStraySession)
+		cfg := &config.City{
+			Agents:        []config.Agent{{Name: "mayor"}},
+			NamedSessions: []config.NamedSession{{Name: "warden", Template: "cherub-law.warden", Dir: "qcore"}},
+		}
+		c := NewOrphanSessionsCheck(cfg, "test", "", sp)
+		if lister != nil {
+			c = c.WithManagedSessionNames(lister.list)
+		}
+		r := c.Run(&CheckContext{})
+		if strings.Join(r.Details, "\n") != orphanTestStraySession {
+			t.Errorf("lister=%v: Run() details = %q, want only %q", lister != nil, r.Details, orphanTestStraySession)
+		}
+		if err := c.Fix(&CheckContext{}); err != nil {
+			t.Fatalf("lister=%v: Fix() error = %v", lister != nil, err)
+		}
+		if got := stopCalls(sp); strings.Join(got, "\n") != orphanTestStraySession {
+			t.Errorf("lister=%v: Stop calls = %q, want only %q", lister != nil, got, orphanTestStraySession)
+		}
+		if !sp.IsRunning(namedSeat) {
+			t.Errorf("lister=%v: configured named session %q was stopped", lister != nil, namedSeat)
+		}
 	}
 }

@@ -21,10 +21,19 @@ import (
 // reads through the session coordination-class store so a
 // [beads.classes.sessions] relocation is honored, and closes the handle it
 // opened. Any error is returned, never swallowed: the check fails closed on it.
+//
+// A relocation the config declares but the one-shot routes do not carry is an
+// error too. cliStorageRoutes answers nil when it cannot load the city's
+// config, and nil routes send the session read to the WORK store, where a city
+// that relocated its sessions has none: the read would succeed EMPTY and every
+// candidate would read as an orphan.
 func doctorManagedSessionNames(cityPath string, cfg *config.City, openStore func(string) (beads.Store, error)) func() (map[string]struct{}, error) {
 	return func() (map[string]struct{}, error) {
 		if openStore == nil {
 			return nil, fmt.Errorf("no bead store opener")
+		}
+		if configRelocatesSessions(cfg) && !cliSessionsRelocated(cityPath) {
+			return nil, fmt.Errorf("city config binds the sessions class to %q but the storage routes do not relocate it; reading session beads would read the work store", cfg.EffectiveStorage().Classes.Sessions)
 		}
 		store, err := openStore(cityPath)
 		if err != nil {
@@ -33,6 +42,19 @@ func doctorManagedSessionNames(cityPath string, cfg *config.City, openStore func
 		defer closeBeadStoreHandle(store) //nolint:errcheck // best-effort close of a one-shot read handle
 		return openSessionRuntimeNames(cliSessionStore(store, cfg, cityPath))
 	}
+}
+
+// configRelocatesSessions reports whether cfg binds the sessions coordination
+// class anywhere but the reserved work binding. It reads configuration only,
+// the same [storage.classes] assignment storageSplitShapeOf classifies. An
+// authored [storage] whose sessions binding is blank counts as relocated: the
+// read must then prove its routing rather than fall back to the work store.
+func configRelocatesSessions(cfg *config.City) bool {
+	if cfg == nil || cfg.Storage == nil {
+		return false
+	}
+	binding := cfg.EffectiveStorage().Classes.BindingFor(config.StorageClassSessions)
+	return strings.TrimSpace(binding) != config.StorageWorkBinding
 }
 
 // openSessionRuntimeNames returns the runtime (tmux) name of every session
