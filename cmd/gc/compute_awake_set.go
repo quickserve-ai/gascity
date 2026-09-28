@@ -164,6 +164,14 @@ type AwakeWorkBead struct {
 	// capacity: the asleep owner's session still exists and still counts
 	// wherever pool session occupancy is counted.
 	CertParked bool
+	// ReleaseProposed is true when a session teardown withheld this bead's
+	// release because it is a named agent's work, and the proposal is still
+	// pending for a judge (ga-9n8hjv, fence #1). The bead keeps its owner, but
+	// its fate is the judge's, so it is not wake demand. Without this a named
+	// seat that drain-acks while holding a claim (the claim is now kept, where
+	// it used to be released) is re-woken by that same claim, drain-acks again,
+	// and loops. Clearing the proposal restores demand.
+	ReleaseProposed bool
 }
 
 // AwakeDecision is the output for a single session.
@@ -975,6 +983,9 @@ func sessionHasCertParkedWork(workBeads []AwakeWorkBead, named []AwakeNamedSessi
 }
 
 func workBeadHasAwakeDemand(bead AwakeWorkBead) bool {
+	if bead.ReleaseProposed {
+		return false
+	}
 	switch bead.Status {
 	case "in_progress":
 		return !bead.Blocked && !bead.CertParked
