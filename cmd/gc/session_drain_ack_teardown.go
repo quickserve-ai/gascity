@@ -137,7 +137,10 @@ func tearDownDrainAckedPoolSeat(
 	// applies here too — so the step is disposed of exactly as a no-work ack
 	// disposes of it, not reopened a second time by this sweep.
 	res := unclaimWorkAssignedToSessionInfo(cityPath, cfg, store, rigStores, info, retiredSessionFallbackRouteInfo(info), drainAckTeardownReleasePath, true, stderr)
-	attempted := res.Released + res.Failed
+	// A withheld bead (a named agent's, proposed not released: ga-9n8hjv) counts
+	// in the denominator, so "released N of M" never reads as complete when the
+	// sweep kept work on its owner.
+	attempted := res.Released + res.Withheld + res.Failed
 	if res.Failed > 0 {
 		return drainAckTeardownOutcome{retainedFor: "release_failed", released: res.Released, attempted: attempted}
 	}
