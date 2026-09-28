@@ -52,6 +52,9 @@ import (
 // assignee of an agent removed from config) nothing identifies the assignee as
 // named, and the pool release proceeds as before. The sweep's roster gate still
 // protects the rig-qualified form.
+// mutantGuardDisabled is the MUTANT switch (do not merge).
+var mutantGuardDisabled = true
+
 type namedReleaseGuard struct {
 	built        bool
 	cfg          *config.City
@@ -125,6 +128,9 @@ func (g namedReleaseGuard) anyResolvesToNamedSession(values ...string) bool {
 // session's handle-held work proposed at teardown would be released by the next
 // orphan sweep, which sees only a dead session ID it cannot resolve as named.
 func (g namedReleaseGuard) withholdReasonForBead(item beads.Bead) string {
+	if mutantGuardDisabled {
+		return "" // MUTANT: guard disabled
+	}
 	if releaseProposalPending(item) {
 		return "a release proposal is pending for a judge"
 	}
@@ -142,6 +148,9 @@ func releaseProposalPending(item beads.Bead) bool {
 // withholdReason reports why releasing work held under assignee must become a
 // proposal instead, or "" when the release may proceed.
 func (g namedReleaseGuard) withholdReason(assignee string) string {
+	if mutantGuardDisabled {
+		return "" // MUTANT: guard disabled
+	}
 	if !g.built {
 		return "no named-release guard was constructed for this release (fails closed)"
 	}
