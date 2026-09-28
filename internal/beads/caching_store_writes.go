@@ -41,10 +41,24 @@ func (c *CachingStore) createWith(create func() (Bead, error)) (Bead, error) {
 		return created, err
 	}
 
+	// Read the create back. Every failure is recorded (recordReadBackProblem,
+	// which leaves the reconcile backoff anchor alone): an unrecorded one let the
+	// cache serve a row that verification could not find, and nothing said so
+	// (ga-th31cy). What the failure does to the row depends on what it proved:
+	//   - a lookup that did not complete (ErrVerifyIndeterminate, which also
+	//     satisfies errors.Is(ErrNotFound)) or any other read error proves
+	//     nothing, so the row is absorbed DIRTY and the next read goes to
+	//     storage instead of trusting this snapshot;
+	//   - a plain not-found stays absorbed clean. Some stores cannot read back
+	//     a freshly written wisp (beadmail's GC_MAIL_VERIFY escape exists for
+	//     them), and there a dirty mark would make the overlay confirm real
+	//     mail absent and drop it from every cached read.
+	readBackUnproven := false
 	if fresh, err := c.backing.Get(created.ID); err == nil {
 		created = fresh
-	} else if !errors.Is(err, ErrNotFound) {
-		c.recordProblem("refresh bead after create", fmt.Errorf("%s: %w", created.ID, err))
+	} else {
+		c.recordReadBackProblem("refresh bead after create", fmt.Errorf("%s: %w", created.ID, err))
+		readBackUnproven = errors.Is(err, ErrVerifyIndeterminate) || !errors.Is(err, ErrNotFound)
 	}
 
 	c.mu.Lock()
@@ -61,6 +75,9 @@ func (c *CachingStore) createWith(create func() (Bead, error)) (Bead, error) {
 		seqMode:    seqKeep,
 		clearDirty: true,
 	})
+	if readBackUnproven {
+		c.markDirtyLocked(created.ID)
+	}
 	c.markFreshLocked(time.Now())
 	c.updateStatsLocked()
 	c.mu.Unlock()
