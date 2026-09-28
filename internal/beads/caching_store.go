@@ -2060,6 +2060,29 @@ func (c *CachingStore) recordProblemLocked(op string, err error) {
 	}
 }
 
+// recordReadBackProblem records a failed read-back of a bead this process just
+// wrote. It counts and logs like recordProblem but deliberately leaves
+// stats.LastProblemAt alone: that stamp is nextReconcileDelay's retry-backoff
+// anchor, and read-backs run on the mail hot path. A store already in backoff
+// (where read-backs also fail) would otherwise have its reconcile retry pushed
+// out by every send and never come due (ga-th31cy; same hazard as the
+// watchdog's, see checkReconcileOverdue).
+func (c *CachingStore) recordReadBackProblem(op string, err error) {
+	if err == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	msg := fmt.Sprintf("%s: %v", op, err)
+	c.stats.ProblemCount++
+	c.stats.LastProblem = msg
+	if c.problemf != nil {
+		if logMsg, ok := c.problemLogMessageLocked(msg, time.Now()); ok {
+			c.problemf(logMsg)
+		}
+	}
+}
+
 func (c *CachingStore) problemLogMessageLocked(msg string, now time.Time) (string, bool) {
 	if c.problemLog == nil {
 		c.problemLog = make(map[string]cacheProblemLogState)

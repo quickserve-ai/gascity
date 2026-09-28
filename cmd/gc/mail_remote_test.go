@@ -648,3 +648,31 @@ func TestCmdMailRemote_Unconfirmed202GetsLocalVerdict(t *testing.T) {
 		t.Errorf("reply --json = %+v, want ok=false id=mc-unc-1 code=mail_unconfirmed exit=%d", got, mailSendUnconfirmedExit)
 	}
 }
+
+// ga-th31cy: a remote send or reply whose write the server VERIFIED absent (500
+// with the mail-not-persisted problem code) gets the local verdict, exit 5 and "re-send",
+// not the generic exit 1.
+func TestCmdMailRemote_NotPersisted500GetsLocalVerdict(t *testing.T) {
+	clearRemoteMailIdentityEnv(t)
+	t.Setenv("GC_HOME", t.TempDir())
+	srv := newRemoteMailTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"type":"urn:gascity:error:mail-not-persisted","code":"mail-not-persisted","title":"Mail Not Persisted","status":500,"detail":"beadmail send: message bead was not persisted: mc-lost-1"}`))
+	}))
+	defer srv.Close()
+
+	var out, errb bytes.Buffer
+	if code := cmdMailSendRemote(remoteTestClient(t, srv.URL), remoteTestTarget(srv.URL), []string{"mayor", "x"}, false, false, "", "", "", "", "", false, &out, &errb); code != mailSendNotPersistedExit {
+		t.Fatalf("send exit = %d, want %d; stderr=%q", code, mailSendNotPersistedExit, errb.String())
+	}
+	if !strings.Contains(errb.String(), "NOT DELIVERED") {
+		t.Errorf("send stderr lacks the NOT DELIVERED verdict: %q", errb.String())
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := cmdMailReplyRemote(remoteTestClient(t, srv.URL), remoteTestTarget(srv.URL), []string{"mc-wisp-1", "ack"}, "", "", false, false, &out, &errb); code != mailSendNotPersistedExit {
+		t.Fatalf("reply exit = %d, want %d; stderr=%q", code, mailSendNotPersistedExit, errb.String())
+	}
+}
