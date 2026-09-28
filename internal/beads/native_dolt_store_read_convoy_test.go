@@ -20,18 +20,21 @@ import (
 // Before the fix (ga-yuiof4.1), withReadRetry derived one wall-clock ctx (the
 // read budget) for the whole read chain, but acquireStorageGen took
 // s.mu.RLock() with no ctx and held it across the read, and the reconnect path
-// took s.mu.Lock() with no ctx. A sync.RWMutex refuses NEW readers once a
-// writer is waiting, so on that store:
+// took s.mu.Lock() with no ctx: first in acquireReconnectGate, to create the
+// gate lazily, before it ever called reopen, and again to install the fresh
+// handle. A sync.RWMutex refuses NEW readers once a writer is waiting, so on
+// that store:
 //
 //	R1  held RLock across fn() on a hung connection that ignored its ctx;
 //	R3  failed transiently, entered reconnect, and waited in s.mu.Lock()
-//	    behind R1;
+//	    inside acquireReconnectGate, behind R1, before any reopen;
 //	R2  (a fresh, unrelated read) then waited in s.mu.RLock() behind R3,
 //	    outside any deadline, until R1 returned.
 //
 // The fixed store holds s.mu only to pick a storage handle, never across I/O,
-// so R1 no longer holds it while hung and R3's reconnect does not queue behind
-// R1.
+// and creates the gate without it, so R1 holds nothing while hung and R3's
+// reconnect reaches reopen at once; its only s.mu.Lock() is the brief swap
+// after reopen.
 //
 // The contract under test: R2 returns within its read budget (plus a margin),
 // and without error, whatever R1 and R3 are doing. The test releases R1
@@ -39,10 +42,13 @@ import (
 //
 // R2 is issued once R3's failure has visibly reached the reconnect path, by
 // whichever of three signals comes first: the reopen hook having been called
-// (a reconnect that did not queue behind R1 gets that far), R3 having
-// returned, or a writer queued on s.mu before any reopen (only a reconnect
-// waiting behind R1 can queue a writer that early: the pre-fix convoy). The
-// test logs which one fired.
+// (the fixed store's reconnect gets that far without waiting on R1), R3
+// having returned, or a writer queued on s.mu before any reopen (on the
+// pre-fix store, R3's acquireReconnectGate queued behind R1 there: the
+// convoy). The fixed store queues no writer before reopen, so there the
+// writer signal cannot fire; the pre-fix store never reaches reopen while R1
+// is hung, so there only the writer signal fires. The test logs which one
+// fired.
 func TestNativeDoltStoreReadBudgetBoundsStorageLockBehindPendingReconnect(t *testing.T) {
 	const (
 		budget      = 200 * time.Millisecond
@@ -122,10 +128,11 @@ func TestNativeDoltStoreReadBudgetBoundsStorageLockBehindPendingReconnect(t *tes
 	// R3: fails transiently and heads into reconnect.
 	r3 := run("gc-r3")
 
-	// Wait until R3's failure has reached the reconnect path. TryRLock fails
-	// only while a writer holds or waits for the lock (readerCount < 0), so
-	// the first signal observes the queued Lock() directly rather than
-	// guessing from a sleep.
+	// Wait until R3's failure has reached the reconnect path. The reopen and
+	// R3 signals are checked first. The writer check uses TryRLock, which
+	// fails only while a writer holds or waits for the lock (readerCount < 0),
+	// so it observes a queued Lock() directly rather than guessing from a
+	// sleep.
 	var r3Res result
 	r3Returned := false
 	syncDeadline := time.Now().Add(margin)
@@ -145,7 +152,8 @@ func TestNativeDoltStoreReadBudgetBoundsStorageLockBehindPendingReconnect(t *tes
 		if !store.mu.TryRLock() {
 			// On the fixed store the only writer on s.mu here is reconnect's
 			// brief handle swap, which comes after the reopen hook; re-check so
-			// that swap is never reported as the convoy.
+			// that swap is never reported as the convoy. On the pre-fix store
+			// this writer is acquireReconnectGate's Lock, before any reopen.
 			select {
 			case <-reopenCalled:
 				syncCondition = reopenCalledLabel
