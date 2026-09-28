@@ -231,10 +231,27 @@ func (sm *SupervisorMux) registerCityRoutes() {
 	// these ops declare Errors, which Huma documents regardless.
 	mailMessageRef := sm.humaAPI.OpenAPI().Components.Schemas.Schema(
 		reflect.TypeOf(mail.Message{}), true, "Message")
+	// The 202 carries the same MailWriteOutput headers as the 201; Huma only
+	// documents output headers on the default status, so they are declared
+	// here with the schemas Huma derives for the 201.
+	indexMinimum := 0.0
+	mailWriteHeaders := func() map[string]*huma.Param {
+		return map[string]*huma.Param{
+			"X-GC-Index": {Schema: &huma.Schema{
+				Type: "integer", Format: "int64", Minimum: &indexMinimum,
+				Description: "Latest event sequence number.",
+			}},
+			"X-GC-Cache-Age-S": {Schema: &huma.Schema{
+				Type: "number", Format: "double",
+				Description: "Age in seconds of the CachingStore snapshot that served this response (0 if not applicable).",
+			}},
+		}
+	}
 	mailUnconfirmedResponse := func(verb string) map[string]*huma.Response {
 		return map[string]*huma.Response{
 			"202": {
 				Description: "Delivery unconfirmed: the store reported the " + verb + " created but it could not be read back, so it may or may not have landed. The body carries its id; check storage for that id before re-sending (a blind re-send may duplicate it). A retry with the same Idempotency-Key replays this 202 without writing again.",
+				Headers:     mailWriteHeaders(),
 				Content:     map[string]*huma.MediaType{"application/json": {Schema: mailMessageRef}},
 			},
 		}

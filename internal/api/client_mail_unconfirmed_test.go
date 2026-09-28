@@ -1,11 +1,13 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/gastownhall/gascity/internal/api/genclient"
 	"github.com/gastownhall/gascity/internal/mail"
 )
 
@@ -14,13 +16,30 @@ import (
 // *mail.DeliveryUnconfirmedError — never as success, and never as a bare
 // "API returned 202 with no body" that loses the ID to check.
 func TestClientMailWriteUnconfirmed202CarriesMessageID(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusAccepted)
-		json.NewEncoder(w).Encode(mail.Message{ID: "gc-unc-client", From: "mayor", To: "worker", Subject: "s"}) //nolint:errcheck
-	}))
-	defer ts.Close()
-	c := NewCityScopedClient(ts.URL, "alpha")
+	// In-process transport: the 202 is served without opening a loopback
+	// listener (the untagged http_test_server census cannot grow).
+	answer202 := rtFunc(func(r *http.Request) (*http.Response, error) {
+		rec := httptest.NewRecorder()
+		rec.Header().Set("Content-Type", "application/json")
+		rec.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(rec).Encode(mail.Message{ID: "gc-unc-client", From: "mayor", To: "worker", Subject: "s"}) //nolint:errcheck
+		resp := rec.Result()
+		resp.Request = r
+		return resp, nil
+	})
+	const baseURL = "http://supervisor.test"
+	cw, err := genclient.NewClientWithResponses(
+		baseURL,
+		genclient.WithHTTPClient(&http.Client{Transport: answer202}),
+		genclient.WithRequestEditorFn(func(_ context.Context, req *http.Request) error {
+			req.Header.Set("X-GC-Request", "true")
+			return nil
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewClientWithResponses: %v", err)
+	}
+	c := &Client{cw: cw, baseURL: baseURL, cityName: "alpha"}
 
 	for name, call := range map[string]func() (mail.Message, error){
 		"send":  func() (mail.Message, error) { return c.SendMail(MailSendRequest{To: "worker", Subject: "s"}) },

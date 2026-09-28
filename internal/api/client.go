@@ -1396,8 +1396,7 @@ var errMailAcceptedUnconfirmed = errors.New("server answered 202: the write was 
 // the ID without unwrapping the error.
 func mailUnconfirmedFromGen(g genclient.Message) (mail.Message, error) {
 	m := mailMessageFromGen(g)
-	return m, fmt.Errorf("delivery unconfirmed: message %s may have landed; check storage with \"GC_NO_API=1 gc mail peek %s\" on the serving city before re-sending (a blind re-send may duplicate it): %w",
-		m.ID, m.ID, &mail.DeliveryUnconfirmedError{ID: m.ID, Cause: errMailAcceptedUnconfirmed})
+	return m, fmt.Errorf("delivery unconfirmed: %w", &mail.DeliveryUnconfirmedError{ID: m.ID, Cause: errMailAcceptedUnconfirmed})
 }
 
 // MailReplyRequest carries the parameters of a mail reply for Client.ReplyMail.

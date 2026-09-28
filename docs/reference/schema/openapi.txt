@@ -37481,6 +37481,21 @@
             },
             "description": "Delivery unconfirmed: the store reported the message created but it could not be read back, so it may or may not have landed. The body carries its id; check storage for that id before re-sending (a blind re-send may duplicate it). A retry with the same Idempotency-Key replays this 202 without writing again.",
             "headers": {
+              "X-GC-Cache-Age-S": {
+                "schema": {
+                  "description": "Age in seconds of the CachingStore snapshot that served this response (0 if not applicable).",
+                  "format": "double",
+                  "type": "number"
+                }
+              },
+              "X-GC-Index": {
+                "schema": {
+                  "description": "Latest event sequence number.",
+                  "format": "int64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
               "X-GC-Request-Id": {
                 "$ref": "#/components/headers/X-GC-Request-Id"
               }
@@ -38662,6 +38677,21 @@
             },
             "description": "Delivery unconfirmed: the store reported the reply created but it could not be read back, so it may or may not have landed. The body carries its id; check storage for that id before re-sending (a blind re-send may duplicate it). A retry with the same Idempotency-Key replays this 202 without writing again.",
             "headers": {
+              "X-GC-Cache-Age-S": {
+                "schema": {
+                  "description": "Age in seconds of the CachingStore snapshot that served this response (0 if not applicable).",
+                  "format": "double",
+                  "type": "number"
+                }
+              },
+              "X-GC-Index": {
+                "schema": {
+                  "description": "Latest event sequence number.",
+                  "format": "int64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
               "X-GC-Request-Id": {
                 "$ref": "#/components/headers/X-GC-Request-Id"
               }
