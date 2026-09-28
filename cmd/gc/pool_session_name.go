@@ -339,6 +339,14 @@ func releaseOrphanedPoolAssignments(
 	// at ~14 minutes.
 	sessionStoreLiveAssignee := make(map[string]bool, len(assignedWorkBeads))
 	ownerStoreLiveAssignee := make(map[string]bool, len(assignedWorkBeads))
+	// No session is in hand here, so only the assignee can mark work as a named
+	// agent's. assigneePreservesNamedSessionRoute above skips a named claim on its
+	// own template; this guard, at the writer, withholds one on ANY template and
+	// for a suspended agent, and proposes it instead (ga-9n8hjv).
+	namedGuard := namedReleaseGuardForAssignee(cfg)
+	// Work held under a dead named session's bead ID is the one case the
+	// assignee alone cannot identify; orphanSweepGuard looks the handle up.
+	handleGuards := make(map[string]orphanSweepGuardResult)
 	sweepStart := time.Now()
 	var probeElapsed time.Duration
 	memoizedProbeCount := 0
@@ -489,9 +497,16 @@ func releaseOrphanedPoolAssignments(
 			}
 			continue
 		}
+		// Named-agent work is proposed, never released (ga-9n8hjv fence #1): a
+		// bare handle the session store resolves to a named session counts as
+		// named. releaseListed applies the guard (releaseSeat.guard).
+		guard, decided := orphanSweepGuard(cfg, sessionStore.Store, wb, namedGuard, handleGuards)
+		if !decided {
+			continue
+		}
 		// The verb's route guard is the one this sweep's pre-filter lacks:
 		// an expanded workflow root's run_target is no lane (NEW-5).
-		if out := releaseListed([]seatWorkHit{{store: ownerStore, bead: wb}}, releaseOrphan, releaseSeat{}, cfg, ReleaseOpts{}); len(out.Released) == 0 {
+		if out := releaseListed([]seatWorkHit{{store: ownerStore, bead: wb}}, releaseOrphan, releaseSeat{guard: guard}, cfg, ReleaseOpts{}); len(out.Released) == 0 {
 			keepLog.log(wb.ID, assignee, out.Why[wb.ID])
 			continue
 		}
@@ -598,9 +613,11 @@ func releaseConfirmedOrphanSessionWork(
 	if len(identifiers) == 0 {
 		return nil
 	}
-
+	// The dead session may be a named one (a non-canonical or mislabeled bead
+	// carrying the identity); its work is proposed, never released (ga-9n8hjv).
 	var released []releasedPoolAssignment
 	seat := releaseSeatOfInfo(info)
+	seat.guard = namedReleaseGuardForSessionInfo(cfg, info)
 	for i, wb := range assignedWorkBeads {
 		assignee := strings.TrimSpace(wb.Assignee)
 		if _, ok := identifiers[assignee]; !ok {
@@ -857,8 +874,18 @@ func isCanonicalWorkflowRoot(wb beads.Bead) bool {
 //     correct path for continuation-group beads: the group is never exposed on
 //     an open, unassigned bead. A store that cannot fence the write is refused
 //     and logged rather than written blind.
-func releaseOrphanedPoolAssignment(store beads.Store, wb beads.Bead, clearDetached bool) bool {
+//
+// guard is REQUIRED (ga-9n8hjv, fence #1): when it names the work as a named
+// agent's, nothing is released and the release is PROPOSED on the bead instead
+// (see named_release_guard.go). It returns false then, as for any skipped release.
+func releaseOrphanedPoolAssignment(store beads.Store, wb beads.Bead, clearDetached bool, guard namedReleaseGuard) bool {
 	if store == nil || strings.TrimSpace(wb.ID) == "" {
+		return false
+	}
+	if reason := guard.withholdReasonForBead(wb); reason != "" {
+		if _, err := proposeNamedRelease(store, wb, reason, "orphaned-pool-assignment", log.Writer()); err != nil {
+			log.Printf("releaseOrphanedPoolAssignments: %v", err)
+		}
 		return false
 	}
 	update := beads.UpdateOpts{
