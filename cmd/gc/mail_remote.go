@@ -140,6 +140,14 @@ func cmdMailSendRemote(c *api.Client, target *remoteTarget, args []string, notif
 		Body:    body,
 	})
 	if err != nil {
+		// A 202 (delivery unconfirmed) gets the local verdict: exit 6 and
+		// the ID to check, not a plain failure that invites a blind re-send.
+		if code := classifyMailWriteFailure(stderr, "gc mail send", err); code != 0 {
+			if jsonOut {
+				return writeMailVerdictJSON(stdout, stderr, "gc mail send", "mail.send", "send", code, err)
+			}
+			return code
+		}
 		return fail("mail_send_failed", "gc mail send: "+err.Error())
 	}
 	if jsonOut {
@@ -176,6 +184,12 @@ func cmdMailReplyRemote(c *api.Client, target *remoteTarget, args []string, subj
 	}
 	reply, err := c.ReplyMail(id, api.MailReplyRequest{From: sender, Subject: subject, Body: body})
 	if err != nil {
+		if code := classifyMailWriteFailure(stderr, "gc mail reply", err); code != 0 {
+			if jsonOut {
+				return writeMailVerdictJSON(stdout, stderr, "gc mail reply", "mail.reply", "reply", code, err)
+			}
+			return code
+		}
 		return fail("mail_reply_failed", "gc mail reply: "+err.Error())
 	}
 	if jsonOut {
