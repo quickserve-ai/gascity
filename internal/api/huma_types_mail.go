@@ -33,6 +33,18 @@ type MailListOutput struct {
 	Body      MailListBody
 }
 
+// MailWriteOutput is the response envelope for send-mail and reply-mail. Status
+// is the runtime code: 201 when the write was read back from storage, 202 when
+// the store reported it created but the read-back did not complete, so the
+// message may or may not have landed (UNCONFIRMED; ga-nee27h). The 202 body
+// carries the message ID to check before any re-send.
+type MailWriteOutput struct {
+	Status    int     `json:"-"` // runtime code: 201 | 202
+	Index     uint64  `header:"X-GC-Index" doc:"Latest event sequence number."`
+	CacheAgeS float64 `header:"X-GC-Cache-Age-S" doc:"Age in seconds of the CachingStore snapshot that served this response (0 if not applicable)."`
+	Body      mail.Message
+}
+
 // --- Mail types ---
 
 // MailListInput is the Huma input for GET /v0/city/{cityName}/mail.

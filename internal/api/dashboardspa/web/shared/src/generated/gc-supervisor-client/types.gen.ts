@@ -14555,6 +14555,10 @@ export type SendMailResponses = {
      * Created
      */
     201: Message;
+    /**
+     * Delivery unconfirmed: the store reported the message created but it could not be read back, so it may or may not have landed. The body carries its id; check storage for that id before re-sending (a blind re-send may duplicate it). A retry with the same Idempotency-Key replays this 202 without writing again.
+     */
+    202: Message;
 };
 
 export type SendMailResponse = SendMailResponses[keyof SendMailResponses];
@@ -15021,6 +15025,10 @@ export type ReplyMailResponses = {
      * Created
      */
     201: Message;
+    /**
+     * Delivery unconfirmed: the store reported the reply created but it could not be read back, so it may or may not have landed. The body carries its id; check storage for that id before re-sending (a blind re-send may duplicate it). A retry with the same Idempotency-Key replays this 202 without writing again.
+     */
+    202: Message;
 };
 
 export type ReplyMailResponse = ReplyMailResponses[keyof ReplyMailResponses];

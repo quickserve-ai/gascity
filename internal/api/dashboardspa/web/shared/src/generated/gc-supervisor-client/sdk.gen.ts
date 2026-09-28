@@ -595,6 +595,8 @@ export const getV0CityByCityNameMail = <ThrowOnError extends boolean = false>(op
 
 /**
  * Send a mail message
+ *
+ * Send a mail message. Returns 201 with the stored message, or 202 when the write is unconfirmed (see the 202 response). A message verified NOT stored is a 500; re-send it.
  */
 export const sendMail = <ThrowOnError extends boolean = false>(options: Options<SendMailData, ThrowOnError>) => (options.client ?? client).post<SendMailResponses, SendMailErrors, ThrowOnError>({
     url: '/v0/city/{cityName}/mail',
@@ -642,6 +644,8 @@ export const postV0CityByCityNameMailByIdRead = <ThrowOnError extends boolean = 
 
 /**
  * Reply to a mail message
+ *
+ * Reply to a mail message. Returns 201 with the stored reply, or 202 when the write is unconfirmed (see the 202 response). A reply verified NOT stored is a 500; re-send it.
  */
 export const replyMail = <ThrowOnError extends boolean = false>(options: Options<ReplyMailData, ThrowOnError>) => (options.client ?? client).post<ReplyMailResponses, ReplyMailErrors, ThrowOnError>({
     url: '/v0/city/{cityName}/mail/{id}/reply',
