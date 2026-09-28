@@ -395,3 +395,21 @@ func TestJudgeClearedProposalReArms(t *testing.T) {
 		t.Fatalf("re-armed proposal: path=%q labels=%v, want p2 and the label", got.Metadata[beadmeta.ReleaseProposedPathMetadataKey], got.Labels)
 	}
 }
+
+// TestProposedClaimIsNotWakeDemand: a named seat that drain-acks while holding a
+// claim keeps it (ga-9n8hjv); if the claim still counted as wake demand the seat
+// would be re-woken by it and drain-ack again, in a loop. A pending proposal is
+// the judge's, so it is not demand; the same claim without one still is.
+func TestProposedClaimIsNotWakeDemand(t *testing.T) {
+	claim := AwakeWorkBead{ID: "gc-1", Assignee: crewRuntimeIdentity, Status: "in_progress"}
+	if !workBeadHasAwakeDemand(claim) {
+		t.Fatalf("control: an in_progress claim with no proposal must be wake demand")
+	}
+	claim.ReleaseProposed = true
+	if workBeadHasAwakeDemand(claim) {
+		t.Fatalf("an in_progress claim with a pending release proposal is wake demand; want none (drain-ack loop)")
+	}
+	if !releaseProposalPending(beads.Bead{Metadata: map[string]string{beadmeta.ReleaseProposedAtMetadataKey: "2026-09-28T00:00:00Z"}}) {
+		t.Fatalf("the bridge's input: a proposal stamp must read as pending with no labels hydrated")
+	}
+}

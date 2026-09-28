@@ -1708,7 +1708,7 @@ func repairStrandedPoolWorkerBead(
 		// re-attempts (episode marker still aged, session still not-alive).
 		// The denominator counts every attempt, including releases that correctly
 		// no-oped because the work had already moved to a live worker.
-		fmt.Fprintf(stderr, "session beads: stranded-repair for %s deferred: %d of %d unassign(s) failed; leaving session bead open for retry\n", info.ID, res.Failed, res.Failed+res.Released) //nolint:errcheck
+		fmt.Fprintf(stderr, "session beads: stranded-repair for %s deferred: %d of %d unassign(s) failed; leaving session bead open for retry\n", info.ID, res.Failed, res.Failed+res.Released+res.Withheld) //nolint:errcheck
 		return false
 	}
 	return closeBead(store, cfg, info.ID, strandedRepairCloseReason, now, stderr)
