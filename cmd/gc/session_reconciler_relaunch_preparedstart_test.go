@@ -222,7 +222,7 @@ func TestRelaunchAgentForLaunchDrift_AbortClearsSpeculativeResumeKey(t *testing.
 	// the relaunched verdict and the abort residue fold.
 	callRelaunch := func(env *reconcilerTestEnv, tp TemplateParams, session *beads.Bead, storedHash, currentHash, storedProvision, storedLaunch string) (bool, map[string]string) {
 		return relaunchAgentForLaunchDrift(
-			context.Background(), env.sp, sessionFrontDoor(env.store), env.sessionInfo(session.ID), "worker",
+			context.Background(), nil, env.sp, sessionFrontDoor(env.store), env.sessionInfo(session.ID), "worker",
 			tp, "", env.cfg, env.store, storedHash, currentHash, storedProvision, storedLaunch,
 			[]string{"Command"}, env.rec, nil, &env.stdout, &env.stderr,
 		)
