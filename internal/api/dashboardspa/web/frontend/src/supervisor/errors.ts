@@ -56,6 +56,61 @@ export async function unwrapSupervisorResult<T>(
   return data;
 }
 
+/**
+ * A mail send or reply the supervisor answered 202: the store reported the
+ * message created but it could not be read back, so it may or may not have
+ * landed (ga-nee27h). It is an ERROR to the UI, never a success: the caller
+ * keeps the draft, and the message names the ID to check before resending,
+ * because a blind resend may duplicate a message that did land, and a message
+ * that did not land must not read as sent.
+ */
+export class SupervisorMailUnconfirmedError extends SupervisorApiError {
+  constructor(
+    public readonly messageId: string | undefined,
+    requestId: string | undefined,
+  ) {
+    super(202, mailUnconfirmedMessage(messageId), requestId, 'mail_unconfirmed');
+  }
+}
+
+function mailUnconfirmedMessage(messageId: string | undefined): string {
+  const id = messageId !== undefined && messageId.length > 0 ? messageId : undefined;
+  const subject = id === undefined ? 'the message (no ID returned)' : `message ${id}`;
+  const check =
+    id === undefined
+      ? "Check the recipient's mailbox"
+      : `Check it with "GC_NO_API=1 gc mail peek ${id}" on the city`;
+  return (
+    `delivery unconfirmed: ${subject} may have landed but could not be read back. ` +
+    `${check} before resending; a blind resend may send a duplicate. The draft was kept.`
+  );
+}
+
+/**
+ * unwrapSupervisorResult for send-mail and reply-mail: a 202 (delivery
+ * unconfirmed) throws SupervisorMailUnconfirmedError instead of resolving,
+ * because unwrapSupervisorResult accepts any 2xx and would drop the status.
+ */
+export async function unwrapSupervisorMailWrite<T extends { id: string }>(
+  promise: Promise<SupervisorResult<T>>,
+  emptyMessage: string,
+): Promise<T> {
+  let result: SupervisorResult<T>;
+  try {
+    result = await promise;
+  } catch (err) {
+    throw normalizeThrownSupervisorError(err);
+  }
+  const { response } = result;
+  if (response !== undefined && response.status === 202 && result.error === undefined) {
+    throw new SupervisorMailUnconfirmedError(
+      result.data?.id,
+      response.headers.get('x-gc-request-id') ?? undefined,
+    );
+  }
+  return unwrapSupervisorResult(Promise.resolve(result), emptyMessage);
+}
+
 function normalizeThrownSupervisorError(err: unknown): SupervisorApiError {
   if (err instanceof SupervisorApiError) return err;
   return new SupervisorApiError(
