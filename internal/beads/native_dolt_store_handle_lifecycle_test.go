@@ -30,10 +30,13 @@ import (
 // that matters with a reading taken on the closer's own goroutine the moment
 // it returns.
 
-// boundedWait is the safety bound on every wait in these tests. Inside a
-// bubble it runs on the fake clock, so it fires only once every goroutine is
-// durably blocked; it never sets the normal test duration.
-const boundedWait = 5 * time.Second
+// fakeClockBound is the safety bound on waits inside a synctest bubble. It
+// runs on the bubble's fake clock, which advances only once every goroutine in
+// the bubble is durably blocked, so a slow or saturated scheduler cannot make
+// it fire: it is not a real-clock timer racing a goroutine, and TESTING.md's
+// real-clock floor ("Test deadline rule") does not apply to it. Waits on the
+// real clock in these files use beadsHangBudget instead.
+const fakeClockBound = 5 * time.Second
 
 // lifecycleSpy is a spy storage that records what the handle lifecycle tests
 // assert on. A read of failID fails with a transient connection error, which
@@ -164,17 +167,19 @@ func newCheckpoint() (func(), <-chan struct{}) {
 }
 
 // waitErr waits for one result from done and fails the test if none arrives
-// within boundedWait, so a regression that parks the operation fails the test
-// instead of hanging it until the go test timeout. Tests that park an
-// operation register its release with t.Cleanup, so a failure here also lets
-// the parked goroutine finish.
-func waitErr(t *testing.T, done <-chan error, what string) error {
+// within the bound, so a regression that parks the operation fails the test
+// instead of hanging it until the go test timeout. The bound is a hang
+// detector, never a latency assertion: fakeClockBound inside a synctest
+// bubble, beadsHangBudget on the real clock. Tests that park an operation
+// register its release with t.Cleanup, so a failure here also lets the parked
+// goroutine finish.
+func waitErr(t *testing.T, done <-chan error, within time.Duration, what string) error {
 	t.Helper()
 	select {
 	case err := <-done:
 		return err
-	case <-time.After(boundedWait):
-		t.Fatalf("%s did not return within %s", what, boundedWait)
+	case <-time.After(within):
+		t.Fatalf("%s did not return within %s", what, within)
 		return nil
 	}
 }
@@ -194,16 +199,18 @@ func startUpdate(store *NativeDoltStore, id string) <-chan error {
 	return done
 }
 
-// getWithin runs store.Get(id) under boundedWait; see waitErr.
+// getWithin runs store.Get(id) inside a synctest bubble, under
+// fakeClockBound; see waitErr.
 func getWithin(t *testing.T, store *NativeDoltStore, id string) error {
 	t.Helper()
-	return waitErr(t, startGet(store, id), fmt.Sprintf("Get(%q)", id))
+	return waitErr(t, startGet(store, id), fakeClockBound, fmt.Sprintf("Get(%q)", id))
 }
 
-// updateWithin runs store.Update(id) under boundedWait; see waitErr.
+// updateWithin runs store.Update(id) inside a synctest bubble, under
+// fakeClockBound; see waitErr.
 func updateWithin(t *testing.T, store *NativeDoltStore, id string) error {
 	t.Helper()
-	return waitErr(t, startUpdate(store, id), fmt.Sprintf("Update(%q)", id))
+	return waitErr(t, startUpdate(store, id), fakeClockBound, fmt.Sprintf("Update(%q)", id))
 }
 
 // startCloseStore runs CloseStore on its own goroutine and returns its result.
@@ -232,13 +239,15 @@ func startCloseStoreObserving(store *NativeDoltStore, observe func() int32) <-ch
 	return done
 }
 
+// waitCloseResult waits, inside a synctest bubble, for one CloseStore result
+// under fakeClockBound; see waitErr.
 func waitCloseResult(t *testing.T, done <-chan closeStoreResult, what string) closeStoreResult {
 	t.Helper()
 	select {
 	case res := <-done:
 		return res
-	case <-time.After(boundedWait):
-		t.Fatalf("%s did not return within %s", what, boundedWait)
+	case <-time.After(fakeClockBound):
+		t.Fatalf("%s did not return within %s", what, fakeClockBound)
 		return closeStoreResult{}
 	}
 }
@@ -342,7 +351,7 @@ func TestNativeDoltStoreWriteSpanningReconnectCompletesOnItsOriginalHandle(t *te
 		writeDone := startUpdate(store, "gc-w")
 		select {
 		case <-old.txEntered:
-		case <-time.After(boundedWait):
+		case <-time.After(fakeClockBound):
 			t.Fatal("write never reached the original handle")
 		}
 
@@ -357,7 +366,7 @@ func TestNativeDoltStoreWriteSpanningReconnectCompletesOnItsOriginalHandle(t *te
 		// The first attempt now fails with a serialization conflict; the retry
 		// must run on the original handle, not the fresh one now current.
 		old.releaseTx()
-		if err := waitErr(t, writeDone, "write spanning the reconnect"); err != nil {
+		if err := waitErr(t, writeDone, fakeClockBound, "write spanning the reconnect"); err != nil {
 			t.Fatalf("write spanning the reconnect: %v", err)
 		}
 		if got := old.txs.Load(); got != 2 {
@@ -406,7 +415,7 @@ func TestNativeDoltStoreCloseStoreWaitsForWriteOnRetiredHandle(t *testing.T) {
 		writeDone := startUpdate(store, "gc-w")
 		select {
 		case <-old.txEntered:
-		case <-time.After(boundedWait):
+		case <-time.After(fakeClockBound):
 			t.Fatal("write never reached the original handle")
 		}
 		if err := getWithin(t, store, "gc-fail"); err != nil {
@@ -418,7 +427,7 @@ func TestNativeDoltStoreCloseStoreWaitsForWriteOnRetiredHandle(t *testing.T) {
 		case <-reachedDrain:
 		case res := <-closeDone:
 			t.Fatalf("CloseStore returned (err=%v, operations still running on the retired handle=%d) without reaching its wait for operations in flight", res.err, res.observed)
-		case <-time.After(boundedWait):
+		case <-time.After(fakeClockBound):
 			t.Fatal("CloseStore never reached its wait for operations in flight")
 		}
 		// Past the checkpoint the closer is in its wait, which the running
@@ -435,7 +444,7 @@ func TestNativeDoltStoreCloseStoreWaitsForWriteOnRetiredHandle(t *testing.T) {
 		}
 
 		old.releaseTx()
-		if err := waitErr(t, writeDone, "write"); err != nil {
+		if err := waitErr(t, writeDone, fakeClockBound, "write"); err != nil {
 			t.Fatalf("write: %v", err)
 		}
 		res := waitCloseResult(t, closeDone, "CloseStore after the write released")
@@ -480,7 +489,7 @@ func TestNativeDoltStoreSecondCloseStoreWaitsForTheFirstToFinish(t *testing.T) {
 		writeDone := startUpdate(store, "gc-w")
 		select {
 		case <-spy.txEntered:
-		case <-time.After(boundedWait):
+		case <-time.After(fakeClockBound):
 			t.Fatal("write never reached the handle")
 		}
 
@@ -489,7 +498,7 @@ func TestNativeDoltStoreSecondCloseStoreWaitsForTheFirstToFinish(t *testing.T) {
 		case <-reachedDrain:
 		case res := <-first:
 			t.Fatalf("first CloseStore returned (%v) without reaching its wait for operations in flight", res.err)
-		case <-time.After(boundedWait):
+		case <-time.After(fakeClockBound):
 			t.Fatal("first CloseStore never reached its wait for operations in flight")
 		}
 		second := startCloseStoreObserving(store, spy.closeReturned.Load)
@@ -497,7 +506,7 @@ func TestNativeDoltStoreSecondCloseStoreWaitsForTheFirstToFinish(t *testing.T) {
 		case <-reachedWaitForFirst:
 		case res := <-second:
 			t.Fatalf("second CloseStore returned (%v) without waiting for the first, which was still waiting for a write in flight", res.err)
-		case <-time.After(boundedWait):
+		case <-time.After(fakeClockBound):
 			t.Fatal("second CloseStore never reached its wait for the first")
 		}
 		synctest.Wait()
@@ -512,12 +521,12 @@ func TestNativeDoltStoreSecondCloseStoreWaitsForTheFirstToFinish(t *testing.T) {
 		// Let the write finish: the first closer goes on to Close the handle,
 		// which parks until the test releases it.
 		spy.releaseTx()
-		if err := waitErr(t, writeDone, "write"); err != nil {
+		if err := waitErr(t, writeDone, fakeClockBound, "write"); err != nil {
 			t.Fatalf("write: %v", err)
 		}
 		select {
 		case <-spy.closeCalled:
-		case <-time.After(boundedWait):
+		case <-time.After(fakeClockBound):
 			t.Fatal("first CloseStore never called Close on the handle after the write released")
 		}
 		synctest.Wait()
@@ -563,7 +572,7 @@ func TestNativeDoltStoreReadPanicReleasesItsStorageUse(t *testing.T) {
 		t.Fatal("withReadRetry did not propagate the read's panic")
 	}
 
-	if err := waitErr(t, startCloseStore(store), "CloseStore after a read panicked"); err != nil {
+	if err := waitErr(t, startCloseStore(store), beadsHangBudget, "CloseStore after a read panicked"); err != nil {
 		t.Fatalf("CloseStore: %v", err)
 	}
 	if got := spy.closes.Load(); got != 1 {
@@ -581,7 +590,10 @@ func TestNativeDoltStoreReadPanicReleasesItsStorageUse(t *testing.T) {
 //
 // It runs on the real clock, outside a synctest bubble: it exists to explore
 // real interleavings, and its busy workers would stop a bubble's fake clock.
-// Every wait in it is on a signal, bounded by boundedWait.
+// Every wait in it is on a signal, bounded by beadsHangBudget, the package's
+// real-clock hang budget (TESTING.md "Test deadline rule"): no assertion
+// depends on how long those waits take. The one short timer, closeSettle, is
+// the window of a negative assertion, which that rule keeps explicit.
 func TestNativeDoltStoreHandleLifecycleStress(t *testing.T) {
 	const parkedID = "gc-parked"
 	var spiesMu sync.Mutex
@@ -651,7 +663,7 @@ func TestNativeDoltStoreHandleLifecycleStress(t *testing.T) {
 	parkedDone := startUpdate(store, parkedID)
 	select {
 	case <-initial.txEntered:
-	case <-time.After(boundedWait):
+	case <-time.After(beadsHangBudget):
 		t.Fatal("parked write never reached the initial handle")
 	}
 
@@ -683,8 +695,8 @@ func TestNativeDoltStoreHandleLifecycleStress(t *testing.T) {
 	select {
 	case <-activity:
 		t.Logf("activity before shutdown: fresh handle served=%v reads=%d txs=%d", freshServed.Load(), reads.Load(), txs.Load())
-	case <-time.After(boundedWait):
-		t.Fatalf("no activity within %s: fresh handle served=%v reads=%d txs=%d", boundedWait, freshServed.Load(), reads.Load(), txs.Load())
+	case <-time.After(beadsHangBudget):
+		t.Fatalf("no activity within %s: fresh handle served=%v reads=%d txs=%d", beadsHangBudget, freshServed.Load(), reads.Load(), txs.Load())
 	}
 	if got := initial.active.Load(); got < 1 {
 		t.Fatalf("operations running on the retired initial handle at shutdown = %d, want at least the parked write", got)
@@ -706,7 +718,7 @@ func TestNativeDoltStoreHandleLifecycleStress(t *testing.T) {
 	}
 	var got []namedResult
 	drainReached, waitReached := reachedDrain, reachedWaitForFirst
-	waitDeadline := time.After(boundedWait)
+	waitDeadline := time.After(beadsHangBudget)
 	for drainReached != nil || (waitReached != nil && len(got) == 0) {
 		select {
 		case <-drainReached:
@@ -717,12 +729,15 @@ func TestNativeDoltStoreHandleLifecycleStress(t *testing.T) {
 			got = append(got, r)
 		case <-waitDeadline:
 			t.Fatalf("closers did not reach their waits within %s (drain reached=%v, wait-for-first reached=%v, returned=%d)",
-				boundedWait, drainReached == nil, waitReached == nil, len(got))
+				beadsHangBudget, drainReached == nil, waitReached == nil, len(got))
 		}
 	}
 	// Both closers are now in their waits (a closer that already returned is
 	// reported below). Watch a bounded window, as the focused tests do:
 	// neither may return while the parked write is still held.
+	// The window of a negative assertion ("neither returned within it"): the
+	// window is the assertion, so it stays short and explicit rather than
+	// taking the hang budget (TESTING.md "Floors, ceilings, and inputs").
 	window := time.After(closeSettle)
 	for watching := true; watching; {
 		select {
@@ -737,7 +752,7 @@ func TestNativeDoltStoreHandleLifecycleStress(t *testing.T) {
 	}
 
 	initial.releaseTx()
-	if err := waitErr(t, parkedDone, "parked write"); err != nil {
+	if err := waitErr(t, parkedDone, beadsHangBudget, "parked write"); err != nil {
 		t.Fatalf("parked write: %v", err)
 	}
 	for len(got) < 2 {
@@ -750,8 +765,8 @@ func TestNativeDoltStoreHandleLifecycleStress(t *testing.T) {
 			if r.observed != 0 {
 				t.Errorf("%s returned with %d operations still running", r.name, r.observed)
 			}
-		case <-time.After(boundedWait):
-			t.Fatalf("CloseStore did not return within %s after the parked write released (%d of 2 returned)", boundedWait, len(got))
+		case <-time.After(beadsHangBudget):
+			t.Fatalf("CloseStore did not return within %s after the parked write released (%d of 2 returned)", beadsHangBudget, len(got))
 		}
 	}
 
@@ -762,19 +777,19 @@ func TestNativeDoltStoreHandleLifecycleStress(t *testing.T) {
 	}()
 	select {
 	case <-workersDone:
-	case <-time.After(boundedWait):
+	case <-time.After(beadsHangBudget):
 		t.Fatal("workers did not stop after CloseStore")
 	}
 
 	// Every handle's Close signals; a retired handle's runs on a detached
 	// goroutine, so wait for each signal rather than read the count at once.
 	all := snapshot()
-	closeDeadline := time.After(boundedWait)
+	closeDeadline := time.After(beadsHangBudget)
 	for i, l := range all {
 		select {
 		case <-l.closeCalled:
 		case <-closeDeadline:
-			t.Fatalf("handle %d of %d was not closed within %s", i, len(all), boundedWait)
+			t.Fatalf("handle %d of %d was not closed within %s", i, len(all), beadsHangBudget)
 		}
 	}
 	for i, l := range all {
