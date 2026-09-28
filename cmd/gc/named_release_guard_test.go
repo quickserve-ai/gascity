@@ -286,10 +286,10 @@ func TestBrokenConfigCloseProposesNamedSessionHandleWork(t *testing.T) {
 	}
 }
 
-// TestNamedReleaseGuardRecognisesAssigneeForms pins the assignee half of the
+// TestNamedReleaseGuardRecognizesAssigneeForms pins the assignee half of the
 // guard directly, per spelling and per agent state, so a lookup that misses one
 // form fails here by name rather than only through a sweep.
-func TestNamedReleaseGuardRecognisesAssigneeForms(t *testing.T) {
+func TestNamedReleaseGuardRecognizesAssigneeForms(t *testing.T) {
 	for _, suspended := range []bool{false, true} {
 		cfg := crewRollConfig(suspended)
 		spec, ok := findNamedSessionSpec(cfg, cfg.EffectiveCityName(), crewRuntimeIdentity)
@@ -300,7 +300,7 @@ func TestNamedReleaseGuardRecognisesAssigneeForms(t *testing.T) {
 				continue
 			}
 			if g.withholdReason(assignee) == "" {
-				t.Errorf("suspended=%v: withholdReason(%q) = \"\", want the named agent recognised", suspended, assignee)
+				t.Errorf("suspended=%v: withholdReason(%q) = \"\", want the named agent recognized", suspended, assignee)
 			}
 		}
 		for _, pool := range []string{"worker-1", "qcore/polecat-3", "gc-123"} {
