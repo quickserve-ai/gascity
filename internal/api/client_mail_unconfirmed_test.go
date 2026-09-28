@@ -61,22 +61,25 @@ func TestClientMailWriteUnconfirmed202CarriesMessageID(t *testing.T) {
 	}
 }
 
-// ga-th31cy: a 500 whose detail carries MailNotPersistedErrorCode comes back as
+// ga-th31cy: a 500 with the registered mail-not-persisted code comes back as
 // beadmail.ErrNotPersisted (the remote CLI then exits 5, re-send), for send and
-// reply alike. CONTROL: any other 500 does not.
+// reply alike. CONTROL: the same detail prose under the generic internal code
+// does not: the client branches on the code, never the prose.
 func TestClientMailWriteNotPersisted500MapsToSentinel(t *testing.T) {
 	for _, tc := range []struct {
+		code     string
 		detail   string
 		wantLost bool
 	}{
-		{MailNotPersistedErrorCode + ": beadmail send: message bead was not persisted: gc-43", true},
-		{"dolt: connection refused", false},
+		{"mail-not-persisted", "beadmail send: message bead was not persisted: gc-43", true},
+		// CONTROL: the same prose under the generic code is not a verdict.
+		{"internal", "beadmail send: message bead was not persisted: gc-43", false},
 	} {
 		answer500 := rtFunc(func(r *http.Request) (*http.Response, error) {
 			rec := httptest.NewRecorder()
 			rec.Header().Set("Content-Type", "application/problem+json")
 			rec.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(rec).Encode(map[string]any{"title": "Internal Server Error", "status": 500, "detail": tc.detail}) //nolint:errcheck
+			json.NewEncoder(rec).Encode(map[string]any{"type": "urn:gascity:error:" + tc.code, "code": tc.code, "title": "x", "status": 500, "detail": tc.detail}) //nolint:errcheck
 			resp := rec.Result()
 			resp.Request = r
 			return resp, nil

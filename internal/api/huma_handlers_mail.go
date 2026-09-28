@@ -428,8 +428,8 @@ func logUnconfirmedMailWrite(op, id string, err error) {
 // write never reaches here from send/reply (they answer 202, ga-nee27h); the
 // branch stays so any other caller keeps naming the message ID and warning
 // against a blind retry, because the message may have landed and a blind
-// retry sends a duplicate. A LOST write (verified absent) is a 500 whose detail starts with
-// MailNotPersistedErrorCode.
+// retry sends a duplicate. A LOST write (verified absent) is a 500 with the registered code
+// mail-not-persisted.
 func mailWriteError(err error) error {
 	if id, ok := mail.UnconfirmedMessageID(err); ok {
 		// Not "GET it": this API's read of a just-created bead can be served
@@ -440,8 +440,8 @@ func mailWriteError(err error) error {
 	}
 	if errors.Is(err, beadmail.ErrNotPersisted) {
 		// Verified absent: the message did not land, so a re-send is right. The
-		// code lets a remote client give the local verdict (ga-th31cy).
-		return apierr.Internal.Msg(MailNotPersistedErrorCode + ": " + err.Error())
+		// registered code lets a remote client give the local verdict (ga-th31cy).
+		return apierr.MailNotPersisted.Msg(err.Error())
 	}
 	return apierr.Internal.Msg(err.Error())
 }

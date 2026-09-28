@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gastownhall/gascity/internal/api/apierr"
 	"github.com/gastownhall/gascity/internal/mail"
 	"github.com/gastownhall/gascity/internal/mail/beadmail"
 )
@@ -28,16 +29,22 @@ func TestMailWriteErrorKeepsUnconfirmedDistinct(t *testing.T) {
 	}
 }
 
-// ga-th31cy: a write VERIFIED absent carries MailNotPersistedErrorCode, so a
+// ga-th31cy: a write VERIFIED absent carries the mail-not-persisted code, so a
 // remote client can give the local verdict (exit 5, re-send). An error that is
-// not the sentinel stays a plain 500 with no code.
+// not the sentinel keeps the generic internal code.
 func TestMailWriteErrorCodesAVerifiedLostWrite(t *testing.T) {
-	lost := mailWriteError(fmt.Errorf("beadmail send: %w: gc-43", beadmail.ErrNotPersisted)).Error()
-	if !strings.Contains(lost, MailNotPersistedErrorCode+": ") || !strings.Contains(lost, "gc-43") {
-		t.Errorf("lost write %q does not carry %q and the ID", lost, MailNotPersistedErrorCode)
+	var lost *apierr.ErrorModel
+	if !errors.As(mailWriteError(fmt.Errorf("beadmail send: %w: gc-43", beadmail.ErrNotPersisted)), &lost) {
+		t.Fatalf("lost write is not an *apierr.ErrorModel")
 	}
-	plain := mailWriteError(errors.New("dolt: connection refused")).Error()
-	if strings.Contains(plain, MailNotPersistedErrorCode) {
-		t.Errorf("a server fault was coded as a lost write: %q", plain)
+	if lost.Code != apierr.MailNotPersisted.Code || !strings.Contains(lost.Error(), "gc-43") {
+		t.Errorf("lost write code=%q err=%q, want code %q naming gc-43", lost.Code, lost.Error(), apierr.MailNotPersisted.Code)
+	}
+	var plain *apierr.ErrorModel
+	if !errors.As(mailWriteError(errors.New("dolt: connection refused")), &plain) {
+		t.Fatalf("server fault is not an *apierr.ErrorModel")
+	}
+	if plain.Code == apierr.MailNotPersisted.Code {
+		t.Errorf("a server fault was coded as a lost write: %+v", plain)
 	}
 }

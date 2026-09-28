@@ -25,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/api/apierr"
 	"github.com/gastownhall/gascity/internal/api/genclient"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
@@ -100,14 +101,6 @@ type storeSlowError struct {
 // StoreSlowErrorCode is the stable problem-detail prefix for mail read
 // timeouts that must not fall back to the local store path.
 const StoreSlowErrorCode = "store_slow"
-
-// MailNotPersistedErrorCode prefixes the detail of the 500 a mail send or reply
-// answers when the write was VERIFIED ABSENT after the store reported it
-// created (beadmail.ErrNotPersisted). The client maps it back to that sentinel
-// so a remote gc mail send gets the local verdict: exit 5, re-send (ga-th31cy).
-// Any other 500 stays a plain failure: without the code the client cannot tell
-// a lost write from a server fault.
-const MailNotPersistedErrorCode = "mail_not_persisted"
 
 func (e *storeSlowError) Error() string {
 	if e.msg == "" {
@@ -1412,15 +1405,27 @@ func mailUnconfirmedFromGen(g genclient.Message) (mail.Message, error) {
 }
 
 // mailNotPersistedFromResponse returns an error wrapping beadmail.ErrNotPersisted
-// when a mail write answered 500 with the MailNotPersistedErrorCode detail, and
-// nil for anything else (the caller's generic handling applies).
+// when a mail write answered with the registered mail-not-persisted problem
+// code (a write the server verified absent), and nil for anything else, so the
+// caller's generic handling applies. It reads the machine code, never the
+// detail prose (ga-th31cy).
 func mailNotPersistedFromResponse(status int, pd *genclient.ErrorModel) error {
-	if status != http.StatusInternalServerError || pd == nil || pd.Detail == nil {
+	if status < 500 || pd == nil {
 		return nil
 	}
-	detail := strings.TrimSpace(*pd.Detail)
-	if !strings.HasPrefix(detail, MailNotPersistedErrorCode+":") {
+	code := ""
+	if pd.Code != nil {
+		code = strings.TrimSpace(*pd.Code)
+	}
+	if code == "" && pd.Type != nil {
+		code = strings.TrimPrefix(strings.TrimSpace(*pd.Type), apierr.URNPrefix)
+	}
+	if code != apierr.MailNotPersisted.Code {
 		return nil
+	}
+	detail := ""
+	if pd.Detail != nil {
+		detail = *pd.Detail
 	}
 	return fmt.Errorf("server verified the write absent (%s): %w", detail, beadmail.ErrNotPersisted)
 }

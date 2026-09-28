@@ -96,6 +96,11 @@ var (
 	StoreUnavailable   = Register(ProblemType{Code: "store-unavailable", Status: http.StatusServiceUnavailable, Title: "Store Unavailable"})
 	ServiceUnavailable = Register(ProblemType{Code: "service-unavailable", Status: http.StatusServiceUnavailable, Title: "Service Unavailable"})
 	Internal           = Register(ProblemType{Code: "internal", Status: http.StatusInternalServerError, Title: "Internal Server Error"})
+	// MailNotPersisted is a mail send or reply the store reported created but
+	// verification then proved ABSENT: the message did not land, so the client
+	// should re-send. Distinct from internal so a client can give that verdict
+	// (the remote CLI exits 5 like the local path) without parsing detail (ga-th31cy).
+	MailNotPersisted = Register(ProblemType{Code: "mail-not-persisted", Status: http.StatusInternalServerError, Title: "Mail Not Persisted"})
 
 	// Generic transport statuses. Titles match http.StatusText so converting a
 	// plain error of these statuses preserves the wire title.

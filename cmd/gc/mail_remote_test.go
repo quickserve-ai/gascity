@@ -650,7 +650,7 @@ func TestCmdMailRemote_Unconfirmed202GetsLocalVerdict(t *testing.T) {
 }
 
 // ga-th31cy: a remote send or reply whose write the server VERIFIED absent (500
-// with the mail_not_persisted code) gets the local verdict, exit 5 and "re-send",
+// with the mail-not-persisted problem code) gets the local verdict, exit 5 and "re-send",
 // not the generic exit 1.
 func TestCmdMailRemote_NotPersisted500GetsLocalVerdict(t *testing.T) {
 	clearRemoteMailIdentityEnv(t)
@@ -658,7 +658,7 @@ func TestCmdMailRemote_NotPersisted500GetsLocalVerdict(t *testing.T) {
 	srv := newRemoteMailTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/problem+json")
 		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte(`{"title":"Internal Server Error","status":500,"detail":"mail_not_persisted: beadmail send: message bead was not persisted: mc-lost-1"}`))
+		_, _ = w.Write([]byte(`{"type":"urn:gascity:error:mail-not-persisted","code":"mail-not-persisted","title":"Mail Not Persisted","status":500,"detail":"beadmail send: message bead was not persisted: mc-lost-1"}`))
 	}))
 	defer srv.Close()
 
