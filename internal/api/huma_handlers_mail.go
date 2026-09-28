@@ -13,6 +13,7 @@ import (
 	"github.com/gastownhall/gascity/internal/api/apierr"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/mail"
+	"github.com/gastownhall/gascity/internal/mail/beadmail"
 	"github.com/gastownhall/gascity/internal/telemetry"
 )
 
@@ -427,7 +428,8 @@ func logUnconfirmedMailWrite(op, id string, err error) {
 // write never reaches here from send/reply (they answer 202, ga-nee27h); the
 // branch stays so any other caller keeps naming the message ID and warning
 // against a blind retry, because the message may have landed and a blind
-// retry sends a duplicate. A LOST write (verified absent) is a plain 500.
+// retry sends a duplicate. A LOST write (verified absent) is a 500 whose detail starts with
+// MailNotPersistedErrorCode.
 func mailWriteError(err error) error {
 	if id, ok := mail.UnconfirmedMessageID(err); ok {
 		// Not "GET it": this API's read of a just-created bead can be served
@@ -435,6 +437,11 @@ func mailWriteError(err error) error {
 		// not the row landed. GC_NO_API=1 gc mail peek reads storage, wisps
 		// included, without the cache (gc bd show does not read the wisp tier).
 		return apierr.Internal.Msg("mail_unconfirmed: message " + id + " may have landed but could not be read back; check storage with \"GC_NO_API=1 gc mail peek " + id + "\" on the city that served this request before retrying (this API's GET may be answered from cache), a blind retry may send a duplicate: " + err.Error())
+	}
+	if errors.Is(err, beadmail.ErrNotPersisted) {
+		// Verified absent: the message did not land, so a re-send is right. The
+		// code lets a remote client give the local verdict (ga-th31cy).
+		return apierr.Internal.Msg(MailNotPersistedErrorCode + ": " + err.Error())
 	}
 	return apierr.Internal.Msg(err.Error())
 }

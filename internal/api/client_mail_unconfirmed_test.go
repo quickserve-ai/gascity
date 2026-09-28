@@ -3,12 +3,14 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/api/genclient"
 	"github.com/gastownhall/gascity/internal/mail"
+	"github.com/gastownhall/gascity/internal/mail/beadmail"
 )
 
 // ga-nee27h: send-mail and reply-mail answer 202 for an UNCONFIRMED write.
@@ -55,6 +57,54 @@ func TestClientMailWriteUnconfirmed202CarriesMessageID(t *testing.T) {
 		}
 		if m.ID != "gc-unc-client" {
 			t.Fatalf("%s: returned message ID = %q, want %q", name, m.ID, "gc-unc-client")
+		}
+	}
+}
+
+// ga-th31cy: a 500 whose detail carries MailNotPersistedErrorCode comes back as
+// beadmail.ErrNotPersisted (the remote CLI then exits 5, re-send), for send and
+// reply alike. CONTROL: any other 500 does not.
+func TestClientMailWriteNotPersisted500MapsToSentinel(t *testing.T) {
+	for _, tc := range []struct {
+		detail   string
+		wantLost bool
+	}{
+		{MailNotPersistedErrorCode + ": beadmail send: message bead was not persisted: gc-43", true},
+		{"dolt: connection refused", false},
+	} {
+		answer500 := rtFunc(func(r *http.Request) (*http.Response, error) {
+			rec := httptest.NewRecorder()
+			rec.Header().Set("Content-Type", "application/problem+json")
+			rec.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(rec).Encode(map[string]any{"title": "Internal Server Error", "status": 500, "detail": tc.detail}) //nolint:errcheck
+			resp := rec.Result()
+			resp.Request = r
+			return resp, nil
+		})
+		const baseURL = "http://supervisor.test"
+		cw, err := genclient.NewClientWithResponses(
+			baseURL,
+			genclient.WithHTTPClient(&http.Client{Transport: answer500}),
+			genclient.WithRequestEditorFn(func(_ context.Context, req *http.Request) error {
+				req.Header.Set("X-GC-Request", "true")
+				return nil
+			}),
+		)
+		if err != nil {
+			t.Fatalf("NewClientWithResponses: %v", err)
+		}
+		c := &Client{cw: cw, baseURL: baseURL, cityName: "alpha"}
+		for name, call := range map[string]func() (mail.Message, error){
+			"send":  func() (mail.Message, error) { return c.SendMail(MailSendRequest{To: "worker", Subject: "s"}) },
+			"reply": func() (mail.Message, error) { return c.ReplyMail("gc-orig", MailReplyRequest{Body: "r"}) },
+		} {
+			_, err := call()
+			if err == nil {
+				t.Fatalf("%s (%q): a 500 returned success", name, tc.detail)
+			}
+			if got := errors.Is(err, beadmail.ErrNotPersisted); got != tc.wantLost {
+				t.Fatalf("%s (%q): errors.Is(ErrNotPersisted) = %v, want %v (err: %v)", name, tc.detail, got, tc.wantLost, err)
+			}
 		}
 	}
 }

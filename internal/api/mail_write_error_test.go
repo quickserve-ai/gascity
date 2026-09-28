@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/mail"
+	"github.com/gastownhall/gascity/internal/mail/beadmail"
 )
 
 // ga-0ejdbv review finding 1: the API returned the same bare 500 for a lost
@@ -24,5 +25,19 @@ func TestMailWriteErrorKeepsUnconfirmedDistinct(t *testing.T) {
 	lost := mailWriteError(errors.New("beadmail send: message bead was not persisted: gc-43")).Error()
 	if strings.Contains(lost, "mail_unconfirmed") {
 		t.Errorf("a lost write reported as unconfirmed: %q", lost)
+	}
+}
+
+// ga-th31cy: a write VERIFIED absent carries MailNotPersistedErrorCode, so a
+// remote client can give the local verdict (exit 5, re-send). An error that is
+// not the sentinel stays a plain 500 with no code.
+func TestMailWriteErrorCodesAVerifiedLostWrite(t *testing.T) {
+	lost := mailWriteError(fmt.Errorf("beadmail send: %w: gc-43", beadmail.ErrNotPersisted)).Error()
+	if !strings.Contains(lost, MailNotPersistedErrorCode+": ") || !strings.Contains(lost, "gc-43") {
+		t.Errorf("lost write %q does not carry %q and the ID", lost, MailNotPersistedErrorCode)
+	}
+	plain := mailWriteError(errors.New("dolt: connection refused")).Error()
+	if strings.Contains(plain, MailNotPersistedErrorCode) {
+		t.Errorf("a server fault was coded as a lost write: %q", plain)
 	}
 }

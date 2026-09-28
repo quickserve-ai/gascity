@@ -30,6 +30,7 @@ import (
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/extmsg"
 	"github.com/gastownhall/gascity/internal/mail"
+	"github.com/gastownhall/gascity/internal/mail/beadmail"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/workspacesvc"
 )
@@ -99,6 +100,14 @@ type storeSlowError struct {
 // StoreSlowErrorCode is the stable problem-detail prefix for mail read
 // timeouts that must not fall back to the local store path.
 const StoreSlowErrorCode = "store_slow"
+
+// MailNotPersistedErrorCode prefixes the detail of the 500 a mail send or reply
+// answers when the write was VERIFIED ABSENT after the store reported it
+// created (beadmail.ErrNotPersisted). The client maps it back to that sentinel
+// so a remote gc mail send gets the local verdict: exit 5, re-send (ga-th31cy).
+// Any other 500 stays a plain failure: without the code the client cannot tell
+// a lost write from a server fault.
+const MailNotPersistedErrorCode = "mail_not_persisted"
 
 func (e *storeSlowError) Error() string {
 	if e.msg == "" {
@@ -1372,6 +1381,9 @@ func (c *Client) SendMail(req MailSendRequest) (mail.Message, error) {
 	if resp == nil {
 		return mail.Message{}, &connError{err: fmt.Errorf("nil response")}
 	}
+	if err := mailNotPersistedFromResponse(resp.StatusCode(), pdOf(resp)); err != nil {
+		return mail.Message{}, err
+	}
 	if err := apiErrorFromResponse(resp.StatusCode(), pdOf(resp)); err != nil {
 		return mail.Message{}, err
 	}
@@ -1397,6 +1409,20 @@ var errMailAcceptedUnconfirmed = errors.New("server answered 202: the write was 
 func mailUnconfirmedFromGen(g genclient.Message) (mail.Message, error) {
 	m := mailMessageFromGen(g)
 	return m, fmt.Errorf("delivery unconfirmed: %w", &mail.DeliveryUnconfirmedError{ID: m.ID, Cause: errMailAcceptedUnconfirmed})
+}
+
+// mailNotPersistedFromResponse returns an error wrapping beadmail.ErrNotPersisted
+// when a mail write answered 500 with the MailNotPersistedErrorCode detail, and
+// nil for anything else (the caller's generic handling applies).
+func mailNotPersistedFromResponse(status int, pd *genclient.ErrorModel) error {
+	if status != http.StatusInternalServerError || pd == nil || pd.Detail == nil {
+		return nil
+	}
+	detail := strings.TrimSpace(*pd.Detail)
+	if !strings.HasPrefix(detail, MailNotPersistedErrorCode+":") {
+		return nil
+	}
+	return fmt.Errorf("server verified the write absent (%s): %w", detail, beadmail.ErrNotPersisted)
 }
 
 // MailReplyRequest carries the parameters of a mail reply for Client.ReplyMail.
@@ -1428,6 +1454,9 @@ func (c *Client) ReplyMail(id string, req MailReplyRequest) (mail.Message, error
 	}
 	if resp == nil {
 		return mail.Message{}, &connError{err: fmt.Errorf("nil response")}
+	}
+	if err := mailNotPersistedFromResponse(resp.StatusCode(), pdOf(resp)); err != nil {
+		return mail.Message{}, err
 	}
 	if err := apiErrorFromResponse(resp.StatusCode(), pdOf(resp)); err != nil {
 		return mail.Message{}, err
