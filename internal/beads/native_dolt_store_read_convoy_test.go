@@ -81,7 +81,7 @@ func TestNativeDoltStoreReadBudgetBoundsStorageLockBehindPendingReconnect(t *tes
 			// A read that fails transiently, arming the reconnect path.
 			return nil, errors.New("invalid connection")
 		default:
-			// A healthy read that honours ctx the way the beads lib's
+			// A healthy read that honors ctx the way the beads lib's
 			// begin-read-tx does.
 			if err := ctx.Err(); err != nil {
 				return nil, fmt.Errorf("begin read tx: %w", err)
@@ -131,22 +131,21 @@ func TestNativeDoltStoreReadBudgetBoundsStorageLockBehindPendingReconnect(t *tes
 	// Wait until R3's failure has reached the reconnect path. The reopen and
 	// R3 signals are checked first. The writer check uses TryRLock, which
 	// fails only while a writer holds or waits for the lock (readerCount < 0),
-	// so it observes a queued Lock() directly rather than guessing from a
-	// sleep.
+	// so it observes a queued Lock() directly rather than guessing from
+	// elapsed time. A queued writer has no signal to wait on, which is why
+	// this one observation goes through pollBoundary.
 	var r3Res result
 	r3Returned := false
-	syncDeadline := time.Now().Add(margin)
-	syncCondition := ""
 	const reopenCalledLabel = "reopen hook called (R3's reconnect did not queue behind R1)"
-	for syncCondition == "" && time.Now().Before(syncDeadline) {
+	syncCtx, cancelSync := context.WithTimeout(context.Background(), margin)
+	defer cancelSync()
+	syncCondition, synced := pollBoundary(syncCtx, func() (string, bool) {
 		select {
 		case <-reopenCalled:
-			syncCondition = reopenCalledLabel
-			continue
+			return reopenCalledLabel, true
 		case r3Res = <-r3:
 			r3Returned = true
-			syncCondition = fmt.Sprintf("R3 returned (took=%s err=%v)", r3Res.took, r3Res.err)
-			continue
+			return fmt.Sprintf("R3 returned (took=%s err=%v)", r3Res.took, r3Res.err), true
 		default:
 		}
 		if !store.mu.TryRLock() {
@@ -156,19 +155,18 @@ func TestNativeDoltStoreReadBudgetBoundsStorageLockBehindPendingReconnect(t *tes
 			// this writer is acquireReconnectGate's Lock, before any reopen.
 			select {
 			case <-reopenCalled:
-				syncCondition = reopenCalledLabel
+				return reopenCalledLabel, true
 			default:
-				syncCondition = "writer queued on s.mu before any reopen: R3's reconnect is waiting behind R1 (the pre-fix convoy)"
+				return "writer queued on s.mu before any reopen: R3's reconnect is waiting behind R1 (the pre-fix convoy)", true
 			}
-			break
 		}
 		store.mu.RUnlock()
-		time.Sleep(time.Millisecond)
-	}
+		return "no writer queued on s.mu, reopen hook not called, R3 still running", false
+	})
 	syncAt := time.Since(testStart)
-	if syncCondition == "" {
+	if !synced {
 		release()
-		t.Fatalf("within %s of R3 starting, no writer queued on s.mu, the reopen hook was not called, and R3 did not return: R3's transient failure never reached the reconnect path", margin)
+		t.Fatalf("within %s of R3 starting, last observation: %s: R3's transient failure never reached the reconnect path", margin, syncCondition)
 	}
 	t.Logf("sync point at %s: %s", syncAt, syncCondition)
 
@@ -223,6 +221,36 @@ func TestNativeDoltStoreReadBudgetBoundsStorageLockBehindPendingReconnect(t *tes
 	}
 	if r2Res.err != nil {
 		t.Fatalf("R2 returned within its budget while R1's read was hung, but failed: %v", r2Res.err)
+	}
+}
+
+// pollBoundaryTick is how often pollBoundary observes its boundary.
+const pollBoundaryTick = time.Millisecond
+
+// pollBoundary observes a black-box boundary that exposes no completion
+// signal: it calls observe at once and then on every tick of a ticker, until
+// observe reports done or ctx ends, and returns the last observed state with
+// whether observe reported done. A caller that gives up can therefore say what
+// it last saw. TESTING.md allows polling only at such a boundary, through a
+// helper like this one rather than a sleep loop.
+//
+// Boundary owner: TestNativeDoltStoreReadBudgetBoundsStorageLockBehindPendingReconnect.
+// The convoy it pins shows only as a writer queued on s.mu, and a
+// sync.RWMutex exposes no signal for a queued writer; giving it one would
+// change the production lock for a test.
+func pollBoundary(ctx context.Context, observe func() (state string, done bool)) (string, bool) {
+	ticker := time.NewTicker(pollBoundaryTick)
+	defer ticker.Stop()
+	for {
+		state, done := observe()
+		if done {
+			return state, true
+		}
+		select {
+		case <-ctx.Done():
+			return state, false
+		case <-ticker.C:
+		}
 	}
 }
 
