@@ -131,18 +131,24 @@ func TestOverdueWatchdogNeverTouchesTheRetryBackoffClock(t *testing.T) {
 	c := NewCachingStore(NewMemStore(), nil)
 	c.problemf = func(string) {}
 	now := time.Date(2026, 9, 3, 17, 0, 0, 0, time.UTC)
-	failedAt := now.Add(-90 * time.Second)
+	// 10s ago with five failures (64s backoff): the retry is NOT yet due, so the
+	// delay comparison below is between two real waits, not 0 == 0.
+	failedAt := now.Add(-10 * time.Second)
 
 	c.mu.Lock()
 	c.stats.ReconcilerArmedAt = now.Add(-4 * time.Hour)
 	c.stats.LastReconcileAt = now.Add(-4 * time.Hour)
-	// A store mid-backoff: five failures, last problem 90s ago.
+	// A store mid-backoff: five failures, the last one 10s ago.
 	c.syncFailures = 5
+	c.lastSyncFailureAt = failedAt
 	c.stats.LastProblemAt = failedAt
 	c.stats.ProblemCount = 5
 	c.mu.Unlock()
 
 	dueBefore := c.nextReconcileDelay(now)
+	if dueBefore <= 0 {
+		t.Fatalf("control: a store 10s into a 64s backoff has delay %v, want > 0", dueBefore)
+	}
 	for i := 0; i < 10; i++ {
 		c.checkReconcileOverdue(now.Add(time.Duration(i) * time.Minute))
 	}
