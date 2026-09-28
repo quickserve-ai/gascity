@@ -279,6 +279,11 @@ func TestBrokenConfigCloseProposesNamedSessionHandleWork(t *testing.T) {
 		t.Fatalf("get: %v", err)
 	}
 	assertProposedNotReleased(t, got, sb.ID, "in_progress", "retired-session-unclaim", "broken-config handle work")
+	// The close command's stderr says "proposing" rather than "releasing" on
+	// exactly this predicate, so it must hold for the ID-only form.
+	if !isNamedSessionBead(idOnly) {
+		t.Fatalf("ID-only form of a named session bead is not named; the close message would claim a release")
+	}
 
 	pool := sessionBeadIDOnlyIdentity(drainAckSessionBead())
 	if len(pool.Metadata) != 0 {
@@ -411,5 +416,84 @@ func TestProposedClaimIsNotWakeDemand(t *testing.T) {
 	}
 	if !releaseProposalPending(beads.Bead{Metadata: map[string]string{beadmeta.ReleaseProposedAtMetadataKey: "2026-09-28T00:00:00Z"}}) {
 		t.Fatalf("the bridge's input: a proposal stamp must read as pending with no labels hydrated")
+	}
+}
+
+// TestProposeNamedReleaseSkipsAReClaimedBead: the writers act on a snapshot. When
+// a fresh worker re-claims the bead between the List and the proposal write, the
+// proposal must not land on the new owner's bead: it would name the old assignee,
+// keep every writer off the bead and drop it from wake demand until a judge
+// cleared it.
+func TestProposeNamedReleaseSkipsAReClaimedBead(t *testing.T) {
+	store := beads.NewMemStore()
+	snapshot := seedWorkBead(t, store, beads.Bead{Title: "re-claimed after the snapshot", Type: "task"}, "in_progress", crewRuntimeIdentity)
+	newOwner := "qcore/polecat-7"
+	if err := store.Update(snapshot.ID, beads.UpdateOpts{Assignee: &newOwner}); err != nil {
+		t.Fatalf("re-claim: %v", err)
+	}
+	var audit bytes.Buffer
+	wrote, err := proposeNamedRelease(store, snapshot, "reason", "test", &audit)
+	if err != nil || wrote {
+		t.Fatalf("proposal over a re-claimed bead wrote=%v err=%v, want no write", wrote, err)
+	}
+	got, err := store.Get(snapshot.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if releaseProposalPending(got) {
+		t.Fatalf("re-claimed bead carries a release proposal: labels=%v metadata=%v", got.Labels, got.Metadata)
+	}
+	if got.Assignee != newOwner {
+		t.Fatalf("assignee = %q, want the new owner %q untouched", got.Assignee, newOwner)
+	}
+	if !strings.Contains(audit.String(), "SKIPPED release proposal for "+snapshot.ID) {
+		t.Fatalf("no SKIPPED audit line; audit=%s", audit.String())
+	}
+}
+
+// TestOrphanSweepProposesWorkHeldUnderADeadNamedSessionHandle: a named session
+// closed by a path that proposes nothing (POST /v0/session/{id}/close closes the
+// session and leaves its work alone) hands its handle-held work to the orphan
+// sweep, where the assignee is only a bead ID. The sweep looks the handle up, so
+// the work is proposed, not released. CONTROLS: a pool session's handle and an
+// assignee that is no session at all still release.
+func TestOrphanSweepProposesWorkHeldUnderADeadNamedSessionHandle(t *testing.T) {
+	sessions := beads.NewMemStore()
+	sessions.HonorExplicitIDs = true
+	named := crewSessionBead()
+	pool := drainAckSessionBead()
+	for _, sb := range []beads.Bead{named, pool} {
+		if _, err := sessions.Create(sb); err != nil {
+			t.Fatalf("seeding session bead %s: %v", sb.ID, err)
+		}
+	}
+	work := beads.NewMemStore()
+	fallback := namedReleaseGuardForAssignee(nil)
+	memo := map[string]orphanSweepGuardResult{}
+	routed := map[string]string{beadmeta.RoutedToMetadataKey: "worker"}
+
+	held := seedWorkBead(t, work, beads.Bead{Title: "held by a dead named handle", Type: "task", Metadata: routed}, "in_progress", named.ID)
+	guard, decided := orphanSweepGuard(nil, sessions, held, fallback, memo)
+	if !decided {
+		t.Fatalf("lookup of a present session bead was undecided")
+	}
+	if released := releaseOrphanedPoolAssignment(work, held, false, guard); released {
+		t.Fatalf("orphan sweep released work held under a dead named session's handle")
+	}
+	got, err := work.Get(held.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	assertProposedNotReleased(t, got, named.ID, "in_progress", "orphaned-pool-assignment", "dead named handle work")
+
+	for _, assignee := range []string{pool.ID, "ga-never-a-session"} {
+		b := seedWorkBead(t, work, beads.Bead{Title: "held by " + assignee, Type: "task", Metadata: routed}, "in_progress", assignee)
+		g, ok := orphanSweepGuard(nil, sessions, b, fallback, memo)
+		if !ok {
+			t.Fatalf("%s: lookup undecided, want the fallback guard", assignee)
+		}
+		if reason := g.withholdReasonForBead(b); reason != "" {
+			t.Fatalf("%s: work withheld (%s), want it releasable", assignee, reason)
+		}
 	}
 }

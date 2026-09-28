@@ -1,8 +1,10 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"strings"
 	"time"
 
@@ -119,6 +121,52 @@ func (g namedReleaseGuard) anyResolvesToNamedSession(values ...string) bool {
 	return false
 }
 
+// orphanSweepGuard picks the guard for one orphan-sweep release. The sweep has no
+// session in hand, but work held under a session HANDLE names one: when the
+// assignee is exactly the ID of a session bead that served a named agent, the
+// guard is built from that bead, so the work is proposed rather than released.
+// This is what covers a named session closed by a path that does not run the CLI
+// close's proposal, such as POST /v0/session/{id}/close, which closes the session
+// and leaves its work to this sweep.
+//
+// ok is false when the lookup could not decide (a read error, or an absence the
+// store could not prove): the caller skips this bead for the tick rather than
+// release it on a guess. A proven absence, or a bead that is not a named session,
+// falls back to the assignee-only guard, which is what the sweep used before.
+// memo is keyed by assignee and lives for one sweep.
+func orphanSweepGuard(cfg *config.City, sessionStore beads.Store, item beads.Bead, fallback namedReleaseGuard, memo map[string]orphanSweepGuardResult) (namedReleaseGuard, bool) {
+	assignee := strings.TrimSpace(item.Assignee)
+	if assignee == "" || sessionStore == nil || releaseProposalPending(item) {
+		// A pending proposal withholds under any guard; skip the lookup.
+		return fallback, true
+	}
+	if r, ok := memo[assignee]; ok {
+		return r.guard, r.ok
+	}
+	r := orphanSweepGuardResult{guard: fallback, ok: true}
+	sb, err := sessionStore.Get(assignee)
+	switch {
+	case err == nil:
+		if strings.TrimSpace(sb.ID) == assignee {
+			if g := namedReleaseGuardForSessionBead(cfg, sb); g.sessionNamed {
+				r.guard = g
+			}
+		}
+	case errors.Is(err, beads.ErrVerifyIndeterminate) || !errors.Is(err, beads.ErrNotFound):
+		log.Printf("releaseOrphanedPoolAssignments: skipping %s this tick: cannot tell whether assignee %q is a named session's handle: %v", item.ID, assignee, err)
+		r.ok = false
+	}
+	if memo != nil {
+		memo[assignee] = r
+	}
+	return r.guard, r.ok
+}
+
+type orphanSweepGuardResult struct {
+	guard namedReleaseGuard
+	ok    bool
+}
+
 // withholdReasonForBead is withholdReason plus one fact only the bead carries: a
 // release proposal already pending on it. A pending proposal is the judge's, so
 // no writer releases the bead until the judge clears it. Without this, a named
@@ -176,6 +224,21 @@ func proposeNamedRelease(store beads.Store, item beads.Bead, reason, releasePath
 		audit = io.Discard
 	}
 	if releaseProposalPending(item) {
+		return false, nil
+	}
+	// The caller's snapshot may be stale: a fresh worker can re-claim the bead
+	// between the List and this write. Stamping a proposal onto the NEW owner's
+	// bead would name the old assignee in its metadata, keep every writer off it
+	// and drop it from wake demand until a judge clears it. So re-verify with the
+	// same live read ReleaseWorkBead's tier 2 uses. Like tier 2 this narrows the
+	// window rather than closing it; a store-level conditional write would close it.
+	stillCurrent, err := liveWorkAssignmentAssigneeMatches(store, item.ID, item.Status, item.Assignee)
+	if err != nil {
+		return false, fmt.Errorf("proposing release of %q: %w", item.ID, err)
+	}
+	if !stillCurrent {
+		fmt.Fprintf(audit, "%s session beads: SKIPPED release proposal for %s: assignment changed since the snapshot (was %q, status %s)\n", //nolint:errcheck // best-effort audit
+			time.Now().UTC().Format(time.RFC3339), item.ID, item.Assignee, item.Status)
 		return false, nil
 	}
 	now := time.Now().UTC().Format(time.RFC3339)

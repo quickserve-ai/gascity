@@ -330,6 +330,9 @@ func releaseOrphanedPoolAssignments(
 	// own template; this guard, at the writer, withholds one on ANY template and
 	// for a suspended agent, and proposes it instead (ga-9n8hjv).
 	namedGuard := namedReleaseGuardForAssignee(cfg)
+	// Work held under a dead named session's bead ID is the one case the
+	// assignee alone cannot identify; orphanSweepGuard looks the handle up.
+	handleGuards := make(map[string]orphanSweepGuardResult)
 	sweepStart := time.Now()
 	var probeElapsed time.Duration
 	memoizedProbeCount := 0
@@ -491,7 +494,11 @@ func releaseOrphanedPoolAssignments(
 		if !allowsRelease {
 			continue
 		}
-		if !releaseOrphanedPoolAssignment(ownerStore, wb, clearDetached, namedGuard) {
+		guard, decided := orphanSweepGuard(cfg, sessionStore.Store, wb, namedGuard, handleGuards)
+		if !decided {
+			continue
+		}
+		if !releaseOrphanedPoolAssignment(ownerStore, wb, clearDetached, guard) {
 			continue
 		}
 		released = append(released, releasedPoolAssignment{ID: wb.ID, Index: i})
