@@ -58,13 +58,22 @@ type CachingStore struct {
 	// the same question (ga-cfhgr).
 	readyProjectionLost map[string]struct{}
 
-	reconciling    atomic.Bool
-	syncFailures   int
-	circuitTripped bool
-	stats          CacheStats
-	onChange       func(eventType, beadID, runID, sessionID, stepID string, dependsOnStepIDs *[]string, payload json.RawMessage)
-	problemf       func(string)
-	problemLog     map[string]cacheProblemLogState
+	reconciling  atomic.Bool
+	syncFailures int
+	// lastSyncFailureAt is when the most recent reconcile failed, and it is the
+	// ONLY retry-backoff anchor: nextReconcileDelay waits until
+	// lastSyncFailureAt + backoff while syncFailures > 0. It is written only
+	// where syncFailures is incremented. It used to be stats.LastProblemAt,
+	// which every recordProblem call stamps, so any per-operation failure on a
+	// store already in backoff (a failed refresh after an update, a create
+	// read-back) pushed the retry out again, and steady write traffic could keep
+	// a degraded cache from ever retrying (ga-yarqx9).
+	lastSyncFailureAt time.Time
+	circuitTripped    bool
+	stats             CacheStats
+	onChange          func(eventType, beadID, runID, sessionID, stepID string, dependsOnStepIDs *[]string, payload json.RawMessage)
+	problemf          func(string)
+	problemLog        map[string]cacheProblemLogState
 
 	// lastReconcileLogAt rate-limits the per-reconcile success log line
 	// emitted by runReconciliation. Without this, a busy cache at SMALL
@@ -186,9 +195,8 @@ type CacheStats struct {
 	// ReconcileOverdueCount is how many watchdog ticks have found no
 	// completed reconcile inside the staleness bound, and
 	// LastReconcileOverdueAt is when the most recent such tick was. They are
-	// the watchdog's OWN counters: it deliberately does not report through
-	// recordProblemLocked, because that stamps LastProblemAt, which
-	// nextReconcileDelay uses as the retry-backoff anchor — see
+	// the watchdog's OWN counters, kept apart from ProblemCount so the
+	// overdue signal is not diluted by per-operation problems — see
 	// checkReconcileOverdue.
 	ReconcileOverdueCount  int64
 	LastReconcileOverdueAt time.Time
@@ -1688,29 +1696,6 @@ func (c *CachingStore) recordProblemLocked(op string, err error) {
 	c.stats.LastProblem = msg
 	if c.problemf != nil {
 		if logMsg, ok := c.problemLogMessageLocked(msg, now); ok {
-			c.problemf(logMsg)
-		}
-	}
-}
-
-// recordReadBackProblem records a failed read-back of a bead this process just
-// wrote. It counts and logs like recordProblem but deliberately leaves
-// stats.LastProblemAt alone: that stamp is nextReconcileDelay's retry-backoff
-// anchor, and read-backs run on the mail hot path. A store already in backoff
-// (where read-backs also fail) would otherwise have its reconcile retry pushed
-// out by every send and never come due (ga-th31cy; same hazard as the
-// watchdog's, see checkReconcileOverdue).
-func (c *CachingStore) recordReadBackProblem(op string, err error) {
-	if err == nil {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	msg := fmt.Sprintf("%s: %v", op, err)
-	c.stats.ProblemCount++
-	c.stats.LastProblem = msg
-	if c.problemf != nil {
-		if logMsg, ok := c.problemLogMessageLocked(msg, time.Now()); ok {
 			c.problemf(logMsg)
 		}
 	}
