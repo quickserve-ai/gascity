@@ -138,6 +138,7 @@ func TestOverdueWatchdogNeverTouchesTheRetryBackoffClock(t *testing.T) {
 	c.stats.LastReconcileAt = now.Add(-4 * time.Hour)
 	// A store mid-backoff: five failures, last problem 90s ago.
 	c.syncFailures = 5
+	c.lastSyncFailureAt = failedAt
 	c.stats.LastProblemAt = failedAt
 	c.stats.ProblemCount = 5
 	c.mu.Unlock()
