@@ -1,0 +1,209 @@
+package beads
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	beadslib "github.com/steveyegge/beads"
+)
+
+// TestNativeDoltStoreReadBudgetBoundsStorageLockBehindPendingReconnect pins
+// ga-yuiof4 step 1: the RWMutex convoy lead for the 2026-09-27 48-minute
+// city-wide order stall.
+//
+// withReadRetry derives one wall-clock ctx (the read budget) for the whole
+// read chain, but acquireStorageGen takes s.mu.RLock() with no ctx and the
+// reconnect path takes s.mu.Lock() with no ctx. A sync.RWMutex refuses NEW
+// readers once a writer is waiting, so:
+//
+//	R1  holds RLock across fn() on a hung connection that ignores its ctx;
+//	R3  fails transiently, enters reconnect, and waits in s.mu.Lock() behind R1;
+//	R2  (a fresh, unrelated read) then waits in s.mu.RLock() behind R3,
+//	    outside any deadline, until R1 returns.
+//
+// The contract under test: R2 returns within its read budget (plus a margin),
+// whatever R1 and R3 are doing. The test releases R1 itself, so it cannot hang
+// past its hard timeout.
+func TestNativeDoltStoreReadBudgetBoundsStorageLockBehindPendingReconnect(t *testing.T) {
+	const (
+		budget      = 200 * time.Millisecond
+		margin      = 2 * time.Second
+		hardTimeout = 10 * time.Second
+	)
+	testStart := time.Now()
+	hard := time.After(hardTimeout)
+
+	r1Entered := make(chan struct{})
+	var r1EnteredOnce sync.Once
+	releaseR1 := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseR1) }) }
+	t.Cleanup(release)
+
+	storage := &nativeDoltStorageSpy{
+		searchIssues: func(ctx context.Context, _ string, f beadslib.IssueFilter) ([]*beadslib.Issue, error) {
+			id := ""
+			if len(f.IDs) > 0 {
+				id = f.IDs[0]
+			}
+			switch id {
+			case "gc-r1":
+				// A read on a hung server connection: it ignores ctx and only
+				// returns when the test releases it.
+				r1EnteredOnce.Do(func() { close(r1Entered) })
+				<-releaseR1
+				return nil, errors.New("invalid connection")
+			case "gc-r3":
+				// A read that fails transiently, arming the reconnect path.
+				return nil, errors.New("invalid connection")
+			default:
+				// A healthy read that honours ctx the way the beads lib's
+				// begin-read-tx does.
+				if err := ctx.Err(); err != nil {
+					return nil, fmt.Errorf("begin read tx: %w", err)
+				}
+				return []*beadslib.Issue{{
+					ID: id, Title: "healthy", Status: beadslib.StatusOpen, IssueType: beadslib.TypeTask, Priority: 2,
+				}}, nil
+			}
+		},
+	}
+	store := newNativeDoltStoreForTest(storage)
+	store.readRetryBudgetOverride = budget
+	store.reopen = func(context.Context) (beadslib.Storage, error) { return storage, nil }
+
+	type result struct {
+		err  error
+		took time.Duration
+		at   time.Duration // since testStart
+	}
+	run := func(id string) <-chan result {
+		ch := make(chan result, 1)
+		go func() {
+			started := time.Now()
+			_, err := store.Get(id)
+			ch <- result{err: err, took: time.Since(started), at: time.Since(testStart)}
+		}()
+		return ch
+	}
+
+	// R1: holds RLock across a read that ignores its ctx.
+	r1 := run("gc-r1")
+	select {
+	case <-r1Entered:
+	case <-hard:
+		t.Fatal("R1 never entered its read")
+	}
+
+	// R3: fails transiently and heads into reconnect.
+	r3 := run("gc-r3")
+
+	// Wait until a writer is pending on s.mu. TryRLock fails only while a
+	// writer holds or waits for the lock (readerCount < 0), so this observes
+	// the queued Lock() directly rather than guessing from a sleep.
+	writerDeadline := time.Now().Add(margin)
+	writerPending := false
+	for time.Now().Before(writerDeadline) {
+		if store.mu.TryRLock() {
+			store.mu.RUnlock()
+			select {
+			case res := <-r3:
+				t.Logf("R3 returned without leaving a writer queued on s.mu: took=%s err=%v", res.took, res.err)
+				r3 = nil
+			default:
+			}
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		writerPending = true
+		break
+	}
+	writerPendingAt := time.Since(testStart)
+	if !writerPending {
+		release()
+		t.Fatalf("no writer queued on s.mu within %s while R1 held RLock: the reconnect path did not take Lock behind R1 (lead CLEARED for this path)", margin)
+	}
+	t.Logf("writer pending on s.mu at %s (R1 still holding RLock)", writerPendingAt)
+
+	// R2: an unrelated read issued while the writer waits.
+	r2Start := time.Since(testStart)
+	r2 := run("gc-r2")
+
+	var r2Res result
+	r2Bounded := false
+	select {
+	case r2Res = <-r2:
+		r2Bounded = true
+	case <-time.After(budget + margin):
+		t.Logf("R2 still blocked %s after issue (budget %s); goroutine stacks in the store:\n%s",
+			budget+margin, budget, storeLockStacks())
+	case <-hard:
+		t.Fatal("hard timeout waiting on R2")
+	}
+
+	// Release R1 in every case, then collect everyone under the hard timeout.
+	releasedAt := time.Since(testStart)
+	release()
+	if !r2Bounded {
+		select {
+		case r2Res = <-r2:
+		case <-hard:
+			t.Fatal("R2 did not return even after R1 was released (hard timeout)")
+		}
+	}
+	var r1Res, r3Res result
+	select {
+	case r1Res = <-r1:
+	case <-hard:
+		t.Fatal("R1 did not return after release (hard timeout)")
+	}
+	if r3 != nil {
+		select {
+		case r3Res = <-r3:
+		case <-hard:
+			t.Fatal("R3 did not return after R1 release (hard timeout)")
+		}
+	}
+
+	t.Logf("timings (since test start): writerPending=%s r2Issued=%s r1Released=%s", writerPendingAt, r2Start, releasedAt)
+	t.Logf("R1: took=%s returnedAt=%s err=%v", r1Res.took, r1Res.at, r1Res.err)
+	t.Logf("R3: took=%s returnedAt=%s err=%v", r3Res.took, r3Res.at, r3Res.err)
+	t.Logf("R2: took=%s returnedAt=%s err=%v", r2Res.took, r2Res.at, r2Res.err)
+
+	if !r2Bounded {
+		t.Fatalf("CONVOY: R2 (budget %s) did not return within %s while a writer waited on s.mu behind R1's read; it returned only after R1 was released (R2 took %s, returned %s after R1 release) with err=%v",
+			budget, budget+margin, r2Res.took, r2Res.at-releasedAt, r2Res.err)
+	}
+}
+
+// storeLockStacks returns the goroutine stacks that are inside the native Dolt
+// store, trimmed to the sync and native_dolt_store.go frames, so a red run
+// names the exact lock call each reader is parked on.
+func storeLockStacks() string {
+	buf := make([]byte, 1<<20)
+	buf = buf[:runtime.Stack(buf, true)]
+	var out strings.Builder
+	for _, g := range strings.Split(string(buf), "\n\n") {
+		if !strings.Contains(g, "native_dolt_store.go") || !strings.Contains(g, "sync.") {
+			continue
+		}
+		lines := strings.Split(g, "\n")
+		out.WriteString(lines[0] + "\n")
+		for i := 1; i+1 < len(lines); i += 2 {
+			fn, loc := strings.TrimSpace(lines[i]), strings.TrimSpace(lines[i+1])
+			if strings.Contains(loc, "native_dolt_store") || strings.HasPrefix(fn, "sync.") {
+				if j := strings.LastIndex(loc, " +0x"); j > 0 {
+					loc = loc[:j]
+				}
+				out.WriteString("    " + fn + "\n        " + loc + "\n")
+			}
+		}
+	}
+	return out.String()
+}
