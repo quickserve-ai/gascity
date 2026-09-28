@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -382,11 +383,51 @@ func (s *Server) humaHandleMailGet(ctx context.Context, input *MailGetInput) (*I
 	}, nil
 }
 
-// mailWriteError keeps an UNCONFIRMED mail write distinguishable from a lost
-// one at the API. Both stay 500s (the documented contract; a 202 for
-// unconfirmed is ga-0ejdbv's follow-up), but an unconfirmed write names the
-// message ID and tells the caller to check before retrying, because the
-// message may have landed and a blind retry sends a duplicate.
+// mailWriteResult is what send-mail and reply-mail cache under an
+// Idempotency-Key: the message, and whether its write was UNCONFIRMED. Caching
+// the unconfirmed outcome (rather than failing the closure) is what keeps the
+// reservation, so a same-key retry replays the 202 instead of writing a second
+// copy of a message that may already have landed (ga-nee27h).
+type mailWriteResult struct {
+	msg         mail.Message
+	unconfirmed bool
+}
+
+// output wraps the result in the send/reply envelope: 202 for an unconfirmed
+// write, 201 for a verified one.
+func (r mailWriteResult) output(index uint64) *MailWriteOutput {
+	status := http.StatusCreated
+	if r.unconfirmed {
+		status = http.StatusAccepted
+	}
+	return &MailWriteOutput{Status: status, Index: index, Body: r.msg}
+}
+
+// unconfirmedMailWrite reports whether err is an UNCONFIRMED write (the store
+// said created, the read-back did not complete) and, if so, the message that
+// may have landed, built from what the caller asked for plus the ID the store
+// minted. Store-derived fields (created_at, thread_id) are absent: nothing
+// could be read back to fill them.
+func unconfirmedMailWrite(err error, msg mail.Message) (mailWriteResult, bool) {
+	id, ok := mail.UnconfirmedMessageID(err)
+	if !ok {
+		return mailWriteResult{}, false
+	}
+	msg.ID = id
+	return mailWriteResult{msg: msg, unconfirmed: true}, true
+}
+
+// logUnconfirmedMailWrite leaves a server-side trace of an unconfirmed write,
+// which the 202 otherwise reports only to the caller.
+func logUnconfirmedMailWrite(op, id string, err error) {
+	log.Printf("mail %s %s: DELIVERY UNCONFIRMED (answered 202; check storage with %q before any re-send): %v", op, id, "GC_NO_API=1 gc mail peek "+id, err)
+}
+
+// mailWriteError turns a failed mail write into its API error. An UNCONFIRMED
+// write never reaches here from send/reply (they answer 202, ga-nee27h); the
+// branch stays so any other caller keeps naming the message ID and warning
+// against a blind retry, because the message may have landed and a blind
+// retry sends a duplicate. A LOST write (verified absent) is a plain 500.
 func mailWriteError(err error) error {
 	if id, ok := mail.UnconfirmedMessageID(err); ok {
 		// Not "GET it": this API's read of a just-created bead can be served
@@ -401,7 +442,7 @@ func mailWriteError(err error) error {
 // humaHandleMailSend is the Huma-typed handler for POST /v0/mail.
 // Body validation (To and Subject required, minLength:"1") is enforced by
 // the framework from MailSendInput's struct tags.
-func (s *Server) humaHandleMailSend(ctx context.Context, input *MailSendInput) (*IndexOutput[mail.Message], error) {
+func (s *Server) humaHandleMailSend(ctx context.Context, input *MailSendInput) (*MailWriteOutput, error) {
 	resolved, resolveErr := s.resolveMailSendRecipientWithContext(ctx, input.Body.To)
 	if resolveErr != nil {
 		if errors.Is(resolveErr, errMailNoBeadStore) {
@@ -426,26 +467,35 @@ func (s *Server) humaHandleMailSend(ctx context.Context, input *MailSendInput) (
 
 	// Idempotency: send at most once per Idempotency-Key. On replay the closure
 	// is skipped entirely, so no duplicate Send, telemetry op, or MailSent event
-	// fires. The helper guarantees the reservation is released on a send error.
-	msg, err := withIdempotency(s.idem, "/v0/mail", input.IdempotencyKey, input.Body,
-		func() (mail.Message, error) {
+	// fires. The helper releases the reservation on a send error, so a LOST
+	// write (verified absent) can be re-sent under the same key. An UNCONFIRMED
+	// write is NOT an error here: it may have landed, so it is cached as a 202
+	// and a same-key retry replays that instead of writing a second copy.
+	res, err := withIdempotency(s.idem, "/v0/mail", input.IdempotencyKey, input.Body,
+		func() (mailWriteResult, error) {
 			sent, sendErr := mp.Send(from, resolved, input.Body.Subject, input.Body.Body)
 			telemetry.RecordMailOp(ctx, "send", sendErr)
 			if sendErr != nil {
-				return mail.Message{}, mailWriteError(sendErr)
+				// No MailSent event for an unconfirmed write: the event log
+				// would record a delivery nobody could confirm. The CLI send
+				// path records none for it either.
+				if unc, ok := unconfirmedMailWrite(sendErr, mail.Message{
+					From: from, To: resolved, Subject: input.Body.Subject, Body: input.Body.Body, Rig: input.Body.Rig,
+				}); ok {
+					logUnconfirmedMailWrite("send", unc.msg.ID, sendErr)
+					return unc, nil
+				}
+				return mailWriteResult{}, mailWriteError(sendErr)
 			}
 			sent.Rig = input.Body.Rig
 			s.recordMailEvent(events.MailSent, sent.From, sent.ID, input.Body.Rig, &sent)
-			return sent, nil
+			return mailWriteResult{msg: sent}, nil
 		})
 	if err != nil {
 		return nil, err
 	}
 
-	return &IndexOutput[mail.Message]{
-		Index: s.latestIndex(),
-		Body:  msg,
-	}, nil
+	return res.output(s.latestIndex()), nil
 }
 
 // humaHandleMailCount is the Huma-typed handler for GET /v0/mail/count.
@@ -673,7 +723,7 @@ func (s *Server) humaHandleMailArchive(ctx context.Context, input *MailArchiveIn
 }
 
 // humaHandleMailReply is the Huma-typed handler for POST /v0/mail/{id}/reply.
-func (s *Server) humaHandleMailReply(ctx context.Context, input *MailReplyInput) (*IndexOutput[mail.Message], error) {
+func (s *Server) humaHandleMailReply(ctx context.Context, input *MailReplyInput) (*MailWriteOutput, error) {
 	id := input.ID
 	rig := input.Rig
 
@@ -684,14 +734,14 @@ func (s *Server) humaHandleMailReply(ctx context.Context, input *MailReplyInput)
 	// "/reply:" boundary and aliasing another (id, key) pair's scope. The
 	// provider lookup stays INSIDE the closure so a replay still succeeds
 	// after the original message was archived (the closure is skipped).
-	msg, err := withIdempotency(s.idem, "/v0/mail/"+url.PathEscape(id)+"/reply", input.IdempotencyKey, input.Body,
-		func() (mail.Message, error) {
+	res, err := withIdempotency(s.idem, "/v0/mail/"+url.PathEscape(id)+"/reply", input.IdempotencyKey, input.Body,
+		func() (mailWriteResult, error) {
 			mp, resolvedRig, mpErr := s.findMailProviderForMessage(id, rig)
 			if mpErr != nil {
-				return mail.Message{}, apierr.Internal.Msg(mpErr.Error())
+				return mailWriteResult{}, apierr.Internal.Msg(mpErr.Error())
 			}
 			if mp == nil {
-				return mail.Message{}, apierr.MailNotFound.Msg("message " + id + " not found")
+				return mailWriteResult{}, apierr.MailNotFound.Msg("message " + id + " not found")
 			}
 
 			// A reply into a foreign-origin thread crosses cities: store
@@ -704,13 +754,13 @@ func (s *Server) humaHandleMailReply(ctx context.Context, input *MailReplyInput)
 				// be applied, and a reply must never cross with a bare sender.
 				orig, getErr := mp.Get(id)
 				if getErr != nil {
-					return mail.Message{}, apierr.Internal.Msg("cross_city_origin_unverified: cannot verify thread origin for cross-city rules: " + getErr.Error())
+					return mailWriteResult{}, apierr.Internal.Msg("cross_city_origin_unverified: cannot verify thread origin for cross-city rules: " + getErr.Error())
 				}
 				// A thread whose origin names a city this roster does not
 				// know is refused, never written to a literal mailbox nobody
 				// polls.
 				if refuse := mail.RefuseUnknownCity(mail.ErrUnresolvedCityProbe, orig.From, roster, s.state.Config().LocalAddressPrefixes()); refuse != nil && !errors.Is(refuse, mail.ErrUnresolvedCityProbe) {
-					return mail.Message{}, apierr.InvalidRequest.Msg("reply origin " + refuse.Error())
+					return mailWriteResult{}, apierr.InvalidRequest.Msg("reply origin " + refuse.Error())
 				}
 				if kind, _ := roster.ResolveCityAddress(orig.From); kind == mail.CityAddressForeign {
 					// The one exception to the roster refusal: the
@@ -726,20 +776,25 @@ func (s *Server) humaHandleMailReply(ctx context.Context, input *MailReplyInput)
 			sent, replyErr := mp.Reply(id, from, input.Body.Subject, input.Body.Body)
 			telemetry.RecordMailOp(ctx, "reply", replyErr)
 			if replyErr != nil {
-				return mail.Message{}, mailWriteError(replyErr)
+				// Unconfirmed: 202 and a kept reservation, no MailReplied
+				// event — the same contract as send-mail (ga-nee27h).
+				if unc, ok := unconfirmedMailWrite(replyErr, mail.Message{
+					From: from, Subject: input.Body.Subject, Body: input.Body.Body, ReplyTo: id, Rig: resolvedRig,
+				}); ok {
+					logUnconfirmedMailWrite("reply", unc.msg.ID, replyErr)
+					return unc, nil
+				}
+				return mailWriteResult{}, mailWriteError(replyErr)
 			}
 			sent.Rig = resolvedRig
 			s.recordMailEvent(events.MailReplied, sent.From, sent.ID, resolvedRig, &sent)
-			return sent, nil
+			return mailWriteResult{msg: sent}, nil
 		})
 	if err != nil {
 		return nil, err
 	}
 
-	return &IndexOutput[mail.Message]{
-		Index: s.latestIndex(),
-		Body:  msg,
-	}, nil
+	return res.output(s.latestIndex()), nil
 }
 
 // humaHandleMailDelete is the Huma-typed handler for DELETE /v0/mail/{id}.
