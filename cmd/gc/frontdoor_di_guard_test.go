@@ -410,11 +410,10 @@ var sessionRelocationRoutedFiles = []string{
 	// relocated sessions class — a green result that reads as "no stuck
 	// sessions" when the check simply looked in the wrong store.
 	"doctor_startup_health.go",
-	// The orphan-sessions managed-name lister (ga-n2f1ph) reads every open
-	// session bead's runtime name. Unrouted, it would find zero sessions under
-	// a relocated sessions class and every live managed seat would read as an
-	// orphan that `gc doctor --fix` then stops.
-	"doctor_orphan_managed_sessions.go",
+	// doctor_orphan_managed_sessions.go (ga-n2f1ph) is deliberately NOT listed:
+	// it builds no session front door. It reads the reconciler's census
+	// (collectAllOpenSessionAvailabilityInfos), whose plan already carries the
+	// sessions binding as a leg.
 }
 
 // sessionRelocationForbidden are the UNROUTED session-front-door constructions a

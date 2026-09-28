@@ -296,3 +296,140 @@ func TestBuildDoctorChecksWiresOrphanSessionsManagedNames(t *testing.T) {
 	}
 	t.Fatalf("orphan-sessions check not registered; names=%v", doctorCheckNames(checks))
 }
+
+// stubDoctorOrphanRigStores points the orphan lister's rig opener at open for
+// the duration of the test.
+func stubDoctorOrphanRigStores(t *testing.T, open func(*config.City, string) (map[string]beads.Store, []rigStoreOpenFailure)) {
+	t.Helper()
+	prev := doctorOrphanRigStores
+	doctorOrphanRigStores = open
+	t.Cleanup(func() { doctorOrphanRigStores = prev })
+}
+
+// orphanRigOnlySession is a namepool pool instance whose open session bead
+// lives only in the qcore rig store.
+const orphanRigOnlySession = "qcore--gastown__slit"
+
+// TestDoctorOrphanSessionsFixSparesRigStoreOnlySession: the lister reads the
+// reconciler's full census, so a live pool instance whose open bead lives only
+// in a rig store is claimed and survives Fix, while a stray is still stopped.
+// It holds for a suspended rig too: the census the lister reads does not skip
+// suspended rigs, since a session claimed only there would otherwise be
+// stopped. Every rig handle the lister opened is closed.
+func TestDoctorOrphanSessionsFixSparesRigStoreOnlySession(t *testing.T) {
+	for _, suspended := range []bool{false, true} {
+		cityStore, _ := managedNamesTestStore(t)
+		cityPath := t.TempDir()
+		rigMem := beads.NewMemStoreFrom(100, nil, nil) // distinct ids from the city store
+		if _, err := rigMem.Create(beads.Bead{
+			Title:    "slit",
+			Type:     sessionBeadType,
+			Labels:   []string{sessionBeadLabel},
+			Metadata: map[string]string{"session_name": orphanRigOnlySession, "state": "active", "pool_managed": "true"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		var opened []*closeCountingStore
+		stubDoctorOrphanRigStores(t, func(*config.City, string) (map[string]beads.Store, []rigStoreOpenFailure) {
+			rig := &closeCountingStore{MemStore: rigMem}
+			opened = append(opened, rig)
+			return map[string]beads.Store{"qcore": rig}, nil
+		})
+		cfg := &config.City{
+			Agents: []config.Agent{{Name: "mayor"}},
+			Rigs:   []config.Rig{{Name: "qcore", Path: filepath.Join(cityPath, "qcore"), SuspendedOnStart: suspended}},
+		}
+
+		sp := runtime.NewFake()
+		for _, name := range []string{"mayor", "qcore--archer", orphanRigOnlySession, "stray"} {
+			if err := sp.Start(context.Background(), name, runtime.Config{}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		check := doctor.NewOrphanSessionsCheck(cfg, "test", "", sp).
+			WithManagedSessionNames(doctorManagedSessionNames(cityPath, cfg, func(string) (beads.Store, error) {
+				return cityStore, nil
+			}))
+		if err := check.Fix(&doctor.CheckContext{CityPath: cityPath}); err != nil {
+			t.Fatalf("suspended=%v: Fix() error = %v", suspended, err)
+		}
+		for _, name := range []string{"mayor", "qcore--archer", orphanRigOnlySession} {
+			if !sp.IsRunning(name) {
+				t.Errorf("suspended=%v: managed session %q was stopped by Fix", suspended, name)
+			}
+		}
+		if sp.IsRunning("stray") {
+			t.Errorf("suspended=%v: orphan session %q still running after Fix", suspended, "stray")
+		}
+		if len(opened) == 0 {
+			t.Fatalf("suspended=%v: the lister never opened the rig stores", suspended)
+		}
+		for i, rig := range opened {
+			if n := rig.closes(); n != 1 {
+				t.Errorf("suspended=%v: rig handle %d closed %d times, want 1", suspended, i, n)
+			}
+		}
+	}
+}
+
+// failingSessionListStore fails every List, the way a dark rig store does.
+type failingSessionListStore struct {
+	*beads.MemStore
+	err error
+}
+
+func (s *failingSessionListStore) List(beads.ListQuery) ([]beads.Bead, error) {
+	return nil, s.err
+}
+
+// TestDoctorOrphanSessionsFixRefusesOnFailingRigLeg: a rig whose store will not
+// open, or whose session listing fails, may hold the only bead claiming a live
+// seat, so the lister errors and Fix stops nothing.
+func TestDoctorOrphanSessionsFixRefusesOnFailingRigLeg(t *testing.T) {
+	tests := []struct {
+		name    string
+		open    func(*config.City, string) (map[string]beads.Store, []rigStoreOpenFailure)
+		wantErr string
+	}{
+		{
+			name: "rig store fails to open",
+			open: func(*config.City, string) (map[string]beads.Store, []rigStoreOpenFailure) {
+				return nil, []rigStoreOpenFailure{{rig: "qcore", err: errors.New("rig dolt unreachable")}}
+			},
+			wantErr: "rig dolt unreachable",
+		},
+		{
+			name: "rig session listing fails",
+			open: func(*config.City, string) (map[string]beads.Store, []rigStoreOpenFailure) {
+				rig := &failingSessionListStore{MemStore: beads.NewMemStoreFrom(100, nil, nil), err: errors.New("rig query timed out")}
+				return map[string]beads.Store{"qcore": rig}, nil
+			},
+			wantErr: "rig query timed out",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stubDoctorOrphanRigStores(t, tt.open)
+			cityStore, _ := managedNamesTestStore(t)
+			cityPath := t.TempDir()
+			cfg := &config.City{
+				Agents: []config.Agent{{Name: "mayor"}},
+				Rigs:   []config.Rig{{Name: "qcore", Path: filepath.Join(cityPath, "qcore")}},
+			}
+			sp, fixErr := orphanFixAgainst(t, cityPath, cfg, cityStore)
+			if fixErr == nil {
+				t.Fatal("Fix() error = nil, want a refusal on a failing rig leg")
+			}
+			for _, want := range []string{"refusing to stop", tt.wantErr} {
+				if !strings.Contains(fixErr.Error(), want) {
+					t.Errorf("Fix() error = %q, want it to contain %q", fixErr.Error(), want)
+				}
+			}
+			for _, name := range []string{"mayor", "qcore--archer", "stray"} {
+				if !sp.IsRunning(name) {
+					t.Errorf("session %q was stopped by a Fix that should have refused", name)
+				}
+			}
+		})
+	}
+}
