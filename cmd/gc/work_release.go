@@ -129,6 +129,7 @@ const (
 	keptUnservedRoute = "unserved-route"
 	keptMoved         = "moved"
 	keptDetachedAlive = "detached-alive"
+	keptNamedProposed = "named-release-proposed" // ga-9n8hjv fence #1
 	failedBudget      = "budget"
 )
 
@@ -154,10 +155,19 @@ type releaseSeat struct {
 	// recordedUnread: the work_started cell could not be read, so it may name
 	// any claim (PHASE1-2 §6.1: unreadable reads as every claim started).
 	recordedUnread bool
+	// named and alias are the seat's own named-session facts (metadata, so
+	// they hold with no config and for a removed agent): releaseListed builds
+	// the named-release guard from them (ga-9n8hjv fence #1). guard, when
+	// built, is a caller's guard that replaces that one (the orphan sweep's
+	// per-bead guard, the orphan close's session guard).
+	named bool
+	alias string
+	guard namedReleaseGuard
 }
 
 func releaseSeatOfBead(b beads.Bead) releaseSeat {
-	s := releaseSeat{id: b.ID, name: b.Metadata["session_name"], template: b.Metadata["template"], fallback: retiredSessionFallbackRoute(b)}
+	s := releaseSeat{id: b.ID, name: b.Metadata["session_name"], template: b.Metadata["template"], fallback: retiredSessionFallbackRoute(b),
+		named: isNamedSessionBead(b) || strings.TrimSpace(b.Metadata["configured_named_identity"]) != "", alias: b.Metadata["alias"]}
 	s.nameStarted(b.Metadata[sessionpkg.CurrentBeadIDKey], b.Metadata[beadmeta.CurrentClaimBeadIDMetadataKey])
 	s.nameRecorded(startedClaimBead(b.Metadata[executionClaimStartedKey]))
 	s.nameWorkStarted(b.Metadata[sessionpkg.WorkStartedKey])
@@ -165,7 +175,8 @@ func releaseSeatOfBead(b beads.Bead) releaseSeat {
 }
 
 func releaseSeatOfInfo(info sessionpkg.Info) releaseSeat {
-	s := releaseSeat{id: info.ID, name: info.SessionNameMetadata, template: info.Template, fallback: retiredSessionFallbackRouteInfo(info)}
+	s := releaseSeat{id: info.ID, name: info.SessionNameMetadata, template: info.Template, fallback: retiredSessionFallbackRouteInfo(info),
+		named: isNamedSessionInfo(info) || strings.TrimSpace(info.ConfiguredNamedIdentity) != "", alias: info.Alias}
 	s.nameStarted(info.CurrentlyProcessingBeadID, info.CurrentClaimBeadID)
 	s.nameRecorded(startedClaimBead(info.ExecutionClaimStarted))
 	s.nameWorkStarted(info.WorkStartedRaw)
@@ -317,9 +328,29 @@ func releaseListed(claims []seatWorkHit, why releaseWhy, seat releaseSeat, cfg *
 	if p.seatRoute {
 		fallback = seat.fallback
 	}
+	guard := seat.guard
+	if !guard.built {
+		guard = newNamedReleaseGuard(cfg, seat.id)
+		guard.sessionNamed = seat.named || guard.anyResolvesToNamedSession(seat.name, seat.alias)
+	}
 	for _, c := range mine {
 		if p.startedNamedKeeps && seat.keepsStarted(c.bead) {
 			keep(c, keptStarted)
+			continue
+		}
+		// A named agent's work is never released by a teardown or a sweep: the
+		// release is proposed (label and metadata on the bead, a WITHHELD audit
+		// line) and the claim stays assigned, so it is kept, not released
+		// (ga-9n8hjv fence #1). The guard sits ahead of every check that could
+		// release the claim, as it did at the carry's writers; only the
+		// started-claim keep above, which releases nothing, comes first.
+		if reason := guard.withholdReasonForBead(c.bead); reason != "" {
+			if _, err := proposeNamedRelease(c.store, c.bead, reason, releaseAuditPaths[why], log.Writer()); err != nil {
+				out.Failed = append(out.Failed, c)
+				out.Why[c.bead.ID] = err.Error()
+				continue
+			}
+			keep(c, keptNamedProposed)
 			continue
 		}
 		if route, served := releaseRoute(cfg, c.bead, fallback, p.lane); !served {
@@ -346,11 +377,11 @@ func releaseListed(claims []seatWorkHit, why releaseWhy, seat releaseSeat, cfg *
 				keep(c, keptDetachedAlive)
 				continue
 			}
-			if !releaseOrphanedPoolAssignment(c.store, c.bead, clearDetached) {
+			if !releaseOrphanedPoolAssignment(c.store, c.bead, clearDetached, guard) {
 				keep(c, keptMoved)
 				continue
 			}
-		} else if err := workAssignmentForStore(beads.WorkStore{Store: c.store}).ReleaseWorkBead(c.bead, fallback, log.Writer(), releaseAuditPaths[why]); err != nil {
+		} else if err := workAssignmentForStore(beads.WorkStore{Store: c.store}).ReleaseWorkBead(c.bead, fallback, guard, log.Writer(), releaseAuditPaths[why]); err != nil {
 			out.Failed = append(out.Failed, c)
 			out.Why[c.bead.ID] = err.Error()
 			continue
