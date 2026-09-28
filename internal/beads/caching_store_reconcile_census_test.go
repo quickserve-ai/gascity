@@ -148,6 +148,12 @@ func TestMergeOracleFieldCoverage(t *testing.T) {
 		// only by readers.
 		"heartbeatSink": true, "reconcilerArmedAtNanos": true,
 		"staleServeLogAtNanos": true,
+		// lastSyncFailureAt is the reconcile retry-backoff anchor (ga-yarqx9).
+		// It is written only by runReconciliation's FAILURE branch, before any
+		// merge, and read only by nextReconcileDelay; the merge seam never
+		// writes it (a successful merge resets syncFailures, which already
+		// disarms the anchor), so it is not merge end state.
+		"lastSyncFailureAt": true,
 	}
 	assertFieldsClassified(t, reflect.TypeOf(CachingStore{}), comparedStore, excludedStore)
 
@@ -164,8 +170,8 @@ func TestMergeOracleFieldCoverage(t *testing.T) {
 		// The reconcile watchdog's own fields: ReconcilerArmedAt is stamped by
 		// StartReconciler, the other two by checkReconcileOverdue. The merge
 		// seam never writes any of them, exactly like StaggerOffsetMs above.
-		// They are deliberately separate from ProblemCount/LastProblemAt,
-		// because LastProblemAt is the reconciler's retry-backoff anchor.
+		// They are deliberately separate from ProblemCount, so the overdue
+		// signal is not diluted by per-operation problems.
 		"ReconcilerArmedAt": true, "ReconcileOverdueCount": true,
 		"LastReconcileOverdueAt": true,
 	}
