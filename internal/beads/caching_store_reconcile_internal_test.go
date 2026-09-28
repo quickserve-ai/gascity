@@ -10,6 +10,45 @@ import (
 	"time"
 )
 
+// TestPerOperationProblemsNeverMoveTheRetryBackoff (ga-yarqx9): a cache in
+// reconcile backoff keeps serving writes, and each failed refresh after an
+// update, close or create records a problem. Those records used to stamp the
+// backoff anchor (stats.LastProblemAt), so steady write traffic pushed the retry
+// out forever. The anchor is now lastSyncFailureAt, which only a failed
+// reconcile writes: the retry comes due at lastSyncFailureAt + backoff however
+// many problems are recorded in between.
+func TestPerOperationProblemsNeverMoveTheRetryBackoff(t *testing.T) {
+	t.Parallel()
+	c := NewCachingStoreForTest(NewMemStore(), nil)
+	failedAt := time.Now().Add(-time.Minute)
+	c.mu.Lock()
+	c.state = cacheLive
+	c.lastFreshAt = time.Unix(1, 0)
+	c.syncFailures = 8 // backoff 2s<<8 = 512s, under the 10 min cap
+	c.lastSyncFailureAt = failedAt
+	c.mu.Unlock()
+
+	now := time.Now()
+	dueBefore := c.nextReconcileDelay(now)
+	if dueBefore <= 0 {
+		t.Fatalf("control: a store in backoff 1 min after its failure has delay %v, want > 0", dueBefore)
+	}
+	for i := 0; i < 50; i++ {
+		c.recordProblem("refresh bead after update", errors.New("i/o timeout"))
+	}
+	if dueAfter := c.nextReconcileDelay(now); dueAfter != dueBefore {
+		t.Fatalf("retry delay moved %v -> %v across 50 recorded problems: per-operation failures are starving the reconcile retry", dueBefore, dueAfter)
+	}
+	// The retry comes due exactly at failedAt + backoff.
+	backoff := cacheReconcileBaseBackoff << 8
+	if backoff > cacheReconcileMaxBackoff {
+		backoff = cacheReconcileMaxBackoff
+	}
+	if d := c.nextReconcileDelay(failedAt.Add(backoff)); d != 0 {
+		t.Fatalf("at failedAt+backoff the delay is %v, want 0 (retry due)", d)
+	}
+}
+
 // TestNextReconcileDelay verifies exponential backoff in nextReconcileDelay:
 // delay starts at failure 1 (not 5), doubles per increment, and caps at 10 min.
 func TestNextReconcileDelay(t *testing.T) {
@@ -22,7 +61,7 @@ func TestNextReconcileDelay(t *testing.T) {
 		c.state = cacheLive
 		c.lastFreshAt = time.Unix(1, 0) // stale — normal path returns 0
 		c.syncFailures = syncFails
-		c.stats.LastProblemAt = problemAt
+		c.lastSyncFailureAt = problemAt
 		return c
 	}
 
