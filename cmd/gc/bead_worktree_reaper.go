@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -139,6 +140,10 @@ func reapClosedBeadWorktrees(
 //
 // A nil *reapPreRemoval (every inline and one-shot caller) changes nothing.
 type reapPreRemoval struct {
+	// ctx is the pass ctx: removal is refused once it is done, and each
+	// removal's git deadline (reaperGitTimeout) derives from it. nil is never
+	// done.
+	ctx context.Context
 	// freshStores are UNCACHED stores keyed by rig, for a fresh bead-status
 	// Get right before removal. A rig with no entry protects.
 	freshStores map[string]beads.Store
@@ -508,9 +513,17 @@ func reapClosedBeadWorktreesGuarded(
 			// scan it was judged on started (sessionStartFence.runIfQuiet).
 			// Nothing but the remove runs inside the fence.
 			var removeErr error
-			remove := func() { removeErr = git.New(rigRoot).WorktreeRemove(worktreePath, false) }
+			var passCtx context.Context
+			if pre != nil {
+				passCtx = pre.ctx
+			}
+			remove := func() {
+				gitCtx, cancel := reaperGitCtx(passCtx)
+				defer cancel()
+				removeErr = git.New(rigRoot).WorktreeRemoveCtx(gitCtx, worktreePath, false)
+			}
 			if pre != nil && pre.startFence != nil {
-				if !pre.startFence.runIfQuiet(liveGen, remove) {
+				if !pre.startFence.runIfQuiet(passCtx, liveGen, remove) {
 					const why = "pre-removal re-check: a controller session start began, ended or is in flight since the liveness scan started (session-start fence); retried next pass"
 					if skips.shouldSurface(worktreePath, why) {
 						fmt.Fprintf(stderr, //nolint:errcheck

@@ -149,7 +149,7 @@ func runWorktreeReaperPass(in worktreeReaperPassInput) worktreeReaperPassResult 
 	// when real reaping is enabled — never under dry-run.
 	if in.reapEnabled {
 		started = time.Now()
-		res.agentHomesReset = cleanupClosedBeadAgentHomeWorktreesGuarded(in.cityPath, in.cfg, in.rawStores, in.stderr, &agentHomeResetGuard{stillEnabled: in.stillEnabled, startFence: in.pre.startFence})
+		res.agentHomesReset = cleanupClosedBeadAgentHomeWorktreesGuarded(in.cityPath, in.cfg, in.rawStores, in.stderr, &agentHomeResetGuard{ctx: in.pre.ctx, stillEnabled: in.stillEnabled, startFence: in.pre.startFence})
 		res.agentHomesRan = true
 		res.agentDuration = time.Since(started)
 	}
@@ -275,7 +275,8 @@ func (cr *CityRuntime) sessionStartFenceOf() *sessionStartFence {
 //   - a start whose bracket ENDED before the scan started had its process up
 //     before the scan, so the scan sees it (liveness protects);
 //   - a start that tries to begin while the removal holds the lock waits for
-//     that one `git worktree remove`: the tree is gone before the session
+//     that one `git worktree remove` (at most reaperGitTimeout; the reset's
+//     detach runs no hooks): the tree is gone before the session
 //     starts, the same outcome as the old inline reaper, where removal always
 //     preceded the next tick's starts.
 //
@@ -407,19 +408,45 @@ func (f *sessionStartFence) generation() uint64 {
 }
 
 // runIfQuiet runs fn under the fence iff no start began, ended or is in flight
-// since genAtScan, and reports whether it ran. fn must be the removal alone.
-func (f *sessionStartFence) runIfQuiet(genAtScan uint64, fn func()) bool {
+// since genAtScan and the pass ctx is not done, and reports whether it ran. fn
+// must be the removal alone, bounded by reaperGitTimeout: a start waiting in
+// beginStart waits for it, and some starts wait on the controller run loop.
+// ctx is re-checked inside the lock, so a pass that outlived the controller
+// never starts a removal. A nil ctx is never done.
+func (f *sessionStartFence) runIfQuiet(ctx context.Context, genAtScan uint64, fn func()) bool {
 	if f == nil {
+		if ctx != nil && ctx.Err() != nil {
+			return false
+		}
 		fn()
 		return true
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if ctx != nil && ctx.Err() != nil {
+		return false
+	}
 	if f.gen != genAtScan || f.inflight > 0 {
 		return false
 	}
 	fn()
 	return true
+}
+
+// reaperGitTimeout bounds each git call the reaper runs inside the
+// session-start fence (`git worktree remove`, the agent-home detach). The
+// fence lock is held for the call, so an unbounded git — a hook blocked on a
+// wedged store, say — would hold every session start behind it. A call that
+// hits the deadline is a failed removal or reset, retried next pass.
+const reaperGitTimeout = 2 * time.Minute
+
+// reaperGitCtx derives the deadline for one fenced reaper git call from the
+// pass ctx (nil means none).
+func reaperGitCtx(passCtx context.Context) (context.Context, context.CancelFunc) {
+	if passCtx == nil {
+		passCtx = context.Background()
+	}
+	return context.WithTimeout(passCtx, reaperGitTimeout)
 }
 
 func (l *worktreeReaperLane) invalidateStatusCache() {
@@ -465,15 +492,18 @@ func (t worktreeReaperTrigger) fields() map[string]any {
 		out["last_pass_seq"] = t.lastSeq
 		out["last_pass_age_ms"] = t.lastAge.Milliseconds()
 		out["last_pass_dry_run"] = t.lastDryRun
-		out["last_pass_reaped"] = len(t.lastResult.report.Reaped)
-		out["last_pass_protected"] = len(t.lastResult.report.Protected)
-		out["last_pass_reap_ms"] = t.lastResult.reapDuration.Milliseconds()
-		if t.lastResult.agentHomesRan {
-			out["last_pass_agent_homes_reset"] = t.lastResult.agentHomesReset
-			out["last_pass_agent_homes_ms"] = t.lastResult.agentDuration.Milliseconds()
-		}
 		if t.lastPanicked {
+			// A panicked pass returned no result: its counts are unknown, and
+			// the zero result finish stored for it must not read as observed.
 			out["last_pass_panicked"] = true
+		} else {
+			out["last_pass_reaped"] = len(t.lastResult.report.Reaped)
+			out["last_pass_protected"] = len(t.lastResult.report.Protected)
+			out["last_pass_reap_ms"] = t.lastResult.reapDuration.Milliseconds()
+			if t.lastResult.agentHomesRan {
+				out["last_pass_agent_homes_reset"] = t.lastResult.agentHomesReset
+				out["last_pass_agent_homes_ms"] = t.lastResult.agentDuration.Milliseconds()
+			}
 		}
 	}
 	return out
@@ -585,6 +615,7 @@ func (cr *CityRuntime) triggerWorktreeReaperPass(ctx context.Context, cfg *confi
 		stderr:          cr.stderr,
 		stillEnabled:    stillEnabled,
 		pre: &reapPreRemoval{
+			ctx:                ctx,
 			freshStores:        rawStores,
 			stillEnabled:       stillEnabled,
 			currentSessionDirs: lane.currentSessionDirs,
@@ -602,8 +633,12 @@ func (cr *CityRuntime) triggerWorktreeReaperPass(ctx context.Context, cfg *confi
 		took := time.Since(started)
 		lane.finish(seq, !reapEnabled, res, panicked, time.Now())
 		if took >= worktreeReaperSlowPassThreshold {
-			fmt.Fprintf(cr.stderr, "%s: worktree reaper: pass %d took %s (reaped=%d protected=%d dry_run=%t)\n", //nolint:errcheck // best-effort stderr
-				cr.logPrefix, seq, took.Round(time.Second), len(res.report.Reaped), len(res.report.Protected), !reapEnabled)
+			counts := fmt.Sprintf("reaped=%d protected=%d", len(res.report.Reaped), len(res.report.Protected))
+			if panicked {
+				counts = "panicked, counts unknown"
+			}
+			fmt.Fprintf(cr.stderr, "%s: worktree reaper: pass %d took %s (%s dry_run=%t)\n", //nolint:errcheck // best-effort stderr
+				cr.logPrefix, seq, took.Round(time.Second), counts, !reapEnabled)
 		}
 	}()
 	return trig
@@ -618,7 +653,8 @@ func (cr *CityRuntime) reapStillEnabled() bool {
 	return cfg != nil && cfg.Daemon.AutoReapClosedBeadWorktreesEnabled()
 }
 
-// finish records a completed pass and releases the single-flight latch.
+// finish records a completed pass and releases the single-flight latch. A
+// panicked pass records the zero result; fields() reports no counts for it.
 func (l *worktreeReaperLane) finish(seq uint64, dryRun bool, res worktreeReaperPassResult, panicked bool, at time.Time) {
 	l.mu.Lock()
 	defer l.mu.Unlock()

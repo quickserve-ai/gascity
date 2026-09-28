@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -21,7 +22,7 @@ type agentWorktreeGitProbe interface {
 	IsRepo() bool
 	CurrentBranch() (string, error)
 	HasUncommittedWork() bool
-	CheckoutDetach(ref string) error
+	CheckoutDetachNoHooksCtx(ctx context.Context, ref string) error
 	DefaultBranch() (string, error)
 }
 
@@ -62,6 +63,10 @@ func cleanupClosedBeadAgentHomeWorktrees(
 // agent-home cleanup before each reset: the live reap flag, and the
 // session-start fence the reset runs under.
 type agentHomeResetGuard struct {
+	// ctx is the pass ctx: a reset is refused once it is done, and each
+	// reset's git deadline (reaperGitTimeout) derives from it. nil is never
+	// done.
+	ctx          context.Context
 	stillEnabled func() bool
 	startFence   *sessionStartFence
 }
@@ -189,10 +194,22 @@ func cleanupClosedBeadAgentHomeWorktreesGuarded(
 					continue
 				}
 			}
+			// The detach runs with hooks disabled: the rig's post-checkout
+			// hook (`bd hooks run`) can block on a wedged store, and the
+			// detach holds the session-start fence. It is bounded by
+			// reaperGitTimeout either way.
+			var passCtx context.Context
+			if guard != nil {
+				passCtx = guard.ctx
+			}
 			var detachErr error
-			detach := func() { detachErr = wg.CheckoutDetach(resetRef) }
+			detach := func() {
+				gitCtx, cancel := reaperGitCtx(passCtx)
+				defer cancel()
+				detachErr = wg.CheckoutDetachNoHooksCtx(gitCtx, resetRef)
+			}
 			if guard != nil && guard.startFence != nil {
-				if !guard.startFence.runIfQuiet(startGen, detach) {
+				if !guard.startFence.runIfQuiet(passCtx, startGen, detach) {
 					fmt.Fprintf(stderr, "cleanupClosedBeadAgentHomeWorktrees: skipping %s: a controller session start began, ended or is in flight since the home was read (session-start fence); retried next pass\n", worktreePath) //nolint:errcheck
 					continue
 				}
