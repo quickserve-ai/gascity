@@ -1899,8 +1899,18 @@ func cfgErrOrUnknown(err error) string {
 // to consult and therefore protects nothing. Passing the full bead with a nil
 // cfg would release the name-shaped identifiers too — that is the ga-9n8hjv
 // portfolio-stripping bug itself.
+//
+// It keeps ONE fact beyond the ID: whether the session was a named session. That
+// flag is not an assignee identifier (sessionAssignmentIdentifiers never reads
+// it), so it widens nothing that is listed; it lets the named-release guard see
+// that work bound to this bead ID is still a named agent's, and propose its
+// release rather than make it (ga-9n8hjv, fence #1).
 func sessionBeadIDOnlyIdentity(b beads.Bead) beads.Bead {
-	return beads.Bead{ID: b.ID}
+	out := beads.Bead{ID: b.ID}
+	if isNamedSessionBead(b) || strings.TrimSpace(b.Metadata["configured_named_identity"]) != "" {
+		out.Metadata = map[string]string{"configured_named_session": "true"}
+	}
+	return out
 }
 
 // cmdSessionClose is the CLI entry point for "gc session close".

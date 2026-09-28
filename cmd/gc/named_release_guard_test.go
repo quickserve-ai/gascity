@@ -243,3 +243,55 @@ func TestDuplicateRepairLeavesNamedIdentityWorkInPlace(t *testing.T) {
 		t.Fatalf("handle-held work assignee = %q, want moved to the winner ga-winner; stderr=%s", got.Assignee, stderr.String())
 	}
 }
+
+// TestBrokenConfigCloseProposesNamedSessionHandleWork: when the city config does
+// not load, `gc session close` releases only work bound to the session bead ID,
+// through an ID-only copy of the bead. That copy used to drop the named marker,
+// so a named seat's bead-ID work was released. It keeps the marker now (and only
+// the marker: no identifier is added to the sweep).
+func TestBrokenConfigCloseProposesNamedSessionHandleWork(t *testing.T) {
+	sb := crewSessionBead()
+	idOnly := sessionBeadIDOnlyIdentity(sb)
+	if ids := sessionAssignmentIdentifiers(idOnly); len(ids) != 1 || ids[0] != sb.ID {
+		t.Fatalf("ID-only identifiers = %v, want only %s: the marker must not widen the sweep", ids, sb.ID)
+	}
+	store := beads.NewMemStore()
+	held := mustCreateDrainAckBead(t, store, beads.Bead{Title: "held by handle", Type: "task"}, "in_progress", sb.ID)
+	var stderr bytes.Buffer
+	unclaimWorkAssignedToRetiredSessionBead("", nil, store, nil, idOnly, "", &stderr)
+	got, err := store.Get(held.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	assertProposedNotReleased(t, got, sb.ID, "in_progress", "retired-session-unclaim", "broken-config handle work")
+
+	pool := sessionBeadIDOnlyIdentity(drainAckSessionBead())
+	if len(pool.Metadata) != 0 {
+		t.Fatalf("pool ID-only bead metadata = %v, want none", pool.Metadata)
+	}
+}
+
+// TestNamedReleaseGuardRecognisesAssigneeForms pins the assignee half of the
+// guard directly, per spelling and per agent state, so a lookup that misses one
+// form fails here by name rather than only through a sweep.
+func TestNamedReleaseGuardRecognisesAssigneeForms(t *testing.T) {
+	for _, suspended := range []bool{false, true} {
+		cfg := crewRollConfig(suspended)
+		spec, ok := findNamedSessionSpec(cfg, cfg.EffectiveCityName(), crewRuntimeIdentity)
+		t.Logf("suspended=%v findNamedSessionSpec(%q) ok=%v identity=%q session_name=%q", suspended, crewRuntimeIdentity, ok, spec.Identity, spec.SessionName)
+		g := namedReleaseGuardForAssignee(cfg)
+		for _, assignee := range []string{crewRuntimeIdentity, spec.SessionName} {
+			if assignee == "" {
+				continue
+			}
+			if g.withholdReason(assignee) == "" {
+				t.Errorf("suspended=%v: withholdReason(%q) = \"\", want the named agent recognised", suspended, assignee)
+			}
+		}
+		for _, pool := range []string{"worker-1", "qcore/polecat-3", "gc-123"} {
+			if r := g.withholdReason(pool); r != "" {
+				t.Errorf("suspended=%v: withholdReason(%q) = %q, want \"\" for pool work", suspended, pool, r)
+			}
+		}
+	}
+}
