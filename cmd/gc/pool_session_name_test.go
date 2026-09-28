@@ -1992,7 +1992,11 @@ func TestReleaseOrphanedPoolAssignments_PreservesCanonicalNamedIdentity(t *testi
 	}
 }
 
-func TestReleaseOrphanedPoolAssignments_ReleasesNamedIdentityForUnreachableStore(t *testing.T) {
+// TestReleaseOrphanedPoolAssignments_ProposesNamedIdentityForUnreachableStore:
+// the named agent is rig-scoped and cannot reach this rig-store work, which is why
+// the sweep used to release it. It is still a named agent's claim, so under fence
+// #1 the sweep proposes the release and the judge makes it (ga-9n8hjv).
+func TestReleaseOrphanedPoolAssignments_ProposesNamedIdentityForUnreachableStore(t *testing.T) {
 	cityPath := t.TempDir()
 	cityStore := beads.NewMemStore()
 	rigStore := beads.NewMemStore()
@@ -2033,17 +2037,15 @@ func TestReleaseOrphanedPoolAssignments_ReleasesNamedIdentityForUnreachableStore
 		[]string{"repo"},
 		map[string]beads.Store{"repo": rigStore},
 	)
-	if len(released) != 1 || released[0].ID != work.ID {
-		t.Fatalf("released = %v, want [%s]", released, work.ID)
+	if len(released) != 0 {
+		t.Fatalf("released = %v, want none: a named agent's claim is proposed, never released (ga-9n8hjv)", released)
 	}
 
 	got, err := rigStore.Get(work.ID)
 	if err != nil {
 		t.Fatalf("Get rig work bead: %v", err)
 	}
-	if got.Status != "open" || got.Assignee != "" {
-		t.Fatalf("rig work = status %q assignee %q, want open/unassigned", got.Status, got.Assignee)
-	}
+	assertProposedNotReleased(t, got, "reviewer", "in_progress", "orphaned-pool-assignment", "unreachable named work")
 }
 
 // A live, cross-store-eligible (city-scoped, Scope="city") NAMED session
@@ -2052,8 +2054,8 @@ func TestReleaseOrphanedPoolAssignments_ReleasesNamedIdentityForUnreachableStore
 // the bead be released — the named-route analog of the pool-worker
 // openSessionOwnsWork cross-store fix (#3453). Without it a backup worker is
 // minted on the same in_progress bead. Contrast
-// ReleasesNamedIdentityForUnreachableStore, where the named agent is rig-scoped
-// and genuinely cannot reach the work, so release is still correct.
+// ProposesNamedIdentityForUnreachableStore, where the named agent is rig-scoped
+// and genuinely cannot reach the work, so the release is proposed to a judge.
 func TestReleaseOrphanedPoolAssignments_PreservesCrossStoreEligibleNamedIdentity(t *testing.T) {
 	cityPath := t.TempDir()
 	cityStore := beads.NewMemStore()
