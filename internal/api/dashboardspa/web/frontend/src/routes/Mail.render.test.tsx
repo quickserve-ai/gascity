@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { invalidate } from '../api/cache';
@@ -16,6 +16,10 @@ interface FetchCall {
 }
 
 const fetchCalls: FetchCall[] = [];
+
+// The status the reply POST answers with: 201 (delivered) by default, 202 when
+// a test needs the server's "delivery unconfirmed" answer.
+let replyStatus = 201;
 
 // Stateful read-state overrides so a mark-read/unread POST is reflected by the
 // next mailbox GET — lets the bulk-mark tests assert the needs-you count (the
@@ -218,7 +222,7 @@ function stubFetch() {
             read: false,
             thread_id: 'thread-direct',
           },
-          201,
+          replyStatus,
         );
       }
       throw new Error(`unexpected fetch: ${url}`);
@@ -282,6 +286,7 @@ function mail(overrides: Record<string, unknown>): Record<string, unknown> {
 }
 
 beforeEach(() => {
+  replyStatus = 201;
   fetchCalls.length = 0;
   markedRead.clear();
   invalidate('mail');
@@ -497,6 +502,23 @@ describe('MailPage supervisor reads', () => {
     expect(compose.getAttribute('title')).toBe('Read-only mode: mutations are disabled');
     // The affordance carries words, not just a dimmed control (DESIGN.md §States).
     expect(screen.getByText('Read-only')).toBeTruthy();
+  });
+
+  it('shows an unconfirmed reply (202) inside the thread and keeps the draft (ga-nee27h)', async () => {
+    replyStatus = 202;
+    renderMailPage();
+
+    fireEvent.click(await screen.findByText('direct supervisor inbox'));
+    fireEvent.change(await screen.findByLabelText('Reply'), {
+      target: { value: 'got it' },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: 'Reply' }));
+
+    const dialog = await screen.findByRole('dialog');
+    const alert = await within(dialog).findByRole('alert');
+    expect(alert.textContent).toContain('delivery unconfirmed');
+    expect(alert.textContent).toContain('mail-reply');
+    expect(within(dialog).getByLabelText('Reply')).toHaveProperty('value', 'got it');
   });
 
   it('disables the thread mark/archive/reply actions in read-only mode', async () => {

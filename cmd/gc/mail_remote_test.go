@@ -603,3 +603,48 @@ func TestCmdMail_ContextMarkReadDispatchesRemoteOthersGated(t *testing.T) {
 		t.Errorf("gated verbs contacted the remote: %v", hits)
 	}
 }
+
+// ga-nee27h: the mail API answers an UNCONFIRMED send or reply with 202. The
+// remote arm must give the local verdict — exit 6 and the message ID to check —
+// not a plain failure (exit 1) that invites a blind re-send.
+func TestCmdMailRemote_Unconfirmed202GetsLocalVerdict(t *testing.T) {
+	clearRemoteMailIdentityEnv(t)
+	t.Setenv("GC_HOME", t.TempDir())
+	srv := newRemoteMailTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"id":"mc-unc-1","from":"alpha/mayor","to":"mayor","subject":"hello","body":"x","created_at":"0001-01-01T00:00:00Z","read":false}`))
+	}))
+	defer srv.Close()
+
+	var out, errb bytes.Buffer
+	if code := cmdMailSendRemote(remoteTestClient(t, srv.URL), remoteTestTarget(srv.URL), []string{"mayor", "x"}, false, false, "", "", "", "", "", false, &out, &errb); code != mailSendUnconfirmedExit {
+		t.Fatalf("send exit = %d, want %d; stderr=%q", code, mailSendUnconfirmedExit, errb.String())
+	}
+	if !strings.Contains(errb.String(), "DELIVERY UNCONFIRMED") || !strings.Contains(errb.String(), "GC_NO_API=1 gc mail peek mc-unc-1") {
+		t.Errorf("send stderr does not name the ID to check: %q", errb.String())
+	}
+	if strings.Contains(out.String(), "Sent message") {
+		t.Errorf("an unconfirmed send reported as sent: %q", out.String())
+	}
+
+	out.Reset()
+	errb.Reset()
+	if code := cmdMailReplyRemote(remoteTestClient(t, srv.URL), remoteTestTarget(srv.URL), []string{"mc-wisp-1", "ack"}, "", "", false, true, &out, &errb); code != mailSendUnconfirmedExit {
+		t.Fatalf("reply --json exit = %d, want %d; stderr=%q", code, mailSendUnconfirmedExit, errb.String())
+	}
+	var got struct {
+		OK    bool   `json:"ok"`
+		ID    string `json:"id"`
+		Error struct {
+			Code     string `json:"code"`
+			ExitCode int    `json:"exit_code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("reply --json output not JSON: %v (%q)", err, out.String())
+	}
+	if got.OK || got.ID != "mc-unc-1" || got.Error.Code != "mail_unconfirmed" || got.Error.ExitCode != mailSendUnconfirmedExit {
+		t.Errorf("reply --json = %+v, want ok=false id=mc-unc-1 code=mail_unconfirmed exit=%d", got, mailSendUnconfirmedExit)
+	}
+}

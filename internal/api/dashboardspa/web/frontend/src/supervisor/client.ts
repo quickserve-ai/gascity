@@ -72,7 +72,13 @@ import type {
   StreamSessionData,
   WorkflowSnapshotResponse,
 } from 'gas-city-dashboard-shared/gc-supervisor';
-import { SupervisorApiError, unwrapSupervisorResult, type SupervisorResult } from './errors';
+import {
+  SupervisorApiError,
+  SupervisorMailUnconfirmedError,
+  unwrapSupervisorMailWrite,
+  unwrapSupervisorResult,
+  type SupervisorResult,
+} from './errors';
 import {
   SUPERVISOR_PROXY_BASE_URL,
   resolveClientBaseUrl,
@@ -85,7 +91,7 @@ export const GC_MUTATION_HEADERS = {
   'X-GC-Request': 'dashboard',
 } as const;
 
-export { SupervisorApiError, SUPERVISOR_PROXY_BASE_URL };
+export { SupervisorApiError, SupervisorMailUnconfirmedError, SUPERVISOR_PROXY_BASE_URL };
 
 type SessionStreamFormat = NonNullable<NonNullable<StreamSessionData['query']>['format']>;
 type SessionTranscriptFormat = NonNullable<
@@ -372,7 +378,8 @@ export function createSupervisorApi(options: CreateSupervisorApiOptions = {}): S
       );
     },
     sendMail(cityName, body) {
-      return unwrapSupervisorResult<Message>(
+      // 202 = delivery unconfirmed: rejects with SupervisorMailUnconfirmedError.
+      return unwrapSupervisorMailWrite<Message>(
         postSupervisorMail({
           client,
           path: { cityName },
@@ -425,7 +432,8 @@ export function createSupervisorApi(options: CreateSupervisorApiOptions = {}): S
       );
     },
     replyMail(cityName, id, body, query) {
-      return unwrapSupervisorResult<Message>(
+      // 202 = delivery unconfirmed: rejects with SupervisorMailUnconfirmedError.
+      return unwrapSupervisorMailWrite<Message>(
         postSupervisorMailReply({
           client,
           path: { cityName, id },
