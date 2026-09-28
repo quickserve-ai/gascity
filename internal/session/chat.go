@@ -476,7 +476,7 @@ func (m *Manager) retryFreshStartAfterStaleKey(
 		}
 		cfg.Env = mergeEnv(cfg.Env, next.Env())
 	}
-	if err := m.sp.Start(ctx, sessName, cfg); err != nil {
+	if err := m.startRuntime(ctx, sessName, cfg); err != nil {
 		switch {
 		case inc == nil:
 		case m.launchedUnder(sessName, cfg.ProcessNames, next):
@@ -945,7 +945,7 @@ func (m *Manager) ensureRunningOn(ctx context.Context, by Actor, id string, b be
 		}
 		inc, provisional = &minted, true
 		cfg = startConfig(cfg, b, minted)
-		if err := m.sp.Start(ctx, sessName, cfg); err != nil {
+		if err := m.startRuntime(ctx, sessName, cfg); err != nil {
 			switch {
 			// A capacity refusal is also a startup death, but the endpoint
 			// refused the launch: that says nothing about the resume key, so
@@ -1203,7 +1203,7 @@ func (m *Manager) ensureRunningRuntimeOnly(ctx context.Context, by Actor, id str
 		}
 		return fmt.Errorf("pre-start orphan cleanup: %w", orphanErr)
 	}
-	if err := m.sp.Start(ctx, sessName, cfg); err != nil {
+	if err := m.startRuntime(ctx, sessName, cfg); err != nil {
 		switch {
 		// A capacity refusal says nothing about the resume key; it takes the
 		// plain failure path, not the stale-key recovery (see ensureRunning).

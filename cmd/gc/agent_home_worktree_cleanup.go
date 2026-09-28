@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -21,7 +22,7 @@ type agentWorktreeGitProbe interface {
 	IsRepo() bool
 	CurrentBranch() (string, error)
 	HasUncommittedWork() bool
-	CheckoutDetach(ref string) error
+	CheckoutDetachNoHooksCtx(ctx context.Context, ref string) error
 	DefaultBranch() (string, error)
 }
 
@@ -54,6 +55,44 @@ func cleanupClosedBeadAgentHomeWorktrees(
 	cfg *config.City,
 	rigStores map[string]beads.Store,
 	stderr io.Writer,
+) int {
+	return cleanupClosedBeadAgentHomeWorktreesGuarded(cityPath, cfg, rigStores, stderr, nil)
+}
+
+// agentHomeResetGuard is what the background reaper lane asks of the
+// agent-home cleanup before each reset: the live reap flag, and the
+// session-start fence the reset runs under.
+type agentHomeResetGuard struct {
+	// ctx is the pass ctx: a reset is refused once it is done, and each
+	// reset's git deadline (reaperGitTimeout) derives from it. nil is never
+	// done.
+	ctx          context.Context
+	stillEnabled func() bool
+	startFence   *sessionStartFence
+}
+
+// cleanupClosedBeadAgentHomeWorktreesGuarded is
+// cleanupClosedBeadAgentHomeWorktrees for a caller whose pass runs off the tick
+// (the background reaper lane, ga-yuiof4 item 3). When guard is non-nil,
+// immediately before each reset it (1) re-checks that real reaping is still
+// configured — a reload may have disabled it mid-pass — (2) re-reads the
+// home's branch and requires it unchanged, so a session the tick dispatched
+// into the home after the bead Get (which may have blocked for a long time)
+// is not detached out from under it, and (3) runs the reset inside the
+// session-start fence, only if no controller session start began, ended or is
+// in flight since the home's evaluation started. All fail closed (skip the
+// home; it is retried next pass).
+//
+// No liveness gate is added: this cleanup never had one inline, because an
+// agent home is expected to host its own live session; its safety rests on
+// the bead being closed (read uncached) and the tree holding no uncommitted
+// work (read immediately before the reset), both of which are unchanged.
+func cleanupClosedBeadAgentHomeWorktreesGuarded(
+	cityPath string,
+	cfg *config.City,
+	rigStores map[string]beads.Store,
+	stderr io.Writer,
+	guard *agentHomeResetGuard,
 ) int {
 	if stderr == nil {
 		stderr = io.Discard
@@ -104,6 +143,11 @@ func cleanupClosedBeadAgentHomeWorktrees(
 			if !wg.IsRepo() {
 				continue
 			}
+			// Fence generation read before anything about this home is.
+			var startGen uint64
+			if guard != nil {
+				startGen = guard.startFence.generation()
+			}
 
 			branch, err := wg.CurrentBranch()
 			if err != nil {
@@ -140,7 +184,39 @@ func cleanupClosedBeadAgentHomeWorktrees(
 				defaultBranch = "main"
 			}
 			resetRef := "origin/" + defaultBranch
-			if err := wg.CheckoutDetach(resetRef); err != nil {
+			if guard != nil {
+				if guard.stillEnabled == nil || !guard.stillEnabled() {
+					fmt.Fprintf(stderr, "cleanupClosedBeadAgentHomeWorktrees: skipping %s: real reaping no longer enabled (reload)\n", worktreePath) //nolint:errcheck
+					continue
+				}
+				if now, err := wg.CurrentBranch(); err != nil || now != branch {
+					fmt.Fprintf(stderr, "cleanupClosedBeadAgentHomeWorktrees: skipping %s: branch changed since bead %s was read (now %q, err=%v)\n", worktreePath, beadID, now, err) //nolint:errcheck
+					continue
+				}
+			}
+			// The detach runs with hooks disabled: the rig's post-checkout
+			// hook (`bd hooks run`) can block on a wedged store, and the
+			// detach holds the session-start fence. It is bounded by
+			// reaperGitTimeout either way.
+			var passCtx context.Context
+			if guard != nil {
+				passCtx = guard.ctx
+			}
+			var detachErr error
+			detach := func() {
+				gitCtx, cancel := reaperGitCtx(passCtx)
+				defer cancel()
+				detachErr = wg.CheckoutDetachNoHooksCtx(gitCtx, resetRef)
+			}
+			if guard != nil && guard.startFence != nil {
+				if !guard.startFence.runIfQuiet(passCtx, startGen, detach) {
+					fmt.Fprintf(stderr, "cleanupClosedBeadAgentHomeWorktrees: skipping %s: a controller session start began, ended or is in flight since the home was read (session-start fence); retried next pass\n", worktreePath) //nolint:errcheck
+					continue
+				}
+			} else {
+				detach()
+			}
+			if err := detachErr; err != nil {
 				fmt.Fprintf(stderr, "cleanupClosedBeadAgentHomeWorktrees: resetting %s to %s: %v\n", worktreePath, resetRef, err) //nolint:errcheck
 				continue
 			}

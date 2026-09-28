@@ -155,7 +155,26 @@ func (g *Git) remoteNamesOriginFirst() []string {
 
 // CheckoutDetach switches the working tree to a detached HEAD at ref.
 func (g *Git) CheckoutDetach(ref string) error {
-	if _, err := g.run("checkout", "--detach", ref); err != nil {
+	return g.CheckoutDetachCtx(context.Background(), ref)
+}
+
+// CheckoutDetachCtx is CheckoutDetach bounded by ctx (see runBounded).
+func (g *Git) CheckoutDetachCtx(ctx context.Context, ref string) error {
+	return g.checkoutDetach(ctx, nil, ref)
+}
+
+// CheckoutDetachNoHooksCtx is CheckoutDetachCtx with every hook disabled
+// (core.hooksPath=/dev/null), for a caller that must not run repo-supplied
+// code — a post-checkout hook can block on services the caller cannot bound.
+func (g *Git) CheckoutDetachNoHooksCtx(ctx context.Context, ref string) error {
+	return g.checkoutDetach(ctx, []string{"-c", "core.hooksPath=/dev/null"}, ref)
+}
+
+func (g *Git) checkoutDetach(ctx context.Context, gitConfig []string, ref string) error {
+	args := make([]string, 0, len(gitConfig)+3)
+	args = append(args, gitConfig...)
+	args = append(args, "checkout", "--detach", ref)
+	if _, err := g.runBounded(ctx, args...); err != nil {
 		return fmt.Errorf("checkout --detach %s: %w", ref, err)
 	}
 	return nil
@@ -164,11 +183,16 @@ func (g *Git) CheckoutDetach(ref string) error {
 // WorktreeRemove removes a worktree. If force is true, removes even with
 // uncommitted changes.
 func (g *Git) WorktreeRemove(path string, force bool) error {
+	return g.WorktreeRemoveCtx(context.Background(), path, force)
+}
+
+// WorktreeRemoveCtx is WorktreeRemove bounded by ctx (see runBounded).
+func (g *Git) WorktreeRemoveCtx(ctx context.Context, path string, force bool) error {
 	args := []string{"worktree", "remove", path}
 	if force {
 		args = append(args, "--force")
 	}
-	_, err := g.run(args...)
+	_, err := g.runBounded(ctx, args...)
 	if err != nil {
 		return fmt.Errorf("removing worktree %q: %w", path, err)
 	}
@@ -627,10 +651,37 @@ func (g *Git) run(args ...string) (string, error) {
 
 // runCtx executes a git command with a context for cancellation/timeout.
 func (g *Git) runCtx(ctx context.Context, args ...string) (string, error) {
+	return g.runCtxWait(ctx, 0, args...)
+}
+
+// boundedWaitDelay is the WaitDelay runBounded gives a cancellable ctx.
+const boundedWaitDelay = 5 * time.Second
+
+// runBounded is runCtx for a caller whose ctx must actually bound the call.
+// Killing git when ctx fires is not enough on its own: a grandchild (a hook's
+// `bd`, say) that inherited the output pipe keeps CombinedOutput reading until
+// the grandchild exits, however long that is. WaitDelay closes the pipe
+// boundedWaitDelay after ctx fires or git exits, so Wait returns.
+//
+// It is not set in runCtx for every caller: WaitDelay also turns a git that
+// exited 0 while a detached grandchild still holds the pipe (an ssh
+// ControlPersist master under ls-remote, say) into exec.ErrWaitDelay, a failure
+// those callers never saw. A context.Background() ctx gets no WaitDelay here
+// either, so a ctx-less method delegating through this path is unchanged.
+func (g *Git) runBounded(ctx context.Context, args ...string) (string, error) {
+	var wait time.Duration
+	if ctx.Done() != nil {
+		wait = boundedWaitDelay
+	}
+	return g.runCtxWait(ctx, wait, args...)
+}
+
+func (g *Git) runCtxWait(ctx context.Context, waitDelay time.Duration, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = g.workDir
 	// Build clean env: inherit everything except git-specific vars.
 	cmd.Env = sanitizeGitEnv(os.Environ())
+	cmd.WaitDelay = waitDelay
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("git %s: %s: %w", strings.Join(args, " "), strings.TrimSpace(string(out)), err)
