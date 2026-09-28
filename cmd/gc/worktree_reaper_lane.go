@@ -146,7 +146,7 @@ func runWorktreeReaperPass(in worktreeReaperPassInput) worktreeReaperPassResult 
 	// when real reaping is enabled — never under dry-run.
 	if in.reapEnabled {
 		started = time.Now()
-		res.agentHomesReset = cleanupClosedBeadAgentHomeWorktreesGuarded(in.cityPath, in.cfg, in.rawStores, in.stderr, in.stillEnabled)
+		res.agentHomesReset = cleanupClosedBeadAgentHomeWorktreesGuarded(in.cityPath, in.cfg, in.rawStores, in.stderr, &agentHomeResetGuard{stillEnabled: in.stillEnabled, startFence: in.pre.startFence})
 		res.agentHomesRan = true
 		res.agentDuration = time.Since(started)
 	}
@@ -172,11 +172,19 @@ type worktreeReaperLane struct {
 	skippedTotal uint64
 
 	// latestSessionDirs is the open-session working-dir set from the most
-	// recent tick that reached the reap phase — published by EVERY trigger,
-	// including one that skips because a pass is in flight — so an in-flight
-	// pass's pre-removal check can see sessions opened after it started
-	// without reading any store.
-	latestSessionDirs []string
+	// recent tick that reached the reap phase with a CLEAN session read —
+	// published by every trigger, including one that skips because a pass is
+	// in flight — so an in-flight pass's pre-removal check can see sessions
+	// opened after it started without reading any store. A failed or partial
+	// read never overwrites it; it clears latestSessionDirsValid instead, and
+	// while that is false every pre-removal check protects. The next clean
+	// read restores both.
+	latestSessionDirs      []string
+	latestSessionDirsValid bool
+
+	// startFence is the session-start generation fence the controller's start
+	// path and this lane's removals share. See sessionStartFence.
+	startFence sessionStartFence
 
 	lastDone     bool
 	lastSeq      uint64
@@ -208,10 +216,113 @@ func (cr *CityRuntime) worktreeReaperLaneOf() *worktreeReaperLane {
 // store backends were replaced. A pass already in flight keeps the memo it was
 // handed — it also keeps the handles it was handed, and its fence refuses those
 // once they are retired — so the memo and the stores it describes stay paired.
-func (l *worktreeReaperLane) currentSessionDirs() []string {
+func (l *worktreeReaperLane) currentSessionDirs() ([]string, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return append([]string(nil), l.latestSessionDirs...)
+	return append([]string(nil), l.latestSessionDirs...), l.latestSessionDirsValid
+}
+
+// publishSessionDirs records one tick's session read. Caller holds l.mu.
+func (l *worktreeReaperLane) publishSessionDirsLocked(dirs []string, valid bool) {
+	if !valid {
+		l.latestSessionDirsValid = false
+		return
+	}
+	l.latestSessionDirs = dirs
+	l.latestSessionDirsValid = true
+}
+
+// sessionStartFenceOf returns the fence the controller's session-start path
+// brackets every runtime start with (withSessionStartFence).
+func (cr *CityRuntime) sessionStartFenceOf() *sessionStartFence {
+	return &cr.worktreeReaperLaneOf().startFence
+}
+
+// sessionStartFence is the session-start generation fence between the
+// controller's session starts and the reaper lane's removals (ga-yuiof4 item
+// 3, Astra r2 finding 1). A snapshot cannot close the window between a pass's
+// liveness scan and its removal — a tick may start a session in the tree in
+// between — but exclusion can.
+//
+// The start path brackets every runtime start: beginStart (gen++, inflight++)
+// before it and endStart (gen++, inflight--) after it, each a short critical
+// section holding nothing else. The bracket sits on runPreparedStartCandidate,
+// the one function every controller start runs through, sync or async — so it
+// covers starts the tick launches that outlive the tick, which a bump at the
+// start of the tick's reconcile phase would not.
+//
+// A removal reads gen when its liveness scan STARTS (genAtScan). After every
+// pre-removal read, it takes the lock, and removes only if gen == genAtScan
+// and inflight == 0; nothing else runs inside the lock. The ordering argument:
+//   - a start that began (or ended) after the scan started moved gen past
+//     genAtScan, so a removal that takes the lock afterwards protects;
+//   - a start still in flight holds inflight > 0: protect;
+//   - a start whose bracket ENDED before the scan started had its process up
+//     before the scan, so the scan sees it (liveness protects);
+//   - a start that tries to begin while the removal holds the lock waits for
+//     that one `git worktree remove`: the tree is gone before the session
+//     starts, the same outcome as the old inline reaper, where removal always
+//     preceded the next tick's starts.
+//
+// Starvation is acceptable: a busy start path protects removals, which fails
+// safe, and the candidate is retried on the next pass.
+//
+// Not covered: runtime starts that do not go through the controller's start
+// path (API-driven session creation, a `gc` CLI process starting a session
+// itself). Those raced the inline reaper the same way; the liveness scan
+// catches them once their process is up.
+//
+// A nil *sessionStartFence is a no-op fence: generation 0, never contended.
+type sessionStartFence struct {
+	mu       sync.Mutex
+	gen      uint64
+	inflight int
+}
+
+func (f *sessionStartFence) beginStart() {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	f.gen++
+	f.inflight++
+	f.mu.Unlock()
+}
+
+func (f *sessionStartFence) endStart() {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	f.gen++
+	f.inflight--
+	f.mu.Unlock()
+}
+
+// generation reads gen; a scan records it as it starts.
+func (f *sessionStartFence) generation() uint64 {
+	if f == nil {
+		return 0
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.gen
+}
+
+// runIfQuiet runs fn under the fence iff no start began, ended or is in flight
+// since genAtScan, and reports whether it ran. fn must be the removal alone.
+func (f *sessionStartFence) runIfQuiet(genAtScan uint64, fn func()) bool {
+	if f == nil {
+		fn()
+		return true
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.gen != genAtScan || f.inflight > 0 {
+		return false
+	}
+	fn()
+	return true
 }
 
 func (l *worktreeReaperLane) invalidateStatusCache() {
@@ -281,11 +392,15 @@ func (cr *CityRuntime) triggerWorktreeReaperPass(ctx context.Context, cfg *confi
 	lane := cr.worktreeReaperLaneOf()
 	now := time.Now()
 	// Computed before the single-flight check so a skipping trigger still
-	// publishes it to the in-flight pass (see latestSessionDirs).
+	// publishes it to the in-flight pass (see latestSessionDirs). A nil
+	// snapshot is a failed session read (loadSessionBeadSnapshot returns nil
+	// on error); a snapshot carrying a LoadError is a degraded one. Neither
+	// may erase the last clean publication.
 	liveSessionDirs := liveSessionWorktreeDirs(sessionBeads)
+	sessionsValid := sessionBeads != nil && sessionBeads.LoadError() == nil
 
 	lane.mu.Lock()
-	lane.latestSessionDirs = liveSessionDirs
+	lane.publishSessionDirsLocked(liveSessionDirs, sessionsValid)
 	trig := worktreeReaperTrigger{
 		dryRun:       !reapEnabled,
 		lastDone:     lane.lastDone,
@@ -341,13 +456,18 @@ func (cr *CityRuntime) triggerWorktreeReaperPass(ctx context.Context, cfg *confi
 	//     old; the borrow-veto List is read uncached, once per rig per pass.
 	// So immediately before EACH removal the reaper re-verifies (reapPreRemoval,
 	// preRemovalReason in bead_worktree_reaper.go): an uncached fenced Get
-	// that must still say closed; a process scan no older than
-	// reapPreRemovalLivenessMaxAge (re-gathered if older); the pass's session
-	// dirs PLUS the latest set any tick has published to the lane since
-	// (latestSessionDirs — at most one tick old, read without touching a
-	// store; the live session snapshot itself is a store read that could
-	// block, so it is not consulted); and the live reap flag. Any error or
-	// indeterminate answer protects.
+	// that must still say closed; a process scan that STARTED no more than
+	// reapPreRemovalLivenessMaxAge before the decision (re-gathered if older;
+	// still too old when it returns protects); the pass's session dirs PLUS
+	// the latest set any tick has published to the lane since
+	// (latestSessionDirs — read without touching a store; the live session
+	// snapshot itself is a store read that could block, so it is not
+	// consulted; a degraded publication protects everything); and the live
+	// reap flag. Any error or indeterminate answer protects. Then the removal
+	// runs under the session-start fence (sessionStartFence): published
+	// session dirs are taken BEFORE the tick's reconcile starts sessions, so
+	// they cannot see a start that lands between the scan and the removal —
+	// the fence can, and that is what closes that window.
 	//
 	// NOT re-verified before removal: the borrow-veto scan (a full rig List
 	// per candidate would multiply the pass's heaviest read). A different bead
@@ -372,6 +492,7 @@ func (cr *CityRuntime) triggerWorktreeReaperPass(ctx context.Context, cfg *confi
 			stillEnabled:       stillEnabled,
 			currentSessionDirs: lane.currentSessionDirs,
 			livenessMaxAge:     reapPreRemovalLivenessMaxAge,
+			startFence:         &lane.startFence,
 		},
 	}
 	go func() {

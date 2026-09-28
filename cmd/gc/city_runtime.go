@@ -2905,6 +2905,12 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 		// idle-timeout relaunch backstop, deduped by the marker + the
 		// unclaimed-trigger gate.
 		withWarmClaimProbe(buildWarmClaimTriggerProbe(cr.newWarmClaimTriggerResolver(rigStores), cr.stderr)),
+		// Every runtime start this reconcile launches — sync or async, and
+		// async ones outlive the tick — runs inside the session-start fence the
+		// worktree reaper lane removes under (sessionStartFence, ga-yuiof4
+		// item 3), so a pass never removes a tree a session started in after
+		// its liveness scan began.
+		withSessionStartFence(cr.sessionStartFenceOf()),
 	}
 	if bootReconcile {
 		// #3288: skip the per-session orphan/failed-create session-bead closes on

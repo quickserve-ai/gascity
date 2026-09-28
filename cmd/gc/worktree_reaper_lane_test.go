@@ -11,8 +11,12 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/events"
+	"github.com/gastownhall/gascity/internal/runtime"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/session/sessiontest"
 )
 
 // wedgedGetStore is a rig store whose Get blocks until release is closed —
@@ -22,6 +26,12 @@ type wedgedGetStore struct {
 	beads.Store
 	release chan struct{}
 	gets    atomic.Int32
+	lists   atomic.Int32
+}
+
+func (s *wedgedGetStore) List(q beads.ListQuery) ([]beads.Bead, error) {
+	s.lists.Add(1)
+	return s.Store.List(q)
 }
 
 func (s *wedgedGetStore) Get(id string) (beads.Bead, error) {
@@ -269,9 +279,11 @@ func TestReaperStoreFence(t *testing.T) {
 
 // TestWorktreeReaperLane_ReloadMidPassFailsClosed is the end-to-end safety
 // case for running off-tick: a pass whose pass-1 Get was already inside the
-// handle when a reload replaced it must not reap. The fence re-checks after
-// the call returns, discards the answer, and the Get error drops the worktree
-// from the candidate set for this pass.
+// handle when a reload replaced it must not reap. It pins the POST-call fence
+// on Get specifically: the Get's answer must be discarded, dropping the
+// candidate before the borrow-veto List is ever issued. (If only the List's
+// pre-call fence caught it, the worktree would survive too — so survival alone
+// cannot tell the two apart; the List count can.)
 func TestWorktreeReaperLane_ReloadMidPassFailsClosed(t *testing.T) {
 	cityPath, rigRoot := initReapRig(t)
 	wt := addClosedWorktree(t, rigRoot, cityPath, "builder", "ga-abc123")
@@ -303,8 +315,11 @@ func TestWorktreeReaperLane_ReloadMidPassFailsClosed(t *testing.T) {
 	if _, err := os.Stat(wt); err != nil {
 		t.Fatalf("worktree %s was removed by a pass whose store was retired mid-pass (stat err=%v), want it kept", wt, err)
 	}
-	if res := lastReaperResult(cr); len(res.report.Reaped) != 0 {
-		t.Fatalf("report reaped=%d, want 0", len(res.report.Reaped))
+	if res := lastReaperResult(cr); len(res.report.Reaped) != 0 || len(res.report.Protected) != 0 {
+		t.Fatalf("report reaped=%d protected=%d, want 0 and 0: the retired Get's answer must drop the candidate in pass 1", len(res.report.Reaped), len(res.report.Protected))
+	}
+	if got := store.lists.Load(); got != 0 {
+		t.Fatalf("borrow-veto List ran %d time(s) on the retired handle's candidate, want 0: the Get's post-call fence did not discard its answer", got)
 	}
 }
 
@@ -348,7 +363,7 @@ func TestCleanupClosedBeadAgentHomeWorktreesGuarded_StopsWhenDisabledOrBranchMov
 			newAgentWorktreeGitProbe = func(string) agentWorktreeGitProbe { return probe }
 			t.Cleanup(func() { newAgentWorktreeGitProbe = orig })
 
-			cleaned := cleanupClosedBeadAgentHomeWorktreesGuarded(cityPath, agentHomeConfig(), map[string]beads.Store{"ga-rig": store}, io.Discard, func() bool { return tc.enabled })
+			cleaned := cleanupClosedBeadAgentHomeWorktreesGuarded(cityPath, agentHomeConfig(), map[string]beads.Store{"ga-rig": store}, io.Discard, &agentHomeResetGuard{stillEnabled: func() bool { return tc.enabled }, startFence: &sessionStartFence{}})
 			if detached := probe.checkoutDetachRef != ""; detached != tc.wantDetached || (cleaned == 1) != tc.wantDetached {
 				t.Fatalf("cleaned=%d detached=%t, want detached=%t", cleaned, detached, tc.wantDetached)
 			}
@@ -405,7 +420,83 @@ func TestWorktreeReaperLane_SessionDirsReachThePass(t *testing.T) {
 	if in.pre == nil || in.pre.currentSessionDirs == nil {
 		t.Fatal("pass input carries no pre-removal session-dir source")
 	}
-	if cur := in.pre.currentSessionDirs(); len(cur) != 1 || cur[0] != second {
-		t.Fatalf("pre-removal session dirs = %v, want the later tick's [%s]", cur, second)
+	if cur, valid := in.pre.currentSessionDirs(); !valid || len(cur) != 1 || cur[0] != second {
+		t.Fatalf("pre-removal session dirs = %v (valid=%t), want the later tick's [%s]", cur, valid, second)
+	}
+}
+
+// fenceObservingProvider records whether the session-start fence showed a
+// start in flight at the moment the provider was asked to Start.
+type fenceObservingProvider struct {
+	*runtime.Fake
+	fence       *sessionStartFence
+	sawInflight atomic.Bool
+	starts      atomic.Int32
+}
+
+func (p *fenceObservingProvider) Start(ctx context.Context, name string, cfg runtime.Config) error {
+	p.starts.Add(1)
+	p.fence.mu.Lock()
+	inflight := p.fence.inflight
+	p.fence.mu.Unlock()
+	if inflight > 0 {
+		p.sawInflight.Store(true)
+	}
+	return p.Fake.Start(ctx, name, cfg)
+}
+
+// TestSessionStartFence_BracketsControllerStarts pins the wiring the fence's
+// ordering argument depends on: every controller runtime start, on the sync
+// wave path and on the async enqueue path (whose starts outlive the tick),
+// happens inside the bracket, and the bracket closes afterwards.
+func TestSessionStartFence_BracketsControllerStarts(t *testing.T) {
+	for _, async := range []bool{false, true} {
+		name := "sync"
+		if async {
+			name = "async"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := beads.NewMemStore()
+			fence := &sessionStartFence{}
+			sp := &fenceObservingProvider{Fake: runtime.NewFake(), fence: fence}
+			mgr := newSessionManagerWithConfig("", store, sp, nil)
+			info, err := mgr.CreateSession(context.Background(), sessionpkg.CreateOptions{BeadOnly: true, Template: "worker", Title: "Worker", Command: "claude", WorkDir: t.TempDir(), Provider: "claude"})
+			if err != nil {
+				t.Fatalf("CreateSession: %v", err)
+			}
+			bead, err := store.Get(info.ID)
+			if err != nil {
+				t.Fatalf("Get bead: %v", err)
+			}
+			item := preparedStart{
+				candidate: startCandidate{info: sessiontest.SeedBead(t, bead), tp: TemplateParams{TemplateName: "worker"}},
+				cfg:       runtime.Config{Command: "claude", WorkDir: info.WorkDir},
+			}
+			genBefore := fence.generation()
+			if async {
+				done := make(chan struct{})
+				enqueuePreparedStartWaveForCity(context.Background(), []asyncPreparedStart{{item: item, done: func() { close(done) }}},
+					"", sp, store, nil, clock.Real{}, events.Discard, 10*time.Second, 0, io.Discard, io.Discard, nil, nil, nil, nil, nil, fence)
+				select {
+				case <-done:
+				case <-time.After(20 * time.Second):
+					t.Fatal("async start did not finish")
+				}
+			} else {
+				executePreparedStartWave(context.Background(), []preparedStart{item}, sp, store, 10*time.Second, withSessionStartFence(fence))
+			}
+			if sp.starts.Load() == 0 {
+				t.Fatal("provider Start was never called; the test did not exercise a start")
+			}
+			if !sp.sawInflight.Load() {
+				t.Fatal("provider Start ran outside the session-start fence bracket")
+			}
+			fence.mu.Lock()
+			gen, inflight := fence.gen, fence.inflight
+			fence.mu.Unlock()
+			if inflight != 0 || gen != genBefore+2 {
+				t.Fatalf("fence after one start: gen=%d inflight=%d, want gen=%d inflight=0", gen, inflight, genBefore+2)
+			}
+		})
 	}
 }

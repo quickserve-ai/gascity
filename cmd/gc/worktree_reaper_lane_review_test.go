@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
@@ -48,6 +49,10 @@ func (s *blockingListStore) List(q beads.ListQuery) ([]beads.Bead, error) {
 	<-s.release
 	return s.Store.List(q)
 }
+
+// cleanSessions is a session snapshot that loaded cleanly and lists no open
+// session.
+func cleanSessions() *sessionBeadSnapshot { return newSessionBeadSnapshotFromInfos(nil) }
 
 func reviewReapConfig(rigRoot string) *config.City {
 	cfg := reapTestConfig(rigRoot)
@@ -91,7 +96,7 @@ func TestWorktreeReaperLane_BeadReopenedBeforeRemovalIsProtected(t *testing.T) {
 	injectLiveness(t, liveWorktreeState{scanned: true})
 
 	cr := newReapTickRuntime(cityPath, cfg, store, io.Discard)
-	cr.triggerWorktreeReaperPass(context.Background(), cfg, true, nil)
+	cr.triggerWorktreeReaperPass(context.Background(), cfg, true, cleanSessions())
 	waitWorktreeReaperIdle(t, cr)
 
 	assertProtectedFor(t, cr, wt, `bead is now "open"`)
@@ -99,12 +104,13 @@ func TestWorktreeReaperLane_BeadReopenedBeforeRemovalIsProtected(t *testing.T) {
 
 // TestWorktreeReaperLane_WorktreeGoneLiveBeforeRemovalIsProtected: the
 // process scan at the liveness gate finds the tree idle; a process then starts
-// in it. The pre-removal liveness read (re-gathered, the bound forced to zero)
-// must see it and protect.
+// in it. The pre-removal liveness read — re-gathered because the slow
+// pre-removal Get outlasts the scan-age bound — must see it and protect.
 func TestWorktreeReaperLane_WorktreeGoneLiveBeforeRemovalIsProtected(t *testing.T) {
 	cityPath, rigRoot := initReapRig(t)
 	wt := addClosedWorktree(t, rigRoot, cityPath, "builder", "ga-abc123")
-	store := beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-abc123", Status: "closed"}}, nil)
+	const bound = 200 * time.Millisecond
+	store := &slowAfterFirstGetStore{Store: beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-abc123", Status: "closed"}}, nil), delay: 2 * bound}
 	cfg := reviewReapConfig(rigRoot)
 
 	var scans atomic.Int32
@@ -116,14 +122,14 @@ func TestWorktreeReaperLane_WorktreeGoneLiveBeforeRemovalIsProtected(t *testing.
 		return liveWorktreeState{scanned: true, cwds: []string{canonicalTestPath(wt)}}
 	}
 	prevAge := reapPreRemovalLivenessMaxAge
-	reapPreRemovalLivenessMaxAge = 0
+	reapPreRemovalLivenessMaxAge = bound
 	t.Cleanup(func() {
 		collectLiveWorktreeStateFn = prevScan
 		reapPreRemovalLivenessMaxAge = prevAge
 	})
 
 	cr := newReapTickRuntime(cityPath, cfg, store, io.Discard)
-	cr.triggerWorktreeReaperPass(context.Background(), cfg, true, nil)
+	cr.triggerWorktreeReaperPass(context.Background(), cfg, true, cleanSessions())
 	waitWorktreeReaperIdle(t, cr)
 
 	assertProtectedFor(t, cr, wt, "pre-removal re-check: live: live process cwd")
@@ -157,7 +163,7 @@ func TestWorktreeReaperLane_ListRetiredDuringCallIsDiscarded(t *testing.T) {
 	t.Cleanup(func() { waitWorktreeReaperIdle(t, cr) })
 	t.Cleanup(release)
 
-	cr.triggerWorktreeReaperPass(context.Background(), cfg, true, nil)
+	cr.triggerWorktreeReaperPass(context.Background(), cfg, true, cleanSessions())
 	<-store.entered
 	cs.mu.Lock()
 	cs.beadStores = map[string]beads.Store{"mrig": beads.NewMemStoreFrom(1, seed, nil)}
@@ -183,7 +189,7 @@ func TestWorktreeReaperLane_ReloadDisablingReapStopsNextRemoval(t *testing.T) {
 	t.Cleanup(func() { waitWorktreeReaperIdle(t, cr) })
 	t.Cleanup(release)
 
-	cr.triggerWorktreeReaperPass(context.Background(), cfg, true, nil)
+	cr.triggerWorktreeReaperPass(context.Background(), cfg, true, cleanSessions())
 	waitForReaperCond(t, func() bool { return store.gets.Load() == 1 }, "the pass to block in its first Get")
 
 	reloaded := reapTestConfig(rigRoot)

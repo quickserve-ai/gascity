@@ -58,14 +58,25 @@ func cleanupClosedBeadAgentHomeWorktrees(
 	return cleanupClosedBeadAgentHomeWorktreesGuarded(cityPath, cfg, rigStores, stderr, nil)
 }
 
+// agentHomeResetGuard is what the background reaper lane asks of the
+// agent-home cleanup before each reset: the live reap flag, and the
+// session-start fence the reset runs under.
+type agentHomeResetGuard struct {
+	stillEnabled func() bool
+	startFence   *sessionStartFence
+}
+
 // cleanupClosedBeadAgentHomeWorktreesGuarded is
 // cleanupClosedBeadAgentHomeWorktrees for a caller whose pass runs off the tick
-// (the background reaper lane, ga-yuiof4 item 3). When stillEnabled is non-nil,
+// (the background reaper lane, ga-yuiof4 item 3). When guard is non-nil,
 // immediately before each reset it (1) re-checks that real reaping is still
-// configured — a reload may have disabled it mid-pass — and (2) re-reads the
+// configured — a reload may have disabled it mid-pass — (2) re-reads the
 // home's branch and requires it unchanged, so a session the tick dispatched
 // into the home after the bead Get (which may have blocked for a long time)
-// is not detached out from under it. Both fail closed (skip the home).
+// is not detached out from under it, and (3) runs the reset inside the
+// session-start fence, only if no controller session start began, ended or is
+// in flight since the home's evaluation started. All fail closed (skip the
+// home; it is retried next pass).
 //
 // No liveness gate is added: this cleanup never had one inline, because an
 // agent home is expected to host its own live session; its safety rests on
@@ -76,7 +87,7 @@ func cleanupClosedBeadAgentHomeWorktreesGuarded(
 	cfg *config.City,
 	rigStores map[string]beads.Store,
 	stderr io.Writer,
-	stillEnabled func() bool,
+	guard *agentHomeResetGuard,
 ) int {
 	if stderr == nil {
 		stderr = io.Discard
@@ -127,6 +138,11 @@ func cleanupClosedBeadAgentHomeWorktreesGuarded(
 			if !wg.IsRepo() {
 				continue
 			}
+			// Fence generation read before anything about this home is.
+			var startGen uint64
+			if guard != nil {
+				startGen = guard.startFence.generation()
+			}
 
 			branch, err := wg.CurrentBranch()
 			if err != nil {
@@ -163,8 +179,8 @@ func cleanupClosedBeadAgentHomeWorktreesGuarded(
 				defaultBranch = "main"
 			}
 			resetRef := "origin/" + defaultBranch
-			if stillEnabled != nil {
-				if !stillEnabled() {
+			if guard != nil {
+				if guard.stillEnabled == nil || !guard.stillEnabled() {
 					fmt.Fprintf(stderr, "cleanupClosedBeadAgentHomeWorktrees: skipping %s: real reaping no longer enabled (reload)\n", worktreePath) //nolint:errcheck
 					continue
 				}
@@ -173,7 +189,17 @@ func cleanupClosedBeadAgentHomeWorktreesGuarded(
 					continue
 				}
 			}
-			if err := wg.CheckoutDetach(resetRef); err != nil {
+			var detachErr error
+			detach := func() { detachErr = wg.CheckoutDetach(resetRef) }
+			if guard != nil && guard.startFence != nil {
+				if !guard.startFence.runIfQuiet(startGen, detach) {
+					fmt.Fprintf(stderr, "cleanupClosedBeadAgentHomeWorktrees: skipping %s: a controller session start began, ended or is in flight since the home was read (session-start fence); retried next pass\n", worktreePath) //nolint:errcheck
+					continue
+				}
+			} else {
+				detach()
+			}
+			if err := detachErr; err != nil {
 				fmt.Fprintf(stderr, "cleanupClosedBeadAgentHomeWorktrees: resetting %s to %s: %v\n", worktreePath, resetRef, err) //nolint:errcheck
 				continue
 			}
