@@ -262,7 +262,10 @@ func nativeDoltStoreClosedForTest(s *NativeDoltStore) bool {
 func nativeDoltStoreStateForTest(s *NativeDoltStore) (beadslib.Storage, NativeReopenFunc) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.storage, s.reopen
+	if s.handle == nil {
+		return nil, s.reopen
+	}
+	return s.handle.storage, s.reopen
 }
 
 func TestNativeDoltStoreCloseStoreWinsInFlightReconnect(t *testing.T) {
