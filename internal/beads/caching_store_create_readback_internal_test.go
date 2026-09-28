@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // readBackFailingStore fails the first Get of each created bead with getErr, the
@@ -58,9 +59,11 @@ func TestCachingStoreCreateRecordsEveryFailedReadBack(t *testing.T) {
 
 			// A store already in reconcile backoff: the read-back record must not
 			// move the backoff anchor, or steady sends keep the retry from ever
-			// coming due (review finding on #185).
+			// coming due (review finding on #185; anchor field since ga-yarqx9).
+			anchor := time.Now().Add(-time.Minute)
 			cache.mu.Lock()
-			anchor := cache.stats.LastProblemAt
+			cache.syncFailures = 3
+			cache.lastSyncFailureAt = anchor
 			cache.mu.Unlock()
 
 			created, err := cache.Create(Bead{Title: "mail", Type: "message"})
@@ -72,8 +75,11 @@ func TestCachingStoreCreateRecordsEveryFailedReadBack(t *testing.T) {
 			if stats.ProblemCount != 1 || !strings.Contains(stats.LastProblem, "refresh bead after create") {
 				t.Fatalf("ProblemCount=%d LastProblem=%q, want the failed read-back recorded", stats.ProblemCount, stats.LastProblem)
 			}
-			if got := cache.Stats().LastProblemAt; !got.Equal(anchor) {
-				t.Fatalf("LastProblemAt moved %v -> %v; it is the reconcile backoff anchor", anchor, got)
+			cache.mu.RLock()
+			gotAnchor := cache.lastSyncFailureAt
+			cache.mu.RUnlock()
+			if !gotAnchor.Equal(anchor) {
+				t.Fatalf("lastSyncFailureAt moved %v -> %v; it is the reconcile backoff anchor", anchor, gotAnchor)
 			}
 			cache.mu.RLock()
 			_, dirty := cache.dirty[created.ID]
