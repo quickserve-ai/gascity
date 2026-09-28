@@ -41139,6 +41139,7 @@ type SendMailResponse struct {
 	Body                      []byte
 	HTTPResponse              *http.Response
 	JSON201                   *Message
+	JSON202                   *Message
 	ApplicationproblemJSON400 *ErrorModel
 	ApplicationproblemJSON401 *ErrorModel
 	ApplicationproblemJSON403 *ErrorModel
@@ -41354,6 +41355,7 @@ type ReplyMailResponse struct {
 	Body                      []byte
 	HTTPResponse              *http.Response
 	JSON201                   *Message
+	JSON202                   *Message
 	ApplicationproblemJSON401 *ErrorModel
 	ApplicationproblemJSON403 *ErrorModel
 	ApplicationproblemJSON404 *ErrorModel
@@ -50444,6 +50446,13 @@ func ParseSendMailResponse(rsp *http.Response) (*SendMailResponse, error) {
 		}
 		response.JSON201 = &dest
 
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 202:
+		var dest Message
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON202 = &dest
+
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
 		var dest ErrorModel
 		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
@@ -50924,6 +50933,13 @@ func ParseReplyMailResponse(rsp *http.Response) (*ReplyMailResponse, error) {
 			return nil, err
 		}
 		response.JSON201 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 202:
+		var dest Message
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON202 = &dest
 
 	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 401:
 		var dest ErrorModel
