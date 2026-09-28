@@ -1978,7 +1978,17 @@ func syncSessionBeadsWithSnapshotAndRigStores(
 				continue
 			}
 			if !closeSessionBeadIfRuntimeStoppedAndUnassigned(cityPath, store, rigStores, sp, cfg, b, "reconfigured", "reconfigured named session", now, stderr) {
-				blockedReconfiguredNamedIdentities[identity] = true
+				// Only a bead that can still CONTINUE the identity blocks a fresh
+				// one. An archived, continuity-ineligible bead (a removed named
+				// session) has already given up its alias and session_name; it
+				// stays open only because it still holds work, which since
+				// ga-9n8hjv is the named agent's withheld, proposed work. Blocking
+				// on it would keep the re-added agent from ever coming back, with no
+				// log line. Mint the fresh bead beside it instead (the phase0 spec's
+				// "archived history stays, a fresh canonical bead is created").
+				if namedSessionContinuityEligible(b) {
+					blockedReconfiguredNamedIdentities[identity] = true
+				}
 				continue
 			}
 			existing[i].Status = "closed"

@@ -1066,23 +1066,51 @@ func TestSyncSessionBeads_RetiresRemovedNamedSessionAndCreatesFreshOnReadd(t *te
 	clk.Advance(5 * time.Second)
 	syncSessionBeads("", store, ds, sp, allConfiguredDS(ds), cfgNamed, clk, &stderr, false)
 
+	// The archived bead still holds the removed seat's withheld work (ga-9n8hjv),
+	// so it is not closed on re-add; it stays open as archived history holding that
+	// work, and a FRESH canonical bead is minted beside it. Before ga-9n8hjv the
+	// work was released and the archived bead closed; with the work withheld, a
+	// refused close used to block the identity and the agent never came back.
 	all, err = store.ListByLabel(sessionBeadLabel, 0)
 	if err != nil {
 		t.Fatalf("listing beads after re-adopt: %v", err)
 	}
-	if len(all) != 1 {
-		t.Fatalf("expected only fresh open bead after re-add listing, got %d", len(all))
+	if len(all) != 2 {
+		t.Fatalf("open session beads after re-add = %d, want 2 (archived history holding withheld work + a fresh bead)", len(all))
 	}
-	fresh := all[0]
-	if fresh.ID == originalID {
-		t.Fatalf("fresh bead ID = %q, want a new bead after archived removal", fresh.ID)
+	var fresh beads.Bead
+	for _, b := range all {
+		if b.ID != originalID {
+			fresh = b
+		}
+	}
+	if fresh.ID == "" {
+		t.Fatalf("no fresh bead minted on re-add; open beads = %v", []string{all[0].ID, all[1].ID})
+	}
+	if got := fresh.Metadata["session_name"]; got != "myrig--witness" {
+		t.Fatalf("fresh bead session_name = %q, want myrig--witness", got)
+	}
+	if got := fresh.Metadata["state"]; got == "archived" {
+		t.Fatalf("fresh bead state = %q, want a live state", got)
 	}
 	historical, err := store.Get(originalID)
 	if err != nil {
 		t.Fatalf("Get(original archived bead): %v", err)
 	}
-	if historical.Status == "open" {
-		t.Fatalf("historical status = %q, want non-open", historical.Status)
+	if historical.Metadata["state"] != "archived" || historical.Metadata["continuity_eligible"] != "false" {
+		t.Fatalf("historical bead state/continuity = %q/%q, want archived/false", historical.Metadata["state"], historical.Metadata["continuity_eligible"])
+	}
+	if historical.Metadata["session_name"] != "" || historical.Metadata["alias"] != "" {
+		t.Fatalf("historical bead session_name/alias = %q/%q, want both cleared", historical.Metadata["session_name"], historical.Metadata["alias"])
+	}
+	for _, tc := range []struct {
+		id, status string
+	}{{assignedOpen.ID, "open"}, {assignedInProgress.ID, "in_progress"}} {
+		got, err := store.Get(tc.id)
+		if err != nil {
+			t.Fatalf("Get(%s) after re-add: %v", tc.id, err)
+		}
+		assertProposedNotReleased(t, got, originalID, tc.status, "retired-session-unclaim", "withheld work after re-add "+tc.id)
 	}
 	if got := fresh.Metadata[namedSessionMetadataKey]; got != "true" {
 		t.Fatalf("configured_named_session after re-adopt = %q, want true", got)
