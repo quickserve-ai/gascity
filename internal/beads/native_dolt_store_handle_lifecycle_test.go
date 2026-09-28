@@ -642,8 +642,15 @@ func TestNativeDoltStoreHandleLifecycleStress(t *testing.T) {
 	// Shut down only once activity is observed: a reconnect has installed a
 	// fresh handle (retiring the initial one under the parked write), and
 	// reads and writes have run.
+	//
+	// generation never blocks on s.mu: on a store that held s.mu across the
+	// parked write, reconnect would queue a writer and a blocking RLock here
+	// would hang the test past its deadline check. While s.mu is unavailable
+	// it reports 0, and the loop retries on its next pass.
 	generation := func() uint64 {
-		store.mu.RLock()
+		if !store.mu.TryRLock() {
+			return 0
+		}
 		defer store.mu.RUnlock()
 		return store.generation
 	}
@@ -654,12 +661,13 @@ func TestNativeDoltStoreHandleLifecycleStress(t *testing.T) {
 			reads += l.reads.Load()
 			txs += l.txs.Load()
 		}
-		if generation() >= 1 && reads >= 50 && txs >= 10 {
-			t.Logf("activity before shutdown: generation=%d reads=%d txs=%d", generation(), reads, txs)
+		gen := generation()
+		if gen >= 1 && reads >= 50 && txs >= 10 {
+			t.Logf("activity before shutdown: generation=%d reads=%d txs=%d", gen, reads, txs)
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("no activity within 5s: generation=%d reads=%d txs=%d", generation(), reads, txs)
+			t.Fatalf("no activity within 5s: generation=%d (0 also when s.mu was unavailable) reads=%d txs=%d", gen, reads, txs)
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -695,6 +703,18 @@ func TestNativeDoltStoreHandleLifecycleStress(t *testing.T) {
 		case <-waitDeadline:
 			t.Fatalf("closers did not reach their waits within 5s (drain reached=%v, wait-for-first reached=%v, returned=%d)",
 				drainReached == nil, waitReached == nil, len(got))
+		}
+	}
+	// Both closers are now in their waits (a closer that already returned is
+	// reported below). Watch a bounded window, as the focused tests do:
+	// neither may return while the parked write is still held.
+	window := time.After(closeSettle)
+	for watching := true; watching; {
+		select {
+		case r := <-results:
+			got = append(got, r)
+		case <-window:
+			watching = false
 		}
 	}
 	for _, r := range got {
