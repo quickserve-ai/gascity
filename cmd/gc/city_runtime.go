@@ -577,7 +577,7 @@ func (cr *CityRuntime) run(ctx context.Context) {
 	// by the provider-changing reloads in one controller lifetime.
 	cr.startFenceActive = true
 	cr.registerSessionStartFence(cr.sp)
-	defer cr.retireSessionStartFencesExcept(nil)
+	defer cr.retireSessionStartFences()
 	cr.sweepOrphanedOrderTracking()
 	if cr.svc != nil {
 		if err := cr.svc.Reload(); err != nil {

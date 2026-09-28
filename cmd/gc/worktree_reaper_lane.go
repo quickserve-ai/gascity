@@ -362,19 +362,13 @@ func (cr *CityRuntime) unregisterSessionStartFence(sp runtime.Provider) {
 	cr.startFenceRegs = kept
 }
 
-// retireSessionStartFencesExcept unregisters the fence from every provider but
-// keep (nil keep retires all). run() calls it with nil on return; nothing
-// retires a registration mid-run.
-func (cr *CityRuntime) retireSessionStartFencesExcept(keep runtime.Provider) {
-	kept := cr.startFenceRegs[:0]
+// retireSessionStartFences unregisters the fence from every provider. run()
+// calls it on return; nothing retires a registration mid-run.
+func (cr *CityRuntime) retireSessionStartFences() {
 	for _, reg := range cr.startFenceRegs {
-		if keep != nil && sameRuntimeProvider(reg.sp, keep) {
-			kept = append(kept, reg)
-			continue
-		}
 		reg.unregister()
 	}
-	cr.startFenceRegs = kept
+	cr.startFenceRegs = nil
 }
 
 func (f *sessionStartFence) beginStart() {

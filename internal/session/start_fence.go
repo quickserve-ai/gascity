@@ -10,7 +10,7 @@ import (
 
 // StartFence is bracketed around every runtime start a Manager makes:
 // BeginStart immediately before the provider call and EndStart after it
-// returns (deferred, so a panic, an early error return or a cancelled context
+// returns (deferred, so a panic, an early error return or a canceled context
 // cannot leave a start counted as in flight).
 //
 // The controller uses it to keep its background worktree reaper from removing

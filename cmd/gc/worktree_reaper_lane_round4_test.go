@@ -53,7 +53,7 @@ func newRound4ReloadRuntime(t *testing.T, sp runtime.Provider) (*CityRuntime, *c
 	// What run() does before anything can start a session.
 	cr.startFenceActive = true
 	cr.registerSessionStartFence(cr.sp)
-	t.Cleanup(func() { cr.retireSessionStartFencesExcept(nil) })
+	t.Cleanup(func() { cr.retireSessionStartFences() })
 	return cr, cs, cityPath, tomlPath
 }
 

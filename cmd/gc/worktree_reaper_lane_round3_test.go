@@ -122,7 +122,7 @@ func TestWorktreeReaperLane_ControlDispatcherStartAfterScanIsProtected(t *testin
 		cityPath:      cityPath,
 	})
 	cr.registerSessionStartFence(cr.sp)
-	t.Cleanup(func() { cr.retireSessionStartFencesExcept(nil) })
+	t.Cleanup(func() { cr.retireSessionStartFences() })
 
 	var scans atomic.Int32
 	prevScan := collectLiveWorktreeStateFn
@@ -213,7 +213,7 @@ func TestWorktreeReaperLane_InProcessAPIWakeAfterScanIsProtected(t *testing.T) {
 	cs := &controllerState{cfg: cfg, sp: sp, cityName: "test", cityPath: cityPath, beadStores: map[string]beads.Store{reapTestRigName: reapStore}}
 	cr.cs = cs
 	cr.registerSessionStartFence(cr.sp)
-	t.Cleanup(func() { cr.retireSessionStartFencesExcept(nil) })
+	t.Cleanup(func() { cr.retireSessionStartFences() })
 
 	sessionStore := beads.NewMemStore()
 	mgr := sessionpkg.NewManagerWithOptions(sessionStore, sp)
