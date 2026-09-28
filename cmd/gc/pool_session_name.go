@@ -853,7 +853,7 @@ func releaseOrphanedPoolAssignment(store beads.Store, wb beads.Bead, clearDetach
 	if store == nil || strings.TrimSpace(wb.ID) == "" {
 		return false
 	}
-	if reason := guard.withholdReason(wb.Assignee); reason != "" {
+	if reason := guard.withholdReasonForBead(wb); reason != "" {
 		if _, err := proposeNamedRelease(store, wb, reason, "orphaned-pool-assignment", log.Writer()); err != nil {
 			log.Printf("releaseOrphanedPoolAssignments: %v", err)
 		}

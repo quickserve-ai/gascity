@@ -94,19 +94,49 @@ func newNamedReleaseGuard(cfg *config.City, sessionID string) namedReleaseGuard 
 	return g
 }
 
+// anyResolvesToNamedSession reports whether one of a SESSION's own names is
+// exactly a configured named session's qualified identity or runtime session
+// name. It deliberately does NOT use findNamedSessionSpecForAssignee, whose first
+// step accepts the V2 bare shorthand ("ray" for "team.ray"): a pool session whose
+// alias happens to equal such a shorthand would otherwise mark the WHOLE pool
+// session as named and withhold every release it makes, stranding pool work.
 func (g namedReleaseGuard) anyResolvesToNamedSession(values ...string) bool {
 	if g.cfg == nil {
 		return false
 	}
-	for _, v := range values {
-		if v = strings.TrimSpace(v); v == "" {
+	for i := range g.cfg.NamedSessions {
+		identity := g.cfg.NamedSessions[i].QualifiedName()
+		spec, ok := findNamedSessionSpec(g.cfg, g.cityName, identity)
+		if !ok {
 			continue
 		}
-		if _, ok := findNamedSessionSpecForAssignee(g.cfg, g.cityName, v); ok {
-			return true
+		for _, v := range values {
+			if v = strings.TrimSpace(v); v != "" && namedSessionAssigneeMatchesSpec(spec, identity, v) {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+// withholdReasonForBead is withholdReason plus one fact only the bead carries: a
+// release proposal already pending on it. A pending proposal is the judge's, so
+// no writer releases the bead until the judge clears it. Without this, a named
+// session's handle-held work proposed at teardown would be released by the next
+// orphan sweep, which sees only a dead session ID it cannot resolve as named.
+func (g namedReleaseGuard) withholdReasonForBead(item beads.Bead) string {
+	if releaseProposalPending(item) {
+		return "a release proposal is pending for a judge"
+	}
+	return g.withholdReason(item.Assignee)
+}
+
+// releaseProposalPending reports whether item carries an unjudged release
+// proposal: the label, or the first-sight stamp (labels are not hydrated on
+// every read path; metadata is).
+func releaseProposalPending(item beads.Bead) bool {
+	return strings.TrimSpace(item.Metadata[beadmeta.ReleaseProposedAtMetadataKey]) != "" ||
+		hasLabel(item.Labels, beadmeta.ReleaseProposedLabel)
 }
 
 // withholdReason reports why releasing work held under assignee must become a
@@ -128,10 +158,16 @@ func (g namedReleaseGuard) withholdReason(assignee string) string {
 
 // proposeNamedRelease records a withheld release on the bead instead of making it:
 // it adds beadmeta.ReleaseProposedLabel and stamps the first-sight proposal
-// metadata, leaving assignee and status untouched. It writes only on FIRST sight
-// (no ReleaseProposedAtMetadataKey on the snapshot), so the per-tick orphan sweep
-// does not rewrite the bead every tick; the audit line is emitted only when it
-// writes. It returns whether it wrote.
+// metadata, leaving assignee and status untouched. It writes only when no
+// proposal is pending on the snapshot (releaseProposalPending), so the per-tick
+// orphan sweep does not rewrite the bead every tick; the audit line is emitted
+// only when it writes. It returns whether it wrote.
+//
+// The judge discharges a proposal by removing the label AND clearing
+// ReleaseProposedAtMetadataKey (the order's mail gives the exact command); a
+// cleared proposal re-arms, so a later teardown proposes afresh. Because a
+// present label also counts as pending, the label is only ever added to a bead
+// that lacks it, so a store that appends labels does not accumulate duplicates.
 //
 // beads.Store has no comment verb, so the proposal is label + metadata. Both are
 // visible on `gc bd show` and the label is queryable by the judge's order.
@@ -139,7 +175,7 @@ func proposeNamedRelease(store beads.Store, item beads.Bead, reason, releasePath
 	if audit == nil {
 		audit = io.Discard
 	}
-	if strings.TrimSpace(item.Metadata[beadmeta.ReleaseProposedAtMetadataKey]) != "" {
+	if releaseProposalPending(item) {
 		return false, nil
 	}
 	now := time.Now().UTC().Format(time.RFC3339)

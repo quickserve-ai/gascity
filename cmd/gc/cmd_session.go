@@ -1907,7 +1907,7 @@ func cfgErrOrUnknown(err error) string {
 // release rather than make it (ga-9n8hjv, fence #1).
 func sessionBeadIDOnlyIdentity(b beads.Bead) beads.Bead {
 	out := beads.Bead{ID: b.ID}
-	if isNamedSessionBead(b) || strings.TrimSpace(b.Metadata["configured_named_identity"]) != "" {
+	if isNamedSessionBead(b) || namedSessionIdentity(b) != "" {
 		out.Metadata = map[string]string{"configured_named_session": "true"}
 	}
 	return out

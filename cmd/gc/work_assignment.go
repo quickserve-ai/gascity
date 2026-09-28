@@ -212,7 +212,7 @@ func (w workAssignment) ReleaseWorkBead(item beads.Bead, runTargetFallback strin
 	if audit == nil {
 		audit = io.Discard
 	}
-	if reason := guard.withholdReason(item.Assignee); reason != "" {
+	if reason := guard.withholdReasonForBead(item); reason != "" {
 		_, err := proposeNamedRelease(store, item, reason, releasePath, audit)
 		return err
 	}

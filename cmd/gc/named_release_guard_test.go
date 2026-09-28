@@ -24,13 +24,28 @@ func poolReleaseGuardForTest() namedReleaseGuard {
 	return namedReleaseGuardForAssignee(nil)
 }
 
+// seedWorkBead seeds a work bead in the requested status/assignee and returns the
+// bead as the store now holds it. mustCreateDrainAckBead returns the CREATE-time
+// snapshot (open, unassigned), and a writer handed that snapshot releases or
+// proposes against the wrong assignee, so every direct writer call here needs the
+// re-read row.
+func seedWorkBead(t *testing.T, store beads.Store, bead beads.Bead, status, assignee string) beads.Bead {
+	t.Helper()
+	created := mustCreateDrainAckBead(t, store, bead, status, assignee)
+	got, err := store.Get(created.ID)
+	if err != nil {
+		t.Fatalf("re-reading seeded %q: %v", bead.Title, err)
+	}
+	return got
+}
+
 // namedSeatPortfolio seeds one bead per status the 2026-09-11 wave touched
 // (in_progress, open, blocked) on assignee, and returns their IDs by status.
 func namedSeatPortfolio(t *testing.T, store beads.Store, assignee string) map[string]string {
 	t.Helper()
 	ids := map[string]string{}
 	for _, status := range []string{"in_progress", "open", "blocked"} {
-		b := mustCreateDrainAckBead(t, store, beads.Bead{Title: status + " work", Type: "task"}, status, assignee)
+		b := seedWorkBead(t, store, beads.Bead{Title: status + " work", Type: "task"}, status, assignee)
 		ids[status] = b.ID
 	}
 	return ids
@@ -98,7 +113,7 @@ func TestNamedSeatCloseAfterRebalanceKeepsPortfolio(t *testing.T) {
 func TestNamedSeatCloseProposesWorkHeldUnderTheSessionHandle(t *testing.T) {
 	store := beads.NewMemStore()
 	sb := crewSessionBead()
-	held := mustCreateDrainAckBead(t, store, beads.Bead{Title: "held by handle", Type: "task"}, "in_progress", sb.ID)
+	held := seedWorkBead(t, store, beads.Bead{Title: "held by handle", Type: "task"}, "in_progress", sb.ID)
 	var stderr bytes.Buffer
 	releaseWorkFromClosedSessionBeadExcept(store, crewRollConfig(false), sb, nil, &stderr)
 	got, err := store.Get(held.ID)
@@ -115,7 +130,7 @@ func TestNamedSeatCloseProposesWorkHeldUnderTheSessionHandle(t *testing.T) {
 // identifier, the configured identity included, with no named check at all.
 func TestNamedSeatDrainAckKeepsHeldClaim(t *testing.T) {
 	store := beads.NewMemStore()
-	held := mustCreateDrainAckBead(t, store, beads.Bead{Title: "named claim", Type: "task"}, "in_progress", crewRuntimeIdentity)
+	held := seedWorkBead(t, store, beads.Bead{Title: "named claim", Type: "task"}, "in_progress", crewRuntimeIdentity)
 	var stderr bytes.Buffer
 	releaseUnexecutedClaimsOnDrainAck("", crewRollConfig(false), store, nil, crewSessionBead(), drainAckReleaseBudget, &stderr)
 	got, err := store.Get(held.ID)
@@ -143,7 +158,7 @@ func TestPoolSessionCloseStillReleasesInProgressWork(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := beads.NewMemStore()
-			held := mustCreateDrainAckBead(t, store, beads.Bead{Title: "pool claim", Type: "task"}, "in_progress", "worker-1")
+			held := seedWorkBead(t, store, beads.Bead{Title: "pool claim", Type: "task"}, "in_progress", "worker-1")
 			var stderr bytes.Buffer
 			tc.run(store, &stderr)
 			got, err := store.Get(held.ID)
@@ -164,7 +179,7 @@ func TestPoolSessionCloseStillReleasesInProgressWork(t *testing.T) {
 // guard withholds rather than releases.
 func TestZeroNamedReleaseGuardFailsClosed(t *testing.T) {
 	store := beads.NewMemStore()
-	held := mustCreateDrainAckBead(t, store, beads.Bead{Title: "pool claim", Type: "task"}, "in_progress", "worker-1")
+	held := seedWorkBead(t, store, beads.Bead{Title: "pool claim", Type: "task"}, "in_progress", "worker-1")
 	wa := workAssignmentForStore(beads.WorkStore{Store: store})
 	var audit bytes.Buffer
 	if err := wa.ReleaseWorkBead(held, "", namedReleaseGuard{}, &audit, "test"); err != nil {
@@ -181,7 +196,7 @@ func TestZeroNamedReleaseGuardFailsClosed(t *testing.T) {
 // tick, so a proposal is written on first sight only.
 func TestProposeNamedReleaseWritesOnce(t *testing.T) {
 	store := beads.NewMemStore()
-	held := mustCreateDrainAckBead(t, store, beads.Bead{Title: "named claim", Type: "task"}, "in_progress", crewRuntimeIdentity)
+	held := seedWorkBead(t, store, beads.Bead{Title: "named claim", Type: "task"}, "in_progress", crewRuntimeIdentity)
 	wrote, err := proposeNamedRelease(store, held, "reason", "test", nil)
 	if err != nil || !wrote {
 		t.Fatalf("first proposal wrote=%v err=%v, want a write", wrote, err)
@@ -202,7 +217,7 @@ func TestProposeNamedReleaseWritesOnce(t *testing.T) {
 // the claim is held under the runtime-name spelling.
 func TestOrphanSweepProposesNamedAssigneeOnAnyTemplate(t *testing.T) {
 	store := beads.NewMemStore()
-	held := mustCreateDrainAckBead(t, store, beads.Bead{
+	held := seedWorkBead(t, store, beads.Bead{
 		Title: "slung to the pool, held by the named seat", Type: "task",
 		Metadata: map[string]string{beadmeta.RoutedToMetadataKey: "qcore/polecat"},
 	}, "in_progress", crewRuntimeIdentity)
@@ -223,8 +238,8 @@ func TestOrphanSweepProposesNamedAssigneeOnAnyTemplate(t *testing.T) {
 func TestDuplicateRepairLeavesNamedIdentityWorkInPlace(t *testing.T) {
 	store := beads.NewMemStore()
 	loser := crewSessionBead()
-	byIdentity := mustCreateDrainAckBead(t, store, beads.Bead{Title: "identity-held", Type: "task"}, "in_progress", crewRuntimeIdentity)
-	byHandle := mustCreateDrainAckBead(t, store, beads.Bead{Title: "handle-held", Type: "task"}, "in_progress", loser.ID)
+	byIdentity := seedWorkBead(t, store, beads.Bead{Title: "identity-held", Type: "task"}, "in_progress", crewRuntimeIdentity)
+	byHandle := seedWorkBead(t, store, beads.Bead{Title: "handle-held", Type: "task"}, "in_progress", loser.ID)
 	var stderr bytes.Buffer
 	reassignWorkAssignedToRetiredSessionBead("", crewRollConfig(false), store, nil, loser, "ga-winner", &stderr)
 
@@ -256,7 +271,7 @@ func TestBrokenConfigCloseProposesNamedSessionHandleWork(t *testing.T) {
 		t.Fatalf("ID-only identifiers = %v, want only %s: the marker must not widen the sweep", ids, sb.ID)
 	}
 	store := beads.NewMemStore()
-	held := mustCreateDrainAckBead(t, store, beads.Bead{Title: "held by handle", Type: "task"}, "in_progress", sb.ID)
+	held := seedWorkBead(t, store, beads.Bead{Title: "held by handle", Type: "task"}, "in_progress", sb.ID)
 	var stderr bytes.Buffer
 	unclaimWorkAssignedToRetiredSessionBead("", nil, store, nil, idOnly, "", &stderr)
 	got, err := store.Get(held.ID)
@@ -293,5 +308,90 @@ func TestNamedReleaseGuardRecognisesAssigneeForms(t *testing.T) {
 				t.Errorf("suspended=%v: withholdReason(%q) = %q, want \"\" for pool work", suspended, pool, r)
 			}
 		}
+	}
+}
+
+// TestOrphanSweepHonorsPendingProposal: a named session's handle-held work,
+// proposed at teardown, is assigned to a dead session ID the assignee lookup
+// cannot resolve as named. The next orphan sweep must still leave it to the judge.
+func TestOrphanSweepHonorsPendingProposal(t *testing.T) {
+	store := beads.NewMemStore()
+	held := seedWorkBead(t, store, beads.Bead{
+		Title: "proposed at teardown", Type: "task",
+		Metadata: map[string]string{beadmeta.RoutedToMetadataKey: "worker"},
+	}, "in_progress", "ga-oldsession")
+	if _, err := proposeNamedRelease(store, held, "session ga-oldsession serves a named agent", "closing-session-release", nil); err != nil {
+		t.Fatalf("propose: %v", err)
+	}
+	proposed, err := store.Get(held.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if released := releaseOrphanedPoolAssignment(store, proposed, false, namedReleaseGuardForAssignee(nil)); released {
+		t.Fatalf("orphan sweep released a bead with a pending release proposal")
+	}
+	got, err := store.Get(held.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Assignee != "ga-oldsession" || got.Status != "in_progress" {
+		t.Fatalf("proposed bead is status=%q assignee=%q, want in_progress/ga-oldsession kept", got.Status, got.Assignee)
+	}
+	if got.Metadata[beadmeta.ReleaseProposedPathMetadataKey] != "closing-session-release" {
+		t.Fatalf("proposal path rewritten to %q, want the first proposal kept", got.Metadata[beadmeta.ReleaseProposedPathMetadataKey])
+	}
+}
+
+// TestPoolAliasEqualToNamedShorthandIsNotANamedSession: a V2 named session
+// "team.ray" is reachable by the bare shorthand "ray". A POOL session whose alias
+// happens to be "ray" must not be classified as a named session, or every release
+// it makes would be withheld and the pool stranded.
+func TestPoolAliasEqualToNamedShorthandIsNotANamedSession(t *testing.T) {
+	cfg := &config.City{
+		Agents:        []config.Agent{{Name: "reviewer", BindingName: "team"}, {Name: "worker", MaxActiveSessions: intPtr(4)}},
+		NamedSessions: []config.NamedSession{{BindingName: "team", Name: "ray", Template: "reviewer"}},
+	}
+	if _, ok := findNamedSessionSpecForAssignee(cfg, cfg.EffectiveCityName(), "ray"); !ok {
+		t.Fatalf("fixture: shorthand %q does not resolve, so this test would pass vacuously", "ray")
+	}
+	pool := beads.Bead{ID: "ga-pool1", Metadata: map[string]string{
+		"pool_managed": "true", "template": "worker", "alias": "ray", "session_name": "worker-ga-pool1",
+	}}
+	if g := namedReleaseGuardForSessionBead(cfg, pool); g.sessionNamed {
+		t.Fatalf("pool session with alias %q was classified as a named session", "ray")
+	}
+	named := beads.Bead{ID: "ga-named1", Metadata: map[string]string{"session_name": "team.ray"}}
+	if g := namedReleaseGuardForSessionBead(cfg, named); !g.sessionNamed {
+		t.Fatalf("session named by the exact identity %q was not classified as named", "team.ray")
+	}
+}
+
+// TestJudgeClearedProposalReArms: the judge discharges a proposal by removing the
+// label and clearing the stamp; a later teardown must be able to propose again.
+func TestJudgeClearedProposalReArms(t *testing.T) {
+	store := beads.NewMemStore()
+	held := seedWorkBead(t, store, beads.Bead{Title: "named claim", Type: "task"}, "in_progress", crewRuntimeIdentity)
+	if wrote, err := proposeNamedRelease(store, held, "r", "p1", nil); err != nil || !wrote {
+		t.Fatalf("first proposal wrote=%v err=%v", wrote, err)
+	}
+	if err := store.Update(held.ID, beads.UpdateOpts{
+		RemoveLabels: []string{beadmeta.ReleaseProposedLabel},
+		Metadata:     map[string]string{beadmeta.ReleaseProposedAtMetadataKey: ""},
+	}); err != nil {
+		t.Fatalf("judge clear: %v", err)
+	}
+	cleared, err := store.Get(held.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if wrote, err := proposeNamedRelease(store, cleared, "r", "p2", nil); err != nil || !wrote {
+		t.Fatalf("proposal after the judge cleared it wrote=%v err=%v, want a fresh proposal", wrote, err)
+	}
+	got, err := store.Get(held.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Metadata[beadmeta.ReleaseProposedPathMetadataKey] != "p2" || !hasLabel(got.Labels, beadmeta.ReleaseProposedLabel) {
+		t.Fatalf("re-armed proposal: path=%q labels=%v, want p2 and the label", got.Metadata[beadmeta.ReleaseProposedPathMetadataKey], got.Labels)
 	}
 }
