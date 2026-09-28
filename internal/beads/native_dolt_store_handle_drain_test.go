@@ -140,7 +140,7 @@ func TestNativeDoltStoreReconnectDefersOldHandleCloseUntilInFlightReadReleases(t
 	// Later reads are served by the fresh handle, not the retired one.
 	oldReads := old.reads.Load()
 	freshReads := fresh.reads.Load()
-	if _, err := store.Get("gc-after"); err != nil {
+	if err := getWithin(t, store, "gc-after", 5*time.Second); err != nil {
 		t.Fatalf("Get after reconnect: %v", err)
 	}
 	if got := fresh.reads.Load(); got != freshReads+1 {
@@ -198,10 +198,10 @@ func TestNativeDoltStoreCloseStoreWaitsForInFlightReadThenClosesOnce(t *testing.
 	waitForCloseLatch(t, store, 5*time.Second)
 
 	// New operations after the latch fail fast rather than waiting.
-	if _, err := store.Get("gc-new"); !errors.Is(err, ErrStoreClosed) {
+	if err := getWithin(t, store, "gc-new", 5*time.Second); !errors.Is(err, ErrStoreClosed) {
 		t.Fatalf("Get after the close latch = %v, want ErrStoreClosed", err)
 	}
-	if err := store.Update("gc-new", UpdateOpts{}); !errors.Is(err, ErrStoreClosed) {
+	if err := updateWithin(t, store, "gc-new", 5*time.Second); !errors.Is(err, ErrStoreClosed) {
 		t.Fatalf("Update after the close latch = %v, want ErrStoreClosed", err)
 	}
 	if s, release, err := store.acquireStorage(); !errors.Is(err, ErrStoreClosed) {
@@ -244,7 +244,7 @@ func TestNativeDoltStoreCloseStoreWaitsForInFlightReadThenClosesOnce(t *testing.
 	if got := storage.closes.Load(); got != 1 {
 		t.Fatalf("handle Close calls after CloseStore returned = %d, want 1", got)
 	}
-	if err := store.CloseStore(); err != nil {
+	if err := waitErr(t, startCloseStore(store), 5*time.Second, "second CloseStore"); err != nil {
 		t.Fatalf("second CloseStore: %v", err)
 	}
 	if got := storage.closes.Load(); got != 1 {
@@ -257,7 +257,7 @@ func TestNativeDoltStoreCloseStoreWaitsForInFlightReadThenClosesOnce(t *testing.
 func TestNativeDoltStoreCloseStoreReturnsStorageCloseError(t *testing.T) {
 	errClose := errors.New("close failed")
 	store := newNativeDoltStoreForTest(&nativeDoltStorageSpy{close: func() error { return errClose }})
-	if err := store.CloseStore(); !errors.Is(err, errClose) {
+	if err := waitErr(t, startCloseStore(store), 5*time.Second, "CloseStore"); !errors.Is(err, errClose) {
 		t.Fatalf("CloseStore = %v, want the storage Close error", err)
 	}
 }
