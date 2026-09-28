@@ -17,25 +17,32 @@ import (
 // ga-yuiof4 step 1: the RWMutex convoy lead for the 2026-09-27 48-minute
 // city-wide order stall.
 //
-// withReadRetry derives one wall-clock ctx (the read budget) for the whole
-// read chain, but acquireStorageGen takes s.mu.RLock() with no ctx and the
-// reconnect path takes s.mu.Lock() with no ctx. A sync.RWMutex refuses NEW
-// readers once a writer is waiting, so:
+// Before the fix (ga-yuiof4.1), withReadRetry derived one wall-clock ctx (the
+// read budget) for the whole read chain, but acquireStorageGen took
+// s.mu.RLock() with no ctx and held it across the read, and the reconnect path
+// took s.mu.Lock() with no ctx. A sync.RWMutex refuses NEW readers once a
+// writer is waiting, so on that store:
 //
-//	R1  holds RLock across fn() on a hung connection that ignores its ctx;
-//	R3  fails transiently, enters reconnect, and waits in s.mu.Lock() behind R1;
-//	R2  (a fresh, unrelated read) then waits in s.mu.RLock() behind R3,
-//	    outside any deadline, until R1 returns.
+//	R1  held RLock across fn() on a hung connection that ignored its ctx;
+//	R3  failed transiently, entered reconnect, and waited in s.mu.Lock()
+//	    behind R1;
+//	R2  (a fresh, unrelated read) then waited in s.mu.RLock() behind R3,
+//	    outside any deadline, until R1 returned.
+//
+// The fixed store holds s.mu only to pick a storage handle, never across I/O,
+// so R1 no longer holds it while hung and R3's reconnect does not queue behind
+// R1.
 //
 // The contract under test: R2 returns within its read budget (plus a margin),
-// whatever R1 and R3 are doing. The test releases R1 itself, so it cannot hang
-// past its hard timeout.
+// and without error, whatever R1 and R3 are doing. The test releases R1
+// itself, so it cannot hang past its hard timeout.
 //
 // R2 is issued once R3's failure has visibly reached the reconnect path, by
-// whichever of three signals comes first: a writer pending on s.mu (the convoy
-// state the unfixed store enters), the reopen hook having been called (a store
-// whose reconnect does not queue behind R1 gets that far), or R3 having
-// returned. The test logs which one fired.
+// whichever of three signals comes first: the reopen hook having been called
+// (a reconnect that did not queue behind R1 gets that far), R3 having
+// returned, or a writer queued on s.mu before any reopen (only a reconnect
+// waiting behind R1 can queue a writer that early: the pre-fix convoy). The
+// test logs which one fired.
 func TestNativeDoltStoreReadBudgetBoundsStorageLockBehindPendingReconnect(t *testing.T) {
 	const (
 		budget      = 200 * time.Millisecond
@@ -52,41 +59,41 @@ func TestNativeDoltStoreReadBudgetBoundsStorageLockBehindPendingReconnect(t *tes
 	release := func() { releaseOnce.Do(func() { close(releaseR1) }) }
 	t.Cleanup(release)
 
-	storage := &nativeDoltStorageSpy{
-		searchIssues: func(ctx context.Context, _ string, f beadslib.IssueFilter) ([]*beadslib.Issue, error) {
-			id := ""
-			if len(f.IDs) > 0 {
-				id = f.IDs[0]
+	searchIssues := func(ctx context.Context, _ string, f beadslib.IssueFilter) ([]*beadslib.Issue, error) {
+		id := ""
+		if len(f.IDs) > 0 {
+			id = f.IDs[0]
+		}
+		switch id {
+		case "gc-r1":
+			// A read on a hung server connection: it ignores ctx and only
+			// returns when the test releases it.
+			r1EnteredOnce.Do(func() { close(r1Entered) })
+			<-releaseR1
+			return nil, errors.New("invalid connection")
+		case "gc-r3":
+			// A read that fails transiently, arming the reconnect path.
+			return nil, errors.New("invalid connection")
+		default:
+			// A healthy read that honours ctx the way the beads lib's
+			// begin-read-tx does.
+			if err := ctx.Err(); err != nil {
+				return nil, fmt.Errorf("begin read tx: %w", err)
 			}
-			switch id {
-			case "gc-r1":
-				// A read on a hung server connection: it ignores ctx and only
-				// returns when the test releases it.
-				r1EnteredOnce.Do(func() { close(r1Entered) })
-				<-releaseR1
-				return nil, errors.New("invalid connection")
-			case "gc-r3":
-				// A read that fails transiently, arming the reconnect path.
-				return nil, errors.New("invalid connection")
-			default:
-				// A healthy read that honours ctx the way the beads lib's
-				// begin-read-tx does.
-				if err := ctx.Err(); err != nil {
-					return nil, fmt.Errorf("begin read tx: %w", err)
-				}
-				return []*beadslib.Issue{{
-					ID: id, Title: "healthy", Status: beadslib.StatusOpen, IssueType: beadslib.TypeTask, Priority: 2,
-				}}, nil
-			}
-		},
+			return []*beadslib.Issue{{
+				ID: id, Title: "healthy", Status: beadslib.StatusOpen, IssueType: beadslib.TypeTask, Priority: 2,
+			}}, nil
+		}
 	}
-	store := newNativeDoltStoreForTest(storage)
+	store := newNativeDoltStoreForTest(&nativeDoltStorageSpy{searchIssues: searchIssues})
 	store.readRetryBudgetOverride = budget
 	reopenCalled := make(chan struct{})
 	var reopenCalledOnce sync.Once
 	store.reopen = func(context.Context) (beadslib.Storage, error) {
 		reopenCalledOnce.Do(func() { close(reopenCalled) })
-		return storage, nil
+		// A distinct handle per reopen, as the real hook returns, so closing a
+		// retired handle can never reach the storage the current handle wraps.
+		return &nativeDoltStorageSpy{searchIssues: searchIssues}, nil
 	}
 
 	type result struct {
@@ -123,21 +130,32 @@ func TestNativeDoltStoreReadBudgetBoundsStorageLockBehindPendingReconnect(t *tes
 	r3Returned := false
 	syncDeadline := time.Now().Add(margin)
 	syncCondition := ""
+	const reopenCalledLabel = "reopen hook called (R3's reconnect did not queue behind R1)"
 	for syncCondition == "" && time.Now().Before(syncDeadline) {
-		if !store.mu.TryRLock() {
-			syncCondition = "writer pending on s.mu (R1 still in its read)"
-			break
-		}
-		store.mu.RUnlock()
 		select {
 		case <-reopenCalled:
-			syncCondition = "reopen hook called (reconnect did not queue behind R1)"
+			syncCondition = reopenCalledLabel
+			continue
 		case r3Res = <-r3:
 			r3Returned = true
 			syncCondition = fmt.Sprintf("R3 returned (took=%s err=%v)", r3Res.took, r3Res.err)
+			continue
 		default:
-			time.Sleep(time.Millisecond)
 		}
+		if !store.mu.TryRLock() {
+			// On the fixed store the only writer on s.mu here is reconnect's
+			// brief handle swap, which comes after the reopen hook; re-check so
+			// that swap is never reported as the convoy.
+			select {
+			case <-reopenCalled:
+				syncCondition = reopenCalledLabel
+			default:
+				syncCondition = "writer queued on s.mu before any reopen: R3's reconnect is waiting behind R1 (the pre-fix convoy)"
+			}
+			break
+		}
+		store.mu.RUnlock()
+		time.Sleep(time.Millisecond)
 	}
 	syncAt := time.Since(testStart)
 	if syncCondition == "" {
@@ -194,6 +212,9 @@ func TestNativeDoltStoreReadBudgetBoundsStorageLockBehindPendingReconnect(t *tes
 	if !r2Bounded {
 		t.Fatalf("CONVOY: R2 (budget %s) did not return within %s while R1's read was hung (sync point: %s); it returned only after R1 was released (R2 took %s, returned %s after R1 release) with err=%v",
 			budget, budget+margin, syncCondition, r2Res.took, r2Res.at-releasedAt, r2Res.err)
+	}
+	if r2Res.err != nil {
+		t.Fatalf("R2 returned within its budget while R1's read was hung, but failed: %v", r2Res.err)
 	}
 }
 
