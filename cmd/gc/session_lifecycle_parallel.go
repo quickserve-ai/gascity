@@ -405,9 +405,40 @@ type startExecutionOptions struct {
 	// onDeathGate holds names whose on_death hook is queued or running;
 	// their starts wait. Nil holds nothing.
 	onDeathGate *onDeathGate
+	// sessionStartFence, when set, brackets every runtime start (sync or
+	// async) so the worktree reaper lane never removes a tree a start began,
+	// ended or is still running in since its liveness scan started
+	// (ga-yuiof4 item 3). Nil disables the bracket.
+	sessionStartFence *sessionStartFence
 }
 
 type startExecutionOption func(*startExecutionOptions)
+
+func withSessionStartFence(fence *sessionStartFence) startExecutionOption {
+	return func(opts *startExecutionOptions) {
+		opts.sessionStartFence = fence
+	}
+}
+
+// runFencedPreparedStartCandidate is runPreparedStartCandidate inside the
+// session-start fence's bracket. Every controller start goes through here.
+func runFencedPreparedStartCandidate(
+	ctx context.Context,
+	fence *sessionStartFence,
+	item preparedStart,
+	cityPath string,
+	sp runtime.Provider,
+	store beads.Store,
+	cfg *config.City,
+	startupTimeout time.Duration,
+	stabilityWaiter startStabilityWaiter,
+	sessionStaleKeyDetectionWaiter sessionpkg.StaleKeyDetectionWaiter,
+	warmClaim warmClaimTriggerProbe,
+) startResult {
+	fence.beginStart()
+	defer fence.endStart()
+	return runPreparedStartCandidate(ctx, item, cityPath, sp, store, cfg, startupTimeout, stabilityWaiter, sessionStaleKeyDetectionWaiter, warmClaim)
+}
 
 type taskWorkDirResolver func(startCandidate, *config.City) string
 
@@ -1686,7 +1717,7 @@ func executePreparedStartWaveForCity(
 				<-sem
 				done <- i
 			}()
-			results[i] = runPreparedStartCandidate(ctx, item, cityPath, sp, store, cfg, startupTimeout, stabilityWaiter, startOpts.sessionStaleKeyDetectionWaiter, startOpts.warmClaimProbe)
+			results[i] = runFencedPreparedStartCandidate(ctx, startOpts.sessionStartFence, item, cityPath, sp, store, cfg, startupTimeout, stabilityWaiter, startOpts.sessionStaleKeyDetectionWaiter, startOpts.warmClaimProbe)
 		}()
 	}
 	for range prepared {
@@ -1979,6 +2010,7 @@ func enqueuePreparedStartWaveForCity(
 	stabilityWaiter startStabilityWaiter,
 	sessionStaleKeyDetectionWaiter sessionpkg.StaleKeyDetectionWaiter,
 	warmClaim warmClaimTriggerProbe,
+	startFence *sessionStartFence,
 ) []startResult {
 	if len(prepared) == 0 {
 		return nil
@@ -2003,7 +2035,7 @@ func enqueuePreparedStartWaveForCity(
 			if release != nil {
 				defer release()
 			}
-			result := runPreparedStartCandidate(ctx, item, cityPath, sp, store, cfg, startupTimeout, stabilityWaiter, sessionStaleKeyDetectionWaiter, warmClaim)
+			result := runFencedPreparedStartCandidate(ctx, startFence, item, cityPath, sp, store, cfg, startupTimeout, stabilityWaiter, sessionStaleKeyDetectionWaiter, warmClaim)
 			// Resolve before the commit so a stale, refused, or panicking
 			// commit cannot lose the endpoint verdict.
 			result = resolveStartCapacity(result, rec, stderr)
@@ -4053,7 +4085,7 @@ func executePlannedStartsTraced(
 				return wakeCount
 			}
 			if startOpts.async {
-				results = enqueuePreparedStartWaveForCity(ctx, asyncPrepared, cityPath, sp, store, cfg, clk, rec, startupTimeout, wave, stdout, stderr, trace, startOpts.asyncFollowUp, stabilityWaiter, sessionStaleKeyDetectionWaiter, startOpts.warmClaimProbe)
+				results = enqueuePreparedStartWaveForCity(ctx, asyncPrepared, cityPath, sp, store, cfg, clk, rec, startupTimeout, wave, stdout, stderr, trace, startOpts.asyncFollowUp, stabilityWaiter, sessionStaleKeyDetectionWaiter, startOpts.warmClaimProbe, startOpts.sessionStartFence)
 				// The start goroutines own these tickets now.
 				admitted = admitted[:0]
 				if len(results) > 0 && asyncStartBatchNeedsFollowUp(batchCandidates, cfg) {
@@ -4072,6 +4104,7 @@ func executePlannedStartsTraced(
 					withStartStabilityWaiter(stabilityWaiter),
 					withSessionStaleKeyDetectionWaiter(sessionStaleKeyDetectionWaiter),
 					withWarmClaimProbe(startOpts.warmClaimProbe),
+					withSessionStartFence(startOpts.sessionStartFence),
 				)
 			}
 			for _, result := range results {

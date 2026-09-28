@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"io"
 	"os"
@@ -37,7 +36,17 @@ func newReapTickRuntime(cityPath string, cfg *config.City, rigStore beads.Store,
 	}
 }
 
+// runReapTick runs one tick and then waits for the worktree-reaper pass it
+// triggered, if any: the reaper runs on a background lane (ga-yuiof4 item 3),
+// so a test asserting on its effects must wait for the pass, not the tick.
 func runReapTick(t *testing.T, cr *CityRuntime) {
+	t.Helper()
+	runReapTickNoWait(t, cr)
+	waitWorktreeReaperIdle(t, cr)
+}
+
+// runReapTickNoWait runs one tick without waiting for the reaper pass.
+func runReapTickNoWait(t *testing.T, cr *CityRuntime) {
 	t.Helper()
 	var dirty atomic.Bool
 	var lastProviderName string
@@ -57,7 +66,7 @@ func TestCityRuntimeTick_SkipsClosedBeadWorktreeReapWhenDisabled(t *testing.T) {
 	disabled := false
 	cfg.Daemon = config.DaemonConfig{AutoReapClosedBeadWorktrees: &disabled}
 
-	var stderr bytes.Buffer
+	var stderr lockedBuffer
 	runReapTick(t, newReapTickRuntime(cityPath, cfg, store, &stderr))
 
 	if _, err := os.Stat(wt); os.IsNotExist(err) {
@@ -81,7 +90,7 @@ func TestCityRuntimeTick_ReapsClosedBeadWorktreeWhenEnabled(t *testing.T) {
 	cfg.Daemon = config.DaemonConfig{AutoReapClosedBeadWorktrees: &enabled}
 	injectLiveness(t, liveWorktreeState{scanned: true}) // idle: nothing live
 
-	var stderr bytes.Buffer
+	var stderr lockedBuffer
 	runReapTick(t, newReapTickRuntime(cityPath, cfg, store, &stderr))
 
 	if _, err := os.Stat(wt); !os.IsNotExist(err) {
@@ -102,7 +111,7 @@ func TestCityRuntimeTick_DryRunReapDeletesNothing(t *testing.T) {
 	cfg.Daemon = config.DaemonConfig{AutoReapClosedBeadWorktreesDryRun: &dryRun}
 	injectLiveness(t, liveWorktreeState{scanned: true})
 
-	var stderr bytes.Buffer
+	var stderr lockedBuffer
 	runReapTick(t, newReapTickRuntime(cityPath, cfg, store, &stderr))
 
 	if _, err := os.Stat(wt); err != nil {
