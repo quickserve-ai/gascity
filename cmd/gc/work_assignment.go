@@ -199,13 +199,22 @@ func excludeMailMessageBeads(items []beads.Bead) []beads.Bead {
 // This is deliberately a log line and not a bead event: gc-layer bead writes are
 // systematically eventless (measured ~4% evented), so an events-table row would
 // be an observability guarantee that is absent exactly when it is needed.
-func (w workAssignment) ReleaseWorkBead(item beads.Bead, runTargetFallback string, audit io.Writer, releasePath string) error {
+//
+// guard is REQUIRED for the same reason (ga-9n8hjv, fence #1): when it names the
+// work as a named agent's, nothing is released. Assignee and status are left
+// exactly as they are and the release is PROPOSED on the bead instead (see
+// named_release_guard.go). A zero guard withholds every release.
+func (w workAssignment) ReleaseWorkBead(item beads.Bead, runTargetFallback string, guard namedReleaseGuard, audit io.Writer, releasePath string) error {
 	store := w.unwrapped()
 	if store == nil {
 		return nil
 	}
 	if audit == nil {
 		audit = io.Discard
+	}
+	if reason := guard.withholdReason(item.Assignee); reason != "" {
+		_, err := proposeNamedRelease(store, item, reason, releasePath, audit)
+		return err
 	}
 	metadata := clearedSessionAffinityMetadata()
 	stampFallbackRoute := runTargetFallback != "" &&

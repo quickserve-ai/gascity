@@ -72,7 +72,7 @@ func TestReleaseWorkBead_PropagatesBackendFailures(t *testing.T) {
 		claimed := seedClaimedBead(t, mem, "retired-session")
 
 		wa := workAssignmentForStore(beads.WorkStore{Store: store})
-		err := wa.ReleaseWorkBead(claimed, "", io.Discard, "test")
+		err := wa.ReleaseWorkBead(claimed, "", poolReleaseGuardForTest(), io.Discard, "test")
 		if err == nil {
 			t.Fatal("ReleaseWorkBead returned nil after a backend failure; the caller will count this as a completed unassign")
 		}
@@ -95,7 +95,7 @@ func TestReleaseWorkBead_PropagatesBackendFailures(t *testing.T) {
 		store.fail = true
 
 		wa := workAssignmentForStore(beads.WorkStore{Store: store})
-		err := wa.ReleaseWorkBead(claimed, "", io.Discard, "test")
+		err := wa.ReleaseWorkBead(claimed, "", poolReleaseGuardForTest(), io.Discard, "test")
 		if err == nil {
 			t.Fatal("ReleaseWorkBead returned nil after the pre-release read failed; the caller will count this as a completed unassign")
 		}
@@ -120,7 +120,7 @@ func TestReleaseWorkBead_FallbackRouteNeverRidesASecondWrite(t *testing.T) {
 		store.updateCalls = 0
 
 		wa := workAssignmentForStore(beads.WorkStore{Store: store})
-		if err := wa.ReleaseWorkBead(claimed, "worker", io.Discard, "test"); err != nil {
+		if err := wa.ReleaseWorkBead(claimed, "worker", poolReleaseGuardForTest(), io.Discard, "test"); err != nil {
 			t.Fatalf("ReleaseWorkBead: %v", err)
 		}
 
@@ -148,7 +148,7 @@ func TestReleaseWorkBead_FallbackRouteNeverRidesASecondWrite(t *testing.T) {
 		store.updateCalls = 0
 
 		wa := workAssignmentForStore(beads.WorkStore{Store: store})
-		if err := wa.ReleaseWorkBead(stale, "worker", io.Discard, "test"); err != nil {
+		if err := wa.ReleaseWorkBead(stale, "worker", poolReleaseGuardForTest(), io.Discard, "test"); err != nil {
 			t.Fatalf("ReleaseWorkBead: %v", err)
 		}
 
@@ -202,7 +202,7 @@ func TestReleaseWorkBead_Tier2DoesNotTrustACachedRead(t *testing.T) {
 	store.stale = stale
 
 	wa := workAssignmentForStore(beads.WorkStore{Store: store})
-	if err := wa.ReleaseWorkBead(stale, "", io.Discard, "test"); err != nil {
+	if err := wa.ReleaseWorkBead(stale, "", poolReleaseGuardForTest(), io.Discard, "test"); err != nil {
 		t.Fatalf("ReleaseWorkBead: %v", err)
 	}
 
@@ -308,7 +308,7 @@ func TestReleaseWorkBead_DoesNotClobberReclaimedAssignee(t *testing.T) {
 			stale := seedReclaimedBead(t, store)
 
 			wa := workAssignmentForStore(beads.WorkStore{Store: store})
-			if err := wa.ReleaseWorkBead(stale, "", io.Discard, "test"); err != nil {
+			if err := wa.ReleaseWorkBead(stale, "", poolReleaseGuardForTest(), io.Discard, "test"); err != nil {
 				t.Fatalf("ReleaseWorkBead: %v", err)
 			}
 
@@ -342,7 +342,7 @@ func TestReleaseWorkBead_ReleasesWhenSnapshotStillCurrent(t *testing.T) {
 			created := seedClaimedBead(t, store, "retired-session")
 
 			wa := workAssignmentForStore(beads.WorkStore{Store: store})
-			if err := wa.ReleaseWorkBead(created, "", io.Discard, "test"); err != nil {
+			if err := wa.ReleaseWorkBead(created, "", poolReleaseGuardForTest(), io.Discard, "test"); err != nil {
 				t.Fatalf("ReleaseWorkBead: %v", err)
 			}
 
@@ -446,7 +446,7 @@ func TestReleaseWorkBead_ContinuationGroupNeverRidesASecondWrite(t *testing.T) {
 		wa := workAssignmentForStore(beads.WorkStore{Store: store})
 		// runTargetFallback is empty, so stampFallbackRoute is false and the group is
 		// the only thing that can force the single-write path.
-		if err := wa.ReleaseWorkBead(claimed, "", io.Discard, "test"); err != nil {
+		if err := wa.ReleaseWorkBead(claimed, "", poolReleaseGuardForTest(), io.Discard, "test"); err != nil {
 			t.Fatalf("ReleaseWorkBead: %v", err)
 		}
 
@@ -477,7 +477,7 @@ func TestReleaseWorkBead_ContinuationGroupNeverRidesASecondWrite(t *testing.T) {
 		store.updateCalls = 0
 
 		wa := workAssignmentForStore(beads.WorkStore{Store: store})
-		if err := wa.ReleaseWorkBead(stale, "", io.Discard, "test"); err != nil {
+		if err := wa.ReleaseWorkBead(stale, "", poolReleaseGuardForTest(), io.Discard, "test"); err != nil {
 			t.Fatalf("ReleaseWorkBead: %v", err)
 		}
 
