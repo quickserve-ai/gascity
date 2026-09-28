@@ -80,11 +80,15 @@ func spyIssue(id string) *beadslib.Issue {
 
 // closeSettle is the observation window the real-time stress test watches
 // for a CloseStore that must NOT return while an operation it has not waited
-// for is still held.
+// for is still held. It is the window of a negative assertion, which
+// TESTING.md keeps short and explicit rather than on a hang budget.
 const closeSettle = 100 * time.Millisecond
 
-// bubbleWatchdog bounds, in real time, a test body run by inStoreBubble.
-const bubbleWatchdog = 30 * time.Second
+// bubbleWatchdog bounds, on the real clock, a test body run by inStoreBubble.
+// It is a pure hang detector, so it is the package's hang budget. Every bound
+// inside a bubble runs on the fake clock (fakeClockBound), so the bubble holds
+// no real-clock deadline for the watchdog to undercut.
+const bubbleWatchdog = beadsHangBudget
 
 // inStoreBubble runs body in a testing/synctest bubble with a real-time
 // watchdog. Inside the bubble every bound a test sets (time.After) runs on the
@@ -127,7 +131,7 @@ func TestNativeDoltStoreReconnectDefersOldHandleCloseUntilInFlightReadReleases(t
 		heldDone := startGet(store, "gc-held")
 		select {
 		case <-old.entered:
-		case <-time.After(boundedWait):
+		case <-time.After(fakeClockBound):
 			t.Fatal("held read never reached the old handle")
 		}
 
@@ -161,7 +165,7 @@ func TestNativeDoltStoreReconnectDefersOldHandleCloseUntilInFlightReadReleases(t
 		}
 
 		old.releaseHeld()
-		if err := waitErr(t, heldDone, "held read on the retired handle"); err != nil {
+		if err := waitErr(t, heldDone, fakeClockBound, "held read on the retired handle"); err != nil {
 			t.Fatalf("held read on the retired handle: %v", err)
 		}
 		if got := old.closesSeenByHeldRead.Load(); got != 0 {
@@ -192,7 +196,7 @@ func TestNativeDoltStoreCloseStoreWaitsForInFlightReadThenClosesOnce(t *testing.
 		heldDone := startGet(store, "gc-held")
 		select {
 		case <-storage.entered:
-		case <-time.After(boundedWait):
+		case <-time.After(fakeClockBound):
 			t.Fatal("held read never reached the handle")
 		}
 
@@ -227,10 +231,10 @@ func TestNativeDoltStoreCloseStoreWaitsForInFlightReadThenClosesOnce(t *testing.
 		}
 
 		storage.releaseHeld()
-		if err := waitErr(t, heldDone, "held read"); err != nil {
+		if err := waitErr(t, heldDone, fakeClockBound, "held read"); err != nil {
 			t.Fatalf("held read: %v", err)
 		}
-		if err := waitErr(t, closeDone, "CloseStore after the in-flight read released"); err != nil {
+		if err := waitErr(t, closeDone, fakeClockBound, "CloseStore after the in-flight read released"); err != nil {
 			t.Fatalf("CloseStore: %v", err)
 		}
 		if got := storage.closesSeenByHeldRead.Load(); got != 0 {
@@ -240,7 +244,7 @@ func TestNativeDoltStoreCloseStoreWaitsForInFlightReadThenClosesOnce(t *testing.
 		if got := storage.closes.Load(); got != 1 {
 			t.Fatalf("handle Close calls after CloseStore returned = %d, want 1", got)
 		}
-		if err := waitErr(t, startCloseStore(store), "second CloseStore"); err != nil {
+		if err := waitErr(t, startCloseStore(store), fakeClockBound, "second CloseStore"); err != nil {
 			t.Fatalf("second CloseStore: %v", err)
 		}
 		if got := storage.closes.Load(); got != 1 {
@@ -254,7 +258,7 @@ func TestNativeDoltStoreCloseStoreWaitsForInFlightReadThenClosesOnce(t *testing.
 func TestNativeDoltStoreCloseStoreReturnsStorageCloseError(t *testing.T) {
 	errClose := errors.New("close failed")
 	store := newNativeDoltStoreForTest(&nativeDoltStorageSpy{close: func() error { return errClose }})
-	if err := waitErr(t, startCloseStore(store), "CloseStore"); !errors.Is(err, errClose) {
+	if err := waitErr(t, startCloseStore(store), beadsHangBudget, "CloseStore"); !errors.Is(err, errClose) {
 		t.Fatalf("CloseStore = %v, want the storage Close error", err)
 	}
 }
