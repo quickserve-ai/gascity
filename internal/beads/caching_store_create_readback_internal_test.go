@@ -56,6 +56,13 @@ func TestCachingStoreCreateRecordsEveryFailedReadBack(t *testing.T) {
 			backing := &readBackFailingStore{Store: NewMemStore(), getErr: tc.getErr}
 			cache := NewCachingStoreForTest(backing, nil)
 
+			// A store already in reconcile backoff: the read-back record must not
+			// move the backoff anchor, or steady sends keep the retry from ever
+			// coming due (review finding on #185).
+			cache.mu.Lock()
+			anchor := cache.stats.LastProblemAt
+			cache.mu.Unlock()
+
 			created, err := cache.Create(Bead{Title: "mail", Type: "message"})
 			if err != nil {
 				t.Fatalf("Create: %v", err)
@@ -64,6 +71,9 @@ func TestCachingStoreCreateRecordsEveryFailedReadBack(t *testing.T) {
 			stats := cache.Stats()
 			if stats.ProblemCount != 1 || !strings.Contains(stats.LastProblem, "refresh bead after create") {
 				t.Fatalf("ProblemCount=%d LastProblem=%q, want the failed read-back recorded", stats.ProblemCount, stats.LastProblem)
+			}
+			if got := cache.Stats().LastProblemAt; !got.Equal(anchor) {
+				t.Fatalf("LastProblemAt moved %v -> %v; it is the reconcile backoff anchor", anchor, got)
 			}
 			cache.mu.RLock()
 			_, dirty := cache.dirty[created.ID]

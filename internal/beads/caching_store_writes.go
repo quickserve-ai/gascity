@@ -39,7 +39,8 @@ func (c *CachingStore) createWith(create func() (Bead, error)) (Bead, error) {
 		return created, err
 	}
 
-	// Read the create back. Every failure is recorded: an unrecorded one let the
+	// Read the create back. Every failure is recorded (recordReadBackProblem,
+	// which leaves the reconcile backoff anchor alone): an unrecorded one let the
 	// cache serve a row that verification could not find, and nothing said so
 	// (ga-th31cy). What the failure does to the row depends on what it proved:
 	//   - a lookup that did not complete (ErrVerifyIndeterminate, which also
@@ -54,7 +55,7 @@ func (c *CachingStore) createWith(create func() (Bead, error)) (Bead, error) {
 	if fresh, err := c.backing.Get(created.ID); err == nil {
 		created = fresh
 	} else {
-		c.recordProblem("refresh bead after create", fmt.Errorf("%s: %w", created.ID, err))
+		c.recordReadBackProblem("refresh bead after create", fmt.Errorf("%s: %w", created.ID, err))
 		readBackUnproven = errors.Is(err, ErrVerifyIndeterminate) || !errors.Is(err, ErrNotFound)
 	}
 
