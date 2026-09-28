@@ -11,6 +11,7 @@ go_library(
 go_test(
     name = "git_test",
     srcs = [
+        "bounded_run_test.go",
         "clone_hardening_test.go",
         "clone_scrub_test.go",
         "clone_test.go",

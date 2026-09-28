@@ -1992,7 +1992,11 @@ func TestReleaseOrphanedPoolAssignments_PreservesCanonicalNamedIdentity(t *testi
 	}
 }
 
-func TestReleaseOrphanedPoolAssignments_ReleasesNamedIdentityForUnreachableStore(t *testing.T) {
+// TestReleaseOrphanedPoolAssignments_ProposesNamedIdentityForUnreachableStore:
+// the named agent is rig-scoped and cannot reach this rig-store work, which is why
+// the sweep used to release it. It is still a named agent's claim, so under fence
+// #1 the sweep proposes the release and the judge makes it (ga-9n8hjv).
+func TestReleaseOrphanedPoolAssignments_ProposesNamedIdentityForUnreachableStore(t *testing.T) {
 	cityPath := t.TempDir()
 	cityStore := beads.NewMemStore()
 	rigStore := beads.NewMemStore()
@@ -2033,17 +2037,15 @@ func TestReleaseOrphanedPoolAssignments_ReleasesNamedIdentityForUnreachableStore
 		[]string{"repo"},
 		map[string]beads.Store{"repo": rigStore},
 	)
-	if len(released) != 1 || released[0].ID != work.ID {
-		t.Fatalf("released = %v, want [%s]", released, work.ID)
+	if len(released) != 0 {
+		t.Fatalf("released = %v, want none: a named agent's claim is proposed, never released (ga-9n8hjv)", released)
 	}
 
 	got, err := rigStore.Get(work.ID)
 	if err != nil {
 		t.Fatalf("Get rig work bead: %v", err)
 	}
-	if got.Status != "open" || got.Assignee != "" {
-		t.Fatalf("rig work = status %q assignee %q, want open/unassigned", got.Status, got.Assignee)
-	}
+	assertProposedNotReleased(t, got, "reviewer", "in_progress", "orphaned-pool-assignment", "unreachable named work")
 }
 
 // A live, cross-store-eligible (city-scoped, Scope="city") NAMED session
@@ -2052,8 +2054,8 @@ func TestReleaseOrphanedPoolAssignments_ReleasesNamedIdentityForUnreachableStore
 // the bead be released — the named-route analog of the pool-worker
 // openSessionOwnsWork cross-store fix (#3453). Without it a backup worker is
 // minted on the same in_progress bead. Contrast
-// ReleasesNamedIdentityForUnreachableStore, where the named agent is rig-scoped
-// and genuinely cannot reach the work, so release is still correct.
+// ProposesNamedIdentityForUnreachableStore, where the named agent is rig-scoped
+// and genuinely cannot reach the work, so the release is proposed to a judge.
 func TestReleaseOrphanedPoolAssignments_PreservesCrossStoreEligibleNamedIdentity(t *testing.T) {
 	cityPath := t.TempDir()
 	cityStore := beads.NewMemStore()
@@ -2631,5 +2633,59 @@ func TestDirectSessionBeadIDCandidates_SkipsFlagLikeCandidates(t *testing.T) {
 		if strings.HasPrefix(c, "-") {
 			t.Fatalf("candidate %q starts with %q; stores that shell out would read it as a flag (all: %v)", c, "-", candidates)
 		}
+	}
+}
+
+// ga-91tu1o: the sweep's routing inputs (the routed template that picks the
+// named/ephemeral session guards, the canonical-root shape, the detached-probe
+// spec, the continuation group that picks the release path) come from the
+// cached assigned-work snapshot. When the live row has moved
+// on, the release must be skipped rather than decided on the stale copy; the
+// live status+assignee match alone does not cover it.
+func TestReleaseOrphanedPoolAssignments_SkipsWhenLiveRoutingDivergesFromSnapshot(t *testing.T) {
+	cases := []struct {
+		name string
+		meta map[string]string
+	}{
+		{name: "routed_to moved", meta: map[string]string{"gc.routed_to": "mayor"}},
+		{name: "detached probe armed", meta: map[string]string{detachedProbeMetadataKey: "pid:1"}},
+		{name: "became canonical workflow root", meta: map[string]string{beadmeta.KindMetadataKey: beadmeta.KindWorkflow}},
+		{name: "continuation group set", meta: map[string]string{beadmeta.ContinuationGroupMetadataKey: "grp-1"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store, snapshot := newConditionalReleaseProbeStore(t)
+			if err := store.mem.Update(snapshot.ID, beads.UpdateOpts{Metadata: tc.meta}); err != nil {
+				t.Fatalf("diverge live row: %v", err)
+			}
+
+			released := releaseProbeAssignments(store, snapshot)
+			if len(released) != 0 {
+				t.Fatalf("released = %v, want none: the live row diverged from the cached snapshot", released)
+			}
+			if len(store.releaseCalls) != 0 || len(store.assignmentUpdates) != 0 {
+				t.Fatalf("release writes = %v / %+v, want none", store.releaseCalls, store.assignmentUpdates)
+			}
+			got, err := store.Get(snapshot.ID)
+			if err != nil {
+				t.Fatalf("Get work bead: %v", err)
+			}
+			if got.Status != "in_progress" || got.Assignee != "worker-dead" {
+				t.Fatalf("work = status %q assignee %q, want the claim untouched", got.Status, got.Assignee)
+			}
+		})
+	}
+}
+
+// Control for the test above: live metadata that the release decision does not
+// read may change freely without holding the release.
+func TestReleaseOrphanedPoolAssignments_UnrelatedLiveMetadataStillReleases(t *testing.T) {
+	store, snapshot := newConditionalReleaseProbeStore(t)
+	if err := store.mem.Update(snapshot.ID, beads.UpdateOpts{Metadata: map[string]string{"gc.note": "touched"}}); err != nil {
+		t.Fatalf("touch live row: %v", err)
+	}
+	released := releaseProbeAssignments(store, snapshot)
+	if len(released) != 1 || released[0].ID != snapshot.ID {
+		t.Fatalf("released = %v, want [%s]", released, snapshot.ID)
 	}
 }

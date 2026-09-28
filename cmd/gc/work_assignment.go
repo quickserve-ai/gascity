@@ -199,13 +199,22 @@ func excludeMailMessageBeads(items []beads.Bead) []beads.Bead {
 // This is deliberately a log line and not a bead event: gc-layer bead writes are
 // systematically eventless (measured ~4% evented), so an events-table row would
 // be an observability guarantee that is absent exactly when it is needed.
-func (w workAssignment) ReleaseWorkBead(item beads.Bead, runTargetFallback string, audit io.Writer, releasePath string) error {
+//
+// guard is REQUIRED for the same reason (ga-9n8hjv, fence #1): when it names the
+// work as a named agent's, nothing is released. Assignee and status are left
+// exactly as they are and the release is PROPOSED on the bead instead (see
+// named_release_guard.go). A zero guard withholds every release.
+func (w workAssignment) ReleaseWorkBead(item beads.Bead, runTargetFallback string, guard namedReleaseGuard, audit io.Writer, releasePath string) error {
 	store := w.unwrapped()
 	if store == nil {
 		return nil
 	}
 	if audit == nil {
 		audit = io.Discard
+	}
+	if reason := guard.withholdReasonForBead(item); reason != "" {
+		_, err := proposeNamedRelease(store, item, reason, releasePath, audit)
+		return err
 	}
 	metadata := clearedSessionAffinityMetadata()
 	stampFallbackRoute := runTargetFallback != "" &&
@@ -374,21 +383,36 @@ func liveWorkAssignmentAssigneeMatches(store beads.Store, id, expectedStatus, ex
 	if store == nil || id == "" || expectedStatus == "" {
 		return false, nil
 	}
+	wb, found, err := liveWorkAssignmentRow(store, id, expectedStatus)
+	if err != nil || !found {
+		return false, err
+	}
+	return strings.TrimSpace(wb.Assignee) == strings.TrimSpace(expectedAssignee), nil
+}
+
+// liveWorkAssignmentRow returns the live row for id when it still holds
+// expectedStatus. found is false when the bead has left that status (or no
+// longer exists); a read failure is returned as an error, never as a verdict.
+func liveWorkAssignmentRow(store beads.Store, id, expectedStatus string) (beads.Bead, bool, error) {
+	id = strings.TrimSpace(id)
+	expectedStatus = strings.TrimSpace(expectedStatus)
+	if store == nil || id == "" || expectedStatus == "" {
+		return beads.Bead{}, false, nil
+	}
 	work, err := store.List(beads.ListQuery{
 		Status:   expectedStatus,
 		Live:     true,
 		TierMode: beads.TierBoth,
 	})
 	if err != nil {
-		return false, fmt.Errorf("live work-assignment verification of %q: %w", id, err)
+		return beads.Bead{}, false, fmt.Errorf("live work-assignment verification of %q: %w", id, err)
 	}
 	for _, wb := range work {
-		if wb.ID != id {
-			continue
+		if wb.ID == id {
+			return wb, true, nil
 		}
-		return strings.TrimSpace(wb.Assignee) == strings.TrimSpace(expectedAssignee), nil
 	}
-	return false, nil
+	return beads.Bead{}, false, nil
 }
 
 // ReassignWorkBead re-homes one WORK bead onto a new session identity, emitting
