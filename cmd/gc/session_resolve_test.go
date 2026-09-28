@@ -996,6 +996,172 @@ func TestResolveSessionIDMaterializingNamed_RuntimeSessionNameWrongTemplateConfl
 			other.ID,
 		)
 	}
+	// ga-lm5coj: the conflict is a name squat, and every by-name verb refuses on
+	// it — kill included. The error must name the verb that clears it, and that
+	// verb must be able to address the squatter by its bead ID.
+	if !errors.Is(err, errNamedSessionConflict) {
+		t.Fatalf("err = %v, want errNamedSessionConflict in the chain", err)
+	}
+	if want := "gc session close " + other.ID; !strings.Contains(err.Error(), want) {
+		t.Fatalf("err = %q, want the remedy %q", err, want)
+	}
+	if got, err := resolveSessionIDWithConfig(cityPath, cfg, store, other.ID); err != nil || got != other.ID {
+		t.Fatalf("resolve squatter by bead ID = %q, %v; want %q (the remedy must be addressable)", got, err, other.ID)
+	}
+}
+
+func TestResolveSessionIDWithConfig_ConflictAdviceFollowsTheConflictShape(t *testing.T) {
+	// ga-lm5coj review: close stops the runtime, ends the bead and releases its
+	// work. The conflict error may recommend it only for a squat: a bead that
+	// records a template or agent other than this seat's. A pool session the
+	// reconciler adopts, or a bead that could be the seat's own unstamped
+	// session (ga-1ycmli), must never be pointed at close.
+	cityPath := filepath.Join(t.TempDir(), "city")
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Agents:        []config.Agent{{Name: "mayor", StartCommand: "true", MaxActiveSessions: intPtr(1)}},
+		NamedSessions: []config.NamedSession{{Template: "mayor"}},
+	}
+	spec, ok := findNamedSessionSpec(cfg, config.EffectiveCityName(cfg, filepath.Base(cityPath)), "mayor")
+	if !ok {
+		t.Fatal("findNamedSessionSpec(mayor) = false")
+	}
+	for _, tc := range []struct {
+		name      string
+		metadata  map[string]string
+		wantClose bool
+		want      string
+	}{
+		{"runtime name, other template", map[string]string{"session_name": spec.SessionName, "template": "other", "agent_name": "other", "state": "asleep"}, true, `template="other"`},
+		{"alias, other template", map[string]string{"session_name": "s-rogue", "alias": "mayor", "template": "other", "state": "active"}, true, "name squat"},
+		{"alias, no template", map[string]string{"session_name": "s-bare", "alias": "mayor", "state": "active"}, false, "gc session show"},
+		{"runtime name, no template", map[string]string{"session_name": spec.SessionName, "state": "asleep"}, false, "gc session show"},
+		{"pool session the reconciler adopts", map[string]string{"session_name": "mayor-ga-x1", "template": "mayor", "agent_name": "mayor", "session_origin": "ephemeral", "pool_managed": "true", "state": "active"}, false, "reconciler adopts"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := beads.NewMemStore()
+			b, err := store.Create(beads.Bead{Type: session.BeadType, Labels: []string{session.LabelSession}, Metadata: tc.metadata})
+			if err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			_, err = resolveSessionIDWithConfig(cityPath, cfg, store, "mayor")
+			if !errors.Is(err, errNamedSessionConflict) {
+				t.Fatalf("err = %v, want errNamedSessionConflict", err)
+			}
+			msg := err.Error()
+			if got := strings.Contains(msg, "a name squat"); got != tc.wantClose {
+				t.Fatalf("calls it a squat = %v, want %v: %q", got, tc.wantClose, msg)
+			}
+			// Every kind but the adoptable pool session names the remedy, at
+			// least conditionally, so no conflict leaves the seat with no way
+			// out (the ga-lm5coj deadlock).
+			if got, want := strings.Contains(msg, "gc session close "+b.ID), tc.want != "reconciler adopts"; got != want {
+				t.Fatalf("names the close remedy = %v, want %v: %q", got, want, msg)
+			}
+			if !strings.Contains(msg, tc.want) || !strings.Contains(msg, "state=") || !strings.Contains(msg, "pool_managed=") {
+				t.Fatalf("err = %q, want %q and the bead's state/template/pool_managed", msg, tc.want)
+			}
+		})
+	}
+}
+
+func TestResolveSessionIDWithConfig_ConflictUnderALegacyTemplateSpellingIsNotASquat(t *testing.T) {
+	// #127 review round 2: the runtime treats a pre-binding template spelling
+	// ("qcore/archer") as the bound agent ("qcore/cherub-law.archer"), so a
+	// seat's own unstamped bead carrying it must not be called a squat. The
+	// same holds for a bead whose agent_name is the seat's identity.
+	cityPath := filepath.Join(t.TempDir(), "city")
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Agents:        []config.Agent{{Name: "archer", Dir: "qcore", BindingName: "cherub-law", StartCommand: "true", MaxActiveSessions: intPtr(1)}},
+		NamedSessions: []config.NamedSession{{Name: "archer", Template: "cherub-law.archer", Dir: "qcore"}},
+	}
+	for _, md := range []map[string]string{
+		{"session_name": "s-legacy", "alias": "qcore/archer", "template": "qcore/archer", "state": "active"},
+		{"session_name": "s-named", "alias": "qcore/archer", "template": "qcore/drifted", "agent_name": "qcore/archer", "state": "active"},
+	} {
+		store := beads.NewMemStore()
+		b, err := store.Create(beads.Bead{Type: session.BeadType, Labels: []string{session.LabelSession}, Metadata: md})
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		_, err = resolveSessionIDWithConfig(cityPath, cfg, store, "qcore/archer")
+		if !errors.Is(err, errNamedSessionConflict) {
+			t.Fatalf("%v: err = %v, want errNamedSessionConflict", md, err)
+		}
+		if strings.Contains(err.Error(), "a name squat") || !strings.Contains(err.Error(), "gc session show "+b.ID) {
+			t.Fatalf("%v: err = %q, want the check-first advice, not a squat", md, err)
+		}
+	}
+}
+
+func TestResolveSessionIDWithConfig_LegacyTemplateSpellingIsNotASquatWhenTheSeatNameDiffers(t *testing.T) {
+	// #127 round-3 review: the case above is vetoed by the plain identity
+	// match (the seat is qcore/archer, and so is the legacy template). Here
+	// the seat is qcore/lead, so ONLY the template equivalence
+	// (findAgentByTemplate's legacy form: qcore/archer is the bound
+	// qcore/cherub-law.archer) can tell that this bead is the seat's own.
+	cityPath := filepath.Join(t.TempDir(), "city")
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Agents:        []config.Agent{{Name: "archer", Dir: "qcore", BindingName: "cherub-law", StartCommand: "true", MaxActiveSessions: intPtr(1)}},
+		NamedSessions: []config.NamedSession{{Name: "lead", Template: "cherub-law.archer", Dir: "qcore"}},
+	}
+	store := beads.NewMemStore()
+	b, err := store.Create(beads.Bead{Type: session.BeadType, Labels: []string{session.LabelSession}, Metadata: map[string]string{
+		"session_name": "s-lead-legacy", "alias": "qcore/lead", "template": "qcore/archer", "state": "active",
+	}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	_, err = resolveSessionIDWithConfig(cityPath, cfg, store, "qcore/lead")
+	if !errors.Is(err, errNamedSessionConflict) {
+		t.Fatalf("err = %v, want errNamedSessionConflict", err)
+	}
+	if strings.Contains(err.Error(), "a name squat") || !strings.Contains(err.Error(), "gc session show "+b.ID) {
+		t.Fatalf("err = %q, want the check-first advice, not a squat", err)
+	}
+}
+
+func TestResolveSessionIDWithConfig_ConfigNameNotFoundNamesTheSessionIdentity(t *testing.T) {
+	// ga-lm5coj: a session is addressed by its named-session identity, never by
+	// its agent config name — the session surface deliberately does not resolve
+	// template names (#666). The refusal must say which name is wanted.
+	store := beads.NewMemStore()
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents:    []config.Agent{{Name: "cherub-law.archer", Dir: "qcore", StartCommand: "true"}},
+		NamedSessions: []config.NamedSession{
+			{Name: "archer", Template: "cherub-law.archer", Dir: "qcore"},
+		},
+	}
+	_, err := resolveSessionIDWithConfig(t.TempDir(), cfg, store, "qcore/cherub-law.archer")
+	if !errors.Is(err, session.ErrSessionNotFound) {
+		t.Fatalf("err = %v, want ErrSessionNotFound (config names stay unresolved)", err)
+	}
+	if !strings.Contains(err.Error(), `"qcore/archer"`) {
+		t.Fatalf("err = %q, want it to name the session identity qcore/archer", err)
+	}
+
+	// Review 2026-09-23: a target that IS a configured named-session identity
+	// (not materialized) must not be pointed at a sibling on the same template.
+	shared := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents:    []config.Agent{{Name: "worker", StartCommand: "true"}},
+		NamedSessions: []config.NamedSession{
+			{Template: "worker"},
+			{Name: "w2", Template: "worker"},
+		},
+	}
+	_, err = resolveSessionIDWithConfig(t.TempDir(), shared, store, "worker")
+	if err == nil || strings.Contains(err.Error(), "agent config name") {
+		t.Fatalf("err = %v, want no config-name hint for a configured named-session identity", err)
+	}
+
+	_, err = resolveSessionIDWithConfig(t.TempDir(), cfg, store, "qcore/nobody")
+	if !errors.Is(err, session.ErrSessionNotFound) || strings.Contains(err.Error(), "named session is") {
+		t.Fatalf("err = %v, want a plain not-found for a name that is no config name", err)
+	}
 }
 
 func TestResolveSessionIDMaterializingNamed_RecreatesClosedConfiguredNamedSession(t *testing.T) {

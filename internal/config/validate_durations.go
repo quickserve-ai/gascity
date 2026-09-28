@@ -143,13 +143,8 @@ func ValidateDurations(cfg *City, source string) []string {
 	check("[orders]", "max_timeout", cfg.Orders.MaxTimeout)
 	for i := range cfg.Orders.Overrides {
 		ov := cfg.Orders.Overrides[i]
-		if ov.CheckTimeout != nil {
-			// A non-positive check_timeout override parses cleanly but reverts
-			// the condition probe to the 10s default at dispatch, so surface it
-			// at config load like an unparseable typo.
-			checkPositive(
-				fmt.Sprintf("[[orders.overrides]] %q", ov.Name),
-				"check_timeout", *ov.CheckTimeout)
+		for _, field := range orderOverridePositiveDurations(ov) {
+			checkPositive(fmt.Sprintf("[[orders.overrides]] %q", ov.Name), field.key, field.value)
 		}
 	}
 
@@ -202,6 +197,27 @@ func ValidateDurations(cfg *City, source string) []string {
 	}
 
 	return warnings
+}
+
+// orderOverrideDuration is one set duration field of an order override.
+type orderOverrideDuration struct {
+	key, value string
+}
+
+// orderOverridePositiveDurations returns the set duration fields of ov whose
+// zero or negative value parses cleanly but silently reverts to a default at
+// dispatch, so config load must surface one like an unparseable typo:
+// check_timeout reverts the condition probe to 10s, and run_stale_after
+// reverts the order wisp watchdog's cutoff to 6h.
+func orderOverridePositiveDurations(ov OrderOverride) []orderOverrideDuration {
+	var out []orderOverrideDuration
+	if ov.CheckTimeout != nil {
+		out = append(out, orderOverrideDuration{key: "check_timeout", value: *ov.CheckTimeout})
+	}
+	if ov.RunStaleAfter != nil {
+		out = append(out, orderOverrideDuration{key: "run_stale_after", value: *ov.RunStaleAfter})
+	}
+	return out
 }
 
 // ValidateNonNegativeDurations checks duration fields that must not be negative

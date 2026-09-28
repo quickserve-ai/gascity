@@ -2461,6 +2461,13 @@ func (m *memoryOrderDispatcher) hasOpenWorkStrict(store beads.Store, scopedName 
 // descendants. It stays in the controller because the subtree walk is graph
 // residual (molecule membership + graph traversal).
 func (m *memoryOrderDispatcher) wispRootHasOpenWork(store beads.Store, b beads.Bead) (bool, error) {
+	return orderWispRootHasOpenWork(store, b)
+}
+
+// orderWispRootHasOpenWork is wispRootHasOpenWork without the dispatcher, so a
+// reader outside it (gc doctor naming the bead that holds a gate) applies the
+// exact predicate the gate applies.
+func orderWispRootHasOpenWork(store beads.Store, b beads.Bead) (bool, error) {
 	if !isOrderWispRootCandidate(b) {
 		return false, nil
 	}
@@ -3464,30 +3471,9 @@ func sweepStaleOrderWispSubtreesMode(store beads.Store, cutoff time.Time, onlyOr
 	ids := make([]string, 0, len(roots))
 	seen := make(map[string]struct{}, len(roots))
 	for _, root := range roots {
-		if root.ID == "" || root.Status == "closed" {
-			continue
-		}
-		if beadLabelsContain(root.Labels, labelOrderTracking) {
-			continue
-		}
-		if !isOrderWispRootCandidate(root) {
-			continue
-		}
-		if !isOrderRootOnlyWispCandidate(root) {
-			openDescendants, err := storeHasOpenDescendants(store, root.ID, nil)
-			if err != nil {
-				return 0, fmt.Errorf("checking stale wisp descendants of %s: %w", root.ID, err)
-			}
-			if !openDescendants {
-				continue
-			}
-		}
-		subtree, err := collectOrderWispSubtree(store, root)
+		subtree, err := staleOrderWispRootSubtree(store, root, cutoff)
 		if err != nil {
-			return 0, fmt.Errorf("collecting stale wisp subtree %s: %w", root.ID, err)
-		}
-		if !openSubtreeOlderThan(subtree, cutoff) {
-			continue
+			return 0, err
 		}
 		for _, id := range staleOrderWispSubtreeCloseIDs(subtree) {
 			if _, ok := seen[id]; ok {
@@ -3508,6 +3494,40 @@ func sweepStaleOrderWispSubtreesMode(store beads.Store, cutoff time.Time, onlyOr
 		return 0, fmt.Errorf("ordering stale order wisp closes: %w", err)
 	}
 	return closeStaleOrderWispIDs(store, ordered, initiator)
+}
+
+// staleOrderWispRootSubtree returns the subtree of one order wisp root that is
+// stale at cutoff, or nil when it is not: the root is closed, an
+// order-tracking bead, not a wisp/molecule root, a molecule root whose
+// descendants are all closed (the gate already ignores it), or the subtree
+// holds an open bead created at or after cutoff. The operator sweep closes what
+// this selects and the controller's order wisp watchdog only reports it, but
+// both select through here, so they cannot disagree about what a stale subtree
+// is.
+func staleOrderWispRootSubtree(store beads.Store, root beads.Bead, cutoff time.Time) ([]beads.Bead, error) {
+	if root.ID == "" || root.Status == "closed" {
+		return nil, nil
+	}
+	if beadLabelsContain(root.Labels, labelOrderTracking) || !isOrderWispRootCandidate(root) {
+		return nil, nil
+	}
+	if !isOrderRootOnlyWispCandidate(root) {
+		openDescendants, err := storeHasOpenDescendants(store, root.ID, nil)
+		if err != nil {
+			return nil, fmt.Errorf("checking stale wisp descendants of %s: %w", root.ID, err)
+		}
+		if !openDescendants {
+			return nil, nil
+		}
+	}
+	subtree, err := collectOrderWispSubtree(store, root)
+	if err != nil {
+		return nil, fmt.Errorf("collecting stale wisp subtree %s: %w", root.ID, err)
+	}
+	if !openSubtreeOlderThan(subtree, cutoff) {
+		return nil, nil
+	}
+	return subtree, nil
 }
 
 // closeStaleOrderWispIDs closes ids via Store.CloseAll with the sweep's audit
@@ -3671,17 +3691,30 @@ func staleOrderWispRoots(store beads.Store, cutoff time.Time, onlyOrders map[str
 	}
 	var roots []beads.Bead
 	for orderName := range onlyOrders {
-		matches, err := store.List(beads.ListQuery{
-			Label:         "order-run:" + orderName,
-			CreatedBefore: cutoff,
-			TierMode:      beads.TierBoth,
-		})
+		matches, err := staleOrderWispRootsForOrder(store, orderName, cutoff)
 		if err != nil {
-			return nil, fmt.Errorf("listing stale order wisps for %s: %w", orderName, err)
+			return nil, err
 		}
 		roots = append(roots, matches...)
 	}
 	return roots, nil
+}
+
+// staleOrderWispRootsForOrder lists the open beads carrying orderName's
+// order-run label that were created before cutoff. The read is Live: the
+// dispatcher writes wisp roots through its own uncached handle, so a cached
+// read in the controller never sees them (the ga-v5vnyp blindness, which kept
+// the tracking watchdog silent for 43 hours).
+func staleOrderWispRootsForOrder(store beads.Store, orderName string, cutoff time.Time) ([]beads.Bead, error) {
+	matches, err := beads.HandlesFor(store).Live.List(beads.ListQuery{
+		Label:         "order-run:" + orderName,
+		CreatedBefore: cutoff,
+		TierMode:      beads.TierBoth,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("listing stale order wisps for %s: %w", orderName, err)
+	}
+	return matches, nil
 }
 
 // collectOrderWispSubtree returns the root plus every descendant the sweep

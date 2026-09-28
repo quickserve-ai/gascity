@@ -24,6 +24,22 @@ var ErrUnresolvedCityProbe = errors.New("origin city unknown")
 type CityRoster struct {
 	Local string
 	Peers []string
+	// Towns maps a peer city name to the town whose rendered roster
+	// (cities/<town>/agents.json) lists its seats. A peer city with no
+	// mapping has no list and keeps the city-level rules only.
+	Towns map[string]string
+	// RosterRoot is the directory holding cities/<town>/agents.json: the
+	// pack-cache clone of the imported repository that ships them at its
+	// pinned commit, or the configured roster_root. Empty means no list.
+	RosterRoot string
+	// RosterPin is the commit RosterRoot was rendered at, printed in a
+	// refusal so the reader knows which roster said no; RosterPinUnknown
+	// when the root was hand-pointed.
+	RosterPin string
+	// RosterSourceErr records a failure to resolve RosterRoot (an ambiguous
+	// or unreadable pack pin). A send to a mapped town then fails closed
+	// with that reason rather than proceeding without a list.
+	RosterSourceErr error
 }
 
 // Enabled reports whether cross-city addressing is configured: a roster needs

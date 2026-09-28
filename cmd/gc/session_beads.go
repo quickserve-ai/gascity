@@ -1515,6 +1515,26 @@ func unclaimWorkAssignedToRetiredSessionInfo(
 	fallbackRoute string,
 	stderr io.Writer,
 ) unclaimResult {
+	return unclaimWorkAssignedToSessionInfo(cityPath, cfg, store, rigStores, retiredSession, fallbackRoute, "stranded-pool-worker-repair", false, stderr)
+}
+
+// unclaimWorkAssignedToSessionInfo is the release sweep behind
+// unclaimWorkAssignedToRetiredSessionInfo, with the caller naming itself as the
+// releasePath that ReleaseWorkBead's audit line records. The stranded repair and
+// the drain-ack teardown both retire a pool seat through it. skipOwnDrainStep
+// leaves the session's own mol-do-work drain step (isSessionOwnDrainStepBead)
+// out of the sweep, for the drain-ack path that already treats it as not-work.
+func unclaimWorkAssignedToSessionInfo(
+	cityPath string,
+	cfg *config.City,
+	store beads.Store,
+	rigStores map[string]beads.Store,
+	retiredSession session.Info,
+	fallbackRoute string,
+	releasePath string,
+	skipOwnDrainStep bool,
+	stderr io.Writer,
+) unclaimResult {
 	var res unclaimResult
 	if store == nil || strings.TrimSpace(retiredSession.ID) == "" {
 		return res
@@ -1543,6 +1563,9 @@ func unclaimWorkAssignedToRetiredSessionInfo(
 					if session.IsSessionBeadOrRepairable(item) {
 						continue
 					}
+					if skipOwnDrainStep && isSessionOwnDrainStepBead(ownerStore, item) {
+						continue
+					}
 					key := strconv.Itoa(storeIndex) + "\x00" + item.ID
 					if _, ok := seen[key]; ok {
 						continue
@@ -1552,7 +1575,7 @@ func unclaimWorkAssignedToRetiredSessionInfo(
 					// detached: ReleaseWorkBead clears the assignee, resets in_progress
 					// to open, and stamps fallbackRoute run_target only when otherwise
 					// unrouted — identical to the raw retirement path.
-					if err := wa.ReleaseWorkBead(item, fallbackRoute, stderr, "stranded-pool-worker-repair"); err != nil {
+					if err := wa.ReleaseWorkBead(item, fallbackRoute, stderr, releasePath); err != nil {
 						fmt.Fprintf(stderr, "session beads: unclaiming work %s assigned to retired session %s: %v\n", item.ID, retiredSession.ID, err) //nolint:errcheck
 						res.Failed++
 						continue

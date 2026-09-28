@@ -30,8 +30,11 @@ type Override struct {
 	Pool         *string
 	Timeout      *string
 	CheckTimeout *string
-	Idempotent   *bool
-	Env          map[string]string
+	// RunStaleAfter overrides the order wisp watchdog's report threshold for
+	// the order's runs.
+	RunStaleAfter *string
+	Idempotent    *bool
+	Env           map[string]string
 }
 
 // ApplyOverrides applies each override to the matching order in aa.
@@ -165,6 +168,9 @@ func applyOverride(a *Order, ov *Override) {
 	}
 	if ov.CheckTimeout != nil {
 		a.CheckTimeout = *ov.CheckTimeout
+	}
+	if ov.RunStaleAfter != nil {
+		a.RunStaleAfter = *ov.RunStaleAfter
 	}
 	if ov.Idempotent != nil {
 		a.Idempotent = *ov.Idempotent

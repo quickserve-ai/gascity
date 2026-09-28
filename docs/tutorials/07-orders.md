@@ -326,7 +326,8 @@ schedule = "0 6 * * *"
 ```
 
 Overrides match by order name and can change `enabled`, `trigger`, `interval`,
-`schedule`, `check`, `on`, `pool`, `timeout`, `idempotent`, and `env`. An
+`schedule`, `check`, `on`, `pool`, `timeout`, `check_timeout`,
+`run_stale_after`, `idempotent`, and `env`. An
 override targeting a nonexistent order is an error, not a silent no-op — `gc
 order` commands fail; `gc start` logs the error and continues with the unmatched
 override skipped.
@@ -399,6 +400,33 @@ is so contended that the check times out, the order is skipped — it fails
 closed. Orders whose dispatch is safe to repeat (sweeps and feeders where a
 duplicate run is a no-op) can set `idempotent = true` to fail open instead:
 on a gate timeout they dispatch anyway rather than starve.
+
+A run whose worker died keeps its order's gate shut until someone closes it.
+The orchestrator does not decide that for you, but it does tell you. When a
+formula order's run has been open longer than the order's `run_stale_after` (a
+Go duration, default `6h`), every orchestrator pass that looks (one every ten
+minutes) logs the run and who holds it, and closes nothing. It judges the whole
+run, root and open steps alike:
+
+| Verdict | Meaning |
+| --- | --- |
+| `held` | a session that is still running holds a claim on the run, or a configured named session does: a long run is not a dead one |
+| `unobservable` | a claim names an identity or session this city cannot prove is its own: on a rig whose store another city shares, that city's agents claim runs this city cannot see |
+| `holder-gone` | every claim names this city's own session or agent, and none of them is running |
+| `unclaimed` | nothing in the run is claimed: it is queued work waiting for an agent |
+
+`gc doctor` prints the same verdict for the run holding each stale order, so a
+stuck order is one command away from the bead to inspect. Closing the run, or
+leaving it, is your call (or a patrol agent's). Raise `run_stale_after` for an
+order whose runs legitimately take longer than the default:
+
+```toml
+[order]
+formula = "mol-digest-generate"
+trigger = "cooldown"
+interval = "24h"
+run_stale_after = "18h"
+```
 
 A third option exists for orders that consume **no bead work at all** — pure
 probes and sweeps that track nothing. `no_work_gate = true` skips the open-work

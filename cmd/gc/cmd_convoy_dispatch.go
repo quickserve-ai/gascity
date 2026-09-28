@@ -27,6 +27,7 @@ import (
 	"github.com/gastownhall/gascity/internal/graphroute"
 	"github.com/gastownhall/gascity/internal/graphv2"
 	"github.com/gastownhall/gascity/internal/orders"
+	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
 	"github.com/gastownhall/gascity/internal/storeref"
 	"github.com/spf13/cobra"
@@ -230,6 +231,16 @@ func runControlDispatcherWithStoreAndConfig(cityPath, storePath string, store be
 	if err != nil {
 		return err
 	}
+	// Refuse anything the control dispatcher cannot execute BEFORE
+	// ProcessControl, whose unsupported-kind refusal routes into the
+	// quarantine path and closes the bead hard-failed. A workflow root or an
+	// ordinary step reaching here is a caller error (ga-k74enr: a serve loop
+	// run inside a worker seat fed it that seat's own work), not a broken
+	// control bead, so it is left exactly as it was.
+	if kind := bead.Metadata[beadmeta.KindMetadataKey]; !beadmeta.IsControlKind(kind) {
+		workflowTracef("control-dispatch refuse bead=%s kind=%s reason=not_control_kind", beadID, kind)
+		return fmt.Errorf("%w: %s kind=%q", errNotControlBead, beadID, kind)
+	}
 
 	opts := dispatch.ProcessOptions{CityPath: cityPath, StorePath: storePath}
 	opts.Tracef = workflowTracef
@@ -360,6 +371,11 @@ func runControlDispatcherWithStoreAndConfig(cityPath, storePath string, store be
 	}
 	return nil
 }
+
+// errNotControlBead reports that a bead handed to the control dispatcher has a
+// gc.kind outside beadmeta.ControlKinds. The dispatcher returns it without
+// writing to the bead: it is never quarantined, and the serve loop skips it.
+var errNotControlBead = errors.New("not a control bead")
 
 // handleControlDispatchError resolves a failed ProcessControl call into the
 // error the dispatcher should return. It is the Tier-B semantic-refusal budget
@@ -1424,13 +1440,45 @@ func decorateDrainItemRecipe(recipe *formula.Recipe, source beads.Bead, store be
 	}
 	scopeKind := strings.TrimSpace(source.Metadata[beadmeta.ScopeKindMetadataKey])
 	scopeRef := strings.TrimSpace(source.Metadata[beadmeta.ScopeRefMetadataKey])
-	if binding, ok, err := graphroute.ResolveGraphDirectSessionBinding(store, cityName, cfg, routedTo, workflowExecutionRigContext(source), cliGraphrouteDeps(cityPath)); err != nil {
+	if binding, ok, err := resolveStoredGraphDirectSessionBinding(store, cityName, cityPath, cfg, routedTo, workflowExecutionRigContext(source)); err != nil {
 		return err
 	} else if ok {
 		defaultRoute := graphroute.GraphRouteBinding{DirectSessionID: binding.DirectSessionID, RigContext: binding.RigContext}
 		return graphroute.DecorateGraphWorkflowRecipeWithDefaultBinding(recipe, graphroute.GraphWorkflowRouteVars(recipe, vars), "", scopeKind, scopeRef, storeRef, defaultRoute, store, cityName, cfg, cliGraphrouteDeps(cityPath))
 	}
 	return applyGraphRouting(recipe, nil, routedTo, vars, scopeKind, scopeRef, storeRef, store, cityName, cityPath, cfg)
+}
+
+// resolveStoredGraphDirectSessionBinding re-resolves a workflow's STORED
+// route. gc sling stamps a city seat's bare identity ("barry") into routed_to,
+// and the dispatcher re-resolves it in the workflow's rig context, where the
+// same leaf also matches "<rig>/barry". When that comes back ambiguous and
+// the stored value is exactly a city seat's identity, the stored value can
+// only have meant that seat, so retry it rooted. Anything that resolves as
+// stored is untouched (ga-pml0rv).
+func resolveStoredGraphDirectSessionBinding(store beads.Store, cityName, cityPath string, cfg *config.City, routedTo, rigContext string) (graphroute.GraphRouteBinding, bool, error) {
+	deps := cliGraphrouteDeps(cityPath)
+	binding, ok, err := graphroute.ResolveGraphDirectSessionBinding(store, cityName, cfg, routedTo, rigContext, deps)
+	if errors.Is(err, session.ErrAmbiguous) && isCityNamedSessionIdentity(cfg, routedTo) {
+		return graphroute.ResolveGraphDirectSessionBinding(store, cityName, cfg, session.RootedNamedSessionIdentity(routedTo), rigContext, deps)
+	}
+	return binding, ok, err
+}
+
+// isCityNamedSessionIdentity reports whether identity is, verbatim, the
+// qualified identity of a city-scoped configured named session.
+func isCityNamedSessionIdentity(cfg *config.City, identity string) bool {
+	identity = strings.TrimSpace(identity)
+	if cfg == nil || identity == "" || strings.Contains(identity, "/") {
+		return false
+	}
+	for i := range cfg.NamedSessions {
+		ns := &cfg.NamedSessions[i]
+		if ns.Dir == "" && ns.QualifiedName() == identity {
+			return true
+		}
+	}
+	return false
 }
 
 func workflowExecutionRigContext(bead beads.Bead) string {
@@ -1466,7 +1514,7 @@ func graphFallbackBindingForBead(source beads.Bead, store beads.Store, cityName,
 		return graphRouteBinding{SessionName: source.Assignee}, nil
 	}
 	rigContext := workflowExecutionRigContext(source)
-	if binding, ok, err := graphroute.ResolveGraphDirectSessionBinding(store, cityName, cfg, routedTo, rigContext, cliGraphrouteDeps(cityPath)); err != nil {
+	if binding, ok, err := resolveStoredGraphDirectSessionBinding(store, cityName, cityPath, cfg, routedTo, rigContext); err != nil {
 		return graphRouteBinding{}, err
 	} else if ok {
 		return binding, nil

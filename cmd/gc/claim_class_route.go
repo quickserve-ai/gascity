@@ -357,6 +357,16 @@ func (r *hookClaimClassRoute) knownResident(id string) bool {
 // work-shaped id. The census is taken to retire exactly this read, and this seam
 // was paying it once per escalated bead while the by-id door had already stopped.
 func (r *hookClaimClassRoute) holds(id string) (bool, error) {
+	return r.holdsWithin(context.Background(), id)
+}
+
+// holdsWithin is holds with the binding probe bounded by ctx (qc-z0fmn0n
+// round 4): the probe takes no context of its own, and on the claim path it
+// runs inside the claim window. Only the probe runs under the deadline; the
+// memo is written here, on the caller's goroutine, so a probe abandoned at the
+// deadline never touches it. A probe cut off by ctx is a failed read, not
+// absence, and is not memoized.
+func (r *hookClaimClassRoute) holdsWithin(ctx context.Context, id string) (bool, error) {
 	id = strings.TrimSpace(id)
 	if r == nil || id == "" {
 		return false, nil
@@ -364,7 +374,10 @@ func (r *hookClaimClassRoute) holds(id string) (bool, error) {
 	if known, ok := r.resident[id]; ok {
 		return known, nil
 	}
-	_, resident, err := byIDBindingOwnerForTopology(r.topology, id)
+	resident, err := runWithDeadline(ctx, func() (bool, error) {
+		_, resident, err := byIDBindingOwnerForTopology(r.topology, id)
+		return resident, err
+	})
 	if err != nil {
 		return false, fmt.Errorf("reading %q from the relocated class binding: %w", id, err)
 	}
@@ -391,7 +404,7 @@ func (r *hookClaimClassRoute) routes(ctx context.Context, from hookStore, id, as
 	if r.anotherWorkLegHolds(ctx, from, id, assignee) {
 		return false, nil
 	}
-	return r.holds(id)
+	return r.holdsWithin(ctx, id)
 }
 
 // anotherWorkLegHolds reports whether some work leg OTHER than the one that
@@ -559,9 +572,15 @@ func classRoutedHookClaimOps(ops hookClaimOps, route *hookClaimClassRoute) hookC
 		}
 	}
 
+	// The binding's Get takes no context, and this seam is also the
+	// closed-root guard's root read, which runs inside the claim window; bound
+	// it by ctx like the teardown query below (qc-z0fmn0n round 4).
+	readRelocated := func(ctx context.Context, beadID string) (beads.Bead, error) {
+		return runWithDeadline(ctx, func() (beads.Bead, error) { return route.graph.Get(beadID) })
+	}
 	ops.ReadWorkMeta = func(ctx context.Context, dir string, env []string, beadID, assignee string) (beads.Bead, error) {
 		if route.knownResident(beadID) {
-			return route.graph.Get(beadID)
+			return readRelocated(ctx, beadID)
 		}
 		bead, err := base.ReadWorkMeta(ctx, dir, env, beadID, assignee)
 		routed, probeErr := route.routes(ctx, hookStore{dir: dir, env: env}, beadID, assignee, err)
@@ -569,10 +588,23 @@ func classRoutedHookClaimOps(ops hookClaimOps, route *hookClaimClassRoute) hookC
 		case probeErr != nil:
 			return beads.Bead{}, probeErr
 		case routed:
-			return route.graph.Get(beadID)
+			return readRelocated(ctx, beadID)
 		default:
 			return bead, err
 		}
+	}
+
+	// The closed-root guard's teardown tail lives with the root: a root the
+	// route already proved binding-resident has its subtree read there.
+	ops.TeardownTail = func(ctx context.Context, dir string, env []string, rootID, assignee string) (func(beads.Bead) bool, error) {
+		if route.knownResident(rootID) {
+			// The binding takes no context; bound the call anyway so a slow
+			// binding cannot hold the claim past its window.
+			return runWithDeadline(ctx, func() (func(beads.Bead) bool, error) {
+				return hookClaimTeardownTail(route.class, rootID)
+			})
+		}
+		return base.TeardownTail(ctx, dir, env, rootID, assignee)
 	}
 
 	// A continuation LIST is the one claim-time call with no not-found to
