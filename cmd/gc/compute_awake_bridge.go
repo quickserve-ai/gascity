@@ -249,6 +249,7 @@ func newAwakeInputFromSnapshotWithWorkSources(
 			blocked := wb.Status == "in_progress" && wb.IsBlocked != nil && *wb.IsBlocked
 			input.WorkBeads = append(input.WorkBeads, AwakeWorkBead{
 				ID: wb.ID, Assignee: a, Status: wb.Status, Ready: ready, Blocked: blocked,
+				ReleaseProposed: releaseProposalPending(wb),
 			})
 			workSources = append(workSources, i)
 		}
