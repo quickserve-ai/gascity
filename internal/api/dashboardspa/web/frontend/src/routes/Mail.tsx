@@ -595,6 +595,14 @@ export function MailPage() {
               />
             </Field>
           )}
+          {threadFor !== null && error && (
+            // Repeated inside the thread: the page-header copy sits behind this
+            // modal's overlay, and a reply answered 202 (delivery unconfirmed)
+            // must be seen here, or a second click sends a duplicate.
+            <p className="text-body text-accent" role="alert">
+              {error}
+            </p>
+          )}
         </div>
       </Modal>
 
