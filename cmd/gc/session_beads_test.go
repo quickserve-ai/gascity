@@ -1014,19 +1014,19 @@ func TestSyncSessionBeads_RetiresRemovedNamedSessionAndCreatesFreshOnReadd(t *te
 	if got := all[0].Metadata["session_name"]; got != "" {
 		t.Fatalf("session_name after removal = %q, want cleared", got)
 	}
-	for _, id := range []string{assignedOpen.ID, assignedInProgress.ID} {
-		got, err := store.Get(id)
+	// A removed named session's work is still a named agent's: it keeps its
+	// assignee and status and carries the release proposal for a judge, with no
+	// fallback route stamped (ga-9n8hjv, fence #1). It used to be unclaimed here.
+	for _, tc := range []struct {
+		id, status string
+	}{{assignedOpen.ID, "open"}, {assignedInProgress.ID, "in_progress"}} {
+		got, err := store.Get(tc.id)
 		if err != nil {
-			t.Fatalf("Get(%s): %v", id, err)
+			t.Fatalf("Get(%s): %v", tc.id, err)
 		}
-		if got.Assignee != "" {
-			t.Fatalf("work bead %s assignee = %q, want unclaimed after named session removal", id, got.Assignee)
-		}
-		if got.Metadata["gc.run_target"] != "myrig/witness" {
-			t.Fatalf("work bead %s gc.run_target = %q, want fallback route myrig/witness", id, got.Metadata["gc.run_target"])
-		}
-		if got.Metadata["gc.routed_to"] != "" {
-			t.Fatalf("work bead %s gc.routed_to = %q, want empty canonical route fallback", id, got.Metadata["gc.routed_to"])
+		assertProposedNotReleased(t, got, originalID, tc.status, "retired-session-unclaim", "removed named session work "+tc.id)
+		if got.Metadata["gc.run_target"] != "" {
+			t.Fatalf("work bead %s gc.run_target = %q, want untouched: a proposal re-routes nothing", tc.id, got.Metadata["gc.run_target"])
 		}
 	}
 	gotWait, err := store.Get(wait.ID)
@@ -1054,23 +1054,51 @@ func TestSyncSessionBeads_RetiresRemovedNamedSessionAndCreatesFreshOnReadd(t *te
 	clk.Advance(5 * time.Second)
 	syncSessionBeads("", store, ds, sp, allConfiguredDS(ds), cfgNamed, clk, &stderr, false)
 
+	// The archived bead still holds the removed seat's withheld work (ga-9n8hjv),
+	// so it is not closed on re-add; it stays open as archived history holding that
+	// work, and a FRESH canonical bead is minted beside it. Before ga-9n8hjv the
+	// work was released and the archived bead closed; with the work withheld, a
+	// refused close used to block the identity and the agent never came back.
 	all, err = store.ListByLabel(sessionBeadLabel, 0)
 	if err != nil {
 		t.Fatalf("listing beads after re-adopt: %v", err)
 	}
-	if len(all) != 1 {
-		t.Fatalf("expected only fresh open bead after re-add listing, got %d", len(all))
+	if len(all) != 2 {
+		t.Fatalf("open session beads after re-add = %d, want 2 (archived history holding withheld work + a fresh bead)", len(all))
 	}
-	fresh := all[0]
-	if fresh.ID == originalID {
-		t.Fatalf("fresh bead ID = %q, want a new bead after archived removal", fresh.ID)
+	var fresh beads.Bead
+	for _, b := range all {
+		if b.ID != originalID {
+			fresh = b
+		}
+	}
+	if fresh.ID == "" {
+		t.Fatalf("no fresh bead minted on re-add; open beads = %v", []string{all[0].ID, all[1].ID})
+	}
+	if got := fresh.Metadata["session_name"]; got != "myrig--witness" {
+		t.Fatalf("fresh bead session_name = %q, want myrig--witness", got)
+	}
+	if got := fresh.Metadata["state"]; got == "archived" {
+		t.Fatalf("fresh bead state = %q, want a live state", got)
 	}
 	historical, err := store.Get(originalID)
 	if err != nil {
 		t.Fatalf("Get(original archived bead): %v", err)
 	}
-	if historical.Status == "open" {
-		t.Fatalf("historical status = %q, want non-open", historical.Status)
+	if historical.Metadata["state"] != "archived" || historical.Metadata["continuity_eligible"] != "false" {
+		t.Fatalf("historical bead state/continuity = %q/%q, want archived/false", historical.Metadata["state"], historical.Metadata["continuity_eligible"])
+	}
+	if historical.Metadata["session_name"] != "" || historical.Metadata["alias"] != "" {
+		t.Fatalf("historical bead session_name/alias = %q/%q, want both cleared", historical.Metadata["session_name"], historical.Metadata["alias"])
+	}
+	for _, tc := range []struct {
+		id, status string
+	}{{assignedOpen.ID, "open"}, {assignedInProgress.ID, "in_progress"}} {
+		got, err := store.Get(tc.id)
+		if err != nil {
+			t.Fatalf("Get(%s) after re-add: %v", tc.id, err)
+		}
+		assertProposedNotReleased(t, got, originalID, tc.status, "retired-session-unclaim", "withheld work after re-add "+tc.id)
 	}
 	if got := fresh.Metadata[namedSessionMetadataKey]; got != "true" {
 		t.Fatalf("configured_named_session after re-adopt = %q, want true", got)
@@ -5293,7 +5321,11 @@ func TestCloseBeadReleasesWorkAssignedByBeadID(t *testing.T) {
 	}
 }
 
-func TestCloseBeadReleasesWorkAssignedByNamedIdentity(t *testing.T) {
+// TestCloseBeadProposesWorkAssignedBySuspendedNamedIdentity: a SUSPENDED named
+// agent's work used to be released on close, because its tier never claims. It
+// is still a named agent's work, so under fence #1 the close keeps assignee and
+// status and proposes the release for a judge (ga-9n8hjv).
+func TestCloseBeadProposesWorkAssignedBySuspendedNamedIdentity(t *testing.T) {
 	store := beads.NewMemStore()
 	now := time.Date(2026, 4, 18, 12, 0, 0, 0, time.UTC)
 
@@ -5332,12 +5364,7 @@ func TestCloseBeadReleasesWorkAssignedByNamedIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get work bead: %v", err)
 	}
-	if gotWork.Assignee != "" {
-		t.Errorf("work assignee = %q, want empty", gotWork.Assignee)
-	}
-	if gotWork.Status != "open" {
-		t.Errorf("work status = %q, want open", gotWork.Status)
-	}
+	assertProposedNotReleased(t, gotWork, "reviewer", "in_progress", "closing-session-release", "suspended named work")
 }
 
 // namedSessionTestCfg declares "reviewer" as a [[named_session]] whose backing agent
@@ -9305,7 +9332,12 @@ func TestCloseSessionBeadIfUnassignedRefusesWhenRigStoreWorkAssignedBySessionNam
 	}
 }
 
-func TestUnclaimWorkAssignedToRetiredSessionBeadClearsRigStoreSessionIdentifiers(t *testing.T) {
+// TestUnclaimWorkAssignedToRetiredSessionBeadProposesRigStoreNamedSessionWork: the
+// sweep reaches the RIG store leg for every identifier the session carries. The
+// session is a named one (configured_named_identity), so what it finds there is a
+// named agent's work and is proposed, not released (ga-9n8hjv); the proposals
+// landing in the rig store are the proof that the leg was swept.
+func TestUnclaimWorkAssignedToRetiredSessionBeadProposesRigStoreNamedSessionWork(t *testing.T) {
 	store := beads.NewMemStore()
 	rigStore := beads.NewMemStore()
 
@@ -9358,28 +9390,15 @@ func TestUnclaimWorkAssignedToRetiredSessionBeadClearsRigStoreSessionIdentifiers
 	if err != nil {
 		t.Fatalf("get session-name work: %v", err)
 	}
-	if gotBySessionName.Assignee != "" {
-		t.Fatalf("session-name assignee = %q, want empty", gotBySessionName.Assignee)
-	}
-	if gotBySessionName.Status != "open" {
-		t.Fatalf("session-name status = %q, want open", gotBySessionName.Status)
-	}
+	assertProposedNotReleased(t, gotBySessionName, "worker-1", "open", "retired-session-unclaim", "session-name work")
 
 	gotByIdentity, err := rigStore.Get(byIdentity.ID)
 	if err != nil {
 		t.Fatalf("get named-identity work: %v", err)
 	}
-	if gotByIdentity.Assignee != "" {
-		t.Fatalf("named-identity assignee = %q, want empty", gotByIdentity.Assignee)
-	}
-	if gotByIdentity.Status != "open" {
-		t.Fatalf("named-identity status = %q, want open after unclaim", gotByIdentity.Status)
-	}
-	if gotByIdentity.Metadata["gc.run_target"] != "frontend/codex-max" {
-		t.Fatalf("named-identity gc.run_target = %q, want frontend/codex-max", gotByIdentity.Metadata["gc.run_target"])
-	}
-	if gotByIdentity.Metadata["gc.routed_to"] != "" {
-		t.Fatalf("named-identity gc.routed_to = %q, want empty canonical route fallback", gotByIdentity.Metadata["gc.routed_to"])
+	assertProposedNotReleased(t, gotByIdentity, "frontend/worker", "in_progress", "retired-session-unclaim", "named-identity work")
+	if gotByIdentity.Metadata["gc.run_target"] != "" {
+		t.Fatalf("named-identity gc.run_target = %q, want untouched: a proposal re-routes nothing", gotByIdentity.Metadata["gc.run_target"])
 	}
 }
 
@@ -9451,8 +9470,11 @@ func TestReassignWorkAssignedToRetiredSessionBeadReassignsRigStoreSessionIdentif
 	if err != nil {
 		t.Fatalf("get named-identity work: %v", err)
 	}
-	if gotByIdentity.Assignee != successor.ID {
-		t.Fatalf("named-identity assignee = %q, want %q", gotByIdentity.Assignee, successor.ID)
+	// Work on the named DURABLE identity stays on it: the successor serves that
+	// identity, and re-homing it onto a session bead ID would make it releasable by
+	// the successor's next close (ga-9n8hjv).
+	if gotByIdentity.Assignee != "frontend/worker" {
+		t.Fatalf("named-identity assignee = %q, want %q left in place", gotByIdentity.Assignee, "frontend/worker")
 	}
 }
 

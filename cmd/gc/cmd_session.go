@@ -1899,8 +1899,18 @@ func cfgErrOrUnknown(err error) string {
 // to consult and therefore protects nothing. Passing the full bead with a nil
 // cfg would release the name-shaped identifiers too — that is the ga-9n8hjv
 // portfolio-stripping bug itself.
+//
+// It keeps ONE fact beyond the ID: whether the session was a named session. That
+// flag is not an assignee identifier (sessionAssignmentIdentifiers never reads
+// it), so it widens nothing that is listed; it lets the named-release guard see
+// that work bound to this bead ID is still a named agent's, and propose its
+// release rather than make it (ga-9n8hjv, fence #1).
 func sessionBeadIDOnlyIdentity(b beads.Bead) beads.Bead {
-	return beads.Bead{ID: b.ID}
+	out := beads.Bead{ID: b.ID}
+	if isNamedSessionBead(b) || namedSessionIdentity(b) != "" {
+		out.Metadata = map[string]string{"configured_named_session": "true"}
+	}
+	return out
 }
 
 // cmdSessionClose is the CLI entry point for "gc session close".
@@ -2095,12 +2105,19 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 	// deliberately not attempted here, because getting it wrong re-opens the
 	// portfolio-stripping bug this function exists to prevent.
 	if cfg == nil {
+		idOnly := sessionBeadIDOnlyIdentity(closedSessionBead)
+		// A named session's handle-held work is proposed, not released, so say so:
+		// the operator must not read "releasing" when assignee and status stay.
+		boundAction := "releasing only work bound to session bead %s"
+		if isNamedSessionBead(idOnly) {
+			boundAction = "proposing (not making) the release of work bound to named session bead %s"
+		}
 		fmt.Fprintf(stderr, "gc session close: city config unavailable (%s); "+ //nolint:errcheck // best-effort stderr
-			"releasing only work bound to session bead %s, and withholding work held "+
+			boundAction+", and withholding work held "+
 			"under a name — a configured named identity cannot be distinguished from a "+
 			"retired one without the config. Re-run once the config loads.\n",
 			cfgErrOrUnknown(cfgErr), closedSessionBead.ID)
-		unclaimWorkAssignedToRetiredSessionBead(cityPath, nil, store, rigStores, sessionBeadIDOnlyIdentity(closedSessionBead), "", stderr)
+		unclaimWorkAssignedToRetiredSessionBead(cityPath, nil, store, rigStores, idOnly, "", stderr)
 	} else {
 		unclaimWorkAssignedToRetiredSessionBead(cityPath, cfg, store, rigStores, closedSessionBead, "", stderr)
 	}

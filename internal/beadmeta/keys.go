@@ -512,6 +512,10 @@ const OptionMetadataPrefix = "opt_"
 var KnownMetadataKeys = []string{
 	ReleaseDeferredMetadataKey,
 	ReleaseDeferredAckMetadataKey,
+	ReleaseProposedAtMetadataKey,
+	ReleaseProposedAssigneeMetadataKey,
+	ReleaseProposedPathMetadataKey,
+	ReleaseProposedReasonMetadataKey,
 	AttemptLogMetadataKey,
 	AttemptMetadataKey,
 	BondMetadataKey,
