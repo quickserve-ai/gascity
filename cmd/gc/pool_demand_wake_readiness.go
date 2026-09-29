@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 )
@@ -136,6 +137,16 @@ func (r *poolWakeReadiness) vetoesWakeCandidate(b beads.Bead, agentCfg *config.A
 	}
 	if beads.IsReadyExcludedBead(b) {
 		return false
+	}
+	// Ready() includes held rows: the assigned-ready serve tier skips them.
+	// A live claimant was handled above; only an orphaned held row must not
+	// mint a fresh seat that cannot claim it.
+	for _, label := range b.Labels {
+		for _, hold := range beadmeta.DispatchHoldLabels {
+			if label == hold {
+				return true
+			}
+		}
 	}
 	return !r.servesWakeCandidate(storeRef, b.ID)
 }
