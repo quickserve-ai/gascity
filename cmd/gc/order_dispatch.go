@@ -242,8 +242,24 @@ func cancelShellExecProcessGroup(cmd *exec.Cmd, pgid int) error {
 	return processgroup.TerminateCommand(cmd, pgid, shellExecSignalGrace, processgroup.Options{})
 }
 
+// orderExecUninheritedKeys never pass from the dispatcher's own environment to
+// an order: a seat's identity is not the order's (ga-s04g7q), and a parent
+// order's identity is not a nested run's. An order may still set any of them
+// itself; the GC_ORDER_* keys are reserved and set by orderExecEnvForRun.
+var orderExecUninheritedKeys = []string{
+	"GC_AGENT",
+	"GC_ALIAS",
+	"GC_SESSION_ID",
+	orders.ExecOrderNameEnv,
+	orders.ExecOrderRunEnv,
+	orders.ExecOrderScopeEnv,
+}
+
 func mergeOrderExecEnv(environ, env []string) []string {
 	out := mergeRuntimeEnv(environ, nil)
+	for _, key := range orderExecUninheritedKeys {
+		out = removeEnvKey(out, key)
+	}
 	for _, entry := range env {
 		key, _, ok := strings.Cut(entry, "=")
 		if ok {
@@ -1919,7 +1935,7 @@ func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, front *orders.
 		}
 	}
 
-	env, err := orderExecEnvWithError(cityPath, m.cfg, target, a, vars)
+	env, err := orderExecEnvForRun(cityPath, m.cfg, target, a, vars, trackingID)
 	var output []byte
 	var execErrMsg string
 	// declared is the outcome file of a run that exited 0; its skipped/partial

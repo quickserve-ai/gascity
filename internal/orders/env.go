@@ -2,6 +2,23 @@ package orders
 
 import "fmt"
 
+// Exec orders learn which order and which run they are through these env
+// vars. The controller sets them after [order.env] and dispatch-time vars, so
+// an order cannot claim another order's identity.
+const (
+	ExecOrderScopeEnv = "GC_ORDER_SCOPE" // the order's rig, or "city"
+	ExecOrderNameEnv  = "GC_ORDER_NAME"  // the order's name
+	ExecOrderRunEnv   = "GC_ORDER_RUN"   // the run's tracking bead id; unset when untracked
+)
+
+// ExecOrderScope is the GC_ORDER_SCOPE value for a: its rig, or "city".
+func ExecOrderScope(a Order) string {
+	if a.Rig != "" {
+		return a.Rig
+	}
+	return "city"
+}
+
 // ValidateExecEnvOverrides rejects [order.env] keys owned by the controller.
 func ValidateExecEnvOverrides(a Order) error {
 	for key := range a.Env {
@@ -54,6 +71,9 @@ func IsReservedExecEnvKey(key string) bool {
 		"GC_DOLT_STATE_FILE",
 		"GC_DOLT_USER",
 		ExecOutcomeFileEnv,
+		ExecOrderNameEnv,
+		ExecOrderRunEnv,
+		ExecOrderScopeEnv,
 		"GC_PACK_DIR",
 		"GC_PACK_NAME",
 		"GC_PACK_STATE_DIR",

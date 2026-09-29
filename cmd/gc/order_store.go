@@ -243,6 +243,31 @@ func orderExecEnvWithError(cityPath string, cfg *config.City, target execStoreTa
 	return mergeRuntimeEnv(nil, env), nil
 }
 
+// orderExecEnvForRun is orderExecEnvWithError plus the order's own identity
+// (GC_ORDER_SCOPE, GC_ORDER_NAME, GC_ORDER_RUN), laid over last so neither
+// [order.env] nor dispatch-time vars can replace it. runID is the run's
+// tracking bead; "" leaves GC_ORDER_RUN unset.
+func orderExecEnvForRun(cityPath string, cfg *config.City, target execStoreTarget, a orders.Order, vars map[string]string, runID string) ([]string, error) {
+	env, err := orderExecEnvWithError(cityPath, cfg, target, a, vars)
+	if err != nil {
+		return nil, err
+	}
+	identity := map[string]string{
+		orders.ExecOrderScopeEnv: orders.ExecOrderScope(a),
+		orders.ExecOrderNameEnv:  a.Name,
+	}
+	if runID != "" {
+		identity[orders.ExecOrderRunEnv] = runID
+	}
+	for _, key := range []string{orders.ExecOrderScopeEnv, orders.ExecOrderNameEnv, orders.ExecOrderRunEnv} {
+		env = removeEnvKey(env, key)
+		if v, ok := identity[key]; ok {
+			env = append(env, key+"="+v)
+		}
+	}
+	return env, nil
+}
+
 func validateOrderExecEnvOverrides(a orders.Order) error {
 	return orders.ValidateExecEnvOverrides(a)
 }
