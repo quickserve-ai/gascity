@@ -3604,21 +3604,24 @@ func (t *Tmux) DismissModelSwitchModalIfPresent(session string) {
 				// ga-ubfc7j: re-read before EVERY key (Down, then Enter after
 				// a settle): a question or approval that replaced the modal
 				// in between must not get the Enter.
-				if err := t.humanPromptGuard(session, target, nudgeGuardStageBeforeType, true); err != nil {
-					if reason, deferred := NudgeDeferredReason(err); !deferred || reason != NudgeDeferReasonSelectionPrompt {
-						return err
+				// One capture decides both questions, so nothing can appear
+				// between the classification and the modal check (Astra
+				// round 5). The modal itself reads as a selection list; that
+				// is the one reading that may pass, and only while the modal
+				// is the live block of that same capture.
+				fresh, err := t.CapturePaneLines(target, promptObservationLines)
+				if err != nil {
+					return err
+				}
+				switch reason := t.classifyPaneLines(session, target, fresh, true); reason {
+				case "":
+				case NudgeDeferReasonSelectionPrompt:
+					ci, _ := lastComposerLine(fresh, t.resolveIdlePromptPrefix(session))
+					if !runtime.ContainsModelSwitchModal(strings.Join(fresh[ci+1:], "\n")) {
+						return &NudgeDeferredError{Session: session, Reason: reason, Stage: nudgeGuardStageBeforeType}
 					}
-					// The modal itself is a selection list; that is the one
-					// reading that may pass, and only while it is still live.
-					fresh, cerr := t.CapturePane(target, promptObservationLines)
-					if cerr != nil {
-						return cerr
-					}
-					fl := strings.Split(fresh, "\n")
-					ci, _ := lastComposerLine(fl, t.resolveIdlePromptPrefix(session))
-					if !runtime.ContainsModelSwitchModal(strings.Join(fl[ci+1:], "\n")) {
-						return err
-					}
+				default:
+					return &NudgeDeferredError{Session: session, Reason: reason, Stage: nudgeGuardStageBeforeType}
 				}
 				if _, err := t.run("send-keys", "-t", paneTarget(target), k); err != nil {
 					return err
