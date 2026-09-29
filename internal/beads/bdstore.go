@@ -3145,12 +3145,15 @@ func (s *BdStore) getEphemeralByID(id string) ([]Bead, error) {
 	out, err := s.runBDTransientRead(args...)
 	if err != nil {
 		if isBdQueryUnsupported(err) {
-			// A bd without "query" cannot answer the wisp question at all. This
-			// used to return (nil, nil), which the caller read as an empty —
-			// i.e. authoritative — result set, turning "I never looked" into
-			// "it is not there". Report it as an error so Get can classify the
-			// lookup as indeterminate (ga-0ejdbv). Get is the only caller.
-			return nil, fmt.Errorf("bd query (wisp by id): unsupported by this bd: %w", err)
+			// A bd with no "query" subcommand has no wisp tier to consult, so
+			// the lookup is COMPLETE with no row — upstream's contract, and the
+			// one the claim-time class route relies on: its other-work-leg probe
+			// (claim_class_route.go anotherWorkLegHolds) opens the binding
+			// escalation only on errors.Is(ErrNotFound), and a capability fact
+			// reported as a failed read closes it for every relocated step
+			// (the I15 re-serve/re-skip treadmill). Only a lookup that could
+			// not finish — a timeout, a refused connection — is indeterminate.
+			return nil, nil
 		}
 		return nil, fmt.Errorf("bd query (wisp by id): %w", err)
 	}
