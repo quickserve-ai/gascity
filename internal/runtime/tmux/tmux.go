@@ -2874,17 +2874,29 @@ func (t *Tmux) nudgeSession(
 	// peek, so a mid-turn session costs one capture-pane and no delay. This
 	// step is best-effort and never aborts the nudge on a peek/dismiss error
 	// (see dismissMidSessionDialogBeforeNudge).
-	if t.dismissMidSessionDialogBeforeNudge(target) {
-		// Give the TUI a beat to retire the dialog before pasting, so the
-		// message lands at the prompt rather than in a closing overlay.
-		time.Sleep(midSessionDialogSettleDelay)
-		// A dismissal key went out, so the screen changed: read it again
-		// before any further key (the C-u below is sent raw). A dialog that
-		// has not retired, or a prompt it uncovered, defers the nudge and
-		// keeps it queued (ga-ubfc7j).
-		if err := t.humanPromptGuard(session, target, nudgeGuardStageBeforeType, true); err != nil {
-			return err
+	//
+	// ga-ubfc7j: the dismissal sends raw keys, so it runs only on a DETACHED
+	// session, where no person can be mid-draft (the same rule as the C-u
+	// clear below). On an attached one a machine dialog defers the nudge.
+	// Whenever the dismissal did not come back clean -- a key went out, it
+	// refused a screen, or it could not read one -- the guard runs again
+	// before the next raw key.
+	if t.sessionClientCount(session) == 0 {
+		keyed, recheck := t.dismissMidSessionDialogs(target)
+		if keyed {
+			// Give the TUI a beat to retire the dialog before pasting, so the
+			// message lands at the prompt rather than in a closing overlay.
+			time.Sleep(midSessionDialogSettleDelay)
 		}
+		if recheck {
+			if err := t.humanPromptGuard(session, target, nudgeGuardStageBeforeType, true); err != nil {
+				return err
+			}
+		}
+	} else if content, err := t.CaptureVisiblePane(target); err != nil {
+		return &NudgeDeferredError{Session: session, Reason: NudgeDeferReasonCaptureFailed, Stage: nudgeGuardStageBeforeType, Err: err}
+	} else if runtime.MidSessionDialogOnScreen(content) != "" {
+		return &NudgeDeferredError{Session: session, Reason: NudgeDeferReasonMachineDialogAttached, Stage: nudgeGuardStageBeforeType}
 	}
 
 	// 1. Clear any pending input already sitting on the line before pasting,
@@ -3265,30 +3277,42 @@ const midSessionDialogSettleDelay = 500 * time.Millisecond
 // delivered. Mirrors DismissModelSwitchModalIfPresent, which swallows the
 // identical errors.
 func (t *Tmux) dismissMidSessionDialogBeforeNudge(target string) bool {
-	// ga-ubfc7j: the dismissal keys go out as raw send-keys, outside the
-	// guarded senders. So the screen is read before EVERY key: it must still
-	// show the machine dialog first peeked and nothing the human-prompt
-	// classifier refuses. A multi-key dismissal (the feedback survey's "0",
-	// then Enter after a settle delay) stops the moment the screen changes, so
-	// a later key never lands on a question, an approval or a draft that the
-	// earlier key uncovered. It also returns true once ANY key has gone out,
-	// so the caller re-reads the screen before its own next key.
-	machineOnly := func(content string) string {
+	keyed, _ := t.dismissMidSessionDialogs(target)
+	return keyed
+}
+
+// dismissMidSessionDialogs is dismissMidSessionDialogBeforeNudge's body. keyed
+// reports that at least one dismissal key went out. recheck reports that the
+// screen must be read again before the caller's next key: a key went out, or
+// the dismissal refused a screen, or could not read one (ga-ubfc7j).
+//
+// The dismissal keys go out as raw send-keys, outside the guarded senders, so
+// the screen is read before EVERY key: it must still show the machine dialog
+// first peeked and nothing the human-prompt classifier refuses. A multi-key
+// dismissal (the feedback survey's "0", then Enter after a settle delay)
+// stops the moment the screen changes. Callers run it on a detached session
+// only, where no person can be typing a draft.
+func (t *Tmux) dismissMidSessionDialogs(target string) (keyed, recheck bool) {
+	// refused: the screen shows something the human-prompt classifier flags.
+	machineOnly := func(content string) (name string, refused bool) {
 		if classifyHumanPrompt(strings.Split(content, "\n"), DefaultReadyPromptPrefix, false) != "" {
-			return ""
+			return "", true
 		}
-		return runtime.MidSessionDialogOnScreen(content)
+		return runtime.MidSessionDialogOnScreen(content), false
 	}
 	var expected string
-	sent := false
-	dismissed, err := runtime.DismissMidSessionDialogs(
+	_, err := runtime.DismissMidSessionDialogs(
 		context.Background(),
 		func() (string, error) {
 			content, err := t.CaptureVisiblePane(target)
 			if err != nil {
 				return "", err
 			}
-			if expected = machineOnly(content); expected == "" {
+			name, refused := machineOnly(content)
+			if refused {
+				recheck = true
+			}
+			if expected = name; expected == "" {
 				return "", nil
 			}
 			return content, nil
@@ -3299,21 +3323,21 @@ func (t *Tmux) dismissMidSessionDialogBeforeNudge(target string) bool {
 				if err != nil {
 					return err
 				}
-				if machineOnly(content) != expected {
+				if name, refused := machineOnly(content); refused || name != expected {
 					return errDismissalScreenChanged
 				}
 				if _, err := t.run("send-keys", "-t", target, k); err != nil {
 					return err
 				}
-				sent = true
+				keyed = true
 			}
 			return nil
 		},
 	)
-	if err != nil {
-		return sent
+	if err != nil || keyed {
+		recheck = true
 	}
-	return dismissed || sent
+	return keyed, recheck
 }
 
 // DismissModelSwitchModalIfPresent clears a mid-session Codex/GPT model-switch
