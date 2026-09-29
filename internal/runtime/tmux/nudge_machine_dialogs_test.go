@@ -150,6 +150,7 @@ type paneAfterCapturesExecutor struct {
 	after    string
 	n        int
 	captures int
+	attached string // "#{session_attached}" answer; "" means "0"
 }
 
 func (p *paneAfterCapturesExecutor) execute(args []string) (string, error) {
@@ -164,6 +165,9 @@ func (p *paneAfterCapturesExecutor) execute(args []string) (string, error) {
 		return p.after, nil
 	}
 	if slices.Contains(args, "#{session_attached}") {
+		if p.attached != "" {
+			return p.attached, nil
+		}
 		return "0", nil
 	}
 	return "", nil
@@ -220,5 +224,52 @@ func TestNudgeSessionDefersOnAMachineDialogWhenAttached(t *testing.T) {
 	}
 	if keys := sentKeys(ex.calls); len(keys) != 0 {
 		t.Fatalf("sent keys on an attached session holding a machine dialog: %v", keys)
+	}
+}
+
+// Astra round 3: the submit guard runs before EVERY key of a multi-key submit
+// sequence. A question that appears inside the settle between Escape and
+// Enter gets neither the Enter nor any later key.
+func TestSendNudgeSubmitSequenceGuardsEveryKey(t *testing.T) {
+	ex := &paneAfterFirstKeyExecutor{before: idleComposerFixture, after: questionDialogFixture, attached: "0"}
+	tm := &Tmux{cfg: DefaultConfig(), exec: ex}
+
+	err := tm.sendNudgeSubmitSequence("agent-pane", []string{"Escape", "Enter"})
+	if reason, deferred := NudgeDeferredReason(err); !deferred || reason != NudgeDeferReasonQuestionDialog {
+		t.Fatalf("sendNudgeSubmitSequence = %v, want a %s deferral before the second key", err, NudgeDeferReasonQuestionDialog)
+	}
+	keys := sentKeys(ex.calls)
+	if len(keys) != 1 || !slices.Contains(keys[0], "Escape") {
+		t.Fatalf("keys sent = %v, want only the first key (Escape)", keys)
+	}
+}
+
+// Astra round 3: on an attached session the fresh visible read that looks
+// for a machine dialog also honours a prompt meant for a person that appeared
+// after the guard's read.
+func TestNudgeSessionDefersOnAQuestionSeenByTheAttachedCheck(t *testing.T) {
+	ex := &paneAfterCapturesExecutor{before: idleComposerFixture, after: questionDialogFixture, n: 1, attached: "1"}
+	tm := &Tmux{cfg: DefaultConfig(), exec: ex}
+
+	err := tm.NudgeSession("agent-pane", "hello world")
+	if reason, deferred := NudgeDeferredReason(err); !deferred || reason != NudgeDeferReasonQuestionDialog {
+		t.Fatalf("NudgeSession = %v, want a %s deferral", err, NudgeDeferReasonQuestionDialog)
+	}
+	if keys := sentKeys(ex.calls); len(keys) != 0 {
+		t.Fatalf("sent keys after the attached check saw a question: %v", keys)
+	}
+}
+
+// Astra round 3: the post-turn survey dismisser matches from scrollback. An
+// old survey above a live question must get no "0" and no Enter: the full
+// guard runs before each of its keys.
+func TestFeedbackSurveyDismisserSendsNoKeysOverALiveQuestion(t *testing.T) {
+	pane := feedbackSurveySessionFixture + "\n" + questionDialogFixture
+	ex := &paneAfterFirstKeyExecutor{before: pane, after: pane, attached: "0"}
+	tm := &Tmux{cfg: DefaultConfig(), exec: ex}
+
+	tm.DismissFeedbackSurveyModalIfPresent("agent-pane")
+	if keys := sentKeys(ex.calls); len(keys) != 0 {
+		t.Fatalf("sent survey keys over a live question: %v", keys)
 	}
 }
