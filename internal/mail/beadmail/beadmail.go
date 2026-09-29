@@ -159,6 +159,15 @@ func (p *Provider) Send(from, to, subject, body string) (mail.Message, error) {
 	return p.sendWithExtraMetadata(from, to, subject, body, nil)
 }
 
+// SendWithMetadata implements [mail.MetadataSender]: Send, with metadata
+// stamped on the message bead when it is created.
+func (p *Provider) SendWithMetadata(from, to, subject, body string, metadata map[string]string) (mail.Message, error) {
+	if to == "" {
+		return mail.Message{}, fmt.Errorf("beadmail send: recipient is required")
+	}
+	return p.sendWithExtraMetadata(from, to, subject, body, metadata)
+}
+
 // sendWithExtraMetadata is the shared body of Send and SendDeduped: resolve
 // the sender route, derive title and thread label, merge extra metadata (the
 // dedup key), and create the message bead.
@@ -210,6 +219,13 @@ func (p *Provider) sendWithExtraMetadata(from, to, subject, body string, extra m
 // matches: the dedup horizon is the previous message's live lifetime by design
 // (see [mail.DedupSender]).
 func (p *Provider) SendDeduped(from, to, subject, body, key string) (mail.Message, bool, error) {
+	return p.SendDedupedWithMetadata(from, to, subject, body, key, nil)
+}
+
+// SendDedupedWithMetadata implements [mail.MetadataSender]: SendDeduped, with
+// metadata stamped on a newly created message. A suppressed send creates
+// nothing and stamps nothing.
+func (p *Provider) SendDedupedWithMetadata(from, to, subject, body, key string, metadata map[string]string) (mail.Message, bool, error) {
 	key = strings.TrimSpace(key)
 	if key == "" {
 		return mail.Message{}, false, fmt.Errorf("beadmail send: dedup key is required")
@@ -233,7 +249,12 @@ func (p *Provider) SendDeduped(from, to, subject, body, key string) (mail.Messag
 			return beadToMessage(b), true, nil
 		}
 	}
-	msg, err := p.sendWithExtraMetadata(from, to, subject, body, map[string]string{mail.DedupKeyMetadataKey: key})
+	extra := make(map[string]string, len(metadata)+1)
+	for k, v := range metadata {
+		extra[k] = v
+	}
+	extra[mail.DedupKeyMetadataKey] = key
+	msg, err := p.sendWithExtraMetadata(from, to, subject, body, extra)
 	if err != nil {
 		return mail.Message{}, false, err
 	}
@@ -793,6 +814,9 @@ func (p *Provider) Reply(id, from, subject, body string) (mail.Message, error) {
 	}
 	if to == "" {
 		return mail.Message{}, fmt.Errorf("beadmail reply: original message %s has no sender to reply to", id)
+	}
+	if mail.IsOrderSender(to) {
+		return mail.Message{}, fmt.Errorf("beadmail reply: message %s was sent by %s, an order, which has no mailbox; mail the order's owning seat or the mayor instead", id, to)
 	}
 	toDisplay := strings.TrimSpace(original.Metadata[fromDisplayMetadataKey])
 	if toDisplay == "" {

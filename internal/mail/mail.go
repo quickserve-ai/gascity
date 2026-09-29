@@ -6,6 +6,7 @@ package mail //nolint:revive // internal package, always imported qualified
 
 import (
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -57,7 +58,27 @@ const (
 	// sent through [DedupSender.SendDeduped]. Repeating notifiers (patrol
 	// orders, maintenance loops) use it to suppress duplicate alerts.
 	DedupKeyMetadataKey = "mail.dedup_key"
+	// FromOrderRunMetadataKey stores the tracking bead of the order run that
+	// sent the message, so a reader can go from a mail to the run.
+	FromOrderRunMetadataKey = "mail.from_order_run"
+	// OrderSenderPrefix begins the sender of mail an order sends:
+	// order:<scope>/<name>. An order has no mailbox, so nothing is delivered
+	// to such an address.
+	OrderSenderPrefix = "order:"
 )
+
+// IsOrderSender reports whether addr is an order's sender address.
+func IsOrderSender(addr string) bool {
+	return strings.HasPrefix(strings.TrimSpace(addr), OrderSenderPrefix)
+}
+
+// MetadataSender is an optional [Provider] capability: send with extra
+// metadata stamped on the message in the same write that creates it. The
+// extra keys must not collide with the provider's own routing keys.
+type MetadataSender interface {
+	SendWithMetadata(from, to, subject, body string, metadata map[string]string) (Message, error)
+	SendDedupedWithMetadata(from, to, subject, body, key string, metadata map[string]string) (msg Message, suppressed bool, err error)
+}
 
 // Message represents a mail message between agents or humans.
 type Message struct {
