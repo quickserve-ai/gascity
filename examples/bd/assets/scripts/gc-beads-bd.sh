@@ -4254,7 +4254,7 @@ op_init() {
         bd_init_reinit="--reinit-local"
     fi
 
-    # The classification above (whichever branch set bd_init_force) can go
+    # The classification above (whichever branch set bd_init_reinit) can go
     # stale before the force actually runs: ensure_database_registered,
     # ensure_current_era_scope_metadata and the interrupted-bootstrap heal
     # all do real work in the gap between that decision and here, during
@@ -4262,7 +4262,7 @@ op_init() {
     # advancing its cursor. Revalidate immediately before forcing rather than
     # acting on a read that is now however-old -- this is the same probe the
     # classification above used, just re-run at the moment it actually matters.
-    if [ -n "$bd_init_force" ]; then
+    if [ -n "$bd_init_reinit" ]; then
         # Revalidating alone is not enough when the concurrent initializer
         # is a SEPARATE OS process (e.g. a second city/worktree pointed at
         # this same dolt_database): two processes can each revalidate
