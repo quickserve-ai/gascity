@@ -3736,7 +3736,7 @@ op_init() {
         seed_fresh_managed_bd_version_witness "$dir"
     fi
 
-    # The classification above (whichever branch set bd_init_force) can go
+    # The classification above (whichever branch set bd_init_reinit) can go
     # stale before the force actually runs: ensure_database_registered and
     # seed_fresh_managed_bd_version_witness both do real work in the gap
     # between that decision and here, during which a concurrent initializer
@@ -3744,7 +3744,7 @@ op_init() {
     # immediately before forcing rather than acting on a read that is now
     # however-old -- this is the same probe the classification above used,
     # just re-run at the moment it actually matters.
-    if [ -n "$bd_init_force" ]; then
+    if [ -n "$bd_init_reinit" ]; then
         # Revalidating alone is not enough when the concurrent initializer
         # is a SEPARATE OS process (e.g. a second city/worktree pointed at
         # this same dolt_database): two processes can each revalidate
@@ -3816,14 +3816,14 @@ op_init() {
         run_bd_init_pinned "$dir" "$prefix" "$dolt_database" "$host" "${bd_init_reinit:+true}" "$database_created_by_gc"
     fi
 
-    # Release the init lock (acquired above only when bd_init_force was
+    # Release the init lock (acquired above only when bd_init_reinit was
     # set) promptly rather than holding it through the post-init
     # verification below: once run_bd_init_pinned has returned, the
     # database's schema is now genuinely present, so whichever process is
     # next in line for this lock will see that in its own revalidation and
     # correctly refuse to force again — it does not also need to wait out
     # this process's own settle/verification below.
-    if [ -n "$bd_init_force" ]; then
+    if [ -n "$bd_init_reinit" ]; then
         exec 8>&-
     fi
 

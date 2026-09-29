@@ -21,7 +21,16 @@ max_modules="${GC_NATIVE_DEP_MAX_MODULES:-737}"
 # grows the binary ~90KB/day, so 180,000,000 gives ~88 days of headroom.
 # Re-baseline with fresh measurement + growth-rate evidence, not an
 # arbitrary bump, when this next fails.
-max_binary_bytes="${GC_NATIVE_DEP_MAX_BINARY_BYTES:-180000000}"
+# CARRY re-baseline 2026-09-29 (gc-8edh, fork re-sync #4), with measurement:
+# upstream 458de7a81 alone builds to 178,137,611 bytes with this exact recipe
+# (98.97% of the 180,000,000 cap, 1,862,389 bytes of headroom), having grown
+# ~195KB/day since the 08-29 baseline, not ~90KB/day; the fork's carried
+# first-party code adds a steady ~2.69MB (no carry-added dependencies:
+# 1100 -> 1104 packages, all internal/*; the beads replace links ~8KB
+# differently), so the fork's binary is 180,831,686 and a carry of this size
+# trips the cap. 200,000,000 gives the fork ~89 days at the measured rate.
+# Carry-only: drops when upstream re-baselines past the fork's measured size.
+max_binary_bytes="${GC_NATIVE_DEP_MAX_BINARY_BYTES:-200000000}"
 max_aws_modules="${GC_NATIVE_DEP_MAX_AWS_MODULES:-25}"
 max_azure_modules="${GC_NATIVE_DEP_MAX_AZURE_MODULES:-9}"
 max_dolthub_modules="${GC_NATIVE_DEP_MAX_DOLTHUB_MODULES:-15}"
