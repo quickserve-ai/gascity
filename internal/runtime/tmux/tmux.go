@@ -2377,6 +2377,14 @@ func (t *Tmux) sendStartupKeysLiteralWithRetry(target, text, provider string, ti
 			// Only the first chunk's retries check for a draft: after it, the
 			// composer holds our own earlier chunks.
 			checkDraft := chunkIndex == 0
+			// A later chunk follows an inter-chunk pause, in which a dialog
+			// can rise: check for one before its first attempt too
+			// (ga-ubfc7j). Its retries are covered by guardRetries.
+			if chunkIndex > 0 {
+				if err := t.humanPromptGuard(target, target, nudgeGuardStageBeforeType, false); err != nil {
+					return err
+				}
+			}
 			chunkIndex++
 			return t.sendTextWithRetry(target, chunk, remaining, t.guardRetries(target, checkDraft, t.pasteLiteralText))
 		}, func() {
@@ -2952,6 +2960,11 @@ func (t *Tmux) nudgeSession(
 	// must not synthesize it for them.
 	if shouldSendEscape(target) {
 		// See: https://github.com/anthropics/gastown/issues/307
+		// ga-ubfc7j: an Escape would cancel a dialog raised during the paste
+		// debounce, so it is guarded like the submit that follows.
+		if err := t.humanPromptGuard(session, target, nudgeGuardStageBeforeSubmit, false); err != nil {
+			return err
+		}
 		_, _ = t.run("send-keys", "-t", target, "Escape")
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -3009,7 +3022,16 @@ func (t *Tmux) nudgeSession(
 			// submit would send their draft (ga-ubfc7j).
 			if marker, ok := t.stagedDraftMarkerFor(target); ok && t.sessionClientCount(session) == 0 {
 				observe := func() (paneSubmitObservation, error) { return t.observeSubmit(target, marker) }
-				switch recoverStagedDraft(sendSubmit, wake, observe, time.Sleep) {
+				// ga-ubfc7j: recovery runs for seconds; a person who attaches
+				// in that time may replace the staged draft with their own, so
+				// every recovery submit needs the session still detached.
+				recoverSubmit := func() error {
+					if t.sessionClientCount(session) != 0 {
+						return errRecoveryNoLongerDetached
+					}
+					return sendSubmit()
+				}
+				switch recoverStagedDraft(recoverSubmit, wake, observe, time.Sleep) {
 				case stagedDraftSubmittedBusy:
 					return nil
 				case stagedDraftCleared:
@@ -3264,6 +3286,10 @@ func dismissModelSwitchModal(content string, sendKeys func(keys ...string) error
 // longer the only thing on screen between two of its keys (ga-ubfc7j).
 var errDismissalScreenChanged = errors.New("tmux: mid-session dialog changed during its dismissal")
 
+// errRecoveryNoLongerDetached stops staged-draft recovery once a client has
+// attached: the draft on the line may no longer be the one gc staged.
+var errRecoveryNoLongerDetached = errors.New("tmux: staged-draft recovery stopped: a client attached")
+
 // midSessionDialogSettleDelay lets a just-dismissed mid-session dialog retire
 // from the pane before the nudge text is pasted, so the message lands at the
 // prompt rather than in a closing overlay.
@@ -3385,6 +3411,25 @@ func (t *Tmux) DismissModelSwitchModalIfPresent(session string) {
 	_, _ = dismissModelSwitchModal(live,
 		func(keys ...string) error {
 			for _, k := range keys {
+				// ga-ubfc7j: re-read before EVERY key (Down, then Enter after
+				// a settle): a question or approval that replaced the modal
+				// in between must not get the Enter.
+				if err := t.humanPromptGuard(session, target, nudgeGuardStageBeforeType, true); err != nil {
+					if reason, deferred := NudgeDeferredReason(err); !deferred || reason != NudgeDeferReasonSelectionPrompt {
+						return err
+					}
+					// The modal itself is a selection list; that is the one
+					// reading that may pass, and only while it is still live.
+					fresh, cerr := t.CapturePane(target, promptObservationLines)
+					if cerr != nil {
+						return cerr
+					}
+					fl := strings.Split(fresh, "\n")
+					ci, _ := lastComposerLine(fl, t.resolveIdlePromptPrefix(session))
+					if !runtime.ContainsModelSwitchModal(strings.Join(fl[ci+1:], "\n")) {
+						return err
+					}
+				}
 				if _, err := t.run("send-keys", "-t", target, k); err != nil {
 					return err
 				}
