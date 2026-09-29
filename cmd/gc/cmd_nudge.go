@@ -1299,6 +1299,14 @@ func deliverSessionNudgeWithWorker(target nudgeTarget, store beads.Store, sp run
 		result.Delivered = true
 		err = nil
 	}
+	if reason, deferred := tmux.NudgeDeferredReason(err); deferred {
+		// The pane holds a prompt meant for a human (ga-ubfc7j) and nothing
+		// was typed. Failing would lose the message; typing would answer the
+		// prompt. Queue it: the dispatcher delivers once the prompt is gone,
+		// and a human's next submit drains it through the hook path.
+		fmt.Fprintf(stderr, "gc session nudge: %s is showing a prompt meant for a human (%s); nothing was typed, queuing instead\n", target.agentKey(), reason) //nolint:errcheck
+		return queueSessionNudgeWithWorker(target, store, sp, message, mode, jsonOutput, worker.NudgeUndeliveredNoIdleBoundary, stdout, stderr)
+	}
 	if err != nil {
 		if errors.Is(err, runtime.ErrSessionNotFound) && target.sessionTransport() == "acp" {
 			if mode == nudgeDeliveryWaitIdle {
@@ -2132,13 +2140,35 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.S
 		Source:   "queue",
 		Wake:     worker.NudgeWakeLiveOnly,
 	})
+	if reason, deferred := tmux.NudgeDeferredReason(err); deferred {
+		// The pane is holding a prompt meant for a human -- a question
+		// dialog, an approval prompt, or an attached person's draft
+		// (ga-ubfc7j) -- and the runtime sent NO keys. Nothing reached the
+		// seat, so this is not a failed attempt: release the claim so the
+		// item stays pending and due, and the next pass tries again. Running
+		// it through recordQueuedNudgeFailure would spend one of
+		// defaultQueuedNudgeMaxAttempts per pass and dead-letter every
+		// reminder queued behind a dialog left open for ten seconds. The
+		// item's TTL (ExpiresAt) still bounds how long it can wait.
+		// When the refusal came at the submit, the text is already in the
+		// composer with no Enter: record that as its own outcome, so the log
+		// never reads it as a delivery that sent nothing.
+		outcome := nudgeDeliveryOutcomeDeferred
+		if tmux.NudgeDeferredAfterTyping(err) {
+			outcome = nudgeDeliveryOutcomeSubmitWithheld
+		}
+		relErr := releaseQueuedNudgeClaims(target.cityPath, queuedNudgeIDs(items))
+		logErr := recordNudgeDelivery(target, items, msg, outcome, reason)
+		return false, errors.Join(bookkeepErr, relErr, logErr)
+	}
 	if err != nil {
 		telemetry.RecordNudge(context.Background(), target.agentKey(), err)
 		if errors.Is(err, runtime.ErrSessionNotFound) {
+			logErr := recordNudgeDelivery(target, items, msg, nudgeDeliveryOutcomeNotDelivered, err.Error())
 			if recErr := releaseQueuedNudgeClaims(target.cityPath, queuedNudgeIDs(items)); recErr != nil {
-				return false, errors.Join(bookkeepErr, recErr)
+				return false, errors.Join(bookkeepErr, recErr, logErr)
 			}
-			return false, bookkeepErr
+			return false, errors.Join(bookkeepErr, logErr)
 		}
 		if errors.Is(err, tmux.ErrNudgeSubmitDeliveredUnobserved) {
 			// The submit Enter was delivered and the composer drained; only the
@@ -2147,24 +2177,28 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.S
 			// attempt-counting/dead-letter path — that would re-inject the same
 			// reminder on the next pass.
 			stampLastNudgeDeliveredAt(deliverySessFront, target.sessionID, time.Now())
+			logErr := recordNudgeDelivery(target, items, msg, nudgeDeliveryOutcomeDeliveredUnobserved, "")
 			ackErr := ackQueuedNudgesWithOutcome(target.cityPath, queuedNudgeIDs(items), "injected_unobserved", "", "provider-nudge-return")
-			return true, errors.Join(bookkeepErr, ackErr)
+			return true, errors.Join(bookkeepErr, logErr, ackErr)
 		}
+		logErr := recordNudgeDelivery(target, items, msg, nudgeDeliveryOutcomeFailed, err.Error())
 		if recErr := recordQueuedNudgeFailureWithStore(target.cityPath, beads.NudgesStore{Store: deliveryStore}, queuedNudgeIDs(items), err, time.Now()); recErr != nil {
-			return false, errors.Join(bookkeepErr, recErr)
+			return false, errors.Join(bookkeepErr, recErr, logErr)
 		}
-		return false, bookkeepErr
+		return false, errors.Join(bookkeepErr, logErr)
 	}
 	if !result.Delivered {
 		// The runtime declined without an error (e.g. the session stopped
 		// between observation and delivery). Release the claims so the next
 		// pass retries promptly instead of waiting out the in-flight lease.
+		logErr := recordNudgeDelivery(target, items, msg, nudgeDeliveryOutcomeNotDelivered, "runtime declined")
 		relErr := releaseQueuedNudgeClaims(target.cityPath, queuedNudgeIDs(items))
-		return false, errors.Join(bookkeepErr, relErr)
+		return false, errors.Join(bookkeepErr, relErr, logErr)
 	}
 	telemetry.RecordNudge(context.Background(), target.agentKey(), nil)
 	stampLastNudgeDeliveredAt(deliverySessFront, target.sessionID, time.Now())
-	return true, errors.Join(bookkeepErr, ackQueuedNudges(target.cityPath, queuedNudgeIDs(items)))
+	logErr := recordNudgeDelivery(target, items, msg, nudgeDeliveryOutcomeDelivered, "")
+	return true, errors.Join(bookkeepErr, logErr, ackQueuedNudges(target.cityPath, queuedNudgeIDs(items)))
 }
 
 func stampLastNudgeDeliveredAt(sessFront *session.Store, sessionID string, t time.Time) {
