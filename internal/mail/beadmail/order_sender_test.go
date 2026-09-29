@@ -73,3 +73,17 @@ func TestReplyToOrderSenderIsRefused(t *testing.T) {
 		t.Fatalf("Reply error = %v, want the order-has-no-mailbox refusal", err)
 	}
 }
+
+// A cross-city send stores the order's sender city-qualified; a reply to it is
+// refused the same way.
+func TestReplyToCityQualifiedOrderSenderIsRefused(t *testing.T) {
+	store := beads.NewMemStore()
+	p := New(store)
+	sent, err := p.Send("peer-city/order:city/deacon-watch", "mayor", "alert", "body")
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if _, err := p.Reply(sent.ID, "mayor", "", "thanks"); err == nil || !strings.Contains(err.Error(), "an order, which has no mailbox") {
+		t.Fatalf("Reply error = %v, want the order-has-no-mailbox refusal", err)
+	}
+}

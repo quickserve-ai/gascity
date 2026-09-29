@@ -1122,7 +1122,7 @@ func defaultMailIdentity() string {
 const controllerMailIdentity = "controller"
 
 func reservedMailSenderIdentity(identifier string) (string, bool) {
-	if id := strings.TrimSpace(identifier); mail.IsOrderSender(id) {
+	if id := strings.TrimSpace(identifier); strings.HasPrefix(id, mail.OrderSenderPrefix) {
 		return id, true
 	}
 	switch normalizeNamedSessionTarget(identifier) {
@@ -1374,6 +1374,9 @@ func resolveMailRecipientIdentityCached(cityPath string, cfg *config.City, sessS
 	}
 	if normalizeNamedSessionTarget(identifier) == controllerMailIdentity {
 		return "", session.ErrSessionNotFound
+	}
+	if mail.IsOrderSender(identifier) {
+		return "", fmt.Errorf("%s is an order, which has no mailbox; mail the order's owning seat or the mayor instead", strings.TrimSpace(identifier))
 	}
 	resolved, err := resolveMailIdentityWithConfigCached(cityPath, cfg, sessStore, identifier, cache)
 	if err != nil {
@@ -3032,7 +3035,7 @@ func cmdMailReplyJSON(args []string, subject, message string, notify bool, jsonO
 	}
 	rec := openCityRecorder(stderr)
 
-	sender := defaultMailIdentity()
+	sender := defaultMailSenderCandidates()[0]
 	providerName := mailProviderName()
 	var store beads.Store
 	var cityPath string

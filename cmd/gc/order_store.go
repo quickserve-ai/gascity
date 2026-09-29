@@ -265,6 +265,11 @@ func orderExecEnvForRun(cityPath string, cfg *config.City, target execStoreTarge
 			env = append(env, key+"="+v)
 		}
 	}
+	// Dispatch-time vars are not reserved-key checked (the design's R4), so a
+	// seat identity arriving that way is dropped here.
+	for _, key := range []string{"GC_AGENT", "GC_ALIAS", "GC_SESSION_ID"} {
+		env = removeEnvKey(env, key)
+	}
 	return env, nil
 }
 

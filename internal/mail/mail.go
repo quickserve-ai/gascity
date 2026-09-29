@@ -67,9 +67,16 @@ const (
 	OrderSenderPrefix = "order:"
 )
 
-// IsOrderSender reports whether addr is an order's sender address.
+// IsOrderSender reports whether addr is an order's sender address, bare
+// (order:<scope>/<name>) or as a cross-city send stores it
+// (<city>/order:<scope>/<name>).
 func IsOrderSender(addr string) bool {
-	return strings.HasPrefix(strings.TrimSpace(addr), OrderSenderPrefix)
+	addr = strings.TrimSpace(addr)
+	if strings.HasPrefix(addr, OrderSenderPrefix) {
+		return true
+	}
+	city, rest, ok := strings.Cut(addr, "/")
+	return ok && city != "" && !strings.Contains(city, ":") && strings.HasPrefix(rest, OrderSenderPrefix)
 }
 
 // MetadataSender is an optional [Provider] capability: send with extra

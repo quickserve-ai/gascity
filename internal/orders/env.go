@@ -71,6 +71,11 @@ func IsReservedExecEnvKey(key string) bool {
 		"GC_DOLT_STATE_FILE",
 		"GC_DOLT_USER",
 		ExecOutcomeFileEnv,
+		// A seat's identity is never an order's: one [order.env] line or
+		// webhook arg would otherwise let an order mail as any seat.
+		"GC_AGENT",
+		"GC_ALIAS",
+		"GC_SESSION_ID",
 		ExecOrderNameEnv,
 		ExecOrderRunEnv,
 		ExecOrderScopeEnv,

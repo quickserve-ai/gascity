@@ -244,8 +244,8 @@ func cancelShellExecProcessGroup(cmd *exec.Cmd, pgid int) error {
 
 // orderExecUninheritedKeys never pass from the dispatcher's own environment to
 // an order: a seat's identity is not the order's (ga-s04g7q), and a parent
-// order's identity is not a nested run's. An order may still set any of them
-// itself; the GC_ORDER_* keys are reserved and set by orderExecEnvForRun.
+// order's identity is not a nested run's. All six are reserved [order.env]
+// keys; orderExecEnvForRun sets the GC_ORDER_* ones.
 var orderExecUninheritedKeys = []string{
 	"GC_AGENT",
 	"GC_ALIAS",

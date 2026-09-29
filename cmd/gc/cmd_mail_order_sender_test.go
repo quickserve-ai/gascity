@@ -2,12 +2,14 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/mail"
 	"github.com/gastownhall/gascity/internal/session"
 )
@@ -155,5 +157,34 @@ func TestCmdMailSend_NoIdentityStillHuman(t *testing.T) {
 	}
 	if stored := mailSendTestFindMessage(t, cityPath); stored.From != "human" {
 		t.Fatalf("From = %q, want human", stored.From)
+	}
+}
+
+// An order has no mailbox: mail addressed to one is refused, bare or
+// city-qualified, rather than stored where nobody reads it.
+func TestResolveMailRecipient_RefusesOrderAddress(t *testing.T) {
+	clearMailIdentityEnv(t)
+	store := beads.NewMemStore()
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	for _, addr := range []string{"order:city/deacon-watch", "order:qcore/cert-landing-patrol"} {
+		_, err := resolveMailRecipientIdentity(t.TempDir(), cfg, store, addr)
+		if err == nil || !strings.Contains(err.Error(), "an order, which has no mailbox") {
+			t.Fatalf("resolveMailRecipientIdentity(%q) error = %v, want the no-mailbox refusal", addr, err)
+		}
+		if errors.Is(err, session.ErrSessionNotFound) {
+			t.Fatalf("resolveMailRecipientIdentity(%q) = not-found; want the explicit refusal", addr)
+		}
+	}
+}
+
+// A remote (--context) send from an order signs as the order, not human.
+func TestRemoteMailIdentity_FallsBackToOrder(t *testing.T) {
+	clearMailIdentityEnv(t)
+	if got := remoteMailIdentity(); got != "human" {
+		t.Fatalf("no identity: %q, want human", got)
+	}
+	setOrderEnv(t, "city", "deacon-watch", "pc-run1")
+	if got := remoteMailIdentity(); got != "order:city/deacon-watch" {
+		t.Fatalf("order: %q, want order:city/deacon-watch", got)
 	}
 }

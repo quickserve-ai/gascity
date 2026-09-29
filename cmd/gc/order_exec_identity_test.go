@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -72,6 +74,19 @@ func TestOrderExecEnvForRunSetsOrderIdentity(t *testing.T) {
 		assertEnvOnce(t, env, orders.ExecOrderNameEnv, "patrol")
 	})
 
+	t.Run("dispatch-time vars cannot carry a seat identity", func(t *testing.T) {
+		a := orders.Order{Name: "deacon-watch", Trigger: "cooldown", Interval: "1m", Exec: "true"}
+		env, err := orderExecEnvForRun(cityDir, nil, target, a, map[string]string{
+			"GC_AGENT": "mayor", "GC_ALIAS": "mayor", "GC_SESSION_ID": "gc-mayor",
+		}, "pc-run3")
+		if err != nil {
+			t.Fatalf("orderExecEnvForRun: %v", err)
+		}
+		for _, key := range []string{"GC_AGENT", "GC_ALIAS", "GC_SESSION_ID"} {
+			assertEnvAbsent(t, env, key)
+		}
+	})
+
 	t.Run("untracked run leaves GC_ORDER_RUN unset", func(t *testing.T) {
 		a := orders.Order{Name: "deacon-watch", Trigger: "cooldown", Interval: "1m", Exec: "true"}
 		env, err := orderExecEnvForRun(cityDir, nil, target, a, map[string]string{orders.ExecOrderRunEnv: "spoofed"}, "")
@@ -102,9 +117,6 @@ func TestMergeOrderExecEnvDropsInheritedIdentity(t *testing.T) {
 	}
 	assertEnvOnce(t, env, "GC_ORDER_NAME", "child")
 	assertEnvOnce(t, env, "PATH", "/usr/bin:/bin")
-
-	declared := mergeOrderExecEnv(environ, []string{"GC_AGENT=declared-by-order"})
-	assertEnvOnce(t, declared, "GC_AGENT", "declared-by-order")
 }
 
 // End to end through the real shell runner: the child process sees the order
@@ -161,14 +173,39 @@ func TestOrderDispatchExecCarriesOrderIdentity(t *testing.T) {
 	}
 }
 
-// Declaring an order identity key in [order.env] is refused at check time,
-// like every other controller-owned key.
+// Declaring an order or seat identity key in [order.env] is refused at check
+// time, like every other controller-owned key.
 func TestOrderCheckRejectsDeclaredOrderIdentityKey(t *testing.T) {
-	for _, key := range []string{orders.ExecOrderScopeEnv, orders.ExecOrderNameEnv, orders.ExecOrderRunEnv} {
+	for _, key := range []string{orders.ExecOrderScopeEnv, orders.ExecOrderNameEnv, orders.ExecOrderRunEnv, "GC_AGENT", "GC_ALIAS", "GC_SESSION_ID"} {
 		a := orders.Order{Name: "bad-env", Trigger: "cooldown", Interval: "24h", Exec: "true", Env: map[string]string{key: "x"}}
 		err := orders.ValidateExecEnvOverrides(a)
 		if err == nil || !strings.Contains(err.Error(), `controller-owned env key "`+key+`"`) {
 			t.Fatalf("ValidateExecEnvOverrides(%s) = %v, want controller-owned key error", key, err)
 		}
+	}
+}
+
+// A manual `gc order run` hands the order its tracking bead as GC_ORDER_RUN.
+func TestOrderRunExecCarriesRunID(t *testing.T) {
+	t.Setenv("GC_SESSION_ID", "gc-leaked")
+	cityDir := t.TempDir()
+	writeFile(t, filepath.Join(cityDir, "city.toml"), "[workspace]\nname = \"test-city\"\nprefix = \"ct\"\n")
+	cfg, err := loadCityConfig(cityDir)
+	if err != nil {
+		t.Fatalf("loadCityConfig: %v", err)
+	}
+	a := orders.Order{
+		Name:     "probe",
+		Trigger:  "cooldown",
+		Interval: "1m",
+		Exec:     `printf 'id=%s|%s|%s|%s\n' "$GC_ORDER_SCOPE" "$GC_ORDER_NAME" "$GC_ORDER_RUN" "${GC_SESSION_ID:-unset}"`,
+	}
+	var stdout, stderr bytes.Buffer
+	result := doOrderRunExecResult(a, cityDir, cfg, nil, "ct-run7", &stdout, &stderr)
+	if result.code != 0 {
+		t.Fatalf("doOrderRunExecResult = %d; stdout=%q stderr=%q", result.code, stdout.String(), stderr.String())
+	}
+	if want := "id=city|probe|ct-run7|unset"; !strings.Contains(stdout.String(), want) {
+		t.Fatalf("stdout = %q, want %q", stdout.String(), want)
 	}
 }
