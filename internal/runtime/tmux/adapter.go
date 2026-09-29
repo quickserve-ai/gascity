@@ -2217,9 +2217,18 @@ func launchOrchestration(ctx context.Context, ops startOps, name string, cfg run
 			// startup turn started from an argv prompt can outlast the
 			// ladder. That is a warning too, with no claim of delivery. Any
 			// other error still fails the start.
+			// A startup nudge refused by the human-prompt guard
+			// (ErrNudgeDeferredHumanPrompt, ga-ubfc7j) sent NO keys: the pane
+			// is showing a dialog or an attached person's draft. It takes the
+			// same warning-not-failure path: tearing the session down would
+			// kill the pane a person may be answering, and the ladder above
+			// does not retry it, because what is on screen needs a human, not
+			// a timer.
 			switch {
 			case errors.Is(err, runtime.ErrSessionBusy), errors.Is(err, errNudgeSubmitHeld):
 				fmt.Fprintf(os.Stderr, "warning: startup nudge to %q not delivered: a running turn held its submit back: %v\n", name, err)
+			case errors.Is(err, ErrNudgeDeferredHumanPrompt):
+				fmt.Fprintf(os.Stderr, "warning: startup nudge to %q not delivered: the pane is holding a human prompt: %v\n", name, err)
 			case errors.Is(err, ErrNudgeSubmitUnconfirmed), errors.Is(err, ErrNudgeSubmitDeliveredUnobserved):
 				fmt.Fprintf(os.Stderr, "warning: startup nudge to %q delivered but not confirmed after retries: %v\n", name, err)
 			default:

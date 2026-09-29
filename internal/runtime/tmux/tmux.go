@@ -2652,12 +2652,23 @@ func (t *Tmux) sendHiddenAttachedText(ctx context.Context, target, text string) 
 	// trailing Enter is delivered, so a later GetSessionActivity discounts gc's
 	// echo instead of counting this nudge as the agent responding (see
 	// discountPokeActivity). A failed write records nothing.
+	// Human-prompt guard (ga-ubfc7j). This client is gc's own hidden attach,
+	// so one attached client says nothing about a person typing; a second one
+	// (or a count that cannot be read) may be a person, and then the draft
+	// rule applies too.
+	clients := t.sessionClientCount(target)
+	if err := t.humanPromptGuard(target, target, nudgeGuardStageBeforeType, clients > 1 || clients < 0); err != nil {
+		return true, err
+	}
 	commitPoke := t.beginPoke(target)
 	if err := t.writeHiddenAttached(ctx, client, []byte(text), true); err != nil {
 		return true, err
 	}
 	if t.cfg.DebounceMs > 0 {
 		time.Sleep(time.Duration(t.cfg.DebounceMs) * time.Millisecond)
+	}
+	if err := t.humanPromptGuard(target, target, nudgeGuardStageBeforeSubmit, false); err != nil {
+		return true, err
 	}
 	if err := t.writeHiddenAttached(ctx, client, []byte{'\r'}, false); err != nil {
 		return true, err
@@ -2909,10 +2920,39 @@ func sendPasteChunks(chunks []string, send func(string) error, pause func()) err
 // This function ONLY addresses the startup race where the agent TUI hasn't
 // initialized yet, causing tmux send-keys to fail with "not in a mode".
 func (t *Tmux) sendKeysLiteralWithRetry(ctx context.Context, target, text string, timeout time.Duration) error {
-	return t.sendTextWithRetry(ctx, target, text, timeout, t.sendLiteralTextForNudge)
+	// Chokepoint (ga-ubfc7j): see humanPromptGuard.
+	if err := t.humanPromptGuard(target, target, nudgeGuardStageBeforeType, true); err != nil {
+		return err
+	}
+	return t.sendTextWithRetry(ctx, target, text, timeout, t.guardRetries(target, true, t.sendLiteralTextForNudge))
+}
+
+// guardRetries wraps one send so every RETRY re-runs the guard. The first
+// attempt is covered by the caller's check, but a transient send failure is
+// retried after a backoff of up to seconds, and in that time a person can
+// start a draft or the agent can raise a dialog; the earlier check does not
+// speak for the pane any more. A deferral is not a transient error, so
+// sendTextWithRetry stops on it.
+func (t *Tmux) guardRetries(target string, checkDraft bool, send func(context.Context, string, string) error) func(context.Context, string, string) error {
+	attempt := 0
+	return func(ctx context.Context, tgt, text string) error {
+		attempt++
+		if attempt > 1 {
+			if err := t.humanPromptGuard(target, target, nudgeGuardStageBeforeType, checkDraft); err != nil {
+				return err
+			}
+		}
+		return send(ctx, tgt, text)
+	}
 }
 
 func (t *Tmux) sendStartupKeysLiteralWithRetry(ctx context.Context, target, text, provider string, timeout time.Duration) error {
+	// Chokepoint (ga-ubfc7j): see humanPromptGuard. Checked once for the
+	// whole prompt, before any chunk: a later chunk's composer holds our own
+	// earlier chunks, which are not a person's draft.
+	if err := t.humanPromptGuard(target, target, nudgeGuardStageBeforeType, true); err != nil {
+		return err
+	}
 	if len(text) > copilotMaxPasteBytes && sessionlog.ProviderFamily(provider) == "copilot" {
 		chunks := splitPasteText(text, copilotMaxPasteBytes)
 		// Budget the inter-chunk pauses on top of the retry window rather than
@@ -2923,12 +2963,17 @@ func (t *Tmux) sendStartupKeysLiteralWithRetry(ctx context.Context, target, text
 		// retry-heavy first chunk can starve the later ones and turn what would
 		// have been a plain timeout into errPartialPasteDelivery.
 		deadline := time.Now().Add(timeout + time.Duration(len(chunks)-1)*copilotPasteChunkDelay)
+		chunkIndex := 0
 		return sendPasteChunks(chunks, func(chunk string) error {
 			remaining := time.Until(deadline)
 			if remaining <= 0 {
 				return fmt.Errorf("agent not ready for input after %s", timeout)
 			}
-			return t.sendTextWithRetry(ctx, target, chunk, remaining, t.pasteLiteralText)
+			// Only the first chunk's retries check for a draft: after it, the
+			// composer holds our own earlier chunks.
+			checkDraft := chunkIndex == 0
+			chunkIndex++
+			return t.sendTextWithRetry(ctx, target, chunk, remaining, t.guardRetries(target, checkDraft, t.pasteLiteralText))
 		}, func() {
 			remaining := time.Until(deadline)
 			if remaining > copilotPasteChunkDelay {
@@ -2939,7 +2984,7 @@ func (t *Tmux) sendStartupKeysLiteralWithRetry(ctx context.Context, target, text
 			}
 		})
 	}
-	return t.sendTextWithRetry(ctx, target, text, timeout, t.sendLiteralText)
+	return t.sendTextWithRetry(ctx, target, text, timeout, t.guardRetries(target, true, t.sendLiteralText))
 }
 
 func (t *Tmux) sendTextWithRetry(ctx context.Context, target, text string, timeout time.Duration, send func(context.Context, string, string) error) error {
@@ -3034,6 +3079,20 @@ func submitEnterAndConfirm(sendSubmit func() error, wake func(), busy func() (bo
 //     before the provider records the message (healthy-direct, 2026-10-15). A
 //     look that fails is not evidence, so it sends nothing either.
 func submitAndConfirm(sendSubmit func() error, wake func(), busy func() (bool, error), mayResend func() (bool, error), sleep func(time.Duration)) (confirmed, sawIdle bool, sent int, err error) {
+	return submitAndConfirmGated(sendSubmit, wake, busy, mayResend, sleep, nil)
+}
+
+// submitAndConfirmGated is submitAndConfirm with a gate consulted before every
+// send that the loop would otherwise make (nil = no gate). gate(resend) is
+// called with resend=false until one send has reached tmux, true after. It
+// returns (true, nil) to let the send go; (false, err) to abandon the delivery
+// with err; (false, nil) to stop re-sending without an error, which the loop
+// reports as best-effort (false, nil) like a pane that never went busy.
+// ga-ubfc7j: a re-sent Enter is only allowed while the composer still holds the
+// typed text -- on a question dialog the agent raised in reply, it picks an
+// answer. A send refused by the human-prompt guard (ErrNudgeDeferredHumanPrompt)
+// ends the loop at once. The gate runs after mayResend: a re-send needs both.
+func submitAndConfirmGated(sendSubmit func() error, wake func(), busy func() (bool, error), mayResend func() (bool, error), sleep func(time.Duration), gate func(resend bool) (bool, error)) (confirmed, sawIdle bool, sent int, err error) {
 	// Baseline reading before the first send: an idle baseline lets send 0's
 	// own polls confirm, while a busy or failed one leaves the pane needing
 	// an idle reading first.
@@ -3061,10 +3120,19 @@ func submitAndConfirm(sendSubmit func() error, wake func(), busy func() (bool, e
 			}
 		}
 		if resend {
+			if gate != nil {
+				ok, gateErr := gate(sent > 0)
+				if gateErr != nil {
+					return false, watch.seenIdle, sent, gateErr
+				}
+				if !ok {
+					return false, watch.seenIdle, sent, lastErr
+				}
+			}
 			if err := sendSubmit(); err != nil {
-				if isLookRefusal(err) {
-					// Never re-send into a permission prompt, or into a pane a
-					// look could not read.
+				if isLookRefusal(err) || errors.Is(err, ErrNudgeDeferredHumanPrompt) {
+					// Never re-send into a permission prompt, a prompt meant for a
+					// human (ga-ubfc7j), or a pane a look could not read.
 					return false, watch.seenIdle, sent, err
 				}
 				lastErr = err
@@ -3388,6 +3456,12 @@ const nudgeSubmitKeySettle = 100 * time.Millisecond
 // remaining keys are not sent after an error, matching sendEnter's previous
 // single-key contract (the caller decides how to react to a failed submit).
 func (t *Tmux) sendNudgeSubmitSequence(ctx context.Context, target string, keys []string) error {
+	// Chokepoint (ga-ubfc7j): no submit key goes to a pane showing a
+	// question dialog or an approval prompt. The draft rule does not apply
+	// here: the text on the line is the text this delivery just typed.
+	if err := t.humanPromptGuard(target, target, nudgeGuardStageBeforeSubmit, false); err != nil {
+		return err
+	}
 	for i, key := range keys {
 		if i > 0 {
 			time.Sleep(nudgeSubmitKeySettle)
@@ -3561,6 +3635,20 @@ func (t *Tmux) nudgeSession(
 		return err
 	}
 
+	// 0. Refuse to type into a prompt meant for a human (ga-ubfc7j). Quiet
+	// and spinner-free is not "safe to type": Claude Code's AskUserQuestion
+	// dialog is both, and on it the typed text vanishes while every Enter
+	// selects the highlighted option -- a queued nudge answered the
+	// operator's questions for him. The authoritative check lives in the key
+	// senders this function calls (sendText -> sendKeysLiteralWithRetry /
+	// sendStartupKeysLiteralWithRetry, and sendNudgeSubmitSequence; see
+	// humanPromptGuard), so no caller can bypass it. It runs here as well
+	// because the C-u clear and the feedback-survey digit below are keys sent
+	// BEFORE the text. The returned ErrNudgeDeferredHumanPrompt means nothing
+	// was sent; the queue keeps the item without spending an attempt.
+	if err := t.humanPromptGuard(session, target, nudgeGuardStageBeforeType, true); err != nil {
+		return err
+	}
 	// A human may have scrolled this pane into copy-mode (the ga-c4w wheel
 	// binding); exit it first so the keystrokes below reach the program
 	// instead of being swallowed by copy-mode. Mirrors SendKeysDebounced.
@@ -3633,10 +3721,13 @@ func (t *Tmux) nudgeSession(
 	// interrupt is usually several rows (see clearInputBeforePaste).
 	//
 	// Skip the clear when a client is attached, or when the probe cannot
-	// tell: a human may be mid-keystroke, and silently wiping their
-	// in-progress input is worse than the concatenation this clear otherwise
-	// prevents (#5192).
-	if attached, err := t.SessionAttachedWithError(session); err == nil && !attached {
+	// tell: a human may be mid-keystroke,
+	// and silently wiping their in-progress input is worse than the
+	// concatenation this clear otherwise prevents (#5192). Any client count
+	// but zero counts, including an unreadable one: IsSessionAttached tests
+	// for exactly one client, so gc's hidden attach client plus a person
+	// would read as detached and have the person's draft wiped (ga-ubfc7j).
+	if t.sessionClientCount(session) == 0 {
 		if err := t.clearInputBeforePaste(ctx, session, target); err != nil {
 			return err
 		}
@@ -3729,12 +3820,18 @@ func (t *Tmux) nudgeSession(
 			busy = func() (bool, error) { return t.turnRunning(target, family) }
 			mayResend = func() (bool, error) { return t.submitStillWaiting(target, family) }
 		}
-		confirmed, sawIdle, sent, err := submitAndConfirm(sendSubmit, wake, busy, mayResend, time.Sleep)
+		// The re-send gate (ga-ubfc7j): the old loop re-sent Enter whenever
+		// no spinner showed, which on a dialog the agent raised in reply meant
+		// answering it. A re-send now needs the typed text still drafted.
+		confirmed, sawIdle, sent, err := submitAndConfirmGated(sendSubmit, wake, busy, mayResend, time.Sleep, t.resendGate(session, target, message))
 		if isLookRefusal(err) {
 			delivered = prompt.submitsSent > 0
 			return prompt.refused(err)
 		}
 		if err != nil {
+			if errors.Is(err, ErrNudgeDeferredHumanPrompt) {
+				return err
+			}
 			return fmt.Errorf("failed to send submit sequence: %w", err)
 		}
 		if sent == 0 {
@@ -3821,6 +3918,9 @@ func (t *Tmux) nudgeSession(
 			if isLookRefusal(err) {
 				return prompt.refused(err)
 			}
+			if errors.Is(err, ErrNudgeDeferredHumanPrompt) {
+				return err
+			}
 			lastErr = err
 			continue
 		}
@@ -3905,6 +4005,9 @@ func (t *Tmux) NudgePane(pane, message string) error {
 			time.Sleep(200 * time.Millisecond)
 		}
 		if err := t.sendNudgeSubmitSequence(context.Background(), pane, submitKeys); err != nil {
+			if errors.Is(err, ErrNudgeDeferredHumanPrompt) {
+				return err
+			}
 			lastErr = err
 			continue
 		}
@@ -4088,7 +4191,20 @@ func (t *Tmux) dismissModelSwitchModalIfPresentCtx(ctx context.Context, session 
 	if err != nil {
 		return
 	}
-	_, _ = dismissModelSwitchModal(content,
+	// ga-ubfc7j: the matcher alone finds its two strings anywhere in the
+	// capture, scrollback included, and the Down+Enter would land on whatever
+	// is actually up. So the modal must be LIVE -- below the last composer
+	// line, where a dialog is drawn -- and nothing a person owns may be on
+	// screen: a question dialog, an approval prompt, or an attached person's
+	// draft. The modal itself classifies as a selection list and passes.
+	lines := strings.Split(content, "\n")
+	composerIdx, _ := lastComposerLine(lines, t.resolveIdlePromptPrefix(session))
+	live := strings.Join(lines[composerIdx+1:], "\n")
+	switch t.classifyPaneLines(session, target, lines, true) {
+	case NudgeDeferReasonQuestionDialog, NudgeDeferReasonApprovalPrompt, NudgeDeferReasonHumanDraft:
+		return
+	}
+	_, _ = dismissModelSwitchModal(live,
 		func(keys ...string) error {
 			for _, k := range keys {
 				if _, err := t.runCtx(ctx, "send-keys", "-t", paneTarget(target), k); err != nil {
