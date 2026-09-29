@@ -835,17 +835,20 @@ func (p *Provider) Reply(id, from, subject, body string) (mail.Message, error) {
 // so a beadmail not-found does not leak beads.ErrNotFound to mail-layer callers.
 // This confinement is intentional and differs from the exec seam, which chains
 // both errors; callers above beadmail must key on mail.ErrNotFound.
+//
+// Only a PROVEN absence is not-found. A lookup that did not finish
+// (beads.ErrVerifyIndeterminate), or that bd answered with a different bead
+// (beads.ErrIDCollision), is mail.ErrLookupIndeterminate instead: it does not
+// satisfy errors.Is(err, mail.ErrNotFound), so a queued nudge is not withdrawn
+// as "mail-missing" and the API does not answer 404 on a read that merely
+// failed. The text still says absence is unproven, for the operator deciding
+// whether to re-send an unconfirmed message (ga-0ejdbv round 4); the cause
+// goes in as text, not %w, so no beads sentinel leaks.
 func beadmailError(operation string, err error) error {
+	if errors.Is(err, beads.ErrVerifyIndeterminate) || errors.Is(err, beads.ErrIDCollision) {
+		return fmt.Errorf("beadmail %s: %w: %s", operation, mail.ErrLookupIndeterminate, err.Error())
+	}
 	if errors.Is(err, beads.ErrNotFound) {
-		// A lookup that did not finish, or that bd answered with a different
-		// bead, still reads as not-found to mail callers, but its text must
-		// say absence is unproven: this is the check an operator runs to
-		// decide whether to re-send an unconfirmed message, and a bare "not
-		// found" there reads as "lost" (ga-0ejdbv round 4). The cause goes in
-		// as text, not %w, so beads.ErrNotFound still does not leak.
-		if errors.Is(err, beads.ErrVerifyIndeterminate) || errors.Is(err, beads.ErrIDCollision) {
-			return fmt.Errorf("beadmail %s: %w (absence unproven: %s)", operation, mail.ErrNotFound, err.Error())
-		}
 		err = mail.ErrNotFound
 	}
 	return fmt.Errorf("beadmail %s: %w", operation, err)

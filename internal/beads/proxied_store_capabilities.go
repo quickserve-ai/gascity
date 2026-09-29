@@ -282,13 +282,14 @@ func (s *ProxiedStore) ConditionalWriterHandle() (ConditionalWriter, bool) {
 //
 // There used to be two more — for MetadataCASWriterHandle and
 // AtomicConditionalCloserHandle — and they were deleted because nothing could
-// reach them (council pr2 D-F8): MetadataCASWriterFor and
-// AtomicConditionalCloserFor follow ConditionalWritesResolveTarget BEFORE they
-// ask for a handle, and this wrapper's target is the bd leaf, so both resolvers
-// always answered with the leaf's own capability. An adapter only a direct
-// method call reaches, which no production code makes, bracketed nothing and
-// let the H6 register list two capabilities as inside the bracket that were
-// not.
+// reach them (council pr2 D-F8): MetadataCASWriterFor follows
+// ConditionalWritesResolveTarget BEFORE it asks for a handle, and this
+// wrapper's target is the bd leaf, so it always answered with the leaf's own
+// capability. AtomicConditionalCloserFor has since started asking each hop for
+// a handle before following it, so this wrapper COULD front the atomic close
+// now; it still does not, and that is deliberate: the bd leaf provides no
+// atomic close, so a handle here would bracket nothing, exactly the H6
+// register defect the deletion fixed.
 //
 // They are values rather than pointers and hold no state of their own: the
 // bracket's state is the wrapper's, and an adapter that could outlive or

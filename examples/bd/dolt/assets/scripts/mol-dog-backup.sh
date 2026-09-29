@@ -15,6 +15,9 @@ PACK_DIR="${GC_PACK_DIR:-$(CDPATH= cd -- "$(dirname "${BASH_SOURCE[0]}")/../.." 
 : "${GC_CITY_PATH:?GC_CITY_PATH must be set}"
 # shellcheck disable=SC1091
 . "$PACK_DIR/assets/scripts/_bounded.sh"
+# _backup_stamp.sh carries write_local_backup_sync_stamp (ga-g3p5rm): the
+# local-backup freshness stamp mol-dog-doctor.sh dates.
+. "$PACK_DIR/assets/scripts/_backup_stamp.sh"
 # shellcheck disable=SC1091
 . "$PACK_DIR/assets/scripts/_notify.sh"
 

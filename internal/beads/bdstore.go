@@ -1461,9 +1461,11 @@ func (s *BdStore) Get(id string) (Bead, error) {
 		// non-bead names (e.g. slash-qualified session recipients), which
 		// must not leak into a supplemental wisp query.
 		if b, found, ferr := s.wispFallback(id); ferr != nil {
-			// Absence is UNPROVEN. ErrVerifyIndeterminate still satisfies
-			// errors.Is(ErrNotFound), so callers that only ask "is it missing?"
-			// are unchanged.
+			// Absence is UNPROVEN: the wisp leg is half of the "absent" verdict,
+			// so its failure is typed ErrVerifyIndeterminate, which does not
+			// satisfy errors.Is(ErrNotFound) — a caller acting on "confirmed
+			// absent" sees a failed read, and one that must tell the two apart
+			// branches on the sentinel.
 			return Bead{}, fmt.Errorf("getting bead %q: %w: %w", id, ErrVerifyIndeterminate, ferr)
 		} else if found {
 			return b, nil

@@ -1,24 +1,30 @@
 load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
-    name = "doltauth",
-    srcs = ["auth.go"],
-    importpath = "github.com/gastownhall/gascity/internal/doltauth",
+    name = "claudecloud",
+    srcs = [
+        "claudecloud.go",
+    ],
+    importpath = "github.com/gastownhall/gascity/internal/notify/claudecloud",
     visibility = ["//:__subpackages__"],
-    deps = ["//internal/beads/contract"],
+    deps = [
+        "//internal/notify",
+    ],
 )
 
 go_test(
-    name = "doltauth_test",
+    name = "claudecloud_test",
     srcs = [
-        "ambient_identity_scope_test.go",
-        "auth_test.go",
+        "claudecloud_test.go",
         "testenv_import_test.go",
     ],
-    embed = [":doltauth"],
+    data = glob(
+        ["**"],
+        exclude = ["BUILD.bazel"],
+    ),
+    embed = [":claudecloud"],
     deps = [
-        "//internal/beads/contract",
-        "//internal/testenv",
+        "//internal/notify",
     ],
 )
 

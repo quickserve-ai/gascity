@@ -275,7 +275,7 @@ func TestHookClaimServesStepWhoseRootIsNotReadable(t *testing.T) {
 
 // Review items 2 and 6: the production read path — a real BdStore — where bd
 // show says not found and the wisp fallback query fails. BdStore reports that
-// as ErrVerifyIndeterminate (which also satisfies errors.Is ErrNotFound); the
+// as ErrVerifyIndeterminate (a failed read, not an ErrNotFound); the
 // step is served and the failed read named.
 func TestHookClaimServesStepWhenBdStoreCannotProveTheRoot(t *testing.T) {
 	var calls []string

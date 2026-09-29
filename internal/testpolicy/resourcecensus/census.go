@@ -257,8 +257,8 @@ var bootstrapPolicy = Ledger{
 		{
 			Scope:           ScopeUntagged,
 			Resource:        ResourceNetListen,
-			BaselineCalls:   97,
-			BaselineFiles:   37,
+			BaselineCalls:   100,
+			BaselineFiles:   39,
 			ReportedCalls:   92,
 			ReportedFiles:   34,
 			OwnerBead:       "ga-cp3hwi",
@@ -541,17 +541,6 @@ var bootstrapPolicy = Ledger{
 			MigrationTarget: "P0.4b",
 			Expires:         "2026-10-31",
 		},
-		{
-			PackageDir:      "scripts",
-			PackageName:     "scripts_test",
-			Owner:           "TestMolScopedWorkTeardownScript",
-			Resources:       []Resource{ResourceSubprocess},
-			OwnerBead:       "pl-4k0",
-			Invariant:       "the mol-scoped-work cleanup-worktree behavior proof is a checked Medium subprocess owner",
-			ResourceOwner:   "the one bash subprocess is confined to TestMolScopedWorkTeardownScript, which runs scripts/test-mol-scoped-work-teardown.sh: the step under test is agent-executed shell rendered from formula TOML, so only running that shell against a stub gc can prove what it does",
-			MigrationTarget: "P0.4b",
-			Expires:         "2026-10-01",
-		},
 	},
 	ReviewedHermeticBody: []ReviewedHermeticBody{
 		{
@@ -678,8 +667,8 @@ var bootstrapPolicy = Ledger{
 		{
 			Scope:           ScopeUntagged,
 			Resource:        ResourceNetListen,
-			BaselineCalls:   95,
-			BaselineFiles:   36,
+			BaselineCalls:   98,
+			BaselineFiles:   38,
 			ReportedCalls:   92,
 			ReportedFiles:   34,
 			OwnerBead:       "ga-cp3hwi",

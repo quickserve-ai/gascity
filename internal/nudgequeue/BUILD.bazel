@@ -20,6 +20,7 @@ go_library(
 go_test(
     name = "nudgequeue_test",
     srcs = [
+        "schema_roundtrip_test.go",
         "state_test.go",
         "store_test.go",
         "testenv_import_test.go",

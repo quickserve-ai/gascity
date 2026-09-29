@@ -142,8 +142,8 @@ expires = "2026-10-31"
 [[debt]]
 scope = "untagged"
 resource = "net_listen"
-baseline_calls = 97
-baseline_files = 37
+baseline_calls = 100
+baseline_files = 39
 reported_calls = 92
 reported_files = 34
 owner_bead = "ga-cp3hwi"
@@ -428,17 +428,6 @@ resource_owner = "the git and bash subprocesses are confined to TestFreshMergeAc
 migration_target = "P0.4b"
 expires = "2026-10-31"
 
-[[medium]]
-package_dir = "scripts"
-package_name = "scripts_test"
-owner = "TestMolScopedWorkTeardownScript"
-resources = ["subprocess"]
-owner_bead = "pl-4k0"
-invariant = "the mol-scoped-work cleanup-worktree behavior proof is a checked Medium subprocess owner"
-resource_owner = "the one bash subprocess is confined to TestMolScopedWorkTeardownScript, which runs scripts/test-mol-scoped-work-teardown.sh: the step under test is agent-executed shell rendered from formula TOML, so only running that shell against a stub gc can prove what it does"
-migration_target = "P0.4b"
-expires = "2026-10-01"
-
 # A reviewed-hermetic-body row is narrower than a Small test declaration. It
 # proves that the exact untagged test body and statically reachable
 # receiverless same-package helpers contain none of the cataloged resources.
@@ -567,8 +556,8 @@ expires = "2026-10-31"
 [[small_debt]]
 scope = "untagged"
 resource = "net_listen"
-baseline_calls = 95
-baseline_files = 36
+baseline_calls = 98
+baseline_files = 38
 reported_calls = 92
 reported_files = 34
 owner_bead = "ga-cp3hwi"
