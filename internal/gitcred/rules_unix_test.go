@@ -18,6 +18,12 @@ func TestStatOwnerReportsRealOwnership(t *testing.T) {
 	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
+	// A new file's group is the process egid on Linux but the parent
+	// directory's group on BSD and macOS, where a TMPDIR under /tmp gives it
+	// wheel. Set it to egid explicitly so the expected value holds on both.
+	if err := os.Chown(path, -1, os.Getegid()); err != nil {
+		t.Fatalf("chown: %v", err)
+	}
 	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatalf("stat: %v", err)
