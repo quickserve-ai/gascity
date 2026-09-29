@@ -72,6 +72,7 @@ go_test(
         "nudge_bracketed_paste_test.go",
         "nudge_dismiss_besteffort_test.go",
         "nudge_human_prompt_test.go",
+        "nudge_machine_dialogs_test.go",
         "nudge_paste_confirm_sub37_test.go",
         "nudge_poke_hidden_test.go",
         "nudge_submit_confirm_test.go",

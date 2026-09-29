@@ -22,7 +22,7 @@ func TestDismissMidSessionDialogBeforeNudge_PeekErrorIsSwallowed(t *testing.T) {
 	fe := &fakeExecutor{errs: []error{errors.New("capture-pane failed")}}
 	tm := &Tmux{cfg: DefaultConfig(), exec: fe}
 
-	if dismissed := tm.dismissMidSessionDialogBeforeNudge("agent-pane"); dismissed {
+	if dismissed := dismissKeyed(tm); dismissed {
 		t.Error("dismissed = true on peek error, want false")
 	}
 	// The peek failed, so no dismissal keystroke may be sent: exactly the one
@@ -43,21 +43,21 @@ func TestDismissMidSessionDialogBeforeNudge_SendErrorIsSwallowed(t *testing.T) {
 	sendErr := errors.New("send-keys failed")
 	// The resume selector, not the session-limit chooser: the chooser is a
 	// numbered list the dismissal refuses to key (ga-ubfc7j). Each key is
-	// preceded by a re-read of the screen, so the calls are the peek, the
-	// re-read, then the failing send-keys.
+	// preceded by a re-read of the screen and a detached check, so the calls
+	// are the peek, the re-read, the client count, then the failing send-keys.
 	fe := &fakeExecutor{
-		outs: []string{resumeDialogPane, resumeDialogPane},
-		errs: []error{nil, nil, sendErr},
+		outs: []string{resumeDialogPane, resumeDialogPane, "0"},
+		errs: []error{nil, nil, nil, sendErr},
 	}
 	tm := &Tmux{cfg: DefaultConfig(), exec: fe}
 
-	if dismissed := tm.dismissMidSessionDialogBeforeNudge("agent-pane"); dismissed {
+	if dismissed := dismissKeyed(tm); dismissed {
 		t.Error("dismissed = true on send error, want false")
 	}
 	// The dialog matched (capture-pane), was re-read, then the first dismissal
 	// keystroke failed; the error must be swallowed rather than propagated.
-	if len(fe.calls) < 3 {
-		t.Fatalf("executor calls = %d, want >=3 (capture-pane, re-read, send-keys)", len(fe.calls))
+	if len(fe.calls) < 4 {
+		t.Fatalf("executor calls = %d, want >=4 (capture-pane, re-read, client count, send-keys)", len(fe.calls))
 	}
 	if !slices.Contains(fe.calls[0], "capture-pane") {
 		t.Errorf("first call = %v, want a capture-pane invocation", fe.calls[0])
@@ -65,8 +65,11 @@ func TestDismissMidSessionDialogBeforeNudge_SendErrorIsSwallowed(t *testing.T) {
 	if !slices.Contains(fe.calls[1], "capture-pane") {
 		t.Errorf("second call = %v, want the pre-key capture-pane re-read", fe.calls[1])
 	}
-	if !slices.Contains(fe.calls[2], "send-keys") {
-		t.Errorf("third call = %v, want a send-keys invocation", fe.calls[2])
+	if !slices.Contains(fe.calls[2], "#{session_attached}") {
+		t.Errorf("third call = %v, want the detached check", fe.calls[2])
+	}
+	if !slices.Contains(fe.calls[3], "send-keys") {
+		t.Errorf("fourth call = %v, want a send-keys invocation", fe.calls[3])
 	}
 }
 
@@ -85,12 +88,12 @@ Enter to confirm · Esc to cancel`
 // the intended nudge (PR #3427 regression). This pins the exact argv of that
 // capture at the executor boundary.
 func TestDismissMidSessionDialogBeforeNudge_UsesVisibleOnlyCapture(t *testing.T) {
-	// Two captures: the peek, and the re-read before the dismissal key
-	// (ga-ubfc7j). Both must be visible-only.
-	fe := &fakeExecutor{outs: []string{resumeDialogPane, resumeDialogPane}}
+	// Two captures: the peek, and the re-read before the dismissal key, then
+	// the detached check (ga-ubfc7j). Both captures must be visible-only.
+	fe := &fakeExecutor{outs: []string{resumeDialogPane, resumeDialogPane, "0"}}
 	tm := &Tmux{cfg: DefaultConfig(), exec: fe}
 
-	if dismissed := tm.dismissMidSessionDialogBeforeNudge("agent-pane"); !dismissed {
+	if dismissed := dismissKeyed(tm); !dismissed {
 		t.Fatal("dismissed = false, want true for a live resume dialog")
 	}
 	if len(fe.calls) < 2 || !slices.Equal(fe.calls[1], []string{"-u", "capture-pane", "-p", "-t", "agent-pane"}) {
@@ -115,7 +118,7 @@ func TestDismissMidSessionDialogBeforeNudge_NoDialogSendsNoKeys(t *testing.T) {
 	fe := &fakeExecutor{outs: []string{"❯ "}}
 	tm := &Tmux{cfg: DefaultConfig(), exec: fe}
 
-	if dismissed := tm.dismissMidSessionDialogBeforeNudge("agent-pane"); dismissed {
+	if dismissed := dismissKeyed(tm); dismissed {
 		t.Error("dismissed = true on a plain idle prompt, want false")
 	}
 	if len(fe.calls) != 1 {
