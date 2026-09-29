@@ -36,10 +36,12 @@ func TestBdStoreGetWispQueryErrorIsIndeterminate(t *testing.T) {
 	if !errors.Is(err, beads.ErrVerifyIndeterminate) {
 		t.Errorf("err = %v, want ErrVerifyIndeterminate — a timed-out lookup is not evidence of absence", err)
 	}
-	// Compatibility is the whole reason this is a sub-case rather than a new
-	// top-level error: every existing not-found caller must be unaffected.
-	if !errors.Is(err, beads.ErrNotFound) {
-		t.Errorf("err = %v, must still satisfy errors.Is(ErrNotFound) so existing callers are unchanged", err)
+	// "Could not look" is not "confirmed absent": the sentinel must not satisfy
+	// errors.Is(ErrNotFound), or the callers that act on a proven absence (the
+	// process-table orphan sweep, the cache's dirty overlay) act on a timeout
+	// (upstream #6649).
+	if errors.Is(err, beads.ErrNotFound) {
+		t.Errorf("err = %v, must NOT satisfy errors.Is(ErrNotFound); absence is unproven", err)
 	}
 }
 
@@ -64,8 +66,8 @@ func TestBdStoreGetWispQueryUnsupportedIsIndeterminate(t *testing.T) {
 	if !errors.Is(err, beads.ErrVerifyIndeterminate) {
 		t.Errorf("err = %v, want ErrVerifyIndeterminate — never looking is not the same as looking and finding nothing", err)
 	}
-	if !errors.Is(err, beads.ErrNotFound) {
-		t.Errorf("err = %v, must still satisfy errors.Is(ErrNotFound)", err)
+	if errors.Is(err, beads.ErrNotFound) {
+		t.Errorf("err = %v, must NOT satisfy errors.Is(ErrNotFound); absence is unproven", err)
 	}
 }
 

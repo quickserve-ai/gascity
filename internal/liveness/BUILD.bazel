@@ -1,37 +1,36 @@
 load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
-    name = "exec",
+    name = "liveness",
     srcs = [
-        "exec.go",
-        "json.go",
+        "keys.go",
+        "mode.go",
+        "plan.go",
+        "schema.go",
+        "store.go",
     ],
-    importpath = "github.com/gastownhall/gascity/internal/beads/exec",
+    importpath = "github.com/gastownhall/gascity/internal/liveness",
     visibility = ["//:__subpackages__"],
-    deps = ["//internal/beads"],
+    deps = [
+        "//internal/beadmeta",
+        "@com_github_go_sql_driver_mysql//:mysql",
+    ],
 )
 
 go_test(
-    name = "exec_test",
+    name = "liveness_test",
     srcs = [
-        "br_script_test.go",
-        "exec_test.go",
-        "idprefix_test.go",
-        "json_awaittype_test.go",
+        "liveness_test.go",
+        "sqlstore_dolt_test.go",
         "testenv_import_test.go",
     ],
     data = glob(
         ["**"],
         exclude = ["BUILD.bazel"],
-    ) + [
-        "//:go.mod",
-        "//contrib:all_files",
-    ],
-    embed = [":exec"],
+    ),
+    embed = [":liveness"],
     deps = [
-        "//internal/beads",
-        "//internal/beads/beadstest",
-        "//internal/testenv",
+        "@com_github_go_sql_driver_mysql//:mysql",
     ],
 )
 

@@ -32,6 +32,7 @@ go_test(
     name = "beadstest_test",
     srcs = [
         "conformance_skips_test.go",
+        "pinned_module_replace_test.go",
         "pinned_module_test.go",
         "recording_store_test.go",
         "testenv_import_test.go",

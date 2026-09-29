@@ -338,7 +338,7 @@ func TestHookClaimSessionFenceReusesLoadedConfig(t *testing.T) {
 	}
 
 	before := loadCityConfigCalls.Load()
-	verdict, reason := classifyHookClaimSession(cityDir, cfg, sessionID, "live-token")
+	verdict, reason, _ := classifyHookClaimSession(cityDir, cfg, sessionID, "live-token")
 	grew := loadCityConfigCalls.Load() - before
 
 	// Assert the verdict first: a fence whose store open failed would also add no

@@ -432,15 +432,15 @@ func checkCondition(a Order, opts TriggerOptions) TriggerResult {
 		// not cause (OOM killer, external SIGKILL), where ExitCode() is a
 		// meaningless -1.
 		//
-		// Only exit 1 is "condition not met": packs author checks as
+		// Only a silent exit 1 is "condition not met": packs author checks as
 		// `[ gate ] && test state`, and test and grep reserve exit >= 2 for an
-		// error. A probe that can never fire (exit 127, a missing binary) must
-		// not read as a quiet "not due" forever, so everything else carries
-		// ConditionProbeErrorMarker, with the redacted stderr excerpt when the
-		// check wrote one (carry: upstream #6679 reads an empty-stderr exit N
-		// as not met; this fork keeps the exit-1 convention, ga-44iyd).
+		// error, so a probe that can never fire (exit 127, a missing binary)
+		// must not read as a quiet "not due" forever (ga-44iyd); and a check
+		// that wrote to stderr is reporting a fault whatever its exit code
+		// (upstream #6679). Everything else carries ConditionProbeErrorMarker,
+		// with the redacted stderr excerpt when the check wrote one.
 		var exitErr *exec.ExitError
-		if ctx.Err() == nil && errors.As(err, &exitErr) && exitErr.Exited() && exitErr.ExitCode() == 1 {
+		if excerpt == "" && ctx.Err() == nil && errors.As(err, &exitErr) && exitErr.Exited() && exitErr.ExitCode() == 1 {
 			return TriggerResult{Due: false, Reason: "condition: not met (exit 1)"}
 		}
 		reason := fmt.Sprintf("%s: %v", ConditionProbeErrorMarker, err)

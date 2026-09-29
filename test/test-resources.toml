@@ -10,8 +10,8 @@ version = 2
 [[audit_baseline]]
 scope = "all"
 resource = "subprocess"
-baseline_calls = 714
-baseline_files = 210
+baseline_calls = 741
+baseline_files = 219
 reported_calls = 495
 reported_files = 135
 owner_bead = "ga-cp3hwi"
@@ -23,8 +23,8 @@ expires = "2026-10-31"
 [[audit_baseline]]
 scope = "all"
 resource = "fixed_sleep"
-baseline_calls = 490
-baseline_files = 179
+baseline_calls = 506
+baseline_files = 183
 reported_calls = 447
 reported_files = 157
 owner_bead = "ga-cp3hwi"
@@ -51,8 +51,8 @@ expires = "2026-10-31"
 [[debt]]
 scope = "untagged"
 resource = "subprocess"
-baseline_calls = 481
-baseline_files = 139
+baseline_calls = 505
+baseline_files = 147
 reported_calls = 380
 reported_files = 98
 owner_bead = "ga-cp3hwi"
@@ -64,8 +64,8 @@ expires = "2026-10-31"
 [[debt]]
 scope = "untagged"
 resource = "fixed_sleep"
-baseline_calls = 319
-baseline_files = 122
+baseline_calls = 330
+baseline_files = 125
 reported_calls = 295
 reported_files = 114
 owner_bead = "ga-cp3hwi"
@@ -142,8 +142,8 @@ expires = "2026-10-31"
 [[debt]]
 scope = "untagged"
 resource = "net_listen"
-baseline_calls = 97
-baseline_files = 37
+baseline_calls = 100
+baseline_files = 39
 reported_calls = 92
 reported_files = 34
 owner_bead = "ga-cp3hwi"
@@ -406,17 +406,6 @@ resource_owner = "the one go run subprocess is confined to TestAddTestenvImportS
 migration_target = "P0.4b"
 expires = "2026-10-31"
 
-[[medium]]
-package_dir = "scripts"
-package_name = "scripts_test"
-owner = "TestMolScopedWorkTeardownScript"
-resources = ["subprocess"]
-owner_bead = "pl-4k0"
-invariant = "the mol-scoped-work cleanup-worktree behavior proof is a checked Medium subprocess owner"
-resource_owner = "the one bash subprocess is confined to TestMolScopedWorkTeardownScript, which runs scripts/test-mol-scoped-work-teardown.sh: the step under test is agent-executed shell rendered from formula TOML, so only running that shell against a stub gc can prove what it does"
-migration_target = "P0.4b"
-expires = "2026-10-01"
-
 # A reviewed-hermetic-body row is narrower than a Small test declaration. It
 # proves that the exact untagged test body and statically reachable
 # receiverless same-package helpers contain none of the cataloged resources.
@@ -454,8 +443,8 @@ medium_reason = "package TestMain mutates process state"
 [[small_debt]]
 scope = "untagged"
 resource = "subprocess"
-baseline_calls = 462
-baseline_files = 132
+baseline_calls = 484
+baseline_files = 138
 reported_calls = 394
 reported_files = 105
 owner_bead = "ga-cp3hwi"
@@ -467,8 +456,8 @@ expires = "2026-10-31"
 [[small_debt]]
 scope = "untagged"
 resource = "fixed_sleep"
-baseline_calls = 319
-baseline_files = 122
+baseline_calls = 330
+baseline_files = 125
 reported_calls = 287
 reported_files = 113
 owner_bead = "ga-cp3hwi"
@@ -545,8 +534,8 @@ expires = "2026-10-31"
 [[small_debt]]
 scope = "untagged"
 resource = "net_listen"
-baseline_calls = 95
-baseline_files = 36
+baseline_calls = 98
+baseline_files = 38
 reported_calls = 92
 reported_files = 34
 owner_bead = "ga-cp3hwi"

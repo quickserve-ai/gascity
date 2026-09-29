@@ -6115,6 +6115,43 @@ func TestBlockedQueuedMailNudgeReason_ReReadsMessageAtDelivery(t *testing.T) {
 	}
 }
 
+// indeterminateGetStore answers every Get with the beads-level "absence
+// unproven" error, the shape BdStore returns when the wisp leg of a lookup did
+// not complete. Wrapped by beadmail.New, it exercises the real bead↔mail
+// boundary (beadmailError), not a forged mail-level error.
+type indeterminateGetStore struct{ beads.Store }
+
+func (s indeterminateGetStore) Get(id string) (beads.Bead, error) {
+	return beads.Bead{}, fmt.Errorf("getting bead %q: %w: dolt i/o timeout", id, beads.ErrVerifyIndeterminate)
+}
+
+// TestBlockedQueuedMailNudgeReason_IndeterminateLookupIsNotWithdrawn pins
+// astra #4 at re-sync #4: a mail lookup that merely failed used to read as
+// mail.ErrNotFound at the beadmail boundary and the queued nudge was withdrawn
+// as "mail-missing" — an irreversible terminalize on an unproven absence. It
+// is a read error now: the split returns it, and both delivery callers release
+// every claim so the next drain or poller pass retries.
+func TestBlockedQueuedMailNudgeReason_IndeterminateLookupIsNotWithdrawn(t *testing.T) {
+	mp := beadmail.New(indeterminateGetStore{Store: beads.NewMemStore()})
+	item := queuedNudge{ID: "n-murky", Agent: "worker", Source: "mail", Reference: &nudgeReference{Kind: "mail", ID: "gc-murky"}}
+
+	reason, block, err := blockedQueuedNudgeReason(nil, mp, item)
+	if err == nil || block || reason != "" {
+		t.Fatalf("blockedQueuedNudgeReason = (%q, %v, %v); want the read error, no withdrawal", reason, block, err)
+	}
+	if !errors.Is(err, mail.ErrLookupIndeterminate) {
+		t.Fatalf("err = %v, want mail.ErrLookupIndeterminate surfaced to the caller", err)
+	}
+
+	deliverable, blocked, err := splitQueuedNudgesForDelivery(nil, mp, []queuedNudge{item})
+	if err == nil {
+		t.Fatalf("splitQueuedNudgesForDelivery = (%v, %v, nil); want the read error so the claims are released", deliverable, blocked)
+	}
+	if len(blocked["mail-missing"]) != 0 {
+		t.Fatalf("an indeterminate lookup was withdrawn as mail-missing: %#v", blocked["mail-missing"])
+	}
+}
+
 // TestSplitQueuedNudgesForDelivery_MailNudges exercises the same
 // re-validation through the delivery-splitting entry point the drain and
 // poller paths actually call, rather than the leaf predicate directly.

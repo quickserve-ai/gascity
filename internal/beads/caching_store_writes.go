@@ -43,8 +43,8 @@ func (c *CachingStore) createWith(create func() (Bead, error)) (Bead, error) {
 	// touches the reconcile backoff anchor, see lastSyncFailureAt): an
 	// unrecorded one let the cache serve a row that verification could not find,
 	// and nothing said so (ga-th31cy). What the failure does to the row depends on what it proved:
-	//   - a lookup that did not complete (ErrVerifyIndeterminate, which also
-	//     satisfies errors.Is(ErrNotFound)) or any other read error proves
+	//   - a lookup that did not complete (ErrVerifyIndeterminate, which is
+	//     not an ErrNotFound) or any other read error proves
 	//     nothing, so the row is absorbed DIRTY and the next read goes to
 	//     storage instead of trusting this snapshot;
 	//   - a plain not-found stays absorbed clean. Some stores cannot read back

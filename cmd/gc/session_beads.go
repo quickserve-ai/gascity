@@ -1993,7 +1993,18 @@ func syncSessionBeadsWithSnapshotAndRigStores(
 			if strings.TrimSpace(b.Metadata["session_name"]) == spec.SessionName {
 				continue
 			}
-			if !closeSessionBeadIfRuntimeStoppedAndUnassigned(cityPath, store, rigStores, sp, cfg, b, "reconfigured", "reconfigured named session", now, stderr) {
+			// A pool shadow adopted under this identity (ga-dfp1b) still runs
+			// under its shadow name, which the desired state drives; the
+			// canonical session replaces it, so its runtime is stopped first
+			// — after the work check, never over assigned work — and the
+			// guard below then retires the bead. A plain rename keeps
+			// upstream's decline: nothing stops a running session behind an
+			// operator's back.
+			shadowStopped := true
+			if shadowAdoptedByDesired(strings.TrimSpace(b.Metadata["session_name"]), cityName, cfg, desiredState) {
+				shadowStopped = stopAdoptedPoolShadowRuntime(cityPath, store, rigStores, sp, cfg, b, stderr)
+			}
+			if !shadowStopped || !closeSessionBeadIfRuntimeStoppedAndUnassigned(cityPath, store, rigStores, sp, cfg, b, "reconfigured", "reconfigured named session", now, stderr) {
 				// Only a bead that can still CONTINUE the identity blocks a fresh
 				// one. An archived, continuity-ineligible bead (a removed named
 				// session) has already given up its alias and session_name; it
@@ -3735,6 +3746,55 @@ func closeSessionBeadIfRuntimeStoppedAndUnassigned(
 		return closeFailedCreateBead(sessionFrontDoor(store), b.ID, now, stderr)
 	}
 	return closeBead(store, cfg, b.ID, closeReason, now, stderr)
+}
+
+// shadowAdoptedByDesired reports whether the bead named sessionName is a pool shadow the desired state
+// has adopted under a configured named identity (ga-dfp1b): its session name
+// is desired with a named identity, yet it is not that identity's canonical
+// session name, so the canonical named session replaces it. Its runtime is
+// stopped first (stopRuntimeBeforeSessionBeadMutation, upstream's own
+// stop-then-mutate shape) and the ordinary close guard then retires the bead;
+// upstream #6596's running-runtime decline stays in force for every other bead.
+func shadowAdoptedByDesired(sessionName, cityName string, cfg *config.City, desiredState map[string]TemplateParams) bool {
+	if cfg == nil || sessionName == "" {
+		return false
+	}
+	tp, ok := desiredState[sessionName]
+	if !ok || strings.TrimSpace(tp.ConfiguredNamedIdentity) == "" {
+		return false
+	}
+	spec, found := findNamedSessionSpec(cfg, cityName, tp.ConfiguredNamedIdentity)
+	return found && spec.SessionName != "" && spec.SessionName != sessionName
+}
+
+// stopAdoptedPoolShadowRuntime stops the runtime of a pool shadow the desired
+// state has adopted under a configured named identity, so the ordinary close
+// guard can retire the bead. Assigned work is checked FIRST, as the carry's
+// pre-#6596 close guard did: a shadow that still holds open work keeps running,
+// and the close guard declines it on the same finding. It reports false when
+// the runtime was not stopped — work held, the work check failed, or the stop
+// itself failed — and the caller then takes the decline path.
+func stopAdoptedPoolShadowRuntime(
+	cityPath string,
+	store beads.Store,
+	rigStores map[string]beads.Store,
+	sp runtime.Provider,
+	cfg *config.City,
+	b beads.Bead,
+	stderr io.Writer,
+) bool {
+	if stderr == nil {
+		stderr = io.Discard
+	}
+	hasAssignedWork, err := sessionHasOpenAssignedWorkForConfig(cityPath, cfg, store, rigStores, b)
+	if err != nil {
+		fmt.Fprintf(stderr, "session work guard: checking assigned work for %s: %v\n", b.ID, err) //nolint:errcheck
+		return false
+	}
+	if hasAssignedWork {
+		return false
+	}
+	return stopRuntimeBeforeSessionBeadMutation(store, sp, cfg, b, "adopted pool shadow replaced by its configured named session", stderr)
 }
 
 func stopRuntimeBeforeSessionBeadMutation(

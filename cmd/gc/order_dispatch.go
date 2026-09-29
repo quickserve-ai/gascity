@@ -653,27 +653,12 @@ func (m *memoryOrderDispatcher) dispatch(ctx context.Context, cityPath string, n
 	if m.maxDispatchesPerTick > 0 {
 		start = m.nextDispatchStart % total
 	}
-	// spendDispatchBudget records one dispatch against the per-tick budget.
-	// unvisited is how many phase-2 candidates the fire loop has not reached
-	// yet: when the budget exhausts with unvisited > 0, orders that passed the
-	// phase-1 gates were left unvisited this pass.
-	spendDispatchBudget := func(idx, unvisited int) bool {
+	spendDispatchBudget := func(idx int) bool {
 		budgetSpent++
 		if m.maxDispatchesPerTick > 0 {
 			m.nextDispatchStart = (idx + 1) % total
 		}
-		if m.maxDispatchesPerTick > 0 && budgetSpent >= m.maxDispatchesPerTick {
-			if unvisited > 0 {
-				// The pass ends with orders unvisited. Under sustained
-				// overload (steady-state due demand above cap x tick rate)
-				// every short-interval order dilutes toward the round-robin
-				// rotation cadence; this line is the durable record that the
-				// budget, not the orders, set the pace (ga-44iyd).
-				logDispatchError(m.stderr, "gc: order dispatch: per-tick budget (%d) spent with %d order(s) unvisited; they wait for the next tick — raise [orders] max_dispatches_per_tick if LATE fires persist", m.maxDispatchesPerTick, unvisited)
-			}
-			return true
-		}
-		return false
+		return m.maxDispatchesPerTick > 0 && budgetSpent >= m.maxDispatchesPerTick
 	}
 
 	// Phase 1: resolve and open-tracking-gate every order, in rotation order.

@@ -38,6 +38,7 @@ go_library(
     embedsrcs = [
         "agents/dog/agent.toml",
         "agents/dog/prompt.template.md",
+        "assets/scripts/_backup_stamp.sh",
         "assets/scripts/_notify.sh",
         "assets/scripts/advisory_state.sh",
         "assets/scripts/compact-gain-drift-proof.sh",
@@ -123,6 +124,7 @@ go_test(
         "stale_db_formula_test.go",
         "status_test.go",
         "sync_ffclassify_test.go",
+        "sync_multiremote_test.go",
         "sync_test.go",
         "testenv_import_test.go",
     ],

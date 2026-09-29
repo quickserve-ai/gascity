@@ -2407,8 +2407,7 @@ func TestCloseSessionBeadIfRuntimeStoppedAndUnassigned_RunningSessionDeclinesWit
 	var stderr bytes.Buffer
 	closed := closeSessionBeadIfRuntimeStoppedAndUnassigned(
 		"",
-		store, nil, sp, nil, b, "orphaned", "orphaned session", now, &stderr,
-	)
+		store, nil, sp, nil, b, "orphaned", "orphaned session", now, &stderr)
 
 	if closed {
 		t.Fatal("closeSessionBeadIfRuntimeStoppedAndUnassigned closed bead while runtime was still running -- it must decline, not kill-then-close")
@@ -2460,8 +2459,7 @@ func TestCloseSessionBeadIfRuntimeStoppedAndUnassigned_AlreadyStoppedClosesAsBef
 	var stderr bytes.Buffer
 	closed := closeSessionBeadIfRuntimeStoppedAndUnassigned(
 		"",
-		store, nil, sp, nil, b, "suspended", "suspended session", now, &stderr,
-	)
+		store, nil, sp, nil, b, "suspended", "suspended session", now, &stderr)
 
 	if !closed {
 		t.Fatalf("closeSessionBeadIfRuntimeStoppedAndUnassigned did not close bead for an already-stopped, unassigned session; stderr=%q", stderr.String())
@@ -2525,8 +2523,7 @@ func TestCloseSessionBeadIfRuntimeStoppedAndUnassignedPreservesConfiguredNamedSe
 	var stderr bytes.Buffer
 	closed := closeSessionBeadIfRuntimeStoppedAndUnassigned(
 		"",
-		store, nil, sp, cfg, b, "suspended", "suspended session", now, &stderr,
-	)
+		store, nil, sp, cfg, b, "suspended", "suspended session", now, &stderr)
 
 	if closed {
 		t.Fatal("closeSessionBeadIfRuntimeStoppedAndUnassigned closed bead with QualifiedName-assigned work")
@@ -7309,7 +7306,7 @@ func TestReapStaleSessionBeads_BeadScopedPoolRowHeldUntilTeardownConfirmed(t *te
 		now := created.CreatedAt.Add(staleCreatingStateTimeout + time.Minute)
 
 		var stderr bytes.Buffer
-		if got := reapStaleSessionBeads(store, sp, nil, &clock.Fake{Time: now}, &stderr); got != 0 {
+		if got := reapStaleSessionBeads(store, nil, sp, nil, &clock.Fake{Time: now}, &stderr); got != 0 {
 			t.Fatalf("reapStaleSessionBeads() = %d, want 0 while the runtime teardown fails\nstderr: %s", got, stderr.String())
 		}
 		if got, _ := store.Get(created.ID); got.Status == "closed" {
@@ -7321,7 +7318,7 @@ func TestReapStaleSessionBeads_BeadScopedPoolRowHeldUntilTeardownConfirmed(t *te
 
 		delete(sp.StopErrors, name)
 		stderr.Reset()
-		if got := reapStaleSessionBeads(store, sp, nil, &clock.Fake{Time: now}, &stderr); got != 1 {
+		if got := reapStaleSessionBeads(store, nil, sp, nil, &clock.Fake{Time: now}, &stderr); got != 1 {
 			t.Fatalf("reapStaleSessionBeads() after recovery = %d, want 1\nstderr: %s", got, stderr.String())
 		}
 		if got, _ := store.Get(created.ID); got.Status != "closed" {
@@ -7349,7 +7346,7 @@ func TestReapStaleSessionBeads_BeadScopedPoolRowHeldUntilTeardownConfirmed(t *te
 		now := created.CreatedAt.Add(staleCreatingStateTimeout + time.Minute)
 
 		var stderr bytes.Buffer
-		if got := reapStaleSessionBeads(store, sp, nil, &clock.Fake{Time: now}, &stderr); got != 1 {
+		if got := reapStaleSessionBeads(store, nil, sp, nil, &clock.Fake{Time: now}, &stderr); got != 1 {
 			t.Fatalf("reapStaleSessionBeads() = %d, want 1 for a non-pool row\nstderr: %s", got, stderr.String())
 		}
 		if got, _ := store.Get(created.ID); got.Status != "closed" {

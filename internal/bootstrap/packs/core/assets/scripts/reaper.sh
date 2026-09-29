@@ -127,10 +127,11 @@ TOTAL_WOULD_PURGE=0
 TOTAL_MAIL_WISPS=0
 TOTAL_WORKFLOW_ROOTS_CLOSED=0
 TOTAL_WOULD_CLOSE_WORKFLOW_ROOTS=0
-# bd stores UTC in every timestamp column, so each age cutoff and each
-# closed_at write below uses UTC_TIMESTAMP(). The server-local clock is off by
-# the host's UTC offset and shifts an hour at each DST change. Closes also set
-# updated_at, because bd's ON UPDATE clause on that column uses the local clock.
+# bd stores UTC in every timestamp column, so each age cutoff below uses
+# UTC_TIMESTAMP(). The server-local clock is off by the host's UTC offset and
+# shifts an hour at each DST change. Closes go through `gc bd` (upstream
+# #6751), which stamps closed_at and updated_at itself; this script writes no
+# timestamp of its own.
 TOTAL_WOULD_CLOSE_STALE=0
 TOTAL_WORKFLOW_ROOTS_STORE_REF_SKIPPED=0
 TOTAL_WORKFLOW_ISSUE_ROOTS_SKIPPED=0
@@ -836,7 +837,7 @@ reap_scope() {
             WHERE i.status IN ('open', 'in_progress')
             AND d.depends_on_issue_id IS NOT NULL
         )
-        -- A directive stays binding because its trigger is rare, so age alone must never close it.
+        -- A directive stays binding because its trigger is rare, so age alone never reaps it.
         -- NOT EXISTS, not a second NOT IN: Dolt 2.2.4 then drops the NOT from the dependency guard above.
         AND NOT EXISTS (SELECT 1 FROM \`$DB\`.labels od WHERE od.issue_id = issues.id AND od.label = 'operator-directive')
     "; then
