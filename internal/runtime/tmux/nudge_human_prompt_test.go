@@ -879,3 +879,65 @@ func (g guardIdleExecutor) execute(args []string) (string, error) {
 func (g guardIdleExecutor) executeCtx(_ context.Context, args []string) (string, error) {
 	return g.execute(args)
 }
+
+// ompAskBoxFixture is omp's Ask box as a live omp pane drew it on 2026-09-29
+// (the box a Codex-model pool worker raised on pl-022h): the tool-call echo in
+// scrollback, then the live box, with no composer below it. Its cursor row
+// starts with the same ❯ as Claude's composer.
+const ompAskBoxFixture = `├─── [option] · options:2 ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│  Which option?                                                                                                                                               │
+│  ○ Alpha                                                                                                                                                     │
+│  ○ Beta                                                                                                                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+ 2026-09-28 22:30:04  ⤵ 24K  ⤴ 76  ⏱ 2.2s  ⚡ 17.5/s
+ Fallback succeeded on openai-codex/gpt-6-astra
+  ⎋ Presenting requested canary choice                                                                                             Choose Between Alpha and Beta
+╭─ Ask ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ Which option?                                                                                                                                                │
+├──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ ❯ ○ Alpha (Recommended)                                                                                                                                      │
+│   ○ Beta                                                                                                                                                     │
+│   ○ Other (type your own)                                                                                                                                    │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+├──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ Enter select · n note · ↑/↓ move · Esc cancel                                                                                                                │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯`
+
+// TestNudgeSessionSendsNoKeysIntoAnOmpAskBox: the phantom-answer mechanism
+// fired live on omp (pl-022h), where the dialog has unnumbered radio rows and
+// its own footer. Detached or attached, nothing may be typed.
+func TestNudgeSessionSendsNoKeysIntoAnOmpAskBox(t *testing.T) {
+	for _, attached := range []bool{false, true} {
+		fe := &panePromptExecutor{screen: ompAskBoxFixture, attached: attached}
+		tm, session := newGuardTestTmux(fe)
+		err := tm.NudgeSession(session, guardTestNudge)
+		if keys := fe.keyCalls(); len(keys) != 0 {
+			t.Fatalf("attached=%v: NudgeSession sent %q into an omp Ask box", attached, keys)
+		}
+		assertDeferred(t, err, NudgeDeferReasonQuestionDialog)
+	}
+}
+
+func TestClassifyOmpAskBox(t *testing.T) {
+	lines := strings.Split(ompAskBoxFixture, "\n")
+	if got := classifyHumanPrompt(lines, "❯ ", false); got != NudgeDeferReasonQuestionDialog {
+		t.Fatalf("omp Ask box classified %q, want question_dialog", got)
+	}
+	var noFooter []string
+	for _, l := range lines {
+		if !strings.Contains(l, "Enter select") {
+			noFooter = append(noFooter, l)
+		}
+	}
+	if got := classifyHumanPrompt(noFooter, "❯ ", false); got == "" {
+		t.Fatal("radio rows under a cursor, footer cut off: classified safe")
+	}
+	// Control: the same box quoted in scrollback above a live, idle composer
+	// is history, not a prompt.
+	quoted := strings.Split(ompAskBoxFixture+"\n"+idleComposerFixture, "\n")
+	if got := classifyHumanPrompt(quoted, "❯ ", false); got != "" {
+		t.Fatalf("an Ask box in scrollback above an idle composer classified %q, want safe", got)
+	}
+}
