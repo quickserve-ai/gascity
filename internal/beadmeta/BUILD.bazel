@@ -4,12 +4,15 @@ go_library(
     name = "beadmeta",
     srcs = [
         "attempt.go",
+        "cert_park.go",
         "control_close.go",
+        "hold.go",
         "hold_labels.go",
         "keys.go",
         "keyshape.go",
         "kindsets.go",
         "path.go",
+        "release_proposed.go",
         "reserved_prefixes.go",
         "runid.go",
         "values.go",
@@ -22,6 +25,7 @@ go_test(
     name = "beadmeta_test",
     srcs = [
         "attempt_test.go",
+        "cert_park_test.go",
         "control_close_test.go",
         "guard_test.go",
         "hold_labels_test.go",

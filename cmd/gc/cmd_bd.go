@@ -645,7 +645,7 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 					// ErrNotFound or any other error: bead may be absent, ephemeral,
 					// or the read seam differs from the write seam — fall through.
 				}
-				if code, blocked := guardUnmergedPRClose(bdArgs, writeIDs, store, stderr); blocked {
+				if code, blocked := guardUnmergedPRClose(bdArgs, writeIDs, guardBeads, store, stderr); blocked {
 					return code
 				}
 			}
@@ -855,7 +855,7 @@ func bdCloseShape(args []string) (isClose, forced bool) {
 // never depend on GitHub availability. Returns (exitCode, true) when
 // the close is blocked; the command has not been forwarded to bd yet,
 // so a block leaves every bead untouched.
-func guardUnmergedPRClose(bdArgs []string, ids []string, store beads.Store, stderr io.Writer) (int, bool) {
+func guardUnmergedPRClose(bdArgs []string, ids []string, fetched map[string]beads.Bead, store beads.Store, stderr io.Writer) (int, bool) {
 	if !prguard.Enabled() {
 		return 0, false
 	}
@@ -864,11 +864,17 @@ func guardUnmergedPRClose(bdArgs []string, ids []string, store beads.Store, stde
 		return 0, false
 	}
 	for _, id := range ids {
-		bead, err := store.Get(id)
-		if err != nil {
-			// Absent/ephemeral/projection-lag rows: same fall-through
-			// contract as the collision guard above.
-			continue
+		// The write-ID guard already read every id (one batched bd show for a
+		// bulk close); only an id it could not resolve costs a Get here.
+		bead, ok := fetched[id]
+		if !ok {
+			var err error
+			bead, err = store.Get(id)
+			if err != nil {
+				// Absent/ephemeral/projection-lag rows: same fall-through
+				// contract as the collision guard above.
+				continue
+			}
 		}
 		if prguard.MetadataPRURL(bead.Metadata) == "" {
 			continue

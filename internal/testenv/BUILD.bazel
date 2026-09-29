@@ -13,6 +13,7 @@ go_library(
 go_test(
     name = "testenv_test",
     srcs = [
+        "ambient_credentials_test.go",
         "bazel_tools_internal_test.go",
         "gc_env_baseline_test.go",
         "legacy_flag_freeze_test.go",
@@ -36,6 +37,7 @@ go_test(
     deps = [
         "//internal/bazeltest",
         "//internal/beads/contract",
+        "//internal/processenv",
         "//internal/rollout",
     ],
 )

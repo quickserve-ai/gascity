@@ -443,6 +443,11 @@ func TestBdStoreGetEphemeralFallbackErrorIsNotErrNotFound(t *testing.T) {
 	if errors.Is(err, beads.ErrNotFound) {
 		t.Fatalf("err = %v; a failed wisp fallback must not read as ErrNotFound", err)
 	}
+	// Carry (ga-0ejdbv, fork #118): the failed leg is typed, so a caller that
+	// must tell "could not look" from "looked, absent" can branch on it.
+	if !errors.Is(err, beads.ErrVerifyIndeterminate) {
+		t.Fatalf("err = %v; a failed wisp fallback must read as ErrVerifyIndeterminate (absence unproven)", err)
+	}
 	if !strings.Contains(err.Error(), "connection refused") {
 		t.Fatalf("err = %v, want the underlying wisp query error", err)
 	}

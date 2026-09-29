@@ -18,6 +18,7 @@ go_test(
         "br_test.go",
         "exec_test.go",
         "idprefix_test.go",
+        "json_awaittype_test.go",
         "testenv_import_test.go",
     ],
     data = glob(
