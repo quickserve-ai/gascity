@@ -775,6 +775,12 @@ func newReaperStaleIssueFixture(t *testing.T, serverTZ, seedSQL string) *reaperS
 	}
 	port := startDoltServerForMaintenanceTest(t, doltPath, dataDir, serverEnv...)
 	waitForDoltServerForMaintenanceTest(t, doltPath, port, "citydb")
+	f := &reaperStaleIssueFixture{doltPath: doltPath, port: port}
+	if serverTZ != "" {
+		// Dolt 2.1 serves NOW() from the process TZ; Dolt >= 2.2 boots with
+		// @@global.time_zone = '+00:00' and ignores it until told otherwise.
+		f.column(t, "SET @@global.time_zone = 'SYSTEM'")
+	}
 	writeCityBeadsMetadata(t, cityDir, "citydb")
 
 	binDir := t.TempDir()
@@ -782,21 +788,9 @@ func newReaperStaleIssueFixture(t *testing.T, serverTZ, seedSQL string) *reaperS
 	if err := os.Symlink(doltPath, filepath.Join(binDir, "dolt")); err != nil {
 		t.Fatalf("Symlink(dolt): %v", err)
 	}
-	writeExecutable(t, filepath.Join(binDir, "bd"), `#!/bin/sh
-set -e
-printf '%s\n' "$*" >> "$BD_CALL_LOG"
-case "$1" in
-  prune)
-    printf '{"pruned_count":0}\n'
-    ;;
-  close)
-    issue_id="$2"
-    DOLT_CLI_PASSWORD="${GC_DOLT_PASSWORD:-}" dolt --host "$GC_DOLT_HOST" --port "$GC_DOLT_PORT" --user "$GC_DOLT_USER" --no-tls --use-db citydb sql \
-      -q "UPDATE issues SET status='closed', closed_at=UTC_TIMESTAMP() WHERE id='${issue_id}'; CALL DOLT_COMMIT('-Am', 'test bd close')"
-    ;;
-esac
-exit 0
-`)
+	// Step 1 closes orphan wisps through `gc bd close` too (upstream #6751),
+	// so the double must apply a close to the wisps table as well as issues.
+	writeRealDoltBdDouble(t, filepath.Join(binDir, "bd"))
 	writeMaintenanceGCStub(t, filepath.Join(binDir, "gc"), `#!/bin/sh
 case "$1 $2" in
   "session prune")
@@ -806,21 +800,19 @@ esac
 exit 0
 `)
 
-	return &reaperStaleIssueFixture{
-		doltPath: doltPath,
-		port:     port,
-		bdLog:    bdLog,
-		env: map[string]string{
-			"BD_CALL_LOG":      bdLog,
-			"GC_CITY":          cityDir,
-			"GC_CITY_PATH":     cityDir,
-			"GC_DOLT_HOST":     "127.0.0.1",
-			"GC_DOLT_PORT":     fmt.Sprintf("%d", port),
-			"GC_DOLT_USER":     "root",
-			"GC_DOLT_PASSWORD": "",
-			"PATH":             binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
-		},
+	f.bdLog = bdLog
+	f.env = map[string]string{
+		"BD_CALL_LOG":      bdLog,
+		"GC_CITY":          cityDir,
+		"GC_CITY_PATH":     cityDir,
+		"GC_DOLT_HOST":     "127.0.0.1",
+		"GC_DOLT_PORT":     fmt.Sprintf("%d", port),
+		"GC_DOLT_USER":     "root",
+		"GC_DOLT_PASSWORD": "",
+		"FAKE_SCOPE_DBS":   "city=citydb",
+		"PATH":             binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
 	}
+	return f
 }
 
 // runReaper runs reaper.sh against the fixture with extraEnv layered on top
