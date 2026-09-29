@@ -1,25 +1,25 @@
 load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
-    name = "doltauth",
-    srcs = ["auth.go"],
-    importpath = "github.com/gastownhall/gascity/internal/doltauth",
+    name = "notify",
+    srcs = [
+        "notify.go",
+    ],
+    importpath = "github.com/gastownhall/gascity/internal/notify",
     visibility = ["//:__subpackages__"],
-    deps = ["//internal/beads/contract"],
 )
 
 go_test(
-    name = "doltauth_test",
+    name = "notify_test",
     srcs = [
-        "ambient_identity_scope_test.go",
-        "auth_test.go",
+        "notify_test.go",
         "testenv_import_test.go",
     ],
-    embed = [":doltauth"],
-    deps = [
-        "//internal/beads/contract",
-        "//internal/testenv",
-    ],
+    data = glob(
+        ["**"],
+        exclude = ["BUILD.bazel"],
+    ),
+    embed = [":notify"],
 )
 
 # --- bazel_repo_srcs (managed by tools/bazel/repo_tree.py) ---

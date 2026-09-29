@@ -633,21 +633,12 @@ INSERT INTO wisp_dependencies (issue_id, depends_on_issue_id, type) VALUES
 		"utc-young": "open",
 	})
 
-	// Step 1 closed the orphan wisp. Its closed_at and updated_at must be
-	// UTC; the server-local clock would put them 330 minutes in the future.
-	// updated_at is the ON UPDATE column, so the close must set it explicitly.
+	// Step 1 closed the orphan wisp through `gc bd close` (upstream #6751):
+	// bd owns the close timestamps, so the reaper writes no closed_at or
+	// updated_at of its own any more; the beads UTC row covers bd's side.
 	requireMaintenanceStatuses(t, queryMaintenanceStatusByID(t, f.doltPath, f.port, "citydb", "wisps"), map[string]string{
 		"utc-orphan-wisp": "closed",
 	})
-	for _, column := range []string{"closed_at", "updated_at"} {
-		skew := f.column(t, fmt.Sprintf("SELECT ABS(TIMESTAMPDIFF(MINUTE, %s, UTC_TIMESTAMP())) FROM wisps WHERE id = 'utc-orphan-wisp'", column))
-		if len(skew) != 1 {
-			t.Fatalf("%s skew query returned %q, want one row", column, skew)
-		}
-		if minutes, err := strconv.Atoi(skew[0]); err != nil || minutes > 5 {
-			t.Fatalf("wisp %s is %q minutes from UTC, want at most 5; the close wrote server-local time", column, skew[0])
-		}
-	}
 }
 
 // TestReaperStaleIssueSkipsOperatorDirectiveRealDolt pins step 5's exemption

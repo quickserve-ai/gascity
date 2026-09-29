@@ -274,6 +274,47 @@ func (s *beadPolicyStore) sweepFencedLivenessRows(fenced map[string]map[string]s
 	}
 }
 
+// AtomicConditionalCloserHandle puts the policy layer in front of the fenced
+// atomic close (upstream #6784, session.Store.CloseWithTerminalPatch). Resolved
+// past this wrapper to the backing's closer, the terminal patch's liveness keys
+// (state, slept_at, ...) committed with no fence and no sweep, so a state=awake
+// row a concurrent wake left in the liveness table shadowed the committed
+// terminal state on every overlaid read — the split Tx forbids, reached by
+// another door. The close still commits atomically on the backing; this
+// handle only fences the patch the way Tx does and sweeps the fenced rows
+// after the commit. It answers false when the backing provides no atomic
+// close, so the caller keeps its Tx arm.
+func (s *beadPolicyStore) AtomicConditionalCloserHandle() (beads.AtomicConditionalCloser, bool) {
+	closer, ok := beads.AtomicConditionalCloserFor(s.Store)
+	if !ok {
+		return nil, false
+	}
+	return &livenessAtomicCloser{policy: s, inner: closer}, true
+}
+
+var _ beads.AtomicConditionalCloserHandleProvider = (*beadPolicyStore)(nil)
+
+// livenessAtomicCloser is the policy store's fenced-close front: the same
+// fence-then-sweep as livenessTx, around one atomic terminal write.
+type livenessAtomicCloser struct {
+	policy *beadPolicyStore
+	inner  beads.AtomicConditionalCloser
+}
+
+func (c *livenessAtomicCloser) CloseWithMetadataIfMatch(id string, expectedRevision int64, metadata map[string]string) (beads.Bead, error) {
+	lt := &livenessTx{policy: c.policy}
+	if len(metadata) > 0 {
+		lt.noteFenced(id, metadata)
+		metadata = liveness.FallbackPlan(metadata, c.policy.lv.Now())
+	}
+	closed, err := c.inner.CloseWithMetadataIfMatch(id, expectedRevision, metadata)
+	if err != nil {
+		return beads.Bead{}, err
+	}
+	c.policy.sweepFencedLivenessRows(lt.fenced)
+	return closed, nil
+}
+
 // livenessTx fences a Store.Tx callback's metadata writes and records which
 // liveness keys it fenced, so Tx can sweep their rows after the commit. See Tx.
 type livenessTx struct {

@@ -34,17 +34,20 @@ var ErrIDCollision = fmt.Errorf("bd resolved a different bead ID (substring coll
 var ErrPinnedIDOutsideNamespace = errors.New("pinned id outside this store's namespaces")
 
 // ErrVerifyIndeterminate is returned when a lookup could not be completed, so
-// the bead's absence is UNPROVEN. It is deliberately a sub-case of ErrNotFound
-// (same idiom as ErrIDCollision above): errors.Is(err, ErrNotFound) stays true
-// so every existing not-found caller behaves exactly as before, while a caller
-// that must not confuse "definitely absent" with "could not look" checks
-// errors.Is(err, ErrVerifyIndeterminate).
+// the bead's absence is UNPROVEN. It is deliberately NOT a sub-case of
+// ErrNotFound: errors.Is(err, ErrNotFound) is the "confirmed absent" verdict
+// that the process-table orphan sweep kills live runtimes on and that the
+// cache's dirty overlay suppresses rows on (upstream #6649), and a lookup that
+// merely timed out must never read as that. A caller that has to tell
+// "definitely absent" from "could not look" checks
+// errors.Is(err, ErrVerifyIndeterminate); every other caller sees a failed
+// read, exactly as it would for any other transport error.
 //
 // This distinction is what makes a read-after-write guard safe. Without it, a
 // verification query that merely TIMED OUT under host load is indistinguishable
 // from a write that never landed, and a guard built on that reading would fail
 // healthy sends at exactly the moment load makes timeouts likely (ga-0ejdbv).
-var ErrVerifyIndeterminate = fmt.Errorf("bead lookup did not complete, absence unproven: %w", ErrNotFound)
+var ErrVerifyIndeterminate = errors.New("bead lookup did not complete, absence unproven")
 
 // ErrMetadataParse is returned when a bead exists but its stored metadata
 // cannot be decoded into the Store object model.
@@ -414,13 +417,31 @@ type AtomicConditionalCloserHandleProvider interface {
 // store implements it. Unlike ConditionalWriterFor, this is not a rollout
 // policy seam: callers must refuse when the underlying store cannot provide
 // this all-or-nothing operation.
+//
+// Resolution asks EVERY wrapper on the ConditionalWritesResolveTarget chain
+// for an AtomicConditionalCloserHandle before following its target, so a
+// wrapper that owns work around the terminal write (the cmd/gc policy store's
+// liveness fence-and-sweep, the cache's eviction) can front the close while
+// still resolving the capability from its backing. A wrapper without a handle
+// is followed through, as before; a handle that answers false ends the
+// search, since the wrapper has already asked its own backing.
 func AtomicConditionalCloserFor(store Store) (AtomicConditionalCloser, bool) {
 	if store == nil {
 		return nil, false
 	}
-	store = followConditionalWritesResolveTarget(store)
-	if provider, ok := store.(AtomicConditionalCloserHandleProvider); ok {
-		return provider.AtomicConditionalCloserHandle()
+	for range conditionalWritesMaxResolveDepth {
+		if provider, ok := store.(AtomicConditionalCloserHandleProvider); ok {
+			return provider.AtomicConditionalCloserHandle()
+		}
+		targeter, ok := store.(ConditionalWritesResolveTargeter)
+		if !ok {
+			break
+		}
+		target := targeter.ConditionalWritesResolveTarget()
+		if target == nil || target == store {
+			break
+		}
+		store = target
 	}
 	closer, ok := store.(AtomicConditionalCloser)
 	return closer, ok

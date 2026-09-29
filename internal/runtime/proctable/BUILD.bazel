@@ -27,7 +27,15 @@ go_library(
         "scan_darwin_command.go",
         "scan_linux.go",
         "scan_stub.go",
-    ],
+    ] + select({
+        "@rules_go//go/platform:darwin": [
+            "kill_target_darwin.go",
+        ],
+        "@rules_go//go/platform:linux": [
+            "kill_target_linux.go",
+        ],
+        "//conditions:default": [],
+    }),
     importpath = "github.com/gastownhall/gascity/internal/runtime/proctable",
     visibility = ["//:__subpackages__"],
     deps = [
@@ -66,7 +74,15 @@ go_test(
         "scan_linux_test.go",
         "supervisor_fork_orphan_repro_test.go",
         "testenv_import_test.go",
-    ],
+    ] + select({
+        "@rules_go//go/platform:darwin": [
+            "kill_target_darwin_test.go",
+        ],
+        "@rules_go//go/platform:linux": [
+            "kill_target_linux_test.go",
+        ],
+        "//conditions:default": [],
+    }),
     embed = [":proctable"],
     deps = [
         "//internal/beads/proxyendpoint",

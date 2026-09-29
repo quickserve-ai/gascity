@@ -1,25 +1,28 @@
 load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
-    name = "doltauth",
-    srcs = ["auth.go"],
-    importpath = "github.com/gastownhall/gascity/internal/doltauth",
+    name = "prguard",
+    srcs = [
+        "prguard.go",
+    ],
+    importpath = "github.com/gastownhall/gascity/internal/prguard",
     visibility = ["//:__subpackages__"],
-    deps = ["//internal/beads/contract"],
+    deps = [
+        "//internal/beadmeta",
+    ],
 )
 
 go_test(
-    name = "doltauth_test",
+    name = "prguard_test",
     srcs = [
-        "ambient_identity_scope_test.go",
-        "auth_test.go",
+        "prguard_test.go",
         "testenv_import_test.go",
     ],
-    embed = [":doltauth"],
-    deps = [
-        "//internal/beads/contract",
-        "//internal/testenv",
-    ],
+    data = glob(
+        ["**"],
+        exclude = ["BUILD.bazel"],
+    ),
+    embed = [":prguard"],
 )
 
 # --- bazel_repo_srcs (managed by tools/bazel/repo_tree.py) ---

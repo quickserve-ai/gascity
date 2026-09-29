@@ -2854,6 +2854,7 @@ func (cr *CityRuntime) reloadConfigTraced(
 		return rejectSuperseded("before provider effects")
 	}
 
+	var providerSwapRunning []string
 	if providerChanged {
 		if err := cr.beforeProviderSwap(nextCfg); err != nil {
 			err = fmt.Errorf("config reload: provider swap: %w", err)
@@ -2885,12 +2886,11 @@ func (cr *CityRuntime) reloadConfigTraced(
 		if pendingProviderName == *lastProviderName {
 			providerSwapSummary = fmt.Sprintf("%s runtime declaration changed", displayProviderName(pendingProviderName))
 		}
-		if len(running) > 0 {
-			fmt.Fprintf(cr.stdout, "Provider changed (%s), stopping %d agent(s)...\n", //nolint:errcheck
-				providerSwapSummary, len(running))
-			gracefulStopAll(running, cr.sp, nextCfg.Daemon.ShutdownTimeoutDuration(), cr.rec, cr.cfg, cr.sessionsBeadStore(), cr.stdout, cr.stderr)
-		}
+		providerSwapRunning = running
 	}
+	// The swapped-out sessions are stopped below, after publication has
+	// replaced cr.sp and cr.cfg, so the stop needs the outgoing pair.
+	outgoingSp, outgoingCfg := cr.sp, cr.cfg
 
 	// Publish to the controller state first and to the loop only if it
 	// accepts, so the tick loop never runs a config the API rejected. On
@@ -2915,6 +2915,18 @@ func (cr *CityRuntime) reloadConfigTraced(
 		err := fmt.Errorf("config reload blocked by native store schema mismatch: %s", diag.PreflightReason)
 		telemetry.RecordConfigReload(ctx, result.Revision, string(source), string(reloadOutcomeFailed), len(warnings), err)
 		return reloadControlReply{Outcome: reloadOutcomeFailed, Error: err.Error(), Revision: result.Revision, Warnings: warnings}
+	}
+	// Only now, past the publishing open, may a provider swap take its
+	// irreversible effect: stopping every session on the outgoing provider.
+	// Publication runs first because its store open is the authoritative
+	// schema gate (ga-mw4dg). The preflight above opens the same store
+	// earlier, and a migration landing between the two opens would otherwise
+	// stop the fleet and only then latch the preserve hold. A superseded
+	// candidate is rejected above with nothing stopped, for the same reason.
+	if providerChanged && len(providerSwapRunning) > 0 {
+		fmt.Fprintf(cr.stdout, "Provider changed (%s), stopping %d agent(s)...\n", //nolint:errcheck
+			providerSwapSummary, len(providerSwapRunning))
+		gracefulStopAll(providerSwapRunning, outgoingSp, nextCfg.Daemon.ShutdownTimeoutDuration(), cr.rec, outgoingCfg, cr.sessionsBeadStore(), cr.stdout, cr.stderr)
 	}
 	if providerChanged {
 		cr.rec.Record(events.Event{

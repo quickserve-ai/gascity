@@ -11021,7 +11021,7 @@ func TestOrderDispatchConfiguredBudgetAboveDefaultFiresMore(t *testing.T) {
 	if got := countOrderTrackingRuns(t, store); got != 6 {
 		t.Fatalf("tracking runs after one tick = %d, want 6 (configured budget above default)", got)
 	}
-	if !strings.Contains(stderr.String(), "per-tick budget (6) spent") {
+	if !strings.Contains(stderr.String(), "per-tick budget 6 spent") { // upstream #5990 wording (logUnreachedCandidates)
 		t.Fatalf("expected budget-exhaustion line naming the cap, got stderr:\n%s", stderr.String())
 	}
 
