@@ -41,25 +41,32 @@ func TestDismissMidSessionDialogBeforeNudge_PeekErrorIsSwallowed(t *testing.T) {
 // the sibling DismissModelSwitchModalIfPresent already honors.
 func TestDismissMidSessionDialogBeforeNudge_SendErrorIsSwallowed(t *testing.T) {
 	sendErr := errors.New("send-keys failed")
+	// The resume selector, not the session-limit chooser: the chooser is a
+	// numbered list the dismissal refuses to key (ga-ubfc7j). Each key is
+	// preceded by a re-read of the screen, so the calls are the peek, the
+	// re-read, then the failing send-keys.
 	fe := &fakeExecutor{
-		outs: []string{sessionLimitChooserPane},
-		errs: []error{nil, sendErr},
+		outs: []string{resumeDialogPane, resumeDialogPane},
+		errs: []error{nil, nil, sendErr},
 	}
 	tm := &Tmux{cfg: DefaultConfig(), exec: fe}
 
 	if dismissed := tm.dismissMidSessionDialogBeforeNudge("agent-pane"); dismissed {
 		t.Error("dismissed = true on send error, want false")
 	}
-	// The chooser matched (capture-pane), then the first dismissal keystroke
-	// failed; the error must be swallowed rather than propagated.
-	if len(fe.calls) < 2 {
-		t.Fatalf("executor calls = %d, want >=2 (capture-pane + send-keys)", len(fe.calls))
+	// The dialog matched (capture-pane), was re-read, then the first dismissal
+	// keystroke failed; the error must be swallowed rather than propagated.
+	if len(fe.calls) < 3 {
+		t.Fatalf("executor calls = %d, want >=3 (capture-pane, re-read, send-keys)", len(fe.calls))
 	}
 	if !slices.Contains(fe.calls[0], "capture-pane") {
 		t.Errorf("first call = %v, want a capture-pane invocation", fe.calls[0])
 	}
-	if !slices.Contains(fe.calls[1], "send-keys") {
-		t.Errorf("second call = %v, want a send-keys invocation", fe.calls[1])
+	if !slices.Contains(fe.calls[1], "capture-pane") {
+		t.Errorf("second call = %v, want the pre-key capture-pane re-read", fe.calls[1])
+	}
+	if !slices.Contains(fe.calls[2], "send-keys") {
+		t.Errorf("third call = %v, want a send-keys invocation", fe.calls[2])
 	}
 }
 
@@ -78,11 +85,16 @@ Enter to confirm · Esc to cancel`
 // the intended nudge (PR #3427 regression). This pins the exact argv of that
 // capture at the executor boundary.
 func TestDismissMidSessionDialogBeforeNudge_UsesVisibleOnlyCapture(t *testing.T) {
-	fe := &fakeExecutor{outs: []string{resumeDialogPane}}
+	// Two captures: the peek, and the re-read before the dismissal key
+	// (ga-ubfc7j). Both must be visible-only.
+	fe := &fakeExecutor{outs: []string{resumeDialogPane, resumeDialogPane}}
 	tm := &Tmux{cfg: DefaultConfig(), exec: fe}
 
 	if dismissed := tm.dismissMidSessionDialogBeforeNudge("agent-pane"); !dismissed {
 		t.Fatal("dismissed = false, want true for a live resume dialog")
+	}
+	if len(fe.calls) < 2 || !slices.Equal(fe.calls[1], []string{"-u", "capture-pane", "-p", "-t", "agent-pane"}) {
+		t.Fatalf("re-read call = %v, want a visible-only capture-pane before the key", fe.calls)
 	}
 	if len(fe.calls) == 0 {
 		t.Fatal("no executor calls recorded")
