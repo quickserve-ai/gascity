@@ -1737,7 +1737,14 @@ func launchOrchestration(ctx context.Context, ops startOps, name string, cfg run
 			// session already received), so by the time it reaches here
 			// delivery is proven and only the observation missed it. Any
 			// other error still fails the start.
-			if !errors.Is(err, ErrNudgeSubmitUnconfirmed) && !errors.Is(err, ErrNudgeSubmitDeliveredUnobserved) {
+			// A startup nudge refused by the human-prompt guard
+			// (ErrNudgeDeferredHumanPrompt, ga-ubfc7j) sent NO keys: the pane
+			// is showing a dialog or an attached person's draft. It takes the
+			// same warning-not-failure path: tearing the session down would
+			// kill the pane a person may be answering, and the ladder above
+			// does not retry it, because what is on screen needs a human, not
+			// a timer.
+			if !errors.Is(err, ErrNudgeSubmitUnconfirmed) && !errors.Is(err, ErrNudgeSubmitDeliveredUnobserved) && !errors.Is(err, ErrNudgeDeferredHumanPrompt) {
 				return fmt.Errorf("sending startup nudge: %w", err)
 			}
 			// The stderr warning alone is not a durable record (Layer 0
