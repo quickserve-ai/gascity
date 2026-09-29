@@ -302,20 +302,22 @@ type getErrStore struct {
 
 func (s getErrStore) Get(string) (beads.Bead, error) { return beads.Bead{}, s.err }
 
-// ga-0ejdbv round 4, finding 1: Get is what the unconfirmed check
-// (GC_NO_API=1 gc mail peek <id>) runs, and it turned "the lookup did not
-// finish" and "bd answered with a different bead" into a bare "message not
-// found", which reads as "lost, re-send". It must still be mail.ErrNotFound
-// to its callers, but say absence is unproven, and must not leak
-// beads.ErrNotFound. A definite absence stays a plain not-found.
+// ga-0ejdbv round 4, finding 1, narrowed at re-sync #4 (astra #4): Get is what
+// the unconfirmed check (GC_NO_API=1 gc mail peek <id>) runs, and it turned
+// "the lookup did not finish" and "bd answered with a different bead" into a
+// bare "message not found", which reads as "lost, re-send". Those are now
+// mail.ErrLookupIndeterminate — NOT mail.ErrNotFound, because a withdrawal or
+// a 404 on an unproven absence is the same defect one layer up — saying
+// absence is unproven, and leaking no beads sentinel. A definite absence stays
+// a plain not-found.
 func TestGetSaysAbsenceUnprovenWhenTheLookupDidNotFinish(t *testing.T) {
 	for name, cause := range map[string]error{
 		"indeterminate": fmt.Errorf("getting bead %q: %w", "gc-1", beads.ErrVerifyIndeterminate),
 		"collision":     fmt.Errorf("getting bead %q (resolved to %q): %w", "gc-1", "gc-11", beads.ErrIDCollision),
 	} {
 		_, err := New(getErrStore{Store: beads.NewMemStore(), err: cause}).Get("gc-1")
-		if !errors.Is(err, mail.ErrNotFound) || errors.Is(err, beads.ErrNotFound) || !strings.Contains(err.Error(), "absence unproven") {
-			t.Errorf("%s: Get err = %v; want mail.ErrNotFound saying absence unproven, without beads.ErrNotFound", name, err)
+		if !errors.Is(err, mail.ErrLookupIndeterminate) || errors.Is(err, mail.ErrNotFound) || errors.Is(err, beads.ErrNotFound) || errors.Is(err, beads.ErrVerifyIndeterminate) || !strings.Contains(err.Error(), "absence unproven") {
+			t.Errorf("%s: Get err = %v; want mail.ErrLookupIndeterminate saying absence unproven, not mail.ErrNotFound, leaking no beads sentinel", name, err)
 		}
 	}
 	_, err := New(getErrStore{Store: beads.NewMemStore(), err: fmt.Errorf("getting bead %q: %w", "gc-1", beads.ErrNotFound)}).Get("gc-1")

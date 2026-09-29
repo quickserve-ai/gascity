@@ -35,6 +35,77 @@ import (
 // drift-churn path). Convergence may legitimately pass through the standing
 // "reconfigured" close+recreate (one bounded restart of the shadow runtime);
 // what it must never do is loop or strand.
+// TestNamedSessionPoolShadowWithAssignedWorkIsNotStopped pins the work guard
+// in front of the adopted-shadow stop: a shadow (ga-dfp1b) that still holds
+// in-progress work keeps its runtime and its bead. The close guard already
+// declines on the same finding; the point is that the STOP never runs first.
+func TestNamedSessionPoolShadowWithAssignedWorkIsNotStopped(t *testing.T) {
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	clk := &clock.Fake{Time: time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)}
+	maxOne := 1
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:              "agent-a",
+			StartCommand:      "true",
+			MaxActiveSessions: &maxOne,
+		}},
+		NamedSessions: []config.NamedSession{{
+			Template: "agent-a",
+			Mode:     "always",
+		}},
+	}
+
+	shadowSessionName := "agent-a-shdw01"
+	shadow, err := store.Create(beads.Bead{
+		Title:  "agent-a",
+		Type:   sessionBeadType,
+		Status: "open",
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name":   shadowSessionName,
+			"template":       "agent-a",
+			"agent_name":     "agent-a",
+			"alias":          "agent-a",
+			"session_origin": "ephemeral",
+			"pool_managed":   "true",
+			"state":          "awake",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(shadow): %v", err)
+	}
+	work, err := store.Create(beads.Bead{Title: "in-flight task", Assignee: shadow.ID})
+	if err != nil {
+		t.Fatalf("create work bead: %v", err)
+	}
+	inProgress := "in_progress"
+	if err := store.Update(work.ID, beads.UpdateOpts{Status: &inProgress}); err != nil {
+		t.Fatalf("mark work in_progress: %v", err)
+	}
+	if err := sp.Start(context.Background(), shadowSessionName, runtime.Config{}); err != nil {
+		t.Fatalf("Start(shadow runtime): %v", err)
+	}
+
+	for tick := 1; tick <= 3; tick++ {
+		var stderr bytes.Buffer
+		dsResult := buildDesiredState("test-city", cityPath, clk.Now().UTC(), cfg, sp, store, &stderr)
+		syncSessionBeads(cityPath, store, dsResult.State, sp, allConfiguredDS(dsResult.State), cfg, clk, &stderr, false)
+		if !sp.IsRunning(shadowSessionName) {
+			t.Fatalf("tick %d: the shadow runtime was stopped over its in-progress work; stderr:\n%s", tick, stderr.String())
+		}
+		got, err := store.Get(shadow.ID)
+		if err != nil {
+			t.Fatalf("tick %d: Get(shadow): %v", tick, err)
+		}
+		if got.Status == "closed" {
+			t.Fatalf("tick %d: the shadow bead was closed over its in-progress work", tick)
+		}
+	}
+}
+
 func TestNamedSessionPoolShadowConverges(t *testing.T) {
 	for _, tc := range []struct {
 		name        string

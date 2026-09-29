@@ -4,6 +4,7 @@ go_library(
     name = "workdir",
     srcs = [
         "pool_isolation.go",
+        "session_setup.go",
         "workdir.go",
     ],
     importpath = "github.com/gastownhall/gascity/internal/workdir",

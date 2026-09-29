@@ -29,6 +29,7 @@ func laneFenceState(cr *CityRuntime) (gen uint64, inflight int) {
 // when run() returns. A future start path that builds a Manager on this
 // provider cannot bypass it.
 func TestCityRuntimeRun_RegistersSessionStartFenceOnItsProvider(t *testing.T) {
+	t.Setenv("GC_HOME", t.TempDir()) // run() reaches supervisor.DefaultHome, which refuses the host home under test
 	cityPath := t.TempDir()
 	tomlPath := filepath.Join(cityPath, "city.toml")
 	writeCityRuntimeConfig(t, tomlPath, "fake")
