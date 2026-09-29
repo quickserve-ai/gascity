@@ -17,6 +17,15 @@ var ErrAlreadyArchived = errors.New("already archived")
 // ErrNotFound is returned when a message ID does not exist.
 var ErrNotFound = errors.New("message not found")
 
+// ErrLookupIndeterminate reports that a message lookup did not complete, so
+// the message's absence is UNPROVEN. It is deliberately not an ErrNotFound:
+// only a proven absence is not-found. A caller that withdraws or terminalizes
+// on ErrNotFound (a queued nudge withdrawn as "mail-missing", a 404) must
+// treat this as a failed read and try again later; the text says "absence
+// unproven" so an operator checking an unconfirmed send does not read it as
+// "lost, re-send".
+var ErrLookupIndeterminate = errors.New("message lookup did not complete, absence unproven")
+
 const (
 	// HandoffLabel marks all mail created by gc handoff. Handoff mail bridges
 	// a restart/compaction gap, so the retention sweep gives it a much longer

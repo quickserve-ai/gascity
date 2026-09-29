@@ -2,7 +2,10 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "doltpool",
-    srcs = ["pool.go"],
+    srcs = [
+        "pool.go",
+        "private.go",
+    ],
     importpath = "github.com/gastownhall/gascity/internal/doltpool",
     visibility = ["//:__subpackages__"],
     deps = ["@com_github_go_sql_driver_mysql//:mysql"],
@@ -12,6 +15,7 @@ go_test(
     name = "doltpool_test",
     srcs = [
         "pool_test.go",
+        "private_test.go",
         "testenv_import_test.go",
     ],
     embed = [":doltpool"],

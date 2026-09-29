@@ -17,6 +17,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/mail"
+	"github.com/gastownhall/gascity/internal/mail/beadmail"
 	"github.com/gastownhall/gascity/internal/session"
 )
 
@@ -527,6 +528,38 @@ func TestMailGetRigStoreSlowReturnsTyped503(t *testing.T) {
 	h.ServeHTTP(rec, req)
 
 	assertStoreSlowProblem(t, rec)
+}
+
+// indeterminateGetStore answers every Get with the beads-level "absence
+// unproven" error; beadmail.New over it exercises the real bead↔mail boundary.
+type indeterminateGetStore struct{ beads.Store }
+
+func (s indeterminateGetStore) Get(id string) (beads.Bead, error) {
+	return beads.Bead{}, fmt.Errorf("getting bead %q: %w: dolt i/o timeout", id, beads.ErrVerifyIndeterminate)
+}
+
+// TestMailGetIndeterminateLookupIsNotA404 pins astra #4 at re-sync #4: a read
+// that merely failed is not a proven absence, so provider discovery and the
+// read itself must not answer 404 (which a client reads as "gone"), and the
+// "absence unproven" text must reach the caller.
+func TestMailGetIndeterminateLookupIsNotA404(t *testing.T) {
+	state := newFakeState(t)
+	state.cityMailProv = beadmail.New(indeterminateGetStore{Store: beads.NewMemStore()})
+	h := newTestCityHandler(t, state)
+
+	req := httptest.NewRequest("GET", cityURL(state, "/mail/msg-1?rig=myrig"), nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusNotFound {
+		t.Fatalf("status = 404 on an indeterminate lookup; body: %s", rec.Body.String())
+	}
+	if rec.Code < 500 {
+		t.Fatalf("status = %d, want a server-side failure for a read that did not complete; body: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "absence unproven") {
+		t.Fatalf("body lost the 'absence unproven' text: %s", rec.Body.String())
+	}
 }
 
 func TestMailListRigProviderPanicReturns500(t *testing.T) {

@@ -3053,7 +3053,6 @@ func (cr *CityRuntime) reloadConfigTraced(
 			}
 		}
 	}
-
 	// Publish to the controller state first and to the loop only if it
 	// accepts, so the tick loop never runs a config the API rejected. On
 	// rejection nothing below runs: the order dispatcher is neither staged

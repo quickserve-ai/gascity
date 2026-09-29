@@ -299,7 +299,7 @@ func TestBuildDoctorChecksWiresOrphanSessionsManagedNames(t *testing.T) {
 
 // stubDoctorOrphanRigStores points the orphan lister's rig opener at open for
 // the duration of the test.
-func stubDoctorOrphanRigStores(t *testing.T, open func(*config.City, string) (map[string]beads.Store, []rigStoreOpenFailure)) {
+func stubDoctorOrphanRigStores(t *testing.T, open func(*config.City, string, rigStoreOpener) (map[string]beads.Store, []rigStoreOpenFailure)) {
 	t.Helper()
 	prev := doctorOrphanRigStores
 	doctorOrphanRigStores = open
@@ -330,7 +330,7 @@ func TestDoctorOrphanSessionsFixSparesRigStoreOnlySession(t *testing.T) {
 			t.Fatal(err)
 		}
 		var opened []*closeCountingStore
-		stubDoctorOrphanRigStores(t, func(*config.City, string) (map[string]beads.Store, []rigStoreOpenFailure) {
+		stubDoctorOrphanRigStores(t, func(*config.City, string, rigStoreOpener) (map[string]beads.Store, []rigStoreOpenFailure) {
 			rig := &closeCountingStore{MemStore: rigMem}
 			opened = append(opened, rig)
 			return map[string]beads.Store{"qcore": rig}, nil
@@ -388,19 +388,19 @@ func (s *failingSessionListStore) List(beads.ListQuery) ([]beads.Bead, error) {
 func TestDoctorOrphanSessionsFixRefusesOnFailingRigLeg(t *testing.T) {
 	tests := []struct {
 		name    string
-		open    func(*config.City, string) (map[string]beads.Store, []rigStoreOpenFailure)
+		open    func(*config.City, string, rigStoreOpener) (map[string]beads.Store, []rigStoreOpenFailure)
 		wantErr string
 	}{
 		{
 			name: "rig store fails to open",
-			open: func(*config.City, string) (map[string]beads.Store, []rigStoreOpenFailure) {
+			open: func(*config.City, string, rigStoreOpener) (map[string]beads.Store, []rigStoreOpenFailure) {
 				return nil, []rigStoreOpenFailure{{rig: "qcore", err: errors.New("rig dolt unreachable")}}
 			},
 			wantErr: "rig dolt unreachable",
 		},
 		{
 			name: "rig session listing fails",
-			open: func(*config.City, string) (map[string]beads.Store, []rigStoreOpenFailure) {
+			open: func(*config.City, string, rigStoreOpener) (map[string]beads.Store, []rigStoreOpenFailure) {
 				rig := &failingSessionListStore{MemStore: beads.NewMemStoreFrom(100, nil, nil), err: errors.New("rig query timed out")}
 				return map[string]beads.Store{"qcore": rig}, nil
 			},
