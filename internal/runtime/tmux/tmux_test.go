@@ -2554,7 +2554,7 @@ func TestSendKeysLiteralWithRetryFallsBackToPasteBufferOnCommandTooLong(t *testi
 		errs: []error{errors.New("command too long")},
 	}
 	tm := NewTmuxWithConfig(DefaultConfig())
-	tm.exec = fe
+	tm.exec = guardIdleExecutor{fe} // the guard's reads are not this test's subject
 
 	err := tm.sendKeysLiteralWithRetry(context.Background(), "%1", "large startup prompt", time.Second)
 	if err != nil {
@@ -2581,7 +2581,7 @@ func TestSendKeysLiteralWithRetryFallsBackToPasteBufferOnCommandTooLong(t *testi
 func TestSendKeysLiteralWithRetryUsesPasteBufferForLargeText(t *testing.T) {
 	fe := &fakeExecutor{}
 	tm := NewTmuxWithConfig(DefaultConfig())
-	tm.exec = fe
+	tm.exec = guardIdleExecutor{fe} // the guard's reads are not this test's subject
 
 	err := tm.sendKeysLiteralWithRetry(context.Background(), "%1", strings.Repeat("x", maxSendKeysLiteralLen+1), time.Second)
 	if err != nil {
@@ -2684,7 +2684,7 @@ func TestSendStartupKeysLiteralWithRetryDoesNotRepeatCompletedCopilotChunks(t *t
 	errs[3] = errors.New("not in a mode")
 	fe := &fakeExecutor{errs: errs}
 	tm := NewTmuxWithConfig(DefaultConfig())
-	tm.exec = fe
+	tm.exec = guardIdleExecutor{fe} // the guard's reads are not this test's subject
 
 	text := strings.Repeat("x", copilotMaxPasteBytes*2)
 	if err := tm.sendStartupKeysLiteralWithRetry(context.Background(), "%1", text, "copilot", 3*time.Second); err != nil {
