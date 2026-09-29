@@ -150,11 +150,18 @@ func (s *Server) humaHandleRigPatchSet(_ context.Context, input *RigPatchSetInpu
 	}
 
 	patch := config.RigPatch{
-		Name:          input.Body.Name,
-		Path:          input.Body.Path,
-		Prefix:        input.Body.Prefix,
-		DefaultBranch: input.Body.DefaultBranch,
-		Suspended:     input.Body.Suspended,
+		Name:             input.Body.Name,
+		Path:             input.Body.Path,
+		Prefix:           input.Body.Prefix,
+		DefaultBranch:    input.Body.DefaultBranch,
+		Suspended:        input.Body.Suspended,
+		SuspendedOnStart: input.Body.SuspendedOnStart,
+		FormulaVars:      input.Body.FormulaVars,
+	}
+	if input.Body.Doctor != nil {
+		patch.Doctor = &config.RigDoctorPatch{
+			CensusOwnerNamespace: input.Body.Doctor.CensusOwnerNamespace,
+		}
 	}
 
 	if patch.Name == "" {

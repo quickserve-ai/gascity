@@ -843,6 +843,13 @@ export type Dep = {
     type: string;
 };
 
+export type DoctorStruct = {
+    /**
+     * Override the doctor census owner namespace; empty string clears it.
+     */
+    census_owner_namespace?: string;
+};
+
 export type ErrorDetail = {
     /**
      * Where the error occurred, e.g. 'body.items[3].tags' or 'path.thing-id'
@@ -2845,6 +2852,16 @@ export type RigPatchSetInputBody = {
      */
     default_branch?: string;
     /**
+     * Override rig doctor settings.
+     */
+    doctor?: DoctorStruct;
+    /**
+     * Rig-scoped formula variable defaults.
+     */
+    formula_vars?: {
+        [key: string]: string;
+    };
+    /**
      * Rig name.
      */
     name?: string;
@@ -2857,9 +2874,13 @@ export type RigPatchSetInputBody = {
      */
     prefix?: string;
     /**
-     * Override suspended state.
+     * Deprecated suspension override.
      */
     suspended?: boolean;
+    /**
+     * Override desired suspension state at city start.
+     */
+    suspended_on_start?: boolean;
 };
 
 export type RigProvisionProgressPayload = {

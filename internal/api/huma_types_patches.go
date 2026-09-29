@@ -84,11 +84,16 @@ type RigPatchGetInput struct {
 type RigPatchSetInput struct {
 	CityScope
 	Body struct {
-		Name          string  `json:"name,omitempty" doc:"Rig name."`
-		Path          *string `json:"path,omitempty" doc:"Override filesystem path."`
-		Prefix        *string `json:"prefix,omitempty" doc:"Override bead ID prefix."`
-		DefaultBranch *string `json:"default_branch,omitempty" doc:"Override mainline branch."`
-		Suspended     *bool   `json:"suspended,omitempty" doc:"Override suspended state."`
+		Name             string            `json:"name,omitempty" doc:"Rig name."`
+		Path             *string           `json:"path,omitempty" doc:"Override filesystem path."`
+		Prefix           *string           `json:"prefix,omitempty" doc:"Override bead ID prefix."`
+		DefaultBranch    *string           `json:"default_branch,omitempty" doc:"Override mainline branch."`
+		Suspended        *bool             `json:"suspended,omitempty" doc:"Deprecated suspension override."`
+		SuspendedOnStart *bool             `json:"suspended_on_start,omitempty" doc:"Override desired suspension state at city start."`
+		FormulaVars      map[string]string `json:"formula_vars,omitempty" doc:"Rig-scoped formula variable defaults."`
+		Doctor           *struct {
+			CensusOwnerNamespace *string `json:"census_owner_namespace,omitempty" doc:"Override the doctor census owner namespace; empty string clears it."`
+		} `json:"doctor,omitempty" doc:"Override rig doctor settings."`
 	}
 }
 

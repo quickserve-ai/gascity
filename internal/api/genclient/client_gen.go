@@ -1682,6 +1682,12 @@ type Dep struct {
 	Type        string `json:"type"`
 }
 
+// DoctorStruct defines model for DoctorStruct.
+type DoctorStruct struct {
+	// CensusOwnerNamespace Override the doctor census owner namespace; empty string clears it.
+	CensusOwnerNamespace *string `json:"census_owner_namespace,omitempty"`
+}
+
 // ErrorDetail defines model for ErrorDetail.
 type ErrorDetail struct {
 	// Location Where the error occurred, e.g. 'body.items[3].tags' or 'path.thing-id'
@@ -3374,7 +3380,11 @@ type RigPatch struct {
 // RigPatchSetInputBody defines model for RigPatchSetInputBody.
 type RigPatchSetInputBody struct {
 	// DefaultBranch Override mainline branch.
-	DefaultBranch *string `json:"default_branch,omitempty"`
+	DefaultBranch *string       `json:"default_branch,omitempty"`
+	Doctor        *DoctorStruct `json:"doctor,omitempty"`
+
+	// FormulaVars Rig-scoped formula variable defaults.
+	FormulaVars *map[string]string `json:"formula_vars,omitempty"`
 
 	// Name Rig name.
 	Name *string `json:"name,omitempty"`
@@ -3385,8 +3395,11 @@ type RigPatchSetInputBody struct {
 	// Prefix Override bead ID prefix.
 	Prefix *string `json:"prefix,omitempty"`
 
-	// Suspended Override suspended state.
+	// Suspended Deprecated suspension override.
 	Suspended *bool `json:"suspended,omitempty"`
+
+	// SuspendedOnStart Override desired suspension state at city start.
+	SuspendedOnStart *bool `json:"suspended_on_start,omitempty"`
 }
 
 // RigProvisionProgressPayload defines model for RigProvisionProgressPayload.

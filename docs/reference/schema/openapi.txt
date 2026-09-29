@@ -2385,6 +2385,16 @@
         ],
         "type": "object"
       },
+      "DoctorStruct": {
+        "additionalProperties": false,
+        "properties": {
+          "census_owner_namespace": {
+            "description": "Override the doctor census owner namespace; empty string clears it.",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
       "ErrorDetail": {
         "additionalProperties": false,
         "properties": {
@@ -6983,6 +6993,17 @@
             "description": "Override mainline branch.",
             "type": "string"
           },
+          "doctor": {
+            "$ref": "#/components/schemas/DoctorStruct",
+            "description": "Override rig doctor settings."
+          },
+          "formula_vars": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Rig-scoped formula variable defaults.",
+            "type": "object"
+          },
           "name": {
             "description": "Rig name.",
             "type": "string"
@@ -6996,7 +7017,11 @@
             "type": "string"
           },
           "suspended": {
-            "description": "Override suspended state.",
+            "description": "Deprecated suspension override.",
+            "type": "boolean"
+          },
+          "suspended_on_start": {
+            "description": "Override desired suspension state at city start.",
             "type": "boolean"
           }
         },
