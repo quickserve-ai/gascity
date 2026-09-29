@@ -89,6 +89,7 @@ go_test(
         "//internal/testpolicy/timingsummary",
         "//internal/testutil",
         "@in_gopkg_yaml_v3//:yaml_v3",
+        "@org_golang_x_mod//modfile",
     ],
 )
 
