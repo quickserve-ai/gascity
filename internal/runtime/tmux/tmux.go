@@ -2835,7 +2835,14 @@ func (t *Tmux) nudgeSession(
 	// BEFORE the text. The returned ErrNudgeDeferredHumanPrompt means nothing
 	// was sent; the queue keeps the item without spending an attempt.
 	if err := t.humanPromptGuard(session, target, nudgeGuardStageBeforeType, true); err != nil {
-		return err
+		// One exception, and only this one: a numbered mid-session machine
+		// dialog (the session-limit chooser) that step 0 below dismisses by
+		// its own match rule. Deferring on it would park every nudge behind a
+		// dialog that never clears by itself. A question dialog, an approval
+		// prompt or a person's draft still defers here.
+		if !t.machineDialogHoldsPane(err, target) {
+			return err
+		}
 	}
 
 	// Snapshot genuine activity BEFORE the first keystroke, and stamp the poke
@@ -2874,6 +2881,13 @@ func (t *Tmux) nudgeSession(
 		// Give the TUI a beat to retire the dialog before pasting, so the
 		// message lands at the prompt rather than in a closing overlay.
 		time.Sleep(midSessionDialogSettleDelay)
+		// The dismissal changed the screen: read it again before any further
+		// key (the C-u below is sent raw). A dialog that has not retired, or
+		// a prompt it uncovered, defers the nudge and keeps it queued
+		// (ga-ubfc7j).
+		if err := t.humanPromptGuard(session, target, nudgeGuardStageBeforeType, true); err != nil {
+			return err
+		}
 	}
 
 	// 1. Clear any pending input already sitting on the line before pasting,
@@ -3230,6 +3244,21 @@ func dismissModelSwitchModal(content string, sendKeys func(keys ...string) error
 	return true, sendKeys("Enter")
 }
 
+// machineDialogHoldsPane reports whether a guard deferral was only its
+// selection-prompt reading of a mid-session machine dialog that
+// dismissMidSessionDialogBeforeNudge will clear (runtime.MidSessionDialogOnScreen).
+// Any other reason, or a failed read, keeps the deferral.
+func (t *Tmux) machineDialogHoldsPane(guardErr error, target string) bool {
+	if reason, deferred := NudgeDeferredReason(guardErr); !deferred || reason != NudgeDeferReasonSelectionPrompt {
+		return false
+	}
+	content, err := t.CaptureVisiblePane(target)
+	if err != nil {
+		return false
+	}
+	return runtime.MidSessionDialogOnScreen(content) != ""
+}
+
 // midSessionDialogSettleDelay lets a just-dismissed mid-session dialog retire
 // from the pane before the nudge text is pasted, so the message lands at the
 // prompt rather than in a closing overlay.
@@ -3252,7 +3281,20 @@ const midSessionDialogSettleDelay = 500 * time.Millisecond
 func (t *Tmux) dismissMidSessionDialogBeforeNudge(target string) bool {
 	dismissed, err := runtime.DismissMidSessionDialogs(
 		context.Background(),
-		func() (string, error) { return t.CaptureVisiblePane(target) },
+		func() (string, error) {
+			content, err := t.CaptureVisiblePane(target)
+			if err != nil {
+				return "", err
+			}
+			// ga-ubfc7j: the keys below go out as raw send-keys, outside the
+			// guarded senders, so never let them land on a question or an
+			// approval, whatever the dialog matchers make of the screen.
+			switch classifyHumanPrompt(strings.Split(content, "\n"), DefaultReadyPromptPrefix, false) {
+			case NudgeDeferReasonQuestionDialog, NudgeDeferReasonApprovalPrompt:
+				return "", nil
+			}
+			return content, nil
+		},
 		func(keys ...string) error {
 			for _, k := range keys {
 				if _, err := t.run("send-keys", "-t", target, k); err != nil {
