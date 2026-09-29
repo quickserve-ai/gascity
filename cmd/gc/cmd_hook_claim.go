@@ -1619,6 +1619,7 @@ func writeHookClaimSuspensionDrain(reason string, opts hookCommandOptions, stdou
 	}
 	return writeHookClaimDrain(hookClaimLabel, reason, 0, opts.JSON, opts.DrainAck, drainAckFn, stdout, stderr)
 }
+
 // hookClaimFenceDrainAck is the drain-ack the two identity-fence drains run for
 // --drain-ack. A seam so a test can observe that hook.claim.refused is recorded
 // before the ack that lets the controller tear the seat down.
