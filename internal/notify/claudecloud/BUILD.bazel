@@ -2,9 +2,7 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "claudecloud",
-    srcs = [
-        "claudecloud.go",
-    ],
+    srcs = ["claudecloud.go"],
     importpath = "github.com/gastownhall/gascity/internal/notify/claudecloud",
     visibility = ["//:__subpackages__"],
     deps = [
@@ -25,6 +23,7 @@ go_test(
     embed = [":claudecloud"],
     deps = [
         "//internal/notify",
+        "//internal/testenv",
     ],
 )
 
