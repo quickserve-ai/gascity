@@ -620,9 +620,9 @@ func TestStripTerminalStyle(t *testing.T) {
 		{name: "placeholder dropped", in: "\x1b[39m❯ \x1b[2mTry\x1b[0m \x1b[2mit\x1b[0m", dropFaint: true, want: "❯  "},
 		{name: "22 ends faint", in: "\x1b[2mghost\x1b[22mtyped", dropFaint: true, want: "typed"},
 		{name: "empty SGR ends faint", in: "\x1b[2mghost\x1b[mtyped", dropFaint: true, want: "typed"},
-		{name: "colour index 2 is not faint", in: "\x1b[38;5;2mgreen\x1b[39m", dropFaint: true, want: "green"},
-		{name: "truecolour args skipped", in: "\x1b[38;2;2;2;2mgrey", dropFaint: true, want: "grey"},
-		{name: "faint combined with colour", in: "\x1b[2;38;5;246mdim\x1b[0m", dropFaint: true, want: ""},
+		{name: "color index 2 is not faint", in: "\x1b[38;5;2mgreen\x1b[39m", dropFaint: true, want: "green"},
+		{name: "truecolor args skipped", in: "\x1b[38;2;2;2;2mgrey", dropFaint: true, want: "grey"},
+		{name: "faint combined with color", in: "\x1b[2;38;5;246mdim\x1b[0m", dropFaint: true, want: ""},
 		{name: "hyperlink OSC stripped", in: "\x1b]8;id=x;https://e.x/\x1b\\link\x1b]8;;\x07", want: "link"},
 	}
 	for _, tt := range tests {
@@ -857,4 +857,25 @@ func TestNudgeDeferredAfterTyping(t *testing.T) {
 	if !NudgeDeferredAfterTyping(fmt.Errorf("%w after 2 chunks: %w", errPartialPasteDelivery, before)) {
 		t.Fatal("a cut-off chunked paste not reported as after typing")
 	}
+}
+
+// guardIdleExecutor answers the human-prompt guard's own reads -- the pane
+// capture and the attached-client count -- as an idle, detached pane, and
+// passes every other call to inner. Tests of the key senders' retry and paste
+// mechanics use it so their call-sequence assertions see only the sender's
+// calls; the guard itself is tested in this file.
+type guardIdleExecutor struct{ inner *fakeExecutor }
+
+func (g guardIdleExecutor) execute(args []string) (string, error) {
+	switch {
+	case tmuxArgsContain(args, "capture-pane"):
+		return idleComposerFixture, nil
+	case tmuxArgsContain(args, "#{session_attached}"):
+		return "0", nil
+	}
+	return g.inner.execute(args)
+}
+
+func (g guardIdleExecutor) executeCtx(_ context.Context, args []string) (string, error) {
+	return g.execute(args)
 }
