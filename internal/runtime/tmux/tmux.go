@@ -3716,7 +3716,7 @@ func (t *Tmux) nudgeSession(
 	// passing it to the prompt, so a nudge sent into one is lost. Single
 	// peek, so a mid-turn session costs one capture-pane and no delay. This
 	// step is best-effort and never aborts the nudge on a peek/dismiss error
-	// (see dismissMidSessionDialogBeforeNudge).
+	// (see dismissMidSessionDialogs).
 	//
 	// ga-ubfc7j: the dismissal sends raw keys, so it runs only on a DETACHED
 	// session, where no person can be mid-draft (the same rule as the C-u
@@ -4191,7 +4191,7 @@ var errRecoveryNoLongerDetached = errors.New("tmux: staged-draft recovery stoppe
 // prompt rather than in a closing overlay.
 const midSessionDialogSettleDelay = 500 * time.Millisecond
 
-// dismissMidSessionDialogBeforeNudge clears a blocking mid-session dialog (the
+// dismissMidSessionDialogs clears a blocking mid-session dialog (the
 // token-ceiling resume selector, the periodic feedback prompt, or the provider
 // session-limit chooser) on target so an imminent nudge lands at the prompt
 // instead of being absorbed by the dialog. It reports whether a dialog was
@@ -4283,7 +4283,7 @@ func (t *Tmux) dismissMidSessionDialogs(ctx context.Context, target string) (key
 // swallowed (the caller retries on the next wake). The resume, feedback, and
 // session-limit mid-session dialogs are handled separately by
 // runtime.DismissMidSessionDialogs (see midSessionDialogs) via
-// dismissMidSessionDialogBeforeNudge.
+// dismissMidSessionDialogs.
 func (t *Tmux) DismissModelSwitchModalIfPresent(session string) {
 	t.dismissModelSwitchModalIfPresentCtx(context.Background(), session)
 }
@@ -5211,7 +5211,7 @@ func (t *Tmux) CapturePane(session string, lines int) (string, error) {
 
 // CaptureVisiblePane captures only the current visible screen of a pane, with
 // no scrollback history (no "-S"). The mid-session dialog dismissal
-// (dismissMidSessionDialogBeforeNudge) uses this instead of CapturePane so an
+// (dismissMidSessionDialogs) uses this instead of CapturePane so an
 // already-dismissed dialog sitting in scrollback cannot satisfy the
 // contains-based matchers and inject dismissal keys into a live prompt before
 // the intended nudge. A live blocking dialog occupies the visible footer, so
