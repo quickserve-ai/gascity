@@ -287,3 +287,17 @@ func TestModelSwitchDismissStopsWhenAQuestionReplacesTheModalBetweenKeys(t *test
 		t.Fatalf("keys sent = %v, want only Down (no Enter onto the question)", keys)
 	}
 }
+
+// Astra round 5: after Down, one capture shows the old model-switch strings
+// with a live approval below them. The approval decides; Enter must not go.
+func TestModelSwitchDismissStopsWhenAnApprovalAppearsBelowTheModal(t *testing.T) {
+	modal := "Approaching rate limits\nSwitch to gpt-5.4-mini for lower credit usage?\n› 1. Switch to gpt-5.4-mini\n  2. Keep current model\n  3. Keep current model (never show again)\nPress enter to confirm or esc to go back"
+	ex := &paneAfterFirstKeyExecutor{before: modal, after: modal + "\n" + approvalPromptFixture, attached: "0"}
+	tm := &Tmux{cfg: DefaultConfig(), exec: ex}
+
+	tm.DismissModelSwitchModalIfPresent("agent-pane")
+	keys := sentKeys(ex.calls)
+	if len(keys) != 1 || !slices.Contains(keys[0], "Down") {
+		t.Fatalf("keys sent = %v, want only Down (no Enter onto the approval)", keys)
+	}
+}
