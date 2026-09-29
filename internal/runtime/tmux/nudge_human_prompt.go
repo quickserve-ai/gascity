@@ -107,8 +107,11 @@ func NudgeDeferredAfterTyping(err error) bool {
 
 // selectionOptionRe matches one row of a numbered selection list once box
 // borders are stripped: an optional cursor glyph, then "N." or "N)" and a
-// label. Claude draws its cursor as ❯ ("❯ 1. Yes"), Codex as ›.
-var selectionOptionRe = regexp.MustCompile(`^([❯›>→▸▶]\s*)?\d{1,2}[.)]\s+\S`)
+// label. Claude draws its cursor as ❯ ("❯ 1. Yes"), Codex as ›. omp's Ask
+// box (also what a Codex-model pool worker shows) draws unnumbered radio rows,
+// "❯ ○ Alpha (Recommended)" / "○ Beta", captured live 2026-09-29; a radio mark
+// stands in for the number.
+var selectionOptionRe = regexp.MustCompile(`^([❯›>→▸▶]\s*)?(\d{1,2}[.)]|[○●◉◯])\s+\S`)
 
 // normalizePaneLine folds NBSP, trims, and strips a leading and trailing box
 // border so a row drawn inside a bordered box reads like a bare one.
@@ -277,6 +280,11 @@ func classifyDialog(live []string) string {
 			return NudgeDeferReasonQuestionDialog
 		}
 		if strings.Contains(s, "Submit") && (strings.Contains(s, "☐") || strings.Contains(s, "☒")) {
+			return NudgeDeferReasonQuestionDialog
+		}
+		// omp's Ask box: "Enter select · n note · ↑/↓ move · Esc cancel".
+		// It fired live on a Codex-model pool worker (pl-022h, 04:34Z 9/29).
+		if strings.Contains(s, "Enter select") && strings.Contains(s, "Esc cancel") {
 			return NudgeDeferReasonQuestionDialog
 		}
 	}
