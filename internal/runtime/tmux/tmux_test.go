@@ -3995,3 +3995,26 @@ func TestNewSessionWithCommandAndEnvWithholdsEmptyVarFromPaneChild(t *testing.T)
 		t.Fatalf("pane child received the controller token: %s", got)
 	}
 }
+
+// guardIdleExecutor answers the human-prompt guard's own reads -- the pane
+// capture and the attached-client count -- as an idle, detached pane, and
+// passes every other call to inner. Tests of the key senders' retry and paste
+// mechanics use it so their call-sequence assertions see only the sender's
+// calls; the guard itself is tested in this file.
+type guardIdleExecutor struct{ inner *fakeExecutor }
+
+func (g guardIdleExecutor) execute(args []string) (string, error) {
+	switch {
+	case tmuxArgsContain(args, "capture-pane"):
+		return idleComposerFixture, nil
+	case tmuxArgsContain(args, "#{session_attached}"):
+		return "0", nil
+	case tmuxArgsContain(args, "show-environment") && tmuxArgsContain(args, sessionReadyPromptEnvKey):
+		return "", errors.New("unknown variable: " + sessionReadyPromptEnvKey)
+	}
+	return g.inner.execute(args)
+}
+
+func (g guardIdleExecutor) executeCtx(_ context.Context, args []string) (string, error) {
+	return g.execute(args)
+}
