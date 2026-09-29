@@ -114,16 +114,40 @@ func DismissMidSessionDialogs(
 	if err != nil {
 		return false, err
 	}
+	dialog := activeMidSessionDialog(content)
+	if dialog == nil {
+		return false, nil
+	}
+	if err := sendDialogKeys(ctx, sendKeys, dialog.keys, bypassDialogConfirmDelay); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// activeMidSessionDialog returns the mid-session dialog that is the active
+// bottom-most block of content, or nil. It is the one match rule
+// DismissMidSessionDialogs acts on.
+func activeMidSessionDialog(content string) *midSessionDialog {
 	tail := lastNonBlankLine(content)
-	for _, dialog := range midSessionDialogs {
+	for i := range midSessionDialogs {
+		dialog := &midSessionDialogs[i]
 		if dialog.match(lastNonBlankLines(content, dialog.tailSpan)) && strings.Contains(tail, dialog.tailAnchor) {
-			if err := sendDialogKeys(ctx, sendKeys, dialog.keys, bypassDialogConfirmDelay); err != nil {
-				return false, err
-			}
-			return true, nil
+			return dialog
 		}
 	}
-	return false, nil
+	return nil
+}
+
+// MidSessionDialogOnScreen names the mid-session machine dialog that
+// DismissMidSessionDialogs would clear on content, or returns "" when there is
+// none. It applies the same match and tail-anchor rule, so a caller that
+// sends a dismissal's keys one at a time (the tmux nudge path, ga-ubfc7j) can
+// confirm before each key that the same dialog still owns the screen.
+func MidSessionDialogOnScreen(content string) string {
+	if dialog := activeMidSessionDialog(content); dialog != nil {
+		return dialog.name
+	}
+	return ""
 }
 
 // lastNonBlankLine returns the final line of content that is not blank after

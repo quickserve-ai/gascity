@@ -17,6 +17,12 @@ import (
 // "esc to interrupt" busy footer — the same signal paneContainsBusyIndicator
 // uses to detect a live Claude turn. Each Enter also prints an "ENTER#<n>"
 // marker so a test can assert exactly how many submit keystrokes were delivered.
+// buildBusyOnEnterBinary builds a stand-in for Claude's input loop. Like the
+// real composer it draws a "❯ " prompt holding what was typed, and a dropped
+// Enter leaves that draft in the composer: the nudge path re-sends Enter only
+// while the composer still shows the text it typed (ga-ubfc7j), so a stand-in
+// with no composer line would never earn a re-send. Control bytes (the C-u
+// clear) are consumed, not echoed.
 func buildBusyOnEnterBinary(t *testing.T, dir, name string) string {
 	t.Helper()
 	bin := dir + "/" + name
@@ -27,6 +33,8 @@ func main(){
 	busyAfter:=1
 	if v:=os.Getenv("GC_TEST_BUSY_AFTER"); v!=""{ if n,err:=strconv.Atoi(v); err==nil && n>0 { busyAfter=n } }
 	enters:=0
+	var draft []byte
+	fmt.Print("\u276f ")
 	r:=bufio.NewReader(os.Stdin)
 	for{
 		b,err:=r.ReadByte()
@@ -34,9 +42,12 @@ func main(){
 		if b=='\r'||b=='\n'{
 			enters++
 			fmt.Printf("\nENTER#%d\n", enters)
-			if enters>=busyAfter { fmt.Print("esc to interrupt\n") }
+			if enters>=busyAfter { fmt.Print("esc to interrupt\n"); draft=draft[:0]; continue }
+			fmt.Printf("\u276f %s", draft)
 			continue
 		}
+		if b<0x20 { continue }
+		draft=append(draft,b)
 		_,_=os.Stdout.Write([]byte{b})
 	}
 }

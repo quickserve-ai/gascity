@@ -2253,7 +2253,7 @@ func TestSendKeysLiteralWithRetryFallsBackToPasteBufferOnCommandTooLong(t *testi
 		errs: []error{errors.New("command too long")},
 	}
 	tm := NewTmuxWithConfig(DefaultConfig())
-	tm.exec = fe
+	tm.exec = guardIdleExecutor{fe} // the guard's reads are not this test's subject
 
 	err := tm.sendKeysLiteralWithRetry("%1", "large startup prompt", time.Second)
 	if err != nil {
@@ -2280,7 +2280,7 @@ func TestSendKeysLiteralWithRetryFallsBackToPasteBufferOnCommandTooLong(t *testi
 func TestSendKeysLiteralWithRetryUsesPasteBufferForLargeText(t *testing.T) {
 	fe := &fakeExecutor{}
 	tm := NewTmuxWithConfig(DefaultConfig())
-	tm.exec = fe
+	tm.exec = guardIdleExecutor{fe} // the guard's reads are not this test's subject
 
 	err := tm.sendKeysLiteralWithRetry("%1", strings.Repeat("x", maxSendKeysLiteralLen+1), time.Second)
 	if err != nil {
@@ -2383,7 +2383,7 @@ func TestSendStartupKeysLiteralWithRetryDoesNotRepeatCompletedCopilotChunks(t *t
 	errs[3] = errors.New("not in a mode")
 	fe := &fakeExecutor{errs: errs}
 	tm := NewTmuxWithConfig(DefaultConfig())
-	tm.exec = fe
+	tm.exec = guardIdleExecutor{fe} // the guard's reads are not this test's subject
 
 	text := strings.Repeat("x", copilotMaxPasteBytes*2)
 	if err := tm.sendStartupKeysLiteralWithRetry("%1", text, "copilot", 3*time.Second); err != nil {
@@ -3994,4 +3994,27 @@ func TestNewSessionWithCommandAndEnvWithholdsEmptyVarFromPaneChild(t *testing.T)
 	if strings.Contains(string(got), token) {
 		t.Fatalf("pane child received the controller token: %s", got)
 	}
+}
+
+// guardIdleExecutor answers the human-prompt guard's own reads -- the pane
+// capture and the attached-client count -- as an idle, detached pane, and
+// passes every other call to inner. Tests of the key senders' retry and paste
+// mechanics use it so their call-sequence assertions see only the sender's
+// calls; the guard itself is tested in this file.
+type guardIdleExecutor struct{ inner *fakeExecutor }
+
+func (g guardIdleExecutor) execute(args []string) (string, error) {
+	switch {
+	case tmuxArgsContain(args, "capture-pane"):
+		return idleComposerFixture, nil
+	case tmuxArgsContain(args, "#{session_attached}"):
+		return "0", nil
+	case tmuxArgsContain(args, "show-environment") && tmuxArgsContain(args, sessionReadyPromptEnvKey):
+		return "", errors.New("unknown variable: " + sessionReadyPromptEnvKey)
+	}
+	return g.inner.execute(args)
+}
+
+func (g guardIdleExecutor) executeCtx(_ context.Context, args []string) (string, error) {
+	return g.execute(args)
 }
