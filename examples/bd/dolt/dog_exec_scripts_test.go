@@ -5397,6 +5397,27 @@ func TestBackupScriptDiscoversNamedBackupsAndSyncsArtifactsOffsite(t *testing.T)
 	}
 }
 
+// writeBackupFakeTimeout installs a recording fake for the bound runtime.sh
+// wraps the offsite rsync in, and returns the log it appends to. It is
+// installed under BOTH names runtime.sh probes, gtimeout first: on a macOS host
+// with Homebrew coreutils the real gtimeout is on PATH, and a fake named only
+// `timeout` is never reached (ga-70ynux). Linux CI has no gtimeout, which is
+// why the single-name fake passed there.
+func writeBackupFakeTimeout(t *testing.T, binDir string) string {
+	t.Helper()
+	logPath := filepath.Join(binDir, "timeout.log")
+	body := fmt.Sprintf(`#!/bin/sh
+printf 'timeout %%s\n' "$*" >> %s
+[ "$1" = "--kill-after=2" ] && shift
+shift
+exec "$@"
+`, shellQuote(logPath))
+	for _, name := range []string{"timeout", "gtimeout"} {
+		writeExecutable(t, filepath.Join(binDir, name), body)
+	}
+	return logPath
+}
+
 func TestBackupScriptEscalatesOffsiteFailureWithConfiguredBound(t *testing.T) {
 	cityPath := t.TempDir()
 	dataDir := filepath.Join(cityPath, "dolt-data")
@@ -5416,13 +5437,7 @@ func TestBackupScriptEscalatesOffsiteFailureWithConfiguredBound(t *testing.T) {
 	gcLogPath := writeDogFakeGC(t, binDir)
 	_ = writeBackupFakeDolt(t, binDir, "2.1.0", 0, "prod")
 	_ = writeBackupFakeRsync(t, binDir, 1)
-	timeoutLogPath := filepath.Join(binDir, "timeout.log")
-	writeExecutable(t, filepath.Join(binDir, "timeout"), fmt.Sprintf(`#!/bin/sh
-printf 'timeout %%s\n' "$*" >> %s
-[ "$1" = "--kill-after=2" ] && shift
-shift
-exec "$@"
-`, shellQuote(timeoutLogPath)))
+	timeoutLogPath := writeBackupFakeTimeout(t, binDir)
 
 	out := runDogScript(t, "mol-dog-backup.sh", binDir, cityPath, dataDir,
 		"GC_BACKUP_OFFSITE_PATH="+offsiteDir,
@@ -5479,13 +5494,7 @@ func TestBackupScriptRejectsUnusableOffsiteTimeout(t *testing.T) {
 			_ = writeDogFakeGC(t, binDir)
 			_ = writeBackupFakeDolt(t, binDir, "2.1.0", 0, "prod")
 			_ = writeBackupFakeRsync(t, binDir)
-			timeoutLogPath := filepath.Join(binDir, "timeout.log")
-			writeExecutable(t, filepath.Join(binDir, "timeout"), fmt.Sprintf(`#!/bin/sh
-printf 'timeout %%s\n' "$*" >> %s
-[ "$1" = "--kill-after=2" ] && shift
-shift
-exec "$@"
-`, shellQuote(timeoutLogPath)))
+			timeoutLogPath := writeBackupFakeTimeout(t, binDir)
 
 			out := runDogScript(t, "mol-dog-backup.sh", binDir, cityPath, dataDir,
 				"GC_BACKUP_OFFSITE_PATH="+offsiteDir,
