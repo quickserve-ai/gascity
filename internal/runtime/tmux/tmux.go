@@ -3459,12 +3459,14 @@ func (t *Tmux) sendNudgeSubmitSequence(ctx context.Context, target string, keys 
 	// Chokepoint (ga-ubfc7j): no submit key goes to a pane showing a
 	// question dialog or an approval prompt. The draft rule does not apply
 	// here: the text on the line is the text this delivery just typed.
-	if err := t.humanPromptGuard(target, target, nudgeGuardStageBeforeSubmit, false); err != nil {
-		return err
-	}
 	for i, key := range keys {
 		if i > 0 {
 			time.Sleep(nudgeSubmitKeySettle)
+		}
+		// Before EVERY key: a prompt can appear inside the settle between
+		// two keys of a multi-key sequence.
+		if err := t.humanPromptGuard(target, target, nudgeGuardStageBeforeSubmit, false); err != nil {
+			return err
 		}
 		if _, err := t.runCtx(ctx, "send-keys", "-t", paneTarget(target), key); err != nil {
 			return err
@@ -3728,6 +3730,9 @@ func (t *Tmux) nudgeSession(
 		}
 	} else if content, err := t.CaptureVisiblePane(target); err != nil {
 		return &NudgeDeferredError{Session: session, Reason: NudgeDeferReasonCaptureFailed, Stage: nudgeGuardStageBeforeType, Err: err}
+	} else if reason := classifyHumanPrompt(strings.Split(content, "\n"), DefaultReadyPromptPrefix, false); reason != "" {
+		// A prompt meant for a person appeared after the guard's read.
+		return &NudgeDeferredError{Session: session, Reason: reason, Stage: nudgeGuardStageBeforeType}
 	} else if runtime.MidSessionDialogOnScreen(content) != "" {
 		return &NudgeDeferredError{Session: session, Reason: NudgeDeferReasonMachineDialogAttached, Stage: nudgeGuardStageBeforeType}
 	}
@@ -3882,22 +3887,22 @@ func (t *Tmux) nudgeSession(
 			// every submit swallowed, leaving the draft staged in the
 			// composer. Where the family's staged-draft marker is known,
 			// re-send while that draft is visible (recoverStagedDraft). Skip
-			// it when a client is attached or the probe cannot tell, for the
-			// same reason the C-u clear above is skipped: a human may be
-			// composing, and a re-sent submit would send their draft. A pane
-			// that never read idle is still running an earlier turn, so
-			// recovery leaves it to the drained-composer check below.
-			if marker, ok := t.stagedDraftMarkerFor(target); ok {
-				if attached, err := t.SessionAttachedWithError(session); err == nil && !attached {
-					observe := func() (paneSubmitObservation, error) { return t.observeSubmit(target, marker) }
-					switch recoverStagedDraft(sawIdle, sendSubmit, wake, observe, time.Sleep) {
-					case stagedDraftSubmittedBusy:
-						return nil
-					case stagedDraftCleared:
-						return t.unobservedSubmitVerdict(session, typedAt, message)
-					}
-					// stagedDraftUnresolved falls through to the handling below.
+			// it unless the session is known to be detached (a count of
+			// zero, not "not exactly one": two clients or an unreadable
+			// count may be a person), for the same reason the C-u clear
+			// above is skipped: a human may be composing, and a re-sent
+			// submit would send their draft (ga-ubfc7j). A pane that never read idle is
+			// still running an earlier turn, so recovery leaves it to the
+			// drained-composer check below.
+			if marker, ok := t.stagedDraftMarkerFor(target); ok && t.sessionClientCount(session) == 0 {
+				observe := func() (paneSubmitObservation, error) { return t.observeSubmit(target, marker) }
+				switch recoverStagedDraft(sawIdle, sendSubmit, wake, observe, time.Sleep) {
+				case stagedDraftSubmittedBusy:
+					return nil
+				case stagedDraftCleared:
+					return t.unobservedSubmitVerdict(session, typedAt, message)
 				}
+				// stagedDraftUnresolved falls through to the handling below.
 			}
 			// Do NOT collapse this to nil: a caller that treats nil as "clean
 			// delivery" would ack a queued nudge for a message that may still
@@ -4226,6 +4231,11 @@ func (t *Tmux) dismissMidSessionDialogs(ctx context.Context, target string) (key
 				if name, refused := machineOnly(content); refused || name != expected {
 					return errDismissalScreenChanged
 				}
+				// Still detached: a person who attaches mid-dismissal may
+				// start a draft the classifier above cannot see.
+				if t.sessionClientCount(target) != 0 {
+					return errDismissalScreenChanged
+				}
 				if _, err := t.runCtx(ctx, "send-keys", "-t", paneTarget(target), k); err != nil {
 					return err
 				}
@@ -4406,6 +4416,13 @@ func (t *Tmux) DismissFeedbackSurveyModalIfPresent(session string) error {
 func (t *Tmux) dismissFeedbackSurveyModalIn(ctx context.Context, session, target string) error {
 	sendKeys := func(keys ...string) error {
 		for _, k := range keys {
+			// ga-ubfc7j: these are raw send-keys, and the survey matcher
+			// reads scrollback, so an old survey row can match while a
+			// question, an approval or an attached person's draft is live.
+			// The full guard runs before EVERY key.
+			if err := t.humanPromptGuard(session, target, nudgeGuardStageBeforeType, true); err != nil {
+				return err
+			}
 			if _, err := t.runCtx(ctx, "send-keys", "-t", paneTarget(target), k); err != nil {
 				return err
 			}
