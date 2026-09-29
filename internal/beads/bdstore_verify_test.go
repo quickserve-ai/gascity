@@ -45,10 +45,15 @@ func TestBdStoreGetWispQueryErrorIsIndeterminate(t *testing.T) {
 	}
 }
 
-// TestBdStoreGetWispQueryUnsupportedIsIndeterminate covers the quieter half:
-// getEphemeralByID used to return (nil, nil) for a bd with no "query"
-// subcommand, which the caller read as an authoritative empty result set.
-func TestBdStoreGetWispQueryUnsupportedIsIndeterminate(t *testing.T) {
+// TestBdStoreGetWispQueryUnsupportedIsNotFound pins the capability half: a bd
+// with no "query" subcommand has no wisp tier to consult, so the lookup is
+// COMPLETE with no row and Get reports a plain ErrNotFound — upstream's
+// contract. It is not indeterminate: the claim-time class route opens its
+// binding escalation only on errors.Is(ErrNotFound) from every other work leg
+// (claim_class_route.go anotherWorkLegHolds), and a capability fact typed as a
+// failed read closed it for every relocated graph step under a query-less bd
+// (TestSplitTopologyConformance/I15, the re-serve/re-skip treadmill).
+func TestBdStoreGetWispQueryUnsupportedIsNotFound(t *testing.T) {
 	runner := fakeRunner(map[string]struct {
 		out []byte
 		err error
@@ -63,11 +68,11 @@ func TestBdStoreGetWispQueryUnsupportedIsIndeterminate(t *testing.T) {
 	s := beads.NewBdStore("/city", runner)
 	_, err := s.Get("gc-wisp-oldbd")
 
-	if !errors.Is(err, beads.ErrVerifyIndeterminate) {
-		t.Errorf("err = %v, want ErrVerifyIndeterminate — never looking is not the same as looking and finding nothing", err)
+	if !errors.Is(err, beads.ErrNotFound) {
+		t.Errorf("err = %v, want ErrNotFound — a bd without a wisp tier has answered the wisp question", err)
 	}
-	if errors.Is(err, beads.ErrNotFound) {
-		t.Errorf("err = %v, must NOT satisfy errors.Is(ErrNotFound); absence is unproven", err)
+	if errors.Is(err, beads.ErrVerifyIndeterminate) {
+		t.Errorf("err = %v, must NOT be indeterminate; a missing capability is not an unfinished lookup", err)
 	}
 }
 
