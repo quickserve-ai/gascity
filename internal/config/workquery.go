@@ -752,16 +752,39 @@ func inProgressBlockedByEnrichmentScriptWithServeAction(federated bool, checkHol
 func assignedReadyTierCommand(shellVar string, topo QueryTopology) string {
 	fed := topo.FederatedReady
 	return `r=$(` + readyReaderCommand(fed) + bdReadyIncludeEphemeralArg(topo.includeEphemeralReady()) +
-		` --assignee="$` + shellVar + `" --json --limit=1` + readyReaderStderrSink(fed) + `)` +
+		` --assignee="$` + shellVar + `"` +
+		(PoolDemandServeRules{ExcludeLabels: beadmeta.DispatchHoldLabels}).ShellArgs() +
+		` --json --limit=20` + readyReaderStderrSink(fed) + `)` +
 		readyReaderFailurePropagation(fed) + `; `
+}
+
+// assignedReadyServeScript filters dispatch holds before the first-row cut.
+// A held head cannot hide another assigned bead or the routed tier behind it.
+// Preserve malformed reader output rather than turning a read failure into
+// false-empty work.
+func assignedReadyServeScript() string {
+	filter := `[.[]` + excludeHoldLabelsJQClause() + `] | .[:1]`
+	return `if [ -n "$r" ] && [ "$r" != "[]" ]; then ` +
+		`gc_assigned_ready=$(printf "%s" "$r" | jq -c ` + shellquote.Quote(filter) + ` 2>/dev/null); ` +
+		`[ -n "$gc_assigned_ready" ] && r="$gc_assigned_ready"; ` +
+		`[ "$r" = "[]" ] || { printf "%s" "$r"; exit 0; }; ` +
+		`fi; `
+}
+
+// The assignee-scoped ephemeral probe remains hold-transparent for existence
+// checks. In the serving query, capture its early exit in a subshell and apply
+// the same hold filter before returning any work to the hook.
+func assignedReadyEphemeralServeScript(shellVar string, topo QueryTopology) string {
+	return `r=$(` + ephemeralAssignedReadyProbeScript(shellVar, topo) + `); ` +
+		assignedReadyServeScript()
 }
 
 func standardAssignedReadyWorkQueryScript(topo QueryTopology) string {
 	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
 		assignedReadyTierCommand("id", topo) +
-		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
-		ephemeralAssignedReadyProbeScript("id", topo) +
+		assignedReadyServeScript() +
+		assignedReadyEphemeralServeScript("id", topo) +
 		`done; `
 }
 
@@ -814,8 +837,8 @@ func legacyControlAssignedReadyWorkQueryScript(topo QueryTopology) string {
 		`for cand in "$id" "$legacy"; do ` +
 		`[ -z "$cand" ] && continue; ` +
 		assignedReadyTierCommand("cand", topo) +
-		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
-		ephemeralAssignedReadyProbeScript("cand", topo) +
+		assignedReadyServeScript() +
+		assignedReadyEphemeralServeScript("cand", topo) +
 		`done; ` +
 		`done; `
 }

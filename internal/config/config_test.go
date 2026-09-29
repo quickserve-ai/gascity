@@ -1948,7 +1948,7 @@ func TestEffectiveWorkQueryBD105CompatibilityOptIn(t *testing.T) {
 	if !strings.Contains(got, `bd ready --include-ephemeral --metadata-field "gc.routed_to=$target" --unassigned --exclude-type=epic --exclude-label "hold:mayor" --exclude-label "hold:external" --json --limit=20`) {
 		t.Errorf("EffectiveWorkQueryForBeads(bd-1.0.5) missing include-ephemeral routed probe: %q", got)
 	}
-	if !strings.Contains(got, `bd ready --include-ephemeral --assignee="$id" --json --limit=1`) {
+	if !strings.Contains(got, `bd ready --include-ephemeral --assignee="$id"`) {
 		t.Errorf("EffectiveWorkQueryForBeads(bd-1.0.5) missing include-ephemeral assigned probe: %q", got)
 	}
 }
