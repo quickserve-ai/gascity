@@ -183,5 +183,15 @@ jobs:
           git diff --exit-code || {
             echo "BUILD files out of sync; run 'make bazel-sync' and commit the result." >&2
             git diff | head -80 >&2
+            # The whole change, new files included, for hosts without bazel
+            # to apply as a patch (artifact bazel-sync-diff; pl-axh9).
+            git add -A && git diff --cached --binary > "$RUNNER_TEMP/bazel-sync.diff"
             exit 1
           }
+      - name: Upload the full BUILD sync diff
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bazel-sync-diff
+          path: ${{ runner.temp }}/bazel-sync.diff
+          retention-days: 7
