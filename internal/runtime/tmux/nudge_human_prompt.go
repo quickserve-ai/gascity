@@ -421,7 +421,7 @@ func stripTerminalStyle(line string, dropFaint bool) string {
 	faint := false
 	for i := 0; i < len(line); {
 		if line[i] != 0x1b || i+1 >= len(line) {
-			if !(dropFaint && faint) {
+			if !dropFaint || !faint {
 				b.WriteByte(line[i])
 			}
 			i++
@@ -442,7 +442,7 @@ func stripTerminalStyle(line string, dropFaint bool) string {
 			i = j + 1
 		case ']':
 			j := i + 2
-			for j < len(line) && line[j] != 0x07 && !(line[j] == 0x1b && j+1 < len(line) && line[j+1] == '\\') {
+			for j < len(line) && line[j] != 0x07 && (line[j] != 0x1b || j+1 >= len(line) || line[j+1] != '\\') {
 				j++
 			}
 			switch {
@@ -461,9 +461,9 @@ func stripTerminalStyle(line string, dropFaint bool) string {
 }
 
 // applySGRFaint folds one SGR parameter list into the faint state: 2 sets it;
-// 0, an empty list, and 22 (normal intensity) clear it. Extended colour
+// 0, an empty list, and 22 (normal intensity) clear it. Extended color
 // arguments (38;5;n, 38;2;r;g;b and their 48/58 forms) are skipped so a
-// colour index of 2 or 22 is not read as an intensity change.
+// color index of 2 or 22 is not read as an intensity change.
 func applySGRFaint(params string, faint bool) bool {
 	if params == "" {
 		return false
