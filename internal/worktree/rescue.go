@@ -629,8 +629,8 @@ func requireSubmodulesSecured(dir, prefix, modulesRoot string) error {
 }
 
 // todoObjectName matches an object name as a todo list writes it. Git never
-// abbreviates below four hex digits (core.abbrev's minimum), and with
-// core.abbrev=4 a stopped cherry-pick really writes `pick e3b6 x`.
+// abbreviates below four hex digits (core.abbrev's minimum), but extends
+// names beyond that minimum when needed to disambiguate.
 var todoObjectName = regexp.MustCompile(`^[0-9a-f]{4,64}$`)
 
 // todoPickCommands are the todo commands whose operand names a commit.
