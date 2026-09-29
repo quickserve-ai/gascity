@@ -1226,7 +1226,8 @@ func TestRescueRefusesAnotherRepositorysCheckoutUnderAnIgnoredPath(t *testing.T)
 }
 
 // Codex review of #97, round 7, P1: with core.abbrev=4 a stopped cherry-pick
-// writes `pick e3b6 x` into sequencer/todo.
+// writes abbreviated object names into sequencer/todo (Git may extend them
+// beyond four characters to disambiguate).
 func TestRescueKeepsCherryPickCommitsNamedByFourCharAbbreviations(t *testing.T) {
 	repo, wt, base := linkedWorktree(t)
 	id := []string{"-c", "user.name=t", "-c", "user.email=t@t"}
@@ -1244,11 +1245,19 @@ func TestRescueKeepsCherryPickCommitsNamedByFourCharAbbreviations(t *testing.T) 
 	}
 	gitDir := runGit(t, wt, "rev-parse", "--path-format=absolute", "--git-dir")
 	todo, err := os.ReadFile(filepath.Join(gitDir, "sequencer", "todo"))
-	if err != nil || !strings.Contains(string(todo), "pick "+picks[1][:4]+" ") {
-		t.Fatalf("control: todo should name %s by four characters, got %q (%v)", picks[1], todo, err)
+	if err != nil {
+		t.Fatalf("control: read sequencer todo: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(todo)), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("control: todo has no second pick: %q", todo)
+	}
+	fields := strings.Fields(lines[1])
+	if len(fields) < 2 || fields[0] != "pick" || !strings.HasPrefix(picks[1], fields[1]) || len(fields[1]) >= len(picks[1]) {
+		t.Fatalf("control: second pick should name %s by an abbreviated prefix, got %q", picks[1], todo)
 	}
 	runGit(t, repo, "checkout", "-q", "--detach", base)
-	runGit(t, repo, "branch", "-D", "side") // only the four-character names remain
+	runGit(t, repo, "branch", "-D", "side") // only abbreviated names remain
 	rep, err := Rescue(rescueSpec(wt))
 	if err != nil {
 		t.Fatalf("Rescue: %v", err)
