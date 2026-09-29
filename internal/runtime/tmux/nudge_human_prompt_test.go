@@ -859,27 +859,6 @@ func TestNudgeDeferredAfterTyping(t *testing.T) {
 	}
 }
 
-// guardIdleExecutor answers the human-prompt guard's own reads -- the pane
-// capture and the attached-client count -- as an idle, detached pane, and
-// passes every other call to inner. Tests of the key senders' retry and paste
-// mechanics use it so their call-sequence assertions see only the sender's
-// calls; the guard itself is tested in this file.
-type guardIdleExecutor struct{ inner *fakeExecutor }
-
-func (g guardIdleExecutor) execute(args []string) (string, error) {
-	switch {
-	case tmuxArgsContain(args, "capture-pane"):
-		return idleComposerFixture, nil
-	case tmuxArgsContain(args, "#{session_attached}"):
-		return "0", nil
-	}
-	return g.inner.execute(args)
-}
-
-func (g guardIdleExecutor) executeCtx(_ context.Context, args []string) (string, error) {
-	return g.execute(args)
-}
-
 // ompAskBoxFixture is omp's Ask box as a live omp pane drew it on 2026-09-29
 // (the box a Codex-model pool worker raised on pl-022h): the tool-call echo in
 // scrollback, then the live box, with no composer below it. Its cursor row
