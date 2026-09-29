@@ -230,8 +230,11 @@ func TestReconcileSessionBeads_IdleRespawnRechecksClaimBeforeStop(t *testing.T) 
 		t.Fatalf("reload session before drain begin: %v", err)
 	}
 	reconcileIdleRespawnTestTickWithDrainOps(t, env, fresh, work, true, dops)
-	if ack, err := env.sp.GetMeta("worker", "GC_DRAIN_ACK"); err != nil || ack != "1" {
-		t.Fatalf("drain acknowledgement = %q, %v; want 1", ack, err)
+	// Carry (gc-hzj5): the reconciler publishes its own ack marker (source,
+	// reason, generation) and never writes GC_DRAIN_ACK, the agent's key;
+	// isDrainAcked reads either writer. Upstream #4961 asserts the key itself.
+	if acked, err := dops.isDrainAcked("worker"); err != nil || !acked {
+		t.Fatalf("drain acknowledgement = %v, %v; want acknowledged", acked, err)
 	}
 	ds := env.dt.get(session.ID)
 	if ds == nil {
@@ -255,8 +258,8 @@ func TestReconcileSessionBeads_IdleRespawnRechecksClaimBeforeStop(t *testing.T) 
 	if !env.sp.IsRunning("worker") {
 		t.Fatal("idle-respawn stopped a worker that claimed work after acknowledgement")
 	}
-	if ack, err := env.sp.GetMeta("worker", "GC_DRAIN_ACK"); err != nil || ack != "" {
-		t.Fatalf("drain acknowledgement after claim = %q, %v; want cleared", ack, err)
+	if acked, err := dops.isDrainAcked("worker"); err != nil || acked {
+		t.Fatalf("drain acknowledgement after claim = %v, %v; want cleared", acked, err)
 	}
 }
 

@@ -2569,8 +2569,7 @@ func TestCloseSessionBeadIfRuntimeStoppedAndUnassigned_RunningSessionDeclinesWit
 	var stderr bytes.Buffer
 	closed := closeSessionBeadIfRuntimeStoppedAndUnassigned(
 		"",
-		store, nil, sp, nil, b, "orphaned", "orphaned session", now, &stderr,
-	)
+		store, nil, sp, nil, b, "orphaned", "orphaned session", now, &stderr)
 
 	if closed {
 		t.Fatal("closeSessionBeadIfRuntimeStoppedAndUnassigned closed bead while runtime was still running -- it must decline, not kill-then-close")
@@ -2622,8 +2621,7 @@ func TestCloseSessionBeadIfRuntimeStoppedAndUnassigned_AlreadyStoppedClosesAsBef
 	var stderr bytes.Buffer
 	closed := closeSessionBeadIfRuntimeStoppedAndUnassigned(
 		"",
-		store, nil, sp, nil, b, "suspended", "suspended session", now, &stderr,
-	)
+		store, nil, sp, nil, b, "suspended", "suspended session", now, &stderr)
 
 	if !closed {
 		t.Fatalf("closeSessionBeadIfRuntimeStoppedAndUnassigned did not close bead for an already-stopped, unassigned session; stderr=%q", stderr.String())
@@ -2687,8 +2685,7 @@ func TestCloseSessionBeadIfRuntimeStoppedAndUnassignedPreservesConfiguredNamedSe
 	var stderr bytes.Buffer
 	closed := closeSessionBeadIfRuntimeStoppedAndUnassigned(
 		"",
-		store, nil, sp, cfg, b, "suspended", "suspended session", now, &stderr,
-	)
+		store, nil, sp, cfg, b, "suspended", "suspended session", now, &stderr)
 
 	if closed {
 		t.Fatal("closeSessionBeadIfRuntimeStoppedAndUnassigned closed bead with QualifiedName-assigned work")

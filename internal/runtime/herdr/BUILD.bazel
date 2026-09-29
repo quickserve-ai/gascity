@@ -30,6 +30,7 @@ go_test(
         "activity_live_test.go",
         "activity_test.go",
         "agent_name_taken_test.go",
+        "agent_start_timeout_test.go",
         "agentname_test.go",
         "client_test.go",
         "conformance_test.go",
