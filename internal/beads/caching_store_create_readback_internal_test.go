@@ -35,7 +35,7 @@ func (s *readBackFailingStore) Get(id string) (Bead, error) {
 
 // TestCachingStoreCreateRecordsEveryFailedReadBack (ga-th31cy): the read-back
 // after a create used to be recorded only for non-not-found errors, and an
-// incomplete lookup (ErrVerifyIndeterminate wraps ErrNotFound) was absorbed
+// incomplete lookup (ErrVerifyIndeterminate, then still wrapping ErrNotFound) was absorbed
 // CLEAN with no record, so the cache served a row verification could not find.
 // Now every failure is recorded; a failure that proves nothing leaves the row
 // dirty so the next read goes to storage, and a proven not-found stays clean

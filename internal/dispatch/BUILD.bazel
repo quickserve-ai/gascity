@@ -28,6 +28,7 @@ go_library(
         "//internal/graphv2",
         "//internal/molecule",
         "//internal/pathutil",
+        "//internal/prguard",
         "//internal/session",
         "//internal/sourceworkflow",
         "//internal/storeref",

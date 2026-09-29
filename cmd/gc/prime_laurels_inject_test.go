@@ -176,14 +176,14 @@ func TestPrimeHookContextSuffixCarriesLaurelsAtSessionStartOnly(t *testing.T) {
 	writeLaurels(t, filepath.Join(checkout, "seat", laurelsFileName), "committed by the repository")
 	t.Setenv("GC_DIR", checkout)
 	t.Setenv("GC_AGENT", laurelsTestAgent)
-	start := primeHookContextSuffix(city, true, primeHookContext{HookEventName: "SessionStart"}, io.Discard, false)
+	start := primeHookContextSuffix(city, nil, true, primeHookContext{HookEventName: "SessionStart"}, io.Discard, false)
 	if !strings.Contains(start.text, "A customer thanked this seat.") {
 		t.Fatalf("SessionStart context lacks the laurels: %q", start.text)
 	}
 	if strings.Contains(start.text, "committed by the repository") {
 		t.Fatalf("SessionStart read laurels from the work dir: %q", start.text)
 	}
-	turn := primeHookContextSuffix(city, true, primeHookContext{HookEventName: "UserPromptSubmit"}, io.Discard, false)
+	turn := primeHookContextSuffix(city, nil, true, primeHookContext{HookEventName: "UserPromptSubmit"}, io.Discard, false)
 	if strings.Contains(turn.text, "<laurels>") {
 		t.Fatalf("a non-SessionStart hook carried the laurels: %q", turn.text)
 	}

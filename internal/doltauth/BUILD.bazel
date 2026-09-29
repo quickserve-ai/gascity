@@ -11,6 +11,7 @@ go_library(
 go_test(
     name = "doltauth_test",
     srcs = [
+        "ambient_identity_scope_test.go",
         "auth_test.go",
         "testenv_import_test.go",
     ],

@@ -16,12 +16,15 @@ go_library(
 go_test(
     name = "orderdiscovery_test",
     srcs = [
+        "discovery_city_import_scope_test.go",
+        "discovery_override_enable_test.go",
         "discovery_test.go",
         "testenv_import_test.go",
     ],
     embed = [":orderdiscovery"],
     deps = [
         "//internal/config",
+        "//internal/orders",
         "//internal/testenv",
     ],
 )
