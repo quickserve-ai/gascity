@@ -141,8 +141,8 @@ func activeMidSessionDialog(content string) *midSessionDialog {
 // MidSessionDialogOnScreen names the mid-session machine dialog that
 // DismissMidSessionDialogs would clear on content, or returns "" when there is
 // none. It applies the same match and tail-anchor rule, so a caller that
-// refuses to type into prompts meant for a person (the tmux nudge guard,
-// ga-ubfc7j) can let exactly these dialogs through to their dismissal.
+// sends a dismissal's keys one at a time (the tmux nudge path, ga-ubfc7j) can
+// confirm before each key that the same dialog still owns the screen.
 func MidSessionDialogOnScreen(content string) string {
 	if dialog := activeMidSessionDialog(content); dialog != nil {
 		return dialog.name
