@@ -105,7 +105,7 @@ func TestNudgeSessionStillDefersOnAGenericSelectionPrompt(t *testing.T) {
 func TestDismissMidSessionDialogBeforeNudgeSendsNoKeysOverAQuestionWordedLikeTheChooser(t *testing.T) {
 	ex := &paneAfterFirstKeyExecutor{before: questionWordedLikeTheChooserPane, after: questionWordedLikeTheChooserPane}
 	tm := &Tmux{cfg: DefaultConfig(), exec: ex}
-	if tm.dismissMidSessionDialogBeforeNudge("agent-pane") {
+	if dismissKeyed(tm) {
 		t.Fatal("dismissed = true over a question worded like the session-limit chooser")
 	}
 	if keys := sentKeys(ex.calls); len(keys) != 0 {
@@ -116,7 +116,7 @@ func TestDismissMidSessionDialogBeforeNudgeSendsNoKeysOverAQuestionWordedLikeThe
 func TestDismissMidSessionDialogBeforeNudgeSendsNoKeysOverAQuestionDialog(t *testing.T) {
 	ex := &paneAfterFirstKeyExecutor{before: questionDialogFixture, after: questionDialogFixture}
 	tm := &Tmux{cfg: DefaultConfig(), exec: ex}
-	if tm.dismissMidSessionDialogBeforeNudge("agent-pane") {
+	if dismissKeyed(tm) {
 		t.Fatal("dismissed = true over a question dialog")
 	}
 	if keys := sentKeys(ex.calls); len(keys) != 0 {
@@ -132,8 +132,8 @@ func TestDismissMidSessionDialogBeforeNudgeSendsNoKeysOverAQuestionDialog(t *tes
 func TestDismissMidSessionDialogBeforeNudgeStopsWhenTheScreenChangesBetweenKeys(t *testing.T) {
 	ex := &paneAfterFirstKeyExecutor{before: machineFeedbackPane, after: questionDialogFixture, attached: "0"}
 	tm := &Tmux{cfg: DefaultConfig(), exec: ex}
-	if !tm.dismissMidSessionDialogBeforeNudge("agent-pane") {
-		t.Fatal("dismissMidSessionDialogBeforeNudge = false after a key went out; the caller would skip its re-read")
+	if !dismissKeyed(tm) {
+		t.Fatal("dismissMidSessionDialogs = false after a key went out; the caller would skip its re-read")
 	}
 	keys := sentKeys(ex.calls)
 	if len(keys) != 1 || !slices.Contains(keys[0], "0") {
@@ -245,7 +245,7 @@ func TestSendNudgeSubmitSequenceGuardsEveryKey(t *testing.T) {
 }
 
 // Astra round 3: on an attached session the fresh visible read that looks
-// for a machine dialog also honours a prompt meant for a person that appeared
+// for a machine dialog also honors a prompt meant for a person that appeared
 // after the guard's read.
 func TestNudgeSessionDefersOnAQuestionSeenByTheAttachedCheck(t *testing.T) {
 	ex := &paneAfterCapturesExecutor{before: idleComposerFixture, after: questionDialogFixture, n: 1, attached: "1"}
@@ -300,4 +300,11 @@ func TestModelSwitchDismissStopsWhenAnApprovalAppearsBelowTheModal(t *testing.T)
 	if len(keys) != 1 || !slices.Contains(keys[0], "Down") {
 		t.Fatalf("keys sent = %v, want only Down (no Enter onto the approval)", keys)
 	}
+}
+
+// dismissKeyed runs the pre-nudge dismissal on the test pane and reports
+// whether any dismissal key went out.
+func dismissKeyed(tm *Tmux) bool {
+	keyed, _ := tm.dismissMidSessionDialogs("agent-pane")
+	return keyed
 }
