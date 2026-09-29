@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,7 +20,6 @@ import (
 	"errors"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/extmsg"
-	"net"
 )
 
 var rawDoltSQLCallRe = regexp.MustCompile(`(?m)(^|[^A-Za-z0-9_-])dolt(?:[ \t]+|[ \t]*\\[ \t]*\r?\n[ \t]*)+sql([ \t]|$)`)
@@ -13954,7 +13952,11 @@ exit 0
 		"GC_DOLT_USER":      "root",
 		"GC_DOLT_PASSWORD":  "",
 		"GC_REAPER_DRY_RUN": "1",
-		"PATH":              binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+		// The scopes come from gc rig list and the fake bd scope route
+		// (maintenanceGCScopeRoute), not from SHOW DATABASES.
+		"FAKE_RIG_LIST_JSON": `{"rigs":[{"name":"rig1","hq":false}]}`,
+		"FAKE_SCOPE_DBS":     "city=citydb rig:rig1=rigdb",
+		"PATH":               binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
 	}
 
 	out, err := runScriptResult(t, coreScriptPath("reaper.sh"), env)

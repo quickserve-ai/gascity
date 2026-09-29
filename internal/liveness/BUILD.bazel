@@ -1,0 +1,47 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "liveness",
+    srcs = [
+        "keys.go",
+        "mode.go",
+        "plan.go",
+        "schema.go",
+        "store.go",
+    ],
+    importpath = "github.com/gastownhall/gascity/internal/liveness",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//internal/beadmeta",
+        "@com_github_go_sql_driver_mysql//:mysql",
+    ],
+)
+
+go_test(
+    name = "liveness_test",
+    srcs = [
+        "liveness_test.go",
+        "sqlstore_dolt_test.go",
+        "testenv_import_test.go",
+    ],
+    data = glob(
+        ["**"],
+        exclude = ["BUILD.bazel"],
+    ),
+    embed = [":liveness"],
+    deps = [
+        "@com_github_go_sql_driver_mysql//:mysql",
+    ],
+)
+
+# --- bazel_repo_srcs (managed by tools/bazel/repo_tree.py) ---
+
+filegroup(
+    name = "bazel_repo_srcs",
+    srcs = glob(
+        ["**"],
+        allow_empty = True,
+        exclude = ["BUILD.bazel"],
+    ),
+    visibility = ["//visibility:public"],
+)

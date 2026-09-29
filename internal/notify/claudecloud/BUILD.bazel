@@ -1,0 +1,41 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "claudecloud",
+    srcs = [
+        "claudecloud.go",
+    ],
+    importpath = "github.com/gastownhall/gascity/internal/notify/claudecloud",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//internal/notify",
+    ],
+)
+
+go_test(
+    name = "claudecloud_test",
+    srcs = [
+        "claudecloud_test.go",
+        "testenv_import_test.go",
+    ],
+    data = glob(
+        ["**"],
+        exclude = ["BUILD.bazel"],
+    ),
+    embed = [":claudecloud"],
+    deps = [
+        "//internal/notify",
+    ],
+)
+
+# --- bazel_repo_srcs (managed by tools/bazel/repo_tree.py) ---
+
+filegroup(
+    name = "bazel_repo_srcs",
+    srcs = glob(
+        ["**"],
+        allow_empty = True,
+        exclude = ["BUILD.bazel"],
+    ),
+    visibility = ["//visibility:public"],
+)
