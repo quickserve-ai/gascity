@@ -47,6 +47,12 @@ const (
 	// NudgeDeferReasonCaptureFailed: the pane could not be read, so a prompt
 	// could not be ruled out. The guard fails closed.
 	NudgeDeferReasonCaptureFailed = "capture_failed"
+	// NudgeDeferReasonMachineDialogAttached: a mid-session machine dialog
+	// (the resume selector, the feedback survey) is on an ATTACHED session.
+	// Its pre-nudge dismissal only runs on a detached pane, where no person
+	// can be typing, so here the nudge waits for the person to clear it
+	// rather than being typed into the dialog.
+	NudgeDeferReasonMachineDialogAttached = "machine_dialog_attached"
 )
 
 // Stages at which the guard can defer a nudge.
