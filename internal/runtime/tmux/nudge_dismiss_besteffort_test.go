@@ -147,6 +147,11 @@ func (d *dialogThenSilentExecutor) execute(args []string) (string, error) {
 	if slices.Contains(args, "capture-pane") && !slices.Contains(args, "-S") {
 		return d.pane, nil
 	}
+	// Detached: the pre-nudge dismissal runs only on a session nobody is
+	// attached to (ga-ubfc7j), which is the case this test models.
+	if slices.Contains(args, "#{session_attached}") {
+		return "0", nil
+	}
 	return "", nil
 }
 
