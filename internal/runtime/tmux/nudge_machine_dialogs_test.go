@@ -273,3 +273,17 @@ func TestFeedbackSurveyDismisserSendsNoKeysOverALiveQuestion(t *testing.T) {
 		t.Fatalf("sent survey keys over a live question: %v", keys)
 	}
 }
+
+// Astra round 4: the model-switch dismissal sends Down, settles, then Enter.
+// If a question replaced the modal in between, the Enter must not follow.
+func TestModelSwitchDismissStopsWhenAQuestionReplacesTheModalBetweenKeys(t *testing.T) {
+	modal := "Approaching rate limits\nSwitch to gpt-5.4-mini for lower credit usage?\n› 1. Switch to gpt-5.4-mini\n  2. Keep current model\n  3. Keep current model (never show again)\nPress enter to confirm or esc to go back"
+	ex := &paneAfterFirstKeyExecutor{before: modal, after: questionDialogFixture, attached: "0"}
+	tm := &Tmux{cfg: DefaultConfig(), exec: ex}
+
+	tm.DismissModelSwitchModalIfPresent("agent-pane")
+	keys := sentKeys(ex.calls)
+	if len(keys) != 1 || !slices.Contains(keys[0], "Down") {
+		t.Fatalf("keys sent = %v, want only Down (no Enter onto the question)", keys)
+	}
+}
