@@ -196,10 +196,18 @@ jobs:
 
   # Quality checks that Linux `CI / required` already runs on every PR.
   # Informational on Mac: nothing waits on this job and the summary does not
-  # fail on it. Its golangci-lint cache is exact-key-only and on an active
-  # branch the cold run never finishes inside the timeout, so the cache never
-  # saves and every run is cold again (gc-atwr). The job keeps running so a
-  # quiet run can finally save that cache.
+  # fail on it (gc-atwr).
+  #
+  # A cold Lint on the Mac runner measured 45m43s: 16m46s loading packages
+  # into an empty Go build cache (setup-gascity-macos runs setup-go with
+  # cache: false) and 28m51s of analysis (pl-yxp, run 36345117142). A
+  # golangci-lint cache hit does not shorten either. This job therefore keeps
+  # its own Go build cache: restored warm, Lint measured 14m21s (loading 6s,
+  # analysis 14m11s; run 36348415554). The build cache is
+  # content-addressed, so an older or partial copy can only save work, never
+  # change a result, which is why it may restore by prefix and save after a
+  # failed or timed-out Lint. The golangci-lint cache below is the opposite and
+  # stays exact-key, saved only on success.
   mac-quality:
     name: Mac / quality (lint, fmt, vet, docs)
     needs:
@@ -207,7 +215,7 @@ jobs:
       - gate
     if: needs.gate.outputs.run_smoke == 'true'
     runs-on: ${{ needs.runner-policy.outputs.runner_macos }}
-    timeout-minutes: 60
+    timeout-minutes: 70
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -225,13 +233,27 @@ jobs:
         id: glint-version
         run: |
           version=$(grep -m1 '^GOLANGCI_LINT_VERSION := ' Makefile | awk '{print $3}')
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-          # staticcheck (bundled in golangci-lint) caches type/CFG facts whose
-          # validity depends on the Go toolchain it was built with. Keying the
-          # cache on GOVERSION prevents a cache populated under one Go toolchain
-          # from being replayed under another, which produced a stale-fact
-          # SA5011 false-positive flood on main (ga-v7x9vk).
-          echo "goversion=$(go env GOVERSION)" >> "$GITHUB_OUTPUT"
+          {
+            echo "version=${version}"
+            # staticcheck (bundled in golangci-lint) caches type/CFG facts whose
+            # validity depends on the Go toolchain it was built with. Keying the
+            # cache on GOVERSION prevents a cache populated under one Go toolchain
+            # from being replayed under another, which produced a stale-fact
+            # SA5011 false-positive flood on main (ga-v7x9vk).
+            echo "goversion=$(go env GOVERSION)"
+            echo "gocache=$(go env GOCACHE)"
+          } >> "$GITHUB_OUTPUT"
+      # Restore/save are split (rather than the combined actions/cache) so the
+      # save step can run with if: always(): a Lint that hits its own timeout
+      # still leaves a warmer build cache for the next run.
+      - name: Restore Go build cache
+        id: gocache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ steps.glint-version.outputs.gocache }}
+          key: ${{ runner.os }}-mac-quality-gocache-${{ steps.glint-version.outputs.goversion }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-mac-quality-gocache-${{ steps.glint-version.outputs.goversion }}-
       - name: Restore golangci-lint cache
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
@@ -244,6 +266,9 @@ jobs:
           # forces a fully fresh, never-poisoned recompute.
           key: ${{ runner.os }}-golangci-lint-${{ steps.glint-version.outputs.version }}-${{ steps.glint-version.outputs.goversion }}-${{ hashFiles('go.sum', '.golangci.yml') }}
       - name: Lint
+        # Below the job limit, so a cold run that overruns fails this step and
+        # the build-cache save below still runs.
+        timeout-minutes: 50
         env:
           GOLANGCI_LINT_CACHE: ${{ github.workspace }}/.cache/golangci-lint
         run: make lint
@@ -253,6 +278,12 @@ jobs:
         run: make vet
       - name: Docs
         run: make check-docs
+      - name: Save Go build cache
+        if: always() && steps.gocache.outcome == 'success' && steps.gocache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ steps.glint-version.outputs.gocache }}
+          key: ${{ runner.os }}-mac-quality-gocache-${{ steps.glint-version.outputs.goversion }}-${{ hashFiles('go.sum') }}
 
   # Unit tests — the suite Mac already ran as "smoke".
   mac-unit:
