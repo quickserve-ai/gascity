@@ -30,50 +30,46 @@ strip_provenance() {
 	fi
 }
 
-sign_with_stable_identity() {
+# try_sign makes one codesign attempt with identity. On failure it leaves
+# codesign's own message in sign_error so the caller can report it.
+sign_error=""
+try_sign() {
 	local identity=$1
-	local source=$2
 
-	if codesign --force --sign "$identity" --identifier "$identifier" "$binary" 2>/dev/null; then
+	if sign_error=$(codesign --force --sign "$identity" --identifier "$identifier" "$binary" 2>&1 </dev/null); then
 		strip_provenance
 		echo "Signed $binary_name with stable macOS identity: $identity"
 		return 0
 	fi
-
-	if [ "$source" = "explicit" ]; then
-		echo "failed to sign $binary_name with GC_SIGN_IDENTITY=$identity" >&2
-		return 1
-	fi
-
-	echo "Could not sign $binary_name with auto-detected identity; leaving Go linker signature unchanged." >&2
-	return 0
+	return 1
 }
 
-find_stable_identity() {
+# find_stable_identities prints every identity name that matches a known
+# pattern, one per line, in pattern priority order and without duplicates.
+# `security find-identity` without -v can list one identity twice: once under
+# the matching identities and again under the valid ones.
+find_stable_identities() {
 	local candidates=$1
 	local pattern
-	local candidate
 
 	for pattern in 'Apple Development:' 'Developer ID Application:' 'GasCity Dev'; do
-		candidate=$(printf '%s\n' "$candidates" | awk -F '"' -v pattern="$pattern" 'index($0, pattern) {print $2; exit}')
-		if [ -n "$candidate" ]; then
-			printf '%s\n' "$candidate"
-			return 0
-		fi
-	done
-	return 0
+		printf '%s\n' "$candidates" | awk -F '"' -v pattern="$pattern" 'index($0, pattern) && $2 != "" {print $2}'
+	done | awk '!seen[$0]++'
 }
 
 if [ -n "${GC_SIGN_IDENTITY:-}" ]; then
-	sign_with_stable_identity "$GC_SIGN_IDENTITY" "explicit"
-	exit $?
+	if try_sign "$GC_SIGN_IDENTITY"; then
+		exit 0
+	fi
+	echo "failed to sign $binary_name with GC_SIGN_IDENTITY=$GC_SIGN_IDENTITY: $sign_error" >&2
+	exit 1
 fi
 
-identity=""
+identities=""
 if command -v security >/dev/null 2>&1; then
 	# NO -v. `-v` filters to identities with a TRUSTED chain, which excludes every
 	# self-signed local certificate -- including "GasCity Dev", one of the three
-	# patterns find_stable_identity searches for. So the auto-detect path could
+	# patterns find_stable_identities searches for. So the auto-detect path could
 	# never find the very identity it was written to look for, and every local
 	# build silently fell through to the Go linker's ad-hoc signature.
 	#
@@ -85,16 +81,32 @@ if command -v security >/dev/null 2>&1; then
 	# build gives `identifier "com.gascity.gc" and certificate root = H"..."`,
 	# which is stable across rebuilds. That is the whole point of this script.
 	#
-	# Dropping -v is safe: find_stable_identity still matches only the three
-	# known patterns, and if an admitted identity cannot actually sign, the
-	# auto path already falls through without failing the build.
+	# Without -v an untrusted or expired identity (an old "Apple Development:"
+	# cert, say) can match ahead of one that works, so every matching identity
+	# is tried in priority order until one signs (ga-0eoxgp).
 	candidates=$(security find-identity -p codesigning 2>/dev/null || true)
-	identity=$(find_stable_identity "$candidates")
+	identities=$(find_stable_identities "$candidates")
 fi
 
-if [ -n "$identity" ]; then
-	sign_with_stable_identity "$identity" "auto"
-	exit $?
+if [ -n "$identities" ]; then
+	failures=""
+	while IFS= read -r identity <&3; do
+		if try_sign "$identity"; then
+			exit 0
+		fi
+		echo "Could not sign $binary_name with $identity; trying the next stable identity." >&2
+		failures="$failures  $identity: ${sign_error:-codesign failed}
+"
+	done 3<<IDENTITIES
+$identities
+IDENTITIES
+	# A stable identity exists but none signed. Falling back to the ad-hoc
+	# signature here would be silent: every rebuild changes the cdhash and TCC
+	# re-prompts with nothing saying why.
+	echo "failed to sign $binary_name with any stable macOS identity. Tried:" >&2
+	printf '%s' "$failures" >&2
+	echo "Set GC_SIGN_IDENTITY='<certificate name>' to choose one, or fix or remove the failing certificates." >&2
+	exit 1
 fi
 
 if [ "${GC_ADHOC_SIGN:-0}" = "1" ]; then

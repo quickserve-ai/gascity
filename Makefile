@@ -166,6 +166,10 @@ install: check-self-contained
 		echo "       (via make: make install FREEZE_ACK=<bead>)"; \
 		exit 1; \
 	fi
+	@# The gc.bak-* backup is signed like the new binary (ga-0eoxgp): an ad-hoc
+	@# backup gets a fresh cdhash and re-prompts TCC whenever it runs. It is
+	@# signed on the backup's own inode (cp -p makes a new file), never on the
+	@# live $(INSTALL_DIR)/$(BINARY), whose inode running processes still map.
 	@mkdir -p $(INSTALL_DIR)
 	@set -e; \
 		tmp="$(INSTALL_DIR)/.$(BINARY).tmp.$$$$"; \
@@ -180,7 +184,14 @@ install: check-self-contained
 			echo "FATAL: staged $(BINARY) will not execute (exit=$$rc, output=$$(wc -c < "$$out") bytes)."; \
 			exit 1; \
 		fi; \
-		if [ -e "$(INSTALL_DIR)/$(BINARY)" ]; then cp -p "$(INSTALL_DIR)/$(BINARY)" "$$backup"; fi; \
+		if [ -e "$(INSTALL_DIR)/$(BINARY)" ]; then \
+			cp -p "$(INSTALL_DIR)/$(BINARY)" "$$backup"; \
+			if [ "$$(uname)" = "Darwin" ]; then \
+				if ! { scripts/sign-darwin-local.sh "$$backup" && ./scripts/sign-staged.sh "$$backup"; }; then \
+					echo "WARN: could not sign backup $$backup; it keeps the previous binary's signature and may re-prompt TCC if run." >&2; \
+				fi; \
+			fi; \
+		fi; \
 		mv -f "$$tmp" "$(INSTALL_DIR)/$(BINARY)"; \
 		: > "$$out"; \
 		set +e; "$(INSTALL_DIR)/$(BINARY)" version > "$$out" 2>&1; rc=$$?; set -e; \
