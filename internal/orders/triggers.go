@@ -512,8 +512,27 @@ func conditionCheckSensitiveValues(env []string) []string {
 	return values
 }
 
+// mergeConditionEnv is the check's environment: the evaluating process's own
+// minus any seat or parent-order identity (a check run from a seat's
+// `gc order check` must not mail as that seat), then the order's overlay.
 func mergeConditionEnv(environ, extra []string) []string {
-	return execenv.MergeEntries(environ, extra)
+	inherited := make([]string, 0, len(environ))
+	for _, entry := range environ {
+		key, _, _ := strings.Cut(entry, "=")
+		if !isExecUninheritedEnvKey(key) {
+			inherited = append(inherited, entry)
+		}
+	}
+	return execenv.MergeEntries(inherited, extra)
+}
+
+func isExecUninheritedEnvKey(key string) bool {
+	for _, k := range ExecUninheritedEnvKeys {
+		if key == k {
+			return true
+		}
+	}
+	return false
 }
 
 // checkEvent checks if matching events exist after the last cursor position.

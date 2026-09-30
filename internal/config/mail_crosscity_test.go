@@ -149,6 +149,19 @@ func TestValidateMailCrossCity(t *testing.T) {
 			mutate: func(c *City) { c.Mail.CrossCity = nil },
 		},
 		{
+			name:    "a peer city named order is reserved",
+			mutate:  func(c *City) { c.Mail.CrossCity.Cities = []string{"gastown", "order"} },
+			wantErr: "reserved",
+		},
+		{
+			name: "this city named order is reserved",
+			mutate: func(c *City) {
+				c.Workspace.Name = "order"
+				c.Mail.CrossCity.City = "order"
+			},
+			wantErr: "reserved",
+		},
+		{
 			name:    "missing city is refused",
 			mutate:  func(c *City) { c.Mail.CrossCity.City = "" },
 			wantErr: "city is required",
