@@ -2,6 +2,36 @@ package orders
 
 import "fmt"
 
+// Exec orders learn which order and which run they are through these env
+// vars. The controller sets them after [order.env] and dispatch-time vars, so
+// an order cannot claim another order's identity.
+const (
+	ExecOrderScopeEnv = "GC_ORDER_SCOPE" // the order's rig, or "city"
+	ExecOrderNameEnv  = "GC_ORDER_NAME"  // the order's name
+	ExecOrderRunEnv   = "GC_ORDER_RUN"   // the run's tracking bead id; unset when untracked
+)
+
+// ExecUninheritedEnvKeys never pass from the evaluating process's own
+// environment to an order's exec or its condition check: a seat's identity is
+// not the order's (ga-s04g7q), and a parent order's identity is not a nested
+// run's. The order's own GC_ORDER_* values are laid over afterwards.
+var ExecUninheritedEnvKeys = []string{
+	"GC_AGENT",
+	"GC_ALIAS",
+	"GC_SESSION_ID",
+	ExecOrderNameEnv,
+	ExecOrderRunEnv,
+	ExecOrderScopeEnv,
+}
+
+// ExecOrderScope is the GC_ORDER_SCOPE value for a: its rig, or "city".
+func ExecOrderScope(a Order) string {
+	if a.Rig != "" {
+		return a.Rig
+	}
+	return "city"
+}
+
 // ValidateExecEnvOverrides rejects [order.env] keys owned by the controller.
 func ValidateExecEnvOverrides(a Order) error {
 	for key := range a.Env {
@@ -54,6 +84,14 @@ func IsReservedExecEnvKey(key string) bool {
 		"GC_DOLT_STATE_FILE",
 		"GC_DOLT_USER",
 		ExecOutcomeFileEnv,
+		// A seat's identity is never an order's: one [order.env] line or
+		// webhook arg would otherwise let an order mail as any seat.
+		"GC_AGENT",
+		"GC_ALIAS",
+		"GC_SESSION_ID",
+		ExecOrderNameEnv,
+		ExecOrderRunEnv,
+		ExecOrderScopeEnv,
 		"GC_PACK_DIR",
 		"GC_PACK_NAME",
 		"GC_PACK_STATE_DIR",

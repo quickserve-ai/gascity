@@ -28,7 +28,8 @@ import (
 // exactly that mailbox back.
 
 // remoteMailIdentity returns the identity part of the default remote sender:
-// the first non-empty of GC_ALIAS, GC_AGENT, GC_SESSION_ID, else "human". The
+// the first non-empty of GC_ALIAS, GC_AGENT, GC_SESSION_ID, else the running
+// order (order:<scope>/<name>), else "human". The
 // alias/agent names lead because they are meaningful to a peer city; a bare
 // session id (the local default, see defaultMailIdentityCandidates) is opaque
 // outside the city that minted it.
@@ -37,6 +38,9 @@ func remoteMailIdentity() string {
 		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
 			return v
 		}
+	}
+	if order := orderMailSenderIdentity(); order != "" {
+		return order
 	}
 	return "human"
 }
