@@ -3,6 +3,8 @@ package main
 import (
 	"errors"
 	"fmt"
+	"os"
+	goruntime "runtime"
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/config"
@@ -20,7 +22,53 @@ import (
 const (
 	maxPromptSuffixRawBytes    = 100000
 	maxPromptSuffixQuotedBytes = 128000
+
+	// darwinTmuxPromptRawBytes and darwinTmuxPromptQuotedBytes replace the
+	// Linux bounds for the tmux runtime on a macOS host. macOS has no
+	// per-element argv cap, only ARG_MAX (1 MiB) across argv and envp, and the
+	// tmux runtime never sends a large prompt through tmux itself: past
+	// maxInlinePromptLen it writes a file and execs the provider with the
+	// prompt as one argument (internal/runtime/tmux/adapter.go buildLaunchCommand).
+	// A single 900,000-byte argument was measured to exec on the operator's Mac
+	// (2026-09-30, ga-alb76h). ARG_MAX is shared with the environment and with an
+	// initial_message appended to the prompt after this decision
+	// (session_lifecycle_parallel.go), so the bound stays near 2x the largest
+	// prime seen (130,301 bytes) and leaves ~750 KB for everything else.
+	//
+	// Without them, every prime over 100 KB went by the nudge fallback, a
+	// bracketed paste, and Claude Code hands a paste to the model as quoted
+	// content it may decline to act on: a seat can start, read its own role
+	// prompt as text someone pasted, and stop (ga-alb76h).
+	darwinTmuxPromptRawBytes    = 256000
+	darwinTmuxPromptQuotedBytes = 320000
 )
+
+// promptArgvHostOS is the host OS the argv bounds are chosen for. The test
+// binary pins it to "linux" (TestMain) so tests read the same on every host.
+var promptArgvHostOS = goruntime.GOOS
+
+// promptArgvLimits returns the raw and argv-encoded byte bounds for a startup
+// prompt launched by runtimeName on goos. sessionEnv is GC_SESSION, which
+// provider construction honors before city.toml (providers.go
+// newSessionProviderForCity) while runtimeName comes from config alone; the
+// darwin bounds apply only when BOTH name tmux (or the default), so a
+// GC_SESSION=k8s override can never receive an argv prime k8s ignores. Every
+// other runtime keeps the Linux bounds, since k8s and hybrid launch into Linux
+// pods and the rest are not measured here.
+func promptArgvLimits(goos, runtimeName, sessionEnv string) (raw, quoted int) {
+	if goos == "darwin" && isTmuxRuntimeName(runtimeName) && isTmuxRuntimeName(sessionEnv) {
+		return darwinTmuxPromptRawBytes, darwinTmuxPromptQuotedBytes
+	}
+	return maxPromptSuffixRawBytes, maxPromptSuffixQuotedBytes
+}
+
+func isTmuxRuntimeName(name string) bool {
+	switch strings.TrimSpace(name) {
+	case "", "tmux":
+		return true
+	}
+	return false
+}
 
 // promptDeliveryResult is the resolved plan for delivering a rendered startup
 // prompt to a freshly launched session: which argv suffix / flag / nudge
@@ -190,7 +238,8 @@ func promptDelivery(prompt string, isACP bool, rp *config.ResolvedProvider, nudg
 	suffix := shellquote.Quote(prompt)
 	res.RawBytes = len(prompt)
 	res.ArgvBytes = len(suffix)
-	if len(prompt) >= maxPromptSuffixRawBytes || len(suffix) >= maxPromptSuffixQuotedBytes {
+	rawLimit, quotedLimit := promptArgvLimits(promptArgvHostOS, runtimeName, os.Getenv("GC_SESSION"))
+	if len(prompt) >= rawLimit || len(suffix) >= quotedLimit {
 		switch promptDeliverySupportFor(runtimeName, packRuntimes) {
 		case promptDeliverySupportArgvSafe:
 			// Falls through to normal argv delivery below: this runtime
@@ -207,7 +256,7 @@ func promptDelivery(prompt string, isACP bool, rp *config.ResolvedProvider, nudg
 			return res, fmt.Errorf(
 				"%w: runtime %q, prompt %d raw bytes / %d argv-encoded bytes (limits: %d raw / %d argv-encoded)",
 				errOversizedPromptUnsupportedRuntime, runtimeName, len(prompt), len(suffix),
-				maxPromptSuffixRawBytes, maxPromptSuffixQuotedBytes)
+				rawLimit, quotedLimit)
 		}
 	}
 
