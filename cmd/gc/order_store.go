@@ -243,6 +243,36 @@ func orderExecEnvWithError(cityPath string, cfg *config.City, target execStoreTa
 	return mergeRuntimeEnv(nil, env), nil
 }
 
+// orderExecEnvForRun is orderExecEnvWithError plus the order's own identity
+// (GC_ORDER_SCOPE, GC_ORDER_NAME, GC_ORDER_RUN), laid over last so neither
+// [order.env] nor dispatch-time vars can replace it. runID is the run's
+// tracking bead; "" leaves GC_ORDER_RUN unset.
+func orderExecEnvForRun(cityPath string, cfg *config.City, target execStoreTarget, a orders.Order, vars map[string]string, runID string) ([]string, error) {
+	env, err := orderExecEnvWithError(cityPath, cfg, target, a, vars)
+	if err != nil {
+		return nil, err
+	}
+	identity := map[string]string{
+		orders.ExecOrderScopeEnv: orders.ExecOrderScope(a),
+		orders.ExecOrderNameEnv:  a.Name,
+	}
+	if runID != "" {
+		identity[orders.ExecOrderRunEnv] = runID
+	}
+	for _, key := range []string{orders.ExecOrderScopeEnv, orders.ExecOrderNameEnv, orders.ExecOrderRunEnv} {
+		env = removeEnvKey(env, key)
+		if v, ok := identity[key]; ok {
+			env = append(env, key+"="+v)
+		}
+	}
+	// Dispatch-time vars are not reserved-key checked (the design's R4), so a
+	// seat identity arriving that way is dropped here.
+	for _, key := range []string{"GC_AGENT", "GC_ALIAS", "GC_SESSION_ID"} {
+		env = removeEnvKey(env, key)
+	}
+	return env, nil
+}
+
 func validateOrderExecEnvOverrides(a orders.Order) error {
 	return orders.ValidateExecEnvOverrides(a)
 }
@@ -266,7 +296,9 @@ func orderTriggerOptionsForTarget(cityPath string, cfg *config.City, target exec
 	if a.Trigger != "condition" || strings.TrimSpace(cityPath) == "" {
 		return orders.TriggerOptions{}, nil
 	}
-	env, err := orderExecEnvWithError(cityPath, cfg, target, a, nil)
+	// A check is the order acting, so it carries the order's scope and name;
+	// it is not a tracked run, so GC_ORDER_RUN stays unset.
+	env, err := orderExecEnvForRun(cityPath, cfg, target, a, nil, "")
 	if err != nil {
 		return orders.TriggerOptions{}, err
 	}

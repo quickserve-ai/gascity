@@ -3406,7 +3406,7 @@ dolt.auto-start: false
 
 	a := orders.Order{Name: "pg-env", Trigger: "cooldown", Interval: "1m", Exec: "true"}
 	var stdout, stderr bytes.Buffer
-	result := doOrderRunExecResult(a, cityDir, nil, nil, &stdout, &stderr)
+	result := doOrderRunExecResult(a, cityDir, nil, nil, "", &stdout, &stderr)
 	if result.code == 0 {
 		t.Fatalf("doOrderRunExecResult = 0, want env failure; stdout=%q stderr=%q", stdout.String(), stderr.String())
 	}
@@ -3453,7 +3453,7 @@ prefix = "ct"
 	}
 
 	var stdout, stderr bytes.Buffer
-	result := doOrderRunExecResult(a, cityDir, cfg, nil, &stdout, &stderr)
+	result := doOrderRunExecResult(a, cityDir, cfg, nil, "", &stdout, &stderr)
 	if result.code == 0 {
 		t.Fatalf("doOrderRunExecResult = 0, want exec failure; stdout=%q stderr=%q", stdout.String(), stderr.String())
 	}
@@ -3501,7 +3501,7 @@ prefix = "ct"
 	}
 
 	var stdout, stderr bytes.Buffer
-	result := doOrderRunExecResult(a, cityDir, cfg, nil, &stdout, &stderr)
+	result := doOrderRunExecResult(a, cityDir, cfg, nil, "", &stdout, &stderr)
 	if result.code != 0 {
 		t.Fatalf("doOrderRunExecResult = %d, want exec success; stdout=%q stderr=%q", result.code, stdout.String(), stderr.String())
 	}
