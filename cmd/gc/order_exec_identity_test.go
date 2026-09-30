@@ -3,12 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/orders"
 )
 
@@ -207,5 +209,64 @@ func TestOrderRunExecCarriesRunID(t *testing.T) {
 	}
 	if want := "id=city|probe|ct-run7|unset"; !strings.Contains(stdout.String(), want) {
 		t.Fatalf("stdout = %q, want %q", stdout.String(), want)
+	}
+}
+
+// navani's requirement 4: GC_ORDER_RUN is UNSET, not empty, on the
+// trigger-condition path (a check is not a run).
+func TestOrderTriggerConditionEnvHasNoRunID(t *testing.T) {
+	t.Setenv("GC_BEADS", "bd")
+	t.Setenv("GC_DOLT", "skip")
+	cityDir := t.TempDir()
+	target := execStoreTarget{ScopeRoot: cityDir, ScopeKind: "city", Prefix: "pc"}
+	a := orders.Order{Name: "cond", Trigger: "condition", Check: "true", Exec: "true"}
+	opts, err := orderTriggerOptionsForTarget(cityDir, nil, target, a)
+	if err != nil {
+		t.Fatalf("orderTriggerOptionsForTarget: %v", err)
+	}
+	if len(opts.ConditionEnv) == 0 {
+		t.Fatal("condition env is empty; the test would pass vacuously")
+	}
+	assertEnvAbsent(t, opts.ConditionEnv, orders.ExecOrderRunEnv)
+}
+
+// navani's requirement 5: the reserved order and seat identity keys are refused
+// by gc order check, beside TestOrderCheckWithStoresResolverRejectsReservedOrderEnvKey.
+func TestOrderCheckWithStoresResolverRejectsIdentityEnvKeys(t *testing.T) {
+	for _, key := range []string{orders.ExecOrderNameEnv, orders.ExecOrderScopeEnv, orders.ExecOrderRunEnv, "GC_AGENT", "GC_ALIAS", "GC_SESSION_ID"} {
+		aa := []orders.Order{{Name: "bad-env", Trigger: "cooldown", Interval: "24h", Exec: "scripts/bad-env.sh", Env: map[string]string{key: "x"}}}
+		var stdout, stderr bytes.Buffer
+		code := doOrderCheckWithStoresResolverScoped(t.TempDir(), &config.City{}, aa,
+			time.Date(2026, 2, 27, 12, 0, 0, 0, time.UTC), nil,
+			func(orders.Order) ([]beads.OrdersStore, error) { return nil, nil }, &stdout, &stderr)
+		if code != 1 || !strings.Contains(stderr.String(), `controller-owned env key "`+key+`"`) {
+			t.Fatalf("%s: code=%d stderr=%q, want the reserved-key refusal", key, code, stderr.String())
+		}
+	}
+}
+
+// navani's requirement 5: the strip holds end to end on the CONTROLLER DISPATCH
+// path too, through the real shell runner (the manual path is
+// TestOrderRunExecCarriesRunID).
+func TestOrderDispatchRealShellStripsSeatIdentity(t *testing.T) {
+	t.Setenv("GC_SESSION_ID", "gc-leaked")
+	t.Setenv("GC_ALIAS", "leaked")
+	t.Setenv("GC_AGENT", "leaked")
+	out := filepath.Join(t.TempDir(), "seen")
+	store := beads.NewMemStore()
+	aa := []orders.Order{{
+		Name: "probe", Trigger: "cooldown", Interval: "1m",
+		Exec: `printf '%s|%s|%s|%s|%s' "${GC_SESSION_ID:-unset}" "${GC_ALIAS:-unset}" "${GC_AGENT:-unset}" "$GC_ORDER_NAME" "${GC_ORDER_RUN:-unset}" > ` + out,
+	}}
+	ad := buildOrderDispatcherFromListExec(aa, store, nil, shellExecRunner, nil)
+	ad.dispatch(context.Background(), t.TempDir(), time.Now())
+	ad.drain(context.Background())
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("order did not run: %v", err)
+	}
+	parts := strings.Split(string(got), "|")
+	if len(parts) != 5 || parts[0] != "unset" || parts[1] != "unset" || parts[2] != "unset" || parts[3] != "probe" || parts[4] == "unset" {
+		t.Fatalf("child saw %q, want seat keys unset, GC_ORDER_NAME=probe and a run id", got)
 	}
 }
