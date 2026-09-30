@@ -5085,6 +5085,22 @@ func TestValidateRigs_WildcardNameRejected(t *testing.T) {
 	}
 }
 
+// Mail from an order is addressed order:<scope>/<name>, so no rig may take the
+// order segment.
+func TestValidateRigs_OrderAddressNameRejected(t *testing.T) {
+	for _, name := range []string{"order", "order:qcore"} {
+		err := ValidateRigs([]Rig{{Name: name, Path: "/a"}}, "ci")
+		if err == nil || !strings.Contains(err.Error(), "reserved") {
+			t.Errorf("ValidateRigs(rig %q) = %v, want a reserved-name error", name, err)
+		}
+	}
+	for _, name := range []string{"orders", "reorder", "qcore"} {
+		if err := ValidateRigs([]Rig{{Name: name, Path: "/a"}}, "ci"); err != nil {
+			t.Errorf("ValidateRigs(rig %q) = %v, want nil", name, err)
+		}
+	}
+}
+
 func TestValidateRigs_DuplicateName(t *testing.T) {
 	rigs := []Rig{
 		{Name: "frontend", Path: "/a"},
