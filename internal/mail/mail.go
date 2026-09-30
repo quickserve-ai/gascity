@@ -6,8 +6,11 @@ package mail //nolint:revive // internal package, always imported qualified
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/config"
 )
 
 // ErrAlreadyArchived is returned by [Provider.Archive] when the message has
@@ -64,8 +67,21 @@ const (
 	// OrderSenderPrefix begins the sender of mail an order sends:
 	// order:<scope>/<name>. An order has no mailbox, so nothing is delivered
 	// to such an address.
-	OrderSenderPrefix = "order:"
+	OrderSenderPrefix = config.OrderAddressSegment + ":"
 )
+
+// OrderNoMailboxError is the refusal for mail addressed to an order, or a
+// reply to one: an order has no mailbox. It names where to write instead, so an
+// operator answering an alert is not left at a dead end: the mayor of the city
+// the order ran in, or the seat that owns the order.
+func OrderNoMailboxError(addr string) error {
+	addr = strings.TrimSpace(addr)
+	where := "mail the seat that owns the order, or this city's mayor"
+	if city, rest, ok := strings.Cut(addr, "/"); ok && !strings.HasPrefix(addr, OrderSenderPrefix) && strings.HasPrefix(rest, OrderSenderPrefix) {
+		where = "mail " + city + "/mayor, or the seat that owns the order in " + city
+	}
+	return fmt.Errorf("%s is an order, which has no mailbox; %s", addr, where)
+}
 
 // IsOrderSender reports whether addr is an order's sender address, bare
 // (order:<scope>/<name>) or as a cross-city send stores it

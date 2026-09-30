@@ -816,7 +816,7 @@ func (p *Provider) Reply(id, from, subject, body string) (mail.Message, error) {
 		return mail.Message{}, fmt.Errorf("beadmail reply: original message %s has no sender to reply to", id)
 	}
 	if mail.IsOrderSender(to) {
-		return mail.Message{}, fmt.Errorf("beadmail reply: message %s was sent by %s, an order, which has no mailbox; mail the order's owning seat or the mayor instead", id, to)
+		return mail.Message{}, fmt.Errorf("beadmail reply: message %s: %w", id, mail.OrderNoMailboxError(to))
 	}
 	toDisplay := strings.TrimSpace(original.Metadata[fromDisplayMetadataKey])
 	if toDisplay == "" {

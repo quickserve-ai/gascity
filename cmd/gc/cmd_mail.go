@@ -1376,7 +1376,7 @@ func resolveMailRecipientIdentityCached(cityPath string, cfg *config.City, sessS
 		return "", session.ErrSessionNotFound
 	}
 	if mail.IsOrderSender(identifier) {
-		return "", fmt.Errorf("%s is an order, which has no mailbox; mail the order's owning seat or the mayor instead", strings.TrimSpace(identifier))
+		return "", mail.OrderNoMailboxError(identifier)
 	}
 	resolved, err := resolveMailIdentityWithConfigCached(cityPath, cfg, sessStore, identifier, cache)
 	if err != nil {
