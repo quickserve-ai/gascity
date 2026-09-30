@@ -236,6 +236,9 @@ func testscriptGC() {
 
 func TestMain(m *testing.M) {
 	maybeRunHostedBeadsCredentialProvider()
+	// Startup-prompt argv bounds depend on the host OS; tests assert the Linux
+	// ones everywhere, and the darwin branch has its own tests (ga-alb76h).
+	promptArgvHostOS = "linux"
 	maybeRunProductMetricsDirectChildEnvSpy()
 	maybeRunFakeDoltSQLServer()
 
