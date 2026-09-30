@@ -472,22 +472,27 @@ func promptDeliveryResultLens(r promptDeliveryResult) string {
 // Linux bounds.
 func TestPromptArgvLimitsByHostAndRuntime(t *testing.T) {
 	for _, tc := range []struct {
-		goos, runtime   string
-		raw, quotedWant int
+		goos, runtime, env string
+		raw, quotedWant    int
 	}{
-		{"linux", "tmux", maxPromptSuffixRawBytes, maxPromptSuffixQuotedBytes},
-		{"linux", "", maxPromptSuffixRawBytes, maxPromptSuffixQuotedBytes},
-		{"darwin", "tmux", darwinTmuxPromptRawBytes, darwinTmuxPromptQuotedBytes},
-		{"darwin", "", darwinTmuxPromptRawBytes, darwinTmuxPromptQuotedBytes},
-		{"darwin", " tmux", darwinTmuxPromptRawBytes, darwinTmuxPromptQuotedBytes},
-		{"darwin", "k8s", maxPromptSuffixRawBytes, maxPromptSuffixQuotedBytes},
-		{"darwin", "hybrid", maxPromptSuffixRawBytes, maxPromptSuffixQuotedBytes},
-		{"darwin", "herdr", maxPromptSuffixRawBytes, maxPromptSuffixQuotedBytes},
-		{"darwin", "subprocess", maxPromptSuffixRawBytes, maxPromptSuffixQuotedBytes},
+		{"linux", "tmux", "", maxPromptSuffixRawBytes, maxPromptSuffixQuotedBytes},
+		{"linux", "", "", maxPromptSuffixRawBytes, maxPromptSuffixQuotedBytes},
+		{"darwin", "tmux", "", darwinTmuxPromptRawBytes, darwinTmuxPromptQuotedBytes},
+		{"darwin", "", "", darwinTmuxPromptRawBytes, darwinTmuxPromptQuotedBytes},
+		{"darwin", " tmux", "", darwinTmuxPromptRawBytes, darwinTmuxPromptQuotedBytes},
+		{"darwin", "k8s", "", maxPromptSuffixRawBytes, maxPromptSuffixQuotedBytes},
+		{"darwin", "hybrid", "", maxPromptSuffixRawBytes, maxPromptSuffixQuotedBytes},
+		{"darwin", "herdr", "", maxPromptSuffixRawBytes, maxPromptSuffixQuotedBytes},
+		{"darwin", "subprocess", "", maxPromptSuffixRawBytes, maxPromptSuffixQuotedBytes},
+		// GC_SESSION overrides city.toml at provider construction; a non-tmux
+		// override must not get the darwin bounds (cross-family read of #201).
+		{"darwin", "tmux", "k8s", maxPromptSuffixRawBytes, maxPromptSuffixQuotedBytes},
+		{"darwin", "", "hybrid", maxPromptSuffixRawBytes, maxPromptSuffixQuotedBytes},
+		{"darwin", "tmux", "tmux", darwinTmuxPromptRawBytes, darwinTmuxPromptQuotedBytes},
 	} {
-		raw, quoted := promptArgvLimits(tc.goos, tc.runtime)
+		raw, quoted := promptArgvLimits(tc.goos, tc.runtime, tc.env)
 		if raw != tc.raw || quoted != tc.quotedWant {
-			t.Errorf("promptArgvLimits(%q, %q) = %d, %d; want %d, %d", tc.goos, tc.runtime, raw, quoted, tc.raw, tc.quotedWant)
+			t.Errorf("promptArgvLimits(%q, %q, %q) = %d, %d; want %d, %d", tc.goos, tc.runtime, tc.env, raw, quoted, tc.raw, tc.quotedWant)
 		}
 	}
 }
@@ -499,6 +504,7 @@ func TestPromptDeliveryDarwinTmuxKeepsLargePrimeInArgv(t *testing.T) {
 	prev := promptArgvHostOS
 	promptArgvHostOS = "darwin"
 	t.Cleanup(func() { promptArgvHostOS = prev })
+	t.Setenv("GC_SESSION", "")
 
 	arg := &config.ResolvedProvider{PromptMode: "arg"}
 	prompt := repeatToBytes("a", 130301)
@@ -519,6 +525,16 @@ func TestPromptDeliveryDarwinTmuxKeepsLargePrimeInArgv(t *testing.T) {
 	if !got.OversizedFallback || got.PromptSuffix != "" {
 		t.Fatalf("k8s on darwin: OversizedFallback=%v PromptSuffix len=%d; want the Linux-bound fallback", got.OversizedFallback, len(got.PromptSuffix))
 	}
+
+	t.Setenv("GC_SESSION", "k8s")
+	got, err = promptDelivery(prompt, false, arg, "wake", "tmux", nil)
+	if err != nil {
+		t.Fatalf("promptDelivery(tmux, GC_SESSION=k8s): %v", err)
+	}
+	if !got.OversizedFallback || got.PromptSuffix != "" {
+		t.Fatalf("tmux in config but GC_SESSION=k8s: OversizedFallback=%v PromptSuffix len=%d; want the fallback", got.OversizedFallback, len(got.PromptSuffix))
+	}
+	t.Setenv("GC_SESSION", "")
 
 	got, err = promptDelivery(repeatToBytes("a", darwinTmuxPromptRawBytes), false, arg, "wake", "tmux", nil)
 	if err != nil {

@@ -191,7 +191,7 @@ func reportPromptDeliveryBudget(prompt string, a *config.Agent, cfg *config.City
 	}
 
 	quoted := shellquote.Quote(prompt)
-	rawLimit, argvLimit := promptArgvLimits(promptArgvHostOS, effProvider)
+	rawLimit, argvLimit := promptArgvLimits(promptArgvHostOS, effProvider, os.Getenv("GC_SESSION"))
 	budget := &promptBudgetJSON{
 		RawBytes:          len(prompt),
 		RawLimit:          rawLimit,
