@@ -1052,7 +1052,7 @@ func doOrderRunExecTracked(a orders.Order, cityPath string, cfg *config.City, fr
 		}
 	}
 
-	result := doOrderRunExecResult(a, cityPath, cfg, vars, stdout, stderr)
+	result := doOrderRunExecResult(a, cityPath, cfg, vars, run.ID, stdout, stderr)
 	outcome := orders.RunOutcomeExec
 	if result.code != 0 {
 		outcome = orders.RunOutcomeExecFailed
@@ -1076,7 +1076,7 @@ func doOrderRunExecTracked(a orders.Order, cityPath string, cfg *config.City, fr
 
 // doOrderRunExec runs an exec order directly via shell.
 func doOrderRunExec(a orders.Order, cityPath string, cfg *config.City, vars map[string]string, stdout, stderr io.Writer) int {
-	return doOrderRunExecResult(a, cityPath, cfg, vars, stdout, stderr).code
+	return doOrderRunExecResult(a, cityPath, cfg, vars, "", stdout, stderr).code
 }
 
 type orderRunExecResult struct {
@@ -1084,7 +1084,7 @@ type orderRunExecResult struct {
 	failureLabel string
 }
 
-func doOrderRunExecResult(a orders.Order, cityPath string, cfg *config.City, vars map[string]string, stdout, stderr io.Writer) orderRunExecResult {
+func doOrderRunExecResult(a orders.Order, cityPath string, cfg *config.City, vars map[string]string, runID string, stdout, stderr io.Writer) orderRunExecResult {
 	var maxTimeout time.Duration
 	if cfg != nil {
 		maxTimeout = cfg.Orders.MaxTimeoutDuration()
@@ -1098,7 +1098,7 @@ func doOrderRunExecResult(a orders.Order, cityPath string, cfg *config.City, var
 		fmt.Fprintf(stderr, "gc order run: %s\n", redactOrderEnvError(err, os.Environ())) //nolint:errcheck // best-effort stderr
 		return orderRunExecResult{code: 1, failureLabel: "exec-failed"}
 	}
-	env, err := orderExecEnvWithError(cityPath, cfg, target, a, vars)
+	env, err := orderExecEnvForRun(cityPath, cfg, target, a, vars, runID)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc order run: %s\n", redactOrderEnvError(err, os.Environ())) //nolint:errcheck // best-effort stderr
 		return orderRunExecResult{code: 1, failureLabel: "exec-env-failed"}
