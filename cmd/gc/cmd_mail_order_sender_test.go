@@ -10,7 +10,9 @@ import (
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/mail"
+	"github.com/gastownhall/gascity/internal/mail/beadmail"
 	"github.com/gastownhall/gascity/internal/session"
 )
 
@@ -186,5 +188,29 @@ func TestRemoteMailIdentity_FallsBackToOrder(t *testing.T) {
 	setOrderEnv(t, "city", "deacon-watch", "pc-run1")
 	if got := remoteMailIdentity(); got != "order:city/deacon-watch" {
 		t.Fatalf("order: %q, want order:city/deacon-watch", got)
+	}
+}
+
+// A broadcast from an order records the run on every message, as a single
+// send does (cross-family review of #199, finding 2).
+func TestMailSendAllRecordsOrderRun(t *testing.T) {
+	store := beads.NewMemStore()
+	mp := beadmail.New(store)
+	recipients := map[string]bool{"human": true, "committer": true, "tester": true}
+	run := map[string]string{mail.FromOrderRunMetadataKey: "pc-run1"}
+
+	var stdout, stderr bytes.Buffer
+	code := doMailSendAllCoverageRun(mp, events.Discard, recipients, "order:city/deacon-watch", []string{"alert"}, nil, false, nil, run, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doMailSendAllCoverageRun = %d; stderr: %s", code, stderr.String())
+	}
+	for _, id := range []string{"gc-1", "gc-2"} {
+		b, err := store.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if got := b.Metadata[mail.FromOrderRunMetadataKey]; got != "pc-run1" {
+			t.Fatalf("%s: %s = %q, want pc-run1", id, mail.FromOrderRunMetadataKey, got)
+		}
 	}
 }

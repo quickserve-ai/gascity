@@ -228,6 +228,9 @@ func TestOrderTriggerConditionEnvHasNoRunID(t *testing.T) {
 		t.Fatal("condition env is empty; the test would pass vacuously")
 	}
 	assertEnvAbsent(t, opts.ConditionEnv, orders.ExecOrderRunEnv)
+	// A check is the order acting: it names the order, so mail it sends reads order:city/cond.
+	assertEnvOnce(t, opts.ConditionEnv, orders.ExecOrderScopeEnv, "city")
+	assertEnvOnce(t, opts.ConditionEnv, orders.ExecOrderNameEnv, "cond")
 }
 
 // navani's requirement 5: the reserved order and seat identity keys are refused

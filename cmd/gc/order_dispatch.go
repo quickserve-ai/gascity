@@ -242,22 +242,9 @@ func cancelShellExecProcessGroup(cmd *exec.Cmd, pgid int) error {
 	return processgroup.TerminateCommand(cmd, pgid, shellExecSignalGrace, processgroup.Options{})
 }
 
-// orderExecUninheritedKeys never pass from the dispatcher's own environment to
-// an order: a seat's identity is not the order's (ga-s04g7q), and a parent
-// order's identity is not a nested run's. All six are reserved [order.env]
-// keys; orderExecEnvForRun sets the GC_ORDER_* ones.
-var orderExecUninheritedKeys = []string{
-	"GC_AGENT",
-	"GC_ALIAS",
-	"GC_SESSION_ID",
-	orders.ExecOrderNameEnv,
-	orders.ExecOrderRunEnv,
-	orders.ExecOrderScopeEnv,
-}
-
 func mergeOrderExecEnv(environ, env []string) []string {
 	out := mergeRuntimeEnv(environ, nil)
-	for _, key := range orderExecUninheritedKeys {
+	for _, key := range orders.ExecUninheritedEnvKeys {
 		out = removeEnvKey(out, key)
 	}
 	for _, entry := range env {

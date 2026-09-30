@@ -11,6 +11,19 @@ const (
 	ExecOrderRunEnv   = "GC_ORDER_RUN"   // the run's tracking bead id; unset when untracked
 )
 
+// ExecUninheritedEnvKeys never pass from the evaluating process's own
+// environment to an order's exec or its condition check: a seat's identity is
+// not the order's (ga-s04g7q), and a parent order's identity is not a nested
+// run's. The order's own GC_ORDER_* values are laid over afterwards.
+var ExecUninheritedEnvKeys = []string{
+	"GC_AGENT",
+	"GC_ALIAS",
+	"GC_SESSION_ID",
+	ExecOrderNameEnv,
+	ExecOrderRunEnv,
+	ExecOrderScopeEnv,
+}
+
 // ExecOrderScope is the GC_ORDER_SCOPE value for a: its rig, or "city".
 func ExecOrderScope(a Order) string {
 	if a.Rig != "" {

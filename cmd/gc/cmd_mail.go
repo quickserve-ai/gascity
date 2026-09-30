@@ -2463,7 +2463,7 @@ func cmdMailSendJSONFull(args []string, notify bool, all bool, from string, to s
 				}
 			}
 		}
-		return doMailSendAllCoverage(mp, rec, crossCityBroadcastRecipients(roster, validRecipients, stderr), sender, args, nf, jsonOut, cov, stdout, stderr)
+		return doMailSendAllCoverageRun(mp, rec, crossCityBroadcastRecipients(roster, validRecipients, stderr), sender, args, nf, jsonOut, cov, runMetadata, stdout, stderr)
 	}
 
 	rec := openCityRecorder(stderr)
@@ -2643,6 +2643,12 @@ func unreachedConfiguredSeats(cov *broadcastCoverage, sent map[string]bool, send
 }
 
 func doMailSendAllCoverage(mp mail.Provider, rec events.Recorder, validRecipients map[string]bool, sender string, args []string, nudgeFn nudgeFunc, jsonOut bool, cov *broadcastCoverage, stdout, stderr io.Writer) int {
+	return doMailSendAllCoverageRun(mp, rec, validRecipients, sender, args, nudgeFn, jsonOut, cov, nil, stdout, stderr)
+}
+
+// doMailSendAllCoverageRun is doMailSendAllCoverage that also stamps each
+// message with runMetadata (the sending order run, ga-uf77nc) when non-nil.
+func doMailSendAllCoverageRun(mp mail.Provider, rec events.Recorder, validRecipients map[string]bool, sender string, args []string, nudgeFn nudgeFunc, jsonOut bool, cov *broadcastCoverage, runMetadata map[string]string, stdout, stderr io.Writer) int {
 	if len(args) < 1 {
 		fmt.Fprintln(stderr, "gc mail send --all: usage: gc mail send --all <body>") //nolint:errcheck // best-effort stderr
 		return 1
@@ -2680,8 +2686,18 @@ func doMailSendAllCoverage(mp mail.Provider, rec events.Recorder, validRecipient
 	// attempted and the summary names exactly who needs what.
 	var lost, failed, unconfirmed, attemptedFailed []string
 	var unconfirmedRecipients []mailUnconfirmedRecipient
+	ms, canStampRun := mp.(mail.MetadataSender)
+	if runMetadata != nil && !canStampRun {
+		fmt.Fprintln(stderr, "gc mail send --all: mail provider cannot record the sending order run on the message") //nolint:errcheck // best-effort stderr
+	}
 	for _, to := range recipients {
-		m, err := mp.Send(sender, to, subject, body)
+		var m mail.Message
+		var err error
+		if runMetadata != nil && canStampRun {
+			m, err = ms.SendWithMetadata(sender, to, subject, body, runMetadata)
+		} else {
+			m, err = mp.Send(sender, to, subject, body)
+		}
 		if err != nil {
 			attemptedFailed = append(attemptedFailed, to)
 			switch id, isUnconfirmed := mail.UnconfirmedMessageID(err); {

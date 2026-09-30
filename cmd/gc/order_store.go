@@ -296,7 +296,9 @@ func orderTriggerOptionsForTarget(cityPath string, cfg *config.City, target exec
 	if a.Trigger != "condition" || strings.TrimSpace(cityPath) == "" {
 		return orders.TriggerOptions{}, nil
 	}
-	env, err := orderExecEnvWithError(cityPath, cfg, target, a, nil)
+	// A check is the order acting, so it carries the order's scope and name;
+	// it is not a tracked run, so GC_ORDER_RUN stays unset.
+	env, err := orderExecEnvForRun(cityPath, cfg, target, a, nil, "")
 	if err != nil {
 		return orders.TriggerOptions{}, err
 	}
