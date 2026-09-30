@@ -26,6 +26,7 @@ go_test(
         "crosscity_test.go",
         "crosstown_test.go",
         "fake_conformance_test.go",
+        "order_sender_test.go",
         "resolve_test.go",
         "testenv_import_test.go",
     ],

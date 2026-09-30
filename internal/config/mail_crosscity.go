@@ -204,10 +204,16 @@ func ValidateMailCrossCity(cfg *City, cityRoot string) error {
 	if err := validateMailCityName(local); err != nil {
 		return fmt.Errorf("[mail.crosscity] city: %w", err)
 	}
+	if IsReservedOrderAddressName(local) {
+		return fmt.Errorf("[mail.crosscity] city %q is reserved: mail from an order is addressed %s:<scope>/<name>", local, OrderAddressSegment)
+	}
 	seen := make(map[string]bool, len(cc.Cities))
 	for _, city := range cc.Cities {
 		if err := validateMailCityName(city); err != nil {
 			return fmt.Errorf("[mail.crosscity] cities: %w", err)
+		}
+		if IsReservedOrderAddressName(city) {
+			return fmt.Errorf("[mail.crosscity] cities: %q is reserved: mail from an order is addressed %s:<scope>/<name>", city, OrderAddressSegment)
 		}
 		if seen[city] {
 			return fmt.Errorf("[mail.crosscity] cities lists duplicate city %q", city)
