@@ -113,6 +113,7 @@ func TestRefuseUnknownCity(t *testing.T) {
 		{"agent dir scope keeps the original error", roster, "tools/x", ""},
 		{"nested agent dir scope keeps the original error by its leading segment", roster, "projects/backend/worker", ""},
 		{"template: session-target form keeps the original error", roster, "template:qcore/worker", ""},
+		{"order: sender form keeps the original error", roster, "order:city/deacon-watch", ""},
 		{"controller keeps the original error", roster, "controller/x", ""},
 		{"human keeps the original error", roster, "human/x", ""},
 		{"no slash keeps the original error", roster, "nobody", ""},

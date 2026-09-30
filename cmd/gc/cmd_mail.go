@@ -24,6 +24,7 @@ import (
 	"github.com/gastownhall/gascity/internal/mail/beadmail"
 	"github.com/gastownhall/gascity/internal/notify"
 	"github.com/gastownhall/gascity/internal/notify/claudecloud"
+	"github.com/gastownhall/gascity/internal/orders"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/telemetry"
 	"github.com/spf13/cobra"
@@ -1145,6 +1146,9 @@ func defaultMailIdentity() string {
 const controllerMailIdentity = "controller"
 
 func reservedMailSenderIdentity(identifier string) (string, bool) {
+	if id := strings.TrimSpace(identifier); strings.HasPrefix(id, mail.OrderSenderPrefix) {
+		return id, true
+	}
 	switch normalizeNamedSessionTarget(identifier) {
 	case "", "human":
 		return "human", true
@@ -1160,6 +1164,56 @@ func reservedMailSenderIdentity(identifier string) (string, bool) {
 // unset. Multiple candidates preserve compatibility for sessions whose concrete
 // ID is unavailable while still preferring the concrete mailbox when it exists.
 func defaultMailIdentityCandidates() []string {
+	out := sessionMailIdentityCandidates()
+	if len(out) == 0 {
+		out = append(out, "human")
+	}
+	return out
+}
+
+// defaultMailSenderCandidates is defaultMailIdentityCandidates for a SENDER:
+// after the session identities and before the human fallback it tries the
+// order running this process (order:<scope>/<name>), so an order's mail says
+// which order sent it (ga-uf77nc). Reading a mailbox never uses it: an order
+// has none.
+func defaultMailSenderCandidates() []string {
+	out := sessionMailIdentityCandidates()
+	if order := orderMailSenderIdentity(); order != "" {
+		out = append(out, order)
+	}
+	if len(out) == 0 {
+		out = append(out, "human")
+	}
+	return out
+}
+
+// orderMailSenderIdentity is order:<GC_ORDER_SCOPE>/<GC_ORDER_NAME> when this
+// process is an order run, else "".
+func orderMailSenderIdentity() string {
+	scope := strings.TrimSpace(os.Getenv(orders.ExecOrderScopeEnv))
+	name := strings.TrimSpace(os.Getenv(orders.ExecOrderNameEnv))
+	if scope == "" || name == "" {
+		return ""
+	}
+	return mail.OrderSenderPrefix + scope + "/" + name
+}
+
+// orderMailRunMetadata is the metadata that ties a message to the order run
+// that sent it, or nil when sender is not this process's own order identity.
+func orderMailRunMetadata(sender string) map[string]string {
+	if sender == "" || sender != orderMailSenderIdentity() {
+		return nil
+	}
+	run := strings.TrimSpace(os.Getenv(orders.ExecOrderRunEnv))
+	if run == "" {
+		return nil
+	}
+	return map[string]string{mail.FromOrderRunMetadataKey: run}
+}
+
+// sessionMailIdentityCandidates returns the ordered non-empty session
+// identities (GC_SESSION_ID, GC_ALIAS, GC_AGENT) of this process.
+func sessionMailIdentityCandidates() []string {
 	seen := map[string]bool{}
 	var out []string
 	add := func(v string) {
@@ -1173,9 +1227,6 @@ func defaultMailIdentityCandidates() []string {
 	add(os.Getenv("GC_SESSION_ID"))
 	add(os.Getenv("GC_ALIAS"))
 	add(os.Getenv("GC_AGENT"))
-	if len(out) == 0 {
-		out = append(out, "human")
-	}
 	return out
 }
 
@@ -1347,6 +1398,9 @@ func resolveMailRecipientIdentityCached(cityPath string, cfg *config.City, sessS
 	}
 	if normalizeNamedSessionTarget(identifier) == controllerMailIdentity {
 		return "", session.ErrSessionNotFound
+	}
+	if mail.IsOrderSender(identifier) {
+		return "", mail.OrderNoMailboxError(identifier)
 	}
 	resolved, err := resolveMailIdentityWithConfigCached(cityPath, cfg, sessStore, identifier, cache)
 	if err != nil {
@@ -1677,7 +1731,7 @@ func resolveDefaultMailSenderForCommand(cityPath string, cfg *config.City, sessS
 }
 
 func resolveDefaultMailSenderForCommandCached(cityPath string, cfg *config.City, sessStore beads.Store, stderr io.Writer, cmdName string, cache *mailIdentitySessionCache) (string, bool) {
-	candidates := defaultMailIdentityCandidates()
+	candidates := defaultMailSenderCandidates()
 	for _, c := range candidates {
 		sender, err := resolveMailIdentityWithConfigCached(cityPath, cfg, sessStore, c, cache)
 		if err == nil {
@@ -2293,6 +2347,10 @@ func cmdMailSendJSONFull(args []string, notify bool, all bool, from string, to s
 	}
 
 	sender := from
+	// runMetadata ties the message to the order run that sent it. It is read
+	// here, while sender is still the bare default identity: a cross-city
+	// send qualifies sender below.
+	var runMetadata map[string]string
 	if sender == "" {
 		if store != nil {
 			var ok bool
@@ -2301,8 +2359,9 @@ func cmdMailSendJSONFull(args []string, notify bool, all bool, from string, to s
 				return 1
 			}
 		} else {
-			sender = defaultMailIdentity()
+			sender = defaultMailSenderCandidates()[0]
 		}
+		runMetadata = orderMailRunMetadata(sender)
 	} else if store != nil {
 		// A --from carrying a peer city's segment is accepted verbatim: only
 		// its own city can check that identity. A local-city qualifier strips
@@ -2477,11 +2536,11 @@ func cmdMailSendJSONFull(args []string, notify bool, all bool, from string, to s
 				}
 			}
 		}
-		return doMailSendAllCoverage(mp, rec, crossCityBroadcastRecipients(roster, validRecipients, stderr), sender, args, nf, jsonOut, cov, stdout, stderr)
+		return doMailSendAllCoverageRun(mp, rec, crossCityBroadcastRecipients(roster, validRecipients, stderr), sender, args, nf, jsonOut, cov, runMetadata, stdout, stderr)
 	}
 
 	rec := openCityRecorder(stderr)
-	sendCode := doMailSendJSON(mp, rec, validRecipients, sender, args, nf, dedupKey, jsonOut, stdout, stderr)
+	sendCode := doMailSendJSONRun(mp, rec, validRecipients, sender, args, nf, dedupKey, runMetadata, jsonOut, stdout, stderr)
 	if sendCode == 0 && foreign && len(args) > 0 {
 		fmt.Fprintln(stderr, localForeignSendWarning(args[0])) //nolint:errcheck // best-effort stderr
 	}
@@ -2500,6 +2559,12 @@ func doMailSend(mp mail.Provider, rec events.Recorder, validRecipients map[strin
 // capability; providers without it fall back to a plain send (fail-open, since
 // a duplicate notification beats a silently dropped one).
 func doMailSendJSON(mp mail.Provider, rec events.Recorder, validRecipients map[string]bool, sender string, args []string, nudgeFn nudgeFunc, dedupKey string, jsonOut bool, stdout, stderr io.Writer) int {
+	return doMailSendJSONRun(mp, rec, validRecipients, sender, args, nudgeFn, dedupKey, nil, jsonOut, stdout, stderr)
+}
+
+// doMailSendJSONRun is doMailSendJSON with runMetadata, which a provider
+// implementing [mail.MetadataSender] stamps on the new message.
+func doMailSendJSONRun(mp mail.Provider, rec events.Recorder, validRecipients map[string]bool, sender string, args []string, nudgeFn nudgeFunc, dedupKey string, runMetadata map[string]string, jsonOut bool, stdout, stderr io.Writer) int {
 	if len(args) < 2 {
 		fmt.Fprintln(stderr, "gc mail send: usage: gc mail send <to> <body>  OR  gc mail send <to> -s <subject> [-m <body>]") //nolint:errcheck // best-effort stderr
 		return 1
@@ -2526,14 +2591,23 @@ func doMailSendJSON(mp mail.Provider, rec events.Recorder, validRecipients map[s
 		suppressed bool
 		err        error
 	)
-	if dedupKey != "" {
+	ms, canStampRun := mp.(mail.MetadataSender)
+	if runMetadata != nil && !canStampRun {
+		fmt.Fprintln(stderr, "gc mail send: mail provider cannot record the sending order run on the message") //nolint:errcheck // best-effort stderr
+	}
+	switch {
+	case dedupKey != "" && runMetadata != nil && canStampRun:
+		m, suppressed, err = ms.SendDedupedWithMetadata(sender, to, subject, body, dedupKey, runMetadata)
+	case dedupKey != "":
 		if ds, ok := mp.(mail.DedupSender); ok {
 			m, suppressed, err = ds.SendDeduped(sender, to, subject, body, dedupKey)
 		} else {
 			fmt.Fprintln(stderr, "gc mail send: mail provider does not support --dedup; sending without dedup") //nolint:errcheck // best-effort stderr
 			m, err = mp.Send(sender, to, subject, body)
 		}
-	} else {
+	case runMetadata != nil && canStampRun:
+		m, err = ms.SendWithMetadata(sender, to, subject, body, runMetadata)
+	default:
 		m, err = mp.Send(sender, to, subject, body)
 	}
 	telemetry.RecordMailOp(context.Background(), "send", err)
@@ -2642,6 +2716,12 @@ func unreachedConfiguredSeats(cov *broadcastCoverage, sent map[string]bool, send
 }
 
 func doMailSendAllCoverage(mp mail.Provider, rec events.Recorder, validRecipients map[string]bool, sender string, args []string, nudgeFn nudgeFunc, jsonOut bool, cov *broadcastCoverage, stdout, stderr io.Writer) int {
+	return doMailSendAllCoverageRun(mp, rec, validRecipients, sender, args, nudgeFn, jsonOut, cov, nil, stdout, stderr)
+}
+
+// doMailSendAllCoverageRun is doMailSendAllCoverage that also stamps each
+// message with runMetadata (the sending order run, ga-uf77nc) when non-nil.
+func doMailSendAllCoverageRun(mp mail.Provider, rec events.Recorder, validRecipients map[string]bool, sender string, args []string, nudgeFn nudgeFunc, jsonOut bool, cov *broadcastCoverage, runMetadata map[string]string, stdout, stderr io.Writer) int {
 	if len(args) < 1 {
 		fmt.Fprintln(stderr, "gc mail send --all: usage: gc mail send --all <body>") //nolint:errcheck // best-effort stderr
 		return 1
@@ -2679,8 +2759,18 @@ func doMailSendAllCoverage(mp mail.Provider, rec events.Recorder, validRecipient
 	// attempted and the summary names exactly who needs what.
 	var lost, failed, unconfirmed, attemptedFailed []string
 	var unconfirmedRecipients []mailUnconfirmedRecipient
+	ms, canStampRun := mp.(mail.MetadataSender)
+	if runMetadata != nil && !canStampRun {
+		fmt.Fprintln(stderr, "gc mail send --all: mail provider cannot record the sending order run on the message") //nolint:errcheck // best-effort stderr
+	}
 	for _, to := range recipients {
-		m, err := mp.Send(sender, to, subject, body)
+		var m mail.Message
+		var err error
+		if runMetadata != nil && canStampRun {
+			m, err = ms.SendWithMetadata(sender, to, subject, body, runMetadata)
+		} else {
+			m, err = mp.Send(sender, to, subject, body)
+		}
 		if err != nil {
 			attemptedFailed = append(attemptedFailed, to)
 			switch id, isUnconfirmed := mail.UnconfirmedMessageID(err); {
@@ -3034,7 +3124,7 @@ func cmdMailReplyJSON(args []string, subject, message string, notify bool, jsonO
 	}
 	rec := openCityRecorder(stderr)
 
-	sender := defaultMailIdentity()
+	sender := defaultMailSenderCandidates()[0]
 	providerName := mailProviderName()
 	var store beads.Store
 	var cityPath string
