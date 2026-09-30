@@ -4491,6 +4491,17 @@ func validateDependsOn(agents []Agent) error {
 	return nil
 }
 
+// OrderAddressSegment leads the mail address an order sends from
+// (order:<scope>/<name>). No rig or mail city may take it, so an address that
+// reads as an order's is never also a rig's or a city's.
+const OrderAddressSegment = "order"
+
+// IsReservedOrderAddressName reports whether name is taken by order addresses:
+// "order" itself or anything that starts "order:".
+func IsReservedOrderAddressName(name string) bool {
+	return name == OrderAddressSegment || strings.HasPrefix(name, OrderAddressSegment+":")
+}
+
 // ValidateRigs checks rig configurations for errors. It returns an error if
 // any rig is missing required fields, has duplicate names, or has colliding
 // prefixes. The hqPrefix is the city's HQ prefix for collision checks.
@@ -4504,17 +4515,6 @@ func validateDependsOn(agents []Agent) error {
 // that already uses one, so ReservedPrefixWarnings surfaces it as a non-fatal
 // advisory instead. Promote it back into a hard error here once per-class
 // routing activates.
-// OrderAddressSegment leads the mail address an order sends from
-// (order:<scope>/<name>). No rig or mail city may take it, so an address that
-// reads as an order's is never also a rig's or a city's.
-const OrderAddressSegment = "order"
-
-// IsReservedOrderAddressName reports whether name is taken by order addresses:
-// "order" itself or anything that starts "order:".
-func IsReservedOrderAddressName(name string) bool {
-	return name == OrderAddressSegment || strings.HasPrefix(name, OrderAddressSegment+":")
-}
-
 func ValidateRigs(rigs []Rig, hqPrefix string) error {
 	seenNames := make(map[string]bool, len(rigs))
 	seenPrefixes := make(map[string]string) // lowercase prefix → rig name (for error messages)

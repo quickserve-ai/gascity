@@ -15,11 +15,11 @@ import (
 )
 
 // clearMailIdentityEnv makes this test process neither a session nor an order.
+// Empty reads as unset: every identity read is os.Getenv plus a blank check.
 func clearMailIdentityEnv(t *testing.T) {
 	t.Helper()
 	for _, key := range []string{"GC_SESSION_ID", "GC_ALIAS", "GC_AGENT", "GC_ORDER_SCOPE", "GC_ORDER_NAME", "GC_ORDER_RUN"} {
 		t.Setenv(key, "")
-		_ = os.Unsetenv(key)
 	}
 }
 
