@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	goruntime "runtime"
 	"strings"
 
 	"github.com/gastownhall/gascity/internal/config"
@@ -20,7 +21,41 @@ import (
 const (
 	maxPromptSuffixRawBytes    = 100000
 	maxPromptSuffixQuotedBytes = 128000
+
+	// darwinTmuxPromptRawBytes and darwinTmuxPromptQuotedBytes replace the
+	// Linux bounds for the tmux runtime on a macOS host. macOS has no
+	// per-element argv cap, only ARG_MAX (1 MiB) across argv and envp, and the
+	// tmux runtime never sends a large prompt through tmux itself: past
+	// maxInlinePromptLen it writes a file and execs the provider with the
+	// prompt as one argument (internal/runtime/tmux/adapter.go buildLaunchCommand).
+	// A single 900,000-byte argument was measured to exec on the operator's Mac
+	// (2026-09-30, ga-alb76h); these leave room under ARG_MAX for the env.
+	//
+	// Without them, every prime over 100 KB went by the nudge fallback, a
+	// bracketed paste, and Claude Code hands a paste to the model as quoted
+	// content it may decline to act on: a seat can start, read its own role
+	// prompt as text someone pasted, and stop (ga-alb76h).
+	darwinTmuxPromptRawBytes    = 512000
+	darwinTmuxPromptQuotedBytes = 640000
 )
+
+// promptArgvHostOS is the host OS the argv bounds are chosen for. The test
+// binary pins it to "linux" (TestMain) so tests read the same on every host.
+var promptArgvHostOS = goruntime.GOOS
+
+// promptArgvLimits returns the raw and argv-encoded byte bounds for a startup
+// prompt launched by runtimeName on goos. Only the tmux runtime on darwin is
+// raised; every other runtime keeps the Linux bounds, since k8s and hybrid
+// launch into Linux pods and the rest are not measured here.
+func promptArgvLimits(goos, runtimeName string) (raw, quoted int) {
+	switch strings.TrimSpace(runtimeName) {
+	case "", "tmux":
+		if goos == "darwin" {
+			return darwinTmuxPromptRawBytes, darwinTmuxPromptQuotedBytes
+		}
+	}
+	return maxPromptSuffixRawBytes, maxPromptSuffixQuotedBytes
+}
 
 // promptDeliveryResult is the resolved plan for delivering a rendered startup
 // prompt to a freshly launched session: which argv suffix / flag / nudge
@@ -165,7 +200,8 @@ func promptDelivery(prompt string, isACP bool, rp *config.ResolvedProvider, nudg
 	}
 
 	suffix := shellquote.Quote(prompt)
-	if len(prompt) >= maxPromptSuffixRawBytes || len(suffix) >= maxPromptSuffixQuotedBytes {
+	rawLimit, quotedLimit := promptArgvLimits(promptArgvHostOS, runtimeName)
+	if len(prompt) >= rawLimit || len(suffix) >= quotedLimit {
 		switch promptDeliverySupportFor(runtimeName, packRuntimes) {
 		case promptDeliverySupportArgvSafe:
 			// Falls through to normal argv delivery below: this runtime
@@ -180,7 +216,7 @@ func promptDelivery(prompt string, isACP bool, rp *config.ResolvedProvider, nudg
 			return promptDeliveryResult{}, fmt.Errorf(
 				"%w: runtime %q, prompt %d raw bytes / %d argv-encoded bytes (limits: %d raw / %d argv-encoded)",
 				errOversizedPromptUnsupportedRuntime, runtimeName, len(prompt), len(suffix),
-				maxPromptSuffixRawBytes, maxPromptSuffixQuotedBytes)
+				rawLimit, quotedLimit)
 		}
 	}
 
