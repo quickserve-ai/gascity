@@ -244,6 +244,9 @@ func cancelShellExecProcessGroup(cmd *exec.Cmd, pgid int) error {
 
 func mergeOrderExecEnv(environ, env []string) []string {
 	out := mergeRuntimeEnv(environ, nil)
+	for _, key := range orders.ExecUninheritedEnvKeys {
+		out = removeEnvKey(out, key)
+	}
 	for _, entry := range env {
 		key, _, ok := strings.Cut(entry, "=")
 		if ok {
@@ -1920,7 +1923,7 @@ func (m *memoryOrderDispatcher) dispatchExec(ctx context.Context, front *orders.
 		}
 	}
 
-	env, err := orderExecEnvWithError(cityPath, m.cfg, target, a, vars)
+	env, err := orderExecEnvForRun(cityPath, m.cfg, target, a, vars, trackingID)
 	var output []byte
 	var execErrMsg string
 	// declared is the outcome file of a run that exited 0; its skipped/partial

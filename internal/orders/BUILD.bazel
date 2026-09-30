@@ -81,6 +81,7 @@ go_library(
 go_test(
     name = "orders_test",
     srcs = [
+        "condition_identity_test.go",
         "discovery_test.go",
         "env_test.go",
         "exec_outcome_test.go",

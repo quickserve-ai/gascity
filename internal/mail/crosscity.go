@@ -128,7 +128,7 @@ func RefuseUnknownCity(err error, recipient string, roster CityRoster, localScop
 	if !found || rest == "" || segment == roster.Local {
 		return err
 	}
-	if strings.HasPrefix(segment, "template:") || segment == "controller" || segment == "human" {
+	if strings.HasPrefix(segment, "template:") || strings.HasPrefix(segment, OrderSenderPrefix) || segment == "controller" || segment == "human" {
 		return err
 	}
 	if slices.Contains(roster.Peers, segment) {
