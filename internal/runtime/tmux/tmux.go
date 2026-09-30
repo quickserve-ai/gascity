@@ -3468,9 +3468,9 @@ func (t *Tmux) DismissFeedbackSurveyModalIfPresent(session string) {
 	sendKeys := func(keys ...string) error {
 		for _, k := range keys {
 			// ga-ubfc7j: these are raw send-keys, and the survey matcher
-			// reads scrollback, so an old survey row can match while a
-			// question, an approval or an attached person's draft is live.
-			// The full guard runs before EVERY key.
+			// is contains-based over the visible screen, so a stray match
+			// could still key a live question, approval or attached
+			// person's draft. The full guard runs before EVERY key.
 			if err := t.humanPromptGuard(session, target, nudgeGuardStageBeforeType, true); err != nil {
 				return err
 			}
@@ -3481,7 +3481,11 @@ func (t *Tmux) DismissFeedbackSurveyModalIfPresent(session string) {
 		return nil
 	}
 
-	content, err := t.CapturePane(target, promptObservationLines)
+	// Visible screen only (no "-S"): a live survey occupies the visible
+	// footer, while an already-answered or already-dismissed survey lingers
+	// in scrollback and would otherwise match the contains-based detector
+	// and type its "0" dismiss key into an empty composer (#6844).
+	content, err := t.CaptureVisiblePane(target)
 	if err != nil {
 		return
 	}
@@ -3491,9 +3495,9 @@ func (t *Tmux) DismissFeedbackSurveyModalIfPresent(session string) {
 	}
 
 	// The survey can occasionally eat the first digit (e.g. a keystroke lost
-	// to a slow-to-wake detached pane); re-check and retry the dismiss pair
-	// once before giving up for this call.
-	content, err = t.CapturePane(target, promptObservationLines)
+	// to a slow-to-wake detached pane); re-read the visible screen and retry
+	// the dismiss pair once before giving up for this call.
+	content, err = t.CaptureVisiblePane(target)
 	if err != nil {
 		return
 	}
@@ -4088,7 +4092,8 @@ func (t *Tmux) CapturePane(session string, lines int) (string, error) {
 
 // CaptureVisiblePane captures only the current visible screen of a pane, with
 // no scrollback history (no "-S"). The mid-session dialog dismissal
-// (dismissMidSessionDialogs) uses this instead of CapturePane so an
+// (dismissMidSessionDialogs) and the feedback-survey dismissal
+// (DismissFeedbackSurveyModalIfPresent) use this instead of CapturePane so an
 // already-dismissed dialog sitting in scrollback cannot satisfy the
 // contains-based matchers and inject dismissal keys into a live prompt before
 // the intended nudge. A live blocking dialog occupies the visible footer, so
