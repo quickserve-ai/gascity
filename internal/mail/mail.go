@@ -6,7 +6,11 @@ package mail //nolint:revive // internal package, always imported qualified
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/config"
 )
 
 // ErrAlreadyArchived is returned by [Provider.Archive] when the message has
@@ -57,7 +61,47 @@ const (
 	// sent through [DedupSender.SendDeduped]. Repeating notifiers (patrol
 	// orders, maintenance loops) use it to suppress duplicate alerts.
 	DedupKeyMetadataKey = "mail.dedup_key"
+	// FromOrderRunMetadataKey stores the tracking bead of the order run that
+	// sent the message, so a reader can go from a mail to the run.
+	FromOrderRunMetadataKey = "mail.from_order_run"
+	// OrderSenderPrefix begins the sender of mail an order sends:
+	// order:<scope>/<name>. An order has no mailbox, so nothing is delivered
+	// to such an address.
+	OrderSenderPrefix = config.OrderAddressSegment + ":"
 )
+
+// OrderNoMailboxError is the refusal for mail addressed to an order, or a
+// reply to one: an order has no mailbox. It names where to write instead, so an
+// operator answering an alert is not left at a dead end: the mayor of the city
+// the order ran in, or the seat that owns the order.
+func OrderNoMailboxError(addr string) error {
+	addr = strings.TrimSpace(addr)
+	where := "mail the seat that owns the order, or this city's mayor"
+	if city, rest, ok := strings.Cut(addr, "/"); ok && !strings.HasPrefix(addr, OrderSenderPrefix) && strings.HasPrefix(rest, OrderSenderPrefix) {
+		where = "mail " + city + "/mayor, or the seat that owns the order in " + city
+	}
+	return fmt.Errorf("%s is an order, which has no mailbox; %s", addr, where)
+}
+
+// IsOrderSender reports whether addr is an order's sender address, bare
+// (order:<scope>/<name>) or as a cross-city send stores it
+// (<city>/order:<scope>/<name>).
+func IsOrderSender(addr string) bool {
+	addr = strings.TrimSpace(addr)
+	if strings.HasPrefix(addr, OrderSenderPrefix) {
+		return true
+	}
+	city, rest, ok := strings.Cut(addr, "/")
+	return ok && city != "" && !strings.Contains(city, ":") && strings.HasPrefix(rest, OrderSenderPrefix)
+}
+
+// MetadataSender is an optional [Provider] capability: send with extra
+// metadata stamped on the message in the same write that creates it. The
+// extra keys must not collide with the provider's own routing keys.
+type MetadataSender interface {
+	SendWithMetadata(from, to, subject, body string, metadata map[string]string) (Message, error)
+	SendDedupedWithMetadata(from, to, subject, body, key string, metadata map[string]string) (msg Message, suppressed bool, err error)
+}
 
 // Message represents a mail message between agents or humans.
 type Message struct {
