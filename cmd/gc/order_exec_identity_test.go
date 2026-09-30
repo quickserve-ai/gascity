@@ -149,6 +149,7 @@ func TestShellExecRunnerChildSeesOrderIdentityNotSeatIdentity(t *testing.T) {
 
 // The controller's dispatch hands the order its own tracking bead as GC_ORDER_RUN.
 func TestOrderDispatchExecCarriesOrderIdentity(t *testing.T) {
+	disableManagedDoltRecoveryForTest(t)
 	store := beads.NewMemStore()
 	var gotEnv []string
 	fakeExec := func(_ context.Context, _, _ string, env []string) ([]byte, error) {
@@ -253,6 +254,7 @@ func TestOrderCheckWithStoresResolverRejectsIdentityEnvKeys(t *testing.T) {
 // path too, through the real shell runner (the manual path is
 // TestOrderRunExecCarriesRunID).
 func TestOrderDispatchRealShellStripsSeatIdentity(t *testing.T) {
+	disableManagedDoltRecoveryForTest(t)
 	t.Setenv("GC_SESSION_ID", "gc-leaked")
 	t.Setenv("GC_ALIAS", "leaked")
 	t.Setenv("GC_AGENT", "leaked")
