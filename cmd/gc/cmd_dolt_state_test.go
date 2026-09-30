@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1537,13 +1538,19 @@ func TestDoltStatePreflightCleanCmdPreservesSocketWhenOpenStateUnknown(t *testin
 func createStaleManagedDoltSocket(t *testing.T) string {
 	t.Helper()
 	socketPath := filepath.Join("/tmp", "dolt-gc-preflight-"+strconv.FormatInt(time.Now().UnixNano(), 10)+".sock")
-	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: socketPath, Net: "unix"})
+	// Bind without listening: preflight clean needs only the socket file, and a
+	// bound-then-closed descriptor leaves exactly that. No listener is opened, so
+	// this helper adds nothing to the untagged listener census (TESTING.md).
+	fd, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
 	if err != nil {
-		t.Fatalf("listen on %s: %v", socketPath, err)
+		t.Fatalf("socket(AF_UNIX): %v", err)
 	}
-	listener.SetUnlinkOnClose(false)
-	if err := listener.Close(); err != nil {
-		t.Fatalf("close listener on %s: %v", socketPath, err)
+	if err := syscall.Bind(fd, &syscall.SockaddrUnix{Name: socketPath}); err != nil {
+		_ = syscall.Close(fd)
+		t.Fatalf("bind %s: %v", socketPath, err)
+	}
+	if err := syscall.Close(fd); err != nil {
+		t.Fatalf("close socket on %s: %v", socketPath, err)
 	}
 	t.Cleanup(func() { _ = os.Remove(socketPath) })
 	info, err := os.Lstat(socketPath)
