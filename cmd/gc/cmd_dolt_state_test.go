@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1463,7 +1464,6 @@ esac
 }
 
 func TestDoltStatePreflightCleanCmdRemovesSocketsButPreservesDoltInternals(t *testing.T) {
-	skipWithoutProcessInspection(t)
 	cityPath := t.TempDir()
 	layout, err := resolveManagedDoltRuntimeLayout(cityPath)
 	if err != nil {
@@ -1489,16 +1489,8 @@ func TestDoltStatePreflightCleanCmdRemovesSocketsButPreservesDoltInternals(t *te
 		t.Fatal(err)
 	}
 
-	socketPath := filepath.Join("/tmp", "dolt-gc-preflight-"+strconv.FormatInt(time.Now().UnixNano(), 10)+".sock")
-	staleSocket := startUnixSocketProcess(t, socketPath)
-	if err := staleSocket.Process.Kill(); err != nil {
-		t.Fatalf("kill stale socket holder: %v", err)
-	}
-	_ = staleSocket.Wait()
-	t.Cleanup(func() { _ = os.Remove(socketPath) })
-	if _, err := os.Stat(socketPath); err != nil {
-		t.Fatalf("stale socket precondition missing: %v", err)
-	}
+	socketPath := createStaleManagedDoltSocket(t)
+	stubManagedDoltSocketOpenState(t, socketPath, false, nil)
 
 	var stdout, stderr bytes.Buffer
 	code := run([]string{"dolt-state", "preflight-clean", "--city", cityPath}, &stdout, &stderr)
@@ -1524,6 +1516,66 @@ func TestDoltStatePreflightCleanCmdRemovesSocketsButPreservesDoltInternals(t *te
 	if _, err := os.Stat(healthyManifest); err != nil {
 		t.Fatalf("healthy manifest removed unexpectedly: %v", err)
 	}
+}
+
+func TestDoltStatePreflightCleanCmdPreservesSocketWhenOpenStateUnknown(t *testing.T) {
+	cityPath := t.TempDir()
+	socketPath := createStaleManagedDoltSocket(t)
+	stubManagedDoltSocketOpenState(t, socketPath, false, fmt.Errorf("%w: lsof probe timed out", errManagedDoltOpenStateUnknown))
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"dolt-state", "preflight-clean", "--city", cityPath}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run() = %d, stderr = %s", code, stderr.String())
+	}
+	if _, err := os.Stat(socketPath); err != nil {
+		t.Fatalf("socket %s removed although its open state was unknown, stat err = %v", socketPath, err)
+	}
+}
+
+// createStaleManagedDoltSocket leaves a bound-then-closed unix socket file at a
+// unique /tmp/dolt*.sock path, the shape preflight clean scans for.
+func createStaleManagedDoltSocket(t *testing.T) string {
+	t.Helper()
+	socketPath := filepath.Join("/tmp", "dolt-gc-preflight-"+strconv.FormatInt(time.Now().UnixNano(), 10)+".sock")
+	// Bind without listening: preflight clean needs only the socket file, and a
+	// bound-then-closed descriptor leaves exactly that. No listener is opened, so
+	// this helper adds nothing to the untagged listener census (TESTING.md).
+	fd, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("socket(AF_UNIX): %v", err)
+	}
+	if err := syscall.Bind(fd, &syscall.SockaddrUnix{Name: socketPath}); err != nil {
+		_ = syscall.Close(fd)
+		t.Fatalf("bind %s: %v", socketPath, err)
+	}
+	if err := syscall.Close(fd); err != nil {
+		t.Fatalf("close socket on %s: %v", socketPath, err)
+	}
+	t.Cleanup(func() { _ = os.Remove(socketPath) })
+	info, err := os.Lstat(socketPath)
+	if err != nil {
+		t.Fatalf("stale socket precondition missing: %v", err)
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("stale socket precondition: %s mode = %v, want socket", socketPath, info.Mode())
+	}
+	return socketPath
+}
+
+// stubManagedDoltSocketOpenState answers the socket open-state probe with
+// (open, err) for socketPath and "unknown" for every other path, so the test
+// does not depend on host load and never removes sockets it did not create.
+func stubManagedDoltSocketOpenState(t *testing.T, socketPath string, open bool, err error) {
+	t.Helper()
+	old := managedDoltSocketOpenStateFn
+	managedDoltSocketOpenStateFn = func(path string) (bool, error) {
+		if path != socketPath {
+			return false, errManagedDoltOpenStateUnknown
+		}
+		return open, err
+	}
+	t.Cleanup(func() { managedDoltSocketOpenStateFn = old })
 }
 
 func TestDoltStatePreflightCleanCmdPreservesLiveArtifacts(t *testing.T) {
