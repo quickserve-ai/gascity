@@ -189,6 +189,7 @@ func TestOrderCheckRejectsDeclaredOrderIdentityKey(t *testing.T) {
 
 // A manual `gc order run` hands the order its tracking bead as GC_ORDER_RUN.
 func TestOrderRunExecCarriesRunID(t *testing.T) {
+	disableManagedDoltRecoveryForTest(t)
 	t.Setenv("GC_SESSION_ID", "gc-leaked")
 	cityDir := t.TempDir()
 	writeFile(t, filepath.Join(cityDir, "city.toml"), "[workspace]\nname = \"test-city\"\nprefix = \"ct\"\n")
