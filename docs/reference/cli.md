@@ -2027,6 +2027,7 @@ gc handoff [subject] [message] [flags]
 |------|------|---------|-------------|
 | `--auto` | bool |  | Send handoff mail without requesting restart (for PreCompact hooks) |
 | `--force` | bool |  | destroy a target even when it has live background subagents |
+| `--from` | string |  | sender identity for --target (default: as gc mail send; --from human sends as the operator) |
 | `--hook-format` | string |  | format hook output for a provider |
 | `--json` | bool |  | emit JSON summary |
 | `--target` | string |  | Remote session alias or ID to handoff (kills only controller-restartable sessions) |
@@ -2636,6 +2637,8 @@ Use --notify to request a recipient turn after replying. In a managed city,
 it can request a wake for a non-running recipient.
 Unread mail alone does not request a wake.
 Use -s/--subject for the reply subject and -m/--message for the reply body.
+--from overrides the sender, resolved as for gc mail send (--from human
+replies as the operator).
 
 With --context/--city-url the reply is sent inside a REMOTE city (the reply
 is addressed by that city to the original sender); the sender is
@@ -2647,6 +2650,7 @@ gc mail reply <id> [-s subject] [-m body] [flags]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
+| `--from` | string |  | sender identity (default: as gc mail send) |
 | `--json` | bool |  | emit JSONL result |
 | `-m`, `--message` | string |  | reply body text |
 | `--notify` | bool |  | request a recipient turn (including a managed wake if not running), even with earlier unread mail |
