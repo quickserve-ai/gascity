@@ -1163,6 +1163,31 @@ func defaultMailSenderCandidates() []string {
 	return out
 }
 
+// resolveExplicitMailSender checks an explicit --from against this city. A
+// --from carrying a peer city's segment is accepted verbatim: only its own
+// city can check that identity. A local-city qualifier strips to the bare
+// form, which stays identity-checked here — the local city is the one place
+// identity can and must be checked. Shared by send and reply so the two
+// accept the same --from values.
+func resolveExplicitMailSender(roster mail.CityRoster, cityPath string, cfg *config.City, sessStore beads.Store, sender string, cache *mailIdentitySessionCache, stderr io.Writer, cmdName string) (string, bool) {
+	kind, addr := roster.ResolveCityAddress(sender)
+	if kind == mail.CityAddressForeign {
+		return addr, true
+	}
+	if kind == mail.CityAddressLocal {
+		sender = addr
+	}
+	if sender == "human" {
+		return sender, true
+	}
+	resolved, err := resolveMailIdentityWithConfigCached(cityPath, cfg, sessStore, sender, cache)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s: invalid sender %q: %v\n", cmdName, sender, err) //nolint:errcheck // best-effort stderr
+		return "", false
+	}
+	return resolved, true
+}
+
 // orderMailSenderIdentity is order:<GC_ORDER_SCOPE>/<GC_ORDER_NAME> when this
 // process is an order run, else "".
 func orderMailSenderIdentity() string {
@@ -2036,6 +2061,7 @@ The message will continue to appear in inbox results.`,
 func newMailReplyCmd(stdout, stderr io.Writer) *cobra.Command {
 	var subject string
 	var message string
+	var from string
 	var notify bool
 	var jsonOut bool
 	cmd := &cobra.Command{
@@ -2048,6 +2074,8 @@ Use --notify to request a recipient turn after replying. In a managed city,
 it can request a wake for a non-running recipient.
 Unread mail alone does not request a wake.
 Use -s/--subject for the reply subject and -m/--message for the reply body.
+--from overrides the sender, resolved as for gc mail send (--from human
+replies as the operator).
 
 With --context/--city-url the reply is sent inside a REMOTE city (the reply
 is addressed by that city to the original sender); the sender is
@@ -2055,9 +2083,12 @@ is addressed by that city to the original sender); the sender is
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
 			code := 0
-			if jsonOut {
+			switch {
+			case from != "":
+				code = cmdMailReplyFromJSON(args, from, subject, message, notify, jsonOut, stdout, stderr)
+			case jsonOut:
 				code = mailReplyJSONRunner(args, subject, message, notify, true, stdout, stderr)
-			} else {
+			default:
 				code = mailReplyRunner(args, subject, message, notify, stdout, stderr)
 			}
 			return exitForCode(code)
@@ -2065,6 +2096,7 @@ is addressed by that city to the original sender); the sender is
 	}
 	cmd.Flags().StringVarP(&subject, "subject", "s", "", "reply subject line")
 	cmd.Flags().StringVarP(&message, "message", "m", "", "reply body text")
+	cmd.Flags().StringVar(&from, "from", "", "sender identity (default: as gc mail send)")
 	cmd.Flags().BoolVar(&notify, "notify", false, "request a recipient turn (including a managed wake if not running), even with earlier unread mail")
 	cmd.Flags().BoolVar(&notify, "nudge", false, "alias for --notify")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit JSONL result")
@@ -2293,24 +2325,9 @@ func cmdMailSendJSONFull(args []string, notify bool, all bool, from string, to s
 		}
 		runMetadata = orderMailRunMetadata(sender)
 	} else if sender != "human" && store != nil {
-		// A --from carrying a peer city's segment is accepted verbatim: only
-		// its own city can check that identity. A local-city qualifier strips
-		// to the bare form, which stays identity-checked here — the local
-		// city is the one place identity can and must be checked.
-		if kind, addr := roster.ResolveCityAddress(sender); kind == mail.CityAddressForeign {
-			sender = addr
-		} else {
-			if kind == mail.CityAddressLocal {
-				sender = addr
-			}
-			if sender != "human" {
-				given := sender
-				sender, err = resolveMailIdentityWithConfigCached(cityPath, cfg, sessStore, sender, idCache)
-				if err != nil {
-					fmt.Fprintf(stderr, "gc mail send: invalid sender %q: %v\n", given, err) //nolint:errcheck // best-effort stderr
-					return 1
-				}
-			}
+		var ok bool
+		if sender, ok = resolveExplicitMailSender(roster, cityPath, cfg, sessStore, sender, idCache, stderr, "gc mail send"); !ok {
+			return 1
 		}
 	}
 
@@ -3033,6 +3050,12 @@ func cmdMailReply(args []string, subject, message string, notify bool, stdout, s
 }
 
 func cmdMailReplyJSON(args []string, subject, message string, notify bool, jsonOut bool, stdout, stderr io.Writer) int {
+	return cmdMailReplyFromJSON(args, "", subject, message, notify, jsonOut, stdout, stderr)
+}
+
+// cmdMailReplyFromJSON is cmdMailReplyJSON with an explicit sender: from ==
+// "" takes the default sender.
+func cmdMailReplyFromJSON(args []string, from, subject, message string, notify bool, jsonOut bool, stdout, stderr io.Writer) int {
 	if len(args) < 1 {
 		fmt.Fprintln(stderr, "gc mail reply: missing message ID") //nolint:errcheck // best-effort stderr
 		return 1
@@ -3042,6 +3065,10 @@ func cmdMailReplyJSON(args []string, subject, message string, notify bool, jsonO
 		fmt.Fprintf(stderr, "gc mail reply: %v\n", rerr) //nolint:errcheck // best-effort stderr
 		return 1
 	} else if isRemote {
+		if strings.TrimSpace(from) != "" {
+			fmt.Fprintln(stderr, "gc mail reply: --from is not supported for a remote-city reply") //nolint:errcheck // best-effort stderr
+			return 1
+		}
 		return cmdMailReplyRemote(remoteC, remoteTgt, args, subject, message, notify, jsonOut, stdout, stderr)
 	}
 
@@ -3051,7 +3078,10 @@ func cmdMailReplyJSON(args []string, subject, message string, notify bool, jsonO
 	}
 	rec := openCityRecorder(stderr)
 
-	sender := defaultMailSenderCandidates()[0]
+	sender, explicitFrom := strings.TrimSpace(from), strings.TrimSpace(from) != ""
+	if !explicitFrom {
+		sender = defaultMailSenderCandidates()[0]
+	}
 	providerName := mailProviderName()
 	var store beads.Store
 	var cityPath string
@@ -3084,8 +3114,14 @@ func cmdMailReplyJSON(args []string, subject, message string, notify bool, jsonO
 			}
 			cfg, _ = loadCityConfig(cityPath, stderr)
 		}
-		if sender != "human" {
-			if store != nil {
+		if sender != "human" && store != nil {
+			if explicitFrom {
+				resolved, ok := resolveExplicitMailSender(mailCityRosterFor(cfg, cityPath), cityPath, cfg, cliSessionStore(store, cfg, cityPath), sender, nil, stderr, "gc mail reply")
+				if !ok {
+					return 1
+				}
+				sender = resolved
+			} else {
 				resolved, ok := resolveDefaultMailSenderForCommand(cityPath, cfg, cliSessionStore(store, cfg, cityPath), stderr, "gc mail reply")
 				if !ok {
 					return 1
