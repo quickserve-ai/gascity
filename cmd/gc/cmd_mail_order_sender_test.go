@@ -314,6 +314,21 @@ func TestMailSendAllRecordsOrderRun(t *testing.T) {
 	}
 }
 
+// A send naming no recipient keeps its old message even when the process
+// has no identity: usage errors come before the sender check.
+func TestCmdMailSend_MissingRecipientBeforeIdentity(t *testing.T) {
+	clearMailIdentityEnv(t)
+	cityPath, _ := orderSenderTestCity(t)
+	var stdout, stderr bytes.Buffer
+	if code := cmdMailSend(nil, false, false, "", "", "", "hi", &stdout, &stderr); code == 0 || !strings.Contains(stderr.String(), "gc mail send: missing recipient") {
+		t.Fatalf("send -m hi with no recipient = %d, stderr=%q; want missing recipient", code, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "no sender identity") {
+		t.Fatalf("stderr = %q: the identity refusal ran before the usage error", stderr.String())
+	}
+	assertNoMessageBeads(t, cityPath)
+}
+
 // cmdMailReplyAsHuman is cmdMailReply with an explicit --from human: the
 // operator replying from his own terminal. Tests written before ga-fi21sm
 // replied with no identity and relied on the "human" fallback it removed.
@@ -322,8 +337,8 @@ func cmdMailReplyAsHuman(args []string, notify bool, stdout, stderr io.Writer) i
 }
 
 // gc handoff --target with no identity is refused before anything is
-// written, and the refusal names --from human (TestCmdHandoff_FromNamesTargetSender
-// covers that path).
+// written, and the refusal names --from human; from the same identity-less
+// process (the operator's terminal), --from human hands off as human.
 func TestCmdHandoffRemote_NoIdentityRefused(t *testing.T) {
 	clearMailIdentityEnv(t)
 	t.Setenv("GC_BEADS", "file")
@@ -354,4 +369,13 @@ func TestCmdHandoffRemote_NoIdentityRefused(t *testing.T) {
 		t.Fatalf("stderr = %q, want the handoff refusal naming --from human", stderr.String())
 	}
 	assertNoMessageBeads(t, cityPath)
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := cmdHandoffRemoteFrom([]string{"context cycle"}, "recipient", "human", false, &stdout, &stderr); code != 0 {
+		t.Fatalf("handoff --target --from human with no identity = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if stored := mailSendTestFindMessage(t, cityPath); stored.From != "human" {
+		t.Fatalf("From = %q, want human", stored.From)
+	}
 }

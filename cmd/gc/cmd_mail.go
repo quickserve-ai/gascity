@@ -1184,7 +1184,8 @@ func defaultMailSender(stderr io.Writer, cmdName string) (string, bool) {
 }
 
 // mailSendUsageError reports a send with no recipient, or no body, with the
-// same usage lines doMailSendJSONRun and the --all path print later.
+// texts the later checks used to print (missing recipient, the usage lines
+// of doMailSendJSONRun and the --all path).
 func mailSendUsageError(args []string, all bool, to, subject, message string, stderr io.Writer) (int, bool) {
 	if all {
 		if len(args) == 0 && subject == "" && message == "" {
@@ -1196,6 +1197,10 @@ func mailSendUsageError(args []string, all bool, to, subject, message string, st
 	n := len(args)
 	if to != "" {
 		n++
+	}
+	if n == 0 && (subject != "" || message != "") {
+		fmt.Fprintln(stderr, "gc mail send: missing recipient") //nolint:errcheck // best-effort stderr
+		return 1, true
 	}
 	if n == 0 || (n < 2 && subject == "" && message == "") {
 		fmt.Fprintln(stderr, "gc mail send: usage: gc mail send <to> <body>  OR  gc mail send <to> -s <subject> [-m <body>]") //nolint:errcheck // best-effort stderr
@@ -2411,10 +2416,6 @@ func cmdMailSendJSONFull(args []string, notify bool, all bool, from string, to s
 			}
 			args = []string{subject, allBody}
 		} else {
-			if len(args) < 1 {
-				fmt.Fprintln(stderr, "gc mail send: missing recipient") //nolint:errcheck // best-effort stderr
-				return 1
-			}
 			body := message
 			if body == "" && len(args) > 1 {
 				body = strings.Join(args[1:], " ")
