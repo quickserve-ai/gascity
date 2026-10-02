@@ -2283,9 +2283,9 @@ func TestCmdMailReplyHumanNotifyQueuesNudge(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := cmdMailReply([]string{original.ID, "reply body"}, "", "", true, &stdout, &stderr)
+	code := cmdMailReplyAsHuman([]string{original.ID, "reply body"}, "", "", true, &stdout, &stderr)
 	if code != 0 {
-		t.Fatalf("cmdMailReply() = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+		t.Fatalf("cmdMailReplyAsHuman() = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "to alice") {
 		t.Fatalf("stdout = %q, want reply addressed to alice", stdout.String())
@@ -2318,9 +2318,9 @@ func TestCmdMailReplyExecProviderNotifyQueuesNudge(t *testing.T) {
 	t.Setenv("GC_MAIL", "exec:"+script)
 
 	var stdout, stderr bytes.Buffer
-	code := cmdMailReply([]string{"gc-1", "reply body"}, "", "", true, &stdout, &stderr)
+	code := cmdMailReplyAsHuman([]string{"gc-1", "reply body"}, "", "", true, &stdout, &stderr)
 	if code != 0 {
-		t.Fatalf("cmdMailReply() = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+		t.Fatalf("cmdMailReplyAsHuman() = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
 
 	assertQueuedMailNudge(t, cityPath, sessionID, stderr.String())
@@ -2335,7 +2335,7 @@ func TestMailReplyNudgeAliasQueuesNudge(t *testing.T) {
 	if cmd.Flags().Lookup("nudge") == nil {
 		t.Fatal("reply command missing --nudge alias")
 	}
-	cmd.SetArgs([]string{"gc-1", "--nudge", "reply body"})
+	cmd.SetArgs([]string{"gc-1", "--from", "human", "--nudge", "reply body"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("reply --nudge: %v; stdout=%s stderr=%s", err, stdout.String(), stderr.String())
 	}
@@ -2355,9 +2355,9 @@ func TestCmdMailReplyExecProviderNotifyWithoutCityWarnsAndSendsReply(t *testing.
 	t.Chdir(t.TempDir())
 
 	var stdout, stderr bytes.Buffer
-	code := cmdMailReply([]string{"gc-1", "reply body"}, "", "", true, &stdout, &stderr)
+	code := cmdMailReplyAsHuman([]string{"gc-1", "reply body"}, "", "", true, &stdout, &stderr)
 	if code != 0 {
-		t.Fatalf("cmdMailReply() = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+		t.Fatalf("cmdMailReplyAsHuman() = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "Replied to gc-1") {
 		t.Fatalf("stdout = %q, want reply confirmation", stdout.String())

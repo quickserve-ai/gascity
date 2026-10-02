@@ -204,7 +204,7 @@ func TestCmdMailReplyCrossCityRosterMismatchWarnsAndSends(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := cmdMailReply([]string{seeded.ID, "received"}, "", "", false, &stdout, &stderr)
+	code := cmdMailReplyAsHuman([]string{seeded.ID, "received"}, "", "", false, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("cmdMailReply = %d, want 0; stderr=%s", code, stderr.String())
 	}
@@ -356,7 +356,7 @@ func TestCmdMailReplyCrossCityRosterWarningWording(t *testing.T) {
 		t.Fatalf("seed Send: %v", err)
 	}
 	var stdout, stderr bytes.Buffer
-	if code := cmdMailReply([]string{seeded.ID, "received"}, "", "", false, &stdout, &stderr); code != 0 {
+	if code := cmdMailReplyAsHuman([]string{seeded.ID, "received"}, "", "", false, &stdout, &stderr); code != 0 {
 		t.Fatalf("cmdMailReply = %d, want 0; stderr=%s", code, stderr.String())
 	}
 	if strings.Contains(stderr.String(), "Nothing sent") {

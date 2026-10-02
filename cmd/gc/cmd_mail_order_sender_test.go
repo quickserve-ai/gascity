@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -253,19 +254,6 @@ func TestCmdMailReply_NoIdentityRefusedExplicitHumanReplies(t *testing.T) {
 	}
 }
 
-func countMessageBeads(t *testing.T, cityPath string) int {
-	t.Helper()
-	store, err := openCityStoreAt(cityPath)
-	if err != nil {
-		t.Fatalf("openCityStoreAt: %v", err)
-	}
-	all, err := store.List(beads.ListQuery{Type: "message", TierMode: beads.TierBoth})
-	if err != nil {
-		t.Fatalf("List messages: %v", err)
-	}
-	return len(all)
-}
-
 func assertNoMessageBeads(t *testing.T, cityPath string) {
 	t.Helper()
 	if n := countMessageBeads(t, cityPath); n != 0 {
@@ -324,4 +312,11 @@ func TestMailSendAllRecordsOrderRun(t *testing.T) {
 			t.Fatalf("%s: %s = %q, want pc-run1", id, mail.FromOrderRunMetadataKey, got)
 		}
 	}
+}
+
+// cmdMailReplyAsHuman is cmdMailReply with an explicit --from human: the
+// operator replying from his own terminal. Tests written before ga-fi21sm
+// replied with no identity and relied on the "human" fallback it removed.
+func cmdMailReplyAsHuman(args []string, subject, message string, notify bool, stdout, stderr io.Writer) int {
+	return cmdMailReplyFromJSON(args, "human", subject, message, notify, false, stdout, stderr)
 }
