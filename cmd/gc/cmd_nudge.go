@@ -154,6 +154,12 @@ type nudgeTarget struct {
 	sessionID         string
 	continuationEpoch string
 	sessionName       string
+	// Set only on dispatcher targets built from a session Info; they let
+	// claudeTranscriptSaysTurnEnded find the seat's keyed transcript and its
+	// recorded provider family (ga-megheo). Empty elsewhere.
+	transcriptWorkDir    string
+	transcriptSessionKey string
+	providerAncestor     string
 }
 
 type nudgeStatusJSON struct {
@@ -1961,7 +1967,7 @@ func resolveNudgeTargetFromSessionInfo(cityPath string, cfg *config.City, i sess
 	if sessionName == "" {
 		sessionName = sessionNameFromBeadID(i.ID)
 	}
-	return buildNudgeTarget(cityPath, cfg, nudgeTargetFields{
+	target := buildNudgeTarget(cityPath, cfg, nudgeTargetFields{
 		sessionID:         i.ID,
 		sessionName:       sessionName,
 		alias:             strings.TrimSpace(i.Alias),
@@ -1973,6 +1979,10 @@ func resolveNudgeTargetFromSessionInfo(cityPath string, cfg *config.City, i sess
 		provider:          strings.TrimSpace(i.Provider),
 		continuationEpoch: strings.TrimSpace(i.ContinuationEpoch),
 	})
+	target.transcriptWorkDir = strings.TrimSpace(i.WorkDir)
+	target.transcriptSessionKey = strings.TrimSpace(i.SessionKey)
+	target.providerAncestor = firstNonEmpty(strings.TrimSpace(i.BuiltinAncestor), strings.TrimSpace(i.ProviderKind))
+	return target
 }
 
 func buildNudgeTarget(cityPath string, cfg *config.City, f nudgeTargetFields) nudgeTarget {
@@ -2215,7 +2225,14 @@ func pollerSessionIdleEnough(target nudgeTarget, sp runtime.Provider, quiescence
 		return true
 	}
 	if obs.LastActivity != nil && !obs.LastActivity.IsZero() {
-		return time.Since(*obs.LastActivity) >= quiescence
+		if time.Since(*obs.LastActivity) >= quiescence {
+			return true
+		}
+		// Fresh pane output does not mean a claude seat is mid-turn: a
+		// background task's timer redraws every second after the main turn
+		// ends. Trust the seat's transcript only when it definitely says the
+		// turn ended; every other case stays not-idle (ga-megheo).
+		return claudeTranscriptSaysTurnEnded(target)
 	}
 	if pollerCanDeliverWithoutActivitySignal(target, sp) {
 		return true
