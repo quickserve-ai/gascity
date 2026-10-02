@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,11 +34,12 @@ func setOrderEnv(t *testing.T, scope, name, run string) {
 }
 
 // An order's default sender is order:<scope>/<name>, tried after any session
-// identity and before the human fallback (ga-uf77nc).
-func TestDefaultMailSenderCandidates_OrderBeforeHuman(t *testing.T) {
+// identity (ga-uf77nc). With neither there is no candidate at all: no "human"
+// fallback for a sender (ga-fi21sm).
+func TestDefaultMailSenderCandidates_OrderAfterSessionNoHuman(t *testing.T) {
 	clearMailIdentityEnv(t)
-	if got := defaultMailSenderCandidates(); strings.Join(got, ",") != "human" {
-		t.Fatalf("no identity: candidates = %q, want [human]", got)
+	if got := defaultMailSenderCandidates(); len(got) != 0 {
+		t.Fatalf("no identity: candidates = %q, want none", got)
 	}
 
 	setOrderEnv(t, "city", "deacon-watch", "pc-run1")
@@ -148,17 +150,114 @@ func TestCmdMailSend_ExplicitFromWinsOverOrder(t *testing.T) {
 	}
 }
 
-// Neither a session nor an order: unchanged, still human (ga-fi21sm changes it).
-func TestCmdMailSend_NoIdentityStillHuman(t *testing.T) {
+// Neither a session nor an order and no --from: refused, with what is missing
+// and both fixes named, and no message written (ga-fi21sm). It used to send
+// as human, the operator's own address.
+func TestCmdMailSend_NoIdentityRefused(t *testing.T) {
 	clearMailIdentityEnv(t)
 	cityPath, seat := orderSenderTestCity(t)
 
 	var stdout, stderr bytes.Buffer
-	if code := cmdMailSend([]string{seat.ID, "body"}, false, false, "", "", "", "", &stdout, &stderr); code != 0 {
+	if code := cmdMailSend([]string{seat.ID, "body"}, false, false, "", "", "", "", &stdout, &stderr); code == 0 {
+		t.Fatalf("cmdMailSend() = 0, want a refusal; stdout=%s", stdout.String())
+	}
+	for _, want := range []string{"no sender identity", "GC_AGENT", "GC_ORDER_NAME", "Run it from a seat", "--from"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr = %q, want it to name %q", stderr.String(), want)
+		}
+	}
+	assertNoMessageBeads(t, cityPath)
+}
+
+// The refusal holds on the storeless (exec:) path too, before any write.
+func TestDefaultMailSender_NoIdentityRefused(t *testing.T) {
+	clearMailIdentityEnv(t)
+	var stderr bytes.Buffer
+	if got, ok := defaultMailSender(&stderr, "gc mail send"); ok || got != "" {
+		t.Fatalf("defaultMailSender() = %q, %v; want refused", got, ok)
+	}
+	if !strings.Contains(stderr.String(), "gc mail send: no sender identity") {
+		t.Fatalf("stderr = %q, want the refusal", stderr.String())
+	}
+}
+
+// Each session key alone is still enough to send, as before.
+func TestCmdMailSend_EachSessionKeyAloneSends(t *testing.T) {
+	for _, key := range []string{"GC_SESSION_ID", "GC_ALIAS", "GC_AGENT"} {
+		t.Run(key, func(t *testing.T) {
+			clearMailIdentityEnv(t)
+			cityPath, seat := orderSenderTestCity(t)
+			value := "worker"
+			if key == "GC_SESSION_ID" {
+				value = seat.ID
+			}
+			t.Setenv(key, value)
+
+			var stdout, stderr bytes.Buffer
+			if code := cmdMailSend([]string{"human", "body"}, false, false, "", "", "", "", &stdout, &stderr); code != 0 {
+				t.Fatalf("cmdMailSend() = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+			}
+			if stored := mailSendTestFindMessage(t, cityPath); stored.From == "human" || stored.From == "" {
+				t.Fatalf("From = %q, want the seat's mailbox", stored.From)
+			}
+		})
+	}
+}
+
+// An explicit --from human with no identity still sends as human: the
+// operator's own terminal relies on it.
+func TestCmdMailSend_NoIdentityExplicitHumanSends(t *testing.T) {
+	clearMailIdentityEnv(t)
+	cityPath, seat := orderSenderTestCity(t)
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdMailSend([]string{seat.ID, "body"}, false, false, "human", "", "", "", &stdout, &stderr); code != 0 {
 		t.Fatalf("cmdMailSend() = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
 	if stored := mailSendTestFindMessage(t, cityPath); stored.From != "human" {
 		t.Fatalf("From = %q, want human", stored.From)
+	}
+}
+
+// gc mail reply falls back the same way: no identity and no --from is
+// refused with nothing written; --from human replies as the operator.
+func TestCmdMailReply_NoIdentityRefusedExplicitHumanReplies(t *testing.T) {
+	clearMailIdentityEnv(t)
+	cityPath, _ := orderSenderTestCity(t)
+	t.Setenv("GC_AGENT", "worker")
+	var stdout, stderr bytes.Buffer
+	if code := cmdMailSend([]string{"human", "original"}, false, false, "", "", "", "", &stdout, &stderr); code != 0 {
+		t.Fatalf("seed send = %d; stderr=%s", code, stderr.String())
+	}
+	orig := mailSendTestFindMessage(t, cityPath)
+	clearMailIdentityEnv(t)
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := cmdMailReplyFromJSON([]string{orig.ID}, "", "", "refused reply", false, false, &stdout, &stderr); code == 0 {
+		t.Fatalf("reply with no identity = 0, want a refusal; stdout=%s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "gc mail reply: no sender identity") {
+		t.Fatalf("stderr = %q, want the refusal", stderr.String())
+	}
+	if n := countMessageBeads(t, cityPath); n != 1 {
+		t.Fatalf("message beads after refused reply = %d, want 1 (the original only)", n)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := cmdMailReplyFromJSON([]string{orig.ID}, "human", "", "operator reply", false, false, &stdout, &stderr); code != 0 {
+		t.Fatalf("reply --from human = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if n := countMessageBeads(t, cityPath); n != 2 {
+		t.Fatalf("message beads after --from human reply = %d, want 2", n)
+	}
+}
+
+func assertNoMessageBeads(t *testing.T, cityPath string) {
+	t.Helper()
+	if n := countMessageBeads(t, cityPath); n != 0 {
+		t.Fatalf("message beads = %d, want none written", n)
 	}
 }
 
@@ -212,5 +311,71 @@ func TestMailSendAllRecordsOrderRun(t *testing.T) {
 		if got := b.Metadata[mail.FromOrderRunMetadataKey]; got != "pc-run1" {
 			t.Fatalf("%s: %s = %q, want pc-run1", id, mail.FromOrderRunMetadataKey, got)
 		}
+	}
+}
+
+// A send naming no recipient keeps its old message even when the process
+// has no identity: usage errors come before the sender check.
+func TestCmdMailSend_MissingRecipientBeforeIdentity(t *testing.T) {
+	clearMailIdentityEnv(t)
+	cityPath, _ := orderSenderTestCity(t)
+	var stdout, stderr bytes.Buffer
+	if code := cmdMailSend(nil, false, false, "", "", "", "hi", &stdout, &stderr); code == 0 || !strings.Contains(stderr.String(), "gc mail send: missing recipient") {
+		t.Fatalf("send -m hi with no recipient = %d, stderr=%q; want missing recipient", code, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "no sender identity") {
+		t.Fatalf("stderr = %q: the identity refusal ran before the usage error", stderr.String())
+	}
+	assertNoMessageBeads(t, cityPath)
+}
+
+// cmdMailReplyAsHuman is cmdMailReply with an explicit --from human: the
+// operator replying from his own terminal. Tests written before ga-fi21sm
+// replied with no identity and relied on the "human" fallback it removed.
+func cmdMailReplyAsHuman(args []string, notify bool, stdout, stderr io.Writer) int {
+	return cmdMailReplyFromJSON(args, "human", "", "", notify, false, stdout, stderr)
+}
+
+// gc handoff --target with no identity is refused before anything is
+// written, and the refusal names --from human; from the same identity-less
+// process (the operator's terminal), --from human hands off as human.
+func TestCmdHandoffRemote_NoIdentityRefused(t *testing.T) {
+	clearMailIdentityEnv(t)
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_BEADS_SCOPE_ROOT", "")
+	t.Setenv("GC_MAIL", "")
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	t.Setenv("GC_CITY", cityPath)
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Type:     session.BeadType,
+		Labels:   []string{session.LabelSession},
+		Metadata: map[string]string{"alias": "recipient", "session_name": "recipient-gc-42"},
+	}); err != nil {
+		t.Fatalf("Create recipient: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdHandoffRemote([]string{"context cycle"}, "recipient", &stdout, &stderr); code == 0 {
+		t.Fatalf("handoff --target with no identity = 0, want a refusal; stdout=%s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "gc handoff: no sender identity") || !strings.Contains(stderr.String(), "--from human") {
+		t.Fatalf("stderr = %q, want the handoff refusal naming --from human", stderr.String())
+	}
+	assertNoMessageBeads(t, cityPath)
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := cmdHandoffRemoteFrom([]string{"context cycle"}, "recipient", "human", false, &stdout, &stderr); code != 0 {
+		t.Fatalf("handoff --target --from human with no identity = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if stored := mailSendTestFindMessage(t, cityPath); stored.From != "human" {
+		t.Fatalf("From = %q, want human", stored.From)
 	}
 }

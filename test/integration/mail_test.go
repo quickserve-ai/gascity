@@ -38,7 +38,7 @@ func TestMail_BashAgent(t *testing.T) {
 	}
 
 	// Human sends a message to the mayor.
-	out, err := gc(cityDir, "mail", "send", "mayor", "hey, are you there?")
+	out, err := gc(cityDir, "mail", "send", "--from", "human", "mayor", "hey, are you there?")
 	if err != nil {
 		t.Fatalf("gc mail send failed: %v\noutput: %s", err, out)
 	}

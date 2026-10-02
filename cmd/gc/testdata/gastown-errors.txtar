@@ -55,7 +55,7 @@ stderr 'missing title'
 ! exec gc mail send
 stderr 'usage:'
 
-! exec gc mail send nobody 'hello'
+! exec gc mail send --from human nobody 'hello'
 stderr 'unknown recipient'
 
 ! exec gc mail read
