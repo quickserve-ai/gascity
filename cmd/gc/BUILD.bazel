@@ -983,6 +983,7 @@ go_test(
         "cmd_lint_test.go",
         "cmd_login_test.go",
         "cmd_mail_broadcast_coverage_test.go",
+        "cmd_mail_from_flag_test.go",
         "cmd_mail_inbox_exit_test.go",
         "cmd_mail_order_sender_test.go",
         "cmd_mail_ref_test.go",
