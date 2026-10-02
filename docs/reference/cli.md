@@ -2027,6 +2027,7 @@ gc handoff [subject] [message] [flags]
 |------|------|---------|-------------|
 | `--auto` | bool |  | Send handoff mail without requesting restart (for PreCompact hooks) |
 | `--force` | bool |  | destroy a target even when it has live background subagents |
+| `--from` | string |  | sender identity for --target (default: as gc mail send; refused when none; --from human sends as the operator) |
 | `--hook-format` | string |  | format hook output for a provider |
 | `--json` | bool |  | emit JSON summary |
 | `--target` | string |  | Remote session alias or ID to handoff (kills only controller-restartable sessions) |

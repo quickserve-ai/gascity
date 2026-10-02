@@ -1167,13 +1167,9 @@ func defaultMailSenderCandidates() []string {
 // noMailSenderIdentity is the refusal for a send or reply from a process with
 // neither a session identity nor an order identity and no --from.
 func noMailSenderIdentity(cmdName string) string {
-	msg := cmdName + ": no sender identity: GC_SESSION_ID, GC_ALIAS and GC_AGENT are unset and this is not an order run " +
-		"(GC_ORDER_SCOPE and GC_ORDER_NAME unset); refusing to send as \"human\", the operator's own address. "
-	if cmdName == "gc handoff" {
-		// gc handoff has no --from: the only fix is to run it as a seat.
-		return msg + "Run it from a seat"
-	}
-	return msg + "Run it from a seat, or pass --from <identity> (--from human sends as the operator)"
+	return cmdName + ": no sender identity: GC_SESSION_ID, GC_ALIAS and GC_AGENT are unset and this is not an order run " +
+		"(GC_ORDER_SCOPE and GC_ORDER_NAME unset); refusing to send as \"human\", the operator's own address. " +
+		"Run it from a seat, or pass --from <identity> (--from human sends as the operator)"
 }
 
 // defaultMailSender is the first default sender candidate. With none it
@@ -1185,6 +1181,27 @@ func defaultMailSender(stderr io.Writer, cmdName string) (string, bool) {
 		return "", false
 	}
 	return candidates[0], true
+}
+
+// mailSendUsageError reports a send with no recipient, or no body, with the
+// same usage lines doMailSendJSONRun and the --all path print later.
+func mailSendUsageError(args []string, all bool, to, subject, message string, stderr io.Writer) (int, bool) {
+	if all {
+		if len(args) == 0 && subject == "" && message == "" {
+			fmt.Fprintln(stderr, "gc mail send --all: usage: gc mail send --all <body>") //nolint:errcheck // best-effort stderr
+			return 1, true
+		}
+		return 0, false
+	}
+	n := len(args)
+	if to != "" {
+		n++
+	}
+	if n == 0 || (n < 2 && subject == "" && message == "") {
+		fmt.Fprintln(stderr, "gc mail send: usage: gc mail send <to> <body>  OR  gc mail send <to> -s <subject> [-m <body>]") //nolint:errcheck // best-effort stderr
+		return 1, true
+	}
+	return 0, false
 }
 
 // resolveExplicitMailSender checks an explicit --from against this city. A
@@ -2295,6 +2312,11 @@ func cmdMailSendJSONFull(args []string, notify bool, all bool, from string, to s
 		return 1
 	} else if isRemote {
 		return cmdMailSendRemote(remoteC, remoteTgt, args, notify, all, from, to, subject, message, dedupKey, jsonOut, stdout, stderr)
+	}
+	// A malformed call is a usage error whoever runs it: report it before the
+	// sender check below can refuse for want of an identity (ga-fi21sm).
+	if code, bad := mailSendUsageError(args, all, to, subject, message, stderr); bad {
+		return code
 	}
 	mp, code := openCityMailProvider(stderr, "gc mail send")
 	if mp == nil {

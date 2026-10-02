@@ -26,6 +26,7 @@ func newHandoffCmd(stdout, stderr io.Writer) *cobra.Command {
 	var hookFormat string
 	var jsonOut bool
 	var force bool
+	var from string
 	cmd := &cobra.Command{
 		Use:   "handoff [subject] [message]",
 		Short: "Send handoff mail and restart controller-managed sessions",
@@ -78,7 +79,7 @@ or ID. Subject is required unless --auto is set.`,
 			if jsonOut {
 				out = io.Discard
 			}
-			if cmdHandoffWithForce(args, target, auto, hookFormat, force, out, stderr) != 0 {
+			if cmdHandoffWithFrom(args, target, from, auto, hookFormat, force, out, stderr) != 0 {
 				return errExit
 			}
 			if jsonOut {
@@ -99,6 +100,7 @@ or ID. Subject is required unless --auto is set.`,
 	cmd.Flags().StringVar(&hookFormat, "hook-format", "", "format hook output for a provider")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit JSON summary")
 	cmd.Flags().BoolVar(&force, "force", false, "destroy a target even when it has live background subagents")
+	cmd.Flags().StringVar(&from, "from", "", "sender identity for --target (default: as gc mail send; refused when none; --from human sends as the operator)")
 	return cmd
 }
 
@@ -132,12 +134,23 @@ func handoffJSONSubject(args []string, auto bool) string {
 }
 
 func cmdHandoffWithForce(args []string, target string, auto bool, hookFormat string, force bool, stdout, stderr io.Writer) int {
+	return cmdHandoffWithFrom(args, target, "", auto, hookFormat, force, stdout, stderr)
+}
+
+// cmdHandoffWithFrom is cmdHandoffWithForce with an explicit --from, which
+// names the sender of a --target handoff. A self-handoff mails as the session
+// itself, so --from is refused there.
+func cmdHandoffWithFrom(args []string, target, from string, auto bool, hookFormat string, force bool, stdout, stderr io.Writer) int {
 	if target != "" {
 		if auto {
 			fmt.Fprintln(stderr, "gc handoff: --auto cannot be used with --target") //nolint:errcheck // best-effort stderr
 			return 1
 		}
-		return cmdHandoffRemoteWithForce(args, target, force, stdout, stderr)
+		return cmdHandoffRemoteFrom(args, target, from, force, stdout, stderr)
+	}
+	if strings.TrimSpace(from) != "" {
+		fmt.Fprintln(stderr, "gc handoff: --from needs --target (a self-handoff mails as the session)") //nolint:errcheck // best-effort stderr
+		return 1
 	}
 
 	current, err := currentSessionRuntimeTarget()
@@ -199,6 +212,10 @@ func cmdHandoffRemote(args []string, target string, stdout, stderr io.Writer) in
 }
 
 func cmdHandoffRemoteWithForce(args []string, target string, force bool, stdout, stderr io.Writer) int {
+	return cmdHandoffRemoteFrom(args, target, "", force, stdout, stderr)
+}
+
+func cmdHandoffRemoteFrom(args []string, target, from string, force bool, stdout, stderr io.Writer) int {
 	targetInfo, err := resolveSessionRuntimeTarget(target, stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc handoff: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -221,7 +238,13 @@ func cmdHandoffRemoteWithForce(args []string, target string, force bool, stdout,
 	sessStore := cliSessionStore(store, cfg, cityPath)
 	// See cmdHandoff: the message bead is ClassMessaging and routes on its own.
 	msgStore := cliMailStore(store, cfg, cityPath).Store
-	sender, ok := resolveDefaultMailSenderForCommand(cityPath, cfg, sessStore, stderr, "gc handoff")
+	var sender string
+	var ok bool
+	if from = strings.TrimSpace(from); from != "" {
+		sender, ok = resolveExplicitMailSender(mailCityRosterFor(cfg, cityPath), cityPath, cfg, sessStore, from, nil, stderr, "gc handoff")
+	} else {
+		sender, ok = resolveDefaultMailSenderForCommand(cityPath, cfg, sessStore, stderr, "gc handoff")
+	}
 	if !ok {
 		return 1
 	}

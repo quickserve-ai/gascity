@@ -350,7 +350,7 @@ func TestCmdMailReplyKeepsNestedAgentDirScope(t *testing.T) {
 		t.Fatalf("seed Send: %v", err)
 	}
 	var stdout, stderr bytes.Buffer
-	code := cmdMailReplyAsHuman([]string{seeded.ID, "received"}, "", "", false, &stdout, &stderr)
+	code := cmdMailReplyAsHuman([]string{seeded.ID, "received"}, false, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("cmdMailReply = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
@@ -370,7 +370,7 @@ func TestCmdMailReplyKeepsAgentDirScope(t *testing.T) {
 		t.Fatalf("seed Send: %v", err)
 	}
 	var stdout, stderr bytes.Buffer
-	code := cmdMailReplyAsHuman([]string{seeded.ID, "received"}, "", "", false, &stdout, &stderr)
+	code := cmdMailReplyAsHuman([]string{seeded.ID, "received"}, false, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("cmdMailReply = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
@@ -469,7 +469,7 @@ func TestCmdMailReplyCrossCityQualifiesSender(t *testing.T) {
 	id := seedForeignOriginMessage(t, cityPath)
 
 	var stdout, stderr bytes.Buffer
-	code := cmdMailReplyAsHuman([]string{id, "received, thank you"}, "", "", false, &stdout, &stderr)
+	code := cmdMailReplyAsHuman([]string{id, "received, thank you"}, false, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("cmdMailReply = %d, want 0; stderr=%s", code, stderr.String())
 	}
@@ -508,7 +508,7 @@ func TestCmdMailReplyCrossCityNotifyRefused(t *testing.T) {
 	id := seedForeignOriginMessage(t, cityPath)
 
 	var stdout, stderr bytes.Buffer
-	code := cmdMailReplyAsHuman([]string{id, "body"}, "", "", true, &stdout, &stderr)
+	code := cmdMailReplyAsHuman([]string{id, "body"}, true, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("cmdMailReply = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
@@ -584,7 +584,7 @@ func TestCmdMailReplyCrossCityFailsClosedWhenOriginUnreadable(t *testing.T) {
 	t.Setenv("GC_MAIL", "fail")
 
 	var stdout, stderr bytes.Buffer
-	code := cmdMailReplyAsHuman([]string{"gc-999", "body"}, "", "", false, &stdout, &stderr)
+	code := cmdMailReplyAsHuman([]string{"gc-999", "body"}, false, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("cmdMailReply = %d, want 1; stdout=%s", code, stdout.String())
 	}
@@ -621,7 +621,7 @@ func TestCmdMailReplyCrossCityUnknownOriginRefused(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := cmdMailReplyAsHuman([]string{seeded.ID, "received"}, "", "", false, &stdout, &stderr)
+	code := cmdMailReplyAsHuman([]string{seeded.ID, "received"}, false, &stdout, &stderr)
 	if code != 1 {
 		t.Fatalf("cmdMailReply = %d, want 1; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}

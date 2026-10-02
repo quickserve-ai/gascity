@@ -317,13 +317,13 @@ func TestMailSendAllRecordsOrderRun(t *testing.T) {
 // cmdMailReplyAsHuman is cmdMailReply with an explicit --from human: the
 // operator replying from his own terminal. Tests written before ga-fi21sm
 // replied with no identity and relied on the "human" fallback it removed.
-func cmdMailReplyAsHuman(args []string, subject, message string, notify bool, stdout, stderr io.Writer) int {
-	return cmdMailReplyFromJSON(args, "human", subject, message, notify, false, stdout, stderr)
+func cmdMailReplyAsHuman(args []string, notify bool, stdout, stderr io.Writer) int {
+	return cmdMailReplyFromJSON(args, "human", "", "", notify, false, stdout, stderr)
 }
 
 // gc handoff --target with no identity is refused before anything is
-// written, and its advice names only the fix it has: handoff has no --from.
-func TestCmdHandoffRemote_NoIdentityRefused(t *testing.T) {
+// written; --from human hands off as the operator, as send and reply do.
+func TestCmdHandoffRemote_NoIdentityRefusedExplicitHumanSends(t *testing.T) {
 	clearMailIdentityEnv(t)
 	t.Setenv("GC_BEADS", "file")
 	t.Setenv("GC_BEADS_SCOPE_ROOT", "")
@@ -349,10 +349,24 @@ func TestCmdHandoffRemote_NoIdentityRefused(t *testing.T) {
 	if code := cmdHandoffRemote([]string{"context cycle"}, "recipient", &stdout, &stderr); code == 0 {
 		t.Fatalf("handoff --target with no identity = 0, want a refusal; stdout=%s", stdout.String())
 	}
-	if !strings.Contains(stderr.String(), "gc handoff: no sender identity") || !strings.HasSuffix(strings.TrimSpace(stderr.String()), "Run it from a seat") {
-		t.Fatalf("stderr = %q, want the handoff refusal without --from advice", stderr.String())
+	if !strings.Contains(stderr.String(), "gc handoff: no sender identity") || !strings.Contains(stderr.String(), "--from human") {
+		t.Fatalf("stderr = %q, want the handoff refusal naming --from human", stderr.String())
 	}
 	assertNoMessageBeads(t, cityPath)
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := cmdHandoffRemoteFrom([]string{"context cycle"}, "recipient", "human", false, &stdout, &stderr); code != 0 {
+		t.Fatalf("handoff --target --from human = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if stored := mailSendTestFindMessage(t, cityPath); stored.From != "human" {
+		t.Fatalf("From = %q, want human", stored.From)
+	}
+
+	stderr.Reset()
+	if code := cmdHandoffWithFrom([]string{"context cycle"}, "", "human", false, "", false, &stdout, &stderr); code == 0 || !strings.Contains(stderr.String(), "--from needs --target") {
+		t.Fatalf("self-handoff --from = %d, stderr=%q; want the --target refusal", code, stderr.String())
+	}
 }
 
 // reply --from accepts what send's --from accepts: a local-city qualifier

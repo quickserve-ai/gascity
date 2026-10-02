@@ -2283,7 +2283,7 @@ func TestCmdMailReplyHumanNotifyQueuesNudge(t *testing.T) {
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := cmdMailReplyAsHuman([]string{original.ID, "reply body"}, "", "", true, &stdout, &stderr)
+	code := cmdMailReplyAsHuman([]string{original.ID, "reply body"}, true, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("cmdMailReplyAsHuman() = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
@@ -2318,7 +2318,7 @@ func TestCmdMailReplyExecProviderNotifyQueuesNudge(t *testing.T) {
 	t.Setenv("GC_MAIL", "exec:"+script)
 
 	var stdout, stderr bytes.Buffer
-	code := cmdMailReplyAsHuman([]string{"gc-1", "reply body"}, "", "", true, &stdout, &stderr)
+	code := cmdMailReplyAsHuman([]string{"gc-1", "reply body"}, true, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("cmdMailReplyAsHuman() = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
@@ -2355,7 +2355,7 @@ func TestCmdMailReplyExecProviderNotifyWithoutCityWarnsAndSendsReply(t *testing.
 	t.Chdir(t.TempDir())
 
 	var stdout, stderr bytes.Buffer
-	code := cmdMailReplyAsHuman([]string{"gc-1", "reply body"}, "", "", true, &stdout, &stderr)
+	code := cmdMailReplyAsHuman([]string{"gc-1", "reply body"}, true, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("cmdMailReplyAsHuman() = %d, want 0; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
