@@ -154,9 +154,9 @@ type nudgeTarget struct {
 	sessionID         string
 	continuationEpoch string
 	sessionName       string
-	// Set only on dispatcher targets built from a session Info; they let
-	// claudeTranscriptSaysTurnEnded find the seat's keyed transcript and its
-	// recorded provider family (ga-megheo). Empty elsewhere.
+	// Set on targets built from a session Info (the dispatcher and the CLI
+	// resolveNudgeTarget path); they let claudeTranscriptSaysTurnEnded find the
+	// seat's keyed transcript and its recorded builtin family (ga-megheo).
 	transcriptWorkDir    string
 	transcriptSessionKey string
 	providerAncestor     string
@@ -1981,7 +1981,7 @@ func resolveNudgeTargetFromSessionInfo(cityPath string, cfg *config.City, i sess
 	})
 	target.transcriptWorkDir = strings.TrimSpace(i.WorkDir)
 	target.transcriptSessionKey = strings.TrimSpace(i.SessionKey)
-	target.providerAncestor = firstNonEmpty(strings.TrimSpace(i.BuiltinAncestor), strings.TrimSpace(i.ProviderKind))
+	target.providerAncestor = strings.TrimSpace(i.BuiltinAncestor)
 	return target
 }
 
