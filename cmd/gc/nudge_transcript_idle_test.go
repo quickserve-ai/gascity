@@ -26,6 +26,9 @@ const (
 	tlQueueEnqueue    = `{"type":"queue-operation","operation":"enqueue","content":"<task-notification>"}`
 	tlQueueRemove     = `{"type":"queue-operation","operation":"remove"}`
 	tlAttachment      = `{"type":"attachment","attachment":{"type":"queued_command"}}`
+	tlPRLink          = `{"type":"pr-link"}`
+	tlBridgeSession   = `{"type":"bridge-session"}`
+	tlFileHistory     = `{"type":"file-history-snapshot"}`
 )
 
 const transcriptIdleTestKey = "0b6f3c1e-7d2a-4c55-9e8f-2a1b3c4d5e6f"
@@ -125,11 +128,12 @@ func TestPollerIdleClaudeTranscriptTurnRunningStaysBusy(t *testing.T) {
 	}
 }
 
-// (c) The live shape: the main turn ended, then only queue-operation and
-// attachment lines were appended while a background task ran.
+// (c) The live shape: the main turn ended, then only queue-operation,
+// attachment and other non-turn lines were appended while a background task ran.
 func TestPollerIdleClaudeTranscriptQueueOperationsAfterTurnEnd(t *testing.T) {
 	lines := []string{tlUserPrompt, tlAssistEndTurn, tlStopHookSummary, tlTurnDuration,
-		tlQueueEnqueue, tlQueueEnqueue, tlQueueRemove, tlQueueRemove, tlAttachment}
+		tlQueueEnqueue, tlQueueEnqueue, tlQueueRemove, tlQueueRemove, tlAttachment,
+		tlPRLink, tlBridgeSession, tlFileHistory}
 	target := transcriptIdleTarget(t, "claude", nil, lines)
 	if !pollerSessionIdleEnough(target, nil, 3*time.Second, freshActivity()) {
 		t.Fatal("pollerSessionIdleEnough = false, want true: only queue-operation/attachment lines follow turn_duration")
