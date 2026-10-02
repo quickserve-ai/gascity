@@ -1167,9 +1167,13 @@ func defaultMailSenderCandidates() []string {
 // noMailSenderIdentity is the refusal for a send or reply from a process with
 // neither a session identity nor an order identity and no --from.
 func noMailSenderIdentity(cmdName string) string {
-	return cmdName + ": no sender identity: GC_SESSION_ID, GC_ALIAS and GC_AGENT are unset and this is not an order run " +
-		"(GC_ORDER_SCOPE and GC_ORDER_NAME unset); refusing to send as \"human\", the operator's own address. " +
-		"Run it from a seat, or pass --from <identity> (--from human sends as the operator)"
+	msg := cmdName + ": no sender identity: GC_SESSION_ID, GC_ALIAS and GC_AGENT are unset and this is not an order run " +
+		"(GC_ORDER_SCOPE and GC_ORDER_NAME unset); refusing to send as \"human\", the operator's own address. "
+	if cmdName == "gc handoff" {
+		// gc handoff has no --from: the only fix is to run it as a seat.
+		return msg + "Run it from a seat"
+	}
+	return msg + "Run it from a seat, or pass --from <identity> (--from human sends as the operator)"
 }
 
 // defaultMailSender is the first default sender candidate. With none it
@@ -1181,6 +1185,31 @@ func defaultMailSender(stderr io.Writer, cmdName string) (string, bool) {
 		return "", false
 	}
 	return candidates[0], true
+}
+
+// resolveExplicitMailSender checks an explicit --from against this city. A
+// --from carrying a peer city's segment is accepted verbatim: only its own
+// city can check that identity. A local-city qualifier strips to the bare
+// form, which stays identity-checked here — the local city is the one place
+// identity can and must be checked. Shared by send and reply so the two
+// accept the same --from values.
+func resolveExplicitMailSender(roster mail.CityRoster, cityPath string, cfg *config.City, sessStore beads.Store, sender string, cache *mailIdentitySessionCache, stderr io.Writer, cmdName string) (string, bool) {
+	kind, addr := roster.ResolveCityAddress(sender)
+	if kind == mail.CityAddressForeign {
+		return addr, true
+	}
+	if kind == mail.CityAddressLocal {
+		sender = addr
+	}
+	if sender == "human" {
+		return sender, true
+	}
+	resolved, err := resolveMailIdentityWithConfigCached(cityPath, cfg, sessStore, sender, cache)
+	if err != nil {
+		fmt.Fprintf(stderr, "%s: invalid sender %q: %v\n", cmdName, sender, err) //nolint:errcheck // best-effort stderr
+		return "", false
+	}
+	return resolved, true
 }
 
 // orderMailSenderIdentity is order:<GC_ORDER_SCOPE>/<GC_ORDER_NAME> when this
@@ -2329,24 +2358,9 @@ func cmdMailSendJSONFull(args []string, notify bool, all bool, from string, to s
 		}
 		runMetadata = orderMailRunMetadata(sender)
 	} else if sender != "human" && store != nil {
-		// A --from carrying a peer city's segment is accepted verbatim: only
-		// its own city can check that identity. A local-city qualifier strips
-		// to the bare form, which stays identity-checked here — the local
-		// city is the one place identity can and must be checked.
-		if kind, addr := roster.ResolveCityAddress(sender); kind == mail.CityAddressForeign {
-			sender = addr
-		} else {
-			if kind == mail.CityAddressLocal {
-				sender = addr
-			}
-			if sender != "human" {
-				given := sender
-				sender, err = resolveMailIdentityWithConfigCached(cityPath, cfg, sessStore, sender, idCache)
-				if err != nil {
-					fmt.Fprintf(stderr, "gc mail send: invalid sender %q: %v\n", given, err) //nolint:errcheck // best-effort stderr
-					return 1
-				}
-			}
+		var ok bool
+		if sender, ok = resolveExplicitMailSender(roster, cityPath, cfg, sessStore, sender, idCache, stderr, "gc mail send"); !ok {
+			return 1
 		}
 	}
 
@@ -3091,12 +3105,8 @@ func cmdMailReplyFromJSON(args []string, from, subject, message string, notify b
 		return cmdMailReplyRemote(remoteC, remoteTgt, args, subject, message, notify, jsonOut, stdout, stderr)
 	}
 
-	mp, code := openCityMailProvider(stderr, "gc mail reply")
-	if mp == nil {
-		return code
-	}
-	rec := openCityRecorder(stderr)
-
+	// The sender is settled before the provider or the event log is opened,
+	// so a reply refused for want of an identity touches nothing on disk.
 	sender, explicitFrom := strings.TrimSpace(from), strings.TrimSpace(from) != ""
 	if !explicitFrom {
 		var ok bool
@@ -3104,6 +3114,12 @@ func cmdMailReplyFromJSON(args []string, from, subject, message string, notify b
 			return 1
 		}
 	}
+
+	mp, code := openCityMailProvider(stderr, "gc mail reply")
+	if mp == nil {
+		return code
+	}
+	rec := openCityRecorder(stderr)
 	providerName := mailProviderName()
 	var store beads.Store
 	var cityPath string
@@ -3138,9 +3154,8 @@ func cmdMailReplyFromJSON(args []string, from, subject, message string, notify b
 		}
 		if sender != "human" && store != nil {
 			if explicitFrom {
-				resolved, err := resolveMailIdentityWithConfigCached(cityPath, cfg, cliSessionStore(store, cfg, cityPath), sender, nil)
-				if err != nil {
-					fmt.Fprintf(stderr, "gc mail reply: invalid sender %q: %v\n", sender, err) //nolint:errcheck // best-effort stderr
+				resolved, ok := resolveExplicitMailSender(mailCityRosterFor(cfg, cityPath), cityPath, cfg, cliSessionStore(store, cfg, cityPath), sender, nil, stderr, "gc mail reply")
+				if !ok {
 					return 1
 				}
 				sender = resolved

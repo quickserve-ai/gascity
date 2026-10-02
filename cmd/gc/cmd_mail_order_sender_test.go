@@ -320,3 +320,85 @@ func TestMailSendAllRecordsOrderRun(t *testing.T) {
 func cmdMailReplyAsHuman(args []string, subject, message string, notify bool, stdout, stderr io.Writer) int {
 	return cmdMailReplyFromJSON(args, "human", subject, message, notify, false, stdout, stderr)
 }
+
+// gc handoff --target with no identity is refused before anything is
+// written, and its advice names only the fix it has: handoff has no --from.
+func TestCmdHandoffRemote_NoIdentityRefused(t *testing.T) {
+	clearMailIdentityEnv(t)
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_BEADS_SCOPE_ROOT", "")
+	t.Setenv("GC_MAIL", "")
+	cityPath := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cityPath, "city.toml"), []byte("[workspace]\nname = \"test-city\"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(city.toml): %v", err)
+	}
+	t.Setenv("GC_CITY", cityPath)
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{
+		Type:     session.BeadType,
+		Labels:   []string{session.LabelSession},
+		Metadata: map[string]string{"alias": "recipient", "session_name": "recipient-gc-42"},
+	}); err != nil {
+		t.Fatalf("Create recipient: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdHandoffRemote([]string{"context cycle"}, "recipient", &stdout, &stderr); code == 0 {
+		t.Fatalf("handoff --target with no identity = 0, want a refusal; stdout=%s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "gc handoff: no sender identity") || !strings.HasSuffix(strings.TrimSpace(stderr.String()), "Run it from a seat") {
+		t.Fatalf("stderr = %q, want the handoff refusal without --from advice", stderr.String())
+	}
+	assertNoMessageBeads(t, cityPath)
+}
+
+// reply --from accepts what send's --from accepts: a local-city qualifier
+// strips to the bare form, and an identity this city cannot resolve is
+// refused before anything is written.
+func TestCmdMailReply_ExplicitFromResolvesLikeSend(t *testing.T) {
+	cityPath := writeCrossCityTestCity(t)
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	orig, err := beadmail.New(store).Send("x", "human", "status", "local thread")
+	if err != nil {
+		t.Fatalf("seed Send: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdMailReplyFromJSON([]string{orig.ID}, "qlandia/nobody", "", "refused", false, false, &stdout, &stderr); code == 0 {
+		t.Fatalf("reply --from qlandia/nobody = 0, want invalid sender; stdout=%s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), `gc mail reply: invalid sender "nobody"`) {
+		t.Fatalf("stderr = %q, want the invalid-sender refusal", stderr.String())
+	}
+	if n := countMessageBeads(t, cityPath); n != 1 {
+		t.Fatalf("message beads after refused reply = %d, want 1 (the original only)", n)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := cmdMailReplyFromJSON([]string{orig.ID}, "qlandia/human", "", "operator reply", false, false, &stdout, &stderr); code != 0 {
+		t.Fatalf("reply --from qlandia/human = %d; stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+	if n := countMessageBeads(t, cityPath); n != 2 {
+		t.Fatalf("message beads after reply = %d, want 2", n)
+	}
+	after, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt after reply: %v", err)
+	}
+	all, err := after.List(beads.ListQuery{Type: "message", TierMode: beads.TierBoth})
+	if err != nil {
+		t.Fatalf("List messages: %v", err)
+	}
+	for _, b := range all {
+		if b.ID != orig.ID && b.From != "human" {
+			t.Fatalf("reply From = %q, want the local qualifier stripped to human", b.From)
+		}
+	}
+}
