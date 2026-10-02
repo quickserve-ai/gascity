@@ -434,7 +434,7 @@ func TestGastown_MayorDispatchPipeline(t *testing.T) {
 		rigName,
 		dispatchTarget,
 	)
-	out, err := c.GC("mail", "send", "--notify", "mayor", "-s", "Dispatch app.py greet work to polecat", "-m", body)
+	out, err := c.GC("mail", "send", "--from", "human", "--notify", "mayor", "-s", "Dispatch app.py greet work to polecat", "-m", body)
 	if err != nil {
 		t.Fatalf("gc mail send: %v\n%s", err, out)
 	}
