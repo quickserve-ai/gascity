@@ -133,13 +133,9 @@ func handoffJSONSubject(args []string, auto bool) string {
 	return "HANDOFF: context cycle"
 }
 
-func cmdHandoffWithForce(args []string, target string, auto bool, hookFormat string, force bool, stdout, stderr io.Writer) int {
-	return cmdHandoffWithFrom(args, target, "", auto, hookFormat, force, stdout, stderr)
-}
-
-// cmdHandoffWithFrom is cmdHandoffWithForce with an explicit --from, which
-// names the sender of a --target handoff. A self-handoff mails as the session
-// itself, so --from is refused there.
+// cmdHandoffWithFrom runs gc handoff. --from names the sender of a --target
+// handoff; a self-handoff mails as the session itself, so --from is refused
+// there.
 func cmdHandoffWithFrom(args []string, target, from string, auto bool, hookFormat string, force bool, stdout, stderr io.Writer) int {
 	if target != "" {
 		if auto {
@@ -208,11 +204,7 @@ func cmdHandoffWithFrom(args []string, target, from string, auto bool, hookForma
 // cmdHandoffRemote sends handoff mail to a remote session and kills its runtime.
 // Returns immediately (non-blocking). The reconciler restarts the target.
 func cmdHandoffRemote(args []string, target string, stdout, stderr io.Writer) int {
-	return cmdHandoffRemoteWithForce(args, target, false, stdout, stderr)
-}
-
-func cmdHandoffRemoteWithForce(args []string, target string, force bool, stdout, stderr io.Writer) int {
-	return cmdHandoffRemoteFrom(args, target, "", force, stdout, stderr)
+	return cmdHandoffRemoteFrom(args, target, "", false, stdout, stderr)
 }
 
 func cmdHandoffRemoteFrom(args []string, target, from string, force bool, stdout, stderr io.Writer) int {
