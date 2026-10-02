@@ -178,8 +178,11 @@ type panePromptExecutor struct {
 	failLiteral int
 	afterFail   string
 	onEnter     func(n int) string
-	calls       [][]string
-	enters      int
+	// onType, when set, returns the screen once text has been typed (a
+	// literal send-keys): what the composer shows before the first Enter.
+	onType func(text string) string
+	calls  [][]string
+	enters int
 }
 
 func (f *panePromptExecutor) execute(args []string) (string, error) {
@@ -228,6 +231,11 @@ func (f *panePromptExecutor) execute(args []string) (string, error) {
 		}
 		return "", errors.New("not in a mode")
 	case tmuxArgsContain(args, "send-keys"):
+		if tmuxArgsContain(args, "-l") && f.onType != nil {
+			if next := f.onType(args[len(args)-1]); next != "" {
+				f.screen = next
+			}
+		}
 		if !tmuxArgsContain(args, "-l") && args[len(args)-1] == "Enter" {
 			f.enters++
 			if f.onEnter != nil {
@@ -918,5 +926,60 @@ func TestClassifyOmpAskBox(t *testing.T) {
 	quoted := strings.Split(ompAskBoxFixture+"\n"+idleComposerFixture, "\n")
 	if got := classifyHumanPrompt(quoted, "❯ ", false); got != "" {
 		t.Fatalf("an Ask box in scrollback above an idle composer classified %q, want safe", got)
+	}
+}
+
+// ga-da5vmz (gap 1): on an ATTACHED claude pane the composer is empty at the
+// before_type check, gc types the nudge and waits out its paste debounce, and
+// in that time a person clears it and types their own message. The first
+// Enter used to submit the PERSON's text. It must not go out; the nudge
+// defers after typing, without spending a queue attempt.
+func TestNudgeSessionDefersWhenAPersonReplacesTheTypedNudgeBeforeTheFirstEnter(t *testing.T) {
+	fe := &panePromptExecutor{screen: idleComposerFixture, attached: true}
+	fe.onType = func(string) string { return composerFixture("❯ actually, stop and rebase first") }
+	fe.onEnter = func(int) string { return busyFixture }
+	tm, session := newGuardTestTmux(fe)
+
+	err := tm.NudgeSession(session, guardTestNudge)
+	if got := fe.enterCount(); got != 0 {
+		t.Fatalf("Enter sent %d time(s) onto a person's text that replaced the nudge", got)
+	}
+	assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+	if !NudgeDeferredAfterTyping(err) {
+		t.Fatalf("NudgeDeferredAfterTyping(%v) = false, want true: the text was typed, only the submit was withheld", err)
+	}
+}
+
+// The first-submit ownership check accepts every way the composer shows the
+// nudge this delivery typed, and applies only to an attached claude pane: a
+// false "not ours" would leave the reminder unsent.
+func TestNudgeSessionFirstEnterAcceptsItsOwnDraft(t *testing.T) {
+	tests := []struct {
+		name      string
+		afterType string // "" leaves the screen unchanged (an empty composer)
+		attached  bool
+	}{
+		{name: "the typed text", afterType: composerFixture("❯ " + guardTestNudge), attached: true},
+		{name: "the typed text wrapped at a narrow width", afterType: composerFixture("❯ <system-reminder> You have a\n  deferred reminder: check the queue\n  </system-reminder>"), attached: true},
+		{name: "a paste placeholder", afterType: composerFixture("❯ [Pasted text #1 +3 lines]"), attached: true},
+		{name: "a partially rendered paste", afterType: composerFixture("❯ <system-remi"), attached: true},
+		{name: "on top of an earlier gc draft", afterType: composerFixture("❯ <system-reminder> older reminder </system-reminder>" + guardTestNudge), attached: true},
+		{name: "an empty composer, as today", afterType: "", attached: true},
+		{name: "foreign text on a DETACHED pane, as today", afterType: composerFixture("❯ actually, stop and rebase first"), attached: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fe := &panePromptExecutor{screen: idleComposerFixture, attached: tt.attached}
+			fe.onType = func(string) string { return tt.afterType }
+			fe.onEnter = func(int) string { return busyFixture }
+			tm, session := newGuardTestTmux(fe)
+
+			if err := tm.NudgeSession(session, guardTestNudge); err != nil {
+				t.Fatalf("NudgeSession() = %v, want nil", err)
+			}
+			if got := fe.enterCount(); got != 1 {
+				t.Fatalf("Enter sent %d times, want 1", got)
+			}
+		})
 	}
 }

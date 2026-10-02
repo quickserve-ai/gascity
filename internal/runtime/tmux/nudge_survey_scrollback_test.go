@@ -63,3 +63,61 @@ func TestNudgeSessionSendsNoSurveyDismissKeyWhenSurveyNotOnScreen(t *testing.T) 
 		t.Fatalf("sent the survey dismiss key %d time(s) into a pane with no survey on screen: %v", len(zeros), zeros)
 	}
 }
+
+// ga-da5vmz (gap 2): a survey row that is still on the VISIBLE screen but sits
+// above later agent output is stale -- the live survey is drawn directly above
+// the composer. The dismisser must send nothing there: its "0" and Enter
+// would land in the idle composer and submit "0" as a user message.
+func TestFeedbackSurveyDismisserSendsNoKeysForASurveyAboveLaterOutput(t *testing.T) {
+	ex := &paneAfterFirstKeyExecutor{before: surveyScrollbackHistory, after: surveyScrollbackHistory, attached: "0"}
+	tm := &Tmux{cfg: DefaultConfig(), exec: ex}
+
+	tm.DismissFeedbackSurveyModalIfPresent("agent-pane")
+	if keys := sentKeys(ex.calls); len(keys) != 0 {
+		t.Fatalf("sent survey keys for a survey above later output on an idle composer: %v", keys)
+	}
+}
+
+// The same stale screen through the whole nudge: no "0", and the nudge text is
+// the first thing typed after the C-u clear.
+func TestNudgeSessionSendsNoSurveyKeyForASurveyAboveLaterOutput(t *testing.T) {
+	ex := &paneAfterFirstKeyExecutor{before: surveyScrollbackHistory, after: surveyScrollbackHistory, attached: "0"}
+	tm := &Tmux{cfg: DefaultConfig(), exec: ex}
+
+	if err := tm.NudgeSession("agent-pane", "hello world"); err != nil {
+		t.Fatalf("NudgeSession: %v", err)
+	}
+	keys := sentKeys(ex.calls)
+	var before [][]string
+	for _, k := range keys {
+		if slices.Contains(k, "-l") {
+			break
+		}
+		if !slices.Contains(k, "C-u") {
+			before = append(before, k)
+		}
+	}
+	if len(before) != 0 {
+		t.Fatalf("keys sent before the nudge text (besides C-u): %v", before)
+	}
+}
+
+// Control: a survey that IS the live block above the composer is still
+// dismissed with exactly "0" then Enter, for both survey variants.
+func TestFeedbackSurveyDismisserDismissesALiveSurvey(t *testing.T) {
+	for name, pane := range map[string]string{
+		"session feedback variant":    feedbackSurveySessionFixture,
+		"memory recollection variant": feedbackSurveyMemoryFixture,
+	} {
+		t.Run(name, func(t *testing.T) {
+			ex := &paneAfterFirstKeyExecutor{before: pane, after: surveyVisibleIdle, attached: "0"}
+			tm := &Tmux{cfg: DefaultConfig(), exec: ex}
+
+			tm.DismissFeedbackSurveyModalIfPresent("agent-pane")
+			keys := sentKeys(ex.calls)
+			if len(keys) != 2 || keys[0][len(keys[0])-1] != "0" || keys[1][len(keys[1])-1] != "Enter" {
+				t.Fatalf("keys sent = %v, want exactly \"0\" then \"Enter\"", keys)
+			}
+		})
+	}
+}

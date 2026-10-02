@@ -42,7 +42,9 @@ const (
 	// cursor on it. Enter picks the highlighted row, so it is refused too.
 	NudgeDeferReasonSelectionPrompt = "selection_prompt"
 	// NudgeDeferReasonHumanDraft: the composer holds text on an ATTACHED
-	// session, so a person may be mid-message.
+	// session, so a person may be mid-message. Before the first Enter
+	// (stage before_submit) it means the composer holds text that is not
+	// the nudge just typed: a person replaced it (ga-da5vmz).
 	NudgeDeferReasonHumanDraft = "human_draft"
 	// NudgeDeferReasonCaptureFailed: the pane could not be read, so a prompt
 	// could not be ruled out. The guard fails closed.
@@ -337,6 +339,38 @@ func composerHoldsSent(lines []string, promptPrefix, sent string) bool {
 	return strings.Contains(remainder, claudePastePlaceholderPrefix) || strings.Contains(remainder, "[Pasted Content")
 }
 
+// composerDraftIsOurs reports whether a non-empty composer draft can be the
+// nudge text sent, as Claude draws it before the first Enter (ga-da5vmz).
+// Whitespace is ignored throughout, since the composer re-wraps long lines.
+// It accepts: Claude's paste placeholder (a long paste shows only that, so
+// a person who clears the nudge and PASTES their own text is not caught);
+// the message's opening, also when an earlier gc draft sits in front of it;
+// a prefix of the message (the paste still rendering); and a long run of the
+// message (a tall draft scrolled so only its tail shows). A short fragment
+// is not accepted as a mid-message match: "ok" occurs in most reminders.
+func composerDraftIsOurs(draft, sent string) bool {
+	if strings.Contains(draft, claudePastePlaceholderPrefix) {
+		return true
+	}
+	d, m := squashSpace(draft), squashSpace(sent)
+	if d == "" || m == "" {
+		return d == ""
+	}
+	if strings.Contains(d, firstNRunes(m, 40)) || strings.HasPrefix(m, d) {
+		return true
+	}
+	return utf8.RuneCountInString(d) >= composerTailMatchMinRunes && strings.Contains(m, d)
+}
+
+// composerTailMatchMinRunes is the shortest draft composerDraftIsOurs accepts
+// as a run from the middle or end of the message.
+const composerTailMatchMinRunes = 24
+
+// squashSpace drops every whitespace rune from s.
+func squashSpace(s string) string {
+	return strings.Join(strings.Fields(s), "")
+}
+
 // humanPromptGuard captures target and returns a *NudgeDeferredError when the
 // pane shows a human prompt.
 //
@@ -527,6 +561,17 @@ func (t *Tmux) paneIsClaudeFamily(target string) bool {
 // a placeholder ("[Pasted text #N +M lines]"), and a person who pastes their
 // own text after a submit that landed unobserved would otherwise have THEIR
 // placeholder submitted. Claude numbers each paste, so theirs differs.
+//
+// The first submit is gated too, on an ATTACHED claude pane only (ga-da5vmz):
+// the composer was empty when the nudge was typed, but in the paste debounce
+// a person may have cleared it and typed their own message, which the first
+// Enter would submit. When the composer then holds text that cannot be the
+// nudge (composerDraftIsOurs) and is not only a faint placeholder, the
+// delivery defers after typing. Only positive evidence of someone else's text
+// defers: an empty or unreadable composer keeps today's behaviour, so a slow
+// render costs nothing. Other families are not checked: claude is the one
+// family whose composer the draft rule models (see humanPromptGuard), and of
+// the others only codex reaches this gate.
 func (t *Tmux) resendGate(session, target, message string) func(resend bool) (bool, error) {
 	promptPrefix := t.resolveIdlePromptPrefix(session)
 	snapshot := ""
@@ -537,6 +582,11 @@ func (t *Tmux) resendGate(session, target, message string) func(resend bool) (bo
 			if err == nil {
 				if found, text := composerDraft(lines, promptPrefix); found {
 					snapshot = text
+					if !composerDraftIsOurs(text, message) &&
+						t.sessionClientCount(session) != 0 && t.paneIsClaudeFamily(target) &&
+						!t.composerHoldsOnlyDimText(target, promptPrefix) {
+						return false, &NudgeDeferredError{Session: session, Reason: NudgeDeferReasonHumanDraft, Stage: nudgeGuardStageBeforeSubmit}
+					}
 				}
 			}
 			return true, nil

@@ -3437,12 +3437,12 @@ const feedbackSurveyDismissConfirmDelay = 150 * time.Millisecond
 // the bundle's chat:submit action, which fires the survey's onDigit handler
 // immediately instead of waiting out its 400ms debounce -- see
 // runtime.ContainsFeedbackSurveyModal for the bundle-verified mechanism this
-// mirrors. It is a no-op unless the matcher fires, so it never sends stray
-// keystrokes into ordinary working panes. Side effects are injected so the
-// decision is unit-testable without a live tmux server. Returns whether the
-// modal was present (i.e. a dismiss was attempted).
-func dismissFeedbackSurveyModal(content string, sendKeys func(keys ...string) error, sleep func(time.Duration)) (bool, error) {
-	if !runtime.ContainsFeedbackSurveyModal(content) {
+// mirrors. It is a no-op unless the survey is LIVE (feedbackSurveyIsLive), so
+// it never sends stray keystrokes into ordinary working panes. Side effects
+// are injected so the decision is unit-testable without a live tmux server.
+// Returns whether the modal was present (i.e. a dismiss was attempted).
+func dismissFeedbackSurveyModal(content, promptPrefix string, sendKeys func(keys ...string) error, sleep func(time.Duration)) (bool, error) {
+	if !feedbackSurveyIsLive(content, promptPrefix) {
 		return false, nil
 	}
 	if err := sendKeys("0"); err != nil {
@@ -3450,6 +3450,39 @@ func dismissFeedbackSurveyModal(content string, sendKeys func(keys ...string) er
 	}
 	sleep(feedbackSurveyDismissConfirmDelay)
 	return true, sendKeys("Enter")
+}
+
+// feedbackSurveyIsLive reports whether content (the visible screen) shows
+// Claude Code's post-turn feedback survey as the LIVE block: its option row is
+// the last thing drawn above the live composer, with only blank lines and the
+// composer box's own border between them (ga-da5vmz). That is how the survey
+// renders (see feedbackSurveySessionFixture): above the composer, so the
+// tail-anchor rule DismissMidSessionDialogs uses -- the dialog's anchor on the
+// last non-blank line -- would never fire on it. A survey row with agent
+// output between it and the composer is stale, left over from an earlier
+// turn; dismissing it would type "0" and Enter into the idle composer and
+// submit "0" as a user message. With no composer on screen, the option row
+// must be the last non-blank line.
+func feedbackSurveyIsLive(content, promptPrefix string) bool {
+	lines := strings.Split(content, "\n")
+	composerIdx, _ := lastComposerLine(lines, promptPrefix)
+	if composerIdx < 0 {
+		composerIdx = len(lines)
+	}
+	for i := composerIdx - 1; i >= 0; i-- {
+		if strings.TrimSpace(lines[i]) == "" || isBoxFrameLine(lines[i]) {
+			continue
+		}
+		return runtime.ContainsFeedbackSurveyModal(lines[i])
+	}
+	return false
+}
+
+// isBoxFrameLine reports whether a captured line is only box-drawing border:
+// a full-width rule, or a box's top or bottom edge ("╭───╮", "╰───╯").
+func isBoxFrameLine(line string) bool {
+	s := strings.TrimSpace(line)
+	return utf8.RuneCountInString(s) >= 8 && strings.Trim(s, "─━╭╮╰╯┌┐└┘") == ""
 }
 
 // DismissFeedbackSurveyModalIfPresent clears Claude Code's post-turn
@@ -3467,10 +3500,11 @@ func (t *Tmux) DismissFeedbackSurveyModalIfPresent(session string) {
 	}
 	sendKeys := func(keys ...string) error {
 		for _, k := range keys {
-			// ga-ubfc7j: these are raw send-keys, and the survey matcher
-			// is contains-based over the visible screen, so a stray match
-			// could still key a live question, approval or attached
-			// person's draft. The full guard runs before EVERY key.
+			// ga-ubfc7j: these are raw send-keys, and the survey check
+			// reads only where the survey row sits, so a live question,
+			// approval or attached person's draft elsewhere on screen
+			// could still take the key. The full guard runs before EVERY
+			// key.
 			if err := t.humanPromptGuard(session, target, nudgeGuardStageBeforeType, true); err != nil {
 				return err
 			}
@@ -3483,13 +3517,16 @@ func (t *Tmux) DismissFeedbackSurveyModalIfPresent(session string) {
 
 	// Visible screen only (no "-S"): a live survey occupies the visible
 	// footer, while an already-answered or already-dismissed survey lingers
-	// in scrollback and would otherwise match the contains-based detector
-	// and type its "0" dismiss key into an empty composer (#6844).
+	// in scrollback (#6844). One can still be on the visible screen above
+	// later output, so the survey must also be the live block directly above
+	// the composer (feedbackSurveyIsLive, ga-da5vmz); otherwise its "0"
+	// and Enter land in the idle composer as a user message.
+	promptPrefix := t.resolveIdlePromptPrefix(session)
 	content, err := t.CaptureVisiblePane(target)
 	if err != nil {
 		return
 	}
-	present, _ := dismissFeedbackSurveyModal(content, sendKeys, time.Sleep)
+	present, _ := dismissFeedbackSurveyModal(content, promptPrefix, sendKeys, time.Sleep)
 	if !present {
 		return
 	}
@@ -3501,7 +3538,7 @@ func (t *Tmux) DismissFeedbackSurveyModalIfPresent(session string) {
 	if err != nil {
 		return
 	}
-	_, _ = dismissFeedbackSurveyModal(content, sendKeys, time.Sleep)
+	_, _ = dismissFeedbackSurveyModal(content, promptPrefix, sendKeys, time.Sleep)
 }
 
 // GetPaneCommand returns the current command running in a pane.
@@ -4094,10 +4131,12 @@ func (t *Tmux) CapturePane(session string, lines int) (string, error) {
 // no scrollback history (no "-S"). The mid-session dialog dismissal
 // (dismissMidSessionDialogs) and the feedback-survey dismissal
 // (DismissFeedbackSurveyModalIfPresent) use this instead of CapturePane so an
-// already-dismissed dialog sitting in scrollback cannot satisfy the
-// contains-based matchers and inject dismissal keys into a live prompt before
-// the intended nudge. A live blocking dialog occupies the visible footer, so
-// the visible screen is the correct and sufficient window for that check.
+// already-dismissed dialog sitting in scrollback cannot satisfy their matchers
+// and inject dismissal keys into a live prompt before the intended nudge. A
+// live blocking dialog occupies the visible footer, so the visible screen is
+// the window for that check; a stale dialog can still be on it above later
+// output, which is why both callers also require the dialog to be the live
+// block (activeMidSessionDialog, feedbackSurveyIsLive).
 func (t *Tmux) CaptureVisiblePane(session string) (string, error) {
 	return t.run("capture-pane", "-p", "-t", session)
 }
