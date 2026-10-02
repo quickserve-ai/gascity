@@ -466,3 +466,81 @@ func promptDeliveryResultLens(r promptDeliveryResult) string {
 		"OversizedFallback=" + strconv.FormatBool(r.OversizedFallback),
 	}, " ")
 }
+
+// ga-alb76h: the tmux runtime on a macOS host carries primes up to 512 KB on
+// the command line; every other runtime, and every runtime on Linux, keeps the
+// Linux bounds.
+func TestPromptArgvLimitsByHostAndRuntime(t *testing.T) {
+	for _, tc := range []struct {
+		goos, runtime, env string
+		raw, quotedWant    int
+	}{
+		{"linux", "tmux", "", maxPromptSuffixRawBytes, maxPromptSuffixQuotedBytes},
+		{"linux", "", "", maxPromptSuffixRawBytes, maxPromptSuffixQuotedBytes},
+		{"darwin", "tmux", "", darwinTmuxPromptRawBytes, darwinTmuxPromptQuotedBytes},
+		{"darwin", "", "", darwinTmuxPromptRawBytes, darwinTmuxPromptQuotedBytes},
+		{"darwin", " tmux", "", darwinTmuxPromptRawBytes, darwinTmuxPromptQuotedBytes},
+		{"darwin", "k8s", "", maxPromptSuffixRawBytes, maxPromptSuffixQuotedBytes},
+		{"darwin", "hybrid", "", maxPromptSuffixRawBytes, maxPromptSuffixQuotedBytes},
+		{"darwin", "herdr", "", maxPromptSuffixRawBytes, maxPromptSuffixQuotedBytes},
+		{"darwin", "subprocess", "", maxPromptSuffixRawBytes, maxPromptSuffixQuotedBytes},
+		// GC_SESSION overrides city.toml at provider construction; a non-tmux
+		// override must not get the darwin bounds (cross-family read of #201).
+		{"darwin", "tmux", "k8s", maxPromptSuffixRawBytes, maxPromptSuffixQuotedBytes},
+		{"darwin", "", "hybrid", maxPromptSuffixRawBytes, maxPromptSuffixQuotedBytes},
+		{"darwin", "tmux", "tmux", darwinTmuxPromptRawBytes, darwinTmuxPromptQuotedBytes},
+	} {
+		raw, quoted := promptArgvLimits(tc.goos, tc.runtime, tc.env)
+		if raw != tc.raw || quoted != tc.quotedWant {
+			t.Errorf("promptArgvLimits(%q, %q, %q) = %d, %d; want %d, %d", tc.goos, tc.runtime, tc.env, raw, quoted, tc.raw, tc.quotedWant)
+		}
+	}
+}
+
+// The refinery's prime on 2026-09-30 was 130,301 bytes. On a macOS tmux host
+// it goes on the command line (a plain first message), not by the paste
+// fallback; on k8s it still falls back.
+func TestPromptDeliveryDarwinTmuxKeepsLargePrimeInArgv(t *testing.T) {
+	prev := promptArgvHostOS
+	promptArgvHostOS = "darwin"
+	t.Cleanup(func() { promptArgvHostOS = prev })
+	t.Setenv("GC_SESSION", "")
+
+	arg := &config.ResolvedProvider{PromptMode: "arg"}
+	prompt := repeatToBytes("a", 130301)
+
+	got, err := promptDelivery(prompt, false, arg, "wake", "tmux", nil)
+	if err != nil {
+		t.Fatalf("promptDelivery(tmux): %v", err)
+	}
+	if got.OversizedFallback || got.PromptSuffix == "" || got.Nudge != "wake" || !got.Delivered {
+		t.Fatalf("tmux on darwin: OversizedFallback=%v PromptSuffix len=%d Nudge len=%d Delivered=%v; want argv delivery with the nudge untouched",
+			got.OversizedFallback, len(got.PromptSuffix), len(got.Nudge), got.Delivered)
+	}
+
+	got, err = promptDelivery(prompt, false, arg, "wake", "k8s", nil)
+	if err != nil {
+		t.Fatalf("promptDelivery(k8s): %v", err)
+	}
+	if !got.OversizedFallback || got.PromptSuffix != "" {
+		t.Fatalf("k8s on darwin: OversizedFallback=%v PromptSuffix len=%d; want the Linux-bound fallback", got.OversizedFallback, len(got.PromptSuffix))
+	}
+
+	t.Setenv("GC_SESSION", "k8s")
+	got, err = promptDelivery(prompt, false, arg, "wake", "tmux", nil)
+	if err != nil {
+		t.Fatalf("promptDelivery(tmux, GC_SESSION=k8s): %v", err)
+	}
+	if !got.OversizedFallback || got.PromptSuffix != "" {
+		t.Fatalf("tmux in config but GC_SESSION=k8s: OversizedFallback=%v PromptSuffix len=%d; want the fallback", got.OversizedFallback, len(got.PromptSuffix))
+	}
+	t.Setenv("GC_SESSION", "")
+
+	got, err = promptDelivery(repeatToBytes("a", darwinTmuxPromptRawBytes), false, arg, "wake", "tmux", nil)
+	if err != nil {
+		t.Fatalf("promptDelivery(tmux, at the darwin bound): %v", err)
+	}
+	if !got.OversizedFallback {
+		t.Fatal("tmux on darwin at the darwin bound: want the fallback")
+	}
+}

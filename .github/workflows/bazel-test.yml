@@ -37,6 +37,9 @@ permissions:
 jobs:
   bazel:
     name: bazel test (side-by-side)
+    # The quickserve-ai fork has no Blacksmith runners and no remote-execution
+    # secrets, so this job would queue forever there (pl-axh9); it runs upstream only.
+    if: github.repository == 'gastownhall/gascity'
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 90
     permissions:
@@ -159,7 +162,9 @@ jobs:
 
   sync-check:
     name: BUILD files in sync
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    # GitHub-hosted on the quickserve-ai fork, which has no Blacksmith runners
+    # (pl-axh9); unchanged upstream. It is gazelle only, capped at 10 minutes.
+    runs-on: ${{ github.repository == 'gastownhall/gascity' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -178,5 +183,15 @@ jobs:
           git diff --exit-code || {
             echo "BUILD files out of sync; run 'make bazel-sync' and commit the result." >&2
             git diff | head -80 >&2
+            # The whole change, new files included, for hosts without bazel
+            # to apply as a patch (artifact bazel-sync-diff; pl-axh9).
+            git add -A && git diff --cached --binary > "$RUNNER_TEMP/bazel-sync.diff"
             exit 1
           }
+      - name: Upload the full BUILD sync diff
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bazel-sync-diff
+          path: ${{ runner.temp }}/bazel-sync.diff
+          retention-days: 7

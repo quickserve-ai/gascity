@@ -77,6 +77,7 @@ go_test(
         "nudge_poke_hidden_test.go",
         "nudge_submit_confirm_test.go",
         "nudge_submit_key_sequence_test.go",
+        "nudge_survey_scrollback_test.go",
         "nudge_unbracketed_refusal_test.go",
         "secretenv_test.go",
         "server_probe_test.go",
