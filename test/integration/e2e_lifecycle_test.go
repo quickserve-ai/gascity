@@ -223,7 +223,7 @@ func TestE2E_Handoff_Remote(t *testing.T) {
 	cityDir := setupE2ECity(t, nil, city)
 
 	// Remote handoff.
-	out, err := gc(cityDir, "handoff", "--target", "target", "Context refresh", "Check status")
+	out, err := gc(cityDir, "handoff", "--target", "target", "--from", "human", "Context refresh", "Check status")
 	if err != nil {
 		t.Fatalf("gc handoff --target failed: %v\noutput: %s", err, out)
 	}

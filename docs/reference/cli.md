@@ -2027,7 +2027,7 @@ gc handoff [subject] [message] [flags]
 |------|------|---------|-------------|
 | `--auto` | bool |  | Send handoff mail without requesting restart (for PreCompact hooks) |
 | `--force` | bool |  | destroy a target even when it has live background subagents |
-| `--from` | string |  | sender identity for --target (default: as gc mail send; --from human sends as the operator) |
+| `--from` | string |  | sender identity for --target (default: as gc mail send; refused when none; --from human sends as the operator) |
 | `--hook-format` | string |  | format hook output for a provider |
 | `--json` | bool |  | emit JSON summary |
 | `--target` | string |  | Remote session alias or ID to handoff (kills only controller-restartable sessions) |
@@ -2637,8 +2637,8 @@ Use --notify to request a recipient turn after replying. In a managed city,
 it can request a wake for a non-running recipient.
 Unread mail alone does not request a wake.
 Use -s/--subject for the reply subject and -m/--message for the reply body.
---from overrides the sender, resolved as for gc mail send (--from human
-replies as the operator).
+The sender defaults as for gc mail send; with no identity the reply is
+refused, and --from overrides it (--from human replies as the operator).
 
 With --context/--city-url the reply is sent inside a REMOTE city (the reply
 is addressed by that city to the original sender); the sender is
@@ -2650,7 +2650,7 @@ gc mail reply <id> [-s subject] [-m body] [flags]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--from` | string |  | sender identity (default: as gc mail send) |
+| `--from` | string |  | sender identity (default: as gc mail send; refused when none) |
 | `--json` | bool |  | emit JSONL result |
 | `-m`, `--message` | string |  | reply body text |
 | `--notify` | bool |  | request a recipient turn (including a managed wake if not running), even with earlier unread mail |
@@ -2661,7 +2661,9 @@ gc mail reply <id> [-s subject] [-m body] [flags]
 Send a message to a session alias or human.
 
 Creates a message bead addressed to the recipient. The sender defaults
-to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". Use --notify to request
+to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or, in an order run,
+order:&lt;scope&gt;/&lt;name&gt;. With none of those and no --from the send is refused;
+--from human sends as the operator. Use --notify to request
 a recipient turn after sending. In a managed city, it can request a wake for
 a non-running recipient. Unread mail alone does not request a wake.
 Use --from to override the sender identity.
@@ -2723,7 +2725,7 @@ gc mail send worker -s "disk warning" --dedup "disk-warn:hq"
 |------|------|---------|-------------|
 | `--all` | bool |  | broadcast to every open session (excludes sender and human); names configured seats it could not reach |
 | `--dedup` | string |  | suppress the send while a live message with this dedup key is in the same mailbox (provider permitting) |
-| `--from` | string |  | sender identity (default: $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human") |
+| `--from` | string |  | sender identity (default: $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or the order run; refused when none) |
 | `--json` | bool |  | emit JSONL result |
 | `-m`, `--message` | string |  | message body text |
 | `--no-notify` | bool |  | suppress the default recipient nudge for a direct local send |

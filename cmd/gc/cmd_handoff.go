@@ -100,7 +100,7 @@ or ID. Subject is required unless --auto is set.`,
 	cmd.Flags().StringVar(&hookFormat, "hook-format", "", "format hook output for a provider")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit JSON summary")
 	cmd.Flags().BoolVar(&force, "force", false, "destroy a target even when it has live background subagents")
-	cmd.Flags().StringVar(&from, "from", "", "sender identity for --target (default: as gc mail send; --from human sends as the operator)")
+	cmd.Flags().StringVar(&from, "from", "", "sender identity for --target (default: as gc mail send; refused when none; --from human sends as the operator)")
 	return cmd
 }
 
