@@ -964,6 +964,7 @@ func TestNudgeSessionFirstEnterAcceptsItsOwnDraft(t *testing.T) {
 		{name: "a paste placeholder", afterType: composerFixture("❯ [Pasted text #1 +3 lines]"), attached: true},
 		{name: "a partially rendered paste", afterType: composerFixture("❯ <system-remi"), attached: true},
 		{name: "on top of an earlier gc draft", afterType: composerFixture("❯ <system-reminder> older reminder </system-reminder>" + guardTestNudge), attached: true},
+		{name: "an earlier gc draft, the nudge not yet rendered", afterType: composerFixture("❯ <system-reminder> older reminder </system-reminder>"), attached: true},
 		{name: "an empty composer, as today", afterType: "", attached: true},
 		{name: "foreign text on a DETACHED pane, as today", afterType: composerFixture("❯ actually, stop and rebase first"), attached: false},
 	}

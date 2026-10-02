@@ -347,9 +347,11 @@ func composerHoldsSent(lines []string, promptPrefix, sent string) bool {
 // the message's opening, also when an earlier gc draft sits in front of it;
 // a prefix of the message (the paste still rendering); and a long run of the
 // message (a tall draft scrolled so only its tail shows). A short fragment
-// is not accepted as a mid-message match: "ok" occurs in most reminders.
+// is not accepted as a mid-message match: "ok" occurs in most reminders. An
+// earlier gc draft (isGCNudgeDraft) is accepted too, matching the
+// before_type guard: the new nudge may not have rendered behind it yet.
 func composerDraftIsOurs(draft, sent string) bool {
-	if strings.Contains(draft, claudePastePlaceholderPrefix) {
+	if strings.Contains(draft, claudePastePlaceholderPrefix) || isGCNudgeDraft(draft) {
 		return true
 	}
 	d, m := squashSpace(draft), squashSpace(sent)
