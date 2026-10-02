@@ -23,7 +23,7 @@ stdout 'Closed bead: gc-1'
 
 # --- Send mail → should emit mail.sent ---
 
-exec gc mail send mayor 'hey there'
+exec gc mail send --from human mayor 'hey there'
 stdout 'Sent message bl-2 to mayor'
 
 # --- Read mail → should emit mail.read ---

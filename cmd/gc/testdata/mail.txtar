@@ -16,7 +16,7 @@ cd $WORK/bright-lights
 ! exec gc mail check mayor
 
 # Human sends a durable message to the configured agent.
-exec gc mail send mayor 'hey, are you still there?'
+exec gc mail send --from human mayor 'hey, are you still there?'
 stdout 'Sent message bl-1 to mayor'
 
 exec gc mail check mayor
