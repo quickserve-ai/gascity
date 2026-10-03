@@ -146,3 +146,102 @@ func TestDemandRootVerdictsAreKeyedByStore(t *testing.T) {
 		t.Fatalf("open-root store: demand = %d, want 27 — it read the other store's closed verdict", count)
 	}
 }
+
+// demandOpenMolecules stores n open roots, each with one routed open step.
+func demandOpenMolecules(n int) []beads.Bead {
+	var rows []beads.Bead
+	for i := 0; i < n; i++ {
+		rootID := fmt.Sprintf("qc-live%02d", i)
+		rows = append(rows, closedRootWorkflowRoot(rootID, "open"), beads.Bead{
+			ID: rootID + ".1", Title: "step", Status: "open", Type: "task",
+			Metadata: map[string]string{"gc.routed_to": demandClosedRootTemplate, "gc.root_bead_id": rootID},
+		})
+	}
+	return rows
+}
+
+// Refreshes of more than twice the budget of open roots, expiring every pass,
+// never starve a closed root that sorts behind them: it is resolved within
+// two passes and stays resolved.
+func TestDemandOpenRootRefreshesDoNotStarveAClosedRoot(t *testing.T) {
+	resetDemandRootMemos(t)
+	now := time.Now()
+	demandClosedRootClock = func() time.Time { return now }
+	store := &demandCountingStore{MemStore: beads.NewMemStoreFrom(0, demandOpenMolecules(20), nil)}
+	for pass := 0; pass < 3; pass++ { // warm up: every open root seen once
+		countDemandClosedRoot(t, store)
+	}
+	root, err := store.Create(beads.Bead{Title: "dead root", Type: "task"})
+	if err != nil {
+		t.Fatalf("creating root: %v", err)
+	}
+	if err := store.Close(root.ID); err != nil {
+		t.Fatalf("closing root: %v", err)
+	}
+	if _, err := store.Create(beads.Bead{Title: "orphan", Type: "task", Metadata: map[string]string{
+		"gc.routed_to": demandClosedRootTemplate, "gc.root_bead_id": root.ID,
+	}}); err != nil {
+		t.Fatalf("creating orphan step: %v", err)
+	}
+	for pass := 1; pass <= 4; pass++ {
+		now = now.Add(demandOpenRootTTL) // every open verdict has expired
+		count, _ := countDemandClosedRoot(t, store)
+		if pass >= 2 && count != 20 {
+			t.Fatalf("pass %d: demand = %d, want 20 — the closed root's step is still counted", pass, count)
+		}
+	}
+}
+
+// A pass that leaves roots unresolved says so once per log interval, not
+// every pass.
+func TestDemandUnresolvedRootsAreLoggedOncePerInterval(t *testing.T) {
+	resetDemandRootMemos(t)
+	now := time.Now()
+	demandClosedRootClock = func() time.Time { return now }
+	demandRootResolveBudget = 1
+	var rows []beads.Bead
+	for i := 0; i < 10; i++ {
+		rootID := fmt.Sprintf("qc-dead%02d", i)
+		rows = append(rows, closedRootWorkflowRoot(rootID, "closed"), beads.Bead{
+			ID: rootID + ".1", Title: "step", Status: "open", Type: "task",
+			Metadata: map[string]string{"gc.routed_to": demandClosedRootTemplate, "gc.root_bead_id": rootID},
+		})
+	}
+	store := beads.NewMemStoreFrom(0, rows, nil)
+	lines := func() int {
+		_, _, _, errs := defaultScaleCheckCountsAndDemand(nil, []defaultScaleCheckTarget{{
+			template: demandClosedRootTemplate, storeKey: "rig:q", store: store,
+		}})
+		n := 0
+		for _, err := range errs {
+			if errors.Is(err, errDemandRootsUnresolved) {
+				n++
+			}
+		}
+		return n
+	}
+	for pass, want := range []int{1, 0, 0} {
+		if got := lines(); got != want {
+			t.Fatalf("pass %d: unresolved lines = %d, want %d", pass+1, got, want)
+		}
+	}
+	now = now.Add(demandRootUnresolvedLogEvery)
+	if got := lines(); got != 1 {
+		t.Fatalf("after the log interval: unresolved lines = %d, want 1", got)
+	}
+}
+
+// Past the sweep threshold, remembering a verdict drops the expired ones.
+func TestDemandRootMemoSweepRemovesExpiredEntries(t *testing.T) {
+	resetDemandRootMemos(t)
+	now := time.Now()
+	demandClosedRootClock = func() time.Time { return now }
+	demandRootMemoSweepAt = 2
+	demandRootRemember("a", "open", nil, time.Minute)
+	demandRootRemember("b", "closed", nil, time.Hour)
+	now = now.Add(2 * time.Minute)
+	demandRootRemember("c", "open", nil, time.Minute)
+	if _, kept := demandRootMemos.m["a"]; kept || len(demandRootMemos.m) != 2 {
+		t.Fatalf("memo keys after sweep = %v, want b and c only", demandRootMemos.m)
+	}
+}
