@@ -70,6 +70,31 @@ func ListClaudeSessionHistory(searchPaths, archiveRoots []string, workDir string
 	return sessionlog.ListClaudeSessionHistory(searchPaths, archiveRoots, workDir)
 }
 
+// FindClaudeTranscriptsByID returns every live copy of the claude-family
+// transcript for sessionID under any project folder of searchPaths, or the
+// archived copies when no live one exists, newest first.
+func FindClaudeTranscriptsByID(searchPaths, archiveRoots []string, sessionID string) []SessionHistoryEntry {
+	return sessionlog.FindClaudeTranscriptsByID(searchPaths, archiveRoots, sessionID)
+}
+
+// ClaudeProjectSlugCandidates returns the project slug directory names a
+// claude process whose cwd is workDir may have used.
+func ClaudeProjectSlugCandidates(workDir string) []string {
+	return sessionlog.ClaudeProjectSlugCandidates(workDir)
+}
+
+// ReadClaudeTranscriptAgentName returns the transcript's first recorded
+// agent name, or "".
+func ReadClaudeTranscriptAgentName(path string) string {
+	return sessionlog.ReadClaudeTranscriptAgentName(path)
+}
+
+// ClaudeTranscriptCwdForSlug returns a cwd the transcript records whose
+// project slug is slug, or "".
+func ClaudeTranscriptCwdForSlug(path, slug string) string {
+	return sessionlog.ClaudeTranscriptCwdForSlug(path, slug)
+}
+
 // ReadClaudeTranscriptSummary scans a transcript for its title, agent name,
 // first user message, and first timestamp.
 func ReadClaudeTranscriptSummary(path string) TranscriptSummary {
