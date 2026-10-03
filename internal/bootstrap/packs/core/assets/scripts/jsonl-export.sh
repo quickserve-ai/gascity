@@ -61,6 +61,12 @@ jsonl_uint_knob() {
     printf '%s\n' "$default"
 }
 
+# Print the epoch $1 as a UTC time (jq is already required, and BSD and GNU
+# date disagree on how to format a given epoch).
+utc_time() {
+    jq -rn --argjson t "$1" '$t | todate'
+}
+
 # Print the bytes in the git size $1 (a whole number with no leading zero and
 # an optional k, m or g, as git reads it), or fail when it is not one. Nine
 # digits keep the product inside bash's 64-bit arithmetic.
@@ -110,7 +116,9 @@ SPIKE_THRESHOLD="${GC_JSONL_SPIKE_THRESHOLD:-20}"  # percentage (0-100)
 # data while suppressing stand-up flares. Set to 0 to disable.
 MIN_PREV_FOR_SPIKE_CHECK="${GC_JSONL_MIN_PREV_FOR_SPIKE:-100}"
 MAX_PUSH_FAILURES="${GC_JSONL_MAX_PUSH_FAILURES:-3}"
-MAX_REPACK_FAILURES="${GC_JSONL_MAX_REPACK_FAILURES:-3}"
+# Repack failures in a row before the repack escalates and backs off
+# (begin_archive_repack); at least 1.
+MAX_REPACK_FAILURES="$(jsonl_uint_knob GC_JSONL_MAX_REPACK_FAILURES 3 1 1000)"
 # Each knob below has a maximum far past any useful setting and inside what
 # git and bash arithmetic take; a value above it warns and falls back.
 # A million loose objects is far past git's own 6700-object trigger.
@@ -137,8 +145,11 @@ REPACK_LOOSE_KIB_CEILING="$(jsonl_uint_knob GC_JSONL_REPACK_LOOSE_KIB_CEILING 52
 ARCHIVE_BIG_FILE_THRESHOLD="$(jsonl_git_size_knob GC_JSONL_BIG_FILE_THRESHOLD 4g 512m 64g)"
 # The delta search's window, which sets its memory. Objects reach the window
 # sorted by path and then size, so a store's consecutive snapshots are
-# neighbours. pack.window=2 keeps up to two predecessors to try each object
-# against (pack-objects hands find_deltas window+1 slots,
+# neighbours. The sort key is a hash of the path that weighs its last
+# characters most, so stores whose paths end alike (issues.jsonl under names
+# that share their last characters) can interleave, and at a window of two a
+# snapshot can miss its own store's delta. pack.window=2 tries each object
+# against the two before it (pack-objects hands find_deltas window+1 slots,
 # builtin/pack-objects.c:3355, git 2.50.1) instead of git's ten.
 # pack.windowMemory is per thread, and git never stores a blob whole for
 # lack of it: find_deltas evicts candidates only `while (mem_usage >
@@ -169,10 +180,11 @@ REPACK_PACK_LIMIT="$(jsonl_uint_knob GC_JSONL_REPACK_PACK_LIMIT 10 0 10000)"
 JSONL_ORDER_TIMEOUT_SECONDS=1800
 # The explicit repack in repack_archive_objects prunes unreachable loose
 # objects older than this many minutes (the reasoning is at the prune). The
-# minimum, 35, is above the order's 30-minute timeout: an object younger
-# than the grace may belong to a run still alive, and only the timeout
-# bounds how long one lives. Maximum one week.
-ARCHIVE_PRUNE_GRACE_MINUTES="$(jsonl_uint_knob GC_JSONL_PRUNE_GRACE_MINUTES 60 35 10080)"
+# minimum is the order's timeout plus five minutes: an object younger than
+# the grace may belong to a run still alive, and only the timeout bounds how
+# long one lives. Maximum one week.
+ARCHIVE_PRUNE_GRACE_MIN_MINUTES=$((JSONL_ORDER_TIMEOUT_SECONDS / 60 + 5))
+ARCHIVE_PRUNE_GRACE_MINUTES="$(jsonl_uint_knob GC_JSONL_PRUNE_GRACE_MINUTES 60 "$ARCHIVE_PRUNE_GRACE_MIN_MINUTES" 10080)"
 # Every archive git call that writes or packs objects carries these: add,
 # commit, gc, repack, prune, fetch, rebase and push. gc --auto adds its
 # trigger settings in repack_archive_objects. None of them reaches the
@@ -180,7 +192,10 @@ ARCHIVE_PRUNE_GRACE_MINUTES="$(jsonl_uint_knob GC_JSONL_PRUNE_GRACE_MINUTES 60 3
 # origin git clears GIT_CONFIG_PARAMETERS with the rest of local_repo_env
 # (connect.c). A remote that repacks with delta reuse keeps the deltas it
 # received; core.bigFileThreshold in the remote's own config matters only
-# for the delta searches it runs itself.
+# for the delta searches it runs itself. A local bare origin's receive-pack
+# also runs that repository's own auto-maintenance, with git's defaults
+# (a window of ten, unbounded window memory, a thread per CPU), unless its
+# own config says otherwise.
 #
 # An archive that already holds whole copies in ONE pack keeps them: git never
 # retries two whole objects of the same pack as a delta pair without
@@ -209,8 +224,10 @@ ARCHIVE_NO_AUTO_GC=(
 )
 # An escalation suppresses repeats for this long, then re-alerts. Bounding the
 # silence by TIME, not by a marker, means a stale marker (a clear that failed
-# to persist) can never mute a later streak for more than this window.
-REPACK_REESCALATE_SECONDS="${GC_JSONL_REPACK_REESCALATE_SECONDS:-86400}"
+# to persist) can never mute a later streak for more than this window. It is
+# also the repack's backoff at the failure threshold (begin_archive_repack).
+# 60 seconds to 30 days.
+REPACK_REESCALATE_SECONDS="$(jsonl_uint_knob GC_JSONL_REPACK_REESCALATE_SECONDS 86400 60 2592000)"
 PUSH_RETRY_DELAY_MIN="${GC_JSONL_PUSH_RETRY_DELAY_MIN:-1}"
 PUSH_RETRY_DELAY_SPAN="${GC_JSONL_PUSH_RETRY_DELAY_SPAN:-4}"
 SCRUB="${GC_JSONL_SCRUB:-true}"
@@ -248,7 +265,7 @@ resolve_escalate_script() {
 ESCALATE_SCRIPT="$(resolve_escalate_script)"
 
 maintenance_done() {
-    local summary="$1${BIG_EXPORT_WARNINGS:+, warning: $BIG_EXPORT_WARNINGS}"
+    local summary="$1${REPACK_BACKOFF_NOTE:+, $REPACK_BACKOFF_NOTE}${BIG_EXPORT_WARNINGS:+, warning: $BIG_EXPORT_WARNINGS}"
     local target="${GC_MAINTENANCE_DONE_TARGET:-}"
 
     [ -n "$target" ] || return 0
@@ -926,10 +943,9 @@ reconcile_repack_marker() {
     if [ -n "$started" ] && [ "$started" -le "$now" ] && [ "$((now - started))" -lt "$JSONL_ORDER_TIMEOUT_SECONDS" ]; then
         return 0
     fi
-    record_archive_repack_failure "step=repack exit=killed repack_in_flight id=${id:-unknown} run_started_at=${started:-unknown}: that run passed the order's ${JSONL_ORDER_TIMEOUT_SECONDS}s timeout with its repack unfinished, so it died mid-repack"
-    if ! write_state_json "$(read_state_json | jq -c --argjson m "$marker" 'if .repack_in_flight == $m then del(.repack_in_flight) else . end')"; then
-        echo "jsonl-export: could not clear the dead run's repack marker; the next run counts it again" >&2
-    fi
+    # The count and the marker's removal are one state write: both land or
+    # neither does, so the dead run is never counted twice.
+    record_archive_repack_failure "step=repack exit=killed repack_in_flight id=${id:-unknown} run_started_at=${started:-unknown}: that run passed the order's ${JSONL_ORDER_TIMEOUT_SECONDS}s timeout with its repack unfinished, so it died mid-repack" "$marker"
 }
 
 # Succeed when this run should repack, after writing its marker.
@@ -954,7 +970,9 @@ begin_archive_repack() {
     case "$last_attempt" in ''|*[!0-9]*) last_attempt="" ;; esac
     if [ "$consecutive" -ge "$MAX_REPACK_FAILURES" ] && [ -n "$last_attempt" ] \
         && [ "$last_attempt" -le "$now" ] && [ "$((now - last_attempt))" -lt "$REPACK_REESCALATE_SECONDS" ]; then
-        echo "jsonl-export: archive repack skipped: $consecutive consecutive failures (threshold $MAX_REPACK_FAILURES) and the last attempt was $((now - last_attempt))s ago; the next comes once ${REPACK_REESCALATE_SECONDS}s have passed. The snapshot commits and pushes as usual" >&2
+        # An exit-0 run keeps no output, so the skip goes in the summary too.
+        REPACK_BACKOFF_NOTE="repack skipped (backoff until $(utc_time "$((last_attempt + REPACK_REESCALATE_SECONDS))"))"
+        echo "jsonl-export: archive repack skipped: $consecutive consecutive failures (threshold $MAX_REPACK_FAILURES) and the last attempt was $((now - last_attempt))s ago; $REPACK_BACKOFF_NOTE. The snapshot commits and pushes as usual" >&2
         return 1
     fi
     if ! write_state_json "$(read_state_json | jq -c --argjson started "$RUN_STARTED_AT" --arg id "$REPACK_ATTEMPT_ID" --argjson now "$now" \
@@ -1022,6 +1040,7 @@ repack_archive_objects() {
     local prune_err
     local pruned=0
     local unreachable
+    local past_grace
     local summary
     # Read the loose objects' count and KiB on disk; either is empty when
     # count-objects did not report it.
@@ -1043,16 +1062,15 @@ repack_archive_objects() {
     loose_over_a_ceiling() {
         [ -n "$loose" ] && [ -n "$loose_kib" ] && ! loose_within_ceilings
     }
-    # Print how many loose objects git prune would remove with no grace at
-    # all: the unreachable ones, one "<id> <type>" line each in its dry run.
-    # Asked right after the prune, every one of them is younger than the
-    # grace. Reachability, not age, is what marks them as garbage: a repack
-    # that exits 0 but packs nothing leaves reachable loose objects that are
-    # just as young.
+    # Print how many unreachable loose objects older than $1 (a git
+    # --expire time) git prune would remove: one "<id> <type>" line each in
+    # its dry run. Reachability, not age, is what marks an object as
+    # garbage: a repack that exits 0 but packs nothing leaves reachable
+    # loose objects just as young.
     count_unreachable_loose_objects() {
         local listing
-        listing=$(git prune --dry-run --expire=now 2>/dev/null) || return 1
-        printf '%s\n' "$listing" | grep -cE '^[0-9a-f]{40}([0-9a-f]{24})? '
+        listing=$(git prune --dry-run --expire="$1" 2>/dev/null) || return 1
+        printf '%s\n' "$listing" | { grep -cE '^[0-9a-f]{40}([0-9a-f]{24})? ' || true; }
     }
     read_loose_count
     if loose_over_a_ceiling; then
@@ -1069,6 +1087,9 @@ repack_archive_objects() {
     # (--keep-largest-pack), so the whole copies inside it stay unrepaired.
     # The remedy is the one-time repair by hand above ARCHIVE_PACK_CONFIG;
     # for such an archive it is a precondition of deploying these settings.
+    # A consolidation the timeout kills leaves its tmp_pack_* files in
+    # objects/pack; the explicit prune below removes them once older than
+    # the grace when it runs, and otherwise only gc's own two-week prune does.
     repack_err=$(git "${ARCHIVE_PACK_CONFIG[@]}" -c gc.auto=256 -c gc.autoDetach=false -c "gc.autoPackLimit=$REPACK_PACK_LIMIT" gc --auto --quiet 2>&1 >/dev/null) || repack_rc=$?
     read_loose_count
     if [ "$repack_rc" -eq 0 ] && loose_over_a_ceiling; then
@@ -1134,13 +1155,16 @@ repack_archive_objects() {
         return 0
     fi
     # Still over a ceiling after a repack and a prune that both succeeded:
-    # when every loose object left is unreachable, it is garbage the grace
-    # still protects (a discarded blob can now sit up to the grace and hold
-    # the KiB ceiling over), waiting its turn rather than a failed repack, so
-    # log it and record no failure. Anything reachable left loose is a
-    # repack that did not pack, and fails below.
+    # when every loose object left is unreachable AND younger than the grace,
+    # it is garbage the grace still protects (a discarded blob can now sit up
+    # to the grace and hold the KiB ceiling over), waiting its turn rather
+    # than a failed repack, so log it and record no failure. Anything
+    # reachable left loose is a repack that did not pack, and anything
+    # unreachable older than the grace is a prune that did not remove it
+    # (prune exits 0 when an unlink fails); both fail below.
     if [ "$repack_rc" -eq 0 ] && [ "$pruned" -eq 1 ] && [ -n "$loose" ] \
-        && unreachable=$(count_unreachable_loose_objects) && [ "$unreachable" -eq "$loose" ]; then
+        && unreachable=$(count_unreachable_loose_objects now) && [ "$unreachable" -eq "$loose" ] \
+        && past_grace=$(count_unreachable_loose_objects "$ARCHIVE_PRUNE_GRACE_MINUTES.minutes.ago") && [ "$past_grace" -eq 0 ]; then
         echo "jsonl-export: $loose loose objects ($loose_kib KiB) remain over a ceiling, all unreachable and younger than the ${ARCHIVE_PRUNE_GRACE_MINUTES}-minute prune grace; a later run prunes them" >&2
         record_archive_repack_success
         return 0
@@ -1212,12 +1236,18 @@ record_archive_repack_success() {
 # reaches MAX_REPACK_FAILURES. gc --auto is a no-op below the loose-object
 # threshold, so a failure only happens when a repack was actually due, and
 # every later commit retries it: a streak means the archive is growing.
+# $2, when given, is a dead run's repack marker (its JSON): it is removed in
+# the same state write that counts the failure, so a crash or a failed
+# write can never leave it behind to be counted again.
 record_archive_repack_failure() {
     local stderr_context="$1"
+    local dead_marker="${2:-null}"
     local consecutive
     local already_escalated
     local stderr_display
     local body
+    local backoff_note=""
+    local last_attempt
 
     echo "jsonl-export: archive repack failed (non-fatal; loose objects keep accumulating until it succeeds)" >&2
     consecutive=$(read_state_json | jq -r '.consecutive_repack_failures // 0' || echo "0")
@@ -1233,8 +1263,10 @@ record_archive_repack_failure() {
             | jq -c \
                 --argjson count "$consecutive" \
                 --arg stderr "$(truncate_push_stderr_for_state "$stderr_context")" \
+                --argjson dead "$dead_marker" \
                 '.consecutive_repack_failures = $count
-                 | if $stderr == "" then del(.last_repack_stderr) else .last_repack_stderr = $stderr end'
+                 | if $stderr == "" then del(.last_repack_stderr) else .last_repack_stderr = $stderr end
+                 | if $dead != null and .repack_in_flight == $dead then del(.repack_in_flight) else . end'
     )"; then
         state_persisted=0
         echo "jsonl-export: could not persist the repack failure streak; escalating now" >&2
@@ -1251,6 +1283,13 @@ record_archive_repack_failure() {
     if [ -z "$stderr_display" ]; then
         stderr_display="(no stderr captured)"
     fi
+    if [ "$consecutive" -ge "$MAX_REPACK_FAILURES" ]; then
+        last_attempt=$(read_state_json | jq -r '.last_repack_attempt_at | numbers' 2>/dev/null) || last_attempt=""
+        case "$last_attempt" in ''|*[!0-9]*) last_attempt=$(date +%s) ;; esac
+        backoff_note="
+The repack is backing off until $(utc_time "$((last_attempt + REPACK_REESCALATE_SECONDS))") (GC_JSONL_REPACK_REESCALATE_SECONDS after
+the last attempt): until then no run repacks, and loose objects accumulate."
+    fi
     body=$(cat <<ESCALATION
 Order: jsonl-export
 Archive: $ARCHIVE_REPO
@@ -1260,12 +1299,12 @@ Last git gc stderr:
 $stderr_display
 
 Every snapshot commit adds full-size loose blobs; until a repack succeeds the
-archive grows by tens of MiB per commit.
+archive grows by tens of MiB per commit.$backoff_note
 
 Remediation:
 - Check free disk and the loose-object count: git -C $ARCHIVE_REPO count-objects -vH
 - Run the repack by hand to see the full error, with the settings that keep large exports delta-compressed: git -C $ARCHIVE_REPO ${ARCHIVE_PACK_CONFIG[*]} gc
-- Temporarily suppress: export GC_JSONL_MAX_REPACK_FAILURES=99
+- Fix the cause; the next attempt follows the backoff. An archive holding whole copies in one pack needs the one-time repair by hand described in jsonl-export.sh (repack -a -d -l -f). Raising GC_JSONL_MAX_REPACK_FAILURES only lifts the backoff, so a repack that keeps failing or being killed runs again after every commit.
 ESCALATION
 )
     # A failed delivery must be distinguishable from the repack failure it
@@ -1415,6 +1454,8 @@ HALT_CURRENT_COUNT=0
 HALT_DELTA=0
 # Exports above the big-file threshold, named in the run's summary.
 BIG_EXPORT_WARNINGS=""
+# Set when the repack backs off this run (begin_archive_repack).
+REPACK_BACKOFF_NOTE=""
 SCOPE_SCRUB_WHERE=""
 if [ "$SCRUB" = "true" ]; then
     SCOPE_SCRUB_WHERE="WHERE issue_type NOT IN ('message', 'event', 'wisp', 'agent') AND title NOT LIKE 'gc:%' AND title NOT LIKE 'order:%' AND NOT (issue_type = 'convoy' AND title LIKE 'sling-%')"
