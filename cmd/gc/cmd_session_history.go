@@ -771,7 +771,7 @@ var historyRigStoreOpener = oneShotRigStoreOpener
 
 // historyTaskLookupTimeout bounds history's whole task-dir discovery: a store
 // that has not answered by then is skipped and named on stderr. The lookups
-// are abandoned, not cancelled: neither a rig open nor a List takes a context,
+// are abandoned, not canceled: neither a rig open nor a List takes a context,
 // so a stalled one runs on until the command exits.
 var historyTaskLookupTimeout = 10 * time.Second
 
