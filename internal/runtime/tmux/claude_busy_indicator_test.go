@@ -82,6 +82,17 @@ func TestPaneContainsBusyIndicatorClaudeHookAndBackgroundShapes(t *testing.T) {
 		"done_brewed_for":        {[]string{"✻ Brewed for 48s · done 11:19 PM · 1 shell still running", rule, "❯\u00a0", rule}, false},
 		"bare_head_in_scrollback": {append(append([]string{"✢ Deliberating…"},
 			strings.Split(strings.Repeat("  later output\n", 30), "\n")...), rule, "❯\u00a0", rule), false},
+		// Column-0 status or prose lines ending in an ellipsis are not
+		// spinners: only Claude's spinner glyphs count.
+		"check_mark_status":     {[]string{"✓ Done…", rule, "❯\u00a0", rule}, false},
+		"dash_status":           {[]string{"- Ready…", rule, "❯\u00a0", rule}, false},
+		"bullet_note":           {[]string{"• Note…", rule, "❯\u00a0", rule}, false},
+		"arrow_status_timer":    {[]string{"→ Next… (22s)", rule, "❯\u00a0", rule}, false},
+		"wrapped_prose_column0": {[]string{"— still checking the logs…", rule, "❯\u00a0", rule}, false},
+		"letter_prose_column0":  {[]string{"I kept waiting…", rule, "❯\u00a0", rule}, false},
+		// Every glyph seen on live panes ("·", "✢", "✳", "✶", "✻", "✽").
+		"dot_glyph_bare":  {[]string{"· Deliberating…", rule, "❯\u00a0", rule}, true},
+		"star_glyph_hook": {[]string{"✳ Musing… (running Stop hook · 4s)", rule, "❯\u00a0", rule}, true},
 		// Later assistant output means the spinner above it is stale.
 		"spinner_then_assistant_output": {[]string{
 			"✶ Proofing… (running UserPromptSubmit hooks… 1/2 · 3s)", "⏺ Done.", rule, "❯\u00a0", rule,
