@@ -4252,6 +4252,20 @@ every conversation an agent ever had in its work directory is listed — includi
 conversations whose session beads were closed long ago, and transcripts moved
 into ~/.claude-transcript-archive/ by the transcript reaper (marked "archived").
 
+A session whose process ran outside its work directory (in the git worktree of
+a task it was assigned) has those conversations under that cwd's slug instead.
+The conversations recorded on its session bead (session_key,
+prior_session_key) are found by id under any projects folder, and the folders
+of its bead's work dirs and of its in-progress tasks' work_dirs are listed too.
+Tasks are looked up in the city bead store and in every rig's bead store, the
+stores the reconciler reads; a rig store that cannot be opened is named on
+stderr and skipped. Those folders can be shared with other agents, and so can
+a pool instance's own work dir or one under .gc/worktrees/, so from them only
+conversations whose id is on the bead are taken, plus, for a named or aliased
+session that is not a pool instance, conversations recorded under that name.
+The JSON row's found_under is the work dir of the projects folder the row was
+found under.
+
 The session id shown for each row is what "gc session resume" takes.
 
 ```
