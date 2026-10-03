@@ -103,12 +103,28 @@ func TestNudgeSessionSendsNoSurveyKeyForASurveyAboveLaterOutput(t *testing.T) {
 	}
 }
 
+// feedbackSurveyRuleComposerFixture is the session survey above the composer
+// current Claude Code draws between two horizontal rules (the
+// idleComposerFixture shape), not the rounded box of the older captures. It is
+// ASSEMBLED, not captured: no live pane showed a survey on 2026-10-02. The
+// survey block's layout -- a "●" header row directly above a two-space
+// indented option row, cells 10 wide, no gap -- is read from the survey
+// component in the Claude Code 2.1.288 bundle (ga-da5vmz).
+const feedbackSurveyRuleComposerFixture = `⏺ Done — pushed the branch and replied on the PR.
+
+● How is Claude doing this session? (optional)
+  1: Bad    2: Fine   3: Good   0: Dismiss
+
+` + rule + "\n❯\n" + rule + "\n  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle)"
+
 // Control: a survey that IS the live block above the composer is still
-// dismissed with exactly "0" then Enter, for both survey variants.
+// dismissed with exactly "0" then Enter, for both survey variants and both
+// composer styles.
 func TestFeedbackSurveyDismisserDismissesALiveSurvey(t *testing.T) {
 	for name, pane := range map[string]string{
 		"session feedback variant":    feedbackSurveySessionFixture,
 		"memory recollection variant": feedbackSurveyMemoryFixture,
+		"horizontal-rule composer":    feedbackSurveyRuleComposerFixture,
 	} {
 		t.Run(name, func(t *testing.T) {
 			ex := &paneAfterFirstKeyExecutor{before: pane, after: surveyVisibleIdle, attached: "0"}
