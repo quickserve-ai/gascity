@@ -1500,7 +1500,10 @@ func makeRigDirs(t *testing.T, dir string, names ...string) map[string]string {
 func TestWorktreeDiskSizeCheck_UnfinishedWalkIsNamedLowerBoundInsideBudget(t *testing.T) {
 	dir := t.TempDir()
 	rigs := makeRigDirs(t, dir, "astro", "qcore")
-	const budget = 100 * time.Millisecond
+	// 2s, not 100ms: the fake measurer returns only after <-ctx.Done(), and the
+	// check abandons a measurer at budget+budget/8. A 12.5ms grace is missed under
+	// load and the run takes the abandoned path (pl-u998; precedent 8abad9c4).
+	const budget = 2 * time.Second
 	c := &WorktreeDiskSizeCheck{
 		cfg:    config.DoctorConfig{WorktreeRigWarnSize: "10GB", WorktreeRigErrorSize: "50GB"},
 		budget: budget,
@@ -1525,13 +1528,13 @@ func TestWorktreeDiskSizeCheck_UnfinishedWalkIsNamedLowerBoundInsideBudget(t *te
 	if r.TimedOut {
 		t.Fatalf("check was abandoned at doctor's per-check timeout: %s", r.Message)
 	}
-	if elapsed > time.Second {
+	if elapsed > budget+time.Second {
 		t.Errorf("check took %s, want it to stop soon after its %s budget", elapsed, budget)
 	}
 	if r.Status != StatusWarning {
 		t.Fatalf("status = %d, want Warning; msg=%s", r.Status, r.Message)
 	}
-	if !strings.Contains(r.Message, `"qcore" at least 3.0 GB logical (lower bound: the size walk did not finish within 100ms)`) {
+	if !strings.Contains(r.Message, fmt.Sprintf(`"qcore" at least 3.0 GB logical (lower bound: the size walk did not finish within %s)`, budget)) {
 		t.Errorf("message must name the unfinished rig with its labeled lower bound; got %q", r.Message)
 	}
 	if strings.Contains(r.Message, `"astro"`) || strings.Contains(r.Message, "253.0 MB") {

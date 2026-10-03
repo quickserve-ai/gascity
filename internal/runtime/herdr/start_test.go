@@ -163,14 +163,17 @@ func TestStartFailsWhenPreStartFails(t *testing.T) {
 	p := newFakeStartProvider(t, f)
 
 	cfg := runtime.Config{
-		WorkDir:  work,
-		PreStart: []string{"printf 'worktree add exploded' >&2; exit 7"},
+		WorkDir: work,
+		// The stderr marker must not equal or contain any env value: pre_start
+		// output is redacted against the environment (SetupCommandSecrets), and
+		// a value such as LINT_CHANGED_SCOPE=worktree would mask a plain word.
+		PreStart: []string{"printf 'prestart-boom-7f3a9c' >&2; exit 7"},
 	}
 	err := p.start(context.Background(), "gastown__worker", cfg)
 	if err == nil {
 		t.Fatal("expected error from failing pre_start")
 	}
-	for _, want := range []string{"running pre_start", "pre_start[0]", "exit status 7", "worktree add exploded"} {
+	for _, want := range []string{"running pre_start", "pre_start[0]", "exit status 7", "prestart-boom-7f3a9c"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error = %q, want it to contain %q", err, want)
 		}
