@@ -4259,8 +4259,10 @@ The conversations recorded on its session bead (session_key,
 prior_session_key) are found by id under any projects folder, and the folders
 of its bead's work dirs and of its in-progress tasks' work_dirs are listed too.
 Tasks are looked up in the city bead store and in every rig's bead store, the
-stores the reconciler reads; a rig store that cannot be opened is named on
-stderr and skipped. Those folders can be shared with other agents, and so can
+stores the reconciler reads, all under one 10 s budget; a store that fails or
+does not answer in time is named on stderr and skipped, and then a "no
+conversations found" says the search was incomplete and the JSON carries
+incomplete: true and skipped_lookups. Those folders can be shared with other agents, and so can
 a pool instance's own work dir or one under .gc/worktrees/, so from them only
 conversations whose id is on the bead are taken, plus, for a named or aliased
 session that is not a pool instance, conversations recorded under that name.
@@ -4536,7 +4538,8 @@ work dir instead and says on stderr what it found.
 
 Selecting a transcript that the reaper moved into the archive restores it
 (copies it) into the live projects directory first, so the provider can find
-it again; --print does that restore too.
+it again; --print does that restore too, and notes it on stderr so stdout
+stays the one command.
 
 session-id may be any unambiguous prefix of an id from "gc session history".
 Note: "gc session pin" (pin_awake) prevents the idle-close that loses context
