@@ -22,11 +22,46 @@ func TestPaneContainsBusyIndicatorClaudeHookAndBackgroundShapes(t *testing.T) {
 			"  user@host /tmp/work", "  [░░░░░░░░░░ 0%] Fable 5.1 [F:27%>Wed]",
 			"  -- INSERT -- ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents", "    ◉ xhigh · /effort", "    /rc",
 		}, true},
-		"single_hook_running": {[]string{"✻ Proofing… (running UserPromptSubmit hook… 4s)", "❯\u00a0"}, true},
+		// One hook: Claude prints no ellipsis after "hook" (Claude Code 2.1.288
+		// builds "running <event> hook" + "… n/m" only when more than one runs).
+		"single_hook_running": {[]string{"✻ Proofing… (running UserPromptSubmit hook · 3s)", rule, "❯\u00a0", rule}, true},
+		"single_post_tool_hook_mid_turn": {[]string{
+			"✢ Transmogrifying… (running PostToolUse hook · 3m 37s · ↓ 12.1k tokens)", rule, "❯\u00a0", rule,
+		}, true},
+		"stop_hooks_mid_turn": {[]string{"✳ Musing… (running Stop hooks… 2/3 · 2m 28s · ↓ 2.3k tokens)", rule, "❯\u00a0", rule}, true},
+		// 80-column panes wrap a long spinner onto a second row.
+		"wrapped_spinner_tail": {[]string{
+			"✢ Transmogrifying… (running PostToolUse hook · 3m 37s · ↓ 12.1k", "  tokens)", rule, "❯\u00a0", rule,
+		}, true},
+		"wrapped_spinner_status": {[]string{
+			"✢ Transmogrifying…", "  (running PostToolUse hook · 3m 37s · ↓ 12.1k tokens)", rule, "❯\u00a0", rule,
+		}, true},
 		"prompt_hooks_running_with_echo": {[]string{
 			"❯\u00a0probe one", "✽ Proofing… (running UserPromptSubmit hooks… 1/2 · 9s)", rule, "❯\u00a0", rule,
 			"  user@host /tmp/work", "  -- INSERT -- ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents", "    /rc",
 		}, true},
+		// The prompt echo is drawn before the new composer: the spinner below it
+		// is live.
+		"echo_spinner_no_composer": {[]string{
+			"❯\u00a0probe one", "✽ Proofing… (running UserPromptSubmit hooks… 1/2 · 1s)",
+			"  user@host /tmp/work", "  -- INSERT -- ⏵⏵ auto mode on · ← for agents",
+		}, true},
+		"spinner_hint_lines_composer": {[]string{
+			"✶ Proofing… (running UserPromptSubmit hooks… 1/2 · 3s)",
+			"  ⎿  Tip: one", "     two", "     three", "     four", "     five",
+			rule, "❯\u00a0", rule, "  user@host /tmp/work",
+		}, true},
+		// An idle seat's background-agent rows below the composer do not push
+		// a live spinner out of the window.
+		"spinner_above_many_background_agents": {append([]string{
+			"✶ Proofing… (running UserPromptSubmit hooks… 1/2 · 3s)", rule, "❯\u00a0", rule,
+			"  >>  seat * ga-xxxxxx · opus-5.5·high", "  5h █▉··· 37%", "  ⏵⏵ bypass permissions on · 2 shells · ← for agents",
+			"    /rc", "  ⏺ main"},
+			strings.Split(strings.TrimSuffix(strings.Repeat("  ◯ general-purpose  Task descripti…    29m 42s · ↓ 236.4k tokens\n", 8), "\n"), "\n")...), true},
+		// Later assistant output means the spinner above it is stale.
+		"spinner_then_assistant_output": {[]string{
+			"✶ Proofing… (running UserPromptSubmit hooks… 1/2 · 3s)", "⏺ Done.", rule, "❯\u00a0", rule,
+		}, false},
 		// The phrase anywhere but the live spinner line above the composer is
 		// history or quoted text, not a running hook.
 		"test_source_line": {[]string{

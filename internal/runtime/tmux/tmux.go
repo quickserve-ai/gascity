@@ -4834,45 +4834,74 @@ func codexTranscriptTailContainsTurnAborted(tail string) bool {
 // "(main)", "⏱️ Jun 4 02:57:04", or the "✻ Worked for 3m 38s" done marker.
 var claudeBusySpinnerRe = regexp.MustCompile(`\([0-9]+[ms][^)]*[·•]`)
 
-// claudeHookSpinnerRe matches Claude Code's live spinner line while a
-// submitted prompt's hooks run, before the turn's first model call: "✶
-// Proofing… (running UserPromptSubmit hooks… 1/2 · 3s)" (real capture,
-// ga-megheo). No elapsed timer follows "(", so claudeBusySpinnerRe misses it.
-// It is anchored at column 0 on a spinner glyph + verb + ellipsis, so prose
-// ("⏺ …"), an echoed prompt ("❯ …"), tool output ("  ⎿ …" and its indented
-// continuation) and quoted source never match, and claudeHookSpinnerLive only
-// looks at it just above the live composer, so the phrase in scrollback does
-// not either.
-var claudeHookSpinnerRe = regexp.MustCompile(`^[^\s\w⏺❯⎿│]\s\S+…\s\(running \S+ hooks?…`)
+// claudeHookSpinnerRe matches Claude Code's live spinner while hooks run: at
+// prompt submit, before the turn's first model call, "✶ Proofing… (running
+// UserPromptSubmit hooks… 1/2 · 3s)" (real capture, ga-megheo), and mid-turn,
+// "✢ Musing… (running PostToolUse hook · 3m 37s · ↓ 12.1k tokens)". Claude
+// Code 2.1.288 prints "… n/m" after "hooks" only when more than one hook runs,
+// so a single hook is followed by " ·" or ")". No elapsed timer follows "(",
+// so claudeBusySpinnerRe misses both. It is anchored at column 0 on a spinner
+// glyph + verb + ellipsis (claudeHookSpinnerHeadRe), so prose ("⏺ …"), an
+// echoed prompt ("❯ …"), tool output ("  ⎿ …" and its indented continuation)
+// and quoted source never match; claudeHookSpinnerLive keeps the phrase in
+// scrollback from matching and joins a spinner wrapped onto a second row.
+var (
+	claudeHookSpinnerHeadRe = regexp.MustCompile(`^[^\s\w⏺❯⎿│]\s\S+…`)
+	claudeHookSpinnerRe     = regexp.MustCompile(`^[^\s\w⏺❯⎿│]\s\S+…\s+\(running \S+ hooks?(…|\s·|\))`)
+)
 
-// claudeHookSpinnerAboveComposer bounds how far above the live composer the
-// hook spinner may sit (the spinner, a tip line, the composer's top rule).
-const claudeHookSpinnerAboveComposer = 4
+// claudeHookSpinnerWrapRows is how many following rows a spinner head is
+// joined with: an 80-column pane wraps a 76-78 character spinner with a token
+// count onto a second row.
+const claudeHookSpinnerWrapRows = 2
+
+// claudeHookSpinnerWindow is how many non-empty lines from the bottom of the
+// capture the live hook spinner may sit. Measured on real captures: a plain
+// seat draws 8 lines below it (composer rule, "❯", rule, two status rows, the
+// mode row, the effort hint, "/rc"), so it is the 9th; the live woodhouse seat
+// draws 7 below its status line (rule, "❯ draft", rule, two statusline rows,
+// the mode row, "/rc") plus the background-agent rows, which are not counted.
+// 12 leaves room for a tip row under the spinner and a few lines of composer
+// draft.
+const claudeHookSpinnerWindow = 12
 
 // claudeHookSpinnerLive reports whether Claude's hook spinner is the live
-// status line: within claudeHookSpinnerAboveComposer non-empty lines above the
-// LAST composer line ("❯"), or of the capture's end when no composer shows.
+// status line: an anchored match within the last claudeHookSpinnerWindow
+// non-empty lines of the capture, counted from the BOTTOM of the screen so an
+// echoed "❯ <prompt>" above the spinner, or a composer not yet redrawn, cannot
+// hide it. Indented background-agent rows ("  ⏺ main", "  ◯ general-purpose
+// …") are not counted. A column-0 "⏺" line is later assistant output: a
+// spinner above it is stale, so the scan stops there.
+//
 // A prompt whose hooks are running is already submitted, so busy is right for
 // every caller: submit confirmation, WaitForIdle, SnapshotIdle and the
 // queued-nudge transcript gate. An idle seat whose background agents tick
-// ("◯ general-purpose  … 1h 25m 34s · ↓ 228.0k tokens", below the composer)
-// stays idle.
+// ("◯ general-purpose  … 1h 25m 34s · ↓ 228.0k tokens") stays idle.
 func claudeHookSpinnerLive(lines []string) bool {
-	end := len(lines)
-	for i := len(lines) - 1; i >= 0; i-- {
-		if strings.HasPrefix(strings.TrimSpace(strings.ReplaceAll(lines[i], "\u00a0", " ")), "❯") {
-			end = i
-			break
-		}
-	}
 	seen := 0
-	for i := end - 1; i >= 0 && seen < claudeHookSpinnerAboveComposer; i-- {
+	for i := len(lines) - 1; i >= 0 && seen < claudeHookSpinnerWindow; i-- {
 		line := strings.TrimRight(lines[i], " \t")
-		if strings.TrimSpace(line) == "" {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case trimmed == "":
 			continue
+		case line != trimmed && (strings.HasPrefix(trimmed, "◯") || strings.HasPrefix(trimmed, "⏺")):
+			continue
+		case strings.HasPrefix(line, "⏺"):
+			return false
 		}
 		seen++
-		if claudeHookSpinnerRe.MatchString(line) {
+		if !claudeHookSpinnerHeadRe.MatchString(line) {
+			continue
+		}
+		joined := line
+		for k, rows := i+1, 0; k < len(lines) && rows < claudeHookSpinnerWrapRows; k++ {
+			if next := strings.TrimSpace(lines[k]); next != "" {
+				joined += " " + next
+				rows++
+			}
+		}
+		if claudeHookSpinnerRe.MatchString(joined) {
 			return true
 		}
 	}

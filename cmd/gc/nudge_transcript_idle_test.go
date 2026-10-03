@@ -693,3 +693,20 @@ func TestClaudePromptMarkerPathRejectsDotNames(t *testing.T) {
 		}
 	}
 }
+
+// The dispatcher's submit-time stamp never moves the marker back: a newer
+// marker the seat's own hook wrote meanwhile stays.
+func TestStampClaudePromptOnDeliveryKeepsNewerMarker(t *testing.T) {
+	city := t.TempDir()
+	target := nudgeTarget{cityPath: city, sessionID: "gc-1", providerAncestor: "claude"}
+	newer := tlPromptAfter.Add(10 * time.Second)
+	if err := recordClaudePromptSubmitted(city, "gc-1", newer); err != nil {
+		t.Fatal(err)
+	}
+	if err := stampClaudePromptOnDelivery(target, tlPromptAfter); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := readClaudePromptSubmitted(city, "gc-1"); !ok || !got.Equal(newer) {
+		t.Fatalf("marker = %v (ok=%v), want the newer %v kept", got, ok, newer)
+	}
+}
