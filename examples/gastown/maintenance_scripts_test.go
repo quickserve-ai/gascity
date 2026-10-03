@@ -9136,6 +9136,10 @@ func TestJsonlExportLiveRepackMarkerOfAnotherRunSkipsThisRunsRepack(t *testing.T
 	if !strings.Contains(string(gcData), "MAINTENANCE_DONE: jsonl — exported 1/1") {
 		t.Errorf("the snapshot must still be committed; gc log:\n%s", gcData)
 	}
+	// An exit-0 run keeps no output, so the skip is in the summary.
+	if !strings.Contains(string(gcData), "repack skipped (marker held by live-run)") {
+		t.Errorf("the summary must carry the marker-held skip; gc log:\n%s", gcData)
+	}
 }
 
 // A run that commits a snapshot and then dies mid-repack can be followed by
