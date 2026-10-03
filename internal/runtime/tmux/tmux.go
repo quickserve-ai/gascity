@@ -5231,10 +5231,16 @@ var claudeBusySpinnerRe = regexp.MustCompile(`\([0-9]+[ms][^)]*[·•]`)
 // no separator "✻ Hyperspacing… (22s)" (live shapes on 8 seats, up to ~33 s).
 // Idle chrome has no ellipsis after its verb ("✻ Worked for 3m 38s", "✻
 // Waiting for 2 background agents to finish", "✻ Brewed for 48s · done …").
+//
+// The leading glyph must be one of Claude's spinner frames, exactly the set
+// seen at column 0 on live panes (a 40 s sample over 22 seats: "·" 11, "✢" 11,
+// "✽" 11, "✻" 8, "✶" 6, "✳" 5) and in the ga-megheo hook captures ("✶", "✽").
+// Any other column-0 line ending in "…" ("✓ Done…", "- Ready…", "• Note…",
+// wrapped prose) is not a spinner.
 var (
-	claudeHookSpinnerHeadRe  = regexp.MustCompile(`^[^\s\w⏺❯⎿│]\s\S+…`)
-	claudeHookSpinnerRe      = regexp.MustCompile(`^[^\s\w⏺❯⎿│]\s\S+…\s+\(running \S+ hooks?(…|\s·|\))`)
-	claudeTurnStartSpinnerRe = regexp.MustCompile(`^[^\s\w⏺❯⎿│]\s\S+…($|\s+\(([0-9]+h )?([0-9]+m )?[0-9]+s\))`)
+	claudeHookSpinnerHeadRe  = regexp.MustCompile(`^[·✢✳✶✻✽]\s\S+…`)
+	claudeHookSpinnerRe      = regexp.MustCompile(`^[·✢✳✶✻✽]\s\S+…\s+\(running \S+ hooks?(…|\s·|\))`)
+	claudeTurnStartSpinnerRe = regexp.MustCompile(`^[·✢✳✶✻✽]\s\S+…($|\s+\(([0-9]+h )?([0-9]+m )?[0-9]+s\))`)
 )
 
 // claudeHookSpinnerWrapRows is how many following rows a spinner head is
