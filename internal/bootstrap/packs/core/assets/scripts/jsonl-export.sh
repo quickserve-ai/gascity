@@ -736,7 +736,7 @@ ESCALATION
     if git rev-parse --verify refs/remotes/origin/main >/dev/null 2>&1; then
         if ! git merge-base --is-ancestor refs/remotes/origin/main HEAD >/dev/null 2>&1; then
             if ! rebase_err=$(git "${ARCHIVE_PACK_CONFIG[@]}" rebase refs/remotes/origin/main 2>&1 >/dev/null); then
-                git rebase --abort >/dev/null 2>&1 || true
+                git "${ARCHIVE_PACK_CONFIG[@]}" rebase --abort >/dev/null 2>&1 || true
                 record_archive_push_failure \
                     "jsonl-export: rebase onto origin/main failed during archive push recovery" \
                     "$rebase_err"
@@ -774,7 +774,7 @@ ESCALATION
                 if git rev-parse --verify refs/remotes/origin/main >/dev/null 2>&1 \
                     && ! git merge-base --is-ancestor refs/remotes/origin/main HEAD >/dev/null 2>&1; then
                     if ! rebase_err=$(git "${ARCHIVE_PACK_CONFIG[@]}" rebase refs/remotes/origin/main 2>&1 >/dev/null); then
-                        git rebase --abort >/dev/null 2>&1 || true
+                        git "${ARCHIVE_PACK_CONFIG[@]}" rebase --abort >/dev/null 2>&1 || true
                         record_archive_push_failure \
                             "jsonl-export: rebase onto origin/main failed during retry $push_attempt" \
                             "$rebase_err"
