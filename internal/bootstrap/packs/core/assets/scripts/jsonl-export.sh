@@ -114,6 +114,10 @@ ARCHIVE_PACK_THREADS="$(jsonl_uint_knob GC_JSONL_PACK_THREADS 1 1)"
 # delta search a consolidation runs. git's default of 50 puts about 50 whole
 # copies of a 961 MB store into one search, which nears the order's timeout.
 REPACK_PACK_LIMIT="$(jsonl_uint_knob GC_JSONL_REPACK_PACK_LIMIT 10 0)"
+# The explicit repack in commit_archive_snapshot prunes unreachable loose
+# objects older than this many minutes; why so short a grace is safe there is
+# explained at the prune.
+ARCHIVE_PRUNE_GRACE_MINUTES="$(jsonl_uint_knob GC_JSONL_PRUNE_GRACE_MINUTES 10 1)"
 # Every archive git call that writes or packs objects carries these: add,
 # commit, gc, repack, fetch, rebase and push. commit, fetch and rebase run
 # git's own auto-maintenance, which inherits them through the environment;
@@ -828,7 +832,8 @@ commit_archive_snapshot() {
     # by count and by KiB on disk: above REPACK_LOOSE_CEILING (default twice
     # the gc.auto trigger) or REPACK_LOOSE_KIB_CEILING after a gc --auto that
     # exited 0, they are packed explicitly with the incremental repack gc
-    # --auto would have run, and only that result is judged, on both.
+    # --auto would have run, the unreachable ones past a short grace are
+    # pruned, and only that result is judged, on both.
     # Both callers run this function as the left operand of ||, where bash
     # ignores errexit for the whole body, so a failing command here cannot
     # end the export. Every failure below is still handled explicitly, so
@@ -845,6 +850,7 @@ commit_archive_snapshot() {
     local gc_holder
     local pre_auto_gc
     local fallback_err
+    local prune_err
     local summary
     # Read the loose objects' count and KiB on disk; either is empty when
     # count-objects did not report it.
@@ -903,6 +909,27 @@ commit_archive_snapshot() {
         # snapshot, and the loose objects would never be packed.
         repack_step="repack -d -l --no-write-bitmap-index"
         fallback_err=$(git "${ARCHIVE_PACK_CONFIG[@]}" repack -d -l -q --no-write-bitmap-index 2>&1 >/dev/null) || repack_rc=$?
+        # A repack packs only reachable objects. Unreachable loose ones (a
+        # snapshot blob discarded after a failed add or commit, or one left
+        # by a run killed mid-add) stay loose and count toward the KiB
+        # ceiling, so two or three such blobs of a large store would fail
+        # the post-condition on every run. Prune them with a grace far
+        # shorter than git's two weeks. That is safe here: the order runs one
+        # export at a time, the archive is private to this script, and this
+        # run's objects are already committed (reachable) when the repack
+        # runs, so an unreachable object older than the grace is garbage from
+        # an earlier run. Ten minutes is far longer than this script takes
+        # between writing an object and committing it, and shorter than the
+        # order's 15-minute cooldown, so an earlier run's garbage is normally
+        # past it by the next run; a blob still inside the grace waits one
+        # run, and one failing run does not escalate (MAX_REPACK_FAILURES).
+        # gc --auto is left alone: its own prune keeps git's two weeks.
+        if [ "$repack_rc" -eq 0 ]; then
+            repack_step="prune --expire=$ARCHIVE_PRUNE_GRACE_MINUTES.minutes.ago"
+            prune_err=$(git "${ARCHIVE_PACK_CONFIG[@]}" prune --expire="$ARCHIVE_PRUNE_GRACE_MINUTES.minutes.ago" 2>&1 >/dev/null) || repack_rc=$?
+            fallback_err="${fallback_err:+$fallback_err
+}$prune_err"
+        fi
         # Keep gc --auto's stderr too: its warnings (unreachable loose
         # objects, for one) explain why the fallback was needed.
         repack_err="${repack_err:+$repack_err
