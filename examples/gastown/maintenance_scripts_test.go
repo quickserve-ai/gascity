@@ -8780,8 +8780,18 @@ func writeUnreachableLooseBlob(t *testing.T, archiveRepo string, size, seed int,
 	return oid
 }
 
-func archiveHasObject(archiveRepo, oid string) bool {
-	return exec.Command("git", "-C", archiveRepo, "cat-file", "-e", oid).Run() == nil
+// archiveHasObject reports whether oid is in the archive, loose or packed.
+// It lists every object through runGitOut rather than adding a subprocess
+// site of its own (the resource census counts each one).
+func archiveHasObject(t *testing.T, archiveRepo, oid string) bool {
+	t.Helper()
+	all := runGitOut(t, archiveRepo, "cat-file", "--batch-all-objects", "--batch-check=%(objectname)")
+	for _, line := range strings.Split(all, "\n") {
+		if line == oid {
+			return true
+		}
+	}
+	return false
 }
 
 // Unreachable loose objects count toward the KiB ceiling, but no repack packs
@@ -8837,11 +8847,11 @@ func TestJsonlExportExplicitRepackPrunesUnreachableLooseObjectsPastTheGrace(t *t
 			runScript(t, coreScriptPath("jsonl-export.sh"), env)
 
 			for _, oid := range garbage {
-				if survived := archiveHasObject(archiveRepo, oid); survived == tt.pruned {
+				if survived := archiveHasObject(t, archiveRepo, oid); survived == tt.pruned {
 					t.Errorf("unreachable loose blob %s, %s old: survived=%v, want pruned=%v", oid, tt.age, survived, tt.pruned)
 				}
 			}
-			if recent != "" && !archiveHasObject(archiveRepo, recent) {
+			if recent != "" && !archiveHasObject(t, archiveRepo, recent) {
 				t.Errorf("unreachable loose blob %s, younger than the prune grace, was pruned", recent)
 			}
 			counts := readArchiveCountObjects(t, archiveRepo)
@@ -9085,7 +9095,7 @@ func TestJsonlExportUnremovableOldGarbageIsARepackFailure(t *testing.T) {
 	writeIssuesPayloadDoltStub(t, binDir, jsonlGrowingStorePayload(1))
 	runScript(t, coreScriptPath("jsonl-export.sh"), env)
 
-	if !archiveHasObject(archiveRepo, oid) {
+	if !archiveHasObject(t, archiveRepo, oid) {
 		t.Fatalf("test setup: the read-only directory must keep blob %s from being pruned", oid)
 	}
 	state := readJsonlExportState(t, stateFile)
