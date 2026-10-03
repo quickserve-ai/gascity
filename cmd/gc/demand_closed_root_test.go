@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
@@ -69,8 +71,10 @@ func countDemandClosedRoot(t *testing.T, store beads.Store) (int, []string) {
 		storeKey: "rig:q",
 		store:    store,
 	}})
-	if len(errs) != 0 {
-		t.Fatalf("defaultScaleCheckCountsAndDemand errs = %v", errs)
+	for _, err := range errs {
+		if !errors.Is(err, errDemandRootsUnresolved) {
+			t.Fatalf("defaultScaleCheckCountsAndDemand err = %v", err)
+		}
 	}
 	return counts[demandClosedRootTemplate], demand[demandClosedRootTemplate].WorkBeadIDs
 }
@@ -176,10 +180,15 @@ func TestDemandDivergenceClassifiesAClosedRootStepWithoutStepIDAsClosedRoot(t *t
 // resetDemandRootMemos keeps root verdicts and knobs from crossing tests.
 func resetDemandRootMemos(t *testing.T) {
 	t.Helper()
-	ttl, openTTL, budget, clock := demandClosedRootTTL, demandOpenRootTTL, demandRootResolveBudget, demandClosedRootClock
-	demandRootMemos.m = map[string]demandRootMemo{}
+	ttl, openTTL, budget, refresh, sweep, logEvery, clock := demandClosedRootTTL, demandOpenRootTTL,
+		demandRootResolveBudget, demandRootRefreshBudget, demandRootMemoSweepAt, demandRootUnresolvedLogEvery, demandClosedRootClock
+	reset := func() {
+		demandRootMemos.m, demandRootMemos.logged = map[string]demandRootMemo{}, time.Time{}
+	}
+	reset()
 	t.Cleanup(func() {
-		demandRootMemos.m = map[string]demandRootMemo{}
-		demandClosedRootTTL, demandOpenRootTTL, demandRootResolveBudget, demandClosedRootClock = ttl, openTTL, budget, clock
+		reset()
+		demandClosedRootTTL, demandOpenRootTTL, demandRootResolveBudget, demandRootRefreshBudget = ttl, openTTL, budget, refresh
+		demandRootMemoSweepAt, demandRootUnresolvedLogEvery, demandClosedRootClock = sweep, logEvery, clock
 	})
 }
