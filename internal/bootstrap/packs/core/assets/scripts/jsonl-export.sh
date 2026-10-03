@@ -31,38 +31,59 @@ if ! command -v jq >/dev/null 2>&1; then
     exit 1
 fi
 # Print the whole number in the environment variable named $1, or warn and
-# print the default $2 when it is not one or is below $3. A malformed
-# override must not reach a shell comparison or a git -c setting.
+# print the default $2 when it is not one or falls outside $3..$4. A
+# malformed override must not reach a shell comparison or a git -c setting,
+# and the maximum keeps out a value git cannot take (pack.threads and
+# gc.autoPackLimit are signed ints there), which would fail the repack
+# instead of falling back.
 jsonl_uint_knob() {
     local name="$1"
     local default="$2"
     local min="$3"
+    local max="$4"
     local value="${!name:-$default}"
     case "$value" in
         ''|*[!0-9]*) ;;
         *)
-            if [ "${#value}" -le 18 ] && [ "$((10#$value))" -ge "$min" ]; then
+            if [ "${#value}" -le 18 ] && [ "$((10#$value))" -ge "$min" ] && [ "$((10#$value))" -le "$max" ]; then
                 printf '%s\n' "$((10#$value))"
                 return
             fi
             ;;
     esac
-    echo "jsonl-export: ignoring $name=$value (want a whole number of at least $min); using $default" >&2
+    echo "jsonl-export: ignoring $name=$value (want a whole number from $min to $max); using $default" >&2
     printf '%s\n' "$default"
 }
 
+# Print the bytes in the git size $1 (a whole number with no leading zero and
+# an optional k, m or g, as git reads it), or fail when it is not one. Nine
+# digits keep the product inside bash's 64-bit arithmetic.
+jsonl_git_size_bytes() {
+    local factor=1
+    [[ "$1" =~ ^([1-9][0-9]{0,8})([kKmMgG]?)$ ]] || return 1
+    case "${BASH_REMATCH[2]}" in
+        k|K) factor=1024 ;;
+        m|M) factor=1048576 ;;
+        g|G) factor=1073741824 ;;
+    esac
+    printf '%s\n' "$((BASH_REMATCH[1] * factor))"
+}
+
 # Print the git size ("512m", "4g") in the environment variable named $1, or
-# warn and print the default $2. Zero is refused: git reads a zero
-# pack.windowMemory as no limit at all.
+# warn and print the default $2 when it is not one or is larger than the git
+# size $3. Zero is refused: git reads a zero pack.windowMemory as no limit at
+# all.
 jsonl_git_size_knob() {
     local name="$1"
     local default="$2"
+    local max="$3"
     local value="${!name:-$default}"
-    if [[ "$value" =~ ^[1-9][0-9]{0,8}[kKmMgG]?$ ]]; then
+    local bytes
+    if bytes=$(jsonl_git_size_bytes "$value") && [ "$bytes" -le "$(jsonl_git_size_bytes "$max")" ]; then
         printf '%s\n' "$value"
         return
     fi
-    echo "jsonl-export: ignoring $name=$value (want a git size such as 512m or 4g); using $default" >&2
+    echo "jsonl-export: ignoring $name=$value (want a git size from 1 to $max, such as 512m or 4g); using $default" >&2
     printf '%s\n' "$default"
 }
 
@@ -82,13 +103,17 @@ SPIKE_THRESHOLD="${GC_JSONL_SPIKE_THRESHOLD:-20}"  # percentage (0-100)
 MIN_PREV_FOR_SPIKE_CHECK="${GC_JSONL_MIN_PREV_FOR_SPIKE:-100}"
 MAX_PUSH_FAILURES="${GC_JSONL_MAX_PUSH_FAILURES:-3}"
 MAX_REPACK_FAILURES="${GC_JSONL_MAX_REPACK_FAILURES:-3}"
-REPACK_LOOSE_CEILING="$(jsonl_uint_knob GC_JSONL_REPACK_LOOSE_CEILING 512 0)"
+# Each knob below has a maximum far past any useful setting and inside what
+# git and bash arithmetic take; a value above it warns and falls back.
+# A million loose objects is far past git's own 6700-object trigger.
+REPACK_LOOSE_CEILING="$(jsonl_uint_knob GC_JSONL_REPACK_LOOSE_CEILING 512 0 1000000)"
 # Loose objects are packed above this many KiB on disk (count-objects -v
 # "size:") as well as above REPACK_LOOSE_CEILING objects. Each snapshot adds
 # one full-size blob per store, so a large store crosses any byte budget far
 # below any object count: 512 loose snapshots of a 961 MB store are ~100 GiB
-# of zlib. 512 MiB is two or three such snapshots between repacks.
-REPACK_LOOSE_KIB_CEILING="$(jsonl_uint_knob GC_JSONL_REPACK_LOOSE_KIB_CEILING 524288 0)"
+# of zlib. 512 MiB is two or three such snapshots between repacks; the
+# maximum is 1 TiB.
+REPACK_LOOSE_KIB_CEILING="$(jsonl_uint_knob GC_JSONL_REPACK_LOOSE_KIB_CEILING 524288 0 1073741824)"
 # Delta compression for large exports. git never delta-compresses a blob
 # above core.bigFileThreshold (default 512 MiB): `git add` streams it whole
 # into a pack of its own, and pack-objects never tries it as a delta. A store
@@ -96,28 +121,33 @@ REPACK_LOOSE_KIB_CEILING="$(jsonl_uint_knob GC_JSONL_REPACK_LOOSE_KIB_CEILING 52
 # 961 MB store were 45.97 GiB of a 46.23 GiB archive, where two consecutive
 # copies pack as a 202 MB base and a 27 KB delta). The threshold is raised on
 # every archive git call that writes or packs objects (ARCHIVE_PACK_CONFIG
-# below); a command-line -c outranks the archive's own config.
-ARCHIVE_BIG_FILE_THRESHOLD="$(jsonl_git_size_knob GC_JSONL_BIG_FILE_THRESHOLD 4g)"
-# The delta search's memory bound. pack.windowMemory is per thread, and it
-# must hold a target, a source and the source's delta index, about three
-# times the largest blob: short of that git stores the blob whole and still
-# exits 0. 8g reaches blobs of about 2.7 GB; raise it as a store grows. One
-# thread keeps the whole search near 8g (the one-time repair of the gc-kt7i
-# host peaked at 9.8 GB on two). Unbounded, git takes a thread per CPU with
-# no window memory limit at all.
-ARCHIVE_PACK_WINDOW_MEMORY="$(jsonl_git_size_knob GC_JSONL_PACK_WINDOW_MEMORY 8g)"
-ARCHIVE_PACK_THREADS="$(jsonl_uint_knob GC_JSONL_PACK_THREADS 1 1)"
+# below); a command-line -c outranks the archive's own config. git reads it
+# as an unsigned long; the maximum, 64g, is far above any blob worth a delta.
+ARCHIVE_BIG_FILE_THRESHOLD="$(jsonl_git_size_knob GC_JSONL_BIG_FILE_THRESHOLD 4g 64g)"
+# The delta search's window limit. pack.windowMemory is per thread and limits
+# how many large candidates the window holds: past it git evicts the oldest
+# before comparing the next object, always keeping at least one, so a larger
+# limit lets each object be tried against more of its neighbours. It is not
+# a bound on memory: git can exceed it while loading and indexing objects
+# (the one-time repair of the gc-kt7i host peaked at 9.8 GB RSS on two
+# threads at 8g). One thread holds one window. git's defaults are a thread
+# per CPU and no window limit at all. Read as an unsigned long; maximum 256g.
+ARCHIVE_PACK_WINDOW_MEMORY="$(jsonl_git_size_knob GC_JSONL_PACK_WINDOW_MEMORY 8g 256g)"
+# pack.threads is a signed int in git; maximum 64.
+ARCHIVE_PACK_THREADS="$(jsonl_uint_knob GC_JSONL_PACK_THREADS 1 1 64)"
 # gc --auto folds the archive into one pack when its packs exceed this many
 # (0 leaves the pack count unchecked, as in git). Every incremental repack
-# writes one pack holding a whole copy of each store it touches, so the
-# limit bounds both the whole copies on disk between consolidations and the
-# delta search a consolidation runs. git's default of 50 puts about 50 whole
-# copies of a 961 MB store into one search, which nears the order's timeout.
-REPACK_PACK_LIMIT="$(jsonl_uint_knob GC_JSONL_REPACK_PACK_LIMIT 10 0)"
+# writes one pack holding a whole copy of each store it touches, so in steady
+# state the limit bounds both the whole copies on disk between
+# consolidations and the delta search a consolidation runs. git's default of
+# 50 puts about 50 whole copies of a 961 MB store into one search, which nears
+# the order's timeout. It is a trigger, not a cap on the work (see the gc
+# --auto call). gc.autoPackLimit is a signed int in git; maximum 10000.
+REPACK_PACK_LIMIT="$(jsonl_uint_knob GC_JSONL_REPACK_PACK_LIMIT 10 0 10000)"
 # The explicit repack in commit_archive_snapshot prunes unreachable loose
 # objects older than this many minutes; why so short a grace is safe there is
-# explained at the prune.
-ARCHIVE_PRUNE_GRACE_MINUTES="$(jsonl_uint_knob GC_JSONL_PRUNE_GRACE_MINUTES 10 1)"
+# explained at the prune. Maximum one week.
+ARCHIVE_PRUNE_GRACE_MINUTES="$(jsonl_uint_knob GC_JSONL_PRUNE_GRACE_MINUTES 10 1 10080)"
 # Every archive git call that writes or packs objects carries these: add,
 # commit, gc, repack, fetch, rebase and push. commit, fetch and rebase run
 # git's own auto-maintenance, which inherits them through the environment;
@@ -882,6 +912,17 @@ commit_archive_snapshot() {
     if loose_over_a_ceiling; then
         echo "jsonl-export: archive holds $loose loose objects in $loose_kib KiB (ceilings $REPACK_LOOSE_CEILING objects, $REPACK_LOOSE_KIB_CEILING KiB); packing them now, which takes minutes on a large backlog" >&2
     fi
+    # gc.autoPackLimit is a trigger, not a bound on the work: once the packs
+    # exceed it, this gc --auto folds ALL of them together in this run. An
+    # archive that arrives holding many packs of whole copies (written
+    # before these settings) runs that whole delta search at once, inside
+    # the order's timeout. Whole copies that already share a pack are never
+    # retried as a delta pair without -f, and when the memory git estimates
+    # for the repack is not available and gc.bigPackThreshold is unset, gc
+    # also keeps the largest pack out of the consolidation altogether
+    # (--keep-largest-pack), so the whole copies inside it stay unrepaired.
+    # The remedy is the one-time repair by hand above ARCHIVE_PACK_CONFIG;
+    # for such an archive it is a precondition of deploying these settings.
     repack_err=$(git "${ARCHIVE_PACK_CONFIG[@]}" -c gc.auto=256 -c gc.autoDetach=false -c "gc.autoPackLimit=$REPACK_PACK_LIMIT" gc --auto --quiet 2>&1 >/dev/null) || repack_rc=$?
     read_loose_count
     if [ "$repack_rc" -eq 0 ] && loose_over_a_ceiling; then
