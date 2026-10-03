@@ -134,7 +134,6 @@ TOTAL_WOULD_CLOSE_WORKFLOW_ROOTS=0
 # timestamp of its own.
 TOTAL_WOULD_CLOSE_STALE=0
 TOTAL_WORKFLOW_ROOTS_STORE_REF_SKIPPED=0
-TOTAL_WORKFLOW_ISSUE_ROOTS_SKIPPED=0
 TOTAL_ISSUES_CLOSED=0
 TOTAL_STALE_ISSUES_SKIPPED=0
 TOTAL_EXPIRED_ISSUES_CLOSED=0
@@ -676,8 +675,8 @@ reap_scope() {
     # and parent-child subtree has no live descendants. Roots stamped with
     # gc.root_store_ref for another store are skipped; cross-store subtrees
     # need cross-store traversal before reaping can be safe. Wisp roots are
-    # closed in every scope; issue roots are city issues and close only in the
-    # city scope.
+    # closed in every scope; issue roots are city issues and are read and
+    # closed only in the city scope.
     if get_sql_count "workflow wisp roots skipped by root store ref" "$(workflow_root_store_ref_skipped_count_query "$DB" "workflow_wisp_root_candidates" "wisps" "w" "'message'")"; then
         TOTAL_WORKFLOW_ROOTS_STORE_REF_SKIPPED=$((TOTAL_WORKFLOW_ROOTS_STORE_REF_SKIPPED + SQL_COUNT_RESULT))
     fi
@@ -709,17 +708,15 @@ reap_scope() {
         fi
     fi
 
-    if get_sql_count "workflow issue roots skipped by root store ref" "$(workflow_root_store_ref_skipped_count_query "$DB" "workflow_issue_root_candidates" "issues" "i" "'message', 'epic'")"; then
+    if [ "$SCOPE_KIND" = "city" ] && get_sql_count "workflow issue roots skipped by root store ref" "$(workflow_root_store_ref_skipped_count_query "$DB" "workflow_issue_root_candidates" "issues" "i" "'message', 'epic'")"; then
         TOTAL_WORKFLOW_ROOTS_STORE_REF_SKIPPED=$((TOTAL_WORKFLOW_ROOTS_STORE_REF_SKIPPED + SQL_COUNT_RESULT))
     fi
 
-    if get_sql_rows "stale inactive workflow issue root" "$(workflow_root_ids_query "$DB" "workflow_issue_root_candidates" "issues" "i" "'message', 'epic'")"; then
+    if [ "$SCOPE_KIND" = "city" ] && get_sql_rows "stale inactive workflow issue root" "$(workflow_root_ids_query "$DB" "workflow_issue_root_candidates" "issues" "i" "'message', 'epic'")"; then
         ids=$SQL_ROWS_RESULT
         count=$(count_lines "$ids")
         if [ "$count" -gt 0 ]; then
-            if [ "$SCOPE_KIND" != "city" ]; then
-                TOTAL_WORKFLOW_ISSUE_ROOTS_SKIPPED=$((TOTAL_WORKFLOW_ISSUE_ROOTS_SKIPPED + count))
-            elif [ -n "$DRY_RUN" ]; then
+            if [ -n "$DRY_RUN" ]; then
                 TOTAL_WOULD_CLOSE_WORKFLOW_ROOTS=$((TOTAL_WOULD_CLOSE_WORKFLOW_ROOTS + count))
             else
                 close_ids "closing stale inactive workflow issue roots" "$ids" "$WORKFLOW_ROOT_CLOSE_REASON"
@@ -1257,7 +1254,7 @@ if [ -n "$ANOMALIES" ]; then
         --message "$ANOMALIES" 2>/dev/null || true
 fi
 
-SUMMARY="reaper — scopes:$TOTAL_SCOPES, stale_wisps:$TOTAL_STALE_WISPS, closed_wisps:$TOTAL_CLOSED_WISPS, held_wisps:$TOTAL_HELD_WISPS, workflow_roots:$TOTAL_WORKFLOW_ROOTS_CLOSED, skipped_cross_store_workflow_roots:$TOTAL_WORKFLOW_ROOTS_STORE_REF_SKIPPED, skipped_non_city_workflow_issue_roots:$TOTAL_WORKFLOW_ISSUE_ROOTS_SKIPPED, purged:$TOTAL_PURGED, sessions-pruned:$TOTAL_SESSIONS_PRUNED, closed:$TOTAL_ISSUES_CLOSED, expired:$TOTAL_EXPIRED_ISSUES_CLOSED, expired_skipped:$TOTAL_EXPIRED_ISSUES_SKIPPED, skipped_non_city_issues:$TOTAL_STALE_ISSUES_SKIPPED, mail_wisps:$TOTAL_MAIL_WISPS"
+SUMMARY="reaper — scopes:$TOTAL_SCOPES, stale_wisps:$TOTAL_STALE_WISPS, closed_wisps:$TOTAL_CLOSED_WISPS, held_wisps:$TOTAL_HELD_WISPS, workflow_roots:$TOTAL_WORKFLOW_ROOTS_CLOSED, skipped_cross_store_workflow_roots:$TOTAL_WORKFLOW_ROOTS_STORE_REF_SKIPPED, purged:$TOTAL_PURGED, sessions-pruned:$TOTAL_SESSIONS_PRUNED, closed:$TOTAL_ISSUES_CLOSED, expired:$TOTAL_EXPIRED_ISSUES_CLOSED, expired_skipped:$TOTAL_EXPIRED_ISSUES_SKIPPED, skipped_non_city_issues:$TOTAL_STALE_ISSUES_SKIPPED, mail_wisps:$TOTAL_MAIL_WISPS"
 if [ -n "$DRY_RUN" ]; then
     SUMMARY="$SUMMARY, would_close_wisps:$TOTAL_WOULD_CLOSE_WISPS, would_close_workflow_roots:$TOTAL_WOULD_CLOSE_WORKFLOW_ROOTS, would_purge:$TOTAL_WOULD_PURGE, would_expire:$TOTAL_WOULD_EXPIRE, would_close_stale:$TOTAL_WOULD_CLOSE_STALE (dry run)"
 fi
