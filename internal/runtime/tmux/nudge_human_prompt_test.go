@@ -185,8 +185,13 @@ type panePromptExecutor struct {
 	onType func(text string) string
 	// pasteBuf holds the text load-buffer read, for the paste-buffer after it.
 	pasteBuf string
-	calls    [][]string
-	enters   int
+	// textCaptures, when set, scripts the plain captures taken once text
+	// has gone in: the i-th returns textCaptures[i], the last repeating.
+	textCaptures []string
+	textIn       bool
+	captures     int
+	calls        [][]string
+	enters       int
 }
 
 func (f *panePromptExecutor) execute(args []string) (string, error) {
@@ -205,6 +210,10 @@ func (f *panePromptExecutor) execute(args []string) (string, error) {
 	case tmuxArgsContain(args, "capture-pane"):
 		if f.captureErr != nil {
 			return "", f.captureErr
+		}
+		if f.textIn && len(f.textCaptures) > 0 {
+			f.screen = f.textCaptures[min(f.captures, len(f.textCaptures)-1)]
+			f.captures++
 		}
 		return f.screen, nil
 	case tmuxArgsContain(args, "#{session_attached}"):
@@ -237,6 +246,7 @@ func (f *panePromptExecutor) execute(args []string) (string, error) {
 		}
 		f.pasteBuf = string(data)
 	case tmuxArgsContain(args, "paste-buffer"):
+		f.textIn = true
 		if f.onType != nil {
 			if next := f.onType(f.pasteBuf); next != "" {
 				f.screen = next
@@ -249,6 +259,7 @@ func (f *panePromptExecutor) execute(args []string) (string, error) {
 		}
 		return "", errors.New("not in a mode")
 	case tmuxArgsContain(args, "send-keys"):
+		f.textIn = f.textIn || tmuxArgsContain(args, "-l")
 		if tmuxArgsContain(args, "-l") && f.onType != nil {
 			if next := f.onType(args[len(args)-1]); next != "" {
 				f.screen = next
@@ -501,7 +512,8 @@ func TestClassifyHumanPrompt(t *testing.T) {
 		{name: "busy pane", screen: busyFixture, want: ""},
 		{name: "dialog quoted in scrollback above the live composer", screen: quotedDialogAboveComposerFixture, attached: true, want: ""},
 		{name: "feedback survey (its own dismissal handles it)", screen: feedbackSurveySessionFixture, want: ""},
-		{name: "attached gc draft left by a lost submit", screen: composerFixture("❯ <system-reminder> earlier nudge"), attached: true, want: ""},
+		{name: "attached gc draft left by a lost submit", screen: composerFixture("❯ <system-reminder> earlier nudge </system-reminder>"), attached: true, want: ""},
+		{name: "attached unclosed reminder: not only gc's (ga-da5vmz)", screen: composerFixture("❯ <system-reminder> earlier nudge"), attached: true, want: NudgeDeferReasonHumanDraft},
 		{name: "attached boxed empty composer", screen: feedbackSurveySessionFixture, attached: true, want: ""},
 		{name: "generic numbered selection", screen: "Pick one\n❯ 1. Red\n  2. Blue\n", want: NudgeDeferReasonSelectionPrompt},
 		{name: "a numbered list with no cursor is prose", screen: "Plan:\n1. Red\n2. Blue\n❯ \n", want: ""},
@@ -1118,5 +1130,68 @@ func TestNudgeSessionFirstEnterAppliesTheOwnershipRuleToTheDimReRead(t *testing.
 			t.Fatalf("Enter sent %d time(s) onto a person's text", got)
 		}
 		assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+	})
+}
+
+// ga-da5vmz round 2 (A): the ownership check must read the screen the first
+// Enter lands on. The composer shows our nudge at the resend gate's capture,
+// and a person's text by the chokepoint's capture just before the key; the
+// Enter must not go out. Both send paths.
+func TestNudgeSessionFirstEnterChecksOwnershipOnTheLastCaptureBeforeTheKey(t *testing.T) {
+	for name, message := range map[string]string{"typed": guardTestNudge, "pasted": guardTestQueuedNudge} {
+		t.Run(name, func(t *testing.T) {
+			fe := &panePromptExecutor{screen: idleComposerFixture, attached: true}
+			fe.textCaptures = []string{composerFixture("❯ [Pasted text #4 +6 lines]"), composerFixture("❯ actually, stop and rebase first")}
+			fe.onEnter = func(int) string { return busyFixture }
+			tm, session := newGuardTestTmux(fe)
+
+			err := tm.NudgeSession(session, message)
+			assertDeliveredBy(t, fe, message)
+			if got := fe.enterCount(); got != 0 {
+				t.Fatalf("Enter sent %d time(s) onto a person's text that replaced the nudge after the resend gate's read", got)
+			}
+			assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+		})
+	}
+}
+
+// ga-da5vmz round 2 (B): a draft that starts with a gc reminder but carries a
+// person's words after it is the person's draft. The pre-type guard used to
+// call it gc's, so every queue pass pasted another copy into it, and a live
+// survey's "0" and Enter could submit it. Neither may happen.
+func TestAStaleReminderWithAPersonsWordsIsTheirDraft(t *testing.T) {
+	draft := "❯ <system-reminder> older reminder </system-reminder> actually s"
+	t.Run("the nudge sends no keys", func(t *testing.T) {
+		fe := &panePromptExecutor{screen: composerFixture(draft), attached: true}
+		tm, session := newGuardTestTmux(fe)
+
+		err := tm.NudgeSession(session, guardTestQueuedNudge)
+		if keys := fe.keyCalls(); len(keys) != 0 {
+			t.Fatalf("NudgeSession sent keys into a person's draft behind a stale reminder: %q", keys)
+		}
+		assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+	})
+	t.Run("the survey dismisser sends no keys", func(t *testing.T) {
+		screen := "● How is Claude doing this session? (optional)\n  1: Bad    2: Fine   3: Good   0: Dismiss\n" +
+			rule + "\n" + draft + "\n" + rule + "\n  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle)"
+		if !feedbackSurveyIsLive(screen, DefaultReadyPromptPrefix) {
+			t.Fatal("fixture: the survey must read live, or the test cannot see the dismisser's keys")
+		}
+		fe := &panePromptExecutor{screen: screen, attached: true}
+		tm, session := newGuardTestTmux(fe)
+
+		tm.DismissFeedbackSurveyModalIfPresent(session)
+		if keys := fe.keyCalls(); len(keys) != 0 {
+			t.Fatalf("the survey dismisser sent keys onto a person's draft behind a stale reminder: %q", keys)
+		}
+	})
+	t.Run("control: a complete stale reminder alone is still gc's", func(t *testing.T) {
+		fe := &panePromptExecutor{screen: composerFixture("❯ <system-reminder> older reminder </system-reminder>"), attached: true}
+		fe.onEnter = func(int) string { return busyFixture }
+		tm, session := newGuardTestTmux(fe)
+
+		if err := tm.NudgeSession(session, guardTestNudge); err != nil {
+			t.Fatalf("NudgeSession() = %v, want nil", err)
+		}
 	})
 }
