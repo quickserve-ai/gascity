@@ -397,9 +397,11 @@ func (g *hookClosedRootGate) closedRootOf(candidate beads.Bead, dir string, env 
 
 // observedClosedRootOf answers from cached verdicts only, never reading: the
 // root this invocation observed closed for bead, when an ESTABLISHED teardown
-// tail says bead is outside it. With no tail built for that root, the answer is
-// "no" — a retry attempt the query never returned could be in the tail. Used by
-// the drain's divergence classifier.
+// tail says bead is outside it — or when bead carries no gc.step_id, which
+// needs no tail (it cannot be a retry attempt). For a bead WITH a gc.step_id
+// and no tail built for that root, the answer is "no" — a retry attempt the
+// query never returned could be in the tail. Used by the drain's divergence
+// classifier.
 //
 // The drain runs with the invocation's work dir and env, while verdicts are
 // keyed by the leg that produced them — on a federated city a different store.
