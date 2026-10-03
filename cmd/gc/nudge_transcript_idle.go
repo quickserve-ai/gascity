@@ -74,7 +74,7 @@ func claudeTranscriptIsBookkeeping(entryType string) bool {
 // run, and a Stop hook can continue the turn. Any other provider, an
 // unresolvable, ambiguous or unreadable transcript, a torn last line, or no
 // turn_duration in the tail reads false, so the caller keeps today's
-// behaviour. The cost is one bounded tail read of a local file, a stat per
+// behavior. The cost is one bounded tail read of a local file, a stat per
 // candidate file, one marker read and one pane capture; no store reads.
 func claudeTranscriptSaysTurnEnded(target nudgeTarget, sp runtime.Provider) bool {
 	if nudgeTargetBuiltinFamily(target) != "claude" {
@@ -120,7 +120,7 @@ func readClaudeTranscriptTail(path string) ([]byte, error) {
 	}
 	buf := make([]byte, info.Size()-offset)
 	n, err := f.ReadAt(buf, offset)
-	if err != nil && err != io.EOF {
+	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, err
 	}
 	buf = buf[:n]
