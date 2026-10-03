@@ -470,11 +470,13 @@ vet-go:
 ## local edits. Reuses the ICU CPPFLAGS (C AND C++) and isolated test environment.
 ## Selection errors stop instead of silently running a full suite on the host.
 ## This is local feedback, never a replacement for required server-side CI.
+## LEAN_LOCAL_CI_ONLY="./cmd/gc" leaves the named packages' tests to CI; vet/build stay.
 .PHONY: check-lean-local
 check-lean-local:
 	$(TEST_ENV) GC_FAST_UNIT=1 GOMAXPROCS=2 \
 		CGO_CFLAGS="$${CGO_CFLAGS-}" CGO_CXXFLAGS="$${CGO_CXXFLAGS-}" \
 		LINT_CHANGED_REF="$(LINT_CHANGED_REF)" LINT_CHANGED_SCOPE="$(LINT_CHANGED_SCOPE)" \
+		LEAN_LOCAL_CI_ONLY="$(LEAN_LOCAL_CI_ONLY)" \
 		"$(CI_STATIC_SELECT)" check-lean-local "$(CI_STATIC_GO)"
 
 ## fmt-check: fail if formatting would change files
