@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -555,5 +556,103 @@ func TestSessionResumePrintQuotesTheWorkDir(t *testing.T) {
 	want := []string{"cd", spaced, "&&", "claude", "--resume", priorConvID}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("--print = %q parses as %q, want %q", stdout.String(), got, want)
+	}
+}
+
+// A rig store that hangs while OPENING must not spend the city store's share
+// of the lookup budget: the city store's in-progress task still names its
+// worktree, so the conversation there is listed (astra/opus read of eb596dae6).
+func TestSessionHistoryCityTaskSurvivesARigStoreThatHangsOpening(t *testing.T) {
+	fx := setupHistoryWorktreeFixture(t, nil, true)
+	bindHistoryTestRig(t, fx, "hung")
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	prevOpener, prevTimeout := historyRigStoreOpener, historyTaskLookupTimeout
+	t.Cleanup(func() { historyRigStoreOpener, historyTaskLookupTimeout = prevOpener, prevTimeout })
+	historyTaskLookupTimeout = 300 * time.Millisecond
+	historyRigStoreOpener = func(*config.City) rigStoreOpener {
+		return func(string, string) (beads.Store, error) {
+			<-release
+			return nil, fmt.Errorf("released")
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdSessionHistory("lana", 0, false, t.TempDir(), &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdSessionHistory = %d; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), worktreeConvID) {
+		t.Fatalf("a rig store hanging in open starved the city store's task lookup; history dropped %s:\n%s\nstderr=%s", worktreeConvID, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stderr.String(), "city store task lookup skipped") {
+		t.Fatalf("city store reported skipped: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "rig hung task lookup skipped") {
+		t.Fatalf("stderr = %q, want the hung rig named", stderr.String())
+	}
+}
+
+// When a task lookup was skipped, "found nothing" must say the search was
+// incomplete, on resume's refusal and in history's JSON, rather than read as
+// "this conversation does not exist" (class-8: no claim without an observer).
+func TestSessionHistoryAndResumeSayASkippedLookupMadeTheSearchIncomplete(t *testing.T) {
+	fx := setupHistoryWorktreeFixture(t, nil, false)
+	bindHistoryTestRig(t, fx, "broken")
+	prevOpener := historyRigStoreOpener
+	t.Cleanup(func() { historyRigStoreOpener = prevOpener })
+	historyRigStoreOpener = func(*config.City) rigStoreOpener {
+		return func(string, string) (beads.Store, error) {
+			return rigStoreStub{Store: beads.NewMemStore(), err: fmt.Errorf("dolt unreachable")}, nil
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdSessionResume([]string{"lana", "f8de97bc"}, false, true, t.TempDir(), &stdout, &stderr); code == 0 {
+		t.Fatalf("resume accepted a conversation it could not see; stdout=%s", stdout.String())
+	}
+	if want := "INCOMPLETE: the task lookup in rig broken was skipped"; !strings.Contains(stderr.String(), want) {
+		t.Fatalf("resume refusal = %q, want it to carry %q", stderr.String(), want)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := cmdSessionHistory("lana", 0, true, t.TempDir(), &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdSessionHistory(--json) = %d; stderr=%s", code, stderr.String())
+	}
+	var payload struct {
+		Incomplete     bool     `json:"incomplete"`
+		SkippedLookups []string `json:"skipped_lookups"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("decode history JSON: %v\n%s", err, stdout.String())
+	}
+	if !payload.Incomplete || strings.Join(payload.SkippedLookups, ",") != "rig broken" {
+		t.Fatalf("history JSON incomplete=%v skipped_lookups=%q, want true and [rig broken]", payload.Incomplete, payload.SkippedLookups)
+	}
+}
+
+// --print's command must survive a work dir holding a single quote and a $.
+func TestSessionResumePrintQuotesQuotesAndDollars(t *testing.T) {
+	fx := setupHistoryWorktreeFixture(t, map[string]string{"prior_session_key": priorConvID}, false)
+	odd := filepath.Join(t.TempDir(), "it's $HOME")
+	if err := os.MkdirAll(odd, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	writeNamedTestSession(t, fx.liveRoot, odd, priorConvID+".jsonl", historyTranscriptLines(priorConvID, "lana", odd, "lana in an odd dir")...)
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdSessionResume([]string{"lana", "dddddddd"}, false, true, t.TempDir(), &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdSessionResume(--print) = %d; stderr=%s", code, stderr.String())
+	}
+	// Parse it with a real shell, not our own Split: printf each word sh sees.
+	line := strings.Replace(strings.TrimSpace(stdout.String()), " && ", " '&&' ", 1)
+	out, err := exec.Command("/bin/sh", "-c", `printf '%s\0' `+line).Output()
+	if err != nil {
+		t.Fatalf("sh could not parse --print = %q: %v", stdout.String(), err)
+	}
+	got := strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00")
+	want := []string{"cd", odd, "&&", "claude", "--resume", priorConvID}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("--print = %q: sh reads %q, want %q", stdout.String(), got, want)
 	}
 }
