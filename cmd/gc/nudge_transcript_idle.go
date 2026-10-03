@@ -7,8 +7,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/fsys"
 	"github.com/gastownhall/gascity/internal/worker"
 	workertranscript "github.com/gastownhall/gascity/internal/worker/transcript"
 )
@@ -19,11 +22,22 @@ const claudeTranscriptTailBudget = 64 * 1024
 
 // claudeTranscriptBookkeeping are entry types Claude Code appends to the main
 // transcript while a background task runs after the main turn ended, without
-// starting or continuing a turn. Any type not listed here is decisive and
-// reads not idle.
+// starting or continuing a turn: queue activity, attachments, and the
+// session-metadata block (last-prompt ... bridge-session, cost-state,
+// file-history-*, frame-link, artifact-*). Any type not listed here is
+// decisive and reads not idle. The metadata block is sometimes written at
+// prompt submit, before the user line; skipping it there is safe because the
+// prompt marker is then newer than the old turn_duration.
 var claudeTranscriptBookkeeping = map[string]bool{
 	"queue-operation": true, "attachment": true, "pr-link": true,
 	"bridge-session": true, "file-history-snapshot": true,
+	"last-prompt": true, "custom-title": true, "agent-name": true, "mode": true,
+	"permission-mode": true, "atis-latch": true, "frame-link": true,
+	"cost-state": true, "file-history-delta": true,
+}
+
+func claudeTranscriptIsBookkeeping(entryType string) bool {
+	return claudeTranscriptBookkeeping[entryType] || strings.HasPrefix(entryType, "artifact-")
 }
 
 // claudeTranscriptSaysTurnEnded reports whether a Claude seat's own transcript
@@ -35,13 +49,34 @@ var claudeTranscriptBookkeeping = map[string]bool{
 // background task writes to its own file, and the main file only gains
 // bookkeeping lines until a new turn starts.
 //
-// It answers true ONLY when the last meaningful entry is system/turn_duration,
-// judged on entry type/subtype fields alone (never message text). A bare
-// end_turn is not enough: it is written before the Stop hooks run, and a Stop
-// hook can continue the turn. Any other provider, an unresolvable, ambiguous or
-// unreadable transcript, a torn last line, or no turn_duration in the tail
-// reads false, so the caller keeps today's behaviour. The cost is one bounded
-// tail read of a local file plus a stat per search root; no store reads.
+// The transcript is only a NECESSARY condition. Claude appends a prompt's user
+// line only after the UserPromptSubmit hooks finish (p50 6.9 s, p90 16.7 s on
+// real transcripts), so a starting turn's file still ends in turn_duration.
+// The seat's own UserPromptSubmit hook (gc nudge drain --inject) therefore
+// records a per-session "prompt submitted" marker first thing, and this
+// answers true ONLY when the last meaningful entry is system/turn_duration
+// AND its timestamp is newer than that marker. No marker, a turn_duration
+// without a parseable timestamp, or one not newer than the marker reads false.
+// That also covers a frozen transcript the key still points at: once the seat
+// has submitted a prompt since, it never reads idle again.
+//
+// Residual window: between submit and the marker write the hook runs
+// sh -> gc hook run -> gc nudge drain, two gc process starts before any store
+// work (gc version measured 0.44-0.68 s on the host at load ~20), so about
+// 1 s, against the 7-17 s hole the marker closes; a dispatcher pass must also
+// land inside it. Writing it in gc hook run would save one start, but that
+// wrapper runs for any hook event a provider config names, and a marker from a
+// non-prompt event would hold delivery back with no turn to end it. The
+// transcript is read BEFORE the marker, so a prompt that submits between the
+// two reads is seen as a newer marker, never missed.
+//
+// Entries are judged on type/subtype/timestamp fields alone (never message
+// text). A bare end_turn is not enough: it is written before the Stop hooks
+// run, and a Stop hook can continue the turn. Any other provider, an
+// unresolvable, ambiguous or unreadable transcript, a torn last line, or no
+// turn_duration in the tail reads false, so the caller keeps today's
+// behaviour. The cost is one bounded tail read of a local file, a stat per
+// candidate file and one marker read; no store reads.
 func claudeTranscriptSaysTurnEnded(target nudgeTarget) bool {
 	if nudgeTargetBuiltinFamily(target) != "claude" {
 		return false
@@ -54,7 +89,12 @@ func claudeTranscriptSaysTurnEnded(target nudgeTarget) bool {
 	if err != nil {
 		return false
 	}
-	return claudeTranscriptTailTurnEnded(tail)
+	ended, endedAt := claudeTranscriptTailTurnEnd(tail)
+	if !ended {
+		return false
+	}
+	submitted, ok := readClaudePromptSubmitted(target.cityPath, target.sessionID)
+	return ok && endedAt.After(submitted)
 }
 
 func readClaudeTranscriptTail(path string) ([]byte, error) {
@@ -87,11 +127,11 @@ func readClaudeTranscriptTail(path string) ([]byte, error) {
 	return buf, nil
 }
 
-// claudeTranscriptTailTurnEnded walks the tail backwards: bookkeeping lines
-// and stop_hook_summary are skipped, turn_duration means idle, and anything
-// else (user, assistant, tool, other system subtypes, unknown types, an
-// unparseable line) means not idle.
-func claudeTranscriptTailTurnEnded(tail []byte) bool {
+// claudeTranscriptTailTurnEnd walks the tail backwards: bookkeeping lines
+// and stop_hook_summary are skipped, turn_duration means the turn ended at its
+// timestamp, and anything else (user, assistant, tool, other system subtypes,
+// unknown types, an unparseable line or timestamp) means not ended.
+func claudeTranscriptTailTurnEnd(tail []byte) (bool, time.Time) {
 	lines := bytes.Split(bytes.TrimRight(tail, "\n"), []byte("\n"))
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := bytes.TrimSpace(lines[i])
@@ -99,24 +139,29 @@ func claudeTranscriptTailTurnEnded(tail []byte) bool {
 			continue
 		}
 		var entry struct {
-			Type    string `json:"type"`
-			Subtype string `json:"subtype"`
+			Type      string `json:"type"`
+			Subtype   string `json:"subtype"`
+			Timestamp string `json:"timestamp"`
 		}
 		if json.Unmarshal(line, &entry) != nil {
-			return false
+			return false, time.Time{}
 		}
 		switch {
 		case entry.Type == "system" && entry.Subtype == "turn_duration":
-			return true
+			at, err := time.Parse(time.RFC3339Nano, entry.Timestamp)
+			if err != nil {
+				return false, time.Time{}
+			}
+			return true, at
 		case entry.Type == "system" && entry.Subtype == "stop_hook_summary":
 			continue
-		case claudeTranscriptBookkeeping[entry.Type]:
+		case claudeTranscriptIsBookkeeping(entry.Type):
 			continue
 		default:
-			return false
+			return false, time.Time{}
 		}
 	}
-	return false
+	return false, time.Time{}
 }
 
 // nudgeTargetBuiltinFamily returns the builtin family of the seat's provider:
@@ -137,10 +182,12 @@ func nudgeTargetBuiltinFamily(target nudgeTarget) string {
 
 // nudgeTargetClaudeTranscriptPath resolves the seat's transcript by its stable
 // session key only (the keyed lookup SessionHandle.TranscriptPath tries
-// first), never by the newest-file-in-workdir fallback. Every root is checked:
-// the seat's CLAUDE_CONFIG_DIR/projects, daemon observe_paths, and the default
-// root. If the key resolves to two different files, the answer is ambiguous
-// and "" is returned, so no root can override another and the search order
+// first), never by the newest-file-in-workdir fallback. Every root is checked
+// (the seat's CLAUDE_CONFIG_DIR/projects, daemon observe_paths, and the default
+// root), and within each root every path-alias spelling of the work dir
+// (/tmp/x and /private/tmp/x on macOS give two slugs). If the key resolves to
+// two different files, the answer is ambiguous and "" is returned, so neither
+// a root nor a newer alias copy can override another and the search order
 // does not matter; one file reached through a symlinked root is one file.
 func nudgeTargetClaudeTranscriptPath(target nudgeTarget) string {
 	workDir := strings.TrimSpace(target.transcriptWorkDir)
@@ -160,11 +207,7 @@ func nudgeTargetClaudeTranscriptPath(target nudgeTarget) string {
 	}
 	var found string
 	var foundInfo os.FileInfo
-	for _, root := range worker.MergeSearchPaths(roots) {
-		path := workertranscript.DiscoverKeyedPath([]string{root}, "claude", workDir, key)
-		if path == "" {
-			continue
-		}
+	for _, path := range workertranscript.DiscoverClaudeKeyedPaths(worker.MergeSearchPaths(roots), workDir, key) {
 		info, err := os.Stat(path)
 		if err != nil {
 			return ""
@@ -196,4 +239,49 @@ func nudgeTargetClaudeConfigDir(target nudgeTarget) string {
 		}
 	}
 	return strings.TrimSpace(target.cfg.Workspace.Env["CLAUDE_CONFIG_DIR"])
+}
+
+// claudePromptMarkerPath is the per-session "prompt submitted" marker, keyed by
+// the session bead id (GC_SESSION_ID in the seat, target.sessionID in the
+// dispatcher). "" for an id that is not a safe file name.
+func claudePromptMarkerPath(cityPath, sessionID string) string {
+	sessionID = strings.TrimSpace(sessionID)
+	if strings.TrimSpace(cityPath) == "" || sessionID == "" || sessionID == "." ||
+		strings.Contains(sessionID, "..") || strings.ContainsAny(sessionID, `/\`) {
+		return ""
+	}
+	return citylayout.RuntimePath(cityPath, "nudges", "prompt-submitted", sessionID)
+}
+
+// recordClaudePromptSubmitted writes the marker atomically. Best-effort: it
+// must never fail the prompt. A failed write with no earlier marker leaves the
+// gate on today's pane-quiet rule; a failed write over an earlier marker
+// reopens the starting-turn hole for that one prompt only.
+func recordClaudePromptSubmitted(cityPath, sessionID string, at time.Time) {
+	path := claudePromptMarkerPath(cityPath, sessionID)
+	if path == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return
+	}
+	_ = fsys.WriteFileAtomic(fsys.OSFS{}, path, []byte(at.UTC().Format(time.RFC3339Nano)+"\n"), 0o644)
+}
+
+// readClaudePromptSubmitted returns the marker time, or false when there is no
+// readable marker.
+func readClaudePromptSubmitted(cityPath, sessionID string) (time.Time, bool) {
+	path := claudePromptMarkerPath(cityPath, sessionID)
+	if path == "" {
+		return time.Time{}, false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return time.Time{}, false
+	}
+	at, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(string(data)))
+	if err != nil {
+		return time.Time{}, false
+	}
+	return at, true
 }

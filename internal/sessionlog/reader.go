@@ -651,6 +651,31 @@ func FindSessionFileByID(searchPaths []string, workDir, sessionID string) string
 	return findSessionFileByIDForCandidates(searchPaths, claudeProjectSlugCandidates(workDir), fileName)
 }
 
+// FindSessionFilesByID returns every existing Claude-style session log for
+// sessionID across all search paths and all path-alias slugs of workDir, in
+// search order. Unlike FindSessionFileByID it does not pick the newest, so a
+// caller can detect two different files behind one key.
+func FindSessionFilesByID(searchPaths []string, workDir, sessionID string) []string {
+	if workDir == "" || sessionID == "" {
+		return nil
+	}
+	fileName := safeSessionLogFileName(sessionID)
+	if fileName == "" {
+		return nil
+	}
+	slugs := claudeProjectSlugCandidates(workDir)
+	var paths []string
+	for _, base := range searchPaths {
+		for _, slug := range slugs {
+			path := filepath.Join(base, slug, fileName)
+			if info, err := os.Stat(path); err == nil && !info.IsDir() {
+				paths = append(paths, path)
+			}
+		}
+	}
+	return paths
+}
+
 func findSessionFileByIDForCandidates(searchPaths, slugs []string, fileName string) string {
 	for _, base := range searchPaths {
 		var bestPath string

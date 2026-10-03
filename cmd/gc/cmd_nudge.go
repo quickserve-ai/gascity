@@ -692,6 +692,15 @@ func cmdNudgeDrainWithFormat(args []string, inject bool, hookFormat string, stdo
 	if inject && len(args) == 0 && !hookHasManagedIdentity() {
 		return 0
 	}
+	if inject {
+		// First thing on every UserPromptSubmit: record that this seat's
+		// turn is starting, before the slow store work below. The queued
+		// nudge gate trusts a claude transcript's turn_duration only when it
+		// is newer than this marker (ga-megheo, nudge_transcript_idle.go).
+		if cityPath, ok := nudgeDrainExplicitCityPath(); ok {
+			recordClaudePromptSubmitted(cityPath, os.Getenv("GC_SESSION_ID"), time.Now())
+		}
+	}
 	// On every prompt, emit a live clock (operator-local + UTC + epoch) and
 	// the agent's active formula step (if any) as UserPromptSubmit hook context.
 	// When a nudge also fires we fold everything into that nudge's single
