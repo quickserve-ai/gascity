@@ -2757,16 +2757,27 @@ const nudgeSubmitKeySettle = 100 * time.Millisecond
 // remaining keys are not sent after an error, matching sendEnter's previous
 // single-key contract (the caller decides how to react to a failed submit).
 func (t *Tmux) sendNudgeSubmitSequence(target string, keys []string) error {
+	return t.sendNudgeSubmitSequenceOwning(target, target, keys, nil)
+}
+
+// sendNudgeSubmitSequenceOwning is sendNudgeSubmitSequence for a delivery
+// that knows its own draft (owner): on an attached claude pane the guard
+// before each key, of the first submit and of every re-send, also refuses a
+// composer draft owner does not own (ga-da5vmz). A person may have cleared
+// the nudge and typed or pasted their own message, which the Enter would
+// submit.
+func (t *Tmux) sendNudgeSubmitSequenceOwning(session, target string, keys []string, owner *draftOwner) error {
 	// Chokepoint (ga-ubfc7j): no submit key goes to a pane showing a
-	// question dialog or an approval prompt. The draft rule does not apply
-	// here: the text on the line is the text this delivery just typed.
+	// question dialog or an approval prompt. The general draft rule does not
+	// apply here, since the line holds the text this delivery typed; owner
+	// checks that it holds ONLY that.
 	for i, key := range keys {
 		if i > 0 {
 			time.Sleep(nudgeSubmitKeySettle)
 		}
 		// Before EVERY key: a prompt can appear inside the settle between
 		// two keys of a multi-key sequence.
-		if err := t.humanPromptGuard(target, target, nudgeGuardStageBeforeSubmit, false); err != nil {
+		if err := t.humanPromptGuardOwning(session, target, nudgeGuardStageBeforeSubmit, false, owner); err != nil {
 			return err
 		}
 		if _, err := t.run("send-keys", "-t", target, key); err != nil {
@@ -2949,6 +2960,9 @@ func (t *Tmux) nudgeSession(
 	if err := sendText(target, message, t.cfg.NudgeReadyTimeout); err != nil {
 		return err
 	}
+	// Placeholder provenance, before the debounce (ga-da5vmz).
+	owner := &draftOwner{message: message}
+	t.noteDraft(owner, session, target)
 
 	// 3. Wait for paste to complete (tested, required). Kimi's TUI can take
 	// longer to accept large pasted prompts in detached panes.
@@ -2996,13 +3010,16 @@ func (t *Tmux) nudgeSession(
 	// only for single-key (plain Enter) sequences, which is what every family
 	// without a table entry has. Adding a multi-key entry for a family that is
 	// not submit-verify eligible would need that gap closed first.
-	sendSubmit := func() error { return t.sendNudgeSubmitSequence(target, submitKeys) }
+	// Every submit, first or re-sent, carries the ownership check (ga-da5vmz);
+	// resendGate's first read fills in our paste placeholder if the
+	// provenance read showed an empty composer.
+	sendSubmit := func() error { return t.sendNudgeSubmitSequenceOwning(session, target, submitKeys, owner) }
 	wake := func() { t.WakePaneIfDetached(session) }
 	if t.submitVerifyEligible(target) {
 		// The re-send gate (ga-ubfc7j): the old loop re-sent Enter whenever
 		// no spinner showed, which on a dialog the agent raised in reply meant
 		// answering it. A re-send now needs the typed text still drafted.
-		confirmed, err := submitEnterAndConfirmGated(sendSubmit, wake, func() (bool, error) { return t.paneBusy(target) }, time.Sleep, t.resendGate(session, target, message))
+		confirmed, err := submitEnterAndConfirmGated(sendSubmit, wake, func() (bool, error) { return t.paneBusy(target) }, time.Sleep, t.resendGate(session, target, message, owner))
 		if err != nil {
 			if errors.Is(err, ErrNudgeDeferredHumanPrompt) {
 				return err
@@ -3142,9 +3159,13 @@ func (t *Tmux) NudgePane(pane, message string) error {
 	if err := t.sendKeysLiteralWithRetry(pane, message, t.cfg.NudgeReadyTimeout); err != nil {
 		return err
 	}
+	// The submit below is owner-checked as NudgeSession's is (ga-da5vmz).
+	owner := &draftOwner{message: message}
+	t.noteDraft(owner, pane, pane)
 
 	// 2. Wait 500ms for paste to complete (tested, required)
 	time.Sleep(500 * time.Millisecond)
+	t.noteDraft(owner, pane, pane)
 
 	// 3. See NudgeSession for why Escape is provider-specific.
 	if t.shouldSendEscapeBeforeEnter(pane) {
@@ -3164,7 +3185,7 @@ func (t *Tmux) NudgePane(pane, message string) error {
 		if attempt > 0 {
 			time.Sleep(200 * time.Millisecond)
 		}
-		if err := t.sendNudgeSubmitSequence(pane, submitKeys); err != nil {
+		if err := t.sendNudgeSubmitSequenceOwning(pane, pane, submitKeys, owner); err != nil {
 			if errors.Is(err, ErrNudgeDeferredHumanPrompt) {
 				return err
 			}
