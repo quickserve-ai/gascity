@@ -967,6 +967,8 @@ begin_archive_repack() {
     state_json=$(read_state_json)
     marker=$(printf '%s\n' "$state_json" | jq -c '.repack_in_flight // empty' 2>/dev/null) || marker=""
     if [ -n "$marker" ]; then
+        # An exit-0 run keeps no output, so the skip goes into the summary too.
+        REPACK_BACKOFF_NOTE="repack skipped (marker held by $(printf '%s\n' "$marker" | jq -r '.id // "unknown"' 2>/dev/null || echo unknown))"
         echo "jsonl-export: archive repack skipped: another run holds the repack marker ($marker) and has not passed the order's timeout; the snapshot commits and pushes as usual" >&2
         return 1
     fi
