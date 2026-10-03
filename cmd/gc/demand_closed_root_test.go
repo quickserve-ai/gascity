@@ -3,8 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -175,25 +175,18 @@ func TestDemandDivergenceClassifiesAClosedRootStepWithoutStepIDAsClosedRoot(t *t
 	}
 }
 
-// resetDemandRootMemos empties the process-level root cache and restores its
-// knobs when the test ends, so no verdict crosses tests.
+// resetDemandRootMemos keeps root verdicts and knobs from crossing tests.
 func resetDemandRootMemos(t *testing.T) {
 	t.Helper()
 	ttl, budget, clock := demandClosedRootTTL, demandRootResolveBudget, demandClosedRootClock
-	clear := func() {
-		demandRootMemos.Lock()
-		demandRootMemos.m = map[string]demandRootMemo{}
-		demandRootMemos.Unlock()
-	}
-	clear()
+	demandRootMemos.m = map[string]demandRootMemo{}
 	t.Cleanup(func() {
-		clear()
+		demandRootMemos.m = map[string]demandRootMemo{}
 		demandClosedRootTTL, demandRootResolveBudget, demandClosedRootClock = ttl, budget, clock
 	})
 }
 
-// demandCountingStore counts the root reads and teardown queries the demand
-// gate sends to its store.
+// demandCountingStore counts the gate's root reads and teardown queries.
 type demandCountingStore struct {
 	*beads.MemStore
 	gets, lists int
@@ -213,8 +206,7 @@ func (s *demandCountingStore) ListByMetadata(filters map[string]string, limit in
 	return s.MemStore.ListByMetadata(filters, limit, opts...)
 }
 
-// A closed root (and its teardown tail) is read once, then remembered: the
-// next pass sends no read for it to the store, until the TTL lapses.
+// A closed root and its tail are read once, then remembered until the TTL.
 func TestDemandRemembersAClosedRootAcrossPassesUntilTheTTL(t *testing.T) {
 	resetDemandRootMemos(t)
 	now := time.Now()
@@ -222,12 +214,9 @@ func TestDemandRemembersAClosedRootAcrossPassesUntilTheTTL(t *testing.T) {
 	all, _ := demandClosedRootFixture("closed", true)
 	store := &demandCountingStore{MemStore: beads.NewMemStoreFrom(0, all, nil)}
 
-	for pass, want := range [][2]int{{1, 1}, {1, 1}} {
-		if count, ids := countDemandClosedRoot(t, store); count != 1 {
-			t.Fatalf("pass %d: demand = %d %v, want 1", pass+1, count, ids)
-		}
-		if store.gets != want[0] || store.lists != want[1] {
-			t.Fatalf("pass %d: root reads = %d, teardown queries = %d; want %d and %d in total", pass+1, store.gets, store.lists, want[0], want[1])
+	for pass := 1; pass <= 2; pass++ {
+		if count, _ := countDemandClosedRoot(t, store); count != 1 || store.gets != 1 || store.lists != 1 {
+			t.Fatalf("pass %d: demand = %d, root reads = %d, teardown queries = %d; want 1, and 1 and 1 in total", pass, count, store.gets, store.lists)
 		}
 	}
 
@@ -237,8 +226,7 @@ func TestDemandRemembersAClosedRootAcrossPassesUntilTheTTL(t *testing.T) {
 	}
 }
 
-// One pass resolves at most demandRootResolveBudget new roots; the steps of
-// the rest are counted, and the next pass resolves the next ones.
+// Each pass resolves at most the budget of new roots; the rest are counted.
 func TestDemandResolvesABoundedNumberOfNewRootsPerPass(t *testing.T) {
 	resetDemandRootMemos(t)
 	var rows []beads.Bead
@@ -261,9 +249,7 @@ func TestDemandResolvesABoundedNumberOfNewRootsPerPass(t *testing.T) {
 	}
 }
 
-// A closed root whose teardown tail cannot be read is unresolved: its steps
-// are counted (a retry attempt the router serves is never dropped), and the
-// failure is not remembered.
+// An unreadable teardown tail leaves the root unresolved, counted, and unremembered.
 func TestDemandCountsStepsOfAClosedRootWhoseTailIsUnreadable(t *testing.T) {
 	resetDemandRootMemos(t)
 	all, _ := demandClosedRootFixture("closed", true)
