@@ -656,3 +656,55 @@ func TestSessionResumePrintQuotesQuotesAndDollars(t *testing.T) {
 		t.Fatalf("--print = %q: sh reads %q, want %q", stdout.String(), got, want)
 	}
 }
+
+// One rig store hanging in open must not cost a healthy rig its lookup: the
+// healthy rig's in-progress task still names its worktree, and the healthy rig
+// is not reported as not answering.
+func TestSessionHistoryHealthyRigTaskSurvivesAnotherRigHangingInOpen(t *testing.T) {
+	fx := setupHistoryWorktreeFixture(t, nil, false)
+	goodDir := bindHistoryTestRig(t, fx, "good")
+	bindHistoryTestRig(t, fx, "hung")
+	if err := ensurePersistedScopeLocalFileStore(goodDir); err != nil {
+		t.Fatalf("rig file store: %v", err)
+	}
+	goodStore, err := openStoreAtForCity(goodDir, fx.cityDir)
+	if err != nil {
+		t.Fatalf("open rig store: %v", err)
+	}
+	task, err := goodStore.Create(beads.Bead{Title: "rig task", Type: "task", Assignee: "lana", Metadata: map[string]string{"work_dir": fx.worktree}})
+	if err != nil {
+		t.Fatalf("create rig task: %v", err)
+	}
+	inProgress := "in_progress"
+	if err := goodStore.Update(task.ID, beads.UpdateOpts{Status: &inProgress}); err != nil {
+		t.Fatalf("mark rig task in progress: %v", err)
+	}
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	prevOpener, prevTimeout := historyRigStoreOpener, historyTaskLookupTimeout
+	t.Cleanup(func() { historyRigStoreOpener, historyTaskLookupTimeout = prevOpener, prevTimeout })
+	historyTaskLookupTimeout = 600 * time.Millisecond
+	historyRigStoreOpener = func(*config.City) rigStoreOpener {
+		return func(rigPath, _ string) (beads.Store, error) {
+			if filepath.Base(rigPath) == "hung" {
+				<-release
+				return nil, fmt.Errorf("released")
+			}
+			return goodStore, nil
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdSessionHistory("lana", 0, false, t.TempDir(), &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdSessionHistory = %d; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), worktreeConvID) {
+		t.Fatalf("a rig hanging in open starved the healthy rig's task lookup; history dropped %s:\n%s\nstderr=%s", worktreeConvID, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stderr.String(), "rig good task lookup skipped") {
+		t.Fatalf("healthy rig reported skipped: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "rig hung task lookup skipped: store did not open within 300ms") {
+		t.Fatalf("stderr = %q, want the hung rig named with the open budget", stderr.String())
+	}
+}
