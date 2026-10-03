@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -178,8 +179,23 @@ type panePromptExecutor struct {
 	failLiteral int
 	afterFail   string
 	onEnter     func(n int) string
-	calls       [][]string
-	enters      int
+	// onType, when set, returns the screen once text has been typed (a
+	// literal send-keys) or pasted (paste-buffer): what the composer shows
+	// before the first Enter. Multi-line claude nudges take the paste path.
+	onType func(text string) string
+	// pasteBuf holds the text load-buffer read, for the paste-buffer after it.
+	pasteBuf string
+	// textCaptures, when set, scripts the plain captures taken once text
+	// has gone in: the i-th returns textCaptures[i], the last repeating.
+	textCaptures []string
+	textIn       bool
+	// afterDebounce, when set, is the screen plain captures show from 200ms
+	// after text went in: a person acting during the paste debounce.
+	afterDebounce string
+	textInAt      time.Time
+	captures      int
+	calls         [][]string
+	enters        int
 }
 
 func (f *panePromptExecutor) execute(args []string) (string, error) {
@@ -198,6 +214,13 @@ func (f *panePromptExecutor) execute(args []string) (string, error) {
 	case tmuxArgsContain(args, "capture-pane"):
 		if f.captureErr != nil {
 			return "", f.captureErr
+		}
+		if f.afterDebounce != "" && f.textIn && time.Since(f.textInAt) >= 200*time.Millisecond {
+			f.screen = f.afterDebounce
+		}
+		if f.textIn && len(f.textCaptures) > 0 {
+			f.screen = f.textCaptures[min(f.captures, len(f.textCaptures)-1)]
+			f.captures++
 		}
 		return f.screen, nil
 	case tmuxArgsContain(args, "#{session_attached}"):
@@ -221,6 +244,22 @@ func (f *panePromptExecutor) execute(args []string) (string, error) {
 			return "GC_PROVIDER=claude", nil
 		}
 		return "", errors.New("unknown variable: " + args[len(args)-1])
+	case tmuxArgsContain(args, "load-buffer"):
+		// The paste's temp file is removed once the paste is done, so read
+		// it now.
+		data, err := os.ReadFile(args[len(args)-1])
+		if err != nil {
+			return "", err
+		}
+		f.pasteBuf = string(data)
+	case tmuxArgsContain(args, "paste-buffer"):
+		f.textIn = true
+		f.textInAt = time.Now()
+		if f.onType != nil {
+			if next := f.onType(f.pasteBuf); next != "" {
+				f.screen = next
+			}
+		}
 	case tmuxArgsContain(args, "send-keys") && tmuxArgsContain(args, "-l") && f.failLiteral > 0:
 		f.failLiteral--
 		if f.afterFail != "" {
@@ -228,6 +267,14 @@ func (f *panePromptExecutor) execute(args []string) (string, error) {
 		}
 		return "", errors.New("not in a mode")
 	case tmuxArgsContain(args, "send-keys"):
+		if tmuxArgsContain(args, "-l") && !f.textIn {
+			f.textIn, f.textInAt = true, time.Now()
+		}
+		if tmuxArgsContain(args, "-l") && f.onType != nil {
+			if next := f.onType(args[len(args)-1]); next != "" {
+				f.screen = next
+			}
+		}
 		if !tmuxArgsContain(args, "-l") && args[len(args)-1] == "Enter" {
 			f.enters++
 			if f.onEnter != nil {
@@ -475,7 +522,8 @@ func TestClassifyHumanPrompt(t *testing.T) {
 		{name: "busy pane", screen: busyFixture, want: ""},
 		{name: "dialog quoted in scrollback above the live composer", screen: quotedDialogAboveComposerFixture, attached: true, want: ""},
 		{name: "feedback survey (its own dismissal handles it)", screen: feedbackSurveySessionFixture, want: ""},
-		{name: "attached gc draft left by a lost submit", screen: composerFixture("❯ <system-reminder> earlier nudge"), attached: true, want: ""},
+		{name: "attached gc draft left by a lost submit", screen: composerFixture("❯ <system-reminder> earlier nudge </system-reminder>"), attached: true, want: ""},
+		{name: "attached unclosed reminder: not only gc's (ga-da5vmz)", screen: composerFixture("❯ <system-reminder> earlier nudge"), attached: true, want: NudgeDeferReasonHumanDraft},
 		{name: "attached boxed empty composer", screen: feedbackSurveySessionFixture, attached: true, want: ""},
 		{name: "generic numbered selection", screen: "Pick one\n❯ 1. Red\n  2. Blue\n", want: NudgeDeferReasonSelectionPrompt},
 		{name: "a numbered list with no cursor is prose", screen: "Plan:\n1. Red\n2. Blue\n❯ \n", want: ""},
@@ -919,4 +967,359 @@ func TestClassifyOmpAskBox(t *testing.T) {
 	if got := classifyHumanPrompt(quoted, "❯ ", false); got != "" {
 		t.Fatalf("an Ask box in scrollback above an idle composer classified %q, want safe", got)
 	}
+}
+
+// ga-da5vmz (gap 1): on an ATTACHED claude pane the composer is empty at the
+// before_type check, gc types the nudge and waits out its paste debounce, and
+// in that time a person clears it and types their own message. The first
+// Enter used to submit the PERSON's text. It must not go out; the nudge
+// defers after typing, without spending a queue attempt.
+func TestNudgeSessionDefersWhenAPersonReplacesTheTypedNudgeBeforeTheFirstEnter(t *testing.T) {
+	fe := &panePromptExecutor{screen: idleComposerFixture, attached: true}
+	fe.onType = func(string) string { return composerFixture("❯ actually, stop and rebase first") }
+	fe.onEnter = func(int) string { return busyFixture }
+	tm, session := newGuardTestTmux(fe)
+
+	err := tm.NudgeSession(session, guardTestNudge)
+	if got := fe.enterCount(); got != 0 {
+		t.Fatalf("Enter sent %d time(s) onto a person's text that replaced the nudge", got)
+	}
+	assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+	if !NudgeDeferredAfterTyping(err) {
+		t.Fatalf("NudgeDeferredAfterTyping(%v) = false, want true: the text was typed, only the submit was withheld", err)
+	}
+}
+
+// guardTestQueuedNudge is a queued nudge in the shape the queue delivers to a
+// tmux pane (formatNudgeInjectOutput in cmd/gc): multi-line, so on a claude
+// pane it is PASTED (paste-buffer), not typed.
+const guardTestQueuedNudge = "<system-reminder>\nYou have a deferred reminder that was queued until a safe boundary:\n\n- [session:mayor] check the queue\n\nHandle them after this turn.\n</system-reminder>\n"
+
+// assertDeliveredBy fails unless the nudge reached the pane by the send path
+// its shape takes: a multi-line claude nudge by paste-buffer, others by
+// literal send-keys. The ownership gate must be exercised on the path a
+// real delivery uses.
+func assertDeliveredBy(t *testing.T, fe *panePromptExecutor, message string) {
+	t.Helper()
+	pasted := false
+	for _, c := range fe.keyCalls() {
+		pasted = pasted || tmuxArgsContain(c, "paste-buffer")
+	}
+	if want := strings.Contains(message, "\n"); pasted != want {
+		t.Fatalf("paste-buffer used = %v, want %v for this message", pasted, want)
+	}
+}
+
+// The first-submit ownership check accepts every way the composer shows the
+// nudge this delivery typed, and applies only to an attached claude pane: a
+// false "not ours" would leave the reminder unsent.
+func TestNudgeSessionFirstEnterAcceptsItsOwnDraft(t *testing.T) {
+	tests := []struct {
+		name      string
+		message   string // "" means guardTestNudge
+		afterType string // "" leaves the screen unchanged (an empty composer)
+		attached  bool
+	}{
+		{name: "the typed text", afterType: composerFixture("❯ " + guardTestNudge), attached: true},
+		{name: "the typed text wrapped at a narrow width", afterType: composerFixture("❯ <system-reminder> You have a\n  deferred reminder: check the queue\n  </system-reminder>"), attached: true},
+		{name: "a paste placeholder", afterType: composerFixture("❯ [Pasted text #1 +3 lines]"), attached: true},
+		{name: "a partially rendered paste of 24 runes", afterType: composerFixture("❯ <system-reminder> You have a"), attached: true},
+		{name: "the scrolled tail of the nudge", afterType: composerFixture("❯ queue </system-reminder>"), attached: true},
+		{name: "on top of an earlier gc draft", afterType: composerFixture("❯ <system-reminder> older reminder </system-reminder>" + guardTestNudge), attached: true},
+		{name: "an earlier gc draft, the nudge not yet rendered", afterType: composerFixture("❯ <system-reminder> older reminder </system-reminder>"), attached: true},
+		{name: "an earlier gc draft, then the nudge's opening", afterType: composerFixture("❯ <system-reminder> older reminder </system-reminder><system-reminder> You have a"), attached: true},
+		{name: "an empty composer, as today", afterType: "", attached: true},
+		{name: "foreign text on a DETACHED pane, as today", afterType: composerFixture("❯ actually, stop and rebase first"), attached: false},
+		{name: "a short raw nudge, whole", message: "check your mail", afterType: composerFixture("❯ check your mail"), attached: true},
+		{name: "pasted: shown in full", message: guardTestQueuedNudge, afterType: composerFixture("❯ <system-reminder>\n  You have a deferred reminder that was queued until a safe boundary:\n\n  - [session:mayor] check the queue\n\n  Handle them after this turn.\n  </system-reminder>"), attached: true},
+		{name: "pasted: a placeholder", message: guardTestQueuedNudge, afterType: composerFixture("❯ [Pasted text #4 +6 lines]"), attached: true},
+		{name: "pasted: an earlier gc draft, then a placeholder", message: guardTestQueuedNudge, afterType: composerFixture("❯ <system-reminder> older reminder </system-reminder>[Pasted text #4 +6 lines]"), attached: true},
+		{name: "pasted: the scrolled tail", message: guardTestQueuedNudge, afterType: composerFixture("❯ after this turn.\n  </system-reminder>"), attached: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			message := tt.message
+			if message == "" {
+				message = guardTestNudge
+			}
+			fe := &panePromptExecutor{screen: idleComposerFixture, attached: tt.attached}
+			fe.onType = func(string) string { return tt.afterType }
+			fe.onEnter = func(int) string { return busyFixture }
+			tm, session := newGuardTestTmux(fe)
+
+			if err := tm.NudgeSession(session, message); err != nil {
+				t.Fatalf("NudgeSession() = %v, want nil", err)
+			}
+			assertDeliveredBy(t, fe, message)
+			if got := fe.enterCount(); got != 1 {
+				t.Fatalf("Enter sent %d times, want 1", got)
+			}
+		})
+	}
+}
+
+// ga-da5vmz round 1 (findings 1, 2): a draft is ours only when, once complete
+// leading gc reminders are set aside, what remains is empty, the opening of
+// THIS nudge (24 runes, or the whole of a shorter one), its visible tail (16
+// runes, or the whole), or Claude's paste placeholder alone. Containing the
+// nudge is not enough: each draft below holds a person's words too, and the
+// first Enter would submit them. Each must defer after typing, with no Enter.
+func TestNudgeSessionFirstEnterRefusesADraftThatIsNotOnlyOurs(t *testing.T) {
+	tests := []struct {
+		name    string
+		message string // "" means guardTestNudge
+		draft   string
+	}{
+		{name: "our nudge with a person's words after it", draft: "❯ " + guardTestNudge + "actually s"},
+		{name: "a person's character before our nudge", draft: "❯ x" + guardTestNudge},
+		{name: "a person's sentence quoting the nudge's opening", draft: "❯ why does <system-reminder> You have a deferred reminder keep showing up"},
+		{name: "a run from the middle of the nudge", draft: "❯ deferred reminder: check the queue"},
+		{name: "a 12-rune opening", draft: "❯ <system-remi"},
+		{name: "a stale gc reminder with a person's words after it", draft: "❯ <system-reminder> older reminder </system-reminder> actually s"},
+		{name: "a stale reminder, a person's words, then our nudge", draft: "❯ <system-reminder> older reminder </system-reminder> actually s " + guardTestNudge},
+		{name: "an unclosed reminder holding a person's words", draft: "❯ <system-reminder> actually s <system-reminder> older </system-reminder>"},
+		{name: "a short raw nudge inside a person's sentence", message: "check your mail", draft: "❯ don't check your mail yet"},
+		{name: "a 2-rune prefix of a raw nudge", message: "You have mail waiting", draft: "❯ Yo"},
+		{name: "pasted: a placeholder with a person's words after it", message: guardTestQueuedNudge, draft: "❯ [Pasted text #3 +6 lines]actually s"},
+		{name: "pasted: a person's character before the placeholder", message: guardTestQueuedNudge, draft: "❯ x[Pasted text #3 +6 lines]"},
+		{name: "pasted: two placeholders", message: guardTestQueuedNudge, draft: "❯ [Pasted text #3 +6 lines][Pasted text #4 +2 lines]"},
+		{name: "pasted: a stale reminder, then a person's words", message: guardTestQueuedNudge, draft: "❯ <system-reminder> older reminder </system-reminder> actually s"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			message := tt.message
+			if message == "" {
+				message = guardTestNudge
+			}
+			fe := &panePromptExecutor{screen: idleComposerFixture, attached: true}
+			fe.onType = func(string) string { return composerFixture(tt.draft) }
+			fe.onEnter = func(int) string { return busyFixture }
+			tm, session := newGuardTestTmux(fe)
+
+			err := tm.NudgeSession(session, message)
+			assertDeliveredBy(t, fe, message)
+			if got := fe.enterCount(); got != 0 {
+				t.Fatalf("Enter sent %d time(s) onto a draft holding a person's words", got)
+			}
+			assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+			if !NudgeDeferredAfterTyping(err) {
+				t.Fatalf("NudgeDeferredAfterTyping(%v) = false, want true", err)
+			}
+		})
+	}
+}
+
+// ga-da5vmz round 1 (finding 7): a draft that is not ours on the plain read is
+// let through only when the attribute re-read shows it was a faint
+// placeholder. That second read is a new capture, so it gets the same
+// ownership rule: our nudge rendered by then is delivered, a person's text
+// by then is not.
+func TestNudgeSessionFirstEnterAppliesTheOwnershipRuleToTheDimReRead(t *testing.T) {
+	placeholder := composerFixture("❯ Try \"how does <filepath> work?\"")
+	t.Run("our nudge rendered by the re-read: delivered", func(t *testing.T) {
+		fe := &panePromptExecutor{screen: idleComposerFixture, attached: true, styled: composerFixture("❯ " + guardTestNudge)}
+		fe.onType = func(string) string { return placeholder }
+		fe.onEnter = func(int) string { return busyFixture }
+		tm, session := newGuardTestTmux(fe)
+
+		if err := tm.NudgeSession(session, guardTestNudge); err != nil {
+			t.Fatalf("NudgeSession() = %v, want nil", err)
+		}
+		if got := fe.enterCount(); got != 1 {
+			t.Fatalf("Enter sent %d times, want 1", got)
+		}
+	})
+	t.Run("a person's text on the re-read: deferred", func(t *testing.T) {
+		fe := &panePromptExecutor{screen: idleComposerFixture, attached: true, styled: composerFixture("❯ actually s")}
+		fe.onType = func(string) string { return placeholder }
+		fe.onEnter = func(int) string { return busyFixture }
+		tm, session := newGuardTestTmux(fe)
+
+		err := tm.NudgeSession(session, guardTestNudge)
+		if got := fe.enterCount(); got != 0 {
+			t.Fatalf("Enter sent %d time(s) onto a person's text", got)
+		}
+		assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+	})
+}
+
+// ga-da5vmz round 2 (A): the ownership check must read the screen the first
+// Enter lands on. The composer shows our nudge at the resend gate's capture,
+// and a person's text by the chokepoint's capture just before the key; the
+// Enter must not go out. Both send paths.
+func TestNudgeSessionFirstEnterChecksOwnershipOnTheLastCaptureBeforeTheKey(t *testing.T) {
+	for name, message := range map[string]string{"typed": guardTestNudge, "pasted": guardTestQueuedNudge} {
+		t.Run(name, func(t *testing.T) {
+			fe := &panePromptExecutor{screen: idleComposerFixture, attached: true}
+			fe.textCaptures = []string{composerFixture("❯ [Pasted text #4 +6 lines]"), composerFixture("❯ actually, stop and rebase first")}
+			fe.onEnter = func(int) string { return busyFixture }
+			tm, session := newGuardTestTmux(fe)
+
+			err := tm.NudgeSession(session, message)
+			assertDeliveredBy(t, fe, message)
+			if got := fe.enterCount(); got != 0 {
+				t.Fatalf("Enter sent %d time(s) onto a person's text that replaced the nudge after the resend gate's read", got)
+			}
+			assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+		})
+	}
+}
+
+// ga-da5vmz round 2 (B): a draft that starts with a gc reminder but carries a
+// person's words after it is the person's draft. The pre-type guard used to
+// call it gc's, so every queue pass pasted another copy into it, and a live
+// survey's "0" and Enter could submit it. Neither may happen.
+func TestAStaleReminderWithAPersonsWordsIsTheirDraft(t *testing.T) {
+	draft := "❯ <system-reminder> older reminder </system-reminder> actually s"
+	t.Run("the nudge sends no keys", func(t *testing.T) {
+		fe := &panePromptExecutor{screen: composerFixture(draft), attached: true}
+		tm, session := newGuardTestTmux(fe)
+
+		err := tm.NudgeSession(session, guardTestQueuedNudge)
+		if keys := fe.keyCalls(); len(keys) != 0 {
+			t.Fatalf("NudgeSession sent keys into a person's draft behind a stale reminder: %q", keys)
+		}
+		assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+	})
+	t.Run("the survey dismisser sends no keys", func(t *testing.T) {
+		screen := "● How is Claude doing this session? (optional)\n  1: Bad    2: Fine   3: Good   0: Dismiss\n" +
+			rule + "\n" + draft + "\n" + rule + "\n  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle)"
+		if !feedbackSurveyIsLive(screen, DefaultReadyPromptPrefix) {
+			t.Fatal("fixture: the survey must read live, or the test cannot see the dismisser's keys")
+		}
+		fe := &panePromptExecutor{screen: screen, attached: true}
+		tm, session := newGuardTestTmux(fe)
+
+		tm.DismissFeedbackSurveyModalIfPresent(session)
+		if keys := fe.keyCalls(); len(keys) != 0 {
+			t.Fatalf("the survey dismisser sent keys onto a person's draft behind a stale reminder: %q", keys)
+		}
+	})
+	t.Run("control: a complete stale reminder alone is still gc's", func(t *testing.T) {
+		fe := &panePromptExecutor{screen: composerFixture("❯ <system-reminder> older reminder </system-reminder>"), attached: true}
+		fe.onEnter = func(int) string { return busyFixture }
+		tm, session := newGuardTestTmux(fe)
+
+		if err := tm.NudgeSession(session, guardTestNudge); err != nil {
+			t.Fatalf("NudgeSession() = %v, want nil", err)
+		}
+	})
+}
+
+// ga-da5vmz round 3 (1): a paste placeholder is ours only when it is the one
+// the composer showed for OUR paste, at the resend gate's read right after
+// it. A person who clears our paste and pastes their own gets the next #N;
+// the first Enter must not submit theirs. A placeholder that appears when our
+// paste had rendered inline is not ours either.
+func TestNudgeSessionFirstEnterOwnsOnlyItsOwnPastePlaceholder(t *testing.T) {
+	// Reads once the text is in: the provenance read, the gate's, then the
+	// chokepoint's (the last repeats).
+	theirs := composerFixture("❯ [Pasted text #5 +2 lines]")
+	for name, reads := range map[string][]string{
+		"a different paste number":      {composerFixture("❯ [Pasted text #4 +6 lines]"), theirs},
+		"our paste had rendered inline": {composerFixture("❯ <system-reminder> You have a deferred reminder that was queued"), theirs},
+		"no placeholder at either read": {composerFixture("❯ "), composerFixture("❯ "), theirs},
+	} {
+		t.Run(name, func(t *testing.T) {
+			fe := &panePromptExecutor{screen: idleComposerFixture, attached: true}
+			fe.textCaptures = reads
+			fe.onEnter = func(int) string { return busyFixture }
+			tm, session := newGuardTestTmux(fe)
+
+			err := tm.NudgeSession(session, guardTestQueuedNudge)
+			assertDeliveredBy(t, fe, guardTestQueuedNudge)
+			if got := fe.enterCount(); got != 0 {
+				t.Fatalf("Enter sent %d time(s) onto a paste placeholder that is not ours", got)
+			}
+			assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+		})
+	}
+}
+
+// ga-da5vmz round 3 (2): a RE-sent Enter gets the same last-capture ownership
+// check as the first. The first Enter is dropped, the resend gate's read still
+// shows our draft, and by the chokepoint's read just before the re-sent key a
+// person has replaced it: no second Enter.
+func TestNudgeSessionReSentEnterChecksOwnershipOnTheLastCapture(t *testing.T) {
+	ours := composerFixture("❯ " + guardTestNudge)
+	// Plain captures once the text is in: the provenance read, the gate's and
+	// the chokepoint's for the first Enter, the confirm polls, the busy
+	// re-check and the resend gate's read -- all ours -- then the
+	// chokepoint's read for the re-send.
+	reads := make([]string, 0, submitConfirmPollsPerSend+6)
+	for range submitConfirmPollsPerSend + 5 {
+		reads = append(reads, ours)
+	}
+	reads = append(reads, composerFixture("❯ actually, stop and rebase first"))
+	fe := &panePromptExecutor{screen: idleComposerFixture, attached: true}
+	fe.textCaptures = reads
+	tm, session := newGuardTestTmux(fe)
+
+	err := tm.NudgeSession(session, guardTestNudge)
+	if got := fe.enterCount(); got != 1 {
+		t.Fatalf("Enter sent %d times, want 1: the re-send must not land on a person's text", got)
+	}
+	assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+}
+
+// ga-da5vmz round 3 (3): the attribute re-read that clears a faint
+// placeholder is a newer capture; a dialog drawn on it must stop the Enter as
+// it would on the plain read.
+func TestNudgeSessionFirstEnterClassifiesTheDimReRead(t *testing.T) {
+	styled := "⏺ Done.\n" + rule + "\n❯\n" + rule + "\nWhich approach would you prefer?\n❯ 1. Alpha approach\n  2. Beta variant\nEnter to select · Tab/Arrow keys to navigate · Esc to cancel"
+	fe := &panePromptExecutor{screen: idleComposerFixture, attached: true, styled: styled}
+	fe.onType = func(string) string { return composerFixture("❯ Try \"how does <filepath> work?\"") }
+	fe.onEnter = func(int) string { return busyFixture }
+	tm, session := newGuardTestTmux(fe)
+
+	err := tm.NudgeSession(session, guardTestNudge)
+	if got := fe.enterCount(); got != 0 {
+		t.Fatalf("Enter sent %d time(s) with a question dialog on the attribute re-read", got)
+	}
+	assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+}
+
+// ga-da5vmz round 4 (F1): our placeholder is the one shown the moment the
+// paste returns; a person's paste during the debounce (the next #N) is not.
+func TestNudgeSessionTakesPlaceholderProvenanceBeforeTheDebounce(t *testing.T) {
+	fe := &panePromptExecutor{screen: idleComposerFixture, attached: true}
+	fe.onType = func(string) string { return composerFixture("❯ [Pasted text #4 +6 lines]") }
+	fe.afterDebounce = composerFixture("❯ [Pasted text #5 +2 lines]")
+	fe.onEnter = func(int) string { return busyFixture }
+	tm, session := newGuardTestTmux(fe)
+
+	err := tm.NudgeSession(session, guardTestQueuedNudge)
+	assertDeliveredBy(t, fe, guardTestQueuedNudge)
+	if got := fe.enterCount(); got != 0 {
+		t.Fatalf("Enter sent %d time(s) onto a person's paste made during the debounce", got)
+	}
+	assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+}
+
+// ga-da5vmz round 4 (N1): bytes captured from Claude Code 2.1.288 (private
+// tmux socket, capture-pane -e, 2026-10-02). The paste placeholder is NOT
+// faint, so the faint-dropping re-read keeps it; the suggestion is (SGR 2).
+func TestClaudePastePlaceholderIsNotFaint(t *testing.T) {
+	const placeholder = "\x1b[39m❯\u00a0[Pasted text #1 +10 lines]"
+	const suggestion = "\x1b[39m❯\u00a0\x1b[2mTry \"create a util logging.py that...\""
+	if got := stripTerminalStyle(placeholder, true); got != "❯\u00a0[Pasted text #1 +10 lines]" {
+		t.Fatalf("faint-dropped placeholder line = %q, want the placeholder kept", got)
+	}
+	if got := stripTerminalStyle(suggestion, true); got != "❯\u00a0" {
+		t.Fatalf("faint-dropped suggestion line = %q, want only the prompt", got)
+	}
+}
+
+// ga-da5vmz round 4 (3): NudgePane's submit is owner-checked too.
+func TestNudgePaneDoesNotSubmitAPersonsReplacement(t *testing.T) {
+	fe := &panePromptExecutor{screen: idleComposerFixture, attached: true}
+	fe.onType = func(string) string { return composerFixture("❯ actually, stop and rebase first") }
+	fe.onEnter = func(int) string { return busyFixture }
+	tm, _ := newGuardTestTmux(fe)
+
+	err := tm.NudgePane("%1", guardTestNudge)
+	if got := fe.enterCount(); got != 0 {
+		t.Fatalf("NudgePane sent Enter %d time(s) onto a person's text", got)
+	}
+	assertDeferred(t, err, NudgeDeferReasonHumanDraft)
 }
