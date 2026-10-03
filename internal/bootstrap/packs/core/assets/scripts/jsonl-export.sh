@@ -13,6 +13,12 @@
 # Runs as an exec order (no LLM, no agent, no wisp).
 set -euo pipefail
 
+# When this run began, which is when the order's timeout started counting,
+# and an id for this run's repack attempt that no other run shares, even one
+# started in the same second (see begin_archive_repack).
+RUN_STARTED_AT="$(date +%s)"
+REPACK_ATTEMPT_ID="$RUN_STARTED_AT-$$-$RANDOM"
+
 CITY="${GC_CITY_PATH:-${GC_CITY:-.}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # CITY_ABS is read by scope_bd.sh.
@@ -131,11 +137,12 @@ REPACK_LOOSE_KIB_CEILING="$(jsonl_uint_knob GC_JSONL_REPACK_LOOSE_KIB_CEILING 52
 ARCHIVE_BIG_FILE_THRESHOLD="$(jsonl_git_size_knob GC_JSONL_BIG_FILE_THRESHOLD 4g 512m 64g)"
 # The delta search's window, which sets its memory. Objects reach the window
 # sorted by path and then size, so a store's consecutive snapshots are
-# neighbours. pack.window=2 tries each object against the one before it,
-# the delta that matters here, instead of git's ten. pack.windowMemory is
-# per thread, and git never stores a blob whole for lack of it: find_deltas
-# evicts candidates only `while (mem_usage > window_memory_limit && count >
-# 1)` (builtin/pack-objects.c:2913, git 2.50.1), so it narrows the window to
+# neighbours. pack.window=2 keeps up to two predecessors to try each object
+# against (pack-objects hands find_deltas window+1 slots,
+# builtin/pack-objects.c:3355, git 2.50.1) instead of git's ten.
+# pack.windowMemory is per thread, and git never stores a blob whole for
+# lack of it: find_deltas evicts candidates only `while (mem_usage >
+# window_memory_limit && count > 1)` (:2913), so it narrows the window to
 # one predecessor and still compares. Peak memory is about windowMemory plus
 # 2.5 times the largest blob (the blob, its candidate and the candidate's
 # delta index); with a window of two at 2g it is about 3.5 times the largest
@@ -171,8 +178,9 @@ ARCHIVE_PRUNE_GRACE_MINUTES="$(jsonl_uint_knob GC_JSONL_PRUNE_GRACE_MINUTES 60 3
 # trigger settings in repack_archive_objects. None of them reaches the
 # remote: over ssh or https it is another machine, and for a local bare
 # origin git clears GIT_CONFIG_PARAMETERS with the rest of local_repo_env
-# (connect.c), so a pushing archive's remote needs core.bigFileThreshold in
-# its own config or it stores every large snapshot whole.
+# (connect.c). A remote that repacks with delta reuse keeps the deltas it
+# received; core.bigFileThreshold in the remote's own config matters only
+# for the delta searches it runs itself.
 #
 # An archive that already holds whole copies in ONE pack keeps them: git never
 # retries two whole objects of the same pack as a delta pair without
@@ -888,20 +896,49 @@ commit_archive_snapshot() {
     return 0
 }
 
-# The repack step runs under a marker, repack_in_flight_since (its start in
-# epoch seconds), kept in the state file this script already owns: a
-# timestamp in that JSON, not a lock or PID file, and nothing waits on it. A
-# run the order's timeout kills mid-repack never clears it, so a marker older
-# than JSONL_ORDER_TIMEOUT_SECONDS at a later run is that death, and it is
-# recorded as a repack failure through the usual path, so it counts and
-# escalates. A younger marker may belong to a run still alive (a manual `gc
-# order run` is not single-flight); it is no failure, and this run's marker
-# replaces it, so a death in an overlapping run can go uncounted.
+# The repack step runs under a marker kept in the state file this script
+# already owns, repack_in_flight = {run_started_at, id}: a timestamp and an
+# attempt id in that JSON, not a lock or PID file. run_started_at is when
+# the RUN began, because the order's timeout counts from there: once
+# JSONL_ORDER_TIMEOUT_SECONDS have passed since it, that run is dead (the
+# controller kills it), however recently its repack began. id is
+# REPACK_ATTEMPT_ID, so a run clears only its own marker, even against one
+# started in the same second. reconcile_repack_marker counts a dead run's
+# marker as a repack failure, through the usual path so it counts and
+# escalates, and clears it; it runs early in every run, so a run that dies
+# mid-repack is counted even if the runs after it have nothing to commit.
+# A live marker of another run (a manual `gc order run` is not single-flight)
+# is left alone, and this run skips its repack: one repack at a time,
+# without a lock. The read, check and write of the state are not atomic
+# across processes, so two overlapping manual runs can still race here.
 # Once the failures reach MAX_REPACK_FAILURES, the step is skipped until
 # REPACK_REESCALATE_SECONDS have passed since the last attempt: a repack the
 # timeout keeps killing then costs one killed run per window instead of every
-# run, and the snapshot still commits and pushes. Succeeds when this run
-# should repack, with REPACK_ATTEMPT_STARTED set to its marker.
+# run, and the snapshot still commits and pushes.
+
+# Count a dead run's repack marker as a repack failure and clear it. A
+# marker whose run started within the timeout is left alone.
+reconcile_repack_marker() {
+    local marker
+    local started
+    local id
+    local now
+    marker=$(read_state_json | jq -c '.repack_in_flight // empty' 2>/dev/null) || marker=""
+    [ -n "$marker" ] || return 0
+    started=$(printf '%s\n' "$marker" | jq -r '.run_started_at? | numbers' 2>/dev/null) || started=""
+    case "$started" in ''|*[!0-9]*) started="" ;; esac
+    id=$(printf '%s\n' "$marker" | jq -r '.id? | strings' 2>/dev/null) || id=""
+    now=$(date +%s)
+    if [ -n "$started" ] && [ "$started" -le "$now" ] && [ "$((now - started))" -lt "$JSONL_ORDER_TIMEOUT_SECONDS" ]; then
+        return 0
+    fi
+    record_archive_repack_failure "step=repack exit=killed repack_in_flight id=${id:-unknown} run_started_at=${started:-unknown}: that run passed the order's ${JSONL_ORDER_TIMEOUT_SECONDS}s timeout with its repack unfinished, so it died mid-repack"
+    if ! write_state_json "$(read_state_json | jq -c --argjson m "$marker" 'if .repack_in_flight == $m then del(.repack_in_flight) else . end')"; then
+        echo "jsonl-export: could not clear the dead run's repack marker; the next run counts it again" >&2
+    fi
+}
+
+# Succeed when this run should repack, after writing its marker.
 begin_archive_repack() {
     local now
     local state_json
@@ -909,15 +946,13 @@ begin_archive_repack() {
     local consecutive
     local last_attempt
     now=$(date +%s)
+    # A run that died since this run's own reconcile is counted here.
+    reconcile_repack_marker
     state_json=$(read_state_json)
-    marker=$(printf '%s\n' "$state_json" | jq -r '.repack_in_flight_since | numbers' 2>/dev/null) || marker=""
-    case "$marker" in ''|*[!0-9]*) marker="" ;; esac
-    if [ -n "$marker" ] && [ "$((now - marker))" -ge "$JSONL_ORDER_TIMEOUT_SECONDS" ]; then
-        record_archive_repack_failure "step=repack exit=killed repack_in_flight_since=$marker is $((now - marker))s old, past the order's ${JSONL_ORDER_TIMEOUT_SECONDS}s timeout: the run that set it died mid-repack"
-        if ! write_state_json "$(read_state_json | jq -c --argjson m "$marker" 'if .repack_in_flight_since == $m then del(.repack_in_flight_since) else . end')"; then
-            echo "jsonl-export: could not clear the dead run's repack marker; the next run counts it again" >&2
-        fi
-        state_json=$(read_state_json)
+    marker=$(printf '%s\n' "$state_json" | jq -c '.repack_in_flight // empty' 2>/dev/null) || marker=""
+    if [ -n "$marker" ]; then
+        echo "jsonl-export: archive repack skipped: another run holds the repack marker ($marker) and has not passed the order's timeout; the snapshot commits and pushes as usual" >&2
+        return 1
     fi
     consecutive=$(printf '%s\n' "$state_json" | jq -r '.consecutive_repack_failures // 0 | numbers' 2>/dev/null) || consecutive=0
     case "$consecutive" in ''|*[!0-9]*) consecutive=0 ;; esac
@@ -928,17 +963,17 @@ begin_archive_repack() {
         echo "jsonl-export: archive repack skipped: $consecutive consecutive failures (threshold $MAX_REPACK_FAILURES) and the last attempt was $((now - last_attempt))s ago; the next comes once ${REPACK_REESCALATE_SECONDS}s have passed. The snapshot commits and pushes as usual" >&2
         return 1
     fi
-    REPACK_ATTEMPT_STARTED="$now"
-    if ! write_state_json "$(read_state_json | jq -c --argjson now "$now" '.repack_in_flight_since = $now | .last_repack_attempt_at = $now')"; then
+    if ! write_state_json "$(read_state_json | jq -c --argjson started "$RUN_STARTED_AT" --arg id "$REPACK_ATTEMPT_ID" --argjson now "$now" \
+        '.repack_in_flight = {run_started_at: $started, id: $id} | .last_repack_attempt_at = $now')"; then
         echo "jsonl-export: could not record the repack attempt in state; if this run dies mid-repack, nothing counts it" >&2
     fi
     return 0
 }
 
-# Clear this run's repack marker, if it is still this run's.
+# Clear the repack marker if its id is this run's attempt.
 end_archive_repack() {
-    if ! write_state_json "$(read_state_json | jq -c --argjson m "$REPACK_ATTEMPT_STARTED" 'if .repack_in_flight_since == $m then del(.repack_in_flight_since) else . end')"; then
-        echo "jsonl-export: could not clear this run's repack marker; once it passes the order's timeout, a later run counts it as a death" >&2
+    if ! write_state_json "$(read_state_json | jq -c --arg id "$REPACK_ATTEMPT_ID" 'if (.repack_in_flight.id? // null) == $id then del(.repack_in_flight) else . end')"; then
+        echo "jsonl-export: could not clear this run's repack marker; once its run passes the order's timeout, a later run counts it as a death" >&2
     fi
 }
 
@@ -1321,6 +1356,9 @@ mkdir -p "$(dirname "$STATE_FILE")"
 
 log_archive_mode_if_needed
 retry_pending_spike_alert
+# Before any path that ends the run: a run that died mid-repack is counted
+# even when this run has nothing to commit.
+reconcile_repack_marker
 
 # The first export in the bd format moves a scope's snapshot files from the
 # old `dolt sql -r json` layout ({"rows":[...]} issues.jsonl, the flat
@@ -1383,8 +1421,6 @@ HALT_CURRENT_COUNT=0
 HALT_DELTA=0
 # Exports above the big-file threshold, named in the run's summary.
 BIG_EXPORT_WARNINGS=""
-# This run's repack marker (begin_archive_repack).
-REPACK_ATTEMPT_STARTED=""
 SCOPE_SCRUB_WHERE=""
 if [ "$SCRUB" = "true" ]; then
     SCOPE_SCRUB_WHERE="WHERE issue_type NOT IN ('message', 'event', 'wisp', 'agent') AND title NOT LIKE 'gc:%' AND title NOT LIKE 'order:%' AND NOT (issue_type = 'convoy' AND title LIKE 'sling-%')"
