@@ -1738,6 +1738,11 @@ func ContainsModelSwitchModal(content string) bool {
 // a working agent's composer. "4: Unsure" is deliberately excluded from the
 // required set — it is present only in the memory-recollection variant, and
 // requiring it would miss the session-feedback variant entirely.
+//
+// It matches the option row anywhere in content, so on its own it cannot
+// tell a live survey from a stale one left above later output. Its one
+// production caller, the tmux nudge path's survey dismisser, applies it only
+// to the line directly above the live composer (ga-da5vmz).
 func ContainsFeedbackSurveyModal(content string) bool {
 	return lineContainsAll(content, "1: Bad", "2: Fine", "3: Good", "0: Dismiss")
 }

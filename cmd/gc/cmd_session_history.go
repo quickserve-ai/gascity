@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -26,6 +27,9 @@ type sessionHistoryTarget struct {
 	identifier string
 	workDir    string
 	provider   string
+	// configured is true when workDir came from config (a named session or a
+	// non-pool agent), so its projects folder is this agent's own.
+	configured bool
 }
 
 // newSessionHistoryCmd creates the "gc session history <agent>" command.
@@ -122,6 +126,7 @@ func resolveSessionHistoryTarget(cityPath string, cfg *config.City, store beads.
 					identifier: spec.Identity,
 					workDir:    workDir,
 					provider:   historyProviderForAgent(cfg, spec.Agent),
+					configured: true,
 				}, nil
 			}
 		}
@@ -136,6 +141,7 @@ func resolveSessionHistoryTarget(cityPath string, cfg *config.City, store beads.
 					identifier: normalized,
 					workDir:    workDir,
 					provider:   historyProviderForAgent(cfg, &agentCfg),
+					configured: true,
 				}, nil
 			}
 		}
@@ -204,6 +210,23 @@ func liveSessionKeysForWorkDir(store beads.Store, workDir string) map[string]str
 	return live
 }
 
+// liveSessionKeysForScope extends liveSessionKeysForWorkDir to every recorded
+// cwd in scope, plus the resolved session bead itself when it is live.
+func liveSessionKeysForScope(store beads.Store, target sessionHistoryTarget, scope sessionHistoryScope) map[string]string {
+	live := liveSessionKeysForWorkDir(store, target.workDir)
+	for _, dir := range scope.workDirs {
+		for key, id := range liveSessionKeysForWorkDir(store, dir) {
+			live[key] = id
+		}
+	}
+	if scope.hasInfo && sessionLogFallbackCandidateLive(scope.info) {
+		if key := strings.TrimSpace(scope.info.SessionKey); key != "" {
+			live[key] = scope.info.ID
+		}
+	}
+	return live
+}
+
 type sessionHistoryJSON struct {
 	SchemaVersion string                  `json:"schema_version"`
 	OK            bool                    `json:"ok"`
@@ -217,15 +240,18 @@ type sessionHistoryJSON struct {
 type sessionHistoryRowJSON struct {
 	SessionID string `json:"session_id"`
 	Path      string `json:"path"`
-	Archived  bool   `json:"archived"`
-	Live      bool   `json:"live"`
-	LiveBead  string `json:"live_bead,omitempty"`
-	Title     string `json:"title,omitempty"`
-	AgentName string `json:"agent_name,omitempty"`
-	FirstUser string `json:"first_user,omitempty"`
-	StartedAt string `json:"started_at,omitempty"`
-	LastAt    string `json:"last_at"`
-	SizeBytes int64  `json:"size_bytes"`
+	// FoundUnder is the work dir of the projects folder the transcript was
+	// found under: the cwd a provider resume of it must run in.
+	FoundUnder string `json:"found_under,omitempty"`
+	Archived   bool   `json:"archived"`
+	Live       bool   `json:"live"`
+	LiveBead   string `json:"live_bead,omitempty"`
+	Title      string `json:"title,omitempty"`
+	AgentName  string `json:"agent_name,omitempty"`
+	FirstUser  string `json:"first_user,omitempty"`
+	StartedAt  string `json:"started_at,omitempty"`
+	LastAt     string `json:"last_at"`
+	SizeBytes  int64  `json:"size_bytes"`
 }
 
 func cmdSessionHistory(identifier string, limit int, jsonOutput bool, archiveRoot string, stdout, stderr io.Writer) int {
@@ -252,7 +278,9 @@ func cmdSessionHistory(identifier string, limit int, jsonOutput bool, archiveRoo
 	}
 
 	searchPaths := worker.MergeSearchPaths(cfg.Daemon.ObservePaths)
-	entries := worker.ListClaudeSessionHistory(searchPaths, historyArchiveRoots(archiveRoot), target.workDir)
+	archiveRoots := historyArchiveRoots(archiveRoot)
+	scope := resolveSessionHistoryScope(cityPath, cfg, store, identifier, target)
+	entries := listSessionHistory(target, scope, searchPaths, archiveRoots)
 	if len(entries) == 0 {
 		fmt.Fprintf(stderr, "gc session history: no conversations found for %q (work dir %s)\n", target.identifier, target.workDir) //nolint:errcheck // best-effort stderr
 		return 1
@@ -261,21 +289,22 @@ func cmdSessionHistory(identifier string, limit int, jsonOutput bool, archiveRoo
 	if limit > 0 && len(entries) > limit {
 		entries = entries[:limit]
 	}
-	live := liveSessionKeysForWorkDir(store, target.workDir)
+	live := liveSessionKeysForScope(store, target, scope)
 
 	if jsonOutput {
 		rows := make([]sessionHistoryRowJSON, 0, len(entries))
 		for _, e := range entries {
 			summary := worker.ReadClaudeTranscriptSummary(e.Path)
 			row := sessionHistoryRowJSON{
-				SessionID: e.SessionID,
-				Path:      e.Path,
-				Archived:  e.Archived,
-				Title:     summary.Title,
-				AgentName: summary.AgentName,
-				FirstUser: summary.FirstUser,
-				LastAt:    e.ModTime.UTC().Format(time.RFC3339),
-				SizeBytes: e.Size,
+				SessionID:  e.SessionID,
+				Path:       e.Path,
+				FoundUnder: e.foundUnder,
+				Archived:   e.Archived,
+				Title:      summary.Title,
+				AgentName:  summary.AgentName,
+				FirstUser:  summary.FirstUser,
+				LastAt:     e.ModTime.UTC().Format(time.RFC3339),
+				SizeBytes:  e.Size,
 			}
 			if !summary.FirstSeen.IsZero() {
 				row.StartedAt = summary.FirstSeen.UTC().Format(time.RFC3339)
@@ -541,4 +570,214 @@ func restoreArchivedTranscript(entry worker.SessionHistoryEntry) (string, error)
 		return "", err
 	}
 	return dest, nil
+}
+
+// sessionHistoryItem is one listed conversation plus the work directory whose
+// projects folder it was found under: the cwd a provider resume must run in.
+type sessionHistoryItem struct {
+	worker.SessionHistoryEntry
+	foundUnder string
+}
+
+// sessionHistoryScope is the recorded state that widens a history search past
+// the configured work dir. Claude keys each transcript by its process's cwd,
+// and a seat's process does not always run in its configured work dir: the
+// launch path (resolvePreparedTaskWorkDir) moves it into the work_dir of an
+// in-progress task it is assigned, typically a shared worktree. The
+// conversation ids on the bead are looked up by id wherever they are; the
+// folders of the bead's work dirs and of its tasks' work_dirs are listed, but
+// those can be shared with other seats, so only attributable transcripts are
+// taken from them.
+type sessionHistoryScope struct {
+	info    sessionpkg.Info
+	hasInfo bool
+	// ownWorkDir is true when the target's work dir is its own folder, listed
+	// unfiltered as before: configured, or read off a session bead that is not
+	// a pool instance and does not lie under .gc/worktrees/. Those two can be
+	// worktrees other seats share.
+	ownWorkDir bool
+	workDirs   []string
+	keys       []string
+	keySet     map[string]bool
+	// names is the agent-name a transcript must record to be taken from a
+	// shared folder without its id on the bead: a named session's identity or
+	// an alias, never a pool instance's (its agent_name is its template, which
+	// every instance records, and it attributes by id only).
+	names map[string]bool
+}
+
+func (s sessionHistoryScope) attributable(e worker.SessionHistoryEntry) bool {
+	if s.keySet[e.SessionID] {
+		return true
+	}
+	if len(s.names) == 0 {
+		return false
+	}
+	return s.names[worker.ReadClaudeTranscriptAgentName(e.Path)]
+}
+
+// resolveSessionHistoryScope collects what the session has recorded: the
+// conversation ids on its bead (session_key, prior_session_key), its bead's
+// work-dir mirrors (work_dir, gc.work_dir, worker_dir), and the work_dir of
+// each in-progress task assigned to it (the same assignee set and task lookup
+// the launch path uses to pick the process cwd). A pool instance's own work
+// dir, and one that lies under .gc/worktrees/, is filtered like the others:
+// either can be a worktree other seats share.
+func resolveSessionHistoryScope(cityPath string, cfg *config.City, store beads.Store, identifier string, target sessionHistoryTarget) sessionHistoryScope {
+	scope := sessionHistoryScope{ownWorkDir: target.configured, keySet: make(map[string]bool), names: make(map[string]bool)}
+	seenDirs := make(map[string]bool)
+	addDir := func(dir string) {
+		dir = strings.TrimSpace(dir)
+		if dir == "" {
+			return
+		}
+		dir = resolveWorkDirAgainstCity(cityPath, dir)
+		key := normalizePathForCompare(dir)
+		if seenDirs[key] {
+			return
+		}
+		seenDirs[key] = true
+		scope.workDirs = append(scope.workDirs, dir)
+	}
+	addKey := func(key string) {
+		if key = strings.TrimSpace(key); key != "" && !scope.keySet[key] {
+			scope.keySet[key] = true
+			scope.keys = append(scope.keys, key)
+		}
+	}
+
+	addDir(target.workDir)
+	if store == nil {
+		return scope
+	}
+	assignees := []string{target.identifier}
+	if sessionID, err := resolveSessionIDAllowClosedWithConfig(cityPath, cfg, store, identifier); err == nil {
+		if info, err := sessionFrontDoor(store).Get(sessionID); err == nil {
+			scope.info, scope.hasInfo = info, true
+			pool := isPoolManagedSessionInfo(info)
+			scope.ownWorkDir = scope.ownWorkDir || (!pool && !underSharedWorktreeRoot(target.workDir))
+			for _, name := range []string{info.ConfiguredNamedIdentity, info.Alias} {
+				if name = strings.TrimSpace(name); name != "" && !pool {
+					scope.names[name] = true
+				}
+			}
+			addDir(info.WorkDir)
+			addDir(info.WorkDirCanonical)
+			addDir(info.WorkerDir)
+			addKey(info.SessionKey)
+			if b, err := store.Get(sessionID); err == nil {
+				addKey(b.Metadata[sessionpkg.PriorSessionKeyMetadata])
+			}
+			assignees = append(taskWorkDirAssignees(startCandidate{info: info}, cfg), assignees...)
+		}
+	}
+	for _, dir := range inProgressTaskWorkDirs(cityPath, store, assignees...) {
+		addDir(dir)
+	}
+	return scope
+}
+
+// underSharedWorktreeRoot reports whether dir lies under a .gc/worktrees/
+// tree, where gc creates the git worktrees tasks run in and several seats can
+// share one.
+func underSharedWorktreeRoot(dir string) bool {
+	return strings.Contains(filepath.ToSlash(filepath.Clean(dir))+"/", "/.gc/worktrees/")
+}
+
+// inProgressTaskWorkDirs returns the work_dir of every in-progress task bead
+// in the city store assigned to any of assignees, using the per-bead
+// resolution the launch path uses but collecting every distinct dir instead of
+// stopping at the newest.
+func inProgressTaskWorkDirs(cityPath string, store beads.Store, assignees ...string) []string {
+	if store == nil {
+		return nil
+	}
+	var dirs []string
+	seenAssignee := make(map[string]bool, len(assignees))
+	seenDir := make(map[string]bool)
+	for _, assignee := range assignees {
+		assignee = strings.TrimSpace(assignee)
+		if assignee == "" || seenAssignee[assignee] {
+			continue
+		}
+		seenAssignee[assignee] = true
+		assigned, err := store.List(beads.ListQuery{
+			Assignee: assignee,
+			Status:   "in_progress",
+			Live:     true,
+			TierMode: beads.TierBoth,
+			Sort:     beads.SortCreatedDesc,
+		})
+		if err != nil {
+			continue
+		}
+		for _, b := range assigned {
+			if dir := resolveTaskBeadWorkDir(cityPath, store, b); dir != "" && !seenDir[dir] {
+				seenDir[dir] = true
+				dirs = append(dirs, dir)
+			}
+		}
+	}
+	return dirs
+}
+
+// listSessionHistory lists the conversations in the target's own work dir's
+// projects folder (unfiltered, as before), the attributable ones from every
+// other folder in scope, and every copy of each conversation id on the bead
+// wherever it was found, deduplicated by session id with live copies preferred
+// over archived ones and the newest copy kept among equals.
+func listSessionHistory(target sessionHistoryTarget, scope sessionHistoryScope, searchPaths, archiveRoots []string) []sessionHistoryItem {
+	byID := make(map[string]sessionHistoryItem)
+	record := func(item sessionHistoryItem) {
+		prev, ok := byID[item.SessionID]
+		switch {
+		case !ok:
+		case prev.Archived == item.Archived && item.ModTime.After(prev.ModTime):
+		case prev.Archived && !item.Archived:
+		default:
+			return
+		}
+		byID[item.SessionID] = item
+	}
+	if scope.ownWorkDir {
+		for _, e := range worker.ListClaudeSessionHistory(searchPaths, archiveRoots, target.workDir) {
+			record(sessionHistoryItem{SessionHistoryEntry: e, foundUnder: target.workDir})
+		}
+	}
+	for _, dir := range scope.workDirs {
+		if scope.ownWorkDir && normalizePathForCompare(dir) == normalizePathForCompare(target.workDir) {
+			continue
+		}
+		for _, e := range worker.ListClaudeSessionHistory(searchPaths, archiveRoots, dir) {
+			if scope.attributable(e) {
+				record(sessionHistoryItem{SessionHistoryEntry: e, foundUnder: dir})
+			}
+		}
+	}
+	knownDirs := append([]string{target.workDir}, scope.workDirs...)
+	for _, key := range scope.keys {
+		for _, e := range worker.FindClaudeTranscriptsByID(searchPaths, archiveRoots, key) {
+			record(sessionHistoryItem{SessionHistoryEntry: e, foundUnder: transcriptFolderWorkDir(e, knownDirs)})
+		}
+	}
+	items := make([]sessionHistoryItem, 0, len(byID))
+	for _, item := range byID {
+		items = append(items, item)
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].ModTime.After(items[j].ModTime) })
+	return items
+}
+
+// transcriptFolderWorkDir names the work dir whose projects folder holds e:
+// a known dir whose slug is e's folder, else a cwd the transcript records that
+// maps to that folder, else "" (the folder's work dir cannot be told).
+func transcriptFolderWorkDir(e worker.SessionHistoryEntry, knownDirs []string) string {
+	for _, dir := range knownDirs {
+		for _, slug := range worker.ClaudeProjectSlugCandidates(dir) {
+			if slug == e.Slug {
+				return dir
+			}
+		}
+	}
+	return worker.ClaudeTranscriptCwdForSlug(e.Path, e.Slug)
 }
