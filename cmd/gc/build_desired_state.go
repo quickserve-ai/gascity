@@ -2193,10 +2193,12 @@ func defaultScaleCheckCountsAndDemand(cfg *config.City, targets []defaultScaleCh
 	// probe no longer cold-gated, that double-count would be a persistent
 	// warm condition rather than a one-tick wake overshoot, so dedup by ID.
 	countedBeads := make(map[string]map[string]struct{})
+	// One budget of new root resolutions for the whole pass (ga-b2oxyf).
+	rootBudget := demandRootResolveBudget
 	for key, group := range groups {
 		// One closed-root gate per store group: the router's own predicate,
-		// verdicts memoized per root for this pass (ga-b2oxyf).
-		rootGate := newStoreClosedRootGate(group.store)
+		// closed verdicts remembered across passes (demand_closed_root.go).
+		rootGate := newDemandClosedRootGate(group.store, &rootBudget)
 		// Ready()/CachedReady() iteration surfaces actionable work
 		// matched against gc.routed_to/gc.run_target. Formula orders that
 		// should wake pools must create an actionable root, such as a
