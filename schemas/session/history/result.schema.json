@@ -16,6 +16,7 @@
         "properties": {
           "session_id": { "type": "string", "minLength": 1 },
           "path": { "type": "string", "minLength": 1 },
+          "found_under": { "type": "string" },
           "archived": { "type": "boolean" },
           "live": { "type": "boolean" },
           "live_bead": { "type": "string" },
