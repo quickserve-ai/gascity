@@ -260,9 +260,9 @@ func TestNudgeSessionDefersOnAQuestionSeenByTheAttachedCheck(t *testing.T) {
 	}
 }
 
-// Astra round 3: the post-turn survey dismisser matches from scrollback. An
-// old survey above a live question must get no "0" and no Enter: the full
-// guard runs before each of its keys.
+// Astra round 3: a survey row directly above a composer can still have a
+// live question drawn below that composer. It must get no "0" and no Enter:
+// the full guard runs before each of the dismisser's keys.
 func TestFeedbackSurveyDismisserSendsNoKeysOverALiveQuestion(t *testing.T) {
 	pane := feedbackSurveySessionFixture + "\n" + questionDialogFixture
 	ex := &paneAfterFirstKeyExecutor{before: pane, after: pane, attached: "0"}
