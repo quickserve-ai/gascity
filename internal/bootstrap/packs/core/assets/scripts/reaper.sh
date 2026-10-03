@@ -155,9 +155,6 @@ TOTAL_WOULD_CLOSE_WORKFLOW_ROOTS=0
 # timestamp of its own.
 TOTAL_WOULD_CLOSE_STALE=0
 TOTAL_WORKFLOW_ROOTS_STORE_REF_SKIPPED=0
-# Candidate workflow issue roots in non-city scopes, which Step 2 counts but
-# does not close.
-TOTAL_WORKFLOW_ISSUE_ROOTS_SKIPPED=0
 TOTAL_WORKFLOW_ROOT_CANDIDATES=0
 TOTAL_WORKFLOW_ROOTS_CHECKED=0
 TOTAL_ISSUES_CLOSED=0
@@ -891,8 +888,8 @@ reap_scope() {
     # and parent-child subtree has no live descendants. Roots stamped with
     # gc.root_store_ref for another store are skipped; cross-store subtrees
     # need cross-store traversal before reaping can be safe. Wisp roots are
-    # closed in every scope; issue roots are city issues and close only in the
-    # city scope, so other scopes only count them. reap_workflow_roots closes
+    # closed in every scope; issue roots are city issues and are read and
+    # closed only in the city scope (no census outside it). reap_workflow_roots closes
     # each census page's stale roots as it goes; the census window leaves time
     # for the later steps and scopes, and each census starts at a random
     # candidate, so the censuses it cuts short still reach every root.
@@ -904,14 +901,10 @@ reap_scope() {
 
     run_budget_exhausted && return 0
 
-    if get_sql_count "workflow issue roots skipped by root store ref" "$(workflow_root_store_ref_skipped_count_query "$DB" "workflow_issue_root_candidates" "issues" "i" "'message', 'epic'")"; then
+    if [ "$SCOPE_KIND" = "city" ] && get_sql_count "workflow issue roots skipped by root store ref" "$(workflow_root_store_ref_skipped_count_query "$DB" "workflow_issue_root_candidates" "issues" "i" "'message', 'epic'")"; then
         TOTAL_WORKFLOW_ROOTS_STORE_REF_SKIPPED=$((TOTAL_WORKFLOW_ROOTS_STORE_REF_SKIPPED + SQL_COUNT_RESULT))
     fi
-    if [ "$SCOPE_KIND" != "city" ]; then
-        if get_sql_count "workflow issue root candidate" "$(workflow_root_candidate_count_query "$DB" "workflow_issue_root_candidates" "issues" "i" "'message', 'epic'")"; then
-            TOTAL_WORKFLOW_ISSUE_ROOTS_SKIPPED=$((TOTAL_WORKFLOW_ISSUE_ROOTS_SKIPPED + SQL_COUNT_RESULT))
-        fi
-    else
+    if [ "$SCOPE_KIND" = "city" ]; then
         reap_workflow_roots issue "workflow_issue_root_candidates" "issues" "i" "'message', 'epic'"
     fi
 
@@ -1452,7 +1445,7 @@ else
     "$ESCALATE_SCRIPT" --resolve-incident "reaper:anomalies" >/dev/null || true
 fi
 
-SUMMARY="reaper — scopes:$TOTAL_SCOPES, stale_wisps:$TOTAL_STALE_WISPS, closed_wisps:$TOTAL_CLOSED_WISPS, held_wisps:$TOTAL_HELD_WISPS, workflow_roots:$TOTAL_WORKFLOW_ROOTS_CLOSED, workflow_root_census:$TOTAL_WORKFLOW_ROOTS_CHECKED/$TOTAL_WORKFLOW_ROOT_CANDIDATES, skipped_cross_store_workflow_roots:$TOTAL_WORKFLOW_ROOTS_STORE_REF_SKIPPED, skipped_non_city_workflow_issue_roots:$TOTAL_WORKFLOW_ISSUE_ROOTS_SKIPPED, purged:$TOTAL_PURGED, sessions-pruned:$TOTAL_SESSIONS_PRUNED, closed:$TOTAL_ISSUES_CLOSED, expired:$TOTAL_EXPIRED_ISSUES_CLOSED, expired_skipped:$TOTAL_EXPIRED_ISSUES_SKIPPED, skipped_non_city_issues:$TOTAL_STALE_ISSUES_SKIPPED, mail_wisps:$TOTAL_MAIL_WISPS"
+SUMMARY="reaper — scopes:$TOTAL_SCOPES, stale_wisps:$TOTAL_STALE_WISPS, closed_wisps:$TOTAL_CLOSED_WISPS, held_wisps:$TOTAL_HELD_WISPS, workflow_roots:$TOTAL_WORKFLOW_ROOTS_CLOSED, workflow_root_census:$TOTAL_WORKFLOW_ROOTS_CHECKED/$TOTAL_WORKFLOW_ROOT_CANDIDATES, skipped_cross_store_workflow_roots:$TOTAL_WORKFLOW_ROOTS_STORE_REF_SKIPPED, purged:$TOTAL_PURGED, sessions-pruned:$TOTAL_SESSIONS_PRUNED, closed:$TOTAL_ISSUES_CLOSED, expired:$TOTAL_EXPIRED_ISSUES_CLOSED, expired_skipped:$TOTAL_EXPIRED_ISSUES_SKIPPED, skipped_non_city_issues:$TOTAL_STALE_ISSUES_SKIPPED, mail_wisps:$TOTAL_MAIL_WISPS"
 if [ -n "$DRY_RUN" ]; then
     SUMMARY="$SUMMARY, would_close_wisps:$TOTAL_WOULD_CLOSE_WISPS, would_close_workflow_roots:$TOTAL_WOULD_CLOSE_WORKFLOW_ROOTS, would_purge:$TOTAL_WOULD_PURGE, would_expire:$TOTAL_WOULD_EXPIRE, would_close_stale:$TOTAL_WOULD_CLOSE_STALE (dry run)"
 fi
