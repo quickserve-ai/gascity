@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/session"
 )
 
@@ -160,6 +161,59 @@ func TestSessionHistoryListsTranscriptUnderTaskWorktreeCwd(t *testing.T) {
 	}
 }
 
+// The reported case: lana's task lives in a RIG store (qcore), not the city
+// store. history must find its work dir there, as the reconciler does.
+// bindHistoryTestRig declares rig name in the fixture city (city.toml plus its
+// .gc/site.toml path binding) and returns the rig's directory.
+func bindHistoryTestRig(t *testing.T, fx historyWorktreeFixture, name string) string {
+	t.Helper()
+	rigDir := filepath.Join(fx.cityDir, "rigs", name)
+	if err := os.MkdirAll(rigDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	for file, entry := range map[string]string{
+		filepath.Join(fx.cityDir, "city.toml"):        fmt.Sprintf("\n[[rigs]]\nname = %q\nprefix = %q\n", name, name[:2]),
+		filepath.Join(fx.cityDir, ".gc", "site.toml"): fmt.Sprintf("\n[[rig]]\nname = %q\npath = %q\n", name, rigDir),
+	} {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(file, append(data, []byte(entry)...), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return rigDir
+}
+
+func TestSessionHistoryListsTranscriptUnderRigStoreTaskWorktree(t *testing.T) {
+	fx := setupHistoryWorktreeFixture(t, nil, false)
+	rigDir := bindHistoryTestRig(t, fx, "qcore")
+	if err := ensurePersistedScopeLocalFileStore(rigDir); err != nil {
+		t.Fatalf("rig file store: %v", err)
+	}
+	rigStore, err := openStoreAtForCity(rigDir, fx.cityDir)
+	if err != nil {
+		t.Fatalf("open rig store: %v", err)
+	}
+	task, err := rigStore.Create(beads.Bead{Title: "rig task", Type: "task", Assignee: "lana", Metadata: map[string]string{"work_dir": fx.worktree}})
+	if err != nil {
+		t.Fatalf("create rig task: %v", err)
+	}
+	inProgress := "in_progress"
+	if err := rigStore.Update(task.ID, beads.UpdateOpts{Status: &inProgress}); err != nil {
+		t.Fatalf("mark rig task in progress: %v", err)
+	}
+
+	rows := sessionHistoryJSONRows(t, "lana")
+	if row, ok := rows[worktreeConvID]; !ok || row.FoundUnder != fx.worktree {
+		t.Fatalf("history row for the rig-task worktree conversation = %+v (listed=%v), want found_under %s", row, ok, fx.worktree)
+	}
+	if _, ok := rows[foreignConvID]; ok {
+		t.Fatalf("history lists another seat's conversation %s", foreignConvID)
+	}
+}
+
 // A session addressed by bead id whose stored work dir is a shared worktree
 // (under .gc/worktrees/) gets that folder filtered like any other shared one.
 func TestSessionHistoryByBeadIDFiltersASharedWorktreeWorkDir(t *testing.T) {
@@ -293,4 +347,64 @@ func sessionHistoryJSONRows(t *testing.T, identifier string) map[string]historyR
 		rows[row.SessionID] = row
 	}
 	return rows
+}
+
+// rigStoreStub stands in for a rig store whose List stalls until release is
+// closed, or fails with err.
+type rigStoreStub struct {
+	beads.Store
+	release chan struct{}
+	err     error
+}
+
+func (s rigStoreStub) List(beads.ListQuery) ([]beads.Bead, error) {
+	if s.release != nil {
+		<-s.release
+	}
+	return nil, s.err
+}
+
+// A rig store can open and then stall in List (bd allows minutes). history
+// bounds the whole task lookup, skips what has not answered, and names each
+// skipped or failed rig on stderr.
+func TestSessionHistoryBoundsAndNamesStalledOrFailedRigTaskLookups(t *testing.T) {
+	fx := setupHistoryWorktreeFixture(t, nil, false)
+	bindHistoryTestRig(t, fx, "slow")
+	bindHistoryTestRig(t, fx, "broken")
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	prevOpener, prevTimeout := historyRigStoreOpener, historyTaskLookupTimeout
+	t.Cleanup(func() { historyRigStoreOpener, historyTaskLookupTimeout = prevOpener, prevTimeout })
+	historyTaskLookupTimeout = 300 * time.Millisecond
+	historyRigStoreOpener = func(*config.City) rigStoreOpener {
+		return func(rigPath, _ string) (beads.Store, error) {
+			if filepath.Base(rigPath) == "slow" {
+				return rigStoreStub{Store: beads.NewMemStore(), release: release}, nil
+			}
+			return rigStoreStub{Store: beads.NewMemStore(), err: fmt.Errorf("dolt unreachable")}, nil
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+	done := make(chan int, 1)
+	go func() { done <- cmdSessionHistory("lana", 0, false, t.TempDir(), &stdout, &stderr) }()
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("cmdSessionHistory = %d; stderr=%s", code, stderr.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("history did not return while a rig store's List stalled")
+	}
+	for _, rig := range []string{"slow", "broken"} {
+		if want := "rig " + rig + " task lookup skipped"; !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr = %q, want %q", stderr.String(), want)
+		}
+	}
+	if !strings.Contains(stderr.String(), "dolt unreachable") {
+		t.Fatalf("stderr = %q, want the failed rig's error", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), agentDirConvID) {
+		t.Fatalf("history dropped the agent-dir conversation:\n%s", stdout.String())
+	}
 }
