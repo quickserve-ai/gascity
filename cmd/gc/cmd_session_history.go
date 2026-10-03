@@ -907,10 +907,12 @@ collect:
 	return dirs, skipped
 }
 
-// historyTaskLegs opens every bound rig store concurrently (a store not open
-// before ctx ends is skipped) and returns the census leg set over the city
-// store and the rig stores that opened, or the city store alone when the
-// census refuses.
+// historyTaskLegs opens every bound rig store concurrently and returns the
+// census leg set over the city store and the rig stores that opened, or the
+// city store alone when the census refuses. The opens get HALF the lookup
+// budget (a store not open by then is skipped): the rig queries start only
+// after this returns, so one store hanging in open must not spend the healthy
+// rigs' whole budget and leave them reported as not answering.
 func historyTaskLegs(ctx context.Context, cityPath string, cfg *config.City, store beads.Store, skipped func(leg, reason string)) []classStoreCandidate {
 	cityOnly := []classStoreCandidate{{store: store}}
 	if cfg == nil || len(cfg.Rigs) == 0 {
@@ -934,6 +936,9 @@ func historyTaskLegs(ctx context.Context, cityPath string, cfg *config.City, sto
 			results <- opened{rig: rig.Name, store: s, err: err}
 		}()
 	}
+	openBudget := historyTaskLookupTimeout / 2
+	openCtx, cancelOpen := context.WithTimeout(ctx, openBudget)
+	defer cancelOpen()
 	rigStores := make(map[string]beads.Store, len(pending))
 	done := make(map[string]bool, len(pending))
 wait:
@@ -946,13 +951,13 @@ wait:
 				continue
 			}
 			rigStores[o.rig] = o.store
-		case <-ctx.Done():
+		case <-openCtx.Done():
 			break wait
 		}
 	}
 	for _, rig := range pending {
 		if !done[rig] {
-			skipped("rig "+rig, fmt.Sprintf("store did not open within %s", historyTaskLookupTimeout))
+			skipped("rig "+rig, fmt.Sprintf("store did not open within %s", openBudget))
 		}
 	}
 	legs, err := censusStoreCandidates(cityPath, cfg, store, rigStores, nil, censusRefBare)
