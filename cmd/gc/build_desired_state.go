@@ -2305,6 +2305,9 @@ func defaultScaleCheckCountsAndDemand(cfg *config.City, targets []defaultScaleCh
 	// warm condition rather than a one-tick wake overshoot, so dedup by ID.
 	for _, group := range groupOrder {
 		key := group.storeKey
+		// One closed-root gate per store group: the router's own predicate,
+		// verdicts memoized per root for this pass (ga-b2oxyf).
+		rootGate := newStoreClosedRootGate(group.store)
 		// Ready()/CachedReady() iteration surfaces actionable work
 		// matched against gc.routed_to/gc.run_target. Formula orders that
 		// should wake pools must create an actionable root, such as a
@@ -2336,6 +2339,14 @@ func defaultScaleCheckCountsAndDemand(cfg *config.City, targets []defaultScaleCh
 			// drains, every tick, forever. See demand_serve_predicate.go.
 			template, servable := demandServableForTemplates(cfg, b, group.templates)
 			if !servable {
+				continue
+			}
+			// AGREEMENT: gc hook --claim skips an open step whose molecule root
+			// it observed closed, outside that root's teardown tail
+			// (qc-z0fmn0n). Counting it spawns a seat that drains (ga-b2oxyf).
+			// Same predicate, so spawn and claim cannot disagree; an unreadable
+			// root is counted, as the router serves it.
+			if _, closedRoot := rootGate.closedRootOf(b, group.storeKey, nil); closedRoot {
 				continue
 			}
 			if group.byTemplate == nil {
