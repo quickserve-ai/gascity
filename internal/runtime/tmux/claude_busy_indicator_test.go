@@ -23,6 +23,26 @@ func TestPaneContainsBusyIndicatorClaudeHookAndBackgroundShapes(t *testing.T) {
 			"  -- INSERT -- ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents", "    ◉ xhigh · /effort", "    /rc",
 		}, true},
 		"single_hook_running": {[]string{"✻ Proofing… (running UserPromptSubmit hook… 4s)", "❯\u00a0"}, true},
+		"prompt_hooks_running_with_echo": {[]string{
+			"❯\u00a0probe one", "✽ Proofing… (running UserPromptSubmit hooks… 1/2 · 9s)", rule, "❯\u00a0", rule,
+			"  user@host /tmp/work", "  -- INSERT -- ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents", "    /rc",
+		}, true},
+		// The phrase anywhere but the live spinner line above the composer is
+		// history or quoted text, not a running hook.
+		"test_source_line": {[]string{
+			`			"✶ Proofing… (running UserPromptSubmit hooks… 1/2 · 3s)", rule, "❯\u00a0", rule,`,
+			rule, "❯\u00a0", rule,
+		}, false},
+		"assistant_prose": {[]string{
+			"⏺ The pane showed ✶ Proofing… (running UserPromptSubmit hooks… 1/2 · 3s) while it waited.",
+			rule, "❯\u00a0", rule,
+		}, false},
+		"tool_output": {[]string{
+			"  ⎿  ✶ Proofing… (running UserPromptSubmit hooks… 1/2 · 3s)",
+			"     ✶ Proofing… (running UserPromptSubmit hooks… 2/2 · 4s)", rule, "❯\u00a0", rule,
+		}, false},
+		"spinner_in_scrollback": {append(append([]string{"✶ Proofing… (running UserPromptSubmit hooks… 1/2 · 3s)"},
+			strings.Split(strings.Repeat("  later output\n", 30), "\n")...), rule, "❯\u00a0", rule, "  user@host /tmp/work"), false},
 		"idle_background_agents_ticking": {[]string{
 			"✻ Waiting for 2 background agents to finish", rule, "❯\u00a0draft text", rule,
 			"  >>  seat * ga-xxxxxx · opus-5.5·high · ctx ██▍·· 48% 482k/1M [acct]",

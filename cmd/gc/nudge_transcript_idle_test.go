@@ -525,11 +525,12 @@ func TestRecordClaudePromptSubmittedPrunesOldMarkers(t *testing.T) {
 // activity, a transcript whose turn ended at tlTurnEnd, and a prompt marker
 // from before that turn ended. deliver runs one dispatcher pass.
 type claudeDispatchSeat struct {
-	t       *testing.T
-	dir     string
-	fake    *gcruntime.Fake
-	pane    *paneRuntime
-	deliver func() bool
+	t          *testing.T
+	dir        string
+	transcript string
+	fake       *gcruntime.Fake
+	pane       *paneRuntime
+	deliver    func() bool
 }
 
 // paneRuntime is a fake runtime whose pane answers SnapshotIdle in order (the
@@ -538,6 +539,14 @@ type paneRuntime struct {
 	*gcruntime.Fake
 	answers []bool
 	calls   int
+	onNudge func()
+}
+
+func (p *paneRuntime) Nudge(name string, content []gcruntime.ContentBlock) error {
+	if p.onNudge != nil {
+		p.onNudge()
+	}
+	return p.Fake.Nudge(name, content)
 }
 
 func (p *paneRuntime) SnapshotIdle(string) (bool, error) {
@@ -579,7 +588,8 @@ func newClaudeDispatchSeat(t *testing.T, answers ...bool) *claudeDispatchSeat {
 		transcriptWorkDir: dir, transcriptSessionKey: transcriptIdleTestKey, providerAncestor: "claude",
 	}
 	pane := &paneRuntime{Fake: fake, answers: answers}
-	seat := &claudeDispatchSeat{t: t, dir: dir, fake: fake, pane: pane}
+	seat := &claudeDispatchSeat{t: t, dir: dir, fake: fake, pane: pane,
+		transcript: filepath.Join(tdir, transcriptIdleTestKey+".jsonl")}
 	seat.deliver = func() bool {
 		t.Helper()
 		delivered, err := tryDeliverQueuedNudgesByPoller(target, store, store, pane, 3*time.Second,
@@ -646,5 +656,40 @@ func TestTryDeliverQueuedNudgesClaudeRechecksBeforeDelivery(t *testing.T) {
 	}
 	if len(pending) != 1 || len(inFlight) != 0 {
 		t.Fatalf("pending=%d inFlight=%d, want the nudge back in pending", len(pending), len(inFlight))
+	}
+}
+
+// The dispatcher's marker carries the time just before its submit, not the
+// time confirmation returned: a short turn that ends while confirmation is
+// still pending must not leave the seat blocked behind its own marker.
+func TestTryDeliverQueuedNudgesClaudeTurnEndedBeforeConfirmationNextDelivers(t *testing.T) {
+	seat := newClaudeDispatchSeat(t, true)
+	seat.pane.onNudge = func() {
+		time.Sleep(5 * time.Millisecond)
+		ended := `{"type":"system","subtype":"turn_duration","timestamp":"` + time.Now().UTC().Format(time.RFC3339Nano) + `"}`
+		lines := []string{tlUserPrompt, tlAssistEndTurn, ended}
+		if err := os.WriteFile(seat.transcript, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+			t.Error(err)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	seat.enqueue("first")
+	if !seat.deliver() {
+		t.Fatal("first nudge not delivered")
+	}
+	seat.pane.onNudge = nil
+	seat.enqueue("second")
+	if !seat.deliver() || seat.nudgeCalls() != 2 {
+		t.Fatalf("second nudge held although the first turn ended (nudge calls = %d)", seat.nudgeCalls())
+	}
+}
+
+// Marker names that start with "." are never session ids (".pruned" is the
+// prune stamp).
+func TestClaudePromptMarkerPathRejectsDotNames(t *testing.T) {
+	for _, id := range []string{".pruned", ".x", "."} {
+		if got := claudePromptMarkerPath(t.TempDir(), id); got != "" {
+			t.Errorf("claudePromptMarkerPath(%q) = %q, want \"\"", id, got)
+		}
 	}
 }

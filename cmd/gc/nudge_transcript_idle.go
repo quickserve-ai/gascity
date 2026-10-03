@@ -114,12 +114,14 @@ func claudeTranscriptSaysTurnEnded(target nudgeTarget, sp runtime.Provider) bool
 // stampClaudePromptOnDelivery records the prompt marker for a claude seat the
 // dispatcher has just submitted to (call it only after a confirmed submit), so
 // the next pass cannot type into the turn this delivery started before that
-// turn's own hook writes the marker.
-func stampClaudePromptOnDelivery(target nudgeTarget) error {
+// turn's own hook writes the marker. submitAt is taken just before the submit
+// was sent, not when confirmation returned: a short turn may already have
+// ended by then, and a later marker would hide that turn_duration.
+func stampClaudePromptOnDelivery(target nudgeTarget, submitAt time.Time) error {
 	if nudgeTargetBuiltinFamily(target) != "claude" {
 		return nil
 	}
-	return recordClaudePromptSubmitted(target.cityPath, target.sessionID, time.Now())
+	return recordClaudePromptSubmitted(target.cityPath, target.sessionID, submitAt)
 }
 
 func readClaudeTranscriptTail(path string) ([]byte, error) {
@@ -275,7 +277,7 @@ func nudgeTargetClaudeConfigDir(target nudgeTarget) string {
 // dispatcher). "" for an id that is not a safe file name.
 func claudePromptMarkerPath(cityPath, sessionID string) string {
 	sessionID = strings.TrimSpace(sessionID)
-	if strings.TrimSpace(cityPath) == "" || sessionID == "" || sessionID == "." ||
+	if strings.TrimSpace(cityPath) == "" || sessionID == "" || strings.HasPrefix(sessionID, ".") ||
 		strings.Contains(sessionID, "..") || strings.ContainsAny(sessionID, `/\`) {
 		return ""
 	}

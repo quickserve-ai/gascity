@@ -2163,6 +2163,7 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.S
 		relErr := releaseQueuedNudgeClaims(target.cityPath, queuedNudgeIDs(items))
 		return false, errors.Join(bookkeepErr, relErr)
 	}
+	submitAt := time.Now()
 	result, err := handle.Nudge(context.Background(), worker.NudgeRequest{
 		Text:     msg,
 		Delivery: worker.NudgeDeliveryDefault,
@@ -2206,7 +2207,7 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.S
 			// attempt-counting/dead-letter path — that would re-inject the same
 			// reminder on the next pass.
 			stampLastNudgeDeliveredAt(deliverySessFront, target.sessionID, time.Now())
-			markErr := stampClaudePromptOnDelivery(target)
+			markErr := stampClaudePromptOnDelivery(target, submitAt)
 			logErr := recordNudgeDelivery(target, items, msg, nudgeDeliveryOutcomeDeliveredUnobserved, "")
 			ackErr := ackQueuedNudgesWithOutcome(target.cityPath, queuedNudgeIDs(items), "injected_unobserved", "", "provider-nudge-return")
 			return true, errors.Join(bookkeepErr, logErr, ackErr, markErr)
@@ -2227,7 +2228,7 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.S
 	}
 	telemetry.RecordNudge(context.Background(), target.agentKey(), nil)
 	stampLastNudgeDeliveredAt(deliverySessFront, target.sessionID, time.Now())
-	markErr := stampClaudePromptOnDelivery(target)
+	markErr := stampClaudePromptOnDelivery(target, submitAt)
 	logErr := recordNudgeDelivery(target, items, msg, nudgeDeliveryOutcomeDelivered, "")
 	return true, errors.Join(bookkeepErr, logErr, ackQueuedNudges(target.cityPath, queuedNudgeIDs(items)), markErr)
 }

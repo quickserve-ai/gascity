@@ -4834,15 +4834,50 @@ func codexTranscriptTailContainsTurnAborted(tail string) bool {
 // "(main)", "⏱️ Jun 4 02:57:04", or the "✻ Worked for 3m 38s" done marker.
 var claudeBusySpinnerRe = regexp.MustCompile(`\([0-9]+[ms][^)]*[·•]`)
 
-// claudeHookSpinnerRe matches Claude Code's spinner while a submitted prompt's
-// hooks run, before the turn's first model call: "✶ Proofing… (running
-// UserPromptSubmit hooks… 1/2 · 3s)" (real capture, ga-megheo). No elapsed
-// timer follows "(", so claudeBusySpinnerRe misses it. The prompt is already
-// submitted, so busy is right for every caller: submit confirmation,
-// WaitForIdle, SnapshotIdle and the queued-nudge transcript gate. An idle seat
-// whose background agents tick ("◯ general-purpose  … 1h 25m 34s · ↓ 228.0k
-// tokens") has no "(" there and stays idle.
-var claudeHookSpinnerRe = regexp.MustCompile(`(?i)\(running \S+ hooks?`)
+// claudeHookSpinnerRe matches Claude Code's live spinner line while a
+// submitted prompt's hooks run, before the turn's first model call: "✶
+// Proofing… (running UserPromptSubmit hooks… 1/2 · 3s)" (real capture,
+// ga-megheo). No elapsed timer follows "(", so claudeBusySpinnerRe misses it.
+// It is anchored at column 0 on a spinner glyph + verb + ellipsis, so prose
+// ("⏺ …"), an echoed prompt ("❯ …"), tool output ("  ⎿ …" and its indented
+// continuation) and quoted source never match, and claudeHookSpinnerLive only
+// looks at it just above the live composer, so the phrase in scrollback does
+// not either.
+var claudeHookSpinnerRe = regexp.MustCompile(`^[^\s\w⏺❯⎿│]\s\S+…\s\(running \S+ hooks?…`)
+
+// claudeHookSpinnerAboveComposer bounds how far above the live composer the
+// hook spinner may sit (the spinner, a tip line, the composer's top rule).
+const claudeHookSpinnerAboveComposer = 4
+
+// claudeHookSpinnerLive reports whether Claude's hook spinner is the live
+// status line: within claudeHookSpinnerAboveComposer non-empty lines above the
+// LAST composer line ("❯"), or of the capture's end when no composer shows.
+// A prompt whose hooks are running is already submitted, so busy is right for
+// every caller: submit confirmation, WaitForIdle, SnapshotIdle and the
+// queued-nudge transcript gate. An idle seat whose background agents tick
+// ("◯ general-purpose  … 1h 25m 34s · ↓ 228.0k tokens", below the composer)
+// stays idle.
+func claudeHookSpinnerLive(lines []string) bool {
+	end := len(lines)
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.HasPrefix(strings.TrimSpace(strings.ReplaceAll(lines[i], "\u00a0", " ")), "❯") {
+			end = i
+			break
+		}
+	}
+	seen := 0
+	for i := end - 1; i >= 0 && seen < claudeHookSpinnerAboveComposer; i-- {
+		line := strings.TrimRight(lines[i], " \t")
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		seen++
+		if claudeHookSpinnerRe.MatchString(line) {
+			return true
+		}
+	}
+	return false
+}
 
 // paneContainsBusyIndicator checks captured pane lines for signs that the agent
 // is actively processing. Agent TUIs surface this differently: older Claude Code
@@ -4854,12 +4889,11 @@ func paneContainsBusyIndicator(lines []string) bool {
 		if strings.Contains(line, "esc to interrupt") ||
 			strings.Contains(line, "Press Esc or Ctrl+C to cancel") ||
 			strings.Contains(line, "[current working directory ") ||
-			claudeBusySpinnerRe.MatchString(line) ||
-			claudeHookSpinnerRe.MatchString(line) {
+			claudeBusySpinnerRe.MatchString(line) {
 			return true
 		}
 	}
-	return false
+	return claudeHookSpinnerLive(lines)
 }
 
 // paneShowsDrainedComposer reports whether the pane's live composer -- the
