@@ -1250,8 +1250,9 @@ func TestNudgeSessionReSentEnterChecksOwnershipOnTheLastCapture(t *testing.T) {
 	for range submitConfirmPollsPerSend + 5 {
 		reads = append(reads, ours)
 	}
+	reads = append(reads, composerFixture("❯ actually, stop and rebase first"))
 	fe := &panePromptExecutor{screen: idleComposerFixture, attached: true}
-	fe.textCaptures = append(reads, composerFixture("❯ actually, stop and rebase first"))
+	fe.textCaptures = reads
 	tm, session := newGuardTestTmux(fe)
 
 	err := tm.NudgeSession(session, guardTestNudge)
