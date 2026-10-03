@@ -197,6 +197,31 @@ func hookRootStoreKey(dir string, env []string, rootID string) string {
 	return b.String()
 }
 
+// newStoreClosedRootGate arms the router's closed-root predicate over one
+// store, for the controller's demand count (ga-b2oxyf). Demand counted a step
+// the router skips — an open step of a molecule whose root was observed closed,
+// outside that root's teardown tail — so the pool spawned a seat that read
+// empty and drained, every tick. Sharing the gate (closedRootOf, the verdict
+// cache, the teardown tail) is what keeps spawn and claim from disagreeing.
+// Read-only: it reads roots and teardown members, and writes nothing. Its
+// diagnostic lines name gc hook --claim, so they are discarded here; an
+// unreadable root is counted, exactly as the router serves it.
+func newStoreClosedRootGate(store beads.Store) *hookClosedRootGate {
+	return &hookClosedRootGate{
+		read: func(_ context.Context, _ string, _ []string, rootID, _ string) (beads.Bead, error) {
+			return store.Get(rootID)
+		},
+		tailFor: func(_ context.Context, _ string, _ []string, rootID, _ string) (func(beads.Bead) bool, error) {
+			return hookClaimTeardownTail(store, rootID)
+		},
+		stderr:   io.Discard,
+		verdicts: map[string]*hookRootVerdict{},
+		byRoot:   map[string][]*hookRootVerdict{},
+		skipped:  map[string][]string{},
+		seen:     map[string]map[string]struct{}{},
+	}
+}
+
 // candidateRoot returns the root a candidate must be checked against, or "" when
 // the candidate is exempt without any read: no root id, its own root, or a
 // teardown-scoped step (served whatever the root's state).
@@ -392,8 +417,13 @@ func (g *hookClosedRootGate) observedClosedRootOf(bead beads.Bead, dir string, e
 	if rootID == "" {
 		return "", false
 	}
+	// A bead with no gc.step_id cannot be a teardown retry attempt (and a
+	// gc.scope_role=teardown bead never gets here — candidateRoot exempts it),
+	// so a closed root excludes it with no tail at all: the same rule
+	// cachedClosedRootOf skips it by (ga-b2oxyf).
+	noStepID := strings.TrimSpace(bead.Metadata[beadmeta.StepIDMetadataKey]) == ""
 	excludes := func(v *hookRootVerdict) bool {
-		return v.closed && v.tail != nil && !v.tail(bead)
+		return v.closed && (noStepID || (v.tail != nil && !v.tail(bead)))
 	}
 	if v, ok := g.verdicts[hookRootStoreKey(dir, env, rootID)]; ok && (v.open || v.closed) {
 		if excludes(v) {
