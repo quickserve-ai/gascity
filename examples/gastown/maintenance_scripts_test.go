@@ -8395,6 +8395,7 @@ func TestJsonlExportDeltifiesExportsAboveGitsBigFileThreshold(t *testing.T) {
 	}
 
 	got := readArchiveBlobStorage(t, archiveRepo, jsonlDeltaLargeBlobMin)
+	t.Logf("large blobs after %d exports: %s", versions, got)
 	if got.whole+got.deltas != versions {
 		t.Fatalf("archive holds %d large blobs, want one per export (%d): %s", got.whole+got.deltas, versions, got)
 	}
@@ -8450,6 +8451,7 @@ func TestJsonlExportPacksLooseObjectsAboveTheByteCeiling(t *testing.T) {
 			t.Fatalf("after run %d: %d KiB of loose objects, over the %d KiB ceiling (%d loose objects, under the count ceiling of %d)", v+1, counts["size"], ceilingKiB, counts["count"], countCeiling)
 		}
 	}
+	t.Logf("snapshot %d KiB, ceiling %d KiB, after the last run: %v", snapshotKiB, ceilingKiB, counts)
 	if counts["packs"] == 0 {
 		t.Fatalf("the byte ceiling never packed the loose objects: %v", counts)
 	}
@@ -8489,13 +8491,15 @@ func TestJsonlExportPackConsolidationKeepsLargeExportsAsDeltas(t *testing.T) {
 	}
 
 	got := readArchiveBlobStorage(t, archiveRepo, jsonlDeltaLargeBlobMin)
+	packs := readArchiveCountObjects(t, archiveRepo)["packs"]
+	t.Logf("large blobs after %d exports: %s; packs=%d", versions, got, packs)
 	if got.whole+got.deltas != versions {
 		t.Fatalf("archive holds %d large blobs, want one per export (%d): %s", got.whole+got.deltas, versions, got)
 	}
 	if got.whole > 2 {
 		t.Fatalf("%d of %d exports are stored whole across pack consolidations, want one base (two at most, if an incremental pack follows the last consolidation): %s", got.whole, versions, got)
 	}
-	if packs := readArchiveCountObjects(t, archiveRepo)["packs"]; packs > packLimit+1 {
+	if packs > packLimit+1 {
 		t.Fatalf("the archive holds %d packs with a pack limit of %d: no consolidation ran", packs, packLimit)
 	}
 	assertNoArchiveRepackFailure(t, stateFile)
