@@ -56,8 +56,10 @@ The conversations recorded on its session bead (session_key,
 prior_session_key) are found by id under any projects folder, and the folders
 of its bead's work dirs and of its in-progress tasks' work_dirs are listed too.
 Tasks are looked up in the city bead store and in every rig's bead store, the
-stores the reconciler reads; a rig store that cannot be opened is named on
-stderr and skipped. Those folders can be shared with other agents, and so can
+stores the reconciler reads, all under one 10 s budget; a store that fails or
+does not answer in time is named on stderr and skipped, and then a "no
+conversations found" says the search was incomplete and the JSON carries
+incomplete: true and skipped_lookups. Those folders can be shared with other agents, and so can
 a pool instance's own work dir or one under .gc/worktrees/, so from them only
 conversations whose id is on the bead are taken, plus, for a named or aliased
 session that is not a pool instance, conversations recorded under that name.
@@ -113,7 +115,8 @@ work dir instead and says on stderr what it found.
 
 Selecting a transcript that the reaper moved into the archive restores it
 (copies it) into the live projects directory first, so the provider can find
-it again; --print does that restore too.
+it again; --print does that restore too, and notes it on stderr so stdout
+stays the one command.
 
 session-id may be any unambiguous prefix of an id from "gc session history".
 Note: "gc session pin" (pin_awake) prevents the idle-close that loses context
@@ -254,13 +257,17 @@ func liveSessionKeysForScope(store beads.Store, target sessionHistoryTarget, sco
 }
 
 type sessionHistoryJSON struct {
-	SchemaVersion string                  `json:"schema_version"`
-	OK            bool                    `json:"ok"`
-	Command       string                  `json:"command"`
-	Agent         string                  `json:"agent"`
-	WorkDir       string                  `json:"work_dir"`
-	Total         int                     `json:"total"`
-	Conversations []sessionHistoryRowJSON `json:"conversations"`
+	SchemaVersion string `json:"schema_version"`
+	OK            bool   `json:"ok"`
+	Command       string `json:"command"`
+	Agent         string `json:"agent"`
+	WorkDir       string `json:"work_dir"`
+	Total         int    `json:"total"`
+	// Incomplete is true when a task lookup was skipped: Total then counts
+	// only what was searched, and SkippedLookups names what was not.
+	Incomplete     bool                    `json:"incomplete"`
+	SkippedLookups []string                `json:"skipped_lookups,omitempty"`
+	Conversations  []sessionHistoryRowJSON `json:"conversations"`
 }
 
 type sessionHistoryRowJSON struct {
@@ -308,7 +315,7 @@ func cmdSessionHistory(identifier string, limit int, jsonOutput bool, archiveRoo
 	scope := resolveSessionHistoryScope(cityPath, cfg, store, identifier, target, stderr)
 	entries := listSessionHistory(target, scope, searchPaths, archiveRoots)
 	if len(entries) == 0 {
-		fmt.Fprintf(stderr, "gc session history: no conversations found for %q (work dir %s)\n", target.identifier, target.workDir) //nolint:errcheck // best-effort stderr
+		fmt.Fprintf(stderr, "gc session history: no conversations found for %q (work dir %s)%s\n", target.identifier, target.workDir, scope.incompleteNote()) //nolint:errcheck // best-effort stderr
 		return 1
 	}
 	total := len(entries)
@@ -342,13 +349,15 @@ func cmdSessionHistory(identifier string, limit int, jsonOutput bool, archiveRoo
 			rows = append(rows, row)
 		}
 		payload := sessionHistoryJSON{
-			SchemaVersion: "1",
-			OK:            true,
-			Command:       "session history",
-			Agent:         target.identifier,
-			WorkDir:       target.workDir,
-			Total:         total,
-			Conversations: rows,
+			SchemaVersion:  "1",
+			OK:             true,
+			Command:        "session history",
+			Agent:          target.identifier,
+			WorkDir:        target.workDir,
+			Total:          total,
+			Incomplete:     len(scope.skippedLookups) > 0,
+			SkippedLookups: scope.skippedLookups,
+			Conversations:  rows,
 		}
 		if err := json.NewEncoder(stdout).Encode(payload); err != nil {
 			fmt.Fprintf(stderr, "gc session history: encoding JSON: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -469,7 +478,7 @@ func cmdSessionResume(args []string, last, printOnly bool, archiveRoot string, s
 	scope := resolveSessionHistoryScope(cityPath, cfg, store, identifier, target, stderr)
 	entries := listSessionHistory(target, scope, searchPaths, archiveRoots)
 	if len(entries) == 0 {
-		fmt.Fprintf(stderr, "gc session resume: no conversations found for %q (work dir %s)\n", target.identifier, target.workDir) //nolint:errcheck // best-effort stderr
+		fmt.Fprintf(stderr, "gc session resume: no conversations found for %q (work dir %s)%s\n", target.identifier, target.workDir, scope.incompleteNote()) //nolint:errcheck // best-effort stderr
 		return 1
 	}
 	live := liveSessionKeysForScope(store, target, scope)
@@ -496,7 +505,7 @@ func cmdSessionResume(args []string, last, printOnly bool, archiveRoot string, s
 		}
 		switch len(matches) {
 		case 0:
-			fmt.Fprintf(stderr, "gc session resume: no conversation matching %q — list them with: gc session history %s\n", requested, target.identifier) //nolint:errcheck // best-effort stderr
+			fmt.Fprintf(stderr, "gc session resume: no conversation matching %q — list them with: gc session history %s%s\n", requested, target.identifier, scope.incompleteNote()) //nolint:errcheck // best-effort stderr
 			return 1
 		case 1:
 			chosen = matches[0]
@@ -522,7 +531,8 @@ func cmdSessionResume(args []string, last, printOnly bool, archiveRoot string, s
 			return 1
 		}
 		transcriptPath = restored
-		fmt.Fprintf(stdout, "Restored archived transcript to %s\n", restored) //nolint:errcheck // best-effort stdout
+		// stderr, so --print's stdout stays the one command a caller can eval.
+		fmt.Fprintf(stderr, "Restored archived transcript to %s\n", restored) //nolint:errcheck // best-effort stderr
 	}
 
 	if printOnly {
@@ -659,6 +669,20 @@ type sessionHistoryScope struct {
 	// an alias, never a pool instance's (its agent_name is its template, which
 	// every instance records, and it attributes by id only).
 	names map[string]bool
+	// skippedLookups names each store whose in-progress task lookup failed or
+	// did not answer in time: the worktrees its tasks ran in were not
+	// searched, so an empty or missing result is incomplete, not "none".
+	skippedLookups []string
+}
+
+// incompleteNote is the clause a "found nothing" message carries when a task
+// lookup was skipped, so the reader is never told a conversation does not
+// exist when its folder was not searched. Empty when nothing was skipped.
+func (s sessionHistoryScope) incompleteNote() string {
+	if len(s.skippedLookups) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("; the search was INCOMPLETE: the task lookup in %s was skipped (see above), so worktrees its tasks ran in were not searched", strings.Join(s.skippedLookups, ", "))
 }
 
 func (s sessionHistoryScope) attributable(e worker.SessionHistoryEntry) bool {
@@ -726,9 +750,11 @@ func resolveSessionHistoryScope(cityPath string, cfg *config.City, store beads.S
 			assignees = append(taskWorkDirAssignees(startCandidate{info: info}, cfg), assignees...)
 		}
 	}
-	for _, dir := range inProgressTaskWorkDirs(cityPath, cfg, store, stderr, assignees...) {
+	taskDirs, skipped := inProgressTaskWorkDirs(cityPath, cfg, store, stderr, assignees...)
+	for _, dir := range taskDirs {
 		addDir(dir)
 	}
+	scope.skippedLookups = skipped
 	return scope
 }
 
@@ -743,8 +769,10 @@ func underSharedWorktreeRoot(dir string) bool {
 // dirs; a var so tests can stand in a store that stalls or fails.
 var historyRigStoreOpener = oneShotRigStoreOpener
 
-// historyTaskLookupTimeout bounds history's whole task-dir discovery: a rig
-// that has not answered by then is skipped and named on stderr.
+// historyTaskLookupTimeout bounds history's whole task-dir discovery: a store
+// that has not answered by then is skipped and named on stderr. The lookups
+// are abandoned, not canceled: neither a rig open nor a List takes a context,
+// so a stalled one runs on until the command exits.
 var historyTaskLookupTimeout = 10 * time.Second
 
 // inProgressTaskWorkDirs returns the work_dir of every in-progress task bead
@@ -752,10 +780,14 @@ var historyTaskLookupTimeout = 10 * time.Second
 // reads (the city store and every rig store), using the per-bead resolution
 // the launch path uses but collecting every distinct dir instead of stopping
 // at the newest. The whole lookup runs under historyTaskLookupTimeout: a store
-// that fails, or has not answered by then, is skipped and named on stderr.
-func inProgressTaskWorkDirs(cityPath string, cfg *config.City, store beads.Store, stderr io.Writer, assignees ...string) []string {
+// that fails, or has not answered by then, is skipped, named on stderr and
+// returned in skipped.
+//
+// The city store's query starts at once, beside the rig opens, so a rig store
+// that hangs while opening cannot spend the city store's share of the budget.
+func inProgressTaskWorkDirs(cityPath string, cfg *config.City, store beads.Store, stderr io.Writer, assignees ...string) (dirs, skipped []string) {
 	if store == nil {
-		return nil
+		return nil, nil
 	}
 	var wanted []string
 	seenAssignee := make(map[string]bool, len(assignees))
@@ -767,61 +799,103 @@ func inProgressTaskWorkDirs(cityPath string, cfg *config.City, store beads.Store
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), historyTaskLookupTimeout)
 	defer cancel()
-	skipped := func(leg, reason string) {
-		fmt.Fprintf(stderr, "history: %s task lookup skipped: %s; conversations from its worktrees may be missing\n", leg, reason) //nolint:errcheck // best-effort stderr
+	skip := func(leg, reason string) {
+		skipped = append(skipped, leg)
+		fmt.Fprintf(stderr, "gc session: %s task lookup skipped: %s; conversations from its worktrees may be missing\n", leg, reason) //nolint:errcheck // best-effort stderr
 	}
-	legs := historyTaskLegs(ctx, cityPath, cfg, store, skipped)
 	type legDirs struct {
 		idx  int
 		dirs []string
 		err  error
 	}
-	results := make(chan legDirs, len(legs))
-	for i, leg := range legs {
-		go func() {
-			var dirs []string
-			for _, assignee := range wanted {
-				assigned, err := leg.store.List(beads.ListQuery{
-					Assignee: assignee,
-					Status:   "in_progress",
-					Live:     true,
-					TierMode: beads.TierBoth,
-					Sort:     beads.SortCreatedDesc,
-				})
-				if err != nil {
-					results <- legDirs{idx: i, err: err}
-					return
-				}
-				for _, b := range assigned {
-					if dir := resolveTaskBeadWorkDir(cityPath, leg.store, b); dir != "" {
-						dirs = append(dirs, dir)
-					}
+	listLeg := func(idx int, s beads.Store, out chan<- legDirs) {
+		var found []string
+		for _, assignee := range wanted {
+			assigned, err := s.List(beads.ListQuery{
+				Assignee: assignee,
+				Status:   "in_progress",
+				Live:     true,
+				TierMode: beads.TierBoth,
+				Sort:     beads.SortCreatedDesc,
+			})
+			if err != nil {
+				out <- legDirs{idx: idx, err: err}
+				return
+			}
+			for _, b := range assigned {
+				if dir := resolveTaskBeadWorkDir(cityPath, s, b); dir != "" {
+					found = append(found, dir)
 				}
 			}
-			results <- legDirs{idx: i, dirs: dirs}
-		}()
+		}
+		out <- legDirs{idx: idx, dirs: found}
+	}
+	// The city leg is index -1 until the census names its position.
+	cityResult := make(chan legDirs, 1)
+	go listLeg(-1, store, cityResult)
+
+	legs := historyTaskLegs(ctx, cityPath, cfg, store, skip)
+	cityIdx := -1
+	results := make(chan legDirs, len(legs))
+	for i, leg := range legs {
+		if leg.ref == "" && cityIdx < 0 {
+			cityIdx = i // the city work store: already being listed
+			continue
+		}
+		go listLeg(i, leg.store, results)
+	}
+	if cityIdx < 0 {
+		// A census with no bare-ref leg: the city store, already being listed,
+		// becomes its own leg. Appended, so the indices the rig legs were
+		// started with stay valid.
+		legs = append(legs, classStoreCandidate{store: store})
+		cityIdx = len(legs) - 1
 	}
 	perLeg := make([][]string, len(legs))
 	answered := make([]bool, len(legs))
+	record := func(r legDirs) {
+		answered[r.idx] = true
+		if r.err != nil {
+			skip(historyLegName(legs[r.idx].ref), r.err.Error())
+			return
+		}
+		perLeg[r.idx] = r.dirs
+	}
+	pending := len(legs)
+	take := func(r legDirs, city bool) {
+		if city {
+			r.idx = cityIdx
+		}
+		record(r)
+		pending--
+	}
 collect:
-	for range legs {
+	for pending > 0 {
+		// An answer already in hand is taken before the deadline is
+		// consulted: select picks at random among ready cases, so a passed
+		// deadline would otherwise discard an answer that arrived in time.
 		select {
+		case r := <-cityResult:
+			take(r, true)
+			continue
 		case r := <-results:
-			answered[r.idx] = true
-			if r.err != nil {
-				skipped(historyLegName(legs[r.idx].ref), r.err.Error())
-				continue
-			}
-			perLeg[r.idx] = r.dirs
+			take(r, false)
+			continue
+		default:
+		}
+		select {
+		case r := <-cityResult:
+			take(r, true)
+		case r := <-results:
+			take(r, false)
 		case <-ctx.Done():
 			break collect
 		}
 	}
-	var dirs []string
 	seenDir := make(map[string]bool)
 	for i, legDirs := range perLeg {
 		if !answered[i] {
-			skipped(historyLegName(legs[i].ref), fmt.Sprintf("no answer within %s", historyTaskLookupTimeout))
+			skip(historyLegName(legs[i].ref), fmt.Sprintf("no answer within %s", historyTaskLookupTimeout))
 		}
 		for _, dir := range legDirs {
 			if !seenDir[dir] {
@@ -830,13 +904,15 @@ collect:
 			}
 		}
 	}
-	return dirs
+	return dirs, skipped
 }
 
-// historyTaskLegs opens every bound rig store concurrently (a store not open
-// before ctx ends is skipped) and returns the census leg set over the city
-// store and the rig stores that opened, or the city store alone when the
-// census refuses.
+// historyTaskLegs opens every bound rig store concurrently and returns the
+// census leg set over the city store and the rig stores that opened, or the
+// city store alone when the census refuses. The opens get HALF the lookup
+// budget (a store not open by then is skipped): the rig queries start only
+// after this returns, so one store hanging in open must not spend the healthy
+// rigs' whole budget and leave them reported as not answering.
 func historyTaskLegs(ctx context.Context, cityPath string, cfg *config.City, store beads.Store, skipped func(leg, reason string)) []classStoreCandidate {
 	cityOnly := []classStoreCandidate{{store: store}}
 	if cfg == nil || len(cfg.Rigs) == 0 {
@@ -860,6 +936,9 @@ func historyTaskLegs(ctx context.Context, cityPath string, cfg *config.City, sto
 			results <- opened{rig: rig.Name, store: s, err: err}
 		}()
 	}
+	openBudget := historyTaskLookupTimeout / 2
+	openCtx, cancelOpen := context.WithTimeout(ctx, openBudget)
+	defer cancelOpen()
 	rigStores := make(map[string]beads.Store, len(pending))
 	done := make(map[string]bool, len(pending))
 wait:
@@ -872,18 +951,18 @@ wait:
 				continue
 			}
 			rigStores[o.rig] = o.store
-		case <-ctx.Done():
+		case <-openCtx.Done():
 			break wait
 		}
 	}
 	for _, rig := range pending {
 		if !done[rig] {
-			skipped("rig "+rig, fmt.Sprintf("store did not open within %s", historyTaskLookupTimeout))
+			skipped("rig "+rig, fmt.Sprintf("store did not open within %s", openBudget))
 		}
 	}
 	legs, err := censusStoreCandidates(cityPath, cfg, store, rigStores, nil, censusRefBare)
 	if err != nil {
-		skipped("every rig", err.Error())
+		skipped("every rig and class-binding store", err.Error())
 		return cityOnly
 	}
 	return legs
