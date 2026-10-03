@@ -234,7 +234,7 @@ func TestSendNudgeSubmitSequenceGuardsEveryKey(t *testing.T) {
 	ex := &paneAfterFirstKeyExecutor{before: idleComposerFixture, after: questionDialogFixture, attached: "0"}
 	tm := &Tmux{cfg: DefaultConfig(), exec: ex}
 
-	err := tm.sendNudgeSubmitSequence("agent-pane", []string{"Escape", "Enter"})
+	err := tm.sendNudgeSubmitSequence(context.Background(), "agent-pane", []string{"Escape", "Enter"})
 	if reason, deferred := NudgeDeferredReason(err); !deferred || reason != NudgeDeferReasonQuestionDialog {
 		t.Fatalf("sendNudgeSubmitSequence = %v, want a %s deferral before the second key", err, NudgeDeferReasonQuestionDialog)
 	}
