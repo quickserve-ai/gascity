@@ -7459,9 +7459,12 @@ func TestJsonlExportRepackFailureIsCountedEscalatedAndCleared(t *testing.T) {
 	}
 
 	// Run 3: git works again. The repack succeeds and the streak clears.
+	// At the threshold the repack backs off until the re-escalation window
+	// has passed since the last attempt; a zero window has passed already.
 	if err := os.Remove(filepath.Join(binDir, "git")); err != nil {
 		t.Fatalf("Remove(git stub): %v", err)
 	}
+	env["GC_JSONL_REPACK_REESCALATE_SECONDS"] = "0"
 	writeMultiRecordDoltStub(t, binDir, 5)
 	runScript(t, coreScriptPath("jsonl-export.sh"), env)
 	state = readState()
@@ -8510,17 +8513,22 @@ func TestJsonlExportPackSettingsReachEveryArchiveGitWrite(t *testing.T) {
 		t.Fatalf("jsonl-export.sh failed: %v\n%s", runErr, out)
 	}
 
-	defaults := []string{"core.bigFileThreshold=4g", "pack.threads=1", "pack.windowMemory=8g"}
+	defaults := []string{"core.bigFileThreshold=4g", "pack.threads=1", "pack.windowMemory=2g", "pack.window=2"}
+	// commit, fetch and rebase run git's own auto-maintenance, which could
+	// start a detached gc that outlives the order; push is held to the same.
+	noAutoGC := append(slices.Clone(defaults), "gc.auto=0", "maintenance.auto=false")
 	want := map[string][]string{
 		"add":    defaults,
-		"commit": defaults,
+		"commit": noAutoGC,
 		"gc":     append(slices.Clone(defaults), "gc.auto=256", "gc.autoDetach=false", "gc.autoPackLimit=10"),
 		"repack": defaults,
-		"fetch":  defaults,
-		"rebase": defaults,
-		"push":   defaults,
-		"prune":  append(slices.Clone(defaults), "--expire=10.minutes.ago"),
+		"fetch":  noAutoGC,
+		"rebase": noAutoGC,
+		"push":   noAutoGC,
+		"prune":  append(slices.Clone(defaults), "--expire=60.minutes.ago"),
 	}
+	// The script's own gc --auto is the one git call that may pack.
+	forbid := map[string][]string{"gc": {"gc.auto=0", "maintenance.auto=false"}}
 	data, err := os.ReadFile(gitLog)
 	if err != nil {
 		t.Fatalf("ReadFile(git log): %v", err)
@@ -8561,6 +8569,11 @@ func TestJsonlExportPackSettingsReachEveryArchiveGitWrite(t *testing.T) {
 		if len(missing) > 0 {
 			t.Errorf("git %s runs without %s: git %s", subcommand, strings.Join(missing, ", "), line)
 		}
+		for _, setting := range forbid[subcommand] {
+			if configs[setting] {
+				t.Errorf("git %s runs with -c %s: git %s", subcommand, setting, line)
+			}
+		}
 	}
 	for subcommand := range want {
 		if !seen[subcommand] {
@@ -8580,6 +8593,9 @@ func TestJsonlExportPackSettingsReachEveryArchiveGitWrite(t *testing.T) {
 // out-of-range value fails the repack instead of falling back. The maximum
 // itself is accepted and reaches git; one past it, and 2147483648 (one past
 // a signed 32-bit int), are refused with a warning and the default is used.
+// The minimums hold the same way: a big-file threshold under git's own
+// 512m, a window memory under 256m, and a prune grace inside the order's
+// 30-minute timeout are refused.
 func TestJsonlExportKnobBoundsRefuseValuesGitCannotTake(t *testing.T) {
 	for _, tt := range []struct {
 		key      string
@@ -8596,19 +8612,27 @@ func TestJsonlExportKnobBoundsRefuseValuesGitCannotTake(t *testing.T) {
 		{"GC_JSONL_REPACK_PACK_LIMIT", "10000", true, "gc.autoPackLimit=10000"},
 		{"GC_JSONL_REPACK_PACK_LIMIT", "10001", false, "gc.autoPackLimit=10"},
 		{"GC_JSONL_REPACK_PACK_LIMIT", "2147483648", false, "gc.autoPackLimit=10"},
+		{"GC_JSONL_PRUNE_GRACE_MINUTES", "35", true, "--expire=35.minutes.ago"},
+		{"GC_JSONL_PRUNE_GRACE_MINUTES", "34", false, "--expire=60.minutes.ago"},
 		{"GC_JSONL_PRUNE_GRACE_MINUTES", "10080", true, "--expire=10080.minutes.ago"},
-		{"GC_JSONL_PRUNE_GRACE_MINUTES", "10081", false, "--expire=10.minutes.ago"},
-		{"GC_JSONL_PRUNE_GRACE_MINUTES", "2147483648", false, "--expire=10.minutes.ago"},
+		{"GC_JSONL_PRUNE_GRACE_MINUTES", "10081", false, "--expire=60.minutes.ago"},
+		{"GC_JSONL_PRUNE_GRACE_MINUTES", "2147483648", false, "--expire=60.minutes.ago"},
 		{"GC_JSONL_REPACK_LOOSE_CEILING", "1000000", true, ""},
 		{"GC_JSONL_REPACK_LOOSE_CEILING", "1000001", false, ""},
 		{"GC_JSONL_REPACK_LOOSE_KIB_CEILING", "1073741824", true, ""},
 		{"GC_JSONL_REPACK_LOOSE_KIB_CEILING", "1073741825", false, ""},
+		{"GC_JSONL_BIG_FILE_THRESHOLD", "512m", true, "core.bigFileThreshold=512m"},
+		{"GC_JSONL_BIG_FILE_THRESHOLD", "511m", false, "core.bigFileThreshold=4g"},
+		{"GC_JSONL_BIG_FILE_THRESHOLD", "536870911", false, "core.bigFileThreshold=4g"},
 		{"GC_JSONL_BIG_FILE_THRESHOLD", "64g", true, "core.bigFileThreshold=64g"},
 		{"GC_JSONL_BIG_FILE_THRESHOLD", "65g", false, "core.bigFileThreshold=4g"},
 		{"GC_JSONL_BIG_FILE_THRESHOLD", "68719476737", false, "core.bigFileThreshold=4g"},
+		{"GC_JSONL_PACK_WINDOW_MEMORY", "256m", true, "pack.windowMemory=256m"},
+		{"GC_JSONL_PACK_WINDOW_MEMORY", "255m", false, "pack.windowMemory=2g"},
+		{"GC_JSONL_PACK_WINDOW_MEMORY", "268435455", false, "pack.windowMemory=2g"},
 		{"GC_JSONL_PACK_WINDOW_MEMORY", "256g", true, "pack.windowMemory=256g"},
-		{"GC_JSONL_PACK_WINDOW_MEMORY", "257g", false, "pack.windowMemory=8g"},
-		{"GC_JSONL_PACK_WINDOW_MEMORY", "274877906945", false, "pack.windowMemory=8g"},
+		{"GC_JSONL_PACK_WINDOW_MEMORY", "257g", false, "pack.windowMemory=2g"},
+		{"GC_JSONL_PACK_WINDOW_MEMORY", "274877906945", false, "pack.windowMemory=2g"},
 	} {
 		t.Run(tt.key+"="+tt.value, func(t *testing.T) {
 			cityDir := t.TempDir()
@@ -8693,16 +8717,22 @@ func archiveHasObject(archiveRepo, oid string) bool {
 // Unreachable loose objects count toward the KiB ceiling, but no repack packs
 // them: a few discarded snapshot blobs would fail the post-condition on every
 // run and escalate. The explicit repack prunes the unreachable loose objects
-// older than GC_JSONL_PRUNE_GRACE_MINUTES (default 10), so they are gone and
-// the run records no failure; one younger than the grace survives the run.
-// Nothing reachable is pruned.
+// older than GC_JSONL_PRUNE_GRACE_MINUTES (default 60, longer than the
+// order's 30-minute timeout, so it never takes an object a live run may
+// still commit), so they are gone and the run records no failure. One
+// younger than the grace survives the run, and young garbage alone holding
+// the loose objects over the ceiling is not a failure: it waits for the
+// grace. Nothing reachable is pruned.
 func TestJsonlExportExplicitRepackPrunesUnreachableLooseObjectsPastTheGrace(t *testing.T) {
 	for _, tt := range []struct {
 		name       string
-		withRecent bool
+		age        time.Duration // of the three ~100 KB unreachable blobs
+		pruned     bool          // whether those three must be gone
+		withRecent bool          // add a fresh ~40 KB unreachable blob that must survive
 	}{
-		{name: "older than the grace are pruned"},
-		{name: "newer than the grace survive", withRecent: true},
+		{name: "older than the grace are pruned", age: 2 * time.Hour, pruned: true},
+		{name: "newer than the grace survive", age: 2 * time.Hour, pruned: true, withRecent: true},
+		{name: "young garbage over the ceiling is not a failure", age: 30 * time.Minute, pruned: false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			cityDir := t.TempDir()
@@ -8720,12 +8750,12 @@ func TestJsonlExportExplicitRepackPrunesUnreachableLooseObjectsPastTheGrace(t *t
 			writeIssuesPayloadDoltStub(t, binDir, jsonlGrowingStorePayload(0))
 			runScript(t, coreScriptPath("jsonl-export.sh"), env)
 
-			// About 300 KiB of unreachable garbage an hour old, against a
-			// 200 KiB ceiling; the recent blob alone fits under it.
+			// About 300 KiB of unreachable garbage, against a 200 KiB
+			// ceiling; the recent blob alone fits under it.
 			const ceilingKiB = 200
-			var stale []string
+			var garbage []string
 			for seed := 0; seed < 3; seed++ {
-				stale = append(stale, writeUnreachableLooseBlob(t, archiveRepo, 100_000, seed, time.Now().Add(-time.Hour)))
+				garbage = append(garbage, writeUnreachableLooseBlob(t, archiveRepo, 100_000, seed, time.Now().Add(-tt.age)))
 			}
 			recent := ""
 			if tt.withRecent {
@@ -8736,9 +8766,9 @@ func TestJsonlExportExplicitRepackPrunesUnreachableLooseObjectsPastTheGrace(t *t
 			writeIssuesPayloadDoltStub(t, binDir, jsonlGrowingStorePayload(1))
 			runScript(t, coreScriptPath("jsonl-export.sh"), env)
 
-			for _, oid := range stale {
-				if archiveHasObject(archiveRepo, oid) {
-					t.Errorf("unreachable loose blob %s, an hour old, survived the explicit repack", oid)
+			for _, oid := range garbage {
+				if survived := archiveHasObject(archiveRepo, oid); survived == tt.pruned {
+					t.Errorf("unreachable loose blob %s, %s old: survived=%v, want pruned=%v", oid, tt.age, survived, tt.pruned)
 				}
 			}
 			if recent != "" && !archiveHasObject(archiveRepo, recent) {
@@ -8746,13 +8776,254 @@ func TestJsonlExportExplicitRepackPrunesUnreachableLooseObjectsPastTheGrace(t *t
 			}
 			counts := readArchiveCountObjects(t, archiveRepo)
 			t.Logf("after the explicit repack: %v", counts)
-			if counts["size"] > ceilingKiB {
+			if tt.pruned && counts["size"] > ceilingKiB {
 				t.Errorf("%d KiB of loose objects remain over the %d KiB ceiling: %v", counts["size"], ceilingKiB, counts)
 			}
 			assertNoArchiveRepackFailure(t, stateFile)
 			// Nothing reachable may go: every commit, tree and blob is present.
 			runGit(t, archiveRepo, "fsck", "--connectivity-only", "--no-dangling")
 		})
+	}
+}
+
+// writeJsonlExportState seeds the export's state file with body.
+func writeJsonlExportState(t *testing.T, stateFile, body string) {
+	t.Helper()
+	if err := os.WriteFile(stateFile, []byte(body+"\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile(state file): %v", err)
+	}
+}
+
+// readJsonlExportState parses the export's state file.
+func readJsonlExportState(t *testing.T, stateFile string) map[string]any {
+	t.Helper()
+	data, err := os.ReadFile(stateFile)
+	if err != nil {
+		t.Fatalf("ReadFile(state file): %v", err)
+	}
+	var state map[string]any
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("Unmarshal(state file): %v\n%s", err, data)
+	}
+	return state
+}
+
+// The repack marker's horizon is the order's timeout: a marker older than it
+// means the run that set it was killed. The script's constant must match the
+// order.
+func TestJsonlExportRepackMarkerHorizonMatchesTheOrderTimeout(t *testing.T) {
+	order, err := os.ReadFile(filepath.Join(corePackDir(), "orders", "jsonl-export.toml"))
+	if err != nil {
+		t.Fatalf("ReadFile(order): %v", err)
+	}
+	orderMatch := regexp.MustCompile(`(?m)^timeout\s*=\s*"(\d+)m"`).FindSubmatch(order)
+	if orderMatch == nil {
+		t.Fatalf("orders/jsonl-export.toml has no timeout in minutes:\n%s", order)
+	}
+	script, err := os.ReadFile(coreScriptPath("jsonl-export.sh"))
+	if err != nil {
+		t.Fatalf("ReadFile(script): %v", err)
+	}
+	scriptMatch := regexp.MustCompile(`(?m)^JSONL_ORDER_TIMEOUT_SECONDS=(\d+)$`).FindSubmatch(script)
+	if scriptMatch == nil {
+		t.Fatalf("jsonl-export.sh defines no JSONL_ORDER_TIMEOUT_SECONDS")
+	}
+	minutes, _ := strconv.Atoi(string(orderMatch[1]))
+	seconds, _ := strconv.Atoi(string(scriptMatch[1]))
+	if minutes*60 != seconds {
+		t.Fatalf("JSONL_ORDER_TIMEOUT_SECONDS=%d, but the order's timeout is %dm (%ds)", seconds, minutes, minutes*60)
+	}
+}
+
+// A run killed mid-repack (the order's timeout kills its process group, and
+// a detached gc it started would outlive it) leaves repack_in_flight_since in
+// state. A marker older than the order's timeout means that run died: it is
+// recorded as a repack failure through the usual path, so it counts and
+// escalates, and the marker is cleared.
+func TestJsonlExportRepackMarkerOlderThanTheOrderTimeoutIsAFailure(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+	mailLog := filepath.Join(t.TempDir(), "gc-mail.log")
+	archiveRepo := filepath.Join(cityDir, "archive")
+	stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
+
+	writeJsonlExportGCStub(t, binDir)
+	writeMultiRecordDoltStub(t, binDir, 3)
+	died := time.Now().Add(-time.Hour).Unix()
+	writeJsonlExportState(t, stateFile, fmt.Sprintf(`{"repack_in_flight_since":%d,"last_repack_attempt_at":%d}`, died, died))
+	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
+	env["GC_JSONL_MAX_REPACK_FAILURES"] = "1"
+
+	runScript(t, coreScriptPath("jsonl-export.sh"), env)
+
+	state := readJsonlExportState(t, stateFile)
+	if got := state["consecutive_repack_failures"]; got != float64(1) {
+		t.Errorf("consecutive_repack_failures = %v, want 1: a run that died mid-repack is a failure\nstate: %v", got, state)
+	}
+	if got, _ := state["last_repack_stderr"].(string); !strings.Contains(got, "repack_in_flight_since") {
+		t.Errorf("last_repack_stderr = %q, want the stale repack_in_flight_since named", got)
+	}
+	if _, ok := state["repack_in_flight_since"]; ok {
+		t.Errorf("the dead run's marker must be cleared once it is counted\nstate: %v", state)
+	}
+	mailData, err := os.ReadFile(mailLog)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("ReadFile(mail log): %v", err)
+	}
+	if !strings.Contains(string(mailData), "ESCALATION: JSONL archive repack failing") {
+		t.Errorf("the failure reaches GC_JSONL_MAX_REPACK_FAILURES=1 and must escalate; mail log:\n%s", mailData)
+	}
+}
+
+// A marker younger than the timeout may belong to a run still in flight (a
+// manual `gc order run` is not single-flight), so it is no failure. The run
+// repacks under a marker of its own, which is in state while the repack runs
+// and gone after.
+func TestJsonlExportRepackMarkerYoungerThanTheOrderTimeoutIsNotAFailure(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+	mailLog := filepath.Join(t.TempDir(), "gc-mail.log")
+	archiveRepo := filepath.Join(cityDir, "archive")
+	stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
+	duringGC := filepath.Join(t.TempDir(), "state-during-gc.json")
+
+	// `git gc` copies the state file aside, so the test sees the marker
+	// the repack step runs under; `git repack` is real.
+	gcScriptedStub(t, binDir, filepath.Join(t.TempDir(), "repack.log"), fmt.Sprintf("cp '%s' '%s'", stateFile, duringGC))
+	writeJsonlExportGCStub(t, binDir)
+	writeMultiRecordDoltStub(t, binDir, 3)
+	young := time.Now().Add(-time.Minute).Unix()
+	writeJsonlExportState(t, stateFile, fmt.Sprintf(`{"repack_in_flight_since":%d,"last_repack_attempt_at":%d}`, young, young))
+	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
+	env["GC_JSONL_REPACK_LOOSE_CEILING"] = "0"
+
+	runScript(t, coreScriptPath("jsonl-export.sh"), env)
+
+	assertNoArchiveRepackFailure(t, stateFile)
+	during := readJsonlExportState(t, duringGC)
+	if got, ok := during["repack_in_flight_since"].(float64); !ok || int64(got) <= young {
+		t.Errorf("during the repack, repack_in_flight_since = %v, want this run's own start (after %d)\nstate: %v", during["repack_in_flight_since"], young, during)
+	}
+	state := readJsonlExportState(t, stateFile)
+	if _, ok := state["repack_in_flight_since"]; ok {
+		t.Errorf("the run must clear its marker when the repack step ends\nstate: %v", state)
+	}
+	if got, ok := state["last_repack_attempt_at"].(float64); !ok || int64(got) <= young {
+		t.Errorf("last_repack_attempt_at = %v, want this run's attempt (after %d)\nstate: %v", state["last_repack_attempt_at"], young, state)
+	}
+	if loose := readArchiveCountObjects(t, archiveRepo)["count"]; loose != 0 {
+		t.Errorf("the repack must have run and packed every loose object; %d remain", loose)
+	}
+}
+
+// Once the failures reach GC_JSONL_MAX_REPACK_FAILURES, the repack is skipped
+// until GC_JSONL_REPACK_REESCALATE_SECONDS (default a day) has passed since
+// the last attempt, so a repack that keeps dying at the order's timeout
+// cannot take every run with it. The snapshot still commits. Past the window
+// the repack is tried again.
+func TestJsonlExportRepackBacksOffAtTheFailureThreshold(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		lastAttempt time.Duration
+		repacks     bool
+	}{
+		{name: "a recent attempt skips the repack", lastAttempt: time.Minute, repacks: false},
+		{name: "an attempt older than the window repacks", lastAttempt: 48 * time.Hour, repacks: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cityDir := t.TempDir()
+			binDir := t.TempDir()
+			stateDir := t.TempDir()
+			gcLog := filepath.Join(t.TempDir(), "gc.log")
+			mailLog := filepath.Join(t.TempDir(), "gc-mail.log")
+			archiveRepo := filepath.Join(cityDir, "archive")
+			stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
+
+			writeJsonlExportGCStub(t, binDir)
+			writeMultiRecordDoltStub(t, binDir, 3)
+			last := time.Now().Add(-tt.lastAttempt).Unix()
+			writeJsonlExportState(t, stateFile, fmt.Sprintf(`{"consecutive_repack_failures":3,"last_repack_attempt_at":%d}`, last))
+			env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
+			// A repack that runs packs every loose object.
+			env["GC_JSONL_REPACK_LOOSE_CEILING"] = "0"
+
+			out, runErr := runScriptResult(t, coreScriptPath("jsonl-export.sh"), env)
+			if runErr != nil {
+				t.Fatalf("the export must succeed whether or not it repacks: %v\n%s", runErr, out)
+			}
+			gcData, err := os.ReadFile(gcLog)
+			if err != nil {
+				t.Fatalf("ReadFile(gc log): %v", err)
+			}
+			if !strings.Contains(string(gcData), "MAINTENANCE_DONE: jsonl — exported 1/1") {
+				t.Errorf("the snapshot must still be committed; gc log:\n%s", gcData)
+			}
+			if skipped := strings.Contains(string(out), "archive repack skipped"); skipped == tt.repacks {
+				t.Errorf("repack skipped logged = %v, want %v; output:\n%s", skipped, !tt.repacks, out)
+			}
+			if packed := readArchiveCountObjects(t, archiveRepo)["count"] == 0; packed != tt.repacks {
+				t.Errorf("loose objects packed = %v, want %v", packed, tt.repacks)
+			}
+			state := readJsonlExportState(t, stateFile)
+			if tt.repacks {
+				if _, ok := state["consecutive_repack_failures"]; ok {
+					t.Errorf("a successful repack must clear the streak\nstate: %v", state)
+				}
+			} else if got := state["consecutive_repack_failures"]; got != float64(3) {
+				t.Errorf("a skipped repack is neither a failure nor a success: consecutive_repack_failures = %v, want 3\nstate: %v", got, state)
+			}
+		})
+	}
+}
+
+// git stores an export above core.bigFileThreshold whole, whatever the
+// archive's pack settings, so the run names every such export, with its
+// size, on stderr and in its summary.
+func TestJsonlExportWarnsWhenAnExportExceedsTheBigFileThreshold(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+	mailLog := filepath.Join(t.TempDir(), "gc-mail.log")
+	archiveRepo := filepath.Join(cityDir, "archive")
+
+	realWc, err := exec.LookPath("wc")
+	if err != nil {
+		t.Fatalf("LookPath(wc): %v", err)
+	}
+	// An export above the 512m minimum threshold is too large to write in a
+	// test, so wc reports one for the store's issues.jsonl.
+	writeExecutable(t, filepath.Join(binDir, "wc"), fmt.Sprintf(`#!/bin/sh
+if [ "$#" -eq 2 ] && [ "$1" = "-c" ]; then
+    case "$2" in
+        */issues.jsonl) printf '%%s %%s\n' 600000000 "$2"; exit 0 ;;
+    esac
+fi
+exec '%s' "$@"
+`, realWc))
+	writeJsonlExportGCStub(t, binDir)
+	writeMultiRecordDoltStub(t, binDir, 3)
+	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
+	env["GC_JSONL_BIG_FILE_THRESHOLD"] = "512m"
+
+	out, runErr := runScriptResult(t, coreScriptPath("jsonl-export.sh"), env)
+	if runErr != nil {
+		t.Fatalf("jsonl-export.sh failed: %v\n%s", runErr, out)
+	}
+	const want = "beads/issues.jsonl is 600000000 bytes, above the big-file threshold (512m); stored whole"
+	if !strings.Contains(string(out), want) {
+		t.Errorf("stderr must warn %q; output:\n%s", want, out)
+	}
+	gcData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	if !strings.Contains(string(gcData), want) {
+		t.Errorf("the run's summary must carry %q; gc log:\n%s", want, gcData)
 	}
 }
 
