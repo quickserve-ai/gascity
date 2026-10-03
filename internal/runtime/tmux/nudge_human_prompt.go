@@ -342,6 +342,28 @@ func composerHoldsSent(lines []string, promptPrefix, sent string) bool {
 	return strings.Contains(remainder, claudePastePlaceholderPrefix) || strings.Contains(remainder, "[Pasted Content")
 }
 
+// draftOwner is what a delivery knows of its own composer draft (ga-da5vmz):
+// the message it typed, and the paste placeholder the composer showed for it
+// at the resend gate's read right after the paste, whitespace squashed ("" if
+// it showed none). A person's paste gets a different #N.
+type draftOwner struct {
+	message, placeholder string
+}
+
+// notePlaceholder records the placeholder a composer draft shows, if it shows
+// only that (after complete gc reminders); otherwise it records none.
+func (o *draftOwner) notePlaceholder(draft string) {
+	o.placeholder = ""
+	if d := stripLeadingGCReminders(squashSpace(draft)); claudePastePlaceholderOnly.MatchString(d) {
+		o.placeholder = d
+	}
+}
+
+// owns reports whether draft can be only o's nudge (composerDraftIsOurs).
+func (o *draftOwner) owns(draft string) bool {
+	return composerDraftIsOurs(draft, o.message, o.placeholder)
+}
+
 // composerDraftIsOurs reports whether a composer draft can be only the nudge
 // sent, as Claude draws it before the first Enter (ga-da5vmz). Whitespace is
 // ignored throughout, since the composer re-wraps long lines. Complete gc
@@ -354,17 +376,18 @@ func composerHoldsSent(lines []string, promptPrefix, sent string) bool {
 //     the whole message (the paste still rendering);
 //   - the end of this message, at least composerTailMinRunes long or the
 //     whole message (a tall draft scrolled so only its tail shows);
-//   - Claude's paste placeholder and nothing else (a long paste shows only
-//     that).
+//   - placeholder, the paste placeholder our own paste showed, and nothing
+//     else (a long paste shows only that). Another placeholder -- a person's
+//     paste replacing ours -- is not ours, nor is any placeholder when ours
+//     showed none.
 //
 // Anything else is not ours: text before or after the nudge, a run from its
 // middle, a sentence quoting it, or a placeholder with words beside it. The
 // draft only has to CONTAIN a person's words for the first Enter to submit
-// them. Known gap: a person who clears the nudge and pastes their own long
-// text shows a placeholder, which this cannot tell from ours.
-func composerDraftIsOurs(draft, sent string) bool {
+// them.
+func composerDraftIsOurs(draft, sent, placeholder string) bool {
 	d := stripLeadingGCReminders(squashSpace(draft))
-	if d == "" || claudePastePlaceholderOnly.MatchString(d) {
+	if d == "" || (placeholder != "" && d == placeholder) {
 		return true
 	}
 	m := squashSpace(sent)
@@ -414,8 +437,9 @@ func squashSpace(s string) string {
 //
 // It is the ONE check every nudge keystroke passes (the chokepoint): the text
 // senders sendKeysLiteralWithRetry and sendStartupKeysLiteralWithRetry call it
-// before typing, and sendNudgeSubmitSequence calls it (dialogs only) before
-// the submit key. Every nudge caller -- NudgeSession on a detached or an
+// before typing, and sendNudgeSubmitSequence calls it before every submit key
+// (dialogs, plus the delivery's own-draft check; see
+// sendNudgeSubmitSequenceOwning). Every nudge caller -- NudgeSession on a detached or an
 // attached pane, Provider.Nudge's send-after-idle-timeout, the startup nudge
 // and its retry ladder, NudgePane -- reaches those senders, so none of them
 // can type into a prompt meant for a human. nudgeSession also calls it once
@@ -431,16 +455,16 @@ func squashSpace(s string) string {
 // is, so callers keep treating it as "session gone"; any other capture failure
 // defers, because a prompt could not be ruled out.
 func (t *Tmux) humanPromptGuard(session, target, stage string, checkDraft bool) error {
-	return t.humanPromptGuardOwning(session, target, stage, checkDraft, "")
+	return t.humanPromptGuardOwning(session, target, stage, checkDraft, nil)
 }
 
-// humanPromptGuardOwning is humanPromptGuard plus, when owned is set, the
-// first-submit ownership rule on the SAME capture (ga-da5vmz): on an attached
-// claude pane, a composer draft that is not only owned defers as a human
-// draft (draftIsNotOurs). The submit chokepoint runs it just before the first
-// submit key, so a person who replaces the nudge is caught up to that read;
-// only the gap between the read and the key is left.
-func (t *Tmux) humanPromptGuardOwning(session, target, stage string, checkDraft bool, owned string) error {
+// humanPromptGuardOwning is humanPromptGuard plus, when owner is set, the
+// ownership rule on the SAME capture (ga-da5vmz): on an attached claude pane,
+// a composer draft that owner does not own defers as a human draft
+// (draftIsNotOurs). The submit chokepoint runs it just before every submit
+// key, so a person who replaces the nudge is caught up to that read; only the
+// gap between the read and the key is left.
+func (t *Tmux) humanPromptGuardOwning(session, target, stage string, checkDraft bool, owner *draftOwner) error {
 	lines, err := t.CapturePaneLines(target, promptObservationLines)
 	if err != nil {
 		if errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer) {
@@ -449,7 +473,7 @@ func (t *Tmux) humanPromptGuardOwning(session, target, stage string, checkDraft 
 		return &NudgeDeferredError{Session: session, Reason: NudgeDeferReasonCaptureFailed, Stage: stage, Err: err}
 	}
 	reason := t.classifyPaneLines(session, target, lines, checkDraft)
-	if reason == "" && owned != "" && t.draftIsNotOurs(session, target, lines, owned) {
+	if reason == "" && owner != nil && t.draftIsNotOurs(session, target, lines, owner) {
 		reason = NudgeDeferReasonHumanDraft
 	}
 	if reason != "" {
@@ -459,18 +483,17 @@ func (t *Tmux) humanPromptGuardOwning(session, target, stage string, checkDraft 
 }
 
 // draftIsNotOurs reports whether lines show, on an attached claude pane, a
-// composer draft that is not only message (composerDraftIsOurs) and that an
-// attribute re-read with faint placeholder text dropped does not clear
-// (undimmedDraftIsOurs). Only positive evidence of someone else's text
+// composer draft owner does not own and that an attribute re-read with faint
+// placeholder text dropped does not clear (undimmedDraftIsOurs). Only positive evidence of someone else's text
 // counts: an empty or unreadable composer does not. Other families are not
 // checked: claude is the one family whose composer the draft rule models
 // (see humanPromptGuard).
-func (t *Tmux) draftIsNotOurs(session, target string, lines []string, message string) bool {
+func (t *Tmux) draftIsNotOurs(session, target string, lines []string, owner *draftOwner) bool {
 	prefix := t.resolveIdlePromptPrefix(session)
 	found, text := composerDraft(lines, prefix)
-	return found && !composerDraftIsOurs(text, message) &&
+	return found && !owner.owns(text) &&
 		t.sessionClientCount(session) != 0 && t.paneIsClaudeFamily(target) &&
-		!t.undimmedDraftIsOurs(target, prefix, message)
+		!t.undimmedDraftIsOurs(target, prefix, owner)
 }
 
 // classifyPaneLines is humanPromptGuard's decision on an already-captured
@@ -501,28 +524,35 @@ func (t *Tmux) composerHoldsOnlyDimText(target, promptPrefix string) bool {
 	return found && text == ""
 }
 
-// undimmedDraftIsOurs is the first-submit form of composerHoldsOnlyDimText
+// undimmedDraftIsOurs is the submit form of composerHoldsOnlyDimText
 // (ga-da5vmz). The attribute re-read is a new capture, so the screen may have
 // changed since the plain read; it gets the same ownership rule as that read,
 // with faint text dropped. An empty draft passes, as before; so does the
 // nudge if it rendered in between. A person's text does not.
-func (t *Tmux) undimmedDraftIsOurs(target, promptPrefix, message string) bool {
+func (t *Tmux) undimmedDraftIsOurs(target, promptPrefix string, owner *draftOwner) bool {
 	found, text := t.undimmedComposerDraft(target, promptPrefix)
-	return found && composerDraftIsOurs(text, message)
+	return found && owner.owns(text)
 }
 
 // undimmedComposerDraft re-reads the pane with its text attributes and
 // returns the composer draft with faint (SGR 2) text dropped. A failed or
-// empty capture reports no composer.
+// empty capture reports no composer, and so does one that shows a dialog
+// (classifyHumanPrompt): being newer than the read it clears, it must pass
+// the same dialog check before it can clear anything.
 func (t *Tmux) undimmedComposerDraft(target, promptPrefix string) (bool, string) {
 	out, err := t.run("capture-pane", "-p", "-e", "-t", paneTarget(target), "-S", fmt.Sprintf("-%d", promptObservationLines))
 	if err != nil || out == "" {
 		return false, ""
 	}
 	styled := strings.Split(out, "\n")
+	plain := make([]string, len(styled))
 	undimmed := make([]string, len(styled))
 	for i, line := range styled {
+		plain[i] = stripTerminalStyle(line, false)
 		undimmed[i] = stripTerminalStyle(line, true)
+	}
+	if classifyHumanPrompt(plain, promptPrefix, false) != "" {
+		return false, ""
 	}
 	return composerDraft(undimmed, promptPrefix)
 }
@@ -636,8 +666,10 @@ func (t *Tmux) paneIsClaudeFamily(target string) bool {
 // allowed only while a fresh capture shows the composer still holding the
 // text this delivery typed and no dialog is up; otherwise it stops the loop
 // without an error, and the caller classifies the outcome from the pane as it
-// already does. The first submit needs no gate here: sendNudgeSubmitSequence
-// (the chokepoint) refuses it itself when a dialog is up.
+// already does. The first submit is not stopped here: the submit chokepoint
+// (sendNudgeSubmitSequenceOwning) refuses every submit key, first or re-sent,
+// on a dialog or a draft that is not ours. This gate's first read records
+// the paste placeholder the chokepoint will accept as ours (owner).
 //
 // "The text this delivery typed" is pinned to what the composer showed just
 // before the FIRST submit: the re-send needs the composer to still show exactly
@@ -646,10 +678,9 @@ func (t *Tmux) paneIsClaudeFamily(target string) bool {
 // own text after a submit that landed unobserved would otherwise have THEIR
 // placeholder submitted. Claude numbers each paste, so theirs differs.
 //
-// The FIRST submit's ownership check (ga-da5vmz) is not here but in the
-// submit chokepoint (sendNudgeSubmitSequenceOwning), on the capture taken
-// just before the key.
-func (t *Tmux) resendGate(session, target, message string) func(resend bool) (bool, error) {
+// The ownership check itself (ga-da5vmz) is not here but in the submit
+// chokepoint, on the capture taken just before each key.
+func (t *Tmux) resendGate(session, target, message string, owner *draftOwner) func(resend bool) (bool, error) {
 	promptPrefix := t.resolveIdlePromptPrefix(session)
 	snapshot := ""
 	return func(resend bool) (bool, error) {
@@ -661,6 +692,7 @@ func (t *Tmux) resendGate(session, target, message string) func(resend bool) (bo
 					snapshot = text
 				}
 			}
+			owner.notePlaceholder(snapshot)
 			return true, nil
 		}
 		if err != nil || snapshot == "" {
