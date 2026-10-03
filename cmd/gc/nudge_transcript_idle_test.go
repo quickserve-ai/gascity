@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -22,9 +23,20 @@ import (
 // shell runs after the main turn has ended.
 const (
 	tlUserPrompt      = `{"type":"user","message":{"role":"user","content":"do the thing"}}`
+	tlTaskNotify      = `{"type":"user","message":{"role":"user","content":"<task-notification>\n<task-id>b8b4rke14</task-id>\n</task-notification>"}}`
+	tlInterrupt       = `{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}`
+	tlQuotesInterrupt = `{"type":"user","message":{"role":"user","content":"why did the log say [Request interrupted by user]?"}}`
+	tlAssistToolUse   = `{"type":"assistant","message":{"role":"assistant","model":"claude-opus","stop_reason":"tool_use"}}`
 	tlAssistEndTurn   = `{"type":"assistant","message":{"role":"assistant","model":"claude-opus","stop_reason":"end_turn"}}`
 	tlStopHookSummary = `{"type":"system","subtype":"stop_hook_summary"}`
 	tlTurnDuration    = `{"type":"system","subtype":"turn_duration","timestamp":"2026-01-01T00:00:10.000Z"}`
+	tlTurnNoTimestamp = `{"type":"system","subtype":"turn_duration"}`
+	tlQueueEnqueue    = `{"type":"queue-operation","operation":"enqueue","content":"<task-notification>"}`
+	tlQueueRemove     = `{"type":"queue-operation","operation":"remove"}`
+	tlAttachment      = `{"type":"attachment","attachment":{"type":"queued_command"}}`
+	tlPRLink          = `{"type":"pr-link"}`
+	tlBridgeSession   = `{"type":"bridge-session"}`
+	tlFileHistory     = `{"type":"file-history-snapshot"}`
 )
 
 var tlIdle = []string{tlUserPrompt, tlAssistEndTurn, tlStopHookSummary, tlTurnDuration}
@@ -37,6 +49,17 @@ var (
 	tlPromptBefore = tlTurnEnd.Add(-5 * time.Second)
 	tlPromptAfter  = tlTurnEnd.Add(time.Second)
 )
+
+// tlMetaBlock is the session-metadata block Claude Code writes after a turn
+// ends and around background-task queue activity, in the type order of a real
+// transcript (types only; contents are irrelevant to the gate).
+var tlMetaBlock = []string{
+	`{"type":"last-prompt"}`, `{"type":"custom-title"}`, `{"type":"agent-name"}`, `{"type":"mode"}`,
+	`{"type":"permission-mode"}`, `{"type":"atis-latch"}`, `{"type":"pr-link"}`, `{"type":"bridge-session"}`,
+	tlQueueEnqueue, tlQueueRemove, `{"type":"cost-state"}`, `{"type":"frame-link"}`,
+	`{"type":"file-history-delta"}`, `{"type":"artifact-comment-monitor"}`, `{"type":"artifact-autoreact-ledger"}`,
+	`{"type":"history-suppression"}`,
+}
 
 const transcriptIdleTestKey = "0b6f3c1e-7d2a-4c55-9e8f-2a1b3c4d5e6f"
 
@@ -94,6 +117,7 @@ func newTranscriptFixture(t *testing.T, provider string, providers map[string]co
 }
 
 func (f *transcriptFixture) accountRoot() string { return filepath.Join(f.accountDir, "projects") }
+func (f *transcriptFixture) defaultRoot() string { return filepath.Join(f.home, ".claude", "projects") }
 
 // promptAt records the seat's prompt-submitted marker, as the seat's
 // UserPromptSubmit hook (gc nudge drain --inject) does.
@@ -138,6 +162,129 @@ func (f *transcriptFixture) idleWith(sp gcruntime.Provider) bool {
 	return pollerSessionIdleEnough(target, sp, 3*time.Second, worker.LiveObservation{LastActivity: &last})
 }
 
+// transcriptIdle is the common case: a claude-family seat whose account
+// root holds lines (nil = no transcript) and whose last prompt was submitted
+// before tlTurnEnd.
+func transcriptIdle(t *testing.T, provider string, providers map[string]config.ProviderSpec, lines []string) bool {
+	t.Helper()
+	f := newTranscriptFixture(t, provider, providers)
+	f.promptAt(tlPromptBefore)
+	if lines != nil {
+		f.write(f.accountRoot(), lines)
+	}
+	return f.idle()
+}
+
+// (a) The deaf-seat case: pane output is fresh (a background task's timer
+// ticks every second) but the transcript says the main turn has ended.
+func TestPollerIdleClaudeTranscriptTurnEndedDelivers(t *testing.T) {
+	if !transcriptIdle(t, "claude", nil, tlIdle) {
+		t.Fatal("pollerSessionIdleEnough = false, want true: turn_duration is the last meaningful entry")
+	}
+}
+
+// (a') Live seats run custom providers based on builtin:claude.
+func TestPollerIdleClaudeTranscriptCustomClaudeProvider(t *testing.T) {
+	base := "builtin:claude"
+	providers := map[string]config.ProviderSpec{"claude-fable-kumar": {Base: &base}}
+	if !transcriptIdle(t, "claude-fable-kumar", providers, tlIdle) {
+		t.Fatal("pollerSessionIdleEnough = false, want true for a custom provider based on builtin:claude")
+	}
+}
+
+// (b) Anything but a finished turn is not idle. A bare end_turn is written
+// BEFORE the Stop hooks run (and a Stop hook can continue the turn), so only
+// turn_duration ends a turn. Interrupt markers and prompt text are never read.
+func TestPollerIdleClaudeTranscriptTurnRunningStaysBusy(t *testing.T) {
+	for name, lines := range map[string][]string{
+		"task_notification":   {tlUserPrompt, tlAssistEndTurn, tlTurnDuration, tlQueueEnqueue, tlQueueRemove, tlTaskNotify},
+		"tool_use":            {tlUserPrompt, tlAssistToolUse},
+		"user_prompt":         {tlAssistEndTurn, tlTurnDuration, tlUserPrompt, tlAttachment},
+		"bare_end_turn":       {tlUserPrompt, tlAssistToolUse, tlAssistEndTurn},
+		"stop_hooks_running":  {tlUserPrompt, tlAssistEndTurn, tlStopHookSummary},
+		"interrupt_marker":    {tlUserPrompt, tlAssistToolUse, tlInterrupt},
+		"prompt_quotes_inter": {tlUserPrompt, tlAssistEndTurn, tlTurnDuration, tlQuotesInterrupt},
+		"unknown_system":      {tlUserPrompt, tlAssistEndTurn, tlTurnDuration, `{"type":"system","subtype":"scheduled_task_fire"}`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if transcriptIdle(t, "claude", nil, lines) {
+				t.Fatal("pollerSessionIdleEnough = true, want false: no finished turn is the last meaningful entry")
+			}
+		})
+	}
+}
+
+// (c) The live shape: the main turn ended, then only bookkeeping lines were
+// appended while a background task ran.
+func TestPollerIdleClaudeTranscriptQueueOperationsAfterTurnEnd(t *testing.T) {
+	lines := append(append([]string{}, tlIdle...), tlQueueEnqueue, tlQueueEnqueue, tlQueueRemove,
+		tlQueueRemove, tlAttachment, tlPRLink, tlBridgeSession, tlFileHistory, tlStopHookSummary)
+	if !transcriptIdle(t, "claude", nil, lines) {
+		t.Fatal("pollerSessionIdleEnough = false, want true: only bookkeeping lines follow turn_duration")
+	}
+}
+
+// (d) No transcript, an unknown tail, or a torn last line keep today's
+// behaviour: fresh pane activity means not idle.
+func TestPollerIdleClaudeTranscriptUnknownKeepsTodaysBehaviour(t *testing.T) {
+	for name, lines := range map[string][]string{
+		"no_transcript": nil,
+		"unknown_tail":  {tlQueueEnqueue, tlQueueRemove, tlAttachment},
+		"torn_last":     {tlUserPrompt, tlAssistEndTurn, tlTurnDuration, `{"type":"user","message":{"role":"us`},
+		"no_timestamp":  {tlUserPrompt, tlAssistEndTurn, tlTurnNoTimestamp},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if transcriptIdle(t, "claude", nil, lines) {
+				t.Fatal("pollerSessionIdleEnough = true, want false (today's behaviour) without a definite idle tail")
+			}
+		})
+	}
+	t.Run("no_session_key", func(t *testing.T) {
+		f := newTranscriptFixture(t, "claude", nil)
+		f.promptAt(tlPromptBefore)
+		f.write(f.accountRoot(), tlIdle)
+		f.info.SessionKey = ""
+		if f.idle() {
+			t.Fatal("pollerSessionIdleEnough = true, want false when the transcript cannot be resolved")
+		}
+	})
+}
+
+// (e) Every other provider keeps today's behaviour even with an idle-looking
+// Claude-format transcript where the claude lookup would find it.
+func TestPollerIdleNonClaudeProviderIgnoresTranscript(t *testing.T) {
+	if transcriptIdle(t, "codex", nil, tlIdle) {
+		t.Fatal("pollerSessionIdleEnough = true, want false for a non-claude provider")
+	}
+}
+
+// A provider NAMED claude whose city spec declares an empty base (and a
+// non-claude command) is not claude, even when the bead's legacy
+// provider_kind says claude.
+func TestPollerIdleClaudeNamedProviderWithEmptyBaseKeepsTodaysBehaviour(t *testing.T) {
+	empty := ""
+	f := newTranscriptFixture(t, "claude", map[string]config.ProviderSpec{"claude": {Base: &empty, Command: "my-agent"}})
+	f.info.ProviderKind = "claude"
+	f.promptAt(tlPromptBefore)
+	f.write(f.accountRoot(), tlIdle)
+	if f.idle() {
+		t.Fatal("pollerSessionIdleEnough = true, want false: provider declares base=\"\" so it is not claude")
+	}
+}
+
+// The seat's own account root wins, and two different files for one session
+// key are ambiguous: a stale idle copy in the default root must not override
+// the in-turn transcript in the account root.
+func TestPollerIdleClaudeTranscriptAmbiguousRootsNotIdle(t *testing.T) {
+	f := newTranscriptFixture(t, "claude", nil)
+	f.promptAt(tlPromptBefore)
+	f.write(f.defaultRoot(), tlIdle)
+	f.write(f.accountRoot(), []string{tlUserPrompt, tlAssistToolUse})
+	if f.idle() {
+		t.Fatal("pollerSessionIdleEnough = true, want false: two different transcripts for one session key")
+	}
+}
+
 // The same file reached through a symlinked root (live: ~/.claude ->
 // ~/.claude-accounts/<acct>) is one transcript, not an ambiguity.
 func TestPollerIdleClaudeTranscriptSymlinkedRootIsOneFile(t *testing.T) {
@@ -174,6 +321,77 @@ func TestPollerIdleClaudeTranscriptNoPromptMarkerKeepsTodaysBehaviour(t *testing
 	if f.idle() {
 		t.Fatal("pollerSessionIdleEnough = true, want false without a prompt-submitted marker")
 	}
+}
+
+// N-stale: a session key that points at a frozen transcript ending in
+// turn_duration (the seat moved on to another file) never delivers once the
+// seat has submitted a prompt since that file froze.
+func TestPollerIdleClaudeTranscriptFrozenFileNewerMarkerStaysBusy(t *testing.T) {
+	f := newTranscriptFixture(t, "claude", nil)
+	f.write(f.accountRoot(), tlIdle)
+	path := filepath.Join(f.accountRoot(), sessionlog.ProjectSlug(f.workDir), transcriptIdleTestKey+".jsonl")
+	frozen := tlTurnEnd
+	if err := os.Chtimes(path, frozen, frozen); err != nil {
+		t.Fatal(err)
+	}
+	f.promptAt(time.Now())
+	if f.idle() {
+		t.Fatal("pollerSessionIdleEnough = true, want false: frozen transcript older than the last prompt")
+	}
+}
+
+// F-meta: the session-metadata block (real transcript type order) written
+// after the turn ended while a background task runs is bookkeeping.
+func TestPollerIdleClaudeTranscriptMetadataBlockAfterTurnEndDelivers(t *testing.T) {
+	lines := append(append(append([]string{}, tlIdle...), tlMetaBlock...), tlFileHistory, tlAttachment)
+	if !transcriptIdle(t, "claude", nil, lines) {
+		t.Fatal("pollerSessionIdleEnough = false, want true: only session metadata follows turn_duration")
+	}
+}
+
+// F-meta: the same block is sometimes written at prompt submit, before the
+// user line. Skipping it reaches the old turn_duration, but the prompt marker
+// is newer, so it is still not idle.
+func TestPollerIdleClaudeTranscriptMetadataBlockAtPromptSubmitStaysBusy(t *testing.T) {
+	f := newTranscriptFixture(t, "claude", nil)
+	f.write(f.accountRoot(), append(append([]string{}, tlIdle...), tlMetaBlock...))
+	f.promptAt(tlPromptAfter)
+	if f.idle() {
+		t.Fatal("pollerSessionIdleEnough = true, want false: metadata written at prompt submit, marker newer than turn_duration")
+	}
+}
+
+// F-alias: within one root, the work dir's path-alias spellings (/var/x and
+// /private/var/x on macOS) give two slugs. Two different files for the key
+// are ambiguous even when the newer one looks idle.
+func TestPollerIdleClaudeTranscriptAliasSlugsAmbiguousNotIdle(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("path-alias slugs are macOS-only")
+	}
+	f := newTranscriptFixture(t, "claude", nil)
+	alias := darwinAliasForTest(f.workDir)
+	if alias == "" {
+		t.Skipf("work dir %q has no /tmp or /var alias", f.workDir)
+	}
+	f.promptAt(tlPromptBefore)
+	f.writeSlug(f.accountRoot(), alias, []string{tlUserPrompt, tlAssistToolUse})
+	old := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(filepath.Join(f.accountRoot(), sessionlog.ProjectSlug(alias), transcriptIdleTestKey+".jsonl"), old, old); err != nil {
+		t.Fatal(err)
+	}
+	f.write(f.accountRoot(), tlIdle)
+	if f.idle() {
+		t.Fatal("pollerSessionIdleEnough = true, want false: two different transcripts under alias slugs of one work dir")
+	}
+}
+
+func darwinAliasForTest(dir string) string {
+	for _, p := range [][2]string{{"/private/var/", "/var/"}, {"/private/tmp/", "/tmp/"}, {"/var/", "/private/var/"}, {"/tmp/", "/private/tmp/"}} {
+		if strings.HasPrefix(dir, p[0]) {
+			return p[1] + strings.TrimPrefix(dir, p[0])
+		}
+	}
+	return ""
 }
 
 // The seat's UserPromptSubmit hook (gc nudge drain --inject) records the
@@ -221,6 +439,23 @@ func TestPollerIdleClaudeTranscriptPaneWorkingStaysBusy(t *testing.T) {
 				t.Fatal("pollerSessionIdleEnough = true, want false without an idle pane reading")
 			}
 		})
+	}
+}
+
+// R3-5: a permission or I/O error on one candidate is not absence: an
+// unreadable (possibly busy) copy must not hide behind a readable idle one.
+func TestPollerIdleClaudeTranscriptUnreadableCandidateNotIdle(t *testing.T) {
+	f := newTranscriptFixture(t, "claude", nil)
+	f.promptAt(tlPromptBefore)
+	f.write(f.defaultRoot(), tlIdle)
+	f.write(f.accountRoot(), []string{tlUserPrompt, tlAssistToolUse})
+	locked := filepath.Join(f.accountRoot(), sessionlog.ProjectSlug(f.workDir))
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+	if f.idle() {
+		t.Fatal("pollerSessionIdleEnough = true, want false: one candidate could not be read")
 	}
 }
 
