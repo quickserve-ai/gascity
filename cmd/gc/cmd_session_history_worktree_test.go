@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -644,16 +643,15 @@ func TestSessionResumePrintQuotesQuotesAndDollars(t *testing.T) {
 	if code := cmdSessionResume([]string{"lana", "dddddddd"}, false, true, t.TempDir(), &stdout, &stderr); code != 0 {
 		t.Fatalf("cmdSessionResume(--print) = %d; stderr=%s", code, stderr.String())
 	}
-	// Parse it with a real shell, not our own Split: printf each word sh sees.
-	line := strings.Replace(strings.TrimSpace(stdout.String()), " && ", " '&&' ", 1)
-	out, err := exec.Command("/bin/sh", "-c", `printf '%s\0' `+line).Output()
-	if err != nil {
-		t.Fatalf("sh could not parse --print = %q: %v", stdout.String(), err)
+	// The POSIX single-quote form, spelled out: the dir in '...', each ' as '\''.
+	wantLine := "cd '" + strings.ReplaceAll(odd, "'", `'\''`) + "' && claude --resume " + priorConvID
+	if got := strings.TrimSpace(stdout.String()); got != wantLine {
+		t.Fatalf("--print = %q, want %q", got, wantLine)
 	}
-	got := strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00")
+	got := shellquote.Split(wantLine)
 	want := []string{"cd", odd, "&&", "claude", "--resume", priorConvID}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
-		t.Fatalf("--print = %q: sh reads %q, want %q", stdout.String(), got, want)
+		t.Fatalf("--print %q parses as %q, want %q", wantLine, got, want)
 	}
 }
 
