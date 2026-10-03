@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -47,6 +48,20 @@ transcript per conversation under <config-dir>/projects/<workdir-slug>/, so
 every conversation an agent ever had in its work directory is listed — including
 conversations whose session beads were closed long ago, and transcripts moved
 into ~/.claude-transcript-archive/ by the transcript reaper (marked "archived").
+
+A session whose process ran outside its work directory (in the git worktree of
+a task it was assigned) has those conversations under that cwd's slug instead.
+The conversations recorded on its session bead (session_key,
+prior_session_key) are found by id under any projects folder, and the folders
+of its bead's work dirs and of its in-progress tasks' work_dirs are listed too.
+Tasks are looked up in the city bead store and in every rig's bead store, the
+stores the reconciler reads; a rig store that cannot be opened is named on
+stderr and skipped. Those folders can be shared with other agents, and so can
+a pool instance's own work dir or one under .gc/worktrees/, so from them only
+conversations whose id is on the bead are taken, plus, for a named or aliased
+session that is not a pool instance, conversations recorded under that name.
+The JSON row's found_under is the work dir of the projects folder the row was
+found under.
 
 The session id shown for each row is what "gc session resume" takes.`,
 		Example: `  gc session history lana
@@ -279,7 +294,7 @@ func cmdSessionHistory(identifier string, limit int, jsonOutput bool, archiveRoo
 
 	searchPaths := worker.MergeSearchPaths(cfg.Daemon.ObservePaths)
 	archiveRoots := historyArchiveRoots(archiveRoot)
-	scope := resolveSessionHistoryScope(cityPath, cfg, store, identifier, target)
+	scope := resolveSessionHistoryScope(cityPath, cfg, store, identifier, target, stderr)
 	entries := listSessionHistory(target, scope, searchPaths, archiveRoots)
 	if len(entries) == 0 {
 		fmt.Fprintf(stderr, "gc session history: no conversations found for %q (work dir %s)\n", target.identifier, target.workDir) //nolint:errcheck // best-effort stderr
@@ -623,7 +638,7 @@ func (s sessionHistoryScope) attributable(e worker.SessionHistoryEntry) bool {
 // the launch path uses to pick the process cwd). A pool instance's own work
 // dir, and one that lies under .gc/worktrees/, is filtered like the others:
 // either can be a worktree other seats share.
-func resolveSessionHistoryScope(cityPath string, cfg *config.City, store beads.Store, identifier string, target sessionHistoryTarget) sessionHistoryScope {
+func resolveSessionHistoryScope(cityPath string, cfg *config.City, store beads.Store, identifier string, target sessionHistoryTarget, stderr io.Writer) sessionHistoryScope {
 	scope := sessionHistoryScope{ownWorkDir: target.configured, keySet: make(map[string]bool), names: make(map[string]bool)}
 	seenDirs := make(map[string]bool)
 	addDir := func(dir string) {
@@ -671,7 +686,7 @@ func resolveSessionHistoryScope(cityPath string, cfg *config.City, store beads.S
 			assignees = append(taskWorkDirAssignees(startCandidate{info: info}, cfg), assignees...)
 		}
 	}
-	for _, dir := range inProgressTaskWorkDirs(cityPath, store, assignees...) {
+	for _, dir := range inProgressTaskWorkDirs(cityPath, cfg, store, stderr, assignees...) {
 		addDir(dir)
 	}
 	return scope
@@ -684,41 +699,165 @@ func underSharedWorktreeRoot(dir string) bool {
 	return strings.Contains(filepath.ToSlash(filepath.Clean(dir))+"/", "/.gc/worktrees/")
 }
 
+// historyRigStoreOpener opens the rig stores history searches for task work
+// dirs; a var so tests can stand in a store that stalls or fails.
+var historyRigStoreOpener = oneShotRigStoreOpener
+
+// historyTaskLookupTimeout bounds history's whole task-dir discovery: a rig
+// that has not answered by then is skipped and named on stderr.
+var historyTaskLookupTimeout = 10 * time.Second
+
 // inProgressTaskWorkDirs returns the work_dir of every in-progress task bead
-// in the city store assigned to any of assignees, using the per-bead
-// resolution the launch path uses but collecting every distinct dir instead of
-// stopping at the newest.
-func inProgressTaskWorkDirs(cityPath string, store beads.Store, assignees ...string) []string {
+// assigned to any of assignees, across the stores the reconciler's census
+// reads (the city store and every rig store), using the per-bead resolution
+// the launch path uses but collecting every distinct dir instead of stopping
+// at the newest. The whole lookup runs under historyTaskLookupTimeout: a store
+// that fails, or has not answered by then, is skipped and named on stderr.
+func inProgressTaskWorkDirs(cityPath string, cfg *config.City, store beads.Store, stderr io.Writer, assignees ...string) []string {
 	if store == nil {
 		return nil
 	}
-	var dirs []string
+	var wanted []string
 	seenAssignee := make(map[string]bool, len(assignees))
-	seenDir := make(map[string]bool)
 	for _, assignee := range assignees {
-		assignee = strings.TrimSpace(assignee)
-		if assignee == "" || seenAssignee[assignee] {
-			continue
+		if assignee = strings.TrimSpace(assignee); assignee != "" && !seenAssignee[assignee] {
+			seenAssignee[assignee] = true
+			wanted = append(wanted, assignee)
 		}
-		seenAssignee[assignee] = true
-		assigned, err := store.List(beads.ListQuery{
-			Assignee: assignee,
-			Status:   "in_progress",
-			Live:     true,
-			TierMode: beads.TierBoth,
-			Sort:     beads.SortCreatedDesc,
-		})
-		if err != nil {
-			continue
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), historyTaskLookupTimeout)
+	defer cancel()
+	skipped := func(leg, reason string) {
+		fmt.Fprintf(stderr, "history: %s task lookup skipped: %s; conversations from its worktrees may be missing\n", leg, reason) //nolint:errcheck // best-effort stderr
+	}
+	legs := historyTaskLegs(ctx, cityPath, cfg, store, skipped)
+	type legDirs struct {
+		idx  int
+		dirs []string
+		err  error
+	}
+	results := make(chan legDirs, len(legs))
+	for i, leg := range legs {
+		go func() {
+			var dirs []string
+			for _, assignee := range wanted {
+				assigned, err := leg.store.List(beads.ListQuery{
+					Assignee: assignee,
+					Status:   "in_progress",
+					Live:     true,
+					TierMode: beads.TierBoth,
+					Sort:     beads.SortCreatedDesc,
+				})
+				if err != nil {
+					results <- legDirs{idx: i, err: err}
+					return
+				}
+				for _, b := range assigned {
+					if dir := resolveTaskBeadWorkDir(cityPath, leg.store, b); dir != "" {
+						dirs = append(dirs, dir)
+					}
+				}
+			}
+			results <- legDirs{idx: i, dirs: dirs}
+		}()
+	}
+	perLeg := make([][]string, len(legs))
+	answered := make([]bool, len(legs))
+collect:
+	for range legs {
+		select {
+		case r := <-results:
+			answered[r.idx] = true
+			if r.err != nil {
+				skipped(historyLegName(legs[r.idx].ref), r.err.Error())
+				continue
+			}
+			perLeg[r.idx] = r.dirs
+		case <-ctx.Done():
+			break collect
 		}
-		for _, b := range assigned {
-			if dir := resolveTaskBeadWorkDir(cityPath, store, b); dir != "" && !seenDir[dir] {
+	}
+	var dirs []string
+	seenDir := make(map[string]bool)
+	for i, legDirs := range perLeg {
+		if !answered[i] {
+			skipped(historyLegName(legs[i].ref), fmt.Sprintf("no answer within %s", historyTaskLookupTimeout))
+		}
+		for _, dir := range legDirs {
+			if !seenDir[dir] {
 				seenDir[dir] = true
 				dirs = append(dirs, dir)
 			}
 		}
 	}
 	return dirs
+}
+
+// historyTaskLegs opens every bound rig store concurrently (a store not open
+// before ctx ends is skipped) and returns the census leg set over the city
+// store and the rig stores that opened, or the city store alone when the
+// census refuses.
+func historyTaskLegs(ctx context.Context, cityPath string, cfg *config.City, store beads.Store, skipped func(leg, reason string)) []classStoreCandidate {
+	cityOnly := []classStoreCandidate{{store: store}}
+	if cfg == nil || len(cfg.Rigs) == 0 {
+		return cityOnly
+	}
+	open := historyRigStoreOpener(cfg)
+	type opened struct {
+		rig   string
+		store beads.Store
+		err   error
+	}
+	results := make(chan opened, len(cfg.Rigs))
+	var pending []string
+	for _, rig := range cfg.Rigs {
+		if strings.TrimSpace(rig.Path) == "" {
+			continue // unbound: openStandaloneRigStores skips it too
+		}
+		pending = append(pending, rig.Name)
+		go func() {
+			s, err := open(rig.Path, cityPath)
+			results <- opened{rig: rig.Name, store: s, err: err}
+		}()
+	}
+	rigStores := make(map[string]beads.Store, len(pending))
+	done := make(map[string]bool, len(pending))
+wait:
+	for range pending {
+		select {
+		case o := <-results:
+			done[o.rig] = true
+			if o.err != nil {
+				skipped("rig "+o.rig, o.err.Error())
+				continue
+			}
+			rigStores[o.rig] = o.store
+		case <-ctx.Done():
+			break wait
+		}
+	}
+	for _, rig := range pending {
+		if !done[rig] {
+			skipped("rig "+rig, fmt.Sprintf("store did not open within %s", historyTaskLookupTimeout))
+		}
+	}
+	legs, err := censusStoreCandidates(cityPath, cfg, store, rigStores, nil, censusRefBare)
+	if err != nil {
+		skipped("every rig", err.Error())
+		return cityOnly
+	}
+	return legs
+}
+
+// historyLegName names a census leg for history's stderr notes.
+func historyLegName(ref string) string {
+	switch {
+	case ref == "":
+		return "city store"
+	case strings.HasPrefix(ref, "class:"):
+		return "store " + ref
+	}
+	return "rig " + ref
 }
 
 // listSessionHistory lists the conversations in the target's own work dir's
