@@ -3,6 +3,7 @@ package doctor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -243,12 +244,15 @@ func TestRigWorktreesCheck_UnfinishedWalkReportsLowerBoundInsideBudget(t *testin
 		<-ctx.Done()
 		return dirSize{bytes: 2 * 1024 * 1024 * 1024, exists: true, lowerBound: true}, nil
 	})
-	c.budget = 100 * time.Millisecond
+	// 2s, not 100ms: the fake measurer returns only after <-ctx.Done(), and the
+	// check abandons a measurer at budget+budget/8. A 12.5ms grace is missed under
+	// load and the run takes the abandoned path (pl-u998; precedent 8abad9c4).
+	c.budget = 2 * time.Second
 
 	start := time.Now()
 	r := c.Run(&CheckContext{})
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Errorf("check took %s, want it to stop soon after its budget", elapsed)
+	if elapsed := time.Since(start); elapsed > c.budget+time.Second {
+		t.Errorf("check took %s, want it to stop soon after its %s budget", elapsed, c.budget)
 	}
 	if r.Status != StatusWarning {
 		t.Fatalf("status = %d (%s), want StatusWarning", r.Status, r.Message)
@@ -256,7 +260,7 @@ func TestRigWorktreesCheck_UnfinishedWalkReportsLowerBoundInsideBudget(t *testin
 	if !strings.Contains(r.Message, "2 per-bead worktree(s)") {
 		t.Errorf("message = %q, want the count", r.Message)
 	}
-	if !strings.Contains(r.Message, "at least 2.0 GB logical (lower bound: the size walk did not finish within 100ms)") {
+	if !strings.Contains(r.Message, fmt.Sprintf("at least 2.0 GB logical (lower bound: the size walk did not finish within %s)", c.budget)) {
 		t.Errorf("message = %q, want the labeled lower bound", r.Message)
 	}
 	if !strings.Contains(r.FixHint, "ran out of time") {
@@ -272,7 +276,7 @@ func TestRigWorktreesCheck_LowerBoundPastErrorThresholdIsAnError(t *testing.T) {
 		<-ctx.Done()
 		return dirSize{bytes: 60 * 1024 * 1024 * 1024, exists: true, lowerBound: true}, nil
 	})
-	c.budget = 50 * time.Millisecond
+	c.budget = 2 * time.Second // see the note on the test above
 
 	r := c.Run(&CheckContext{})
 	if r.Status != StatusError {
