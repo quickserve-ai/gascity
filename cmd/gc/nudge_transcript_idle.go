@@ -25,11 +25,18 @@ const claudeTranscriptTailBudget = 64 * 1024
 
 // claudeTranscriptBookkeeping are entry types Claude Code appends to the main
 // transcript while a background task runs after the main turn ended, without
-// starting or continuing a turn. Any type not listed here is decisive and
-// reads not idle.
+// starting or continuing a turn: queue activity, attachments, and the
+// session-metadata block (last-prompt ... bridge-session, cost-state,
+// file-history-*, frame-link, history-suppression, artifact-*). Any type not listed here is
+// decisive and reads not idle. The metadata block is sometimes written at
+// prompt submit, before the user line; skipping it there is safe because the
+// prompt marker is then newer than the old turn_duration.
 var claudeTranscriptBookkeeping = map[string]bool{
 	"queue-operation": true, "attachment": true, "pr-link": true,
 	"bridge-session": true, "file-history-snapshot": true,
+	"last-prompt": true, "custom-title": true, "agent-name": true, "mode": true,
+	"permission-mode": true, "atis-latch": true, "frame-link": true,
+	"cost-state": true, "file-history-delta": true, "history-suppression": true,
 }
 
 func claudeTranscriptIsBookkeeping(entryType string) bool {
