@@ -547,10 +547,33 @@ def lint_affected(
     return run_static_checks(lint_tool, go_tool, lint_flags, packages)
 
 
+def ci_only_packages() -> set[str] | None:
+    """Package directories named in LEAN_LOCAL_CI_ONLY, normalised the way
+    affected_package_args spells them ("./dir"), or None when one is malformed.
+    Unset or blank names nothing."""
+    names: set[str] = set()
+    for entry in os.environ.get("LEAN_LOCAL_CI_ONLY", "").split():
+        if not entry.startswith("./") or ".." in entry:
+            print(
+                f"check-lean-local: invalid LEAN_LOCAL_CI_ONLY entry {entry!r}: "
+                "want a ./-relative package directory without ..",
+                file=sys.stderr,
+            )
+            return None
+        normalized = posixpath.normpath(entry)
+        names.add("." if normalized == "." else f"./{normalized}")
+    return names
+
+
 def check_lean_local(go_tool: str) -> int:
     # Reuse the static selector's build-input and reverse-dependency graph.
     # Unlike lint-affected, a selection failure must NOT expand into a full
     # test suite on the shared host. CI owns the full-suite fallback.
+    # LEAN_LOCAL_CI_ONLY (pl-8xqx) names packages whose TESTS are left to
+    # required CI; vet and build still cover them. Matching is exact.
+    ci_only = ci_only_packages()
+    if ci_only is None:
+        return 2
     try:
         records = diff_records()
         if not records:
@@ -566,6 +589,16 @@ def check_lean_local(go_tool: str) -> int:
         result = run_tool([go_tool, operation, "-mod=readonly", "-p=2", "./..."])
         if result != 0:
             return result
+    left_to_ci = [package for package in packages if package in ci_only]
+    if left_to_ci:
+        packages = [package for package in packages if package not in ci_only]
+        print(
+            f"check-lean-local: tests left to CI (LEAN_LOCAL_CI_ONLY): {' '.join(left_to_ci)}",
+            flush=True,
+        )
+        if not packages:
+            print("check-lean-local: vet/build passed; no other affected Go tests selected")
+            return 0
     if not packages:
         print("check-lean-local: vet/build passed; no affected Go tests selected")
         return 0
