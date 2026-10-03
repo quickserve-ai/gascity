@@ -11,36 +11,23 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 )
 
-// The controller's demand count skips the steps gc hook --claim skips: an open
-// step of a molecule whose root was observed closed, outside that root's
-// teardown tail (qc-z0fmn0n). Counting one spawns a seat that reads empty and
-// drains, every tick (ga-b2oxyf). The demand side arms the router's own gate
-// (closedRootOf, the teardown tail), so spawn and claim cannot disagree. It is
-// read-only: it reads roots and teardown members and writes nothing.
+// The demand count skips the steps gc hook --claim skips (ga-b2oxyf) by arming
+// the router's own closed-root gate over the demand group's store. Read-only.
 //
-// Cost. A closed root is not in the controller's cache, so each read of one —
-// and its IncludeClosed teardown query — goes to the backing store. So:
-//
-//   - A CLOSED verdict (with its tail) and a NOT-FOUND result are remembered
-//     across passes for demandClosedRootTTL. A root reopened inside that window
-//     is under-counted (its steps are not demand) for at most the TTL.
-//   - An OPEN verdict is not remembered: the cached store answers it cheaply,
-//     and a root that closes is then seen on the next pass.
-//   - At most demandRootResolveBudget roots that are not remembered and turn
-//     out closed or unreadable are resolved per pass (an open root is refunded).
-//     A step whose root is not resolved this pass is COUNTED, as it was before
-//     this guard existed.
-//   - A root whose teardown tail cannot be read is unresolved, so its steps are
-//     counted: a retry attempt the router would serve is never dropped.
+// A closed root is not in the controller's cache, so its Get and IncludeClosed
+// teardown query go to the backing store. Hence: a CLOSED verdict (with its
+// tail) and a NOT-FOUND are remembered across passes for demandClosedRootTTL —
+// a root reopened inside that window is under-counted for at most the TTL. An
+// OPEN verdict is not remembered (the cache answers it cheaply). At most
+// demandRootResolveBudget new closed or unreadable roots are resolved per pass;
+// a step whose root is unresolved — including a root whose teardown tail cannot
+// be read — is COUNTED, as it was before this guard.
 
+// Knobs, replaced in tests.
 var (
-	// demandClosedRootTTL bounds how long a closed or not-found root verdict is
-	// remembered across demand passes.
-	demandClosedRootTTL = 10 * time.Minute
-	// demandRootResolveBudget caps the uncached root resolutions of one pass.
+	demandClosedRootTTL     = 10 * time.Minute
 	demandRootResolveBudget = 8
-	// demandClosedRootClock is the TTL clock, replaced in tests.
-	demandClosedRootClock = time.Now
+	demandClosedRootClock   = time.Now
 )
 
 var errDemandRootUnresolved = errors.New("demand: root not resolved this pass")
@@ -52,8 +39,7 @@ type demandRootMemo struct {
 	expires time.Time
 }
 
-// demandRootMemos is the process-level cache, keyed by hookRootStoreKey over
-// the demand group's store key and the root id.
+// demandRootMemos is keyed by hookRootStoreKey(group store key, root id).
 var demandRootMemos = struct {
 	sync.Mutex
 	m map[string]demandRootMemo
