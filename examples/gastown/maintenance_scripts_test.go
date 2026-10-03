@@ -8506,11 +8506,11 @@ func TestJsonlExportPackConsolidationKeepsLargeExportsAsDeltas(t *testing.T) {
 }
 
 // Every git call that writes or packs archive objects carries the pack
-// settings: add, commit, gc --auto and the explicit repack on the commit
-// path, and fetch, rebase and push on the push path (commit, fetch and rebase
-// run git's own auto-maintenance, and push packs objects for transport). A
-// malformed override falls back to its default, with a warning, instead of
-// reaching git.
+// settings: add, commit, gc --auto, the explicit repack and its prune on the
+// commit path, and fetch, rebase and push on the push path (commit, fetch and
+// rebase run git's own auto-maintenance, and push packs objects for
+// transport). A malformed override falls back to its default, with a
+// warning, instead of reaching git.
 func TestJsonlExportPackSettingsReachEveryArchiveGitWrite(t *testing.T) {
 	cityDir := t.TempDir()
 	binDir := t.TempDir()
@@ -8551,6 +8551,7 @@ exec '%s' "$@"
 		"GC_JSONL_PACK_WINDOW_MEMORY":       "0",
 		"GC_JSONL_REPACK_LOOSE_KIB_CEILING": "-1",
 		"GC_JSONL_REPACK_PACK_LIMIT":        "ten",
+		"GC_JSONL_PRUNE_GRACE_MINUTES":      "0",
 	}
 	for key, value := range garbage {
 		env[key] = value
@@ -8570,6 +8571,7 @@ exec '%s' "$@"
 		"fetch":  defaults,
 		"rebase": defaults,
 		"push":   defaults,
+		"prune":  append(slices.Clone(defaults), "--expire=10.minutes.ago"),
 	}
 	data, err := os.ReadFile(gitLog)
 	if err != nil {
@@ -8599,12 +8601,17 @@ exec '%s' "$@"
 		seen[subcommand] = true
 		var missing []string
 		for _, setting := range settings {
-			if !configs[setting] {
-				missing = append(missing, setting)
+			switch {
+			case strings.HasPrefix(setting, "--"):
+				if !slices.Contains(args, setting) {
+					missing = append(missing, setting)
+				}
+			case !configs[setting]:
+				missing = append(missing, "-c "+setting)
 			}
 		}
 		if len(missing) > 0 {
-			t.Errorf("git %s runs without -c %s: git %s", subcommand, strings.Join(missing, ", -c "), line)
+			t.Errorf("git %s runs without %s: git %s", subcommand, strings.Join(missing, ", "), line)
 		}
 	}
 	for subcommand := range want {
@@ -8618,6 +8625,101 @@ exec '%s' "$@"
 		}
 	}
 	assertNoArchiveRepackFailure(t, stateFile)
+}
+
+// writeUnreachableLooseBlob writes size bytes that zlib cannot shrink (a
+// SHA-256 chain seeded by seed) into the archive as a loose blob that no ref,
+// reflog or index entry reaches, sets its file's mtime, and returns its id.
+// It stands in for a blob staged and then discarded after a failed commit,
+// or one written by a run killed mid-add.
+func writeUnreachableLooseBlob(t *testing.T, archiveRepo string, size, seed int, mtime time.Time) string {
+	t.Helper()
+	data := make([]byte, 0, size+sha256.Size)
+	block := sha256.Sum256([]byte("unreachable-" + strconv.Itoa(seed)))
+	for len(data) < size {
+		data = append(data, block[:]...)
+		block = sha256.Sum256(block[:])
+	}
+	src := filepath.Join(t.TempDir(), "blob")
+	if err := os.WriteFile(src, data[:size], 0o644); err != nil {
+		t.Fatalf("WriteFile(blob): %v", err)
+	}
+	oid := runGitOut(t, archiveRepo, "hash-object", "-w", src)
+	path := filepath.Join(archiveRepo, ".git", "objects", oid[:2], oid[2:])
+	if err := os.Chtimes(path, mtime, mtime); err != nil {
+		t.Fatalf("Chtimes(loose blob %s): %v", oid, err)
+	}
+	return oid
+}
+
+func archiveHasObject(archiveRepo, oid string) bool {
+	return exec.Command("git", "-C", archiveRepo, "cat-file", "-e", oid).Run() == nil
+}
+
+// Unreachable loose objects count toward the KiB ceiling, but no repack packs
+// them: a few discarded snapshot blobs would fail the post-condition on every
+// run and escalate. The explicit repack prunes the unreachable loose objects
+// older than GC_JSONL_PRUNE_GRACE_MINUTES (default 10), so they are gone and
+// the run records no failure; one younger than the grace survives the run.
+// Nothing reachable is pruned.
+func TestJsonlExportExplicitRepackPrunesUnreachableLooseObjectsPastTheGrace(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		withRecent bool
+	}{
+		{name: "older than the grace are pruned"},
+		{name: "newer than the grace survive", withRecent: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cityDir := t.TempDir()
+			binDir := t.TempDir()
+			stateDir := t.TempDir()
+			gcLog := filepath.Join(t.TempDir(), "gc.log")
+			mailLog := filepath.Join(t.TempDir(), "gc-mail.log")
+			archiveRepo := filepath.Join(cityDir, "archive")
+			stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
+
+			writeJsonlExportGCStub(t, binDir)
+			env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
+
+			// Run 1 creates the archive under the default ceilings.
+			writeIssuesPayloadDoltStub(t, binDir, jsonlGrowingStorePayload(0))
+			runScript(t, coreScriptPath("jsonl-export.sh"), env)
+
+			// About 300 KiB of unreachable garbage an hour old, against a
+			// 200 KiB ceiling; the recent blob alone fits under it.
+			const ceilingKiB = 200
+			var stale []string
+			for seed := 0; seed < 3; seed++ {
+				stale = append(stale, writeUnreachableLooseBlob(t, archiveRepo, 100_000, seed, time.Now().Add(-time.Hour)))
+			}
+			recent := ""
+			if tt.withRecent {
+				recent = writeUnreachableLooseBlob(t, archiveRepo, 40_000, 99, time.Now())
+			}
+			env["GC_JSONL_REPACK_LOOSE_KIB_CEILING"] = strconv.Itoa(ceilingKiB)
+
+			writeIssuesPayloadDoltStub(t, binDir, jsonlGrowingStorePayload(1))
+			runScript(t, coreScriptPath("jsonl-export.sh"), env)
+
+			for _, oid := range stale {
+				if archiveHasObject(archiveRepo, oid) {
+					t.Errorf("unreachable loose blob %s, an hour old, survived the explicit repack", oid)
+				}
+			}
+			if recent != "" && !archiveHasObject(archiveRepo, recent) {
+				t.Errorf("unreachable loose blob %s, younger than the prune grace, was pruned", recent)
+			}
+			counts := readArchiveCountObjects(t, archiveRepo)
+			t.Logf("after the explicit repack: %v", counts)
+			if counts["size"] > ceilingKiB {
+				t.Errorf("%d KiB of loose objects remain over the %d KiB ceiling: %v", counts["size"], ceilingKiB, counts)
+			}
+			assertNoArchiveRepackFailure(t, stateFile)
+			// Nothing reachable may go: every commit, tree and blob is present.
+			runGit(t, archiveRepo, "fsck", "--connectivity-only", "--no-dangling")
+		})
+	}
 }
 
 func TestJsonlExportSkipsSpikeCheckBelowMinPrev(t *testing.T) {
