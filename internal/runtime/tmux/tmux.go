@@ -2757,16 +2757,27 @@ const nudgeSubmitKeySettle = 100 * time.Millisecond
 // remaining keys are not sent after an error, matching sendEnter's previous
 // single-key contract (the caller decides how to react to a failed submit).
 func (t *Tmux) sendNudgeSubmitSequence(target string, keys []string) error {
+	return t.sendNudgeSubmitSequenceOwning(target, target, keys, nil)
+}
+
+// sendNudgeSubmitSequenceOwning is sendNudgeSubmitSequence for a delivery
+// that knows its own draft (owner): on an attached claude pane the guard
+// before each key, of the first submit and of every re-send, also refuses a
+// composer draft owner does not own (ga-da5vmz). A person may have cleared
+// the nudge and typed or pasted their own message, which the Enter would
+// submit.
+func (t *Tmux) sendNudgeSubmitSequenceOwning(session, target string, keys []string, owner *draftOwner) error {
 	// Chokepoint (ga-ubfc7j): no submit key goes to a pane showing a
-	// question dialog or an approval prompt. The draft rule does not apply
-	// here: the text on the line is the text this delivery just typed.
+	// question dialog or an approval prompt. The general draft rule does not
+	// apply here, since the line holds the text this delivery typed; owner
+	// checks that it holds ONLY that.
 	for i, key := range keys {
 		if i > 0 {
 			time.Sleep(nudgeSubmitKeySettle)
 		}
 		// Before EVERY key: a prompt can appear inside the settle between
 		// two keys of a multi-key sequence.
-		if err := t.humanPromptGuard(target, target, nudgeGuardStageBeforeSubmit, false); err != nil {
+		if err := t.humanPromptGuardOwning(session, target, nudgeGuardStageBeforeSubmit, false, owner); err != nil {
 			return err
 		}
 		if _, err := t.run("send-keys", "-t", target, key); err != nil {
@@ -2949,6 +2960,9 @@ func (t *Tmux) nudgeSession(
 	if err := sendText(target, message, t.cfg.NudgeReadyTimeout); err != nil {
 		return err
 	}
+	// Placeholder provenance, before the debounce (ga-da5vmz).
+	owner := &draftOwner{message: message}
+	t.noteDraft(owner, session, target)
 
 	// 3. Wait for paste to complete (tested, required). Kimi's TUI can take
 	// longer to accept large pasted prompts in detached panes.
@@ -2996,13 +3010,16 @@ func (t *Tmux) nudgeSession(
 	// only for single-key (plain Enter) sequences, which is what every family
 	// without a table entry has. Adding a multi-key entry for a family that is
 	// not submit-verify eligible would need that gap closed first.
-	sendSubmit := func() error { return t.sendNudgeSubmitSequence(target, submitKeys) }
+	// Every submit, first or re-sent, carries the ownership check (ga-da5vmz);
+	// resendGate's first read fills in our paste placeholder if the
+	// provenance read showed an empty composer.
+	sendSubmit := func() error { return t.sendNudgeSubmitSequenceOwning(session, target, submitKeys, owner) }
 	wake := func() { t.WakePaneIfDetached(session) }
 	if t.submitVerifyEligible(target) {
 		// The re-send gate (ga-ubfc7j): the old loop re-sent Enter whenever
 		// no spinner showed, which on a dialog the agent raised in reply meant
 		// answering it. A re-send now needs the typed text still drafted.
-		confirmed, err := submitEnterAndConfirmGated(sendSubmit, wake, func() (bool, error) { return t.paneBusy(target) }, time.Sleep, t.resendGate(session, target, message))
+		confirmed, err := submitEnterAndConfirmGated(sendSubmit, wake, func() (bool, error) { return t.paneBusy(target) }, time.Sleep, t.resendGate(session, target, message, owner))
 		if err != nil {
 			if errors.Is(err, ErrNudgeDeferredHumanPrompt) {
 				return err
@@ -3142,9 +3159,13 @@ func (t *Tmux) NudgePane(pane, message string) error {
 	if err := t.sendKeysLiteralWithRetry(pane, message, t.cfg.NudgeReadyTimeout); err != nil {
 		return err
 	}
+	// The submit below is owner-checked as NudgeSession's is (ga-da5vmz).
+	owner := &draftOwner{message: message}
+	t.noteDraft(owner, pane, pane)
 
 	// 2. Wait 500ms for paste to complete (tested, required)
 	time.Sleep(500 * time.Millisecond)
+	t.noteDraft(owner, pane, pane)
 
 	// 3. See NudgeSession for why Escape is provider-specific.
 	if t.shouldSendEscapeBeforeEnter(pane) {
@@ -3164,7 +3185,7 @@ func (t *Tmux) NudgePane(pane, message string) error {
 		if attempt > 0 {
 			time.Sleep(200 * time.Millisecond)
 		}
-		if err := t.sendNudgeSubmitSequence(pane, submitKeys); err != nil {
+		if err := t.sendNudgeSubmitSequenceOwning(pane, pane, submitKeys, owner); err != nil {
 			if errors.Is(err, ErrNudgeDeferredHumanPrompt) {
 				return err
 			}
@@ -3432,17 +3453,21 @@ func (t *Tmux) DismissModelSwitchModalIfPresent(session string) {
 // composer before Enter confirms it, so Enter does not race the digit.
 const feedbackSurveyDismissConfirmDelay = 150 * time.Millisecond
 
+// feedbackSurveyRetrySettle is how long the dismisser waits after its Enter
+// before it re-reads the screen to decide on a retry (ga-da5vmz).
+const feedbackSurveyRetrySettle = 500 * time.Millisecond
+
 // dismissFeedbackSurveyModal dismisses Claude Code's post-turn feedback
 // survey (ga-zg7fjq) by sending "0" (Dismiss) then Enter. Enter resolves to
 // the bundle's chat:submit action, which fires the survey's onDigit handler
 // immediately instead of waiting out its 400ms debounce -- see
 // runtime.ContainsFeedbackSurveyModal for the bundle-verified mechanism this
-// mirrors. It is a no-op unless the matcher fires, so it never sends stray
-// keystrokes into ordinary working panes. Side effects are injected so the
-// decision is unit-testable without a live tmux server. Returns whether the
-// modal was present (i.e. a dismiss was attempted).
-func dismissFeedbackSurveyModal(content string, sendKeys func(keys ...string) error, sleep func(time.Duration)) (bool, error) {
-	if !runtime.ContainsFeedbackSurveyModal(content) {
+// mirrors. It is a no-op unless the survey is LIVE (feedbackSurveyIsLive), so
+// it never sends stray keystrokes into ordinary working panes. Side effects
+// are injected so the decision is unit-testable without a live tmux server.
+// Returns whether the modal was present (i.e. a dismiss was attempted).
+func dismissFeedbackSurveyModal(content, promptPrefix string, sendKeys func(keys ...string) error, sleep func(time.Duration)) (bool, error) {
+	if !feedbackSurveyIsLive(content, promptPrefix) {
 		return false, nil
 	}
 	if err := sendKeys("0"); err != nil {
@@ -3450,6 +3475,74 @@ func dismissFeedbackSurveyModal(content string, sendKeys func(keys ...string) er
 	}
 	sleep(feedbackSurveyDismissConfirmDelay)
 	return true, sendKeys("Enter")
+}
+
+// feedbackSurveyIsLive reports whether content (the visible screen) shows
+// Claude Code's post-turn feedback survey as the LIVE block (ga-da5vmz): its
+// header line directly above its option row, and the row the last thing drawn
+// above an anchor, with only blank lines and box border between them. That is
+// how the survey renders (see feedbackSurveySessionFixture): above the
+// composer, so the tail-anchor rule DismissMidSessionDialogs uses -- the
+// dialog's anchor on the last non-blank line -- would never fire on it.
+//
+// Two anchors are tried: the last composer-looking line, and the end of the
+// screen. The second covers a screen with no live composer, where the last
+// composer-looking line is an earlier prompt in the agent's history and the
+// live survey is drawn below it.
+//
+// A survey row with agent output between it and the anchor is stale, left
+// over from an earlier turn. A row with no header directly above it is an
+// agent QUOTING the row as its last line of output. Dismissing either would
+// type "0" and Enter into the idle composer and submit "0" as a user message.
+func feedbackSurveyIsLive(content, promptPrefix string) bool {
+	lines := strings.Split(content, "\n")
+	if composerIdx, _ := lastComposerLine(lines, promptPrefix); composerIdx >= 0 && feedbackSurveyDirectlyAbove(lines, composerIdx) {
+		return true
+	}
+	return feedbackSurveyDirectlyAbove(lines, len(lines))
+}
+
+// feedbackSurveyDirectlyAbove reports whether the last line above anchor that
+// is not blank or box border is the survey's option row, with the survey's
+// header on the line right above that row.
+func feedbackSurveyDirectlyAbove(lines []string, anchor int) bool {
+	for i := anchor - 1; i >= 0; i-- {
+		if strings.TrimSpace(lines[i]) == "" || isBoxFrameLine(lines[i]) {
+			continue
+		}
+		return i > 0 && runtime.ContainsFeedbackSurveyModal(lines[i]) && isFeedbackSurveyHeader(lines[i-1])
+	}
+	return false
+}
+
+// feedbackSurveyHeaders are the titles Claude Code draws above the survey's
+// option row, one per variant (see feedbackSurveySessionFixture and
+// feedbackSurveyMemoryFixture). A title Claude Code changes stops the
+// dismissal: the nudge then waits on the survey, which is the safe failure.
+var feedbackSurveyHeaders = []string{
+	"How is Claude doing this session?",
+	"How was Claude's recollection?",
+}
+
+// isFeedbackSurveyHeader reports whether line is a survey title as drawn: an
+// optional "●" bullet, the title, and an optional "(optional)".
+func isFeedbackSurveyHeader(line string) bool {
+	s := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "●"))
+	for _, header := range feedbackSurveyHeaders {
+		if rest, ok := strings.CutPrefix(s, header); ok {
+			if rest = strings.TrimSpace(rest); rest == "" || rest == "(optional)" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isBoxFrameLine reports whether a captured line is only box-drawing border:
+// a full-width rule, or a box's top or bottom edge ("╭───╮", "╰───╯").
+func isBoxFrameLine(line string) bool {
+	s := strings.TrimSpace(line)
+	return utf8.RuneCountInString(s) >= 8 && strings.Trim(s, "─━╭╮╰╯┌┐└┘") == ""
 }
 
 // DismissFeedbackSurveyModalIfPresent clears Claude Code's post-turn
@@ -3461,16 +3554,23 @@ func dismissFeedbackSurveyModal(content string, sendKeys func(keys ...string) er
 // Best-effort: capture/send failures are swallowed (the caller retries on
 // the next wake).
 func (t *Tmux) DismissFeedbackSurveyModalIfPresent(session string) {
+	t.dismissFeedbackSurvey(session, time.Sleep)
+}
+
+// dismissFeedbackSurvey is DismissFeedbackSurveyModalIfPresent with its sleep
+// injected, so a test can redraw the pane while the dismisser waits.
+func (t *Tmux) dismissFeedbackSurvey(session string, sleep func(time.Duration)) {
 	target := session
 	if agentPane, err := t.FindAgentPane(session); err == nil && agentPane != "" {
 		target = agentPane
 	}
 	sendKeys := func(keys ...string) error {
 		for _, k := range keys {
-			// ga-ubfc7j: these are raw send-keys, and the survey matcher
-			// is contains-based over the visible screen, so a stray match
-			// could still key a live question, approval or attached
-			// person's draft. The full guard runs before EVERY key.
+			// ga-ubfc7j: these are raw send-keys, and the survey check
+			// reads only where the survey row sits, so a live question,
+			// approval or attached person's draft elsewhere on screen
+			// could still take the key. The full guard runs before EVERY
+			// key.
 			if err := t.humanPromptGuard(session, target, nudgeGuardStageBeforeType, true); err != nil {
 				return err
 			}
@@ -3483,25 +3583,33 @@ func (t *Tmux) DismissFeedbackSurveyModalIfPresent(session string) {
 
 	// Visible screen only (no "-S"): a live survey occupies the visible
 	// footer, while an already-answered or already-dismissed survey lingers
-	// in scrollback and would otherwise match the contains-based detector
-	// and type its "0" dismiss key into an empty composer (#6844).
+	// in scrollback (#6844). One can still be on the visible screen above
+	// later output, so the survey must also be the live block directly above
+	// the composer (feedbackSurveyIsLive, ga-da5vmz); otherwise its "0"
+	// and Enter land in the idle composer as a user message.
+	promptPrefix := t.resolveIdlePromptPrefix(session)
 	content, err := t.CaptureVisiblePane(target)
 	if err != nil {
 		return
 	}
-	present, _ := dismissFeedbackSurveyModal(content, sendKeys, time.Sleep)
+	present, _ := dismissFeedbackSurveyModal(content, promptPrefix, sendKeys, sleep)
 	if !present {
 		return
 	}
 
 	// The survey can occasionally eat the first digit (e.g. a keystroke lost
 	// to a slow-to-wake detached pane); re-read the visible screen and retry
-	// the dismiss pair once before giving up for this call.
+	// the dismiss pair once before giving up for this call. Wait for Claude
+	// to redraw first (ga-da5vmz): read straight after the Enter, the screen
+	// can still show the survey it has just dismissed, and a second "0" and
+	// Enter would land in the now-empty composer as a user message. The pair
+	// goes out only if the survey is still live after the wait.
+	sleep(feedbackSurveyRetrySettle)
 	content, err = t.CaptureVisiblePane(target)
 	if err != nil {
 		return
 	}
-	_, _ = dismissFeedbackSurveyModal(content, sendKeys, time.Sleep)
+	_, _ = dismissFeedbackSurveyModal(content, promptPrefix, sendKeys, sleep)
 }
 
 // GetPaneCommand returns the current command running in a pane.
@@ -4094,10 +4202,12 @@ func (t *Tmux) CapturePane(session string, lines int) (string, error) {
 // no scrollback history (no "-S"). The mid-session dialog dismissal
 // (dismissMidSessionDialogs) and the feedback-survey dismissal
 // (DismissFeedbackSurveyModalIfPresent) use this instead of CapturePane so an
-// already-dismissed dialog sitting in scrollback cannot satisfy the
-// contains-based matchers and inject dismissal keys into a live prompt before
-// the intended nudge. A live blocking dialog occupies the visible footer, so
-// the visible screen is the correct and sufficient window for that check.
+// already-dismissed dialog sitting in scrollback cannot satisfy their matchers
+// and inject dismissal keys into a live prompt before the intended nudge. A
+// live blocking dialog occupies the visible footer, so the visible screen is
+// the window for that check; a stale dialog can still be on it above later
+// output, which is why both callers also require the dialog to be the live
+// block (activeMidSessionDialog, feedbackSurveyIsLive).
 func (t *Tmux) CaptureVisiblePane(session string) (string, error) {
 	return t.run("capture-pane", "-p", "-t", session)
 }
@@ -4834,6 +4944,97 @@ func codexTranscriptTailContainsTurnAborted(tail string) bool {
 // "(main)", "⏱️ Jun 4 02:57:04", or the "✻ Worked for 3m 38s" done marker.
 var claudeBusySpinnerRe = regexp.MustCompile(`\([0-9]+[ms][^)]*[·•]`)
 
+// claudeHookSpinnerRe matches Claude Code's live spinner while hooks run: at
+// prompt submit, before the turn's first model call, "✶ Proofing… (running
+// UserPromptSubmit hooks… 1/2 · 3s)" (real capture, ga-megheo), and mid-turn,
+// "✢ Musing… (running PostToolUse hook · 3m 37s · ↓ 12.1k tokens)". Claude
+// Code 2.1.288 prints "… n/m" after "hooks" only when more than one hook runs,
+// so a single hook is followed by " ·" or ")". No elapsed timer follows "(",
+// so claudeBusySpinnerRe misses both. It is anchored at column 0 on a spinner
+// glyph + verb + ellipsis (claudeHookSpinnerHeadRe), so prose ("⏺ …"), an
+// echoed prompt ("❯ …"), tool output ("  ⎿ …" and its indented continuation)
+// and quoted source never match; claudeHookSpinnerLive keeps the phrase in
+// scrollback from matching and joins a spinner wrapped onto a second row.
+//
+// claudeTurnStartSpinnerRe matches, under the same anchor and window, the plain
+// working spinner right after the hook phase, which claudeBusySpinnerRe also
+// misses: a bare head "✢ Deliberating…" with nothing after it, or a timer with
+// no separator "✻ Hyperspacing… (22s)" (live shapes on 8 seats, up to ~33 s).
+// Idle chrome has no ellipsis after its verb ("✻ Worked for 3m 38s", "✻
+// Waiting for 2 background agents to finish", "✻ Brewed for 48s · done …").
+//
+// The leading glyph must be one of Claude's spinner frames, exactly the set
+// seen at column 0 on live panes (a 40 s sample over 22 seats: "·" 11, "✢" 11,
+// "✽" 11, "✻" 8, "✶" 6, "✳" 5) and in the ga-megheo hook captures ("✶", "✽").
+// Any other column-0 line ending in "…" ("✓ Done…", "- Ready…", "• Note…",
+// wrapped prose) is not a spinner.
+var (
+	claudeHookSpinnerHeadRe  = regexp.MustCompile(`^[·✢✳✶✻✽]\s\S+…`)
+	claudeHookSpinnerRe      = regexp.MustCompile(`^[·✢✳✶✻✽]\s\S+…\s+\(running \S+ hooks?(…|\s·|\))`)
+	claudeTurnStartSpinnerRe = regexp.MustCompile(`^[·✢✳✶✻✽]\s\S+…($|\s+\(([0-9]+h )?([0-9]+m )?[0-9]+s\))`)
+)
+
+// claudeHookSpinnerWrapRows is how many following rows a spinner head is
+// joined with: an 80-column pane wraps a 76-78 character spinner with a token
+// count onto a second row.
+const claudeHookSpinnerWrapRows = 2
+
+// claudeHookSpinnerWindow is how many non-empty lines from the bottom of the
+// capture the live hook spinner may sit. Measured on real captures: a plain
+// seat draws 8 lines below it (composer rule, "❯", rule, two status rows, the
+// mode row, the effort hint, "/rc"), so it is the 9th; the live woodhouse seat
+// draws 7 below its status line (rule, "❯ draft", rule, two statusline rows,
+// the mode row, "/rc") plus the background-agent rows, which are not counted.
+// 12 leaves room for a tip row under the spinner and a few lines of composer
+// draft.
+const claudeHookSpinnerWindow = 12
+
+// claudeHookSpinnerLive reports whether Claude's hook spinner (or the plain
+// turn-start spinner after it) is the live status line: an anchored match within the last claudeHookSpinnerWindow
+// non-empty lines of the capture, counted from the BOTTOM of the screen so an
+// echoed "❯ <prompt>" above the spinner, or a composer not yet redrawn, cannot
+// hide it. Indented background-agent rows ("  ⏺ main", "  ◯ general-purpose
+// …") are not counted. A column-0 "⏺" line is later assistant output: a
+// spinner above it is stale, so the scan stops there.
+//
+// A prompt whose hooks are running is already submitted, so busy is right for
+// every caller: submit confirmation, WaitForIdle, SnapshotIdle and the
+// queued-nudge transcript gate. An idle seat whose background agents tick
+// ("◯ general-purpose  … 1h 25m 34s · ↓ 228.0k tokens") stays idle.
+func claudeHookSpinnerLive(lines []string) bool {
+	seen := 0
+	for i := len(lines) - 1; i >= 0 && seen < claudeHookSpinnerWindow; i-- {
+		line := strings.TrimRight(lines[i], " \t")
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case trimmed == "":
+			continue
+		case line != trimmed && (strings.HasPrefix(trimmed, "◯") || strings.HasPrefix(trimmed, "⏺")):
+			continue
+		case strings.HasPrefix(line, "⏺"):
+			return false
+		}
+		seen++
+		if !claudeHookSpinnerHeadRe.MatchString(line) {
+			continue
+		}
+		if claudeTurnStartSpinnerRe.MatchString(line) {
+			return true
+		}
+		joined := line
+		for k, rows := i+1, 0; k < len(lines) && rows < claudeHookSpinnerWrapRows; k++ {
+			if next := strings.TrimSpace(lines[k]); next != "" {
+				joined += " " + next
+				rows++
+			}
+		}
+		if claudeHookSpinnerRe.MatchString(joined) {
+			return true
+		}
+	}
+	return false
+}
+
 // paneContainsBusyIndicator checks captured pane lines for signs that the agent
 // is actively processing. Agent TUIs surface this differently: older Claude Code
 // and Codex show "esc to interrupt"; current Claude Code shows a live spinner
@@ -4848,7 +5049,7 @@ func paneContainsBusyIndicator(lines []string) bool {
 			return true
 		}
 	}
-	return false
+	return claudeHookSpinnerLive(lines)
 }
 
 // paneShowsDrainedComposer reports whether the pane's live composer -- the
