@@ -15,6 +15,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/shellquote"
 	workdirutil "github.com/gastownhall/gascity/internal/workdir"
 	"github.com/gastownhall/gascity/internal/worker"
 	"github.com/spf13/cobra"
@@ -93,16 +94,26 @@ func newSessionResumeCmd(stdout, stderr io.Writer) *cobra.Command {
 		Long: `Put an agent back into a past conversation listed by "gc session history".
 
 By default this seeds the agent's session bead with the chosen conversation id
-and requests a wake, so the reconciler's normal resume path reopens that exact
+and requests a wake, so the reconciler's normal resume path tries that exact
 conversation — including for wake_mode=fresh agents that never auto-resume, and
 for on-demand crew whose context is normally lost on idle-close. The agent must
 not be running (attach to a running agent instead, or use --print).
 
---print skips all state changes and prints the provider command for an attended
-dive in your own terminal.
+resume never moves a live transcript. The next launch resumes the
+conversation only if the transcript is under the projects folder of that
+launch's cwd (the work_dir of an in-progress task assigned to the agent, else
+its work dir); otherwise the reconciler starts a fresh one. The output says
+which work dir the transcript was found under.
 
-Transcripts that the reaper moved into the archive are restored into the live
-projects directory first, so the provider can find them again.
+--print changes no session state and prints the provider command for an
+attended dive in your own terminal, run from the work dir whose projects folder
+holds the conversation. When that work dir cannot be used (it does not exist, or which
+work dir the folder belongs to could not be determined), it prints the agent's
+work dir instead and says on stderr what it found.
+
+Selecting a transcript that the reaper moved into the archive restores it
+(copies it) into the live projects directory first, so the provider can find
+it again; --print does that restore too.
 
 session-id may be any unambiguous prefix of an id from "gc session history".
 Note: "gc session pin" (pin_awake) prevents the idle-close that loses context
@@ -454,14 +465,16 @@ func cmdSessionResume(args []string, last, printOnly bool, archiveRoot string, s
 	}
 
 	searchPaths := worker.MergeSearchPaths(cfg.Daemon.ObservePaths)
-	entries := worker.ListClaudeSessionHistory(searchPaths, historyArchiveRoots(archiveRoot), target.workDir)
+	archiveRoots := historyArchiveRoots(archiveRoot)
+	scope := resolveSessionHistoryScope(cityPath, cfg, store, identifier, target, stderr)
+	entries := listSessionHistory(target, scope, searchPaths, archiveRoots)
 	if len(entries) == 0 {
 		fmt.Fprintf(stderr, "gc session resume: no conversations found for %q (work dir %s)\n", target.identifier, target.workDir) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	live := liveSessionKeysForWorkDir(store, target.workDir)
+	live := liveSessionKeysForScope(store, target, scope)
 
-	var chosen *worker.SessionHistoryEntry
+	var chosen *sessionHistoryItem
 	if last {
 		for i := range entries {
 			if _, isLive := live[entries[i].SessionID]; isLive {
@@ -475,7 +488,7 @@ func cmdSessionResume(args []string, last, printOnly bool, archiveRoot string, s
 			return 1
 		}
 	} else {
-		var matches []*worker.SessionHistoryEntry
+		var matches []*sessionHistoryItem
 		for i := range entries {
 			if strings.HasPrefix(entries[i].SessionID, requested) {
 				matches = append(matches, &entries[i])
@@ -503,7 +516,7 @@ func cmdSessionResume(args []string, last, printOnly bool, archiveRoot string, s
 	// reconciler's stale-resume probe only look at live roots.
 	transcriptPath := chosen.Path
 	if chosen.Archived {
-		restored, err := restoreArchivedTranscript(*chosen)
+		restored, err := restoreArchivedTranscript(chosen.SessionHistoryEntry)
 		if err != nil {
 			fmt.Fprintf(stderr, "gc session resume: restoring archived transcript: %v\n", err) //nolint:errcheck // best-effort stderr
 			return 1
@@ -513,7 +526,12 @@ func cmdSessionResume(args []string, last, printOnly bool, archiveRoot string, s
 	}
 
 	if printOnly {
-		fmt.Fprintf(stdout, "cd %s && claude --resume %s\n", target.workDir, chosen.SessionID) //nolint:errcheck // best-effort stdout
+		dir := chosen.foundUnder
+		if problem := foundUnderProblem(dir); problem != "" {
+			fmt.Fprintf(stderr, "gc session resume: %s; the command below runs in %s, where claude finds %s only once it is under that dir's projects folder\n", problem, target.workDir, transcriptPath) //nolint:errcheck // best-effort stderr
+			dir = target.workDir
+		}
+		fmt.Fprintf(stdout, "cd %s && claude --resume %s\n", shellquote.Join([]string{dir}), shellquote.Join([]string{chosen.SessionID})) //nolint:errcheck // best-effort stdout
 		return 0
 	}
 
@@ -556,9 +574,31 @@ func cmdSessionResume(args []string, last, printOnly bool, archiveRoot string, s
 	}
 	_ = pokeController(cityPath)
 
-	fmt.Fprintf(stdout, "Seeded %s (bead %s) with conversation %s — the reconciler will resume it.\n", target.identifier, sessionID, chosen.SessionID) //nolint:errcheck // best-effort stdout
-	fmt.Fprintf(stdout, "Transcript: %s\nAttach with: gc session attach %s\n", transcriptPath, target.identifier)                                      //nolint:errcheck // best-effort stdout
+	foundUnder := chosen.foundUnder
+	if foundUnder == "" {
+		foundUnder = "a work dir that could not be determined"
+	}
+	fmt.Fprintf(stdout, "Seeded %s (bead %s) with conversation %s. Its next launch resumes it only if the transcript is under the projects folder of that launch's cwd; nothing was moved.\n", target.identifier, sessionID, chosen.SessionID) //nolint:errcheck // best-effort stdout
+	fmt.Fprintf(stdout, "Transcript: %s (found under %s)\nAttach with: gc session attach %s\n", transcriptPath, foundUnder, target.identifier)                                                                                                 //nolint:errcheck // best-effort stdout
 	return 0
+}
+
+// foundUnderProblem says what makes dir unusable as the cwd for a provider
+// resume, as observed, or "" when it is an existing directory.
+func foundUnderProblem(dir string) string {
+	if dir == "" {
+		return "which work dir the transcript's projects folder belongs to could not be determined"
+	}
+	info, err := os.Stat(dir)
+	switch {
+	case os.IsNotExist(err):
+		return dir + " does not exist"
+	case err != nil:
+		return fmt.Sprintf("stat %s: %v", dir, err)
+	case !info.IsDir():
+		return dir + " is not a directory"
+	}
+	return ""
 }
 
 // restoreArchivedTranscript copies an archived transcript back into the
