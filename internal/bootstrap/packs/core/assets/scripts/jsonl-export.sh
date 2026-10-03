@@ -70,20 +70,22 @@ jsonl_git_size_bytes() {
 }
 
 # Print the git size ("512m", "4g") in the environment variable named $1, or
-# warn and print the default $2 when it is not one or is larger than the git
-# size $3. Zero is refused: git reads a zero pack.windowMemory as no limit at
-# all.
+# warn and print the default $2 when it is not one or falls outside the git
+# sizes $3..$4.
 jsonl_git_size_knob() {
     local name="$1"
     local default="$2"
-    local max="$3"
+    local min="$3"
+    local max="$4"
     local value="${!name:-$default}"
     local bytes
-    if bytes=$(jsonl_git_size_bytes "$value") && [ "$bytes" -le "$(jsonl_git_size_bytes "$max")" ]; then
+    if bytes=$(jsonl_git_size_bytes "$value") \
+        && [ "$bytes" -ge "$(jsonl_git_size_bytes "$min")" ] \
+        && [ "$bytes" -le "$(jsonl_git_size_bytes "$max")" ]; then
         printf '%s\n' "$value"
         return
     fi
-    echo "jsonl-export: ignoring $name=$value (want a git size from 1 to $max, such as 512m or 4g); using $default" >&2
+    echo "jsonl-export: ignoring $name=$value (want a git size from $min to $max); using $default" >&2
     printf '%s\n' "$default"
 }
 
@@ -121,18 +123,27 @@ REPACK_LOOSE_KIB_CEILING="$(jsonl_uint_knob GC_JSONL_REPACK_LOOSE_KIB_CEILING 52
 # 961 MB store were 45.97 GiB of a 46.23 GiB archive, where two consecutive
 # copies pack as a 202 MB base and a 27 KB delta). The threshold is raised on
 # every archive git call that writes or packs objects (ARCHIVE_PACK_CONFIG
-# below); a command-line -c outranks the archive's own config. git reads it
-# as an unsigned long; the maximum, 64g, is far above any blob worth a delta.
-ARCHIVE_BIG_FILE_THRESHOLD="$(jsonl_git_size_knob GC_JSONL_BIG_FILE_THRESHOLD 4g 64g)"
-# The delta search's window limit. pack.windowMemory is per thread and limits
-# how many large candidates the window holds: past it git evicts the oldest
-# before comparing the next object, always keeping at least one, so a larger
-# limit lets each object be tried against more of its neighbours. It is not
-# a bound on memory: git can exceed it while loading and indexing objects
-# (the one-time repair of the gc-kt7i host peaked at 9.8 GB RSS on two
-# threads at 8g). One thread holds one window. git's defaults are a thread
-# per CPU and no window limit at all. Read as an unsigned long; maximum 256g.
-ARCHIVE_PACK_WINDOW_MEMORY="$(jsonl_git_size_knob GC_JSONL_PACK_WINDOW_MEMORY 8g 256g)"
+# below); a command-line -c outranks the archive's own config. An export
+# above it is still stored whole, so the run warns about each one before
+# staging. git reads it as an unsigned long. The minimum is git's own 512m
+# (lower would deltify less than git does); the maximum, 64g, is far above
+# any blob worth a delta.
+ARCHIVE_BIG_FILE_THRESHOLD="$(jsonl_git_size_knob GC_JSONL_BIG_FILE_THRESHOLD 4g 512m 64g)"
+# The delta search's window, which sets its memory. Objects reach the window
+# sorted by path and then size, so a store's consecutive snapshots are
+# neighbours. pack.window=2 tries each object against the one before it,
+# the delta that matters here, instead of git's ten. pack.windowMemory is
+# per thread, and git never stores a blob whole for lack of it: find_deltas
+# evicts candidates only `while (mem_usage > window_memory_limit && count >
+# 1)` (builtin/pack-objects.c:2913, git 2.50.1), so it narrows the window to
+# one predecessor and still compares. Peak memory is about windowMemory plus
+# 2.5 times the largest blob (the blob, its candidate and the candidate's
+# delta index); with a window of two at 2g it is about 3.5 times the largest
+# blob, ~3.4 GB for a 961 MB export, on one thread (two threads hold two
+# windows). The window is fixed because that bound rests on it; the window
+# memory is a git size from 256m to 256g (an unsigned long in git).
+ARCHIVE_PACK_WINDOW=2
+ARCHIVE_PACK_WINDOW_MEMORY="$(jsonl_git_size_knob GC_JSONL_PACK_WINDOW_MEMORY 2g 256m 256g)"
 # pack.threads is a signed int in git; maximum 64.
 ARCHIVE_PACK_THREADS="$(jsonl_uint_knob GC_JSONL_PACK_THREADS 1 1 64)"
 # gc --auto folds the archive into one pack when its packs exceed this many
@@ -144,15 +155,24 @@ ARCHIVE_PACK_THREADS="$(jsonl_uint_knob GC_JSONL_PACK_THREADS 1 1 64)"
 # the order's timeout. It is a trigger, not a cap on the work (see the gc
 # --auto call). gc.autoPackLimit is a signed int in git; maximum 10000.
 REPACK_PACK_LIMIT="$(jsonl_uint_knob GC_JSONL_REPACK_PACK_LIMIT 10 0 10000)"
-# The explicit repack in commit_archive_snapshot prunes unreachable loose
-# objects older than this many minutes; why so short a grace is safe there is
-# explained at the prune. Maximum one week.
-ARCHIVE_PRUNE_GRACE_MINUTES="$(jsonl_uint_knob GC_JSONL_PRUNE_GRACE_MINUTES 10 1 10080)"
+# The order's timeout (orders/jsonl-export.toml, timeout = "30m", kept equal
+# by a test): the controller kills a run that reaches it. A repack marker
+# older than this means its run died mid-repack (begin_archive_repack), and
+# no run lives longer, which bounds the prune grace below.
+JSONL_ORDER_TIMEOUT_SECONDS=1800
+# The explicit repack in repack_archive_objects prunes unreachable loose
+# objects older than this many minutes (the reasoning is at the prune). The
+# minimum, 35, is above the order's 30-minute timeout: an object younger
+# than the grace may belong to a run still alive, and only the timeout
+# bounds how long one lives. Maximum one week.
+ARCHIVE_PRUNE_GRACE_MINUTES="$(jsonl_uint_knob GC_JSONL_PRUNE_GRACE_MINUTES 60 35 10080)"
 # Every archive git call that writes or packs objects carries these: add,
-# commit, gc, repack, fetch, rebase and push. commit, fetch and rebase run
-# git's own auto-maintenance, which inherits them through the environment;
-# push packs objects for the remote. gc --auto adds its trigger settings in
-# commit_archive_snapshot.
+# commit, gc, repack, prune, fetch, rebase and push. gc --auto adds its
+# trigger settings in repack_archive_objects. None of them reaches the
+# remote: over ssh or https it is another machine, and for a local bare
+# origin git clears GIT_CONFIG_PARAMETERS with the rest of local_repo_env
+# (connect.c), so a pushing archive's remote needs core.bigFileThreshold in
+# its own config or it stores every large snapshot whole.
 #
 # An archive that already holds whole copies in ONE pack keeps them: git never
 # retries two whole objects of the same pack as a delta pair without
@@ -164,6 +184,20 @@ ARCHIVE_PACK_CONFIG=(
     -c "core.bigFileThreshold=$ARCHIVE_BIG_FILE_THRESHOLD"
     -c "pack.threads=$ARCHIVE_PACK_THREADS"
     -c "pack.windowMemory=$ARCHIVE_PACK_WINDOW_MEMORY"
+    -c "pack.window=$ARCHIVE_PACK_WINDOW"
+)
+# Only the script's own gc --auto step (and the explicit repack behind it)
+# may pack the archive, inside the run. commit, fetch and rebase run git's
+# `maintenance run --auto` when they finish (builtin/commit.c:1935,
+# builtin/fetch.c:2679, builtin/rebase.c:566 in git 2.50.1), which detaches
+# by default: a gc it starts inherits the pack settings above and outlives
+# the order's kill of the run's process group. maintenance.auto=false stops
+# that call (run-command.c:1820), and gc.auto=0 stops any gc --auto it
+# reaches anyway: need_to_gc returns when gc.auto <= 0, before its
+# pack-count check (builtin/gc.c:635). push carries both too.
+ARCHIVE_NO_AUTO_GC=(
+    -c gc.auto=0
+    -c maintenance.auto=false
 )
 # An escalation suppresses repeats for this long, then re-alerts. Bounding the
 # silence by TIME, not by a marker, means a stale marker (a clear that failed
@@ -206,7 +240,7 @@ resolve_escalate_script() {
 ESCALATE_SCRIPT="$(resolve_escalate_script)"
 
 maintenance_done() {
-    local summary="$1"
+    local summary="$1${BIG_EXPORT_WARNINGS:+, warning: $BIG_EXPORT_WARNINGS}"
     local target="${GC_MAINTENANCE_DONE_TARGET:-}"
 
     [ -n "$target" ] || return 0
@@ -430,7 +464,7 @@ has_pending_archive_push() {
 }
 
 refresh_archive_remote_main() {
-    git "${ARCHIVE_PACK_CONFIG[@]}" fetch origin main -q 2>/dev/null
+    git "${ARCHIVE_PACK_CONFIG[@]}" "${ARCHIVE_NO_AUTO_GC[@]}" fetch origin main -q 2>/dev/null
 }
 
 archive_has_local_only_commits_from_tracking() {
@@ -751,7 +785,7 @@ ESCALATION
     # Successful git commands can emit benign stderr (e.g. "warning: redirecting
     # to https://...", credential-helper notes, protocol upgrade hints) which
     # would otherwise misclassify the run as a failure and falsely escalate.
-    if ! fetch_err=$(git "${ARCHIVE_PACK_CONFIG[@]}" fetch origin main -q 2>&1 >/dev/null); then
+    if ! fetch_err=$(git "${ARCHIVE_PACK_CONFIG[@]}" "${ARCHIVE_NO_AUTO_GC[@]}" fetch origin main -q 2>&1 >/dev/null); then
         if git rev-parse --verify refs/remotes/origin/main >/dev/null 2>&1; then
             record_archive_push_failure \
                 "jsonl-export: fetching origin/main failed" \
@@ -763,8 +797,8 @@ ESCALATION
 
     if git rev-parse --verify refs/remotes/origin/main >/dev/null 2>&1; then
         if ! git merge-base --is-ancestor refs/remotes/origin/main HEAD >/dev/null 2>&1; then
-            if ! rebase_err=$(git "${ARCHIVE_PACK_CONFIG[@]}" rebase refs/remotes/origin/main 2>&1 >/dev/null); then
-                git "${ARCHIVE_PACK_CONFIG[@]}" rebase --abort >/dev/null 2>&1 || true
+            if ! rebase_err=$(git "${ARCHIVE_PACK_CONFIG[@]}" "${ARCHIVE_NO_AUTO_GC[@]}" rebase refs/remotes/origin/main 2>&1 >/dev/null); then
+                git "${ARCHIVE_PACK_CONFIG[@]}" "${ARCHIVE_NO_AUTO_GC[@]}" rebase --abort >/dev/null 2>&1 || true
                 record_archive_push_failure \
                     "jsonl-export: rebase onto origin/main failed during archive push recovery" \
                     "$rebase_err"
@@ -785,7 +819,7 @@ ESCALATION
     # in tests to keep failure-path coverage fast.
     push_succeeded=false
     for push_attempt in 1 2 3; do
-        if push_err=$(git "${ARCHIVE_PACK_CONFIG[@]}" push origin main -q 2>&1 >/dev/null); then
+        if push_err=$(git "${ARCHIVE_PACK_CONFIG[@]}" "${ARCHIVE_NO_AUTO_GC[@]}" push origin main -q 2>&1 >/dev/null); then
             push_succeeded=true
             if [ "$push_attempt" -gt 1 ]; then
                 echo "jsonl-export: push succeeded on retry attempt $push_attempt" >&2
@@ -798,11 +832,11 @@ ESCALATION
 
             # Refresh origin tracking before retry — a sibling rig may have
             # moved the ref while we slept.
-            if fetch_err=$(git "${ARCHIVE_PACK_CONFIG[@]}" fetch origin main -q 2>&1 >/dev/null); then
+            if fetch_err=$(git "${ARCHIVE_PACK_CONFIG[@]}" "${ARCHIVE_NO_AUTO_GC[@]}" fetch origin main -q 2>&1 >/dev/null); then
                 if git rev-parse --verify refs/remotes/origin/main >/dev/null 2>&1 \
                     && ! git merge-base --is-ancestor refs/remotes/origin/main HEAD >/dev/null 2>&1; then
-                    if ! rebase_err=$(git "${ARCHIVE_PACK_CONFIG[@]}" rebase refs/remotes/origin/main 2>&1 >/dev/null); then
-                        git "${ARCHIVE_PACK_CONFIG[@]}" rebase --abort >/dev/null 2>&1 || true
+                    if ! rebase_err=$(git "${ARCHIVE_PACK_CONFIG[@]}" "${ARCHIVE_NO_AUTO_GC[@]}" rebase refs/remotes/origin/main 2>&1 >/dev/null); then
+                        git "${ARCHIVE_PACK_CONFIG[@]}" "${ARCHIVE_NO_AUTO_GC[@]}" rebase --abort >/dev/null 2>&1 || true
                         record_archive_push_failure \
                             "jsonl-export: rebase onto origin/main failed during retry $push_attempt" \
                             "$rebase_err"
@@ -834,26 +868,95 @@ commit_archive_snapshot() {
         GIT_AUTHOR_EMAIL="daemon@gastown.local" \
         GIT_COMMITTER_NAME="Gas Town Daemon" \
         GIT_COMMITTER_EMAIL="daemon@gastown.local" \
-        git "${ARCHIVE_PACK_CONFIG[@]}" commit -q -m "$message"; then
+        git "${ARCHIVE_PACK_CONFIG[@]}" "${ARCHIVE_NO_AUTO_GC[@]}" commit -q -m "$message"; then
         echo "jsonl-export: $context commit failed" >&2
         return 1
     fi
+    # Both callers run this function as the left operand of ||, where bash
+    # ignores errexit for the whole body, so nothing in the repack below can
+    # end the export; it is never fatal (the snapshot is already committed).
+    if begin_archive_repack; then
+        repack_archive_objects
+        end_archive_repack
+    fi
+    return 0
+}
+
+# The repack step runs under a marker, repack_in_flight_since (its start in
+# epoch seconds), kept in the state file this script already owns: a
+# timestamp in that JSON, not a lock or PID file, and nothing waits on it. A
+# run the order's timeout kills mid-repack never clears it, so a marker older
+# than JSONL_ORDER_TIMEOUT_SECONDS at a later run is that death, and it is
+# recorded as a repack failure through the usual path, so it counts and
+# escalates. A younger marker may belong to a run still alive (a manual `gc
+# order run` is not single-flight); it is no failure, and this run's marker
+# replaces it, so a death in an overlapping run can go uncounted.
+# Once the failures reach MAX_REPACK_FAILURES, the step is skipped until
+# REPACK_REESCALATE_SECONDS have passed since the last attempt: a repack the
+# timeout keeps killing then costs one killed run per window instead of every
+# run, and the snapshot still commits and pushes. Succeeds when this run
+# should repack, with REPACK_ATTEMPT_STARTED set to its marker.
+begin_archive_repack() {
+    local now
+    local state_json
+    local marker
+    local consecutive
+    local last_attempt
+    now=$(date +%s)
+    state_json=$(read_state_json)
+    marker=$(printf '%s\n' "$state_json" | jq -r '.repack_in_flight_since | numbers' 2>/dev/null) || marker=""
+    case "$marker" in ''|*[!0-9]*) marker="" ;; esac
+    if [ -n "$marker" ] && [ "$((now - marker))" -ge "$JSONL_ORDER_TIMEOUT_SECONDS" ]; then
+        record_archive_repack_failure "step=repack exit=killed repack_in_flight_since=$marker is $((now - marker))s old, past the order's ${JSONL_ORDER_TIMEOUT_SECONDS}s timeout: the run that set it died mid-repack"
+        if ! write_state_json "$(read_state_json | jq -c --argjson m "$marker" 'if .repack_in_flight_since == $m then del(.repack_in_flight_since) else . end')"; then
+            echo "jsonl-export: could not clear the dead run's repack marker; the next run counts it again" >&2
+        fi
+        state_json=$(read_state_json)
+    fi
+    consecutive=$(printf '%s\n' "$state_json" | jq -r '.consecutive_repack_failures // 0 | numbers' 2>/dev/null) || consecutive=0
+    case "$consecutive" in ''|*[!0-9]*) consecutive=0 ;; esac
+    last_attempt=$(printf '%s\n' "$state_json" | jq -r '.last_repack_attempt_at | numbers' 2>/dev/null) || last_attempt=""
+    case "$last_attempt" in ''|*[!0-9]*) last_attempt="" ;; esac
+    if [ "$consecutive" -ge "$MAX_REPACK_FAILURES" ] && [ -n "$last_attempt" ] \
+        && [ "$last_attempt" -le "$now" ] && [ "$((now - last_attempt))" -lt "$REPACK_REESCALATE_SECONDS" ]; then
+        echo "jsonl-export: archive repack skipped: $consecutive consecutive failures (threshold $MAX_REPACK_FAILURES) and the last attempt was $((now - last_attempt))s ago; the next comes once ${REPACK_REESCALATE_SECONDS}s have passed. The snapshot commits and pushes as usual" >&2
+        return 1
+    fi
+    REPACK_ATTEMPT_STARTED="$now"
+    if ! write_state_json "$(read_state_json | jq -c --argjson now "$now" '.repack_in_flight_since = $now | .last_repack_attempt_at = $now')"; then
+        echo "jsonl-export: could not record the repack attempt in state; if this run dies mid-repack, nothing counts it" >&2
+    fi
+    return 0
+}
+
+# Clear this run's repack marker, if it is still this run's.
+end_archive_repack() {
+    if ! write_state_json "$(read_state_json | jq -c --argjson m "$REPACK_ATTEMPT_STARTED" 'if .repack_in_flight_since == $m then del(.repack_in_flight_since) else . end')"; then
+        echo "jsonl-export: could not clear this run's repack marker; once it passes the order's timeout, a later run counts it as a death" >&2
+    fi
+}
+
+# Pack the archive after a snapshot commit, and judge the result. Every
+# failure is recorded in state and escalated by record_archive_repack_failure;
+# nothing here can end the export (see commit_archive_snapshot).
+repack_archive_objects() {
     # Every snapshot commit leaves one new loose blob per exported store (a
     # full issues.jsonl, tens of MiB each, or far more for a large store).
-    # The auto-maintenance that `git commit` starts packs only past gc.auto's
-    # default of 6700 loose objects, which at this blob size is several GiB
-    # of loose data. Repack on the commit path with a much lower trigger:
-    # gc.auto=256 fires roughly every ~128 commits, so each repack handles a
-    # few hundred MiB, not the whole history; autoDetach off so the repack
-    # finishes inside this order's run instead of a detached child that
-    # outlives it; gc.autoPackLimit at REPACK_PACK_LIMIT, so the packs those
-    # repacks write are folded together (and their whole copies deltified)
-    # long before git's default of 50. The first run against an archive that
-    # is already far behind packs the whole backlog at once, which is why the
-    # order's timeout is 30m. Never fatal: the snapshot is already committed,
-    # and a failed repack costs disk, not data. Never silent either: a repack
-    # that keeps failing lets loose objects pile up toward git's own trigger,
-    # so failures are counted in state and escalated.
+    # The commit's own auto-maintenance is off (ARCHIVE_NO_AUTO_GC), and its
+    # trigger, gc.auto's default of 6700 loose objects, would be several GiB
+    # of loose data at this blob size anyway. Repack here with a much lower
+    # trigger: gc.auto=256 fires roughly every ~128 commits, so each repack
+    # handles a few hundred MiB, not the whole history; autoDetach off so
+    # the repack finishes inside this order's run instead of a detached child
+    # that outlives it; gc.autoPackLimit at REPACK_PACK_LIMIT, so the packs
+    # those repacks write are folded together (and their whole copies
+    # deltified) long before git's default of 50. The first run against an
+    # archive that is already far behind packs the whole backlog at once,
+    # which is why the order's timeout is 30m. Never fatal: the snapshot is
+    # already committed, and a failed repack costs disk, not data. Never
+    # silent either: a repack that keeps failing lets loose objects pile up
+    # toward git's own trigger, so failures are counted in state and
+    # escalated.
     # Exit status alone is not proof: gc --auto returns 0 without packing when
     # its sampled estimate (one of the 256 loose-object fan-out directories)
     # misses the trigger, when another git gc holds the repository, when the
@@ -864,10 +967,11 @@ commit_archive_snapshot() {
     # exited 0, they are packed explicitly with the incremental repack gc
     # --auto would have run, the unreachable ones past a short grace are
     # pruned, and only that result is judged, on both.
-    # Both callers run this function as the left operand of ||, where bash
-    # ignores errexit for the whole body, so a failing command here cannot
-    # end the export. Every failure below is still handled explicitly, so
-    # the snapshot is marked for push even if a caller drops the ||.
+    # It runs inside commit_archive_snapshot, whose callers run it as the
+    # left operand of ||, where bash ignores errexit for the whole body, so a
+    # failing command here cannot end the export. Every failure below is
+    # still handled explicitly, so the snapshot is marked for push even if a
+    # caller drops the ||.
     local repack_err
     local repack_rc=0
     local repack_step="gc --auto"
@@ -881,6 +985,8 @@ commit_archive_snapshot() {
     local pre_auto_gc
     local fallback_err
     local prune_err
+    local pruned=0
+    local unreachable
     local summary
     # Read the loose objects' count and KiB on disk; either is empty when
     # count-objects did not report it.
@@ -901,6 +1007,17 @@ commit_archive_snapshot() {
     # unreadable reading is neither; the post-condition below fails on it.
     loose_over_a_ceiling() {
         [ -n "$loose" ] && [ -n "$loose_kib" ] && ! loose_within_ceilings
+    }
+    # Print how many loose objects git prune would remove with no grace at
+    # all: the unreachable ones, one "<id> <type>" line each in its dry run.
+    # Asked right after the prune, every one of them is younger than the
+    # grace. Reachability, not age, is what marks them as garbage: a repack
+    # that exits 0 but packs nothing leaves reachable loose objects that are
+    # just as young.
+    count_unreachable_loose_objects() {
+        local listing
+        listing=$(git prune --dry-run --expire=now 2>/dev/null) || return 1
+        printf '%s\n' "$listing" | grep -cE '^[0-9a-f]{40}([0-9a-f]{24})? '
     }
     read_loose_count
     if loose_over_a_ceiling; then
@@ -955,21 +1072,21 @@ commit_archive_snapshot() {
         # by a run killed mid-add) stay loose and count toward the KiB
         # ceiling, so two or three such blobs of a large store would fail
         # the post-condition on every run. Prune them with a grace far
-        # shorter than git's two weeks. That is safe here: the order runs one
-        # export at a time, the archive is private to this script, and this
-        # run's objects are already committed (reachable) when the repack
-        # runs, so an unreachable object older than the grace is garbage from
-        # an earlier run. Ten minutes is far longer than this script takes
-        # between writing an object and committing it, and shorter than the
-        # order's 15-minute cooldown, so an earlier run's garbage is normally
-        # past it by the next run; a blob still inside the grace waits one
-        # run, and one failing run does not escalate (MAX_REPACK_FAILURES).
-        # gc --auto is left alone: its own prune keeps git's two weeks.
+        # shorter than git's two weeks, but longer than the order's timeout.
+        # Nothing serializes runs: a manual `gc order run` does not wait for
+        # one in flight, and the cooldown counts from a run's start. What
+        # bounds a run is the timeout, which kills it by
+        # JSONL_ORDER_TIMEOUT_SECONDS, and this run's own objects are
+        # committed (reachable) before its repack. So an unreachable object
+        # younger than the grace may still belong to a live run and is never
+        # pruned, and one older is garbage. gc --auto is left alone: its own
+        # prune keeps git's two weeks.
         if [ "$repack_rc" -eq 0 ]; then
             repack_step="prune --expire=$ARCHIVE_PRUNE_GRACE_MINUTES.minutes.ago"
             prune_err=$(git "${ARCHIVE_PACK_CONFIG[@]}" prune --expire="$ARCHIVE_PRUNE_GRACE_MINUTES.minutes.ago" 2>&1 >/dev/null) || repack_rc=$?
             fallback_err="${fallback_err:+$fallback_err
 }$prune_err"
+            [ "$repack_rc" -eq 0 ] && pruned=1
         fi
         # Keep gc --auto's stderr too: its warnings (unreachable loose
         # objects, for one) explain why the fallback was needed.
@@ -978,6 +1095,18 @@ commit_archive_snapshot() {
         read_loose_count
     fi
     if [ "$repack_rc" -eq 0 ] && loose_within_ceilings; then
+        record_archive_repack_success
+        return 0
+    fi
+    # Still over a ceiling after a repack and a prune that both succeeded:
+    # when every loose object left is unreachable, it is garbage the grace
+    # still protects (a discarded blob can now sit up to the grace and hold
+    # the KiB ceiling over), waiting its turn rather than a failed repack, so
+    # log it and record no failure. Anything reachable left loose is a
+    # repack that did not pack, and fails below.
+    if [ "$repack_rc" -eq 0 ] && [ "$pruned" -eq 1 ] && [ -n "$loose" ] \
+        && unreachable=$(count_unreachable_loose_objects) && [ "$unreachable" -eq "$loose" ]; then
+        echo "jsonl-export: $loose loose objects ($loose_kib KiB) remain over a ceiling, all unreachable and younger than the ${ARCHIVE_PRUNE_GRACE_MINUTES}-minute prune grace; a later run prunes them" >&2
         record_archive_repack_success
         return 0
     fi
@@ -1246,6 +1375,10 @@ HALT_DB=""
 HALT_PREV_COUNT=0
 HALT_CURRENT_COUNT=0
 HALT_DELTA=0
+# Exports above the big-file threshold, named in the run's summary.
+BIG_EXPORT_WARNINGS=""
+# This run's repack marker (begin_archive_repack).
+REPACK_ATTEMPT_STARTED=""
 SCOPE_SCRUB_WHERE=""
 if [ "$SCRUB" = "true" ]; then
     SCOPE_SCRUB_WHERE="WHERE issue_type NOT IN ('message', 'event', 'wisp', 'agent') AND title NOT LIKE 'gc:%' AND title NOT LIKE 'order:%' AND NOT (issue_type = 'convoy' AND title LIKE 'sling-%')"
@@ -1453,6 +1586,20 @@ fi
 
 cd "$ARCHIVE_REPO"
 if [ "${#STAGE_PATHS[@]}" -gt 0 ]; then
+    # git stores an export above core.bigFileThreshold whole, whatever the
+    # pack settings: name each one, with its size, on stderr and in the
+    # run's summary.
+    big_file_threshold_bytes=$(jsonl_git_size_bytes "$ARCHIVE_BIG_FILE_THRESHOLD")
+    for stage_path in "${STAGE_PATHS[@]}"; do
+        [ -f "$stage_path/issues.jsonl" ] || continue
+        export_bytes=$(wc -c "./$stage_path/issues.jsonl" | awk '{print $1}')
+        case "$export_bytes" in ''|*[!0-9]*) continue ;; esac
+        if [ "$export_bytes" -gt "$big_file_threshold_bytes" ]; then
+            big_export="$stage_path/issues.jsonl is $export_bytes bytes, above the big-file threshold ($ARCHIVE_BIG_FILE_THRESHOLD); stored whole"
+            echo "jsonl-export: warning: $big_export" >&2
+            BIG_EXPORT_WARNINGS="${BIG_EXPORT_WARNINGS:+$BIG_EXPORT_WARNINGS; }$big_export"
+        fi
+    done
     if ! git "${ARCHIVE_PACK_CONFIG[@]}" add -A -- "${STAGE_PATHS[@]}"; then
         discard_staged_archive_outputs
         echo "jsonl-export: staging archive outputs failed" >&2
