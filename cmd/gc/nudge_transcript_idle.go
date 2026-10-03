@@ -104,6 +104,25 @@ func claudeTranscriptSaysTurnEnded(target nudgeTarget, sp runtime.Provider) bool
 	return err == nil && idle
 }
 
+// stampClaudePromptOnDelivery records the prompt marker for a claude seat the
+// dispatcher has just submitted to (call it only after a confirmed submit), so
+// the next pass cannot type into the turn this delivery started before that
+// turn's own hook writes the marker. submitAt is taken just before the submit
+// was sent, not when confirmation returned: a short turn may already have
+// ended by then, and a later marker would hide that turn_duration. A newer
+// marker (the seat's own hook, written during confirmation) is kept; a hook
+// write landing between this read and the write below can still be lost, a
+// window of one file read.
+func stampClaudePromptOnDelivery(target nudgeTarget, submitAt time.Time) error {
+	if nudgeTargetBuiltinFamily(target) != "claude" {
+		return nil
+	}
+	if existing, ok := readClaudePromptSubmitted(target.cityPath, target.sessionID); ok && existing.After(submitAt) {
+		return nil
+	}
+	return recordClaudePromptSubmitted(target.cityPath, target.sessionID, submitAt)
+}
+
 func readClaudeTranscriptTail(path string) ([]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
