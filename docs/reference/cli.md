@@ -4531,16 +4531,26 @@ gc session reset <session-id-or-alias> [flags]
 Put an agent back into a past conversation listed by "gc session history".
 
 By default this seeds the agent's session bead with the chosen conversation id
-and requests a wake, so the reconciler's normal resume path reopens that exact
+and requests a wake, so the reconciler's normal resume path tries that exact
 conversation — including for wake_mode=fresh agents that never auto-resume, and
 for on-demand crew whose context is normally lost on idle-close. The agent must
 not be running (attach to a running agent instead, or use --print).
 
---print skips all state changes and prints the provider command for an attended
-dive in your own terminal.
+resume never moves a live transcript. The next launch resumes the
+conversation only if the transcript is under the projects folder of that
+launch's cwd (the work_dir of an in-progress task assigned to the agent, else
+its work dir); otherwise the reconciler starts a fresh one. The output says
+which work dir the transcript was found under.
 
-Transcripts that the reaper moved into the archive are restored into the live
-projects directory first, so the provider can find them again.
+--print changes no session state and prints the provider command for an
+attended dive in your own terminal, run from the work dir whose projects folder
+holds the conversation. When that work dir cannot be used (it does not exist, or which
+work dir the folder belongs to could not be determined), it prints the agent's
+work dir instead and says on stderr what it found.
+
+Selecting a transcript that the reaper moved into the archive restores it
+(copies it) into the live projects directory first, so the provider can find
+it again; --print does that restore too.
 
 session-id may be any unambiguous prefix of an id from "gc session history".
 Note: "gc session pin" (pin_awake) prevents the idle-close that loses context
