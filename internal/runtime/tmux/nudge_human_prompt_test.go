@@ -1195,3 +1195,71 @@ func TestAStaleReminderWithAPersonsWordsIsTheirDraft(t *testing.T) {
 		}
 	})
 }
+
+// ga-da5vmz round 3 (1): a paste placeholder is ours only when it is the one
+// the composer showed for OUR paste, at the resend gate's read right after
+// it. A person who clears our paste and pastes their own gets the next #N;
+// the first Enter must not submit theirs. A placeholder that appears when our
+// paste had rendered inline is not ours either.
+func TestNudgeSessionFirstEnterOwnsOnlyItsOwnPastePlaceholder(t *testing.T) {
+	for name, gateRead := range map[string]string{
+		"a different paste number":          "❯ [Pasted text #4 +6 lines]",
+		"our paste had rendered inline":     "❯ <system-reminder> You have a deferred reminder that was queued",
+		"no placeholder at the gate's read": "❯ ",
+	} {
+		t.Run(name, func(t *testing.T) {
+			fe := &panePromptExecutor{screen: idleComposerFixture, attached: true}
+			fe.textCaptures = []string{composerFixture(gateRead), composerFixture("❯ [Pasted text #5 +2 lines]")}
+			fe.onEnter = func(int) string { return busyFixture }
+			tm, session := newGuardTestTmux(fe)
+
+			err := tm.NudgeSession(session, guardTestQueuedNudge)
+			assertDeliveredBy(t, fe, guardTestQueuedNudge)
+			if got := fe.enterCount(); got != 0 {
+				t.Fatalf("Enter sent %d time(s) onto a paste placeholder that is not ours", got)
+			}
+			assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+		})
+	}
+}
+
+// ga-da5vmz round 3 (2): a RE-sent Enter gets the same last-capture ownership
+// check as the first. The first Enter is dropped, the resend gate's read still
+// shows our draft, and by the chokepoint's read just before the re-sent key a
+// person has replaced it: no second Enter.
+func TestNudgeSessionReSentEnterChecksOwnershipOnTheLastCapture(t *testing.T) {
+	ours := composerFixture("❯ " + guardTestNudge)
+	// Plain captures once the text is in: the gate's and the chokepoint's for
+	// the first Enter, the confirm polls, the busy re-check and the resend
+	// gate's read -- all ours -- then the chokepoint's read for the re-send.
+	reads := make([]string, 0, submitConfirmPollsPerSend+5)
+	for range submitConfirmPollsPerSend + 4 {
+		reads = append(reads, ours)
+	}
+	fe := &panePromptExecutor{screen: idleComposerFixture, attached: true}
+	fe.textCaptures = append(reads, composerFixture("❯ actually, stop and rebase first"))
+	tm, session := newGuardTestTmux(fe)
+
+	err := tm.NudgeSession(session, guardTestNudge)
+	if got := fe.enterCount(); got != 1 {
+		t.Fatalf("Enter sent %d times, want 1: the re-send must not land on a person's text", got)
+	}
+	assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+}
+
+// ga-da5vmz round 3 (3): the attribute re-read that clears a faint
+// placeholder is a newer capture; a dialog drawn on it must stop the Enter as
+// it would on the plain read.
+func TestNudgeSessionFirstEnterClassifiesTheDimReRead(t *testing.T) {
+	styled := "⏺ Done.\n" + rule + "\n❯\n" + rule + "\nWhich approach would you prefer?\n❯ 1. Alpha approach\n  2. Beta variant\nEnter to select · Tab/Arrow keys to navigate · Esc to cancel"
+	fe := &panePromptExecutor{screen: idleComposerFixture, attached: true, styled: styled}
+	fe.onType = func(string) string { return composerFixture("❯ Try \"how does <filepath> work?\"") }
+	fe.onEnter = func(int) string { return busyFixture }
+	tm, session := newGuardTestTmux(fe)
+
+	err := tm.NudgeSession(session, guardTestNudge)
+	if got := fe.enterCount(); got != 0 {
+		t.Fatalf("Enter sent %d time(s) with a question dialog on the attribute re-read", got)
+	}
+	assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+}
