@@ -413,3 +413,125 @@ func TestLeanLocalRefusesUnknownScope(t *testing.T) {
 		t.Fatalf("module change must refuse rather than under-select tests: err=%v\n%s", err, output)
 	}
 }
+
+// newCIOnlyFixture builds a changed package whose own tests fail, a
+// sub-package and a name-prefix sibling that consume it and pass, and an
+// unrelated package whose tests must stay in CI.
+func newCIOnlyFixture(t *testing.T, consumers bool) prStaticScopeFixture {
+	t.Helper()
+	files := map[string]string{
+		"alpha/alpha.go":      "package alpha\n\nfunc Value() int { return 1 }\n",
+		"alpha/alpha_test.go": "package alpha\n\nimport \"testing\"\n\nfunc TestAlpha(t *testing.T) { t.Fatal(\"alpha tests must be left to CI\") }\n",
+		"unrelated/unrelated_test.go": "package unrelated\n\nimport \"testing\"\n\n" +
+			"func TestUnrelated(t *testing.T) { t.Fatal(\"unrelated test must stay in CI\") }\n",
+	}
+	if consumers {
+		consumer := "import (\n\t\"testing\"\n\n\t\"example.com/static-scope/alpha\"\n)\n\n" +
+			"func TestValue(t *testing.T) {\n\tif alpha.Value() != 1 {\n\t\tt.Fatal(\"consumer contract broken\")\n\t}\n}\n"
+		files["alpha/sub/sub_test.go"] = "package sub\n\n" + consumer
+		files["alphax/alphax_test.go"] = "package alphax\n\n" + consumer
+	}
+	fixture := newPRStaticScopeFixture(t, files)
+	writeTestFile(t, filepath.Join(fixture.repoRoot, "alpha", "alpha.go"),
+		"package alpha\n\n// Value is stable.\nfunc Value() int { return 1 }\n")
+	return fixture
+}
+
+// runLeanLocalCIOnly passes LEAN_LOCAL_CI_ONLY as a make variable, the way the
+// executor does, so a pass proves the recipe carries it through env -i.
+func (f prStaticScopeFixture) runLeanLocalCIOnly(ciOnly string) (string, error) {
+	cmd := makeCommand(
+		"--no-print-directory",
+		"-f", f.productionMakefile,
+		"CI_STATIC_GO="+f.realGo,
+		"LINT_CHANGED_SCOPE=tracked",
+		"LINT_CHANGED_REF=HEAD",
+		"SYS_USR_CGO_FALLBACK=0",
+		"LEAN_LOCAL_CI_ONLY="+ciOnly,
+		"check-lean-local",
+	)
+	cmd.Dir = f.repoRoot
+	cmd.Env = f.commandEnv()
+	output, err := cmd.CombinedOutput()
+	return string(output), err
+}
+
+// selectorLines keeps the lines the selector prints; make echoes the recipe,
+// which names the variable and its value, so raw output cannot be searched.
+func selectorLines(output string) []string {
+	var lines []string
+	for _, line := range strings.Split(output, "\n") {
+		if strings.HasPrefix(line, "check-lean-local: ") {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+// The executor leaves a named package's tests to required CI; every other
+// selected package is still tested, a directory match is exact, and a named
+// package that was not selected is not reported.
+func TestLeanLocalCIOnlyLeavesNamedPackageTestsToCI(t *testing.T) {
+	fixture := newCIOnlyFixture(t, true)
+	output, err := fixture.runLeanLocalCIOnly("./alpha ./unrelated")
+	if err != nil {
+		t.Fatalf("named package was tested or the rest refused: %v\n%s", err, output)
+	}
+	want := []string{
+		"check-lean-local: tests left to CI (LEAN_LOCAL_CI_ONLY): ./alpha",
+		"check-lean-local: testing ./alpha/sub ./alphax",
+	}
+	if got := selectorLines(output); !slices.Equal(got, want) {
+		t.Errorf("selector lines = %q, want %q\n%s", got, want, output)
+	}
+	for _, tested := range []string{"example.com/static-scope/alpha/sub", "example.com/static-scope/alphax"} {
+		if !strings.Contains(output, tested) {
+			t.Errorf("output lacks a result for %s:\n%s", tested, output)
+		}
+	}
+}
+
+func TestLeanLocalCIOnlyUnsetKeepsTodaysSelection(t *testing.T) {
+	fixture := newCIOnlyFixture(t, true)
+	for name, run := range map[string]func() (string, error){
+		"absent":     func() (string, error) { return fixture.runMakeTargetWithGo("check-lean-local", fixture.realGo) },
+		"empty":      func() (string, error) { return fixture.runLeanLocalCIOnly("") },
+		"whitespace": func() (string, error) { return fixture.runLeanLocalCIOnly("  ") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			output, err := run()
+			want := []string{"check-lean-local: testing ./alpha ./alpha/sub ./alphax"}
+			if got := selectorLines(output); err == nil || !slices.Equal(got, want) ||
+				!strings.Contains(output, "alpha tests must be left to CI") {
+				t.Fatalf("unset switch changed the selection: err=%v lines=%q\n%s", err, got, output)
+			}
+		})
+	}
+}
+
+func TestLeanLocalCIOnlyPassesWhenNamedPackageWasTheOnlySelection(t *testing.T) {
+	fixture := newCIOnlyFixture(t, false)
+	output, err := fixture.runLeanLocalCIOnly("./alpha")
+	want := []string{
+		"check-lean-local: tests left to CI (LEAN_LOCAL_CI_ONLY): ./alpha",
+		"check-lean-local: vet/build passed; no other affected Go tests selected",
+	}
+	if got := selectorLines(output); err != nil || !slices.Equal(got, want) {
+		t.Fatalf("only-selected named package must pass after vet/build: err=%v lines=%q\n%s", err, got, output)
+	}
+}
+
+func TestLeanLocalCIOnlyRefusesMalformedEntries(t *testing.T) {
+	fixture := newCIOnlyFixture(t, false)
+	for _, entry := range []string{"/abs/alpha", "alpha", "../alpha", "./alpha/../alpha", "./alpha/...", "./alpha alpha"} {
+		t.Run(entry, func(t *testing.T) {
+			output, err := fixture.runLeanLocalCIOnly(entry)
+			lines := selectorLines(output)
+			if err == nil || len(lines) != 1 ||
+				!strings.HasPrefix(lines[0], "check-lean-local: invalid LEAN_LOCAL_CI_ONLY entry") ||
+				!strings.Contains(output, "Error 2") {
+				t.Fatalf("malformed entry %q must fail closed with status 2: err=%v lines=%q\n%s", entry, err, lines, output)
+			}
+		})
+	}
+}
