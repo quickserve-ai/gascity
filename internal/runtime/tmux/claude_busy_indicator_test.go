@@ -56,7 +56,8 @@ func TestPaneContainsBusyIndicatorClaudeHookAndBackgroundShapes(t *testing.T) {
 		"spinner_above_many_background_agents": {append([]string{
 			"✶ Proofing… (running UserPromptSubmit hooks… 1/2 · 3s)", rule, "❯\u00a0", rule,
 			"  >>  seat * ga-xxxxxx · opus-5.5·high", "  5h █▉··· 37%", "  ⏵⏵ bypass permissions on · 2 shells · ← for agents",
-			"    /rc", "  ⏺ main"},
+			"    /rc", "  ⏺ main",
+		},
 			strings.Split(strings.TrimSuffix(strings.Repeat("  ◯ general-purpose  Task descripti…    29m 42s · ↓ 236.4k tokens\n", 8), "\n"), "\n")...), true},
 		// The plain turn-start spinner right after the hook phase: a bare head,
 		// or a timer with no separator (live shapes, 8 seats).
