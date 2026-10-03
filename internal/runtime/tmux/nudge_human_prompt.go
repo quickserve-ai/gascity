@@ -343,18 +343,36 @@ func composerHoldsSent(lines []string, promptPrefix, sent string) bool {
 }
 
 // draftOwner is what a delivery knows of its own composer draft (ga-da5vmz):
-// the message it typed, and the paste placeholder the composer showed for it
-// at the resend gate's read right after the paste, whitespace squashed ("" if
-// it showed none). A person's paste gets a different #N.
+// the message it typed, and the paste placeholder the composer showed for it,
+// whitespace squashed ("" if it showed none). A person's paste gets a
+// different #N. The first read that shows a draft sets it: the provenance
+// read as the text goes in (noteDraft), else resendGate's.
 type draftOwner struct {
 	message, placeholder string
+	settled              bool
+}
+
+// noteDraft reads target's composer and records it in o (notePlaceholder).
+// Called the moment a delivery's text is in, before any debounce, a
+// placeholder it sees is our paste's, not one a person pasted in the wait.
+func (t *Tmux) noteDraft(o *draftOwner, session, target string) {
+	if lines, err := t.CapturePaneLines(target, promptObservationLines); err == nil {
+		if found, text := composerDraft(lines, t.resolveIdlePromptPrefix(session)); found {
+			o.notePlaceholder(text)
+		}
+	}
 }
 
 // notePlaceholder records the placeholder a composer draft shows, if it shows
-// only that (after complete gc reminders); otherwise it records none.
+// only that (after complete gc reminders), or none if it shows other text.
+// The first draft that is not empty settles it; an empty one leaves it open.
 func (o *draftOwner) notePlaceholder(draft string) {
-	o.placeholder = ""
-	if d := stripLeadingGCReminders(squashSpace(draft)); claudePastePlaceholderOnly.MatchString(d) {
+	d := stripLeadingGCReminders(squashSpace(draft))
+	if o.settled || d == "" {
+		return
+	}
+	o.settled = true
+	if claudePastePlaceholderOnly.MatchString(d) {
 		o.placeholder = d
 	}
 }
@@ -385,6 +403,10 @@ func (o *draftOwner) owns(draft string) bool {
 // middle, a sentence quoting it, or a placeholder with words beside it. The
 // draft only has to CONTAIN a person's words for the first Enter to submit
 // them.
+//
+// Known gap: a person who replaces our paste with their own in the ms before
+// the provenance read (or, if ours had not rendered by then, before the read
+// after the debounce) has their placeholder taken as ours.
 func composerDraftIsOurs(draft, sent, placeholder string) bool {
 	d := stripLeadingGCReminders(squashSpace(draft))
 	if d == "" || (placeholder != "" && d == placeholder) {

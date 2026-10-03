@@ -2960,6 +2960,9 @@ func (t *Tmux) nudgeSession(
 	if err := sendText(target, message, t.cfg.NudgeReadyTimeout); err != nil {
 		return err
 	}
+	// Placeholder provenance, before the debounce (ga-da5vmz).
+	owner := &draftOwner{message: message}
+	t.noteDraft(owner, session, target)
 
 	// 3. Wait for paste to complete (tested, required). Kimi's TUI can take
 	// longer to accept large pasted prompts in detached panes.
@@ -3008,8 +3011,8 @@ func (t *Tmux) nudgeSession(
 	// without a table entry has. Adding a multi-key entry for a family that is
 	// not submit-verify eligible would need that gap closed first.
 	// Every submit, first or re-sent, carries the ownership check (ga-da5vmz);
-	// resendGate's first read records our paste placeholder in owner.
-	owner := &draftOwner{message: message}
+	// resendGate's first read fills in our paste placeholder if the
+	// provenance read showed an empty composer.
 	sendSubmit := func() error { return t.sendNudgeSubmitSequenceOwning(session, target, submitKeys, owner) }
 	wake := func() { t.WakePaneIfDetached(session) }
 	if t.submitVerifyEligible(target) {
@@ -3156,9 +3159,13 @@ func (t *Tmux) NudgePane(pane, message string) error {
 	if err := t.sendKeysLiteralWithRetry(pane, message, t.cfg.NudgeReadyTimeout); err != nil {
 		return err
 	}
+	// The submit below is owner-checked as NudgeSession's is (ga-da5vmz).
+	owner := &draftOwner{message: message}
+	t.noteDraft(owner, pane, pane)
 
 	// 2. Wait 500ms for paste to complete (tested, required)
 	time.Sleep(500 * time.Millisecond)
+	t.noteDraft(owner, pane, pane)
 
 	// 3. See NudgeSession for why Escape is provider-specific.
 	if t.shouldSendEscapeBeforeEnter(pane) {
@@ -3178,7 +3185,7 @@ func (t *Tmux) NudgePane(pane, message string) error {
 		if attempt > 0 {
 			time.Sleep(200 * time.Millisecond)
 		}
-		if err := t.sendNudgeSubmitSequence(pane, submitKeys); err != nil {
+		if err := t.sendNudgeSubmitSequenceOwning(pane, pane, submitKeys, owner); err != nil {
 			if errors.Is(err, ErrNudgeDeferredHumanPrompt) {
 				return err
 			}
