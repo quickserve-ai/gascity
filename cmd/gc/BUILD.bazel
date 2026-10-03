@@ -1003,6 +1003,7 @@ go_test(
         "cwd_fallback_guard_test.go",
         "dead_assignee_event_test.go",
         "dead_assignee_repair_test.go",
+        "demand_closed_root_cache_test.go",
         "demand_closed_root_test.go",
         "demand_divergence_test.go",
         "demand_serve_agreement_test.go",
