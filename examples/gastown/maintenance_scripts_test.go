@@ -8835,12 +8835,31 @@ func TestJsonlExportRepackMarkerHorizonMatchesTheOrderTimeout(t *testing.T) {
 	}
 }
 
+// repackMarkerState is a state file body holding another run's repack marker.
+func repackMarkerState(runStartedAt int64, id string) string {
+	return fmt.Sprintf(`{"repack_in_flight":{"run_started_at":%d,"id":%q}}`, runStartedAt, id)
+}
+
+// seedRepackMarker adds another run's repack marker to the existing state.
+func seedRepackMarker(t *testing.T, stateFile string, runStartedAt int64, id string) {
+	t.Helper()
+	state := readJsonlExportState(t, stateFile)
+	state["repack_in_flight"] = map[string]any{"run_started_at": runStartedAt, "id": id}
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("Marshal(state): %v", err)
+	}
+	writeJsonlExportState(t, stateFile, string(data))
+}
+
 // A run killed mid-repack (the order's timeout kills its process group, and
-// a detached gc it started would outlive it) leaves repack_in_flight_since in
-// state. A marker older than the order's timeout means that run died: it is
+// a detached gc it started would outlive it) leaves its repack_in_flight
+// marker in state. The timeout counts from the RUN's start, so a marker whose
+// run started longer ago than the timeout is a dead run, however recently
+// its repack began (a slow export, then a repack killed at 30m): it is
 // recorded as a repack failure through the usual path, so it counts and
 // escalates, and the marker is cleared.
-func TestJsonlExportRepackMarkerOlderThanTheOrderTimeoutIsAFailure(t *testing.T) {
+func TestJsonlExportRepackMarkerOfARunPastTheOrderTimeoutIsAFailure(t *testing.T) {
 	cityDir := t.TempDir()
 	binDir := t.TempDir()
 	stateDir := t.TempDir()
@@ -8851,8 +8870,10 @@ func TestJsonlExportRepackMarkerOlderThanTheOrderTimeoutIsAFailure(t *testing.T)
 
 	writeJsonlExportGCStub(t, binDir)
 	writeMultiRecordDoltStub(t, binDir, 3)
-	died := time.Now().Add(-time.Hour).Unix()
-	writeJsonlExportState(t, stateFile, fmt.Sprintf(`{"repack_in_flight_since":%d,"last_repack_attempt_at":%d}`, died, died))
+	// The dead run started an hour ago; its repack began a minute ago.
+	runStarted := time.Now().Add(-time.Hour).Unix()
+	repackBegan := time.Now().Add(-time.Minute).Unix()
+	writeJsonlExportState(t, stateFile, fmt.Sprintf(`{"repack_in_flight":{"run_started_at":%d,"id":"dead-run"},"last_repack_attempt_at":%d}`, runStarted, repackBegan))
 	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
 	env["GC_JSONL_MAX_REPACK_FAILURES"] = "1"
 
@@ -8862,10 +8883,10 @@ func TestJsonlExportRepackMarkerOlderThanTheOrderTimeoutIsAFailure(t *testing.T)
 	if got := state["consecutive_repack_failures"]; got != float64(1) {
 		t.Errorf("consecutive_repack_failures = %v, want 1: a run that died mid-repack is a failure\nstate: %v", got, state)
 	}
-	if got, _ := state["last_repack_stderr"].(string); !strings.Contains(got, "repack_in_flight_since") {
-		t.Errorf("last_repack_stderr = %q, want the stale repack_in_flight_since named", got)
+	if got, _ := state["last_repack_stderr"].(string); !strings.Contains(got, "dead-run") {
+		t.Errorf("last_repack_stderr = %q, want the dead run's marker named", got)
 	}
-	if _, ok := state["repack_in_flight_since"]; ok {
+	if _, ok := state["repack_in_flight"]; ok {
 		t.Errorf("the dead run's marker must be cleared once it is counted\nstate: %v", state)
 	}
 	mailData, err := os.ReadFile(mailLog)
@@ -8877,11 +8898,11 @@ func TestJsonlExportRepackMarkerOlderThanTheOrderTimeoutIsAFailure(t *testing.T)
 	}
 }
 
-// A marker younger than the timeout may belong to a run still in flight (a
-// manual `gc order run` is not single-flight), so it is no failure. The run
-// repacks under a marker of its own, which is in state while the repack runs
-// and gone after.
-func TestJsonlExportRepackMarkerYoungerThanTheOrderTimeoutIsNotAFailure(t *testing.T) {
+// A marker whose run started within the timeout belongs to a run that may
+// still be repacking (a manual `gc order run` is not single-flight). It is no
+// failure, this run neither overwrites it nor repacks alongside it (one
+// repack at a time, without a lock), and the snapshot still commits.
+func TestJsonlExportLiveRepackMarkerOfAnotherRunSkipsThisRunsRepack(t *testing.T) {
 	cityDir := t.TempDir()
 	binDir := t.TempDir()
 	stateDir := t.TempDir()
@@ -8889,34 +8910,142 @@ func TestJsonlExportRepackMarkerYoungerThanTheOrderTimeoutIsNotAFailure(t *testi
 	mailLog := filepath.Join(t.TempDir(), "gc-mail.log")
 	archiveRepo := filepath.Join(cityDir, "archive")
 	stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
-	duringGC := filepath.Join(t.TempDir(), "state-during-gc.json")
 
-	// `git gc` copies the state file aside, so the test sees the marker
-	// the repack step runs under; `git repack` is real.
-	gcScriptedStub(t, binDir, filepath.Join(t.TempDir(), "repack.log"), fmt.Sprintf("cp '%s' '%s'", stateFile, duringGC))
 	writeJsonlExportGCStub(t, binDir)
 	writeMultiRecordDoltStub(t, binDir, 3)
-	young := time.Now().Add(-time.Minute).Unix()
-	writeJsonlExportState(t, stateFile, fmt.Sprintf(`{"repack_in_flight_since":%d,"last_repack_attempt_at":%d}`, young, young))
+	writeJsonlExportState(t, stateFile, repackMarkerState(time.Now().Add(-time.Minute).Unix(), "live-run"))
 	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
+	// A repack that runs packs every loose object.
 	env["GC_JSONL_REPACK_LOOSE_CEILING"] = "0"
 
+	out, runErr := runScriptResult(t, coreScriptPath("jsonl-export.sh"), env)
+	if runErr != nil {
+		t.Fatalf("the export must succeed while another run repacks: %v\n%s", runErr, out)
+	}
+	if !strings.Contains(string(out), "archive repack skipped") || !strings.Contains(string(out), "live-run") {
+		t.Errorf("the skip must be logged, naming the run that holds the marker; output:\n%s", out)
+	}
+	assertNoArchiveRepackFailure(t, stateFile)
+	state := readJsonlExportState(t, stateFile)
+	if marker, _ := state["repack_in_flight"].(map[string]any); marker["id"] != "live-run" {
+		t.Errorf("the live run's marker must survive this run: repack_in_flight = %v\nstate: %v", state["repack_in_flight"], state)
+	}
+	if loose := readArchiveCountObjects(t, archiveRepo)["count"]; loose == 0 {
+		t.Errorf("this run must not repack while another run holds the marker")
+	}
+	gcData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	if !strings.Contains(string(gcData), "MAINTENANCE_DONE: jsonl — exported 1/1") {
+		t.Errorf("the snapshot must still be committed; gc log:\n%s", gcData)
+	}
+}
+
+// A run that commits a snapshot and then dies mid-repack can be followed by
+// runs with nothing to commit, which never reach the repack step. The dead
+// run's marker is still reconciled early in every run: a no-change run counts
+// it as a failure and clears it.
+func TestJsonlExportDeadRepackMarkerIsCountedOnANoChangeRun(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+	mailLog := filepath.Join(t.TempDir(), "gc-mail.log")
+	archiveRepo := filepath.Join(cityDir, "archive")
+	stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
+
+	writeJsonlExportGCStub(t, binDir)
+	writeMultiRecordDoltStub(t, binDir, 3)
+	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
+	runScript(t, coreScriptPath("jsonl-export.sh"), env)
+	seedRepackMarker(t, stateFile, time.Now().Add(-time.Hour).Unix(), "dead-run")
+	if err := os.Remove(gcLog); err != nil {
+		t.Fatalf("Remove(gc log): %v", err)
+	}
+
+	// The same payload again: nothing to commit.
 	runScript(t, coreScriptPath("jsonl-export.sh"), env)
 
-	assertNoArchiveRepackFailure(t, stateFile)
-	during := readJsonlExportState(t, duringGC)
-	if got, ok := during["repack_in_flight_since"].(float64); !ok || int64(got) <= young {
-		t.Errorf("during the repack, repack_in_flight_since = %v, want this run's own start (after %d)\nstate: %v", during["repack_in_flight_since"], young, during)
+	gcData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	if !strings.Contains(string(gcData), "MAINTENANCE_DONE: jsonl — no changes") {
+		t.Fatalf("test setup: the second run must have nothing to commit; gc log:\n%s", gcData)
 	}
 	state := readJsonlExportState(t, stateFile)
-	if _, ok := state["repack_in_flight_since"]; ok {
-		t.Errorf("the run must clear its marker when the repack step ends\nstate: %v", state)
+	if got := state["consecutive_repack_failures"]; got != float64(1) {
+		t.Errorf("consecutive_repack_failures = %v, want 1: the dead run must be counted on a no-change run\nstate: %v", got, state)
 	}
-	if got, ok := state["last_repack_attempt_at"].(float64); !ok || int64(got) <= young {
-		t.Errorf("last_repack_attempt_at = %v, want this run's attempt (after %d)\nstate: %v", state["last_repack_attempt_at"], young, state)
+	if got, _ := state["last_repack_stderr"].(string); !strings.Contains(got, "dead-run") {
+		t.Errorf("last_repack_stderr = %q, want the dead run's marker named", got)
 	}
-	if loose := readArchiveCountObjects(t, archiveRepo)["count"]; loose != 0 {
-		t.Errorf("the repack must have run and packed every loose object; %d remain", loose)
+	if _, ok := state["repack_in_flight"]; ok {
+		t.Errorf("the dead run's marker must be cleared once it is counted\nstate: %v", state)
+	}
+}
+
+// The repack runs under this run's own marker, and the run clears only a
+// marker whose id is its own: when another run has put its marker in place
+// meanwhile (here with the same start second, where epochs alone would
+// collide), that marker survives this run's clear.
+func TestJsonlExportRepackMarkerIsClearedOnlyByItsOwnRun(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		takeOver bool
+	}{
+		{name: "this run clears its own marker"},
+		{name: "another run's marker survives this run's clear", takeOver: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cityDir := t.TempDir()
+			binDir := t.TempDir()
+			stateDir := t.TempDir()
+			gcLog := filepath.Join(t.TempDir(), "gc.log")
+			mailLog := filepath.Join(t.TempDir(), "gc-mail.log")
+			archiveRepo := filepath.Join(cityDir, "archive")
+			stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
+			duringGC := filepath.Join(t.TempDir(), "state-during-gc.json")
+
+			// `git gc` copies the state file aside, so the test sees the
+			// marker the repack runs under; with takeOver it then gives the
+			// marker another run's id, keeping its start. `git repack` is real.
+			onGC := fmt.Sprintf("cp '%s' '%s'", stateFile, duringGC)
+			if tt.takeOver {
+				onGC += fmt.Sprintf(`
+        jq -c 'if .repack_in_flight then .repack_in_flight.id = "other-run" else . end' '%[1]s' > '%[1]s.take' && mv -f '%[1]s.take' '%[1]s'`, stateFile)
+			}
+			gcScriptedStub(t, binDir, filepath.Join(t.TempDir(), "repack.log"), onGC)
+			writeJsonlExportGCStub(t, binDir)
+			writeMultiRecordDoltStub(t, binDir, 3)
+			env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
+			env["GC_JSONL_REPACK_LOOSE_CEILING"] = "0"
+			testStarted := time.Now().Unix()
+
+			runScript(t, coreScriptPath("jsonl-export.sh"), env)
+
+			assertNoArchiveRepackFailure(t, stateFile)
+			during := readJsonlExportState(t, duringGC)
+			own, _ := during["repack_in_flight"].(map[string]any)
+			if started, ok := own["run_started_at"].(float64); !ok || int64(started) < testStarted {
+				t.Errorf("during the repack, repack_in_flight = %v, want this run's start (at or after %d) and id", during["repack_in_flight"], testStarted)
+			}
+			if id, _ := own["id"].(string); id == "" {
+				t.Errorf("during the repack, repack_in_flight = %v, want an attempt id", during["repack_in_flight"])
+			}
+			state := readJsonlExportState(t, stateFile)
+			marker, present := state["repack_in_flight"].(map[string]any)
+			switch {
+			case tt.takeOver && (!present || marker["id"] != "other-run"):
+				t.Errorf("another run's marker must survive this run's clear: repack_in_flight = %v\nstate: %v", state["repack_in_flight"], state)
+			case !tt.takeOver && present:
+				t.Errorf("the run must clear its own marker when the repack step ends\nstate: %v", state)
+			}
+			if loose := readArchiveCountObjects(t, archiveRepo)["count"]; loose != 0 {
+				t.Errorf("the repack must have run and packed every loose object; %d remain", loose)
+			}
+		})
 	}
 }
 
