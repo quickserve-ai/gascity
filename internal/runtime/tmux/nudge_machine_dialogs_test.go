@@ -320,3 +320,95 @@ func dismissKeyed(tm *Tmux) bool {
 	keyed, _ := tm.dismissMidSessionDialogs("agent-pane")
 	return keyed
 }
+
+// scriptedCaptureExecutor answers every capture-pane with before until the
+// first send-keys; from then on it answers the i-th capture with afterKey[i]
+// (the last screen repeats). It reports a detached session.
+type scriptedCaptureExecutor struct {
+	calls    [][]string
+	before   string
+	afterKey []string
+	keyed    bool
+	captures int
+}
+
+func (s *scriptedCaptureExecutor) execute(args []string) (string, error) {
+	cp := make([]string, len(args))
+	copy(cp, args)
+	s.calls = append(s.calls, cp)
+	if slices.Contains(args, "capture-pane") {
+		if !s.keyed {
+			return s.before, nil
+		}
+		i := min(s.captures, len(s.afterKey)-1)
+		s.captures++
+		return s.afterKey[i], nil
+	}
+	if slices.Contains(args, "#{session_attached}") {
+		return "0", nil
+	}
+	if slices.Contains(args, "send-keys") {
+		s.keyed = true
+	}
+	return "", nil
+}
+
+func (s *scriptedCaptureExecutor) executeCtx(_ context.Context, args []string) (string, error) {
+	return s.execute(args)
+}
+
+// ga-da5vmz (nit on Astra round 5): the pre-Enter check must classify the
+// screen and find the modal on ONE capture. Reverting to two reads (guard
+// capture, then a separate modal capture) reopens a window in which the screen
+// the guard approved is not the screen the modal check read. The approval
+// test above cannot see that revert: its single post-Down screen refuses on
+// either code. Two checks here can:
+//
+//   - the capture count between Down and Enter is exactly one;
+//   - a sequence whose FIRST post-Down read is a person's numbered question and
+//     whose SECOND read is the modal again gets no Enter. The one-capture code
+//     refuses on the question; the two-capture code classified the question as
+//     the modal's own selection reading and then found the modal on its second
+//     read, and sent Enter onto the question.
+func TestModelSwitchDismissDecidesEachKeyOnOneCapture(t *testing.T) {
+	modal := "Approaching rate limits\nSwitch to gpt-5.4-mini for lower credit usage?\n› 1. Switch to gpt-5.4-mini\n  2. Keep current model\n  3. Keep current model (never show again)\nPress enter to confirm or esc to go back"
+
+	t.Run("one capture between Down and Enter", func(t *testing.T) {
+		ex := &scriptedCaptureExecutor{before: modal, afterKey: []string{modal}}
+		tm := &Tmux{cfg: DefaultConfig(), exec: ex}
+
+		tm.DismissModelSwitchModalIfPresent("agent-pane")
+		down, enter := -1, -1
+		for i, c := range ex.calls {
+			if slices.Contains(c, "send-keys") && slices.Contains(c, "Down") {
+				down = i
+			}
+			if slices.Contains(c, "send-keys") && slices.Contains(c, "Enter") {
+				enter = i
+			}
+		}
+		if down < 0 || enter < 0 {
+			t.Fatalf("want Down then Enter on a live modal; calls: %v", ex.calls)
+		}
+		captures := 0
+		for _, c := range ex.calls[down+1 : enter] {
+			if slices.Contains(c, "capture-pane") {
+				captures++
+			}
+		}
+		if captures != 1 {
+			t.Fatalf("capture-pane calls between Down and Enter = %d, want 1 (classify and match the modal on the same read)", captures)
+		}
+	})
+
+	t.Run("a question on the first post-Down read gets no Enter", func(t *testing.T) {
+		ex := &scriptedCaptureExecutor{before: modal, afterKey: []string{genericSelectionPane, modal}}
+		tm := &Tmux{cfg: DefaultConfig(), exec: ex}
+
+		tm.DismissModelSwitchModalIfPresent("agent-pane")
+		keys := sentKeys(ex.calls)
+		if len(keys) != 1 || !slices.Contains(keys[0], "Down") {
+			t.Fatalf("keys sent = %v, want only Down (no Enter onto the question)", keys)
+		}
+	})
+}
