@@ -92,7 +92,6 @@ func (p *paneStub) SnapshotIdle(string) (bool, error) {
 	return p.answers[min(p.calls, len(p.answers))-1], nil
 }
 
-//nolint:unparam // the next slice (ga-megheo s6) calls it with other providers and provider specs
 func newTranscriptFixture(t *testing.T, provider string, providers map[string]config.ProviderSpec) *transcriptFixture {
 	t.Helper()
 	f := &transcriptFixture{
@@ -232,7 +231,7 @@ func TestPollerIdleClaudeTranscriptQueueOperationsAfterTurnEnd(t *testing.T) {
 }
 
 // (d) No transcript, an unknown tail, or a torn last line keep today's
-// behaviour: fresh pane activity means not idle.
+// behavior: fresh pane activity means not idle.
 func TestPollerIdleClaudeTranscriptUnknownKeepsTodaysBehaviour(t *testing.T) {
 	for name, lines := range map[string][]string{
 		"no_transcript": nil,
@@ -242,7 +241,7 @@ func TestPollerIdleClaudeTranscriptUnknownKeepsTodaysBehaviour(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			if transcriptIdle(t, "claude", nil, lines) {
-				t.Fatal("pollerSessionIdleEnough = true, want false (today's behaviour) without a definite idle tail")
+				t.Fatal("pollerSessionIdleEnough = true, want false (today's behavior) without a definite idle tail")
 			}
 		})
 	}
@@ -257,7 +256,7 @@ func TestPollerIdleClaudeTranscriptUnknownKeepsTodaysBehaviour(t *testing.T) {
 	})
 }
 
-// (e) Every other provider keeps today's behaviour even with an idle-looking
+// (e) Every other provider keeps today's behavior even with an idle-looking
 // Claude-format transcript where the claude lookup would find it.
 func TestPollerIdleNonClaudeProviderIgnoresTranscript(t *testing.T) {
 	if transcriptIdle(t, "codex", nil, tlIdle) {
