@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/events"
@@ -88,6 +90,7 @@ func workQueryFor(rows []beads.Bead) string {
 // alone, and a seat that drains on any of the other 26 is classified
 // closed_root — never an unexplained divergence.
 func TestDemandReplayClosedRootCountsOnlyTheTeardownTailTheRouterServes(t *testing.T) {
+	resetDemandRootMemos(t)
 	all, open := demandClosedRootFixture("closed", true)
 
 	count, ids := countDemandClosedRoot(t, beads.NewMemStoreFrom(0, all, nil))
@@ -127,7 +130,9 @@ func TestDemandReplayClosedRootCountsOnlyTheTeardownTailTheRouterServes(t *testi
 // Done-means 1: a route whose only open steps sit under a closed root, outside
 // its teardown tail, is no demand at all — with or without gc.step_id.
 func TestDemandIsZeroWhenEveryRoutedStepSitsUnderAClosedRoot(t *testing.T) {
+	resetDemandRootMemos(t)
 	for _, withStepIDs := range []bool{true, false} {
+		resetDemandRootMemos(t)
 		all, _ := demandClosedRootFixture("closed", withStepIDs)
 		store := beads.NewMemStoreFrom(0, all[:len(all)-1], nil) // drop the teardown-tail step
 		if count, ids := countDemandClosedRoot(t, store); count != 0 {
@@ -139,6 +144,7 @@ func TestDemandIsZeroWhenEveryRoutedStepSitsUnderAClosedRoot(t *testing.T) {
 // Control: the same 27 steps under an OPEN root are all demand, so the zero
 // above came from the root's status, not the fixture.
 func TestDemandCountsEveryStepUnderAnOpenRoot(t *testing.T) {
+	resetDemandRootMemos(t)
 	all, _ := demandClosedRootFixture("open", true)
 	if count, ids := countDemandClosedRoot(t, beads.NewMemStoreFrom(0, all, nil)); count != 27 {
 		t.Fatalf("demand = %d %v, want 27 under an open root", count, ids)
@@ -166,5 +172,105 @@ func TestDemandDivergenceClassifiesAClosedRootStepWithoutStepIDAsClosedRoot(t *t
 	}
 	if classification != events.DemandClaimClosedRoot {
 		t.Fatalf("classification = %q, want %q", classification, events.DemandClaimClosedRoot)
+	}
+}
+
+// resetDemandRootMemos empties the process-level root cache and restores its
+// knobs when the test ends, so no verdict crosses tests.
+func resetDemandRootMemos(t *testing.T) {
+	t.Helper()
+	ttl, budget, clock := demandClosedRootTTL, demandRootResolveBudget, demandClosedRootClock
+	clear := func() {
+		demandRootMemos.Lock()
+		demandRootMemos.m = map[string]demandRootMemo{}
+		demandRootMemos.Unlock()
+	}
+	clear()
+	t.Cleanup(func() {
+		clear()
+		demandClosedRootTTL, demandRootResolveBudget, demandClosedRootClock = ttl, budget, clock
+	})
+}
+
+// demandCountingStore counts the root reads and teardown queries the demand
+// gate sends to its store.
+type demandCountingStore struct {
+	*beads.MemStore
+	gets, lists int
+	listErr     error
+}
+
+func (s *demandCountingStore) Get(id string) (beads.Bead, error) {
+	s.gets++
+	return s.MemStore.Get(id)
+}
+
+func (s *demandCountingStore) ListByMetadata(filters map[string]string, limit int, opts ...beads.QueryOpt) ([]beads.Bead, error) {
+	s.lists++
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
+	return s.MemStore.ListByMetadata(filters, limit, opts...)
+}
+
+// A closed root (and its teardown tail) is read once, then remembered: the
+// next pass sends no read for it to the store, until the TTL lapses.
+func TestDemandRemembersAClosedRootAcrossPassesUntilTheTTL(t *testing.T) {
+	resetDemandRootMemos(t)
+	now := time.Now()
+	demandClosedRootClock = func() time.Time { return now }
+	all, _ := demandClosedRootFixture("closed", true)
+	store := &demandCountingStore{MemStore: beads.NewMemStoreFrom(0, all, nil)}
+
+	for pass, want := range [][2]int{{1, 1}, {1, 1}} {
+		if count, ids := countDemandClosedRoot(t, store); count != 1 {
+			t.Fatalf("pass %d: demand = %d %v, want 1", pass+1, count, ids)
+		}
+		if store.gets != want[0] || store.lists != want[1] {
+			t.Fatalf("pass %d: root reads = %d, teardown queries = %d; want %d and %d in total", pass+1, store.gets, store.lists, want[0], want[1])
+		}
+	}
+
+	now = now.Add(demandClosedRootTTL)
+	if count, _ := countDemandClosedRoot(t, store); count != 1 || store.gets != 2 || store.lists != 2 {
+		t.Fatalf("after the TTL: demand = %d, root reads = %d, teardown queries = %d; want 1, 2, 2", count, store.gets, store.lists)
+	}
+}
+
+// One pass resolves at most demandRootResolveBudget new roots; the steps of
+// the rest are counted, and the next pass resolves the next ones.
+func TestDemandResolvesABoundedNumberOfNewRootsPerPass(t *testing.T) {
+	resetDemandRootMemos(t)
+	var rows []beads.Bead
+	for i := 0; i < 20; i++ {
+		rootID := fmt.Sprintf("qc-dead%02d", i)
+		rows = append(rows, closedRootWorkflowRoot(rootID, "closed"), beads.Bead{
+			ID: rootID + ".1", Title: "step", Status: "open", Type: "task",
+			Metadata: map[string]string{"gc.routed_to": demandClosedRootTemplate, "gc.root_bead_id": rootID},
+		})
+	}
+	store := &demandCountingStore{MemStore: beads.NewMemStoreFrom(0, rows, nil)}
+
+	for pass, want := range []int{12, 4, 0} {
+		if count, _ := countDemandClosedRoot(t, store); count != want {
+			t.Fatalf("pass %d: demand = %d, want %d (budget %d new roots per pass)", pass+1, count, want, demandRootResolveBudget)
+		}
+	}
+	if store.gets != 20 {
+		t.Fatalf("root reads = %d, want 20 — each root read once", store.gets)
+	}
+}
+
+// A closed root whose teardown tail cannot be read is unresolved: its steps
+// are counted (a retry attempt the router serves is never dropped), and the
+// failure is not remembered.
+func TestDemandCountsStepsOfAClosedRootWhoseTailIsUnreadable(t *testing.T) {
+	resetDemandRootMemos(t)
+	all, _ := demandClosedRootFixture("closed", true)
+	store := &demandCountingStore{MemStore: beads.NewMemStoreFrom(0, all, nil), listErr: errors.New("partial list")}
+	for pass := 1; pass <= 2; pass++ {
+		if count, _ := countDemandClosedRoot(t, store); count != 27 || store.gets != pass {
+			t.Fatalf("pass %d: demand = %d, root reads = %d; want 27 and %d", pass, count, store.gets, pass)
+		}
 	}
 }
