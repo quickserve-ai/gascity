@@ -3464,16 +3464,26 @@ const nudgeSubmitKeySettle = 100 * time.Millisecond
 // remaining keys are not sent after an error, matching sendEnter's previous
 // single-key contract (the caller decides how to react to a failed submit).
 func (t *Tmux) sendNudgeSubmitSequence(ctx context.Context, target string, keys []string) error {
+	return t.sendNudgeSubmitSequenceOwning(ctx, target, target, keys, "")
+}
+
+// sendNudgeSubmitSequenceOwning is sendNudgeSubmitSequence for a delivery's
+// FIRST submit, with owned the text it typed: on an attached claude pane the
+// guard before each key also refuses a composer draft that is not only owned
+// (ga-da5vmz). In the paste debounce a person may have cleared the nudge and
+// typed their own message, which the Enter would submit.
+func (t *Tmux) sendNudgeSubmitSequenceOwning(ctx context.Context, session, target string, keys []string, owned string) error {
 	// Chokepoint (ga-ubfc7j): no submit key goes to a pane showing a
-	// question dialog or an approval prompt. The draft rule does not apply
-	// here: the text on the line is the text this delivery just typed.
+	// question dialog or an approval prompt. The general draft rule does not
+	// apply here, since the line holds the text this delivery typed; owned
+	// checks that it holds ONLY that.
 	for i, key := range keys {
 		if i > 0 {
 			time.Sleep(nudgeSubmitKeySettle)
 		}
 		// Before EVERY key: a prompt can appear inside the settle between
 		// two keys of a multi-key sequence.
-		if err := t.humanPromptGuard(target, target, nudgeGuardStageBeforeSubmit, false); err != nil {
+		if err := t.humanPromptGuardOwning(session, target, nudgeGuardStageBeforeSubmit, false, owned); err != nil {
 			return err
 		}
 		if _, err := t.runCtx(ctx, "send-keys", "-t", paneTarget(target), key); err != nil {
@@ -3845,9 +3855,18 @@ func (t *Tmux) nudgeSession(
 	// need that gap closed first.
 	//
 	// Every submit is preceded by a look for a permission prompt: Enter on
-	// one picks its highlighted option (see nudgePromptGuard.refused).
+	// one picks its highlighted option (see nudgePromptGuard.refused). The
+	// first submit also carries the ownership check (ga-da5vmz); a re-send is
+	// gated by resendGate instead.
+	submitted := false
 	sendSubmit := func() error {
-		return prompt.submit(func() error { return t.sendNudgeSubmitSequence(ctx, target, submitKeys) })
+		owned := ""
+		if !submitted {
+			owned = message
+		}
+		err := prompt.submit(func() error { return t.sendNudgeSubmitSequenceOwning(ctx, session, target, submitKeys, owned) })
+		submitted = submitted || err == nil
+		return err
 	}
 	wake := func() { t.WakePaneIfDetached(session, target) }
 	if t.submitVerifyEligible(target) {
