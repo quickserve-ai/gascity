@@ -58,6 +58,30 @@ func TestPaneContainsBusyIndicatorClaudeHookAndBackgroundShapes(t *testing.T) {
 			"  >>  seat * ga-xxxxxx · opus-5.5·high", "  5h █▉··· 37%", "  ⏵⏵ bypass permissions on · 2 shells · ← for agents",
 			"    /rc", "  ⏺ main"},
 			strings.Split(strings.TrimSuffix(strings.Repeat("  ◯ general-purpose  Task descripti…    29m 42s · ↓ 236.4k tokens\n", 8), "\n"), "\n")...), true},
+		// The plain turn-start spinner right after the hook phase: a bare head,
+		// or a timer with no separator (live shapes, 8 seats).
+		"bare_head_over_tip_row": {[]string{
+			"✢ Deliberating…", "  ⎿  Tip: a tip row", rule, "❯\u00a0", rule, "  user@host /tmp/work",
+		}, true},
+		// Live woodhouse layout: 14 non-empty rows up, 4 of them indented
+		// background-agent rows, which do not use window budget.
+		"bare_head_above_background_agents": {[]string{
+			"✽ Onioning…", "  ⎿  Tip: a tip row", rule, "❯\u00a0", rule,
+			"  >>  seat * ga-xxxxxx · opus-5.5·high", "  5h █▉··· 37% · 7d ██▏·· 43%",
+			"  ⏵⏵ bypass permissions on · 2 shells · ← for agents", "    ◉ high · /effort", "    /rc", "  ⏺ main",
+			"  ◯ general-purpose  First task descripti… 1h 25m 34s · ↓ 228.0k tokens",
+			"  ◯ general-purpose  Second task descript…    29m 42s · ↓ 236.4k tokens",
+			"  ◯ general-purpose  Third task descripti…     4m 02s · ↓ 12.4k tokens",
+		}, true},
+		"bare_head_over_composer_rule": {[]string{"✢ Deliberating…", rule, "❯\u00a0", rule}, true},
+		"timer_only_seconds":           {[]string{"✻ Hyperspacing… (22s)", rule, "❯\u00a0", rule}, true},
+		"timer_only_minutes":           {[]string{"· Deliberating… (1m 16s)", rule, "❯\u00a0", rule}, true},
+		// Idle chrome has no ellipsis after the verb.
+		"done_worked_for":        {[]string{"✻ Worked for 3m 38s", rule, "❯\u00a0", rule}, false},
+		"waiting_for_background": {[]string{"✻ Waiting for 2 background agents to finish", rule, "❯\u00a0", rule}, false},
+		"done_brewed_for":        {[]string{"✻ Brewed for 48s · done 11:19 PM · 1 shell still running", rule, "❯\u00a0", rule}, false},
+		"bare_head_in_scrollback": {append(append([]string{"✢ Deliberating…"},
+			strings.Split(strings.Repeat("  later output\n", 30), "\n")...), rule, "❯\u00a0", rule), false},
 		// Later assistant output means the spinner above it is stale.
 		"spinner_then_assistant_output": {[]string{
 			"✶ Proofing… (running UserPromptSubmit hooks… 1/2 · 3s)", "⏺ Done.", rule, "❯\u00a0", rule,

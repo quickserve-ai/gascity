@@ -4845,9 +4845,17 @@ var claudeBusySpinnerRe = regexp.MustCompile(`\([0-9]+[ms][^)]*[·•]`)
 // echoed prompt ("❯ …"), tool output ("  ⎿ …" and its indented continuation)
 // and quoted source never match; claudeHookSpinnerLive keeps the phrase in
 // scrollback from matching and joins a spinner wrapped onto a second row.
+//
+// claudeTurnStartSpinnerRe matches, under the same anchor and window, the plain
+// working spinner right after the hook phase, which claudeBusySpinnerRe also
+// misses: a bare head "✢ Deliberating…" with nothing after it, or a timer with
+// no separator "✻ Hyperspacing… (22s)" (live shapes on 8 seats, up to ~33 s).
+// Idle chrome has no ellipsis after its verb ("✻ Worked for 3m 38s", "✻
+// Waiting for 2 background agents to finish", "✻ Brewed for 48s · done …").
 var (
-	claudeHookSpinnerHeadRe = regexp.MustCompile(`^[^\s\w⏺❯⎿│]\s\S+…`)
-	claudeHookSpinnerRe     = regexp.MustCompile(`^[^\s\w⏺❯⎿│]\s\S+…\s+\(running \S+ hooks?(…|\s·|\))`)
+	claudeHookSpinnerHeadRe  = regexp.MustCompile(`^[^\s\w⏺❯⎿│]\s\S+…`)
+	claudeHookSpinnerRe      = regexp.MustCompile(`^[^\s\w⏺❯⎿│]\s\S+…\s+\(running \S+ hooks?(…|\s·|\))`)
+	claudeTurnStartSpinnerRe = regexp.MustCompile(`^[^\s\w⏺❯⎿│]\s\S+…($|\s+\(([0-9]+h )?([0-9]+m )?[0-9]+s\))`)
 )
 
 // claudeHookSpinnerWrapRows is how many following rows a spinner head is
@@ -4865,8 +4873,8 @@ const claudeHookSpinnerWrapRows = 2
 // draft.
 const claudeHookSpinnerWindow = 12
 
-// claudeHookSpinnerLive reports whether Claude's hook spinner is the live
-// status line: an anchored match within the last claudeHookSpinnerWindow
+// claudeHookSpinnerLive reports whether Claude's hook spinner (or the plain
+// turn-start spinner after it) is the live status line: an anchored match within the last claudeHookSpinnerWindow
 // non-empty lines of the capture, counted from the BOTTOM of the screen so an
 // echoed "❯ <prompt>" above the spinner, or a composer not yet redrawn, cannot
 // hide it. Indented background-agent rows ("  ⏺ main", "  ◯ general-purpose
@@ -4893,6 +4901,9 @@ func claudeHookSpinnerLive(lines []string) bool {
 		seen++
 		if !claudeHookSpinnerHeadRe.MatchString(line) {
 			continue
+		}
+		if claudeTurnStartSpinnerRe.MatchString(line) {
+			return true
 		}
 		joined := line
 		for k, rows := i+1, 0; k < len(lines) && rows < claudeHookSpinnerWrapRows; k++ {
