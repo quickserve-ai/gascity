@@ -5,9 +5,27 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/config"
+	gcruntime "github.com/gastownhall/gascity/internal/runtime"
+	"github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/sessionlog"
 )
+
+// Transcript lines in the shape Claude Code writes them (ga-megheo). The
+// bookkeeping lines are the live shape seen while a background subagent or
+// shell runs after the main turn has ended.
+const (
+	tlUserPrompt      = `{"type":"user","message":{"role":"user","content":"do the thing"}}`
+	tlAssistEndTurn   = `{"type":"assistant","message":{"role":"assistant","model":"claude-opus","stop_reason":"end_turn"}}`
+	tlStopHookSummary = `{"type":"system","subtype":"stop_hook_summary"}`
+	tlTurnDuration    = `{"type":"system","subtype":"turn_duration","timestamp":"2026-01-01T00:00:10.000Z"}`
+)
+
+var tlIdle = []string{tlUserPrompt, tlAssistEndTurn, tlStopHookSummary, tlTurnDuration}
 
 // tlTurnEnd is tlTurnDuration's timestamp. The prompt that started that turn
 // was submitted before it (tlPromptBefore); a prompt submitted after it
@@ -15,7 +33,134 @@ import (
 var (
 	tlTurnEnd      = time.Date(2026, 1, 1, 0, 0, 10, 0, time.UTC)
 	tlPromptBefore = tlTurnEnd.Add(-5 * time.Second)
+	tlPromptAfter  = tlTurnEnd.Add(time.Second)
 )
+
+const transcriptIdleTestKey = "0b6f3c1e-7d2a-4c55-9e8f-2a1b3c4d5e6f"
+
+// transcriptFixture is a seat whose provider declares its own
+// CLAUDE_CONFIG_DIR (the per-account layout live seats use) under a private
+// HOME, so both the account root and the default ~/.claude/projects root are
+// test-owned.
+type transcriptFixture struct {
+	t                                   *testing.T
+	home, workDir, accountDir, cityPath string
+	cfg                                 *config.City
+	info                                session.Info
+	pane                                *paneStub
+}
+
+// paneStub is the seat's runtime as the gate sees it: SnapshotIdle answers in
+// order (the last answer repeats), or err.
+type paneStub struct {
+	gcruntime.Provider
+	answers []bool
+	err     error
+	calls   int
+}
+
+func (p *paneStub) SnapshotIdle(string) (bool, error) {
+	p.calls++
+	if p.err != nil {
+		return false, p.err
+	}
+	return p.answers[min(p.calls, len(p.answers))-1], nil
+}
+
+func newTranscriptFixture(t *testing.T, provider string, providers map[string]config.ProviderSpec) *transcriptFixture {
+	t.Helper()
+	f := &transcriptFixture{t: t, home: t.TempDir(), workDir: t.TempDir(), accountDir: t.TempDir(), cityPath: t.TempDir(),
+		pane: &paneStub{answers: []bool{true}}}
+	t.Setenv("HOME", f.home)
+	if providers == nil {
+		providers = map[string]config.ProviderSpec{}
+	}
+	spec := providers[provider]
+	if spec.Env == nil {
+		spec.Env = map[string]string{}
+	}
+	spec.Env["CLAUDE_CONFIG_DIR"] = f.accountDir
+	providers[provider] = spec
+	f.cfg = &config.City{
+		Workspace: config.Workspace{Provider: provider},
+		Providers: providers,
+		Agents:    []config.Agent{{Name: "worker", Provider: provider, Session: "tmux"}},
+	}
+	f.info = session.Info{ID: "gc-megheo", AgentName: "worker", Provider: provider,
+		WorkDir: f.workDir, SessionName: "sess-worker", SessionKey: transcriptIdleTestKey}
+	return f
+}
+
+func (f *transcriptFixture) accountRoot() string { return filepath.Join(f.accountDir, "projects") }
+
+// promptAt records the seat's prompt-submitted marker, as the seat's
+// UserPromptSubmit hook (gc nudge drain --inject) does.
+func (f *transcriptFixture) promptAt(at time.Time) {
+	f.t.Helper()
+	recordClaudePromptSubmitted(f.cityPath, f.info.ID, at)
+	if _, ok := readClaudePromptSubmitted(f.cityPath, f.info.ID); !ok {
+		f.t.Fatal("prompt marker not readable after write")
+	}
+}
+
+// write puts lines in the seat's keyed transcript under the projects root.
+func (f *transcriptFixture) write(root string, lines []string) {
+	f.t.Helper()
+	f.writeSlug(root, f.workDir, lines)
+}
+
+// writeSlug writes the keyed transcript under the slug of workDir spelled as
+// given (a path alias of the seat's work dir yields a second slug).
+func (f *transcriptFixture) writeSlug(root, workDir string, lines []string) {
+	f.t.Helper()
+	dir := filepath.Join(root, sessionlog.ProjectSlug(workDir))
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		f.t.Fatal(err)
+	}
+	data := strings.Join(lines, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(dir, transcriptIdleTestKey+".jsonl"), []byte(data), 0o644); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+// idle runs the real gate on the dispatcher-shaped target with pane activity
+// 1 s old (fresh, under the 3 s quiescence) and a pane that shows no live
+// working indicator unless the test says otherwise.
+func (f *transcriptFixture) idle() bool {
+	return f.idleWith(f.pane)
+}
+
+func (f *transcriptFixture) idleWith(sp gcruntime.Provider) bool {
+	target := resolveNudgeTargetFromSessionInfo(f.cityPath, f.cfg, f.info)
+	return claudeTranscriptSaysTurnEnded(target, sp)
+}
+
+// The same file reached through a symlinked root (live: ~/.claude ->
+// ~/.claude-accounts/<acct>) is one transcript, not an ambiguity.
+func TestPollerIdleClaudeTranscriptSymlinkedRootIsOneFile(t *testing.T) {
+	f := newTranscriptFixture(t, "claude", nil)
+	f.promptAt(tlPromptBefore)
+	f.write(f.accountRoot(), tlIdle)
+	if err := os.Symlink(f.accountDir, filepath.Join(f.home, ".claude")); err != nil {
+		t.Fatal(err)
+	}
+	if !f.idle() {
+		t.Fatal("pollerSessionIdleEnough = false, want true: both roots reach the same file")
+	}
+}
+
+// B-new: Claude appends the user line only after the UserPromptSubmit hooks
+// finish (p50 6.9 s, p90 16.7 s on real transcripts), so for that long a
+// starting turn's transcript still ends in turn_duration. The prompt marker
+// the hook writes first is newer than that turn_duration: not idle.
+func TestPollerIdleClaudeTranscriptPromptSubmittedAfterTurnEndStaysBusy(t *testing.T) {
+	f := newTranscriptFixture(t, "claude", nil)
+	f.write(f.accountRoot(), tlIdle)
+	f.promptAt(tlPromptAfter)
+	if f.idle() {
+		t.Fatal("pollerSessionIdleEnough = true, want false: a prompt was submitted after the last turn_duration")
+	}
+}
 
 // The seat's UserPromptSubmit hook (gc nudge drain --inject) records the
 // prompt marker the gate compares turn_duration against, keyed by
