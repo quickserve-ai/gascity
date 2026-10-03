@@ -557,3 +557,152 @@ func TestSessionResumePrintQuotesTheWorkDir(t *testing.T) {
 		t.Fatalf("--print = %q parses as %q, want %q", stdout.String(), got, want)
 	}
 }
+
+// A rig store that hangs while OPENING must not spend the city store's share
+// of the lookup budget: the city store's in-progress task still names its
+// worktree, so the conversation there is listed (astra/opus read of eb596dae6).
+func TestSessionHistoryCityTaskSurvivesARigStoreThatHangsOpening(t *testing.T) {
+	fx := setupHistoryWorktreeFixture(t, nil, true)
+	bindHistoryTestRig(t, fx, "hung")
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	prevOpener, prevTimeout := historyRigStoreOpener, historyTaskLookupTimeout
+	t.Cleanup(func() { historyRigStoreOpener, historyTaskLookupTimeout = prevOpener, prevTimeout })
+	historyTaskLookupTimeout = 300 * time.Millisecond
+	historyRigStoreOpener = func(*config.City) rigStoreOpener {
+		return func(string, string) (beads.Store, error) {
+			<-release
+			return nil, fmt.Errorf("released")
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdSessionHistory("lana", 0, false, t.TempDir(), &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdSessionHistory = %d; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), worktreeConvID) {
+		t.Fatalf("a rig store hanging in open starved the city store's task lookup; history dropped %s:\n%s\nstderr=%s", worktreeConvID, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stderr.String(), "city store task lookup skipped") {
+		t.Fatalf("city store reported skipped: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "rig hung task lookup skipped") {
+		t.Fatalf("stderr = %q, want the hung rig named", stderr.String())
+	}
+}
+
+// When a task lookup was skipped, "found nothing" must say the search was
+// incomplete, on resume's refusal and in history's JSON, rather than read as
+// "this conversation does not exist" (class-8: no claim without an observer).
+func TestSessionHistoryAndResumeSayASkippedLookupMadeTheSearchIncomplete(t *testing.T) {
+	fx := setupHistoryWorktreeFixture(t, nil, false)
+	bindHistoryTestRig(t, fx, "broken")
+	prevOpener := historyRigStoreOpener
+	t.Cleanup(func() { historyRigStoreOpener = prevOpener })
+	historyRigStoreOpener = func(*config.City) rigStoreOpener {
+		return func(string, string) (beads.Store, error) {
+			return rigStoreStub{Store: beads.NewMemStore(), err: fmt.Errorf("dolt unreachable")}, nil
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdSessionResume([]string{"lana", "f8de97bc"}, false, true, t.TempDir(), &stdout, &stderr); code == 0 {
+		t.Fatalf("resume accepted a conversation it could not see; stdout=%s", stdout.String())
+	}
+	if want := "INCOMPLETE: the task lookup in rig broken was skipped"; !strings.Contains(stderr.String(), want) {
+		t.Fatalf("resume refusal = %q, want it to carry %q", stderr.String(), want)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := cmdSessionHistory("lana", 0, true, t.TempDir(), &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdSessionHistory(--json) = %d; stderr=%s", code, stderr.String())
+	}
+	var payload struct {
+		Incomplete     bool     `json:"incomplete"`
+		SkippedLookups []string `json:"skipped_lookups"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("decode history JSON: %v\n%s", err, stdout.String())
+	}
+	if !payload.Incomplete || strings.Join(payload.SkippedLookups, ",") != "rig broken" {
+		t.Fatalf("history JSON incomplete=%v skipped_lookups=%q, want true and [rig broken]", payload.Incomplete, payload.SkippedLookups)
+	}
+}
+
+// --print's command must survive a work dir holding a single quote and a $.
+func TestSessionResumePrintQuotesQuotesAndDollars(t *testing.T) {
+	fx := setupHistoryWorktreeFixture(t, map[string]string{"prior_session_key": priorConvID}, false)
+	odd := filepath.Join(t.TempDir(), "it's $HOME")
+	if err := os.MkdirAll(odd, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	writeNamedTestSession(t, fx.liveRoot, odd, priorConvID+".jsonl", historyTranscriptLines(priorConvID, "lana", odd, "lana in an odd dir")...)
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdSessionResume([]string{"lana", "dddddddd"}, false, true, t.TempDir(), &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdSessionResume(--print) = %d; stderr=%s", code, stderr.String())
+	}
+	// The POSIX single-quote form, spelled out: the dir in '...', each ' as '\''.
+	wantLine := "cd '" + strings.ReplaceAll(odd, "'", `'\''`) + "' && claude --resume " + priorConvID
+	if got := strings.TrimSpace(stdout.String()); got != wantLine {
+		t.Fatalf("--print = %q, want %q", got, wantLine)
+	}
+	got := shellquote.Split(wantLine)
+	want := []string{"cd", odd, "&&", "claude", "--resume", priorConvID}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("--print %q parses as %q, want %q", wantLine, got, want)
+	}
+}
+
+// One rig store hanging in open must not cost a healthy rig its lookup: the
+// healthy rig's in-progress task still names its worktree, and the healthy rig
+// is not reported as not answering.
+func TestSessionHistoryHealthyRigTaskSurvivesAnotherRigHangingInOpen(t *testing.T) {
+	fx := setupHistoryWorktreeFixture(t, nil, false)
+	goodDir := bindHistoryTestRig(t, fx, "good")
+	bindHistoryTestRig(t, fx, "hung")
+	if err := ensurePersistedScopeLocalFileStore(goodDir); err != nil {
+		t.Fatalf("rig file store: %v", err)
+	}
+	goodStore, err := openStoreAtForCity(goodDir, fx.cityDir)
+	if err != nil {
+		t.Fatalf("open rig store: %v", err)
+	}
+	task, err := goodStore.Create(beads.Bead{Title: "rig task", Type: "task", Assignee: "lana", Metadata: map[string]string{"work_dir": fx.worktree}})
+	if err != nil {
+		t.Fatalf("create rig task: %v", err)
+	}
+	inProgress := "in_progress"
+	if err := goodStore.Update(task.ID, beads.UpdateOpts{Status: &inProgress}); err != nil {
+		t.Fatalf("mark rig task in progress: %v", err)
+	}
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	prevOpener, prevTimeout := historyRigStoreOpener, historyTaskLookupTimeout
+	t.Cleanup(func() { historyRigStoreOpener, historyTaskLookupTimeout = prevOpener, prevTimeout })
+	historyTaskLookupTimeout = 600 * time.Millisecond
+	historyRigStoreOpener = func(*config.City) rigStoreOpener {
+		return func(rigPath, _ string) (beads.Store, error) {
+			if filepath.Base(rigPath) == "hung" {
+				<-release
+				return nil, fmt.Errorf("released")
+			}
+			return goodStore, nil
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdSessionHistory("lana", 0, false, t.TempDir(), &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdSessionHistory = %d; stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), worktreeConvID) {
+		t.Fatalf("a rig hanging in open starved the healthy rig's task lookup; history dropped %s:\n%s\nstderr=%s", worktreeConvID, stdout.String(), stderr.String())
+	}
+	if strings.Contains(stderr.String(), "rig good task lookup skipped") {
+		t.Fatalf("healthy rig reported skipped: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "rig hung task lookup skipped: store did not open within 300ms") {
+		t.Fatalf("stderr = %q, want the hung rig named with the open budget", stderr.String())
+	}
+}
