@@ -47,7 +47,7 @@ func historyTranscriptLines(sessionID, agentName, cwd, text string) []string {
 	}
 }
 
-func setupHistoryWorktreeFixture(t *testing.T, sessionMeta map[string]string, withInProgressTask bool) historyWorktreeFixture {
+func setupHistoryWorktreeFixture(t *testing.T, sessionMeta map[string]string, withInProgressTask bool) historyWorktreeFixture { //nolint:unparam // sessionMeta is set by tests in a later slice (c5)
 	t.Helper()
 	clearGCEnv(t)
 	clearInheritedCityRoutingEnv(t)
