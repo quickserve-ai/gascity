@@ -3,7 +3,10 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,7 +14,7 @@ import (
 
 	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
-	"github.com/gastownhall/gascity/internal/fsys"
+	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/worker"
 	workertranscript "github.com/gastownhall/gascity/internal/worker/transcript"
 )
@@ -24,7 +27,7 @@ const claudeTranscriptTailBudget = 64 * 1024
 // transcript while a background task runs after the main turn ended, without
 // starting or continuing a turn: queue activity, attachments, and the
 // session-metadata block (last-prompt ... bridge-session, cost-state,
-// file-history-*, frame-link, artifact-*). Any type not listed here is
+// file-history-*, frame-link, history-suppression, artifact-*). Any type not listed here is
 // decisive and reads not idle. The metadata block is sometimes written at
 // prompt submit, before the user line; skipping it there is safe because the
 // prompt marker is then newer than the old turn_duration.
@@ -33,7 +36,7 @@ var claudeTranscriptBookkeeping = map[string]bool{
 	"bridge-session": true, "file-history-snapshot": true,
 	"last-prompt": true, "custom-title": true, "agent-name": true, "mode": true,
 	"permission-mode": true, "atis-latch": true, "frame-link": true,
-	"cost-state": true, "file-history-delta": true,
+	"cost-state": true, "file-history-delta": true, "history-suppression": true,
 }
 
 func claudeTranscriptIsBookkeeping(entryType string) bool {
@@ -52,23 +55,26 @@ func claudeTranscriptIsBookkeeping(entryType string) bool {
 // The transcript is only a NECESSARY condition. Claude appends a prompt's user
 // line only after the UserPromptSubmit hooks finish (p50 6.9 s, p90 16.7 s on
 // real transcripts), so a starting turn's file still ends in turn_duration.
-// The seat's own UserPromptSubmit hook (gc nudge drain --inject) therefore
-// records a per-session "prompt submitted" marker first thing, and this
-// answers true ONLY when the last meaningful entry is system/turn_duration
-// AND its timestamp is newer than that marker. No marker, a turn_duration
-// without a parseable timestamp, or one not newer than the marker reads false.
-// That also covers a frozen transcript the key still points at: once the seat
-// has submitted a prompt since, it never reads idle again.
+// It answers true ONLY when all three independent readings agree:
 //
-// Residual window: between submit and the marker write the hook runs
-// sh -> gc hook run -> gc nudge drain, two gc process starts before any store
-// work (gc version measured 0.44-0.68 s on the host at load ~20), so about
-// 1 s, against the 7-17 s hole the marker closes; a dispatcher pass must also
-// land inside it. Writing it in gc hook run would save one start, but that
-// wrapper runs for any hook event a provider config names, and a marker from a
-// non-prompt event would hold delivery back with no turn to end it. The
-// transcript is read BEFORE the marker, so a prompt that submits between the
-// two reads is seen as a newer marker, never missed.
+//  1. the last meaningful transcript entry is system/turn_duration;
+//  2. its timestamp is newer than the seat's "prompt submitted" marker, which
+//     the seat's UserPromptSubmit hook (gc nudge drain --inject) writes, and
+//     the dispatcher also writes on each confirmed submit of its own;
+//  3. the pane, read now, shows no live Claude working indicator
+//     (runtime.IdleSnapshotProvider; the "running UserPromptSubmit hooks"
+//     spinner counts as working).
+//
+// The marker alone is not enough: the hook drains its stdin before it starts
+// gc, then pays a gc process start (0.6-0.7 s at load ~25), and it is not
+// written at all for some prompts, a fresh session's first prompt, or a seat
+// resumed into a file ending in its previous incarnation's turn_duration.
+// The pane reading covers those; the marker covers a turn the pane has not
+// redrawn yet. No marker, no parseable timestamp, an older turn_duration, or
+// no idle pane reading (no runtime, a capture error) reads false. A frozen
+// transcript the key still points at never reads idle once the seat has
+// prompted since. The transcript is read BEFORE the marker, so a prompt that
+// submits between the two reads is seen as a newer marker, never missed.
 //
 // Entries are judged on type/subtype/timestamp fields alone (never message
 // text). A bare end_turn is not enough: it is written before the Stop hooks
@@ -76,8 +82,8 @@ func claudeTranscriptIsBookkeeping(entryType string) bool {
 // unresolvable, ambiguous or unreadable transcript, a torn last line, or no
 // turn_duration in the tail reads false, so the caller keeps today's
 // behaviour. The cost is one bounded tail read of a local file, a stat per
-// candidate file and one marker read; no store reads.
-func claudeTranscriptSaysTurnEnded(target nudgeTarget) bool {
+// candidate file, one marker read and one pane capture; no store reads.
+func claudeTranscriptSaysTurnEnded(target nudgeTarget, sp runtime.Provider) bool {
 	if nudgeTargetBuiltinFamily(target) != "claude" {
 		return false
 	}
@@ -94,7 +100,26 @@ func claudeTranscriptSaysTurnEnded(target nudgeTarget) bool {
 		return false
 	}
 	submitted, ok := readClaudePromptSubmitted(target.cityPath, target.sessionID)
-	return ok && endedAt.After(submitted)
+	if !ok || !endedAt.After(submitted) {
+		return false
+	}
+	pane, ok := sp.(runtime.IdleSnapshotProvider)
+	if !ok || target.sessionName == "" {
+		return false
+	}
+	idle, err := pane.SnapshotIdle(target.sessionName)
+	return err == nil && idle
+}
+
+// stampClaudePromptOnDelivery records the prompt marker for a claude seat the
+// dispatcher has just submitted to (call it only after a confirmed submit), so
+// the next pass cannot type into the turn this delivery started before that
+// turn's own hook writes the marker.
+func stampClaudePromptOnDelivery(target nudgeTarget) error {
+	if nudgeTargetBuiltinFamily(target) != "claude" {
+		return nil
+	}
+	return recordClaudePromptSubmitted(target.cityPath, target.sessionID, time.Now())
 }
 
 func readClaudeTranscriptTail(path string) ([]byte, error) {
@@ -207,7 +232,11 @@ func nudgeTargetClaudeTranscriptPath(target nudgeTarget) string {
 	}
 	var found string
 	var foundInfo os.FileInfo
-	for _, path := range workertranscript.DiscoverClaudeKeyedPaths(worker.MergeSearchPaths(roots), workDir, key) {
+	paths, err := workertranscript.DiscoverClaudeKeyedPaths(worker.MergeSearchPaths(roots), workDir, key)
+	if err != nil {
+		return ""
+	}
+	for _, path := range paths {
 		info, err := os.Stat(path)
 		if err != nil {
 			return ""
@@ -253,19 +282,81 @@ func claudePromptMarkerPath(cityPath, sessionID string) string {
 	return citylayout.RuntimePath(cityPath, "nudges", "prompt-submitted", sessionID)
 }
 
-// recordClaudePromptSubmitted writes the marker atomically. Best-effort: it
-// must never fail the prompt. A failed write with no earlier marker leaves the
-// gate on today's pane-quiet rule; a failed write over an earlier marker
-// reopens the starting-turn hole for that one prompt only.
-func recordClaudePromptSubmitted(cityPath, sessionID string, at time.Time) {
+// recordClaudePromptSubmitted writes the marker atomically. It must never fail
+// the prompt, so callers only log its error. When the write fails, the old
+// marker is removed: left in place it would keep vouching for the previous
+// prompt, while a missing marker shuts the transcript path until the next
+// write. The error is returned only if that removal fails too.
+func recordClaudePromptSubmitted(cityPath, sessionID string, at time.Time) error {
 	path := claudePromptMarkerPath(cityPath, sessionID)
 	if path == "" {
+		return nil
+	}
+	dir := filepath.Dir(path)
+	err := os.MkdirAll(dir, 0o755)
+	if err == nil {
+		err = claudePromptMarkerWrite(path, []byte(at.UTC().Format(time.RFC3339Nano)+"\n"))
+	}
+	if err == nil {
+		pruneClaudePromptMarkers(dir, time.Now())
+		return nil
+	}
+	if rmErr := os.Remove(path); rmErr != nil && !errors.Is(rmErr, fs.ErrNotExist) {
+		return fmt.Errorf("prompt marker %s: write: %v; removing the stale marker: %w", path, err, rmErr)
+	}
+	return nil
+}
+
+// claudePromptMarkerWrite writes one marker by temp file + rename (no
+// directory sweep per write); a var so tests can fail it.
+var claudePromptMarkerWrite = func(path string, data []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp*")
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(f.Name(), path)
+	}
+	if err != nil {
+		_ = os.Remove(f.Name())
+	}
+	return err
+}
+
+// claudePromptMarkerTTL: a marker this old belongs to a seat that has not
+// prompted for a week or is gone. Pruning it only shuts the transcript path
+// for that seat until its next prompt.
+const claudePromptMarkerTTL = 7 * 24 * time.Hour
+
+// pruneClaudePromptMarkers removes markers and stray temp files older than
+// claudePromptMarkerTTL, at most once a day: each call costs one stat of the
+// ".pruned" stamp (a name no session id can take), and only a stale stamp
+// pays for the directory read.
+func pruneClaudePromptMarkers(dir string, now time.Time) {
+	stamp := filepath.Join(dir, ".pruned")
+	if info, err := os.Stat(stamp); err == nil && now.Sub(info.ModTime()) < 24*time.Hour {
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.WriteFile(stamp, nil, 0o644); err != nil {
 		return
 	}
-	_ = fsys.WriteFileAtomic(fsys.OSFS{}, path, []byte(at.UTC().Format(time.RFC3339Nano)+"\n"), 0o644)
+	_ = os.Chtimes(stamp, now, now)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.Name() == ".pruned" || entry.IsDir() {
+			continue
+		}
+		if info, err := entry.Info(); err == nil && now.Sub(info.ModTime()) > claudePromptMarkerTTL {
+			_ = os.Remove(filepath.Join(dir, entry.Name()))
+		}
+	}
 }
 
 // readClaudePromptSubmitted returns the marker time, or false when there is no

@@ -79,7 +79,7 @@ func DiscoverKeyedPath(searchPaths []string, provider, workDir, gcSessionID stri
 // DiscoverClaudeKeyedPaths returns every existing Claude transcript for the
 // session key across all search paths and every path-alias spelling of
 // workDir, without choosing one, so a caller can refuse when they differ.
-func DiscoverClaudeKeyedPaths(searchPaths []string, workDir, sessionKey string) []string {
+func DiscoverClaudeKeyedPaths(searchPaths []string, workDir, sessionKey string) ([]string, error) {
 	return sessionlog.FindSessionFilesByID(searchPaths, workDir, sessionKey)
 }
 

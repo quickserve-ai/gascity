@@ -3,12 +3,15 @@ package sessionlog
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/pathutil"
@@ -654,26 +657,35 @@ func FindSessionFileByID(searchPaths []string, workDir, sessionID string) string
 // FindSessionFilesByID returns every existing Claude-style session log for
 // sessionID across all search paths and all path-alias slugs of workDir, in
 // search order. Unlike FindSessionFileByID it does not pick the newest, so a
-// caller can detect two different files behind one key.
-func FindSessionFilesByID(searchPaths []string, workDir, sessionID string) []string {
+// caller can detect two different files behind one key. Only "does not exist"
+// is absence: any other stat error (permission, I/O) is returned, so an
+// unreadable candidate cannot hide behind a readable one.
+func FindSessionFilesByID(searchPaths []string, workDir, sessionID string) ([]string, error) {
 	if workDir == "" || sessionID == "" {
-		return nil
+		return nil, nil
 	}
 	fileName := safeSessionLogFileName(sessionID)
 	if fileName == "" {
-		return nil
+		return nil, nil
 	}
 	slugs := claudeProjectSlugCandidates(workDir)
 	var paths []string
 	for _, base := range searchPaths {
 		for _, slug := range slugs {
 			path := filepath.Join(base, slug, fileName)
-			if info, err := os.Stat(path); err == nil && !info.IsDir() {
-				paths = append(paths, path)
+			info, err := os.Stat(path)
+			switch {
+			case err == nil:
+				if !info.IsDir() {
+					paths = append(paths, path)
+				}
+			case errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR):
+			default:
+				return nil, err
 			}
 		}
 	}
-	return paths
+	return paths, nil
 }
 
 func findSessionFileByIDForCandidates(searchPaths, slugs []string, fileName string) string {
