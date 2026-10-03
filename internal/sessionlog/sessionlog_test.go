@@ -2761,3 +2761,36 @@ func mustTime(s string) time.Time {
 	}
 	return t
 }
+
+// FindSessionFilesByID lists every keyed candidate across roots without
+// choosing one, and treats only "does not exist" as absence: a candidate it
+// cannot stat (permission, I/O) is an error, so an unreadable copy cannot hide
+// behind a readable one (ga-megheo).
+func TestFindSessionFilesByIDListsAllAndRejectsUnreadable(t *testing.T) {
+	workDir := t.TempDir()
+	rootA, rootB := t.TempDir(), t.TempDir()
+	for _, root := range []string{rootA, rootB} {
+		dir := filepath.Join(root, ProjectSlug(workDir))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "k1.jsonl"), []byte("{}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	paths, err := FindSessionFilesByID([]string{rootA, rootB}, workDir, "k1")
+	if err != nil || len(paths) != 2 {
+		t.Fatalf("FindSessionFilesByID = %v, %v; want both roots' files", paths, err)
+	}
+	if paths, err := FindSessionFilesByID([]string{rootA}, workDir, "missing"); err != nil || len(paths) != 0 {
+		t.Fatalf("missing key = %v, %v; want none and no error", paths, err)
+	}
+	locked := filepath.Join(rootA, ProjectSlug(workDir))
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+	if paths, err := FindSessionFilesByID([]string{rootA, rootB}, workDir, "k1"); err == nil {
+		t.Fatalf("FindSessionFilesByID = %v, nil; want an error for the unreadable candidate", paths)
+	}
+}
