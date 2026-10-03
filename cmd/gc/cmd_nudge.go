@@ -2260,6 +2260,9 @@ func stampLastNudgeDeliveredAt(sessFront *session.Store, sessionID string, t tim
 	_ = sessFront.SetMarker(sessionID, session.MetadataLastNudgeDeliveredAt, t.UTC().Format(time.RFC3339))
 }
 
+// pollerSessionIdleEnough is the yes/no view of pollerSessionIdleDecision.
+//
+//nolint:unparam // production passes its quiescence to pollerSessionIdleDecision; only tests call this, all with 3s
 func pollerSessionIdleEnough(target nudgeTarget, sp runtime.Provider, quiescence time.Duration, obs worker.LiveObservation) bool {
 	idle, _ := pollerSessionIdleDecision(target, sp, quiescence, obs)
 	return idle
