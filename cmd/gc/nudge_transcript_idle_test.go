@@ -71,8 +71,10 @@ func (p *paneStub) SnapshotIdle(string) (bool, error) {
 
 func newTranscriptFixture(t *testing.T, provider string, providers map[string]config.ProviderSpec) *transcriptFixture {
 	t.Helper()
-	f := &transcriptFixture{t: t, home: t.TempDir(), workDir: t.TempDir(), accountDir: t.TempDir(), cityPath: t.TempDir(),
-		pane: &paneStub{answers: []bool{true}}}
+	f := &transcriptFixture{
+		t: t, home: t.TempDir(), workDir: t.TempDir(), accountDir: t.TempDir(), cityPath: t.TempDir(),
+		pane: &paneStub{answers: []bool{true}},
+	}
 	t.Setenv("HOME", f.home)
 	if providers == nil {
 		providers = map[string]config.ProviderSpec{}
@@ -88,8 +90,10 @@ func newTranscriptFixture(t *testing.T, provider string, providers map[string]co
 		Providers: providers,
 		Agents:    []config.Agent{{Name: "worker", Provider: provider, Session: "tmux"}},
 	}
-	f.info = session.Info{ID: "gc-megheo", AgentName: "worker", Provider: provider,
-		WorkDir: f.workDir, SessionName: "sess-worker", SessionKey: transcriptIdleTestKey}
+	f.info = session.Info{
+		ID: "gc-megheo", AgentName: "worker", Provider: provider,
+		WorkDir: f.workDir, SessionName: "sess-worker", SessionKey: transcriptIdleTestKey,
+	}
 	return f
 }
 
@@ -99,7 +103,9 @@ func (f *transcriptFixture) accountRoot() string { return filepath.Join(f.accoun
 // UserPromptSubmit hook (gc nudge drain --inject) does.
 func (f *transcriptFixture) promptAt(at time.Time) {
 	f.t.Helper()
-	recordClaudePromptSubmitted(f.cityPath, f.info.ID, at)
+	if err := recordClaudePromptSubmitted(f.cityPath, f.info.ID, at); err != nil {
+		f.t.Fatalf("record prompt marker: %v", err)
+	}
 	if _, ok := readClaudePromptSubmitted(f.cityPath, f.info.ID); !ok {
 		f.t.Fatal("prompt marker not readable after write")
 	}
