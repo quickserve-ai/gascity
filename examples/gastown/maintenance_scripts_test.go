@@ -8505,6 +8505,26 @@ func TestJsonlExportPackConsolidationKeepsLargeExportsAsDeltas(t *testing.T) {
 	assertNoArchiveRepackFailure(t, stateFile)
 }
 
+// writeGitArgsLogStub installs a git that appends each of the script's own
+// calls (its argv, space-joined) to gitLog and runs the real git. A git that
+// git itself starts inherits a marker and is not logged: it receives the -c
+// settings through the environment, not argv.
+func writeGitArgsLogStub(t *testing.T, binDir, gitLog string) {
+	t.Helper()
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("LookPath(git): %v", err)
+	}
+	writeExecutable(t, filepath.Join(binDir, "git"), fmt.Sprintf(`#!/bin/sh
+if [ -z "${JSONL_TEST_GIT_NESTED:-}" ]; then
+    printf '%%s\n' "$*" >> '%s'
+fi
+JSONL_TEST_GIT_NESTED=1
+export JSONL_TEST_GIT_NESTED
+exec '%s' "$@"
+`, gitLog, realGit))
+}
+
 // Every git call that writes or packs archive objects carries the pack
 // settings: add, commit, gc --auto, the explicit repack and its prune on the
 // commit path, and fetch, rebase and push on the push path (commit, fetch and
@@ -8526,20 +8546,7 @@ func TestJsonlExportPackSettingsReachEveryArchiveGitWrite(t *testing.T) {
 	remoteRepo, _ := initSeedArchiveWithRemote(t, archiveRepo)
 	advanceArchiveRemoteMain(t, remoteRepo)
 
-	realGit, err := exec.LookPath("git")
-	if err != nil {
-		t.Fatalf("LookPath(git): %v", err)
-	}
-	// Log only the script's own calls: a git that git itself starts inherits
-	// the marker and its -c settings through the environment, not argv.
-	writeExecutable(t, filepath.Join(binDir, "git"), fmt.Sprintf(`#!/bin/sh
-if [ -z "${JSONL_TEST_GIT_NESTED:-}" ]; then
-    printf '%%s\n' "$*" >> '%s'
-fi
-JSONL_TEST_GIT_NESTED=1
-export JSONL_TEST_GIT_NESTED
-exec '%s' "$@"
-`, gitLog, realGit))
+	writeGitArgsLogStub(t, binDir, gitLog)
 	writeJsonlExportGCStub(t, binDir)
 	writeMultiRecordDoltStub(t, binDir, 101)
 
@@ -8625,6 +8632,92 @@ exec '%s' "$@"
 		}
 	}
 	assertNoArchiveRepackFailure(t, stateFile)
+}
+
+// Each knob has a maximum, so a value git cannot take never reaches it:
+// pack.threads and gc.autoPackLimit are signed ints in git, and an
+// out-of-range value fails the repack instead of falling back. The maximum
+// itself is accepted and reaches git; one past it, and 2147483648 (one past
+// a signed 32-bit int), are refused with a warning and the default is used.
+func TestJsonlExportKnobBoundsRefuseValuesGitCannotTake(t *testing.T) {
+	for _, tt := range []struct {
+		key      string
+		value    string
+		accepted bool
+		// gitArg is the argv token the run must pass to git: the value's
+		// own when accepted, the default's when refused. Empty when the
+		// knob never reaches a git argument.
+		gitArg string
+	}{
+		{"GC_JSONL_PACK_THREADS", "64", true, "pack.threads=64"},
+		{"GC_JSONL_PACK_THREADS", "65", false, "pack.threads=1"},
+		{"GC_JSONL_PACK_THREADS", "2147483648", false, "pack.threads=1"},
+		{"GC_JSONL_REPACK_PACK_LIMIT", "10000", true, "gc.autoPackLimit=10000"},
+		{"GC_JSONL_REPACK_PACK_LIMIT", "10001", false, "gc.autoPackLimit=10"},
+		{"GC_JSONL_REPACK_PACK_LIMIT", "2147483648", false, "gc.autoPackLimit=10"},
+		{"GC_JSONL_PRUNE_GRACE_MINUTES", "10080", true, "--expire=10080.minutes.ago"},
+		{"GC_JSONL_PRUNE_GRACE_MINUTES", "10081", false, "--expire=10.minutes.ago"},
+		{"GC_JSONL_PRUNE_GRACE_MINUTES", "2147483648", false, "--expire=10.minutes.ago"},
+		{"GC_JSONL_REPACK_LOOSE_CEILING", "1000000", true, ""},
+		{"GC_JSONL_REPACK_LOOSE_CEILING", "1000001", false, ""},
+		{"GC_JSONL_REPACK_LOOSE_KIB_CEILING", "1073741824", true, ""},
+		{"GC_JSONL_REPACK_LOOSE_KIB_CEILING", "1073741825", false, ""},
+		{"GC_JSONL_BIG_FILE_THRESHOLD", "64g", true, "core.bigFileThreshold=64g"},
+		{"GC_JSONL_BIG_FILE_THRESHOLD", "65g", false, "core.bigFileThreshold=4g"},
+		{"GC_JSONL_BIG_FILE_THRESHOLD", "68719476737", false, "core.bigFileThreshold=4g"},
+		{"GC_JSONL_PACK_WINDOW_MEMORY", "256g", true, "pack.windowMemory=256g"},
+		{"GC_JSONL_PACK_WINDOW_MEMORY", "257g", false, "pack.windowMemory=8g"},
+		{"GC_JSONL_PACK_WINDOW_MEMORY", "274877906945", false, "pack.windowMemory=8g"},
+	} {
+		t.Run(tt.key+"="+tt.value, func(t *testing.T) {
+			cityDir := t.TempDir()
+			binDir := t.TempDir()
+			stateDir := t.TempDir()
+			gcLog := filepath.Join(t.TempDir(), "gc.log")
+			mailLog := filepath.Join(t.TempDir(), "gc-mail.log")
+			archiveRepo := filepath.Join(cityDir, "archive")
+			stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
+			gitLog := filepath.Join(t.TempDir(), "git-args.log")
+
+			writeGitArgsLogStub(t, binDir, gitLog)
+			writeJsonlExportGCStub(t, binDir)
+			writeMultiRecordDoltStub(t, binDir, 3)
+			env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
+			// The explicit repack and its prune run unless the case sets
+			// the count ceiling itself.
+			env["GC_JSONL_REPACK_LOOSE_CEILING"] = "0"
+			env[tt.key] = tt.value
+
+			out, runErr := runScriptResult(t, coreScriptPath("jsonl-export.sh"), env)
+			if runErr != nil {
+				t.Fatalf("jsonl-export.sh failed: %v\n%s", runErr, out)
+			}
+			warned := strings.Contains(string(out), "ignoring "+tt.key+"="+tt.value+" ")
+			if tt.accepted && warned {
+				t.Errorf("%s=%s is within bounds but was refused; output:\n%s", tt.key, tt.value, out)
+			}
+			if !tt.accepted && !warned {
+				t.Errorf("%s=%s is out of bounds and must be refused with a warning; output:\n%s", tt.key, tt.value, out)
+			}
+			if tt.gitArg != "" {
+				data, err := os.ReadFile(gitLog)
+				if err != nil {
+					t.Fatalf("ReadFile(git log): %v", err)
+				}
+				found := false
+				for _, line := range strings.Split(string(data), "\n") {
+					if slices.Contains(strings.Fields(line), tt.gitArg) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("no git call carried %s\ngit calls:\n%s", tt.gitArg, data)
+				}
+			}
+			assertNoArchiveRepackFailure(t, stateFile)
+		})
+	}
 }
 
 // writeUnreachableLooseBlob writes size bytes that zlib cannot shrink (a
