@@ -240,15 +240,18 @@ type sessionHistoryJSON struct {
 type sessionHistoryRowJSON struct {
 	SessionID string `json:"session_id"`
 	Path      string `json:"path"`
-	Archived  bool   `json:"archived"`
-	Live      bool   `json:"live"`
-	LiveBead  string `json:"live_bead,omitempty"`
-	Title     string `json:"title,omitempty"`
-	AgentName string `json:"agent_name,omitempty"`
-	FirstUser string `json:"first_user,omitempty"`
-	StartedAt string `json:"started_at,omitempty"`
-	LastAt    string `json:"last_at"`
-	SizeBytes int64  `json:"size_bytes"`
+	// FoundUnder is the work dir of the projects folder the transcript was
+	// found under: the cwd a provider resume of it must run in.
+	FoundUnder string `json:"found_under,omitempty"`
+	Archived   bool   `json:"archived"`
+	Live       bool   `json:"live"`
+	LiveBead   string `json:"live_bead,omitempty"`
+	Title      string `json:"title,omitempty"`
+	AgentName  string `json:"agent_name,omitempty"`
+	FirstUser  string `json:"first_user,omitempty"`
+	StartedAt  string `json:"started_at,omitempty"`
+	LastAt     string `json:"last_at"`
+	SizeBytes  int64  `json:"size_bytes"`
 }
 
 func cmdSessionHistory(identifier string, limit int, jsonOutput bool, archiveRoot string, stdout, stderr io.Writer) int {
@@ -293,14 +296,15 @@ func cmdSessionHistory(identifier string, limit int, jsonOutput bool, archiveRoo
 		for _, e := range entries {
 			summary := worker.ReadClaudeTranscriptSummary(e.Path)
 			row := sessionHistoryRowJSON{
-				SessionID: e.SessionID,
-				Path:      e.Path,
-				Archived:  e.Archived,
-				Title:     summary.Title,
-				AgentName: summary.AgentName,
-				FirstUser: summary.FirstUser,
-				LastAt:    e.ModTime.UTC().Format(time.RFC3339),
-				SizeBytes: e.Size,
+				SessionID:  e.SessionID,
+				Path:       e.Path,
+				FoundUnder: e.foundUnder,
+				Archived:   e.Archived,
+				Title:      summary.Title,
+				AgentName:  summary.AgentName,
+				FirstUser:  summary.FirstUser,
+				LastAt:     e.ModTime.UTC().Format(time.RFC3339),
+				SizeBytes:  e.Size,
 			}
 			if !summary.FirstSeen.IsZero() {
 				row.StartedAt = summary.FirstSeen.UTC().Format(time.RFC3339)
@@ -718,8 +722,9 @@ func inProgressTaskWorkDirs(cityPath string, store beads.Store, assignees ...str
 }
 
 // listSessionHistory lists the conversations in the target's own work dir's
-// projects folder (unfiltered, as before) and the attributable ones from every
-// other folder in scope, deduplicated by session id with live copies preferred
+// projects folder (unfiltered, as before), the attributable ones from every
+// other folder in scope, and every copy of each conversation id on the bead
+// wherever it was found, deduplicated by session id with live copies preferred
 // over archived ones and the newest copy kept among equals.
 func listSessionHistory(target sessionHistoryTarget, scope sessionHistoryScope, searchPaths, archiveRoots []string) []sessionHistoryItem {
 	byID := make(map[string]sessionHistoryItem)
@@ -749,10 +754,30 @@ func listSessionHistory(target sessionHistoryTarget, scope sessionHistoryScope, 
 			}
 		}
 	}
+	knownDirs := append([]string{target.workDir}, scope.workDirs...)
+	for _, key := range scope.keys {
+		for _, e := range worker.FindClaudeTranscriptsByID(searchPaths, archiveRoots, key) {
+			record(sessionHistoryItem{SessionHistoryEntry: e, foundUnder: transcriptFolderWorkDir(e, knownDirs)})
+		}
+	}
 	items := make([]sessionHistoryItem, 0, len(byID))
 	for _, item := range byID {
 		items = append(items, item)
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].ModTime.After(items[j].ModTime) })
 	return items
+}
+
+// transcriptFolderWorkDir names the work dir whose projects folder holds e:
+// a known dir whose slug is e's folder, else a cwd the transcript records that
+// maps to that folder, else "" (the folder's work dir cannot be told).
+func transcriptFolderWorkDir(e worker.SessionHistoryEntry, knownDirs []string) string {
+	for _, dir := range knownDirs {
+		for _, slug := range worker.ClaudeProjectSlugCandidates(dir) {
+			if slug == e.Slug {
+				return dir
+			}
+		}
+	}
+	return worker.ClaudeTranscriptCwdForSlug(e.Path, e.Slug)
 }
