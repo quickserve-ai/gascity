@@ -13,6 +13,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/shellquote"
 )
 
 // The seat's configured work dir is A, but its process ran with cwd inside a
@@ -158,6 +159,134 @@ func TestSessionHistoryListsTranscriptUnderTaskWorktreeCwd(t *testing.T) {
 	}
 	if strings.Contains(out, foreignConvID) {
 		t.Fatalf("history lists another seat's conversation %s from the shared worktree:\n%s", foreignConvID, out)
+	}
+}
+
+func TestSessionResumePrintAcceptsTranscriptUnderTaskWorktreeCwd(t *testing.T) {
+	fx := setupHistoryWorktreeFixture(t, nil, true)
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdSessionResume([]string{"lana", "f8de97bc"}, false, true, t.TempDir(), &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdSessionResume(--print) = %d; stderr=%s", code, stderr.String())
+	}
+	want := fmt.Sprintf("cd %s && claude --resume %s", fx.worktree, worktreeConvID)
+	if !strings.Contains(stdout.String(), want) {
+		t.Fatalf("stdout = %q, want %q", stdout.String(), want)
+	}
+}
+
+func TestSessionResumeRefusesAnotherSeatsTranscriptInSharedWorktree(t *testing.T) {
+	setupHistoryWorktreeFixture(t, nil, true)
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdSessionResume([]string{"lana", "aaaaaaaa"}, false, true, t.TempDir(), &stdout, &stderr); code == 0 {
+		t.Fatalf("cmdSessionResume accepted another seat's conversation; stdout=%s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "no conversation matching") {
+		t.Fatalf("stderr = %q, want a no-match refusal", stderr.String())
+	}
+}
+
+func TestSessionResumeSeedsTranscriptUnderTaskWorktreeCwd(t *testing.T) {
+	fx := setupHistoryWorktreeFixture(t, map[string]string{"session_key": currentConvID}, true)
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdSessionResume([]string{"lana", "f8de97bc"}, false, false, t.TempDir(), &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdSessionResume = %d; stderr=%s", code, stderr.String())
+	}
+	got, err := fx.store.Get(fx.sessionID)
+	if err != nil {
+		t.Fatalf("store.Get(session): %v", err)
+	}
+	if key := got.Metadata["session_key"]; key != worktreeConvID {
+		t.Fatalf("session_key = %q, want seeded %q", key, worktreeConvID)
+	}
+	// The next launch runs in the task worktree, where the transcript already
+	// lives, so the reconciler's stale-resume probe will find it there.
+	if present, _ := staleResumeKeyProbe("claude", fx.worktree, worktreeConvID); !present {
+		t.Fatalf("stale-resume probe cannot see %s from the launch cwd %s", worktreeConvID, fx.worktree)
+	}
+}
+
+// The task that put the seat in B has closed, so the next launch runs in A.
+// B is still recorded through the bead's prior_session_key: history finds the
+// conversation by id and resume seeds it without copying the transcript
+// anywhere (the launch path moves it when the launch cwd cannot see it).
+func TestSessionResumeSeedsPriorKeyTranscriptWithoutCopyingIt(t *testing.T) {
+	fx := setupHistoryWorktreeFixture(t, map[string]string{
+		"session_key":       currentConvID,
+		"prior_session_key": worktreeConvID,
+	}, false)
+
+	rows := sessionHistoryJSONRows(t, "lana")
+	if row, ok := rows[worktreeConvID]; !ok || row.FoundUnder != fx.worktree {
+		t.Fatalf("history row for the prior-key conversation = %+v (listed=%v), want found_under %s", row, ok, fx.worktree)
+	}
+	if _, ok := rows[foreignConvID]; ok {
+		t.Fatalf("history lists another seat's conversation %s", foreignConvID)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdSessionResume([]string{"lana", "f8de97bc"}, false, false, t.TempDir(), &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdSessionResume = %d; stderr=%s", code, stderr.String())
+	}
+	got, err := fx.store.Get(fx.sessionID)
+	if err != nil {
+		t.Fatalf("store.Get(session): %v", err)
+	}
+	if key := got.Metadata["session_key"]; key != worktreeConvID {
+		t.Fatalf("session_key = %q, want seeded %q", key, worktreeConvID)
+	}
+	if present, _ := staleResumeKeyProbe("claude", fx.agentDir, worktreeConvID); present {
+		t.Fatalf("resume copied %s under the agent dir's projects folder; stdout=%s", worktreeConvID, stdout.String())
+	}
+	if strings.Contains(stdout.String(), "Copied") {
+		t.Fatalf("resume claims a copy: %s", stdout.String())
+	}
+	// No code observes the next launch, so resume must not promise one.
+	out := stdout.String()
+	if strings.Contains(out, "will resume it") || !strings.Contains(out, "only if") || !strings.Contains(out, fx.worktree) {
+		t.Fatalf("resume output = %q, want the seed stated with its condition and the work dir the transcript was found under (%s)", out, fx.worktree)
+	}
+}
+
+// --print for a conversation whose worktree is gone cannot cd there: it prints
+// the agent's work dir and says on stderr what it observed (the dir does not
+// exist), not why.
+func TestSessionResumePrintNamesTargetWorkDirWhenWorktreeRemoved(t *testing.T) {
+	fx := setupHistoryWorktreeFixture(t, map[string]string{"prior_session_key": worktreeConvID}, false)
+	if err := os.RemoveAll(fx.worktree); err != nil {
+		t.Fatalf("remove worktree: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdSessionResume([]string{"lana", "f8de97bc"}, false, true, t.TempDir(), &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdSessionResume(--print) = %d; stderr=%s", code, stderr.String())
+	}
+	if want := fmt.Sprintf("cd %s && claude --resume %s\n", fx.agentDir, worktreeConvID); stdout.String() != want {
+		t.Fatalf("stdout = %q, want %q", stdout.String(), want)
+	}
+	if got := stderr.String(); strings.Contains(got, "removed worktree") || !strings.Contains(got, fx.worktree+" does not exist") {
+		t.Fatalf("stderr = %q, want the observation that %s does not exist, not a cause", got, fx.worktree)
+	}
+}
+
+// A transcript found by id in a folder whose work dir cannot be told (no known
+// dir maps to it, no recorded cwd does) is reported as exactly that.
+func TestSessionResumePrintReportsAnUndeterminedFolder(t *testing.T) {
+	fx := setupHistoryWorktreeFixture(t, map[string]string{"prior_session_key": priorConvID}, false)
+	writeNamedTestSession(t, fx.liveRoot, "/elsewhere/unknown", priorConvID+".jsonl",
+		historyTranscriptLines(priorConvID, "lana", "/recorded/other", "lana elsewhere")...)
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdSessionResume([]string{"lana", "dddddddd"}, false, true, t.TempDir(), &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdSessionResume(--print) = %d; stderr=%s", code, stderr.String())
+	}
+	if want := fmt.Sprintf("cd %s && claude --resume %s\n", fx.agentDir, priorConvID); stdout.String() != want {
+		t.Fatalf("stdout = %q, want %q", stdout.String(), want)
+	}
+	if got := stderr.String(); strings.Contains(got, "removed worktree") || !strings.Contains(got, "could not be determined") {
+		t.Fatalf("stderr = %q, want the observation that the folder's work dir could not be determined", got)
 	}
 }
 
@@ -406,5 +535,25 @@ func TestSessionHistoryBoundsAndNamesStalledOrFailedRigTaskLookups(t *testing.T)
 	}
 	if !strings.Contains(stdout.String(), agentDirConvID) {
 		t.Fatalf("history dropped the agent-dir conversation:\n%s", stdout.String())
+	}
+}
+
+// --print's command must survive a work dir with spaces.
+func TestSessionResumePrintQuotesTheWorkDir(t *testing.T) {
+	fx := setupHistoryWorktreeFixture(t, map[string]string{"prior_session_key": priorConvID}, false)
+	spaced := filepath.Join(t.TempDir(), "my worktree")
+	if err := os.MkdirAll(spaced, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	writeNamedTestSession(t, fx.liveRoot, spaced, priorConvID+".jsonl", historyTranscriptLines(priorConvID, "lana", spaced, "lana in a spaced dir")...)
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdSessionResume([]string{"lana", "dddddddd"}, false, true, t.TempDir(), &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdSessionResume(--print) = %d; stderr=%s", code, stderr.String())
+	}
+	got := shellquote.Split(strings.TrimSpace(stdout.String()))
+	want := []string{"cd", spaced, "&&", "claude", "--resume", priorConvID}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("--print = %q parses as %q, want %q", stdout.String(), got, want)
 	}
 }
