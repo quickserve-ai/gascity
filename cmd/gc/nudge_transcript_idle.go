@@ -18,13 +18,12 @@ import (
 const claudeTranscriptTailBudget = 64 * 1024
 
 // claudeTranscriptBookkeeping are entry types Claude Code appends to the main
-// transcript without starting or continuing a turn. They were observed after
-// turn_duration on this host (1158 turn ends over 150 recent transcripts,
-// 2026-10-02); any type not listed here is decisive and reads not idle.
+// transcript while a background task runs after the main turn ended, without
+// starting or continuing a turn. Any type not listed here is decisive and
+// reads not idle.
 var claudeTranscriptBookkeeping = map[string]bool{
-	"queue-operation": true, "attachment": true, "pr-link": true, "bridge-session": true,
-	"file-history-snapshot": true, "last-prompt": true, "custom-title": true,
-	"agent-name": true, "mode": true, "permission-mode": true,
+	"queue-operation": true, "attachment": true, "pr-link": true,
+	"bridge-session": true, "file-history-snapshot": true,
 }
 
 // claudeTranscriptSaysTurnEnded reports whether a Claude seat's own transcript
@@ -73,9 +72,11 @@ func readClaudeTranscriptTail(path string) ([]byte, error) {
 		offset = 0
 	}
 	buf := make([]byte, info.Size()-offset)
-	if _, err := f.ReadAt(buf, offset); err != nil && err != io.EOF {
+	n, err := f.ReadAt(buf, offset)
+	if err != nil && err != io.EOF {
 		return nil, err
 	}
+	buf = buf[:n]
 	if offset > 0 { // drop the partial first line
 		if i := bytes.IndexByte(buf, '\n'); i >= 0 {
 			buf = buf[i+1:]
@@ -136,11 +137,11 @@ func nudgeTargetBuiltinFamily(target nudgeTarget) string {
 
 // nudgeTargetClaudeTranscriptPath resolves the seat's transcript by its stable
 // session key only (the keyed lookup SessionHandle.TranscriptPath tries
-// first), never by the newest-file-in-workdir fallback. Roots are searched
-// seat CLAUDE_CONFIG_DIR/projects first, then daemon observe_paths, then the
-// default root. If the key resolves to two different files, the answer is
-// ambiguous and "" is returned; one file reached through a symlinked root is
-// one file.
+// first), never by the newest-file-in-workdir fallback. Every root is checked:
+// the seat's CLAUDE_CONFIG_DIR/projects, daemon observe_paths, and the default
+// root. If the key resolves to two different files, the answer is ambiguous
+// and "" is returned, so no root can override another and the search order
+// does not matter; one file reached through a symlinked root is one file.
 func nudgeTargetClaudeTranscriptPath(target nudgeTarget) string {
 	workDir := strings.TrimSpace(target.transcriptWorkDir)
 	key := strings.TrimSpace(target.transcriptSessionKey)
