@@ -621,7 +621,7 @@ func (t *Tmux) paneIsClaudeFamily(target string) bool {
 // nudge (composerDraftIsOurs), the delivery defers after typing -- unless an
 // attribute re-read, with faint placeholder text dropped, passes the same
 // ownership rule (undimmedDraftIsOurs). Only positive evidence of someone else's text
-// defers: an empty or unreadable composer keeps today's behaviour, so a slow
+// defers: an empty or unreadable composer keeps today's behavior, so a slow
 // render costs nothing. Other families are not checked: claude is the one
 // family whose composer the draft rule models (see humanPromptGuard), and of
 // the others only codex reaches this gate.
