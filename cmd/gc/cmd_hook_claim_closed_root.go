@@ -349,6 +349,8 @@ func (g *hookClosedRootGate) resolveRemaining(rest []beads.Bead, admit func(bead
 // if any, reading the root (and its teardown tail) when this store has no
 // verdict yet. Only the resolve path calls it, never a tier: tiers ask skip,
 // which answers from the cache alone.
+//
+//nolint:unparam // no caller reads the root id today; the signature predates ga-b2oxyf and is left as it was
 func (g *hookClosedRootGate) closedRootOf(candidate beads.Bead, dir string, env []string) (string, bool) {
 	if g == nil {
 		return "", false
