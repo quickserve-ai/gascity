@@ -44,7 +44,7 @@ func recordClaudePromptSubmitted(cityPath, sessionID string, at time.Time) error
 		return nil
 	}
 	if rmErr := os.Remove(path); rmErr != nil && !errors.Is(rmErr, fs.ErrNotExist) {
-		return fmt.Errorf("prompt marker %s: write: %v; removing the stale marker: %w", path, err, rmErr)
+		return fmt.Errorf("prompt marker %s: write: %w; removing the stale marker: %w", path, err, rmErr)
 	}
 	return nil
 }
