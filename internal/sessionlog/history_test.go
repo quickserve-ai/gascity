@@ -119,3 +119,47 @@ func TestIsSessionIDStem(t *testing.T) {
 		}
 	}
 }
+
+func TestFindClaudeTranscriptsByIDStatsEveryLiveSlugBeforeArchive(t *testing.T) {
+	live := t.TempDir()
+	archive := t.TempDir()
+	now := time.Now()
+	older := writeHistoryTranscript(t, filepath.Join(live, ProjectSlug("/wt/a")), historyTestUUIDA, []string{"{}"}, now.Add(-time.Hour))
+	newer := writeHistoryTranscript(t, filepath.Join(live, ProjectSlug("/wt/b")), historyTestUUIDA, []string{"{}"}, now)
+	writeHistoryTranscript(t, filepath.Join(archive, "reaped", "2026-09-01", ProjectSlug("/wt/a")), historyTestUUIDA, []string{"{}"}, now)
+	reaped := writeHistoryTranscript(t, filepath.Join(archive, "reaped", "2026-09-01", ProjectSlug("/old/wt")), historyTestUUIDB, []string{"{}"}, time.Time{})
+
+	got := FindClaudeTranscriptsByID([]string{live}, []string{archive}, historyTestUUIDA)
+	if len(got) != 2 || got[0].Path != newer || got[1].Path != older || got[0].Archived || got[0].Slug != ProjectSlug("/wt/b") {
+		t.Fatalf("live lookup = %+v, want both live copies newest first and no archive copy", got)
+	}
+	got = FindClaudeTranscriptsByID([]string{live}, []string{archive}, historyTestUUIDB)
+	if len(got) != 1 || got[0].Path != reaped || !got[0].Archived {
+		t.Fatalf("archive-only lookup = %+v, want the reaped copy %s", got, reaped)
+	}
+	if got := FindClaudeTranscriptsByID([]string{live}, []string{archive}, historyTestUUIDC); len(got) != 0 {
+		t.Fatalf("missing id = %+v, want none", got)
+	}
+	if got := FindClaudeTranscriptsByID([]string{live}, []string{archive}, "not-a-uuid"); len(got) != 0 {
+		t.Fatalf("non-uuid key = %+v, want none", got)
+	}
+}
+
+func TestClaudeTranscriptAgentNameAndCwdForSlug(t *testing.T) {
+	dir := t.TempDir()
+	path := writeHistoryTranscript(t, dir, historyTestUUIDA, []string{
+		`{"type":"agent-name","agentName":"rig/lana","sessionId":"x"}`,
+		`{"type":"user","cwd":"/wt/a","message":{"role":"user","content":"hi"}}`,
+		`{"type":"agent-name","agentName":"other","sessionId":"x"}`,
+		`{"type":"user","cwd":"/wt/b","message":{"role":"user","content":"moved"}}`,
+	}, time.Time{})
+	if got := ReadClaudeTranscriptAgentName(path); got != "rig/lana" {
+		t.Fatalf("agent name = %q, want the first record rig/lana", got)
+	}
+	if got := ClaudeTranscriptCwdForSlug(path, ProjectSlug("/wt/b")); got != "/wt/b" {
+		t.Fatalf("cwd for /wt/b slug = %q, want /wt/b (a later cwd, not the first)", got)
+	}
+	if got := ClaudeTranscriptCwdForSlug(path, ProjectSlug("/wt/c")); got != "" {
+		t.Fatalf("cwd for an unrecorded slug = %q, want empty", got)
+	}
+}
