@@ -314,10 +314,13 @@ func classifyDialog(live []string) string {
 }
 
 // isGCNudgeDraft reports whether a composer draft is gc's own: a queued
-// nudge left on the line by a lost submit (ga-bwm) starts with the reminder
-// wrapper. It is not a person's message, so it does not hold delivery back.
+// nudge left on the line by a lost submit (ga-bwm) is one or more complete
+// reminders and nothing else. It is not a person's message, so it does not
+// hold delivery back. A reminder with anything after it is a person's draft
+// (ga-da5vmz): typing onto it would add to their text, and a survey's "0"
+// and Enter would submit it.
 func isGCNudgeDraft(draft string) bool {
-	return strings.HasPrefix(draft, "<system-reminder>")
+	return stripLeadingGCReminders(squashSpace(draft)) == ""
 }
 
 // composerHoldsSent reports whether the live composer still shows the text a
@@ -428,6 +431,16 @@ func squashSpace(s string) string {
 // is, so callers keep treating it as "session gone"; any other capture failure
 // defers, because a prompt could not be ruled out.
 func (t *Tmux) humanPromptGuard(session, target, stage string, checkDraft bool) error {
+	return t.humanPromptGuardOwning(session, target, stage, checkDraft, "")
+}
+
+// humanPromptGuardOwning is humanPromptGuard plus, when owned is set, the
+// first-submit ownership rule on the SAME capture (ga-da5vmz): on an attached
+// claude pane, a composer draft that is not only owned defers as a human
+// draft (draftIsNotOurs). The submit chokepoint runs it just before the first
+// submit key, so a person who replaces the nudge is caught up to that read;
+// only the gap between the read and the key is left.
+func (t *Tmux) humanPromptGuardOwning(session, target, stage string, checkDraft bool, owned string) error {
 	lines, err := t.CapturePaneLines(target, promptObservationLines)
 	if err != nil {
 		if errors.Is(err, ErrSessionNotFound) || errors.Is(err, ErrNoServer) {
@@ -435,10 +448,29 @@ func (t *Tmux) humanPromptGuard(session, target, stage string, checkDraft bool) 
 		}
 		return &NudgeDeferredError{Session: session, Reason: NudgeDeferReasonCaptureFailed, Stage: stage, Err: err}
 	}
-	if reason := t.classifyPaneLines(session, target, lines, checkDraft); reason != "" {
+	reason := t.classifyPaneLines(session, target, lines, checkDraft)
+	if reason == "" && owned != "" && t.draftIsNotOurs(session, target, lines, owned) {
+		reason = NudgeDeferReasonHumanDraft
+	}
+	if reason != "" {
 		return &NudgeDeferredError{Session: session, Reason: reason, Stage: stage}
 	}
 	return nil
+}
+
+// draftIsNotOurs reports whether lines show, on an attached claude pane, a
+// composer draft that is not only message (composerDraftIsOurs) and that an
+// attribute re-read with faint placeholder text dropped does not clear
+// (undimmedDraftIsOurs). Only positive evidence of someone else's text
+// counts: an empty or unreadable composer does not. Other families are not
+// checked: claude is the one family whose composer the draft rule models
+// (see humanPromptGuard).
+func (t *Tmux) draftIsNotOurs(session, target string, lines []string, message string) bool {
+	prefix := t.resolveIdlePromptPrefix(session)
+	found, text := composerDraft(lines, prefix)
+	return found && !composerDraftIsOurs(text, message) &&
+		t.sessionClientCount(session) != 0 && t.paneIsClaudeFamily(target) &&
+		!t.undimmedDraftIsOurs(target, prefix, message)
 }
 
 // classifyPaneLines is humanPromptGuard's decision on an already-captured
@@ -614,17 +646,9 @@ func (t *Tmux) paneIsClaudeFamily(target string) bool {
 // own text after a submit that landed unobserved would otherwise have THEIR
 // placeholder submitted. Claude numbers each paste, so theirs differs.
 //
-// The first submit is gated too, on an ATTACHED claude pane only (ga-da5vmz):
-// the composer was empty when the nudge was typed, but in the paste debounce
-// a person may have cleared it and typed their own message, which the first
-// Enter would submit. When the composer then holds text that is not only the
-// nudge (composerDraftIsOurs), the delivery defers after typing -- unless an
-// attribute re-read, with faint placeholder text dropped, passes the same
-// ownership rule (undimmedDraftIsOurs). Only positive evidence of someone else's text
-// defers: an empty or unreadable composer keeps today's behaviour, so a slow
-// render costs nothing. Other families are not checked: claude is the one
-// family whose composer the draft rule models (see humanPromptGuard), and of
-// the others only codex reaches this gate.
+// The FIRST submit's ownership check (ga-da5vmz) is not here but in the
+// submit chokepoint (sendNudgeSubmitSequenceOwning), on the capture taken
+// just before the key.
 func (t *Tmux) resendGate(session, target, message string) func(resend bool) (bool, error) {
 	promptPrefix := t.resolveIdlePromptPrefix(session)
 	snapshot := ""
@@ -635,11 +659,6 @@ func (t *Tmux) resendGate(session, target, message string) func(resend bool) (bo
 			if err == nil {
 				if found, text := composerDraft(lines, promptPrefix); found {
 					snapshot = text
-					if !composerDraftIsOurs(text, message) &&
-						t.sessionClientCount(session) != 0 && t.paneIsClaudeFamily(target) &&
-						!t.undimmedDraftIsOurs(target, promptPrefix, message) {
-						return false, &NudgeDeferredError{Session: session, Reason: NudgeDeferReasonHumanDraft, Stage: nudgeGuardStageBeforeSubmit}
-					}
 				}
 			}
 			return true, nil
