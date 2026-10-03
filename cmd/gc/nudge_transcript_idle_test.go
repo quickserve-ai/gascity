@@ -92,10 +92,13 @@ func (p *paneStub) SnapshotIdle(string) (bool, error) {
 	return p.answers[min(p.calls, len(p.answers))-1], nil
 }
 
+//nolint:unparam // the next slice (ga-megheo s6) calls it with other providers and provider specs
 func newTranscriptFixture(t *testing.T, provider string, providers map[string]config.ProviderSpec) *transcriptFixture {
 	t.Helper()
-	f := &transcriptFixture{t: t, home: t.TempDir(), workDir: t.TempDir(), accountDir: t.TempDir(), cityPath: t.TempDir(),
-		pane: &paneStub{answers: []bool{true}}}
+	f := &transcriptFixture{
+		t: t, home: t.TempDir(), workDir: t.TempDir(), accountDir: t.TempDir(), cityPath: t.TempDir(),
+		pane: &paneStub{answers: []bool{true}},
+	}
 	t.Setenv("HOME", f.home)
 	if providers == nil {
 		providers = map[string]config.ProviderSpec{}
@@ -111,8 +114,10 @@ func newTranscriptFixture(t *testing.T, provider string, providers map[string]co
 		Providers: providers,
 		Agents:    []config.Agent{{Name: "worker", Provider: provider, Session: "tmux"}},
 	}
-	f.info = session.Info{ID: "gc-megheo", AgentName: "worker", Provider: provider,
-		WorkDir: f.workDir, SessionName: "sess-worker", SessionKey: transcriptIdleTestKey}
+	f.info = session.Info{
+		ID: "gc-megheo", AgentName: "worker", Provider: provider,
+		WorkDir: f.workDir, SessionName: "sess-worker", SessionKey: transcriptIdleTestKey,
+	}
 	return f
 }
 
@@ -123,7 +128,9 @@ func (f *transcriptFixture) defaultRoot() string { return filepath.Join(f.home, 
 // UserPromptSubmit hook (gc nudge drain --inject) does.
 func (f *transcriptFixture) promptAt(at time.Time) {
 	f.t.Helper()
-	recordClaudePromptSubmitted(f.cityPath, f.info.ID, at)
+	if err := recordClaudePromptSubmitted(f.cityPath, f.info.ID, at); err != nil {
+		f.t.Fatalf("record prompt marker: %v", err)
+	}
 	if _, ok := readClaudePromptSubmitted(f.cityPath, f.info.ID); !ok {
 		f.t.Fatal("prompt marker not readable after write")
 	}
@@ -549,6 +556,7 @@ func (p *paneRuntime) Nudge(name string, content []gcruntime.ContentBlock) error
 	return p.Fake.Nudge(name, content)
 }
 
+//nolint:unparam // implements runtime.IdleSnapshotProvider; this fake pane never fails a capture
 func (p *paneRuntime) SnapshotIdle(string) (bool, error) {
 	p.calls++
 	return p.answers[min(p.calls, len(p.answers))-1], nil
@@ -588,8 +596,10 @@ func newClaudeDispatchSeat(t *testing.T, answers ...bool) *claudeDispatchSeat {
 		transcriptWorkDir: dir, transcriptSessionKey: transcriptIdleTestKey, providerAncestor: "claude",
 	}
 	pane := &paneRuntime{Fake: fake, answers: answers}
-	seat := &claudeDispatchSeat{t: t, dir: dir, fake: fake, pane: pane,
-		transcript: filepath.Join(tdir, transcriptIdleTestKey+".jsonl")}
+	seat := &claudeDispatchSeat{
+		t: t, dir: dir, fake: fake, pane: pane,
+		transcript: filepath.Join(tdir, transcriptIdleTestKey+".jsonl"),
+	}
 	seat.deliver = func() bool {
 		t.Helper()
 		delivered, err := tryDeliverQueuedNudgesByPoller(target, store, store, pane, 3*time.Second,
@@ -659,19 +669,34 @@ func TestTryDeliverQueuedNudgesClaudeRechecksBeforeDelivery(t *testing.T) {
 	}
 }
 
+// wallClockAfter returns the first wall-clock reading strictly after t. It
+// spins rather than sleeping a fixed time: the clock advances within
+// microseconds, and the comparisons it orders use wall time (monotonic
+// readings are stripped).
+func wallClockAfter(t time.Time) time.Time {
+	t = t.Round(0)
+	for {
+		if now := time.Now().Round(0); now.After(t) {
+			return now
+		}
+	}
+}
+
 // The dispatcher's marker carries the time just before its submit, not the
 // time confirmation returned: a short turn that ends while confirmation is
 // still pending must not leave the seat blocked behind its own marker.
 func TestTryDeliverQueuedNudgesClaudeTurnEndedBeforeConfirmationNextDelivers(t *testing.T) {
 	seat := newClaudeDispatchSeat(t, true)
 	seat.pane.onNudge = func() {
-		time.Sleep(5 * time.Millisecond)
-		ended := `{"type":"system","subtype":"turn_duration","timestamp":"` + time.Now().UTC().Format(time.RFC3339Nano) + `"}`
+		// The turn ends strictly after the submit (submitAt is taken before
+		// Nudge), and confirmation returns strictly after the turn ended.
+		endedAt := wallClockAfter(time.Now())
+		ended := `{"type":"system","subtype":"turn_duration","timestamp":"` + endedAt.UTC().Format(time.RFC3339Nano) + `"}`
 		lines := []string{tlUserPrompt, tlAssistEndTurn, ended}
 		if err := os.WriteFile(seat.transcript, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
 			t.Error(err)
 		}
-		time.Sleep(5 * time.Millisecond)
+		wallClockAfter(endedAt)
 	}
 	seat.enqueue("first")
 	if !seat.deliver() {

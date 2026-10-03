@@ -349,6 +349,8 @@ func (g *hookClosedRootGate) resolveRemaining(rest []beads.Bead, admit func(bead
 // if any, reading the root (and its teardown tail) when this store has no
 // verdict yet. Only the resolve path calls it, never a tier: tiers ask skip,
 // which answers from the cache alone.
+//
+//nolint:unparam // no caller reads the root id today; the signature predates ga-b2oxyf and is left as it was
 func (g *hookClosedRootGate) closedRootOf(candidate beads.Bead, dir string, env []string) (string, bool) {
 	if g == nil {
 		return "", false
@@ -372,9 +374,11 @@ func (g *hookClosedRootGate) closedRootOf(candidate beads.Bead, dir string, env 
 
 // observedClosedRootOf answers from cached verdicts only, never reading: the
 // root this invocation observed closed for bead, when an ESTABLISHED teardown
-// tail says bead is outside it. With no tail built for that root, the answer is
-// "no" — a retry attempt the query never returned could be in the tail. Used by
-// the drain's divergence classifier.
+// tail says bead is outside it — or when bead carries no gc.step_id, which
+// needs no tail (it cannot be a retry attempt). For a bead WITH a gc.step_id
+// and no tail built for that root, the answer is "no" — a retry attempt the
+// query never returned could be in the tail. Used by the drain's divergence
+// classifier.
 //
 // The drain runs with the invocation's work dir and env, while verdicts are
 // keyed by the leg that produced them — on a federated city a different store.
@@ -392,8 +396,13 @@ func (g *hookClosedRootGate) observedClosedRootOf(bead beads.Bead, dir string, e
 	if rootID == "" {
 		return "", false
 	}
+	// A bead with no gc.step_id cannot be a teardown retry attempt (and a
+	// gc.scope_role=teardown bead never gets here — candidateRoot exempts it),
+	// so a closed root excludes it with no tail at all: the same rule
+	// cachedClosedRootOf skips it by (ga-b2oxyf).
+	noStepID := strings.TrimSpace(bead.Metadata[beadmeta.StepIDMetadataKey]) == ""
 	excludes := func(v *hookRootVerdict) bool {
-		return v.closed && v.tail != nil && !v.tail(bead)
+		return v.closed && (noStepID || (v.tail != nil && !v.tail(bead)))
 	}
 	if v, ok := g.verdicts[hookRootStoreKey(dir, env, rootID)]; ok && (v.open || v.closed) {
 		if excludes(v) {
