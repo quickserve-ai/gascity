@@ -198,7 +198,7 @@ func newPoolWakeReadiness(cache *readyDemandCache, work []beads.Bead, stores []b
 			continue
 		}
 		seen[ref] = true
-		rows, err := cache.controllerDemandReady(stores[i])
+		rows, err := cache.controllerDemandReady(stores[i], cache.storeLabel(stores[i], "pool_wake_readiness"))
 		if err != nil {
 			// Partial or failed: this store has no verdict to give, so its rows
 			// keep the demand they had before this gate existed. Say so on the
