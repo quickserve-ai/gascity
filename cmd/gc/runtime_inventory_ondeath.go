@@ -357,7 +357,10 @@ func (l *runtimeInventoryLane) noticeUnattestedHandlers(pass InventoryPass, hand
 
 // startOnDeathWorker starts the worker goroutine and returns a channel closed
 // when it exits. On cancellation it drops every queued edge; a hook already
-// running finishes first (hooks are bounded by their own timeout).
+// running finishes first (hooks are bounded by their own timeout). A
+// controller store newer than this binary holds the worker as it holds the
+// tick (ga-mw4dg): no edge runs, and the worker waits for shutdown, then
+// drops the queue.
 func (cr *CityRuntime) startOnDeathWorker(ctx context.Context, lane *runtimeInventoryLane) <-chan struct{} {
 	gate := lane.onDeath
 	done := make(chan struct{})
@@ -371,6 +374,10 @@ func (cr *CityRuntime) startOnDeathWorker(ctx context.Context, lane *runtimeInve
 			case <-gate.wakeCh:
 			}
 			for ctx.Err() == nil {
+				if cr.holdForControllerStoreSchemaSkew(ctx) {
+					gate.drop()
+					return
+				}
 				e, ok := gate.take()
 				if !ok {
 					break
