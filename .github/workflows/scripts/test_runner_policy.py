@@ -68,6 +68,31 @@ class RunnerPolicyTests(unittest.TestCase):
         self.assertIn("every event", reason)
         self.assertEqual(runners["runner_macos"], "blacksmith-6vcpu-macos-15")
 
+    def test_fork_repository_uses_github_even_when_forced(self) -> None:
+        use_blacksmith, reason, runners = runner_policy.select_runners(
+            "pull_request",
+            "julianknutsen",
+            {"julianknutsen"},
+            force_blacksmith=True,
+            repository="quickserve-ai/gascity",
+        )
+
+        self.assertFalse(use_blacksmith)
+        self.assertIn("GitHub-hosted", reason)
+        self.assertEqual(runners["runner_32vcpu"], "ubuntu-latest")
+        self.assertEqual(runners["runner_macos"], "macos-15")
+
+    def test_upstream_repository_keeps_blacksmith(self) -> None:
+        use_blacksmith, _, runners = runner_policy.select_runners(
+            "push",
+            "",
+            set(),
+            repository="gastownhall/gascity",
+        )
+
+        self.assertTrue(use_blacksmith)
+        self.assertEqual(runners["runner_2vcpu"], "blacksmith-2vcpu-ubuntu-2404")
+
 
 if __name__ == "__main__":
     unittest.main()
