@@ -314,9 +314,9 @@ func TestInputOpsTargetExactPane(t *testing.T) {
 			[]string{"send-keys"},
 		},
 		{
-			"dismissMidSessionDialogBeforeNudge",
+			"dismissMidSessionDialogs",
 			scriptedTargetExecutor{captures: []string{resumeDialogPane}},
-			func(tm *Tmux) { tm.dismissMidSessionDialogBeforeNudge(context.Background(), "worker-1") },
+			func(tm *Tmux) { _, _ = tm.dismissMidSessionDialogs(context.Background(), "worker-1") },
 			[]string{"capture-pane", "send-keys"},
 		},
 		{
