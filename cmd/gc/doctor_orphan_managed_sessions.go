@@ -43,7 +43,10 @@ var doctorOrphanRigStores = openStandaloneRigStores
 // partial and pin the fleet against reaping. Here the danger runs the other
 // way: a session claimed only in a skipped rig would read as an orphan and be
 // stopped. So every bound rig is a leg, and a suspended rig whose store is
-// dark makes Fix refuse rather than guess.
+// dark makes Fix refuse rather than guess. A rig whose bd-owned proxied store
+// is stopped is never opened, since opening it would start its proxy and Dolt
+// (doctorGatedRigStoreOpener): it is a failed leg, and Fix refuses the same
+// way.
 //
 // A relocation the config declares but the one-shot routes do not carry is an
 // error too, and the census does not catch it on its own. cliStorageRoutes
@@ -52,7 +55,7 @@ var doctorOrphanRigStores = openStandaloneRigStores
 // the work and rig stores alone, where a city that relocated its sessions has
 // none: the read would succeed without the binding's beads and every seat
 // claimed only there would read as an orphan.
-func doctorManagedSessionNames(cityPath string, cfg *config.City, openStore func(string) (beads.Store, error)) func() (map[string]struct{}, error) {
+func doctorManagedSessionNames(cityPath string, cfg *config.City, openStore func(string) (beads.Store, error), gate *doctorStoreGate) func() (map[string]struct{}, error) {
 	return func() (map[string]struct{}, error) {
 		if openStore == nil {
 			return nil, fmt.Errorf("no bead store opener")
@@ -65,7 +68,7 @@ func doctorManagedSessionNames(cityPath string, cfg *config.City, openStore func
 			return nil, fmt.Errorf("opening city bead store: %w", err)
 		}
 		defer closeBeadStoreHandle(store) //nolint:errcheck // best-effort close of a one-shot read handle
-		rigStores, failures := doctorOrphanRigStores(cfg, cityPath, oneShotRigStoreOpener(cfg))
+		rigStores, failures := doctorOrphanRigStores(cfg, cityPath, doctorGatedRigStoreOpener(gate, oneShotRigStoreOpener(cfg)))
 		defer func() {
 			for _, rigStore := range rigStores {
 				closeBeadStoreHandle(rigStore) //nolint:errcheck // best-effort close of a one-shot read handle
@@ -84,6 +87,19 @@ func doctorManagedSessionNames(cityPath string, cfg *config.City, openStore func
 			return nil, fmt.Errorf("session census: %w", err)
 		}
 		return sessionRuntimeNames(infos), nil
+	}
+}
+
+// doctorGatedRigStoreOpener answers errDoctorStoreNotRunning for a rig whose
+// bd-owned proxied store is stopped instead of opening it: doctor never starts
+// a server (#6817). rigPath is the scope root the other gated rig checks hand
+// the gate (rig.Path).
+func doctorGatedRigStoreOpener(gate *doctorStoreGate, open rigStoreOpener) rigStoreOpener {
+	return func(rigPath, cityPath string) (beads.Store, error) {
+		if gate.Stopped(rigPath) {
+			return nil, errDoctorStoreNotRunning
+		}
+		return open(rigPath, cityPath)
 	}
 }
 
