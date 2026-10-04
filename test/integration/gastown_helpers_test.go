@@ -354,7 +354,7 @@ func claimBead(t *testing.T, cityDir, agent, beadID string) {
 // sendMail sends a message to a recipient.
 func sendMail(t *testing.T, cityDir, to, body string) {
 	t.Helper()
-	out, err := gc(cityDir, "mail", "send", to, body)
+	out, err := gc(cityDir, "mail", "send", "--from", "human", to, body)
 	if err != nil {
 		t.Fatalf("gc mail send %s %q failed: %v\noutput: %s", to, body, err, out)
 	}

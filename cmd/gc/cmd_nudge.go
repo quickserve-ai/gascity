@@ -154,6 +154,12 @@ type nudgeTarget struct {
 	sessionID         string
 	continuationEpoch string
 	sessionName       string
+	// Set on targets built from a session Info (the dispatcher and the CLI
+	// resolveNudgeTarget path); they let claudeTranscriptSaysTurnEnded find the
+	// seat's keyed transcript and its recorded builtin family (ga-megheo).
+	transcriptWorkDir    string
+	transcriptSessionKey string
+	providerAncestor     string
 }
 
 type nudgeStatusJSON struct {
@@ -685,6 +691,17 @@ func cmdNudgeDrainWithFormat(args []string, inject bool, hookFormat string, stdo
 	// non-inject form is the human-facing one and is untouched (#5304).
 	if inject && len(args) == 0 && !hookHasManagedIdentity() {
 		return 0
+	}
+	if inject {
+		// First thing on every UserPromptSubmit: record that this seat's
+		// turn is starting, before the slow store work below. The queued
+		// nudge gate trusts a claude transcript's turn_duration only when it
+		// is newer than this marker (ga-megheo, nudge_transcript_idle.go).
+		if cityPath, ok := nudgeDrainExplicitCityPath(); ok {
+			if err := recordClaudePromptSubmitted(cityPath, os.Getenv("GC_SESSION_ID"), time.Now()); err != nil {
+				fmt.Fprintf(stderr, "gc nudge drain: %v\n", err) //nolint:errcheck
+			}
+		}
 	}
 	// On every prompt, emit a live clock (operator-local + UTC + epoch) and
 	// the agent's active formula step (if any) as UserPromptSubmit hook context.
@@ -1961,7 +1978,7 @@ func resolveNudgeTargetFromSessionInfo(cityPath string, cfg *config.City, i sess
 	if sessionName == "" {
 		sessionName = sessionNameFromBeadID(i.ID)
 	}
-	return buildNudgeTarget(cityPath, cfg, nudgeTargetFields{
+	target := buildNudgeTarget(cityPath, cfg, nudgeTargetFields{
 		sessionID:         i.ID,
 		sessionName:       sessionName,
 		alias:             strings.TrimSpace(i.Alias),
@@ -1973,6 +1990,10 @@ func resolveNudgeTargetFromSessionInfo(cityPath string, cfg *config.City, i sess
 		provider:          strings.TrimSpace(i.Provider),
 		continuationEpoch: strings.TrimSpace(i.ContinuationEpoch),
 	})
+	target.transcriptWorkDir = strings.TrimSpace(i.WorkDir)
+	target.transcriptSessionKey = strings.TrimSpace(i.SessionKey)
+	target.providerAncestor = strings.TrimSpace(i.BuiltinAncestor)
+	return target
 }
 
 func buildNudgeTarget(cityPath string, cfg *config.City, f nudgeTargetFields) nudgeTarget {
@@ -2063,7 +2084,8 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.S
 	if err != nil || !matches {
 		return false, err
 	}
-	if !pollerSessionIdleEnough(target, sp, quiescence, obs) {
+	idle, viaTranscript := pollerSessionIdleDecision(target, sp, quiescence, obs)
+	if !idle {
 		return false, nil
 	}
 	items, err := claimDueQueuedNudgesForTarget(target.cityPath, target, time.Now())
@@ -2134,6 +2156,14 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.S
 		relErr := releaseQueuedNudgeClaims(target.cityPath, queuedNudgeIDs(items))
 		return false, errors.Join(bookkeepErr, err, relErr)
 	}
+	if viaTranscript && !claudeTranscriptSaysTurnEnded(target, sp) {
+		// Re-checked after the queue and store work above: a turn that started
+		// meanwhile (a newer marker or a working pane) keeps the nudge queued.
+		// Releasing the claim spends no attempt (ga-megheo).
+		relErr := releaseQueuedNudgeClaims(target.cityPath, queuedNudgeIDs(items))
+		return false, errors.Join(bookkeepErr, relErr)
+	}
+	submitAt := time.Now()
 	result, err := handle.Nudge(context.Background(), worker.NudgeRequest{
 		Text:     msg,
 		Delivery: worker.NudgeDeliveryDefault,
@@ -2177,9 +2207,10 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.S
 			// attempt-counting/dead-letter path — that would re-inject the same
 			// reminder on the next pass.
 			stampLastNudgeDeliveredAt(deliverySessFront, target.sessionID, time.Now())
+			markErr := stampClaudePromptOnDelivery(target, submitAt)
 			logErr := recordNudgeDelivery(target, items, msg, nudgeDeliveryOutcomeDeliveredUnobserved, "")
 			ackErr := ackQueuedNudgesWithOutcome(target.cityPath, queuedNudgeIDs(items), "injected_unobserved", "", "provider-nudge-return")
-			return true, errors.Join(bookkeepErr, logErr, ackErr)
+			return true, errors.Join(bookkeepErr, logErr, ackErr, markErr)
 		}
 		logErr := recordNudgeDelivery(target, items, msg, nudgeDeliveryOutcomeFailed, err.Error())
 		if recErr := recordQueuedNudgeFailureWithStore(target.cityPath, beads.NudgesStore{Store: deliveryStore}, queuedNudgeIDs(items), err, time.Now()); recErr != nil {
@@ -2197,8 +2228,9 @@ func tryDeliverQueuedNudgesByPoller(target nudgeTarget, store, sessStore beads.S
 	}
 	telemetry.RecordNudge(context.Background(), target.agentKey(), nil)
 	stampLastNudgeDeliveredAt(deliverySessFront, target.sessionID, time.Now())
+	markErr := stampClaudePromptOnDelivery(target, submitAt)
 	logErr := recordNudgeDelivery(target, items, msg, nudgeDeliveryOutcomeDelivered, "")
-	return true, errors.Join(bookkeepErr, logErr, ackQueuedNudges(target.cityPath, queuedNudgeIDs(items)))
+	return true, errors.Join(bookkeepErr, logErr, ackQueuedNudges(target.cityPath, queuedNudgeIDs(items)), markErr)
 }
 
 func stampLastNudgeDeliveredAt(sessFront *session.Store, sessionID string, t time.Time) {
@@ -2210,28 +2242,47 @@ func stampLastNudgeDeliveredAt(sessFront *session.Store, sessionID string, t tim
 	_ = sessFront.SetMarker(sessionID, session.MetadataLastNudgeDeliveredAt, t.UTC().Format(time.RFC3339))
 }
 
+// pollerSessionIdleEnough is the yes/no view of pollerSessionIdleDecision.
+//
+//nolint:unparam // production passes its quiescence to pollerSessionIdleDecision; only tests call this, all with 3s
 func pollerSessionIdleEnough(target nudgeTarget, sp runtime.Provider, quiescence time.Duration, obs worker.LiveObservation) bool {
+	idle, _ := pollerSessionIdleDecision(target, sp, quiescence, obs)
+	return idle
+}
+
+// pollerSessionIdleDecision is pollerSessionIdleEnough that also reports
+// whether the yes came from the claude transcript path, which the caller must
+// re-check right before it types (ga-megheo).
+func pollerSessionIdleDecision(target nudgeTarget, sp runtime.Provider, quiescence time.Duration, obs worker.LiveObservation) (idle, viaTranscript bool) {
 	if quiescence <= 0 {
-		return true
+		return true, false
 	}
 	if obs.LastActivity != nil && !obs.LastActivity.IsZero() {
-		return time.Since(*obs.LastActivity) >= quiescence
+		if time.Since(*obs.LastActivity) >= quiescence {
+			return true, false
+		}
+		// Fresh pane output does not mean a claude seat is mid-turn: a
+		// background task's timer redraws every second after the main turn
+		// ends. Trust the seat's transcript only when it definitely says the
+		// turn ended; every other case stays not-idle (ga-megheo).
+		ended := claudeTranscriptSaysTurnEnded(target, sp)
+		return ended, ended
 	}
 	if pollerCanDeliverWithoutActivitySignal(target, sp) {
-		return true
+		return true, false
 	}
 	if target.sessionName == "" {
-		return false
+		return false, false
 	}
 	waiter, ok := sp.(runtime.IdleWaitProvider)
 	if !ok {
-		return false
+		return false, false
 	}
 	// The poller may take up to the quiescence window to exit while this
 	// runtime idle check is in progress.
 	ctx, cancel := context.WithTimeout(context.Background(), quiescence)
 	defer cancel()
-	return waiter.WaitForIdle(ctx, target.sessionName, quiescence) == nil
+	return waiter.WaitForIdle(ctx, target.sessionName, quiescence) == nil, false
 }
 
 func pollerCanDeliverWithoutActivitySignal(target nudgeTarget, sp runtime.Provider) bool {
