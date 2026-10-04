@@ -288,9 +288,11 @@ func TestInputOpsTargetExactPane(t *testing.T) {
 		},
 		{
 			"dismissMidSessionDialogs",
-			scriptedTargetExecutor{captures: []string{resumeDialogPane}},
+			// The carry's dismissal re-reads the screen and confirms a zero
+			// client count before each key (ga-ubfc7j).
+			scriptedTargetExecutor{captures: []string{resumeDialogPane, resumeDialogPane}, display: "0"},
 			func(tm *Tmux) { _, _ = tm.dismissMidSessionDialogs("worker-1") },
-			[]string{"capture-pane", "send-keys"},
+			[]string{"capture-pane", "display-message", "send-keys"},
 		},
 		{
 			"DismissModelSwitchModalIfPresent",
