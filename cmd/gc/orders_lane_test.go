@@ -371,6 +371,60 @@ func TestOrdersLanePassReturnsWhenCanceled(t *testing.T) {
 	}
 }
 
+// Kills: order dispatch against a controller store newer than this binary
+// (ga-mw4dg). A skew latched after startup holds the tick; the lane, which
+// upstream moved dispatch onto, skips its passes instead of holding, so it
+// stays stoppable. A skipped pass reaches neither the managed-Dolt preflight
+// nor the dispatcher, and once the diagnostic clears the lane dispatches again.
+func TestOrdersLanePassSkipsOnControllerStoreSchemaSkew(t *testing.T) {
+	od := &recordingOrderDispatcher{}
+	var stderr strings.Builder
+	cr := ordersLaneTestRuntime(t, od, "1h", &stderr)
+	var preflight atomic.Bool
+	cr.managedDoltOwned = func(string) (bool, error) {
+		preflight.Store(true)
+		return false, nil
+	}
+	// The controller state carries the runtime's memory store, so a pass that
+	// does dispatch reads it rather than opening a real one at cityPath.
+	cs := &controllerState{cityBeadStore: cr.standaloneCityStore}
+	cs.mu.Lock()
+	cs.cityBeadsDiagnostic = &beads.BeadsDiagnostic{
+		Store: beads.BeadsStoreNameBdStore, PreflightGate: "native_open",
+		PreflightReason: "schema version mismatch: database is at v55, binary knows up to v54 (1 migration ahead)",
+	}
+	cs.mu.Unlock()
+	cr.setControllerState(cs)
+
+	for i := 0; i < 2; i++ {
+		cr.runOrdersLanePass(context.Background(), cr.cityPath, ordersLaneReasonCadence)
+	}
+	if od.called.Load() {
+		t.Fatal("order dispatch ran under a schema-skewed controller store")
+	}
+	if preflight.Load() {
+		t.Fatal("managed-Dolt preflight ran under a schema-skewed controller store")
+	}
+	if _, _, ran := cr.ordersLaneOf().lastPass(); ran {
+		t.Fatal("a skipped pass reported reaching dispatch")
+	}
+	out := stderr.String()
+	if n := strings.Count(out, "skipping order dispatch"); n != 1 {
+		t.Fatalf("skew skip lines = %d, want 1 per episode; stderr = %q", n, out)
+	}
+	if strings.Contains(out, "CRITICAL") || cr.preserveSessionsShutdown.Load() {
+		t.Fatalf("the lane held instead of skipping; stderr = %q", out)
+	}
+
+	cs.mu.Lock()
+	cs.cityBeadsDiagnostic = nil
+	cs.mu.Unlock()
+	cr.runOrdersLanePass(context.Background(), cr.cityPath, ordersLaneReasonCadence)
+	if !od.called.Load() {
+		t.Fatal("order dispatch did not run once the controller store had no diagnostic")
+	}
+}
+
 // The tick trace reports the lane's last-pass age so a stuck lane is visible.
 // A lane that has never finished a pass reports no age at all, and a finished
 // pass latches its time and trigger.
