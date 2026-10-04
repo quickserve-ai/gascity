@@ -397,8 +397,9 @@ func TestCmdMailSendCrossCityNotifyRefused(t *testing.T) {
 	}
 }
 
-// --from carrying a foreign city segment is accepted verbatim: the sender's
-// identity can only be checked by its own city.
+// --from carrying a foreign city segment is accepted verbatim from a caller
+// with no session identity (the operator): the sender's identity can only be
+// checked by its own city.
 func TestCmdMailSendCrossCityForeignFromAccepted(t *testing.T) {
 	cityPath := writeCrossCityTestCity(t)
 
@@ -413,6 +414,50 @@ func TestCmdMailSendCrossCityForeignFromAccepted(t *testing.T) {
 	}
 	if msg.From != "westeros/mayor" {
 		t.Errorf("From = %q, want verbatim %q", msg.From, "westeros/mayor")
+	}
+}
+
+// A live session may claim only its own identity on gc mail send (upstream
+// #4857), and a foreign --from is not its own: it is refused like a local
+// one, before anything is written.
+func TestCmdMailSendCrossCityForeignFromRejectedForLiveSession(t *testing.T) {
+	cityPath := writeCrossCityTestCity(t)
+	t.Setenv("GC_SESSION_ID", "worker-session")
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	createMailIdentitySession(t, store, "qlandia/worker", "worker", "worker-session")
+
+	var stdout, stderr bytes.Buffer
+	code := cmdMailSend(nil, false, false, "westeros/mayor", "human", "relayed", "body", &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("cmdMailSend(--from westeros/mayor, caller=worker) = %d, want 1; stdout=%s", code, stdout.String())
+	}
+	if !strings.Contains(stderr.String(), `--from "westeros/mayor" does not match this session's own identity`) {
+		t.Errorf("stderr = %q, want the own-identity refusal naming the given sender", stderr.String())
+	}
+	if _, found := findMessageBead(t, cityPath); found {
+		t.Error("refusal must happen before the message is written")
+	}
+}
+
+// Reply and handoff --target (authorize=false, fork #205) keep accepting a
+// foreign --from verbatim, from a live session too.
+func TestResolveExplicitMailSenderForeignUnauthorizedKeepsReplyRule(t *testing.T) {
+	cityPath := writeCrossCityTestCity(t)
+	t.Setenv("GC_SESSION_ID", "worker-session")
+	store, err := openCityStoreAt(cityPath)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+	createMailIdentitySession(t, store, "qlandia/worker", "worker", "worker-session")
+	cfg := crossCityTestConfig()
+
+	var stderr bytes.Buffer
+	got, ok := resolveExplicitMailSender(mailCityRosterFor(cfg, cityPath), cityPath, cfg, cliSessionStore(store, cfg, cityPath), "westeros/mayor", nil, &stderr, "gc mail reply", false)
+	if !ok || got != "westeros/mayor" {
+		t.Fatalf("resolveExplicitMailSender(authorize=false) = (%q, %v), want (%q, true); stderr=%s", got, ok, "westeros/mayor", stderr.String())
 	}
 }
 
