@@ -3,7 +3,10 @@ package main
 // Frozen copies of the pool decision code that P3-1 refactored, taken from
 // main at c3d461c78e with comment lines removed and functions renamed. They
 // are the "before" side of the differential tests in pool_pieces_test.go and
-// go away with the legacy reconciler.
+// go away with the legacy reconciler. On the fork, computeAwakeSetPreRefactor
+// carries the carry's suspended-agent rules (ga-9qanni: pending-create,
+// reset-pending, wait-ready, on-demand:running) so the differential still
+// compares the refactor, not the carry.
 
 import (
 	"fmt"
@@ -48,6 +51,9 @@ func computeAwakeSetPreRefactor(input AwakeInput) map[string]AwakeDecision {
 
 	for _, bead := range input.SessionBeads {
 		if !bead.PendingCreate {
+			continue
+		}
+		if agent, ok := lookupAgent(bead.Template); ok && agent.Suspended {
 			continue
 		}
 		desired[bead.SessionName] = "pending-create"
@@ -240,6 +246,9 @@ func computeAwakeSetPreRefactor(input AwakeInput) map[string]AwakeDecision {
 		if !bead.ContinuationResetPending || bead.RestartRequested || bead.WaitHold || bead.Drained {
 			continue
 		}
+		if agent, ok := lookupAgent(bead.Template); ok && agent.Suspended {
+			continue
+		}
 		switch desired[bead.SessionName] {
 		case "pending-create", "explicit-wake":
 			continue
@@ -290,15 +299,19 @@ func computeAwakeSetPreRefactor(input AwakeInput) map[string]AwakeDecision {
 		}
 
 		if input.ReadyWaitSet[bead.ID] {
-			decision.ShouldWake = true
-			decision.Reason = "wait-ready"
+			if agent, ok := lookupAgent(bead.Template); !ok || !agent.Suspended {
+				decision.ShouldWake = true
+				decision.Reason = "wait-ready"
+			}
 		}
 
 		if !decision.ShouldWake && !bead.Drained && !bead.WaitHold &&
 			bead.SleepReason != string(session.SleepReasonIdleTimeout) {
 			if input.RunningSessions[name] && isOnDemandSession(input.NamedSessions, bead) {
-				decision.ShouldWake = true
-				decision.Reason = "on-demand:running"
+				if agent, ok := lookupAgent(bead.Template); !ok || !agent.Suspended {
+					decision.ShouldWake = true
+					decision.Reason = "on-demand:running"
+				}
 			}
 		}
 

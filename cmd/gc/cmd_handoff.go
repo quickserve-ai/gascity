@@ -235,7 +235,7 @@ func cmdHandoffRemoteFrom(args []string, target, from string, force bool, stdout
 	var sender string
 	var ok bool
 	if from = strings.TrimSpace(from); from != "" {
-		sender, ok = resolveExplicitMailSender(mailCityRosterFor(cfg, cityPath), cityPath, cfg, sessStore, from, nil, stderr, "gc handoff")
+		sender, ok = resolveExplicitMailSender(mailCityRosterFor(cfg, cityPath), cityPath, cfg, sessStore, from, nil, stderr, "gc handoff", false)
 	} else {
 		sender, ok = resolveDefaultMailSenderForCommand(cityPath, cfg, sessStore, stderr, "gc handoff")
 	}

@@ -4317,11 +4317,17 @@ op_init() {
     # A plain bd init runs migrations too, so it takes the shared init lock
     # like every other migration step (a no-op when the force path above
     # already holds it exclusively).
+    #
+    # A database THIS invocation created keeps the consented local reinit
+    # below (run_bd_init_pinned: BD_ALLOW_REMOTE_MIGRATE for the created
+    # database only, and the checkpoint retry after a dirty partial schema,
+    # ga-zyvj2k). The verified-empty plain init is for an empty database gc did
+    # not create, which may not be given that consent.
     if [ "$FLOCK_AVAILABLE" = true ]; then
         acquire_init_lock "$dolt_database" shared
     fi
     ensure_current_era_version_witness "$dir" "$dolt_database"
-    if [ "$bd_init_over_verified_empty" = true ]; then
+    if [ "$bd_init_over_verified_empty" = true ] && [ "$database_created_by_gc" != true ]; then
         run_bd_init_pinned_over_verified_empty "$dir" "$prefix" "$dolt_database" "$host"
     else
         # Automatic partial-schema recovery is safe only for a database this
