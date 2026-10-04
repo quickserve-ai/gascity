@@ -280,6 +280,11 @@ const (
 	// against the PR base commit's spec, which the lane writes with git show
 	// and hands to @openapi_base_spec. Reviewed delta: one job removed; no
 	// new job, trigger, step command or permission.
+	//
+	// Carry (pl-axh9, after upstream #6997): the runner-policy job's runs-on is
+	// Blacksmith on gastownhall/gascity and ubuntu-latest anywhere else, since
+	// the quickserve-ai fork has no Blacksmith runners. Reviewed delta: that
+	// one runs-on value, no new job, step, trigger or permission.
 	expectedCIExecutionHash     = "0b81b0eead4e815e218330ee63ccec936e8a14b7867b5e784ef0aadbd3cb006b"
 	expectedNightlyTriggersHash = "0a4400a09ac567e90adf8be1232eef1f14e36efd8dba3e143aa6e36f5b7a36f5"
 	// Nightly: reviewed delta Beads v1.3.0-rc.2 -> v1.3.0, then (round3 review,
