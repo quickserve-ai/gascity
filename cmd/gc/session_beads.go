@@ -790,10 +790,6 @@ func retireDuplicateConfiguredNamedSessionBeads(
 			if setMetaBatch(sessionFrontDoor(store), b.ID, batch, stderr) != nil {
 				continue
 			}
-			// S19 Stage 3 shadow: record the canonical-identity clears exactly as
-			// the duplicate repair above does, so a converge-shadow soak attributes
-			// this retirement instead of classifying it as a foreign write.
-			recordLegacyCompareWrites(b.ID, "retireDuplicateConfiguredNamedSessionBeads.shadow", batch)
 			if err := sessionFrontDoor(store).SetStatusOpen(b.ID); err != nil {
 				fmt.Fprintf(stderr, "session beads: archiving shadow of named session %s: %v\n", spec.Identity, err) //nolint:errcheck
 				continue
