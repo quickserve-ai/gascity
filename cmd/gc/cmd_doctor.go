@@ -437,7 +437,7 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 				// name. The lister is lazy (no store read unless a running session is
 				// not template-derived) and a failure makes Fix refuse.
 				register(doctor.NewOrphanSessionsCheck(cfg, cityName, st, sp).
-					WithManagedSessionNames(doctorManagedSessionNames(cityPath, cfg, openStoreForCity(cityPath))))
+					WithManagedSessionNames(doctorManagedSessionNames(cityPath, cfg, openStoreForCity(cityPath), storeGate)))
 			}
 		}
 	}
