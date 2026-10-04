@@ -108,7 +108,7 @@ const (
 	// Carry (ga-azybk8): the go-mod-warm composite step, one deterministic
 	// module warm per job ahead of every go command; the hashes below are
 	// recomputed from the carried workflows at each re-sync.
-	expectedCIExecutionHash     = "63317c9e54304db88ef66aa35a70b9b09a7e0a34c5002ecab567b51ccc8c3026"
+	expectedCIExecutionHash     = "e7201d01b4fe8a73fa1e551b6b4bf8c647949a71b7b87ed5c89e32174a15a504"
 	expectedNightlyTriggersHash = "0a4400a09ac567e90adf8be1232eef1f14e36efd8dba3e143aa6e36f5b7a36f5"
 	// Nightly: reviewed delta Beads v1.3.0-rc.2 -> v1.3.0, then (round3 review,
 	// completeness) one new job, beads-proxied-perf: ubuntu-latest,
@@ -122,8 +122,8 @@ const (
 	// TestFreshInit_ClaudeUnrestricted, mirroring RC Gate's acceptance C shards;
 	// same job, env, secrets and runner. Then the Beads v1.3.0 -> v1.3.1-rc.2
 	// -> v1.3.1 pins: the workflow and job BD_VERSION env values only.
-	expectedNightlyExecutionHash = "183db1faaa748f8bacd7d7de970ddc40ea87a65892bc37083ca40175cc4c2ea1"
-	expectedSetupActionHash      = "8f2d6b3a57f11d4f33a41211b1d3d5362d1437ba40c7b6db068abb98e731e5ac"
+	expectedNightlyExecutionHash = "6fa0f3ce26753a4ddc5655d1c19d6566f0f2d8f6292124c5ba600a5f3414a11e"
+	expectedSetupActionHash      = "12920621ee8af83820e2a89d8b3f216030c1e58559b2650a705e224df23ed3de"
 )
 
 var requiredFilterPaths = map[string][]string{

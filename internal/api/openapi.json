@@ -2744,6 +2744,9 @@
             "$ref": "#/components/schemas/SessionPoolSlotRetiredAtDrainDeadlinePayload"
           },
           {
+            "$ref": "#/components/schemas/SessionReleaseDeferredPayload"
+          },
+          {
             "$ref": "#/components/schemas/SessionResetStalledPayload"
           },
           {
@@ -6995,6 +6998,21 @@
         ],
         "type": "object"
       },
+      "RigDoctorPatch": {
+        "additionalProperties": false,
+        "properties": {
+          "CensusOwnerNamespace": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "CensusOwnerNamespace"
+        ],
+        "type": "object"
+      },
       "RigPatch": {
         "additionalProperties": false,
         "properties": {
@@ -7009,6 +7027,9 @@
               "string",
               "null"
             ]
+          },
+          "Doctor": {
+            "$ref": "#/components/schemas/RigDoctorPatch"
           },
           "FormulaVars": {
             "additionalProperties": {
@@ -14360,6 +14381,7 @@
                 "session.drain_stop_escalated",
                 "session.stranded",
                 "session.pool_slot_retired_at_drain_deadline",
+                "session.release_deferred",
                 "session.unknown_state",
                 "session.wake_refused",
                 "session.reset_stalled",
@@ -20970,6 +20992,7 @@
                 "session.drain_stop_escalated",
                 "session.stranded",
                 "session.pool_slot_retired_at_drain_deadline",
+                "session.release_deferred",
                 "session.unknown_state",
                 "session.wake_refused",
                 "session.reset_stalled",
