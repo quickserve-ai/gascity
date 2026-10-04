@@ -69,6 +69,9 @@ type ordersLane struct {
 	// lane's count, or the lane would never reach its own forced pass.
 	fsPressureSkips  int
 	fsPressureLogged bool
+	// schemaSkewLogged is set once a pass skipped on controller store schema
+	// skew has logged it (passMu), and cleared by a pass that finds no skew.
+	schemaSkewLogged bool
 
 	// Last pass that reached dispatch, for the tick trace (statusMu). A pass
 	// the FS gate skipped does not count, so a lane starved by pressure shows
@@ -156,9 +159,10 @@ func (cr *CityRuntime) startOrdersLane(ctx context.Context, cityRoot string) <-c
 	})
 }
 
-// runOrdersLanePass is one lane pass: the FS-pressure gate, then the
-// managed-Dolt preflight, then dispatch — the order the tick ran them in, so a
-// pressure-skipped or endpoint-repair pass writes no tracking first.
+// runOrdersLanePass is one lane pass: the schema-skew skip, the FS-pressure
+// gate, then the managed-Dolt preflight, then dispatch — the order the tick ran
+// them in, so a skew- or pressure-skipped or endpoint-repair pass writes no
+// tracking first.
 func (cr *CityRuntime) runOrdersLanePass(ctx context.Context, cityRoot, reason string) {
 	if ctx.Err() != nil {
 		return
@@ -180,6 +184,21 @@ func (cr *CityRuntime) runOrdersLanePass(ctx context.Context, cityRoot, reason s
 			trace.end(completion, traceRecordPayload{"phase": "orders", "reason": reason})
 		}
 	}()
+
+	// A controller store newer than this binary holds the tick fail-closed
+	// (tickSchemaSkewHold), ahead of its pressure gate. The lane skips the
+	// pass instead of holding, so it stays stoppable, and runs nothing against
+	// that store: no preflight, watchdog or dispatch (ga-mw4dg). It logs once
+	// per skew episode.
+	if diag := cr.controllerStoreSchemaSkewDiagnostic(); diag != nil {
+		if !lane.schemaSkewLogged && cr.stderr != nil {
+			fmt.Fprintf(cr.stderr, "%s: %s; skipping order dispatch until a schema-compatible gc binary is installed\n", cr.logPrefix, diag.PreflightReason) //nolint:errcheck // best-effort stderr
+		}
+		lane.schemaSkewLogged = true
+		completion = TraceCompletionCompleted
+		return
+	}
+	lane.schemaSkewLogged = false
 
 	if cr.ordersLaneShouldSkipForFSPressureLocked(lane, trace, reason) {
 		completion = TraceCompletionCompleted
