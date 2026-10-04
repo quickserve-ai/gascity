@@ -75,10 +75,24 @@ func worktreeReaperLaneState(cr *CityRuntime) (inflight bool, started, skipped u
 	return lane.inflight, lane.seq, lane.skippedTotal
 }
 
+// countingWispGC counts the tick's wisp_gc phase. It runs on every tick after
+// reap_closed_bead_worktrees, so a tick that reaches it got past the reap
+// trigger.
+type countingWispGC struct{ runs atomic.Int32 }
+
+func (g *countingWispGC) shouldRun(time.Time) bool { return true }
+
+func (g *countingWispGC) runGC(beads.GraphStore, beads.SessionStore, beads.MailStore, time.Time) (int, error) {
+	g.runs.Add(1)
+	return 0, nil
+}
+
 // TestWorktreeReaperLane_WedgedPassDoesNotHoldTheTick is the outage regression
 // (ga-yuiof4 item 3): a reaper pass wedged forever in a rig-store call must not
-// hold the controller tick, so the NEXT tick still dispatches orders, and the
-// wedged pass must not be joined by a second one.
+// hold the controller tick, so every tick still runs the phases after the reap
+// trigger (wisp GC; order dispatch, the original proof, moved off the tick onto
+// its own lane upstream), and the wedged pass must not be joined by a second
+// one.
 //
 // Against the pre-lane inline reap phase this fails at tick 1 — the tick
 // never returns, because the reap phase runs inline and blocks in store.Get.
@@ -96,8 +110,8 @@ func TestWorktreeReaperLane_WedgedPassDoesNotHoldTheTick(t *testing.T) {
 	// Unwedge and drain the pass before the temp dirs are removed.
 	t.Cleanup(func() { waitWorktreeReaperIdle(t, cr) })
 	t.Cleanup(release)
-	od := &recordingOrderDispatcher{}
-	cr.od = od
+	wg := &countingWispGC{}
+	cr.wg = wg
 
 	for i := 1; i <= 3; i++ {
 		done := make(chan struct{})
@@ -108,10 +122,10 @@ func TestWorktreeReaperLane_WedgedPassDoesNotHoldTheTick(t *testing.T) {
 		select {
 		case <-done:
 		case <-time.After(20 * time.Second):
-			t.Fatalf("tick %d did not return while a reaper pass is wedged in a store call: the reap phase is holding the tick (order dispatch ran %d time(s))", i, od.calls.Load())
+			t.Fatalf("tick %d did not return while a reaper pass is wedged in a store call: the reap phase is holding the tick (wisp GC ran %d time(s))", i, wg.runs.Load())
 		}
-		if got := od.calls.Load(); got != int32(i) {
-			t.Fatalf("after tick %d order dispatch ran %d time(s), want %d", i, got, i)
+		if got := wg.runs.Load(); got != int32(i) {
+			t.Fatalf("after tick %d wisp GC ran %d time(s), want %d", i, got, i)
 		}
 	}
 	waitForReaperCond(t, func() bool { return store.gets.Load() >= 1 }, "the first pass to reach the wedged store")
