@@ -14,6 +14,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/nudgequeue"
+	"github.com/gastownhall/gascity/internal/reconcilekey"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/worker"
@@ -608,7 +609,7 @@ func TestNudgeDeadLetterBounceSkipsManagedWakeRollback(t *testing.T) {
 	}
 	prevManaged, prevPoke, prevObserve := nudgeCityUsesManagedReconciler, nudgePokeController, nudgeObserveTarget
 	nudgeCityUsesManagedReconciler = func(cityPath string) bool { return cityPath == dir }
-	nudgePokeController = func(string) error { return nil }
+	nudgePokeController = func(string, reconcilekey.Key) error { return nil }
 	nudgeObserveTarget = func(nudgeTarget, beads.Store, runtime.Provider) (worker.LiveObservation, error) {
 		return worker.LiveObservation{Running: false}, nil
 	}

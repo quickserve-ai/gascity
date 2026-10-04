@@ -650,7 +650,7 @@ func TestPoolCreateForNamedBackedTemplateRefusesForeignCensusHolder(t *testing.T
 			} else {
 				sessionName = spec.SessionName
 			}
-			holder := seedGuardedPoolSessionHolder(t, foreign, "rig-leg identity holder", alias, sessionName)
+			holder := seedGuardedPoolSessionHolder(t, foreign, "rig-leg identity holder", "rig/manual", alias, sessionName)
 
 			_, qualifiedInstance, slot := poolDesiredRequestIdentity(&cfg.Agents[0], 1)
 			created, err := createPoolSessionBeadWithGuardedAlias(bp, &cfg.Agents[0], cfg.Agents[0].QualifiedName(), qualifiedInstance, slot, nil)
