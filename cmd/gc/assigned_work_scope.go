@@ -190,13 +190,14 @@ func filterAssignedWorkBeadsForPoolDemand(
 		return assignedWorkBeads
 	}
 	claimRefs := assignedWorkRelocatedClaimRefs(cityPath, cfg, leading)
-	return filterAssignedWorkBeadsForPoolDemandAt(cfg, cityPath, claimRefs, sessionInfos, assignedWorkBeads, assignedWorkStoreRefs, time.Now().UTC())
+	return filterAssignedWorkBeadsForPoolDemandAt(cfg, cityPath, claimRefs, sessionInfos, assignedWorkBeads, assignedWorkStoreRefs, time.Now().UTC(), wakeReady)
 }
 
 // filterAssignedWorkBeadsForPoolDemandAt is filterAssignedWorkBeadsForPoolDemand
 // with the claim refs (assignedWorkRelocatedClaimRefs) resolved and the clock
 // read by the caller, so it does no I/O: the v2 allocator calls it inside its
-// pure pass.
+// pure pass. wakeReady is as for filterAssignedWorkBeadsForPoolDemand; nil
+// keeps every row.
 func filterAssignedWorkBeadsForPoolDemandAt(
 	cfg *config.City,
 	cityPath string,
@@ -205,6 +206,7 @@ func filterAssignedWorkBeadsForPoolDemandAt(
 	assignedWorkBeads []beads.Bead,
 	assignedWorkStoreRefs []string,
 	now time.Time,
+	wakeReady *poolWakeReadiness,
 ) []beads.Bead {
 	if len(assignedWorkBeads) == 0 || len(assignedWorkStoreRefs) == 0 {
 		return assignedWorkBeads

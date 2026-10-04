@@ -5843,7 +5843,7 @@ func mintConfiguredNamedSessionBeadForPoolCreate(
 		// A holder in any other census leg is invisible to them, so re-read the
 		// full session topology under the same locks, as the pool mint does; an
 		// unreadable leg leaves absence unprovable, so fail before mutation.
-		availabilityInfos, availabilityErr := freshPoolAvailabilityInfos(bp)
+		availabilityInfos, availabilityErr := freshPoolAvailabilityInfos(poolCreateViewOf(bp))
 		if availabilityErr != nil {
 			return fmt.Errorf("checking locked availability of configured named session %q for pool template %q: %w", identity, template, availabilityErr)
 		}

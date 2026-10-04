@@ -1974,7 +1974,7 @@ func TestOrderTrackingSweepWatchdogSeesBeadsWrittenBehindTheCache(t *testing.T) 
 		stderr:              io.Discard,
 		logPrefix:           "gc test",
 	}
-	cr.runOrderTrackingSweepWatchdog(time.Now().Add(orderTrackingSweepWatchdogStaleAfter + time.Second))
+	cr.runOrderTrackingSweepWatchdog(cfg, time.Now().Add(orderTrackingSweepWatchdogStaleAfter+time.Second))
 
 	got, err := backing.Get(stale.ID)
 	if err != nil {
@@ -4855,9 +4855,9 @@ func TestCityRuntimeTickSchemaSkewHoldsBeforePoolDeathHook(t *testing.T) {
 	t.Cleanup(func() { controllerStatePreflightCityStore = previousPreflight })
 
 	hookOutput := filepath.Join(cityPath, "on-death-ran")
-	cr.poolDeathHandlers = map[string]poolDeathInfo{
+	cr.publishPoolDeathHandlers(map[string]poolDeathInfo{
 		"dead-agent": {Command: fmt.Sprintf("touch %q", hookOutput), Dir: cityPath},
-	}
+	})
 	previousRunning := map[string]bool{"dead-agent": true}
 	writeCityRuntimeConfig(t, tomlPath, "fail")
 	var dirty atomic.Bool
@@ -4928,9 +4928,9 @@ func TestCityRuntimeTickJudgesPoolDeathByPreReloadHandlers(t *testing.T) {
 			cs.cityBeadStore = beads.NewMemStore()
 			cr.setControllerState(cs)
 
-			cr.poolDeathHandlers = computePoolDeathHandlers(cfg, "test-city", cityPath, sp, io.Discard)
-			if _, ok := cr.poolDeathHandlers[deadSession]; !ok {
-				t.Fatalf("pre-reload handlers %v have no entry for %s", cr.poolDeathHandlers, deadSession)
+			cr.publishPoolDeathHandlers(computePoolDeathHandlers(cfg, "test-city", cityPath, sp, io.Discard))
+			if _, ok := cr.publishedPoolDeathHandlers()[deadSession]; !ok {
+				t.Fatalf("pre-reload handlers %v have no entry for %s", cr.publishedPoolDeathHandlers(), deadSession)
 			}
 			previousRunning := map[string]bool{deadSession: true}
 			if err := sp.Stop(deadSession); err != nil {
@@ -4948,8 +4948,8 @@ func TestCityRuntimeTickJudgesPoolDeathByPreReloadHandlers(t *testing.T) {
 
 			cr.tick(context.Background(), &dirty, &lastProviderName, cityPath, &previousRunning, "pool-death-reload-test")
 
-			if _, ok := cr.poolDeathHandlers[deadSession]; ok {
-				t.Fatalf("reload kept a handler for %s, so this fixture no longer drops it: %v", deadSession, cr.poolDeathHandlers)
+			if _, ok := cr.publishedPoolDeathHandlers()[deadSession]; ok {
+				t.Fatalf("reload kept a handler for %s, so this fixture no longer drops it: %v", deadSession, cr.publishedPoolDeathHandlers())
 			}
 			data, err := os.ReadFile(hookOutput)
 			if err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -5014,9 +5014,9 @@ func TestCityRuntimeTickJudgesPoolLivenessByPreReloadProvider(t *testing.T) {
 	cs.cityBeadStore = beads.NewMemStore()
 	cr.setControllerState(cs)
 
-	cr.poolDeathHandlers = computePoolDeathHandlers(cfg, "test-city", cityPath, sp, io.Discard)
-	if _, ok := cr.poolDeathHandlers[liveSession]; !ok {
-		t.Fatalf("pre-reload handlers %v have no entry for %s", cr.poolDeathHandlers, liveSession)
+	cr.publishPoolDeathHandlers(computePoolDeathHandlers(cfg, "test-city", cityPath, sp, io.Discard))
+	if _, ok := cr.publishedPoolDeathHandlers()[liveSession]; !ok {
+		t.Fatalf("pre-reload handlers %v have no entry for %s", cr.publishedPoolDeathHandlers(), liveSession)
 	}
 	previousRunning := map[string]bool{liveSession: true}
 

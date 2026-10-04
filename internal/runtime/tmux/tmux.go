@@ -2516,7 +2516,7 @@ func (t *Tmux) paneBracketsPaste(target string, confirmByAgent bool) bool {
 // renders the unknown format as "", which therefore means "cannot tell", not
 // "off".
 func (t *Tmux) paneBracketPasteFlag(target string) (string, error) {
-	flag, err := t.run("display-message", "-t", target, "-p", "#{bracket_paste_flag}")
+	flag, err := t.run("display-message", "-t", paneTarget(target), "-p", "#{bracket_paste_flag}")
 	return strings.TrimSpace(flag), err
 }
 
