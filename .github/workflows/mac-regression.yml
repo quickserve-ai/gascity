@@ -89,7 +89,9 @@ env:
 jobs:
   runner-policy:
     name: Runner policy
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    # GitHub-hosted on the quickserve-ai fork, which has no Blacksmith
+    # runners (pl-axh9); unchanged upstream.
+    runs-on: ${{ github.repository == 'gastownhall/gascity' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     outputs:
       use_blacksmith: ${{ steps.policy.outputs.use_blacksmith }}
       reason: ${{ steps.policy.outputs.reason }}
