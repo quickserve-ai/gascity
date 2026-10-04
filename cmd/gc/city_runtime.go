@@ -1573,18 +1573,28 @@ func (cr *CityRuntime) tickSchemaSkewHold(p *tickPass) bool {
 	return cr.holdForControllerStoreSchemaSkew(p.ctx)
 }
 
-// tickReconcilePoolDeaths detects pool instance deaths since last tick. Two
-// contracts meet here. Deaths are judged by the state they happened under: the
-// check acts on the handler set and session listing tickObservePoolLiveness
-// observed before this tick's reload, so a reload that removes a pool, or
-// rediscovers an unlimited pool without its dead instance, still runs that
-// instance's on_death hook, a changed hook applies only to later deaths, and a
-// reload that swaps the session provider (stopping the old provider's
-// sessions) does not make a session that was running look dead. The hooks
-// still run only after the schema-skew hold, so a controller store the reload
-// found newer than this binary runs no on_death hook (ga-mw4dg). While the
-// inventory lane runs it owns on_death, off the tick
-// (runtime_inventory_ondeath.go).
+// tickReconcilePoolDeaths detects pool instance deaths since last tick, on the
+// lane-less path only: while the inventory lane runs it owns on_death, off the
+// tick (runtime_inventory_ondeath.go), and this phase does nothing.
+//
+// On the lane-less path two contracts meet here. Deaths are judged by the
+// state they happened under: the check acts on the handler set and session
+// listing tickObservePoolLiveness observed before this tick's reload, so a
+// reload that removes a pool, or rediscovers an unlimited pool without its
+// dead instance, still runs that instance's on_death hook, a changed hook
+// applies only to later deaths, and a reload that swaps the session provider
+// (stopping the old provider's sessions) does not make a session that was
+// running look dead. The hooks still run only after the schema-skew hold, so a
+// controller store the reload found newer than this binary runs no on_death
+// hook (ga-mw4dg).
+//
+// That provider-swap rule is the carry's and holds only on the lane-less
+// path. On the lane path upstream's rule governs: the swap removes the old
+// provider's backend from the lane's passes, and the first pass in which every
+// backend listed completely concludes that backend's names absent
+// (InventoryPass.concludesAbsent). detectPoolDeathEdges raises their edges,
+// and executeDeathEdge re-checks each name against the current, swapped-in
+// provider and runs its on_death hook when an error-free listing omits it.
 func (cr *CityRuntime) tickReconcilePoolDeaths(p *tickPass) bool {
 	if cr.inventoryLane == nil {
 		cr.actOnPoolDeaths(p.poolLiveness, p.prevPoolRunning)
