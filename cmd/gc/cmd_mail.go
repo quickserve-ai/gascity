@@ -1239,11 +1239,17 @@ func mailSendUsageError(args []string, all bool, to, subject, message string, st
 // form, which stays identity-checked here — the local city is the one place
 // identity can and must be checked. Shared by send, reply and handoff so they
 // resolve the same --from values. authorize applies upstream #4857's
-// own-identity check (gc mail send); reply and handoff --target keep the
-// carry's rule (fork #205), under which a seat may name "human".
+// own-identity check (gc mail send) to local and foreign senders alike, so a
+// live session cannot send as a peer city's address; reply and handoff
+// --target keep the carry's rule (fork #205), under which a seat may name
+// "human".
 func resolveExplicitMailSender(roster mail.CityRoster, cityPath string, cfg *config.City, sessStore beads.Store, sender string, cache *mailIdentitySessionCache, stderr io.Writer, cmdName string, authorize bool) (string, bool) {
 	kind, addr := roster.ResolveCityAddress(sender)
 	if kind == mail.CityAddressForeign {
+		if authorize && !mailSenderAuthorizedCached(cityPath, cfg, sessStore, addr, cache) {
+			fmt.Fprintf(stderr, "%s: --from %q does not match this session's own identity\n", cmdName, sender) //nolint:errcheck // best-effort stderr
+			return "", false
+		}
 		return addr, true
 	}
 	if kind == mail.CityAddressLocal {
