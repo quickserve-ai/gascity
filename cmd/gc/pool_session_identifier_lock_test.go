@@ -125,12 +125,9 @@ func (s *toggleListFailStore) List(query beads.ListQuery) ([]beads.Bead, error) 
 func seedGuardedPoolSessionHolder(
 	t *testing.T,
 	store beads.Store,
-	title, alias, sessionName string,
+	title, agentName, alias, sessionName string,
 ) sessionpkg.Info {
 	t.Helper()
-	// Every holder these guards race is a manual rig session, so the agent is
-	// fixed here rather than an argument each caller passes identically.
-	const agentName = "rig/manual"
 	bead, err := store.Create(beads.Bead{
 		Title:  title,
 		Status: "open",
@@ -457,7 +454,7 @@ func TestCreatePoolSessionBeadWithGuardedAlias_ForeignAliasCollisionDefersAlias(
 			NamepoolNames:     []string{"furiosa", "nux"},
 		}},
 	}
-	holder := seedGuardedPoolSessionHolder(t, foreign, "foreign alias holder", "rig/furiosa", "manual-furiosa")
+	holder := seedGuardedPoolSessionHolder(t, foreign, "foreign alias holder", "rig/manual", "rig/furiosa", "manual-furiosa")
 	bp := newAgentBuildParams("test-city", cityPath, cfg, runtime.NewFake(), time.Now().UTC(), primary, io.Discard)
 	primeGuardedPoolCrossStoreCensus(t, bp, map[string]beads.Store{"rig": foreign})
 
@@ -519,7 +516,7 @@ func TestCreatePoolSessionBeadWithGuardedAlias_LateForeignExactNameHolderBlocksC
 		if !containsString(identifiers, expectedRuntimeName) {
 			t.Fatalf("identifier locks = %v, want exact runtime name %q", identifiers, expectedRuntimeName)
 		}
-		seedGuardedPoolSessionHolder(t, foreign, "late exact-name holder", "", expectedRuntimeName)
+		seedGuardedPoolSessionHolder(t, foreign, "late exact-name holder", "rig/manual", "", expectedRuntimeName)
 		return fn()
 	}
 	created, err := createPoolSessionBeadWithGuardedAliasUsingLock(
@@ -582,7 +579,7 @@ func TestCreatePoolSessionBeadWithGuardedAlias_LiveRecensusBypassesStaleForeignC
 
 	_, qualifiedInstance, slot := poolDesiredRequestIdentity(&cfg.Agents[0], 1)
 	expectedRuntimeName := poolRuntimeSessionName(cfg, qualifiedInstance, cfg.Agents[0].QualifiedName(), true)
-	holder := seedGuardedPoolSessionHolder(t, foreignBacking, "external exact-name holder", "", expectedRuntimeName)
+	holder := seedGuardedPoolSessionHolder(t, foreignBacking, "external exact-name holder", "rig/manual", "", expectedRuntimeName)
 
 	// The ordinary controller census deliberately stays cache-served. It misses
 	// the external write until reconciliation, reproducing the production race
