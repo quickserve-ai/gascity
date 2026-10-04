@@ -93,7 +93,7 @@ func TestDoctorManagedSessionNamesCollectsOpenSessionBeadsOnly(t *testing.T) {
 			t.Errorf("opened store at %q, want city path %q", path, cityPath)
 		}
 		return store, nil
-	})
+	}, newDoctorStoreGate(false))
 	if opens != 0 {
 		t.Fatalf("store opened %d times before the lister was called, want 0 (lazy)", opens)
 	}
@@ -123,7 +123,7 @@ func TestDoctorManagedSessionNamesCollectsOpenSessionBeadsOnly(t *testing.T) {
 func TestDoctorManagedSessionNamesOpenErrorIsReturned(t *testing.T) {
 	lister := doctorManagedSessionNames(t.TempDir(), &config.City{}, func(string) (beads.Store, error) {
 		return nil, errors.New("dolt unreachable")
-	})
+	}, newDoctorStoreGate(false))
 	names, err := lister()
 	if err == nil {
 		t.Fatalf("lister() error = nil, names = %v; want the open error", names)
@@ -156,7 +156,7 @@ func TestDoctorOrphanSessionsFixSparesSessionBeadClaimedSeats(t *testing.T) {
 	check := doctor.NewOrphanSessionsCheck(cfg, "test", "", sp).
 		WithManagedSessionNames(doctorManagedSessionNames(cityPath, cfg, func(string) (beads.Store, error) {
 			return store, nil
-		}))
+		}, newDoctorStoreGate(false)))
 
 	if r := check.Run(&doctor.CheckContext{CityPath: cityPath}); r.Status != doctor.StatusWarning || len(r.Details) != 2 {
 		t.Fatalf("Run() = status %d details %v (%s), want a warning naming exactly platform--gastown__nux and stray", r.Status, r.Details, r.Message)
@@ -191,7 +191,7 @@ func orphanFixAgainst(t *testing.T, cityPath string, cfg *config.City, store bea
 	check := doctor.NewOrphanSessionsCheck(cfg, "test", "", sp).
 		WithManagedSessionNames(doctorManagedSessionNames(cityPath, cfg, func(string) (beads.Store, error) {
 			return store, nil
-		}))
+		}, newDoctorStoreGate(false)))
 	return sp, check.Fix(&doctor.CheckContext{CityPath: cityPath})
 }
 
@@ -222,7 +222,7 @@ func TestDoctorManagedSessionNamesRefusesUnroutedSessionsRelocation(t *testing.T
 
 	names, err := doctorManagedSessionNames(cityPath, cfg, func(string) (beads.Store, error) {
 		return store, nil
-	})()
+	}, newDoctorStoreGate(false))()
 	if err == nil {
 		t.Fatalf("lister() error = nil, names = %v; want a refusal to read the work store for a relocated sessions class", names)
 	}
@@ -349,7 +349,7 @@ func TestDoctorOrphanSessionsFixSparesRigStoreOnlySession(t *testing.T) {
 		check := doctor.NewOrphanSessionsCheck(cfg, "test", "", sp).
 			WithManagedSessionNames(doctorManagedSessionNames(cityPath, cfg, func(string) (beads.Store, error) {
 				return cityStore, nil
-			}))
+			}, newDoctorStoreGate(false)))
 		if err := check.Fix(&doctor.CheckContext{CityPath: cityPath}); err != nil {
 			t.Fatalf("suspended=%v: Fix() error = %v", suspended, err)
 		}
@@ -431,5 +431,67 @@ func TestDoctorOrphanSessionsFixRefusesOnFailingRigLeg(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestDoctorGatedRigStoreOpenerNeverOpensAStoppedRig: doctor never starts a
+// server (#6817), so the census's rig opener answers errDoctorStoreNotRunning
+// for a rig whose bd-owned proxied store is stopped without calling the
+// underlying opener, which would start its proxy and Dolt. A running rig is
+// still opened.
+func TestDoctorGatedRigStoreOpenerNeverOpensAStoppedRig(t *testing.T) {
+	stubDoctorStoreLiveness(t, "dark")
+	cityPath := t.TempDir()
+	lit := beads.NewMemStore()
+	var opened []string
+	open := doctorGatedRigStoreOpener(newDoctorStoreGate(false), func(rigPath, _ string) (beads.Store, error) {
+		opened = append(opened, rigPath)
+		return lit, nil
+	})
+
+	if store, err := open(filepath.Join(cityPath, "dark"), cityPath); !errors.Is(err, errDoctorStoreNotRunning) || store != nil {
+		t.Fatalf("open(dark) = (%v, %v), want (nil, errDoctorStoreNotRunning)", store, err)
+	}
+	if len(opened) != 0 {
+		t.Fatalf("underlying opener called for %v, want never for a stopped rig", opened)
+	}
+	litPath := filepath.Join(cityPath, "lit")
+	if store, err := open(litPath, cityPath); err != nil || store != lit {
+		t.Fatalf("open(lit) = (%v, %v), want the opened store", store, err)
+	}
+	if len(opened) != 1 || opened[0] != litPath {
+		t.Fatalf("underlying opener called for %v, want once for %q", opened, litPath)
+	}
+}
+
+// TestDoctorOrphanSessionsFixRefusesOnStoppedRigStore: a rig whose proxied
+// store is stopped is a census leg the lister cannot read, so it errors
+// naming the rig, and Fix stops nothing, as for any dark rig.
+func TestDoctorOrphanSessionsFixRefusesOnStoppedRigStore(t *testing.T) {
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_DOLT", "skip")
+	stubDoctorStoreLiveness(t, "dark")
+	cityStore, _ := managedNamesTestStore(t)
+	cityPath := t.TempDir()
+	cfg := &config.City{
+		Agents: []config.Agent{{Name: "mayor"}},
+		Rigs:   []config.Rig{{Name: "dark", Path: filepath.Join(cityPath, "dark")}},
+	}
+
+	names, err := doctorManagedSessionNames(cityPath, cfg, func(string) (beads.Store, error) {
+		return cityStore, nil
+	}, newDoctorStoreGate(false))()
+	if !errors.Is(err, errDoctorStoreNotRunning) || !strings.Contains(err.Error(), `rig "dark"`) {
+		t.Fatalf("lister() = (%v, %v), want errDoctorStoreNotRunning naming rig \"dark\"", names, err)
+	}
+
+	sp, fixErr := orphanFixAgainst(t, cityPath, cfg, cityStore)
+	if fixErr == nil || !strings.Contains(fixErr.Error(), "refusing to stop") {
+		t.Fatalf("Fix() error = %v, want a refusal", fixErr)
+	}
+	for _, name := range []string{"mayor", "qcore--archer", "stray"} {
+		if !sp.IsRunning(name) {
+			t.Errorf("session %q was stopped by a Fix that should have refused", name)
+		}
 	}
 }
