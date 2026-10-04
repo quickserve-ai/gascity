@@ -96,7 +96,7 @@ func TestDismissMidSessionDialogBeforeNudge_UsesVisibleOnlyCapture(t *testing.T)
 	if dismissed := dismissKeyed(tm); !dismissed {
 		t.Fatal("dismissed = false, want true for a live resume dialog")
 	}
-	if len(fe.calls) < 2 || !slices.Equal(fe.calls[1], []string{"-u", "capture-pane", "-p", "-t", "agent-pane"}) {
+	if len(fe.calls) < 2 || !slices.Equal(fe.calls[1], []string{"-u", "capture-pane", "-p", "-t", "=agent-pane:"}) {
 		t.Fatalf("re-read call = %v, want a visible-only capture-pane before the key", fe.calls)
 	}
 	if len(fe.calls) == 0 {

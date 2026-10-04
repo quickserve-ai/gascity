@@ -3646,7 +3646,7 @@ func TestRespawnAgentMarksClaudeAccountRemovedFromSessionEnv(t *testing.T) {
 			}
 			if tc.wantCalls == 2 {
 				setEnv := strings.Join(fake.calls[0], " ")
-				if !strings.Contains(setEnv, "set-environment -t gc-test-account-pin -r CLAUDE_CONFIG_DIR") {
+				if !strings.Contains(setEnv, "set-environment -t =gc-test-account-pin -r CLAUDE_CONFIG_DIR") {
 					t.Errorf("first call = %q, want CLAUDE_CONFIG_DIR marked removed from the session env", setEnv)
 				}
 			}
