@@ -288,8 +288,10 @@ func TestNudgeSessionAttachProbeErrorKeepsInput(t *testing.T) {
 			enters++
 		}
 	}
-	// Only the confirm window's submits; staged-draft recovery adds more.
-	if enters != submitEnterMaxSends {
-		t.Fatalf("submit Enter sends = %d, want %d (no staged-draft resubmit)", enters, submitEnterMaxSends)
+	// Only the first submit: the carry's per-key submit guard (ga-ubfc7j,
+	// ga-da5vmz) re-checks before every later Enter and withholds it while the
+	// client count cannot be read as zero, and staged-draft recovery adds none.
+	if enters != 1 {
+		t.Fatalf("submit Enter sends = %d, want 1 (no confirm-window or staged-draft resubmit)", enters)
 	}
 }

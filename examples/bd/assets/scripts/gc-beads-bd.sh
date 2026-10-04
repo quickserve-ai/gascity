@@ -3805,7 +3805,13 @@ op_init() {
     # visible issue prefix, while `--database` tells bd which existing Dolt
     # database to initialize. Without `--database`, bd can seed beads_<prefix>
     # and leave the pinned database schema-less.
-    if [ "$bd_init_over_verified_empty" = true ]; then
+    #
+    # A database THIS invocation created keeps the consented local reinit
+    # below (run_bd_init_pinned: BD_ALLOW_REMOTE_MIGRATE for the created
+    # database only, and the checkpoint retry after a dirty partial schema,
+    # ga-zyvj2k). The verified-empty plain init is for an empty database gc did
+    # not create, which may not be given that consent.
+    if [ "$bd_init_over_verified_empty" = true ] && [ "$database_created_by_gc" != true ]; then
         run_bd_init_pinned_over_verified_empty "$dir" "$prefix" "$dolt_database" "$host"
     else
         # Automatic partial-schema recovery is safe only for a database this

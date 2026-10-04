@@ -1236,10 +1236,12 @@ func mailSendUsageError(args []string, all bool, to, subject, message string, st
 // resolveExplicitMailSender checks an explicit --from against this city. A
 // --from carrying a peer city's segment is accepted verbatim: only its own
 // city can check that identity. A local-city qualifier strips to the bare
-// form, which stays identity-checked and authorized here — the local city is the one place
-// identity can and must be checked. Shared by send and reply so the two
-// accept the same --from values.
-func resolveExplicitMailSender(roster mail.CityRoster, cityPath string, cfg *config.City, sessStore beads.Store, sender string, cache *mailIdentitySessionCache, stderr io.Writer, cmdName string) (string, bool) {
+// form, which stays identity-checked here — the local city is the one place
+// identity can and must be checked. Shared by send, reply and handoff so they
+// resolve the same --from values. authorize applies upstream #4857's
+// own-identity check (gc mail send); reply and handoff --target keep the
+// carry's rule (fork #205), under which a seat may name "human".
+func resolveExplicitMailSender(roster mail.CityRoster, cityPath string, cfg *config.City, sessStore beads.Store, sender string, cache *mailIdentitySessionCache, stderr io.Writer, cmdName string, authorize bool) (string, bool) {
 	kind, addr := roster.ResolveCityAddress(sender)
 	if kind == mail.CityAddressForeign {
 		return addr, true
@@ -1247,13 +1249,19 @@ func resolveExplicitMailSender(roster mail.CityRoster, cityPath string, cfg *con
 	if kind == mail.CityAddressLocal {
 		sender = addr
 	}
+	if !authorize && sender == "human" {
+		return sender, true
+	}
 	resolved, err := resolveMailIdentityWithConfigCached(cityPath, cfg, sessStore, sender, cache)
 	if err != nil {
 		fmt.Fprintf(stderr, "%s: invalid sender %q: %v\n", cmdName, sender, err) //nolint:errcheck // best-effort stderr
 		return "", false
 	}
-	// A session may claim only its own identity, "human" included (#4070,
-	// upstream #4857); see mailSenderAuthorizedCached.
+	if !authorize {
+		return resolved, true
+	}
+	// gc mail send: a session may claim only its own identity, "human"
+	// included (#4070, upstream #4857); see mailSenderAuthorizedCached.
 	if !mailSenderAuthorizedCached(cityPath, cfg, sessStore, resolved, cache) {
 		fmt.Fprintf(stderr, "%s: --from %q does not match this session's own identity\n", cmdName, sender) //nolint:errcheck // best-effort stderr
 		return "", false
@@ -2459,7 +2467,7 @@ func cmdMailSendJSONFull(args []string, notify bool, all bool, from string, to s
 		runMetadata = orderMailRunMetadata(sender)
 	} else if store != nil {
 		var ok bool
-		if sender, ok = resolveExplicitMailSender(roster, cityPath, cfg, sessStore, sender, idCache, stderr, "gc mail send"); !ok {
+		if sender, ok = resolveExplicitMailSender(roster, cityPath, cfg, sessStore, sender, idCache, stderr, "gc mail send", true); !ok {
 			return 1
 		}
 	}
@@ -3250,7 +3258,7 @@ func cmdMailReplyFromJSON(args []string, from, subject, message string, notify b
 		}
 		if sender != "human" && store != nil {
 			if explicitFrom {
-				resolved, ok := resolveExplicitMailSender(mailCityRosterFor(cfg, cityPath), cityPath, cfg, cliSessionStore(store, cfg, cityPath), sender, nil, stderr, "gc mail reply")
+				resolved, ok := resolveExplicitMailSender(mailCityRosterFor(cfg, cityPath), cityPath, cfg, cliSessionStore(store, cfg, cityPath), sender, nil, stderr, "gc mail reply", false)
 				if !ok {
 					return 1
 				}
