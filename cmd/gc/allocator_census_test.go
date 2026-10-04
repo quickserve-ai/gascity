@@ -440,7 +440,8 @@ func TestCensusKeysRowsThatShareANameByBeadID(t *testing.T) {
 // within its lease only.
 func TestCensusLedgerFactsStartLeaseNeedsClaimOrCreating(t *testing.T) {
 	woke := censusNow.Add(-10 * time.Second).Format(time.RFC3339)
-	oldWoke := censusNow.Add(-5 * time.Minute).Format(time.RFC3339)
+	// Past the lease whatever the default startup timeout.
+	oldWoke := censusNow.Add(-5*time.Minute - new(config.SessionConfig).StartupTimeoutDuration()).Format(time.RFC3339)
 	cases := []struct {
 		name                 string
 		meta                 map[string]string
