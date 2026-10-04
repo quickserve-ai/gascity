@@ -325,6 +325,11 @@ func (cr *CityRuntime) dispatchOrdersLocked(ctx context.Context, cityRoot string
 	if effectiveCitySuspended(cfg, loadSuspensionStateBestEffort(cr.cityPath)) {
 		return
 	}
+	// The boot pass needs this skip (ga-mw4dg): the startup config reload can
+	// latch store schema skew after run()'s hold, and the boot dispatch follows.
+	if cr.controllerStoreSchemaSkewDiagnostic() != nil {
+		return
+	}
 	now := time.Now()
 	if !cr.wispIndexMigrationApplied {
 		cr.wispIndexMigrationApplied = true
