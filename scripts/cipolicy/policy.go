@@ -108,7 +108,12 @@ const (
 	// Carry (ga-azybk8): the go-mod-warm composite step, one deterministic
 	// module warm per job ahead of every go command; the hashes below are
 	// recomputed from the carried workflows at each re-sync.
-	expectedCIExecutionHash     = "e7201d01b4fe8a73fa1e551b6b4bf8c647949a71b7b87ed5c89e32174a15a504"
+	//
+	// Carry (pl-axh9, after upstream #6997): the runner-policy job's runs-on is
+	// Blacksmith on gastownhall/gascity and ubuntu-latest anywhere else, since
+	// the quickserve-ai fork has no Blacksmith runners. Reviewed delta: that
+	// one runs-on value, no new job, step, trigger or permission.
+	expectedCIExecutionHash     = "b3698f3f860d289f77724d495768b2005fd6a30774e4def0ca0ad12975c80e14"
 	expectedNightlyTriggersHash = "0a4400a09ac567e90adf8be1232eef1f14e36efd8dba3e143aa6e36f5b7a36f5"
 	// Nightly: reviewed delta Beads v1.3.0-rc.2 -> v1.3.0, then (round3 review,
 	// completeness) one new job, beads-proxied-perf: ubuntu-latest,
