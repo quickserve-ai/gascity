@@ -25,6 +25,7 @@ import (
 // the session-start fence armed the way run() arms it.
 func newRound4ReloadRuntime(t *testing.T, sp runtime.Provider) (*CityRuntime, *controllerState, string, string) {
 	t.Helper()
+	t.Setenv("GC_HOME", t.TempDir()) // a reload reaches supervisor.DefaultHome, which refuses the host home under test
 	cityPath := t.TempDir()
 	tomlPath := filepath.Join(cityPath, "city.toml")
 	writeCityRuntimeConfig(t, tomlPath, "fake")
