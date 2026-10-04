@@ -425,6 +425,36 @@ func TestOrdersLanePassSkipsOnControllerStoreSchemaSkew(t *testing.T) {
 	}
 }
 
+// Kills: the boot order dispatch against a controller store newer than this
+// binary (ga-mw4dg). run()'s hold precedes the startup config reload, whose
+// store preflight can latch the skew; the synchronous boot dispatch runs after
+// that reload and must dispatch nothing. Without skew it dispatches.
+func TestOrdersBootDispatchSkipsOnControllerStoreSchemaSkew(t *testing.T) {
+	od := &recordingOrderDispatcher{}
+	cr := ordersLaneTestRuntime(t, od, "1h", nil)
+	cs := &controllerState{cityBeadStore: cr.standaloneCityStore}
+	cs.mu.Lock()
+	cs.cityBeadsDiagnostic = &beads.BeadsDiagnostic{
+		Store: beads.BeadsStoreNameBdStore, PreflightGate: "native_open",
+		PreflightReason: "schema version mismatch: database is at v55, binary knows up to v54 (1 migration ahead)",
+	}
+	cs.mu.Unlock()
+	cr.setControllerState(cs)
+
+	cr.dispatchOrders(context.Background(), cr.cityPath, true)
+	if od.called.Load() {
+		t.Fatal("boot order dispatch ran under a schema-skewed controller store")
+	}
+
+	cs.mu.Lock()
+	cs.cityBeadsDiagnostic = nil
+	cs.mu.Unlock()
+	cr.dispatchOrders(context.Background(), cr.cityPath, true)
+	if !od.called.Load() {
+		t.Fatal("boot order dispatch did not run once the controller store had no diagnostic")
+	}
+}
+
 // The tick trace reports the lane's last-pass age so a stuck lane is visible.
 // A lane that has never finished a pass reports no age at all, and a finished
 // pass latches its time and trigger.
