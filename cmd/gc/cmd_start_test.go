@@ -498,8 +498,10 @@ func TestBuildIdleTracker_AliasAlwaysNamedPoolExemptsAliasOnly(t *testing.T) {
 // shape of a named session that declares its own name over a single-session
 // agent (name = "brett", template = "cherub-law.brett"). The reconciler checks
 // the session under its own runtime name, so the timeout must be stored
-// there. The agent-derived name keeps its timeout too: template-routed work
-// can run an ordinary session under it while the aliased session is cold.
+// there. The agent-derived name keeps the registration it always had, for a
+// session that runs under an explicit runtime alias equal to the agent's
+// name. A bead-named ordinary session of a single-session template is not
+// covered by this test or by the code.
 func TestBuildIdleTracker_AliasOnDemandSingleSessionRegistersSessionName(t *testing.T) {
 	cfg := &config.City{
 		Workspace: config.Workspace{},
@@ -544,14 +546,14 @@ func TestBuildIdleTracker_AliasOnDemandSingleSessionRegistersSessionName(t *test
 	startFakeSession(t, sp, agentDerived)
 	sp.SetActivity(agentDerived, now.Add(-30*time.Minute))
 	if !idle.checkIdle(agentDerived, template, "", "", sp, now) {
-		t.Fatalf("ordinary session %q under the agent's own name lost its idle timeout", agentDerived)
+		t.Fatalf("session %q under the agent-derived name lost its idle timeout", agentDerived)
 	}
 }
 
 // TestBuildIdleTracker_AliasAlwaysSingleSessionIsExempt pins the other half:
 // the same aliased single-session shape with mode "always" never idles out
-// under its own name, while an ordinary session under the agent's own name
-// keeps the agent's timeout.
+// under its own name, while a session running under the agent-derived name
+// keeps the registration it always had.
 func TestBuildIdleTracker_AliasAlwaysSingleSessionIsExempt(t *testing.T) {
 	cfg := &config.City{
 		Workspace: config.Workspace{},
@@ -594,7 +596,7 @@ func TestBuildIdleTracker_AliasAlwaysSingleSessionIsExempt(t *testing.T) {
 		t.Fatalf("always-mode session %q idled out", namedSession)
 	}
 	if !idle.checkIdle(agentDerived, template, "", "", sp, now) {
-		t.Fatalf("ordinary session %q under the agent's own name lost its idle timeout", agentDerived)
+		t.Fatalf("session %q under the agent-derived name lost its idle timeout", agentDerived)
 	}
 }
 
