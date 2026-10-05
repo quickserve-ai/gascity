@@ -85,15 +85,19 @@ func TestACPOrphanReapedAfterProviderRestart(t *testing.T) {
 	if err := restarted.TerminateRuntime(found[0]); err != nil {
 		t.Fatalf("TerminateRuntime: %v", err)
 	}
-	deadline := time.Now().Add(orphanGroupGoneTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), orphanGroupGoneTimeout)
+	defer cancel()
+	tick := time.NewTicker(orphanGroupGonePoll)
+	defer tick.Stop()
 	for {
 		scanSnapshot(t, func() { found = findOnly(t, restarted, sessionID) }, pids...)
-		if len(found) == 0 || !time.Now().Before(deadline) {
+		if len(found) == 0 {
 			break
 		}
-		time.Sleep(orphanGroupGonePoll)
-	}
-	if len(found) != 0 {
-		t.Fatalf("after terminate found = %+v, want the whole process group gone", found)
+		select {
+		case <-ctx.Done():
+			t.Fatalf("after terminate found = %+v, want the whole process group gone", found)
+		case <-tick.C:
+		}
 	}
 }
