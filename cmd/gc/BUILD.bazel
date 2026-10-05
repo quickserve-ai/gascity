@@ -1109,6 +1109,7 @@ go_test(
         "cmd_session_logs_test.go",
         "cmd_session_rename_test.go",
         "cmd_session_reset_test.go",
+        "cmd_session_resume_own_conversation_test.go",
         "cmd_session_state_banner_test.go",
         "cmd_session_submit_test.go",
         "cmd_session_test.go",
