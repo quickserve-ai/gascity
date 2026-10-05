@@ -144,6 +144,18 @@ func mailboxMatchesByMetadata(store beads.Store, key, selector, status string) (
 	if status != "" {
 		query.Status = status
 	}
+	if status == "closed" {
+		// A closed-only probe runs on every inbox read (pl-d9lw item 1), and a
+		// backend that cannot push the metadata filter into its ephemeral leg
+		// answers it with every closed ephemeral row it holds: 5,400 closed mail
+		// messages and no session on the live city store, 2026-10-05. The
+		// session label is a filter both legs push down, and it keeps both
+		// kinds of bead the re-check below accepts that a session is ever
+		// created as: every creation path stamps the label, and a
+		// crash-damaged bead with an empty type is recognized by it. A typed
+		// bead that has lost its label is the one shape this narrows away.
+		query.Label = LabelSession
+	}
 	items, err := store.List(query)
 	if err != nil {
 		return nil, err

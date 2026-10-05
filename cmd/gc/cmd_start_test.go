@@ -494,6 +494,112 @@ func TestBuildIdleTracker_AliasAlwaysNamedPoolExemptsAliasOnly(t *testing.T) {
 	}
 }
 
+// TestBuildIdleTracker_AliasOnDemandSingleSessionRegistersSessionName pins the
+// shape of a named session that declares its own name over a single-session
+// agent (name = "brett", template = "cherub-law.brett"). The reconciler checks
+// the session under its own runtime name, so the timeout must be stored
+// there. The agent-derived name keeps the registration it always had, for a
+// session that runs under an explicit runtime alias equal to the agent's
+// name. A bead-named ordinary session of a single-session template is not
+// covered by this test or by the code.
+func TestBuildIdleTracker_AliasOnDemandSingleSessionRegistersSessionName(t *testing.T) {
+	cfg := &config.City{
+		Workspace: config.Workspace{},
+		Agents: []config.Agent{
+			{
+				Name:              "builder",
+				Dir:               "local-core",
+				MaxActiveSessions: intPtr(1),
+				IdleTimeout:       "20m",
+			},
+		},
+		NamedSessions: []config.NamedSession{{
+			Name:     "primary",
+			Template: "builder",
+			Dir:      "local-core",
+		}},
+	}
+	if cfg.Agents[0].SupportsInstanceExpansion() {
+		t.Fatal("fixture agent must be single-session")
+	}
+	template := cfg.Agents[0].QualifiedName()
+	namedSession := config.NamedSessionRuntimeName("city", cfg.Workspace, cfg.NamedSessions[0].QualifiedName())
+	agentDerived := startupSessionName("city", template, cfg.Workspace.SessionTemplate)
+	if namedSession == agentDerived {
+		t.Fatalf("fixture must give the session a name of its own, both are %q", namedSession)
+	}
+	now := time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)
+	sp := runtime.NewFake()
+	startFakeSession(t, sp, namedSession)
+	sp.SetActivity(namedSession, now.Add(-30*time.Minute))
+
+	idle, ok := buildIdleTracker(cfg, "city", "", sp).(*memoryIdleTracker)
+	if !ok {
+		t.Fatalf("buildIdleTracker returned %T, want *memoryIdleTracker", idle)
+	}
+	if _, ok := idle.timeouts[namedSession]; !ok {
+		t.Fatalf("idle tracker missing the session's own name %q in %v", namedSession, idle.timeouts)
+	}
+	if !idle.checkIdle(namedSession, template, "", "", sp, now) {
+		t.Fatalf("aliased on_demand session %q did not idle out past its timeout", namedSession)
+	}
+	startFakeSession(t, sp, agentDerived)
+	sp.SetActivity(agentDerived, now.Add(-30*time.Minute))
+	if !idle.checkIdle(agentDerived, template, "", "", sp, now) {
+		t.Fatalf("session %q under the agent-derived name lost its idle timeout", agentDerived)
+	}
+}
+
+// TestBuildIdleTracker_AliasAlwaysSingleSessionIsExempt pins the other half:
+// the same aliased single-session shape with mode "always" never idles out
+// under its own name, while a session running under the agent-derived name
+// keeps the registration it always had.
+func TestBuildIdleTracker_AliasAlwaysSingleSessionIsExempt(t *testing.T) {
+	cfg := &config.City{
+		Workspace: config.Workspace{},
+		Agents: []config.Agent{
+			{
+				Name:              "builder",
+				Dir:               "local-core",
+				MaxActiveSessions: intPtr(1),
+				IdleTimeout:       "20m",
+			},
+		},
+		NamedSessions: []config.NamedSession{{
+			Name:     "primary",
+			Template: "builder",
+			Dir:      "local-core",
+			Mode:     "always",
+		}},
+	}
+	template := cfg.Agents[0].QualifiedName()
+	namedSession := config.NamedSessionRuntimeName("city", cfg.Workspace, cfg.NamedSessions[0].QualifiedName())
+	agentDerived := startupSessionName("city", template, cfg.Workspace.SessionTemplate)
+	now := time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)
+	sp := runtime.NewFake()
+	startFakeSession(t, sp, namedSession)
+	startFakeSession(t, sp, agentDerived)
+	sp.SetActivity(namedSession, now.Add(-30*time.Minute))
+	sp.SetActivity(agentDerived, now.Add(-30*time.Minute))
+
+	idle, ok := buildIdleTracker(cfg, "city", "", sp).(*memoryIdleTracker)
+	if !ok {
+		t.Fatalf("buildIdleTracker returned %T, want *memoryIdleTracker", idle)
+	}
+	if _, ok := idle.timeouts[namedSession]; ok {
+		t.Fatalf("always-mode session %q has an idle timeout", namedSession)
+	}
+	if !idle.templateFallbackExemptions[namedSession] {
+		t.Fatalf("always-mode session %q is not exempt from the template fallback", namedSession)
+	}
+	if idle.checkIdle(namedSession, template, "", "", sp, now) {
+		t.Fatalf("always-mode session %q idled out", namedSession)
+	}
+	if !idle.checkIdle(agentDerived, template, "", "", sp, now) {
+		t.Fatalf("session %q under the agent-derived name lost its idle timeout", agentDerived)
+	}
+}
+
 func TestBuildIdleTracker_NamedAlwaysNoExplicitPoolRegistersTemplateFallback(t *testing.T) {
 	cfg := &config.City{
 		Workspace: config.Workspace{},
