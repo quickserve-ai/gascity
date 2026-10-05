@@ -316,6 +316,12 @@ clone_db_snapshot() {
 # FAILS CLOSED. Nothing is deleted unless the manifest parses AND every table
 # file it references is present on disk; a backup we cannot fully verify is one
 # we do not touch.
+#
+# A table file is on disk under one of two names: `<hash>.darc` (archive
+# format) or bare `<hash>` (the older format). The backup copies whichever the
+# store holds, so one directory can carry both. Looking for `.darc` alone read
+# a store with older-format files as "references a missing table file" and
+# skipped the prune on every run (hq, 72 of 79 files, 2026-10-04 on; ga-btisea).
 prune_backup_orphans() {
     prune_db="$1"
     if [ "$BACKUP_PRUNE_ORPHANS" = "0" ]; then
@@ -350,6 +356,7 @@ prune_backup_orphans() {
     prune_referenced=" "
     prune_pairs=0
     prune_malformed=0
+    prune_missing=""
     while [ -n "$prune_rest" ]; do
         prune_hash="${prune_rest%%:*}"
         case "$prune_rest" in
@@ -381,16 +388,20 @@ prune_backup_orphans() {
             prune_malformed=1
             break
         fi
-        if [ ! -f "$prune_dir/$prune_hash.darc" ]; then
-            prune_malformed=1
+        if [ ! -f "$prune_dir/$prune_hash.darc" ] && [ ! -f "$prune_dir/$prune_hash" ]; then
+            prune_missing="$prune_hash"
             break
         fi
         prune_referenced="$prune_referenced$prune_hash "
         prune_pairs=$((prune_pairs + 1))
     done
 
+    if [ -n "$prune_missing" ]; then
+        echo "backup: $prune_db — orphan prune SKIPPED (manifest references a table file that is not in the backup: $prune_missing)"
+        return 0
+    fi
     if [ "$prune_malformed" -ne 0 ]; then
-        echo "backup: $prune_db — orphan prune SKIPPED (manifest unreadable or references a missing table file)"
+        echo "backup: $prune_db — orphan prune SKIPPED (manifest unreadable)"
         return 0
     fi
     if [ "$prune_pairs" -eq 0 ]; then
@@ -402,7 +413,7 @@ prune_backup_orphans() {
 
     prune_removed=0
     prune_freed=0
-    for prune_file in "$prune_dir"/*.darc; do
+    for prune_file in "$prune_dir"/*; do
         [ -f "$prune_file" ] || continue
         prune_base="${prune_file##*/}"
         prune_base="${prune_base%.darc}"
@@ -415,6 +426,11 @@ prune_backup_orphans() {
             *[!0-9a-v]*) continue ;;
         esac
         if [ "${#prune_base}" -ne 32 ]; then
+            continue
+        fi
+        # Dolt's chunk journal is a bare 32-character name too, and no
+        # manifest pair ever references it. It is not an orphan.
+        if [ "$prune_base" = "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv" ]; then
             continue
         fi
         # Never reap anything newer than the manifest we just validated.

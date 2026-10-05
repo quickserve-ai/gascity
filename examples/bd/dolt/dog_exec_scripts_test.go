@@ -4609,6 +4609,8 @@ const (
 	orphan1Hash = "cccccccccccccccccccccccccccccccc"
 	orphan2Hash = "dddddddddddddddddddddddddddddddd"
 	absentHash  = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	// Dolt's chunk journal: shaped like a bare table file, never in a manifest.
+	chunkJournalName = "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"
 )
 
 // cowCloneAvailable reports whether this filesystem supports the reflink copy
@@ -4861,6 +4863,65 @@ func TestBackupScriptPrunesUnreferencedBackupTableFiles(t *testing.T) {
 	}
 }
 
+// writeBareBackupTableFiles adds table files in Dolt's older format, which
+// carry no extension, backdated like writeBackupArtifacts' files.
+func writeBareBackupTableFiles(t *testing.T, dbDir string, hashes ...string) {
+	t.Helper()
+	old := time.Now().Add(-2 * time.Hour)
+	for _, name := range hashes {
+		path := filepath.Join(dbDir, name)
+		if err := os.WriteFile(path, []byte("chunkdata"), 0o644); err != nil {
+			t.Fatalf("write bare table file: %v", err)
+		}
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatalf("chtimes: %v", err)
+		}
+	}
+}
+
+// TestBackupScriptPrunesMixedFormatBackup: a backup holds table files as
+// `<hash>.darc` or as bare `<hash>`, whichever the store had. The prune looked
+// for `.darc` only, so a store with older-format files read as "references a
+// missing table file" and was skipped on every run (hq, ga-btisea). Both forms
+// count as present when referenced and both are reaped when not; files that are
+// not table files stay.
+func TestBackupScriptPrunesMixedFormatBackup(t *testing.T) {
+	cityPath := t.TempDir()
+	dataDir := filepath.Join(cityPath, "dolt-data")
+	if err := os.MkdirAll(filepath.Join(dataDir, "prod", ".dolt"), 0o755); err != nil {
+		t.Fatalf("mkdir db: %v", err)
+	}
+	artifactDir := filepath.Join(cityPath, ".dolt-backup")
+	// keepA and orphan1 are archives; keepB and orphan2 are bare.
+	dbDir := writeBackupArtifacts(t, artifactDir, "prod",
+		"5:__DOLT__:lock0:root0:00000000000000000000000000000000:"+keepAHash+":12:"+keepBHash+":34",
+		keepAHash, orphan1Hash)
+	writeBareBackupTableFiles(t, dbDir, keepBHash, orphan2Hash, "LOCK", chunkJournalName)
+
+	binDir := t.TempDir()
+	_ = writeDogFakeGC(t, binDir)
+	_ = writeBackupPWDLoggingDolt(t, binDir, 0)
+
+	out := runDogScript(t, "mol-dog-backup.sh", binDir, cityPath, dataDir,
+		"GC_BACKUP_DATABASES=prod", "GC_BACKUP_ARTIFACT_DIR="+artifactDir)
+	if strings.Contains(out, "orphan prune SKIPPED") {
+		t.Fatalf("a bare referenced table file is present, not missing:\n%s", out)
+	}
+	if !strings.Contains(out, "pruned 2 unreferenced table file(s)") {
+		t.Fatalf("expected one archive and one bare orphan pruned:\n%s", out)
+	}
+	for _, keep := range []string{keepAHash + ".darc", keepBHash, "LOCK", "manifest", chunkJournalName} {
+		if _, err := os.Stat(filepath.Join(dbDir, keep)); err != nil {
+			t.Fatalf("%s must survive: %v", keep, err)
+		}
+	}
+	for _, gone := range []string{orphan1Hash + ".darc", orphan2Hash} {
+		if _, err := os.Stat(filepath.Join(dbDir, gone)); !os.IsNotExist(err) {
+			t.Fatalf("unreferenced table file %s should be pruned, stat err: %v", gone, err)
+		}
+	}
+}
+
 // TestBackupScriptRefusesToPruneWhenManifestReferencesMissingTableFile is the
 // fail-closed guard. A backup whose manifest we cannot fully verify is one we
 // must not touch: deleting from it could turn a damaged backup into no backup.
@@ -4882,8 +4943,8 @@ func TestBackupScriptRefusesToPruneWhenManifestReferencesMissingTableFile(t *tes
 
 	out := runDogScript(t, "mol-dog-backup.sh", binDir, cityPath, dataDir,
 		"GC_BACKUP_DATABASES=prod", "GC_BACKUP_ARTIFACT_DIR="+artifactDir)
-	if !strings.Contains(out, "orphan prune SKIPPED") {
-		t.Fatalf("prune must fail closed on an unverifiable manifest:\n%s", out)
+	if !strings.Contains(out, "orphan prune SKIPPED (manifest references a table file that is not in the backup: "+absentHash+")") {
+		t.Fatalf("prune must fail closed and name the missing table file:\n%s", out)
 	}
 	if _, err := os.Stat(filepath.Join(dbDir, orphan1Hash+".darc")); err != nil {
 		t.Fatalf("nothing may be deleted when the manifest cannot be verified: %v", err)
