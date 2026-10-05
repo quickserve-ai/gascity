@@ -550,8 +550,17 @@ func cmdSessionResume(args []string, last, printOnly bool, archiveRoot string, s
 	}
 
 	if beadID, isLive := live[chosen.SessionID]; isLive && !printOnly {
-		fmt.Fprintf(stderr, "gc session resume: conversation %s is already live on %s — attach with: gc session attach %s\n", chosen.SessionID, beadID, target.identifier) //nolint:errcheck // best-effort stderr
-		return 1
+		if scope.hasInfo && beadID == scope.info.ID {
+			// The session's own record is not another session sharing the
+			// conversation: whether it is running is decided below, from its
+			// bead as it reads now, not from the snapshot taken before the
+			// lookup. Ask the store whether some other live session holds it.
+			beadID = liveOtherSessionOnKey(store, chosen.SessionID, scope.info.ID)
+		}
+		if beadID != "" {
+			fmt.Fprintf(stderr, "gc session resume: conversation %s is already live on %s — attach with: gc session attach %s\n", chosen.SessionID, beadID, target.identifier) //nolint:errcheck // best-effort stderr
+			return 1
+		}
 	}
 
 	// A transcript the reaper archived must be restored into the live
