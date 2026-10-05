@@ -35,6 +35,9 @@ type fakeIdleTracker struct {
 	idle       map[string]bool
 	templates  map[string]bool
 	exemptions map[string]bool
+	// providers records the provider argument of the last checkIdle call per
+	// session name, so a test can pin what the reconciler hands the tracker.
+	providers map[string]string
 }
 
 func newFakeIdleTracker() *fakeIdleTracker {
@@ -42,10 +45,14 @@ func newFakeIdleTracker() *fakeIdleTracker {
 		idle:       make(map[string]bool),
 		templates:  make(map[string]bool),
 		exemptions: make(map[string]bool),
+		providers:  make(map[string]string),
 	}
 }
 
-func (f *fakeIdleTracker) checkIdle(sessionName, template, _, _ string, _ runtime.Provider, _ time.Time) bool {
+func (f *fakeIdleTracker) checkIdle(sessionName, template, provider, _ string, _ runtime.Provider, _ time.Time) bool {
+	if f.providers != nil {
+		f.providers[sessionName] = provider
+	}
 	if f.idle[sessionName] {
 		return true
 	}
@@ -10800,6 +10807,60 @@ func TestReconcileSessionBeads_IdleTimeoutStopsAndStaysAsleep(t *testing.T) {
 	}
 	if b.Metadata["slept_at"] != env.clk.Now().UTC().Format(time.RFC3339) {
 		t.Errorf("slept_at = %q, want idle stop timestamp", b.Metadata["slept_at"])
+	}
+}
+
+// TestReconcileSessionBeads_IdleCheckGetsTheProviderFamilyNotItsName pins the
+// call site pl-mhyy was about: the idle tracker's content clock is keyed on
+// the provider family, and the reconciler handed it the configured provider
+// NAME, so a Claude seat on a provider a city had named claude-opus-<account>
+// never got the clock. The tracker's own tests passed "claude" by hand and
+// could not see it.
+func TestReconcileSessionBeads_IdleCheckGetsTheProviderFamilyNotItsName(t *testing.T) {
+	for name, tc := range map[string]struct {
+		metadata map[string]string
+		want     string
+	}{
+		"named claude provider with its ancestor": {
+			metadata: map[string]string{"provider": "claude-opus-acct", "builtin_ancestor": "claude"},
+			want:     "claude",
+		},
+		"named claude provider with only its kind": {
+			metadata: map[string]string{"provider": "claude-opus-acct", "provider_kind": "claude"},
+			want:     "claude",
+		},
+		"another family stays another family": {
+			metadata: map[string]string{"provider": "codex-sol", "builtin_ancestor": "codex"},
+			want:     "codex",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			env := newReconcilerTestEnv()
+			env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
+			env.addDesired("worker", "worker", true)
+			session := env.createSessionBead("worker", "worker")
+			env.markSessionActive(&session)
+			env.setSessionMetadata(&session, tc.metadata)
+			if err := env.sp.SetMeta("worker", "GC_SESSION_ID", session.ID); err != nil {
+				t.Fatalf("SetMeta(GC_SESSION_ID): %v", err)
+			}
+			it := newFakeIdleTracker()
+
+			cfgNames := configuredSessionNames(env.cfg, "", env.store)
+			reconcileSessionBeads(
+				context.Background(), []beads.Bead{session}, env.desiredState, cfgNames,
+				env.cfg, env.sp, env.store, nil, nil, nil, env.dt, map[string]int{}, false, nil, "",
+				it, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr,
+			)
+
+			got, called := it.providers["worker"]
+			if !called {
+				t.Fatalf("the reconciler never asked the idle tracker about worker; stderr: %s", env.stderr.String())
+			}
+			if got != tc.want {
+				t.Fatalf("checkIdle provider = %q, want the family %q", got, tc.want)
+			}
+		})
 	}
 }
 

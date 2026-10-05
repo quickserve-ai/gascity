@@ -4352,7 +4352,10 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		}
 		if it != nil && alive {
 			facts := sessionpkg.TimerFacts{
-				Triggered: it.checkIdle(name, tp.TemplateName, infoByID[id].Provider, infoByID[id].Transport, sp, clk.Now()),
+				// The provider FAMILY, not its configured name: a city names its
+				// providers freely (claude-opus-<account>), and the tracker's
+				// content clock is keyed on what the runtime is (pl-mhyy).
+				Triggered: it.checkIdle(name, tp.TemplateName, sessionProviderFamily(infoByID[id]), infoByID[id].Transport, sp, clk.Now()),
 			}
 			if facts.Triggered {
 				facts.Blocker = lifecycleTimerBlockerInfo(infoByID[id], clk.Now())
