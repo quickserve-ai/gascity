@@ -406,13 +406,15 @@ func (s *failingAddressListStore) List(beads.ListQuery) ([]beads.Bead, error) {
 	return nil, fmt.Errorf("%w: metadata filter exposed %s", errAddressDirectoryBackend, s.sensitive)
 }
 
-// TestClosedSessionProbesCarryTheSessionType pins the cost bound on the probe
+// TestClosedSessionProbesCarryTheSessionLabel pins the cost bound on the probe
 // every inbox read makes (pl-d9lw item 1): a closed-only lookup names the
-// session type in its query, so a backend's ephemeral leg, which cannot push a
+// session label in its query, so a backend's ephemeral leg, which cannot push a
 // metadata filter down, returns closed sessions rather than every closed
-// ephemeral row in the store. The live pass must not carry the type: it still
-// has to find a crash-damaged session bead whose type is empty.
-func TestClosedSessionProbesCarryTheSessionType(t *testing.T) {
+// ephemeral row in the store. The label, not the type, because a seat's
+// crash-damaged predecessor (empty type, label intact) must still be found, or
+// replies addressed to it never reach its successor. The live pass is left as
+// it was.
+func TestClosedSessionProbesCarryTheSessionLabel(t *testing.T) {
 	store := &listCountingStore{MemStore: beads.NewMemStore()}
 	seat := map[string]string{
 		"alias":                      "rig/seat",
@@ -432,6 +434,15 @@ func TestClosedSessionProbesCarryTheSessionType(t *testing.T) {
 	if err := store.Close(stray.ID); err != nil {
 		t.Fatalf("Close message: %v", err)
 	}
+	// A closed predecessor a crash left with an empty type: still the seat's.
+	damaged := mustCreateAddressed(t, store, seat)
+	emptyType := ""
+	if err := store.Update(damaged.ID, beads.UpdateOpts{Type: &emptyType}); err != nil {
+		t.Fatalf("clear type: %v", err)
+	}
+	if err := store.Close(damaged.ID); err != nil {
+		t.Fatalf("Close damaged session: %v", err)
+	}
 	directory := NewStore(beads.SessionStore{Store: store})
 
 	store.queries = nil
@@ -439,15 +450,22 @@ func TestClosedSessionProbesCarryTheSessionType(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListClosedByNamedIdentity: %v", err)
 	}
-	if len(got) != 1 || got[0].ID != closed.ID {
-		t.Fatalf("ListClosedByNamedIdentity(rig/seat) = %v, want only %s", got, closed.ID)
+	ids := make([]string, 0, len(got))
+	for _, info := range got {
+		ids = append(ids, info.ID)
+	}
+	slices.Sort(ids)
+	want := []string{closed.ID, damaged.ID}
+	slices.Sort(want)
+	if !slices.Equal(ids, want) {
+		t.Fatalf("ListClosedByNamedIdentity(rig/seat) = %v, want the closed session and its damaged twin %v", ids, want)
 	}
 	if len(store.queries) == 0 {
 		t.Fatal("ListClosedByNamedIdentity issued no List query")
 	}
 	for _, q := range store.queries {
-		if q.Status != "closed" || q.Type != BeadType {
-			t.Fatalf("closed probe query = status %q type %q, want status closed and type %q", q.Status, q.Type, BeadType)
+		if q.Status != "closed" || q.Label != LabelSession || q.Type != "" {
+			t.Fatalf("closed probe query = status %q label %q type %q, want status closed, label %q and no type", q.Status, q.Label, q.Type, LabelSession)
 		}
 	}
 
@@ -455,8 +473,8 @@ func TestClosedSessionProbesCarryTheSessionType(t *testing.T) {
 	if _, err := mailboxMatchesByMetadata(store, "alias", "rig/seat", ""); err != nil {
 		t.Fatalf("live probe: %v", err)
 	}
-	if len(store.queries) != 1 || store.queries[0].Type != "" {
-		t.Fatalf("live probe queries = %+v, want one query with no type", store.queries)
+	if len(store.queries) != 1 || store.queries[0].Type != "" || store.queries[0].Label != "" {
+		t.Fatalf("live probe queries = %+v, want one query with no type and no label", store.queries)
 	}
 }
 
