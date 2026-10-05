@@ -239,18 +239,22 @@ func buildIdleTracker(cfg *config.City, cityName, _ string, sp runtime.Provider)
 		if timeout <= 0 {
 			continue
 		}
-		named := config.FindNamedSession(cfg, a.QualifiedName())
-		namedAlways := named != nil && named.ModeOrDefault() == "always"
-		if named != nil {
+		namedSessions := namedSessionsBackedByAgent(cfg, a)
+		if len(namedSessions) > 0 {
 			// Configured named sessions own the canonical runtime session for
-			// direct configured identities. mode="always" must never be subject
-			// to idle timeout.
-			namedSessionName := config.NamedSessionRuntimeName(cityName, cfg.Workspace, named.QualifiedName())
-			if !namedAlways {
-				it.setTimeout(namedSessionName, timeout)
-				registeredAny = true
-			} else {
-				it.exemptTemplateFallbackForSession(namedSessionName)
+			// direct configured identities. The reconciler checks a session
+			// under its own runtime name, so the timeout is stored under the
+			// named session's name, which differs from the agent's whenever
+			// the session declares a name of its own. mode="always" must never
+			// be subject to idle timeout.
+			for _, named := range namedSessions {
+				namedSessionName := config.NamedSessionRuntimeName(cityName, cfg.Workspace, named.QualifiedName())
+				if named.ModeOrDefault() != "always" {
+					it.setTimeout(namedSessionName, timeout)
+					registeredAny = true
+				} else {
+					it.exemptTemplateFallbackForSession(namedSessionName)
+				}
 			}
 			if !a.SupportsInstanceExpansion() {
 				continue
@@ -407,6 +411,30 @@ func buildAssignedWorkDeferTracker(cfg *config.City, cityName string, sp runtime
 		tr.setLimit(sn, limit)
 	}
 	return tr
+}
+
+// namedSessionsBackedByAgent returns every configured named session that runs
+// the agent: the one a lookup by the agent's own name finds, and every session
+// whose template is the agent, whatever name the session itself declares. The
+// lookup by name alone misses a session declared as name = "brett",
+// template = "cherub-law.brett".
+func namedSessionsBackedByAgent(cfg *config.City, a config.Agent) []*config.NamedSession {
+	if cfg == nil {
+		return nil
+	}
+	var out []*config.NamedSession
+	byName := config.FindNamedSession(cfg, a.QualifiedName())
+	if byName != nil {
+		out = append(out, byName)
+	}
+	for i := range cfg.NamedSessions {
+		named := &cfg.NamedSessions[i]
+		if named == byName || named.TemplateQualifiedName() != a.QualifiedName() {
+			continue
+		}
+		out = append(out, named)
+	}
+	return out
 }
 
 func lifecycleTemplateFallbackKey(a config.Agent) string {
