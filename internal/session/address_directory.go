@@ -144,6 +144,16 @@ func mailboxMatchesByMetadata(store beads.Store, key, selector, status string) (
 	if status != "" {
 		query.Status = status
 	}
+	if status == "closed" {
+		// A closed-only probe runs on every inbox read (pl-d9lw item 1), and a
+		// backend that cannot push the metadata filter into its ephemeral leg
+		// answers it with every closed ephemeral row it holds: 5,400 closed mail
+		// messages and no session on the live city store, 2026-10-05. The type
+		// is a filter both legs push down. It costs the closed pass the
+		// crash-damaged session beads with an empty type, which the direct ID
+		// lookup in mailboxMatches still finds; the live pass keeps them.
+		query.Type = BeadType
+	}
 	items, err := store.List(query)
 	if err != nil {
 		return nil, err
