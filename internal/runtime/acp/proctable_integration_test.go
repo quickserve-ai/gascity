@@ -9,8 +9,19 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/runtime"
+)
+
+// orphanGroupGoneTimeout bounds how long a terminated runtime's process group
+// may stay visible to the scan, and orphanGroupGonePoll is the interval between
+// scans. TerminateRuntime confirms only the root pid dead: a group member the
+// same signal reached is reparented to init when the root exits and reads as a
+// root of its own until it has exited too (gastownhall/gascity#7077).
+const (
+	orphanGroupGoneTimeout = 5 * time.Second
+	orphanGroupGonePoll    = 50 * time.Millisecond
 )
 
 // childPIDs returns pid's direct children from procfs.
@@ -74,7 +85,14 @@ func TestACPOrphanReapedAfterProviderRestart(t *testing.T) {
 	if err := restarted.TerminateRuntime(found[0]); err != nil {
 		t.Fatalf("TerminateRuntime: %v", err)
 	}
-	scanSnapshot(t, func() { found = findOnly(t, restarted, sessionID) }, pids...)
+	deadline := time.Now().Add(orphanGroupGoneTimeout)
+	for {
+		scanSnapshot(t, func() { found = findOnly(t, restarted, sessionID) }, pids...)
+		if len(found) == 0 || !time.Now().Before(deadline) {
+			break
+		}
+		time.Sleep(orphanGroupGonePoll)
+	}
 	if len(found) != 0 {
 		t.Fatalf("after terminate found = %+v, want the whole process group gone", found)
 	}
