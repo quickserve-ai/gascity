@@ -2,7 +2,10 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "builtinpacks",
-    srcs = ["registry.go"],
+    srcs = [
+        "embedded_diff.go",
+        "registry.go",
+    ],
     importpath = "github.com/gastownhall/gascity/internal/builtinpacks",
     visibility = ["//:__subpackages__"],
     deps = [
@@ -20,6 +23,7 @@ go_library(
 go_test(
     name = "builtinpacks_test",
     srcs = [
+        "embedded_diff_test.go",
         "embedded_overlay_test.go",
         "registry_content_memo_test.go",
         "registry_scoped_test.go",
