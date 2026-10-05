@@ -256,6 +256,21 @@ func liveSessionKeysForScope(store beads.Store, target sessionHistoryTarget, sco
 	return live
 }
 
+// liveOtherSessionOnKey names a live session bead other than ownID whose
+// session_key is key, or "" when there is none.
+func liveOtherSessionOnKey(store beads.Store, key, ownID string) string {
+	found, err := sessionFrontDoor(store).ListByMetadataInfos(map[string]string{"session_key": key}, 0)
+	if err != nil {
+		return ""
+	}
+	for _, info := range found {
+		if info.ID != ownID && sessionLogFallbackCandidateLive(info) {
+			return info.ID
+		}
+	}
+	return ""
+}
+
 type sessionHistoryJSON struct {
 	SchemaVersion string `json:"schema_version"`
 	OK            bool   `json:"ok"`
@@ -475,13 +490,32 @@ func cmdSessionResume(args []string, last, printOnly bool, archiveRoot string, s
 
 	searchPaths := worker.MergeSearchPaths(cfg.Daemon.ObservePaths)
 	archiveRoots := historyArchiveRoots(archiveRoot)
-	scope := resolveSessionHistoryScope(cityPath, cfg, store, identifier, target, stderr)
-	entries := listSessionHistory(target, scope, searchPaths, archiveRoots)
+	// An id recorded on the session's own bead is found by id wherever its
+	// transcript lies, so it is resolved from the bead alone; the in-progress
+	// task lookup, which opens every rig store, runs only when it is not.
+	scope := resolveSessionBeadHistoryScope(cityPath, cfg, store, identifier, target)
+	var entries []sessionHistoryItem
+	byBeadID := false
+	if requested != "" && scope.keySet[requested] {
+		entries = listSessionHistory(target, scope, searchPaths, archiveRoots)
+		byBeadID = sessionHistoryHasID(entries, requested)
+	}
+	if !byBeadID {
+		scope.addTaskWorkDirs(cityPath, cfg, store, stderr)
+		entries = listSessionHistory(target, scope, searchPaths, archiveRoots)
+	}
 	if len(entries) == 0 {
 		fmt.Fprintf(stderr, "gc session resume: no conversations found for %q (work dir %s)%s\n", target.identifier, target.workDir, scope.incompleteNote()) //nolint:errcheck // best-effort stderr
 		return 1
 	}
 	live := liveSessionKeysForScope(store, target, scope)
+	if byBeadID {
+		// The task worktrees were not searched for a session live on this
+		// conversation, so ask the store for every session bound to it.
+		if other := liveOtherSessionOnKey(store, requested, scope.info.ID); other != "" {
+			live[requested] = other
+		}
+	}
 
 	var chosen *sessionHistoryItem
 	if last {
@@ -673,6 +707,10 @@ type sessionHistoryScope struct {
 	// did not answer in time: the worktrees its tasks ran in were not
 	// searched, so an empty or missing result is incomplete, not "none".
 	skippedLookups []string
+	// taskAssignees are the assignees whose in-progress tasks addTaskWorkDirs
+	// looks up; seenDirs dedups workDirs.
+	taskAssignees []string
+	seenDirs      map[string]bool
 }
 
 // incompleteNote is the clause a "found nothing" message carries when a task
@@ -703,21 +741,15 @@ func (s sessionHistoryScope) attributable(e worker.SessionHistoryEntry) bool {
 // dir, and one that lies under .gc/worktrees/, is filtered like the others:
 // either can be a worktree other seats share.
 func resolveSessionHistoryScope(cityPath string, cfg *config.City, store beads.Store, identifier string, target sessionHistoryTarget, stderr io.Writer) sessionHistoryScope {
-	scope := sessionHistoryScope{ownWorkDir: target.configured, keySet: make(map[string]bool), names: make(map[string]bool)}
-	seenDirs := make(map[string]bool)
-	addDir := func(dir string) {
-		dir = strings.TrimSpace(dir)
-		if dir == "" {
-			return
-		}
-		dir = resolveWorkDirAgainstCity(cityPath, dir)
-		key := normalizePathForCompare(dir)
-		if seenDirs[key] {
-			return
-		}
-		seenDirs[key] = true
-		scope.workDirs = append(scope.workDirs, dir)
-	}
+	scope := resolveSessionBeadHistoryScope(cityPath, cfg, store, identifier, target)
+	scope.addTaskWorkDirs(cityPath, cfg, store, stderr)
+	return scope
+}
+
+// resolveSessionBeadHistoryScope is the part of the scope read off the
+// session's own bead, without the in-progress task lookup.
+func resolveSessionBeadHistoryScope(cityPath string, cfg *config.City, store beads.Store, identifier string, target sessionHistoryTarget) sessionHistoryScope {
+	scope := sessionHistoryScope{ownWorkDir: target.configured, keySet: make(map[string]bool), names: make(map[string]bool), seenDirs: make(map[string]bool)}
 	addKey := func(key string) {
 		if key = strings.TrimSpace(key); key != "" && !scope.keySet[key] {
 			scope.keySet[key] = true
@@ -725,11 +757,11 @@ func resolveSessionHistoryScope(cityPath string, cfg *config.City, store beads.S
 		}
 	}
 
-	addDir(target.workDir)
+	scope.addWorkDir(cityPath, target.workDir)
 	if store == nil {
 		return scope
 	}
-	assignees := []string{target.identifier}
+	scope.taskAssignees = []string{target.identifier}
 	if sessionID, err := resolveSessionIDAllowClosedWithConfig(cityPath, cfg, store, identifier); err == nil {
 		if info, err := sessionFrontDoor(store).Get(sessionID); err == nil {
 			scope.info, scope.hasInfo = info, true
@@ -740,22 +772,55 @@ func resolveSessionHistoryScope(cityPath string, cfg *config.City, store beads.S
 					scope.names[name] = true
 				}
 			}
-			addDir(info.WorkDir)
-			addDir(info.WorkDirCanonical)
-			addDir(info.WorkerDir)
+			scope.addWorkDir(cityPath, info.WorkDir)
+			scope.addWorkDir(cityPath, info.WorkDirCanonical)
+			scope.addWorkDir(cityPath, info.WorkerDir)
 			addKey(info.SessionKey)
 			if b, err := store.Get(sessionID); err == nil {
 				addKey(b.Metadata[sessionpkg.PriorSessionKeyMetadata])
 			}
-			assignees = append(taskWorkDirAssignees(startCandidate{info: info}, cfg), assignees...)
+			scope.taskAssignees = append(taskWorkDirAssignees(startCandidate{info: info}, cfg), scope.taskAssignees...)
 		}
 	}
-	taskDirs, skipped := inProgressTaskWorkDirs(cityPath, cfg, store, stderr, assignees...)
-	for _, dir := range taskDirs {
-		addDir(dir)
-	}
-	scope.skippedLookups = skipped
 	return scope
+}
+
+// addTaskWorkDirs widens the scope to the work_dir of every in-progress task
+// assigned to the session, looked up in the city store and every rig store.
+func (s *sessionHistoryScope) addTaskWorkDirs(cityPath string, cfg *config.City, store beads.Store, stderr io.Writer) {
+	if store == nil {
+		return
+	}
+	taskDirs, skipped := inProgressTaskWorkDirs(cityPath, cfg, store, stderr, s.taskAssignees...)
+	for _, dir := range taskDirs {
+		s.addWorkDir(cityPath, dir)
+	}
+	s.skippedLookups = skipped
+}
+
+// addWorkDir adds dir, resolved against the city, unless it is already in scope.
+func (s *sessionHistoryScope) addWorkDir(cityPath, dir string) {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return
+	}
+	dir = resolveWorkDirAgainstCity(cityPath, dir)
+	key := normalizePathForCompare(dir)
+	if s.seenDirs[key] {
+		return
+	}
+	s.seenDirs[key] = true
+	s.workDirs = append(s.workDirs, dir)
+}
+
+// sessionHistoryHasID reports whether entries list the conversation id.
+func sessionHistoryHasID(entries []sessionHistoryItem, id string) bool {
+	for _, e := range entries {
+		if e.SessionID == id {
+			return true
+		}
+	}
+	return false
 }
 
 // underSharedWorktreeRoot reports whether dir lies under a .gc/worktrees/
