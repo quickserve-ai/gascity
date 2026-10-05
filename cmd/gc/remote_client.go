@@ -37,6 +37,16 @@ func remoteClientOptions(target *remoteTarget) (api.RemoteOptions, error) {
 			}
 			opts.RESTTimeout = d
 		}
+		if ctx.MailReadTimeout != "" {
+			d, err := time.ParseDuration(ctx.MailReadTimeout)
+			if err != nil {
+				return api.RemoteOptions{}, fmt.Errorf("context %q: invalid mail_read_timeout %q: %w", ctx.Name, ctx.MailReadTimeout, err)
+			}
+			if d <= 0 {
+				return api.RemoteOptions{}, fmt.Errorf("context %q: mail_read_timeout %q must be positive", ctx.Name, ctx.MailReadTimeout)
+			}
+			opts.MailReadTimeout = d
+		}
 		if ctx.CredentialAudience != "" {
 			argv, err := registryCredentialProviderArgv()
 			if err != nil {
