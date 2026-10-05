@@ -47,6 +47,7 @@ func (p *unreadCallCountingProvider) Check(recipient string) ([]mail.Message, er
 	return p.byRecipient[recipient], nil
 }
 
+//nolint:unparam // the error result is mail.MultiRecipientInboxer's signature
 func (p *unreadCallCountingProvider) InboxRecipients(recipients []string) ([]mail.Message, error) {
 	p.multiCalls = append(p.multiCalls, append([]string(nil), recipients...))
 	var out []mail.Message
