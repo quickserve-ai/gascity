@@ -999,8 +999,9 @@ func sessionInboxForTarget(mp any, target resolvedMailTarget) (inbox *beadmail.I
 
 // unreadMailForTarget returns the target's unread mail, oldest first. A target
 // resolved from its own session bead is read as one inbox (sessionInboxForTarget),
-// returned as the inbox the mail came from; any other target or provider is
-// asked recipient by recipient, and the inbox is nil.
+// returned as the inbox the mail came from; any other target is read through
+// collectUnreadMailMessages (one batch read when the provider can, else
+// recipient by recipient), and the inbox is nil.
 func unreadMailForTarget(mp mail.Provider, target resolvedMailTarget) ([]mail.Message, *beadmail.Inbox, error) {
 	inbox, ok, err := sessionInboxForTarget(mp, target)
 	if ok {
@@ -1009,7 +1010,7 @@ func unreadMailForTarget(mp mail.Provider, target resolvedMailTarget) ([]mail.Me
 		}
 		return inbox.Unread(), inbox, nil
 	}
-	messages, err := collectMailMessages(mp.Check, target.recipients)
+	messages, err := collectUnreadMailMessages(mp, mp.Check, target.recipients)
 	return messages, nil, err
 }
 
@@ -2105,6 +2106,25 @@ func resolveMailAddressForCommand(identifier string, stderr io.Writer, cmdName s
 	return target.display, true
 }
 
+// collectUnreadMailMessages returns one mailbox's unread mail across all of
+// its recipient addresses. A provider that can answer for several addresses at
+// once is asked once: a seat has several addresses (its name, its alias, its
+// session), and asking per address repeated every per-mailbox cost that many
+// times on each prompt hook, the closed-session lookup among them (pl-d9lw
+// item 1). fetch is the per-address read (Check or Inbox, which return the
+// same unread set) for a provider that cannot, and for a single address.
+func collectUnreadMailMessages(provider any, fetch func(string) ([]mail.Message, error), recipients []string) ([]mail.Message, error) {
+	inboxer, ok := provider.(mail.MultiRecipientInboxer)
+	if !ok || len(recipients) < 2 {
+		return collectMailMessages(fetch, recipients)
+	}
+	// One fetch for the whole set, through the same de-duplication and
+	// ordering as the per-address path.
+	return collectMailMessages(func(string) ([]mail.Message, error) {
+		return inboxer.InboxRecipients(recipients)
+	}, recipients[:1])
+}
+
 func collectMailMessages(fetch func(string) ([]mail.Message, error), recipients []string) ([]mail.Message, error) {
 	sets := make([][]mail.Message, 0, len(recipients))
 	for _, recipient := range recipients {
@@ -3167,7 +3187,7 @@ func doMailInboxTargetWithJSON(mp mailInboxReader, target resolvedMailTarget, js
 	case ok && err == nil:
 		messages = inbox.Unread()
 	case !ok:
-		messages, err = collectMailMessages(mp.Inbox, target.recipients)
+		messages, err = collectUnreadMailMessages(mp, mp.Inbox, target.recipients)
 	}
 	if err != nil {
 		fmt.Fprintf(stderr, "gc mail inbox: %v\n", err) //nolint:errcheck // best-effort stderr
