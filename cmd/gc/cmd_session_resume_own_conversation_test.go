@@ -3,12 +3,14 @@ package main
 import (
 	"bytes"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/session"
 )
 
 // The fleet's resume-me helper cycles a session onto its own conversation:
@@ -137,5 +139,47 @@ func TestSessionResumeOfAConversationOnTheBeadOpensNoRigStores(t *testing.T) {
 	if len(opened) != 0 {
 		t.Fatalf("resume with the explicit conversation id %s, recorded on the session's bead, opened %d rig store(s) %q; want none",
 			currentConvID, len(opened), opened)
+	}
+}
+
+// Resolving an id on the bead without the task lookup must not drop the guard
+// that lookup fed: a conversation another session is live on is refused as
+// already live on that session, here one running in the seat's task worktree.
+func TestSessionResumeOfAConversationOnTheBeadRefusesAnotherSessionLiveOnIt(t *testing.T) {
+	fx := setupHistoryWorktreeFixture(t, map[string]string{"session_key": currentConvID}, true)
+	writeNamedTestSession(t, fx.liveRoot, fx.agentDir, currentConvID+".jsonl",
+		historyTranscriptLines(currentConvID, "lana", fx.agentDir, "lana's current conversation")...)
+	other, err := fx.store.Create(beads.Bead{
+		Title:  "ray",
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"session_name": "ray-runtime",
+			"alias":        "ray",
+			"agent_name":   "ray",
+			"template":     "ray",
+			"provider":     "claude",
+			"state":        "awake",
+			"work_dir":     fx.worktree,
+			"session_key":  currentConvID,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create the other session bead: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdSessionResume([]string{fx.sessionID, currentConvID}, false, false, t.TempDir(), &stdout, &stderr); code == 0 {
+		t.Fatalf("resume seeded a conversation another session (%s) is live on; stdout=%s", other.ID, stdout.String())
+	}
+	if want := "is already live on " + other.ID; !strings.Contains(stderr.String(), want) {
+		t.Fatalf("stderr = %q, want the refusal to carry %q", stderr.String(), want)
+	}
+	got, err := fx.store.Get(fx.sessionID)
+	if err != nil {
+		t.Fatalf("store.Get(session): %v", err)
+	}
+	if req := got.Metadata["wake_request"]; req != "" {
+		t.Fatalf("the refused resume requested a wake (%q)", req)
 	}
 }
