@@ -211,11 +211,14 @@ func TestIdleTracker_ContentClockFiresDespiteFreshActivity(t *testing.T) {
 	}
 }
 
-// TestIdleTracker_ContentClockFollowsTheProviderFamily is the pl-mhyy
-// regression at the tracker: fed the family the reconciler resolves for a
-// Claude provider under a city's own name, the content clock fires as it does
-// for "claude"; fed that provider's NAME, as the reconciler used to, it does
-// not, which is how an idle seat stayed up.
+// TestIdleTracker_ContentClockFollowsTheProviderFamily pins the tracker's
+// half of the pl-mhyy contract, which that fix did not change: fed the family
+// resolved for a Claude provider under a city's own name, the content clock
+// fires as it does for "claude"; fed that provider's NAME it does not, which
+// is how an idle seat stayed up. It is NOT the regression test for the fix: it
+// stays green if the reconciler goes back to passing the name. That test is
+// TestReconcileSessionBeads_IdleCheckGetsTheProviderFamilyNotItsName in
+// session_reconciler_test.go.
 func TestIdleTracker_ContentClockFollowsTheProviderFamily(t *testing.T) {
 	t.Parallel()
 
