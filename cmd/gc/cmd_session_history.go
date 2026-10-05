@@ -256,19 +256,23 @@ func liveSessionKeysForScope(store beads.Store, target sessionHistoryTarget, sco
 	return live
 }
 
-// liveOtherSessionOnKey names a live session bead other than ownID whose
-// session_key is key, or "" when there is none.
-func liveOtherSessionOnKey(store beads.Store, key, ownID string) string {
+// liveOtherSessionOnKey names a live session bead other than ownID that
+// records key as its session_key, or "" when there is none; a store error is
+// returned, not read as none. It does not establish who holds the transcript:
+// a live session running the conversation under a different or stale key, one
+// that keeps the id only as prior_session_key among them, is not seen. Prior
+// keys are deliberately not treated as occupied (follow-up gc-v0h6).
+func liveOtherSessionOnKey(store beads.Store, key, ownID string) (string, error) {
 	found, err := sessionFrontDoor(store).ListByMetadataInfos(map[string]string{"session_key": key}, 0)
 	if err != nil {
-		return ""
+		return "", err
 	}
 	for _, info := range found {
 		if info.ID != ownID && sessionLogFallbackCandidateLive(info) {
-			return info.ID
+			return info.ID, nil
 		}
 	}
-	return ""
+	return "", nil
 }
 
 type sessionHistoryJSON struct {
@@ -508,20 +512,36 @@ func cmdSessionResume(args []string, last, printOnly bool, archiveRoot string, s
 		fmt.Fprintf(stderr, "gc session resume: no conversations found for %q (work dir %s)%s\n", target.identifier, target.workDir, scope.incompleteNote()) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	live := liveSessionKeysForScope(store, target, scope)
-	if byBeadID {
-		// The task worktrees were not searched for a session live on this
-		// conversation, so ask the store for every session bound to it.
-		if other := liveOtherSessionOnKey(store, requested, scope.info.ID); other != "" {
-			live[requested] = other
-		}
+	// The session's own record of a conversation is not another session live
+	// on it: whether the session itself is running is decided further down,
+	// from its bead as it reads after the lookup.
+	ownID := ""
+	if scope.hasInfo {
+		ownID = scope.info.ID
 	}
 
 	var chosen *sessionHistoryItem
 	if last {
+		live := liveSessionKeysForScope(store, target, scope)
 		for i := range entries {
 			if _, isLive := live[entries[i].SessionID]; isLive {
 				continue
+			}
+			// live covers only the work dirs in scope, and a session live on
+			// the conversation can run anywhere, so the store is asked too.
+			// --print goes ahead without that answer when the store cannot
+			// give it.
+			if store != nil {
+				other, err := liveOtherSessionOnKey(store, entries[i].SessionID, ownID)
+				switch {
+				case err != nil && !printOnly:
+					fmt.Fprintf(stderr, "gc session resume: checking whether conversation %s is live elsewhere: %v\n", entries[i].SessionID, err) //nolint:errcheck // best-effort stderr
+					return 1
+				case err != nil:
+					fmt.Fprintf(stderr, "gc session resume: could not check whether conversation %s is live elsewhere: %v\n", entries[i].SessionID, err) //nolint:errcheck // best-effort stderr
+				case other != "":
+					continue
+				}
 			}
 			chosen = &entries[i]
 			break
@@ -549,16 +569,44 @@ func cmdSessionResume(args []string, last, printOnly bool, archiveRoot string, s
 		}
 	}
 
-	if beadID, isLive := live[chosen.SessionID]; isLive && !printOnly {
-		if scope.hasInfo && beadID == scope.info.ID {
-			// The session's own record is not another session sharing the
-			// conversation: whether it is running is decided below, from its
-			// bead as it reads now, not from the snapshot taken before the
-			// lookup. Ask the store whether some other live session holds it.
-			beadID = liveOtherSessionOnKey(store, chosen.SessionID, scope.info.ID)
+	// Every refusal comes before every write. --print changes no session
+	// state, so it is refused nothing here.
+	var (
+		sessFront *sessionpkg.Store
+		sessionID string
+		info      sessionpkg.Info
+	)
+	if !printOnly {
+		if store == nil {
+			fmt.Fprintln(stderr, "gc session resume: bead store unavailable — use --print for an attended resume") //nolint:errcheck // best-effort stderr
+			return 1
 		}
-		if beadID != "" {
-			fmt.Fprintf(stderr, "gc session resume: conversation %s is already live on %s — attach with: gc session attach %s\n", chosen.SessionID, beadID, target.identifier) //nolint:errcheck // best-effort stderr
+		// Asked of the conversation the id resolved to, not of the id as
+		// typed, so a prefix is guarded as the full id is.
+		other, err := liveOtherSessionOnKey(store, chosen.SessionID, ownID)
+		if err != nil {
+			fmt.Fprintf(stderr, "gc session resume: checking whether conversation %s is live elsewhere: %v\n", chosen.SessionID, err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		if other != "" {
+			fmt.Fprintf(stderr, "gc session resume: conversation %s is already live on %s — attach with: gc session attach %s\n", chosen.SessionID, other, target.identifier) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		// After the ownership check: this creates the bead of a named session
+		// not yet materialized, and such a session cannot be running.
+		sessionID, err = resolveSessionIDMaterializingNamed(cityPath, cfg, store, identifier)
+		if err != nil {
+			fmt.Fprintf(stderr, "gc session resume: %v\n", err) //nolint:errcheck // best-effort stderr
+			return 1
+		}
+		sessFront = sessionFrontDoor(store)
+		info, err = sessFront.Get(sessionID)
+		if err != nil {
+			fmt.Fprintf(stderr, "gc session resume: %v\n", err) //nolint:errcheck
+			return 1
+		}
+		if sessionLogFallbackCandidateLive(info) {
+			fmt.Fprintf(stderr, "gc session resume: %s is currently running — attach with: gc session attach %s, or use --print for a side-channel dive\n", target.identifier, target.identifier) //nolint:errcheck
 			return 1
 		}
 	}
@@ -586,26 +634,6 @@ func cmdSessionResume(args []string, last, printOnly bool, archiveRoot string, s
 		}
 		fmt.Fprintf(stdout, "cd %s && claude --resume %s\n", shellquote.Join([]string{dir}), shellquote.Join([]string{chosen.SessionID})) //nolint:errcheck // best-effort stdout
 		return 0
-	}
-
-	if store == nil {
-		fmt.Fprintln(stderr, "gc session resume: bead store unavailable — use --print for an attended resume") //nolint:errcheck // best-effort stderr
-		return 1
-	}
-	sessionID, err := resolveSessionIDMaterializingNamed(cityPath, cfg, store, identifier)
-	if err != nil {
-		fmt.Fprintf(stderr, "gc session resume: %v\n", err) //nolint:errcheck // best-effort stderr
-		return 1
-	}
-	sessFront := sessionFrontDoor(store)
-	info, err := sessFront.Get(sessionID)
-	if err != nil {
-		fmt.Fprintf(stderr, "gc session resume: %v\n", err) //nolint:errcheck
-		return 1
-	}
-	if sessionLogFallbackCandidateLive(info) {
-		fmt.Fprintf(stderr, "gc session resume: %s is currently running — attach with: gc session attach %s, or use --print for a side-channel dive\n", target.identifier, target.identifier) //nolint:errcheck
-		return 1
 	}
 
 	patch := sessionpkg.MetadataPatch{
