@@ -357,6 +357,7 @@ prune_backup_orphans() {
     prune_pairs=0
     prune_malformed=0
     prune_missing=""
+    prune_reason=""
     while [ -n "$prune_rest" ]; do
         prune_hash="${prune_rest%%:*}"
         case "$prune_rest" in
@@ -367,6 +368,7 @@ prune_backup_orphans() {
         if [ -z "$prune_rest" ]; then
             if [ -n "$prune_hash" ]; then
                 prune_malformed=1
+                prune_reason="a table file hash with no chunk count after it"
             fi
             break
         fi
@@ -376,16 +378,17 @@ prune_backup_orphans() {
             *) prune_rest="" ;;
         esac
         case "$prune_count" in
-            ''|*[!0-9]*) prune_malformed=1; break ;;
+            ''|*[!0-9]*) prune_malformed=1; prune_reason="a chunk count that is not a number"; break ;;
         esac
         # Dolt table file hashes are 32 base32 characters. Anything else is a
         # manifest we do not understand — including `../sentinel`, which would
         # otherwise resolve to a real file and validate.
         case "$prune_hash" in
-            *[!0-9a-v]*) prune_malformed=1; break ;;
+            *[!0-9a-v]*) prune_malformed=1; prune_reason="a table file hash with characters outside 0-9a-v"; break ;;
         esac
         if [ "${#prune_hash}" -ne 32 ]; then
             prune_malformed=1
+            prune_reason="a table file hash that is not 32 characters"
             break
         fi
         if [ ! -f "$prune_dir/$prune_hash.darc" ] && [ ! -f "$prune_dir/$prune_hash" ]; then
@@ -397,11 +400,11 @@ prune_backup_orphans() {
     done
 
     if [ -n "$prune_missing" ]; then
-        echo "backup: $prune_db — orphan prune SKIPPED (manifest references a table file that is not in the backup: $prune_missing)"
+        echo "backup: $prune_db — orphan prune SKIPPED (manifest references a table file that is not in the backup; first missing: $prune_missing)"
         return 0
     fi
     if [ "$prune_malformed" -ne 0 ]; then
-        echo "backup: $prune_db — orphan prune SKIPPED (manifest unreadable)"
+        echo "backup: $prune_db — orphan prune SKIPPED (manifest not in the expected shape: $prune_reason)"
         return 0
     fi
     if [ "$prune_pairs" -eq 0 ]; then
@@ -428,8 +431,8 @@ prune_backup_orphans() {
         if [ "${#prune_base}" -ne 32 ]; then
             continue
         fi
-        # Dolt's chunk journal is a bare 32-character name too, and no
-        # manifest pair ever references it. It is not an orphan.
+        # Dolt's chunk journal is a bare 32-character name too. A backup
+        # remote should not contain one; if one is here it is never reaped.
         if [ "$prune_base" = "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv" ]; then
             continue
         fi

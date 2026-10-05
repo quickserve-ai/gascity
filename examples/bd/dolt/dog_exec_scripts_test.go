@@ -4897,6 +4897,18 @@ func TestBackupScriptPrunesMixedFormatBackup(t *testing.T) {
 		"5:__DOLT__:lock0:root0:00000000000000000000000000000000:"+keepAHash+":12:"+keepBHash+":34",
 		keepAHash, orphan1Hash)
 	writeBareBackupTableFiles(t, dbDir, keepBHash, orphan2Hash, "LOCK", chunkJournalName)
+	// keepA also exists bare: a referenced hash present under both names keeps both.
+	writeBareBackupTableFiles(t, dbDir, keepAHash)
+	// An unreferenced bare file written after the manifest belongs to a sync
+	// the manifest does not describe yet. It is not an orphan.
+	newerBare := filepath.Join(dbDir, absentHash)
+	if err := os.WriteFile(newerBare, []byte("chunkdata"), 0o644); err != nil {
+		t.Fatalf("write newer bare table file: %v", err)
+	}
+	future := time.Now().Add(time.Hour)
+	if err := os.Chtimes(newerBare, future, future); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
 
 	binDir := t.TempDir()
 	_ = writeDogFakeGC(t, binDir)
@@ -4910,7 +4922,7 @@ func TestBackupScriptPrunesMixedFormatBackup(t *testing.T) {
 	if !strings.Contains(out, "pruned 2 unreferenced table file(s)") {
 		t.Fatalf("expected one archive and one bare orphan pruned:\n%s", out)
 	}
-	for _, keep := range []string{keepAHash + ".darc", keepBHash, "LOCK", "manifest", chunkJournalName} {
+	for _, keep := range []string{keepAHash + ".darc", keepAHash, keepBHash, "LOCK", "manifest", chunkJournalName, absentHash} {
 		if _, err := os.Stat(filepath.Join(dbDir, keep)); err != nil {
 			t.Fatalf("%s must survive: %v", keep, err)
 		}
@@ -4943,7 +4955,7 @@ func TestBackupScriptRefusesToPruneWhenManifestReferencesMissingTableFile(t *tes
 
 	out := runDogScript(t, "mol-dog-backup.sh", binDir, cityPath, dataDir,
 		"GC_BACKUP_DATABASES=prod", "GC_BACKUP_ARTIFACT_DIR="+artifactDir)
-	if !strings.Contains(out, "orphan prune SKIPPED (manifest references a table file that is not in the backup: "+absentHash+")") {
+	if !strings.Contains(out, "orphan prune SKIPPED (manifest references a table file that is not in the backup; first missing: "+absentHash+")") {
 		t.Fatalf("prune must fail closed and name the missing table file:\n%s", out)
 	}
 	if _, err := os.Stat(filepath.Join(dbDir, orphan1Hash+".darc")); err != nil {
