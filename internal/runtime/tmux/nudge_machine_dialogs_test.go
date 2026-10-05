@@ -4,6 +4,7 @@ import (
 	"context"
 	"slices"
 	"testing"
+	"time"
 )
 
 // Upstream dismisses three mid-session machine dialogs before a nudge
@@ -53,6 +54,15 @@ func (p *paneAfterFirstKeyExecutor) execute(args []string) (string, error) {
 	}
 	if slices.Contains(args, "#{session_attached}") {
 		return p.attached, nil
+	}
+	// SessionAttachedWithError's probe echoes the session name with the count
+	// (upstream #7013's survey dismisser reads it); every test here drives
+	// "agent-pane".
+	if slices.Contains(args, "#{session_name}|#{session_attached}") {
+		if p.attached == "" {
+			return "", nil
+		}
+		return "agent-pane|" + p.attached, nil
 	}
 	if slices.Contains(args, "send-keys") {
 		p.keyed = true
@@ -260,15 +270,17 @@ func TestNudgeSessionDefersOnAQuestionSeenByTheAttachedCheck(t *testing.T) {
 	}
 }
 
-// Astra round 3: the post-turn survey dismisser matches from scrollback. An
-// old survey above a live question must get no "0" and no Enter: the full
-// guard runs before each of its keys.
+// Astra round 3: a survey row directly above a composer can still have a
+// live question drawn below that composer. It must get no "0": the full
+// guard runs before each of the dismisser's keys.
 func TestFeedbackSurveyDismisserSendsNoKeysOverALiveQuestion(t *testing.T) {
 	pane := feedbackSurveySessionFixture + "\n" + questionDialogFixture
 	ex := &paneAfterFirstKeyExecutor{before: pane, after: pane, attached: "0"}
 	tm := &Tmux{cfg: DefaultConfig(), exec: ex}
 
-	tm.DismissFeedbackSurveyModalIfPresent("agent-pane")
+	if err := tm.dismissFeedbackSurvey("agent-pane", func(time.Duration) {}); err != nil {
+		t.Fatalf("dismissFeedbackSurvey: %v", err)
+	}
 	if keys := sentKeys(ex.calls); len(keys) != 0 {
 		t.Fatalf("sent survey keys over a live question: %v", keys)
 	}
