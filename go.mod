@@ -255,9 +255,9 @@ require (
 )
 
 // The beads module resolves to the fleet build of the quickserve-ai fork:
-// upstream v1.3.0-rc.2 plus the carries the fleet runs on (gc-1c2b). The
+// upstream v1.3.1 plus the carries the fleet runs on (gc-1c2b). The
 // require line above stays upstream's, so this is a redirect and not a
 // different dependency -- every import path, every other bd pin and the
 // module graph itself still reason about github.com/steveyegge/beads.
 // scripts/beads_fleet_replace_test.go checks the two stay in step.
-replace github.com/steveyegge/beads => github.com/quickserve-ai/beads v1.3.0-fleet.20260923.2
+replace github.com/steveyegge/beads => github.com/quickserve-ai/beads v1.3.1-fleet.20261005.1
