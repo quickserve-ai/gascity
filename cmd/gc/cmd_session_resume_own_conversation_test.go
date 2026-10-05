@@ -18,8 +18,9 @@ import (
 // until the seed is accepted, both addressed by session bead id. The suspend
 // only records the hold; the runtime stays up while the reconciler drains it,
 // and the reconciler rewrites the bead's state to awake for as long as it does.
-// A session's own conversation is not "already live" on some other session, so
-// the seed has to land in every one of those states.
+// A session's own conversation is not "already live" on some other session:
+// while S's runtime is still up the seed is refused as "currently running",
+// which the helper retries, and once it is down the seed lands.
 
 // seedOwnConversation runs the helper's seed against a fixture session that
 // records currentConvID as its conversation and carries sessionMeta on top.
@@ -72,7 +73,14 @@ func TestSessionResumeAcceptsItsOwnConversationWhileHeld(t *testing.T) {
 				meta[k] = v
 			}
 			fx, code, stdout, stderr := seedOwnConversation(t, meta)
-			if code != 0 {
+			switch {
+			case tc.runtimeUp:
+				// The retryable refusal the running-session gate gives, decided from
+				// the bead's state as read after the lookup.
+				if want := fx.sessionID + " is currently running"; code != 1 || !strings.Contains(stderr, want) || strings.Contains(stderr, "already live") {
+					t.Fatalf("resume of the session's own conversation while its runtime is up (state %q) = exit %d, stderr %q; want exit 1 carrying %q, not \"already live\"\nstdout: %s", tc.meta["state"], code, stderr, want, stdout)
+				}
+			case code != 0:
 				t.Fatalf("resume of the session's own conversation was refused (state %q, user hold): exit %d\nstderr: %sstdout: %s", tc.meta["state"], code, stderr, stdout)
 			}
 			got, err := fx.store.Get(fx.sessionID)
@@ -88,7 +96,7 @@ func TestSessionResumeAcceptsItsOwnConversationWhileHeld(t *testing.T) {
 			// The process is still up and being drained for the hold. A seed that
 			// clears the hold or requests a wake cancels that drain (user-hold is a
 			// cancelable reason) and leaves the seat on its old process, so here the
-			// seed records the conversation and nothing else.
+			// refused seed writes nothing.
 			if got.Metadata["held_until"] != heldUntil || got.Metadata["sleep_intent"] != "user-hold" {
 				t.Fatalf("the seed disturbed the hold of a session still draining for it: held_until=%q sleep_intent=%q, want %q and %q",
 					got.Metadata["held_until"], got.Metadata["sleep_intent"], heldUntil, "user-hold")
@@ -96,7 +104,104 @@ func TestSessionResumeAcceptsItsOwnConversationWhileHeld(t *testing.T) {
 			if req := got.Metadata["wake_request"]; req != "" {
 				t.Fatalf("the seed requested a wake (%q) for a session still draining for its hold", req)
 			}
+			if seeded := got.Metadata[session.ResumeSeededKey()]; seeded != "" {
+				t.Fatalf("the refused seed marked a seeded resume (%s=%q) on a session still draining for its hold", session.ResumeSeededKey(), seeded)
+			}
 		})
+	}
+}
+
+// Whether the session is running is decided from its bead as it reads after
+// the lookup, not as it read before: here the session is awake when resume
+// starts and asleep by the time the (slow) task lookup returns, and the seed of
+// its own conversation lands.
+func TestSessionResumeOfItsOwnConversationReadsTheStateAfterTheLookup(t *testing.T) {
+	fx := setupHistoryWorktreeFixture(t, map[string]string{"session_key": currentConvID, "state": "awake"}, false)
+	writeNamedTestSession(t, fx.liveRoot, fx.agentDir, currentConvID+".jsonl",
+		historyTranscriptLines(currentConvID, "lana", fx.agentDir, "lana's current conversation")...)
+	bindHistoryTestRig(t, fx, "far")
+
+	var once sync.Once
+	var stopErr error
+	prevOpener := historyRigStoreOpener
+	t.Cleanup(func() { historyRigStoreOpener = prevOpener })
+	historyRigStoreOpener = func(*config.City) rigStoreOpener {
+		return func(string, string) (beads.Store, error) {
+			once.Do(func() {
+				stopErr = fx.store.SetMetadataBatch(fx.sessionID, map[string]string{"state": "asleep", "sleep_reason": "user-hold"})
+			})
+			return beads.NewMemStore(), nil
+		}
+	}
+
+	// A prefix, so the id is resolved through the task lookup.
+	var stdout, stderr bytes.Buffer
+	code := cmdSessionResume([]string{fx.sessionID, currentConvID[:8]}, false, false, t.TempDir(), &stdout, &stderr)
+	if stopErr != nil {
+		t.Fatalf("stopping the session during the lookup: %v", stopErr)
+	}
+	if code != 0 {
+		t.Fatalf("resume of the session's own conversation, asleep by the time the lookup returned = exit %d; stderr=%s", code, stderr.String())
+	}
+	got, err := fx.store.Get(fx.sessionID)
+	if err != nil {
+		t.Fatalf("store.Get(session): %v", err)
+	}
+	if req := got.Metadata["wake_request"]; req == "" {
+		t.Fatalf("the accepted seed requested no wake; metadata=%v", got.Metadata)
+	}
+}
+
+// Excusing the session's own record from the "already live" guard must not
+// excuse another session live on the same conversation: here the session stops
+// during the lookup, and another one in its work dir still holds the id.
+func TestSessionResumeOfItsOwnConversationStillRefusesAnotherSessionLiveOnIt(t *testing.T) {
+	fx := setupHistoryWorktreeFixture(t, map[string]string{"session_key": currentConvID, "state": "awake"}, false)
+	writeNamedTestSession(t, fx.liveRoot, fx.agentDir, currentConvID+".jsonl",
+		historyTranscriptLines(currentConvID, "lana", fx.agentDir, "lana's current conversation")...)
+	bindHistoryTestRig(t, fx, "far")
+	other, err := fx.store.Create(beads.Bead{
+		Title:  "ray",
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"session_name": "ray-runtime",
+			"alias":        "ray",
+			"agent_name":   "ray",
+			"template":     "ray",
+			"provider":     "claude",
+			"state":        "awake",
+			"work_dir":     fx.agentDir,
+			"session_key":  currentConvID,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create the other session bead: %v", err)
+	}
+
+	var once sync.Once
+	var stopErr error
+	prevOpener := historyRigStoreOpener
+	t.Cleanup(func() { historyRigStoreOpener = prevOpener })
+	historyRigStoreOpener = func(*config.City) rigStoreOpener {
+		return func(string, string) (beads.Store, error) {
+			once.Do(func() {
+				stopErr = fx.store.SetMetadataBatch(fx.sessionID, map[string]string{"state": "asleep", "sleep_reason": "user-hold"})
+			})
+			return beads.NewMemStore(), nil
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cmdSessionResume([]string{fx.sessionID, currentConvID[:8]}, false, false, t.TempDir(), &stdout, &stderr)
+	if stopErr != nil {
+		t.Fatalf("stopping the session during the lookup: %v", stopErr)
+	}
+	if code == 0 {
+		t.Fatalf("resume seeded a conversation another session (%s) is live on; stdout=%s", other.ID, stdout.String())
+	}
+	if want := "is already live on " + other.ID; !strings.Contains(stderr.String(), want) {
+		t.Fatalf("stderr = %q, want the refusal to carry %q", stderr.String(), want)
 	}
 }
 
