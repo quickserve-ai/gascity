@@ -730,6 +730,10 @@ func TestCachingStoreScanFencesStress(t *testing.T) {
 		t.Fatalf("%d dirty marks survived reads no scan overlapped", dirty)
 	}
 
+	// The stress phase's UpdateIfMatch workers re-arm the recent-local-write stamp, and the final reconcile would otherwise keep a stale row inside that 5 s window.
+	for _, id := range ids {
+		ageLocalWrite(cache, id)
+	}
 	cache.ReconcileNowForTest()
 	for _, id := range ids {
 		truth, err := mem.Get(id)
