@@ -497,8 +497,9 @@ func TestBuildIdleTracker_AliasAlwaysNamedPoolExemptsAliasOnly(t *testing.T) {
 // TestBuildIdleTracker_AliasOnDemandSingleSessionRegistersSessionName pins the
 // shape of a named session that declares its own name over a single-session
 // agent (name = "brett", template = "cherub-law.brett"). The reconciler checks
-// the session under its own runtime name, so the timeout must be stored there
-// and not under the agent-derived name, which no running session carries.
+// the session under its own runtime name, so the timeout must be stored
+// there. The agent-derived name keeps its timeout too: template-routed work
+// can run an ordinary session under it while the aliased session is cold.
 func TestBuildIdleTracker_AliasOnDemandSingleSessionRegistersSessionName(t *testing.T) {
 	cfg := &config.City{
 		Workspace: config.Workspace{},
@@ -537,18 +538,21 @@ func TestBuildIdleTracker_AliasOnDemandSingleSessionRegistersSessionName(t *test
 	if _, ok := idle.timeouts[namedSession]; !ok {
 		t.Fatalf("idle tracker missing the session's own name %q in %v", namedSession, idle.timeouts)
 	}
-	if _, ok := idle.timeouts[agentDerived]; ok {
-		t.Fatalf("idle tracker stored the timeout under the agent-derived name %q, which no session runs as", agentDerived)
-	}
 	if !idle.checkIdle(namedSession, template, "", "", sp, now) {
 		t.Fatalf("aliased on_demand session %q did not idle out past its timeout", namedSession)
 	}
+	startFakeSession(t, sp, agentDerived)
+	sp.SetActivity(agentDerived, now.Add(-30*time.Minute))
+	if !idle.checkIdle(agentDerived, template, "", "", sp, now) {
+		t.Fatalf("ordinary session %q under the agent's own name lost its idle timeout", agentDerived)
+	}
 }
 
-// TestBuildIdleTracker_AliasAlwaysSingleSessionNeverRegisters pins the other
-// half: the same aliased single-session shape with mode "always" gets no
-// timeout under either name.
-func TestBuildIdleTracker_AliasAlwaysSingleSessionNeverRegisters(t *testing.T) {
+// TestBuildIdleTracker_AliasAlwaysSingleSessionIsExempt pins the other half:
+// the same aliased single-session shape with mode "always" never idles out
+// under its own name, while an ordinary session under the agent's own name
+// keeps the agent's timeout.
+func TestBuildIdleTracker_AliasAlwaysSingleSessionIsExempt(t *testing.T) {
 	cfg := &config.City{
 		Workspace: config.Workspace{},
 		Agents: []config.Agent{
@@ -572,20 +576,25 @@ func TestBuildIdleTracker_AliasAlwaysSingleSessionNeverRegisters(t *testing.T) {
 	now := time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)
 	sp := runtime.NewFake()
 	startFakeSession(t, sp, namedSession)
+	startFakeSession(t, sp, agentDerived)
 	sp.SetActivity(namedSession, now.Add(-30*time.Minute))
+	sp.SetActivity(agentDerived, now.Add(-30*time.Minute))
 
-	// With nothing registered the builder returns no tracker at all.
-	if it := buildIdleTracker(cfg, "city", "", sp); it != nil {
-		idle := it.(*memoryIdleTracker)
-		if _, ok := idle.timeouts[namedSession]; ok {
-			t.Fatalf("always-mode session %q has an idle timeout", namedSession)
-		}
-		if _, ok := idle.timeouts[agentDerived]; ok {
-			t.Fatalf("always-mode agent has a timeout under the agent-derived name %q", agentDerived)
-		}
-		if idle.checkIdle(namedSession, template, "", "", sp, now) {
-			t.Fatalf("always-mode session %q idled out", namedSession)
-		}
+	idle, ok := buildIdleTracker(cfg, "city", "", sp).(*memoryIdleTracker)
+	if !ok {
+		t.Fatalf("buildIdleTracker returned %T, want *memoryIdleTracker", idle)
+	}
+	if _, ok := idle.timeouts[namedSession]; ok {
+		t.Fatalf("always-mode session %q has an idle timeout", namedSession)
+	}
+	if !idle.templateFallbackExemptions[namedSession] {
+		t.Fatalf("always-mode session %q is not exempt from the template fallback", namedSession)
+	}
+	if idle.checkIdle(namedSession, template, "", "", sp, now) {
+		t.Fatalf("always-mode session %q idled out", namedSession)
+	}
+	if !idle.checkIdle(agentDerived, template, "", "", sp, now) {
+		t.Fatalf("ordinary session %q under the agent's own name lost its idle timeout", agentDerived)
 	}
 }
 
