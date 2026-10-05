@@ -421,14 +421,14 @@ func RecordCloudWake(ctx context.Context, target, outcome, ref, accountDir strin
 		),
 	)
 	emit(ctx, "session.cloud_wake", severity(err),
-		otellog.String("target", target),
-		otellog.String("status", status),
-		otellog.String("transport", "claude-cloud"),
-		otellog.String("outcome", outcome),
-		otellog.String("ref", ref),
-		otellog.String("account_lineage", accountDir),
-		otellog.Int64("latency_ms", latency.Milliseconds()),
-		otellog.Bool("retryable", retryable),
+		attribute.String("target", target),
+		attribute.String("status", status),
+		attribute.String("transport", "claude-cloud"),
+		attribute.String("outcome", outcome),
+		attribute.String("ref", ref),
+		attribute.String("account_lineage", accountDir),
+		attribute.Int64("latency_ms", latency.Milliseconds()),
+		attribute.Bool("retryable", retryable),
 		errKV(err),
 	)
 }

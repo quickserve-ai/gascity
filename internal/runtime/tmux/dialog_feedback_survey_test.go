@@ -440,18 +440,25 @@ func TestNudgeSessionDoesNotPasteOntoUnresolvedSurveyDigit(t *testing.T) {
 	}
 }
 
+// Upstream #7013 delivers the nudge when the survey peek cannot read the pane.
+// On the carry the nudge path's human-prompt guard (ga-ubfc7j) reads the pane
+// before any key and defers on a capture it cannot make, so the message is not
+// dropped either: it comes back as a capture_failed deferral, which keeps it
+// queued for the next pass, and nothing is typed into a pane nobody could read.
 func TestNudgeSessionDeliversWhenSurveyPeekFails(t *testing.T) {
 	executor := &failingRecaptureExecutor{scriptedTargetExecutor: scriptedTargetExecutor{display: "agent-pane|0"}, captureFails: true}
 	cfg := DefaultConfig()
 	cfg.NudgeReadyTimeout = 10 * time.Millisecond
 	tm := &Tmux{cfg: cfg, exec: executor}
 
-	_ = tm.NudgeSession("agent-pane", "hello")
+	err := tm.NudgeSession("agent-pane", "hello")
 
 	for _, call := range executor.calls {
-		if slices.Contains(call, "send-keys") && slices.Contains(call, "hello") {
-			return
+		if slices.Contains(call, "send-keys") {
+			t.Fatalf("NudgeSession typed into a pane it could not read: %v", executor.calls)
 		}
 	}
-	t.Fatalf("NudgeSession dropped the message after a capture-pane failure in the survey peek: %v", executor.calls)
+	if reason, deferred := NudgeDeferredReason(err); !deferred || reason != NudgeDeferReasonCaptureFailed {
+		t.Fatalf("NudgeSession error = %v, want a %s deferral that keeps the message queued", err, NudgeDeferReasonCaptureFailed)
+	}
 }

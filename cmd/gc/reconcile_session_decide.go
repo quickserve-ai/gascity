@@ -158,7 +158,12 @@ func timerHealPatch(row session.Info, now time.Time) (session.MetadataPatch, tim
 		at    string
 		clear func(string) session.MetadataPatch
 	}{
-		{row.HeldUntil, session.ClearExpiredHoldPatch},
+		{row.HeldUntil, func(reason string) session.MetadataPatch {
+			// The carry's standing sleep intent (27bc8ff95): a user-hold intent
+			// is released with its own timer, as the legacy heal does
+			// (session_reconcile.go ClearExpiredHoldPatch(info.SleepReason, info.SleepIntent)).
+			return session.ClearExpiredHoldPatch(reason, row.SleepIntent)
+		}},
 		{row.QuarantinedUntil, session.ClearExpiredQuarantinePatch},
 	} {
 		t, _ := time.Parse(time.RFC3339, timer.at)

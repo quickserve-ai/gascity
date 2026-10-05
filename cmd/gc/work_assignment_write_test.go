@@ -336,6 +336,13 @@ func (s *auditFailingUpdateStore) Update(string, beads.UpdateOpts) error {
 	return errUpdateRefused
 }
 
+// UpdateIfMatch fails too: tier 2 now writes through the store's conditional
+// writer (upstream #7021's releaseAssignmentFenced), and the embedded MemStore
+// would otherwise land the release on that path.
+func (s *auditFailingUpdateStore) UpdateIfMatch(string, int64, beads.UpdateOpts) error {
+	return errUpdateRefused
+}
+
 var errUpdateRefused = fmt.Errorf("update refused")
 
 // TestWorkAssignmentReleaseWorkBead_EmitsAuditLine is the ga-9n8hjv acceptance-4
