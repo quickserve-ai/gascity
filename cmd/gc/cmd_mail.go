@@ -928,7 +928,7 @@ func doMailCheckTarget(mp mail.Provider, target resolvedMailTarget, inject bool,
 }
 
 func doMailCheckTargetWithFormat(mp mail.Provider, target resolvedMailTarget, inject bool, hookFormat string, stdout, stderr io.Writer) int {
-	messages, err := collectMailMessages(mp.Check, target.recipients)
+	messages, err := collectUnreadMailMessages(mp, mp.Check, target.recipients)
 	if err != nil {
 		if inject {
 			fmt.Fprintf(stderr, "gc mail check: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -1980,6 +1980,25 @@ func resolveMailAddressForCommand(identifier string, stderr io.Writer, cmdName s
 	return target.display, true
 }
 
+// collectUnreadMailMessages returns one mailbox's unread mail across all of
+// its recipient addresses. A provider that can answer for several addresses at
+// once is asked once: a seat has several addresses (its name, its alias, its
+// session), and asking per address repeated every per-mailbox cost that many
+// times on each prompt hook, the closed-session lookup among them (pl-d9lw
+// item 1). fetch is the per-address read (Check or Inbox, which return the
+// same unread set) for a provider that cannot, and for a single address.
+func collectUnreadMailMessages(provider any, fetch func(string) ([]mail.Message, error), recipients []string) ([]mail.Message, error) {
+	inboxer, ok := provider.(mail.MultiRecipientInboxer)
+	if !ok || len(recipients) < 2 {
+		return collectMailMessages(fetch, recipients)
+	}
+	// One fetch for the whole set, through the same de-duplication and
+	// ordering as the per-address path.
+	return collectMailMessages(func(string) ([]mail.Message, error) {
+		return inboxer.InboxRecipients(recipients)
+	}, recipients[:1])
+}
+
 func collectMailMessages(fetch func(string) ([]mail.Message, error), recipients []string) ([]mail.Message, error) {
 	seen := map[string]mail.Message{}
 	order := make([]string, 0, len(recipients))
@@ -3000,7 +3019,7 @@ func doMailInboxTarget(mp mailInboxReader, target resolvedMailTarget, stdout, st
 }
 
 func doMailInboxTargetWithJSON(mp mailInboxReader, target resolvedMailTarget, jsonOut bool, stdout, stderr io.Writer) int {
-	messages, err := collectMailMessages(mp.Inbox, target.recipients)
+	messages, err := collectUnreadMailMessages(mp, mp.Inbox, target.recipients)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc mail inbox: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
