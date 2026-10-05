@@ -477,10 +477,10 @@ func TestMailListRigStoreSlowReturnsTyped503(t *testing.T) {
 	state := newFakeState(t)
 	release := make(chan struct{})
 	state.cityMailProv = &blockingMailProvider{release: release}
-	oldDeadline := mailReadDeadline
-	mailReadDeadline = 5 * time.Millisecond
+	oldDeadline := mailReadDeadlineOverride
+	mailReadDeadlineOverride = 5 * time.Millisecond
 	t.Cleanup(func() {
-		mailReadDeadline = oldDeadline
+		mailReadDeadlineOverride = oldDeadline
 		close(release)
 	})
 	h := newTestCityHandler(t, state)
@@ -496,10 +496,10 @@ func TestMailCountRigStoreSlowReturnsTyped503(t *testing.T) {
 	state := newFakeState(t)
 	release := make(chan struct{})
 	state.cityMailProv = &blockingMailProvider{release: release}
-	oldDeadline := mailReadDeadline
-	mailReadDeadline = 5 * time.Millisecond
+	oldDeadline := mailReadDeadlineOverride
+	mailReadDeadlineOverride = 5 * time.Millisecond
 	t.Cleanup(func() {
-		mailReadDeadline = oldDeadline
+		mailReadDeadlineOverride = oldDeadline
 		close(release)
 	})
 	h := newTestCityHandler(t, state)
@@ -515,10 +515,10 @@ func TestMailGetRigStoreSlowReturnsTyped503(t *testing.T) {
 	state := newFakeState(t)
 	release := make(chan struct{})
 	state.cityMailProv = &blockingMailProvider{release: release}
-	oldDeadline := mailReadDeadline
-	mailReadDeadline = 5 * time.Millisecond
+	oldDeadline := mailReadDeadlineOverride
+	mailReadDeadlineOverride = 5 * time.Millisecond
 	t.Cleanup(func() {
-		mailReadDeadline = oldDeadline
+		mailReadDeadlineOverride = oldDeadline
 		close(release)
 	})
 	h := newTestCityHandler(t, state)
@@ -628,10 +628,10 @@ func TestMailListAllRigsStoreSlowReturnsPartial(t *testing.T) {
 			"slow": &blockingMailProvider{release: release},
 		},
 	}
-	oldDeadline := mailReadDeadline
-	mailReadDeadline = mailPartialReadTestDeadline
+	oldDeadline := mailReadDeadlineOverride
+	mailReadDeadlineOverride = mailPartialReadTestDeadline
 	t.Cleanup(func() {
-		mailReadDeadline = oldDeadline
+		mailReadDeadlineOverride = oldDeadline
 		close(release)
 	})
 	h := newTestCityHandler(t, state)
@@ -654,10 +654,10 @@ func TestMailListAllStatusStoreSlowReturnsPartial(t *testing.T) {
 			"slow": &blockingMailProvider{release: release},
 		},
 	}
-	oldDeadline := mailReadDeadline
-	mailReadDeadline = mailPartialReadTestDeadline
+	oldDeadline := mailReadDeadlineOverride
+	mailReadDeadlineOverride = mailPartialReadTestDeadline
 	t.Cleanup(func() {
-		mailReadDeadline = oldDeadline
+		mailReadDeadlineOverride = oldDeadline
 		close(release)
 	})
 	h := newTestCityHandler(t, state)
@@ -680,10 +680,10 @@ func TestMailCountAllRigsStoreSlowReturnsPartial(t *testing.T) {
 			"slow": &blockingMailProvider{release: release},
 		},
 	}
-	oldDeadline := mailReadDeadline
-	mailReadDeadline = mailPartialReadTestDeadline
+	oldDeadline := mailReadDeadlineOverride
+	mailReadDeadlineOverride = mailPartialReadTestDeadline
 	t.Cleanup(func() {
-		mailReadDeadline = oldDeadline
+		mailReadDeadlineOverride = oldDeadline
 		close(release)
 	})
 	h := newTestCityHandler(t, state)
@@ -720,10 +720,10 @@ func TestMailListAllRigsStoreSlowAllFailedReturnsTyped503(t *testing.T) {
 			"slow-b": &blockingMailProvider{release: releaseB},
 		},
 	}
-	oldDeadline := mailReadDeadline
-	mailReadDeadline = 5 * time.Millisecond
+	oldDeadline := mailReadDeadlineOverride
+	mailReadDeadlineOverride = 5 * time.Millisecond
 	t.Cleanup(func() {
-		mailReadDeadline = oldDeadline
+		mailReadDeadlineOverride = oldDeadline
 		close(releaseA)
 		close(releaseB)
 	})
@@ -746,10 +746,10 @@ func TestMailListAllStatusStoreSlowAllFailedReturnsTyped503(t *testing.T) {
 			"slow-b": &blockingMailProvider{release: releaseB},
 		},
 	}
-	oldDeadline := mailReadDeadline
-	mailReadDeadline = 5 * time.Millisecond
+	oldDeadline := mailReadDeadlineOverride
+	mailReadDeadlineOverride = 5 * time.Millisecond
 	t.Cleanup(func() {
-		mailReadDeadline = oldDeadline
+		mailReadDeadlineOverride = oldDeadline
 		close(releaseA)
 		close(releaseB)
 	})
@@ -772,10 +772,10 @@ func TestMailCountAllRigsStoreSlowAllFailedReturnsTyped503(t *testing.T) {
 			"slow-b": &blockingMailProvider{release: releaseB},
 		},
 	}
-	oldDeadline := mailReadDeadline
-	mailReadDeadline = 5 * time.Millisecond
+	oldDeadline := mailReadDeadlineOverride
+	mailReadDeadlineOverride = 5 * time.Millisecond
 	t.Cleanup(func() {
-		mailReadDeadline = oldDeadline
+		mailReadDeadlineOverride = oldDeadline
 		close(releaseA)
 		close(releaseB)
 	})
@@ -792,10 +792,10 @@ func TestMailThreadRigStoreSlowReturnsTyped503(t *testing.T) {
 	state := newFakeState(t)
 	release := make(chan struct{})
 	state.cityMailProv = &blockingMailProvider{release: release}
-	oldDeadline := mailReadDeadline
-	mailReadDeadline = 5 * time.Millisecond
+	oldDeadline := mailReadDeadlineOverride
+	mailReadDeadlineOverride = 5 * time.Millisecond
 	t.Cleanup(func() {
-		mailReadDeadline = oldDeadline
+		mailReadDeadlineOverride = oldDeadline
 		close(release)
 	})
 	h := newTestCityHandler(t, state)
@@ -816,10 +816,10 @@ func TestMailThreadAllRigsStoreSlowReturnsPartial(t *testing.T) {
 			"slow": &blockingMailProvider{release: release},
 		},
 	}
-	oldDeadline := mailReadDeadline
-	mailReadDeadline = mailPartialReadTestDeadline
+	oldDeadline := mailReadDeadlineOverride
+	mailReadDeadlineOverride = mailPartialReadTestDeadline
 	t.Cleanup(func() {
-		mailReadDeadline = oldDeadline
+		mailReadDeadlineOverride = oldDeadline
 		close(release)
 	})
 	h := newTestCityHandler(t, state)
@@ -841,10 +841,10 @@ func TestMailThreadAllRigsStoreSlowAllFailedReturnsTyped503(t *testing.T) {
 			"slow-b": &blockingMailProvider{release: releaseB},
 		},
 	}
-	oldDeadline := mailReadDeadline
-	mailReadDeadline = 5 * time.Millisecond
+	oldDeadline := mailReadDeadlineOverride
+	mailReadDeadlineOverride = 5 * time.Millisecond
 	t.Cleanup(func() {
-		mailReadDeadline = oldDeadline
+		mailReadDeadlineOverride = oldDeadline
 		close(releaseA)
 		close(releaseB)
 	})
@@ -869,12 +869,12 @@ func TestClientMailListAllRigsMultipleStoreSlowReturnsTyped503BeforeClientTimeou
 			"slow-c": &blockingMailProvider{release: releaseC},
 		},
 	}
-	oldDeadline := mailReadDeadline
-	mailReadDeadline = 100 * time.Millisecond
+	oldDeadline := mailReadDeadlineOverride
+	mailReadDeadlineOverride = 100 * time.Millisecond
 	ts := httptest.NewServer(newTestCityHandler(t, state))
 	t.Cleanup(ts.Close)
 	t.Cleanup(func() {
-		mailReadDeadline = oldDeadline
+		mailReadDeadlineOverride = oldDeadline
 		close(releaseA)
 		close(releaseB)
 		close(releaseC)
