@@ -257,6 +257,14 @@ func buildIdleTracker(cfg *config.City, cityName, _ string, sp runtime.Provider)
 				}
 			}
 			if !a.SupportsInstanceExpansion() {
+				if config.FindNamedSession(cfg, a.QualifiedName()) == nil {
+					// No named session reuses the agent's own name, so a
+					// session that runs under it (template-routed work while
+					// the aliased session is cold) is an ordinary one and
+					// keeps the agent's timeout, as it always has.
+					it.setTimeout(startupSessionName(cityName, a.QualifiedName(), st), timeout)
+					registeredAny = true
+				}
 				continue
 			}
 			// Hybrid named-and-pool: fall through to the pool registrations
