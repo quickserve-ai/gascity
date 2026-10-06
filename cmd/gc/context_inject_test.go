@@ -121,15 +121,17 @@ func TestContextInjectIterationsFallBackToTopLevelSum(t *testing.T) {
 	// can only read high. Reading low would hide a real overflow.
 	const top = 927_275
 	cases := map[string]string{
-		"not a list":                      `{"a":1}`,
-		"empty list":                      `[]`,
-		"no message iteration":            `[` + advisorIteration + `]`,
-		"iterations do not add to top":    `[` + messageIteration(2, 400_000, 0) + `,` + messageIteration(2, 463_141, 991) + `]`,
-		"partial last iteration":          `[` + messageIteration(2, 927_270, 0) + `,{"type":"message","input_tokens":3}]`,
-		"string field":                    `[` + messageIteration(2, 463_139, 0) + `,{"type":"message","input_tokens":"2","cache_read_input_tokens":463141,"cache_creation_input_tokens":991}]`,
-		"negative field":                  `[` + messageIteration(2, 463_142, 0) + `,{"type":"message","input_tokens":-1,"cache_read_input_tokens":463141,"cache_creation_input_tokens":991}]`,
-		"last request smaller than first": `[` + messageIteration(2, 463_141, 991) + `,` + advisorIteration + `,` + messageIteration(2, 462_546, 593) + `]`,
-		"non-object entries":              `["x",7,null]`,
+		"not a list":                                 `{"a":1}`,
+		"empty list":                                 `[]`,
+		"no message iteration":                       `[` + advisorIteration + `]`,
+		"iterations do not add to top":               `[` + messageIteration(2, 400_000, 0) + `,` + messageIteration(2, 463_141, 991) + `]`,
+		"partial last iteration":                     `[` + messageIteration(2, 927_270, 0) + `,{"type":"message","input_tokens":3}]`,
+		"partial last iteration that is the largest": `[` + messageIteration(2, 400_000, 0) + `,{"type":"message","input_tokens":527273}]`,
+		"null field in an iteration":                 `[` + messageIteration(2, 463_141, 991) + `,{"type":"message","input_tokens":464134,"cache_read_input_tokens":null,"cache_creation_input_tokens":0}]`,
+		"string field":                               `[` + messageIteration(2, 463_139, 0) + `,{"type":"message","input_tokens":"2","cache_read_input_tokens":463141,"cache_creation_input_tokens":991}]`,
+		"negative field":                             `[` + messageIteration(2, 463_142, 0) + `,{"type":"message","input_tokens":-1,"cache_read_input_tokens":463141,"cache_creation_input_tokens":991}]`,
+		"last request smaller than first":            `[` + messageIteration(2, 463_141, 991) + `,` + advisorIteration + `,` + messageIteration(2, 462_546, 593) + `]`,
+		"non-object entries":                         `["x",7,null]`,
 	}
 	for name, iterations := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -138,6 +140,18 @@ func TestContextInjectIterationsFallBackToTopLevelSum(t *testing.T) {
 				t.Errorf("occupancy = %d (ok=%v), want the top-level sum %d", tokens, ok, top)
 			}
 		})
+	}
+}
+
+func TestContextInjectModelFallbackTurnReadsTopLevel(t *testing.T) {
+	// A turn that fell back to another model lists the first request and the
+	// fallback request, and its top-level fields are the fallback request
+	// alone: the newest request. The iterations do not add up to it, so it is
+	// read as the top level, unchanged by the advisor rule.
+	iterations := "[" + messageIteration(2, 143_868, 0) + `,{"type":"fallback_message","model":"claude-opus-4-8","input_tokens":2,"output_tokens":1,"cache_read_input_tokens":129064,"cache_creation_input_tokens":0}]`
+	p := writeTranscript(t, advisorUsageLine("claude-opus-4-8", 2, 129_064, 0, iterations))
+	if tokens, _, ok := lastTranscriptUsage(p); !ok || tokens != 129_066 {
+		t.Errorf("fallback turn occupancy = %d (ok=%v), want the top level 129066", tokens, ok)
 	}
 }
 
