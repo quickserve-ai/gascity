@@ -10590,16 +10590,12 @@ func TestGcBeadsBdStartManagedHelperReceivesStartLockFD(t *testing.T) {
 		"GC_FAKE_FD9_STATUS_FILE="+fd9StatusFile,
 		"PATH="+strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
 	)
-	cmd := exec.Command(script, "start")
-	cmd.Env = env
-	out, err := cmd.CombinedOutput()
+	out, err := runGcBeadsBdOpForTest(script, env, "start")
 	if err != nil {
 		t.Fatalf("gc-beads-bd start failed: %v\n%s", err, out)
 	}
 	t.Cleanup(func() {
-		stop := exec.Command(script, "stop")
-		stop.Env = env
-		_ = stop.Run()
+		_, _ = runGcBeadsBdOpForTest(script, env, "stop")
 	})
 
 	// ga-7yjvin: start-managed takes the lifecycle lock through the script's
@@ -10642,20 +10638,27 @@ func runGcBeadsBdStartWithFakeGCForTest(t *testing.T, extraEnv ...string) (strin
 		"GC_FAKE_DOLT_PID_FILE=" + doltPIDFile,
 		"PATH=" + strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
 	}, extraEnv...)...)
-	cmd := exec.Command(script, "start")
-	cmd.Env = env
-	out, err := cmd.CombinedOutput()
+	out, err := runGcBeadsBdOpForTest(script, env, "start")
 	t.Cleanup(func() {
-		stop := exec.Command(script, "stop")
-		stop.Env = env
-		_ = stop.Run()
+		_, _ = runGcBeadsBdOpForTest(script, env, "stop")
 		// The fake gc's stop-managed is a no-op, so a bare-started fake
 		// server would outlive the test.
 		killFakeDoltServersForTest(doltPIDFile)
 	})
 	invocation, _ := os.ReadFile(invocationFile)
 	logFile := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt-from-gc", "dolt.log")
-	return string(out), string(invocation), logFile, err
+	return out, string(invocation), logFile, err
+}
+
+// runGcBeadsBdOpForTest runs one gc-beads-bd operation with env and returns
+// its combined output. The ga-7yjvin start tests share it so the untagged
+// subprocess census carries one call site instead of a start and a stop per
+// test.
+func runGcBeadsBdOpForTest(script string, env []string, op string) (string, error) {
+	cmd := exec.Command(script, op)
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	return string(out), err
 }
 
 // killFakeDoltServersForTest kills every fake dolt sql-server that recorded
@@ -10801,32 +10804,23 @@ func TestGcBeadsBdStartWithoutHelperWarnsNoScopeWatchdog(t *testing.T) {
 	}
 	writeFakeManagedConfigWriterDolt(t, binDir)
 	doltPIDFile := filepath.Join(t.TempDir(), "fake-dolt-pids")
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	_ = ln.Close()
+	port := reserveRandomTCPPort(t)
 	env := sanitizedBaseEnv(
 		"GC_CITY_PATH="+cityPath,
 		"GC_DOLT_PORT="+strconv.Itoa(port),
 		"GC_FAKE_DOLT_PID_FILE="+doltPIDFile,
 		"PATH="+strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
 	)
-	cmd := exec.Command(script, "start")
-	cmd.Env = env
-	out, err := cmd.CombinedOutput()
+	out, err := runGcBeadsBdOpForTest(script, env, "start")
 	t.Cleanup(func() {
-		stop := exec.Command(script, "stop")
-		stop.Env = env
-		_ = stop.Run()
+		_, _ = runGcBeadsBdOpForTest(script, env, "stop")
 		killFakeDoltServersForTest(doltPIDFile)
 	})
 	if err != nil {
 		t.Fatalf("gc-beads-bd start without a helper failed: %v\n%s", err, out)
 	}
 	want := "WITHOUT a scope watchdog: no gc helper (GC_BIN unset)"
-	if !strings.Contains(string(out), want) {
+	if !strings.Contains(out, want) {
 		t.Fatalf("start output lacks %q:\n%s", want, out)
 	}
 	logFile := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "dolt.log")
