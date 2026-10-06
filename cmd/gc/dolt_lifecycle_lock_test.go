@@ -92,7 +92,7 @@ func TestStartManagedLifecycleLockHeldFDDoesNotBypassAnotherHolder(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer other.Close()
+	defer func() { _ = other.Close() }()
 	otherFD, err := syscall.Dup(int(other.Fd()))
 	if err != nil {
 		t.Fatal(err)
@@ -104,7 +104,7 @@ func TestStartManagedLifecycleLockHeldFDDoesNotBypassAnotherHolder(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer wrong.Close()
+	defer func() { _ = wrong.Close() }()
 	wrongFD, err := syscall.Dup(int(wrong.Fd()))
 	if err != nil {
 		t.Fatal(err)
@@ -222,7 +222,7 @@ func TestScopeWatchdogSpawnFailureIsRefusedOnlyAfterStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer logFile.Close()
+	defer func() { _ = logFile.Close() }()
 	oldExecutable := managedDoltTestExecutable
 	t.Cleanup(func() { managedDoltTestExecutable = oldExecutable })
 
