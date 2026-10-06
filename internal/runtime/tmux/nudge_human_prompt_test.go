@@ -167,6 +167,7 @@ type panePromptExecutor struct {
 	attached   bool
 	screen     string
 	captureErr error
+	provider   string
 	// styled answers capture-pane -e (the text-attribute read); empty means
 	// the screen itself, which carries no attributes.
 	styled    string
@@ -241,6 +242,9 @@ func (f *panePromptExecutor) execute(args []string) (string, error) {
 		return "1700000000", nil
 	case tmuxArgsContain(args, "show-environment"):
 		if args[len(args)-1] == "GC_PROVIDER" {
+			if f.provider != "" {
+				return "GC_PROVIDER=" + f.provider, nil
+			}
 			return "GC_PROVIDER=claude", nil
 		}
 		return "", errors.New("unknown variable: " + args[len(args)-1])
@@ -338,6 +342,63 @@ func newGuardTestTmux(fe *panePromptExecutor) (*Tmux, string) {
 	tm := NewTmuxWithConfig(DefaultConfig())
 	tm.exec = fe
 	return tm, fmt.Sprintf("guard-test-%d", guardSessionSeq.Add(1))
+}
+
+func TestSnapshotIdleHumanPrompts(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		screen   string
+		styled   string
+		provider string
+		attached bool
+		wantIdle bool
+	}{
+		{name: "detached question", screen: questionDialogFixture},
+		{name: "detached approval", screen: approvalPromptFixture},
+		{name: "human draft", screen: humanDraftFixture, attached: true},
+		// Unsent text on a DETACHED pane is not a human's draft to the
+		// lifecycle paths: on such a pane it is far more often gc's own
+		// (a dropped-Enter nudge, a cut paste), nothing could clear it, and
+		// the hold would never expire. The nudge guard applies the same rule.
+		{name: "detached draft does not hold", screen: humanDraftFixture, wantIdle: true},
+		// A bare numbered chooser (Claude's usage-limit "Stop and wait /
+		// Upgrade" has this shape) is not a question dialog: the idle timeout
+		// reclaims such a seat as it did before.
+		{name: "selection prompt does not hold", screen: "⏺ You've used your limit.\nPick one\n❯ 1. Stop and wait\n  2. Upgrade\n", wantIdle: true},
+		{name: "idle composer", screen: idleComposerFixture, wantIdle: true},
+		{name: "quoted dialog", screen: quotedDialogAboveComposerFixture, wantIdle: true},
+		{name: "other provider placeholder", screen: humanDraftFixture, provider: "codex", wantIdle: true},
+		{
+			name: "faint placeholder", attached: true, wantIdle: true,
+			screen: strings.Replace(idleComposerFixture, "❯\n", "❯ Try a question\n", 1),
+			styled: strings.Replace(idleComposerFixture, "❯\n", "❯ \x1b[2mTry a question\x1b[0m\n", 1),
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			fe := &panePromptExecutor{screen: tt.screen, styled: tt.styled, attached: tt.attached, provider: tt.provider}
+			tm, session := newGuardTestTmux(fe)
+			idle, err := tm.SnapshotIdle(session)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if idle != tt.wantIdle {
+				t.Fatalf("SnapshotIdle() = %v, want %v", idle, tt.wantIdle)
+			}
+			pending, err := tm.Pending(session)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if (pending == nil) != tt.wantIdle {
+				t.Fatalf("Pending() = %+v, want pending=%v", pending, !tt.wantIdle)
+			}
+			if pending != nil {
+				err := tm.Respond(session, runtime.InteractionResponse{RequestID: pending.RequestID, Action: "approve"})
+				if !errors.Is(err, runtime.ErrInteractionUnsupported) || len(fe.keyCalls()) != 0 {
+					t.Fatalf("terminal-only interaction response = %v, keys=%v", err, fe.keyCalls())
+				}
+			}
+		})
+	}
 }
 
 const guardTestNudge = "<system-reminder> You have a deferred reminder: check the queue </system-reminder>"

@@ -172,8 +172,8 @@ func (d *approvalDedup) clear(session string) {
 // InteractionProvider implementation
 // ---------------------------------------------------------------------------
 
-// Pending checks the tmux pane for an active Claude Code approval prompt.
-// Returns nil with no error if no approval is pending.
+// Pending checks the tmux pane for an active approval or terminal-only human
+// interaction. Returns nil with no error if no interaction is pending.
 func (t *Tmux) Pending(name string) (*runtime.PendingInteraction, error) {
 	paneText, err := t.CapturePane(name, 40)
 	if err != nil {
@@ -202,6 +202,15 @@ func (t *Tmux) Pending(name string) (*runtime.PendingInteraction, error) {
 	approval := parseApprovalPrompt(paneText)
 	if approval == nil {
 		t.approvalDedup().clear(name)
+		reason := t.classifyLifecycleHumanPrompt(name, name, strings.Split(paneText, "\n"), t.resolveIdlePromptPrefix(name))
+		if reason != "" {
+			hash := sha256.Sum256([]byte(paneText))
+			return &runtime.PendingInteraction{
+				RequestID: fmt.Sprintf("%s%x", humanPromptRequestPrefix, hash[:8]),
+				Kind:      "human-input",
+				Prompt:    "Complete the pending human interaction in the terminal.",
+			}, nil
+		}
 		return nil, nil
 	}
 
@@ -232,13 +241,17 @@ func (t *Tmux) Pending(name string) (*runtime.PendingInteraction, error) {
 }
 
 const (
-	respondVerifyAttempts = 3
-	respondVerifyMs       = 500
+	humanPromptRequestPrefix = "tmux-human-"
+	respondVerifyAttempts    = 3
+	respondVerifyMs          = 500
 )
 
 // Respond sends the appropriate keystroke to the tmux pane to approve or deny
 // a pending tool approval, then verifies the prompt was consumed.
 func (t *Tmux) Respond(name string, response runtime.InteractionResponse) error {
+	if strings.HasPrefix(response.RequestID, humanPromptRequestPrefix) {
+		return runtime.ErrInteractionUnsupported
+	}
 	// Verify the expected approval is still present before sending keys.
 	paneText, err := t.CapturePane(name, 40)
 	if err != nil {
