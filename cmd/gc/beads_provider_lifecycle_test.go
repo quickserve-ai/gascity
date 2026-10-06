@@ -9064,6 +9064,12 @@ case "$subcmd" in
           log_level="$2"
           shift 2
           ;;
+        --archive-level|--max-connections|--read-timeout-millis|--write-timeout-millis)
+          shift 2
+          ;;
+        --auto-gc-enabled=*)
+          shift
+          ;;
         *)
           echo "unexpected arg: $1" >&2
           exit 65
@@ -9321,14 +9327,31 @@ EOF
     printf 'GC_DOLT_CONFIG_FILE\t%%s\n' "$pack_dir/dolt-config.yaml"
     ;;
   "dolt-state start-managed")
+    if [ "${1:-}" = "--help" ]; then
+      echo "Usage: gc dolt-state start-managed [flags]"
+      echo "      --city string"
+      if [ "${GC_FAKE_START_MANAGED_OLD:-}" != "true" ]; then
+        echo "      --lifecycle-lock-fd int"
+      fi
+      exit 0
+    fi
     city=""
     host=""
     port=""
     log_level="warning"
+    lock_fd=""
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --city)
           city="$2"
+          shift 2
+          ;;
+        --lifecycle-lock-fd)
+          if [ "${GC_FAKE_START_MANAGED_OLD:-}" = "true" ]; then
+            echo "Error: unknown flag: --lifecycle-lock-fd" >&2
+            exit 1
+          fi
+          lock_fd="$2"
           shift 2
           ;;
         --host|--port|--user|--log-level|--timeout-ms)
@@ -9349,6 +9372,31 @@ EOF
     state_file="$pack_dir/dolt-provider-state.json"
     pid_file="$pack_dir/dolt.pid"
     printf 'gc dolt-state start-managed\n' >> "$invocation_file"
+    if [ -n "${GC_FAKE_START_MANAGED_FAIL:-}" ]; then
+      echo "gc dolt-state start-managed: $GC_FAKE_START_MANAGED_FAIL" >&2
+      if [ "${GC_FAKE_START_MANAGED_REFUSED:-}" = "true" ]; then
+        printf 'refused\ttrue\n'
+      fi
+      printf 'ready\tfalse\npid\t0\nport\t%%s\naddress_in_use\tfalse\n' "$port"
+      printf 'error\t%%s\n' "$GC_FAKE_START_MANAGED_FAIL"
+      exit 1
+    fi
+    if [ "${GC_FAKE_START_MANAGED_LOCKS:-}" = "true" ]; then
+      # Model the real start-managed: a non-blocking exclusive flock on the
+      # lifecycle lock, through the inherited fd when told one, else through
+      # a fresh open of the lock file (a separate open file description).
+      if [ -n "$lock_fd" ]; then
+        if ! flock -n "$lock_fd"; then
+          echo "gc dolt-state start-managed: managed dolt lifecycle is busy" >&2
+          printf 'refused\ttrue\nerror\tmanaged dolt lifecycle is busy\n'
+          exit 1
+        fi
+      elif ! flock -n "$pack_dir/dolt.lock" true; then
+        echo "gc dolt-state start-managed: managed dolt lifecycle is busy" >&2
+        printf 'refused\ttrue\nerror\tmanaged dolt lifecycle is busy\n'
+        exit 1
+      fi
+    fi
     if [ -n "${GC_FAKE_FD9_STATUS_FILE:-}" ]; then
       if (: >&9) 2>/dev/null; then
         printf 'open\n' > "$GC_FAKE_FD9_STATUS_FILE"
@@ -9458,6 +9506,12 @@ case "${1:-}" in
     if [ "${GC_FAKE_DOLT_FAIL_SQL_SERVER:-}" = "true" ]; then
       echo "unexpected dolt sql-server invocation" >&2
       exit 97
+    fi
+    if [ -n "${GC_FAKE_DOLT_INVOCATION_FILE:-}" ]; then
+      printf 'sql-server\n' >> "$GC_FAKE_DOLT_INVOCATION_FILE"
+    fi
+    if [ -n "${GC_FAKE_DOLT_PID_FILE:-}" ]; then
+      printf '%s\n' "$$" >> "$GC_FAKE_DOLT_PID_FILE"
     fi
     config_file=""
     prev=""
@@ -10511,7 +10565,7 @@ func TestGcBeadsBdStartUsesGCBinManagedConfigWriter(t *testing.T) {
 	}
 }
 
-func TestGcBeadsBdStartManagedHelperDoesNotInheritStartLockFD(t *testing.T) {
+func TestGcBeadsBdStartManagedHelperReceivesStartLockFD(t *testing.T) {
 	cityPath := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
 		t.Fatal(err)
@@ -10548,9 +10602,236 @@ func TestGcBeadsBdStartManagedHelperDoesNotInheritStartLockFD(t *testing.T) {
 		_ = stop.Run()
 	})
 
+	// ga-7yjvin: start-managed takes the lifecycle lock through the script's
+	// fd 9 (--lifecycle-lock-fd 9) and marks it close-on-exec itself, so the
+	// fd must reach it open; a closed fd 9 forces a fresh open that the
+	// script's own lock refuses.
 	status := strings.TrimSpace(string(mustReadFile(t, fd9StatusFile)))
-	if status != "closed" {
-		t.Fatalf("dolt-state start-managed inherited fd 9 = %q, want closed", status)
+	if status != "open" {
+		t.Fatalf("dolt-state start-managed fd 9 = %q, want open (passed as --lifecycle-lock-fd)", status)
+	}
+}
+
+// runGcBeadsBdStartWithFakeGCForTest runs `gc-beads-bd start` against the
+// fake gc helper and a fake dolt that fails if the script ever falls back to
+// launching `dolt sql-server` itself. It returns the combined output, the
+// gc invocation log, the path of the managed dolt log, and the start error.
+func runGcBeadsBdStartWithFakeGCForTest(t *testing.T, extraEnv ...string) (string, string, string, error) {
+	t.Helper()
+	if _, err := exec.LookPath("flock"); err != nil {
+		t.Skip("flock not installed")
+	}
+	cityPath := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	materializeBuiltinPacksForTest(t, cityPath)
+	script := gcBeadsBdScriptPath(cityPath)
+	binDir := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	invocationFile := filepath.Join(t.TempDir(), "gc-invocation")
+	fakeGC := writeFakeManagedConfigWriterGC(t, binDir, invocationFile)
+	writeFakeManagedConfigWriterDolt(t, binDir)
+	doltPIDFile := filepath.Join(t.TempDir(), "fake-dolt-pids")
+	env := sanitizedBaseEnv(append([]string{
+		"GC_CITY_PATH=" + cityPath,
+		"GC_BIN=" + fakeGC,
+		"GC_FAKE_DOLT_FAIL_SQL_SERVER=true",
+		"GC_FAKE_DOLT_PID_FILE=" + doltPIDFile,
+		"PATH=" + strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
+	}, extraEnv...)...)
+	cmd := exec.Command(script, "start")
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	t.Cleanup(func() {
+		stop := exec.Command(script, "stop")
+		stop.Env = env
+		_ = stop.Run()
+		// The fake gc's stop-managed is a no-op, so a bare-started fake
+		// server would outlive the test.
+		killFakeDoltServersForTest(doltPIDFile)
+	})
+	invocation, _ := os.ReadFile(invocationFile)
+	logFile := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt-from-gc", "dolt.log")
+	return string(out), string(invocation), logFile, err
+}
+
+// killFakeDoltServersForTest kills every fake dolt sql-server that recorded
+// its own pid in pidFile (GC_FAKE_DOLT_PID_FILE). Only pids the fake wrote are
+// signalled.
+func killFakeDoltServersForTest(pidFile string) {
+	data, err := os.ReadFile(pidFile)
+	if err != nil {
+		return
+	}
+	for _, field := range strings.Fields(string(data)) {
+		if pid, convErr := strconv.Atoi(field); convErr == nil && pid > 1 {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+	}
+}
+
+// ga-7yjvin: op_start holds the lifecycle flock on fd 9 and then asks
+// `gc dolt-state start-managed` to start the server. start-managed takes the
+// same lifecycle lock non-blocking. Through a fresh open of the lock file it
+// is always refused as busy, and the script then fell back to a bare
+// `dolt sql-server` with no scope watchdog.
+func TestGcBeadsBdStartManagedHelperIsNotRefusedByTheScriptsOwnStartLock(t *testing.T) {
+	out, invocation, logFile, err := runGcBeadsBdStartWithFakeGCForTest(t, "GC_FAKE_START_MANAGED_LOCKS=true")
+	if err != nil {
+		t.Fatalf("gc-beads-bd start failed: %v\n%s", err, out)
+	}
+	if strings.Contains(out, "lifecycle is busy") {
+		t.Fatalf("start-managed was refused by the script's own start lock:\n%s", out)
+	}
+	if strings.Count(invocation, "gc dolt-state start-managed\n") != 1 {
+		t.Fatalf("start-managed invocation count != 1:\n%s", invocation)
+	}
+	if data, _ := os.ReadFile(logFile); strings.Contains(string(data), "unexpected dolt sql-server invocation") {
+		t.Fatalf("script fell back to a bare dolt sql-server start:\n%s", data)
+	}
+}
+
+// ga-7yjvin: when start-managed refuses (a bare start could add a second
+// server or override ownership), the start must fail with the helper's reason
+// and must not launch `dolt sql-server` itself.
+func TestGcBeadsBdStartFailsWhenStartManagedRefuses(t *testing.T) {
+	out, _, logFile, err := runGcBeadsBdStartWithFakeGCForTest(t,
+		"GC_FAKE_START_MANAGED_FAIL=simulated helper refusal",
+		"GC_FAKE_START_MANAGED_REFUSED=true",
+	)
+	if err == nil {
+		t.Fatalf("gc-beads-bd start succeeded after start-managed failed:\n%s", out)
+	}
+	if !strings.Contains(out, "simulated helper refusal") {
+		t.Fatalf("start error does not carry the helper's reason:\n%s", out)
+	}
+	if data, _ := os.ReadFile(logFile); strings.Contains(string(data), "unexpected dolt sql-server invocation") {
+		t.Fatalf("script fell back to a bare dolt sql-server start:\n%s", data)
+	}
+}
+
+// ga-7yjvin: the disk floor (checkManagedDoltDiskPreflight) is a plain error,
+// not a refusal, ON PURPOSE: the script then takes the bare start with no disk
+// check, which is what production has always run. Refusing to start the
+// database over the floor is a separate decision. The fallback says why.
+func TestGcBeadsBdStartDiskFloorFailureIntentionallyFallsBackToBareStart(t *testing.T) {
+	doltInvocations := filepath.Join(t.TempDir(), "dolt-invocation")
+	out, _, logFile, err := runGcBeadsBdStartWithFakeGCForTest(t,
+		"GC_FAKE_START_MANAGED_FAIL=insufficient disk",
+		"GC_FAKE_DOLT_FAIL_SQL_SERVER=",
+		"GC_FAKE_DOLT_INVOCATION_FILE="+doltInvocations,
+	)
+	if err != nil {
+		t.Fatalf("gc-beads-bd start failed instead of falling back: %v\n%s", err, out)
+	}
+	want := "WITHOUT a scope watchdog: gc helper failed: insufficient disk"
+	if !strings.Contains(out, want) {
+		t.Fatalf("start output lacks %q:\n%s", want, out)
+	}
+	data, _ := os.ReadFile(logFile)
+	if !strings.Contains(string(data), want) {
+		t.Fatalf("dolt log lacks %q:\n%s", want, data)
+	}
+	if got := strings.TrimSpace(string(mustReadFile(t, doltInvocations))); got != "sql-server" {
+		t.Fatalf("bare dolt sql-server launches = %q, want exactly one", got)
+	}
+}
+
+// ga-7yjvin: start-managed whose scope watchdog started and then failed the
+// handshake may have left a server behind. It reports refused, and the script
+// must not bare-start a second server.
+func TestGcBeadsBdStartDoesNotBareStartAfterWatchdogSpawnedThenFailed(t *testing.T) {
+	reason := "scope watchdog handshake timed out; a server may have been spawned"
+	out, _, logFile, err := runGcBeadsBdStartWithFakeGCForTest(t,
+		"GC_FAKE_START_MANAGED_FAIL="+reason,
+		"GC_FAKE_START_MANAGED_REFUSED=true",
+	)
+	if err == nil {
+		t.Fatalf("gc-beads-bd start succeeded after a post-spawn refusal:\n%s", out)
+	}
+	if !strings.Contains(out, reason) {
+		t.Fatalf("start error does not carry the helper's reason:\n%s", out)
+	}
+	if data, _ := os.ReadFile(logFile); strings.Contains(string(data), "unexpected dolt sql-server invocation") || strings.Contains(string(data), "WITHOUT a scope watchdog") {
+		t.Fatalf("script fell back to a bare dolt sql-server start:\n%s", data)
+	}
+}
+
+// ga-7yjvin version skew: a gc helper older than the script has no
+// --lifecycle-lock-fd. The start must not die on the unknown flag; it falls
+// back to the bare start and says why.
+func TestGcBeadsBdStartWithHelperTooOldForLockFDFallsBackWithWarning(t *testing.T) {
+	out, invocation, logFile, err := runGcBeadsBdStartWithFakeGCForTest(t,
+		"GC_FAKE_START_MANAGED_OLD=true",
+		"GC_FAKE_DOLT_FAIL_SQL_SERVER=",
+	)
+	if err != nil {
+		t.Fatalf("gc-beads-bd start failed against an old gc helper: %v\n%s", err, out)
+	}
+	if strings.Contains(invocation, "gc dolt-state start-managed\n") {
+		t.Fatalf("start-managed was called with a flag the old helper rejects:\n%s", invocation)
+	}
+	want := "WITHOUT a scope watchdog: gc helper"
+	if !strings.Contains(out, want) || !strings.Contains(out, "--lifecycle-lock-fd") {
+		t.Fatalf("start output lacks the too-old warning %q:\n%s", want, out)
+	}
+	if data, _ := os.ReadFile(logFile); !strings.Contains(string(data), want) {
+		t.Fatalf("dolt log lacks the too-old warning %q:\n%s", want, data)
+	}
+}
+
+// With no gc helper the bare start is by design; it must say it runs without
+// a scope watchdog, on stderr and in the dolt log.
+func TestGcBeadsBdStartWithoutHelperWarnsNoScopeWatchdog(t *testing.T) {
+	if _, err := exec.LookPath("flock"); err != nil {
+		t.Skip("flock not installed")
+	}
+	cityPath := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	materializeBuiltinPacksForTest(t, cityPath)
+	script := gcBeadsBdScriptPath(cityPath)
+	binDir := filepath.Join(t.TempDir(), "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFakeManagedConfigWriterDolt(t, binDir)
+	doltPIDFile := filepath.Join(t.TempDir(), "fake-dolt-pids")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+	env := sanitizedBaseEnv(
+		"GC_CITY_PATH="+cityPath,
+		"GC_DOLT_PORT="+strconv.Itoa(port),
+		"GC_FAKE_DOLT_PID_FILE="+doltPIDFile,
+		"PATH="+strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
+	)
+	cmd := exec.Command(script, "start")
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	t.Cleanup(func() {
+		stop := exec.Command(script, "stop")
+		stop.Env = env
+		_ = stop.Run()
+		killFakeDoltServersForTest(doltPIDFile)
+	})
+	if err != nil {
+		t.Fatalf("gc-beads-bd start without a helper failed: %v\n%s", err, out)
+	}
+	want := "WITHOUT a scope watchdog: no gc helper (GC_BIN unset)"
+	if !strings.Contains(string(out), want) {
+		t.Fatalf("start output lacks %q:\n%s", want, out)
+	}
+	logFile := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "dolt.log")
+	if data, _ := os.ReadFile(logFile); !strings.Contains(string(data), want) {
+		t.Fatalf("dolt log %s lacks %q:\n%s", logFile, want, data)
 	}
 }
 
