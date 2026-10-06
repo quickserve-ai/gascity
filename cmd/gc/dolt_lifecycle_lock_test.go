@@ -114,6 +114,21 @@ func TestStartManagedLifecycleLockHeldFDDoesNotBypassAnotherHolder(t *testing.T)
 	}
 }
 
+// A standard descriptor is refused before it is adopted, and is left open:
+// closing fd 1 would swallow the failure report the script parses, and a lock
+// on fd 2 would ride into the watchdog, which is handed stderr.
+func TestStartManagedLifecycleLockRejectsStandardDescriptors(t *testing.T) {
+	cityPath, _, _ := startManagedLockTestCity(t)
+	for fd := 0; fd <= 2; fd++ {
+		if _, err := acquireStartManagedLifecycleLock(cityPath, fd); err == nil || !strings.Contains(err.Error(), "standard descriptor") {
+			t.Fatalf("fd %d admission err = %v, want a standard-descriptor refusal", fd, err)
+		}
+		if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err != nil {
+			t.Fatalf("fd %d was closed by the refusal: %v", fd, err)
+		}
+	}
+}
+
 // gc-beads-bd.sh probes `start-managed --help` for --lifecycle-lock-fd before
 // passing it, so an older gc falls back instead of failing the start. Pin
 // that the hidden command's help lists the flag, exits 0, and runs nothing.
