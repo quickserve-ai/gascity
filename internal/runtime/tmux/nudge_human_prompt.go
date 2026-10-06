@@ -531,6 +531,17 @@ func (t *Tmux) classifyPaneLines(session, target string, lines []string, checkDr
 	return reason
 }
 
+// classifyLifecycleHumanPrompt protects human input from session teardown,
+// even after a client detaches. Other providers' non-faint placeholders are
+// not distinguishable from drafts, so only Claude drafts are classified.
+func (t *Tmux) classifyLifecycleHumanPrompt(target string, lines []string, prefix string) string {
+	reason := classifyHumanPrompt(lines, prefix, true)
+	if reason == NudgeDeferReasonHumanDraft && (!t.paneIsClaudeFamily(target) || t.composerHoldsOnlyDimText(target, prefix)) {
+		return ""
+	}
+	return reason
+}
+
 // composerHoldsOnlyDimText re-reads the pane WITH its text attributes and
 // reports whether the composer's apparent draft is all faint (SGR 2) text.
 // An empty Claude composer draws a placeholder there in faint text -- on a

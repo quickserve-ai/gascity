@@ -140,6 +140,7 @@ cmd_gc_integration_tests=(
   TestPhase2RealTransportResultStillFailsWhenGenuinelyBroken
   TestPhase2RealTransportResultToleratesASlowButCorrectStart
   TestPhase2WorkerCoreRealTransportProof
+  TestReconcileSessionBeads_ContentIdleTimeoutPreservesQuestionDialog
   TestRigAddIncludeResolvesScopedRegistryPackName
   TestStorageGateServesACityFromItsBeadsWorkspace
 )

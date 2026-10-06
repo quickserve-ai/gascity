@@ -455,6 +455,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Human prompts no longer count as content-idle in tmux.** Question and
+  permission dialogs, and unsent Claude drafts even after detaching, reset
+  the content idle clock and hold lifecycle timers through pending-interaction
+  detection. Faint placeholders and complete gc reminders remain exempt.
+  Terminal-only interactions must be completed in the terminal; API responses
+  are rejected without sending keystrokes.
+
 - **The reaper's stale-issue auto-close works again when an open bead
   depends on a wisp or external bead.** Such a dependency has no
   `depends_on_issue_id`, and that NULL emptied the active-dependency exclusion,
