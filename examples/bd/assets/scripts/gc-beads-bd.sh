@@ -2426,7 +2426,7 @@ wait_for_managed_pid_ready() {
 }
 
 load_start_managed_from_gc() {
-    local gc_bin host output key value status parsed=false
+    local gc_bin host output key value status parsed=false help probe_status=0 refused=false
     host=$(connect_host)
     gc_bin=$(resolve_gc_helper_bin)
     GC_START_MANAGED_USED="false"
@@ -2434,9 +2434,38 @@ load_start_managed_from_gc() {
     GC_START_PID=""
     GC_START_PORT="$DOLT_PORT"
     GC_START_ADDRESS_IN_USE="false"
-    [ -n "$gc_bin" ] || return 1
-    GC_START_MANAGED_USED="true"
-    output=$("$gc_bin" dolt-state start-managed --city "$GC_CITY_PATH" --host "$DOLT_HOST" --port "$DOLT_PORT" --user "$DOLT_USER" --log-level "$DOLT_LOGLEVEL" --timeout-ms 30000 9>&- </dev/null 2>/dev/null)
+    GC_START_ERROR=""
+    GC_START_UNWATCHED_REASON=""
+    if [ -z "$gc_bin" ]; then
+        GC_START_UNWATCHED_REASON="no gc helper (GC_BIN unset)"
+        return 1
+    fi
+    # A gc older than this script has no --lifecycle-lock-fd and would refuse
+    # the call on an unknown flag. Ask its --help first (cobra prints usage and
+    # exits before any hook or RunE runs; fd 9 closed, stdin /dev/null). An
+    # old helper, or a failed probe, gets the pre-ga-7yjvin outcome: a bare
+    # start, not a dead data plane.
+    help=$("$gc_bin" dolt-state start-managed --help </dev/null 9>&- 2>&1) || probe_status=$?
+    if [ "$probe_status" -ne 0 ]; then
+        GC_START_UNWATCHED_REASON="gc helper $gc_bin start-managed --help probe failed (exit $probe_status)"
+        return 1
+    fi
+    case "$help" in
+        *--lifecycle-lock-fd*) ;;
+        *)
+            GC_START_UNWATCHED_REASON="gc helper $gc_bin is too old to take the held lifecycle lock (start-managed --help does not list --lifecycle-lock-fd)"
+            return 1
+            ;;
+    esac
+    # op_start holds the lifecycle flock on fd 9. start-managed takes the same
+    # lock; through a fresh open of the lock file the script's own lock always
+    # refused it as busy, and op_start fell back to an unwatched bare start
+    # (ga-7yjvin). Hand it fd 9 instead: it locks through this open file
+    # description and marks the fd close-on-exec, so the dolt server and scope
+    # watchdog it spawns do not inherit the lock. stderr stays /dev/null: the
+    # watchdog inherits it as its escalation channel. Failures arrive on stdout
+    # as error/refused lines.
+    output=$("$gc_bin" dolt-state start-managed --city "$GC_CITY_PATH" --host "$DOLT_HOST" --port "$DOLT_PORT" --user "$DOLT_USER" --log-level "$DOLT_LOGLEVEL" --timeout-ms 30000 --lifecycle-lock-fd 9 </dev/null 2>/dev/null)
     status=$?
     while IFS="$(printf '	')" read -r key value; do
         case "$key" in
@@ -2456,15 +2485,33 @@ load_start_managed_from_gc() {
                 GC_START_ADDRESS_IN_USE="$value"
                 parsed=true
                 ;;
+            error)
+                GC_START_ERROR="$value"
+                ;;
+            refused)
+                refused="$value"
+                ;;
         esac
     done <<EOF
 $output
 EOF
-    if [ "$status" -ne 0 ] && [ "$parsed" != "true" ]; then
-        GC_START_MANAGED_USED="false"
+    if [ "$status" -eq 0 ]; then
+        GC_START_MANAGED_USED="true"
+        return 0
+    fi
+    # Whether a failure may fall back to the bare start (ga-7yjvin):
+    # - refused: a bare start could add a second server or override an
+    #   ownership decision. op_start dies with the reason.
+    # - the helper got as far as a server (pid, ready, or address in use): a
+    #   server may exist. op_start dies, as it always has on this path.
+    # - anything else (an error line only, or nothing at all, e.g. a crash):
+    #   fall back to the bare start production has always run, and say so.
+    if [ "$refused" = "true" ] || [ -n "$GC_START_PID" ] || [ "$GC_START_READY" = "true" ] || [ "$GC_START_ADDRESS_IN_USE" = "true" ]; then
+        GC_START_MANAGED_USED="true"
         return 1
     fi
-    [ "$status" -eq 0 ]
+    GC_START_UNWATCHED_REASON="gc helper failed: ${GC_START_ERROR:-no reason reported}"
+    return 1
 }
 
 wait_for_concurrent_start_ready() {
@@ -3177,10 +3224,16 @@ op_start() {
             DOLT_PORT="$GC_START_PORT"
             rm -f "$PID_FILE"
             save_state 0 false
-            die "dolt server could not start via gc helper (check $LOG_FILE)"
+            die "dolt server could not start via gc helper: ${GC_START_ERROR:-start-managed gave no reason} (check $LOG_FILE)"
         fi
         break
     done
+
+    # Only reached when load_start_managed_from_gc left the start to this
+    # script (no helper, a helper too old for --lifecycle-lock-fd, or a helper
+    # failure that is neither a refusal nor past a spawned server); it set the
+    # reason. Say so where start failures are read: stderr and the dolt log.
+    echo "warning: starting dolt sql-server WITHOUT a scope watchdog: ${GC_START_UNWATCHED_REASON:-gc helper not used}" | tee -a "$LOG_FILE" >&2 || true
 
     local launch_attempt=0
     while [ "$launch_attempt" -lt 5 ]; do
