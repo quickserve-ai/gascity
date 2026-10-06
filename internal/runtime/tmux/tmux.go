@@ -5788,7 +5788,7 @@ func idlePromptPrefix(configured string) string {
 // resolves the prefix once and polls snapshotPaneIdleWithPrefix directly so its
 // loop does not re-exec tmux show-environment on every 200ms tick.
 func (t *Tmux) snapshotPaneIdle(session string) (bool, error) {
-	return t.snapshotPaneIdleWithPrefix(session, t.resolveIdlePromptPrefix(session))
+	return t.snapshotPaneIdleWithPrefix(session, t.resolveIdlePromptPrefix(session), true)
 }
 
 // resolveIdlePromptPrefix reads the session's configured ready-prompt prefix,
@@ -5803,20 +5803,27 @@ func (t *Tmux) resolveIdlePromptPrefix(session string) string {
 // snapshotPaneIdleWithPrefix is the pure pane scan behind idle detection: it
 // captures the pane once and reports whether it shows promptPrefix with no
 // active-processing indicator. A busy-indicator string anywhere in the capture
-// is the scan's only busy reading, (false, nil): usually the live indicator,
+// is the scan's busy reading, (false, nil): usually the live indicator,
 // though a stale frame or transcript text that contains one reads the same. A
 // capture showing neither an indicator string nor the prompt returns
 // [runtime.ErrIdleIndeterminate]: the prompt may be scrolled away, covered by
 // an alternate screen, or overwritten by a broadcast message, so its absence is
 // not evidence of work. A capture error is returned verbatim so callers can
 // distinguish a session that has gone away (ErrSessionNotFound / ErrNoServer)
-// from a transient read failure.
-func (t *Tmux) snapshotPaneIdleWithPrefix(session, promptPrefix string) (bool, error) {
+// from a transient read failure. With protectHumanPrompt, a human prompt or an
+// unsent human draft on the pane also reads (false, nil) (pl-9pye).
+func (t *Tmux) snapshotPaneIdleWithPrefix(session, promptPrefix string, protectHumanPrompt bool) (bool, error) {
 	lines, err := t.CapturePaneLines(session, promptObservationLines)
 	if err != nil {
 		return false, err
 	}
 	if paneContainsBusyIndicator(lines) {
+		return false, nil
+	}
+	// The content clock protects unsent human input even on detached panes.
+	// WaitForIdle also serves nudge submission, so it keeps its boundary-only
+	// semantics rather than waiting for the composer's draft to disappear.
+	if protectHumanPrompt && t.classifyLifecycleHumanPrompt(session, lines, promptPrefix) != "" {
 		return false, nil
 	}
 	if PaneShowsIdlePrompt(lines, promptPrefix) {
@@ -5867,12 +5874,13 @@ func PaneShowsIdlePrompt(lines []string, promptPrefix string) bool {
 }
 
 // SnapshotIdle reports whether the named session is at an idle interactive
-// boundary right now — a ready prompt with no active-processing indicator — in
-// a single non-blocking observation. It implements
+// boundary right now — a ready prompt with no active-processing indicator or
+// human prompt/draft — in a single non-blocking observation. It implements
 // [runtime.IdleSnapshotProvider]: (false, nil) means the capture contains a
-// busy-indicator string (see snapshotPaneIdleWithPrefix), and a pane showing
-// neither that nor the ready prompt returns [runtime.ErrIdleIndeterminate]. A
-// session that has gone away is reported as an error, not as idle.
+// busy-indicator string or a human prompt/draft (see
+// snapshotPaneIdleWithPrefix), and a pane showing neither that nor the ready
+// prompt returns [runtime.ErrIdleIndeterminate]. A session that has gone away
+// is reported as an error, not as idle.
 func (t *Tmux) SnapshotIdle(session string) (bool, error) {
 	return t.snapshotPaneIdle(session)
 }
@@ -5913,7 +5921,7 @@ func (t *Tmux) WaitForIdle(ctx context.Context, session string, timeout time.Dur
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		idle, err := t.snapshotPaneIdleWithPrefix(target, promptPrefix)
+		idle, err := t.snapshotPaneIdleWithPrefix(target, promptPrefix, false)
 		if err != nil {
 			// Distinguish terminal errors from transient ones.
 			// Session not found or no server means the session is gone —
