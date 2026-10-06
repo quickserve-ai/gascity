@@ -92,10 +92,11 @@ function toWhosWaitingSession(session: SessionResponse): WhosWaitingSession {
 /** Carry the probe outcome across verbatim; only `pending` gains detail. */
 function toWhosWaitingProbe(probe: AgentPendingProbe): WhosWaitingProbe {
   if (probe.outcome === 'pending' && probe.pending !== undefined) {
-    const row: { seat: string; outcome: 'pending'; prompt?: string; toolName?: string } = {
+    const row: { seat: string; outcome: 'pending'; prompt?: string; toolName?: string; kind?: string } = {
       seat: probe.agentName,
       outcome: 'pending',
     };
+    if (probe.pending.kind !== undefined) row.kind = probe.pending.kind;
     if (probe.pending.prompt !== undefined) row.prompt = probe.pending.prompt;
     const toolName = probe.pending.metadata?.['tool_name'];
     if (toolName !== undefined) row.toolName = toolName;
