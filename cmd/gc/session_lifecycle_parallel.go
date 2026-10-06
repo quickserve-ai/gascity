@@ -1586,6 +1586,13 @@ func resolvePreparedTaskWorkDir(
 	store beads.Store,
 	workDirResolver taskWorkDirResolver,
 ) string {
+	// A configured named session always launches in its own work dir. A task
+	// it is assigned may have been started by a pool worker, and that task's
+	// work_dir is the worker's worktree: launched there, the seat would run its
+	// git commands in a checkout it does not own (ga-5iu30d).
+	if candidate.info.ConfiguredNamedSession {
+		return ""
+	}
 	// Prepared drain items only: the item step's copied metadata can still name
 	// the launcher checkout before prepare-worktree runs. Deliberately NOT the
 	// full resolveTaskBeadWorkDir chain — that would put the trigger bead ahead
