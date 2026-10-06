@@ -531,13 +531,29 @@ func (t *Tmux) classifyPaneLines(session, target string, lines []string, checkDr
 	return reason
 }
 
-// classifyLifecycleHumanPrompt protects human input from session teardown,
-// even after a client detaches. Other providers' non-faint placeholders are
-// not distinguishable from drafts, so only Claude drafts are classified.
-func (t *Tmux) classifyLifecycleHumanPrompt(target string, lines []string, prefix string) string {
-	reason := classifyHumanPrompt(lines, prefix, true)
-	if reason == NudgeDeferReasonHumanDraft && (!t.paneIsClaudeFamily(target) || t.composerHoldsOnlyDimText(target, prefix)) {
+// classifyLifecycleHumanPrompt is the lifecycle paths' (idle timeout, max
+// age, drain, sleep) read of a pane: a question dialog or an approval prompt
+// holds the seat whether or not a client is attached, because the human who
+// must answer it may come back. A DRAFT holds only while a client is attached,
+// the nudge guard's rule: on a detached pane unsent text is far more often
+// gc's own (a nudge whose Enter was dropped, a paste cut mid-reminder, a
+// startup prompt left on the line) than a person's, nothing could ever clear
+// it, and a hold on it would never expire (fork PR 243, independent read F2).
+// A SELECTION prompt that is neither (a bare numbered chooser, Claude's
+// usage-limit "Stop and wait / Upgrade" among them) does not hold: before this
+// change the idle timeout reclaimed such a seat, and it keeps doing so (F1).
+// Other providers' non-faint placeholders are not distinguishable from
+// drafts, so only Claude drafts are classified.
+func (t *Tmux) classifyLifecycleHumanPrompt(session, target string, lines []string, prefix string) string {
+	draft := t.sessionClientCount(session) != 0 && t.paneIsClaudeFamily(target)
+	reason := classifyHumanPrompt(lines, prefix, draft)
+	switch reason {
+	case NudgeDeferReasonSelectionPrompt:
 		return ""
+	case NudgeDeferReasonHumanDraft:
+		if t.composerHoldsOnlyDimText(target, prefix) {
+			return ""
+		}
 	}
 	return reason
 }
