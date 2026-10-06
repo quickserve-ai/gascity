@@ -56,6 +56,60 @@ type transcriptUsage struct {
 	InputTokens              int `json:"input_tokens"`
 	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	// Iterations lists the requests one turn made, when it made more than one
+	// (an advisor consult). Kept raw so an odd shape inside it can never cost
+	// the entry itself: see transcriptUsageOccupancy.
+	Iterations json.RawMessage `json:"iterations"`
+}
+
+// transcriptUsageOccupancy is the context footprint of one usage block.
+//
+// A turn that consults the advisor makes more than one request: iterations
+// holds the executor's request, the advisor's own request (another model,
+// another window) and the executor's request again, and the block's top-level
+// fields are the SUM of the executor requests. Adding them read 927k at a true
+// 464k, which is the urgent tier at half fill. The footprint is the LAST
+// executor request (type "message").
+//
+// Reading LOW is the dangerous direction, so the last iteration is trusted
+// only when the block proves the shape: every message iteration reads as
+// non-negative ints, together they add up to exactly the top-level sum, and
+// the last is not smaller than an earlier one (a context only grows inside one
+// turn). Any other shape falls back to the top-level sum, which can only read
+// high.
+func transcriptUsageOccupancy(u *transcriptUsage) int {
+	top := u.InputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens
+	var iterations []json.RawMessage
+	if len(u.Iterations) == 0 || json.Unmarshal(u.Iterations, &iterations) != nil {
+		return top
+	}
+	sum, last, largest, seen := 0, 0, 0, false
+	for _, raw := range iterations {
+		var kind struct {
+			Type any `json:"type"`
+		}
+		if json.Unmarshal(raw, &kind) != nil || kind.Type != "message" {
+			continue
+		}
+		var it struct {
+			InputTokens              int `json:"input_tokens"`
+			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+		}
+		if json.Unmarshal(raw, &it) != nil || it.InputTokens < 0 || it.CacheReadInputTokens < 0 || it.CacheCreationInputTokens < 0 {
+			return top
+		}
+		last = it.InputTokens + it.CacheReadInputTokens + it.CacheCreationInputTokens
+		sum += last
+		if last > largest {
+			largest = last
+		}
+		seen = true
+	}
+	if !seen || last <= 0 || sum != top || last < largest {
+		return top
+	}
+	return last
 }
 
 // contextInjectLine returns the context-usage guidance line for the session
@@ -150,7 +204,8 @@ func lastTranscriptUsage(path string) (tokens int, models []string, ok bool) {
 		}
 		// Tokens: the LAST qualifying entry is the live context size (after a
 		// compaction the newest entry reads low again).
-		tokens = u.InputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens
+		// A turn with several requests counts its last one, not their sum.
+		tokens = transcriptUsageOccupancy(u)
 		if m := entry.Message.Model; m != "" {
 			models = append(models, m)
 		}
