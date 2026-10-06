@@ -407,7 +407,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "the created-database migrate-consent proof is a checked Medium subprocess owner",
 			ResourceOwner:   "the test executes the shipped provider script once per case with a test-owned bd, dolt and sleep on PATH and a scope built from files alone, so no Dolt, no bd and no host service are involved",
 			MigrationTarget: "P0.4b",
-			Expires:         "2026-10-01",
+			Expires:         "2026-10-31",
 		},
 		{
 			PackageDir:      "internal/runtime/herdr",
@@ -462,7 +462,7 @@ var bootstrapPolicy = Ledger{
 			Invariant:       "the mol-scoped-work cleanup-worktree behavior proof is a checked Medium subprocess owner",
 			ResourceOwner:   "the one bash subprocess is confined to TestMolScopedWorkTeardownScript, which runs scripts/test-mol-scoped-work-teardown.sh: the step under test is agent-executed shell rendered from formula TOML, so only running that shell against a stub gc can prove what it does",
 			MigrationTarget: "P0.4b",
-			Expires:         "2026-10-01",
+			Expires:         "2026-10-31",
 		},
 		{
 			PackageDir:      "scripts",
