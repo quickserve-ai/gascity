@@ -78,6 +78,13 @@ func acquireStartManagedLifecycleLock(cityPath string, heldFD int) (func(), erro
 		}
 		return func() { releaseManagedDoltLifecycleLock(lock) }, nil
 	}
+	// fd 0-2 are never the caller's lock: adopting one would close this
+	// process's own stdin, stdout or stderr on the way out (stdout carries the
+	// failure report), and the watchdog is handed stderr on purpose, so a lock
+	// on fd 2 would stay held for the watchdog's whole life.
+	if heldFD <= 2 {
+		return nil, fmt.Errorf("lifecycle lock fd %d is a standard descriptor; the caller must pass its lock on fd 3 or above", heldFD)
+	}
 	layout, err := resolveManagedDoltRuntimeLayout(cityPath)
 	if err != nil {
 		return nil, err
