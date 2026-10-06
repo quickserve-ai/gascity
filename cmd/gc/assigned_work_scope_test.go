@@ -1063,10 +1063,14 @@ func TestResolvePreparedTaskWorkDir_ConfiguredNamedSessionIgnoresTaskWorkDir(t *
 		SessionNameMetadata:    "rig--seat",
 		ConfiguredNamedSession: true,
 	}}
+	// Both legs that can name a task work dir: the live lookup of the seat's
+	// in-progress tasks, and the snapshot resolver that answers ahead of it.
+	if got := resolvePreparedTaskWorkDir(candidate, "", nil, store, nil); got != "" {
+		t.Fatalf("resolvePreparedTaskWorkDir = %q from the task lookup for a configured named session, want no task work dir", got)
+	}
 	resolver := func(startCandidate, *config.City) string { return poolWorktree }
-
-	if got := resolvePreparedTaskWorkDir(candidate, "", nil, store, resolver); got != "" {
-		t.Fatalf("resolvePreparedTaskWorkDir = %q for a configured named session, want no task work dir", got)
+	if got := resolvePreparedTaskWorkDir(candidate, "", nil, beads.NewMemStore(), resolver); got != "" {
+		t.Fatalf("resolvePreparedTaskWorkDir = %q from the resolver for a configured named session, want no task work dir", got)
 	}
 }
 
