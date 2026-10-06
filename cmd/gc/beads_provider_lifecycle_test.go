@@ -11642,7 +11642,7 @@ func runGcBeadsBdOpForTest(script string, env []string, op string) (string, erro
 
 // killFakeDoltServersForTest kills every fake dolt sql-server that recorded
 // its own pid in pidFile (GC_FAKE_DOLT_PID_FILE). Only pids the fake wrote are
-// signalled.
+// signaled.
 func killFakeDoltServersForTest(pidFile string) {
 	data, err := os.ReadFile(pidFile)
 	if err != nil {
