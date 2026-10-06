@@ -336,17 +336,27 @@ func buildMaxSessionAgeTracker(cfg *config.City, cityName string, sp runtime.Pro
 			continue
 		}
 		jitter := a.MaxSessionAgeJitterDuration()
-		named := config.FindNamedSession(cfg, a.QualifiedName())
-		namedAlways := named != nil && named.ModeOrDefault() == "always"
-		if named != nil {
-			namedSessionName := config.NamedSessionRuntimeName(cityName, cfg.Workspace, named.QualifiedName())
-			if !namedAlways {
-				tr.setConfig(namedSessionName, maxAge, jitter)
-				registeredAny = true
-			} else {
-				tr.exemptTemplateFallbackForSession(namedSessionName)
+		namedSessions := namedSessionsBackedByAgent(cfg, a)
+		if len(namedSessions) > 0 {
+			// Found by template as well as by name, as in buildIdleTracker:
+			// the reconciler checks a session under its own runtime name.
+			for _, named := range namedSessions {
+				namedSessionName := config.NamedSessionRuntimeName(cityName, cfg.Workspace, named.QualifiedName())
+				if named.ModeOrDefault() != "always" {
+					tr.setConfig(namedSessionName, maxAge, jitter)
+					registeredAny = true
+				} else {
+					tr.exemptTemplateFallbackForSession(namedSessionName)
+				}
 			}
 			if !a.SupportsInstanceExpansion() {
+				if config.FindNamedSession(cfg, a.QualifiedName()) == nil {
+					// No named session reuses the agent's own name: keep the
+					// registration under the agent-derived name that this
+					// builder has always made for that case.
+					tr.setConfig(startupSessionName(cityName, a.QualifiedName(), st), maxAge, jitter)
+					registeredAny = true
+				}
 				continue
 			}
 		}
@@ -392,16 +402,25 @@ func buildAssignedWorkDeferTracker(cfg *config.City, cityName string, sp runtime
 			continue
 		}
 		limit := *a.AssignedWorkDeferLimit
-		named := config.FindNamedSession(cfg, a.QualifiedName())
-		namedAlways := named != nil && named.ModeOrDefault() == "always"
-		if named != nil {
-			namedSessionName := config.NamedSessionRuntimeName(cityName, cfg.Workspace, named.QualifiedName())
-			if !namedAlways {
-				tr.setLimit(namedSessionName, limit)
-			} else {
-				tr.exemptTemplateFallbackForSession(namedSessionName)
+		namedSessions := namedSessionsBackedByAgent(cfg, a)
+		if len(namedSessions) > 0 {
+			// Found by template as well as by name, as in buildIdleTracker:
+			// the reconciler checks a session under its own runtime name.
+			for _, named := range namedSessions {
+				namedSessionName := config.NamedSessionRuntimeName(cityName, cfg.Workspace, named.QualifiedName())
+				if named.ModeOrDefault() != "always" {
+					tr.setLimit(namedSessionName, limit)
+				} else {
+					tr.exemptTemplateFallbackForSession(namedSessionName)
+				}
 			}
 			if !a.SupportsInstanceExpansion() {
+				if config.FindNamedSession(cfg, a.QualifiedName()) == nil {
+					// No named session reuses the agent's own name: keep the
+					// registration under the agent-derived name that this
+					// builder has always made for that case.
+					tr.setLimit(startupSessionName(cityName, a.QualifiedName(), st), limit)
+				}
 				continue
 			}
 		}
