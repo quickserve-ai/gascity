@@ -356,7 +356,15 @@ func TestSnapshotIdleHumanPrompts(t *testing.T) {
 		{name: "detached question", screen: questionDialogFixture},
 		{name: "detached approval", screen: approvalPromptFixture},
 		{name: "human draft", screen: humanDraftFixture, attached: true},
-		{name: "detached human draft", screen: humanDraftFixture},
+		// Unsent text on a DETACHED pane is not a human's draft to the
+		// lifecycle paths: on such a pane it is far more often gc's own
+		// (a dropped-Enter nudge, a cut paste), nothing could clear it, and
+		// the hold would never expire. The nudge guard applies the same rule.
+		{name: "detached draft does not hold", screen: humanDraftFixture, wantIdle: true},
+		// A bare numbered chooser (Claude's usage-limit "Stop and wait /
+		// Upgrade" has this shape) is not a question dialog: the idle timeout
+		// reclaims such a seat as it did before.
+		{name: "selection prompt does not hold", screen: "⏺ You've used your limit.\nPick one\n❯ 1. Stop and wait\n  2. Upgrade\n", wantIdle: true},
 		{name: "idle composer", screen: idleComposerFixture, wantIdle: true},
 		{name: "quoted dialog", screen: quotedDialogAboveComposerFixture, wantIdle: true},
 		{name: "other provider placeholder", screen: humanDraftFixture, provider: "codex", wantIdle: true},
