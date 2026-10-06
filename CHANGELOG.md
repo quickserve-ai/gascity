@@ -268,9 +268,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Human prompts no longer count as content-idle in tmux.** Question and
-  permission dialogs, and unsent Claude drafts even after detaching, reset
-  the content idle clock and hold lifecycle timers through pending-interaction
-  detection. Faint placeholders and complete gc reminders remain exempt.
+  permission dialogs, attached or not, and unsent Claude drafts while a client
+  is attached, reset the content idle clock and hold lifecycle timers through
+  pending-interaction detection (`Pending` reports them as kind `human-input`,
+  which `Respond` refuses, and `Send`/`Submit` answer 409 while one is shown).
+  A draft on a detached pane and a bare numbered chooser (Claude's usage-limit
+  prompt among them) do not hold: the idle timeout reclaims such a seat as
+  before. Faint placeholders and complete gc reminders remain exempt.
   Terminal-only interactions must be completed in the terminal; API responses
   are rejected without sending keystrokes.
 
