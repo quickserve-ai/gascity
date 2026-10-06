@@ -670,11 +670,10 @@ func (d *approvalDedup) clear(session string) {
 // InteractionProvider implementation
 // ---------------------------------------------------------------------------
 
-// Pending checks the tmux pane for an active Claude Code approval prompt or
-// Codex approval overlay.
-// Returns nil with no error if no approval is pending.
+// Pending checks the tmux pane for an active approval or terminal-only human
+// interaction. Returns nil with no error if no interaction is pending.
 func (t *Tmux) Pending(name string) (*runtime.PendingInteraction, error) {
-	approval, err := t.approvalInPane(name)
+	approval, paneText, err := t.readApprovalPane(name)
 	if err != nil {
 		// Pane might not exist (session not started yet or already stopped).
 		// Check for known "can't find" errors vs unexpected failures.
@@ -700,6 +699,15 @@ func (t *Tmux) Pending(name string) (*runtime.PendingInteraction, error) {
 
 	if approval == nil {
 		t.approvalDedup().clear(name)
+		reason := t.classifyLifecycleHumanPrompt(name, strings.Split(paneText, "\n"), t.resolveIdlePromptPrefix(name))
+		if reason != "" {
+			hash := sha256.Sum256([]byte(paneText))
+			return &runtime.PendingInteraction{
+				RequestID: fmt.Sprintf("%s%x", humanPromptRequestPrefix, hash[:8]),
+				Kind:      "human-input",
+				Prompt:    "Complete the pending human interaction in the terminal.",
+			}, nil
+		}
 		return nil, nil
 	}
 
@@ -817,23 +825,31 @@ func (t *Tmux) cancelClaudeApproval(ctx context.Context, name string) (handled b
 // pane's geometry, which says where Codex wrapped its rows and whether the
 // capture reaches the overlay's top (parseCodexApprovalOverlay).
 func (t *Tmux) approvalInPane(target string) (*parsedApproval, error) {
+	approval, _, err := t.readApprovalPane(target)
+	return approval, err
+}
+
+// readApprovalPane is approvalInPane that also returns the agent pane's
+// capture, which Pending reads for a terminal-only human interaction when no
+// approval shows (pl-9pye), so that reading costs no second capture.
+func (t *Tmux) readApprovalPane(target string) (*parsedApproval, string, error) {
 	resolved, err := t.agentPaneTarget(target)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	paneText, err := t.CapturePane(resolved, promptObservationLines)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	approval := parseApprovalPrompt(paneText)
 	if approval == nil || !approval.Codex {
-		return approval, nil
+		return approval, paneText, nil
 	}
 	pane, err := t.capturePaneWithGeometry(resolved)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return parseApprovalCapture(pane), nil
+	return parseApprovalCapture(pane), paneText, nil
 }
 
 // capturePaneWithGeometry captures target's screen and the last
@@ -875,12 +891,19 @@ var (
 	respondVerifyTimeout  = 10 * time.Second
 )
 
+// humanPromptRequestPrefix marks a terminal-only human interaction Pending
+// reports (pl-9pye): Respond refuses it, since only the terminal can answer.
+const humanPromptRequestPrefix = "tmux-human-"
+
 // Respond sends the appropriate keystroke to the tmux pane to approve or deny
 // a pending tool approval, then verifies the prompt was consumed.
 //
 // The prompt is the agent's: every capture and the answer key go to its pane
 // (agentPaneTarget), resolved once for this response.
 func (t *Tmux) Respond(name string, response runtime.InteractionResponse) error {
+	if strings.HasPrefix(response.RequestID, humanPromptRequestPrefix) {
+		return runtime.ErrInteractionUnsupported
+	}
 	target, err := t.agentPaneTarget(name)
 	if err != nil {
 		if errors.Is(err, ErrSessionNotFound) {
