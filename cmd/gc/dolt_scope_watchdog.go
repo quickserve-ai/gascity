@@ -172,7 +172,10 @@ func startManagedDoltSQLServerWithScopeWatchdogEnv(cityPath, configFile, logFile
 	if err != nil {
 		_ = terminateManagedDoltPID(cityPath, cmd.Process.Pid)
 		_ = cmd.Wait()
-		return managedDoltStartedProcess{}, err
+		// ga-7yjvin: the watchdog started, so a dolt sql-server may exist (it
+		// leads its own process group and can outlive the SIGTERM above). A
+		// caller must not start another one on the same data dir.
+		return managedDoltStartedProcess{}, managedDoltStartRefusedError{fmt.Errorf("%w; a dolt sql-server may have been spawned", err)}
 	}
 	watchdogPID := cmd.Process.Pid
 	// Snapshot the watchdog's own OS start identity while it is definitely alive
