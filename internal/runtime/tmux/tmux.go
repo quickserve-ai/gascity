@@ -4938,7 +4938,7 @@ func (t *Tmux) snapshotPaneIdleWithPrefix(session, promptPrefix string, protectH
 	// WaitForIdle also serves nudge submission, so it keeps its boundary-only
 	// semantics rather than waiting for the composer's draft to disappear.
 	if protectHumanPrompt {
-		reason := t.classifyLifecycleHumanPrompt(session, lines, promptPrefix)
+		reason := t.classifyLifecycleHumanPrompt(session, session, lines, promptPrefix)
 		if reason != "" {
 			return false, nil
 		}

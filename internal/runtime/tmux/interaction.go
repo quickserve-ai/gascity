@@ -202,7 +202,7 @@ func (t *Tmux) Pending(name string) (*runtime.PendingInteraction, error) {
 	approval := parseApprovalPrompt(paneText)
 	if approval == nil {
 		t.approvalDedup().clear(name)
-		reason := t.classifyLifecycleHumanPrompt(name, strings.Split(paneText, "\n"), t.resolveIdlePromptPrefix(name))
+		reason := t.classifyLifecycleHumanPrompt(name, name, strings.Split(paneText, "\n"), t.resolveIdlePromptPrefix(name))
 		if reason != "" {
 			hash := sha256.Sum256([]byte(paneText))
 			return &runtime.PendingInteraction{
