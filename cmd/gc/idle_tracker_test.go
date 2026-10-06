@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/runtime"
+	sessionpkg "github.com/gastownhall/gascity/internal/session"
 )
 
 // errIdleSnapshotProbe is a stand-in transient snapshot failure used by the
@@ -207,6 +208,38 @@ func TestIdleTracker_ContentClockFiresDespiteFreshActivity(t *testing.T) {
 	sp.SetActivity("deacon", base.Add(61*time.Minute))
 	if !it.checkIdle("deacon", "", "claude", "", sp, base.Add(61*time.Minute)) {
 		t.Fatalf("checkIdle did NOT fire after 61m of continuous content-idle (ga-07mi8 regression)")
+	}
+}
+
+// TestIdleTracker_ContentClockFollowsTheProviderFamily pins the tracker's
+// half of the pl-mhyy contract, which that fix did not change: fed the family
+// resolved for a Claude provider under a city's own name, the content clock
+// fires as it does for "claude"; fed that provider's NAME it does not, which
+// is how an idle seat stayed up. It is NOT the regression test for the fix: it
+// stays green if the reconciler goes back to passing the name. That test is
+// TestReconcileSessionBeads_IdleCheckGetsTheProviderFamilyNotItsName in
+// session_reconciler_test.go.
+func TestIdleTracker_ContentClockFollowsTheProviderFamily(t *testing.T) {
+	t.Parallel()
+
+	named := sessionpkg.Info{Provider: "claude-opus-acct", BuiltinAncestor: "claude"}
+	base := time.Now()
+	run := func(provider string) bool {
+		it := newIdleTracker()
+		it.setTimeout("seat", 1*time.Hour)
+		sp := newFakeIdleSnapshotProvider()
+		startFakeSession(t, sp.Fake, "seat")
+		sp.idle["seat"] = true
+		sp.SetActivity("seat", base)
+		it.checkIdle("seat", "", provider, "", sp, base)
+		sp.SetActivity("seat", base.Add(61*time.Minute)) // the status line keeps repainting
+		return it.checkIdle("seat", "", provider, "", sp, base.Add(61*time.Minute))
+	}
+	if !run(sessionProviderFamily(named)) {
+		t.Fatalf("content clock did not fire for family %q of provider %q", sessionProviderFamily(named), named.Provider)
+	}
+	if run(named.Provider) {
+		t.Fatalf("content clock fired for the bare provider name %q; the gate is meant to key on the family", named.Provider)
 	}
 }
 
