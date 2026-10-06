@@ -5037,9 +5037,11 @@ func (t *Tmux) snapshotPaneIdleWithPrefix(session, promptPrefix string, protectH
 		return false, nil
 	}
 
-	// The content clock protects unsent human input even on detached panes.
-	// WaitForIdle also serves nudge submission, so it keeps its boundary-only
-	// semantics rather than waiting for the composer's draft to disappear.
+	// The content clock protects a human prompt: a question or approval on
+	// any pane, an unsent draft while a client is attached (see
+	// classifyLifecycleHumanPrompt). WaitForIdle also serves nudge submission,
+	// so it keeps its boundary-only semantics rather than waiting for the
+	// composer's draft to disappear.
 	if protectHumanPrompt {
 		reason := t.classifyLifecycleHumanPrompt(session, session, lines, promptPrefix)
 		if reason != "" {
