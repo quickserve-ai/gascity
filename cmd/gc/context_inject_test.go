@@ -127,7 +127,7 @@ func TestContextInjectIterationsFallBackToTopLevelSum(t *testing.T) {
 		"iterations do not add to top":               `[` + messageIteration(2, 400_000, 0) + `,` + messageIteration(2, 463_141, 991) + `]`,
 		"partial last iteration":                     `[` + messageIteration(2, 927_270, 0) + `,{"type":"message","input_tokens":3}]`,
 		"partial last iteration that is the largest": `[` + messageIteration(2, 400_000, 0) + `,{"type":"message","input_tokens":527273}]`,
-		"null field in an iteration":                 `[` + messageIteration(2, 463_141, 991) + `,{"type":"message","input_tokens":464134,"cache_read_input_tokens":null,"cache_creation_input_tokens":0}]`,
+		"null field in an iteration":                 `[` + messageIteration(2, 463_139, 0) + `,{"type":"message","input_tokens":464134,"cache_read_input_tokens":null,"cache_creation_input_tokens":0}]`,
 		"string field":                               `[` + messageIteration(2, 463_139, 0) + `,{"type":"message","input_tokens":"2","cache_read_input_tokens":463141,"cache_creation_input_tokens":991}]`,
 		"negative field":                             `[` + messageIteration(2, 463_142, 0) + `,{"type":"message","input_tokens":-1,"cache_read_input_tokens":463141,"cache_creation_input_tokens":991}]`,
 		"last request smaller than first":            `[` + messageIteration(2, 463_141, 991) + `,` + advisorIteration + `,` + messageIteration(2, 462_546, 593) + `]`,
