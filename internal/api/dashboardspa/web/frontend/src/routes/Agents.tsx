@@ -407,18 +407,7 @@ export function AgentsPage() {
           const pending = pendingByAgent.get(r.name);
           return (
             <div className="flex justify-end gap-2">
-              {pending !== undefined && pending.pending.kind === 'human-input' && (
-                <>
-                  {/* A question dialog, permission prompt or unsent draft: the
-                      runtime refuses to answer it (ErrInteractionUnsupported),
-                      so there is nothing to approve from here. */}
-                  <span className="text-xs text-fg-muted" title={pending.pending.prompt}>
-                    answer it in the seat's terminal
-                  </span>
-                  <CopyAttachButton command={attachCommand(r.name)} />
-                </>
-              )}
-              {pending !== undefined && pending.pending.kind !== 'human-input' && (
+              {pending !== undefined && (
                 <>
                   {readOnly && <ReadOnlyBadge />}
                   <Button
