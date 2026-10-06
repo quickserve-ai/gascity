@@ -191,7 +191,7 @@ func startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel str
 	// lock is still held after the configured window, fail closed: refusing
 	// to start is recoverable, a corrupted noms journal is not.
 	if err := waitForManagedDoltDataDirLockFree(layout.DataDir, managedDoltLockReleaseTimeoutFn(cityPath)); err != nil {
-		return report, fmt.Errorf("refusing to start dolt sql-server for %s: %w", layout.DataDir, err)
+		return report, managedDoltStartRefusedError{fmt.Errorf("refusing to start dolt sql-server for %s: %w", layout.DataDir, err)}
 	}
 
 	currentPort := portNum
