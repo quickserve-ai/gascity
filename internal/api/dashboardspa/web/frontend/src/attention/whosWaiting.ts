@@ -102,9 +102,6 @@ export type WhosWaitingProbe =
       readonly prompt?: string;
       /** The tool the dialog is asking to run (PendingInteraction.metadata.tool_name). */
       readonly toolName?: string;
-      /** PendingInteraction.kind: "approval", or "human-input" for a question
-       *  dialog, permission prompt or unsent draft the runtime cannot answer. */
-      readonly kind?: string;
     }
   | { readonly seat: string; readonly outcome: 'none' }
   | { readonly seat: string; readonly outcome: 'unsupported' }
@@ -315,8 +312,8 @@ function stateFor(entry: AttentionRegistryEntry): WhosWaitingState {
  * How the claim is worded. `confirmed` rows say what the probe saw; every other
  * row says what the hook wrote, and the pane wraps it in "reported …".
  */
-function reasonLabelFor(entry: AttentionRegistryEntry, confirmed: boolean, kind?: string): string {
-  if (confirmed) return kind === 'human-input' ? 'question or draft in the terminal' : 'approval prompt';
+function reasonLabelFor(entry: AttentionRegistryEntry, confirmed: boolean): string {
+  if (confirmed) return 'approval prompt';
   if (entry.reason === 'permission') return 'permission request';
   if (entry.reason === 'blocked') return 'blocked';
   if (entry.reason === 'question') {
@@ -359,7 +356,7 @@ function buildRow(
     state: confirmed ? 'blocked' : stateFor(entry),
     verification,
     reason: entry.reason ?? '',
-    reasonLabel: reasonLabelFor(entry, confirmed, probe?.kind),
+    reasonLabel: reasonLabelFor(entry, confirmed),
     since: entry.since ?? '',
     elapsedMs,
     elapsedLabel: elapsedMs === null ? null : formatElapsed(elapsedMs),
