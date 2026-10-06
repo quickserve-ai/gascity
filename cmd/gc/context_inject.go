@@ -72,11 +72,15 @@ type transcriptUsage struct {
 // executor request (type "message").
 //
 // Reading LOW is the dangerous direction, so the last iteration is trusted
-// only when the block proves the shape: every message iteration reads as
-// non-negative ints, together they add up to exactly the top-level sum, and
-// the last is not smaller than an earlier one (a context only grows inside one
-// turn). Any other shape falls back to the top-level sum, which can only read
-// high.
+// only when the block proves the shape: every message iteration carries all
+// three fields as non-negative ints, together they add up to exactly the
+// top-level sum, and the last is not smaller than an earlier one (a context
+// only grows inside one turn). Any other shape reads the top-level sum, as
+// before this rule existed. For message and advisor shapes that sum is never
+// below the last request. It is not a bound for every shape: a turn that fell
+// back to another model lists [message, fallback_message] and its top-level
+// fields are the fallback request alone, which is the newest request and can
+// be smaller than the first.
 func transcriptUsageOccupancy(u *transcriptUsage) int {
 	top := u.InputTokens + u.CacheReadInputTokens + u.CacheCreationInputTokens
 	var iterations []json.RawMessage
@@ -92,21 +96,24 @@ func transcriptUsageOccupancy(u *transcriptUsage) int {
 			continue
 		}
 		var it struct {
-			InputTokens              int `json:"input_tokens"`
-			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
-			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+			InputTokens              *int `json:"input_tokens"`
+			CacheReadInputTokens     *int `json:"cache_read_input_tokens"`
+			CacheCreationInputTokens *int `json:"cache_creation_input_tokens"`
 		}
-		if json.Unmarshal(raw, &it) != nil || it.InputTokens < 0 || it.CacheReadInputTokens < 0 || it.CacheCreationInputTokens < 0 {
+		if json.Unmarshal(raw, &it) != nil || it.InputTokens == nil || it.CacheReadInputTokens == nil || it.CacheCreationInputTokens == nil {
 			return top
 		}
-		last = it.InputTokens + it.CacheReadInputTokens + it.CacheCreationInputTokens
+		if *it.InputTokens < 0 || *it.CacheReadInputTokens < 0 || *it.CacheCreationInputTokens < 0 {
+			return top
+		}
+		last = *it.InputTokens + *it.CacheReadInputTokens + *it.CacheCreationInputTokens
 		sum += last
 		if last > largest {
 			largest = last
 		}
 		seen = true
 	}
-	if !seen || last <= 0 || sum != top || last < largest {
+	if !seen || sum != top || last < largest {
 		return top
 	}
 	return last
