@@ -8808,6 +8808,16 @@ case "$query" in
     fi
     if [ -f "$dir/dirty-config" ]; then
       printf '+------------+\n| table_name |\n+------------+\n| config     |\n+------------+\n'
+    elif [ -f "$dir/dirty-user-table" ]; then
+      printf '+----------------+\n| table_name     |\n+----------------+\n| operator_notes |\n+----------------+\n'
+    elif [ -f "$dir/dirty-user-table-beside-bd" ]; then
+      printf '+----------------+\n| table_name     |\n+----------------+\n| comments       |\n| issues         |\n| operator_notes |\n+----------------+\n'
+    elif [ -f "$dir/status-list-empty" ]; then
+      :
+    else
+      # The 2026-09-02 interrupted bootstrap: migration 0049's ALTERs left
+      # bd's own comments and issues dirty (the count above says 2).
+      printf '+------------+\n| table_name |\n+------------+\n| comments   |\n| issues     |\n+------------+\n'
     fi
     exit 0
     ;;
@@ -9063,6 +9073,12 @@ func TestGcBeadsBdInitHealsOnlyAConfirmedInterruptedBootstrap(t *testing.T) {
 	}{
 		{"user config change pending", "dirty-config", false},
 		{"dirty tables unlistable", "status-list-error", false},
+		// The fork's B23 fold (counsel-astra round 1): a database with no
+		// issues can still hold a table bd does not own, and the reset
+		// would discard its uncommitted rows.
+		{"a dirty table bd does not own", "dirty-user-table", false},
+		{"a dirty table bd does not own beside bd's own", "dirty-user-table-beside-bd", false},
+		{"a dirty count with no dirty table listed", "status-list-empty", false},
 		{"issues probe unanswered", "issues-probe-error", false},
 		{"concurrent initializer committed while waiting for the lock", "status-dirty-once", false},
 		{"issues table absent", "issues-absent", true},

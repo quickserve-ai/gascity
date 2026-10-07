@@ -1114,6 +1114,30 @@ release_init_lock() {
     INIT_LOCK_HELD=""
 }
 
+# is_bd_schema_table reports whether a dirty table is one bd's own schema
+# migrations write: the tables, the two migration cursors, the dolt system
+# tables they insert into (dolt_ignore, dolt_nonlocal_tables) or store views in
+# (dolt_schemas), and bd's __temp__/__bd_ scratch tables. config and metadata
+# are bd's too, but bd_bootstrap_interrupted refuses them before asking (a
+# user's `bd config set` leaves them dirty). Derived from the pinned beads
+# module (v1.3.1-fleet.20261005.1) by bd's own touch rule
+# (migrationSQLTouchesTable: CREATE/ALTER/DROP/RENAME TABLE, INSERT/UPDATE/
+# DELETE/REPLACE INTO, CREATE INDEX ... ON, CREATE/ALTER VIEW) over
+# internal/storage/schema/migrations/*.up.sql, migrations/ignored/*.up.sql and
+# the schema package's Go DDL; re-derive at every beads pin move from
+# `go list -m -f '{{.Dir}}' github.com/steveyegge/beads`. A table a newer bd
+# adds is missing here until then, and makes the heal decline: bd's own guard
+# then refuses the open, as it did before the heal existed.
+is_bd_schema_table() {
+    case "$1" in
+        bd_events_journal|bd_events_seq|child_counters|comments|compaction_snapshots|custom_statuses|custom_types|dependencies|events|federation_peers|interactions|issue_counter|issue_snapshots|issues|labels|leases|local_metadata|provenance_events|repo_mtimes|repo_mtimes_tmp|routes|wisp_child_counters|wisp_comments|wisp_dependencies|wisp_events|wisp_labels|wisps) return 0 ;;
+        schema_migrations|ignored_schema_migrations) return 0 ;;
+        dolt_ignore|dolt_nonlocal_tables|dolt_schemas) return 0 ;;
+        __temp__*|__bd_*) return 0 ;;
+    esac
+    return 1
+}
+
 # bd_bootstrap_interrupted reports whether the pinned database looks like a
 # bootstrap that died between a migration's DDL and its per-step commit:
 # uncommitted table changes in the working set and no user data at all
@@ -1133,7 +1157,7 @@ release_init_lock() {
 # probe that fails for any reason other than the one it is asking about
 # leaves the database's contents unknown, and unknown never resets.
 bd_bootstrap_interrupted() {
-    local db="$1" dirty status_tables issues issues_probe
+    local db="$1" dirty status_tables dirty_names table issues issues_probe
     valid_sql_name "$db" || return 1
     dirty=$(server_sql_scalar "USE \`$db\`; SELECT COUNT(*) FROM dolt_status" | tr -dc '0-9')
     [ -n "$dirty" ] && [ "$dirty" -gt 0 ] || return 1
@@ -1149,6 +1173,21 @@ bd_bootstrap_interrupted() {
     if printf '%s\n' "$status_tables" | grep -qE '^\| *(config|metadata) *\|'; then
         return 1
     fi
+    # Fork carry (counsel-astra round 1): every dirty table must be one bd's
+    # own migrations write (is_bd_schema_table). A database with no issues can
+    # still hold a table bd does not own, an operator's or another tool's, and
+    # the reset would discard its uncommitted rows. The rows of the table
+    # listing are taken after its table_name header; a non-zero count beside
+    # an empty listing is unexplained, and unexplained never resets.
+    dirty_names=$(printf '%s\n' "$status_tables" \
+        | sed -n 's/^|[[:space:]]*\([^|]*[^|[:space:]]\)[[:space:]]*|$/\1/p' \
+        | tail -n +2)
+    [ -n "$dirty_names" ] || return 1
+    while IFS= read -r table; do
+        is_bd_schema_table "$table" || return 1
+    done <<EOF
+$dirty_names
+EOF
     # Only dolt's explicit "table not found" licenses treating issues as
     # absent; any other failure of this probe says nothing about its rows.
     if issues_probe=$(server_sql "USE \`$db\`; SELECT 1 FROM issues LIMIT 1" 2>&1); then
