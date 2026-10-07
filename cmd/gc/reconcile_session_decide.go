@@ -31,7 +31,11 @@ func timerHealPatch(row session.Info, now time.Time) (session.MetadataPatch, tim
 		at    string
 		clear func(string) session.MetadataPatch
 	}{
-		{row.HeldUntil, session.ClearExpiredHoldPatch},
+		// The carry's standing user hold (#5561, fork #59; replayed PR #6335): an expired hold
+		// also clears a matching standing sleep_intent, as the legacy path does.
+		{row.HeldUntil, func(reason string) session.MetadataPatch {
+			return session.ClearExpiredHoldPatch(reason, row.SleepIntent)
+		}},
 		{row.QuarantinedUntil, session.ClearExpiredQuarantinePatch},
 	} {
 		t, _ := time.Parse(time.RFC3339, timer.at)

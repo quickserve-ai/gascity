@@ -202,7 +202,7 @@ func (f *failAgentTomlRenameOSFS) Rename(oldpath, newpath string) error {
 func TestNewControllerStateSchemaSkewSkipsCachingAndRigStores(t *testing.T) {
 	fallback := beads.NewMemStore()
 	previousOpen := newControllerStateOpenCityStore
-	newControllerStateOpenCityStore = func(string, gate.Mode) (beads.StoreOpenResult, error) {
+	newControllerStateOpenCityStore = func(string, gate.Mode, beads.NativeTransportMode) (beads.StoreOpenResult, error) {
 		return beads.StoreOpenResult{Store: fallback, Diagnostic: beads.BeadsDiagnostic{
 			Store: beads.BeadsStoreNameBdStore, PreflightGate: "native_open",
 			PreflightReason: "schema version mismatch: database is at v55, binary knows up to v54 (1 migration ahead)",
@@ -226,7 +226,7 @@ func TestNewControllerStateSchemaSkewSkipsCachingAndRigStores(t *testing.T) {
 
 func TestNewControllerStateSchemaSkewWinsOverFallbackOpenFailure(t *testing.T) {
 	previousOpen := newControllerStateOpenCityStore
-	newControllerStateOpenCityStore = func(string, gate.Mode) (beads.StoreOpenResult, error) {
+	newControllerStateOpenCityStore = func(string, gate.Mode, beads.NativeTransportMode) (beads.StoreOpenResult, error) {
 		return beads.StoreOpenResult{Diagnostic: beads.BeadsDiagnostic{
 			Store: beads.BeadsStoreNameBdStore, PreflightGate: "native_open",
 			PreflightReason: "schema version mismatch: database is at v55, binary knows up to v54 (1 migration ahead)",

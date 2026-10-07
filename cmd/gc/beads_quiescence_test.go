@@ -111,7 +111,7 @@ func TestRetireSuspendedRigScopeAfterItsSessionsDrain(t *testing.T) {
 // its retired proxy.
 func TestWrapWithCachingStoreLeavesASuspendedRigCold(t *testing.T) {
 	backing := &primeCountingStore{Store: beads.NewMemStore()}
-	wrapWithCachingStore(context.Background(), backing, nil, false)
+	wrapWithCachingStore(context.Background(), backing, nil, false, "", "")
 	if backing.lists != 0 {
 		t.Fatalf("a suspended rig's store was listed %d time(s) at wrap", backing.lists)
 	}
@@ -320,7 +320,7 @@ func TestDispatchOrdersSkipsASuspendedCity(t *testing.T) {
 	cr.wispIndexMigrationApplied = true
 	t.Setenv("GC_SUSPENDED", "1")
 	before := len(store.recorded())
-	cr.dispatchOrdersLocked(context.Background(), cr.cityPath, 0, cr.cfg)
+	cr.dispatchOrdersLocked(context.Background(), cr.cityPath, 0, cr.cfg, false)
 	if od.dispatches != 0 {
 		t.Fatalf("dispatched %d order pass(es) in a suspended city", od.dispatches)
 	}
@@ -328,7 +328,7 @@ func TestDispatchOrdersSkipsASuspendedCity(t *testing.T) {
 		t.Fatalf("the order pass touched the store in a suspended city: %v", got)
 	}
 	t.Setenv("GC_SUSPENDED", "")
-	cr.dispatchOrdersLocked(context.Background(), cr.cityPath, 0, cr.cfg)
+	cr.dispatchOrdersLocked(context.Background(), cr.cityPath, 0, cr.cfg, false)
 	if od.dispatches != 1 {
 		t.Fatalf("dispatches after resume = %d, want 1", od.dispatches)
 	}

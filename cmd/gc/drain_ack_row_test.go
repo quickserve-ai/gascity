@@ -596,7 +596,7 @@ func TestHookDrainAckToleranceCallSites(t *testing.T) {
 	// claimsErrored reaches the same writeHookClaimDrain call as an idle store
 	// without the post-drain divergence read.
 	noWork := func(ack hookDrainAckFunc, stdout, stderr io.Writer) int {
-		return writeHookClaimNoWork(hookClaimOptions{DrainAck: true, JSON: true}, hookClaimOps{DrainAck: ack}, true, "", stdout, stderr)
+		return writeHookClaimNoWork(hookClaimOptions{DrainAck: true, JSON: true}, hookClaimOps{DrainAck: ack}, true, 0, "", stdout, stderr)
 	}
 	suspended := func(ack hookDrainAckFunc, stdout, stderr io.Writer) int {
 		return writeHookClaimSuspensionDrain(hookClaimReasonRigSuspended, hookCommandOptions{DrainAck: true, JSON: true, DrainAckFn: ack}, stdout, stderr)

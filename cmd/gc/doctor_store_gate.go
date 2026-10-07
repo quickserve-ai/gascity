@@ -169,14 +169,19 @@ func (g *doctorStoreGate) OrderLastRun(cityPath string, cfg *config.City, lastRu
 }
 
 // OrderOpenWork wraps an order open-work lookup the same way OrderLastRun
-// wraps its history lookup: an order whose store scope is stopped answers
-// errDoctorStoreNotRunning instead of opening and reading it (pl-503's
-// open-work attribution on upstream's stopped-store gate).
+// wraps its history lookup: an order whose store scope is skipped (stopped or
+// suspended) answers the skip error instead of opening and reading it
+// (pl-503's open-work attribution on upstream's store gate).
 func (g *doctorStoreGate) OrderOpenWork(cityPath string, cfg *config.City, openWork doctor.OrderFiringCurrentOpenWorkFunc) doctor.OrderFiringCurrentOpenWorkFunc {
 	return func(order orders.Order) (doctor.OrderFiringOpenWork, bool, error) {
 		if target, err := resolveOrderStoreTarget(cityPath, cfg, order); err == nil {
-			if g.Stopped(target.ScopeRoot) || (legacyOrderCityFallbackNeeded(cityPath, target) && g.Stopped(cityPath)) {
-				return doctor.OrderFiringOpenWork{}, false, errDoctorStoreNotRunning
+			if err := g.skipErr(target.ScopeRoot); err != nil {
+				return doctor.OrderFiringOpenWork{}, false, err
+			}
+			if legacyOrderCityFallbackNeeded(cityPath, target) {
+				if err := g.skipErr(cityPath); err != nil {
+					return doctor.OrderFiringOpenWork{}, false, err
+				}
 			}
 		}
 		return openWork(order)
