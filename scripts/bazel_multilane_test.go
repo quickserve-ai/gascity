@@ -457,8 +457,10 @@ func TestBazelMultiLaneWorkflowShape(t *testing.T) {
 	// Mode remote runs a 2 vCPU client, except acceptance: its client-side
 	// analysis (~1900 packages) took ~2 m of its lane on 2 vCPU. Every other
 	// mode executes here, or may (a fork lane's fallback to the read-only
-	// cache), so it gets 4 vCPU.
-	if want := "${{ (needs.rbe.outputs.mode != 'remote' || matrix.lane == 'acceptance') && 'blacksmith-4vcpu-ubuntu-2404' || 'blacksmith-2vcpu-ubuntu-2404' }}"; lane.RunsOn != want {
+	// cache), so it gets 4 vCPU. Fork carry (pl-axh9): upstream's choice
+	// inside the repository-aware form, GitHub-hosted on the fork
+	// (TestBazelWorkflowForkRunnerRule).
+	if want := "${{ github.repository == 'gastownhall/gascity' && ((needs.rbe.outputs.mode != 'remote' || matrix.lane == 'acceptance') && 'blacksmith-4vcpu-ubuntu-2404' || 'blacksmith-2vcpu-ubuntu-2404') || 'ubuntu-latest' }}"; lane.RunsOn != want {
 		t.Errorf("lane runs-on = %q, want %q (2 vCPU clients in mode remote, 4 vCPU otherwise and for acceptance)", lane.RunsOn, want)
 	}
 

@@ -1058,7 +1058,9 @@ func TestBazelMultiLaneWorkerEnvPreflight(t *testing.T) {
 		}
 	}
 	measAt, meas := findStep(lane, runs(rbeWorkerScript))
-	if meas == nil || meas.If != "always() && matrix.lane == 'unit' && steps.worker-env.outputs.measure == 'true'" ||
+	// Fork carry (pl-axh9): the measurement needs a Blacksmith host, so it is
+	// upstream only (bazel.yml's fork runner rule).
+	if meas == nil || meas.If != "always() && matrix.lane == 'unit' && steps.worker-env.outputs.measure == 'true' && github.repository == 'gastownhall/gascity'" ||
 		len(meas.Env) != 1 || meas.Env["WORKER_MODE"] != "measure" {
 		t.Fatalf("lane job: no unit-lane host measurement step (if measure, WORKER_MODE=measure): %+v", meas)
 	}
