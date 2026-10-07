@@ -174,7 +174,7 @@ func TestReleaseOrphanedPoolAssignment_BdStoreGuardedRelease(t *testing.T) {
 			}
 			wb := ledger.row()
 
-			if !releaseOrphanedPoolAssignment(store, wb, false) {
+			if !releaseOrphanedPoolAssignment(store, wb, false, poolReleaseGuardForTest()) {
 				t.Fatalf("release = false, want the guarded release to land; bd updates %v", ledger.updates)
 			}
 			if len(ledger.updates) != 1 {
@@ -214,7 +214,7 @@ func TestReleaseOrphanedPoolAssignment_BdStoreGuardLostToAClaim(t *testing.T) {
 	restore := captureLogOutput(&buf)
 	defer restore()
 
-	if releaseOrphanedPoolAssignment(store, wb, false) {
+	if releaseOrphanedPoolAssignment(store, wb, false, poolReleaseGuardForTest()) {
 		t.Fatal("release = true after bd refused the guard")
 	}
 	got := ledger.row()
@@ -239,7 +239,7 @@ func TestReleaseOrphanedPoolAssignment_BdStoreWithoutGuardsRefuses(t *testing.T)
 	restore := captureLogOutput(&buf)
 	defer restore()
 
-	if releaseOrphanedPoolAssignment(store, wb, false) {
+	if releaseOrphanedPoolAssignment(store, wb, false, poolReleaseGuardForTest()) {
 		t.Fatal("release = true on a bd that can fence neither way")
 	}
 	got := ledger.row()

@@ -42,7 +42,7 @@ func TestWrapWithCachingStoreStampsNotificationSource(t *testing.T) {
 	ep := events.NewFake()
 	// A non-cancellable context: the cache pre-primes but starts no
 	// background prime or reconcile.
-	store := wrapWithCachingStore(context.Background(), backing, ep, true)
+	store := wrapWithCachingStore(context.Background(), backing, ep, true, "", "")
 	cache, ok := store.(*beads.CachingStore)
 	if !ok {
 		t.Fatalf("wrapWithCachingStore returned %T, want *beads.CachingStore", store)

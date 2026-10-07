@@ -1245,8 +1245,8 @@ func TestAStaleReminderWithAPersonsWordsIsTheirDraft(t *testing.T) {
 	t.Run("the survey dismisser sends no keys", func(t *testing.T) {
 		screen := "● How is Claude doing this session? (optional)\n  1: Bad    2: Fine   3: Good   0: Dismiss\n" +
 			rule + "\n" + draft + "\n" + rule + "\n  -- INSERT -- ⏵⏵ bypass permissions on (shift+tab to cycle)"
-		if !feedbackSurveyIsLive(screen, DefaultReadyPromptPrefix) {
-			t.Fatal("fixture: the survey must read live, or the test cannot see the dismisser's keys")
+		if !runtime.ContainsFeedbackSurveyModal(screen) {
+			t.Fatal("fixture: the survey must be on screen, or the test cannot see the dismisser's keys")
 		}
 		fe := &panePromptExecutor{screen: screen, attached: true}
 		tm, session := newGuardTestTmux(fe)
