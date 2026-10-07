@@ -30,6 +30,8 @@ func runDogScriptCommand(t *testing.T, scriptName, binDir, cityPath, dataDir str
 		"GC_BACKUP_OFFSITE_REQUIRED",
 		"GC_BACKUP_OFFSITE_WAIVER_FILE",
 		"GC_BACKUP_ARTIFACT_DIR",
+		"GC_PACK_STATE_DIR",
+		"GC_CITY_RUNTIME_DIR",
 		"GC_PHANTOM_DATA_DIR",
 		"GC_ESCALATE_SCRIPT",
 		"GC_ESCALATE_SEARCH_PACKS",
@@ -3571,12 +3573,53 @@ func TestPhantomDBScriptEscalatesAndPreservesAllDatabases(t *testing.T) {
 	}
 }
 
+// fakeSyncRoot is the root a fake `dolt backup sync` lands on both sides.
+const fakeSyncRoot = "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"
+
+// fakeSyncWritesManifestRoots is the body a fake `dolt backup sync` runs: it
+// writes fakeSyncRoot as the root of the source manifest ($PWD, the clone the
+// script syncs from) and of the backup manifest, as a healthy sync leaves them
+// (ga-rirak7: the script now counts a sync only when the two roots are equal).
+// An existing backup manifest keeps every other field and its line shape (no
+// trailing newline, as Dolt writes it), so the prune tests still exercise the
+// parser on the real shape. FAKE_BACKUP_ROOT, when set, lands a DIFFERENT root
+// on the backup side: the exit-0-without-moving case the check exists for.
+// The backup side is the path the fake ADVERTISES for <db>-backup (see
+// fakeBackupURLFunc), so the tests exercise the script's real binding: it reads
+// the remote's url with `dolt backup -v` and compares against that path.
+const fakeSyncWritesManifestRoots = `  fake_root=` + fakeSyncRoot + `
+  fake_bak_root="${FAKE_BACKUP_ROOT:-$fake_root}"
+  mkdir -p .dolt/noms
+  printf '5:__DOLT__:fakelock:%s:00000000000000000000000000000000' "$fake_root" > .dolt/noms/manifest
+  fake_url="$(fake_backup_url "${3%-backup}")"
+  case "$fake_url" in
+    file://*) fake_bak="${fake_url#file://}" ;;
+    *) fake_bak="" ;;
+  esac
+  if [ -z "$fake_bak" ]; then
+    :
+  elif [ -s "$fake_bak/manifest" ]; then
+    awk -F: -v OFS=: -v ORS= -v r="$fake_bak_root" 'NR > 1 { printf "\n" } NR == 1 { $4 = r } { print }' "$fake_bak/manifest" > "$fake_bak/manifest.tmp"
+    mv "$fake_bak/manifest.tmp" "$fake_bak/manifest"
+  else
+    mkdir -p "$fake_bak"
+    printf '5:__DOLT__:fakelock:%s:00000000000000000000000000000000' "$fake_bak_root" > "$fake_bak/manifest"
+  fi`
+
+// fakeBackupURLFunc defines fake_backup_url <db>: the url a fake lists for
+// <db>-backup, which is also where its sync writes. It is the artifact dir the
+// script would auto-configure; FAKE_BACKUP_URL overrides it.
+const fakeBackupURLFunc = `fake_backup_url() {
+  printf '%s' "${FAKE_BACKUP_URL:-file://${GC_BACKUP_ARTIFACT_DIR:-$GC_CITY_PATH/.dolt-backup}/$1}"
+}`
+
 func writeBackupFakeDolt(t *testing.T, binDir, version string, syncExit int, sqlDatabases ...string) string {
 	t.Helper()
 	logPath := filepath.Join(binDir, "dolt.log")
 	dbCSV := "Database\n" + strings.Join(sqlDatabases, "\n") + "\n"
 	writeExecutable(t, filepath.Join(binDir, "dolt"), fmt.Sprintf(`#!/usr/bin/env bash
 set -euo pipefail
+%s
 printf 'dolt %%s\n' "$*" >> %s
 if [ "${1:-}" = "version" ]; then
   printf 'dolt version %%s\n' %s
@@ -3588,9 +3631,9 @@ case "$*" in
     exit 0
     ;;
 esac
-if [ "${1:-}" = "backup" ] && [ "$#" -eq 1 ]; then
+if [ "${1:-}" = "backup" ] && { [ "$#" -eq 1 ] || [ "${2:-}" = "-v" ]; }; then
   db="$(basename "$PWD")"
-  printf '%%s-backup file:///backups/%%s\n' "$db" "$db"
+  printf '%%s-backup %%s\n' "$db" "$(fake_backup_url "$db")"
   exit 0
 fi
 if [ "${1:-}" = "remote" ]; then
@@ -3598,10 +3641,11 @@ if [ "${1:-}" = "remote" ]; then
   exit 64
 fi
 if [ "${1:-} ${2:-}" = "backup sync" ]; then
+%s
   exit %d
 fi
 exit 0
-`, shellQuote(logPath), shellQuote(version), shellQuote(dbCSV), syncExit))
+`, fakeBackupURLFunc, shellQuote(logPath), shellQuote(version), shellQuote(dbCSV), fakeSyncWritesManifestRoots, syncExit))
 	return logPath
 }
 
@@ -3911,6 +3955,7 @@ func writeAutoConfigureFakeDolt(t *testing.T, binDir string, addExit int) string
 	logPath := filepath.Join(binDir, "dolt.log")
 	writeExecutable(t, filepath.Join(binDir, "dolt"), fmt.Sprintf(`#!/usr/bin/env bash
 set -euo pipefail
+%s
 printf 'dolt %%s\n' "$*" >> %s
 if [ "${1:-}" = "version" ]; then
   printf 'dolt version 2.1.0\n'
@@ -3922,20 +3967,28 @@ case "$*" in
     exit 0
     ;;
 esac
-if [ "${1:-}" = "backup" ] && [ "$#" -eq 1 ]; then
+if [ "${1:-}" = "backup" ] && { [ "$#" -eq 1 ] || [ "${2:-}" = "-v" ]; }; then
   if [ "$(basename "$PWD")" = "prod" ]; then
-    printf 'prod-backup file:///backups/prod\n'
+    printf 'prod-backup %%s\n' "$(fake_backup_url prod)"
+  elif [ -s .dolt/fake-backup-url ]; then
+    printf '%%s-backup %%s\n' "$(basename "$PWD")" "$(cat .dolt/fake-backup-url)"
   fi
   exit 0
 fi
 if [ "${1:-} ${2:-}" = "backup add" ]; then
+  # A remote that was added is listed afterwards, with the url it was given;
+  # the snapshot clone carries it the way it carries repo_state.json.
+  if [ %d -eq 0 ]; then
+    printf '%%s' "${4:-}" > .dolt/fake-backup-url
+  fi
   exit %d
 fi
 if [ "${1:-} ${2:-}" = "backup sync" ]; then
+%s
   exit 0
 fi
 exit 0
-`, shellQuote(logPath), addExit))
+`, fakeBackupURLFunc, shellQuote(logPath), addExit, addExit, fakeSyncWritesManifestRoots))
 	return logPath
 }
 
@@ -4640,6 +4693,7 @@ func writeBackupPWDLoggingDolt(t *testing.T, binDir string, syncExit int) string
 	logPath := filepath.Join(binDir, "dolt.log")
 	writeExecutable(t, filepath.Join(binDir, "dolt"), fmt.Sprintf(`#!/usr/bin/env bash
 set -euo pipefail
+%s
 if [ "${1:-}" = "version" ]; then
   printf 'dolt version 2.1.0\n'
   exit 0
@@ -4650,16 +4704,17 @@ case "$*" in
     exit 0
     ;;
 esac
-if [ "${1:-}" = "backup" ] && [ "$#" -eq 1 ]; then
-  printf '%%s-backup file:///backups/%%s\n' "$(basename "$PWD")" "$(basename "$PWD")"
+if [ "${1:-}" = "backup" ] && { [ "$#" -eq 1 ] || [ "${2:-}" = "-v" ]; }; then
+  printf '%%s-backup %%s\n' "$(basename "$PWD")" "$(fake_backup_url "$(basename "$PWD")")"
   exit 0
 fi
 if [ "${1:-} ${2:-}" = "backup sync" ]; then
   printf 'sync-cwd %%s\n' "$PWD" >> %s
+%s
   exit %d
 fi
 exit 0
-`, shellQuote(logPath), syncExit))
+`, fakeBackupURLFunc, shellQuote(logPath), fakeSyncWritesManifestRoots, syncExit))
 	return logPath
 }
 
@@ -4703,6 +4758,87 @@ func TestBackupScriptSyncsFromCopyOnWriteSnapshotNotLiveDatabase(t *testing.T) {
 	}
 	if _, err := os.Stat(snapshotDir); !os.IsNotExist(err) {
 		t.Fatalf("snapshot must be discarded after the run, stat err: %v", err)
+	}
+	// ga-rirak7: equal roots after a good sync write the freshness stamp. The
+	// mismatch test checks the same path is ABSENT; this proves it is the path.
+	stamp := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "local-backup-freshness", "prod")
+	if body, err := os.ReadFile(stamp); err != nil || !strings.Contains(string(body), "synced_at_epoch=") {
+		t.Fatalf("a good snapshot sync must write the freshness stamp at %s: err=%v body=%q", stamp, err, body)
+	}
+}
+
+// TestBackupScriptSnapshotRootMismatchWritesNoStamp pins ga-rirak7: `dolt
+// backup sync` exits 0 when its read of the source root fails, so exit 0 alone
+// stamped a backup fresh whose root never moved. A snapshot sync that exits 0
+// with the backup root different from the clone's is a failed database: a
+// FAILED line naming both roots, no freshness stamp, 0/1.
+func TestBackupScriptSnapshotRootMismatchWritesNoStamp(t *testing.T) {
+	if !cowCloneAvailable(t) {
+		t.Skip("filesystem has no copy-on-write clone support; the root check runs on the snapshot path only")
+	}
+	cityPath := t.TempDir()
+	dataDir := filepath.Join(cityPath, "dolt-data")
+	if err := os.MkdirAll(filepath.Join(dataDir, "prod", ".dolt"), 0o755); err != nil {
+		t.Fatalf("mkdir db: %v", err)
+	}
+	binDir := t.TempDir()
+	gcLogPath := writeDogFakeGC(t, binDir)
+	_ = writeBackupPWDLoggingDolt(t, binDir, 0)
+	const staleRoot = "ssssssssssssssssssssssssssssssss"
+
+	out := runDogScript(t, "mol-dog-backup.sh", binDir, cityPath, dataDir,
+		"GC_BACKUP_DATABASES=prod", "FAKE_BACKUP_ROOT="+staleRoot)
+	want := "backup: prod — FAILED: root mismatch after sync, source " + fakeSyncRoot + " backup " + staleRoot
+	if !strings.Contains(out, want) {
+		t.Fatalf("expected %q:\n%s", want, out)
+	}
+	if strings.Contains(out, "synced (snapshot)") || !strings.Contains(out, "synced: 0/1") {
+		t.Fatalf("a root mismatch must not count as synced:\n%s", out)
+	}
+	stamp := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "local-backup-freshness", "prod")
+	if _, err := os.Stat(stamp); !os.IsNotExist(err) {
+		t.Fatalf("a root mismatch must write no freshness stamp, stat err: %v", err)
+	}
+	gcLog, err := os.ReadFile(gcLogPath)
+	if err != nil {
+		t.Fatalf("read gc log: %v", err)
+	}
+	if !strings.Contains(string(gcLog), "Dolt backup: 1/1 databases failed to sync") {
+		t.Fatalf("a root mismatch must escalate as a failed database, log:\n%s", gcLog)
+	}
+}
+
+// TestBackupScriptSnapshotNonFileRemoteFailsClosed: the job stamps, prunes and
+// copies off-box its artifact directory, so the <db>-backup remote must point
+// there. A remote anywhere else (here not even a file:// path) cannot vouch
+// for that directory, so the database is failed with no stamp rather than
+// credited on exit 0 (ga-rirak7).
+func TestBackupScriptSnapshotNonFileRemoteFailsClosed(t *testing.T) {
+	if !cowCloneAvailable(t) {
+		t.Skip("filesystem has no copy-on-write clone support; the root check runs on the snapshot path only")
+	}
+	cityPath := t.TempDir()
+	dataDir := filepath.Join(cityPath, "dolt-data")
+	if err := os.MkdirAll(filepath.Join(dataDir, "prod", ".dolt"), 0o755); err != nil {
+		t.Fatalf("mkdir db: %v", err)
+	}
+	binDir := t.TempDir()
+	_ = writeDogFakeGC(t, binDir)
+	_ = writeBackupPWDLoggingDolt(t, binDir, 0)
+
+	out := runDogScript(t, "mol-dog-backup.sh", binDir, cityPath, dataDir,
+		"GC_BACKUP_DATABASES=prod", "FAKE_BACKUP_URL=aws://bucket/prod")
+	want := "backup: prod — FAILED: backup remote aws://bucket/prod is not this job's artifact directory " +
+		filepath.Join(cityPath, ".dolt-backup", "prod") + "; root not verifiable"
+	if !strings.Contains(out, want) || strings.Count(out, "— FAILED:") != 1 {
+		t.Fatalf("expected exactly one %q:\n%s", want, out)
+	}
+	if !strings.Contains(out, "synced: 0/1") {
+		t.Fatalf("a non-file remote must not count as synced:\n%s", out)
+	}
+	stamp := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "local-backup-freshness", "prod")
+	if _, err := os.Stat(stamp); !os.IsNotExist(err) {
+		t.Fatalf("a non-file remote must write no freshness stamp, stat err: %v", err)
 	}
 }
 
