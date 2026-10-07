@@ -504,7 +504,9 @@ func TestBazelMultiLaneWorkflowShape(t *testing.T) {
 	// lane's client-side loading and analysis is CPU-bound (ga-vnycm2.8:
 	// 23-34 s on 4 vCPU, 15-19 s on 8), and every other mode executes here,
 	// or may (a fork lane's fallback to the read-only cache).
-	if want := "${{ (matrix.lane == 'unit' || matrix.lane == 'acceptance') && 'blacksmith-8vcpu-ubuntu-2404' || 'blacksmith-4vcpu-ubuntu-2404' }}"; lane.RunsOn != want {
+	// Fork carry (pl-axh9): upstream's choice inside the repository-aware
+	// form, GitHub-hosted on the fork (TestBazelWorkflowForkRunnerRule).
+	if want := "${{ github.repository == 'gastownhall/gascity' && ((matrix.lane == 'unit' || matrix.lane == 'acceptance') && 'blacksmith-8vcpu-ubuntu-2404' || 'blacksmith-4vcpu-ubuntu-2404') || 'ubuntu-latest' }}"; lane.RunsOn != want {
 		t.Errorf("lane runs-on = %q, want %q", lane.RunsOn, want)
 	}
 
@@ -1140,7 +1142,9 @@ func TestBazelWorkerHostFetchAlwaysRuns(t *testing.T) {
 	if !ok {
 		t.Fatalf("worker-host: no %q step", "Measure this Blacksmith host against the PR's manifest")
 	}
-	wantMeasureIf := "steps.host.outputs.measure == 'true' || steps.pins.outputs.pin-changed == 'true'"
+	// Fork carry (pl-axh9): the measurement needs a Blacksmith host, so it is
+	// upstream only (bazel.yml's fork runner rule).
+	wantMeasureIf := "(steps.host.outputs.measure == 'true' || steps.pins.outputs.pin-changed == 'true') && github.repository == 'gastownhall/gascity'"
 	if measure.If != wantMeasureIf {
 		t.Errorf("worker-host measure step: if %q, want %q", measure.If, wantMeasureIf)
 	}
