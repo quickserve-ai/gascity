@@ -4964,7 +4964,7 @@ func TestCityRuntimeReloadSchemaSkewPreservesSessionsBeforeProviderSwap(t *testi
 	cr.setControllerState(cs)
 
 	previousOpen := newControllerStateOpenCityStore
-	newControllerStateOpenCityStore = func(string, gate.Mode) (beads.StoreOpenResult, error) {
+	newControllerStateOpenCityStore = func(string, gate.Mode, beads.NativeTransportMode) (beads.StoreOpenResult, error) {
 		return beads.StoreOpenResult{
 			Store: beads.NewMemStore(),
 			Diagnostic: beads.BeadsDiagnostic{
@@ -4978,7 +4978,7 @@ func TestCityRuntimeReloadSchemaSkewPreservesSessionsBeforeProviderSwap(t *testi
 	t.Cleanup(func() { newControllerStateOpenCityStore = previousOpen })
 	previousPreflight := controllerStatePreflightCityStore
 	controllerStatePreflightCityStore = func(string, *config.City, gate.Mode) (beads.StoreOpenResult, error) {
-		return newControllerStateOpenCityStore("", gate.ModeUnset)
+		return newControllerStateOpenCityStore("", gate.ModeUnset, beads.NativeTransportUnset)
 	}
 	t.Cleanup(func() { controllerStatePreflightCityStore = previousPreflight })
 
@@ -5048,7 +5048,7 @@ func TestCityRuntimeReloadPublishingOpenSkewPreservesSessionsBeforeProviderSwap(
 	}
 	t.Cleanup(func() { controllerStatePreflightCityStore = previousPreflight })
 	previousOpen := newControllerStateOpenCityStore
-	newControllerStateOpenCityStore = func(string, gate.Mode) (beads.StoreOpenResult, error) {
+	newControllerStateOpenCityStore = func(string, gate.Mode, beads.NativeTransportMode) (beads.StoreOpenResult, error) {
 		return beads.StoreOpenResult{
 			Store: beads.NewMemStore(),
 			Diagnostic: beads.BeadsDiagnostic{
@@ -5148,7 +5148,7 @@ func TestCityRuntimeTickSchemaSkewHoldsBeforePoolDeathHook(t *testing.T) {
 	cr.setControllerState(cs)
 
 	previousOpen := newControllerStateOpenCityStore
-	newControllerStateOpenCityStore = func(string, gate.Mode) (beads.StoreOpenResult, error) {
+	newControllerStateOpenCityStore = func(string, gate.Mode, beads.NativeTransportMode) (beads.StoreOpenResult, error) {
 		return beads.StoreOpenResult{Store: beads.NewMemStore(), Diagnostic: beads.BeadsDiagnostic{
 			Store: beads.BeadsStoreNameBdStore, PreflightGate: "native_open",
 			PreflightReason: "schema version mismatch: database is at v55, binary knows up to v54 (1 migration ahead)",
@@ -5157,7 +5157,7 @@ func TestCityRuntimeTickSchemaSkewHoldsBeforePoolDeathHook(t *testing.T) {
 	t.Cleanup(func() { newControllerStateOpenCityStore = previousOpen })
 	previousPreflight := controllerStatePreflightCityStore
 	controllerStatePreflightCityStore = func(string, *config.City, gate.Mode) (beads.StoreOpenResult, error) {
-		return newControllerStateOpenCityStore("", gate.ModeUnset)
+		return newControllerStateOpenCityStore("", gate.ModeUnset, beads.NativeTransportUnset)
 	}
 	t.Cleanup(func() { controllerStatePreflightCityStore = previousPreflight })
 

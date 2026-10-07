@@ -90,14 +90,14 @@ func doctorManagedSessionNames(cityPath string, cfg *config.City, openStore func
 	}
 }
 
-// doctorGatedRigStoreOpener answers errDoctorStoreNotRunning for a rig whose
-// bd-owned proxied store is stopped instead of opening it: doctor never starts
-// a server (#6817). rigPath is the scope root the other gated rig checks hand
+// doctorGatedRigStoreOpener answers the gate's skip error for a rig whose
+// bd-owned proxied store is stopped or suspended instead of opening it: doctor
+// never starts a server (#6817, #7102). rigPath is the scope root the other gated rig checks hand
 // the gate (rig.Path).
 func doctorGatedRigStoreOpener(gate *doctorStoreGate, open rigStoreOpener) rigStoreOpener {
 	return func(rigPath, cityPath string) (beads.Store, error) {
-		if gate.Stopped(rigPath) {
-			return nil, errDoctorStoreNotRunning
+		if err := gate.skipErr(rigPath); err != nil {
+			return nil, err
 		}
 		return open(rigPath, cityPath)
 	}
