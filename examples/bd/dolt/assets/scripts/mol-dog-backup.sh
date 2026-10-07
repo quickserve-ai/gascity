@@ -306,6 +306,140 @@ clone_db_snapshot() {
     return 1
 }
 
+# manifest_root prints the root hash field of a Dolt manifest
+# (version:__DOLT__:lock:root:appendix...). Returns 1 when the file is missing,
+# empty or unreadable, 2 when it is there but not that shape: a non-integer
+# version, any magic but __DOLT__, an empty lock, a root that is not 32 base32
+# characters, or no field after the root.
+manifest_root() {
+    mr_file="$1"
+    [ -s "$mr_file" ] && [ -r "$mr_file" ] || return 1
+    mr_ver=""
+    mr_magic=""
+    mr_lock=""
+    mr_root=""
+    mr_app=""
+    # Dolt writes the manifest with no trailing newline, so `read` exits
+    # non-zero while still assigning every field; the checks below validate.
+    IFS=: read -r mr_ver mr_magic mr_lock mr_root mr_app _ < "$mr_file" 2>/dev/null || true
+    case "$mr_ver" in
+        ''|*[!0-9]*) return 2 ;;
+    esac
+    [ "$mr_magic" = "__DOLT__" ] || return 2
+    [ -n "$mr_lock" ] || return 2
+    [ -n "$mr_app" ] || return 2
+    case "$mr_root" in
+        ''|*[!0-9a-v]*) return 2 ;;
+    esac
+    [ "${#mr_root}" -eq 32 ] || return 2
+    printf '%s\n' "$mr_root"
+}
+
+# manifest_check <db> <side> <file>: sets MC_ROOT, or prints the one FAILED
+# line for that side, sets ROOT_FAILURE and returns 1.
+manifest_check() {
+    mc_rc=0
+    MC_ROOT="$(manifest_root "$3")" || mc_rc=$?
+    case "$mc_rc" in
+        0) return 0 ;;
+        1) mc_what="unreadable" ;;
+        *) mc_what="malformed" ;;
+    esac
+    echo "backup: $1 — FAILED: $2 manifest $mc_what after sync ($3)"
+    ROOT_FAILURE="$2 manifest $mc_what after sync"
+    return 1
+}
+
+# physical_dir prints a directory's physical path (`cd -P && pwd -P`: a
+# logical cd would resolve `..` against the spelling, so link/../x names the
+# link's sibling, not its target's), or the path as given minus any trailing
+# slash when it cannot be entered. Returns 1 on an empty path.
+physical_dir() {
+    pd_path="$1"
+    [ -n "$pd_path" ] || return 1
+    if pd_phys="$(cd -P "$pd_path" 2>/dev/null && pwd -P)"; then
+        printf '%s\n' "$pd_phys"
+    else
+        while [ "${pd_path%/}" != "$pd_path" ] && [ "$pd_path" != "/" ]; do
+            pd_path="${pd_path%/}"
+        done
+        printf '%s\n' "$pd_path"
+    fi
+}
+
+# backup_remote_url <db> <dir>: prints the WHOLE url `dolt backup -v` (run in
+# <dir>) lists for <db>-backup — everything after the name, trailing
+# whitespace trimmed, so a path with a space survives. Returns 1, printing
+# nothing, when the lookup exits non-zero (whatever it printed) or lists no
+# such remote.
+backup_remote_url() {
+    bru_name="$1-backup"
+    bru_rc=0
+    bru_list="$(cd "$2" && run_bounded 30 dolt backup -v 2>/dev/null)" || bru_rc=$?
+    [ "$bru_rc" -eq 0 ] || return 1
+    bru_name_re="$(printf '%s' "$bru_name" | sed 's/[][\.*^$/]/\\&/g')"
+    bru_url="$(printf '%s\n' "$bru_list" \
+        | sed -n "s/^${bru_name_re}[[:space:]][[:space:]]*//p" \
+        | sed -n '1{s/[[:space:]]*$//;p;}')"
+    [ -n "$bru_url" ] || return 1
+    printf '%s\n' "$bru_url"
+}
+
+# verify_synced_root (ga-rirak7): `dolt backup sync` exits 0 when its read of
+# the SOURCE root fails (SyncRoots returns nil), so exit 0 alone cannot prove
+# the backup moved. After a healthy snapshot sync the clone's manifest root
+# equals the backup's byte for byte (measured on copies of `as`, 2026-10-06);
+# before the sync the clone's manifest lags the chunk journal, so this must
+# run after it. Prints one FAILED line and returns 1 on anything but equal.
+# Only meaningful for a snapshot: the LIVE manifest lags the journal while the
+# sql-server holds the store, so an in-place sync has no comparable source.
+#
+# This job stamps, prunes and copies off-box $BACKUP_ARTIFACT_DIR/<db>, so the
+# <db>-backup remote (read from the clone, no server above it) must point
+# THERE. ensure_backup_remote accepts an existing remote whatever its URL; any
+# other destination, a file remote elsewhere included, or a failed lookup,
+# fails closed.
+verify_synced_root() {
+    vr_db="$1"
+    vr_src_manifest="$2/.dolt/noms/manifest"
+    # The WHOLE <dir>/<db> path is canonicalised: resolving only the parent and
+    # appending <db> would refuse a symlink at <db> that points exactly where
+    # the remote does. (ensure_backup_remote creates <dir>/<db> only when it
+    # adds the remote; an existing remote may point anywhere, which is what
+    # the comparison below is for. A <dir>/<db> that cannot be entered falls
+    # back to its spelling and cannot match a resolvable remote: fails closed.)
+    vr_want="$(physical_dir "$BACKUP_ARTIFACT_DIR/$vr_db")" || vr_want=""
+    vr_url="$(backup_remote_url "$vr_db" "$2")" || vr_url=""
+    vr_bak_dir=""
+    case "$vr_url" in
+        file://*)
+            vr_path="${vr_url#file://}"
+            case "$vr_path" in
+                /*) ;;
+                *) vr_path="/$vr_path" ;;
+            esac
+            vr_bak_dir="$(physical_dir "$vr_path")" || vr_bak_dir=""
+            ;;
+    esac
+    if [ -z "$vr_want" ] || [ -z "$vr_bak_dir" ] || [ "$vr_bak_dir" != "$vr_want" ]; then
+        vr_why="backup remote ${vr_url:-(unresolved)} is not this job's artifact directory $BACKUP_ARTIFACT_DIR/$vr_db; root not verifiable"
+        echo "backup: $vr_db — FAILED: $vr_why"
+        ROOT_FAILURE="$vr_why"
+        return 1
+    fi
+    vr_bak_manifest="$vr_bak_dir/manifest"
+    manifest_check "$vr_db" source "$vr_src_manifest" || return 1
+    vr_src="$MC_ROOT"
+    manifest_check "$vr_db" backup "$vr_bak_manifest" || return 1
+    vr_bak="$MC_ROOT"
+    if [ "$vr_src" != "$vr_bak" ]; then
+        echo "backup: $vr_db — FAILED: root mismatch after sync, source $vr_src backup $vr_bak"
+        ROOT_FAILURE="root mismatch after sync, source $vr_src backup $vr_bak"
+        return 1
+    fi
+    return 0
+}
+
 # prune_backup_orphans deletes table files the backup manifest does not
 # reference. A killed sync leaves its partial chunks behind, and nothing ever
 # reclaimed them: 46.89 GB had accumulated by 2026-08-13, and the failed 07:02Z
@@ -508,12 +642,29 @@ for db in $DATABASES; do
         fi
     fi
     if (cd "$sync_dir" && run_bounded "$BACKUP_SYNC_TIMEOUT" dolt backup sync "${db}-backup" 2>"$sync_stderr"); then
-        SYNCED=$((SYNCED + 1))
-        sync_ok=1
-        echo "backup: $db — synced ($sync_mode)"
-        # Stamp ONLY on exit 0. Health reads this instead of any mtime on the
-        # artifact plane, because the failure path can write those too.
-        write_local_backup_sync_stamp "$db" "$BACKUP_ARTIFACT_DIR"
+        ROOT_FAILURE=""
+        if [ "$sync_mode" = "snapshot" ]; then
+            # Fail closed on the return code too: a return 1 that set no
+            # message must still refuse the stamp.
+            if ! verify_synced_root "$db" "$sync_dir"; then
+                ROOT_FAILURE="${ROOT_FAILURE:-root unverified}"
+            fi
+        else
+            echo "backup: $db — root not verified (in-place sync: the live manifest lags the chunk journal)"
+        fi
+        if [ -n "$ROOT_FAILURE" ]; then
+            # Exit 0 with a root that did not land is a failed sync: no stamp,
+            # no prune (sync_ok stays 0), counted like any other failure.
+            append_failed_db "$db($sync_mode sync $ROOT_FAILURE)"
+        else
+            SYNCED=$((SYNCED + 1))
+            sync_ok=1
+            echo "backup: $db — synced ($sync_mode)"
+            # Stamp ONLY on exit 0 AND equal roots. Health reads this instead of
+            # any mtime on the artifact plane, because the failure path can
+            # write those too.
+            write_local_backup_sync_stamp "$db" "$BACKUP_ARTIFACT_DIR"
+        fi
     else
         # ga-28huj class: the reason used to go to /dev/null, so "sync failed"
         # was unactionable. Carry the first stderr line into the failure label.
@@ -568,6 +719,27 @@ OFFSITE_STATUS="unconfigured — NO OFF-BOX COPY"
 OFFSITE_FATAL=0
 OFFSITE_DETAIL=""
 
+# offsite_source_has_symlinks <dir>: returns 0 and sets OFFSITE_SYMLINKS to the
+# names when any entry directly under <dir> is a symlink, else 1. The root
+# check accepts a symlink AT <db> (its target is where the remote points), but
+# `rsync -a` copies a link AS A LINK, so the off-box copy of such a database
+# would hold a pointer into this box and no data while the leg reported ok.
+# No rsync flag fixes that portably (openrsync on macOS has no --copy-links or
+# --copy-dirlinks; rsync's -L would also follow links INSIDE a database), so
+# the leg refuses the layout by name instead of copying it wrong.
+OFFSITE_SYMLINKS=""
+offsite_source_has_symlinks() {
+    osh_dir="$1"
+    OFFSITE_SYMLINKS=""
+    for osh_entry in "$osh_dir"/* "$osh_dir"/.[!.]*; do
+        [ -e "$osh_entry" ] || [ -L "$osh_entry" ] || continue
+        if [ -L "$osh_entry" ]; then
+            OFFSITE_SYMLINKS="${OFFSITE_SYMLINKS:+$OFFSITE_SYMLINKS }${osh_entry##*/}"
+        fi
+    done
+    [ -n "$OFFSITE_SYMLINKS" ]
+}
+
 # PUBLISH THE BINDING BEFORE THE WORK, not only after it. The copy can take the
 # better part of an hour and the process can be killed inside it; publishing only
 # at the end left health reading the PREVIOUS target's declaration — and, with a
@@ -601,6 +773,13 @@ if [ -n "$OFFSITE_PATH" ]; then
         OFFSITE_STATUS="same-volume"
         OFFSITE_FATAL=1
         OFFSITE_DETAIL="offsite target $OFFSITE_PATH is on the SAME VOLUME as $BACKUP_ARTIFACT_DIR; a copy there survives no disk event and is not an off-box copy"
+    elif offsite_source_has_symlinks "$BACKUP_ARTIFACT_DIR"; then
+        # A symlinked <db> is accepted by the root check but cannot be copied
+        # faithfully by rsync -a (see offsite_source_has_symlinks). Refuse
+        # before the copy, naming the entries, rather than ship pointers.
+        OFFSITE_STATUS="symlinked-artifact"
+        OFFSITE_FATAL=1
+        OFFSITE_DETAIL="artifact dir $BACKUP_ARTIFACT_DIR holds symlinked entries ($OFFSITE_SYMLINKS); rsync -a would copy each as a link with no data behind it, so no off-box copy was attempted"
     elif run_bounded "$OFFSITE_TIMEOUT_SECS" rsync -a --delete "$BACKUP_ARTIFACT_DIR/" "$OFFSITE_PATH/" 2>/dev/null; then
         OFFSITE_STATUS="ok"
         # A stamp that could not be written must not be reported as if it were.
