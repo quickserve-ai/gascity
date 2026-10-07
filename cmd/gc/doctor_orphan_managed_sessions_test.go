@@ -93,7 +93,7 @@ func TestDoctorManagedSessionNamesCollectsOpenSessionBeadsOnly(t *testing.T) {
 			t.Errorf("opened store at %q, want city path %q", path, cityPath)
 		}
 		return store, nil
-	}, newDoctorStoreGate(false))
+	}, newDoctorStoreGate(false, nil))
 	if opens != 0 {
 		t.Fatalf("store opened %d times before the lister was called, want 0 (lazy)", opens)
 	}
@@ -123,7 +123,7 @@ func TestDoctorManagedSessionNamesCollectsOpenSessionBeadsOnly(t *testing.T) {
 func TestDoctorManagedSessionNamesOpenErrorIsReturned(t *testing.T) {
 	lister := doctorManagedSessionNames(t.TempDir(), &config.City{}, func(string) (beads.Store, error) {
 		return nil, errors.New("dolt unreachable")
-	}, newDoctorStoreGate(false))
+	}, newDoctorStoreGate(false, nil))
 	names, err := lister()
 	if err == nil {
 		t.Fatalf("lister() error = nil, names = %v; want the open error", names)
@@ -156,7 +156,7 @@ func TestDoctorOrphanSessionsFixSparesSessionBeadClaimedSeats(t *testing.T) {
 	check := doctor.NewOrphanSessionsCheck(cfg, "test", "", sp).
 		WithManagedSessionNames(doctorManagedSessionNames(cityPath, cfg, func(string) (beads.Store, error) {
 			return store, nil
-		}, newDoctorStoreGate(false)))
+		}, newDoctorStoreGate(false, nil)))
 
 	if r := check.Run(&doctor.CheckContext{CityPath: cityPath}); r.Status != doctor.StatusWarning || len(r.Details) != 2 {
 		t.Fatalf("Run() = status %d details %v (%s), want a warning naming exactly platform--gastown__nux and stray", r.Status, r.Details, r.Message)
@@ -191,7 +191,7 @@ func orphanFixAgainst(t *testing.T, cityPath string, cfg *config.City, store bea
 	check := doctor.NewOrphanSessionsCheck(cfg, "test", "", sp).
 		WithManagedSessionNames(doctorManagedSessionNames(cityPath, cfg, func(string) (beads.Store, error) {
 			return store, nil
-		}, newDoctorStoreGate(false)))
+		}, newDoctorStoreGate(false, nil)))
 	return sp, check.Fix(&doctor.CheckContext{CityPath: cityPath})
 }
 
@@ -222,7 +222,7 @@ func TestDoctorManagedSessionNamesRefusesUnroutedSessionsRelocation(t *testing.T
 
 	names, err := doctorManagedSessionNames(cityPath, cfg, func(string) (beads.Store, error) {
 		return store, nil
-	}, newDoctorStoreGate(false))()
+	}, newDoctorStoreGate(false, nil))()
 	if err == nil {
 		t.Fatalf("lister() error = nil, names = %v; want a refusal to read the work store for a relocated sessions class", names)
 	}
@@ -349,7 +349,7 @@ func TestDoctorOrphanSessionsFixSparesRigStoreOnlySession(t *testing.T) {
 		check := doctor.NewOrphanSessionsCheck(cfg, "test", "", sp).
 			WithManagedSessionNames(doctorManagedSessionNames(cityPath, cfg, func(string) (beads.Store, error) {
 				return cityStore, nil
-			}, newDoctorStoreGate(false)))
+			}, newDoctorStoreGate(false, nil)))
 		if err := check.Fix(&doctor.CheckContext{CityPath: cityPath}); err != nil {
 			t.Fatalf("suspended=%v: Fix() error = %v", suspended, err)
 		}
@@ -444,7 +444,7 @@ func TestDoctorGatedRigStoreOpenerNeverOpensAStoppedRig(t *testing.T) {
 	cityPath := t.TempDir()
 	lit := beads.NewMemStore()
 	var opened []string
-	open := doctorGatedRigStoreOpener(newDoctorStoreGate(false), func(rigPath, _ string) (beads.Store, error) {
+	open := doctorGatedRigStoreOpener(newDoctorStoreGate(false, nil), func(rigPath, _ string) (beads.Store, error) {
 		opened = append(opened, rigPath)
 		return lit, nil
 	})
@@ -480,7 +480,7 @@ func TestDoctorOrphanSessionsFixRefusesOnStoppedRigStore(t *testing.T) {
 
 	names, err := doctorManagedSessionNames(cityPath, cfg, func(string) (beads.Store, error) {
 		return cityStore, nil
-	}, newDoctorStoreGate(false))()
+	}, newDoctorStoreGate(false, nil))()
 	if !errors.Is(err, errDoctorStoreNotRunning) || !strings.Contains(err.Error(), `rig "dark"`) {
 		t.Fatalf("lister() = (%v, %v), want errDoctorStoreNotRunning naming rig \"dark\"", names, err)
 	}

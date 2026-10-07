@@ -2564,7 +2564,7 @@ func TestReleaseOrphanedPoolAssignment_FencedFallbackFollowsAResolveTarget(t *te
 		t.Fatal("the wrapper promotes the writer itself; the case needs one that only declares a target")
 	}
 
-	if !releaseOrphanedPoolAssignment(wrapper, work, false) {
+	if !releaseOrphanedPoolAssignment(wrapper, work, false, poolReleaseGuardForTest()) {
 		t.Fatal("release through the wrapper = false, want the fenced release to land on its target")
 	}
 	if len(store.assignmentUpdates) != 1 {

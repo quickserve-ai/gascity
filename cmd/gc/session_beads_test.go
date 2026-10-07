@@ -5603,7 +5603,7 @@ func TestCloseBeadWithholdsWorkFromLiveNamedIdentity(t *testing.T) {
 	now := time.Date(2026, 4, 18, 12, 0, 0, 0, time.UTC)
 	store, sessionBead, work := closeBeadNamedIdentityFixture(t, "reviewer")
 
-	if !closeBead(store, namedSessionTestCfg(false), sessionBead.ID, "orphaned", now, ioDiscard{}) {
+	if !closeBead(store, namedSessionTestCfg(false), decidedSessionInfo(store, sessionBead.ID), "orphaned", now, ioDiscard{}) {
 		t.Fatal("closeBead returned false, want true")
 	}
 
@@ -5625,7 +5625,7 @@ func TestCloseBeadWithholdsWorkFromLiveRigScopedNamedIdentity(t *testing.T) {
 	now := time.Date(2026, 4, 18, 12, 0, 0, 0, time.UTC)
 	store, sessionBead, work := closeBeadNamedIdentityFixture(t, "gascity/reviewer")
 
-	if !closeBead(store, namedSessionTestCfgRigScoped(false), sessionBead.ID, "orphaned", now, ioDiscard{}) {
+	if !closeBead(store, namedSessionTestCfgRigScoped(false), decidedSessionInfo(store, sessionBead.ID), "orphaned", now, ioDiscard{}) {
 		t.Fatal("closeBead returned false, want true")
 	}
 
@@ -5649,7 +5649,7 @@ func TestCloseBeadWithholdsWorkFromNamedIdentityWithoutConfig(t *testing.T) {
 	now := time.Date(2026, 4, 18, 12, 0, 0, 0, time.UTC)
 	store, sessionBead, work := closeBeadNamedIdentityFixture(t, "reviewer")
 
-	if !closeBead(store, nil, sessionBead.ID, "orphaned", now, ioDiscard{}) {
+	if !closeBead(store, nil, decidedSessionInfo(store, sessionBead.ID), "orphaned", now, ioDiscard{}) {
 		t.Fatal("closeBead returned false, want true")
 	}
 

@@ -605,7 +605,7 @@ func TestEnqueuePreparedStartWaveReleasesItsSlotWhenAPostStartObservationHangs(t
 				},
 			}},
 			"", sp, store, nil, clk, rec, postStartTimeout, 1, ioDiscard{}, ioDiscard{}, nil, nil,
-			immediateStartStabilityWaiter, immediateSessionStaleKeyDetectionWaiter, nil,
+			immediateStartStabilityWaiter, immediateSessionStaleKeyDetectionWaiter, nil, nil,
 		)
 		select {
 		case <-finishedC:
