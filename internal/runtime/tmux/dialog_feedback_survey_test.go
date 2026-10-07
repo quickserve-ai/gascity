@@ -440,12 +440,32 @@ func TestNudgeSessionDoesNotPasteOntoUnresolvedSurveyDigit(t *testing.T) {
 	}
 }
 
-// Upstream (#7013) delivers the nudge when the survey peek's capture fails.
-// The carry's human-prompt guard (ga-ubfc7j) reads the same pane before it
-// types anything and fails closed on a pane it cannot read: an unreadable
-// pane may be holding a person's prompt. So here the nudge is withheld with
-// an error rather than typed blind, and the caller retries it.
-func TestNudgeSessionDeliversWhenSurveyPeekFails(t *testing.T) {
+// nudgeInputVerbs are the tmux verbs that put input into a pane or stage it
+// for one.
+var nudgeInputVerbs = []string{"send-keys", "paste-buffer", "load-buffer", "set-buffer"}
+
+// inputCalls returns the recorded calls that put input into a pane.
+func inputCalls(calls [][]string) [][]string {
+	var out [][]string
+	for _, call := range calls {
+		for _, verb := range nudgeInputVerbs {
+			if slices.Contains(call, verb) {
+				out = append(out, call)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// Every capture fails, so the carry's human-prompt guard (ga-ubfc7j) cannot
+// read the pane at its first read, before the C-u clear or any other key, and
+// fails closed: an unreadable pane may be holding a person's prompt. The
+// nudge is withheld as a typed capture-failure deferral that keeps it queued
+// for a retry, and nothing reaches the pane. Upstream (#7013, which has no
+// such guard) delivers here; this case never reaches the survey peek, which
+// the next test exercises on its own.
+func TestNudgeSessionWithholdsWhenGuardCannotReadPane(t *testing.T) {
 	executor := &failingRecaptureExecutor{scriptedTargetExecutor: scriptedTargetExecutor{display: "agent-pane|0"}, captureFails: true}
 	cfg := DefaultConfig()
 	cfg.NudgeReadyTimeout = 10 * time.Millisecond
@@ -453,12 +473,92 @@ func TestNudgeSessionDeliversWhenSurveyPeekFails(t *testing.T) {
 
 	err := tm.NudgeSession("agent-pane", "hello")
 
-	for _, call := range executor.calls {
+	var deferred *NudgeDeferredError
+	if !errors.As(err, &deferred) {
+		t.Fatalf("NudgeSession error = %v, want a *NudgeDeferredError for a pane the guard could not read", err)
+	}
+	if !errors.Is(err, ErrNudgeDeferredHumanPrompt) {
+		t.Fatalf("NudgeSession error = %v, want errors.Is ErrNudgeDeferredHumanPrompt so the queue keeps the item", err)
+	}
+	if deferred.Reason != NudgeDeferReasonCaptureFailed || deferred.Stage != nudgeGuardStageBeforeType {
+		t.Fatalf("deferral = reason %q stage %q, want %q at %q", deferred.Reason, deferred.Stage, NudgeDeferReasonCaptureFailed, nudgeGuardStageBeforeType)
+	}
+	if got := inputCalls(executor.calls); len(got) != 0 {
+		t.Fatalf("NudgeSession sent input to a pane its guard could not read: %v", got)
+	}
+}
+
+// surveyPeekFailsExecutor is a detached session (no client: the nudge's
+// client count reads 0, and the "name|attached" probes read "agent-pane|0")
+// that fails exactly one read: the first visible-screen capture (no -S) after
+// the nudge's C-u clear, which is DismissFeedbackSurveyModalIfPresent's survey
+// peek. The human-prompt guard reads with -S (CapturePaneLines), and
+// dismissMidSessionDialogs's visible-screen peek comes before the clear, so
+// every other read succeeds.
+type surveyPeekFailsExecutor struct {
+	scriptedTargetExecutor
+	cleared    bool
+	failedCall int // index into calls of the failed capture; -1 until it fires
+}
+
+func (f *surveyPeekFailsExecutor) execute(args []string) (string, error) {
+	if slices.Contains(args, "display-message") && slices.Contains(args, "#{session_attached}") {
+		f.calls = append(f.calls, slices.Clone(args))
+		return "0", nil
+	}
+	if slices.Contains(args, "send-keys") && slices.Contains(args, "C-u") {
+		f.cleared = true
+	}
+	if f.cleared && f.failedCall < 0 && slices.Contains(args, "capture-pane") && !slices.Contains(args, "-S") {
+		f.failedCall = len(f.calls)
+		f.calls = append(f.calls, slices.Clone(args))
+		return "", errors.New("capture-pane failed")
+	}
+	return f.scriptedTargetExecutor.execute(args)
+}
+
+func (f *surveyPeekFailsExecutor) executeCtx(_ context.Context, args []string) (string, error) {
+	return f.execute(args)
+}
+
+// Only the survey peek fails; the guard's reads succeed. The carry delivers
+// here, as upstream #7013 does: DismissFeedbackSurveyModalIfPresent swallows
+// a read failure before any digit is typed (nothing was keyed, so there is
+// nothing to protect), and the text sender re-runs the human-prompt guard
+// (sendKeysLiteralWithRetry) and reads the pane again before it types. So the
+// nudge is never typed into a pane gc could not read: the read that licenses
+// the text is the guard's, made after the failed peek.
+func TestNudgeSessionDeliversWhenOnlySurveyPeekFails(t *testing.T) {
+	executor := &surveyPeekFailsExecutor{scriptedTargetExecutor: scriptedTargetExecutor{display: "agent-pane|0"}, failedCall: -1}
+	cfg := DefaultConfig()
+	cfg.NudgeReadyTimeout = 10 * time.Millisecond
+	tm := &Tmux{cfg: cfg, exec: executor}
+
+	err := tm.NudgeSession("agent-pane", "hello")
+
+	if executor.failedCall < 0 {
+		t.Fatalf("the survey peek's capture never ran, so its failure was not exercised: %v", executor.calls)
+	}
+	if _, deferred := NudgeDeferredReason(err); deferred {
+		t.Fatalf("NudgeSession deferred (%v) although only the survey peek failed: %v", err, executor.calls)
+	}
+	typed := -1
+	for i, call := range executor.calls {
 		if slices.Contains(call, "send-keys") && slices.Contains(call, "hello") {
-			t.Fatalf("NudgeSession typed into a pane its human-prompt guard could not read: %v", executor.calls)
+			typed = i
+			break
 		}
 	}
-	if err == nil {
-		t.Fatalf("NudgeSession error = nil after withholding the nudge from an unreadable pane: %v", executor.calls)
+	if typed < 0 {
+		t.Fatalf("NudgeSession dropped the message after a capture-pane failure in the survey peek: %v", executor.calls)
+	}
+	readBeforeTyping := false
+	for _, call := range executor.calls[executor.failedCall+1 : typed] {
+		if slices.Contains(call, "capture-pane") && slices.Contains(call, "-S") {
+			readBeforeTyping = true
+		}
+	}
+	if !readBeforeTyping {
+		t.Fatalf("NudgeSession typed without a guard read after the failed survey peek: %v", executor.calls)
 	}
 }
