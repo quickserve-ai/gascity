@@ -792,6 +792,23 @@ Rig defines an external project registered in the city.
 | `dolt_port` | string |  |  | DoltPort overrides the city-level Dolt port for this rig's beads. When set, controller commands (scale_check, work_query) prefix their shell invocations with BEADS_DOLT_SERVER_PORT=&lt;port&gt; so bd connects to the correct server instead of the city-level default. |
 | `formula_vars` | map[string]string |  |  | FormulaVars provides rig-scoped defaults for formula vars. Keys match var names declared in formula `[vars.&lt;name&gt;]` blocks. Values are used when a formula runs in this rig and the caller did not pass an explicit --var override. Takes precedence over formula-level defaults but loses to --var flags. |
 | `beads_proxied_idle_timeout` | string |  |  | BeadsProxiedIdleTimeout overrides [beads] proxied_idle_timeout for this rig's bd-owned proxied scope. Go duration; "0" means never. Ignored, with a warning, for a rig that shares the city's proxy root: one proxy serves every scope on that root and carries the city's value. |
+| `doctor` | RigDoctorConfig |  |  | Doctor holds rig-scoped gc doctor policy ([rigs.doctor]). |
+
+## RigDoctorConfig
+
+RigDoctorConfig holds gc doctor policy that applies to one rig.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `census_owner_namespace` | string |  |  | CensusOwnerNamespace declares that this rig's resource-census ledger (test/test-resources.toml) names owner_bead values from ANOTHER tracker, e.g. "gastownhall/gascity" for a fork of Gas City whose ledger comes from upstream. The census-owner-liveness check then reports an owner_bead missing from this city as owned in that namespace instead of dangling. The cost: a missing owner on this rig that is genuinely this city's is not detected. Empty means every missing owner is dangling. |
+
+## RigDoctorPatch
+
+RigDoctorPatch overrides fields of a rig's [rigs.doctor] table.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `census_owner_namespace` | string |  |  | CensusOwnerNamespace overrides Rig.Doctor.CensusOwnerNamespace; an empty string clears the declaration. |
 
 ## RigPatch
 
@@ -808,6 +825,7 @@ RigPatch modifies an existing rig identified by Name.
 | `suspended_on_start` | boolean |  |  | SuspendedOnStart overrides the rig's desired suspension state at city start. Mirrors Rig.SuspendedOnStart. |
 | `formula_vars` | map[string]string |  |  | FormulaVars adds or overrides rig-scoped formula var defaults. Additive merge: patch keys win over existing rig keys, unspecified keys are preserved. |
 | `beads_proxied_idle_timeout` | string |  |  | BeadsProxiedIdleTimeout overrides the rig's beads_proxied_idle_timeout. |
+| `doctor` | RigDoctorPatch |  |  | Doctor overrides fields of the rig's [rigs.doctor] table. |
 
 ## Service
 

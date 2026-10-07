@@ -285,7 +285,7 @@ const (
 	// Blacksmith on gastownhall/gascity and ubuntu-latest anywhere else, since
 	// the quickserve-ai fork has no Blacksmith runners. Reviewed delta: that
 	// one runs-on value, no new job, step, trigger or permission.
-	expectedCIExecutionHash     = "0b81b0eead4e815e218330ee63ccec936e8a14b7867b5e784ef0aadbd3cb006b"
+	expectedCIExecutionHash     = "974344c8bd810f2e807e54f785cd38beec114d040afccb8b01c12387a5fef02d"
 	expectedNightlyTriggersHash = "0a4400a09ac567e90adf8be1232eef1f14e36efd8dba3e143aa6e36f5b7a36f5"
 	// Nightly: reviewed delta Beads v1.3.0-rc.2 -> v1.3.0, then (round3 review,
 	// completeness) one new job, beads-proxied-perf: ubuntu-latest,
@@ -319,7 +319,7 @@ const (
 	// Setup action: reviewed delta (Go module fetch resilience) is setup-go
 	// `cache: false` and one step right after it,
 	// `uses: ./.github/actions/go-mod-download`.
-	expectedSetupActionHash = "910f005f48c629c9bf76c69a007b60c4132a76859183e59c0fe99d642bf6141f"
+	expectedSetupActionHash = "1e9e0ae10c9b6a48e07cfc7beff53cb28c89d44569e37c00b13ab92234057692"
 )
 
 var requiredFilterPaths = map[string][]string{

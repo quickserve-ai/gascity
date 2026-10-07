@@ -2788,6 +2788,10 @@
         "beads_proxied_idle_timeout": {
           "type": "string",
           "description": "BeadsProxiedIdleTimeout overrides [beads] proxied_idle_timeout for this\nrig's bd-owned proxied scope. Go duration; \"0\" means never. Ignored, with\na warning, for a rig that shares the city's proxy root: one proxy serves\nevery scope on that root and carries the city's value."
+        },
+        "doctor": {
+          "$ref": "#/$defs/RigDoctorConfig",
+          "description": "Doctor holds rig-scoped gc doctor policy ([rigs.doctor])."
         }
       },
       "additionalProperties": false,
@@ -2796,6 +2800,28 @@
         "name"
       ],
       "description": "Rig defines an external project registered in the city."
+    },
+    "RigDoctorConfig": {
+      "properties": {
+        "census_owner_namespace": {
+          "type": "string",
+          "description": "CensusOwnerNamespace declares that this rig's resource-census ledger\n(test/test-resources.toml) names owner_bead values from ANOTHER\ntracker, e.g. \"gastownhall/gascity\" for a fork of Gas City whose ledger\ncomes from upstream. The census-owner-liveness check then reports an\nowner_bead missing from this city as owned in that namespace instead of\ndangling. The cost: a missing owner on this rig that is genuinely this\ncity's is not detected. Empty means every missing owner is dangling."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "RigDoctorConfig holds gc doctor policy that applies to one rig."
+    },
+    "RigDoctorPatch": {
+      "properties": {
+        "census_owner_namespace": {
+          "type": "string",
+          "description": "CensusOwnerNamespace overrides Rig.Doctor.CensusOwnerNamespace; an\nempty string clears the declaration."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "RigDoctorPatch overrides fields of a rig's [rigs.doctor] table."
     },
     "RigPatch": {
       "properties": {
@@ -2837,6 +2863,10 @@
         "beads_proxied_idle_timeout": {
           "type": "string",
           "description": "BeadsProxiedIdleTimeout overrides the rig's beads_proxied_idle_timeout."
+        },
+        "doctor": {
+          "$ref": "#/$defs/RigDoctorPatch",
+          "description": "Doctor overrides fields of the rig's [rigs.doctor] table."
         }
       },
       "additionalProperties": false,

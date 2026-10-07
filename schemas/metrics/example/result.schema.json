@@ -219,7 +219,14 @@
               "storage-preflight",
               "nudge-drop",
               "beads-city-migrate-proxied",
-              "storage-repair-sequence"
+              "storage-repair-sequence",
+              "agent-is-foreign",
+              "session-bind-cloud",
+              "session-resume",
+              "worktree-gc",
+              "worktree-rescue",
+              "worktree-teardown",
+              "session-history"
             ]
           },
           "event_id": {
