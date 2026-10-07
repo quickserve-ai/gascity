@@ -3030,8 +3030,8 @@
         },
         "startup_timeout": {
           "type": "string",
-          "description": "StartupTimeout is how long to wait for each agent's Start() call before\ntreating it as failed. Duration string (e.g., \"60s\", \"5m\"). Defaults to\n\"300s\" — generous by design (ga-fcdvn): at 60s this deadline killed\nhealthy agents whose stacked MCP-server connects outlasted the budget,\nand the reconciler then restarted them in a 60s loop (37 kill cycles in\n~35 minutes, taking down a merge-queue consumer). A start that is merely\nslow must not be treated as failed; a truly dead start still fails, just\nlater, and the retry loop is 5x cheaper. The herdr provider derives its\ninner `agent start --timeout` from this same deadline, so the two bounds\ncannot invert.",
-          "default": "300s"
+          "description": "StartupTimeout is how long to wait for each agent's Start() call before\ntreating it as failed. Duration string (e.g., \"60s\", \"2m\"). Defaults to \"60s\".",
+          "default": "60s"
         },
         "progress_stall_timeout": {
           "type": "string",
