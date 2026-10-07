@@ -51,6 +51,11 @@ var goModDownloadExemptWorkflows = map[string]string{
 	"release.yml":         "publishing job keeps setup-go's own cache; not migrated",
 	"rc-release.yml":      "publishing job keeps setup-go's own cache; not migrated",
 	"gc-edge-publish.yml": "publishing job keeps setup-go's own cache; not migrated",
+	// Fork carry (ga-azybk8): the quickserve-ai fleet unit's publishing job
+	// warms modules inline against a scratch -modfile, so a dispatched rebuild
+	// depends on nothing outside the tag's tree and the tracked go.sum stays
+	// clean (the build's -dirty check refuses a grown go.sum).
+	"fleet-release.yml": "fork publishing job warms modules inline against a scratch go.mod; not migrated",
 }
 
 type goFetchWorkflow struct {
