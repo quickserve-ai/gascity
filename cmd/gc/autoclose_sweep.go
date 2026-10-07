@@ -258,6 +258,15 @@ func (cs *controllerState) runAutocloseSweepPass(now time.Time) autocloseSweepRe
 		// touched until it resumes.
 		return autocloseSweepResult{}
 	}
+	if diag := cs.CityBeadsDiagnostic(); diag != nil && beads.IsSchemaSkewDiagnostic(*diag) {
+		// A city store newer than this binary holds the tick fail-closed
+		// (tickSchemaSkewHold); this lane skips the pass the way the orders
+		// lane does (ga-mw4dg), so it closes nothing in preserve mode. It
+		// returns before the census and the pending queue: ids owed a check
+		// stay owed, and a row that leaves the census meanwhile shows up in
+		// the first healthy pass's diff.
+		return autocloseSweepResult{}
+	}
 	sweep := cs.autocloseSweepOf()
 	keep := map[*beads.CachingStore]struct{}{}
 	for _, cache := range cs.sweepCaches() {

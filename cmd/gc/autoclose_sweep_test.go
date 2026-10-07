@@ -641,3 +641,54 @@ func TestAutocloseSweepLeavesASuspendedRigCold(t *testing.T) {
 		t.Fatalf("after resume the sweep ran autoclose %d time(s), want 1", got.Ran)
 	}
 }
+
+// A city store newer than this binary puts the controller in preserve mode
+// (ga-mw4dg), and the sweep's minute ticker runs past the boot guard that
+// starts it: each pass checks the latched diagnostic itself. Healthy, then
+// skewed, then healthy again: the skewed pass closes nothing and consumes
+// nothing, so the close owed a check is still owed and runs on the first
+// healthy pass after it.
+func TestAutocloseSweepSkipsAPassUnderStoreSchemaSkew(t *testing.T) {
+	cs, backing, cached, _, convoy, member := convoySweepFixture(t)
+	cs.runAutocloseSweepPass(sweepTestClock(0)) // seeds the census
+	if err := backing.Close(member.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cached.List(beads.ListQuery{Live: true, Status: "open"}); err != nil {
+		t.Fatal(err)
+	}
+	cached.ReconcileNowForTest()
+	cached.ReconcileNowForTest()
+	if got := cs.runAutocloseSweepPass(sweepTestClock(1)); got.Ran != 0 {
+		t.Fatalf("healthy pass 1 ran autoclose %d time(s) inside the grace", got.Ran)
+	}
+	if !cs.autocloseSweepOf().isPending(member.ID) {
+		t.Fatal("precondition: the departed member is not owed a check after the healthy pass")
+	}
+
+	cs.mu.Lock()
+	cs.cityBeadsDiagnostic = &beads.BeadsDiagnostic{
+		Store: beads.BeadsStoreNameBdStore, PreflightGate: "native_open",
+		PreflightReason: "schema version mismatch: database is at v55, binary knows up to v54 (1 migration ahead)",
+	}
+	cs.mu.Unlock()
+	if got := cs.runAutocloseSweepPass(sweepTestClock(2)); got != (autocloseSweepResult{}) {
+		t.Fatalf("skewed pass = %+v, want nothing done", got)
+	}
+	if got := statusOf(t, backing, convoy.ID); got != "open" {
+		t.Fatalf("convoy %s after a pass under schema skew, want open", got)
+	}
+	if !cs.autocloseSweepOf().isPending(member.ID) {
+		t.Fatal("the skewed pass consumed the check the member is owed")
+	}
+
+	cs.mu.Lock()
+	cs.cityBeadsDiagnostic = nil
+	cs.mu.Unlock()
+	if got := cs.runAutocloseSweepPass(sweepTestClock(3)); got.Ran != 1 {
+		t.Fatalf("healthy pass after the skew ran autoclose %d time(s), want 1", got.Ran)
+	}
+	if got := statusOf(t, backing, convoy.ID); got != "closed" {
+		t.Fatalf("convoy %s after the skew cleared, want closed", got)
+	}
+}
