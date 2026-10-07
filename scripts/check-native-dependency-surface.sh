@@ -35,7 +35,13 @@ esac
 # pulled through by the google.golang.org/api bump MVS forced alongside it. None
 # of the OpenAPI stack links into gc -- only bd's internal/httpapi/apigen imports
 # it, which the root beads package never reaches.
-max_modules="${GC_NATIVE_DEP_MAX_MODULES:-737}"
+#
+# Fork carry: 738, one above upstream's 737. The fork's go.mod replace of
+# github.com/steveyegge/beads (the fleet beads build) adds
+# github.com/quickserve-ai/beads to go.sum, and the go.sum count below takes it
+# as a second module although `go list -m all` still lists 737. Drop back to
+# upstream's value when the replace goes.
+max_modules="${GC_NATIVE_DEP_MAX_MODULES:-738}"
 # max_binary_bytes re-baselined 2026-08-29 (ga-iuznq2). The build below now
 # adds -trimpath and CGO_ENABLED=0, which removes cross-host path-embedding
 # and native C-object (dolthub/gozstd, ICU) variance that previously made
