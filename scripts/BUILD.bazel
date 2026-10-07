@@ -81,6 +81,7 @@ go_test(
         "add_testenv_import_test.go",
         "bazel_bep_summary_workflow_test.go",
         "bazel_fork_cache_test.go",
+        "bazel_fork_runner_rule_test.go",
         "bazel_fresh_merge_test.go",
         "bazel_hermetic_cc_test.go",
         "bazel_hermetic_tags_test.go",

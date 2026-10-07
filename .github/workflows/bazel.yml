@@ -115,10 +115,32 @@ concurrency:
 permissions:
   contents: read
 
+# Fork carry (pl-axh9, fork #198; re-expressed at re-sync #6 after upstream
+# #7239 folded bazel-test.yml into this workflow). The quickserve-ai fork has
+# no Blacksmith runners and no remote-execution secrets, so a job hard-coded to
+# either would sit queued there forever. A rule per job, not a list of jobs, so
+# it holds through the next upstream reshuffle:
+#   - a job that needs no org secret and no Blacksmith-only runner runs on the
+#     fork on GitHub-hosted runners: its runs-on is
+#     `github.repository == 'gastownhall/gascity' && <upstream's label> ||
+#     'ubuntu-latest'`, the expression the carry gives the runner-policy jobs
+#     of ci.yml, codeql.yml, container-scan.yml, govulncheck.yml,
+#     mac-regression.yml and review-formulas.yml;
+#   - a job that needs the remote-execution secret or a Blacksmith host runs
+#     upstream only, by `github.repository == 'gastownhall/gascity'` in its
+#     `if:` (#198's guard), and so does a step that needs a Blacksmith host
+#     inside a job the first rule covers.
+# On the fork the lanes end in mode cache: a push or dispatch sees no
+# RBE_WEST_WORKERS variable, and a PR (the fork's own branches are fork heads)
+# asks gastownhall's rbe-west mint, where anything but a certificate leaves the
+# lane on the read-only cache (the rbe job takes cache when the mint is closed,
+# refuses or is unreachable; a lane whose certificate it refuses falls back to
+# cache). They execute on the GitHub-hosted runner with lookups in the
+# anonymous read-only cache.
 jobs:
   rbe:
     name: execution mode
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'gastownhall/gascity' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 5
     permissions:
       contents: read
@@ -294,7 +316,8 @@ jobs:
     # is CPU-bound (acceptance ~1900 packages took ~2 m on 2 vCPU; unit's
     # //... is ~3000 packages, 107-137 s on 2 vCPU vs acceptance's 39-44 s
     # on 4).
-    runs-on: ${{ (needs.rbe.outputs.mode != 'remote' || matrix.lane == 'acceptance' || matrix.lane == 'unit') && 'blacksmith-4vcpu-ubuntu-2404' || 'blacksmith-2vcpu-ubuntu-2404' }}
+    # Fork carry: GitHub-hosted on the fork (the rule above jobs:).
+    runs-on: ${{ github.repository == 'gastownhall/gascity' && ((needs.rbe.outputs.mode != 'remote' || matrix.lane == 'acceptance' || matrix.lane == 'unit') && 'blacksmith-4vcpu-ubuntu-2404' || 'blacksmith-2vcpu-ubuntu-2404') || 'ubuntu-latest' }}
     timeout-minutes: 90
     permissions:
       contents: read
@@ -400,7 +423,11 @@ jobs:
       # would skip ("tmux not installed") rather than run.
       - name: Host tools for locally run integration tests
         if: (matrix.lane == 'integration-packages' || matrix.lane == 'integration-smoke') && (needs.rbe.outputs.mode == 'cache' || needs.rbe.outputs.mode == 'local' || steps.bazel-fallback.outcome == 'success')
+        # Fork carry (ga-azybk8 class, as setup-gascity-ubuntu): drop the
+        # third-party apt sources nothing here installs from; a bad index on
+        # any of them fails the whole update.
         run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome* /etc/apt/sources.list.d/microsoft-prod*
           sudo apt-get update -qq
           sudo apt-get install -y -qq tmux lsof openssh-client
 
@@ -627,8 +654,10 @@ jobs:
       # what the client's own actions see. The PR's own blacksmith-worker.sh
       # and manifest, on the Blacksmith image the pool runs: a manifest no
       # worker would measure can't merge.
+      # Fork carry: needs a Blacksmith host (it measures the pool's image), so
+      # upstream only (the rule above jobs:).
       - name: Measure this Blacksmith host against the worker-env manifest
-        if: always() && matrix.lane == 'unit' && steps.worker-env.outputs.measure == 'true'
+        if: always() && matrix.lane == 'unit' && steps.worker-env.outputs.measure == 'true' && github.repository == 'gastownhall/gascity'
         env:
           WORKER_MODE: measure
         run: tools/rbe/blacksmith-worker.sh
@@ -644,7 +673,7 @@ jobs:
     name: bazel / test cache report
     needs: [rbe, lane]
     if: always() && needs.rbe.result == 'success' && needs.rbe.outputs.lanes != '[]'
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'gastownhall/gascity' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -721,7 +750,9 @@ jobs:
   coverage:
     name: bazel / coverage
     needs: rbe
-    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && needs.rbe.outputs.mode == 'remote'
+    # Fork carry: mode remote needs the remote-execution secret; the
+    # repository term makes the upstream-only rule explicit (above jobs:).
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' && needs.rbe.outputs.mode == 'remote' && github.repository == 'gastownhall/gascity'
     runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 90
     permissions:
@@ -832,7 +863,7 @@ jobs:
   sync-check:
     name: BUILD files in sync
     needs: rbe
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'gastownhall/gascity' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 15
     permissions:
       contents: read
@@ -885,7 +916,7 @@ jobs:
     name: bazel test (side-by-side)
     needs: [rbe, lane, sync-check]
     if: always()
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'gastownhall/gascity' && 'blacksmith-2vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Evaluate
