@@ -208,7 +208,7 @@ func legacyAllocation(t *testing.T, c diffCity) allocOutcome {
 	// The reconciler's accepted counts: the demand snapshot's second
 	// compute over the build's result (city_runtime.go, POOL-063).
 	open := snap.OpenInfos()
-	work := filterAssignedWorkBeadsForPoolDemand(cfg, cityPath, store, open, result.AssignedWorkBeads, result.AssignedWorkStoreRefs)
+	work := filterAssignedWorkBeadsForPoolDemand(cfg, cityPath, store, open, result.AssignedWorkBeads, result.AssignedWorkStoreRefs, nil)
 	counts := retainScaleCheckPartialPoolDesired(cfg, PoolDesiredCounts(ComputePoolDesiredStatesTracedAt(cfg, work, open, result.ScaleCheckCounts, diffNow, nil)),
 		snap, effectivePoolPartialRetentionTemplates(result))
 	if counts == nil {

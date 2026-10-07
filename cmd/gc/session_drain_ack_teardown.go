@@ -144,7 +144,7 @@ func tearDownDrainAckedPoolSeat(
 	if res.Failed > 0 {
 		return drainAckTeardownOutcome{retainedFor: "release_failed", released: res.Released, attempted: attempted}
 	}
-	if !closeBead(store, cfg, info.ID, drainAckTeardownCloseReason, now, stderr) {
+	if !closeBead(store, cfg, info, drainAckTeardownCloseReason, now, stderr) {
 		return drainAckTeardownOutcome{retainedFor: "close_failed", released: res.Released, attempted: attempted}
 	}
 	return drainAckTeardownOutcome{closed: true, released: res.Released, attempted: attempted}
