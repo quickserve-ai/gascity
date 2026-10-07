@@ -3,7 +3,6 @@ package config
 import (
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestValidateDurationsAllValid(t *testing.T) {
@@ -481,13 +480,11 @@ func TestValidateDurationsSetupTimeoutEqualsStartupTimeout(t *testing.T) {
 }
 
 func TestValidateDurationsSetupTimeoutExceedsDefaultStartupTimeout(t *testing.T) {
-	// startup_timeout left unset still takes its runtime default (300s since
-	// ga-fcdvn), so an explicit setup_timeout above that default must still
-	// warn. Derived from the default so the case stays above it.
-	defaultStartup := (&SessionConfig{}).StartupTimeoutDuration()
+	// startup_timeout left unset still defaults to 60s at runtime, so an
+	// explicit setup_timeout above that default must still warn.
 	cfg := &City{
 		Session: SessionConfig{
-			SetupTimeout: (defaultStartup + 30*time.Second).String(),
+			SetupTimeout: "90s",
 		},
 	}
 	warnings := ValidateDurations(cfg, "city.toml")

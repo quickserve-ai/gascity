@@ -8859,14 +8859,7 @@ func TestReconcileSessionBeads_RateLimitPendingCreateBatchFailureRetriesBeforeRo
 		failRateLimitHold: true,
 	}
 	env.store = store
-	// Pin the start-in-flight gate below the 2-minute aging used for
-	// last_woke_at: the gate follows [session] startup_timeout (default 300s,
-	// ga-fcdvn), and the rate-limit hold under test only runs once the pending
-	// create is past it.
-	env.cfg = &config.City{
-		Agents:  []config.Agent{{Name: "worker"}},
-		Session: config.SessionConfig{StartupTimeout: "1m"},
-	}
+	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
 	env.desiredState["worker"] = TemplateParams{
 		Command:      "test-cmd",
 		SessionName:  "worker",
