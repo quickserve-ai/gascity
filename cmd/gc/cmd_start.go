@@ -239,20 +239,35 @@ func buildIdleTracker(cfg *config.City, cityName, _ string, sp runtime.Provider)
 		if timeout <= 0 {
 			continue
 		}
-		named := config.FindNamedSession(cfg, a.QualifiedName())
-		namedAlways := named != nil && named.ModeOrDefault() == "always"
-		if named != nil {
+		namedSessions := namedSessionsBackedByAgent(cfg, a)
+		if len(namedSessions) > 0 {
 			// Configured named sessions own the canonical runtime session for
-			// direct configured identities. mode="always" must never be subject
-			// to idle timeout.
-			namedSessionName := config.NamedSessionRuntimeName(cityName, cfg.Workspace, named.QualifiedName())
-			if !namedAlways {
-				it.setTimeout(namedSessionName, timeout)
-				registeredAny = true
-			} else {
-				it.exemptTemplateFallbackForSession(namedSessionName)
+			// direct configured identities. The reconciler checks a session
+			// under its own runtime name, so the timeout is stored under the
+			// named session's name, which differs from the agent's whenever
+			// the session declares a name of its own. mode="always" must never
+			// be subject to idle timeout.
+			for _, named := range namedSessions {
+				namedSessionName := config.NamedSessionRuntimeName(cityName, cfg.Workspace, named.QualifiedName())
+				if named.ModeOrDefault() != "always" {
+					it.setTimeout(namedSessionName, timeout)
+					registeredAny = true
+				} else {
+					it.exemptTemplateFallbackForSession(namedSessionName)
+				}
 			}
 			if !a.SupportsInstanceExpansion() {
+				if config.FindNamedSession(cfg, a.QualifiedName()) == nil {
+					// No named session reuses the agent's own name. Keep the
+					// registration under the agent-derived name that this
+					// branch has always made, so a session that does run
+					// under it (an explicit runtime alias equal to the
+					// agent's name) keeps its timeout. An ordinary bead-named
+					// session of a single-session template is not covered
+					// here, before or after: it has no per-template fallback.
+					it.setTimeout(startupSessionName(cityName, a.QualifiedName(), st), timeout)
+					registeredAny = true
+				}
 				continue
 			}
 			// Hybrid named-and-pool: fall through to the pool registrations
@@ -321,17 +336,27 @@ func buildMaxSessionAgeTracker(cfg *config.City, cityName string, sp runtime.Pro
 			continue
 		}
 		jitter := a.MaxSessionAgeJitterDuration()
-		named := config.FindNamedSession(cfg, a.QualifiedName())
-		namedAlways := named != nil && named.ModeOrDefault() == "always"
-		if named != nil {
-			namedSessionName := config.NamedSessionRuntimeName(cityName, cfg.Workspace, named.QualifiedName())
-			if !namedAlways {
-				tr.setConfig(namedSessionName, maxAge, jitter)
-				registeredAny = true
-			} else {
-				tr.exemptTemplateFallbackForSession(namedSessionName)
+		namedSessions := namedSessionsBackedByAgent(cfg, a)
+		if len(namedSessions) > 0 {
+			// Found by template as well as by name, as in buildIdleTracker:
+			// the reconciler checks a session under its own runtime name.
+			for _, named := range namedSessions {
+				namedSessionName := config.NamedSessionRuntimeName(cityName, cfg.Workspace, named.QualifiedName())
+				if named.ModeOrDefault() != "always" {
+					tr.setConfig(namedSessionName, maxAge, jitter)
+					registeredAny = true
+				} else {
+					tr.exemptTemplateFallbackForSession(namedSessionName)
+				}
 			}
 			if !a.SupportsInstanceExpansion() {
+				if config.FindNamedSession(cfg, a.QualifiedName()) == nil {
+					// No named session reuses the agent's own name: keep the
+					// registration under the agent-derived name that this
+					// builder has always made for that case.
+					tr.setConfig(startupSessionName(cityName, a.QualifiedName(), st), maxAge, jitter)
+					registeredAny = true
+				}
 				continue
 			}
 		}
@@ -377,16 +402,25 @@ func buildAssignedWorkDeferTracker(cfg *config.City, cityName string, sp runtime
 			continue
 		}
 		limit := *a.AssignedWorkDeferLimit
-		named := config.FindNamedSession(cfg, a.QualifiedName())
-		namedAlways := named != nil && named.ModeOrDefault() == "always"
-		if named != nil {
-			namedSessionName := config.NamedSessionRuntimeName(cityName, cfg.Workspace, named.QualifiedName())
-			if !namedAlways {
-				tr.setLimit(namedSessionName, limit)
-			} else {
-				tr.exemptTemplateFallbackForSession(namedSessionName)
+		namedSessions := namedSessionsBackedByAgent(cfg, a)
+		if len(namedSessions) > 0 {
+			// Found by template as well as by name, as in buildIdleTracker:
+			// the reconciler checks a session under its own runtime name.
+			for _, named := range namedSessions {
+				namedSessionName := config.NamedSessionRuntimeName(cityName, cfg.Workspace, named.QualifiedName())
+				if named.ModeOrDefault() != "always" {
+					tr.setLimit(namedSessionName, limit)
+				} else {
+					tr.exemptTemplateFallbackForSession(namedSessionName)
+				}
 			}
 			if !a.SupportsInstanceExpansion() {
+				if config.FindNamedSession(cfg, a.QualifiedName()) == nil {
+					// No named session reuses the agent's own name: keep the
+					// registration under the agent-derived name that this
+					// builder has always made for that case.
+					tr.setLimit(startupSessionName(cityName, a.QualifiedName(), st), limit)
+				}
 				continue
 			}
 		}
@@ -407,6 +441,30 @@ func buildAssignedWorkDeferTracker(cfg *config.City, cityName string, sp runtime
 		tr.setLimit(sn, limit)
 	}
 	return tr
+}
+
+// namedSessionsBackedByAgent returns every configured named session that runs
+// the agent: the one a lookup by the agent's own name finds, and every session
+// whose template is the agent, whatever name the session itself declares. The
+// lookup by name alone misses a session declared as name = "brett",
+// template = "cherub-law.brett".
+func namedSessionsBackedByAgent(cfg *config.City, a config.Agent) []*config.NamedSession {
+	if cfg == nil {
+		return nil
+	}
+	var out []*config.NamedSession
+	byName := config.FindNamedSession(cfg, a.QualifiedName())
+	if byName != nil {
+		out = append(out, byName)
+	}
+	for i := range cfg.NamedSessions {
+		named := &cfg.NamedSessions[i]
+		if named == byName || named.TemplateQualifiedName() != a.QualifiedName() {
+			continue
+		}
+		out = append(out, named)
+	}
+	return out
 }
 
 func lifecycleTemplateFallbackKey(a config.Agent) string {

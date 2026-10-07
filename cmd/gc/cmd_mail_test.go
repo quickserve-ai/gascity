@@ -33,6 +33,108 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// unreadCallCountingProvider counts how a caller asks for unread mail. It
+// embeds a nil mail.Provider: only the two methods below may be called.
+type unreadCallCountingProvider struct {
+	mail.Provider
+	checks      []string
+	multiCalls  [][]string
+	byRecipient map[string][]mail.Message
+}
+
+func (p *unreadCallCountingProvider) Check(recipient string) ([]mail.Message, error) {
+	p.checks = append(p.checks, recipient)
+	return p.byRecipient[recipient], nil
+}
+
+//nolint:unparam // the error result is mail.MultiRecipientInboxer's signature
+func (p *unreadCallCountingProvider) InboxRecipients(recipients []string) ([]mail.Message, error) {
+	p.multiCalls = append(p.multiCalls, append([]string(nil), recipients...))
+	var out []mail.Message
+	for _, r := range recipients {
+		out = append(out, p.byRecipient[r]...)
+	}
+	return out, nil
+}
+
+// perAddressOnlyProvider hides InboxRecipients, like a provider that cannot
+// answer for several addresses at once.
+type perAddressOnlyProvider struct {
+	mail.Provider
+	inner *unreadCallCountingProvider
+}
+
+func (p perAddressOnlyProvider) Check(recipient string) ([]mail.Message, error) {
+	return p.inner.Check(recipient)
+}
+
+// TestMailCheckAsksAMultiRecipientProviderOnce pins pl-d9lw item 1's second
+// half: a seat's mail check reads all of its addresses in ONE provider call,
+// so per-mailbox costs (the closed-session lookup) are paid once per prompt,
+// not once per address. The result is the same set in the same order as the
+// per-address path, which a provider without the batch method still gets.
+func TestMailCheckAsksAMultiRecipientProviderOnce(t *testing.T) {
+	t0 := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
+	older := mail.Message{ID: "m-1", Subject: "older", CreatedAt: t0}
+	newer := mail.Message{ID: "m-2", Subject: "newer", CreatedAt: t0.Add(time.Minute)}
+	seed := func() *unreadCallCountingProvider {
+		return &unreadCallCountingProvider{byRecipient: map[string][]mail.Message{
+			"seat":       {newer},
+			"rig/seat":   {older, newer}, // the same message under two addresses
+			"ga-wisp-s1": nil,
+		}}
+	}
+	addresses := []string{"seat", "rig/seat", "ga-wisp-s1"}
+	ids := func(msgs []mail.Message) []string {
+		out := make([]string, 0, len(msgs))
+		for _, m := range msgs {
+			out = append(out, m.ID)
+		}
+		return out
+	}
+
+	batch := seed()
+	got, err := collectUnreadMailMessages(batch, batch.Check, addresses)
+	if err != nil {
+		t.Fatalf("collectUnreadMailMessages: %v", err)
+	}
+	if len(batch.multiCalls) != 1 || len(batch.checks) != 0 {
+		t.Fatalf("batch provider: %d InboxRecipients calls and %d Check calls, want 1 and 0", len(batch.multiCalls), len(batch.checks))
+	}
+	if !slices.Equal(batch.multiCalls[0], addresses) {
+		t.Fatalf("InboxRecipients got %v, want every address %v", batch.multiCalls[0], addresses)
+	}
+
+	plain := seed()
+	want, err := collectUnreadMailMessages(perAddressOnlyProvider{inner: plain}, plain.Check, addresses)
+	if err != nil {
+		t.Fatalf("collectUnreadMailMessages (per-address): %v", err)
+	}
+	if len(plain.checks) != len(addresses) || len(plain.multiCalls) != 0 {
+		t.Fatalf("per-address provider: %d Check calls and %d batch calls, want %d and 0", len(plain.checks), len(plain.multiCalls), len(addresses))
+	}
+	if !slices.Equal(ids(got), ids(want)) || !slices.Equal(ids(got), []string{"m-1", "m-2"}) {
+		t.Fatalf("batch result %v, per-address result %v, want both [m-1 m-2]", ids(got), ids(want))
+	}
+
+	single := seed()
+	if _, err := collectUnreadMailMessages(single, single.Check, addresses[:1]); err != nil {
+		t.Fatalf("collectUnreadMailMessages (one address): %v", err)
+	}
+	if len(single.checks) != 1 || len(single.multiCalls) != 0 {
+		t.Fatalf("one address: %d Check calls and %d batch calls, want 1 and 0", len(single.checks), len(single.multiCalls))
+	}
+
+	// The command itself, not only the helper: gc mail check for a seat with
+	// three addresses makes one provider call.
+	cmdProvider := seed()
+	var stdout, stderr bytes.Buffer
+	doMailCheckTarget(cmdProvider, resolvedMailTarget{display: "seat", recipients: addresses}, false, &stdout, &stderr)
+	if len(cmdProvider.multiCalls) != 1 || len(cmdProvider.checks) != 0 {
+		t.Fatalf("gc mail check: %d batch calls and %d Check calls, want 1 and 0; stderr: %s", len(cmdProvider.multiCalls), len(cmdProvider.checks), stderr.String())
+	}
+}
+
 type countOnlyMailProvider struct{}
 
 type failingListByLabelStore struct {

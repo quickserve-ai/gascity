@@ -2557,7 +2557,7 @@ func targetHasUnreadMail(target nudgeTarget, mp mail.Provider, sessStore beads.S
 	if err != nil {
 		return true, err
 	}
-	messages, err := collectMailMessages(mp.Check, resolved.recipients)
+	messages, err := collectUnreadMailMessages(mp, mp.Check, resolved.recipients)
 	if err != nil {
 		return true, err
 	}

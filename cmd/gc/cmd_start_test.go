@@ -494,6 +494,112 @@ func TestBuildIdleTracker_AliasAlwaysNamedPoolExemptsAliasOnly(t *testing.T) {
 	}
 }
 
+// TestBuildIdleTracker_AliasOnDemandSingleSessionRegistersSessionName pins the
+// shape of a named session that declares its own name over a single-session
+// agent (name = "brett", template = "cherub-law.brett"). The reconciler checks
+// the session under its own runtime name, so the timeout must be stored
+// there. The agent-derived name keeps the registration it always had, for a
+// session that runs under an explicit runtime alias equal to the agent's
+// name. A bead-named ordinary session of a single-session template is not
+// covered by this test or by the code.
+func TestBuildIdleTracker_AliasOnDemandSingleSessionRegistersSessionName(t *testing.T) {
+	cfg := &config.City{
+		Workspace: config.Workspace{},
+		Agents: []config.Agent{
+			{
+				Name:              "builder",
+				Dir:               "local-core",
+				MaxActiveSessions: intPtr(1),
+				IdleTimeout:       "20m",
+			},
+		},
+		NamedSessions: []config.NamedSession{{
+			Name:     "primary",
+			Template: "builder",
+			Dir:      "local-core",
+		}},
+	}
+	if cfg.Agents[0].SupportsInstanceExpansion() {
+		t.Fatal("fixture agent must be single-session")
+	}
+	template := cfg.Agents[0].QualifiedName()
+	namedSession := config.NamedSessionRuntimeName("city", cfg.Workspace, cfg.NamedSessions[0].QualifiedName())
+	agentDerived := startupSessionName("city", template, cfg.Workspace.SessionTemplate)
+	if namedSession == agentDerived {
+		t.Fatalf("fixture must give the session a name of its own, both are %q", namedSession)
+	}
+	now := time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)
+	sp := runtime.NewFake()
+	startFakeSession(t, sp, namedSession)
+	sp.SetActivity(namedSession, now.Add(-30*time.Minute))
+
+	idle, ok := buildIdleTracker(cfg, "city", "", sp).(*memoryIdleTracker)
+	if !ok {
+		t.Fatalf("buildIdleTracker returned %T, want *memoryIdleTracker", idle)
+	}
+	if _, ok := idle.timeouts[namedSession]; !ok {
+		t.Fatalf("idle tracker missing the session's own name %q in %v", namedSession, idle.timeouts)
+	}
+	if !idle.checkIdle(namedSession, template, "", "", sp, now) {
+		t.Fatalf("aliased on_demand session %q did not idle out past its timeout", namedSession)
+	}
+	startFakeSession(t, sp, agentDerived)
+	sp.SetActivity(agentDerived, now.Add(-30*time.Minute))
+	if !idle.checkIdle(agentDerived, template, "", "", sp, now) {
+		t.Fatalf("session %q under the agent-derived name lost its idle timeout", agentDerived)
+	}
+}
+
+// TestBuildIdleTracker_AliasAlwaysSingleSessionIsExempt pins the other half:
+// the same aliased single-session shape with mode "always" never idles out
+// under its own name, while a session running under the agent-derived name
+// keeps the registration it always had.
+func TestBuildIdleTracker_AliasAlwaysSingleSessionIsExempt(t *testing.T) {
+	cfg := &config.City{
+		Workspace: config.Workspace{},
+		Agents: []config.Agent{
+			{
+				Name:              "builder",
+				Dir:               "local-core",
+				MaxActiveSessions: intPtr(1),
+				IdleTimeout:       "20m",
+			},
+		},
+		NamedSessions: []config.NamedSession{{
+			Name:     "primary",
+			Template: "builder",
+			Dir:      "local-core",
+			Mode:     "always",
+		}},
+	}
+	template := cfg.Agents[0].QualifiedName()
+	namedSession := config.NamedSessionRuntimeName("city", cfg.Workspace, cfg.NamedSessions[0].QualifiedName())
+	agentDerived := startupSessionName("city", template, cfg.Workspace.SessionTemplate)
+	now := time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)
+	sp := runtime.NewFake()
+	startFakeSession(t, sp, namedSession)
+	startFakeSession(t, sp, agentDerived)
+	sp.SetActivity(namedSession, now.Add(-30*time.Minute))
+	sp.SetActivity(agentDerived, now.Add(-30*time.Minute))
+
+	idle, ok := buildIdleTracker(cfg, "city", "", sp).(*memoryIdleTracker)
+	if !ok {
+		t.Fatalf("buildIdleTracker returned %T, want *memoryIdleTracker", idle)
+	}
+	if _, ok := idle.timeouts[namedSession]; ok {
+		t.Fatalf("always-mode session %q has an idle timeout", namedSession)
+	}
+	if !idle.templateFallbackExemptions[namedSession] {
+		t.Fatalf("always-mode session %q is not exempt from the template fallback", namedSession)
+	}
+	if idle.checkIdle(namedSession, template, "", "", sp, now) {
+		t.Fatalf("always-mode session %q idled out", namedSession)
+	}
+	if !idle.checkIdle(agentDerived, template, "", "", sp, now) {
+		t.Fatalf("session %q under the agent-derived name lost its idle timeout", agentDerived)
+	}
+}
+
 func TestBuildIdleTracker_NamedAlwaysNoExplicitPoolRegistersTemplateFallback(t *testing.T) {
 	cfg := &config.City{
 		Workspace: config.Workspace{},
@@ -597,6 +703,127 @@ func TestBuildMaxSessionAgeTracker_NamedAlwaysNoExplicitPoolRegistersTemplateFal
 	}
 	if !maxAge.shouldRestart(poolSession, template, now.Add(-2*time.Hour), now) {
 		t.Fatalf("pool session %q did not max-age restart via template %q", poolSession, template)
+	}
+}
+
+// aliasedSingleSessionCity is the shape of a named session that declares its
+// own name over a single-session agent (name = "brett",
+// template = "cherub-law.brett"): a lookup of the named session by the agent's
+// name finds nothing.
+func aliasedSingleSessionCity(t *testing.T, mode string, agent config.Agent) (cfg *config.City, template, namedSession, agentDerived string) {
+	t.Helper()
+	agent.Name = "builder"
+	agent.Dir = "local-core"
+	agent.MaxActiveSessions = intPtr(1)
+	cfg = &config.City{
+		Workspace: config.Workspace{},
+		Agents:    []config.Agent{agent},
+		NamedSessions: []config.NamedSession{{
+			Name:     "primary",
+			Template: "builder",
+			Dir:      "local-core",
+			Mode:     mode,
+		}},
+	}
+	if cfg.Agents[0].SupportsInstanceExpansion() {
+		t.Fatal("fixture agent must be single-session")
+	}
+	template = cfg.Agents[0].QualifiedName()
+	namedSession = config.NamedSessionRuntimeName("city", cfg.Workspace, cfg.NamedSessions[0].QualifiedName())
+	agentDerived = startupSessionName("city", template, cfg.Workspace.SessionTemplate)
+	if namedSession == agentDerived {
+		t.Fatalf("fixture must give the session a name of its own, both are %q", namedSession)
+	}
+	return cfg, template, namedSession, agentDerived
+}
+
+// TestBuildMaxSessionAgeTracker_AliasOnDemandSingleSessionRegistersSessionName
+// pins that the max-age tracker finds a named session by its template, as
+// buildIdleTracker does: the reconciler checks the session under its own
+// runtime name, so the config must be stored there. The agent-derived name
+// keeps the registration it always had.
+func TestBuildMaxSessionAgeTracker_AliasOnDemandSingleSessionRegistersSessionName(t *testing.T) {
+	cfg, template, namedSession, agentDerived := aliasedSingleSessionCity(t, "", config.Agent{MaxSessionAge: "1h"})
+	now := time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)
+
+	maxAge, ok := buildMaxSessionAgeTracker(cfg, "city", runtime.NewFake()).(*memoryMaxSessionAgeTracker)
+	if !ok {
+		t.Fatalf("buildMaxSessionAgeTracker returned %T, want *memoryMaxSessionAgeTracker", maxAge)
+	}
+	if _, ok := maxAge.configs[namedSession]; !ok {
+		t.Fatalf("max-age tracker missing the session's own name %q in %v", namedSession, maxAge.configs)
+	}
+	if !maxAge.shouldRestart(namedSession, template, now.Add(-2*time.Hour), now) {
+		t.Fatalf("aliased on_demand session %q did not max-age restart", namedSession)
+	}
+	if !maxAge.shouldRestart(agentDerived, template, now.Add(-2*time.Hour), now) {
+		t.Fatalf("session %q under the agent-derived name lost its max age", agentDerived)
+	}
+}
+
+// TestBuildMaxSessionAgeTracker_AliasAlwaysSingleSessionIsExempt pins the
+// other half: the same shape with mode "always" never restarts on age under
+// its own name.
+func TestBuildMaxSessionAgeTracker_AliasAlwaysSingleSessionIsExempt(t *testing.T) {
+	cfg, template, namedSession, agentDerived := aliasedSingleSessionCity(t, "always", config.Agent{MaxSessionAge: "1h"})
+	now := time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)
+
+	maxAge, ok := buildMaxSessionAgeTracker(cfg, "city", runtime.NewFake()).(*memoryMaxSessionAgeTracker)
+	if !ok {
+		t.Fatalf("buildMaxSessionAgeTracker returned %T, want *memoryMaxSessionAgeTracker", maxAge)
+	}
+	if _, ok := maxAge.configs[namedSession]; ok {
+		t.Fatalf("always-mode session %q has a max age", namedSession)
+	}
+	if !maxAge.templateFallbackExemptions[namedSession] {
+		t.Fatalf("always-mode session %q is not exempt from the template fallback", namedSession)
+	}
+	if maxAge.shouldRestart(namedSession, template, now.Add(-2*time.Hour), now) {
+		t.Fatalf("always-mode session %q restarted on age", namedSession)
+	}
+	if !maxAge.shouldRestart(agentDerived, template, now.Add(-2*time.Hour), now) {
+		t.Fatalf("session %q under the agent-derived name lost its max age", agentDerived)
+	}
+}
+
+// TestBuildAssignedWorkDeferTracker_AliasOnDemandSingleSessionRegistersSessionName
+// pins that an assigned_work_deferTrackerlimit set on the agent reaches a named
+// session that declares its own name.
+func TestBuildAssignedWorkDeferTracker_AliasOnDemandSingleSessionRegistersSessionName(t *testing.T) {
+	limit := defaultAssignedWorkDeferLimit + 4
+	cfg, template, namedSession, agentDerived := aliasedSingleSessionCity(t, "", config.Agent{AssignedWorkDeferLimit: intPtr(limit)})
+
+	deferTracker, ok := buildAssignedWorkDeferTracker(cfg, "city", runtime.NewFake()).(*memoryAssignedWorkDeferTracker)
+	if !ok {
+		t.Fatalf("buildAssignedWorkDeferTracker returned %T, want *memoryAssignedWorkDeferTracker", deferTracker)
+	}
+	if got := deferTracker.limitFor(namedSession, template); got != limit {
+		t.Fatalf("limitFor(%q) = %d, want the agent's configured %d", namedSession, got, limit)
+	}
+	if got := deferTracker.limitFor(agentDerived, template); got != limit {
+		t.Fatalf("limitFor(%q) = %d, want %d: the agent-derived name lost its limit", agentDerived, got, limit)
+	}
+}
+
+// TestBuildAssignedWorkDeferTracker_AliasAlwaysSingleSessionIsExempt pins the
+// other half: an always-mode session under its own name takes no configured
+// limit and is exempt from the template fallback.
+func TestBuildAssignedWorkDeferTracker_AliasAlwaysSingleSessionIsExempt(t *testing.T) {
+	limit := defaultAssignedWorkDeferLimit + 4
+	cfg, template, namedSession, agentDerived := aliasedSingleSessionCity(t, "always", config.Agent{AssignedWorkDeferLimit: intPtr(limit)})
+
+	deferTracker, ok := buildAssignedWorkDeferTracker(cfg, "city", runtime.NewFake()).(*memoryAssignedWorkDeferTracker)
+	if !ok {
+		t.Fatalf("buildAssignedWorkDeferTracker returned %T, want *memoryAssignedWorkDeferTracker", deferTracker)
+	}
+	if _, ok := deferTracker.limits[namedSession]; ok {
+		t.Fatalf("always-mode session %q has a configured defer limit", namedSession)
+	}
+	if !deferTracker.templateFallbackExemptions[namedSession] {
+		t.Fatalf("always-mode session %q is not exempt from the template fallback", namedSession)
+	}
+	if got := deferTracker.limitFor(agentDerived, template); got != limit {
+		t.Fatalf("limitFor(%q) = %d, want %d: the agent-derived name lost its limit", agentDerived, got, limit)
 	}
 }
 
