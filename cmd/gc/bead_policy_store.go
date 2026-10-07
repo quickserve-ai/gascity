@@ -56,13 +56,23 @@ var (
 // *beadPolicyStore.
 //
 // The policy layer DOES now intercept plain metadata writes (the session
-// liveness splitter, bead_policy_store_liveness.go). The CAS surface is
-// unaffected: the only CAS'd keys in the tree are the control epoch and the
-// exclusive drain reservation, and neither is a liveness key. The fenced
-// atomic close is NOT: its terminal patch carries liveness keys (state,
-// slept_at), so the policy store fronts it through AtomicConditionalCloserHandle
-// (bead_policy_store_liveness.go) rather than letting resolution run past this
-// declaration to the backing's closer.
+// liveness splitter, bead_policy_store_liveness.go), and upstream's fenced
+// writes bypass it. ResolveConditionalWriter follows this declared target
+// before it looks for a writer
+// (internal/beads/conditional_writes_resolve.go:312), so a resolved writer's
+// UpdateIfMatch on a session bead (#7021's start-commit, reopen and kill
+// fences among them) commits liveness keys to versioned metadata with no
+// fence marker and no table-row sweep, and a surviving session_liveness row
+// then shadows the committed value. The bypass is dormant only while [beads]
+// conditional_writes is off, its default (internal/rollout/registry.go:27):
+// the resolver then returns nil (conditional_writes_resolve.go:320) and
+// callers fall back to their legacy write through this policy store, where
+// the splitter applies, or refuse the write. The carry therefore requires
+// conditional_writes=off while liveness runs in table mode (gc-t47s). The
+// fenced atomic close does not bypass it: its terminal patch carries liveness
+// keys (state, slept_at), so the policy store fronts it through
+// AtomicConditionalCloserHandle (bead_policy_store_liveness.go) rather than
+// letting resolution run past this declaration to the backing's closer.
 func (s *beadPolicyStore) ConditionalWritesResolveTarget() beads.Store { return s.Store }
 
 var (
