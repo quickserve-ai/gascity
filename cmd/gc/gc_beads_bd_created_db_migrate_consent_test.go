@@ -207,7 +207,12 @@ case "$query" in
     printf 'table_name\nissues\n'
     ;;
   *'FROM config'*)
-    [ -f %q ]
+    # A bd-less database answers the way dolt does, so the script's
+    # schema probe (upstream #7265) reads it as "no schema", not a failure.
+    if [ ! -f %q ]; then
+      echo "table not found: config" >&2
+      exit 1
+    fi
     ;;
   *)
     exit 0

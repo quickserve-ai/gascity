@@ -23,6 +23,7 @@ var sessionStartFenceAllowlist = map[string]string{
 	"cmd/gc/cmd_session.go|(*attachmentCachingProvider).Relaunch|Relaunch":           "forwarding wrapper built only by `gc session list`'s fallback (doSessionListFallback), a separate CLI process",
 	"cmd/gc/session_lifecycle_parallel.go|startPreparedStartCandidate|StartResolved": "worker-handle start; reached only through runPreparedStartCandidate, whose every caller is runFencedPreparedStartCandidate (bracketed); session handles also land in Manager.startRuntime (hooked)",
 	"internal/worker/runtime_handle.go|(*RuntimeHandle).StartResolved|Start":         "runtime-only worker handle (no session bead, so no Manager); in-process it is started only by startPreparedStartCandidate, which runFencedPreparedStartCandidate brackets; the API server's wakes use session-backed handles",
+	"cmd/gc/reconcile_planner.go|(*planner).run|Start@method value":                  "not a runtime call: p.last.Start is the time.Time a planner pass began (plannerPassStats), read to pace the next pass; upstream's v2 planner (#7285) starts nothing here",
 }
 
 // sessionStartFenceBrackets are the calls that open a session-start fence
