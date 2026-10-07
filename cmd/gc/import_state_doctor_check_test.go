@@ -881,9 +881,9 @@ fetched = "2026-06-11T17:08:05Z"
 // TestImportStateDoctorCheckMigratesCarryCanonicalPin covers a city whose
 // pack.toml and packs.lock both pin the bundled core pack, under its tree-URL
 // source, at the canonical commit carry builds wrote through
-// fleet/2026-09-15. A binary with a different canonical pin cannot load that
-// city, and gastownhall/gascity has no ref that reaches the commit, so the
-// fix must re-pin both files without a fetch.
+// fleet/2026-09-15. gastownhall/gascity has no ref that reaches the commit, so
+// the city is served from the built-in packs and the fix must re-pin both
+// files without a fetch.
 func TestImportStateDoctorCheckMigratesCarryCanonicalPin(t *testing.T) {
 	clearGCEnv(t)
 	const carryCommit = "abcf2b6393a1e52378656570028ac6deb3d2f10f"
@@ -912,8 +912,11 @@ fetched = "2026-08-13T05:03:17Z"
 
 	check := newImportStateDoctorCheck(cityDir)
 	result := check.Run(&doctor.CheckContext{CityPath: cityDir})
-	if result.Status != doctor.StatusError {
-		t.Fatalf("status = %v, want error for a carry canonical pin; result=%#v", result.Status, result)
+	// Upstream #7070 serves every superseded bundled pin from the built-in
+	// packs and reports it as a warning; the carry's own former pins join that
+	// list, so they are judged the same way (and still re-pinned by Fix).
+	if result.Status != doctor.StatusWarning {
+		t.Fatalf("status = %v, want warning (served from the built-in packs) for a carry canonical pin; result=%#v", result.Status, result)
 	}
 	details := strings.Join(result.Details, "\n")
 	if !strings.Contains(details, carryCommit) || !strings.Contains(details, "superseded-canonical-pin") {

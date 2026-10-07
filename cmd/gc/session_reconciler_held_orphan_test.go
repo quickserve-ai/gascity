@@ -23,7 +23,13 @@ func newUndesiredPoolSeat(t *testing.T, hold time.Duration) (*reconcilerTestEnv,
 	_ = env.sp.Start(context.Background(), "worker", runtime.Config{})
 	session := env.createSessionBead("worker", "worker")
 	env.markSessionActive(&session)
-	meta := map[string]string{"pool_managed": "true"}
+	// Past upstream's INC-003 undesired-wake grace (#7192): the subject is the
+	// orphan drain and its heartbeat-hold lens, not the wake-vs-demand race the
+	// grace defers, so the row is aged the way upstream ages its own fixtures.
+	meta := map[string]string{
+		"pool_managed": "true",
+		"last_woke_at": env.clk.Now().Add(-wakeUndesiredGrace - time.Minute).UTC().Format(time.RFC3339),
+	}
 	heldUntil := ""
 	if hold != 0 {
 		heldUntil = env.clk.Now().Add(hold).UTC().Format(time.RFC3339)
