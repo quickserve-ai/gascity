@@ -256,9 +256,7 @@ func TestSlingConvoyRoutesEachChildLikeCLI(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got.Metadata[beadmeta.RoutedToMetadataKey] != "myrig/worker" {
-			t.Fatalf("child %s gc.routed_to = %q, want myrig/worker", child.ID, got.Metadata[beadmeta.RoutedToMetadataKey])
-		}
+		assertSlungToNamedWorker(t, got, "child "+child.ID)
 	}
 	gotConvoy, err := store.Get(convoy.ID)
 	if err != nil {
@@ -318,9 +316,7 @@ func TestSlingOnFormulaAttachesEachConvoyChildLikeCLI(t *testing.T) {
 			t.Fatalf("child %s has no molecule_id, want the formula attached to it", child.ID)
 		}
 		molecules[molecule] = true
-		if got.Metadata[beadmeta.RoutedToMetadataKey] != "myrig/worker" {
-			t.Fatalf("child %s gc.routed_to = %q, want myrig/worker", child.ID, got.Metadata[beadmeta.RoutedToMetadataKey])
-		}
+		assertSlungToNamedWorker(t, got, "child "+child.ID)
 	}
 	if len(molecules) != len(children) {
 		t.Fatalf("children share molecules %v, want one wisp per child", molecules)
@@ -340,5 +336,17 @@ func TestSlingOnFormulaAttachesEachConvoyChildLikeCLI(t *testing.T) {
 	}
 	if resp.Batch == nil || resp.Batch.Routed != 2 || resp.Batch.Total != 2 || resp.Batch.ContainerType != "convoy" {
 		t.Fatalf("batch = %+v, want convoy with 2 of 2 routed", resp.Batch)
+	}
+}
+
+// assertSlungToNamedWorker checks a bead slung to myrig/worker. The fixture
+// declares a [[named_session]] whose identity is myrig/worker, so the carry's
+// direct named-session routing (sling routes a target that names a configured
+// named session to that session: Assignee set, gc.routed_to cleared) applies
+// where upstream expects a gc.routed_to pool route.
+func assertSlungToNamedWorker(t *testing.T, b beads.Bead, label string) {
+	t.Helper()
+	if b.Assignee != "myrig/worker" || b.Metadata[beadmeta.RoutedToMetadataKey] != "" {
+		t.Fatalf("%s assignee = %q, gc.routed_to = %q; want assigned to the named session myrig/worker with no pool route", label, b.Assignee, b.Metadata[beadmeta.RoutedToMetadataKey])
 	}
 }

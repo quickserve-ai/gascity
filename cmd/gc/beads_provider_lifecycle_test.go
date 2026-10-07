@@ -8114,7 +8114,12 @@ case "$query" in
     : > %q
     ;;
   'USE `+"`hq`"+`; SELECT 1 FROM config LIMIT 1')
-    [ -f %q ]
+    # A bd-less database answers the way dolt does, so the script's
+    # schema probe (upstream #7265) reads it as "no schema", not a failure.
+    if [ ! -f %q ]; then
+      echo "table not found: config" >&2
+      exit 1
+    fi
     ;;
   *'FROM dolt_status'*)
     printf 'table_name\n'
@@ -9000,7 +9005,9 @@ func TestGcBeadsBdInitHealsInterruptedBootstrapBeforeForcing(t *testing.T) {
 	if !strings.Contains(sql, "CALL DOLT_RESET('--hard')") {
 		t.Fatalf("expected DOLT_RESET('--hard') on the interrupted bootstrap, got:\n%s", sql)
 	}
-	if !strings.Contains(bdArgs, "init --force --quiet --server -p gc --database hq") {
+	// The carry spells the forced init --reinit-local (bd's --force is its
+	// deprecated alias).
+	if !strings.Contains(bdArgs, "init --reinit-local --quiet --server -p gc --database hq") {
 		t.Fatalf("expected a forced init after the reset, got:\n%s", bdArgs)
 	}
 	// Order: the reset must precede bd, or bd's guard fires on the dirty set.

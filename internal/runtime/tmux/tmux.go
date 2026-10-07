@@ -3862,9 +3862,9 @@ func (t *Tmux) DismissFeedbackSurveyModalIfPresent(session string) error {
 	sendKeys := func(keys ...string) error {
 		for _, k := range keys {
 			// ga-ubfc7j: these are raw send-keys, and the survey matcher
-			// reads scrollback, so an old survey row can match while a
-			// question, an approval or an attached person's draft is live.
-			// The full guard runs before EVERY key.
+			// is contains-based over the visible screen, so a stray match
+			// could still key a live question, approval or attached
+			// person's draft. The full guard runs before EVERY key.
 			if err := t.humanPromptGuard(session, target, nudgeGuardStageBeforeType, true); err != nil {
 				return err
 			}
