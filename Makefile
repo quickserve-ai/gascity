@@ -270,10 +270,18 @@ complexity-update:
 	@./scripts/ci/complexity.sh update
 
 ## check: fast quality gates: the shell guards below plus `make test` (bazel test //...: nogo lint/vet, formatting, generated artifacts, unit tests)
-check: check-release-dist-ignore check-routed-test-rows check-split-topology-rows check-residency-boundary test
+check: check-release-dist-ignore check-routed-test-rows check-split-topology-rows check-residency-boundary check-atomic-binary-swap test
 
 ## check-go: the same gates without Bazel: golangci-lint fmt/lint, go vet, go test (offline convenience; CI does not run it)
-check-go: fmt-check lint-golangci vet-go check-release-dist-ignore check-routed-test-rows check-split-topology-rows check-residency-boundary test-go
+check-go: fmt-check lint-golangci vet-go check-release-dist-ignore check-routed-test-rows check-split-topology-rows check-residency-boundary check-atomic-binary-swap test-go
+
+## check-atomic-binary-swap: keep build/install swapping the gc binary by atomic
+## rename, and keep install's verification exec unpiped. An in-place write to a
+## live gc reuses the inode and SIGKILLs running processes against the stale
+## cached code signature -- silent, and it looks like a flaky supervisor.
+## See ga-l8pur (the outages) and ga-pmeo1 (this class fix).
+check-atomic-binary-swap:
+	@scripts/check-atomic-binary-swap.sh
 
 ## check-release-dist-ignore: keep GoReleaser output from marking release builds dirty
 check-release-dist-ignore:

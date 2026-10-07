@@ -9,7 +9,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/beads/splittest"
 	"github.com/gastownhall/gascity/internal/config"
@@ -119,9 +118,7 @@ title = "Work"
 		t.Fatalf("graph binding holds %d beads, want the one wisp root: %+v", len(roots), roots)
 	}
 	root := roots[0]
-	if got := root.Metadata[beadmeta.RoutedToMetadataKey]; got != "myrig/worker" {
-		t.Errorf("binding-resident wisp root %s gc.routed_to = %q, want myrig/worker", root.ID, got)
-	}
+	assertSlungToNamedWorker(t, root, "binding-resident wisp root "+root.ID)
 	if _, err := state.stores["myrig"].Get(root.ID); !errors.Is(err, beads.ErrNotFound) {
 		t.Errorf("wisp root %s resolves in the rig work store (err=%v); it must live only in the graph binding", root.ID, err)
 	}
@@ -174,9 +171,7 @@ title = "Work"
 	if len(roots) != 1 {
 		t.Fatalf("rig store holds %d beads, want the one wisp root: %+v", len(roots), roots)
 	}
-	if got := roots[0].Metadata[beadmeta.RoutedToMetadataKey]; got != "myrig/worker" {
-		t.Errorf("wisp root %s gc.routed_to = %q, want myrig/worker", roots[0].ID, got)
-	}
+	assertSlungToNamedWorker(t, roots[0], "wisp root "+roots[0].ID)
 	leaked, err := state.CityBeadStore().List(beads.ListQuery{AllowScan: true})
 	if err != nil {
 		t.Fatalf("list city store: %v", err)
