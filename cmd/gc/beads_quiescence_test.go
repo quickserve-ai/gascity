@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -350,24 +351,51 @@ func TestConvergenceTickSkipsASuspendedRig(t *testing.T) {
 	}
 }
 
-// The closed-bead worktree reaper is not handed a suspended rig's store.
+// The closed-bead worktree reaper is not handed a suspended rig's store. The
+// carry runs the reaper off-tick on its single-flight lane (ga-yuiof4 item 3),
+// so the stores under test are the ones the lane's pass receives
+// (fencedReaperStores); the unsuspended control shows the seam is live.
 func TestReapClosedBeadWorktreesSkipsASuspendedRig(t *testing.T) {
-	cr, _, _, _ := quiescenceRuntime(t, "suspended_on_start = true\n")
-	t.Setenv("GC_SUSPENDED", "")
-	cr.standaloneRigStores = map[string]beads.Store{"r1": beads.NewMemStore()}
-	enabled := true
-	cr.cfg.Daemon.AutoReapClosedBeadWorktrees = &enabled
-	old := tickReapClosedBeadWorktreesFn
-	t.Cleanup(func() { tickReapClosedBeadWorktreesFn = old })
-	var handed map[string]beads.Store
-	tickReapClosedBeadWorktreesFn = func(_ string, _ *config.City, rigStores map[string]beads.Store, _ []string, _ bool, _ events.Recorder, _ *reapSkipTracker, _ io.Writer) reapReport {
-		handed = rigStores
-		return reapReport{}
-	}
-	p := &tickPass{ctx: context.Background(), sessionBeads: newSessionBeadSnapshotFromInfos(nil)}
-	cr.tickReapClosedBeadWorktrees(p)
-	if _, ok := handed["r1"]; ok {
-		t.Fatalf("the worktree reaper was handed the suspended rig's store: %v", handed)
+	for _, tc := range []struct {
+		name     string
+		rigExtra string
+		wantRig  bool
+	}{
+		{name: "suspended rig is withheld", rigExtra: "suspended_on_start = true\n"},
+		{name: "control: an active rig is handed", wantRig: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cr, _, _, _ := quiescenceRuntime(t, tc.rigExtra)
+			t.Setenv("GC_SUSPENDED", "")
+			cr.standaloneRigStores = map[string]beads.Store{"r1": beads.NewMemStore()}
+			enabled := true
+			cr.cfg.Daemon.AutoReapClosedBeadWorktrees = &enabled
+			var (
+				mu     sync.Mutex
+				handed []map[string]beads.Store
+			)
+			prev := runWorktreeReaperPassFn
+			runWorktreeReaperPassFn = func(in worktreeReaperPassInput) worktreeReaperPassResult {
+				mu.Lock()
+				handed = append(handed, in.cachedStores, in.rawStores)
+				mu.Unlock()
+				return worktreeReaperPassResult{}
+			}
+			t.Cleanup(func() { runWorktreeReaperPassFn = prev })
+			p := &tickPass{ctx: context.Background(), sessionBeads: newSessionBeadSnapshotFromInfos(nil)}
+			cr.tickReapClosedBeadWorktrees(p)
+			waitWorktreeReaperIdle(t, cr)
+			mu.Lock()
+			defer mu.Unlock()
+			if len(handed) == 0 {
+				t.Fatal("the worktree reaper pass never ran")
+			}
+			for _, stores := range handed {
+				if _, ok := stores["r1"]; ok != tc.wantRig {
+					t.Fatalf("rig r1 handed to the reaper = %v, want %v: %v", ok, tc.wantRig, stores)
+				}
+			}
+		})
 	}
 }
 

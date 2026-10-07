@@ -440,18 +440,25 @@ func TestNudgeSessionDoesNotPasteOntoUnresolvedSurveyDigit(t *testing.T) {
 	}
 }
 
+// Upstream (#7013) delivers the nudge when the survey peek's capture fails.
+// The carry's human-prompt guard (ga-ubfc7j) reads the same pane before it
+// types anything and fails closed on a pane it cannot read: an unreadable
+// pane may be holding a person's prompt. So here the nudge is withheld with
+// an error rather than typed blind, and the caller retries it.
 func TestNudgeSessionDeliversWhenSurveyPeekFails(t *testing.T) {
 	executor := &failingRecaptureExecutor{scriptedTargetExecutor: scriptedTargetExecutor{display: "agent-pane|0"}, captureFails: true}
 	cfg := DefaultConfig()
 	cfg.NudgeReadyTimeout = 10 * time.Millisecond
 	tm := &Tmux{cfg: cfg, exec: executor}
 
-	_ = tm.NudgeSession("agent-pane", "hello")
+	err := tm.NudgeSession("agent-pane", "hello")
 
 	for _, call := range executor.calls {
 		if slices.Contains(call, "send-keys") && slices.Contains(call, "hello") {
-			return
+			t.Fatalf("NudgeSession typed into a pane its human-prompt guard could not read: %v", executor.calls)
 		}
 	}
-	t.Fatalf("NudgeSession dropped the message after a capture-pane failure in the survey peek: %v", executor.calls)
+	if err == nil {
+		t.Fatalf("NudgeSession error = nil after withholding the nudge from an unreadable pane: %v", executor.calls)
+	}
 }

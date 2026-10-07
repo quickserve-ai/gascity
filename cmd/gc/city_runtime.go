@@ -1774,10 +1774,6 @@ func (cr *CityRuntime) tickReapStaleSessionBeads(p *tickPass) bool {
 	return false
 }
 
-// tickReapClosedBeadWorktreesFn is the tick's call into the closed-bead
-// worktree reaper, a seam so tests can pin which rig stores it is handed.
-var tickReapClosedBeadWorktreesFn = reapClosedBeadWorktrees
-
 func (cr *CityRuntime) tickReapClosedBeadWorktrees(p *tickPass) bool {
 	reapEnabled := cr.cfg.Daemon.AutoReapClosedBeadWorktreesEnabled()
 	reapDryRun := cr.cfg.Daemon.AutoReapClosedBeadWorktreesDryRunEnabled()
