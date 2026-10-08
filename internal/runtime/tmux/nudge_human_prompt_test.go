@@ -1251,7 +1251,11 @@ func TestAStaleReminderWithAPersonsWordsIsTheirDraft(t *testing.T) {
 		fe := &panePromptExecutor{screen: screen, attached: true}
 		tm, session := newGuardTestTmux(fe)
 
-		tm.DismissFeedbackSurveyModalIfPresent(session)
+		// Declining types nothing, so there is no digit whose fate is
+		// unknown: the dismisser must return nil, not an error.
+		if err := tm.DismissFeedbackSurveyModalIfPresent(session); err != nil {
+			t.Fatalf("DismissFeedbackSurveyModalIfPresent() = %v, want nil when it sends no keys", err)
+		}
 		if keys := fe.keyCalls(); len(keys) != 0 {
 			t.Fatalf("the survey dismisser sent keys onto a person's draft behind a stale reminder: %q", keys)
 		}
