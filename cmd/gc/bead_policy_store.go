@@ -67,9 +67,16 @@ var (
 // conditional_writes is off, its default (internal/rollout/registry.go:27):
 // the resolver then returns nil (conditional_writes_resolve.go:320) and
 // callers fall back to their legacy write through this policy store, where
-// the splitter applies, or refuse the write. The carry therefore requires
-// conditional_writes=off while liveness runs in table mode (gc-t47s). The
-// fenced atomic close does not bypass it: its terminal patch carries liveness
+// the splitter applies, or refuse the write. Metadata mode does not close the
+// gap: the read overlay applies table rows in BOTH modes
+// (internal/liveness/mode.go), and what makes a metadata-mode write win over
+// an older table row is the per-key fence marker the splitter adds to it. A
+// conditional write that bypasses the splitter carries no marker, so an older
+// session_liveness row shadows it in metadata mode too. The carry therefore
+// requires conditional_writes=off while the liveness overlay is bound, in
+// either mode; metadata mode is not a safe route to enabling conditional
+// writes before the bridge (gc-t47s). The fenced atomic close does not bypass
+// it: its terminal patch carries liveness
 // keys (state, slept_at), so the policy store fronts it through
 // AtomicConditionalCloserHandle (bead_policy_store_liveness.go) rather than
 // letting resolution run past this declaration to the backing's closer.
