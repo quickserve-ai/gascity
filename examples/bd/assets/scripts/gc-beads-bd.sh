@@ -3638,10 +3638,14 @@ EOF
 # export_created_database_migrate_consent gives bd consent to finish migrating
 # a server-mode database, but only one this invocation proved it created
 # (database_created_by_gc: backing store absent before its own CREATE
-# DATABASE). bd init --reinit-local's preflight opens the store writable under
-# a 5-second cap; on a database with no schema yet that open starts bd's
-# migrations and can stop part-way (v41..v46 of v66 in fork CI, ga-zyvj2k,
-# gastownhall/beads#6746). bd's real open then takes its own half-done
+# DATABASE). The 5-second --reinit-local preflight that first cut migrations
+# part-way (v41..v46 of v66 in fork CI, ga-zyvj2k, gastownhall/beads#6746) is
+# read-only at the pinned beads (countExistingIssues, ga-ylug59) and migrates
+# nothing. This consent and the partial-schema checkpoint above now cover a
+# migration stopped inside one step by a kill or by an error other than a
+# timeout. bd's own interrupted-bootstrap heal never arms on these databases:
+# it needs bd's own CREATE DATABASE to have created the database, and gc
+# created it first. Without consent, bd's next open takes its own half-done
 # migration for a co-resident client's and refuses it (#5920), so init dies on
 # a store nobody else has seen. Creating the database is consent to its
 # schema. A database that already existed may have clients on an older bd,
