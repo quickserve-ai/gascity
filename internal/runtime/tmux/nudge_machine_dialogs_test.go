@@ -268,7 +268,11 @@ func TestFeedbackSurveyDismisserSendsNoKeysOverALiveQuestion(t *testing.T) {
 	ex := &paneAfterFirstKeyExecutor{before: pane, after: pane, attached: "0"}
 	tm := &Tmux{cfg: DefaultConfig(), exec: ex}
 
-	tm.DismissFeedbackSurveyModalIfPresent("agent-pane")
+	// Declining types nothing, so there is no digit whose fate is unknown:
+	// the dismisser must return nil, not an error.
+	if err := tm.DismissFeedbackSurveyModalIfPresent("agent-pane"); err != nil {
+		t.Fatalf("DismissFeedbackSurveyModalIfPresent() = %v, want nil when it sends no keys", err)
+	}
 	if keys := sentKeys(ex.calls); len(keys) != 0 {
 		t.Fatalf("sent survey keys over a live question: %v", keys)
 	}
