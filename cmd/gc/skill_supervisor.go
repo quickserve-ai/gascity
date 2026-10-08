@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"sort"
 
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/doctor"
@@ -25,13 +26,20 @@ import (
 // root; acp runs in-process and doesn't read from it). Hybrid is
 // per-session-routed; conservatively ineligible until v0.15.2.
 //
+// Agents with the same scope root and provider family share one sink
+// directory, so the pass groups agents by sink and runs the
+// materializer once per sink with the union of what those agents want.
+// A pass per agent would let each agent prune the agent-local skills
+// another agent wrote, since the sink's ownership manifest marks every
+// gc-written link as prunable by any later pass.
+//
 // Catalog load happens once per scope per call and feeds every
-// agent's materialization in this tick. Per-agent errors
-// (LoadAgentCatalog, MaterializeAgent) are logged to stderr and do
-// not abort the pass — the supervisor should continue reconciling
-// every other agent. Shared-catalog load failures are also logged and
-// then downgraded to an empty shared desired set, while preserving
-// owned-root cleanup so stale gc-managed symlinks can still be pruned.
+// agent's materialization in this tick. Per-agent and per-sink errors
+// (LoadAgentCatalog, Run) are logged to stderr and do not abort the
+// pass — the supervisor should continue reconciling every other sink.
+// Shared-catalog load failures are also logged and then downgraded to
+// an empty shared desired set, while preserving owned-root cleanup so
+// stale gc-managed symlinks can still be pruned.
 func runStage1SkillMaterialization(cityPath string, cfg *config.City, stderr io.Writer) error {
 	if cfg == nil {
 		return nil
@@ -65,6 +73,7 @@ func runStage1SkillMaterialization(cityPath string, cfg *config.City, stderr io.
 	skipPass := stage1SkillSkipLog.beginPass(cityPath)
 	defer skipPass.finish()
 
+	sinks := make(map[string]*stage1Sink)
 	for i := range cfg.Agents {
 		agent := &cfg.Agents[i]
 		if !canStage1Materialize(cfg.Session.Provider, agent) {
@@ -87,7 +96,6 @@ func runStage1SkillMaterialization(cityPath string, cfg *config.City, stderr io.
 
 		rigName := agentRigScopeName(agent, cfg.Rigs)
 		cityCat := loadCatalog(rigName)
-		desired := materialize.EffectiveSet(cityCat, agentCat)
 
 		// Resolve the agent's scope root to an absolute path. Use the
 		// un-canonicalized form here so the materializer writes into
@@ -99,44 +107,167 @@ func runStage1SkillMaterialization(cityPath string, cfg *config.City, stderr io.
 		if !filepath.IsAbs(scopeRoot) {
 			scopeRoot = filepath.Join(cityPath, scopeRoot)
 		}
-		sinkDir := filepath.Join(scopeRoot, vendor)
+		sinkDir := filepath.Clean(filepath.Join(scopeRoot, vendor))
 
-		owned := append([]string{}, cityCat.OwnedRoots...)
-		if agentCat.OwnedRoot != "" {
-			owned = append(owned, agentCat.OwnedRoot)
+		sink := sinks[sinkDir]
+		if sink == nil {
+			sink = newStage1Sink()
+			sinks[sinkDir] = sink
 		}
-		if len(desired) == 0 && len(owned) == 0 {
+		sink.add(agent.QualifiedName(), cityCat, agentCat)
+	}
+
+	sinkDirs := make([]string, 0, len(sinks))
+	for dir := range sinks {
+		sinkDirs = append(sinkDirs, dir)
+	}
+	sort.Strings(sinkDirs)
+	for _, dir := range sinkDirs {
+		sink := sinks[dir]
+		if len(sink.conflicts) > 0 {
+			for _, c := range sink.conflicts {
+				fmt.Fprintf(stderr, "gc: stage-1 materialize-skills at %s: %s; leaving the sink unchanged\n", dir, c) //nolint:errcheck // best-effort stderr
+			}
+			sink.markIncomplete(skipPass)
+			continue
+		}
+		desired := sink.desired()
+		if len(desired) == 0 && len(sink.owned) == 0 {
 			continue
 		}
 
 		res, merr := materialize.Run(materialize.Request{
-			SinkDir:          sinkDir,
+			SinkDir:          dir,
 			Desired:          desired,
-			OwnedRoots:       owned,
+			OwnedRoots:       sink.owned,
 			LegacyNames:      materialize.LegacyStubNames(),
 			LegacyOwnedRoots: materialize.LegacyOwnedRootsFor(cityPath),
 		})
 		if merr != nil {
-			skipPass.markIncomplete(agent.QualifiedName())
-			fmt.Fprintf(stderr, "gc: stage-1 materialize-skills for agent %q at %s: %v\n", //nolint:errcheck // best-effort stderr
-				agent.QualifiedName(), sinkDir, merr)
+			sink.markIncomplete(skipPass)
+			fmt.Fprintf(stderr, "gc: stage-1 materialize-skills at %s: %v\n", dir, merr) //nolint:errcheck // best-effort stderr
 			continue
 		}
 		for _, s := range res.Skipped {
 			// A skip is the standing outcome for user content at a sink
 			// path; report it once per episode, not on every pass
-			// (skill_skip_log.go).
-			msg := fmt.Sprintf("gc: agent %q skipped skill %q at %s — %s", agent.QualifiedName(), s.Name, s.Path, s.Reason)
-			if skipPass.shouldReport(agent.QualifiedName(), s.Path, msg) {
+			// (skill_skip_log.go). It is reported once per sink, under
+			// the first agent that wants the skill.
+			agent := sink.wantedBy(s.Name)
+			msg := fmt.Sprintf("gc: agent %q skipped skill %q at %s — %s", agent, s.Name, s.Path, s.Reason)
+			if skipPass.shouldReport(agent, s.Path, msg) {
 				fmt.Fprintln(stderr, msg) //nolint:errcheck // best-effort stderr
 			}
 		}
 		for _, w := range res.Warnings {
-			fmt.Fprintf(stderr, "gc: agent %q stage-1 materialize warning: %s\n", //nolint:errcheck // best-effort stderr
-				agent.QualifiedName(), w)
+			fmt.Fprintf(stderr, "gc: stage-1 materialize warning at %s: %s\n", dir, w) //nolint:errcheck // best-effort stderr
 		}
 	}
 	return nil
+}
+
+// stage1SinkWant is one skill a shared sink must hold, with the first
+// agent (in config order) that asked for it.
+type stage1SinkWant struct {
+	entry materialize.SkillEntry
+	agent string
+}
+
+// stage1Sink accumulates, for one sink directory, the union of the
+// skills wanted by every agent that materializes into it, and the union
+// of the gc-managed roots those agents may prune under. Shared-catalog
+// and agent-local entries are kept apart so the overlay in desired is
+// the same precedence materialize.EffectiveSet applies to one agent.
+type stage1Sink struct {
+	agents    []string
+	shared    map[string]stage1SinkWant
+	local     map[string]stage1SinkWant
+	owned     []string
+	ownedSeen map[string]bool
+	conflicts []string
+}
+
+func newStage1Sink() *stage1Sink {
+	return &stage1Sink{
+		shared:    make(map[string]stage1SinkWant),
+		local:     make(map[string]stage1SinkWant),
+		ownedSeen: make(map[string]bool),
+	}
+}
+
+// add merges one agent's shared and agent-local catalogs into the sink.
+func (s *stage1Sink) add(agent string, city materialize.CityCatalog, local materialize.AgentCatalog) {
+	s.agents = append(s.agents, agent)
+	for _, e := range city.Entries {
+		s.want(s.shared, agent, e)
+	}
+	for _, e := range local.Entries {
+		s.want(s.local, agent, e)
+	}
+	for _, root := range city.OwnedRoots {
+		s.addOwned(root)
+	}
+	s.addOwned(local.OwnedRoot)
+}
+
+// want records that agent wants entry e, in the shared or the
+// agent-local class. A name wanted from one source by several agents is
+// wanted once. Two sources for one name in the same class are a
+// conflict: the sink holds one link per name, and choosing between them
+// would silently drop the other agent's skill.
+func (s *stage1Sink) want(class map[string]stage1SinkWant, agent string, e materialize.SkillEntry) {
+	prev, ok := class[e.Name]
+	if !ok {
+		class[e.Name] = stage1SinkWant{entry: e, agent: agent}
+		return
+	}
+	if prev.entry.Source != e.Source {
+		s.conflicts = append(s.conflicts, fmt.Sprintf("skill %q is provided by agent %q from %s and by agent %q from %s",
+			e.Name, prev.agent, prev.entry.Source, agent, e.Source))
+	}
+}
+
+// addOwned adds root to the sink's prunable roots once.
+func (s *stage1Sink) addOwned(root string) {
+	if root == "" || s.ownedSeen[root] {
+		return
+	}
+	s.ownedSeen[root] = true
+	s.owned = append(s.owned, root)
+}
+
+// desired returns the sink's wanted entries sorted by name. An
+// agent-local entry overrides a shared entry of the same name, as it
+// does within one agent; every agent writing the sink sees the override.
+func (s *stage1Sink) desired() []materialize.SkillEntry {
+	out := make([]materialize.SkillEntry, 0, len(s.shared)+len(s.local))
+	for name, w := range s.shared {
+		if _, overridden := s.local[name]; !overridden {
+			out = append(out, w.entry)
+		}
+	}
+	for _, w := range s.local {
+		out = append(out, w.entry)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// wantedBy returns the agent a skip of name is reported under: the agent
+// whose entry desired chose for that name.
+func (s *stage1Sink) wantedBy(name string) string {
+	if w, ok := s.local[name]; ok {
+		return w.agent
+	}
+	return s.shared[name].agent
+}
+
+// markIncomplete carries every agent's previously reported skips in this
+// sink over to the next pass, since this pass did not finish the sink.
+func (s *stage1Sink) markIncomplete(pass *skillSkipPass) {
+	for _, agent := range s.agents {
+		pass.markIncomplete(agent)
+	}
 }
 
 // checkSkillCollisions runs the skill-collision validator before

@@ -6410,6 +6410,86 @@ func TestCityRuntimeReloadKeepsAgentLocalSkillInSharedSink(t *testing.T) {
 	}
 }
 
+// TestCityRuntimeReloadPrunesOneAgentsSkillInSharedSink: mayor and deputy
+// share <city>/.claude/skills and each has its own agent-local skill.
+// Both skills survive an applied reload. When deputy's skill is removed
+// from its skills directory, the next applied reload prunes deputy's link
+// and keeps mayor's: one pass per sink still cleans up after a single
+// agent's catalog.
+func TestCityRuntimeReloadPrunesOneAgentsSkillInSharedSink(t *testing.T) {
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	clearInheritedBeadsEnv(t)
+	requireNoLeakedDoltAfterForPaths(t, cityPath)
+	deputy := "[[agent]]\nname = \"deputy\"\nscope = \"city\"\nprovider = \"claude\"\n\n"
+	writeSkillMaterializationTestConfig(t, tomlPath, deputy)
+	writeSkillSource(t, filepath.Join(cityPath, "skills", "plan"))
+	writeSkillSource(t, filepath.Join(cityPath, "agents", "mayor", "skills", "m-only"))
+	deputySkill := filepath.Join(cityPath, "agents", "deputy", "skills", "d-only")
+	writeSkillSource(t, deputySkill)
+
+	cfg, configRev := loadCityRuntimeControllerConfig(t, cityPath)
+	sink := filepath.Join(cityPath, ".claude", "skills")
+	requireLinks := func(when string, present, absent []string) {
+		t.Helper()
+		for _, name := range present {
+			if _, err := os.Lstat(filepath.Join(sink, name)); err != nil {
+				t.Errorf("%s: %s missing from the shared sink: %v", when, name, err)
+			}
+		}
+		for _, name := range absent {
+			if _, err := os.Lstat(filepath.Join(sink, name)); !os.IsNotExist(err) {
+				t.Errorf("%s: %s still in the shared sink (lstat err=%v)", when, name, err)
+			}
+		}
+	}
+
+	var startErr bytes.Buffer
+	if err := runStage1SkillMaterialization(cityPath, cfg, &startErr); err != nil {
+		t.Fatalf("start pass: %v", err)
+	}
+	requireLinks("after the start pass", []string{"plan", "m-only", "d-only"}, nil)
+
+	sp := runtime.NewFake()
+	var stdout, stderr bytes.Buffer
+	cr := newTestCityRuntime(t, CityRuntimeParams{
+		CityPath:     cityPath,
+		CityName:     "test-city",
+		TomlPath:     tomlPath,
+		WatchTargets: config.WatchTargets(nil, cfg, cityPath),
+		ConfigRev:    configRev,
+		ConfigDirty:  &atomic.Bool{},
+		Cfg:          cfg,
+		SP:           sp,
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		Dops:   newDrainOps(sp),
+		Rec:    events.Discard,
+		PokeCh: make(chan struct{}, 8),
+		Stdout: &stdout,
+		Stderr: &stderr,
+	})
+	reload := func(extra ...string) {
+		t.Helper()
+		writeSkillMaterializationTestConfig(t, tomlPath, append([]string{deputy}, extra...)...)
+		lastProviderName := "tmux"
+		reply := cr.reloadConfigTraced(context.Background(), &lastProviderName, cityPath, nil, reloadSourceWatch)
+		if reply.Outcome != reloadOutcomeApplied {
+			t.Fatalf("reload outcome = %q, want %q; stderr=%q", reply.Outcome, reloadOutcomeApplied, stderr.String())
+		}
+	}
+
+	reload("[orders]\nskip = [\"reaper\"]\n")
+	requireLinks("after the first reload", []string{"plan", "m-only", "d-only"}, nil)
+
+	if err := os.RemoveAll(deputySkill); err != nil {
+		t.Fatal(err)
+	}
+	reload()
+	requireLinks("after deputy's skill was removed", []string{"plan", "m-only"}, []string{"d-only"})
+}
+
 // TestCityRuntimeReloadRejectsCollidingSkillMaterialization guards the
 // collision gate the reload path shares with `gc start` and the
 // supervisor tick (checkSkillCollisions before materialize). Two
