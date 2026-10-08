@@ -501,12 +501,17 @@ fi
 # published population lives on the rig stores, so sweeping HQ alone and exiting
 # 0 would report "nothing is stalled" from a sweep that never looked. That is the
 # precise failure this order exists to prevent, so it is loud and non-zero.
+#
+# A suspended rig is left out, as the sibling sweeps leave it (scope_bd.sh,
+# orphan-sweep.sh, renudge-stale-human-gates.sh): suspension is quiescence
+# (upstream #7115), and any bd read restarts the rig's retired proxy and Dolt.
+# It is swept again once resumed.
 SCOPES_FILE="$(mktemp "$PACK_STATE_DIR/.detect-silent-scopes.XXXXXX")"
 trap 'rm -f "$SCOPES_FILE"' EXIT
 printf '\n' > "$SCOPES_FILE"
 RIG_DISCOVERY_OK=1
 if RIGS_JSON="$(gc rig list --json 2>/dev/null)"; then
-    if ! printf '%s' "$RIGS_JSON" | jq -r '(.rigs // [])[] | select(.hq != true) | .name' \
+    if ! printf '%s' "$RIGS_JSON" | jq -r '(.rigs // [])[] | select(.hq != true and .suspended != true) | .name' \
             >> "$SCOPES_FILE" 2>/dev/null; then
         RIG_DISCOVERY_OK=0
     fi
