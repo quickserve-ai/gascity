@@ -652,6 +652,101 @@ func TestRunStage1SharedSinkKeepsAgentLocalSkill(t *testing.T) {
 	}
 }
 
+// TestRunStage1SharedSinkAgentLocalOverridesShared: mayor's agent-local
+// plan overrides the shared plan, as it does for mayor alone. deputy shares
+// the sink and wants the shared plan; the sink holds one link per name, so
+// the override wins whichever agent comes first in the config.
+func TestRunStage1SharedSinkAgentLocalOverridesShared(t *testing.T) {
+	for _, order := range []string{"mayor-first", "deputy-first"} {
+		t.Run(order, func(t *testing.T) {
+			clearGCEnv(t)
+			cityPath := t.TempDir()
+			t.Setenv("GC_HOME", t.TempDir())
+			writeSkillSource(t, filepath.Join(cityPath, "skills", "plan"))
+			mayorSkills := filepath.Join(cityPath, "agents", "mayor", "skills")
+			writeSkillSource(t, filepath.Join(mayorSkills, "plan"))
+
+			agents := []config.Agent{
+				{Name: "mayor", Scope: "city", Provider: "claude", SkillsDir: mayorSkills},
+				{Name: "deputy", Scope: "city", Provider: "claude"},
+			}
+			if order == "deputy-first" {
+				agents[0], agents[1] = agents[1], agents[0]
+			}
+			cfg := &config.City{
+				PackSkillsDir: filepath.Join(cityPath, "skills"),
+				Session:       config.SessionConfig{Provider: "tmux"},
+				Agents:        agents,
+			}
+			var stderr bytes.Buffer
+			if err := runStage1SkillMaterialization(cityPath, cfg, &stderr); err != nil {
+				t.Fatal(err)
+			}
+			tgt, err := os.Readlink(filepath.Join(cityPath, ".claude", "skills", "plan"))
+			if err != nil || tgt != filepath.Join(mayorSkills, "plan") {
+				t.Errorf("plan -> %q (err %v), want mayor's agent-local source; stderr=%q", tgt, err, stderr.String())
+			}
+		})
+	}
+}
+
+// TestRunStage1SharedSinkCollisionLeavesSinkUnchanged covers two agents
+// in one sink that provide the same agent-local skill name from different
+// directories. checkSkillCollisions rejects this config before
+// materialization; called directly, the stage-1 pass must not pick one
+// source over the other. It reports the collision and leaves the sink as
+// the previous pass wrote it.
+func TestRunStage1SharedSinkCollisionLeavesSinkUnchanged(t *testing.T) {
+	clearGCEnv(t)
+	cityPath := t.TempDir()
+	t.Setenv("GC_HOME", t.TempDir())
+
+	writeSkillSource(t, filepath.Join(cityPath, "skills", "plan"))
+	mayorSkills := filepath.Join(cityPath, "agents", "mayor", "skills")
+	deputySkills := filepath.Join(cityPath, "agents", "deputy", "skills")
+	writeSkillSource(t, filepath.Join(mayorSkills, "dup"))
+
+	cfg := &config.City{
+		PackSkillsDir: filepath.Join(cityPath, "skills"),
+		Session:       config.SessionConfig{Provider: "tmux"},
+		Agents: []config.Agent{
+			{Name: "mayor", Scope: "city", Provider: "claude", SkillsDir: mayorSkills},
+			{Name: "deputy", Scope: "city", Provider: "claude", SkillsDir: deputySkills},
+		},
+	}
+	var stderr bytes.Buffer
+	if err := runStage1SkillMaterialization(cityPath, cfg, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	sink := filepath.Join(cityPath, ".claude", "skills")
+	link := filepath.Join(sink, "dup")
+	if tgt, err := os.Readlink(link); err != nil || tgt != filepath.Join(mayorSkills, "dup") {
+		t.Fatalf("precondition: dup -> %q (err %v), want mayor's source", tgt, err)
+	}
+
+	writeSkillSource(t, filepath.Join(deputySkills, "dup"))
+	writeSkillSource(t, filepath.Join(cityPath, "skills", "review"))
+	if err := checkSkillCollisions(cfg, cityPath); err == nil {
+		t.Fatal("checkSkillCollisions accepted two agent-local dup skills in one sink")
+	}
+
+	stderr.Reset()
+	if err := runStage1SkillMaterialization(cityPath, cfg, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`skill "dup"`, `agent "mayor"`, `agent "deputy"`, sink, "leaving the sink unchanged"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("stderr missing %q: %q", want, stderr.String())
+		}
+	}
+	if tgt, err := os.Readlink(link); err != nil || tgt != filepath.Join(mayorSkills, "dup") {
+		t.Errorf("dup -> %q (err %v) after the collision, want mayor's source left in place", tgt, err)
+	}
+	if _, err := os.Lstat(filepath.Join(sink, "review")); !os.IsNotExist(err) {
+		t.Errorf("sink with a collision was materialized anyway: review lstat err=%v", err)
+	}
+}
+
 // TestRunStage1RenameSkillLifecycle confirms that renaming a skill
 // (delete old, add new name with same content) correctly cleans up
 // the old symlink and creates the new one in a single tick. This is
