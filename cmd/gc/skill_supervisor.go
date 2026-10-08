@@ -234,6 +234,15 @@ func stage1OwnsAgentWorkDir(cityPath string, cfg *config.City, agent *config.Age
 	return stage1DeliversToWorkDir(cfg.Session.Provider, agent, workDir, cityPath, cfg.Rigs)
 }
 
+// stage1OptInAtScopeRoot is stage 1's opt-in placement as the
+// collision validator's predicate, so validation checks an opted-in skill
+// in the sink it is delivered to.
+func stage1OptInAtScopeRoot(cityPath string, cfg *config.City) validation.OptInAtScopeRoot {
+	return func(agent *config.Agent) bool {
+		return stage1OwnsAgentWorkDir(cityPath, cfg, agent, io.Discard)
+	}
+}
+
 // stage1SinkWant is one skill a shared sink must hold, with the first
 // agent (in config order) that asked for it.
 type stage1SinkWant struct {
@@ -402,7 +411,7 @@ func checkSkillCollisions(cfg *config.City, cityPath string) error {
 	if cfg == nil {
 		return nil
 	}
-	collisions := validation.ValidateSkillCollisions(cfg)
+	collisions := validation.ValidateSkillCollisionsWithOptIn(cfg, stage1OptInAtScopeRoot(cityPath, cfg))
 	if len(collisions) == 0 {
 		return nil
 	}

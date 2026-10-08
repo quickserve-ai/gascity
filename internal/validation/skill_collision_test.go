@@ -323,6 +323,10 @@ func writeOptInSkill(t *testing.T, skillsRoot, name string) {
 	writeAgentSkill(t, filepath.Join(skillsRoot, config.OptInSkillsDir), name)
 }
 
+// everyOptInAtScopeRoot places every agent's opt-ins in its scope-root
+// sink, as stage 1 does for an agent whose work_dir is that root.
+func everyOptInAtScopeRoot(*config.Agent) bool { return true }
+
 func TestValidateSkillCollisionsOptInComparesSources(t *testing.T) {
 	t.Run("two seats choosing the same opt-in skill share it", func(t *testing.T) {
 		tmp := t.TempDir()
@@ -336,7 +340,7 @@ func TestValidateSkillCollisionsOptInComparesSources(t *testing.T) {
 				{Name: "rotator", Provider: "claude", Scope: "city", OptInSkills: []string{"fleet.login"}},
 			},
 		}
-		if got := ValidateSkillCollisions(cfg); got != nil {
+		if got := ValidateSkillCollisionsWithOptIn(cfg, everyOptInAtScopeRoot); got != nil {
 			t.Fatalf("want nil, got %+v", got)
 		}
 	})
@@ -355,7 +359,7 @@ func TestValidateSkillCollisionsOptInComparesSources(t *testing.T) {
 				{Name: "supervisor", Provider: "claude", Scope: "city", SkillsDir: supervisorSkills},
 			},
 		}
-		got := ValidateSkillCollisions(cfg)
+		got := ValidateSkillCollisionsWithOptIn(cfg, everyOptInAtScopeRoot)
 		want := []SkillCollision{{
 			ScopeRoot:  "<city>",
 			Vendor:     "claude",
@@ -387,7 +391,7 @@ func TestValidateSkillCollisionsOptInComparesSources(t *testing.T) {
 				{Name: "refinery", Dir: "be", Provider: "claude", OptInSkills: []string{"ops.audit"}},
 			},
 		}
-		got := ValidateSkillCollisions(cfg)
+		got := ValidateSkillCollisionsWithOptIn(cfg, everyOptInAtScopeRoot)
 		want := []SkillCollision{{
 			ScopeRoot:  shared,
 			Vendor:     "claude",
@@ -399,4 +403,31 @@ func TestValidateSkillCollisionsOptInComparesSources(t *testing.T) {
 			t.Fatalf("got %+v, want %+v", got, want)
 		}
 	})
+}
+
+func TestValidateSkillCollisionsOptInFollowsDelivery(t *testing.T) {
+	tmp := t.TempDir()
+	citySkills := filepath.Join(tmp, "city", "skills")
+	writeOptInSkill(t, citySkills, "notes")
+	supervisorSkills := makeAgentSkillsDir(t, tmp, "supervisor")
+	writeAgentSkill(t, supervisorSkills, "notes")
+	cfg := &config.City{
+		PackSkillsDir: citySkills,
+		Agents: []config.Agent{
+			{Name: "katya", Provider: "claude", Scope: "city", WorkDir: ".gc/agents/katya", OptInSkills: []string{"notes"}},
+			{Name: "supervisor", Provider: "claude", Scope: "city", SkillsDir: supervisorSkills},
+		},
+	}
+	// katya's opt-in goes to her own work_dir, not the scope-root sink
+	// supervisor's agent-local notes lives in: nothing collides there.
+	notAtRoot := func(a *config.Agent) bool { return a.WorkDir == "" }
+	if got := ValidateSkillCollisionsWithOptIn(cfg, notAtRoot); got != nil {
+		t.Fatalf("an opt-in delivered outside the scope root collided there: %+v", got)
+	}
+	if got := ValidateSkillCollisions(cfg); got != nil {
+		t.Fatalf("the agent-local-only validator counted an opt-in: %+v", got)
+	}
+	if got := ValidateSkillCollisionsWithOptIn(cfg, everyOptInAtScopeRoot); len(got) != 1 || got[0].SkillName != "notes" {
+		t.Fatalf("an opt-in delivered at the scope root did not collide: %+v", got)
+	}
 }
