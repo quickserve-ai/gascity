@@ -178,6 +178,26 @@ type CityCatalog struct {
 	// names. Sorted by Name. An opt-in skill whose name a default entry
 	// already has is left out and recorded in Shadowed.
 	OptIn []SkillEntry
+	// OptInWarnings lists the opt-in roots that could not be read. Their
+	// skills are missing from OptIn; nothing else in the catalog is
+	// affected. Callers report them.
+	OptInWarnings []string
+}
+
+// optInWarnings flattens a DiscoverOptInSkills error, one entry per
+// unreadable root.
+func optInWarnings(err error) []string {
+	var errs []error
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		errs = joined.Unwrap()
+	} else {
+		errs = []error{err}
+	}
+	out := make([]string, 0, len(errs))
+	for _, e := range errs {
+		out = append(out, e.Error())
+	}
+	return out
 }
 
 // OptedIn returns the opt-in entries named in names, sorted by Name, each
@@ -347,9 +367,12 @@ func LoadCityCatalog(packSkillsDir string, imported ...config.DiscoveredSkillCat
 
 	// Opt-in skills from the city pack and the imported catalogs, indexed
 	// apart from the default set. Compatibility bootstrap packs ship none.
+	// The index is optional: a root that cannot be read is reported in
+	// OptInWarnings and leaves Entries and OwnedRoots as they are, so the
+	// default skills, and pruning under the owned roots, are unaffected.
 	optIn, err := config.DiscoverOptInSkills(fsys.OSFS{}, packSkillsDir, imported)
 	if err != nil {
-		return cat, err
+		cat.OptInWarnings = optInWarnings(err)
 	}
 	for _, s := range optIn {
 		if existing, dup := nameOwner[s.Name]; dup {

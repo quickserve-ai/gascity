@@ -1359,3 +1359,50 @@ func TestRunStage1OptInOfASeatWithItsOwnWorkDirStaysOutOfTheScopeRootSink(t *tes
 		}
 	}
 }
+
+// TestRunStage1UnreadableOptInIndexKeepsDefaultSkills: an opt-in root the
+// pass cannot read, with no agent selecting from it, must not cost the
+// sink its default skills, neither on the first pass nor by pruning a
+// link an earlier pass wrote.
+func TestRunStage1UnreadableOptInIndexKeepsDefaultSkills(t *testing.T) {
+	clearGCEnv(t)
+	cityPath := t.TempDir()
+	t.Setenv("GC_HOME", t.TempDir())
+	fleetSkills := writeFleetPackSkills(t, t.TempDir())
+	cfg := &config.City{
+		PackSkills: []config.DiscoveredSkillCatalog{{SourceDir: fleetSkills, BindingName: "fleet"}},
+		Session:    config.SessionConfig{Provider: "tmux"},
+		Agents:     []config.Agent{{Name: "mayor", Scope: "city", Provider: "claude"}},
+	}
+	link := filepath.Join(cityPath, ".claude", "skills", "fleet.status")
+	var stderr bytes.Buffer
+	if err := runStage1SkillMaterialization(cityPath, cfg, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(link); err != nil {
+		t.Fatalf("precondition: fleet.status not linked: %v", err)
+	}
+
+	locked := filepath.Join(fleetSkills, config.OptInSkillsDir)
+	if err := os.Chmod(locked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+	if _, err := os.ReadDir(locked); err == nil {
+		t.Skip("directory permissions are not enforced for this user")
+	}
+	resetSkillCatalogCache()
+
+	for pass := 1; pass <= 2; pass++ {
+		stderr.Reset()
+		if err := runStage1SkillMaterialization(cityPath, cfg, &stderr); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Lstat(link); err != nil {
+			t.Fatalf("pass %d: default fleet.status gone with the opt-in root unreadable: %v; stderr=%q", pass, err, stderr.String())
+		}
+	}
+	if !strings.Contains(stderr.String(), locked) {
+		t.Errorf("stderr does not report the unreadable opt-in root %s: %q", locked, stderr.String())
+	}
+}
