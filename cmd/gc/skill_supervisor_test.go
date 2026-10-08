@@ -1241,3 +1241,121 @@ func TestRunStage1CleansRemovedSkills(t *testing.T) {
 		t.Errorf("code-review symlink should remain: %v", err)
 	}
 }
+
+// writeFleetPackSkills writes a pack skills root with one default skill
+// (status) and one opt-in skill (login) and returns the root.
+func writeFleetPackSkills(t *testing.T, root string) string {
+	t.Helper()
+	skills := filepath.Join(root, "fleet", "skills")
+	writeSkillSource(t, filepath.Join(skills, "status"))
+	writeSkillSource(t, filepath.Join(skills, config.OptInSkillsDir, "login"))
+	return skills
+}
+
+// TestRunStage1OptedInSkillJoinsTheScopeRootSink: a town-level agent whose
+// work_dir is the city root opts in to fleet.login. The city-root sink it
+// shares with deputy holds the opt-in beside the shared skill, and
+// deputy's agent-local skill survives the pass. A rig sink, whose agents
+// did not opt in, gets the shared skill only. Opting out prunes the link
+// and leaves deputy's skill alone.
+func TestRunStage1OptedInSkillJoinsTheScopeRootSink(t *testing.T) {
+	clearGCEnv(t)
+	cityPath := t.TempDir()
+	t.Setenv("GC_HOME", t.TempDir())
+	fleetSkills := writeFleetPackSkills(t, t.TempDir())
+	deputySkills := filepath.Join(cityPath, "agents", "deputy", "skills")
+	writeSkillSource(t, filepath.Join(deputySkills, "d-only"))
+	rigPath := filepath.Join(cityPath, "rigs", "fe")
+	if err := os.MkdirAll(rigPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.City{
+		PackSkills: []config.DiscoveredSkillCatalog{{SourceDir: fleetSkills, BindingName: "fleet"}},
+		Session:    config.SessionConfig{Provider: "tmux"},
+		Rigs:       []config.Rig{{Name: "fe", Path: rigPath}},
+		Agents: []config.Agent{
+			{Name: "mayor", Scope: "city", Provider: "claude", OptInSkills: []string{"fleet.login"}},
+			{Name: "deputy", Scope: "city", Provider: "claude", SkillsDir: deputySkills},
+			{Name: "polecat", Dir: "fe", Provider: "claude"},
+		},
+	}
+	var stderr bytes.Buffer
+	if err := runStage1SkillMaterialization(cityPath, cfg, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	citySink := filepath.Join(cityPath, ".claude", "skills")
+	if tgt, err := os.Readlink(filepath.Join(citySink, "fleet.login")); err != nil || tgt != filepath.Join(fleetSkills, config.OptInSkillsDir, "login") {
+		t.Fatalf("fleet.login -> %q (err %v), want the opt-in source; stderr=%q", tgt, err, stderr.String())
+	}
+	for _, name := range []string{"fleet.status", "d-only"} {
+		if _, err := os.Lstat(filepath.Join(citySink, name)); err != nil {
+			t.Errorf("%s missing from the city-root sink: %v", name, err)
+		}
+	}
+	rigSink := filepath.Join(rigPath, ".claude", "skills")
+	if _, err := os.Lstat(filepath.Join(rigSink, "fleet.status")); err != nil {
+		t.Errorf("shared fleet.status missing from the rig sink: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(rigSink, "fleet.login")); !os.IsNotExist(err) {
+		t.Errorf("rig sink holds the opt-in no rig agent selected: lstat err=%v", err)
+	}
+
+	cfg.Agents[0].OptInSkills = nil
+	stderr.Reset()
+	if err := runStage1SkillMaterialization(cityPath, cfg, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(citySink, "fleet.login")); !os.IsNotExist(err) {
+		t.Errorf("fleet.login still in the sink after the agent opted out: lstat err=%v; stderr=%q", err, stderr.String())
+	}
+	for _, name := range []string{"fleet.status", "d-only"} {
+		if _, err := os.Lstat(filepath.Join(citySink, name)); err != nil {
+			t.Errorf("%s removed with the opt-out: %v", name, err)
+		}
+	}
+}
+
+// TestRunStage1OptInOfASeatWithItsOwnWorkDirStaysOutOfTheScopeRootSink: a
+// town-level seat with its own work_dir (katya) opts in. Stage 1 writes the
+// city-root sink every city-root seat reads, so it must not carry katya's
+// opt-in; the per-session pass delivers it into katya's work_dir alone.
+func TestRunStage1OptInOfASeatWithItsOwnWorkDirStaysOutOfTheScopeRootSink(t *testing.T) {
+	clearGCEnv(t)
+	cityPath := t.TempDir()
+	t.Setenv("GC_HOME", t.TempDir())
+	fleetSkills := writeFleetPackSkills(t, t.TempDir())
+
+	cfg := &config.City{
+		Workspace:  config.Workspace{Name: "test-city"},
+		PackSkills: []config.DiscoveredSkillCatalog{{SourceDir: fleetSkills, BindingName: "fleet"}},
+		Session:    config.SessionConfig{Provider: "tmux"},
+		Agents: []config.Agent{
+			{Name: "mayor", Scope: "city", Provider: "claude"},
+			{Name: "katya", Scope: "city", Provider: "claude", WorkDir: ".gc/agents/katya", OptInSkills: []string{"fleet.login"}},
+		},
+	}
+	var stderr bytes.Buffer
+	if err := runStage1SkillMaterialization(cityPath, cfg, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	citySink := filepath.Join(cityPath, ".claude", "skills")
+	if _, err := os.Lstat(filepath.Join(citySink, "fleet.status")); err != nil {
+		t.Fatalf("shared fleet.status missing from the city-root sink: %v; stderr=%q", err, stderr.String())
+	}
+	if _, err := os.Lstat(filepath.Join(citySink, "fleet.login")); !os.IsNotExist(err) {
+		t.Fatalf("katya's opt-in reached the city-root sink the mayor reads: lstat err=%v", err)
+	}
+
+	katyaWorkDir := filepath.Join(cityPath, ".gc", "agents", "katya")
+	var stdout bytes.Buffer
+	if err := materializeSkillsIntoWorkdir(cfg, &cfg.Agents[1], cityPath, katyaWorkDir, nil, &stdout, &stderr); err != nil {
+		t.Fatalf("materializeSkillsIntoWorkdir: %v; stderr=%q", err, stderr.String())
+	}
+	katyaSink := filepath.Join(katyaWorkDir, ".claude", "skills")
+	for _, name := range []string{"fleet.login", "fleet.status"} {
+		if _, err := os.Lstat(filepath.Join(katyaSink, name)); err != nil {
+			t.Errorf("%s missing from katya's own sink: %v", name, err)
+		}
+	}
+}

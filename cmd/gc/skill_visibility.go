@@ -32,10 +32,15 @@ func listVisibleSkillEntries(cityPath string, cfg *config.City, sessFront *sessi
 	if err != nil {
 		return nil, err
 	}
-	// Every agent sees the entire shared catalog plus its own agent-local
-	// skills. No attachment filtering.
+	// Every agent sees the entire shared catalog, its own agent-local
+	// skills, and the opt-in skills its opt_in_skills selects.
 	entries = append(entries, discoverImportedSkillEntries(sharedSkillCatalogInputs(cfg, agentRigScopeName(agent, cfg.Rigs)))...)
 	entries = append(entries, discoverAgentSkillEntries(agentAssetRoot(cityPath, agent), agent.Name, "agent")...)
+	optIn, err := discoverOptInSkillEntries(cfg, agent)
+	if err != nil {
+		return nil, err
+	}
+	entries = append(entries, optIn...)
 	sortVisibilityEntries(entries)
 	return entries, nil
 }
