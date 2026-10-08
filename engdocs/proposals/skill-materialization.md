@@ -342,13 +342,16 @@ tombstones above, and `gc doctor --fix` deletes them. It is not accepted in
 **Validation.** Config load resolves each name against the opt-in skills in
 the agent's scope: the city pack and the city's imports, plus the rig's
 imports for a rig-scoped agent. An unknown name fails the load with the
-agent, the key, the name and the opt-in skills that agent could select. The
-collision validator counts opted-in skills with agent-local skills in each
-sink and compares their sources. Two agents selecting the same opt-in skill
-share one source and do not collide. One name that resolves to two
-directories in one sink does, whether that is an opt-in skill and another
-agent's agent-local skill, or two rigs at one path importing different
-packs under one binding name.
+agent, the key, the name and the opt-in skills that agent could select, and
+so does a name that a default skill in scope also has. An opt-in root that
+cannot be read is reported and skipped; the default skills are unaffected.
+The collision validator counts an agent's opted-in skills in the sink they
+are delivered to, with agent-local skills, and compares sources. Two agents
+selecting the same opt-in skill share one source and do not collide. One
+name that resolves to two directories in one sink does: an opt-in skill and
+another agent's agent-local skill, or two rigs at one path importing
+different packs under one binding name. An opt-in delivered to the agent's
+own work_dir is not counted against the scope root.
 
 **Delivery.** An opted-in skill joins that agent's shared set
 (`CityCatalog.WithOptIn`), so it materializes, fingerprints and overrides
@@ -358,10 +361,7 @@ the link on the next pass. The two stages treat it differently:
 
 - Stage 1 adds an agent's opt-in skills to its scope-root sink only when the
   agent's work_dir is that scope root, the test the prompt's skills appendix
-  also uses. Every agent whose work_dir is that root reads the same sink, so
-  those agents see each other's opted-in skills. This is the isolation
-  limit: seats that share the city root as their work_dir share one skill
-  directory.
+  also uses.
 - An agent with its own work_dir gets its opt-in skills only from the
   per-session pass (`gc internal materialize-skills` in PreStart, so tmux
   and herdr), in that work_dir. They stay out of the shared scope root. A
@@ -372,6 +372,20 @@ the link on the next pass. The two stages treat it differently:
   session uses the same work_dir prunes the first agent's opted-in links, as
   it prunes its agent-local ones; grouping that pass by sink is a known
   follow-up.
+
+**Who sees an opt-in skill.** gc decides which skill directory an opted-in
+skill is written to; the provider decides which sessions load that
+directory. Claude Code loads `.claude/skills` from the directory a session
+starts in and from every parent up to the repository root, and in a linked
+git worktree only up to the worktree root. So an opt-in delivered to a
+scope-root sink is visible to every Claude session that loads that
+directory's skills: sessions started there, and sessions started in plain
+subdirectories below it within the same repository, but not sessions in
+their own linked worktrees. The same holds for the agent-local skills stage 1
+writes there today. A seat gets an opt-in exclusively only by having its own
+work_dir, which receives that seat's skills alone. gc's tests check which
+sink holds an opted-in skill, not which provider sessions load it: provider
+discovery is not modelled.
 
 `gc skill list --agent <name>` lists an agent's opted-in skills once each,
 under their binding-qualified names. The city-wide `gc skill list` does not

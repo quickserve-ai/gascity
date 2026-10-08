@@ -219,12 +219,20 @@ func stage1UnreconciledSinks(err error) []error {
 // stage1OwnsAgentWorkDir reports whether the agent's own work_dir is its
 // scope root, the directory stage 1 writes, by the predicate the prompt's
 // skills appendix uses (stage1DeliversToWorkDir). Only then do the
-// agent's opt-in skills join the scope-root sink. Every agent whose
-// work_dir is that root reads the sink, so a sink-mate also sees the
-// skill; an agent with its own work_dir instead receives its opt-ins in
-// that directory from the per-session pass (gc internal
-// materialize-skills), and they stay out of the shared scope root. A
-// work_dir that does not resolve keeps the opt-ins out of the sink.
+// agent's opt-in skills join the scope-root sink. An agent with its own
+// work_dir instead receives its opt-ins in that directory from the
+// per-session pass (gc internal materialize-skills), and they stay out of
+// the shared scope root. A work_dir that does not resolve keeps the
+// opt-ins out of the sink.
+//
+// The contract this gives: an opt-in in the scope-root sink is visible to
+// every session the provider loads that directory's skills for. Claude
+// Code loads .claude/skills from a session's start directory and every
+// parent up to the repository root (the worktree root in a linked
+// worktree), so that is every session started at the scope root or in a
+// plain subdirectory below it in the same repository, but not a session
+// in its own linked worktree. A seat gets an opt-in exclusively only by
+// having its own work_dir.
 func stage1OwnsAgentWorkDir(cityPath string, cfg *config.City, agent *config.Agent, stderr io.Writer) bool {
 	workDir, err := resolveConfiguredWorkDirPathUnvalidated(cityPath, loadedCityName(cfg, cityPath), agent.QualifiedName(), agent, cfg.Rigs)
 	if err != nil {
