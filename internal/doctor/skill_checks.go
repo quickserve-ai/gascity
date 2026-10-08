@@ -12,20 +12,23 @@ import (
 // the materializer cannot satisfy — two agents sharing a scope-root
 // sink that both want to write the same skill name.
 //
-// The check is a thin wrapper around validation.ValidateSkillCollisions;
+// The check is a thin wrapper around validation.ValidateSkillCollisionsWithOptIn;
 // the validator is the single source of truth. The same function is
 // invoked at `gc start` and every supervisor tick (Phase 4A); surfacing
 // it here lets operators diagnose outside a startup gate.
 type SkillCollisionCheck struct {
-	cfg      *config.City
-	cityPath string
+	cfg              *config.City
+	cityPath         string
+	optInAtScopeRoot validation.OptInAtScopeRoot
 }
 
-// NewSkillCollisionCheck builds a check that scans cfg for agent-local
-// skill collisions. cityPath is used to rewrite the "<city>" sentinel
-// in error messages to the actual city root when available.
-func NewSkillCollisionCheck(cfg *config.City, cityPath string) *SkillCollisionCheck {
-	return &SkillCollisionCheck{cfg: cfg, cityPath: cityPath}
+// NewSkillCollisionCheck builds a check that scans cfg for skill
+// collisions: agent-local skills, and opted-in skills in the sinks
+// optInAtScopeRoot places them in (nil checks agent-local skills only).
+// cityPath is used to rewrite the "<city>" sentinel in error messages to
+// the actual city root when available.
+func NewSkillCollisionCheck(cfg *config.City, cityPath string, optInAtScopeRoot validation.OptInAtScopeRoot) *SkillCollisionCheck {
+	return &SkillCollisionCheck{cfg: cfg, cityPath: cityPath, optInAtScopeRoot: optInAtScopeRoot}
 }
 
 // Name returns the check identifier.
@@ -41,7 +44,7 @@ func (c *SkillCollisionCheck) Run(_ *CheckContext) *CheckResult {
 		return r
 	}
 
-	collisions := validation.ValidateSkillCollisions(c.cfg)
+	collisions := validation.ValidateSkillCollisionsWithOptIn(c.cfg, c.optInAtScopeRoot)
 	if len(collisions) == 0 {
 		r.Status = StatusOK
 		r.Message = "no agent-local skill collisions"
