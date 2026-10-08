@@ -467,9 +467,7 @@ func resolveTemplate(p *agentBuildParams, cfgAgent *config.Agent, qualifiedName 
 		}
 		provider := effectiveAgentProviderFamily(cfgAgent, wsProvider, p.providers)
 		if _, ok := materialize.VendorSink(provider); ok {
-			scopeRoot := agentScopeRoot(cfgAgent, p.cityPath, p.rigs)
-			canonWorkDir := canonicaliseFilePath(workDir, p.cityPath)
-			stage1Delivers := canStage1Materialize(p.sessionProvider, cfgAgent) && canonWorkDir == scopeRoot
+			stage1Delivers := stage1DeliversToWorkDir(p.sessionProvider, cfgAgent, workDir, p.cityPath, p.rigs)
 			stage2Delivers := isStage2EligibleSession(p.sessionProvider, cfgAgent)
 			if stage1Delivers || stage2Delivers {
 				var agentCat materialize.AgentCatalog

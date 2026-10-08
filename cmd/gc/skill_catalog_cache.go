@@ -232,6 +232,7 @@ func cloneCityCatalog(cat materialize.CityCatalog) materialize.CityCatalog {
 		Entries:    append([]materialize.SkillEntry(nil), cat.Entries...),
 		OwnedRoots: append([]string(nil), cat.OwnedRoots...),
 		Shadowed:   append([]materialize.ShadowedEntry(nil), cat.Shadowed...),
+		OptIn:      append([]materialize.SkillEntry(nil), cat.OptIn...),
 	}
 }
 

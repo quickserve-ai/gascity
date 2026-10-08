@@ -250,3 +250,96 @@ func writeCatalogFile(t *testing.T, dir, rel, content string) {
 		t.Fatalf("WriteFile(%s): %v", path, err)
 	}
 }
+
+// writeOptInSkillListCity writes the bead's fixture city: an imported pack
+// account-fleet with one default skill and one opt-in skill, a town-level
+// mayor opted in through [[patches.agent]] opt_in_skills_append, a
+// crew-style agent with its own work_dir, and a pool agent.
+func writeOptInSkillListCity(t *testing.T) (cityDir, fleetDir string) {
+	t.Helper()
+	clearGCEnv(t)
+	rootDir := t.TempDir()
+	cityDir = filepath.Join(rootDir, "city")
+	fleetDir = filepath.Join(rootDir, "account-fleet")
+	t.Setenv("GC_CITY", cityDir)
+	writeNamedSessionCityTOML(t, cityDir)
+	writeCatalogFile(t, fleetDir, "pack.toml", "[pack]\nname = \"account-fleet\"\nversion = \"0.1.0\"\nschema = 2\n")
+	writeCatalogFile(t, fleetDir, "skills/fleet-status/SKILL.md", "default skill")
+	writeCatalogFile(t, fleetDir, "skills/opt-in/fleet-login/SKILL.md", "opt-in skill")
+	writeCatalogFile(t, cityDir, "pack.toml", "[pack]\nname = \"city\"\nversion = \"0.1.0\"\nschema = 2\n\n[imports.account-fleet]\nsource = \"../account-fleet\"\n")
+	writeCatalogFile(t, cityDir, "agents/crew/agent.toml", "scope = \"city\"\nprovider = \"claude\"\nstart_command = \"echo\"\nwork_dir = \".gc/agents/crew\"\n")
+	writeCatalogFile(t, cityDir, "agents/polecat/agent.toml", "scope = \"city\"\nprovider = \"claude\"\nstart_command = \"echo\"\nwork_dir = \".gc/agents/{{.AgentBase}}\"\nmax_active_sessions = 3\n")
+	writeCatalogFile(t, cityDir, "city.toml", `[workspace]
+
+[beads]
+provider = "file"
+
+[[patches.agent]]
+name = "mayor"
+opt_in_skills_append = ["account-fleet.fleet-login"]
+`)
+	return cityDir, fleetDir
+}
+
+func skillListEntries(t *testing.T, args ...string) []visibilityEntry {
+	t.Helper()
+	var stdout, stderr bytes.Buffer
+	code := run(append([]string{"skill", "list", "--json"}, args...), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("gc skill list %v exited %d: %s", args, code, stderr.String())
+	}
+	var payload skillListJSONResult
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout.String())
+	}
+	return payload.Entries
+}
+
+func countSkillListName(entries []visibilityEntry, name string) int {
+	n := 0
+	for _, e := range entries {
+		if e.Name == name {
+			n++
+		}
+	}
+	return n
+}
+
+func TestSkillListAgentListsAnOptedInSkillOnceForThatAgentOnly(t *testing.T) {
+	_, fleetDir := writeOptInSkillListCity(t)
+
+	mayor := skillListEntries(t, "--agent", "mayor")
+	if got := countSkillListName(mayor, "account-fleet.fleet-login"); got != 1 {
+		t.Fatalf("mayor lists account-fleet.fleet-login %d times, want once: %+v", got, mayor)
+	}
+	for _, e := range mayor {
+		if e.Name != "account-fleet.fleet-login" {
+			continue
+		}
+		wantPath := filepath.ToSlash(filepath.Join(fleetDir, "skills", "opt-in", "fleet-login", "SKILL.md"))
+		if e.Source != "account-fleet" || e.Path != wantPath {
+			t.Errorf("opted-in entry = %+v, want source account-fleet and path %s", e, wantPath)
+		}
+	}
+
+	for _, agent := range []string{"crew", "polecat"} {
+		entries := skillListEntries(t, "--agent", agent)
+		if got := countSkillListName(entries, "account-fleet.fleet-login"); got != 0 {
+			t.Errorf("%s lists the opt-in skill it did not select: %+v", agent, entries)
+		}
+		if got := countSkillListName(entries, "account-fleet.fleet-status"); got != 1 {
+			t.Errorf("%s lists the default skill %d times, want once: %+v", agent, got, entries)
+		}
+	}
+
+	city := skillListEntries(t)
+	if got := countSkillListName(city, "account-fleet.fleet-status"); got != 1 {
+		t.Errorf("city listing has the default skill %d times, want once: %+v", got, city)
+	}
+	if got := countSkillListName(city, "account-fleet.fleet-login"); got != 0 {
+		t.Errorf("city listing shows the opt-in skill as if every agent had it: %+v", city)
+	}
+	if got := countSkillListName(mayor, "account-fleet.fleet-status"); got != 1 {
+		t.Errorf("mayor lists the default skill %d times, want once: %+v", got, mayor)
+	}
+}
