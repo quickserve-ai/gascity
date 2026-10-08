@@ -105,7 +105,7 @@ func scanFenceFile(fset *token.FileSet, rel string, file *ast.File, findings *[]
 		if !ok || fd.Body == nil {
 			continue
 		}
-		scanFenceFunc(fset, rel, funcDeclName(fd), fd.Body, findings, seen)
+		scanFenceFunc(fset, rel, ratchetFuncDeclName(fd), fd.Body, findings, seen)
 	}
 }
 
@@ -271,7 +271,7 @@ func calleeName(fun ast.Expr) string {
 	return ""
 }
 
-func funcDeclName(fd *ast.FuncDecl) string {
+func ratchetFuncDeclName(fd *ast.FuncDecl) string {
 	if fd.Recv == nil || len(fd.Recv.List) == 0 {
 		return fd.Name.Name
 	}
