@@ -3773,10 +3773,13 @@ type Agent struct {
 	// form: "<binding>.<name>" for an imported pack's skill, "<name>" for the
 	// city pack's own. A name must resolve to an opt-in skill in the agent's
 	// scope (the city's imports, plus its rig's imports for a rig-scoped
-	// agent), or config load fails. Agents whose work_dir is the same scope
-	// root and whose provider uses the same skill directory share that
-	// directory, so they also see each other's opted-in skills; an agent with
-	// its own work_dir receives its opt-ins there alone.
+	// agent), or config load fails. An agent whose work_dir is its scope
+	// root receives its opt-ins in the scope root's skill directory, and
+	// every session the provider loads that directory for sees them: for
+	// Claude Code, sessions started there and in plain subdirectories below
+	// it in the same repository, but not sessions in their own linked
+	// worktrees. An agent with its own work_dir receives its opt-ins in that
+	// work_dir alone; that is how a seat gets an opt-in skill exclusively.
 	OptInSkills []string `toml:"opt_in_skills,omitempty"`
 	// Attach controls whether the agent's session supports interactive
 	// attachment (e.g., tmux attach). When false, the agent can use a
