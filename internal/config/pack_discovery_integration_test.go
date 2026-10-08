@@ -172,6 +172,22 @@ opt_in_skills_append = ["fleet.logout"]
 	}
 }
 
+func TestLoadWithIncludes_ReservedOptInDirectoryHoldingASkillWarns(t *testing.T) {
+	cityDir := writeOptInSkillCity(t, "")
+	fleetDir := filepath.Join(filepath.Dir(cityDir), "fleet")
+	writeTestFile(t, fleetDir, "skills/opt-in/SKILL.md", "# bundle\n")
+	_, prov, err := LoadWithIncludes(fsys.OSFS{}, filepath.Join(cityDir, "city.toml"))
+	if err != nil {
+		t.Fatalf("LoadWithIncludes: %v", err)
+	}
+	for _, w := range prov.Warnings {
+		if strings.Contains(w, filepath.Join(fleetDir, "skills", "opt-in", "SKILL.md")) && strings.Contains(w, "reserved") {
+			return
+		}
+	}
+	t.Fatalf("no reserved-directory warning in %v", prov.Warnings)
+}
+
 func TestLoadWithIncludes_CityPackCommandsUsePackNameBinding(t *testing.T) {
 	dir := t.TempDir()
 	packDir := filepath.Join(dir, "helper")
