@@ -337,7 +337,7 @@ func buildDoctorChecks(cityPath string, cfg *config.City, cfgErr error, opts bui
 		register(doctor.NewNamedAlwaysMinConflictCheck(cfg))
 		register(doctor.NewInstructionsFileCheck(cfg, cityPath))
 		register(doctor.NewServiceSecretsPermsCheck(cfg, cityPath))
-		register(doctor.NewSkillCollisionCheck(cfg, cityPath))
+		register(doctor.NewSkillCollisionCheck(cfg, cityPath, stage1OptInAtScopeRoot(cityPath, cfg)))
 		register(doctor.NewSkillDanglingSinkCheck(doctorSkillStaticSinks(cityPath, cfg), materialize.LegacyOwnedRootsFor(cityPath), liveSessionSinks))
 		registerCityStoreCheck(doctor.NewOrderFiringCurrentCheck(cfg, cityPath,
 			doctor.WithOrderFiringCurrentLastRunFunc(

@@ -44,7 +44,7 @@ func TestSkillCollisionCheck_NoCollisions(t *testing.T) {
 		},
 	}
 
-	chk := NewSkillCollisionCheck(cfg, tmp)
+	chk := NewSkillCollisionCheck(cfg, tmp, nil)
 	res := chk.Run(&CheckContext{CityPath: tmp})
 	if res.Status != StatusOK {
 		t.Fatalf("status = %v, want OK; msg=%q", res.Status, res.Message)
@@ -65,7 +65,7 @@ func TestSkillCollisionCheck_CityCollisionMessage(t *testing.T) {
 		},
 	}
 
-	chk := NewSkillCollisionCheck(cfg, "/path/to/city")
+	chk := NewSkillCollisionCheck(cfg, "/path/to/city", nil)
 	res := chk.Run(&CheckContext{CityPath: "/path/to/city"})
 	if res.Status != StatusError {
 		t.Fatalf("status = %v, want Error; msg=%q", res.Status, res.Message)
@@ -108,7 +108,7 @@ func TestSkillCollisionCheck_RigCollisionUsesRigPath(t *testing.T) {
 		},
 	}
 
-	chk := NewSkillCollisionCheck(cfg, "/path/to/city")
+	chk := NewSkillCollisionCheck(cfg, "/path/to/city", nil)
 	res := chk.Run(&CheckContext{CityPath: "/path/to/city"})
 	if res.Status != StatusError {
 		t.Fatalf("status = %v, want Error; msg=%q", res.Status, res.Message)
@@ -122,7 +122,7 @@ func TestSkillCollisionCheck_RigCollisionUsesRigPath(t *testing.T) {
 }
 
 func TestSkillCollisionCheck_NilCfg(t *testing.T) {
-	chk := NewSkillCollisionCheck(nil, "")
+	chk := NewSkillCollisionCheck(nil, "", nil)
 	res := chk.Run(&CheckContext{})
 	if res.Status != StatusOK {
 		t.Fatalf("nil cfg should yield OK, got %v (msg=%q)", res.Status, res.Message)
