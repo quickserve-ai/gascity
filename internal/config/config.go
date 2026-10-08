@@ -839,6 +839,12 @@ type AgentOverride struct {
 	MouseMode *string `toml:"mouse_mode,omitempty" jsonschema:"enum=on,enum=off"`
 	// InjectFragmentsAppend appends to the agent's inject_fragments list.
 	InjectFragmentsAppend []string `toml:"inject_fragments_append,omitempty"`
+	// OptInSkills replaces the agent's opt_in_skills list (see
+	// Agent.OptInSkills). Leave it unset to keep the agent's list; set an
+	// empty list to clear it.
+	OptInSkills *[]string `toml:"opt_in_skills,omitempty"`
+	// OptInSkillsAppend appends to the agent's opt_in_skills list.
+	OptInSkillsAppend []string `toml:"opt_in_skills_append,omitempty"`
 	// MaxActiveSessions overrides the agent-level cap on concurrent sessions.
 	MaxActiveSessions *int `toml:"max_active_sessions,omitempty"`
 	// MinActiveSessions overrides the minimum number of sessions to keep alive.
@@ -3761,6 +3767,17 @@ type Agent struct {
 	//   *false -> disable; the template is responsible for rendering
 	//             any skill guidance itself
 	InjectAssignedSkills *bool `toml:"inject_assigned_skills,omitempty"`
+	// OptInSkills names the opt-in skills this agent receives. A pack ships
+	// an opt-in skill under skills/opt-in/<name>/SKILL.md, and no agent
+	// receives it unless it names it here. Names use the shared catalog's
+	// form: "<binding>.<name>" for an imported pack's skill, "<name>" for the
+	// city pack's own. A name must resolve to an opt-in skill in the agent's
+	// scope (the city's imports, plus its rig's imports for a rig-scoped
+	// agent), or config load fails. Agents whose work_dir is the same scope
+	// root and whose provider uses the same skill directory share that
+	// directory, so they also see each other's opted-in skills; an agent with
+	// its own work_dir receives its opt-ins there alone.
+	OptInSkills []string `toml:"opt_in_skills,omitempty"`
 	// Attach controls whether the agent's session supports interactive
 	// attachment (e.g., tmux attach). When false, the agent can use a
 	// lighter runtime (subprocess instead of tmux). Defaults to true.
@@ -3840,6 +3857,7 @@ func (a Agent) Clone() Agent {
 	out.InjectFragments = append([]string(nil), a.InjectFragments...)
 	out.AppendFragments = append([]string(nil), a.AppendFragments...)
 	out.InheritedAppendFragments = append([]string(nil), a.InheritedAppendFragments...)
+	out.OptInSkills = append([]string(nil), a.OptInSkills...)
 	out.DependsOn = append([]string(nil), a.DependsOn...)
 	out.SharedSkills = append([]string(nil), a.SharedSkills...)
 	out.SharedMCP = append([]string(nil), a.SharedMCP...)

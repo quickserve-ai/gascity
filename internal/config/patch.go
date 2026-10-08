@@ -162,6 +162,13 @@ type AgentPatch struct {
 	InstallAgentHooksAppend []string `toml:"install_agent_hooks_append,omitempty"`
 	// InjectFragmentsAppend appends to the agent's inject_fragments list.
 	InjectFragmentsAppend []string `toml:"inject_fragments_append,omitempty"`
+	// OptInSkills replaces the agent's opt_in_skills list (see
+	// Agent.OptInSkills). Leave it unset to keep the agent's list; set an
+	// empty list to clear it.
+	OptInSkills *[]string `toml:"opt_in_skills,omitempty"`
+	// OptInSkillsAppend appends to the agent's opt_in_skills list, the way
+	// inject_fragments_append adds a prompt fragment.
+	OptInSkillsAppend []string `toml:"opt_in_skills_append,omitempty"`
 	// MaxActiveSessions overrides the agent-level cap on concurrent sessions.
 	MaxActiveSessions *int `toml:"max_active_sessions,omitempty"`
 	// MinActiveSessions overrides the minimum number of sessions to keep alive.
@@ -722,6 +729,14 @@ func applyAgentMutation(a *Agent, p *AgentPatch, sleepSource string) {
 	}
 	if len(p.InjectFragmentsAppend) > 0 {
 		a.InjectFragments = append(a.InjectFragments, p.InjectFragmentsAppend...)
+	}
+	// OptInSkills is presence-aware like InjectFragments, so a city can
+	// clear the opt-ins a pack's agent declares with `opt_in_skills = []`.
+	if p.OptInSkills != nil {
+		a.OptInSkills = append([]string(nil), (*p.OptInSkills)...)
+	}
+	if len(p.OptInSkillsAppend) > 0 {
+		a.OptInSkills = append(a.OptInSkills, p.OptInSkillsAppend...)
 	}
 	// Env: additive merge.
 	if len(p.Env) > 0 {

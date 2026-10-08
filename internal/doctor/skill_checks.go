@@ -69,6 +69,12 @@ func (c *SkillCollisionCheck) Fix(_ *CheckContext) error { return nil }
 //	agent-local skill collision at scope root <path> (<vendor>):
 //	  "<name>" is provided by both <agent1> and <agent2>
 //	  rename one of the colliding skills to resolve
+//
+// A collision involving an opted-in skill (SkillCollision.OptIn) reads:
+//
+//	skill collision at scope root <path> (<vendor>):
+//	  "<name>" resolves to different skills for both <agent1> and <agent2>
+//	  select a different opt-in skill, or rename the agent-local one, to resolve
 func FormatSkillCollisions(collisions []validation.SkillCollision, cityPath string) string {
 	if len(collisions) == 0 {
 		return ""
@@ -81,6 +87,12 @@ func FormatSkillCollisions(collisions []validation.SkillCollision, cityPath stri
 		scope := c.ScopeRoot
 		if scope == "<city>" && cityPath != "" {
 			scope = cityPath
+		}
+		if c.OptIn {
+			fmt.Fprintf(&b, "skill collision at scope root %s (%s):\n", scope, c.Vendor)
+			fmt.Fprintf(&b, "  %q resolves to different skills for %s\n", c.SkillName, joinAgentsHuman(c.AgentNames))
+			b.WriteString("  select a different opt-in skill, or rename the agent-local one, to resolve")
+			continue
 		}
 		fmt.Fprintf(&b, "agent-local skill collision at scope root %s (%s):\n", scope, c.Vendor)
 		fmt.Fprintf(&b, "  %q is provided by %s\n", c.SkillName, joinAgentsHuman(c.AgentNames))

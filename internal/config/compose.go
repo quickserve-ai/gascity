@@ -830,6 +830,13 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 
 	populateAgentLocalAssetDirs(fs, root, cityRoot)
 
+	// Opt-in skill names resolve against the pack catalogs composed above,
+	// once patches, rig overrides and implicit agents have settled each
+	// agent's opt_in_skills.
+	if err := ValidateOptInSkills(fs, root); err != nil {
+		return nil, nil, fmt.Errorf("%s: %w", path, err)
+	}
+
 	// Load namepool files for pool agents.
 	loadNamepools(fs, root, cityRoot)
 
