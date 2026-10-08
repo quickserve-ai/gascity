@@ -690,13 +690,13 @@ func TestRunStage1SharedSinkAgentLocalOverridesShared(t *testing.T) {
 	}
 }
 
-// TestRunStage1SharedSinkCollisionLeavesSinkUnchanged covers two agents
-// in one sink that provide the same agent-local skill name from different
-// directories. checkSkillCollisions rejects this config before
+// TestRunStage1SharedSinkLocalConflictKeepsExistingLinks covers two
+// agents in one sink that provide the same agent-local skill name from
+// different directories. checkSkillCollisions rejects this config before
 // materialization; called directly, the stage-1 pass must not pick one
-// source over the other. It reports the collision and leaves the sink as
-// the previous pass wrote it.
-func TestRunStage1SharedSinkCollisionLeavesSinkUnchanged(t *testing.T) {
+// source over the other. It reports the conflict and does not reconcile
+// the sink that pass, so the links the previous pass wrote stay.
+func TestRunStage1SharedSinkLocalConflictKeepsExistingLinks(t *testing.T) {
 	clearGCEnv(t)
 	cityPath := t.TempDir()
 	t.Setenv("GC_HOME", t.TempDir())
@@ -734,7 +734,7 @@ func TestRunStage1SharedSinkCollisionLeavesSinkUnchanged(t *testing.T) {
 	if err := runStage1SkillMaterialization(cityPath, cfg, &stderr); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{`skill "dup"`, `agent "mayor"`, `agent "deputy"`, sink, "leaving the sink unchanged"} {
+	for _, want := range []string{`skill "dup"`, `agent "mayor"`, `agent "deputy"`, sink, "sink not reconciled this pass"} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Errorf("stderr missing %q: %q", want, stderr.String())
 		}
@@ -743,7 +743,190 @@ func TestRunStage1SharedSinkCollisionLeavesSinkUnchanged(t *testing.T) {
 		t.Errorf("dup -> %q (err %v) after the collision, want mayor's source left in place", tgt, err)
 	}
 	if _, err := os.Lstat(filepath.Join(sink, "review")); !os.IsNotExist(err) {
-		t.Errorf("sink with a collision was materialized anyway: review lstat err=%v", err)
+		t.Errorf("sink with a conflict was reconciled anyway: review lstat err=%v", err)
+	}
+}
+
+// sharedPathRigsCity returns a config with two rigs, fe and be, at one
+// path. ValidateRigs requires unique rig names and prefixes, not unique
+// paths, so their claude agents share one sink. Each rig imports a pack
+// under the binding "ops", from feOps and beOps respectively.
+func sharedPathRigsCity(cityPath, feOps, beOps string) *config.City {
+	rigPath := filepath.Join(cityPath, "rigs", "shared")
+	return &config.City{
+		PackSkillsDir: filepath.Join(cityPath, "skills"),
+		Session:       config.SessionConfig{Provider: "tmux"},
+		Rigs:          []config.Rig{{Name: "fe", Path: rigPath}, {Name: "be", Path: rigPath}},
+		RigPackSkills: map[string][]config.DiscoveredSkillCatalog{
+			"fe": {{SourceDir: feOps, BindingName: "ops", PackName: "ops"}},
+			"be": {{SourceDir: beOps, BindingName: "ops", PackName: "ops"}},
+		},
+		Agents: []config.Agent{
+			{Name: "polecat", Scope: "rig", Dir: "fe", Provider: "claude"},
+			{Name: "witness", Scope: "rig", Dir: "be", Provider: "claude"},
+		},
+	}
+}
+
+// TestRunStage1SharedSinkLocalOverrideSettlesSharedConflict: the two rigs'
+// imports give ops.review different sources in one sink, but polecat's
+// agent-local ops.review overrides it. The sink links the agent-local
+// source either way, so the shared clash is not a conflict and the sink
+// reconciles.
+func TestRunStage1SharedSinkLocalOverrideSettlesSharedConflict(t *testing.T) {
+	clearGCEnv(t)
+	cityPath := t.TempDir()
+	t.Setenv("GC_HOME", t.TempDir())
+	opsA := filepath.Join(cityPath, "imports", "ops-a", "skills")
+	opsB := filepath.Join(cityPath, "imports", "ops-b", "skills")
+	writeSkillSource(t, filepath.Join(opsA, "review"))
+	writeSkillSource(t, filepath.Join(opsB, "review"))
+	polecatSkills := filepath.Join(cityPath, "agents", "polecat", "skills")
+	writeSkillSource(t, filepath.Join(polecatSkills, "ops.review"))
+
+	cfg := sharedPathRigsCity(cityPath, opsA, opsB)
+	cfg.Agents[0].SkillsDir = polecatSkills
+
+	var stderr bytes.Buffer
+	if err := runStage1SkillMaterialization(cityPath, cfg, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stderr.String(), "not reconciled") {
+		t.Errorf("agent-local override reported as a conflict: %q", stderr.String())
+	}
+	link := filepath.Join(cityPath, "rigs", "shared", ".claude", "skills", "ops.review")
+	if tgt, err := os.Readlink(link); err != nil || tgt != filepath.Join(polecatSkills, "ops.review") {
+		t.Errorf("ops.review -> %q (err %v), want polecat's agent-local source", tgt, err)
+	}
+}
+
+// TestRunStage1SharedSinkSharedConflictDegradesReconciliation reaches a
+// conflict through the production gates: ValidateRigs accepts two rigs at
+// one path and checkSkillCollisions checks only agent-local names, so
+// both pass when the rigs' imports give ops.review two sources. The
+// sink's pass is degraded, not rejected: existing links stay, a new
+// shared skill is not added and a removed one is not pruned until the
+// conflict is resolved, and then the sink reconciles.
+func TestRunStage1SharedSinkSharedConflictDegradesReconciliation(t *testing.T) {
+	clearGCEnv(t)
+	cityPath := t.TempDir()
+	t.Setenv("GC_HOME", t.TempDir())
+	opsA := filepath.Join(cityPath, "imports", "ops-a", "skills")
+	opsB := filepath.Join(cityPath, "imports", "ops-b", "skills")
+	writeSkillSource(t, filepath.Join(opsA, "review"))
+	writeSkillSource(t, filepath.Join(opsB, "review"))
+	writeSkillSource(t, filepath.Join(cityPath, "skills", "plan"))
+	dropped := filepath.Join(cityPath, "skills", "dropped")
+	writeSkillSource(t, dropped)
+
+	cfg := sharedPathRigsCity(cityPath, opsA, opsA)
+	sink := filepath.Join(cityPath, "rigs", "shared", ".claude", "skills")
+	var stderr bytes.Buffer
+	if err := runStage1SkillMaterialization(cityPath, cfg, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"plan", "dropped", "ops.review"} {
+		if _, err := os.Lstat(filepath.Join(sink, name)); err != nil {
+			t.Fatalf("precondition: %s missing: %v", name, err)
+		}
+	}
+
+	cfg.RigPackSkills["be"] = []config.DiscoveredSkillCatalog{{SourceDir: opsB, BindingName: "ops", PackName: "ops"}}
+	if err := config.ValidateRigs(cfg.Rigs, "hq"); err != nil {
+		t.Fatalf("ValidateRigs rejected two rigs at one path: %v", err)
+	}
+	if err := checkSkillCollisions(cfg, cityPath); err != nil {
+		t.Fatalf("checkSkillCollisions rejected a shared-source clash: %v", err)
+	}
+	writeSkillSource(t, filepath.Join(cityPath, "skills", "added"))
+	if err := os.RemoveAll(dropped); err != nil {
+		t.Fatal(err)
+	}
+
+	stderr.Reset()
+	if err := runStage1SkillMaterialization(cityPath, cfg, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`skill "ops.review"`, `agent "fe/polecat"`, `agent "be/witness"`, "existing links kept"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("stderr missing %q: %q", want, stderr.String())
+		}
+	}
+	if tgt, err := os.Readlink(filepath.Join(sink, "ops.review")); err != nil || tgt != filepath.Join(opsA, "review") {
+		t.Errorf("ops.review -> %q (err %v) during the conflict, want the existing link kept", tgt, err)
+	}
+	if _, err := os.Lstat(filepath.Join(sink, "dropped")); err != nil {
+		t.Errorf("dropped was pruned during the conflict: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(sink, "added")); !os.IsNotExist(err) {
+		t.Errorf("added was linked during the conflict: lstat err=%v", err)
+	}
+
+	cfg.RigPackSkills["be"] = []config.DiscoveredSkillCatalog{{SourceDir: opsA, BindingName: "ops", PackName: "ops"}}
+	stderr.Reset()
+	if err := runStage1SkillMaterialization(cityPath, cfg, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stderr.String(), "not reconciled") {
+		t.Errorf("conflict still reported after it was resolved: %q", stderr.String())
+	}
+	if _, err := os.Lstat(filepath.Join(sink, "added")); err != nil {
+		t.Errorf("added missing after the conflict was resolved: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(sink, "dropped")); !os.IsNotExist(err) {
+		t.Errorf("dropped not pruned after the conflict was resolved: lstat err=%v", err)
+	}
+}
+
+// TestRunStage1SharedSinkIncompletePassKeepsEveryAgentsSkips: user content
+// blocks one agent-local skill of each agent in a shared sink, so the
+// first pass reports one skip per agent. A pass that does not reconcile
+// the sink must carry the skip history of every agent in it, not only
+// one, so neither skip prints again once the sink reconciles.
+func TestRunStage1SharedSinkIncompletePassKeepsEveryAgentsSkips(t *testing.T) {
+	clearGCEnv(t)
+	t.Setenv("GC_HOME", t.TempDir())
+	t.Setenv("GC_DEBUG", "")
+	cityPath := t.TempDir()
+	writeSkillSource(t, filepath.Join(cityPath, "skills", "plan"))
+	mayorSkills := filepath.Join(cityPath, "agents", "mayor", "skills")
+	deputySkills := filepath.Join(cityPath, "agents", "deputy", "skills")
+	writeSkillSource(t, filepath.Join(mayorSkills, "m-only"))
+	writeSkillSource(t, filepath.Join(deputySkills, "d-only"))
+	sink := filepath.Join(cityPath, ".claude", "skills")
+	for _, name := range []string{"m-only", "d-only"} {
+		if err := os.MkdirAll(filepath.Join(sink, name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := &config.City{
+		PackSkillsDir: filepath.Join(cityPath, "skills"),
+		Session:       config.SessionConfig{Provider: "tmux"},
+		Agents: []config.Agent{
+			{Name: "mayor", Scope: "city", Provider: "claude", SkillsDir: mayorSkills},
+			{Name: "deputy", Scope: "city", Provider: "claude", SkillsDir: deputySkills},
+		},
+	}
+
+	var stderr bytes.Buffer
+	runStage1ForSkipTest(t, cityPath, cfg, &stderr)
+	// An agent-local clash keeps the next pass from reconciling the sink.
+	writeSkillSource(t, filepath.Join(mayorSkills, "dup"))
+	dup := filepath.Join(deputySkills, "dup")
+	writeSkillSource(t, dup)
+	runStage1ForSkipTest(t, cityPath, cfg, &stderr)
+	if !strings.Contains(stderr.String(), "not reconciled") {
+		t.Fatalf("second pass did not hit the conflict: %q", stderr.String())
+	}
+	if err := os.RemoveAll(dup); err != nil {
+		t.Fatal(err)
+	}
+	runStage1ForSkipTest(t, cityPath, cfg, &stderr)
+
+	for _, want := range []string{`agent "mayor" skipped skill "m-only"`, `agent "deputy" skipped skill "d-only"`} {
+		if got := strings.Count(stderr.String(), want); got != 1 {
+			t.Errorf("%s reported %d times over three passes, want 1:\n%s", want, got, stderr.String())
+		}
 	}
 }
 
