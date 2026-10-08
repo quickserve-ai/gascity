@@ -972,6 +972,7 @@ func TestDeepCopyAgentCoversAllFields(t *testing.T) {
 		InjectFragments:              []string{"frag1"},
 		AppendFragments:              []string{"agent-footer"},
 		InheritedAppendFragments:     []string{"pack-footer"},
+		OptInSkills:                  []string{"fleet.login"},
 		Attach:                       &trueVal,
 		PoolName:                     "template/name",
 		ResumeCommand:                "claude --resume {{.SessionKey}} --dangerously",
