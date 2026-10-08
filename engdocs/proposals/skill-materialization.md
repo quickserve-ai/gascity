@@ -147,7 +147,19 @@ this to the **union** of:
 The materializer enumerates all three and produces the union as the
 desired symlink set for each agent. City-pack entries and implicit-bootstrap
 entries are "shared catalog" (universal across agents of the matching
-vendor); the agent-local entries are only for that one agent.
+vendor); the agent-local entries come from that one agent's catalog.
+
+"Agent-local" names the source catalog, not who can see the skill. Agents
+with the same scope root and provider sink write one sink directory, so
+stage 1 materializes each sink once, with the union of its agents' desired
+sets, and every agent reading that sink sees every agent-local skill in it.
+The sink holds one link per name: an agent-local entry that overrides a
+shared entry replaces the shared version for every agent in the sink. Two
+sources for one name in the same class (two agents' agent-local skills, or
+two shared catalogs reaching one sink, as two rigs at one path can) cannot
+both be linked. The collision validator rejects the agent-local case at
+start; otherwise the pass reports the conflict and leaves that sink's
+existing links in place until it is resolved.
 
 User-declared third-party imports' `skills/` are **not** enumerated in
 v0.15.1 (per the non-goal). The mechanism to include them later is
@@ -665,7 +677,8 @@ That is not part of this release.
 **Acceptance:**
 - `test/acceptance/skill_test.go` — extend with:
   - "city skill is materialized into every agent's sink (per-vendor)."
-  - "agent-local skill is only in that agent's sink."
+  - "agent-local skill reaches only the sink its agent writes; agents
+    sharing that sink see it too."
   - "adding a skill to the city catalog drains affected agents."
   - "removing a skill cleans up the symlink on next tick."
   - "renaming a skill (delete + add) cleans up old and creates new."
