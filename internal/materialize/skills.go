@@ -171,6 +171,53 @@ type CityCatalog struct {
 	// source. The winning entry appears in Entries; this list is purely
 	// diagnostic.
 	Shadowed []ShadowedEntry
+	// OptIn indexes the opt-in skills in scope: the ones a pack ships
+	// under skills/opt-in/<name>/ (config.OptInSkillsDir), named as the
+	// default entries are. They are not in Entries and no agent receives
+	// one by default; WithOptIn adds the ones an agent's opt_in_skills
+	// names. Sorted by Name. An opt-in skill whose name a default entry
+	// already has is left out and recorded in Shadowed.
+	OptIn []SkillEntry
+}
+
+// OptedIn returns the opt-in entries named in names, sorted by Name, each
+// once. Names that match no opt-in entry are skipped: config load rejects
+// them (config.ValidateOptInSkills), and a catalog read from an older
+// snapshot may lack the index.
+func (c CityCatalog) OptedIn(names []string) []SkillEntry {
+	if len(names) == 0 || len(c.OptIn) == 0 {
+		return nil
+	}
+	want := make(map[string]bool, len(names))
+	for _, n := range names {
+		want[strings.TrimSpace(n)] = true
+	}
+	var out []SkillEntry
+	for _, e := range c.OptIn {
+		if want[e.Name] {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// WithOptIn returns the catalog one agent sees once it has opted in to
+// names: a copy of c whose Entries also hold the selected opt-in entries,
+// so they materialize, fingerprint and override like any shared skill.
+// The receiver is not modified. OwnedRoots needs no addition: an opt-in
+// skill lives under its pack's skills root, which is already owned, so a
+// skill an agent stops selecting is pruned like a removed shared skill.
+func (c CityCatalog) WithOptIn(names []string) CityCatalog {
+	selected := c.OptedIn(names)
+	if len(selected) == 0 {
+		return c
+	}
+	out := c
+	out.Entries = make([]SkillEntry, 0, len(c.Entries)+len(selected))
+	out.Entries = append(out.Entries, c.Entries...)
+	out.Entries = append(out.Entries, selected...)
+	sort.Slice(out.Entries, func(i, j int) bool { return out.Entries[i].Name < out.Entries[j].Name })
+	return out
 }
 
 // AgentCatalog is one agent's private skill catalog
@@ -296,6 +343,33 @@ func LoadCityCatalog(packSkillsDir string, imported ...config.DiscoveredSkillCat
 		for _, e := range entries {
 			addEntry(e)
 		}
+	}
+
+	// Opt-in skills from the city pack and the imported catalogs, indexed
+	// apart from the default set. Compatibility bootstrap packs ship none.
+	optIn, err := config.DiscoverOptInSkills(fsys.OSFS{}, packSkillsDir, imported)
+	if err != nil {
+		return cat, err
+	}
+	for _, s := range optIn {
+		if existing, dup := nameOwner[s.Name]; dup {
+			cat.Shadowed = append(cat.Shadowed, ShadowedEntry{
+				Name:   s.Name,
+				Winner: cat.Entries[existing].Origin,
+				Loser:  s.Origin + " (opt-in)",
+			})
+			continue
+		}
+		source := s.Dir
+		if abs, err := filepath.Abs(source); err == nil {
+			source = abs
+		}
+		cat.OptIn = append(cat.OptIn, SkillEntry{
+			Name:        s.Name,
+			Source:      source,
+			Origin:      s.Origin,
+			Description: readSkillDescription(filepath.Join(source, "SKILL.md")),
+		})
 	}
 
 	sort.Slice(cat.Entries, func(i, j int) bool { return cat.Entries[i].Name < cat.Entries[j].Name })
