@@ -229,10 +229,11 @@ func loadSharedSkillCatalogWithFallback(cityPath string, cfg *config.City, rigNa
 
 func cloneCityCatalog(cat materialize.CityCatalog) materialize.CityCatalog {
 	return materialize.CityCatalog{
-		Entries:    append([]materialize.SkillEntry(nil), cat.Entries...),
-		OwnedRoots: append([]string(nil), cat.OwnedRoots...),
-		Shadowed:   append([]materialize.ShadowedEntry(nil), cat.Shadowed...),
-		OptIn:      append([]materialize.SkillEntry(nil), cat.OptIn...),
+		Entries:       append([]materialize.SkillEntry(nil), cat.Entries...),
+		OwnedRoots:    append([]string(nil), cat.OwnedRoots...),
+		Shadowed:      append([]materialize.ShadowedEntry(nil), cat.Shadowed...),
+		OptIn:         append([]materialize.SkillEntry(nil), cat.OptIn...),
+		OptInWarnings: append([]string(nil), cat.OptInWarnings...),
 	}
 }
 
