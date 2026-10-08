@@ -836,6 +836,7 @@ func LoadWithIncludesOptions(fs fsys.FS, path string, opts LoadOptions, extraInc
 	if err := ValidateOptInSkills(fs, root); err != nil {
 		return nil, nil, fmt.Errorf("%s: %w", path, err)
 	}
+	prov.Warnings = append(prov.Warnings, OptInLayoutWarnings(fs, root)...)
 
 	// Load namepool files for pool agents.
 	loadNamepools(fs, root, cityRoot)

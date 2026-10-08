@@ -180,3 +180,54 @@ func TestValidateOptInSkills_UnreadableRootFailsOnlyTheNamesItHides(t *testing.T
 		t.Fatalf("ValidateOptInSkills = %v, want an error carrying the unreadable root %s", err, locked)
 	}
 }
+
+func TestValidateOptInSkills_SelectingAnOptInADefaultShadowsIsALoadError(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	fleetSkills := filepath.Join(dir, "fleet", "skills")
+	writeTestFile(t, fleetSkills, "login/SKILL.md", "default copy")
+	writeTestFile(t, fleetSkills, "opt-in/login/SKILL.md", "opt-in copy")
+	writeTestFile(t, fleetSkills, "opt-in/audit/SKILL.md", "opt-in only")
+	cfg := func(names ...string) *City {
+		return &City{
+			PackSkills: []DiscoveredSkillCatalog{{SourceDir: fleetSkills, BindingName: "fleet"}},
+			Agents:     []Agent{{Name: "mayor", Scope: "city", OptInSkills: names}},
+		}
+	}
+	if err := ValidateOptInSkills(fsys.OSFS{}, cfg("fleet.audit")); err != nil {
+		t.Fatalf("an unshadowed opt-in failed beside an unselected shadowed one: %v", err)
+	}
+	err := ValidateOptInSkills(fsys.OSFS{}, cfg("fleet.login"))
+	if err == nil {
+		t.Fatal("selecting an opt-in skill a default skill shadows loaded; the agent would silently get the default")
+	}
+	for _, want := range []string{`agent "mayor"`, `"fleet.login"`, filepath.Join(fleetSkills, "login"), filepath.Join(fleetSkills, "opt-in", "login")} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err.Error(), want)
+		}
+	}
+}
+
+func TestOptInLayoutWarnings_ReservedDirectoryHoldingASkill(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	fleetSkills := filepath.Join(dir, "fleet", "skills")
+	opsSkills := filepath.Join(dir, "ops", "skills")
+	writeTestFile(t, fleetSkills, "opt-in/SKILL.md", "a bundle in the reserved directory")
+	writeTestFile(t, opsSkills, "opt-in/audit/SKILL.md", "a proper opt-in skill")
+	cfg := &City{
+		PackSkills: []DiscoveredSkillCatalog{
+			{SourceDir: fleetSkills, BindingName: "fleet"},
+			{SourceDir: opsSkills, BindingName: "ops"},
+		},
+	}
+	got := OptInLayoutWarnings(fsys.OSFS{}, cfg)
+	if len(got) != 1 {
+		t.Fatalf("OptInLayoutWarnings = %v, want one warning for fleet", got)
+	}
+	for _, want := range []string{filepath.Join(fleetSkills, "opt-in", "SKILL.md"), `"fleet.opt-in"`, "reserved"} {
+		if !strings.Contains(got[0], want) {
+			t.Errorf("warning %q does not mention %q", got[0], want)
+		}
+	}
+}
