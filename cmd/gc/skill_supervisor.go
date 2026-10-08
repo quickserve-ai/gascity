@@ -31,7 +31,10 @@ import (
 // materializer once per sink with the union of what those agents want.
 // A pass per agent would let each agent prune the agent-local skills
 // another agent wrote, since the sink's ownership manifest marks every
-// gc-written link as prunable by any later pass.
+// gc-written link as prunable by any later pass. The grouping covers
+// the stage-1 passes (gc start, city start, applied reload) only; the
+// per-session path still materializes one agent per run (see
+// materializeSkillsIntoWorkdir).
 //
 // Catalog load happens once per scope per call and feeds every
 // agent's materialization in this tick. Per-agent and per-sink errors
@@ -124,9 +127,14 @@ func runStage1SkillMaterialization(cityPath string, cfg *config.City, stderr io.
 	sort.Strings(sinkDirs)
 	for _, dir := range sinkDirs {
 		sink := sinks[dir]
-		if len(sink.conflicts) > 0 {
-			for _, c := range sink.conflicts {
-				fmt.Fprintf(stderr, "gc: stage-1 materialize-skills at %s: %s; leaving the sink unchanged\n", dir, c) //nolint:errcheck // best-effort stderr
+		// A name the sink cannot resolve degrades this sink's
+		// reconciliation for the pass: its existing links stay, and
+		// additions and removals for every agent in it wait until the
+		// conflict is resolved. The config itself still applies, and
+		// every other sink reconciles normally.
+		if conflicts := sink.conflicts(); len(conflicts) > 0 {
+			for _, c := range conflicts {
+				fmt.Fprintf(stderr, "gc: stage-1 materialize-skills at %s: %s; sink not reconciled this pass (existing links kept, additions and removals wait for the conflict to be resolved)\n", dir, c) //nolint:errcheck // best-effort stderr
 			}
 			sink.markIncomplete(skipPass)
 			continue
@@ -176,15 +184,23 @@ type stage1SinkWant struct {
 // stage1Sink accumulates, for one sink directory, the union of the
 // skills wanted by every agent that materializes into it, and the union
 // of the gc-managed roots those agents may prune under. Shared-catalog
-// and agent-local entries are kept apart so the overlay in desired is
-// the same precedence materialize.EffectiveSet applies to one agent.
+// and agent-local entries are kept apart so desired can apply the
+// precedence materialize.EffectiveSet applies to one agent.
 type stage1Sink struct {
 	agents    []string
 	shared    map[string]stage1SinkWant
 	local     map[string]stage1SinkWant
+	clashes   []stage1SinkClash
 	owned     []string
 	ownedSeen map[string]bool
-	conflicts []string
+}
+
+// stage1SinkClash records a name wanted from two sources in the same
+// class (shared or agent-local).
+type stage1SinkClash struct {
+	name  string
+	local bool
+	msg   string
 }
 
 func newStage1Sink() *stage1Sink {
@@ -199,10 +215,10 @@ func newStage1Sink() *stage1Sink {
 func (s *stage1Sink) add(agent string, city materialize.CityCatalog, local materialize.AgentCatalog) {
 	s.agents = append(s.agents, agent)
 	for _, e := range city.Entries {
-		s.want(s.shared, agent, e)
+		s.want(s.shared, false, agent, e)
 	}
 	for _, e := range local.Entries {
-		s.want(s.local, agent, e)
+		s.want(s.local, true, agent, e)
 	}
 	for _, root := range city.OwnedRoots {
 		s.addOwned(root)
@@ -210,21 +226,39 @@ func (s *stage1Sink) add(agent string, city materialize.CityCatalog, local mater
 	s.addOwned(local.OwnedRoot)
 }
 
-// want records that agent wants entry e, in the shared or the
-// agent-local class. A name wanted from one source by several agents is
-// wanted once. Two sources for one name in the same class are a
-// conflict: the sink holds one link per name, and choosing between them
-// would silently drop the other agent's skill.
-func (s *stage1Sink) want(class map[string]stage1SinkWant, agent string, e materialize.SkillEntry) {
+// want records that agent wants entry e in the given class. A name
+// wanted from one source by several agents is wanted once; a second
+// source for the same name is recorded as a clash.
+func (s *stage1Sink) want(class map[string]stage1SinkWant, local bool, agent string, e materialize.SkillEntry) {
 	prev, ok := class[e.Name]
 	if !ok {
 		class[e.Name] = stage1SinkWant{entry: e, agent: agent}
 		return
 	}
 	if prev.entry.Source != e.Source {
-		s.conflicts = append(s.conflicts, fmt.Sprintf("skill %q is provided by agent %q from %s and by agent %q from %s",
-			e.Name, prev.agent, prev.entry.Source, agent, e.Source))
+		s.clashes = append(s.clashes, stage1SinkClash{
+			name:  e.Name,
+			local: local,
+			msg: fmt.Sprintf("skill %q is provided by agent %q from %s and by agent %q from %s",
+				e.Name, prev.agent, prev.entry.Source, agent, e.Source),
+		})
 	}
+}
+
+// conflicts returns the clashes the sink cannot resolve: two agent-local
+// sources for one name, or two shared sources for a name no agent-local
+// entry overrides. An agent-local override settles a shared clash,
+// because the sink links the agent-local source either way. The sink
+// holds one link per name, so choosing between two sources of the same
+// class would silently drop one agent's skill.
+func (s *stage1Sink) conflicts() []string {
+	var out []string
+	for _, c := range s.clashes {
+		if _, overridden := s.local[c.name]; c.local || !overridden {
+			out = append(out, c.msg)
+		}
+	}
+	return out
 }
 
 // addOwned adds root to the sink's prunable roots once.
@@ -236,21 +270,21 @@ func (s *stage1Sink) addOwned(root string) {
 	s.owned = append(s.owned, root)
 }
 
-// desired returns the sink's wanted entries sorted by name. An
-// agent-local entry overrides a shared entry of the same name, as it
-// does within one agent; every agent writing the sink sees the override.
+// desired returns the sink's wanted entries, sorted by name, with the
+// precedence materialize.EffectiveSet applies to one agent: an
+// agent-local entry overrides a shared entry of the same name. The sink
+// holds one link per name, so an override from one agent also replaces
+// the shared version for every other agent writing the sink.
 func (s *stage1Sink) desired() []materialize.SkillEntry {
-	out := make([]materialize.SkillEntry, 0, len(s.shared)+len(s.local))
-	for name, w := range s.shared {
-		if _, overridden := s.local[name]; !overridden {
-			out = append(out, w.entry)
-		}
+	var shared materialize.CityCatalog
+	for _, w := range s.shared {
+		shared.Entries = append(shared.Entries, w.entry)
 	}
+	var local materialize.AgentCatalog
 	for _, w := range s.local {
-		out = append(out, w.entry)
+		local.Entries = append(local.Entries, w.entry)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out
+	return materialize.EffectiveSet(shared, local)
 }
 
 // wantedBy returns the agent a skip of name is reported under: the agent
