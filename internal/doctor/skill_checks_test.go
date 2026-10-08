@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/validation"
 )
 
 // writeSkillMD creates a skill directory at <skillsDir>/<name>/ with a
@@ -125,5 +126,27 @@ func TestSkillCollisionCheck_NilCfg(t *testing.T) {
 	res := chk.Run(&CheckContext{})
 	if res.Status != StatusOK {
 		t.Fatalf("nil cfg should yield OK, got %v (msg=%q)", res.Status, res.Message)
+	}
+}
+
+func TestFormatSkillCollisions_OptInNamesTheSources(t *testing.T) {
+	msg := FormatSkillCollisions([]validation.SkillCollision{{
+		ScopeRoot:  "<city>",
+		Vendor:     "claude",
+		SkillName:  "notes",
+		AgentNames: []string{"mayor", "supervisor"},
+		OptIn:      true,
+	}}, "/path/to/city")
+	for _, want := range []string{
+		"skill collision at scope root /path/to/city (claude)",
+		`"notes" resolves to different skills for both mayor and supervisor`,
+		"select a different opt-in skill, or rename the agent-local one",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("message missing %q\nfull message:\n%s", want, msg)
+		}
+	}
+	if strings.Contains(msg, "agent-local skill collision") {
+		t.Errorf("an opt-in collision is not an agent-local one:\n%s", msg)
 	}
 }

@@ -27,6 +27,8 @@ func TestMatchedDeprecatedKey(t *testing.T) {
 		{"comment line", `# skills = ["a"]`, "", false},
 		{"unrelated key", `skills_dir = "x"`, "", false},
 		{"key prefix mismatch", `skills_other = []`, "", false},
+		{"opt_in_skills is not a tombstone", `opt_in_skills = ["fleet.login"]`, "", false},
+		{"opt_in_skills_append is not a tombstone", `opt_in_skills_append = ["fleet.login"]`, "", false},
 		{"empty line", "", "", false},
 		{"no equals", `skills`, "", false},
 	}
