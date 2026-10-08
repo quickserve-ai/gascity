@@ -32,6 +32,8 @@ import (
 // Agents with the same scope root and provider family share one sink
 // directory, so the pass groups agents by sink and runs the
 // materializer once per sink with the union of what those agents want.
+// An agent's opt-in skills are part of what it wants only when its
+// work_dir is the scope root (stage1OwnsAgentWorkDir).
 // A pass per agent would let each agent prune the agent-local skills
 // another agent wrote, since the sink's ownership manifest marks every
 // gc-written link as prunable by any later pass. The grouping covers
@@ -74,6 +76,7 @@ func runStage1SkillMaterialization(cityPath string, cfg *config.City, stderr io.
 			if result.Mode == sharedCatalogLoadDirect {
 				cat.Entries = nil
 				cat.Shadowed = nil
+				cat.OptIn = nil
 			}
 			catalogs[rigName] = cat
 			return catalogs[rigName]
@@ -101,6 +104,9 @@ func runStage1SkillMaterialization(cityPath string, cfg *config.City, stderr io.
 
 		rigName := agentRigScopeName(agent, cfg.Rigs)
 		cityCat := loadCatalog(rigName)
+		if len(agent.OptInSkills) > 0 && stage1OwnsAgentWorkDir(cityPath, cfg, agent, stderr) {
+			cityCat = cityCat.WithOptIn(agent.OptInSkills)
+		}
 
 		// Resolve the agent's scope root to an absolute path. Use the
 		// un-canonicalized form here so the materializer writes into
@@ -204,6 +210,24 @@ func stage1UnreconciledSinks(err error) []error {
 		return []error{err}
 	}
 	return nil
+}
+
+// stage1OwnsAgentWorkDir reports whether the agent's own work_dir is its
+// scope root, the directory stage 1 writes, by the predicate the prompt's
+// skills appendix uses (stage1DeliversToWorkDir). Only then do the
+// agent's opt-in skills join the scope-root sink. Every agent whose
+// work_dir is that root reads the sink, so a sink-mate also sees the
+// skill; an agent with its own work_dir instead receives its opt-ins in
+// that directory from the per-session pass (gc internal
+// materialize-skills), and they stay out of the shared scope root. A
+// work_dir that does not resolve keeps the opt-ins out of the sink.
+func stage1OwnsAgentWorkDir(cityPath string, cfg *config.City, agent *config.Agent, stderr io.Writer) bool {
+	workDir, err := resolveConfiguredWorkDirPathUnvalidated(cityPath, loadedCityName(cfg, cityPath), agent.QualifiedName(), agent, cfg.Rigs)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc: stage-1 materialize-skills for agent %q: resolving work_dir: %v; opt-in skills not written to the scope root\n", agent.QualifiedName(), err) //nolint:errcheck // best-effort stderr
+		return false
+	}
+	return stage1DeliversToWorkDir(cfg.Session.Provider, agent, workDir, cityPath, cfg.Rigs)
 }
 
 // stage1SinkWant is one skill a shared sink must hold, with the first

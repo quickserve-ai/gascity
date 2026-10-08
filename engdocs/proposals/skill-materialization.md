@@ -296,6 +296,84 @@ fields into their configs based on the published JSON schema.
 (The schema and reference docs are updated in v0.15.1 to mark the fields
 deprecated; they are deleted in v0.16.)
 
+### Opt-in skills
+
+"No attachment filtering" holds for the shared catalog: every agent gets
+every default skill. A pack can also ship a skill that no agent gets until
+an agent asks for it by name.
+
+**Pack side.** A skill at `skills/opt-in/<name>/SKILL.md` is an opt-in
+skill. The default catalog (`readSkillDir`) and `gc skill list` read only
+`skills/<name>/SKILL.md`. The `opt-in/` directory holds no `SKILL.md` of its
+own, so it never becomes a default skill, and `opt-in` is a reserved name
+under `skills/`. An opt-in
+skill is named the way a default skill is: `<binding>.<name>` for an
+imported pack, `<name>` for the city pack. When a pack ships one name both
+ways, the default wins and the catalog records the opt-in copy as shadowed.
+
+**Seat side.** An agent selects opt-in skills with `opt_in_skills`:
+
+```toml
+# agents/rotator/agent.toml in a pack
+opt_in_skills = ["account-fleet.fleet-login"]
+
+# city.toml
+[[patches.agent]]
+name = "mayor"
+opt_in_skills_append = ["account-fleet.fleet-login", "account-fleet.account-rebalance"]
+
+[[rigs]]
+name = "fe"
+
+[[rigs.overrides]]
+agent = "polecat"
+opt_in_skills_append = ["ops.audit"]
+```
+
+On a patch or a rig override, `opt_in_skills` replaces the agent's list
+(`opt_in_skills = []` clears a pack agent's list) and `opt_in_skills_append`
+adds to it. The key is new on purpose: `skills` and `skills_append` are the
+tombstones above, and `gc doctor --fix` deletes them. It is not accepted in
+`[agent_defaults]`, because a skill every agent opts in to is a default skill.
+
+**Validation.** Config load resolves each name against the opt-in skills in
+the agent's scope: the city pack and the city's imports, plus the rig's
+imports for a rig-scoped agent. An unknown name fails the load with the
+agent, the key, the name and the opt-in skills that agent could select. The
+collision validator counts opted-in skills with agent-local skills in each
+sink and compares their sources. Two agents selecting the same opt-in skill
+share one source and do not collide. One name that resolves to two
+directories in one sink does, whether that is an opt-in skill and another
+agent's agent-local skill, or two rigs at one path importing different
+packs under one binding name.
+
+**Delivery.** An opted-in skill joins that agent's shared set
+(`CityCatalog.WithOptIn`), so it materializes, fingerprints and overrides
+like any shared skill. Its source sits under the pack's `skills/` root,
+which is already an owned root, so dropping it from `opt_in_skills` prunes
+the link on the next pass. The two stages treat it differently:
+
+- Stage 1 adds an agent's opt-in skills to its scope-root sink only when the
+  agent's work_dir is that scope root, the test the prompt's skills appendix
+  also uses. Every agent whose work_dir is that root reads the same sink, so
+  those agents see each other's opted-in skills. This is the isolation
+  limit: seats that share the city root as their work_dir share one skill
+  directory.
+- An agent with its own work_dir gets its opt-in skills only from the
+  per-session pass (`gc internal materialize-skills` in PreStart, so tmux
+  and herdr), in that work_dir. They stay out of the shared scope root. A
+  subprocess seat with its own work_dir gets no opt-in skills, since it has
+  no per-session pass. Agent-local skills keep their stage-1 behavior and
+  still land in the scope root.
+- The per-session pass reconciles one agent at a time. A second agent whose
+  session uses the same work_dir prunes the first agent's opted-in links, as
+  it prunes its agent-local ones; grouping that pass by sink is a known
+  follow-up.
+
+`gc skill list --agent <name>` lists an agent's opted-in skills once each,
+under their binding-qualified names. The city-wide `gc skill list` does not
+show opt-in skills. The prompt appendix lists them under "Assigned to you".
+
 ### Per-skill fingerprint entries via `FingerprintExtra`
 
 Each materialized symlink produces one entry in the agent's
