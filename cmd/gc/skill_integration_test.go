@@ -582,3 +582,60 @@ func namesOf(entries []materialize.SkillEntry) []string {
 	}
 	return out
 }
+
+func TestEffectiveSkillsForAgentAddsOnlyItsOwnOptIns(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	sharedSkill := filepath.Join(tmp, "fleet", "skills", "status")
+	optInSkill := filepath.Join(tmp, "fleet", "skills", "opt-in", "login")
+	mustCreateSkill(t, sharedSkill)
+	mustCreateSkill(t, optInSkill)
+	shared := materialize.CityCatalog{
+		Entries:    []materialize.SkillEntry{{Name: "fleet.status", Source: sharedSkill, Origin: "fleet"}},
+		OptIn:      []materialize.SkillEntry{{Name: "fleet.login", Source: optInSkill, Origin: "fleet"}},
+		OwnedRoots: []string{filepath.Join(tmp, "fleet", "skills")},
+	}
+
+	mayor := &config.Agent{Name: "mayor", Provider: "claude", OptInSkills: []string{"fleet.login"}}
+	if got, want := namesOf(effectiveSkillsForAgent(&shared, mayor, "", nil, nil)), []string{"fleet.login", "fleet.status"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("mayor desired = %v, want %v", got, want)
+	}
+	crew := &config.Agent{Name: "crew", Provider: "claude"}
+	if got, want := namesOf(effectiveSkillsForAgent(&shared, crew, "", nil, nil)), []string{"fleet.status"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("crew desired = %v, want %v", got, want)
+	}
+}
+
+func TestBuildAssignedSkillsPromptFragmentListsOptInsAsAssigned(t *testing.T) {
+	t.Parallel()
+	city := &materialize.CityCatalog{
+		Entries: []materialize.SkillEntry{
+			{Name: "fleet.status", Source: "/fleet/skills/status", Origin: "fleet", Description: "Fleet status"},
+		},
+		OptIn: []materialize.SkillEntry{
+			{Name: "fleet.login", Source: "/fleet/skills/opt-in/login", Origin: "fleet", Description: "Log a seat in"},
+			{Name: "fleet.rebalance", Source: "/fleet/skills/opt-in/rebalance", Origin: "fleet", Description: "Rebalance accounts"},
+		},
+	}
+	a := &config.Agent{Name: "mayor", Scope: "city", OptInSkills: []string{"fleet.login"}}
+	got := buildAssignedSkillsPromptFragment(a, city, materialize.AgentCatalog{})
+
+	assigned, shared, ok := strings.Cut(got, "### Shared in this scope")
+	if !ok {
+		t.Fatalf("fragment has no shared section:\n%s", got)
+	}
+	if !strings.Contains(assigned, "### Assigned to you") || !strings.Contains(assigned, "`fleet.login` — Log a seat in *(fleet)*") {
+		t.Errorf("opted-in fleet.login not listed as assigned:\n%s", got)
+	}
+	if !strings.Contains(shared, "`fleet.status` — Fleet status *(fleet)*") {
+		t.Errorf("shared fleet.status missing:\n%s", got)
+	}
+	if strings.Contains(got, "fleet.rebalance") {
+		t.Errorf("fragment lists an opt-in skill the agent did not select:\n%s", got)
+	}
+
+	crew := &config.Agent{Name: "crew", Scope: "city"}
+	if crewGot := buildAssignedSkillsPromptFragment(crew, city, materialize.AgentCatalog{}); strings.Contains(crewGot, "fleet.login") || strings.Contains(crewGot, "### Assigned to you") {
+		t.Errorf("crew fragment lists an opt-in it did not select:\n%s", crewGot)
+	}
+}
