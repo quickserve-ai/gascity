@@ -4064,6 +4064,35 @@ nudge = "standalone dog"
 	}
 }
 
+func TestExpandPacks_OverrideOptInSkillsAppend(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "packs/test/pack.toml", `
+[pack]
+name = "test"
+schema = 1
+
+[[agent]]
+name = "polecat"
+opt_in_skills = ["fleet.login"]
+`)
+	cfg := &City{
+		Rigs: []Rig{{
+			Name: "hw", Path: "/tmp/hw", Includes: []string{"packs/test"},
+			Overrides: []AgentOverride{{
+				Agent:             "polecat",
+				OptInSkillsAppend: []string{"fleet.rebalance"},
+			}},
+		}},
+	}
+	if err := ExpandPacks(cfg, fsys.OSFS{}, dir, nil); err != nil {
+		t.Fatalf("ExpandPacks: %v", err)
+	}
+	want := []string{"fleet.login", "fleet.rebalance"}
+	if got := cfg.Agents[0].OptInSkills; !sliceEqual(got, want) {
+		t.Errorf("OptInSkills = %v, want %v", got, want)
+	}
+}
+
 func TestExpandPacks_OverrideAppendAlone(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "packs/test/pack.toml", `

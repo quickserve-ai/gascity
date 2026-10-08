@@ -345,6 +345,10 @@ func deepCopyAgent(src *config.Agent, name, dir string) config.Agent {
 		dst.InheritedAppendFragments = make([]string, len(src.InheritedAppendFragments))
 		copy(dst.InheritedAppendFragments, src.InheritedAppendFragments)
 	}
+	if len(src.OptInSkills) > 0 {
+		dst.OptInSkills = make([]string, len(src.OptInSkills))
+		copy(dst.OptInSkills, src.OptInSkills)
+	}
 	if len(src.InstallAgentHooks) > 0 {
 		dst.InstallAgentHooks = make([]string, len(src.InstallAgentHooks))
 		copy(dst.InstallAgentHooks, src.InstallAgentHooks)

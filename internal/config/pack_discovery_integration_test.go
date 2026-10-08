@@ -113,6 +113,65 @@ name = "test"
 	}
 }
 
+// writeOptInSkillCity writes a city whose pack imports "fleet", a pack that
+// ships one default skill and one opt-in skill, and whose city.toml carries
+// patches (the caller's [[patches.agent]] blocks).
+func writeOptInSkillCity(t *testing.T, patches string) string {
+	t.Helper()
+	dir := t.TempDir()
+	fleetDir := filepath.Join(dir, "fleet")
+	cityDir := filepath.Join(dir, "city")
+	writeTestFile(t, fleetDir, "pack.toml", "[pack]\nname = \"fleet\"\nschema = 2\n")
+	writeTestFile(t, fleetDir, "skills/shared/SKILL.md", "# shared\n")
+	writeTestFile(t, fleetDir, "skills/opt-in/login/SKILL.md", "# login\n")
+	writeTestFile(t, cityDir, "pack.toml", "[pack]\nname = \"city\"\nschema = 2\n\n[imports.fleet]\nsource = \"../fleet\"\n")
+	writeTestFile(t, cityDir, "agents/mayor/prompt.md", "mayor\n")
+	writeTestFile(t, cityDir, "agents/crew/prompt.md", "crew\n")
+	writeTestFile(t, cityDir, "city.toml", "[workspace]\nname = \"test\"\n\n"+patches)
+	return cityDir
+}
+
+func TestLoadWithIncludes_PatchAppendSelectsAnImportedOptInSkill(t *testing.T) {
+	cityDir := writeOptInSkillCity(t, `
+[[patches.agent]]
+name = "mayor"
+opt_in_skills_append = ["fleet.login"]
+`)
+	cfg, _, err := LoadWithIncludes(fsys.OSFS{}, filepath.Join(cityDir, "city.toml"))
+	if err != nil {
+		t.Fatalf("LoadWithIncludes: %v", err)
+	}
+	for _, a := range cfg.Agents {
+		switch a.Name {
+		case "mayor":
+			if !sliceEqual(a.OptInSkills, []string{"fleet.login"}) {
+				t.Errorf("mayor OptInSkills = %v, want [fleet.login]", a.OptInSkills)
+			}
+		default:
+			if len(a.OptInSkills) != 0 {
+				t.Errorf("agent %q OptInSkills = %v, want none", a.QualifiedName(), a.OptInSkills)
+			}
+		}
+	}
+}
+
+func TestLoadWithIncludes_UnknownOptInSkillIsALoadError(t *testing.T) {
+	cityDir := writeOptInSkillCity(t, `
+[[patches.agent]]
+name = "mayor"
+opt_in_skills_append = ["fleet.logout"]
+`)
+	_, _, err := LoadWithIncludes(fsys.OSFS{}, filepath.Join(cityDir, "city.toml"))
+	if err == nil {
+		t.Fatal("LoadWithIncludes succeeded; want an error for the unknown opt-in skill")
+	}
+	for _, want := range []string{`agent "mayor"`, "opt_in_skills", `"fleet.logout"`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err.Error(), want)
+		}
+	}
+}
+
 func TestLoadWithIncludes_CityPackCommandsUsePackNameBinding(t *testing.T) {
 	dir := t.TempDir()
 	packDir := filepath.Join(dir, "helper")
