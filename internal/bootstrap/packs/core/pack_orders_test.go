@@ -531,6 +531,15 @@ func TestDetectSilentPublishedWorkScriptContract(t *testing.T) {
 		t.Error("detect-silent-published-work.sh must fail loudly when rigs cannot be enumerated rather than sweeping HQ only and exiting clean")
 	}
 
+	// Suspension is quiescence (upstream #7115): a suspended rig is left cold,
+	// because any bd read restarts its retired proxy and Dolt. The sweep's rig
+	// enumeration must skip it, as the sibling sweeps do (scope_bd.sh,
+	// orphan-sweep.sh, renudge-stale-human-gates.sh); otherwise every sweep's
+	// `gc bd list --rig` restarts the pair and the controller stops it again.
+	if !strings.Contains(body, "select(.hq != true and .suspended != true)") {
+		t.Error("detect-silent-published-work.sh must leave suspended rigs out of its rig enumeration; a read of a suspended rig restarts its retired proxy (#7115)")
+	}
+
 	// An UNKNOWN read must CARRY the prior observation forward. Dropping it
 	// restarts that bead's clock next sweep, so a flapping API would hold a real
 	// stall permanently below threshold.
