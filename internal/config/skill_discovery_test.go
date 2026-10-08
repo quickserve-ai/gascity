@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -145,5 +146,37 @@ func TestValidateOptInSkills_ResolvesNamesInTheAgentScope(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestValidateOptInSkills_UnreadableRootFailsOnlyTheNamesItHides(t *testing.T) {
+	dir := t.TempDir()
+	fleetSkills := filepath.Join(dir, "fleet", "skills")
+	opsSkills := filepath.Join(dir, "ops", "skills")
+	writeTestFile(t, fleetSkills, "opt-in/login/SKILL.md", "fleet opt-in")
+	writeTestFile(t, opsSkills, "opt-in/audit/SKILL.md", "ops opt-in")
+	locked := filepath.Join(opsSkills, OptInSkillsDir)
+	if err := os.Chmod(locked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+	if _, err := os.ReadDir(locked); err == nil {
+		t.Skip("directory permissions are not enforced for this user")
+	}
+	cfg := func(names ...string) *City {
+		return &City{
+			PackSkills: []DiscoveredSkillCatalog{
+				{SourceDir: fleetSkills, BindingName: "fleet"},
+				{SourceDir: opsSkills, BindingName: "ops"},
+			},
+			Agents: []Agent{{Name: "mayor", Scope: "city", OptInSkills: names}},
+		}
+	}
+	if err := ValidateOptInSkills(fsys.OSFS{}, cfg("fleet.login")); err != nil {
+		t.Fatalf("a name from a readable root failed: %v", err)
+	}
+	err := ValidateOptInSkills(fsys.OSFS{}, cfg("ops.audit"))
+	if err == nil || !strings.Contains(err.Error(), "could not be read") || !strings.Contains(err.Error(), locked) {
+		t.Fatalf("ValidateOptInSkills = %v, want an error carrying the unreadable root %s", err, locked)
 	}
 }
