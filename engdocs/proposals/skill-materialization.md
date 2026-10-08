@@ -158,8 +158,9 @@ shared entry replaces the shared version for every agent in the sink. Two
 sources for one name in the same class (two agents' agent-local skills, or
 two shared catalogs reaching one sink, as two rigs at one path can) cannot
 both be linked. The collision validator rejects the agent-local case at
-start; otherwise the pass reports the conflict and leaves that sink's
-existing links in place until it is resolved.
+start. A shared clash is settled when an agent-local skill in the sink
+overrides that name; otherwise the pass reports the conflict and leaves
+that sink's existing links in place until it is resolved.
 
 User-declared third-party imports' `skills/` are **not** enumerated in
 v0.15.1 (per the non-goal). The mechanism to include them later is
