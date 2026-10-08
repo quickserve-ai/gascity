@@ -395,6 +395,45 @@ func TestLoadCityCatalogIndexesOptInSkillsApartFromTheDefaultSet(t *testing.T) {
 	}
 }
 
+func TestLoadCityCatalogKeepsTheDefaultSetWhenAnOptInRootIsUnreadable(t *testing.T) {
+	t.Setenv("GC_HOME", "")
+	importedPack := t.TempDir()
+	otherPack := t.TempDir()
+	importedDir := filepath.Join(importedPack, "skills")
+	otherDir := filepath.Join(otherPack, "skills")
+	mkSkill(t, importedDir, "plan")
+	mkSkill(t, filepath.Join(importedDir, config.OptInSkillsDir), "login")
+	mkSkill(t, filepath.Join(otherDir, config.OptInSkillsDir), "audit")
+	locked := filepath.Join(importedDir, config.OptInSkillsDir)
+	if err := os.Chmod(locked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+	if _, err := os.ReadDir(locked); err == nil {
+		t.Skip("directory permissions are not enforced for this user")
+	}
+
+	cat, err := LoadCityCatalog("",
+		config.DiscoveredSkillCatalog{SourceDir: importedDir, BindingName: "ops"},
+		config.DiscoveredSkillCatalog{SourceDir: otherDir, BindingName: "qa"},
+	)
+	if err != nil {
+		t.Fatalf("LoadCityCatalog failed on an unreadable opt-in root: %v", err)
+	}
+	if got := namesOfEntries(cat.Entries); !reflect.DeepEqual(got, []string{"ops.plan"}) {
+		t.Fatalf("default entries = %v, want [ops.plan]", got)
+	}
+	if got := namesOfEntries(cat.OptIn); !reflect.DeepEqual(got, []string{"qa.audit"}) {
+		t.Fatalf("opt-in index = %v, want the readable root's qa.audit only", got)
+	}
+	if len(cat.OptInWarnings) != 1 || !strings.Contains(cat.OptInWarnings[0], locked) {
+		t.Fatalf("OptInWarnings = %v, want one naming %s", cat.OptInWarnings, locked)
+	}
+	if len(cat.OwnedRoots) != 2 {
+		t.Fatalf("OwnedRoots = %v, want both skills roots", cat.OwnedRoots)
+	}
+}
+
 func TestCityCatalogWithOptInAddsOnlyTheSelectedSkills(t *testing.T) {
 	cat := CityCatalog{
 		Entries: []SkillEntry{{Name: "ops.plan", Source: "/ops/skills/plan", Origin: "ops"}},

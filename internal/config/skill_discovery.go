@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -104,20 +105,27 @@ type OptInSkill struct {
 // in the precedence the shared catalog uses: the city pack, then catalogs
 // in order. A directory counts as a skill when it holds a SKILL.md, as in
 // the shared catalog. The result is sorted by Name.
+//
+// An opt-in root that cannot be read does not stop discovery: the skills
+// of every readable root are returned, with an error that joins one error
+// per unreadable root. The opt-in index is optional, so a caller building
+// the default catalog reports the error and keeps going.
 func DiscoverOptInSkills(fs fsys.FS, packSkillsDir string, catalogs []DiscoveredSkillCatalog) ([]OptInSkill, error) {
 	var out []OptInSkill
+	var errs []error
 	seen := make(map[string]bool)
-	add := func(skillsRoot, binding, origin string) error {
+	add := func(skillsRoot, binding, origin string) {
 		root := filepath.Join(skillsRoot, OptInSkillsDir)
 		entries, err := fs.ReadDir(root)
 		if err != nil {
 			if os.IsNotExist(err) {
-				return nil
+				return
 			}
 			if info, statErr := fs.Stat(root); statErr == nil && !info.IsDir() {
-				return nil
+				return
 			}
-			return fmt.Errorf("reading opt-in skills %q: %w", root, err)
+			errs = append(errs, fmt.Errorf("reading opt-in skills %q: %w", root, err))
+			return
 		}
 		for _, e := range entries {
 			if !e.IsDir() {
@@ -137,12 +145,9 @@ func DiscoverOptInSkills(fs fsys.FS, packSkillsDir string, catalogs []Discovered
 			seen[name] = true
 			out = append(out, OptInSkill{Name: name, Dir: dir, Origin: origin})
 		}
-		return nil
 	}
 	if packSkillsDir != "" {
-		if err := add(packSkillsDir, "", "city"); err != nil {
-			return nil, err
-		}
+		add(packSkillsDir, "", "city")
 	}
 	for _, catalog := range catalogs {
 		binding := strings.TrimSpace(catalog.BindingName)
@@ -153,27 +158,24 @@ func DiscoverOptInSkills(fs fsys.FS, packSkillsDir string, catalogs []Discovered
 		if origin == "" {
 			origin = "import"
 		}
-		if err := add(catalog.SourceDir, binding, origin); err != nil {
-			return nil, err
-		}
+		add(catalog.SourceDir, binding, origin)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	return out, nil
+	return out, errors.Join(errs...)
 }
 
 // AgentOptInSkills resolves agent's opt_in_skills against the opt-in skills
 // in its scope, returning the selected skills in name order with
 // duplicates dropped. A name that resolves to no opt-in skill is skipped;
-// ValidateOptInSkills rejects such a config at load.
+// ValidateOptInSkills rejects such a config at load. An unreadable opt-in
+// root returns the skills resolved from the readable ones with the read
+// error (DiscoverOptInSkills).
 func AgentOptInSkills(fs fsys.FS, cfg *City, agent *Agent) ([]OptInSkill, error) {
 	if cfg == nil || agent == nil || len(agent.OptInSkills) == 0 {
 		return nil, nil
 	}
 	available, err := DiscoverOptInSkills(fs, cfg.PackSkillsDir, cfg.SharedSkillCatalogs(SkillRigScope(agent, cfg.Rigs)))
-	if err != nil {
-		return nil, err
-	}
-	return selectOptInSkills(available, agent.OptInSkills), nil
+	return selectOptInSkills(available, agent.OptInSkills), err
 }
 
 func selectOptInSkills(available []OptInSkill, names []string) []OptInSkill {
@@ -200,6 +202,7 @@ func ValidateOptInSkills(fs fsys.FS, cfg *City) error {
 		return nil
 	}
 	byScope := make(map[string][]OptInSkill)
+	readErr := make(map[string]error)
 	loaded := make(map[string]bool)
 	for i := range cfg.Agents {
 		a := &cfg.Agents[i]
@@ -209,10 +212,8 @@ func ValidateOptInSkills(fs fsys.FS, cfg *City) error {
 		scope := SkillRigScope(a, cfg.Rigs)
 		if !loaded[scope] {
 			available, err := DiscoverOptInSkills(fs, cfg.PackSkillsDir, cfg.SharedSkillCatalogs(scope))
-			if err != nil {
-				return fmt.Errorf("agent %q: opt_in_skills: %w", a.QualifiedName(), err)
-			}
 			byScope[scope] = available
+			readErr[scope] = err
 			loaded[scope] = true
 		}
 		known := make(map[string]bool, len(byScope[scope]))
@@ -223,8 +224,12 @@ func ValidateOptInSkills(fs fsys.FS, cfg *City) error {
 			if known[strings.TrimSpace(name)] {
 				continue
 			}
-			return fmt.Errorf("agent %q: opt_in_skills names %q, which is not an opt-in skill in this agent's scope (a pack's skills/%s/<name>/SKILL.md, named <binding>.<name>); available: %s",
+			err := fmt.Errorf("agent %q: opt_in_skills names %q, which is not an opt-in skill in this agent's scope (a pack's skills/%s/<name>/SKILL.md, named <binding>.<name>); available: %s",
 				a.QualifiedName(), name, OptInSkillsDir, describeOptInSkills(byScope[scope]))
+			if readErr[scope] != nil {
+				return fmt.Errorf("%w; some opt-in skills could not be read: %w", err, readErr[scope])
+			}
+			return err
 		}
 	}
 	return nil

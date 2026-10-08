@@ -77,9 +77,13 @@ func runStage1SkillMaterialization(cityPath string, cfg *config.City, stderr io.
 				cat.Entries = nil
 				cat.Shadowed = nil
 				cat.OptIn = nil
+				cat.OptInWarnings = nil
 			}
 			catalogs[rigName] = cat
 			return catalogs[rigName]
+		}
+		for _, w := range cat.OptInWarnings {
+			fmt.Fprintf(stderr, "gc: stage-1 materialize-skills: %s; opt-in skills from it are not delivered, default skills are unaffected\n", w) //nolint:errcheck // best-effort stderr
 		}
 		catalogs[rigName] = cat
 		return cat
