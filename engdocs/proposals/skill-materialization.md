@@ -306,10 +306,13 @@ an agent asks for it by name.
 skill. The default catalog (`readSkillDir`) and `gc skill list` read only
 `skills/<name>/SKILL.md`. The `opt-in/` directory holds no `SKILL.md` of its
 own, so it never becomes a default skill, and `opt-in` is a reserved name
-under `skills/`. An opt-in
-skill is named the way a default skill is: `<binding>.<name>` for an
-imported pack, `<name>` for the city pack. When a pack ships one name both
-ways, the default wins and the catalog records the opt-in copy as shadowed.
+under `skills/`: a `SKILL.md` placed directly in `skills/opt-in/` would make
+the directory a default skill every agent gets, and config load warns about
+it. An opt-in skill is named the way a default skill is: `<binding>.<name>`
+for an imported pack, `<name>` for the city pack. When a pack ships one name
+both ways, the default wins: the catalog records the opt-in copy as shadowed,
+and an agent that selects that name fails config load, with both
+directories named, rather than silently getting the default.
 
 **Seat side.** An agent selects opt-in skills with `opt_in_skills`:
 
