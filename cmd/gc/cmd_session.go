@@ -1947,9 +1947,10 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 	}
 	// SURGICAL route: the session-class consumers (session-ID resolution, session
 	// worker handle, session bead read) go through the session coordination-class
-	// store for relocation-safety; the post-close work-release below
-	// (unclaimWorkAssignedToRetiredSessionBead) is WORK-class and stays on the
-	// generic store.
+	// store for relocation-safety. The post-close work-release below
+	// (unclaimWorkAssignedToRetiredSessionBeadVia) releases WORK-class beads
+	// through the generic store and clears the session bead's claim back-channel
+	// in sessStore.
 	sessStore := cliSessionStore(store, cfg, cityPath)
 	sessionID, err := resolveSessionIDWithConfig(cityPath, cfg, sessStore, args[0])
 	if err != nil {
@@ -2042,6 +2043,10 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 	if cityErr == nil && cfg != nil {
 		rigStores = buildStandaloneRigStoresWithConfig(cfg, cityPath, stderr)
 	}
+	// The session bead lives in the sessions-class store (sessStore), which on a
+	// split city is not the work store the sweep leads with; the claim
+	// back-channel must be cleared where the session bead actually is (upstream
+	// #6565), on both branches of the ga-sdynmb guard below.
 	// ga-sdynmb: cfg is what makes this close non-destructive for CREW. A provider
 	// flip or config-drift roll runs `gc session close <agent>` (city.toml documents
 	// it as the required move -- `reset` does not re-resolve the provider), and this
@@ -2128,9 +2133,9 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 			"under a name — a configured named identity cannot be distinguished from a "+
 			"retired one without the config. Re-run once the config loads.\n",
 			cfgErrOrUnknown(cfgErr), closedSessionBead.ID)
-		unclaimWorkAssignedToRetiredSessionBead(cityPath, nil, store, rigStores, idOnly, "", stderr)
+		unclaimWorkAssignedToRetiredSessionBeadVia(cityPath, nil, store, sessStore, rigStores, idOnly, "", stderr)
 	} else {
-		unclaimWorkAssignedToRetiredSessionBead(cityPath, cfg, store, rigStores, closedSessionBead, "", stderr)
+		unclaimWorkAssignedToRetiredSessionBeadVia(cityPath, cfg, store, sessStore, rigStores, closedSessionBead, "", stderr)
 	}
 
 	if asJSON {

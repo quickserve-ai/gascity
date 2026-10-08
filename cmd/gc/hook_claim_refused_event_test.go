@@ -423,13 +423,13 @@ func TestHookCommandClaimNonRefusalsRecordNoRefusedEvent(t *testing.T) {
 			queryMarker := tc.setup(t, cityDir)
 
 			var verdicts []hookClaimSessionVerdict
-			realClassify := hookClaimClassifySession
-			hookClaimClassifySession = func(cityPath string, cfg *config.City, sessionID, instanceToken string) (hookClaimSessionVerdict, string, hookClaimStaleDetail) {
-				verdict, reason, detail := realClassify(cityPath, cfg, sessionID, instanceToken)
+			realClassify := hookClaimClassifySessionInfo
+			hookClaimClassifySessionInfo = func(cityPath string, cfg *config.City, sessionID, instanceToken string) (hookClaimSessionVerdict, string, hookClaimStaleDetail, *session.Info) {
+				verdict, reason, detail, info := realClassify(cityPath, cfg, sessionID, instanceToken)
 				verdicts = append(verdicts, verdict)
-				return verdict, reason, detail
+				return verdict, reason, detail, info
 			}
-			t.Cleanup(func() { hookClaimClassifySession = realClassify })
+			t.Cleanup(func() { hookClaimClassifySessionInfo = realClassify })
 
 			var stdout, stderr bytes.Buffer
 			_ = cmdHookWithOptions(nil, hookCommandOptions{Claim: true, JSON: true}, &stdout, &stderr)
