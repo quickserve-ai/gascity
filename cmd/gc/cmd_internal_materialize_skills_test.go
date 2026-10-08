@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/materialize"
 )
 
@@ -906,5 +907,68 @@ func TestInternalMaterializeSkillsNonBestEffortFailsOnLoadCityConfigError(t *tes
 	var so, se bytes.Buffer
 	if code := run([]string{"internal", "materialize-skills", "--agent", "some-agent", "--workdir", t.TempDir()}, &so, &se); code == 0 {
 		t.Fatalf("missing city.toml without --best-effort: got exit 0, want non-zero; stderr=%q", se.String())
+	}
+}
+
+// TestMaterializeSkillsIntoWorkdirSelectsOptInsFromTheSnapshot: the shared
+// catalog snapshot staged for a session carries the scope's opt-in index,
+// and the per-session pass delivers only the opt-ins the agent selects. A
+// snapshot staged by an older gc has no index and delivers none.
+func TestMaterializeSkillsIntoWorkdirSelectsOptInsFromTheSnapshot(t *testing.T) {
+	clearGCEnv(t)
+	cityPath := t.TempDir()
+	t.Setenv("GC_HOME", t.TempDir())
+	fleetSkills := filepath.Join(t.TempDir(), "fleet", "skills")
+	writeSkillSource(t, filepath.Join(fleetSkills, "status"))
+	writeSkillSource(t, filepath.Join(fleetSkills, config.OptInSkillsDir, "login"))
+	cfg := &config.City{
+		PackSkills: []config.DiscoveredSkillCatalog{{SourceDir: fleetSkills, BindingName: "fleet"}},
+		Agents: []config.Agent{
+			{Name: "rotator", Scope: "city", Provider: "claude", OptInSkills: []string{"fleet.login"}},
+			{Name: "crew", Scope: "city", Provider: "claude"},
+		},
+	}
+	live, err := loadSharedSkillCatalog(cfg, "")
+	if err != nil {
+		t.Fatalf("loadSharedSkillCatalog: %v", err)
+	}
+	encoded, err := encodeSharedCatalogSnapshot(live)
+	if err != nil {
+		t.Fatalf("encodeSharedCatalogSnapshot: %v", err)
+	}
+	snapshot, err := decodeSharedCatalogSnapshot(encoded)
+	if err != nil {
+		t.Fatalf("decodeSharedCatalogSnapshot: %v", err)
+	}
+	legacy := snapshot
+	legacy.OptIn = nil
+
+	tests := []struct {
+		name      string
+		agent     *config.Agent
+		catalog   materialize.CityCatalog
+		wantLogin bool
+	}{
+		{name: "opted-in agent", agent: &cfg.Agents[0], catalog: snapshot, wantLogin: true},
+		{name: "agent that did not opt in", agent: &cfg.Agents[1], catalog: snapshot},
+		{name: "snapshot without the opt-in index", agent: &cfg.Agents[0], catalog: legacy},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			workdir := t.TempDir()
+			catalog := tt.catalog
+			var stdout, stderr bytes.Buffer
+			if err := materializeSkillsIntoWorkdir(cfg, tt.agent, cityPath, workdir, &catalog, &stdout, &stderr); err != nil {
+				t.Fatalf("materializeSkillsIntoWorkdir: %v; stderr=%q", err, stderr.String())
+			}
+			sink := filepath.Join(workdir, ".claude", "skills")
+			if _, err := os.Lstat(filepath.Join(sink, "fleet.status")); err != nil {
+				t.Errorf("shared fleet.status missing: %v", err)
+			}
+			_, err := os.Lstat(filepath.Join(sink, "fleet.login"))
+			if got := err == nil; got != tt.wantLogin {
+				t.Errorf("fleet.login present = %v, want %v (lstat err=%v)", got, tt.wantLogin, err)
+			}
+		})
 	}
 }
