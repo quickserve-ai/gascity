@@ -1111,24 +1111,10 @@ func directSessionBeadIDCandidates(assignee string) []string {
 	return candidates
 }
 
-// liveWorkAssignmentStillReleasable confirms the snapshot is not stale before
-// clearing assignee, collapsing a read failure to "not releasable" for callers
-// that have no error channel. Open status is required for the issue #2793 path —
-// graph.v2 step beads stuck on a dead session's long-form assignee are
-// status=open, not in_progress.
-//
-// The check itself lives in liveWorkAssignmentAssigneeMatches (work_assignment.go).
-func liveWorkAssignmentStillReleasable(store beads.Store, id, expectedStatus, assignee string) bool {
-	matches, err := liveWorkAssignmentAssigneeMatches(store, id, expectedStatus, assignee)
-	if err != nil {
-		log.Printf("releaseOrphanedPoolAssignments: live work validation failed for %q: %v", id, err)
-		return false
-	}
-	return matches
-}
-
-// liveWorkRowStillReleasable is liveWorkAssignmentStillReleasable for the two
-// sweep decision sites (ga-91tu1o). Both choose their guards from the cached
+// liveWorkRowStillReleasable is the pre-release staleness check for the two
+// sweep decision sites (ga-91tu1o): the live row must still hold the
+// snapshot's status and assignee, and a read failure counts as "not
+// releasable". Both sites choose their guards from the cached
 // assigned-work snapshot: the routed template picks the named- and
 // ephemeral-session guards and the rig gate, the canonical-root shape exempts
 // workflow roots, the gc.detached spec decides whether a probe runs, and

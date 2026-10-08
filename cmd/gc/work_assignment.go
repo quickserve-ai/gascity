@@ -452,9 +452,10 @@ func releaseWorkAssignmentIfCurrent(store beads.Store, item beads.Bead) (release
 }
 
 // liveWorkAssignmentAssigneeMatches reports whether a WORK bead still carries the
-// (status, assignee) pair a caller's earlier snapshot recorded. The pool path in
-// pool_session_name.go uses it as its pre-write staleness check; the work path
-// here fences its writes instead (releaseAssignmentFenced).
+// (status, assignee) pair a caller's earlier snapshot recorded. The named-session
+// release guard (named_release_guard.go) uses it as its pre-write staleness
+// check; the pool sweep reads the whole row (liveWorkRowStillReleasable), and
+// the work path here fences its writes instead (releaseAssignmentFenced).
 //
 // It uses a LIVE list query, not Get, and that choice is load-bearing:
 // CachingStore.Get serves a clone straight from the in-memory cache for a bead
