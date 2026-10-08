@@ -195,8 +195,12 @@ func selectOptInSkills(available []OptInSkill, names []string) []OptInSkill {
 // ValidateOptInSkills checks that every name in every agent's opt_in_skills
 // resolves to an opt-in skill in that agent's scope. An unknown name is a
 // config error naming the agent, the key, the name and the opt-in skills the
-// agent could select. It runs once composition, patches and rig overrides
-// have settled each agent's list.
+// agent could select. So is a name a default skill in scope also has: the
+// sink holds one link per name and the default wins, so the selection would
+// silently deliver the default; the error names both directories. (Legacy
+// compatibility bootstrap packs are not consulted; the catalog still records
+// such a shadow.) It runs once composition, patches and rig overrides have
+// settled each agent's list.
 func ValidateOptInSkills(fs fsys.FS, cfg *City) error {
 	if cfg == nil {
 		return nil
@@ -216,12 +220,16 @@ func ValidateOptInSkills(fs fsys.FS, cfg *City) error {
 			readErr[scope] = err
 			loaded[scope] = true
 		}
-		known := make(map[string]bool, len(byScope[scope]))
+		known := make(map[string]OptInSkill, len(byScope[scope]))
 		for _, s := range byScope[scope] {
-			known[s.Name] = true
+			known[s.Name] = s
 		}
 		for _, name := range a.OptInSkills {
-			if known[strings.TrimSpace(name)] {
+			if s, ok := known[strings.TrimSpace(name)]; ok {
+				if dir, shadowed := defaultSkillDir(fs, cfg.PackSkillsDir, cfg.SharedSkillCatalogs(scope), s.Name); shadowed {
+					return fmt.Errorf("agent %q: opt_in_skills names %q, but the default skill %s has the same name and every agent in scope gets it instead of the opt-in skill %s; rename one of them",
+						a.QualifiedName(), name, dir, s.Dir)
+				}
 				continue
 			}
 			err := fmt.Errorf("agent %q: opt_in_skills names %q, which is not an opt-in skill in this agent's scope (a pack's skills/%s/<name>/SKILL.md, named <binding>.<name>); available: %s",
@@ -244,4 +252,94 @@ func describeOptInSkills(skills []OptInSkill) string {
 		names[i] = s.Name
 	}
 	return strings.Join(names, ", ")
+}
+
+// defaultSkillDir returns the directory of the default skill named name in
+// the scope of packSkillsDir and catalogs, mapping names as the shared
+// catalog does: "<leaf>" in the city pack's skills root, "<binding>.<leaf>"
+// in a bound catalog, "<leaf>" in an unbound one.
+func defaultSkillDir(fs fsys.FS, packSkillsDir string, catalogs []DiscoveredSkillCatalog, name string) (string, bool) {
+	if packSkillsDir != "" {
+		if dir, ok := skillDirAt(fs, packSkillsDir, name); ok {
+			return dir, true
+		}
+	}
+	for _, c := range catalogs {
+		leaf := name
+		if binding := strings.TrimSpace(c.BindingName); binding != "" {
+			var found bool
+			if leaf, found = strings.CutPrefix(name, binding+"."); !found {
+				continue
+			}
+		}
+		if dir, ok := skillDirAt(fs, c.SourceDir, leaf); ok {
+			return dir, true
+		}
+	}
+	return "", false
+}
+
+// skillDirAt reports whether root/leaf is a skill as the shared catalog
+// reads one: a directory entry (not a symlink to one) holding SKILL.md.
+func skillDirAt(fs fsys.FS, root, leaf string) (string, bool) {
+	if leaf == "" || strings.ContainsRune(leaf, filepath.Separator) {
+		return "", false
+	}
+	dir := filepath.Join(root, leaf)
+	info, err := fs.Lstat(dir)
+	if err != nil || !info.IsDir() {
+		return "", false
+	}
+	if _, err := fs.Stat(filepath.Join(dir, "SKILL.md")); err != nil {
+		return "", false
+	}
+	return dir, true
+}
+
+// OptInLayoutWarnings reports skills roots whose reserved opt-in/
+// directory itself holds a SKILL.md. The default catalog then treats the
+// directory as one default skill named "<binding>.opt-in" (or "opt-in" in
+// the city pack) and delivers it to every agent, which is not what a pack
+// putting skills under opt-in/ means.
+func OptInLayoutWarnings(fs fsys.FS, cfg *City) []string {
+	if cfg == nil {
+		return nil
+	}
+	type root struct{ dir, binding string }
+	roots := []root{}
+	if cfg.PackSkillsDir != "" {
+		roots = append(roots, root{dir: cfg.PackSkillsDir})
+	}
+	add := func(catalogs []DiscoveredSkillCatalog) {
+		for _, c := range catalogs {
+			roots = append(roots, root{dir: c.SourceDir, binding: strings.TrimSpace(c.BindingName)})
+		}
+	}
+	add(cfg.PackSkills)
+	rigNames := make([]string, 0, len(cfg.RigPackSkills))
+	for name := range cfg.RigPackSkills {
+		rigNames = append(rigNames, name)
+	}
+	sort.Strings(rigNames)
+	for _, name := range rigNames {
+		add(cfg.RigPackSkills[name])
+	}
+	var out []string
+	seen := make(map[root]bool)
+	for _, r := range roots {
+		if seen[r] {
+			continue
+		}
+		seen[r] = true
+		if _, ok := skillDirAt(fs, r.dir, OptInSkillsDir); !ok {
+			continue
+		}
+		name := OptInSkillsDir
+		if r.binding != "" {
+			name = r.binding + "." + name
+		}
+		out = append(out, fmt.Sprintf("%s: skills/%s/ is reserved for opt-in skills, but this SKILL.md makes it a default skill %q that every agent in scope receives; move it to skills/%s/<name>/SKILL.md",
+			filepath.Join(r.dir, OptInSkillsDir, "SKILL.md"), OptInSkillsDir, name, OptInSkillsDir))
+	}
+	return out
 }
