@@ -1166,6 +1166,46 @@ func TestApplyPatches_AppendAlone(t *testing.T) {
 	}
 }
 
+func TestApplyPatches_OptInSkills(t *testing.T) {
+	tests := []struct {
+		name  string
+		patch AgentPatch
+		want  []string
+	}{
+		{
+			name:  "append keeps the agent's own selection",
+			patch: AgentPatch{Name: "mayor", OptInSkillsAppend: []string{"fleet.rebalance"}},
+			want:  []string{"fleet.login", "fleet.rebalance"},
+		},
+		{
+			name:  "replace then append",
+			patch: AgentPatch{Name: "mayor", OptInSkills: Fragments("ops.audit"), OptInSkillsAppend: []string{"fleet.rebalance"}},
+			want:  []string{"ops.audit", "fleet.rebalance"},
+		},
+		{
+			name:  "empty list clears the selection",
+			patch: AgentPatch{Name: "mayor", OptInSkills: Fragments()},
+			want:  []string{},
+		},
+		{
+			name:  "unset leaves the selection alone",
+			patch: AgentPatch{Name: "mayor"},
+			want:  []string{"fleet.login"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &City{Agents: []Agent{{Name: "mayor", OptInSkills: []string{"fleet.login"}}}}
+			if err := ApplyPatches(cfg, Patches{Agents: []AgentPatch{tt.patch}}); err != nil {
+				t.Fatalf("ApplyPatches: %v", err)
+			}
+			if got := cfg.Agents[0].OptInSkills; !sliceEqual(got, tt.want) {
+				t.Errorf("OptInSkills = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestApplyPatches_ReplacePlusAppend(t *testing.T) {
 	cfg := &City{
 		Agents: []Agent{{
