@@ -611,6 +611,47 @@ func TestRunStage1AgentLocalOnlyInItsOwnSink(t *testing.T) {
 	}
 }
 
+// TestRunStage1SharedSinkKeepsAgentLocalSkill covers two agents that share
+// one sink: same scope root (the city) and same provider family, so both
+// materialize into <city>/.claude/skills. Only mayor has an agent-local
+// skill. Each agent's pass records what it writes in the sink's ownership
+// manifest, and a later agent's pass reads the manifest, treats mayor's
+// link as its own, finds it undesired, and removes it. The pass runs per
+// agent, not per sink, so whichever agent comes later in cfg.Agents decides
+// what the shared sink holds. mayor's agent-local skill must survive.
+func TestRunStage1SharedSinkKeepsAgentLocalSkill(t *testing.T) {
+	clearGCEnv(t)
+	cityPath := t.TempDir()
+	t.Setenv("GC_HOME", t.TempDir())
+
+	// A shared skill keeps deputy's pass from being skipped as empty.
+	writeSkillSource(t, filepath.Join(cityPath, "skills", "plan"))
+	mayorSkills := filepath.Join(cityPath, "agents", "mayor", "skills")
+	writeSkillSource(t, filepath.Join(mayorSkills, "a-only"))
+
+	cfg := &config.City{
+		PackSkillsDir: filepath.Join(cityPath, "skills"),
+		Session:       config.SessionConfig{Provider: "tmux"},
+		Agents: []config.Agent{
+			{Name: "mayor", Scope: "city", Provider: "claude", SkillsDir: mayorSkills},
+			{Name: "deputy", Scope: "city", Provider: "claude"},
+		},
+	}
+
+	var stderr bytes.Buffer
+	if err := runStage1SkillMaterialization(cityPath, cfg, &stderr); err != nil {
+		t.Fatal(err)
+	}
+
+	sink := filepath.Join(cityPath, ".claude", "skills")
+	if _, err := os.Lstat(filepath.Join(sink, "plan")); err != nil {
+		t.Fatalf("shared skill plan missing from shared sink: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(sink, "a-only")); err != nil {
+		t.Errorf("mayor's agent-local skill a-only removed from the sink it shares with deputy: %v; stderr=%q", err, stderr.String())
+	}
+}
+
 // TestRunStage1RenameSkillLifecycle confirms that renaming a skill
 // (delete old, add new name with same content) correctly cleans up
 // the old symlink and creates the new one in a single tick. This is

@@ -6330,6 +6330,86 @@ func TestCityRuntimeReloadMaterializesNewlyAddedSkill(t *testing.T) {
 	}
 }
 
+// TestCityRuntimeReloadKeepsAgentLocalSkillInSharedSink is the live-reload
+// form of TestRunStage1SharedSinkKeepsAgentLocalSkill. mayor and deputy are
+// both city-scoped claude agents, so they share <city>/.claude/skills; only
+// mayor has an agent-local skill. The skill is in the sink before the
+// reload (mayor's own materialize-skills pass put it there). An applied
+// reload then runs stage-1 materialization for every configured agent in
+// turn, and deputy's pass removes mayor's link because the sink's ownership
+// manifest records it as gc-written. Ordinary ticks never run stage-1, so
+// in a running city the skill disappears at the first config change that
+// moves the revision.
+func TestCityRuntimeReloadKeepsAgentLocalSkillInSharedSink(t *testing.T) {
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	clearInheritedBeadsEnv(t)
+	requireNoLeakedDoltAfterForPaths(t, cityPath)
+	deputy := "[[agent]]\nname = \"deputy\"\nscope = \"city\"\nprovider = \"claude\"\n\n"
+	writeSkillMaterializationTestConfig(t, tomlPath, deputy)
+	// A shared skill keeps deputy's pass from being skipped as empty; a
+	// live city's sink always has shared skills.
+	writeSkillSource(t, filepath.Join(cityPath, "skills", "plan"))
+	writeSkillSource(t, filepath.Join(cityPath, "agents", "mayor", "skills", "a-only"))
+
+	cfg, configRev := loadCityRuntimeControllerConfig(t, cityPath)
+
+	var mayor *config.Agent
+	for i := range cfg.Agents {
+		if cfg.Agents[i].Name == "mayor" && cfg.Agents[i].Dir == "" {
+			mayor = &cfg.Agents[i]
+			break
+		}
+	}
+	if mayor == nil {
+		t.Fatal("mayor agent missing from loaded config")
+	}
+	var seedOut, seedErr bytes.Buffer
+	if err := materializeSkillsIntoWorkdir(cfg, mayor, cityPath, cityPath, nil, &seedOut, &seedErr); err != nil {
+		t.Fatalf("seed mayor's sink: %v; stderr=%q", err, seedErr.String())
+	}
+	link := filepath.Join(cityPath, ".claude", "skills", "a-only")
+	if _, err := os.Lstat(link); err != nil {
+		t.Fatalf("precondition: a-only not in the sink before reload: %v; stdout=%q", err, seedOut.String())
+	}
+
+	sp := runtime.NewFake()
+	dirty := &atomic.Bool{}
+	pokeCh := make(chan struct{}, 8)
+	var stdout, stderr bytes.Buffer
+	cr := newTestCityRuntime(t, CityRuntimeParams{
+		CityPath:     cityPath,
+		CityName:     "test-city",
+		TomlPath:     tomlPath,
+		WatchTargets: config.WatchTargets(nil, cfg, cityPath),
+		ConfigRev:    configRev,
+		ConfigDirty:  dirty,
+		Cfg:          cfg,
+		SP:           sp,
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		Dops:   newDrainOps(sp),
+		Rec:    events.Discard,
+		PokeCh: pokeCh,
+		Stdout: &stdout,
+		Stderr: &stderr,
+	})
+
+	// A live-reloadable edit that moves the revision, so the reload takes
+	// the applied branch rather than the same-revision no-op.
+	writeSkillMaterializationTestConfig(t, tomlPath, deputy, "[orders]\nskip = [\"reaper\"]\n")
+
+	lastProviderName := "tmux"
+	reply := cr.reloadConfigTraced(context.Background(), &lastProviderName, cityPath, nil, reloadSourceWatch)
+	if reply.Outcome != reloadOutcomeApplied {
+		t.Fatalf("reload outcome = %q, want %q; stderr=%q", reply.Outcome, reloadOutcomeApplied, stderr.String())
+	}
+	if _, err := os.Lstat(link); err != nil {
+		t.Errorf("mayor's agent-local skill a-only removed by the reload: %v; stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+	}
+}
+
 // TestCityRuntimeReloadRejectsCollidingSkillMaterialization guards the
 // collision gate the reload path shares with `gc start` and the
 // supervisor tick (checkSkillCollisions before materialize). Two
