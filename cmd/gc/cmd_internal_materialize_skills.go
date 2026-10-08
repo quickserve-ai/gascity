@@ -199,11 +199,18 @@ func materializeSkillsIntoWorkdir(cfg *config.City, agent *config.Agent, cityPat
 			cat.Entries = nil
 			cat.Shadowed = nil
 			cat.OptIn = nil
+			cat.OptInWarnings = nil
 		}
 		cityCat = cat
 	}
 	// The snapshot and the live catalog carry the scope's opt-in index;
-	// the agent's own opt_in_skills selects from it.
+	// the agent's own opt_in_skills selects from it. An unreadable opt-in
+	// root matters here only to an agent that selects opt-in skills.
+	if len(agent.OptInSkills) > 0 {
+		for _, w := range cityCat.OptInWarnings {
+			fmt.Fprintf(stderr, "gc internal materialize-skills: %s; opt-in skills from it are not delivered\n", w) //nolint:errcheck // best-effort stderr
+		}
+	}
 	cityCat = cityCat.WithOptIn(agent.OptInSkills)
 
 	agentCat, err := materialize.LoadAgentCatalog(agent.SkillsDir)
