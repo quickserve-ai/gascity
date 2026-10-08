@@ -409,7 +409,7 @@ func (w *legacyWorld) tick(t *testing.T, reconcile bool) {
 		return
 	}
 	open := updated.OpenInfos()
-	work := filterAssignedWorkBeadsForPoolDemand(cfg, w.cityPath, w.store, open, result.AssignedWorkBeads, result.AssignedWorkStoreRefs)
+	work := filterAssignedWorkBeadsForPoolDemand(cfg, w.cityPath, w.store, open, result.AssignedWorkBeads, result.AssignedWorkStoreRefs, result.PoolWakeReadiness)
 	poolDesired := retainScaleCheckPartialPoolDesired(cfg, PoolDesiredCounts(ComputePoolDesiredStatesAt(cfg, work, open, result.ScaleCheckCounts, now)),
 		updated, effectivePoolPartialRetentionTemplates(result))
 	if poolDesired == nil {
