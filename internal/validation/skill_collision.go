@@ -51,15 +51,29 @@ type SkillCollision struct {
 	OptIn bool
 }
 
-// ValidateSkillCollisions groups agents by (scope-root, resolved sink),
-// builds the multi-map skill-name → [agent-names] over each agent's
-// agent-local skills and opted-in skills, and returns one SkillCollision
-// entry per name that two or more agents provide as agent-local skills,
-// or that resolves to two or more source directories. Two agents opting
-// in to the same skill share one source and do not collide. An agent's
-// own agent-local skill overrides its opt-in of the same name, as it
-// overrides a shared skill. Returns nil when there are no collisions.
-// The sink comes from
+// OptInAtScopeRoot reports whether stage 1 writes an agent's opted-in
+// skills into its scope-root sink. An agent with its own work_dir gets
+// them in that work_dir from the per-session pass instead, where only its
+// own skills are wanted, so they cannot collide with another agent's.
+type OptInAtScopeRoot func(agent *config.Agent) bool
+
+// ValidateSkillCollisions checks agent-local skills only: two agents
+// providing one agent-local skill name into the same sink collide. It is
+// ValidateSkillCollisionsWithOptIn without opt-in skills.
+func ValidateSkillCollisions(cfg *config.City) []SkillCollision {
+	return ValidateSkillCollisionsWithOptIn(cfg, nil)
+}
+
+// ValidateSkillCollisionsWithOptIn groups agents by (scope-root, resolved
+// sink), builds the multi-map skill-name → [agent-names] over each agent's
+// agent-local skills and, where atScopeRoot places them in that sink, its
+// opted-in skills, and returns one SkillCollision entry per name that two
+// or more agents provide as agent-local skills, or that resolves to two or
+// more source directories. Two agents opting in to the same skill share
+// one source and do not collide. An agent's own agent-local skill
+// overrides its opt-in of the same name, as it overrides a shared skill.
+// A nil atScopeRoot counts no opt-in skills. Returns nil when there are no
+// collisions. The sink comes from
 // materialize.VendorSink, so this gate stays in step with what the
 // materializer actually writes — including providers that share a sink.
 //
@@ -76,7 +90,7 @@ type SkillCollision struct {
 //
 // Collisions are returned sorted by (ScopeRoot, Vendor, SkillName) so
 // tests and user-facing output are stable.
-func ValidateSkillCollisions(cfg *config.City) []SkillCollision {
+func ValidateSkillCollisionsWithOptIn(cfg *config.City, atScopeRoot OptInAtScopeRoot) []SkillCollision {
 	if cfg == nil || len(cfg.Agents) == 0 {
 		return nil
 	}
@@ -119,10 +133,14 @@ func ValidateSkillCollisions(cfg *config.City) []SkillCollision {
 
 		names := listAgentLocalSkills(a.SkillsDir)
 		// Opt-in names resolve against the catalogs in the agent's
-		// scope. An unresolvable name failed config load already, and
-		// a read error leaves the agent's opt-ins out, as a read error
-		// leaves its agent-local skills out above.
-		optIn, _ := config.AgentOptInSkills(fsys.OSFS{}, cfg, a)
+		// scope, and count in this sink only where stage 1 writes them.
+		// An unresolvable name failed config load already, and a read
+		// error leaves the unread opt-ins out, as a read error leaves
+		// agent-local skills out above.
+		var optIn []config.OptInSkill
+		if atScopeRoot != nil && len(a.OptInSkills) > 0 && atScopeRoot(a) {
+			optIn, _ = config.AgentOptInSkills(fsys.OSFS{}, cfg, a)
+		}
 		if len(names) == 0 && len(optIn) == 0 {
 			continue
 		}

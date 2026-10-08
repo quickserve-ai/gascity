@@ -1406,3 +1406,32 @@ func TestRunStage1UnreadableOptInIndexKeepsDefaultSkills(t *testing.T) {
 		t.Errorf("stderr does not report the unreadable opt-in root %s: %q", locked, stderr.String())
 	}
 }
+
+// TestCheckSkillCollisionsPlacesOptInsWhereStage1DeliversThem: a town-level
+// seat with its own work_dir selects a city-pack opt-in whose name matches
+// a city-root agent's agent-local skill. Stage 1 keeps that opt-in out of
+// the city-root sink, so gc start must not refuse the config; the same
+// selection by a seat working at the city root does collide.
+func TestCheckSkillCollisionsPlacesOptInsWhereStage1DeliversThem(t *testing.T) {
+	clearGCEnv(t)
+	cityPath := t.TempDir()
+	citySkills := filepath.Join(cityPath, "skills")
+	writeSkillSource(t, filepath.Join(citySkills, config.OptInSkillsDir, "notes"))
+	supervisorSkills := filepath.Join(cityPath, "agents", "supervisor", "skills")
+	writeSkillSource(t, filepath.Join(supervisorSkills, "notes"))
+	cfg := &config.City{
+		PackSkillsDir: citySkills,
+		Session:       config.SessionConfig{Provider: "tmux"},
+		Agents: []config.Agent{
+			{Name: "katya", Scope: "city", Provider: "claude", WorkDir: ".gc/agents/katya", OptInSkills: []string{"notes"}},
+			{Name: "supervisor", Scope: "city", Provider: "claude", SkillsDir: supervisorSkills},
+		},
+	}
+	if err := checkSkillCollisions(cfg, cityPath); err != nil {
+		t.Fatalf("checkSkillCollisions refused an opt-in delivered to the seat's own work_dir: %v", err)
+	}
+	cfg.Agents[0].WorkDir = ""
+	if err := checkSkillCollisions(cfg, cityPath); err == nil {
+		t.Fatal("checkSkillCollisions accepted an opt-in that stage 1 writes beside another agent's agent-local skill of the same name")
+	}
+}
