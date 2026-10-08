@@ -81,6 +81,88 @@ func TestContextInjectLastUsageEntryWins(t *testing.T) {
 	}
 }
 
+// advisorUsageLine is a usage block for a turn that made several requests.
+// iterations is the raw JSON list; the top-level fields are given separately
+// so a test can make the two disagree.
+func advisorUsageLine(model string, input, cacheRead, cacheCreate int, iterations string) string {
+	return fmt.Sprintf(
+		`{"type":"assistant","message":{"model":%q,"usage":{"input_tokens":%d,"cache_read_input_tokens":%d,"cache_creation_input_tokens":%d,"iterations":%s}}}`,
+		model, input, cacheRead, cacheCreate, iterations)
+}
+
+func messageIteration(input, cacheRead, cacheCreate int) string {
+	return fmt.Sprintf(`{"type":"message","input_tokens":%d,"output_tokens":1,"cache_read_input_tokens":%d,"cache_creation_input_tokens":%d}`,
+		input, cacheRead, cacheCreate)
+}
+
+const advisorIteration = `{"type":"advisor_message","model":"claude-fable-5-1","input_tokens":463500,"output_tokens":3828,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}`
+
+func TestContextInjectAdvisorTurnCountsLastRequest(t *testing.T) {
+	t.Setenv("GC_INJECT_CONTEXT", "")
+	t.Setenv("GC_CONTEXT_ADVISORY_PCT", "")
+	t.Setenv("GC_CONTEXT_URGENT_PCT", "")
+	t.Setenv("GC_CONTEXT_WINDOW_TOKENS", "")
+	// The shape a seat hit on 2026-10-06: the executor asked at 463,141, the
+	// advisor answered, the executor asked again at 464,134. The top-level
+	// fields add the two executor requests: 927,275, "HIGH" on a 1M window at
+	// a true 46%.
+	iterations := "[" + messageIteration(2, 462_546, 593) + "," + advisorIteration + "," + messageIteration(2, 463_141, 991) + "]"
+	p := writeTranscript(t, advisorUsageLine("claude-opus-5-5[1m]", 4, 925_687, 1_584, iterations))
+	if tokens, _, ok := lastTranscriptUsage(p); !ok || tokens != 464_134 {
+		t.Errorf("advisor turn occupancy = %d (ok=%v), want the last executor request 464134", tokens, ok)
+	}
+	if got := contextInjectLine(hookInputFor(p)); got != "" {
+		t.Errorf("46%% of the window must be silent, got %q", got)
+	}
+}
+
+func TestContextInjectIterationsFallBackToTopLevelSum(t *testing.T) {
+	// Every shape that does not prove itself reads the top-level sum, which
+	// can only read high. Reading low would hide a real overflow.
+	const top = 927_275
+	cases := map[string]string{
+		"not a list":                                 `{"a":1}`,
+		"empty list":                                 `[]`,
+		"no message iteration":                       `[` + advisorIteration + `]`,
+		"iterations do not add to top":               `[` + messageIteration(2, 400_000, 0) + `,` + messageIteration(2, 463_141, 991) + `]`,
+		"partial last iteration":                     `[` + messageIteration(2, 927_270, 0) + `,{"type":"message","input_tokens":3}]`,
+		"partial last iteration that is the largest": `[` + messageIteration(2, 400_000, 0) + `,{"type":"message","input_tokens":527273}]`,
+		"null field in an iteration":                 `[` + messageIteration(2, 463_139, 0) + `,{"type":"message","input_tokens":464134,"cache_read_input_tokens":null,"cache_creation_input_tokens":0}]`,
+		"string field":                               `[` + messageIteration(2, 463_139, 0) + `,{"type":"message","input_tokens":"2","cache_read_input_tokens":463141,"cache_creation_input_tokens":991}]`,
+		"negative field":                             `[` + messageIteration(2, 463_142, 0) + `,{"type":"message","input_tokens":-1,"cache_read_input_tokens":463141,"cache_creation_input_tokens":991}]`,
+		"last request smaller than first":            `[` + messageIteration(2, 463_141, 991) + `,` + advisorIteration + `,` + messageIteration(2, 462_546, 593) + `]`,
+		"non-object entries":                         `["x",7,null]`,
+	}
+	for name, iterations := range cases {
+		t.Run(name, func(t *testing.T) {
+			p := writeTranscript(t, advisorUsageLine("claude-opus-5-5[1m]", 4, 925_687, 1_584, iterations))
+			if tokens, _, ok := lastTranscriptUsage(p); !ok || tokens != top {
+				t.Errorf("occupancy = %d (ok=%v), want the top-level sum %d", tokens, ok, top)
+			}
+		})
+	}
+}
+
+func TestContextInjectModelFallbackTurnReadsTopLevel(t *testing.T) {
+	// A turn that fell back to another model lists the first request and the
+	// fallback request, and its top-level fields are the fallback request
+	// alone: the newest request. The iterations do not add up to it, so it is
+	// read as the top level, unchanged by the advisor rule.
+	iterations := "[" + messageIteration(2, 143_868, 0) + `,{"type":"fallback_message","model":"claude-opus-4-8","input_tokens":2,"output_tokens":1,"cache_read_input_tokens":129064,"cache_creation_input_tokens":0}]`
+	p := writeTranscript(t, advisorUsageLine("claude-opus-4-8", 2, 129_064, 0, iterations))
+	if tokens, _, ok := lastTranscriptUsage(p); !ok || tokens != 129_066 {
+		t.Errorf("fallback turn occupancy = %d (ok=%v), want the top level 129066", tokens, ok)
+	}
+}
+
+func TestContextInjectSingleIterationMatchesTopLevel(t *testing.T) {
+	// An ordinary turn may list its one request; it reads the same either way.
+	p := writeTranscript(t, advisorUsageLine("claude-fable-5", 10_000, 680_000, 10_000, "["+messageIteration(10_000, 680_000, 10_000)+"]"))
+	if tokens, _, ok := lastTranscriptUsage(p); !ok || tokens != 700_000 {
+		t.Errorf("single-iteration occupancy = %d (ok=%v), want 700000", tokens, ok)
+	}
+}
+
 func TestContextInjectDefaultWindow200k(t *testing.T) {
 	t.Setenv("GC_INJECT_CONTEXT", "")
 	// 150k on an unrecognized model = 75% of the conservative 200k default.
