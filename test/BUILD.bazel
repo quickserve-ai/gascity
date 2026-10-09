@@ -11,6 +11,8 @@ exports_files(
         "BUILD.bazel",
         "bazel-hermeticity.toml",
         "test-resources.toml",
+        # //examples/bd/dolt:dolt_test runs it (TestDoltENOSPCGuardShellHarness).
+        "dolt_enospc_guard_test.sh",
     ],
     visibility = ["//visibility:public"],
 )
