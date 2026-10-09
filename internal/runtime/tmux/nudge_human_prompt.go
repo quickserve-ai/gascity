@@ -381,7 +381,9 @@ func (t *Tmux) newDraftOwner(session, message string) *draftOwner {
 // keyed by #{client_tty}, or false when the read fails, no client is
 // attached, or a line does not parse. tmux bumps client_activity (whole
 // seconds) on every input event from that client, so an unchanged mark means
-// that client has sent no key, paste or other input since.
+// that client has sent no key, paste or other input since the second it
+// names; input later in that same second reads the same, which is why
+// newDraftOwner claims nothing for a mark in the current second.
 func (t *Tmux) clientActivity(session string) (map[string]int64, bool) {
 	out, err := t.run("list-clients", "-t", session, "-F", "#{client_tty} #{client_activity}")
 	if err != nil {
@@ -594,8 +596,9 @@ func (t *Tmux) humanPromptGuardOwning(session, target, stage string, checkDraft 
 
 // draftIsNotOurs reports whether lines show, on an attached claude pane, a
 // composer draft owner does not own and that an attribute re-read with faint
-// placeholder text dropped does not clear (undimmedComposerDraft), and that
-// no client has stayed silent over since it was typed (noHumanInputSince). Only positive evidence of someone else's text
+// placeholder text dropped does not clear (undimmedComposerDraft), unless it
+// is a bare paste placeholder of our message's size that no attached client
+// has typed over since our text went in (noHumanInputSince). Only positive evidence of someone else's text
 // counts: an empty or unreadable composer does not. Other families are not
 // checked: claude is the one family whose composer the draft rule models
 // (see humanPromptGuard).
@@ -615,16 +618,38 @@ func (t *Tmux) draftIsNotOurs(session, target string, lines []string, owner *dra
 	if owner.owns(undimmed) {
 		return false
 	}
-	if owner.placeholder != "" || !claudePastePlaceholderOnly.MatchString(stripLeadingGCReminders(squashSpace(undimmed))) {
+	if owner.placeholder != "" || !placeholderFitsMessage(stripLeadingGCReminders(squashSpace(undimmed)), owner.message) {
 		// Visible text that is not ours keeps its veto whatever the input
 		// marks say: a client can attach, type and detach between the two
-		// reads. The quiet-clients rule covers one shape only: the bare
-		// paste placeholder our own long paste collapses to, and only when
-		// no placeholder of ours was recorded (one was, and a different one
+		// reads. The quiet-clients rule covers one shape only: a bare paste
+		// placeholder whose line count is our message's, and only when no
+		// placeholder of ours was recorded (one was, and a different one
 		// shows now: that is someone else's paste, by provenance).
 		return true
 	}
 	return !t.noHumanInputSince(session, owner)
+}
+
+// claudePastePlaceholderLines captures the "+M lines" count of a squashed
+// Claude Code paste placeholder; a placeholder without it is a one-line paste.
+var claudePastePlaceholderLines = regexp.MustCompile(`^\[Pastedtext#\d+(?:\+(\d+)lines?)?\]$`)
+
+// placeholderFitsMessage reports whether d is a bare paste placeholder whose
+// line count is message's: Claude Code shows "+M lines" for a paste with M
+// line breaks (a 6-item queued batch of 12 line breaks shows "+12 lines";
+// measured 2026-10-09), and no count for a paste with none. A placeholder
+// that does not fit is someone else's paste, whatever the input marks say.
+func placeholderFitsMessage(d, message string) bool {
+	m := claudePastePlaceholderLines.FindStringSubmatch(d)
+	if m == nil {
+		return false
+	}
+	breaks := strings.Count(message, "\n")
+	if m[1] == "" {
+		return breaks == 0
+	}
+	n, err := strconv.Atoi(m[1])
+	return err == nil && (n == breaks || n == breaks-1)
 }
 
 // classifyPaneLines is humanPromptGuard's decision on an already-captured

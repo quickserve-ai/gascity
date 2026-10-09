@@ -3258,10 +3258,12 @@ func (t *Tmux) nudgeSession(
 		return fmt.Errorf("dismissing feedback survey before nudge: %w", err)
 	}
 
-	// The attached clients' input marks, read before our text goes in: a
-	// bare paste placeholder that no attached client has typed over since,
-	// with no placeholder of ours recorded, is our own collapsed paste
-	// (noHumanInputSince, ga-ib2ffp).
+	// The attached clients' input marks, read before our text goes in. At
+	// the submit check they let a bare paste placeholder of our message's
+	// size, with no placeholder of ours recorded and no input from an
+	// attached client since, be taken as our own collapsed paste
+	// (noHumanInputSince, ga-ib2ffp); a client present only between the two
+	// reads is the stated residual.
 	owner := t.newDraftOwner(session, message)
 
 	// 2. Send text in literal mode with retry on transient errors

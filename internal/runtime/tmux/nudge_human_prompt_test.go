@@ -1321,16 +1321,19 @@ func TestNudgeSessionFirstEnterOwnsOnlyItsOwnPastePlaceholder(t *testing.T) {
 // "[Pasted text #N +M lines]" placeholder the provenance read never saw. On
 // 2026-10-09 that left six seats deaf behind their own nudge: the first Enter
 // was withheld as a human draft and every later delivery deferred on the
-// leftover. The draft is ours when the pre-type guard saw the composer empty
-// and no client of the session has sent any input since our text went in
-// (#{client_activity} unchanged); a keystroke after the paste, or a read that
-// cannot tell, still withholds the Enter.
+// leftover. A bare placeholder of our message's line count is taken as ours
+// when the pre-type guard saw the composer empty, no placeholder of ours was
+// recorded, and no attached client has sent input since our text went in
+// (#{client_activity} unchanged, same clients); a keystroke after the paste,
+// a placeholder of another size, or a read that cannot tell, still withholds
+// the Enter.
 func TestNudgeSessionOwnsItsCollapsedPasteWhenNoOneTyped(t *testing.T) {
 	// Reads once the text is in: the provenance read shows the paste inline,
 	// every later read shows the placeholder Claude Code collapsed it to.
+	// guardTestQueuedNudge has 7 line breaks, so its placeholder reads "+7".
 	reads := []string{
 		composerFixture("❯ <system-reminder> You have a deferred reminder that was queued"),
-		composerFixture("❯ [Pasted text #23 +12 lines]"),
+		composerFixture("❯ [Pasted text #23 +7 lines]"),
 	}
 	t.Run("no input since the paste: submits", func(t *testing.T) {
 		fe := &panePromptExecutor{screen: idleComposerFixture, attached: true, activity: "/dev/ttys000 1791558385"}
@@ -1444,13 +1447,28 @@ func TestNudgeSessionOwnsItsCollapsedPasteWhenNoOneTyped(t *testing.T) {
 		// Provenance already names #5 as someone else's paste (ours was #4);
 		// quiet marks do not reopen that.
 		fe := &panePromptExecutor{screen: idleComposerFixture, attached: true, activity: "/dev/ttys000 1791558385"}
-		fe.textCaptures = []string{composerFixture("❯ [Pasted text #4 +12 lines]"), composerFixture("❯ [Pasted text #5 +2 lines]")}
+		fe.textCaptures = []string{composerFixture("❯ [Pasted text #4 +7 lines]"), composerFixture("❯ [Pasted text #5 +7 lines]")}
 		fe.onEnter = func(int) string { return busyFixture }
 		tm, session := newGuardTestTmux(fe)
 
 		err := tm.NudgeSession(session, guardTestQueuedNudge)
 		if got := fe.enterCount(); got != 0 {
 			t.Fatalf("Enter sent %d time(s) onto a paste placeholder provenance had already ruled out", got)
+		}
+		assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+	})
+	t.Run("a placeholder of another size after our inline render, clients quiet: withholds", func(t *testing.T) {
+		// Our paste was recorded inline (no placeholder of ours), then a
+		// placeholder appears that is not our message's size: someone
+		// else's paste, whoever's marks are quiet.
+		fe := &panePromptExecutor{screen: idleComposerFixture, attached: true, activity: "/dev/ttys000 1791558385"}
+		fe.textCaptures = []string{reads[0], composerFixture("❯ [Pasted text #23 +12 lines]")}
+		fe.onEnter = func(int) string { return busyFixture }
+		tm, session := newGuardTestTmux(fe)
+
+		err := tm.NudgeSession(session, guardTestQueuedNudge)
+		if got := fe.enterCount(); got != 0 {
+			t.Fatalf("Enter sent %d time(s) onto a placeholder of another paste's size", got)
 		}
 		assertDeferred(t, err, NudgeDeferReasonHumanDraft)
 	})
