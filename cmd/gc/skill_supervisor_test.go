@@ -929,6 +929,72 @@ func TestRunStage1SharedSinkIncompletePassKeepsEveryAgentsSkips(t *testing.T) {
 	}
 }
 
+// TestRunStage1SharedSinkRunErrorKeepsEveryAgentsSkips: when the
+// materializer fails on a shared sink, the pass reports the failure once,
+// under the sink rather than an agent, and carries the skip history of
+// every agent in the sink, so neither agent's skip prints again once the
+// sink materializes.
+func TestRunStage1SharedSinkRunErrorKeepsEveryAgentsSkips(t *testing.T) {
+	clearGCEnv(t)
+	t.Setenv("GC_HOME", t.TempDir())
+	t.Setenv("GC_DEBUG", "")
+	cityPath := t.TempDir()
+	writeSkillSource(t, filepath.Join(cityPath, "skills", "plan"))
+	mayorSkills := filepath.Join(cityPath, "agents", "mayor", "skills")
+	deputySkills := filepath.Join(cityPath, "agents", "deputy", "skills")
+	writeSkillSource(t, filepath.Join(mayorSkills, "m-only"))
+	writeSkillSource(t, filepath.Join(deputySkills, "d-only"))
+	sink := filepath.Join(cityPath, ".claude", "skills")
+	for _, name := range []string{"m-only", "d-only"} {
+		if err := os.MkdirAll(filepath.Join(sink, name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := &config.City{
+		PackSkillsDir: filepath.Join(cityPath, "skills"),
+		Session:       config.SessionConfig{Provider: "tmux"},
+		Agents: []config.Agent{
+			{Name: "mayor", Scope: "city", Provider: "claude", SkillsDir: mayorSkills},
+			{Name: "deputy", Scope: "city", Provider: "claude", SkillsDir: deputySkills},
+		},
+	}
+
+	var stderr bytes.Buffer
+	runStage1ForSkipTest(t, cityPath, cfg, &stderr)
+
+	// A regular file where the sink's .claude directory belongs makes the
+	// materializer fail to create the sink.
+	claudeDir := filepath.Join(cityPath, ".claude")
+	aside := filepath.Join(cityPath, "claude-aside")
+	if err := os.Rename(claudeDir, aside); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(claudeDir, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before := stderr.Len()
+	runStage1ForSkipTest(t, cityPath, cfg, &stderr)
+	failed := stderr.String()[before:]
+	want := "gc: stage-1 materialize-skills at " + sink + ": "
+	if got := strings.Count(failed, want); got != 1 {
+		t.Fatalf("failed pass reported %q %d times, want 1:\n%s", want, got, failed)
+	}
+
+	if err := os.Remove(claudeDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(aside, claudeDir); err != nil {
+		t.Fatal(err)
+	}
+	runStage1ForSkipTest(t, cityPath, cfg, &stderr)
+
+	for _, want := range []string{`agent "mayor" skipped skill "m-only"`, `agent "deputy" skipped skill "d-only"`} {
+		if got := strings.Count(stderr.String(), want); got != 1 {
+			t.Errorf("%s reported %d times over three passes, want 1:\n%s", want, got, stderr.String())
+		}
+	}
+}
+
 // TestRunStage1RenameSkillLifecycle confirms that renaming a skill
 // (delete old, add new name with same content) correctly cleans up
 // the old symlink and creates the new one in a single tick. This is
