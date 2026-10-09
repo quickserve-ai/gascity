@@ -36,7 +36,7 @@ import (
 // session answers to (hookHeartbeatUnreusedPriorAliases): the orphan-release
 // reader casts over the whole alias history so it never strips live work,
 // while a writer vouching for liveness must not vouch through a name a later
-// live session has taken (SESSION-RUNTIME-010).
+// live session has taken (SESSION-RUNTIME-012).
 // Each row is heartbeated with the row's OWN assignee spelling as actor,
 // because bd's owner check is exact string equality and a cross-spelling
 // heartbeat is refused (measured; the refusal would otherwise be swallowed by
@@ -61,7 +61,7 @@ import (
 // registers only a SessionStart hook (gc prime --hook) and no per-turn
 // event, so an armed kimi seat's claims get NO turn-driven refresh; its
 // leases lapse at the TTL like an unattended seat's. Stage 2 must not reap
-// on expiry for a provider with no heartbeat seam (see SESSION-RUNTIME-012).
+// on expiry for a provider with no heartbeat seam (see SESSION-RUNTIME-014).
 
 // hookHeartbeatTimeout bounds the whole run. The command is invoked detached
 // from the turn (never synchronously — a bd invocation costs seconds and a
