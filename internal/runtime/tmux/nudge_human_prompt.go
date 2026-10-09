@@ -597,11 +597,14 @@ func (t *Tmux) humanPromptGuardOwning(session, target, stage string, checkDraft 
 // draftIsNotOurs reports whether lines show, on an attached claude pane, a
 // composer draft owner does not own and that an attribute re-read with faint
 // placeholder text dropped does not clear (undimmedComposerDraft), unless it
-// is a bare paste placeholder of our message's size that no attached client
-// has typed over since our text went in (noHumanInputSince). Only positive evidence of someone else's text
-// counts: an empty or unreadable composer does not. Other families are not
-// checked: claude is the one family whose composer the draft rule models
-// (see humanPromptGuard).
+// is a bare paste placeholder of our message's line count (exact, or one
+// less), no placeholder of ours was recorded, and no attached client's mark
+// moved since our text went in (noHumanInputSince). On the plain capture
+// only positive evidence of someone else's text counts: an empty or
+// unreadable composer there does not. The styled re-read is the other way
+// round: once a draft is seen, a re-read that fails or shows a dialog keeps
+// the veto. Other families are not checked: claude is the one family whose
+// composer the draft rule models (see humanPromptGuard).
 func (t *Tmux) draftIsNotOurs(session, target string, lines []string, owner *draftOwner) bool {
 	prefix := t.resolveIdlePromptPrefix(session)
 	found, text := composerDraft(lines, prefix)

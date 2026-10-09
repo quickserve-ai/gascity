@@ -1321,12 +1321,13 @@ func TestNudgeSessionFirstEnterOwnsOnlyItsOwnPastePlaceholder(t *testing.T) {
 // "[Pasted text #N +M lines]" placeholder the provenance read never saw. On
 // 2026-10-09 that left six seats deaf behind their own nudge: the first Enter
 // was withheld as a human draft and every later delivery deferred on the
-// leftover. A bare placeholder of our message's line count is taken as ours
-// when the pre-type guard saw the composer empty, no placeholder of ours was
-// recorded, and no attached client has sent input since our text went in
-// (#{client_activity} unchanged, same clients); a keystroke after the paste,
-// a placeholder of another size, or a read that cannot tell, still withholds
-// the Enter.
+// leftover. A bare placeholder of our message's line count (exact, or one
+// less) is taken as ours when the pre-type guard saw the composer empty, no
+// placeholder of ours was recorded, and the sampled client marks show no
+// input since our text went in (#{client_activity} unchanged, same clients).
+// Input the sampled marks can see, a count outside that range, or a read
+// that cannot tell, still withholds the Enter; a client present only between
+// the two reads is the stated residual.
 func TestNudgeSessionOwnsItsCollapsedPasteWhenNoOneTyped(t *testing.T) {
 	// Reads once the text is in: the provenance read shows the paste inline,
 	// every later read shows the placeholder Claude Code collapsed it to.
