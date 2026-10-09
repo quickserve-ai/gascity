@@ -1011,6 +1011,8 @@ type AgentPatch struct {
 	MouseMode               *string           `json:"MouseMode"`
 	Name                    string            `json:"Name"`
 	Nudge                   *string           `json:"Nudge"`
+	OptInSkills             *[]string         `json:"OptInSkills"`
+	OptInSkillsAppend       *[]string         `json:"OptInSkillsAppend"`
 	OptionDefaults          map[string]string `json:"OptionDefaults"`
 	OverlayDir              *string           `json:"OverlayDir"`
 	Pool                    PoolOverride      `json:"Pool"`
@@ -1050,6 +1052,12 @@ type AgentPatchSetInputBody struct {
 
 	// Name Agent name.
 	Name *string `json:"name,omitempty"`
+
+	// OptInSkills Replace the agent's opt-in skill selection (binding-qualified names of skills a pack ships under skills/opt-in/). An empty list clears it; omit the field to inherit the underlying agent's list.
+	OptInSkills *[]string `json:"opt_in_skills,omitempty"`
+
+	// OptInSkillsAppend Opt-in skills to add to the agent's selection.
+	OptInSkillsAppend *[]string `json:"opt_in_skills_append,omitempty"`
 
 	// Provider Override the agent's provider.
 	Provider *string `json:"provider,omitempty"`

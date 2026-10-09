@@ -275,6 +275,13 @@
           "type": "boolean",
           "description": "InjectAssignedSkills controls whether gc appends an\n\"assigned skills\" appendix to the agent's rendered prompt. The\nappendix lists every skill visible to this agent, partitioned\ninto (assigned-to-you, shared-with-every-agent), so agents\nsharing a scope-root sink can tell which skills are their\nspecialization vs which are the city-wide set.\n\nPointer tri-state:\n  nil   -\u003e inherit: inject when the agent has a vendor sink\n  *true -\u003e explicitly inject (equivalent to the default)\n  *false -\u003e disable; the template is responsible for rendering\n            any skill guidance itself"
         },
+        "opt_in_skills": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "OptInSkills names the opt-in skills this agent receives. A pack ships\nan opt-in skill under skills/opt-in/\u003cname\u003e/SKILL.md, and no agent\nreceives it unless it names it here. Names use the shared catalog's\nform: \"\u003cbinding\u003e.\u003cname\u003e\" for an imported pack's skill, \"\u003cname\u003e\" for the\ncity pack's own. A name must resolve to an opt-in skill in the agent's\nscope (the city's imports, plus its rig's imports for a rig-scoped\nagent), or config load fails. An agent whose work_dir is its scope\nroot receives its opt-ins in the scope root's skill directory, and\nevery session the provider loads that directory for sees them: for\nClaude Code, sessions started there and in plain subdirectories below\nit in the same repository, but not sessions in their own linked\nworktrees. An agent with its own work_dir receives its opt-ins in that\nwork_dir alone; that is how a seat gets an opt-in skill exclusively."
+        },
         "attach": {
           "type": "boolean",
           "description": "Attach controls whether the agent's session supports interactive\nattachment (e.g., tmux attach). When false, the agent can use a\nlighter runtime (subprocess instead of tmux). Defaults to true."
@@ -657,6 +664,20 @@
           },
           "type": "array",
           "description": "InjectFragmentsAppend appends to the agent's inject_fragments list."
+        },
+        "opt_in_skills": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "OptInSkills replaces the agent's opt_in_skills list (see\nAgent.OptInSkills). Leave it unset to keep the agent's list; set an\nempty list to clear it."
+        },
+        "opt_in_skills_append": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "OptInSkillsAppend appends to the agent's opt_in_skills list, the way\ninject_fragments_append adds a prompt fragment."
         },
         "max_active_sessions": {
           "type": "integer",

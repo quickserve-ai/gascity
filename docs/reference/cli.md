@@ -4746,6 +4746,8 @@ Output includes:
   - Imported pack shared skills (binding-qualified, e.g. ops.code-review)
   - Compatibility bootstrap skills, when legacy implicit imports still exist
   - With --agent/--session: that agent's agents/&lt;name&gt;/skills/ catalog
+    and the opt-in skills its opt_in_skills selects (a pack's
+    skills/opt-in/&lt;name&gt;/, binding-qualified)
 
 The listing is a diagnostic view of what's *available*. It does not
 collapse precedence, filter to agents whose provider has a vendor
