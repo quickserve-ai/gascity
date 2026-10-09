@@ -397,7 +397,11 @@ func (t *Tmux) clientActivity(session string) (map[string]int64, bool) {
 			return nil, false
 		}
 		n, err := strconv.ParseInt(f[1], 10, 64)
-		if err != nil {
+		if err != nil || n < 0 {
+			return nil, false
+		}
+		if _, dup := marks[f[0]]; dup {
+			// Two rows for one tty: which mark is current is ambiguous.
 			return nil, false
 		}
 		marks[f[0]] = n
@@ -415,8 +419,9 @@ func (t *Tmux) clientActivity(session string) (map[string]int64, bool) {
 // provenance read never saw, which is how six seats were left deaf behind
 // their own nudge on 2026-10-09. A client that joined or left, a failed or
 // ambiguous read, each claims nothing (false): the oracle fails toward "a
-// person may have typed". It never overrides a dialog or an unreadable
-// composer; draftIsNotOurs settles those first.
+// person may have typed". It never overrides a dialog, an unreadable
+// composer, or visible text that is not a bare paste placeholder;
+// draftIsNotOurs settles those first.
 func (t *Tmux) noHumanInputSince(session string, owner *draftOwner) bool {
 	if owner == nil || !owner.quietKnown {
 		return false
@@ -608,6 +613,13 @@ func (t *Tmux) draftIsNotOurs(session, target string, lines []string, owner *dra
 	}
 	if owner.owns(undimmed) {
 		return false
+	}
+	if !claudePastePlaceholderOnly.MatchString(stripLeadingGCReminders(squashSpace(undimmed))) {
+		// Visible text that is not ours keeps its veto whatever the input
+		// marks say: a client can attach, type and detach between the two
+		// reads. The quiet-clients rule covers one shape only, the bare
+		// paste placeholder our own long paste collapses to.
+		return true
 	}
 	return !t.noHumanInputSince(session, owner)
 }

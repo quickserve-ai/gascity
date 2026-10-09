@@ -1414,6 +1414,32 @@ func TestNudgeSessionOwnsItsCollapsedPasteWhenNoOneTyped(t *testing.T) {
 		}
 		assertDeferred(t, err, NudgeDeferReasonHumanDraft)
 	})
+	t.Run("visible text that is not ours, clients quiet: withholds", func(t *testing.T) {
+		// A client can attach, replace the draft and detach between the two
+		// reads; quiet marks never override text the guard can see.
+		fe := &panePromptExecutor{screen: idleComposerFixture, attached: true, activity: "/dev/ttys000 1791558385"}
+		fe.textCaptures = []string{reads[0], composerFixture("❯ actually, stop and rebase first")}
+		fe.onEnter = func(int) string { return busyFixture }
+		tm, session := newGuardTestTmux(fe)
+
+		err := tm.NudgeSession(session, guardTestQueuedNudge)
+		if got := fe.enterCount(); got != 0 {
+			t.Fatalf("Enter sent %d time(s) onto visible foreign text because the clients were quiet", got)
+		}
+		assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+	})
+	t.Run("two rows for one tty: withholds", func(t *testing.T) {
+		fe := &panePromptExecutor{screen: idleComposerFixture, attached: true, activity: "/dev/ttys000 1791558385", activityAfterText: "/dev/ttys000 1791558390\n/dev/ttys000 1791558385"}
+		fe.textCaptures = reads
+		fe.onEnter = func(int) string { return busyFixture }
+		tm, session := newGuardTestTmux(fe)
+
+		err := tm.NudgeSession(session, guardTestQueuedNudge)
+		if got := fe.enterCount(); got != 0 {
+			t.Fatalf("Enter sent %d time(s) on an ambiguous duplicate-tty read", got)
+		}
+		assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+	})
 	t.Run("the activity read answers nothing: withholds", func(t *testing.T) {
 		fe := &panePromptExecutor{screen: idleComposerFixture, attached: true}
 		fe.textCaptures = reads
