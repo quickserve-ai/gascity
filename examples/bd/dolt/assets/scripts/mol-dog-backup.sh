@@ -173,18 +173,42 @@ if [ -z "$DATABASES" ]; then
     exit 0
 fi
 
-# ensure_backup_remote guarantees db has a named <db>-backup remote, creating
-# one under the backup artifact dir when missing. Auto-configuration is logged
-# loudly so operators can see when coverage was established rather than
-# assumed. Returns 1 when the remote cannot be configured.
+# backup_name_at_url <dir> <url>: prints the name of the backup `dolt backup
+# -v` (run in <dir>) lists at exactly <url>, whatever that name is. Prints
+# nothing when none does or the lookup fails.
+backup_name_at_url() {
+    bnu_list="$(cd "$1" && run_bounded 30 dolt backup -v 2>/dev/null)" || return 0
+    printf '%s\n' "$bnu_list" | BNU_WANT="$2" awk '
+        found { next }
+        { n = $1; sub(/^[^[:space:]]+[[:space:]]+/, ""); sub(/[[:space:]]+$/, "") }
+        $0 == ENVIRON["BNU_WANT"] { print n; found = 1 }' || true
+}
+
+# ensure_backup_remote resolves BACKUP_NAME, the backup the sync loop syncs for
+# db. A backup already at the artifact URL is used under whatever name it has:
+# Dolt refuses a second name for one URL, so adding <db>-backup beside it
+# (`bd backup init` names its backup 'default') failed and the database
+# silently stopped backing up (ga-eh8lt5). Otherwise it is <db>-backup,
+# created under the backup artifact dir when missing. Auto-configuration is
+# logged loudly so operators can see when coverage was established rather
+# than assumed. Returns 1 when the remote cannot be configured.
 ensure_backup_remote() {
     remote_db="$1"
+    BACKUP_NAME="${remote_db}-backup"
     remote_db_dir="$DOLT_DATA_DIR/$remote_db"
     [ -d "$remote_db_dir/.dolt" ] || return 0 # sync loop reports not-found
+    remote_url="file://$BACKUP_ARTIFACT_DIR/$remote_db"
+    remote_name="$(backup_name_at_url "$remote_db_dir" "$remote_url")"
+    if [ -n "$remote_name" ]; then
+        BACKUP_NAME="$remote_name"
+        if [ "$BACKUP_NAME" != "${remote_db}-backup" ]; then
+            echo "backup: $remote_db — syncing backup '$BACKUP_NAME' (already at $remote_url)"
+        fi
+        return 0
+    fi
     if (cd "$remote_db_dir" && run_bounded 30 dolt backup 2>/dev/null | awk '{print $1}' | grep -qx "${remote_db}-backup"); then
         return 0
     fi
-    remote_url="file://$BACKUP_ARTIFACT_DIR/$remote_db"
     mkdir -p "$BACKUP_ARTIFACT_DIR/$remote_db"
     if (cd "$remote_db_dir" && run_bounded 30 dolt backup add "${remote_db}-backup" "$remote_url" >/dev/null 2>&1); then
         echo "backup: auto-configured missing backup remote ${remote_db}-backup -> $remote_url"
@@ -367,13 +391,13 @@ physical_dir() {
     fi
 }
 
-# backup_remote_url <db> <dir>: prints the WHOLE url `dolt backup -v` (run in
-# <dir>) lists for <db>-backup — everything after the name, trailing
+# backup_remote_url <name> <dir>: prints the WHOLE url `dolt backup -v` (run in
+# <dir>) lists for backup <name> — everything after the name, trailing
 # whitespace trimmed, so a path with a space survives. Returns 1, printing
 # nothing, when the lookup exits non-zero (whatever it printed) or lists no
 # such remote.
 backup_remote_url() {
-    bru_name="$1-backup"
+    bru_name="$1"
     bru_rc=0
     bru_list="$(cd "$2" && run_bounded 30 dolt backup -v 2>/dev/null)" || bru_rc=$?
     [ "$bru_rc" -eq 0 ] || return 1
@@ -395,7 +419,7 @@ backup_remote_url() {
 # sql-server holds the store, so an in-place sync has no comparable source.
 #
 # This job stamps, prunes and copies off-box $BACKUP_ARTIFACT_DIR/<db>, so the
-# <db>-backup remote (read from the clone, no server above it) must point
+# backup it synced (BACKUP_NAME, read from the clone, no server above it) must point
 # THERE. ensure_backup_remote accepts an existing remote whatever its URL; any
 # other destination, a file remote elsewhere included, or a failed lookup,
 # fails closed.
@@ -409,7 +433,7 @@ verify_synced_root() {
     # the comparison below is for. A <dir>/<db> that cannot be entered falls
     # back to its spelling and cannot match a resolvable remote: fails closed.)
     vr_want="$(physical_dir "$BACKUP_ARTIFACT_DIR/$vr_db")" || vr_want=""
-    vr_url="$(backup_remote_url "$vr_db" "$2")" || vr_url=""
+    vr_url="$(backup_remote_url "$BACKUP_NAME" "$2")" || vr_url=""
     vr_bak_dir=""
     case "$vr_url" in
         file://*)
@@ -641,7 +665,7 @@ for db in $DATABASES; do
             echo "backup: $db — copy-on-write clone unavailable, falling back to in-place sync through the sql-server"
         fi
     fi
-    if (cd "$sync_dir" && run_bounded "$BACKUP_SYNC_TIMEOUT" dolt backup sync "${db}-backup" 2>"$sync_stderr"); then
+    if (cd "$sync_dir" && run_bounded "$BACKUP_SYNC_TIMEOUT" dolt backup sync "$BACKUP_NAME" 2>"$sync_stderr"); then
         ROOT_FAILURE=""
         if [ "$sync_mode" = "snapshot" ]; then
             # Fail closed on the return code too: a return 1 that set no
