@@ -1440,6 +1440,20 @@ func TestNudgeSessionOwnsItsCollapsedPasteWhenNoOneTyped(t *testing.T) {
 		}
 		assertDeferred(t, err, NudgeDeferReasonHumanDraft)
 	})
+	t.Run("our placeholder was recorded and a different one shows, clients quiet: withholds", func(t *testing.T) {
+		// Provenance already names #5 as someone else's paste (ours was #4);
+		// quiet marks do not reopen that.
+		fe := &panePromptExecutor{screen: idleComposerFixture, attached: true, activity: "/dev/ttys000 1791558385"}
+		fe.textCaptures = []string{composerFixture("❯ [Pasted text #4 +12 lines]"), composerFixture("❯ [Pasted text #5 +2 lines]")}
+		fe.onEnter = func(int) string { return busyFixture }
+		tm, session := newGuardTestTmux(fe)
+
+		err := tm.NudgeSession(session, guardTestQueuedNudge)
+		if got := fe.enterCount(); got != 0 {
+			t.Fatalf("Enter sent %d time(s) onto a paste placeholder provenance had already ruled out", got)
+		}
+		assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+	})
 	t.Run("the activity read answers nothing: withholds", func(t *testing.T) {
 		fe := &panePromptExecutor{screen: idleComposerFixture, attached: true}
 		fe.textCaptures = reads

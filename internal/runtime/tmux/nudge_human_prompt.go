@@ -411,13 +411,14 @@ func (t *Tmux) clientActivity(session string) (map[string]int64, bool) {
 
 // noHumanInputSince reports whether no client of session has sent any input
 // since owner's text went in (ga-ib2ffp): the same clients are attached as
-// at the pre-type read, and none has a newer activity mark. The pre-type
-// guard saw the composer empty (or holding only complete gc reminders)
-// before we typed, so a draft nobody has touched since can only be what we
-// typed, however the composer renders it: a long paste shows inline for a
-// moment and then collapses to a "[Pasted text #N +M lines]" placeholder the
-// provenance read never saw, which is how six seats were left deaf behind
-// their own nudge on 2026-10-09. A client that joined or left, a failed or
+// at the pre-type read, and none has a newer activity mark. It is evidence
+// about the attached clients only (one that attached and detached between
+// the two reads leaves no mark), so draftIsNotOurs consults it for one
+// shape alone: a bare paste placeholder when no placeholder of ours was
+// recorded. That is the shape of a long paste that showed inline for a
+// moment and then collapsed to "[Pasted text #N +M lines]" after the
+// provenance read, which is how six seats were left deaf behind their own
+// nudge on 2026-10-09. A client that joined or left, a failed or
 // ambiguous read, each claims nothing (false): the oracle fails toward "a
 // person may have typed". It never overrides a dialog, an unreadable
 // composer, or visible text that is not a bare paste placeholder;
@@ -614,11 +615,13 @@ func (t *Tmux) draftIsNotOurs(session, target string, lines []string, owner *dra
 	if owner.owns(undimmed) {
 		return false
 	}
-	if !claudePastePlaceholderOnly.MatchString(stripLeadingGCReminders(squashSpace(undimmed))) {
+	if owner.placeholder != "" || !claudePastePlaceholderOnly.MatchString(stripLeadingGCReminders(squashSpace(undimmed))) {
 		// Visible text that is not ours keeps its veto whatever the input
 		// marks say: a client can attach, type and detach between the two
-		// reads. The quiet-clients rule covers one shape only, the bare
-		// paste placeholder our own long paste collapses to.
+		// reads. The quiet-clients rule covers one shape only: the bare
+		// paste placeholder our own long paste collapses to, and only when
+		// no placeholder of ours was recorded (one was, and a different one
+		// shows now: that is someone else's paste, by provenance).
 		return true
 	}
 	return !t.noHumanInputSince(session, owner)

@@ -3258,8 +3258,9 @@ func (t *Tmux) nudgeSession(
 		return fmt.Errorf("dismissing feedback survey before nudge: %w", err)
 	}
 
-	// The session's input high-water mark, read before our text goes in: a
-	// draft nobody has touched since is ours whatever it looks like
+	// The attached clients' input marks, read before our text goes in: a
+	// bare paste placeholder that no attached client has typed over since,
+	// with no placeholder of ours recorded, is our own collapsed paste
 	// (noHumanInputSince, ga-ib2ffp).
 	owner := t.newDraftOwner(session, message)
 
