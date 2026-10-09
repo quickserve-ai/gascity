@@ -591,15 +591,17 @@ type hookClaimStaleDetail struct {
 }
 
 // fenceHookClaimSession applies the runtime-identity fence that gates
-// gc hook --claim before it runs the work query. It returns (code, handled):
-// handled is true for a definitively stale session OR a managed pool runtime
+// gc hook --claim before it runs the work query. It returns (code, handled,
+// info): handled is true for a definitively stale session OR a managed pool runtime
 // with no verifiable session-bead registration (GC_TEMPLATE set, GC_SESSION_ID
 // empty), either of whose terminal drain result the caller must return as-is.
 // A genuinely un-fenceable context (no GC_TEMPLATE and no session id, or a
 // session id present but no instance token), an eligible session, or a
 // transient session-store fault all return handled=false so the normal claim
 // path runs — the fence never turns an infrastructure hiccup or an
-// in-progress start into a false refusal.
+// in-progress start into a false refusal. info is the session bead the fence
+// read, returned ONLY on an eligible verdict (nil otherwise), so the claim can
+// act on a collapsed identity without a second read (upstream #6565).
 func fenceHookClaimSession(cityPath string, cfg *config.City, sessionID string, opts hookCommandOptions, stdout, stderr io.Writer) (int, bool, *session.Info) {
 	if sessionID == "" {
 		// GC_TEMPLATE is the pool-membership signal (set only alongside
