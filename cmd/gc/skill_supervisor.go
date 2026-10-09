@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -46,6 +47,11 @@ import (
 // logged and then downgraded to an empty shared desired set, while
 // preserving owned-root cleanup so stale gc-managed symlinks can still
 // be pruned.
+//
+// The returned error joins one error per sink the pass left as it was
+// (stage1UnreconciledSinks splits it), so a caller can surface them; it
+// is nil when every sink reconciled. It never means the pass stopped
+// early.
 func runStage1SkillMaterialization(cityPath string, cfg *config.City, stderr io.Writer) error {
 	if cfg == nil {
 		return nil
@@ -128,6 +134,7 @@ func runStage1SkillMaterialization(cityPath string, cfg *config.City, stderr io.
 		}
 	}
 
+	var unreconciled []error
 	sinkKeys := make([]string, 0, len(sinks))
 	for key := range sinks {
 		sinkKeys = append(sinkKeys, key)
@@ -146,6 +153,7 @@ func runStage1SkillMaterialization(cityPath string, cfg *config.City, stderr io.
 			for _, p := range problems {
 				fmt.Fprintf(stderr, "gc: stage-1 materialize-skills at %s: %s; sink not reconciled this pass (existing links kept, additions and removals wait until it is resolved)\n", dir, p) //nolint:errcheck // best-effort stderr
 			}
+			unreconciled = append(unreconciled, fmt.Errorf("skill sink %s not reconciled: %s", dir, strings.Join(problems, "; ")))
 			sink.markIncomplete(skipPass)
 			continue
 		}
@@ -164,6 +172,7 @@ func runStage1SkillMaterialization(cityPath string, cfg *config.City, stderr io.
 		if merr != nil {
 			sink.markIncomplete(skipPass)
 			fmt.Fprintf(stderr, "gc: stage-1 materialize-skills at %s (agents %s): %v\n", dir, sink.agentList(), merr) //nolint:errcheck // best-effort stderr
+			unreconciled = append(unreconciled, fmt.Errorf("skill sink %s (agents %s) not reconciled: %w", dir, sink.agentList(), merr))
 			continue
 		}
 		for _, s := range res.Skipped {
@@ -180,6 +189,19 @@ func runStage1SkillMaterialization(cityPath string, cfg *config.City, stderr io.
 		for _, w := range res.Warnings {
 			fmt.Fprintf(stderr, "gc: stage-1 materialize warning at %s (agents %s): %s\n", dir, sink.agentList(), w) //nolint:errcheck // best-effort stderr
 		}
+	}
+	return errors.Join(unreconciled...)
+}
+
+// stage1UnreconciledSinks splits the error runStage1SkillMaterialization
+// returns into one error per sink it left as it was.
+func stage1UnreconciledSinks(err error) []error {
+	var joined interface{ Unwrap() []error }
+	if errors.As(err, &joined) {
+		return joined.Unwrap()
+	}
+	if err != nil {
+		return []error{err}
 	}
 	return nil
 }
