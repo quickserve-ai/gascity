@@ -995,6 +995,81 @@ func TestRunStage1SharedSinkRunErrorKeepsEveryAgentsSkips(t *testing.T) {
 	}
 }
 
+// TestRunStage1AliasedRigPathsShareOneSink: rig be's path is a symlink
+// to rig fe's, so polecat and witness write one physical sink through two
+// spellings of its path, which does not exist before the first pass. The
+// pass must treat it as one sink, or the later of two passes over it
+// prunes the other agent's agent-local skill.
+func TestRunStage1AliasedRigPathsShareOneSink(t *testing.T) {
+	clearGCEnv(t)
+	cityPath := t.TempDir()
+	t.Setenv("GC_HOME", t.TempDir())
+	writeSkillSource(t, filepath.Join(cityPath, "skills", "plan"))
+	polecatSkills := filepath.Join(cityPath, "agents", "polecat", "skills")
+	witnessSkills := filepath.Join(cityPath, "agents", "witness", "skills")
+	writeSkillSource(t, filepath.Join(polecatSkills, "p-only"))
+	writeSkillSource(t, filepath.Join(witnessSkills, "w-only"))
+	realRig := filepath.Join(cityPath, "rigs", "real")
+	aliasRig := filepath.Join(cityPath, "rigs", "alias")
+	if err := os.MkdirAll(realRig, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realRig, aliasRig); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{
+		PackSkillsDir: filepath.Join(cityPath, "skills"),
+		Session:       config.SessionConfig{Provider: "tmux"},
+		Rigs:          []config.Rig{{Name: "fe", Path: realRig}, {Name: "be", Path: aliasRig}},
+		Agents: []config.Agent{
+			{Name: "polecat", Scope: "rig", Dir: "fe", Provider: "claude", SkillsDir: polecatSkills},
+			{Name: "witness", Scope: "rig", Dir: "be", Provider: "claude", SkillsDir: witnessSkills},
+		},
+	}
+
+	sink := filepath.Join(realRig, ".claude", "skills")
+	for pass := 1; pass <= 2; pass++ {
+		var stderr bytes.Buffer
+		if err := runStage1SkillMaterialization(cityPath, cfg, &stderr); err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range []string{"plan", "p-only", "w-only"} {
+			if _, err := os.Lstat(filepath.Join(sink, name)); err != nil {
+				t.Errorf("pass %d: %s missing from the sink both rigs alias: %v; stderr=%q", pass, name, err, stderr.String())
+			}
+		}
+	}
+}
+
+// TestRunStage1AliasedCatalogPathsAreNotAConflict: the two rigs' imports
+// reach ops.review through two spellings of one directory, one of them a
+// symlink. One physical source is not a conflict, so the sink reconciles
+// and links it.
+func TestRunStage1AliasedCatalogPathsAreNotAConflict(t *testing.T) {
+	clearGCEnv(t)
+	cityPath := t.TempDir()
+	t.Setenv("GC_HOME", t.TempDir())
+	ops := filepath.Join(cityPath, "imports", "ops", "skills")
+	writeSkillSource(t, filepath.Join(ops, "review"))
+	opsAlias := filepath.Join(cityPath, "imports", "ops-alias")
+	if err := os.Symlink(ops, opsAlias); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := sharedPathRigsCity(cityPath, ops, opsAlias)
+	var stderr bytes.Buffer
+	if err := runStage1SkillMaterialization(cityPath, cfg, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stderr.String(), "not reconciled") {
+		t.Errorf("one source reached through two paths reported as a conflict: %q", stderr.String())
+	}
+	link := filepath.Join(cityPath, "rigs", "shared", ".claude", "skills", "ops.review")
+	if _, err := os.Stat(link); err != nil {
+		t.Errorf("ops.review not linked: %v; stderr=%q", err, stderr.String())
+	}
+}
+
 // TestRunStage1RenameSkillLifecycle confirms that renaming a skill
 // (delete old, add new name with same content) correctly cleans up
 // the old symlink and creates the new one in a single tick. This is
