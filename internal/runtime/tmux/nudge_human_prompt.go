@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/gastownhall/gascity/internal/sessionlog"
@@ -350,6 +351,95 @@ func composerHoldsSent(lines []string, promptPrefix, sent string) bool {
 type draftOwner struct {
 	message, placeholder string
 	settled              bool
+	// quiet is each attached client's #{client_activity} (a unix second,
+	// bumped by any input that client sends), keyed by client tty, read just
+	// before our text went in; quietKnown is false when that read failed or
+	// was ambiguous, in which case no quiet claim is made (noHumanInputSince).
+	quiet      map[string]int64
+	quietKnown bool
+}
+
+// newDraftOwner makes the owner for message with the session's input
+// high-water marks read now, before the text goes in. A client whose mark is
+// the current second is ambiguous (input later in that second reads the
+// same), so the owner then claims nothing.
+func (t *Tmux) newDraftOwner(session, message string) *draftOwner {
+	o := &draftOwner{message: message}
+	now := time.Now().Unix()
+	if marks, ok := t.clientActivity(session); ok {
+		o.quiet, o.quietKnown = marks, true
+		for _, at := range marks {
+			if at >= now {
+				o.quietKnown = false
+			}
+		}
+	}
+	return o
+}
+
+// clientActivity returns #{client_activity} per client attached to session,
+// keyed by #{client_tty}, or false when the read fails, no client is
+// attached, or a line does not parse. tmux bumps client_activity (whole
+// seconds) on every input event from that client, so an unchanged mark means
+// that client has sent no key, paste or other input since the second it
+// names; input later in that same second reads the same, which is why
+// newDraftOwner claims nothing for a mark in the current second.
+func (t *Tmux) clientActivity(session string) (map[string]int64, bool) {
+	out, err := t.run("list-clients", "-t", session, "-F", "#{client_tty} #{client_activity}")
+	if err != nil {
+		return nil, false
+	}
+	marks := map[string]int64{}
+	for _, line := range strings.Split(out, "\n") {
+		f := strings.Fields(line)
+		if len(f) == 0 {
+			continue
+		}
+		if len(f) != 2 {
+			return nil, false
+		}
+		n, err := strconv.ParseInt(f[1], 10, 64)
+		if err != nil || n < 0 {
+			return nil, false
+		}
+		if _, dup := marks[f[0]]; dup {
+			// Two rows for one tty: which mark is current is ambiguous.
+			return nil, false
+		}
+		marks[f[0]] = n
+	}
+	return marks, len(marks) > 0
+}
+
+// noHumanInputSince reports whether no client of session has sent any input
+// since owner's text went in (ga-ib2ffp): the same clients are attached as
+// at the pre-type read, and none has a newer activity mark. It is evidence
+// about the attached clients only (one that attached and detached between
+// the two reads leaves no mark), so draftIsNotOurs consults it for one
+// shape alone: a bare paste placeholder when no placeholder of ours was
+// recorded. That is the shape of a long paste that showed inline for a
+// moment and then collapsed to "[Pasted text #N +M lines]" after the
+// provenance read, which is how six seats were left deaf behind their own
+// nudge on 2026-10-09. A client that joined or left, a failed or
+// ambiguous read, each claims nothing (false): the oracle fails toward "a
+// person may have typed". It never overrides a dialog, an unreadable
+// composer, or visible text that is not a bare paste placeholder;
+// draftIsNotOurs settles those first.
+func (t *Tmux) noHumanInputSince(session string, owner *draftOwner) bool {
+	if owner == nil || !owner.quietKnown {
+		return false
+	}
+	marks, ok := t.clientActivity(session)
+	if !ok || len(marks) != len(owner.quiet) {
+		return false
+	}
+	for tty, at := range marks {
+		was, seen := owner.quiet[tty]
+		if !seen || at > was {
+			return false
+		}
+	}
+	return true
 }
 
 // noteDraft reads target's composer and records it in o (notePlaceholder).
@@ -506,16 +596,63 @@ func (t *Tmux) humanPromptGuardOwning(session, target, stage string, checkDraft 
 
 // draftIsNotOurs reports whether lines show, on an attached claude pane, a
 // composer draft owner does not own and that an attribute re-read with faint
-// placeholder text dropped does not clear (undimmedDraftIsOurs). Only positive evidence of someone else's text
-// counts: an empty or unreadable composer does not. Other families are not
-// checked: claude is the one family whose composer the draft rule models
-// (see humanPromptGuard).
+// placeholder text dropped does not clear (undimmedComposerDraft), unless it
+// is a bare paste placeholder of our message's line count (exact, or one
+// less), no placeholder of ours was recorded, and no attached client's mark
+// moved since our text went in (noHumanInputSince). On the plain capture
+// only positive evidence of someone else's text counts: an empty or
+// unreadable composer there does not. The styled re-read is the other way
+// round: once a draft is seen, a re-read that fails or shows a dialog keeps
+// the veto. Other families are not checked: claude is the one family whose
+// composer the draft rule models (see humanPromptGuard).
 func (t *Tmux) draftIsNotOurs(session, target string, lines []string, owner *draftOwner) bool {
 	prefix := t.resolveIdlePromptPrefix(session)
 	found, text := composerDraft(lines, prefix)
-	return found && !owner.owns(text) &&
-		t.sessionClientCount(session) != 0 && t.paneIsClaudeFamily(target) &&
-		!t.undimmedDraftIsOurs(target, prefix, owner)
+	if !found || owner.owns(text) || t.sessionClientCount(session) == 0 || !t.paneIsClaudeFamily(target) {
+		return false
+	}
+	undimmedFound, undimmed := t.undimmedComposerDraft(target, prefix)
+	if !undimmedFound {
+		// A failed re-read, or a dialog on the newer capture: never ours,
+		// whatever the input marks say (an agent can raise a question with
+		// nobody typing).
+		return true
+	}
+	if owner.owns(undimmed) {
+		return false
+	}
+	if owner.placeholder != "" || !placeholderFitsMessage(stripLeadingGCReminders(squashSpace(undimmed)), owner.message) {
+		// Visible text that is not ours keeps its veto whatever the input
+		// marks say: a client can attach, type and detach between the two
+		// reads. The quiet-clients rule covers one shape only: a bare paste
+		// placeholder whose line count is our message's, and only when no
+		// placeholder of ours was recorded (one was, and a different one
+		// shows now: that is someone else's paste, by provenance).
+		return true
+	}
+	return !t.noHumanInputSince(session, owner)
+}
+
+// claudePastePlaceholderLines captures the "+M lines" count of a squashed
+// Claude Code paste placeholder; a placeholder without it is a one-line paste.
+var claudePastePlaceholderLines = regexp.MustCompile(`^\[Pastedtext#\d+(?:\+(\d+)lines?)?\]$`)
+
+// placeholderFitsMessage reports whether d is a bare paste placeholder whose
+// line count is message's: Claude Code shows "+M lines" for a paste with M
+// line breaks (a 6-item queued batch of 12 line breaks shows "+12 lines";
+// measured 2026-10-09), and no count for a paste with none. A placeholder
+// that does not fit is someone else's paste, whatever the input marks say.
+func placeholderFitsMessage(d, message string) bool {
+	m := claudePastePlaceholderLines.FindStringSubmatch(d)
+	if m == nil {
+		return false
+	}
+	breaks := strings.Count(message, "\n")
+	if m[1] == "" {
+		return breaks == 0
+	}
+	n, err := strconv.Atoi(m[1])
+	return err == nil && (n == breaks || n == breaks-1)
 }
 
 // classifyPaneLines is humanPromptGuard's decision on an already-captured
@@ -571,16 +708,6 @@ func (t *Tmux) classifyLifecycleHumanPrompt(session, target string, lines []stri
 func (t *Tmux) composerHoldsOnlyDimText(target, promptPrefix string) bool {
 	found, text := t.undimmedComposerDraft(target, promptPrefix)
 	return found && text == ""
-}
-
-// undimmedDraftIsOurs is the submit form of composerHoldsOnlyDimText
-// (ga-da5vmz). The attribute re-read is a new capture, so the screen may have
-// changed since the plain read; it gets the same ownership rule as that read,
-// with faint text dropped. An empty draft passes, as before; so does the
-// nudge if it rendered in between. A person's text does not.
-func (t *Tmux) undimmedDraftIsOurs(target, promptPrefix string, owner *draftOwner) bool {
-	found, text := t.undimmedComposerDraft(target, promptPrefix)
-	return found && owner.owns(text)
 }
 
 // undimmedComposerDraft re-reads the pane with its text attributes and

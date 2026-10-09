@@ -186,6 +186,12 @@ type panePromptExecutor struct {
 	onType func(text string) string
 	// pasteBuf holds the text load-buffer read, for the paste-buffer after it.
 	pasteBuf string
+	// activity answers list-clients' "#{client_tty} #{client_activity}" lines
+	// (one per attached client; a unix-second input mark each).
+	// activityAfterText, when set, replaces it once text has gone in: a
+	// person's keystroke after our paste, or a client joining or leaving.
+	activity          string
+	activityAfterText string
 	// textCaptures, when set, scripts the plain captures taken once text
 	// has gone in: the i-th returns textCaptures[i], the last repeating.
 	textCaptures []string
@@ -219,7 +225,10 @@ func (f *panePromptExecutor) execute(args []string) (string, error) {
 		if f.afterDebounce != "" && f.textIn && time.Since(f.textInAt) >= 200*time.Millisecond {
 			f.screen = f.afterDebounce
 		}
-		if f.textIn && len(f.textCaptures) > 0 {
+		// Once an Enter has gone in and onEnter scripts the screen after it,
+		// that screen wins: the scripted reads describe the composer BEFORE
+		// the submit.
+		if f.textIn && len(f.textCaptures) > 0 && (f.onEnter == nil || f.enters == 0) {
 			f.screen = f.textCaptures[min(f.captures, len(f.textCaptures)-1)]
 			f.captures++
 		}
@@ -232,6 +241,13 @@ func (f *panePromptExecutor) execute(args []string) (string, error) {
 			return "1", nil
 		}
 		return "0", nil
+	case tmuxArgsContain(args, "list-clients"):
+		// The session's input high-water mark (list-clients). Unset means
+		// the read answers nothing, as a session with no client does.
+		if f.textIn && f.activityAfterText != "" {
+			return f.activityAfterText, nil
+		}
+		return f.activity, nil
 	case tmuxArgsContain(args, "#{bracket_paste_flag}"):
 		return "1", nil
 	case tmuxArgsContain(args, "#{pane_pid}"):
@@ -1299,6 +1315,176 @@ func TestNudgeSessionFirstEnterOwnsOnlyItsOwnPastePlaceholder(t *testing.T) {
 			assertDeferred(t, err, NudgeDeferReasonHumanDraft)
 		})
 	}
+}
+
+// ga-ib2ffp: a long paste renders inline for a moment and then collapses to a
+// "[Pasted text #N +M lines]" placeholder the provenance read never saw. On
+// 2026-10-09 that left six seats deaf behind their own nudge: the first Enter
+// was withheld as a human draft and every later delivery deferred on the
+// leftover. A bare placeholder of our message's line count (exact, or one
+// less) is taken as ours when the pre-type guard saw the composer empty, no
+// placeholder of ours was recorded, and the sampled client marks show no
+// input since our text went in (#{client_activity} unchanged, same clients).
+// Input the sampled marks can see, a count outside that range, or a read
+// that cannot tell, still withholds the Enter; a client present only between
+// the two reads is the stated residual.
+func TestNudgeSessionOwnsItsCollapsedPasteWhenNoOneTyped(t *testing.T) {
+	// Reads once the text is in: the provenance read shows the paste inline,
+	// every later read shows the placeholder Claude Code collapsed it to.
+	// guardTestQueuedNudge has 7 line breaks, so its placeholder reads "+7".
+	reads := []string{
+		composerFixture("❯ <system-reminder> You have a deferred reminder that was queued"),
+		composerFixture("❯ [Pasted text #23 +7 lines]"),
+	}
+	t.Run("no input since the paste: submits", func(t *testing.T) {
+		fe := &panePromptExecutor{screen: idleComposerFixture, attached: true, activity: "/dev/ttys000 1791558385"}
+		fe.textCaptures = reads
+		fe.onEnter = func(int) string { return busyFixture }
+		tm, session := newGuardTestTmux(fe)
+
+		if err := tm.NudgeSession(session, guardTestQueuedNudge); err != nil {
+			t.Fatalf("NudgeSession() = %v, want nil: the collapsed paste is ours, nobody typed", err)
+		}
+		assertDeliveredBy(t, fe, guardTestQueuedNudge)
+		if got := fe.enterCount(); got != 1 {
+			t.Fatalf("Enter sent %d time(s), want 1", got)
+		}
+	})
+	t.Run("a keystroke after the paste: withholds", func(t *testing.T) {
+		fe := &panePromptExecutor{screen: idleComposerFixture, attached: true, activity: "/dev/ttys000 1791558385", activityAfterText: "/dev/ttys000 1791558390"}
+		fe.textCaptures = reads
+		fe.onEnter = func(int) string { return busyFixture }
+		tm, session := newGuardTestTmux(fe)
+
+		err := tm.NudgeSession(session, guardTestQueuedNudge)
+		if got := fe.enterCount(); got != 0 {
+			t.Fatalf("Enter sent %d time(s) after a person's input landed on the composer", got)
+		}
+		assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+	})
+	t.Run("a keystroke in the same second as the pre-type read: withholds", func(t *testing.T) {
+		// A mark equal to the current second cannot tell input before the
+		// read from input after it, so the owner claims nothing.
+		fe := &panePromptExecutor{screen: idleComposerFixture, attached: true, activity: fmt.Sprintf("/dev/ttys000 %d", time.Now().Unix()+2)}
+		fe.textCaptures = reads
+		fe.onEnter = func(int) string { return busyFixture }
+		tm, session := newGuardTestTmux(fe)
+
+		err := tm.NudgeSession(session, guardTestQueuedNudge)
+		if got := fe.enterCount(); got != 0 {
+			t.Fatalf("Enter sent %d time(s) on an ambiguous same-second mark", got)
+		}
+		assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+	})
+	t.Run("a client left after the paste, the rest quiet: withholds", func(t *testing.T) {
+		// The client that typed may be the one that disconnected; its input
+		// is not in the second read, so membership must match.
+		fe := &panePromptExecutor{screen: idleComposerFixture, attached: true, activity: "/dev/ttys000 1791558385\n/dev/ttys003 1791558300", activityAfterText: "/dev/ttys000 1791558385"}
+		fe.textCaptures = reads
+		fe.onEnter = func(int) string { return busyFixture }
+		tm, session := newGuardTestTmux(fe)
+
+		err := tm.NudgeSession(session, guardTestQueuedNudge)
+		if got := fe.enterCount(); got != 0 {
+			t.Fatalf("Enter sent %d time(s) after a client left", got)
+		}
+		assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+	})
+	t.Run("two quiet clients: submits", func(t *testing.T) {
+		fe := &panePromptExecutor{screen: idleComposerFixture, attached: true, activity: "/dev/ttys000 1791558385\n/dev/ttys003 1791558300"}
+		fe.textCaptures = reads
+		fe.onEnter = func(int) string { return busyFixture }
+		tm, session := newGuardTestTmux(fe)
+
+		if err := tm.NudgeSession(session, guardTestQueuedNudge); err != nil {
+			t.Fatalf("NudgeSession() = %v, want nil", err)
+		}
+		if got := fe.enterCount(); got != 1 {
+			t.Fatalf("Enter sent %d time(s), want 1", got)
+		}
+	})
+	t.Run("a dialog on the styled re-read, clients quiet: withholds", func(t *testing.T) {
+		// An agent can raise a question with nobody typing; the quiet marks
+		// never override the dialog veto.
+		styled := "⏺ Done.\n" + rule + "\n❯ [Pasted text #23 +12 lines]\n" + rule + "\nWhich approach would you prefer?\n❯ 1. Alpha approach\n  2. Beta variant\nEnter to select · Tab/Arrow keys to navigate · Esc to cancel"
+		fe := &panePromptExecutor{screen: idleComposerFixture, attached: true, activity: "/dev/ttys000 1791558385", styled: styled}
+		fe.textCaptures = reads
+		fe.onEnter = func(int) string { return busyFixture }
+		tm, session := newGuardTestTmux(fe)
+
+		err := tm.NudgeSession(session, guardTestQueuedNudge)
+		if got := fe.enterCount(); got != 0 {
+			t.Fatalf("Enter sent %d time(s) into a dialog because the clients were quiet", got)
+		}
+		assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+	})
+	t.Run("visible text that is not ours, clients quiet: withholds", func(t *testing.T) {
+		// A client can attach, replace the draft and detach between the two
+		// reads; quiet marks never override text the guard can see.
+		fe := &panePromptExecutor{screen: idleComposerFixture, attached: true, activity: "/dev/ttys000 1791558385"}
+		fe.textCaptures = []string{reads[0], composerFixture("❯ actually, stop and rebase first")}
+		fe.onEnter = func(int) string { return busyFixture }
+		tm, session := newGuardTestTmux(fe)
+
+		err := tm.NudgeSession(session, guardTestQueuedNudge)
+		if got := fe.enterCount(); got != 0 {
+			t.Fatalf("Enter sent %d time(s) onto visible foreign text because the clients were quiet", got)
+		}
+		assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+	})
+	t.Run("two rows for one tty: withholds", func(t *testing.T) {
+		fe := &panePromptExecutor{screen: idleComposerFixture, attached: true, activity: "/dev/ttys000 1791558385", activityAfterText: "/dev/ttys000 1791558390\n/dev/ttys000 1791558385"}
+		fe.textCaptures = reads
+		fe.onEnter = func(int) string { return busyFixture }
+		tm, session := newGuardTestTmux(fe)
+
+		err := tm.NudgeSession(session, guardTestQueuedNudge)
+		if got := fe.enterCount(); got != 0 {
+			t.Fatalf("Enter sent %d time(s) on an ambiguous duplicate-tty read", got)
+		}
+		assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+	})
+	t.Run("our placeholder was recorded and a different one shows, clients quiet: withholds", func(t *testing.T) {
+		// Provenance already names #5 as someone else's paste (ours was #4);
+		// quiet marks do not reopen that.
+		fe := &panePromptExecutor{screen: idleComposerFixture, attached: true, activity: "/dev/ttys000 1791558385"}
+		fe.textCaptures = []string{composerFixture("❯ [Pasted text #4 +7 lines]"), composerFixture("❯ [Pasted text #5 +7 lines]")}
+		fe.onEnter = func(int) string { return busyFixture }
+		tm, session := newGuardTestTmux(fe)
+
+		err := tm.NudgeSession(session, guardTestQueuedNudge)
+		if got := fe.enterCount(); got != 0 {
+			t.Fatalf("Enter sent %d time(s) onto a paste placeholder provenance had already ruled out", got)
+		}
+		assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+	})
+	t.Run("a placeholder of another size after our inline render, clients quiet: withholds", func(t *testing.T) {
+		// Our paste was recorded inline (no placeholder of ours), then a
+		// placeholder appears that is not our message's size: someone
+		// else's paste, whoever's marks are quiet.
+		fe := &panePromptExecutor{screen: idleComposerFixture, attached: true, activity: "/dev/ttys000 1791558385"}
+		fe.textCaptures = []string{reads[0], composerFixture("❯ [Pasted text #23 +12 lines]")}
+		fe.onEnter = func(int) string { return busyFixture }
+		tm, session := newGuardTestTmux(fe)
+
+		err := tm.NudgeSession(session, guardTestQueuedNudge)
+		if got := fe.enterCount(); got != 0 {
+			t.Fatalf("Enter sent %d time(s) onto a placeholder of another paste's size", got)
+		}
+		assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+	})
+	t.Run("the activity read answers nothing: withholds", func(t *testing.T) {
+		fe := &panePromptExecutor{screen: idleComposerFixture, attached: true}
+		fe.textCaptures = reads
+		fe.onEnter = func(int) string { return busyFixture }
+		tm, session := newGuardTestTmux(fe)
+
+		err := tm.NudgeSession(session, guardTestQueuedNudge)
+		if got := fe.enterCount(); got != 0 {
+			t.Fatalf("Enter sent %d time(s) with no evidence that nobody typed", got)
+		}
+		assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+	})
 }
 
 // ga-da5vmz round 3 (2): a RE-sent Enter gets the same last-capture ownership
