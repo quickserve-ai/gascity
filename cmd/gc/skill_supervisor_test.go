@@ -975,7 +975,7 @@ func TestRunStage1SharedSinkRunErrorKeepsEveryAgentsSkips(t *testing.T) {
 	before := stderr.Len()
 	runStage1ForSkipTest(t, cityPath, cfg, &stderr)
 	failed := stderr.String()[before:]
-	want := "gc: stage-1 materialize-skills at " + sink + ": "
+	want := "gc: stage-1 materialize-skills at " + sink + ` (agents "mayor", "deputy"): `
 	if got := strings.Count(failed, want); got != 1 {
 		t.Fatalf("failed pass reported %q %d times, want 1:\n%s", want, got, failed)
 	}
@@ -991,6 +991,79 @@ func TestRunStage1SharedSinkRunErrorKeepsEveryAgentsSkips(t *testing.T) {
 	for _, want := range []string{`agent "mayor" skipped skill "m-only"`, `agent "deputy" skipped skill "d-only"`} {
 		if got := strings.Count(stderr.String(), want); got != 1 {
 			t.Errorf("%s reported %d times over three passes, want 1:\n%s", want, got, stderr.String())
+		}
+	}
+}
+
+// TestRunStage1SharedSinkCatalogLoadErrorKeepsLinks: when one agent's
+// skill catalog cannot be read, the pass cannot tell that agent's links
+// from stale ones, so it must leave the shared sink as it is rather than
+// prune them, and report the load error once. The sink reconciles again
+// once the catalog reads.
+func TestRunStage1SharedSinkCatalogLoadErrorKeepsLinks(t *testing.T) {
+	clearGCEnv(t)
+	cityPath := t.TempDir()
+	t.Setenv("GC_HOME", t.TempDir())
+	writeSkillSource(t, filepath.Join(cityPath, "skills", "plan"))
+	mayorDir := filepath.Join(cityPath, "agents", "mayor")
+	mayorSkills := filepath.Join(mayorDir, "skills")
+	deputySkills := filepath.Join(cityPath, "agents", "deputy", "skills")
+	writeSkillSource(t, filepath.Join(mayorSkills, "m-only"))
+	writeSkillSource(t, filepath.Join(deputySkills, "d-only"))
+	cfg := &config.City{
+		PackSkillsDir: filepath.Join(cityPath, "skills"),
+		Session:       config.SessionConfig{Provider: "tmux"},
+		Agents: []config.Agent{
+			{Name: "mayor", Scope: "city", Provider: "claude", SkillsDir: mayorSkills},
+			{Name: "deputy", Scope: "city", Provider: "claude", SkillsDir: deputySkills},
+		},
+	}
+	var stderr bytes.Buffer
+	if err := runStage1SkillMaterialization(cityPath, cfg, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	sink := filepath.Join(cityPath, ".claude", "skills")
+	link := filepath.Join(sink, "m-only")
+	if _, err := os.Lstat(link); err != nil {
+		t.Fatalf("precondition: m-only missing: %v", err)
+	}
+
+	// A regular file where mayor's agent directory belongs makes reading
+	// mayor's skills directory fail with an error other than not-exist.
+	aside := filepath.Join(cityPath, "mayor-aside")
+	if err := os.Rename(mayorDir, aside); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(mayorDir, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stderr.Reset()
+	_ = runStage1SkillMaterialization(cityPath, cfg, &stderr)
+	if got := strings.Count(stderr.String(), "LoadAgentCatalog"); got != 1 {
+		t.Errorf("load error reported %d times, want 1: %q", got, stderr.String())
+	}
+	for _, want := range []string{sink, `agent "mayor"`, "sink not reconciled this pass"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("stderr missing %q: %q", want, stderr.String())
+		}
+	}
+	if _, err := os.Lstat(link); err != nil {
+		t.Errorf("m-only pruned while mayor's catalog could not be read: %v", err)
+	}
+
+	if err := os.Remove(mayorDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(aside, mayorDir); err != nil {
+		t.Fatal(err)
+	}
+	stderr.Reset()
+	if err := runStage1SkillMaterialization(cityPath, cfg, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"plan", "m-only", "d-only"} {
+		if _, err := os.Lstat(filepath.Join(sink, name)); err != nil {
+			t.Errorf("%s missing after mayor's catalog reads again: %v; stderr=%q", name, err, stderr.String())
 		}
 	}
 }

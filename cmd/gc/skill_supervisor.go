@@ -5,6 +5,7 @@ import (
 	"io"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/doctor"
@@ -38,12 +39,13 @@ import (
 // materializeSkillsIntoWorkdir).
 //
 // Catalog load happens once per scope per call and feeds every
-// agent's materialization in this tick. Per-agent and per-sink errors
-// (LoadAgentCatalog, Run) are logged to stderr and do not abort the
-// pass — the supervisor should continue reconciling every other sink.
-// Shared-catalog load failures are also logged and then downgraded to
-// an empty shared desired set, while preserving owned-root cleanup so
-// stale gc-managed symlinks can still be pruned.
+// agent's materialization in this tick. A sink with an agent catalog
+// that cannot be read, a name it cannot resolve, or a Run error is
+// logged to stderr and left as it is for the pass; the pass goes on to
+// reconcile every other sink. Shared-catalog load failures are also
+// logged and then downgraded to an empty shared desired set, while
+// preserving owned-root cleanup so stale gc-managed symlinks can still
+// be pruned.
 func runStage1SkillMaterialization(cityPath string, cfg *config.City, stderr io.Writer) error {
 	if cfg == nil {
 		return nil
@@ -90,13 +92,6 @@ func runStage1SkillMaterialization(cityPath string, cfg *config.City, stderr io.
 		}
 
 		agentCat, lerr := materialize.LoadAgentCatalog(agent.SkillsDir)
-		if lerr != nil {
-			fmt.Fprintf(stderr, "gc: stage-1 materialize-skills for agent %q: LoadAgentCatalog %q: %v\n", //nolint:errcheck // best-effort stderr
-				agent.QualifiedName(), agent.SkillsDir, lerr)
-			// Continue with empty agent catalog rather than skipping the
-			// whole materialization — the shared catalog still delivers.
-			agentCat = materialize.AgentCatalog{}
-		}
 
 		rigName := agentRigScopeName(agent, cfg.Rigs)
 		cityCat := loadCatalog(rigName)
@@ -124,6 +119,13 @@ func runStage1SkillMaterialization(cityPath string, cfg *config.City, stderr io.
 			sinks[sinkKey] = sink
 		}
 		sink.add(agent.QualifiedName(), cityCat, agentCat)
+		if lerr != nil {
+			// Fail closed: without this agent's catalog the pass cannot
+			// tell its links from stale ones, so the sink is left as it
+			// is rather than pruning them.
+			sink.unreadable = append(sink.unreadable, fmt.Sprintf("agent %q: LoadAgentCatalog %q: %v",
+				agent.QualifiedName(), agent.SkillsDir, lerr))
+		}
 	}
 
 	sinkKeys := make([]string, 0, len(sinks))
@@ -134,14 +136,15 @@ func runStage1SkillMaterialization(cityPath string, cfg *config.City, stderr io.
 	for _, key := range sinkKeys {
 		sink := sinks[key]
 		dir := sink.dir
-		// A name the sink cannot resolve degrades this sink's
-		// reconciliation for the pass: its existing links stay, and
-		// additions and removals for every agent in it wait until the
-		// conflict is resolved. The config itself still applies, and
-		// every other sink reconciles normally.
-		if conflicts := sink.conflicts(); len(conflicts) > 0 {
-			for _, c := range conflicts {
-				fmt.Fprintf(stderr, "gc: stage-1 materialize-skills at %s: %s; sink not reconciled this pass (existing links kept, additions and removals wait for the conflict to be resolved)\n", dir, c) //nolint:errcheck // best-effort stderr
+		// An agent catalog the pass could not read, or a name the sink
+		// cannot resolve, degrades this sink's reconciliation for the
+		// pass: its existing links stay, and additions and removals for
+		// every agent in it wait until the problem is resolved. The
+		// config itself still applies, and every other sink reconciles
+		// normally.
+		if problems := sink.problems(); len(problems) > 0 {
+			for _, p := range problems {
+				fmt.Fprintf(stderr, "gc: stage-1 materialize-skills at %s: %s; sink not reconciled this pass (existing links kept, additions and removals wait until it is resolved)\n", dir, p) //nolint:errcheck // best-effort stderr
 			}
 			sink.markIncomplete(skipPass)
 			continue
@@ -160,7 +163,7 @@ func runStage1SkillMaterialization(cityPath string, cfg *config.City, stderr io.
 		})
 		if merr != nil {
 			sink.markIncomplete(skipPass)
-			fmt.Fprintf(stderr, "gc: stage-1 materialize-skills at %s: %v\n", dir, merr) //nolint:errcheck // best-effort stderr
+			fmt.Fprintf(stderr, "gc: stage-1 materialize-skills at %s (agents %s): %v\n", dir, sink.agentList(), merr) //nolint:errcheck // best-effort stderr
 			continue
 		}
 		for _, s := range res.Skipped {
@@ -175,7 +178,7 @@ func runStage1SkillMaterialization(cityPath string, cfg *config.City, stderr io.
 			}
 		}
 		for _, w := range res.Warnings {
-			fmt.Fprintf(stderr, "gc: stage-1 materialize warning at %s: %s\n", dir, w) //nolint:errcheck // best-effort stderr
+			fmt.Fprintf(stderr, "gc: stage-1 materialize warning at %s (agents %s): %s\n", dir, sink.agentList(), w) //nolint:errcheck // best-effort stderr
 		}
 	}
 	return nil
@@ -194,13 +197,14 @@ type stage1SinkWant struct {
 // and agent-local entries are kept apart so desired can apply the
 // precedence materialize.EffectiveSet applies to one agent.
 type stage1Sink struct {
-	dir       string
-	agents    []string
-	shared    map[string]stage1SinkWant
-	local     map[string]stage1SinkWant
-	clashes   []stage1SinkClash
-	owned     []string
-	ownedSeen map[string]bool
+	dir        string
+	agents     []string
+	shared     map[string]stage1SinkWant
+	local      map[string]stage1SinkWant
+	clashes    []stage1SinkClash
+	unreadable []string
+	owned      []string
+	ownedSeen  map[string]bool
 }
 
 // stage1SinkClash records a name wanted from two sources in the same
@@ -270,6 +274,21 @@ func (s *stage1Sink) conflicts() []string {
 		}
 	}
 	return out
+}
+
+// problems returns why the sink cannot be reconciled this pass: agent
+// catalogs that could not be read, then unresolved conflicts.
+func (s *stage1Sink) problems() []string {
+	return append(append([]string(nil), s.unreadable...), s.conflicts()...)
+}
+
+// agentList names the sink's agents, in config order, for log lines.
+func (s *stage1Sink) agentList() string {
+	quoted := make([]string, len(s.agents))
+	for i, agent := range s.agents {
+		quoted[i] = fmt.Sprintf("%q", agent)
+	}
+	return strings.Join(quoted, ", ")
 }
 
 // addOwned adds root to the sink's prunable roots once.
