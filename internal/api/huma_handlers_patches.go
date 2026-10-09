@@ -55,15 +55,17 @@ func (s *Server) humaHandleAgentPatchSet(_ context.Context, input *AgentPatchSet
 	}
 
 	patch := config.AgentPatch{
-		Dir:       input.Body.Dir,
-		Rig:       input.Body.Rig,
-		Name:      input.Body.Name,
-		Provider:  input.Body.Provider,
-		WorkDir:   input.Body.WorkDir,
-		TmuxAlias: input.Body.TmuxAlias,
-		Scope:     input.Body.Scope,
-		Suspended: input.Body.Suspended,
-		Env:       input.Body.Env,
+		Dir:               input.Body.Dir,
+		Rig:               input.Body.Rig,
+		Name:              input.Body.Name,
+		Provider:          input.Body.Provider,
+		WorkDir:           input.Body.WorkDir,
+		TmuxAlias:         input.Body.TmuxAlias,
+		Scope:             input.Body.Scope,
+		Suspended:         input.Body.Suspended,
+		Env:               input.Body.Env,
+		OptInSkills:       input.Body.OptInSkills,
+		OptInSkillsAppend: input.Body.OptInSkillsAppend,
 	}
 
 	// Validate at the edge so a patch that would hard-fail the next config
