@@ -163,6 +163,7 @@ go_test(
         "//internal/suspensionstate",
         "//internal/testenv",
         "//internal/testutil",
+        "//internal/validation",
     ],
 )
 
