@@ -293,7 +293,9 @@ func cmdRigAdd(args []string, includes []string, nameOverride, prefixOverride, d
 //
 // Idempotent: a converged city creates nothing new. Non-fatal by design: a
 // config-load error here must not fail an already-persisted rig add, and
-// runStage1SkillMaterialization logs per-agent issues inline and returns nil.
+// runStage1SkillMaterialization logs every sink it cannot reconcile inline
+// and leaves it as it was; the error it returns repeats that, so rig add
+// ignores it.
 func materializeSkillsForCity(cityPath string, stderr io.Writer) {
 	cfg, _, err := loadCityConfigWithBuiltinPacks(cityPath)
 	if err != nil {
