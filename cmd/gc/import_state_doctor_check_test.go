@@ -88,6 +88,71 @@ version = "^1.0"
 	}
 }
 
+// TestImportStateDoctorCheckStaysGreenOnNoticeOnlyFindings is a regression test
+// for a defect a cross-family reviewer caught in this change before it shipped.
+//
+// The divergence leg was added to packman's report with the claim that it
+// "never changes an exit code", which was true of `gc import check` and FALSE
+// here: this check turned ANY report.HasIssues() into StatusError, doctor
+// severity defaults to blocking, and `gc doctor` exits 1 on a blocking failure.
+// A city that deliberately pins a fork of a bundled pack — a supported
+// configuration — would have gone red the moment the binary landed, and
+// `gc doctor --fix` would have run syncImports plus an install against a city
+// where nothing was broken, which cannot change a pin in any case.
+//
+// StatusWarning is not the answer either: CheckStatus.IsFailure() counts a
+// warning, so --fix would still fire. The count belongs in the MESSAGE, which
+// always prints, with the itemization left to `gc import check`.
+func TestImportStateDoctorCheckStaysGreenOnNoticeOnlyFindings(t *testing.T) {
+	clearGCEnv(t)
+	cityDir := t.TempDir()
+	writeCityToml(t, cityDir, "[workspace]\nname = \"demo\"\n")
+	writePackToml(t, cityDir, `[pack]
+name = "demo"
+schema = 1
+
+[imports.core]
+source = "https://github.com/quickserve-ai/gascity.git//internal/bootstrap/packs/core"
+version = "sha:ab3ed836ac6f08586ea691e58257f18acc0586d9"
+`)
+
+	prevCheck := checkInstalledImports
+	t.Cleanup(func() { checkInstalledImports = prevCheck })
+	checkInstalledImports = func(_ string, _ map[string]config.Import) (*packman.CheckReport, error) {
+		return &packman.CheckReport{
+			CheckedSources: 1,
+			Issues: []packman.CheckIssue{{
+				Severity:   packman.CheckSeverityNotice,
+				Code:       "bundled-pack-content-diverged",
+				ImportName: "core",
+				Source:     "https://github.com/quickserve-ai/gascity.git//internal/bootstrap/packs/core",
+				Commit:     "ab3ed836ac6f08586ea691e58257f18acc0586d9",
+				Message:    `content that executes differs from this binary's embedded "core" pack: 1 differ (formulas/mol-scoped-work.toml)`,
+			}},
+		}, nil
+	}
+
+	check := newImportStateDoctorCheck(cityDir)
+	result := check.Run(&doctor.CheckContext{CityPath: cityDir, Verbose: true})
+	if result.Status != doctor.StatusOK {
+		t.Fatalf("status = %v, want OK — a notice must not fail gc doctor; result=%#v", result.Status, result)
+	}
+	if result.Status.IsFailure() {
+		t.Fatal("status counts as a failure, so gc doctor --fix would run an install against a healthy city")
+	}
+	// Visible without --verbose: Details only print in verbose mode, so the
+	// summary line itself has to say a finding exists.
+	if !strings.Contains(result.Message, "finding(s) worth reading") {
+		t.Fatalf("message hides the finding: %q", result.Message)
+	}
+	if !strings.Contains(result.Message, "gc import check") {
+		t.Fatalf("message does not point at the itemized report: %q", result.Message)
+	}
+	if len(result.Details) != 1 || !strings.Contains(result.Details[0], "bundled-pack-content-diverged") {
+		t.Fatalf("details = %#v", result.Details)
+	}
+}
+
 func TestImportStateDoctorCheckFixRunsImportInstallPath(t *testing.T) {
 	clearGCEnv(t)
 	cityDir := t.TempDir()
