@@ -614,11 +614,10 @@ func TestRunStage1AgentLocalOnlyInItsOwnSink(t *testing.T) {
 // TestRunStage1SharedSinkKeepsAgentLocalSkill covers two agents that share
 // one sink: same scope root (the city) and same provider family, so both
 // materialize into <city>/.claude/skills. Only mayor has an agent-local
-// skill. Each agent's pass records what it writes in the sink's ownership
-// manifest, and a later agent's pass reads the manifest, treats mayor's
-// link as its own, finds it undesired, and removes it. The pass runs per
-// agent, not per sink, so whichever agent comes later in cfg.Agents decides
-// what the shared sink holds. mayor's agent-local skill must survive.
+// skill, and it must survive the pass. The sink's ownership manifest marks
+// every gc-written link as prunable by any later pass, so a pass per agent
+// would let deputy, later in cfg.Agents, find mayor's link undesired and
+// remove it; the sink is materialized once with both agents' skills.
 func TestRunStage1SharedSinkKeepsAgentLocalSkill(t *testing.T) {
 	clearGCEnv(t)
 	cityPath := t.TempDir()
