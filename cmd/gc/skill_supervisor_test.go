@@ -1057,6 +1057,15 @@ func TestRunStage1SharedSinkCatalogLoadErrorKeepsLinks(t *testing.T) {
 		t.Errorf("m-only pruned while mayor's catalog could not be read: %v", err)
 	}
 
+	// A shared skill added while the sink is held waits for the next pass
+	// that can read every catalog, so its link proves that pass reconciled.
+	writeSkillSource(t, filepath.Join(cityPath, "skills", "fresh"))
+	stderr.Reset()
+	_ = runStage1SkillMaterialization(cityPath, cfg, &stderr)
+	if _, err := os.Lstat(filepath.Join(sink, "fresh")); err == nil {
+		t.Errorf("fresh linked while mayor's catalog could not be read")
+	}
+
 	if err := os.Remove(mayorDir); err != nil {
 		t.Fatal(err)
 	}
@@ -1067,7 +1076,7 @@ func TestRunStage1SharedSinkCatalogLoadErrorKeepsLinks(t *testing.T) {
 	if err := runStage1SkillMaterialization(cityPath, cfg, &stderr); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"plan", "m-only", "d-only"} {
+	for _, name := range []string{"plan", "m-only", "d-only", "fresh"} {
 		if _, err := os.Lstat(filepath.Join(sink, name)); err != nil {
 			t.Errorf("%s missing after mayor's catalog reads again: %v; stderr=%q", name, err, stderr.String())
 		}
