@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -153,6 +154,52 @@ func TestHandleAgentPatchSet_Provider(t *testing.T) {
 	}
 	if patch.Provider == nil || *patch.Provider != "claude-max" {
 		t.Errorf("GET patch Provider = %v, want %q", patch.Provider, "claude-max")
+	}
+}
+
+// TestHandleAgentPatchSet_OptInSkills verifies PUT /patches/agents carries
+// the opt-in skill selection: opt_in_skills replaces the agent's list (an
+// empty list clears it; leaving it out, or a null the decoder turns into
+// nil, keeps it) and opt_in_skills_append adds to it.
+func TestHandleAgentPatchSet_OptInSkills(t *testing.T) {
+	tests := []struct {
+		name        string
+		body        string
+		wantReplace *[]string
+		wantAppend  []string
+	}{
+		{name: "replace", body: `{"name":"mayor","opt_in_skills":["fleet.login"]}`, wantReplace: &[]string{"fleet.login"}},
+		{name: "clear", body: `{"name":"mayor","opt_in_skills":[]}`, wantReplace: &[]string{}},
+		{name: "append", body: `{"name":"mayor","opt_in_skills_append":["fleet.audit"]}`, wantAppend: []string{"fleet.audit"}},
+		{name: "null leaves the list alone", body: `{"name":"mayor","opt_in_skills":null}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs := newFakeMutatorState(t)
+			h := newTestCityHandler(t, fs)
+			req := httptest.NewRequest("PUT", cityURL(fs, "/patches/agents"), strings.NewReader(tt.body))
+			req.Header.Set("X-GC-Request", "true")
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body = %s", w.Code, http.StatusOK, w.Body.String())
+			}
+			if len(fs.cfg.Patches.Agents) != 1 {
+				t.Fatalf("patches.agent count = %d, want 1", len(fs.cfg.Patches.Agents))
+			}
+			got := fs.cfg.Patches.Agents[0]
+			switch {
+			case tt.wantReplace == nil && got.OptInSkills != nil:
+				t.Errorf("OptInSkills = %v, want unset", *got.OptInSkills)
+			case tt.wantReplace != nil && got.OptInSkills == nil:
+				t.Errorf("OptInSkills unset, want %v", *tt.wantReplace)
+			case tt.wantReplace != nil && !reflect.DeepEqual(*got.OptInSkills, *tt.wantReplace):
+				t.Errorf("OptInSkills = %#v, want %#v", *got.OptInSkills, *tt.wantReplace)
+			}
+			if !reflect.DeepEqual(got.OptInSkillsAppend, tt.wantAppend) {
+				t.Errorf("OptInSkillsAppend = %#v, want %#v", got.OptInSkillsAppend, tt.wantAppend)
+			}
+		})
 	}
 }
 

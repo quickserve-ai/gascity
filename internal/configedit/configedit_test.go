@@ -2554,6 +2554,34 @@ func TestSetAgentPatch_Replaces(t *testing.T) {
 	}
 }
 
+// TestSetAgentPatch_OptInSkillsRoundTrip: an agent patch written by the
+// editor keeps the opt-in selection through city.toml, including the
+// empty list that clears an agent's selection.
+func TestSetAgentPatch_OptInSkillsRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := writeTOML(t, dir, minimalCity())
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+
+	if err := ed.SetAgentPatch(config.AgentPatch{
+		Name:              "mayor",
+		OptInSkills:       &[]string{},
+		OptInSkillsAppend: []string{"fleet.audit"},
+	}); err != nil {
+		t.Fatalf("SetAgentPatch: %v", err)
+	}
+	cfg := readTOML(t, path)
+	if len(cfg.Patches.Agents) != 1 {
+		t.Fatalf("patches.agent count = %d, want 1", len(cfg.Patches.Agents))
+	}
+	got := cfg.Patches.Agents[0]
+	if got.OptInSkills == nil || len(*got.OptInSkills) != 0 {
+		t.Errorf("OptInSkills = %v, want the empty list that clears the selection", got.OptInSkills)
+	}
+	if len(got.OptInSkillsAppend) != 1 || got.OptInSkillsAppend[0] != "fleet.audit" {
+		t.Errorf("OptInSkillsAppend = %v, want [fleet.audit]", got.OptInSkillsAppend)
+	}
+}
+
 func TestDeleteAgentPatch(t *testing.T) {
 	dir := t.TempDir()
 	path := writeTOML(t, dir, minimalCity())
