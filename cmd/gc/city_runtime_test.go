@@ -6504,6 +6504,76 @@ func TestCityRuntimeReloadPrunesOneAgentsSkillInSharedSink(t *testing.T) {
 	requireLinks("after deputy's skill was removed", []string{"plan", "m-only"}, []string{"d-only"})
 }
 
+// TestCityRuntimeReloadWarnsOfUnreconciledSkillSink: rigs fe and be share
+// one path, and each imports a pack bound as ops whose review skill lives
+// in a different directory. Both pass validation, so the reload applies,
+// but the rigs' claude agents write one sink that cannot link ops.review
+// from two sources, and stage 1 leaves it unreconciled. The reload reply
+// must say so, naming the sink, and not only the controller's stderr.
+func TestCityRuntimeReloadWarnsOfUnreconciledSkillSink(t *testing.T) {
+	holdFeatureFlagsForTest(t)
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	clearInheritedBeadsEnv(t)
+	requireNoLeakedDoltAfterForPaths(t, cityPath)
+	rigDir := filepath.Join(cityPath, "rigs", "shared")
+	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(rigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, pack := range []string{"ops-a", "ops-b"} {
+		packDir := filepath.Join(cityPath, "assets", pack)
+		writeSkillSource(t, filepath.Join(packDir, "skills", "review"))
+		writeMaterializeTestCityFile(t, packDir, "pack.toml", "[pack]\nname = \"ops\"\nversion = \"0.1.0\"\nschema = 2\n")
+	}
+	writeMaterializeTestCityFile(t, filepath.Join(cityPath, ".gc"), "site.toml",
+		fmt.Sprintf("[[rig]]\nname = \"fe\"\npath = %q\n\n[[rig]]\nname = \"be\"\npath = %q\n", rigDir, rigDir))
+	rigs := "[[rigs]]\nname = \"fe\"\n\n[rigs.imports.ops]\nsource = \"./assets/ops-a\"\n\n" +
+		"[[rigs]]\nname = \"be\"\n\n[rigs.imports.ops]\nsource = \"./assets/ops-b\"\n\n"
+	writeSkillMaterializationTestConfig(t, tomlPath, rigs)
+
+	cfg, configRev := loadCityRuntimeControllerConfig(t, cityPath)
+	sp := runtime.NewFake()
+	var stdout, stderr bytes.Buffer
+	cr := newTestCityRuntime(t, CityRuntimeParams{
+		CityPath:     cityPath,
+		CityName:     "test-city",
+		TomlPath:     tomlPath,
+		WatchTargets: config.WatchTargets(nil, cfg, cityPath),
+		ConfigRev:    configRev,
+		ConfigDirty:  &atomic.Bool{},
+		Cfg:          cfg,
+		SP:           sp,
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		Dops:   newDrainOps(sp),
+		Rec:    events.Discard,
+		PokeCh: make(chan struct{}, 8),
+		Stdout: &stdout,
+		Stderr: &stderr,
+	})
+
+	writeSkillMaterializationTestConfig(t, tomlPath, rigs, "[orders]\nskip = [\"reaper\"]\n")
+	lastProviderName := "tmux"
+	reply := cr.reloadConfigTraced(context.Background(), &lastProviderName, cityPath, nil, reloadSourceWatch)
+	if reply.Outcome != reloadOutcomeApplied {
+		t.Fatalf("reload outcome = %q, want %q; stderr=%q", reply.Outcome, reloadOutcomeApplied, stderr.String())
+	}
+	sink := filepath.Join(rigDir, ".claude", "skills")
+	found := false
+	for _, w := range reply.Warnings {
+		if strings.Contains(w, sink) && strings.Contains(w, `"ops.review"`) {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("reload warnings %q do not name the unreconciled sink %s; stderr=%q", reply.Warnings, sink, stderr.String())
+	}
+}
+
 // TestCityRuntimeReloadRejectsCollidingSkillMaterialization guards the
 // collision gate the reload path shares with `gc start` and the
 // supervisor tick (checkSkillCollisions before materialize). Two
