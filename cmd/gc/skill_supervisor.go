@@ -9,6 +9,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/doctor"
 	"github.com/gastownhall/gascity/internal/materialize"
+	"github.com/gastownhall/gascity/internal/pathutil"
 	"github.com/gastownhall/gascity/internal/validation"
 )
 
@@ -112,21 +113,27 @@ func runStage1SkillMaterialization(cityPath string, cfg *config.City, stderr io.
 		}
 		sinkDir := filepath.Join(scopeRoot, vendor)
 
-		sink := sinks[sinkDir]
+		// Group by the sink's physical directory: a rig path that is a
+		// symlink to another rig's path, or to the city root, reaches
+		// the same sink, and two passes over one sink would prune each
+		// other's links. The first agent's spelling is the one written.
+		sinkKey := pathutil.NormalizePathForCompare(sinkDir)
+		sink := sinks[sinkKey]
 		if sink == nil {
-			sink = newStage1Sink()
-			sinks[sinkDir] = sink
+			sink = newStage1Sink(sinkDir)
+			sinks[sinkKey] = sink
 		}
 		sink.add(agent.QualifiedName(), cityCat, agentCat)
 	}
 
-	sinkDirs := make([]string, 0, len(sinks))
-	for dir := range sinks {
-		sinkDirs = append(sinkDirs, dir)
+	sinkKeys := make([]string, 0, len(sinks))
+	for key := range sinks {
+		sinkKeys = append(sinkKeys, key)
 	}
-	sort.Strings(sinkDirs)
-	for _, dir := range sinkDirs {
-		sink := sinks[dir]
+	sort.Strings(sinkKeys)
+	for _, key := range sinkKeys {
+		sink := sinks[key]
+		dir := sink.dir
 		// A name the sink cannot resolve degrades this sink's
 		// reconciliation for the pass: its existing links stay, and
 		// additions and removals for every agent in it wait until the
@@ -187,6 +194,7 @@ type stage1SinkWant struct {
 // and agent-local entries are kept apart so desired can apply the
 // precedence materialize.EffectiveSet applies to one agent.
 type stage1Sink struct {
+	dir       string
 	agents    []string
 	shared    map[string]stage1SinkWant
 	local     map[string]stage1SinkWant
@@ -203,8 +211,10 @@ type stage1SinkClash struct {
 	msg   string
 }
 
-func newStage1Sink() *stage1Sink {
+// newStage1Sink returns an empty sink that the materializer writes at dir.
+func newStage1Sink(dir string) *stage1Sink {
 	return &stage1Sink{
+		dir:       dir,
 		shared:    make(map[string]stage1SinkWant),
 		local:     make(map[string]stage1SinkWant),
 		ownedSeen: make(map[string]bool),
@@ -228,14 +238,15 @@ func (s *stage1Sink) add(agent string, city materialize.CityCatalog, local mater
 
 // want records that agent wants entry e in the given class. A name
 // wanted from one source by several agents is wanted once; a second
-// source for the same name is recorded as a clash.
+// source for the same name is recorded as a clash. Sources are compared
+// by physical directory, so two paths to one directory are one source.
 func (s *stage1Sink) want(class map[string]stage1SinkWant, local bool, agent string, e materialize.SkillEntry) {
 	prev, ok := class[e.Name]
 	if !ok {
 		class[e.Name] = stage1SinkWant{entry: e, agent: agent}
 		return
 	}
-	if prev.entry.Source != e.Source {
+	if pathutil.NormalizePathForCompare(prev.entry.Source) != pathutil.NormalizePathForCompare(e.Source) {
 		s.clashes = append(s.clashes, stage1SinkClash{
 			name:  e.Name,
 			local: local,
