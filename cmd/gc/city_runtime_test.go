@@ -6334,12 +6334,12 @@ func TestCityRuntimeReloadMaterializesNewlyAddedSkill(t *testing.T) {
 // form of TestRunStage1SharedSinkKeepsAgentLocalSkill. mayor and deputy are
 // both city-scoped claude agents, so they share <city>/.claude/skills; only
 // mayor has an agent-local skill. The skill is in the sink before the
-// reload (mayor's own materialize-skills pass put it there). An applied
-// reload then runs stage-1 materialization for every configured agent in
-// turn, and deputy's pass removes mayor's link because the sink's ownership
-// manifest records it as gc-written. Ordinary ticks never run stage-1, so
-// in a running city the skill disappears at the first config change that
-// moves the revision.
+// reload (mayor's own materialize-skills pass put it there), and an
+// applied reload, which runs stage-1 materialization for the whole city,
+// must keep it even though the sink's ownership manifest records the link
+// as gc-written and deputy does not want it. Ordinary ticks never run
+// stage-1, so an applied reload is the live path that reconciles the
+// shared sink.
 func TestCityRuntimeReloadKeepsAgentLocalSkillInSharedSink(t *testing.T) {
 	cityPath := t.TempDir()
 	tomlPath := filepath.Join(cityPath, "city.toml")
