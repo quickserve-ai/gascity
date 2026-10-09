@@ -3789,20 +3789,29 @@ func (t *Tmux) nudgeSession(
 		return fmt.Errorf("dismissing feedback survey before nudge: %w", err)
 	}
 
-	// 2. Send text in literal mode with retry on transient errors, after a
-	// last look for a permission prompt: the clear and the survey check above
-	// take time, and a paste into a prompt is read as menu input.
+	// A last look for a permission prompt before the paste: the clear and the
+	// survey check above take time, and a paste into a prompt is read as menu
+	// input.
 	if err := prompt.check(); err != nil {
 		return err
 	}
-	// The provider's own record of this delivery is read from here on (see
+
+	// The attached clients' input marks, read before our text goes in. At
+	// the submit check they let a bare paste placeholder of our message's
+	// size, with no placeholder of ours recorded and no input from an
+	// attached client since, be taken as our own collapsed paste
+	// (noHumanInputSince, ga-ib2ffp); a client present only between the two
+	// reads is the stated residual.
+	owner := t.newDraftOwner(session, message)
+
+	// 2. Send text in literal mode with retry on transient errors. The
+	// provider's own record of this delivery is read from here on (see
 	// unobservedSubmitVerdict).
 	typedAt := time.Now()
 	if err := sendText(ctx, target, message, t.cfg.NudgeReadyTimeout); err != nil {
 		return err
 	}
 	// Placeholder provenance, before the debounce (ga-da5vmz).
-	owner := &draftOwner{message: message}
 	t.noteDraft(owner, session, target)
 
 	// 3. Wait for paste to complete (tested, required). Kimi's TUI can take
@@ -4045,12 +4054,14 @@ func (t *Tmux) NudgePane(pane, message string) error {
 		}
 	}()
 
+	// The submit below is owner-checked as NudgeSession's is (ga-da5vmz),
+	// with the input high-water mark read before the text goes in (ga-ib2ffp).
+	owner := t.newDraftOwner(pane, message)
+
 	// 1. Send text in literal mode with retry on transient errors
 	if err := t.sendKeysLiteralWithRetry(context.Background(), pane, message, t.cfg.NudgeReadyTimeout); err != nil {
 		return err
 	}
-	// The submit below is owner-checked as NudgeSession's is (ga-da5vmz).
-	owner := &draftOwner{message: message}
 	t.noteDraft(owner, pane, pane)
 
 	// 2. Wait 500ms for paste to complete (tested, required)
