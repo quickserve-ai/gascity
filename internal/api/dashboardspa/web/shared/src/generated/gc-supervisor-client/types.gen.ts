@@ -88,6 +88,8 @@ export type AgentPatch = {
     MouseMode: string | null;
     Name: string;
     Nudge: string | null;
+    OptInSkills: Array<string> | null;
+    OptInSkillsAppend: Array<string> | null;
     OptionDefaults: {
         [key: string]: string;
     };
@@ -134,6 +136,14 @@ export type AgentPatchSetInputBody = {
      * Agent name.
      */
     name?: string;
+    /**
+     * Replace the agent's opt-in skill selection (binding-qualified names of skills a pack ships under skills/opt-in/). An empty list clears it; omit the field to inherit the underlying agent's list.
+     */
+    opt_in_skills?: Array<string>;
+    /**
+     * Opt-in skills to add to the agent's selection.
+     */
+    opt_in_skills_append?: Array<string> | null;
     /**
      * Override the agent's provider.
      */

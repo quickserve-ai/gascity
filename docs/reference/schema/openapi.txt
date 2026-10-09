@@ -342,6 +342,24 @@
               "null"
             ]
           },
+          "OptInSkills": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "OptInSkillsAppend": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "OptionDefaults": {
             "additionalProperties": {
               "type": "string"
@@ -575,6 +593,8 @@
           "SessionLiveAppend",
           "InstallAgentHooksAppend",
           "InjectFragmentsAppend",
+          "OptInSkills",
+          "OptInSkillsAppend",
           "MaxActiveSessions",
           "MinActiveSessions",
           "ScaleCheck",
@@ -599,6 +619,23 @@
           "name": {
             "description": "Agent name.",
             "type": "string"
+          },
+          "opt_in_skills": {
+            "description": "Replace the agent's opt-in skill selection (binding-qualified names of skills a pack ships under skills/opt-in/). An empty list clears it; omit the field to inherit the underlying agent's list.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "opt_in_skills_append": {
+            "description": "Opt-in skills to add to the agent's selection.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
           },
           "provider": {
             "description": "Override the agent's provider.",
