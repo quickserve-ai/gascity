@@ -751,7 +751,7 @@ func cmdMailCheckWithFormat(args []string, inject bool, hookFormat string, stdou
 			if inject {
 				// The turn-driven lease refresher rides the start-of-turn
 				// leg every managed overlay EXCEPT kimi traverses (kimi has
-				// only a SessionStart hook; SESSION-RUNTIME-012). Detached
+				// only a SessionStart hook; SESSION-RUNTIME-014). Detached
 				// and throttled; writes nothing to the injected stream
 				// (ga-56nq1a stage 1).
 				maybeSpawnLeaseHeartbeat(cityPath, cfg)
