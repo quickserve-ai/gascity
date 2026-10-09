@@ -25,7 +25,9 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/executionevent"
+	"github.com/gastownhall/gascity/internal/formulatest"
 	"github.com/gastownhall/gascity/internal/fsys"
+	"github.com/gastownhall/gascity/internal/molecule"
 	"github.com/gastownhall/gascity/internal/orders"
 	"github.com/gastownhall/gascity/internal/resilience"
 	"github.com/gastownhall/gascity/internal/rollout/gate"
@@ -6330,6 +6332,16 @@ func TestCityRuntimeReloadMaterializesNewlyAddedSkill(t *testing.T) {
 	}
 }
 
+// holdFeatureFlagsForTest restores the process-global feature flags when
+// t ends. loadCityRuntimeControllerConfig and an applied reload both apply
+// the loaded config's flags, which would otherwise leak into later tests.
+func holdFeatureFlagsForTest(t *testing.T) {
+	t.Helper()
+	formulatest.HoldV2ForTest(t)
+	prevGraphApply := molecule.IsGraphApplyEnabled()
+	t.Cleanup(func() { molecule.SetGraphApplyEnabled(prevGraphApply) })
+}
+
 // TestCityRuntimeReloadKeepsAgentLocalSkillInSharedSink is the live-reload
 // form of TestRunStage1SharedSinkKeepsAgentLocalSkill. mayor and deputy are
 // both city-scoped claude agents, so they share <city>/.claude/skills; only
@@ -6341,6 +6353,7 @@ func TestCityRuntimeReloadMaterializesNewlyAddedSkill(t *testing.T) {
 // stage-1, so an applied reload is the live path that reconciles the
 // shared sink.
 func TestCityRuntimeReloadKeepsAgentLocalSkillInSharedSink(t *testing.T) {
+	holdFeatureFlagsForTest(t)
 	cityPath := t.TempDir()
 	tomlPath := filepath.Join(cityPath, "city.toml")
 	clearInheritedBeadsEnv(t)
@@ -6417,6 +6430,7 @@ func TestCityRuntimeReloadKeepsAgentLocalSkillInSharedSink(t *testing.T) {
 // and keeps mayor's: one pass per sink still cleans up after a single
 // agent's catalog.
 func TestCityRuntimeReloadPrunesOneAgentsSkillInSharedSink(t *testing.T) {
+	holdFeatureFlagsForTest(t)
 	cityPath := t.TempDir()
 	tomlPath := filepath.Join(cityPath, "city.toml")
 	clearInheritedBeadsEnv(t)
