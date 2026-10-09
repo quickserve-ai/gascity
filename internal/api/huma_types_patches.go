@@ -46,6 +46,11 @@ type AgentPatchSetInput struct {
 		Scope     *string           `json:"scope,omitempty" doc:"Override agent scope."`
 		Suspended *bool             `json:"suspended,omitempty" doc:"Override suspended state."`
 		Env       map[string]string `json:"env,omitempty" doc:"Override environment variables."`
+		// OptInSkills is presence-aware like config.AgentPatch.OptInSkills:
+		// leaving it out keeps the agent's list, [] clears it. A JSON null
+		// decodes to nil and is treated as left out.
+		OptInSkills       *[]string `json:"opt_in_skills,omitempty" doc:"Replace the agent's opt-in skill selection (binding-qualified names of skills a pack ships under skills/opt-in/). An empty list clears it; omit the field to keep the agent's list."`
+		OptInSkillsAppend []string  `json:"opt_in_skills_append,omitempty" doc:"Opt-in skills to add to the agent's selection."`
 	}
 }
 
