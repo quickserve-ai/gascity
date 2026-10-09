@@ -730,8 +730,8 @@ func TestRunStage1SharedSinkLocalConflictKeepsExistingLinks(t *testing.T) {
 	}
 
 	stderr.Reset()
-	if err := runStage1SkillMaterialization(cityPath, cfg, &stderr); err != nil {
-		t.Fatal(err)
+	if err := runStage1SkillMaterialization(cityPath, cfg, &stderr); err == nil || !strings.Contains(err.Error(), sink) {
+		t.Errorf("pass over a conflicting sink returned %v, want an error naming %s", err, sink)
 	}
 	for _, want := range []string{`skill "dup"`, `agent "mayor"`, `agent "deputy"`, sink, "sink not reconciled this pass"} {
 		if !strings.Contains(stderr.String(), want) {
@@ -843,8 +843,8 @@ func TestRunStage1SharedSinkSharedConflictDegradesReconciliation(t *testing.T) {
 	}
 
 	stderr.Reset()
-	if err := runStage1SkillMaterialization(cityPath, cfg, &stderr); err != nil {
-		t.Fatal(err)
+	if err := runStage1SkillMaterialization(cityPath, cfg, &stderr); err == nil || !strings.Contains(err.Error(), sink) {
+		t.Errorf("pass over a conflicting sink returned %v, want an error naming %s", err, sink)
 	}
 	for _, want := range []string{`skill "ops.review"`, `agent "fe/polecat"`, `agent "be/witness"`, "existing links kept"} {
 		if !strings.Contains(stderr.String(), want) {
@@ -913,7 +913,9 @@ func TestRunStage1SharedSinkIncompletePassKeepsEveryAgentsSkips(t *testing.T) {
 	writeSkillSource(t, filepath.Join(mayorSkills, "dup"))
 	dup := filepath.Join(deputySkills, "dup")
 	writeSkillSource(t, dup)
-	runStage1ForSkipTest(t, cityPath, cfg, &stderr)
+	if err := runStage1SkillMaterialization(cityPath, cfg, &stderr); err == nil {
+		t.Error("pass over a conflicting sink returned no error")
+	}
 	if !strings.Contains(stderr.String(), "not reconciled") {
 		t.Fatalf("second pass did not hit the conflict: %q", stderr.String())
 	}
@@ -973,7 +975,9 @@ func TestRunStage1SharedSinkRunErrorKeepsEveryAgentsSkips(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := stderr.Len()
-	runStage1ForSkipTest(t, cityPath, cfg, &stderr)
+	if err := runStage1SkillMaterialization(cityPath, cfg, &stderr); err == nil || !strings.Contains(err.Error(), sink) {
+		t.Errorf("failed pass returned %v, want an error naming %s", err, sink)
+	}
 	failed := stderr.String()[before:]
 	want := "gc: stage-1 materialize-skills at " + sink + ` (agents "mayor", "deputy"): `
 	if got := strings.Count(failed, want); got != 1 {
@@ -1038,7 +1042,9 @@ func TestRunStage1SharedSinkCatalogLoadErrorKeepsLinks(t *testing.T) {
 		t.Fatal(err)
 	}
 	stderr.Reset()
-	_ = runStage1SkillMaterialization(cityPath, cfg, &stderr)
+	if err := runStage1SkillMaterialization(cityPath, cfg, &stderr); err == nil || !strings.Contains(err.Error(), sink) {
+		t.Errorf("pass with an unreadable catalog returned %v, want an error naming %s", err, sink)
+	}
 	if got := strings.Count(stderr.String(), "LoadAgentCatalog"); got != 1 {
 		t.Errorf("load error reported %d times, want 1: %q", got, stderr.String())
 	}
