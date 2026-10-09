@@ -110,7 +110,7 @@ func runStage1SkillMaterialization(cityPath string, cfg *config.City, stderr io.
 		if !filepath.IsAbs(scopeRoot) {
 			scopeRoot = filepath.Join(cityPath, scopeRoot)
 		}
-		sinkDir := filepath.Clean(filepath.Join(scopeRoot, vendor))
+		sinkDir := filepath.Join(scopeRoot, vendor)
 
 		sink := sinks[sinkDir]
 		if sink == nil {
