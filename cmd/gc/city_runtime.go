@@ -3097,8 +3097,8 @@ func (cr *CityRuntime) reloadConfigTraced(
 	// advertised in the catalog and prompt appendix but never materialized
 	// into (or pruned from) the vendor sink until a full supervisor
 	// restart (#3459). Idempotent — a converged pass creates nothing new;
-	// per-agent errors are logged to stderr internally and never abort
-	// the reload.
+	// a sink it cannot reconcile is logged to stderr internally and never
+	// aborts the reload.
 	//
 	// Match the start/supervisor invariant: validate skill collisions
 	// before materializing so a colliding live-reload config can't write
