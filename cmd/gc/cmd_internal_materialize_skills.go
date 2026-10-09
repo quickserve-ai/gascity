@@ -164,10 +164,13 @@ func decodeSharedCatalogSnapshot(encoded string) (materialize.CityCatalog, error
 // materializeSkillsIntoWorkdir materializes one agent's skills into
 // workdir's vendor sink, for `gc internal materialize-skills` and
 // `gc worktree ensure --agent`. Unlike the stage-1 pass, it reconciles
-// the sink for this agent alone: if another agent's skills land in the
-// same sink (two sessions sharing a work_dir, or a work_dir that is
-// another agent's scope root), this run prunes that agent's agent-local
-// links. Grouping this path by sink is a known follow-up.
+// the sink for this agent alone, so a shared sink is still pruned
+// across agents in two ways. Two sessions of different agents sharing a
+// work_dir prune each other's agent-local links. A session whose
+// work_dir is another agent's scope root writes its links into that
+// root's sink, and the root's next stage-1 pass, which groups only the
+// agents scoped there, prunes them. Grouping this path by sink is a
+// known follow-up.
 func materializeSkillsIntoWorkdir(cfg *config.City, agent *config.Agent, cityPath, workdir string, sharedCatalog *materialize.CityCatalog, stdout, stderr io.Writer) error {
 	if cfg == nil || agent == nil {
 		fmt.Fprintln(stderr, "gc internal materialize-skills: missing city config or agent") //nolint:errcheck // best-effort stderr
