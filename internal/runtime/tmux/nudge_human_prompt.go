@@ -350,6 +350,60 @@ func composerHoldsSent(lines []string, promptPrefix, sent string) bool {
 type draftOwner struct {
 	message, placeholder string
 	settled              bool
+	// quietSince is the newest #{client_activity} (a unix second, bumped by
+	// any input a tmux client sends) across the session's clients, read just
+	// before our text went in; quietKnown is false when that read failed, in
+	// which case no quiet claim is made (noHumanInputSince).
+	quietSince int64
+	quietKnown bool
+}
+
+// newDraftOwner makes the owner for message with the session's input
+// high-water mark read now, before the text goes in.
+func (t *Tmux) newDraftOwner(session, message string) *draftOwner {
+	o := &draftOwner{message: message}
+	if at, ok := t.clientActivityMax(session); ok {
+		o.quietSince, o.quietKnown = at, true
+	}
+	return o
+}
+
+// clientActivityMax returns the newest #{client_activity} across the clients
+// attached to session, or false when the read fails, no client is attached,
+// or a value does not parse. tmux bumps client_activity (whole seconds) on
+// every input event from that client, so an unchanged maximum means no
+// person has typed, pasted or pressed a key in the session since the read.
+func (t *Tmux) clientActivityMax(session string) (int64, bool) {
+	out, err := t.run("list-clients", "-t", session, "-F", "#{client_activity}")
+	if err != nil {
+		return 0, false
+	}
+	var newest int64 = -1
+	for _, f := range strings.Fields(out) {
+		n, err := strconv.ParseInt(f, 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		newest = max(newest, n)
+	}
+	return newest, newest >= 0
+}
+
+// noHumanInputSince reports whether no client of session has sent any input
+// since owner's text went in (ga-ib2ffp). The pre-type guard saw the
+// composer empty (or holding only complete gc reminders) before we typed, so
+// a draft that nobody has touched since can only be what we typed, however
+// the composer renders it: a long paste shows inline for a moment and then
+// collapses to a "[Pasted text #N +M lines]" placeholder the provenance
+// read never saw, which is how six seats were left deaf behind their own
+// nudge on 2026-10-09. A failed or unknown read claims nothing (false): the
+// oracle fails toward "a person may have typed".
+func (t *Tmux) noHumanInputSince(session string, owner *draftOwner) bool {
+	if owner == nil || !owner.quietKnown {
+		return false
+	}
+	newest, ok := t.clientActivityMax(session)
+	return ok && newest <= owner.quietSince
 }
 
 // noteDraft reads target's composer and records it in o (notePlaceholder).
@@ -515,7 +569,8 @@ func (t *Tmux) draftIsNotOurs(session, target string, lines []string, owner *dra
 	found, text := composerDraft(lines, prefix)
 	return found && !owner.owns(text) &&
 		t.sessionClientCount(session) != 0 && t.paneIsClaudeFamily(target) &&
-		!t.undimmedDraftIsOurs(target, prefix, owner)
+		!t.undimmedDraftIsOurs(target, prefix, owner) &&
+		!t.noHumanInputSince(session, owner)
 }
 
 // classifyPaneLines is humanPromptGuard's decision on an already-captured
