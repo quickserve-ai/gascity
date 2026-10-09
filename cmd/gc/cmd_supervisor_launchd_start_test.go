@@ -20,8 +20,14 @@ func launchdStartFixture(t *testing.T, plistBinary string, launchctlErr error) (
 	}
 	recorded := []string{}
 	started := false
-	oldRun, oldAlive := supervisorLaunchctlRun, supervisorAliveHook
-	t.Cleanup(func() { supervisorLaunchctlRun, supervisorAliveHook = oldRun, oldAlive })
+	oldRun, oldAlive, oldLoaded := supervisorLaunchctlRun, supervisorAliveHook, supervisorLaunchdLoaded
+	t.Cleanup(func() {
+		supervisorLaunchctlRun, supervisorAliveHook, supervisorLaunchdLoaded = oldRun, oldAlive, oldLoaded
+	})
+	// The carry boots the job out before bootstrap and waits for launchd to
+	// report it gone. Answer that probe here too: the real one runs
+	// `launchctl print`, which a host without launchctl (Linux CI) cannot.
+	supervisorLaunchdLoaded = func(string) (bool, bool, string) { return false, true, "" }
 	supervisorLaunchctlRun = func(args ...string) error {
 		recorded = append(recorded, strings.Join(args, " "))
 		// The carry's launchd refresh loads with `launchctl bootstrap` where
