@@ -47,6 +47,11 @@ type Context struct {
 	TLSServerName            string   `toml:"tls_server_name,omitempty"`
 	InsecureSkipVerify       bool     `toml:"insecure_skip_verify,omitempty"`
 	Timeout                  string   `toml:"timeout,omitempty"` // REST overall timeout; never applied to SSE streams
+	// MailReadTimeout is the budget for one mail read against this city. Set
+	// it above the remote city's server-side mail read deadline (its [mail]
+	// read_timeout minus 5s) so that city's typed store_slow answer arrives
+	// first. Empty uses the 30s default.
+	MailReadTimeout string `toml:"mail_read_timeout,omitempty"`
 }
 
 // File is the on-disk shape of ~/.gc/contexts.toml. Default names the sticky
