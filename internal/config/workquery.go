@@ -752,16 +752,43 @@ func inProgressBlockedByEnrichmentScriptWithServeAction(federated bool, checkHol
 func assignedReadyTierCommand(shellVar string, topo QueryTopology) string {
 	fed := topo.FederatedReady
 	return `r=$(` + readyReaderCommand(fed) + bdReadyIncludeEphemeralArg(topo.includeEphemeralReady()) +
-		` --assignee="$` + shellVar + `" --json --limit=1` + readyReaderStderrSink(fed) + `)` +
+		` --assignee="$` + shellVar + `"` +
+		(PoolDemandServeRules{ExcludeLabels: beadmeta.DispatchHoldLabels}).ShellArgs() +
+		` --json --limit=20` + readyReaderStderrSink(fed) + `)` +
 		readyReaderFailurePropagation(fed) + `; `
+}
+
+// assignedReadyServeScript filters dispatch holds before the first-row cut.
+// A held head cannot hide another assigned bead or the routed tier behind it.
+// Preserve malformed reader output rather than turning a read failure into
+// false-empty work.
+func assignedReadyServeScript() string {
+	filter := `[.[]` + excludeHoldLabelsJQClause() + `] | .[:1]`
+	return `if [ -n "$r" ] && [ "$r" != "[]" ]; then ` +
+		`gc_assigned_ready=$(printf "%s" "$r" | jq -c ` + shellquote.Quote(filter) + ` 2>/dev/null); ` +
+		`[ -n "$gc_assigned_ready" ] && r="$gc_assigned_ready"; ` +
+		`[ "$r" = "[]" ] || { printf "%s" "$r"; exit 0; }; ` +
+		`fi; `
+}
+
+// The assignee-scoped ephemeral probe remains hold-transparent for existence
+// checks. In the serving query, capture its early exit in a subshell and apply
+// the same hold filter before returning any work to the hook. The candidate
+// read runs in the parent shell, ahead of the subshell, so the per-query
+// snapshot memo (ephemeralStatusSnapshotShell, #5712) survives into the next
+// identity instead of being re-scanned inside every subshell.
+func assignedReadyEphemeralServeScript(shellVar string, topo QueryTopology) string {
+	read, filter := ephemeralAssignedReadyProbeParts(shellVar, topo)
+	return read + `r=$(` + filter + `); ` +
+		assignedReadyServeScript()
 }
 
 func standardAssignedReadyWorkQueryScript(topo QueryTopology) string {
 	return `for id in "$GC_SESSION_ID" "$GC_SESSION_NAME" "$GC_ALIAS"; do ` +
 		`[ -z "$id" ] && continue; ` +
 		assignedReadyTierCommand("id", topo) +
-		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
-		ephemeralAssignedReadyProbeScript("id", topo) +
+		assignedReadyServeScript() +
+		assignedReadyEphemeralServeScript("id", topo) +
 		`done; `
 }
 
@@ -814,8 +841,8 @@ func legacyControlAssignedReadyWorkQueryScript(topo QueryTopology) string {
 		`for cand in "$id" "$legacy"; do ` +
 		`[ -z "$cand" ] && continue; ` +
 		assignedReadyTierCommand("cand", topo) +
-		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
-		ephemeralAssignedReadyProbeScript("cand", topo) +
+		assignedReadyServeScript() +
+		assignedReadyEphemeralServeScript("cand", topo) +
 		`done; ` +
 		`done; `
 }
@@ -918,16 +945,23 @@ func ephemeralAssignedInProgressProbeScriptDeferringGraphAnchor(shellVar string,
 // through the same fast and slow filters: `bd query status=open` is not a
 // readiness query, since dependency-blocked issues keep status "open".
 func ephemeralAssignedReadyProbeScript(shellVar string, topo QueryTopology) string {
+	read, filter := ephemeralAssignedReadyProbeParts(shellVar, topo)
+	return read + filter
+}
+
+// ephemeralAssignedReadyProbeParts splits the probe into its candidate read and
+// the filter-and-serve script that consumes it, so a caller that runs the
+// filter in a subshell can keep the read (and its memo) in the parent shell.
+func ephemeralAssignedReadyProbeParts(shellVar string, topo QueryTopology) (read, filter string) {
 	fastFilter := legacyEphemeralReadyFilterJQ(`select((.assignee // "") == $id)`, 1, false)
 	slowFilter := ephemeralReadyDependencyCandidateFilterJQ(`select((.assignee // "") == $id)`, 1, false)
 	candidatesVar := "open_ephemeral"
-	read := ephemeralStatusSnapshotShell(candidatesVar, "open")
+	read = ephemeralStatusSnapshotShell(candidatesVar, "open")
 	if topo.includeEphemeralReady() {
 		candidatesVar = "assigned_open_ephemeral"
 		read = candidatesVar + `=$(` + bdQueryEphemeralAssignedStatusQuietShell("open", shellVar) + `); `
 	}
-	return read +
-		`r=$(printf "%s" "$` + candidatesVar + `" | jq --arg id "$` + shellVar + `" ` + shellquote.Quote(fastFilter) + ` 2>/dev/null); ` +
+	return read, `r=$(printf "%s" "$` + candidatesVar + `" | jq --arg id "$` + shellVar + `" ` + shellquote.Quote(fastFilter) + ` 2>/dev/null); ` +
 		`[ -n "$r" ] && [ "$r" != "[]" ] && printf "%s" "$r" && exit 0; ` +
 		`r=$(printf "%s" "$` + candidatesVar + `" | jq --arg id "$` + shellVar + `" ` + shellquote.Quote(slowFilter) + ` 2>/dev/null); ` +
 		`if [ -n "$r" ] && [ "$r" != "[]" ]; then ` +
