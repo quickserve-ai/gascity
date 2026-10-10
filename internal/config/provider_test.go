@@ -1034,3 +1034,131 @@ func TestReplaceSchemaFlagsMigratesBareFablePinTo1M(t *testing.T) {
 		t.Fatalf("restart command = %q, want --effort high preserved", got)
 	}
 }
+
+// TestReplaceSchemaFlagsMigratesDatedFablePinToAlias locks the restart path the
+// fleet actually takes when the 13 fable providers flip from model = "fable-5"
+// to model = "fable" (ga-a306b1). Each of those seats has a live session
+// command on disk baked with `--model claude-fable-5[1m]`; on restart it must
+// become `fable[1m]` with exactly one --model flag. If the dated pin were ever
+// dropped from the enum, StripFlags could no longer strip the baked sequence
+// and the restart would accumulate a second --model flag instead of migrating
+// — the same migration-safety contract the fable-5-200k pin provides for the
+// 200k form below it.
+func TestReplaceSchemaFlagsMigratesDatedFablePinToAlias(t *testing.T) {
+	p := BuiltinProviders()["claude"]
+	rp := &ResolvedProvider{
+		Command:       p.Command,
+		Args:          p.Args,
+		OptionsSchema: p.OptionsSchema,
+		EffectiveDefaults: ComputeEffectiveDefaults(p.OptionsSchema, p.OptionDefaults,
+			map[string]string{"model": "fable", "effort": "high"}),
+	}
+
+	// The shape every live fable-lane session command has on disk today.
+	live := `claude --dangerously-skip-permissions --effort high --model claude-fable-5[1m] --settings /Users/cherub/gascity/.gc/settings.json`
+
+	got := ReplaceSchemaFlags(live, p.OptionsSchema, rp.ResolveDefaultArgs())
+
+	if n := strings.Count(got, "--model"); n != 1 {
+		t.Fatalf("restart command = %q, want exactly one --model flag, got %d", got, n)
+	}
+	tokens := shellquote.Split(got)
+	var model string
+	for i, tok := range tokens {
+		if tok == "--model" && i+1 < len(tokens) {
+			model = tokens[i+1]
+		}
+	}
+	if model != "fable[1m]" {
+		t.Fatalf("restart command = %q, resolved model token = %q, want fable[1m] — the fable lane is pinned to a stale generation", got, model)
+	}
+	if !strings.Contains(got, "--settings") || !strings.Contains(got, ".gc/settings.json") {
+		t.Fatalf("restart command = %q, non-schema --settings flag was dropped", got)
+	}
+	if !strings.Contains(got, "--effort high") {
+		t.Fatalf("restart command = %q, want --effort high preserved", got)
+	}
+}
+
+// TestFableModelChoicesResolveToExpectedFlags locks the flag each fable choice
+// emits. The alias must stay a BARE family alias ("fable[1m]", not
+// "claude-fable-5-1[1m]"): a dated ID stops tracking the newest generation the
+// moment one ships, which is the defect ga-a306b1 exists to fix. The explicit
+// 5.1 pin is what a rollback or a determinism requirement selects instead, and
+// both dated pins must keep their exact pre-existing flags so sessions baked
+// against them still migrate rather than duplicating --model.
+func TestFableModelChoicesResolveToExpectedFlags(t *testing.T) {
+	p := BuiltinProviders()["claude"]
+	var modelOpt *ProviderOption
+	for i := range p.OptionsSchema {
+		if p.OptionsSchema[i].Key == "model" {
+			modelOpt = &p.OptionsSchema[i]
+		}
+	}
+	if modelOpt == nil {
+		t.Fatal("claude provider has no \"model\" option in its schema")
+	}
+
+	want := map[string]string{
+		"fable":        "fable[1m]",
+		"fable-5-1":    "claude-fable-5-1[1m]",
+		"fable-5":      "claude-fable-5[1m]",
+		"fable-5-200k": "claude-fable-5",
+	}
+	got := make(map[string]string)
+	for _, c := range modelOpt.Choices {
+		if !strings.HasPrefix(c.Value, "fable") {
+			continue
+		}
+		if len(c.FlagArgs) != 2 || c.FlagArgs[0] != "--model" {
+			t.Fatalf("choice %q: FlagArgs = %v, want [--model <id>]", c.Value, c.FlagArgs)
+		}
+		got[c.Value] = c.FlagArgs[1]
+		// The -m alias must carry the identical model token, or a session
+		// started through the short flag lands on a different generation than
+		// one started through the long flag.
+		if len(c.FlagAliases) != 1 || len(c.FlagAliases[0]) != 2 ||
+			c.FlagAliases[0][0] != "-m" || c.FlagAliases[0][1] != c.FlagArgs[1] {
+			t.Errorf("choice %q: FlagAliases = %v, want [[-m %s]]", c.Value, c.FlagAliases, c.FlagArgs[1])
+		}
+	}
+	if len(got) != len(want) {
+		t.Fatalf("fable choices = %v, want exactly %v", got, want)
+	}
+	for value, wantFlag := range want {
+		if got[value] != wantFlag {
+			t.Errorf("choice %q emits --model %q, want %q", value, got[value], wantFlag)
+		}
+	}
+}
+
+// TestValidateOptionDefaultsAcceptsFableAlias covers the step the city.toml
+// flip depends on: providers set model = "fable" and config load must accept
+// it AND expand it to the 1M launch id.
+//
+// The model option is open (upstream #5658), so an undeclared value no longer
+// fails config load; it reaches the CLI verbatim. That makes the ordering
+// hazard quieter, not gone: flipping city.toml to "fable" on a binary without
+// these aliases loads fine and launches "--model fable", which lands on the
+// 200k tier. So this test pins the expansion, not just the validation.
+func TestValidateOptionDefaultsAcceptsFableAlias(t *testing.T) {
+	schema := BuiltinProviders()["claude"].OptionsSchema
+	opt := findOption(schema, "model")
+	if opt == nil {
+		t.Fatal("claude schema has no model option")
+	}
+	for value, wantModel := range map[string]string{
+		"fable":        "fable[1m]",
+		"fable-5-1":    "claude-fable-5-1[1m]",
+		"fable-5":      "claude-fable-5[1m]",
+		"fable-5-200k": "claude-fable-5",
+	} {
+		if err := ValidateOptionDefaults(schema, map[string]string{"model": value}); err != nil {
+			t.Errorf("ValidateOptionDefaults(model=%q) = %v, want nil", value, err)
+		}
+		args, ok := OptionFlagArgs(*opt, value)
+		if !ok || !containsFlagValue(args, "--model", wantModel) {
+			t.Errorf("OptionFlagArgs(model=%q) = %v, %v; want --model %s", value, args, ok, wantModel)
+		}
+	}
+}
