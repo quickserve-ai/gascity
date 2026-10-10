@@ -496,6 +496,14 @@ jobs:
           read -r -a args <<<"$CMD"
           rc=0
           start=$(date +%s)
+          # DIAGNOSTIC ONLY (ga-l0b72a.3, not for merge): sample the unit
+          # lane's memory and disk every 20 s so the line before a runner
+          # shutdown names the resource that ran out.
+          if [ "$LANE" = unit ]; then
+            ( while sleep 20; do
+                echo "res $(date -u +%H:%M:%S) mem_used_mb=$(free -m | awk 'NR==2{print $3}') mem_avail_mb=$(free -m | awk 'NR==2{print $7}') swap_used_mb=$(free -m | awk 'NR==3{print $3}') root_avail=$(df -h / | awk 'NR==2{print $4}') tmp_avail=$(df -h "$RUNNER_TEMP" | awk 'NR==2{print $4}') top=$(ps -eo rss=,comm= --sort=-rss | head -3 | awk '{printf "%s:%dMB,", $2, $1/1024}')"
+              done ) &
+          fi
           bazel "${args[@]}" \
             --profile="$RUNNER_TEMP/bazel-profile.json" \
             --build_event_json_file="$RUNNER_TEMP/bazel-bep.json" \
