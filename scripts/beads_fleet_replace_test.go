@@ -91,3 +91,45 @@ func TestGoModPinsTheBeadsFleetBuild(t *testing.T) {
 		t.Errorf("fleet tag %q was cut from %s, but go.mod requires %s; the replace must redirect the required release, not substitute another one", beadsFleetTag, base, required)
 	}
 }
+
+// TestBazelFleetBDFollowsTheBeadsFleetTag keeps Bazel's fleet bd on the tag
+// go.mod's replace names (ga-l0b72a.1). The targets that test gc against the
+// bd the fleet runs (cmd/gc's integration build, :acceptance_test) take
+// MODULE.bazel's fleet http_file; a pin advance that moves the replace and
+// leaves this file behind would test gc's library against the previous
+// fleet bd, the same split that kept
+// TestBuildPinnedBDBinaryForTestsUsesGoModSource and the BeadsProxied
+// acceptance rows red while Bazel handed them the upstream release.
+func TestBazelFleetBDFollowsTheBeadsFleetTag(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join(repoRoot(t), "MODULE.bazel"))
+	if err != nil {
+		t.Fatalf("read MODULE.bazel: %v", err)
+	}
+	module := string(data)
+	repo := "bd_bin_" + strings.NewReplacer(".", "_", "-", "_").Replace(beadsFleetTag)
+	start := strings.Index(module, "http_file(\n    name = \""+repo+"\",\n")
+	if start < 0 {
+		t.Fatalf("MODULE.bazel has no http_file %s for the fleet bd %s", repo, beadsFleetTag)
+	}
+	end := strings.Index(module[start:], "\n)\n")
+	if end < 0 {
+		t.Fatalf("MODULE.bazel http_file %s is not closed", repo)
+	}
+	block := module[start : start+end]
+	url := "https://github.com/quickserve-ai/beads/releases/download/" + beadsFleetTag + "/bd-" + beadsFleetTag + "-linux-amd64"
+	for _, want := range []string{`"` + url + `"`, `downloaded_file_path = "bd",`, `executable = True,`} {
+		if !strings.Contains(block, want) {
+			t.Errorf("http_file %s lacks %s:\n%s", repo, want, block)
+		}
+	}
+	label := "@" + repo + "//file"
+	for _, rel := range []string{"cmd/gc/BUILD.bazel", "test/acceptance/BUILD.bazel"} {
+		build, err := os.ReadFile(filepath.Join(repoRoot(t), filepath.FromSlash(rel)))
+		if err != nil {
+			t.Fatalf("read %s: %v", rel, err)
+		}
+		if !strings.Contains(string(build), "$(rootpath "+label+")") {
+			t.Errorf("%s does not hand its tests %s", rel, label)
+		}
+	}
+}
