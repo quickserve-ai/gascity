@@ -390,6 +390,21 @@ exports_files(["bd"])
 """,
 )
 
+# The fleet bd: the quickserve-ai/beads release gc's go.mod replace names
+# (scripts/beads_fleet_replace_test.go keeps this repository's name, URL and
+# version in step with that replace). The targets that test gc against the bd
+# every fleet machine runs take this one; the bd CLI contract cells keep the
+# upstream release archives above (CARRY.md, the Beads fleet pin row).
+http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+
+http_file(
+    name = "bd_bin_v1_3_1_fleet_20261005_1",
+    downloaded_file_path = "bd",
+    executable = True,
+    sha256 = "08af5de6caaafa1d78a4ed1259430e4ad44b42542e3ed4db84d7171daea521f9",
+    urls = ["https://github.com/quickserve-ai/beads/releases/download/v1.3.1-fleet.20261005.1/bd-v1.3.1-fleet.20261005.1-linux-amd64"],
+)
+
 http_archive(
     name = "dolt_bin_v2_2_0",
     urls = ["https://github.com/dolthub/dolt/releases/download/v2.2.0/dolt-linux-amd64.tar.gz"],

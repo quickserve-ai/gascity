@@ -1902,7 +1902,7 @@ go_test(
         "//:gotags_integration": [
             ":gc",
             "//cmd/gc-write-mint",
-            "@bd_bin_v1_3_1//:bd",
+            "@bd_bin_v1_3_1_fleet_20261005_1//file",
             "@dolt_bin_v2_2_0//:dolt-linux-amd64/bin/dolt",
         ],
         "//conditions:default": [],
@@ -1912,12 +1912,13 @@ go_test(
     # the integration-tagged and process-backed tests: bd/dolt by name
     # (GC_TEST_TOOL_PATHS puts the pinned binaries first on PATH, see
     # internal/testenv), and the gc and gc-write-mint Bazel built and the
-    # pinned release bd instead of `go build` / `go install`.
+    # fleet bd release go.mod's beads replace names instead of `go build` /
+    # `go install`.
     env = select({
         "//:gotags_integration": {
             "GC_TEST_GC_BIN": "$(rootpath :gc)",
-            "GC_TEST_PINNED_BD_BIN": "$(rootpath @bd_bin_v1_3_1//:bd)",
-            "GC_TEST_TOOL_PATHS": "$(rootpath @bd_bin_v1_3_1//:bd) $(rootpath @dolt_bin_v2_2_0//:dolt-linux-amd64/bin/dolt)",
+            "GC_TEST_PINNED_BD_BIN": "$(rootpath @bd_bin_v1_3_1_fleet_20261005_1//file)",
+            "GC_TEST_TOOL_PATHS": "$(rootpath @bd_bin_v1_3_1_fleet_20261005_1//file) $(rootpath @dolt_bin_v2_2_0//:dolt-linux-amd64/bin/dolt)",
             "GC_TEST_WRITE_MINT_BIN": "$(rootpath //cmd/gc-write-mint)",
         },
         "//conditions:default": {},
