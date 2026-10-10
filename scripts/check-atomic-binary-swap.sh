@@ -61,6 +61,21 @@ if ! printf '%s' "$install_body" | grep -qE 'mv -f .*\$\(INSTALL_DIR\)/\$\(BINAR
 	fail=1
 fi
 
+if printf '%s' "$install_body" | grep -qE 'sign-(darwin-local|staged)\.sh[[:space:]]+"?\$\(INSTALL_DIR\)/\$\(BINARY\)"?[[:space:]]*(;|&&|\||$)'; then
+	note "ERROR: 'make install' signs \$(INSTALL_DIR)/\$(BINARY) in place."
+	note "       codesign --force rewrites the live inode; sign staged copies only."
+	fail=1
+fi
+
+# The rotated gc.bak-* copy must be signed too, or it stays ad-hoc and its
+# per-build cdhash re-prompts TCC whenever it runs (ga-0eoxgp).
+# shellcheck disable=SC2016 # matches the literal $$backup in the Makefile text
+if ! printf '%s' "$install_body" | grep -qE 'sign-darwin-local\.sh[[:space:]]+"\$\$backup"'; then
+	note "ERROR: 'make install' does not sign the gc.bak-* backup it rotates."
+	note "       Sign the cp -p copy (its own inode) with the same identity as the new binary."
+	fail=1
+fi
+
 # 3. `make install` must verify the installed binary UNPIPED.
 #    `gc version | head; echo $?` reports head's status and shows 0 for a binary
 #    SIGKILLed before writing a byte -- this nearly caused a false all-clear.
