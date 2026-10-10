@@ -21,6 +21,10 @@ import (
 // URL; archive starts with none. `backup add` refuses a URL that already has a
 // name, as Dolt does; `backup sync <name>` fails for an unknown name and
 // otherwise lands fakeSyncRoot on the source and on the named backup's URL.
+// With FAKE_SERVER_DATA_DIR set, a `backup -v` run under that dir prints each
+// line as "name url {}", the form Dolt prints when a sql-server holds the data
+// dir (the live city's case); the snapshot clone outside it has no server
+// above it and prints the plain form.
 func writeNamedBackupFakeDolt(t *testing.T, binDir, dataDir, artifactDir string) string {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dataDir, "prod", ".dolt", "fake-backups"),
@@ -47,7 +51,10 @@ if [ "${1:-}" = "backup" ] && [ "$#" -eq 1 ]; then
   exit 0
 fi
 if [ "${1:-} ${2:-}" = "backup -v" ]; then
-  cat .dolt/fake-backups
+  case "$PWD/" in
+    "${FAKE_SERVER_DATA_DIR:-/nonexistent}"/*) awk '{ print $1 " " $2 " {}" }' .dolt/fake-backups ;;
+    *) cat .dolt/fake-backups ;;
+  esac
   exit 0
 fi
 if [ "${1:-} ${2:-}" = "backup add" ]; then
@@ -79,8 +86,24 @@ exit 0
 // has a backup named 'default' at its artifact URL, so the dog syncs
 // 'default' (and says so) rather than adding a conflicting prod-backup; archive
 // has none, so it still gets archive-backup auto-added and synced. Both write
-// the local-backup freshness stamp.
+// the local-backup freshness stamp. The server case is the live city's: `dolt
+// backup -v` there appends a params field, which the lookup must ignore.
 func TestBackupScriptSyncsExistingBackupAtArtifactURLUnderAnyName(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		server bool
+	}{
+		{name: "no-server", server: false},
+		{name: "sql-server-params-field", server: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runExistingBackupNameCase(t, tc.server)
+		})
+	}
+}
+
+func runExistingBackupNameCase(t *testing.T, server bool) {
+	t.Helper()
 	cityPath := t.TempDir()
 	dataDir := filepath.Join(cityPath, "dolt-data")
 	artifactDir := filepath.Join(cityPath, ".dolt-backup")
@@ -93,12 +116,25 @@ func TestBackupScriptSyncsExistingBackupAtArtifactURLUnderAnyName(t *testing.T) 
 	_ = writeDogFakeGC(t, binDir)
 	doltLogPath := writeNamedBackupFakeDolt(t, binDir, dataDir, artifactDir)
 
-	out := runDogScript(t, "mol-dog-backup.sh", binDir, cityPath, dataDir)
+	var extraEnv []string
+	if server {
+		extraEnv = append(extraEnv, "FAKE_SERVER_DATA_DIR="+dataDir)
+	}
+	out := runDogScript(t, "mol-dog-backup.sh", binDir, cityPath, dataDir, extraEnv...)
 	if !strings.Contains(out, "synced: 2/2") {
 		t.Fatalf("both databases must sync:\n%s", out)
 	}
 	if !strings.Contains(out, "syncing backup 'default'") {
 		t.Fatalf("a backup name other than <db>-backup must be logged:\n%s", out)
+	}
+	// On the snapshot path the ga-rirak7 root check reads the synced backup's
+	// url by name, so a pass there proves it read 'default'.
+	if cowCloneAvailable(t) {
+		for _, db := range []string{"prod", "archive"} {
+			if !strings.Contains(out, "backup: "+db+" — synced (snapshot)") {
+				t.Fatalf("%s must sync from the snapshot so the root check runs:\n%s", db, out)
+			}
+		}
 	}
 	doltLog, err := os.ReadFile(doltLogPath)
 	if err != nil {

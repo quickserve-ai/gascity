@@ -16,6 +16,10 @@ HOST="${GC_DOLT_HOST:-127.0.0.1}"
 USER="${GC_DOLT_USER:-root}"
 OFFSITE_PATH="${GC_BACKUP_OFFSITE_PATH:-}"
 BACKUP_ARTIFACT_DIR="${GC_BACKUP_ARTIFACT_DIR:-$GC_CITY_PATH/.dolt-backup}"
+# Dolt stores a backup URL without a trailing slash; match its spelling.
+while [ "${BACKUP_ARTIFACT_DIR%/}" != "$BACKUP_ARTIFACT_DIR" ] && [ "$BACKUP_ARTIFACT_DIR" != "/" ]; do
+    BACKUP_ARTIFACT_DIR="${BACKUP_ARTIFACT_DIR%/}"
+done
 SYSTEM_DBS="^(information_schema|mysql|dolt_cluster|__gc_probe|performance_schema|sys)$"
 MIN_DOLT_BACKUP_VERSION="2.1.0"
 BACKUP_LOCK_FILE="${GC_DOLT_BACKUP_LOCK_FILE:-$GC_CITY_PATH/.gc/runtime/packs/dolt/backup-sync.lock}"
@@ -174,13 +178,15 @@ if [ -z "$DATABASES" ]; then
 fi
 
 # backup_name_at_url <dir> <url>: prints the name of the backup `dolt backup
-# -v` (run in <dir>) lists at exactly <url>, whatever that name is. Prints
-# nothing when none does or the lookup fails.
+# -v` (run in <dir>) lists at exactly <url>, whatever that name is. With a
+# sql-server holding the data dir, Dolt prints each line as "name url {...}";
+# the trailing params field is dropped before comparing. Prints nothing when
+# none matches or the lookup fails.
 backup_name_at_url() {
     bnu_list="$(cd "$1" && run_bounded 30 dolt backup -v 2>/dev/null)" || return 0
     printf '%s\n' "$bnu_list" | BNU_WANT="$2" awk '
         found { next }
-        { n = $1; sub(/^[^[:space:]]+[[:space:]]+/, ""); sub(/[[:space:]]+$/, "") }
+        { n = $1; sub(/^[^[:space:]]+[[:space:]]+/, ""); sub(/[[:space:]]+\{.*\}[[:space:]]*$/, ""); sub(/[[:space:]]+$/, "") }
         $0 == ENVIRON["BNU_WANT"] { print n; found = 1 }' || true
 }
 
