@@ -483,6 +483,23 @@ jobs:
       # position. upload_strategy=local keeps the profile and exec log (the
       # BEP's local_file/uri fields) out of the farm CAS: both hold argv/env
       # values the ci-analytics extractor reads and redacts, never the farm.
+      # Fork carry (ga-l0b72a.3): on the fork the unit lane executes locally on
+      # a 16 GB GitHub-hosted runner, where nogo on //cmd/gc:gc_test (~7.5 GB)
+      # and a Go compile running beside it (~5.4 GB) took available memory to
+      # ~240 MB and filled the runner's 3 GB swap; the VM then shut the runner
+      # down at the same step on every attempt (sampled on fork draft #264,
+      # 2026-10-10). A 16 GB swapfile on the runner's free disk (63 GB at the
+      # kill) lets that peak page instead of killing the job. Upstream's unit
+      # lane runs on a Blacksmith host and takes no swap.
+      - name: Fork runner swap for the unit lane
+        if: github.repository != 'gastownhall/gascity' && matrix.lane == 'unit' && steps.worker-env.outputs.pin-moved != 'true'
+        run: |
+          sudo fallocate -l 16G /swapfile-bazel
+          sudo chmod 600 /swapfile-bazel
+          sudo mkswap /swapfile-bazel >/dev/null
+          sudo swapon /swapfile-bazel
+          echo "bazel / unit: swap $(free -m | awk 'NR==3{print $2}') MB total after the fork swapfile" | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: bazel ${{ matrix.cmd }}
         id: test
         if: steps.worker-env.outputs.pin-moved != 'true'
