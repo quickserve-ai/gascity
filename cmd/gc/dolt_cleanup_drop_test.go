@@ -189,6 +189,74 @@ func TestRunDoltCleanup_ForceDropsStaleDatabases(t *testing.T) {
 	}
 }
 
+// TestRunDoltCleanup_ForceOnLegacyFallbackPortDropsNothing pins the
+// blast-radius guard the controller's DROP path already has
+// (TestControllerDropManagedDoltDatabase_RefusesOnLegacyFallback) on the
+// cleanup command's own drop and purge stages. A city with no --port, no
+// dolt.port and a stopped managed dolt (a supervisor restart) is a clean live
+// miss, so the chain lands on LegacyDefaultDoltPort. Whatever listens there
+// is not provably this city's server — on a shared host it can be another
+// city's dolt or a forwarder to a shared hub — so a forced run must not drop
+// test-shaped databases on it or call DOLT_PURGE_DROPPED_DATABASES there, and
+// it must say why.
+func TestRunDoltCleanup_ForceOnLegacyFallbackPortDropsNothing(t *testing.T) {
+	fs := fsys.NewFake()
+	fs.Files["/city/.beads/metadata.json"] = []byte(`{"dolt_database":"hq"}`)
+	// The server answering on the legacy port holds a database with the
+	// city's rig name plus test-shaped databases that are not this city's.
+	client := &fakeCleanupDoltClient{
+		databases: []string{"hq", "testdb_abc", "doctest_x"},
+	}
+
+	var stdout, stderr bytes.Buffer
+	opts := cleanupOptions{
+		Rigs:              []resolverRig{{Name: "hq", Path: "/city", HQ: true}},
+		FS:                fs,
+		CityPath:          "/city",
+		LiveResolve:       fakeLiveResolveMiss(),
+		JSON:              true,
+		Force:             true,
+		DoltClient:        client,
+		DiscoverProcesses: func() ([]DoltProcInfo, error) { return nil, nil },
+		ReapGracePeriod:   1,
+	}
+	code := runDoltCleanup(opts, &stdout, &stderr)
+
+	var r CleanupReport
+	if err := json.Unmarshal(stdout.Bytes(), &r); err != nil {
+		t.Fatalf("Unmarshal: %v\nstdout: %s", err, stdout.String())
+	}
+	if r.Port.Resolved != LegacyDefaultDoltPort || !r.Port.Fallback {
+		t.Fatalf("Port = %+v, want the legacy-default fallback this test is about", r.Port)
+	}
+
+	if len(client.dropped) != 0 {
+		t.Errorf("dropped = %v, want none: a forced cleanup must not DROP on the legacy fallback port %d", client.dropped, LegacyDefaultDoltPort)
+	}
+	if client.purged != 0 {
+		t.Errorf("purged = %d, want 0: a forced cleanup must not call DOLT_PURGE_DROPPED_DATABASES on the legacy fallback port %d", client.purged, LegacyDefaultDoltPort)
+	}
+
+	legacyPort := fmt.Sprint(LegacyDefaultDoltPort)
+	reported := false
+	for _, e := range r.Errors {
+		if strings.Contains(e.Error, legacyPort) {
+			reported = true
+		}
+	}
+	for _, b := range r.ForceBlockers {
+		if strings.Contains(b.Error, legacyPort) {
+			reported = true
+		}
+	}
+	if !reported {
+		t.Errorf("errors = %+v, force_blockers = %+v: want the refusal reported, naming the legacy port %s", r.Errors, r.ForceBlockers, legacyPort)
+	}
+	if code == 0 && r.Summary.ErrorsTotal == 0 {
+		t.Errorf("exit=0 with errors_total=0: the refusal must be visible to automation (nonzero exit or a counted error)")
+	}
+}
+
 func TestRunDoltCleanup_ForceDisablesDropAndPurgeWhenRigMetadataUnreadable(t *testing.T) {
 	fs := fsys.NewFake()
 	fs.Errors["/rigs/foo/.beads/metadata.json"] = os.ErrPermission
