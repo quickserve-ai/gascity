@@ -896,14 +896,15 @@ func TestBuildPinnedBDBinaryForTestsUsesGoModSource(t *testing.T) {
 	// The module line carries a version only when bd was installed at one. A
 	// replace makes that impossible (see planPinnedBDBuild), so the
 	// replacement's module directory is built instead and the toolchain
-	// stamps the main module (devel). Bazel's bd is the fleet release built
-	// from a checkout at the replace's tag, which the toolchain stamps with
-	// that tag: the replacement's version. The declared module path stays
+	// stamps the main module (devel). Under Bazel, rules_go's build info
+	// reports beads at the replace's version with no replace, and the bd it
+	// hands the test is the fleet release built at that tag, which the
+	// toolchain stamps with the same version. The declared module path stays
 	// beadsModulePath either way — a fork that keeps declaring the upstream
 	// path is exactly what makes the replace legal, so the path is the part
 	// worth asserting.
 	wantModVersion := mod.Version
-	if mod.Replaced && bazeltest.DataPath(t, "GC_TEST_PINNED_BD_BIN") == "" {
+	if mod.Replaced {
 		wantModVersion = develModuleVersion
 	}
 	// bd resolves user-level state from HOME and writes machine-id, event and
