@@ -483,8 +483,9 @@ jobs:
       # ~240 MB and filled the runner's 3 GB swap; the VM then shut the runner
       # down at the same step on every attempt (sampled on fork draft #264,
       # 2026-10-10). A 16 GB swapfile on the runner's free disk (63 GB at the
-      # kill) lets that peak page instead of killing the job. Upstream's unit
-      # lane runs on a Blacksmith host and takes no swap.
+      # kill) lets that peak page instead of killing the job, and the bazel
+      # step below caps the fork's unit lane at two parallel actions.
+      # Upstream's unit lane runs on a Blacksmith host and takes neither.
       - name: Fork runner swap for the unit lane
         if: github.repository != 'gastownhall/gascity' && matrix.lane == 'unit' && steps.worker-env.outputs.pin-moved != 'true'
         run: |
@@ -508,9 +509,18 @@ jobs:
           MODE: ${{ needs.rbe.outputs.mode }}
           LANE: ${{ matrix.lane }}
           EVIDENCE_ONLY: ${{ matrix.evidence-only == true }}
+          FORK_RUNNER: ${{ github.repository != 'gastownhall/gascity' }}
         run: |
           set -o pipefail
           read -r -a args <<<"$CMD"
+          # Fork carry (ga-l0b72a.3): the swapfile alone did not hold the
+          # fork's unit lane (#265's first run still lost its runner at
+          # 196/236 with 19 GB of swap), so on the fork that lane also runs
+          # at most two actions at once; nogo on //cmd/gc:gc_test and a
+          # multi-GB compile then rarely overlap. --jobs changes no cache key.
+          if [ "$FORK_RUNNER" = true ] && [ "$LANE" = unit ]; then
+            args+=(--jobs=2)
+          fi
           rc=0
           start=$(date +%s)
           bazel "${args[@]}" \
