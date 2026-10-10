@@ -53,7 +53,7 @@ func TestBazelWorkflowForkRunnerRule(t *testing.T) {
 // at nogo on //cmd/gc:gc_test and the VM shuts the runner down, so the unit
 // lane never concludes on the fork. The step must run on the fork only, and
 // before the lane's bazel step, and the bazel step caps the fork's unit lane
-// at two parallel actions (the swap alone did not hold it).
+// at two locally executed actions (the swap alone did not hold it).
 func TestBazelWorkflowForkUnitLaneSwap(t *testing.T) {
 	wf := readMultiLaneWorkflow(t)
 	job, ok := wf.Jobs["lane"]
@@ -76,8 +76,8 @@ func TestBazelWorkflowForkUnitLaneSwap(t *testing.T) {
 			if step.Env["FORK_RUNNER"] != "${{ github.repository != 'gastownhall/gascity' }}" {
 				t.Errorf("bazel test step env FORK_RUNNER = %q; want the fork-only repository test", step.Env["FORK_RUNNER"])
 			}
-			if !strings.Contains(step.Run, `if [ "$FORK_RUNNER" = true ] && [ "$LANE" = unit ]; then`) || !strings.Contains(step.Run, "args+=(--jobs=2)") {
-				t.Errorf("bazel test step does not cap the fork's unit lane at --jobs=2:\n%s", step.Run)
+			if !strings.Contains(step.Run, `if [ "$FORK_RUNNER" = true ] && [ "$LANE" = unit ]; then`) || !strings.Contains(step.Run, "args+=(--local_resources=cpu=2)") {
+				t.Errorf("bazel test step does not cap the fork's unit lane at --local_resources=cpu=2:\n%s", step.Run)
 			}
 		}
 	}

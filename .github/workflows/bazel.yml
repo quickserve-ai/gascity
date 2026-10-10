@@ -484,7 +484,7 @@ jobs:
       # down at the same step on every attempt (sampled on fork draft #264,
       # 2026-10-10). A 16 GB swapfile on the runner's free disk (63 GB at the
       # kill) lets that peak page instead of killing the job, and the bazel
-      # step below caps the fork's unit lane at two parallel actions.
+      # step below caps the fork's unit lane at two locally executed actions.
       # Upstream's unit lane runs on a Blacksmith host and takes neither.
       - name: Fork runner swap for the unit lane
         if: github.repository != 'gastownhall/gascity' && matrix.lane == 'unit' && steps.worker-env.outputs.pin-moved != 'true'
@@ -515,11 +515,14 @@ jobs:
           read -r -a args <<<"$CMD"
           # Fork carry (ga-l0b72a.3): the swapfile alone did not hold the
           # fork's unit lane (#265's first run still lost its runner at
-          # 196/236 with 19 GB of swap), so on the fork that lane also runs
-          # at most two actions at once; nogo on //cmd/gc:gc_test and a
-          # multi-GB compile then rarely overlap. --jobs changes no cache key.
+          # 196/236 with 19 GB of swap), so on the fork that lane also
+          # executes at most two actions on the runner at once; nogo on
+          # //cmd/gc:gc_test and a multi-GB compile then rarely overlap.
+          # --local_resources bounds local execution only: the fork cache's
+          # 64 parallel lookups (--jobs, .bazelrc) are untouched, and no cache
+          # key changes.
           if [ "$FORK_RUNNER" = true ] && [ "$LANE" = unit ]; then
-            args+=(--jobs=2)
+            args+=(--local_resources=cpu=2)
           fi
           rc=0
           start=$(date +%s)
