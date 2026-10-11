@@ -47,3 +47,44 @@ func TestBazelWorkflowForkRunnerRule(t *testing.T) {
 		}
 	}
 }
+
+// TestBazelWorkflowForkUnitLaneSwap pins the fork's unit-lane swapfile
+// (ga-l0b72a.3). Without it the 16 GB GitHub-hosted runner runs out of memory
+// at nogo on //cmd/gc:gc_test and the VM shuts the runner down, so the unit
+// lane never concludes on the fork. The step must run on the fork only, and
+// before the lane's bazel step, and the bazel step caps the fork's unit lane
+// at two locally executed actions (the swap alone did not hold it).
+func TestBazelWorkflowForkUnitLaneSwap(t *testing.T) {
+	wf := readMultiLaneWorkflow(t)
+	job, ok := wf.Jobs["lane"]
+	if !ok {
+		t.Fatalf("%s: no job lane", bazelMultiLaneWorkflow)
+	}
+	swap, test := -1, -1
+	for i, step := range job.Steps {
+		switch {
+		case step.Name == "Fork runner swap for the unit lane":
+			swap = i
+			if !strings.Contains(step.If, "github.repository != 'gastownhall/gascity'") || !strings.Contains(step.If, "matrix.lane == 'unit'") {
+				t.Errorf("swap step if %q: must be fork-only and unit-lane-only", step.If)
+			}
+			if !strings.Contains(step.Run, "swapon /swapfile-bazel") {
+				t.Errorf("swap step does not enable /swapfile-bazel:\n%s", step.Run)
+			}
+		case step.ID == "test":
+			test = i
+			if step.Env["FORK_RUNNER"] != "${{ github.repository != 'gastownhall/gascity' }}" {
+				t.Errorf("bazel test step env FORK_RUNNER = %q; want the fork-only repository test", step.Env["FORK_RUNNER"])
+			}
+			if !strings.Contains(step.Run, `if [ "$FORK_RUNNER" = true ] && [ "$LANE" = unit ]; then`) || !strings.Contains(step.Run, "args+=(--local_resources=cpu=2)") {
+				t.Errorf("bazel test step does not cap the fork's unit lane at --local_resources=cpu=2:\n%s", step.Run)
+			}
+		}
+	}
+	if swap < 0 {
+		t.Fatalf("job lane has no %q step", "Fork runner swap for the unit lane")
+	}
+	if test < 0 || swap > test {
+		t.Errorf("swap step (index %d) must come before the bazel test step (index %d)", swap, test)
+	}
+}

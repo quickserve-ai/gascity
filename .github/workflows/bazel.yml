@@ -477,6 +477,24 @@ jobs:
           echo "GC_OPENAPI_BREAKING_BASE_SPEC=$spec" >> "$GITHUB_ENV"
           echo "OpenAPI breaking-change base: \`$BASE_SHA\`" >> "$GITHUB_STEP_SUMMARY"
 
+      # Fork carry (ga-l0b72a.3): on the fork the unit lane executes locally on
+      # a 16 GB GitHub-hosted runner, where nogo on //cmd/gc:gc_test (~7.5 GB)
+      # and a Go compile running beside it (~5.4 GB) took available memory to
+      # ~240 MB and filled the runner's 3 GB swap; the VM then shut the runner
+      # down at the same step on every attempt (sampled on fork draft #264,
+      # 2026-10-10). A 16 GB swapfile on the runner's free disk (63 GB at the
+      # kill) lets that peak page instead of killing the job, and the bazel
+      # step below caps the fork's unit lane at two locally executed actions.
+      # Upstream's unit lane runs on a Blacksmith host and takes neither.
+      - name: Fork runner swap for the unit lane
+        if: github.repository != 'gastownhall/gascity' && matrix.lane == 'unit' && steps.worker-env.outputs.pin-moved != 'true'
+        run: |
+          sudo fallocate -l 16G /swapfile-bazel
+          sudo chmod 600 /swapfile-bazel
+          sudo mkswap /swapfile-bazel >/dev/null
+          sudo swapon /swapfile-bazel
+          echo "bazel / unit: swap $(free -m | awk 'NR==3{print $2}') MB total after the fork swapfile" | tee -a "$GITHUB_STEP_SUMMARY"
+
       # --profile, --build_event_json_file, --execution_log_compact_file and
       # --experimental_build_event_upload_strategy are command options, so
       # they go after the command (CMD's first word), never in a startup
@@ -491,9 +509,21 @@ jobs:
           MODE: ${{ needs.rbe.outputs.mode }}
           LANE: ${{ matrix.lane }}
           EVIDENCE_ONLY: ${{ matrix.evidence-only == true }}
+          FORK_RUNNER: ${{ github.repository != 'gastownhall/gascity' }}
         run: |
           set -o pipefail
           read -r -a args <<<"$CMD"
+          # Fork carry (ga-l0b72a.3): the swapfile alone did not hold the
+          # fork's unit lane (#265's first run still lost its runner at
+          # 196/236 with 19 GB of swap), so on the fork that lane also
+          # executes at most two actions on the runner at once; nogo on
+          # //cmd/gc:gc_test and a multi-GB compile then rarely overlap.
+          # --local_resources bounds local execution only: the fork cache's
+          # 64 parallel lookups (--jobs, .bazelrc) are untouched, and no cache
+          # key changes.
+          if [ "$FORK_RUNNER" = true ] && [ "$LANE" = unit ]; then
+            args+=(--local_resources=cpu=2)
+          fi
           rc=0
           start=$(date +%s)
           bazel "${args[@]}" \
