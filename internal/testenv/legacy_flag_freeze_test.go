@@ -41,7 +41,13 @@ var legacyFlagNeedles = []string{
 // tight ratchet lands with the S5 migration that removes this test. A dir with
 // coupled test files but no ceiling fails loudly.
 var legacyFlagTestFileCeilings = map[string]int{
-	"cmd/gc": 5,
+	// cmd/gc: 6 on the quickserve-ai fork, not upstream's 5. The sixth is
+	// city_runtime_test.go's holdFeatureFlagsForTest (fork #258, the skills
+	// carry): it restores the formula_v2 and graph-apply globals that the
+	// production reload path writes, which rollout.ForTest cannot restore.
+	// Raised deliberately (ga-l0b72a.5); drops back to 5 with that carry or
+	// at S5, whichever comes first.
+	"cmd/gc": 6,
 	// internal/api absorbed a third and fourth coupled test file
 	// (handler_formulas_test.go, huma_handlers_run_launch_test.go) via
 	// mainline merges that predated this freeze; the ceiling blocks growth
