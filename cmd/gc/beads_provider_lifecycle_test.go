@@ -11724,7 +11724,11 @@ func TestGcBeadsBdStartDiskFloorFailureIntentionallyFallsBackToBareStart(t *test
 	if !strings.Contains(string(data), want) {
 		t.Fatalf("dolt log lacks %q:\n%s", want, data)
 	}
-	if got := strings.TrimSpace(string(mustReadFile(t, doltInvocations))); got != "sql-server" {
+	// The bare start launches dolt in the background (nohup ... &) and the fake
+	// helper reports it ready at once, so the script can return before the
+	// child has run; wait for its invocation record instead of reading it
+	// once (a loaded CI runner lost that race, ga-l0b72a.5).
+	if got := strings.TrimSpace(waitForFileText(t, doltInvocations, "sql-server", 10*time.Second)); got != "sql-server" {
 		t.Fatalf("bare dolt sql-server launches = %q, want exactly one", got)
 	}
 }
