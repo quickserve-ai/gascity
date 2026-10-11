@@ -66,8 +66,8 @@ func TestReconcileSessionBeads_DrainAckNoWorkFreesSlotAndReallocates(t *testing.
 
 		// Two routed-ready beads. bead-1 goes in_progress under the winner;
 		// bead-2 stays ready in the queue.
-		beadOne := createRoutedReadyBeadForReplacement(t, store, "repo/worker", "queued work 1")
-		createRoutedReadyBeadForReplacement(t, store, "repo/worker", "queued work 2")
+		beadOne := createRoutedReadyBeadForReplacement(t, store, "queued work 1")
+		createRoutedReadyBeadForReplacement(t, store, "queued work 2")
 
 		// Winner: slot 1, active, holds bead-1 in_progress.
 		winner := createCanonicalPoolSession(t, store, &cfg.Agents[0], now, 1)
@@ -407,13 +407,17 @@ func TestReusablePoolSessionInfo_OneShotAsleepFreeableWithOpenAssignedWorkNotReu
 	}
 }
 
-func createRoutedReadyBeadForReplacement(t *testing.T, store beads.Store, template, title string) beads.Bead {
+// createRoutedReadyBeadForReplacement creates open work routed to the
+// "repo/worker" pool template, the one template every caller in this package
+// routes to (nogo's unparam rejects a parameter that always receives the same
+// value; ga-l0b72a.5).
+func createRoutedReadyBeadForReplacement(t *testing.T, store beads.Store, title string) beads.Bead {
 	t.Helper()
 	b, err := store.Create(beads.Bead{
 		Title:    title,
 		Type:     "task",
 		Status:   "open",
-		Metadata: map[string]string{"gc.routed_to": template},
+		Metadata: map[string]string{"gc.routed_to": "repo/worker"},
 	})
 	if err != nil {
 		t.Fatalf("create routed ready bead %q: %v", title, err)

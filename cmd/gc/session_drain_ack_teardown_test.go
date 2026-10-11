@@ -72,7 +72,7 @@ func newDrainAckTeardownFixtureSized(t *testing.T, maxActive, seats int) *drainA
 	}
 	inProgress := "in_progress"
 	for slot := 1; slot <= seats; slot++ {
-		work := createRoutedReadyBeadForReplacement(t, f.store, drainAckTeardownTemplate, "platform leg")
+		work := createRoutedReadyBeadForReplacement(t, f.store, "platform leg")
 		seat := createCanonicalPoolSession(t, f.store, &f.cfg.Agents[0], now, slot)
 		setPoolSessionActive(t, f.store, seat.ID)
 		seat = mustGetBead(t, f.store, seat.ID)
