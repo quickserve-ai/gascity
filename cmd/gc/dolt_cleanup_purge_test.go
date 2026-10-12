@@ -88,6 +88,7 @@ func TestRunDoltCleanup_DryRunComputesPurgeBytesFromDroppedDirs(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	opts := cleanupOptions{
+		CityPort:          28231,
 		Rigs:              rigs,
 		FS:                fs,
 		JSON:              true,
@@ -133,6 +134,7 @@ func TestRunDoltCleanup_ForceCallsPurgePerRigDatabase(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	opts := cleanupOptions{
+		CityPort:          28231,
 		Rigs:              rigs,
 		FS:                fs,
 		JSON:              true,
@@ -176,6 +178,7 @@ func TestRunDoltCleanup_PurgeFailureRecordedNotFatal(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	opts := cleanupOptions{
+		CityPort:          28231,
 		Rigs:              rigs,
 		FS:                fs,
 		JSON:              true,
@@ -230,6 +233,7 @@ func TestRunDoltCleanup_ForceFailsPurgeWhenMissingRigDatabaseHasBytes(t *testing
 
 	var stdout, stderr bytes.Buffer
 	opts := cleanupOptions{
+		CityPort:          28231,
 		Rigs:              rigs,
 		FS:                fs,
 		JSON:              true,
@@ -269,6 +273,7 @@ func TestRunDoltCleanup_PurgeReportsUnexpectedFilesystemErrors(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	opts := cleanupOptions{
+		CityPort:          28231,
 		Rigs:              []resolverRig{{Name: "city", Path: "/city", HQ: true}},
 		FS:                fs,
 		JSON:              true,
@@ -341,6 +346,7 @@ func TestRunDoltCleanup_ForceSkipsPurgeForMissingRigDatabases(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	opts := cleanupOptions{
+		CityPort:          28231,
 		Rigs:              rigs,
 		FS:                fs,
 		JSON:              true,
@@ -815,6 +821,10 @@ func TestRigSharesResolvedDoltServer_ContractResolutionDecides(t *testing.T) {
 		opts.PortResolution = PortResolution{Port: 28231, Source: liveDoltHandleSource}
 		if rigSharesResolvedDoltServer(resolverRig{Name: "r", Path: "/rigs/r"}, opts) {
 			t.Error("non-fallback, non-city-config sources must not vouch for unresolvable scopes")
+		}
+		opts.PortResolution = PortResolution{Port: LegacyDefaultDoltPort, Source: "legacy default", Fallback: true}
+		if rigSharesResolvedDoltServer(resolverRig{Name: "r", Path: "/rigs/r"}, opts) {
+			t.Error("the legacy fallback must not vouch for unresolvable scopes")
 		}
 	})
 }

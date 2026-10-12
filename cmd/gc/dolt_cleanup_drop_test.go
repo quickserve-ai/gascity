@@ -91,6 +91,7 @@ func TestRunDoltCleanup_DryRunEnumeratesDropCandidatesWithoutDropping(t *testing
 		Probe:             false,
 		DoltClient:        client,
 		DiscoverProcesses: func() ([]DoltProcInfo, error) { return nil, nil },
+		LiveResolve:       fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -122,6 +123,7 @@ func TestRunDoltCleanup_InvalidStaleIdentifiersCountAsDropErrors(t *testing.T) {
 		Probe:             false,
 		DoltClient:        client,
 		DiscoverProcesses: func() ([]DoltProcInfo, error) { return nil, nil },
+		LiveResolve:       fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -171,6 +173,7 @@ func TestRunDoltCleanup_ForceDropsStaleDatabases(t *testing.T) {
 		DoltClient:        client,
 		DiscoverProcesses: func() ([]DoltProcInfo, error) { return nil, nil },
 		ReapGracePeriod:   1,
+		LiveResolve:       fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -276,6 +279,7 @@ func TestRunDoltCleanup_ForceDisablesDropAndPurgeWhenRigMetadataUnreadable(t *te
 		DoltClient:        client,
 		DiscoverProcesses: func() ([]DoltProcInfo, error) { return nil, nil },
 		ReapGracePeriod:   1,
+		LiveResolve:       fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -321,6 +325,7 @@ func TestRunDoltCleanup_ForceDisablesDropAndPurgeWhenRigMetadataCorrupt(t *testi
 		DoltClient:        client,
 		DiscoverProcesses: func() ([]DoltProcInfo, error) { return nil, nil },
 		ReapGracePeriod:   1,
+		LiveResolve:       fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -360,6 +365,7 @@ func TestRunDoltCleanup_ForceRecordsDropFailureAndContinues(t *testing.T) {
 		DoltClient:        client,
 		DiscoverProcesses: func() ([]DoltProcInfo, error) { return nil, nil },
 		ReapGracePeriod:   1,
+		LiveResolve:       fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	// Drop failures don't fail the whole run — they're recorded into the
@@ -444,6 +450,7 @@ func TestProbeLiveSessions_HealthyServer(t *testing.T) {
 		JSON:              true,
 		DoltClient:        client,
 		DiscoverProcesses: func() ([]DoltProcInfo, error) { return nil, nil },
+		LiveResolve:       fakeLiveResolve(),
 	}
 	if code := runDoltCleanup(opts, &stdout, &stderr); code != 0 {
 		t.Fatalf("exit=%d, stderr=%q", code, stderr.String())
@@ -476,6 +483,7 @@ func TestProbeLiveSessions_TimesOut(t *testing.T) {
 		// discoverActiveTestRoots (which invokes ps -ax and can take ~1-2 s on
 		// macOS, blowing past the wall-clock budget this test exercises).
 		ActiveTestRoots: []string{},
+		LiveResolve:     fakeLiveResolve(),
 	}
 
 	start := time.Now()
@@ -529,6 +537,7 @@ func TestProbeLiveSessions_FailClosed(t *testing.T) {
 		DoltClient:        client,
 		DiscoverProcesses: func() ([]DoltProcInfo, error) { return nil, nil },
 		ReapGracePeriod:   1,
+		LiveResolve:       fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 1 {
@@ -588,6 +597,7 @@ func TestProbeLiveSessions_DryRunSurvivesFailure(t *testing.T) {
 		Force:             false,
 		DoltClient:        client,
 		DiscoverProcesses: func() ([]DoltProcInfo, error) { return nil, nil },
+		LiveResolve:       fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -631,6 +641,7 @@ func TestProbeLiveSessions_RemovesFromToDrop(t *testing.T) {
 		DoltClient:        client,
 		DiscoverProcesses: func() ([]DoltProcInfo, error) { return nil, nil },
 		ReapGracePeriod:   1,
+		LiveResolve:       fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {

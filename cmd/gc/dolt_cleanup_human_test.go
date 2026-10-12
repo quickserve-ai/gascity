@@ -78,6 +78,7 @@ func TestRunDoltCleanup_HumanOutputForceOmitsDryRunFooter(t *testing.T) {
 		DoltClient:        client,
 		DiscoverProcesses: func() ([]DoltProcInfo, error) { return nil, nil },
 		ReapGracePeriod:   1,
+		LiveResolve:       fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -131,6 +132,7 @@ func TestRunDoltCleanup_HumanOutputShowsErrorsSection(t *testing.T) {
 		DoltClient:        client,
 		DiscoverProcesses: func() ([]DoltProcInfo, error) { return nil, nil },
 		ReapGracePeriod:   1,
+		LiveResolve:       fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -158,6 +160,7 @@ func TestRunDoltCleanup_HumanOutputShowsForceBlockersSection(t *testing.T) {
 		FS:                fs,
 		JSON:              false,
 		DiscoverProcesses: func() ([]DoltProcInfo, error) { return nil, nil },
+		LiveResolve:       fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -201,6 +204,7 @@ func TestRunDoltCleanup_HumanOutputCountsPostSIGTERMGoneAsReaped(t *testing.T) {
 		},
 		KillProcess:     func(_ int, _ syscall.Signal) error { return nil },
 		ReapGracePeriod: 1,
+		LiveResolve:     fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {

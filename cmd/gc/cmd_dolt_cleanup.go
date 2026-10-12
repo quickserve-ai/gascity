@@ -179,6 +179,12 @@ const (
 	// malformed result). FAIL-CLOSED: --force refuses to drop ANY DB
 	// when this kind is recorded.
 	cleanupErrorKindLiveSessionProbeFailed = "live-session-probe-failed"
+	// cleanupErrorKindLegacyFallbackPort marks that the port resolved only
+	// by falling back to LegacyDefaultDoltPort: no --port, no city
+	// dolt.port and no live managed dolt. Whatever listens there is not
+	// provably this city's server, so drop and purge refuse it and --force
+	// exits nonzero.
+	cleanupErrorKindLegacyFallbackPort = "legacy-fallback-port"
 )
 
 // MarshalJSON ensures slices serialize as `[]` rather than `null` for empty
@@ -338,6 +344,14 @@ func runDoltCleanup(opts cleanupOptions, stdout, stderr io.Writer) int {
 		recordCleanupError(&report, "port", fatalAttempt.Source, err)
 		emitReport(report, fatalResolution, opts, stdout, stderr)
 		return 1
+	}
+
+	if resolution.Fallback {
+		err := fmt.Errorf("no --port, no city dolt.port and no live managed dolt: resolution fell back to legacy port %d, which is not provably this city's server; refusing to drop or purge there (start the city's managed dolt, or pass --port to name the server)", resolution.Port)
+		recordCleanupForceBlocker(&report, cleanupErrorKindLegacyFallbackPort, "", err)
+		if opts.Force {
+			recordCleanupErrorKind(&report, "port", cleanupErrorKindLegacyFallbackPort, "", err)
+		}
 	}
 
 	if opts.Probe {
@@ -1042,8 +1056,12 @@ reaps orphaned dolt sql-server processes left over from leaked test
 harnesses. Invalid explicit ports, invalid city port settings, and
 live-resolution errors (ambiguous listeners, discovery failures) fail
 closed before cleanup stages run; only a clean live-resolution miss can
-reach the legacy default. The legacy default is a connection fallback
-only; it does not protect port 3307 from orphan-process reaping.
+reach the legacy default. Nothing proves the city's server listens on
+the legacy default, so a run that reaches it opens no SQL connection,
+drops and purges nothing, and records a legacy-fallback-port force
+blocker (--force then exits nonzero); start the city's managed dolt,
+or pass --port to name the server. The legacy default does not protect
+port 3307 from orphan-process reaping.
 
 Dry-run by default. Pass --force to actually drop, purge, and kill.
 Pass --max-orphan-dbs with --force to refuse all destructive cleanup
@@ -1145,7 +1163,9 @@ can still return successfully after emitting the report.`,
 
 			// Resolve the port first so we can open a Dolt connection at the
 			// right address. Failed opens are reported by runDoltCleanup inside
-			// the typed cleanup envelope.
+			// the typed cleanup envelope. A legacy-fallback port is not
+			// provably this city's server, so no connection is opened there;
+			// runDoltCleanup reports the refusal as a force blocker.
 			resolution := ResolveDoltPort(PortResolverInput{
 				Flag: opts.Flag, CityPort: opts.CityPort, CityPath: opts.CityPath,
 			})
@@ -1154,7 +1174,7 @@ can still return successfully after emitting the report.`,
 			if host == "" {
 				host = "127.0.0.1"
 			}
-			if fatalPortResolutionError(resolution) == nil {
+			if fatalPortResolutionError(resolution) == nil && !resolution.Fallback {
 				client, openErr := newSQLCleanupDoltClient(cityPath, host, strconv.Itoa(resolution.Port))
 				if openErr != nil {
 					opts.DoltClientOpenErr = openErr
@@ -1230,13 +1250,14 @@ func hasRigProtectionError(report *CleanupReport) bool {
 
 // hasFatalForceBlocker reports whether a force-blocker has been
 // recorded that requires runDoltCleanup to exit non-zero in --force
-// mode. Currently only cleanupErrorKindLiveSessionProbeFailed counts;
-// rig-protection refusals are signaled via the Errors slice
-// (hasRigProtectionError), and max-orphan-refusal historically returns
-// exit 0 with the report (existing behavior preserved).
+// mode. cleanupErrorKindLiveSessionProbeFailed and
+// cleanupErrorKindLegacyFallbackPort count; rig-protection refusals are
+// signaled via the Errors slice (hasRigProtectionError), and
+// max-orphan-refusal historically returns exit 0 with the report (existing
+// behavior preserved).
 func hasFatalForceBlocker(report *CleanupReport) bool {
 	for _, b := range report.ForceBlockers {
-		if b.Kind == cleanupErrorKindLiveSessionProbeFailed {
+		if b.Kind == cleanupErrorKindLiveSessionProbeFailed || b.Kind == cleanupErrorKindLegacyFallbackPort {
 			return true
 		}
 	}

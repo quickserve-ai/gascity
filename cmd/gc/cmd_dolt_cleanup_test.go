@@ -464,8 +464,10 @@ func TestRunDoltCleanup_ForceDoesNotProtectLegacyFallbackPort(t *testing.T) {
 		ReapGracePeriod: 1,
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("exit=%d, stderr=%s", code, stderr.String())
+	// The fallback refuses drop and purge, so the forced run exits nonzero;
+	// the reap still runs and still gives the fallback port no protection.
+	if code != 1 {
+		t.Fatalf("exit=%d, want 1 from the legacy-fallback force blocker; stderr=%s", code, stderr.String())
 	}
 	var r CleanupReport
 	if err := json.Unmarshal(stdout.Bytes(), &r); err != nil {
@@ -473,6 +475,9 @@ func TestRunDoltCleanup_ForceDoesNotProtectLegacyFallbackPort(t *testing.T) {
 	}
 	if r.Port.Resolved != LegacyDefaultDoltPort || !r.Port.Fallback {
 		t.Fatalf("Port = %+v, want legacy fallback", r.Port)
+	}
+	if len(r.ForceBlockers) != 1 || r.ForceBlockers[0].Kind != cleanupErrorKindLegacyFallbackPort {
+		t.Fatalf("ForceBlockers = %+v, want the %s blocker", r.ForceBlockers, cleanupErrorKindLegacyFallbackPort)
 	}
 	if !equalIntSlice(r.Reaped.ProtectedPIDs, nil) {
 		t.Fatalf("ProtectedPIDs = %v, want none for legacy fallback test process", r.Reaped.ProtectedPIDs)
@@ -511,6 +516,7 @@ func TestRunDoltCleanup_ForceReapsBareDeletedCwd(t *testing.T) {
 			return nil
 		},
 		ReapGracePeriod: 1,
+		LiveResolve:     fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -556,6 +562,7 @@ func TestRunDoltCleanup_SQLClientOpenFailureIsTypedAndFatal(t *testing.T) {
 		DoltClientOpenErr: fmt.Errorf("open dolt connection: refused"),
 		DiscoverProcesses: func() ([]DoltProcInfo, error) { return nil, nil },
 		ReapGracePeriod:   1,
+		LiveResolve:       fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code == 0 {
@@ -829,6 +836,7 @@ func TestRunDoltCleanup_ForceKillsOrphans(t *testing.T) {
 			return syscall.ESRCH // pretend the process is already gone after TERM
 		},
 		ReapGracePeriod: 1, // tiny so the test doesn't sleep meaningfully
+		LiveResolve:     fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -862,6 +870,7 @@ func TestRunDoltCleanup_ForceReportsReapedRSSBytes(t *testing.T) {
 		DiscoverProcesses: func() ([]DoltProcInfo, error) { return procs, nil },
 		KillProcess:       func(_ int, _ syscall.Signal) error { return syscall.ESRCH },
 		ReapGracePeriod:   1,
+		LiveResolve:       fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -898,6 +907,7 @@ func TestRunDoltCleanup_ForceCountsSuccessfulKill(t *testing.T) {
 			return nil
 		},
 		ReapGracePeriod: 1,
+		LiveResolve:     fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -950,6 +960,7 @@ func TestRunDoltCleanup_ForceCountsPostSIGTERMGoneAsReaped(t *testing.T) {
 			return nil
 		},
 		ReapGracePeriod: 1,
+		LiveResolve:     fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -1066,6 +1077,7 @@ func TestRunDoltCleanup_ForceSkipsSignalWhenPIDStartTimeChanges(t *testing.T) {
 			return nil
 		},
 		ReapGracePeriod: 1,
+		LiveResolve:     fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -1115,6 +1127,7 @@ func TestRunDoltCleanup_ForceDoesNotCountMissingPIDAfterRevalidation(t *testing.
 			return nil
 		},
 		ReapGracePeriod: 1,
+		LiveResolve:     fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -1164,6 +1177,7 @@ func TestRunDoltCleanup_ForceSkipsSIGKILLWhenRevalidationDiscoverErrors(t *testi
 			return nil
 		},
 		ReapGracePeriod: 1,
+		LiveResolve:     fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -1263,6 +1277,7 @@ func TestRunDoltCleanup_ForceRecordsKillError(t *testing.T) {
 			return syscall.EPERM
 		},
 		ReapGracePeriod: 1,
+		LiveResolve:     fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -1360,6 +1375,7 @@ func TestRunDoltCleanup_SkipsNonDoltBackedRig(t *testing.T) {
 		FS:                fs,
 		JSON:              true,
 		DiscoverProcesses: func() ([]DoltProcInfo, error) { return nil, nil },
+		LiveResolve:       fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -1488,6 +1504,7 @@ func TestRunDoltCleanup_ForceDisablesDropAndPurgeWhenRigMetadataMissing(t *testi
 		DoltClient:        client,
 		DiscoverProcesses: func() ([]DoltProcInfo, error) { return nil, nil },
 		ReapGracePeriod:   1,
+		LiveResolve:       fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -1527,6 +1544,7 @@ func TestRunDoltCleanup_ForceDisablesDropAndPurgeWhenRigMetadataLacksDoltDatabas
 		DoltClient:        client,
 		DiscoverProcesses: func() ([]DoltProcInfo, error) { return nil, nil },
 		ReapGracePeriod:   1,
+		LiveResolve:       fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -1564,6 +1582,7 @@ func TestRunDoltCleanup_ForceRefusesDropWhenApplyPlanExceedsMaxOrphanDBs(t *test
 		DoltClient:        client,
 		DiscoverProcesses: func() ([]DoltProcInfo, error) { return nil, nil },
 		ReapGracePeriod:   1,
+		LiveResolve:       fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -1624,6 +1643,7 @@ func TestRunDoltCleanup_MaxOrphanRefusalAbortsForcedPurgeAndReap(t *testing.T) {
 			return nil
 		},
 		ReapGracePeriod: 1,
+		LiveResolve:     fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -1781,6 +1801,7 @@ func TestRunDoltCleanup_ForceRemovesDataDirAfterConfirmedKill(t *testing.T) {
 			return nil
 		},
 		ReapGracePeriod: 1,
+		LiveResolve:     fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -1875,6 +1896,7 @@ func TestRunDoltCleanup_ForceSkipsDataDirRemovalWhenTargetBecomesProtected(t *te
 			return nil
 		},
 		ReapGracePeriod: 1,
+		LiveResolve:     fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -1915,6 +1937,7 @@ func TestRunDoltCleanup_ForceDataDirRemovalErrorIsRecorded(t *testing.T) {
 			return fmt.Errorf("permission denied")
 		},
 		ReapGracePeriod: 1,
+		LiveResolve:     fakeLiveResolve(),
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
