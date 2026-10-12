@@ -183,7 +183,7 @@ func (c *bdTopologyCity) addScope(t *testing.T, name, db, prefix string, proxied
 				// A failed init may leave processes bd dolt stop cannot
 				// retire; killing those is the reset's job, so only a
 				// survivor is an error here.
-				if _, err := c.stopScope(s); err != nil {
+				if _, _, err := c.stopScope(s); err != nil {
 					return err
 				}
 				return os.RemoveAll(filepath.Join(dir, ".beads"))
@@ -313,11 +313,11 @@ func (c *bdTopologyCity) stopProcesses() {
 		if !s.proxied {
 			continue
 		}
-		killed, err := c.stopScope(s)
+		killed, stopOut, err := c.stopScope(s)
 		if err != nil {
 			c.t.Errorf("stop proxied scope %s: %v", s.dir, err)
 		} else if len(killed) != 0 {
-			c.t.Errorf("stop proxied scope %s: bd dolt stop left processes that needed SIGKILL:\n%s", s.dir, formatScopeProcesses(killed))
+			c.t.Errorf("stop proxied scope %s: bd dolt stop (%q) left processes that needed SIGKILL:\n%s", s.dir, stopOut, formatScopeProcesses(killed))
 		}
 	}
 }
@@ -330,8 +330,9 @@ func (c *bdTopologyCity) stopProcesses() {
 // (`bd db-proxy-child`) or `dolt sql-server` still naming the scope's .beads
 // directory — a restarted backend, a stale pid record, or what a failed init
 // left behind. Only such a just-observed process is SIGKILLed; stopScope
-// returns the processes it killed, and an error naming any that survive.
-func (c *bdTopologyCity) stopScope(s bdTopologyScope) ([]scopeProcess, error) {
+// returns the processes it killed, bd dolt stop's output, and an error naming
+// any that survive.
+func (c *bdTopologyCity) stopScope(s bdTopologyScope) ([]scopeProcess, string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	var stopOut string
@@ -342,12 +343,16 @@ func (c *bdTopologyCity) stopScope(s bdTopologyScope) ([]scopeProcess, error) {
 			stopOut = fmt.Sprintf("%s (%v)", stopOut, err)
 		}
 	}
-	leaked, err := c.scopeProcesses(ctx, s)
+	// The scan gets its own deadline: a bd dolt stop that ran out the 60s one
+	// must still be followed by a read of what it left.
+	scanCtx, scanCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer scanCancel()
+	leaked, err := c.scopeProcesses(scanCtx, s)
 	if err != nil {
-		return nil, fmt.Errorf("after bd dolt stop (%q): %w", stopOut, err)
+		return nil, stopOut, fmt.Errorf("after bd dolt stop (%q): %w", stopOut, err)
 	}
 	if len(leaked) == 0 {
-		return nil, nil
+		return nil, stopOut, nil
 	}
 	for _, p := range leaked {
 		_ = syscall.Kill(p.pid, syscall.SIGKILL)
@@ -362,9 +367,9 @@ func (c *bdTopologyCity) stopScope(s bdTopologyScope) ([]scopeProcess, error) {
 		}
 		return err == nil && len(got) == 0
 	}) {
-		return leaked, nil
+		return leaked, stopOut, nil
 	}
-	return leaked, fmt.Errorf("bd dolt stop (%q) left processes still alive 15s after SIGKILL (last process-table read err=%v):\n%s", stopOut, err, formatScopeProcesses(survivors))
+	return leaked, stopOut, fmt.Errorf("bd dolt stop (%q) left processes still alive 15s after SIGKILL (last process-table read err=%v):\n%s", stopOut, err, formatScopeProcesses(survivors))
 }
 
 type scopeProcess struct {
@@ -386,7 +391,7 @@ func formatScopeProcesses(ps []scopeProcess) string {
 // zombie has no command line in ps output, so an exited-but-unreaped process
 // is not listed.
 func (c *bdTopologyCity) scopeProcesses(ctx context.Context, s bdTopologyScope) ([]scopeProcess, error) {
-	out, err := c.runContext(ctx, c.root, nil, "ps", "-A", "-o", "pid=,args=")
+	out, err := c.runContext(ctx, c.root, nil, "ps", "-A", "-ww", "-o", "pid=,args=")
 	if err != nil {
 		return nil, fmt.Errorf("read process table: %w\n%s", err, out)
 	}
