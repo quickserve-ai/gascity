@@ -78,13 +78,16 @@ func testSuspendDeletedSocketAndDeadServer(t *testing.T, newProvider func(tmux.C
 		// SIGUSR1 makes tmux recreate a deleted socket, so kill-server can
 		// reach it. Each attempt is a tmux round trip, which paces the retry;
 		// a server that never answers is stopped by its own pid.
-		_ = syscall.Kill(serverPID, syscall.SIGUSR1)
+		// The body normally stops the server first, and a pid that has exited
+		// can be reused, so every signal goes through signalTmux, which
+		// refuses a pid that is no longer a live tmux process.
+		_ = signalTmux(serverPID, syscall.SIGUSR1)
 		stopped := false
 		for attempt := 0; attempt < 100 && !stopped; attempt++ {
-			stopped = tm.KillServer() == nil || syscall.Kill(serverPID, 0) != nil
+			stopped = tm.KillServer() == nil || !tmuxAlive(serverPID)
 		}
 		if !stopped {
-			_ = syscall.Kill(serverPID, syscall.SIGTERM)
+			_ = signalTmux(serverPID, syscall.SIGTERM)
 		}
 		_ = os.RemoveAll(socketRoot)
 	})
@@ -106,7 +109,7 @@ func testSuspendDeletedSocketAndDeadServer(t *testing.T, newProvider func(tmux.C
 	// "no server running" as success, so a kill-server that runs before the
 	// server has recreated its socket stops nothing: wait for the socket
 	// first, and for the server process to be gone after.
-	if err := syscall.Kill(serverPID, syscall.SIGUSR1); err != nil {
+	if err := signalTmux(serverPID, syscall.SIGUSR1); err != nil {
 		t.Fatalf("signal server to recreate its socket: %v", err)
 	}
 	waitFor(t, "the server to recreate its socket", func() bool {
@@ -170,5 +173,29 @@ func parentPID(t *testing.T, pid string) int {
 	if err != nil || ppid <= 1 {
 		t.Fatalf("parent of pane %s = %q, want the tmux server's pid", pid, fields[1])
 	}
+	if !tmuxAlive(ppid) {
+		t.Fatalf("parent of pane %s = %d, which is not a live tmux process; refusing to signal it", pid, ppid)
+	}
 	return ppid
+}
+
+// tmuxAlive reports whether pid is a live tmux process: its executable is
+// tmux and it has not exited. It is never this test binary or its parent,
+// which a SIGUSR1 would kill.
+func tmuxAlive(pid int) bool {
+	if pid <= 1 || pid == os.Getpid() || pid == os.Getppid() || processGone(pid) {
+		return false
+	}
+	exe, err := os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "exe"))
+	return err == nil && filepath.Base(exe) == "tmux"
+}
+
+// signalTmux sends sig to pid only while pid is a live tmux process. The
+// server's pid is read once; after the server exits the kernel may hand it to
+// another process, and a SIGUSR1 to anything but tmux terminates it.
+func signalTmux(pid int, sig syscall.Signal) error {
+	if !tmuxAlive(pid) {
+		return fmt.Errorf("pid %d is not a live tmux process", pid)
+	}
+	return syscall.Kill(pid, sig)
 }
