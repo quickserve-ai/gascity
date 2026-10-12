@@ -171,7 +171,7 @@ func (c *bdTopologyCity) addScope(t *testing.T, name, db, prefix string, proxied
 		out, err := retryOnBdProxyStartTimeout(
 			func() (string, error) { return c.run(t, dir, c.scopeEnv(s), c.bd, args...) },
 			func() error {
-				c.signalScopeProcesses(s, syscall.SIGKILL)
+				waitProcessesGone(c.signalScopeProcesses(s, syscall.SIGKILL), 10*time.Second)
 				return os.RemoveAll(filepath.Join(dir, ".beads"))
 			},
 		)
@@ -289,19 +289,74 @@ func shellSingleQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'"
 }
 
-// stopProcesses kills the bd proxies and Dolt children this fixture's proxied
-// scopes started, found through their own pidfiles.
+// stopProcesses stops the bd proxies and Dolt children this fixture's proxied
+// scopes started, found through their own pidfiles, and waits for them to
+// exit. It is registered after t.TempDir, so it runs before the directory is
+// removed; it must not return while a backend is still alive, because a Dolt
+// sql-server that is shutting down on SIGTERM still writes into
+// .beads/dolt/<db>/.dolt/noms, and RemoveAll then fails with "directory not
+// empty". These processes are bd's daemonized descendants, not the test's
+// children, so there is no exec.Cmd to Wait on: exit is observed by polling.
 func (c *bdTopologyCity) stopProcesses() {
+	var pids []int
 	for _, s := range c.scopes {
 		if s.proxied {
-			c.signalScopeProcesses(s, syscall.SIGTERM)
+			pids = append(pids, c.signalScopeProcesses(s, syscall.SIGTERM)...)
 		}
+	}
+	if waitProcessesGone(pids, 30*time.Second) {
+		return
+	}
+	for _, pid := range pids {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+	}
+	if !waitProcessesGone(pids, 10*time.Second) {
+		c.t.Logf("bd proxy/dolt processes %v still alive after SIGKILL; TempDir removal may fail", pids)
 	}
 }
 
+// waitProcessesGone polls until every pid has exited or timeout passes, and
+// reports whether all of them exited.
+func waitProcessesGone(pids []int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		alive := false
+		for _, pid := range pids {
+			if processAlive(pid) {
+				alive = true
+				break
+			}
+		}
+		if !alive {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// processAlive reports whether pid names a running process. A zombie has
+// already exited and released its files, so on Linux one counts as gone; it
+// stays a zombie when its reaper is a subreaper that does not reap promptly.
+func processAlive(pid int) bool {
+	if err := syscall.Kill(pid, 0); err == syscall.ESRCH {
+		return false
+	}
+	if stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid)); err == nil {
+		if i := strings.LastIndexByte(string(stat), ')'); i >= 0 && i+2 < len(stat) && stat[i+2] == 'Z' {
+			return false
+		}
+	}
+	return true
+}
+
 // signalScopeProcesses signals the processes a proxied scope's pid records
-// name: the proxy (proxy.pid) and its dolt backend (proxy-child.pid).
-func (c *bdTopologyCity) signalScopeProcesses(s bdTopologyScope, sig syscall.Signal) {
+// name: the proxy (proxy.pid) and its dolt backend (proxy-child.pid). It
+// returns the pids it signaled.
+func (c *bdTopologyCity) signalScopeProcesses(s bdTopologyScope, sig syscall.Signal) []int {
+	var pids []int
 	for _, name := range []string{"proxy.pid", "proxy-child.pid"} {
 		data, err := os.ReadFile(filepath.Join(s.dir, ".beads", "dolt", name))
 		if err != nil {
@@ -314,7 +369,9 @@ func (c *bdTopologyCity) signalScopeProcesses(s bdTopologyScope, sig syscall.Sig
 			continue
 		}
 		_ = syscall.Kill(rec.PID, sig)
+		pids = append(pids, rec.PID)
 	}
+	return pids
 }
 
 // bdProxyStartTimeout is how bd reports a proxied first start that missed its
