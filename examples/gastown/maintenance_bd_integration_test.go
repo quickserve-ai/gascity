@@ -3,7 +3,7 @@
 package gastown_test
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -115,7 +115,13 @@ func newBdTopologyCity(t *testing.T, bd string) *bdTopologyCity {
 
 func (c *bdTopologyCity) run(t *testing.T, dir string, extra []string, name string, args ...string) (string, error) {
 	t.Helper()
-	cmd := exec.Command(name, args...)
+	return c.runContext(context.Background(), dir, extra, name, args...)
+}
+
+// runContext is run bounded by ctx; cleanup paths use it so a wedged bd or ps
+// cannot hang the test binary.
+func (c *bdTopologyCity) runContext(ctx context.Context, dir string, extra []string, name string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
 	cmd.Env = append(append([]string{}, c.env...), extra...)
 	out, err := cmd.CombinedOutput()
@@ -160,6 +166,9 @@ func (c *bdTopologyCity) addScope(t *testing.T, name, db, prefix string, proxied
 		t.Fatalf("git init %s: %v\n%s", dir, err, out)
 	}
 	s := bdTopologyScope{name: name, dir: dir, db: db, prefix: prefix, proxied: proxied}
+	// Record the scope before its init runs, so cleanup stops whatever a
+	// failed init left running.
+	c.scopes = append(c.scopes, s)
 	args := []string{"init", "--quiet"}
 	if proxied {
 		args = append(args, "--proxied-server", "--proxied-server-idle-timeout", "120s")
@@ -171,7 +180,12 @@ func (c *bdTopologyCity) addScope(t *testing.T, name, db, prefix string, proxied
 		out, err := retryOnBdProxyStartTimeout(
 			func() (string, error) { return c.run(t, dir, c.scopeEnv(s), c.bd, args...) },
 			func() error {
-				c.signalScopeProcesses(s, syscall.SIGKILL)
+				// A failed init may leave processes bd dolt stop cannot
+				// retire; killing those is the reset's job, so only a
+				// survivor is an error here.
+				if _, _, err := c.stopScope(s); err != nil {
+					return err
+				}
 				return os.RemoveAll(filepath.Join(dir, ".beads"))
 			},
 		)
@@ -181,7 +195,6 @@ func (c *bdTopologyCity) addScope(t *testing.T, name, db, prefix string, proxied
 	} else {
 		c.bdIn(t, s, args...)
 	}
-	c.scopes = append(c.scopes, s)
 	c.writeRouter(t)
 	return s
 }
@@ -289,31 +302,147 @@ func shellSingleQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'"
 }
 
-// stopProcesses kills the bd proxies and Dolt children this fixture's proxied
-// scopes started, found through their own pidfiles.
+// stopProcesses stops the bd proxy and Dolt backend of every proxied scope
+// and fails the test if either outlives the stop. It is registered after
+// t.TempDir, so it runs before the directory is removed, and it must not
+// return while a backend is alive: a Dolt sql-server still shutting down
+// writes into .beads/dolt/<db>/.dolt/noms, and TempDir's RemoveAll then fails
+// with "directory not empty".
 func (c *bdTopologyCity) stopProcesses() {
 	for _, s := range c.scopes {
-		if s.proxied {
-			c.signalScopeProcesses(s, syscall.SIGTERM)
+		if !s.proxied {
+			continue
+		}
+		killed, stopOut, err := c.stopScope(s)
+		if err != nil {
+			c.t.Errorf("stop proxied scope %s: %v", s.dir, err)
+		} else if len(killed) != 0 {
+			c.t.Errorf("stop proxied scope %s: bd dolt stop (%q) left processes that needed SIGKILL:\n%s", s.dir, stopOut, formatScopeProcesses(killed))
 		}
 	}
 }
 
-// signalScopeProcesses signals the processes a proxied scope's pid records
-// name: the proxy (proxy.pid) and its dolt backend (proxy-child.pid).
-func (c *bdTopologyCity) signalScopeProcesses(s bdTopologyScope, sig syscall.Signal) {
-	for _, name := range []string{"proxy.pid", "proxy-child.pid"} {
-		data, err := os.ReadFile(filepath.Join(s.dir, ".beads", "dolt", name))
+// stopScope retires a proxied scope's proxy and Dolt backend with bd's own
+// `bd dolt stop`, which checks each recorded process's identity, signals it,
+// and returns once it has exited (a zombie counts as exited). These processes
+// are bd's daemonized descendants, not the test's children, so the test has
+// no exec.Cmd to wait on. The process table is then read for any proxy
+// (`bd db-proxy-child`) or `dolt sql-server` still naming the scope's .beads
+// directory — a restarted backend, a stale pid record, or what a failed init
+// left behind. Only such a just-observed process is SIGKILLed; stopScope
+// returns the processes it killed, bd dolt stop's output, and an error naming
+// any that survive.
+func (c *bdTopologyCity) stopScope(s bdTopologyScope) ([]scopeProcess, string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	var stopOut string
+	if _, err := os.Stat(filepath.Join(s.dir, ".beads")); err == nil {
+		out, err := c.runContext(ctx, s.dir, c.scopeEnv(s), c.bd, "dolt", "stop")
+		stopOut = strings.TrimSpace(out)
 		if err != nil {
+			stopOut = fmt.Sprintf("%s (%v)", stopOut, err)
+		}
+	}
+	// The scan gets its own deadline: a bd dolt stop that ran out the 60s one
+	// must still be followed by a read of what it left.
+	scanCtx, scanCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer scanCancel()
+	leaked, err := c.scopeProcesses(scanCtx, s)
+	if err != nil {
+		return nil, stopOut, fmt.Errorf("after bd dolt stop (%q): %w", stopOut, err)
+	}
+	if len(leaked) == 0 {
+		return nil, stopOut, nil
+	}
+	for _, p := range leaked {
+		_ = syscall.Kill(p.pid, syscall.SIGKILL)
+	}
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer waitCancel()
+	var survivors []scopeProcess
+	if waitUntilCtx(waitCtx, func() bool {
+		var got []scopeProcess
+		if got, err = c.scopeProcesses(waitCtx, s); err == nil {
+			survivors = got
+		}
+		return err == nil && len(got) == 0
+	}) {
+		return leaked, stopOut, nil
+	}
+	return leaked, stopOut, fmt.Errorf("bd dolt stop (%q) left processes still alive 15s after SIGKILL (last process-table read err=%v):\n%s", stopOut, err, formatScopeProcesses(survivors))
+}
+
+type scopeProcess struct {
+	pid  int
+	args string
+}
+
+func formatScopeProcesses(ps []scopeProcess) string {
+	var b strings.Builder
+	for _, p := range ps {
+		fmt.Fprintf(&b, "  pid %d: %s\n", p.pid, p.args)
+	}
+	return b.String()
+}
+
+// scopeProcesses lists live bd proxy and dolt sql-server processes whose
+// command line names s's .beads directory, spelled as given or with symlinks
+// resolved (t.TempDir on macOS sits under the /var -> /private/var link). A
+// zombie has no command line in ps output, so an exited-but-unreaped process
+// is not listed.
+func (c *bdTopologyCity) scopeProcesses(ctx context.Context, s bdTopologyScope) ([]scopeProcess, error) {
+	out, err := c.runContext(ctx, c.root, nil, "ps", "-A", "-ww", "-o", "pid=,args=")
+	if err != nil {
+		return nil, fmt.Errorf("read process table: %w\n%s", err, out)
+	}
+	beadsDirs := []string{filepath.Join(s.dir, ".beads")}
+	if resolved, err := filepath.EvalSymlinks(s.dir); err == nil && resolved != s.dir {
+		beadsDirs = append(beadsDirs, filepath.Join(resolved, ".beads"))
+	}
+	namesScope := func(args string) bool {
+		for _, d := range beadsDirs {
+			if strings.Contains(args, d) {
+				return true
+			}
+		}
+		return false
+	}
+	var found []scopeProcess
+	for _, line := range strings.Split(out, "\n") {
+		pidField, args, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if !ok || !namesScope(args) {
 			continue
 		}
-		var rec struct {
-			PID int `json:"pid"`
-		}
-		if json.Unmarshal(data, &rec) != nil || rec.PID <= 1 {
+		if !strings.Contains(args, "db-proxy-child") && !strings.Contains(args, "sql-server") {
 			continue
 		}
-		_ = syscall.Kill(rec.PID, sig)
+		pid, err := strconv.Atoi(pidField)
+		if err != nil || pid <= 1 {
+			continue
+		}
+		found = append(found, scopeProcess{pid: pid, args: strings.TrimSpace(args)})
+	}
+	return found, nil
+}
+
+// waitUntilCtx reports whether done became true before ctx ended. It is the
+// one wait at this black-box boundary: bd's daemonized processes expose no
+// exit notification to the test. It checks on a ticker, never with a sleep.
+func waitUntilCtx(ctx context.Context, done func() bool) bool {
+	if done() {
+		return true
+	}
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return done()
+		case <-ticker.C:
+			if done() {
+				return true
+			}
+		}
 	}
 }
 
