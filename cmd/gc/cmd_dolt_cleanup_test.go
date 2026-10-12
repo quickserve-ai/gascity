@@ -479,6 +479,10 @@ func TestRunDoltCleanup_ForceDoesNotProtectLegacyFallbackPort(t *testing.T) {
 	if len(r.ForceBlockers) != 1 || r.ForceBlockers[0].Kind != cleanupErrorKindLegacyFallbackPort {
 		t.Fatalf("ForceBlockers = %+v, want the %s blocker", r.ForceBlockers, cleanupErrorKindLegacyFallbackPort)
 	}
+	// This run has no CityPath, so the refusal has no city to name.
+	if strings.Contains(r.ForceBlockers[0].Error, " for :") {
+		t.Fatalf("force blocker = %q, want no empty city path printed", r.ForceBlockers[0].Error)
+	}
 	if !equalIntSlice(r.Reaped.ProtectedPIDs, nil) {
 		t.Fatalf("ProtectedPIDs = %v, want none for legacy fallback test process", r.Reaped.ProtectedPIDs)
 	}
@@ -562,7 +566,7 @@ func TestRunDoltCleanup_SQLClientOpenFailureIsTypedAndFatal(t *testing.T) {
 		DoltClientOpenErr: fmt.Errorf("open dolt connection: refused"),
 		DiscoverProcesses: func() ([]DoltProcInfo, error) { return nil, nil },
 		ReapGracePeriod:   1,
-		LiveResolve:       fakeLiveResolve(),
+		CityPort:          28231,
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code == 0 {
@@ -836,7 +840,9 @@ func TestRunDoltCleanup_ForceKillsOrphans(t *testing.T) {
 			return syscall.ESRCH // pretend the process is already gone after TERM
 		},
 		ReapGracePeriod: 1, // tiny so the test doesn't sleep meaningfully
-		LiveResolve:     fakeLiveResolve(),
+		// Not 28231: the bare server above must stay protected for having no
+		// --config, not for sitting on the resolved port.
+		CityPort: 4242,
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -1504,7 +1510,7 @@ func TestRunDoltCleanup_ForceDisablesDropAndPurgeWhenRigMetadataMissing(t *testi
 		DoltClient:        client,
 		DiscoverProcesses: func() ([]DoltProcInfo, error) { return nil, nil },
 		ReapGracePeriod:   1,
-		LiveResolve:       fakeLiveResolve(),
+		CityPort:          28231,
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -1544,7 +1550,7 @@ func TestRunDoltCleanup_ForceDisablesDropAndPurgeWhenRigMetadataLacksDoltDatabas
 		DoltClient:        client,
 		DiscoverProcesses: func() ([]DoltProcInfo, error) { return nil, nil },
 		ReapGracePeriod:   1,
-		LiveResolve:       fakeLiveResolve(),
+		CityPort:          28231,
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -1643,7 +1649,7 @@ func TestRunDoltCleanup_MaxOrphanRefusalAbortsForcedPurgeAndReap(t *testing.T) {
 			return nil
 		},
 		ReapGracePeriod: 1,
-		LiveResolve:     fakeLiveResolve(),
+		CityPort:        28231,
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -1896,7 +1902,10 @@ func TestRunDoltCleanup_ForceSkipsDataDirRemovalWhenTargetBecomesProtected(t *te
 			return nil
 		},
 		ReapGracePeriod: 1,
-		LiveResolve:     fakeLiveResolve(),
+		// Not 28231, and no live resolution: the target must become protected
+		// through the recorded port file, the fence left when the managed dolt
+		// is down.
+		CityPort: 4242,
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {

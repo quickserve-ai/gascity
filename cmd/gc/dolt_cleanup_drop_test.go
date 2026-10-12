@@ -31,9 +31,11 @@ type fakeCleanupDoltClient struct {
 	liveSessions    map[string]int
 	liveSessionsErr error
 	probeCalls      int
+	listCalls       int
 }
 
 func (f *fakeCleanupDoltClient) ListDatabases(_ context.Context) ([]string, error) {
+	f.listCalls++
 	out := make([]string, len(f.databases))
 	copy(out, f.databases)
 	return out, nil
@@ -255,8 +257,73 @@ func TestRunDoltCleanup_ForceOnLegacyFallbackPortDropsNothing(t *testing.T) {
 	if !reported {
 		t.Errorf("errors = %+v, force_blockers = %+v: want the refusal reported, naming the legacy port %s", r.Errors, r.ForceBlockers, legacyPort)
 	}
-	if code == 0 && r.Summary.ErrorsTotal == 0 {
-		t.Errorf("exit=0 with errors_total=0: the refusal must be visible to automation (nonzero exit or a counted error)")
+	// The exit code and the counted error are separate signals to automation;
+	// each is asserted on its own so losing either one fails here.
+	if code != 1 {
+		t.Errorf("exit=%d, want 1: a forced run on the legacy fallback port must fail", code)
+	}
+	if r.Summary.ErrorsTotal != 1 || len(r.Errors) != 1 || r.Errors[0].Stage != "port" || r.Errors[0].Kind != cleanupErrorKindLegacyFallbackPort {
+		t.Errorf("errors_total = %d, errors = %+v: want exactly one port-stage error of kind %s", r.Summary.ErrorsTotal, r.Errors, cleanupErrorKindLegacyFallbackPort)
+	}
+	if len(r.ForceBlockers) != 1 || r.ForceBlockers[0].Kind != cleanupErrorKindLegacyFallbackPort {
+		t.Errorf("force_blockers = %+v: want exactly one of kind %s", r.ForceBlockers, cleanupErrorKindLegacyFallbackPort)
+	}
+}
+
+// TestRunDoltCleanup_DryRunOnLegacyFallbackPortReportsOnlyTheBlocker pins the
+// contract mol-dog-stale-db's scan gate reads before it ever passes --force:
+// on a fallback resolution the dry run exits 0 with errors_total 0 and exactly
+// one force blocker, naming the legacy port and the city. It also proposes no
+// drops and runs no SQL at all on that port, not even the listing a dry run
+// normally does.
+func TestRunDoltCleanup_DryRunOnLegacyFallbackPortReportsOnlyTheBlocker(t *testing.T) {
+	fs := fsys.NewFake()
+	fs.Files["/city/.beads/metadata.json"] = []byte(`{"dolt_database":"hq"}`)
+	client := &fakeCleanupDoltClient{
+		databases: []string{"hq", "testdb_abc", "doctest_x"},
+	}
+
+	var stdout, stderr bytes.Buffer
+	opts := cleanupOptions{
+		Rigs:              []resolverRig{{Name: "hq", Path: "/city", HQ: true}},
+		FS:                fs,
+		CityPath:          "/city",
+		LiveResolve:       fakeLiveResolveMiss(),
+		JSON:              true,
+		DoltClient:        client,
+		DiscoverProcesses: func() ([]DoltProcInfo, error) { return nil, nil },
+	}
+	code := runDoltCleanup(opts, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit=%d, want 0: a dry run reports the blocker without failing; stderr=%q", code, stderr.String())
+	}
+
+	var r CleanupReport
+	if err := json.Unmarshal(stdout.Bytes(), &r); err != nil {
+		t.Fatalf("Unmarshal: %v\nstdout: %s", err, stdout.String())
+	}
+	if r.Port.Resolved != LegacyDefaultDoltPort || !r.Port.Fallback {
+		t.Fatalf("Port = %+v, want the legacy-default fallback this test is about", r.Port)
+	}
+
+	if len(r.ForceBlockers) != 1 || r.ForceBlockers[0].Kind != cleanupErrorKindLegacyFallbackPort {
+		t.Fatalf("force_blockers = %+v: want exactly one of kind %s", r.ForceBlockers, cleanupErrorKindLegacyFallbackPort)
+	}
+	blocker := r.ForceBlockers[0].Error
+	if !strings.Contains(blocker, fmt.Sprint(LegacyDefaultDoltPort)) || !strings.Contains(blocker, opts.CityPath) {
+		t.Errorf("force blocker = %q: want it to name the legacy port %d and the city %s", blocker, LegacyDefaultDoltPort, opts.CityPath)
+	}
+	if r.Summary.ErrorsTotal != 0 || len(r.Errors) != 0 {
+		t.Errorf("errors_total = %d, errors = %+v: want none, a dry-run blocker is not an error", r.Summary.ErrorsTotal, r.Errors)
+	}
+	if r.Dropped.Count != 0 || len(r.Dropped.Names) != 0 {
+		t.Errorf("dropped = %+v: want no drop candidates listed from the legacy fallback port", r.Dropped)
+	}
+	if len(client.dropped) != 0 || client.purged != 0 {
+		t.Errorf("dropped = %v, purged = %d: want no DROP and no purge", client.dropped, client.purged)
+	}
+	if client.listCalls != 0 || client.probeCalls != 0 {
+		t.Errorf("SHOW DATABASES calls = %d, processlist probes = %d: want no SQL at all on the legacy fallback port", client.listCalls, client.probeCalls)
 	}
 }
 
@@ -279,7 +346,7 @@ func TestRunDoltCleanup_ForceDisablesDropAndPurgeWhenRigMetadataUnreadable(t *te
 		DoltClient:        client,
 		DiscoverProcesses: func() ([]DoltProcInfo, error) { return nil, nil },
 		ReapGracePeriod:   1,
-		LiveResolve:       fakeLiveResolve(),
+		CityPort:          28231,
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
@@ -325,7 +392,7 @@ func TestRunDoltCleanup_ForceDisablesDropAndPurgeWhenRigMetadataCorrupt(t *testi
 		DoltClient:        client,
 		DiscoverProcesses: func() ([]DoltProcInfo, error) { return nil, nil },
 		ReapGracePeriod:   1,
-		LiveResolve:       fakeLiveResolve(),
+		CityPort:          28231,
 	}
 	code := runDoltCleanup(opts, &stdout, &stderr)
 	if code != 0 {
