@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -71,7 +73,9 @@ type reapReport struct {
 //     (worktreeLastActivity). It covers what gate 6 cannot see: a seat whose
 //     resident process sits in its home and works in the tree through
 //     short-lived shell calls (pl-4fj). An indeterminate last use or a
-//     misconfigured period protects.
+//     misconfigured period protects, and the gate runs again immediately
+//     before removal (after the borrow-veto query and every other blocking
+//     step), on every caller's path.
 //  4. Git state: no authored uncommitted changes and no commits that removing
 //     the worktree would orphan — commits reachable from no branch, tag, or
 //     remote-tracking ref (git.HasUnreachableCommitsResult). The test is
@@ -522,11 +526,18 @@ func reapClosedBeadWorktreesGuarded(
 			// scan it was judged on started (sessionStartFence.runIfQuiet).
 			// Nothing but the remove runs inside the fence.
 			var removeErr error
+			var recheckWhy string
 			var passCtx context.Context
 			if pre != nil {
 				passCtx = pre.ctx
 			}
 			remove := func() {
+				// Last-use re-check, after every blocking step above: a seat
+				// that worked in the tree while this pass ran protects it.
+				if why := quietPeriodReason(worktreePath, &cfg.Daemon); why != "" {
+					recheckWhy = "pre-removal re-check: " + why
+					return
+				}
 				gitCtx, cancel := reaperGitCtx(passCtx)
 				defer cancel()
 				removeErr = git.New(rigRoot).WorktreeRemoveCtx(gitCtx, worktreePath, false)
@@ -548,6 +559,19 @@ func reapClosedBeadWorktreesGuarded(
 				}
 			} else {
 				remove()
+			}
+			if recheckWhy != "" {
+				if skips.shouldSurface(worktreePath, recheckWhy) {
+					fmt.Fprintf(stderr, //nolint:errcheck
+						"reapClosedBeadWorktrees: protecting %s (bead %s closed but %s)\n",
+						worktreePath, beadID, recheckWhy,
+					)
+					recordReapSkipped(rec, beadID, worktreePath, rigName, recheckWhy)
+				}
+				report.Protected = append(report.Protected, reapDecision{
+					BeadID: beadID, Path: worktreePath, Rig: rigName, Branch: branch, Reason: recheckWhy,
+				})
+				continue
 			}
 			if err := removeErr; err != nil {
 				fmt.Fprintf(stderr, "reapClosedBeadWorktrees: removing %s: %v\n", worktreePath, err) //nolint:errcheck
@@ -855,19 +879,25 @@ func quietPeriodReason(worktreePath string, d *config.DaemonConfig) string {
 	return ""
 }
 
-// worktreeLastActivity returns when worktreePath was last used: the newest
-// mtime among its root directory and its private gitdir's HEAD and index,
-// which a commit, checkout, `git add` or file creation in the root refreshes.
-// Three stats, never a tree walk. The reflog is not read by its mtime: `git
-// gc` rewrites every worktree's reflog at once, which would make every tree
-// in a busy repo look used. ok is false when the gitdir cannot be resolved or
-// any of the three cannot be stat'd, a missing index included.
+// worktreeLastActivity returns when worktreePath was last used: the newest of
+// the mtimes of its root directory and its private gitdir's HEAD and index,
+// and the time git recorded on the newest entry of that gitdir's HEAD reflog.
+// A commit, checkout or reset adds a reflog entry even when it rewrites
+// neither HEAD nor the index (an empty commit on a clean tree); a `git add`
+// or a file created in the root moves an mtime. The reflog is read by its
+// entries, never its mtime: `git gc` rewrites every worktree's reflog at once
+// without changing them. A few stats and one bounded read, never a tree walk.
+// ok is false when the gitdir cannot be resolved, any signal is missing or
+// unreadable, or the newest reflog entry does not parse.
 func worktreeLastActivity(worktreePath string) (time.Time, bool) {
 	gitDir, ok := worktreeGitDir(worktreePath)
 	if !ok {
 		return time.Time{}, false
 	}
-	var newest time.Time
+	newest, ok := newestReflogEntryTime(filepath.Join(gitDir, "logs", "HEAD"))
+	if !ok {
+		return time.Time{}, false
+	}
 	for _, p := range [...]string{worktreePath, filepath.Join(gitDir, "HEAD"), filepath.Join(gitDir, "index")} {
 		info, err := os.Stat(p)
 		if err != nil {
@@ -878,6 +908,49 @@ func worktreeLastActivity(worktreePath string) (time.Time, bool) {
 		}
 	}
 	return newest, true
+}
+
+// reflogTailBytes bounds the read of a reflog's end; an entry is ~200 bytes.
+const reflogTailBytes = 64 << 10
+
+// newestReflogEntryTime returns the time git recorded on the last entry of the
+// reflog at path ("<old> <new> <name> <email> <unix-seconds> <tz>[\t<msg>]"),
+// reading at most reflogTailBytes from its end. A reflog with no entries left
+// (all expired) returns the zero time. ok is false when the file is missing or
+// unreadable, or its last entry does not parse.
+func newestReflogEntryTime(path string) (time.Time, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return time.Time{}, false
+	}
+	defer f.Close() //nolint:errcheck // read-only
+	info, err := f.Stat()
+	if err != nil {
+		return time.Time{}, false
+	}
+	off := max(info.Size()-reflogTailBytes, 0)
+	buf := make([]byte, info.Size()-off)
+	if _, err := f.ReadAt(buf, off); err != nil && !errors.Is(err, io.EOF) {
+		return time.Time{}, false
+	}
+	tail := strings.TrimRight(string(buf), "\n")
+	if tail == "" && off == 0 {
+		return time.Time{}, true
+	}
+	i := strings.LastIndexByte(tail, '\n')
+	if i < 0 && off > 0 {
+		return time.Time{}, false // the last entry is longer than the read
+	}
+	head, _, _ := strings.Cut(tail[i+1:], "\t")
+	fields := strings.Fields(head)
+	if len(fields) < 5 {
+		return time.Time{}, false
+	}
+	secs, err := strconv.ParseInt(fields[len(fields)-2], 10, 64)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return time.Unix(secs, 0), true
 }
 
 // worktreeGitDir resolves a linked worktree's private gitdir from the
