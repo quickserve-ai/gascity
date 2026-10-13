@@ -331,7 +331,7 @@ func beadsTopologyCheck(name string) bool {
 // internal/doctor/checks_order_firing.go writes them, anchored at both ends
 // so an appended suffix does not match.
 var (
-	schedulerStaleLine   = regexp.MustCompile(`^\S+: last fired \S+ ago, expected every \S+ \(CRITICAL: stale\)$`)
+	schedulerStaleLine   = regexp.MustCompile(`^\S+: last fired (\S+) ago, expected every (\S+) \(CRITICAL: stale\)$`)
 	schedulerOverdueLine = regexp.MustCompile(`^\S+: last fired \S+ ago, expected every \S+ \(overdue\)$`)
 	schedulerCurrentLine = regexp.MustCompile(`^\d+ other scheduled order\(s\) current$`)
 )
@@ -339,9 +339,9 @@ var (
 // schedulerLagOnly reports whether the run's ONLY blocking failure is the test
 // city's own order scheduler running late: order-firing-current in error, not
 // timed out, and every line it flags an age ("last fired 3m ago, expected
-// every 1m (CRITICAL: stale)"). That is a loaded CI runner missing 1-minute
-// ticks (ga-l0b72a.9: #271 run 38317797049 failed three proxied tests on
-// "dolt-health: last fired 2m ago ... CRITICAL: stale" and passed on rerun).
+// every 1m (CRITICAL: stale)") of a 1-minute order at most schedulerMaxLag
+// old. That is a loaded CI runner missing 1-minute ticks (ga-l0b72a.9: #271
+// run 38317797049 failed three proxied tests on "dolt-health: last fired 2m ago ... CRITICAL: stale" and passed on rerun).
 // A lookup timeout, a never-fired order, an unreadable history, or any other
 // failing check is NOT lag and stays fatal: those are the defects this
 // assertion has caught before (see assertDoctorGreen).
@@ -364,6 +364,9 @@ func schedulerLagOnly(report doctorReport) bool {
 		for _, d := range r.Details {
 			switch {
 			case schedulerStaleLine.MatchString(d):
+				if !schedulerLateNotStopped(schedulerStaleLine.FindStringSubmatch(d)) {
+					return false
+				}
 				lagged = true
 			case schedulerOverdueLine.MatchString(d), schedulerCurrentLine.MatchString(d):
 			default:
@@ -372,6 +375,29 @@ func schedulerLagOnly(report doctorReport) bool {
 		}
 	}
 	return lagged
+}
+
+// schedulerMaxLag is how stale a 1-minute order may be and still count as a
+// loaded runner missing ticks. The check goes CRITICAL at 3x the interval, so
+// this tolerates a few missed ticks; an order older than this has stopped, and
+// a stopped scheduler is the controller regression the assertion must catch.
+const schedulerMaxLag = 5 * time.Minute
+
+// schedulerLateNotStopped judges one stale line's captured age and interval:
+// only the test city's 1-minute orders, and only up to schedulerMaxLag.
+func schedulerLateNotStopped(m []string) bool {
+	if len(m) != 3 {
+		return false
+	}
+	age, err := time.ParseDuration(m[1])
+	if err != nil {
+		return false
+	}
+	expected, err := time.ParseDuration(m[2])
+	if err != nil {
+		return false
+	}
+	return expected == time.Minute && age <= schedulerMaxLag
 }
 
 // TestSchedulerLagOnly pins which order-firing-current reports count as lag.
@@ -400,6 +426,12 @@ func TestSchedulerLagOnly(t *testing.T) {
 		{"unreadable history", report(1, false, stale, "mol-x: cannot read order history: boom"), false},
 		{"unknown line", report(1, false, stale, "something new"), false},
 		{"overdue only", report(1, false, "wisp-gc: last fired 2h ago, expected every 1h (overdue)"), false},
+		{"stale at the lag bound", report(1, false,
+			"dolt-health: last fired 5m ago, expected every 1m (CRITICAL: stale)"), true},
+		{"stale past the lag bound: stopped, not late", report(1, false,
+			"dolt-health: last fired 45m ago, expected every 1m (CRITICAL: stale)"), false},
+		{"stale on a longer interval", report(1, false,
+			"wisp-gc: last fired 3h ago, expected every 1h (CRITICAL: stale)"), false},
 		{"timed out", report(1, true, stale), false},
 		{"a second blocking failure", report(2, false, stale), false},
 	} {
