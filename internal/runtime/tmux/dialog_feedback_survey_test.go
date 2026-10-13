@@ -590,6 +590,13 @@ func TestFeedbackSurveyLiveOnlyDirectlyAboveComposer(t *testing.T) {
 		"stale survey on screen": {feedbackSurveyStaleOnScreenFixture, false},
 		"no composer":            {"  1: Bad    2: Fine   3: Good   0: Dismiss", false},
 		"quoted row, no header":  {"⏺ The survey row reads:\n  1: Bad    2: Fine   3: Good   0: Dismiss\n\n╭──────────╮\n│ ❯        │\n╰──────────╯", false},
+		// A narrow pane wraps the header; the option row still fits on one line.
+		"header wrapped before (optional)": {"⏺ Done.\n\n● How is Claude doing this session?\n  (optional)\n  1: Bad    2: Fine   3: Good   0: Dismiss\n\n╭──────────╮\n│ ❯        │\n╰──────────╯", true},
+		"header wrapped mid-title":         {"⏺ Done.\n\n● How is Claude doing this\n  session? (optional)\n  1: Bad    2: Fine   3: Good   0: Dismiss\n\n╭──────────╮\n│ ❯        │\n╰──────────╯", true},
+		// An agent quoting the whole survey, header and row: its block opens
+		// with the agent's ⏺, not the ● Claude Code draws a survey under.
+		"quoted survey, header and row": {"⏺ Here is the survey text:\n  How is Claude doing this session? (optional)\n  1: Bad    2: Fine   3: Good   0: Dismiss\n\n╭──────────╮\n│ ❯        │\n╰──────────╯", false},
+		"quoted survey in a user turn":  {"> paste: How is Claude doing this session? (optional)\n  1: Bad    2: Fine   3: Good   0: Dismiss\n\n╭──────────╮\n│ ❯        │\n╰──────────╯", false},
 	} {
 		if got := feedbackSurveyLive(tc.content); got != tc.want {
 			t.Errorf("%s: feedbackSurveyLive = %v, want %v", name, got, tc.want)
