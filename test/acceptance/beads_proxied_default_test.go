@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -58,16 +59,20 @@ type scopeOwnershipDoc struct {
 }
 
 type doctorReport struct {
-	Passed  int                 `json:"passed"`
-	Warned  int                 `json:"warned"`
-	Failed  int                 `json:"failed"`
-	Results []doctorCheckResult `json:"results"`
+	Passed         int                 `json:"passed"`
+	Warned         int                 `json:"warned"`
+	Failed         int                 `json:"failed"`
+	BlockingFailed int                 `json:"blocking_failed"`
+	Results        []doctorCheckResult `json:"results"`
 }
 
 type doctorCheckResult struct {
-	Name    string `json:"name"`
-	Status  string `json:"status"`
-	Message string `json:"message"`
+	Name     string `json:"name"`
+	Status   string `json:"status"`
+	Severity string `json:"severity"`
+	Message  string `json:"message"`
+	// TimedOut marks a check doctor abandoned: its outcome is unknown.
+	TimedOut bool `json:"timed_out,omitempty"`
 	// Details are the check's supporting lines; proxied-backup-coverage
 	// lists each scope it found backed up here.
 	Details []string `json:"details,omitempty"`
@@ -322,6 +327,144 @@ func beadsTopologyCheck(name string) bool {
 	return strings.HasPrefix(name, "custom-types")
 }
 
+// The order-firing-current detail lines that mean only "fired late", as
+// internal/doctor/checks_order_firing.go writes them, anchored at both ends
+// so an appended suffix does not match.
+var (
+	schedulerStaleLine   = regexp.MustCompile(`^\S+: last fired (\S+) ago, expected every (\S+) \(CRITICAL: stale\)$`)
+	schedulerOverdueLine = regexp.MustCompile(`^\S+: last fired \S+ ago, expected every \S+ \(overdue\)$`)
+	schedulerCurrentLine = regexp.MustCompile(`^\d+ other scheduled order\(s\) current$`)
+)
+
+// schedulerLagOnly reports whether the run's ONLY blocking failure is the test
+// city's own order scheduler running late: order-firing-current in error, not
+// timed out, and every line it flags an age ("last fired 3m ago, expected
+// every 1m (CRITICAL: stale)") of a 1-minute order at most schedulerMaxLag
+// old. That is a loaded CI runner missing 1-minute ticks (ga-l0b72a.9: #271
+// run 38317797049 failed three proxied tests on "dolt-health: last fired 2m
+// ago ... CRITICAL: stale" and passed on rerun).
+// A lookup timeout, a never-fired order, an unreadable history, or any other
+// failing check is NOT lag and stays fatal: those are the defects this
+// assertion has caught before (see assertDoctorGreen).
+func schedulerLagOnly(report doctorReport) bool {
+	if report.BlockingFailed != 1 {
+		return false
+	}
+	lagged := false
+	for _, r := range report.Results {
+		if r.Status != "error" || r.Severity == "advisory" {
+			continue
+		}
+		if r.Name != "order-firing-current" || r.TimedOut {
+			return false
+		}
+		// Every detail line must be one this check writes for lag, or its
+		// closing count line. Anything else, including a lag line carrying a
+		// suffix (", gated on open work ..." is a stuck item; ", open-work
+		// lookup failed: ..." is a failed store read), is not lag.
+		for _, d := range r.Details {
+			switch {
+			case schedulerStaleLine.MatchString(d):
+				if !schedulerLateNotStopped(schedulerStaleLine.FindStringSubmatch(d)) {
+					return false
+				}
+				lagged = true
+			case schedulerOverdueLine.MatchString(d), schedulerCurrentLine.MatchString(d):
+			default:
+				return false
+			}
+		}
+	}
+	return lagged
+}
+
+// schedulerMaxLag is how stale a 1-minute order may be and still count as a
+// loaded runner missing ticks. The check goes CRITICAL at 3x the interval, so
+// this tolerates a few missed ticks; an order older than this has stopped, and
+// a stopped scheduler is the controller regression the assertion must catch.
+const schedulerMaxLag = 5 * time.Minute
+
+// schedulerLateNotStopped judges one stale line's captured age and interval:
+// only the test city's 1-minute orders, and only up to schedulerMaxLag.
+func schedulerLateNotStopped(m []string) bool {
+	if len(m) != 3 {
+		return false
+	}
+	age, err := time.ParseDuration(m[1])
+	if err != nil {
+		return false
+	}
+	expected, err := time.ParseDuration(m[2])
+	if err != nil {
+		return false
+	}
+	return expected == time.Minute && age <= schedulerMaxLag
+}
+
+// TestSchedulerLagOnly pins which order-firing-current reports count as lag.
+// It needs no bd or dolt: it judges literal doctor reports.
+func TestSchedulerLagOnly(t *testing.T) {
+	stale := "dolt-health: last fired 2m ago, expected every 1m (CRITICAL: stale)" // #271 run 38317797049
+	report := func(blocking int, timedOut bool, details ...string) doctorReport {
+		return doctorReport{BlockingFailed: blocking, Results: []doctorCheckResult{{
+			Name: "order-firing-current", Status: "error", Severity: "blocking",
+			TimedOut: timedOut, Details: details,
+		}}}
+	}
+	for _, tc := range []struct {
+		name   string
+		report doctorReport
+		want   bool
+	}{
+		{"one stale line", report(1, false, stale), true},
+		{"stale with overdue sibling and count", report(1, false, stale,
+			"wisp-gc: last fired 1h30m0s ago, expected every 1h (overdue)", "4 other scheduled order(s) current"), true},
+		{"stale sibling gated on open work", report(1, false, stale,
+			"mol-x: last fired 3m ago, expected every 1m (CRITICAL: stale), gated on open work ga-1 (5m old, unassigned)"), false},
+		{"stale sibling whose open-work lookup failed", report(1, false, stale,
+			"mol-x: last fired 3m ago, expected every 1m (CRITICAL: stale), open-work lookup failed: dial tcp: refused"), false},
+		{"never fired", report(1, false, stale, "mol-x: never fired since controller start 9m ago"), false},
+		{"unreadable history", report(1, false, stale, "mol-x: cannot read order history: boom"), false},
+		{"unknown line", report(1, false, stale, "something new"), false},
+		{"overdue only", report(1, false, "wisp-gc: last fired 2h ago, expected every 1h (overdue)"), false},
+		{"stale at the lag bound", report(1, false,
+			"dolt-health: last fired 5m ago, expected every 1m (CRITICAL: stale)"), true},
+		{"stale past the lag bound: stopped, not late", report(1, false,
+			"dolt-health: last fired 45m ago, expected every 1m (CRITICAL: stale)"), false},
+		{"stale on a longer interval", report(1, false,
+			"wisp-gc: last fired 3h ago, expected every 1h (CRITICAL: stale)"), false},
+		{"timed out", report(1, true, stale), false},
+		{"a second blocking failure", report(2, false, stale), false},
+	} {
+		if got := schedulerLagOnly(tc.report); got != tc.want {
+			t.Errorf("%s: schedulerLagOnly = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// doctorJSONAllowingSchedulerLag runs `gc doctor --json` and fails the test on
+// a non-zero exit unless schedulerLagOnly says the only blocking failure is the
+// test city's scheduler running late, which it logs. It returns the parsed
+// report and the raw output.
+func doctorJSONAllowingSchedulerLag(t *testing.T, city *helpers.City, label string) (doctorReport, string) {
+	t.Helper()
+	out, err := city.GC("doctor", "--json")
+	var report doctorReport
+	lastJSONLine(t, out, &report)
+	if err != nil {
+		if !schedulerLagOnly(report) {
+			t.Fatalf("gc doctor --json exited non-zero on %s: %v\n%s", label, err, out)
+		}
+		for _, r := range report.Results {
+			if r.Name == "order-firing-current" {
+				t.Logf("tolerated on %s: order-firing-current %s (%s): the test city's scheduler ran late on this runner, not a topology fault",
+					label, r.Message, strings.Join(r.Details, "; "))
+			}
+		}
+	}
+	return report, out
+}
+
 // assertDoctorGreen runs the real `gc doctor --json` front door and requires
 // exit 0, zero failures anywhere, and zero warnings from any check whose
 // subject is the bead store's topology.
@@ -338,12 +481,7 @@ func beadsTopologyCheck(name string) bool {
 // a doctor report nobody can get to zero is a doctor report nobody reads.
 func assertDoctorGreen(t *testing.T, city *helpers.City, label string) {
 	t.Helper()
-	out, err := city.GC("doctor", "--json")
-	var report doctorReport
-	lastJSONLine(t, out, &report)
-	if err != nil {
-		t.Fatalf("gc doctor --json exited non-zero on %s: %v\n%s", label, err, out)
-	}
+	report, _ := doctorJSONAllowingSchedulerLag(t, city, label)
 	topologyWarnings := 0
 	for _, r := range report.Results {
 		if r.Status == "ok" {
@@ -354,9 +492,13 @@ func assertDoctorGreen(t *testing.T, city *helpers.City, label string) {
 			topologyWarnings++
 		}
 	}
-	if report.Failed != 0 || topologyWarnings != 0 {
+	failed := report.Failed
+	if schedulerLagOnly(report) {
+		failed-- // the one tolerated order-firing-current result, logged by the helper
+	}
+	if failed != 0 || topologyWarnings != 0 {
 		t.Fatalf("gc doctor on %s reported %d failure(s) and %d bead-topology warning(s), want none",
-			label, report.Failed, topologyWarnings)
+			label, failed, topologyWarnings)
 	}
 	for _, r := range report.Results {
 		switch r.Name {
@@ -949,9 +1091,7 @@ func TestBeadsProxiedDefaultInit(t *testing.T) {
 		// attributable rather than cumulative. `gc doctor --json` on a healthy
 		// proxied city is the read-only shape PR2's budget is stated against.
 		bdCalls.Reset()
-		if out, err := p.city.GC("doctor", "--json"); err != nil {
-			t.Fatalf("gc doctor --json: %v\n%s", err, out)
-		}
+		doctorJSONAllowingSchedulerLag(t, p.city, "a 0-rig proxied city")
 		t.Logf("gc doctor --json on a 0-rig proxied city: %d bd fork(s), %d ping(s)\n%s",
 			bdCalls.Count(), bdCalls.Count("ping"), bdCalls.Describe())
 	})
