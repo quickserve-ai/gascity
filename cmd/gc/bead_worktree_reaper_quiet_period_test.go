@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 )
 
@@ -23,132 +24,124 @@ func touchWorktreeIndex(t *testing.T, worktreePath string) {
 	}
 }
 
+// runQuietReap runs one reap pass over a single closed-bead worktree with the
+// given quiet-period minutes (nil = default) and no live process.
+func runQuietReap(t *testing.T, cityPath, rigRoot, beadID string, minutes *int, store beads.Store) reapReport {
+	t.Helper()
+	if store == nil {
+		store = beads.NewMemStoreFrom(1, []beads.Bead{{ID: beadID, Status: "closed"}}, nil)
+	}
+	cfg := reapTestConfig(rigRoot)
+	cfg.Daemon.AutoReapClosedBeadWorktreesQuietPeriodMinutes = minutes
+	injectLiveness(t, liveWorktreeState{scanned: true})
+	var stderr bytes.Buffer
+	return reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, events.Discard, nil, &stderr)
+}
+
+func requireProtected(t *testing.T, report reapReport, wt, wantReason string) {
+	t.Helper()
+	if len(report.Reaped) != 0 || len(report.Protected) != 1 || !strings.Contains(report.Protected[0].Reason, wantReason) {
+		t.Fatalf("Reaped = %+v Protected = %+v, want one protection naming %q", report.Reaped, report.Protected, wantReason)
+	}
+	if _, err := os.Stat(wt); err != nil {
+		t.Fatalf("protected worktree %s was removed or unstattable: %v", wt, err)
+	}
+}
+
 // TestReapClosedBeadWorktrees_ProtectsRecentlyUsedWorktreeUnderDefaultQuietPeriod
 // reproduces pl-4fj (brett-qc-nmoxbup, 2026-09-14): a named seat's per-bead
 // worktree — closed bead, clean and pushed, created days ago, no live process
 // cwd inside it because the seat's resident process sits in its home — was
 // reaped six minutes after the seat's last commit in it. A git index touched
-// minutes ago is recent use; the default quiet period must protect the tree
-// and say why.
+// minutes ago is recent use; the default quiet period protects the tree and
+// the reason names the period and the activity age.
 func TestReapClosedBeadWorktrees_ProtectsRecentlyUsedWorktreeUnderDefaultQuietPeriod(t *testing.T) {
 	cityPath, rigRoot := initReapRig(t)
 	wt := addClosedWorktree(t, rigRoot, cityPath, "seat", "ga-quiet01")
 	backdateWorktreeActivity(t, wt, 72*time.Hour)
 	touchWorktreeIndex(t, wt)
-	store := beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-quiet01", Status: "closed"}}, nil)
-	cfg := reapTestConfig(rigRoot) // quiet period unset -> default
-	injectLiveness(t, liveWorktreeState{scanned: true})
-
-	var stderr bytes.Buffer
-	report := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, events.Discard, nil, &stderr)
-
-	if len(report.Reaped) != 0 {
-		t.Fatalf("Reaped = %+v, want 0 for a worktree used minutes ago\nstderr:\n%s", report.Reaped, stderr.String())
-	}
-	if len(report.Protected) != 1 || report.Protected[0].BeadID != "ga-quiet01" {
-		t.Fatalf("Protected = %+v, want exactly ga-quiet01", report.Protected)
-	}
-	if reason := report.Protected[0].Reason; !strings.Contains(reason, "quiet period") || !strings.Contains(reason, "quiet_period=6h0m0s") {
-		t.Errorf("Reason = %q, want it to name the quiet period and its configured length", reason)
-	}
-	if _, err := os.Stat(wt); err != nil {
-		t.Fatalf("recently used worktree %s was removed or unstattable: %v", wt, err)
-	}
+	report := runQuietReap(t, cityPath, rigRoot, "ga-quiet01", nil, nil)
+	requireProtected(t, report, wt, "quiet_period=6h0m0s, last_activity_age=")
 }
 
 // TestReapClosedBeadWorktrees_ReapsWorktreeQuietLongerThanDefaultQuietPeriod is
-// the control: the same tree with every activity signal older than the
-// default quiet period is reaped. A fresh logs/HEAD is not use: `git gc`
-// rewrites every worktree's reflog at once, and the live qcore repo showed
-// exactly that, all trees' logs/HEAD at one second, entries weeks older.
+// the control: every activity signal older than the default quiet period, and
+// a logs/HEAD file just rewritten, as `git gc` rewrites every worktree's
+// reflog at once, keeping the entries' own times. The tree is reaped.
 func TestReapClosedBeadWorktrees_ReapsWorktreeQuietLongerThanDefaultQuietPeriod(t *testing.T) {
 	cityPath, rigRoot := initReapRig(t)
 	wt := addClosedWorktree(t, rigRoot, cityPath, "seat", "ga-quiet02")
 	backdateWorktreeActivity(t, wt, 72*time.Hour)
 	mustGit(t, rigRoot, "reflog", "expire", "--expire=never", "--all") // as git gc does
-	gitDir := strings.TrimSpace(runGit(t, wt, "rev-parse", "--absolute-git-dir"))
-	if info, err := os.Stat(filepath.Join(gitDir, "logs", "HEAD")); err != nil || time.Since(info.ModTime()) > time.Hour {
-		t.Fatalf("precondition: reflog expire left logs/HEAD stale (info=%v err=%v)", info, err)
-	}
-	store := beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-quiet02", Status: "closed"}}, nil)
-	cfg := reapTestConfig(rigRoot)
-	injectLiveness(t, liveWorktreeState{scanned: true})
-
-	var stderr bytes.Buffer
-	report := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, events.Discard, nil, &stderr)
-
+	report := runQuietReap(t, cityPath, rigRoot, "ga-quiet02", nil, nil)
 	if len(report.Reaped) != 1 || report.Reaped[0].BeadID != "ga-quiet02" {
-		t.Fatalf("Reaped = %+v, want exactly ga-quiet02\nstderr:\n%s", report.Reaped, stderr.String())
-	}
-	if _, err := os.Stat(wt); !os.IsNotExist(err) {
-		t.Fatalf("worktree %s still present after reap (stat err=%v)", wt, err)
+		t.Fatalf("Reaped = %+v Protected = %+v, want exactly ga-quiet02", report.Reaped, report.Protected)
 	}
 }
 
-// TestReapClosedBeadWorktrees_QuietPeriodHonorsConfiguredValue proves the gate
-// reads the configured period, and that an explicit zero turns it off: use 2h
-// ago is quiet under a 1h period and recent under a 3h one; use 15m ago is
-// reaped when the period is zero.
-func TestReapClosedBeadWorktrees_QuietPeriodHonorsConfiguredValue(t *testing.T) {
+// TestReapClosedBeadWorktrees_QuietPeriodConfig proves the gate reads the
+// configured period, that only an explicit zero turns it off, and that a
+// negative or overflowing value protects and is named rather than disabling
+// the gate.
+func TestReapClosedBeadWorktrees_QuietPeriodConfig(t *testing.T) {
 	for _, tc := range []struct {
-		minutes  int
-		lastUse  time.Duration
-		wantReap bool
+		minutes    int
+		lastUse    time.Duration
+		wantReason string // "" = reaped
 	}{
-		{minutes: 0, lastUse: 15 * time.Minute, wantReap: true},
-		{minutes: 60, lastUse: 2 * time.Hour, wantReap: true},
-		{minutes: 180, lastUse: 2 * time.Hour, wantReap: false},
+		{minutes: 0, lastUse: 15 * time.Minute},
+		{minutes: 60, lastUse: 2 * time.Hour},
+		{minutes: 180, lastUse: 2 * time.Hour, wantReason: "quiet_period=3h0m0s"},
+		{minutes: -1, lastUse: 15 * time.Minute, wantReason: "quiet period misconfigured"},
+		{minutes: 153722868, lastUse: 15 * time.Minute, wantReason: "quiet period misconfigured"},
 	} {
 		cityPath, rigRoot := initReapRig(t)
 		wt := addClosedWorktree(t, rigRoot, cityPath, "seat", "ga-quiet04")
 		backdateWorktreeActivity(t, wt, tc.lastUse)
-		store := beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-quiet04", Status: "closed"}}, nil)
-		cfg := reapTestConfig(rigRoot)
 		minutes := tc.minutes
-		cfg.Daemon.AutoReapClosedBeadWorktreesQuietPeriodMinutes = &minutes
-		injectLiveness(t, liveWorktreeState{scanned: true})
-
-		var stderr bytes.Buffer
-		report := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, events.Discard, nil, &stderr)
-
-		if gotReap := len(report.Reaped) == 1; gotReap != tc.wantReap {
-			t.Errorf("quiet_period=%dm, last use %s ago: Reaped = %+v Protected = %+v, want reaped=%v", tc.minutes, tc.lastUse, report.Reaped, report.Protected, tc.wantReap)
+		report := runQuietReap(t, cityPath, rigRoot, "ga-quiet04", &minutes, nil)
+		if tc.wantReason == "" {
+			if len(report.Reaped) != 1 {
+				t.Errorf("quiet_period=%dm, last use %s ago: Protected = %+v, want reaped", tc.minutes, tc.lastUse, report.Protected)
+			}
+			continue
 		}
+		requireProtected(t, report, wt, tc.wantReason)
+	}
+	if _, err := (&config.DaemonConfig{}).AutoReapClosedBeadWorktreesQuietPeriod(); err != nil {
+		t.Errorf("default quiet period: %v", err)
 	}
 }
 
 // TestReapClosedBeadWorktrees_ProtectsWhenLastActivityIndeterminate proves the
-// gate fails closed: a ".git" pointer that names no gitdir leaves no last-use
-// signal to read, and the tree is protected rather than treated as idle.
+// gate fails closed when a signal cannot be read: a ".git" pointer naming no
+// gitdir, or a missing index.
 func TestReapClosedBeadWorktrees_ProtectsWhenLastActivityIndeterminate(t *testing.T) {
-	cityPath, rigRoot := initReapRig(t)
-	wt := addClosedWorktree(t, rigRoot, cityPath, "seat", "ga-quiet05")
-	if err := os.WriteFile(filepath.Join(wt, ".git"), []byte("not a gitdir pointer\n"), 0o644); err != nil {
-		t.Fatalf("corrupt .git pointer: %v", err)
-	}
-	backdateWorktreeGitFile(t, wt, 24*time.Hour) // creation age stays determinate
-	store := beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-quiet05", Status: "closed"}}, nil)
-	cfg := reapTestConfig(rigRoot)
-	injectLiveness(t, liveWorktreeState{scanned: true})
-
-	var stderr bytes.Buffer
-	report := reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, events.Discard, nil, &stderr)
-
-	if len(report.Reaped) != 0 {
-		t.Fatalf("Reaped = %+v, want 0 when last activity is indeterminate", report.Reaped)
-	}
-	if len(report.Protected) != 1 || !strings.Contains(report.Protected[0].Reason, "last activity indeterminate") {
-		t.Fatalf("Protected = %+v, want one entry naming the indeterminate last activity", report.Protected)
+	for name, breakIt := range map[string]func(wt, gitDir string) error{
+		"pointer": func(wt, _ string) error {
+			return os.WriteFile(filepath.Join(wt, ".git"), []byte("not a gitdir pointer\n"), 0o644)
+		},
+		"index": func(_, gitDir string) error { return os.Remove(filepath.Join(gitDir, "index")) },
+	} {
+		cityPath, rigRoot := initReapRig(t)
+		wt := addClosedWorktree(t, rigRoot, cityPath, "seat", "ga-quiet05")
+		gitDir := strings.TrimSpace(runGit(t, wt, "rev-parse", "--absolute-git-dir"))
+		if err := breakIt(wt, gitDir); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		backdateWorktreeGitFile(t, wt, 24*time.Hour) // creation age stays determinate
+		t.Run(name, func(t *testing.T) {
+			requireProtected(t, runQuietReap(t, cityPath, rigRoot, "ga-quiet05", nil, nil), wt, "last activity indeterminate")
+		})
 	}
 }
 
 // TestReapSkipTracker_SuppressesQuietPeriodRepeats pins that the quiet-period
-// reason is stable across passes, including while the tree keeps being used,
-// so the skip tracker announces it once rather than on every tick.
+// protection is announced once across passes, although the reason's activity
+// age changes every pass.
 func TestReapSkipTracker_SuppressesQuietPeriodRepeats(t *testing.T) {
 	cityPath, rigRoot := initReapRig(t)
 	wt := addClosedWorktree(t, rigRoot, cityPath, "seat", "ga-quiet06")
-	touchWorktreeIndex(t, wt)
 	store := beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-quiet06", Status: "closed"}}, nil)
 	cfg := reapTestConfig(rigRoot)
 	injectLiveness(t, liveWorktreeState{scanned: true})
@@ -156,22 +149,22 @@ func TestReapSkipTracker_SuppressesQuietPeriodRepeats(t *testing.T) {
 	fake := events.NewFake()
 	skips := newReapSkipTracker()
 	var stderr bytes.Buffer
+	touchWorktreeIndex(t, wt)
 	for pass := 1; pass <= 3; pass++ {
+		time.Sleep(1100 * time.Millisecond) // the activity age differs each pass
 		reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, fake, skips, &stderr)
-		touchWorktreeIndex(t, wt) // the seat keeps working in the tree between passes
 	}
 
 	reasons := skipReasonsFor(t, fake, wt)
-	if len(reasons) != 1 || !strings.Contains(reasons[0], "quiet period") {
+	if len(reasons) != 1 || !strings.Contains(reasons[0], "last_activity_age=") {
 		t.Fatalf("reap_skipped reasons = %q, want exactly one quiet-period event across 3 passes", reasons)
 	}
 }
 
-// TestWorktreeLastActivity_RelativeGitdirAndMissingOptionalSignals covers the
-// pointer forms git writes: a relative gitdir (worktree.useRelativePaths)
-// resolves against the worktree root, and an absent index is skipped rather
-// than making the reading indeterminate. The newest signal wins.
-func TestWorktreeLastActivity_RelativeGitdirAndMissingOptionalSignals(t *testing.T) {
+// TestWorktreeLastActivity_RelativeGitdirAndNewestSignal covers a relative
+// gitdir pointer (worktree.useRelativePaths), resolved against the worktree
+// root, and that the newest signal wins.
+func TestWorktreeLastActivity_RelativeGitdirAndNewestSignal(t *testing.T) {
 	base := t.TempDir()
 	wt := filepath.Join(base, "wt")
 	gitDir := filepath.Join(base, "repo", ".git", "worktrees", "wt")
@@ -180,26 +173,25 @@ func TestWorktreeLastActivity_RelativeGitdirAndMissingOptionalSignals(t *testing
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(wt, ".git"), []byte("gitdir: ../repo/.git/worktrees/wt\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(gitDir, "HEAD"), []byte("ref: refs/heads/x\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	old := time.Now().Add(-48 * time.Hour).Truncate(time.Second)
+	old := time.Now().Add(-48 * time.Hour)
 	headTime := time.Now().Add(-3 * time.Hour).Truncate(time.Second)
-	if err := os.Chtimes(wt, old, old); err != nil {
-		t.Fatal(err)
+	for path, body := range map[string]string{
+		filepath.Join(wt, ".git"):      "gitdir: ../repo/.git/worktrees/wt\n",
+		filepath.Join(gitDir, "HEAD"):  "ref: refs/heads/x\n",
+		filepath.Join(gitDir, "index"): "",
+	} {
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if err := os.Chtimes(filepath.Join(gitDir, "HEAD"), headTime, headTime); err != nil {
-		t.Fatal(err)
+	for path, at := range map[string]time.Time{wt: old, filepath.Join(wt, ".git"): old, filepath.Join(gitDir, "index"): old, filepath.Join(gitDir, "HEAD"): headTime} {
+		if err := os.Chtimes(path, at, at); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	got, ok := worktreeLastActivity(wt)
-	if !ok {
-		t.Fatalf("worktreeLastActivity: indeterminate, want HEAD's mtime")
-	}
-	if !got.Equal(headTime) {
-		t.Errorf("worktreeLastActivity = %v, want %v (HEAD, the newest present signal)", got, headTime)
+	if !ok || !got.Equal(headTime) {
+		t.Fatalf("worktreeLastActivity = %v, %v; want %v (HEAD, the newest signal)", got, ok, headTime)
 	}
 }

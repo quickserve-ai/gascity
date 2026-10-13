@@ -70,7 +70,8 @@ type reapReport struct {
 //     cfg.Daemon.AutoReapClosedBeadWorktreesQuietPeriod is exempt
 //     (worktreeLastActivity). It covers what gate 6 cannot see: a seat whose
 //     resident process sits in its home and works in the tree through
-//     short-lived shell calls (pl-4fj). An indeterminate last use protects.
+//     short-lived shell calls (pl-4fj). An indeterminate last use or a
+//     misconfigured period protects.
 //  4. Git state: no authored uncommitted changes and no commits that removing
 //     the worktree would orphan — commits reachable from no branch, tag, or
 //     remote-tracking ref (git.HasUnreachableCommitsResult). The test is
@@ -352,7 +353,7 @@ func reapClosedBeadWorktreesGuarded(
 			case minAge > 0 && age < minAge:
 				reason = fmt.Sprintf("worktree too young to reap (quarantine): min_age=%s", minAge)
 			default:
-				reason = quietPeriodReason(worktreePath, cfg.Daemon.AutoReapClosedBeadWorktreesQuietPeriod())
+				reason = quietPeriodReason(worktreePath, &cfg.Daemon)
 			}
 			if reason != "" {
 				branch, _ := git.New(worktreePath).CurrentBranch()
@@ -705,10 +706,13 @@ func (t *reapSkipTracker) shouldSurface(worktreePath, reason string) bool {
 		return true
 	}
 	t.thisPass[worktreePath] = struct{}{}
-	if prev, tracked := t.lastReason[worktreePath]; tracked && prev == reason {
+	// A quiet-period reason ends with the tree's activity age, which changes
+	// on every pass the tree is used; dedupe on the reason without it.
+	key, _, _ := strings.Cut(reason, lastActivityAgeSep)
+	if prev, tracked := t.lastReason[worktreePath]; tracked && prev == key {
 		return false
 	}
-	t.lastReason[worktreePath] = reason
+	t.lastReason[worktreePath] = key
 	return true
 }
 
@@ -823,21 +827,30 @@ func computeWorktreeAge(worktreePath string) (age time.Duration, ok bool) {
 	return time.Since(info.ModTime()), true
 }
 
+// lastActivityAgeSep introduces the activity age at the end of a quiet-period
+// reason; reapSkipTracker dedupes on the text before it.
+const lastActivityAgeSep = ", last_activity_age="
+
 // quietPeriodReason applies the last-use gate to one worktree and returns the
-// protecting reason, or "" when the tree has gone unused for at least quiet
-// (zero disables the gate). An indeterminate last use protects. The reason
-// names the period, never a time or age: reapSkipTracker keys on the reason,
-// so a value that changes with each use would emit an event per tick.
-func quietPeriodReason(worktreePath string, quiet time.Duration) string {
-	if quiet <= 0 {
+// protecting reason, or "" when the tree has gone unused for at least the
+// configured quiet period (only an explicit zero disables the gate). A
+// misconfigured period or an indeterminate last use protects. The reason ends
+// with the activity age (negative for a timestamp in the future, which also
+// protects).
+func quietPeriodReason(worktreePath string, d *config.DaemonConfig) string {
+	quiet, err := d.AutoReapClosedBeadWorktreesQuietPeriod()
+	if err != nil {
+		return fmt.Sprintf("quiet period misconfigured (failing closed): %v", err)
+	}
+	if quiet == 0 {
 		return ""
 	}
 	last, ok := worktreeLastActivity(worktreePath)
-	switch {
-	case !ok:
+	if !ok {
 		return "worktree last activity indeterminate (failing closed)"
-	case time.Since(last) < quiet:
-		return fmt.Sprintf("worktree used within the quiet period: quiet_period=%s", quiet)
+	}
+	if age := time.Since(last); age < quiet {
+		return fmt.Sprintf("worktree used within the quiet period: quiet_period=%s%s%s", quiet, lastActivityAgeSep, age.Round(time.Second))
 	}
 	return ""
 }
@@ -845,30 +858,19 @@ func quietPeriodReason(worktreePath string, quiet time.Duration) string {
 // worktreeLastActivity returns when worktreePath was last used: the newest
 // mtime among its root directory and its private gitdir's HEAD and index,
 // which a commit, checkout, `git add` or file creation in the root refreshes.
-// Three stats, never a tree walk. logs/HEAD is deliberately not read: `git gc`
-// rewrites every worktree's reflog at once, which would make every tree in a
-// busy repo look used. ok is false when the gitdir cannot be resolved or the
-// root or HEAD cannot be stat'd; an absent index is skipped, and any other
-// error on it is indeterminate.
+// Three stats, never a tree walk. The reflog is not read by its mtime: `git
+// gc` rewrites every worktree's reflog at once, which would make every tree
+// in a busy repo look used. ok is false when the gitdir cannot be resolved or
+// any of the three cannot be stat'd, a missing index included.
 func worktreeLastActivity(worktreePath string) (time.Time, bool) {
 	gitDir, ok := worktreeGitDir(worktreePath)
 	if !ok {
 		return time.Time{}, false
 	}
 	var newest time.Time
-	for _, sig := range [...]struct {
-		path     string
-		optional bool
-	}{
-		{worktreePath, false},
-		{filepath.Join(gitDir, "HEAD"), false},
-		{filepath.Join(gitDir, "index"), true},
-	} {
-		info, err := os.Stat(sig.path)
+	for _, p := range [...]string{worktreePath, filepath.Join(gitDir, "HEAD"), filepath.Join(gitDir, "index")} {
+		info, err := os.Stat(p)
 		if err != nil {
-			if sig.optional && os.IsNotExist(err) {
-				continue
-			}
 			return time.Time{}, false
 		}
 		if info.ModTime().After(newest) {
