@@ -25,7 +25,7 @@ type reviveFixture struct {
 	restores    bool   // a node reappears after SIGUSR1
 	restoredAs  string // "" (socket) or "file"
 	answerPID   int    // pid the revived server reports (0: servers[0])
-	signalDelay time.Duration
+	waitHits    int    // signal waits until socketNode has run this often
 	signaled    []int
 	callsAtSig  int
 	findCalls   int
@@ -58,7 +58,14 @@ func (f *reviveFixture) reviver() *socketReviver {
 			return f.servers, nil
 		},
 		signal: func(pid int) error {
-			time.Sleep(f.signalDelay)
+			for end := time.Now().Add(time.Second); time.Now().Before(end); time.Sleep(time.Millisecond) {
+				f.mu.Lock()
+				hits := f.presentHits
+				f.mu.Unlock()
+				if hits >= f.waitHits {
+					break
+				}
+			}
 			f.mu.Lock()
 			defer f.mu.Unlock()
 			f.signaled = append(f.signaled, pid)
@@ -71,6 +78,7 @@ func (f *reviveFixture) reviver() *socketReviver {
 			}
 			return f.servers[0], nil
 		},
+		budget:   time.Second,
 		timeout:  50 * time.Millisecond,
 		interval: time.Millisecond,
 	}
@@ -214,9 +222,25 @@ func TestFindTmuxSocketOwnersDistinguishesMissingFromFailingLsof(t *testing.T) {
 // Review fix 4: two callers finding the same orphan signal it once.
 func TestConcurrentReviveSignalsOrphanOnce(t *testing.T) {
 	f := newReviveFixture()
-	f.servers, f.restores, f.signalDelay = []int{27432}, true, 20*time.Millisecond
+	f.servers, f.restores = []int{27432}, true
+	errs := reviveConcurrently(f, "/tmp/tmux-test/gc-revive-concurrent")
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("caller %d: %v", i, err)
+		}
+	}
+	if len(f.signaled) != 1 {
+		t.Fatalf("signaled = %v, want exactly one SIGUSR1", f.signaled)
+	}
+}
+
+// reviveConcurrently runs two revivals of path at once. The signal waits until
+// both callers have observed the absent socket and the lock holder has
+// re-checked it (three socketNode calls), so the second caller is queued on
+// the lock rather than arriving after the socket is back.
+func reviveConcurrently(f *reviveFixture, path string) []error {
+	f.waitHits = 3
 	tm := f.tmux()
-	path := "/tmp/tmux-test/gc-revive-concurrent"
 	var wg sync.WaitGroup
 	errs := make([]error, 2)
 	for i := range errs {
@@ -227,13 +251,48 @@ func TestConcurrentReviveSignalsOrphanOnce(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+	return errs
+}
+
+// Round 2 (6): a queued caller must not accept a node its predecessor rejected.
+func TestQueuedReviveCallerVerifiesTheRestoredNode(t *testing.T) {
+	f := newReviveFixture()
+	f.servers, f.restores, f.restoredAs = []int{27432}, true, "file"
+	errs := reviveConcurrently(f, "/tmp/tmux-test/gc-revive-queued-reject")
 	for i, err := range errs {
-		if err != nil {
-			t.Fatalf("caller %d: %v", i, err)
+		if !errors.Is(err, ErrServerDegraded) || !strings.Contains(err.Error(), "restored-node-not-a-socket") {
+			t.Fatalf("caller %d: err = %v, want refusal of the non-socket node", i, err)
 		}
 	}
 	if len(f.signaled) != 1 {
 		t.Fatalf("signaled = %v, want exactly one SIGUSR1", f.signaled)
+	}
+}
+
+// Round 2 (b): the lock wait is inside the revival's end-to-end deadline.
+func TestReviveLockWaitIsBoundedByTheDeadline(t *testing.T) {
+	f := newReviveFixture()
+	f.servers = []int{27432}
+	r := f.reviver()
+	r.budget = 30 * time.Millisecond
+	tm := f.tmux()
+	tm.socketReviver = r
+	path := "/tmp/tmux-test/gc-revive-lock-held"
+	release, err := acquireReviveLock(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	start := time.Now()
+	err = tm.reviveOrphanedServer(path)
+	if !errors.Is(err, ErrServerDegraded) || !strings.Contains(err.Error(), "revive-lock-timeout") {
+		t.Fatalf("err = %v, want ErrServerDegraded revive-lock-timeout", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("waited %v for a held lock, want about the 30ms budget", elapsed)
+	}
+	if len(f.signaled) != 0 || f.findCalls != 0 {
+		t.Fatalf("signaled=%v findCalls=%d, want no probe or signal without the lock", f.signaled, f.findCalls)
 	}
 }
 
@@ -290,5 +349,17 @@ func TestParseLsofSocketOwners(t *testing.T) {
 	}
 	if got, err := parseLsofSocketOwners("p42\nctmux\nf5\nn/tmp/tmux-501/gas\\x09town\n", paths); err == nil {
 		t.Fatalf("escaped name owners = %v, want a fail-closed error", got)
+	}
+
+	// Round 2 (3i): a full-name match wins before any " type=" stripping.
+	typed := "/tmp/a type=b/tmux-501/gastown"
+	got, err = parseLsofSocketOwners("p43\nctmux\nf5\nn"+typed+"\n", []string{typed})
+	if err != nil || len(got) != 1 || got[0] != 43 {
+		t.Fatalf("path containing \" type=\": owners = %v, %v; want [43]", got, err)
+	}
+	// Round 2 (3ii): an escaped name that cannot be ours is ignored.
+	got, err = parseLsofSocketOwners("p44\nctmux\nf5\nn/home/other/so\\x09ck\np27432\nctmux\nf6\nn/tmp/tmux-501/gastown\n", paths)
+	if err != nil || len(got) != 1 || got[0] != 27432 {
+		t.Fatalf("unrelated escaped name: owners = %v, %v; want [27432]", got, err)
 	}
 }
