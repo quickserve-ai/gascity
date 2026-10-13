@@ -2896,9 +2896,12 @@ func (s *BdStore) listByTier(query ListQuery) ([]Bead, error) {
 }
 
 func (s *BdStore) listViaBDList(query ListQuery) ([]Bead, error) {
-	serverQuery, clientFilteredAssignees := bdServerQueryForAssignees(query)
+	if routes := assigneeFanOutRoutes(query); routes != nil {
+		return listPerAssignee("bd list", query, routes, s.listViaBDList)
+	}
+	serverQuery := bdServerQueryForAssignees(query)
 	limit := serverQuery.Limit
-	if bdListRequiresClientLimit(query, serverQuery, clientFilteredAssignees) {
+	if bdListRequiresClientLimit(query, serverQuery) {
 		limit = 0
 	}
 	args := []string{"list", "--json"}
@@ -2971,7 +2974,7 @@ func (s *BdStore) listViaBDList(query ListQuery) ([]Bead, error) {
 	return filtered, nil
 }
 
-func bdListRequiresClientLimit(query, serverQuery ListQuery, clientFilteredAssignees bool) bool {
+func bdListRequiresClientLimit(query, serverQuery ListQuery) bool {
 	// TierWisps always merges two independently-fetched legs (this bd-list
 	// leg plus the ephemeral leg in listWispsTier) and needs full candidates
 	// from both to union/dedupe/sort/limit correctly; TierIssues is the only
@@ -2980,7 +2983,7 @@ func bdListRequiresClientLimit(query, serverQuery ListQuery, clientFilteredAssig
 	if query.TierMode == TierWisps {
 		return true
 	}
-	if serverQuery.Sort == SortCreatedAsc || clientFilteredAssignees {
+	if serverQuery.Sort == SortCreatedAsc {
 		return true
 	}
 	if len(serverQuery.Metadata) > 0 || !serverQuery.CreatedBefore.IsZero() || !serverQuery.UpdatedBefore.IsZero() {
@@ -3006,23 +3009,16 @@ func bdListShouldIncludeTemplates(query ListQuery) bool {
 	return query.TierMode == TierWisps || (query.TierMode == TierBoth && query.Type != "message")
 }
 
-func bdServerQueryForAssignees(query ListQuery) (ListQuery, bool) {
+// bdServerQueryForAssignees maps a one-route Assignees query onto bd's
+// singular assignee predicate. Plural queries never reach it: the list legs
+// answer them per route (listPerAssignee) before building a bd command.
+func bdServerQueryForAssignees(query ListQuery) ListQuery {
 	serverQuery := query
-	if query.Assignee != "" {
-		return serverQuery, false
-	}
-	switch len(query.Assignees) {
-	case 0:
-		return serverQuery, false
-	case 1:
+	if query.Assignee == "" && len(query.Assignees) == 1 {
 		serverQuery.Assignee = query.Assignees[0]
 		serverQuery.Assignees = nil
-		return serverQuery, false
-	default:
-		serverQuery.Assignees = nil
-		serverQuery.AllowScan = true
-		return serverQuery, true
 	}
+	return serverQuery
 }
 
 func (s *BdStore) listWispsTier(query ListQuery) ([]Bead, error) {
@@ -3041,9 +3037,12 @@ func (s *BdStore) listWispsTier(query ListQuery) ([]Bead, error) {
 // <filters>"`. The installed bd list surface does not expose ephemeral rows, so
 // TierWisps and TierBoth must union this path with bd list results.
 func (s *BdStore) listEphemeral(query ListQuery) ([]Bead, error) {
-	serverQuery, clientFilteredAssignees := bdServerQueryForAssignees(query)
+	if routes := assigneeFanOutRoutes(query); routes != nil {
+		return listPerAssignee("bd query (wisps)", query, routes, s.listEphemeral)
+	}
+	serverQuery := bdServerQueryForAssignees(query)
 	clauses := []string{"ephemeral=true"}
-	serverFilteredOnly := !clientFilteredAssignees
+	serverFilteredOnly := true
 	clauses, serverFilteredOnly = appendBdQueryClause(clauses, serverFilteredOnly, "label", serverQuery.Label)
 	clauses, serverFilteredOnly = appendBdQueryClause(clauses, serverFilteredOnly, "status", serverQuery.Status)
 	clauses, serverFilteredOnly = appendBdQueryClause(clauses, serverFilteredOnly, "type", serverQuery.Type)

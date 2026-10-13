@@ -2,6 +2,7 @@ package beads_test
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -137,6 +138,175 @@ func fanoutIDs(got []beads.Bead) []string {
 	return ids
 }
 
+// mailShapedQuery is the query beadmail's messageCandidatesAll issues for an
+// inbox read: open messages across both storage tiers, for every route
+// spelling of one seat.
+func mailShapedQuery(routes ...string) beads.ListQuery {
+	return beads.ListQuery{
+		Type:      "message",
+		Status:    "open",
+		TierMode:  beads.TierBoth,
+		Live:      true,
+		Assignees: routes,
+	}
+}
+
+// A multi-route read reaches bd once per route with that route as the
+// predicate, on BOTH tiers, and never as an unpredicated scan. This is the
+// inbox read of a seat with three route spellings (pl-adj: 12,798 rows
+// hydrated to return 13 messages on the hub).
+func TestBdStoreListAssigneesMultipleReadsEachRoutePredicated(t *testing.T) {
+	fake := &predicatedBd{t: t, rows: []fanoutRow{
+		{ID: "msg-a", Assignee: "platform/gastown.rictus", Priority: 2, Created: "2026-09-25T10:00:00Z", Ephemeral: true},
+		{ID: "msg-b", Assignee: "gastown.rictus", Priority: 2, Created: "2026-09-25T11:00:00Z", Ephemeral: true},
+		{ID: "msg-c", Assignee: "rictus", Priority: 2, Created: "2026-09-25T09:00:00Z"},
+		{ID: "msg-other", Assignee: "platform/gastown.nux", Priority: 2, Created: "2026-09-25T12:00:00Z", Ephemeral: true},
+		{ID: "msg-other-durable", Assignee: "mayor", Priority: 2, Created: "2026-09-25T12:00:00Z"},
+	}}
+	routes := []string{"platform/gastown.rictus", "gastown.rictus", "rictus"}
+	s := beads.NewBdStore("/city", fake.runner)
+
+	got, err := s.List(mailShapedQuery(routes...))
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+
+	calls := fake.snapshot()
+	var lists, queries []string
+	for _, call := range calls {
+		switch {
+		case strings.HasPrefix(call, "bd list "):
+			lists = append(lists, call)
+			if !strings.Contains(call, "--assignee=") {
+				t.Errorf("bd list without an assignee predicate (a scan): %s", call)
+			}
+		case strings.HasPrefix(call, "bd query "):
+			queries = append(queries, call)
+			if !strings.Contains(call, "assignee=") {
+				t.Errorf("bd query without an assignee predicate (a scan): %s", call)
+			}
+		}
+	}
+	if len(lists) != len(routes) || len(queries) != len(routes) {
+		t.Fatalf("got %d bd list and %d bd query calls, want %d of each (one per route per tier): %v",
+			len(lists), len(queries), len(routes), calls)
+	}
+	for _, route := range routes {
+		if firstCommandContaining(lists, "--assignee="+route+" ") == "" {
+			t.Errorf("no bd list predicated on route %q: %v", route, lists)
+		}
+	}
+	if firstCommandContaining(queries, `assignee="platform/gastown.rictus"`) == "" {
+		t.Errorf("slash route must reach bd query as a quoted predicate: %v", queries)
+	}
+
+	// Durable leg first, then the wisp leg in bd's default order (created DESC
+	// within one priority) — the same order one unpredicated read produced.
+	if want := []string{"msg-c", "msg-b", "msg-a"}; !slices.Equal(fanoutIDs(got), want) {
+		t.Fatalf("List ids = %v, want %v", fanoutIDs(got), want)
+	}
+}
+
+// Merging per-route reads reproduces bd's single-read default order across
+// routes: priority ASC, then created_at DESC, then id ASC.
+func TestBdStoreListAssigneesMultipleKeepsBdDefaultOrderAndLimit(t *testing.T) {
+	fake := &predicatedBd{t: t, rows: []fanoutRow{
+		{ID: "r1-old", Assignee: "route-1", Priority: 2, Created: "2026-09-25T08:00:00Z"},
+		{ID: "r2-new", Assignee: "route-2", Priority: 2, Created: "2026-09-25T10:00:00Z"},
+		{ID: "r2-urgent", Assignee: "route-2", Priority: 0, Created: "2026-09-25T07:00:00Z"},
+		{ID: "r1-tie-b", Assignee: "route-1", Priority: 2, Created: "2026-09-25T09:00:00Z"},
+		{ID: "r2-tie-a", Assignee: "route-2", Priority: 2, Created: "2026-09-25T09:00:00Z"},
+	}}
+	s := beads.NewBdStore("/city", fake.runner)
+
+	all, err := s.List(beads.ListQuery{Type: "message", Assignees: []string{"route-1", "route-2"}})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	want := []string{"r2-urgent", "r2-new", "r1-tie-b", "r2-tie-a", "r1-old"}
+	if !slices.Equal(fanoutIDs(all), want) {
+		t.Fatalf("List ids = %v, want bd default order %v", fanoutIDs(all), want)
+	}
+
+	top, err := s.List(beads.ListQuery{Type: "message", Assignees: []string{"route-1", "route-2"}, Limit: 3})
+	if err != nil {
+		t.Fatalf("List limit 3: %v", err)
+	}
+	if !slices.Equal(fanoutIDs(top), want[:3]) {
+		t.Fatalf("List limit 3 ids = %v, want %v", fanoutIDs(top), want[:3])
+	}
+}
+
+// Repeated or blank route spellings read each distinct route once.
+func TestBdStoreListAssigneesDuplicateRoutesReadOnce(t *testing.T) {
+	fake := &predicatedBd{t: t, rows: []fanoutRow{
+		{ID: "a1", Assignee: "route-a", Priority: 2, Created: "2026-09-25T08:00:00Z"},
+		{ID: "b1", Assignee: "route-b", Priority: 2, Created: "2026-09-25T09:00:00Z"},
+	}}
+	s := beads.NewBdStore("/city", fake.runner)
+
+	got, err := s.List(beads.ListQuery{Type: "message", Assignees: []string{"route-a", " route-a ", "", "route-b"}})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if calls := fake.snapshot(); len(calls) != 2 {
+		t.Fatalf("got %d bd calls, want 2 (one per distinct route): %v", len(calls), calls)
+	}
+	if want := []string{"b1", "a1"}; !slices.Equal(fanoutIDs(got), want) {
+		t.Fatalf("List ids = %v, want %v", fanoutIDs(got), want)
+	}
+}
+
+// A route whose read fails must not vanish from the answer silently: the
+// caller gets an error, never a shorter inbox presented as complete.
+func TestBdStoreListAssigneesRouteFailureIsReported(t *testing.T) {
+	fake := &predicatedBd{
+		t: t,
+		rows: []fanoutRow{
+			{ID: "a1", Assignee: "route-a", Priority: 2, Created: "2026-09-25T08:00:00Z"},
+			{ID: "b1", Assignee: "route-b", Priority: 2, Created: "2026-09-25T09:00:00Z"},
+		},
+		fail: map[string]error{"route-b": errors.New("dolt: connection refused")},
+	}
+	s := beads.NewBdStore("/city", fake.runner)
+
+	got, err := s.List(beads.ListQuery{Type: "message", Assignees: []string{"route-a", "route-b"}})
+	if err == nil {
+		t.Fatalf("List = %v, nil error; want the route-b failure reported", fanoutIDs(got))
+	}
+	if !strings.Contains(err.Error(), "connection refused") {
+		t.Fatalf("List error = %v, want the route-b cause", err)
+	}
+	var partial *beads.PartialResultError
+	if !errors.As(err, &partial) {
+		t.Fatalf("List error = %T %v, want *PartialResultError carrying the rows that did arrive", err, err)
+	}
+	if want := []string{"a1"}; !slices.Equal(fanoutIDs(got), want) {
+		t.Fatalf("partial ids = %v, want %v", fanoutIDs(got), want)
+	}
+}
+
+// Control: a route-less read (the "all mail" listing) is still one scan.
+func TestBdStoreListWithoutAssigneesStillScans(t *testing.T) {
+	fake := &predicatedBd{t: t, rows: []fanoutRow{
+		{ID: "a1", Assignee: "route-a", Priority: 2, Created: "2026-09-25T08:00:00Z"},
+		{ID: "b1", Assignee: "route-b", Priority: 2, Created: "2026-09-25T09:00:00Z"},
+	}}
+	s := beads.NewBdStore("/city", fake.runner)
+
+	got, err := s.List(beads.ListQuery{Type: "message", AllowScan: true})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	calls := fake.snapshot()
+	if len(calls) != 1 || strings.Contains(calls[0], "--assignee=") {
+		t.Fatalf("calls = %v, want one unpredicated bd list", calls)
+	}
+	if len(got) != 2 {
+		t.Fatalf("List ids = %v, want both rows", fanoutIDs(got))
+	}
+}
+
 // A quote or backslash inside a value is escaped the way the bd lexer reads
 // it, so the predicate names exactly the value asked for.
 func TestBdStoreListWispsEscapesQuotedQueryValue(t *testing.T) {
@@ -173,4 +343,13 @@ func TestBdStoreListWispsKeepsNoneValueClientSide(t *testing.T) {
 	if strings.Contains(strings.ToLower(query), "assignee=") {
 		t.Fatalf("query cmd = %q, a none/null value must not become a bd predicate", query)
 	}
+}
+
+func firstCommandContaining(calls []string, needle string) string {
+	for _, call := range calls {
+		if strings.Contains(call+" ", needle) {
+			return call
+		}
+	}
+	return ""
 }
