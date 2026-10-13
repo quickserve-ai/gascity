@@ -44,6 +44,7 @@ go_library(
 go_test(
     name = "beads_test",
     srcs = [
+        "assignee_fanout_internal_test.go",
         "atomic_close_memstore_test.go",
         "awaittype_roundtrip_test.go",
         "bdsql_relocation_internal_test.go",
