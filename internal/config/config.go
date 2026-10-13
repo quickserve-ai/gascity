@@ -4,6 +4,7 @@ package config
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -3054,12 +3055,18 @@ const DefaultAutoReapClosedBeadWorktreesQuietPeriodMinutes = 360
 // AutoReapClosedBeadWorktreesQuietPeriod returns how long a closed-bead
 // worktree must go unused before it is eligible for reap classification.
 // Defaults to DefaultAutoReapClosedBeadWorktreesQuietPeriodMinutes when unset;
-// an explicit zero disables the gate.
-func (d *DaemonConfig) AutoReapClosedBeadWorktreesQuietPeriod() time.Duration {
+// only an explicit zero disables the gate. A negative value, or one too large
+// for a time.Duration, is an error: the gate guards against data loss, so the
+// caller protects rather than treating a bad value as "off".
+func (d *DaemonConfig) AutoReapClosedBeadWorktreesQuietPeriod() (time.Duration, error) {
 	if d.AutoReapClosedBeadWorktreesQuietPeriodMinutes == nil {
-		return time.Duration(DefaultAutoReapClosedBeadWorktreesQuietPeriodMinutes) * time.Minute
+		return time.Duration(DefaultAutoReapClosedBeadWorktreesQuietPeriodMinutes) * time.Minute, nil
 	}
-	return time.Duration(*d.AutoReapClosedBeadWorktreesQuietPeriodMinutes) * time.Minute
+	minutes := *d.AutoReapClosedBeadWorktreesQuietPeriodMinutes
+	if minutes < 0 || int64(minutes) > math.MaxInt64/int64(time.Minute) {
+		return 0, fmt.Errorf("daemon.auto_reap_closed_bead_worktrees_quiet_period_minutes = %d: want 0 (off) or 1..%d", minutes, math.MaxInt64/int64(time.Minute))
+	}
+	return time.Duration(minutes) * time.Minute, nil
 }
 
 // AutoReapStoppedAgentHomesEnabled reports whether stopped configured
