@@ -3834,9 +3834,10 @@ func awaitFeedbackSurveyDigit(capture func() (string, error), sleep func(time.Du
 // prompt and the survey is drawn below it).
 //
 // A survey row with agent output between it and the anchor is stale, left
-// over from an earlier turn; a row with no header directly above it is an
-// agent QUOTING the row. Keying either types "0" into an idle composer on
-// every delivery attempt. Restores #209's rule, which the re-sync #6 merge of
+// over from an earlier turn; a row with no header directly above it, or a
+// header and row inside an agent reply (⏺) or a user turn (>), is text QUOTING
+// the survey. Keying any of them types "0" into an idle composer on every
+// delivery attempt. The header may wrap in a narrow pane. Restores #209's rule, which the re-sync #6 merge of
 // upstream's dismisser dropped.
 func feedbackSurveyLive(content string) bool {
 	lines := strings.Split(content, "\n")
@@ -3848,13 +3849,56 @@ func feedbackSurveyLive(content string) bool {
 
 // feedbackSurveyDirectlyAbove reports whether the last line above anchor that
 // is not blank or a composer edge is the survey's option row, with the
-// survey's header on the line right above that row.
+// survey's header directly above that row and the block Claude Code's own.
 func feedbackSurveyDirectlyAbove(lines []string, anchor int) bool {
 	for i := anchor - 1; i >= 0; i-- {
 		if s := strings.TrimSpace(lines[i]); s == "" || isComposerEdge(s) {
 			continue
 		}
-		return i > 0 && runtime.ContainsFeedbackSurveyModal(lines[i]) && isFeedbackSurveyHeader(lines[i-1])
+		if !runtime.ContainsFeedbackSurveyModal(lines[i]) {
+			return false
+		}
+		h := feedbackSurveyHeaderStart(lines, i)
+		return h >= 0 && !feedbackSurveyQuoted(lines, h)
+	}
+	return false
+}
+
+// feedbackSurveyHeaderMaxRows bounds how many rows a wrapped survey header may
+// span in a narrow pane ("● How is Claude doing this" / "session? (optional)").
+const feedbackSurveyHeaderMaxRows = 3
+
+// feedbackSurveyHeaderStart returns the index of the first row of the survey
+// header that ends on the row directly above the option row at row, or -1.
+// The header may wrap over up to feedbackSurveyHeaderMaxRows non-blank rows.
+func feedbackSurveyHeaderStart(lines []string, row int) int {
+	joined := ""
+	for k := 1; k <= feedbackSurveyHeaderMaxRows && row-k >= 0; k++ {
+		part := strings.TrimSpace(lines[row-k])
+		if part == "" {
+			return -1
+		}
+		joined = strings.TrimSpace(part + " " + joined)
+		if isFeedbackSurveyHeader(joined) {
+			return row - k
+		}
+	}
+	return -1
+}
+
+// feedbackSurveyQuoted reports whether the survey header at row h sits inside
+// a block that Claude Code did not draw as a survey: walking up from h, the
+// first unindented row opens the block, and an agent reply (⏺) or a user turn
+// (>) there means the header and row are text QUOTED in that block. A live
+// survey's block opens with its own ● header (feedbackSurveySessionFixture) or
+// the "● Claude recalled a memory:" line (feedbackSurveyMemoryFixture).
+func feedbackSurveyQuoted(lines []string, h int) bool {
+	for j := h; j >= 0; j-- {
+		line := lines[j]
+		if strings.TrimSpace(line) == "" || strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t") {
+			continue
+		}
+		return strings.HasPrefix(line, "⏺") || strings.HasPrefix(line, ">")
 	}
 	return false
 }
