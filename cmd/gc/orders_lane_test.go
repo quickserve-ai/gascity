@@ -441,7 +441,7 @@ func TestOrdersBootDispatchSkipsOnControllerStoreSchemaSkew(t *testing.T) {
 	cs.mu.Unlock()
 	cr.setControllerState(cs)
 
-	cr.dispatchOrders(context.Background(), cr.cityPath, true)
+	cr.dispatchOrders(context.Background(), cr.cityPath)
 	if od.called.Load() {
 		t.Fatal("boot order dispatch ran under a schema-skewed controller store")
 	}
@@ -449,7 +449,7 @@ func TestOrdersBootDispatchSkipsOnControllerStoreSchemaSkew(t *testing.T) {
 	cs.mu.Lock()
 	cs.cityBeadsDiagnostic = nil
 	cs.mu.Unlock()
-	cr.dispatchOrders(context.Background(), cr.cityPath, true)
+	cr.dispatchOrders(context.Background(), cr.cityPath)
 	if !od.called.Load() {
 		t.Fatal("boot order dispatch did not run once the controller store had no diagnostic")
 	}

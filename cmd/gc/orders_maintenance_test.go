@@ -7,7 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -38,11 +38,11 @@ func (s *blackHoleWriteStore) CloseAll([]string, map[string]string) (int, error)
 
 func (s *blackHoleWriteStore) Delete(string) error { return s.blackHole() }
 
-// ga-yuiof4: the order-tracking watchdogs run ahead of dispatch in the same
+// ga-yuiof4: the order-tracking watchdogs ran ahead of dispatch in the same
 // pass and walk every store. One black-holed rig store holding a retention
 // backlog cost the pass one store budget per write — 100 deletes, hours at the
 // production 90-120 s budgets — and every city order waited behind it. The
-// pass must stop using a store after its first failure and still dispatch.
+// pass must dispatch without that maintenance (red on 3798728c8's base).
 func TestOrdersPassDispatchesPastABlackHoledRigStore(t *testing.T) {
 	now := time.Now()
 	cityPath := t.TempDir()
@@ -95,7 +95,7 @@ func TestOrdersPassDispatchesPastABlackHoledRigStore(t *testing.T) {
 		logPrefix:           "gc test",
 	}
 
-	cr.dispatchOrders(context.Background(), cityPath, false)
+	cr.dispatchOrders(context.Background(), cityPath)
 
 	if od.calls.Load() != 1 {
 		t.Fatalf("dispatch calls = %d, want 1\nstderr:\n%s", od.calls.Load(), stderr.String())
@@ -105,7 +105,86 @@ func TestOrdersPassDispatchesPastABlackHoledRigStore(t *testing.T) {
 		t.Fatalf("city order dispatched %s after the pass started (rig store absorbed %d black-holed writes first), want <= 1s\nstderr:\n%s",
 			got, rig.writes.Load(), stderr.String())
 	}
-	if got := strings.Count(stderr.String(), `store circuit tripped for rig "frontend"`); got != 1 {
-		t.Fatalf("circuit-trip log lines for the rig store = %d, want exactly 1\nstderr:\n%s", got, stderr.String())
+	if got := rig.writes.Load(); got != 0 {
+		t.Fatalf("the dispatch pass made %d write(s) to the rig store; its maintenance belongs to runOrderMaintenance", got)
+	}
+}
+
+// stuckCloseStore is a rig store whose closes hang until release is closed.
+type stuckCloseStore struct {
+	beads.Store
+	entered, release chan struct{}
+	once             sync.Once
+	closes           atomic.Int32
+}
+
+func (s *stuckCloseStore) CloseAll(ids []string, metadata map[string]string) (int, error) {
+	s.closes.Add(1)
+	s.once.Do(func() { close(s.entered) })
+	<-s.release
+	return s.Store.CloseAll(ids, metadata)
+}
+
+// stuckMaintenanceRuntime starts a maintenance run that is stuck closing a
+// stale tracking bead in a rig store, and returns once it is. Cleanup releases
+// the store and waits for the run.
+func stuckMaintenanceRuntime(t *testing.T) (*CityRuntime, *recordingOrderDispatcher, *stuckCloseStore) {
+	t.Helper()
+	od := &recordingOrderDispatcher{}
+	cr := ordersLaneTestRuntime(t, od, "1h", nil)
+	rig := &stuckCloseStore{entered: make(chan struct{}), release: make(chan struct{}), Store: beads.NewMemStoreFrom(10, []beads.Bead{{
+		ID: "stale-00", Title: "order:rig-poll", Status: "open", Type: "task", CreatedAt: time.Now().Add(-time.Hour),
+		Labels: []string{"order-run:rig-poll", labelOrderTracking}, Ephemeral: true,
+	}}, nil)}
+	cr.cfg.Rigs = []config.Rig{{Name: "frontend", Path: filepath.Join(cr.cityPath, "frontend")}}
+	cr.standaloneRigStores = map[string]beads.Store{"frontend": rig}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		cr.runOrderMaintenance(context.Background())
+	}()
+	t.Cleanup(func() {
+		select {
+		case <-rig.release:
+		default:
+			close(rig.release)
+		}
+		awaitClose(t, done, "the stuck maintenance run finishing")
+	})
+	awaitClose(t, rig.entered, "the maintenance run reaching the stuck rig store")
+	return cr, od, rig
+}
+
+// Dispatch is independent of maintenance: with a maintenance watchdog stuck on
+// a store indefinitely, consecutive passes still dispatch due city orders.
+func TestOrdersPassesDispatchWhileMaintenanceIsStuckOnAStore(t *testing.T) {
+	cr, od, _ := stuckMaintenanceRuntime(t)
+	passes := make(chan struct{})
+	go func() {
+		defer close(passes)
+		for range 2 {
+			cr.runOrdersLanePass(context.Background(), cr.cityPath, ordersLaneReasonCadence)
+		}
+	}()
+	awaitClose(t, passes, "two orders passes beside a stuck maintenance run")
+	if got := od.calls.Load(); got != 2 {
+		t.Fatalf("dispatch calls = %d over two passes, want 2", got)
+	}
+}
+
+// An overlapping maintenance run is skipped, not queued, and stamps nothing.
+func TestOrderMaintenanceOverlapIsSkippedNotQueued(t *testing.T) {
+	cr, _, rig := stuckMaintenanceRuntime(t)
+	if cr.runOrderMaintenance(context.Background()) {
+		t.Fatal("a maintenance run overlapping a stuck one ran")
+	}
+	if !cr.orderTrackingRetentionWatchdogLast.IsZero() {
+		t.Fatal("the skipped run stamped the retention watchdog")
+	}
+	close(rig.release)
+	awaitCond(t, func() bool { return cr.ordersLaneOf().maintMu.TryLock() }, "the stuck run releasing maintMu")
+	defer cr.ordersLaneOf().maintMu.Unlock()
+	if got := rig.closes.Load(); got != 1 {
+		t.Fatalf("rig store closes = %d, want 1: the skipped run must not have been queued behind the stuck one", got)
 	}
 }
