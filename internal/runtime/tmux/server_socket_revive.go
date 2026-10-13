@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -24,32 +25,56 @@ import (
 //
 // Seams are injectable so tests run without tmux, lsof or real signals.
 type socketReviver struct {
-	socketPresent func(path string) (bool, error)
-	findServers   func(ctx context.Context, path string) ([]int, error)
-	signal        func(pid int) error
-	timeout       time.Duration
-	interval      time.Duration
+	// socketNode reports whether path exists and, if so, whether it is a
+	// unix socket.
+	socketNode  func(path string) (exists, isSocket bool, err error)
+	findServers func(ctx context.Context, path string) ([]int, error)
+	signal      func(pid int) error
+	// serverPID asks the server listening on path for its pid without
+	// starting one (tmux -N, 3.2+).
+	serverPID func(ctx context.Context, path string) (int, error)
+	timeout   time.Duration
+	interval  time.Duration
 }
+
+// errOwnerProbeUnavailable means the owner probe cannot run on this host
+// (lsof not installed). Revival is skipped rather than refusing every cold
+// start.
+var errOwnerProbeUnavailable = errors.New("socket owner probe unavailable")
 
 // productionSocketReviver uses lstat, lsof and SIGUSR1. Detection is lsof
 // because macOS keeps a unix socket's bound name after the file is unlinked:
 // `lsof -a -U -c tmux -F pcn` still lists the server's listener fd under the
 // original path (measured on macOS 27, tmux 3.7c; see ga-46jb3c).
 var productionSocketReviver = &socketReviver{
-	socketPresent: func(path string) (bool, error) {
-		_, err := os.Lstat(path)
+	socketNode: func(path string) (bool, bool, error) {
+		info, err := os.Lstat(path)
 		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
+			return false, false, nil
 		}
-		return err == nil, err
+		if err != nil {
+			return false, false, err
+		}
+		return true, info.Mode()&os.ModeSocket != 0, nil
 	},
 	findServers: findTmuxSocketOwners,
 	signal: func(pid int) error {
 		return signalPID(pid, processSignalUsr1)
 	},
+	serverPID: func(ctx context.Context, path string) (int, error) {
+		out, err := realExecutor{}.executeCtx(ctx, []string{"-u", "-N", "-S", path, "display-message", "-p", "#{pid}"})
+		if err != nil {
+			return 0, err
+		}
+		return strconv.Atoi(strings.TrimSpace(out))
+	},
 	timeout:  2 * time.Second,
 	interval: 50 * time.Millisecond,
 }
+
+// reviveLocks serializes revival per socket path: a second SIGUSR1 makes
+// tmux unlink and rebind again, racing the first caller's new-session.
+var reviveLocks sync.Map // path -> *sync.Mutex
 
 // reviver returns the seams in force. A test that injects only
 // serverSocketObserver owns the whole socket verdict, so no revival runs.
@@ -63,30 +88,47 @@ func (t *Tmux) reviver() *socketReviver {
 	return productionSocketReviver
 }
 
+func orphanErr(path string, pid int, reason string, err error) error {
+	if err != nil {
+		return fmt.Errorf("%w: protocol=orphaned-server path=%s pid=%d reason=%s: %w", ErrServerDegraded, path, pid, reason, err)
+	}
+	return fmt.Errorf("%w: protocol=orphaned-server path=%s pid=%d reason=%s", ErrServerDegraded, path, pid, reason)
+}
+
 // reviveOrphanedServer runs in the new-session preflight after tmux reported
 // no server and the socket observation called path safe to create. nil means
 // creating a server is safe: the socket file exists (a stale socket, handled
-// exactly as before), no live tmux server holds path (including a server that
-// was deliberately stopped, which has no process left), or one did and
-// SIGUSR1 restored its socket. Any uncertainty refuses with ErrServerDegraded
-// so the caller retries next tick instead of founding a second server.
+// exactly as before, or one a concurrent caller just revived), no live tmux
+// server holds path (including a server that was deliberately stopped, which
+// has no process left), the owner probe is not installed, or one server did
+// hold it and SIGUSR1 restored a socket that it provably owns. Any other
+// uncertainty refuses with ErrServerDegraded so the caller retries next tick
+// instead of founding a second server.
 func (t *Tmux) reviveOrphanedServer(path string) error {
 	r := t.reviver()
 	if r == nil {
 		return nil
 	}
-	present, err := r.socketPresent(path)
+	mu, _ := reviveLocks.LoadOrStore(path, &sync.Mutex{})
+	mu.(*sync.Mutex).Lock()
+	defer mu.(*sync.Mutex).Unlock()
+
+	exists, _, err := r.socketNode(path)
 	if err != nil {
-		return fmt.Errorf("%w: protocol=orphaned-server path=%s reason=socket-lstat: %w", ErrServerDegraded, path, err)
+		return orphanErr(path, 0, "socket-lstat", err)
 	}
-	if present {
+	if exists {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), r.timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*r.timeout)
 	defer cancel()
 	pids, err := r.findServers(ctx, path)
+	if errors.Is(err, errOwnerProbeUnavailable) {
+		log.Printf("tmux socket %s is missing and the revive check is unavailable (%v); creating a server without checking for a live orphan", path, err)
+		return nil
+	}
 	if err != nil {
-		return fmt.Errorf("%w: protocol=orphaned-server path=%s reason=owner-detection-failed: %w", ErrServerDegraded, path, err)
+		return orphanErr(path, 0, "owner-detection-failed", err)
 	}
 	switch len(pids) {
 	case 0:
@@ -98,22 +140,52 @@ func (t *Tmux) reviveOrphanedServer(path string) error {
 	pid := pids[0]
 	// tmux re-binds in place but does not recreate a deleted directory.
 	_ = os.MkdirAll(filepath.Dir(path), 0o700)
-	if err := r.signal(pid); err != nil {
-		return fmt.Errorf("%w: protocol=orphaned-server path=%s pid=%d reason=sigusr1-failed: %w", ErrServerDegraded, path, pid, err)
+	// Re-verify right before the signal so a reused pid is never signaled.
+	if again, err := r.findServers(ctx, path); err != nil || !slices.Equal(again, pids) {
+		return orphanErr(path, pid, fmt.Sprintf("owner-changed-before-signal owners=%v", again), err)
 	}
+	if err := r.signal(pid); err != nil {
+		return orphanErr(path, pid, "sigusr1-failed", err)
+	}
+	reason := "socket-not-restored"
 	deadline := time.Now().Add(r.timeout)
 	for {
-		if present, err := r.socketPresent(path); err == nil && present {
+		if reason = revivedSocketReason(ctx, r, path, pid); reason == "" {
 			log.Printf("tmux socket %s was missing while server pid %d lived; sent SIGUSR1, socket restored", path, pid)
 			return nil
 		}
-		if !time.Now().Before(deadline) {
+		if !strings.HasSuffix(reason, "-pending") || !time.Now().Before(deadline) {
 			break
 		}
 		time.Sleep(r.interval)
 	}
-	log.Printf("tmux socket %s was missing while server pid %d lived; sent SIGUSR1, socket NOT restored: refusing new-session", path, pid)
-	return fmt.Errorf("%w: protocol=orphaned-server path=%s pid=%d reason=socket-not-restored", ErrServerDegraded, path, pid)
+	if reason == "socket-absent-pending" {
+		reason = "socket-not-restored"
+	}
+	log.Printf("tmux socket %s was missing while server pid %d lived; sent SIGUSR1, socket NOT restored (%s): refusing new-session", path, pid, reason)
+	return orphanErr(path, pid, reason, nil)
+}
+
+// revivedSocketReason is "" when path is a socket owned by pid alone and the
+// server on it answers with pid. A "-pending" reason may still clear; any
+// other reason is final.
+func revivedSocketReason(ctx context.Context, r *socketReviver, path string, pid int) string {
+	exists, isSocket, err := r.socketNode(path)
+	switch {
+	case err != nil:
+		return "socket-lstat-failed"
+	case !exists:
+		return "socket-absent-pending"
+	case !isSocket:
+		return "restored-node-not-a-socket"
+	}
+	if owners, err := r.findServers(ctx, path); err != nil || !slices.Equal(owners, []int{pid}) {
+		return fmt.Sprintf("restored-socket-owner-mismatch owners=%v", owners)
+	}
+	if got, err := r.serverPID(ctx, path); err != nil || got != pid {
+		return "restored-socket-unresponsive-pending"
+	}
+	return ""
 }
 
 // findTmuxSocketOwners lists the tmux processes holding a unix socket bound to
@@ -125,6 +197,9 @@ func findTmuxSocketOwners(ctx context.Context, path string) ([]int, error) {
 	cmd := exec.CommandContext(ctx, "lsof", "-w", "-a", "-U", "-c", "tmux", "-F", "pcn")
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()
+	if errors.Is(err, exec.ErrNotFound) {
+		return nil, fmt.Errorf("%w: %w", errOwnerProbeUnavailable, err)
+	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 && stdout.Len() == 0 && strings.TrimSpace(stderr.String()) == "" {
 		return nil, nil
@@ -132,7 +207,7 @@ func findTmuxSocketOwners(ctx context.Context, path string) ([]int, error) {
 	if err != nil {
 		return nil, fmt.Errorf("lsof: %w: %s", err, strings.TrimSpace(stderr.String()))
 	}
-	return parseLsofSocketOwners(stdout.String(), []string{path, canonicalSocketPath(path)}), nil
+	return parseLsofSocketOwners(stdout.String(), []string{path, canonicalSocketPath(path)})
 }
 
 // canonicalSocketPath resolves symlinks in the nearest existing ancestor of
@@ -153,9 +228,13 @@ func canonicalSocketPath(path string) string {
 }
 
 // parseLsofSocketOwners returns, in first-seen order, the distinct pids of
-// processes whose command is exactly "tmux" holding an fd named one of paths.
-// Linux lsof may suffix the name with " type=STREAM ...".
-func parseLsofSocketOwners(out string, paths []string) []int {
+// tmux processes holding an fd named one of paths. macOS reports the command
+// as "tmux"; Linux tmux sets its proctitle, so lsof reports "tmux: server".
+// Linux lsof may append " type=STREAM ..." to the name; only that suffix is
+// stripped, so a path containing spaces still matches. lsof escapes
+// non-printable bytes with backslashes, which cannot be compared reliably, so
+// such a name fails closed.
+func parseLsofSocketOwners(out string, paths []string) ([]int, error) {
 	var owners []int
 	pid, command := 0, ""
 	for _, line := range strings.Split(out, "\n") {
@@ -170,11 +249,19 @@ func parseLsofSocketOwners(out string, paths []string) []int {
 		case 'c':
 			command = value
 		case 'n':
-			name, _, _ := strings.Cut(value, " ")
-			if pid > 0 && command == "tmux" && slices.Contains(paths, name) && !slices.Contains(owners, pid) {
+			if pid <= 0 || (command != "tmux" && !strings.HasPrefix(command, "tmux:")) {
+				continue
+			}
+			if strings.Contains(value, "\\") {
+				return nil, fmt.Errorf("lsof: escaped socket name %q for pid %d", value, pid)
+			}
+			if i := strings.LastIndex(value, " type="); i >= 0 {
+				value = value[:i]
+			}
+			if slices.Contains(paths, value) && !slices.Contains(owners, pid) {
 				owners = append(owners, pid)
 			}
 		}
 	}
-	return owners
+	return owners, nil
 }
