@@ -2960,6 +2960,7 @@ func (s *BdStore) listViaBDList(query ListQuery) ([]Bead, error) {
 	}
 	s.noteInlineDependencyProjection(issues, result)
 	filtered := applyListQuery(result, query)
+	TraceListRows(TraceSourceBDListRows, s.dir, args, len(issues), len(filtered))
 	if parseErr != nil {
 		if len(filtered) == 0 {
 			return nil, fmt.Errorf("bd list: %w", parseErr)
@@ -3080,6 +3081,7 @@ func (s *BdStore) listEphemeral(query ListQuery) ([]Bead, error) {
 	}
 	s.noteInlineDependencyProjection(issues, result)
 	filtered := applyListQuery(result, query)
+	TraceListRows(TraceSourceBDListRows, s.dir, args, len(issues), len(filtered))
 	if parseErr != nil {
 		if len(filtered) > 0 {
 			return filtered, &PartialResultError{Op: "bd query", Err: parseErr}
