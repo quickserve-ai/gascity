@@ -26,7 +26,6 @@ type reviveFixture struct {
 	existing    bool   // a socket node is already at the path before any signal
 	restoredAs  string // "" (socket) or "file"
 	answerPID   int    // pid the revived server reports (0: servers[0])
-	waitHits    int    // signal waits until socketNode has run this often
 	signaled    []int
 	callsAtSig  int
 	findCalls   int
@@ -62,14 +61,6 @@ func (f *reviveFixture) reviver() *socketReviver {
 			return f.servers, nil
 		},
 		signal: func(pid int) error {
-			for end := time.Now().Add(time.Second); time.Now().Before(end); time.Sleep(time.Millisecond) {
-				f.mu.Lock()
-				hits := f.presentHits
-				f.mu.Unlock()
-				if hits >= f.waitHits {
-					break
-				}
-			}
 			f.mu.Lock()
 			defer f.mu.Unlock()
 			f.signaled = append(f.signaled, pid)
@@ -223,7 +214,8 @@ func TestFindTmuxSocketOwnersDistinguishesMissingFromFailingLsof(t *testing.T) {
 	}
 }
 
-// Review fix 4: two callers finding the same orphan signal it once.
+// Review fix 4: two callers finding the same orphan signal it once, whether
+// the second waits on the lock or arrives after the socket is back.
 func TestConcurrentReviveSignalsOrphanOnce(t *testing.T) {
 	f := newReviveFixture()
 	f.servers, f.restores = []int{27432}, true
