@@ -341,7 +341,8 @@ var (
 // timed out, and every line it flags an age ("last fired 3m ago, expected
 // every 1m (CRITICAL: stale)") of a 1-minute order at most schedulerMaxLag
 // old. That is a loaded CI runner missing 1-minute ticks (ga-l0b72a.9: #271
-// run 38317797049 failed three proxied tests on "dolt-health: last fired 2m ago ... CRITICAL: stale" and passed on rerun).
+// run 38317797049 failed three proxied tests on "dolt-health: last fired 2m
+// ago ... CRITICAL: stale" and passed on rerun).
 // A lookup timeout, a never-fired order, an unreadable history, or any other
 // failing check is NOT lag and stays fatal: those are the defects this
 // assertion has caught before (see assertDoctorGreen).
