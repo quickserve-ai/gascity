@@ -25,7 +25,6 @@ type reviveFixture struct {
 	restores    bool   // a node reappears after SIGUSR1
 	restoredAs  string // "" (socket) or "file"
 	answerPID   int    // pid the revived server reports (0: servers[0])
-	signalDelay time.Duration
 	signaled    []int
 	callsAtSig  int
 	findCalls   int
@@ -58,7 +57,6 @@ func (f *reviveFixture) reviver() *socketReviver {
 			return f.servers, nil
 		},
 		signal: func(pid int) error {
-			time.Sleep(f.signalDelay)
 			f.mu.Lock()
 			defer f.mu.Unlock()
 			f.signaled = append(f.signaled, pid)
@@ -211,10 +209,11 @@ func TestFindTmuxSocketOwnersDistinguishesMissingFromFailingLsof(t *testing.T) {
 	}
 }
 
-// Review fix 4: two callers finding the same orphan signal it once.
+// Review fix 4: two callers finding the same orphan signal it once, whether
+// the second waits on the lock or arrives after the socket is back.
 func TestConcurrentReviveSignalsOrphanOnce(t *testing.T) {
 	f := newReviveFixture()
-	f.servers, f.restores, f.signalDelay = []int{27432}, true, 20*time.Millisecond
+	f.servers, f.restores = []int{27432}, true
 	tm := f.tmux()
 	path := "/tmp/tmux-test/gc-revive-concurrent"
 	var wg sync.WaitGroup
