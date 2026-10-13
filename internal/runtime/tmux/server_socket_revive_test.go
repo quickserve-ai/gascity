@@ -329,6 +329,29 @@ func TestReviveRefusesUnprovenOwnership(t *testing.T) {
 	}
 }
 
+// Round 4 (b): the restoration window bounds the probes after SIGUSR1, so a
+// revived server that never answers cannot hold new-session past it.
+func TestReviveRestorationProbesStopAtTheWindow(t *testing.T) {
+	f := newReviveFixture()
+	f.servers, f.restores = []int{27432}, true
+	r := f.reviver()
+	r.serverPID = func(ctx context.Context, _ string) (int, error) {
+		<-ctx.Done()
+		return 0, ctx.Err()
+	}
+	r.budget, r.timeout = 5*time.Second, 40*time.Millisecond
+	tm := f.tmux()
+	tm.socketReviver = r
+	start := time.Now()
+	err := tm.reviveOrphanedServer("/tmp/tmux-test/gc-revive-window")
+	if !errors.Is(err, ErrServerDegraded) || !strings.Contains(err.Error(), "restored-socket-unresponsive") {
+		t.Fatalf("err = %v, want ErrServerDegraded restored-socket-unresponsive", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("revival took %v, want about the 40ms restoration window, not the 5s budget", elapsed)
+	}
+}
+
 // Round 3: the socket observation cannot say whether it saw the path absent or
 // stale, so a node found at the path is verified, never trusted. A caller that
 // observed absence and then finds a node a concurrent reviver restored but the
@@ -396,10 +419,12 @@ func TestParseLsofSocketOwners(t *testing.T) {
 	if err != nil || len(got) != 1 || got[0] != 43 {
 		t.Fatalf("path containing \" type=\": owners = %v, %v; want [43]", got, err)
 	}
-	// Round 3: after " type=" lsof writes an uppercase socket type; anything
-	// else could be a literal file name and is refused, not matched.
-	if got, err := parseLsofSocketOwners("p45\nctmux\nf5\nn/tmp/tmux-501/gastown type=other\n", paths); err == nil {
-		t.Fatalf("\" type=\" with no socket type: owners = %v, want a fail-closed error", got)
+	// Rounds 3-4: after " type=" only tmux's STREAM (with an optional state)
+	// matches; anything else could be a literal file name and is refused.
+	for _, suffix := range []string{"other", "BOGUS", "STREAM extra", "STREAM (LISTEN) x", "DGRAM"} {
+		if got, err := parseLsofSocketOwners("p45\nctmux\nf5\nn/tmp/tmux-501/gastown type="+suffix+"\n", paths); err == nil {
+			t.Fatalf("\" type=%s\": owners = %v, want a fail-closed error", suffix, got)
+		}
 	}
 	// Round 2 (3ii): an escaped name that cannot be ours is ignored.
 	got, err = parseLsofSocketOwners("p44\nctmux\nf5\nn/home/other/so\\x09ck\np27432\nctmux\nf6\nn/tmp/tmux-501/gastown\n", paths)
