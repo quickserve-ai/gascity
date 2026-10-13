@@ -1975,6 +1975,11 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
 	if !query.HasFilter() && !query.AllowScan {
 		return nil, fmt.Errorf("listing beads: %w", ErrQueryRequiresScan)
 	}
+	// The backing IssueFilter takes one assignee; a plural query is answered
+	// one predicated search per route rather than one unfiltered search.
+	if routes := assigneeFanOutRoutes(query); routes != nil {
+		return listPerAssignee("listing beads", query, routes, s.List)
+	}
 	var out []Bead
 	err := s.withReadRetry(func(ctx context.Context, storage beadslib.Storage) error {
 		filter := nativeIssueFilterFromListQuery(query)
@@ -3343,13 +3348,16 @@ func nativeCreatedLimitPushdown(query ListQuery) int {
 	if query.TierMode == TierWisps {
 		return 0
 	}
-	// SeekAfter, UpdatedBefore, and plural Assignees are enforced only Go-side in
-	// ApplyListQuery (q.Matches); they are not pushed to the backing search, so a
-	// backing limit applied before them would cut rows before the residual filter
-	// runs and silently drop page rows. Fetch the full candidate set for those
-	// shapes, mirroring the sibling gates (doltliteCanSelectBoundedTopN,
-	// exec.go, bdstore canApplyWispsServerLimit).
-	if query.SeekAfter != nil || !query.UpdatedBefore.IsZero() || len(query.Assignees) > 0 {
+	// SeekAfter, UpdatedBefore and IDs are enforced only Go-side in
+	// ApplyListQuery (q.Matches); they are not pushed to the backing search, so
+	// a backing limit applied before them would cut rows before the residual
+	// filter runs and silently drop page rows. Fetch the full candidate set for
+	// those shapes, mirroring the sibling gates (doltliteCanSelectBoundedTopN,
+	// exec.go, bdstore canApplyWispsServerLimit and bdListRequiresClientLimit).
+	// List answers plural Assignees one route per search (listPerAssignee), so
+	// they do not reach here from List; the guard stays for any caller that
+	// passes them through unsplit.
+	if query.SeekAfter != nil || !query.UpdatedBefore.IsZero() || len(query.IDs) > 0 || len(query.Assignees) > 0 {
 		return 0
 	}
 	switch query.Sort {

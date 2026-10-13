@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -980,6 +981,112 @@ func TestDoltliteReadStoreFiltersPluralAssigneesAcrossTiers(t *testing.T) {
 	}
 	if !rows[1].Ephemeral {
 		t.Fatalf("wisp row Ephemeral = false: %#v", rows[1])
+	}
+}
+
+// The doltlite store sends the plural predicate to SQL (assignee IN (...));
+// BdStore answers the same query with one predicated bd read per route. Pin
+// that both stores give the same answer for the same multi-route query over
+// the same rows, so they cannot drift apart. The BdStore here reads a fake bd
+// serving the doltlite fixture's own rows, and the fake refuses a read with no
+// assignee predicate: a BdStore that scanned instead fails the test too.
+// rig/nohistory-worker is left out on purpose: doltlite's wisp tier includes
+// no-history rows and bd's ephemeral query does not, a tier difference outside
+// this contract.
+func TestDoltliteReadStorePluralAssigneesMatchBdStore(t *testing.T) {
+	store, closeStore := newTestDoltliteReadStore(t)
+	defer closeStore()
+
+	fixture, err := store.List(ListQuery{AllowScan: true, TierMode: TierBoth, IncludeClosed: true})
+	if err != nil {
+		t.Fatalf("List fixture rows: %v", err)
+	}
+	bd := NewBdStore("/city", fixtureBdRunner(t, fixture))
+
+	routes := []string{"rig/ready-worker", "rig/wisp-worker", "rig/worker", "rig/no-such-route", "rig/ready-worker"}
+	for _, sortOrder := range []SortOrder{SortCreatedAsc, SortDefault} {
+		query := ListQuery{Assignees: routes, TierMode: TierBoth, Sort: sortOrder}
+		fromDoltlite, err := store.List(query)
+		if err != nil {
+			t.Fatalf("doltlite List(sort %q): %v", sortOrder, err)
+		}
+		fromBd, err := bd.List(query)
+		if err != nil {
+			t.Fatalf("BdStore List(sort %q): %v", sortOrder, err)
+		}
+		want, got := testBeadIDs(fromDoltlite), testBeadIDs(fromBd)
+		if len(want) < 3 {
+			t.Fatalf("doltlite ids = %v; the fixture should hold rows for three routes, or the check is vacuous", want)
+		}
+		if sortOrder == SortDefault {
+			// Default order is each backing's own; compare the answer, not its order.
+			slices.Sort(want)
+			slices.Sort(got)
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("sort %q: BdStore ids = %v, doltlite ids = %v", sortOrder, got, want)
+		}
+	}
+}
+
+// fixtureBdRunner is a fake bd serving rows: `bd list` answers the
+// non-ephemeral rows and `bd query "ephemeral=true AND ..."` the ephemeral
+// ones, each predicated on its --assignee / assignee= value, with closed rows
+// only under --all. A read with no assignee predicate is an error.
+func fixtureBdRunner(t *testing.T, rows []Bead) CommandRunner {
+	t.Helper()
+	return func(_, name string, args ...string) ([]byte, error) {
+		full := name + " " + strings.Join(args, " ")
+		var (
+			assignee  string
+			predicate bool
+			ephemeral bool
+		)
+		all := slices.Contains(args, "--all")
+		switch {
+		case len(args) > 0 && args[0] == "list":
+			for _, arg := range args {
+				if v, ok := strings.CutPrefix(arg, "--assignee="); ok {
+					assignee, predicate = v, true
+				}
+			}
+		case len(args) > 2 && args[0] == "query":
+			ephemeral = true
+			for _, clause := range strings.Split(args[2], " AND ") {
+				if v, ok := strings.CutPrefix(clause, "assignee="); ok {
+					unquoted, err := strconv.Unquote(v)
+					if err != nil {
+						unquoted = v
+					}
+					assignee, predicate = unquoted, true
+				}
+			}
+		default:
+			return nil, fmt.Errorf("unexpected command: %s", full)
+		}
+		if !predicate {
+			return nil, fmt.Errorf("unpredicated read (a scan): %s", full)
+		}
+		out := make([]map[string]any, 0)
+		for _, b := range rows {
+			if b.Ephemeral != ephemeral || b.Assignee != assignee || (b.Status == "closed" && !all) {
+				continue
+			}
+			row := map[string]any{
+				"id":         b.ID,
+				"title":      b.Title,
+				"status":     b.Status,
+				"issue_type": b.Type,
+				"assignee":   b.Assignee,
+				"created_at": b.CreatedAt.Format(time.RFC3339Nano),
+				"ephemeral":  b.Ephemeral,
+			}
+			if b.Priority != nil {
+				row["priority"] = *b.Priority
+			}
+			out = append(out, row)
+		}
+		return json.Marshal(out)
 	}
 }
 

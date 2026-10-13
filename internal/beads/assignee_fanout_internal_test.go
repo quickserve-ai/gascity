@@ -1,6 +1,7 @@
 package beads
 
 import (
+	"context"
 	"errors"
 	"slices"
 	"sort"
@@ -8,7 +9,120 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	beadslib "github.com/steveyegge/beads"
 )
+
+// IDs is matched only Go-side (the backing filter has no id list), so a native
+// read carrying IDs must not let the backing cut its limit first: the backing
+// would return the route's top row, the IDs filter would discard it, and the
+// wanted row would never be read. A plural read fans out to single-route reads
+// that keep IDs, so the guard holds for them too.
+func TestNativeDoltStoreListIDsReadsUnlimitedBeforeIDsFilter(t *testing.T) {
+	base := time.Date(2026, 9, 25, 8, 0, 0, 0, time.UTC)
+	all := []*beadslib.Issue{
+		{ID: "other", Title: "m", Status: beadslib.StatusOpen, IssueType: "message", Assignee: "a", Priority: 0, CreatedAt: base},
+		{ID: "wanted", Title: "m", Status: beadslib.StatusOpen, IssueType: "message", Assignee: "a", Priority: 2, CreatedAt: base},
+	}
+	storage := &nativeDoltStorageSpy{
+		searchIssues: func(_ context.Context, _ string, filter beadslib.IssueFilter) ([]*beadslib.Issue, error) {
+			var out []*beadslib.Issue
+			for _, issue := range all {
+				if filter.Assignee == nil || issue.Assignee == *filter.Assignee {
+					out = append(out, issue)
+				}
+			}
+			sort.SliceStable(out, func(i, j int) bool { return out[i].Priority < out[j].Priority })
+			if filter.Limit > 0 && len(out) > filter.Limit {
+				out = out[:filter.Limit]
+			}
+			return out, nil
+		},
+	}
+	store := newNativeDoltStoreForTest(storage)
+
+	for _, query := range []ListQuery{
+		{Assignees: []string{"a", "b"}, IDs: []string{"wanted"}, Limit: 1},
+		{Assignee: "a", IDs: []string{"wanted"}, Limit: 1},
+	} {
+		got, err := store.List(query)
+		if err != nil {
+			t.Fatalf("List(%+v): %v", query, err)
+		}
+		if want := []string{"wanted"}; !slices.Equal(fanoutTestIDs(got), want) {
+			t.Fatalf("List(%+v) ids = %v, want %v", query, fanoutTestIDs(got), want)
+		}
+	}
+}
+
+// The native store's backing filter carries one assignee, so a multi-route
+// read must reach SearchIssues once per route with that route set — never as
+// one unfiltered search hydrating every open message (pl-adj).
+func TestNativeDoltStoreListAssigneesSearchesEachRoutePredicated(t *testing.T) {
+	base := time.Date(2026, 9, 25, 8, 0, 0, 0, time.UTC)
+	p0, p2 := 0, 2
+	all := []*beadslib.Issue{
+		{ID: "a-old", Title: "m", Status: beadslib.StatusOpen, IssueType: "message", Assignee: "rig/route-a", Priority: p2, CreatedAt: base},
+		{ID: "b-new", Title: "m", Status: beadslib.StatusOpen, IssueType: "message", Assignee: "route-b", Priority: p2, CreatedAt: base.Add(2 * time.Hour)},
+		{ID: "b-urgent", Title: "m", Status: beadslib.StatusOpen, IssueType: "message", Assignee: "route-b", Priority: p0, CreatedAt: base},
+		{ID: "a-mid", Title: "m", Status: beadslib.StatusOpen, IssueType: "message", Assignee: "rig/route-a", Priority: p2, CreatedAt: base.Add(time.Hour)},
+		{ID: "other", Title: "m", Status: beadslib.StatusOpen, IssueType: "message", Assignee: "someone-else", Priority: p2, CreatedAt: base.Add(3 * time.Hour)},
+	}
+	var (
+		mu        sync.Mutex
+		searched  []string
+		unfilterd int
+	)
+	storage := &nativeDoltStorageSpy{
+		searchIssues: func(_ context.Context, _ string, filter beadslib.IssueFilter) ([]*beadslib.Issue, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if filter.Assignee == nil {
+				unfilterd++
+				return all, nil
+			}
+			searched = append(searched, *filter.Assignee)
+			var out []*beadslib.Issue
+			for _, issue := range all {
+				if issue.Assignee == *filter.Assignee {
+					out = append(out, issue)
+				}
+			}
+			// The backing's default order: priority ASC, created_at DESC, id ASC.
+			sort.SliceStable(out, func(i, j int) bool {
+				if out[i].Priority != out[j].Priority {
+					return out[i].Priority < out[j].Priority
+				}
+				if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+					return out[i].CreatedAt.After(out[j].CreatedAt)
+				}
+				return out[i].ID < out[j].ID
+			})
+			return out, nil
+		},
+	}
+	store := newNativeDoltStoreForTest(storage)
+
+	got, err := store.List(ListQuery{
+		Type:      "message",
+		Status:    "open",
+		TierMode:  TierBoth,
+		Assignees: []string{"rig/route-a", "route-b", "route-a-unused"},
+	})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if unfilterd != 0 {
+		t.Fatalf("SearchIssues ran %d unfiltered searches, want 0", unfilterd)
+	}
+	slices.Sort(searched)
+	if want := []string{"rig/route-a", "route-a-unused", "route-b"}; !slices.Equal(searched, want) {
+		t.Fatalf("searched assignees = %v, want one search per route %v", searched, want)
+	}
+	if want := []string{"b-urgent", "b-new", "a-mid", "a-old"}; !slices.Equal(fanoutTestIDs(got), want) {
+		t.Fatalf("List ids = %v, want backing default order %v", fanoutTestIDs(got), want)
+	}
+}
 
 // assigneeFanOutRoutes decides which queries fan out: only a plural,
 // route-bearing query does, and its routes come back trimmed and distinct.
@@ -233,5 +347,89 @@ func TestListPerAssigneeDedupesIDsAcrossRoutes(t *testing.T) {
 	}
 	if want := []string{"shared", "b-only"}; !slices.Equal(fanoutTestIDs(got), want) {
 		t.Fatalf("listPerAssignee ids = %v, want %v", fanoutTestIDs(got), want)
+	}
+}
+
+// SQLiteStore sends plural assignees to SQL as assignee IN (...), so a
+// multi-route read selects only those routes' rows and can take its LIMIT in
+// SQL, instead of decoding every row the other filters select and matching
+// the routes in Go.
+func TestSQLiteStoreListPluralAssigneesPredicatedInSQL(t *testing.T) {
+	sqlText, args := sqliteListSQL(ListQuery{Assignees: []string{"rig/a", "b"}, Type: "message", Limit: 2}, "b.id")
+	if !strings.Contains(sqlText, "b.assignee IN (?,?)") || !strings.Contains(sqlText, "LIMIT 2") {
+		t.Fatalf("sql = %q, want an assignee IN predicate and the limit in SQL", sqlText)
+	}
+	if !slices.Contains(args, any("rig/a")) || !slices.Contains(args, any("b")) {
+		t.Fatalf("args = %v, want both routes bound", args)
+	}
+
+	opened, err := OpenSQLiteStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenSQLiteStore: %v", err)
+	}
+	store := opened.(*SQLiteStore)
+	t.Cleanup(func() { _ = store.CloseStore() })
+	want := map[string]bool{}
+	for _, assignee := range []string{"rig/a", "rig/a", "b", "c", ""} {
+		b, err := store.Create(Bead{Title: "m", Type: "message", Assignee: assignee})
+		if err != nil {
+			t.Fatalf("Create: %v", err)
+		}
+		if assignee == "rig/a" || assignee == "b" {
+			want[b.ID] = true
+		}
+	}
+	got, err := store.List(ListQuery{Assignees: []string{"rig/a", "b"}, Type: "message"})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("List = %v, want the %d rows of rig/a and b", fanoutTestIDs(got), len(want))
+	}
+	for _, b := range got {
+		if !want[b.ID] {
+			t.Fatalf("List returned %s (assignee %q), not a listed route's row", b.ID, b.Assignee)
+		}
+	}
+	limited, err := store.List(ListQuery{Assignees: []string{"rig/a", "b"}, Type: "message", Sort: SortCreatedAsc, Limit: 2})
+	if err != nil {
+		t.Fatalf("List limited: %v", err)
+	}
+	if len(limited) != 2 || !want[limited[0].ID] || !want[limited[1].ID] {
+		t.Fatalf("List limited = %v, want two rows of the listed routes", fanoutTestIDs(limited))
+	}
+}
+
+// A plural-assignee count is answered one predicated CountIssues per route and
+// summed: a bead has one assignee and the routes are distinct, so the
+// per-route counts partition the total. Reporting it unsupported sent callers
+// to a hydrating List instead.
+func TestNativeDoltStoreCountPluralAssigneesSumsPerRouteCounts(t *testing.T) {
+	counts := map[string]int64{"rig/a": 3, "b": 4}
+	var seen []string
+	storage := &nativeDoltStorageSpy{
+		countIssues: func(_ context.Context, _ string, filter beadslib.IssueFilter) (int64, error) {
+			if filter.Assignee == nil {
+				t.Fatal("CountIssues ran with no assignee predicate")
+			}
+			seen = append(seen, *filter.Assignee)
+			return counts[*filter.Assignee], nil
+		},
+		searchIssues: func(context.Context, string, beadslib.IssueFilter) ([]*beadslib.Issue, error) {
+			t.Fatal("Count hydrated rows through SearchIssues")
+			return nil, nil
+		},
+	}
+	store := newNativeDoltStoreForTest(storage)
+
+	got, err := store.Count(context.Background(), ListQuery{Assignees: []string{"rig/a", "b", " rig/a"}, Type: "message"})
+	if err != nil {
+		t.Fatalf("Count: %v", err)
+	}
+	if got != 7 {
+		t.Fatalf("Count = %d, want 7 (3 + 4)", got)
+	}
+	if want := []string{"rig/a", "b"}; !slices.Equal(seen, want) {
+		t.Fatalf("CountIssues routes = %v, want %v (one count per distinct route)", seen, want)
 	}
 }

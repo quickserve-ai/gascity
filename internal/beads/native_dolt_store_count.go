@@ -32,6 +32,24 @@ func (s *NativeDoltStore) Count(ctx context.Context, query ListQuery, excludeTyp
 	if !query.HasFilter() && !query.AllowScan {
 		return 0, fmt.Errorf("counting beads: %w", ErrQueryRequiresScan)
 	}
+	// The backing count filter takes one assignee, so a plural query counts one
+	// route at a time. A bead has one assignee and the routes are distinct, so
+	// the per-route counts partition the total; a route whose shape is
+	// unsupported reports ErrCountUnsupported for the whole count.
+	if routes := assigneeFanOutRoutes(query); routes != nil {
+		total := 0
+		for _, route := range routes {
+			routeQuery := query
+			routeQuery.Assignees = nil
+			routeQuery.Assignee = route
+			n, err := s.Count(ctx, routeQuery, excludeTypes...)
+			if err != nil {
+				return 0, err
+			}
+			total += n
+		}
+		return total, nil
+	}
 	if !nativeDoltCountSupported(query, excludeTypes) {
 		return 0, fmt.Errorf("counting beads: %w", ErrCountUnsupported)
 	}

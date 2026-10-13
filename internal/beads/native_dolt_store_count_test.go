@@ -149,7 +149,7 @@ func TestNativeDoltStoreCountUnsupportedShapes(t *testing.T) {
 		{name: "status open exclude-list translation", query: ListQuery{Status: "open", AllowScan: true}},
 		{name: "wisps tier filtered Go-side", query: ListQuery{AllowScan: true, TierMode: TierWisps}},
 		{name: "metadata re-filtered Go-side", query: ListQuery{AllowScan: true, Metadata: map[string]string{"gc.rig": "fc"}}},
-		{name: "assignees not translated", query: ListQuery{AllowScan: true, Assignees: []string{"a", "b"}}},
+		{name: "assignees fan out but each route keeps an untranslated shape", query: ListQuery{Status: "open", Assignees: []string{"a", "b"}}},
 		{name: "parentID Go-side projection", query: ListQuery{AllowScan: true, ParentID: "ga-parent"}},
 		{name: "parentIDs not translated", query: ListQuery{AllowScan: true, ParentIDs: []string{"ga-parent"}}},
 		{name: "createdBefore precision", query: ListQuery{AllowScan: true, CreatedBefore: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)}},

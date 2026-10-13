@@ -77,6 +77,7 @@ func TestNativeCreatedLimitPushdownGates(t *testing.T) {
 		{"asc but seek strips", ListQuery{Sort: SortCreatedAsc, Limit: 5, SeekAfter: seek}, 0},
 		{"desc opt-in but updated-before strips", ListQuery{Sort: SortCreatedDesc, Limit: 5, AllowBackingCreatedLimit: true, UpdatedBefore: time.Unix(2, 0).UTC()}, 0},
 		{"desc opt-in but plural assignees strips", ListQuery{Sort: SortCreatedDesc, Limit: 5, AllowBackingCreatedLimit: true, Assignees: []string{"a", "b"}}, 0},
+		{"default sort but ids strips", ListQuery{Limit: 5, IDs: []string{"gc-1"}}, 0},
 		{"wisp tier strips", ListQuery{Sort: SortCreatedDesc, Limit: 5, AllowBackingCreatedLimit: true, TierMode: TierWisps}, 0},
 		{"default sort pushes", ListQuery{Sort: SortDefault, Limit: 5}, 5},
 		{"zero limit stays zero", ListQuery{Sort: SortCreatedDesc, Limit: 0, AllowBackingCreatedLimit: true}, 0},
