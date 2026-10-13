@@ -114,25 +114,17 @@ func orphanErr(path string, pid int, reason string, err error) error {
 
 // reviveOrphanedServer runs in the new-session preflight after tmux reported
 // no server and the socket observation called path safe to create. nil means
-// creating a server is safe: the socket file exists (a stale socket, handled
-// exactly as before, or one a concurrent caller just revived), no live tmux
-// server holds path (including a server that was deliberately stopped, which
-// has no process left), the owner probe is not installed, or one server did
-// hold it and SIGUSR1 restored a socket that it provably owns. Any other
-// uncertainty refuses with ErrServerDegraded so the caller retries next tick
-// instead of founding a second server.
+// creating a server is safe: a node at path that no live tmux server holds (a
+// stale socket, handled exactly as before), a node a concurrent caller
+// revived that passes verification, no live tmux server holding path
+// (including a server that was deliberately stopped, which has no process
+// left), the owner probe is not installed, or one server did hold it and
+// SIGUSR1 restored a socket that it provably owns. Any other uncertainty
+// refuses with ErrServerDegraded so the caller retries next tick instead of
+// founding a second server.
 func (t *Tmux) reviveOrphanedServer(path string) error {
 	r := t.reviver()
 	if r == nil {
-		return nil
-	}
-	// Observed before the lock: an existing node here is the stale socket
-	// the observation already judged safe, handled exactly as before.
-	exists, _, err := r.socketNode(path)
-	if err != nil {
-		return orphanErr(path, 0, "socket-lstat", err)
-	}
-	if exists {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), r.budget)
@@ -143,23 +135,30 @@ func (t *Tmux) reviveOrphanedServer(path string) error {
 	}
 	defer release()
 
-	if exists, _, err := r.socketNode(path); err != nil {
+	// Read under the lock so a concurrent reviver's result is visible. The
+	// observation does not say whether it saw path absent or stale, so a node
+	// here is verified, never trusted: it may be one a predecessor restored
+	// and then rejected.
+	exists, _, err := r.socketNode(path)
+	if err != nil {
 		return orphanErr(path, 0, "socket-lstat", err)
-	} else if exists {
-		// A predecessor revived (or failed to revive) the server while we
-		// waited. Trust the node only if it passes the same verification.
-		if reason := revivedSocketReason(ctx, r, path, 0); reason != "" {
-			return orphanErr(path, 0, "waiter-"+reason, nil)
-		}
-		return nil
 	}
 	pids, err := r.findServers(ctx, path)
 	if errors.Is(err, errOwnerProbeUnavailable) {
-		log.Printf("tmux socket %s is missing and the revive check is unavailable (%v); creating a server without checking for a live orphan", path, err)
+		log.Printf("tmux socket %s: the revive check is unavailable (%v); creating a server without checking for a live orphan", path, err)
 		return nil
 	}
 	if err != nil {
 		return orphanErr(path, 0, "owner-detection-failed", err)
+	}
+	if exists {
+		if len(pids) == 0 {
+			return nil // stale: no server holds it
+		}
+		if reason := revivedSocketReason(ctx, r, path, 0); reason != "" {
+			return orphanErr(path, 0, "existing-"+reason, nil)
+		}
+		return nil
 	}
 	switch len(pids) {
 	case 0:
@@ -173,33 +172,43 @@ func (t *Tmux) reviveOrphanedServer(path string) error {
 	_ = os.MkdirAll(filepath.Dir(path), 0o700)
 	// Re-probe right before the signal. This narrows, but cannot close, the
 	// pid-reuse race: without a pidfd on macOS, the pid can still exit and
-	// be reused by a tmux process between this probe and the kill below.
+	// be reused by any process between this probe and the kill below.
 	if again, err := r.findServers(ctx, path); err != nil || !slices.Equal(again, pids) {
 		return orphanErr(path, pid, fmt.Sprintf("owner-changed-before-signal owners=%v", again), err)
 	}
 	if err := r.signal(pid); err != nil {
 		return orphanErr(path, pid, "sigusr1-failed", err)
 	}
-	reason := "socket-not-restored"
-	deadline := time.Now().Add(r.timeout)
-	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
-		deadline = d
-	}
+	// The restoration window bounds every probe after the signal too.
+	rctx, rcancel := context.WithTimeout(ctx, r.timeout)
+	defer rcancel()
+	var reason string
 	for {
-		if reason = revivedSocketReason(ctx, r, path, pid); reason == "" {
+		if reason = revivedSocketReason(rctx, r, path, pid); reason == "" {
 			log.Printf("tmux socket %s was missing while server pid %d lived; sent SIGUSR1, socket restored", path, pid)
 			return nil
 		}
-		if !strings.HasSuffix(reason, "-pending") || !time.Now().Before(deadline) {
+		if !strings.HasSuffix(reason, "-pending") || !sleepCtx(rctx, r.interval) {
 			break
 		}
-		time.Sleep(r.interval)
 	}
 	if reason == "socket-absent-pending" {
 		reason = "socket-not-restored"
 	}
 	log.Printf("tmux socket %s was missing while server pid %d lived; sent SIGUSR1, socket NOT restored (%s): refusing new-session", path, pid, reason)
 	return orphanErr(path, pid, reason, nil)
+}
+
+// sleepCtx waits d and reports true, or reports false as soon as ctx ends.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // revivedSocketReason is "" when path is a socket owned by pid alone and the
@@ -301,12 +310,21 @@ func parseLsofSocketOwners(out string, paths []string) ([]int, error) {
 
 // lsofNameMatches reports whether an lsof NAME is one of paths. An exact match
 // wins; otherwise Linux lsof's appended " type=STREAM ..." is accepted after a
-// candidate path. lsof escapes non-printable bytes with backslashes, which
-// cannot be compared reliably: such a name is an error only when its
-// unescaped prefix could still be one of paths, and is ignored otherwise.
+// candidate path when an uppercase socket type follows; any other text there
+// could be a literal file name and is an error. lsof escapes non-printable
+// bytes with backslashes, which cannot be compared reliably: such a name is
+// an error only when its unescaped prefix could still be one of paths, and is
+// ignored otherwise.
 func lsofNameMatches(name string, paths []string) (bool, error) {
 	for _, path := range paths {
-		if name == path || strings.HasPrefix(name, path+" type=") {
+		if name == path {
+			return true, nil
+		}
+		if rest, ok := strings.CutPrefix(name, path+" type="); ok {
+			kind, _, _ := strings.Cut(rest, " ")
+			if kind == "" || strings.Trim(kind, "ABCDEFGHIJKLMNOPQRSTUVWXYZ") != "" {
+				return false, fmt.Errorf("socket name %q may be %s", name, path)
+			}
 			return true, nil
 		}
 	}
