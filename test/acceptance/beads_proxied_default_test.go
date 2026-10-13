@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -326,6 +327,15 @@ func beadsTopologyCheck(name string) bool {
 	return strings.HasPrefix(name, "custom-types")
 }
 
+// The order-firing-current detail lines that mean only "fired late", as
+// internal/doctor/checks_order_firing.go writes them, anchored at both ends
+// so an appended suffix does not match.
+var (
+	schedulerStaleLine   = regexp.MustCompile(`^\S+: last fired \S+ ago, expected every \S+ \(CRITICAL: stale\)$`)
+	schedulerOverdueLine = regexp.MustCompile(`^\S+: last fired \S+ ago, expected every \S+ \(overdue\)$`)
+	schedulerCurrentLine = regexp.MustCompile(`^\d+ other scheduled order\(s\) current$`)
+)
+
 // schedulerLagOnly reports whether the run's ONLY blocking failure is the test
 // city's own order scheduler running late: order-firing-current in error, not
 // timed out, and every line it flags an age ("last fired 3m ago, expected
@@ -347,16 +357,56 @@ func schedulerLagOnly(report doctorReport) bool {
 		if r.Name != "order-firing-current" || r.TimedOut {
 			return false
 		}
+		// Every detail line must be one this check writes for lag, or its
+		// closing count line. Anything else, including a lag line carrying a
+		// suffix (", gated on open work ..." is a stuck item; ", open-work
+		// lookup failed: ..." is a failed store read), is not lag.
 		for _, d := range r.Details {
 			switch {
-			case strings.Contains(d, "never fired"), strings.Contains(d, "cannot "), strings.Contains(d, "timed out"):
-				return false
-			case strings.Contains(d, " ago, expected every ") && strings.HasSuffix(d, "(CRITICAL: stale)"):
+			case schedulerStaleLine.MatchString(d):
 				lagged = true
+			case schedulerOverdueLine.MatchString(d), schedulerCurrentLine.MatchString(d):
+			default:
+				return false
 			}
 		}
 	}
 	return lagged
+}
+
+// TestSchedulerLagOnly pins which order-firing-current reports count as lag.
+// It needs no bd or dolt: it judges literal doctor reports.
+func TestSchedulerLagOnly(t *testing.T) {
+	stale := "dolt-health: last fired 2m ago, expected every 1m (CRITICAL: stale)" // #271 run 38317797049
+	report := func(blocking int, timedOut bool, details ...string) doctorReport {
+		return doctorReport{BlockingFailed: blocking, Results: []doctorCheckResult{{
+			Name: "order-firing-current", Status: "error", Severity: "blocking",
+			TimedOut: timedOut, Details: details,
+		}}}
+	}
+	for _, tc := range []struct {
+		name   string
+		report doctorReport
+		want   bool
+	}{
+		{"one stale line", report(1, false, stale), true},
+		{"stale with overdue sibling and count", report(1, false, stale,
+			"wisp-gc: last fired 1h30m0s ago, expected every 1h (overdue)", "4 other scheduled order(s) current"), true},
+		{"stale sibling gated on open work", report(1, false, stale,
+			"mol-x: last fired 3m ago, expected every 1m (CRITICAL: stale), gated on open work ga-1 (5m old, unassigned)"), false},
+		{"stale sibling whose open-work lookup failed", report(1, false, stale,
+			"mol-x: last fired 3m ago, expected every 1m (CRITICAL: stale), open-work lookup failed: dial tcp: refused"), false},
+		{"never fired", report(1, false, stale, "mol-x: never fired since controller start 9m ago"), false},
+		{"unreadable history", report(1, false, stale, "mol-x: cannot read order history: boom"), false},
+		{"unknown line", report(1, false, stale, "something new"), false},
+		{"overdue only", report(1, false, "wisp-gc: last fired 2h ago, expected every 1h (overdue)"), false},
+		{"timed out", report(1, true, stale), false},
+		{"a second blocking failure", report(2, false, stale), false},
+	} {
+		if got := schedulerLagOnly(tc.report); got != tc.want {
+			t.Errorf("%s: schedulerLagOnly = %v, want %v", tc.name, got, tc.want)
+		}
+	}
 }
 
 // doctorJSONAllowingSchedulerLag runs `gc doctor --json` and fails the test on
