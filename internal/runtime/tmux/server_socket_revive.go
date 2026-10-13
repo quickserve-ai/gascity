@@ -259,6 +259,20 @@ func findTmuxSocketOwners(ctx context.Context, path string) ([]int, error) {
 	return parseLsofSocketOwners(stdout.String(), []string{path, canonicalSocketPath(path)})
 }
 
+// lsofStreamType reports whether rest is "STREAM" or "STREAM (STATE)" with an
+// uppercase state.
+func lsofStreamType(rest string) bool {
+	if rest == "STREAM" {
+		return true
+	}
+	state, ok := strings.CutPrefix(rest, "STREAM (")
+	if !ok {
+		return false
+	}
+	state, ok = strings.CutSuffix(state, ")")
+	return ok && state != "" && strings.Trim(state, "ABCDEFGHIJKLMNOPQRSTUVWXYZ_") == ""
+}
+
 // canonicalSocketPath resolves symlinks in the nearest existing ancestor of
 // path, since the socket directory itself may have been deleted.
 func canonicalSocketPath(path string) string {
@@ -309,20 +323,23 @@ func parseLsofSocketOwners(out string, paths []string) ([]int, error) {
 }
 
 // lsofNameMatches reports whether an lsof NAME is one of paths. An exact match
-// wins; otherwise Linux lsof's appended " type=STREAM ..." is accepted after a
-// candidate path when an uppercase socket type follows; any other text there
-// could be a literal file name and is an error. lsof escapes non-printable
-// bytes with backslashes, which cannot be compared reliably: such a name is
-// an error only when its unescaped prefix could still be one of paths, and is
-// ignored otherwise.
+// wins; otherwise Linux lsof's appended socket type is accepted after a
+// candidate path only as " type=STREAM" (tmux listens on a stream socket),
+// optionally followed by a state such as " (LISTEN)"; any other text there
+// could be a literal file name and is an error. A file literally named
+// path+" type=STREAM" stays indistinguishable; the worst it causes is a
+// SIGUSR1 to that tmux server, which only recreates its own socket, and then
+// a refusal, since the restored socket at path must answer with the signaled
+// pid. lsof escapes non-printable bytes with backslashes, which cannot be
+// compared reliably: such a name is an error only when its unescaped prefix
+// could still be one of paths, and is ignored otherwise.
 func lsofNameMatches(name string, paths []string) (bool, error) {
 	for _, path := range paths {
 		if name == path {
 			return true, nil
 		}
 		if rest, ok := strings.CutPrefix(name, path+" type="); ok {
-			kind, _, _ := strings.Cut(rest, " ")
-			if kind == "" || strings.Trim(kind, "ABCDEFGHIJKLMNOPQRSTUVWXYZ") != "" {
+			if !lsofStreamType(rest) {
 				return false, fmt.Errorf("socket name %q may be %s", name, path)
 			}
 			return true, nil
