@@ -1030,8 +1030,16 @@ func IsTimeoutError(err error) bool {
 // a top-level array; bd 1.0.5 may emit an object envelope with an issues array.
 // This prevents a single bad bead from breaking all list operations.
 func parseIssuesTolerant(data []byte) ([]bdIssue, error) {
+	issues, _, err := parseIssuesTolerantCounted(data)
+	return issues, err
+}
+
+// parseIssuesTolerantCounted is parseIssuesTolerant that also reports how
+// many rows the output held, decodable or not: rows bd hydrated and shipped
+// count toward a read's cost even when the store skips them.
+func parseIssuesTolerantCounted(data []byte) ([]bdIssue, int, error) {
 	if len(bytes.TrimSpace(data)) == 0 {
-		return nil, nil
+		return nil, 0, nil
 	}
 	raw, err := bdListIssueRows(data)
 	if err != nil {
@@ -1040,7 +1048,7 @@ func parseIssuesTolerant(data []byte) ([]bdIssue, error) {
 		// literal string "None" and the unwrapped error was the opaque
 		// "invalid character 'N' looking for beginning of value" with no
 		// hint that the offending byte was a Python None text.
-		return nil, fmt.Errorf("parsing JSON: raw=%q: %w", truncateRawOutput(data, 200), err)
+		return nil, 0, fmt.Errorf("parsing JSON: raw=%q: %w", truncateRawOutput(data, 200), err)
 	}
 	result := make([]bdIssue, 0, len(raw))
 	var parseErr error
@@ -1065,9 +1073,9 @@ func parseIssuesTolerant(data []byte) ([]bdIssue, error) {
 		if skipped == 1 {
 			beadNoun = "bead"
 		}
-		return result, fmt.Errorf("skipped %d corrupt %s: %w", skipped, beadNoun, parseErr)
+		return result, len(raw), fmt.Errorf("skipped %d corrupt %s: %w", skipped, beadNoun, parseErr)
 	}
-	return result, nil
+	return result, len(raw), nil
 }
 
 func bdListIssueRows(data []byte) ([]json.RawMessage, error) {
@@ -2949,7 +2957,7 @@ func (s *BdStore) listViaBDList(query ListQuery) ([]Bead, error) {
 	if err != nil {
 		return nil, fmt.Errorf("bd list: %w", err)
 	}
-	issues, parseErr := parseIssuesTolerant(extractJSON(out))
+	issues, returned, parseErr := parseIssuesTolerantCounted(extractJSON(out))
 	// Latched from what bd RETURNED, before applyListQuery: a store that
 	// answered with rows is the populated one, whatever this query's filters
 	// then reduce that to.
@@ -2960,6 +2968,7 @@ func (s *BdStore) listViaBDList(query ListQuery) ([]Bead, error) {
 	}
 	s.noteInlineDependencyProjection(issues, result)
 	filtered := applyListQuery(result, query)
+	TraceListRows(TraceSourceBDListRows, s.dir, args, returned, len(issues), len(filtered))
 	if parseErr != nil {
 		if len(filtered) == 0 {
 			return nil, fmt.Errorf("bd list: %w", parseErr)
@@ -3070,7 +3079,7 @@ func (s *BdStore) listEphemeral(query ListQuery) ([]Bead, error) {
 		}
 		return nil, fmt.Errorf("bd query (wisps): %w", err)
 	}
-	issues, parseErr := parseIssuesTolerant(extractJSON(out))
+	issues, returned, parseErr := parseIssuesTolerantCounted(extractJSON(out))
 	s.noteServerRows(len(issues))
 	result := make([]Bead, len(issues))
 	for i := range issues {
@@ -3080,6 +3089,7 @@ func (s *BdStore) listEphemeral(query ListQuery) ([]Bead, error) {
 	}
 	s.noteInlineDependencyProjection(issues, result)
 	filtered := applyListQuery(result, query)
+	TraceListRows(TraceSourceBDListRows, s.dir, args, returned, len(issues), len(filtered))
 	if parseErr != nil {
 		if len(filtered) > 0 {
 			return filtered, &PartialResultError{Op: "bd query", Err: parseErr}

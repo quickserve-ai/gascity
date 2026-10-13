@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2000,12 +2001,31 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
 		}
 		s.noteRows(len(issues))
 		out = ApplyListQuery(beads, query)
+		TraceListRows(TraceSourceNativeListRows, "", nativeListTraceArgs(query), len(issues), len(issues), len(out))
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+// nativeListTraceArgs names a native List read in the rows trace by the
+// filter terms it pushed to the backing search.
+func nativeListTraceArgs(query ListQuery) []string {
+	args := []string{"list", "tier=" + strconv.Itoa(int(query.TierMode))}
+	for _, term := range []struct{ field, value string }{
+		{"type", query.Type},
+		{"status", query.Status},
+		{"assignee", query.Assignee},
+		{"label", query.Label},
+		{"parent", query.ParentID},
+	} {
+		if term.value != "" {
+			args = append(args, term.field+"="+term.value)
+		}
+	}
+	return args
 }
 
 // ListOpen returns non-closed beads by default, or beads with the given status.

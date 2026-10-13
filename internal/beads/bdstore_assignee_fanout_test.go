@@ -1,9 +1,12 @@
 package beads_test
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -423,6 +426,117 @@ func TestBdStoreListWispsIDsReadsUnlimitedBeforeIDsFilter(t *testing.T) {
 	}
 	if want := []string{"w-wanted"}; !slices.Equal(fanoutIDs(got), want) {
 		t.Fatalf("List ids = %v, want %v (calls %v)", fanoutIDs(got), want, fake.snapshot())
+	}
+}
+
+// listRowsRecord is one TraceListRows record as the trace file holds it.
+type listRowsRecord struct {
+	Source  string   `json:"source"`
+	Args    []string `json:"args"`
+	Rows    *int     `json:"rows"`
+	Decoded *int     `json:"decoded"`
+	Kept    *int     `json:"kept"`
+}
+
+// readListRowsRecords returns the trace file's records from source.
+func readListRowsRecords(t *testing.T, trace, source string) []listRowsRecord {
+	t.Helper()
+	f, err := os.Open(trace)
+	if err != nil {
+		t.Fatalf("open trace: %v", err)
+	}
+	defer f.Close() //nolint:errcheck // test cleanup
+	var records []listRowsRecord
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		var rec listRowsRecord
+		if err := json.Unmarshal(sc.Bytes(), &rec); err != nil {
+			t.Fatalf("trace line %q: %v", sc.Text(), err)
+		}
+		if rec.Source != source {
+			continue
+		}
+		if rec.Rows == nil || rec.Decoded == nil || rec.Kept == nil {
+			t.Fatalf("record %+v lacks rows/decoded/kept", rec)
+		}
+		if len(rec.Args) == 0 {
+			t.Fatalf("record %+v lacks the bd args that name the read", rec)
+		}
+		records = append(records, rec)
+	}
+	return records
+}
+
+// Every bd read a list issues records how many rows bd returned, how many
+// decoded and how many the query kept, in the GC_BD_TRACE_JSON trace, so the
+// cost of an inbox read is measured rather than assumed.
+func TestBdStoreListTracesRowsPerRead(t *testing.T) {
+	trace := filepath.Join(t.TempDir(), "trace.jsonl")
+	t.Setenv("GC_BD_TRACE_JSON", trace)
+	fake := &predicatedBd{t: t, rows: []fanoutRow{
+		{ID: "a1", Assignee: "route-a", Priority: 2, Created: "2026-09-25T08:00:00Z", Ephemeral: true},
+		{ID: "a2", Assignee: "route-a", Priority: 2, Created: "2026-09-25T08:30:00Z", Ephemeral: true},
+		{ID: "b1", Assignee: "route-b", Priority: 2, Created: "2026-09-25T09:00:00Z", Ephemeral: true},
+	}}
+	s := beads.NewBdStore("/city", fake.runner)
+
+	got, err := s.List(mailShapedQuery("route-a", "route-b"))
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+
+	records := readListRowsRecords(t, trace, beads.TraceSourceBDListRows)
+	if len(records) != 4 {
+		t.Fatalf("got %d %s records, want 4 (two tiers x two routes): %+v", len(records), beads.TraceSourceBDListRows, records)
+	}
+	rows, decoded, kept := 0, 0, 0
+	for _, rec := range records {
+		rows += *rec.Rows
+		decoded += *rec.Decoded
+		kept += *rec.Kept
+	}
+	if rows != 3 || decoded != 3 {
+		t.Fatalf("rows/decoded across reads = %d/%d, want 3/3 (each route's own messages, nothing else)", rows, decoded)
+	}
+	if kept != len(got) {
+		t.Fatalf("kept across reads = %d, want %d (the rows List returned)", kept, len(got))
+	}
+}
+
+// A row bd returned but the store could not decode still counts as returned:
+// it was hydrated and shipped, so it is part of what the read cost. The
+// record keeps returned, decoded and kept apart.
+func TestBdStoreListTraceCountsUndecodedRows(t *testing.T) {
+	trace := filepath.Join(t.TempDir(), "trace.jsonl")
+	t.Setenv("GC_BD_TRACE_JSON", trace)
+	runner := func(_, _ string, args ...string) ([]byte, error) {
+		if len(args) > 0 && args[0] == "query" {
+			return []byte(`[{"id":"ok1","title":"m","status":"open","issue_type":"message","assignee":"route-a","priority":2,"created_at":"2026-09-25T08:00:00Z","ephemeral":true},{"id":"bad","priority":"oops"}]`), nil
+		}
+		return []byte(`[]`), nil
+	}
+	s := beads.NewBdStore("/city", runner)
+
+	got, err := s.List(beads.ListQuery{Assignee: "route-a", TierMode: beads.TierWisps})
+	var partial *beads.PartialResultError
+	if !errors.As(err, &partial) {
+		t.Fatalf("List err = %v, want a PartialResultError for the undecodable row", err)
+	}
+	if want := []string{"ok1"}; !slices.Equal(fanoutIDs(got), want) {
+		t.Fatalf("List ids = %v, want %v", fanoutIDs(got), want)
+	}
+
+	var query *listRowsRecord
+	for _, rec := range readListRowsRecords(t, trace, beads.TraceSourceBDListRows) {
+		if rec.Args[0] == "query" {
+			query = &rec
+		}
+	}
+	if query == nil {
+		t.Fatal("no rows record for the bd query read")
+	}
+	if *query.Rows != 2 || *query.Decoded != 1 || *query.Kept != 1 {
+		t.Fatalf("bd query record rows/decoded/kept = %d/%d/%d, want 2/1/1", *query.Rows, *query.Decoded, *query.Kept)
 	}
 }
 
