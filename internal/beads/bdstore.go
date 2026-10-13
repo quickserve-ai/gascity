@@ -3185,25 +3185,66 @@ func isBdQueryUnsupported(err error) bool {
 }
 
 func canApplyWispsServerLimit(query ListQuery) bool {
+	// Sort: the wisp query passes bd no --sort, so bd cuts --limit in its own
+	// default order (priority ASC, created_at DESC, id ASC). Only SortDefault
+	// asks for that order; under any other sort a bd-side limit keeps the
+	// wrong rows (a newest-first read would keep an old P0 over a newer P2),
+	// and the client-side sort cannot recover rows bd never returned.
 	// SeekAfter: the compound (created_at, id) boundary is resolved Go-side
 	// (identical tie-break to the in-memory sort), not via a bd query flag, so
 	// a bd-side limit would cut rows before that filter runs — same class as
-	// CreatedBefore.
-	return (query.Sort == SortDefault || query.Sort == SortCreatedDesc) &&
+	// CreatedBefore. IDs: also matched only Go-side (no bd query clause), so a
+	// bd-side limit could cut the wanted rows before that filter runs.
+	return query.Sort == SortDefault &&
 		query.CreatedBefore.IsZero() &&
 		query.UpdatedBefore.IsZero() &&
 		len(query.Metadata) == 0 &&
+		len(query.IDs) == 0 &&
 		query.SeekAfter == nil
 }
 
+// appendBdQueryClause adds field=value to a bd query expression. A value
+// outside the bare-token set goes in as a quoted string: dropping it instead
+// would leave the read unpredicated on that field, a scan of every row the
+// remaining clauses select — and route spellings like "rig/agent" are the
+// values mail reads filter on. Only the values bd's DSL reads as "no
+// assignee/label" (none, null) cannot be expressed as a predicate for a
+// literal value; those stay client-side filters and the read reports it is
+// not server-filtered only.
 func appendBdQueryClause(clauses []string, serverFilteredOnly bool, field, value string) ([]string, bool) {
 	if value == "" {
 		return clauses, serverFilteredOnly
 	}
-	if !isBareBdQueryValue(value) {
+	if isBdQueryEmptinessValue(value) {
 		return clauses, false
 	}
+	if !isBareBdQueryValue(value) {
+		value = quoteBdQueryValue(value)
+	}
 	return append(clauses, field+"="+value), serverFilteredOnly
+}
+
+// isBdQueryEmptinessValue reports whether bd's query DSL reads value as the
+// "unset" sentinel (assignee=none, label=null) rather than as a literal.
+func isBdQueryEmptinessValue(value string) bool {
+	return strings.EqualFold(value, "none") || strings.EqualFold(value, "null")
+}
+
+// quoteBdQueryValue renders value as a bd query DSL string literal: double
+// quotes, with backslash and double quote escaped the way bd's lexer reads
+// them back.
+func quoteBdQueryValue(value string) string {
+	var sb strings.Builder
+	sb.Grow(len(value) + 2)
+	sb.WriteByte('"')
+	for i := 0; i < len(value); i++ {
+		if value[i] == '"' || value[i] == '\\' {
+			sb.WriteByte('\\')
+		}
+		sb.WriteByte(value[i])
+	}
+	sb.WriteByte('"')
+	return sb.String()
 }
 
 func isBareBdQueryValue(value string) bool {

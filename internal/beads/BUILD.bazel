@@ -47,6 +47,7 @@ go_test(
         "atomic_close_memstore_test.go",
         "awaittype_roundtrip_test.go",
         "bdsql_relocation_internal_test.go",
+        "bdstore_assignee_fanout_test.go",
         "bdstore_batch_test.go",
         "bdstore_blocked_repair_test.go",
         "bdstore_conditional_integration_bridge_test.go",
