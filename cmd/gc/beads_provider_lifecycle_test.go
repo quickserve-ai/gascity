@@ -24,6 +24,7 @@ import (
 	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/fsys"
+	"github.com/gastownhall/gascity/internal/pidutil"
 	"gopkg.in/yaml.v3"
 )
 
@@ -10617,6 +10618,12 @@ case "${1:-}" in
     done
     port=$(awk '/port:/ {print $2; exit}' "$config_file")
     data_dir=$(awk '/data_dir:/ {print $2; exit}' "$config_file" | tr -d '"')
+    # Every record this fake will write is written: release the gc-beads-bd
+    # completion pipe (newGcBeadsBdDescendantsDoneForTest) before turning into
+    # a long-lived server, so the test's wait ends here rather than at exit.
+    if [ -n "${GC_FAKE_DOLT_DONE_FD:-}" ]; then
+      eval "exec ${GC_FAKE_DOLT_DONE_FD}>&-"
+    fi
     exec python3 - "$port" "$data_dir" <<'INNERPY'
 import os
 import signal
@@ -10808,8 +10815,10 @@ while [ ! -f "$release_file" ]; do
 		"GC_FAKE_DOLT_INVOCATION_FILE="+invocationFile,
 		"PATH="+strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
 	)
+	doneFD, waitDescendants := newGcBeadsBdDescendantsDoneForTest(t)
 	cmd := exec.Command(script, "start")
 	cmd.Env = env
+	cmd.ExtraFiles = []*os.File{doneFD}
 	out, err := cmd.CombinedOutput()
 	exitCode := 0
 	if err != nil {
@@ -10835,6 +10844,13 @@ while [ ! -f "$release_file" ]; do
 	afterInode := inodeFor(layout.LockFile)
 	if afterInode != beforeInode {
 		t.Fatalf("lock inode changed from %d to %d while original holder was still live", beforeInode, afterInode)
+	}
+	// A launched dolt is backgrounded and may write its invocation after the
+	// script exits; the read below happens only once every process the
+	// script forked has released the completion pipe.
+	if waitErr := waitDescendants(gcBeadsBdDescendantsDoneTimeoutForTest); waitErr != nil {
+		invocation, _ := os.ReadFile(invocationFile)
+		t.Fatalf("%v (a dolt launched while the start lock was held would keep it); dolt invocations:\n%s", waitErr, invocation)
 	}
 	if invocation, err := os.ReadFile(invocationFile); err == nil && strings.TrimSpace(string(invocation)) != "" {
 		t.Fatalf("dolt should not have been invoked while the start lock was held:\n%s", string(invocation))
@@ -11083,8 +11099,10 @@ printf 'sleep %%s\n' "$1" >> "$invocation_file"
 		"GC_FAKE_DOLT_INVOCATION_FILE="+invokedDolt,
 		"PATH="+strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
 	)
+	doneFD, waitDescendants := newGcBeadsBdDescendantsDoneForTest(t)
 	cmd := exec.Command(script, "start")
 	cmd.Env = env
+	cmd.ExtraFiles = []*os.File{doneFD}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("gc-beads-bd start failed while concurrent starter was making progress: %v\n%s", err, out)
@@ -11118,6 +11136,12 @@ printf 'sleep %%s\n' "$1" >> "$invocation_file"
 	}
 	if got, want := string(mustReadFile(t, sleepInvocationFile)), strings.Repeat("sleep 0.5\n", 6)+"sleep 0.500\n"; got != want {
 		t.Fatalf("sleep transcript = %q, want %q", got, want)
+	}
+	// A launched dolt is backgrounded and may write its invocation after the
+	// script exits; the read below happens only once every process the
+	// script forked has released the completion pipe.
+	if waitErr := waitDescendants(gcBeadsBdDescendantsDoneTimeoutForTest); waitErr != nil {
+		t.Fatalf("gc-beads-bd start: %v\n%s", waitErr, out)
 	}
 	if invocation, err := os.ReadFile(invokedDolt); err == nil && strings.TrimSpace(string(invocation)) != "" {
 		t.Fatalf("dolt should not have been invoked while concurrent starter won:\n%s", string(invocation))
@@ -11385,8 +11409,10 @@ exec sleep 60
 		"GC_FAKE_DOLT_INVOCATION_FILE="+invokedDolt,
 		"PATH="+strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
 	)
+	doneFD, waitDescendants := newGcBeadsBdDescendantsDoneForTest(t)
 	cmd := exec.Command(script, "start")
 	cmd.Env = env
+	cmd.ExtraFiles = []*os.File{doneFD}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("gc-beads-bd start failed while slow concurrent starter was making progress: %v\n%s", err, out)
@@ -11397,6 +11423,12 @@ exec sleep 60
 	}
 	if elapsed := readyAt - 1000000; elapsed <= 10000 || elapsed >= 12000 {
 		t.Fatalf("concurrent starter became ready after %dms, want more than 10000ms and less than the 12000ms deadline", elapsed)
+	}
+	// A launched dolt is backgrounded and may write its invocation after the
+	// script exits; the read below happens only once every process the
+	// script forked has released the completion pipe.
+	if waitErr := waitDescendants(gcBeadsBdDescendantsDoneTimeoutForTest); waitErr != nil {
+		t.Fatalf("gc-beads-bd start: %v\n%s", waitErr, out)
 	}
 	if invocation, err := os.ReadFile(invokedDolt); err == nil && strings.TrimSpace(string(invocation)) != "" {
 		t.Fatalf("dolt should not have been invoked while concurrent starter won:\n%s", string(invocation))
@@ -11729,15 +11761,27 @@ func runGcBeadsBdStartWithFakeGCForTest(t *testing.T, extraEnv ...string) (strin
 		"GC_BIN=" + fakeGC,
 		"GC_FAKE_DOLT_FAIL_SQL_SERVER=true",
 		"GC_FAKE_DOLT_PID_FILE=" + doltPIDFile,
+		gcBeadsBdDoneFDEnvForTest,
 		"PATH=" + strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
 	}, extraEnv...)...)
-	out, err := runGcBeadsBdOpForTest(script, env, "start")
+	doneFD, waitDescendants := newGcBeadsBdDescendantsDoneForTest(t)
+	out, err := runGcBeadsBdOpWithDoneFDForTest(script, env, "start", doneFD)
 	t.Cleanup(func() {
 		_, _ = runGcBeadsBdOpForTest(script, env, "stop")
 		// The fake gc's stop-managed is a no-op, so a bare-started fake
 		// server would outlive the test.
-		killFakeDoltServersForTest(doltPIDFile)
+		killFakeDoltServersForTest(doltPIDFile, cityPath)
 	})
+	// The bare start backgrounds `dolt sql-server` and the script can exit
+	// before that child has written anything. Wait until the script and every
+	// process it forked have released the completion pipe, so the callers'
+	// reads of the dolt log (an "unexpected dolt sql-server invocation" line
+	// must be absent) and the cleanup's read of the pid file see every record
+	// a launched fake will ever write.
+	if waitErr := waitDescendants(gcBeadsBdDescendantsDoneTimeoutForTest); waitErr != nil {
+		logData, _ := os.ReadFile(filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt-from-gc", "dolt.log"))
+		t.Fatalf("gc-beads-bd start: %v\nstart output:\n%s\ndolt log:\n%s", waitErr, out, logData)
+	}
 	invocation, _ := os.ReadFile(invocationFile)
 	logFile := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt-from-gc", "dolt.log")
 	return out, string(invocation), logFile, err
@@ -11748,22 +11792,102 @@ func runGcBeadsBdStartWithFakeGCForTest(t *testing.T, extraEnv ...string) (strin
 // subprocess census carries one call site instead of a start and a stop per
 // test.
 func runGcBeadsBdOpForTest(script string, env []string, op string) (string, error) {
+	return runGcBeadsBdOpWithDoneFDForTest(script, env, op, nil)
+}
+
+// runGcBeadsBdOpWithDoneFDForTest is runGcBeadsBdOpForTest with doneFD, the
+// write end from newGcBeadsBdDescendantsDoneForTest, inherited as fd 3 (nil
+// passes no extra fd).
+func runGcBeadsBdOpWithDoneFDForTest(script string, env []string, op string, doneFD *os.File) (string, error) {
 	cmd := exec.Command(script, op)
 	cmd.Env = env
+	if doneFD != nil {
+		cmd.ExtraFiles = []*os.File{doneFD}
+	}
 	out, err := cmd.CombinedOutput()
 	return string(out), err
 }
 
+// gcBeadsBdDoneFDEnvForTest names the inherited completion fd for the fake
+// dolt from writeFakeManagedConfigWriterDolt, which closes it once it has
+// written every record and before it turns into a long-lived server. The fd
+// is 3 because it is the first ExtraFiles entry.
+const gcBeadsBdDoneFDEnvForTest = "GC_FAKE_DOLT_DONE_FD=3"
+
+// gcBeadsBdDescendantsDoneTimeoutForTest is the safety deadline for a
+// gc-beads-bd run's descendants to release the completion pipe: the package
+// hang budget (TESTING.md "Test deadline rule"), since the wait only detects a
+// hang. It does not set the normal duration: the pipe reaches EOF as soon as
+// the last holder exits or closes it.
+const gcBeadsBdDescendantsDoneTimeoutForTest = hangBudget
+
+// newGcBeadsBdDescendantsDoneForTest returns the write end of a pipe to hand
+// a gc-beads-bd run as its fd 3 (cmd.ExtraFiles[0]) and a wait func. The
+// script and every process it forks inherit fd 3, including a
+// `nohup dolt sql-server &` the script backgrounds and does not wait for, so
+// the read end reaches EOF only after each of them has exited or closed it.
+// A fake dolt therefore holds the pipe until it has written its records (or
+// for as long as it runs), and after wait returns an absent record is an
+// observation rather than a read that beat the child. wait first closes the
+// parent's copy of the write end, then blocks until EOF or timeout; it may be
+// called more than once. A path that runs the script's run_with_timeout leaves
+// its watchdog's sleep holding fd 3 until that timeout runs out (2 s for the
+// lsof probe under a stripped GC_* environment; 30 s or 600 s on the journal
+// recovery paths), so a test that reaches recovery must not hand out the pipe.
+func newGcBeadsBdDescendantsDoneForTest(t *testing.T) (*os.File, func(timeout time.Duration) error) {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create gc-beads-bd completion pipe: %v", err)
+	}
+	done := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(io.Discard, r)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		_ = w.Close()
+		_ = r.Close()
+	})
+	return w, func(timeout time.Duration) error {
+		_ = w.Close()
+		select {
+		case <-done:
+			return nil
+		case <-time.After(timeout):
+			return fmt.Errorf("a gc-beads-bd descendant still held the completion pipe (fd 3) after %s", timeout)
+		}
+	}
+}
+
 // killFakeDoltServersForTest kills every fake dolt sql-server that recorded
-// its own pid in pidFile (GC_FAKE_DOLT_PID_FILE). Only pids the fake wrote are
-// signaled.
-func killFakeDoltServersForTest(pidFile string) {
+// its own pid in pidFile (GC_FAKE_DOLT_PID_FILE) and is still that fake.
+// Callers first wait on the run's completion pipe, so the pid file already
+// holds every pid a launched fake will write. A pid is signaled only while its
+// argv still names a path under owner (the fake's --config path, then the
+// python server's data dir, both live under the test's city), so a pid the
+// fake released and the system reused is left alone.
+func killFakeDoltServersForTest(pidFile, owner string) {
 	data, err := os.ReadFile(pidFile)
 	if err != nil {
 		return
 	}
+	owners := []string{owner}
+	if resolved, resolveErr := filepath.EvalSymlinks(owner); resolveErr == nil && resolved != owner {
+		owners = append(owners, resolved)
+	}
+	stillTheFake := func(argv []string) bool {
+		for _, arg := range argv {
+			for _, prefix := range owners {
+				if strings.HasPrefix(arg, prefix+string(os.PathSeparator)) {
+					return true
+				}
+			}
+		}
+		return false
+	}
 	for _, field := range strings.Fields(string(data)) {
-		if pid, convErr := strconv.Atoi(field); convErr == nil && pid > 1 {
+		if pid, convErr := strconv.Atoi(field); convErr == nil && pid > 1 && pidutil.AliveWithCmdline(pid, stillTheFake) {
 			_ = syscall.Kill(pid, syscall.SIGKILL)
 		}
 	}
@@ -11906,13 +12030,20 @@ func TestGcBeadsBdStartWithoutHelperWarnsNoScopeWatchdog(t *testing.T) {
 		"GC_CITY_PATH="+cityPath,
 		"GC_DOLT_PORT="+strconv.Itoa(port),
 		"GC_FAKE_DOLT_PID_FILE="+doltPIDFile,
+		gcBeadsBdDoneFDEnvForTest,
 		"PATH="+strings.Join([]string{binDir, os.Getenv("PATH")}, string(os.PathListSeparator)),
 	)
-	out, err := runGcBeadsBdOpForTest(script, env, "start")
+	doneFD, waitDescendants := newGcBeadsBdDescendantsDoneForTest(t)
+	out, err := runGcBeadsBdOpWithDoneFDForTest(script, env, "start", doneFD)
 	t.Cleanup(func() {
 		_, _ = runGcBeadsBdOpForTest(script, env, "stop")
-		killFakeDoltServersForTest(doltPIDFile)
+		killFakeDoltServersForTest(doltPIDFile, cityPath)
 	})
+	// The fake server is backgrounded; wait until it has recorded its pid
+	// (and released the completion pipe) so cleanup kills it.
+	if waitErr := waitDescendants(gcBeadsBdDescendantsDoneTimeoutForTest); waitErr != nil {
+		t.Fatalf("gc-beads-bd start without a helper: %v\n%s", waitErr, out)
+	}
 	if err != nil {
 		t.Fatalf("gc-beads-bd start without a helper failed: %v\n%s", err, out)
 	}
