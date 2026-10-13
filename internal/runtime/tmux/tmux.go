@@ -3774,7 +3774,7 @@ func dismissFeedbackSurveyModal(capture func() (string, error), attached func() 
 	}
 	sleep(feedbackSurveyMountGuard)
 	content, err := capture()
-	if err != nil || !runtime.ContainsFeedbackSurveyModal(content) {
+	if err != nil || !feedbackSurveyLive(content) {
 		return nil
 	}
 	if composer, observed := feedbackSurveyComposer(content); !observed || composer != "" {
@@ -3820,6 +3820,35 @@ func awaitFeedbackSurveyDigit(capture func() (string, error), sleep func(time.Du
 		return "", false, errFeedbackSurveyDigitUnresolved
 	}
 	return composer, surveyGone, nil
+}
+
+// feedbackSurveyLive reports whether the feedback survey is the live block of
+// content: Claude Code draws a live survey directly above the composer, so
+// walking up from the last composer line past blank lines and the composer's
+// own border or rule, the first line must be the survey's option row. A row
+// still on screen with a later turn's output under it is history, and keying
+// "0" at it types into an idle composer on every delivery attempt
+// (ga-da5vmz).
+func feedbackSurveyLive(content string) bool {
+	lines := strings.Split(content, "\n")
+	ci, _ := lastComposerLine(lines, DefaultReadyPromptPrefix)
+	if ci < 0 {
+		return false
+	}
+	for i := ci - 1; i >= 0; i-- {
+		s := strings.TrimSpace(lines[i])
+		if s == "" || isComposerEdge(s) {
+			continue
+		}
+		return runtime.ContainsFeedbackSurveyModal(lines[i])
+	}
+	return false
+}
+
+// isComposerEdge reports whether a trimmed line is a border Claude Code draws
+// around its composer: a horizontal rule, or a box's top or bottom edge.
+func isComposerEdge(s string) bool {
+	return utf8.RuneCountInString(s) >= 8 && strings.Trim(s, "─━╭╮╰╯") == ""
 }
 
 func feedbackSurveyComposer(content string) (string, bool) {
@@ -3892,7 +3921,7 @@ func (t *Tmux) DismissFeedbackSurveyModalIfPresent(session string) error {
 		return err != nil || attached
 	}
 	content, err := capture()
-	if err != nil || !runtime.ContainsFeedbackSurveyModal(content) {
+	if err != nil || !feedbackSurveyLive(content) {
 		return nil
 	}
 	return dismissFeedbackSurveyModal(capture, attached, sendKeys, time.Sleep)
