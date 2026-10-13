@@ -58,16 +58,20 @@ type scopeOwnershipDoc struct {
 }
 
 type doctorReport struct {
-	Passed  int                 `json:"passed"`
-	Warned  int                 `json:"warned"`
-	Failed  int                 `json:"failed"`
-	Results []doctorCheckResult `json:"results"`
+	Passed         int                 `json:"passed"`
+	Warned         int                 `json:"warned"`
+	Failed         int                 `json:"failed"`
+	BlockingFailed int                 `json:"blocking_failed"`
+	Results        []doctorCheckResult `json:"results"`
 }
 
 type doctorCheckResult struct {
-	Name    string `json:"name"`
-	Status  string `json:"status"`
-	Message string `json:"message"`
+	Name     string `json:"name"`
+	Status   string `json:"status"`
+	Severity string `json:"severity"`
+	Message  string `json:"message"`
+	// TimedOut marks a check doctor abandoned: its outcome is unknown.
+	TimedOut bool `json:"timed_out,omitempty"`
 	// Details are the check's supporting lines; proxied-backup-coverage
 	// lists each scope it found backed up here.
 	Details []string `json:"details,omitempty"`
@@ -322,6 +326,62 @@ func beadsTopologyCheck(name string) bool {
 	return strings.HasPrefix(name, "custom-types")
 }
 
+// schedulerLagOnly reports whether the run's ONLY blocking failure is the test
+// city's own order scheduler running late: order-firing-current in error, not
+// timed out, and every line it flags an age ("last fired 3m ago, expected
+// every 1m (CRITICAL: stale)"). That is a loaded CI runner missing 1-minute
+// ticks (ga-l0b72a.9: #271 run 38317797049 failed three proxied tests on
+// "dolt-health: last fired 2m ago ... CRITICAL: stale" and passed on rerun).
+// A lookup timeout, a never-fired order, an unreadable history, or any other
+// failing check is NOT lag and stays fatal: those are the defects this
+// assertion has caught before (see assertDoctorGreen).
+func schedulerLagOnly(report doctorReport) bool {
+	if report.BlockingFailed != 1 {
+		return false
+	}
+	lagged := false
+	for _, r := range report.Results {
+		if r.Status != "error" || r.Severity == "advisory" {
+			continue
+		}
+		if r.Name != "order-firing-current" || r.TimedOut {
+			return false
+		}
+		for _, d := range r.Details {
+			switch {
+			case strings.Contains(d, "never fired"), strings.Contains(d, "cannot "), strings.Contains(d, "timed out"):
+				return false
+			case strings.Contains(d, " ago, expected every ") && strings.HasSuffix(d, "(CRITICAL: stale)"):
+				lagged = true
+			}
+		}
+	}
+	return lagged
+}
+
+// doctorJSONAllowingSchedulerLag runs `gc doctor --json` and fails the test on
+// a non-zero exit unless schedulerLagOnly says the only blocking failure is the
+// test city's scheduler running late, which it logs. It returns the parsed
+// report and the raw output.
+func doctorJSONAllowingSchedulerLag(t *testing.T, city *helpers.City, label string) (doctorReport, string) {
+	t.Helper()
+	out, err := city.GC("doctor", "--json")
+	var report doctorReport
+	lastJSONLine(t, out, &report)
+	if err != nil {
+		if !schedulerLagOnly(report) {
+			t.Fatalf("gc doctor --json exited non-zero on %s: %v\n%s", label, err, out)
+		}
+		for _, r := range report.Results {
+			if r.Name == "order-firing-current" {
+				t.Logf("tolerated on %s: order-firing-current %s (%s): the test city's scheduler ran late on this runner, not a topology fault",
+					label, r.Message, strings.Join(r.Details, "; "))
+			}
+		}
+	}
+	return report, out
+}
+
 // assertDoctorGreen runs the real `gc doctor --json` front door and requires
 // exit 0, zero failures anywhere, and zero warnings from any check whose
 // subject is the bead store's topology.
@@ -338,12 +398,7 @@ func beadsTopologyCheck(name string) bool {
 // a doctor report nobody can get to zero is a doctor report nobody reads.
 func assertDoctorGreen(t *testing.T, city *helpers.City, label string) {
 	t.Helper()
-	out, err := city.GC("doctor", "--json")
-	var report doctorReport
-	lastJSONLine(t, out, &report)
-	if err != nil {
-		t.Fatalf("gc doctor --json exited non-zero on %s: %v\n%s", label, err, out)
-	}
+	report, _ := doctorJSONAllowingSchedulerLag(t, city, label)
 	topologyWarnings := 0
 	for _, r := range report.Results {
 		if r.Status == "ok" {
@@ -354,9 +409,13 @@ func assertDoctorGreen(t *testing.T, city *helpers.City, label string) {
 			topologyWarnings++
 		}
 	}
-	if report.Failed != 0 || topologyWarnings != 0 {
+	failed := report.Failed
+	if schedulerLagOnly(report) {
+		failed-- // the one tolerated order-firing-current result, logged by the helper
+	}
+	if failed != 0 || topologyWarnings != 0 {
 		t.Fatalf("gc doctor on %s reported %d failure(s) and %d bead-topology warning(s), want none",
-			label, report.Failed, topologyWarnings)
+			label, failed, topologyWarnings)
 	}
 	for _, r := range report.Results {
 		switch r.Name {
@@ -950,9 +1009,7 @@ func TestBeadsProxiedDefaultInit(t *testing.T) {
 		// attributable rather than cumulative. `gc doctor --json` on a healthy
 		// proxied city is the read-only shape PR2's budget is stated against.
 		bdCalls.Reset()
-		if out, err := p.city.GC("doctor", "--json"); err != nil {
-			t.Fatalf("gc doctor --json: %v\n%s", err, out)
-		}
+		doctorJSONAllowingSchedulerLag(t, p.city, "a 0-rig proxied city")
 		t.Logf("gc doctor --json on a 0-rig proxied city: %d bd fork(s), %d ping(s)\n%s",
 			bdCalls.Count(), bdCalls.Count("ping"), bdCalls.Describe())
 	})
