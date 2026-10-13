@@ -1,9 +1,12 @@
 package beads_test
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -342,6 +345,63 @@ func TestBdStoreListWispsKeepsNoneValueClientSide(t *testing.T) {
 	query := firstCommandWithPrefix(fake.snapshot(), "bd query ")
 	if strings.Contains(strings.ToLower(query), "assignee=") {
 		t.Fatalf("query cmd = %q, a none/null value must not become a bd predicate", query)
+	}
+}
+
+// Every bd read a list issues records how many rows bd returned and how many
+// the query kept, in the GC_BD_TRACE_JSON trace, so the cost of an inbox read
+// is measured rather than assumed.
+func TestBdStoreListTracesRowsPerRead(t *testing.T) {
+	trace := filepath.Join(t.TempDir(), "trace.jsonl")
+	t.Setenv("GC_BD_TRACE_JSON", trace)
+	fake := &predicatedBd{t: t, rows: []fanoutRow{
+		{ID: "a1", Assignee: "route-a", Priority: 2, Created: "2026-09-25T08:00:00Z", Ephemeral: true},
+		{ID: "a2", Assignee: "route-a", Priority: 2, Created: "2026-09-25T08:30:00Z", Ephemeral: true},
+		{ID: "b1", Assignee: "route-b", Priority: 2, Created: "2026-09-25T09:00:00Z", Ephemeral: true},
+	}}
+	s := beads.NewBdStore("/city", fake.runner)
+
+	if _, err := s.List(mailShapedQuery("route-a", "route-b")); err != nil {
+		t.Fatalf("List: %v", err)
+	}
+
+	f, err := os.Open(trace)
+	if err != nil {
+		t.Fatalf("open trace: %v", err)
+	}
+	defer f.Close() //nolint:errcheck // test cleanup
+	type rowsRecord struct {
+		Source string   `json:"source"`
+		Args   []string `json:"args"`
+		Rows   *int     `json:"rows"`
+		Kept   *int     `json:"kept"`
+	}
+	var records []rowsRecord
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		var rec rowsRecord
+		if err := json.Unmarshal(sc.Bytes(), &rec); err != nil {
+			t.Fatalf("trace line %q: %v", sc.Text(), err)
+		}
+		if rec.Source == beads.TraceSourceBDListRows {
+			records = append(records, rec)
+		}
+	}
+	if len(records) != 4 {
+		t.Fatalf("got %d %s records, want 4 (two tiers x two routes): %+v", len(records), beads.TraceSourceBDListRows, records)
+	}
+	total := 0
+	for _, rec := range records {
+		if rec.Rows == nil || rec.Kept == nil {
+			t.Fatalf("record %+v lacks rows/kept", rec)
+		}
+		if len(rec.Args) == 0 {
+			t.Fatalf("record %+v lacks the bd args that name the read", rec)
+		}
+		total += *rec.Rows
+	}
+	if total != 3 {
+		t.Fatalf("rows returned across reads = %d, want 3 (each route's own messages, nothing else)", total)
 	}
 }
 
