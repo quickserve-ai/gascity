@@ -102,6 +102,7 @@ go_test(
         "secretenv_integration_test.go",
         "secretenv_test.go",
         "server_probe_test.go",
+        "server_socket_revive_test.go",
         "session_env_file_integration_test.go",
         "session_env_file_test.go",
         "session_object_integration_test.go",
