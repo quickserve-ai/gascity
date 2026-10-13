@@ -32,6 +32,7 @@ type fakeCleanupDoltClient struct {
 	liveSessionsErr error
 	probeCalls      int
 	listCalls       int
+	closeCalls      int
 }
 
 func (f *fakeCleanupDoltClient) ListDatabases(_ context.Context) ([]string, error) {
@@ -74,7 +75,10 @@ func (f *fakeCleanupDoltClient) ProbeLiveSessions(_ context.Context) (map[string
 	return out, nil
 }
 
-func (f *fakeCleanupDoltClient) Close() error { return nil }
+func (f *fakeCleanupDoltClient) Close() error {
+	f.closeCalls++
+	return nil
+}
 
 func TestRunDoltCleanup_DryRunEnumeratesDropCandidatesWithoutDropping(t *testing.T) {
 	client := &fakeCleanupDoltClient{

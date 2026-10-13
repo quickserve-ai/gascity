@@ -291,9 +291,10 @@ type cleanupOptions struct {
 // CleanupReport JSON envelope or a human-readable summary to stdout.
 // Returns the exit code.
 //
-// Drop and purge stages are populated when a Dolt SQL client is available;
-// otherwise the report still renders with errors describing the unreachable
-// data plane.
+// Drop and purge stages are populated when a Dolt SQL client is available
+// and the port did not fall back to the legacy default; otherwise the report
+// still renders, with errors describing the unreachable data plane or with
+// the legacy-fallback-port force blocker.
 func runDoltCleanup(opts cleanupOptions, stdout, stderr io.Writer) int {
 	if opts.MaxOrphanDBs < 0 {
 		report := CleanupReport{Schema: CleanupSchemaVersion}
@@ -836,8 +837,12 @@ func emitHumanReport(report CleanupReport, resolution PortResolution, opts clean
 	emitForceBlockersSection(report, stdout)
 	emitErrorsOrSummary(report, opts, stdout)
 	if !opts.Force {
-		fmt.Fprintln(stdout, "")                              //nolint:errcheck
-		fmt.Fprintln(stdout, "Re-run with --force to apply.") //nolint:errcheck
+		fmt.Fprintln(stdout, "") //nolint:errcheck
+		if report.Port.Fallback {
+			fmt.Fprintln(stdout, "--force is refused on the legacy fallback port; see FORCE BLOCKERS above.") //nolint:errcheck
+		} else {
+			fmt.Fprintln(stdout, "Re-run with --force to apply.") //nolint:errcheck
+		}
 	}
 }
 
@@ -845,7 +850,11 @@ func emitDroppedSection(report CleanupReport, stdout io.Writer) {
 	fmt.Fprintln(stdout, "")                                                         //nolint:errcheck
 	fmt.Fprintf(stdout, "DROPPED-DATABASE DIRECTORIES (%d)\n", report.Dropped.Count) //nolint:errcheck
 	if len(report.Dropped.Names) == 0 {
-		fmt.Fprintln(stdout, "  (none)") //nolint:errcheck
+		if report.Port.Fallback {
+			fmt.Fprintln(stdout, "  (not scanned: legacy fallback port)") //nolint:errcheck
+		} else {
+			fmt.Fprintln(stdout, "  (none)") //nolint:errcheck
+		}
 		return
 	}
 	for _, name := range report.Dropped.Names {
@@ -950,9 +959,12 @@ func emitErrorsOrSummary(report CleanupReport, opts cleanupOptions, stdout io.Wr
 	fmt.Fprintf(stdout, "  Drops:         %d (failed: %d)\n", report.Dropped.Count, len(report.Dropped.Failed)) //nolint:errcheck
 	purgeStatus := "skipped"
 	if opts.Force {
-		if report.Purge.OK {
+		switch {
+		case report.Port.Fallback:
+			purgeStatus = "refused"
+		case report.Purge.OK:
 			purgeStatus = "ok"
-		} else {
+		default:
 			purgeStatus = "failed"
 		}
 	}
@@ -1167,27 +1179,12 @@ can still return successfully after emitting the report.`,
 			}
 
 			// Resolve the port first so we can open a Dolt connection at the
-			// right address. Failed opens are reported by runDoltCleanup inside
-			// the typed cleanup envelope. A legacy-fallback port is not
-			// provably this city's server, so no connection is opened there;
-			// runDoltCleanup reports the refusal as a force blocker.
-			resolution := ResolveDoltPort(PortResolverInput{
+			// right address.
+			opts.PortResolution = ResolveDoltPort(PortResolverInput{
 				Flag: opts.Flag, CityPort: opts.CityPort, CityPath: opts.CityPath,
 			})
-			opts.PortResolution = resolution
-			host := opts.Host
-			if host == "" {
-				host = "127.0.0.1"
-			}
-			if fatalPortResolutionError(resolution) == nil && !resolution.Fallback {
-				client, openErr := newSQLCleanupDoltClient(cityPath, host, strconv.Itoa(resolution.Port))
-				if openErr != nil {
-					opts.DoltClientOpenErr = openErr
-				} else {
-					opts.DoltClient = client
-					defer client.Close() //nolint:errcheck
-				}
-			}
+			closeDoltClient := attachCleanupDoltClient(&opts, newSQLCleanupDoltClient)
+			defer closeDoltClient()
 
 			if code := runDoltCleanup(opts, stdout, stderr); code != 0 {
 				return errExit
@@ -1201,6 +1198,38 @@ can still return successfully after emitting the report.`,
 	cmd.Flags().BoolVar(&force, "force", false, "actually drop, purge, and kill orphaned resources (default: dry-run)")
 	cmd.Flags().IntVar(&maxOrphanDBs, "max-orphan-dbs", 0, "with --force, refuse cleanup when live stale database count exceeds this limit")
 	return cmd
+}
+
+// cleanupDoltClientOpener opens the SQL client for the drop and purge stages
+// against a resolved Dolt server. Production passes newSQLCleanupDoltClient.
+type cleanupDoltClientOpener func(cityPath, host, port string) (CleanupDoltClient, error)
+
+// attachCleanupDoltClient opens a Dolt connection at opts.PortResolution and
+// attaches the client to opts for the drop and purge stages. Failed opens are
+// recorded as opts.DoltClientOpenErr and reported by runDoltCleanup inside the
+// typed cleanup envelope. A fatal resolution opens nothing: runDoltCleanup
+// fails closed on it before any stage runs. A legacy-fallback port is not
+// provably this city's server, so no connection is opened there;
+// runDoltCleanup reports the refusal as a force blocker.
+//
+// The returned func closes the attached client and is a no-op when none was
+// attached, so the caller can defer it unconditionally.
+func attachCleanupDoltClient(opts *cleanupOptions, open cleanupDoltClientOpener) func() {
+	resolution := opts.PortResolution
+	if fatalPortResolutionError(resolution) != nil || resolution.Fallback {
+		return func() {}
+	}
+	host := opts.Host
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	client, err := open(opts.CityPath, host, strconv.Itoa(resolution.Port))
+	if err != nil {
+		opts.DoltClientOpenErr = err
+		return func() {}
+	}
+	opts.DoltClient = client
+	return func() { _ = client.Close() }
 }
 
 // rigProtections projects the resolver's rig list into the JSON-envelope
