@@ -23,6 +23,7 @@ type reviveFixture struct {
 	postSignal  []int // owners once restored (nil: servers)
 	findErr     error
 	restores    bool   // a node reappears after SIGUSR1
+	existing    bool   // a socket node is already at the path before any signal
 	restoredAs  string // "" (socket) or "file"
 	answerPID   int    // pid the revived server reports (0: servers[0])
 	waitHits    int    // signal waits until socketNode has run this often
@@ -38,6 +39,9 @@ func (f *reviveFixture) reviver() *socketReviver {
 			f.mu.Lock()
 			defer f.mu.Unlock()
 			f.presentHits++
+			if f.existing {
+				return true, true, nil
+			}
 			if !f.restores || len(f.signaled) == 0 {
 				return false, false, nil
 			}
@@ -234,12 +238,10 @@ func TestConcurrentReviveSignalsOrphanOnce(t *testing.T) {
 	}
 }
 
-// reviveConcurrently runs two revivals of path at once. The signal waits until
-// both callers have observed the absent socket and the lock holder has
-// re-checked it (three socketNode calls), so the second caller is queued on
-// the lock rather than arriving after the socket is back.
+// reviveConcurrently runs two revivals of path at once. Every caller reads the
+// node only under the lock, so a caller queued on it and one arriving after
+// the socket is back take the same path.
 func reviveConcurrently(f *reviveFixture, path string) []error {
-	f.waitHits = 3
 	tm := f.tmux()
 	var wg sync.WaitGroup
 	errs := make([]error, 2)
@@ -296,8 +298,10 @@ func TestReviveLockWaitIsBoundedByTheDeadline(t *testing.T) {
 	}
 }
 
-// Review fixes 5 and 6: never signal a reused pid; never accept a restored
-// path that is not the revived server's socket.
+// Review fixes 5 and 6: re-check the owner right before the signal (this
+// narrows, but cannot close, the window in which its pid is reused by any
+// process); never accept a restored path that is not the revived server's
+// socket.
 func TestReviveRefusesUnprovenOwnership(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -320,6 +324,41 @@ func TestReviveRefusesUnprovenOwnership(t *testing.T) {
 			}
 			if (len(f.signaled) > 0) != tc.wantSignal || issuedNewSession(f.fe) {
 				t.Fatalf("signaled=%v calls=%#v", f.signaled, f.fe.calls)
+			}
+		})
+	}
+}
+
+// Round 3: the socket observation cannot say whether it saw the path absent or
+// stale, so a node found at the path is verified, never trusted. A caller that
+// observed absence and then finds a node a concurrent reviver restored but the
+// server never answered on must refuse, or new-session founds a second server.
+func TestReviveVerifiesANodeAlreadyAtThePath(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		setup   func(*reviveFixture)
+		refuses string // "" means creating is safe
+	}{
+		{name: "owned-but-unresponsive", setup: func(f *reviveFixture) { f.servers, f.answerPID = []int{27432}, 26334 }, refuses: "restored-socket-unresponsive"},
+		{name: "two-owners", setup: func(f *reviveFixture) { f.servers = []int{27432, 26334} }, refuses: "restored-socket-owner-mismatch"},
+		{name: "stale-no-owner", setup: func(f *reviveFixture) {}},
+		{name: "owned-and-answering", setup: func(f *reviveFixture) { f.servers = []int{27432} }},
+		{name: "owner-probe-not-installed", setup: func(f *reviveFixture) { f.findErr = errOwnerProbeUnavailable }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newReviveFixture()
+			f.existing = true
+			tc.setup(f)
+			err := f.tmux().NewSession("gc-seat", "")
+			if tc.refuses == "" {
+				if err != nil || !issuedNewSession(f.fe) {
+					t.Fatalf("err=%v calls=%#v, want new-session", err, f.fe.calls)
+				}
+			} else if !errors.Is(err, ErrServerDegraded) || !strings.Contains(err.Error(), tc.refuses) || issuedNewSession(f.fe) {
+				t.Fatalf("err=%v calls=%#v, want ErrServerDegraded %q and no new-session", err, f.fe.calls, tc.refuses)
+			}
+			if len(f.signaled) != 0 {
+				t.Fatalf("signaled = %v, want no SIGUSR1 for a node already present", f.signaled)
 			}
 		})
 	}
@@ -356,6 +395,11 @@ func TestParseLsofSocketOwners(t *testing.T) {
 	got, err = parseLsofSocketOwners("p43\nctmux\nf5\nn"+typed+"\n", []string{typed})
 	if err != nil || len(got) != 1 || got[0] != 43 {
 		t.Fatalf("path containing \" type=\": owners = %v, %v; want [43]", got, err)
+	}
+	// Round 3: after " type=" lsof writes an uppercase socket type; anything
+	// else could be a literal file name and is refused, not matched.
+	if got, err := parseLsofSocketOwners("p45\nctmux\nf5\nn/tmp/tmux-501/gastown type=other\n", paths); err == nil {
+		t.Fatalf("\" type=\" with no socket type: owners = %v, want a fail-closed error", got)
 	}
 	// Round 2 (3ii): an escaped name that cannot be ours is ignored.
 	got, err = parseLsofSocketOwners("p44\nctmux\nf5\nn/home/other/so\\x09ck\np27432\nctmux\nf6\nn/tmp/tmux-501/gastown\n", paths)
