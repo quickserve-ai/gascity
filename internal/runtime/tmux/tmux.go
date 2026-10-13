@@ -4103,7 +4103,7 @@ func dismissFeedbackSurveyModal(capture func() (string, error), attached func() 
 	}
 	sleep(feedbackSurveyMountGuard)
 	content, err := capture()
-	if err != nil || !runtime.ContainsFeedbackSurveyModal(content) {
+	if err != nil || !feedbackSurveyLive(content) {
 		return nil
 	}
 	if composer, observed := feedbackSurveyComposer(content); !observed || composer != "" {
@@ -4149,6 +4149,116 @@ func awaitFeedbackSurveyDigit(capture func() (string, error), sleep func(time.Du
 		return "", false, errFeedbackSurveyDigitUnresolved
 	}
 	return composer, surveyGone, nil
+}
+
+// feedbackSurveyLive reports whether content (the visible screen) shows
+// Claude Code's post-turn feedback survey as the LIVE block (ga-da5vmz): its
+// header line directly above its option row, and the row the last thing drawn
+// above an anchor, with only blank lines and the composer's rule or box edge
+// between them. A live survey is drawn above the composer, so the tail-anchor
+// rule DismissMidSessionDialogs uses would never fire on it.
+//
+// Two anchors are tried: the last composer-looking line, and the end of the
+// screen (no live composer: the last composer-looking line is an earlier
+// prompt and the survey is drawn below it).
+//
+// A survey row with agent output between it and the anchor is stale, left
+// over from an earlier turn; a row with no header directly above it, or a
+// header and row inside an agent reply (⏺) or a user turn (>), is text QUOTING
+// the survey. Keying any of them types "0" into an idle composer on every
+// delivery attempt. The header may wrap in a narrow pane. Restores #209's rule, which the re-sync #6 merge of
+// upstream's dismisser dropped.
+func feedbackSurveyLive(content string) bool {
+	lines := strings.Split(content, "\n")
+	if ci, _ := lastComposerLine(lines, DefaultReadyPromptPrefix); ci >= 0 && feedbackSurveyDirectlyAbove(lines, ci) {
+		return true
+	}
+	return feedbackSurveyDirectlyAbove(lines, len(lines))
+}
+
+// feedbackSurveyDirectlyAbove reports whether the last line above anchor that
+// is not blank or a composer edge is the survey's option row, with the
+// survey's header directly above that row and the block Claude Code's own.
+func feedbackSurveyDirectlyAbove(lines []string, anchor int) bool {
+	for i := anchor - 1; i >= 0; i-- {
+		if s := strings.TrimSpace(lines[i]); s == "" || isComposerEdge(s) {
+			continue
+		}
+		if !runtime.ContainsFeedbackSurveyModal(lines[i]) {
+			return false
+		}
+		h := feedbackSurveyHeaderStart(lines, i)
+		return h >= 0 && !feedbackSurveyQuoted(lines, h)
+	}
+	return false
+}
+
+// feedbackSurveyHeaderMaxRows bounds how many rows a wrapped survey header may
+// span in a narrow pane ("● How is Claude doing this" / "session? (optional)").
+const feedbackSurveyHeaderMaxRows = 3
+
+// feedbackSurveyHeaderStart returns the index of the first row of the survey
+// header that ends on the row directly above the option row at row, or -1.
+// The header may wrap over up to feedbackSurveyHeaderMaxRows non-blank rows.
+func feedbackSurveyHeaderStart(lines []string, row int) int {
+	joined := ""
+	for k := 1; k <= feedbackSurveyHeaderMaxRows && row-k >= 0; k++ {
+		part := strings.TrimSpace(lines[row-k])
+		if part == "" {
+			return -1
+		}
+		joined = strings.TrimSpace(part + " " + joined)
+		if isFeedbackSurveyHeader(joined) {
+			return row - k
+		}
+	}
+	return -1
+}
+
+// feedbackSurveyQuoted reports whether the survey header at row h sits inside
+// a block that Claude Code did not draw as a survey: walking up from h, the
+// first unindented row opens the block, and an agent reply (⏺) or a user turn
+// (>) there means the header and row are text QUOTED in that block. A live
+// survey's block opens with its own ● header (feedbackSurveySessionFixture) or
+// the "● Claude recalled a memory:" line (feedbackSurveyMemoryFixture).
+func feedbackSurveyQuoted(lines []string, h int) bool {
+	for j := h; j >= 0; j-- {
+		line := lines[j]
+		if strings.TrimSpace(line) == "" || strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t") {
+			continue
+		}
+		return strings.HasPrefix(line, "⏺") || strings.HasPrefix(line, ">")
+	}
+	return false
+}
+
+// isComposerEdge reports whether a trimmed line is a border Claude Code draws
+// around its composer: a horizontal rule, or a box's top or bottom edge.
+func isComposerEdge(s string) bool {
+	return utf8.RuneCountInString(s) >= 8 && strings.Trim(s, "─━╭╮╰╯") == ""
+}
+
+// feedbackSurveyHeaders are the titles Claude Code draws above the survey's
+// option row, one per variant (feedbackSurveySessionFixture and
+// feedbackSurveyMemoryFixture). A title Claude Code changes stops the
+// dismissal: the nudge then waits on the survey, which is the safe failure.
+var feedbackSurveyHeaders = []string{
+	"How is Claude doing this session?",
+	"How was Claude's recollection?",
+}
+
+// isFeedbackSurveyHeader reports whether line is a survey title as drawn: an
+// optional "●" bullet, the title, and an optional "(optional)".
+func isFeedbackSurveyHeader(line string) bool {
+	s := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "●"))
+	for _, header := range feedbackSurveyHeaders {
+		if rest, ok := strings.CutPrefix(s, header); ok {
+			if rest = strings.TrimSpace(rest); rest == "" || rest == "(optional)" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func feedbackSurveyComposer(content string) (string, bool) {
@@ -4228,7 +4338,7 @@ func (t *Tmux) dismissFeedbackSurveyModalIn(session, target string) error {
 		return err != nil || attached
 	}
 	content, err := capture()
-	if err != nil || !runtime.ContainsFeedbackSurveyModal(content) {
+	if err != nil || !feedbackSurveyLive(content) {
 		return nil
 	}
 	return dismissFeedbackSurveyModal(capture, attached, sendKeys, time.Sleep)

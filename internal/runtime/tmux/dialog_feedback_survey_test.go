@@ -587,3 +587,58 @@ func TestNudgeSessionDeliversWhenOnlySurveyPeekFails(t *testing.T) {
 		t.Fatalf("NudgeSession typed without a guard read after the failed survey peek: %v", executor.calls)
 	}
 }
+
+// feedbackSurveyStaleOnScreenFixture is a survey that is still on the visible
+// screen but no longer live: the agent answered a later turn under it, so the
+// composer's nearest block is that turn's output, not the option row
+// (ga-da5vmz). Claude Code renders a live survey directly above the composer.
+const feedbackSurveyStaleOnScreenFixture = `⏺ Done — pushed the branch and replied on the PR.
+
+● How is Claude doing this session? (optional)
+  1: Bad    2: Fine   3: Good   0: Dismiss
+
+> check the deploy too
+⏺ The deploy finished at 10:42.
+
+╭──────────────────────────────────────────────────────────╮
+│ ❯                                                        │
+╰──────────────────────────────────────────────────────────╯
+  ⏵⏵ bypass permissions on (shift+tab to cycle)`
+
+func TestFeedbackSurveyLiveOnlyDirectlyAboveComposer(t *testing.T) {
+	for name, tc := range map[string]struct {
+		content string
+		want    bool
+	}{
+		"session survey":         {feedbackSurveySessionFixture, true},
+		"memory survey":          {feedbackSurveyMemoryFixture, true},
+		"stale survey on screen": {feedbackSurveyStaleOnScreenFixture, false},
+		"no composer":            {"  1: Bad    2: Fine   3: Good   0: Dismiss", false},
+		"quoted row, no header":  {"⏺ The survey row reads:\n  1: Bad    2: Fine   3: Good   0: Dismiss\n\n╭──────────╮\n│ ❯        │\n╰──────────╯", false},
+		// A narrow pane wraps the header; the option row still fits on one line.
+		"header wrapped before (optional)": {"⏺ Done.\n\n● How is Claude doing this session?\n  (optional)\n  1: Bad    2: Fine   3: Good   0: Dismiss\n\n╭──────────╮\n│ ❯        │\n╰──────────╯", true},
+		"header wrapped mid-title":         {"⏺ Done.\n\n● How is Claude doing this\n  session? (optional)\n  1: Bad    2: Fine   3: Good   0: Dismiss\n\n╭──────────╮\n│ ❯        │\n╰──────────╯", true},
+		// An agent quoting the whole survey, header and row: its block opens
+		// with the agent's ⏺, not the ● Claude Code draws a survey under.
+		"quoted survey, header and row": {"⏺ Here is the survey text:\n  How is Claude doing this session? (optional)\n  1: Bad    2: Fine   3: Good   0: Dismiss\n\n╭──────────╮\n│ ❯        │\n╰──────────╯", false},
+		"quoted survey in a user turn":  {"> paste: How is Claude doing this session? (optional)\n  1: Bad    2: Fine   3: Good   0: Dismiss\n\n╭──────────╮\n│ ❯        │\n╰──────────╯", false},
+	} {
+		if got := feedbackSurveyLive(tc.content); got != tc.want {
+			t.Errorf("%s: feedbackSurveyLive = %v, want %v", name, got, tc.want)
+		}
+	}
+}
+
+func TestDismissFeedbackSurveyModalIgnoresStaleSurveyOnScreen(t *testing.T) {
+	executor := &scriptedTargetExecutor{capture: feedbackSurveyStaleOnScreenFixture, display: "agent-pane|0"}
+	tm := &Tmux{cfg: DefaultConfig(), exec: executor}
+
+	if err := tm.DismissFeedbackSurveyModalIfPresent("agent-pane"); err != nil {
+		t.Fatalf("DismissFeedbackSurveyModalIfPresent error = %v", err)
+	}
+	for _, call := range executor.calls {
+		if slices.Contains(call, "send-keys") {
+			t.Fatalf("a survey with a later turn under it is history, but keys were sent: %v", executor.calls)
+		}
+	}
+}
