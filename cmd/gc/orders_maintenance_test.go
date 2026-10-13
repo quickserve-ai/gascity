@@ -18,17 +18,16 @@ import (
 )
 
 // blackHoleWriteStore is a rig store whose server stopped answering writes:
-// reads still return, and every close or delete blocks for the store's own
-// budget and then fails, as a remote store does when its link black-holes.
+// reads still return, and every close or delete fails as a remote store's does
+// when its link black-holes. In production each failure first costs the
+// store's own 90-120 s budget; here it fails at once and is counted.
 type blackHoleWriteStore struct {
 	beads.Store
-	budget time.Duration
 	writes atomic.Int32
 }
 
 func (s *blackHoleWriteStore) blackHole() error {
 	s.writes.Add(1)
-	time.Sleep(s.budget)
 	return fmt.Errorf("remote write: %w", context.DeadlineExceeded)
 }
 
@@ -71,13 +70,8 @@ func TestOrdersPassDispatchesPastABlackHoledRigStore(t *testing.T) {
 			Labels:    []string{"order-run:rig-poll", labelOrderTracking}, Ephemeral: true,
 		})
 	}
-	rig := &blackHoleWriteStore{Store: beads.NewMemStoreFrom(1000, seed, nil), budget: 40 * time.Millisecond}
-
-	var dispatchedAfter atomic.Int64
-	start := time.Now()
-	od := &recordingOrderDispatcher{onDispatch: func(context.Context, string, time.Time) {
-		dispatchedAfter.Store(int64(time.Since(start)))
-	}}
+	rig := &blackHoleWriteStore{Store: beads.NewMemStoreFrom(1000, seed, nil)}
+	od := &recordingOrderDispatcher{}
 	var stderr bytes.Buffer
 	cr := &CityRuntime{
 		cityName: "test-city",
@@ -100,13 +94,9 @@ func TestOrdersPassDispatchesPastABlackHoledRigStore(t *testing.T) {
 	if od.calls.Load() != 1 {
 		t.Fatalf("dispatch calls = %d, want 1\nstderr:\n%s", od.calls.Load(), stderr.String())
 	}
-	// Each black-holed write costs 40ms; the pre-fix pass spends >4s on them.
-	if got := time.Duration(dispatchedAfter.Load()); got > time.Second {
-		t.Fatalf("city order dispatched %s after the pass started (rig store absorbed %d black-holed writes first), want <= 1s\nstderr:\n%s",
-			got, rig.writes.Load(), stderr.String())
-	}
+	// Each black-holed write would cost the dispatch pass a whole store budget.
 	if got := rig.writes.Load(); got != 0 {
-		t.Fatalf("the dispatch pass made %d write(s) to the rig store; its maintenance belongs to runOrderMaintenance", got)
+		t.Fatalf("the dispatch pass made %d write(s) to the black-holed rig store before dispatching; its maintenance belongs to runOrderMaintenance", got)
 	}
 }
 
