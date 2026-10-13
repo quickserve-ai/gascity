@@ -130,6 +130,32 @@ func (s *stuckCloseStore) CloseAll(ids []string, metadata map[string]string) (in
 // the store and waits for the run.
 func stuckMaintenanceRuntime(t *testing.T) (*CityRuntime, *recordingOrderDispatcher, *stuckCloseStore) {
 	t.Helper()
+	cr, od, rig := stuckStoreRuntime(t)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		cr.runOrderMaintenance(context.Background())
+	}()
+	t.Cleanup(func() {
+		releaseStuckStore(rig)
+		awaitClose(t, done, "the stuck maintenance run finishing")
+	})
+	awaitClose(t, rig.entered, "the maintenance run reaching the stuck rig store")
+	return cr, od, rig
+}
+
+func releaseStuckStore(rig *stuckCloseStore) {
+	select {
+	case <-rig.release:
+	default:
+		close(rig.release)
+	}
+}
+
+// stuckStoreRuntime is an orders-lane runtime whose rig store holds a stale
+// tracking bead and hangs every close of it until rig.release is closed.
+func stuckStoreRuntime(t *testing.T) (*CityRuntime, *recordingOrderDispatcher, *stuckCloseStore) {
+	t.Helper()
 	od := &recordingOrderDispatcher{}
 	cr := ordersLaneTestRuntime(t, od, "1h", nil)
 	rig := &stuckCloseStore{entered: make(chan struct{}), release: make(chan struct{}), Store: beads.NewMemStoreFrom(10, []beads.Bead{{
@@ -138,21 +164,29 @@ func stuckMaintenanceRuntime(t *testing.T) (*CityRuntime, *recordingOrderDispatc
 	}}, nil)}
 	cr.cfg.Rigs = []config.Rig{{Name: "frontend", Path: filepath.Join(cr.cityPath, "frontend")}}
 	cr.standaloneRigStores = map[string]beads.Store{"frontend": rig}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		cr.runOrderMaintenance(context.Background())
-	}()
-	t.Cleanup(func() {
-		select {
-		case <-rig.release:
-		default:
-			close(rig.release)
-		}
-		awaitClose(t, done, "the stuck maintenance run finishing")
-	})
-	awaitClose(t, rig.entered, "the maintenance run reaching the stuck rig store")
 	return cr, od, rig
+}
+
+// The real lane wiring: startOrdersLane's maintenance goroutine sticks on a
+// store, its pass goroutine still dispatches, and shutdown completes once the
+// stuck store call returns. (Shutdown waits for that call, as it waited for
+// the pass that carried maintenance before; bounding it is ga-yuiof4's
+// follow-up.)
+func TestOrdersLaneDispatchesWhileItsMaintenanceIsStuck(t *testing.T) {
+	cr, od, rig := stuckStoreRuntime(t)
+	defer releaseStuckStore(rig)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := cr.startOrdersLane(ctx, cr.cityPath)
+	cr.ordersLaneOf().wake()
+	awaitClose(t, rig.entered, "the lane's maintenance reaching the stuck rig store")
+	// Count only dispatches made after maintenance is stuck.
+	before := od.calls.Load()
+	cr.ordersLaneOf().wake()
+	awaitCond(t, func() bool { return od.calls.Load() > before }, "a lane pass dispatching while maintenance is stuck")
+	cancel()
+	releaseStuckStore(rig)
+	awaitClose(t, done, "the lane shutting down once the stuck store call returns")
 }
 
 // Dispatch is independent of maintenance: with a maintenance watchdog stuck on
