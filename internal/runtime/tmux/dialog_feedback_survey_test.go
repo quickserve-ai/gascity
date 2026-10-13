@@ -589,6 +589,7 @@ func TestFeedbackSurveyLiveOnlyDirectlyAboveComposer(t *testing.T) {
 		"memory survey":          {feedbackSurveyMemoryFixture, true},
 		"stale survey on screen": {feedbackSurveyStaleOnScreenFixture, false},
 		"no composer":            {"  1: Bad    2: Fine   3: Good   0: Dismiss", false},
+		"quoted row, no header":  {"⏺ The survey row reads:\n  1: Bad    2: Fine   3: Good   0: Dismiss\n\n╭──────────╮\n│ ❯        │\n╰──────────╯", false},
 	} {
 		if got := feedbackSurveyLive(tc.content); got != tc.want {
 			t.Errorf("%s: feedbackSurveyLive = %v, want %v", name, got, tc.want)

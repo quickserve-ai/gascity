@@ -3822,25 +3822,39 @@ func awaitFeedbackSurveyDigit(capture func() (string, error), sleep func(time.Du
 	return composer, surveyGone, nil
 }
 
-// feedbackSurveyLive reports whether the feedback survey is the live block of
-// content: Claude Code draws a live survey directly above the composer, so
-// walking up from the last composer line past blank lines and the composer's
-// own border or rule, the first line must be the survey's option row. A row
-// still on screen with a later turn's output under it is history, and keying
-// "0" at it types into an idle composer on every delivery attempt
-// (ga-da5vmz).
+// feedbackSurveyLive reports whether content (the visible screen) shows
+// Claude Code's post-turn feedback survey as the LIVE block (ga-da5vmz): its
+// header line directly above its option row, and the row the last thing drawn
+// above an anchor, with only blank lines and the composer's rule or box edge
+// between them. A live survey is drawn above the composer, so the tail-anchor
+// rule DismissMidSessionDialogs uses would never fire on it.
+//
+// Two anchors are tried: the last composer-looking line, and the end of the
+// screen (no live composer: the last composer-looking line is an earlier
+// prompt and the survey is drawn below it).
+//
+// A survey row with agent output between it and the anchor is stale, left
+// over from an earlier turn; a row with no header directly above it is an
+// agent QUOTING the row. Keying either types "0" into an idle composer on
+// every delivery attempt. Restores #209's rule, which the re-sync #6 merge of
+// upstream's dismisser dropped.
 func feedbackSurveyLive(content string) bool {
 	lines := strings.Split(content, "\n")
-	ci, _ := lastComposerLine(lines, DefaultReadyPromptPrefix)
-	if ci < 0 {
-		return false
+	if ci, _ := lastComposerLine(lines, DefaultReadyPromptPrefix); ci >= 0 && feedbackSurveyDirectlyAbove(lines, ci) {
+		return true
 	}
-	for i := ci - 1; i >= 0; i-- {
-		s := strings.TrimSpace(lines[i])
-		if s == "" || isComposerEdge(s) {
+	return feedbackSurveyDirectlyAbove(lines, len(lines))
+}
+
+// feedbackSurveyDirectlyAbove reports whether the last line above anchor that
+// is not blank or a composer edge is the survey's option row, with the
+// survey's header on the line right above that row.
+func feedbackSurveyDirectlyAbove(lines []string, anchor int) bool {
+	for i := anchor - 1; i >= 0; i-- {
+		if s := strings.TrimSpace(lines[i]); s == "" || isComposerEdge(s) {
 			continue
 		}
-		return runtime.ContainsFeedbackSurveyModal(lines[i])
+		return i > 0 && runtime.ContainsFeedbackSurveyModal(lines[i]) && isFeedbackSurveyHeader(lines[i-1])
 	}
 	return false
 }
@@ -3849,6 +3863,29 @@ func feedbackSurveyLive(content string) bool {
 // around its composer: a horizontal rule, or a box's top or bottom edge.
 func isComposerEdge(s string) bool {
 	return utf8.RuneCountInString(s) >= 8 && strings.Trim(s, "─━╭╮╰╯") == ""
+}
+
+// feedbackSurveyHeaders are the titles Claude Code draws above the survey's
+// option row, one per variant (feedbackSurveySessionFixture and
+// feedbackSurveyMemoryFixture). A title Claude Code changes stops the
+// dismissal: the nudge then waits on the survey, which is the safe failure.
+var feedbackSurveyHeaders = []string{
+	"How is Claude doing this session?",
+	"How was Claude's recollection?",
+}
+
+// isFeedbackSurveyHeader reports whether line is a survey title as drawn: an
+// optional "●" bullet, the title, and an optional "(optional)".
+func isFeedbackSurveyHeader(line string) bool {
+	s := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "●"))
+	for _, header := range feedbackSurveyHeaders {
+		if rest, ok := strings.CutPrefix(s, header); ok {
+			if rest = strings.TrimSpace(rest); rest == "" || rest == "(optional)" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func feedbackSurveyComposer(content string) (string, bool) {
