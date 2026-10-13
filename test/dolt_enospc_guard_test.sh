@@ -268,7 +268,13 @@ EOF
     printf 'RC=%s\nOPS=%s\n%s\n' "$rc" "$(recorded_ops "$dir/ops.log")" "$out"
 }
 
-has() { printf '%s' "$1" | grep -qF -- "$2"; }
+# has <text> <literal>: <literal> occurs in <text>. Pure bash, no pipe. The old
+# `printf '%s' "$1" | grep -qF -- "$2"` could return false on a match under
+# `set -o pipefail`: grep -q exits at the first match, and a printf still
+# writing gets SIGPIPE (141), which pipefail reports as the pipeline's status.
+# R2 and T20 failed that way on CI with the token in their own printed output
+# (ga-l0b72a.8). The quoted "$2" in the pattern is matched literally, as -F did.
+has() { case "$1" in *"$2"*) return 0 ;; esac; return 1; }
 
 # rc_is <output> <code>: the exit code a run_restart/run_recover call recorded.
 rc_is() { [ "$(printf '%s\n' "$1" | sed -n 's/^RC=//p')" = "$2" ]; }
@@ -277,6 +283,27 @@ rc_is() { [ "$(printf '%s\n' "$1" | sed -n 's/^RC=//p')" = "$2" ]; }
 ops_are() { [ "$(printf '%s\n' "$1" | sed -n 's/^OPS=//p' | sed 's/ *$//')" = "$2" ]; }
 # no_ops <output>: nothing reached the backend.
 no_ops() { ops_are "$1" ""; }
+
+# H1: has() answers correctly on a 256 KB text with the match at its start (the
+# shape where a pipe form can lose a match to SIGPIPE) and keeps a glob
+# character literal.
+_h1_text="needle$(printf '%0262144d' 0)"
+if has "$_h1_text" "needle" && ! has "$_h1_text" "absent" && has "a*b" "*" && ! has "ab" "*"; then
+    pass "H1: has() matches literally and cannot lose a match to SIGPIPE"
+else
+    fail "H1: has() gave a wrong answer on a 256 KB text or a glob literal"
+fi
+# H1 CONTROL, informational only (never fails the suite): how often the OLD pipe
+# form loses that same match on THIS host's grep. macOS's BSD grep read to EOF
+# and lost 0/200 (2026-10-12); GNU grep exits at the first match, so a nonzero
+# count on a Linux runner is the evidence that names R2's and T20's cause.
+_h1_lost=0
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    printf '%s' "$_h1_text" | grep -qF -- needle || _h1_lost=$((_h1_lost + 1))
+done
+printf 'NOTE H1 CONTROL: the old pipe form lost a present match %s/20 times on this host (%s)\n' \
+    "$_h1_lost" "$(grep --version 2>/dev/null | head -n 1 || echo "grep, version unknown")"
+unset _h1_text _h1_lost
 
 # check_no_force <case> <output>: criterion 5, applied to every refusal.
 check_no_force() {
