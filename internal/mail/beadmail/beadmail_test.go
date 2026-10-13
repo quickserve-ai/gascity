@@ -3210,3 +3210,66 @@ func TestMarkUnreadReopensClosedMessage(t *testing.T) {
 		t.Errorf("mail.read = %q, want false", got.Metadata["mail.read"])
 	}
 }
+
+// A multi-route inbox read is one predicated bd list and one predicated bd
+// query per route (the store reads each route by itself, the two tiers in
+// turn). When one route's read fails, the inbox read fails whole: answering
+// with the other routes' mail would show the inbox as complete while one
+// spelling's messages were never read. That is the same answer the single
+// unpredicated scan gave when it failed.
+func TestInboxRecipientsReadsEachRoutePredicatedAndFailsWhole(t *testing.T) {
+	newProvider := func(failRoute string) (*Provider, *[]string) {
+		var messageReads []string
+		runner := func(_ string, name string, args ...string) ([]byte, error) {
+			cmd := name + " " + strings.Join(args, " ")
+			switch {
+			case strings.Contains(cmd, "bd show --json"):
+				return nil, errors.New("not found")
+			case !strings.Contains(cmd, "--type=message") && !strings.Contains(cmd, "type=message"):
+				return []byte(`[]`), nil
+			}
+			messageReads = append(messageReads, cmd)
+			if failRoute != "" && strings.Contains(cmd, failRoute) {
+				return nil, errors.New("exit status 1: storage error")
+			}
+			if strings.HasPrefix(cmd, "bd query ") && strings.Contains(cmd, "assignee=route-a") {
+				return []byte(`[{"id":"msg-a","title":"hi","description":"body","status":"open","issue_type":"message","assignee":"route-a","from":"human","created_at":"2026-01-02T03:04:05Z","ephemeral":true}]`), nil
+			}
+			return []byte(`[]`), nil
+		}
+		return New(beads.NewBdStore(t.TempDir(), runner)), &messageReads
+	}
+
+	t.Run("each route is read predicated, both tiers", func(t *testing.T) {
+		p, reads := newProvider("")
+		msgs, err := p.InboxRecipients([]string{"route-a", "route-b"})
+		if err != nil {
+			t.Fatalf("InboxRecipients: %v", err)
+		}
+		if len(msgs) != 1 || msgs[0].ID != "msg-a" {
+			t.Fatalf("InboxRecipients = %#v, want msg-a", msgs)
+		}
+		if len(*reads) != 4 {
+			t.Fatalf("message reads = %d %v, want 4 (bd list and bd query for each of two routes)", len(*reads), *reads)
+		}
+		for _, cmd := range *reads {
+			if strings.Contains(cmd, "route-a") == strings.Contains(cmd, "route-b") {
+				t.Fatalf("message read %q does not carry exactly one route predicate", cmd)
+			}
+		}
+	})
+
+	t.Run("one failed route fails the read", func(t *testing.T) {
+		p, _ := newProvider("route-b")
+		msgs, err := p.InboxRecipients([]string{"route-a", "route-b"})
+		if err == nil {
+			t.Fatalf("InboxRecipients = %#v, nil; want an error naming route-b, not route-a's mail alone", msgs)
+		}
+		if !strings.Contains(err.Error(), "route-b") {
+			t.Fatalf("InboxRecipients err = %v, want it to name the failed route", err)
+		}
+		if len(msgs) != 0 {
+			t.Fatalf("InboxRecipients = %#v with an error, want no messages", msgs)
+		}
+	})
+}

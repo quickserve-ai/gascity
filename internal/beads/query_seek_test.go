@@ -168,12 +168,12 @@ func TestSeekGatesForceClientSideLimit(t *testing.T) {
 	seek := &SeekBoundary{CreatedAt: time.Now(), ID: "gc-1"}
 
 	base := ListQuery{Sort: SortCreatedDesc, Limit: 10, TierMode: TierBoth}
-	if bdListRequiresClientLimit(base, base, false) {
+	if bdListRequiresClientLimit(base, base) {
 		t.Fatal("baseline TierBoth query should allow bd-side limit (test setup wrong)")
 	}
 	seeked := base
 	seeked.SeekAfter = seek
-	if !bdListRequiresClientLimit(seeked, seeked, false) {
+	if !bdListRequiresClientLimit(seeked, seeked) {
 		t.Fatal("bdListRequiresClientLimit must force client-side limit when SeekAfter is set")
 	}
 
