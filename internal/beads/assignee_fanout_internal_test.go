@@ -1,6 +1,7 @@
 package beads
 
 import (
+	"context"
 	"errors"
 	"slices"
 	"sort"
@@ -8,7 +9,78 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	beadslib "github.com/steveyegge/beads"
 )
+
+// The native store's backing filter carries one assignee, so a multi-route
+// read must reach SearchIssues once per route with that route set — never as
+// one unfiltered search hydrating every open message (pl-adj).
+func TestNativeDoltStoreListAssigneesSearchesEachRoutePredicated(t *testing.T) {
+	base := time.Date(2026, 9, 25, 8, 0, 0, 0, time.UTC)
+	p0, p2 := 0, 2
+	all := []*beadslib.Issue{
+		{ID: "a-old", Title: "m", Status: beadslib.StatusOpen, IssueType: "message", Assignee: "rig/route-a", Priority: p2, CreatedAt: base},
+		{ID: "b-new", Title: "m", Status: beadslib.StatusOpen, IssueType: "message", Assignee: "route-b", Priority: p2, CreatedAt: base.Add(2 * time.Hour)},
+		{ID: "b-urgent", Title: "m", Status: beadslib.StatusOpen, IssueType: "message", Assignee: "route-b", Priority: p0, CreatedAt: base},
+		{ID: "a-mid", Title: "m", Status: beadslib.StatusOpen, IssueType: "message", Assignee: "rig/route-a", Priority: p2, CreatedAt: base.Add(time.Hour)},
+		{ID: "other", Title: "m", Status: beadslib.StatusOpen, IssueType: "message", Assignee: "someone-else", Priority: p2, CreatedAt: base.Add(3 * time.Hour)},
+	}
+	var (
+		mu        sync.Mutex
+		searched  []string
+		unfilterd int
+	)
+	storage := &nativeDoltStorageSpy{
+		searchIssues: func(_ context.Context, _ string, filter beadslib.IssueFilter) ([]*beadslib.Issue, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if filter.Assignee == nil {
+				unfilterd++
+				return all, nil
+			}
+			searched = append(searched, *filter.Assignee)
+			var out []*beadslib.Issue
+			for _, issue := range all {
+				if issue.Assignee == *filter.Assignee {
+					out = append(out, issue)
+				}
+			}
+			// The backing's default order: priority ASC, created_at DESC, id ASC.
+			sort.SliceStable(out, func(i, j int) bool {
+				if out[i].Priority != out[j].Priority {
+					return out[i].Priority < out[j].Priority
+				}
+				if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
+					return out[i].CreatedAt.After(out[j].CreatedAt)
+				}
+				return out[i].ID < out[j].ID
+			})
+			return out, nil
+		},
+	}
+	store := newNativeDoltStoreForTest(storage)
+
+	got, err := store.List(ListQuery{
+		Type:      "message",
+		Status:    "open",
+		TierMode:  TierBoth,
+		Assignees: []string{"rig/route-a", "route-b", "route-a-unused"},
+	})
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if unfilterd != 0 {
+		t.Fatalf("SearchIssues ran %d unfiltered searches, want 0", unfilterd)
+	}
+	slices.Sort(searched)
+	if want := []string{"rig/route-a", "route-a-unused", "route-b"}; !slices.Equal(searched, want) {
+		t.Fatalf("searched assignees = %v, want one search per route %v", searched, want)
+	}
+	if want := []string{"b-urgent", "b-new", "a-mid", "a-old"}; !slices.Equal(fanoutTestIDs(got), want) {
+		t.Fatalf("List ids = %v, want backing default order %v", fanoutTestIDs(got), want)
+	}
+}
 
 // assigneeFanOutRoutes decides which queries fan out: only a plural,
 // route-bearing query does, and its routes come back trimmed and distinct.
