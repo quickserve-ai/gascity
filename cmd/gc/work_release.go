@@ -200,7 +200,7 @@ type ReleaseOpts struct {
 type ReleaseOutcome struct {
 	Released, Kept, Failed []seatWorkHit
 	Why                    map[string]string // by bead ID, for Kept and Failed
-	Route                  map[string]string // by bead ID, for a claim kept unserved: the route it would take
+	Route                  map[string]string // by bead ID, for a claim kept unserved (a named proposal included): the route it would take
 }
 
 // withheld counts the claims kept because the named-release guard proposed
@@ -218,11 +218,14 @@ func (o ReleaseOutcome) withheld() int {
 // strandedClaim is one claim kept because no lane serves it.
 type strandedClaim struct{ id, route, reason string }
 
-// Unserved are the claims kept because no lane serves them, by ID.
+// Unserved are the claims kept because no lane serves them, by ID: those
+// kept for that alone, and the named-agent proposals no lane would serve
+// either (ga-9n8hjv fence #1 keeps them first).
 func (o ReleaseOutcome) Unserved() []strandedClaim {
 	var out []strandedClaim
 	for _, k := range o.Kept {
-		if id := k.bead.ID; o.Why[id] == keptUnservedRoute {
+		id := k.bead.ID
+		if _, unrouted := o.Route[id]; o.Why[id] == keptUnservedRoute || o.Why[id] == keptNamedProposed && unrouted {
 			out = append(out, strandedClaim{id: id, route: o.Route[id], reason: keptUnservedRoute})
 		}
 	}
@@ -293,6 +296,13 @@ func releaseListed(claims []seatWorkHit, why releaseWhy, seat releaseSeat, cfg *
 				continue
 			}
 			keep(c, keptNamedProposed)
+			// A proposed claim no lane would serve is stranded work as well (O5,
+			// revised): both rules keep it assigned, and a judge's release would
+			// land it in no lane, so the close stamps and names it as it does any
+			// unserved claim it keeps.
+			if route, served := releaseRoute(cfg, c.bead, fallback, p.lane); !served {
+				out.Route[c.bead.ID] = route
+			}
 			continue
 		}
 		if route, served := releaseRoute(cfg, c.bead, fallback, p.lane); !served {
