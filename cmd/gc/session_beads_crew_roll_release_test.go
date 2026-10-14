@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"slices"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
@@ -58,6 +59,18 @@ func crewRollConfig(suspended bool) *config.City {
 			{Name: "ray", Template: "cherub-law.ray", Dir: "qcore", Mode: "always"},
 		},
 	}
+}
+
+// crewRigCity is cfg with the qcore rig declared. Since #7561 the release
+// reads a rig store only as a leg of the city's work legs, and a rig store is
+// a leg only while its rig is declared (servingRigStores): handed in for an
+// undeclared rig it is never read, and a "keeps the work" assertion passes
+// over a sweep that saw nothing. The rig path never exists, as in
+// declaredRigsConfig.
+func crewRigCity(cfg *config.City) *config.City {
+	c := *cfg
+	c.Rigs = append(slices.Clone(cfg.Rigs), declaredRigsConfig("qcore").Rigs...)
+	return &c
 }
 
 // crewSessionBead is the closing session bead for the named crew agent, shaped
@@ -122,7 +135,7 @@ func TestSessionCloseKeepsConfiguredCrewWorkAcrossRoll(t *testing.T) {
 
 	var stderr bytes.Buffer
 	unclaimWorkAssignedToRetiredSessionBead(
-		testWorkLegs("", crewRollConfig(false), cityStore, map[string]beads.Store{"qcore": rigStore}),
+		testWorkLegs("", crewRigCity(crewRollConfig(false)), cityStore, map[string]beads.Store{"qcore": rigStore}),
 		cityStore,
 		crewSessionBead(),
 		"", // the close path's runTargetFallback, verbatim from cmdSessionClose
@@ -226,7 +239,7 @@ func TestSessionCloseProposesRetiredNamedSessionWork(t *testing.T) {
 
 	var stderr bytes.Buffer
 	unclaimWorkAssignedToRetiredSessionBead(
-		testWorkLegs("", &config.City{}, cityStore, map[string]beads.Store{"qcore": rigStore}), // qcore/ray is no longer configured
+		testWorkLegs("", crewRigCity(&config.City{}), cityStore, map[string]beads.Store{"qcore": rigStore}), // qcore/ray is no longer configured
 		cityStore,
 		crewSessionBead(),
 		"qcore/fallback-route",
@@ -258,7 +271,7 @@ func TestSessionCloseProposesSuspendedAgentWork(t *testing.T) {
 
 	var stderr bytes.Buffer
 	unclaimWorkAssignedToRetiredSessionBead(
-		testWorkLegs("", crewRollConfig(true), cityStore, map[string]beads.Store{"qcore": rigStore}), // backing agent suspended
+		testWorkLegs("", crewRigCity(crewRollConfig(true)), cityStore, map[string]beads.Store{"qcore": rigStore}), // backing agent suspended
 		cityStore,
 		crewSessionBead(),
 		"qcore/fallback-route",
@@ -296,7 +309,7 @@ func TestSessionCloseProposesEphemeralIdentifierWork(t *testing.T) {
 
 	var stderr bytes.Buffer
 	unclaimWorkAssignedToRetiredSessionBead(
-		testWorkLegs("", crewRollConfig(false), cityStore, map[string]beads.Store{"qcore": rigStore}),
+		testWorkLegs("", crewRigCity(crewRollConfig(false)), cityStore, map[string]beads.Store{"qcore": rigStore}),
 		cityStore,
 		sessionBead,
 		"qcore/fallback-route",
