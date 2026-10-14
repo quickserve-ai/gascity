@@ -316,10 +316,13 @@ func TestReconcileSessionBeads_DegradedLivenessReadDefersStandingHoldDrainAck(t 
 	if woken := tick(dops); woken != 0 {
 		t.Errorf("woken on the recovered drain-ack tick = %d, want 0; stderr=%s", woken, env.stderr.String())
 	}
+	// Owner ruling (navani, row owner): the hold is asserted through the
+	// disposition; upstream completes the drain as an idle sleep (D-J 3).
 	final := env.sessionInfo(session.ID)
-	if final.SleepIntent != string(sessionpkg.SleepReasonUserHold) || final.SleepReason != string(sessionpkg.SleepReasonUserHold) {
-		t.Errorf("after the recovered finalize: sleep_intent=%q sleep_reason=%q, want both %q (state=%q)",
-			final.SleepIntent, final.SleepReason, sessionpkg.SleepReasonUserHold, final.MetadataState)
+	if final.SleepIntent != string(sessionpkg.SleepReasonUserHold) ||
+		sessionpkg.DispositionOfInfo(final).Operator != sessionpkg.OperatorSuspended {
+		t.Errorf("after the recovered finalize: sleep_intent=%q operator=%d, want %q and the operator suspend standing (state=%q sleep_reason=%q)",
+			final.SleepIntent, sessionpkg.DispositionOfInfo(final).Operator, sessionpkg.SleepReasonUserHold, final.MetadataState, final.SleepReason)
 	}
 
 	// And the following ticks leave the suspended seat down. Two plain ticks:
