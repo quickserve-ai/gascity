@@ -300,30 +300,34 @@ func TestReconcileSessionBeads_ExpiredSuspendHoldReleasesUserHoldIntent(t *testi
 // gastownhall/gascity#5561 actually reports: a POOL seat parked on a standing
 // hold is reaped.
 //
-// The pool-slot gate reads only state + sleep_reason
-// (isPoolSessionSlotFreeableInfo, cmd/gc/session_state_helpers.go) — never
-// sleep_intent or wait_hold. The drain-ack path used to hardcode
-// SleepReasonIdle as the completion reason, so a held seat landed on
-// state=asleep/sleep_reason=idle: freeable. With its runtime gone and its work
-// still claimed, the stranded arm then fires and, once the confirmation window
-// has aged, repairStrandedPoolWorkerBead unclaims the work and closes the bead —
-// the park is destroyed rather than honored. Carrying the standing intent as the
-// drain reason takes the seat out of that switch.
+// A drain-ack that keeps work completes as an idle sleep (upstream's Sleep
+// cell, D-J 3), so the held seat lands on state=asleep/sleep_reason=idle and
+// its hold lives in the disposition: the operator suspend
+// (Disposition.KeepsSlot) or the wait (Disposition.Wait). The pool-slot gate
+// (isPoolSessionSlotFreeableInfo) reads the hold there; when it read only the
+// reason, the stranded arm fired on the parked seat and, once the confirmation
+// window had aged, repairStrandedPoolWorkerBead unclaimed the work and closed
+// the bead — the park destroyed rather than honored.
 func TestReconcileSessionBeads_StandingHoldKeepsPoolSlotAndClaim(t *testing.T) {
 	for _, tt := range []struct {
 		name   string
 		intent sessionpkg.SleepReason
 		extra  map[string]string
+		// holds is the disposition's reading of the park, as SuppressesWake
+		// and HoldsDeliberately read it.
+		holds func(sessionpkg.Disposition) bool
 	}{
 		{
 			name:   "wait hold",
 			intent: sessionpkg.SleepReasonWaitHold,
 			extra:  map[string]string{"wait_hold": "true"},
+			holds:  func(d sessionpkg.Disposition) bool { return d.Wait },
 		},
 		{
 			name:   "user hold",
 			intent: sessionpkg.SleepReasonUserHold,
 			extra:  map[string]string{"state": "suspended"},
+			holds:  func(d sessionpkg.Disposition) bool { return d.Operator == sessionpkg.OperatorSuspended },
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -373,9 +377,11 @@ func TestReconcileSessionBeads_StandingHoldKeepsPoolSlotAndClaim(t *testing.T) {
 			if intent := got.Metadata["sleep_intent"]; intent != string(tt.intent) {
 				t.Fatalf("sleep_intent after drain-ack = %q, want %q", intent, tt.intent)
 			}
-			if reason := got.Metadata["sleep_reason"]; reason != string(tt.intent) {
-				t.Errorf("sleep_reason after drain-ack = %q, want %q (the pool gate reads the reason, so a held seat must not read as idle)",
-					reason, tt.intent)
+			// Owner ruling (navani, row owner): the hold is asserted through the
+			// disposition; upstream pins sleep_reason=idle here (D-J 3).
+			if d := sessionpkg.DispositionOfInfo(env.sessionInfo(session.ID)); !tt.holds(d) {
+				t.Errorf("after drain-ack the disposition no longer holds the %s park (operator=%d wait=%v); the pool gate reads the hold there",
+					tt.intent, d.Operator, d.Wait)
 			}
 			if info := env.sessionInfo(session.ID); isPoolSessionSlotFreeableInfo(info, env.clk.Now()) {
 				t.Errorf("a %s-held pool seat reads as slot-freeable (state=%q sleep_reason=%q); the reaper will take its slot",
