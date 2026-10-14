@@ -280,37 +280,53 @@ func TestReaperVisitsEveryRigScopeAndClosesExpiredNudgesThere(t *testing.T) {
 // issues, so a database serving only rigs never runs the issue-root census.
 // A rig store that times out on that query must not escalate the run, and
 // the wisp-root half of the step still runs there.
+//
+// The store logs every workflow-root read by kind and by the shape of upstream
+// #6050's bounded census: the store-ref skip count, the candidate count, the
+// census start and the census page. A read it cannot classify fails the test,
+// so "no issue-root read" covers every shape the census has.
 func TestReaperReadsWorkflowIssueRootsOnlyInTheCityScope(t *testing.T) {
 	rootReads := filepath.Join(t.TempDir(), "root-reads.log")
 	f := newScopeFixture(t, `
-  *"WITH RECURSIVE workflow_wisp_root_candidates"*)
-    case "$*" in *"SELECT DISTINCT root.id"*) kind=rows ;; *) kind=count ;; esac
-    printf '%s wisp-%s\n' "$GC_FAKE_SCOPE" "$kind" >> "`+rootReads+`"
-    if [ "$kind" = rows ]; then printf 'id\n'; else printf 'COUNT(*)\n0\n'; fi
-    ;;
-  *"WITH RECURSIVE workflow_issue_root_candidates"*)
-    case "$*" in *"SELECT DISTINCT root.id"*) kind=rows ;; *) kind=count ;; esac
-    printf '%s issue-%s\n' "$GC_FAKE_SCOPE" "$kind" >> "`+rootReads+`"
-    if [ "$GC_FAKE_SCOPE" != city ]; then
+  *"workflow_wisp_root_candidates"*|*"workflow_issue_root_candidates"*)
+    case "$*" in *"workflow_wisp_root_candidates"*) kind=wisp ;; *) kind=issue ;; esac
+    case "$*" in
+      *"LEFT JOIN workflow_${kind}_root_candidates candidate"*) read=refcount ;;
+      *"FROM workflow_${kind}_root_candidates_page root"*) read=page ;;
+      *"OFFSET "*) read=start ;;
+      *"SELECT COUNT(*) FROM workflow_${kind}_root_candidates"*) read=count ;;
+      *) read=other ;;
+    esac
+    printf '%s %s-%s\n' "$GC_FAKE_SCOPE" "$kind" "$read" >> "`+rootReads+`"
+    if [ "$kind" = issue ] && [ "$GC_FAKE_SCOPE" != city ]; then
       printf 'Error 1105: read tcp 10.0.0.2:3307: i/o timeout\n' >&2
       exit 1
     fi
-    if [ "$kind" = rows ]; then printf 'id\nissue-close\n'; else printf 'COUNT(*)\n0\n'; fi
+    case "$kind:$read" in
+      *:refcount) printf 'COUNT(*)\n0\n' ;;
+      *:count) printf 'COUNT(*)\n1\n' ;;
+      issue:page) printf 'id,verdict\nissue-close,close\n' ;;
+      wisp:page) printf 'id,verdict\nwisp-keep,keep\n' ;;
+      *) printf 'id\n' ;;
+    esac
     ;;`)
 	f.env["FAKE_RIG_LIST_JSON"] = `{"rigs":[{"name":"api","hq":false}]}`
 	f.env["FAKE_SCOPE_DBS"] = "rig:api=apidb"
 	f.runReaper(t)
 
 	reads := f.read(t, rootReads)
+	if strings.Contains(reads, "-other\n") {
+		t.Fatalf("a workflow-root read the store does not classify; teach it the new shape:\n%s", reads)
+	}
 	if got := strings.Count(reads, "rig:api issue-"); got != 0 {
 		t.Fatalf("rig scope ran %d workflow issue-root read(s), want none:\n%s", got, reads)
 	}
-	for _, read := range []string{"city issue-count", "city issue-rows"} {
+	for _, read := range []string{"city issue-refcount", "city issue-count", "city issue-page"} {
 		if got := strings.Count(reads, read+"\n"); got != 1 {
 			t.Fatalf("city scope ran %q %d time(s), want once:\n%s", read, got, reads)
 		}
 	}
-	for _, read := range []string{"rig:api wisp-count", "rig:api wisp-rows"} {
+	for _, read := range []string{"rig:api wisp-count", "rig:api wisp-page"} {
 		if !strings.Contains(reads, read+"\n") {
 			t.Fatalf("rig scope skipped the workflow wisp-root read %q:\n%s", read, reads)
 		}
