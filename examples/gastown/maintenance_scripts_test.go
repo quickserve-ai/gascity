@@ -5199,6 +5199,13 @@ func TestReaperWorkflowRootCensusReachesTheRootsBehindTheOnesItKeeps(t *testing.
 	}
 }
 
+// TestReaperOnlyCountsWorkflowIssueRootsOutsideTheCityScope is upstream #6050's
+// test, rewritten in the carry (row gc-uh3t, draft #6946) and kept under its
+// upstream name so the rewrite stays a visible diff of it. #6050 counts the
+// candidate issue roots of every non-city scope and reports them as
+// skipped_non_city_workflow_issue_roots; the carry reads issue roots in the
+// city scope only, so a rig scope runs no issue-root read of any shape and the
+// summary has no such field. Every other assertion is #6050's own.
 func TestReaperOnlyCountsWorkflowIssueRootsOutsideTheCityScope(t *testing.T) {
 	f := newWorkflowRootCensusFixture(t, "issue", "root-a:close root-b:keep root-c:close")
 	f.env["CENSUS_SCOPE"] = "rig:api"
@@ -5214,11 +5221,24 @@ func TestReaperOnlyCountsWorkflowIssueRootsOutsideTheCityScope(t *testing.T) {
 	if got := workflowRootVerbIDs(bdText, "close"); got != "" {
 		t.Fatalf("closed %q outside the city scope, want none", got)
 	}
-	gcText := f.read(t, f.gcLog)
-	for _, want := range []string{"skipped_non_city_workflow_issue_roots:3,", "workflow_root_census:0/0,"} {
-		if !strings.Contains(gcText, want) {
-			t.Fatalf("summary missing %q:\n%s", want, gcText)
+	// The census store logs every call it answers as "<scope>|<args>", and a
+	// query's own lines follow its first one, so each line belongs to the
+	// scope of the last line that opened an entry.
+	scope := ""
+	for _, line := range strings.Split(f.read(t, f.doltLog), "\n") {
+		if s, _, ok := strings.Cut(line, "|"); ok && (s == "city" || strings.HasPrefix(s, "rig:")) {
+			scope = s
 		}
+		if scope == "rig:api" && strings.Contains(line, "workflow_issue_root_candidates") {
+			t.Fatalf("the rig scope ran a workflow issue-root read, want none outside the city scope:\n%s", line)
+		}
+	}
+	gcText := f.read(t, f.gcLog)
+	if !strings.Contains(gcText, "workflow_root_census:0/0,") {
+		t.Fatalf("summary missing %q:\n%s", "workflow_root_census:0/0,", gcText)
+	}
+	if strings.Contains(gcText, "skipped_non_city_workflow_issue_roots") {
+		t.Fatalf("summary reports rig issue roots that no scope reads:\n%s", gcText)
 	}
 }
 
