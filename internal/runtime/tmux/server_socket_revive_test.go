@@ -356,7 +356,7 @@ func TestReviveVerifiesANodeAlreadyAtThePath(t *testing.T) {
 	}{
 		{name: "owned-but-unresponsive", setup: func(f *reviveFixture) { f.servers, f.answerPID = []int{27432}, 26334 }, refuses: "restored-socket-unresponsive"},
 		{name: "two-owners", setup: func(f *reviveFixture) { f.servers = []int{27432, 26334} }, refuses: "restored-socket-owner-mismatch"},
-		{name: "stale-no-owner", setup: func(f *reviveFixture) {}},
+		{name: "stale-no-owner", setup: func(*reviveFixture) {}},
 		{name: "owned-and-answering", setup: func(f *reviveFixture) { f.servers = []int{27432} }},
 		{name: "owner-probe-not-installed", setup: func(f *reviveFixture) { f.findErr = errOwnerProbeUnavailable }},
 	} {
