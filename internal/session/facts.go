@@ -15,8 +15,10 @@ import (
 type Facts struct{ v [numFactKeys]string }
 
 // numFactKeys is the number of keys Facts holds; TestFactsKeys pins it to
-// the registry.
-const numFactKeys = 75
+// the registry. The carry's two premise keys (resume_seeded, ga-oe8h;
+// gc.release_deferred, ga-dt5ffp) count in it: short of them, Facts would
+// drop the last two assignment identity keys from every comparison.
+const numFactKeys = 77
 
 // factKeys are Facts' keys, and identityFrom the index of the first
 // assignment identity key outside the premise.
