@@ -61,14 +61,6 @@ func replyToRetiredSession(t *testing.T, store beads.Store, p *Provider, retired
 	return reply, next
 }
 
-func messageIDs(msgs []mail.Message) []string {
-	ids := make([]string, 0, len(msgs))
-	for _, m := range msgs {
-		ids = append(ids, m.ID)
-	}
-	return ids
-}
-
 func containsMessage(msgs []mail.Message, id string) bool {
 	for _, m := range msgs {
 		if m.ID == id {

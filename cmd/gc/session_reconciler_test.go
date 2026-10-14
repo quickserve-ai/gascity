@@ -11339,7 +11339,7 @@ func TestReconcileSessionBeads_IdleCheckGetsTheProviderFamilyNotItsName(t *testi
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			env := newReconcilerTestEnv()
+			env := newReconcilerTestEnv(t)
 			env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
 			env.addDesired("worker", "worker", true)
 			session := env.createSessionBead("worker", "worker")
@@ -11351,11 +11351,10 @@ func TestReconcileSessionBeads_IdleCheckGetsTheProviderFamilyNotItsName(t *testi
 			it := newFakeIdleTracker()
 
 			cfgNames := configuredSessionNames(env.cfg, "", env.store)
-			reconcileSessionBeads(
-				context.Background(), []beads.Bead{session}, env.desiredState, cfgNames,
-				env.cfg, env.sp, env.store, nil, nil, nil, env.dt, map[string]int{}, false, nil, "",
-				it, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr,
-			)
+			reconcileSessionBeadsAtPath(
+				context.Background(), env.city, []beads.Bead{session}, env.desiredState, cfgNames,
+				env.cfg, env.sp, env.store, nil, nil, nil, nil, env.dt, map[string]int{}, false, nil, "",
+				it, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr)
 
 			got, called := it.providers["worker"]
 			if !called {
@@ -15097,7 +15096,7 @@ func TestReconcileSessionBeads_PoolSuccessClearsLegacyStartupHealthEpisode(t *te
 // runtime cadence. A session without the always-named marker must NOT be held.
 func TestReconcileSessionBeads_DrainAckStampsHeartbeatCooldown(t *testing.T) {
 	run := func(t *testing.T, named bool) (beads.Bead, time.Time) {
-		env := newReconcilerTestEnv()
+		env := newReconcilerTestEnv(t)
 		env.cfg = &config.City{
 			Agents: []config.Agent{{Name: "worker", SleepAfterIdle: config.SessionSleepOff}},
 		}
@@ -15116,12 +15115,11 @@ func TestReconcileSessionBeads_DrainAckStampsHeartbeatCooldown(t *testing.T) {
 		if err := dops.setDrainAck("worker"); err != nil {
 			t.Fatalf("setDrainAck: %v", err)
 		}
-		reconcileSessionBeads(
-			context.Background(), []beads.Bead{session}, env.desiredState,
+		reconcileSessionBeadsAtPath(
+			context.Background(), env.city, []beads.Bead{session}, env.desiredState,
 			map[string]bool{"worker": true}, env.cfg, env.sp, env.store, dops,
-			nil, nil, env.dt, nil, false, nil, "",
-			nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr,
-		)
+			nil, nil, nil, env.dt, nil, false, nil, "",
+			nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr)
 		return env.reconcileStopPendingToTerminal(t, env.sp, session, dops, map[string]bool{"worker": true}), env.clk.Now()
 	}
 

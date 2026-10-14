@@ -353,7 +353,7 @@ func TestRunWorkflowServeSkipsNonControlKindWithoutQuarantine(t *testing.T) {
 		}, nil
 	}
 	var dispatched []string
-	controlDispatcherServe = func(cityPath, storePath, beadID string, stdout, stderr io.Writer) error {
+	controlDispatcherServe = func(cityPath, storePath, beadID string, stdout, stderr io.Writer, _ *executionEmitDeferral) error {
 		dispatched = append(dispatched, beadID)
 		cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
 		return runControlDispatcherWithStoreAndConfig(cityPath, storePath, store, beadID, cfg, stdout, stderr)

@@ -1024,7 +1024,7 @@ func TestSnapshotPaneIdleWithPrefixHourSpinner(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			tm := NewTmux()
 			tm.exec = &fakeExecutor{agentPane: true, out: tt.pane}
-			got, err := tm.snapshotPaneIdleWithPrefix("gc-test", "❯")
+			got, err := tm.snapshotPaneIdleWithPrefix("gc-test", "❯", false)
 			if err != nil {
 				t.Fatalf("snapshotPaneIdleWithPrefix error = %v, want nil", err)
 			}

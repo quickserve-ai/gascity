@@ -9021,7 +9021,7 @@ func TestLaunchDriftRelaunchRecordsConversationReset(t *testing.T) {
 			"started_provision_hash": runtime.ProvisionFingerprint(oldCfg),
 			"started_launch_hash":    runtime.LaunchFingerprint(oldCfg),
 		})
-		ok, _ := relaunchAgentForLaunchDrift(context.Background(), env.sp, sessionFrontDoor(env.store), env.sessionInfo(b.ID), "worker",
+		ok, _ := relaunchAgentForLaunchDrift(context.Background(), nil, env.sp, sessionFrontDoor(env.store), env.sessionInfo(b.ID), "worker",
 			tp, t.TempDir(), env.cfg, env.store, dispatchOptionSources{}, runtime.CoreFingerprint(agentCfg), runtime.CoreFingerprint(agentCfg),
 			runtime.ProvisionFingerprint(oldCfg), runtime.LaunchFingerprint(oldCfg), []string{"Command"}, rec, nil, &env.stdout, &env.stderr)
 		if !ok || env.sp.CountCalls("Relaunch", "worker") != 1 {

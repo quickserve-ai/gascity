@@ -108,7 +108,7 @@ max_active_sessions = 1
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := cmdSessionClose([]string{sessionBead.ID}, &stdout, &stderr)
+	code := cmdSessionClose([]string{sessionBead.ID}, "", &stdout, &stderr, false)
 
 	reopened, err := openCityStoreAt(cityDir)
 	if err != nil {
@@ -237,7 +237,7 @@ max_active_sessions = 1
 	}
 
 	var stdout, stderr bytes.Buffer
-	code := cmdSessionClose([]string{sessionBead.ID}, &stdout, &stderr)
+	code := cmdSessionClose([]string{sessionBead.ID}, "", &stdout, &stderr, false)
 
 	reopened, err := openCityStoreAt(cityDir)
 	if err != nil {

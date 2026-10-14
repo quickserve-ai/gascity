@@ -13,7 +13,7 @@ import (
 // that the awake set has no reason to keep awake: no pool demand, no hold.
 func newDesiredPoolSeatWithNoWakeReason(t *testing.T) (*reconcilerTestEnv, beads.Bead) {
 	t.Helper()
-	env := newReconcilerTestEnv()
+	env := newReconcilerTestEnv(t)
 	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
 	env.addDesired("worker", "worker", true)
 	session := env.createSessionBead("worker", "worker")
@@ -23,8 +23,8 @@ func newDesiredPoolSeatWithNoWakeReason(t *testing.T) (*reconcilerTestEnv, beads
 }
 
 func reconcileDesiredPoolSeat(env *reconcilerTestEnv, session beads.Bead, work []beads.Bead) {
-	reconcileSessionBeads(
-		context.Background(),
+	reconcileSessionBeadsAtPath(
+		context.Background(), env.city,
 		[]beads.Bead{session},
 		env.desiredState,
 		nil,
@@ -32,7 +32,7 @@ func reconcileDesiredPoolSeat(env *reconcilerTestEnv, session beads.Bead, work [
 		env.sp,
 		env.store,
 		newDrainOps(env.sp),
-		work,
+		work, nil,
 		nil,
 		env.dt,
 		nil,
@@ -45,8 +45,7 @@ func reconcileDesiredPoolSeat(env *reconcilerTestEnv, session beads.Bead, work [
 		0,
 		0,
 		&env.stdout,
-		&env.stderr,
-	)
+		&env.stderr)
 }
 
 // Control: a desired pool seat holding nothing drains for no-wake-reason
