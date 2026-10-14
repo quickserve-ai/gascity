@@ -238,7 +238,8 @@ func operatorMailIdentities() []string {
 // no caller identity to bind the sender to (mc-8e9ci), so a sender is the
 // operator, a configured agent, a configured named session or a live session
 // of a configured agent. An empty sender is no identity either (v5.10f): a
-// message names who sent it.
+// message names who sent it. The carry also accepts a seat of a
+// [mail.crosscity] peer city (peerCityMailSender).
 func (s *Server) refuseUnconfiguredMailSender(ctx context.Context, from string) error {
 	from = strings.TrimSpace(from)
 	if slices.Contains(operatorMailIdentities(), from) {
@@ -261,6 +262,11 @@ func (s *Server) refuseUnconfiguredMailSender(ctx context.Context, from string) 
 				}
 			}
 		}
+	}
+	// Carry (#5386 via PROP-027): a seat of a [mail.crosscity] peer city,
+	// city-qualified. Drop when upstream binds a sender to its caller (mc-8e9ci).
+	if s.peerCityMailSender(from) {
+		return nil
 	}
 	return apierr.ValidationFailed.With("mail sender "+strconv.Quote(from)+" is no configured identity: send as the operator, a configured agent or a named session (the API cannot yet bind a sender to its caller); nothing was sent",
 		&huma.ErrorDetail{Location: "body.from", Message: "not a configured mail identity", Value: from})
