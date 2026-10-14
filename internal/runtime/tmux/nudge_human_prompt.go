@@ -3,6 +3,7 @@ package tmux
 import (
 	"errors"
 	"fmt"
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -750,21 +751,28 @@ func (t *Tmux) undimmedComposerDraft(target, promptPrefix string) (bool, string)
 }
 
 // sessionClientCount returns how many tmux clients are attached to the
-// session, or -1 when that cannot be read. #{session_attached} is a COUNT:
-// IsSessionAttached tests it for "1" only, so gc's own hidden attach client
-// plus a person (2) reads as detached there. The nudge path uses this instead,
-// and treats -1 as attached: when it cannot tell, it assumes a person may be
-// typing.
+// session, or -1 when that cannot be read, and the nudge path treats -1 as
+// attached: when it cannot tell, it assumes a person may be typing. It reads
+// upstream's attach probe (SessionAttachedWithError: #{session_name} echoed
+// beside #{session_attached}, which is a COUNT) and keeps the count, so the
+// carry's guards and upstream's attach checks read one probe.
 func (t *Tmux) sessionClientCount(target string) int {
-	out, err := t.run("display-message", "-t", paneTarget(target), "-p", "#{session_attached}")
+	if strings.TrimSpace(target) == "" {
+		return -1
+	}
+	out, err := t.run("display-message", "-t", paneTarget(target), "-p", "#{session_name}|#{session_attached}")
 	if err != nil {
 		return -1
 	}
-	n, err := strconv.Atoi(strings.TrimSpace(out))
-	if err != nil {
+	echoed, count, _ := cutLast(strings.TrimSpace(out), "|")
+	if echoed == "" || (validSessionNameRe.MatchString(target) && echoed != target) {
 		return -1
 	}
-	return n
+	n, err := parseAttachedClients(count)
+	if err != nil || n > math.MaxInt32 {
+		return -1
+	}
+	return int(n)
 }
 
 // stripTerminalStyle removes escape sequences from one captured line: CSI

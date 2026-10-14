@@ -21,6 +21,7 @@ var Analyzer = New(Config{
 			"doStartStandalone":                      "oneShotStore, the store the one-shot pass registers as the work leg",
 			"gather":                                 "gatherEnv.WorkStore: cr.cityBeadStore (newPlannerHost)",
 			"gatherEnv.externalReadsEnv":             "gatherEnv.WorkStore, as gather mints it",
+			"evaluateStoppedAgentHomeCandidate":      "cityStore: the controller's city bead store, or gc worktree-gc's openStoreAtForCity (carry, agent-home reaper)",
 		},
 		"workLegsFromCensus": {
 			"CityRuntime.workLegs":                   "over cityWorkLegOf(cr.cityWorkStore())",
@@ -30,6 +31,7 @@ var Analyzer = New(Config{
 			"doStartStandalone":                      "over its cityWorkLegOf",
 			"gather":                                 "over its cityWorkLegOf",
 			"gatherEnv.externalReadsEnv":             "over its cityWorkLegOf",
+			"evaluateStoppedAgentHomeCandidate":      "over its cityWorkLegOf (carry, agent-home reaper)",
 		},
 	},
 	// The release primitives (R9 REL): every release path goes through
