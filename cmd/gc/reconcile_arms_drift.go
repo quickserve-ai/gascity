@@ -168,6 +168,7 @@ func (r *rowFacts) driftRepair(cfg runtime.Config, stored, core string) (intent,
 	if !restartKeyMints(res.TP, info) {
 		patch["session_key"] = "" // the start launches bare, its provider minting its own
 	}
+	session.StampPriorSessionKeyInfo(patch, info) // the key reset away stays findable (ga-oe8h), as legacy's drift reset stamps it
 	maps.Copy(patch, session.MetadataPatch{
 		namedSessionConfigDriftDeferredAtMetadata: "", namedSessionConfigDriftDeferredKeyMetadata: "",
 		sessionAttachedConfigDriftDeferredAtMetadata: "", sessionAttachedConfigDriftDeferredKeyMetadata: "",
@@ -178,6 +179,7 @@ func (r *rowFacts) driftRepair(cfg runtime.Config, stored, core string) (intent,
 	composed := repair
 	composed.Patch = maps.Clone(patch)
 	composed.Patch["session_key"] = ""
+	session.StampPriorSessionKeyInfo(composed.Patch, info)
 	if start := r.startHealed(composed); start.Kind == intentStart {
 		return start, true
 	}
