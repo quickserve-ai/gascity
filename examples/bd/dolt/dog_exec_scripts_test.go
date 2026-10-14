@@ -6321,6 +6321,78 @@ func TestDoctorFallbackScanReadsTheManifestNotTheNewestChunk(t *testing.T) {
 	}
 }
 
+// TestDoctorFallbackScanCreditsTheSyncStampOnlyWithAManifest pins the fallback
+// scan (no db-named remote directory) under the carry's composition with
+// upstream #7381 (ga-g3p5rm). A bare-file artifact dir, with no manifest, is
+// dated by its newest matching file as upstream dates it, and the sync stamp
+// is ignored there: it proves a `dolt backup sync`, and no Dolt remote exists
+// to have been synced, so a fresh stamp must not make a stale chunk read
+// fresh. With a manifest, the newer of it and the stamp dates the backup.
+func TestDoctorFallbackScanCreditsTheSyncStampOnlyWithAManifest(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		chunkStale bool // prod.backup/chunk.darc is two hours old, else written now
+		manifest   bool // prod.backup/manifest, two hours old
+		stamp      bool // a sync stamp for prod, written now
+		want       string
+		dontWant   []string
+	}{
+		{name: "no manifest, fresh chunk, no stamp", dontWant: []string{"prod backup"}},
+		{name: "no manifest, stale chunk, fresh stamp", chunkStale: true, stamp: true, want: "prod backup is 2h old", dontWant: []string{"prod backup missing", "no successful sync recorded"}},
+		{name: "no manifest, fresh chunk, fresh stamp", stamp: true, dontWant: []string{"prod backup"}},
+		{name: "old manifest, fresh stamp", manifest: true, stamp: true, dontWant: []string{"prod backup"}},
+		{name: "old manifest, no stamp", manifest: true, want: "prod backup is 2h old (no successful sync recorded)", dontWant: []string{"prod backup missing"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cityPath := t.TempDir()
+			dataDir := filepath.Join(cityPath, "dolt-data")
+			artifactDir := filepath.Join(cityPath, ".dolt-backup")
+			if err := os.MkdirAll(filepath.Join(dataDir, "prod", ".dolt"), 0o755); err != nil {
+				t.Fatalf("mkdir prod: %v", err)
+			}
+			// prod.backup/, never prod/: only the fallback scan reads it.
+			if err := os.MkdirAll(filepath.Join(artifactDir, "prod.backup"), 0o755); err != nil {
+				t.Fatalf("mkdir prod.backup: %v", err)
+			}
+			now := time.Now()
+			old := now.Add(-2 * time.Hour)
+			chunkAt := now
+			if tc.chunkStale {
+				chunkAt = old
+			}
+			writeBackupRemoteFile(t, filepath.Join(artifactDir, "prod.backup", "chunk.darc"), chunkAt)
+			if tc.manifest {
+				writeBackupRemoteFile(t, filepath.Join(artifactDir, "prod.backup", "manifest"), old)
+			}
+			if tc.stamp {
+				writeDoctorLocalSyncStamp(t, cityPath, "prod", now)
+			}
+
+			binDir := t.TempDir()
+			gcLogPath := writeDogFakeGC(t, binDir)
+			writeDoctorFakeDoltWithBackupRemotes(t, binDir, "prod")
+
+			out := runDogScript(t, "mol-dog-doctor.sh", binDir, cityPath, dataDir, doctorBackupStaleEnv)
+			if !strings.Contains(out, "server: ok") {
+				t.Fatalf("unexpected doctor output:\n%s", out)
+			}
+			// No log means the doctor sent no advisory at all.
+			gcLog, err := os.ReadFile(gcLogPath)
+			if err != nil && !os.IsNotExist(err) {
+				t.Fatalf("read gc log: %v", err)
+			}
+			if tc.want != "" && !strings.Contains(string(gcLog), tc.want) {
+				t.Fatalf("want %q in log:\n%s", tc.want, gcLog)
+			}
+			for _, dontWant := range tc.dontWant {
+				if strings.Contains(string(gcLog), dontWant) {
+					t.Fatalf("unexpected %q in log:\n%s", dontWant, gcLog)
+				}
+			}
+		})
+	}
+}
+
 func TestDoctorScriptUsesServerMaxConnections(t *testing.T) {
 	for _, tc := range []struct {
 		name      string

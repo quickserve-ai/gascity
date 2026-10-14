@@ -149,6 +149,25 @@ backup_commit_mtime_for_db() {
     fi
 }
 
+# Succeed when the backup backup_commit_mtime_for_db dates for a database is a
+# Dolt remote's: its db-named directory's manifest or, without that directory,
+# a matching manifest. Only then can the local sync-success stamp (ga-g3p5rm)
+# speak for it: the stamp proves a `dolt backup sync`, and a bare-file
+# artifact dir has no Dolt remote for a sync to have written.
+backup_has_manifest_for_db() {
+    db_name="$1"
+    if [ -d "$BACKUP_ARTIFACT_DIR/$db_name" ]; then
+        [ -f "$BACKUP_ARTIFACT_DIR/$db_name/manifest" ]
+        return
+    fi
+    while IFS= read -r -d '' backup_path; do
+        if backup_path_matches_db "$db_name" "${backup_path#$BACKUP_ARTIFACT_DIR/}"; then
+            return 0
+        fi
+    done < <(find "$BACKUP_ARTIFACT_DIR" -type f -name manifest -print0 2>/dev/null)
+    return 1
+}
+
 append_backup_stale() {
     backup_stale_item="$1"
     if [ -n "$BACKUP_STALE_ITEMS" ]; then
@@ -249,8 +268,8 @@ if [ -n "$BACKUP_ELIGIBLE_DBS" ]; then
     else
         NOW_S=$(date +%s)
         for db in $BACKUP_ELIGIBLE_DBS; do
-            # A backup's age is the newer of two proofs that a sync completed,
-            # and counts only while the remote holds a restorable backup:
+            # A Dolt remote's backup is dated by the newer of two proofs that a
+            # sync completed:
             #   - the remote's manifest (backup_commit_mtime_for_db, upstream
             #     #7381), rewritten last by a sync that adopted new data, so
             #     the orphan chunks a KILLED sync leaves never date it;
@@ -258,21 +277,31 @@ if [ -n "$BACKUP_ELIGIBLE_DBS" ]; then
             #     `dolt backup sync` exits 0. An up-to-date sync does not
             #     rewrite the manifest, so the manifest alone would page on
             #     every idle database.
-            # No restorable backup is "missing", whatever the stamp says. A
-            # stale backup with no stamp at all says so: no sync of it was
-            # ever recorded as successful.
+            # Nothing to date is "missing", whatever the stamp says. A
+            # bare-file artifact dir (no manifest) keeps upstream's dating by
+            # its newest file, and the stamp does not count there. A stale
+            # remote with no stamp at all says so: no sync of it was ever
+            # recorded as successful.
             BACKUP_COMMIT_MTIME=$(backup_commit_mtime_for_db "$db")
             if [ "$BACKUP_COMMIT_MTIME" -le 0 ]; then
                 append_backup_stale "$db backup missing"
                 continue
             fi
+            # The stamp counts only while a manifest exists: a bare-file
+            # artifact dir (no manifest) is dated by its newest file alone, as
+            # upstream dates it, so a fresh stamp cannot make a stale chunk
+            # read fresh where no Dolt remote was ever synced.
             # Guarded for `set -euo pipefail`: a missing stamp is normal (a
             # database not synced since the stamp shipped), and an unguarded
             # pipeline over a nonexistent file would abort the doctor pass.
+            BACKUP_STAMP_COUNTS=0
             BACKUP_SYNCED_AT=0
-            if [ -f "$LOCAL_BACKUP_FRESHNESS_DIR/$db" ]; then
-                BACKUP_SYNCED_AT=$(sed -n 's/^synced_at_epoch=//p' \
-                    "$LOCAL_BACKUP_FRESHNESS_DIR/$db" 2>/dev/null | head -1 || true)
+            if backup_has_manifest_for_db "$db"; then
+                BACKUP_STAMP_COUNTS=1
+                if [ -f "$LOCAL_BACKUP_FRESHNESS_DIR/$db" ]; then
+                    BACKUP_SYNCED_AT=$(sed -n 's/^synced_at_epoch=//p' \
+                        "$LOCAL_BACKUP_FRESHNESS_DIR/$db" 2>/dev/null | head -1 || true)
+                fi
             fi
             case "$BACKUP_SYNCED_AT" in ''|*[!0-9]*) BACKUP_SYNCED_AT=0 ;; esac
             BACKUP_FRESH_AT="$BACKUP_COMMIT_MTIME"
@@ -281,7 +310,7 @@ if [ -n "$BACKUP_ELIGIBLE_DBS" ]; then
             fi
             BACKUP_AGE=$((NOW_S - BACKUP_FRESH_AT))
             if [ "$BACKUP_AGE" -gt "$BACKUP_STALE_S" ]; then
-                if [ "$BACKUP_SYNCED_AT" -le 0 ]; then
+                if [ "$BACKUP_STAMP_COUNTS" -eq 1 ] && [ "$BACKUP_SYNCED_AT" -le 0 ]; then
                     append_backup_stale "$db backup is $((BACKUP_AGE / 3600))h old (no successful sync recorded)"
                 else
                     append_backup_stale "$db backup is $((BACKUP_AGE / 3600))h old"
