@@ -24,25 +24,42 @@ var sessionStartFenceAllowlist = map[string]string{
 	"cmd/gc/session_lifecycle_parallel.go|startPreparedStartCandidate|StartResolved": "worker-handle start; reached only through runPreparedStartCandidate, whose every caller is runFencedPreparedStartCandidate (bracketed); session handles also land in Manager.startRuntime (hooked)",
 	"internal/worker/runtime_handle.go|(*RuntimeHandle).StartResolved|Start":         "runtime-only worker handle (no session bead, so no Manager); in-process it is started only by startPreparedStartCandidate, which runFencedPreparedStartCandidate brackets; the API server's wakes use session-backed handles",
 	"cmd/gc/reconcile_planner.go|(*planner).run|Start@method value":                  "not a runtime call: p.last.Start is the time.Time a planner pass began (plannerPassStats), read to pace the next pass; upstream's v2 planner (#7285) starts nothing here",
+	// Upstream's v2 relaunch (#7636) names a bool fact Relaunch; reading it
+	// starts nothing. The relaunch itself is relaunchCall's, bracketed.
+	"cmd/gc/reconcile_effect_abandon.go|rollbackClose|Relaunch@method value":    "not a runtime call: v.It.Relaunch is the intent's bool relaunch flag (S7), read to keep the configured named row for A18",
+	"cmd/gc/reconcile_effect_abandon.go|rollbackStep|Relaunch@method value":     "not a runtime call: v.It.Relaunch is the intent's bool relaunch flag (S7), read to decide the rollback's step",
+	"cmd/gc/reconcile_effects_registry.go|newEffectPass|Relaunch@method value":  "not a runtime call: env.Relaunch is reconcileEnv's bool relaunch capability, copied onto the stripped env",
+	"cmd/gc/reconcile_keys.go|(*reconcileEnv).relaunches|Relaunch@method value": "not a runtime call: e.Relaunch is reconcileEnv's bool relaunch capability, read when the provider was stripped",
 }
 
 // sessionStartFenceBrackets are the calls that open a session-start fence
-// bracket. A runtime-creating call is covered when one of them appears
-// earlier in the same innermost function.
-var sessionStartFenceBrackets = map[string]bool{
-	"beginStart":           true, // cmd/gc sessionStartFence
-	"BeginStart":           true,
-	"bracketStart":         true, // internal/session Manager.startRuntime
-	"BracketProviderStart": true,
+// bracket, each with the number of arguments it takes. A runtime-creating
+// call is covered when one of them appears earlier in the same innermost
+// function. The arity is part of the match: upstream's v2 launch gates a start
+// on its shutdown with a package function beginStart(ctx), which shares the
+// fence method's name but opens no bracket.
+var sessionStartFenceBrackets = map[string]int{
+	"beginStart":           0, // cmd/gc sessionStartFence
+	"BeginStart":           0,
+	"bracketStart":         2, // internal/session Manager.startRuntime
+	"BracketProviderStart": 1,
+}
+
+// isSessionStartFenceBracket reports a call that opens a session-start fence
+// bracket: a bracket name called with that bracket's arity.
+func isSessionStartFenceBracket(call *ast.CallExpr) bool {
+	arity, ok := sessionStartFenceBrackets[ratchetCalleeName(call.Fun)]
+	return ok && len(call.Args) == arity
 }
 
 // TestSessionStartFenceRatchet keeps every in-process runtime creation inside
 // the worktree reaper's session-start fence (ga-yuiof4 item 3). It scans the
 // non-test Go files of the packages that create runtimes in the controller
-// process for provider-shaped calls — Start/Relaunch/StartResolved with three
-// arguments (ctx, name-or-command, runtime config), the runtime.Provider,
-// runtime.RelaunchProvider and worker-handle signatures — and fails on any that
-// is neither bracketed nor allowlisted with a reason.
+// process for provider-shaped calls — Start/Relaunch with three arguments
+// (ctx, name-or-command, runtime config), the runtime.Provider and
+// runtime.RelaunchProvider signatures, and the worker handle's StartResolved
+// with four (ctx, actor, command, runtime config) — and fails on any that is
+// neither bracketed nor allowlisted with a reason.
 //
 // One-argument handle.Start(ctx) calls are not scanned: a worker handle's
 // Start always ends in one of the scanned three-argument sites (a session
@@ -92,10 +109,15 @@ func TestSessionStartFenceRatchet(t *testing.T) {
 var runtimeCreatingMethods = map[string]bool{"Start": true, "Relaunch": true, "StartResolved": true}
 
 // isRuntimeCreatingCall reports a provider-shaped call: a runtime-creating
-// method with three arguments (ctx, name-or-command, runtime config).
+// method with three arguments (ctx, name-or-command, runtime config), or the
+// worker handle's StartResolved with four (ctx, actor, command, runtime
+// config): upstream #7496 put the session Actor on the worker verbs.
 func isRuntimeCreatingCall(call *ast.CallExpr) bool {
 	sel, ok := call.Fun.(*ast.SelectorExpr)
-	return ok && runtimeCreatingMethods[sel.Sel.Name] && len(call.Args) == 3
+	if !ok || !runtimeCreatingMethods[sel.Sel.Name] {
+		return false
+	}
+	return len(call.Args) == 3 || (sel.Sel.Name == "StartResolved" && len(call.Args) == 4)
 }
 
 // scanFenceFile checks every function declared in one parsed file.
@@ -141,7 +163,7 @@ func scanFenceFunc(fset *token.FileSet, rel, fn string, body *ast.BlockStmt, fin
 				goCalls[x.Call] = true
 			}
 		case *ast.CallExpr:
-			if sessionStartFenceBrackets[ratchetCalleeName(x.Fun)] {
+			if isSessionStartFenceBracket(x) {
 				brackets = append(brackets, x.Pos())
 			}
 			if sel, ok := x.Fun.(*ast.SelectorExpr); ok {
@@ -242,6 +264,16 @@ func TestSessionStartFenceRatchet_RejectsEscapingShapes(t *testing.T) {
 			name:      "control: unrelated one-argument Start",
 			src:       "func f(p Plane) { p.Start(ctx) }",
 			wantFlags: 0,
+		},
+		{
+			name:      "a one-argument beginStart(ctx) gate is no fence bracket",
+			src:       "func f(leaf P) error { if !beginStart(ctx) { return nil }; return leaf.Start(ctx, \"n\", cfg) }",
+			wantFlags: 1,
+		},
+		{
+			name:      "an unbracketed four-argument worker StartResolved",
+			src:       "func f(h H) error { return h.StartResolved(ctx, by, \"cmd\", cfg) }",
+			wantFlags: 1,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

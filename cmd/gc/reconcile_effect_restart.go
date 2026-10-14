@@ -196,6 +196,13 @@ func relaunchCall(ctx context.Context, c txCaps, p relaunchPlan) (relaunched, er
 	case strings.TrimSpace(p.row.SessionKey) == "" && p.tp.ResolvedProvider != nil && strings.TrimSpace(p.tp.ResolvedProvider.SessionIDFlag) != "":
 		out.Err = errors.New("relaunch would mint a speculative resume key") // legacy's preparation mints one here, then falls back
 	default:
+		// The relaunch respawns the agent in its work dir: bracket it in the
+		// worktree reaper's session-start fence as legacy's
+		// relaunchAgentForLaunchDrift does (carry ga-yuiof4 item 3, fork
+		// #182), on the composite the controller registers the fence for.
+		// Opened before the attach read, so that read stays the last before
+		// the Relaunch; closed when this Call returns.
+		defer session.BracketProviderStart(c.start.sp)()
 		if out.Held, _ = attachLeg(ctx, p.leaf, p.name, false, p.now); out.Held != "" {
 			return out, nil
 		}

@@ -331,6 +331,13 @@ func startLaunch(ctx context.Context, c txCaps, in launchPass) (startOutcome, er
 	leaf, _, _ := runtime.ResolveBackend(c.start.sp, name)
 	prepared.cfg.FreshOnly = true
 	in.w.Templates.installSideEffects(in.agent, in.tp)
+	// The start creates a runtime in the row's work dir: bracket it in the
+	// worktree reaper's session-start fence like every controller start (carry
+	// ga-yuiof4 item 3, fork #182). The composite is the provider the
+	// controller registers the fence for; deferred, so a panic cannot leave
+	// the start counted in flight. Opened before the shutdown gate below, so
+	// a wait on a removal comes before the gate, not after it.
+	defer session.BracketProviderStart(c.start.sp)()
 	if !beginStart(ctx) {
 		return startOutcome{}, context.Cause(ctx) // the shutdown came first: never begin a start after it
 	}
