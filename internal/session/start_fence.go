@@ -1,7 +1,6 @@
 package session
 
 import (
-	"context"
 	"reflect"
 	"sync"
 
@@ -93,6 +92,12 @@ func BracketProviderStart(sp runtime.Provider) func() {
 	return bracketStart(nil, sp)
 }
 
+// bracketStart begins every fence that applies to a start through sp (direct,
+// then each RegisterStartFence fence for sp) and returns the func that ends
+// them. Each place a Manager asks its provider to start a runtime opens it
+// right before the call, deferred in a closure around the call alone (chat.go,
+// manager.go): the provider Start stays lexically in the function upstream's
+// runtime-lease lint (runtimelease) allowlists with the lease it runs under.
 func bracketStart(direct StartFence, sp runtime.Provider) func() {
 	var fences []StartFence
 	if direct != nil {
@@ -113,12 +118,4 @@ func bracketStart(direct StartFence, sp runtime.Provider) func() {
 			f.EndStart()
 		}
 	}
-}
-
-// startRuntime is the ONLY place a Manager asks its provider to start a
-// runtime. Every fence that applies (WithStartFence, RegisterStartFence) is
-// begun before the call and ended after it, deferred.
-func (m *Manager) startRuntime(ctx context.Context, name string, cfg runtime.Config) error {
-	defer bracketStart(m.startFence, m.sp)()
-	return m.sp.Start(ctx, name, cfg)
 }
