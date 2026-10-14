@@ -98,11 +98,10 @@ func (f *drainAckTeardownFixture) tick(t *testing.T, dops drainOps) {
 	for _, s := range f.sessions {
 		current = append(current, mustGetBead(t, f.store, s.ID))
 	}
-	reconcileSessionBeads(
-		context.Background(), current, ds.State, map[string]bool{drainAckTeardownTemplate: true},
-		f.cfg, f.sp, f.store, dops, nil, nil, f.dt, ds.PoolDesiredCounts, false, nil, "trace-town",
-		nil, f.clk, f.rec, 0, 0, io.Discard, &f.stderr,
-	)
+	reconcileSessionBeadsAtPath(
+		context.Background(), f.cityDir, current, ds.State, map[string]bool{drainAckTeardownTemplate: true},
+		f.cfg, f.sp, f.store, dops, nil, nil, nil, f.dt, ds.PoolDesiredCounts, false, nil, "trace-town",
+		nil, f.clk, f.rec, 0, 0, io.Discard, &f.stderr)
 }
 
 // tickSummary is the template tick summary the trace would record for the pool
@@ -402,7 +401,7 @@ func TestDrainAckTeardown_CertParkReadsLiveLabelsNotCache(t *testing.T) {
 
 	var stderr bytes.Buffer
 	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
-	outcome := tearDownDrainAckedPoolSeat("", nil, store, nil, seedSessionInfo(mustGetBead(t, mem, seat.ID)), now, &stderr)
+	outcome := tearDownDrainAckedPoolSeat(store, testSeatWork("", nil, store, nil), seedSessionInfo(mustGetBead(t, mem, seat.ID)), now, &stderr)
 	if outcome.closed || outcome.retainedFor != "cert_parked_work:"+work.ID {
 		t.Fatalf("outcome = %+v, want retained for cert_parked_work:%s (the live row carries the hold); stderr=%s", outcome, work.ID, stderr.String())
 	}
@@ -427,7 +426,7 @@ func TestDrainAckTeardown_NonPoolSeatsKeptWithReason(t *testing.T) {
 		{name: "named seat", meta: map[string]string{namedSessionMetadataKey: "true", "pool_managed": "true"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			env := newReconcilerTestEnv()
+			env := newReconcilerTestEnv(t)
 			env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
 			env.addDesired("worker", "worker", true)
 			fake := events.NewFake()
@@ -446,11 +445,10 @@ func TestDrainAckTeardown_NonPoolSeatsKeptWithReason(t *testing.T) {
 				t.Fatalf("setDrainAck: %v", err)
 			}
 			cfgNames := map[string]bool{"worker": true}
-			reconcileSessionBeads(
-				context.Background(), []beads.Bead{seat}, env.desiredState, cfgNames, env.cfg, env.sp,
-				env.store, dops, nil, nil, env.dt, nil, false, nil, "",
-				nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr,
-			)
+			reconcileSessionBeadsAtPath(
+				context.Background(), env.city, []beads.Bead{seat}, env.desiredState, cfgNames, env.cfg, env.sp,
+				env.store, dops, nil, nil, nil, env.dt, nil, false, nil, "",
+				nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr)
 			got := env.reconcileStopPendingToTerminal(t, env.sp, seat, dops, cfgNames)
 			if got.Status == "closed" {
 				t.Fatalf("%s was closed; a non-pool seat must be kept", tc.name)

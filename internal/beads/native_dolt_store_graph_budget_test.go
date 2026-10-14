@@ -10,6 +10,7 @@ import (
 	"time"
 
 	beadslib "github.com/steveyegge/beads"
+	"github.com/steveyegge/beads/issueops"
 )
 
 // budgetExhaustedTestPlan is the smallest plan that reaches the edge loop:
@@ -31,10 +32,22 @@ func budgetExhaustedTestPlan() *GraphApplyPlan {
 // budgetTestStore returns a native store whose AddDependency runs hook, over
 // the in-memory storage fake the other graph-apply tests use.
 func budgetTestStore(hook func(context.Context, *beadslib.Dependency) error) *NativeDoltStore {
-	return newNativeDoltStoreForTest(&nativeDoltFailingDependencyStorage{
+	return newNativeDoltStoreForTest(&budgetTestStorage{&nativeDoltFailingDependencyStorage{
 		nativeDoltMemStorage: newNativeDoltMemStorage(),
 		addDependency:        hook,
-	})
+	}})
+}
+
+// budgetTestStorage routes the graph apply's batch through the double's own
+// AddDependency: since upstream #7049 the native graph apply is one batch
+// request (BatchApplier), and rawBatchApplier replays its dep_add items on
+// this storage, so the hook still runs inside the apply's derived context.
+type budgetTestStorage struct {
+	*nativeDoltFailingDependencyStorage
+}
+
+func (s *budgetTestStorage) BatchApplier() (issueops.BatchApplier, error) {
+	return rawBatchApplier{storage: s}, nil
 }
 
 // An apply whose own derived context expires while the caller's context is
@@ -87,9 +100,6 @@ func TestApplyGraphPlanWrapsOwnDeadlineAsBudgetExhausted(t *testing.T) {
 		}
 		if want := fmt.Sprintf("%d nodes/%d edges", len(plan.Nodes), len(plan.Edges)); !strings.Contains(err.Error(), want) {
 			t.Errorf("error = %v, want the plan size %q named", err, want)
-		}
-		if !strings.Contains(err.Error(), "adding edge") {
-			t.Errorf("error = %v, want the failing edge named", err)
 		}
 	})
 }

@@ -7286,7 +7286,6 @@ func TestNudgeOverACrashedAgentQueues(t *testing.T) {
 	})
 }
 
-
 func TestNudgeSenderIdentityPrecedenceAndStamp(t *testing.T) {
 	t.Setenv("GC_AGENT", "woodhouse")
 	t.Setenv("GC_ALIAS", "wh-alias")

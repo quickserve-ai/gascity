@@ -601,7 +601,7 @@ func TestNudgeDeadLetterBounceSkipsManagedWakeRollback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if err := mgr.Suspend(info.ID); err != nil {
+	if err := mgr.Suspend(context.Background(), testOperatorIn(t, dir), info.ID, false); err != nil {
 		t.Fatalf("Suspend: %v", err)
 	}
 	if err := store.SetMetadata(info.ID, "state", "closing"); err != nil {

@@ -18,7 +18,7 @@ import (
 // stamps held_until if hold is non-zero.
 func newUndesiredPoolSeat(t *testing.T, hold time.Duration) (*reconcilerTestEnv, beads.Bead, string) {
 	t.Helper()
-	env := newReconcilerTestEnv()
+	env := newReconcilerTestEnv(t)
 	env.cfg = &config.City{Agents: []config.Agent{{Name: "other"}}}
 	_ = env.sp.Start(context.Background(), "worker", runtime.Config{})
 	session := env.createSessionBead("worker", "worker")
@@ -348,7 +348,7 @@ func TestAdvanceSessionDrains_HeartbeatHeldPoolSeatSurvivesOrphanDeadline(t *tes
 		return &got
 	})
 
-	advanceSessionDrainsWithSessionsTraced(dt, sp, store, lookup, map[string]wakeEvaluation{}, &config.City{}, clk, nil)
+	advanceSessionDrainsWithSessionsTraced(t.TempDir(), dt, sp, store, lookup, map[string]wakeEvaluation{}, &config.City{}, clk, nil)
 
 	if !sp.IsRunning("worker") {
 		t.Fatal("heartbeat-held pool seat was force-stopped by the drain scan past an orphan deadline")
@@ -370,7 +370,7 @@ func TestAdvanceSessionDrains_HeartbeatHeldPoolSeatSurvivesOrphanDeadline(t *tes
 			t.Fatalf("SetMeta(%s): %v", key, err)
 		}
 	}
-	advanceSessionDrainsWithSessionsTraced(dt, sp, store, lookup, map[string]wakeEvaluation{}, &config.City{}, clk, nil)
+	advanceSessionDrainsWithSessionsTraced(t.TempDir(), dt, sp, store, lookup, map[string]wakeEvaluation{}, &config.City{}, clk, nil)
 	if sp.IsRunning("worker") {
 		t.Fatal("agent-acked orphan drain must still force-stop past its deadline despite the hold")
 	}
@@ -430,7 +430,7 @@ func TestReconcileSessionBeads_HeartbeatHoldLeavesAckWhenProvenanceUnreadable(t 
 		reason:     "orphaned",
 		generation: 1,
 	})
-	advanceSessionDrainsWithSessionsTraced(env.dt, sp, env.store, infoLookupFromBeadLookup(func(id string) *beads.Bead {
+	advanceSessionDrainsWithSessionsTraced(env.city, env.dt, sp, env.store, infoLookupFromBeadLookup(func(id string) *beads.Bead {
 		b, _ := env.store.Get(id)
 		return &b
 	}), map[string]wakeEvaluation{}, env.cfg, env.clk, nil)

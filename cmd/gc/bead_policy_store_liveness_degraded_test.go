@@ -138,7 +138,7 @@ func TestLivenessReadMarkersNeverPersistOnCreate(t *testing.T) {
 			liveness.ReadDegradedKey: "true",
 			liveness.WrittenAtKey:    "2026-09-17T00:00:00Z",
 			"alias":                  "katya",
-			"sleep_intent":           "user-hold",
+			"last_woke_at":           "2026-09-17T00:00:00Z",
 		}
 	}
 	assertClean := func(t *testing.T, path, id string) {
