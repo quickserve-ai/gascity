@@ -62,6 +62,8 @@ func TestHealStatePatchWithRollbackInfo(t *testing.T) {
 		"continuation_reset_pending": "true", "pending_create_claim": "", "pending_create_started_at": "",
 		"primed_at": "", "priming_attempted_at": "", "prompt_hash": "", "resume_failures": "", "resume_launch": "",
 		"session_key": "", "sleep_reason": "runtime-missing", "started_config_hash": "", "state": "asleep",
+		// The carry's seeded-resume latch (ga-oe8h) is cleared with the key.
+		"resume_seeded": "",
 	}
 
 	cases := []healOracleCase{
@@ -145,7 +147,7 @@ func TestHealStatePatchWithRollbackInfo(t *testing.T) {
 			meta:     map[string]string{"state": "active", "configured_named_session": "true", "configured_named_identity": "mayor", "configured_named_mode": "singleton", "session_name": "mayor", "session_key": "sk", "started_config_hash": "h"},
 			alive:    false,
 			rollback: true,
-			want:     map[string]string{"continuation_reset_pending": "true", "primed_at": "", "priming_attempted_at": "", "prompt_hash": "", "resume_failures": "", "resume_launch": "", "session_key": "", "sleep_reason": "runtime-missing", "started_config_hash": "", "state": "asleep"},
+			want:     map[string]string{"continuation_reset_pending": "true", "primed_at": "", "priming_attempted_at": "", "prompt_hash": "", "resume_failures": "", "resume_launch": "", "resume_seeded": "", "session_key": "", "sleep_reason": "runtime-missing", "started_config_hash": "", "state": "asleep"},
 		},
 		{
 			// gascity#5121: a failed liveness probe (Observed=false) must not be
