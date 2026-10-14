@@ -147,9 +147,13 @@ gc agent add --name worker --prompt-template ./worker.md --suspended
 
 Report whether an assignee identity belongs to another city's roster.
 
-Answers the question the pool sweeper's foreign-identity gate answers, using the
+Answers the roster half of the pool sweeper's foreign-identity gate, using the
 same code: is this &lt;rig&gt;/&lt;name&gt; identity one THIS city configures, or one it
-merely SEES in a shared rig store?
+merely SEES in a shared rig store? It decides on roster membership only. The
+in-process sweeper also accepts this city's own session records as provenance
+(an identity off the roster that one of its session records answers to), so
+the two can differ, only in the conservative direction: this verb can answer
+"foreign" for an identity the sweeper treats as this city's own.
 
 Exit codes:
   0  local    this city can answer this identity's liveness
