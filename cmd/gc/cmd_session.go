@@ -1745,7 +1745,7 @@ The session bead persists and can be resumed later.
 
 The hold is durable: a suspended session that still owns assigned work stays
 asleep rather than being restarted to serve it, and its pool slot and claim are
-left alone. It comes back on ` + "`gc session wake`" + `, or when the hold expires.
+left alone. It comes back on ` + "`gc session wake`" + `.
 
 Where session liveness is kept in a separate store, this holds only while that
 store can be read: a reconciler tick that cannot read it may still restart a
