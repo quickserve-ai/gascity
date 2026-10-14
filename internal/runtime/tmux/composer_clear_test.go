@@ -135,6 +135,9 @@ type fakeClaudePane struct {
 	// ignoreCtrlU makes Ctrl-U and Ctrl-K no-ops (an input box that will
 	// not clear).
 	ignoreCtrlU bool
+	// swallowEnter makes Enter a no-op: the draft stays in the input box,
+	// the way a submit raced against the paste is dropped (ga-bwm).
+	swallowEnter bool
 	// placeholder is drawn dim in an empty input box, as Claude draws
 	// "Try \"write a test for <filepath>\"" at startup.
 	placeholder string
@@ -425,7 +428,7 @@ func (f *fakeClaudePane) sendKeys(args []string) error {
 			f.draft = ""
 			f.cursor = draftEnd
 		case "Enter":
-			if f.draft != "" {
+			if f.draft != "" && !f.swallowEnter {
 				f.submitted = append(f.submitted, f.draft)
 				f.draft = ""
 				f.cursor = draftEnd
