@@ -195,12 +195,18 @@ func classifyHumanPrompt(lines []string, promptPrefix string, checkDraft bool) s
 	if reason := classifyDialog(lines[composerIdx+1:]); reason != "" {
 		return reason
 	}
-	if checkDraft {
-		if found, text := composerDraft(lines, promptPrefix); found && text != "" && !isGCNudgeDraft(text) {
-			return NudgeDeferReasonHumanDraft
-		}
+	if checkDraft && composerHoldsHumanDraft(lines, promptPrefix) {
+		return NudgeDeferReasonHumanDraft
 	}
 	return ""
+}
+
+// composerHoldsHumanDraft reports whether the live composer holds text that is
+// not gc's own (isGCNudgeDraft): the draft half of classifyHumanPrompt, which
+// applies it only where the caller says a draft can be a person's.
+func composerHoldsHumanDraft(lines []string, promptPrefix string) bool {
+	found, text := composerDraft(lines, promptPrefix)
+	return found && text != "" && !isGCNudgeDraft(text)
 }
 
 // composerDraft returns the text in the live composer and whether a composer
@@ -698,9 +704,15 @@ func (t *Tmux) classifyPaneLines(session, target string, lines []string, checkDr
 // change the idle timeout reclaimed such a seat, and it keeps doing so (F1).
 // Other providers' non-faint placeholders are not distinguishable from
 // drafts, so only Claude drafts are classified.
+//
+// The client count and the provider are read only when the composer holds
+// text the draft rule could hold on, so a pane without one costs SnapshotIdle
+// no probe beyond its one capture.
 func (t *Tmux) classifyLifecycleHumanPrompt(session, target string, lines []string, prefix string) string {
-	draft := t.sessionClientCount(session) != 0 && t.paneIsClaudeFamily(target)
-	reason := classifyHumanPrompt(lines, prefix, draft)
+	reason := classifyHumanPrompt(lines, prefix, false)
+	if reason == "" && composerHoldsHumanDraft(lines, prefix) && t.sessionClientCount(session) != 0 && t.paneIsClaudeFamily(target) {
+		reason = NudgeDeferReasonHumanDraft
+	}
 	switch reason {
 	case NudgeDeferReasonSelectionPrompt:
 		return ""
