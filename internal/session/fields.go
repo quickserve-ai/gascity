@@ -406,8 +406,10 @@ var registry = slices.Concat([]Field{
 	// with the key it names.
 	{Key: resumeSeededKey, Class: ClassMarker, Writers: sites(op("cmd/gc/cmd_session_history.go", "cmdSessionResume")), Clears: append(sites(legacyCommit), resumeRunClears...)},
 	// The carry's deferred-release obligation (ga-dt5ffp): a close that withholds
-	// work publishes it on the closing session row.
-	{Key: beadmeta.ReleaseDeferredMetadataKey, Class: ClassMarker, Writers: sites(op("cmd/gc/session_release_marker.go", "publishDeferredReleaseObligation"), op("cmd/gc/session_release_marker.go", "publishDeferredReleaseObligationUnconditionally"))},
+	// work publishes it on the closing session row. Advisory: only its publisher
+	// reads it back (readSessionReleaseObligation, for its own CAS upgrade); no
+	// decision reads it, so no fence compares it.
+	{Key: beadmeta.ReleaseDeferredMetadataKey, Class: ClassAdvisory, Writers: sites(op("cmd/gc/session_release_marker.go", "publishDeferredReleaseObligation"), op("cmd/gc/session_release_marker.go", "publishDeferredReleaseObligationUnconditionally"))},
 	{Key: "alias", Class: ClassAssignmentIdentity, Writers: sites(legacy(srcPoolNames, "createPoolSessionBeadWithIdentifiers"), v2("cmd/gc/allocator_create_named.go", "createEffects.writeNamed"))},
 	{Key: aliasHistoryMetadataKey, Class: ClassLaunchConfig, Writers: sites(legacy("internal/session/alias.go", "UpdatedAliasMetadata"))},
 	{Key: "common_name", Class: ClassLaunchConfig, NoWriter: "retired: no production writer; name lookups still query it"},
