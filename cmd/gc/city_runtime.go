@@ -657,6 +657,39 @@ func (cr *CityRuntime) controllerStoreSchemaSkewDiagnostic() *beads.BeadsDiagnos
 	return diag
 }
 
+// probePublishingOpenSchemaSkew runs, ahead of time, the city-store open a
+// publication of next makes when it cannot reuse the current stores
+// (controllerState.updateLocked), and latches its diagnostic as that open
+// would when it finds the store's schema ahead of this binary (ga-mw4dg).
+// A provider swap stops the runtimes the new provider cannot reach before it
+// publishes (CONTRACT P7), and those stops cannot be undone, while the
+// publishing open is the authoritative schema gate: the swap calls this
+// first, so a skewed store fails the reload closed with nothing stopped. A
+// publication that reuses the current stores opens nothing (the preflight
+// was its gate), and neither does this; an open that errs is left to the
+// publication, which reports it.
+func (cr *CityRuntime) probePublishingOpenSchemaSkew(next *config.City) *beads.BeadsDiagnostic {
+	cs := cr.cs
+	if cs == nil || cs.runtimeUpdateCanReuseCurrentStores(next) {
+		return nil
+	}
+	opened, err := newControllerStateOpenCityStore(cs.cityPath, cs.rolloutFlags.BeadsConditionalWrites(), cs.nativeTransport)
+	if err != nil {
+		return nil
+	}
+	if opened.Store != nil {
+		closeBeadStoreHandle(opened.Store) //nolint:errcheck // a probe's handle; the publication opens its own
+	}
+	if !beads.IsSchemaSkewDiagnostic(opened.Diagnostic) {
+		return nil
+	}
+	diag := diagnosticPtr(opened.Diagnostic)
+	cs.mu.Lock()
+	cs.cityBeadsDiagnostic = diag
+	cs.mu.Unlock()
+	return diag
+}
+
 // holdForControllerStoreSchemaSkew blocks until shutdown when the controller
 // store is newer than this binary. The preserve latch protects every outer
 // lifecycle owner that may call shutdown after run returns.
@@ -3006,6 +3039,14 @@ func (cr *CityRuntime) reloadConfigTraced(
 		// restarts or frees them as after any other death. A failed stop
 		// aborts before publication, while the old provider still reaches it.
 		if len(stops) > 0 {
+			// The publishing open below is the authoritative schema gate
+			// (ga-mw4dg), but these stops come first and cannot be undone: run
+			// that open now, so a store newer than this binary fails the reload
+			// closed and preserves sessions before any is stopped.
+			if diag := cr.probePublishingOpenSchemaSkew(nextCfg); diag != nil {
+				cr.preserveSessionsOnShutdown()
+				return swapFailed(fmt.Errorf("blocked by native store schema mismatch before stopping %d agent(s): %s", len(stops), diag.PreflightReason))
+			}
 			fmt.Fprintf(cr.stdout, "Provider changed (%s), stopping %d agent(s) the new provider cannot reach...\n", //nolint:errcheck
 				providerSwapSummary, len(stops))
 			if err := stopProviderSwapRuntimes(stops, cr.cfg, cr.sessionsBeadStore().Store, cr.rec, cr.stdout, cr.stderr); err != nil {
