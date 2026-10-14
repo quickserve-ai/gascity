@@ -79,3 +79,22 @@ func TestSimRestartHandoffStampsPriorSessionKey(t *testing.T) {
 	}
 	s.noViolations(t)
 }
+
+// The same for a row whose runtime is already gone, which the restart
+// finalizes without a stop.
+func TestSimRestartHandoffOfAGoneRowStampsPriorSessionKey(t *testing.T) {
+	s := scripted(t, nil, poolRow("gc-1", "worker", 1, "asleep", "instance_token", "tok-1", "session_key", "k-1", "started_config_hash", "h-1"), gc1Work())
+	s.ask(restartAsked...)
+	for range 6 {
+		s.settle()
+		if m := s.gc1(); m["restart_requested"] == "" {
+			if m[session.PriorSessionKeyMetadata] != "k-1" {
+				t.Fatalf("prior_session_key = %q after the handoff, want k-1 (row %v)", m[session.PriorSessionKeyMetadata], m)
+			}
+			s.noViolations(t)
+			return
+		}
+		s.advance(simPatrol)
+	}
+	t.Fatalf("row %v: the restart was never handed off", s.gc1())
+}
