@@ -220,7 +220,14 @@
               "nudge-drop",
               "beads-city-migrate-proxied",
               "storage-repair-sequence",
-              "runtime-workdir-export"
+              "runtime-workdir-export",
+              "session-bind-cloud",
+              "session-resume",
+              "worktree-gc",
+              "worktree-rescue",
+              "worktree-teardown",
+              "session-history",
+              "agent-is-foreign"
             ]
           },
           "event_id": {

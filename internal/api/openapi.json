@@ -342,6 +342,24 @@
               "null"
             ]
           },
+          "OptInSkills": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "OptInSkillsAppend": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "OptionDefaults": {
             "additionalProperties": {
               "type": "string"
@@ -510,6 +528,12 @@
               "null"
             ]
           },
+          "WakeTransport": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "WorkDir": {
             "type": [
               "string",
@@ -529,6 +553,7 @@
           "PreStart",
           "PromptTemplate",
           "Session",
+          "WakeTransport",
           "Provider",
           "Upstream",
           "Args",
@@ -565,6 +590,8 @@
           "SessionLiveAppend",
           "InstallAgentHooksAppend",
           "InjectFragmentsAppend",
+          "OptInSkills",
+          "OptInSkillsAppend",
           "MaxActiveSessions",
           "MinActiveSessions",
           "ScaleCheck"
@@ -588,6 +615,23 @@
           "name": {
             "description": "Agent name.",
             "type": "string"
+          },
+          "opt_in_skills": {
+            "description": "Replace the agent's opt-in skill selection (binding-qualified names of skills a pack ships under skills/opt-in/). An empty list clears it; omit the field to inherit the underlying agent's list.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "opt_in_skills_append": {
+            "description": "Opt-in skills to add to the agent's selection.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
           },
           "provider": {
             "description": "Override the agent's provider.",
@@ -903,6 +947,9 @@
         "additionalProperties": false,
         "properties": {
           "assignee": {
+            "type": "string"
+          },
+          "await_type": {
             "type": "string"
           },
           "close_reason": {
@@ -2778,6 +2825,9 @@
           },
           {
             "$ref": "#/components/schemas/SessionPoolSlotRetiredAtDrainDeadlinePayload"
+          },
+          {
+            "$ref": "#/components/schemas/SessionReleaseDeferredPayload"
           },
           {
             "$ref": "#/components/schemas/SessionResetStalledPayload"
@@ -7054,6 +7104,21 @@
         ],
         "type": "object"
       },
+      "RigDoctorPatch": {
+        "additionalProperties": false,
+        "properties": {
+          "CensusOwnerNamespace": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "CensusOwnerNamespace"
+        ],
+        "type": "object"
+      },
       "RigPatch": {
         "additionalProperties": false,
         "properties": {
@@ -7074,6 +7139,9 @@
               "string",
               "null"
             ]
+          },
+          "Doctor": {
+            "$ref": "#/components/schemas/RigDoctorPatch"
           },
           "FormulaVars": {
             "additionalProperties": {
@@ -8333,6 +8401,9 @@
           "attached": {
             "type": "boolean"
           },
+          "base_state": {
+            "type": "string"
+          },
           "configured_named_session": {
             "type": "boolean"
           },
@@ -8343,6 +8414,9 @@
           "context_window": {
             "format": "int64",
             "type": "integer"
+          },
+          "control_plane": {
+            "type": "boolean"
           },
           "created_at": {
             "type": "string"
@@ -8374,6 +8448,9 @@
           "model": {
             "type": "string"
           },
+          "navigator_schema_version": {
+            "type": "string"
+          },
           "options": {
             "additionalProperties": {
               "type": "string"
@@ -8382,6 +8459,9 @@
           },
           "pool": {
             "type": "string"
+          },
+          "pool_managed": {
+            "type": "boolean"
           },
           "provider": {
             "type": "string"
@@ -8396,6 +8476,9 @@
             "type": "boolean"
           },
           "session_name": {
+            "type": "string"
+          },
+          "session_origin": {
             "type": "string"
           },
           "state": {
@@ -8423,6 +8506,11 @@
           "session_name",
           "created_at",
           "attached",
+          "configured_named_session",
+          "pool_managed",
+          "control_plane",
+          "base_state",
+          "navigator_schema_version",
           "running"
         ],
         "type": "object"
@@ -13108,6 +13196,7 @@
             "request.result.session.submit": "#/components/schemas/TypedEventStreamEnvelopeRequestResultSessionSubmit",
             "rig.provision.progress": "#/components/schemas/TypedEventStreamEnvelopeRigProvisionProgress",
             "session.cold_start_timeout": "#/components/schemas/TypedEventStreamEnvelopeSessionColdStartTimeout",
+            "session.config_drift_wave": "#/components/schemas/TypedEventStreamEnvelopeSessionConfigDriftWave",
             "session.conversation_reset": "#/components/schemas/TypedEventStreamEnvelopeSessionConversationReset",
             "session.crashed": "#/components/schemas/TypedEventStreamEnvelopeSessionCrashed",
             "session.demand_claim_divergence": "#/components/schemas/TypedEventStreamEnvelopeSessionDemandClaimDivergence",
@@ -13361,6 +13450,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionColdStartTimeout"
+          },
+          {
+            "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionConfigDriftWave"
           },
           {
             "$ref": "#/components/schemas/TypedEventStreamEnvelopeSessionConversationReset"
@@ -14845,9 +14937,11 @@
                 "session.stranded",
                 "session.pool_slot_retired_at_drain_deadline",
                 "session.stranded_claims",
+                "session.release_deferred",
                 "session.unknown_state",
                 "session.wake_refused",
                 "session.reset_stalled",
+                "session.config_drift_wave",
                 "session.work_query_failed",
                 "session.drain_fence_unavailable",
                 "session.demand_claim_divergence",
@@ -17691,6 +17785,63 @@
         "title": "TypedEventStreamEnvelope session.cold_start_timeout",
         "type": "object"
       },
+      "TypedEventStreamEnvelopeSessionConfigDriftWave": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/NoPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.config_drift_wave",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload"
+        ],
+        "title": "TypedEventStreamEnvelope session.config_drift_wave",
+        "type": "object"
+      },
       "TypedEventStreamEnvelopeSessionConversationReset": {
         "additionalProperties": false,
         "properties": {
@@ -19875,6 +20026,7 @@
             "request.result.session.submit": "#/components/schemas/TypedTaggedEventStreamEnvelopeRequestResultSessionSubmit",
             "rig.provision.progress": "#/components/schemas/TypedTaggedEventStreamEnvelopeRigProvisionProgress",
             "session.cold_start_timeout": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionColdStartTimeout",
+            "session.config_drift_wave": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionConfigDriftWave",
             "session.conversation_reset": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionConversationReset",
             "session.crashed": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionCrashed",
             "session.demand_claim_divergence": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionDemandClaimDivergence",
@@ -20128,6 +20280,9 @@
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionColdStartTimeout"
+          },
+          {
+            "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionConfigDriftWave"
           },
           {
             "$ref": "#/components/schemas/TypedTaggedEventStreamEnvelopeSessionConversationReset"
@@ -21707,9 +21862,11 @@
                 "session.stranded",
                 "session.pool_slot_retired_at_drain_deadline",
                 "session.stranded_claims",
+                "session.release_deferred",
                 "session.unknown_state",
                 "session.wake_refused",
                 "session.reset_stalled",
+                "session.config_drift_wave",
                 "session.work_query_failed",
                 "session.drain_fence_unavailable",
                 "session.demand_claim_divergence",
@@ -24744,6 +24901,67 @@
           "city"
         ],
         "title": "TypedTaggedEventStreamEnvelope session.cold_start_timeout",
+        "type": "object"
+      },
+      "TypedTaggedEventStreamEnvelopeSessionConfigDriftWave": {
+        "additionalProperties": false,
+        "properties": {
+          "actor": {
+            "type": "string"
+          },
+          "city": {
+            "type": "string"
+          },
+          "depends_on_step_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "message": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/NoPayload"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "step_id": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "ts": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "type": {
+            "const": "session.config_drift_wave",
+            "type": "string"
+          },
+          "workflow": {
+            "$ref": "#/components/schemas/WorkflowEventProjection"
+          }
+        },
+        "required": [
+          "seq",
+          "type",
+          "ts",
+          "actor",
+          "payload",
+          "city"
+        ],
+        "title": "TypedTaggedEventStreamEnvelope session.config_drift_wave",
         "type": "object"
       },
       "TypedTaggedEventStreamEnvelopeSessionConversationReset": {
@@ -38852,7 +39070,7 @@
               },
               "X-GC-Index": {
                 "schema": {
-                  "description": "City event sequence captured before this response's state was read. Resume or block after it to observe every change made through this server that the body does not reflect; a change another process writes directly to the city's stores is reflected once this server applies its event.",
+                  "description": "Latest event sequence number.",
                   "format": "int64",
                   "minimum": 0,
                   "type": "integer"
@@ -40048,7 +40266,7 @@
               },
               "X-GC-Index": {
                 "schema": {
-                  "description": "City event sequence captured before this response's state was read. Resume or block after it to observe every change made through this server that the body does not reflect; a change another process writes directly to the city's stores is reflected once this server applies its event.",
+                  "description": "Latest event sequence number.",
                   "format": "int64",
                   "minimum": 0,
                   "type": "integer"
