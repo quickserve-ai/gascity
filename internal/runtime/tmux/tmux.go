@@ -3901,14 +3901,18 @@ func (t *Tmux) nudgeSession(
 		// no spinner showed, which on a dialog the agent raised in reply meant
 		// answering it. A re-send now needs the typed text still drafted.
 		confirmed, sawIdle, sent, err := submitAndConfirmGated(sendSubmit, wake, busy, mayResend, time.Sleep, t.resendGate(session, target, message, owner))
+		// The human-prompt guard's deferral first, as is: one on a
+		// permission prompt is also a look refusal (NudgeDeferredError.Is),
+		// and prompt.refused would wrap it into an unconfirmed submit and
+		// lose the deferral its callers release without spending an attempt.
+		if errors.Is(err, ErrNudgeDeferredHumanPrompt) {
+			return err
+		}
 		if isLookRefusal(err) {
 			delivered = prompt.submitsSent > 0
 			return prompt.refused(err)
 		}
 		if err != nil {
-			if errors.Is(err, ErrNudgeDeferredHumanPrompt) {
-				return err
-			}
 			return fmt.Errorf("failed to send submit sequence: %w", err)
 		}
 		if sent == 0 {
@@ -4001,11 +4005,12 @@ func (t *Tmux) nudgeSession(
 			time.Sleep(submitReEnterBackoff)
 		}
 		if err := sendSubmit(); err != nil {
-			if isLookRefusal(err) {
-				return prompt.refused(err)
-			}
+			// The deferral first, as in the verified path above.
 			if errors.Is(err, ErrNudgeDeferredHumanPrompt) {
 				return err
+			}
+			if isLookRefusal(err) {
+				return prompt.refused(err)
 			}
 			lastErr = err
 			continue
