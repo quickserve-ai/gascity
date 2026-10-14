@@ -400,7 +400,14 @@ type closeReleases struct {
 
 // release is a work branch's release over the seat's legs, read live.
 func (c *closeReleases) release(r closeRelease) (closeReleased, error) {
-	out, err := ReleaseClaims(seatWorkFor(c.legs, r.scope), r.scope, r.seat, r.why, ReleaseOpts{})
+	// A seat's release reports its landed releases and named proposals where
+	// the close reports (ga-9n8hjv), as the legacy close does; the orphan
+	// release's lines go to the process log, as on every orphan path.
+	opts := ReleaseOpts{Audit: c.stderr}
+	if r.why == releaseOrphan {
+		opts.Audit = nil
+	}
+	out, err := ReleaseClaims(seatWorkFor(c.legs, r.scope), r.scope, r.seat, r.why, opts)
 	logRelease(c.stderr, "closing", r.seat.id, out, err)
 	done := closeReleased{why: r.why, out: out}
 	if r.why == releaseOrphan {
@@ -454,7 +461,7 @@ func (c *closeReleases) cascade(ctx context.Context, it intent) {
 				fmt.Fprintf(c.stderr, "session beads: clearing current claim on closing session %s: %v\n", b.ID, err) //nolint:errcheck // best-effort stderr
 			}
 		}
-		out, err := ReleaseClaims(seatWorkFor(c.legs, scope), scope, releaseSeatOfBead(b), releaseCloseCascade, ReleaseOpts{Late: true, Deadline: deadline})
+		out, err := ReleaseClaims(seatWorkFor(c.legs, scope), scope, releaseSeatOfBead(b), releaseCloseCascade, ReleaseOpts{Late: true, Deadline: deadline, Audit: c.stderr})
 		logRelease(c.stderr, "closing", b.ID, out, err)
 		strand(c.alerts, releaseSeatOfBead(b), strings.TrimSpace(b.Metadata["state"]), out, c.now, c.stderr)
 	}

@@ -148,7 +148,7 @@ func tearDownDrainAckedPoolSeat(
 	if cfg == nil && len(claims) > 0 {
 		readErr = errors.Join(readErr, errReleaseNoConfig)
 	} else {
-		out = releaseListed(claims, releaseDrainAckTeardown, releaseSeatOfInfo(info), cfg, ReleaseOpts{})
+		out = releaseListed(claims, releaseDrainAckTeardown, releaseSeatOfInfo(info), cfg, ReleaseOpts{Audit: stderr})
 	}
 	logRelease(stderr, "drain-acked", info.ID, out, readErr)
 	// A kept claim (a named agent's, proposed not released: ga-9n8hjv; or one
