@@ -544,6 +544,7 @@ go_test(
         "//internal/orderdispatch",
         "//internal/orders",
         "//internal/packman",
+        "//internal/processenv",
         "//internal/processgroup/processgrouptest",
         "//internal/reconcilekey",
         "//internal/rig",
