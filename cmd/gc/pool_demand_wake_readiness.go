@@ -140,6 +140,16 @@ func (r *poolWakeReadiness) vetoesWakeCandidate(b beads.Bead, agentCfg *config.A
 	return !r.servesWakeCandidate(storeRef, b.ID)
 }
 
+// poolWakeWithheldRow is one row the verdict removed from wake demand, as the
+// pure filter (filterAssignedWorkBeadsForPoolDemandAt) returns it for its
+// caller to report: the report takes the verdict's lock and writes stderr,
+// which the v2 allocator's pure pass may not reach.
+type poolWakeWithheldRow struct {
+	storeRef string
+	bead     beads.Bead
+	template string
+}
+
 // reportWithheld names a row this verdict removed from wake demand, once per
 // verdict. The fail-open path reports on stderr, and the withhold path must too:
 // without a record, a pool that stops scaling looks the same as a pool with no
