@@ -244,13 +244,22 @@ var keys = map[string]struct{}{
 	// biggest churn class measured after the first deploy.
 	"last_nudge_delivered_at": {},
 
-	// Stalled-claim backstop state machine (cmd/gc/idle_nudge.go). All three
+	// Stalled-claim backstop state machine (cmd/gc/idle_nudge.go). The marker
 	// keys are written by ONE SetMetadataBatch in writeIdleClaimMarker and
 	// cleared by one in clearIdleClaimMarker, so the count key has to move with
-	// the other two or the batch keeps committing.
-	"idle_claim_nudge_trigger": {},
-	"idle_claim_nudge_count":   {},
-	"idle_claim_nudge_at":      {},
+	// the other two or the batch keeps committing. Upstream #7752 added the
+	// incarnation the marker paces (idle_claim_nudge_token) to the write, and
+	// the terminal drain's once-per-incarnation latch (idle_claim_nudge_stalled
+	// and its token) to the clear, so they move too: left behind, every
+	// observe, reserve and clear commits again. Losing the latch to a lost
+	// working-set row costs at most one repeat drain request for an incarnation
+	// already being drained.
+	"idle_claim_nudge_trigger":       {},
+	"idle_claim_nudge_count":         {},
+	"idle_claim_nudge_at":            {},
+	"idle_claim_nudge_token":         {},
+	"idle_claim_nudge_stalled":       {},
+	"idle_claim_nudge_stalled_token": {},
 
 	// Post-step continuation-claim backstop — the same engine, the same
 	// write-one-batch shape (writeContinuationClaimMarker), so the same
