@@ -371,9 +371,13 @@ func TestSnapshotIdleHumanPrompts(t *testing.T) {
 		provider string
 		attached bool
 		wantIdle bool
+		// wantApproval: Pending reports the prompt as upstream's answerable
+		// approval (#6832's parser reads this layout), not as a terminal-only
+		// human-input interaction; Respond is upstream's answer by label.
+		wantApproval bool
 	}{
 		{name: "detached question", screen: questionDialogFixture},
-		{name: "detached approval", screen: approvalPromptFixture},
+		{name: "detached approval", screen: approvalPromptFixture, wantApproval: true},
 		{name: "human draft", screen: humanDraftFixture, attached: true},
 		// Unsent text on a DETACHED pane is not a human's draft to the
 		// lifecycle paths: on such a pane it is far more often gc's own
@@ -409,6 +413,15 @@ func TestSnapshotIdleHumanPrompts(t *testing.T) {
 			}
 			if (pending == nil) != tt.wantIdle {
 				t.Fatalf("Pending() = %+v, want pending=%v", pending, !tt.wantIdle)
+			}
+			if tt.wantApproval {
+				// The terminal-only reading must not shadow an approval
+				// upstream can answer: it is the fallback for what upstream's
+				// parser does not read.
+				if pending.Kind != "approval" || strings.HasPrefix(pending.RequestID, humanPromptRequestPrefix) {
+					t.Fatalf("Pending() = %+v, want upstream's approval interaction", pending)
+				}
+				return
 			}
 			if pending != nil {
 				err := tm.Respond(session, runtime.InteractionResponse{RequestID: pending.RequestID, Action: "approve"})
