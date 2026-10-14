@@ -173,7 +173,7 @@ func TestReconcileSessionBeads_HeartbeatHoldCancelsAckedOrphanDrain(t *testing.T
 	}
 
 	reconcileSessionBeadsAtPath(
-		context.Background(), "", []beads.Bead{got}, nil, nil, env.cfg, env.sp, env.store,
+		context.Background(), env.city, []beads.Bead{got}, nil, nil, env.cfg, env.sp, env.store,
 		newDrainOps(env.sp), nil, nil, nil, env.dt, map[string]int{}, false, nil, "",
 		nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr,
 	)
@@ -220,7 +220,7 @@ func reconcileUndesiredSeatWithDrainOps(t *testing.T, env *reconcilerTestEnv, id
 		t.Fatalf("Get(%s): %v", id, err)
 	}
 	reconcileSessionBeadsAtPath(
-		context.Background(), "", []beads.Bead{got}, nil, nil, env.cfg, env.sp, env.store,
+		context.Background(), env.city, []beads.Bead{got}, nil, nil, env.cfg, env.sp, env.store,
 		newDrainOps(env.sp), nil, nil, nil, env.dt, map[string]int{}, storeQueryPartial, nil, "",
 		nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr,
 	)
@@ -416,7 +416,7 @@ func TestReconcileSessionBeads_HeartbeatHoldLeavesAckWhenProvenanceUnreadable(t 
 		t.Fatalf("Get: %v", err)
 	}
 	reconcileSessionBeadsAtPath(
-		context.Background(), "", []beads.Bead{got}, nil, nil, env.cfg, sp, env.store,
+		context.Background(), env.city, []beads.Bead{got}, nil, nil, env.cfg, sp, env.store,
 		newDrainOps(sp), nil, nil, nil, env.dt, map[string]int{}, false, nil, "",
 		nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr,
 	)
