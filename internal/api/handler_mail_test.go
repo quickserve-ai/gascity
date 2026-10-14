@@ -1485,7 +1485,7 @@ func TestMailSendUnresolvedForeignTownRecipientNamesTheHubLeg(t *testing.T) {
 
 	send := func(to string) *httptest.ResponseRecorder {
 		t.Helper()
-		body := `{"from":"mayor","to":"` + to + `","subject":"cross-town probe","body":"x"}`
+		body := `{"from":"human","to":"` + to + `","subject":"cross-town probe","body":"x"}`
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, newPostRequest(cityURL(state, "/mail"), bytes.NewBufferString(body)))
 		return rec
@@ -1552,7 +1552,7 @@ func TestMailSendThroughRuntimeNameSquatStoresForTheConfiguredMailbox(t *testing
 	}
 
 	h := newTestCityHandler(t, state)
-	body := `{"from":"mayor","to":"myrig/worker","subject":"through the squat","body":"x"}`
+	body := `{"from":"human","to":"myrig/worker","subject":"through the squat","body":"x"}`
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, newPostRequest(cityURL(state, "/mail"), bytes.NewBufferString(body)))
 	if rec.Code != http.StatusCreated {
@@ -1585,7 +1585,7 @@ func TestMailSendThroughAliasSquatStillRefuses(t *testing.T) {
 		"state":        "active",
 	}, "")
 	h := newTestCityHandler(t, state)
-	body := `{"from":"mayor","to":"myrig/worker","subject":"must refuse","body":"x"}`
+	body := `{"from":"human","to":"myrig/worker","subject":"must refuse","body":"x"}`
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, newPostRequest(cityURL(state, "/mail"), bytes.NewBufferString(body)))
 	if rec.Code < 400 || rec.Code >= 500 {
@@ -1625,7 +1625,7 @@ func TestMailSendTwoSquattersOneHoldingTheAliasStillRefuses(t *testing.T) {
 		"state":        "active",
 	}, "")
 	h := newTestCityHandler(t, state)
-	body := `{"from":"mayor","to":"myrig/worker","subject":"must refuse","body":"x"}`
+	body := `{"from":"human","to":"myrig/worker","subject":"must refuse","body":"x"}`
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, newPostRequest(cityURL(state, "/mail"), bytes.NewBufferString(body)))
 	if rec.Code < 400 || rec.Code >= 500 {
@@ -1675,7 +1675,7 @@ func TestMailSendThroughSquatStoresWhenTheOnlyAliasHolderIsTheSeatsOwnArchivedBe
 		t.Fatalf("fixture: resolution err = %v, want the squat conflict (the archived seat bead must not be canonical)", err)
 	}
 	h := newTestCityHandler(t, state)
-	body := `{"from":"mayor","to":"myrig/worker","subject":"to the seat","body":"x"}`
+	body := `{"from":"human","to":"myrig/worker","subject":"to the seat","body":"x"}`
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, newPostRequest(cityURL(state, "/mail"), bytes.NewBufferString(body)))
 	if rec.Code != http.StatusCreated {
