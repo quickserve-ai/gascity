@@ -28,8 +28,21 @@ import (
 // "qcore/pool.omp-1" resolve against our "qcore/omp" and their live claim reads
 // as our dead instance.
 //
-// So this verb calls poolAssigneeObservability, the SAME function the in-process
-// sweeper calls. The formula decides nothing about identities; it asks.
+// So this verb calls poolAssigneeObservability, the SAME roster function the
+// in-process sweeper calls. The formula decides nothing about identities; it
+// asks.
+//
+// ROSTER MEMBERSHIP ONLY (re-sync #7 decision, navani, OD-3). Since upstream
+// #7763 the sweeper's gate has a second half (foreignClaimGate.observable): an
+// identity off the roster is still this city's own when one of its session
+// records, open or closed, answers to it under its alias, configured named
+// identity or alias history (a namepool seat whose name was trimmed, a named
+// session dropped from config). This verb does not ask that half: it decides on
+// roster membership alone and stays a config-only read. So the two can differ,
+// and only in the conservative direction: the verb answers "foreign" (protect)
+// for an identity the sweeper still reaps by record provenance. Asking the
+// second half would make the verb open the city store for every identity off
+// the roster.
 //
 // EXIT CODES ARE THE CONTRACT, because a shell caller reads them before it reads
 // JSON:
@@ -94,9 +107,13 @@ func newAgentIsForeignCmd(stdout, stderr io.Writer) *cobra.Command {
 		Short: "Report whether an assignee identity belongs to another city's roster",
 		Long: `Report whether an assignee identity belongs to another city's roster.
 
-Answers the question the pool sweeper's foreign-identity gate answers, using the
+Answers the roster half of the pool sweeper's foreign-identity gate, using the
 same code: is this <rig>/<name> identity one THIS city configures, or one it
-merely SEES in a shared rig store?
+merely SEES in a shared rig store? It decides on roster membership only. The
+in-process sweeper also accepts this city's own session records as provenance
+(an identity off the roster that one of its session records answers to), so
+the two can differ, only in the conservative direction: this verb can answer
+"foreign" for an identity the sweeper treats as this city's own.
 
 Exit codes:
   0  local    this city can answer this identity's liveness
