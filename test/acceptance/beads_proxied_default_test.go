@@ -583,7 +583,15 @@ func testNeverFiredOrders(t *testing.T) {
 // report and the raw output.
 func doctorJSONAllowingSchedulerLag(t *testing.T, city *helpers.City, label string) (doctorReport, string) {
 	t.Helper()
-	out, err := city.GC("doctor", "--json")
+	return doctorRunAllowingSchedulerLag(t, label, func() (string, error) { return city.GC("doctor", "--json") })
+}
+
+// doctorRunAllowingSchedulerLag is doctorJSONAllowingSchedulerLag for a caller
+// that runs doctor its own way (another env, or scoped checks): run is called
+// for the first read and again for every deferred first-firing read.
+func doctorRunAllowingSchedulerLag(t *testing.T, label string, run func() (string, error)) (doctorReport, string) {
+	t.Helper()
+	out, err := run()
 	var report doctorReport
 	lastJSONLine(t, out, &report)
 	if err != nil {
@@ -597,7 +605,7 @@ func doctorJSONAllowingSchedulerLag(t *testing.T, city *helpers.City, label stri
 			}
 		}
 		if pending := neverFiredOrders(report); len(pending) > 0 {
-			awaitFirstFirings(t, city, label, pending)
+			awaitFirstFirings(t, run, label, pending)
 		}
 	}
 	return report, out
@@ -633,14 +641,14 @@ func neverFiredOrders(report doctorReport) []string {
 // `gc doctor` is a black-box boundary with no completion signal for an order's
 // first firing, so this polls it (TESTING.md: a context-aware ticker, failing
 // with the last observed state). Boundary owner: this helper.
-func awaitFirstFirings(t *testing.T, city *helpers.City, label string, orders []string) {
+func awaitFirstFirings(t *testing.T, run func() (string, error), label string, orders []string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), schedulerColdStart)
 	defer cancel()
 	tick := time.NewTicker(15 * time.Second)
 	defer tick.Stop()
 	for {
-		out, _ := city.GC("doctor", "--json")
+		out, _ := run()
 		var report doctorReport
 		lastJSONLine(t, out, &report)
 		still := stillNeverFired(report, orders)
@@ -772,12 +780,7 @@ func assertDoctorGreen(t *testing.T, city *helpers.City, label string) {
 func assertDoctorReportsBdOwnedProxiedStore(t *testing.T, city *helpers.City, label string) {
 	t.Helper()
 	const proxiedProviderStoreMessage = "bd-owned proxied store (bd CLI front door)"
-	out, err := city.GC("doctor", "--json")
-	if err != nil {
-		t.Fatalf("gc doctor --json exited non-zero on %s: %v\n%s", label, err, out)
-	}
-	var report doctorReport
-	lastJSONLine(t, out, &report)
+	report, _ := doctorJSONAllowingSchedulerLag(t, city, label)
 	for _, r := range report.Results {
 		if r.Name != "beads-store" {
 			continue
@@ -821,12 +824,7 @@ func readBeadsStorePayloadWith(t *testing.T, env *helpers.Env, cityRoot, label s
 	for _, check := range checks {
 		args = append(args, "--check", check)
 	}
-	out, err := helpers.RunGC(env, cityRoot, args...)
-	if err != nil {
-		t.Fatalf("gc doctor --json exited non-zero on %s: %v\n%s", label, err, out)
-	}
-	var report doctorReport
-	lastJSONLine(t, out, &report)
+	report, _ := doctorRunAllowingSchedulerLag(t, label, func() (string, error) { return helpers.RunGC(env, cityRoot, args...) })
 	for _, r := range report.Results {
 		if r.Name != "beads-store" {
 			continue
@@ -904,12 +902,7 @@ func assertCheckOK(t *testing.T, city *helpers.City, name, label string) {
 
 func assertProxiedBackupAdvisory(t *testing.T, city *helpers.City, label string, want bool, wantScopes ...string) {
 	t.Helper()
-	out, err := city.GC("doctor", "--json")
-	if err != nil {
-		t.Fatalf("gc doctor --json exited non-zero on %s: %v\n%s", label, err, out)
-	}
-	var report doctorReport
-	lastJSONLine(t, out, &report)
+	report, _ := doctorJSONAllowingSchedulerLag(t, city, label)
 
 	var found *doctorCheckResult
 	for i := range report.Results {
