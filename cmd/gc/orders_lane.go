@@ -24,9 +24,9 @@ import (
 //
 // What the lane owns, and why it can:
 //
-//   - The live dispatcher (cr.od), the retired dispatchers awaiting drain, and
-//     the dispatch-side watchdog clocks are held under passMu. A pass holds it
-//     for its whole length; nothing else dispatches.
+//   - The live dispatcher (cr.od) and the retired dispatchers awaiting drain
+//     are held under passMu. A pass holds it for its whole length; nothing
+//     else dispatches. The maintenance watchdog clocks are held under maintMu.
 //   - The order-set bookkeeping (cr.orderSet, cr.orderSetSignature,
 //     cr.orderRescanLast) and a staged replacement dispatcher are held under
 //     setMu, because a config reload on the controller goroutine writes them.
@@ -85,6 +85,13 @@ type ordersLane struct {
 	// Pass counts by trigger, for observability and tests.
 	cadencePasses atomic.Int64
 	wakePasses    atomic.Int64
+
+	// maintMu single-flights the order-store maintenance watchdogs
+	// (runOrderMaintenance), which run on their own goroutine and never take
+	// passMu, so dispatch never waits on a store they are stuck on (ga-yuiof4).
+	// maintWakeCh is wakeCh's twin for that goroutine.
+	maintMu     sync.Mutex
+	maintWakeCh chan struct{}
 }
 
 const (
@@ -100,7 +107,7 @@ const (
 )
 
 func newOrdersLane() *ordersLane {
-	return &ordersLane{wakeCh: make(chan struct{}, 1)}
+	return &ordersLane{wakeCh: make(chan struct{}, 1), maintWakeCh: make(chan struct{}, 1)}
 }
 
 // ordersLaneOf returns this runtime's lane, creating it on first use so a
@@ -110,12 +117,14 @@ func (cr *CityRuntime) ordersLaneOf() *ordersLane {
 	return cr.ordersLane
 }
 
-// wake asks the lane for a pass. Non-blocking; harmless when no lane goroutine
-// is running.
+// wake asks the lane for a pass and a maintenance run. Non-blocking; harmless
+// when no lane goroutine is running.
 func (l *ordersLane) wake() {
-	select {
-	case l.wakeCh <- struct{}{}:
-	default:
+	for _, ch := range []chan struct{}{l.wakeCh, l.maintWakeCh} {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -143,10 +152,17 @@ func (l *ordersLane) lastPass() (at time.Time, reason string, ran bool) {
 // On maintainer-city, where a pass (~32s) outlasts the patrol interval (15s),
 // the backstop comes first and the lane runs one pass per interval plus pass
 // time, whatever the tick does.
+//
+// The order-store maintenance goroutine starts beside it on the same wakes and
+// interval; the returned channel closes once both have exited.
 func (cr *CityRuntime) startOrdersLane(ctx context.Context, cityRoot string) <-chan struct{} {
 	lane := cr.ordersLaneOf()
 	interval := cr.serviceConfigSnapshot().Daemon.PatrolIntervalDuration()
-	return startPacedLane(ctx, interval, 0, lane.wakeCh, func(wake bool) {
+	maintDone := startGatedPacedLane(ctx, interval, 0, lane.maintWakeCh, func(bool) (ran bool) {
+		cr.safeTick(func() { ran = cr.runOrderMaintenance(ctx) }, ordersLaneSafeTickTrigger+"-maintenance")
+		return ran
+	})
+	passesDone := startPacedLane(ctx, interval, 0, lane.wakeCh, func(wake bool) {
 		reason := ordersLaneReasonCadence
 		if wake {
 			reason = ordersLaneReasonWake
@@ -158,6 +174,52 @@ func (cr *CityRuntime) startOrdersLane(ctx context.Context, cityRoot string) <-c
 			cr.runOrdersLanePass(ctx, cityRoot, reason)
 		}, ordersLaneSafeTickTrigger)
 	})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		<-passesDone
+		<-maintDone
+	}()
+	return done
+}
+
+// runOrderMaintenance runs the order-store maintenance watchdogs — stale
+// tracking sweep, order wisp report, closed-tracking retention, nudge/mail
+// sweep — and reports whether it ran. They walk every scope's store, so on a
+// pass a black-holed remote store held every city order behind them for hours
+// (ga-yuiof4); off the pass they hold only each other. An overlapping call is
+// skipped, never queued, and stamps nothing. None of them needs passMu: they
+// touch only their own clocks and the beads, never the dispatcher or its
+// state, and the stale sweep's staleAfter cutoff — not exclusion — is what
+// keeps it off in-flight tracking, as it already is for `gc order
+// sweep-tracking` running beside a live controller.
+func (cr *CityRuntime) runOrderMaintenance(ctx context.Context) bool {
+	lane := cr.ordersLaneOf()
+	if !lane.maintMu.TryLock() {
+		return false
+	}
+	defer lane.maintMu.Unlock()
+	_, cfg := cr.orderPassConfig()
+	// The same skips the pass makes: a suspended city's stores stay unread,
+	// a schema-skewed controller store is not written, and FS pressure sheds.
+	if ctx.Err() != nil || effectiveCitySuspended(cfg, loadSuspensionStateBestEffort(cr.cityPath)) ||
+		cr.controllerStoreSchemaSkewDiagnostic() != nil {
+		return false
+	}
+	if status, ok := currentFSPressureStatus(nil); ok && status.High {
+		return false
+	}
+	now := time.Now()
+	for _, watchdog := range []func(*config.City, time.Time){
+		cr.runOrderTrackingSweepWatchdog, cr.runOrderWispWatchdog,
+		cr.runOrderTrackingRetentionWatchdog, cr.runNudgeMailSweepWatchdog,
+	} {
+		if ctx.Err() != nil {
+			break
+		}
+		watchdog(cfg, now)
+	}
+	return true
 }
 
 // runOrdersLanePass is one lane pass: the schema-skew skip, the FS-pressure
@@ -217,7 +279,7 @@ func (cr *CityRuntime) runOrdersLanePass(ctx context.Context, cityRoot, reason s
 	}
 
 	phaseStart = time.Now()
-	cr.dispatchOrdersLocked(ctx, cityRoot, generation, cfg, false)
+	cr.dispatchOrdersLocked(ctx, cityRoot, generation, cfg)
 	lane.notePass(time.Now(), reason)
 	if trace != nil {
 		trace.RecordControllerOperation(TraceSiteOrderDispatch, TraceReasonRetained, TraceOutcomeComplete,
@@ -294,35 +356,25 @@ func (cr *CityRuntime) ordersLaneShouldSkipForFSPressureLocked(lane *ordersLane,
 
 // dispatchOrders runs one dispatch outside the lane goroutine — the startup
 // pass, which must precede the cold-start session reconcile (MAINT-008). It
-// takes the same lock a lane pass does. bootDispatch is true for that startup
-// pass (see dispatchOrdersLocked).
-func (cr *CityRuntime) dispatchOrders(ctx context.Context, cityRoot string, bootDispatch bool) {
+// takes the same lock a lane pass does, and like every pass it runs no store
+// maintenance, so readiness never waits on retention (#6429).
+func (cr *CityRuntime) dispatchOrders(ctx context.Context, cityRoot string) {
 	lane := cr.ordersLaneOf()
 	lane.passMu.Lock()
 	defer lane.passMu.Unlock()
 	generation, cfg := cr.orderPassConfig()
-	cr.dispatchOrdersLocked(ctx, cityRoot, generation, cfg, bootDispatch)
+	cr.dispatchOrdersLocked(ctx, cityRoot, generation, cfg)
 }
 
 // dispatchOrdersLocked is the dispatch body. passMu must be held; generation
-// and cfg come from orderPassConfig.
-//
-// bootDispatch is true only for the synchronous pass on the startup path: that
-// pass runs before the city reports ready, so it skips the order-tracking
-// retention watchdog, which is always due at boot and lists every closed
-// order-tracking bead before pruning — on a slow store with a large closed
-// backlog that would hold readiness for the whole pass
-// (gastownhall/gascity#6429). The first lane pass runs the watchdog; the other
-// watchdogs still run on the boot pass. This moves the pass, it does not
-// shorten it: the first lane pass still runs the watchdog inline, so the same
-// list delays that pass's order dispatch (gastownhall/gascity#2604).
-func (cr *CityRuntime) dispatchOrdersLocked(ctx context.Context, cityRoot string, generation uint64, cfg *config.City, bootDispatch bool) {
+// and cfg come from orderPassConfig. The store maintenance watchdogs that once
+// ran here, ahead of dispatch, run on their own goroutine (runOrderMaintenance).
+func (cr *CityRuntime) dispatchOrdersLocked(ctx context.Context, cityRoot string, generation uint64, cfg *config.City) {
 	if ctx.Err() != nil {
 		return
 	}
-	// A suspended city gets no order pass at all: dispatch already skips it,
-	// and the tracking and mail watchdogs below would read every scope's
-	// store, restarting the proxies suspension retired.
+	// A suspended city gets no order pass at all: reading every scope's store
+	// would restart the proxies suspension retired.
 	if effectiveCitySuspended(cfg, loadSuspensionStateBestEffort(cr.cityPath)) {
 		return
 	}
@@ -341,18 +393,6 @@ func (cr *CityRuntime) dispatchOrdersLocked(ctx context.Context, cityRoot string
 	// while the previous pass held the lock — before anything dispatches
 	// against the outgoing dispatcher.
 	cr.installPendingOrderDispatcherLocked(ctx)
-	cr.runOrderTrackingSweepWatchdog(cfg, now)
-	cr.runOrderWispWatchdog(cfg, now)
-	if bootDispatch {
-		// #6429: skip without stamping orderTrackingRetentionWatchdogLast, so the
-		// first lane pass still finds the watchdog due.
-		if cr.stderr != nil {
-			fmt.Fprintf(cr.stderr, "%s: order-tracking retention watchdog: deferred on boot; it runs inline on the first orders-lane pass\n", cr.logPrefix) //nolint:errcheck // best-effort stderr
-		}
-	} else {
-		cr.runOrderTrackingRetentionWatchdog(cfg, now)
-	}
-	cr.runNudgeMailSweepWatchdog(cfg, now)
 	if cr.od != nil {
 		cr.od.dispatch(ctx, cityRoot, now)
 	}

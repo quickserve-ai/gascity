@@ -376,7 +376,7 @@ func TestDispatchOrdersSkipsASuspendedCity(t *testing.T) {
 	cr.wispIndexMigrationApplied = true
 	t.Setenv("GC_SUSPENDED", "1")
 	before := len(store.recorded())
-	cr.dispatchOrdersLocked(context.Background(), cr.cityPath, 0, cr.cfg, false)
+	cr.dispatchOrdersLocked(context.Background(), cr.cityPath, 0, cr.cfg)
 	if od.dispatches != 0 {
 		t.Fatalf("dispatched %d order pass(es) in a suspended city", od.dispatches)
 	}
@@ -384,7 +384,7 @@ func TestDispatchOrdersSkipsASuspendedCity(t *testing.T) {
 		t.Fatalf("the order pass touched the store in a suspended city: %v", got)
 	}
 	t.Setenv("GC_SUSPENDED", "")
-	cr.dispatchOrdersLocked(context.Background(), cr.cityPath, 0, cr.cfg, false)
+	cr.dispatchOrdersLocked(context.Background(), cr.cityPath, 0, cr.cfg)
 	if od.dispatches != 1 {
 		t.Fatalf("dispatches after resume = %d, want 1", od.dispatches)
 	}
