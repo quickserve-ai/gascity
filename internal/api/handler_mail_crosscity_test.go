@@ -31,7 +31,7 @@ func TestMailSendCrossCityForeignRecipient(t *testing.T) {
 	enableCrossCity(state)
 	h := newTestCityHandler(t, state)
 
-	body := `{"from":"mayor","to":"gastown/mayor","subject":"cutover","body":"leg is green"}`
+	body := `{"from":"worker","to":"gastown/mayor","subject":"cutover","body":"leg is green"}`
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, newPostRequest(cityURL(state, "/mail"), bytes.NewBufferString(body)))
 	if rec.Code != http.StatusCreated {
@@ -42,8 +42,8 @@ func TestMailSendCrossCityForeignRecipient(t *testing.T) {
 	if sent.To != "gastown/mayor" {
 		t.Errorf("To = %q, want canonical %q", sent.To, "gastown/mayor")
 	}
-	if sent.From != "test-city/mayor" {
-		t.Errorf("From = %q, want city-qualified %q (a plain reply must resolve back)", sent.From, "test-city/mayor")
+	if sent.From != "test-city/worker" {
+		t.Errorf("From = %q, want city-qualified %q (a plain reply must resolve back)", sent.From, "test-city/worker")
 	}
 }
 
@@ -83,7 +83,7 @@ func TestMailSendCrossCityLocalQualifiedRecipient(t *testing.T) {
 	enableCrossCity(state)
 	h := newTestCityHandler(t, state)
 
-	body := `{"from":"mayor","to":"test-city/worker","subject":"s","body":"b"}`
+	body := `{"from":"human","to":"test-city/worker","subject":"s","body":"b"}`
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, newPostRequest(cityURL(state, "/mail"), bytes.NewBufferString(body)))
 	if rec.Code != http.StatusCreated {
@@ -103,7 +103,7 @@ func TestMailSendCrossCityUnknownCityRefused(t *testing.T) {
 	enableCrossCity(state)
 	h := newTestCityHandler(t, state)
 
-	body := `{"from":"mayor","to":"gastwn/mayor","subject":"s","body":"b"}`
+	body := `{"from":"human","to":"gastwn/mayor","subject":"s","body":"b"}`
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, newPostRequest(cityURL(state, "/mail"), bytes.NewBufferString(body)))
 	if rec.Code == http.StatusCreated {
@@ -123,7 +123,7 @@ func TestMailSendCrossCityNoRosterUnchanged(t *testing.T) {
 	state := newFakeState(t)
 	h := newTestCityHandler(t, state)
 
-	body := `{"from":"mayor","to":"gastown/mayor","subject":"s","body":"b"}`
+	body := `{"from":"human","to":"gastown/mayor","subject":"s","body":"b"}`
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, newPostRequest(cityURL(state, "/mail"), bytes.NewBufferString(body)))
 	if rec.Code == http.StatusCreated {
