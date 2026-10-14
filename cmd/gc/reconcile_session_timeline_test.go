@@ -66,7 +66,8 @@ import (
 // TestSessionTimelineDifferential -update-golden` rewrites both goldens, and
 // the test then fails until timelineGoldenRulings admits the fixture's new
 // section, by digest, under a ruling (timelineRulingRefs, a "§12.2 row N",
-// or a merged fix, "fix #NNNN (mc-xxxx)").
+// a merged fix, "fix #NNNN (mc-xxxx)", or, in the fork, a carry ledger row,
+// "carry row xx-xxxx").
 
 var updateTimelineGolden = flag.Bool("update-golden", false, "rewrite the timeline differential's goldens from the copies' outcomes")
 
@@ -572,6 +573,10 @@ var (
 	timelineRulingRefs = []string{"O1", "O2", "O3", "O4", "O5", "O6", "O8", "O9", "O10"}
 	timelineSection122 = regexp.MustCompile(`§12\.2 row \d+\b`)
 	timelineMergedFix  = regexp.MustCompile(`\bfix #[1-9]\d* \(mc-[a-z0-9]{4,}\)`)
+	// timelineCarryRow names a row of the fork's carry ledger (CARRY.md) that
+	// changes legacy on purpose: the fork's admission for a carried legacy
+	// behavior, as a merged fix is upstream's.
+	timelineCarryRow = regexp.MustCompile(`\bcarry row [a-z]{2,}-[a-z0-9]{4,}\b`)
 )
 
 // timelineGoldenRulings admit each fixture's golden section. A change to
@@ -591,6 +596,8 @@ var timelineGoldenRulings = []goldenRuling{
 	{"a manual conversation crashes 31s after wake", "fix #7470 (mc-k1yy6): a committed manual conversation keeps its key and hash through the churn (#7470)", "b82abd57b861"},
 	{"a live quarantined row 29s after wake", timelineGoldenBaseline, "f559e3fcf255"},
 	{"a live quarantined row 31s after wake", timelineGoldenBaseline, "25811fbce399"},
+	{"a live quarantined row 29s after wake", "carry row gc-mdh0 (#6168 replay): a live pool seat holding assigned work stays out of the timer drains, so legacy no longer begins and vetoes a drain of the quarantined holder each tick", "8987a49bd66b"},
+	{"a live quarantined row 31s after wake", "carry row gc-mdh0 (#6168 replay): a live pool seat holding assigned work stays out of the timer drains, so legacy no longer begins and vetoes a drain of the quarantined holder each tick", "af88c5e06ac3"},
 	{"a managed suspend drains, then wake", timelineGoldenBaseline, "48df08bf8396"},
 	{"a managed suspend drains, then wake", "fix #7417 (mc-esqo7)", "61f2ce80feb0"},
 	{"a managed suspend drains, then wake", "fix #7590 (mc-esqo7): the drain's sleep keeps suspended_at (the Sleep cell, NEW2-5)", "e6e0e6743019"},
@@ -626,7 +633,7 @@ func namesRuling(ruling string) bool {
 			return true
 		}
 	}
-	return timelineSection122.MatchString(ruling) || timelineMergedFix.MatchString(ruling)
+	return timelineSection122.MatchString(ruling) || timelineMergedFix.MatchString(ruling) || timelineCarryRow.MatchString(ruling)
 }
 
 // unruledGolden lists the sections no ruling admits and the rulings out of
@@ -644,7 +651,7 @@ func unruledGolden(sections map[string]string, rulings []goldenRuling) []string 
 		case first && r.ruling != timelineGoldenBaseline:
 			out = append(out, fmt.Sprintf("%q's first ruling %q is not the baseline", r.fixture, r.ruling))
 		case !first && (r.ruling == timelineGoldenBaseline || !namesRuling(r.ruling)):
-			out = append(out, fmt.Sprintf("ruling %q for %q names none of %v, a \"§12.2 row N\" nor a \"fix #NNNN (mc-xxxx)\"", r.ruling, r.fixture, timelineRulingRefs))
+			out = append(out, fmt.Sprintf("ruling %q for %q names none of %v, a \"§12.2 row N\", a \"fix #NNNN (mc-xxxx)\" nor a \"carry row xx-xxxx\"", r.ruling, r.fixture, timelineRulingRefs))
 		}
 		inForce[r.fixture] = r
 	}
@@ -779,6 +786,9 @@ func TestTimelineGoldenNeedsARuling(t *testing.T) {
 		{"a fix with no PR number", []goldenRuling{{"a", base, "000000000000"}, {"a", "fix 7417 (mc-esqo7)", da}, {"b", base, db}}, 1},
 		{"a fix with a malformed bead", []goldenRuling{{"a", base, "000000000000"}, {"a", "fix #7417 (esqo7)", da}, {"b", base, db}}, 1},
 		{"a fix as the first entry", []goldenRuling{{"a", "fix #7417 (mc-esqo7)", da}, {"b", base, db}}, 1},
+		// The fork's carry ledger names its own legacy changes (timelineCarryRow).
+		{"a later carry row supersedes", []goldenRuling{{"a", base, "000000000000"}, {"a", "carry row gc-mdh0 (#6168 replay)", da}, {"b", base, db}}, 0},
+		{"a carry row with no bead", []goldenRuling{{"a", base, "000000000000"}, {"a", "carry row", da}, {"b", base, db}}, 1},
 		{"a later entry naming O7", []goldenRuling{{"a", base, "000000000000"}, {"a", "O7", da}, {"b", base, db}}, 1},
 		{"a later baseline", []goldenRuling{{"a", base, "000000000000"}, {"a", base, da}, {"b", base, db}}, 1},
 		{"a later entry naming nothing", []goldenRuling{{"a", base, "000000000000"}, {"a", "looks fine", da}, {"b", base, db}}, 1},
@@ -1017,10 +1027,10 @@ func stabilityTimeline() []timelineFixture {
 			[]parityRow{row("wake_attempts", "2", "quarantined_until", tlAt(time.Hour))}, tlClaim("in_progress", "worker"), []simRuntime{tlLive("gc-1")},
 			[]parityStep{{Name: "seed", Ticks: 1, Restless: true}, {Name: "alive", At: d, Ticks: -1, Restless: true}, {Name: "settled", Ticks: 6}}, tlPol("gc-1"), per) // A7 takes its first pass: no lag
 	}
-	// drained is legacy's drain of the quarantined row, begun and vetoed in
-	// a tick and its follow-up; lagged, v2's current-bead stamp a pass after
-	// the stability clear.
-	drained := map[string]string{"provider:SetMeta s-gc-1": "drain-stop-lag", "provider:RemoveMeta s-gc-1": "drain-stop-lag"}
+	// lagged is v2's current-bead stamp a pass after the stability clear.
+	// Legacy no longer begins and vetoes a drain of the quarantined row each
+	// tick (upstream's drain-stop-lag here): the carry's gc-mdh0 keeps a live
+	// pool seat holding assigned work out of the timer drains, as v2 does.
 	lagged := map[string]string{"row:gc-1:currently_processing_bead_id": "§12.2#37 current-bead-lag"}
 	return []timelineFixture{
 		crashAfter(29*time.Second, tlRestarted()),
@@ -1028,12 +1038,8 @@ func stabilityTimeline() []timelineFixture {
 		crashAfter(5*time.Minute, tlRestarted()),
 		manualCrashAfter(29 * time.Second),
 		manualCrashAfter(31 * time.Second),
-		quarantinedAt(29*time.Second, map[string]map[string]string{
-			"seed": drained, "alive": drained, "settled": tlMerged(drained, lagged),
-		}),
-		quarantinedAt(31*time.Second, map[string]map[string]string{
-			"seed": drained, "alive": tlMerged(drained, lagged),
-		}),
+		quarantinedAt(29*time.Second, map[string]map[string]string{"settled": lagged}),
+		quarantinedAt(31*time.Second, map[string]map[string]string{"alive": lagged}),
 	}
 }
 
