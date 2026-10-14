@@ -2,7 +2,7 @@ Current time: <now>
 <system-reminder>
 You have a deferred reminder that was queued until a safe boundary:
 
-- [session] review queued work
+- [session from probe-a] review queued work
 
 Handle them after this turn.
 </system-reminder>

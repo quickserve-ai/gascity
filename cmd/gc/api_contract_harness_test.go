@@ -79,6 +79,9 @@ type contractHarness struct {
 	clones    atomic.Int64
 	// mailbox is the session name the mail family addresses.
 	mailbox string
+	// asyncMailbox is the session name the async family's mail rows address
+	// (the carry's ga-nee27h send-mail and reply-mail rows).
+	asyncMailbox string
 }
 
 func newContractHarness(t *testing.T) *contractHarness {
