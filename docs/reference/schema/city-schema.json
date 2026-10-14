@@ -346,6 +346,13 @@
           "type": "boolean",
           "description": "InjectAssignedSkills controls whether gc appends an\n\"assigned skills\" appendix to the agent's rendered prompt. The\nappendix lists every skill visible to this agent, partitioned\ninto (assigned-to-you, shared-with-every-agent), so agents\nsharing a scope-root sink can tell which skills are their\nspecialization vs which are the city-wide set.\n\nPointer tri-state:\n  nil   -\u003e inherit: inject when the agent has a vendor sink\n  *true -\u003e explicitly inject (equivalent to the default)\n  *false -\u003e disable; the template is responsible for rendering\n            any skill guidance itself"
         },
+        "opt_in_skills": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "OptInSkills names the opt-in skills this agent receives. A pack ships\nan opt-in skill under skills/opt-in/\u003cname\u003e/SKILL.md, and no agent\nreceives it unless it names it here. Names use the shared catalog's\nform: \"\u003cbinding\u003e.\u003cname\u003e\" for an imported pack's skill, \"\u003cname\u003e\" for the\ncity pack's own. A name must resolve to an opt-in skill in the agent's\nscope (the city's imports, plus its rig's imports for a rig-scoped\nagent), or config load fails. An agent whose work_dir is its scope\nroot receives its opt-ins in the scope root's skill directory, and\nevery session the provider loads that directory for sees them: for\nClaude Code, sessions started there and in plain subdirectories below\nit in the same repository, but not sessions in their own linked\nworktrees. An agent with its own work_dir receives its opt-ins in that\nwork_dir alone; that is how a seat gets an opt-in skill exclusively."
+        },
         "attach": {
           "type": "boolean",
           "description": "Attach controls whether the agent's session supports interactive\nattachment (e.g., tmux attach). When false, the agent can use a\nlighter runtime (subprocess instead of tmux). Defaults to true."
@@ -725,6 +732,20 @@
           "type": "array",
           "description": "InjectFragmentsAppend appends to the agent's inject_fragments list."
         },
+        "opt_in_skills": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "OptInSkills replaces the agent's opt_in_skills list (see\nAgent.OptInSkills). Leave it unset to keep the agent's list; set an\nempty list to clear it."
+        },
+        "opt_in_skills_append": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "OptInSkillsAppend appends to the agent's opt_in_skills list."
+        },
         "max_active_sessions": {
           "type": "integer",
           "description": "MaxActiveSessions overrides the agent-level cap on concurrent sessions."
@@ -1025,6 +1046,20 @@
           },
           "type": "array",
           "description": "InjectFragmentsAppend appends to the agent's inject_fragments list."
+        },
+        "opt_in_skills": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "OptInSkills replaces the agent's opt_in_skills list (see\nAgent.OptInSkills). Leave it unset to keep the agent's list; set an\nempty list to clear it."
+        },
+        "opt_in_skills_append": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "OptInSkillsAppend appends to the agent's opt_in_skills list, the way\ninject_fragments_append adds a prompt fragment."
         },
         "max_active_sessions": {
           "type": "integer",
@@ -2029,11 +2064,48 @@
         "unread_retention_ttl": {
           "type": "string",
           "description": "UnreadRetentionTTL is how long a never-read mail bead stays open before\nthe nudge-mail sweep closes it. Empty or \"0\" disables the unread-mail\nphase; it is opt-in so unread mail is never closed by default."
+        },
+        "crosscity": {
+          "$ref": "#/$defs/MailCrossCityConfig",
+          "description": "CrossCity enables city-qualified mail addressing (\u003ccity\u003e/\u003caddress\u003e).\nAbsent means disabled: every recipient resolves exactly as today."
         }
       },
       "additionalProperties": false,
       "type": "object",
       "description": "MailConfig holds mail provider settings."
+    },
+    "MailCrossCityConfig": {
+      "properties": {
+        "city": {
+          "type": "string",
+          "description": "City is this city's own segment in city-qualified addresses, and it is\nREQUIRED when the section is present: the CLI and the API derive the\neffective city name differently (site binding, workspace name, the\nsupervisor's registered name), so a defaulted name could stamp two\nspellings of this city on mail and strand replies. \u003cCity\u003e/\u003caddress\u003e and\n\u003caddress\u003e are one mailbox."
+        },
+        "cities": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "description": "Cities lists the peer cities addressable as \u003ccity\u003e/\u003caddress\u003e. A\nrecipient naming a listed city resolves against the roster and is never\nlooked up in the local session store."
+        },
+        "towns": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object",
+          "description": "Towns maps a listed peer city to the town whose rendered roster\n(cities/\u003ctown\u003e/agents.json) lists that city's seats. A send to a\nmapped city is refused unless the seat is in that list; a peer city\nwith no mapping keeps the city-level rules only."
+        },
+        "roster_root": {
+          "type": "string",
+          "description": "RosterRoot points at the directory holding cities/\u003ctown\u003e/agents.json\nand overrides discovery. Unset, the roster is the pack-cache clone of\nthe imported repository that ships cities/, at its packs.lock commit;\nwith no such import there is no list and sends behave exactly as\nbefore this knob existed."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "required": [
+        "city",
+        "cities"
+      ],
+      "description": "MailCrossCityConfig enables city-qualified mail addressing: recipients of the form \u003ccity\u003e/\u003caddress\u003e, where the first path segment names a city and the remainder is that city's own address form."
     },
     "MaintenanceConfig": {
       "properties": {
@@ -2837,6 +2909,10 @@
         "beads_proxied_idle_timeout": {
           "type": "string",
           "description": "BeadsProxiedIdleTimeout overrides [beads] proxied_idle_timeout for this\nrig's bd-owned proxied scope. Go duration; \"0\" means never. Ignored, with\na warning, for a rig that shares the city's proxy root: one proxy serves\nevery scope on that root and carries the city's value."
+        },
+        "doctor": {
+          "$ref": "#/$defs/RigDoctorConfig",
+          "description": "Doctor holds rig-scoped gc doctor policy ([rigs.doctor])."
         }
       },
       "additionalProperties": false,
@@ -2845,6 +2921,28 @@
         "name"
       ],
       "description": "Rig defines an external project registered in the city."
+    },
+    "RigDoctorConfig": {
+      "properties": {
+        "census_owner_namespace": {
+          "type": "string",
+          "description": "CensusOwnerNamespace declares that this rig's resource-census ledger\n(test/test-resources.toml) names owner_bead values from ANOTHER\ntracker, e.g. \"gastownhall/gascity\" for a fork of Gas City whose ledger\ncomes from upstream. The census-owner-liveness check then reports an\nowner_bead missing from this city as owned in that namespace instead of\ndangling. The cost: a missing owner on this rig that is genuinely this\ncity's is not detected. Empty means every missing owner is dangling."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "RigDoctorConfig holds gc doctor policy that applies to one rig."
+    },
+    "RigDoctorPatch": {
+      "properties": {
+        "census_owner_namespace": {
+          "type": "string",
+          "description": "CensusOwnerNamespace overrides Rig.Doctor.CensusOwnerNamespace; an\nempty string clears the declaration."
+        }
+      },
+      "additionalProperties": false,
+      "type": "object",
+      "description": "RigDoctorPatch overrides fields of a rig's [rigs.doctor] table."
     },
     "RigPatch": {
       "properties": {
@@ -2886,6 +2984,10 @@
         "beads_proxied_idle_timeout": {
           "type": "string",
           "description": "BeadsProxiedIdleTimeout overrides the rig's beads_proxied_idle_timeout."
+        },
+        "doctor": {
+          "$ref": "#/$defs/RigDoctorPatch",
+          "description": "Doctor overrides fields of the rig's [rigs.doctor] table."
         }
       },
       "additionalProperties": false,
