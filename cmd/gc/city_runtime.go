@@ -679,17 +679,17 @@ func (cr *CityRuntime) controllerStoreSchemaSkewDiagnostic() *beads.BeadsDiagnos
 // publishing open is the authoritative schema gate: the swap calls this
 // first, so a skewed store fails the reload closed with nothing stopped. A
 // publication that reuses the current stores opens nothing (the preflight
-// was its gate), and neither does this; an open that errs is left to the
-// publication, which reports it.
+// was its gate), and neither does this. The diagnostic is read whatever the
+// open returned, as updateLocked reads it: the factory can refuse a store and
+// still report the schema skew it found first (a conditional-writes refusal
+// keeps its native-selection diagnostic). An open that errs without skew is
+// left to the publication, which reports it.
 func (cr *CityRuntime) probePublishingOpenSchemaSkew(next *config.City) *beads.BeadsDiagnostic {
 	cs := cr.cs
 	if cs == nil || cs.runtimeUpdateCanReuseCurrentStores(next) {
 		return nil
 	}
-	opened, err := newControllerStateOpenCityStore(cs.cityPath, cs.rolloutFlags.BeadsConditionalWrites(), cs.nativeTransport)
-	if err != nil {
-		return nil
-	}
+	opened, _ := newControllerStateOpenCityStore(cs.cityPath, cs.rolloutFlags.BeadsConditionalWrites(), cs.nativeTransport) // the error is the publication's to report
 	if opened.Store != nil {
 		closeBeadStoreHandle(opened.Store) //nolint:errcheck // a probe's handle; the publication opens its own
 	}
