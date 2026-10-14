@@ -25,7 +25,7 @@ func laneFenceState(cr *CityRuntime) (gen uint64, inflight int) {
 // the round-3 coverage rests on: once run() is under way, every
 // internal/session Manager start through the city's provider is bracketed by
 // the lane's fence (observed through session.BracketProviderStart, the same
-// registry lookup Manager.startRuntime does), and the registration is retired
+// registry lookup a Manager's start bracket does), and the registration is retired
 // when run() returns. A future start path that builds a Manager on this
 // provider cannot bypass it.
 func TestCityRuntimeRun_RegistersSessionStartFenceOnItsProvider(t *testing.T) {

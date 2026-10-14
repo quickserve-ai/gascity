@@ -250,8 +250,9 @@ func (cr *CityRuntime) sessionStartFenceOf() *sessionStartFence {
 // Every in-process runtime creation is bracketed: beginStart (gen++,
 // inflight++) before it and endStart (gen++, inflight--, deferred) after it,
 // each a short critical section holding nothing else. The brackets:
-//   - internal/session.Manager.startRuntime, the one place a Manager asks its
-//     provider to start a runtime. The controller registers this fence for its
+//   - each place an internal/session Manager asks its provider to start a
+//     runtime, which opens session.bracketStart around the call. The
+//     controller registers this fence for its
 //     provider (registerSessionStartFence → session.RegisterStartFence), so
 //     every Manager built on that provider is covered: the reconcile tick, the
 //     control-dispatcher tick, and the in-process API server's session wakes
