@@ -25,17 +25,30 @@ import (
 //
 // gc hook --claim was the top write chokepoint and now writes the alias form
 // (6d6c33382). This file guards the manual chokepoint: known variants are
-// rewritten to the canonical alias with a notice, and shapes matching no
-// live identity produce a loud warning but pass through unchanged — a
-// cross-town assignee (q_core/*, Alex-town crew) is legitimate here, so
-// unknown must warn, never block or rewrite.
+// rewritten to the canonical alias with a notice, and a shape matching no
+// live identity REFUSES the write (ga-6sm0d7, Cherub 2026-09-06: the
+// warn-and-write guard stored qcore/crew.barry and 98 other ghosts that
+// looked assigned and were invisible). The refusal names the nearest live
+// identities.
+//
+// A cross-town assignee (q_core/*, Alex-town crew on the shared hub) never
+// resolves here: other towns' session beads live in their own city stores,
+// so locally it is indistinguishable from a ghost. It is a deliberate
+// offline assignee and takes --allow-unknown-assignee, a gc-side flag that
+// is stripped before bd sees it and keeps the old loud warning.
 //
 // Fail-open by design: any error building the identity index skips
 // canonicalization silently. This path runs in front of every bd write and
-// must never turn an index hiccup into a blocked mutation or spurious noise.
-// Set GC_BD_ASSIGNEE_CANONICALIZE=off to disable entirely.
+// must never turn an index hiccup into a blocked mutation or spurious noise
+// — without an index nothing is known to be unknown. Ambiguous and
+// pool-template shapes still warn and pass. Set
+// GC_BD_ASSIGNEE_CANONICALIZE=off to disable entirely.
 
 const bdAssigneeCanonicalizeEnv = "GC_BD_ASSIGNEE_CANONICALIZE"
+
+// bdAllowUnknownAssigneeFlag is gc's own flag on the bd passthrough; it
+// never reaches bd.
+const bdAllowUnknownAssigneeFlag = "--allow-unknown-assignee"
 
 // bdListSessionBeadsForAssigneeIndex is a package var so tests can stub the
 // store round-trip. Live:true keeps ephemeral (wisp) session beads visible —
@@ -50,31 +63,32 @@ var bdListSessionBeadsForAssigneeIndex = func(cityPath string) ([]beads.Bead, er
 
 // canonicalizeBdAssigneeArgs rewrites -a/--assignee values on bd
 // update/create invocations to the canonical alias form when the written
-// value maps unambiguously to a live agent identity, and warns on values
-// matching nothing. Returns args unchanged (and stays silent) when the
-// subcommand carries no assignee, the identity index cannot be built, or
-// canonicalization is disabled.
-func canonicalizeBdAssigneeArgs(bdArgs []string, cityPath string, cfg *config.City, stderr io.Writer) []string {
+// value maps unambiguously to a live agent identity, and refuses values
+// matching nothing unless allowUnknown (--allow-unknown-assignee, which the
+// caller has already stripped). Returns args unchanged (and stays silent)
+// when the subcommand carries no assignee, the identity index cannot be
+// built, or canonicalization is disabled.
+func canonicalizeBdAssigneeArgs(bdArgs []string, allowUnknown bool, cityPath string, cfg *config.City, stderr io.Writer) ([]string, error) {
 	if strings.EqualFold(strings.TrimSpace(os.Getenv(bdAssigneeCanonicalizeEnv)), "off") {
-		return bdArgs
+		return bdArgs, nil
 	}
 	sub := bdFirstPositionalArg(bdArgs)
 	if sub != "update" && sub != "create" {
-		return bdArgs
+		return bdArgs, nil
 	}
 	tokens := bdAssigneeTokens(sub, bdArgs)
 	if len(tokens) == 0 {
-		return bdArgs
+		return bdArgs, nil
 	}
 	if cfg == nil {
-		return bdArgs
+		return bdArgs, nil
 	}
 	sessionBeads, err := bdListSessionBeadsForAssigneeIndex(cityPath)
 	if err != nil {
 		// Config-only resolution could misreport live-only identities
 		// (session bead IDs, pool session names) as unknown. Better no
-		// canonicalization than wrong warnings.
-		return bdArgs
+		// canonicalization than wrong warnings or a wrong refusal.
+		return bdArgs, nil
 	}
 	index := buildBdAssigneeIndex(cfg, sessionBeads)
 
@@ -100,10 +114,36 @@ func canonicalizeBdAssigneeArgs(bdArgs []string, cityPath string, cfg *config.Ci
 		case bdAssigneeAmbiguous:
 			fmt.Fprintf(stderr, "gc bd: WARNING: assignee %q is ambiguous among [%s] — leaving as-is; use the full alias form (ga-i44k)\n", raw, strings.Join(index.candidatesFor(raw), ", ")) //nolint:errcheck // best-effort stderr
 		default: // bdAssigneeUnknown
-			fmt.Fprintf(stderr, "gc bd: WARNING: assignee %q matches no live agent identity in this city — the bead will NOT surface in any agent's find-work (ga-i44k). Verify with 'gc agent list' / 'gc session list', or ignore if this is a cross-town assignee.\n", raw) //nolint:errcheck // best-effort stderr
+			if !allowUnknown {
+				nearest := "no near match; see 'gc session list'"
+				if candidates := index.nearestFor(raw); len(candidates) > 0 {
+					nearest = "nearest live: " + strings.Join(candidates, ", ")
+				}
+				return bdArgs, fmt.Errorf("assignee %q matches no live agent identity in this city (%s) — refusing the write: the bead would look assigned and surface in no agent's find-work (ga-i44k). If this is another town's identity or a deliberate offline assignee, re-run with %s", raw, nearest, bdAllowUnknownAssigneeFlag)
+			}
+			fmt.Fprintf(stderr, "gc bd: WARNING: assignee %q matches no live agent identity in this city — the bead will NOT surface in any agent's find-work here (ga-i44k); written as-is under %s.\n", raw, bdAllowUnknownAssigneeFlag) //nolint:errcheck // best-effort stderr
 		}
 	}
-	return out
+	return out, nil
+}
+
+// stripBdAllowUnknownAssignee removes gc's --allow-unknown-assignee flag
+// ahead of any "--" terminator, reporting whether it was present.
+func stripBdAllowUnknownAssignee(args []string) ([]string, bool) {
+	found := false
+	out := make([]string, 0, len(args))
+	for i, arg := range args {
+		if arg == "--" {
+			out = append(out, args[i:]...)
+			break
+		}
+		if arg == bdAllowUnknownAssigneeFlag {
+			found = true
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out, found
 }
 
 func bdFirstPositionalArg(args []string) string {
@@ -381,6 +421,46 @@ func (ix *bdAssigneeIndex) resolve(raw string) (string, bdAssigneeVerdict) {
 		return singleBdAssignee(candidates), bdAssigneeRewrite
 	}
 	return "", bdAssigneeAmbiguous
+}
+
+// nearestFor suggests live identities for an unknown assignee: those
+// sharing its last segment or, for a dotted segment ("crew.barry"), its
+// final dotted part — preferring the written rig prefix. At most five.
+func (ix *bdAssigneeIndex) nearestFor(raw string) []string {
+	leaf, prefix := bdAssigneeLeafAndPrefix(raw)
+	if leaf == "" {
+		return nil
+	}
+	keys := []string{leaf}
+	if dot := strings.LastIndexByte(leaf, '.'); dot >= 0 && dot+1 < len(leaf) {
+		keys = append(keys, leaf[dot+1:])
+	}
+	set := make(map[string]struct{})
+	for _, key := range keys {
+		for c := range ix.byName[key] {
+			set[c] = struct{}{}
+		}
+	}
+	if prefix != "" {
+		scoped := make(map[string]struct{})
+		for c := range set {
+			if strings.HasPrefix(c, prefix+"/") {
+				scoped[c] = struct{}{}
+			}
+		}
+		if len(scoped) > 0 {
+			set = scoped
+		}
+	}
+	out := make([]string, 0, len(set))
+	for c := range set {
+		out = append(out, c)
+	}
+	sort.Strings(out)
+	if len(out) > 5 {
+		out = out[:5]
+	}
+	return out
 }
 
 // candidatesFor lists the possible canonicals behind an ambiguous verdict,
