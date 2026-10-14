@@ -135,6 +135,23 @@ func poolOrphanReleaseGate(cfg *config.City, storeRef string, storeRefAware bool
 	return poolOrphanReleaseRigForBead(cfg, wb), poolOrphanReleaseAllowedForBead(cfg, wb)
 }
 
+// orphanReleaseStoreRefOf is the store ref of the leg s, in
+// DesiredStateResult.AssignedWorkStoreRefs' spelling, for a claim the v2
+// close effect read through legs rather than off the census: a serving rig's
+// bare name, or "" for the city work store or a class binding, which hold the
+// city's own work. ok is false when s is none of legs' stores; the gate then
+// resolves the rig from the bead, as for a census row without refs.
+func orphanReleaseStoreRefOf(legs WorkLegs, s beads.Store) (string, bool) {
+	for name, rig := range legs.rigs {
+		if rig == s {
+			return name, true
+		}
+	}
+	found := false
+	legs.each(func(leg beads.Store) { found = found || leg == s })
+	return "", found
+}
+
 // poolOrphanReleaseRigForBead names the rig that owns wb, or "" when no rig
 // claims it. Mirrors storeForPoolAssignment's resolution order.
 func poolOrphanReleaseRigForBead(cfg *config.City, wb beads.Bead) string {

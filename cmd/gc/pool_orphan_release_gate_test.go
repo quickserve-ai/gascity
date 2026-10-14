@@ -432,3 +432,88 @@ func TestPoolOrphanReleaseGate_DisabledRigDoesNotWedgeCityOrphanClose(t *testing
 		t.Fatalf("session bead status = %q, want closed — once the work is released the close guard stops refusing", gotSeat.Status)
 	}
 }
+
+// v2OrphanCloseCase is a v2 close effect over a confirmed-orphaned pool row
+// (the closeCase harness) in a city with rig "repo" declared, whose work legs
+// include repoStore as that rig's store: what the effect's orphan release
+// reads its claims through.
+func v2OrphanCloseCase(t *testing.T, orphanRelease *bool, meta ...string) (c *closeCase, repoStore beads.Store) {
+	t.Helper()
+	c = newCloseCase(t, livenessGone, desireDrain, append([]string{"state", "asleep"}, meta...)...)
+	c.entry().DrainReason = drainOrphaned
+	c.cfg.Rigs = []config.Rig{{Name: "repo", Path: filepath.Join(c.w.CityPath, "repo"), OrphanRelease: orphanRelease}}
+	repoStore = beads.NewMemStore()
+	c.w.WorkLegs = testWorkLegs(c.w.CityPath, c.cfg, c.store, map[string]beads.Store{"repo": repoStore})
+	return c, repoStore
+}
+
+// assertClaim fails unless claim id in store is (status, assignee).
+func assertClaim(t *testing.T, store beads.Store, id, status, assignee, what string) {
+	t.Helper()
+	got, err := store.Get(id)
+	if err != nil {
+		t.Fatalf("get %s: %v", what, err)
+	}
+	if got.Status != status || got.Assignee != assignee {
+		t.Fatalf("%s = status %q assignee %q, want %q/%q", what, got.Status, got.Assignee, status, assignee)
+	}
+}
+
+// The v2 close effect's orphan release takes the orphan_release stop lever
+// (ga-h5435p) as the legacy tie-break does: a disabled rig holds the claim the
+// seat keeps in that rig's store, so the close refuses has-work, while the
+// seat's city-owned claim (read on the city work leg) is still released. With
+// the knob unset the same rig claim is released and the close lands.
+func TestV2OrphanCloseHonorsOrphanReleaseSwitch(t *testing.T) {
+	t.Run("disabled rig holds its claim, spares city work", func(t *testing.T) {
+		c, repoStore := v2OrphanCloseCase(t, boolPtr(false))
+		rigClaim := createWork(t, repoStore, "in_progress", c.k.ID, routedClaim())
+		cityClaim := c.work(t, "in_progress", routedClaim())
+		logBuf := captureSweepLog(t)
+		s := c.run(t, gone().tmux())
+		if s.Cause != causeHasWork || c.row(t).Status == "closed" {
+			t.Fatalf("settlement %+v row %s, want refused has-work over the held claim", s, c.row(t).Status)
+		}
+		assertClaim(t, repoStore, rigClaim.ID, "in_progress", c.k.ID, "rig claim under orphan_release=false")
+		assertClaim(t, c.store, cityClaim.ID, "open", "", "city-owned claim")
+		if logged := logBuf.String(); !strings.Contains(logged, `orphan_release=false held `+rigClaim.ID+` in rig "repo"`) {
+			t.Fatalf("the hold must be reported with the bead and rig:\n%s", logged)
+		}
+	})
+	t.Run("unset knob releases and closes", func(t *testing.T) {
+		c, repoStore := v2OrphanCloseCase(t, nil)
+		rigClaim := createWork(t, repoStore, "in_progress", c.k.ID, routedClaim())
+		if s := c.run(t, gone().tmux()); s.Outcome != settledLanded || c.row(t).Status != "closed" {
+			t.Fatalf("settlement %+v, want the close landed", s)
+		}
+		assertClaim(t, repoStore, rigClaim.ID, "open", "", "rig claim with the knob unset")
+	})
+}
+
+// The v2 close effect's orphan release takes the orphan close's roster gate
+// (#5952 carry, composed with #7763) as the legacy tie-break does: a claim
+// held under a qualified identity this city cannot observe, which the seat
+// matches only through a raw stored session_name, is protected and the close
+// refuses has-work; the seat's own alias claim, off the roster but answered
+// by the seat's record, is released.
+func TestV2OrphanCloseHonorsForeignIdentityGate(t *testing.T) {
+	c, repoStore := v2OrphanCloseCase(t, nil, "session_name", "repo/dalinar", "alias", "repo/nux")
+	// A namepool seat: its alias is a stable identity (a numeric slot's is
+	// not, and never enters the release scope); "nux" has left the namepool.
+	c.cfg.Agents[2].NamepoolNames = []string{"furiosa"}
+	if poolAssigneeIsLocallyObservable(c.cfg, "test-city", "repo/dalinar") || poolAssigneeIsLocallyObservable(c.cfg, "test-city", "repo/nux") {
+		t.Fatal("fixture: both qualified identities must fail the roster, or this test proves nothing")
+	}
+	foreign := createWork(t, repoStore, "in_progress", "repo/dalinar", routedClaim())
+	own := createWork(t, repoStore, "in_progress", "repo/nux", routedClaim())
+	logBuf := captureSweepLog(t)
+	s := c.run(t, gone().tmux())
+	if s.Cause != causeHasWork || c.row(t).Status == "closed" {
+		t.Fatalf("settlement %+v row %s, want refused has-work over the protected claim", s, c.row(t).Status)
+	}
+	assertClaim(t, repoStore, foreign.ID, "in_progress", "repo/dalinar", "foreign-shaped claim")
+	assertClaim(t, repoStore, own.ID, "open", "", "the seat's own alias claim")
+	if logged := logBuf.String(); !strings.Contains(logged, `protected "repo/dalinar" (`+foreign.ID+`)`) {
+		t.Fatalf("the gate must refuse loudly, naming the identity and claim:\n%s", logged)
+	}
+}
