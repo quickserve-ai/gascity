@@ -160,7 +160,10 @@ provider = "file"
 		t.Fatalf("workerHandleForSessionWithConfig: %v", err)
 	}
 	sp.Calls = nil
-	if _, err := handle.Message(context.Background(), testActorIn(t, session.ActorAgent, cityDir), worker.MessageRequest{
+	// As the operator, as cmdSessionSubmit sends: a background (agent) send
+	// never consumes the operator's suspend (upstream #7380), so only the
+	// operator's own submit takes the resume branch.
+	if _, err := handle.Message(context.Background(), testOperatorIn(t, cityDir), worker.MessageRequest{
 		Text:     "wake",
 		Delivery: workerDeliveryIntentForSubmitIntent(session.SubmitIntentDefault),
 	}); err != nil {
