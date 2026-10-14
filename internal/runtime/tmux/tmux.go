@@ -3951,10 +3951,17 @@ func (t *Tmux) nudgeSession(
 				observe := func() (paneSubmitObservation, error) { return t.observeSubmit(target, marker) }
 				// ga-ubfc7j: recovery runs for seconds; a person who attaches
 				// in that time may replace the staged draft with their own, so
-				// every recovery submit needs the session still detached.
+				// every recovery submit needs the session still detached. A
+				// recovery submit is a re-sent Enter, so it also stops once
+				// the composer shows a draft other than the one it showed
+				// before the first Enter (ga-da5vmz): another paste's
+				// placeholder is a staged draft too, but not ours.
 				recoverSubmit := func() error {
 					if t.sessionClientCount(session) != 0 {
 						return errRecoveryNoLongerDetached
+					}
+					if t.recoveryDraftIsNotOurs(session, target, owner) {
+						return errRecoveryDraftNotOurs
 					}
 					return sendSubmit()
 				}
@@ -4232,6 +4239,10 @@ var errDismissalScreenChanged = errors.New("tmux: mid-session dialog changed dur
 // errRecoveryNoLongerDetached stops staged-draft recovery once a client has
 // attached: the draft on the line may no longer be the one gc staged.
 var errRecoveryNoLongerDetached = errors.New("tmux: staged-draft recovery stopped: a client attached")
+
+// errRecoveryDraftNotOurs stops staged-draft recovery once the composer no
+// longer shows the draft it showed before the first submit (resendGate).
+var errRecoveryDraftNotOurs = errors.New("tmux: staged-draft recovery stopped: the staged draft is not the one this nudge typed")
 
 // midSessionDialogSettleDelay lets a just-dismissed mid-session dialog retire
 // from the pane before the nudge text is pasted, so the message lands at the
