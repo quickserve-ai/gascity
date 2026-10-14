@@ -118,7 +118,7 @@ func tearDownDrainAckedPoolSeat(
 	if refusal := drainAckTeardownRefusal(cfg, info); refusal != "" {
 		return drainAckTeardownOutcome{retainedFor: refusal}
 	}
-	if standing := sessionpkg.StandingSleepIntent(info.SleepIntent); standing != "" {
+	if standing := sessionpkg.StandingIntent(sessionpkg.DispositionOfInfo(info)); standing != "" {
 		return drainAckTeardownOutcome{retainedFor: "standing_hold:" + string(standing)}
 	}
 	parkedID, scanErr := drainAckedSeatCertParkedBead(sw, info)

@@ -75,3 +75,18 @@ func StandingSleepIntent(intent string) SleepReason {
 		return ""
 	}
 }
+
+// StandingIntent is StandingSleepIntent read through a decoded disposition
+// (R7's projection), for a reader that must not read sleep_intent raw: an
+// operator's suspend is the user-hold intent, a wait's own intent the
+// wait-hold one.
+func StandingIntent(d Disposition) SleepReason {
+	switch {
+	case d.Operator == OperatorSuspended:
+		return SleepReasonUserHold
+	case d.WaitIntent:
+		return SleepReasonWaitHold
+	default:
+		return ""
+	}
+}

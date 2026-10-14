@@ -67,3 +67,16 @@ func resetSuppressed(t *testing.T, reason SleepReason) bool {
 	input := LifecycleInput{SessionKey: "sk-1"}
 	return !shouldResetContinuation(BaseStateActive, input, string(reason))
 }
+
+// StandingIntent (the carry's drain-ack teardown, ga-x99xh0, reads through it)
+// must answer as StandingSleepIntent on the raw marker for every intent.
+func TestStandingIntentMatchesTheRawMarker(t *testing.T) {
+	for _, intent := range []string{"", "user-hold", " user-hold ", "wait-hold", "idle-stop-pending", "drain", "garbage"} {
+		for _, state := range []string{"asleep", "suspended"} {
+			d := DecodeDisposition(map[string]string{"sleep_intent": intent, "state": state})
+			if got, want := StandingIntent(d), StandingSleepIntent(intent); got != want {
+				t.Errorf("StandingIntent(%q, state %s) = %q, want %q", intent, state, got, want)
+			}
+		}
+	}
+}

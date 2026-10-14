@@ -35,8 +35,7 @@ func healReleasedWaitHoldReasonInfo(info sessionpkg.Info, sessFront *sessionpkg.
 	if sessionpkg.SleepReason(strings.TrimSpace(info.SleepReason)) != sessionpkg.SleepReasonWaitHold {
 		return info
 	}
-	if strings.TrimSpace(info.WaitHold) != "" ||
-		sessionpkg.StandingSleepIntent(info.SleepIntent) == sessionpkg.SleepReasonWaitHold {
+	if d := sessionpkg.DispositionOfInfo(info); d.Wait || d.WaitIntent { // either half of the wait hold, read through the disposition (R7)
 		return info
 	}
 	if strings.TrimSpace(info.MetadataState) != string(sessionpkg.StateAsleep) {
