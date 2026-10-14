@@ -1359,7 +1359,7 @@ func (c *CachingStore) cacheServableLocked() bool {
 // backing-store fallback path (I5), so a refusal degrades the read from cached
 // to live rather than failing it. Caller must hold c.mu.
 func (c *CachingStore) freshEnoughToServeLocked() bool {
-	age, bound, stale := c.staleBeyondServeBoundLocked(time.Now())
+	age, bound, stale := c.staleBeyondServeBoundLocked(c.clockNow())
 	if !stale {
 		return true
 	}
@@ -1425,7 +1425,7 @@ func (c *CachingStore) serveStaleBoundLocked() time.Duration {
 // rate-limited problem line while holding the lock for writing; this one holds
 // it only for reading and fires at most twelve times an hour.
 func (c *CachingStore) logStaleServeRefusal(age, bound time.Duration) {
-	now := time.Now()
+	now := c.clockNow()
 	prev := c.staleServeLogAtNanos.Load()
 	if prev != 0 && now.Sub(time.Unix(0, prev)) < cacheStaleServeLogWindow {
 		return
@@ -2099,13 +2099,13 @@ func (c *CachingStore) StartReconciler(ctx context.Context, stagger StaggerOptio
 	// neither can race a concurrent StopReconciler's Wait.
 	c.lifecycleWG.Add(2)
 	c.lifecycleMu.Unlock()
-	c.reconcilerArmedAtNanos.Store(time.Now().UnixNano())
+	c.reconcilerArmedAtNanos.Store(c.clockNow().UnixNano())
 
 	offset := stagger.resolve(agentID)
 
 	c.mu.Lock()
 	c.stats.StaggerOffsetMs = offset.Milliseconds()
-	c.stats.ReconcilerArmedAt = time.Now()
+	c.stats.ReconcilerArmedAt = c.clockNow()
 	c.mu.Unlock()
 
 	log.Printf("beads cache: stagger=%dms agent=%s", offset.Milliseconds(), agentID)
@@ -2157,7 +2157,7 @@ func (c *CachingStore) SetReconcileHeartbeatSink(sink func(ReconcileHeartbeat)) 
 	c.heartbeatSink = sink
 	c.lifecycleMu.Unlock()
 	if sink != nil {
-		c.reconcilerArmedAtNanos.CompareAndSwap(0, time.Now().UnixNano())
+		c.reconcilerArmedAtNanos.CompareAndSwap(0, c.clockNow().UnixNano())
 		c.publishReconcileHeartbeat()
 	}
 }
@@ -2221,7 +2221,7 @@ func (c *CachingStore) reconcileHeartbeatSnapshotLocked() ReconcileHeartbeat {
 		LastReconcileAt: c.stats.LastReconcileAt,
 		IntervalMs:      interval.Milliseconds(),
 		State:           c.stateStringLocked(),
-		UpdatedAt:       time.Now(),
+		UpdatedAt:       c.clockNow(),
 	}
 }
 

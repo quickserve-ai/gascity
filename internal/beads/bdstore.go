@@ -3276,12 +3276,11 @@ func (s *BdStore) wispFallback(id string) (Bead, bool, error) {
 	}
 	wisps, queryErr := s.getEphemeralByID(id)
 	if queryErr != nil {
-		// bd answering "not found" on the wisp leg is a completed lookup that
-		// proves absence (upstream #6649); any other failure leaves absence
-		// unproven and is reported so Get can classify it as indeterminate.
-		if isBdBeadNotFound(queryErr) {
-			return Bead{}, false, nil
-		}
+		// The wisp leg could not be read, so absence is unproven, whatever its
+		// failure text says ("not found" wording included): upstream's wisp-
+		// tier contract (TestBdStoreGetWispTier*). getEphemeralByID already
+		// answers bd's own no-match as a completed, empty lookup. Get reports
+		// the failure as indeterminate.
 		return Bead{}, false, queryErr
 	}
 	for _, b := range wisps {

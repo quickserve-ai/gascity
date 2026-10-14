@@ -5578,7 +5578,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			// assigned-work gate. Pool seats only: a named seat's held work is the
 			// retired-session lane's concern.
 			if intent == "" && isPoolManagedSessionInfo(info) {
-				holdsWork, holdsErr := sessionHasOpenAssignedWorkForReachableStore(cityPath, cfg, store, rigStores, info)
+				holdsWork, holdsErr := sessionHasOpenAssignedWorkForReachableStore(sw, info)
 				if holdsErr != nil {
 					fmt.Fprintf(stderr, "session reconciler: checking assigned work before draining %s: %v (retaining)\n", name, holdsErr) //nolint:errcheck
 					holdsWork = true
