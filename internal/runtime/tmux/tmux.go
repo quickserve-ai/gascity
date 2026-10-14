@@ -444,6 +444,11 @@ type Tmux struct {
 	// a deterministic observation without opening a socket.
 	serverSocketObserver func(context.Context, string) error
 
+	// socketReviver recovers a live server whose socket was unlinked before
+	// new-session may found a server (ga-46jb3c). Nil selects
+	// productionSocketReviver; tests inject fakes.
+	socketReviver *socketReviver
+
 	// namedSocketLstat observes a named socket before an attach. Nil selects
 	// the production filesystem observation.
 	namedSocketLstat func(context.Context, string) (namedSocketObservation, error)
@@ -634,6 +639,9 @@ func wrapError(err error, stderr string, args []string) error {
 //     server answered and is alive with zero sessions, so new-session attaches
 //     rather than unlinking and rebinding.
 //   - nil when ErrNoServer is corroborated by a safely absent or stale socket.
+//     An absent socket first goes through reviveOrphanedServer: a live
+//     server that still owns the unlinked path gets SIGUSR1 instead of a
+//     second server (ga-46jb3c).
 //   - ErrServerDegraded when the probe times out or returns any other error,
 //     indicating the server is in a state where new-session would risk
 //     clobbering. Callers MUST surface this and refuse to proceed.
@@ -662,7 +670,9 @@ func (t *Tmux) probeServerAlive() error {
 		path := namedSocketPath(t.cfg.SocketName)
 		observationErr := t.observeServerSocket(ctx, path)
 		if observationErr == nil {
-			return nil
+			// Absent or stale: before a server is founded here, make sure no
+			// live server still owns this path with its socket unlinked.
+			return t.reviveOrphanedServer(path)
 		}
 		// Do not wrap ErrNoServer here: callers such as EnsureSessionFresh
 		// must not retry a guarded no-server result as an ordinary absence.
