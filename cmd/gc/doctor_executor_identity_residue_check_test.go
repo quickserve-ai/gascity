@@ -825,10 +825,18 @@ func TestExecutorIdentityResidueCheckSingleStoreCityComparesStoresByEngine(t *te
 	cityDir := t.TempDir()
 	writeOneShotCityTOML(t, cityDir, "")
 	captureCLIStorageStderr(t)
-	cfg := &config.City{}
+	// The carry's executor-identity-residue rules (ga-n2f1ph): only a bead
+	// routed to an agent this city configures is judged, and a
+	// gc.session_name is cleared only when this city ran that session, so
+	// the fixture configures the route and records the run, as the carry's
+	// adaptations of upstream's other residue fixtures do.
+	cfg := residueTestCity()
 	engine, err := beads.OpenSQLiteStore(t.TempDir())
 	if err != nil {
 		t.Fatalf("opening the city engine: %v", err)
+	}
+	if _, err := engine.Create(residueRanSession("", "gascity--builder")); err != nil {
+		t.Fatalf("seeding the ran session: %v", err)
 	}
 	stale, err := engine.Create(beads.Bead{Title: "stale stamp", Type: "task", Metadata: map[string]string{
 		"gc.routed_to":    "gascity/reviewer",
@@ -850,7 +858,7 @@ func TestExecutorIdentityResidueCheckSingleStoreCityComparesStoresByEngine(t *te
 		t.Fatal("sameStoreEngine reported a rig's distinct store as the city engine")
 	}
 
-	check := newExecutorIdentityResidueCheck(cfg, cityDir, func(path string) (beads.Store, error) {
+	check := newResidueTestCheck(cfg, cityDir, func(path string) (beads.Store, error) {
 		if path != cityDir {
 			return nil, fmt.Errorf("unexpected store path %q", path)
 		}
