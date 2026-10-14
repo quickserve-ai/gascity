@@ -1222,6 +1222,9 @@ repack_archive_objects() {
     if [ -z "$loose" ] || [ -z "$loose_kib" ]; then
         repack_err="$repack_err
 $count_out"
+        # Counted below, once: the archive maintenance after the push reads
+        # the same statistics (archive_stats_failure_already_recorded).
+        ARCHIVE_STATS_FAILURE_RECORDED=1
     fi
     gc_log=$(git rev-parse --git-path gc.log 2>/dev/null) || gc_log=".git/gc.log"
     if [ -f "$gc_log" ]; then
@@ -1424,6 +1427,23 @@ check_archive_gc_free_space() {
     fi
 }
 
+# ARCHIVE_STATS_FAILURE_RECORDED is set when this run's post-commit repack
+# could not read the archive's loose-object statistics and counted that as a
+# repack failure (repack_archive_objects, the carry's streak, ga-ssadrx).
+ARCHIVE_STATS_FAILURE_RECORDED=0
+
+# Succeed, saying so, when this run's repack already counted unreadable
+# archive statistics as a repack failure: that failure is counted and
+# escalated through the repack streak, and is not a second, fatal one. Any
+# other unreadable statistics read stays fatal.
+archive_stats_failure_already_recorded() {
+    if [ "$ARCHIVE_STATS_FAILURE_RECORDED" -eq 1 ]; then
+        echo "jsonl-export: this run's archive repack already recorded the unreadable statistics as a repack failure; not failing the run for them again" >&2
+        return 0
+    fi
+    return 1
+}
+
 # Pack the archive once its loose objects reach either limit. Callers treat a
 # non-zero return as a failed run; call it in a condition so the explicit
 # returns below, not set -e, decide the outcome.
@@ -1437,6 +1457,7 @@ maintain_archive_repository() {
 
     object_stats=$(git -C "$ARCHIVE_REPO" count-objects -v) || {
         echo "jsonl-export: reading archive object statistics failed" >&2
+        archive_stats_failure_already_recorded && return 0
         return 1
     }
     while IFS=': ' read -r key value; do
@@ -1450,10 +1471,12 @@ maintain_archive_repository() {
     case "$loose_objects:$loose_kb:$pack_kb" in
         *[!0-9:]*)
             echo "jsonl-export: archive object statistics were malformed" >&2
+            archive_stats_failure_already_recorded && return 0
             return 1
             ;;
         :*|*:|*::*)
             echo "jsonl-export: archive object statistics were incomplete" >&2
+            archive_stats_failure_already_recorded && return 0
             return 1
             ;;
     esac
