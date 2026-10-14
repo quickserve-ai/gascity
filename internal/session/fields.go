@@ -401,7 +401,10 @@ var registry = slices.Concat([]Field{
 	// The carry's resume keys (ga-oe8h, ga-fe2rmu): the conversation a
 	// lifecycle reset replaced, and `gc session resume`'s seeded latch.
 	{Key: PriorSessionKeyMetadata, Class: ClassLaunchConfig, Writers: sites(legacy(srcTransition, "StampPriorSessionKey"), legacy(srcTransition, "StampPriorSessionKeyInfo"))},
-	{Key: resumeSeededKey, Class: ClassMarker, Writers: sites(op("cmd/gc/cmd_session_history.go", "cmdSessionResume"))},
+	// The carry's seeded-resume latch (ga-oe8h): the start's commit consumes
+	// it, and every conversation reset that clears the resume run clears it
+	// with the key it names.
+	{Key: resumeSeededKey, Class: ClassMarker, Writers: sites(op("cmd/gc/cmd_session_history.go", "cmdSessionResume")), Clears: append(sites(legacyCommit), resumeRunClears...)},
 	// The carry's deferred-release obligation (ga-dt5ffp): a close that withholds
 	// work publishes it on the closing session row.
 	{Key: beadmeta.ReleaseDeferredMetadataKey, Class: ClassMarker, Writers: sites(op("cmd/gc/session_release_marker.go", "publishDeferredReleaseObligation"), op("cmd/gc/session_release_marker.go", "publishDeferredReleaseObligationUnconditionally"))},
