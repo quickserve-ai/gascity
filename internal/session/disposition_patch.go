@@ -170,7 +170,9 @@ func spendDisposition(id string, class MetadataPatch) bool {
 // function, which forward their caller's patch: the guard looks past both for
 // the writer.
 var (
-	dispositionPlumbing = []string{"/internal/beads/", "/internal/session/disposition_patch.go", "/cmd/gc/class_store_emit.go", "/cmd/gc/bead_policy_store.go"}
+	// bead_policy_store_liveness.go is the carry's liveness overlay (ga-lys454),
+	// the same policy store's write verbs moved to their own file.
+	dispositionPlumbing = []string{"/internal/beads/", "/internal/session/disposition_patch.go", "/cmd/gc/class_store_emit.go", "/cmd/gc/bead_policy_store.go", "/cmd/gc/bead_policy_store_liveness.go"}
 	dispositionVerbs    = map[string]bool{
 		"internal/session.(*Store).ApplyPatch": true, "internal/session.(*Store).ApplyPatchInfo": true,
 		"internal/session.(*Store).commitIf": true, "internal/session.(*Store).applyPatchIfLifecycleUnchanged": true,

@@ -459,7 +459,11 @@ func (c *closeReleases) cascade(ctx context.Context, it intent) {
 		strand(c.alerts, releaseSeatOfBead(b), strings.TrimSpace(b.Metadata["state"]), out, c.now, c.stderr)
 	}
 	if it.Closing.Kind == closePoolSlot && c.cfg != nil && ctx.Err() == nil && !c.workDirInUse(store, b) {
-		pruneWorktree(sessionInfoFromBead(b), c.cityPath, c.cfg, c.stderr)
+		// No runtime provider for the prune's liveness veto (ga-1xiv): this
+		// close's transaction already re-read the runtime and refuses a live
+		// pane or an unknown liveness (redecideClose), so nil vetoes nothing
+		// the close has not.
+		pruneWorktree(sessionInfoFromBead(b), c.cityPath, c.cfg, nil, c.stderr)
 	}
 }
 

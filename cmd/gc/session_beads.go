@@ -812,7 +812,7 @@ func retireDuplicateConfiguredNamedSessionBeads(
 				continue
 			}
 			oldSessionName := strings.TrimSpace(b.Metadata["session_name"])
-			if !stopRuntimeBeforeSessionBeadMutation(store, sp, cfg, b, "shadows configured named session", stderr) {
+			if !stopRuntimeBeforeSessionBeadMutation(cityPath, store, sp, cfg, b, "shadows configured named session", stderr) {
 				continue
 			}
 			batch := session.RetireNamedSessionPatch(now, "duplicate-repair", spec.Identity)
@@ -823,7 +823,7 @@ func retireDuplicateConfiguredNamedSessionBeads(
 				fmt.Fprintf(stderr, "session beads: archiving shadow of named session %s: %v\n", spec.Identity, err) //nolint:errcheck
 				continue
 			}
-			reassignWorkAssignedToRetiredSessionBead(cityPath, cfg, store, rigStores, b, canonical.ID, stderr)
+			reassignWorkAssignedToRetiredSessionBead(sw.Legs(), store, b, canonical.ID, stderr)
 			reassignStateAssignedToRetiredSessionBead(store, b.ID, canonical.ID, now, stderr)
 			if b.Metadata == nil {
 				b.Metadata = make(map[string]string, len(batch))
@@ -1543,7 +1543,7 @@ func reassignWorkAssignedToRetiredSessionBead(
 					// Work on a named agent's durable identity stays there: the
 					// winner serves that identity, and re-homing it onto a session
 					// bead ID would make it releasable by the next close (ga-9n8hjv).
-					if assigneeIsDurableNamedIdentity(cfg, namedSessionIdentity(retiredSession), item.Assignee) {
+					if assigneeIsDurableNamedIdentity(legs.cfg, namedSessionIdentity(retiredSession), item.Assignee) {
 						continue
 					}
 					if err := wa.ReassignWorkBead(item, newSessionID); err != nil {
@@ -1601,7 +1601,7 @@ func reassignWorkAssignedToRetiredSessionInfo(
 					// Work on a named agent's durable identity stays there: the
 					// winner serves that identity, and re-homing it onto a session
 					// bead ID would make it releasable by the next close (ga-9n8hjv).
-					if assigneeIsDurableNamedIdentity(cfg, namedSessionIdentityInfo(retiredSession), item.Assignee) {
+					if assigneeIsDurableNamedIdentity(legs.cfg, namedSessionIdentityInfo(retiredSession), item.Assignee) {
 						continue
 					}
 					if err := wa.ReassignWorkBead(item, newSessionID); err != nil {
@@ -1628,26 +1628,6 @@ func unclaimWorkAssignedToRetiredSessionInfo(
 	retiredSession session.Info,
 	stderr io.Writer,
 ) unclaimResult {
-	return unclaimWorkAssignedToSessionInfo(cityPath, cfg, store, rigStores, retiredSession, fallbackRoute, "stranded-pool-worker-repair", false, stderr)
-}
-
-// unclaimWorkAssignedToSessionInfo is the release sweep behind
-// unclaimWorkAssignedToRetiredSessionInfo, with the caller naming itself as the
-// releasePath that ReleaseWorkBead's audit line records. The stranded repair and
-// the drain-ack teardown both retire a pool seat through it. skipOwnDrainStep
-// leaves the session's own mol-do-work drain step (isSessionOwnDrainStepBead)
-// out of the sweep, for the drain-ack path that already treats it as not-work.
-func unclaimWorkAssignedToSessionInfo(
-	cityPath string,
-	cfg *config.City,
-	store beads.Store,
-	rigStores map[string]beads.Store,
-	retiredSession session.Info,
-	fallbackRoute string,
-	releasePath string,
-	skipOwnDrainStep bool,
-	stderr io.Writer,
-) unclaimResult {
 	var res unclaimResult
 	if store == nil || strings.TrimSpace(retiredSession.ID) == "" {
 		return res
@@ -1665,6 +1645,7 @@ func unclaimWorkAssignedToSessionInfo(
 	}
 	res.Failed += len(out.Failed)
 	res.Released = len(out.Released)
+	res.Withheld = out.withheld()
 	return res
 }
 
@@ -2049,7 +2030,7 @@ func syncSessionBeadsWithSnapshotAndRigStores(
 			// is never stopped here.
 			shadowStopped := true
 			if !carveOut && shadowAdoptedByDesired(beadSessionName, cityName, cfg, desiredState) {
-				shadowStopped = stopAdoptedPoolShadowRuntime(cityPath, store, rigStores, sp, cfg, b, stderr)
+				shadowStopped = stopAdoptedPoolShadowRuntime(cityPath, store, sw, sp, cfg, b, stderr)
 			}
 			if !shadowStopped || !closeSeatIfRuntimeStopped(store, sw, sp, sessionInfoFromBead(b), closeWhy{reason: "reconfigured", gate: closeGated}, now, stderr) {
 				// Only a bead that can still CONTINUE the identity blocks a fresh
@@ -4210,11 +4191,12 @@ func shadowAdoptedByDesired(sessionName, cityName string, cfg *config.City, desi
 // pre-#6596 close guard did: a shadow that still holds open work keeps running,
 // and the close guard declines it on the same finding. It reports false when
 // the runtime was not stopped — work held, the work check failed, or the stop
-// itself failed — and the caller then takes the decline path.
+// itself failed — and the caller then takes the decline path. The check reads
+// the wide identity set live (RefuseScope): it gates ending a live runtime.
 func stopAdoptedPoolShadowRuntime(
 	cityPath string,
 	store beads.Store,
-	rigStores map[string]beads.Store,
+	sw *SeatWork,
 	sp runtime.Provider,
 	cfg *config.City,
 	b beads.Bead,
@@ -4223,7 +4205,7 @@ func stopAdoptedPoolShadowRuntime(
 	if stderr == nil {
 		stderr = io.Discard
 	}
-	hasAssignedWork, err := sessionHasOpenAssignedWorkForConfig(cityPath, cfg, store, rigStores, b)
+	hasAssignedWork, err := sessionHasOpenAssignedWorkInStores(sw, refuseScope(sessionInfoFromBead(b), cfg))
 	if err != nil {
 		fmt.Fprintf(stderr, "session work guard: checking assigned work for %s: %v\n", b.ID, err) //nolint:errcheck
 		return false
@@ -4231,7 +4213,7 @@ func stopAdoptedPoolShadowRuntime(
 	if hasAssignedWork {
 		return false
 	}
-	return stopRuntimeBeforeSessionBeadMutation(store, sp, cfg, b, "adopted pool shadow replaced by its configured named session", stderr)
+	return stopRuntimeBeforeSessionBeadMutation(cityPath, store, sp, cfg, b, "adopted pool shadow replaced by its configured named session", stderr)
 }
 
 func stopRuntimeBeforeSessionBeadMutation(

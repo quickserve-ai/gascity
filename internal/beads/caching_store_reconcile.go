@@ -316,7 +316,7 @@ func (c *CachingStore) runReconciliation() {
 		bdLatency := time.Since(bdStart)
 		c.mu.Lock()
 		c.syncFailures++
-		c.lastSyncFailureAt = time.Now()
+		c.lastSyncFailureAt = c.clockNow()
 		if (IsPartialResult(err) || c.syncFailures >= maxCacheSyncFailures) && (c.state == cacheLive || c.state == cachePartial) {
 			c.state = cacheDegraded
 			if !c.circuitTripped {

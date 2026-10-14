@@ -334,7 +334,13 @@ func evaluateStoppedAgentHomeCandidate(
 			return decision
 		}
 	}
-	hasAssigned, err := sessionHasOpenAssignedWorkInStores(cityPath, cfg, cityStore, rigStores, compactSessionAssignmentIdentifiers(assignmentIDs))
+	// Every owner identity, read live on every leg of the census (the city
+	// work store, the serving rigs, the relocated bindings): a home is reaped
+	// only when no leg holds work for any of them, and an unreadable leg keeps
+	// it (RefuseScope: the wide set, never answered from a snapshot).
+	legs := workLegsFromCensus(cityPath, cfg, cityWorkLegOf(beads.WorkStore{Store: cityStore}), rigStores)
+	scope := RefuseScope{ids: compactSessionAssignmentIdentifiers(assignmentIDs)}
+	hasAssigned, err := sessionHasOpenAssignedWorkInStores(seatWorkFor(legs, scope), scope)
 	if err != nil {
 		decision.gate("assignments", false)
 		decision.Reason = "assignment probe failed: " + err.Error()

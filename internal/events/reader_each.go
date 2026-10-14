@@ -47,7 +47,7 @@ func ReadFilteredEach(ctx context.Context, path string, filter Filter, fn func(E
 		}
 		var ctxErr error
 		calls := 0
-		err := streamArchive(filepath.Join(dir, info.Basename), filter, func(e Event) bool {
+		err := streamArchive(filepath.Join(dir, info.Basename), filter, typeNeedles(filter, nil), func(e Event) bool {
 			if calls++; calls%historyTailCtxCheckLines == 0 {
 				if ctxErr = ctx.Err(); ctxErr != nil {
 					return false

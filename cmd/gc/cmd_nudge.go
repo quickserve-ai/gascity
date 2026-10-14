@@ -1505,20 +1505,6 @@ func checkNudgeMessageSize(target nudgeTarget, message string) error {
 		len(message), maxClaudeNudgeMessageBytes)
 }
 
-// providerFamily returns the built-in provider family of the target (e.g.
-// "claude" for a custom provider based on claude), or "" when it cannot be
-// determined.
-func (t nudgeTarget) providerFamily() string {
-	if t.resolved != nil {
-		return resolvedProviderLaunchFamily(t.resolved)
-	}
-	var providers map[string]config.ProviderSpec
-	if t.cfg != nil {
-		providers = t.cfg.Providers
-	}
-	return config.BuiltinFamily(t.providerName(), providers)
-}
-
 func shouldQueueManagedNudgeWake(target nudgeTarget, store beads.Store, sp runtime.Provider) (bool, error) {
 	if !canRequestManagedNudgeWake(target, store) {
 		return false, nil
