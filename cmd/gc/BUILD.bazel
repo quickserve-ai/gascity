@@ -1884,6 +1884,7 @@ go_test(
         "reconcile_operator_lease_reread_test.go",
         "reconcile_pass_test.go",
         "reconcile_planner_test.go",
+        "reconcile_prior_session_key_test.go",
         "reconcile_ready_fanout_test.go",
         "reconcile_replay_test.go",
         "reconcile_session_decide_test.go",
