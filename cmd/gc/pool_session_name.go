@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"path"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -571,9 +572,11 @@ func (l *deadAssigneeKeepLog) log(id, assignee, why string) bool {
 // closed on an unreadable liveness observation. Releasing work from a seat that
 // is actually alive is data loss, not recovery (ga-g3pf0).
 //
-// Every per-bead gate from releaseOrphanedPoolAssignments applies unchanged,
-// including the live re-read in liveWorkRowStillReleasable — the tick
-// snapshot names candidates but never by itself justifies a release.
+// Every per-bead gate from releaseOrphanedPoolAssignments applies, the roster
+// gate taking the seat's own record as provenance (orphanCloseHold, shared
+// with the v2 close effect), and the live re-read in
+// liveWorkRowStillReleasable included — the tick snapshot names candidates
+// but never by itself justifies a release.
 //
 // assignedWorkStores is the index-aligned snapshot of the legs the census read
 // assignedWorkBeads through, and it is how a binding-resident row is released at
@@ -623,40 +626,14 @@ func releaseConfirmedOrphanSessionWork(
 		if _, ok := identifiers[assignee]; !ok {
 			continue
 		}
-		// Roster gate on the SECOND release site. The identifiers set is
-		// built from this city's own session info, but it includes RAW
-		// metadata strings (bead ID, session_name, configured identity read
-		// off the store — see sessionAssignmentIdentifierRawInfo), not
-		// roster-derived names; a stored value that collides with another
-		// city's identity would otherwise carry that identity straight into
-		// a release here, ungated. Same predicate, same failure direction as
-		// the sweep path: unobservable means protect, loudly. The
-		// shared-pack residual applies here as everywhere — a pool instance
-		// byte-identical across cities passes any roster test (see the
-		// package comment in pool_orphan_foreign_identity.go).
-		if !poolAssigneeIsLocallyObservable(cfg, config.EffectiveCityName(cfg, ""), assignee) {
-			log.Printf("releaseConfirmedOrphanSessionWork: protected %q (%s): assignee is not locally observable — refusing orphan-close release", assignee, wb.ID)
-			continue
-		}
-		// OPERATOR STOP LEVER (ga-h5435p) on the SECOND release site: a thrown
-		// orphan_release = false must stop every autonomous write to the rig's
-		// work, and this tie-break writes the same fields the sweep does. Same
-		// placement rule as the sweep — after the candidacy filters, ahead of
-		// the live re-read and the detached probe — and never silent. Same
-		// decision as the sweep too: the rig is read off the index-aligned store
-		// ref, so city-owned work is never held by a disabled rig (a held release
-		// leaves the orphaned seat holding the work, and the close guard then
-		// refuses to close it); only without refs is the rig resolved from the
-		// bead, failing closed while any rig has the switch thrown.
+		// The orphan close's own gates (the roster gate with the seat's record
+		// as provenance, and the orphan_release stop lever), shared with the v2
+		// close effect's orphan release (orphanCloseHold).
 		workStoreRef := ""
 		if storeRefAware {
 			workStoreRef = assignedWorkStoreRefs[i]
 		}
-		if rigName, allowed := poolOrphanReleaseGate(cfg, workStoreRef, storeRefAware, wb); !allowed {
-			if rigName == "" {
-				rigName = "<unresolved>"
-			}
-			log.Printf("releaseConfirmedOrphanSessionWork: orphan_release=false held %s in rig %q: refusing orphan-close release of %q", wb.ID, rigName, assignee)
+		if orphanCloseHold(cfg, seat, wb, workStoreRef, storeRefAware) != "" {
 			continue
 		}
 		ownerStore := assignedWorkOwnerStore(cfg, store, rigStores, assignedWorkStores, i, wb)
@@ -671,6 +648,77 @@ func releaseConfirmedOrphanSessionWork(
 		}
 	}
 	return released
+}
+
+// Why the orphan close holds a claim back (orphanCloseHold).
+const (
+	orphanCloseHeldForeign = "orphan-close-foreign" // the roster gate: an identity this city cannot observe
+	orphanCloseHeldSwitch  = "orphan-close-off"     // the rig's orphan_release = false (ga-h5435p)
+)
+
+// orphanCloseHold is the orphan close's own two gates on one claim of the
+// orphaned seat, for both engines: the legacy tie-break
+// (releaseConfirmedOrphanSessionWork) and the v2 close effect's orphan release
+// (ReleaseClaims under releaseOrphan). It returns "" when the claim may be
+// released; otherwise it logs the hold, never silently, and returns why.
+//
+// THE ROSTER GATE, WITH THE SEAT'S OWN RECORD AS PROVENANCE (the #5952 carry,
+// composed with #7763). The seat's identifiers include RAW metadata strings
+// read off the store (the bead ID, session_name: see
+// sessionAssignmentIdentifierRawInfo), and a stored value that collides with
+// another city's <rig>/<name> identity would otherwise carry that identity
+// straight into a release here. So an assignee the roster cannot observe is
+// protected, as in the sweep, unless the orphaned seat's own record answers to
+// it under a key that holds a qualified identity: its alias, its configured
+// named identity or its alias history (session.HasRecordAnsweringTo's keys,
+// the provenance the sweep's foreignClaimGate accepts). That keeps upstream's
+// point about this site: a namepool seat's stable alias leaves the roster when
+// its name leaves the namepool, an orphaned seat is exactly one whose config
+// is gone, and refusing its own alias claim would re-wedge it (ga-jrnou). A
+// bead ID or a session_name never legitimately holds "<rig>/<name>", so a
+// qualified assignee matched only through one of those is the collision, and
+// it is held.
+//
+// THE STOP LEVER (ga-h5435p). A thrown orphan_release = false stops every
+// autonomous write to the rig's work, and the orphan close writes the same
+// fields the sweep does. The rig is read off the claim's store ref when the
+// caller has one (storeRefAware), so city-owned work is never held by a
+// disabled rig (a held release leaves the orphaned seat holding the work, and
+// the close guard then refuses to close it); only without a ref is the rig
+// resolved from the bead, failing closed while any rig has the switch thrown.
+//
+// The shared-pack residual applies here as everywhere: a pool instance
+// byte-identical across cities passes any roster test (see the package comment
+// in pool_orphan_foreign_identity.go).
+func orphanCloseHold(cfg *config.City, seat releaseSeat, wb beads.Bead, storeRef string, storeRefAware bool) string {
+	assignee := strings.TrimSpace(wb.Assignee)
+	if !poolAssigneeIsLocallyObservable(cfg, config.EffectiveCityName(cfg, ""), assignee) && !slices.Contains(seat.records, assignee) {
+		log.Printf("releaseConfirmedOrphanSessionWork: protected %q (%s): assignee is not locally observable — refusing orphan-close release", assignee, wb.ID)
+		return orphanCloseHeldForeign
+	}
+	if rigName, allowed := poolOrphanReleaseGate(cfg, storeRef, storeRefAware, wb); !allowed {
+		if rigName == "" {
+			rigName = "<unresolved>"
+		}
+		log.Printf("releaseConfirmedOrphanSessionWork: orphan_release=false held %s in rig %q: refusing orphan-close release of %q", wb.ID, rigName, assignee)
+		return orphanCloseHeldSwitch
+	}
+	return ""
+}
+
+// orphanCloseClaims splits the claims an orphan close read through legs into
+// those it may release and those orphanCloseHold holds back; each claim's
+// store ref is the leg it was read on (orphanReleaseStoreRefOf).
+func orphanCloseClaims(legs WorkLegs, seat releaseSeat, claims []seatWorkHit) (releasable, held []seatWorkHit) {
+	for _, c := range claims {
+		ref, aware := orphanReleaseStoreRefOf(legs, c.store)
+		if orphanCloseHold(legs.cfg, seat, c.bead, ref, aware) != "" {
+			held = append(held, c)
+			continue
+		}
+		releasable = append(releasable, c)
+	}
+	return releasable, held
 }
 
 // assignedWorkOwnerStore resolves the store that owns the assigned work bead at

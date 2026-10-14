@@ -133,6 +133,7 @@ const (
 	keptMoved         = "moved"
 	keptDetachedAlive = "detached-alive"
 	keptNamedProposed = "named-release-proposed" // ga-9n8hjv fence #1
+	keptOrphanClose   = "orphan-close-held"      // the orphan close's own gates (orphanCloseHold)
 	failedBudget      = "budget"
 )
 
@@ -154,6 +155,13 @@ type releaseSeat struct {
 	named bool
 	alias string
 	guard namedReleaseGuard
+	// records are the identities the seat's own record answers to under the
+	// keys that can hold a qualified "<rig>/<name>" identity (alias,
+	// configured named identity, alias history: session.HasRecordAnsweringTo's
+	// keys): the provenance the orphan close's roster gate accepts
+	// (orphanCloseHold). Only the session.Info form carries them, which both
+	// orphan closes hold; without them that gate protects more, never less.
+	records []string
 }
 
 func releaseSeatOfBead(b beads.Bead) releaseSeat {
@@ -173,6 +181,11 @@ func releaseSeatOfBead(b beads.Bead) releaseSeat {
 func releaseSeatOfInfo(info sessionpkg.Info) releaseSeat {
 	s := releaseSeat{id: info.ID, name: info.SessionNameMetadata, template: info.Template, fallback: retiredSessionFallbackRouteInfo(info),
 		named: isNamedSessionInfo(info) || strings.TrimSpace(info.ConfiguredNamedIdentity) != "", alias: info.Alias}
+	for _, id := range append([]string{info.ConfiguredNamedIdentity, info.Alias}, info.AliasHistory...) {
+		if id = strings.TrimSpace(id); id != "" {
+			s.records = append(s.records, id)
+		}
+	}
 	for _, id := range []string{info.CurrentlyProcessingBeadID, info.CurrentClaimBeadID} {
 		if id = strings.TrimSpace(id); id != "" {
 			if s.started == nil {
@@ -249,7 +262,21 @@ func ReleaseClaims(sw *SeatWork, scope ReleaseScope, seat releaseSeat, why relea
 	if err != nil && p.startedKeeps {
 		return ReleaseOutcome{}, err
 	}
-	return releaseListed(claims, why, seat, sw.Legs().cfg, opts), err
+	// Under releaseOrphan this is the orphan close (the v2 close effect's): a
+	// seat's claims read through its legs. It takes the orphan close's own
+	// gates, as the legacy tie-break does; a claim one holds stays assigned to
+	// the seat, kept. (The dead-assignee sweep lists and gates its own claims
+	// and calls releaseListed.)
+	var held []seatWorkHit
+	if why == releaseOrphan {
+		claims, held = orphanCloseClaims(sw.Legs(), seat, claims)
+	}
+	out := releaseListed(claims, why, seat, sw.Legs().cfg, opts)
+	for _, h := range held {
+		out.Kept = append(out.Kept, h)
+		out.Why[h.bead.ID] = keptOrphanClose
+	}
+	return out, err
 }
 
 // releaseListed is ReleaseClaims' body for claims a caller already listed
