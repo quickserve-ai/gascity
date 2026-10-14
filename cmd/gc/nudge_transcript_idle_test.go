@@ -602,7 +602,7 @@ func newClaudeDispatchSeat(t *testing.T, answers ...bool) *claudeDispatchSeat {
 	seat.deliver = func() bool {
 		t.Helper()
 		delivered, err := tryDeliverQueuedNudgesByPoller(target, store, store, pane, 3*time.Second,
-			worker.LiveObservation{Running: true, LastActivity: &fresh})
+			worker.LiveObservation{Running: true, Alive: true, LastActivity: &fresh})
 		if err != nil {
 			t.Fatalf("tryDeliverQueuedNudgesByPoller: %v", err)
 		}
