@@ -135,13 +135,26 @@ func TestRigTemplateInstance(t *testing.T) {
 // A [[patches.agent]] (or rig/provider) patch whose target is absent from the
 // merged config is rolled back at reload; the client named a target that does
 // not exist, so it is a 400, not a 500.
+//
+// ApplyPatches skips a patch whose target is missing and records it on
+// LoadWarnings instead of failing the load (ga-djvbvp), so the reload refuses
+// the edit through that warning: cmd/gc's newUnappliedPatch wraps a warning
+// the edit introduced in config.ErrPatchTargetNotFound, the chain built here.
 func TestMutationErrorMapsPatchTargetNotFoundToBadRequest(t *testing.T) {
 	cfg := &config.City{}
-	applyErr := config.ApplyPatches(cfg, config.Patches{Agents: []config.AgentPatch{{Dir: "myrig", Name: "rigbot"}}})
-	if applyErr == nil {
-		t.Fatal("ApplyPatches accepted a patch for a missing agent")
+	if err := config.ApplyPatches(cfg, config.Patches{Agents: []config.AgentPatch{{Dir: "myrig", Name: "rigbot"}}}); err != nil {
+		t.Fatalf("ApplyPatches: %v; an unappliable patch is recorded, not returned", err)
 	}
-	wrapped := fmt.Errorf("refreshing updated city config: %w", fmt.Errorf("applying patches: %w", applyErr))
+	var unapplied string
+	for _, w := range cfg.LoadWarnings {
+		if config.IsUnappliedPatchWarning(w) && strings.Contains(w, "myrig/rigbot") {
+			unapplied = w
+		}
+	}
+	if unapplied == "" {
+		t.Fatalf("ApplyPatches did not report the patch for a missing agent; warnings = %q", cfg.LoadWarnings)
+	}
+	wrapped := fmt.Errorf("refreshing updated city config: %w", fmt.Errorf("%s: %w", unapplied, config.ErrPatchTargetNotFound))
 	var se huma.StatusError
 	if !errors.As(mutationError(wrapped), &se) || se.GetStatus() != http.StatusBadRequest {
 		t.Fatalf("mutationError(%v) = %v, want 400", wrapped, mutationError(wrapped))
