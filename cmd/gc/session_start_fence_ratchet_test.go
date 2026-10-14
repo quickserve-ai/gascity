@@ -21,7 +21,7 @@ var sessionStartFenceAllowlist = map[string]string{
 	"cmd/gc/status_provider.go|(*statusProvider).Start|Start":                        "forwarding wrapper used only by `gc status` (newStatusSessionProviderForCityWithSnapshot), a separate CLI process; the controller never holds it",
 	"cmd/gc/status_provider.go|(*statusProvider).Relaunch|Relaunch":                  "forwarding wrapper used only by `gc status`, a separate CLI process",
 	"cmd/gc/cmd_session.go|(*attachmentCachingProvider).Relaunch|Relaunch":           "forwarding wrapper built only by `gc session list`'s fallback (doSessionListFallback), a separate CLI process",
-	"cmd/gc/session_lifecycle_parallel.go|startPreparedStartCandidate|StartResolved": "worker-handle start; reached only through runPreparedStartCandidate, whose every caller is runFencedPreparedStartCandidate (bracketed); session handles also land in Manager.startRuntime (hooked)",
+	"cmd/gc/session_lifecycle_parallel.go|startPreparedStartCandidate|StartResolved": "worker-handle start; reached only through runPreparedStartCandidate, whose every caller is runFencedPreparedStartCandidate (bracketed); session handles also land in a Manager start, which brackets its provider call",
 	"internal/worker/runtime_handle.go|(*RuntimeHandle).StartResolved|Start":         "runtime-only worker handle (no session bead, so no Manager); in-process it is started only by startPreparedStartCandidate, which runFencedPreparedStartCandidate brackets; the API server's wakes use session-backed handles",
 	"cmd/gc/reconcile_planner.go|(*planner).run|Start@method value":                  "not a runtime call: p.last.Start is the time.Time a planner pass began (plannerPassStats), read to pace the next pass; upstream's v2 planner (#7285) starts nothing here",
 	// Upstream's v2 relaunch (#7636) names a bool fact Relaunch; reading it
@@ -41,7 +41,7 @@ var sessionStartFenceAllowlist = map[string]string{
 var sessionStartFenceBrackets = map[string]int{
 	"beginStart":           0, // cmd/gc sessionStartFence
 	"BeginStart":           0,
-	"bracketStart":         2, // internal/session Manager.startRuntime
+	"bracketStart":         2, // internal/session: a Manager's provider start
 	"BracketProviderStart": 1,
 }
 
@@ -63,7 +63,8 @@ func isSessionStartFenceBracket(call *ast.CallExpr) bool {
 //
 // One-argument handle.Start(ctx) calls are not scanned: a worker handle's
 // Start always ends in one of the scanned three-argument sites (a session
-// handle in Manager.startRuntime, a runtime handle in RuntimeHandle.StartResolved).
+// handle in a Manager's bracketed provider start, a runtime handle in
+// RuntimeHandle.StartResolved).
 func TestSessionStartFenceRatchet(t *testing.T) {
 	root := filepath.Join("..", "..")
 	var findings []string
