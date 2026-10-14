@@ -1503,6 +1503,7 @@ go_test(
         "orders_lane_cadence_test.go",
         "orders_lane_fs_pressure_test.go",
         "orders_lane_test.go",
+        "orders_maintenance_test.go",
         "pack_command_discovery_lock_test.go",
         "pack_import_formula_order_test.go",
         "path_helpers_test.go",
