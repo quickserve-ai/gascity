@@ -10,6 +10,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/sessionlog"
 )
 
@@ -84,8 +85,18 @@ func (e *NudgeDeferredError) Error() string {
 	return msg
 }
 
-// Is makes errors.Is(err, ErrNudgeDeferredHumanPrompt) true.
-func (e *NudgeDeferredError) Is(target error) bool { return target == ErrNudgeDeferredHumanPrompt }
+// Is makes errors.Is(err, ErrNudgeDeferredHumanPrompt) true. A deferral on a
+// permission prompt (NudgeDeferReasonApprovalPrompt) is also
+// runtime.ErrPendingInteraction: it is the pane state upstream's own look
+// refuses with that sentinel (#6832), and every caller that answers a pending
+// interaction (the API's 409, the queue's release) recognizes it either way.
+// Callers that check for the deferral first keep the carry's handling.
+func (e *NudgeDeferredError) Is(target error) bool {
+	if target == ErrNudgeDeferredHumanPrompt {
+		return true
+	}
+	return target == runtime.ErrPendingInteraction && e.Reason == NudgeDeferReasonApprovalPrompt
+}
 
 // Unwrap exposes the capture error, if any.
 func (e *NudgeDeferredError) Unwrap() error { return e.Err }

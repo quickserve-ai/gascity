@@ -1083,6 +1083,32 @@ func TestNudgeSessionDefersWhenAPersonReplacesTheTypedNudgeBeforeTheFirstEnter(t
 	}
 }
 
+// Re-sync #7: a deferral on a permission prompt is also
+// runtime.ErrPendingInteraction (NudgeDeferredError.Is), which upstream's look
+// refusal handling matches too. When the submit chokepoint, not the look just
+// before it, is the read that sees the prompt, the nudge must still report
+// the chokepoint's deferral (before_submit), which the queue releases without
+// spending an attempt -- not an unconfirmed submit, which spends one.
+func TestNudgeSessionApprovalAtTheSubmitChokepointStaysADeferral(t *testing.T) {
+	ours := composerFixture("❯ " + guardTestNudge)
+	fe := &panePromptExecutor{screen: idleComposerFixture}
+	// Plain reads once the text is in: provenance, busy baseline, the resend
+	// gate's, the permission look before the submit -- all ours -- then the
+	// chokepoint's, which shows the prompt.
+	fe.textCaptures = []string{ours, ours, ours, ours, approvalPromptFixture}
+	fe.onEnter = func(int) string { return busyFixture }
+	tm, session := newGuardTestTmux(fe)
+
+	err := tm.NudgeSession(session, guardTestNudge)
+	if got := fe.enterCount(); got != 0 {
+		t.Fatalf("Enter sent %d time(s) onto a permission prompt", got)
+	}
+	assertDeferred(t, err, NudgeDeferReasonApprovalPrompt)
+	if !NudgeDeferredAfterTyping(err) || errors.Is(err, ErrNudgeSubmitUnconfirmed) {
+		t.Fatalf("NudgeSession() = %v, want the before_submit deferral, not an unconfirmed submit", err)
+	}
+}
+
 // guardTestQueuedNudge is a queued nudge in the shape the queue delivers to a
 // tmux pane (formatNudgeInjectOutput in cmd/gc): multi-line, so on a claude
 // pane it is PASTED (paste-buffer), not typed.
