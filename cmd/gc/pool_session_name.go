@@ -884,7 +884,7 @@ func releaseOrphanedPoolAssignment(store beads.Store, wb beads.Bead, clearDetach
 		return false
 	}
 	if reason := guard.withholdReasonForBead(wb); reason != "" {
-		if _, err := proposeNamedRelease(store, wb, reason, "orphaned-pool-assignment", log.Writer()); err != nil {
+		if _, err := proposeNamedRelease(store, wb, reason, orphanReleaseAuditPath, log.Writer()); err != nil {
 			log.Printf("releaseOrphanedPoolAssignments: %v", err)
 		}
 		return false

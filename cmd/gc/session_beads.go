@@ -1341,7 +1341,7 @@ func unclaimWorkAssignedToRetiredSessionBeadVia(
 	scope := releaseScopeOwn(sessionBead).except(configuredNamedIdentitiesIn(legs.cfg, sessionAssignmentIdentifiers(sessionBead)))
 	seat := releaseSeatOfBead(sessionBead)
 	seat.fallback = fallbackRoute // "" keeps whatever routing each claim carries
-	out, err := ReleaseClaims(seatWorkFor(legs, scope), scope, seat, releaseRetired, ReleaseOpts{})
+	out, err := ReleaseClaims(seatWorkFor(legs, scope), scope, seat, releaseRetired, ReleaseOpts{Audit: stderr})
 	logRelease(stderr, "retired", sessionBead.ID, out, err)
 	return out
 }
@@ -1389,7 +1389,7 @@ func releaseUnexecutedClaimsOnDrainAck(
 	}
 	scope := releaseScopeOwn(sessionBead)
 	sw := seatWorkFor(legs, scope)
-	out, err := ReleaseClaims(sw, scope, releaseSeatOfBead(sessionBead), releaseDrainAck, ReleaseOpts{Deadline: time.Now().Add(budget)})
+	out, err := ReleaseClaims(sw, scope, releaseSeatOfBead(sessionBead), releaseDrainAck, ReleaseOpts{Deadline: time.Now().Add(budget), Audit: stderr})
 	if slices.ContainsFunc(out.Failed, func(c seatWorkHit) bool { return out.Why[c.bead.ID] == failedBudget }) {
 		spent()
 	}
@@ -1467,7 +1467,7 @@ func releaseUnexecutedClaimsOnKill(
 		!isPoolSessionSlotFreeable(sessionBead, now) {
 		return
 	}
-	out, err := ReleaseClaims(sw, releaseScopeOfBead(sessionBead, sw.Legs().cfg), releaseSeatOfBead(sessionBead), releaseKilledSeat, ReleaseOpts{})
+	out, err := ReleaseClaims(sw, releaseScopeOfBead(sessionBead, sw.Legs().cfg), releaseSeatOfBead(sessionBead), releaseKilledSeat, ReleaseOpts{Audit: stderr})
 	if err != nil {
 		fmt.Fprintf(stderr, "session beads: checking killed session %s for started work: %v; releasing nothing\n", sessionBead.ID, err) //nolint:errcheck
 		return
@@ -1638,7 +1638,7 @@ func unclaimWorkAssignedToRetiredSessionInfo(
 	if err := clearSessionCurrentClaim(store, retiredSession.ID); err != nil {
 		fmt.Fprintf(stderr, "session beads: clearing current claim on retired session %s: %v\n", retiredSession.ID, err) //nolint:errcheck
 	}
-	out, err := ReleaseClaims(sw, releaseScope(retiredSession, sw.Legs().cfg), releaseSeatOfInfo(retiredSession), releaseStrandedRepair, ReleaseOpts{})
+	out, err := ReleaseClaims(sw, releaseScope(retiredSession, sw.Legs().cfg), releaseSeatOfInfo(retiredSession), releaseStrandedRepair, ReleaseOpts{Audit: stderr})
 	logRelease(stderr, "retired", retiredSession.ID, out, err)
 	if err != nil {
 		res.Failed++
@@ -4486,7 +4486,7 @@ func releaseWorkFromClosedSessionBeadExcept(store beads.Store, sw *SeatWork, ses
 	// detach its work (ga-9n8hjv; see releasableAssigneeIdentities). The
 	// caller's preserve set withholds further identities on top of it.
 	scope := releaseScopeOfBead(sessionBead, sw.Legs().cfg).except(preserve).except(durableSessionIdentities(sw.Legs().cfg, sessionBead))
-	out, err := ReleaseClaims(sw, scope, releaseSeatOfBead(sessionBead), releaseCloseCascade, ReleaseOpts{Late: true})
+	out, err := ReleaseClaims(sw, scope, releaseSeatOfBead(sessionBead), releaseCloseCascade, ReleaseOpts{Late: true, Audit: stderr})
 	logRelease(stderr, "closing", sessionBead.ID, out, err)
 	return out
 }
