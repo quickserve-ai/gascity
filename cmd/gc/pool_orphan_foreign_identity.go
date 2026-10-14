@@ -65,12 +65,16 @@ import (
 // this gate to every identity shape without the shape exemption, because the
 // order has no route filter (claimIdentityProvenance, #5955).
 //
-// The orphan-close release (releaseConfirmedOrphanSessionWork) has no gate of
-// its own, deliberately. It releases only under identifiers read off this
-// city's own orphaned session bead or derived from its roster, so every claim
-// it touches already carries the provenance this gate looks for. A roster test
-// there would refuse exactly the seats that site exists for (an orphaned seat
-// is one whose config is gone) and re-wedge them (ga-jrnou).
+// The orphan close (releaseConfirmedOrphanSessionWork, and the v2 close
+// effect's orphan release) does not use this gate. It releases only under the
+// orphaned seat's own identifiers, and a plain roster test there would refuse
+// exactly the seats that site exists for (an orphaned seat is one whose config
+// is gone) and re-wedge them (ga-jrnou). It has a narrower gate of its own
+// (orphanCloseHold, kept by the fork): an identifier off the roster passes
+// when the seat's own record answers to it under alias, configured named
+// identity or alias history, the same provenance this gate accepts, and is
+// protected when it reached the seat only as a raw stored bead ID or
+// session_name, which never legitimately hold "<rig>/<name>".
 //
 // KNOWN RESIDUAL (ga-dk24ao): two cities importing the same agent pack share an
 // identity space, so a foreign POOL instance ("qcore/gastown.furiosa") is
