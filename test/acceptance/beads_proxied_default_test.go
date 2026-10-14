@@ -344,12 +344,15 @@ var (
 // timed out, and every line it flags either an age ("last fired 3m ago,
 // expected every 1m (CRITICAL: stale)") of a 1-minute order at most
 // schedulerMaxLag old, or a first firing not yet made by a controller at most
-// schedulerMaxLag old ("gate-sweep: never fired since controller start 1m
-// ago") while the same report shows the scheduler firing other orders. That is
-// a loaded CI runner missing ticks (ga-l0b72a.9: #271 run 38317797049 failed
-// three proxied tests on "dolt-health: last fired 2m ago ... CRITICAL: stale";
-// run 38485422418 failed on a 30s order not yet fired one minute in, with 8
-// other orders current).
+// schedulerColdStart old ("gate-sweep: never fired since controller start 1m
+// ago") while the same report shows the scheduler firing other orders.
+// The first is a loaded CI runner missing ticks (ga-l0b72a.9: #271 run
+// 38317797049 failed three proxied tests on "dolt-health: last fired 2m ago
+// ... CRITICAL: stale"). The second is the cold-start dispatch budget: the
+// controller dispatches at most 4 orders a tick, so the test city's ~20 orders
+// take ~5 ticks to fire once, while order-firing-current flags a never-fired
+// 30s order after 45s (run 38485422418: 8 orders fired in two ticks, and
+// gate-sweep, 11th of the rest, was not yet reached one minute in).
 // A lookup timeout, a never-fired order on an older controller or with no
 // order shown firing, an unreadable history, or any other failing check is
 // NOT lag and stays fatal: those are the defects this assertion has caught
@@ -362,7 +365,9 @@ func schedulerLagOnly(report doctorReport) bool {
 	// fired records evidence in this report that the scheduler fires at all:
 	// an order with a last firing, or a non-zero count of current orders. A
 	// never-fired line is lag only beside it; without it, a scheduler that
-	// fires nothing would read as late.
+	// fires nothing would read as late. The count reads every retained firing,
+	// not only those since the latest controller start, so this assumes the
+	// test city's controller started once, as every caller's city does.
 	fired := false
 	neverFired := false
 	for _, r := range report.Results {
@@ -386,7 +391,7 @@ func schedulerLagOnly(report doctorReport) bool {
 				lagged, fired = true, true
 			case schedulerNeverFiredLine.MatchString(d):
 				uptime, err := time.ParseDuration(schedulerNeverFiredLine.FindStringSubmatch(d)[1])
-				if err != nil || uptime > schedulerMaxLag {
+				if err != nil || uptime > schedulerColdStart {
 					return false
 				}
 				lagged, neverFired = true, true
@@ -414,6 +419,14 @@ func schedulerLagOnly(report doctorReport) bool {
 // a stopped scheduler is the controller regression the assertion must catch.
 const schedulerMaxLag = 5 * time.Minute
 
+// schedulerColdStart is how old a controller may be while an order still
+// waits for its first firing and that counts as the cold-start dispatch
+// budget, not a skipped order: ~20 orders at 4 a tick is 5 ticks, 2.5m at the
+// 30s patrol interval. The check prints uptime rounded to the minute, so "3m"
+// covers up to 3m29s. A never-fired order on an older controller has been
+// skipped, which the assertion must catch.
+const schedulerColdStart = 3 * time.Minute
+
 // schedulerLateNotStopped judges one stale line's captured age and interval:
 // only the test city's 1-minute orders, and only up to schedulerMaxLag.
 func schedulerLateNotStopped(m []string) bool {
@@ -431,7 +444,9 @@ func schedulerLateNotStopped(m []string) bool {
 	return expected == time.Minute && age <= schedulerMaxLag
 }
 
-// TestSchedulerLagOnly pins which order-firing-current reports count as lag.
+// TestSchedulerLagOnly pins which order-firing-current reports count as lag:
+// late 1-minute orders, and first firings still waiting on the cold-start
+// dispatch budget.
 // It needs no bd or dolt: it judges literal doctor reports.
 func TestSchedulerLagOnly(t *testing.T) {
 	stale := "dolt-health: last fired 2m ago, expected every 1m (CRITICAL: stale)" // #271 run 38317797049
@@ -448,7 +463,7 @@ func TestSchedulerLagOnly(t *testing.T) {
 	}{
 		{"one stale line", report(1, false, stale), true},
 		{"stale with overdue sibling and count", report(1, false, stale,
-			"wisp-gc: last fired 1h30m0s ago, expected every 1h (overdue)", "4 other scheduled order(s) current"), true},
+			"wisp-gc: last fired 90m ago, expected every 1h (overdue)", "4 other scheduled order(s) current"), true},
 		{"stale sibling gated on open work", report(1, false, stale,
 			"mol-x: last fired 3m ago, expected every 1m (CRITICAL: stale), gated on open work ga-1 (5m old, unassigned)"), false},
 		{"stale sibling whose open-work lookup failed", report(1, false, stale,
@@ -459,8 +474,20 @@ func TestSchedulerLagOnly(t *testing.T) {
 			"gate-sweep: never fired since controller start 1m ago",
 			"reaper: never fired (controller running 1m, within first cycle)",
 			"8 other scheduled order(s) current"), true},
-		{"never fired at the lag bound beside a stale line", report(1, false, stale,
-			"gate-sweep: never fired since controller start 5m ago"), true},
+		{"never fired at the cold-start bound beside a stale line", report(1, false, stale,
+			"gate-sweep: never fired since controller start 3m ago"), true},
+		{"never fired past the cold-start bound: skipped, not waiting", report(1, false,
+			"gate-sweep: never fired since controller start 4m ago", "8 other scheduled order(s) current"), false},
+		{"several never fired one minute in, others current", report(1, false,
+			"gate-sweep: never fired since controller start 1m ago",
+			"order-tracking-sweep: never fired since controller start 1m ago",
+			"8 other scheduled order(s) current"), true},
+		{"never fired with only an overdue order as evidence", report(1, false,
+			"gate-sweep: never fired since controller start 1m ago",
+			"wisp-gc: last fired 90m ago, expected every 1h (overdue)"), true},
+		{"never fired gated on open work", report(1, false,
+			"gate-sweep: never fired since controller start 1m ago, gated on open work ga-1 (1m old, unassigned)",
+			"8 other scheduled order(s) current"), false},
 		{"never fired with nothing shown firing", report(1, false,
 			"gate-sweep: never fired since controller start 1m ago"), false},
 		{"never fired with zero orders current", report(1, false,
