@@ -489,8 +489,12 @@ func TestSessionStartFence_BracketsControllerStarts(t *testing.T) {
 			}
 			genBefore := fence.generation()
 			if async {
+				// The async start runs under its candidate's runtime lease too
+				// (upstream #7431), as upstream's own async wave tests lease it.
+				leased, release := leasedStart(t, city, item)
+				defer release()
 				done := make(chan struct{})
-				enqueuePreparedStartWaveForCity(context.Background(), []asyncPreparedStart{{item: item, done: func() { close(done) }}},
+				enqueuePreparedStartWaveForCity(context.Background(), []asyncPreparedStart{{item: leased, done: func() { close(done) }}},
 					city, sp, store, nil, clock.Real{}, events.Discard, 10*time.Second, 0, io.Discard, io.Discard, nil, nil, nil, nil, nil, fence)
 				select {
 				case <-done:
