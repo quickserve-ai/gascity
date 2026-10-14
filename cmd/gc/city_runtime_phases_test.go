@@ -452,15 +452,10 @@ func TestCityRuntimeTickPhasesMatchLegacyTickRecordsAndStoreOps(t *testing.T) {
 				"SetMetadataBatch gc-1 state",
 				"SetMetadataBatch gc-1 effective_sleep_after_idle,requested_sleep_after_idle,sleep_capability,sleep_policy_source",
 				// The carry's gc-mdh0 assigned-work probe before a timer drain (replayed
-				// upstream #6168): open and in_progress, issues then wisps, by identifier.
-				"List status=open type= label= metadata= include_closed=false live=true",
-				"List status=open type= label= metadata= include_closed=false live=true",
-				"List status=open type= label= metadata= include_closed=false live=true",
-				"List status=open type= label= metadata= include_closed=false live=true",
+				// upstream #6168), read through the tick's SeatWork since #7552/#7561:
+				// one live list per status, in_progress then open.
 				"List status=in_progress type= label= metadata= include_closed=false live=true",
-				"List status=in_progress type= label= metadata= include_closed=false live=true",
-				"List status=in_progress type= label= metadata= include_closed=false live=true",
-				"List status=in_progress type= label= metadata= include_closed=false live=true",
+				"List status=open type= label= metadata= include_closed=false live=true",
 				"Get gc-1",
 				"Get gc-1",
 				"List status=open type=session label= metadata= include_closed=false live=false",
@@ -552,15 +547,10 @@ func TestCityRuntimeTickPhasesMatchLegacyTickRecordsAndStoreOps(t *testing.T) {
 				"SetMetadataBatch gc-1 state",
 				"SetMetadataBatch gc-1 effective_sleep_after_idle,requested_sleep_after_idle,sleep_capability,sleep_policy_source",
 				// The carry's gc-mdh0 assigned-work probe before a timer drain (replayed
-				// upstream #6168): open and in_progress, issues then wisps, by identifier.
-				"List status=open type= label= metadata= include_closed=false live=true",
-				"List status=open type= label= metadata= include_closed=false live=true",
-				"List status=open type= label= metadata= include_closed=false live=true",
-				"List status=open type= label= metadata= include_closed=false live=true",
+				// upstream #6168), read through the tick's SeatWork since #7552/#7561:
+				// one live list per status, in_progress then open.
 				"List status=in_progress type= label= metadata= include_closed=false live=true",
-				"List status=in_progress type= label= metadata= include_closed=false live=true",
-				"List status=in_progress type= label= metadata= include_closed=false live=true",
-				"List status=in_progress type= label= metadata= include_closed=false live=true",
+				"List status=open type= label= metadata= include_closed=false live=true",
 				"Get gc-1",
 				"Get gc-1",
 				"List status=open type=session label= metadata= include_closed=false live=false",
@@ -694,15 +684,10 @@ func TestCityRuntimeStartupLegacyPhaseSequenceUnchanged(t *testing.T) {
 		"SetMetadataBatch gc-1 state",
 		"SetMetadataBatch gc-1 effective_sleep_after_idle,requested_sleep_after_idle,sleep_capability,sleep_policy_source",
 		// The carry's gc-mdh0 assigned-work probe before a timer drain (replayed
-		// upstream #6168): open and in_progress, issues then wisps, by identifier.
-		"List status=open type= label= metadata= include_closed=false live=true",
-		"List status=open type= label= metadata= include_closed=false live=true",
-		"List status=open type= label= metadata= include_closed=false live=true",
-		"List status=open type= label= metadata= include_closed=false live=true",
+		// upstream #6168), read through the tick's SeatWork since #7552/#7561:
+		// one live list per status, in_progress then open.
 		"List status=in_progress type= label= metadata= include_closed=false live=true",
-		"List status=in_progress type= label= metadata= include_closed=false live=true",
-		"List status=in_progress type= label= metadata= include_closed=false live=true",
-		"List status=in_progress type= label= metadata= include_closed=false live=true",
+		"List status=open type= label= metadata= include_closed=false live=true",
 		"Get gc-1",
 		"Get gc-1",
 		"List status=open type=session label= metadata= include_closed=false live=false",
