@@ -5941,6 +5941,11 @@ var claudeBusySpinnerRe = regexp.MustCompile(`\([0-9]+[hms][^)]*[·•]`)
 // "✻ Worked for 1m 49s" done marker do not. A transcript line that itself
 // starts with a frame glyph and a lone word ending in "…" (a "* Loading…"
 // bullet) still reads busy.
+//
+// It is read only on the live status row (claudeHookSpinnerLive, ga-megheo):
+// a column-0 row in the bottom window with no later assistant output. The
+// same row in scrollback, above a column-0 "⏺" line, or indented as tool
+// output is an old frame, and a seat idle under it must read idle.
 var claudeBareGerundSpinnerRe = regexp.MustCompile(`^\s*[·✢✳✶✻✽*] [^\s…]+…`)
 
 // claudeHookSpinnerRe matches Claude Code's live spinner while hooks run: at
@@ -5989,7 +5994,8 @@ const claudeHookSpinnerWrapRows = 2
 const claudeHookSpinnerWindow = 12
 
 // claudeHookSpinnerLive reports whether Claude's hook spinner (or the plain
-// turn-start spinner after it) is the live status line: an anchored match within the last claudeHookSpinnerWindow
+// turn-start spinner after it, or upstream's bare glyph+gerund row,
+// claudeBareGerundSpinnerRe) is the live status line: an anchored match within the last claudeHookSpinnerWindow
 // non-empty lines of the capture, counted from the BOTTOM of the screen so an
 // echoed "❯ <prompt>" above the spinner, or a composer not yet redrawn, cannot
 // hide it. Indented background-agent rows ("  ⏺ main", "  ◯ general-purpose
@@ -6014,6 +6020,11 @@ func claudeHookSpinnerLive(lines []string) bool {
 			return false
 		}
 		seen++
+		// Upstream #5977's bare spinner row, at column 0 only: an indented
+		// match is tool output ("  ⎿ …" and its continuation rows).
+		if line == strings.TrimLeft(line, " \t") && claudeBareGerundSpinnerRe.MatchString(line) {
+			return true
+		}
 		if !claudeHookSpinnerHeadRe.MatchString(line) {
 			continue
 		}
@@ -6039,15 +6050,14 @@ func claudeHookSpinnerLive(lines []string) bool {
 // and Codex show "esc to interrupt"; current Claude Code shows a live spinner
 // with an elapsed timer + token stream (claudeBusySpinnerRe) or, for roughly
 // the first second of a turn, the bare glyph+gerund form
-// (claudeBareGerundSpinnerRe); Gemini shows its own cancel / shell-tool
-// strings.
+// (claudeBareGerundSpinnerRe), read on the live status row only
+// (claudeHookSpinnerLive); Gemini shows its own cancel / shell-tool strings.
 func paneContainsBusyIndicator(lines []string) bool {
 	for _, line := range lines {
 		if strings.Contains(line, "esc to interrupt") ||
 			strings.Contains(line, "Press Esc or Ctrl+C to cancel") ||
 			strings.Contains(line, "[current working directory ") ||
-			claudeBusySpinnerRe.MatchString(line) ||
-			claudeBareGerundSpinnerRe.MatchString(line) {
+			claudeBusySpinnerRe.MatchString(line) {
 			return true
 		}
 	}
