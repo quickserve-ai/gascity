@@ -88,6 +88,8 @@ export type AgentPatch = {
     MouseMode: string | null;
     Name: string;
     Nudge: string | null;
+    OptInSkills: Array<string> | null;
+    OptInSkillsAppend: Array<string> | null;
     OptionDefaults?: {
         [key: string]: string;
     };
@@ -115,6 +117,7 @@ export type AgentPatch = {
     TmuxAlias: string | null;
     Upstream: string | null;
     WakeMode: string | null;
+    WakeTransport: string | null;
     WorkDir: string | null;
 };
 
@@ -133,6 +136,14 @@ export type AgentPatchSetInputBody = {
      * Agent name.
      */
     name?: string;
+    /**
+     * Replace the agent's opt-in skill selection (binding-qualified names of skills a pack ships under skills/opt-in/). An empty list clears it; omit the field to inherit the underlying agent's list.
+     */
+    opt_in_skills?: Array<string>;
+    /**
+     * Opt-in skills to add to the agent's selection.
+     */
+    opt_in_skills_append?: Array<string> | null;
     /**
      * Override the agent's provider.
      */
@@ -288,6 +299,7 @@ export type BackendCredentialResolvedPayload = {
 
 export type Bead = {
     assignee?: string;
+    await_type?: string;
     close_reason?: string;
     created_at: string;
     defer_until?: string;
@@ -940,7 +952,7 @@ export type EventEmitRequest = {
     type: string;
 };
 
-export type EventPayload = AdapterEventPayload | BackendCredentialResolvedPayload | BeadClaimRejectedPayload | BeadClaimReleasedPayload | BeadDeadAssigneeReopenedPayload | BeadEventPayload | BeadWorktreeReapSkippedPayload | BeadWorktreeReapedPayload | BlockedRecomputedPayload | BoundEventPayload | CityCreateSucceededPayload | CityLifecyclePayload | CityUnregisterSucceededPayload | ConditionalWritesDegradedPayload | ControlDispatcherScopeGapPayload | ControlRootSettleFailedPayload | ControlStalledPayload | ExecutionClaimWindowExpiredPayload | ExecutionStepStalledPayload | GroupCreatedEventPayload | HookClaimReclaimedStalePayload | InboundEventPayload | MailEventPayload | MoleculeResolvedPayload | NoPayload | OrderSkippedPayload | OrderSuppressedPayload | OutboundChannelMismatchPayload | OutboundEventPayload | ProjectIdentityStampedPayload | Record | RequestFailedPayload | RigCreateSucceededPayload | RigProvisionProgressPayload | RotatedPayload | SessionCreateSucceededPayload | SessionDemandClaimDivergencePayload | SessionDrainAckedWithAssignedWorkPayload | SessionLifecyclePayload | SessionMessageSucceededPayload | SessionPendingClearedPayload | SessionPendingPayload | SessionPoolSlotRetiredAtDrainDeadlinePayload | SessionResetStalledPayload | SessionStrandedClaimsPayload | SessionStrandedPayload | SessionSubmitSucceededPayload | SessionUnknownStatePayload | SessionWakeRefusedPayload | StorageBindingOutcomePayload | StoreDiskCriticalPayload | StoreDiskWarnPayload | StoreMaintenanceDonePayload | StoreMaintenanceFailedPayload | SupervisorFsPressureSkippedTickPayload | SupervisorRequestPayload | SupervisorShutdownPayload | SupervisorStartedPayload | UnboundEventPayload | WebhookReceivedPayload | WebhookRejectedPayload | WorkerOperationEventPayload;
+export type EventPayload = AdapterEventPayload | BackendCredentialResolvedPayload | BeadClaimRejectedPayload | BeadClaimReleasedPayload | BeadDeadAssigneeReopenedPayload | BeadEventPayload | BeadWorktreeReapSkippedPayload | BeadWorktreeReapedPayload | BlockedRecomputedPayload | BoundEventPayload | CityCreateSucceededPayload | CityLifecyclePayload | CityUnregisterSucceededPayload | ConditionalWritesDegradedPayload | ControlDispatcherScopeGapPayload | ControlRootSettleFailedPayload | ControlStalledPayload | ExecutionClaimWindowExpiredPayload | ExecutionStepStalledPayload | GroupCreatedEventPayload | HookClaimReclaimedStalePayload | HookClaimRefusedPayload | InboundEventPayload | MailEventPayload | MoleculeResolvedPayload | NoPayload | OrderSkippedPayload | OrderSuppressedPayload | OutboundChannelMismatchPayload | OutboundEventPayload | ProjectIdentityStampedPayload | Record | RequestFailedPayload | RigCreateSucceededPayload | RigProvisionProgressPayload | RotatedPayload | SessionCreateSucceededPayload | SessionDemandClaimDivergencePayload | SessionDrainAckedWithAssignedWorkPayload | SessionLifecyclePayload | SessionMessageSucceededPayload | SessionPendingClearedPayload | SessionPendingPayload | SessionPoolSlotRetiredAtDrainDeadlinePayload | SessionReleaseDeferredPayload | SessionResetStalledPayload | SessionStrandedClaimsPayload | SessionStrandedPayload | SessionSubmitSucceededPayload | SessionUnknownStatePayload | SessionWakeRefusedPayload | StorageBindingOutcomePayload | StoreDiskCriticalPayload | StoreDiskWarnPayload | StoreMaintenanceDonePayload | StoreMaintenanceFailedPayload | SupervisorFsPressureSkippedTickPayload | SupervisorRequestPayload | SupervisorShutdownPayload | SupervisorStartedPayload | UnboundEventPayload | WebhookReceivedPayload | WebhookRejectedPayload | WorkerOperationEventPayload;
 
 export type EventRotateAnchor = {
     /**
@@ -1470,6 +1482,57 @@ export type HookClaimReclaimedStalePayload = {
     bead_id: string;
     new_assignee: string;
     previous_owner: string;
+};
+
+export type HookClaimRefusedPayload = {
+    /**
+     * The runtime's GC_ALIAS, else GC_AGENT.
+     */
+    agent?: string;
+    /**
+     * The session bead's generation now, normalized as a start normalizes it (empty, zero or unparseable becomes 1), so it compares directly with runtime_epoch. A lower runtime_epoch means the generation moved on after this runtime started. Equal epochs do NOT prove the same incarnation: a start that finds no instance token mints one without bumping the generation.
+     */
+    bead_epoch?: string;
+    /**
+     * First 8 hex chars of SHA-256 of the session bead's instance token. Never the token.
+     */
+    bead_token_fingerprint?: string;
+    /**
+     * Which identity check refused: session_closed, token_superseded, bead_token_missing, state_not_claim_eligible, session_bead_not_found, not_a_session_bead, or session_id_unset.
+     */
+    detail: string;
+    /**
+     * Drain reason the refusal reported: stale_session or missing_session_registration.
+     */
+    reason: string;
+    /**
+     * The runtime's GC_RUNTIME_EPOCH: the session bead's generation when this runtime was started, with an empty, zero or unparseable generation started as 1.
+     */
+    runtime_epoch?: string;
+    /**
+     * First 8 hex chars of SHA-256 of the runtime's instance token. Never the token.
+     */
+    runtime_token_fingerprint?: string;
+    /**
+     * The runtime's GC_SESSION_ID (its session bead id); empty for session_id_unset.
+     */
+    session_id?: string;
+    /**
+     * The runtime's GC_SESSION_NAME.
+     */
+    session_name?: string;
+    /**
+     * The session bead's state when it was read.
+     */
+    state?: string;
+    /**
+     * The runtime's GC_TEMPLATE (pool membership).
+     */
+    template?: string;
+    /**
+     * Whether the runtime's instance token equals the session bead's; absent when no bead was read.
+     */
+    token_matched?: boolean;
 };
 
 export type InboundEventPayload = {
@@ -2833,10 +2896,15 @@ export type RigCreateSucceededPayload = {
     rig: string;
 };
 
+export type RigDoctorPatch = {
+    CensusOwnerNamespace: string | null;
+};
+
 export type RigPatch = {
     BeadsProxiedIdleTimeout: string | null;
     DefaultBranch: string | null;
     DefaultMergeStrategy: string | null;
+    Doctor?: RigDoctorPatch;
     FormulaVars?: {
         [key: string]: string;
     };
@@ -3466,6 +3534,45 @@ export type SessionPoolSlotRetiredAtDrainDeadlinePayload = {
  */
 export type SessionRawMessageFrame = unknown;
 
+export type SessionReleaseDeferredPayload = {
+    /**
+     * "full" when the pre-close session bead was read, "id_only" when it could not be and only the resolved session ID is known.
+     */
+    capture: string;
+    /**
+     * True when the obligation was published through the store's compare-and-set metadata primitive, which makes the write-once guarantee hold across concurrent close processes. False means the store lacked that capability and a read-then-write fallback was used, which two simultaneous closes could race.
+     */
+    conditional_write: boolean;
+    /**
+     * Obligation generation. 1 for a first publish; higher only when a degraded ID-only obligation was later replaced by a full capture. A drain acknowledges one generation, never the key as a whole.
+     */
+    generation: number;
+    /**
+     * Every identifier under which work could be assigned to this session, captured BEFORE the close mutated them. Untruncated.
+     */
+    identities?: Array<string> | null;
+    /**
+     * Why the obligation write failed, when MarkerPersisted is false.
+     */
+    marker_error?: string;
+    /**
+     * Whether the obligation was durably written to the session bead. False means the deferred release is unrecoverable by any automated path.
+     */
+    marker_persisted: boolean;
+    /**
+     * Why the city config was unavailable, as reported at close time.
+     */
+    reason?: string;
+    /**
+     * False when rig stores could not be enumerated (the usual case here, since enumerating them needs the config that failed to load). A drain must treat false as "scope unknown", never as "no rig stores".
+     */
+    rig_stores_known: boolean;
+    /**
+     * Canonical session bead ID whose close withheld the release (also the envelope Subject).
+     */
+    session_id: string;
+};
+
 export type SessionRenameInputBody = {
     /**
      * New session title.
@@ -3518,9 +3625,11 @@ export type SessionResponse = {
     agent_kind?: string;
     alias?: string;
     attached: boolean;
-    configured_named_session?: boolean;
+    base_state: string;
+    configured_named_session: boolean;
     context_pct?: number;
     context_window?: number;
+    control_plane: boolean;
     created_at: string;
     display_name?: string;
     id: string;
@@ -3532,15 +3641,18 @@ export type SessionResponse = {
         [key: string]: string;
     };
     model?: string;
+    navigator_schema_version: string;
     options?: {
         [key: string]: string;
     };
     pool?: string;
+    pool_managed: boolean;
     provider: string;
     reason?: string;
     rig?: string;
     running: boolean;
     session_name: string;
+    session_origin?: string;
     state: string;
     submission_capabilities?: SubmissionCapabilities;
     template: string;
@@ -5685,6 +5797,8 @@ export type TypedEventStreamEnvelope = ({
 } & TypedEventStreamEnvelopeGcStoreMaintenanceFailed) | ({
     type: 'hook.claim.reclaimed_stale';
 } & TypedEventStreamEnvelopeHookClaimReclaimedStale) | ({
+    type: 'hook.claim.refused';
+} & TypedEventStreamEnvelopeHookClaimRefused) | ({
     type: 'mail.archived';
 } & TypedEventStreamEnvelopeMailArchived) | ({
     type: 'mail.deleted';
@@ -5733,6 +5847,8 @@ export type TypedEventStreamEnvelope = ({
 } & TypedEventStreamEnvelopeRigProvisionProgress) | ({
     type: 'session.cold_start_timeout';
 } & TypedEventStreamEnvelopeSessionColdStartTimeout) | ({
+    type: 'session.config_drift_wave';
+} & TypedEventStreamEnvelopeSessionConfigDriftWave) | ({
     type: 'session.conversation_reset';
 } & TypedEventStreamEnvelopeSessionConversationReset) | ({
     type: 'session.crashed';
@@ -5759,6 +5875,8 @@ export type TypedEventStreamEnvelope = ({
 } & TypedEventStreamEnvelopeSessionPoolSlotRetiredAtDrainDeadline) | ({
     type: 'session.quarantined';
 } & TypedEventStreamEnvelopeSessionQuarantined) | ({
+    type: 'session.release_deferred';
+} & TypedEventStreamEnvelopeSessionReleaseDeferred) | ({
     type: 'session.reset_stalled';
 } & TypedEventStreamEnvelopeSessionResetStalled) | ({
     type: 'session.stopped';
@@ -6655,6 +6773,24 @@ export type TypedEventStreamEnvelopeHookClaimReclaimedStale = {
 };
 
 /**
+ * TypedEventStreamEnvelope hook.claim.refused
+ */
+export type TypedEventStreamEnvelopeHookClaimRefused = {
+    actor: string;
+    depends_on_step_ids?: Array<string>;
+    message?: string;
+    payload: HookClaimRefusedPayload;
+    run_id?: string;
+    seq: number;
+    session_id?: string;
+    step_id?: string;
+    subject?: string;
+    ts: string;
+    type: 'hook.claim.refused';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
  * TypedEventStreamEnvelope mail.archived
  */
 export type TypedEventStreamEnvelopeMailArchived = {
@@ -7087,6 +7223,24 @@ export type TypedEventStreamEnvelopeSessionColdStartTimeout = {
 };
 
 /**
+ * TypedEventStreamEnvelope session.config_drift_wave
+ */
+export type TypedEventStreamEnvelopeSessionConfigDriftWave = {
+    actor: string;
+    depends_on_step_ids?: Array<string>;
+    message?: string;
+    payload: NoPayload;
+    run_id?: string;
+    seq: number;
+    session_id?: string;
+    step_id?: string;
+    subject?: string;
+    ts: string;
+    type: 'session.config_drift_wave';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
  * TypedEventStreamEnvelope session.conversation_reset
  */
 export type TypedEventStreamEnvelopeSessionConversationReset = {
@@ -7317,6 +7471,24 @@ export type TypedEventStreamEnvelopeSessionQuarantined = {
     subject?: string;
     ts: string;
     type: 'session.quarantined';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedEventStreamEnvelope session.release_deferred
+ */
+export type TypedEventStreamEnvelopeSessionReleaseDeferred = {
+    actor: string;
+    depends_on_step_ids?: Array<string>;
+    message?: string;
+    payload: SessionReleaseDeferredPayload;
+    run_id?: string;
+    seq: number;
+    session_id?: string;
+    step_id?: string;
+    subject?: string;
+    ts: string;
+    type: 'session.release_deferred';
     workflow?: WorkflowEventProjection;
 };
 
@@ -7832,6 +8004,8 @@ export type TypedTaggedEventStreamEnvelope = ({
 } & TypedTaggedEventStreamEnvelopeGcStoreMaintenanceFailed) | ({
     type: 'hook.claim.reclaimed_stale';
 } & TypedTaggedEventStreamEnvelopeHookClaimReclaimedStale) | ({
+    type: 'hook.claim.refused';
+} & TypedTaggedEventStreamEnvelopeHookClaimRefused) | ({
     type: 'mail.archived';
 } & TypedTaggedEventStreamEnvelopeMailArchived) | ({
     type: 'mail.deleted';
@@ -7880,6 +8054,8 @@ export type TypedTaggedEventStreamEnvelope = ({
 } & TypedTaggedEventStreamEnvelopeRigProvisionProgress) | ({
     type: 'session.cold_start_timeout';
 } & TypedTaggedEventStreamEnvelopeSessionColdStartTimeout) | ({
+    type: 'session.config_drift_wave';
+} & TypedTaggedEventStreamEnvelopeSessionConfigDriftWave) | ({
     type: 'session.conversation_reset';
 } & TypedTaggedEventStreamEnvelopeSessionConversationReset) | ({
     type: 'session.crashed';
@@ -7906,6 +8082,8 @@ export type TypedTaggedEventStreamEnvelope = ({
 } & TypedTaggedEventStreamEnvelopeSessionPoolSlotRetiredAtDrainDeadline) | ({
     type: 'session.quarantined';
 } & TypedTaggedEventStreamEnvelopeSessionQuarantined) | ({
+    type: 'session.release_deferred';
+} & TypedTaggedEventStreamEnvelopeSessionReleaseDeferred) | ({
     type: 'session.reset_stalled';
 } & TypedTaggedEventStreamEnvelopeSessionResetStalled) | ({
     type: 'session.stopped';
@@ -8849,6 +9027,25 @@ export type TypedTaggedEventStreamEnvelopeHookClaimReclaimedStale = {
 };
 
 /**
+ * TypedTaggedEventStreamEnvelope hook.claim.refused
+ */
+export type TypedTaggedEventStreamEnvelopeHookClaimRefused = {
+    actor: string;
+    city: string;
+    depends_on_step_ids?: Array<string>;
+    message?: string;
+    payload: HookClaimRefusedPayload;
+    run_id?: string;
+    seq: number;
+    session_id?: string;
+    step_id?: string;
+    subject?: string;
+    ts: string;
+    type: 'hook.claim.refused';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
  * TypedTaggedEventStreamEnvelope mail.archived
  */
 export type TypedTaggedEventStreamEnvelopeMailArchived = {
@@ -9305,6 +9502,25 @@ export type TypedTaggedEventStreamEnvelopeSessionColdStartTimeout = {
 };
 
 /**
+ * TypedTaggedEventStreamEnvelope session.config_drift_wave
+ */
+export type TypedTaggedEventStreamEnvelopeSessionConfigDriftWave = {
+    actor: string;
+    city: string;
+    depends_on_step_ids?: Array<string>;
+    message?: string;
+    payload: NoPayload;
+    run_id?: string;
+    seq: number;
+    session_id?: string;
+    step_id?: string;
+    subject?: string;
+    ts: string;
+    type: 'session.config_drift_wave';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
  * TypedTaggedEventStreamEnvelope session.conversation_reset
  */
 export type TypedTaggedEventStreamEnvelopeSessionConversationReset = {
@@ -9548,6 +9764,25 @@ export type TypedTaggedEventStreamEnvelopeSessionQuarantined = {
     subject?: string;
     ts: string;
     type: 'session.quarantined';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedTaggedEventStreamEnvelope session.release_deferred
+ */
+export type TypedTaggedEventStreamEnvelopeSessionReleaseDeferred = {
+    actor: string;
+    city: string;
+    depends_on_step_ids?: Array<string>;
+    message?: string;
+    payload: SessionReleaseDeferredPayload;
+    run_id?: string;
+    seq: number;
+    session_id?: string;
+    step_id?: string;
+    subject?: string;
+    ts: string;
+    type: 'session.release_deferred';
     workflow?: WorkflowEventProjection;
 };
 

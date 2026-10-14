@@ -1050,6 +1050,8 @@ type AgentPatch struct {
 	MouseMode               *string            `json:"MouseMode"`
 	Name                    string             `json:"Name"`
 	Nudge                   *string            `json:"Nudge"`
+	OptInSkills             *[]string          `json:"OptInSkills"`
+	OptInSkillsAppend       *[]string          `json:"OptInSkillsAppend"`
 	OptionDefaults          *map[string]string `json:"OptionDefaults,omitempty"`
 	OverlayDir              *string            `json:"OverlayDir"`
 	Pool                    *PoolOverride      `json:"Pool,omitempty"`
@@ -1075,6 +1077,7 @@ type AgentPatch struct {
 	TmuxAlias               *string            `json:"TmuxAlias"`
 	Upstream                *string            `json:"Upstream"`
 	WakeMode                *string            `json:"WakeMode"`
+	WakeTransport           *string            `json:"WakeTransport"`
 	WorkDir                 *string            `json:"WorkDir"`
 }
 
@@ -1088,6 +1091,12 @@ type AgentPatchSetInputBody struct {
 
 	// Name Agent name.
 	Name *string `json:"name,omitempty"`
+
+	// OptInSkills Replace the agent's opt-in skill selection (binding-qualified names of skills a pack ships under skills/opt-in/). An empty list clears it; omit the field to inherit the underlying agent's list.
+	OptInSkills *[]string `json:"opt_in_skills,omitempty"`
+
+	// OptInSkillsAppend Opt-in skills to add to the agent's selection.
+	OptInSkillsAppend *[]string `json:"opt_in_skills_append,omitempty"`
 
 	// Provider Override the agent's provider.
 	Provider *string `json:"provider,omitempty"`
@@ -1223,6 +1232,7 @@ type BackendCredentialResolvedPayload struct {
 // Bead defines model for Bead.
 type Bead struct {
 	Assignee     *string            `json:"assignee,omitempty"`
+	AwaitType    *string            `json:"await_type,omitempty"`
 	CloseReason  *string            `json:"close_reason,omitempty"`
 	CreatedAt    time.Time          `json:"created_at"`
 	DeferUntil   *time.Time         `json:"defer_until,omitempty"`
@@ -3473,11 +3483,17 @@ type RigCreateSucceededPayload struct {
 	Rig string `json:"rig"`
 }
 
+// RigDoctorPatch defines model for RigDoctorPatch.
+type RigDoctorPatch struct {
+	CensusOwnerNamespace *string `json:"CensusOwnerNamespace"`
+}
+
 // RigPatch defines model for RigPatch.
 type RigPatch struct {
 	BeadsProxiedIdleTimeout *string            `json:"BeadsProxiedIdleTimeout"`
 	DefaultBranch           *string            `json:"DefaultBranch"`
 	DefaultMergeStrategy    *string            `json:"DefaultMergeStrategy"`
+	Doctor                  *RigDoctorPatch    `json:"Doctor,omitempty"`
 	FormulaVars             *map[string]string `json:"FormulaVars,omitempty"`
 	Name                    string             `json:"Name"`
 	Path                    *string            `json:"Path"`
@@ -3980,6 +3996,36 @@ type SessionPoolSlotRetiredAtDrainDeadlinePayload struct {
 // SessionRawMessageFrame Provider-native transcript frame. Gas City forwards the exact JSON the provider wrote to its session log, so the shape is provider-specific and can be any JSON value. The producing provider is identified by the Provider field on the enclosing envelope; consumers dispatch per-provider frame parsing keyed by that identifier.
 type SessionRawMessageFrame = interface{}
 
+// SessionReleaseDeferredPayload defines model for SessionReleaseDeferredPayload.
+type SessionReleaseDeferredPayload struct {
+	// Capture "full" when the pre-close session bead was read, "id_only" when it could not be and only the resolved session ID is known.
+	Capture string `json:"capture"`
+
+	// ConditionalWrite True when the obligation was published through the store's compare-and-set metadata primitive, which makes the write-once guarantee hold across concurrent close processes. False means the store lacked that capability and a read-then-write fallback was used, which two simultaneous closes could race.
+	ConditionalWrite bool `json:"conditional_write"`
+
+	// Generation Obligation generation. 1 for a first publish; higher only when a degraded ID-only obligation was later replaced by a full capture. A drain acknowledges one generation, never the key as a whole.
+	Generation int64 `json:"generation"`
+
+	// Identities Every identifier under which work could be assigned to this session, captured BEFORE the close mutated them. Untruncated.
+	Identities *[]string `json:"identities,omitempty"`
+
+	// MarkerError Why the obligation write failed, when MarkerPersisted is false.
+	MarkerError *string `json:"marker_error,omitempty"`
+
+	// MarkerPersisted Whether the obligation was durably written to the session bead. False means the deferred release is unrecoverable by any automated path.
+	MarkerPersisted bool `json:"marker_persisted"`
+
+	// Reason Why the city config was unavailable, as reported at close time.
+	Reason *string `json:"reason,omitempty"`
+
+	// RigStoresKnown False when rig stores could not be enumerated (the usual case here, since enumerating them needs the config that failed to load). A drain must treat false as "scope unknown", never as "no rig stores".
+	RigStoresKnown bool `json:"rig_stores_known"`
+
+	// SessionId Canonical session bead ID whose close withheld the release (also the envelope Subject).
+	SessionId string `json:"session_id"`
+}
+
 // SessionRenameInputBody defines model for SessionRenameInputBody.
 type SessionRenameInputBody struct {
 	// Title New session title.
@@ -4025,9 +4071,11 @@ type SessionResponse struct {
 	AgentKind              *string                 `json:"agent_kind,omitempty"`
 	Alias                  *string                 `json:"alias,omitempty"`
 	Attached               bool                    `json:"attached"`
-	ConfiguredNamedSession *bool                   `json:"configured_named_session,omitempty"`
+	BaseState              string                  `json:"base_state"`
+	ConfiguredNamedSession bool                    `json:"configured_named_session"`
 	ContextPct             *int64                  `json:"context_pct,omitempty"`
 	ContextWindow          *int64                  `json:"context_window,omitempty"`
+	ControlPlane           bool                    `json:"control_plane"`
 	CreatedAt              string                  `json:"created_at"`
 	DisplayName            *string                 `json:"display_name,omitempty"`
 	Id                     string                  `json:"id"`
@@ -4037,13 +4085,16 @@ type SessionResponse struct {
 	LastOutput             *string                 `json:"last_output,omitempty"`
 	Metadata               *map[string]string      `json:"metadata,omitempty"`
 	Model                  *string                 `json:"model,omitempty"`
+	NavigatorSchemaVersion string                  `json:"navigator_schema_version"`
 	Options                *map[string]string      `json:"options,omitempty"`
 	Pool                   *string                 `json:"pool,omitempty"`
+	PoolManaged            bool                    `json:"pool_managed"`
 	Provider               string                  `json:"provider"`
 	Reason                 *string                 `json:"reason,omitempty"`
 	Rig                    *string                 `json:"rig,omitempty"`
 	Running                bool                    `json:"running"`
 	SessionName            string                  `json:"session_name"`
+	SessionOrigin          *string                 `json:"session_origin,omitempty"`
 	State                  string                  `json:"state"`
 	SubmissionCapabilities *SubmissionCapabilities `json:"submission_capabilities,omitempty"`
 	Template               string                  `json:"template"`
@@ -6881,6 +6932,22 @@ type TypedEventStreamEnvelopeSessionColdStartTimeout struct {
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
 }
 
+// TypedEventStreamEnvelopeSessionConfigDriftWave defines model for TypedEventStreamEnvelopeSessionConfigDriftWave.
+type TypedEventStreamEnvelopeSessionConfigDriftWave struct {
+	Actor            string                   `json:"actor"`
+	DependsOnStepIds *[]string                `json:"depends_on_step_ids,omitempty"`
+	Message          *string                  `json:"message,omitempty"`
+	Payload          NoPayload                `json:"payload"`
+	RunId            *string                  `json:"run_id,omitempty"`
+	Seq              int64                    `json:"seq"`
+	SessionId        *string                  `json:"session_id,omitempty"`
+	StepId           *string                  `json:"step_id,omitempty"`
+	Subject          *string                  `json:"subject,omitempty"`
+	Ts               time.Time                `json:"ts"`
+	Type             string                   `json:"type"`
+	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
+}
+
 // TypedEventStreamEnvelopeSessionConversationReset defines model for TypedEventStreamEnvelopeSessionConversationReset.
 type TypedEventStreamEnvelopeSessionConversationReset struct {
 	Actor            string                   `json:"actor"`
@@ -7087,6 +7154,22 @@ type TypedEventStreamEnvelopeSessionQuarantined struct {
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
+}
+
+// TypedEventStreamEnvelopeSessionReleaseDeferred defines model for TypedEventStreamEnvelopeSessionReleaseDeferred.
+type TypedEventStreamEnvelopeSessionReleaseDeferred struct {
+	Actor            string                        `json:"actor"`
+	DependsOnStepIds *[]string                     `json:"depends_on_step_ids,omitempty"`
+	Message          *string                       `json:"message,omitempty"`
+	Payload          SessionReleaseDeferredPayload `json:"payload"`
+	RunId            *string                       `json:"run_id,omitempty"`
+	Seq              int64                         `json:"seq"`
+	SessionId        *string                       `json:"session_id,omitempty"`
+	StepId           *string                       `json:"step_id,omitempty"`
+	Subject          *string                       `json:"subject,omitempty"`
+	Ts               time.Time                     `json:"ts"`
+	Type             string                        `json:"type"`
+	Workflow         *WorkflowEventProjection      `json:"workflow,omitempty"`
 }
 
 // TypedEventStreamEnvelopeSessionResetStalled defines model for TypedEventStreamEnvelopeSessionResetStalled.
@@ -8686,6 +8769,23 @@ type TypedTaggedEventStreamEnvelopeSessionColdStartTimeout struct {
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
 }
 
+// TypedTaggedEventStreamEnvelopeSessionConfigDriftWave defines model for TypedTaggedEventStreamEnvelopeSessionConfigDriftWave.
+type TypedTaggedEventStreamEnvelopeSessionConfigDriftWave struct {
+	Actor            string                   `json:"actor"`
+	City             string                   `json:"city"`
+	DependsOnStepIds *[]string                `json:"depends_on_step_ids,omitempty"`
+	Message          *string                  `json:"message,omitempty"`
+	Payload          NoPayload                `json:"payload"`
+	RunId            *string                  `json:"run_id,omitempty"`
+	Seq              int64                    `json:"seq"`
+	SessionId        *string                  `json:"session_id,omitempty"`
+	StepId           *string                  `json:"step_id,omitempty"`
+	Subject          *string                  `json:"subject,omitempty"`
+	Ts               time.Time                `json:"ts"`
+	Type             string                   `json:"type"`
+	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
+}
+
 // TypedTaggedEventStreamEnvelopeSessionConversationReset defines model for TypedTaggedEventStreamEnvelopeSessionConversationReset.
 type TypedTaggedEventStreamEnvelopeSessionConversationReset struct {
 	Actor            string                   `json:"actor"`
@@ -8905,6 +9005,23 @@ type TypedTaggedEventStreamEnvelopeSessionQuarantined struct {
 	Ts               time.Time                `json:"ts"`
 	Type             string                   `json:"type"`
 	Workflow         *WorkflowEventProjection `json:"workflow,omitempty"`
+}
+
+// TypedTaggedEventStreamEnvelopeSessionReleaseDeferred defines model for TypedTaggedEventStreamEnvelopeSessionReleaseDeferred.
+type TypedTaggedEventStreamEnvelopeSessionReleaseDeferred struct {
+	Actor            string                        `json:"actor"`
+	City             string                        `json:"city"`
+	DependsOnStepIds *[]string                     `json:"depends_on_step_ids,omitempty"`
+	Message          *string                       `json:"message,omitempty"`
+	Payload          SessionReleaseDeferredPayload `json:"payload"`
+	RunId            *string                       `json:"run_id,omitempty"`
+	Seq              int64                         `json:"seq"`
+	SessionId        *string                       `json:"session_id,omitempty"`
+	StepId           *string                       `json:"step_id,omitempty"`
+	Subject          *string                       `json:"subject,omitempty"`
+	Ts               time.Time                     `json:"ts"`
+	Type             string                        `json:"type"`
+	Workflow         *WorkflowEventProjection      `json:"workflow,omitempty"`
 }
 
 // TypedTaggedEventStreamEnvelopeSessionResetStalled defines model for TypedTaggedEventStreamEnvelopeSessionResetStalled.
@@ -12049,6 +12166,32 @@ func (t *EventPayload) FromSessionPoolSlotRetiredAtDrainDeadlinePayload(v Sessio
 
 // MergeSessionPoolSlotRetiredAtDrainDeadlinePayload performs a merge with any union data inside the EventPayload, using the provided SessionPoolSlotRetiredAtDrainDeadlinePayload
 func (t *EventPayload) MergeSessionPoolSlotRetiredAtDrainDeadlinePayload(v SessionPoolSlotRetiredAtDrainDeadlinePayload) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsSessionReleaseDeferredPayload returns the union data inside the EventPayload as a SessionReleaseDeferredPayload
+func (t EventPayload) AsSessionReleaseDeferredPayload() (SessionReleaseDeferredPayload, error) {
+	var body SessionReleaseDeferredPayload
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromSessionReleaseDeferredPayload overwrites any union data inside the EventPayload as the provided SessionReleaseDeferredPayload
+func (t *EventPayload) FromSessionReleaseDeferredPayload(v SessionReleaseDeferredPayload) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeSessionReleaseDeferredPayload performs a merge with any union data inside the EventPayload, using the provided SessionReleaseDeferredPayload
+func (t *EventPayload) MergeSessionReleaseDeferredPayload(v SessionReleaseDeferredPayload) error {
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
@@ -16216,6 +16359,34 @@ func (t *TypedEventStreamEnvelope) MergeTypedEventStreamEnvelopeSessionColdStart
 	return err
 }
 
+// AsTypedEventStreamEnvelopeSessionConfigDriftWave returns the union data inside the TypedEventStreamEnvelope as a TypedEventStreamEnvelopeSessionConfigDriftWave
+func (t TypedEventStreamEnvelope) AsTypedEventStreamEnvelopeSessionConfigDriftWave() (TypedEventStreamEnvelopeSessionConfigDriftWave, error) {
+	var body TypedEventStreamEnvelopeSessionConfigDriftWave
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedEventStreamEnvelopeSessionConfigDriftWave overwrites any union data inside the TypedEventStreamEnvelope as the provided TypedEventStreamEnvelopeSessionConfigDriftWave
+func (t *TypedEventStreamEnvelope) FromTypedEventStreamEnvelopeSessionConfigDriftWave(v TypedEventStreamEnvelopeSessionConfigDriftWave) error {
+	v.Type = "session.config_drift_wave"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedEventStreamEnvelopeSessionConfigDriftWave performs a merge with any union data inside the TypedEventStreamEnvelope, using the provided TypedEventStreamEnvelopeSessionConfigDriftWave
+func (t *TypedEventStreamEnvelope) MergeTypedEventStreamEnvelopeSessionConfigDriftWave(v TypedEventStreamEnvelopeSessionConfigDriftWave) error {
+	v.Type = "session.config_drift_wave"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsTypedEventStreamEnvelopeSessionConversationReset returns the union data inside the TypedEventStreamEnvelope as a TypedEventStreamEnvelopeSessionConversationReset
 func (t TypedEventStreamEnvelope) AsTypedEventStreamEnvelopeSessionConversationReset() (TypedEventStreamEnvelopeSessionConversationReset, error) {
 	var body TypedEventStreamEnvelopeSessionConversationReset
@@ -16570,6 +16741,34 @@ func (t *TypedEventStreamEnvelope) FromTypedEventStreamEnvelopeSessionQuarantine
 // MergeTypedEventStreamEnvelopeSessionQuarantined performs a merge with any union data inside the TypedEventStreamEnvelope, using the provided TypedEventStreamEnvelopeSessionQuarantined
 func (t *TypedEventStreamEnvelope) MergeTypedEventStreamEnvelopeSessionQuarantined(v TypedEventStreamEnvelopeSessionQuarantined) error {
 	v.Type = "session.quarantined"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsTypedEventStreamEnvelopeSessionReleaseDeferred returns the union data inside the TypedEventStreamEnvelope as a TypedEventStreamEnvelopeSessionReleaseDeferred
+func (t TypedEventStreamEnvelope) AsTypedEventStreamEnvelopeSessionReleaseDeferred() (TypedEventStreamEnvelopeSessionReleaseDeferred, error) {
+	var body TypedEventStreamEnvelopeSessionReleaseDeferred
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedEventStreamEnvelopeSessionReleaseDeferred overwrites any union data inside the TypedEventStreamEnvelope as the provided TypedEventStreamEnvelopeSessionReleaseDeferred
+func (t *TypedEventStreamEnvelope) FromTypedEventStreamEnvelopeSessionReleaseDeferred(v TypedEventStreamEnvelopeSessionReleaseDeferred) error {
+	v.Type = "session.release_deferred"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedEventStreamEnvelopeSessionReleaseDeferred performs a merge with any union data inside the TypedEventStreamEnvelope, using the provided TypedEventStreamEnvelopeSessionReleaseDeferred
+func (t *TypedEventStreamEnvelope) MergeTypedEventStreamEnvelopeSessionReleaseDeferred(v TypedEventStreamEnvelopeSessionReleaseDeferred) error {
+	v.Type = "session.release_deferred"
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
@@ -17410,6 +17609,8 @@ func (t TypedEventStreamEnvelope) ValueByDiscriminator() (interface{}, error) {
 		return t.AsTypedEventStreamEnvelopeRigProvisionProgress()
 	case "session.cold_start_timeout":
 		return t.AsTypedEventStreamEnvelopeSessionColdStartTimeout()
+	case "session.config_drift_wave":
+		return t.AsTypedEventStreamEnvelopeSessionConfigDriftWave()
 	case "session.conversation_reset":
 		return t.AsTypedEventStreamEnvelopeSessionConversationReset()
 	case "session.crashed":
@@ -17436,6 +17637,8 @@ func (t TypedEventStreamEnvelope) ValueByDiscriminator() (interface{}, error) {
 		return t.AsTypedEventStreamEnvelopeSessionPoolSlotRetiredAtDrainDeadline()
 	case "session.quarantined":
 		return t.AsTypedEventStreamEnvelopeSessionQuarantined()
+	case "session.release_deferred":
+		return t.AsTypedEventStreamEnvelopeSessionReleaseDeferred()
 	case "session.reset_stalled":
 		return t.AsTypedEventStreamEnvelopeSessionResetStalled()
 	case "session.stopped":
@@ -19485,6 +19688,34 @@ func (t *TypedTaggedEventStreamEnvelope) MergeTypedTaggedEventStreamEnvelopeSess
 	return err
 }
 
+// AsTypedTaggedEventStreamEnvelopeSessionConfigDriftWave returns the union data inside the TypedTaggedEventStreamEnvelope as a TypedTaggedEventStreamEnvelopeSessionConfigDriftWave
+func (t TypedTaggedEventStreamEnvelope) AsTypedTaggedEventStreamEnvelopeSessionConfigDriftWave() (TypedTaggedEventStreamEnvelopeSessionConfigDriftWave, error) {
+	var body TypedTaggedEventStreamEnvelopeSessionConfigDriftWave
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedTaggedEventStreamEnvelopeSessionConfigDriftWave overwrites any union data inside the TypedTaggedEventStreamEnvelope as the provided TypedTaggedEventStreamEnvelopeSessionConfigDriftWave
+func (t *TypedTaggedEventStreamEnvelope) FromTypedTaggedEventStreamEnvelopeSessionConfigDriftWave(v TypedTaggedEventStreamEnvelopeSessionConfigDriftWave) error {
+	v.Type = "session.config_drift_wave"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedTaggedEventStreamEnvelopeSessionConfigDriftWave performs a merge with any union data inside the TypedTaggedEventStreamEnvelope, using the provided TypedTaggedEventStreamEnvelopeSessionConfigDriftWave
+func (t *TypedTaggedEventStreamEnvelope) MergeTypedTaggedEventStreamEnvelopeSessionConfigDriftWave(v TypedTaggedEventStreamEnvelopeSessionConfigDriftWave) error {
+	v.Type = "session.config_drift_wave"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsTypedTaggedEventStreamEnvelopeSessionConversationReset returns the union data inside the TypedTaggedEventStreamEnvelope as a TypedTaggedEventStreamEnvelopeSessionConversationReset
 func (t TypedTaggedEventStreamEnvelope) AsTypedTaggedEventStreamEnvelopeSessionConversationReset() (TypedTaggedEventStreamEnvelopeSessionConversationReset, error) {
 	var body TypedTaggedEventStreamEnvelopeSessionConversationReset
@@ -19839,6 +20070,34 @@ func (t *TypedTaggedEventStreamEnvelope) FromTypedTaggedEventStreamEnvelopeSessi
 // MergeTypedTaggedEventStreamEnvelopeSessionQuarantined performs a merge with any union data inside the TypedTaggedEventStreamEnvelope, using the provided TypedTaggedEventStreamEnvelopeSessionQuarantined
 func (t *TypedTaggedEventStreamEnvelope) MergeTypedTaggedEventStreamEnvelopeSessionQuarantined(v TypedTaggedEventStreamEnvelopeSessionQuarantined) error {
 	v.Type = "session.quarantined"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsTypedTaggedEventStreamEnvelopeSessionReleaseDeferred returns the union data inside the TypedTaggedEventStreamEnvelope as a TypedTaggedEventStreamEnvelopeSessionReleaseDeferred
+func (t TypedTaggedEventStreamEnvelope) AsTypedTaggedEventStreamEnvelopeSessionReleaseDeferred() (TypedTaggedEventStreamEnvelopeSessionReleaseDeferred, error) {
+	var body TypedTaggedEventStreamEnvelopeSessionReleaseDeferred
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedTaggedEventStreamEnvelopeSessionReleaseDeferred overwrites any union data inside the TypedTaggedEventStreamEnvelope as the provided TypedTaggedEventStreamEnvelopeSessionReleaseDeferred
+func (t *TypedTaggedEventStreamEnvelope) FromTypedTaggedEventStreamEnvelopeSessionReleaseDeferred(v TypedTaggedEventStreamEnvelopeSessionReleaseDeferred) error {
+	v.Type = "session.release_deferred"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedTaggedEventStreamEnvelopeSessionReleaseDeferred performs a merge with any union data inside the TypedTaggedEventStreamEnvelope, using the provided TypedTaggedEventStreamEnvelopeSessionReleaseDeferred
+func (t *TypedTaggedEventStreamEnvelope) MergeTypedTaggedEventStreamEnvelopeSessionReleaseDeferred(v TypedTaggedEventStreamEnvelopeSessionReleaseDeferred) error {
+	v.Type = "session.release_deferred"
 	b, err := json.Marshal(v)
 	if err != nil {
 		return err
@@ -20679,6 +20938,8 @@ func (t TypedTaggedEventStreamEnvelope) ValueByDiscriminator() (interface{}, err
 		return t.AsTypedTaggedEventStreamEnvelopeRigProvisionProgress()
 	case "session.cold_start_timeout":
 		return t.AsTypedTaggedEventStreamEnvelopeSessionColdStartTimeout()
+	case "session.config_drift_wave":
+		return t.AsTypedTaggedEventStreamEnvelopeSessionConfigDriftWave()
 	case "session.conversation_reset":
 		return t.AsTypedTaggedEventStreamEnvelopeSessionConversationReset()
 	case "session.crashed":
@@ -20705,6 +20966,8 @@ func (t TypedTaggedEventStreamEnvelope) ValueByDiscriminator() (interface{}, err
 		return t.AsTypedTaggedEventStreamEnvelopeSessionPoolSlotRetiredAtDrainDeadline()
 	case "session.quarantined":
 		return t.AsTypedTaggedEventStreamEnvelopeSessionQuarantined()
+	case "session.release_deferred":
+		return t.AsTypedTaggedEventStreamEnvelopeSessionReleaseDeferred()
 	case "session.reset_stalled":
 		return t.AsTypedTaggedEventStreamEnvelopeSessionResetStalled()
 	case "session.stopped":

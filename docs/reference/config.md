@@ -135,6 +135,7 @@ Agent defines a configured agent in the city.
 | `inject_fragments` | []string |  |  | InjectFragments lists named template fragments to append to this agent's rendered prompt. Fragments come from shared template directories across all loaded packs. Each name must match a &#123;&#123; define "name" &#125;&#125; block. |
 | `append_fragments` | []string |  |  | AppendFragments is the V2 per-agent alias for prompt fragment injection. It layers after InjectFragments and before inherited/default fragments. |
 | `inject_assigned_skills` | boolean |  |  | InjectAssignedSkills controls whether gc appends an "assigned skills" appendix to the agent's rendered prompt. The appendix lists every skill visible to this agent, partitioned into (assigned-to-you, shared-with-every-agent), so agents sharing a scope-root sink can tell which skills are their specialization vs which are the city-wide set.  Pointer tri-state:   nil   -&gt; inherit: inject when the agent has a vendor sink   *true -&gt; explicitly inject (equivalent to the default)   *false -&gt; disable; the template is responsible for rendering             any skill guidance itself |
+| `opt_in_skills` | []string |  |  | OptInSkills names the opt-in skills this agent receives. A pack ships an opt-in skill under skills/opt-in/&lt;name&gt;/SKILL.md, and no agent receives it unless it names it here. Names use the shared catalog's form: "&lt;binding&gt;.&lt;name&gt;" for an imported pack's skill, "&lt;name&gt;" for the city pack's own. A name must resolve to an opt-in skill in the agent's scope (the city's imports, plus its rig's imports for a rig-scoped agent), or config load fails. An agent whose work_dir is its scope root receives its opt-ins in the scope root's skill directory, and every session the provider loads that directory for sees them: for Claude Code, sessions started there and in plain subdirectories below it in the same repository, but not sessions in their own linked worktrees. An agent with its own work_dir receives its opt-ins in that work_dir alone; that is how a seat gets an opt-in skill exclusively. |
 | `attach` | boolean |  |  | Attach controls whether the agent's session supports interactive attachment (e.g., tmux attach). When false, the agent can use a lighter runtime (subprocess instead of tmux). Defaults to true. |
 | `depends_on` | []string |  |  | DependsOn lists agent names that must be awake before this agent wakes. Used for dependency-ordered startup and shutdown. Validated for cycles at config load time. |
 | `resume_command` | string |  |  | ResumeCommand is the full shell command to run when resuming this agent. Supports &#123;&#123;.SessionKey&#125;&#125; template variable. When set, takes precedence over the provider's ResumeFlag/ResumeStyle. Example:   "claude --resume &#123;&#123;.SessionKey&#125;&#125; --dangerously-skip-permissions" |
@@ -215,6 +216,8 @@ AgentOverride modifies a pack-stamped agent for a specific rig.
 | `wake_mode` | string |  |  | WakeMode overrides the agent's wake mode ("resume" or "fresh"). Enum: `resume`, `fresh` |
 | `mouse_mode` | string |  |  | MouseMode overrides whether tmux mouse mode is preserved ("on" or "off"). Enum: `on`, `off` |
 | `inject_fragments_append` | []string |  |  | InjectFragmentsAppend appends to the agent's inject_fragments list. |
+| `opt_in_skills` | []string |  |  | OptInSkills replaces the agent's opt_in_skills list (see Agent.OptInSkills). Leave it unset to keep the agent's list; set an empty list to clear it. |
+| `opt_in_skills_append` | []string |  |  | OptInSkillsAppend appends to the agent's opt_in_skills list. |
 | `max_active_sessions` | integer |  |  | MaxActiveSessions overrides the agent-level cap on concurrent sessions. |
 | `min_active_sessions` | integer |  |  | MinActiveSessions overrides the minimum number of sessions to keep alive. |
 | `scale_check` | string |  |  | ScaleCheck overrides the shell command whose output reports new unassigned session demand for bead-backed reconciliation. |
@@ -277,6 +280,8 @@ AgentPatch modifies existing agents identified by rig scope and Name.
 | `session_live_append` | []string |  |  | SessionLiveAppend appends commands to the agent's session_live list. |
 | `install_agent_hooks_append` | []string |  |  | InstallAgentHooksAppend appends to the agent's install_agent_hooks list. |
 | `inject_fragments_append` | []string |  |  | InjectFragmentsAppend appends to the agent's inject_fragments list. |
+| `opt_in_skills` | []string |  |  | OptInSkills replaces the agent's opt_in_skills list (see Agent.OptInSkills). Leave it unset to keep the agent's list; set an empty list to clear it. |
+| `opt_in_skills_append` | []string |  |  | OptInSkillsAppend appends to the agent's opt_in_skills list, the way inject_fragments_append adds a prompt fragment. |
 | `max_active_sessions` | integer |  |  | MaxActiveSessions overrides the agent-level cap on concurrent sessions. |
 | `min_active_sessions` | integer |  |  | MinActiveSessions overrides the minimum number of sessions to keep alive. |
 | `scale_check` | string |  |  | ScaleCheck overrides the command template whose output reports new unassigned session demand for bead-backed reconciliation. Supports the same Go template placeholders as Agent.scale_check. |
@@ -554,6 +559,18 @@ MailConfig holds mail provider settings.
 | `provider` | string |  |  | Provider selects the mail backend: "fake", "fail", "exec:&lt;script&gt;", or "" (default: beadmail). |
 | `retention_ttl` | string |  |  | RetentionTTL has two consumers: it is how long read messages are retained before purge, and how long a read mail bead stays open before the nudge-mail sweep closes it. Empty or "0" disables read-message purge. The sweep distinguishes the two: empty leaves it at its own 60-minute default, while "0" disables its mail-close phase. |
 | `unread_retention_ttl` | string |  |  | UnreadRetentionTTL is how long a never-read mail bead stays open before the nudge-mail sweep closes it. Empty or "0" disables the unread-mail phase; it is opt-in so unread mail is never closed by default. |
+| `crosscity` | MailCrossCityConfig |  |  | CrossCity enables city-qualified mail addressing (&lt;city&gt;/&lt;address&gt;). Absent means disabled: every recipient resolves exactly as today. |
+
+## MailCrossCityConfig
+
+MailCrossCityConfig enables city-qualified mail addressing: recipients of the form <city>/<address>, where the first path segment names a city and the remainder is that city's own address form.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `city` | string | **yes** |  | City is this city's own segment in city-qualified addresses, and it is REQUIRED when the section is present: the CLI and the API derive the effective city name differently (site binding, workspace name, the supervisor's registered name), so a defaulted name could stamp two spellings of this city on mail and strand replies. &lt;City&gt;/&lt;address&gt; and &lt;address&gt; are one mailbox. |
+| `cities` | []string | **yes** |  | Cities lists the peer cities addressable as &lt;city&gt;/&lt;address&gt;. A recipient naming a listed city resolves against the roster and is never looked up in the local session store. |
+| `towns` | map[string]string |  |  | Towns maps a listed peer city to the town whose rendered roster (cities/&lt;town&gt;/agents.json) lists that city's seats. A send to a mapped city is refused unless the seat is in that list; a peer city with no mapping keeps the city-level rules only. |
+| `roster_root` | string |  |  | RosterRoot points at the directory holding cities/&lt;town&gt;/agents.json and overrides discovery. Unset, the roster is the pack-cache clone of the imported repository that ships cities/, at its packs.lock commit; with no such import there is no list and sends behave exactly as before this knob existed. |
 
 ## MaintenanceConfig
 
@@ -783,6 +800,23 @@ Rig defines an external project registered in the city.
 | `dolt_port` | string |  |  | DoltPort overrides the city-level Dolt port for this rig's beads. When set, controller commands (scale_check, work_query) prefix their shell invocations with BEADS_DOLT_SERVER_PORT=&lt;port&gt; so bd connects to the correct server instead of the city-level default. |
 | `formula_vars` | map[string]string |  |  | FormulaVars provides rig-scoped defaults for formula vars. Keys match var names declared in formula `[vars.&lt;name&gt;]` blocks. Values are used when a formula runs in this rig and the caller did not pass an explicit --var override. Takes precedence over formula-level defaults but loses to --var flags. |
 | `beads_proxied_idle_timeout` | string |  |  | BeadsProxiedIdleTimeout overrides [beads] proxied_idle_timeout for this rig's bd-owned proxied scope. Go duration; "0" means never. Ignored, with a warning, for a rig that shares the city's proxy root: one proxy serves every scope on that root and carries the city's value. |
+| `doctor` | RigDoctorConfig |  |  | Doctor holds rig-scoped gc doctor policy ([rigs.doctor]). |
+
+## RigDoctorConfig
+
+RigDoctorConfig holds gc doctor policy that applies to one rig.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `census_owner_namespace` | string |  |  | CensusOwnerNamespace declares that this rig's resource-census ledger (test/test-resources.toml) names owner_bead values from ANOTHER tracker, e.g. "gastownhall/gascity" for a fork of Gas City whose ledger comes from upstream. The census-owner-liveness check then reports an owner_bead missing from this city as owned in that namespace instead of dangling. The cost: a missing owner on this rig that is genuinely this city's is not detected. Empty means every missing owner is dangling. |
+
+## RigDoctorPatch
+
+RigDoctorPatch overrides fields of a rig's [rigs.doctor] table.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `census_owner_namespace` | string |  |  | CensusOwnerNamespace overrides Rig.Doctor.CensusOwnerNamespace; an empty string clears the declaration. |
 
 ## RigPatch
 
@@ -799,6 +833,7 @@ RigPatch modifies an existing rig identified by Name.
 | `suspended_on_start` | boolean |  |  | SuspendedOnStart overrides the rig's desired suspension state at city start. Mirrors Rig.SuspendedOnStart. |
 | `formula_vars` | map[string]string |  |  | FormulaVars adds or overrides rig-scoped formula var defaults. Additive merge: patch keys win over existing rig keys, unspecified keys are preserved. |
 | `beads_proxied_idle_timeout` | string |  |  | BeadsProxiedIdleTimeout overrides the rig's beads_proxied_idle_timeout. |
+| `doctor` | RigDoctorPatch |  |  | Doctor overrides fields of the rig's [rigs.doctor] table. |
 
 ## Service
 
