@@ -15,6 +15,8 @@ func signalPID(pid int, signal processSignal) error {
 		sig = syscall.SIGTERM
 	case processSignalKill:
 		sig = syscall.SIGKILL
+	case processSignalUsr1:
+		sig = syscall.SIGUSR1
 	default:
 		return fmt.Errorf("unsupported process signal %q", signal)
 	}
