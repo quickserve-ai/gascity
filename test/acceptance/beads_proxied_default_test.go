@@ -22,6 +22,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -331,26 +332,39 @@ func beadsTopologyCheck(name string) bool {
 // internal/doctor/checks_order_firing.go writes them, anchored at both ends
 // so an appended suffix does not match.
 var (
-	schedulerStaleLine   = regexp.MustCompile(`^\S+: last fired (\S+) ago, expected every (\S+) \(CRITICAL: stale\)$`)
-	schedulerOverdueLine = regexp.MustCompile(`^\S+: last fired \S+ ago, expected every \S+ \(overdue\)$`)
-	schedulerCurrentLine = regexp.MustCompile(`^\d+ other scheduled order\(s\) current$`)
+	schedulerStaleLine      = regexp.MustCompile(`^\S+: last fired (\S+) ago, expected every (\S+) \(CRITICAL: stale\)$`)
+	schedulerOverdueLine    = regexp.MustCompile(`^\S+: last fired \S+ ago, expected every \S+ \(overdue\)$`)
+	schedulerCurrentLine    = regexp.MustCompile(`^(\d+) other scheduled order\(s\) current$`)
+	schedulerNeverFiredLine = regexp.MustCompile(`^\S+: never fired since controller start (\S+) ago$`)
+	schedulerFirstCycleLine = regexp.MustCompile(`^\S+: never fired \(controller running \S+, within first cycle\)$`)
 )
 
 // schedulerLagOnly reports whether the run's ONLY blocking failure is the test
 // city's own order scheduler running late: order-firing-current in error, not
-// timed out, and every line it flags an age ("last fired 3m ago, expected
-// every 1m (CRITICAL: stale)") of a 1-minute order at most schedulerMaxLag
-// old. That is a loaded CI runner missing 1-minute ticks (ga-l0b72a.9: #271
-// run 38317797049 failed three proxied tests on "dolt-health: last fired 2m
-// ago ... CRITICAL: stale" and passed on rerun).
-// A lookup timeout, a never-fired order, an unreadable history, or any other
-// failing check is NOT lag and stays fatal: those are the defects this
-// assertion has caught before (see assertDoctorGreen).
+// timed out, and every line it flags either an age ("last fired 3m ago,
+// expected every 1m (CRITICAL: stale)") of a 1-minute order at most
+// schedulerMaxLag old, or a first firing not yet made by a controller at most
+// schedulerMaxLag old ("gate-sweep: never fired since controller start 1m
+// ago") while the same report shows the scheduler firing other orders. That is
+// a loaded CI runner missing ticks (ga-l0b72a.9: #271 run 38317797049 failed
+// three proxied tests on "dolt-health: last fired 2m ago ... CRITICAL: stale";
+// run 38485422418 failed on a 30s order not yet fired one minute in, with 8
+// other orders current).
+// A lookup timeout, a never-fired order on an older controller or with no
+// order shown firing, an unreadable history, or any other failing check is
+// NOT lag and stays fatal: those are the defects this assertion has caught
+// before (see assertDoctorGreen).
 func schedulerLagOnly(report doctorReport) bool {
 	if report.BlockingFailed != 1 {
 		return false
 	}
 	lagged := false
+	// fired records evidence in this report that the scheduler fires at all:
+	// an order with a last firing, or a non-zero count of current orders. A
+	// never-fired line is lag only beside it; without it, a scheduler that
+	// fires nothing would read as late.
+	fired := false
+	neverFired := false
 	for _, r := range report.Results {
 		if r.Status != "error" || r.Severity == "advisory" {
 			continue
@@ -358,22 +372,38 @@ func schedulerLagOnly(report doctorReport) bool {
 		if r.Name != "order-firing-current" || r.TimedOut {
 			return false
 		}
-		// Every detail line must be one this check writes for lag, or its
-		// closing count line. Anything else, including a lag line carrying a
-		// suffix (", gated on open work ..." is a stuck item; ", open-work
-		// lookup failed: ..." is a failed store read), is not lag.
+		// Every detail line must be one this check writes for lag, a
+		// first-cycle note, or its closing count line. Anything else,
+		// including a lag line carrying a suffix (", gated on open work ..."
+		// is a stuck item; ", open-work lookup failed: ..." is a failed store
+		// read), is not lag.
 		for _, d := range r.Details {
 			switch {
 			case schedulerStaleLine.MatchString(d):
 				if !schedulerLateNotStopped(schedulerStaleLine.FindStringSubmatch(d)) {
 					return false
 				}
-				lagged = true
-			case schedulerOverdueLine.MatchString(d), schedulerCurrentLine.MatchString(d):
+				lagged, fired = true, true
+			case schedulerNeverFiredLine.MatchString(d):
+				uptime, err := time.ParseDuration(schedulerNeverFiredLine.FindStringSubmatch(d)[1])
+				if err != nil || uptime > schedulerMaxLag {
+					return false
+				}
+				lagged, neverFired = true, true
+			case schedulerCurrentLine.MatchString(d):
+				if n, err := strconv.Atoi(schedulerCurrentLine.FindStringSubmatch(d)[1]); err == nil && n > 0 {
+					fired = true
+				}
+			case schedulerOverdueLine.MatchString(d):
+				fired = true
+			case schedulerFirstCycleLine.MatchString(d):
 			default:
 				return false
 			}
 		}
+	}
+	if neverFired && !fired {
+		return false
 	}
 	return lagged
 }
@@ -423,7 +453,23 @@ func TestSchedulerLagOnly(t *testing.T) {
 			"mol-x: last fired 3m ago, expected every 1m (CRITICAL: stale), gated on open work ga-1 (5m old, unassigned)"), false},
 		{"stale sibling whose open-work lookup failed", report(1, false, stale,
 			"mol-x: last fired 3m ago, expected every 1m (CRITICAL: stale), open-work lookup failed: dial tcp: refused"), false},
-		{"never fired", report(1, false, stale, "mol-x: never fired since controller start 9m ago"), false},
+		{"never fired on an older controller", report(1, false, stale, "mol-x: never fired since controller start 9m ago"), false},
+		{"never fired one minute in, others current", report(1, false, // run 38485422418
+			"cross-rig-deps: never fired (controller running 1m, within first cycle)",
+			"gate-sweep: never fired since controller start 1m ago",
+			"reaper: never fired (controller running 1m, within first cycle)",
+			"8 other scheduled order(s) current"), true},
+		{"never fired at the lag bound beside a stale line", report(1, false, stale,
+			"gate-sweep: never fired since controller start 5m ago"), true},
+		{"never fired with nothing shown firing", report(1, false,
+			"gate-sweep: never fired since controller start 1m ago"), false},
+		{"never fired with zero orders current", report(1, false,
+			"gate-sweep: never fired since controller start 1m ago", "0 other scheduled order(s) current"), false},
+		{"never fired, start predates the logs", report(1, false,
+			"gate-sweep: never fired; controller start predates the active event log and every retained archive (no first-cycle grace)",
+			"8 other scheduled order(s) current"), false},
+		{"first-cycle notes alone", report(1, false,
+			"reaper: never fired (controller running 1m, within first cycle)", "8 other scheduled order(s) current"), false},
 		{"unreadable history", report(1, false, stale, "mol-x: cannot read order history: boom"), false},
 		{"unknown line", report(1, false, stale, "something new"), false},
 		{"overdue only", report(1, false, "wisp-gc: last fired 2h ago, expected every 1h (overdue)"), false},
