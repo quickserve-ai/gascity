@@ -146,6 +146,8 @@ func foldPreWake(_ context.Context, r effectReads, v txView) (preWakeFold, error
 	// reset; an allocated key no start committed yet is kept.
 	if f.transcript = transcriptOf(r, v.World, next, tp); f.transcript == sessTranscriptAbsent && staleResumeKeyClears(next, tp.ResolvedProvider) {
 		f.reset = clearStaleResumeKeyMetadata("", nil) // its patch only
+		// The stale key stays findable (ga-oe8h), as legacy's clear stamps it from its read.
+		session.StampPriorSessionKeyInfo(f.reset, next)
 	}
 	return f, nil
 }

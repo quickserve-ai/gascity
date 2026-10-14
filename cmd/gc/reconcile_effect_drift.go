@@ -90,6 +90,7 @@ func withRepairKey(patch session.MetadataPatch, w *World, row session.Info) sess
 		if key, err := session.GenerateSessionKey(); err == nil {
 			patch = maps.Clone(patch)
 			patch["session_key"] = key
+			session.StampPriorSessionKeyInfo(patch, row) // the rotated-away key stays findable (ga-oe8h)
 		}
 	}
 	return patch

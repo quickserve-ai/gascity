@@ -293,5 +293,6 @@ func driftRestartPatch(tp TemplateParams, row session.Info, now time.Time) sessi
 	for _, k := range []string{namedSessionConfigDriftDeferredAtMetadata, namedSessionConfigDriftDeferredKeyMetadata, sessionAttachedConfigDriftDeferredAtMetadata, sessionAttachedConfigDriftDeferredKeyMetadata} {
 		patch[k] = ""
 	}
+	session.StampPriorSessionKeyInfo(patch, row) // a rotated or cleared key stays findable (ga-oe8h), as legacy's drift reset stamps it
 	return patch
 }
