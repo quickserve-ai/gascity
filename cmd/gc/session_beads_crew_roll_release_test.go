@@ -122,14 +122,11 @@ func TestSessionCloseKeepsConfiguredCrewWorkAcrossRoll(t *testing.T) {
 
 	var stderr bytes.Buffer
 	unclaimWorkAssignedToRetiredSessionBead(
-		"",
-		crewRollConfig(false),
+		testWorkLegs("", crewRollConfig(false), cityStore, map[string]beads.Store{"qcore": rigStore}),
 		cityStore,
-		map[string]beads.Store{"qcore": rigStore},
 		crewSessionBead(),
 		"", // the close path's runTargetFallback, verbatim from cmdSessionClose
-		&stderr,
-	)
+		&stderr)
 
 	gotOpen, err := rigStore.Get(openWork.ID)
 	if err != nil {
@@ -166,8 +163,7 @@ func TestSessionCloseKeepsConfiguredCrewWorkInCityStore(t *testing.T) {
 
 	var stderr bytes.Buffer
 	unclaimWorkAssignedToRetiredSessionBead(
-		"", crewRollConfig(false), cityStore, nil, crewSessionBead(), "", &stderr,
-	)
+		testWorkLegs("", crewRollConfig(false), cityStore, nil), cityStore, crewSessionBead(), "", &stderr)
 
 	got, err := cityStore.Get(work.ID)
 	if err != nil {
@@ -230,14 +226,11 @@ func TestSessionCloseProposesRetiredNamedSessionWork(t *testing.T) {
 
 	var stderr bytes.Buffer
 	unclaimWorkAssignedToRetiredSessionBead(
-		"",
-		&config.City{}, // qcore/ray is no longer configured
+		testWorkLegs("", &config.City{}, cityStore, map[string]beads.Store{"qcore": rigStore}), // qcore/ray is no longer configured
 		cityStore,
-		map[string]beads.Store{"qcore": rigStore},
 		crewSessionBead(),
 		"qcore/fallback-route",
-		&stderr,
-	)
+		&stderr)
 
 	got, err := rigStore.Get(work.ID)
 	if err != nil {
@@ -265,14 +258,11 @@ func TestSessionCloseProposesSuspendedAgentWork(t *testing.T) {
 
 	var stderr bytes.Buffer
 	unclaimWorkAssignedToRetiredSessionBead(
-		"",
-		crewRollConfig(true), // backing agent suspended
+		testWorkLegs("", crewRollConfig(true), cityStore, map[string]beads.Store{"qcore": rigStore}), // backing agent suspended
 		cityStore,
-		map[string]beads.Store{"qcore": rigStore},
 		crewSessionBead(),
 		"qcore/fallback-route",
-		&stderr,
-	)
+		&stderr)
 
 	got, err := rigStore.Get(work.ID)
 	if err != nil {
@@ -306,14 +296,11 @@ func TestSessionCloseProposesEphemeralIdentifierWork(t *testing.T) {
 
 	var stderr bytes.Buffer
 	unclaimWorkAssignedToRetiredSessionBead(
-		"",
-		crewRollConfig(false),
+		testWorkLegs("", crewRollConfig(false), cityStore, map[string]beads.Store{"qcore": rigStore}),
 		cityStore,
-		map[string]beads.Store{"qcore": rigStore},
 		sessionBead,
 		"qcore/fallback-route",
-		&stderr,
-	)
+		&stderr)
 
 	gotByID, err := rigStore.Get(byBeadID.ID)
 	if err != nil {

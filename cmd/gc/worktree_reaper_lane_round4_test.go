@@ -94,7 +94,7 @@ func TestSessionStartFence_HandleOnReplacedProviderStaysFenced(t *testing.T) {
 	}
 
 	gen0, _ := laneFenceState(cr)
-	if startErr := handle.Start(context.Background()); startErr != nil {
+	if startErr := handle.Start(context.Background(), testOperatorIn(t, cityPath)); startErr != nil {
 		t.Logf("wake returned %v (only the fence is under test)", startErr)
 	}
 	if !anyStartCall(sp) {

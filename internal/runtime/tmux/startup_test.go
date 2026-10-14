@@ -3740,15 +3740,16 @@ func TestDoRelaunchSession_ReappliesEnvOnRespawn(t *testing.T) {
 // account is a real value and is never marked.
 func TestRespawnAgentMarksClaudeAccountRemovedFromSessionEnv(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		account   string
-		wantCalls int
+		name       string
+		account    string
+		wantMarked bool
 	}{
-		{name: "reset account is withheld across respawn", account: "", wantCalls: 2},
-		{name: "declared account is left in place", account: "/accounts/seat", wantCalls: 1},
+		{name: "reset account is withheld across respawn", account: "", wantMarked: true},
+		{name: "declared account is left in place", account: "/accounts/seat", wantMarked: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			fake := &fakeExecutor{}
+			// The respawn resolves the agent pane first (upstream #7677).
+			fake := &fakeExecutor{agentPane: true}
 			tm := NewTmux()
 			tm.exec = fake
 			ops := &tmuxStartOps{tm: tm}
@@ -3761,14 +3762,18 @@ func TestRespawnAgentMarksClaudeAccountRemovedFromSessionEnv(t *testing.T) {
 			if err := ops.respawnAgent("gc-test-account-pin", "/proj", "claude", env); err != nil {
 				t.Fatalf("respawnAgent: %v", err)
 			}
-			if len(fake.calls) != tc.wantCalls {
-				t.Fatalf("tmux calls = %d (%v), want %d", len(fake.calls), fake.calls, tc.wantCalls)
-			}
-			if tc.wantCalls == 2 {
-				setEnv := strings.Join(fake.calls[0], " ")
-				if !strings.Contains(setEnv, "set-environment -t =gc-test-account-pin -r CLAUDE_CONFIG_DIR") {
-					t.Errorf("first call = %q, want CLAUDE_CONFIG_DIR marked removed from the session env", setEnv)
+			var setEnv []string
+			for _, call := range fake.calls {
+				if joined := strings.Join(call, " "); strings.Contains(joined, "set-environment") {
+					setEnv = append(setEnv, joined)
 				}
+			}
+			if tc.wantMarked {
+				if len(setEnv) != 1 || !strings.Contains(setEnv[0], "set-environment -t =gc-test-account-pin -r CLAUDE_CONFIG_DIR") {
+					t.Errorf("set-environment calls = %q, want CLAUDE_CONFIG_DIR marked removed from the session env", setEnv)
+				}
+			} else if len(setEnv) != 0 {
+				t.Errorf("set-environment calls = %q, want none for a declared account", setEnv)
 			}
 			if respawn := strings.Join(fake.calls[len(fake.calls)-1], " "); !strings.Contains(respawn, "respawn-pane") {
 				t.Errorf("last call = %q, want respawn-pane", respawn)

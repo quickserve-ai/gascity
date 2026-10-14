@@ -45,14 +45,17 @@ func (p *paneAfterFirstKeyExecutor) execute(args []string) (string, error) {
 	cp := make([]string, len(args))
 	copy(cp, args)
 	p.calls = append(p.calls, cp)
+	if row, ok := fakeAgentPaneRow(args); ok {
+		return row, nil
+	}
 	if slices.Contains(args, "capture-pane") {
 		if p.keyed {
 			return p.after, nil
 		}
 		return p.before, nil
 	}
-	if slices.Contains(args, "#{session_attached}") {
-		return p.attached, nil
+	if slices.Contains(args, clientCountProbe) {
+		return countAnswer(args, p.attached), nil
 	}
 	if slices.Contains(args, "send-keys") {
 		p.keyed = true
@@ -64,7 +67,7 @@ func (p *paneAfterFirstKeyExecutor) executeCtx(_ context.Context, args []string)
 	return p.execute(args)
 }
 
-func sentKeys(calls [][]string) [][]string {
+func sentKeyCalls(calls [][]string) [][]string {
 	var out [][]string
 	for _, c := range calls {
 		if slices.Contains(c, "send-keys") {
@@ -82,7 +85,7 @@ func TestNudgeSessionDefersOnTheSessionLimitChooser(t *testing.T) {
 	if reason, deferred := NudgeDeferredReason(err); !deferred || reason != NudgeDeferReasonSelectionPrompt {
 		t.Fatalf("NudgeSession on the session-limit chooser = %v, want a %s deferral", err, NudgeDeferReasonSelectionPrompt)
 	}
-	if keys := sentKeys(ex.calls); len(keys) != 0 {
+	if keys := sentKeyCalls(ex.calls); len(keys) != 0 {
 		t.Fatalf("sent keys on the session-limit chooser: %v", keys)
 	}
 }
@@ -95,7 +98,7 @@ func TestNudgeSessionStillDefersOnAGenericSelectionPrompt(t *testing.T) {
 	if reason, deferred := NudgeDeferredReason(err); !deferred || reason != NudgeDeferReasonSelectionPrompt {
 		t.Fatalf("NudgeSession on a generic numbered prompt = %v, want a %s deferral", err, NudgeDeferReasonSelectionPrompt)
 	}
-	if keys := sentKeys(ex.calls); len(keys) != 0 {
+	if keys := sentKeyCalls(ex.calls); len(keys) != 0 {
 		t.Fatalf("sent keys into a prompt meant for a person: %v", keys)
 	}
 }
@@ -108,7 +111,7 @@ func TestDismissMidSessionDialogBeforeNudgeSendsNoKeysOverAQuestionWordedLikeThe
 	if dismissKeyed(tm) {
 		t.Fatal("dismissed = true over a question worded like the session-limit chooser")
 	}
-	if keys := sentKeys(ex.calls); len(keys) != 0 {
+	if keys := sentKeyCalls(ex.calls); len(keys) != 0 {
 		t.Fatalf("answered the operator's question: %v", keys)
 	}
 }
@@ -119,7 +122,7 @@ func TestDismissMidSessionDialogBeforeNudgeSendsNoKeysOverAQuestionDialog(t *tes
 	if dismissKeyed(tm) {
 		t.Fatal("dismissed = true over a question dialog")
 	}
-	if keys := sentKeys(ex.calls); len(keys) != 0 {
+	if keys := sentKeyCalls(ex.calls); len(keys) != 0 {
 		t.Fatalf("sent keys over a question dialog: %v", keys)
 	}
 }
@@ -135,7 +138,7 @@ func TestDismissMidSessionDialogBeforeNudgeStopsWhenTheScreenChangesBetweenKeys(
 	if !dismissKeyed(tm) {
 		t.Fatal("dismissMidSessionDialogs = false after a key went out; the caller would skip its re-read")
 	}
-	keys := sentKeys(ex.calls)
+	keys := sentKeyCalls(ex.calls)
 	if len(keys) != 1 || !slices.Contains(keys[0], "0") {
 		t.Fatalf("keys sent = %v, want exactly the first dismissal key \"0\"", keys)
 	}
@@ -157,6 +160,9 @@ func (p *paneAfterCapturesExecutor) execute(args []string) (string, error) {
 	cp := make([]string, len(args))
 	copy(cp, args)
 	p.calls = append(p.calls, cp)
+	if row, ok := fakeAgentPaneRow(args); ok {
+		return row, nil
+	}
 	if slices.Contains(args, "capture-pane") {
 		p.captures++
 		if p.captures <= p.n {
@@ -164,11 +170,11 @@ func (p *paneAfterCapturesExecutor) execute(args []string) (string, error) {
 		}
 		return p.after, nil
 	}
-	if slices.Contains(args, "#{session_attached}") {
+	if slices.Contains(args, clientCountProbe) {
 		if p.attached != "" {
-			return p.attached, nil
+			return countAnswer(args, p.attached), nil
 		}
-		return "0", nil
+		return countAnswer(args, "0"), nil
 	}
 	return "", nil
 }
@@ -189,7 +195,7 @@ func TestNudgeSessionDefersWhenTheDismissalRefusesBeforeItsFirstKey(t *testing.T
 	if reason, deferred := NudgeDeferredReason(err); !deferred || reason != NudgeDeferReasonQuestionDialog {
 		t.Fatalf("NudgeSession = %v, want a %s deferral", err, NudgeDeferReasonQuestionDialog)
 	}
-	if keys := sentKeys(ex.calls); len(keys) != 0 {
+	if keys := sentKeyCalls(ex.calls); len(keys) != 0 {
 		t.Fatalf("sent keys after the dismissal refused a question: %v", keys)
 	}
 }
@@ -205,7 +211,7 @@ func TestNudgeSessionDefersWhenADismissalKeyUncoversAQuestion(t *testing.T) {
 	if reason, deferred := NudgeDeferredReason(err); !deferred || reason != NudgeDeferReasonQuestionDialog {
 		t.Fatalf("NudgeSession = %v, want a %s deferral", err, NudgeDeferReasonQuestionDialog)
 	}
-	keys := sentKeys(ex.calls)
+	keys := sentKeyCalls(ex.calls)
 	if len(keys) != 1 || !slices.Contains(keys[0], "0") {
 		t.Fatalf("keys sent = %v, want only the survey's \"0\" (no Enter, no C-u, no text)", keys)
 	}
@@ -222,7 +228,7 @@ func TestNudgeSessionDefersOnAMachineDialogWhenAttached(t *testing.T) {
 	if reason, deferred := NudgeDeferredReason(err); !deferred || reason != NudgeDeferReasonMachineDialogAttached {
 		t.Fatalf("NudgeSession = %v, want a %s deferral", err, NudgeDeferReasonMachineDialogAttached)
 	}
-	if keys := sentKeys(ex.calls); len(keys) != 0 {
+	if keys := sentKeyCalls(ex.calls); len(keys) != 0 {
 		t.Fatalf("sent keys on an attached session holding a machine dialog: %v", keys)
 	}
 }
@@ -238,7 +244,7 @@ func TestSendNudgeSubmitSequenceGuardsEveryKey(t *testing.T) {
 	if reason, deferred := NudgeDeferredReason(err); !deferred || reason != NudgeDeferReasonQuestionDialog {
 		t.Fatalf("sendNudgeSubmitSequence = %v, want a %s deferral before the second key", err, NudgeDeferReasonQuestionDialog)
 	}
-	keys := sentKeys(ex.calls)
+	keys := sentKeyCalls(ex.calls)
 	if len(keys) != 1 || !slices.Contains(keys[0], "Escape") {
 		t.Fatalf("keys sent = %v, want only the first key (Escape)", keys)
 	}
@@ -255,7 +261,7 @@ func TestNudgeSessionDefersOnAQuestionSeenByTheAttachedCheck(t *testing.T) {
 	if reason, deferred := NudgeDeferredReason(err); !deferred || reason != NudgeDeferReasonQuestionDialog {
 		t.Fatalf("NudgeSession = %v, want a %s deferral", err, NudgeDeferReasonQuestionDialog)
 	}
-	if keys := sentKeys(ex.calls); len(keys) != 0 {
+	if keys := sentKeyCalls(ex.calls); len(keys) != 0 {
 		t.Fatalf("sent keys after the attached check saw a question: %v", keys)
 	}
 }
@@ -273,7 +279,7 @@ func TestFeedbackSurveyDismisserSendsNoKeysOverALiveQuestion(t *testing.T) {
 	if err := tm.DismissFeedbackSurveyModalIfPresent("agent-pane"); err != nil {
 		t.Fatalf("DismissFeedbackSurveyModalIfPresent() = %v, want nil when it sends no keys", err)
 	}
-	if keys := sentKeys(ex.calls); len(keys) != 0 {
+	if keys := sentKeyCalls(ex.calls); len(keys) != 0 {
 		t.Fatalf("sent survey keys over a live question: %v", keys)
 	}
 }
@@ -286,7 +292,7 @@ func TestModelSwitchDismissStopsWhenAQuestionReplacesTheModalBetweenKeys(t *test
 	tm := &Tmux{cfg: DefaultConfig(), exec: ex}
 
 	tm.DismissModelSwitchModalIfPresent("agent-pane")
-	keys := sentKeys(ex.calls)
+	keys := sentKeyCalls(ex.calls)
 	if len(keys) != 1 || !slices.Contains(keys[0], "Down") {
 		t.Fatalf("keys sent = %v, want only Down (no Enter onto the question)", keys)
 	}
@@ -300,7 +306,7 @@ func TestModelSwitchDismissStopsWhenAnApprovalAppearsBelowTheModal(t *testing.T)
 	tm := &Tmux{cfg: DefaultConfig(), exec: ex}
 
 	tm.DismissModelSwitchModalIfPresent("agent-pane")
-	keys := sentKeys(ex.calls)
+	keys := sentKeyCalls(ex.calls)
 	if len(keys) != 1 || !slices.Contains(keys[0], "Down") {
 		t.Fatalf("keys sent = %v, want only Down (no Enter onto the approval)", keys)
 	}
@@ -328,6 +334,9 @@ func (s *scriptedCaptureExecutor) execute(args []string) (string, error) {
 	cp := make([]string, len(args))
 	copy(cp, args)
 	s.calls = append(s.calls, cp)
+	if row, ok := fakeAgentPaneRow(args); ok {
+		return row, nil
+	}
 	if slices.Contains(args, "capture-pane") {
 		if !s.keyed {
 			return s.before, nil
@@ -336,8 +345,8 @@ func (s *scriptedCaptureExecutor) execute(args []string) (string, error) {
 		s.captures++
 		return s.afterKey[i], nil
 	}
-	if slices.Contains(args, "#{session_attached}") {
-		return "0", nil
+	if slices.Contains(args, clientCountProbe) {
+		return countAnswer(args, "0"), nil
 	}
 	if slices.Contains(args, "send-keys") {
 		s.keyed = true
@@ -398,7 +407,7 @@ func TestModelSwitchDismissDecidesEachKeyOnOneCapture(t *testing.T) {
 		tm := &Tmux{cfg: DefaultConfig(), exec: ex}
 
 		tm.DismissModelSwitchModalIfPresent("agent-pane")
-		keys := sentKeys(ex.calls)
+		keys := sentKeyCalls(ex.calls)
 		if len(keys) != 1 || !slices.Contains(keys[0], "Down") {
 			t.Fatalf("keys sent = %v, want only Down (no Enter onto the question)", keys)
 		}

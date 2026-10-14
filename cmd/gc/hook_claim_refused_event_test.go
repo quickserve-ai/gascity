@@ -14,7 +14,6 @@ import (
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beads"
-	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/session"
 )
@@ -424,10 +423,10 @@ func TestHookCommandClaimNonRefusalsRecordNoRefusedEvent(t *testing.T) {
 
 			var verdicts []hookClaimSessionVerdict
 			realClassify := hookClaimClassifySession
-			hookClaimClassifySession = func(cityPath string, cfg *config.City, sessionID, instanceToken string) (hookClaimSessionVerdict, string, hookClaimStaleDetail) {
-				verdict, reason, detail := realClassify(cityPath, cfg, sessionID, instanceToken)
+			hookClaimClassifySession = func(front sessionFrontGetter, sessionID, instanceToken string) (hookClaimSessionVerdict, string, *session.Info, hookClaimStaleDetail) {
+				verdict, reason, info, detail := realClassify(front, sessionID, instanceToken)
 				verdicts = append(verdicts, verdict)
-				return verdict, reason, detail
+				return verdict, reason, info, detail
 			}
 			t.Cleanup(func() { hookClaimClassifySession = realClassify })
 

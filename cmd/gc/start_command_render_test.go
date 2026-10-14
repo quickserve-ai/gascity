@@ -151,7 +151,7 @@ provider = "file"
 	}
 	// Suspended, so the submit below takes the resume branch
 	// (Manager.submit -> sendLocked -> ensureRunning -> sp.Start).
-	if err := mgr.Suspend(info.ID); err != nil {
+	if err := mgr.Suspend(context.Background(), testOperatorIn(t, cityDir), info.ID, false); err != nil {
 		t.Fatalf("Suspend: %v", err)
 	}
 
@@ -160,7 +160,7 @@ provider = "file"
 		t.Fatalf("workerHandleForSessionWithConfig: %v", err)
 	}
 	sp.Calls = nil
-	if _, err := handle.Message(context.Background(), worker.MessageRequest{
+	if _, err := handle.Message(context.Background(), testActorIn(t, session.ActorAgent, cityDir), worker.MessageRequest{
 		Text:     "wake",
 		Delivery: workerDeliveryIntentForSubmitIntent(session.SubmitIntentDefault),
 	}); err != nil {

@@ -22,7 +22,7 @@ import (
 // runtime name.
 func carryAlwaysFreshNamedEnv(t *testing.T) (*reconcilerTestEnv, beads.Bead, string) {
 	t.Helper()
-	env := newReconcilerTestEnv()
+	env := newReconcilerTestEnv(t)
 	env.cfg = &config.City{
 		Workspace:     config.Workspace{Name: "test-city"},
 		Agents:        []config.Agent{{Name: "worker", SleepAfterIdle: config.SessionSleepOff}},
@@ -64,12 +64,11 @@ func carryDrainAckToTerminal(t *testing.T, env *reconcilerTestEnv, session beads
 	if err := dops.setDrainAck(sessionName); err != nil {
 		t.Fatalf("setDrainAck: %v", err)
 	}
-	if woken := reconcileSessionBeads(
-		context.Background(), []beads.Bead{session}, env.desiredState, cfgNames,
-		env.cfg, env.sp, env.store, dops, nil, nil, env.dt,
+	if woken := reconcileSessionBeadsAtPath(
+		context.Background(), env.city, []beads.Bead{session}, env.desiredState, cfgNames,
+		env.cfg, env.sp, env.store, dops, nil, nil, nil, env.dt,
 		nil, false, nil, "",
-		nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr, env.startOptions...,
-	); woken != 0 {
+		nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr, env.startOptions...); woken != 0 {
 		t.Fatalf("woken on the drain-ack tick = %d, want 0; stderr=%s", woken, env.stderr.String())
 	}
 	return env.reconcileStopPendingToTerminal(t, env.sp, session, dops, cfgNames)
@@ -83,12 +82,11 @@ func carryReconcileOnce(t *testing.T, env *reconcilerTestEnv, id string) int {
 	if err != nil {
 		t.Fatalf("Get(%s): %v", id, err)
 	}
-	return reconcileSessionBeads(
-		context.Background(), []beads.Bead{cur}, env.desiredState,
+	return reconcileSessionBeadsAtPath(
+		context.Background(), env.city, []beads.Bead{cur}, env.desiredState,
 		configuredSessionNames(env.cfg, "", env.store), env.cfg, env.sp, env.store,
-		nil, nil, nil, env.dt, nil, false, nil, "",
-		nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr, env.startOptions...,
-	)
+		nil, nil, nil, nil, env.dt, nil, false, nil, "",
+		nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr, env.startOptions...)
 }
 
 // TestReconcileSessionBeads_SuspendHoldOutlivesFreshWakeCooldown pins woodhouse's
@@ -103,7 +101,7 @@ func carryReconcileOnce(t *testing.T, env *reconcilerTestEnv, id string) int {
 // extend a hold but never shorten one.
 func TestReconcileSessionBeads_SuspendHoldOutlivesFreshWakeCooldown(t *testing.T) {
 	env, session, sessionName := carryAlwaysFreshNamedEnv(t)
-	sentinel := env.clk.Now().Add(indefiniteHoldDuration).UTC().Format(time.RFC3339)
+	sentinel := env.clk.Now().Add(sessionpkg.IndefiniteHoldDuration).UTC().Format(time.RFC3339)
 	// Exactly what cmdSessionSuspend writes on the managed path.
 	env.setSessionMetadata(&session, map[string]string{
 		"held_until":   sentinel,
@@ -226,13 +224,13 @@ func TestReconcileSessionBeads_DegradedLivenessReadDefersStandingHoldDrainAck(t 
 		return wrapStoreWithBeadPolicies(backing, &config.City{}, newLivenessBindingForTest(store, liveness.ModeTable))
 	}
 
-	env := newReconcilerTestEnv()
+	env := newReconcilerTestEnv(t)
 	env.store = overlay(lv)
 	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
 	env.addDesired("worker", "worker", true)
 	session := env.createSessionBead("worker", "worker")
 	env.markSessionActive(&session)
-	heldUntil := env.clk.Now().Add(indefiniteHoldDuration).UTC().Format(time.RFC3339)
+	heldUntil := env.clk.Now().Add(sessionpkg.IndefiniteHoldDuration).UTC().Format(time.RFC3339)
 	env.setSessionMetadata(&session, map[string]string{
 		"held_until":   heldUntil,
 		"sleep_intent": string(sessionpkg.SleepReasonUserHold),
@@ -263,12 +261,11 @@ func TestReconcileSessionBeads_DegradedLivenessReadDefersStandingHoldDrainAck(t 
 		if err != nil {
 			t.Fatalf("Get(%s): %v", session.ID, err)
 		}
-		return reconcileSessionBeads(
-			context.Background(), []beads.Bead{cur}, env.desiredState, cfgNames,
-			env.cfg, env.sp, env.store, dops, []beads.Bead{task}, nil, env.dt,
+		return reconcileSessionBeadsAtPath(
+			context.Background(), env.city, []beads.Bead{cur}, env.desiredState, cfgNames,
+			env.cfg, env.sp, env.store, dops, []beads.Bead{task}, nil, nil, env.dt,
 			map[string]int{"worker": 1}, false, nil, "",
-			nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr, env.startOptions...,
-		)
+			nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr, env.startOptions...)
 	}
 
 	// Healthy tick: the ack moves the seat to stop-pending and stops it.
@@ -352,7 +349,7 @@ func TestReconcileSessionBeads_WaitHoldReleasedOnDegradedReadFreesPoolSlot(t *te
 		return wrapStoreWithBeadPolicies(backing, &config.City{}, newLivenessBindingForTest(store, liveness.ModeTable))
 	}
 
-	env := newReconcilerTestEnv()
+	env := newReconcilerTestEnv(t)
 	env.store = overlay(lv)
 	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
 	// A desired pool seat with no demand: its slot is decided by the pool-slot
@@ -372,8 +369,8 @@ func TestReconcileSessionBeads_WaitHoldReleasedOnDegradedReadFreesPoolSlot(t *te
 	// The wait resolves while the overlay is down.
 	lvNow = lvNow.Add(time.Minute)
 	down := &unreachableLivenessStore{MemStore: lv}
-	if err := clearSessionWaitHold(sessionFrontDoor(overlay(down)), seat.ID); err != nil {
-		t.Fatalf("clearSessionWaitHold: %v", err)
+	if err := clearSessionWaitHoldIfIdle(sessionFrontDoor(overlay(down)), seat.ID); err != nil {
+		t.Fatalf("clearSessionWaitHoldIfIdle: %v", err)
 	}
 	if down.reads == 0 {
 		t.Fatalf("the release never read through the unreachable store; the test proves nothing")
@@ -386,9 +383,9 @@ func TestReconcileSessionBeads_WaitHoldReleasedOnDegradedReadFreesPoolSlot(t *te
 	if stranded.WaitHold != "" || stranded.SleepIntent != "" {
 		t.Fatalf("precondition: the degraded release did not land (wait_hold=%q sleep_intent=%q)", stranded.WaitHold, stranded.SleepIntent)
 	}
-	if stranded.SleepReason != string(sessionpkg.SleepReasonWaitHold) || isPoolSessionSlotFreeableInfo(stranded) {
+	if stranded.SleepReason != string(sessionpkg.SleepReasonWaitHold) || isPoolSessionSlotFreeableInfo(stranded, env.clk.Now()) {
 		t.Fatalf("precondition: want the reason stranded and the slot refused after a degraded release; sleep_reason=%q freeable=%v",
-			stranded.SleepReason, isPoolSessionSlotFreeableInfo(stranded))
+			stranded.SleepReason, isPoolSessionSlotFreeableInfo(stranded, env.clk.Now()))
 	}
 
 	// A degraded read is never healed: its fields are committed values.
@@ -421,12 +418,11 @@ func TestReconcileSessionBeads_WaitHoldReleasedOnDegradedReadFreesPoolSlot(t *te
 	}
 
 	// A healthy tick heals the reason, and the pool-slot arm reclaims the seat.
-	reconcileSessionBeads(
-		context.Background(), []beads.Bead{mustGetBead(t, env.store, seat.ID)}, env.desiredState,
-		map[string]bool{"worker": true}, env.cfg, env.sp, env.store, nil, nil, nil, env.dt,
+	reconcileSessionBeadsAtPath(
+		context.Background(), env.city, []beads.Bead{mustGetBead(t, env.store, seat.ID)}, env.desiredState,
+		map[string]bool{"worker": true}, env.cfg, env.sp, env.store, nil, nil, nil, nil, env.dt,
 		map[string]int{}, false, nil, "",
-		nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr, env.startOptions...,
-	)
+		nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr, env.startOptions...)
 	after, err := env.store.Get(seat.ID)
 	if err != nil {
 		t.Fatalf("Get(%s): %v", seat.ID, err)
@@ -434,7 +430,7 @@ func TestReconcileSessionBeads_WaitHoldReleasedOnDegradedReadFreesPoolSlot(t *te
 	if after.Status != "closed" {
 		info := env.sessionInfo(seat.ID)
 		t.Errorf("released wait-hold seat still holds its pool slot after a healthy tick: status=%q state=%q sleep_reason=%q freeable=%v; stderr=%s",
-			after.Status, info.MetadataState, info.SleepReason, isPoolSessionSlotFreeableInfo(info), env.stderr.String())
+			after.Status, info.MetadataState, info.SleepReason, isPoolSessionSlotFreeableInfo(info, env.clk.Now()), env.stderr.String())
 	}
 
 	// Control: a seat whose wait still stands keeps its reason.
