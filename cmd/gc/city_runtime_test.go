@@ -5073,6 +5073,76 @@ func TestCityRuntimeReloadPublishingOpenSkewPreservesSessionsBeforeProviderSwap(
 	}
 }
 
+// The same guard when the publishing open's factory refuses the store AND
+// reports the schema skew that it found first: a conditional-writes refusal
+// under require keeps the native-selection diagnostic beside its error
+// (beads.StoreOpenOptions.unstampableResult), so the skew must latch and the
+// swap stop nothing, as when the open returns no error (ga-mw4dg).
+func TestCityRuntimeReloadPublishingOpenSkewWithAnOpenErrorPreservesSessions(t *testing.T) {
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	writeCityRuntimeConfig(t, tomlPath, "fake")
+
+	cfg, err := config.Load(osFS{}, tomlPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "existing-agent", runtime.Config{}); err != nil {
+		t.Fatalf("start existing agent: %v", err)
+	}
+	cr := newTestCityRuntime(t, CityRuntimeParams{
+		CityPath: cityPath,
+		CityName: "test-city",
+		TomlPath: tomlPath,
+		Cfg:      cfg,
+		SP:       sp,
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		Dops:   newDrainOps(sp),
+		Rec:    events.Discard,
+		Stdout: io.Discard,
+		Stderr: io.Discard,
+	})
+	cs := newControllerState(context.Background(), cfg, sp, events.NewFake(), "test-city", cityPath)
+	cs.cityBeadStore = beads.NewMemStore()
+	cs.storeMetadataSignature = "signature-at-boot" // publication must reopen the store
+	cr.setControllerState(cs)
+
+	previousPreflight := controllerStatePreflightCityStore
+	controllerStatePreflightCityStore = func(string, *config.City, gate.Mode) (beads.StoreOpenResult, error) {
+		return beads.StoreOpenResult{Store: beads.NewMemStore()}, nil
+	}
+	t.Cleanup(func() { controllerStatePreflightCityStore = previousPreflight })
+	previousOpen := newControllerStateOpenCityStore
+	newControllerStateOpenCityStore = func(string, gate.Mode, beads.NativeTransportMode) (beads.StoreOpenResult, error) {
+		return beads.StoreOpenResult{
+			Diagnostic: beads.BeadsDiagnostic{
+				Store:               beads.BeadsStoreNameBdStore,
+				NativeStoreEligible: false,
+				PreflightGate:       "native_open",
+				PreflightReason:     "schema version mismatch: database is at v55, binary knows up to v54 (1 migration ahead)",
+			},
+		}, &beads.ConditionalWritesRequiredError{StoreKind: beads.BeadsStoreNameBdStore, Reason: "refused for the test"}
+	}
+	t.Cleanup(func() { newControllerStateOpenCityStore = previousOpen })
+
+	writeCityRuntimeConfig(t, tomlPath, "fail")
+	lastProviderName := "fake"
+	reply := cr.reloadConfigTraced(context.Background(), &lastProviderName, cityPath, nil, reloadSourceManual)
+
+	if reply.Outcome != reloadOutcomeFailed {
+		t.Fatalf("reply.Outcome = %q, want %q", reply.Outcome, reloadOutcomeFailed)
+	}
+	if !sp.IsRunning("existing-agent") {
+		t.Fatal("existing agent stopped though the publishing open reported schema skew beside its error")
+	}
+	if cr.controllerStoreSchemaSkewDiagnostic() == nil {
+		t.Fatal("the skew reported beside the open's error was not latched for the run-loop hold")
+	}
+}
+
 // TestCityRuntimeReloadReportsConfigParseErrorBeforeStorePreflightFailure pins
 // the order of two reload refusals. Opening the city store reads city.toml, so
 // an unparsable city.toml also fails the store preflight, and reporting that
