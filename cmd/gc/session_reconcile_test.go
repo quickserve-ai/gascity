@@ -2590,6 +2590,8 @@ func TestHealStatePatchProjectsRuntimeLiveness(t *testing.T) {
 				sessionpkg.PromptHashMetadataKey:         "",
 				"resume_failures":                        "",
 				"resume_launch":                          "",
+				// The carry's seeded-resume latch (ga-oe8h) is cleared with the key.
+				sessionpkg.ResumeSeededKey(): "",
 			},
 		},
 		{
@@ -2678,6 +2680,8 @@ func TestHealStatePatchProjectsRuntimeLiveness(t *testing.T) {
 				sessionpkg.PromptHashMetadataKey:         "",
 				"resume_failures":                        "",
 				"resume_launch":                          "",
+				// The carry's seeded-resume latch (ga-oe8h) is cleared with the key.
+				sessionpkg.ResumeSeededKey(): "",
 			},
 		},
 	}

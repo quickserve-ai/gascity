@@ -1234,6 +1234,10 @@ func healStatePatchWithRollbackInfo(info sessionpkg.Info, alive bool, observed b
 		if view.ResetContinuation || stalePendingCreateRollback {
 			if !sessionpkg.PreserveConversationOnRuntimeLoss(info) {
 				batch["session_key"] = ""
+				// A seeded resume (gc session resume, ga-oe8h) names the key
+				// cleared here, so it is cleared with it, as
+				// ConversationResetPatch clears it for v2's heal.
+				batch[sessionpkg.ResumeSeededKey()] = ""
 				batch["started_config_hash"] = ""
 				batch["continuation_reset_pending"] = "true"
 				// Priming markers share started_config_hash's lifetime (S19
