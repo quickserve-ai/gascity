@@ -355,10 +355,17 @@ func hookBudgetScenarios() []hookBudgetScenario {
 		{name: "prime --hook/fresh", seed: none, run: primeHook, ceiling: hookBudgetCeiling{Requests: 11, Opens: 1, SessionGets: 1, GetMisses: 0}},
 		{name: "prime --hook/auto-handoff", seed: handoff, run: primeHook, ceiling: hookBudgetCeiling{Requests: 13, Opens: 1, SessionGets: 1, GetMisses: 0}, wantStdout: "context cycle"},
 		{name: "prime --hook/auto-handoff and mail", seed: handoffAndMail, run: primeHook, ceiling: hookBudgetCeiling{Requests: 13, Opens: 1, SessionGets: 1, GetMisses: 0}, wantStdout: "status please"},
-		{name: "handoff --auto", seed: none, ceiling: hookBudgetCeiling{Requests: 6, Opens: 1, SessionGets: 1, GetMisses: 0}, run: func(_ *testing.T, _ hookBudgetFixture, stdout, stderr io.Writer) int {
+		// The fork's carry: ga-0ejdbv ("a lost send is loud, not silent") reads
+		// every mail write back through the store's live handle, one Get of the
+		// new message bead, modeled at 2 requests over upstream's 6. No read
+		// upstream's hook makes can serve it: its one Get is the hook's own
+		// session row, read before the write, and the write's own response is
+		// what the verification exists to distrust.
+		{name: "handoff --auto", seed: none, ceiling: hookBudgetCeiling{Requests: 8, Opens: 1, SessionGets: 1, GetMisses: 0}, run: func(_ *testing.T, _ hookBudgetFixture, stdout, stderr io.Writer) int {
 			return cmdHandoffWithFrom([]string{"context cycle"}, "", "", true, "", false, stdout, stderr)
 		}},
-		{name: "mail send human", seed: none, ceiling: hookBudgetCeiling{Requests: 6, Opens: 1, SessionGets: 1, GetMisses: 0}, run: func(_ *testing.T, _ hookBudgetFixture, stdout, stderr io.Writer) int {
+		// ga-0ejdbv's read-after-write of the sent message, as for handoff --auto.
+		{name: "mail send human", seed: none, ceiling: hookBudgetCeiling{Requests: 8, Opens: 1, SessionGets: 1, GetMisses: 0}, run: func(_ *testing.T, _ hookBudgetFixture, stdout, stderr io.Writer) int {
 			return cmdMailSend([]string{"human"}, false, false, "", "", "done", "work finished", stdout, stderr)
 		}},
 	}
