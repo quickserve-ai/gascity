@@ -273,6 +273,7 @@ go_test(
         "//internal/config",
         "//internal/execenv",
         "//internal/fsys",
+        "//internal/liveness",
         "//internal/nudgepoller",
         "//internal/nudgequeue",
         "//internal/pidutil",
