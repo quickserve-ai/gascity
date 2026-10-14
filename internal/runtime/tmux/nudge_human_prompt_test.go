@@ -1372,13 +1372,14 @@ func TestAStaleReminderWithAPersonsWordsIsTheirDraft(t *testing.T) {
 // the first Enter must not submit theirs. A placeholder that appears when our
 // paste had rendered inline is not ours either.
 func TestNudgeSessionFirstEnterOwnsOnlyItsOwnPastePlaceholder(t *testing.T) {
-	// Reads once the text is in: the provenance read, the gate's, then the
-	// chokepoint's (the last repeats).
+	// Reads once the text is in: the provenance read, the busy baseline
+	// (upstream #5977), the gate's, the permission-prompt look before the
+	// submit (#6832), then the chokepoint's (the last repeats).
 	theirs := composerFixture("❯ [Pasted text #5 +2 lines]")
 	for name, reads := range map[string][]string{
 		"a different paste number":      {composerFixture("❯ [Pasted text #4 +6 lines]"), theirs},
 		"our paste had rendered inline": {composerFixture("❯ <system-reminder> You have a deferred reminder that was queued"), theirs},
-		"no placeholder at either read": {composerFixture("❯ "), composerFixture("❯ "), theirs},
+		"no placeholder at either read": {composerFixture("❯ "), composerFixture("❯ "), composerFixture("❯ "), theirs},
 	} {
 		t.Run(name, func(t *testing.T) {
 			fe := &panePromptExecutor{screen: idleComposerFixture, attached: true}
@@ -1572,12 +1573,13 @@ func TestNudgeSessionOwnsItsCollapsedPasteWhenNoOneTyped(t *testing.T) {
 // person has replaced it: no second Enter.
 func TestNudgeSessionReSentEnterChecksOwnershipOnTheLastCapture(t *testing.T) {
 	ours := composerFixture("❯ " + guardTestNudge)
-	// Plain captures once the text is in: the provenance read, the gate's and
-	// the chokepoint's for the first Enter, the confirm polls, the busy
-	// re-check and the resend gate's read -- all ours -- then the
-	// chokepoint's read for the re-send.
-	reads := make([]string, 0, submitConfirmPollsPerSend+6)
-	for range submitConfirmPollsPerSend + 5 {
+	// Plain captures once the text is in: for the first Enter the provenance
+	// read, the busy baseline (upstream #5977), the gate's, the permission-
+	// prompt look (#6832) and the chokepoint's; then the confirm polls, the
+	// busy re-check, the resend gate's read and the look before the re-send
+	// -- all ours -- then the chokepoint's read for the re-send.
+	reads := make([]string, 0, submitConfirmPollsPerSend+9)
+	for range submitConfirmPollsPerSend + 8 {
 		reads = append(reads, ours)
 	}
 	reads = append(reads, composerFixture("❯ actually, stop and rebase first"))
