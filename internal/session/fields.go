@@ -398,6 +398,13 @@ var registry = slices.Concat([]Field{
 
 	// Launch configuration.
 	{Key: "session_key", Class: ClassLaunchConfig, Premise: true, Writers: sites(op(srcManager, "Manager.PersistSessionKey"))},
+	// The carry's resume keys (ga-oe8h, ga-fe2rmu): the conversation a
+	// lifecycle reset replaced, and `gc session resume`'s seeded latch.
+	{Key: PriorSessionKeyMetadata, Class: ClassLaunchConfig, Writers: sites(legacy(srcTransition, "StampPriorSessionKey"), legacy(srcTransition, "StampPriorSessionKeyInfo"))},
+	{Key: resumeSeededKey, Class: ClassMarker, Writers: sites(op("cmd/gc/cmd_session_history.go", "cmdSessionResume"))},
+	// The carry's deferred-release obligation (ga-dt5ffp): a close that withholds
+	// work publishes it on the closing session row.
+	{Key: beadmeta.ReleaseDeferredMetadataKey, Class: ClassMarker, Writers: sites(op("cmd/gc/session_release_marker.go", "publishDeferredReleaseObligation"), op("cmd/gc/session_release_marker.go", "publishDeferredReleaseObligationUnconditionally"))},
 	{Key: "alias", Class: ClassAssignmentIdentity, Writers: sites(legacy(srcPoolNames, "createPoolSessionBeadWithIdentifiers"), v2("cmd/gc/allocator_create_named.go", "createEffects.writeNamed"))},
 	{Key: aliasHistoryMetadataKey, Class: ClassLaunchConfig, Writers: sites(legacy("internal/session/alias.go", "UpdatedAliasMetadata"))},
 	{Key: "common_name", Class: ClassLaunchConfig, NoWriter: "retired: no production writer; name lookups still query it"},
@@ -411,6 +418,12 @@ var registry = slices.Concat([]Field{
 	{Key: CanonicalPoolSlotMetadata, Class: ClassLaunchConfig, Writers: sites(legacy("cmd/gc/session_identity.go", "desiredSessionIdentity"))},
 	{Key: "real_world_app_project_id", Class: ClassLaunchConfig, Writers: sites(op("internal/api/handler_session_create.go", "Server.persistSessionMeta"))},
 	{Key: beadmeta.OptionMetadataPrefix, Family: true, Class: ClassLaunchConfig, Writers: sites(op(srcManager, "Manager.UpdateTemplateOverrides"))},
+	// The carry's Claude cloud wake binding and outcome stamps (gc session
+	// bind-cloud; the cloud wake transport in cmd/gc's nudge path).
+	{Key: "cloud_wake_", Family: true, Class: ClassAdvisory, Writers: sites(op("cmd/gc/cmd_session_bind_cloud.go", "cmdSessionBindCloud"), op("cmd/gc/cmd_nudge.go", "deliverClaudeCloudNotify"))},
+	// The carry's liveness overlay (ga-lys454): one versioned fence stamp per
+	// liveness key it routes to the table, committed beside the row's write.
+	{Key: beadmeta.LivenessFencePrefix, Family: true, Class: ClassAdvisory, Writers: sites(op("internal/liveness/plan.go", "stampFences"))},
 	{Key: beadmeta.LabelRevisionMetadataKey, Class: ClassAdvisory, NewKey: true, NoWriter: "written by internal/beads' native Dolt label CAS (LL1), outside the census dirs; a version stamp no decision reads"},
 	{Key: beadmeta.InfraMigratedFromMetadataKey, Class: ClassAdvisory, Writers: sites(legacy("cmd/gc/infra_class_migrate.go", "infraMigrationRow"))},
 	// Usage compute attributes a row by its run chain (beadmeta's runIDChainKeys).

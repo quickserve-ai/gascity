@@ -3648,9 +3648,35 @@ func (cs *controllerState) refreshConfigSnapshot() (string, error) {
 
 	cs.mu.RLock()
 	sp := cs.sp
+	prev := cs.cfg
 	cs.mu.RUnlock()
+	// A loaded config skips a patch whose target is gone and only warns
+	// (ga-djvbvp), so one dangling reference cannot stop the city. An API edit
+	// that introduces one is still refused, as upstream's mutation contract
+	// says (ErrPatchTargetNotFound, a 400): mutateAndPoke restores the
+	// previous file.
+	if err := newUnappliedPatch(prev, nextCfg); err != nil {
+		return "", err
+	}
 	cs.updateLocked(nextCfg, sp)
 	return revision, nil
+}
+
+// newUnappliedPatch reports the first unapplied-patch warning next carries
+// that prev did not, as an error wrapping config.ErrPatchTargetNotFound.
+func newUnappliedPatch(prev, next *config.City) error {
+	had := map[string]bool{}
+	if prev != nil {
+		for _, w := range prev.LoadWarnings {
+			had[w] = true
+		}
+	}
+	for _, w := range next.LoadWarnings {
+		if config.IsUnappliedPatchWarning(w) && !had[w] {
+			return fmt.Errorf("%s: %w", w, config.ErrPatchTargetNotFound)
+		}
+	}
+	return nil
 }
 
 func (cs *controllerState) loadCurrentConfigSnapshot() (*config.City, string, error) {
