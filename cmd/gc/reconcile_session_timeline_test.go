@@ -615,6 +615,7 @@ var timelineGoldenRulings = []goldenRuling{
 	{"a managed suspend drains, then wake", "fix #7417 (mc-esqo7)", "61f2ce80feb0"},
 	{"a managed suspend drains, then wake", "fix #7590 (mc-esqo7): the drain's sleep keeps suspended_at (the Sleep cell, NEW2-5)", "e6e0e6743019"},
 	{"a managed suspend drains, then wake", timelineFingerprintV7, "da6d33776ea5"},
+	{"a managed suspend drains, then wake", "carry row gc-hzj5 (#6178 replay): the reconciler publishes its drain ack under its own keys (source, reason, generation), never the agent's GC_DRAIN_ACK, so a legacy drain sets one runtime key fewer", "e6128868b1b4"},
 	{"a manual create read between its two writes", timelineGoldenBaseline, "8c2d0f4552c4"},
 	{"a manual create read between its two writes", timelineFingerprintV7, "544ff5662fa5"},
 	{"a provider swap stops the runtime", timelineGoldenBaseline, "68a5d9d9b0ef"},
@@ -625,16 +626,23 @@ var timelineGoldenRulings = []goldenRuling{
 	{"a waiter sleeps", timelineGoldenBaseline, "6b615dd20429"},
 	{"a waiter sleeps", "fix #7590 (mc-q6x43): the sleep keeps the wait's intent (D-J 3)", "064ac1bc84b8"},
 	{"a waiter sleeps", timelineFingerprintV7, "45ab826dd96e"},
+	{"a waiter sleeps", "carry row gc-hzj5 (#6178 replay): the reconciler publishes its drain ack under its own keys (source, reason, generation), never the agent's GC_DRAIN_ACK, so a legacy drain sets one runtime key fewer; and the fork #59 row (#5561, \"Standing sleep intent survives drain completion\", re-expressed on R7): a wait-parked idle pool seat keeps its slot and claim, so neither engine reports the waiter's own work stranded", "972f3c53c903"},
 	{"an idle on-demand named session sleeps", timelineGoldenBaseline, "2752bd8f4cc4"},
+	{"an idle on-demand named session sleeps", "carry row gc-hzj5 (#6178 replay): the reconciler publishes its drain ack under its own keys (source, reason, generation), never the agent's GC_DRAIN_ACK, so a legacy drain sets one runtime key fewer", "efb8c8b8ccc5"},
 	{"an unwanted row inside, then past, the wake grace", timelineGoldenBaseline, "c4d3c5eb08a0"},
+	{"an unwanted row inside, then past, the wake grace", "carry row gc-hzj5 (#6178 replay): the reconciler publishes its drain ack under its own keys (source, reason, generation), never the agent's GC_DRAIN_ACK, so a legacy drain sets one runtime key fewer", "c26264edc56b"},
 	{"an unwanted row of a suspended agent", timelineGoldenBaseline, "90405aa55ba7"},
+	{"an unwanted row of a suspended agent", "carry row gc-hzj5 (#6178 replay): the reconciler publishes its drain ack under its own keys (source, reason, generation), never the agent's GC_DRAIN_ACK, so a legacy drain sets one runtime key fewer", "dcb257350051"},
 	{"an unwanted row woken by a clock ten minutes ahead", timelineGoldenBaseline, "27e15af2efe9"},
+	{"an unwanted row woken by a clock ten minutes ahead", "carry row gc-hzj5 (#6178 replay): the reconciler publishes its drain ack under its own keys (source, reason, generation), never the agent's GC_DRAIN_ACK, so a legacy drain sets one runtime key fewer", "d1e00d4f811b"},
 	{"an unwanted row woken by a clock two minutes ahead", timelineGoldenBaseline, "7863a5af3820"},
+	{"an unwanted row woken by a clock two minutes ahead", "carry row gc-hzj5 (#6178 replay): the reconciler publishes its drain ack under its own keys (source, reason, generation), never the agent's GC_DRAIN_ACK, so a legacy drain sets one runtime key fewer", "baa6d7a6e388"},
 	{"attach, then detach, then idle", timelineGoldenBaseline, "a8a76fb85cf8"},
 	{"drift deferrals through time", timelineGoldenBaseline, "b7bf2d092994"},
 	{"drift deferrals through time", timelineFingerprintV7, "0a780490c9ee"},
 	{"idle, then sleep, then the next pass", timelineGoldenBaseline, "df4154567a92"},
 	{"idle, then sleep, then the next pass", timelineFingerprintV7, "2cf94220b36f"},
+	{"idle, then sleep, then the next pass", "carry row gc-hzj5 (#6178 replay): the reconciler publishes its drain ack under its own keys (source, reason, generation), never the agent's GC_DRAIN_ACK, so a legacy drain sets one runtime key fewer", "3ae3afb2d511"},
 	{"kill a seat holding a dep-blocked claim", timelineGoldenBaseline, "44f501ec9412"},
 	{"kill a seat holding a ready claim", timelineGoldenBaseline, "a6a3283ef592"},
 	{"kill a seat holding a ready claim", timelineFingerprintV7, "56f71e57af9a"},
@@ -1405,8 +1413,12 @@ func operatorTimeline() []timelineFixture {
 	// R7b2, keeps the wait's intent (D-J 3) rather than leaving a bare
 	// wait_hold. When the wait's dependency closes, legacy wakes it through
 	// the idle latch: the wait's own intent is no explicit sleep intent
-	// (explicitSleepIntentInfo), so its claim is not stranded.
-	waitDrained := tlMerged(tlIdent(), map[string]string{"row:gc-1:*drain": "drain-stop-lag", "row:gc-1:last_woke_at": "drain-stop-lag", "row:gc-1:sleep_reason": "drain-stop-lag"}, map[string]string{"runtime:s-gc-1": "drain-stop-lag", "row:gc-1:state": "drain-stop-lag", "row:gc-1:stranded_event_emitted_at": "drain-stop-lag", "row:gc-1:detached_at": "wait-sleep-lag"})
+	// (explicitSleepIntentInfo), so its claim is not stranded. On the fork,
+	// neither engine reports it stranded while it sleeps either: a wait-parked
+	// idle seat keeps its slot and claim (carry row "Standing sleep intent
+	// survives drain completion", #5561, fork #59), where upstream's legacy
+	// stamped stranded at the drain and v2 a minute later.
+	waitDrained := tlMerged(tlIdent(), map[string]string{"row:gc-1:*drain": "drain-stop-lag", "row:gc-1:last_woke_at": "drain-stop-lag", "row:gc-1:sleep_reason": "drain-stop-lag"}, map[string]string{"runtime:s-gc-1": "drain-stop-lag", "row:gc-1:state": "drain-stop-lag", "row:gc-1:detached_at": "wait-sleep-lag"})
 	napping := func() *config.City {
 		cfg := tlCity()
 		cfg.Agents[0].SleepAfterIdle = "5m"
@@ -1447,11 +1459,9 @@ func operatorTimeline() []timelineFixture {
 				"provider:SetMeta s-gc-1": "drain-env-clears", "provider:RemoveMeta s-gc-1": "drain-env-clears", "provider:Stop s-gc-1": "drain-stop-lag",
 				`event:session.drain_acked_with_assigned_work worker {"bead_id":"gw-1","bead_status":"in_progress","reason":"drain_acked_with_assigned_work","session_id":"gc-1","template":"worker"}`: "drain-stop-lag",
 				`event:session.stopped worker {"reason":"drain acknowledged","session_id":"gc-1","template":"worker"}`:                                                                                 "drain-stop-lag",
-				`event:session.stranded gc-1 {"session_id":"gc-1","session_name":"s-gc-1","template":"worker","work_bead_ids":["gw-1"]}`:                                                               "drain-stop-lag",
 			}),
 			"the wait turns ready": tlMerged(tlIdent(), map[string]string{
 				"row:gc-1:*waitsleep": "wait-sleep-lag", "provider:RemoveMeta s-gc-1": "§12.2#38 start-meta-clears",
-				`event:session.stranded gc-1 {"session_id":"gc-1","session_name":"s-gc-1","template":"worker","work_bead_ids":["gw-1"]}`: "drain-stop-lag",
 			}, nudgeQueued),
 		})
 	return []timelineFixture{suspend, managed, kill(false), kill(true), swap, fence, waiter}
