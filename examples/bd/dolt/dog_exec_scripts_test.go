@@ -5755,6 +5755,70 @@ func TestDoctorReadsBackupFreshnessFromTheManifestNotTheNewestChunk(t *testing.T
 	}
 }
 
+// TestDoctorDatesABackupByTheNewerOfManifestAndSyncStamp pins how the carry's
+// sync-success stamp (ga-g3p5rm) composes with upstream's manifest dating
+// (#7381): the age is the newer of the two, and counts only while the remote
+// holds a manifest.
+//   - idle: an up-to-date sync exits 0 without rewriting the manifest, so a
+//     fresh stamp keeps a database with an old manifest fresh;
+//   - killed: a sync that died leaves fresh chunks and no new stamp, so the
+//     old manifest and the old stamp both say stale;
+//   - never stamped: with no stamp the manifest alone dates it, and the stale
+//     item says no successful sync was recorded;
+//   - stamp only: a stamp beside a remote with no manifest is still missing.
+func TestDoctorDatesABackupByTheNewerOfManifestAndSyncStamp(t *testing.T) {
+	cityPath := t.TempDir()
+	dataDir := filepath.Join(cityPath, "dolt-data")
+	artifactDir := filepath.Join(cityPath, ".dolt-backup")
+	dbs := []string{"idle", "killed", "unstamped", "ghost"}
+	for _, db := range dbs {
+		if err := os.MkdirAll(filepath.Join(dataDir, db, ".dolt"), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", db, err)
+		}
+		if err := os.MkdirAll(filepath.Join(artifactDir, db), 0o755); err != nil {
+			t.Fatalf("mkdir backup remote %s: %v", db, err)
+		}
+	}
+	now := time.Now()
+	old := now.Add(-2 * time.Hour)
+	writeBackupRemoteFile(t, filepath.Join(artifactDir, "idle", "manifest"), old)
+	writeDoctorLocalSyncStamp(t, cityPath, "idle", now)
+	writeBackupRemoteFile(t, filepath.Join(artifactDir, "killed", "manifest"), old)
+	writeBackupRemoteFile(t, filepath.Join(artifactDir, "killed", "chunk.darc"), now)
+	writeDoctorLocalSyncStamp(t, cityPath, "killed", old)
+	writeBackupRemoteFile(t, filepath.Join(artifactDir, "unstamped", "manifest"), old)
+	writeBackupRemoteFile(t, filepath.Join(artifactDir, "ghost", "chunk.darc"), now)
+	writeDoctorLocalSyncStamp(t, cityPath, "ghost", now)
+
+	binDir := t.TempDir()
+	gcLogPath := writeDogFakeGC(t, binDir)
+	writeDoctorFakeDoltWithBackupRemotes(t, binDir, dbs...)
+
+	out := runDogScript(t, "mol-dog-doctor.sh", binDir, cityPath, dataDir, doctorBackupStaleEnv)
+	if !strings.Contains(out, "server: ok") {
+		t.Fatalf("unexpected doctor output:\n%s", out)
+	}
+	gcLog, err := os.ReadFile(gcLogPath)
+	if err != nil {
+		t.Fatalf("read gc log: %v", err)
+	}
+	log := string(gcLog)
+	for _, want := range []string{
+		"killed backup is 2h old",
+		"unstamped backup is 2h old (no successful sync recorded)",
+		"ghost backup missing",
+	} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("want %q in log:\n%s", want, log)
+		}
+	}
+	for _, dontWant := range []string{"idle backup", "killed backup is 2h old (no successful sync recorded)"} {
+		if strings.Contains(log, dontWant) {
+			t.Fatalf("unexpected %q in log:\n%s", dontWant, log)
+		}
+	}
+}
+
 // TestDoctorReportsBackupRemoteWithNoManifestAsMissing asserts a Dolt remote
 // directory holding chunk data but no manifest reports as missing rather than
 // as a backup as fresh as its newest chunk. Nothing in it is restorable: the
