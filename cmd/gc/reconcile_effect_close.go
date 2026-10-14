@@ -396,6 +396,9 @@ type closeReleases struct {
 	now      time.Time
 	alerts   *strandedClaimAlerts
 	stderr   io.Writer
+	// sp is the pass's provider, read only by the cascade's worktree prune for
+	// its liveness veto (ga-1xiv); no provider verb runs through it here.
+	sp runtime.Provider
 }
 
 // release is a work branch's release over the seat's legs, read live.
@@ -466,11 +469,12 @@ func (c *closeReleases) cascade(ctx context.Context, it intent) {
 		strand(c.alerts, releaseSeatOfBead(b), strings.TrimSpace(b.Metadata["state"]), out, c.now, c.stderr)
 	}
 	if it.Closing.Kind == closePoolSlot && c.cfg != nil && ctx.Err() == nil && !c.workDirInUse(store, b) {
-		// No runtime provider for the prune's liveness veto (ga-1xiv): this
-		// close's transaction already re-read the runtime and refuses a live
-		// pane or an unknown liveness (redecideClose), so nil vetoes nothing
-		// the close has not.
-		pruneWorktree(sessionInfoFromBead(b), c.cityPath, c.cfg, nil, c.stderr)
+		// The prune re-reads the runtime itself (ga-1xiv's prune-time veto), with
+		// the close's own provider, as the legacy close does. The close's
+		// transaction read it too, but the cascade runs after the lock and after
+		// the release's store round-trips, and a runtime that came back in that
+		// window must keep its worktree.
+		pruneWorktree(sessionInfoFromBead(b), c.cityPath, c.cfg, c.sp, c.stderr)
 	}
 }
 
@@ -514,7 +518,7 @@ func (c *closeReleases) workDirInUse(store beads.Store, closed beads.Bead) bool 
 func newCloseReleases(w *World, alerts *strandedClaimAlerts, stderr io.Writer) *closeReleases {
 	c := &closeReleases{legs: w.WorkLegs, stores: w.LegStores, cityPath: w.CityPath, now: w.Now, alerts: alerts, stderr: stderr}
 	if w.Env != nil {
-		c.cfg = w.Env.Cfg
+		c.cfg, c.sp = w.Env.Cfg, w.Env.SP
 	}
 	if c.stderr == nil {
 		c.stderr = io.Discard

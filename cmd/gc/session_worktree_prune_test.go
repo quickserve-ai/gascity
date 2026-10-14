@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
@@ -524,6 +525,34 @@ func TestPruneAgentHomeWorktreeIfSafe_LiveRuntimeNeverPruned(t *testing.T) {
 	}
 	if !pruneAgentHomeWorktreeIfSafe(session, fx.cityPath, fx.cfg, sp, &stderr) {
 		t.Fatalf("expected prune after runtime stopped; stderr: %q", stderr.String())
+	}
+}
+
+// TestV2ClosePruneVetoesARuntimeThatCameBack: the v2 close's cascade prunes a
+// pool slot's worker_dir after the close landed, outside its lock and after
+// the release's store round-trips, so it runs ga-1xiv's prune-time liveness
+// veto with the close's own provider, as the legacy close does: a runtime that
+// came back in that window keeps its worktree.
+func TestV2ClosePruneVetoesARuntimeThatCameBack(t *testing.T) {
+	c := newCloseCase(t, livenessGone, desireSleep, "state", "asleep", "sleep_reason", "idle", "slept_at", gatherNow.Add(-time.Hour).Format(time.RFC3339),
+		"work_dir", "/city/.gc/worktrees/repo/worker-1")
+	it := c.decide()
+	if it.Closing.Kind != closePoolSlot {
+		t.Fatalf("closing kind %v, want a pool-slot close (the one that prunes)", it.Closing.Kind)
+	}
+	if err := c.store.Close(c.k.ID); err != nil {
+		t.Fatal(err)
+	}
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "s-close", runtime.Config{}); err != nil {
+		t.Fatalf("fake start: %v", err)
+	}
+	w := *c.w
+	w.Env = &reconcileEnv{SP: sp, Cfg: c.cfg}
+	var stderr bytes.Buffer
+	newCloseReleases(&w, &strandedClaimAlerts{rec: c.rec}, &stderr).cascade(context.Background(), it)
+	if !strings.Contains(stderr.String(), "not pruning worker_dir for s-close: runtime session is live") {
+		t.Fatalf("the v2 prune ran without its liveness veto; stderr: %q", stderr.String())
 	}
 }
 
