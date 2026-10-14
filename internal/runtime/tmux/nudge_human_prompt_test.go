@@ -199,10 +199,14 @@ type panePromptExecutor struct {
 	// afterDebounce, when set, is the screen plain captures show from 200ms
 	// after text went in: a person acting during the paste debounce.
 	afterDebounce string
-	textInAt      time.Time
-	captures      int
-	calls         [][]string
-	enters        int
+	// cleared, when set, is the screen once a clearing press (C-u, sent with
+	// C-k by the verified clear, upstream #6832) lands before any text went
+	// in: the input box emptied.
+	cleared  string
+	textInAt time.Time
+	captures int
+	calls    [][]string
+	enters   int
 }
 
 func (f *panePromptExecutor) execute(args []string) (string, error) {
@@ -298,6 +302,9 @@ func (f *panePromptExecutor) execute(args []string) (string, error) {
 				f.screen = next
 			}
 		}
+		if !tmuxArgsContain(args, "-l") && !f.textIn && f.cleared != "" && tmuxArgsContain(args, "C-u") {
+			f.screen = f.cleared
+		}
 		if !tmuxArgsContain(args, "-l") && args[len(args)-1] == "Enter" {
 			f.enters++
 			if f.onEnter != nil {
@@ -328,9 +335,32 @@ func (f *panePromptExecutor) keyCalls() [][]string {
 	return out
 }
 
+// sentKey reports whether a non-literal send-keys carried key. One call can
+// carry several keys: the verified clear presses C-u C-k together (#6832).
 func (f *panePromptExecutor) sentKey(key string) bool {
 	for _, c := range f.keyCalls() {
-		if !tmuxArgsContain(c, "-l") && c[len(c)-1] == key {
+		if tmuxArgsContain(c, "-l") {
+			continue
+		}
+		for i := len(c) - 1; i >= 0 && c[i] != "-t"; i-- {
+			if c[i] == key && i > 0 && c[i-1] != "-t" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// readInputBoxBeforeText reports whether the input box was read for the clear
+// (a joined, styled capture: captureInputLines) before any text went in.
+func (f *panePromptExecutor) readInputBoxBeforeText() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.calls {
+		if tmuxArgsContain(c, "send-keys") && tmuxArgsContain(c, "-l") || tmuxArgsContain(c, "paste-buffer") {
+			return false
+		}
+		if tmuxArgsContain(c, "capture-pane") && tmuxArgsContain(c, "-J") {
 			return true
 		}
 	}
@@ -521,7 +551,10 @@ func TestNudgeSessionDoesNotReEnterIntoADialogRaisedByTheFirstEnter(t *testing.T
 // composer, and that (and only that) earns a re-send.
 func TestNudgeSessionReEntersOnlyWhileTheTypedTextIsStillDrafted(t *testing.T) {
 	drafted := composerFixture("❯ " + guardTestNudge)
-	fe := &panePromptExecutor{screen: drafted}
+	// The composer is empty until the nudge types; the verified clear before
+	// it (#6832) checks a draft present before typing actually empties.
+	fe := &panePromptExecutor{screen: idleComposerFixture}
+	fe.onType = func(string) string { return drafted }
 	fe.onEnter = func(n int) string {
 		if n == 2 {
 			return busyFixture
@@ -539,7 +572,9 @@ func TestNudgeSessionReEntersOnlyWhileTheTypedTextIsStillDrafted(t *testing.T) {
 }
 
 // TestNudgeSessionDeliversIntoAnIdleComposer is the control: an ordinary idle
-// pane still gets C-u, the text and one Enter, exactly as before.
+// pane still gets the detached clear, the text and one Enter, exactly as
+// before. The clear is upstream's verified one (#6832): it reads the input box
+// and, finding it empty, sends no key into it.
 func TestNudgeSessionDeliversIntoAnIdleComposer(t *testing.T) {
 	fe := &panePromptExecutor{screen: idleComposerFixture}
 	fe.onEnter = func(int) string { return busyFixture }
@@ -548,8 +583,8 @@ func TestNudgeSessionDeliversIntoAnIdleComposer(t *testing.T) {
 	if err := tm.NudgeSession(session, guardTestNudge); err != nil {
 		t.Fatalf("NudgeSession() = %v, want nil", err)
 	}
-	if !fe.sentKey("C-u") {
-		t.Fatal("no C-u clear on a detached idle pane")
+	if !fe.readInputBoxBeforeText() {
+		t.Fatal("no clear on a detached idle pane: the input box was not read before typing")
 	}
 	if typed := fe.typed(); len(typed) != 1 || typed[0] != guardTestNudge {
 		t.Fatalf("typed = %q, want the nudge once", typed)
@@ -564,7 +599,7 @@ func TestNudgeSessionDeliversIntoAnIdleComposer(t *testing.T) {
 // draft on the line is an earlier nudge's lost submit (ga-bwm), and the C-u
 // clear that replaces it is still right (ra-3x46cy).
 func TestNudgeSessionClearsAStaleDraftOnADetachedSession(t *testing.T) {
-	fe := &panePromptExecutor{screen: humanDraftFixture}
+	fe := &panePromptExecutor{screen: humanDraftFixture, cleared: idleComposerFixture}
 	fe.onEnter = func(int) string { return busyFixture }
 	tm, session := newGuardTestTmux(fe)
 
@@ -876,7 +911,9 @@ func TestNudgeSessionCountsEveryAttachedClient(t *testing.T) {
 func TestNudgeSessionDoesNotReEnterOnSomeoneElsesPaste(t *testing.T) {
 	ours := composerFixture("❯ [Pasted text #1 +3 lines]")
 	theirs := composerFixture("❯ [Pasted text #2 +7 lines]")
-	fe := &panePromptExecutor{screen: ours}
+	// Ours shows once the nudge types (the composer was empty before it).
+	fe := &panePromptExecutor{screen: idleComposerFixture}
+	fe.onType = func(string) string { return ours }
 	fe.onEnter = func(n int) string {
 		if n == 1 {
 			return theirs
