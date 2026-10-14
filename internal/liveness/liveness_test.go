@@ -27,6 +27,7 @@ func TestIsKeyCoversTheMovedFieldSet(t *testing.T) {
 		"usage_compute_emitted_at", "usage_model_swept_at",
 		"last_nudge_delivered_at",
 		"idle_claim_nudge_trigger", "idle_claim_nudge_count", "idle_claim_nudge_at",
+		"idle_claim_nudge_token", "idle_claim_nudge_stalled", "idle_claim_nudge_stalled_token",
 		"continuation_claim_nudge_work", "continuation_claim_nudge_root",
 		"continuation_claim_nudge_store_ref", "continuation_claim_nudge_generation",
 		"continuation_claim_nudge_count", "continuation_claim_nudge_at",
