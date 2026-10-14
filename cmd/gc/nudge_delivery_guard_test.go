@@ -25,7 +25,7 @@ func startGuardTestSession(t *testing.T, dir string, fake *runtime.Fake) (sessio
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if err := mgr.Start(context.Background(), info.ID, "", runtime.Config{WorkDir: dir}); err != nil {
+	if err := mgr.Start(context.Background(), testOperatorIn(t, dir), info.ID, "", runtime.Config{WorkDir: dir}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	idleSince := time.Now().Add(-10 * time.Second)

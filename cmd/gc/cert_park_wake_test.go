@@ -221,7 +221,7 @@ func TestCertParkUnreadableLabelsFailTowardWaking(t *testing.T) {
 // while it still owns one in_progress bead.
 func certParkPoolOwnerEnv(t *testing.T, labels []string) (*reconcilerTestEnv, beads.Bead, beads.Bead, *capturingRecorder) {
 	t.Helper()
-	env := newReconcilerTestEnv()
+	env := newReconcilerTestEnv(t)
 	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
 	env.addDesired("worker", "worker", false)
 	session := env.createSessionBead("worker", "worker")
@@ -253,12 +253,11 @@ func runCertParkReconcileTick(t *testing.T, env *reconcilerTestEnv, session, wor
 	row := work
 	row.Labels = nil
 	opts := append([]startExecutionOption{withAssignedWorkStores([]beads.Store{env.store})}, env.startOptions...)
-	return reconcileSessionBeads(
-		context.Background(), []beads.Bead{session}, env.desiredState, nil, env.cfg, env.sp,
-		env.store, nil, []beads.Bead{row}, nil, env.dt, map[string]int{}, false, nil, "",
+	return reconcileSessionBeadsAtPath(
+		context.Background(), env.city, []beads.Bead{session}, env.desiredState, nil, env.cfg, env.sp,
+		env.store, nil, []beads.Bead{row}, nil, nil, env.dt, map[string]int{}, false, nil, "",
 		nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr,
-		opts...,
-	)
+		opts...)
 }
 
 // TestReconcileSessionBeads_CertParkedPoolOwnerStaysAsleepAndKeepsItsBead is the

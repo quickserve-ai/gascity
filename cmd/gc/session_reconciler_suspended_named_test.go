@@ -28,7 +28,7 @@ func suspendedNamedTestCity(suspended bool) *config.City {
 
 func TestReconcileSessionBeads_SuspendedAgentsRunningNamedSessionIsDrained(t *testing.T) {
 	for _, suspended := range []bool{true, false} {
-		env := newReconcilerTestEnv()
+		env := newReconcilerTestEnv(t)
 		env.cfg = suspendedNamedTestCity(suspended)
 		name := "refinery"
 		_ = env.sp.Start(context.Background(), name, runtime.Config{Command: "true"})
@@ -62,7 +62,7 @@ func TestReconcileSessionBeads_SuspendedAgentsRunningNamedSessionIsDrained(t *te
 
 func TestReconcileSessionBeads_SuspendedAgentsMaterializedNamedSessionIsNotStarted(t *testing.T) {
 	for _, suspended := range []bool{true, false} {
-		env := newReconcilerTestEnv()
+		env := newReconcilerTestEnv(t)
 		env.cfg = suspendedNamedTestCity(suspended)
 		name := "refinery"
 		sess := env.createSessionBead(name, "refinery")
@@ -91,7 +91,7 @@ func TestReconcileSessionBeads_SuspendedAgentsMaterializedNamedSessionIsNotStart
 // keep its bead (#6307); the not-suspended control keeps running.
 func TestReconcileSessionBeads_SuspendedAgentHoldingWorkIsStopped(t *testing.T) {
 	for _, suspended := range []bool{true, false} {
-		env := newReconcilerTestEnv()
+		env := newReconcilerTestEnv(t)
 		env.cfg = suspendedNamedTestCity(suspended)
 		name := "refinery"
 		if err := env.sp.Start(context.Background(), name, runtime.Config{Command: "true"}); err != nil {

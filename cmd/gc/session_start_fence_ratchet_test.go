@@ -141,7 +141,7 @@ func scanFenceFunc(fset *token.FileSet, rel, fn string, body *ast.BlockStmt, fin
 				goCalls[x.Call] = true
 			}
 		case *ast.CallExpr:
-			if sessionStartFenceBrackets[calleeName(x.Fun)] {
+			if sessionStartFenceBrackets[ratchetCalleeName(x.Fun)] {
 				brackets = append(brackets, x.Pos())
 			}
 			if sel, ok := x.Fun.(*ast.SelectorExpr); ok {
@@ -259,14 +259,14 @@ func TestSessionStartFenceRatchet_RejectsEscapingShapes(t *testing.T) {
 	}
 }
 
-func calleeName(fun ast.Expr) string {
+func ratchetCalleeName(fun ast.Expr) string {
 	switch f := fun.(type) {
 	case *ast.Ident:
 		return f.Name
 	case *ast.SelectorExpr:
 		return f.Sel.Name
 	case *ast.CallExpr:
-		return calleeName(f.Fun)
+		return ratchetCalleeName(f.Fun)
 	}
 	return ""
 }

@@ -138,6 +138,10 @@ func TestInboxForRoutesRefusesNoRoutes(t *testing.T) {
 }
 
 func TestPinnedSenderMatchesResolvedSenderRoute(t *testing.T) {
+	// The carry verifies every created mail bead with a read of that bead
+	// (ga-0ejdbv, verifyMessageBeadPersisted); this test counts only the
+	// sender route's session reads, so it turns the verification off.
+	t.Setenv("GC_MAIL_VERIFY", "0")
 	for _, from := range []string{"sky", "runtime-sky", "id"} {
 		t.Run(from, func(t *testing.T) {
 			store, p, info := newInboxFixture(t)

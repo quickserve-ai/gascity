@@ -76,7 +76,7 @@ func TestStartupSendPathDoesNotRefuseUnbracketedClaudeText(t *testing.T) {
 	tm := NewTmuxWithConfig(DefaultConfig())
 	tm.exec = fe
 	text := sizedNudge(2048)
-	if err := tm.sendLiteralText("%1", text); err != nil {
+	if err := tm.sendLiteralText(context.Background(), "%1", text); err != nil {
 		t.Fatalf("sendLiteralText() = %v, want nil", err)
 	}
 	if sent := fe.literalSends(); len(sent) != 1 || sent[0] != text {

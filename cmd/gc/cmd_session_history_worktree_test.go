@@ -203,7 +203,7 @@ func TestSessionResumeSeedsTranscriptUnderTaskWorktreeCwd(t *testing.T) {
 	}
 	// The next launch runs in the task worktree, where the transcript already
 	// lives, so the reconciler's stale-resume probe will find it there.
-	if present, _ := staleResumeKeyProbe("claude", fx.worktree, worktreeConvID); !present {
+	if present, _ := staleResumeKeyProbe(nil, "claude", fx.worktree, worktreeConvID); !present {
 		t.Fatalf("stale-resume probe cannot see %s from the launch cwd %s", worktreeConvID, fx.worktree)
 	}
 }
@@ -237,7 +237,7 @@ func TestSessionResumeSeedsPriorKeyTranscriptWithoutCopyingIt(t *testing.T) {
 	if key := got.Metadata["session_key"]; key != worktreeConvID {
 		t.Fatalf("session_key = %q, want seeded %q", key, worktreeConvID)
 	}
-	if present, _ := staleResumeKeyProbe("claude", fx.agentDir, worktreeConvID); present {
+	if present, _ := staleResumeKeyProbe(nil, "claude", fx.agentDir, worktreeConvID); present {
 		t.Fatalf("resume copied %s under the agent dir's projects folder; stdout=%s", worktreeConvID, stdout.String())
 	}
 	if strings.Contains(stdout.String(), "Copied") {

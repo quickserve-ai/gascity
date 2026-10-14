@@ -209,6 +209,9 @@ func (f *panePromptExecutor) execute(args []string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, append([]string(nil), args...))
+	if row, ok := fakeAgentPaneRow(args); ok {
+		return row, nil
+	}
 	switch {
 	case tmuxArgsContain(args, "capture-pane") && tmuxArgsContain(args, "-e"):
 		if f.styledErr != nil {
@@ -233,14 +236,14 @@ func (f *panePromptExecutor) execute(args []string) (string, error) {
 			f.captures++
 		}
 		return f.screen, nil
-	case tmuxArgsContain(args, "#{session_attached}"):
+	case tmuxArgsContain(args, clientCountProbe):
 		if f.clients != "" {
-			return f.clients, nil
+			return countAnswer(args, f.clients), nil
 		}
 		if f.attached {
-			return "1", nil
+			return countAnswer(args, "1"), nil
 		}
-		return "0", nil
+		return countAnswer(args, "0"), nil
 	case tmuxArgsContain(args, "list-clients"):
 		// The session's input high-water mark (list-clients). Unset means
 		// the read answers nothing, as a session with no client does.
@@ -1573,4 +1576,26 @@ func TestNudgePaneDoesNotSubmitAPersonsReplacement(t *testing.T) {
 		t.Fatalf("NudgePane sent Enter %d time(s) onto a person's text", got)
 	}
 	assertDeferred(t, err, NudgeDeferReasonHumanDraft)
+}
+
+// clientCountProbe is the attach probe's format (#{session_name} echoed
+// beside the #{session_attached} count), which the nudge path's client count
+// reads since re-sync #7; a fake answers it with countAnswer.
+const clientCountProbe = "#{session_name}|#{session_attached}"
+
+// countAnswer is the attach probe's answer for args: the probed session's name
+// (from the -t target) and count.
+func countAnswer(args []string, count string) string {
+	name := "s"
+	for i, a := range args {
+		if a == "-t" && i+1 < len(args) {
+			target := strings.TrimPrefix(args[i+1], "=")
+			if n, _, ok := strings.Cut(target, ":"); ok {
+				name = n
+			} else if target != "" {
+				name = target
+			}
+		}
+	}
+	return name + "|" + count
 }
