@@ -3,20 +3,29 @@
 # session-row writes at F1's chokepoint (mc-8s63i): it matches by name and misses the generic writes.
 cmd/gc/cmd_handoff.go 1
 cmd/gc/cmd_prime.go 1
+# Fork carry (re-sync #7, registered at the current count): cmdSessionResume's resume seed, row "gc session history and resume, with prior_session_key" (ga-oe8h).
+cmd/gc/cmd_session_history.go 1
 cmd/gc/cmd_session_wake.go 1
 cmd/gc/cmd_wait.go 1
 cmd/gc/execution_backstop.go 1
 cmd/gc/session_bead_cycle.go 1
-cmd/gc/session_beads.go 5
+# Fork carry: one of the 6 is retireDuplicateConfiguredNamedSessionBeads' pool-shadow retirement, row "Named-session conflict diagnostic and pool-shadow adoption" (ga-dfp1b).
+cmd/gc/session_beads.go 6
 cmd/gc/session_circuit_breaker.go 3
 cmd/gc/session_lifecycle_parallel.go 5
 cmd/gc/session_pool_drain_deadline.go 2
 cmd/gc/session_reconcile.go 12
-cmd/gc/session_reconciler.go 12
+# Fork carry: two of the 14 are clearStaleResetMarkerIfHealthy, row "Reconciler crash policy: lazy FPExtra drift, restart stagger, reset-marker self-heal" (ga-9n5hj, ga-2aq43),
+# and acceptCopyFilesDriftInPlace, row "CopyFiles-only drift accepted in place; handoff before a drift drain" (hq-wi4ka). Both decide on the tick snapshot: re-sync #8 routes them through Commit.
+cmd/gc/session_reconciler.go 14
 cmd/gc/session_sleep.go 4
+# Fork carry: healReleasedWaitHoldReasonInfo, the released wait-hold heal (fork #59, commit 7c12df662), a re-sync #8 drop candidate.
+cmd/gc/session_wait_hold_reason_heal.go 1
 cmd/gc/session_wake.go 1
 cmd/gc/soft_reload.go 1
-internal/session/chat.go 7
+# Fork carry: clearStaleResumeMetadata's three SetMetadata calls are one SetMetadataBatch over a built patch (StampPriorSessionKey, ga-oe8h),
+# which this scanner cannot resolve: the row still takes that raw premise write, the count just cannot see it.
+internal/session/chat.go 4
 internal/session/manager.go 2
 internal/session/runtime_lease.go 2
 internal/session/store.go 4
