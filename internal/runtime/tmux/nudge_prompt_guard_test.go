@@ -76,7 +76,10 @@ func TestNudgeNowSendsNoEnterWhenTheLookBeforeItCannotReadThePane(t *testing.T) 
 	pane := promptGuardPane(t)
 	pane.promptAfterPaste = true
 	pane.captureErr = errors.New("capture-pane: timed out")
-	pane.captureErrAfterPaste = 2 // capture 1 is submitEnterAndConfirm's busy baseline
+	// Capture 4 after the paste is the look before Enter. Before it: the
+	// carry's placeholder-provenance read (1, ga-da5vmz), submitEnterAndConfirm's
+	// busy baseline (2) and the carry's re-send gate's first read (3, ga-ubfc7j).
+	pane.captureErrAfterPaste = 4
 
 	err := nudgeNowText(t, pane, "run the tests")
 	if !errors.Is(err, pane.captureErr) {

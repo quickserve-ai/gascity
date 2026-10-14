@@ -546,10 +546,12 @@ func TestNudgeSessionLeavesAttachedClaudeDraftAlone(t *testing.T) {
 // draft: the human now at the pane may be typing (#5192).
 func TestNudgeSessionStopsClearingWhenClientAttachesMidClear(t *testing.T) {
 	pane := newFakeClaudePane(claudeRestoredDraft)
-	// Capture 4 is the redraw read after the first Ctrl-U Ctrl-K: the nudge
-	// looks for a permission prompt (1) and a dialog (2), then the clear reads
-	// the input box (3) and presses.
-	pane.attachOnCapture = 4
+	// Capture 5 is the redraw read after the first Ctrl-U Ctrl-K: the nudge
+	// runs the carry's human-prompt guard (1, ga-ubfc7j: it must precede every
+	// key, so it is the first read under the lock), looks for a permission
+	// prompt (2) and a dialog (3), then the clear reads the input box (4) and
+	// presses.
+	pane.attachOnCapture = 5
 	tm := newFakeClaudeTmux(pane)
 
 	err := tm.NudgeSession(pane.sessionName, "nudge")
