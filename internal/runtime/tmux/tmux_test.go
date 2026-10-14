@@ -212,6 +212,11 @@ func TestAttachSessionNoStartServerDoesNotSelfRebindAfterProbe(t *testing.T) {
 		var originalServer, replacementServer processTarget
 		var replacementSocket os.FileInfo
 		replacement := NewTmuxWithConfig(cfg)
+		// The replacement deliberately founds a second server beside the live
+		// original after unlinking its socket: the case new-session's orphan
+		// revival (ga-46jb3c) refuses. An injected observer opts this fixture
+		// out of revival; the production observer keeps its verdict real.
+		replacement.serverSocketObserver = observeNamedSocket
 		t.Cleanup(func() {
 			if err := replacement.KillServer(); err != nil && !errors.Is(err, ErrNoServer) {
 				t.Errorf("stop explicit replacement server: %v", err)
