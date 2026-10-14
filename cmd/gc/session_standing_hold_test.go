@@ -28,7 +28,7 @@ import (
 // injects sleep_intent="user-hold" directly rather than letting the drain-ack
 // produce it, which is why the erasure shipped unnoticed.
 func TestReconcileSessionBeads_SuspendHoldSurvivesDrainAckWithAssignedWork(t *testing.T) {
-	env := newReconcilerTestEnv()
+	env := newReconcilerTestEnv(t)
 	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
 	env.addDesired("worker", "worker", true)
 	session := env.createSessionBead("worker", "worker")
@@ -64,12 +64,11 @@ func TestReconcileSessionBeads_SuspendHoldSurvivesDrainAckWithAssignedWork(t *te
 	}
 
 	cfgNames := map[string]bool{"worker": true}
-	woken := reconcileSessionBeads(
-		context.Background(), []beads.Bead{session}, env.desiredState, cfgNames,
-		env.cfg, env.sp, env.store, dops, []beads.Bead{task}, nil, env.dt,
+	woken := reconcileSessionBeadsAtPath(
+		context.Background(), env.city, []beads.Bead{session}, env.desiredState, cfgNames,
+		env.cfg, env.sp, env.store, dops, []beads.Bead{task}, nil, nil, env.dt,
 		map[string]int{"worker": 1}, false, nil, "",
-		nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr, env.startOptions...,
-	)
+		nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr, env.startOptions...)
 	if woken != 0 {
 		t.Fatalf("woken on the drain-ack tick = %d, want 0; stderr=%s", woken, env.stderr.String())
 	}
@@ -95,12 +94,11 @@ func TestReconcileSessionBeads_SuspendHoldSurvivesDrainAckWithAssignedWork(t *te
 	if err != nil {
 		t.Fatalf("Get(%s): %v", session.ID, err)
 	}
-	woken = reconcileSessionBeads(
-		context.Background(), []beads.Bead{final}, env.desiredState, cfgNames,
-		env.cfg, env.sp, env.store, nil, []beads.Bead{task}, nil, env.dt,
+	woken = reconcileSessionBeadsAtPath(
+		context.Background(), env.city, []beads.Bead{final}, env.desiredState, cfgNames,
+		env.cfg, env.sp, env.store, nil, []beads.Bead{task}, nil, nil, env.dt,
 		map[string]int{"worker": 1}, false, nil, "",
-		nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr, env.startOptions...,
-	)
+		nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr, env.startOptions...)
 	if woken != 0 {
 		t.Errorf("woken on the tick after the drain-ack = %d, want 0 (a suspended seat with assigned work must stay asleep until `gc session wake`); stderr=%s",
 			woken, env.stderr.String())
@@ -122,12 +120,11 @@ func TestReconcileSessionBeads_SuspendHoldSurvivesDrainAckWithAssignedWork(t *te
 	if err != nil {
 		t.Fatalf("Get(%s): %v", session.ID, err)
 	}
-	woken = reconcileSessionBeads(
-		context.Background(), []beads.Bead{awake}, env.desiredState, cfgNames,
-		env.cfg, env.sp, env.store, nil, []beads.Bead{task}, nil, env.dt,
+	woken = reconcileSessionBeadsAtPath(
+		context.Background(), env.city, []beads.Bead{awake}, env.desiredState, cfgNames,
+		env.cfg, env.sp, env.store, nil, []beads.Bead{task}, nil, nil, env.dt,
 		map[string]int{"worker": 1}, false, nil, "",
-		nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr, env.startOptions...,
-	)
+		nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr, env.startOptions...)
 	if woken != 1 {
 		t.Errorf("woken after `gc session wake` = %d, want 1 (the release must bring the seat back); stderr=%s", woken, env.stderr.String())
 	}
@@ -148,7 +145,7 @@ func TestReconcileSessionBeads_SuspendHoldSurvivesDrainAckWithAssignedWork(t *te
 // uses: tick 1 begins the drain on a live session with no wake reason, then the
 // clock crosses defaultDrainTimeout and tick 2 stops the runtime and completes.
 func TestReconcileSessionBeads_WaitHoldSurvivesDrainTimeout(t *testing.T) {
-	env := newReconcilerTestEnv()
+	env := newReconcilerTestEnv(t)
 	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
 	env.addDesired("worker", "worker", true)
 	session := env.createSessionBead("worker", "worker")
@@ -166,12 +163,11 @@ func TestReconcileSessionBeads_WaitHoldSurvivesDrainTimeout(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Get(%s): %v", session.ID, err)
 		}
-		reconcileSessionBeads(
-			context.Background(), []beads.Bead{got}, env.desiredState,
+		reconcileSessionBeadsAtPath(
+			context.Background(), env.city, []beads.Bead{got}, env.desiredState,
 			configuredSessionNames(env.cfg, "", env.store), env.cfg, env.sp, env.store,
-			nil, nil, nil, env.dt, map[string]int{}, false, nil, "",
-			nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr, env.startOptions...,
-		)
+			nil, nil, nil, nil, env.dt, map[string]int{}, false, nil, "",
+			nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr, env.startOptions...)
 	}
 
 	// Tick 1: no wake reason and an explicit sleep intent, so the seat drains
@@ -222,7 +218,7 @@ func TestReconcileSessionBeads_WaitHoldSurvivesDrainTimeout(t *testing.T) {
 // gone with `held_until`. A wait-hold is released by the wait's own resolution,
 // not by this timer, so it is deliberately not cleared here.
 func TestReconcileSessionBeads_ExpiredSuspendHoldReleasesUserHoldIntent(t *testing.T) {
-	env := newReconcilerTestEnv()
+	env := newReconcilerTestEnv(t)
 	// An enabled idle-sleep policy is what makes the surviving intent decisive:
 	// after the drain-ack the seat is asleep with sleep_reason=idle, so config
 	// suppression applies and only the assigned-work demand override can beat it.
@@ -257,24 +253,22 @@ func TestReconcileSessionBeads_ExpiredSuspendHoldReleasesUserHoldIntent(t *testi
 		if err != nil {
 			t.Fatalf("Get(%s): %v", session.ID, err)
 		}
-		return reconcileSessionBeads(
-			context.Background(), []beads.Bead{got}, env.desiredState, cfgNames,
-			env.cfg, env.sp, env.store, nil, []beads.Bead{task}, nil, env.dt,
+		return reconcileSessionBeadsAtPath(
+			context.Background(), env.city, []beads.Bead{got}, env.desiredState, cfgNames,
+			env.cfg, env.sp, env.store, nil, []beads.Bead{task}, nil, nil, env.dt,
 			map[string]int{"worker": 1}, false, nil, "",
-			nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr, env.startOptions...,
-		)
+			nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr, env.startOptions...)
 	}
 
 	dops := newFakeDrainOps()
 	if err := dops.setDrainAck("worker"); err != nil {
 		t.Fatalf("setDrainAck: %v", err)
 	}
-	if woken := reconcileSessionBeads(
-		context.Background(), []beads.Bead{session}, env.desiredState, cfgNames,
-		env.cfg, env.sp, env.store, dops, []beads.Bead{task}, nil, env.dt,
+	if woken := reconcileSessionBeadsAtPath(
+		context.Background(), env.city, []beads.Bead{session}, env.desiredState, cfgNames,
+		env.cfg, env.sp, env.store, dops, []beads.Bead{task}, nil, nil, env.dt,
 		map[string]int{"worker": 1}, false, nil, "",
-		nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr, env.startOptions...,
-	); woken != 0 {
+		nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr, env.startOptions...); woken != 0 {
 		t.Fatalf("woken on the drain-ack tick = %d, want 0; stderr=%s", woken, env.stderr.String())
 	}
 	got := env.reconcileStopPendingToTerminal(t, env.sp, session, dops, cfgNames)
@@ -333,7 +327,7 @@ func TestReconcileSessionBeads_StandingHoldKeepsPoolSlotAndClaim(t *testing.T) {
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			env := newReconcilerTestEnv()
+			env := newReconcilerTestEnv(t)
 			env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
 			env.addDesired("worker", "worker", true)
 			session := env.createSessionBead("worker", "worker")
@@ -368,12 +362,11 @@ func TestReconcileSessionBeads_StandingHoldKeepsPoolSlotAndClaim(t *testing.T) {
 			if err := dops.setDrainAck("worker"); err != nil {
 				t.Fatalf("setDrainAck: %v", err)
 			}
-			if woken := reconcileSessionBeads(
-				context.Background(), []beads.Bead{session}, env.desiredState, cfgNames,
-				env.cfg, env.sp, env.store, dops, []beads.Bead{task}, nil, env.dt,
+			if woken := reconcileSessionBeadsAtPath(
+				context.Background(), env.city, []beads.Bead{session}, env.desiredState, cfgNames,
+				env.cfg, env.sp, env.store, dops, []beads.Bead{task}, nil, nil, env.dt,
 				map[string]int{"worker": 1}, false, nil, "",
-				nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr, env.startOptions...,
-			); woken != 0 {
+				nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr, env.startOptions...); woken != 0 {
 				t.Fatalf("woken on the drain-ack tick = %d, want 0; stderr=%s", woken, env.stderr.String())
 			}
 			got := env.reconcileStopPendingToTerminal(t, env.sp, session, dops, cfgNames)
@@ -384,7 +377,7 @@ func TestReconcileSessionBeads_StandingHoldKeepsPoolSlotAndClaim(t *testing.T) {
 				t.Errorf("sleep_reason after drain-ack = %q, want %q (the pool gate reads the reason, so a held seat must not read as idle)",
 					reason, tt.intent)
 			}
-			if info := env.sessionInfo(session.ID); isPoolSessionSlotFreeableInfo(info) {
+			if info := env.sessionInfo(session.ID); isPoolSessionSlotFreeableInfo(info, env.clk.Now()) {
 				t.Errorf("a %s-held pool seat reads as slot-freeable (state=%q sleep_reason=%q); the reaper will take its slot",
 					tt.intent, info.MetadataState, info.SleepReason)
 			}
@@ -397,12 +390,11 @@ func TestReconcileSessionBeads_StandingHoldKeepsPoolSlotAndClaim(t *testing.T) {
 				if err != nil {
 					t.Fatalf("Get(%s): %v", session.ID, err)
 				}
-				reconcileSessionBeads(
-					context.Background(), []beads.Bead{cur}, env.desiredState, cfgNames,
-					env.cfg, env.sp, env.store, nil, []beads.Bead{task}, nil, env.dt,
+				reconcileSessionBeadsAtPath(
+					context.Background(), env.city, []beads.Bead{cur}, env.desiredState, cfgNames,
+					env.cfg, env.sp, env.store, nil, []beads.Bead{task}, nil, nil, env.dt,
 					map[string]int{"worker": 1}, false, nil, "",
-					nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr, env.startOptions...,
-				)
+					nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr, env.startOptions...)
 			}
 
 			final, err := env.store.Get(session.ID)

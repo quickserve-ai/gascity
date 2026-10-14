@@ -55,7 +55,7 @@ func resetMarkerTestSetup(env *reconcilerTestEnv, age time.Duration) beads.Bead 
 }
 
 func TestClearStaleResetMarkerIfHealthy_ClearsForAttachedSession(t *testing.T) {
-	env := newReconcilerTestEnv()
+	env := newReconcilerTestEnv(t)
 	session := resetMarkerTestSetup(env, time.Hour)
 	env.sp.SetAttached("worker", true)
 
@@ -79,7 +79,7 @@ func TestClearStaleResetMarkerIfHealthy_ClearsForAttachedSession(t *testing.T) {
 }
 
 func TestClearStaleResetMarkerIfHealthy_ClearsForActivityAfterReset(t *testing.T) {
-	env := newReconcilerTestEnv()
+	env := newReconcilerTestEnv(t)
 	session := resetMarkerTestSetup(env, time.Hour)
 	// Runtime not attached, but provider observed activity well after the
 	// reset commit + startup window — the conversation running now began
@@ -142,7 +142,7 @@ func TestClearStaleResetMarkerIfHealthy_KeepsMarker(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			env := newReconcilerTestEnv()
+			env := newReconcilerTestEnv(t)
 			session := resetMarkerTestSetup(env, tc.age)
 			tc.setup(env)
 
@@ -167,7 +167,7 @@ func TestClearStaleResetMarkerIfHealthy_KeepsMarker(t *testing.T) {
 // change drifted every agent's FPExtra, the guards held for ~2.5h, and on
 // guard expiry the reconciler rolled the entire roster mid-work (ga-9n5hj).
 func TestReconcileSessionBeads_ConfigDriftFPExtraOnlyIsLazy(t *testing.T) {
-	env := newReconcilerTestEnv()
+	env := newReconcilerTestEnv(t)
 	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
 	// Desired/current config has NO FingerprintExtra; the session started
 	// with one — the only drifted field is FPExtra.
@@ -210,7 +210,7 @@ func TestReconcileSessionBeads_ConfigDriftFPExtraOnlyIsLazy(t *testing.T) {
 // check's scope: drift that includes a non-lazy field (Command) keeps the
 // existing drain behavior even when FPExtra also drifted.
 func TestReconcileSessionBeads_ConfigDriftCommandStaysEager(t *testing.T) {
-	env := newReconcilerTestEnv()
+	env := newReconcilerTestEnv(t)
 	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
 	env.addRunningWorkerDesiredWithNewConfig() // current Command: new-cmd
 	session := env.createSessionBead("worker", "worker")
@@ -264,7 +264,7 @@ func staggerTestNamedSession(env *reconcilerTestEnv, name string) beads.Bead {
 // defers the rest to later ticks. The 2026-07-18 crash rolled ~17 sessions
 // in one sweep, which also cycled the tmux server (ga-9n5hj).
 func TestReconcileSessionBeads_ConfigDriftRestartsStaggered(t *testing.T) {
-	env := newReconcilerTestEnv()
+	env := newReconcilerTestEnv(t)
 	names := []string{"crew-a", "crew-b", "crew-c", "crew-d"}
 	agents := make([]config.Agent, 0, len(names))
 	for _, n := range names {
@@ -347,7 +347,7 @@ func findMessageBeads(t *testing.T, store beads.Store, assignee string) []beads.
 // existed, and a count-the-beads assertion cannot see that. The body assertion
 // below is the guarantee that was missing, not an extra.
 func TestSendConfigDriftHandoffMail(t *testing.T) {
-	env := newReconcilerTestEnv()
+	env := newReconcilerTestEnv(t)
 	body := configDriftHandoffBody("qcore/worker", []string{"model", "prompt"}, time.Unix(1700000000, 0).UTC())
 	sendConfigDriftHandoffMail(env.store, env.rec, "qcore/worker", body, &env.stderr)
 	msgs := findMessageBeads(t, env.store, "qcore/worker")
@@ -490,7 +490,7 @@ func TestConfigDriftCopyFilesOnly(t *testing.T) {
 // rebaselined so the next tick sees no drift. 2026-08-20 the eager path
 // drained all 14 crew sessions over a one-line script edit.
 func TestReconcileSessionBeads_ConfigDriftCopyFilesOnlyAcceptedInPlace(t *testing.T) {
-	env := newReconcilerTestEnv()
+	env := newReconcilerTestEnv(t)
 	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
 	// Desired config: a probed CopyFiles entry whose content changed. The
 	// session started with the OLD content hash; only CopyFiles drifts.
@@ -541,7 +541,7 @@ func TestReconcileSessionBeads_ConfigDriftCopyFilesOnlyAcceptedInPlace(t *testin
 // the in-place accept's scope: drift that includes a non-CopyFiles field
 // (Command) keeps the drain behavior even when CopyFiles also drifted.
 func TestReconcileSessionBeads_ConfigDriftCopyFilesPlusCommandStaysEager(t *testing.T) {
-	env := newReconcilerTestEnv()
+	env := newReconcilerTestEnv(t)
 	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
 	env.addDesiredCopyFilesWithCommand("worker", "worker", "new-cmd", "new-content-hash")
 	session := env.createSessionBead("worker", "worker")
@@ -576,7 +576,7 @@ func TestReconcileSessionBeads_ConfigDriftCopyFilesPlusCommandStaysEager(t *test
 // draining, so the rebuilt session can recover its context instead of losing
 // the conversation. 2026-08-19/20 the fleet drained with no handoff.
 func TestReconcileSessionBeads_ConfigDriftDrainRecordsHandoff(t *testing.T) {
-	env := newReconcilerTestEnv()
+	env := newReconcilerTestEnv(t)
 	env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
 	env.addRunningWorkerDesiredWithNewConfig() // eager Command drift
 	session := env.createSessionBead("worker", "worker")

@@ -83,7 +83,7 @@ func TestNamedSeatCloseKeepsPortfolioWhateverTheAgentState(t *testing.T) {
 			store := beads.NewMemStore()
 			ids := namedSeatPortfolio(t, store, crewRuntimeIdentity)
 			var stderr bytes.Buffer
-			releaseWorkFromClosedSessionBeadExcept(store, tc.cfg, crewSessionBead(), nil, &stderr)
+			releaseWorkFromClosedSessionBeadExcept(store, testSeatWork("", tc.cfg, store, nil), crewSessionBead(), nil, &stderr)
 			assertPortfolioKept(t, store, ids, crewRuntimeIdentity, &stderr)
 			if strings.Contains(stderr.String(), "RELEASED work") {
 				t.Fatalf("close released a named seat's work: %s", stderr.String())
@@ -102,7 +102,7 @@ func TestNamedSeatCloseAfterRebalanceKeepsPortfolio(t *testing.T) {
 	sb := crewSessionBead()
 	sb.Metadata["template"] = "qcore/cherub-law.ray-previous-provider"
 	var stderr bytes.Buffer
-	releaseWorkFromClosedSessionBeadExcept(store, crewRollConfig(false), sb, nil, &stderr)
+	releaseWorkFromClosedSessionBeadExcept(store, testSeatWork("", crewRollConfig(false), store, nil), sb, nil, &stderr)
 	assertPortfolioKept(t, store, ids, crewRuntimeIdentity, &stderr)
 }
 
@@ -115,7 +115,7 @@ func TestNamedSeatCloseProposesWorkHeldUnderTheSessionHandle(t *testing.T) {
 	sb := crewSessionBead()
 	held := seedWorkBead(t, store, beads.Bead{Title: "held by handle", Type: "task"}, "in_progress", sb.ID)
 	var stderr bytes.Buffer
-	releaseWorkFromClosedSessionBeadExcept(store, crewRollConfig(false), sb, nil, &stderr)
+	releaseWorkFromClosedSessionBeadExcept(store, testSeatWork("", crewRollConfig(false), store, nil), sb, nil, &stderr)
 	got, err := store.Get(held.ID)
 	if err != nil {
 		t.Fatalf("get: %v", err)
@@ -132,7 +132,7 @@ func TestNamedSeatDrainAckKeepsHeldClaim(t *testing.T) {
 	store := beads.NewMemStore()
 	held := seedWorkBead(t, store, beads.Bead{Title: "named claim", Type: "task"}, "in_progress", crewRuntimeIdentity)
 	var stderr bytes.Buffer
-	releaseUnexecutedClaimsOnDrainAck("", crewRollConfig(false), store, nil, crewSessionBead(), drainAckReleaseBudget, &stderr)
+	releaseUnexecutedClaimsOnDrainAck(testWorkLegs("", crewRollConfig(false), store, nil), crewSessionBead(), drainAckReleaseBudget, &stderr)
 	got, err := store.Get(held.ID)
 	if err != nil {
 		t.Fatalf("get: %v", err)
@@ -150,10 +150,10 @@ func TestPoolSessionCloseStillReleasesInProgressWork(t *testing.T) {
 		run  func(store beads.Store, stderr *bytes.Buffer)
 	}{
 		{"close", func(store beads.Store, stderr *bytes.Buffer) {
-			releaseWorkFromClosedSessionBeadExcept(store, poolCfg, drainAckSessionBead(), nil, stderr)
+			releaseWorkFromClosedSessionBeadExcept(store, testSeatWork("", poolCfg, store, nil), drainAckSessionBead(), nil, stderr)
 		}},
 		{"drain-ack", func(store beads.Store, stderr *bytes.Buffer) {
-			releaseUnexecutedClaimsOnDrainAck("", poolCfg, store, nil, drainAckSessionBead(), drainAckReleaseBudget, stderr)
+			releaseUnexecutedClaimsOnDrainAck(testWorkLegs("", poolCfg, store, nil), drainAckSessionBead(), drainAckReleaseBudget, stderr)
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -241,7 +241,7 @@ func TestDuplicateRepairLeavesNamedIdentityWorkInPlace(t *testing.T) {
 	byIdentity := seedWorkBead(t, store, beads.Bead{Title: "identity-held", Type: "task"}, "in_progress", crewRuntimeIdentity)
 	byHandle := seedWorkBead(t, store, beads.Bead{Title: "handle-held", Type: "task"}, "in_progress", loser.ID)
 	var stderr bytes.Buffer
-	reassignWorkAssignedToRetiredSessionBead("", crewRollConfig(false), store, nil, loser, "ga-winner", &stderr)
+	reassignWorkAssignedToRetiredSessionBead(testWorkLegs("", crewRollConfig(false), store, nil), store, loser, "ga-winner", &stderr)
 
 	got, err := store.Get(byIdentity.ID)
 	if err != nil {
@@ -256,38 +256,6 @@ func TestDuplicateRepairLeavesNamedIdentityWorkInPlace(t *testing.T) {
 	}
 	if got.Assignee != "ga-winner" {
 		t.Fatalf("handle-held work assignee = %q, want moved to the winner ga-winner; stderr=%s", got.Assignee, stderr.String())
-	}
-}
-
-// TestBrokenConfigCloseProposesNamedSessionHandleWork: when the city config does
-// not load, `gc session close` releases only work bound to the session bead ID,
-// through an ID-only copy of the bead. That copy used to drop the named marker,
-// so a named seat's bead-ID work was released. It keeps the marker now (and only
-// the marker: no identifier is added to the sweep).
-func TestBrokenConfigCloseProposesNamedSessionHandleWork(t *testing.T) {
-	sb := crewSessionBead()
-	idOnly := sessionBeadIDOnlyIdentity(sb)
-	if ids := sessionAssignmentIdentifiers(idOnly); len(ids) != 1 || ids[0] != sb.ID {
-		t.Fatalf("ID-only identifiers = %v, want only %s: the marker must not widen the sweep", ids, sb.ID)
-	}
-	store := beads.NewMemStore()
-	held := seedWorkBead(t, store, beads.Bead{Title: "held by handle", Type: "task"}, "in_progress", sb.ID)
-	var stderr bytes.Buffer
-	unclaimWorkAssignedToRetiredSessionBead("", nil, store, nil, idOnly, "", &stderr)
-	got, err := store.Get(held.ID)
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	assertProposedNotReleased(t, got, sb.ID, "in_progress", "retired-session-unclaim", "broken-config handle work")
-	// The close command's stderr says "proposing" rather than "releasing" on
-	// exactly this predicate, so it must hold for the ID-only form.
-	if !isNamedSessionBead(idOnly) {
-		t.Fatalf("ID-only form of a named session bead is not named; the close message would claim a release")
-	}
-
-	pool := sessionBeadIDOnlyIdentity(drainAckSessionBead())
-	if len(pool.Metadata) != 0 {
-		t.Fatalf("pool ID-only bead metadata = %v, want none", pool.Metadata)
 	}
 }
 

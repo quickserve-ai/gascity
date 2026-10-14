@@ -574,7 +574,7 @@ func newClaudeDispatchSeat(t *testing.T, answers ...bool) *claudeDispatchSeat {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if err := mgr.Start(context.Background(), info.ID, "", gcruntime.Config{WorkDir: dir}); err != nil {
+	if err := mgr.Start(context.Background(), testOperatorIn(t, dir), info.ID, "", gcruntime.Config{WorkDir: dir}); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	tdir := filepath.Join(home, ".claude", "projects", sessionlog.ProjectSlug(dir))

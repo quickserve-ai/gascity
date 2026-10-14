@@ -771,7 +771,7 @@ func TestCloseEffectEdges(t *testing.T) {
 	t.Run("past its deadline a cascade neither prunes nor clears the current claim (D9, D10)", func(t *testing.T) {
 		pruned := 0
 		orig := pruneWorktree
-		pruneWorktree = func(session.Info, string, *config.City, io.Writer) { pruned++ }
+		pruneWorktree = func(session.Info, string, *config.City, runtime.Provider, io.Writer) { pruned++ }
 		t.Cleanup(func() { pruneWorktree = orig })
 		for _, past := range []bool{false, true} {
 			c := newCloseCase(t, livenessGone, desireSleep, "state", "asleep", "sleep_reason", "idle", "slept_at", gatherNow.Add(-time.Hour).Format(time.RFC3339),

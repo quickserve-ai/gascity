@@ -527,9 +527,9 @@ type surveyPeekFailsExecutor struct {
 }
 
 func (f *surveyPeekFailsExecutor) execute(args []string) (string, error) {
-	if slices.Contains(args, "display-message") && slices.Contains(args, "#{session_attached}") {
+	if slices.Contains(args, "display-message") && slices.Contains(args, clientCountProbe) {
 		f.calls = append(f.calls, slices.Clone(args))
-		return "0", nil
+		return countAnswer(args, "0"), nil
 	}
 	if slices.Contains(args, "send-keys") && slices.Contains(args, "C-u") {
 		f.cleared = true

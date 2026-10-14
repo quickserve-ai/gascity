@@ -2380,7 +2380,9 @@ func TestProcessRetryEvalRetriesDistinctInvalidWorkerResultContracts(t *testing.
 func TestProcessRetryEvalHardFailsUnknownFailureClass(t *testing.T) {
 	t.Parallel()
 
-	store := newStrictCloseStore()
+	// bd's close policy, as upstream's settle-order tests use (#7450 settles
+	// the logical bead, which the eval still blocks, before closing the eval).
+	store := newBdClosePolicyStore()
 	root := mustCreateWorkflowBead(t, store, beads.Bead{
 		Title: "workflow",
 		Type:  "task",

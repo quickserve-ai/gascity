@@ -1191,7 +1191,7 @@ func TestReleaseConfirmedOrphanSessionWork_ReleasesTrimmedSeatUnderItsStableAlia
 
 	released := releaseConfirmedOrphanSessionWork(cfg, cityStore, rigStores,
 		[]beads.Bead{seat, foreign},
-		[]beads.Store{rigStore, rigStore},
+		[]beads.Store{rigStore, rigStore}, nil,
 		session.Info{
 			ID:                  "gc-seat",
 			SessionNameMetadata: "worker-gc-nux",
@@ -1199,8 +1199,7 @@ func TestReleaseConfirmedOrphanSessionWork_ReleasesTrimmedSeatUnderItsStableAlia
 			Template:            "repo/worker",
 			PoolSlot:            "2",
 			PoolManaged:         true,
-		},
-	)
+		})
 	if len(released) != 1 || released[0].ID != seat.ID {
 		t.Fatalf("released = %v, want exactly [%s] (the orphaned seat's own alias claim)", released, seat.ID)
 	}

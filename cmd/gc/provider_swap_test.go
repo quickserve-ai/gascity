@@ -824,7 +824,7 @@ func TestEnqueuedAsyncStartIsCountedUntilItReturns(t *testing.T) {
 			context.Background(),
 			[]asyncPreparedStart{{item: item, release: func() { <-gate }, tracker: &tracker}},
 			testCity, runtime.NewFake(), store, nil, clk, events.NewFake(), postStartTimeout, 1, io.Discard, io.Discard, nil, nil,
-			immediateStartStabilityWaiter, immediateSessionStaleKeyDetectionWaiter, nil,
+			immediateStartStabilityWaiter, immediateSessionStaleKeyDetectionWaiter, nil, nil,
 		)
 		synctest.Wait()
 		if err := tracker.waitLaunchedStarts(context.Background(), 0); err == nil {

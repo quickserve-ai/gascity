@@ -369,7 +369,12 @@ func TestAsleepHealPatchMatchesLegacy(t *testing.T) {
 						info.CreatedAt = gatherNow.Add(-time.Hour)
 						info.ConfiguredNamedSession, info.ConfiguredNamedMode = mode != "", mode
 						info.SessionOrigin, info.ManualSessionMetadata = manual.SessionOrigin, manual.ManualSessionMetadata
-						if got, want := asleepHealPatch(info), legacyHeal(info); !maps.Equal(got, want) {
+						got, want := asleepHealPatch(info), legacyHeal(info)
+						// The carry's seeded-resume latch (gc session resume) rides
+						// ConversationResetPatch, which v2's heal uses; legacy's inline
+						// reset list never cleared it (as at the old carry).
+						delete(got, session.ResumeSeededKey())
+						if !maps.Equal(got, want) {
 							t.Errorf("%s/%q/%+v/%q/%+v: patch %v, legacy %v", state, reason, cont, mode, manual, got, want)
 						}
 					}

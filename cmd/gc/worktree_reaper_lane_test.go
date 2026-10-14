@@ -471,6 +471,7 @@ func TestSessionStartFence_BracketsControllerStarts(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			store := beads.NewMemStore()
+			city := t.TempDir()
 			fence := &sessionStartFence{}
 			sp := &fenceObservingProvider{Fake: runtime.NewFake(), fence: fence}
 			mgr := newSessionManagerWithConfig("", store, sp, nil)
@@ -490,14 +491,16 @@ func TestSessionStartFence_BracketsControllerStarts(t *testing.T) {
 			if async {
 				done := make(chan struct{})
 				enqueuePreparedStartWaveForCity(context.Background(), []asyncPreparedStart{{item: item, done: func() { close(done) }}},
-					"", sp, store, nil, clock.Real{}, events.Discard, 10*time.Second, 0, io.Discard, io.Discard, nil, nil, nil, nil, nil, fence)
+					city, sp, store, nil, clock.Real{}, events.Discard, 10*time.Second, 0, io.Discard, io.Discard, nil, nil, nil, nil, nil, fence)
 				select {
 				case <-done:
 				case <-time.After(20 * time.Second):
 					t.Fatal("async start did not finish")
 				}
 			} else {
-				executePreparedStartWave(context.Background(), []preparedStart{item}, sp, store, 10*time.Second, withSessionStartFence(fence))
+				leased, release := leasedStart(t, city, item)
+				executePreparedStartWaveForCity(context.Background(), []preparedStart{leased}, city, sp, store, nil, 10*time.Second, 1, withSessionStartFence(fence))
+				release()
 			}
 			if sp.starts.Load() == 0 {
 				t.Fatal("provider Start was never called; the test did not exercise a start")

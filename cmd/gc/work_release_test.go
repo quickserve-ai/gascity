@@ -32,6 +32,8 @@ func TestReleasePoliciesTable(t *testing.T) {
 		releaseStrandedRepair: {statuses: []string{"open", "in_progress"}, lane: laneCarried, seatRoute: true},
 		releaseOrphan:         {statuses: []string{"open", "in_progress"}, lane: laneDirect, pool: true},
 		releaseRetired:        {statuses: []string{"open", "in_progress"}, lane: laneCarried, seatRoute: true},
+		// The carry's drain-ack teardown (ga-x99xh0).
+		releaseDrainAckTeardown: {statuses: []string{"open", "in_progress"}, lane: laneCarried, seatRoute: true},
 	}
 	if !reflect.DeepEqual(releasePolicies, want) {
 		t.Fatalf("releasePolicies = %+v\nwant %+v", releasePolicies, want)
@@ -196,7 +198,7 @@ func TestReleasePathsKeepEveryStrand(t *testing.T) {
 		for _, sc := range strandCases {
 			assigned = append(assigned, c.claim[sc.name])
 		}
-		releaseConfirmedOrphanSessionWork(c.cfg, c.store, nil, assigned, nil, c.info())
+		releaseConfirmedOrphanSessionWork(c.cfg, c.store, nil, assigned, nil, nil, c.info())
 		c.assertStrandTable(t, "open")
 	})
 	t.Run("dead assignee", func(t *testing.T) {

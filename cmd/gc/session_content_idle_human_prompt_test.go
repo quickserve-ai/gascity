@@ -95,7 +95,7 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel`
 				t.Fatalf("fixture not rendered: capture=%q, err=%v", captured, err)
 			}
 
-			env := newReconcilerTestEnv()
+			env := newReconcilerTestEnv(t)
 			rec := events.NewFake()
 			env.rec = rec
 			env.cfg = &config.City{Agents: []config.Agent{{Name: "worker"}}}
@@ -112,12 +112,11 @@ Enter to select · Tab/Arrow keys to navigate · Esc to cancel`
 				if err != nil {
 					t.Fatal(err)
 				}
-				reconcileSessionBeads(
-					context.Background(), []beads.Bead{current}, env.desiredState,
+				reconcileSessionBeadsAtPath(
+					context.Background(), env.city, []beads.Bead{current}, env.desiredState,
 					configuredSessionNames(env.cfg, "", env.store), env.cfg, sp, env.store,
-					nil, nil, nil, env.dt, map[string]int{}, false, nil, "",
-					it, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr,
-				)
+					nil, nil, nil, nil, env.dt, map[string]int{}, false, nil, "",
+					it, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr)
 			}
 			tick()
 			env.clk.Advance(2 * time.Minute)

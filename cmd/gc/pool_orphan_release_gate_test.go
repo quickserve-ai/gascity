@@ -410,7 +410,7 @@ func TestPoolOrphanReleaseGate_DisabledRigDoesNotWedgeCityOrphanClose(t *testing
 		stdout:              io.Discard,
 		stderr:              io.Discard,
 	}
-	cr.beadReconcileTick(context.Background(), DesiredStateResult{
+	cr.beadReconcileTick(context.Background(), newSeatWork(cr.workLegs()), DesiredStateResult{
 		State:                 map[string]TemplateParams{},
 		AssignedWorkBeads:     []beads.Bead{work},
 		AssignedWorkStores:    []beads.Store{store},

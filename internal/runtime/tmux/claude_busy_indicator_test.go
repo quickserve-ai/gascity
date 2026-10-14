@@ -81,8 +81,11 @@ func TestPaneContainsBusyIndicatorClaudeHookAndBackgroundShapes(t *testing.T) {
 		"done_worked_for":        {[]string{"✻ Worked for 3m 38s", rule, "❯\u00a0", rule}, false},
 		"waiting_for_background": {[]string{"✻ Waiting for 2 background agents to finish", rule, "❯\u00a0", rule}, false},
 		"done_brewed_for":        {[]string{"✻ Brewed for 48s · done 11:19 PM · 1 shell still running", rule, "❯\u00a0", rule}, false},
+		// Upstream #5977 (claudeBareGerundSpinnerRe) reads a glyph-led gerund
+		// line anywhere in the capture as busy, a stale frame included, by
+		// design; the three scrollback cases below follow it (re-sync #7).
 		"bare_head_in_scrollback": {append(append([]string{"✢ Deliberating…"},
-			strings.Split(strings.Repeat("  later output\n", 30), "\n")...), rule, "❯\u00a0", rule), false},
+			strings.Split(strings.Repeat("  later output\n", 30), "\n")...), rule, "❯\u00a0", rule), true},
 		// Column-0 status or prose lines ending in an ellipsis are not
 		// spinners: only Claude's spinner glyphs count.
 		"check_mark_status":     {[]string{"✓ Done…", rule, "❯\u00a0", rule}, false},
@@ -97,7 +100,7 @@ func TestPaneContainsBusyIndicatorClaudeHookAndBackgroundShapes(t *testing.T) {
 		// Later assistant output means the spinner above it is stale.
 		"spinner_then_assistant_output": {[]string{
 			"✶ Proofing… (running UserPromptSubmit hooks… 1/2 · 3s)", "⏺ Done.", rule, "❯\u00a0", rule,
-		}, false},
+		}, true},
 		// The phrase anywhere but the live spinner line above the composer is
 		// history or quoted text, not a running hook.
 		"test_source_line": {[]string{
@@ -111,9 +114,9 @@ func TestPaneContainsBusyIndicatorClaudeHookAndBackgroundShapes(t *testing.T) {
 		"tool_output": {[]string{
 			"  ⎿  ✶ Proofing… (running UserPromptSubmit hooks… 1/2 · 3s)",
 			"     ✶ Proofing… (running UserPromptSubmit hooks… 2/2 · 4s)", rule, "❯\u00a0", rule,
-		}, false},
+		}, true}, // upstream #5977: an indented glyph-led gerund line reads busy
 		"spinner_in_scrollback": {append(append([]string{"✶ Proofing… (running UserPromptSubmit hooks… 1/2 · 3s)"},
-			strings.Split(strings.Repeat("  later output\n", 30), "\n")...), rule, "❯\u00a0", rule, "  user@host /tmp/work"), false},
+			strings.Split(strings.Repeat("  later output\n", 30), "\n")...), rule, "❯\u00a0", rule, "  user@host /tmp/work"), true},
 		"idle_background_agents_ticking": {[]string{
 			"✻ Waiting for 2 background agents to finish", rule, "❯\u00a0draft text", rule,
 			"  >>  seat * ga-xxxxxx · opus-5.5·high · ctx ██▍·· 48% 482k/1M [acct]",

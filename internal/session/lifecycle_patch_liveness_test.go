@@ -34,7 +34,7 @@ func TestHotPatchBuildersEmitOnlyLivenessKeys(t *testing.T) {
 		"ClearWakeBlockersPatch":      ClearWakeBlockersPatch(StateSuspended, string(SleepReasonUserHold), now),
 		"ClearExpiredHoldPatch":       ClearExpiredHoldPatch(string(SleepReasonUserHold)),
 		"ClearExpiredQuarantinePatch": ClearExpiredQuarantinePatch(string(SleepReasonQuarantine)),
-		"QuarantinePatch":             QuarantinePatch(now.Add(time.Hour), 3),
+		"QuarantinePatch":             QuarantinePatch(3),
 		"PreWakePatch": PreWakePatch(PreWakePatchInput{
 			Generation:        4,
 			InstanceToken:     "tok-1",

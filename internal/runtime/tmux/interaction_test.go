@@ -928,7 +928,7 @@ func TestSnapshotPaneIdle_ApprovalPromptIsNotIdle(t *testing.T) {
 	// either, so the scan reports it indeterminate rather than busy.
 	fe := &fakeExecutor{agentPane: true, out: readApprovalFixture(t, "bash-manual-80x24.txt")}
 	tm := &Tmux{exec: fe}
-	idle, err := tm.snapshotPaneIdleWithPrefix("s", DefaultReadyPromptPrefix)
+	idle, err := tm.snapshotPaneIdleWithPrefix("s", DefaultReadyPromptPrefix, false)
 	if idle {
 		t.Fatal("pane showing a permission prompt reported idle")
 	}
@@ -937,7 +937,7 @@ func TestSnapshotPaneIdle_ApprovalPromptIsNotIdle(t *testing.T) {
 	}
 
 	fe.out = readApprovalFixture(t, "idle-after-deny-80x24.txt")
-	idle, err = tm.snapshotPaneIdleWithPrefix("s", DefaultReadyPromptPrefix)
+	idle, err = tm.snapshotPaneIdleWithPrefix("s", DefaultReadyPromptPrefix, false)
 	if err != nil {
 		t.Fatalf("snapshotPaneIdleWithPrefix: %v", err)
 	}

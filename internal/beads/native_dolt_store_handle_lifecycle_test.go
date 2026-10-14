@@ -195,7 +195,10 @@ func startGet(store *NativeDoltStore, id string) <-chan error {
 
 func startUpdate(store *NativeDoltStore, id string) <-chan error {
 	done := make(chan error, 1)
-	go func() { done <- store.Update(id, UpdateOpts{}) }()
+	// A real field: since upstream #7049 an empty update is a row read and
+	// no write, so it would never open the transaction these tests hold.
+	title := "updated"
+	go func() { done <- store.Update(id, UpdateOpts{Title: &title}) }()
 	return done
 }
 
@@ -681,7 +684,8 @@ func TestNativeDoltStoreHandleLifecycleStress(t *testing.T) {
 				case 0:
 					_, err = store.Get("gc-fail")
 				case 1:
-					err = store.Update(fmt.Sprintf("gc-w-%d", w), UpdateOpts{})
+					title := "updated"
+					err = store.Update(fmt.Sprintf("gc-w-%d", w), UpdateOpts{Title: &title})
 				default:
 					_, err = store.Get(fmt.Sprintf("gc-%d-%d", w, i))
 				}

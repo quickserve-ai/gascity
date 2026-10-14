@@ -73,7 +73,7 @@ func driftWaveMailCount(t *testing.T, env *reconcilerTestEnv, recipient string) 
 // budget is first exceeded, and that the still-rolling wave on the next
 // tick does not mail again.
 func TestReconcileSessionBeads_ConfigDriftWaveMailsOncePerWave(t *testing.T) {
-	env := newReconcilerTestEnv()
+	env := newReconcilerTestEnv(t)
 	env.cfg = &config.City{Session: config.SessionConfig{DriftWaveNotify: "gastown.mayor"}}
 	sessions := driftWaveMailTestSessions(env, 4)
 
@@ -111,7 +111,7 @@ func TestReconcileSessionBeads_ConfigDriftWaveMailsOncePerWave(t *testing.T) {
 // beads ARE present here and must not be mistaken for the gated coordinator
 // notice.
 func TestReconcileSessionBeads_ConfigDriftWaveNoRecipientNoMail(t *testing.T) {
-	env := newReconcilerTestEnv()
+	env := newReconcilerTestEnv(t)
 	sessions := driftWaveMailTestSessions(env, 4)
 
 	env.reconcile(sessions)

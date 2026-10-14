@@ -29,6 +29,9 @@ type bracketedPasteExecutor struct {
 
 func (f *bracketedPasteExecutor) execute(args []string) (string, error) {
 	f.calls = append(f.calls, append([]string(nil), args...))
+	if row, ok := fakeAgentPaneRow(args); ok {
+		return row, nil
+	}
 	switch {
 	case tmuxArgsContain(args, "#{bracket_paste_flag}"):
 		return f.pasteFlag, f.pasteFlagErr

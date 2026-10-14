@@ -154,7 +154,7 @@ func TestSweptSessionTransitionsWriteNoVersionedMetadata(t *testing.T) {
 		{"request-wake", sessionpkg.RequestWakePatch("demand", now)},
 		{"complete-drain", sessionpkg.CompleteDrainPatch(now, "drain_complete", false)},
 		{"acknowledge-drain", sessionpkg.AcknowledgeDrainPatch(now, false)},
-		{"quarantine", sessionpkg.QuarantinePatch(now.Add(time.Hour), 3)},
+		{"quarantine", sessionpkg.QuarantinePatch(3)},
 		{"pre-wake", sessionpkg.PreWakePatch(sessionpkg.PreWakePatchInput{
 			Generation:        4,
 			InstanceToken:     "tok-1",

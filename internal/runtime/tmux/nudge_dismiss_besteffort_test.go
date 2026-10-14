@@ -65,7 +65,7 @@ func TestDismissMidSessionDialogBeforeNudge_SendErrorIsSwallowed(t *testing.T) {
 	if !slices.Contains(fe.calls[1], "capture-pane") {
 		t.Errorf("second call = %v, want the pre-key capture-pane re-read", fe.calls[1])
 	}
-	if !slices.Contains(fe.calls[2], "#{session_attached}") {
+	if !slices.Contains(fe.calls[2], clientCountProbe) {
 		t.Errorf("third call = %v, want the detached check", fe.calls[2])
 	}
 	if !slices.Contains(fe.calls[3], "send-keys") {
@@ -155,8 +155,8 @@ func (d *dialogThenSilentExecutor) execute(args []string) (string, error) {
 	}
 	// Detached: the pre-nudge dismissal runs only on a session nobody is
 	// attached to (ga-ubfc7j), which is the case this test models.
-	if slices.Contains(args, "#{session_attached}") {
-		return "0", nil
+	if slices.Contains(args, clientCountProbe) {
+		return countAnswer(args, "0"), nil
 	}
 	return "", nil
 }

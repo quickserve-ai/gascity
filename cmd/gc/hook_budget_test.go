@@ -150,7 +150,7 @@ func (f hookBudgetFixture) sendMail(t *testing.T, subject string) {
 func (f hookBudgetFixture) autoHandoff(t *testing.T) {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
-	if code := cmdHandoffWithForce([]string{"context cycle"}, "", true, "", false, &stdout, &stderr); code != 0 {
+	if code := cmdHandoffWithFrom([]string{"context cycle"}, "", "", true, "", false, &stdout, &stderr); code != 0 {
 		t.Fatalf("gc handoff --auto = %d; stderr=%s", code, stderr.String())
 	}
 	resetHookBudgetProcessState(t)
@@ -356,7 +356,7 @@ func hookBudgetScenarios() []hookBudgetScenario {
 		{name: "prime --hook/auto-handoff", seed: handoff, run: primeHook, ceiling: hookBudgetCeiling{Requests: 13, Opens: 1, SessionGets: 1, GetMisses: 0}, wantStdout: "context cycle"},
 		{name: "prime --hook/auto-handoff and mail", seed: handoffAndMail, run: primeHook, ceiling: hookBudgetCeiling{Requests: 13, Opens: 1, SessionGets: 1, GetMisses: 0}, wantStdout: "status please"},
 		{name: "handoff --auto", seed: none, ceiling: hookBudgetCeiling{Requests: 6, Opens: 1, SessionGets: 1, GetMisses: 0}, run: func(_ *testing.T, _ hookBudgetFixture, stdout, stderr io.Writer) int {
-			return cmdHandoffWithForce([]string{"context cycle"}, "", true, "", false, stdout, stderr)
+			return cmdHandoffWithFrom([]string{"context cycle"}, "", "", true, "", false, stdout, stderr)
 		}},
 		{name: "mail send human", seed: none, ceiling: hookBudgetCeiling{Requests: 6, Opens: 1, SessionGets: 1, GetMisses: 0}, run: func(_ *testing.T, _ hookBudgetFixture, stdout, stderr io.Writer) int {
 			return cmdMailSend([]string{"human"}, false, false, "", "", "done", "work finished", stdout, stderr)

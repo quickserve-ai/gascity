@@ -236,7 +236,7 @@ func TestWorktreeReaperLane_InProcessAPIWakeAfterScanIsProtected(t *testing.T) {
 				t.Errorf("worker handle: %v", herr)
 				return liveWorktreeState{scanned: true}
 			}
-			if serr := handle.Start(context.Background()); serr != nil {
+			if serr := handle.Start(context.Background(), testOperatorIn(t, cityPath)); serr != nil {
 				t.Errorf("API-style wake: %v", serr)
 			}
 		}

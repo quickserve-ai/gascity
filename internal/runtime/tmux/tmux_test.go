@@ -4465,8 +4465,8 @@ func (g guardIdleExecutor) execute(args []string) (string, error) {
 	switch {
 	case tmuxArgsContain(args, "capture-pane"):
 		return idleComposerFixture, nil
-	case tmuxArgsContain(args, "#{session_attached}"):
-		return "0", nil
+	case tmuxArgsContain(args, clientCountProbe):
+		return countAnswer(args, "0"), nil
 	case tmuxArgsContain(args, "show-environment") && tmuxArgsContain(args, sessionReadyPromptEnvKey):
 		return "", errors.New("unknown variable: " + sessionReadyPromptEnvKey)
 	}
