@@ -207,6 +207,9 @@ func otherFailurePatch(row session.Info, meta map[string]string, f startFailureR
 		backstop, count := resumeBackstop(failures, kept, f.resume)
 		if !kept || backstop {
 			maps.Copy(patch, session.ConversationResetPatch(true))
+			// The carry's history pointer (ga-oe8h): the reset keeps the key
+			// it clears as prior_session_key, as legacy's recordWakeFailure does.
+			session.StampPriorSessionKeyInfo(patch, row)
 			count = 0
 		}
 		maps.Copy(patch, resumeFailuresPatch(row, count))
