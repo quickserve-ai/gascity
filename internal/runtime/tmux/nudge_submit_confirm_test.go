@@ -653,7 +653,11 @@ type agentPaneExecutor struct {
 	attached string
 	pane     []string
 	after    []string
-	calls    [][]string
+	// beforeText, when set, is the capture until the nudge's text goes in
+	// (a literal send-keys or a paste): the composer before typing.
+	beforeText []string
+	textIn     bool
+	calls      [][]string
 }
 
 func (e *agentPaneExecutor) execute(args []string) (string, error) {
@@ -669,8 +673,13 @@ func (e *agentPaneExecutor) execute(args []string) (string, error) {
 		return e.session + "|" + e.attached, nil
 	case slices.Contains(args, "show-environment") && slices.Contains(args, "GC_PROVIDER"):
 		return "GC_PROVIDER=" + e.provider, nil
+	case slices.Contains(args, "send-keys") && slices.Contains(args, "-l"), slices.Contains(args, "paste-buffer"):
+		e.textIn = true
 	case slices.Contains(args, "capture-pane"):
 		lines := e.pane
+		if e.beforeText != nil && !e.textIn {
+			lines = e.beforeText
+		}
 		if e.after != nil && e.submitEnters() == submitEnterMaxSends && e.capturesSinceLastEnter() > submitConfirmPollsPerSend {
 			lines = e.after
 		}
@@ -751,6 +760,8 @@ func TestNudgeSessionClaudeStagedDraftStaysUnconfirmed(t *testing.T) {
 		{"attached pane skips recovery", "staged-claude-attached", "1", submitEnterMaxSends},
 		{"failing attachment probe skips recovery", "staged-claude-probe-error", "", submitEnterMaxSends},
 	}
+	// The composer is empty until the nudge types (ga-ubfc7j defers on text there before typing).
+	emptyBefore := []string{"● Done.", "────", "❯\u00a0", "────", "  ⏵⏵ bypass permissions on"}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// The bubble creates this session's nudge lock channel; drop it so
@@ -762,6 +773,9 @@ func TestNudgeSessionClaudeStagedDraftStaysUnconfirmed(t *testing.T) {
 					provider: "claude",
 					attached: tt.attached,
 					pane:     []string{"● Done.", "────", "❯\u00a0[Pasted text #1 +42 lines]", "────", "  ⏵⏵ bypass permissions on"},
+				}
+				if tt.attached != "0" {
+					ex.beforeText = emptyBefore
 				}
 				tm := &Tmux{cfg: DefaultConfig(), exec: ex}
 
@@ -812,6 +826,10 @@ func TestNudgeSessionClaudeBusyThroughoutIsNotCredited(t *testing.T) {
 					provider: "claude",
 					attached: tt.attached,
 					pane:     slices.Concat(turn, tt.composer, footer),
+				}
+				if tt.attached != "0" {
+					// The composer is empty until the nudge types (ga-ubfc7j defers on text there before typing).
+					ex.beforeText = slices.Concat(turn, []string{"────", "❯\u00a0"}, footer)
 				}
 				tm := &Tmux{cfg: DefaultConfig(), exec: ex}
 
