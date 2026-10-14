@@ -16,6 +16,7 @@
 package acceptance_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -513,14 +514,20 @@ func TestSchedulerLagOnly(t *testing.T) {
 			t.Errorf("%s: schedulerLagOnly = %v, want %v", tc.name, got, tc.want)
 		}
 	}
+	t.Run("never-fired orders", testNeverFiredOrders)
 }
 
-// TestNeverFiredOrders pins which orders the deferred first-firing assertion
-// waits on, and when it stops waiting.
-func TestNeverFiredOrders(t *testing.T) {
+// testNeverFiredOrders pins which orders the deferred first-firing assertion
+// waits on, and when it stops waiting. It runs as a subtest of
+// TestSchedulerLagOnly: rules_go shards top-level tests round-robin in source
+// order, and a new top-level test would move the heavy tests the shard guard
+// keeps apart.
+func testNeverFiredOrders(t *testing.T) {
 	report := func(details ...string) doctorReport {
-		return doctorReport{Results: []doctorCheckResult{{Name: "order-firing-current",
-			Message: "scheduled orders are stale", Details: details}}}
+		return doctorReport{Results: []doctorCheckResult{{
+			Name:    "order-firing-current",
+			Message: "scheduled orders are stale", Details: details,
+		}}}
 	}
 	got := neverFiredOrders(report(
 		"gate-sweep: never fired since controller start 1m ago",
@@ -547,18 +554,24 @@ func TestNeverFiredOrders(t *testing.T) {
 	}
 	// Reads that judged nothing are no evidence of a firing.
 	for name, r := range map[string]doctorReport{
-		"timed out": {Results: []doctorCheckResult{{Name: "order-firing-current", Status: "error",
-			Severity: "advisory", TimedOut: true}}},
-		"early error": {Results: []doctorCheckResult{{Name: "order-firing-current", Status: "error",
-			Message: "read order firing events: boom"}}},
+		"timed out": {Results: []doctorCheckResult{{
+			Name: "order-firing-current", Status: "error",
+			Severity: "advisory", TimedOut: true,
+		}}},
+		"early error": {Results: []doctorCheckResult{{
+			Name: "order-firing-current", Status: "error",
+			Message: "read order firing events: boom",
+		}}},
 		"no result": {},
 	} {
 		if still := stillNeverFired(r, orders); len(still) != 1 {
 			t.Errorf("%s: stillNeverFired = %v, want [gate-sweep]", name, still)
 		}
 	}
-	green := doctorReport{Results: []doctorCheckResult{{Name: "order-firing-current", Status: "ok",
-		Message: "all scheduled orders are current", Details: []string{"20 other scheduled order(s) current"}}}}
+	green := doctorReport{Results: []doctorCheckResult{{
+		Name: "order-firing-current", Status: "ok",
+		Message: "all scheduled orders are current", Details: []string{"20 other scheduled order(s) current"},
+	}}}
 	if still := stillNeverFired(green, orders); len(still) != 0 {
 		t.Errorf("green read: stillNeverFired = %v, want none", still)
 	}
@@ -616,9 +629,16 @@ func neverFiredOrders(report doctorReport) []string {
 // controller start): an order that long unfired was skipped, not late. Each
 // poll is a `gc doctor` run, so it also counts in any bd-call tally taken
 // around this helper.
+//
+// `gc doctor` is a black-box boundary with no completion signal for an order's
+// first firing, so this polls it (TESTING.md: a context-aware ticker, failing
+// with the last observed state). Boundary owner: this helper.
 func awaitFirstFirings(t *testing.T, city *helpers.City, label string, orders []string) {
 	t.Helper()
-	deadline := time.Now().Add(schedulerColdStart)
+	ctx, cancel := context.WithTimeout(context.Background(), schedulerColdStart)
+	defer cancel()
+	tick := time.NewTicker(15 * time.Second)
+	defer tick.Stop()
 	for {
 		out, _ := city.GC("doctor", "--json")
 		var report doctorReport
@@ -628,11 +648,12 @@ func awaitFirstFirings(t *testing.T, city *helpers.City, label string, orders []
 			t.Logf("on %s: %s fired after the tolerated doctor read", label, strings.Join(orders, ", "))
 			return
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("on %s: %s still never fired %s after the tolerated doctor read: a skipped order, not scheduler lag\n%s",
+		select {
+		case <-ctx.Done():
+			t.Fatalf("on %s: %s still never fired %s after the tolerated doctor read: a skipped order, not scheduler lag\nlast doctor read:\n%s",
 				label, strings.Join(still, ", "), schedulerColdStart, out)
+		case <-tick.C:
 		}
-		time.Sleep(15 * time.Second)
 	}
 }
 
