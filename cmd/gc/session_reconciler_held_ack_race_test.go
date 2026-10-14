@@ -67,7 +67,7 @@ func TestWoodhouseHeartbeatHoldPreservesConcurrentAgentAck(t *testing.T) {
 				t.Fatal(err)
 			}
 			provider := &ackAtFirstRemovalProvider{Provider: env.sp}
-			reconcileSessionBeadsAtPath(context.Background(), "", []beads.Bead{got}, nil, nil, env.cfg, provider, env.store,
+			reconcileSessionBeadsAtPath(context.Background(), env.city, []beads.Bead{got}, nil, nil, env.cfg, provider, env.store,
 				newDrainOps(provider), nil, nil, nil, env.dt, map[string]int{}, false, nil, "", nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr)
 			if !provider.fired || provider.ackErr != nil {
 				t.Fatalf("agent acknowledgment did not complete at the cancellation boundary: fired=%v error=%v removals=%v", provider.fired, provider.ackErr, provider.keys)
@@ -97,7 +97,7 @@ func TestWoodhouseHeartbeatHoldPreservesConcurrentAgentAck(t *testing.T) {
 				t.Fatal(err)
 			}
 			before := env.stdout.Len()
-			reconcileSessionBeadsAtPath(context.Background(), "", []beads.Bead{got}, nil, nil, env.cfg, env.sp, env.store,
+			reconcileSessionBeadsAtPath(context.Background(), env.city, []beads.Bead{got}, nil, nil, env.cfg, env.sp, env.store,
 				newDrainOps(env.sp), nil, nil, nil, env.dt, map[string]int{}, false, nil, "", nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr)
 			if tail := env.stdout.String()[before:]; strings.Contains(tail, "(heartbeat hold)") {
 				t.Fatalf("the hold canceled again over the agent's surviving ack: %s", tail)
@@ -121,7 +121,7 @@ func TestWoodhouseHeartbeatHoldPreservesConcurrentAgentAck(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			reconcileSessionBeadsAtPath(context.Background(), "", []beads.Bead{got}, nil, nil, env.cfg, env.sp, env.store,
+			reconcileSessionBeadsAtPath(context.Background(), env.city, []beads.Bead{got}, nil, nil, env.cfg, env.sp, env.store,
 				newDrainOps(env.sp), nil, nil, nil, env.dt, map[string]int{}, false, nil, "", nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr)
 			got, err = env.store.Get(session.ID)
 			if err != nil {

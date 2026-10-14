@@ -11,6 +11,7 @@ import (
 	"github.com/gastownhall/gascity/internal/clock"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/runtime"
+	sessionpkg "github.com/gastownhall/gascity/internal/session"
 )
 
 // newUndesiredPoolSeat builds a live pool-managed seat that has no entry in
@@ -358,12 +359,15 @@ func TestAdvanceSessionDrains_HeartbeatHeldPoolSeatSurvivesOrphanDeadline(t *tes
 	}
 
 	// Same seat, but the agent acked the drain: the hold yields and the
-	// deadline force-stop proceeds as before.
+	// deadline force-stop proceeds as before. The force-stop executes against
+	// the drain's basis (upstream #7519, R8a), so the drain carries the row it
+	// began on, as beginSessionDrainInfo records it.
 	dt.set(b.ID, &drainState{
 		startedAt:  now.Add(-60 * time.Second),
 		deadline:   now.Add(-10 * time.Second),
 		reason:     "orphaned",
 		generation: 3,
+		basis:      sessionpkg.Decide(sessionInfoFromBead(mustGetBead(t, store, b.ID)), sessionpkg.FactsLegacyStopPending),
 	})
 	for key, value := range map[string]string{reconcilerDrainAckSourceKey: drainAckSourceAgentValue, "GC_DRAIN_ACK": "1"} {
 		if err := sp.SetMeta("worker", key, value); err != nil {
@@ -424,11 +428,13 @@ func TestReconcileSessionBeads_HeartbeatHoldLeavesAckWhenProvenanceUnreadable(t 
 	}
 
 	// Drain scan, same seat, deadline passed: the hold yields, the stop proceeds.
+	// The force-stop executes against the drain's basis (upstream #7519, R8a).
 	env.dt.set(session.ID, &drainState{
 		startedAt:  env.clk.Now().Add(-defaultDrainTimeout - time.Minute),
 		deadline:   env.clk.Now().Add(-time.Minute),
 		reason:     "orphaned",
 		generation: 1,
+		basis:      sessionpkg.Decide(env.sessionInfo(session.ID), sessionpkg.FactsLegacyStopPending),
 	})
 	advanceSessionDrainsWithSessionsTraced(env.city, env.dt, sp, env.store, infoLookupFromBeadLookup(func(id string) *beads.Bead {
 		b, _ := env.store.Get(id)
