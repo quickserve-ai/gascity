@@ -177,11 +177,15 @@ func TestNudgeSessionReportsARefusedReSendUnconfirmed(t *testing.T) {
 		}
 		return nil
 	}
-	// The text never reaches the input box, so Enter submits nothing, the pane
-	// never turns busy, and the submit is re-sent.
-	dropText := func(string, string, time.Duration) error { return nil }
+	// The text reaches the input box and the first Enter is dropped, so the
+	// draft stays, the pane never turns busy, and the submit is re-sent.
+	pane.swallowEnter = true // ga-ubfc7j re-sends only while our text is still drafted.
+	typeText := func(target, text string, _ time.Duration) error {
+		_, err := tm.run("send-keys", "-t", paneTarget(target), "-l", text)
+		return err
+	}
 
-	err := tm.nudgeSession(pane.sessionName, "run the tests", dropText,
+	err := tm.nudgeSession(pane.sessionName, "run the tests", typeText,
 		func(string) bool { return false }, func(string) []string { return []string{"Enter"} }, look)
 	if !errors.Is(err, ErrNudgeSubmitUnconfirmed) {
 		t.Fatalf("nudgeSession = %v, want ErrNudgeSubmitUnconfirmed", err)
