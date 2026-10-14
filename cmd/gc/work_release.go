@@ -49,6 +49,10 @@ const (
 	releaseOrphan // the confirmed orphan and the dead-assignee sweep: one policy
 	releaseRetired
 	releaseLadder // the work ladder's release of an unstarted claim (PHASE1-2 §6.5)
+	// releaseDrainAckTeardown is the carry's drain-ack teardown of a pool seat
+	// that acked holding work (ga-x99xh0): unlike D5's drain-ack it gives back
+	// open claims too, since the seat is closed in the same act.
+	releaseDrainAckTeardown
 )
 
 // laneRule says when a released claim's route counts as served.
@@ -109,18 +113,22 @@ var releasePolicies = map[releaseWhy]releasePolicy{
 	releaseOrphan:         {statuses: openOrStarted, lane: laneDirect, pool: true},
 	releaseRetired:        {statuses: openOrStarted, lane: laneCarried, seatRoute: true},
 	releaseLadder:         {statuses: startedOnly, lane: laneCarried, seatRoute: true},
+	// The carry's drain-ack teardown (ga-x99xh0): the seat closes in the same
+	// act, so its open claims are given back too, as on the stranded repair.
+	releaseDrainAckTeardown: {statuses: openOrStarted, lane: laneCarried, seatRoute: true},
 }
 
 // releaseAuditPaths labels each release path on the audit line a landed
 // release writes (ReleaseWorkBead, ga-9n8hjv), so a successful release is never
 // silent. The orphan paths write through releaseOrphanedPoolAssignment instead.
 var releaseAuditPaths = map[releaseWhy]string{
-	releaseKilledSeat:     "killed-seat-unexecuted-claim",
-	releaseDrainAck:       "draining-session-unexecuted-claim",
-	releaseCloseCascade:   "closing-session-release",
-	releaseStrandedRepair: "stranded-pool-worker-repair",
-	releaseOrphan:         "orphan",
-	releaseRetired:        "retired-session-unclaim",
+	releaseKilledSeat:       "killed-seat-unexecuted-claim",
+	releaseDrainAck:         "draining-session-unexecuted-claim",
+	releaseCloseCascade:     "closing-session-release",
+	releaseStrandedRepair:   "stranded-pool-worker-repair",
+	releaseOrphan:           "orphan",
+	releaseRetired:          "retired-session-unclaim",
+	releaseDrainAckTeardown: drainAckTeardownReleasePath,
 }
 
 // Why a claim was kept or failed.
@@ -257,6 +265,18 @@ type ReleaseOutcome struct {
 	Why                    map[string]string // by bead ID, for Kept and Failed
 	Route                  map[string]string // by bead ID, for a claim kept unserved: the route it would take
 	Refused                bool              // RefuseStarted refused the release: Kept are the started claims
+}
+
+// withheld counts the claims kept because the named-release guard proposed
+// them instead (ga-9n8hjv fence #1): still owned, by a named agent.
+func (o ReleaseOutcome) withheld() int {
+	n := 0
+	for _, k := range o.Kept {
+		if o.Why[k.bead.ID] == keptNamedProposed {
+			n++
+		}
+	}
+	return n
 }
 
 // strandedClaim is one claim kept because no lane serves it.
