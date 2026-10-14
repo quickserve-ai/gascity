@@ -99,7 +99,7 @@ func TestMailSendUnconfirmedReturns202AndReplaysWithoutResend(t *testing.T) {
 	prov := &countingWriteMailProvider{Provider: state.cityMailProv, writeErr: unconfirmedWriteErr("send", "gc-unc-send")}
 	state.cityMailProv = prov
 	h := newTestCityHandler(t, state)
-	body := `{"from":"mayor","to":"worker","subject":"s","body":"b"}`
+	body := `{"from":"human","to":"worker","subject":"s","body":"b"}`
 
 	first := decodeMailMessage(t, postMailWithKey(t, h, cityURL(state, "/mail"), body, "unc-send-1", http.StatusAccepted))
 	if first.ID != "gc-unc-send" {
@@ -158,7 +158,7 @@ func TestMailSendNotPersistedStays500AndReleasesKey(t *testing.T) {
 	prov := &countingWriteMailProvider{Provider: state.cityMailProv, writeErr: lostWriteErr("send", "gc-lost-send")}
 	state.cityMailProv = prov
 	h := newTestCityHandler(t, state)
-	body := `{"from":"mayor","to":"worker","subject":"s","body":"b"}`
+	body := `{"from":"human","to":"worker","subject":"s","body":"b"}`
 
 	first := postMailWithKey(t, h, cityURL(state, "/mail"), body, "lost-send-1", http.StatusInternalServerError)
 	if strings.Contains(first.String(), "mail_unconfirmed") {
