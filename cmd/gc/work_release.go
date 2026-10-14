@@ -120,13 +120,20 @@ var releasePolicies = map[releaseWhy]releasePolicy{
 
 // releaseAuditPaths labels each release path on the audit line a landed
 // release writes (ReleaseWorkBead, ga-9n8hjv), so a successful release is never
-// silent. The orphan paths write through releaseOrphanedPoolAssignment instead.
+// silent, and on the proposal a withheld one stamps
+// (gc.release_proposed_path). The orphan paths write through
+// releaseOrphanedPoolAssignment, under the label it has always proposed with.
+// orphanReleaseAuditPath labels both orphan releases (the dead-assignee
+// sweep and the confirmed-orphan close) wherever they propose: in
+// releaseListed and in releaseOrphanedPoolAssignment's own guard check.
+const orphanReleaseAuditPath = "orphaned-pool-assignment"
+
 var releaseAuditPaths = map[releaseWhy]string{
 	releaseKilledSeat:       "killed-seat-unexecuted-claim",
 	releaseDrainAck:         "draining-session-unexecuted-claim",
 	releaseCloseCascade:     "closing-session-release",
 	releaseStrandedRepair:   "stranded-pool-worker-repair",
-	releaseOrphan:           "orphan",
+	releaseOrphan:           orphanReleaseAuditPath,
 	releaseRetired:          "retired-session-unclaim",
 	releaseDrainAckTeardown: drainAckTeardownReleasePath,
 }
@@ -257,6 +264,12 @@ type ReleaseOpts struct {
 	// released, and the outcome is Refused with those claims Kept. A seat's
 	// own drain-ack uses it: it must finish such work before it acks.
 	RefuseStarted bool
+	// Audit receives the line each landed release (RELEASED) and each named
+	// proposal (WITHHELD) writes (ga-9n8hjv): a successful release is never
+	// silent. A seat path passes the stderr its caller reports on, as the
+	// carry's release loops did; nil writes to the process log, which is where
+	// the orphan releases' lines have always gone.
+	Audit io.Writer
 }
 
 // ReleaseOutcome is what a release did with each claim.
@@ -330,6 +343,10 @@ func ReleaseClaims(sw *SeatWork, scope ReleaseScope, seat releaseSeat, why relea
 // (the orphan releases list them from the tick's census).
 func releaseListed(claims []seatWorkHit, why releaseWhy, seat releaseSeat, cfg *config.City, opts ReleaseOpts) ReleaseOutcome {
 	p := releasePolicies[why]
+	audit := opts.Audit
+	if audit == nil {
+		audit = log.Writer()
+	}
 	out := ReleaseOutcome{Why: map[string]string{}, Route: map[string]string{}}
 	keep := func(c seatWorkHit, why string) { out.Kept = append(out.Kept, c); out.Why[c.bead.ID] = why }
 	var mine []seatWorkHit
@@ -365,7 +382,7 @@ func releaseListed(claims []seatWorkHit, why releaseWhy, seat releaseSeat, cfg *
 		// release the claim, as it did at the carry's writers; only the
 		// started-claim keep above, which releases nothing, comes first.
 		if reason := guard.withholdReasonForBead(c.bead); reason != "" {
-			if _, err := proposeNamedRelease(c.store, c.bead, reason, releaseAuditPaths[why], log.Writer()); err != nil {
+			if _, err := proposeNamedRelease(c.store, c.bead, reason, releaseAuditPaths[why], audit); err != nil {
 				out.Failed = append(out.Failed, c)
 				out.Why[c.bead.ID] = err.Error()
 				continue
@@ -401,7 +418,7 @@ func releaseListed(claims []seatWorkHit, why releaseWhy, seat releaseSeat, cfg *
 				keep(c, keptMoved)
 				continue
 			}
-		} else if err := workAssignmentForStore(beads.WorkStore{Store: c.store}).ReleaseWorkBead(c.bead, fallback, guard, log.Writer(), releaseAuditPaths[why]); err != nil {
+		} else if err := workAssignmentForStore(beads.WorkStore{Store: c.store}).ReleaseWorkBead(c.bead, fallback, guard, audit, releaseAuditPaths[why]); err != nil {
 			out.Failed = append(out.Failed, c)
 			out.Why[c.bead.ID] = err.Error()
 			continue
