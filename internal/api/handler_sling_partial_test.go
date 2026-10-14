@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
@@ -11,23 +12,38 @@ import (
 	"github.com/gastownhall/gascity/internal/sourceworkflow"
 )
 
-// failRouteStore refuses the gc.routed_to write for one bead with err (a
-// generic failure when err is nil), so a convoy sling routes every other child
-// and fails that one.
+// failRouteStore refuses the route write for one bead with err (a generic
+// failure when err is nil), so a convoy sling routes every other child and
+// fails that one. The route write is the gc.routed_to write, or, for a target
+// that is a configured named session, the direct assignment the sling makes
+// instead (an Update with an Assignee; the carry row "Sling routes a singleton
+// template to its configured named session"). myrig/worker is one in the
+// fake state.
 type failRouteStore struct {
 	beads.Store
 	failID string
 	err    error
 }
 
+func (s failRouteStore) routeErr() error {
+	if s.err != nil {
+		return s.err
+	}
+	return errors.New("injected route failure")
+}
+
 func (s failRouteStore) SetMetadata(id, key, value string) error {
 	if id == s.failID && key == beadmeta.RoutedToMetadataKey {
-		if s.err != nil {
-			return s.err
-		}
-		return errors.New("injected route failure")
+		return s.routeErr()
 	}
 	return s.Store.SetMetadata(id, key, value)
+}
+
+func (s failRouteStore) Update(id string, opts beads.UpdateOpts) error {
+	if id == s.failID && opts.Assignee != nil {
+		return s.routeErr()
+	}
+	return s.Store.Update(id, opts)
 }
 
 // TestSlingConvoyPartialFailureReturnsPerChildOutcomes pins the partial
@@ -90,8 +106,11 @@ func TestSlingConvoyPartialFailureReturnsPerChildOutcomes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Metadata[beadmeta.RoutedToMetadataKey] != "myrig/worker" {
-		t.Fatalf("routed child gc.routed_to = %q, want myrig/worker", got.Metadata[beadmeta.RoutedToMetadataKey])
+	if got.Assignee != "myrig/worker" {
+		t.Fatalf("routed child assignee = %q, want the configured named session myrig/worker", got.Assignee)
+	}
+	if routedTo := strings.TrimSpace(got.Metadata[beadmeta.RoutedToMetadataKey]); routedTo != "" {
+		t.Fatalf("routed child gc.routed_to = %q, want empty for direct named-session assignment", routedTo)
 	}
 }
 
