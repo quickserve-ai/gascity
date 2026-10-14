@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/gastownhall/gascity/internal/clock"
+	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/session"
 )
@@ -97,4 +98,31 @@ func TestSimRestartHandoffOfAGoneRowStampsPriorSessionKey(t *testing.T) {
 		s.advance(simPatrol)
 	}
 	t.Fatalf("row %v: the restart was never handed off", s.gc1())
+}
+
+// Kills v2's config-drift restart in place (driftRestartPatch) and its drift
+// repair's late mint (withRepairKey) rotating or clearing a key without
+// stamping it, where legacy's drift reset stamps it
+// (resetConfiguredNamedSessionForConfigDriftInfo).
+func TestV2DriftResetsStampPriorSessionKey(t *testing.T) {
+	now := time.Date(2026, 10, 14, 12, 0, 0, 0, time.UTC)
+	mints := TemplateParams{TemplateName: "worker", ResolvedProvider: &config.ResolvedProvider{Name: "claude", SessionIDFlag: "--session-id"}}
+	clears := TemplateParams{TemplateName: "worker"}
+	row := session.Info{ID: "gc-1", SessionKey: "k-1"} // no stored hash: the conversation is not preserved
+	for name, tp := range map[string]TemplateParams{"rotated": mints, "cleared": clears} {
+		patch := driftRestartPatch(tp, row, now)
+		if patch["session_key"] == "k-1" || patch[session.PriorSessionKeyMetadata] != "k-1" {
+			t.Errorf("driftRestartPatch (%s) = %v, want the key replaced and k-1 stamped as prior", name, patch)
+		}
+	}
+	if patch := driftRestartPatch(mints, session.Info{ID: "gc-1", SessionKey: "k-1", StartedConfigHash: "h-1"}, now); patch[session.PriorSessionKeyMetadata] != "" {
+		t.Errorf("a preserved conversation stamped prior_session_key %q, want none (its key stays)", patch[session.PriorSessionKeyMetadata])
+	}
+
+	c := newHealCase(t, livenessGone, desireKeep, "state", "asleep", "session_key", "k-1")
+	info := c.w.Census.Rows[c.k].Info
+	c.w.Templates = &templateMemo{entries: map[templateMemoKey]templateResolution{templateMemoKeyOf(info): {TP: mints}}}
+	if patch := withRepairKey(session.MetadataPatch{"state": "asleep"}, c.w, info); patch["session_key"] == "k-1" || patch[session.PriorSessionKeyMetadata] != "k-1" {
+		t.Errorf("withRepairKey = %v, want a minted key and k-1 stamped as prior", patch)
+	}
 }
