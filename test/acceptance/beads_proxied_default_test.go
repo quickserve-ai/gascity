@@ -335,7 +335,7 @@ var (
 	schedulerStaleLine      = regexp.MustCompile(`^\S+: last fired (\S+) ago, expected every (\S+) \(CRITICAL: stale\)$`)
 	schedulerOverdueLine    = regexp.MustCompile(`^\S+: last fired \S+ ago, expected every \S+ \(overdue\)$`)
 	schedulerCurrentLine    = regexp.MustCompile(`^(\d+) other scheduled order\(s\) current$`)
-	schedulerNeverFiredLine = regexp.MustCompile(`^\S+: never fired since controller start (\S+) ago$`)
+	schedulerNeverFiredLine = regexp.MustCompile(`^(\S+): never fired since controller start (\S+) ago$`)
 	schedulerFirstCycleLine = regexp.MustCompile(`^\S+: never fired \(controller running \S+, within first cycle\)$`)
 )
 
@@ -390,7 +390,7 @@ func schedulerLagOnly(report doctorReport) bool {
 				}
 				lagged, fired = true, true
 			case schedulerNeverFiredLine.MatchString(d):
-				uptime, err := time.ParseDuration(schedulerNeverFiredLine.FindStringSubmatch(d)[1])
+				uptime, err := time.ParseDuration(schedulerNeverFiredLine.FindStringSubmatch(d)[2])
 				if err != nil || uptime > schedulerColdStart {
 					return false
 				}
@@ -515,6 +515,34 @@ func TestSchedulerLagOnly(t *testing.T) {
 	}
 }
 
+// TestNeverFiredOrders pins which orders the deferred first-firing assertion
+// waits on, and when it stops waiting.
+func TestNeverFiredOrders(t *testing.T) {
+	report := func(details ...string) doctorReport {
+		return doctorReport{Results: []doctorCheckResult{{Name: "order-firing-current", Details: details}}}
+	}
+	got := neverFiredOrders(report(
+		"gate-sweep: never fired since controller start 1m ago",
+		"reaper: never fired (controller running 1m, within first cycle)",
+		"8 other scheduled order(s) current"))
+	if len(got) != 1 || got[0] != "gate-sweep" {
+		t.Errorf("neverFiredOrders = %v, want [gate-sweep]", got)
+	}
+	orders := []string{"gate-sweep"}
+	if still := stillNeverFired(report("gate-sweep: never fired since controller start 2m ago"), orders); len(still) != 1 {
+		t.Errorf("flagged line: stillNeverFired = %v, want [gate-sweep]", still)
+	}
+	if still := stillNeverFired(report("gate-sweep: never fired (controller running 2m, within first cycle)"), orders); len(still) != 1 {
+		t.Errorf("first-cycle line: stillNeverFired = %v, want [gate-sweep]", still)
+	}
+	if still := stillNeverFired(report("9 other scheduled order(s) current"), orders); len(still) != 0 {
+		t.Errorf("fired: stillNeverFired = %v, want none", still)
+	}
+	if still := stillNeverFired(report("gate-sweep-2: never fired since controller start 2m ago"), orders); len(still) != 0 {
+		t.Errorf("a different order with a shared prefix: stillNeverFired = %v, want none", still)
+	}
+}
+
 // doctorJSONAllowingSchedulerLag runs `gc doctor --json` and fails the test on
 // a non-zero exit unless schedulerLagOnly says the only blocking failure is the
 // test city's scheduler running late, which it logs. It returns the parsed
@@ -534,8 +562,73 @@ func doctorJSONAllowingSchedulerLag(t *testing.T, city *helpers.City, label stri
 					label, r.Message, strings.Join(r.Details, "; "))
 			}
 		}
+		if pending := neverFiredOrders(report); len(pending) > 0 {
+			awaitFirstFirings(t, city, label, pending)
+		}
 	}
 	return report, out
+}
+
+// neverFiredOrders names the orders an order-firing-current result flags as
+// never fired since controller start.
+func neverFiredOrders(report doctorReport) []string {
+	var names []string
+	for _, r := range report.Results {
+		if r.Name != "order-firing-current" {
+			continue
+		}
+		for _, d := range r.Details {
+			if m := schedulerNeverFiredLine.FindStringSubmatch(d); m != nil {
+				names = append(names, m[1])
+			}
+		}
+	}
+	return names
+}
+
+// awaitFirstFirings turns a tolerated never-fired line into a deferred
+// assertion: the evidence that other orders fired proves only that the
+// scheduler runs, not that this order was merely waiting its turn. It re-reads
+// `gc doctor --json` until no named order is still reported never fired, and
+// fails the test if one has not fired within schedulerColdStart, which is a
+// skipped order, not a late one.
+func awaitFirstFirings(t *testing.T, city *helpers.City, label string, orders []string) {
+	t.Helper()
+	deadline := time.Now().Add(schedulerColdStart)
+	for {
+		out, _ := city.GC("doctor", "--json")
+		var report doctorReport
+		lastJSONLine(t, out, &report)
+		still := stillNeverFired(report, orders)
+		if len(still) == 0 {
+			t.Logf("on %s: %s fired after the tolerated doctor read", label, strings.Join(orders, ", "))
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("on %s: %s still never fired %s after the tolerated doctor read: a skipped order, not scheduler lag\n%s",
+				label, strings.Join(still, ", "), schedulerColdStart, out)
+		}
+		time.Sleep(15 * time.Second)
+	}
+}
+
+// stillNeverFired returns the orders an order-firing-current result still
+// reports as never fired, in either the flagged or the first-cycle form.
+func stillNeverFired(report doctorReport, orders []string) []string {
+	var still []string
+	for _, name := range orders {
+		for _, r := range report.Results {
+			if r.Name != "order-firing-current" {
+				continue
+			}
+			for _, d := range r.Details {
+				if strings.HasPrefix(d, name+": never fired") {
+					still = append(still, name)
+				}
+			}
+		}
+	}
+	return still
 }
 
 // assertDoctorGreen runs the real `gc doctor --json` front door and requires
