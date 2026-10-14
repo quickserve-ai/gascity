@@ -850,6 +850,9 @@ var nonSessionKeys = func() map[string]string {
 		"GitHub PR bead and trace":    "source github.base github.failed_checks github.failure_kind github.head github.head_sha github.merge_state_status github.monitor github.owner github.pending_checks github.pr github.repo github.state github.url",
 		"order wisp bead":             "order_tracking_sweep order_tracking_sweep_by order_wisp_sweep",
 		"rig idempotency bead":        "gc.idem.created_dir gc.idem.dolt_db gc.idem.event_cursor gc.idem.kind gc.idem.result.branch gc.idem.result.prefix gc.idem.result.rig gc.idem.state",
+		// The carry's named-release proposal (ga-9n8hjv): stamped on the
+		// work bead whose release it proposes, never on a session row.
+		"work bead (named-release proposal)": "gc.release_proposed_assignee gc.release_proposed_at gc.release_proposed_path gc.release_proposed_reason",
 	} {
 		for _, k := range strings.Fields(keys) {
 			out[k] = class
