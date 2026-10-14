@@ -519,7 +519,8 @@ func TestSchedulerLagOnly(t *testing.T) {
 // waits on, and when it stops waiting.
 func TestNeverFiredOrders(t *testing.T) {
 	report := func(details ...string) doctorReport {
-		return doctorReport{Results: []doctorCheckResult{{Name: "order-firing-current", Details: details}}}
+		return doctorReport{Results: []doctorCheckResult{{Name: "order-firing-current",
+			Message: "scheduled orders are stale", Details: details}}}
 	}
 	got := neverFiredOrders(report(
 		"gate-sweep: never fired since controller start 1m ago",
@@ -540,6 +541,26 @@ func TestNeverFiredOrders(t *testing.T) {
 	}
 	if still := stillNeverFired(report("gate-sweep-2: never fired since controller start 2m ago"), orders); len(still) != 0 {
 		t.Errorf("a different order with a shared prefix: stillNeverFired = %v, want none", still)
+	}
+	if still := stillNeverFired(report("gate-sweep: cannot read order history: boom"), orders); len(still) != 1 {
+		t.Errorf("unreadable history: stillNeverFired = %v, want [gate-sweep]", still)
+	}
+	// Reads that judged nothing are no evidence of a firing.
+	for name, r := range map[string]doctorReport{
+		"timed out": {Results: []doctorCheckResult{{Name: "order-firing-current", Status: "error",
+			Severity: "advisory", TimedOut: true}}},
+		"early error": {Results: []doctorCheckResult{{Name: "order-firing-current", Status: "error",
+			Message: "read order firing events: boom"}}},
+		"no result": {},
+	} {
+		if still := stillNeverFired(r, orders); len(still) != 1 {
+			t.Errorf("%s: stillNeverFired = %v, want [gate-sweep]", name, still)
+		}
+	}
+	green := doctorReport{Results: []doctorCheckResult{{Name: "order-firing-current", Status: "ok",
+		Message: "all scheduled orders are current", Details: []string{"20 other scheduled order(s) current"}}}}
+	if still := stillNeverFired(green, orders); len(still) != 0 {
+		t.Errorf("green read: stillNeverFired = %v, want none", still)
 	}
 }
 
@@ -589,9 +610,12 @@ func neverFiredOrders(report doctorReport) []string {
 // awaitFirstFirings turns a tolerated never-fired line into a deferred
 // assertion: the evidence that other orders fired proves only that the
 // scheduler runs, not that this order was merely waiting its turn. It re-reads
-// `gc doctor --json` until no named order is still reported never fired, and
-// fails the test if one has not fired within schedulerColdStart, which is a
-// skipped order, not a late one.
+// `gc doctor --json` until a read that judged every order no longer reports a
+// named order as never fired, and fails the test if that has not happened
+// within schedulerColdStart of the tolerated read (so up to ~6.5m from
+// controller start): an order that long unfired was skipped, not late. Each
+// poll is a `gc doctor` run, so it also counts in any bd-call tally taken
+// around this helper.
 func awaitFirstFirings(t *testing.T, city *helpers.City, label string, orders []string) {
 	t.Helper()
 	deadline := time.Now().Add(schedulerColdStart)
@@ -612,19 +636,35 @@ func awaitFirstFirings(t *testing.T, city *helpers.City, label string, orders []
 	}
 }
 
-// stillNeverFired returns the orders an order-firing-current result still
-// reports as never fired, in either the flagged or the first-cycle form.
+// orderFiringJudged lists the order-firing-current messages written only after
+// the check classified every scheduled order (internal/doctor/
+// checks_order_firing.go). Any other message, a timed-out result, or no result
+// at all judged nothing, so it is no evidence that an order fired.
+var orderFiringJudged = map[string]bool{
+	"all scheduled orders are current": true,
+	"scheduled orders are overdue":     true,
+	"scheduled orders are stale":       true,
+}
+
+// stillNeverFired returns the orders not yet shown to have fired: every one of
+// them when the read judged nothing, else each one whose line still says never
+// fired (flagged or first-cycle form) or that its history could not be read.
 func stillNeverFired(report doctorReport, orders []string) []string {
+	var result *doctorCheckResult
+	for i := range report.Results {
+		if report.Results[i].Name == "order-firing-current" {
+			result = &report.Results[i]
+		}
+	}
+	if result == nil || result.TimedOut || !orderFiringJudged[result.Message] {
+		return orders
+	}
 	var still []string
 	for _, name := range orders {
-		for _, r := range report.Results {
-			if r.Name != "order-firing-current" {
-				continue
-			}
-			for _, d := range r.Details {
-				if strings.HasPrefix(d, name+": never fired") {
-					still = append(still, name)
-				}
+		for _, d := range result.Details {
+			if strings.HasPrefix(d, name+": never fired") || strings.HasPrefix(d, name+": cannot") {
+				still = append(still, name)
+				break
 			}
 		}
 	}
