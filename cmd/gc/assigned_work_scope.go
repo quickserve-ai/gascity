@@ -191,14 +191,21 @@ func filterAssignedWorkBeadsForPoolDemand(
 		return assignedWorkBeads
 	}
 	claimRefs := assignedWorkRelocatedClaimRefs(cityPath, cfg, leading)
-	return filterAssignedWorkBeadsForPoolDemandAt(cfg, cityPath, claimRefs, sessionInfos, assignedWorkBeads, assignedWorkStoreRefs, time.Now().UTC(), wakeReady)
+	filtered, withheld := filterAssignedWorkBeadsForPoolDemandAt(cfg, cityPath, claimRefs, sessionInfos, assignedWorkBeads, assignedWorkStoreRefs, time.Now().UTC(), wakeReady)
+	for _, w := range withheld {
+		wakeReady.reportWithheld(w.storeRef, w.bead, w.template)
+	}
+	return filtered
 }
 
 // filterAssignedWorkBeadsForPoolDemandAt is filterAssignedWorkBeadsForPoolDemand
 // with the claim refs (assignedWorkRelocatedClaimRefs) resolved and the clock
 // read by the caller, so it does no I/O: the v2 allocator calls it inside its
 // pure pass. wakeReady is as for filterAssignedWorkBeadsForPoolDemand; nil
-// keeps every row.
+// keeps every row. It returns the rows the readiness veto withheld beside the
+// kept ones instead of reporting them: the report writes stderr under the
+// verdict's lock, which a pure pass may not reach, so the caller reports
+// (poolWakeReadiness.reportWithheld).
 func filterAssignedWorkBeadsForPoolDemandAt(
 	cfg *config.City,
 	cityPath string,
@@ -208,12 +215,12 @@ func filterAssignedWorkBeadsForPoolDemandAt(
 	assignedWorkStoreRefs []string,
 	now time.Time,
 	wakeReady *poolWakeReadiness,
-) []beads.Bead {
+) ([]beads.Bead, []poolWakeWithheldRow) {
 	if len(assignedWorkBeads) == 0 || len(assignedWorkStoreRefs) == 0 {
-		return assignedWorkBeads
+		return assignedWorkBeads, nil
 	}
 	if cfg == nil {
-		return assignedWorkBeads
+		return assignedWorkBeads, nil
 	}
 	assigneeToSessionBeadID := make(map[string]string)
 	sessionBeadTemplate := make(map[string]string)
@@ -247,6 +254,7 @@ func filterAssignedWorkBeadsForPoolDemandAt(
 		}
 	}
 	filtered := make([]beads.Bead, 0, len(assignedWorkBeads))
+	var withheld []poolWakeWithheldRow
 	for i, wb := range assignedWorkBeads {
 		// A deferred bead is deliberately parked (future defer_until) and is
 		// invisible to bd ready, so scale_check reports zero demand for it.
@@ -295,13 +303,13 @@ func filterAssignedWorkBeadsForPoolDemandAt(
 		if i < len(assignedWorkStoreRefs) {
 			_, claimantLive := eligibleClaimants[strings.TrimSpace(wb.Assignee)]
 			if wakeReady.vetoesWakeCandidate(wb, agentCfg, claimantLive, assignedWorkStoreRefs[i]) {
-				wakeReady.reportWithheld(assignedWorkStoreRefs[i], wb, template)
+				withheld = append(withheld, poolWakeWithheldRow{storeRef: assignedWorkStoreRefs[i], bead: wb, template: template})
 				continue
 			}
 		}
 		filtered = append(filtered, wb)
 	}
-	return filtered
+	return filtered, withheld
 }
 
 // filterAssignedWorkBeadsForSessionWake resolves work through assignment
