@@ -1015,7 +1015,7 @@ func advanceSessionDrainsWithSessionsTraced(
 				if trace != nil {
 					trace.RecordDecision(TraceSiteDrainCancel, TraceReasonUserHold, TraceOutcomeCancel, normalizedSessionTemplateInfo(info, cfg), name, traceRecordPayload{
 						"drain_reason": ds.reason,
-						"held_until":   info.HeldUntil,
+						"held_until":   heartbeatHoldUntilInfo(info),
 					})
 				}
 				continue

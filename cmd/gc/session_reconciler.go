@@ -112,10 +112,26 @@ func lifecycleTimerBlockerInfo(info sessionpkg.Info, now time.Time) string {
 // seat is excluded from pool reuse and from the demand floor by construction,
 // so it can be surplus while its hold runs; the orphan arm and the drain-ack
 // branch keep it (gastownhall/gascity#6173), as the timer arm does (#3994).
+//
+// The hold is read through the row's disposition (R7): a live held_until
+// with no sleep intent of any kind decodes as a live Heartbeat.
 func heartbeatHeldPoolSeatInfo(info sessionpkg.Info, now time.Time) bool {
-	return isPoolManagedSessionInfo(info) && !isNamedSessionInfo(info) &&
-		strings.TrimSpace(info.SleepIntent) == "" &&
-		lifecycleTimerBlockerInfo(info, now) == "user_hold"
+	if !isPoolManagedSessionInfo(info) || isNamedSessionInfo(info) {
+		return false
+	}
+	d := sessionpkg.DispositionOfInfo(info)
+	noIntent := d.Operator != sessionpkg.OperatorSuspended && !d.WaitIntent && !d.IdleStop && d.Unknown&sessionpkg.UnknownIntent == 0
+	return noIntent && d.Heartbeat.After(now)
+}
+
+// heartbeatHoldUntilInfo is a heartbeat-held seat's held_until as its traces
+// and log lines report it, read through the row's disposition (R7).
+func heartbeatHoldUntilInfo(info sessionpkg.Info) string {
+	until := sessionpkg.DispositionOfInfo(info).Heartbeat
+	if until.IsZero() {
+		return ""
+	}
+	return until.UTC().Format(time.RFC3339)
 }
 
 // maxSessionAgeBlockerInfo reports the active blocker for the max-session-age
@@ -1275,7 +1291,14 @@ func finalizeDrainAckStoppedSession(
 		info.WakeMode == "fresh" &&
 		strings.TrimSpace(info.ConfiguredNamedMode) == "always" {
 		cooldownUntil := clk.Now().Add(freshWakeHeartbeatCooldown).UTC()
-		if !metadataTimeInFuture(info.HeldUntil, cooldownUntil) {
+		// The row's own hold, read through its disposition (R7): an
+		// operator suspend's Until, or a heartbeat's.
+		held := sessionpkg.DispositionOfInfo(info)
+		heldUntil := held.Until
+		if held.Heartbeat.After(heldUntil) {
+			heldUntil = held.Heartbeat
+		}
+		if !heldUntil.After(cooldownUntil) {
 			write = func(id string, patch sessionpkg.MetadataPatch) (sessionpkg.MetadataPatch, error) {
 				return applyDrainAckWithHeartbeatCooldown(store, id, patch, cooldownUntil, clk.Now())
 			}
@@ -2921,7 +2944,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 								fmt.Fprintf(stdout, "Canceled drain-acked session '%s' (heartbeat hold)\n", name) //nolint:errcheck
 								if trace != nil {
 									trace.RecordDecision(TraceSiteDrainCancel, TraceReasonUserHold, TraceOutcomeCancel, template, name, traceRecordPayload{
-										"held_until": infoPostHeal.HeldUntil,
+										"held_until": heartbeatHoldUntilInfo(infoPostHeal),
 									})
 								}
 								continue
@@ -3089,10 +3112,10 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 								"store_query_partial": storeQueryPartial,
 								"provider_alive":      providerAlive,
 								"blocker":             string(TraceReasonUserHold),
-								"held_until":          infoPostHeal.HeldUntil,
+								"held_until":          heartbeatHoldUntilInfo(infoPostHeal),
 							})
 						}
-						fmt.Fprintf(stdout, "Skipping drain for '%s': heartbeat hold active until %s\n", name, infoPostHeal.HeldUntil) //nolint:errcheck
+						fmt.Fprintf(stdout, "Skipping drain for '%s': heartbeat hold active until %s\n", name, heartbeatHoldUntilInfo(infoPostHeal)) //nolint:errcheck
 						continue
 					}
 					// When a store query failed (partial results),
@@ -3653,7 +3676,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						fmt.Fprintf(stdout, "Canceled drain-acked session '%s' (heartbeat hold)\n", name) //nolint:errcheck
 						if trace != nil {
 							trace.RecordDecision(TraceSiteDrainCancel, TraceReasonUserHold, TraceOutcomeCancel, tp.TemplateName, name, traceRecordPayload{
-								"held_until": infoByID[id].HeldUntil,
+								"held_until": heartbeatHoldUntilInfo(infoByID[id]),
 							})
 						}
 						continue
