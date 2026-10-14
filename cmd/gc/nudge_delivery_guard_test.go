@@ -37,7 +37,7 @@ func startGuardTestSession(t *testing.T, dir string, fake *runtime.Fake) (sessio
 		resolved:    &config.ResolvedProvider{Name: "claude"},
 		sessionName: info.SessionName,
 	}
-	return info, target, worker.LiveObservation{Running: true, LastActivity: &idleSince}
+	return info, target, worker.LiveObservation{Running: true, Alive: true, LastActivity: &idleSince}
 }
 
 // TestTryDeliverQueuedNudgesByPollerKeepsADeferredNudgeQueued is the queue half
