@@ -391,6 +391,9 @@ type draftOwner struct {
 	// was ambiguous, in which case no quiet claim is made (noHumanInputSince).
 	quiet      map[string]int64
 	quietKnown bool
+	// preSubmit is the composer draft resendGate's first read saw, just
+	// before the first submit ("" when it saw none or could not read one).
+	preSubmit string
 }
 
 // newDraftOwner makes the owner for message with the session's input
@@ -874,6 +877,26 @@ func applySGRFaint(params string, faint bool) bool {
 	return faint
 }
 
+// recoveryDraftIsNotOurs reports whether a staged-draft recovery submit
+// (recoverStagedDraft) would land on a draft that is not the one this nudge
+// left before its first submit: the re-send gate's snapshot is known and the
+// composer now shows something else, such as another paste's placeholder
+// (ga-da5vmz; a person's paste gets the next #N). Only positive evidence
+// counts: with no snapshot, or no composer this read can find (codex's
+// "› " under a claude prompt prefix), recovery keeps upstream's rule and
+// re-sends while a staged draft is visible. A failed read stops it.
+func (t *Tmux) recoveryDraftIsNotOurs(session, target string, owner *draftOwner) bool {
+	if owner == nil || owner.preSubmit == "" {
+		return false
+	}
+	lines, err := t.CapturePaneLines(target, promptObservationLines)
+	if err != nil {
+		return true
+	}
+	found, text := composerDraft(lines, t.resolveIdlePromptPrefix(session))
+	return found && text != owner.preSubmit
+}
+
 // paneIsClaudeFamily resolves target's provider family the way
 // targetIsClaudeFamily does, without its process sniff fallback cost when the
 // pane declares GC_PROVIDER.
@@ -916,6 +939,7 @@ func (t *Tmux) resendGate(session, target, message string, owner *draftOwner) fu
 				}
 			}
 			owner.notePlaceholder(snapshot)
+			owner.preSubmit = snapshot
 			return true, nil
 		}
 		if err != nil || snapshot == "" {
