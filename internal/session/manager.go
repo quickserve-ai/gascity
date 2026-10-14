@@ -675,7 +675,7 @@ type Manager struct {
 	staleKeyDetectionWaiter StaleKeyDetectionWaiter
 	leaseTTL                time.Duration // the runtime lease records' TTL (WithRuntimeLeaseTTL)
 	// startFence, when set, is bracketed around every runtime start this
-	// Manager makes (see startRuntime), in addition to any fence registered
+	// Manager makes (see bracketStart), in addition to any fence registered
 	// for sp with RegisterStartFence.
 	startFence StartFence
 }
@@ -1119,7 +1119,10 @@ func (m *Manager) createStarted(ctx context.Context, spec CreateOptions) (Info, 
 			}
 			return fmt.Errorf("pre-start orphan cleanup: %w", orphanErr)
 		}
-		if err := m.startRuntime(ctx, sessName, cfg); err != nil {
+		if err := func() error {
+			defer bracketStart(m.startFence, m.sp)() // the session-start fence (start_fence.go)
+			return m.sp.Start(ctx, sessName, cfg)
+		}(); err != nil {
 			if runtimeSessionMatchesBead(m.sp, sessName, b.ID, meta["instance_token"]) {
 				if metaErr := m.confirmStartedRuntimeMetadata(b.ID, sessName, &b); metaErr != nil {
 					return metaErr

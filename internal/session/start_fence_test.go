@@ -44,9 +44,11 @@ type startFailingProvider struct {
 	fence      *countingStartFence
 	panicStart bool
 	sawInside  bool
+	starts     int
 }
 
 func (p *startFailingProvider) Start(context.Context, string, runtime.Config) error {
+	p.starts++
 	_, _, inflight := p.fence.snapshot()
 	p.sawInside = inflight > 0
 	if p.panicStart {
@@ -55,10 +57,13 @@ func (p *startFailingProvider) Start(context.Context, string, runtime.Config) er
 	return errors.New("provider start failed")
 }
 
-// TestManagerStartRuntime_FenceEndsOnPanicAndError: the Manager's start hook
-// brackets the provider call, and EndStart runs even when Start panics or
-// returns an error, so no failed start is left counted in flight.
-func TestManagerStartRuntime_FenceEndsOnPanicAndError(t *testing.T) {
+// TestManagerRuntimeStart_FenceEndsOnPanicAndError: a Manager's start brackets
+// the provider call, and EndStart runs even when Start panics or returns an
+// error, so no failed start is left counted in flight. It drives the
+// reconciler's start bridge (StartRuntimeOnly), one of the places a Manager
+// asks its provider to start a runtime; cmd/gc's source ratchet
+// (TestSessionStartFenceRatchet) holds every such place to the same bracket.
+func TestManagerRuntimeStart_FenceEndsOnPanicAndError(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		panicStart bool
@@ -72,6 +77,7 @@ func TestManagerStartRuntime_FenceEndsOnPanicAndError(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			fence := &countingStartFence{}
 			sp := &startFailingProvider{Fake: runtime.NewFake(), fence: fence, panicStart: tc.panicStart}
+			store := beads.NewMemStore()
 			var m *Manager
 			if tc.register {
 				unregister, ok := RegisterStartFence(sp, fence)
@@ -79,14 +85,19 @@ func TestManagerStartRuntime_FenceEndsOnPanicAndError(t *testing.T) {
 					t.Fatal("RegisterStartFence refused a pointer provider")
 				}
 				defer unregister()
-				m = NewManagerWithOptions(beads.NewMemStore(), sp)
+				m = newTestManager(t, store, sp)
 			} else {
-				m = NewManagerWithOptions(beads.NewMemStore(), sp, WithStartFence(fence))
+				m = newTestManager(t, store, sp, WithStartFence(fence))
 			}
+			id := seedFenceTestSession(t, store)
+			by := runtimeOnlyActor(t, m, id)
 			func() {
 				defer func() { _ = recover() }()
-				_ = m.startRuntime(context.Background(), "s1", runtime.Config{})
+				_ = m.StartRuntimeOnly(context.Background(), by, id, "claude", runtime.Config{WorkDir: t.TempDir()})
 			}()
+			if sp.starts != 1 {
+				t.Fatalf("provider Start ran %d time(s), want once", sp.starts)
+			}
 			begins, ends, inflight := fence.snapshot()
 			if !sp.sawInside {
 				t.Fatal("provider Start ran outside the fence bracket")
@@ -96,6 +107,29 @@ func TestManagerStartRuntime_FenceEndsOnPanicAndError(t *testing.T) {
 			}
 		})
 	}
+}
+
+// seedFenceTestSession stores an asleep session row a runtime-only start can
+// bring up, and returns its id.
+func seedFenceTestSession(t *testing.T, store beads.Store) string {
+	t.Helper()
+	b, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"state":    string(StateAsleep),
+			"provider": "claude",
+			"work_dir": t.TempDir(),
+			"command":  "claude",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create bead: %v", err)
+	}
+	if err := store.SetMetadata(b.ID, "session_name", sessionNameFor(b.ID)); err != nil {
+		t.Fatalf("SetMetadata(session_name): %v", err)
+	}
+	return b.ID
 }
 
 // TestRegisterStartFence_UnregisterStopsBracketing: after unregister, a start

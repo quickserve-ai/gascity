@@ -431,7 +431,10 @@ func (m *Manager) retryFreshStartAfterStaleKey(
 		}
 		return false, fmt.Errorf("pre-start orphan cleanup: %w", orphanErr)
 	}
-	if err := m.startRuntime(ctx, sessName, cfg); err != nil {
+	if err := func() error {
+		defer bracketStart(m.startFence, m.sp)() // the session-start fence (start_fence.go)
+		return m.sp.Start(ctx, sessName, cfg)
+	}(); err != nil {
 		if unroute != nil {
 			unroute()
 		}
@@ -778,7 +781,10 @@ func (m *Manager) ensureRunningOn(ctx context.Context, by Actor, id string, b be
 		}
 		return fmt.Errorf("pre-start orphan cleanup: %w", orphanErr)
 	}
-	if err := m.startRuntime(ctx, sessName, cfg); err != nil {
+	if err := func() error {
+		defer bracketStart(m.startFence, m.sp)() // the session-start fence (start_fence.go)
+		return m.sp.Start(ctx, sessName, cfg)
+	}(); err != nil {
 		switch {
 		// A capacity refusal is also a startup death, but the endpoint refused
 		// the launch: that says nothing about the resume key, so it falls
@@ -978,7 +984,10 @@ func (m *Manager) ensureRunningRuntimeOnly(ctx context.Context, by Actor, id str
 		}
 		return fmt.Errorf("pre-start orphan cleanup: %w", orphanErr)
 	}
-	if err := m.startRuntime(ctx, sessName, cfg); err != nil {
+	if err := func() error {
+		defer bracketStart(m.startFence, m.sp)() // the session-start fence (start_fence.go)
+		return m.sp.Start(ctx, sessName, cfg)
+	}(); err != nil {
 		switch {
 		// A capacity refusal says nothing about the resume key; it takes the
 		// plain failure path, not the stale-key recovery (see ensureRunning).
