@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -25,12 +24,14 @@ func touchWorktreeIndex(t *testing.T, worktreePath string) {
 	}
 }
 
-// emptyCommitKeepingMtimes runs `git commit --allow-empty` in a clean tree and
-// then puts the root's, HEAD's and the index's mtimes back to age ago, as git
-// may leave them: a commit that changes no file needs no index rewrite, and a
-// symbolic HEAD is not rewritten. Only the reflog records the commit.
+// emptyCommitKeepingMtimes runs `git commit --allow-empty` in a clean tree with
+// a committer date of 2020, so the reflog entry it appends records a time long
+// past, and then puts the root's, HEAD's and the index's mtimes back to age
+// ago, as git may leave them: a commit that changes no file needs no index
+// rewrite, and a symbolic HEAD is not rewritten. Only logs/HEAD's mtime moves.
 func emptyCommitKeepingMtimes(t *testing.T, worktreePath string, age time.Duration) {
 	t.Helper()
+	t.Setenv("GIT_COMMITTER_DATE", "2020-01-01T00:00:00Z")
 	mustGit(t, worktreePath, "commit", "--allow-empty", "-q", "-m", "heartbeat")
 	gitDir := strings.TrimSpace(runGit(t, worktreePath, "rev-parse", "--absolute-git-dir"))
 	old := time.Now().Add(-age)
@@ -82,8 +83,9 @@ func TestReapClosedBeadWorktrees_ProtectsRecentlyUsedWorktreeUnderDefaultQuietPe
 }
 
 // TestReapClosedBeadWorktrees_ProtectsEmptyCommitThatLeavesIndexUntouched: a
-// commit is recorded in the HEAD reflog even when it rewrites neither HEAD
-// nor the index, so the gate reads the newest reflog entry's own time.
+// commit appends to the HEAD reflog even when it rewrites neither HEAD nor the
+// index, and the gate reads that file's mtime, not the date the entry records
+// (backdated here, as GIT_COMMITTER_DATE allows).
 func TestReapClosedBeadWorktrees_ProtectsEmptyCommitThatLeavesIndexUntouched(t *testing.T) {
 	cityPath, rigRoot := initReapRig(t)
 	wt := addClosedWorktree(t, rigRoot, cityPath, "seat", "ga-quiet03")
@@ -92,17 +94,53 @@ func TestReapClosedBeadWorktrees_ProtectsEmptyCommitThatLeavesIndexUntouched(t *
 }
 
 // TestReapClosedBeadWorktrees_ReapsWorktreeQuietLongerThanDefaultQuietPeriod is
-// the control: every activity signal older than the default quiet period, and
-// a logs/HEAD file just rewritten, as `git gc` rewrites every worktree's
-// reflog at once, keeping the entries' own times. The tree is reaped.
+// the control: every activity signal older than the default quiet period is
+// reaped, and so is a tree with no logs/HEAD at all (a HEAD that never moved),
+// whose other signals decide.
 func TestReapClosedBeadWorktrees_ReapsWorktreeQuietLongerThanDefaultQuietPeriod(t *testing.T) {
-	cityPath, rigRoot := initReapRig(t)
-	wt := addClosedWorktree(t, rigRoot, cityPath, "seat", "ga-quiet02")
-	backdateWorktreeActivity(t, wt, 72*time.Hour)
-	mustGit(t, rigRoot, "reflog", "expire", "--expire=never", "--all") // as git gc does
-	report := runQuietReap(t, cityPath, rigRoot, "ga-quiet02", nil, nil)
-	if len(report.Reaped) != 1 || report.Reaped[0].BeadID != "ga-quiet02" {
-		t.Fatalf("Reaped = %+v Protected = %+v, want exactly ga-quiet02", report.Reaped, report.Protected)
+	for name, removeReflog := range map[string]bool{"all old": false, "no reflog": true} {
+		t.Run(name, func(t *testing.T) {
+			cityPath, rigRoot := initReapRig(t)
+			wt := addClosedWorktree(t, rigRoot, cityPath, "seat", "ga-quiet02")
+			if removeReflog {
+				gitDir := strings.TrimSpace(runGit(t, wt, "rev-parse", "--absolute-git-dir"))
+				if err := os.Remove(filepath.Join(gitDir, "logs", "HEAD")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			report := runQuietReap(t, cityPath, rigRoot, "ga-quiet02", nil, nil)
+			if len(report.Reaped) != 1 || report.Reaped[0].BeadID != "ga-quiet02" {
+				t.Fatalf("Reaped = %+v Protected = %+v, want exactly ga-quiet02", report.Reaped, report.Protected)
+			}
+		})
+	}
+}
+
+// TestReapClosedBeadWorktrees_ProtectsFreshReflogWhateverItsContent: a
+// logs/HEAD written within the quiet period protects although every other
+// signal is old, whether it is emptied, holds garbage, or was rewritten by
+// `git reflog expire` as `git gc` does (the accepted cost: one more quiet
+// period before that tree is reaped). Its content is never read.
+func TestReapClosedBeadWorktrees_ProtectsFreshReflogWhateverItsContent(t *testing.T) {
+	for name, write := range map[string]func(t *testing.T, rigRoot, reflog string) error{
+		"empty": func(_ *testing.T, _, reflog string) error { return os.WriteFile(reflog, nil, 0o644) },
+		"garbage": func(_ *testing.T, _, reflog string) error {
+			return os.WriteFile(reflog, []byte("garbage garbage garbage 1 garbage\n"), 0o644)
+		},
+		"gc rewrite": func(t *testing.T, rigRoot, _ string) error {
+			mustGit(t, rigRoot, "reflog", "expire", "--expire=never", "--all")
+			return nil
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cityPath, rigRoot := initReapRig(t)
+			wt := addClosedWorktree(t, rigRoot, cityPath, "seat", "ga-quiet09")
+			gitDir := strings.TrimSpace(runGit(t, wt, "rev-parse", "--absolute-git-dir"))
+			if err := write(t, rigRoot, filepath.Join(gitDir, "logs", "HEAD")); err != nil {
+				t.Fatal(err)
+			}
+			requireProtected(t, runQuietReap(t, cityPath, rigRoot, "ga-quiet09", nil, nil), wt, "used within the quiet period")
+		})
 	}
 }
 
@@ -142,39 +180,53 @@ func TestReapClosedBeadWorktrees_QuietPeriodConfig(t *testing.T) {
 
 // TestReapClosedBeadWorktrees_ProtectsWhenLastActivityIndeterminate proves the
 // gate fails closed when a signal cannot be read: a ".git" pointer naming no
-// gitdir, a missing index, a missing HEAD reflog, or an entry that does not
-// parse.
+// gitdir, a missing index, or a logs/HEAD that fails to stat for a reason
+// other than not existing (an unreadable or non-directory logs).
 func TestReapClosedBeadWorktrees_ProtectsWhenLastActivityIndeterminate(t *testing.T) {
-	for name, breakIt := range map[string]func(wt, gitDir string) error{
-		"pointer": func(wt, _ string) error {
+	for name, breakIt := range map[string]func(t *testing.T, wt, gitDir string) error{
+		"pointer": func(_ *testing.T, wt, _ string) error {
 			return os.WriteFile(filepath.Join(wt, ".git"), []byte("not a gitdir pointer\n"), 0o644)
 		},
-		"index":  func(_, gitDir string) error { return os.Remove(filepath.Join(gitDir, "index")) },
-		"reflog": func(_, gitDir string) error { return os.Remove(filepath.Join(gitDir, "logs", "HEAD")) },
-		"entry": func(_, gitDir string) error {
-			return os.WriteFile(filepath.Join(gitDir, "logs", "HEAD"), []byte("garbage\n"), 0o644)
+		"index": func(_ *testing.T, _, gitDir string) error { return os.Remove(filepath.Join(gitDir, "index")) },
+		"logs unreadable": func(t *testing.T, _, gitDir string) error {
+			if os.Geteuid() == 0 {
+				t.Skip("root stats through a mode-000 directory")
+			}
+			logs := filepath.Join(gitDir, "logs")
+			t.Cleanup(func() { _ = os.Chmod(logs, 0o755) })
+			return os.Chmod(logs, 0)
+		},
+		"logs not a directory": func(_ *testing.T, _, gitDir string) error {
+			logs := filepath.Join(gitDir, "logs")
+			if err := os.RemoveAll(logs); err != nil {
+				return err
+			}
+			return os.WriteFile(logs, nil, 0o644)
 		},
 	} {
-		cityPath, rigRoot := initReapRig(t)
-		wt := addClosedWorktree(t, rigRoot, cityPath, "seat", "ga-quiet05")
-		gitDir := strings.TrimSpace(runGit(t, wt, "rev-parse", "--absolute-git-dir"))
-		if err := breakIt(wt, gitDir); err != nil {
-			t.Fatalf("%s: %v", name, err)
-		}
-		backdateWorktreeGitFile(t, wt, 24*time.Hour) // creation age stays determinate
 		t.Run(name, func(t *testing.T) {
+			cityPath, rigRoot := initReapRig(t)
+			wt := addClosedWorktree(t, rigRoot, cityPath, "seat", "ga-quiet05")
+			gitDir := strings.TrimSpace(runGit(t, wt, "rev-parse", "--absolute-git-dir"))
+			if err := breakIt(t, wt, gitDir); err != nil {
+				t.Fatal(err)
+			}
+			backdateWorktreeGitFile(t, wt, 24*time.Hour) // creation age stays determinate
 			requireProtected(t, runQuietReap(t, cityPath, rigRoot, "ga-quiet05", nil, nil), wt, "last activity indeterminate")
 		})
 	}
 }
 
-// TestReapClosedBeadWorktrees_ProtectsFutureActivityTimestamp: a reflog entry
-// stamped in the future (clock skew) reads as use now, never as idle.
+// TestReapClosedBeadWorktrees_ProtectsFutureActivityTimestamp: an activity
+// mtime in the future (clock skew) reads as use now, never as idle.
 func TestReapClosedBeadWorktrees_ProtectsFutureActivityTimestamp(t *testing.T) {
 	cityPath, rigRoot := initReapRig(t)
 	wt := addClosedWorktree(t, rigRoot, cityPath, "seat", "ga-quiet07")
 	gitDir := strings.TrimSpace(runGit(t, wt, "rev-parse", "--absolute-git-dir"))
-	backdateReflogEntries(t, filepath.Join(gitDir, "logs", "HEAD"), time.Now().Add(time.Hour))
+	future := time.Now().Add(time.Hour)
+	if err := os.Chtimes(filepath.Join(gitDir, "logs", "HEAD"), future, future); err != nil {
+		t.Fatal(err)
+	}
 	requireProtected(t, runQuietReap(t, cityPath, rigRoot, "ga-quiet07", nil, nil), wt, "last_activity_age=-")
 }
 
@@ -231,40 +283,37 @@ func TestReapSkipTracker_SuppressesQuietPeriodRepeats(t *testing.T) {
 
 // TestWorktreeLastActivity_RelativeGitdirAndNewestSignal covers a relative
 // gitdir pointer (worktree.useRelativePaths), resolved against the worktree
-// root, and that the newest signal wins: here the reflog entry's own time,
-// newer than every mtime.
+// root, and that the newest signal wins: here logs/HEAD's mtime, newer than
+// every other, whatever its entries say.
 func TestWorktreeLastActivity_RelativeGitdirAndNewestSignal(t *testing.T) {
 	base := t.TempDir()
 	wt := filepath.Join(base, "wt")
 	gitDir := filepath.Join(base, "repo", ".git", "worktrees", "wt")
-	if err := os.MkdirAll(filepath.Join(gitDir, "logs"), 0o755); err != nil {
-		t.Fatal(err)
+	for _, d := range []string{wt, filepath.Join(gitDir, "logs")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if err := os.MkdirAll(wt, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	entry := time.Now().Add(-3 * time.Hour).Truncate(time.Second)
-	files := map[string]string{
+	old := time.Now().Add(-48 * time.Hour)
+	reflogTime := time.Now().Add(-3 * time.Hour).Truncate(time.Second)
+	for path, body := range map[string]string{
 		filepath.Join(wt, ".git"):             "gitdir: ../repo/.git/worktrees/wt\n",
 		filepath.Join(gitDir, "HEAD"):         "ref: refs/heads/x\n",
 		filepath.Join(gitDir, "index"):        "",
-		filepath.Join(gitDir, "logs", "HEAD"): "0000 1111 A U Thor <a@example.com> 1 +0000\tclone\n1111 2222 A U Thor <a@example.com> " + strconv.FormatInt(entry.Unix(), 10) + " -0700\tcommit: x\n",
-	}
-	old := time.Now().Add(-48 * time.Hour)
-	for path, body := range files {
+		filepath.Join(gitDir, "logs", "HEAD"): "0000 1111 A U Thor <a@example.com> 1 +0000\tcommit: x\n",
+	} {
 		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.Chtimes(path, old, old); err != nil {
+	}
+	for path, at := range map[string]time.Time{wt: old, filepath.Join(wt, ".git"): old, filepath.Join(gitDir, "HEAD"): old, filepath.Join(gitDir, "index"): old, filepath.Join(gitDir, "logs", "HEAD"): reflogTime} {
+		if err := os.Chtimes(path, at, at); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := os.Chtimes(wt, old, old); err != nil {
-		t.Fatal(err)
-	}
 
 	got, ok := worktreeLastActivity(wt)
-	if !ok || !got.Equal(entry) {
-		t.Fatalf("worktreeLastActivity = %v, %v; want %v (the newest reflog entry)", got, ok, entry)
+	if !ok || !got.Equal(reflogTime) {
+		t.Fatalf("worktreeLastActivity = %v, %v; want %v (logs/HEAD's mtime, the newest signal)", got, ok, reflogTime)
 	}
 }

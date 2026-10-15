@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -95,43 +94,16 @@ func backdateWorktreeActivity(t *testing.T, worktreePath string, age time.Durati
 	// Re-record the files' new stat data in the index, as the last git command
 	// run in the tree would have, before the index itself is aged below.
 	runGit(t, worktreePath, "update-index", "-q", "--refresh")
-	backdateReflogEntries(t, filepath.Join(gitDir, "logs", "HEAD"), backdated)
 	for _, p := range []string{
 		worktreePath,
 		filepath.Join(worktreePath, ".git"),
 		filepath.Join(gitDir, "HEAD"),
 		filepath.Join(gitDir, "index"),
+		filepath.Join(gitDir, "logs", "HEAD"),
 	} {
 		if err := os.Chtimes(p, backdated, backdated); err != nil {
 			t.Fatalf("backdate %s: %v", p, err)
 		}
-	}
-}
-
-// backdateReflogEntries rewrites the time git recorded on every entry of the
-// reflog at path to at, as entries written then would read; the last-use gate
-// reads that time, not the file's mtime.
-func backdateReflogEntries(t *testing.T, path string, at time.Time) {
-	t.Helper()
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read reflog %s: %v", path, err)
-	}
-	lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
-	for i, line := range lines {
-		head, msg, hasMsg := strings.Cut(line, "\t")
-		f := strings.Fields(head)
-		if len(f) < 5 {
-			t.Fatalf("reflog %s entry %q does not parse", path, line)
-		}
-		f[len(f)-2] = strconv.FormatInt(at.Unix(), 10)
-		lines[i] = strings.Join(f, " ")
-		if hasMsg {
-			lines[i] += "\t" + msg
-		}
-	}
-	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
-		t.Fatalf("rewrite reflog %s: %v", path, err)
 	}
 }
 
