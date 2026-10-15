@@ -306,8 +306,8 @@ func TestBlockedRepairSkipsSuspendedScopesAndRunsOnResume(t *testing.T) {
 
 // A rig that runs on a store built while it was suspended (no cache
 // reconciler) schedules a config reload from the tick, whatever the ticks
-// published in between, and asks again after rearmRetryInterval until a
-// rebuild lands. A store built while the rig ran, and a rig still suspended,
+// published in between, and asks again after rearmRetryInterval until an
+// armed store is installed. An armed store, and a rig still suspended,
 // schedule nothing (ga-r5ppfi).
 func TestRigOnAStoreBuiltWhileSuspendedSchedulesARearm(t *testing.T) {
 	cr, _, _, _ := quiescenceRuntime(t, "")
@@ -325,9 +325,9 @@ func TestRigOnAStoreBuiltWhileSuspendedSchedulesARearm(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	buildStores := func() { // what a store rebuild records: the gate each rig store got
+	install := func(armed bool) { // what a store build publishes beside the stores
 		cr.cs.mu.Lock()
-		cr.cs.storeMetadataSignature = storeMetadataSignature(cr.cityPath, cr.cfg)
+		cr.cs.rigStoreRefresh = map[string]bool{"r1": armed}
 		cr.cs.mu.Unlock()
 	}
 	tick := func() bool {
@@ -335,37 +335,41 @@ func TestRigOnAStoreBuiltWhileSuspendedSchedulesARearm(t *testing.T) {
 		return cr.configDirty.Swap(false)
 	}
 
-	buildStores() // built while r1 runs: armed
+	install(true)
 	if tick() {
-		t.Fatal("a store built while its rig ran scheduled a reload")
-	}
-	suspendRig(true)
-	if tick() {
-		t.Fatal("suspending the rig scheduled a reload; the reconcile gate pauses it")
-	}
-	buildStores() // a rebuild inside the suspension: r1's store has no reconciler
-	if tick() {
-		t.Fatal("a tick while the rig stayed suspended scheduled a reload")
+		t.Fatal("an armed store scheduled a reload")
 	}
 
-	// Resumed with no tick having published the suspension as over (a manual
-	// reload can hide it): the installed store is what is read.
-	suspendRig(false)
+	// A store built while r1 was suspended, and no tick ever published the
+	// suspension (a manual reload can hide it): r1 runs now, so it is stale.
+	install(false)
 	if !tick() {
-		t.Fatal("the resumed rig on a store built while suspended scheduled no reload; its cache stays blind")
+		t.Fatal("a running rig on a store built without its reconciler scheduled no reload; its cache stays blind")
 	}
 	if tick() {
 		t.Fatal("asked again inside rearmRetryInterval")
 	}
-	// The reload failed (nothing rebuilt the store): once the interval passes it asks again.
+	// The reload failed (nothing installed an armed store): after the interval it asks again.
 	cr.lastRearmRequest = cr.lastRearmRequest.Add(-rearmRetryInterval)
 	if !tick() {
-		t.Fatal("a rearm whose reload did not rebuild the store was not asked again")
+		t.Fatal("a rearm whose reload installed nothing was not asked again")
 	}
-	buildStores() // the rebuild landed: armed
+
+	// While the rig is suspended its store is meant to be cold.
+	cr.lastRearmRequest = time.Time{}
+	suspendRig(true)
+	if tick() {
+		t.Fatal("a suspended rig's cold store scheduled a reload")
+	}
+	suspendRig(false)
+	if !tick() {
+		t.Fatal("the resumed rig on its cold store scheduled no reload")
+	}
+
+	install(true) // the rebuild landed
 	cr.lastRearmRequest = time.Time{}
 	if tick() {
-		t.Fatal("a reload was scheduled after the store was rebuilt armed")
+		t.Fatal("a reload was scheduled after an armed store was installed")
 	}
 }
 

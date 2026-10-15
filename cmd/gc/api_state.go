@@ -120,6 +120,7 @@ type controllerState struct {
 	version                string
 	startedAt              time.Time
 	storeMetadataSignature string
+	rigStoreRefresh        map[string]bool // per rig store in beadStores: built with its reconciler armed (ga-r5ppfi)
 	ct                     crashTracker    // nil if crash tracking disabled
 	wake                   *controllerWake // the controller's wake; nil when not wired (see wakeOf)
 	pokeCh                 chan struct{}   // wakeOf's fallback when no wake is wired; triggers immediate reconciler tick
@@ -362,7 +363,7 @@ func newControllerStateWithRoutes(
 		if cityStoreErr != nil {
 			fmt.Fprintf(os.Stderr, "api: city bead store: %v (session/mail endpoints disabled)\n", cityStoreErr)
 		}
-		cs.beadStores = cs.buildStores(cfg)
+		cs.beadStores, cs.rigStoreRefresh = cs.buildStoresWithRefresh(cfg)
 		if cityStoreErr == nil {
 			cs.cityBeadStore = wrapWithCachingStore(ctx, opened.Store, ep, true, cityPath, cacheHeartbeatCityScope, cs.reconcileGate())
 			cs.cityBeadsDiagnostic = diagnosticPtr(opened.Diagnostic)
@@ -530,9 +531,17 @@ func primeThenStartReconciler(ctx context.Context, cs *beads.CachingStore, agent
 // Does not read or write mutable cs fields (safe to call unlocked); reads
 // the runtime suspension state file to gate per-rig cache refresh.
 func (cs *controllerState) buildStores(cfg *config.City) map[string]beads.Store {
+	stores, _ := cs.buildStoresWithRefresh(cfg)
+	return stores
+}
+
+// buildStoresWithRefresh is buildStores that also returns, per rig store it
+// built, whether that store's background refresh (reconciler) was armed.
+func (cs *controllerState) buildStoresWithRefresh(cfg *config.City) (map[string]beads.Store, map[string]bool) {
 	cityProvider := rawBeadsProviderForScope(cs.cityPath, cs.cityPath)
 	suspState := loadSuspensionStateBestEffort(cs.cityPath)
 	stores := make(map[string]beads.Store, len(cfg.Rigs))
+	refresh := make(map[string]bool, len(cfg.Rigs))
 
 	var sharedLegacyFileStore beads.Store
 	var sharedLegacyCachedStore beads.Store
@@ -580,13 +589,15 @@ func (cs *controllerState) buildStores(cfg *config.City) map[string]beads.Store 
 				sharedLegacyCachedStore = wrapWithCachingStore(cs.cacheCtx, sharedLegacyFileStore, cs.eventProv, true, cs.cityPath, "", cs.reconcileGate())
 			}
 			stores[rig.Name] = sharedLegacyCachedStore
+			refresh[rig.Name] = true
 			continue
 		}
 		store = cs.openRigStore(scopeProvider, rig.Name, scopeRoot, rig.EffectivePrefix(), cfg)
+		refresh[rig.Name] = rigStoreBackgroundRefresh(suspState, rig)
 		stores[rig.Name] = wrapWithCachingStore(cs.cacheCtx, store, cs.eventProv,
-			rigStoreBackgroundRefresh(suspState, rig), cs.cityPath, cacheHeartbeatScopeForRig(rig.Name), cs.rigReconcileGate(rig.Name))
+			refresh[rig.Name], cs.cityPath, cacheHeartbeatScopeForRig(rig.Name), cs.rigReconcileGate(rig.Name))
 	}
-	return stores
+	return stores, refresh
 }
 
 // rigStoreBackgroundRefresh reports whether the controller should run
@@ -643,40 +654,25 @@ func (cs *controllerState) setSuspendedRigs(rigs map[string]bool) {
 	cs.suspendedRigs.Store(&rigs)
 }
 
-// rigStoresAwaitingRearm returns, sorted, the bound rigs that are not
-// suspended now but whose installed store was built without its cache
-// reconciler: the captured store-metadata signature records each rig's
-// refresh gate (rigRefreshSignatureLabel) as it was when the stores were
-// built. It reads installed state, not suspension transitions, so a
-// suspension no tick published and a rebuild that failed are both still
-// seen on the next tick (ga-r5ppfi).
-func (cs *controllerState) rigStoresAwaitingRearm(cfg *config.City, suspended map[string]bool) []string {
-	if cs == nil || cfg == nil {
+// rigStoresAwaitingRearm returns, sorted, the rigs that are not suspended now
+// but whose installed store was built without its cache reconciler
+// (rigStoreRefresh, written with the stores themselves). It reads installed
+// state, not suspension transitions, so a suspension no tick published and a
+// rebuild that failed are both still seen on the next tick (ga-r5ppfi).
+func (cs *controllerState) rigStoresAwaitingRearm(suspended map[string]bool) []string {
+	if cs == nil {
 		return nil
 	}
 	cs.mu.RLock()
-	signature := cs.storeMetadataSignature
-	cs.mu.RUnlock()
-	if signature == "" {
-		return nil
-	}
+	defer cs.mu.RUnlock()
 	var stale []string
-	for _, rig := range cfg.Rigs {
-		if strings.TrimSpace(rig.Path) == "" || suspended[rig.Name] {
-			continue
-		}
-		if strings.Contains(signature, "\n"+rigRefreshSignatureLabel(rig.Name, false)+":") {
-			stale = append(stale, rig.Name)
+	for name, armed := range cs.rigStoreRefresh {
+		if !armed && !suspended[name] {
+			stale = append(stale, name)
 		}
 	}
 	sort.Strings(stale)
 	return stale
-}
-
-// rigRefreshSignatureLabel is the store-metadata signature label that records
-// a rig store's background-refresh gate.
-func rigRefreshSignatureLabel(rigName string, refresh bool) string {
-	return fmt.Sprintf("rig:%s:refresh=%t", rigName, refresh)
 }
 
 // beginStoreWork counts one piece of store work as in flight (see storeWork)
@@ -1449,7 +1445,7 @@ func (cs *controllerState) updateLocked(cfg *config.City, sp runtime.Provider) {
 	}
 	// Build rig stores only after the publishing city-store open passes the
 	// schema gate; otherwise their cache loops would reconcile degraded state.
-	stores := cs.buildStores(cfg)
+	stores, storeRefresh := cs.buildStoresWithRefresh(cfg)
 	cityStore := openedCityStore.Store
 	cityBeadsDiagnostic := diagnosticPtr(openedCityStore.Diagnostic)
 	var cityMailProv mail.Provider
@@ -1472,6 +1468,7 @@ func (cs *controllerState) updateLocked(cfg *config.City, sp runtime.Provider) {
 	cs.usageSink = usageSink
 	oldRigStores = cs.beadStores
 	cs.beadStores = stores
+	cs.rigStoreRefresh = storeRefresh
 	if cityStore != nil {
 		oldCityStore = cs.cityBeadStore
 		cs.cityBeadStore = cityStore
@@ -1823,7 +1820,7 @@ func storeMetadataSignature(cityPath string, cfg *config.City) string {
 		if strings.TrimSpace(rig.Path) == "" {
 			continue
 		}
-		label := rigRefreshSignatureLabel(rig.Name, rigStoreBackgroundRefresh(suspState, rig))
+		label := fmt.Sprintf("rig:%s:refresh=%t", rig.Name, rigStoreBackgroundRefresh(suspState, rig))
 		appendScopeMetadataSignature(label, rig.Path)
 	}
 	return b.String()
