@@ -4480,6 +4480,42 @@ func TestRigStoreBackgroundRefreshUsesEffectiveSuspension(t *testing.T) {
 // suspend/resume flip invalidates runtimeUpdateCanReuseCurrentStores and
 // the next config reload rebuilds stores with the correct
 // background-refresh gate.
+// A running rig whose installed store was built cold forces a rebuild even
+// when the store-metadata signature reads armed (it is rewritten only when the
+// city store reopens), and an armed one lets the stores be reused (ga-r5ppfi).
+func TestColdStoreForRunningRigDefeatsReuseWhateverTheSignatureSays(t *testing.T) {
+	cityDir := t.TempDir()
+	cfg := &config.City{Rigs: []config.Rig{{Name: "rig1", Path: t.TempDir()}}}
+	cs := &controllerState{
+		cityPath:               cityDir,
+		cfg:                    cfg,
+		cityBeadStore:          beads.NewMemStore(),
+		beadStores:             map[string]beads.Store{"rig1": beads.NewMemStore()},
+		storeMetadataSignature: storeMetadataSignature(cityDir, cfg), // rig1 running: refresh=true
+	}
+
+	cs.rigStoreRefresh = map[string]bool{"rig1": true}
+	if cs.storeMetadataChanged(cfg) || !cs.runtimeUpdateCanReuseCurrentStores(cfg) {
+		t.Fatal("an armed store for a running rig was not left to reuse")
+	}
+
+	cs.rigStoreRefresh = map[string]bool{"rig1": false} // built while suspended; the signature never caught up
+	if !cs.storeMetadataChanged(cfg) {
+		t.Fatal("same-revision reload sees no change for a running rig on a cold store; it would skip the rebuild")
+	}
+	if cs.runtimeUpdateCanReuseCurrentStores(cfg) {
+		t.Fatal("a running rig's cold store was reused; the retry would loop without re-arming")
+	}
+
+	suspended := true // while the rig is suspended its store is meant to be cold
+	if err := suspensionstate.SetRigSuspended(fsys.OSFS{}, cityDir, "rig1", &suspended); err != nil {
+		t.Fatal(err)
+	}
+	if cs.coldStoreForRunningRig(cfg) {
+		t.Fatal("a suspended rig's cold store was taken for a running rig's")
+	}
+}
+
 func TestStoreMetadataSignatureChangesOnRigSuspensionFlip(t *testing.T) {
 	cityDir := t.TempDir()
 	rigDir := t.TempDir()
