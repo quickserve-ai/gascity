@@ -90,8 +90,10 @@ func (cr *CityRuntime) enterBeadsQuiescenceIfDue(ctx context.Context) bool {
 	suspended := suspendedBeadsScopes(cr.cityPath, cr.cfg)
 	cr.retiredScopes.forgetResumed(suspended)
 	cr.repairResumedScopes(suspended)
-	if resumed := cr.cs.setSuspendedRigs(buildEffectiveSuspendedRigNames(cr.cfg, loadSuspensionStateBestEffort(cr.cityPath))); len(resumed) > 0 {
-		cr.rearmResumedRigStores(resumed)
+	suspendedRigs := buildEffectiveSuspendedRigNames(cr.cfg, loadSuspensionStateBestEffort(cr.cityPath))
+	cr.cs.setSuspendedRigs(suspendedRigs)
+	if stale := cr.cs.rigStoresAwaitingRearm(cr.cfg, suspendedRigs); len(stale) > 0 {
+		cr.rearmResumedRigStores(stale, time.Now())
 	}
 	quiescent := false
 	if suspended.City() {
@@ -110,18 +112,27 @@ func (cr *CityRuntime) enterBeadsQuiescenceIfDue(ctx context.Context) bool {
 	return true
 }
 
-// rearmResumedRigStores schedules a config reload for this tick when rigs
-// resumed at runtime. gc rig resume writes only the suspension-state file,
-// which no config watcher reads, and a rig store rebuilt while its rig was
-// suspended was built without its cache reconciler (rigStoreBackgroundRefresh).
-// The store-metadata signature records that gate per rig, so the reload's
-// config_reload phase, later in this same tick, finds the signature changed and
-// rebuilds the stores with the reconciler armed; a store built before the
-// suspension kept its loop, the signature matches, and the reload reuses it.
-// Suspending is left alone: rigReconcileGate already pauses the rig's loop, and
-// a rebuild would open the suspended scope's store (ga-r5ppfi).
-func (cr *CityRuntime) rearmResumedRigStores(resumed []string) {
-	fmt.Fprintf(cr.stdout, "%s: rig(s) resumed at runtime (%s); scheduling a config reload so their bead stores re-arm\n", cr.logPrefix, strings.Join(resumed, ", ")) //nolint:errcheck // best-effort stdout
+// rearmRetryInterval bounds how often rearmResumedRigStores asks again while
+// a rig still runs on a store built without its reconciler (the reload that
+// would rebuild it failed or was superseded).
+const rearmRetryInterval = time.Minute
+
+// rearmResumedRigStores schedules a config reload for this tick when rigs run
+// on stores built while they were suspended. gc rig resume writes only the
+// suspension-state file, which no config watcher reads, and a rig store rebuilt
+// during a suspension was built without its cache reconciler
+// (rigStoreBackgroundRefresh). The store-metadata signature records that gate
+// per rig, so the reload's config_reload phase, later in this same tick, finds
+// the signature changed and rebuilds the stores with the reconciler armed. It
+// asks again, at most once per rearmRetryInterval, until a rebuild lands.
+// Suspending is left alone: rigReconcileGate already pauses the rig's loop,
+// and a rebuild would open the suspended scope's store (ga-r5ppfi).
+func (cr *CityRuntime) rearmResumedRigStores(stale []string, now time.Time) {
+	if !cr.lastRearmRequest.IsZero() && now.Sub(cr.lastRearmRequest) < rearmRetryInterval {
+		return
+	}
+	cr.lastRearmRequest = now
+	fmt.Fprintf(cr.stdout, "%s: rig(s) %s run on a bead store built while suspended (no cache reconciler); scheduling a config reload to re-arm it\n", cr.logPrefix, strings.Join(stale, ", ")) //nolint:errcheck // best-effort stdout
 	cr.requestConfigReloadRetry()
 }
 

@@ -304,15 +304,15 @@ func TestBlockedRepairSkipsSuspendedScopesAndRunsOnResume(t *testing.T) {
 	}
 }
 
-// A rig resumed at runtime (gc rig resume writes only the suspension-state
-// file, which no config watcher reads) schedules a config reload on the tick
-// that sees it, so a rig store rebuilt during the suspension, without its cache
-// reconciler, is rebuilt armed. Booting, suspending and ticking while suspended
+// A rig that runs on a store built while it was suspended (no cache
+// reconciler) schedules a config reload from the tick, whatever the ticks
+// published in between, and asks again after rearmRetryInterval until a
+// rebuild lands. A store built while the rig ran, and a rig still suspended,
 // schedule nothing (ga-r5ppfi).
-func TestRuntimeRigResumeSchedulesStoreRearm(t *testing.T) {
+func TestRigOnAStoreBuiltWhileSuspendedSchedulesARearm(t *testing.T) {
 	cr, _, _, _ := quiescenceRuntime(t, "")
 	t.Setenv("GC_SUSPENDED", "")
-	cr.cs = &controllerState{beadsQuiescent: new(atomic.Bool)}
+	cr.cs = &controllerState{beadsQuiescent: new(atomic.Bool), cityPath: cr.cityPath}
 	cr.configDirty = &atomic.Bool{}
 
 	oldCandidates := resumeRepairCandidates
@@ -325,27 +325,47 @@ func TestRuntimeRigResumeSchedulesStoreRearm(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	buildStores := func() { // what a store rebuild records: the gate each rig store got
+		cr.cs.mu.Lock()
+		cr.cs.storeMetadataSignature = storeMetadataSignature(cr.cityPath, cr.cfg)
+		cr.cs.mu.Unlock()
+	}
 	tick := func() bool {
 		cr.enterBeadsQuiescenceIfDue(context.Background())
 		return cr.configDirty.Swap(false)
 	}
 
+	buildStores() // built while r1 runs: armed
 	if tick() {
-		t.Fatal("the first tick scheduled a config reload")
+		t.Fatal("a store built while its rig ran scheduled a reload")
 	}
 	suspendRig(true)
 	if tick() {
-		t.Fatal("suspending the rig scheduled a config reload")
+		t.Fatal("suspending the rig scheduled a reload; the reconcile gate pauses it")
 	}
+	buildStores() // a rebuild inside the suspension: r1's store has no reconciler
 	if tick() {
-		t.Fatal("a tick while the rig stayed suspended scheduled a config reload")
+		t.Fatal("a tick while the rig stayed suspended scheduled a reload")
 	}
+
+	// Resumed with no tick having published the suspension as over (a manual
+	// reload can hide it): the installed store is what is read.
 	suspendRig(false)
 	if !tick() {
-		t.Fatal("resuming the rig scheduled no config reload; a store built while it was suspended stays without a reconciler")
+		t.Fatal("the resumed rig on a store built while suspended scheduled no reload; its cache stays blind")
 	}
 	if tick() {
-		t.Fatal("the tick after the resume scheduled a second config reload")
+		t.Fatal("asked again inside rearmRetryInterval")
+	}
+	// The reload failed (nothing rebuilt the store): once the interval passes it asks again.
+	cr.lastRearmRequest = cr.lastRearmRequest.Add(-rearmRetryInterval)
+	if !tick() {
+		t.Fatal("a rearm whose reload did not rebuild the store was not asked again")
+	}
+	buildStores() // the rebuild landed: armed
+	cr.lastRearmRequest = time.Time{}
+	if tick() {
+		t.Fatal("a reload was scheduled after the store was rebuilt armed")
 	}
 }
 

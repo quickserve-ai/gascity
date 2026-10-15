@@ -635,26 +635,48 @@ func (cs *controllerState) rigSuspended(rigName string) bool {
 	return rigs != nil && (*rigs)[rigName]
 }
 
-// setSuspendedRigs publishes the rigs the city runtime sees suspended and
-// returns, sorted, the rigs the previous publication had suspended that this
-// one does not: the rigs resumed since the last tick. The first publication
-// resumes nothing.
-func (cs *controllerState) setSuspendedRigs(rigs map[string]bool) []string {
+// setSuspendedRigs publishes the rigs the city runtime sees suspended.
+func (cs *controllerState) setSuspendedRigs(rigs map[string]bool) {
 	if cs == nil {
+		return
+	}
+	cs.suspendedRigs.Store(&rigs)
+}
+
+// rigStoresAwaitingRearm returns, sorted, the bound rigs that are not
+// suspended now but whose installed store was built without its cache
+// reconciler: the captured store-metadata signature records each rig's
+// refresh gate (rigRefreshSignatureLabel) as it was when the stores were
+// built. It reads installed state, not suspension transitions, so a
+// suspension no tick published and a rebuild that failed are both still
+// seen on the next tick (ga-r5ppfi).
+func (cs *controllerState) rigStoresAwaitingRearm(cfg *config.City, suspended map[string]bool) []string {
+	if cs == nil || cfg == nil {
 		return nil
 	}
-	prev := cs.suspendedRigs.Swap(&rigs)
-	if prev == nil {
+	cs.mu.RLock()
+	signature := cs.storeMetadataSignature
+	cs.mu.RUnlock()
+	if signature == "" {
 		return nil
 	}
-	var resumed []string
-	for name, was := range *prev {
-		if was && !rigs[name] {
-			resumed = append(resumed, name)
+	var stale []string
+	for _, rig := range cfg.Rigs {
+		if strings.TrimSpace(rig.Path) == "" || suspended[rig.Name] {
+			continue
+		}
+		if strings.Contains(signature, "\n"+rigRefreshSignatureLabel(rig.Name, false)+":") {
+			stale = append(stale, rig.Name)
 		}
 	}
-	sort.Strings(resumed)
-	return resumed
+	sort.Strings(stale)
+	return stale
+}
+
+// rigRefreshSignatureLabel is the store-metadata signature label that records
+// a rig store's background-refresh gate.
+func rigRefreshSignatureLabel(rigName string, refresh bool) string {
+	return fmt.Sprintf("rig:%s:refresh=%t", rigName, refresh)
 }
 
 // beginStoreWork counts one piece of store work as in flight (see storeWork)
@@ -1793,14 +1815,15 @@ func storeMetadataSignature(cityPath string, cfg *config.City) string {
 	// signature is compared against a recomputed one on reload
 	// (runtimeUpdateCanReuseCurrentStores), so a runtime suspend/resume
 	// flip invalidates store reuse and the next reload rebuilds stores
-	// with the correct background-refresh gate. A runtime resume schedules
-	// that reload on the tick that sees it (rearmResumedRigStores).
+	// with the correct background-refresh gate. A rig running on a store
+	// built while it was suspended schedules that reload from the tick
+	// (rigStoresAwaitingRearm, rearmResumedRigStores).
 	suspState := loadSuspensionStateBestEffort(cityPath)
 	for _, rig := range cfg.Rigs {
 		if strings.TrimSpace(rig.Path) == "" {
 			continue
 		}
-		label := fmt.Sprintf("rig:%s:refresh=%t", rig.Name, rigStoreBackgroundRefresh(suspState, rig))
+		label := rigRefreshSignatureLabel(rig.Name, rigStoreBackgroundRefresh(suspState, rig))
 		appendScopeMetadataSignature(label, rig.Path)
 	}
 	return b.String()
