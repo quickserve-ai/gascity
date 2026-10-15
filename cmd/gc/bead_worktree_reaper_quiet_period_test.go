@@ -94,25 +94,14 @@ func TestReapClosedBeadWorktrees_ProtectsEmptyCommitThatLeavesIndexUntouched(t *
 }
 
 // TestReapClosedBeadWorktrees_ReapsWorktreeQuietLongerThanDefaultQuietPeriod is
-// the control: every activity signal older than the default quiet period is
-// reaped, and so is a tree with no logs/HEAD at all (a HEAD that never moved),
-// whose other signals decide.
+// the control: a tree whose every activity signal is older than the default
+// quiet period is reaped.
 func TestReapClosedBeadWorktrees_ReapsWorktreeQuietLongerThanDefaultQuietPeriod(t *testing.T) {
-	for name, removeReflog := range map[string]bool{"all old": false, "no reflog": true} {
-		t.Run(name, func(t *testing.T) {
-			cityPath, rigRoot := initReapRig(t)
-			wt := addClosedWorktree(t, rigRoot, cityPath, "seat", "ga-quiet02")
-			if removeReflog {
-				gitDir := strings.TrimSpace(runGit(t, wt, "rev-parse", "--absolute-git-dir"))
-				if err := os.Remove(filepath.Join(gitDir, "logs", "HEAD")); err != nil {
-					t.Fatal(err)
-				}
-			}
-			report := runQuietReap(t, cityPath, rigRoot, "ga-quiet02", nil, nil)
-			if len(report.Reaped) != 1 || report.Reaped[0].BeadID != "ga-quiet02" {
-				t.Fatalf("Reaped = %+v Protected = %+v, want exactly ga-quiet02", report.Reaped, report.Protected)
-			}
-		})
+	cityPath, rigRoot := initReapRig(t)
+	wt := addClosedWorktree(t, rigRoot, cityPath, "seat", "ga-quiet02")
+	report := runQuietReap(t, cityPath, rigRoot, "ga-quiet02", nil, nil)
+	if len(report.Reaped) != 1 || report.Reaped[0].BeadID != "ga-quiet02" {
+		t.Fatalf("Reaped = %+v Protected = %+v, want exactly %s reaped", report.Reaped, report.Protected, wt)
 	}
 }
 
@@ -180,14 +169,19 @@ func TestReapClosedBeadWorktrees_QuietPeriodConfig(t *testing.T) {
 
 // TestReapClosedBeadWorktrees_ProtectsWhenLastActivityIndeterminate proves the
 // gate fails closed when a signal cannot be read: a ".git" pointer naming no
-// gitdir, a missing index, or a logs/HEAD that fails to stat for a reason
-// other than not existing (an unreadable or non-directory logs).
+// gitdir, a missing index, or a logs/HEAD that is missing or fails to stat (an
+// unreadable or non-directory logs). A missing logs/HEAD cannot tell a HEAD
+// that never moved from a reflog that held recent use and was then removed,
+// so it protects like any other unreadable signal.
 func TestReapClosedBeadWorktrees_ProtectsWhenLastActivityIndeterminate(t *testing.T) {
 	for name, breakIt := range map[string]func(t *testing.T, wt, gitDir string) error{
 		"pointer": func(_ *testing.T, wt, _ string) error {
 			return os.WriteFile(filepath.Join(wt, ".git"), []byte("not a gitdir pointer\n"), 0o644)
 		},
 		"index": func(_ *testing.T, _, gitDir string) error { return os.Remove(filepath.Join(gitDir, "index")) },
+		"logs/HEAD missing": func(_ *testing.T, _, gitDir string) error {
+			return os.Remove(filepath.Join(gitDir, "logs", "HEAD"))
+		},
 		"logs unreadable": func(t *testing.T, _, gitDir string) error {
 			if os.Geteuid() == 0 {
 				t.Skip("root stats through a mode-000 directory")
@@ -254,6 +248,23 @@ func TestReapClosedBeadWorktrees_RechecksActivityBeforeRemoval(t *testing.T) {
 		during: func() { emptyCommitKeepingMtimes(t, wt, 24*time.Hour) },
 	}
 	requireProtected(t, runQuietReap(t, cityPath, rigRoot, "ga-quiet08", nil, store), wt, "pre-removal re-check: worktree used within the quiet period")
+}
+
+// TestReapClosedBeadWorktrees_DryRunRechecksActivityLikeRemoval: the
+// activity-during-List case under dry-run. Dry-run runs the same final quiet
+// check a real removal runs, so it reports the tree Protected with the same
+// reason a real pass would, never "would reap".
+func TestReapClosedBeadWorktrees_DryRunRechecksActivityLikeRemoval(t *testing.T) {
+	cityPath, rigRoot := initReapRig(t)
+	wt := addClosedWorktree(t, rigRoot, cityPath, "seat", "ga-quiet10")
+	store := &reapActivityDuringListStore{
+		Store:  beads.NewMemStoreFrom(1, []beads.Bead{{ID: "ga-quiet10", Status: "closed"}}, nil),
+		during: func() { emptyCommitKeepingMtimes(t, wt, 24*time.Hour) },
+	}
+	injectLiveness(t, liveWorktreeState{scanned: true})
+	var stderr bytes.Buffer
+	report := reapClosedBeadWorktrees(cityPath, reapTestConfig(rigRoot), map[string]beads.Store{reapTestRigName: store}, nil, true, events.Discard, nil, &stderr)
+	requireProtected(t, report, wt, "pre-removal re-check: worktree used within the quiet period")
 }
 
 // TestReapSkipTracker_SuppressesQuietPeriodRepeats pins that the quiet-period
