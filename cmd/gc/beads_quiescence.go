@@ -92,7 +92,11 @@ func (cr *CityRuntime) enterBeadsQuiescenceIfDue(ctx context.Context) bool {
 	suspended := suspendedBeadsScopes(cr.cityPath, cr.cfg)
 	cr.retiredScopes.forgetResumed(suspended)
 	cr.repairResumedScopes(suspended)
-	cr.cs.setSuspendedRigs(buildEffectiveSuspendedRigNames(cr.cfg, loadSuspensionStateBestEffort(cr.cityPath)))
+	suspendedRigs := buildEffectiveSuspendedRigNames(cr.cfg, loadSuspensionStateBestEffort(cr.cityPath))
+	cr.cs.setSuspendedRigs(suspendedRigs)
+	if stale := cr.cs.rigStoresAwaitingRearm(suspendedRigs); len(stale) > 0 {
+		cr.rearmResumedRigStores(stale, time.Now())
+	}
 	quiescent := false
 	if suspended.City() {
 		running, err := cr.sp.ListRunning("")
@@ -108,6 +112,31 @@ func (cr *CityRuntime) enterBeadsQuiescenceIfDue(ctx context.Context) bool {
 	// for a whole tick, so no straggler read restarts them.
 	cr.retireSuspendedScopes(ctx, suspended, func(string) bool { return !cr.cs.storeWorkInFlight() })
 	return true
+}
+
+// rearmRetryInterval bounds how often rearmResumedRigStores asks again while
+// a rig still runs on a store built without its reconciler (the reload that
+// would rebuild it failed or was superseded).
+const rearmRetryInterval = time.Minute
+
+// rearmResumedRigStores schedules a config reload for this tick when rigs run
+// on stores built while they were suspended. gc rig resume writes only the
+// suspension-state file, which no config watcher reads, and a rig store rebuilt
+// during a suspension was built without its cache reconciler
+// (rigStoreBackgroundRefresh). The store-metadata signature carries that gate
+// per rig, so the reload's config_reload phase, later in this same tick, finds
+// the signature changed and rebuilds the stores with the reconciler armed. It
+// asks again, at most once per rearmRetryInterval, until rigStoreRefresh
+// records an armed store.
+// Suspending is left alone: rigReconcileGate already pauses the rig's loop,
+// and a rebuild would open the suspended scope's store (ga-r5ppfi).
+func (cr *CityRuntime) rearmResumedRigStores(stale []string, now time.Time) {
+	if !cr.lastRearmRequest.IsZero() && now.Sub(cr.lastRearmRequest) < rearmRetryInterval {
+		return
+	}
+	cr.lastRearmRequest = now
+	fmt.Fprintf(cr.stdout, "%s: rig(s) %s run on a bead store built while suspended (no cache reconciler); scheduling a config reload to re-arm it\n", cr.logPrefix, strings.Join(stale, ", ")) //nolint:errcheck // best-effort stdout
+	cr.requestConfigReloadRetry()
 }
 
 // resumeRepairBlockedFlags and resumeRepairCandidates are the resume path's

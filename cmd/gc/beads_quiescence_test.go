@@ -304,6 +304,75 @@ func TestBlockedRepairSkipsSuspendedScopesAndRunsOnResume(t *testing.T) {
 	}
 }
 
+// A rig that runs on a store built while it was suspended (no cache
+// reconciler) schedules a config reload from the tick, whatever the ticks
+// published in between, and asks again after rearmRetryInterval until an
+// armed store is installed. An armed store, and a rig still suspended,
+// schedule nothing (ga-r5ppfi).
+func TestRigOnAStoreBuiltWhileSuspendedSchedulesARearm(t *testing.T) {
+	cr, _, _, _ := quiescenceRuntime(t, "")
+	t.Setenv("GC_SUSPENDED", "")
+	cr.cs = &controllerState{beadsQuiescent: new(atomic.Bool), cityPath: cr.cityPath}
+	cr.configDirty = &atomic.Bool{}
+
+	oldCandidates := resumeRepairCandidates
+	t.Cleanup(func() { resumeRepairCandidates = oldCandidates })
+	resumeRepairCandidates = func(string, *config.City) []blockedRepairScope { return nil }
+
+	suspendRig := func(v bool) {
+		t.Helper()
+		if err := suspensionstate.SetRigSuspended(fsys.OSFS{}, cr.cityPath, "r1", &v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	install := func(armed bool) { // what a store build publishes beside the stores
+		cr.cs.mu.Lock()
+		cr.cs.rigStoreRefresh = map[string]bool{"r1": armed}
+		cr.cs.mu.Unlock()
+	}
+	tick := func() bool {
+		cr.enterBeadsQuiescenceIfDue(context.Background())
+		return cr.configDirty.Swap(false)
+	}
+
+	install(true)
+	if tick() {
+		t.Fatal("an armed store scheduled a reload")
+	}
+
+	// A store built while r1 was suspended, and no tick ever published the
+	// suspension (a manual reload can hide it): r1 runs now, so it is stale.
+	install(false)
+	if !tick() {
+		t.Fatal("a running rig on a store built without its reconciler scheduled no reload; its cache stays blind")
+	}
+	if tick() {
+		t.Fatal("asked again inside rearmRetryInterval")
+	}
+	// The reload failed (nothing installed an armed store): after the interval it asks again.
+	cr.lastRearmRequest = cr.lastRearmRequest.Add(-rearmRetryInterval)
+	if !tick() {
+		t.Fatal("a rearm whose reload installed nothing was not asked again")
+	}
+
+	// While the rig is suspended its store is meant to be cold.
+	cr.lastRearmRequest = time.Time{}
+	suspendRig(true)
+	if tick() {
+		t.Fatal("a suspended rig's cold store scheduled a reload")
+	}
+	suspendRig(false)
+	if !tick() {
+		t.Fatal("the resumed rig on its cold store scheduled no reload")
+	}
+
+	install(true) // the rebuild landed
+	cr.lastRearmRequest = time.Time{}
+	if tick() {
+		t.Fatal("a reload was scheduled after an armed store was installed")
+	}
+}
+
 // A suspended proxied scope's pair is stopped whenever it is found running,
 // not once: a late touch that restarted it is undone on the next tick.
 func TestRetireSuspendedProxiedScopeConvergesOnLiveState(t *testing.T) {
