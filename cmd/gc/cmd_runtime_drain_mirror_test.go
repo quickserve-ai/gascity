@@ -183,16 +183,16 @@ func TestClearSoftReloadConfigDriftDrainAckToleratesMirrorFailure(t *testing.T) 
 	}
 }
 
-// The reconciler's deferred ack is an ack once GC_DRAIN_ACK landed, even when
-// the runtime's view of it lags: rolling it back would flap the ack, and record
-// a failure, on every tick of a T3 outage.
+// The reconciler's deferred ack lives under its own keys, which t3bridge does
+// not mirror, so a T3 outage cannot flap it or record a failure; GC_DRAIN_ACK
+// stays the agent's alone, so the hold's cancel never erases an agent's ack.
 func TestSetReconcilerDrainAckMetadataToleratesMirrorFailure(t *testing.T) {
 	sp := mirrorFailingProvider{Fake: runtime.NewFake()}
 	if err := setReconcilerDrainAckMetadata(sp, "worker", &drainState{reason: "orphaned", generation: 3}); err != nil {
 		t.Fatalf("setReconcilerDrainAckMetadata = %v, want nil", err)
 	}
 	for key, want := range map[string]string{
-		"GC_DRAIN_ACK":                  "1",
+		"GC_DRAIN_ACK":                  "",
 		reconcilerDrainAckSourceKey:     reconcilerDrainAckSourceValue,
 		reconcilerDrainAckReasonKey:     "orphaned",
 		reconcilerDrainAckGenerationKey: "3",
@@ -206,7 +206,7 @@ func TestSetReconcilerDrainAckMetadataToleratesMirrorFailure(t *testing.T) {
 // An ack write that failed outright is no ack: the setter rolls back the keys
 // it wrote and reports the failure.
 func TestSetReconcilerDrainAckMetadataRollsBackWhenTheAckWriteFailed(t *testing.T) {
-	sp := mirrorFailingProvider{Fake: runtime.NewFake(), hardFailKey: "GC_DRAIN_ACK"}
+	sp := mirrorFailingProvider{Fake: runtime.NewFake(), hardFailKey: reconcilerDrainAckGenerationKey}
 	if err := setReconcilerDrainAckMetadata(sp, "worker", &drainState{reason: "orphaned", generation: 3}); err == nil || runtime.OnlyMetadataNotMirrored(err) {
 		t.Fatalf("setReconcilerDrainAckMetadata = %v, want the write failure", err)
 	}
