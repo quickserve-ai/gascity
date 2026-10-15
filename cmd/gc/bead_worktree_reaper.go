@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -879,28 +878,33 @@ func quietPeriodReason(worktreePath string, d *config.DaemonConfig) string {
 	return ""
 }
 
-// worktreeLastActivity returns when worktreePath was last used: the newest of
-// the mtimes of its root directory and its private gitdir's HEAD and index,
-// and the time git recorded on the newest entry of that gitdir's HEAD reflog.
-// A commit, checkout or reset adds a reflog entry even when it rewrites
-// neither HEAD nor the index (an empty commit on a clean tree); a `git add`
-// or a file created in the root moves an mtime. The reflog is read by its
-// entries, never its mtime: `git gc` rewrites every worktree's reflog at once
-// without changing them. A few stats and one bounded read, never a tree walk.
-// ok is false when the gitdir cannot be resolved, any signal is missing or
-// unreadable, or the newest reflog entry does not parse.
+// worktreeLastActivity returns when worktreePath was last used: the newest
+// mtime among its root directory and its private gitdir's HEAD, index and
+// logs/HEAD. A `git add` or a file created in the root moves an mtime, and a
+// commit, checkout or reset appends to logs/HEAD even when it rewrites
+// neither HEAD nor the index (an empty commit on a clean tree), whatever date
+// the entry records. The reflog's content is never read, only its mtime, so
+// it can only ever protect: `git gc` and `git reflog expire` rewrite every
+// worktree's reflog at once, which makes the tree look used for one more
+// quiet period, a delay and never a removal. A few stats, never a tree walk.
+// A worktree whose HEAD never moved has no logs/HEAD, so an absent one adds
+// nothing. ok is false when the gitdir cannot be resolved, the root, HEAD or
+// index cannot be stat'd (a missing index included), or logs/HEAD fails to
+// stat for any reason other than not existing.
 func worktreeLastActivity(worktreePath string) (time.Time, bool) {
 	gitDir, ok := worktreeGitDir(worktreePath)
 	if !ok {
 		return time.Time{}, false
 	}
-	newest, ok := newestReflogEntryTime(filepath.Join(gitDir, "logs", "HEAD"))
-	if !ok {
-		return time.Time{}, false
-	}
-	for _, p := range [...]string{worktreePath, filepath.Join(gitDir, "HEAD"), filepath.Join(gitDir, "index")} {
+	logsHEAD := filepath.Join(gitDir, "logs", "HEAD")
+	var newest time.Time
+	for _, p := range [...]string{worktreePath, filepath.Join(gitDir, "HEAD"), filepath.Join(gitDir, "index"), logsHEAD} {
 		info, err := os.Stat(p)
-		if err != nil {
+		switch {
+		case err == nil:
+		case p == logsHEAD && errors.Is(err, os.ErrNotExist):
+			continue
+		default:
 			return time.Time{}, false
 		}
 		if info.ModTime().After(newest) {
@@ -908,49 +912,6 @@ func worktreeLastActivity(worktreePath string) (time.Time, bool) {
 		}
 	}
 	return newest, true
-}
-
-// reflogTailBytes bounds the read of a reflog's end; an entry is ~200 bytes.
-const reflogTailBytes = 64 << 10
-
-// newestReflogEntryTime returns the time git recorded on the last entry of the
-// reflog at path ("<old> <new> <name> <email> <unix-seconds> <tz>[\t<msg>]"),
-// reading at most reflogTailBytes from its end. A reflog with no entries left
-// (all expired) returns the zero time. ok is false when the file is missing or
-// unreadable, or its last entry does not parse.
-func newestReflogEntryTime(path string) (time.Time, bool) {
-	f, err := os.Open(path)
-	if err != nil {
-		return time.Time{}, false
-	}
-	defer f.Close() //nolint:errcheck // read-only
-	info, err := f.Stat()
-	if err != nil {
-		return time.Time{}, false
-	}
-	off := max(info.Size()-reflogTailBytes, 0)
-	buf := make([]byte, info.Size()-off)
-	if _, err := f.ReadAt(buf, off); err != nil && !errors.Is(err, io.EOF) {
-		return time.Time{}, false
-	}
-	tail := strings.TrimRight(string(buf), "\n")
-	if tail == "" && off == 0 {
-		return time.Time{}, true
-	}
-	i := strings.LastIndexByte(tail, '\n')
-	if i < 0 && off > 0 {
-		return time.Time{}, false // the last entry is longer than the read
-	}
-	head, _, _ := strings.Cut(tail[i+1:], "\t")
-	fields := strings.Fields(head)
-	if len(fields) < 5 {
-		return time.Time{}, false
-	}
-	secs, err := strconv.ParseInt(fields[len(fields)-2], 10, 64)
-	if err != nil {
-		return time.Time{}, false
-	}
-	return time.Unix(secs, 0), true
 }
 
 // worktreeGitDir resolves a linked worktree's private gitdir from the
