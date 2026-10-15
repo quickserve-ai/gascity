@@ -304,6 +304,51 @@ func TestBlockedRepairSkipsSuspendedScopesAndRunsOnResume(t *testing.T) {
 	}
 }
 
+// A rig resumed at runtime (gc rig resume writes only the suspension-state
+// file, which no config watcher reads) schedules a config reload on the tick
+// that sees it, so a rig store rebuilt during the suspension, without its cache
+// reconciler, is rebuilt armed. Booting, suspending and ticking while suspended
+// schedule nothing (ga-r5ppfi).
+func TestRuntimeRigResumeSchedulesStoreRearm(t *testing.T) {
+	cr, _, _, _ := quiescenceRuntime(t, "")
+	t.Setenv("GC_SUSPENDED", "")
+	cr.cs = &controllerState{beadsQuiescent: new(atomic.Bool)}
+	cr.configDirty = &atomic.Bool{}
+
+	oldCandidates := resumeRepairCandidates
+	t.Cleanup(func() { resumeRepairCandidates = oldCandidates })
+	resumeRepairCandidates = func(string, *config.City) []blockedRepairScope { return nil }
+
+	suspendRig := func(v bool) {
+		t.Helper()
+		if err := suspensionstate.SetRigSuspended(fsys.OSFS{}, cr.cityPath, "r1", &v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tick := func() bool {
+		cr.enterBeadsQuiescenceIfDue(context.Background())
+		return cr.configDirty.Swap(false)
+	}
+
+	if tick() {
+		t.Fatal("the first tick scheduled a config reload")
+	}
+	suspendRig(true)
+	if tick() {
+		t.Fatal("suspending the rig scheduled a config reload")
+	}
+	if tick() {
+		t.Fatal("a tick while the rig stayed suspended scheduled a config reload")
+	}
+	suspendRig(false)
+	if !tick() {
+		t.Fatal("resuming the rig scheduled no config reload; a store built while it was suspended stays without a reconciler")
+	}
+	if tick() {
+		t.Fatal("the tick after the resume scheduled a second config reload")
+	}
+}
+
 // A suspended proxied scope's pair is stopped whenever it is found running,
 // not once: a late touch that restarted it is undone on the next tick.
 func TestRetireSuspendedProxiedScopeConvergesOnLiveState(t *testing.T) {

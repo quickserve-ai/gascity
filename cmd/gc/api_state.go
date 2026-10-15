@@ -635,12 +635,26 @@ func (cs *controllerState) rigSuspended(rigName string) bool {
 	return rigs != nil && (*rigs)[rigName]
 }
 
-// setSuspendedRigs publishes the rigs the city runtime sees suspended.
-func (cs *controllerState) setSuspendedRigs(rigs map[string]bool) {
+// setSuspendedRigs publishes the rigs the city runtime sees suspended and
+// returns, sorted, the rigs the previous publication had suspended that this
+// one does not: the rigs resumed since the last tick. The first publication
+// resumes nothing.
+func (cs *controllerState) setSuspendedRigs(rigs map[string]bool) []string {
 	if cs == nil {
-		return
+		return nil
 	}
-	cs.suspendedRigs.Store(&rigs)
+	prev := cs.suspendedRigs.Swap(&rigs)
+	if prev == nil {
+		return nil
+	}
+	var resumed []string
+	for name, was := range *prev {
+		if was && !rigs[name] {
+			resumed = append(resumed, name)
+		}
+	}
+	sort.Strings(resumed)
+	return resumed
 }
 
 // beginStoreWork counts one piece of store work as in flight (see storeWork)
@@ -1779,7 +1793,8 @@ func storeMetadataSignature(cityPath string, cfg *config.City) string {
 	// signature is compared against a recomputed one on reload
 	// (runtimeUpdateCanReuseCurrentStores), so a runtime suspend/resume
 	// flip invalidates store reuse and the next reload rebuilds stores
-	// with the correct background-refresh gate.
+	// with the correct background-refresh gate. A runtime resume schedules
+	// that reload on the tick that sees it (rearmResumedRigStores).
 	suspState := loadSuspensionStateBestEffort(cityPath)
 	for _, rig := range cfg.Rigs {
 		if strings.TrimSpace(rig.Path) == "" {
