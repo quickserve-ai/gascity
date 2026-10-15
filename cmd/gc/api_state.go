@@ -1761,6 +1761,9 @@ func (cs *controllerState) runtimeUpdateCanReuseCurrentStores(next *config.City)
 	if storeSignature != "" && storeSignature != storeMetadataSignature(cs.cityPath, next) {
 		return false
 	}
+	if cs.coldStoreForRunningRig(next) {
+		return false
+	}
 	for _, rig := range next.Rigs {
 		if strings.TrimSpace(rig.Path) == "" {
 			continue
@@ -1778,7 +1781,29 @@ func (cs *controllerState) storeMetadataChanged(next *config.City) bool {
 	storeSignature := cs.storeMetadataSignature
 	cs.mu.RUnlock()
 
-	return storeSignature != "" && storeSignature != storeMetadataSignature(cityPath, next)
+	return (storeSignature != "" && storeSignature != storeMetadataSignature(cityPath, next)) ||
+		cs.coldStoreForRunningRig(next)
+}
+
+// coldStoreForRunningRig reports whether a rig that is not suspended now runs
+// on an installed store built without its cache reconciler (rigStoreRefresh).
+// The store-metadata signature cannot be trusted to say so: it is rewritten
+// only when the city store reopens and reads suspension apart from the build,
+// so a reload that went by the signature alone could reuse a cold store and
+// leave the rig's cache blind (ga-r5ppfi).
+func (cs *controllerState) coldStoreForRunningRig(next *config.City) bool {
+	if cs == nil || next == nil {
+		return false
+	}
+	suspState := loadSuspensionStateBestEffort(cs.cityPath)
+	cs.mu.RLock()
+	defer cs.mu.RUnlock()
+	for _, rig := range next.Rigs {
+		if armed, ok := cs.rigStoreRefresh[rig.Name]; ok && !armed && rigStoreBackgroundRefresh(suspState, rig) {
+			return true
+		}
+	}
+	return false
 }
 
 func storeMetadataSignature(cityPath string, cfg *config.City) string {
