@@ -339,8 +339,9 @@ var (
 	schedulerNeverFiredLine = regexp.MustCompile(`^(\S+): never fired since controller start (\S+) ago$`)
 	schedulerFirstCycleLine = regexp.MustCompile(`^\S+: never fired \(controller running \S+, within first cycle\)$`)
 	// schedulerInFlightLine is a never-fired line whose only gate is the
-	// order's own tracking bead, unclaimed: the controller has reached the
-	// order and its first dispatch is running as doctor reads.
+	// order's own tracking bead (doctor does not judge its holder, so it
+	// always prints "unassigned"): the controller has reached the order and
+	// its first dispatch is running as doctor reads.
 	schedulerInFlightLine = regexp.MustCompile(`^(\S+): never fired since controller start (\S+) ago, gated on open work \S+ \((\S+) old, unassigned; order-tracking bead: a dispatch is in flight\)$`)
 )
 
@@ -392,8 +393,8 @@ func schedulerLagOnly(report doctorReport) bool {
 		// including a lag line carrying a suffix (", gated on open work ..."
 		// is a stuck item; ", open-work lookup failed: ..." is a failed store
 		// read), is not lag. The one gated line that is lag is a first
-		// dispatch caught in flight: its gate is the order's own young,
-		// unclaimed tracking bead, not a stuck item.
+		// dispatch caught in flight: its gate is the order's own young
+		// tracking bead, not a stuck item.
 		for _, d := range r.Details {
 			switch {
 			case schedulerStaleLine.MatchString(d):
@@ -599,6 +600,9 @@ func testNeverFiredOrders(t *testing.T) {
 	orders := []string{"gate-sweep"}
 	if still := stillNeverFired(report("gate-sweep: never fired since controller start 2m ago"), orders); len(still) != 1 {
 		t.Errorf("flagged line: stillNeverFired = %v, want [gate-sweep]", still)
+	}
+	if still := stillNeverFired(report("gate-sweep: never fired since controller start 2m ago, gated on open work ae-wisp-b6m (0s old, unassigned; order-tracking bead: a dispatch is in flight)"), orders); len(still) != 1 {
+		t.Errorf("in-flight line: stillNeverFired = %v, want [gate-sweep]", still)
 	}
 	if still := stillNeverFired(report("gate-sweep: never fired (controller running 2m, within first cycle)"), orders); len(still) != 1 {
 		t.Errorf("first-cycle line: stillNeverFired = %v, want [gate-sweep]", still)
