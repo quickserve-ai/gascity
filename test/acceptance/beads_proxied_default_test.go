@@ -338,6 +338,11 @@ var (
 	schedulerCurrentLine    = regexp.MustCompile(`^(\d+) other scheduled order\(s\) current$`)
 	schedulerNeverFiredLine = regexp.MustCompile(`^(\S+): never fired since controller start (\S+) ago$`)
 	schedulerFirstCycleLine = regexp.MustCompile(`^\S+: never fired \(controller running \S+, within first cycle\)$`)
+	// schedulerInFlightLine is a never-fired line whose only gate is the
+	// order's own tracking bead (doctor does not judge its holder, so it
+	// always prints "unassigned"): the controller has reached the order and
+	// its first dispatch is running as doctor reads.
+	schedulerInFlightLine = regexp.MustCompile(`^(\S+): never fired since controller start (\S+) ago, gated on open work \S+ \((\S+) old, unassigned; order-tracking bead: a dispatch is in flight\)$`)
 )
 
 // schedulerLagOnly reports whether the run's ONLY blocking failure is the test
@@ -353,7 +358,12 @@ var (
 // controller dispatches at most 4 orders a tick, so the test city's ~20 orders
 // take ~5 ticks to fire once, while order-firing-current flags a never-fired
 // 30s order after 45s (run 38485422418: 8 orders fired in two ticks, and
-// gate-sweep, 11th of the rest, was not yet reached one minute in).
+// gate-sweep, 11th of the rest, was not yet reached one minute in). It may be
+// read mid-dispatch, the order's tracking bead at most
+// schedulerDispatchInFlight old ("gate-sweep: never fired since controller
+// start 2m ago, gated on open work ae-wisp-b6m (0s old, unassigned;
+// order-tracking bead: a dispatch is in flight)", runs 38762309551 and
+// 38771902221).
 // A lookup timeout, a never-fired order on an older controller or with no
 // order shown firing, an unreadable history, or any other failing check is
 // NOT lag and stays fatal: those are the defects this assertion has caught
@@ -382,7 +392,9 @@ func schedulerLagOnly(report doctorReport) bool {
 		// first-cycle note, or its closing count line. Anything else,
 		// including a lag line carrying a suffix (", gated on open work ..."
 		// is a stuck item; ", open-work lookup failed: ..." is a failed store
-		// read), is not lag.
+		// read), is not lag. The one gated line that is lag is a first
+		// dispatch caught in flight: its gate is the order's own young
+		// tracking bead, not a stuck item.
 		for _, d := range r.Details {
 			switch {
 			case schedulerStaleLine.MatchString(d):
@@ -393,6 +405,17 @@ func schedulerLagOnly(report doctorReport) bool {
 			case schedulerNeverFiredLine.MatchString(d):
 				uptime, err := time.ParseDuration(schedulerNeverFiredLine.FindStringSubmatch(d)[2])
 				if err != nil || uptime > schedulerColdStart {
+					return false
+				}
+				lagged, neverFired = true, true
+			case schedulerInFlightLine.MatchString(d):
+				m := schedulerInFlightLine.FindStringSubmatch(d)
+				uptime, err := time.ParseDuration(m[2])
+				if err != nil || uptime > schedulerColdStart {
+					return false
+				}
+				age, err := time.ParseDuration(m[3])
+				if err != nil || age > schedulerDispatchInFlight {
 					return false
 				}
 				lagged, neverFired = true, true
@@ -427,6 +450,12 @@ const schedulerMaxLag = 5 * time.Minute
 // covers up to 3m29s. A never-fired order on an older controller has been
 // skipped, which the assertion must catch.
 const schedulerColdStart = 3 * time.Minute
+
+// schedulerDispatchInFlight is how old an order's tracking bead may be while
+// its first dispatch still counts as in flight. The check prints the age
+// rounded to the minute, so "1m" covers up to 1m29s; a dispatch older than
+// that is stuck, which the assertion must catch.
+const schedulerDispatchInFlight = time.Minute
 
 // schedulerLateNotStopped judges one stale line's captured age and interval:
 // only the test city's 1-minute orders, and only up to schedulerMaxLag.
@@ -489,6 +518,32 @@ func TestSchedulerLagOnly(t *testing.T) {
 		{"never fired gated on open work", report(1, false,
 			"gate-sweep: never fired since controller start 1m ago, gated on open work ga-1 (1m old, unassigned)",
 			"8 other scheduled order(s) current"), false},
+		{"first dispatch in flight, others current", report(1, false, // runs 38762309551, 38771902221
+			"dolt-health: last fired 1m ago, expected every 1m (overdue)",
+			"gate-sweep: never fired since controller start 2m ago, gated on open work ae-wisp-b6m (0s old, unassigned; order-tracking bead: a dispatch is in flight)",
+			"order-tracking-sweep: never fired since controller start 2m ago",
+			"reaper: never fired (controller running 2m, within first cycle)",
+			"10 other scheduled order(s) current"), true},
+		{"dispatch in flight at the in-flight bound", report(1, false,
+			"gate-sweep: never fired since controller start 3m ago, gated on open work ae-wisp-b6m (1m old, unassigned; order-tracking bead: a dispatch is in flight)",
+			"10 other scheduled order(s) current"), true},
+		{"dispatch in flight past the in-flight bound: stuck", report(1, false,
+			"gate-sweep: never fired since controller start 2m ago, gated on open work ae-wisp-b6m (2m old, unassigned; order-tracking bead: a dispatch is in flight)",
+			"10 other scheduled order(s) current"), false},
+		{"dispatch in flight of unknown age", report(1, false,
+			"gate-sweep: never fired since controller start 2m ago, gated on open work ae-wisp-b6m (age unknown, unassigned; order-tracking bead: a dispatch is in flight)",
+			"10 other scheduled order(s) current"), false},
+		{"dispatch in flight on an older controller", report(1, false,
+			"gate-sweep: never fired since controller start 4m ago, gated on open work ae-wisp-b6m (0s old, unassigned; order-tracking bead: a dispatch is in flight)",
+			"10 other scheduled order(s) current"), false},
+		{"tracking bead with a holder", report(1, false,
+			"gate-sweep: never fired since controller start 2m ago, gated on open work ae-wisp-b6m (0s old, gc-1; order-tracking bead: a dispatch is in flight)",
+			"10 other scheduled order(s) current"), false},
+		{"gated on a run whose holder check failed", report(1, false,
+			"gate-sweep: never fired since controller start 2m ago, gated on open work ae-wisp-b6m (0s old, unassigned; holder check failed: boom)",
+			"10 other scheduled order(s) current"), false},
+		{"dispatch in flight with nothing shown firing", report(1, false,
+			"gate-sweep: never fired since controller start 2m ago, gated on open work ae-wisp-b6m (0s old, unassigned; order-tracking bead: a dispatch is in flight)"), false},
 		{"never fired with nothing shown firing", report(1, false,
 			"gate-sweep: never fired since controller start 1m ago"), false},
 		{"never fired with zero orders current", report(1, false,
@@ -536,9 +591,18 @@ func testNeverFiredOrders(t *testing.T) {
 	if len(got) != 1 || got[0] != "gate-sweep" {
 		t.Errorf("neverFiredOrders = %v, want [gate-sweep]", got)
 	}
+	got = neverFiredOrders(report(
+		"gate-sweep: never fired since controller start 2m ago, gated on open work ae-wisp-b6m (0s old, unassigned; order-tracking bead: a dispatch is in flight)",
+		"10 other scheduled order(s) current"))
+	if len(got) != 1 || got[0] != "gate-sweep" {
+		t.Errorf("in-flight line: neverFiredOrders = %v, want [gate-sweep]", got)
+	}
 	orders := []string{"gate-sweep"}
 	if still := stillNeverFired(report("gate-sweep: never fired since controller start 2m ago"), orders); len(still) != 1 {
 		t.Errorf("flagged line: stillNeverFired = %v, want [gate-sweep]", still)
+	}
+	if still := stillNeverFired(report("gate-sweep: never fired since controller start 2m ago, gated on open work ae-wisp-b6m (0s old, unassigned; order-tracking bead: a dispatch is in flight)"), orders); len(still) != 1 {
+		t.Errorf("in-flight line: stillNeverFired = %v, want [gate-sweep]", still)
 	}
 	if still := stillNeverFired(report("gate-sweep: never fired (controller running 2m, within first cycle)"), orders); len(still) != 1 {
 		t.Errorf("first-cycle line: stillNeverFired = %v, want [gate-sweep]", still)
@@ -621,6 +685,8 @@ func neverFiredOrders(report doctorReport) []string {
 		}
 		for _, d := range r.Details {
 			if m := schedulerNeverFiredLine.FindStringSubmatch(d); m != nil {
+				names = append(names, m[1])
+			} else if m := schedulerInFlightLine.FindStringSubmatch(d); m != nil {
 				names = append(names, m[1])
 			}
 		}
