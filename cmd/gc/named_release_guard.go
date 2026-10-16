@@ -27,9 +27,10 @@ import (
 // WHY AT THE WRITER. On 2026-09-11 gc's own per-bead writer cleared 50 beads off a
 // named agent 8 s after its session bead closed, 11 of them in_progress -> open, and
 // the owner's resume check then reported "no work". The guards added since sat in
-// two of the callers (releasableAssigneeIdentities, and the per-identity skip in
-// unclaimWorkAssignedToRetiredSessionBead) and covered only a LIVE configured seat
-// under its exact identity. The drain-ack release, the stranded-repair sweep and
+// two of the callers (the release-identity filter, now durableSessionIdentities,
+// and the per-identity skip in unclaimWorkAssignedToRetiredSessionBead) and covered
+// only a LIVE configured seat under its exact identity. The drain-ack release, the
+// stranded-repair sweep and
 // the orphan-close tie-break had no named check at all, and a suspended or removed
 // named agent, work held under the session bead ID or alias_history, and the
 // runtime-name spelling were released by design. Guarding callers one by one is
