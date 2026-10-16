@@ -297,7 +297,7 @@ func (r *orderWispOwnerResolver) isLive(ref orderWispClaimRef) (bool, string, er
 		return false, "", nil
 	}
 	// A configured named session between sessions is its normal state, not an
-	// orphan: its claims outlive any one session bead (releasableAssigneeIdentities).
+	// orphan: its claims outlive any one session bead (durableSessionIdentities).
 	if _, ok := findNamedSessionSpecForAssignee(r.cfg, r.cityName, ref.value); ok {
 		return true, "configured named session with no open session; its claims outlive any one session", nil
 	}
