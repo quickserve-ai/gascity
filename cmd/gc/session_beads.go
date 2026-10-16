@@ -4533,7 +4533,7 @@ func releaseWorkFromClosedSessionBeadExcept(store beads.Store, sw *SeatWork, ses
 	// The close-time re-read (Late) adds what was assigned since sw's read.
 	// RELEASE set, not the capture set: a closing session's durable named
 	// identity (session_name, configured_named_identity) must not be used to
-	// detach its work (ga-9n8hjv; see releasableAssigneeIdentities). The
+	// detach its work (ga-9n8hjv; see durableSessionIdentities). The
 	// caller's preserve set withholds further identities on top of it.
 	scope := releaseScopeOfBead(sessionBead, sw.Legs().cfg).except(preserve).except(durableSessionIdentities(sw.Legs().cfg, sessionBead))
 	out, err := ReleaseClaims(sw, scope, releaseSeatOfBead(sessionBead), releaseCloseCascade, ReleaseOpts{Late: true, Audit: stderr})
