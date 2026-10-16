@@ -558,8 +558,8 @@ func reapClosedBeadWorktreesGuarded(
 				passCtx = pre.ctx
 			}
 			remove := func() {
-				// Last-use re-check, after every blocking step above: a seat
-				// that worked in the tree while this pass ran protects it.
+				// Last-use re-check, after every blocking step above:
+				// activity that moves a sampled mtime protects it.
 				if recheckWhy = finalQuietPeriodReason(worktreePath, &cfg.Daemon); recheckWhy != "" {
 					return
 				}
@@ -881,11 +881,11 @@ func computeWorktreeAge(worktreePath string) (age time.Duration, ok bool) {
 const lastActivityAgeSep = ", last_activity_age="
 
 // quietPeriodReason applies the last-use gate to one worktree and returns the
-// protecting reason, or "" when the tree has gone unused for at least the
-// configured quiet period (only an explicit zero disables the gate). A
-// misconfigured period or an indeterminate last use protects. The reason ends
-// with the activity age (negative for a timestamp in the future, which also
-// protects).
+// protecting reason, or "" when the sampled paths show no recent activity for
+// at least the configured quiet period (only an explicit zero disables the
+// gate). A misconfigured period or an indeterminate last use protects. The
+// reason ends with the activity age (negative for a timestamp in the future,
+// which also protects).
 //
 // The safety claim is narrow, and these are its limits:
 //   - It sees only changes to its four sampled paths: the worktree root
