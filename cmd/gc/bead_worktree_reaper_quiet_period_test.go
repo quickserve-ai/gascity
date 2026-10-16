@@ -111,23 +111,26 @@ func TestReapClosedBeadWorktrees_ReapsWorktreeQuietLongerThanDefaultQuietPeriod(
 // `git reflog expire` as `git gc` does (the accepted cost: one more quiet
 // period before that tree is reaped). Its content is never read.
 func TestReapClosedBeadWorktrees_ProtectsFreshReflogWhateverItsContent(t *testing.T) {
-	for name, write := range map[string]func(t *testing.T, rigRoot, reflog string) error{
-		"empty": func(_ *testing.T, _, reflog string) error { return os.WriteFile(reflog, nil, 0o644) },
-		"garbage": func(_ *testing.T, _, reflog string) error {
-			return os.WriteFile(reflog, []byte("garbage garbage garbage 1 garbage\n"), 0o644)
+	writeReflog := func(t *testing.T, reflog string, content []byte) {
+		t.Helper()
+		if err := os.WriteFile(reflog, content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, write := range map[string]func(t *testing.T, rigRoot, reflog string){
+		"empty": func(t *testing.T, _, reflog string) { writeReflog(t, reflog, nil) },
+		"garbage": func(t *testing.T, _, reflog string) {
+			writeReflog(t, reflog, []byte("garbage garbage garbage 1 garbage\n"))
 		},
-		"gc rewrite": func(t *testing.T, rigRoot, _ string) error {
+		"gc rewrite": func(t *testing.T, rigRoot, _ string) {
 			mustGit(t, rigRoot, "reflog", "expire", "--expire=never", "--all")
-			return nil
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			cityPath, rigRoot := initReapRig(t)
 			wt := addClosedWorktree(t, rigRoot, cityPath, "seat", "ga-quiet09")
 			gitDir := strings.TrimSpace(runGit(t, wt, "rev-parse", "--absolute-git-dir"))
-			if err := write(t, rigRoot, filepath.Join(gitDir, "logs", "HEAD")); err != nil {
-				t.Fatal(err)
-			}
+			write(t, rigRoot, filepath.Join(gitDir, "logs", "HEAD"))
 			requireProtected(t, runQuietReap(t, cityPath, rigRoot, "ga-quiet09", nil, nil), wt, "used within the quiet period")
 		})
 	}
