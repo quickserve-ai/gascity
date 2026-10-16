@@ -237,7 +237,7 @@ var parityFindings = map[string]parityEntry{
 		append([]string{"sleep_intent", "sleep_reason", "slept_at", "drain_at", "detached_at", "stranded_event_emitted_at", session.DrainIntentReasonKey, session.DrainIntentAtKey, session.DrainIntentIncarnationKey}, parityStartKeys...),
 	},
 
-	// The carry's legacy-only rows (the fork's CARRY.md): behaviour the fleet
+	// The carry's legacy-only rows (the fork's CARRY.md): behavior the fleet
 	// runs under the default legacy reconciler that v2 does not implement.
 	// Each stays a finding until v2 ports it or its owner rules it away.
 	"carry-drain-ack-teardown": {
