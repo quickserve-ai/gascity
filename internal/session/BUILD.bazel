@@ -233,6 +233,7 @@ go_test(
         "//internal/api:bazel_go_srcs",
         "//internal/api:handler_sessions.go",
         "//internal/beadmeta:bazel_go_srcs",
+        "//internal/liveness:bazel_go_srcs",
         "//internal/worker:bazel_go_srcs",
     ],
     embed = [":session"],
