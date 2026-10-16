@@ -24,8 +24,7 @@ func TestIsInfrastructureKillTargetReadsComm(t *testing.T) {
 	write(100, "tmux: server")
 	write(101, "tmux")
 	write(102, "claude")
-	restore := SetScanRootForTesting(root)
-	defer restore()
+	SetScanRootForTesting(t, root)
 	for pid, want := range map[int]bool{100: true, 101: true, 102: false, 103: false} {
 		if got := isInfrastructureKillTarget(pid); got != want {
 			t.Errorf("isInfrastructureKillTarget(%d) = %v, want %v", pid, got, want)
