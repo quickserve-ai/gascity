@@ -5590,7 +5590,7 @@ func TestCloseBeadProposesWorkAssignedBySuspendedNamedIdentity(t *testing.T) {
 }
 
 // namedSessionTestCfg declares "reviewer" as a [[named_session]] whose backing agent
-// is live or suspended. releasableAssigneeIdentities reaches it through
+// is live or suspended. durableSessionIdentities reaches it through
 // isConfiguredNamedSessionIdentity, the only thing that can separate a LIVE named seat
 // (whose work must be withheld) from a SUSPENDED one (whose work must be released,
 // because the named-session tier never claims for a suspended agent).
