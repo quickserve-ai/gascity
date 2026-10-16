@@ -71,7 +71,18 @@ type reapReport struct {
 //     (worktreeLastActivity). It covers what gate 6 cannot see: a seat whose
 //     resident process sits in its home and works in the tree through
 //     short-lived shell calls (pl-4fj). An indeterminate last use or a
-//     misconfigured period protects.
+//     misconfigured period protects, and the gate runs again immediately
+//     before removal (after the borrow-veto query and every other blocking
+//     step), on every caller's path, dry-run included.
+//     What it does NOT guarantee (see quietPeriodReason): it sees only
+//     changes to its four sampled paths (the worktree root directory and the
+//     gitdir's HEAD, index and logs/HEAD). A reader moves none of them, and
+//     neither does some writing, e.g. appending to an existing git-ignored
+//     file in an existing subdirectory, which gate 4 also ignores; such a
+//     seat is not protected by it past the quiet period. The final check and
+//     the removal are not atomic with an agent already running, and it
+//     trusts the wall clock. A shared exclusion mechanism that closes these
+//     is follow-on pl-r561.
 //  4. Git state: no authored uncommitted changes and no commits that removing
 //     the worktree would orphan — commits reachable from no branch, tag, or
 //     remote-tracking ref (git.HasUnreachableCommitsResult). The test is
@@ -480,6 +491,25 @@ func reapClosedBeadWorktreesGuarded(
 			}
 
 			if dryRun {
+				// Dry-run also runs the final quiet-period check a real
+				// removal runs (in remove below), so it never says "would
+				// reap" for a tree that check would protect. A real removal
+				// has further guards that dry-run skips (preRemovalReason,
+				// the session-start fence), and those can protect a tree
+				// dry-run lists.
+				if why := finalQuietPeriodReason(worktreePath, &cfg.Daemon); why != "" {
+					if skips.shouldSurface(worktreePath, why) {
+						fmt.Fprintf(stderr, //nolint:errcheck
+							"reapClosedBeadWorktrees: protecting %s (bead %s closed but %s)\n",
+							worktreePath, beadID, why,
+						)
+						recordReapSkipped(rec, beadID, worktreePath, rigName, why)
+					}
+					report.Protected = append(report.Protected, reapDecision{
+						BeadID: beadID, Path: worktreePath, Rig: rigName, Branch: branch, Reason: why,
+					})
+					continue
+				}
 				const whatIf = "dry-run: would reap (closed bead, clean tree, no live process)"
 				if skips.shouldSurface(worktreePath, whatIf) {
 					fmt.Fprintf(stderr, //nolint:errcheck
@@ -522,11 +552,17 @@ func reapClosedBeadWorktreesGuarded(
 			// scan it was judged on started (sessionStartFence.runIfQuiet).
 			// Nothing but the remove runs inside the fence.
 			var removeErr error
+			var recheckWhy string
 			var passCtx context.Context
 			if pre != nil {
 				passCtx = pre.ctx
 			}
 			remove := func() {
+				// Last-use re-check, after every blocking step above:
+				// activity that moves a sampled mtime protects it.
+				if recheckWhy = finalQuietPeriodReason(worktreePath, &cfg.Daemon); recheckWhy != "" {
+					return
+				}
 				gitCtx, cancel := reaperGitCtx(passCtx)
 				defer cancel()
 				removeErr = git.New(rigRoot).WorktreeRemoveCtx(gitCtx, worktreePath, false)
@@ -548,6 +584,19 @@ func reapClosedBeadWorktreesGuarded(
 				}
 			} else {
 				remove()
+			}
+			if recheckWhy != "" {
+				if skips.shouldSurface(worktreePath, recheckWhy) {
+					fmt.Fprintf(stderr, //nolint:errcheck
+						"reapClosedBeadWorktrees: protecting %s (bead %s closed but %s)\n",
+						worktreePath, beadID, recheckWhy,
+					)
+					recordReapSkipped(rec, beadID, worktreePath, rigName, recheckWhy)
+				}
+				report.Protected = append(report.Protected, reapDecision{
+					BeadID: beadID, Path: worktreePath, Rig: rigName, Branch: branch, Reason: recheckWhy,
+				})
+				continue
 			}
 			if err := removeErr; err != nil {
 				fmt.Fprintf(stderr, "reapClosedBeadWorktrees: removing %s: %v\n", worktreePath, err) //nolint:errcheck
@@ -832,11 +881,32 @@ func computeWorktreeAge(worktreePath string) (age time.Duration, ok bool) {
 const lastActivityAgeSep = ", last_activity_age="
 
 // quietPeriodReason applies the last-use gate to one worktree and returns the
-// protecting reason, or "" when the tree has gone unused for at least the
-// configured quiet period (only an explicit zero disables the gate). A
-// misconfigured period or an indeterminate last use protects. The reason ends
-// with the activity age (negative for a timestamp in the future, which also
-// protects).
+// protecting reason, or "" when the sampled paths show no recent activity for
+// at least the configured quiet period (only an explicit zero disables the
+// gate). A misconfigured period or an indeterminate last use protects. The
+// reason ends with the activity age (negative for a timestamp in the future,
+// which also protects).
+//
+// The safety claim is narrow, and these are its limits:
+//   - It sees only changes to its four sampled paths: the worktree root
+//     directory and the gitdir's HEAD, index and logs/HEAD. Reading files,
+//     `git log` or `git diff` move none of them, and neither does some
+//     writing: appending to an existing git-ignored file in an existing
+//     subdirectory changes no sampled mtime, and ignored content does not
+//     trip the dirty-tree gate either. A seat whose use is invisible this way
+//     is unprotected by this gate once its last sampled change is older than
+//     the quiet period (the liveness gate still sees a process whose cwd is
+//     in the tree at scan time).
+//   - It is check-then-remove, not a lock. The final check runs immediately
+//     before `git worktree remove`, but an agent that is already running can
+//     start using the tree between the two.
+//   - It trusts the wall clock. File mtimes carry no monotonic reading, so a
+//     forward jump of the controller's clock, or mtimes written by a host
+//     whose clock lags it, reads as that much extra quiet. Only a timestamp
+//     in the future is caught.
+//
+// A shared exclusion mechanism the reaper takes before removal (follow-on
+// pl-r561) is what closes all three.
 func quietPeriodReason(worktreePath string, d *config.DaemonConfig) string {
 	quiet, err := d.AutoReapClosedBeadWorktreesQuietPeriod()
 	if err != nil {
@@ -855,20 +925,40 @@ func quietPeriodReason(worktreePath string, d *config.DaemonConfig) string {
 	return ""
 }
 
+// finalQuietPeriodReason is the last-use re-check run immediately before a
+// removal, and before a dry-run's "would reap": quietPeriodReason with the
+// pre-removal prefix, or "". Dry-run runs only this final check, so it never
+// says "would reap" for a tree this check would protect; a real removal has
+// further guards (preRemovalReason, the session-start fence) that dry-run
+// skips and that can protect a tree dry-run lists.
+func finalQuietPeriodReason(worktreePath string, d *config.DaemonConfig) string {
+	if why := quietPeriodReason(worktreePath, d); why != "" {
+		return "pre-removal re-check: " + why
+	}
+	return ""
+}
+
 // worktreeLastActivity returns when worktreePath was last used: the newest
-// mtime among its root directory and its private gitdir's HEAD and index,
-// which a commit, checkout, `git add` or file creation in the root refreshes.
-// Three stats, never a tree walk. The reflog is not read by its mtime: `git
-// gc` rewrites every worktree's reflog at once, which would make every tree
-// in a busy repo look used. ok is false when the gitdir cannot be resolved or
-// any of the three cannot be stat'd, a missing index included.
+// mtime among its root directory and its private gitdir's HEAD, index and
+// logs/HEAD. A `git add` or a file created in the root moves an mtime, and a
+// commit, checkout or reset appends to logs/HEAD even when it rewrites
+// neither HEAD nor the index (an empty commit on a clean tree), whatever date
+// the entry records. The reflog's content is never read, only its mtime, so
+// it can only ever protect: `git gc` and `git reflog expire` rewrite every
+// worktree's reflog at once, which makes the tree look used for one more
+// quiet period, a delay and never a removal. A few stats, never a tree walk.
+// ok is false when the gitdir cannot be resolved or any of the four cannot be
+// stat'd. That includes a missing index and a missing logs/HEAD: an absent
+// reflog cannot tell a HEAD that never moved (or a repository with
+// core.logAllRefUpdates off) from a reflog that recorded recent use and was
+// then removed, so it protects, and such a tree is never reaped by this gate.
 func worktreeLastActivity(worktreePath string) (time.Time, bool) {
 	gitDir, ok := worktreeGitDir(worktreePath)
 	if !ok {
 		return time.Time{}, false
 	}
 	var newest time.Time
-	for _, p := range [...]string{worktreePath, filepath.Join(gitDir, "HEAD"), filepath.Join(gitDir, "index")} {
+	for _, p := range [...]string{worktreePath, filepath.Join(gitDir, "HEAD"), filepath.Join(gitDir, "index"), filepath.Join(gitDir, "logs", "HEAD")} {
 		info, err := os.Stat(p)
 		if err != nil {
 			return time.Time{}, false
