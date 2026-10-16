@@ -99,6 +99,7 @@ func backdateWorktreeActivity(t *testing.T, worktreePath string, age time.Durati
 		filepath.Join(worktreePath, ".git"),
 		filepath.Join(gitDir, "HEAD"),
 		filepath.Join(gitDir, "index"),
+		filepath.Join(gitDir, "logs", "HEAD"),
 	} {
 		if err := os.Chtimes(p, backdated, backdated); err != nil {
 			t.Fatalf("backdate %s: %v", p, err)
