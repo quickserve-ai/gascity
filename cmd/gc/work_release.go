@@ -189,8 +189,10 @@ type releaseSeat struct {
 }
 
 func releaseSeatOfBead(b beads.Bead) releaseSeat {
-	s := releaseSeat{id: b.ID, name: b.Metadata["session_name"], template: b.Metadata["template"], fallback: retiredSessionFallbackRoute(b),
-		named: isNamedSessionBead(b) || strings.TrimSpace(b.Metadata["configured_named_identity"]) != "", alias: b.Metadata["alias"]}
+	s := releaseSeat{
+		id: b.ID, name: b.Metadata["session_name"], template: b.Metadata["template"], fallback: retiredSessionFallbackRoute(b),
+		named: isNamedSessionBead(b) || strings.TrimSpace(b.Metadata["configured_named_identity"]) != "", alias: b.Metadata["alias"],
+	}
 	s.nameStarted(b.Metadata[sessionpkg.CurrentBeadIDKey], b.Metadata[beadmeta.CurrentClaimBeadIDMetadataKey])
 	s.nameRecorded(startedClaimBead(b.Metadata[executionClaimStartedKey]))
 	s.nameWorkStarted(b.Metadata[sessionpkg.WorkStartedKey])
@@ -198,8 +200,10 @@ func releaseSeatOfBead(b beads.Bead) releaseSeat {
 }
 
 func releaseSeatOfInfo(info sessionpkg.Info) releaseSeat {
-	s := releaseSeat{id: info.ID, name: info.SessionNameMetadata, template: info.Template, fallback: retiredSessionFallbackRouteInfo(info),
-		named: isNamedSessionInfo(info) || strings.TrimSpace(info.ConfiguredNamedIdentity) != "", alias: info.Alias}
+	s := releaseSeat{
+		id: info.ID, name: info.SessionNameMetadata, template: info.Template, fallback: retiredSessionFallbackRouteInfo(info),
+		named: isNamedSessionInfo(info) || strings.TrimSpace(info.ConfiguredNamedIdentity) != "", alias: info.Alias,
+	}
 	for _, id := range append([]string{info.ConfiguredNamedIdentity, info.Alias}, info.AliasHistory...) {
 		if id = strings.TrimSpace(id); id != "" {
 			s.records = append(s.records, id)
