@@ -727,7 +727,7 @@ func TestReadyUnboundRigIsSkippedOnBothSurfaces(t *testing.T) {
 	}
 
 	cs := &controllerState{cfg: cfg, cityName: cfg.Workspace.Name, cityPath: cityDir, cacheCtx: context.Background()}
-	if apiStores := cs.buildStores(cfg); len(apiStores) != 0 {
+	if apiStores := cs.buildStores(cfg, nil); len(apiStores) != 0 {
 		t.Fatalf("the API built %v for the unbound rig but gc ready built %v; the two surfaces must skip it identically or this slice's CLI == API criterion is false on the arm it did not change", apiStores, stores)
 	}
 }
