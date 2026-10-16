@@ -3,6 +3,7 @@
 package productmetrics
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
@@ -37,6 +38,11 @@ type TesthookOptions struct {
 	PauseKeys      []TesthookPauseKey
 	Now            func() time.Time
 	NewUUID        func() (string, error)
+	// WithDeadline builds the real-time bound on RecordOnce's state-lock
+	// wait. A caller that freezes Now must supply one that follows the same
+	// clock model, or the frozen decision window still carries a live 50 ms
+	// wall-clock lock deadline. Nil keeps the production context.WithTimeout.
+	WithDeadline func(context.Context, time.Duration) (context.Context, context.CancelFunc)
 }
 
 // OpenTesthook constructs a synthetic official/default-on service for a
@@ -111,6 +117,7 @@ func OpenTesthook(options TesthookOptions) (*Service, error) {
 		getenv:               os.Getenv,
 		newUUID:              newUUID,
 		now:                  now,
+		withDeadline:         options.WithDeadline,
 		verifyTTY:            productionNoticeWriterIsTTY,
 		privateUploaderStart: asynchronousUploadStart(transport),
 	})
