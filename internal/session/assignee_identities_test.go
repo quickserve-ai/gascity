@@ -426,3 +426,36 @@ func TestHasRecordAnsweringTo_NothingToLookUp(t *testing.T) {
 		t.Fatalf("blank identity = %v, %v after %d lookups; want false, nil and no lookup", got, err, len(store.queries))
 	}
 }
+
+// TestCurrentAssigneeIdentitiesExcludesAliasHistory pins the reader/writer
+// asymmetry (ga-56nq1a, codex P1 on PR #128): a prior alias can be REUSED by
+// a later live session, so the heartbeat writer's identity set must stop at
+// the identifiers this session answers to now, while the orphan-release
+// reader keeps the full history. If this set ever grows history back, session
+// A heartbeats session B's work through the reused alias and keeps B's claims
+// looking alive after B dies.
+func TestCurrentAssigneeIdentitiesExcludesAliasHistory(t *testing.T) {
+	info := Info{
+		ID:                      "mc-sess1",
+		SessionNameMetadata:     "katya",
+		ConfiguredNamedIdentity: "gastown.katya",
+		Alias:                   "nux",
+		AliasHistory:            []string{"toast", "capable"},
+	}
+	got := CurrentAssigneeIdentities(info)
+	want := []string{"mc-sess1", "katya", "gastown.katya", "nux"}
+	if len(got) != len(want) {
+		t.Fatalf("CurrentAssigneeIdentities = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("CurrentAssigneeIdentities = %v, want %v", got, want)
+		}
+	}
+	// And the wide reader set still carries the history, so the asymmetry is
+	// a deliberate pair, not a drifted copy.
+	wide := AssigneeIdentities(info)
+	if len(wide) != len(want)+2 {
+		t.Fatalf("AssigneeIdentities = %v, want the same set plus both history aliases", wide)
+	}
+}
