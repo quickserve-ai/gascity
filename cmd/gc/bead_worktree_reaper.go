@@ -74,11 +74,15 @@ type reapReport struct {
 //     misconfigured period protects, and the gate runs again immediately
 //     before removal (after the borrow-veto query and every other blocking
 //     step), on every caller's path, dry-run included.
-//     What it does NOT guarantee (see quietPeriodReason): it sees writes,
-//     not readers, so a seat that only reads the tree past the quiet period
-//     is not protected by it; the final check and the removal are not atomic
-//     with an agent already running; and it trusts the wall clock. A shared
-//     exclusion mechanism that closes these is follow-on pl-r561.
+//     What it does NOT guarantee (see quietPeriodReason): it sees only
+//     changes to its four sampled paths (the worktree root directory and the
+//     gitdir's HEAD, index and logs/HEAD). A reader moves none of them, and
+//     neither does some writing, e.g. appending to an existing git-ignored
+//     file in an existing subdirectory, which gate 4 also ignores; such a
+//     seat is not protected by it past the quiet period. The final check and
+//     the removal are not atomic with an agent already running, and it
+//     trusts the wall clock. A shared exclusion mechanism that closes these
+//     is follow-on pl-r561.
 //  4. Git state: no authored uncommitted changes and no commits that removing
 //     the worktree would orphan — commits reachable from no branch, tag, or
 //     remote-tracking ref (git.HasUnreachableCommitsResult). The test is
@@ -487,9 +491,12 @@ func reapClosedBeadWorktreesGuarded(
 			}
 
 			if dryRun {
-				// The final last-use check a real removal runs (in remove
-				// below), so dry-run never says "would reap" for a tree a
-				// real pass would protect.
+				// Dry-run also runs the final quiet-period check a real
+				// removal runs (in remove below), so it never says "would
+				// reap" for a tree that check would protect. A real removal
+				// has further guards that dry-run skips (preRemovalReason,
+				// the session-start fence), and those can protect a tree
+				// dry-run lists.
 				if why := finalQuietPeriodReason(worktreePath, &cfg.Daemon); why != "" {
 					if skips.shouldSurface(worktreePath, why) {
 						fmt.Fprintf(stderr, //nolint:errcheck
@@ -881,11 +888,15 @@ const lastActivityAgeSep = ", last_activity_age="
 // protects).
 //
 // The safety claim is narrow, and these are its limits:
-//   - It sees MUTATION, not use. Every signal is an mtime that a write moves;
-//     reading files, `git log` or `git diff` move none of them, so a seat that
-//     only reads a tree is unprotected by this gate once its last write is
-//     older than the quiet period (the liveness gate still sees a process
-//     whose cwd is in the tree at scan time).
+//   - It sees only changes to its four sampled paths: the worktree root
+//     directory and the gitdir's HEAD, index and logs/HEAD. Reading files,
+//     `git log` or `git diff` move none of them, and neither does some
+//     writing: appending to an existing git-ignored file in an existing
+//     subdirectory changes no sampled mtime, and ignored content does not
+//     trip the dirty-tree gate either. A seat whose use is invisible this way
+//     is unprotected by this gate once its last sampled change is older than
+//     the quiet period (the liveness gate still sees a process whose cwd is
+//     in the tree at scan time).
 //   - It is check-then-remove, not a lock. The final check runs immediately
 //     before `git worktree remove`, but an agent that is already running can
 //     start using the tree between the two.
@@ -916,7 +927,10 @@ func quietPeriodReason(worktreePath string, d *config.DaemonConfig) string {
 
 // finalQuietPeriodReason is the last-use re-check run immediately before a
 // removal, and before a dry-run's "would reap": quietPeriodReason with the
-// pre-removal prefix, or "".
+// pre-removal prefix, or "". Dry-run runs only this final check, so it never
+// says "would reap" for a tree this check would protect; a real removal has
+// further guards (preRemovalReason, the session-start fence) that dry-run
+// skips and that can protect a tree dry-run lists.
 func finalQuietPeriodReason(worktreePath string, d *config.DaemonConfig) string {
 	if why := quietPeriodReason(worktreePath, d); why != "" {
 		return "pre-removal re-check: " + why
