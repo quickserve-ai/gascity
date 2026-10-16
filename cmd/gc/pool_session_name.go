@@ -54,7 +54,7 @@ func sessionBeadAssigneeIdentities(sb beads.Bead) []string {
 // durableSessionIdentities is the set of a closing session's identities its work
 // must not be detached under (ga-9n8hjv). The session bead ID and the pool alias
 // (plus alias history) are session handles: once the session is gone they name
-// nothing, so work still claimed under one is orphaned and is released.
+// nothing, so this filter does not withhold them.
 // session_name and configured_named_identity are durable identities: a configured
 // named seat between sessions is its normal state, and releasing under them strips
 // the seat's portfolio each time it cycles (measured 2026-09-11: 50 beads detached
@@ -62,10 +62,11 @@ func sessionBeadAssigneeIdentities(sb beads.Bead) []string {
 //
 // With cfg, it withholds every identity of the seat that names a LIVE configured
 // named session (isConfiguredNamedSessionIdentity, which excludes a suspended one:
-// the named-session tier never claims for a suspended agent, so its work must be
-// released), as unclaimWorkAssignedToRetiredSessionBead does. With a nil cfg it
-// must not call isConfiguredNamedSessionIdentity, which returns false there and
-// would fail open; it withholds the metadata identities instead, which can only
+// the named-session tier never claims for a suspended agent, so this filter does
+// not withhold its identities), as unclaimWorkAssignedToRetiredSessionBead does.
+// With a nil cfg it must not call isConfiguredNamedSessionIdentity, which returns
+// false there and would fail open; instead, when the bead carries
+// configured_named_identity, it withholds that and session_name, which can only
 // release less, and releaseOrphanedPoolAssignments on the next reconcile tick is
 // the fallback. The close cascade's release scope drops this set
 // (releaseWorkFromClosedSessionBeadExcept, and the v2 close effect).
