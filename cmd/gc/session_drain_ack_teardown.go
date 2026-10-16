@@ -69,11 +69,13 @@ type drainAckTeardownOutcome struct {
 // The retained_for reasons for a drain-ack with assigned work that the teardown
 // is not allowed to act on: the seat is not a disposable pool seat, it is a
 // canonical singleton pool's stable identity, or the call site did not grant
-// permission to close it.
+// permission to close it; and the one for a seat the teardown acted on but kept:
+// the caller observed a bead and the release sweep found nothing to release.
 const (
-	drainAckRetainedNotPoolSeat       = "not_pool_seat"
-	drainAckRetainedSingletonIdentity = "singleton_identity"
-	drainAckRetainedCloseNotPermitted = "close_not_permitted"
+	drainAckRetainedNotPoolSeat         = "not_pool_seat"
+	drainAckRetainedSingletonIdentity   = "singleton_identity"
+	drainAckRetainedCloseNotPermitted   = "close_not_permitted"
+	drainAckRetainedReleaseFoundNothing = "release_found_nothing"
 )
 
 // drainAckTeardownRefusal returns "" when a drain-acked seat is one the teardown
@@ -101,10 +103,14 @@ func drainAckTeardownRefusal(cfg *config.City, info sessionpkg.Info) string {
 // holds and closes the seat's bead. The caller has already observed that the
 // seat drain-acked with assigned work and that its runtime is gone. sw is the
 // tick's read of every work leg; the release reads the seat live (fresh).
+// observed is the ID of the bead the caller saw the seat holding; when it is
+// set and the sweep attempts no release, the seat is kept
+// (release_found_nothing) rather than closed over work it may still hold.
 func tearDownDrainAckedPoolSeat(
 	store beads.Store,
 	sw *SeatWork,
 	info sessionpkg.Info,
+	observed string,
 	now time.Time,
 	stderr io.Writer,
 ) drainAckTeardownOutcome {
@@ -158,6 +164,16 @@ func tearDownDrainAckedPoolSeat(
 	attempted := released + len(out.Kept) + len(out.Failed)
 	if readErr != nil || len(out.Failed) > 0 {
 		return drainAckTeardownOutcome{retainedFor: "release_failed", released: released, attempted: attempted}
+	}
+	// The caller observed a bead on this seat, but the sweep attempted nothing:
+	// the two finders disagree, so closing would leave the observed bead
+	// assigned to a closed seat while the log reads as a complete sweep
+	// (pl-xx64). Keep the seat: the caller completes the ack as a sleep, the
+	// shape this teardown replaced, so a bead still under the seat's names stays
+	// owned by an open seat that its assignment can wake and the stranded repair
+	// can see, never by a closed one.
+	if observed != "" && attempted == 0 {
+		return drainAckTeardownOutcome{retainedFor: drainAckRetainedReleaseFoundNothing}
 	}
 	if !closeBead(store, sw, info, drainAckTeardownCloseReason, now, stderr) {
 		return drainAckTeardownOutcome{retainedFor: "close_failed", released: released, attempted: attempted}
