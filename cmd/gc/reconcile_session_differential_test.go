@@ -1328,8 +1328,10 @@ func parityFixtures() []parityFixture {
 			// The carry's drain-ack teardown (ga-x99xh0) retires the seat in
 			// legacy instead: its work released, the seat closed, a fresh one
 			// started; v2 restarts the same seat with its work.
-			Explain: map[string]string{"provider:RemoveMeta s-gc-1": "drain-env-clears", "row:gc-1:*teardown": "carry-drain-ack-teardown", "work:gw-1:*teardown": "carry-drain-ack-teardown",
-				"row:gc-2": "carry-drain-ack-teardown", "provider:Start s-gc-1": "carry-drain-ack-teardown", "provider:Start worker-gc-2": "carry-drain-ack-teardown", "provider:RemoveMeta worker-gc-2": "carry-drain-ack-teardown"},
+			Explain: map[string]string{
+				"provider:RemoveMeta s-gc-1": "drain-env-clears", "row:gc-1:*teardown": "carry-drain-ack-teardown", "work:gw-1:*teardown": "carry-drain-ack-teardown",
+				"row:gc-2": "carry-drain-ack-teardown", "provider:Start s-gc-1": "carry-drain-ack-teardown", "provider:Start worker-gc-2": "carry-drain-ack-teardown", "provider:RemoveMeta worker-gc-2": "carry-drain-ack-teardown",
+			},
 		},
 		{
 			// A stop-pending named row with no work ends drained, and its
