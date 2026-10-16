@@ -51,59 +51,24 @@ func sessionBeadAssigneeIdentities(sb beads.Bead) []string {
 	return identities
 }
 
-// releasableAssigneeIdentities returns the subset of sessionBeadAssigneeIdentities
-// under which a closing session's work may be DETACHED. Capture and release want
-// opposite sets from the same function, which is the distinction this exists to make
-// explicit (ga-9n8hjv).
+// durableSessionIdentities is the set of a closing session's identities its work
+// must not be detached under (ga-9n8hjv). The session bead ID and the pool alias
+// (plus alias history) are session handles: once the session is gone they name
+// nothing, so work still claimed under one is orphaned and is released.
+// session_name and configured_named_identity are durable identities: a configured
+// named seat between sessions is its normal state, and releasing under them strips
+// the seat's portfolio each time it cycles (measured 2026-09-11: 50 beads detached
+// 9 s after one session bead closed, 11 of them reset in_progress -> open).
 //
-// The session bead ID and the pool alias (plus alias history) are SESSION HANDLES:
-// when the session is gone the handle names nothing, so work still claimed under one
-// is genuinely orphaned and must be released or it is held forever.
-//
-// session_name and configured_named_identity are DURABLE IDENTITIES. A configured
-// named agent between sessions is the normal, doctrine-encouraged state — not an
-// orphan — and releasing on those identifiers strips the seat's whole portfolio every
-// time it cycles. Measured 2026-09-11: 50 beads detached 9s after one session bead
-// closed, 11 of them reset in_progress -> open, after which the mechanical resume
-// check reported "no work" to a seat that held 11 in-progress items. The more
-// disciplined the seat is about cycling at clean boundaries, the more often it was
-// stripped.
-//
-// WHEN cfg IS PRESENT, this consults it. isConfiguredNamedSessionIdentity answers the
-// question the metadata alone cannot: it separates a LIVE configured named seat (whose
-// work must be withheld) from a SUSPENDED one (whose work must be RELEASED, because the
-// named-session tier never claims work for a suspended agent — withholding there would
-// orphan the bead with neither tier picking it up). This mirrors the sibling release
-// path in cmdSessionClose (unclaimWorkAssignedToRetiredSessionBead) so the two release
-// paths cannot disagree about the same seat.
-//
-// WHEN cfg IS NIL, this falls back to the metadata alone, and MUST NOT call
-// isConfiguredNamedSessionIdentity: that function returns false on a nil cfg, so calling
-// it blind here would fail OPEN and strip live seats — the original 2026-09-11 bug.
-// Withholding both name-shaped identifiers is the conservative cut; it can only ever
-// release LESS. The cost is bounded: pool work is routed, and releaseOrphanedPoolAssignments
-// at the top of the next reconcile tick is this function's documented idempotent fallback.
-// The identifiers pool work is actually claimed under (the bead ID and the alias) are
-// retained on BOTH branches, so ordinary polecat orphan release is untouched either way.
-func releasableAssigneeIdentities(cfg *config.City, sb beads.Bead) []string {
-	withheld := durableSessionIdentities(cfg, sb)
-	identities := make([]string, 0, 5)
-	for _, id := range sessionBeadAssigneeIdentities(sb) {
-		if _, skip := withheld[strings.TrimSpace(id)]; skip {
-			continue
-		}
-		identities = append(identities, id)
-	}
-	return identities
-}
-
-// durableSessionIdentities is the set releasableAssigneeIdentities withholds
-// (ga-9n8hjv), by the two branches above: with cfg, every identity of the seat
-// that is a configured named-session identity of a LIVE agent
-// (isConfiguredNamedSessionIdentity, which already excludes a suspended one);
-// without cfg, the metadata-only cut below. The close cascade's release scope
-// drops the same set (releaseWorkFromClosedSessionBeadExcept, and the v2 close
-// effect).
+// With cfg, it withholds every identity of the seat that names a LIVE configured
+// named session (isConfiguredNamedSessionIdentity, which excludes a suspended one:
+// the named-session tier never claims for a suspended agent, so its work must be
+// released), as unclaimWorkAssignedToRetiredSessionBead does. With a nil cfg it
+// must not call isConfiguredNamedSessionIdentity, which returns false there and
+// would fail open; it withholds the metadata identities instead, which can only
+// release less, and releaseOrphanedPoolAssignments on the next reconcile tick is
+// the fallback. The close cascade's release scope drops this set
+// (releaseWorkFromClosedSessionBeadExcept, and the v2 close effect).
 func durableSessionIdentities(cfg *config.City, sb beads.Bead) map[string]struct{} {
 	withheld := map[string]struct{}{}
 	if cfg != nil {
