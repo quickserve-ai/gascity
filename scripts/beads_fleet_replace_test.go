@@ -133,3 +133,28 @@ func TestBazelFleetBDFollowsTheBeadsFleetTag(t *testing.T) {
 		}
 	}
 }
+
+// TestMacAcceptanceFleetBDFollowsTheBeadsFleetTag is the Mac lane's twin of the
+// Bazel test above (ga-tkfdsb). Tier A acceptance on the Mac runs plain go test,
+// and setup-gascity-macos installs the upstream BD_VERSION release, which kept
+// TestBeadsProxiedDefaultNativeLane/status-zero-forks red on the Mac nightly
+// after ga-l0b72a.2 fixed only Bazel. The acceptance step takes the fleet bd
+// named by FLEET_BD_TAG through GC_ACCEPTANCE_BD_BIN; this keeps that tag on
+// the replace's and the step wired to it.
+func TestMacAcceptanceFleetBDFollowsTheBeadsFleetTag(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join(repoRoot(t), ".github", "workflows", "mac-regression.yml"))
+	if err != nil {
+		t.Fatalf("read mac-regression.yml: %v", err)
+	}
+	workflow := string(data)
+	for _, want := range []string{
+		`FLEET_BD_TAG: "` + beadsFleetTag + `"`,
+		`GC_ACCEPTANCE_BD_BIN: ${{ steps.fleet-bd.outputs.path }}`,
+		`https://github.com/quickserve-ai/beads/releases/download/${TAG}`,
+		`shasum -a 256 -c -`,
+	} {
+		if !strings.Contains(workflow, want) {
+			t.Errorf("mac-regression.yml lacks %s: the Mac acceptance step must test gc against the fleet bd %s", want, beadsFleetTag)
+		}
+	}
+}
