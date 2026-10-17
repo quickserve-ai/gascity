@@ -147,3 +147,85 @@ func TestPassthroughGCSideRefusesAMeasurementOfNothing(t *testing.T) {
 		t.Errorf("a floor 1.85s above the command's gc side gave marginal %v with no error; it would pass any gc side under 2s", got)
 	}
 }
+
+// loadedSampler stands in for a box under load: every call is one process
+// run, numbered from 1 in the order the gate makes them, and a call whose
+// number falls inside [from, to] costs `extra` on top of its base time.
+type loadedSampler struct {
+	calls    int
+	from, to int
+	extra    time.Duration
+}
+
+func (l *loadedSampler) run(base time.Duration) time.Duration {
+	l.calls++
+	if l.calls >= l.from && l.calls <= l.to {
+		return base + l.extra
+	}
+	return base
+}
+
+func TestGateMarginalOverFloor(t *testing.T) {
+	const (
+		budget = 100 * time.Millisecond
+		floor  = 100 * time.Millisecond
+		gcSide = 150 * time.Millisecond // a 50ms marginal: within budget
+	)
+	noPause := func() {}
+
+	// The shape that fired in CI (39008517541): five floors first, then five
+	// command samples, and the load landed on the command samples only. Here
+	// the load covers calls 6-10, which in that order is every command sample
+	// and no floor. Interleaved, calls 6-10 are a mix of both, so the command
+	// keeps clean samples and the floor stays honest.
+	burst := &loadedSampler{from: 6, to: 10, extra: 250 * time.Millisecond}
+	got, err := GateMarginalOverFloor(1, 5, budget, noPause,
+		func() time.Duration { return burst.run(floor) },
+		func() time.Duration { return burst.run(gcSide) })
+	if err != nil {
+		t.Fatalf("a burst over calls 6-10: %v", err)
+	}
+	if !got.Pass || got.Marginal != 50*time.Millisecond {
+		t.Errorf("a burst over calls 6-10 = pass %v marginal %v, want pass with the unloaded 50ms\n%s", got.Pass, got.Marginal, got.Describe())
+	}
+
+	// A load episode that outlasts a whole round and that the floor does not
+	// feel (CI's floor stayed at 112-115ms while every command sample tripled):
+	// round 1's command samples are all loaded, so it misses, and the gate
+	// re-measures after a pause instead of failing.
+	pauses := 0
+	episode := &loadedSampler{from: 1, to: 5, extra: 250 * time.Millisecond}
+	got, err = GateMarginalOverFloor(3, 5, budget, func() { pauses++ },
+		func() time.Duration { return floor },
+		func() time.Duration { return episode.run(gcSide) })
+	if err != nil {
+		t.Fatalf("a round-long episode: %v", err)
+	}
+	if !got.Pass || len(got.Rounds) != 2 || pauses != 1 {
+		t.Errorf("a round-long episode = pass %v after %d round(s), %d pause(s); want a pass in round 2 after one pause\n%s", got.Pass, len(got.Rounds), pauses, got.Describe())
+	}
+
+	// The regression signal: a gc that bolted 150ms of work onto the
+	// passthrough pays it on every sample of every round, so no round passes.
+	pauses = 0
+	got, err = GateMarginalOverFloor(3, 5, budget, func() { pauses++ },
+		func() time.Duration { return floor },
+		func() time.Duration { return gcSide + 150*time.Millisecond })
+	if err != nil {
+		t.Fatalf("a regressed command: %v", err)
+	}
+	if got.Pass || len(got.Rounds) != 3 || got.Marginal != 200*time.Millisecond || pauses != 2 {
+		t.Errorf("a command 200ms over its floor = pass %v, %d round(s), best marginal %v, %d pause(s); want a fail after all 3 rounds at 200ms\n%s", got.Pass, len(got.Rounds), got.Marginal, pauses, got.Describe())
+	}
+	if d := got.Describe(); strings.Count(d, "round ") != 3 || !strings.Contains(d, "300ms") {
+		t.Errorf("Describe must name every round and every sample, got:\n%s", d)
+	}
+
+	// The vacuity guard survives the rounds: a floor that stopped being one
+	// is an error, not a retry.
+	if _, err := GateMarginalOverFloor(3, 5, budget, noPause,
+		func() time.Duration { return 2 * time.Second },
+		func() time.Duration { return gcSide }); err == nil {
+		t.Error("a floor 1.85s above the command's gc side was accepted")
+	}
+}

@@ -216,3 +216,94 @@ func (b *BDTrace) Describe() string {
 	}
 	return strings.Join(lines, "\n")
 }
+
+// MarginalRound is one round of GateMarginalOverFloor: every floor and
+// command sample it took, in the order taken, and the marginal of their
+// minimums.
+type MarginalRound struct {
+	Floors   []time.Duration
+	GCSides  []time.Duration
+	Marginal time.Duration
+}
+
+// MarginalGate is GateMarginalOverFloor's result: every round it measured
+// and the best marginal among them.
+type MarginalGate struct {
+	Rounds   []MarginalRound
+	Marginal time.Duration
+	Pass     bool
+}
+
+// Describe renders every sample of every round, so a failure says whether
+// the load was on the floor, on the command, or on both.
+func (g MarginalGate) Describe() string {
+	lines := make([]string, 0, len(g.Rounds))
+	for i, round := range g.Rounds {
+		lines = append(lines, fmt.Sprintf("  round %d: marginal %s; floors %s; gc sides %s",
+			i+1, round.Marginal, joinDurations(round.Floors), joinDurations(round.GCSides)))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func joinDurations(ds []time.Duration) string {
+	parts := make([]string, 0, len(ds))
+	for _, d := range ds {
+		parts = append(parts, d.Round(time.Millisecond).String())
+	}
+	return "[" + strings.Join(parts, " ") + "]"
+}
+
+// GateMarginalOverFloor measures a command's marginal gc-side time over the
+// bare-process floor and holds it to budget, in a way a loaded runner cannot
+// fail on its own.
+//
+// Within a round, floor and command samples alternate (floor, command,
+// floor, ...), and the round's marginal is the minimum command sample over
+// the minimum floor sample, through MarginalOverFloor. The minimum, not the
+// mean: each sample is a fixed cost plus whatever else the box was doing, and
+// a regression that adds work raises every sample, the best one included.
+// Sampling all floors
+// first let a load burst fall on the command samples only, and CI failed that
+// way: floor 115ms, every command sample about three times its usual cost
+// (39008517541). A round over budget is measured again after pause, up to
+// rounds rounds, and the gate passes on the first round within budget. A gc
+// that bolts work onto the command pays it on every sample of every round,
+// so it still fails. A floor that is not one (MarginalOverFloor's error)
+// ends the gate at once: it is a broken measurement, not a slow box.
+func GateMarginalOverFloor(rounds, samples int, budget time.Duration, pause func(), floor, gcSide func() time.Duration) (MarginalGate, error) {
+	var gate MarginalGate
+	for r := 0; r < rounds; r++ {
+		if r > 0 {
+			pause()
+		}
+		var round MarginalRound
+		minFloor, minGCSide := time.Duration(-1), time.Duration(-1)
+		for i := 0; i < samples; i++ {
+			f := floor()
+			round.Floors = append(round.Floors, f)
+			if minFloor < 0 || f < minFloor {
+				minFloor = f
+			}
+			g := gcSide()
+			round.GCSides = append(round.GCSides, g)
+			if minGCSide < 0 || g < minGCSide {
+				minGCSide = g
+			}
+		}
+		marginal, err := MarginalOverFloor(minGCSide, minFloor, budget)
+		if err != nil {
+			gate.Rounds = append(gate.Rounds, round)
+			return gate, fmt.Errorf("round %d: %w", r+1, err)
+		}
+		round.Marginal = marginal
+		gate.Rounds = append(gate.Rounds, round)
+		if r == 0 || marginal < gate.Marginal {
+			gate.Marginal = marginal
+		}
+		if marginal <= budget {
+			gate.Pass = true
+			return gate, nil
+		}
+	}
+	return gate, nil
+}
