@@ -218,16 +218,20 @@ func (b *BDTrace) Describe() string {
 }
 
 // MarginalRound is one round of GateMarginalOverFloor: every floor and
-// command sample it took, in the order taken, and the marginal of their
-// minimums.
+// command sample it took, in the order taken, and the marginal of the
+// minimums over this round and every round before it. Err is set when that
+// marginal could not be measured (MarginalOverFloor refused the floor); its
+// Marginal is then not a reading.
 type MarginalRound struct {
 	Floors   []time.Duration
 	GCSides  []time.Duration
 	Marginal time.Duration
+	Err      error
 }
 
 // MarginalGate is GateMarginalOverFloor's result: every round it measured
-// and the best marginal among them.
+// and the last round's marginal, which is over every sample taken (so it is
+// also the best).
 type MarginalGate struct {
 	Rounds   []MarginalRound
 	Marginal time.Duration
@@ -239,8 +243,12 @@ type MarginalGate struct {
 func (g MarginalGate) Describe() string {
 	lines := make([]string, 0, len(g.Rounds))
 	for i, round := range g.Rounds {
+		marginal := round.Marginal.Round(time.Millisecond).String()
+		if round.Err != nil {
+			marginal = "invalid (" + round.Err.Error() + ")"
+		}
 		lines = append(lines, fmt.Sprintf("  round %d: marginal %s; floors %s; gc sides %s",
-			i+1, round.Marginal, joinDurations(round.Floors), joinDurations(round.GCSides)))
+			i+1, marginal, joinDurations(round.Floors), joinDurations(round.GCSides)))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -258,8 +266,10 @@ func joinDurations(ds []time.Duration) string {
 // fail on its own.
 //
 // Within a round, floor and command samples alternate (floor, command,
-// floor, ...), and the round's marginal is the minimum command sample over
-// the minimum floor sample, through MarginalOverFloor. The minimum, not the
+// floor, ...). A round's marginal is the minimum command sample over the
+// minimum floor sample, through MarginalOverFloor, both minimums taken over
+// this round and every round before it: a later round whose floors are
+// inflated must not lower the floor a regression is measured against. The minimum, not the
 // mean: each sample is a fixed cost plus whatever else the box was doing, and
 // a regression that adds work raises every sample, the best one included.
 // Sampling all floors
@@ -272,12 +282,12 @@ func joinDurations(ds []time.Duration) string {
 // ends the gate at once: it is a broken measurement, not a slow box.
 func GateMarginalOverFloor(rounds, samples int, budget time.Duration, pause func(), floor, gcSide func() time.Duration) (MarginalGate, error) {
 	var gate MarginalGate
+	minFloor, minGCSide := time.Duration(-1), time.Duration(-1)
 	for r := 0; r < rounds; r++ {
 		if r > 0 {
 			pause()
 		}
 		var round MarginalRound
-		minFloor, minGCSide := time.Duration(-1), time.Duration(-1)
 		for i := 0; i < samples; i++ {
 			f := floor()
 			round.Floors = append(round.Floors, f)
@@ -292,14 +302,13 @@ func GateMarginalOverFloor(rounds, samples int, budget time.Duration, pause func
 		}
 		marginal, err := MarginalOverFloor(minGCSide, minFloor, budget)
 		if err != nil {
+			round.Err = err
 			gate.Rounds = append(gate.Rounds, round)
 			return gate, fmt.Errorf("round %d: %w", r+1, err)
 		}
 		round.Marginal = marginal
 		gate.Rounds = append(gate.Rounds, round)
-		if r == 0 || marginal < gate.Marginal {
-			gate.Marginal = marginal
-		}
+		gate.Marginal = marginal
 		if marginal <= budget {
 			gate.Pass = true
 			return gate, nil

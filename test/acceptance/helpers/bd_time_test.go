@@ -221,11 +221,42 @@ func TestGateMarginalOverFloor(t *testing.T) {
 		t.Errorf("Describe must name every round and every sample, got:\n%s", d)
 	}
 
+	// A retry must not re-earn a floor: the regressed command is 300ms on
+	// every sample, round 1's floors are 100ms, and later rounds' floors are
+	// inflated to 220ms by load. Taken round by round, round 2 reads an 80ms
+	// marginal and passes the regression (Astra r1, finding 1). The lowest
+	// floor seen in any round is the floor.
+	floorCalls := 0
+	got, err = GateMarginalOverFloor(3, 5, budget, noPause,
+		func() time.Duration {
+			floorCalls++
+			if floorCalls <= 5 {
+				return floor
+			}
+			return 220 * time.Millisecond
+		},
+		func() time.Duration { return gcSide + 150*time.Millisecond })
+	if err != nil {
+		t.Fatalf("a regressed command under inflated later floors: %v", err)
+	}
+	if got.Pass {
+		t.Errorf("a command 200ms over round 1's floor passed once later floors inflated:\n%s", got.Describe())
+	}
+
 	// The vacuity guard survives the rounds: a floor that stopped being one
-	// is an error, not a retry.
-	if _, err := GateMarginalOverFloor(3, 5, budget, noPause,
+	// is an error, not a retry, and the round says it is invalid rather than
+	// showing a zero marginal it never measured.
+	pauses = 0
+	got, err = GateMarginalOverFloor(3, 5, budget, func() { pauses++ },
 		func() time.Duration { return 2 * time.Second },
-		func() time.Duration { return gcSide }); err == nil {
+		func() time.Duration { return gcSide })
+	if err == nil {
 		t.Error("a floor 1.85s above the command's gc side was accepted")
+	}
+	if len(got.Rounds) != 1 || pauses != 0 {
+		t.Errorf("a broken floor ran %d round(s) with %d pause(s), want 1 and 0: it is not a slow box to wait out", len(got.Rounds), pauses)
+	}
+	if d := got.Describe(); !strings.Contains(d, "invalid") || strings.Contains(d, "marginal 0s") {
+		t.Errorf("a broken round must read as invalid, not as a zero marginal:\n%s", d)
 	}
 }

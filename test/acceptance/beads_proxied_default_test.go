@@ -2080,7 +2080,7 @@ func runProxiedNativeLaneGates(t *testing.T, bdPath, doltPath string) {
 			gate.Marginal.Round(time.Millisecond), len(gate.Rounds),
 			lastRecords, lastChild.Round(time.Millisecond), gate.Describe(), describe)
 		if !gate.Pass {
-			t.Errorf("marginal gc-side time for `gc bd list --json` = %s at best, want <= %s, in every one of %d rounds (each round: min gc side minus min `gc --help` floor, sampled interleaved)\n%s",
+			t.Errorf("marginal gc-side time for `gc bd list --json` = %s at best, want <= %s, after %d rounds (min gc side minus min `gc --help` floor over every interleaved sample taken)\n%s",
 				gate.Marginal.Round(time.Millisecond), proxiedNativeGCSideBudget, len(gate.Rounds), gate.Describe())
 		}
 	})
