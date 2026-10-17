@@ -2076,11 +2076,11 @@ func runProxiedNativeLaneGates(t *testing.T, bdPath, doltPath string) {
 		// The artifact: bd-bound and machine-bound, recorded so the delta is
 		// reproducible, never asserted. The 0.4s figure in the bead is a
 		// stretch target for a future in-process arm and is NOT a PR2 gate.
-		t.Logf("gc bd list --json, flag ON: best marginal %s over %d round(s) of 5 interleaved samples; last sample had %d traced call(s) totalling %s\n%s\n%s",
+		t.Logf("gc bd list --json, flag ON: cumulative marginal %s over %d round(s) of 5 interleaved samples; last sample had %d traced call(s) totalling %s\n%s\n%s",
 			gate.Marginal.Round(time.Millisecond), len(gate.Rounds),
 			lastRecords, lastChild.Round(time.Millisecond), gate.Describe(), describe)
 		if !gate.Pass {
-			t.Errorf("marginal gc-side time for `gc bd list --json` = %s at best, want <= %s, after %d rounds (min gc side minus min `gc --help` floor over every interleaved sample taken)\n%s",
+			t.Errorf("marginal gc-side time for `gc bd list --json` = %s, want <= %s, after %d rounds (min gc side minus min `gc --help` floor over every interleaved sample taken)\n%s",
 				gate.Marginal.Round(time.Millisecond), proxiedNativeGCSideBudget, len(gate.Rounds), gate.Describe())
 		}
 	})

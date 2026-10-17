@@ -230,8 +230,7 @@ type MarginalRound struct {
 }
 
 // MarginalGate is GateMarginalOverFloor's result: every round it measured
-// and the last round's marginal, which is over every sample taken (so it is
-// also the best).
+// and the last round's marginal, the cumulative one over every sample taken.
 type MarginalGate struct {
 	Rounds   []MarginalRound
 	Marginal time.Duration
