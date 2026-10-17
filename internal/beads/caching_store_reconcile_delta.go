@@ -155,3 +155,24 @@ func reconcileFingerprint(b Bead, deps []Dep) uint64 {
 	_, _ = fmt.Fprintf(h, "|%t|%d|%d", b.IndefinitelyDeferred, b.Revision, b.ClaimFence)
 	return h.Sum64()
 }
+
+// cacheReconcileDeltaChunk bounds one IN-list read of changed rows.
+const cacheReconcileDeltaChunk = 500
+
+// listForReconcile is the full-scan List narrowed to ids, in chunks, so a
+// delta pass applies exactly the filters a full pass would.
+func (c *CachingStore) listForReconcile(ids []string) ([]Bead, error) {
+	out := make([]Bead, 0, len(ids))
+	for start := 0; start < len(ids); start += cacheReconcileDeltaChunk {
+		end := min(start+cacheReconcileDeltaChunk, len(ids))
+		query := cacheFullScanQuery()
+		query.AllowScan = false
+		query.IDs = ids[start:end]
+		rows, err := c.backing.List(query)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, rows...)
+	}
+	return out, nil
+}
