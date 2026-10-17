@@ -310,8 +310,15 @@ func (c *CachingStore) runReconciliation() {
 	startSeq, startScan := c.mutationSeq, c.scanGen
 	c.mu.RUnlock()
 
+	plan := c.planReconcile(c.clockNow())
 	bdStart := time.Now()
-	fresh, err := c.backing.List(cacheFullScanQuery())
+	var fresh []Bead
+	var err error
+	if plan.delta {
+		fresh, err = c.listForReconcile(plan.fetch)
+	} else {
+		fresh, err = c.backing.List(cacheFullScanQuery())
+	}
 	if err != nil {
 		bdLatency := time.Since(bdStart)
 		c.mu.Lock()
@@ -343,7 +350,7 @@ func (c *CachingStore) runReconciliation() {
 		freshByID[b.ID] = cloneBead(b)
 	}
 
-	confirmedClosed, deferred := c.recoverMissingFromList(freshByID)
+	confirmedClosed, deferred := c.recoverMissingFromListKeep(freshByID, plan.keep)
 
 	depMap, depsComplete, depErr := c.fetchDepsForBeads(freshByID)
 	if depErr != nil {
@@ -357,7 +364,7 @@ func (c *CachingStore) runReconciliation() {
 	// completeness verdict and keeps only the problem-log entry.
 	// Its backing read still counts toward the latency that sets the cadence.
 	projectStart := time.Now()
-	enriched, _ := c.applyReadyProjection("reconcile ready projection", fresh)
+	enriched, projectionErr := c.applyReadyProjection("reconcile ready projection", fresh)
 	bdLatency := listLatency + time.Since(projectStart)
 	for _, b := range enriched {
 		if _, kept := freshByID[b.ID]; kept {
@@ -378,7 +385,11 @@ func (c *CachingStore) runReconciliation() {
 		return
 	}
 	now := c.clockNow()
-	res := c.mergeSnapshotLocked(freshByID, confirmedClosed, deferred, depMap, useFreshDeps, depErr != nil, startSeq, now)
+	res := c.mergeSnapshotKeepLocked(freshByID, plan.keep, confirmedClosed, deferred, depMap, useFreshDeps, depErr != nil, startSeq, now)
+	c.reconcileDigest = c.recordedDigestLocked(plan, freshByID, deferred, depMap, useFreshDeps, projectionErr)
+	if !plan.delta {
+		c.lastFullListAt = now
+	}
 	durMs := float64(time.Since(start).Microseconds()) / 1000.0
 	c.stats.LastReconcileMs = durMs
 	c.recordReconcileLatencyLocked(bdLatency)
@@ -558,6 +569,19 @@ func (c *CachingStore) mergeSnapshotLocked(
 	depMap map[string][]Dep, useFreshDeps, depsReadFailed bool,
 	startSeq uint64, now time.Time,
 ) mergeSectionResult {
+	return c.mergeSnapshotKeepLocked(freshByID, nil, confirmedClosed, deferred, depMap, useFreshDeps, depsReadFailed, startSeq, now)
+}
+
+// mergeSnapshotKeepLocked is mergeSnapshotLocked for a delta pass: keep names
+// the cached rows the pass did not list because their digest has not moved
+// (caching_store_reconcile_delta.go). They are left exactly as cached, so
+// freshByID plus keep is the complete active universe.
+func (c *CachingStore) mergeSnapshotKeepLocked(
+	freshByID map[string]Bead, keep map[string]struct{},
+	confirmedClosed map[string]Bead, deferred map[string]struct{},
+	depMap map[string][]Dep, useFreshDeps, depsReadFailed bool,
+	startSeq uint64, now time.Time,
+) mergeSectionResult {
 	c.scanGen++
 	c.fullScanGen = c.scanGen
 	// Preserve a cached is_blocked for any row the projection did not return
@@ -574,6 +598,12 @@ func (c *CachingStore) mergeSnapshotLocked(
 
 	res := mergeSectionResult{notifications: make([]cacheNotification, 0, len(freshByID))}
 	nextDepsComplete := useFreshDeps
+	if keep != nil {
+		// A delta pass read edges only for the rows it listed, so it can keep
+		// completeness but never restore it: an edge hole on a kept row (an
+		// event that dropped a row's deps) waits for the next full list.
+		nextDepsComplete = nextDepsComplete && c.depsComplete
+	}
 
 	// 1. Absorb loop — over freshByID. Classification reads pre-absorb state.
 	for id, freshBead := range freshByID {
@@ -642,6 +672,9 @@ func (c *CachingStore) mergeSnapshotLocked(
 	//    inside range c.beads is safe per the Go spec.
 	for id, cached := range c.beads {
 		if _, exists := freshByID[id]; exists {
+			continue
+		}
+		if _, kept := keep[id]; kept {
 			continue
 		}
 		d := reconcileMergeDecision(mergeRowInput{
@@ -841,10 +874,20 @@ func (c *CachingStore) depsForReconcileLocked(id string, freshBead Bead, depMap 
 // Callers must own freshByID and not access it concurrently while recovery is
 // running.
 func (c *CachingStore) recoverMissingFromList(freshByID map[string]Bead) (map[string]Bead, map[string]struct{}) {
+	return c.recoverMissingFromListKeep(freshByID, nil)
+}
+
+// recoverMissingFromListKeep is recoverMissingFromList for a delta pass: a
+// kept row is absent from freshByID because it was not listed, not because it
+// left the active set, so it is not re-read.
+func (c *CachingStore) recoverMissingFromListKeep(freshByID map[string]Bead, keep map[string]struct{}) (map[string]Bead, map[string]struct{}) {
 	c.mu.RLock()
 	candidates := make(map[string]Bead)
 	for id, b := range c.beads {
 		if _, ok := freshByID[id]; ok {
+			continue
+		}
+		if _, kept := keep[id]; kept {
 			continue
 		}
 		if b.Status == "closed" {
