@@ -1271,7 +1271,7 @@ func finalizeDrainAckStoppedSession(
 			if found {
 				ackedWork = &anomaly
 				observed = "assigned work " + anomaly.ID
-				outcome = tearDownDrainAckedPoolSeat(store, evidence, info, clk.Now().UTC(), stderr)
+				outcome = tearDownDrainAckedPoolSeat(store, evidence, info, anomaly.ID, clk.Now().UTC(), stderr)
 				if outcome.closed {
 					if dops != nil {
 						_ = dops.clearDrain(name)
