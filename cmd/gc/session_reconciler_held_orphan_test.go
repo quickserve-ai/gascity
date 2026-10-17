@@ -219,10 +219,13 @@ func reconcileUndesiredSeatWithDrainOps(t *testing.T, env *reconcilerTestEnv, id
 	if err != nil {
 		t.Fatalf("Get(%s): %v", id, err)
 	}
+	// env.startOptions carries the env's drain-ack stop tracker: without it the
+	// async stop a drain-ack starts is untracked, outlives the test, and races
+	// TempDir's removal of the city (.gc/session-name-locks: directory not empty).
 	reconcileSessionBeadsAtPath(
 		context.Background(), env.city, []beads.Bead{got}, nil, nil, env.cfg, env.sp, env.store,
 		newDrainOps(env.sp), nil, nil, nil, env.dt, map[string]int{}, storeQueryPartial, nil, "",
-		nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr,
+		nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr, env.startOptions...,
 	)
 }
 
