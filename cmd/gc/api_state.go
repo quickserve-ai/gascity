@@ -363,7 +363,8 @@ func newControllerStateWithRoutes(
 		if cityStoreErr != nil {
 			fmt.Fprintf(os.Stderr, "api: city bead store: %v (session/mail endpoints disabled)\n", cityStoreErr)
 		}
-		cs.beadStores, cs.rigStoreRefresh = cs.buildStoresWithRefresh(cfg)
+		cs.rigStoreRefresh = make(map[string]bool, len(cfg.Rigs))
+		cs.beadStores = cs.buildStores(cfg, cs.rigStoreRefresh)
 		if cityStoreErr == nil {
 			cs.cityBeadStore = wrapWithCachingStore(ctx, opened.Store, ep, true, cityPath, cacheHeartbeatCityScope, cs.reconcileGate())
 			cs.cityBeadsDiagnostic = diagnosticPtr(opened.Diagnostic)
@@ -530,14 +531,13 @@ func primeThenStartReconciler(ctx context.Context, cs *beads.CachingStore, agent
 // Mail providers are NOT built here — all mail uses the city-level store.
 // Does not read or write mutable cs fields (safe to call unlocked); reads
 // the runtime suspension state file to gate per-rig cache refresh.
-func (cs *controllerState) buildStores(cfg *config.City) map[string]beads.Store {
-	stores, _ := cs.buildStoresWithRefresh(cfg)
-	return stores
-}
-
-// buildStoresWithRefresh is buildStores that also returns, per rig store it
-// built, whether that store's background refresh (reconciler) was armed.
-func (cs *controllerState) buildStoresWithRefresh(cfg *config.City) (map[string]beads.Store, map[string]bool) {
+//
+// When armed is non-nil, it receives, per rig store built, whether that
+// store's background refresh (reconciler) was armed (ga-r5ppfi). It is an
+// out-parameter rather than a second return so this stays the one function
+// that hands back the rig store map (the residency boundary ratchet,
+// scripts/residency-boundary-baseline.txt).
+func (cs *controllerState) buildStores(cfg *config.City, armed map[string]bool) map[string]beads.Store {
 	cityProvider := rawBeadsProviderForScope(cs.cityPath, cs.cityPath)
 	suspState := loadSuspensionStateBestEffort(cs.cityPath)
 	stores := make(map[string]beads.Store, len(cfg.Rigs))
@@ -597,7 +597,12 @@ func (cs *controllerState) buildStoresWithRefresh(cfg *config.City) (map[string]
 		stores[rig.Name] = wrapWithCachingStore(cs.cacheCtx, store, cs.eventProv,
 			refresh[rig.Name], cs.cityPath, cacheHeartbeatScopeForRig(rig.Name), cs.rigReconcileGate(rig.Name))
 	}
-	return stores, refresh
+	if armed != nil {
+		for name, on := range refresh {
+			armed[name] = on
+		}
+	}
+	return stores
 }
 
 // rigStoreBackgroundRefresh reports whether the controller should run
@@ -1445,7 +1450,8 @@ func (cs *controllerState) updateLocked(cfg *config.City, sp runtime.Provider) {
 	}
 	// Build rig stores only after the publishing city-store open passes the
 	// schema gate; otherwise their cache loops would reconcile degraded state.
-	stores, storeRefresh := cs.buildStoresWithRefresh(cfg)
+	storeRefresh := make(map[string]bool, len(cfg.Rigs))
+	stores := cs.buildStores(cfg, storeRefresh)
 	cityStore := openedCityStore.Store
 	cityBeadsDiagnostic := diagnosticPtr(openedCityStore.Diagnostic)
 	var cityMailProv mail.Provider
