@@ -3082,7 +3082,7 @@ provider = "file"
 	}
 
 	cs := &controllerState{cityPath: cityDir, cfg: cfg}
-	stores := cs.buildStores(cfg)
+	stores := cs.buildStores(cfg, nil)
 	store, ok := stores["frontend"]
 	if !ok {
 		t.Fatal("buildStores() missing frontend store")
@@ -3149,7 +3149,7 @@ provider = "file"
 	}
 
 	cs := &controllerState{cityPath: cityDir, cfg: cfg}
-	stores := cs.buildStores(cfg)
+	stores := cs.buildStores(cfg, nil)
 
 	if !factoryCalled {
 		t.Fatal("buildStores did not route bd-backed rig through store factory")
@@ -3194,7 +3194,7 @@ provider = "file"
 	}
 
 	cs := &controllerState{cityPath: cityDir, cfg: cfg}
-	stores := cs.buildStores(cfg)
+	stores := cs.buildStores(cfg, nil)
 	rigStore, ok := stores["frontend"]
 	if !ok {
 		t.Fatal("buildStores() missing frontend store")
@@ -4198,7 +4198,7 @@ func TestBuildStores_ExecProviderSetsPerRigEnv(t *testing.T) {
 	}
 
 	cs := &controllerState{cityPath: cityDir}
-	stores := cs.buildStores(cfg)
+	stores := cs.buildStores(cfg, nil)
 
 	if len(stores) != 2 {
 		t.Fatalf("buildStores returned %d stores, want 2", len(stores))
@@ -4316,7 +4316,7 @@ func TestBuildStoresBdProviderUsesPassedConfigForRigEnv(t *testing.T) {
 		cityPath: cityDir,
 	}
 
-	stores := cs.buildStores(nextCfg)
+	stores := cs.buildStores(nextCfg, nil)
 	if stores["alpha"] == nil {
 		t.Fatal("buildStores did not create alpha store")
 	}
