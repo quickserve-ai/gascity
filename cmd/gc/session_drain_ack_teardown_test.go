@@ -46,6 +46,23 @@ func newDrainAckTeardownFixture(t *testing.T) *drainAckTeardownFixture {
 // maxActive and `seats` seats, each holding one routed in_progress bead.
 func newDrainAckTeardownFixtureSized(t *testing.T, maxActive, seats int) *drainAckTeardownFixture {
 	t.Helper()
+	return buildDrainAckTeardownFixture(t, maxActive, seats, nil)
+}
+
+// newDrainAckTeardownNamepoolFixture is the live platform-pool shape behind
+// pl-xx64: a max-2 namepool pool whose `seats` seats each hold one routed
+// in_progress bead claimed under the seat's stable alias ("repo/furiosa"), as
+// `gc hook --claim` claims, rather than under the session bead ID.
+func newDrainAckTeardownNamepoolFixture(t *testing.T, seats int) *drainAckTeardownFixture {
+	t.Helper()
+	return buildDrainAckTeardownFixture(t, 2, seats, []string{"furiosa", "nux"})
+}
+
+// buildDrainAckTeardownFixture builds the fixture. With a namepool, the agent
+// draws seat names from it and each bead is assigned to its seat's alias;
+// without one, each bead is assigned to its seat's bead ID.
+func buildDrainAckTeardownFixture(t *testing.T, maxActive, seats int, namepool []string) *drainAckTeardownFixture {
+	t.Helper()
 	now := time.Date(2026, 9, 25, 23, 19, 33, 0, time.UTC)
 	cityDir := t.TempDir()
 	writeCityTOML(t, cityDir, "trace-town", "worker")
@@ -61,6 +78,7 @@ func newDrainAckTeardownFixtureSized(t *testing.T, maxActive, seats int) *drainA
 				StartCommand:      "true",
 				MinActiveSessions: intPtr(0),
 				MaxActiveSessions: intPtr(maxActive),
+				NamepoolNames:     namepool,
 			}},
 		},
 		store: beads.NewMemStore(),
@@ -81,6 +99,12 @@ func newDrainAckTeardownFixtureSized(t *testing.T, maxActive, seats int) *drainA
 			t.Fatalf("start seat %s runtime: %v", name, err)
 		}
 		assignee := seat.ID
+		if len(namepool) > 0 {
+			assignee = seat.Metadata["alias"]
+			if assignee == "" || assignee == seat.ID || assignee == name {
+				t.Fatalf("precondition: namepool seat %s alias = %q, want a stable alias distinct from its ID and session_name %q", seat.ID, assignee, name)
+			}
+		}
 		if err := f.store.Update(work.ID, beads.UpdateOpts{Status: &inProgress, Assignee: &assignee}); err != nil {
 			t.Fatalf("assign %s to %s: %v", work.ID, seat.ID, err)
 		}
@@ -401,7 +425,7 @@ func TestDrainAckTeardown_CertParkReadsLiveLabelsNotCache(t *testing.T) {
 
 	var stderr bytes.Buffer
 	now := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
-	outcome := tearDownDrainAckedPoolSeat(store, testSeatWork("", nil, store, nil), seedSessionInfo(mustGetBead(t, mem, seat.ID)), now, &stderr)
+	outcome := tearDownDrainAckedPoolSeat(store, testSeatWork("", nil, store, nil), seedSessionInfo(mustGetBead(t, mem, seat.ID)), work.ID, now, &stderr)
 	if outcome.closed || outcome.retainedFor != "cert_parked_work:"+work.ID {
 		t.Fatalf("outcome = %+v, want retained for cert_parked_work:%s (the live row carries the hold); stderr=%s", outcome, work.ID, stderr.String())
 	}
@@ -497,5 +521,114 @@ func TestDrainAckTeardown_SingletonPoolIdentityKept(t *testing.T) {
 	}
 	if want := "seat kept: " + drainAckRetainedSingletonIdentity; !strings.Contains(f.stderr.String(), want) {
 		t.Fatalf("stderr does not name %q: %s", want, f.stderr.String())
+	}
+}
+
+// TestDrainAckTeardown_NamepoolSeatReleasesAliasHeldWork is a regression guard
+// for the alias fix that landed with re-sync #7 (4bfafc5be), which put the
+// release sweep on releaseScope, the classifier's alias-bearing set. It passes
+// on carry/operational without pl-xx64's change and is not evidence of it. It
+// pins the live platform-pool shape: a namepool seat claims its bead under its
+// stable alias ("repo/furiosa"), not its session bead ID, and the drain ack
+// releases that bead (assignee cleared, status open, gc.routed_to kept) before
+// the seat closes. A sweep on the narrower {ID, session_name,
+// configured_named_identity} set logs "released 0 of 0; seat closed" and
+// leaves the bead in_progress under the closed seat; this test fails then.
+func TestDrainAckTeardown_NamepoolSeatReleasesAliasHeldWork(t *testing.T) {
+	f := newDrainAckTeardownNamepoolFixture(t, 1)
+	seat := f.sessions[0]
+	alias := seat.Metadata["alias"]
+	name := seat.Metadata["session_name"]
+	if err := f.dops.setDrainAck(name); err != nil {
+		t.Fatalf("setDrainAck(%s): %v", name, err)
+	}
+	f.tick(t, f.dops)
+	waitForProviderStopped(t, f.sp, name)
+	f.tick(t, f.dops)
+
+	logged := f.stderr.String()
+	if got := mustGetBead(t, f.store, seat.ID); got.Status != "closed" {
+		t.Fatalf("seat %s status=%q state=%q, want closed; stderr=%s", seat.ID, got.Status, got.Metadata["state"], logged)
+	}
+	w := mustGetBead(t, f.store, f.work[0].ID)
+	if w.Assignee != "" || w.Status != "open" {
+		t.Fatalf("alias-held work %s: assignee=%q status=%q, want released (\"\"/open) from %q; stderr=%s", w.ID, w.Assignee, w.Status, alias, logged)
+	}
+	if route := w.Metadata[beadmeta.RoutedToMetadataKey]; route != drainAckTeardownTemplate {
+		t.Fatalf("work %s gc.routed_to = %q, want %q kept", w.ID, route, drainAckTeardownTemplate)
+	}
+	if !drainAckTeardownAudited(logged, w.ID) {
+		t.Fatalf("no release audit line for %s with path=%s; stderr=%s", w.ID, drainAckTeardownReleasePath, logged)
+	}
+	if want := "observed assigned work " + w.ID + "; released 1 of 1; seat closed"; !strings.Contains(logged, want) {
+		t.Fatalf("stderr does not report %q: %s", want, logged)
+	}
+	if n := drainAckedEventCount(f.rec); n != 1 {
+		t.Fatalf("%s events = %d, want exactly 1", events.SessionDrainAckedWithAssignedWork, n)
+	}
+}
+
+// TestDrainAckTeardown_ObservedWorkSweptNothingKeepsSeat: the caller observed a
+// bead on the seat, but the release sweep found nothing to release (attempted
+// 0). Closing then would leave the observed bead assigned to a closed seat
+// whenever the two finders disagree, and log "released 0 of 0; seat closed" as
+// if the sweep were complete (pl-xx64). The teardown keeps the seat and names
+// release_found_nothing.
+func TestDrainAckTeardown_ObservedWorkSweptNothingKeepsSeat(t *testing.T) {
+	mem := beads.NewMemStore()
+	seat, err := mem.Create(beads.Bead{
+		Title:    "worker session",
+		Type:     sessionBeadType,
+		Status:   "open",
+		Metadata: map[string]string{"session_name": "worker-1", "pool_managed": "true", "pool_slot": "1", "alias": "repo/furiosa"},
+	})
+	if err != nil {
+		t.Fatalf("create seat: %v", err)
+	}
+	var stderr bytes.Buffer
+	now := time.Date(2026, 10, 16, 23, 0, 0, 0, time.UTC)
+	const observed = "pl-observed"
+	outcome := tearDownDrainAckedPoolSeat(mem, testSeatWork("", nil, mem, nil), seedSessionInfo(mustGetBead(t, mem, seat.ID)), observed, now, &stderr)
+	if outcome.closed || outcome.retainedFor != drainAckRetainedReleaseFoundNothing {
+		t.Fatalf("outcome = %+v, want retained for %s (observed %s, swept nothing); stderr=%s", outcome, drainAckRetainedReleaseFoundNothing, observed, stderr.String())
+	}
+	if outcome.released != 0 || outcome.attempted != 0 {
+		t.Fatalf("outcome counts released=%d attempted=%d, want 0/0", outcome.released, outcome.attempted)
+	}
+	if got := mustGetBead(t, mem, seat.ID); got.Status == "closed" {
+		t.Fatalf("seat closed with close_reason=%q although the sweep released nothing it was told about", got.Metadata["close_reason"])
+	}
+}
+
+// TestDrainAckTeardown_AliasHeldCertParkIsRetained is a regression guard for
+// the same re-sync #7 (4bfafc5be) alias fix, on the cert-park scan; it passes
+// on carry/operational without pl-xx64's change and is not evidence of it. The
+// scan reads the seat under the classifier's names, so a park claimed under a
+// namepool seat's alias keeps the seat and the assignment, exactly as an
+// ID-held park does (TestDrainAckTeardown_CertParkedWorkIsRetained).
+func TestDrainAckTeardown_AliasHeldCertParkIsRetained(t *testing.T) {
+	f := newDrainAckTeardownNamepoolFixture(t, 1)
+	seat := f.sessions[0]
+	alias := seat.Metadata["alias"]
+	parked := f.work[0]
+	if err := f.store.Update(parked.ID, beads.UpdateOpts{Labels: []string{beadmeta.CertWaitHoldLabel}}); err != nil {
+		t.Fatalf("park %s: %v", parked.ID, err)
+	}
+	name := seat.Metadata["session_name"]
+	if err := f.dops.setDrainAck(name); err != nil {
+		t.Fatalf("setDrainAck(%s): %v", name, err)
+	}
+	f.tick(t, f.dops)
+	waitForProviderStopped(t, f.sp, name)
+	f.tick(t, f.dops)
+
+	if got := mustGetBead(t, f.store, seat.ID); got.Status == "closed" {
+		t.Fatalf("seat holding an alias-held cert park was torn down; close_reason=%q", got.Metadata["close_reason"])
+	}
+	if w := mustGetBead(t, f.store, parked.ID); w.Assignee != alias || w.Status != "in_progress" {
+		t.Fatalf("alias-held park %s: assignee=%q status=%q, want %q/in_progress kept", w.ID, w.Assignee, w.Status, alias)
+	}
+	if want := "seat kept: cert_parked_work:" + parked.ID; !strings.Contains(f.stderr.String(), want) {
+		t.Fatalf("stderr does not name the retention reason %q: %s", want, f.stderr.String())
 	}
 }
