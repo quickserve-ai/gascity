@@ -524,14 +524,16 @@ func TestDrainAckTeardown_SingletonPoolIdentityKept(t *testing.T) {
 	}
 }
 
-// TestDrainAckTeardown_NamepoolSeatReleasesAliasHeldWork pins the live
-// platform-pool shape (pl-xx64): a namepool seat claims its bead under its
-// stable alias ("repo/furiosa"), not its session bead ID. The release sweep
-// must look the work up under the same names the classifier found it under, so
-// the drain ack releases the bead (assignee cleared, status open, gc.routed_to
-// kept) before the seat closes. Until re-sync #7 the sweep used the narrower
-// {ID, session_name, configured_named_identity} set and logged "released 0 of
-// 0; seat closed" while the bead stayed in_progress under the closed seat.
+// TestDrainAckTeardown_NamepoolSeatReleasesAliasHeldWork is a regression guard
+// for the alias fix that landed with re-sync #7 (4bfafc5be), which put the
+// release sweep on releaseScope, the classifier's alias-bearing set. It passes
+// on carry/operational without pl-xx64's change and is not evidence of it. It
+// pins the live platform-pool shape: a namepool seat claims its bead under its
+// stable alias ("repo/furiosa"), not its session bead ID, and the drain ack
+// releases that bead (assignee cleared, status open, gc.routed_to kept) before
+// the seat closes. A sweep on the narrower {ID, session_name,
+// configured_named_identity} set logs "released 0 of 0; seat closed" and
+// leaves the bead in_progress under the closed seat; this test fails then.
 func TestDrainAckTeardown_NamepoolSeatReleasesAliasHeldWork(t *testing.T) {
 	f := newDrainAckTeardownNamepoolFixture(t, 1)
 	seat := f.sessions[0]
@@ -598,10 +600,12 @@ func TestDrainAckTeardown_ObservedWorkSweptNothingKeepsSeat(t *testing.T) {
 	}
 }
 
-// TestDrainAckTeardown_AliasHeldCertParkIsRetained: the cert-park scan reads the
-// seat under the classifier's names too, so a park claimed under a namepool
-// seat's alias keeps the seat and the assignment, exactly as an ID-held park
-// does (TestDrainAckTeardown_CertParkedWorkIsRetained).
+// TestDrainAckTeardown_AliasHeldCertParkIsRetained is a regression guard for
+// the same re-sync #7 (4bfafc5be) alias fix, on the cert-park scan; it passes
+// on carry/operational without pl-xx64's change and is not evidence of it. The
+// scan reads the seat under the classifier's names, so a park claimed under a
+// namepool seat's alias keeps the seat and the assignment, exactly as an
+// ID-held park does (TestDrainAckTeardown_CertParkedWorkIsRetained).
 func TestDrainAckTeardown_AliasHeldCertParkIsRetained(t *testing.T) {
 	f := newDrainAckTeardownNamepoolFixture(t, 1)
 	seat := f.sessions[0]
