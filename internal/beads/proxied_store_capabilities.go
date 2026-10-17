@@ -194,6 +194,19 @@ func (s *ProxiedStore) enrichReadyProjectionForCache(items []Bead) ([]Bead, erro
 	return enriched, s.classifyReadError(err)
 }
 
+// reconcileDigestForCache follows the read leaf for the same reason: the
+// digest describes the rows List returns, and the read leaf lists them. A
+// leaf without it answers unsupported, which sends the cache's reconcile down
+// its full list (ga-ckbnpj).
+func (s *ProxiedStore) reconcileDigestForCache() (map[string]string, error) {
+	reader, ok := s.readLeaf().(cacheReconcileDigestStore)
+	if !ok {
+		return nil, errReconcileDigestUnsupported
+	}
+	digest, err := reader.reconcileDigestForCache()
+	return digest, s.classifyReadError(err)
+}
+
 // The third — cacheDependencySnapshotStore (dependencySnapshotForCache) — is
 // DELIBERATELY NOT IMPLEMENTED, and this comment is the reason.
 //
