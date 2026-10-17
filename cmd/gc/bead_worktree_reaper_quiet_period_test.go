@@ -283,9 +283,16 @@ func TestReapSkipTracker_SuppressesQuietPeriodRepeats(t *testing.T) {
 	fake := events.NewFake()
 	skips := newReapSkipTracker()
 	var stderr bytes.Buffer
-	touchWorktreeIndex(t, wt)
+	// Every other activity signal is old, so the index alone sets the age; each
+	// pass stamps it a different number of minutes ago (all inside the 6h quiet
+	// period), so the reason's age differs per pass without a wall-clock wait.
+	backdateWorktreeActivity(t, wt, 72*time.Hour)
+	gitDir := strings.TrimSpace(runGit(t, wt, "rev-parse", "--absolute-git-dir"))
 	for pass := 1; pass <= 3; pass++ {
-		time.Sleep(1100 * time.Millisecond) // the activity age differs each pass
+		at := time.Now().Add(-time.Duration(pass) * time.Minute)
+		if err := os.Chtimes(filepath.Join(gitDir, "index"), at, at); err != nil {
+			t.Fatalf("stamp index for pass %d: %v", pass, err)
+		}
 		reapClosedBeadWorktrees(cityPath, cfg, map[string]beads.Store{reapTestRigName: store}, nil, false, fake, skips, &stderr)
 	}
 
