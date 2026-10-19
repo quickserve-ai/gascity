@@ -11,6 +11,9 @@ permissions:
 env:
   DOLT_VERSION: "2.2.0"
   BD_VERSION: "v1.3.1"
+  # The fleet bd: the quickserve-ai/beads release go.mod's beads replace names
+  # (ga-tkfdsb). scripts/beads_fleet_replace_test.go keeps it on the replace's tag.
+  FLEET_BD_TAG: "v1.3.1-fleet.20261005.1"
 
 jobs:
   tier-b:
@@ -91,9 +94,12 @@ jobs:
   # is a statement about the runner, and the plan leaves the number to "the
   # GC_ACCEPTANCE_PERF nightly lane" — which did not exist, so nothing
   # enforced it (round3 review, completeness). This is that lane: the
-  # native-lane test the PR topology job runs, with the gate on. bd is built from
-  # BD_CURRENT_REF exactly as the PR jobs build it, so the bd on PATH and the
-  # beads library in go.mod reach the same upstream commit.
+  # native-lane test the PR topology job runs, with the gate on. bd is the fleet
+  # release go.mod's beads replace names (FLEET_BD_TAG), so the bd on PATH and
+  # the beads library gc links are the same build. A bd built from upstream's
+  # BD_CURRENT_REF kept status-zero-forks red here every night (4 forks: the
+  # fleet library's first write-mode open commits once on a release-bd store,
+  # gc-xol7; ga-tkfdsb, the Linux twin of mac-regression.yml's Tier A step).
   beads-proxied-perf:
     name: Beads / proxied-native perf lane
     runs-on: ubuntu-latest
@@ -108,28 +114,21 @@ jobs:
           dolt-version: ${{ env.DOLT_VERSION }}
           bd-version: ""
           install-claude-cli: "false"
-      - name: Resolve bd current pin
-        id: bd
+      - name: Install the fleet bd ${{ env.FLEET_BD_TAG }}
+        env:
+          TAG: ${{ env.FLEET_BD_TAG }}
         run: |
           set -euo pipefail
-          ref="$(grep -E '^BD_CURRENT_REF=' deps.env | cut -d= -f2)"
-          ver="$(grep -E '^BD_CURRENT_VERSION=' deps.env | cut -d= -f2)"
-          if [ -z "$ref" ] || [ -z "$ver" ]; then
-            echo "::error::BD_CURRENT_REF/BD_CURRENT_VERSION missing or empty in deps.env" >&2
-            exit 1
-          fi
-          echo "ref=$ref" >> "$GITHUB_OUTPUT"
-          echo "ver=$ver" >> "$GITHUB_OUTPUT"
-      - name: Build bd ${{ steps.bd.outputs.ver }} from source @ ${{ steps.bd.outputs.ref }}
-        run: |
-          set -euo pipefail
-          src="${RUNNER_TEMP}/beads-src"
-          git clone --filter=blob:none https://github.com/gastownhall/beads "$src"
-          git -C "$src" checkout "${{ steps.bd.outputs.ref }}"
-          mkdir -p "${HOME}/.local/bin"
-          go -C "$src" build -tags gms_pure_go -o "${HOME}/.local/bin/bd" ./cmd/bd
-          echo "GC_ACCEPTANCE_BD_BIN=${HOME}/.local/bin/bd" >> "$GITHUB_ENV"
-          echo "${HOME}/.local/bin" >> "$GITHUB_PATH"
+          dir="${HOME}/.local/bin"
+          mkdir -p "$dir"
+          asset="bd-${TAG}-linux-amd64"
+          base="https://github.com/quickserve-ai/beads/releases/download/${TAG}"
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/${asset}" "$base/$asset"
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/SHA256SUMS" "$base/SHA256SUMS"
+          (cd "${RUNNER_TEMP}" && grep " ${asset}\$" SHA256SUMS | sha256sum -c -)
+          install -m 0755 "${RUNNER_TEMP}/${asset}" "$dir/bd"
+          echo "GC_ACCEPTANCE_BD_BIN=$dir/bd" >> "$GITHUB_ENV"
+          echo "$dir" >> "$GITHUB_PATH"
       # A failing test copies its managed Dolt server logs and the supervisor
       # log out of its temp dir before t.Cleanup removes it
       # (internal/testutil.SaveFailureDiagnostics); the upload below keeps them.
