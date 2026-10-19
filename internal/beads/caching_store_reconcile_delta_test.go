@@ -51,7 +51,7 @@ func (s *digestingStore) reconcileDigestForCache() (map[string]string, error) {
 	}
 	digest := make(map[string]string, len(rows))
 	for _, b := range rows {
-		deps, err := s.MemStore.DepList(b.ID, "down")
+		deps, err := s.DepList(b.ID, "down")
 		if err != nil {
 			return nil, err
 		}
