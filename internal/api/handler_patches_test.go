@@ -404,6 +404,85 @@ func TestHandleRigPatchSet(t *testing.T) {
 	}
 }
 
+// A PUT replaces the complete patch, including the rig fields not present in
+// the original HTTP input shape. Omitted fields on the next PUT are cleared.
+// TestRigPatchSetBodyCarriesEveryRigPatchField keeps the body complete.
+func TestHandleRigPatchSetFullReplacement(t *testing.T) {
+	fs := newFakeMutatorState(t)
+	h := newTestCityHandler(t, fs)
+	put := func(body string) {
+		t.Helper()
+		req := httptest.NewRequest("PUT", cityURL(fs, "/patches/rigs"), strings.NewReader(body))
+		req.Header.Set("X-GC-Request", "true")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("PUT status = %d, want 200; body = %s", w.Code, w.Body.String())
+		}
+	}
+
+	put(`{"name":"myrig","default_branch":"develop","default_merge_strategy":"pr","formula_vars":{"test_command":"go test ./..."},"suspended_on_start":false,"beads_proxied_idle_timeout":"5m","doctor":{"census_owner_namespace":"platform"}}`)
+	if len(fs.cfg.Patches.Rigs) != 1 {
+		t.Fatalf("patches.rigs count = %d, want 1", len(fs.cfg.Patches.Rigs))
+	}
+	p := fs.cfg.Patches.Rigs[0]
+	if p.FormulaVars["test_command"] != "go test ./..." || p.SuspendedOnStart == nil || *p.SuspendedOnStart ||
+		p.Doctor == nil || p.Doctor.CensusOwnerNamespace == nil || *p.Doctor.CensusOwnerNamespace != "platform" ||
+		p.DefaultMergeStrategy == nil || *p.DefaultMergeStrategy != "pr" ||
+		p.BeadsProxiedIdleTimeout == nil || *p.BeadsProxiedIdleTimeout != "5m" {
+		t.Fatalf("PUT lost rig patch fields: %+v", p)
+	}
+	req := httptest.NewRequest("GET", cityURL(fs, "/patches/rig/myrig"), nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+	var got config.RigPatch
+	if err := json.NewDecoder(w.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.FormulaVars["test_command"] != "go test ./..." || got.SuspendedOnStart == nil ||
+		*got.SuspendedOnStart || got.Doctor == nil || got.Doctor.CensusOwnerNamespace == nil ||
+		*got.Doctor.CensusOwnerNamespace != "platform" ||
+		got.DefaultMergeStrategy == nil || *got.DefaultMergeStrategy != "pr" ||
+		got.BeadsProxiedIdleTimeout == nil || *got.BeadsProxiedIdleTimeout != "5m" {
+		t.Fatalf("GET lost rig patch fields: %+v", got)
+	}
+
+	put(`{"name":"myrig","default_branch":"main","formula_vars":{"build_command":"make build"},"suspended_on_start":true,"doctor":{"census_owner_namespace":""}}`)
+	p = fs.cfg.Patches.Rigs[0]
+	if len(p.FormulaVars) != 1 || p.FormulaVars["build_command"] != "make build" ||
+		p.SuspendedOnStart == nil || !*p.SuspendedOnStart ||
+		p.Doctor == nil || p.Doctor.CensusOwnerNamespace == nil || *p.Doctor.CensusOwnerNamespace != "" {
+		t.Fatalf("PUT did not replace rig patch fields: %+v", p)
+	}
+
+	put(`{"name":"myrig","default_branch":"main"}`)
+	p = fs.cfg.Patches.Rigs[0]
+	if p.FormulaVars != nil || p.SuspendedOnStart != nil || p.Doctor != nil ||
+		p.DefaultMergeStrategy != nil || p.BeadsProxiedIdleTimeout != nil {
+		t.Fatalf("omitted fields survived replacement: %+v", p)
+	}
+}
+
+// TestRigPatchSetBodyCarriesEveryRigPatchField: the PUT replaces the whole
+// patch, so a RigPatch field the request body cannot carry is cleared on every
+// write. A field added to config.RigPatch must be added to the body too.
+func TestRigPatchSetBodyCarriesEveryRigPatchField(t *testing.T) {
+	body := reflect.TypeOf(RigPatchSetInput{}.Body)
+	carried := make(map[string]bool, body.NumField())
+	for i := 0; i < body.NumField(); i++ {
+		carried[body.Field(i).Name] = true
+	}
+	patch := reflect.TypeOf(config.RigPatch{})
+	for i := 0; i < patch.NumField(); i++ {
+		if name := patch.Field(i).Name; !carried[name] {
+			t.Errorf("config.RigPatch.%s has no field in RigPatchSetInput.Body; a PUT clears it", name)
+		}
+	}
+}
+
 func TestHandleRigPatchDelete(t *testing.T) {
 	fs := newFakeMutatorState(t)
 	suspended := true
