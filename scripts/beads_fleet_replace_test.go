@@ -158,3 +158,27 @@ func TestMacAcceptanceFleetBDFollowsTheBeadsFleetTag(t *testing.T) {
 		}
 	}
 }
+
+// TestNightlyPerfLaneFleetBDFollowsTheBeadsFleetTag is the Linux nightly's twin
+// of the Mac test above (ga-tkfdsb). The beads-proxied-perf lane built bd from
+// upstream's BD_CURRENT_REF, which kept
+// TestBeadsProxiedDefaultNativeLane/status-zero-forks red every night (4 forks,
+// gc-xol7); it now installs the fleet release named by FLEET_BD_TAG, checked
+// against its SHA256SUMS. This keeps that tag on the replace's.
+func TestNightlyPerfLaneFleetBDFollowsTheBeadsFleetTag(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join(repoRoot(t), ".github", "workflows", "nightly.yml"))
+	if err != nil {
+		t.Fatalf("read nightly.yml: %v", err)
+	}
+	workflow := string(data)
+	for _, want := range []string{
+		`FLEET_BD_TAG: "` + beadsFleetTag + `"`,
+		`https://github.com/quickserve-ai/beads/releases/download/${TAG}`,
+		`sha256sum -c -`,
+		`echo "GC_ACCEPTANCE_BD_BIN=$dir/bd" >> "$GITHUB_ENV"`,
+	} {
+		if !strings.Contains(workflow, want) {
+			t.Errorf("nightly.yml lacks %s: the proxied-native perf lane must test gc against the fleet bd %s", want, beadsFleetTag)
+		}
+	}
+}
