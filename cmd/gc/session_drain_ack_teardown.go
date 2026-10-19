@@ -187,7 +187,7 @@ func tearDownDrainAckedPoolSeat(
 	if retained := drainAckObservedNotReleased(observed, observedRows, observedErr, out, attempted); retained != "" {
 		return drainAckTeardownOutcome{retainedFor: retained, released: released, attempted: attempted}
 	}
-	// A withheld claim stays assigned (the close's release honours the proposal
+	// A withheld claim stays assigned (the close's release honors the proposal
 	// too), so closing would strand it: keep the seat until a judge settles it.
 	if id := drainAckWithheldClaim(out); id != "" {
 		return drainAckTeardownOutcome{retainedFor: drainAckRetainedWithheldWorkKept + ":" + id, released: released, attempted: attempted}
