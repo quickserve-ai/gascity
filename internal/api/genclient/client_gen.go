@@ -2898,6 +2898,12 @@ type Dep struct {
 	Type        string `json:"type"`
 }
 
+// DoctorStruct defines model for DoctorStruct.
+type DoctorStruct struct {
+	// CensusOwnerNamespace Override the doctor census owner namespace; empty string clears it.
+	CensusOwnerNamespace *string `json:"census_owner_namespace,omitempty"`
+}
+
 // ErrorDetail defines model for ErrorDetail.
 type ErrorDetail struct {
 	// Location Where the error occurred, e.g. 'body.items[3].tags' or 'path.thing-id'
@@ -4732,8 +4738,18 @@ type RigPatch struct {
 
 // RigPatchSetInputBody defines model for RigPatchSetInputBody.
 type RigPatchSetInputBody struct {
+	// BeadsProxiedIdleTimeout Override the rig's beads_proxied_idle_timeout.
+	BeadsProxiedIdleTimeout *string `json:"beads_proxied_idle_timeout,omitempty"`
+
 	// DefaultBranch Override mainline branch.
 	DefaultBranch *string `json:"default_branch,omitempty"`
+
+	// DefaultMergeStrategy Override the merge strategy gc sling stamps on beads routed into this rig; empty string clears it.
+	DefaultMergeStrategy *string       `json:"default_merge_strategy,omitempty"`
+	Doctor               *DoctorStruct `json:"doctor,omitempty"`
+
+	// FormulaVars Rig-scoped formula variable defaults.
+	FormulaVars *map[string]string `json:"formula_vars,omitempty"`
 
 	// Name Rig name.
 	Name *string `json:"name,omitempty"`
@@ -4744,8 +4760,11 @@ type RigPatchSetInputBody struct {
 	// Prefix Override bead ID prefix.
 	Prefix *string `json:"prefix,omitempty"`
 
-	// Suspended Override suspended state.
+	// Suspended Deprecated suspension override.
 	Suspended *bool `json:"suspended,omitempty"`
+
+	// SuspendedOnStart Override desired suspension state at city start.
+	SuspendedOnStart *bool `json:"suspended_on_start,omitempty"`
 }
 
 // RigProvisionProgressPayload defines model for RigProvisionProgressPayload.
