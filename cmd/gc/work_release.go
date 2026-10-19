@@ -218,6 +218,18 @@ type ReleaseOutcome struct {
 	Released, Kept, Failed []seatWorkHit
 	Why                    map[string]string // by bead ID, for Kept and Failed
 	Route                  map[string]string // by bead ID, for a claim kept unserved (a named proposal included): the route it would take
+	// keptWhy is each Kept claim's own reason, by index: Why is keyed by bead
+	// ID, which two stores can share (storeScopedBeadKey).
+	keptWhy []string
+}
+
+// keptReason is why Kept[i] was kept: its own reason when the release
+// recorded one, else Why's entry for its ID.
+func (o ReleaseOutcome) keptReason(i int) string {
+	if i < len(o.keptWhy) {
+		return o.keptWhy[i]
+	}
+	return o.Why[o.Kept[i].bead.ID]
 }
 
 // withheld counts the claims kept because the named-release guard proposed
@@ -277,7 +289,7 @@ func ReleaseClaims(sw *SeatWork, scope ReleaseScope, seat releaseSeat, why relea
 	}
 	out := releaseListed(claims, why, seat, sw.Legs().cfg, opts)
 	for _, h := range held {
-		out.Kept = append(out.Kept, h)
+		out.Kept, out.keptWhy = append(out.Kept, h), append(out.keptWhy, keptOrphanClose)
 		out.Why[h.bead.ID] = keptOrphanClose
 	}
 	return out, err
@@ -292,7 +304,10 @@ func releaseListed(claims []seatWorkHit, why releaseWhy, seat releaseSeat, cfg *
 		audit = log.Writer()
 	}
 	out := ReleaseOutcome{Why: map[string]string{}, Route: map[string]string{}}
-	keep := func(c seatWorkHit, why string) { out.Kept = append(out.Kept, c); out.Why[c.bead.ID] = why }
+	keep := func(c seatWorkHit, why string) {
+		out.Kept, out.keptWhy = append(out.Kept, c), append(out.keptWhy, why)
+		out.Why[c.bead.ID] = why
+	}
 	var mine []seatWorkHit
 	for _, c := range claims {
 		if slices.Contains(p.statuses, c.bead.Status) {
