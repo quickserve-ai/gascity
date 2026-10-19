@@ -1,0 +1,38 @@
+name: pl-1dkn red-green
+# Throwaway runner proof for pl-1dkn rework round 1; removed in the next commit.
+on:
+  push:
+    branches: ["polecat/pl-1dkn"]
+jobs:
+  drainack:
+    name: DrainAck tests (${{ matrix.side }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [red, green]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+      - name: "red: round-1 code (2e7cb6166) under this round's tests"
+        if: matrix.side == 'red'
+        run: git checkout 2e7cb616639187ffe123e7b1361c37d0cfe4dbd8 -- cmd/gc/session_drain_ack_teardown.go cmd/gc/work_release.go && git status --short
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Vet cmd/gc
+        if: matrix.side == 'green'
+        run: go vet ./cmd/gc
+      - name: Build the cmd/gc test binary
+        run: go test -c -o "${RUNNER_TEMP}/gc.test" ./cmd/gc
+      - name: Run the tests
+        working-directory: cmd/gc
+        run: |
+          pat='DrainAck'
+          [ "${{ matrix.side }}" = green ] && pat='DrainAck|Release|Unclaim|Stranded|Proposed|Withh'
+          "${RUNNER_TEMP}/gc.test" -test.run "$pat" -test.count=1 -test.v > "${RUNNER_TEMP}/out.txt" 2>&1 || true
+          grep -E '^(--- FAIL|ok|FAIL|PASS)' "${RUNNER_TEMP}/out.txt" || true
+          echo "pass=$(grep -c '^--- PASS' "${RUNNER_TEMP}/out.txt") fail=$(grep -c '^--- FAIL' "${RUNNER_TEMP}/out.txt")"
+          ! grep -q '^--- FAIL' "${RUNNER_TEMP}/out.txt" && tail -1 "${RUNNER_TEMP}/out.txt" | grep -q '^ok\|^PASS'
