@@ -11,7 +11,7 @@ import (
 // TestReconcileDigestSQLCarriesEveryJoinedTerm pins the digest's surface
 // against the native List's projection: each table the List joins onto a row
 // must have a term, or a write there goes unseen until the next full list.
-// The terms' behaviour against a server-mode Dolt is the integration
+// The terms' behavior against a server-mode Dolt is the integration
 // follow-up; the embedded store exports no SQL pool and answers unsupported.
 func TestReconcileDigestSQLCarriesEveryJoinedTerm(t *testing.T) {
 	for _, tier := range reconcileDigestTiers {
