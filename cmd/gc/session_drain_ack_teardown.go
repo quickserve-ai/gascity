@@ -71,11 +71,8 @@ type drainAckTeardownOutcome struct {
 // is not allowed to act on: the seat is not a disposable pool seat, it is a
 // canonical singleton pool's stable identity, or the call site did not grant
 // permission to close it; and the ones for a seat the teardown acted on but
-// kept because work may still be owned by it: the sweep found nothing to
-// release, it released other work but not the observed bead, it kept the
-// observed bead (observed_work_kept:<why>, with the release's reason), the
-// observed bead's rows could not be read, or it withheld another claim
-// (withheld_work_kept:<id>: a named agent's, proposed not released).
+// kept because it may still own work: drainAckObservedNotReleased's, and
+// withheld_work_kept:<id> (a named agent's claim, proposed not released).
 const (
 	drainAckRetainedNotPoolSeat           = "not_pool_seat"
 	drainAckRetainedSingletonIdentity     = "singleton_identity"
@@ -160,6 +157,9 @@ func tearDownDrainAckedPoolSeat(
 	// disposed of exactly as a no-work ack disposes of it, not reopened a
 	// second time by this sweep.
 	scope := releaseScope(info, cfg)
+	// The observed bead's rows as sw holds them, read before the sweep: a sw
+	// not yet loaded would otherwise load after the release, without them.
+	observedRows, observedErr := drainAckObservedRows(sw, scope, observed)
 	claims, readErr := sw.fresh(scope).snapshot(seatWorkQuery{scope: scope, statuses: releasePolicies[releaseDrainAckTeardown].statuses, keep: notOwnDrainStep}, false)
 	out := ReleaseOutcome{}
 	if cfg == nil && len(claims) > 0 {
@@ -184,13 +184,11 @@ func tearDownDrainAckedPoolSeat(
 	// sleep, the shape this teardown replaced, so a bead still under the seat's
 	// names stays owned by an open seat that its assignment can wake and the
 	// stranded repair can see, never by a closed one.
-	if retained := drainAckObservedNotReleased(sw, scope, observed, out, attempted); retained != "" {
+	if retained := drainAckObservedNotReleased(observed, observedRows, observedErr, out, attempted); retained != "" {
 		return drainAckTeardownOutcome{retainedFor: retained, released: released, attempted: attempted}
 	}
-	// A claim the sweep withheld (a named agent's, proposed not released) stays
-	// assigned to the seat, and the close's own release honours the pending
-	// proposal too, so closing would strand it under a closed seat. Keep the
-	// seat until a judge settles the proposal.
+	// A withheld claim stays assigned (the close's release honours the proposal
+	// too), so closing would strand it: keep the seat until a judge settles it.
 	if id := drainAckWithheldClaim(out); id != "" {
 		return drainAckTeardownOutcome{retainedFor: drainAckRetainedWithheldWorkKept + ":" + id, released: released, attempted: attempted}
 	}
@@ -200,32 +198,19 @@ func tearDownDrainAckedPoolSeat(
 	return drainAckTeardownOutcome{closed: true, released: released, attempted: attempted}
 }
 
-// drainAckObservedNotReleased returns "" when the sweep released the observed
-// bead (or the caller observed none), and otherwise the retained_for reason:
-// release_found_nothing when the sweep attempted no release at all,
-// observed_work_kept:<why> when it kept the observed claim,
-// release_missed_observed when it acted on other work but never reached the
-// observed bead, and observed_scan_failed when the observed bead's rows could
-// not all be read.
-//
-// A bead ID names a row only within one store: independent city and rig
-// stores can each hold the same ID (storeScopedBeadKey), so a release of one
-// says nothing about the other. The observed bead's rows are read from sw, the
-// read the caller observed it in, and each is matched by store and ID: every
-// one must be among the released, or the seat may still hold it.
-func drainAckObservedNotReleased(sw *SeatWork, scope ReleaseScope, observed string, out ReleaseOutcome, attempted int) string {
+// drainAckObservedNotReleased returns "" when the sweep released every one of
+// the observed bead's rows (or the caller observed none), else the
+// retained_for reason: release_found_nothing (no release attempted),
+// observed_scan_failed, observed_work_kept:<why>, or release_missed_observed.
+// Rows match by store AND ID: independent city and rig stores can hold the
+// same ID (storeScopedBeadKey), so one store's release says nothing of another.
+func drainAckObservedNotReleased(observed string, rows []seatWorkHit, err error, out ReleaseOutcome, attempted int) string {
 	if observed == "" {
 		return ""
 	}
 	if attempted == 0 {
 		return drainAckRetainedReleaseFoundNothing
 	}
-	rows, err := sw.snapshot(seatWorkQuery{scope: scope, statuses: releasePolicies[releaseDrainAckTeardown].statuses, keep: func(s beads.Store, b beads.Bead) (bool, error) {
-		if b.ID != observed {
-			return false, nil
-		}
-		return notOwnDrainStep(s, b)
-	}}, false)
 	if err != nil {
 		return drainAckRetainedObservedScanFailed
 	}
@@ -245,9 +230,22 @@ func drainAckObservedNotReleased(sw *SeatWork, scope ReleaseScope, observed stri
 	return ""
 }
 
+// drainAckObservedRows returns the seat's rows of bead observed in sw, the read
+// the caller observed it in: one per store holding the ID. None for "".
+func drainAckObservedRows(sw *SeatWork, scope ReleaseScope, observed string) ([]seatWorkHit, error) {
+	if observed == "" {
+		return nil, nil
+	}
+	return sw.snapshot(seatWorkQuery{scope: scope, statuses: releasePolicies[releaseDrainAckTeardown].statuses, keep: func(s beads.Store, b beads.Bead) (bool, error) {
+		if b.ID != observed {
+			return false, nil
+		}
+		return notOwnDrainStep(s, b)
+	}}, false)
+}
+
 // drainAckWithheldClaim returns the ID of a claim the sweep withheld (proposed
-// for a judge instead of released: ga-9n8hjv fence #1), or "" when it withheld
-// none.
+// for a judge, not released: ga-9n8hjv fence #1), or "".
 func drainAckWithheldClaim(out ReleaseOutcome) string {
 	for i, c := range out.Kept {
 		if out.keptReason(i) == keptNamedProposed {

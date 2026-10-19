@@ -33,6 +33,6 @@ jobs:
           pat='DrainAck'
           [ "${{ matrix.side }}" = green ] && pat='DrainAck|Release|Unclaim|Stranded|Proposed|Withh'
           "${RUNNER_TEMP}/gc.test" -test.run "$pat" -test.count=1 -test.v > "${RUNNER_TEMP}/out.txt" 2>&1 || true
-          grep -E '^(--- FAIL|ok|FAIL|PASS)' "${RUNNER_TEMP}/out.txt" || true
+          grep -E '^(--- FAIL|ok|FAIL|PASS)|_test.go:[0-9]+:' "${RUNNER_TEMP}/out.txt" || true
           echo "pass=$(grep -c '^--- PASS' "${RUNNER_TEMP}/out.txt") fail=$(grep -c '^--- FAIL' "${RUNNER_TEMP}/out.txt")"
           ! grep -q '^--- FAIL' "${RUNNER_TEMP}/out.txt" && tail -1 "${RUNNER_TEMP}/out.txt" | grep -q '^ok\|^PASS'
