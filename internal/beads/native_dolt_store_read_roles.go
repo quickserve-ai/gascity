@@ -759,7 +759,10 @@ func nativeListLimitPushdown(query ListQuery) int {
 	}
 	// SeekAfter, UpdatedBefore and plural Assignees are Go-side too
 	// (ListQuery.Matches), and each is a residual filter for the same reason.
-	if query.SeekAfter != nil || !query.UpdatedBefore.IsZero() || len(query.Assignees) > 0 {
+	// So are ids: chunked into IDFilter they are exact, but a backend that
+	// refuses IDFilter is read unfiltered, and a limit there would cut the
+	// ledger's first rows before the ids are applied.
+	if query.SeekAfter != nil || !query.UpdatedBefore.IsZero() || len(query.Assignees) > 0 || len(query.IDs) > 0 {
 		return 0
 	}
 	switch query.Sort {

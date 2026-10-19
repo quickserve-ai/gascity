@@ -39,6 +39,22 @@ func TestNativeListPlanPushesIDsInServerSizedChunks(t *testing.T) {
 	}
 }
 
+// A limit is never pushed beside ids: a backend that refuses IDFilter is read
+// unfiltered, and a pushed limit would return the ledger's first rows, not the
+// asked-for ones.
+func TestNativeListPlanPushesNoLimitBesideIDs(t *testing.T) {
+	plan := NativeListPlan(ListQuery{IDs: []string{"gc-z"}, IncludeClosed: true, TierMode: TierBoth, Sort: SortCreatedAsc, Limit: 1})
+	for i, req := range plan {
+		if req.Limit == nil || *req.Limit != 0 {
+			t.Fatalf("request %d limit = %v, want explicit 0 (unlimited)", i, req.Limit)
+		}
+	}
+	control := NativeListPlan(ListQuery{IncludeClosed: true, TierMode: TierBoth, Sort: SortCreatedAsc, Limit: 1})
+	if control[0].Limit == nil || *control[0].Limit != 1 {
+		t.Fatalf("control: an id-less exact query still pushes its limit, got %v", control[0].Limit)
+	}
+}
+
 func idListRows() []*beadslib.Issue {
 	var rows []*beadslib.Issue
 	for _, id := range []string{"gc-a", "gc-b", "gc-c"} {
