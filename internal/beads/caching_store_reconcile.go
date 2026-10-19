@@ -49,7 +49,7 @@ var recordCacheScanLarge = telemetry.RecordCacheScanLarge
 // cacheFullScanQuery is the single query shape Prime and the reconciler use
 // to load the cache's authoritative snapshot. The reconcile diff treats the
 // result as the COMPLETE active universe: any cached bead absent from it is
-// re-verified per ID (recoverMissingFromList) and then evicted with a
+// re-verified per ID (recoverMissingFromListKeep) and then evicted with a
 // synthetic bead.closed event. Two bounds follow from that authority:
 //
 //   - Limit must stay unset (0). A bounded list would route every active
@@ -460,7 +460,7 @@ type mergeDecision struct {
 // (mutationSeq starts at 1 — noteMutationLocked pre-increments — so seq 0
 // means "no entry"; time.Time zero means "no recency stamp").
 type mergeRowInput struct {
-	freshExists   bool // id present in freshByID (post-recoverMissingFromList)
+	freshExists   bool // id present in freshByID (post-recoverMissingFromListKeep)
 	fresh         Bead
 	freshDeps     []Dep // depsForReconcileLocked output, computed by caller
 	cachedExists  bool  // id present in c.beads
@@ -557,7 +557,7 @@ type mergeSectionResult struct {
 // reconcileMergeDecision; the three index sets it iterates (freshByID, the
 // cached rows absent from freshByID, and the orphan fence/deps ids) are
 // pairwise disjoint, so the passes cannot perturb each other. deferred names
-// the freshByID entries recoverMissingFromList filled from the cache because
+// the freshByID entries recoverMissingFromListKeep filled from the cache because
 // it could not read the backing row: they are held, not absorbed, so their
 // row, mark and fences stay as they were. depsReadFailed reports that the
 // snapshot's dependency read failed: a row that does not answer for its edges
@@ -859,7 +859,7 @@ func (c *CachingStore) depsForReconcileLocked(id string, freshBead Bead, depMap 
 	return freshDeps
 }
 
-// recoverMissingFromList re-fetches any cached active bead that didn't appear
+// recoverMissingFromListKeep re-fetches any cached active bead that didn't appear
 // in freshByID and merges verified-alive ones back. This guards against
 // cleanly incomplete List results: a List that drops an active bead must not
 // synthesize a spurious bead.closed event for it.
@@ -873,13 +873,10 @@ func (c *CachingStore) depsForReconcileLocked(id string, freshBead Bead, depMap 
 // deferred ids so the merge holds them rather than absorbing an unread row.
 // Callers must own freshByID and not access it concurrently while recovery is
 // running.
-func (c *CachingStore) recoverMissingFromList(freshByID map[string]Bead) (map[string]Bead, map[string]struct{}) {
-	return c.recoverMissingFromListKeep(freshByID, nil)
-}
-
-// recoverMissingFromListKeep is recoverMissingFromList for a delta pass: a
-// kept row is absent from freshByID because it was not listed, not because it
-// left the active set, so it is not re-read.
+//
+// keep names the rows a delta pass did not list: such a row is absent from
+// freshByID because it was not listed, not because it left the active set, so
+// it is not re-read. A full pass passes nil.
 func (c *CachingStore) recoverMissingFromListKeep(freshByID map[string]Bead, keep map[string]struct{}) (map[string]Bead, map[string]struct{}) {
 	c.mu.RLock()
 	candidates := make(map[string]Bead)
