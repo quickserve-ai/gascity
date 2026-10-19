@@ -162,14 +162,40 @@ func TestReconcileRecordsOnlyTheDigestThePassVerified(t *testing.T) {
 	}
 	deferred := map[string]struct{}{"deferred": {}}
 
-	got := cache.recordedDigestLocked(plan, fresh, deferred, nil, false, nil)
+	got := cache.recordedDigestLocked(plan, fresh, deferred, map[string][]Dep{}, true, nil)
 	if len(got) != 2 || got["kept"] != "k1" || got["absorbed"] != "a2" {
 		t.Fatalf("recorded digest = %v, want only kept and absorbed", got)
 	}
 	if fp := cache.reconcileFingerprints; len(fp) != 2 || fp["kept"] == 0 || fp["absorbed"] == 0 {
 		t.Fatalf("recorded fingerprints = %v, want kept and absorbed", fp)
 	}
-	if got := cache.recordedDigestLocked(plan, fresh, deferred, nil, false, errors.New("projection failed")); got != nil {
+	if got := cache.recordedDigestLocked(plan, fresh, deferred, map[string][]Dep{}, true, errors.New("projection failed")); got != nil {
 		t.Fatalf("recorded digest after a failed projection = %v, want none", got)
+	}
+}
+
+// TestReconcileDoesNotCertifyEdgesThePassNeverRead: when the dependency read
+// failed and the listed row carries no edges, the cache keeps its own edges.
+// Recording that row would certify them against a digest that may already
+// describe different ones.
+func TestReconcileDoesNotCertifyEdgesThePassNeverRead(t *testing.T) {
+	cache := NewCachingStoreForTest(NewMemStore(), nil)
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	row := Bead{ID: "absorbed", Title: "new", Status: "open"}
+	cache.beads = map[string]Bead{"absorbed": row}
+	cache.deps = map[string][]Dep{"absorbed": {{IssueID: "absorbed", DependsOnID: "stale-blocker", Type: "blocks"}}}
+	plan := reconcilePlan{digest: map[string]string{"absorbed": "a2"}}
+	fresh := map[string]Bead{"absorbed": row}
+
+	if got := cache.recordedDigestLocked(plan, fresh, nil, nil, false, nil); len(got) != 0 {
+		t.Fatalf("recorded digest = %v, want none: the pass read no edges", got)
+	}
+	if fp := cache.reconcileFingerprints; len(fp) != 0 {
+		t.Fatalf("recorded fingerprints = %v, want none", fp)
+	}
+	read := map[string][]Dep{"absorbed": cloneDeps(cache.deps["absorbed"])}
+	if got := cache.recordedDigestLocked(plan, fresh, nil, read, true, nil); got["absorbed"] != "a2" {
+		t.Fatalf("control: recorded digest = %v, want absorbed once its edges were read", got)
 	}
 }
