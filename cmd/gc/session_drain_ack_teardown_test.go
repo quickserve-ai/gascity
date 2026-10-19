@@ -531,9 +531,11 @@ func TestDrainAckTeardown_SingletonPoolIdentityKept(t *testing.T) {
 // pins the live platform-pool shape: a namepool seat claims its bead under its
 // stable alias ("repo/furiosa"), not its session bead ID, and the drain ack
 // releases that bead (assignee cleared, status open, gc.routed_to kept) before
-// the seat closes. A sweep on the narrower {ID, session_name,
-// configured_named_identity} set logs "released 0 of 0; seat closed" and
-// leaves the bead in_progress under the closed seat; this test fails then.
+// the seat closes. Before pl-xx64's release_found_nothing guard, a sweep on
+// the narrower {ID, session_name, configured_named_identity} set logged
+// "released 0 of 0; seat closed" and left the bead in_progress under the closed
+// seat; with the guard that sweep keeps the seat instead (release_found_nothing)
+// and the bead stays assigned. This test fails in both shapes.
 func TestDrainAckTeardown_NamepoolSeatReleasesAliasHeldWork(t *testing.T) {
 	f := newDrainAckTeardownNamepoolFixture(t, 1)
 	seat := f.sessions[0]
@@ -630,5 +632,131 @@ func TestDrainAckTeardown_AliasHeldCertParkIsRetained(t *testing.T) {
 	}
 	if want := "seat kept: cert_parked_work:" + parked.ID; !strings.Contains(f.stderr.String(), want) {
 		t.Fatalf("stderr does not name the retention reason %q: %s", want, f.stderr.String())
+	}
+}
+
+// listHidingStore is a store whose lists never return hiddenID, while Get and
+// every write still reach it: the seat's release sweep cannot see that bead,
+// the shape in which the caller's finder and the sweep disagree. It embeds the
+// concrete MemStore so its conditional-write capabilities (which the release
+// asserts on the store) stay promoted.
+type listHidingStore struct {
+	*beads.MemStore
+	hiddenID string
+}
+
+func (s listHidingStore) List(q beads.ListQuery) ([]beads.Bead, error) {
+	rows, err := s.MemStore.List(q)
+	out := rows[:0:0]
+	for _, b := range rows {
+		if b.ID != s.hiddenID {
+			out = append(out, b)
+		}
+	}
+	return out, err
+}
+
+// drainAckTeardownSecondClaim gives the fixture's one seat a second routed
+// in_progress bead, assigned like its first, and returns it.
+func drainAckTeardownSecondClaim(t *testing.T, f *drainAckTeardownFixture, meta map[string]string) beads.Bead {
+	t.Helper()
+	b := createRoutedReadyBeadForReplacement(t, f.store, "second claim")
+	inProgress := "in_progress"
+	assignee := f.work[0].Assignee
+	if err := f.store.Update(b.ID, beads.UpdateOpts{Status: &inProgress, Assignee: &assignee, Metadata: meta}); err != nil {
+		t.Fatalf("assign %s to %s: %v", b.ID, assignee, err)
+	}
+	return mustGetBead(t, f.store, b.ID)
+}
+
+// TestDrainAckTeardown_SweepMissesObservedKeepsSeat: the caller observed bead X
+// on the seat, and the release sweep acted on other work (bead Y) but never saw
+// X (pl-1dkn, shape a). Before, attempted > 0 let the seat close, leaving X
+// in_progress under a closed seat while the log read "released 1 of 1; seat
+// closed". The teardown now keeps the seat (release_missed_observed): X stays
+// owned by an open seat. Y's release stands; it was a landed write.
+func TestDrainAckTeardown_SweepMissesObservedKeepsSeat(t *testing.T) {
+	f := newDrainAckTeardownFixtureSized(t, 2, 1)
+	seat := f.sessions[0]
+	other := f.work[0]
+	observed := drainAckTeardownSecondClaim(t, f, nil)
+	mem, ok := f.store.(*beads.MemStore)
+	if !ok {
+		t.Fatalf("fixture store is %T, want *beads.MemStore", f.store)
+	}
+	store := listHidingStore{MemStore: mem, hiddenID: observed.ID}
+
+	var stderr bytes.Buffer
+	outcome := tearDownDrainAckedPoolSeat(store, testSeatWork(f.cityDir, f.cfg, store, nil), seedSessionInfo(mustGetBead(t, f.store, seat.ID)), observed.ID, f.now, &stderr)
+	if outcome.closed || outcome.retainedFor != "release_missed_observed" {
+		t.Fatalf("outcome = %+v, want retained for release_missed_observed (observed %s, swept only %s); stderr=%s", outcome, observed.ID, other.ID, stderr.String())
+	}
+	if outcome.released != 1 || outcome.attempted != 1 {
+		t.Fatalf("outcome counts released=%d attempted=%d, want 1/1 (the sweep released %s)", outcome.released, outcome.attempted, other.ID)
+	}
+	if got := mustGetBead(t, f.store, seat.ID); got.Status == "closed" {
+		t.Fatalf("seat closed with close_reason=%q although the sweep never released observed %s", got.Metadata["close_reason"], observed.ID)
+	}
+	if got := mustGetBead(t, f.store, observed.ID); got.Assignee != seat.ID || got.Status != "in_progress" {
+		t.Fatalf("observed %s: assignee=%q status=%q, want %q/in_progress (owned by the open seat)", observed.ID, got.Assignee, got.Status, seat.ID)
+	}
+	if got := mustGetBead(t, f.store, other.ID); got.Assignee != "" || got.Status != "open" {
+		t.Fatalf("swept %s: assignee=%q status=%q, want released (\"\"/open)", other.ID, got.Assignee, got.Status)
+	}
+}
+
+// TestDrainAckTeardown_ObservedClaimKeptKeepsSeat: the sweep found the observed
+// bead and KEPT it, here because a release proposal is already pending for a
+// judge (the named-release guard withholds it: ga-9n8hjv fence #1), so attempted
+// = 1 and released = 0 (pl-1dkn, shape b). Before, the seat closed and logged
+// "released 0 of 1; seat closed" with the bead still assigned to it. The
+// teardown now keeps the seat and names the release's reason.
+func TestDrainAckTeardown_ObservedClaimKeptKeepsSeat(t *testing.T) {
+	f := newDrainAckTeardownFixtureSized(t, 2, 1)
+	seat := f.sessions[0]
+	observed := f.work[0]
+	if err := f.store.SetMetadata(observed.ID, beadmeta.ReleaseProposedAtMetadataKey, f.now.Add(-time.Hour).Format(time.RFC3339)); err != nil {
+		t.Fatalf("stamp pending proposal on %s: %v", observed.ID, err)
+	}
+
+	var stderr bytes.Buffer
+	outcome := tearDownDrainAckedPoolSeat(f.store, testSeatWork(f.cityDir, f.cfg, f.store, nil), seedSessionInfo(mustGetBead(t, f.store, seat.ID)), observed.ID, f.now, &stderr)
+	if want := "observed_work_kept:named-release-proposed"; outcome.closed || outcome.retainedFor != want {
+		t.Fatalf("outcome = %+v, want retained for %s; stderr=%s", outcome, want, stderr.String())
+	}
+	if outcome.released != 0 || outcome.attempted != 1 {
+		t.Fatalf("outcome counts released=%d attempted=%d, want 0/1", outcome.released, outcome.attempted)
+	}
+	if got := mustGetBead(t, f.store, seat.ID); got.Status == "closed" {
+		t.Fatalf("seat closed with close_reason=%q over the observed claim it kept", got.Metadata["close_reason"])
+	}
+	if got := mustGetBead(t, f.store, observed.ID); got.Assignee != seat.ID || got.Status != "in_progress" {
+		t.Fatalf("observed %s: assignee=%q status=%q, want %q/in_progress kept", observed.ID, got.Assignee, got.Status, seat.ID)
+	}
+}
+
+// TestDrainAckTeardown_ObservedReleasedClosesDespiteOtherKept is the control for
+// the rule above: closure turns on the OBSERVED bead. The sweep released it and
+// kept another claim (a pending proposal), so the seat closes, and the count
+// reads "released 1 of 2", as it did before pl-1dkn.
+func TestDrainAckTeardown_ObservedReleasedClosesDespiteOtherKept(t *testing.T) {
+	f := newDrainAckTeardownFixtureSized(t, 2, 1)
+	seat := f.sessions[0]
+	observed := f.work[0]
+	kept := drainAckTeardownSecondClaim(t, f, map[string]string{beadmeta.ReleaseProposedAtMetadataKey: f.now.Add(-time.Hour).Format(time.RFC3339)})
+
+	var stderr bytes.Buffer
+	outcome := tearDownDrainAckedPoolSeat(f.store, testSeatWork(f.cityDir, f.cfg, f.store, nil), seedSessionInfo(mustGetBead(t, f.store, seat.ID)), observed.ID, f.now, &stderr)
+	if !outcome.closed || outcome.retainedFor != "" {
+		t.Fatalf("outcome = %+v, want closed (observed %s was released); stderr=%s", outcome, observed.ID, stderr.String())
+	}
+	if outcome.released != 1 || outcome.attempted != 2 {
+		t.Fatalf("outcome counts released=%d attempted=%d, want 1/2", outcome.released, outcome.attempted)
+	}
+	if got := mustGetBead(t, f.store, observed.ID); got.Assignee != "" || got.Status != "open" {
+		t.Fatalf("observed %s: assignee=%q status=%q, want released (\"\"/open)", observed.ID, got.Assignee, got.Status)
+	}
+	if got := mustGetBead(t, f.store, kept.ID); got.Assignee != seat.ID {
+		t.Fatalf("kept %s assignee = %q, want %q (a proposal is never released)", kept.ID, got.Assignee, seat.ID)
 	}
 }

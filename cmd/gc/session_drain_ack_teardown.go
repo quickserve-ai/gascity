@@ -69,13 +69,17 @@ type drainAckTeardownOutcome struct {
 // The retained_for reasons for a drain-ack with assigned work that the teardown
 // is not allowed to act on: the seat is not a disposable pool seat, it is a
 // canonical singleton pool's stable identity, or the call site did not grant
-// permission to close it; and the one for a seat the teardown acted on but kept:
-// the caller observed a bead and the release sweep found nothing to release.
+// permission to close it; and the ones for a seat the teardown acted on but
+// kept because the bead the caller observed was not released: the sweep found
+// nothing to release, it released other work but not the observed bead, or it
+// kept the observed bead (observed_work_kept:<why>, with the release's reason).
 const (
-	drainAckRetainedNotPoolSeat         = "not_pool_seat"
-	drainAckRetainedSingletonIdentity   = "singleton_identity"
-	drainAckRetainedCloseNotPermitted   = "close_not_permitted"
-	drainAckRetainedReleaseFoundNothing = "release_found_nothing"
+	drainAckRetainedNotPoolSeat           = "not_pool_seat"
+	drainAckRetainedSingletonIdentity     = "singleton_identity"
+	drainAckRetainedCloseNotPermitted     = "close_not_permitted"
+	drainAckRetainedReleaseFoundNothing   = "release_found_nothing"
+	drainAckRetainedReleaseMissedObserved = "release_missed_observed"
+	drainAckRetainedObservedWorkKept      = "observed_work_kept"
 )
 
 // drainAckTeardownRefusal returns "" when a drain-acked seat is one the teardown
@@ -104,8 +108,9 @@ func drainAckTeardownRefusal(cfg *config.City, info sessionpkg.Info) string {
 // seat drain-acked with assigned work and that its runtime is gone. sw is the
 // tick's read of every work leg; the release reads the seat live (fresh).
 // observed is the ID of the bead the caller saw the seat holding; when it is
-// set and the sweep attempts no release, the seat is kept
-// (release_found_nothing) rather than closed over work it may still hold.
+// set, the seat closes only if the sweep released that bead, and is otherwise
+// kept (drainAckObservedNotReleased names why) rather than closed over work it
+// may still hold.
 func tearDownDrainAckedPoolSeat(
 	store beads.Store,
 	sw *SeatWork,
@@ -165,20 +170,47 @@ func tearDownDrainAckedPoolSeat(
 	if readErr != nil || len(out.Failed) > 0 {
 		return drainAckTeardownOutcome{retainedFor: "release_failed", released: released, attempted: attempted}
 	}
-	// The caller observed a bead on this seat, but the sweep attempted nothing:
-	// the two finders disagree, so closing would leave the observed bead
-	// assigned to a closed seat while the log reads as a complete sweep
-	// (pl-xx64). Keep the seat: the caller completes the ack as a sleep, the
-	// shape this teardown replaced, so a bead still under the seat's names stays
-	// owned by an open seat that its assignment can wake and the stranded repair
-	// can see, never by a closed one.
-	if observed != "" && attempted == 0 {
-		return drainAckTeardownOutcome{retainedFor: drainAckRetainedReleaseFoundNothing}
+	// The caller observed a bead on this seat, but the sweep did not release
+	// it: the two finders disagree, or the release kept it (a named agent's
+	// claim, proposed not released). Closing would leave the observed bead
+	// assigned to a closed seat while the log reads as a finished sweep
+	// (pl-xx64, pl-1dkn). Keep the seat: the caller completes the ack as a
+	// sleep, the shape this teardown replaced, so a bead still under the seat's
+	// names stays owned by an open seat that its assignment can wake and the
+	// stranded repair can see, never by a closed one.
+	if retained := drainAckObservedNotReleased(observed, out, attempted); retained != "" {
+		return drainAckTeardownOutcome{retainedFor: retained, released: released, attempted: attempted}
 	}
 	if !closeBead(store, sw, info, drainAckTeardownCloseReason, now, stderr) {
 		return drainAckTeardownOutcome{retainedFor: "close_failed", released: released, attempted: attempted}
 	}
 	return drainAckTeardownOutcome{closed: true, released: released, attempted: attempted}
+}
+
+// drainAckObservedNotReleased returns "" when the sweep released the observed
+// bead (or the caller observed none), and otherwise the retained_for reason:
+// release_found_nothing when the sweep attempted no release at all,
+// observed_work_kept:<why> when it kept the observed claim, and
+// release_missed_observed when it acted on other work but never reached the
+// observed bead.
+func drainAckObservedNotReleased(observed string, out ReleaseOutcome, attempted int) string {
+	if observed == "" {
+		return ""
+	}
+	if attempted == 0 {
+		return drainAckRetainedReleaseFoundNothing
+	}
+	for _, c := range out.Released {
+		if c.bead.ID == observed {
+			return ""
+		}
+	}
+	for _, c := range out.Kept {
+		if c.bead.ID == observed {
+			return drainAckRetainedObservedWorkKept + ":" + out.Why[observed]
+		}
+	}
+	return drainAckRetainedReleaseMissedObserved
 }
 
 // drainAckedSeatCertParkedBead returns the ID of an in_progress bead the seat
