@@ -450,6 +450,10 @@ export const zConvoyGetResponse = z.object({
     progress: zConvoyProgress.optional()
 });
 
+export const zDoctorStruct = z.object({
+    census_owner_namespace: z.string().optional()
+});
+
 export const zErrorDetail = z.object({
     location: z.string().optional(),
     message: z.string().optional(),
@@ -1507,11 +1511,16 @@ export const zListBodyRigPatch = z.object({
 });
 
 export const zRigPatchSetInputBody = z.object({
+    beads_proxied_idle_timeout: z.string().optional(),
     default_branch: z.string().optional(),
+    default_merge_strategy: z.string().optional(),
+    doctor: zDoctorStruct.optional(),
+    formula_vars: z.record(z.string(), z.string()).optional(),
     name: z.string().optional(),
     path: z.string().optional(),
     prefix: z.string().optional(),
-    suspended: z.boolean().optional()
+    suspended: z.boolean().optional(),
+    suspended_on_start: z.boolean().optional()
 });
 
 export const zRigProvisionProgressPayload = z.object({
