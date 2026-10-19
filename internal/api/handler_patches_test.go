@@ -404,6 +404,313 @@ func TestHandleRigPatchSet(t *testing.T) {
 	}
 }
 
+// A PUT replaces the complete patch, including the rig fields not present in
+// the original HTTP input shape. Omitted fields on the next PUT are cleared.
+// TestRigPatchSetBodyCarriesEveryRigPatchField keeps the body complete.
+func TestHandleRigPatchSetFullReplacement(t *testing.T) {
+	fs := newFakeMutatorState(t)
+	h := newTestCityHandler(t, fs)
+	put := func(body string) {
+		t.Helper()
+		req := httptest.NewRequest("PUT", cityURL(fs, "/patches/rigs"), strings.NewReader(body))
+		req.Header.Set("X-GC-Request", "true")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("PUT status = %d, want 200; body = %s", w.Code, w.Body.String())
+		}
+	}
+
+	put(`{"name":"myrig","default_branch":"develop","default_merge_strategy":"mr","formula_vars":{"test_command":"go test ./..."},"suspended_on_start":false,"beads_proxied_idle_timeout":"5m","doctor":{"census_owner_namespace":"platform"}}`)
+	if len(fs.cfg.Patches.Rigs) != 1 {
+		t.Fatalf("patches.rigs count = %d, want 1", len(fs.cfg.Patches.Rigs))
+	}
+	p := fs.cfg.Patches.Rigs[0]
+	if p.FormulaVars["test_command"] != "go test ./..." || p.SuspendedOnStart == nil || *p.SuspendedOnStart ||
+		p.Doctor == nil || p.Doctor.CensusOwnerNamespace == nil || *p.Doctor.CensusOwnerNamespace != "platform" ||
+		p.DefaultMergeStrategy == nil || *p.DefaultMergeStrategy != "mr" ||
+		p.BeadsProxiedIdleTimeout == nil || *p.BeadsProxiedIdleTimeout != "5m" {
+		t.Fatalf("PUT lost rig patch fields: %+v", p)
+	}
+	req := httptest.NewRequest("GET", cityURL(fs, "/patches/rig/myrig"), nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+	var got config.RigPatch
+	if err := json.NewDecoder(w.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got.FormulaVars["test_command"] != "go test ./..." || got.SuspendedOnStart == nil ||
+		*got.SuspendedOnStart || got.Doctor == nil || got.Doctor.CensusOwnerNamespace == nil ||
+		*got.Doctor.CensusOwnerNamespace != "platform" ||
+		got.DefaultMergeStrategy == nil || *got.DefaultMergeStrategy != "mr" ||
+		got.BeadsProxiedIdleTimeout == nil || *got.BeadsProxiedIdleTimeout != "5m" {
+		t.Fatalf("GET lost rig patch fields: %+v", got)
+	}
+
+	put(`{"name":"myrig","default_branch":"main","formula_vars":{"build_command":"make build"},"suspended_on_start":true,"doctor":{"census_owner_namespace":""}}`)
+	p = fs.cfg.Patches.Rigs[0]
+	if len(p.FormulaVars) != 1 || p.FormulaVars["build_command"] != "make build" ||
+		p.SuspendedOnStart == nil || !*p.SuspendedOnStart ||
+		p.Doctor == nil || p.Doctor.CensusOwnerNamespace == nil || *p.Doctor.CensusOwnerNamespace != "" {
+		t.Fatalf("PUT did not replace rig patch fields: %+v", p)
+	}
+
+	put(`{"name":"myrig","default_branch":"main"}`)
+	p = fs.cfg.Patches.Rigs[0]
+	if p.FormulaVars != nil || p.SuspendedOnStart != nil || p.Doctor != nil ||
+		p.DefaultMergeStrategy != nil || p.BeadsProxiedIdleTimeout != nil {
+		t.Fatalf("omitted fields survived replacement: %+v", p)
+	}
+}
+
+// TestRigPatchSetBodyCarriesEveryRigPatchField: the PUT replaces the whole
+// patch, so a RigPatch field the request body cannot carry is cleared on every
+// write. Every config.RigPatch field, nested ones included, must have a body
+// field with the same wire name and type, and every body field must have a
+// RigPatch field to land in.
+func TestRigPatchSetBodyCarriesEveryRigPatchField(t *testing.T) {
+	checkRigPatchWireShape(t, "", reflect.TypeOf(RigPatchSetInput{}.Body), reflect.TypeOf(config.RigPatch{}))
+}
+
+// A PUT stores every body field, nested ones included, a second PUT replaces
+// every one of them, and a PUT that omits them clears them. The body is filled
+// by reflection, so a field added to both types is driven through the handler
+// without editing this test.
+func TestHandleRigPatchSetStoresEveryBodyField(t *testing.T) {
+	fs := newFakeMutatorState(t)
+	h := newTestCityHandler(t, fs)
+	putAndCheck := func(body any) {
+		t.Helper()
+		data, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest("PUT", cityURL(fs, "/patches/rigs"), strings.NewReader(string(data)))
+		req.Header.Set("X-GC-Request", "true")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("PUT %s: status = %d, want 200; body = %s", data, w.Code, w.Body.String())
+		}
+		if len(fs.cfg.Patches.Rigs) != 1 {
+			t.Fatalf("patches.rigs count = %d, want 1", len(fs.cfg.Patches.Rigs))
+		}
+		checkRigPatchStored(t, "", reflect.ValueOf(body).Elem(), reflect.ValueOf(fs.cfg.Patches.Rigs[0]))
+	}
+	filled := func(seed, strategy, timeout string) any {
+		body := RigPatchSetInput{}.Body
+		fillRigPatchBody(t, reflect.ValueOf(&body).Elem(), "", seed)
+		// Values the handler validates.
+		body.Name = "myrig"
+		body.DefaultMergeStrategy = &strategy
+		body.BeadsProxiedIdleTimeout = &timeout
+		return &body
+	}
+
+	putAndCheck(filled("a", "mr", "5m"))
+	putAndCheck(filled("b", "direct", "0"))
+	omitted := RigPatchSetInput{}.Body
+	omitted.Name = "myrig"
+	putAndCheck(&omitted)
+}
+
+func TestHandleRigPatchSetRejectsInvalidValues(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{name: "unknown merge strategy", body: `{"name":"myrig","default_merge_strategy":"pr"}`},
+		{name: "idle timeout not a duration", body: `{"name":"myrig","beads_proxied_idle_timeout":"garbage"}`},
+		{name: "idle timeout under the minimum", body: `{"name":"myrig","beads_proxied_idle_timeout":"30s"}`},
+		{name: "idle timeout negative", body: `{"name":"myrig","beads_proxied_idle_timeout":"-5m"}`},
+		{name: "idle timeout empty", body: `{"name":"myrig","beads_proxied_idle_timeout":""}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := newFakeMutatorState(t)
+			branch := "develop"
+			existing := config.RigPatch{Name: "myrig", DefaultBranch: &branch}
+			fs.cfg.Patches.Rigs = []config.RigPatch{existing}
+			h := newTestCityHandler(t, fs)
+
+			req := httptest.NewRequest("PUT", cityURL(fs, "/patches/rigs"), strings.NewReader(tc.body))
+			req.Header.Set("X-GC-Request", "true")
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, req)
+
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d; body = %s", w.Code, http.StatusBadRequest, w.Body.String())
+			}
+			if !reflect.DeepEqual(fs.cfg.Patches.Rigs, []config.RigPatch{existing}) {
+				t.Errorf("patches.rigs = %+v, want the existing patch unchanged (invalid patch must not be stored)", fs.cfg.Patches.Rigs)
+			}
+		})
+	}
+}
+
+func TestHandleRigPatchSetAcceptsValidValues(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		field string
+		value string
+	}{
+		{name: "merge strategy cleared", field: "default_merge_strategy", value: ""},
+		{name: "merge strategy direct", field: "default_merge_strategy", value: "direct"},
+		{name: "merge strategy mr", field: "default_merge_strategy", value: "mr"},
+		{name: "merge strategy local", field: "default_merge_strategy", value: "local"},
+		{name: "idle timeout never", field: "beads_proxied_idle_timeout", value: "0"},
+		{name: "idle timeout at the minimum", field: "beads_proxied_idle_timeout", value: "1m"},
+		{name: "idle timeout above the minimum", field: "beads_proxied_idle_timeout", value: "90m"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := newFakeMutatorState(t)
+			h := newTestCityHandler(t, fs)
+
+			body := `{"name":"myrig","` + tc.field + `":"` + tc.value + `"}`
+			req := httptest.NewRequest("PUT", cityURL(fs, "/patches/rigs"), strings.NewReader(body))
+			req.Header.Set("X-GC-Request", "true")
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, req)
+
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+			}
+			if len(fs.cfg.Patches.Rigs) != 1 {
+				t.Fatalf("patches.rigs count = %d, want 1", len(fs.cfg.Patches.Rigs))
+			}
+			p := fs.cfg.Patches.Rigs[0]
+			got := p.DefaultMergeStrategy
+			if tc.field == "beads_proxied_idle_timeout" {
+				got = p.BeadsProxiedIdleTimeout
+			}
+			if got == nil || *got != tc.value {
+				t.Errorf("stored %s = %v, want %q", tc.field, got, tc.value)
+			}
+		})
+	}
+}
+
+// rigPatchWireFields maps the wire names of a struct's fields to the fields:
+// the json name for the PUT body, the toml name for config.RigPatch (what the
+// PUT writes to city.toml).
+func rigPatchWireFields(t *testing.T, typ reflect.Type, tag string) map[string]reflect.StructField {
+	t.Helper()
+	fields := make(map[string]reflect.StructField, typ.NumField())
+	for i := 0; i < typ.NumField(); i++ {
+		f := typ.Field(i)
+		name, _, _ := strings.Cut(f.Tag.Get(tag), ",")
+		if name == "" || name == "-" {
+			t.Fatalf("%s.%s has no %s name", typ, f.Name, tag)
+		}
+		fields[name] = f
+	}
+	return fields
+}
+
+func joinWirePath(path, name string) string {
+	if path == "" {
+		return name
+	}
+	return path + "." + name
+}
+
+// checkRigPatchWireShape fails unless body and patch have the same wire
+// fields with the same types, recursing into nested structs.
+func checkRigPatchWireShape(t *testing.T, path string, body, patch reflect.Type) {
+	t.Helper()
+	if body.Kind() == reflect.Pointer && patch.Kind() == reflect.Pointer &&
+		body.Elem().Kind() == reflect.Struct && patch.Elem().Kind() == reflect.Struct {
+		checkRigPatchWireShape(t, path, body.Elem(), patch.Elem())
+		return
+	}
+	if body.Kind() != reflect.Struct || patch.Kind() != reflect.Struct {
+		if body != patch {
+			t.Errorf("%s: PUT body type %s, config.RigPatch type %s", path, body, patch)
+		}
+		return
+	}
+	bodyFields := rigPatchWireFields(t, body, "json")
+	patchFields := rigPatchWireFields(t, patch, "toml")
+	for name, pf := range patchFields {
+		bf, ok := bodyFields[name]
+		if !ok {
+			t.Errorf("%s (%s.%s) has no field in RigPatchSetInput.Body; a PUT clears it", joinWirePath(path, name), patch, pf.Name)
+			continue
+		}
+		checkRigPatchWireShape(t, joinWirePath(path, name), bf.Type, pf.Type)
+	}
+	for name := range bodyFields {
+		if _, ok := patchFields[name]; !ok {
+			t.Errorf("RigPatchSetInput.Body field %s has no %s field to store it in", joinWirePath(path, name), patch)
+		}
+	}
+}
+
+// fillRigPatchBody sets every field under v to a non-zero value derived from
+// seed, so two seeds give values that differ in every field. It fails on a
+// kind it cannot fill, so a new field kind forces this filler to grow.
+func fillRigPatchBody(t *testing.T, v reflect.Value, path, seed string) {
+	t.Helper()
+	switch v.Kind() {
+	case reflect.Pointer:
+		v.Set(reflect.New(v.Type().Elem()))
+		fillRigPatchBody(t, v.Elem(), path, seed)
+	case reflect.Struct:
+		for i := 0; i < v.NumField(); i++ {
+			fillRigPatchBody(t, v.Field(i), joinWirePath(path, v.Type().Field(i).Name), seed)
+		}
+	case reflect.String:
+		v.SetString(seed + "-" + path)
+	case reflect.Bool:
+		v.SetBool(seed == "a")
+	case reflect.Map:
+		if v.Type().Key().Kind() != reflect.String || v.Type().Elem().Kind() != reflect.String {
+			t.Fatalf("%s: no filler for %s", path, v.Type())
+		}
+		m := reflect.MakeMap(v.Type())
+		m.SetMapIndex(reflect.ValueOf(seed+"-key").Convert(v.Type().Key()), reflect.ValueOf(seed+"-"+path).Convert(v.Type().Elem()))
+		v.Set(m)
+	default:
+		t.Fatalf("%s: no filler for kind %s", path, v.Kind())
+	}
+}
+
+// checkRigPatchStored fails unless the stored patch holds exactly what the
+// body sent, matched by wire name: a body field that was set is stored with
+// its value, and one that was omitted is stored as unset.
+func checkRigPatchStored(t *testing.T, path string, body, patch reflect.Value) {
+	t.Helper()
+	if body.Kind() == reflect.Pointer && patch.Kind() == reflect.Pointer {
+		if body.IsNil() != patch.IsNil() {
+			t.Errorf("%s: body set = %t, stored set = %t", path, !body.IsNil(), !patch.IsNil())
+			return
+		}
+		if body.IsNil() {
+			return
+		}
+		checkRigPatchStored(t, path, body.Elem(), patch.Elem())
+		return
+	}
+	if body.Kind() == reflect.Struct && patch.Kind() == reflect.Struct {
+		bodyFields := rigPatchWireFields(t, body.Type(), "json")
+		patchFields := rigPatchWireFields(t, patch.Type(), "toml")
+		for name, pf := range patchFields {
+			bf, ok := bodyFields[name]
+			if !ok {
+				t.Errorf("%s: no body field", joinWirePath(path, name))
+				continue
+			}
+			checkRigPatchStored(t, joinWirePath(path, name), body.FieldByIndex(bf.Index), patch.FieldByIndex(pf.Index))
+		}
+		return
+	}
+	if !reflect.DeepEqual(body.Interface(), patch.Interface()) {
+		t.Errorf("%s: stored %#v, body sent %#v", path, patch.Interface(), body.Interface())
+	}
+}
+
 func TestHandleRigPatchDelete(t *testing.T) {
 	fs := newFakeMutatorState(t)
 	suspended := true
