@@ -2,8 +2,10 @@ package api
 
 import (
 	"context"
+	"strings"
 
 	"github.com/gastownhall/gascity/internal/api/apierr"
+	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/config"
 )
 
@@ -194,6 +196,18 @@ func (s *Server) humaHandleRigPatchSet(_ context.Context, input *RigPatchSetInpu
 
 	if patch.Name == "" {
 		return nil, apierr.InvalidRequest.Msg("name is required")
+	}
+	// Validate at the edge: SetRigPatch stores the patch without config
+	// load's rig checks, so a value that load rejects would be persisted and
+	// only fail at the next config load.
+	if s := patch.DefaultMergeStrategy; s != nil && *s != "" && !beadmeta.IsKnownMergeStrategy(*s) {
+		return nil, apierr.InvalidRequest.Msgf("default_merge_strategy %q is not one of %s",
+			*s, strings.Join(beadmeta.KnownMergeStrategies, ", "))
+	}
+	if t := patch.BeadsProxiedIdleTimeout; t != nil {
+		if _, err := config.ParseProxiedIdleTimeout(*t); err != nil {
+			return nil, apierr.InvalidRequest.Msgf("beads_proxied_idle_timeout: %v", err)
+		}
 	}
 
 	if err := sm.SetRigPatch(patch); err != nil {
