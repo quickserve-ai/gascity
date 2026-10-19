@@ -131,7 +131,8 @@ func (c *CachingStore) recordedDigestLocked(
 			}
 		} else {
 			fresh, listed := freshByID[id]
-			if !listed || reconcileFingerprint(cached, nil) != reconcileFingerprint(fresh, nil) ||
+			if !listed || !c.depsReadForReconcileLocked(fresh, useFreshDeps) ||
+				reconcileFingerprint(cached, nil) != reconcileFingerprint(fresh, nil) ||
 				depsChanged(c.deps[id], c.depsForReconcileLocked(id, fresh, depMap, useFreshDeps)) {
 				continue
 			}
@@ -141,6 +142,21 @@ func (c *CachingStore) recordedDigestLocked(
 	}
 	c.reconcileFingerprints = fingerprints
 	return recorded
+}
+
+// depsReadForReconcileLocked reports whether this pass read the row's edges
+// from the backing. When it did not, depsForReconcileLocked answers the cached
+// edges, which then match themselves: recording that row would certify edges
+// no read observed, and an unchanged digest would keep them until the next full
+// pass. Caller holds c.mu.
+func (c *CachingStore) depsReadForReconcileLocked(fresh Bead, useFreshDeps bool) bool {
+	if useFreshDeps {
+		return true
+	}
+	if _, ok := c.backing.(*BdStore); ok {
+		return true
+	}
+	return len(depsFromBeadFields(fresh)) > 0
 }
 
 // reconcileFingerprint hashes a cached row and its edges, including the fields
