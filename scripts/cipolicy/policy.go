@@ -350,7 +350,11 @@ const (
 	// hard-errors on it), so it failed every night; no job may select a
 	// provider now. Reviewed delta: one job removed; no new job, trigger or
 	// permission.
-	expectedNightlyExecutionHash = "cb54a44e7bfc392a047849ab6cfe695dcbffec56e127b5a84d427e3c1d4bef8c"
+	// Bumped again (ga-tkfdsb): beads-proxied-perf installs the fleet bd release
+	// (workflow env FLEET_BD_TAG, checked against its SHA256SUMS) instead of
+	// building upstream's BD_CURRENT_REF; two steps become one. Reviewed delta:
+	// one env key, one step's commands; no new job, trigger, permission or secret.
+	expectedNightlyExecutionHash = "16a550fd8ef6b137577af74308686494ed32d308c29073bf7f44d4ffe2e0d42c"
 	// Setup action: reviewed delta (Go module fetch resilience) is setup-go
 	// `cache: false` and one step right after it,
 	// `uses: ./.github/actions/go-mod-download`.
