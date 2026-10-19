@@ -34,8 +34,12 @@ var _ cacheReconcileDigestStore = (*NativeDoltStore)(nil)
 //   - leases: lease_expires_at, heartbeat_at, granted_node
 //   - comments: comment_count
 //
-// A set term is COUNT plus BIT_XOR(CRC32(member)). Its residual blind spot (a
-// member swap whose CRCs collide) is what the cache's periodic full scan is for.
+// A set term is COUNT plus the BIT_XOR of each member's first 64 bits of SHA1.
+// Not CRC32: CRC32 is affine, so over an even number of equal-length members
+// its constant cancels, and a swap such as labels {aa,bb} -> {ab,ba} leaves
+// BIT_XOR(CRC32) unchanged (2988704377 for both on Dolt, 2026-10-19). Its
+// residual blind spot (a member swap whose 64-bit prefixes collide) is what the
+// cache's periodic full scan is for.
 //
 // A storage that exports no SQL pool answers errReconcileDigestUnsupported,
 // never an empty digest: an empty one would read as "every row vanished".
@@ -77,18 +81,18 @@ func reconcileDigestSQL(t reconcileDigestTier) string {
 			COALESCE(r.content_hash, '-'), CAST(r.row_lock AS CHAR),
 			COALESCE(l.h, '-'), COALESCE(d.h, '-'), COALESCE(rd.h, '-'), COALESCE(le.h, '-'), COALESCE(cm.h, '-'))
 		FROM %[1]s r
-		LEFT JOIN (SELECT issue_id, CONCAT(COUNT(*), ':', BIT_XOR(CRC32(label))) AS h
+		LEFT JOIN (SELECT issue_id, CONCAT(COUNT(*), ':', BIT_XOR(CAST(CONV(LEFT(SHA1(label), 16), 16, 10) AS UNSIGNED))) AS h
 			FROM %[2]s GROUP BY issue_id) l ON l.issue_id = r.id
-		LEFT JOIN (SELECT e.issue_id, CONCAT(COUNT(*), ':', BIT_XOR(CRC32(CONCAT_WS('|',
+		LEFT JOIN (SELECT e.issue_id, CONCAT(COUNT(*), ':', BIT_XOR(CAST(CONV(LEFT(SHA1(CONCAT_WS('|',
 				COALESCE(e.depends_on_issue_id, e.depends_on_wisp_id, e.depends_on_external), e.type,
 				COALESCE(CAST(e.metadata AS CHAR), ''), COALESCE(e.thread_id, ''),
 				COALESCE(ti.status, tw.status, ''), COALESCE(ti.content_hash, tw.content_hash, ''),
-				COALESCE(CAST(ti.updated_at AS CHAR), CAST(tw.updated_at AS CHAR), ''))))) AS h
+				COALESCE(CAST(ti.updated_at AS CHAR), CAST(tw.updated_at AS CHAR), ''))), 16), 16, 10) AS UNSIGNED))) AS h
 			FROM %[3]s e
 			LEFT JOIN issues ti ON ti.id = e.depends_on_issue_id
 			LEFT JOIN wisps tw ON tw.id = e.depends_on_wisp_id
 			GROUP BY e.issue_id) d ON d.issue_id = r.id
-		LEFT JOIN (SELECT dep_id, CONCAT(COUNT(*), ':', BIT_XOR(CRC32(CONCAT_WS('|', issue_id, type)))) AS h
+		LEFT JOIN (SELECT dep_id, CONCAT(COUNT(*), ':', BIT_XOR(CAST(CONV(LEFT(SHA1(CONCAT_WS('|', issue_id, type)), 16), 16, 10) AS UNSIGNED))) AS h
 			FROM (SELECT %[5]s AS dep_id, issue_id, type FROM dependencies
 				UNION ALL SELECT %[5]s AS dep_id, issue_id, type FROM wisp_dependencies) x
 			GROUP BY dep_id) rd ON rd.dep_id = r.id
