@@ -1853,31 +1853,6 @@ func assertProxiedNativePerfHeadroom(t *testing.T, label string, wall, target ti
 	}
 }
 
-// bestOfGCSide returns the smallest gc-side time over n samples of one
-// measurement.
-//
-// The minimum, not the mean: what is being measured is a fixed cost, and every
-// sample is that cost plus whatever else this shared box was doing during it.
-// The mean of a fixed cost plus one-sided noise is a measure of the noise. The
-// minimum is the closest any sample got to the quantity, and a regression that
-// really did add work to gc's side raises every sample, including the best one.
-//
-// Each sample returns its gc-side time already attributed. It used to return
-// (wall, child) and clamp a negative difference to zero here, and under an
-// upper bound zero passes: over-reported child time made the gate pass
-// whatever gc did (round3 review, completeness). A sample that cannot be
-// attributed now fails the row where it is measured (helpers.PassthroughGCSide).
-func bestOfGCSide(t *testing.T, n int, sample func() time.Duration) time.Duration {
-	t.Helper()
-	best := time.Duration(-1)
-	for i := 0; i < n; i++ {
-		if gcSide := sample(); best < 0 || gcSide < best {
-			best = gcSide
-		}
-	}
-	return best
-}
-
 // describeProxiedAccount renders the store open's own account of the proxied
 // lane for a failure message.
 func describeProxiedAccount(payload beadsStorePayloadDoc) string {
@@ -2049,11 +2024,18 @@ func runProxiedNativeLaneGates(t *testing.T, bdPath, doltPath string) {
 		// (round3 review, completeness): a sample whose children cannot be
 		// attributed fails, and so does a floor that stopped being one — see
 		// helpers.PassthroughGCSide and helpers.MarginalOverFloor.
-		floor := bestOfGCSide(t, 5, func() time.Duration {
+		//
+		// The floor is sampled beside the command, one floor before each
+		// command sample, and a round that misses the budget is measured
+		// again: a loaded CI runner failed this row three times in ~64 runs
+		// with the floor flat and every command sample inflated
+		// (ga-l0b72a.9). helpers.GateMarginalOverFloor says why a regression
+		// still fails.
+		floor := func() time.Duration {
 			start := time.Now()
 			helpers.RunGC(lane, cityRoot, "--help") //nolint:errcheck // the exit status of --help is not the measurement
 			return time.Since(start)
-		})
+		}
 
 		trace := helpers.NewBDTrace(t)
 		traced := lane.Clone().With(helpers.BDTraceEnv, trace.Path)
@@ -2062,7 +2044,7 @@ func runProxiedNativeLaneGates(t *testing.T, bdPath, doltPath string) {
 			lastRecords int
 			describe    string
 		)
-		gcSide := bestOfGCSide(t, 5, func() time.Duration {
+		gcSide := func() time.Duration {
 			trace.Reset()
 			bdCalls.Reset()
 			start := time.Now()
@@ -2084,22 +2066,22 @@ func runProxiedNativeLaneGates(t *testing.T, bdPath, doltPath string) {
 				t.Fatalf("gc bd list --json: %v\n%s", err, describe)
 			}
 			return sampleGCSide
-		})
+		}
 
-		marginal, err := helpers.MarginalOverFloor(gcSide, floor, proxiedNativeGCSideBudget)
+		gate, err := helpers.GateMarginalOverFloor(3, 5, proxiedNativeGCSideBudget,
+			func() { time.Sleep(5 * time.Second) }, floor, gcSide)
 		if err != nil {
-			t.Fatalf("gc bd list --json, best of 5: %v", err)
+			t.Fatalf("gc bd list --json: %v\n%s", err, gate.Describe())
 		}
 		// The artifact: bd-bound and machine-bound, recorded so the delta is
 		// reproducible, never asserted. The 0.4s figure in the bead is a
 		// stretch target for a future in-process arm and is NOT a PR2 gate.
-		t.Logf("gc bd list --json, flag ON (best of 5): gc-side %s = process floor %s + marginal %s; last sample had %d traced call(s) totalling %s\n%s",
-			gcSide.Round(time.Millisecond), floor.Round(time.Millisecond), marginal.Round(time.Millisecond),
-			lastRecords, lastChild.Round(time.Millisecond), describe)
-		if marginal > proxiedNativeGCSideBudget {
-			t.Errorf("marginal gc-side time for `gc bd list --json` = %s, want <= %s (best-of-5 gc-side %s minus this box's %s process floor)",
-				marginal.Round(time.Millisecond), proxiedNativeGCSideBudget,
-				gcSide.Round(time.Millisecond), floor.Round(time.Millisecond))
+		t.Logf("gc bd list --json, flag ON: cumulative marginal %s over %d round(s) of 5 interleaved samples; last sample had %d traced call(s) totalling %s\n%s\n%s",
+			gate.Marginal.Round(time.Millisecond), len(gate.Rounds),
+			lastRecords, lastChild.Round(time.Millisecond), gate.Describe(), describe)
+		if !gate.Pass {
+			t.Errorf("marginal gc-side time for `gc bd list --json` = %s, want <= %s, after %d rounds (min gc side minus min `gc --help` floor over every interleaved sample taken)\n%s",
+				gate.Marginal.Round(time.Millisecond), proxiedNativeGCSideBudget, len(gate.Rounds), gate.Describe())
 		}
 	})
 
