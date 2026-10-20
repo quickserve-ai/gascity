@@ -1580,8 +1580,21 @@ func unwindUndeliveredHookClaim(reason, cause string, bead beads.Bead, priorAssi
 	//
 	// Deliberately NOT the window-bounded context: in the straddle case the
 	// window is already spent, and the unwind must still be allowed to run.
-	ctx, cancel := context.WithTimeout(context.Background(), hookClaimMutationTimeout)
-	defer cancel()
+	//
+	// Each write gets its OWN fresh hookClaimMutationTimeout deadline. A restore
+	// that spends its whole budget without committing must not hand the
+	// fallback release an already-expired context: the release is what keeps
+	// the claim from staying parked, so it always gets a full budget.
+	release := func() (bool, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), hookClaimMutationTimeout)
+		defer cancel()
+		return ops.Release(ctx, dir, opts.Env, bead.ID, assignee)
+	}
+	restore := func(prior string) (bool, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), hookClaimMutationTimeout)
+		defer cancel()
+		return ops.Restore(ctx, dir, opts.Env, bead.ID, assignee, prior)
+	}
 	prior := strings.TrimSpace(priorAssignee)
 	var (
 		released   bool
@@ -1590,14 +1603,14 @@ func unwindUndeliveredHookClaim(reason, cause string, bead beads.Bead, priorAssi
 	)
 	switch {
 	case prior == "":
-		released, err = ops.Release(ctx, dir, opts.Env, bead.ID, assignee)
+		released, err = release()
 	case ops.Restore == nil:
 		restoreErr = errHookClaimRestoreUnavailable
-		released, err = ops.Release(ctx, dir, opts.Env, bead.ID, assignee)
+		released, err = release()
 	default:
-		released, restoreErr = ops.Restore(ctx, dir, opts.Env, bead.ID, assignee, prior)
+		released, restoreErr = restore(prior)
 		if restoreErr != nil {
-			released, err = ops.Release(ctx, dir, opts.Env, bead.ID, assignee)
+			released, err = release()
 		}
 	}
 	if released && err == nil {
