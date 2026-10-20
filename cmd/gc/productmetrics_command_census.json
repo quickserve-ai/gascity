@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "next_id": 212,
+  "next_id": 218,
   "permanent_ids": [
     {
       "name": "help",
@@ -3660,7 +3660,7 @@
       "notice_policy": "eligible",
       "classification": "session-bind-cloud",
       "owner": "immediate",
-      "id": 211
+      "id": 217
     },
     {
       "path": "gc session close",
@@ -3690,7 +3690,7 @@
       "notice_policy": "eligible",
       "classification": "session-history",
       "owner": "immediate",
-      "id": 209
+      "id": 216
     },
     {
       "path": "gc session kill",
