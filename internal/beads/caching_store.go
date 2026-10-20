@@ -212,6 +212,15 @@ type CachingStore struct {
 	ownEmitMu       sync.Mutex
 	ownEmits        map[string][]ownEmit
 	ownEmitsSweptAt time.Time
+
+	// reconcileDigest is the backing's per-row digest read at the start of
+	// the last completed reconcile, reconcileFingerprints the cached content
+	// that reconcile left for each recorded row, and lastFullListAt when a
+	// reconcile last listed the whole active set. All guarded by mu
+	// (caching_store_reconcile_delta.go).
+	reconcileDigest       map[string]string
+	reconcileFingerprints map[string]uint64
+	lastFullListAt        time.Time
 }
 
 // CacheObservation is an opaque, process-local stamp returned with a cached

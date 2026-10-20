@@ -111,6 +111,7 @@ go_test(
         "caching_store_reconcile_census_test.go",
         "caching_store_reconcile_coverage_test.go",
         "caching_store_reconcile_decision_test.go",
+        "caching_store_reconcile_delta_test.go",
         "caching_store_reconcile_differential_test.go",
         "caching_store_reconcile_diffutil_test.go",
         "caching_store_reconcile_digest_test.go",
