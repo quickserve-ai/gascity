@@ -68,7 +68,7 @@ func doctorManagedSessionNames(cityPath string, cfg *config.City, openStore func
 			return nil, fmt.Errorf("opening city bead store: %w", err)
 		}
 		defer closeBeadStoreHandle(store) //nolint:errcheck // best-effort close of a one-shot read handle
-		rigStores, failures := doctorOrphanRigStores(cfg, cityPath, doctorGatedRigStoreOpener(gate, oneShotRigStoreOpener(cfg)))
+		rigStores, failures := doctorOrphanRigStores(cityRigs(cfg), cityPath, doctorGatedRigStoreOpener(gate, oneShotRigStoreOpener(cfg)), sequentialRigStoreOpens)
 		defer func() {
 			for _, rigStore := range rigStores {
 				closeBeadStoreHandle(rigStore) //nolint:errcheck // best-effort close of a one-shot read handle
