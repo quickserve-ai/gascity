@@ -3775,8 +3775,25 @@ func TestRespawnAgentMarksClaudeAccountRemovedFromSessionEnv(t *testing.T) {
 			} else if len(setEnv) != 0 {
 				t.Errorf("set-environment calls = %q, want none for a declared account", setEnv)
 			}
-			if respawn := strings.Join(fake.calls[len(fake.calls)-1], " "); !strings.Contains(respawn, "respawn-pane") {
-				t.Errorf("last call = %q, want respawn-pane", respawn)
+			// The respawn is not the last call: the input fence's environment
+			// read follows it (republishInputFence, upstream #7962). What the
+			// withholding needs is the order: the session env is marked before
+			// respawn-pane starts the agent, which inherits that env.
+			respawnAt, markAt := -1, -1
+			for i, call := range fake.calls {
+				joined := strings.Join(call, " ")
+				if respawnAt < 0 && strings.Contains(joined, "respawn-pane") {
+					respawnAt = i
+				}
+				if markAt < 0 && strings.Contains(joined, "set-environment") {
+					markAt = i
+				}
+			}
+			if respawnAt < 0 {
+				t.Fatalf("tmux calls = %q, want a respawn-pane", fake.calls)
+			}
+			if tc.wantMarked && markAt > respawnAt {
+				t.Errorf("set-environment ran as call %d, after respawn-pane (call %d): the respawned agent would inherit the account", markAt, respawnAt)
 			}
 		})
 	}
