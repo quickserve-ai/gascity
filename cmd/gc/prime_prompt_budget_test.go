@@ -49,6 +49,11 @@ func writePromptBudgetCity(t *testing.T, toml, promptContent string) {
 		t.Fatal(err)
 	}
 	t.Setenv("GC_CITY_PATH", dir)
+	// The fixture has no bead store of its own: without these, prime's
+	// context build opens the default store and starts a managed Dolt
+	// server that outlives the test (pl-n35a: seven were left at ~20:54Z).
+	t.Setenv("GC_BEADS", "file")
+	disableManagedDoltRecoveryForTest(t)
 }
 
 const promptBudgetBareTOML = `[workspace]

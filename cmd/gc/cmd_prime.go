@@ -536,7 +536,9 @@ func doPrimeWithHookFormatOpts(args []string, stdout, stderr io.Writer, hookMode
 					}
 				}
 				injection := primeHookContextSuffix(cityPath, sessionStart, hookMode, hookContext, stderr, consumeHandoff)
-				prompt = primeHookPromptForDelivery(cityPath, cityName, ctx.AgentName, primeSeatSessionName(cityPath, cityName, &a, cfg.Workspace.SessionTemplate), prompt, hookMode, suppressHookPrompt, injection.text, stderr)
+				if hookMode {
+					prompt, injection = fitPrimeHookInjection(primeSeatForHook(cityPath, cityName, ctx.AgentName, &a, cfg, resolved), prompt, suppressHookPrompt, injection, stderr)
+				}
 				writePrimePromptWithFormat(stdout, cityName, ctx.AgentName, prompt, hookMode, hookFormat, suppressHookPrompt, injection.text, injection.afterDelivery)
 				return 0, budget
 			}
@@ -570,7 +572,9 @@ func doPrimeWithHookFormatOpts(args []string, stdout, stderr io.Writer, hookMode
 					cfg.PackDirsForRig(ctx.RigName), nil, nil)
 				if content != "" {
 					injection := primeHookContextSuffix(cityPath, sessionStart, hookMode, hookContext, stderr, consumeHandoff)
-					content = primeHookPromptForDelivery(cityPath, cityName, ctx.AgentName, primeSeatSessionName(cityPath, cityName, &a, cfg.Workspace.SessionTemplate), content, hookMode, suppressHookPrompt, injection.text, stderr)
+					if hookMode {
+						content, injection = fitPrimeHookInjection(primeSeatForHook(cityPath, cityName, ctx.AgentName, &a, cfg, resolved), content, suppressHookPrompt, injection, stderr)
+					}
 					writePrimePromptWithFormat(stdout, cityName, ctx.AgentName, content, hookMode, hookFormat, suppressHookPrompt, injection.text, injection.afterDelivery)
 					return 0, nil
 				}
@@ -737,6 +741,25 @@ func primeSeatSessionName(cityPath, cityName string, a *config.Agent, sessionTem
 	return cliSessionName(cityPath, cityName, a.QualifiedName(), sessionTemplate)
 }
 
+// primeSeatForHook describes the seat whose SessionStart context is fitted
+// to its provider's hook limit (see primeHookFitContext).
+func primeSeatForHook(cityPath, cityName, agentName string, a *config.Agent, cfg *config.City, resolved *config.ResolvedProvider) primeHookSeat {
+	return primeHookSeat{
+		cityPath:    cityPath,
+		cityName:    cityName,
+		agentName:   agentName,
+		sessionName: primeSeatSessionName(cityPath, cityName, a, cfg.Workspace.SessionTemplate),
+		capped:      primeHookContextCapped(resolved),
+	}
+}
+
+// fitPrimeHookInjection applies primeHookFitContext to a prompt and its hook
+// injection.
+func fitPrimeHookInjection(seat primeHookSeat, prompt string, suppressPrompt bool, injection primeHookContextInjection, stderr io.Writer) (string, primeHookContextInjection) {
+	prompt, injection.text = primeHookFitContext(seat, prompt, suppressPrompt, injection.text, stderr)
+	return prompt, injection
+}
+
 func managedSessionHookPromptAlreadyDelivered(ctx primeHookContext) bool {
 	if strings.TrimSpace(os.Getenv(startupPromptDeliveredEnv)) != "1" {
 		return false
@@ -744,17 +767,7 @@ func managedSessionHookPromptAlreadyDelivered(ctx primeHookContext) bool {
 	if strings.TrimSpace(os.Getenv(managedSessionHookEnv)) != "1" {
 		return false
 	}
-	if strings.TrimSpace(ctx.HookEventName) != "SessionStart" {
-		return false
-	}
-	// /compact and /clear restart the conversation inside the process gc
-	// launched: the launch marker is still set, but the prompt it delivered
-	// is no longer in the conversation.
-	switch strings.TrimSpace(ctx.Source) {
-	case "compact", "clear":
-		return false
-	}
-	return true
+	return strings.TrimSpace(ctx.HookEventName) == "SessionStart"
 }
 
 func primeHookSessionStart(ctx primeHookContext) bool {

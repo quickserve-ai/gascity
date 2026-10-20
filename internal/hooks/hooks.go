@@ -1573,25 +1573,15 @@ func upgradeClaudeHookEntry(event string, entry map[string]any) bool {
 
 	// Second pass: normalize matcher only when the entry is identifiably
 	// GC-managed. Blocks user-authored SessionStart entries with
-	// matcher:"" from being silently rewritten. A managed entry left on an
-	// earlier matcher ("" or "startup") would otherwise merge beside the
-	// embedded entry as a second one, keyed by its own matcher, and run
-	// gc prime twice at startup.
+	// matcher:"" from being silently rewritten to "startup".
 	if event == "SessionStart" && hasManagedCommand {
-		if matcher, ok := entry["matcher"].(string); ok && (matcher == "" || matcher == "startup") {
-			entry["matcher"] = claudeSessionStartMatcher
+		if matcher, ok := entry["matcher"].(string); ok && matcher == "" {
+			entry["matcher"] = "startup"
 			changed = true
 		}
 	}
 	return changed
 }
-
-// claudeSessionStartMatcher is the matcher on gc's managed Claude
-// SessionStart entry. Besides startup it covers resume, clear and compact,
-// so a conversation that restarts inside a running seat (or a resumed one)
-// still reaches its role prompt; gc prime decides per source what to
-// inject (see managedSessionHookPromptAlreadyDelivered in cmd/gc).
-const claudeSessionStartMatcher = "startup|resume|clear|compact"
 
 // canonicalGCPathPrefix is the env-setup prefix gc prepends to every
 // managed hook command. Legacy command bodies always appear either bare
