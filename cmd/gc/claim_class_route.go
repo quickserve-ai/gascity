@@ -782,8 +782,14 @@ func restoreGraphHookClaim(ctx context.Context, graph storebinding.GraphStore, b
 // only while it is still the claim being given back — in_progress under
 // holder — at the revision it reads, as ONE revision-fenced write. verb names
 // the write in a failed read's error.
+//
+// The binding takes no context, so each call is bounded by ctx the way the
+// teardown read above is (runWithDeadline). A stalled read must not outlast the
+// unwind's deadline. A read abandoned at the deadline cannot write late: the
+// write is never issued once ctx is done, and it is fenced on the revision
+// read in any case.
 func writeGraphHookClaimFenced(ctx context.Context, graph storebinding.GraphStore, beadID, holder, verb string, opts beads.UpdateOpts) (fencedReleaseOutcome, error) {
-	current, err := graph.Get(beadID)
+	current, err := runWithDeadline(ctx, func() (beads.Bead, error) { return graph.Get(beadID) })
 	if errors.Is(err, beads.ErrNotFound) {
 		return fencedReleaseChanged, nil
 	}
@@ -796,7 +802,9 @@ func writeGraphHookClaimFenced(ctx context.Context, graph storebinding.GraphStor
 	if err := ctx.Err(); err != nil {
 		return fencedReleaseRefused, err
 	}
-	err = graph.UpdateIfMatch(beadID, current.Revision, opts)
+	_, err = runWithDeadline(ctx, func() (struct{}, error) {
+		return struct{}{}, graph.UpdateIfMatch(beadID, current.Revision, opts)
+	})
 	switch {
 	case err == nil:
 		return fencedReleaseApplied, nil
