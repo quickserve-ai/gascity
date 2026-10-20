@@ -1595,6 +1595,17 @@ func unwindUndeliveredHookClaim(reason, cause string, bead beads.Bead, priorAssi
 		defer cancel()
 		return ops.Restore(ctx, dir, opts.Env, bead.ID, assignee, prior)
 	}
+	restoredLate := func(prior string) bool {
+		if ops.ReadWorkMeta == nil {
+			return false
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), hookClaimMutationTimeout)
+		defer cancel()
+		current, readErr := ops.ReadWorkMeta(ctx, dir, opts.Env, bead.ID, assignee)
+		return readErr == nil &&
+			strings.EqualFold(strings.TrimSpace(current.Status), "open") &&
+			strings.TrimSpace(current.Assignee) == prior
+	}
 	prior := strings.TrimSpace(priorAssignee)
 	var (
 		released   bool
@@ -1611,6 +1622,18 @@ func unwindUndeliveredHookClaim(reason, cause string, bead beads.Bead, priorAssi
 		released, restoreErr = restore(prior)
 		if restoreErr != nil {
 			released, err = release()
+			// A restore that gave up waiting has not necessarily failed: the
+			// graph binding's write runs on a goroutine runWithDeadline stops
+			// waiting for, so it can commit after the deadline. When the
+			// release's CAS then misses, classify from a fresh read rather
+			// than assume: open under the pre-claim owner is that restore,
+			// landed late. Anything else moved, and is left alone. A
+			// release-miss proves the bead left in_progress under our claim, and
+			// any write but the restore itself bumps the revision the restore
+			// is fenced on, so no restore can still land after this read.
+			if err == nil && !released && restoredLate(prior) {
+				released, restoreErr = true, nil
+			}
 		}
 	}
 	if released && err == nil {
