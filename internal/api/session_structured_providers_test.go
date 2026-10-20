@@ -21,6 +21,7 @@ import (
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/sessionlog"
+	"github.com/gastownhall/gascity/internal/testutil"
 )
 
 // isolateProviderDiscovery points provider transcript discovery at an empty,
@@ -1160,6 +1161,8 @@ func TestSessionStreamStructuredPromotesFallbackToHistoryWithoutReconnect(t *tes
 			srv := New(fs)
 			structuredPeekPoll := make(chan time.Time)
 			srv.structuredPeekPoll = structuredPeekPoll
+			structuredPeekLoopReady := make(chan struct{})
+			srv.structuredPeekLoopReady = structuredPeekLoopReady
 			humaHandler := newTestCityHandlerWith(t, fs, srv)
 			srv.sessionLogSearchPaths = []string{searchBase}
 
@@ -1202,13 +1205,26 @@ func TestSessionStreamStructuredPromotesFallbackToHistoryWithoutReconnect(t *tes
 			if !strings.Contains(fallbackBody, structuredTranscriptUnavailableCode) {
 				t.Fatalf("fallback body missing degraded diagnostic: %s", fallbackBody)
 			}
+			// The fallback frame is written before the stream's first history
+			// check. Writing the JSONL any earlier than the loop-ready signal
+			// lets that check promote directly, and the stream then never
+			// reads the injected tick below.
+			select {
+			case <-structuredPeekLoopReady:
+			case <-done:
+				t.Fatal("handler exited before entering the structured peek poll loop")
+			case <-time.After(testutil.GoroutineRaceTimeout):
+				t.Fatal("structured peek stream did not reach its poll loop")
+			}
 
 			writeNamedSessionJSONL(t, searchBase, workDir, info.SessionKey+".jsonl",
 				`{"uuid":"m1","parentUuid":"","type":"assistant","message":{"role":"assistant","content":"authoritative history"},"timestamp":"2025-01-01T00:00:00Z"}`,
 			)
 			select {
 			case structuredPeekPoll <- time.Now():
-			case <-time.After(hangBudget):
+			case <-done:
+				t.Fatal("handler exited before the injected poll tick")
+			case <-time.After(testutil.GoroutineRaceTimeout):
 				t.Fatal("structured peek stream did not consume the injected poll tick")
 			}
 
