@@ -919,7 +919,7 @@ func TestListOverlaySkipsBeadsThatCannotCarryLiveness(t *testing.T) {
 type orderedReadyBacking struct{ *beads.MemStore }
 
 func (s orderedReadyBacking) ReadyOrdered(query beads.ReadyQuery, _ beads.ReadyOrder) ([]beads.Bead, bool, error) {
-	rows, err := s.MemStore.Ready(query)
+	rows, err := s.Ready(query)
 	return rows, true, err
 }
 

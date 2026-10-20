@@ -93,6 +93,7 @@ func readyBeadFromGen(g genclient.ReadyBead) readywork.ReadyBead {
 		Ref:         derefStr(g.Ref),
 		Description: derefStr(g.Description),
 		CloseReason: derefStr(g.CloseReason),
+		AwaitType:   derefStr(g.AwaitType),
 		DeferUntil:  g.DeferUntil,
 		IsBlocked:   g.IsBlocked,
 	}
