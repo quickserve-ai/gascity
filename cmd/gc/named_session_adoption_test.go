@@ -258,6 +258,194 @@ func TestNamedSessionPoolShadowConverges(t *testing.T) {
 	}
 }
 
+// TestAlwaysNamedCustomCheckMintStaysDesiredAcrossTicks pins the invariant
+// that makes the allocator differential's carry-named-canonical-mint
+// difference (POOL-008: accepted mayor, legacy 0, v2 1) accounting only. A
+// mode=always named session backs a singleton template whose custom
+// scale_check counts work, and the city starts from an empty store. ga-dfp1b
+// L2's guarded pool create mints the canonical named row on the first tick;
+// the recount the reconciler is handed (cmd_start.go, and the controller's
+// demand snapshot) then reads that row as the slot's holder, so the
+// template's accepted demand is 0. Nothing reads that 0 to decide differently:
+// every tick keeps one canonical row and one desired entry for the identity
+// and asks the guard for no second create, the row stays config-eligible and
+// wakes on WakeConfig under the recount, and a reconcile fed that recount
+// starts it without draining or closing it, which still holds a tick later.
+func TestAlwaysNamedCustomCheckMintStaysDesiredAcrossTicks(t *testing.T) {
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	sp := runtime.NewFake()
+	// The guarded mint stamps pending_create_started_at from the wall clock
+	// (poolSessionCreateStartedAt), so the fake clock starts there too: a fixed
+	// date would put that lease's anchor weeks away from the reconciler's now.
+	clk := &clock.Fake{Time: time.Now().UTC()}
+	maxOne := 1
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:              "mayor",
+			StartCommand:      "true",
+			MaxActiveSessions: &maxOne,
+			ScaleCheck:        "echo 2",
+		}},
+		NamedSessions: []config.NamedSession{{
+			Template: "mayor",
+			Mode:     "always",
+		}},
+	}
+	requireNamedGuardRoutes(t, cfg)
+	spec, ok := findNamedSessionSpec(cfg, "test-city", "mayor")
+	if !ok {
+		t.Fatalf("findNamedSessionSpec(mayor) not found")
+	}
+	env := newReconcilerTestEnv(t)
+	env.store, env.sp, env.cfg, env.clk, env.city = store, sp, cfg, clk, cityPath
+
+	// canonicalID is the tick-1 mint's bead ID. requireHeld fails unless that
+	// bead is open, not drained, not draining, and its runtime runs.
+	canonicalID := ""
+	requireHeld := func(when string) {
+		t.Helper()
+		id := canonicalID
+		got, err := store.Get(id)
+		if err != nil {
+			t.Fatalf("%s: Get(%s): %v", when, id, err)
+		}
+		if got.Status == "closed" {
+			t.Fatalf("%s: canonical bead %s closed (state %q, close_reason %q)", when, id, got.Metadata["state"], got.Metadata["close_reason"])
+		}
+		info, err := sessionFrontDoor(store).Get(id)
+		if err != nil {
+			t.Fatalf("%s: front-door Get(%s): %v", when, id, err)
+		}
+		if isDrainedSessionInfo(info) {
+			t.Fatalf("%s: canonical bead %s reads drained (state %q)", when, id, got.Metadata["state"])
+		}
+		if drain := env.dt.get(id); drain != nil {
+			t.Fatalf("%s: canonical bead %s is draining (reason %q)", when, id, drain.reason)
+		}
+		if !sp.IsRunning(spec.SessionName) {
+			t.Fatalf("%s: runtime %q is not running (state %q); reconcile stderr:\n%s", when, spec.SessionName, got.Metadata["state"], env.stderr.String())
+		}
+	}
+
+	for tick := 1; tick <= 3; tick++ {
+		var stderr bytes.Buffer
+		dsResult := buildDesiredState("test-city", cityPath, clk.Now().UTC(), cfg, sp, store, &stderr)
+		syncSessionBeads(cityPath, store, dsResult.State, sp, allConfiguredDS(dsResult.State), cfg, clk, &stderr, false)
+
+		// No pool request was refused or skipped, the guard never refused a
+		// second holder, and the builder never skipped the identity.
+		msg := stderr.String()
+		for _, refused := range []string{"already holds pool template", "blocked by conflicting session bead", `pool "mayor" request:`} {
+			if strings.Contains(msg, refused) {
+				t.Fatalf("tick %d: stderr reports %q:\n%s", tick, refused, msg)
+			}
+		}
+
+		// Exactly one desired entry: the identity, on its canonical session name.
+		var keys []string
+		for name, tp := range dsResult.State {
+			keys = append(keys, name+"|identity="+tp.ConfiguredNamedIdentity)
+		}
+		sort.Strings(keys)
+		if tp, found := dsResult.State[spec.SessionName]; len(dsResult.State) != 1 || !found || tp.ConfiguredNamedIdentity != "mayor" {
+			t.Fatalf("tick %d: desired = %v, want only %q|identity=mayor", tick, keys, spec.SessionName)
+		}
+
+		// Exactly one session bead, open and canonical: the tick-1 mint, with
+		// no pool shadow beside it and nothing closed before it.
+		all, err := store.ListByLabel(sessionBeadLabel, 0, beads.IncludeClosed)
+		if err != nil {
+			t.Fatalf("tick %d: ListByLabel: %v", tick, err)
+		}
+		if len(all) != 1 || all[0].Status == "closed" {
+			for _, b := range all {
+				t.Logf("tick %d: bead %s status=%s meta=%v", tick, b.ID, b.Status, b.Metadata)
+			}
+			t.Fatalf("tick %d: %d session beads, want exactly one, open", tick, len(all))
+		}
+		canonical := all[0]
+		if canonicalID == "" {
+			canonicalID = canonical.ID
+		} else if canonical.ID != canonicalID {
+			t.Fatalf("tick %d: canonical bead is %s, want the tick-1 mint %s", tick, canonical.ID, canonicalID)
+		}
+		for key, want := range map[string]string{
+			namedSessionMetadataKey:      "true",
+			namedSessionIdentityMetadata: "mayor",
+			namedSessionModeMetadata:     "always",
+			"alias":                      "mayor",
+			"session_name":               spec.SessionName,
+			poolManagedMetadataKey:       "",
+		} {
+			if got := canonical.Metadata[key]; got != want {
+				t.Errorf("tick %d: %s = %q, want %q", tick, key, got, want)
+			}
+		}
+		if canonical.Ephemeral {
+			t.Errorf("tick %d: canonical bead is on the wisp tier, want durable", tick)
+		}
+		lookup, err := sessionpkg.LookupConfiguredNamedSession(store, spec)
+		if err != nil {
+			t.Fatalf("tick %d: LookupConfiguredNamedSession: %v", tick, err)
+		}
+		if !lookup.HasCanonical || lookup.Canonical.ID != canonicalID || lookup.HasConflict {
+			t.Errorf("tick %d: resolver canonical = (%v, %s), conflict %v; want (true, %s), no conflict", tick, lookup.HasCanonical, lookup.Canonical.ID, lookup.HasConflict, canonicalID)
+		}
+
+		switch tick {
+		case 2:
+			// The recount the reconciler is handed, as cmd_start.go computes
+			// it over the post-sync snapshot.
+			if got := dsResult.ScaleCheckCounts["mayor"]; got < 1 {
+				t.Fatalf("tick 2: scale_check count for mayor = %d, want the custom check's demand (a zero recount would prove nothing)", got)
+			}
+			snap, err := loadSessionBeadSnapshot(store)
+			if err != nil {
+				t.Fatalf("tick 2: loadSessionBeadSnapshot: %v", err)
+			}
+			openInfos := snap.OpenInfos()
+			poolWork := filterAssignedWorkBeadsForPoolDemand(cfg, cityPath, store, openInfos, dsResult.AssignedWorkBeads, dsResult.AssignedWorkStoreRefs, dsResult.PoolWakeReadiness)
+			poolDesired := retainScaleCheckPartialPoolDesired(
+				cfg,
+				PoolDesiredCounts(ComputePoolDesiredStatesAt(cfg, poolWork, openInfos, dsResult.ScaleCheckCounts, clk.Now().UTC())),
+				snap,
+				effectivePoolPartialRetentionTemplates(dsResult),
+			)
+			if poolDesired == nil {
+				poolDesired = make(map[string]int)
+			}
+			mergeNamedSessionDemand(poolDesired, dsResult.NamedSessionDemand, cfg)
+			if got := poolDesired["mayor"]; got != 0 {
+				t.Fatalf("tick 2: recount poolDesired[mayor] = %d, want 0 (the canonical row holds the slot)", got)
+			}
+			info, found := snap.FindInfoByID(canonicalID)
+			if !found {
+				t.Fatalf("tick 2: canonical bead %s missing from the post-sync snapshot", canonicalID)
+			}
+			if agent, eligible := sessionWithinDesiredConfigInfo(info, cfg, poolDesired); agent == nil || !eligible {
+				t.Fatalf("tick 2: sessionWithinDesiredConfigInfo under recount %v = (agent found %t, eligible %t), want (true, true)", poolDesired, agent != nil, eligible)
+			}
+			if eval := evaluateWakeReasonsInfo(info, cfg, sp, poolDesired, nil, nil, clk); !containsWakeReason(eval.Reasons, WakeConfig) {
+				t.Fatalf("tick 2: wake reasons under recount %v = %v, want WakeConfig", poolDesired, eval.Reasons)
+			}
+
+			// The reconciler, fed that recount (reconcile() would derive 1
+			// from the desired entry instead).
+			sessions, err := loadSessionBeads(store)
+			if err != nil {
+				t.Fatalf("tick 2: loadSessionBeads: %v", err)
+			}
+			env.desiredState = dsResult.State
+			env.reconcileWithPoolDesired(sessions, poolDesired)
+			requireHeld("tick 2, after the reconcile")
+		case 3:
+			requireHeld("tick 3, the build and sync after the reconcile")
+		}
+	}
+}
+
 // distinctIdentityNamedSessionCity is a city whose configured named session
 // identity ("agent-lead") differs from its single-session backing template
 // ("agent-b").
