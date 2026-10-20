@@ -106,7 +106,12 @@ var allocDifferences = map[string]allocDifference{
 // does not explain. They are pinned so the suite stays honest while the owner
 // decides; an entry is deleted when its fix lands (the fixture then fails
 // until its explain entry goes too). A finding is not an explanation.
-var allocFindings = map[string]allocDifference{}
+var allocFindings = map[string]allocDifference{
+	"carry-named-canonical-mint": {
+		"carry row ga-dfp1b L2 (7ee2e4dd36), not CONTRACT v5; re-sync #8 owner decision pending",
+		"legacy's guarded pool create mints the canonical named row when a pool create targets a template whose only session is a mode=always named identity, and the post-build recount reads that row as holding the identity's slot, so legacy's accepted demand is 0 where upstream's pool-managed row is skipped and both sides accept 1",
+	},
+}
 
 // diffCity is one fixture city: its config, the beads both stores start
 // from, the runtime names alive on both sides, and the K1 scale_check run.
@@ -689,7 +694,7 @@ func scaleCheckDiffCities() []diffCity {
 		},
 		{
 			name:       "named sessions backed by custom checks: on_demand and always (POOL-008)",
-			explain:    map[string]explained{"create:named:mayor": {"named-singleton-custom-count", "legacy false, v2 true"}, "create:pool:mayor/mayor#": {"named-singleton-custom-count", "legacy true, v2 false"}},
+			explain:    map[string]explained{"create:named:mayor": {"named-singleton-custom-count", "legacy false, v2 true"}, "create:pool:mayor/mayor#": {"named-singleton-custom-count", "legacy true, v2 false"}, "accepted:mayor": {"carry-named-canonical-mint", "legacy 0, v2 1"}},
 			cfg:        named,
 			beads:      []beads.Bead{diffWork("dw-1", "chat"), diffWork("dw-2", "worker")},
 			scaleCheck: true,
