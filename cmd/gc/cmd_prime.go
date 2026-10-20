@@ -487,10 +487,7 @@ func doPrimeWithHookFormatOpts(args []string, stdout, stderr io.Writer, hookMode
 		}
 		resolved, rErr := config.ResolveProvider(&a, &cfg.Workspace, cfg.Providers, exec.LookPath)
 		if rErr == nil && hookMode {
-			sessionName := os.Getenv("GC_SESSION_NAME")
-			if sessionName == "" {
-				sessionName = cliSessionName(cityPath, cityName, a.QualifiedName(), cfg.Workspace.SessionTemplate)
-			}
+			sessionName := primeSeatSessionName(cityPath, cityName, &a, cfg.Workspace.SessionTemplate)
 			maybeStartNudgePoller(withNudgeTargetFenceFromLiveSession(openNudgeBeadStore(cityPath).Store, sessionStart.liveInfo(), nudgeTarget{
 				cityPath:          cityPath,
 				cityName:          cityName,
@@ -539,6 +536,7 @@ func doPrimeWithHookFormatOpts(args []string, stdout, stderr io.Writer, hookMode
 					}
 				}
 				injection := primeHookContextSuffix(cityPath, sessionStart, hookMode, hookContext, stderr, consumeHandoff)
+				prompt = primeHookPromptForDelivery(cityPath, cityName, ctx.AgentName, primeSeatSessionName(cityPath, cityName, &a, cfg.Workspace.SessionTemplate), prompt, hookMode, suppressHookPrompt, injection.text, stderr)
 				writePrimePromptWithFormat(stdout, cityName, ctx.AgentName, prompt, hookMode, hookFormat, suppressHookPrompt, injection.text, injection.afterDelivery)
 				return 0, budget
 			}
@@ -572,6 +570,7 @@ func doPrimeWithHookFormatOpts(args []string, stdout, stderr io.Writer, hookMode
 					cfg.PackDirsForRig(ctx.RigName), nil, nil)
 				if content != "" {
 					injection := primeHookContextSuffix(cityPath, sessionStart, hookMode, hookContext, stderr, consumeHandoff)
+					content = primeHookPromptForDelivery(cityPath, cityName, ctx.AgentName, primeSeatSessionName(cityPath, cityName, &a, cfg.Workspace.SessionTemplate), content, hookMode, suppressHookPrompt, injection.text, stderr)
 					writePrimePromptWithFormat(stdout, cityName, ctx.AgentName, content, hookMode, hookFormat, suppressHookPrompt, injection.text, injection.afterDelivery)
 					return 0, nil
 				}
@@ -729,6 +728,15 @@ func prependHookBeacon(cityName, agentName, prompt string) string {
 	return beacon + "\n\n" + prompt
 }
 
+// primeSeatSessionName names the seat's session: GC_SESSION_NAME when the
+// session carries it, otherwise the name gc derives for the agent.
+func primeSeatSessionName(cityPath, cityName string, a *config.Agent, sessionTemplate string) string {
+	if name := strings.TrimSpace(os.Getenv("GC_SESSION_NAME")); name != "" {
+		return name
+	}
+	return cliSessionName(cityPath, cityName, a.QualifiedName(), sessionTemplate)
+}
+
 func managedSessionHookPromptAlreadyDelivered(ctx primeHookContext) bool {
 	if strings.TrimSpace(os.Getenv(startupPromptDeliveredEnv)) != "1" {
 		return false
@@ -736,7 +744,17 @@ func managedSessionHookPromptAlreadyDelivered(ctx primeHookContext) bool {
 	if strings.TrimSpace(os.Getenv(managedSessionHookEnv)) != "1" {
 		return false
 	}
-	return strings.TrimSpace(ctx.HookEventName) == "SessionStart"
+	if strings.TrimSpace(ctx.HookEventName) != "SessionStart" {
+		return false
+	}
+	// /compact and /clear restart the conversation inside the process gc
+	// launched: the launch marker is still set, but the prompt it delivered
+	// is no longer in the conversation.
+	switch strings.TrimSpace(ctx.Source) {
+	case "compact", "clear":
+		return false
+	}
+	return true
 }
 
 func primeHookSessionStart(ctx primeHookContext) bool {

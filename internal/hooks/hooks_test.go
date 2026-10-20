@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -134,13 +135,13 @@ func TestInstallClaude(t *testing.T) {
 	if !strings.Contains(sessionStartCommand, "GC_MANAGED_SESSION_HOOK=1") {
 		t.Error("claude SessionStart hook should mark managed hook invocation")
 	}
-	if entries := claudeHookEntries(t, runtimeData, "SessionStart"); len(entries) == 0 || entries[0].Matcher != "startup" {
-		t.Errorf("claude SessionStart matcher should be \"startup\" to avoid re-injecting prompt on resume/clear/compact, got %q", func() string {
+	if entries := claudeHookEntries(t, runtimeData, "SessionStart"); len(entries) == 0 || entries[0].Matcher != claudeSessionStartMatcher {
+		t.Errorf("claude SessionStart matcher = %q, want %q", func() string {
 			if len(entries) == 0 {
 				return ""
 			}
 			return entries[0].Matcher
-		}())
+		}(), claudeSessionStartMatcher)
 	}
 	if !strings.Contains(claudeHookCommand(t, runtimeData, "PreCompact"), `gc handoff --auto "context cycle"`) {
 		t.Error("claude PreCompact hook should use gc handoff --auto (not gc prime or restart handoff) on compaction")
@@ -289,7 +290,7 @@ func TestInstallClaudeUpgradesGeneratedFileSessionStartMatcher(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readEmbedded: %v", err)
 	}
-	stale := strings.Replace(string(current), `"matcher": "startup"`, `"matcher": ""`, 1)
+	stale := strings.Replace(string(current), `"matcher": "`+claudeSessionStartMatcher+`"`, `"matcher": ""`, 1)
 	if stale == string(current) {
 		t.Fatal("stale fixture did not diverge from current embedded config — check SessionStart matcher pattern")
 	}
@@ -302,16 +303,68 @@ func TestInstallClaudeUpgradesGeneratedFileSessionStartMatcher(t *testing.T) {
 
 	hookData := fs.Files["/city/hooks/claude.json"]
 	runtimeData := fs.Files["/city/.gc/settings.json"]
-	if entries := claudeHookEntries(t, hookData, "SessionStart"); len(entries) == 0 || entries[0].Matcher != "startup" {
-		t.Fatalf("upgraded hook SessionStart matcher = %q, want startup", func() string {
+	if entries := claudeHookEntries(t, hookData, "SessionStart"); len(entries) == 0 || entries[0].Matcher != claudeSessionStartMatcher {
+		t.Fatalf("upgraded hook SessionStart matcher = %q, want %q", func() string {
 			if len(entries) == 0 {
 				return ""
 			}
 			return entries[0].Matcher
-		}())
+		}(), claudeSessionStartMatcher)
 	}
 	if string(runtimeData) != string(hookData) {
 		t.Fatalf("runtime Claude settings should mirror upgraded hook settings:\n%s", string(runtimeData))
+	}
+}
+
+// TestClaudeSessionStartMatcherCoversRestartSources pins the sources the
+// managed SessionStart entry fires on. Claude Code matches the matcher as a
+// regex against the hook input's source; a conversation restarted by
+// /compact, /clear or a resume reaches its role prompt only if the entry
+// fires for that source.
+func TestClaudeSessionStartMatcherCoversRestartSources(t *testing.T) {
+	data, err := readEmbedded("config/claude.json")
+	if err != nil {
+		t.Fatalf("readEmbedded: %v", err)
+	}
+	entries := claudeHookEntries(t, data, "SessionStart")
+	if len(entries) != 1 {
+		t.Fatalf("SessionStart entries = %d, want 1", len(entries))
+	}
+	re, err := regexp.Compile("^(?:" + entries[0].Matcher + ")$")
+	if err != nil {
+		t.Fatalf("SessionStart matcher %q does not compile: %v", entries[0].Matcher, err)
+	}
+	for _, source := range []string{"startup", "resume", "clear", "compact"} {
+		if !re.MatchString(source) {
+			t.Errorf("SessionStart matcher %q does not match source %q", entries[0].Matcher, source)
+		}
+	}
+}
+
+// TestInstallClaudeUpgradesStartupOnlySessionStartMatcher covers a city
+// whose override still carries gc's previous managed entry on "startup".
+// Merge keys entries by matcher, so without the upgrade the override's
+// entry would sit beside the embedded one and gc prime would run twice.
+func TestInstallClaudeUpgradesStartupOnlySessionStartMatcher(t *testing.T) {
+	fs := fsys.NewFake()
+	current, err := readEmbedded("config/claude.json")
+	if err != nil {
+		t.Fatalf("readEmbedded: %v", err)
+	}
+	stale := strings.Replace(string(current), `"matcher": "`+claudeSessionStartMatcher+`"`, `"matcher": "startup"`, 1)
+	if stale == string(current) {
+		t.Fatal("stale fixture did not diverge from current embedded config — check SessionStart matcher pattern")
+	}
+	fs.Files["/city/.claude/settings.json"] = []byte(stale)
+
+	if err := Install(fs, "/city", "/work", []string{"claude"}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+
+	runtimeData := fs.Files["/city/.gc/settings.json"]
+	entries := claudeHookEntries(t, runtimeData, "SessionStart")
+	if len(entries) != 1 || entries[0].Matcher != claudeSessionStartMatcher {
+		t.Fatalf("SessionStart entries = %+v, want one entry on %q:\n%s", entries, claudeSessionStartMatcher, string(runtimeData))
 	}
 }
 
@@ -904,7 +957,7 @@ func TestInstallClaudeUpgradesGeneratedFileWithCombinedKnownDrift(t *testing.T) 
 		t.Fatalf("readEmbedded: %v", err)
 	}
 	stale := strings.Replace(string(current), `GC_MANAGED_SESSION_HOOK=1 GC_HOOK_EVENT_NAME=SessionStart gc prime --hook --hook-format codex`, `gc prime --hook`, 1)
-	stale = strings.Replace(stale, `"matcher": "startup"`, `"matcher": ""`, 1)
+	stale = strings.Replace(stale, `"matcher": "`+claudeSessionStartMatcher+`"`, `"matcher": ""`, 1)
 	if stale == string(current) {
 		t.Fatal("stale fixture did not diverge from current embedded config — check combined SessionStart drift pattern")
 	}
@@ -924,13 +977,13 @@ func TestInstallClaudeUpgradesGeneratedFileWithCombinedKnownDrift(t *testing.T) 
 	if !strings.Contains(sessionStartCommand, "GC_MANAGED_SESSION_HOOK=1") {
 		t.Fatalf("upgraded combined-drift SessionStart missing managed marker: %s", sessionStartCommand)
 	}
-	if entries := claudeHookEntries(t, hookData, "SessionStart"); len(entries) == 0 || entries[0].Matcher != "startup" {
-		t.Fatalf("upgraded combined-drift hook SessionStart matcher = %q, want startup", func() string {
+	if entries := claudeHookEntries(t, hookData, "SessionStart"); len(entries) == 0 || entries[0].Matcher != claudeSessionStartMatcher {
+		t.Fatalf("upgraded combined-drift hook SessionStart matcher = %q, want %q", func() string {
 			if len(entries) == 0 {
 				return ""
 			}
 			return entries[0].Matcher
-		}())
+		}(), claudeSessionStartMatcher)
 	}
 	if string(runtimeData) != string(hookData) {
 		t.Fatalf("runtime Claude settings should mirror upgraded combined-drift hook settings:\n%s", string(runtimeData))
@@ -945,7 +998,7 @@ func TestInstallClaudeUpgradesGeneratedFileWithAllKnownDrift(t *testing.T) {
 	}
 	stale := strings.Replace(string(current), `gc handoff --auto \"context cycle\"`, `gc prime --hook`, 1)
 	stale = strings.Replace(stale, `GC_MANAGED_SESSION_HOOK=1 GC_HOOK_EVENT_NAME=SessionStart gc prime --hook --hook-format codex`, `gc prime --hook --hook-format codex`, 1)
-	stale = strings.Replace(stale, `"matcher": "startup"`, `"matcher": ""`, 1)
+	stale = strings.Replace(stale, `"matcher": "`+claudeSessionStartMatcher+`"`, `"matcher": ""`, 1)
 	if stale == string(current) {
 		t.Fatal("stale fixture did not diverge from current embedded config — check all known Claude drift patterns")
 	}
@@ -965,13 +1018,13 @@ func TestInstallClaudeUpgradesGeneratedFileWithAllKnownDrift(t *testing.T) {
 	if !strings.Contains(sessionStartCommand, "GC_MANAGED_SESSION_HOOK=1") {
 		t.Fatalf("upgraded all-drift SessionStart missing managed marker: %s", sessionStartCommand)
 	}
-	if entries := claudeHookEntries(t, hookData, "SessionStart"); len(entries) == 0 || entries[0].Matcher != "startup" {
-		t.Fatalf("upgraded all-drift hook SessionStart matcher = %q, want startup", func() string {
+	if entries := claudeHookEntries(t, hookData, "SessionStart"); len(entries) == 0 || entries[0].Matcher != claudeSessionStartMatcher {
+		t.Fatalf("upgraded all-drift hook SessionStart matcher = %q, want %q", func() string {
 			if len(entries) == 0 {
 				return ""
 			}
 			return entries[0].Matcher
-		}())
+		}(), claudeSessionStartMatcher)
 	}
 	if !strings.Contains(claudeHookCommand(t, hookData, "PreCompact"), `gc handoff --auto "context cycle"`) {
 		t.Fatalf("upgraded all-drift PreCompact hook missing gc handoff:\n%s", string(hookData))
