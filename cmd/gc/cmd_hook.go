@@ -77,6 +77,7 @@ The agent is determined from $GC_AGENT or a positional argument.`,
 	}
 	cmd.AddCommand(newHookRunCmd(stdout, stderr))
 	cmd.AddCommand(newHookCurrentCmd(stdout, stderr))
+	cmd.AddCommand(newHookHeartbeatCmd(stdout, stderr))
 	return cmd
 }
 
