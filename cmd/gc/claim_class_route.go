@@ -704,9 +704,10 @@ func classRoutedHookClaimOps(ops hookClaimOps, route *hookClaimClassRoute) hookC
 	// routes on the MEMO alone and never probes: a bead this invocation did not
 	// route is one the work store claimed, and the release is a consequence of
 	// that claim rather than a second opinion about where the bead lives.
+	// The binding takes no context, so ctx bounds it as it does the restore.
 	ops.Release = func(ctx context.Context, dir string, env []string, beadID, assignee string) (bool, error) {
 		if route.knownResident(beadID) {
-			return route.graph.ReleaseIfCurrent(beadID, assignee)
+			return runWithDeadline(ctx, func() (bool, error) { return route.graph.ReleaseIfCurrent(beadID, assignee) })
 		}
 		return base.Release(ctx, dir, env, beadID, assignee)
 	}
@@ -782,8 +783,14 @@ func restoreGraphHookClaim(ctx context.Context, graph storebinding.GraphStore, b
 // only while it is still the claim being given back — in_progress under
 // holder — at the revision it reads, as ONE revision-fenced write. verb names
 // the write in a failed read's error.
+//
+// The binding takes no context, so each call is bounded by ctx the way the
+// teardown read above is (runWithDeadline). A stalled read must not outlast the
+// unwind's deadline. A read abandoned at the deadline cannot write late: the
+// write is never issued once ctx is done, and it is fenced on the revision
+// read in any case.
 func writeGraphHookClaimFenced(ctx context.Context, graph storebinding.GraphStore, beadID, holder, verb string, opts beads.UpdateOpts) (fencedReleaseOutcome, error) {
-	current, err := graph.Get(beadID)
+	current, err := runWithDeadline(ctx, func() (beads.Bead, error) { return graph.Get(beadID) })
 	if errors.Is(err, beads.ErrNotFound) {
 		return fencedReleaseChanged, nil
 	}
@@ -796,7 +803,9 @@ func writeGraphHookClaimFenced(ctx context.Context, graph storebinding.GraphStor
 	if err := ctx.Err(); err != nil {
 		return fencedReleaseRefused, err
 	}
-	err = graph.UpdateIfMatch(beadID, current.Revision, opts)
+	_, err = runWithDeadline(ctx, func() (struct{}, error) {
+		return struct{}{}, graph.UpdateIfMatch(beadID, current.Revision, opts)
+	})
 	switch {
 	case err == nil:
 		return fencedReleaseApplied, nil
