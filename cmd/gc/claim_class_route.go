@@ -711,6 +711,20 @@ func classRoutedHookClaimOps(ops hookClaimOps, route *hookClaimClassRoute) hookC
 		return base.Release(ctx, dir, env, beadID, assignee)
 	}
 
+	// The restore of an undelivered ready-assignment claim (ga-812fpb) routes
+	// exactly like the release above, on the memo alone. The graph binding has
+	// no guarded assignee update, so its restore is a read, a check against the
+	// claim being given back, and a revision-fenced write.
+	ops.Restore = func(ctx context.Context, dir string, env []string, beadID, holder, prior string) (bool, error) {
+		if route.knownResident(beadID) {
+			return restoreGraphHookClaim(ctx, route.graph, beadID, holder, prior)
+		}
+		if base.Restore == nil {
+			return false, errHookClaimRestoreUnavailable
+		}
+		return base.Restore(ctx, dir, env, beadID, holder, prior)
+	}
+
 	// An adoption re-stamp of a bead resident in the relocated graph store has
 	// no conditional-transfer primitive there, so it reports unsupported and
 	// the bead is adopted as-is (the pre-re-stamp behavior). Anything else
@@ -743,4 +757,52 @@ func classRoutedHookClaimOps(ops hookClaimOps, route *hookClaimClassRoute) hookC
 	}
 
 	return ops
+}
+
+// restoreGraphHookClaim is hookClaimRestoreOnStore for a bead resident in the
+// relocated graph store: open under prior, only while the bead is still
+// in_progress under holder at the revision read.
+func restoreGraphHookClaim(ctx context.Context, graph storebinding.GraphStore, beadID, holder, prior string) (bool, error) {
+	open := "open"
+	prior = strings.TrimSpace(prior)
+	outcome, err := writeGraphHookClaimFenced(ctx, graph, beadID, holder, "restore", beads.UpdateOpts{Status: &open, Assignee: &prior})
+	switch outcome {
+	case fencedReleaseApplied:
+		return true, nil
+	case fencedReleaseChanged:
+		return false, nil
+	case fencedReleaseLost:
+		return false, errHookClaimRestoreLost
+	default:
+		return false, fmt.Errorf("restoring %s to %q: %w", beadID, prior, err)
+	}
+}
+
+// writeGraphHookClaimFenced writes opts to a bead resident in the graph store
+// only while it is still the claim being given back — in_progress under
+// holder — at the revision it reads, as ONE revision-fenced write. verb names
+// the write in a failed read's error.
+func writeGraphHookClaimFenced(ctx context.Context, graph storebinding.GraphStore, beadID, holder, verb string, opts beads.UpdateOpts) (fencedReleaseOutcome, error) {
+	current, err := graph.Get(beadID)
+	if errors.Is(err, beads.ErrNotFound) {
+		return fencedReleaseChanged, nil
+	}
+	if err != nil {
+		return fencedReleaseRefused, fmt.Errorf("re-reading %s before %s: %w", beadID, verb, err)
+	}
+	if current.Status != "in_progress" || strings.TrimSpace(current.Assignee) != strings.TrimSpace(holder) {
+		return fencedReleaseChanged, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return fencedReleaseRefused, err
+	}
+	err = graph.UpdateIfMatch(beadID, current.Revision, opts)
+	switch {
+	case err == nil:
+		return fencedReleaseApplied, nil
+	case beads.IsPreconditionFailed(err):
+		return fencedReleaseLost, nil
+	default:
+		return fencedReleaseRefused, err
+	}
 }
