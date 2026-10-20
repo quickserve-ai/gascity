@@ -63,7 +63,7 @@ type allocDifference struct {
 
 // allocDifferences are the explained differences, by ID, each citing
 // CONTRACT v5 (AL1 keeps v4.3 §2-§3 and §6 except as it notes) or, for a
-// fork carry's own behaviour, its carry row.
+// fork carry's own behavior, its carry row.
 var allocDifferences = map[string]allocDifference{
 	"create-budget": {
 		"v5 P4",
