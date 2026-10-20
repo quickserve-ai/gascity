@@ -704,9 +704,10 @@ func classRoutedHookClaimOps(ops hookClaimOps, route *hookClaimClassRoute) hookC
 	// routes on the MEMO alone and never probes: a bead this invocation did not
 	// route is one the work store claimed, and the release is a consequence of
 	// that claim rather than a second opinion about where the bead lives.
+	// The binding takes no context, so ctx bounds it as it does the restore.
 	ops.Release = func(ctx context.Context, dir string, env []string, beadID, assignee string) (bool, error) {
 		if route.knownResident(beadID) {
-			return route.graph.ReleaseIfCurrent(beadID, assignee)
+			return runWithDeadline(ctx, func() (bool, error) { return route.graph.ReleaseIfCurrent(beadID, assignee) })
 		}
 		return base.Release(ctx, dir, env, beadID, assignee)
 	}

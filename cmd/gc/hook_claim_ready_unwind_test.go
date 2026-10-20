@@ -144,7 +144,9 @@ func TestHookClaimUnwindFallbackReleaseGetsItsOwnDeadline(t *testing.T) {
 	}
 	ops := readyUnwindOps(t, store, seeded.ID)
 	ops.Restore = func(ctx context.Context, _ string, _ []string, _, _, _ string) (bool, error) {
-		<-ctx.Done()
+		if err := awaitUnwindBarrier(ctx.Done(), "the restore's deadline never expired"); err != nil {
+			t.Error(err)
+		}
 		return false, ctx.Err()
 	}
 	ops.Release = func(ctx context.Context, _ string, _ []string, beadID, assignee string) (bool, error) {
@@ -412,7 +414,9 @@ type unwindRaceGraph struct {
 	// hold, when set, parks the first Get after its read until the test
 	// closes it: a stalled read, as a channel barrier rather than a sleep.
 	hold chan struct{}
-	done chan struct{}
+	// stallRelease parks ReleaseIfCurrent on hold, then fails it unwritten.
+	stallRelease bool
+	done         chan struct{}
 
 	mu    sync.Mutex
 	raced bool
@@ -446,6 +450,13 @@ func (g *unwindRaceGraph) Get(id string) (beads.Bead, error) {
 		}
 	}
 	return snap, err
+}
+
+func (g *unwindRaceGraph) ReleaseIfCurrent(id, assignee string) (bool, error) {
+	if !g.stallRelease {
+		return g.GraphStore.ReleaseIfCurrent(id, assignee)
+	}
+	return false, awaitUnwindBarrier(g.hold, "the stalled release was never released")
 }
 
 // graphRestoreRig is a class store, a graph binding over it that races, and
@@ -541,31 +552,37 @@ func TestHookClaimRestoreOnGraphBinding(t *testing.T) {
 // TestHookClaimUnwindGraphRestoreHonorsDeadline pins the PR #305 re-review P2:
 // the graph-binding restore runs under the unwind's deadline. A graph read that
 // stalls past it must not hold the unwind: the restore gives up at the deadline
-// and the fallback release still gets the claim back.
+// and the fallback release still gets the claim back, or gives up at its own.
 func TestHookClaimUnwindGraphRestoreHonorsDeadline(t *testing.T) {
 	old := hookClaimMutationTimeout
 	hookClaimMutationTimeout = 200 * time.Millisecond
 	t.Cleanup(func() { hookClaimMutationTimeout = old })
 
 	const seat = "gc__role-mc-sess1"
-	race := &unwindRaceGraph{hold: make(chan struct{})}
-	class, ops := graphRestoreRig(t, "gcg-stall", "in_progress", seat, race)
-	// Registered after graphRestoreRig's cleanup, so it runs first and unparks
-	// the abandoned read before that cleanup waits for it.
-	t.Cleanup(func() { close(race.hold) })
+	for _, stallRelease := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stallRelease=%v", stallRelease), func(t *testing.T) {
+			race := &unwindRaceGraph{hold: make(chan struct{}), stallRelease: stallRelease}
+			class, ops := graphRestoreRig(t, "gcg-stall", "in_progress", seat, race)
+			// Runs before graphRestoreRig's cleanup, which waits on what it unparks.
+			t.Cleanup(func() { close(race.hold) })
 
-	var stderr bytes.Buffer
-	start := time.Now()
-	code := unwindUndeliveredHookClaim(hookClaimReleaseReasonUndelivered, "test unwind", beads.Bead{ID: "gcg-stall", Assignee: seat}, seat,
-		hookClaimOptions{Assignee: seat}, ops, "/rig", &stderr)
-	elapsed := time.Since(start)
-	if code != 1 {
-		t.Fatalf("code = %d, want 1", code)
-	}
-	if elapsed > time.Second {
-		t.Fatalf("unwind took %s behind a stalled graph read, want it bounded by the %s restore deadline", elapsed, hookClaimMutationTimeout)
-	}
-	if got, _ := class.Get("gcg-stall"); got.Status != "open" || got.Assignee != "" {
-		t.Fatalf("after a stalled restore: status=%q assignee=%q, want the fallback release (open, unassigned); stderr=%s", got.Status, got.Assignee, stderr.String())
+			var stderr bytes.Buffer
+			start := time.Now()
+			code := unwindUndeliveredHookClaim(hookClaimReleaseReasonUndelivered, "test unwind", beads.Bead{ID: "gcg-stall", Assignee: seat}, seat,
+				hookClaimOptions{Assignee: seat}, ops, "/rig", &stderr)
+			if elapsed := time.Since(start); elapsed > time.Second {
+				t.Fatalf("unwind took %s behind a stalled graph store, want it bounded by the %s restore and release deadlines", elapsed, hookClaimMutationTimeout)
+			}
+			if code != 1 {
+				t.Fatalf("code = %d, want 1", code)
+			}
+			if stallRelease {
+				if !strings.Contains(stderr.String(), "releasing undelivered claim gcg-stall") {
+					t.Fatalf("a timed-out release was not reported; stderr=%s", stderr.String())
+				}
+			} else if got, _ := class.Get("gcg-stall"); got.Status != "open" || got.Assignee != "" {
+				t.Fatalf("after a stalled restore: status=%q assignee=%q, want the fallback release (open, unassigned); stderr=%s", got.Status, got.Assignee, stderr.String())
+			}
+		})
 	}
 }
