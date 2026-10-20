@@ -49,6 +49,11 @@ func readyUnwindOps(t *testing.T, store *beads.MemStore, id string) hookClaimOps
 	ops.Restore = func(_ context.Context, _ string, _ []string, beadID, holder, prior string) (bool, error) {
 		return hookClaimRestoreOnStore(store, beadID, holder, prior)
 	}
+	// The canonical readback (and the unwind's re-read after a failed restore)
+	// reads the same store.
+	ops.ReadWorkMeta = func(_ context.Context, _ string, _ []string, beadID, _ string) (beads.Bead, error) {
+		return store.Get(beadID)
+	}
 	return ops
 }
 
@@ -431,7 +436,13 @@ func (g *unwindRaceGraph) UpdateIfMatch(id string, expected int64, opts beads.Up
 func (g *unwindRaceGraph) ReleaseIfCurrent(id, assignee string) (bool, error) {
 	if g.holdWrite != nil {
 		close(g.holdWrite)
-		<-g.writeDone
+		// Bounded: a write that never commits fails the test instead of
+		// hanging it.
+		select {
+		case <-g.writeDone:
+		case <-time.After(5 * time.Second):
+			return false, errors.New("test barrier: the late restore write never committed")
+		}
 	}
 	return g.GraphStore.ReleaseIfCurrent(id, assignee)
 }
@@ -566,8 +577,9 @@ func TestHookClaimUnwindGraphRestoreHonorsDeadline(t *testing.T) {
 // binding already started, so a restore can commit after its deadline. The
 // fallback must then classify from a fresh read instead of assuming the
 // restore failed: open under the pre-claim owner is a restore that landed
-// late, which emits the same bead.claim_released a restore does and is not
-// reported as "no longer ours".
+// late OR another actor's identical write; the unwind cannot tell which, so it
+// says so, emits no bead.claim_released (that event records a release THIS
+// process made), and never reports "no longer ours".
 func TestHookClaimUnwindLateRestoreIsRecognized(t *testing.T) {
 	old := hookClaimMutationTimeout
 	hookClaimMutationTimeout = 200 * time.Millisecond
@@ -592,10 +604,95 @@ func TestHookClaimUnwindLateRestoreIsRecognized(t *testing.T) {
 	if got, _ := class.Get("gcg-late"); got.Status != "open" || got.Assignee != seat {
 		t.Fatalf("after a late restore: status=%q assignee=%q, want open under %q", got.Status, got.Assignee, seat)
 	}
-	if len(released) != 1 || released[0].BeadID != "gcg-late" {
-		t.Fatalf("bead.claim_released = %+v, want one for gcg-late: a late restore is still a give-back", released)
+	if len(released) != 0 {
+		t.Fatalf("bead.claim_released = %+v, want none: the unwind cannot prove it made this write", released)
+	}
+	if !strings.Contains(stderr.String(), "open under its pre-claim owner") || !strings.Contains(stderr.String(), "our late restore or an identical write") {
+		t.Fatalf("stderr does not report the ambiguous late-restore verdict; stderr=%s", stderr.String())
 	}
 	if strings.Contains(stderr.String(), "no longer ours") || strings.Contains(stderr.String(), "released it unassigned") {
 		t.Fatalf("a late restore was misreported; stderr=%s", stderr.String())
+	}
+}
+
+// TestHookClaimUnwindUnreadableAfterFailedRestoreIsUnresolved: a restore that
+// failed, a fallback release that missed, and a re-read that FAILED leave the
+// bead's state unknown. That is reported as unresolved with the recovery,
+// never as "no longer ours".
+func TestHookClaimUnwindUnreadableAfterFailedRestoreIsUnresolved(t *testing.T) {
+	const seat = "gc__role-mc-sess1"
+	store := beads.NewMemStore()
+	seeded, err := store.Create(beads.Bead{Title: "pre-assigned", Status: "open", Assignee: seat})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ops := readyUnwindOps(t, store, seeded.ID)
+	ops.Restore = func(context.Context, string, []string, string, string, string) (bool, error) {
+		return false, context.DeadlineExceeded
+	}
+	// The fallback release misses; only reads AFTER it (the unwind's re-read)
+	// fail, so the claim path's own canonical readbacks still answer.
+	releaseRan := false
+	ops.Release = func(context.Context, string, []string, string, string) (bool, error) {
+		releaseRan = true
+		return false, nil
+	}
+	base := ops.ReadWorkMeta
+	ops.ReadWorkMeta = func(ctx context.Context, dir string, env []string, beadID, assignee string) (beads.Bead, error) {
+		if releaseRan {
+			return beads.Bead{}, errors.New("store unreachable")
+		}
+		return base(ctx, dir, env, beadID, assignee)
+	}
+	var stderr bytes.Buffer
+	if code := doHookClaim("query", "/rig", poolClaimOpts(), ops, brokenPipeWriter{}, &stderr); code != 1 {
+		t.Fatalf("code = %d, want 1; stderr=%s", code, stderr.String())
+	}
+	if !releaseRan {
+		t.Fatal("the fallback release never ran, so this test proves nothing")
+	}
+	out := stderr.String()
+	for _, want := range []string{"unresolved: could not re-read " + seeded.ID + ": store unreachable; check it", "bd update " + seeded.ID + " --assignee \"" + seat + "\""} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("stderr missing %q; stderr=%s", want, out)
+		}
+	}
+	if strings.Contains(out, "no longer ours") {
+		t.Fatalf("an unreadable bead was reported as no longer ours; stderr=%s", out)
+	}
+}
+
+// TestHookClaimUnwindErroringFallbackIsReRead: a fallback release that ERRORS
+// (here: after the restore's write committed late) is re-read too, so a bead
+// now open under its pre-claim owner is reported as such, not as a release
+// failure on a bead that is in fact back where it belongs.
+func TestHookClaimUnwindErroringFallbackIsReRead(t *testing.T) {
+	const seat = "gc__role-mc-sess1"
+	store := beads.NewMemStore()
+	seeded, err := store.Create(beads.Bead{Title: "pre-assigned", Status: "open", Assignee: seat})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ops := readyUnwindOps(t, store, seeded.ID)
+	baseRestore := ops.Restore
+	ops.Restore = func(ctx context.Context, dir string, env []string, beadID, holder, prior string) (bool, error) {
+		// The write commits, but the caller stopped waiting for it.
+		if _, err := baseRestore(ctx, dir, env, beadID, holder, prior); err != nil {
+			t.Fatalf("seeding the late restore: %v", err)
+		}
+		return false, context.DeadlineExceeded
+	}
+	ops.Release = func(context.Context, string, []string, string, string) (bool, error) {
+		return false, errors.New("release timed out")
+	}
+	var stderr bytes.Buffer
+	if code := doHookClaim("query", "/rig", poolClaimOpts(), ops, brokenPipeWriter{}, &stderr); code != 1 {
+		t.Fatalf("code = %d, want 1; stderr=%s", code, stderr.String())
+	}
+	if got, _ := store.Get(seeded.ID); got.Status != "open" || got.Assignee != seat {
+		t.Fatalf("seed: status=%q assignee=%q, want open under %q", got.Status, got.Assignee, seat)
+	}
+	if out := stderr.String(); !strings.Contains(out, "open under its pre-claim owner") {
+		t.Fatalf("an erroring fallback was not re-read; stderr=%s", out)
 	}
 }
