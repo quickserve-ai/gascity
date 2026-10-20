@@ -122,6 +122,7 @@ go_test(
         "caching_store_reconcile_decision_test.go",
         "caching_store_reconcile_differential_test.go",
         "caching_store_reconcile_diffutil_test.go",
+        "caching_store_reconcile_digest_test.go",
         "caching_store_reconcile_external_claim_test.go",
         "caching_store_reconcile_fixtures_test.go",
         "caching_store_reconcile_flood_internal_test.go",
