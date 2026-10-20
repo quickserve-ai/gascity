@@ -419,8 +419,14 @@ type unwindRaceGraph struct {
 	// hold, when set, parks the first Get after its read until the test
 	// closes it: a stalled read, as a channel barrier rather than a sleep.
 	hold chan struct{}
-	// stallRelease parks ReleaseIfCurrent on hold, then fails it unwritten.
+	// stallRelease parks the fallback release's write — ReleaseIfCurrent, or
+	// the fenced release's UpdateIfMatch — on hold, then fails it unwritten.
 	stallRelease bool
+	// releaseIgnoresStatus makes ReleaseIfCurrent answer the way
+	// NativeDoltStore's does (TestReleaseIfCurrentPinsTheFamilyDivergenceEdges):
+	// it releases a row whose assignee matches whether that row is in_progress
+	// OR already open. The class store under this double refuses an open row.
+	releaseIgnoresStatus bool
 	// holdWrite, when set, parks the FIRST UpdateIfMatch (the restore's) until
 	// the fallback release arrives — its first call into this double after
 	// the restore's read — then lets that write COMMIT before the release
@@ -441,6 +447,13 @@ func (g *unwindRaceGraph) hasRaced() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.raced
+}
+
+// hasWritten reports whether any UpdateIfMatch has reached the double.
+func (g *unwindRaceGraph) hasWritten() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.wrote
 }
 
 // arrive is the fallback release reaching the store: it lets a parked
@@ -489,6 +502,12 @@ func (g *unwindRaceGraph) UpdateIfMatch(id string, expected int64, opts beads.Up
 	first := !g.wrote
 	g.wrote = true
 	g.mu.Unlock()
+	if g.stallRelease {
+		if err := awaitUnwindBarrier(g.hold, "the stalled release was never released"); err != nil {
+			return err
+		}
+		return errors.New("the stalled release write failed unwritten")
+	}
 	if g.holdWrite == nil || !first {
 		return g.GraphStore.UpdateIfMatch(id, expected, opts)
 	}
@@ -503,10 +522,21 @@ func (g *unwindRaceGraph) ReleaseIfCurrent(id, assignee string) (bool, error) {
 	if err := g.arrive(); err != nil {
 		return false, err
 	}
-	if !g.stallRelease {
+	if g.stallRelease {
+		return false, awaitUnwindBarrier(g.hold, "the stalled release was never released")
+	}
+	if !g.releaseIgnoresStatus {
 		return g.GraphStore.ReleaseIfCurrent(id, assignee)
 	}
-	return false, awaitUnwindBarrier(g.hold, "the stalled release was never released")
+	cur, err := g.GraphStore.Get(id)
+	if err != nil {
+		return false, err
+	}
+	if assignee == "" || strings.TrimSpace(cur.Assignee) != assignee || (cur.Status != "open" && cur.Status != "in_progress") {
+		return false, nil
+	}
+	open, unassigned := "open", ""
+	return true, g.GraphStore.Update(id, beads.UpdateOpts{Status: &open, Assignee: &unassigned})
 }
 
 // graphRestoreRig is a class store, a graph binding over it that races, and
@@ -682,6 +712,105 @@ func TestHookClaimUnwindLateRestoreIsRecognized(t *testing.T) {
 	}
 	if strings.Contains(stderr.String(), "no longer ours") || strings.Contains(stderr.String(), "released it unassigned") {
 		t.Fatalf("a late restore was misreported; stderr=%s", stderr.String())
+	}
+}
+
+// TestHookClaimUnwindFallbackReleaseDoesNotEraseALateRestore pins the PR #305
+// fifth review P1 (ga-812fpb slice 3b). On the ready-assignment tier the holder
+// and the pre-claim owner are usually the SAME string, and the graph binding's
+// native release clears an assignee on an OPEN row as well as an in_progress
+// one. A restore that commits after its deadline leaves the bead open under
+// that owner; a fallback release keyed on the assignee alone then clears it and
+// reports success. The fallback must only release a row still in_progress
+// under this claim.
+func TestHookClaimUnwindFallbackReleaseDoesNotEraseALateRestore(t *testing.T) {
+	old := hookClaimMutationTimeout
+	hookClaimMutationTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { hookClaimMutationTimeout = old })
+
+	const seat = "gc__role-mc-sess1"
+	race := &unwindRaceGraph{holdWrite: make(chan struct{}), writeDone: make(chan struct{}), releaseIgnoresStatus: true}
+	var released []hookClaimReleaseRecord
+	class, ops := graphRestoreRig(t, "gcg-erase", "in_progress", seat, race, &released)
+
+	var stderr bytes.Buffer
+	code := unwindUndeliveredHookClaim(hookClaimReleaseReasonUndelivered, "test unwind", beads.Bead{ID: "gcg-erase", Assignee: seat}, seat,
+		hookClaimOptions{Assignee: seat}, ops, "/rig", &stderr)
+	if code != 1 {
+		t.Fatalf("code = %d, want 1", code)
+	}
+	select {
+	case <-race.writeDone:
+	default:
+		t.Fatal("the late restore write never committed, so this test proves nothing")
+	}
+	if got, _ := class.Get("gcg-erase"); got.Status != "open" || got.Assignee != seat {
+		t.Fatalf("the fallback release erased a late restore: status=%q assignee=%q, want open under %q; stderr=%s", got.Status, got.Assignee, seat, stderr.String())
+	}
+	if len(released) != 0 {
+		t.Fatalf("bead.claim_released = %+v, want none: nothing this process released", released)
+	}
+	if out := stderr.String(); !strings.Contains(out, "open under its pre-claim owner") || strings.Contains(out, "released it unassigned") {
+		t.Fatalf("stderr does not report the late restore; stderr=%s", out)
+	}
+}
+
+// TestHookClaimUnwindGraphReleaseLeavesAnOpenRowAlone: a graph-resident bead
+// already open under the holder (a late restore that landed) is not this
+// claim any more. The fallback release reports a miss and issues no write,
+// even over a binding whose own release would clear it.
+func TestHookClaimUnwindGraphReleaseLeavesAnOpenRowAlone(t *testing.T) {
+	const seat = "gc__role-mc-sess1"
+	race := &unwindRaceGraph{releaseIgnoresStatus: true}
+	class, ops := graphRestoreRig(t, "gcg-open", "open", seat, race)
+	ok, err := ops.Release(context.Background(), "/rig", nil, "gcg-open", seat)
+	if ok || err != nil {
+		t.Fatalf("release of an open row = (%v, %v), want (false, nil)", ok, err)
+	}
+	if race.hasWritten() {
+		t.Fatal("the release issued a write against a row that is no longer this claim")
+	}
+	if got, _ := class.Get("gcg-open"); got.Status != "open" || got.Assignee != seat {
+		t.Fatalf("after release: status=%q assignee=%q, want open under %q", got.Status, got.Assignee, seat)
+	}
+}
+
+// TestHookClaimUnwindGraphReleaseMatchesAnotherHolderSpelling: the native
+// release matches holders separator-insensitively (beads issueops
+// actorMatches), so the fenced release must too. A claim stored under one
+// spelling of the holder and released under another is still released while
+// it is in_progress.
+func TestHookClaimUnwindGraphReleaseMatchesAnotherHolderSpelling(t *testing.T) {
+	race := &unwindRaceGraph{}
+	class, ops := graphRestoreRig(t, "gcg-spell", "in_progress", "gc__role-mc", race)
+	ok, err := ops.Release(context.Background(), "/rig", nil, "gcg-spell", "gc-role.mc")
+	if !ok || err != nil {
+		t.Fatalf("release under another spelling of the holder = (%v, %v), want (true, nil)", ok, err)
+	}
+	if got, _ := class.Get("gcg-spell"); got.Status != "open" || got.Assignee != "" {
+		t.Fatalf("after release: status=%q assignee=%q, want open and unassigned", got.Status, got.Assignee)
+	}
+}
+
+// TestHookClaimUnwindHolderMatchIsSeparatorInsensitive pins hookClaimHolderMatches
+// to the native release's rule: runs of . _ - are one separator, but an exact
+// "--" is an encoded "/" and stays distinct from "__".
+func TestHookClaimUnwindHolderMatchIsSeparatorInsensitive(t *testing.T) {
+	for _, tc := range []struct {
+		a, b string
+		want bool
+	}{
+		{"gc__role-mc", "gc-role.mc", true},
+		{"gastown.mayor", "gastown_mayor", true},
+		{" gastown.mayor ", "gastown.mayor", true},
+		{"gastown--mayor", "gastown/mayor", true},
+		{"gastown--mayor", "gastown__mayor", false},
+		{"gastown.mayor", "gastown.dog-3", false},
+		{"", "_", false},
+	} {
+		if got := hookClaimHolderMatches(tc.a, tc.b); got != tc.want {
+			t.Errorf("hookClaimHolderMatches(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
+		}
 	}
 }
 

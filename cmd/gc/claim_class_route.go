@@ -704,10 +704,13 @@ func classRoutedHookClaimOps(ops hookClaimOps, route *hookClaimClassRoute) hookC
 	// routes on the MEMO alone and never probes: a bead this invocation did not
 	// route is one the work store claimed, and the release is a consequence of
 	// that claim rather than a second opinion about where the bead lives.
-	// The binding takes no context, so ctx bounds it as it does the restore.
+	//
+	// In the binding it is fenced on status as well as holder
+	// (releaseGraphHookClaim), unlike the binding's own ReleaseIfCurrent, and
+	// ctx bounds it as it does the restore: the binding takes no context.
 	ops.Release = func(ctx context.Context, dir string, env []string, beadID, assignee string) (bool, error) {
 		if route.knownResident(beadID) {
-			return runWithDeadline(ctx, func() (bool, error) { return route.graph.ReleaseIfCurrent(beadID, assignee) })
+			return releaseGraphHookClaim(ctx, route.graph, beadID, assignee)
 		}
 		return base.Release(ctx, dir, env, beadID, assignee)
 	}
@@ -779,6 +782,89 @@ func restoreGraphHookClaim(ctx context.Context, graph storebinding.GraphStore, b
 	}
 }
 
+// releaseGraphHookClaim is the undelivered-claim release for a bead resident in
+// the relocated graph store: open and unassigned, only while the bead is still
+// in_progress under holder at the revision read (ga-812fpb slice 3b).
+//
+// It is NOT the binding's ReleaseIfCurrent. NativeDoltStore's release
+// (beads UnclaimIssueIfAssigneeInTx) clears an assignee on an OPEN row as well
+// as an in_progress one, and on the ready-assignment tier the holder and the
+// pre-claim owner are usually the same string. A restore that committed after
+// its deadline has left the bead open under that owner; a release fenced on the
+// assignee alone would erase it to open/unassigned and report success (PR #305
+// review 5). This write is fenced on the claim itself and on the revision it
+// read. Every status or assignee write remints the revision, so a restore that
+// lands after the read makes this write refuse (errHookClaimReleaseLost)
+// instead of erasing it, and the unwind's re-read names what it finds.
+//
+// Knowingly NOT the native release's side effects (data plane, katya, on
+// ga-812fpb.4; native parity is ga-gomsfr): the update path cannot clear
+// started_at, so the reopened row keeps it, and the change records a
+// status_changed event, not unclaimed. No gc code reads either. The holder IS
+// matched by the native rule (hookClaimHolderMatches).
+//
+// A binding that cannot fence the write at all gets its own ReleaseIfCurrent:
+// the restore is fenced through the same UpdateIfMatch, so on such a binding
+// no restore can have landed for this release to erase.
+func releaseGraphHookClaim(ctx context.Context, graph storebinding.GraphStore, beadID, holder string) (bool, error) {
+	open, unassigned := "open", ""
+	outcome, err := writeGraphHookClaimFenced(ctx, graph, beadID, holder, "release", beads.UpdateOpts{Status: &open, Assignee: &unassigned})
+	switch {
+	case outcome == fencedReleaseApplied:
+		return true, nil
+	case outcome == fencedReleaseChanged:
+		return false, nil
+	case outcome == fencedReleaseLost:
+		return false, errHookClaimReleaseLost
+	case beads.IsConditionalWriteUnsupported(err) || errors.Is(err, storebinding.ErrBeadsAdapterCapability):
+		return runWithDeadline(ctx, func() (bool, error) { return graph.ReleaseIfCurrent(beadID, holder) })
+	default:
+		return false, fmt.Errorf("releasing %s: %w", beadID, err)
+	}
+}
+
+// errHookClaimReleaseLost: the bead's revision moved between the release's
+// read and its write. Nothing was written; the unwind re-reads the bead to
+// say where it stands.
+var errHookClaimReleaseLost = errors.New("bead changed during the release")
+
+// hookClaimHolderMatches reports whether two spellings name the same claim
+// holder, by the rule the native release fences on (beads
+// internal/storage/issueops/identity.go actorMatches, which gc cannot import):
+// a run of '.', '_' and '-' is one separator, except an exact "--", which
+// gascity's session-name encoding uses for '/' and so stays distinct from
+// "__". Empty matches only empty. Keep it in sync with actorMatches.
+func hookClaimHolderMatches(a, b string) bool {
+	a, b = strings.TrimSpace(a), strings.TrimSpace(b)
+	return a == b || canonicalHookClaimHolder(a) == canonicalHookClaimHolder(b)
+}
+
+func canonicalHookClaimHolder(s string) string {
+	if s == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		if c := s[i]; c != '.' && c != '_' && c != '-' {
+			b.WriteByte(c)
+			i++
+			continue
+		}
+		j := i
+		for j < len(s) && (s[j] == '.' || s[j] == '_' || s[j] == '-') {
+			j++
+		}
+		if s[i:j] == "--" {
+			b.WriteByte('/')
+		} else {
+			b.WriteByte('_')
+		}
+		i = j
+	}
+	return b.String()
+}
+
 // writeGraphHookClaimFenced writes opts to a bead resident in the graph store
 // only while it is still the claim being given back — in_progress under
 // holder — at the revision it reads, as ONE revision-fenced write. verb names
@@ -797,7 +883,7 @@ func writeGraphHookClaimFenced(ctx context.Context, graph storebinding.GraphStor
 	if err != nil {
 		return fencedReleaseRefused, fmt.Errorf("re-reading %s before %s: %w", beadID, verb, err)
 	}
-	if current.Status != "in_progress" || strings.TrimSpace(current.Assignee) != strings.TrimSpace(holder) {
+	if current.Status != "in_progress" || !hookClaimHolderMatches(current.Assignee, holder) {
 		return fencedReleaseChanged, nil
 	}
 	if err := ctx.Err(); err != nil {
