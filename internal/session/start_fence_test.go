@@ -91,9 +91,10 @@ func TestManagerRuntimeStart_FenceEndsOnPanicAndError(t *testing.T) {
 			}
 			id := seedFenceTestSession(t, store)
 			by := runtimeOnlyActor(t, m, id)
+			inc := mintUnder(t, m, by.Lease, id) // the incarnation the reconciler's PreWake mints
 			func() {
 				defer func() { _ = recover() }()
-				_ = m.StartRuntimeOnly(context.Background(), by, id, "claude", runtime.Config{WorkDir: t.TempDir()})
+				_ = m.StartRuntimeOnly(context.Background(), by, id, inc, "claude", runtime.Config{WorkDir: t.TempDir()})
 			}()
 			if sp.starts != 1 {
 				t.Fatalf("provider Start ran %d time(s), want once", sp.starts)
