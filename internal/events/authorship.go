@@ -146,6 +146,7 @@ var builtinAuthorship = map[string]Authorship{
 	BeadClaimReleased:              AuthorWorker,
 	BeadClaimFailed:                AuthorWorker,
 	HookClaimReclaimedStale:        AuthorWorker,
+	HookClaimRefused:               AuthorWorker, // gc hook --claim's identity refusals (cmd/gc hook_claim_refused_event.go)
 	ExecutionStepStarted:           AuthorWorker, // re-derived by the projector from a live step read (D13, CD §5)
 	ExecutionClaimWindowExpired:    AuthorWorker,
 	MailSent:                       AuthorWorker,
@@ -179,6 +180,10 @@ var builtinAuthorship = map[string]Authorship{
 	// controller's detector does; a box's copy would otherwise be dropped
 	// and wait for the detector's next pass.
 	SessionStrandedClaims: AuthorWorker,
+	// gc session close records the work release it defers when the city
+	// config is unreadable (cmd/gc session_release_marker.go,
+	// deferMissingConfigWorkRelease), for the same reason.
+	SessionReleaseDeferred: AuthorWorker,
 
 	// Controller: the reconciler's session lifecycle.
 	SessionWoke:                           AuthorController,
@@ -192,6 +197,7 @@ var builtinAuthorship = map[string]Authorship{
 	SessionDrainStopEscalated:             AuthorController,
 	SessionStranded:                       AuthorController,
 	SessionPoolSlotRetiredAtDrainDeadline: AuthorController,
+	SessionConfigDriftWave:                AuthorController, // the reconciler's per-tick drift budget (session_reconciler.go)
 	SessionUnknownState:                   AuthorController,
 	SessionWakeRefused:                    AuthorController,
 	SessionResetStalled:                   AuthorController,
