@@ -334,7 +334,7 @@ jobs:
       - gate
     if: needs.gate.outputs.run_smoke == 'true'
     runs-on: ${{ needs.runner-policy.outputs.runner_macos }}
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -371,6 +371,33 @@ jobs:
           ACCEPTANCE_TIMEOUT: 20m
           GC_ACCEPTANCE_BD_BIN: ${{ steps.fleet-bd.outputs.path }}
         run: make test-acceptance-go
+      # The plain go test run above prints the same "ok" whether
+      # TestBeadsProxiedDefaultNativeLane/status-zero-forks passed or skipped
+      # (requireProxiedTooling skips the whole lane when bd or dolt is
+      # missing), so no run recorded which (ga-tkfdsb). Re-run that row
+      # verbosely through the same make target, with the lane's quiescence
+      # precondition and its flag-off positive control, and fail unless go
+      # test reports it PASSED. No if:, so it runs only after Tier A passed
+      # and a Tier A failure stays that step's failure.
+      - name: Prove status-zero-forks passes (not skips) on the Mac
+        env:
+          ACCEPTANCE_TIMEOUT: 20m
+          GC_ACCEPTANCE_BD_BIN: ${{ steps.fleet-bd.outputs.path }}
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/status-zero-forks.log"
+          rc=0
+          # \$\$ reaches make as $$, which make turns into the regex's one $.
+          make test-acceptance-go \
+            ACCEPTANCE_GO_TEST_FLAGS="-v -count=1 -run '^TestBeadsProxiedDefaultNativeLane\$\$/^(precondition-gc-initialised|status-flag-off-still-forks|status-zero-forks)\$\$'" \
+            2>&1 | tee "$log" || rc=$?
+          echo "TestBeadsProxiedDefaultNativeLane result lines:"
+          grep -E -- '--- (PASS|FAIL|SKIP): TestBeadsProxiedDefaultNativeLane' "$log" || echo "(none)"
+          if ! grep -qF -- '--- PASS: TestBeadsProxiedDefaultNativeLane/status-zero-forks' "$log"; then
+            echo "::error::TestBeadsProxiedDefaultNativeLane/status-zero-forks did not report PASS (skipped, failed or never ran; make exited $rc)"
+            exit 1
+          fi
+          exit "$rc"
       - name: Run external bd CLI contract
         run: make test-bd-cli-contract
       - name: Run external bd CLI contract HOME isolation
