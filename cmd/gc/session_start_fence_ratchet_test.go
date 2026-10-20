@@ -24,6 +24,11 @@ var sessionStartFenceAllowlist = map[string]string{
 	"cmd/gc/session_lifecycle_parallel.go|startPreparedStartCandidate|StartResolved": "worker-handle start; reached only through runPreparedStartCandidate, whose every caller is runFencedPreparedStartCandidate (bracketed); session handles also land in a Manager start, which brackets its provider call",
 	"internal/worker/runtime_handle.go|(*RuntimeHandle).StartResolved|Start":         "runtime-only worker handle (no session bead, so no Manager); in-process it is started only by startPreparedStartCandidate, which runFencedPreparedStartCandidate brackets; the API server's wakes use session-backed handles",
 	"cmd/gc/reconcile_planner.go|(*planner).run|Start@method value":                  "not a runtime call: p.last.Start is the time.Time a planner pass began (plannerPassStats), read to pace the next pass; upstream's v2 planner (#7285) starts nothing here",
+	// Upstream's turn capabilities name a turn-start trait Start; reading it
+	// starts nothing.
+	"cmd/gc/conversation_lane_turn.go|laneTurnTraitsOf|Start@method value": "not a runtime call: caps.Start is worker.TurnCapabilities' turn-start trait (the embedded runtime.TurnCapabilities field), read to tell whether the source records turn starts",
+	"internal/worker/turn.go|composeTurnCapabilities|Start@method value":   "not a runtime call: support.Start is sessionlog.TurnSupport's turn-start level, read to decide whether a transcript can source turns",
+	"internal/worker/turn.go|turnInterruptRefusal|Start@method value":      "not a runtime call: caps.Start is worker.TurnCapabilities' turn-start trait (the embedded runtime.TurnCapabilities field), read to refuse an interrupt no start record can fence and named in the refusal",
 	// Upstream's v2 relaunch (#7636) names a bool fact Relaunch; reading it
 	// starts nothing. The relaunch itself is relaunchCall's, bracketed.
 	"cmd/gc/reconcile_effect_abandon.go|rollbackClose|Relaunch@method value":    "not a runtime call: v.It.Relaunch is the intent's bool relaunch flag (S7), read to keep the configured named row for A18",
@@ -58,8 +63,8 @@ func isSessionStartFenceBracket(call *ast.CallExpr) bool {
 // process for provider-shaped calls — Start/Relaunch with three arguments
 // (ctx, name-or-command, runtime config), the runtime.Provider and
 // runtime.RelaunchProvider signatures, and the worker handle's StartResolved
-// with four (ctx, actor, command, runtime config) — and fails on any that is
-// neither bracketed nor allowlisted with a reason.
+// with five (ctx, actor, incarnation, command, runtime config) — and fails on
+// any that is neither bracketed nor allowlisted with a reason.
 //
 // One-argument handle.Start(ctx) calls are not scanned: a worker handle's
 // Start always ends in one of the scanned three-argument sites (a session
@@ -111,14 +116,15 @@ var runtimeCreatingMethods = map[string]bool{"Start": true, "Relaunch": true, "S
 
 // isRuntimeCreatingCall reports a provider-shaped call: a runtime-creating
 // method with three arguments (ctx, name-or-command, runtime config), or the
-// worker handle's StartResolved with four (ctx, actor, command, runtime
-// config): upstream #7496 put the session Actor on the worker verbs.
+// worker handle's StartResolved with five (ctx, actor, incarnation, command,
+// runtime config): upstream #7496 put the session Actor on the worker verbs,
+// and #8087 added the Incarnation after it.
 func isRuntimeCreatingCall(call *ast.CallExpr) bool {
 	sel, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok || !runtimeCreatingMethods[sel.Sel.Name] {
 		return false
 	}
-	return len(call.Args) == 3 || (sel.Sel.Name == "StartResolved" && len(call.Args) == 4)
+	return len(call.Args) == 3 || (sel.Sel.Name == "StartResolved" && len(call.Args) == 5)
 }
 
 // scanFenceFile checks every function declared in one parsed file.
@@ -272,8 +278,8 @@ func TestSessionStartFenceRatchet_RejectsEscapingShapes(t *testing.T) {
 			wantFlags: 1,
 		},
 		{
-			name:      "an unbracketed four-argument worker StartResolved",
-			src:       "func f(h H) error { return h.StartResolved(ctx, by, \"cmd\", cfg) }",
+			name:      "an unbracketed five-argument worker StartResolved",
+			src:       "func f(h H) error { return h.StartResolved(ctx, by, inc, \"cmd\", cfg) }",
 			wantFlags: 1,
 		},
 	} {
