@@ -166,9 +166,89 @@ func TestHookClaimUnwindFallbackReleaseGetsItsOwnDeadline(t *testing.T) {
 	}
 }
 
+// unwindRaceStore hands the restore's fence read a snapshot, then applies mutate to
+// the live bead before returning it: the change lands AFTER the restore's read
+// and BEFORE its write. Only the first Get races, and raced records that it
+// did, so a test can refuse to pass on a race that never fired.
+type unwindRaceStore struct {
+	*beads.MemStore
+	mutate func(id string) error
+	raced  bool
+}
+
+func (s *unwindRaceStore) Get(id string) (beads.Bead, error) {
+	snap, err := s.MemStore.Get(id)
+	if err == nil && !s.raced {
+		s.raced = true
+		if merr := s.mutate(id); merr != nil {
+			return beads.Bead{}, merr
+		}
+	}
+	return snap, err
+}
+
+// unwindSeedInProgress creates a bead in_progress under holder.
+func unwindSeedInProgress(t *testing.T, store *beads.MemStore, holder string) beads.Bead {
+	t.Helper()
+	seeded, err := store.Create(beads.Bead{Title: "claimed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inProgress := "in_progress"
+	if err := store.Update(seeded.ID, beads.UpdateOpts{Status: &inProgress, Assignee: &holder}); err != nil {
+		t.Fatal(err)
+	}
+	return seeded
+}
+
+func unwindSetStatus(store *beads.MemStore, status string) func(string) error {
+	return func(id string) error { return store.Update(id, beads.UpdateOpts{Status: &status}) }
+}
+
+func unwindSetAssignee(store *beads.MemStore, assignee string) func(string) error {
+	return func(id string) error { return store.Update(id, beads.UpdateOpts{Assignee: &assignee}) }
+}
+
+// TestHookClaimUnwindRestoreLostFallsBackToRelease: a write lands between the
+// restore's read and its write without changing owner or status (a metadata
+// stamp). The restore's fence is lost, so it must not write; the unwind falls
+// back to the holder-fenced release, which still gets the claim back, and the
+// lost owner is surfaced with its recovery.
+func TestHookClaimUnwindRestoreLostFallsBackToRelease(t *testing.T) {
+	const seat = "gc__role-mc-sess1"
+	store := beads.NewMemStore()
+	seeded, err := store.Create(beads.Bead{Title: "pre-assigned", Status: "open", Assignee: seat})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ops := readyUnwindOps(t, store, seeded.ID)
+	race := &unwindRaceStore{MemStore: store, mutate: func(id string) error {
+		return store.Update(id, beads.UpdateOpts{Metadata: map[string]string{"gc.unrelated": "stamped"}})
+	}}
+	ops.Restore = func(_ context.Context, _ string, _ []string, beadID, holder, prior string) (bool, error) {
+		return hookClaimRestoreOnStore(race, beadID, holder, prior)
+	}
+
+	var stderr bytes.Buffer
+	if code := doHookClaim("query", "/rig", poolClaimOpts(), ops, brokenPipeWriter{}, &stderr); code != 1 {
+		t.Fatalf("code = %d, want 1; stderr=%s", code, stderr.String())
+	}
+	if !race.raced {
+		t.Fatal("the race never fired, so this test proves nothing")
+	}
+	got, _ := store.Get(seeded.ID)
+	if got.Status != "open" || got.Assignee != "" {
+		t.Fatalf("after a lost restore: status=%q assignee=%q, want the fallback release (open, unassigned)", got.Status, got.Assignee)
+	}
+	for _, want := range []string{errHookClaimRestoreLost.Error(), "bd update " + seeded.ID + " --assignee \"" + seat + "\""} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing %q; stderr=%s", want, stderr.String())
+		}
+	}
+}
+
 // TestHookClaimUnwindRestoreFailureFallsBackToRelease: a restore that errors
-// outright still gets the claim back (released, unassigned) and surfaces the
-// lost owner with its recovery, rather than leaving the claim parked.
+// outright still gets the claim back through the release.
 func TestHookClaimUnwindRestoreFailureFallsBackToRelease(t *testing.T) {
 	const seat = "gc__role-mc-sess1"
 	store := beads.NewMemStore()
@@ -189,101 +269,91 @@ func TestHookClaimUnwindRestoreFailureFallsBackToRelease(t *testing.T) {
 	if got.Status != "open" || got.Assignee != "" {
 		t.Fatalf("after a failed restore: status=%q assignee=%q, want released (open, unassigned)", got.Status, got.Assignee)
 	}
-	for _, want := range []string{"binding refused the restore", "bd update " + seeded.ID + " --assignee \"" + seat + "\""} {
-		if !strings.Contains(stderr.String(), want) {
-			t.Fatalf("stderr missing %q; stderr=%s", want, stderr.String())
-		}
+	if !strings.Contains(stderr.String(), "binding refused the restore") {
+		t.Fatalf("stderr does not surface the restore failure; stderr=%s", stderr.String())
 	}
 }
 
 // TestHookClaimUnwindRestoresLegacySpellingAfterRestamp: a ready claim of a
 // bead held under a legacy spelling is re-stamped to the claim identity, so the
 // unwind's holder and the pre-claim owner are DIFFERENT strings. The restore
-// must fence on the re-stamped holder and write back the legacy spelling.
+// must fence on the re-stamped holder and write back the legacy spelling, and
+// must not overwrite an owner change that lands between its read and write.
 func TestHookClaimUnwindRestoresLegacySpellingAfterRestamp(t *testing.T) {
 	const (
 		current = "gcg-session-1"
 		legacy  = "claude-gcg-session-1"
 	)
-	store := beads.NewMemStore()
-	seeded, err := store.Create(beads.Bead{Title: "legacy-assigned", Status: "open", Assignee: legacy})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ops := readyUnwindOps(t, store, seeded.ID)
-	var restoredHolder string
-	baseRestore := ops.Restore
-	ops.Restore = func(ctx context.Context, dir string, env []string, beadID, holder, prior string) (bool, error) {
-		restoredHolder = holder
-		return baseRestore(ctx, dir, env, beadID, holder, prior)
-	}
-	ops.RestampAdopted = func(_ context.Context, _ string, _ []string, beadID, from, to string) (bool, error) {
-		cur, err := store.Get(beadID)
-		if err != nil || cur.Status != "in_progress" || cur.Assignee != from {
-			return false, err
+	run := func(t *testing.T, race bool) (beads.Bead, *unwindRaceStore, string) {
+		store := beads.NewMemStore()
+		seeded, err := store.Create(beads.Bead{Title: "legacy-assigned", Status: "open", Assignee: legacy})
+		if err != nil {
+			t.Fatal(err)
 		}
-		return true, store.Update(beadID, beads.UpdateOpts{Assignee: &to})
+		ops := readyUnwindOps(t, store, seeded.ID)
+		rs := &unwindRaceStore{MemStore: store, mutate: unwindSetAssignee(store, "thief"), raced: !race}
+		var holderSeen string
+		ops.Restore = func(_ context.Context, _ string, _ []string, beadID, holder, prior string) (bool, error) {
+			holderSeen = holder
+			return hookClaimRestoreOnStore(rs, beadID, holder, prior)
+		}
+		ops.RestampAdopted = func(_ context.Context, _ string, _ []string, beadID, from, to string) (bool, error) {
+			cur, err := store.Get(beadID)
+			if err != nil || cur.Status != "in_progress" || cur.Assignee != from {
+				return false, err
+			}
+			return true, store.Update(beadID, beads.UpdateOpts{Assignee: &to})
+		}
+		opts := poolClaimOpts()
+		opts.Assignee = current
+		opts.RuntimeActor = current
+		opts.IdentityCandidates = []string{current, legacy}
+		var stderr bytes.Buffer
+		if code := doHookClaim("query", "/rig", opts, ops, brokenPipeWriter{}, &stderr); code != 1 {
+			t.Fatalf("code = %d, want 1; stderr=%s", code, stderr.String())
+		}
+		if holderSeen != current {
+			t.Fatalf("restore fenced on holder %q, want the re-stamped %q (the restamp did not run, so this test proves nothing)", holderSeen, current)
+		}
+		got, _ := store.Get(seeded.ID)
+		return got, rs, stderr.String()
 	}
-	opts := poolClaimOpts()
-	opts.Assignee = current
-	opts.RuntimeActor = current
-	opts.IdentityCandidates = []string{current, legacy}
-
-	var stderr bytes.Buffer
-	if code := doHookClaim("query", "/rig", opts, ops, brokenPipeWriter{}, &stderr); code != 1 {
-		t.Fatalf("code = %d, want 1; stderr=%s", code, stderr.String())
-	}
-	if restoredHolder != current {
-		t.Fatalf("restore fenced on holder %q, want the re-stamped %q (the restamp did not run, so this test proves nothing)", restoredHolder, current)
-	}
-	got, _ := store.Get(seeded.ID)
-	if got.Status != "open" || got.Assignee != legacy {
-		t.Fatalf("after unwind: status=%q assignee=%q, want open under the pre-claim spelling %q; stderr=%s", got.Status, got.Assignee, legacy, stderr.String())
-	}
+	t.Run("restores", func(t *testing.T) {
+		got, _, stderr := run(t, false)
+		if got.Status != "open" || got.Assignee != legacy {
+			t.Fatalf("after unwind: status=%q assignee=%q, want open under the pre-claim spelling %q; stderr=%s", got.Status, got.Assignee, legacy, stderr)
+		}
+	})
+	t.Run("owner change mid-write", func(t *testing.T) {
+		got, rs, stderr := run(t, true)
+		if !rs.raced {
+			t.Fatal("the race never fired, so this test proves nothing")
+		}
+		if got.Status != "in_progress" || got.Assignee != "thief" {
+			t.Fatalf("owner change was overwritten: status=%q assignee=%q; stderr=%s", got.Status, got.Assignee, stderr)
+		}
+	})
 }
 
 // TestHookClaimRestoreStatusOnlyChangeIsLeftAlone: the fence covers status as
-// well as owner. A bead the holder still owns but that is no longer in_progress
-// is not the claim being given back, and is not written.
+// well as owner. A status change that lands between the restore's read and its
+// write (owner unchanged) must not be overwritten.
 func TestHookClaimRestoreStatusOnlyChangeIsLeftAlone(t *testing.T) {
 	const seat = "gc__role-mc-sess1"
-	store := beads.NewMemStore()
-	seeded, err := store.Create(beads.Bead{Title: "blocked"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	blocked, holder := "blocked", seat
-	if err := store.Update(seeded.ID, beads.UpdateOpts{Status: &blocked, Assignee: &holder}); err != nil {
-		t.Fatal(err)
-	}
+	mem := beads.NewMemStore()
+	seeded := unwindSeedInProgress(t, mem, seat)
+	store := &unwindRaceStore{MemStore: mem, mutate: unwindSetStatus(mem, "blocked")}
 	restored, err := hookClaimRestoreOnStore(store, seeded.ID, seat, "someone-prior")
-	if err != nil || restored {
-		t.Fatalf("restore of a status-changed bead = (%v, %v), want (false, nil)", restored, err)
+	if restored || !errors.Is(err, errHookClaimRestoreLost) {
+		t.Fatalf("restore across a status change = (%v, %v), want (false, errHookClaimRestoreLost)", restored, err)
 	}
-	got, _ := store.Get(seeded.ID)
+	if !store.raced {
+		t.Fatal("the race never fired, so this test proves nothing")
+	}
+	got, _ := mem.Get(seeded.ID)
 	if got.Status != "blocked" || got.Assignee != seat {
-		t.Fatalf("status-changed bead was written: status=%q assignee=%q", got.Status, got.Assignee)
+		t.Fatalf("status change was overwritten: status=%q assignee=%q", got.Status, got.Assignee)
 	}
-}
-
-// racingOwnerStore hands the restore's fence read a snapshot, then moves the
-// bead to another owner before the write: the change lands BETWEEN the
-// restore's read and its write.
-type racingOwnerStore struct {
-	*beads.MemStore
-	raced bool
-	to    string
-}
-
-func (s *racingOwnerStore) Get(id string) (beads.Bead, error) {
-	snap, err := s.MemStore.Get(id)
-	if err == nil && !s.raced {
-		s.raced = true
-		if uerr := s.MemStore.Update(id, beads.UpdateOpts{Assignee: &s.to}); uerr != nil {
-			return beads.Bead{}, uerr
-		}
-	}
-	return snap, err
 }
 
 // TestHookClaimRestoreLosesToAnOwnerChangeMidWrite pins that the restore's write
@@ -293,15 +363,8 @@ func (s *racingOwnerStore) Get(id string) (beads.Bead, error) {
 func TestHookClaimRestoreLosesToAnOwnerChangeMidWrite(t *testing.T) {
 	const seat = "gc__role-mc-sess1"
 	mem := beads.NewMemStore()
-	seeded, err := mem.Create(beads.Bead{Title: "racing"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	inProgress, holder := "in_progress", seat
-	if err := mem.Update(seeded.ID, beads.UpdateOpts{Status: &inProgress, Assignee: &holder}); err != nil {
-		t.Fatal(err)
-	}
-	store := &racingOwnerStore{MemStore: mem, to: "thief"}
+	seeded := unwindSeedInProgress(t, mem, seat)
+	store := &unwindRaceStore{MemStore: mem, mutate: unwindSetAssignee(mem, "thief")}
 	restored, err := hookClaimRestoreOnStore(store, seeded.ID, seat, seat)
 	if restored || !errors.Is(err, errHookClaimRestoreLost) {
 		t.Fatalf("restore across an owner change = (%v, %v), want (false, errHookClaimRestoreLost)", restored, err)
@@ -318,45 +381,149 @@ func TestHookClaimRestoreLosesToAnOwnerChangeMidWrite(t *testing.T) {
 	}
 }
 
-// TestHookClaimRestoreOnGraphBinding drives the graph-binding restore over a
-// real class store: it restores a claim it holds, and leaves alone one that
-// changed hands or status.
-func TestHookClaimRestoreOnGraphBinding(t *testing.T) {
-	const seat = "gc__role-mc-sess1"
+// unwindRaceGraph is unwindRaceStore for the graph binding: its first Get returns the
+// snapshot, then (after an optional stall) applies mutate before the caller can
+// write. done closes when that Get returns, so a test can wait out a Get its
+// caller abandoned before the store underneath is closed.
+type unwindRaceGraph struct {
+	storebinding.GraphStore
+	mutate func(id string) error
+	stall  time.Duration
+	raced  bool
+	done   chan struct{}
+}
+
+func (g *unwindRaceGraph) Get(id string) (beads.Bead, error) {
+	if g.raced {
+		return g.GraphStore.Get(id)
+	}
+	g.raced = true
+	defer close(g.done)
+	snap, err := g.GraphStore.Get(id)
+	if g.stall > 0 {
+		time.Sleep(g.stall)
+	}
+	if err == nil && g.mutate != nil {
+		if merr := g.mutate(id); merr != nil {
+			return beads.Bead{}, merr
+		}
+	}
+	return snap, err
+}
+
+// graphRestoreRig is a class store, a graph binding over it that races, and
+// the route's ops with id known resident in the binding.
+func graphRestoreRig(t *testing.T, id, status, assignee string, race *unwindRaceGraph) (beads.Store, hookClaimOps) {
+	t.Helper()
 	class := newClaimRouteClassStore(t)
 	graph, err := storebinding.NewBeadsGraphStore(class)
 	if err != nil {
 		t.Fatal(err)
 	}
-	mint := func(id, status, assignee string) {
-		t.Helper()
-		mintClaimRouteBead(t, class, id, nil)
-		if err := class.Update(id, beads.UpdateOpts{Status: &status, Assignee: &assignee}); err != nil {
-			t.Fatal(err)
-		}
+	mintClaimRouteBead(t, class, id, nil)
+	if err := class.Update(id, beads.UpdateOpts{Status: &status, Assignee: &assignee}); err != nil {
+		t.Fatal(err)
 	}
-	mint("gcg-held", "in_progress", seat)
-	mint("gcg-moved", "in_progress", "someone-else")
-	mint("gcg-blocked", "blocked", seat)
+	race.GraphStore = graph
+	race.done = make(chan struct{})
+	// Registered after the store's own cleanup, so it runs first: never close
+	// the store under a Get the restore abandoned at its deadline.
+	t.Cleanup(func() {
+		if race.raced {
+			<-race.done
+		}
+	})
+	route := newClaimClassRouteOver(class, race)
+	route.resident[id] = true
+	ops := classRoutedHookClaimOps(hookClaimOps{EmitClaimReleased: func(hookClaimReleaseRecord) {}}, route)
+	return class, ops
+}
 
-	if ok, err := restoreGraphHookClaim(graph, "gcg-held", seat, seat); !ok || err != nil {
-		t.Fatalf("restore of a held graph claim = (%v, %v), want (true, nil)", ok, err)
+func unwindClassUpdate(class *beads.Store, status, assignee string) func(string) error {
+	return func(id string) error {
+		opts := beads.UpdateOpts{}
+		if status != "" {
+			opts.Status = &status
+		}
+		if assignee != "" {
+			opts.Assignee = &assignee
+		}
+		return (*class).Update(id, opts)
 	}
-	if got, _ := class.Get("gcg-held"); got.Status != "open" || got.Assignee != seat {
-		t.Fatalf("gcg-held after restore: status=%q assignee=%q, want open under %q", got.Status, got.Assignee, seat)
-	}
-	for id, want := range map[string][2]string{
-		"gcg-moved":   {"in_progress", "someone-else"},
-		"gcg-blocked": {"blocked", seat},
+}
+
+// TestHookClaimRestoreOnGraphBinding drives the routed restore of a bead
+// resident in the graph binding over a real class store: it restores a claim
+// it still holds, and leaves alone one whose owner or status changes between
+// the restore's read and its write.
+func TestHookClaimRestoreOnGraphBinding(t *testing.T) {
+	const seat = "gc__role-mc-sess1"
+	t.Run("restores", func(t *testing.T) {
+		race := &unwindRaceGraph{}
+		class, ops := graphRestoreRig(t, "gcg-held", "in_progress", seat, race)
+		if ok, err := ops.Restore(context.Background(), "/rig", nil, "gcg-held", seat, seat); !ok || err != nil {
+			t.Fatalf("restore of a held graph claim = (%v, %v), want (true, nil)", ok, err)
+		}
+		if got, _ := class.Get("gcg-held"); got.Status != "open" || got.Assignee != seat {
+			t.Fatalf("after restore: status=%q assignee=%q, want open under %q", got.Status, got.Assignee, seat)
+		}
+	})
+	for name, change := range map[string][2]string{
+		"owner change mid-write":  {"", "someone-else"},
+		"status change mid-write": {"blocked", ""},
 	} {
-		if ok, err := restoreGraphHookClaim(graph, id, seat, seat); ok || err != nil {
-			t.Fatalf("restore of %s = (%v, %v), want (false, nil)", id, ok, err)
-		}
-		if got, _ := class.Get(id); got.Status != want[0] || got.Assignee != want[1] {
-			t.Fatalf("%s was written: status=%q assignee=%q", id, got.Status, got.Assignee)
-		}
+		t.Run(name, func(t *testing.T) {
+			var class beads.Store
+			race := &unwindRaceGraph{}
+			race.mutate = func(id string) error { return unwindClassUpdate(&class, change[0], change[1])(id) }
+			class, ops := graphRestoreRig(t, "gcg-race", "in_progress", seat, race)
+			_ = class
+			ok, err := ops.Restore(context.Background(), "/rig", nil, "gcg-race", seat, seat)
+			if ok || !errors.Is(err, errHookClaimRestoreLost) {
+				t.Fatalf("restore across the change = (%v, %v), want (false, errHookClaimRestoreLost)", ok, err)
+			}
+			if !race.raced {
+				t.Fatal("the race never fired, so this test proves nothing")
+			}
+			wantStatus, wantAssignee := "in_progress", seat
+			if change[0] != "" {
+				wantStatus = change[0]
+			}
+			if change[1] != "" {
+				wantAssignee = change[1]
+			}
+			if got, _ := class.Get("gcg-race"); got.Status != wantStatus || got.Assignee != wantAssignee {
+				t.Fatalf("change was overwritten: status=%q assignee=%q, want %q/%q", got.Status, got.Assignee, wantStatus, wantAssignee)
+			}
+		})
 	}
-	if ok, err := restoreGraphHookClaim(graph, "gcg-absent", seat, seat); ok || err != nil {
-		t.Fatalf("restore of an absent bead = (%v, %v), want (false, nil)", ok, err)
+}
+
+// TestHookClaimUnwindGraphRestoreHonorsDeadline pins the PR #305 re-review P2:
+// the graph-binding restore runs under the unwind's deadline. A graph read that
+// stalls past it must not hold the unwind: the restore gives up at the deadline
+// and the fallback release still gets the claim back.
+func TestHookClaimUnwindGraphRestoreHonorsDeadline(t *testing.T) {
+	old := hookClaimMutationTimeout
+	hookClaimMutationTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { hookClaimMutationTimeout = old })
+
+	const seat = "gc__role-mc-sess1"
+	race := &unwindRaceGraph{stall: 2 * time.Second}
+	class, ops := graphRestoreRig(t, "gcg-stall", "in_progress", seat, race)
+
+	var stderr bytes.Buffer
+	start := time.Now()
+	code := unwindUndeliveredHookClaim(hookClaimReleaseReasonUndelivered, "test unwind", beads.Bead{ID: "gcg-stall", Assignee: seat}, seat,
+		hookClaimOptions{Assignee: seat}, ops, "/rig", &stderr)
+	elapsed := time.Since(start)
+	if code != 1 {
+		t.Fatalf("code = %d, want 1", code)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("unwind took %s behind a stalled graph read, want it bounded by the %s restore deadline", elapsed, hookClaimMutationTimeout)
+	}
+	if got, _ := class.Get("gcg-stall"); got.Status != "open" || got.Assignee != "" {
+		t.Fatalf("after a stalled restore: status=%q assignee=%q, want the fallback release (open, unassigned); stderr=%s", got.Status, got.Assignee, stderr.String())
 	}
 }
