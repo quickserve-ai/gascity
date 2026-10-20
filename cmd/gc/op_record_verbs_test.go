@@ -856,7 +856,11 @@ func TestSessionKillOpClosesAfterTheLeaseIsReleased(t *testing.T) {
 }
 
 // A close closes its op only after its cleanup: the session's claims are
-// released by the time the op reads succeeded.
+// released by the time the op reads succeeded. This session is a configured
+// named seat, so its cleanup keeps the claim on its assignee and proposes the
+// release instead (ga-9n8hjv fence #1; see
+// TestNamedSeatCloseProposesWorkHeldUnderTheSessionHandle): that proposal is
+// what must be on the claim when the op closes.
 func TestSessionCloseOpClosesAfterItsCleanup(t *testing.T) {
 	h := newCLIOpHarness(t, map[string]string{"GC_OPS_LIFECYCLE": "auto"})
 	c := newCLIOpCity(t, h, nil)
@@ -878,8 +882,8 @@ func TestSessionCloseOpClosesAfterItsCleanup(t *testing.T) {
 			t.Errorf("reading claim: %v", err)
 			return
 		}
-		if got.Assignee == c.bead.ID {
-			t.Errorf("the close closed its op before releasing the session's claim %s", claim.ID)
+		if !releaseProposalPending(got) || got.Metadata[beadmeta.ReleaseProposedAssigneeMetadataKey] != c.bead.ID {
+			t.Errorf("the close closed its op before proposing the release of the session's claim %s", claim.ID)
 		}
 	}
 	var stdout, stderr bytes.Buffer
