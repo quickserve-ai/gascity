@@ -258,3 +258,19 @@ func refuseScope(info sessionpkg.Info, cfg *config.City) RefuseScope {
 	}
 	return RefuseScope{ids: drainAckAssigneeIdentities(info, cfg)}
 }
+
+// refuseScopeOwn is refuseScope with no config: what b itself records (ID,
+// session_name, the configured named identity, the alias and the alias
+// history), for a gate in front of a close whose config did not load
+// (ga-9z2363). Without the agent the slot rule cannot be judged, so a
+// slotted pool row keeps its current alias but drops its history: a prior
+// alias there may be a slot rebound to the next occupant, whose claims must
+// not hold this row open.
+func refuseScopeOwn(b beads.Bead) RefuseScope {
+	info := sessionInfoFromBead(b)
+	if isPoolManagedSessionInfo(info) && strings.TrimSpace(info.PoolSlot) != "" {
+		ids := append(sessionAssignmentIdentifiersInfo(info), strings.TrimSpace(info.Alias))
+		return RefuseScope{ids: compactSessionAssignmentIdentifiers(ids)}
+	}
+	return RefuseScope{ids: compactSessionAssignmentIdentifiers(sessionpkg.AssigneeIdentities(info))}
+}

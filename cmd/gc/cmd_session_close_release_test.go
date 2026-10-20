@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gastownhall/gascity/internal/beadmeta"
 	"github.com/gastownhall/gascity/internal/beads"
@@ -301,5 +302,93 @@ func TestCmdSessionCloseWithoutConfigRefusesOnlyOverClaims(t *testing.T) {
 				t.Fatalf("cmdSessionClose = %d, stderr %q; want refused %t", code, stderr.String(), holds)
 			}
 		})
+	}
+}
+
+// configLessCloseCity is the store of a file-store city whose config does not
+// load, opened before the config broke.
+func configLessCloseCity(t *testing.T) beads.Store {
+	t.Helper()
+	cityDir := t.TempDir()
+	writePhase0InterfaceCity(t, cityDir, "[workspace]\nname = \"test-city\"\n\n[beads]\nprovider = \"file\"\n")
+	t.Setenv("GC_CITY", cityDir)
+	t.Setenv("GC_DIR", t.TempDir())
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_SESSION", "fake")
+	store, err := openCityStoreAt(cityDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendCityTOML(t, cityDir, "\n[[[not toml\n")
+	return store
+}
+
+// A config-less close refuses while the seat holds a claim under its alias
+// or a prior alias alone: a seat claims under its alias first, and the
+// narrower bead-ID/session_name scope let it close and strand that work
+// (ga-9z2363).
+func TestCmdSessionCloseWithoutConfigRefusesOverAliasHeldClaims(t *testing.T) {
+	for name, assignee := range map[string]string{"current alias": "test-city/furiosa", "prior alias": "test-city/nux"} {
+		t.Run(name, func(t *testing.T) {
+			store := configLessCloseCity(t)
+			seat, err := store.Create(beads.Bead{Title: "worker", Type: session.BeadType, Labels: []string{session.LabelSession}, Metadata: map[string]string{
+				"session_name": "worker-1", "template": "worker", "state": "asleep",
+				"alias": "test-city/furiosa", "alias_history": "test-city/nux",
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			claim, err := store.Create(beads.Bead{Title: "claim", Type: "task", Assignee: assignee, Metadata: map[string]string{beadmeta.RoutedToMetadataKey: "worker"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			inProgress := "in_progress"
+			if err := store.Update(claim.ID, beads.UpdateOpts{Status: &inProgress}); err != nil {
+				t.Fatal(err)
+			}
+
+			var stdout, stderr bytes.Buffer
+			if code := cmdSessionClose([]string{seat.ID}, &stdout, &stderr); code == 0 || !strings.Contains(stderr.String(), "refusing to close") {
+				t.Fatalf("cmdSessionClose = %d, stderr %q; want refused", code, stderr.String())
+			}
+			if got, err := store.Get(seat.ID); err != nil || got.Status == "closed" {
+				t.Fatalf("session bead = (%q, %v), want still open", got.Status, err)
+			}
+			if got, err := store.Get(claim.ID); err != nil || got.Assignee != assignee || got.Status != "in_progress" {
+				t.Fatalf("claim = (%q, %q, %v), want untouched under %q", got.Assignee, got.Status, err, assignee)
+			}
+		})
+	}
+}
+
+// A config-less close of a seat holding nothing still closes, and says on
+// stderr and on the bead that rig stores went unchecked: without the config
+// they cannot be found (ga-9z2363).
+func TestCmdSessionCloseWithoutConfigSaysRigStoresWentUnchecked(t *testing.T) {
+	store := configLessCloseCity(t)
+	seat, err := store.Create(beads.Bead{Title: "worker", Type: session.BeadType, Labels: []string{session.LabelSession}, Metadata: map[string]string{
+		"session_name": "worker-1", "template": "worker", "state": "asleep", "alias": "test-city/furiosa",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdSessionClose([]string{seat.ID}, &stdout, &stderr); code != 0 {
+		t.Fatalf("cmdSessionClose = %d, stderr %q; want closed", code, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "rig stores not checked: city config did not load") ||
+		!strings.Contains(stderr.String(), "test-city/furiosa") {
+		t.Fatalf("stderr %q; want the rig-stores-unchecked line naming the alias", stderr.String())
+	}
+	got, err := store.Get(seat.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != "closed" {
+		t.Fatalf("session bead status = %q, want closed", got.Status)
+	}
+	if _, err := time.Parse(time.RFC3339, got.Metadata[session.CloseRigStoresUncheckedMetadata]); err != nil {
+		t.Fatalf("%s = %q, want an RFC3339 time: %v", session.CloseRigStoresUncheckedMetadata, got.Metadata[session.CloseRigStoresUncheckedMetadata], err)
 	}
 }
