@@ -48,7 +48,7 @@ func nativeListPlan(query ListQuery, pushableTypes map[string]bool) []issueops.L
 	base := nativeListRequestFromListQuery(query, pushableTypes)
 	assignees := nativeListFanOutAssignees(query)
 	if len(assignees) == 0 {
-		return []issueops.ListRequest{base}
+		return nativeListIDChunks(base, query.IDs)
 	}
 	plan := make([]issueops.ListRequest, 0, len(assignees))
 	for _, assignee := range assignees {
@@ -57,6 +57,33 @@ func nativeListPlan(query ListQuery, pushableTypes map[string]bool) []issueops.L
 		plan = append(plan, req)
 	}
 	return plan
+}
+
+// nativeListIDChunks pushes an id set as IDFilter, one request per
+// nativeServerEdgeAnchorCap ids (the id count a served backend is known to
+// accept on one call). Without it a ListQuery naming ids listed the whole
+// ledger and filtered in Go. ApplyListQuery still applies the ids exactly, so
+// the union of the chunks is a superset of nothing it should not return. A
+// backend that refuses IDFilter is handled by List (nativeListIDsRefused).
+func nativeListIDChunks(base issueops.ListRequest, ids []string) []issueops.ListRequest {
+	if len(ids) == 0 {
+		return []issueops.ListRequest{base}
+	}
+	plan := make([]issueops.ListRequest, 0, (len(ids)+nativeServerEdgeAnchorCap-1)/nativeServerEdgeAnchorCap)
+	for start := 0; start < len(ids); start += nativeServerEdgeAnchorCap {
+		req := base
+		req.IDFilter = strings.Join(ids[start:min(start+nativeServerEdgeAnchorCap, len(ids))], ",")
+		plan = append(plan, req)
+	}
+	return plan
+}
+
+// nativeListIDsRefused reports a backend refusing IDFilter on a listing: an
+// http-native IssueReader does so client-side, before any round trip, with an
+// error that unwraps to *beadslib.ErrUnsupported.
+func nativeListIDsRefused(err error) bool {
+	var unsupported *beadslib.ErrUnsupported
+	return errors.As(err, &unsupported)
 }
 
 // nativeListFanOutAssignees returns the distinct assignees a plan fans out
@@ -185,6 +212,7 @@ func nativeListTypeRefused(err error) bool {
 // the list-request tripwire counts.
 func NativeListRequestKeyed(req issueops.ListRequest) bool {
 	return req.ParentID != "" ||
+		req.IDFilter != "" ||
 		req.Assignee != "" ||
 		len(req.Labels) > 0 ||
 		len(req.MetadataFields) > 0 ||
