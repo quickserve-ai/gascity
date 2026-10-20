@@ -62,7 +62,8 @@ type allocDifference struct {
 }
 
 // allocDifferences are the explained differences, by ID, each citing
-// CONTRACT v5 (AL1 keeps v4.3 §2-§3 and §6 except as it notes).
+// CONTRACT v5 (AL1 keeps v4.3 §2-§3 and §6 except as it notes) or, for a
+// fork carry's own behaviour, its carry row.
 var allocDifferences = map[string]allocDifference{
 	"create-budget": {
 		"v5 P4",
@@ -100,18 +101,17 @@ var allocDifferences = map[string]allocDifference{
 		"v5 §12.2 #71, PAR-SC, POOL-008 (owner ruling 2026-10-17)",
 		"a named session desired with no row (always, or on_demand through work assigned to its identity) on a singleton template whose custom check counts work: v2 plans the canonical named create, where legacy's build creates a pool-managed ephemeral row that its desired state maps to the named identity",
 	},
+	"carry-named-canonical-mint": {
+		"carry row ga-dfp1b L2 (7ee2e4dd36); accounting only, pinned by TestAlwaysNamedCustomCheckMintStaysDesiredAcrossTicks",
+		"legacy's guarded pool create mints a mode=always singleton identity's canonical named row on the first tick, and the recount reads that row as the slot's holder (accepted 0), as upstream's recount does from the second tick for every canonical row; no consumer decides differently, since the row stays config-eligible and wakes on WakeConfig whatever the count",
+	},
 }
 
 // allocFindings are divergences the differential found that CONTRACT v5
 // does not explain. They are pinned so the suite stays honest while the owner
 // decides; an entry is deleted when its fix lands (the fixture then fails
 // until its explain entry goes too). A finding is not an explanation.
-var allocFindings = map[string]allocDifference{
-	"carry-named-canonical-mint": {
-		"carry row ga-dfp1b L2 (7ee2e4dd36), not CONTRACT v5; re-sync #8 owner decision pending",
-		"legacy's guarded pool create mints the canonical named row when a pool create targets a template whose only session is a mode=always named identity, and the post-build recount reads that row as holding the identity's slot, so legacy's accepted demand is 0 where upstream's pool-managed row is skipped and both sides accept 1",
-	},
-}
+var allocFindings = map[string]allocDifference{}
 
 // diffCity is one fixture city: its config, the beads both stores start
 // from, the runtime names alive on both sides, and the K1 scale_check run.
