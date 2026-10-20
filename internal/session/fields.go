@@ -287,6 +287,12 @@ func withObserved(fields []Field) []Field {
 	return fields
 }
 
+// CloseRigStoresUncheckedMetadata stamps a session closed without its city
+// config: the close checked no rig store for claims held under the seat,
+// since rig stores are found through that config (ga-9z2363). The value is
+// the close time, RFC3339.
+const CloseRigStoresUncheckedMetadata = "close.rig_stores_unchecked"
+
 var registry = slices.Concat([]Field{
 	// Incarnation.
 	{Key: "generation", Class: ClassIncarnation, Writers: sites(legacyPreWake, opCreate, v2PreWake)},
@@ -386,6 +392,10 @@ var registry = slices.Concat([]Field{
 	// reads it back (readSessionReleaseObligation, for its own CAS upgrade); no
 	// decision reads it, so no fence compares it.
 	{Key: beadmeta.ReleaseDeferredMetadataKey, Class: ClassAdvisory, Writers: sites(op("cmd/gc/session_release_marker.go", "publishDeferredReleaseObligation"), op("cmd/gc/session_release_marker.go", "publishDeferredReleaseObligationUnconditionally"))},
+	// The carry's rig-stores-unchecked stamp (ga-9z2363): a config-less close
+	// records that no rig store was read for the seat's claims. Advisory: no
+	// decision reads it.
+	{Key: CloseRigStoresUncheckedMetadata, Class: ClassAdvisory, Writers: sites(op("cmd/gc/cmd_session.go", "cmdSessionClose"))},
 	{Key: "alias", Class: ClassAssignmentIdentity, Writers: sites(legacy(srcPoolNames, "createPoolSessionBeadWithIdentifiers"), v2("cmd/gc/allocator_create_named.go", "createEffects.writeNamed"))},
 	{Key: aliasHistoryMetadataKey, Class: ClassLaunchConfig, Writers: sites(legacy("internal/session/alias.go", "UpdatedAliasMetadata"))},
 	{Key: "common_name", Class: ClassLaunchConfig, NoWriter: "retired: no production writer; name lookups still query it"},

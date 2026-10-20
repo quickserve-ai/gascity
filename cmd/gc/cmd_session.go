@@ -1951,9 +1951,12 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 	}
 	// Without the config no claim's route can be judged, so the close could
 	// release none of the session's claims: refuse while it holds any, rather
-	// than strand them all. A session holding none closes.
+	// than strand them all. A session holding none closes. The scope is every
+	// identity the bead itself records, its alias and alias history included:
+	// a seat claims under its alias first, so a narrower set let a seat whose
+	// claims all sat under its alias close and strand them (ga-9z2363).
 	if cityErr == nil && cfg == nil {
-		scope := releaseScopeOwn(closedSessionBead)
+		scope := refuseScopeOwn(closedSessionBead)
 		legs := workLegsFromCensus(cityPath, nil, cityWorkLegOf(beads.WorkStore{Store: store}), nil)
 		if holds, err := seatWorkFor(legs, scope).has(seatWorkQuery{scope: scope, statuses: seatWorkStatuses}); holds || err != nil {
 			fmt.Fprintf(stderr, "gc session close: city config did not load (%v); refusing to close %s while it holds claims: they could not be released\n", cfgErr, sessionID) //nolint:errcheck // best-effort stderr
@@ -1999,10 +2002,27 @@ func cmdSessionClose(args []string, stdout, stderr io.Writer, jsonOutput ...bool
 		closeRec()
 	}
 
+	// RIG STORES WENT UNCHECKED (ga-9z2363). The refusal above reads only the
+	// city work store: rig stores are found through the config that did not
+	// load. Stamp that on the bead BEFORE the close, as the deferred release
+	// above is: the close retires the row, and a write after it may land on a
+	// closed bead or not at all. A close that then fails leaves the stamp on a
+	// row still open: it records a config-less close attempt, not a close.
+	if cfg == nil {
+		_ = setMetaBatch(sessionFrontDoor(sessStore), sessionID, map[string]string{
+			session.CloseRigStoresUncheckedMetadata: time.Now().UTC().Format(time.RFC3339),
+		}, stderr)
+	}
+
 	closeResult, err := handle.CloseDetailed(context.Background(), sessionActor(session.ActorOperator, cityPath))
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session close: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
+	}
+	if cfg == nil {
+		fmt.Fprintf(stderr, "gc session close: rig stores not checked: city config did not load (%s); "+ //nolint:errcheck // best-effort stderr
+			"claims held there under %s may be stranded; re-run gc session close with the city config\n",
+			cfgErrOrUnknown(cfgErr), strings.Join(refuseScopeOwn(closedSessionBead).scopeIDs(), ", "))
 	}
 	if cityErr == nil {
 		if err := withdrawQueuedWaitNudges(cityPath, closeResult.WaitNudgeIDs); err != nil {
