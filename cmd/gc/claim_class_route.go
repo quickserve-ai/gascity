@@ -711,6 +711,20 @@ func classRoutedHookClaimOps(ops hookClaimOps, route *hookClaimClassRoute) hookC
 		return base.Release(ctx, dir, env, beadID, assignee)
 	}
 
+	// The restore of an undelivered ready-assignment claim (ga-812fpb) routes
+	// exactly like the release above, on the memo alone. The graph binding has
+	// no guarded assignee update, so its restore is a read, a check against the
+	// claim being given back, and a revision-fenced write.
+	ops.Restore = func(ctx context.Context, dir string, env []string, beadID, holder, prior string) (bool, error) {
+		if route.knownResident(beadID) {
+			return restoreGraphHookClaim(ctx, route.graph, beadID, holder, prior)
+		}
+		if base.Restore == nil {
+			return false, errHookClaimRestoreUnavailable
+		}
+		return base.Restore(ctx, dir, env, beadID, holder, prior)
+	}
+
 	// An adoption re-stamp of a bead resident in the relocated graph store has
 	// no conditional-transfer primitive there, so it reports unsupported and
 	// the bead is adopted as-is (the pre-re-stamp behavior). Anything else
@@ -743,4 +757,43 @@ func classRoutedHookClaimOps(ops hookClaimOps, route *hookClaimClassRoute) hookC
 	}
 
 	return ops
+}
+
+// restoreGraphHookClaim is hookClaimRestoreOnStore for a bead resident in the
+// relocated graph store: open under prior, only while the bead is still
+// in_progress under holder at the revision read.
+//
+// The binding takes no context, so each call is bounded by ctx the way the
+// teardown read above is (runWithDeadline). A stalled read must not outlast the
+// unwind's deadline: the unwind's fallback release is what keeps the claim from
+// staying parked, and it only runs once this returns. A read abandoned at the
+// deadline cannot write late: the write is never issued once ctx is done, and
+// it is fenced on the revision read in any case.
+func restoreGraphHookClaim(ctx context.Context, graph storebinding.GraphStore, beadID, holder, prior string) (bool, error) {
+	current, err := runWithDeadline(ctx, func() (beads.Bead, error) { return graph.Get(beadID) })
+	if errors.Is(err, beads.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("re-reading %s before restore: %w", beadID, err)
+	}
+	if current.Status != "in_progress" || strings.TrimSpace(current.Assignee) != strings.TrimSpace(holder) {
+		return false, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	open := "open"
+	prior = strings.TrimSpace(prior)
+	_, err = runWithDeadline(ctx, func() (struct{}, error) {
+		return struct{}{}, graph.UpdateIfMatch(beadID, current.Revision, beads.UpdateOpts{Status: &open, Assignee: &prior})
+	})
+	switch {
+	case err == nil:
+		return true, nil
+	case beads.IsPreconditionFailed(err):
+		return false, errHookClaimRestoreLost
+	default:
+		return false, fmt.Errorf("restoring %s to %q: %w", beadID, prior, err)
+	}
 }
