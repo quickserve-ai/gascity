@@ -325,12 +325,17 @@ func (s *beadPolicyStore) ReadyPreferCache(query beads.ReadyQuery) ([]beads.Bead
 }
 
 // ReadyOrdered forwards a bounded ordered ready read (beads.OrderedReadyReader)
-// with the policy's expanded read tier, exactly as Ready does. Explicit for the
-// reason DeleteBatch is: the embedded Store interface does not promote optional
-// capabilities, and a silent wrapper would send every bounded read down the
-// whole-set path.
+// with the policy's expanded read tier and the session-liveness overlay,
+// exactly as Ready does: a bounded read must not hand its caller committed
+// telemetry the unbounded one would have overlaid (ga-lys454). The overlay
+// rewrites metadata in place, so the inner store's row order and its ordered
+// report pass through unchanged. Explicit for the reason DeleteBatch is: the
+// embedded Store interface does not promote optional capabilities, and a
+// silent wrapper would send every bounded read down the whole-set path.
 func (s *beadPolicyStore) ReadyOrdered(query beads.ReadyQuery, order beads.ReadyOrder) ([]beads.Bead, bool, error) {
-	return beads.ReadyOrdered(s.Store, expandPolicyReadyQuery(query), order)
+	rows, ordered, err := beads.ReadyOrdered(s.Store, expandPolicyReadyQuery(query), order)
+	rows, err = s.overlayResult(rows, err)
+	return rows, ordered, err
 }
 
 var (
