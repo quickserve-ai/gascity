@@ -295,6 +295,13 @@ type hookClaimOps struct {
 	// legitimately changed hands in the meantime is left alone. It reports
 	// whether the release actually landed.
 	Release hookClaimReleaseFunc
+	// Restore gives back a claim that promoted a bead the seat was ALREADY
+	// assigned (the ready-assignment tier): compare-and-swap from in_progress
+	// under holder to open under prior, so the unwind returns the bead to its
+	// pre-claim owner instead of clearing it. It reports whether the restore
+	// landed; an error means it could not be attempted conditionally, and the
+	// unwind falls back to Release.
+	Restore hookClaimRestoreFunc
 	// EmitClaimWindowExpired and EmitClaimReleased publish the two turn-binding
 	// facts. Best-effort, like EmitClaimRejected.
 	EmitClaimWindowExpired func(hookClaimWindowExpiry)
@@ -346,6 +353,7 @@ type (
 	hookStampSessionClaimFunc     func(sessionID, beadID string) error
 	hookPublishRunMapFunc         func(runID, beadID string, sessionKeys ...string) error
 	hookClaimReleaseFunc          func(ctx context.Context, dir string, env []string, beadID, assignee string) (bool, error)
+	hookClaimRestoreFunc          func(ctx context.Context, dir string, env []string, beadID, holder, prior string) (bool, error)
 	// hookClaimReclaimFunc attempts a scoped stale-lease reclaim for exactly
 	// one bead ID (ctx, dir, env, beadID) and reports whether it reclaimed
 	// the lease and, if so, the previous owner.
@@ -537,7 +545,7 @@ func tryHookClaim(workQuery, dir string, opts *hookClaimOptions, ops *hookClaimO
 				bead = restamped
 				result.Assignee = restamped.Assignee
 				// minted=false: adoption returns work this session already owned.
-				return hookClaimResult{terminal: true, code: writeHookClaimWorkResultForBead(result, bead, *opts, *ops, dir, false, stdout, stderr)}
+				return hookClaimResult{terminal: true, code: writeHookClaimWorkResultForBead(result, bead, *opts, *ops, dir, false, "", stdout, stderr)}
 			}
 		}
 		// Not adopted — the canonical store named another owner, or the bead is
@@ -638,6 +646,14 @@ func (ops *hookClaimOps) applyDefaults() {
 	}
 	if ops.Release == nil {
 		ops.Release = hookClaimReleaseWithBdStore
+		// The restore is the release's dual for a ready-assignment claim and
+		// runs against the same bd context. A caller that injected its own
+		// Release injected its ledger too, so it gets no default restore that
+		// would write a store its release never touches; its unwind falls back
+		// to that Release.
+		if ops.Restore == nil {
+			ops.Restore = hookClaimRestoreWithBdStore
+		}
 	}
 	if ops.EmitClaimWindowExpired == nil {
 		ops.EmitClaimWindowExpired = hookEmitClaimWindowExpired
@@ -949,7 +965,9 @@ func claimReadyHookAssignmentPass(candidates []beads.Bead, opts hookClaimOptions
 		if result.Assignee == "" {
 			result.Assignee = claimActor
 		}
-		return hookClaimResult{terminal: true, code: writeHookClaimWorkResultForBead(result, claimed, opts, ops, dir, true, stdout, stderr)}, -1
+		// The bead was open and already this seat's before the claim, so an
+		// unwind must hand it back to claimActor, not clear it (ga-812fpb).
+		return hookClaimResult{terminal: true, code: writeHookClaimWorkResultForBead(result, claimed, opts, ops, dir, true, claimActor, stdout, stderr)}, -1
 	}
 	return hookClaimResult{claimsErrored: claimsErrored}, -1
 }
@@ -1180,7 +1198,7 @@ func claimEligibleHookCandidatePass(candidates []beads.Bead, carry *hookClaimTie
 		}
 		reportDeclinedForeign(stderr, carry.declinedForeign)
 		reportDeclinedLiveOwner(stderr, carry.declinedLiveOwner)
-		return hookClaimResult{terminal: true, code: writeHookClaimWorkResultForBead(result, claimed, opts, ops, dir, true, stdout, stderr)}, -1
+		return hookClaimResult{terminal: true, code: writeHookClaimWorkResultForBead(result, claimed, opts, ops, dir, true, "", stdout, stderr)}, -1
 	}
 
 	return hookClaimResult{}, -1
@@ -1437,7 +1455,11 @@ func hookClaimCandidateIsMessage(candidate beads.Bead) bool {
 // owned, so releasing it on a delivery failure would give away a claim an earlier
 // turn legitimately made. A held claim that goes undelivered is re-served to the
 // next turn by the existing-assignment tier instead.
-func writeHookClaimWorkResultForBead(result hookClaimJSONResult, bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string, minted bool, stdout, stderr io.Writer) int {
+//
+// priorAssignee is who held the bead before a minted claim: empty for a fresh
+// claim of unassigned work, the seat's stored spelling for a ready-assignment
+// promotion. An unwind restores it rather than clearing the bead.
+func writeHookClaimWorkResultForBead(result hookClaimJSONResult, bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string, minted bool, priorAssignee string, stdout, stderr io.Writer) int {
 	// F-B straddle. The CAS was STARTED inside the window and LANDED outside the
 	// window plus its reserved claim budget: the claim-write child carries its own
 	// ceiling, so a claim can commit after the invoking turn is already gone. That is the same parked claim by another
@@ -1445,7 +1467,7 @@ func writeHookClaimWorkResultForBead(result hookClaimJSONResult, bead beads.Bead
 	if minted && ops.claimLandingWindowSpent() {
 		cause := fmt.Sprintf("claim of %s landed after the %s claim window and its %s claim reserve closed (invocation age %s); releasing it rather than parking it",
 			bead.ID, ops.claimWindowOrDefault(), hookClaimMutationTimeout, ops.invocationAge().Round(time.Millisecond))
-		return unwindUndeliveredHookClaim(hookClaimReleaseReasonStraddled, cause, bead, opts, ops, dir, stderr)
+		return unwindUndeliveredHookClaim(hookClaimReleaseReasonStraddled, cause, bead, priorAssignee, opts, ops, dir, stderr)
 	}
 	result.RootBeadID = strings.TrimSpace(bead.Metadata[beadmeta.RootBeadIDMetadataKey])
 	result.ContinuationGroup = strings.TrimSpace(bead.Metadata[beadmeta.ContinuationGroupMetadataKey])
@@ -1480,7 +1502,7 @@ func writeHookClaimWorkResultForBead(result hookClaimJSONResult, bead beads.Bead
 		// this back-channel exists to prevent. The straddle path (F-B) needs no clear
 		// because it returns before the stamp.
 		clearHookSessionCurrentClaim(opts, ops, stderr)
-		return unwindUndeliveredHookClaim(hookClaimReleaseReasonUndelivered, cause, bead, opts, ops, dir, stderr)
+		return unwindUndeliveredHookClaim(hookClaimReleaseReasonUndelivered, cause, bead, priorAssignee, opts, ops, dir, stderr)
 	}
 	// Enqueue a per-session continuation nudge when the hook just claimed a
 	// graph.v2 workflow root and pre-assigned at least one continuation sibling.
@@ -1527,7 +1549,15 @@ func writeHookClaimResultLine(result hookClaimJSONResult, jsonOut bool, stdout i
 // of the result payload, so they cannot be computed after it). Those siblings
 // stay open and assigned, which is the dead-assignee release lane's shape, and
 // the next turn of the same session re-claims them.
-func unwindUndeliveredHookClaim(reason, cause string, bead beads.Bead, opts hookClaimOptions, ops hookClaimOps, dir string, stderr io.Writer) int {
+//
+// A claim that promoted a bead the seat was ALREADY assigned (priorAssignee
+// non-empty: the ready-assignment tier) is given back by ops.Restore instead,
+// which returns it to open under priorAssignee in one fenced write. Releasing
+// it would leave a named seat's pre-assigned work open and unowned
+// (ga-812fpb). A restore that cannot be made conditionally falls back to the
+// release, so the claim is never left parked, and the lost owner is surfaced
+// with its recovery.
+func unwindUndeliveredHookClaim(reason, cause string, bead beads.Bead, priorAssignee string, opts hookClaimOptions, ops hookClaimOps, dir string, stderr io.Writer) int {
 	assignee := strings.TrimSpace(bead.Assignee)
 	if assignee == "" {
 		assignee = opts.Assignee
@@ -1552,11 +1582,31 @@ func unwindUndeliveredHookClaim(reason, cause string, bead beads.Bead, opts hook
 	// window is already spent, and the unwind must still be allowed to run.
 	ctx, cancel := context.WithTimeout(context.Background(), hookClaimMutationTimeout)
 	defer cancel()
-	released, err := ops.Release(ctx, dir, opts.Env, bead.ID, assignee)
+	prior := strings.TrimSpace(priorAssignee)
+	var (
+		released   bool
+		err        error
+		restoreErr error
+	)
+	switch {
+	case prior == "":
+		released, err = ops.Release(ctx, dir, opts.Env, bead.ID, assignee)
+	case ops.Restore == nil:
+		restoreErr = errHookClaimRestoreUnavailable
+		released, err = ops.Release(ctx, dir, opts.Env, bead.ID, assignee)
+	default:
+		released, restoreErr = ops.Restore(ctx, dir, opts.Env, bead.ID, assignee, prior)
+		if restoreErr != nil {
+			released, err = ops.Release(ctx, dir, opts.Env, bead.ID, assignee)
+		}
+	}
 	if released && err == nil {
 		ops.EmitClaimReleased(hookClaimReleaseRecord{BeadID: bead.ID, Assignee: assignee, Reason: reason})
 	}
 	fmt.Fprintf(stderr, "gc hook --claim: %s\n", cause) //nolint:errcheck
+	if restoreErr != nil && released && err == nil {
+		fmt.Fprintf(stderr, "gc hook --claim: could not hand undelivered claim %s back to its pre-claim assignee %q (%v); released it unassigned instead (recover with: bd update %s --assignee %q)\n", bead.ID, prior, restoreErr, bead.ID, prior) //nolint:errcheck
+	}
 	switch {
 	case err != nil:
 		fmt.Fprintf(stderr, "gc hook --claim: releasing undelivered claim %s: %v\n", bead.ID, err) //nolint:errcheck
@@ -3120,6 +3170,49 @@ func hookResolveWorkBranch(tree hookClaimWorkTree) string {
 // city so the release reaches the ledger the claim actually landed in.
 func hookClaimReleaseWithBdStore(ctx context.Context, dir string, env []string, beadID, assignee string) (bool, error) {
 	return hookClaimBdStoreContext(ctx, dir, env, assignee).ReleaseIfCurrent(beadID, assignee)
+}
+
+// errHookClaimRestoreUnavailable: no restore seam reaches the ledger this claim
+// landed in, so the unwind can only release.
+var errHookClaimRestoreUnavailable = errors.New("no conditional restore reaches this ledger")
+
+// errHookClaimRestoreLost: the bead's revision moved between the restore's
+// read and its write. It may still be this claim, so the unwind falls back to
+// the release's own assignee CAS rather than leave it parked.
+var errHookClaimRestoreLost = errors.New("bead changed during the restore")
+
+// hookClaimRestoreWithBdStore is the unrouted restore, through the same
+// work-directory bd context as hookClaimReleaseWithBdStore and actored as the
+// holder the release would be.
+func hookClaimRestoreWithBdStore(ctx context.Context, dir string, env []string, beadID, holder, prior string) (bool, error) {
+	return hookClaimRestoreOnStore(hookClaimBdStoreContext(ctx, dir, env, holder), beadID, holder, prior)
+}
+
+// hookClaimRestoreOnStore returns a ready-assignment claim to its pre-claim
+// shape, open and assigned to prior, in ONE write fenced on the claim being
+// given back (in_progress under holder): releaseAssignmentFenced with the
+// restore as its write. A bead that changed hands since the claim reports
+// false with nothing written. A store that cannot fence the write, or a fence
+// lost to a concurrent write, reports an error so the caller can fall back to
+// the release; it is never written blind.
+func hookClaimRestoreOnStore(store beads.Store, beadID, holder, prior string) (bool, error) {
+	open := "open"
+	prior = strings.TrimSpace(prior)
+	claim := beads.Bead{ID: beadID, Status: "in_progress", Assignee: strings.TrimSpace(holder)}
+	outcome, err := releaseAssignmentFenced(store, claim, beads.UpdateOpts{Status: &open, Assignee: &prior})
+	switch outcome {
+	case fencedReleaseApplied:
+		return true, nil
+	case fencedReleaseChanged:
+		return false, nil
+	case fencedReleaseLost:
+		return false, errHookClaimRestoreLost
+	default:
+		if err == nil {
+			err = beads.ErrConditionalWriteUnsupported
+		}
+		return false, fmt.Errorf("restoring %s to %q: %w", beadID, prior, err)
+	}
 }
 
 // hookClaimRestampWithBdStore is the unrouted adoption re-stamp: an assignee
