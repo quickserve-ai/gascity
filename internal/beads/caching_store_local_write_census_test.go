@@ -80,6 +80,11 @@ var localWriteCensusExempt = map[string]string{
 	"CachingStore.SetPrimeRetryDelayForTest": "test hook",
 	// Clone-local data is never cached, so there is no cached row to fence.
 	"CachingStore.SetLocalString": "clone-local, never cached",
+	// The reconciler's liveness wiring (ga-yc0chj): a getter of the arm time,
+	// and the setter of the heartbeat sink, which stamps that arm time and
+	// publishes one heartbeat. Neither writes a cached row or the backing store.
+	"CachingStore.ReconcilerArmedAt":         "read: reports when the reconcile loop was armed",
+	"CachingStore.SetReconcileHeartbeatSink": "cache maintenance: installs the reconciler's heartbeat sink, writes no row",
 }
 
 // TestCachingStoreWritesRegisterLocalWrites is the local-write census: every
