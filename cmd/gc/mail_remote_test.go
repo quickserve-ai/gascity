@@ -30,7 +30,7 @@ const remoteMailMessageJSON = `{"id":"mc-wisp-1","from":"alpha/mayor","to":"mayo
 // default remote sender deterministically.
 func clearRemoteMailIdentityEnv(t *testing.T) {
 	t.Helper()
-	for _, k := range []string{"GC_ALIAS", "GC_AGENT", "GC_SESSION_ID", "GC_CITY", "GC_CITY_PATH", "GC_CITY_ROOT", "GC_RIG", "GC_DIR"} {
+	for _, k := range []string{"GC_ALIAS", "GC_AGENT", "GC_SESSION_ID", "GC_ORDER_SCOPE", "GC_ORDER_NAME", "GC_ORDER_RUN", "GC_CITY", "GC_CITY_PATH", "GC_CITY_ROOT", "GC_RIG", "GC_DIR"} {
 		t.Setenv(k, "")
 	}
 }
@@ -50,33 +50,43 @@ func seedLocalCity(t *testing.T) {
 }
 
 // The default remote sender is city-qualified ("<local city>/<identity>") with
-// alias > agent > session id, and --from wins verbatim.
+// alias > agent > session id, and --from wins verbatim. With no identity there
+// is no default sender at all (ga-u5dz0g); only the inbox owner reads "human".
 func TestRemoteMailSender(t *testing.T) {
 	clearRemoteMailIdentityEnv(t)
 	t.Setenv("GC_HOME", t.TempDir())
-	if got := remoteMailSender("citadel/mayor"); got != "citadel/mayor" {
-		t.Errorf("--from must pass verbatim, got %q", got)
+	if got, ok := remoteMailSender("citadel/mayor"); !ok || got != "citadel/mayor" {
+		t.Errorf("--from must pass verbatim, got %q, %v", got, ok)
 	}
 	// Chdir to a non-city dir so cwd discovery cannot find a real city.
 	t.Chdir(t.TempDir())
-	if got := remoteMailSender(""); got != "human" {
-		t.Errorf("no city, no identity: want human, got %q", got)
+	if got, ok := remoteMailSender(""); ok || got != "" {
+		t.Errorf("no city, no identity: want refused, got %q, %v", got, ok)
+	}
+	if got := remoteMailInboxOwner(); got != "human" {
+		t.Errorf("no identity inbox owner: want human, got %q", got)
+	}
+	if got, ok := remoteMailSender("human"); !ok || got != "human" {
+		t.Errorf("--from human must still send as human, got %q, %v", got, ok)
 	}
 	t.Setenv("GC_SESSION_ID", "s-1")
-	if got := remoteMailSender(""); got != "s-1" {
+	if got, _ := remoteMailSender(""); got != "s-1" {
 		t.Errorf("session id fallback: got %q", got)
 	}
 	t.Setenv("GC_AGENT", "rig/worker")
-	if got := remoteMailSender(""); got != "rig/worker" {
+	if got, _ := remoteMailSender(""); got != "rig/worker" {
 		t.Errorf("agent beats session id: got %q", got)
 	}
 	t.Setenv("GC_ALIAS", "mayor")
-	if got := remoteMailSender(""); got != "mayor" {
+	if got, _ := remoteMailSender(""); got != "mayor" {
 		t.Errorf("alias beats agent: got %q", got)
 	}
 	seedLocalCity(t)
-	if got := remoteMailSender(""); got != "alpha/mayor" {
+	if got, _ := remoteMailSender(""); got != "alpha/mayor" {
 		t.Errorf("city-qualified sender: got %q", got)
+	}
+	if got := remoteMailInboxOwner(); got != "alpha/mayor" {
+		t.Errorf("city-qualified inbox owner: got %q", got)
 	}
 }
 
@@ -218,6 +228,7 @@ func TestCmdMailSendRemote_FlagsAndJSON(t *testing.T) {
 func TestCmdMailSendRemote_ServerErrorSurfaces(t *testing.T) {
 	clearRemoteMailIdentityEnv(t)
 	t.Setenv("GC_HOME", t.TempDir())
+	t.Setenv("GC_ALIAS", "mayor")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/problem+json")
 		w.WriteHeader(http.StatusUnauthorized)
@@ -314,6 +325,7 @@ func TestCmdMailInboxRemote_ListsAndDefaultsRecipient(t *testing.T) {
 func TestCmdMail_ContextDispatchesRemote(t *testing.T) {
 	clearRemoteMailIdentityEnv(t)
 	t.Setenv("GC_HOME", t.TempDir())
+	t.Setenv("GC_ALIAS", "mayor")
 	t.Chdir(t.TempDir())
 	var hits []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -412,6 +424,7 @@ func TestCmdMailInboxRemote_PagesAndRefusesPartial(t *testing.T) {
 func TestCmdMail_ContextDispatchMatrix(t *testing.T) {
 	clearRemoteMailIdentityEnv(t)
 	t.Setenv("GC_HOME", t.TempDir())
+	t.Setenv("GC_ALIAS", "mayor")
 	t.Chdir(t.TempDir())
 	srv := newRemoteMailTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/problem+json")
@@ -610,6 +623,7 @@ func TestCmdMail_ContextMarkReadDispatchesRemoteOthersGated(t *testing.T) {
 func TestCmdMailRemote_Unconfirmed202GetsLocalVerdict(t *testing.T) {
 	clearRemoteMailIdentityEnv(t)
 	t.Setenv("GC_HOME", t.TempDir())
+	t.Setenv("GC_ALIAS", "mayor")
 	srv := newRemoteMailTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
@@ -655,6 +669,7 @@ func TestCmdMailRemote_Unconfirmed202GetsLocalVerdict(t *testing.T) {
 func TestCmdMailRemote_NotPersisted500GetsLocalVerdict(t *testing.T) {
 	clearRemoteMailIdentityEnv(t)
 	t.Setenv("GC_HOME", t.TempDir())
+	t.Setenv("GC_ALIAS", "mayor")
 	srv := newRemoteMailTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/problem+json")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -674,5 +689,98 @@ func TestCmdMailRemote_NotPersisted500GetsLocalVerdict(t *testing.T) {
 	errb.Reset()
 	if code := cmdMailReplyRemote(remoteTestClient(t, srv.URL), remoteTestTarget(srv.URL), []string{"mc-wisp-1", "ack"}, "", "", false, false, &out, &errb); code != mailSendNotPersistedExit {
 		t.Fatalf("reply exit = %d, want %d; stderr=%q", code, mailSendNotPersistedExit, errb.String())
+	}
+}
+
+// ga-u5dz0g: a remote send or reply from a process with no session identity,
+// no order identity and no --from is refused with the local refusal text,
+// before anything is posted. --from human still sends as human, and an order
+// run still signs as the order.
+func TestCmdMailRemote_RefusesWithoutIdentity(t *testing.T) {
+	clearRemoteMailIdentityEnv(t)
+	t.Setenv("GC_HOME", t.TempDir())
+	t.Chdir(t.TempDir())
+	var hits int
+	var gotFrom []string
+	srv := newRemoteMailTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		var body map[string]any
+		b, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(b, &body)
+		from, _ := body["from"].(string)
+		gotFrom = append(gotFrom, from)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(remoteMailMessageJSON))
+	}))
+	defer srv.Close()
+
+	var out, errb bytes.Buffer
+	if code := cmdMailSendRemote(remoteTestClient(t, srv.URL), remoteTestTarget(srv.URL), []string{"mayor", "x"}, false, false, "", "", "", "", "", false, &out, &errb); code == 0 {
+		t.Fatalf("identityless remote send exit 0; stdout=%q", out.String())
+	}
+	if !strings.Contains(errb.String(), noMailSenderIdentity("gc mail send")) {
+		t.Errorf("send refusal text differs from local send: %q", errb.String())
+	}
+	out.Reset()
+	errb.Reset()
+	if code := cmdMailReplyRemote(remoteTestClient(t, srv.URL), remoteTestTarget(srv.URL), []string{"mc-wisp-1", "ack"}, "", "", false, false, &out, &errb); code == 0 {
+		t.Fatalf("identityless remote reply exit 0; stdout=%q", out.String())
+	}
+	// A remote reply refuses --from, so its refusal must not advise one: it
+	// names the remedy that works, a seat or an order.
+	if !strings.Contains(errb.String(), "gc mail reply: no sender identity") || !strings.Contains(errb.String(), "from a seat or an order") || strings.Contains(errb.String(), "--from") {
+		t.Errorf("remote reply refusal must name a seat or an order and give no --from advice: %q", errb.String())
+	}
+	out.Reset()
+	errb.Reset()
+	if code := cmdMailReplyRemote(remoteTestClient(t, srv.URL), remoteTestTarget(srv.URL), []string{"mc-wisp-1", "ack"}, "", "", false, true, &out, &errb); code == 0 {
+		t.Fatalf("identityless remote reply --json exit 0; stdout=%q", out.String())
+	}
+	var replyErr struct {
+		OK    bool `json:"ok"`
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &replyErr); err != nil {
+		t.Fatalf("remote reply --json refusal not JSON: %v (%q)", err, out.String())
+	}
+	if replyErr.OK || replyErr.Error.Code != "no_sender_identity" || !strings.Contains(replyErr.Error.Message, "from a seat or an order") || strings.Contains(replyErr.Error.Message, "--from") {
+		t.Errorf("remote reply --json refusal = %+v; want code no_sender_identity, seat-or-order remedy, no --from advice", replyErr)
+	}
+	out.Reset()
+	errb.Reset()
+	if code := cmdMailSendRemote(remoteTestClient(t, srv.URL), remoteTestTarget(srv.URL), []string{"mayor", "x"}, false, false, "", "", "", "", "", true, &out, &errb); code == 0 || !strings.Contains(out.String(), "no_sender_identity") {
+		t.Errorf("identityless remote send --json: exit=%d stdout=%q", code, out.String())
+	}
+	if hits != 0 {
+		t.Fatalf("a refused send or reply reached the peer: %d request(s), from=%v", hits, gotFrom)
+	}
+
+	// --from human is the operator's explicit choice and still sends.
+	out.Reset()
+	errb.Reset()
+	if code := cmdMailSendRemote(remoteTestClient(t, srv.URL), remoteTestTarget(srv.URL), []string{"mayor", "x"}, false, false, "human", "", "", "", "", false, &out, &errb); code != 0 {
+		t.Fatalf("--from human: exit %d stderr=%q", code, errb.String())
+	}
+	// An order run signs as the order, city-qualified, for send and reply.
+	setOrderEnv(t, "city", "deacon-watch", "pc-run1")
+	seedLocalCity(t)
+	if code := cmdMailSendRemote(remoteTestClient(t, srv.URL), remoteTestTarget(srv.URL), []string{"mayor", "x"}, false, false, "", "", "", "", "", false, &out, &errb); code != 0 {
+		t.Fatalf("order send: exit %d stderr=%q", code, errb.String())
+	}
+	if code := cmdMailReplyRemote(remoteTestClient(t, srv.URL), remoteTestTarget(srv.URL), []string{"mc-wisp-1", "ack"}, "", "", false, false, &out, &errb); code != 0 {
+		t.Fatalf("order reply: exit %d stderr=%q", code, errb.String())
+	}
+	// A seat identity wins over the order, as it does locally.
+	t.Setenv("GC_AGENT", "rig/worker")
+	if code := cmdMailSendRemote(remoteTestClient(t, srv.URL), remoteTestTarget(srv.URL), []string{"mayor", "x"}, false, false, "", "", "", "", "", false, &out, &errb); code != 0 {
+		t.Fatalf("seat send: exit %d stderr=%q", code, errb.String())
+	}
+	want := []string{"human", "alpha/order:city/deacon-watch", "alpha/order:city/deacon-watch", "alpha/rig/worker"}
+	if strings.Join(gotFrom, ",") != strings.Join(want, ",") {
+		t.Errorf("senders=%v want %v", gotFrom, want)
 	}
 }
