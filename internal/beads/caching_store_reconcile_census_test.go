@@ -169,6 +169,11 @@ func TestMergeOracleFieldCoverage(t *testing.T) {
 		// lastScanAt is set by Prime and PrimeActive, never by the merge
 		// seam; it dates the backstop only until the first reconcile.
 		"lastScanAt": true,
+		// The delta reconcile's plan state (ga-ckbnpj): runReconciliation
+		// reads it before the backing read to choose a delta or full pass,
+		// and writes it after the merge returns; the merge neither reads nor
+		// writes it, so two merges cannot differ on it.
+		"reconcileDigest": true, "reconcileFingerprints": true, "lastFullListAt": true,
 		// Reconcile-liveness publishing (ga-yc0chj). Both are lifecycle
 		// state, not merge state: they are written once at arm time (the
 		// sink under lifecycleMu, the arm clock atomically) and only READ
