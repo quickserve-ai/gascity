@@ -1,6 +1,9 @@
 package doltauth
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
 
 // The regression these guard is ga-3qvmjj: after the 2026-08-27 qcore hub flip,
 // an agent session projected for the hub could not open the LOCAL city store,
@@ -154,7 +157,7 @@ func TestResolveScopedFromEnv_CrewEnvDeclinesBothOnMismatch(t *testing.T) {
 	got := ResolveScopedFromEnv(t.TempDir(), "", map[string]string{
 		"GC_DOLT_HOST": "127.0.0.1",
 		"GC_DOLT_PORT": "51361",
-	})
+	}, os.Getenv)
 	if got.User == "cherub" {
 		t.Error("scoped resolution leaked the ambient hub user onto the local store")
 	}

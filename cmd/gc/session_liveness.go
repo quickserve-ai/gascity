@@ -352,12 +352,14 @@ func openScopeLivenessStore(cityPath, scopeRoot string) (liveness.Store, error) 
 	// degrade every local scope's dial — the exact contamination
 	// ResolveScopedFromEnv exists to prevent. The local managed server's own
 	// password still arrives via managedDoltOpenDatabaseAuthed's endpoint-bound
-	// empty-password fallback.
+	// empty-password fallback. The ambient BEADS_CREDENTIALS_FILE fallback is
+	// read through the same native-open guard dolt_auth.go uses, so a concurrent
+	// scope's native open cannot lend this dial its transient credentials file.
 	authRoot := doltauth.AuthScopeRoot(cityPath, scopeRoot, target)
 	auth := doltauth.ResolveScopedFromEnv(authRoot, target.User, map[string]string{
 		"GC_DOLT_HOST": managedDoltConnectHost(target.Host),
 		"GC_DOLT_PORT": strings.TrimSpace(target.Port),
-	})
+	}, ambientNativeDoltOpenEnv)
 	db, err := managedDoltOpenDatabaseAuthed(target.Host, target.Port, auth.User, auth.Password, target.Database)
 	if err != nil {
 		return nil, fmt.Errorf("opening %s: %w", target.Database, err)
