@@ -24,8 +24,8 @@ type StartFence interface {
 }
 
 // startFenceRegistry maps a runtime provider (by identity) to the fences
-// registered for it. A provider is keyed only when its dynamic type is
-// comparable; production providers are pointers.
+// registered for it. A provider is keyed only when its value is comparable;
+// production providers are pointers.
 var startFenceRegistry = struct {
 	mu         sync.RWMutex
 	byProvider map[any][]*registeredStartFence
@@ -33,11 +33,17 @@ var startFenceRegistry = struct {
 
 type registeredStartFence struct{ fence StartFence }
 
+// startFenceKey returns sp as a registry key, or false when sp cannot be one.
+// The check is on the value, not the type: a provider struct whose fields are
+// interfaces has a comparable type, yet hashing it panics when one of those
+// fields holds an uncomparable value (a profile wrapper around a fake with a
+// func field, say). reflect.Value.Comparable looks through interface and
+// struct fields to the values they hold.
 func startFenceKey(sp runtime.Provider) (any, bool) {
 	if sp == nil {
 		return nil, false
 	}
-	if !reflect.TypeOf(sp).Comparable() {
+	if !reflect.ValueOf(sp).Comparable() {
 		return nil, false
 	}
 	return sp, true
