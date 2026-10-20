@@ -727,8 +727,28 @@ func TestCmdMailRemote_RefusesWithoutIdentity(t *testing.T) {
 	if code := cmdMailReplyRemote(remoteTestClient(t, srv.URL), remoteTestTarget(srv.URL), []string{"mc-wisp-1", "ack"}, "", "", false, false, &out, &errb); code == 0 {
 		t.Fatalf("identityless remote reply exit 0; stdout=%q", out.String())
 	}
-	if !strings.Contains(errb.String(), noMailSenderIdentity("gc mail reply")) {
-		t.Errorf("reply refusal text differs from local reply: %q", errb.String())
+	// A remote reply refuses --from, so its refusal must not advise one: it
+	// names the remedy that works, a seat or an order.
+	if !strings.Contains(errb.String(), "gc mail reply: no sender identity") || !strings.Contains(errb.String(), "from a seat or an order") || strings.Contains(errb.String(), "--from") {
+		t.Errorf("remote reply refusal must name a seat or an order and give no --from advice: %q", errb.String())
+	}
+	out.Reset()
+	errb.Reset()
+	if code := cmdMailReplyRemote(remoteTestClient(t, srv.URL), remoteTestTarget(srv.URL), []string{"mc-wisp-1", "ack"}, "", "", false, true, &out, &errb); code == 0 {
+		t.Fatalf("identityless remote reply --json exit 0; stdout=%q", out.String())
+	}
+	var replyErr struct {
+		OK    bool `json:"ok"`
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &replyErr); err != nil {
+		t.Fatalf("remote reply --json refusal not JSON: %v (%q)", err, out.String())
+	}
+	if replyErr.OK || replyErr.Error.Code != "no_sender_identity" || !strings.Contains(replyErr.Error.Message, "from a seat or an order") || strings.Contains(replyErr.Error.Message, "--from") {
+		t.Errorf("remote reply --json refusal = %+v; want code no_sender_identity, seat-or-order remedy, no --from advice", replyErr)
 	}
 	out.Reset()
 	errb.Reset()

@@ -86,6 +86,15 @@ func remoteMailSender(from string) (string, bool) {
 	return qualifyRemoteMailIdentity(id), true
 }
 
+// noRemoteMailReplySenderIdentity is the remote reply's refusal for a process
+// with no identity. It is noMailSenderIdentity without the --from advice: a
+// remote reply refuses any --from, so the only remedy is a seat or an order.
+func noRemoteMailReplySenderIdentity() string {
+	return "gc mail reply: no sender identity: GC_SESSION_ID, GC_ALIAS and GC_AGENT are unset and this is not an order run " +
+		"(GC_ORDER_SCOPE and GC_ORDER_NAME unset); refusing to send as \"human\", the operator's own address. " +
+		"A remote-city reply cannot name its own sender, so reply from a seat or an order"
+}
+
 // remoteMailInboxOwner is the mailbox a remote `gc mail inbox` with no
 // argument reads: this client's qualified sender identity, or "human" when
 // the process has none. Reading keeps the human fallback that sending lost,
@@ -213,7 +222,7 @@ func cmdMailReplyRemote(c *api.Client, target *remoteTarget, args []string, subj
 	// with no identity has no override here: it must run from a seat or order.
 	sender, ok := remoteMailSender("")
 	if !ok {
-		return fail("no_sender_identity", noMailSenderIdentity("gc mail reply"))
+		return fail("no_sender_identity", noRemoteMailReplySenderIdentity())
 	}
 	if !jsonOut {
 		fmt.Fprintln(stderr, formatRemoteTarget(target)) //nolint:errcheck // best-effort stderr
