@@ -186,6 +186,17 @@ expires = "2026-10-31"
 [[medium]]
 package_dir = "cmd/gc"
 package_name = "main"
+owner = "TestGcBeadsBdInitConsentsToMigrateOnlyADatabaseItCreated"
+resources = ["subprocess"]
+owner_bead = "ga-zyvj2k"
+invariant = "the created-database migrate-consent proof is a checked Medium subprocess owner"
+resource_owner = "the test executes the shipped provider script once per case with a test-owned bd, dolt and sleep on PATH and a scope built from files alone, so no Dolt, no bd and no host service are involved"
+migration_target = "P0.4b"
+expires = "2026-10-31"
+
+[[medium]]
+package_dir = "cmd/gc"
+package_name = "main"
 owner = "TestGcBeadsBdProviderOwnedLifecycleUsesBdBoundary"
 resources = ["subprocess"]
 owner_bead = "ga-p9iuv.30"
@@ -316,17 +327,6 @@ migration_target = "P0.4c-listener"
 expires = "2026-10-31"
 
 [[medium]]
-package_dir = "cmd/gc"
-package_name = "main"
-owner = "TestGcBeadsBdInitConsentsToMigrateOnlyADatabaseItCreated"
-resources = ["subprocess"]
-owner_bead = "ga-zyvj2k"
-invariant = "the created-database migrate-consent proof is a checked Medium subprocess owner"
-resource_owner = "the test executes the shipped provider script once per case with a test-owned bd, dolt and sleep on PATH and a scope built from files alone, so no Dolt, no bd and no host service are involved"
-migration_target = "P0.4b"
-expires = "2026-10-31"
-
-[[medium]]
 package_dir = "internal/runtime/herdr"
 package_name = "herdr"
 owner = "TestServerAliveRejectsStaleSocket"
@@ -439,17 +439,6 @@ expires = "2026-10-31"
 [[medium]]
 package_dir = "scripts"
 package_name = "scripts_test"
-owner = "TestMolScopedWorkTeardownScript"
-resources = ["subprocess"]
-owner_bead = "pl-4k0"
-invariant = "the mol-scoped-work cleanup-worktree behavior proof is a checked Medium subprocess owner"
-resource_owner = "the one bash subprocess is confined to TestMolScopedWorkTeardownScript, which runs scripts/test-mol-scoped-work-teardown.sh: the step under test is agent-executed shell rendered from formula TOML, so only running that shell against a stub gc can prove what it does"
-migration_target = "P0.4b"
-expires = "2026-10-31"
-
-[[medium]]
-package_dir = "scripts"
-package_name = "scripts_test"
 owner = "TestFreshMergeActionBehaviour"
 resources = ["subprocess"]
 owner_bead = "ga-cp3hwi"
@@ -477,6 +466,17 @@ resources = ["subprocess"]
 owner_bead = "ga-cp3hwi"
 invariant = "the CI Go module cache verification proof is a checked Medium subprocess owner"
 resource_owner = "the go and bash subprocesses are confined to TestGoModVerifyCacheDetectsTamperedModules, which exists to run .github/scripts/go-mod-download-retry.sh and .github/scripts/go-mod-verify-cache.sh with the real go command against a file:// module proxy and an isolated module cache, then tamper with the cached zip: the claim under test is the go command's own trust of a cached .ziphash, so only the real go command can prove the verify step catches what it accepts"
+migration_target = "P0.4b"
+expires = "2026-10-31"
+
+[[medium]]
+package_dir = "scripts"
+package_name = "scripts_test"
+owner = "TestMolScopedWorkTeardownScript"
+resources = ["subprocess"]
+owner_bead = "pl-4k0"
+invariant = "the mol-scoped-work cleanup-worktree behavior proof is a checked Medium subprocess owner"
+resource_owner = "the one bash subprocess is confined to TestMolScopedWorkTeardownScript, which runs scripts/test-mol-scoped-work-teardown.sh: the step under test is agent-executed shell rendered from formula TOML, so only running that shell against a stub gc can prove what it does"
 migration_target = "P0.4b"
 expires = "2026-10-31"
 
