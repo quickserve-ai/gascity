@@ -912,3 +912,71 @@ func TestListOverlaySkipsBeadsThatCannotCarryLiveness(t *testing.T) {
 		}
 	}
 }
+
+// orderedReadyBacking answers bounded ready reads the way an ordered store
+// does (beads.OrderedReadyReader, ordered=true), so the policy store's bounded
+// path is the one read, not its whole-set fallback.
+type orderedReadyBacking struct{ *beads.MemStore }
+
+func (s orderedReadyBacking) ReadyOrdered(query beads.ReadyQuery, _ beads.ReadyOrder) ([]beads.Bead, bool, error) {
+	rows, err := s.MemStore.Ready(query)
+	return rows, true, err
+}
+
+// TestLivenessOverlayOnReadyOrderedMatchesReady: ReadyOrdered, bounded or not,
+// overlays session liveness exactly as Ready does, and keeps the ordered report
+// of the read underneath (counsel-astra round 1 on fork PR #302: upstream's
+// bounded ready read bypassed the ga-lys454 overlay that Ready applies).
+func TestLivenessOverlayOnReadyOrderedMatchesReady(t *testing.T) {
+	backing := orderedReadyBacking{MemStore: beads.NewMemStore()}
+	lv := liveness.NewMemStore()
+	store := wrapStoreWithBeadPolicies(backing, &config.City{}, newLivenessBindingForTest(lv, liveness.ModeTable))
+	// Committed straight to the backing store, so "state" is committed metadata
+	// the overlay must shadow.
+	work, err := backing.Create(beads.Bead{Title: "work", Type: "task", Metadata: map[string]string{"state": "active"}})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := lv.SetBatch(context.Background(), work.ID, map[string]string{"state": "asleep"}); err != nil {
+		t.Fatalf("liveness SetBatch: %v", err)
+	}
+	stateOf := func(rows []beads.Bead) string {
+		for _, b := range rows {
+			if b.ID == work.ID {
+				return b.Metadata["state"]
+			}
+		}
+		return "<absent>"
+	}
+
+	ready, err := store.Ready()
+	if err != nil {
+		t.Fatalf("Ready: %v", err)
+	}
+	if got := stateOf(ready); got != "asleep" {
+		t.Fatalf("Ready state = %q, want the liveness value", got)
+	}
+	reader, ok := store.(beads.OrderedReadyReader)
+	if !ok {
+		t.Fatalf("%T does not forward ReadyOrdered", store)
+	}
+	for _, tc := range []struct {
+		name        string
+		limit       int
+		wantOrdered bool
+	}{
+		{name: "bounded read cut by the inner store", limit: 1, wantOrdered: true},
+		{name: "unbounded read takes the whole-set path", limit: 0, wantOrdered: false},
+	} {
+		rows, ordered, err := reader.ReadyOrdered(beads.ReadyQuery{Limit: tc.limit}, beads.ReadyOrderCanonical)
+		if err != nil {
+			t.Fatalf("%s: ReadyOrdered: %v", tc.name, err)
+		}
+		if ordered != tc.wantOrdered {
+			t.Errorf("%s: ordered = %v, want %v", tc.name, ordered, tc.wantOrdered)
+		}
+		if got, want := stateOf(rows), stateOf(ready); got != want {
+			t.Errorf("%s: ReadyOrdered state = %q, want %q as Ready reads it", tc.name, got, want)
+		}
+	}
+}
