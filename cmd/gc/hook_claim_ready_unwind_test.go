@@ -169,7 +169,7 @@ func TestHookClaimUnwindFallbackReleaseGetsItsOwnDeadline(t *testing.T) {
 	if got.Status != "open" {
 		t.Fatalf("after a timed-out restore: status=%q assignee=%q, want the fallback release to land (open); stderr=%s", got.Status, got.Assignee, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "bd update "+seeded.ID+" --assignee \""+seat+"\"") {
+	if !strings.Contains(stderr.String(), "bd update "+seeded.ID+" --status open --assignee \""+seat+"\"") {
 		t.Fatalf("stderr does not name the lost owner's recovery; stderr=%s", stderr.String())
 	}
 }
@@ -248,7 +248,7 @@ func TestHookClaimUnwindRestoreLostFallsBackToRelease(t *testing.T) {
 	if got.Status != "open" || got.Assignee != "" {
 		t.Fatalf("after a lost restore: status=%q assignee=%q, want the fallback release (open, unassigned)", got.Status, got.Assignee)
 	}
-	for _, want := range []string{errHookClaimRestoreLost.Error(), "bd update " + seeded.ID + " --assignee \"" + seat + "\""} {
+	for _, want := range []string{errHookClaimRestoreLost.Error(), "bd update " + seeded.ID + " --status open --assignee \"" + seat + "\""} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Fatalf("stderr missing %q; stderr=%s", want, stderr.String())
 		}
@@ -775,6 +775,39 @@ func TestHookClaimUnwindUnreadableAfterFailedRestoreIsUnresolved(t *testing.T) {
 	}
 	if strings.Contains(out, "no longer ours") {
 		t.Fatalf("an unreadable bead was reported as no longer ours; stderr=%s", out)
+	}
+}
+
+// TestHookClaimUnwindMovedAfterFailedRestoreIsNamed: a restore that failed, a
+// fallback release that ERRORED, and a re-read that finds the bead under
+// another seat. The unwind names the move it read, not only the release error.
+func TestHookClaimUnwindMovedAfterFailedRestoreIsNamed(t *testing.T) {
+	const seat = "gc__role-mc-sess1"
+	store := beads.NewMemStore()
+	seeded, err := store.Create(beads.Bead{Title: "pre-assigned", Status: "open", Assignee: seat})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ops := readyUnwindOps(t, store, seeded.ID)
+	ops.Restore = func(context.Context, string, []string, string, string, string) (bool, error) {
+		return false, context.DeadlineExceeded
+	}
+	// Another seat takes the bead while the release is failing.
+	ops.Release = func(_ context.Context, _ string, _ []string, beadID, _ string) (bool, error) {
+		if err := unwindSetAssignee(store, "other-seat")(beadID); err != nil {
+			t.Fatal(err)
+		}
+		return false, errors.New("release timed out")
+	}
+	var stderr bytes.Buffer
+	if code := doHookClaim("query", "/rig", poolClaimOpts(), ops, brokenPipeWriter{}, &stderr); code != 1 {
+		t.Fatalf("code = %d, want 1; stderr=%s", code, stderr.String())
+	}
+	out := stderr.String()
+	for _, want := range []string{"undelivered claim " + seeded.ID + " was no longer ours to release: a re-read finds it in_progress under \"other-seat\"", "release timed out"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("stderr missing %q; stderr=%s", want, out)
+		}
 	}
 }
 

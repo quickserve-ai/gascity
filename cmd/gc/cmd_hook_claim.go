@@ -1596,28 +1596,31 @@ func unwindUndeliveredHookClaim(reason, cause string, bead beads.Bead, priorAssi
 		return ops.Restore(ctx, dir, opts.Env, bead.ID, assignee, prior)
 	}
 	// reRead classifies the bead from a fresh read after a failed restore whose
-	// fallback release did not land. It never decides that the bead moved
-	// without having read it.
-	reRead := func(prior string) (hookUnwindReRead, error) {
+	// fallback release did not land, and returns what it read. It never
+	// decides that the bead moved without having read it.
+	reRead := func(prior string) (hookUnwindReRead, beads.Bead, error) {
 		if ops.ReadWorkMeta == nil {
-			return hookUnwindReReadUnresolved, errors.New("no read seam reaches this ledger")
+			return hookUnwindReReadUnresolved, beads.Bead{}, errors.New("no read seam reaches this ledger")
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), hookClaimMutationTimeout)
 		defer cancel()
 		current, readErr := ops.ReadWorkMeta(ctx, dir, opts.Env, bead.ID, assignee)
 		switch {
 		case readErr != nil:
-			return hookUnwindReReadUnresolved, readErr
+			return hookUnwindReReadUnresolved, current, readErr
 		case strings.EqualFold(strings.TrimSpace(current.Status), "open") && strings.TrimSpace(current.Assignee) == prior:
-			return hookUnwindReReadPriorOwner, nil
+			return hookUnwindReReadPriorOwner, current, nil
 		case strings.EqualFold(strings.TrimSpace(current.Status), "in_progress") && strings.TrimSpace(current.Assignee) == assignee:
-			return hookUnwindReReadStillHeld, nil
+			return hookUnwindReReadStillHeld, current, nil
 		default:
-			return hookUnwindReReadMoved, nil
+			return hookUnwindReReadMoved, current, nil
 		}
 	}
 	verdict := hookUnwindReReadNone
-	var reReadErr error
+	var (
+		reReadBead beads.Bead
+		reReadErr  error
+	)
 	prior := strings.TrimSpace(priorAssignee)
 	var (
 		released   bool
@@ -1643,7 +1646,7 @@ func unwindUndeliveredHookClaim(reason, cause string, bead beads.Bead, priorAssi
 			// bumped the revision the restore is fenced on, so no restore can
 			// still land after this read.
 			if !released {
-				verdict, reReadErr = reRead(prior)
+				verdict, reReadBead, reReadErr = reRead(prior)
 			}
 		}
 	}
@@ -1666,12 +1669,17 @@ func unwindUndeliveredHookClaim(reason, cause string, bead beads.Bead, priorAssi
 		// this session, and nothing in this process will give it back.
 		fmt.Fprintf(stderr, "gc hook --claim: undelivered claim %s is still in_progress under this claim (%q): neither the restore (%v) nor the fallback release (%s) landed; recover with: bd update %s --status open --assignee %q\n", bead.ID, assignee, restoreErr, describeHookFallbackRelease(err), bead.ID, prior) //nolint:errcheck
 		return 1
+	case hookUnwindReReadMoved:
+		// The read answered: the bead is neither ours nor back with its
+		// pre-claim owner. Someone else changed it, and it is theirs to keep.
+		fmt.Fprintf(stderr, "gc hook --claim: undelivered claim %s was no longer ours to release: a re-read finds it %s under %q (restore: %v; fallback release: %s)\n", bead.ID, reReadBead.Status, reReadBead.Assignee, restoreErr, describeHookFallbackRelease(err)) //nolint:errcheck
+		return 1
 	case hookUnwindReReadUnresolved:
 		fmt.Fprintf(stderr, "gc hook --claim: unresolved: could not re-read %s: %v; check it (restore: %v; fallback release: %s; if it is still in_progress under %q, recover with: bd update %s --status open --assignee %q)\n", bead.ID, reReadErr, restoreErr, describeHookFallbackRelease(err), assignee, bead.ID, prior) //nolint:errcheck
 		return 1
 	}
 	if restoreErr != nil && released && err == nil {
-		fmt.Fprintf(stderr, "gc hook --claim: could not hand undelivered claim %s back to its pre-claim assignee %q (%v); released it unassigned instead (recover with: bd update %s --assignee %q)\n", bead.ID, prior, restoreErr, bead.ID, prior) //nolint:errcheck
+		fmt.Fprintf(stderr, "gc hook --claim: could not hand undelivered claim %s back to its pre-claim assignee %q (%v); released it unassigned instead (recover with: bd update %s --status open --assignee %q)\n", bead.ID, prior, restoreErr, bead.ID, prior) //nolint:errcheck
 	}
 	switch {
 	case err != nil:
