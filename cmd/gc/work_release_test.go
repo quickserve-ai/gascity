@@ -41,6 +41,31 @@ func TestReleasePoliciesTable(t *testing.T) {
 	}
 }
 
+// TestEveryReleasePolicyHasAnAuditPath: every path with a release policy (the
+// table above pins that set) labels its audit line and the proposal a withheld
+// release stamps (gc.release_proposed_path), and no two paths share a label. A
+// path with no label wrote an empty proposed path (the work ladder's did, fork
+// PR #302 review).
+func TestEveryReleasePolicyHasAnAuditPath(t *testing.T) {
+	seen := map[string]releaseWhy{}
+	for why := range releasePolicies {
+		label := releaseAuditPaths[why]
+		if strings.TrimSpace(label) == "" {
+			t.Errorf("release path %d has a policy but no audit path label", why)
+			continue
+		}
+		if other, dup := seen[label]; dup {
+			t.Errorf("release paths %d and %d share the audit path label %q", other, why, label)
+		}
+		seen[label] = why
+	}
+	for why := range releaseAuditPaths {
+		if _, ok := releasePolicies[why]; !ok {
+			t.Errorf("audit path label for release path %d, which has no release policy", why)
+		}
+	}
+}
+
 // strandCase is one row of NEW-5's strand table (mc-zndi7.87): a claim no
 // lane would serve once released, except "served", the control.
 type strandCase struct {
