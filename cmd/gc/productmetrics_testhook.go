@@ -25,6 +25,9 @@ const (
 	taggedProductMetricsCAFileEnvironment   = "GC_PRODUCT_METRICS_TESTHOOK_CA_FILE"
 	taggedProductMetricsMaximumCABytes      = 64 * 1024
 	taggedProductMetricsReleaseVersion      = "0.31.0"
+	// taggedProductMetricsStateLockWait is the real ceiling on the tagged
+	// binary's state-lock wait, matching the house per-process test deadline.
+	taggedProductMetricsStateLockWait = 10 * time.Second
 )
 
 func configuredPrivateProductMetricsRunner() privateProductMetricsRunFunc {
@@ -66,22 +69,39 @@ func openProductMetricsTesthookService() (*productmetrics.Service, error) {
 	if !roots.AppendCertsFromPEM(certificatePEM) {
 		return nil, errors.New("product metrics testhook CA file has no certificate")
 	}
-	// Keep the tagged process contract independent of scheduler time spent
-	// inside RecordOnce's production 50 ms best-effort decision window.
+	options := productMetricsTesthookOptions(endpoint, roots)
+	options.Home = gchome.ResolveReadOnly()
+	return productmetrics.OpenTesthook(options)
+}
+
+// productMetricsTesthookOptions builds the tagged service's options with one
+// clock model. The clock is frozen so scheduler time spent inside RecordOnce's
+// production 50 ms best-effort decision window cannot break the process
+// contract, and the state-lock wait follows that frozen clock: RecordOnce
+// hands its lock a deadline of the window's remaining budget, which a frozen
+// clock always reports as the full 50 ms, and the production builder turns
+// that into a live 50 ms wall-clock timer. On a loaded runner, opening,
+// validating and flocking state.lock can take longer than that, the record
+// drops, and "gc help" leaves the queue empty (pl-7sm). The lock wait here is
+// instead bounded by a fixed real ceiling, so a lock that is genuinely stuck
+// still drops the record rather than hanging the child.
+func productMetricsTesthookOptions(endpoint string, roots *x509.CertPool) productmetrics.TesthookOptions {
 	now := time.Now()
-	return productmetrics.OpenTesthook(productmetrics.TesthookOptions{
-		Home:           gchome.ResolveReadOnly(),
+	return productmetrics.TesthookOptions{
 		ReleaseVersion: taggedProductMetricsReleaseVersion,
 		MetricsEpoch:   1,
 		NoticeVersion:  1,
 		NoticeText:     []byte("Gas City product metrics test-only notice."),
 		Endpoint:       endpoint,
 		Now:            func() time.Time { return now },
+		WithDeadline: func(parent context.Context, _ time.Duration) (context.Context, context.CancelFunc) {
+			return context.WithTimeout(parent, taggedProductMetricsStateLockWait)
+		},
 		Client: &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 			RootCAs:    roots,
 		}}},
-	})
+	}
 }
 
 func validateProductMetricsTesthookEndpoint(raw string) error {
