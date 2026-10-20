@@ -305,9 +305,9 @@ func TestCmdSessionCloseWithoutConfigRefusesOnlyOverClaims(t *testing.T) {
 	}
 }
 
-// configLessCloseCity is a file-store city whose config does not load, and
-// its store, opened before the config broke.
-func configLessCloseCity(t *testing.T) (string, beads.Store) {
+// configLessCloseCity is the store of a file-store city whose config does not
+// load, opened before the config broke.
+func configLessCloseCity(t *testing.T) beads.Store {
 	t.Helper()
 	cityDir := t.TempDir()
 	writePhase0InterfaceCity(t, cityDir, "[workspace]\nname = \"test-city\"\n\n[beads]\nprovider = \"file\"\n")
@@ -320,7 +320,7 @@ func configLessCloseCity(t *testing.T) (string, beads.Store) {
 		t.Fatal(err)
 	}
 	appendCityTOML(t, cityDir, "\n[[[not toml\n")
-	return cityDir, store
+	return store
 }
 
 // A config-less close refuses while the seat holds a claim under its alias
@@ -330,7 +330,7 @@ func configLessCloseCity(t *testing.T) (string, beads.Store) {
 func TestCmdSessionCloseWithoutConfigRefusesOverAliasHeldClaims(t *testing.T) {
 	for name, assignee := range map[string]string{"current alias": "test-city/furiosa", "prior alias": "test-city/nux"} {
 		t.Run(name, func(t *testing.T) {
-			_, store := configLessCloseCity(t)
+			store := configLessCloseCity(t)
 			seat, err := store.Create(beads.Bead{Title: "worker", Type: session.BeadType, Labels: []string{session.LabelSession}, Metadata: map[string]string{
 				"session_name": "worker-1", "template": "worker", "state": "asleep",
 				"alias": "test-city/furiosa", "alias_history": "test-city/nux",
@@ -365,7 +365,7 @@ func TestCmdSessionCloseWithoutConfigRefusesOverAliasHeldClaims(t *testing.T) {
 // stderr and on the bead that rig stores went unchecked: without the config
 // they cannot be found (ga-9z2363).
 func TestCmdSessionCloseWithoutConfigSaysRigStoresWentUnchecked(t *testing.T) {
-	_, store := configLessCloseCity(t)
+	store := configLessCloseCity(t)
 	seat, err := store.Create(beads.Bead{Title: "worker", Type: session.BeadType, Labels: []string{session.LabelSession}, Metadata: map[string]string{
 		"session_name": "worker-1", "template": "worker", "state": "asleep", "alias": "test-city/furiosa",
 	}})
