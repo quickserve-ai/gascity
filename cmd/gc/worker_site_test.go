@@ -2071,9 +2071,9 @@ func TestWorkerSiteRestartWithoutItsMarkerRequestsNothing(t *testing.T) {
 // TestWorkerSiteHandoffRecordsTheRestart: a self handoff on a worker site sends
 // its mail and records the restart as the bead marker, the one restart signal a
 // box can leave for the remote controller, and its poke is the worker-site
-// notice. For a named session the controller does not restart, the handoff
-// keeps its mail and clears a stale marker from the bead; the guard holds no
-// runtime flag to clear.
+// notice. An on-demand configured named session cycles on a self-handoff too
+// (ga-cctcju: the seat asking to be cycled is the authorization), so on a
+// worker site it gets the same recorded restart, not upstream's skip.
 func TestWorkerSiteHandoffRecordsTheRestart(t *testing.T) {
 	for _, tc := range workerSiteRestartSeeds {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2099,11 +2099,13 @@ func TestWorkerSiteHandoffRecordsTheRestart(t *testing.T) {
 			}
 		})
 	}
-	t.Run("named session the controller does not restart", func(t *testing.T) {
+	// The seed carries no restart marker, so the marker the assertion finds
+	// is the one this handoff recorded. Off a worker site the same rule is
+	// TestDoHandoff_OnDemandNamedSessionRequestsRestart's.
+	t.Run("on-demand named session cycles too (ga-cctcju)", func(t *testing.T) {
 		cityDir, _ := newWorkerSiteSessionCity(t, map[string]string{
 			"state": "awake", "alias": "worker",
 			"configured_named_session": "true", "configured_named_mode": "on_demand",
-			"restart_requested": "true", "continuation_reset_pending": "true",
 		})
 		t.Setenv("GC_ALIAS", "worker")
 		t.Setenv("GC_SESSION_NAME", "worker-1")
@@ -2114,15 +2116,13 @@ func TestWorkerSiteHandoffRecordsTheRestart(t *testing.T) {
 		if code := cmdHandoffWithFrom([]string{"HANDOFF: context full"}, "", "", false, "", false, &stdout, &stderr); code != 0 {
 			t.Fatalf("gc handoff = %d on a worker site, want 0; stderr=%s", code, stderr.String())
 		}
-		if !strings.Contains(stdout.String(), "restart skipped") {
-			t.Fatalf("stdout = %q, want the skipped restart", stdout.String())
+		if !strings.Contains(stdout.String(), "requesting restart") || strings.Contains(stdout.String(), "restart skipped") {
+			t.Fatalf("stdout = %q, want the restart request, not a skip", stdout.String())
 		}
+		assertWorkerSitePokeNotice(t, stderr.String())
 		assertNoControllerReached(t, dials, accepted)
 		ledger := localLedger(t, cityDir)
-		all := sessionBeadsIn(t, ledger)
-		if len(all) != 1 || all[0].Metadata["restart_requested"] != "" || all[0].Metadata["continuation_reset_pending"] != "" {
-			t.Fatalf("the stale restart marker was not cleared: %+v", all)
-		}
+		assertRestartMarkerRecorded(t, sessionBeadsIn(t, ledger))
 		if got := messageBeadsIn(t, ledger); len(got) != 1 {
 			t.Fatalf("handoff mail beads = %d, want one: %+v", len(got), got)
 		}
