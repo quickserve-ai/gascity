@@ -754,9 +754,14 @@ func primeSeatForHook(cityPath, cityName, agentName string, a *config.Agent, cfg
 }
 
 // fitPrimeHookInjection applies primeHookFitContext to a prompt and its hook
-// injection.
+// injection; a suffix that is not delivered does not run its after-delivery
+// step, so a handoff it carries is not consumed.
 func fitPrimeHookInjection(seat primeHookSeat, prompt string, suppressPrompt bool, injection primeHookContextInjection, stderr io.Writer) (string, primeHookContextInjection) {
-	prompt, injection.text = primeHookFitContext(seat, prompt, suppressPrompt, injection.text, stderr)
+	var delivered bool
+	prompt, injection.text, delivered = primeHookFitContext(seat, prompt, suppressPrompt, injection.text, stderr)
+	if !delivered {
+		injection.afterDelivery = nil
+	}
 	return prompt, injection
 }
 

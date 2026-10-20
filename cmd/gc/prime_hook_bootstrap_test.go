@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -143,50 +144,149 @@ func fitTestDelivered(seat primeHookSeat, prompt string, suppress bool, suffix s
 	return prependHookBeacon(seat.cityName, seat.agentName, prompt) + suffix
 }
 
-// TestPrimeHookFitContextOversizedPrompt covers a capped seat's oversized
-// prompt (written to its file, bootstrap under the limit), an unwritable
-// runtime directory (a bounded notice to capture `gc prime`), and the cases
-// that change nothing: an uncapped provider, a suppressed prompt.
-func TestPrimeHookFitContextOversizedPrompt(t *testing.T) {
+// TestPrimeHookFitContextBoundsEveryBranch covers the complete delivered
+// context staying under the limit: an oversized prompt, an oversized
+// assignment beside it, an oversized assignment on a launched seat whose
+// prompt is suppressed, and an unwritable runtime directory.
+func TestPrimeHookFitContextBoundsEveryBranch(t *testing.T) {
 	big := strings.Repeat("doctrine line\n", 2000)
-	const step = "\n\nstep: small"
+	bigStep := "\n\n## Current step\n" + strings.Repeat("assignment detail\n", 1000)
+	for _, tc := range []struct {
+		name, prompt, suffix string
+		suppress             bool
+		wantPrompt, wantStep bool // files written
+		wantInline           bool // suffix delivered in the context itself
+	}{
+		{name: "oversized prompt", prompt: big, suffix: "\n\nstep: small", wantPrompt: true, wantInline: true},
+		{name: "oversized prompt and assignment", prompt: big, suffix: bigStep, wantPrompt: true, wantStep: true},
+		{name: "suppressed prompt, oversized assignment", prompt: big, suffix: bigStep, suppress: true, wantStep: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			seat := fitTestSeat(t)
+			var stderr bytes.Buffer
+			prompt, suffix, delivered := primeHookFitContext(seat, tc.prompt, tc.suppress, tc.suffix, &stderr)
+			ctx := fitTestDelivered(seat, prompt, tc.suppress, suffix)
+			if !delivered || len(ctx) >= primeHookContextLimit {
+				t.Fatalf("delivered=%v, context %d bytes; want delivered under %d (stderr %q)", delivered, len(ctx), primeHookContextLimit, stderr.String())
+			}
+			if got, ok := fitTestFile(t, seat, primeHookPromptFileName); ok != tc.wantPrompt || (ok && got != tc.prompt) {
+				t.Errorf("prompt file present=%v (want %v) or content differs", ok, tc.wantPrompt)
+			}
+			if got, ok := fitTestFile(t, seat, primeHookContextFileName); ok != tc.wantStep || (ok && got != tc.suffix) {
+				t.Errorf("context file present=%v (want %v) or content differs", ok, tc.wantStep)
+			}
+			if strings.Contains(ctx, tc.suffix) != tc.wantInline {
+				t.Errorf("suffix inline = %v, want %v", !tc.wantInline, tc.wantInline)
+			}
+		})
+	}
+
+	t.Run("write failure", func(t *testing.T) {
+		seat := fitTestSeat(t)
+		writePrimeHookTestFile(t, filepath.Join(seat.cityPath, ".gc"), "not a dir")
+		for _, suffix := range []string{"\n\nstep: small", bigStep} {
+			var stderr bytes.Buffer
+			prompt, got, delivered := primeHookFitContext(seat, big, false, suffix, &stderr)
+			ctx := fitTestDelivered(seat, prompt, false, got)
+			if len(ctx) >= primeHookContextLimit || !strings.Contains(ctx, "gc prime worker >") {
+				t.Fatalf("failure context is %d bytes or lacks the capture command:\n%.600s", len(ctx), ctx)
+			}
+			if wantDelivered := suffix != bigStep; delivered != wantDelivered || strings.Contains(ctx, suffix) != wantDelivered {
+				t.Fatalf("suffix %d bytes: delivered=%v, want %v", len(suffix), delivered, wantDelivered)
+			}
+			if !strings.Contains(stderr.String(), "could not be written") {
+				t.Fatalf("stderr = %q, want the write failure reported", stderr.String())
+			}
+		}
+	})
+}
+
+// TestPrimeHookFitContextFiles covers what the seat directory holds: an
+// uncapped provider and a fitting prompt write nothing, a later fitting
+// prompt removes the files an earlier oversized one left, distinct session
+// names never share a directory, and concurrent hooks leave one whole file.
+func TestPrimeHookFitContextFiles(t *testing.T) {
+	big := strings.Repeat("doctrine line\n", 2000)
 	var stderr bytes.Buffer
 
 	seat := fitTestSeat(t)
-	prompt, suffix := primeHookFitContext(seat, big, false, step, &stderr)
-	ctx := fitTestDelivered(seat, prompt, false, suffix)
-	if len(ctx) >= primeHookContextLimit || !strings.HasSuffix(ctx, step) {
-		t.Fatalf("context %d bytes (want under %d) or step not delivered (stderr %q)", len(ctx), primeHookContextLimit, stderr.String())
+	seat.capped = false
+	if p, s, _ := primeHookFitContext(seat, big, false, "x", &stderr); p != big || s != "x" {
+		t.Fatal("uncapped provider: prompt or suffix changed")
 	}
-	if got, ok := fitTestFile(t, seat, primeHookPromptFileName); !ok || got != big {
-		t.Fatalf("prompt file present=%v or content differs", ok)
+	if _, err := os.Stat(filepath.Join(seat.cityPath, ".gc")); !os.IsNotExist(err) {
+		t.Fatalf("uncapped provider wrote state (stat err %v)", err)
 	}
 
-	for _, tc := range []struct {
-		name     string
-		capped   bool
-		suppress bool
-	}{{"uncapped provider", false, false}, {"suppressed prompt", true, true}} {
-		seat := fitTestSeat(t)
-		seat.capped = tc.capped
-		if p, s := primeHookFitContext(seat, big, tc.suppress, step, &stderr); p != big || s != step {
-			t.Fatalf("%s: prompt or suffix changed", tc.name)
-		}
-		if _, err := os.Stat(filepath.Join(seat.cityPath, ".gc")); !os.IsNotExist(err) {
-			t.Fatalf("%s wrote state (stat err %v)", tc.name, err)
+	seat.capped = true
+	primeHookFitContext(seat, big, false, "\n\n"+big, &stderr)
+	if _, ok := fitTestFile(t, seat, primeHookContextFileName); !ok {
+		t.Fatal("oversized hook wrote no context file")
+	}
+	if p, s, _ := primeHookFitContext(seat, "short\n", false, "", &stderr); p != "short\n" || s != "" {
+		t.Fatalf("fitting prompt changed: %q %q", p, s)
+	}
+	for _, name := range []string{primeHookPromptFileName, primeHookContextFileName} {
+		if _, ok := fitTestFile(t, seat, name); ok {
+			t.Errorf("stale %s left after a fitting prompt", name)
 		}
 	}
 
-	seat = fitTestSeat(t)
-	writePrimeHookTestFile(t, filepath.Join(seat.cityPath, ".gc"), "not a dir")
-	stderr.Reset()
-	prompt, suffix = primeHookFitContext(seat, big, false, step, &stderr)
-	ctx = fitTestDelivered(seat, prompt, false, suffix)
-	if len(ctx) >= primeHookContextLimit || !strings.Contains(ctx, "gc prime worker >") || !strings.HasSuffix(ctx, step) {
-		t.Fatalf("failure context is %d bytes or lacks the capture command or the step:\n%.600s", len(ctx), ctx)
+	a, errA := primeHookSeatDir("/city", "a/b")
+	b, errB := primeHookSeatDir("/city", "a--b")
+	if errA != nil || errB != nil || a == b || filepath.Dir(a) != filepath.Dir(b) {
+		t.Fatalf("session dirs a/b=%q a--b=%q (errs %v %v): want distinct siblings", a, b, errA, errB)
 	}
-	if !strings.Contains(stderr.String(), "could not be written") {
-		t.Fatalf("stderr = %q, want the write failure reported", stderr.String())
+	for _, name := range []string{"", ".", ".."} {
+		if _, err := primeHookSeatDir("/city", name); err == nil {
+			t.Errorf("primeHookSeatDir(%q) succeeded, want error", name)
+		}
+	}
+
+	prompts := make([]string, 8)
+	var wg sync.WaitGroup
+	for i := range prompts {
+		prompts[i] = strings.Repeat(fmt.Sprintf("writer %d line\n", i), 1000)
+		wg.Add(1)
+		go func(p string) {
+			defer wg.Done()
+			primeHookFitContext(seat, p, false, "", &bytes.Buffer{})
+		}(prompts[i])
+	}
+	wg.Wait()
+	got, _ := fitTestFile(t, seat, primeHookPromptFileName)
+	whole := false
+	for _, p := range prompts {
+		whole = whole || got == p
+	}
+	if !whole {
+		t.Fatalf("after concurrent hooks the prompt file (%d bytes) is no writer's whole prompt", len(got))
+	}
+}
+
+// TestPrimeHookFitContextRefusesSymlinkedAncestor: a symlink anywhere below
+// the city root (here .gc/sessions) must not redirect the write, or the
+// stale-file removal, outside it.
+func TestPrimeHookFitContextRefusesSymlinkedAncestor(t *testing.T) {
+	seat := fitTestSeat(t)
+	outside := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(seat.cityPath, ".gc"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(seat.cityPath, ".gc", "sessions")); err != nil {
+		t.Fatal(err)
+	}
+	victim := filepath.Join(outside, "gastown--worker", primeHookPromptFileName)
+	writePrimeHookTestFile(t, victim, "not the city's file")
+
+	var stderr bytes.Buffer
+	prompt, suffix, _ := primeHookFitContext(seat, strings.Repeat("doctrine line\n", 2000), false, "", &stderr)
+	if !strings.Contains(stderr.String(), "is a symlink") || !strings.Contains(prompt+suffix, "gc prime worker >") {
+		t.Fatalf("write through a symlinked ancestor was not refused: stderr=%q", stderr.String())
+	}
+	primeHookFitContext(seat, "short\n", false, "", &stderr)
+	if got, err := os.ReadFile(victim); err != nil || string(got) != "not the city's file" {
+		t.Fatalf("file outside the city was changed or removed: %q, %v", got, err)
 	}
 }
 
