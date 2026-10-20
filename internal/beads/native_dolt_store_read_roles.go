@@ -176,11 +176,22 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
 		}
 		var beads []Bead
 		seen := make(map[string]bool)
-		for _, req := range plan {
+		reqs := plan
+		for i := 0; i < len(reqs); i++ {
+			req := reqs[i]
 			if req.IssueType != "" && s.typePushdownOff.Load() {
 				req.IssueType = ""
 			}
 			page, err := s.listPlanRequest(ctx, reader, req, &tally)
+			if err != nil && req.IDFilter != "" && nativeListIDsRefused(err) {
+				// The backend refuses IDFilter (before any round trip): read the
+				// unfiltered set once and let ApplyListQuery apply the ids.
+				unfiltered := req
+				unfiltered.IDFilter = ""
+				reqs, i, beads = []issueops.ListRequest{unfiltered}, -1, beads[:0]
+				clear(seen)
+				continue
+			}
 			if err != nil {
 				return err
 			}
@@ -193,7 +204,7 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
 					}
 					return err
 				}
-				if len(plan) > 1 {
+				if len(reqs) > 1 {
 					if seen[bead.ID] {
 						continue
 					}
@@ -202,7 +213,7 @@ func (s *NativeDoltStore) List(query ListQuery) ([]Bead, error) {
 				beads = append(beads, bead)
 			}
 		}
-		if len(plan) > 1 && query.Sort == SortDefault {
+		if len(reqs) > 1 && query.Sort == SortDefault {
 			// One request answers in the backend's default order, and an
 			// unsorted Limit keeps that order's prefix. A union of several is
 			// put back into it, so the prefix ApplyListQuery keeps is the one
@@ -826,7 +837,10 @@ func nativeListLimitPushdown(query ListQuery) int {
 	}
 	// SeekAfter, UpdatedBefore and plural Assignees are Go-side too
 	// (ListQuery.Matches), and each is a residual filter for the same reason.
-	if query.SeekAfter != nil || !query.UpdatedBefore.IsZero() || len(query.Assignees) > 0 {
+	// So are ids: chunked into IDFilter they are exact, but a backend that
+	// refuses IDFilter is read unfiltered, and a limit there would cut the
+	// ledger's first rows before the ids are applied.
+	if query.SeekAfter != nil || !query.UpdatedBefore.IsZero() || len(query.Assignees) > 0 || len(query.IDs) > 0 {
 		return 0
 	}
 	switch query.Sort {
