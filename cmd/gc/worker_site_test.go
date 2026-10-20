@@ -2084,7 +2084,7 @@ func TestWorkerSiteHandoffRecordsTheRestart(t *testing.T) {
 			dials := countSocketDials(t)
 
 			var stdout, stderr bytes.Buffer
-			if code := cmdHandoffWithForce([]string{"HANDOFF: context full"}, "", false, "", false, &stdout, &stderr); code != 0 {
+			if code := cmdHandoffWithFrom([]string{"HANDOFF: context full"}, "", "", false, "", false, &stdout, &stderr); code != 0 {
 				t.Fatalf("gc handoff = %d on a worker site, want 0; stderr=%s", code, stderr.String())
 			}
 			if !strings.Contains(stdout.String(), "requesting restart") {
@@ -2111,7 +2111,7 @@ func TestWorkerSiteHandoffRecordsTheRestart(t *testing.T) {
 		dials := countSocketDials(t)
 
 		var stdout, stderr bytes.Buffer
-		if code := cmdHandoffWithForce([]string{"HANDOFF: context full"}, "", false, "", false, &stdout, &stderr); code != 0 {
+		if code := cmdHandoffWithFrom([]string{"HANDOFF: context full"}, "", "", false, "", false, &stdout, &stderr); code != 0 {
 			t.Fatalf("gc handoff = %d on a worker site, want 0; stderr=%s", code, stderr.String())
 		}
 		if !strings.Contains(stdout.String(), "restart skipped") {
@@ -2186,7 +2186,7 @@ func TestWorkerSiteHandoffTargetRefusesBeforeWriting(t *testing.T) {
 
 	for _, target := range []string{sessionID, "no-such-session"} {
 		var stdout, stderr bytes.Buffer
-		if code := cmdHandoffWithForce([]string{"HANDOFF: context full"}, target, false, "", false, &stdout, &stderr); code != 1 {
+		if code := cmdHandoffWithFrom([]string{"HANDOFF: context full"}, target, "", false, "", false, &stdout, &stderr); code != 1 {
 			t.Fatalf("gc handoff --target %s on a worker site = %d, want 1; stdout=%q stderr=%q", target, code, stdout.String(), stderr.String())
 		}
 		if !strings.Contains(stderr.String(), errWorkerSiteHandoffTargetNeedsController.Error()) {
