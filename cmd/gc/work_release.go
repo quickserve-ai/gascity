@@ -135,6 +135,7 @@ var releaseAuditPaths = map[releaseWhy]string{
 	releaseStrandedRepair:   "stranded-pool-worker-repair",
 	releaseOrphan:           orphanReleaseAuditPath,
 	releaseRetired:          "retired-session-unclaim",
+	releaseLadder:           "work-ladder-unstarted-claim",
 	releaseDrainAckTeardown: drainAckTeardownReleasePath,
 }
 
