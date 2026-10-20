@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "next_id": 218,
+  "next_id": 219,
   "permanent_ids": [
     {
       "name": "help",
@@ -3660,7 +3660,7 @@
       "notice_policy": "eligible",
       "classification": "session-bind-cloud",
       "owner": "immediate",
-      "id": 217
+      "id": 218
     },
     {
       "path": "gc session close",
@@ -4874,5 +4874,11 @@
       "exclusion": "private-completion"
     }
   ],
-  "tombstones": []
+  "tombstones": [
+    {
+      "name": "agent-is-foreign-fork",
+      "id": 217,
+      "wire": "agent-is-foreign-fork"
+    }
+  ]
 }
