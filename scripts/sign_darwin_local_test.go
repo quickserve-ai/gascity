@@ -76,24 +76,90 @@ func TestSignDarwinLocalLeavesGoSignatureWhenNoIdentity(t *testing.T) {
 	}
 }
 
-func TestSignDarwinLocalDoesNotFallbackToAdhocWhenAutoSignFails(t *testing.T) {
+func TestSignDarwinLocalTriesNextIdentityWhenFirstFails(t *testing.T) {
 	env := newSignTestEnv(t, "Darwin")
-	env.securityOutput = "  1) 1234567890ABCDEF \"Apple Development: Example (TEAMID)\"\n"
+	env.securityOutput = strings.Join([]string{
+		"  1) 1111111111111111 \"GasCity Dev\" (CSSMERR_TP_NOT_TRUSTED)",
+		"  2) 2222222222222222 \"Apple Development: Expired (TEAMID)\" (CSSMERR_TP_CERT_EXPIRED)",
+		"",
+	}, "\n")
 
-	result := env.run(t, "CODESIGN_EXIT=1")
+	result := env.run(t, "CODESIGN_FAIL_IDENTITY=Apple Development: Expired (TEAMID)")
 	if result.err != nil {
 		t.Fatalf("sign-darwin-local.sh failed: %v\nstdout:\n%s\nstderr:\n%s", result.err, result.stdout, result.stderr)
 	}
 
 	log := env.readLog(t)
-	if strings.Count(log, "codesign") != 1 {
-		t.Fatalf("expected exactly one stable codesign attempt, got log:\n%s", log)
+	appleAt := strings.Index(log, "codesign\t--force\t--sign\tApple Development: Expired (TEAMID)\t")
+	devAt := strings.Index(log, "codesign\t--force\t--sign\tGasCity Dev\t--identifier\tcom.gascity.gc\t"+env.binary)
+	if appleAt < 0 || devAt < 0 || appleAt > devAt {
+		t.Fatalf("expected Apple Development attempt, then GasCity Dev, got log:\n%s", log)
 	}
 	if strings.Contains(log, "codesign\t--force\t--sign\t-\t") {
 		t.Fatalf("expected no ad-hoc fallback, got log:\n%s", log)
 	}
-	if !strings.Contains(result.stderr, "leaving Go linker signature unchanged") {
-		t.Fatalf("expected fallback guidance, got stderr:\n%s", result.stderr)
+	if !strings.Contains(result.stdout, "Signed gc with stable macOS identity: GasCity Dev") {
+		t.Fatalf("expected GasCity Dev to be reported as the signer, got stdout:\n%s", result.stdout)
+	}
+}
+
+func TestSignDarwinLocalTriesEveryIdentityMatchingAPattern(t *testing.T) {
+	env := newSignTestEnv(t, "Darwin")
+	env.securityOutput = strings.Join([]string{
+		"  1) 1111111111111111 \"Apple Development: Old (TEAMID)\"",
+		"  2) 2222222222222222 \"Apple Development: New (TEAMID)\"",
+		"",
+	}, "\n")
+
+	result := env.run(t, "CODESIGN_FAIL_IDENTITY=Apple Development: Old (TEAMID)")
+	if result.err != nil {
+		t.Fatalf("sign-darwin-local.sh failed: %v\nstdout:\n%s\nstderr:\n%s", result.err, result.stdout, result.stderr)
+	}
+	if !strings.Contains(result.stdout, "Signed gc with stable macOS identity: Apple Development: New (TEAMID)") {
+		t.Fatalf("expected the second Apple Development identity to sign, got stdout:\n%s\nlog:\n%s", result.stdout, env.readLog(t))
+	}
+}
+
+func TestSignDarwinLocalFailsNamingEveryIdentityWhenNoneSigns(t *testing.T) {
+	env := newSignTestEnv(t, "Darwin")
+	env.securityOutput = strings.Join([]string{
+		"  1) 1111111111111111 \"GasCity Dev\"",
+		"  2) 2222222222222222 \"Apple Development: Expired (TEAMID)\"",
+		"",
+	}, "\n")
+
+	result := env.run(t, "CODESIGN_EXIT=1")
+	if result.err == nil {
+		t.Fatalf("expected non-zero exit when no stable identity signs\nstdout:\n%s\nstderr:\n%s", result.stdout, result.stderr)
+	}
+
+	log := env.readLog(t)
+	if strings.Count(log, "codesign") != 2 {
+		t.Fatalf("expected one attempt per identity, got log:\n%s", log)
+	}
+	if strings.Contains(log, "codesign\t--force\t--sign\t-\t") {
+		t.Fatalf("expected no ad-hoc fallback, got log:\n%s", log)
+	}
+	for _, identity := range []string{"Apple Development: Expired (TEAMID)", "GasCity Dev"} {
+		if !strings.Contains(result.stderr, identity) {
+			t.Fatalf("expected failure message to name %q, got stderr:\n%s", identity, result.stderr)
+		}
+	}
+}
+
+func TestSignDarwinLocalIgnoresIdentitiesMatchingNoPattern(t *testing.T) {
+	env := newSignTestEnv(t, "Darwin")
+	env.securityOutput = "  1) 1111111111111111 \"Gas Town Local Dev\"\n     1 identities found\n"
+
+	result := env.run(t)
+	if result.err != nil {
+		t.Fatalf("sign-darwin-local.sh failed: %v\nstdout:\n%s\nstderr:\n%s", result.err, result.stdout, result.stderr)
+	}
+	if log := env.readLog(t); strings.Contains(log, "codesign") {
+		t.Fatalf("expected no codesign invocation, got log:\n%s", log)
+	}
+	if !strings.Contains(result.stdout, "No stable macOS signing identity found") {
+		t.Fatalf("expected no-identity guidance, got stdout:\n%s", result.stdout)
 	}
 }
 
@@ -182,7 +248,7 @@ func newSignTestEnv(t *testing.T, unameOutput string) *signTestEnv {
 
 	env.writeStub(t, "uname", "printf '%s\\n' "+shellQuote(unameOutput)+"\n")
 	env.writeStub(t, "security", "printf '%s' \"${SECURITY_OUTPUT:-}\"\n")
-	env.writeStub(t, "codesign", "printf 'codesign' >> \"$SIGN_LOG\"\nfor arg in \"$@\"; do printf '\\t%s' \"$arg\" >> \"$SIGN_LOG\"; done\nprintf '\\n' >> \"$SIGN_LOG\"\nexit \"${CODESIGN_EXIT:-0}\"\n")
+	env.writeStub(t, "codesign", "printf 'codesign' >> \"$SIGN_LOG\"\nfor arg in \"$@\"; do printf '\\t%s' \"$arg\" >> \"$SIGN_LOG\"; done\nprintf '\\n' >> \"$SIGN_LOG\"\nif [ -n \"${CODESIGN_FAIL_IDENTITY:-}\" ] && [ \"$3\" = \"$CODESIGN_FAIL_IDENTITY\" ]; then exit 1; fi\nexit \"${CODESIGN_EXIT:-0}\"\n")
 	env.writeStub(t, "xattr", "printf 'xattr' >> \"$SIGN_LOG\"\nfor arg in \"$@\"; do printf '\\t%s' \"$arg\" >> \"$SIGN_LOG\"; done\nprintf '\\n' >> \"$SIGN_LOG\"\nexit 0\n")
 
 	return env
