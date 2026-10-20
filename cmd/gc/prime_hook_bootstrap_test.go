@@ -12,9 +12,10 @@ import (
 
 // TestDoPrimeWithHook_OversizedPromptBootstrap drives the SessionStart hook
 // for a seat whose prompt (~150 KB, the shape of a real seat prompt) is past
-// the hook limit. A Claude conversation started by hand in the seat's pane
-// must get a bootstrap under the limit naming a file that holds exactly what
-// `gc prime` prints for the seat. A gc-launched seat's startup and resume
+// the hook limit. A Claude conversation started by hand in the seat's pane,
+// or restarted by /compact or /clear inside a gc-launched one, must get a
+// bootstrap under the limit naming a file that holds exactly what `gc prime`
+// prints for the seat. A gc-launched seat's startup and resume
 // hooks stay as they were (no prompt, no file: the launch delivered it), and
 // a provider that does not cap hook context still gets its prompt whole.
 func TestDoPrimeWithHook_OversizedPromptBootstrap(t *testing.T) {
@@ -23,6 +24,8 @@ func TestDoPrimeWithHook_OversizedPromptBootstrap(t *testing.T) {
 		wantBootstrap, wantWhole          bool
 	}{
 		{name: "started by hand", provider: "claude", source: "startup", wantBootstrap: true},
+		{name: "compact in launched seat", provider: "claude", delivered: "1", source: "compact", wantBootstrap: true},
+		{name: "clear in launched seat", provider: "claude", delivered: "1", source: "clear", wantBootstrap: true},
 		{name: "launched seat startup", provider: "claude", delivered: "1", source: "startup"},
 		{name: "launched seat resume", provider: "claude", delivered: "1", source: "resume"},
 		{name: "uncapped provider", provider: "codex", source: "startup", wantWhole: true},

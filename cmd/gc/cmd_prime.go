@@ -767,7 +767,17 @@ func managedSessionHookPromptAlreadyDelivered(ctx primeHookContext) bool {
 	if strings.TrimSpace(os.Getenv(managedSessionHookEnv)) != "1" {
 		return false
 	}
-	return strings.TrimSpace(ctx.HookEventName) == "SessionStart"
+	if strings.TrimSpace(ctx.HookEventName) != "SessionStart" {
+		return false
+	}
+	// /compact and /clear restart the conversation inside the process gc
+	// launched: the launch marker is still set, but the prompt it delivered
+	// is no longer in the conversation.
+	switch strings.TrimSpace(ctx.Source) {
+	case "compact", "clear":
+		return false
+	}
+	return true
 }
 
 func primeHookSessionStart(ctx primeHookContext) bool {
