@@ -792,6 +792,143 @@ func TestHookClaimUnwindGraphReleaseMatchesAnotherHolderSpelling(t *testing.T) {
 	}
 }
 
+// TestHookClaimUnwindFencedReleaseLosesToARestoreAfterItsRead pins the #311
+// review P3: the fenced release reads the row in_progress under this claim at
+// revision R, then a late restore commits (open under the pre-claim owner)
+// before the release writes. The status check already passed on the stale
+// read, so only the revision fence can refuse the write: the release returns
+// errHookClaimReleaseLost, the restore stands, and the unwind's re-read names
+// it without recording a release.
+func TestHookClaimUnwindFencedReleaseLosesToARestoreAfterItsRead(t *testing.T) {
+	const seat = "gc__role-mc-sess1"
+	var class beads.Store
+	// The release's read is the double's first Get: it returns the in_progress
+	// snapshot, then the late restore commits before the release's write.
+	race := &unwindRaceGraph{mutate: func(id string) error { return unwindClassUpdate(&class, "open", seat)(id) }}
+	var released []hookClaimReleaseRecord
+	class, ops := graphRestoreRig(t, "gcg-lost", "in_progress", seat, race, &released)
+	ops.Restore = func(context.Context, string, []string, string, string, string) (bool, error) {
+		return false, context.DeadlineExceeded
+	}
+	var releaseErr error
+	baseRelease := ops.Release
+	ops.Release = func(ctx context.Context, dir string, env []string, beadID, assignee string) (bool, error) {
+		ok, err := baseRelease(ctx, dir, env, beadID, assignee)
+		releaseErr = err
+		return ok, err
+	}
+
+	var stderr bytes.Buffer
+	code := unwindUndeliveredHookClaim(hookClaimReleaseReasonUndelivered, "test unwind", beads.Bead{ID: "gcg-lost", Assignee: seat}, seat,
+		hookClaimOptions{Assignee: seat}, ops, "/rig", &stderr)
+	if code != 1 {
+		t.Fatalf("code = %d, want 1", code)
+	}
+	if !race.hasRaced() {
+		t.Fatal("the release never read the bead, so the restore never raced it and this test proves nothing")
+	}
+	if !errors.Is(releaseErr, errHookClaimReleaseLost) {
+		t.Fatalf("release across a restore that landed after its read = %v, want errHookClaimReleaseLost; stderr=%s", releaseErr, stderr.String())
+	}
+	if got, _ := class.Get("gcg-lost"); got.Status != "open" || got.Assignee != seat {
+		t.Fatalf("the fenced release erased a restore that landed after its read: status=%q assignee=%q, want open under %q", got.Status, got.Assignee, seat)
+	}
+	if len(released) != 0 {
+		t.Fatalf("bead.claim_released = %+v, want none: the release wrote nothing", released)
+	}
+	out := stderr.String()
+	for _, want := range []string{"open under its pre-claim owner", "the fallback release of gcg-lost errored", errHookClaimReleaseLost.Error()} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("stderr missing %q; stderr=%s", want, out)
+		}
+	}
+	if strings.Contains(out, "released it unassigned") {
+		t.Fatalf("a lost release was reported as a release; stderr=%s", out)
+	}
+}
+
+// unsupportedFenceGraph is a graph binding that cannot fence a write: its
+// UpdateIfMatch answers updateErr, and its ReleaseIfCurrent records the call
+// and answers (ok, err), or parks on hold when that is set.
+type unsupportedFenceGraph struct {
+	storebinding.GraphStore
+	updateErr error
+	ok        bool
+	err       error
+	hold      chan struct{}
+	calls     []string
+}
+
+func (g *unsupportedFenceGraph) UpdateIfMatch(string, int64, beads.UpdateOpts) error {
+	return g.updateErr
+}
+
+func (g *unsupportedFenceGraph) ReleaseIfCurrent(id, assignee string) (bool, error) {
+	if g.hold != nil {
+		return false, awaitUnwindBarrier(g.hold, "the parked ReleaseIfCurrent was never released")
+	}
+	g.calls = append(g.calls, id+"|"+assignee)
+	return g.ok, g.err
+}
+
+// TestHookClaimGraphReleaseWithoutAFenceDelegates pins the #311 review P3: a
+// graph binding whose UpdateIfMatch answers a capability/unsupported error
+// gets its own ReleaseIfCurrent, whose answer and error are returned as they
+// are, and whose wait is bounded by the release's context.
+func TestHookClaimGraphReleaseWithoutAFenceDelegates(t *testing.T) {
+	const seat = "gc__role-mc-sess1"
+	releaseFailed := errors.New("release failed")
+	unsupported := map[string]error{
+		"conditional write unsupported":         beads.ErrConditionalWriteUnsupported,
+		"wrapped conditional write unsupported": fmt.Errorf("bd: %w", beads.ErrConditionalWriteUnsupported),
+		"adapter capability":                    storebinding.ErrBeadsAdapterCapability,
+		"wrapped adapter capability":            fmt.Errorf("adapter: %w", storebinding.ErrBeadsAdapterCapability),
+	}
+	newGraph := func(t *testing.T, updateErr error) *unsupportedFenceGraph {
+		class := newClaimRouteClassStore(t)
+		mintClaimRouteBead(t, class, "gcg-nofence", nil)
+		status, assignee := "in_progress", seat
+		if err := class.Update("gcg-nofence", beads.UpdateOpts{Status: &status, Assignee: &assignee}); err != nil {
+			t.Fatal(err)
+		}
+		graph, err := storebinding.NewBeadsGraphStore(class)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return &unsupportedFenceGraph{GraphStore: graph, updateErr: updateErr}
+	}
+	for name, updateErr := range unsupported {
+		for _, want := range []struct {
+			ok  bool
+			err error
+		}{{true, nil}, {false, nil}, {false, releaseFailed}} {
+			t.Run(fmt.Sprintf("%s/(%v,%v)", name, want.ok, want.err), func(t *testing.T) {
+				g := newGraph(t, updateErr)
+				g.ok, g.err = want.ok, want.err
+				ok, err := releaseGraphHookClaim(context.Background(), g, "gcg-nofence", seat)
+				if ok != want.ok || !errors.Is(err, want.err) {
+					t.Fatalf("release = (%v, %v), want ReleaseIfCurrent's (%v, %v)", ok, err, want.ok, want.err)
+				}
+				if len(g.calls) != 1 || g.calls[0] != "gcg-nofence|"+seat {
+					t.Fatalf("ReleaseIfCurrent calls = %q, want one for gcg-nofence under %q", g.calls, seat)
+				}
+			})
+		}
+		t.Run(name+"/bounded", func(t *testing.T) {
+			g := newGraph(t, updateErr)
+			g.hold = make(chan struct{})
+			t.Cleanup(func() { close(g.hold) })
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			start := time.Now()
+			ok, err := releaseGraphHookClaim(ctx, g, "gcg-nofence", seat)
+			if elapsed := time.Since(start); ok || !errors.Is(err, context.DeadlineExceeded) || elapsed > time.Second {
+				t.Fatalf("release behind a parked ReleaseIfCurrent = (%v, %v) after %s, want (false, deadline exceeded) at the 100ms deadline", ok, err, elapsed)
+			}
+		})
+	}
+}
+
 // TestHookClaimUnwindHolderMatchIsSeparatorInsensitive pins hookClaimHolderMatches
 // to the native release's rule: runs of . _ - are one separator, but an exact
 // "--" is an encoded "/" and stays distinct from "__".
