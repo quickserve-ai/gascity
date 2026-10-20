@@ -1595,6 +1595,32 @@ func unwindUndeliveredHookClaim(reason, cause string, bead beads.Bead, priorAssi
 		defer cancel()
 		return ops.Restore(ctx, dir, opts.Env, bead.ID, assignee, prior)
 	}
+	// reRead classifies the bead from a fresh read after a failed restore whose
+	// fallback release did not land, and returns what it read. It never
+	// decides that the bead moved without having read it.
+	reRead := func(prior string) (hookUnwindReRead, beads.Bead, error) {
+		if ops.ReadWorkMeta == nil {
+			return hookUnwindReReadUnresolved, beads.Bead{}, errors.New("no read seam reaches this ledger")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), hookClaimMutationTimeout)
+		defer cancel()
+		current, readErr := ops.ReadWorkMeta(ctx, dir, opts.Env, bead.ID, assignee)
+		switch {
+		case readErr != nil:
+			return hookUnwindReReadUnresolved, current, readErr
+		case strings.EqualFold(strings.TrimSpace(current.Status), "open") && strings.TrimSpace(current.Assignee) == prior:
+			return hookUnwindReReadPriorOwner, current, nil
+		case strings.EqualFold(strings.TrimSpace(current.Status), "in_progress") && strings.TrimSpace(current.Assignee) == assignee:
+			return hookUnwindReReadStillHeld, current, nil
+		default:
+			return hookUnwindReReadMoved, current, nil
+		}
+	}
+	verdict := hookUnwindReReadNone
+	var (
+		reReadBead beads.Bead
+		reReadErr  error
+	)
 	prior := strings.TrimSpace(priorAssignee)
 	var (
 		released   bool
@@ -1611,14 +1637,49 @@ func unwindUndeliveredHookClaim(reason, cause string, bead beads.Bead, priorAssi
 		released, restoreErr = restore(prior)
 		if restoreErr != nil {
 			released, err = release()
+			// A restore that gave up waiting has not necessarily failed: the
+			// graph binding's write runs on a goroutine runWithDeadline stops
+			// waiting for, so it can commit after the deadline. When the
+			// release did not land (a CAS miss, or an error that may hide a
+			// late commit), classify from a fresh read rather than assume. A
+			// bead no longer in_progress under our claim has had a write that
+			// bumped the revision the restore is fenced on, so no restore can
+			// still land after this read.
+			if !released {
+				verdict, reReadBead, reReadErr = reRead(prior)
+			}
 		}
 	}
 	if released && err == nil {
 		ops.EmitClaimReleased(hookClaimReleaseRecord{BeadID: bead.ID, Assignee: assignee, Reason: reason})
 	}
 	fmt.Fprintf(stderr, "gc hook --claim: %s\n", cause) //nolint:errcheck
+	switch verdict {
+	case hookUnwindReReadPriorOwner:
+		// Status and assignee cannot tell our late restore from another
+		// actor's identical write, so no bead.claim_released: that event
+		// records a release THIS process made.
+		fmt.Fprintf(stderr, "gc hook --claim: undelivered claim %s is open under its pre-claim owner %q (our late restore or an identical write); restore reported: %v\n", bead.ID, prior, restoreErr) //nolint:errcheck
+		if err != nil {
+			fmt.Fprintf(stderr, "gc hook --claim: the fallback release of %s errored: %v\n", bead.ID, err) //nolint:errcheck
+		}
+		return 1
+	case hookUnwindReReadStillHeld:
+		// Neither write landed: the claim nobody received is still parked on
+		// this session, and nothing in this process will give it back.
+		fmt.Fprintf(stderr, "gc hook --claim: undelivered claim %s is still in_progress under this claim (%q): neither the restore (%v) nor the fallback release (%s) landed; recover with: bd update %s --status open --assignee %q\n", bead.ID, assignee, restoreErr, describeHookFallbackRelease(err), bead.ID, prior) //nolint:errcheck
+		return 1
+	case hookUnwindReReadMoved:
+		// The read answered: the bead is neither ours nor back with its
+		// pre-claim owner. Someone else changed it, and it is theirs to keep.
+		fmt.Fprintf(stderr, "gc hook --claim: undelivered claim %s was no longer ours to release: a re-read finds it %s under %q (restore: %v; fallback release: %s)\n", bead.ID, reReadBead.Status, reReadBead.Assignee, restoreErr, describeHookFallbackRelease(err)) //nolint:errcheck
+		return 1
+	case hookUnwindReReadUnresolved:
+		fmt.Fprintf(stderr, "gc hook --claim: unresolved: could not re-read %s: %v; check it (restore: %v; fallback release: %s; if it is still in_progress under %q, recover with: bd update %s --status open --assignee %q)\n", bead.ID, reReadErr, restoreErr, describeHookFallbackRelease(err), assignee, bead.ID, prior) //nolint:errcheck
+		return 1
+	}
 	if restoreErr != nil && released && err == nil {
-		fmt.Fprintf(stderr, "gc hook --claim: could not hand undelivered claim %s back to its pre-claim assignee %q (%v); released it unassigned instead (recover with: bd update %s --assignee %q)\n", bead.ID, prior, restoreErr, bead.ID, prior) //nolint:errcheck
+		fmt.Fprintf(stderr, "gc hook --claim: could not hand undelivered claim %s back to its pre-claim assignee %q (%v); released it unassigned instead (recover with: bd update %s --status open --assignee %q)\n", bead.ID, prior, restoreErr, bead.ID, prior) //nolint:errcheck
 	}
 	switch {
 	case err != nil:
@@ -3183,6 +3244,33 @@ func hookResolveWorkBranch(tree hookClaimWorkTree) string {
 // city so the release reaches the ledger the claim actually landed in.
 func hookClaimReleaseWithBdStore(ctx context.Context, dir string, env []string, beadID, assignee string) (bool, error) {
 	return hookClaimBdStoreContext(ctx, dir, env, assignee).ReleaseIfCurrent(beadID, assignee)
+}
+
+// hookUnwindReRead is what the unwind's fresh read said about a bead whose
+// restore failed and whose fallback release did not land.
+type hookUnwindReRead int
+
+const (
+	// hookUnwindReReadNone: no re-read was needed.
+	hookUnwindReReadNone hookUnwindReRead = iota
+	// hookUnwindReReadPriorOwner: open under the pre-claim owner — our late
+	// restore, or an identical write by someone else.
+	hookUnwindReReadPriorOwner
+	// hookUnwindReReadStillHeld: still in_progress under this claim — neither
+	// the restore nor the fallback release landed.
+	hookUnwindReReadStillHeld
+	// hookUnwindReReadMoved: the read answered, and the bead is neither ours
+	// nor back with its pre-claim owner.
+	hookUnwindReReadMoved
+	// hookUnwindReReadUnresolved: the read failed; the bead's state is unknown.
+	hookUnwindReReadUnresolved
+)
+
+func describeHookFallbackRelease(err error) string {
+	if err != nil {
+		return err.Error()
+	}
+	return "missed"
 }
 
 // errHookClaimRestoreUnavailable: no restore seam reaches the ledger this claim
