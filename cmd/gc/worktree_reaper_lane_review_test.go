@@ -35,16 +35,16 @@ func (s *reopenedAfterFirstGetStore) Get(id string) (beads.Bead, error) {
 	return b, err
 }
 
-// blockingListStore blocks the borrow-veto List until release, then answers
+// borrowVetoBlockingListStore blocks the borrow-veto List until release, then answers
 // it successfully from the backing store (no referencing beads).
-type blockingListStore struct {
+type borrowVetoBlockingListStore struct {
 	beads.Store
 	entered chan struct{}
 	release chan struct{}
 	once    sync.Once
 }
 
-func (s *blockingListStore) List(q beads.ListQuery) ([]beads.Bead, error) {
+func (s *borrowVetoBlockingListStore) List(q beads.ListQuery) ([]beads.Bead, error) {
 	s.once.Do(func() { close(s.entered) })
 	<-s.release
 	return s.Store.List(q)
@@ -147,7 +147,7 @@ func TestWorktreeReaperLane_ListRetiredDuringCallIsDiscarded(t *testing.T) {
 	cityPath, rigRoot := initReapRig(t)
 	wt := addClosedWorktree(t, rigRoot, cityPath, "builder", "ga-abc123")
 	seed := []beads.Bead{{ID: "ga-abc123", Status: "closed"}}
-	store := &blockingListStore{
+	store := &borrowVetoBlockingListStore{
 		Store:   beads.NewMemStoreFrom(1, seed, nil),
 		entered: make(chan struct{}),
 		release: make(chan struct{}),
