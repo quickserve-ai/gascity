@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/gastownhall/gascity/internal/citylayout"
 	"github.com/gastownhall/gascity/internal/config"
@@ -162,7 +163,7 @@ func primeHookFitContext(seat primeHookSeat, prompt string, suppressPrompt bool,
 	}
 	if err != nil {
 		fmt.Fprintf(stderr, "gc prime: hook context is %d bytes, over the %d-byte hook limit, and could not be written to a file: %v\n", overhead+len(delivered)+len(suffix), primeHookContextLimit, err) //nolint:errcheck // diagnostics are best effort.
-		notice := primeHookWriteFailureNotice(seat.agentName, len(delivered), err)
+		notice := primeHookWriteFailureNotice(seat.agentName, len(delivered), err, budget)
 		if len(notice)+len(suffix) > budget {
 			return "", notice, false
 		}
@@ -174,7 +175,10 @@ func primeHookFitContext(seat primeHookSeat, prompt string, suppressPrompt bool,
 }
 
 // primeHookRemoveFiles removes the seat's prompt and context files except
-// those in keep. A file already gone is not an error.
+// those in keep. A file already gone is not an error. Removal is not
+// coordinated across hooks: one conversation per session name is the model,
+// so two SessionStart hooks running at once for one session name (where one
+// can remove the context file the other just wrote) are outside it.
 func primeHookRemoveFiles(dir string, keep map[string]bool) {
 	for _, name := range []string{primeHookPromptFileName, primeHookContextFileName} {
 		if !keep[name] {
@@ -231,10 +235,23 @@ func primeHookExcerpt(prompt, promptPath string, room int) string {
 
 // primeHookWriteFailureNotice replaces an oversized context whose file could
 // not be written: the seat captures its prompt itself and reads it in parts.
-func primeHookWriteFailureNotice(agentName string, promptBytes int, err error) string {
+// The error text is cut so the notice fits in room bytes; stderr has it whole.
+func primeHookWriteFailureNotice(agentName string, promptBytes int, err error, room int) string {
 	seat := agentName
 	if seat == "" {
 		seat = "<your agent>"
 	}
-	return fmt.Sprintf("\n\n# Your role prompt did not reach this conversation\n\nThis hook's context is over the %d-byte hook limit (role prompt %d bytes), and writing it to a file failed: %v\n\nBefore you do anything else, capture your prompt and read it to its end in parts (offset/limit of about 1,200 lines per call):\n\n    f=$(mktemp \"${TMPDIR:-/tmp}/prime.XXXXXX\") && gc prime %s > \"$f\" && echo \"$f\"\n", primeHookContextLimit, promptBytes, err, seat)
+	render := func(reason string) string {
+		return fmt.Sprintf("\n\n# Your role prompt did not reach this conversation\n\nThis hook's context is over the %d-byte hook limit (role prompt %d bytes), and writing it to a file failed: %s\n\nBefore you do anything else, capture your prompt and read it to its end in parts (offset/limit of about 1,200 lines per call):\n\n    f=$(mktemp \"${TMPDIR:-/tmp}/prime.XXXXXX\") && gc prime %s > \"$f\" && echo \"$f\"\n", primeHookContextLimit, promptBytes, reason, seat)
+	}
+	reason := err.Error()
+	if over := len(render(reason)) - room; over > 0 {
+		const cut = " [cut to fit; the whole error is on stderr]"
+		keep := max(0, len(reason)-over-len(cut))
+		for keep > 0 && !utf8.RuneStart(reason[keep]) {
+			keep--
+		}
+		reason = reason[:keep] + cut
+	}
+	return render(reason)
 }

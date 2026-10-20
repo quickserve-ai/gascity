@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -199,6 +200,26 @@ func TestPrimeHookFitContextBoundsEveryBranch(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestPrimeHookWriteFailureNoticeFits: the notice that replaces an
+// unwritable context fits the budget whatever the error says (an overlong
+// session name yields a long ENAMETOOLONG path).
+func TestPrimeHookWriteFailureNoticeFits(t *testing.T) {
+	seat := fitTestSeat(t)
+	seat.sessionName = strings.Repeat("s", 20_000)
+	var stderr bytes.Buffer
+	prompt, suffix, delivered := primeHookFitContext(seat, strings.Repeat("doctrine line\n", 2000), false, "\n\nstep: small", &stderr)
+	ctx := fitTestDelivered(seat, prompt, false, suffix)
+	if len(ctx) >= primeHookContextLimit || !strings.Contains(ctx, "gc prime worker >") || !delivered {
+		t.Fatalf("failure context is %d bytes (delivered %v), want under %d with the capture command (stderr %d bytes)", len(ctx), delivered, primeHookContextLimit, stderr.Len())
+	}
+
+	budget := primeHookContextLimit - primeHookBootstrapMargin
+	notice := primeHookWriteFailureNotice("worker", 140_000, errors.New(strings.Repeat("e", 50_000)), budget)
+	if len(notice) > budget || !strings.Contains(notice, "gc prime worker >") {
+		t.Fatalf("notice for a 50 KB error is %d bytes, want at most %d with the capture command", len(notice), budget)
+	}
 }
 
 // TestPrimeHookFitContextFiles covers what the seat directory holds: an
