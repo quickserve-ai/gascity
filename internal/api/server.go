@@ -73,6 +73,13 @@ type Server struct {
 	// history check in tests. Nil uses outputStreamPollInterval.
 	structuredPeekPoll <-chan time.Time
 
+	// structuredPeekLoopReady, when non-nil, receives one signal from each
+	// structured fallback stream after its initial peek and history check,
+	// just before it starts reading structuredPeekPoll. Tests use it to
+	// create history only once the stream is waiting on the injected poll.
+	// Nil in production.
+	structuredPeekLoopReady chan<- struct{}
+
 	// idem caches responses for Idempotency-Key replay on create endpoints.
 	idem *idempotencyCache
 
