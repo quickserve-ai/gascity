@@ -29,7 +29,7 @@ var laneInjectAllowlist = map[string]string{
 	"status_provider.go:statusProvider.SendKeys": "provider wrapper",
 	// Legacy CLI paths.
 	"cmd_nudge.go:deliverSessionNudgeLegacy":      "legacy CLI: gc session nudge",
-	"cmd_nudge.go:deliverSessionNotification":     "legacy CLI: mail send/reply --notify, through sendMailNotifyRecorded and the notice's op (sendNotificationWithOp): the notification plane's default session wake transport (ga-bjbaui)",
+	"cmd_nudge.go:deliverSessionNotification":     "legacy CLI: mail send/reply --notify, through sendMailNotifyRecorded and the notice's op (sendNotificationWithOp): the notification plane's default session wake transport (ga-bjbaui); the store-less sendMailNotifyWithProvider reaches it through sendMailNotifyWithOp",
 	"cmd_nudge.go:tryDeliverQueuedNudgesByPoller": "legacy poller",
 	"cmd_sling.go:deliverSlingNudge":              "legacy CLI: sling --nudge",
 	// Planner notices with [ops] authoritative empty, without a lane host
