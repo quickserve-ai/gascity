@@ -218,6 +218,12 @@ func TestPreflightTakesNoMigrationGuard(t *testing.T) {
 // run from inside one. So it is reported by PID, and the exit code stays clear.
 func TestPreflightReportsALiveControllerWithoutBlocking(t *testing.T) {
 	request, _, _ := preflightReadyCity(t, 1)
+	// The city path carries the PID's digits, so only an assertion on the
+	// controller line itself can tell a named PID from an echoed path.
+	request.CityPath = filepath.Join(request.CityPath, "city-4242")
+	if err := os.MkdirAll(filepath.Join(request.CityPath, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	stubInfraControllerPing(t, 4242)
 
 	var stdout, stderr bytes.Buffer
@@ -225,8 +231,8 @@ func TestPreflightReportsALiveControllerWithoutBlocking(t *testing.T) {
 		t.Fatalf("preflight blocked on a live controller, so it can only be run from inside the window it exists to plan: exit %d stdout=%q", code, stdout.String())
 	}
 	out := stdout.String()
-	if !strings.Contains(out, "4242") {
-		t.Errorf("preflight does not name the live controller's PID: %q", out)
+	if !strings.Contains(out, "controller: PID 4242 is live") {
+		t.Errorf("preflight does not name the live controller's PID on its controller line: %q", out)
 	}
 	if !strings.Contains(out, storageStopCommand) {
 		t.Errorf("preflight names a live controller without naming the command that stops it: %q", out)
