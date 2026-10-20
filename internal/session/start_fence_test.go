@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 
@@ -148,5 +149,63 @@ func TestRegisterStartFence_UnregisterStopsBracketing(t *testing.T) {
 	BracketProviderStart(sp)()
 	if begins, ends, _ := fence.snapshot(); begins != 1 || ends != 1 {
 		t.Fatalf("fence begins=%d ends=%d, want 1/1 (only the start before unregister)", begins, ends)
+	}
+}
+
+// funcFieldProvider is a provider value that cannot be hashed: its func field
+// makes the type uncomparable.
+type funcFieldProvider struct {
+	runtime.Provider
+	onStart func()
+}
+
+func (p funcFieldProvider) Start(ctx context.Context, name string, cfg runtime.Config) error {
+	if p.onStart != nil {
+		p.onStart()
+	}
+	return p.Provider.Start(ctx, name, cfg)
+}
+
+// interfaceFieldProvider is a provider value whose type is comparable (its
+// only field is an interface) while its contents may not be. It is the shape of
+// a profile wrapper around a test backend (runtime.NewFakeProfile over
+// internal/worker's inputHookBackend), which panicked "hash of unhashable type"
+// when startFenceKey checked only the static type.
+type interfaceFieldProvider struct {
+	runtime.Provider
+}
+
+// TestStartFenceKey_RefusesProviderWithUnhashableContents: a provider whose
+// static type is comparable but whose value holds an uncomparable one is not
+// keyed, RegisterStartFence refuses it, and a start through it is still
+// bracketed by its direct fence without panicking.
+func TestStartFenceKey_RefusesProviderWithUnhashableContents(t *testing.T) {
+	sp := interfaceFieldProvider{Provider: funcFieldProvider{Provider: runtime.NewFake(), onStart: func() {}}}
+	if !reflect.TypeOf(sp).Comparable() {
+		t.Fatal("fixture: the provider's static type must be comparable, or this test does not reach the value check")
+	}
+	if _, ok := startFenceKey(sp); ok {
+		t.Fatal("startFenceKey keyed a provider whose value cannot be hashed")
+	}
+	registered := &countingStartFence{}
+	unregister, ok := RegisterStartFence(sp, registered)
+	defer unregister()
+	if ok {
+		t.Fatal("RegisterStartFence accepted a provider whose value cannot be hashed")
+	}
+	direct := &countingStartFence{}
+	bracketStart(direct, sp)()
+	if begins, ends, inflight := direct.snapshot(); begins != 1 || ends != 1 || inflight != 0 {
+		t.Fatalf("direct fence begins=%d ends=%d inflight=%d, want 1/1/0", begins, ends, inflight)
+	}
+	if begins, _, _ := registered.snapshot(); begins != 0 {
+		t.Fatalf("refused fence begins=%d, want 0", begins)
+	}
+	BracketProviderStart(sp)()
+
+	// A comparable value of the same wrapper shape is still keyed.
+	keyed := interfaceFieldProvider{Provider: runtime.NewFake()}
+	if _, ok := startFenceKey(keyed); !ok {
+		t.Fatal("startFenceKey refused a wrapper whose contents are comparable (a pointer)")
 	}
 }
