@@ -5,8 +5,8 @@ import "errors"
 // The cache's per-row reconcile digest (ga-ckbnpj): what a backing answers so
 // a reconcile can list only the rows that moved since its last pass. The
 // native Dolt store implements it (native_dolt_store_reconcile_digest.go) and
-// ProxiedStore forwards its read leaf. Nothing reads it yet: the delta
-// reconcile that does arrives with the rest of its stack.
+// ProxiedStore forwards its read leaf. The delta reconcile that reads it is
+// caching_store_reconcile_delta.go.
 
 // errReconcileDigestUnsupported is a backing's "I cannot answer a digest",
 // which sends the pass down the full list without recording a problem.
