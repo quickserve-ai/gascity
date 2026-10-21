@@ -5,6 +5,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"os"
 	"path/filepath"
 	"sort"
@@ -14,32 +15,37 @@ import (
 
 // sessionStartFenceAllowlist names every runtime-creating call site that is
 // NOT lexically inside a session-start fence bracket, keyed
-// "path|enclosing function|method", with the reason it is safe. A new entry
-// needs a reason a reviewer can check; an entry the tree no longer contains
-// fails the test too, so the list only shrinks with the code.
+// "path|enclosing function|method", with the reason it is safe. A method
+// value is keyed by its receiver expression as well,
+// "path|enclosing function|recv.Method@method value", so a row exempts that
+// receiver's selector only, not every same-named selector in the function. A
+// new entry needs a reason a reviewer can check; an entry the tree no longer
+// contains fails the test too, so the list only shrinks with the code.
 var sessionStartFenceAllowlist = map[string]string{
 	"cmd/gc/status_provider.go|(*statusProvider).Start|Start":                        "forwarding wrapper used only by `gc status` (newStatusSessionProviderForCityWithSnapshot), a separate CLI process; the controller never holds it",
 	"cmd/gc/status_provider.go|(*statusProvider).Relaunch|Relaunch":                  "forwarding wrapper used only by `gc status`, a separate CLI process",
 	"cmd/gc/cmd_session.go|(*attachmentCachingProvider).Relaunch|Relaunch":           "forwarding wrapper built only by `gc session list`'s fallback (doSessionListFallback), a separate CLI process",
 	"cmd/gc/session_lifecycle_parallel.go|startPreparedStartCandidate|StartResolved": "worker-handle start; reached only through runPreparedStartCandidate, whose every caller is runFencedPreparedStartCandidate (bracketed); session handles also land in a Manager start, which brackets its provider call",
 	"internal/worker/runtime_handle.go|(*RuntimeHandle).StartResolved|Start":         "runtime-only worker handle (no session bead, so no Manager); in-process it is started only by startPreparedStartCandidate, which runFencedPreparedStartCandidate brackets; the API server's wakes use session-backed handles",
-	"cmd/gc/reconcile_planner.go|(*planner).run|Start@method value":                  "not a runtime call: p.last.Start is the time.Time a planner pass began (plannerPassStats), read to pace the next pass; upstream's v2 planner (#7285) starts nothing here",
+	"cmd/gc/reconcile_planner.go|(*planner).run|p.last.Start@method value":           "not a runtime call: p.last.Start is the time.Time a planner pass began (plannerPassStats), read to pace the next pass; upstream's v2 planner (#7285) starts nothing here",
 	// Upstream's turn capabilities name a turn-start trait Start; reading it
 	// starts nothing.
-	"cmd/gc/conversation_lane_turn.go|laneTurnTraitsOf|Start@method value":            "not a runtime call: caps.Start is worker.TurnCapabilities' turn-start trait (the embedded runtime.TurnCapabilities field), read to tell whether the source records turn starts",
-	"cmd/gc/conversation_lane_turns.go|laneMinTurnCaps|Start@method value":            "not a runtime call: a.Start, b.Start and out.Start are runtime.TurnCapabilities' turn-start trait (a runtime.TurnStart), compared and copied to keep the lower turn-start level of two capability sets; upstream's lane turn observer (#8141) added it",
-	"cmd/gc/conversation_lane_turns.go|laneTurnCapsStamp|Start@method value":          "not a runtime call: n.Start is the turn-start trait (a runtime.TurnStart) of n, the runtime.TurnCapabilities caps.Normalized() returns, read to render the start axis of the gc.rt.turn.caps stamp; upstream's lane turn observer (#8141) added it",
-	"cmd/gc/conversation_lane_turns.go|laneTurnCapsFromStamp|Start@method value":      "not a runtime call: caps.Start is a local runtime.TurnCapabilities' turn-start trait (a runtime.TurnStart), written from the stamp's start axis; upstream's lane turn observer (#8141) added it",
-	"internal/api/session_control_ops.go|(*Server).namedStopPlan|Start@method value":  "not a runtime call: caps.Start is worker.TurnCapabilities' turn-start trait (the embedded runtime.TurnCapabilities field) that handle.TurnCapabilities returns, read to refuse a named-turn stop on a runtime that does not record turn starts; upstream's shadow ops on the control verbs (#8140) added it",
-	"internal/api/session_turn.go|(*Server).humaHandleSessionTurn|Start@method value": "not a runtime call: caps.Start is worker.TurnCapabilities' turn-start trait (the embedded runtime.TurnCapabilities field) that handle.TurnCapabilities returns, read into the turn endpoint's capabilities body; upstream's dependable session API (#8053) added it",
-	"internal/worker/turn.go|composeTurnCapabilities|Start@method value":              "not a runtime call: support.Start is sessionlog.TurnSupport's turn-start level, read to decide whether a transcript can source turns",
-	"internal/worker/turn.go|turnInterruptRefusal|Start@method value":                 "not a runtime call: caps.Start is worker.TurnCapabilities' turn-start trait (the embedded runtime.TurnCapabilities field), read to refuse an interrupt no start record can fence and named in the refusal",
+	"cmd/gc/conversation_lane_turn.go|laneTurnTraitsOf|caps.Start@method value":            "not a runtime call: caps.Start is worker.TurnCapabilities' turn-start trait (the embedded runtime.TurnCapabilities field), read to tell whether the source records turn starts",
+	"cmd/gc/conversation_lane_turns.go|laneMinTurnCaps|a.Start@method value":               "not a runtime call: a.Start is the turn-start trait (a runtime.TurnStart) of a, a normalized runtime.TurnCapabilities, compared with b.Start to keep the lower turn-start level of two capability sets; upstream's lane turn observer (#8141) added it",
+	"cmd/gc/conversation_lane_turns.go|laneMinTurnCaps|b.Start@method value":               "not a runtime call: b.Start is the turn-start trait (a runtime.TurnStart) of b, a normalized runtime.TurnCapabilities, compared with a.Start and copied into out.Start when lower; upstream's lane turn observer (#8141) added it",
+	"cmd/gc/conversation_lane_turns.go|laneMinTurnCaps|out.Start@method value":             "not a runtime call: out.Start is the turn-start trait (a runtime.TurnStart) of out, the runtime.TurnCapabilities the function returns, written with b.Start when b's level is lower; upstream's lane turn observer (#8141) added it",
+	"cmd/gc/conversation_lane_turns.go|laneTurnCapsStamp|n.Start@method value":             "not a runtime call: n.Start is the turn-start trait (a runtime.TurnStart) of n, the runtime.TurnCapabilities caps.Normalized() returns, read to render the start axis of the gc.rt.turn.caps stamp; upstream's lane turn observer (#8141) added it",
+	"cmd/gc/conversation_lane_turns.go|laneTurnCapsFromStamp|caps.Start@method value":      "not a runtime call: caps.Start is a local runtime.TurnCapabilities' turn-start trait (a runtime.TurnStart), written from the stamp's start axis; upstream's lane turn observer (#8141) added it",
+	"internal/api/session_control_ops.go|(*Server).namedStopPlan|caps.Start@method value":  "not a runtime call: caps.Start is worker.TurnCapabilities' turn-start trait (the embedded runtime.TurnCapabilities field) that handle.TurnCapabilities returns, read to refuse a named-turn stop on a runtime that does not record turn starts; upstream's shadow ops on the control verbs (#8140) added it",
+	"internal/api/session_turn.go|(*Server).humaHandleSessionTurn|caps.Start@method value": "not a runtime call: caps.Start is worker.TurnCapabilities' turn-start trait (the embedded runtime.TurnCapabilities field) that handle.TurnCapabilities returns, read into the turn endpoint's capabilities body; upstream's dependable session API (#8053) added it",
+	"internal/worker/turn.go|composeTurnCapabilities|support.Start@method value":           "not a runtime call: support.Start is sessionlog.TurnSupport's turn-start level, read to decide whether a transcript can source turns",
+	"internal/worker/turn.go|turnInterruptRefusal|caps.Start@method value":                 "not a runtime call: caps.Start is worker.TurnCapabilities' turn-start trait (the embedded runtime.TurnCapabilities field), read to refuse an interrupt no start record can fence and named in the refusal",
 	// Upstream's v2 relaunch (#7636) names a bool fact Relaunch; reading it
 	// starts nothing. The relaunch itself is relaunchCall's, bracketed.
-	"cmd/gc/reconcile_effect_abandon.go|rollbackClose|Relaunch@method value":    "not a runtime call: v.It.Relaunch is the intent's bool relaunch flag (S7), read to keep the configured named row for A18",
-	"cmd/gc/reconcile_effect_abandon.go|rollbackStep|Relaunch@method value":     "not a runtime call: v.It.Relaunch is the intent's bool relaunch flag (S7), read to decide the rollback's step",
-	"cmd/gc/reconcile_effects_registry.go|newEffectPass|Relaunch@method value":  "not a runtime call: env.Relaunch is reconcileEnv's bool relaunch capability, copied onto the stripped env",
-	"cmd/gc/reconcile_keys.go|(*reconcileEnv).relaunches|Relaunch@method value": "not a runtime call: e.Relaunch is reconcileEnv's bool relaunch capability, read when the provider was stripped",
+	"cmd/gc/reconcile_effect_abandon.go|rollbackClose|v.It.Relaunch@method value":  "not a runtime call: v.It.Relaunch is the intent's bool relaunch flag (S7), read to keep the configured named row for A18",
+	"cmd/gc/reconcile_effect_abandon.go|rollbackStep|v.It.Relaunch@method value":   "not a runtime call: v.It.Relaunch is the intent's bool relaunch flag (S7), read to decide the rollback's step",
+	"cmd/gc/reconcile_effects_registry.go|newEffectPass|env.Relaunch@method value": "not a runtime call: env.Relaunch is reconcileEnv's bool relaunch capability, copied onto the stripped env",
+	"cmd/gc/reconcile_keys.go|(*reconcileEnv).relaunches|e.Relaunch@method value":  "not a runtime call: e.Relaunch is reconcileEnv's bool relaunch capability, read when the provider was stripped",
 }
 
 // sessionStartFenceBrackets are the calls that open a session-start fence
@@ -224,16 +230,23 @@ func scanFenceFunc(fset *token.FileSet, rel, fn string, body *ast.BlockStmt, fin
 			report(call.Pos(), method, "")
 		}
 	}
+	// A method value is reported under its receiver expression, so an
+	// allowlisted field read (caps.Start) does not cover a provider method
+	// value (sp.Start) in the same function.
 	for _, sel := range methodValues {
-		report(sel.Pos(), sel.Sel.Name, "method value")
+		report(sel.Pos(), types.ExprString(sel.X)+"."+sel.Sel.Name, "method value")
 	}
 }
 
 // TestSessionStartFenceRatchet_RejectsEscapingShapes feeds the scanner the two
-// shapes Astra r4 found it missed, plus controls it must accept.
+// shapes Astra r4 found it missed, the collision Astra r5 found (an
+// allowlisted field read must not cover a provider method value in the same
+// function), plus controls it must accept. A case's allow keys are added to
+// sessionStartFenceAllowlist for that case only.
 func TestSessionStartFenceRatchet_RejectsEscapingShapes(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
+		allow     []string
 		src       string
 		wantFlags int
 	}{
@@ -287,8 +300,28 @@ func TestSessionStartFenceRatchet_RejectsEscapingShapes(t *testing.T) {
 			src:       "func f(h H) error { return h.StartResolved(ctx, by, inc, \"cmd\", cfg) }",
 			wantFlags: 1,
 		},
+		{
+			name:      "an allowlisted field read does not cover a provider method value in the same function",
+			allow:     []string{"fixture/fixture.go|f|caps.Start@method value"},
+			src:       "func f(caps C, sp P) { _ = caps.Start; start := sp.Start; _ = start }",
+			wantFlags: 1,
+		},
+		{
+			name:      "control: the allowlisted field read alone",
+			allow:     []string{"fixture/fixture.go|f|caps.Start@method value"},
+			src:       "func f(caps C) { _ = caps.Start }",
+			wantFlags: 0,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			for _, key := range tc.allow {
+				sessionStartFenceAllowlist[key] = "fixture row: " + tc.name
+			}
+			defer func() {
+				for _, key := range tc.allow {
+					delete(sessionStartFenceAllowlist, key)
+				}
+			}()
 			fset := token.NewFileSet()
 			file, err := parser.ParseFile(fset, "fixture.go", "package fixture\n\n"+tc.src+"\n", parser.SkipObjectResolution)
 			if err != nil {
