@@ -980,3 +980,69 @@ func TestLivenessOverlayOnReadyOrderedMatchesReady(t *testing.T) {
 		}
 	}
 }
+
+// childrenBatchBacking answers the batched children read
+// (beads.ChildrenBatchLister) one parent at a time over its MemStore, and
+// counts the batches it served, so a test can tell the policy store's batch
+// path from its per-parent fallback.
+type childrenBatchBacking struct {
+	*beads.MemStore
+	batches int
+}
+
+func (s *childrenBatchBacking) ChildrenOfAny(parentIDs []string, opts ...beads.QueryOpt) ([]beads.Bead, error) {
+	s.batches++
+	return beads.ChildrenOfAnyPerParent(s.MemStore, parentIDs, opts...)
+}
+
+// TestLivenessOverlayOnChildrenOfAnyMatchesChildren: the batched children
+// read overlays session liveness exactly as Children does (counsel-astra round
+// 3 on re-sync #8: upstream's new ChildrenOfAny forwarded the wrapped store's
+// batch without the ga-lys454 overlay, so whether a caller read fresh
+// telemetry or committed metadata depended on the backend's capabilities).
+// Same fixture as TestLivenessOverlayOnReadyOrderedMatchesReady, with the
+// liveness-bearing bead as a child.
+func TestLivenessOverlayOnChildrenOfAnyMatchesChildren(t *testing.T) {
+	backing := &childrenBatchBacking{MemStore: beads.NewMemStore()}
+	lv := liveness.NewMemStore()
+	store := wrapStoreWithBeadPolicies(backing, &config.City{}, newLivenessBindingForTest(lv, liveness.ModeTable))
+	parent, err := backing.Create(beads.Bead{Title: "parent", Type: "task"})
+	if err != nil {
+		t.Fatalf("Create parent: %v", err)
+	}
+	// Committed straight to the backing store, so "state" is committed metadata
+	// the overlay must shadow.
+	child, err := backing.Create(beads.Bead{Title: "child", Type: "task", ParentID: parent.ID, Metadata: map[string]string{"state": "active"}})
+	if err != nil {
+		t.Fatalf("Create child: %v", err)
+	}
+	if err := lv.SetBatch(context.Background(), child.ID, map[string]string{"state": "asleep"}); err != nil {
+		t.Fatalf("liveness SetBatch: %v", err)
+	}
+	stateOf := func(rows []beads.Bead) string {
+		for _, b := range rows {
+			if b.ID == child.ID {
+				return b.Metadata["state"]
+			}
+		}
+		return "<absent>"
+	}
+
+	children, err := store.Children(parent.ID)
+	if err != nil {
+		t.Fatalf("Children: %v", err)
+	}
+	if got := stateOf(children); got != "asleep" {
+		t.Fatalf("Children state = %q, want the liveness value", got)
+	}
+	batched, err := beads.ChildrenOfAny(store, []string{parent.ID})
+	if err != nil {
+		t.Fatalf("ChildrenOfAny: %v", err)
+	}
+	if backing.batches != 1 {
+		t.Fatalf("the wrapped batch served %d reads, want 1: the per-parent fallback answered, so the batch path went untested", backing.batches)
+	}
+	if got, want := stateOf(batched), stateOf(children); got != want {
+		t.Errorf("ChildrenOfAny state = %q, want %q as Children reads it", got, want)
+	}
+}
