@@ -2,6 +2,7 @@ package session
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/beads"
@@ -748,6 +749,71 @@ func TestLookupConfiguredNamedSession_SessionNameConflictReportedOverBareAliasMa
 	}
 }
 
+func TestLookupConfiguredNamedSession_ReportsEphemeralBackingTemplateConflict(t *testing.T) {
+	maxOne := 1
+	store := beads.NewMemStore()
+	spec := NamedSessionSpec{
+		Agent:       &config.Agent{Name: "woodhouse", MaxActiveSessions: &maxOne},
+		Identity:    "woodhouse",
+		SessionName: "demo--woodhouse",
+	}
+	shadow, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Status: "open",
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"session_name":   "woodhouse-ga-dl5gy",
+			"template":       "woodhouse",
+			"pool_managed":   "true",
+			"agent_name":     "woodhouse",
+			"session_origin": "ephemeral",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(shadow): %v", err)
+	}
+
+	lookup, err := LookupConfiguredNamedSession(store, spec)
+	if err != nil {
+		t.Fatalf("LookupConfiguredNamedSession: %v", err)
+	}
+	if !lookup.HasConflict || lookup.Conflict.ID != shadow.ID {
+		t.Fatalf("lookup = %+v, want ephemeral backing-template conflict %s", lookup, shadow.ID)
+	}
+}
+
+func TestLookupConfiguredNamedSession_AllowsManualBackingTemplateSession(t *testing.T) {
+	maxOne := 1
+	store := beads.NewMemStore()
+	spec := NamedSessionSpec{
+		Agent:       &config.Agent{Name: "woodhouse", MaxActiveSessions: &maxOne},
+		Identity:    "woodhouse",
+		SessionName: "demo--woodhouse",
+	}
+	_, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Status: "open",
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"session_name":   "operator-chosen",
+			"template":       "woodhouse",
+			"agent_name":     "operator-chosen",
+			"session_origin": "manual",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(manual): %v", err)
+	}
+
+	lookup, err := LookupConfiguredNamedSession(store, spec)
+	if err != nil {
+		t.Fatalf("LookupConfiguredNamedSession: %v", err)
+	}
+	if lookup.HasConflict || lookup.HasCanonical {
+		t.Fatalf("lookup = %+v, want manual session preserved without conflict", lookup)
+	}
+}
+
 func TestLookupConfiguredNamedSession_EmptySpecNoListCall(t *testing.T) {
 	store := &listCountingStore{MemStore: beads.NewMemStore()}
 
@@ -1469,6 +1535,133 @@ func TestDemandOnlySingletonWakeRefused(t *testing.T) {
 		info := Info{Template: "worker", PoolManaged: true, MetadataState: tt.state}
 		if got := DemandOnlySingletonWakeRefused(cfg, agent, info); got != tt.want {
 			t.Errorf("DemandOnlySingletonWakeRefused(state=%q) = %v, want %v", tt.state, got, tt.want)
+		}
+	}
+}
+
+func TestFindNamedSessionSpecsByBackingTemplate(t *testing.T) {
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{
+			{Name: "helper"},
+			{Name: "solo"},
+		},
+		NamedSessions: []config.NamedSession{
+			{Name: "lana", Template: "helper", Mode: "always"},
+			{Name: "pam", Template: "helper", Mode: "on_demand"},
+			{Name: "ray", Template: "solo"},
+		},
+	}
+
+	specs := FindNamedSessionSpecsByBackingTemplate(cfg, "test-city", "helper")
+	if len(specs) != 2 {
+		t.Fatalf("specs for helper = %d, want 2", len(specs))
+	}
+	got := map[string]bool{}
+	for _, s := range specs {
+		got[s.Identity] = true
+	}
+	if !got["lana"] || !got["pam"] {
+		t.Fatalf("specs identities = %v, want lana and pam", got)
+	}
+
+	specs = FindNamedSessionSpecsByBackingTemplate(cfg, "test-city", "solo")
+	if len(specs) != 1 || specs[0].Identity != "ray" {
+		t.Fatalf("specs for solo = %#v, want single ray", specs)
+	}
+
+	if specs := FindNamedSessionSpecsByBackingTemplate(cfg, "test-city", "unbacked"); len(specs) != 0 {
+		t.Fatalf("specs for unbacked template = %d, want 0", len(specs))
+	}
+	if specs := FindNamedSessionSpecsByBackingTemplate(nil, "test-city", "helper"); specs != nil {
+		t.Fatalf("specs for nil cfg = %#v, want nil", specs)
+	}
+}
+
+// barryCityAndRigConfig is the ga-mk8tp4 shape: a city-scoped seat and a
+// rig-scoped seat that share the bare name "barry".
+func barryCityAndRigConfig() *config.City {
+	return &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{
+			{Name: "barry"},
+			{Name: "barry", Dir: "qcore"},
+		},
+		NamedSessions: []config.NamedSession{
+			{Template: "barry"},
+			{Template: "barry", Dir: "qcore"},
+		},
+	}
+}
+
+func TestResolveNamedSessionSpecForConfigTarget_RootedTargetIsTheCitySeatFromInsideARig(t *testing.T) {
+	spec, ok, err := ResolveNamedSessionSpecForConfigTarget(barryCityAndRigConfig(), "test-city", "/barry", "qcore")
+	if err != nil || !ok {
+		t.Fatalf("ResolveNamedSessionSpecForConfigTarget(/barry, qcore) ok=%v err=%v, want the city seat", ok, err)
+	}
+	if spec.Identity != "barry" {
+		t.Fatalf("identity = %q, want the city seat barry", spec.Identity)
+	}
+}
+
+func TestResolveNamedSessionSpecForConfigTarget_RootedTargetNeverReachesARigSeat(t *testing.T) {
+	cfg := &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Agents:        []config.Agent{{Name: "worker", Dir: "qcore"}},
+		NamedSessions: []config.NamedSession{{Template: "worker", Dir: "qcore"}},
+	}
+	if _, ok, err := ResolveNamedSessionSpecForConfigTarget(cfg, "test-city", "/worker", "qcore"); ok || err != nil {
+		t.Fatalf("ResolveNamedSessionSpecForConfigTarget(/worker, qcore) ok=%v err=%v, want not found: rooted means city scope", ok, err)
+	}
+	// The bare form still reaches it from inside the rig, unchanged.
+	if spec, ok, err := ResolveNamedSessionSpecForConfigTarget(cfg, "test-city", "worker", "qcore"); !ok || err != nil || spec.Identity != "qcore/worker" {
+		t.Fatalf("ResolveNamedSessionSpecForConfigTarget(worker, qcore) = %q ok=%v err=%v, want qcore/worker", spec.Identity, ok, err)
+	}
+}
+
+func TestResolveNamedSessionSpecForConfigTarget_AmbiguityNamesAnAddressForEachCandidate(t *testing.T) {
+	_, ok, err := ResolveNamedSessionSpecForConfigTarget(barryCityAndRigConfig(), "test-city", "barry", "qcore")
+	if !errors.Is(err, ErrAmbiguous) || ok {
+		t.Fatalf("ResolveNamedSessionSpecForConfigTarget(barry, qcore) ok=%v err=%v, want ErrAmbiguous", ok, err)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "address one of: /barry, qcore/barry") {
+		t.Fatalf("error = %q, want it to name /barry and qcore/barry as the addresses to use", msg)
+	}
+	// And each named address resolves on its own, from the same rig cwd.
+	for addr, want := range map[string]string{"/barry": "barry", "qcore/barry": "qcore/barry"} {
+		spec, ok, err := ResolveNamedSessionSpecForConfigTarget(barryCityAndRigConfig(), "test-city", addr, "qcore")
+		if err != nil || !ok || spec.Identity != want {
+			t.Fatalf("ResolveNamedSessionSpecForConfigTarget(%s, qcore) = %q ok=%v err=%v, want %s", addr, spec.Identity, ok, err, want)
+		}
+	}
+}
+
+// ga-elylrw (finding 3): "/qcore/barry" matched qcore/barry and was then
+// dropped as rig-scoped, so a rooted path to a rig seat read as "not found".
+// A rooted qualified target is a path from the city root.
+func TestResolveNamedSessionSpecForConfigTarget_RootedQualifiedTargetIsThatRigSeat(t *testing.T) {
+	for _, rigContext := range []string{"", "qcore", "other"} {
+		spec, ok, err := ResolveNamedSessionSpecForConfigTarget(barryCityAndRigConfig(), "test-city", "/qcore/barry", rigContext)
+		if err != nil || !ok || spec.Identity != "qcore/barry" {
+			t.Fatalf("ResolveNamedSessionSpecForConfigTarget(/qcore/barry, rig %q) = %q ok=%v err=%v, want qcore/barry", rigContext, spec.Identity, ok, err)
+		}
+	}
+	// A rooted path that names no seat stays a plain miss, not an error.
+	if _, ok, err := ResolveNamedSessionSpecForConfigTarget(barryCityAndRigConfig(), "test-city", "/nope/barry", "qcore"); ok || err != nil {
+		t.Fatalf("ResolveNamedSessionSpecForConfigTarget(/nope/barry) ok=%v err=%v, want not found", ok, err)
+	}
+}
+
+func TestRootedNamedSessionIdentity(t *testing.T) {
+	for in, want := range map[string]string{
+		"barry":         "/barry",
+		"gastown.mayor": "/gastown.mayor",
+		"qcore/barry":   "qcore/barry",
+		"":              "",
+	} {
+		if got := RootedNamedSessionIdentity(in); got != want {
+			t.Fatalf("RootedNamedSessionIdentity(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

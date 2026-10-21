@@ -636,7 +636,7 @@ With the unit configured:
   to run, and `gc supervisor uninstall` only removes gc's own legacy
   service.
 - `gc supervisor stop` runs `systemctl [--user] stop <unit>`
-  synchronously, bounded by `--wait-timeout` (default 30s) whether or
+  synchronously, bounded by `--wait-timeout` (default 90s) whether or
   not `--wait` is set, then verifies a previously-running supervisor
   actually exited. A live supervisor the unit does not manage (common
   mid-migration) fails the stop with its PID instead of reporting a
@@ -910,10 +910,11 @@ environment, so set these at orchestrator start to customize routing:
   unset; a fixed clock never reaches the reminder interval, so an unchanged
   incident is never mailed again.
 - `GC_MAINTENANCE_DONE_TARGET` — session target to nudge with
-  `MAINTENANCE_DONE:`/warn summaries when a maintenance run completes
-  (default: unset, no completion nudge). Deployments that relied on the
-  old hardcoded completion nudges to a health-patrol session should set
-  this to restore that loop.
+  `MAINTENANCE_DONE:`, `MAINTENANCE_WARN:`, and `MAINTENANCE_ESCALATE:`
+  summaries when a maintenance run completes, crosses a warning
+  threshold, or leaves work only an operator can finish (default: unset,
+  no nudge). Deployments that relied on the old hardcoded completion
+  nudges to a health-patrol session should set this to restore that loop.
 
 Common root causes, in rough order of frequency:
 

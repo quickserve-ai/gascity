@@ -94,6 +94,7 @@ func ResolveProvider(agent *Agent, ws *Workspace, cityProviders map[string]Provi
 	// of the raw Name. See engdocs/design/provider-inheritance.md
 	// §Kind / provider-family propagation.
 	resolved.BuiltinAncestor = BuiltinFamily(name, cityProviders)
+	resolved.SessionDisplayName = agent.QualifiedName()
 	mergeAgentOverrides(resolved, agent)
 	if agent.ResumeCommand == "" {
 		completeResolvedProviderResumeCommand(resolved)

@@ -261,7 +261,7 @@ func TestProxiedStoreGetFallsBackToBdLeafForWispIDs(t *testing.T) {
 	t.Run("a hit never reaches the bd leaf", func(t *testing.T) {
 		// Seed the ISSUES table the native leaf can see, through a write leaf
 		// pointed at the same storage.
-		seeded, err := newNativeDoltStoreForTest(native.storage.(*nativeDoltMemStorage)).Create(Bead{Title: "in the issues table", Type: "task"})
+		seeded, err := newNativeDoltStoreForTest(native.handle.storage.(*nativeDoltMemStorage)).Create(Bead{Title: "in the issues table", Type: "task"})
 		if err != nil {
 			t.Fatalf("seeding the native ledger: %v", err)
 		}
@@ -818,6 +818,11 @@ func TestProxiedStoreDepListBatchGuardsEveryIDBeforeTheNativeBatch(t *testing.T)
 	bd := NewBdStoreWithPrefix(t.TempDir(), func(_, _ string, args ...string) ([]byte, error) {
 		forks++
 		if len(args) > 1 && args[0] == "dep" && args[1] == "list" {
+			// Real bd: one id prints the depended-on beads' rows; several
+			// print the dependency records.
+			if len(args) == 4 {
+				return []byte(`[{"id":"prx-9","status":"open","dependency_type":"blocks"}]`), nil
+			}
 			return []byte(`[{"issue_id":"prx-1","depends_on_id":"prx-9","type":"blocks"}]`), nil
 		}
 		return nil, fmt.Errorf("unexpected bd %v", args)

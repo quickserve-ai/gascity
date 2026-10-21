@@ -402,7 +402,7 @@ func (c *BinaryCheck) Name() string { return c.binary + "-binary" }
 func (c *BinaryCheck) Run(_ *CheckContext) *CheckResult {
 	r := &CheckResult{Name: c.Name()}
 	if c.skipMsg != "" {
-		r.Status = StatusOK
+		r.Status = StatusSkipped
 		r.Message = c.skipMsg
 		return r
 	}
@@ -570,52 +570,176 @@ func (c *ZombieSessionsCheck) Fix(ctx *CheckContext) error {
 	return nil
 }
 
-// OrphanSessionsCheck finds sessions with the city prefix not in config.
+// OrphanSessionsCheck finds running sessions that nothing in this city claims.
+//
+// A session is an orphan only when NEITHER a configured agent template, NOR a
+// configured named session, NOR an OPEN session bead claims its runtime name.
+// The template-derived name (agent.SessionNameFor) is not the only name the
+// supervisor runs a session under: a named session whose alias differs from
+// its template (alias "qcore/archer" runs as "qcore--archer" while its
+// template is "qcore/cherub-law.archer") and a namepool-themed pool instance
+// ("platform--gastown__furiosa") are supervisor-managed yet never
+// template-derived. Their open session bead records the runtime name in its
+// session_name metadata, so the optional managed-name lister
+// (WithManagedSessionNames) supplies those names. Without it, the check once
+// reported 12 live, supervisor-managed seats as orphans and its Fix would have
+// stopped every one of them (ga-n2f1ph).
 type OrphanSessionsCheck struct {
 	cfg             *config.City
 	cityName        string
 	sessionTemplate string
 	sp              runtime.Provider
+	// managedNames, when non-nil, returns the runtime names of every session
+	// an OPEN session bead claims. A nil lister keeps the template-only
+	// behavior; a lister that errors, or that returns no names at all, makes
+	// the check fail closed (Run warns the candidates are unconfirmed, Fix
+	// refuses and stops nothing).
+	managedNames func() (map[string]struct{}, error)
 }
+
+// errEmptyManagedSessionSet is the scan's verdict on a managed-name listing
+// that succeeded but named nothing while unclaimed sessions are running. A
+// live city always has open session beads, so an empty set is far likelier a
+// read of the wrong or an empty store than proof that every candidate is an
+// orphan; it is treated like a listing failure (ga-n2f1ph).
+var errEmptyManagedSessionSet = errors.New("listing managed sessions returned no open session bead, which a live city always has, so the empty set cannot rule any candidate out")
+
+// HasManagedSessionNames reports whether a managed-name lister is installed.
+// It lets the production wiring be pinned: without the lister the check is
+// template-only and would report every non-template-derived seat as an orphan.
+func (c *OrphanSessionsCheck) HasManagedSessionNames() bool { return c.managedNames != nil }
 
 // NewOrphanSessionsCheck creates a check for orphaned sessions.
 func NewOrphanSessionsCheck(cfg *config.City, cityName, sessionTemplate string, sp runtime.Provider) *OrphanSessionsCheck {
 	return &OrphanSessionsCheck{cfg: cfg, cityName: cityName, sessionTemplate: sessionTemplate, sp: sp}
 }
 
+// WithManagedSessionNames installs the lister that returns the runtime names
+// claimed by open session beads. Those names count as expected alongside the
+// template-derived ones, so a supervisor-managed session whose runtime name is
+// not template-derived is never reported (or stopped) as an orphan. The lister
+// is only called when at least one running session is not template-derived.
+// It returns c for chaining.
+func (c *OrphanSessionsCheck) WithManagedSessionNames(fn func() (map[string]struct{}, error)) *OrphanSessionsCheck {
+	c.managedNames = fn
+	return c
+}
+
 // Name returns the check identifier.
 func (c *OrphanSessionsCheck) Name() string { return "orphan-sessions" }
 
-// Run finds sessions with the city prefix that don't match any configured agent.
-func (c *OrphanSessionsCheck) Run(_ *CheckContext) *CheckResult {
-	r := &CheckResult{Name: c.Name()}
+// orphanScan is the single orphan computation Run and Fix share, so the two
+// can never disagree about which sessions are orphans.
+type orphanScan struct {
+	// orphans are running sessions claimed by neither a configured template,
+	// nor a configured named session, nor (when a lister is installed and
+	// succeeded) an open session bead.
+	// When managedErr is non-nil they are template-only candidates that could
+	// NOT be confirmed.
+	orphans []string
+	// partialErr is the runtime's partial-list error, if the running-session
+	// listing only partially succeeded.
+	partialErr error
+	// managedErr is the managed-name lister's error, or
+	// errEmptyManagedSessionSet when it listed nothing. Non-nil means orphans
+	// are unconfirmed and must not be stopped.
+	managedErr error
+}
+
+// scan lists running sessions and computes the orphan set. The returned error
+// is a hard (non-partial) ListRunning failure; a partial listing is reported
+// through orphanScan.partialErr with the visible sessions still scanned.
+func (c *OrphanSessionsCheck) scan() (orphanScan, error) {
 	prefix := "" // per-city socket isolation: all sessions belong to this city
 	running, err := c.sp.ListRunning(prefix)
-	partialList := runtime.IsPartialListError(err)
-	if err != nil && !partialList {
-		r.Status = StatusError
-		r.Message = fmt.Sprintf("listing sessions: %v", err)
-		return r
+	var s orphanScan
+	if err != nil {
+		if !runtime.IsPartialListError(err) {
+			return s, err
+		}
+		s.partialErr = err
 	}
 
-	// Build set of expected session names.
+	// Template-derived names: every configured agent.
 	expected := make(map[string]bool)
 	for _, a := range c.cfg.Agents {
 		sn := agent.SessionNameFor(c.cityName, a.QualifiedName(), c.sessionTemplate)
 		expected[sn] = true
 	}
-
-	var orphans []string
-	for _, s := range running {
-		if !expected[s] {
-			orphans = append(orphans, s)
+	// Configured named sessions are managed from config alone, so a named
+	// seat whose session bead is closed or missing is never stopped.
+	for i := range c.cfg.NamedSessions {
+		identity := c.cfg.NamedSessions[i].QualifiedName()
+		if identity == "" {
+			continue
 		}
+		expected[config.NamedSessionRuntimeName(c.cityName, c.cfg.Workspace, identity)] = true
+	}
+	var candidates []string
+	for _, name := range running {
+		if !expected[name] {
+			candidates = append(candidates, name)
+		}
+	}
+	if len(candidates) == 0 || c.managedNames == nil {
+		s.orphans = candidates
+		return s, nil
+	}
+
+	// Names claimed by open session beads. Consulted only when a candidate
+	// exists, so a clean city never pays for a store read.
+	managed, merr := c.managedNames()
+	if merr != nil {
+		s.orphans = candidates
+		s.managedErr = fmt.Errorf("listing managed sessions failed: %w", merr)
+		return s, nil
+	}
+	if len(managed) == 0 {
+		s.orphans = candidates
+		s.managedErr = errEmptyManagedSessionSet
+		return s, nil
+	}
+	for _, name := range candidates {
+		if _, ok := managed[name]; !ok {
+			s.orphans = append(s.orphans, name)
+		}
+	}
+	return s, nil
+}
+
+// Run finds running sessions claimed by neither a configured agent template
+// nor an open session bead. If the managed-name lister fails, the template-only
+// candidates are reported as unconfirmed rather than as orphans.
+func (c *OrphanSessionsCheck) Run(_ *CheckContext) *CheckResult {
+	r := &CheckResult{Name: c.Name()}
+	s, err := c.scan()
+	if err != nil {
+		r.Status = StatusError
+		r.Message = fmt.Sprintf("listing sessions: %v", err)
+		return r
+	}
+	orphans := s.orphans
+
+	if s.managedErr != nil {
+		r.Status = StatusWarning
+		r.Message = fmt.Sprintf("cannot confirm orphaned sessions: %v (%d unconfirmed candidate(s))", s.managedErr, len(orphans))
+		if s.partialErr != nil {
+			r.Message += fmt.Sprintf("; listing sessions partially failed: %v", s.partialErr)
+		}
+		why := "open session beads could not be listed"
+		if errors.Is(s.managedErr, errEmptyManagedSessionSet) {
+			why = "open session beads listed empty"
+		}
+		for _, name := range orphans {
+			r.Details = append(r.Details, name+" (unconfirmed: not template-derived; "+why+")")
+		}
+		return r
 	}
 
 	if len(orphans) == 0 {
-		if partialList {
+		if s.partialErr != nil {
 			r.Status = StatusWarning
-			r.Message = fmt.Sprintf("listing sessions partially failed: %v", err)
+			r.Message = fmt.Sprintf("listing sessions partially failed: %v", s.partialErr)
 			return r
 		}
 		r.Status = StatusOK
@@ -623,8 +747,8 @@ func (c *OrphanSessionsCheck) Run(_ *CheckContext) *CheckResult {
 		return r
 	}
 	r.Status = StatusWarning
-	if partialList {
-		r.Message = fmt.Sprintf("listing sessions partially failed: %v (%d visible orphaned session(s))", err, len(orphans))
+	if s.partialErr != nil {
+		r.Message = fmt.Sprintf("listing sessions partially failed: %v (%d visible orphaned session(s))", s.partialErr, len(orphans))
 	} else {
 		r.Message = fmt.Sprintf("%d orphaned session(s)", len(orphans))
 	}
@@ -639,29 +763,29 @@ func (c *OrphanSessionsCheck) CanFix() bool { return true }
 // (GH#5742): the controller's own health patrol already reconciles orphan
 // sessions, and an uncoordinated Stop here would race it. Like
 // ZombieSessionsCheck.Fix, it stops through runtime.StopForCleanup, so an
-// orphan whose tmux server died after the listing counts as removed.
+// orphan whose tmux server died after the listing counts as removed. It also
+// fails closed when it cannot tell a managed session from an orphan: a partial
+// runtime listing, a managed-name lister error, or an empty managed set
+// returns an error and stops nothing, because a session is an orphan only
+// when neither config nor an open session bead claims it, and a failed or
+// empty listing cannot rule the second out (ga-n2f1ph).
 func (c *OrphanSessionsCheck) Fix(ctx *CheckContext) error {
 	if IsControllerRunning(ctx.CityPath) {
 		return errControllerRunningFixSkipped
 	}
-	prefix := "" // per-city socket isolation: all sessions belong to this city
-	running, err := c.sp.ListRunning(prefix)
-	if runtime.IsPartialListError(err) {
-		return fmt.Errorf("listing sessions partially failed: %w", err)
-	}
+	s, err := c.scan()
 	if err != nil {
 		return err
 	}
-	expected := make(map[string]bool)
-	for _, a := range c.cfg.Agents {
-		sn := agent.SessionNameFor(c.cityName, a.QualifiedName(), c.sessionTemplate)
-		expected[sn] = true
+	if s.partialErr != nil {
+		return fmt.Errorf("listing sessions partially failed: %w", s.partialErr)
 	}
-	for _, s := range running {
-		if !expected[s] {
-			if err := runtime.StopForCleanup(c.sp, s); err != nil {
-				return fmt.Errorf("killing orphan session %q: %w", s, err)
-			}
+	if s.managedErr != nil {
+		return fmt.Errorf("refusing to stop %d unconfirmed orphan candidate(s): %w", len(s.orphans), s.managedErr)
+	}
+	for _, name := range s.orphans {
+		if err := runtime.StopForCleanup(c.sp, name); err != nil {
+			return fmt.Errorf("killing orphan session %q: %w", name, err)
 		}
 	}
 	return nil
@@ -719,6 +843,12 @@ func (c *BeadsStoreCheck) Run(_ *CheckContext) *CheckResult {
 		}
 	}
 	result, err := c.newStore(c.cityPath)
+	if beads.IsSchemaSkewDiagnostic(result.Diagnostic) {
+		r.Status = StatusError
+		r.Message = fmt.Sprintf("native store schema mismatch: %s", result.Diagnostic.PreflightReason)
+		r.FixHint = "install a gc binary built against the current beads schema; the controller is refusing session reconciliation until the mismatch is cleared"
+		return r
+	}
 	if err != nil {
 		r.Status = StatusError
 		r.Message = fmt.Sprintf("store open failed: %v", err)
@@ -798,11 +928,11 @@ func (c *BeadsStoreCheck) Run(_ *CheckContext) *CheckResult {
 		r.Message = proxiedFallbackStoreMessage(proxied)
 		return r
 	}
-	if result.Diagnostic.Store == beads.BeadsStoreNameBdStore {
+	if !result.Diagnostic.NativeStoreEligible && result.Diagnostic.PreflightGate != "" {
 		r.Status = StatusWarning
 		r.Message = fmt.Sprintf(
-			"beads store running on BdStore fallback (fork-per-op; gate=%s): %s",
-			result.Diagnostic.PreflightGate, result.Diagnostic.PreflightReason)
+			"beads store running on %s fallback (gate=%s): %s",
+			result.Diagnostic.Store, result.Diagnostic.PreflightGate, result.Diagnostic.PreflightReason)
 		r.FixHint = "native store unavailable; repair the named preflight gate, then restart the process to pick up native store eligibility"
 		return r
 	}
@@ -1340,7 +1470,7 @@ func (c *DoltServerCheck) Name() string { return "dolt-server" }
 func (c *DoltServerCheck) Run(_ *CheckContext) *CheckResult {
 	r := &CheckResult{Name: c.Name()}
 	if c.skip {
-		r.Status = StatusOK
+		r.Status = StatusSkipped
 		r.Message = "skipped (file backend or GC_DOLT=skip)"
 		return r
 	}
@@ -1408,7 +1538,7 @@ func (c *RigDoltServerCheck) Name() string { return "rig:" + c.rig.Name + ":dolt
 func (c *RigDoltServerCheck) Run(_ *CheckContext) *CheckResult {
 	r := &CheckResult{Name: c.Name()}
 	if c.skip {
-		r.Status = StatusOK
+		r.Status = StatusSkipped
 		r.Message = "skipped (file backend or GC_DOLT=skip)"
 		return r
 	}
@@ -2181,15 +2311,58 @@ func managedLocalDoltScanTargets(cityPath string) ([]doltDataScanTarget, bool) {
 	return managedLocalDoltScanTargetsForScopeRoots(cityPath, managedDoltScopeRoots(cityPath))
 }
 
+func sameManagedDoltHost(left, right string) bool {
+	normalize := func(host string) string {
+		host = strings.ToLower(strings.TrimSpace(host))
+		if host == "localhost" {
+			return "127.0.0.1"
+		}
+		return host
+	}
+	return normalize(left) == normalize(right)
+}
+
+func sameManagedDoltServer(city, target contract.DoltConnectionTarget) bool {
+	return !city.External && sameManagedDoltHost(city.Host, target.Host) && city.Port == target.Port
+}
+
 func managedLocalDoltScanTargetsForScopeRoots(cityPath string, scopeRoots []string) ([]doltDataScanTarget, bool) {
 	dataDir := resolveManagedDoltDataDir(cityPath)
 	seenRoots := map[string]struct{}{}
 	targets := make([]doltDataScanTarget, 0, len(scopeRoots))
 	unresolved := false
+	directKnownDBs := make(map[string]struct{})
+	rememberDirectDatabase := func(scopeRoot string) {
+		metadata, ok, err := contract.LoadMetadataState(fsys.OSFS{}, filepath.Join(scopeRoot, ".beads", "metadata.json"))
+		if err != nil || !ok || metadata.Backend != "dolt" || metadata.DoltMode != "server" {
+			return
+		}
+		db := strings.TrimSpace(metadata.DoltDatabase)
+		if isManagedDoltUserDatabase(db) {
+			directKnownDBs[db] = struct{}{}
+		}
+	}
 	for _, scopeRoot := range scopeRoots {
 		target, _, active, err := validateBDStoreTarget(cityPath, scopeRoot)
 		if err == nil {
-			if !active || target.External {
+			if !active {
+				// scopeRoots comes from the city rig roster (or the conservative
+				// filesystem fallback). A rig with metadata but no resolvable
+				// canonical endpoint still references its named managed database.
+				if !sameDoctorScope(scopeRoot, cityPath) {
+					rememberDirectDatabase(scopeRoot)
+					unresolved = true
+				}
+				continue
+			}
+			if target.External {
+				// A rig can explicitly pin the same local server used by the managed
+				// city. ResolveDoltConnectionTarget calls that shape "external" even
+				// though its database lives under the city's managed data directory.
+				cityTarget, cityErr := contract.ResolveDoltConnectionTarget(fsys.OSFS{}, cityPath, cityPath)
+				if cityErr == nil && sameManagedDoltServer(cityTarget, target) {
+					rememberDirectDatabase(scopeRoot)
+				}
 				continue
 			}
 			db := strings.TrimSpace(target.Database)
@@ -2210,6 +2383,10 @@ func managedLocalDoltScanTargetsForScopeRoots(cityPath string, scopeRoots []stri
 		resolved, resolveErr := contract.ResolveScopeConfigState(fsys.OSFS{}, cityPath, scopeRoot, "")
 		if resolveErr != nil || resolved.Kind != contract.ScopeConfigAuthoritative {
 			unresolved = true
+			// A configured active scope whose endpoint cannot be resolved
+			// authoritatively still references its metadata-named managed database.
+			// Successfully resolved external scopes never reach this fallback.
+			rememberDirectDatabase(scopeRoot)
 			continue
 		}
 		switch resolved.State.EndpointOrigin {
@@ -2249,7 +2426,8 @@ func managedLocalDoltScanTargetsForScopeRoots(cityPath string, scopeRoots []stri
 			if info, statErr := os.Stat(scanRoot); statErr != nil || !info.IsDir() {
 				continue
 			}
-			appendDoltDataScanTarget(&targets, seenRoots, db, scanRoot, true)
+			_, directlyKnown := directKnownDBs[db]
+			appendDoltDataScanTarget(&targets, seenRoots, db, scanRoot, !directlyKnown)
 		}
 	} else if !os.IsNotExist(err) {
 		unresolved = true
@@ -2431,6 +2609,17 @@ func sumDirBytes(root string) (int64, bool, error) {
 }
 
 func sumDirBytesWithContext(ctx context.Context, root string) (int64, bool, error) {
+	total, exists, err := countDirBytes(ctx, root)
+	if err != nil {
+		return 0, exists, err
+	}
+	return total, exists, nil
+}
+
+// countDirBytes is sumDirBytesWithContext that also returns, alongside a walk
+// error, the bytes counted before the walk stopped: a lower bound when the
+// error is ctx's deadline.
+func countDirBytes(ctx context.Context, root string) (int64, bool, error) {
 	info, err := os.Stat(root)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -2462,7 +2651,7 @@ func sumDirBytesWithContext(ctx context.Context, root string) (int64, bool, erro
 		return nil
 	})
 	if err != nil {
-		return 0, true, err
+		return total, true, err
 	}
 	return total, true, nil
 }
@@ -2501,6 +2690,11 @@ func duDirBytes(root string) (int64, bool, error) {
 		if errors.Is(err, exec.ErrNotFound) {
 			return boundedSumDirBytes(root)
 		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			full := strings.TrimSpace(string(exitErr.Stderr))
+			return 0, true, duExitError("du -sk", err, strings.Contains(full, "Permission denied"), full)
+		}
 		return 0, true, fmt.Errorf("measure directory with du -sk: %w", err)
 	}
 
@@ -2515,9 +2709,121 @@ func duDirBytes(root string) (int64, bool, error) {
 	return kb * 1024, true, nil
 }
 
+// duExitError explains a du that exited non-zero. du reports WHY only on
+// stderr ("Permission denied") and exits 1; without it the caller sees a bare
+// "exit status 1" and cannot tell an unreadable tree from any other failure
+// (ga-hyhccs). denied must be decided over the WHOLE stderr, since a few long
+// worktree paths fill any prefix and the permission line need not be first;
+// the text is then shortened to one line, because callers print the error
+// inside a single-line doctor message.
+func duExitError(invocation string, err error, denied bool, stderr string) error {
+	stderr = strings.Join(strings.Fields(strings.ReplaceAll(stderr, "\n", " ; ")), " ")
+	if runes := []rune(stderr); len(runes) > 300 {
+		stderr = string(runes[:300]) + "..."
+	}
+	if denied {
+		return fmt.Errorf("measure directory with %s: %w: %w: %s", invocation, err, fs.ErrPermission, stderr)
+	}
+	if stderr != "" {
+		return fmt.Errorf("measure directory with %s: %w: %s", invocation, err, stderr)
+	}
+	return fmt.Errorf("measure directory with %s: %w", invocation, err)
+}
+
 func formatGB(bytes int64) string {
 	gb := float64(bytes) / (1024.0 * 1024.0 * 1024.0)
 	return fmt.Sprintf("%.2f GB", gb)
+}
+
+// Subtrees of a managed Dolt database's .dolt directory that grow large for
+// unrelated reasons and are reclaimed by different (or no) procedures.
+const (
+	doltNomsSubdir           = "noms"
+	doltGitRemoteCacheSubdir = "git-remote-cache"
+)
+
+// doltDataFootprint splits a .dolt directory's bytes into the parts an
+// operator can act on differently. Reporting only the total invites the wrong
+// remedy: history compaction cannot reclaim transport-cache bytes, and its
+// flatten step rewrites lineage, which permanently breaks an origin mirror
+// (ga-npnoeo / ga-2wvmj9). Naming the subtrees keeps the metric honest about
+// which remedy, if any, applies.
+type doltDataFootprint struct {
+	// Noms is versioned history under noms/ — reclaimed by DOLT_GC and
+	// compaction. This is the subtree the bloat-recovery runbook addresses.
+	Noms int64
+	// GitRemoteCache is the Dolt git-remote transport's chunk cache under
+	// git-remote-cache/, present only for git+https remotes. It is a cache,
+	// not history: compaction cannot reclaim it. It is routinely LARGER on a
+	// database whose mirror is healthy than on one whose mirror is broken, so
+	// its size is not by itself a fault signal.
+	GitRemoteCache int64
+	// Other is everything else in .dolt (config, repo_state, stats). Normally
+	// negligible; carried so the parts always sum to the measured total.
+	Other int64
+}
+
+func (f *doltDataFootprint) add(other doltDataFootprint) {
+	f.Noms += other.Noms
+	f.GitRemoteCache += other.GitRemoteCache
+	f.Other += other.Other
+}
+
+// note renders the breakdown for a message, omitting parts that are absent so
+// a plain single-subtree database does not gain noise.
+func (f doltDataFootprint) note() string {
+	parts := make([]string, 0, 3)
+	if f.Noms > 0 {
+		parts = append(parts, "versioned history "+formatGB(f.Noms))
+	}
+	if f.GitRemoteCache > 0 {
+		parts = append(parts, "git remote cache "+formatGB(f.GitRemoteCache))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(parts, ", ") + ")"
+}
+
+// fixHint routes the operator to the remedy for whichever subtree dominates.
+// Pointing at the history-compaction runbook when the bytes are transport
+// cache is worse than saying nothing: compaction's flatten step is
+// irreversible and cannot reclaim those bytes.
+func (f doltDataFootprint) fixHint() string {
+	if f.GitRemoteCache > f.Noms {
+		return "most of this is git-remote-cache (dolt git-remote transport cache), which compaction does NOT reclaim — do not flatten history for it; see docs/troubleshooting/dolt-bloat-recovery.md#git-remote-cache"
+	}
+	return "see docs/troubleshooting/dolt-bloat-recovery.md"
+}
+
+// measureDoltDataSplit breaks a measured .dolt total into its named subtrees.
+// measure is the injected directory-measure function so this shares the
+// caller's timeout, du fallback, and test double. Each subtree holds a few
+// thousand large files at most, so the extra passes are cheap (measured at
+// <0.2s for a 13 GB database).
+func measureDoltDataSplit(measure func(string) (int64, bool, error), scanRoot string, total int64) (doltDataFootprint, error) {
+	var f doltDataFootprint
+	for _, sub := range []struct {
+		name string
+		dst  *int64
+	}{
+		{doltNomsSubdir, &f.Noms},
+		{doltGitRemoteCacheSubdir, &f.GitRemoteCache},
+	} {
+		bytes, exists, err := measure(filepath.Join(scanRoot, sub.name))
+		if err != nil {
+			return doltDataFootprint{}, err
+		}
+		if exists {
+			*sub.dst = bytes
+		}
+	}
+	// Guard against a negative remainder: the subtree passes are not atomic
+	// with the total, so a concurrent write can make the parts exceed it.
+	if other := total - f.Noms - f.GitRemoteCache; other > 0 {
+		f.Other = other
+	}
+	return f, nil
 }
 
 // DoltNomsSizeCheck warns when the managed Dolt database's on-disk footprint
@@ -2563,7 +2869,7 @@ func (c *DoltNomsSizeCheck) Name() string { return "dolt-noms-size" }
 func (c *DoltNomsSizeCheck) Run(_ *CheckContext) *CheckResult {
 	r := &CheckResult{Name: c.Name()}
 	if c.skip || !c.managedApplicable() {
-		r.Status = StatusOK
+		r.Status = StatusSkipped
 		r.Message = "skipped (file backend, external dolt endpoint, or GC_DOLT=skip)"
 		return r
 	}
@@ -2575,11 +2881,11 @@ func (c *DoltNomsSizeCheck) Run(_ *CheckContext) *CheckResult {
 	if len(targets) == 0 {
 		if unresolved {
 			// Let the beads-store / dolt-server checks report resolution errors.
-			r.Status = StatusOK
+			r.Status = StatusSkipped
 			r.Message = "skipped (dolt target unresolved)"
 			return r
 		}
-		r.Status = StatusOK
+		r.Status = StatusSkipped
 		r.Message = "skipped (file backend, external dolt endpoint, or GC_DOLT=skip)"
 		return r
 	}
@@ -2587,7 +2893,9 @@ func (c *DoltNomsSizeCheck) Run(_ *CheckContext) *CheckResult {
 	var (
 		worstTarget doltDataScanTarget
 		worstBytes  int64
+		worstSplit  doltDataFootprint
 		totalBytes  int64
+		totalSplit  doltDataFootprint
 		existsCount int
 	)
 	measureDir := c.measureDir
@@ -2604,11 +2912,24 @@ func (c *DoltNomsSizeCheck) Run(_ *CheckContext) *CheckResult {
 		if !exists {
 			continue
 		}
+		// The scan root is the whole .dolt directory, which holds two
+		// unrelated subtrees with different remedies: noms/ is versioned
+		// history (reclaimed by GC/compaction) and git-remote-cache/ is the
+		// git remote transport's chunk cache (compaction cannot touch it).
+		// Measure them apart so the report cannot misname which one is large.
+		split, err := measureDoltDataSplit(measureDir, target.ScanRoot, total)
+		if err != nil {
+			r.Status = StatusWarning
+			r.Message = fmt.Sprintf("scan dolt data dir: %v", err)
+			return r
+		}
 		existsCount++
 		totalBytes += total
+		totalSplit.add(split)
 		if total > worstBytes {
 			worstBytes = total
 			worstTarget = target
+			worstSplit = split
 		}
 	}
 	if existsCount == 0 {
@@ -2631,20 +2952,20 @@ func (c *DoltNomsSizeCheck) Run(_ *CheckContext) *CheckResult {
 	switch {
 	case worstBytes >= doltNomsErrorBytes:
 		r.Status = StatusError
-		r.Message = fmt.Sprintf("dolt noms directory for %s is %s%s — excessive; recovery recommended", targetLabel, size, scopeNote)
-		r.FixHint = "see docs/troubleshooting/dolt-bloat-recovery.md"
+		r.Message = fmt.Sprintf("dolt data directory for %s is %s%s%s — excessive; recovery recommended", targetLabel, size, worstSplit.note(), scopeNote)
+		r.FixHint = worstSplit.fixHint()
 	case totalBytes >= doltNomsErrorBytes:
 		r.Status = StatusError
-		r.Message = fmt.Sprintf("aggregate dolt data footprint is %s across %d databases — excessive; recovery recommended", formatGB(totalBytes), existsCount)
-		r.FixHint = "see docs/troubleshooting/dolt-bloat-recovery.md"
+		r.Message = fmt.Sprintf("aggregate dolt data footprint is %s%s across %d databases — excessive; recovery recommended", formatGB(totalBytes), totalSplit.note(), existsCount)
+		r.FixHint = totalSplit.fixHint()
 	case worstBytes >= doltNomsWarnBytes:
 		r.Status = StatusWarning
-		r.Message = fmt.Sprintf("dolt noms directory for %s is %s%s — approaching threshold", targetLabel, size, scopeNote)
-		r.FixHint = "see docs/troubleshooting/dolt-bloat-recovery.md"
+		r.Message = fmt.Sprintf("dolt data directory for %s is %s%s%s — approaching threshold", targetLabel, size, worstSplit.note(), scopeNote)
+		r.FixHint = worstSplit.fixHint()
 	case totalBytes >= doltNomsWarnBytes:
 		r.Status = StatusWarning
-		r.Message = fmt.Sprintf("aggregate dolt data footprint is %s across %d databases — approaching threshold", formatGB(totalBytes), existsCount)
-		r.FixHint = "see docs/troubleshooting/dolt-bloat-recovery.md"
+		r.Message = fmt.Sprintf("aggregate dolt data footprint is %s%s across %d databases — approaching threshold", formatGB(totalBytes), totalSplit.note(), existsCount)
+		r.FixHint = totalSplit.fixHint()
 	default:
 		r.Status = StatusOK
 		if existsCount > 1 {
@@ -2819,7 +3140,7 @@ func (c *DoltConfigCheck) Name() string { return "dolt-config" }
 func (c *DoltConfigCheck) Run(_ *CheckContext) *CheckResult {
 	r := &CheckResult{Name: c.Name()}
 	if c.skip || !c.managedApplicable() {
-		r.Status = StatusOK
+		r.Status = StatusSkipped
 		r.Message = "skipped (file backend, external dolt endpoint, or GC_DOLT=skip)"
 		return r
 	}
@@ -2978,7 +3299,7 @@ func (c *DoltVersionCheck) Name() string { return "dolt-version" }
 func (c *DoltVersionCheck) Run(_ *CheckContext) *CheckResult {
 	r := &CheckResult{Name: c.Name()}
 	if c.skip || (c.cityPath != "" && !c.managedApplicable()) {
-		r.Status = StatusOK
+		r.Status = StatusSkipped
 		r.Message = "skipped (file backend, external dolt endpoint, or GC_DOLT=skip)"
 		return r
 	}

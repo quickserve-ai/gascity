@@ -161,6 +161,16 @@ func decodeSharedCatalogSnapshot(encoded string) (materialize.CityCatalog, error
 	return cat, nil
 }
 
+// materializeSkillsIntoWorkdir materializes one agent's skills into
+// workdir's vendor sink, for `gc internal materialize-skills` and
+// `gc worktree ensure --agent`. Unlike the stage-1 pass, it reconciles
+// the sink for this agent alone, so a shared sink is still pruned
+// across agents in two ways. Two sessions of different agents sharing a
+// work_dir prune each other's agent-local and opted-in links. A session
+// whose work_dir is another agent's scope root writes its links into
+// that root's sink, and the root's next stage-1 pass, which groups only
+// the agents scoped there, prunes them. Grouping this path by sink is a
+// known follow-up.
 func materializeSkillsIntoWorkdir(cfg *config.City, agent *config.Agent, cityPath, workdir string, sharedCatalog *materialize.CityCatalog, stdout, stderr io.Writer) error {
 	if cfg == nil || agent == nil {
 		fmt.Fprintln(stderr, "gc internal materialize-skills: missing city config or agent") //nolint:errcheck // best-effort stderr
@@ -188,9 +198,20 @@ func materializeSkillsIntoWorkdir(cfg *config.City, agent *config.Agent, cityPat
 			fmt.Fprintf(stderr, "gc internal materialize-skills: shared skill catalog unavailable for %q: %v\n", agent.QualifiedName(), err) //nolint:errcheck // best-effort stderr
 			cat.Entries = nil
 			cat.Shadowed = nil
+			cat.OptIn = nil
+			cat.OptInWarnings = nil
 		}
 		cityCat = cat
 	}
+	// The snapshot and the live catalog carry the scope's opt-in index;
+	// the agent's own opt_in_skills selects from it. An unreadable opt-in
+	// root matters here only to an agent that selects opt-in skills.
+	if len(agent.OptInSkills) > 0 {
+		for _, w := range cityCat.OptInWarnings {
+			fmt.Fprintf(stderr, "gc internal materialize-skills: %s; opt-in skills from it are not delivered\n", w) //nolint:errcheck // best-effort stderr
+		}
+	}
+	cityCat = cityCat.WithOptIn(agent.OptInSkills)
 
 	agentCat, err := materialize.LoadAgentCatalog(agent.SkillsDir)
 	if err != nil {

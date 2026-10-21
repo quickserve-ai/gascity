@@ -9,6 +9,7 @@ import (
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/coordclass"
+	"github.com/gastownhall/gascity/internal/liveness"
 	"github.com/gastownhall/gascity/internal/session"
 )
 
@@ -32,6 +33,13 @@ type beadPolicyStore struct {
 	// (invocation_store_memo.go). closeBeadStoreHandle leaves its store open;
 	// the memo closes it when the invocation ends.
 	borrowed bool
+	// lv routes session-liveness telemetry to the non-versioned
+	// session_liveness table instead of the versioned issues metadata. A nil
+	// binding disables both the write split and the read overlay, leaving this
+	// wrapper byte-identical to its pre-liveness behavior — which is what
+	// every scope without a resolvable managed Dolt endpoint (file/doltlite
+	// providers, unit tests) gets. See bead_policy_store_liveness.go.
+	lv *livenessBinding
 }
 
 type beadPolicyGraphStore struct {
@@ -45,13 +53,37 @@ var (
 )
 
 // ConditionalWritesResolveTarget declares the wrapped store as the
-// conditional-writes resolution target. The policy layer shapes creation and
-// reads; it does not intercept metadata writes (SetMetadata promotes from the
-// embedded store), so fenced writes resolve against the inner store — without
-// this declaration, interface embedding would hide the factory stamp and a
-// require deployment would silently collapse to legacy writes through the
-// wrapper. beadPolicyGraphStore inherits this via its embedded
+// conditional-writes resolution target. Fenced writes resolve against the inner
+// store — without this declaration, interface embedding would hide the factory
+// stamp and a require deployment would silently collapse to legacy writes
+// through the wrapper. beadPolicyGraphStore inherits this via its embedded
 // *beadPolicyStore.
+//
+// The policy layer DOES now intercept plain metadata writes (the session
+// liveness splitter, bead_policy_store_liveness.go), and upstream's fenced
+// writes bypass it. ResolveConditionalWriter follows this declared target
+// before it looks for a writer
+// (internal/beads/conditional_writes_resolve.go:312), so a resolved writer's
+// UpdateIfMatch on a session bead (#7021's start-commit, reopen and kill
+// fences among them) commits liveness keys to versioned metadata with no
+// fence marker and no table-row sweep, and a surviving session_liveness row
+// then shadows the committed value. The bypass is dormant only while [beads]
+// conditional_writes is off, its default (internal/rollout/registry.go:27):
+// the resolver then returns nil (conditional_writes_resolve.go:320) and
+// callers fall back to their legacy write through this policy store, where
+// the splitter applies, or refuse the write. Metadata mode does not close the
+// gap: the read overlay applies table rows in BOTH modes
+// (internal/liveness/mode.go), and what makes a metadata-mode write win over
+// an older table row is the per-key fence marker the splitter adds to it. A
+// conditional write that bypasses the splitter carries no marker, so an older
+// session_liveness row shadows it in metadata mode too. The carry therefore
+// requires conditional_writes=off while the liveness overlay is bound, in
+// either mode; metadata mode is not a safe route to enabling conditional
+// writes before the bridge (gc-t47s). The fenced atomic close does not bypass
+// it: its terminal patch carries liveness
+// keys (state, slept_at), so the policy store fronts it through
+// AtomicConditionalCloserHandle (bead_policy_store_liveness.go) rather than
+// letting resolution run past this declaration to the backing's closer.
 func (s *beadPolicyStore) ConditionalWritesResolveTarget() beads.Store { return s.Store }
 
 var (
@@ -63,17 +95,23 @@ var (
 	_ beads.ParentProjectionWaiter = (*beadPolicyGraphStore)(nil)
 )
 
-func wrapStoreWithBeadPolicies(store beads.Store, cfg *config.City) beads.Store {
-	return wrapStoreWithBeadPoliciesOwnership(store, cfg, false)
+// wrapStoreWithBeadPolicies wraps store with the bead storage-tier policy layer
+// and, when a liveness binding is supplied, the session-liveness write splitter
+// and read overlay. The binding is variadic so the ~40 existing call sites
+// (mostly tests, which want the plain policy behavior) stay untouched.
+func wrapStoreWithBeadPolicies(store beads.Store, cfg *config.City, lv ...*livenessBinding) beads.Store {
+	return wrapStoreWithBeadPoliciesOwnership(store, cfg, false, lv...)
 }
 
 // borrowedStoreWithBeadPolicies is wrapStoreWithBeadPolicies for a store the
-// invocation memo owns: the handle's close leaves the store open.
-func borrowedStoreWithBeadPolicies(store beads.Store, cfg *config.City) beads.Store {
-	return wrapStoreWithBeadPoliciesOwnership(store, cfg, true)
+// invocation memo owns: the handle's close leaves the store open. The memo
+// entry passes the liveness binding resolved at its open, so a borrowed handle
+// splits and overlays exactly as an owned one does (ga-lys454).
+func borrowedStoreWithBeadPolicies(store beads.Store, cfg *config.City, lv ...*livenessBinding) beads.Store {
+	return wrapStoreWithBeadPoliciesOwnership(store, cfg, true, lv...)
 }
 
-func wrapStoreWithBeadPoliciesOwnership(store beads.Store, cfg *config.City, borrowed bool) beads.Store {
+func wrapStoreWithBeadPoliciesOwnership(store beads.Store, cfg *config.City, borrowed bool, lv ...*livenessBinding) beads.Store {
 	if store == nil {
 		return nil
 	}
@@ -81,6 +119,9 @@ func wrapStoreWithBeadPoliciesOwnership(store beads.Store, cfg *config.City, bor
 		Store:    store,
 		cfg:      cfg,
 		borrowed: borrowed,
+	}
+	if len(lv) > 0 {
+		policyStore.lv = lv[0]
 	}
 	if applier, ok := beads.GraphApplyFor(store); ok {
 		return &beadPolicyGraphStore{
@@ -120,18 +161,27 @@ func unwrapBeadPolicyStore(store beads.Store) (beads.Store, *beadPolicyStore, bo
 	}
 }
 
+// Create applies the storage-tier policy. It also strips the liveness overlay's
+// synthetic read-side keys: unlike a metadata patch, a create never passes
+// through the splitter, so a bead assembled from metadata read off another bead
+// would commit them (fork PR #59 review, round 2). See liveness.StripReadSideKeys.
 func (s *beadPolicyStore) Create(b beads.Bead) (beads.Bead, error) {
+	b.Metadata = liveness.StripReadSideKeys(b.Metadata)
 	_, storage := s.policyForCreate(b)
 	return createWithStoragePolicy(s.createTarget(coordclass.Classify(b)), b, storage)
 }
 
+// List materializes beads with their session-liveness values overlaid, so every
+// consumer of a listed bead's raw metadata reads fresh telemetry. ListOpen /
+// Children / ListByLabel / ListByAssignee / ListByMetadata all funnel through
+// here, so one overlay point covers the whole legacy list surface.
 func (s *beadPolicyStore) List(query beads.ListQuery) ([]beads.Bead, error) {
 	query = expandPolicyReadTier(query)
-	return s.Store.List(query)
+	return s.overlayResult(s.Store.List(query))
 }
 
 func (s *beadPolicyStore) Ready(query ...beads.ReadyQuery) ([]beads.Bead, error) {
-	return s.Store.Ready(expandPolicyReadyQuery(query...))
+	return s.overlayResult(s.Store.Ready(expandPolicyReadyQuery(query...)))
 }
 
 // ReadyContext preserves the policy-expanded read tier for deadline-sensitive
@@ -142,7 +192,7 @@ func (s *beadPolicyStore) ReadyContext(ctx context.Context, query ...beads.Ready
 	if !ok {
 		return nil, fmt.Errorf("reading ready beads through policy store: %w", beads.ErrReadyContextUnsupported)
 	}
-	return reader.ReadyContext(ctx, expandPolicyReadyQuery(query...))
+	return s.overlayResult(reader.ReadyContext(ctx, expandPolicyReadyQuery(query...)))
 }
 
 // DepMetadata forwards the inner store's edge-payload read. The policy layer
@@ -275,44 +325,120 @@ func (s *beadPolicyStore) ReadyPreferCache(query beads.ReadyQuery) ([]beads.Bead
 }
 
 // ReadyOrdered forwards a bounded ordered ready read (beads.OrderedReadyReader)
-// with the policy's expanded read tier, exactly as Ready does. Explicit for the
-// reason DeleteBatch is: the embedded Store interface does not promote optional
-// capabilities, and a silent wrapper would send every bounded read down the
-// whole-set path.
+// with the policy's expanded read tier and the session-liveness overlay,
+// exactly as Ready does: a bounded read must not hand its caller committed
+// telemetry the unbounded one would have overlaid (ga-lys454). The overlay
+// rewrites metadata in place, so the inner store's row order and its ordered
+// report pass through unchanged. Explicit for the reason DeleteBatch is: the
+// embedded Store interface does not promote optional capabilities, and a
+// silent wrapper would send every bounded read down the whole-set path.
 func (s *beadPolicyStore) ReadyOrdered(query beads.ReadyQuery, order beads.ReadyOrder) ([]beads.Bead, bool, error) {
-	return beads.ReadyOrdered(s.Store, expandPolicyReadyQuery(query), order)
+	rows, ordered, err := beads.ReadyOrdered(s.Store, expandPolicyReadyQuery(query), order)
+	rows, err = s.overlayResult(rows, err)
+	return rows, ordered, err
+}
+
+var (
+	_ beads.ChildrenBatchLister = (*beadPolicyStore)(nil)
+	_ beads.ChildrenBatchLister = (*beadPolicyGraphStore)(nil)
+)
+
+// ChildrenOfAny forwards the batched children read to the wrapped store, at
+// the tier this layer's own Children reads. Children widens a TierIssues read
+// to TierBoth, so the forwarded batch asks for both tiers too; otherwise a
+// wrapped bd store would answer the batch without the ephemeral children the
+// per-parent read returns. A wrapped store without the batch is read one
+// parent at a time through this layer's Children.
+//
+// The batch's rows carry the session-liveness overlay, as Children's do
+// (Children reads through List): which path answers is a capability of the
+// wrapped store, and it must not decide whether a caller reads fresh
+// telemetry or committed metadata (ga-lys454).
+//
+// Explicit for the reason DepListBatch above is: the embedded Store interface
+// does not promote optional capabilities, so a silent wrapper sends
+// molecule.ListSubtree back to one `bd list --parent` plus one `bd query` per
+// member. beadPolicyGraphStore embeds *beadPolicyStore, so it forwards through
+// this too.
+func (s *beadPolicyStore) ChildrenOfAny(parentIDs []string, opts ...beads.QueryOpt) ([]beads.Bead, error) {
+	batch, ok := s.Store.(beads.ChildrenBatchLister)
+	if !ok {
+		return beads.ChildrenOfAnyPerParent(s, parentIDs, opts...)
+	}
+	return s.overlayResult(batch.ChildrenOfAny(parentIDs, policyTierQueryOpts(opts)...))
+}
+
+// policyTierQueryOpts restates opts' tier as the policy layer reads it
+// (policyTierFromOpts), keeping every other option.
+func policyTierQueryOpts(opts []beads.QueryOpt) []beads.QueryOpt {
+	out := make([]beads.QueryOpt, 0, len(opts)+1)
+	for _, opt := range opts {
+		if opt == beads.WithBothTiers || opt == beads.WithEphemeral {
+			continue
+		}
+		out = append(out, opt)
+	}
+	switch policyTierFromOpts(opts) {
+	case beads.TierBoth:
+		out = append(out, beads.WithBothTiers)
+	case beads.TierWisps:
+		out = append(out, beads.WithEphemeral)
+	}
+	return out
 }
 
 func (s *beadPolicyStore) Handles() beads.StoreHandles {
 	handles := beads.HandlesFor(s.Store)
-	handles.Cached = beadPolicyCachedReader{CachedReader: handles.Cached}
-	handles.Live = beadPolicyLiveReader{LiveReader: handles.Live}
+	handles.Cached = beadPolicyCachedReader{CachedReader: handles.Cached, policy: s}
+	handles.Live = beadPolicyLiveReader{LiveReader: handles.Live, policy: s}
 	handles.Writer = s
 	return handles
 }
 
+// beadPolicyCachedReader carries both policy read-tier expansion and the
+// session-liveness overlay. The narrow handles bypass beadPolicyStore.List /
+// Get, so the overlay has to be re-applied here or a Handles() consumer would
+// read frozen committed telemetry.
 type beadPolicyCachedReader struct {
 	beads.CachedReader
+	policy *beadPolicyStore
+}
+
+func (r beadPolicyCachedReader) Get(id string) (beads.Bead, error) {
+	b, err := r.CachedReader.Get(id)
+	if err != nil {
+		return b, err
+	}
+	return r.policy.overlayBead(b), nil
 }
 
 func (r beadPolicyCachedReader) List(query beads.ListQuery) ([]beads.Bead, error) {
-	return r.CachedReader.List(expandPolicyReadTier(query))
+	return r.policy.overlayResult(r.CachedReader.List(expandPolicyReadTier(query)))
 }
 
 func (r beadPolicyCachedReader) Ready(query ...beads.ReadyQuery) ([]beads.Bead, error) {
-	return r.CachedReader.Ready(expandPolicyReadyQuery(query...))
+	return r.policy.overlayResult(r.CachedReader.Ready(expandPolicyReadyQuery(query...)))
 }
 
 type beadPolicyLiveReader struct {
 	beads.LiveReader
+	policy *beadPolicyStore
+}
+
+func (r beadPolicyLiveReader) Get(id string) (beads.Bead, error) {
+	b, err := r.LiveReader.Get(id)
+	if err != nil {
+		return b, err
+	}
+	return r.policy.overlayBead(b), nil
 }
 
 func (r beadPolicyLiveReader) List(query beads.ListQuery) ([]beads.Bead, error) {
-	return r.LiveReader.List(expandPolicyReadTier(query))
+	return r.policy.overlayResult(r.LiveReader.List(expandPolicyReadTier(query)))
 }
 
 func (r beadPolicyLiveReader) Ready(query ...beads.ReadyQuery) ([]beads.Bead, error) {
-	return r.LiveReader.Ready(expandPolicyReadyQuery(query...))
+	return r.policy.overlayResult(r.LiveReader.Ready(expandPolicyReadyQuery(query...)))
 }
 
 func (s *beadPolicyStore) Children(parentID string, opts ...beads.QueryOpt) ([]beads.Bead, error) {
@@ -329,7 +455,11 @@ func (s *beadPolicyStore) ListByLabel(label string, limit int, opts ...beads.Que
 		Label:         label,
 		Limit:         limit,
 		IncludeClosed: beads.HasOpt(opts, beads.IncludeClosed),
-		TierMode:      policyTierFromOpts(opts),
+		// Both wrapped implementations (BdStore, CachingStore) set a Sort here;
+		// omitting it left SortDefault, which over a map is non-deterministic
+		// order — so any budgeted consumer got an arbitrary slice (ga-v5vnyp).
+		Sort:     beads.SortCreatedDesc,
+		TierMode: policyTierFromOpts(opts),
 	})
 }
 
@@ -417,6 +547,7 @@ func (s *beadPolicyGraphStore) ApplyGraphPlan(ctx context.Context, plan *beads.G
 	if plan == nil {
 		return s.graphApplierFor(coordclass.ClassWork).ApplyGraphPlan(ctx, plan)
 	}
+	plan = stripGraphPlanLivenessReadKeys(plan)
 	applier := s.graphApplierFor(coordclass.ClassifyGraphPlan(plan))
 	policyName := policyNameForGraphPlan(plan)
 	if policyName == "" {
@@ -427,6 +558,34 @@ func (s *beadPolicyGraphStore) ApplyGraphPlan(ctx context.Context, plan *beads.G
 		return storageApplier.ApplyGraphPlanWithStorage(ctx, plan, beadStorageClass(storage))
 	}
 	return applier.ApplyGraphPlan(ctx, plan)
+}
+
+// stripGraphPlanLivenessReadKeys returns plan with the liveness overlay's
+// synthetic read-side keys removed from every node's metadata and metadata
+// refs — the graph-create arm of the same rule Create applies. The plan and its
+// nodes are copied only when something has to be stripped, so the ordinary
+// dispatch path is untouched, and the caller's plan is never mutated.
+func stripGraphPlanLivenessReadKeys(plan *beads.GraphApplyPlan) *beads.GraphApplyPlan {
+	carries := false
+	for _, node := range plan.Nodes {
+		for k := range node.Metadata {
+			carries = carries || liveness.IsReadSideKey(k)
+		}
+		for k := range node.MetadataRefs {
+			carries = carries || liveness.IsReadSideKey(k)
+		}
+	}
+	if !carries {
+		return plan
+	}
+	stripped := *plan
+	stripped.Nodes = make([]beads.GraphApplyNode, len(plan.Nodes))
+	for i, node := range plan.Nodes {
+		node.Metadata = liveness.StripReadSideKeys(node.Metadata)
+		node.MetadataRefs = liveness.StripReadSideKeys(node.MetadataRefs)
+		stripped.Nodes[i] = node
+	}
+	return &stripped
 }
 
 // policyNameForGraphPlan returns the storage-tier policy name for a graph-apply

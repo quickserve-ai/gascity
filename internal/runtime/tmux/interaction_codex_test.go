@@ -1022,17 +1022,17 @@ func TestRespond_CodexUnreadableOverlayAnswersOnlyDeny(t *testing.T) {
 func TestSnapshotPaneIdle_CodexApprovalOverlayIsNotIdle(t *testing.T) {
 	fe := &fakeExecutor{agentPane: true, out: readCodexApprovalFixture(t, "exec-0.162.1-80x24.txt")}
 	tm := &Tmux{exec: fe}
-	if idle, _ := tm.snapshotPaneIdleWithPrefix("s", "› "); idle {
+	if idle, _ := tm.snapshotPaneIdleWithPrefix("s", "› ", false); idle {
 		t.Fatal("pane showing a Codex approval overlay reported idle")
 	}
 	for _, tc := range codexUnreadableOverlays() {
 		fe.out = tc.pane
-		if idle, _ := tm.snapshotPaneIdleWithPrefix("s", "› "); idle {
+		if idle, _ := tm.snapshotPaneIdleWithPrefix("s", "› ", false); idle {
 			t.Fatalf("pane showing a Codex overlay gc cannot read (%s) reported idle", tc.name)
 		}
 	}
 	fe.out = readCodexApprovalFixture(t, "idle-after-deny-0.162.1-80x24.txt")
-	idle, err := tm.snapshotPaneIdleWithPrefix("s", "› ")
+	idle, err := tm.snapshotPaneIdleWithPrefix("s", "› ", false)
 	if err != nil {
 		t.Fatalf("snapshotPaneIdleWithPrefix: %v", err)
 	}

@@ -516,6 +516,56 @@ func TestInventoryOnDeath_ShutdownDropsQueuedEdges(t *testing.T) {
 	})
 }
 
+// Kills: on_death hooks run under a controller store newer than this binary
+// (ga-mw4dg). A reload that latches the skew after startup holds the tick;
+// the worker holds the same way, before any re-check, and shutdown drops the
+// queue.
+func TestInventoryOnDeath_SchemaSkewHoldsWorker(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		sp := newScriptedInventoryProvider("worker-1")
+		cr, hooks, stderr := onDeathLaneRuntime(t, sp, onDeathHandlers("worker-1"))
+		cs := &controllerState{}
+		cr.setControllerState(cs)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := cr.startOnDeathWorker(ctx, cr.inventoryLane)
+		defer func() {
+			cancel()
+			<-done
+		}()
+		first := sp.calls()
+		passAndDrain(cr)
+		perPass := sp.calls() - first
+
+		cs.mu.Lock()
+		cs.cityBeadsDiagnostic = &beads.BeadsDiagnostic{
+			Store: beads.BeadsStoreNameBdStore, PreflightGate: "native_open",
+			PreflightReason: "schema version mismatch: database is at v55, binary knows up to v54 (1 migration ahead)",
+		}
+		cs.mu.Unlock()
+		sp.setListing(nil)
+		before := sp.calls()
+		passAndDrain(cr) // worker-1's edge is queued; the worker holds
+
+		if got := hooks.commands(); len(got) != 0 {
+			t.Fatalf("hooks = %v, want none under a schema-skewed controller store", got)
+		}
+		if got := sp.calls() - before; got != perPass {
+			t.Fatalf("listings = %d, want only the pass's %d (no re-check under the hold)", got, perPass)
+		}
+		if !strings.Contains(stderr.String(), "CRITICAL") || !cr.preserveSessionsShutdown.Load() {
+			t.Fatalf("hold did not alarm and latch session preservation; stderr = %q", stderr.String())
+		}
+		cancel()
+		<-done
+		if got := hooks.commands(); len(got) != 0 {
+			t.Fatalf("hooks = %v after shutdown, want the queued edge dropped", got)
+		}
+		if cr.onDeathGate().Pending("worker-1") {
+			t.Fatal("worker-1 still held after shutdown")
+		}
+	})
+}
+
 // Kills: prev reset on a provider swap (legacy parity). The reload stops the
 // old provider's sessions; the new provider's first complete pass fires for
 // them even though its backend labels differ, and a partial one does not.

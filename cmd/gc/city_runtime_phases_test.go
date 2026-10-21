@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -258,6 +259,42 @@ func assertLinesEqual(t *testing.T, what string, got, want []string) {
 	}
 }
 
+// seatWorkLiveListSuffix ends the recorded line of one of SeatWork's live
+// per-status lists (SeatWork.load), which name no type, label or metadata.
+const seatWorkLiveListSuffix = " type= label= metadata= include_closed=false live=true"
+
+// orderSeatWorkLiveLists returns lines with each adjacent run of SeatWork's
+// live per-status lists sorted into seatWorkStatuses order. SeatWork.load
+// issues those lists at once, one goroutine each, and keeps each result by its
+// list's index, so no caller depends on the order the store sees them in, and
+// the store records them in whatever order they run (pl-fvcu: "open" before
+// "in_progress" on one run in many). Every other line keeps its place, so the
+// rest of a sequence is still compared strictly.
+func orderSeatWorkLiveLists(lines []string) []string {
+	rank := func(line string) int {
+		if !strings.HasPrefix(line, "List status=") || !strings.HasSuffix(line, seatWorkLiveListSuffix) {
+			return -1
+		}
+		status := strings.TrimSuffix(strings.TrimPrefix(line, "List status="), seatWorkLiveListSuffix)
+		return slices.Index(seatWorkStatuses, status)
+	}
+	out := append([]string(nil), lines...)
+	for i := 0; i < len(out); {
+		j := i
+		for j < len(out) && rank(out[j]) >= 0 {
+			j++
+		}
+		if j == i {
+			i++
+			continue
+		}
+		run := out[i:j]
+		sort.SliceStable(run, func(a, b int) bool { return rank(run[a]) < rank(run[b]) })
+		i = j
+	}
+	return out
+}
+
 // phaseFixtureConfig is a soft-reload city whose reloaded config turns on
 // every config-gated tick phase: wisp GC, the closed-bead worktree reaper
 // (dry run, so it removes nothing) and chat auto-suspend.
@@ -451,6 +488,12 @@ func TestCityRuntimeTickPhasesMatchLegacyTickRecordsAndStoreOps(t *testing.T) {
 				"Get gc-1",
 				"SetMetadataBatch gc-1 state",
 				"SetMetadataBatch gc-1 effective_sleep_after_idle,requested_sleep_after_idle,sleep_capability,sleep_policy_source",
+				// The carry's gc-mdh0 assigned-work probe before a timer drain (replayed
+				// upstream #6168), read through the tick's SeatWork since #7552/#7561:
+				// one live list per status, issued at once, so compared in either
+				// order (orderSeatWorkLiveLists).
+				"List status=in_progress type= label= metadata= include_closed=false live=true",
+				"List status=open type= label= metadata= include_closed=false live=true",
 				"Get gc-1",
 				"Get gc-1",
 				"List status=open type=session label= metadata= include_closed=false live=false",
@@ -541,6 +584,12 @@ func TestCityRuntimeTickPhasesMatchLegacyTickRecordsAndStoreOps(t *testing.T) {
 				"Get gc-1",
 				"SetMetadataBatch gc-1 state",
 				"SetMetadataBatch gc-1 effective_sleep_after_idle,requested_sleep_after_idle,sleep_capability,sleep_policy_source",
+				// The carry's gc-mdh0 assigned-work probe before a timer drain (replayed
+				// upstream #6168), read through the tick's SeatWork since #7552/#7561:
+				// one live list per status, issued at once, so compared in either
+				// order (orderSeatWorkLiveLists).
+				"List status=in_progress type= label= metadata= include_closed=false live=true",
+				"List status=open type= label= metadata= include_closed=false live=true",
 				"Get gc-1",
 				"Get gc-1",
 				"List status=open type=session label= metadata= include_closed=false live=false",
@@ -557,7 +606,7 @@ func TestCityRuntimeTickPhasesMatchLegacyTickRecordsAndStoreOps(t *testing.T) {
 			gotStore := store.recorded()
 			gotOps := tickOperationRecords(t, cr)
 			assertLinesEqual(t, "tick operation records", gotOps, tc.wantOps)
-			assertLinesEqual(t, "tick store calls", gotStore, tc.wantStore)
+			assertLinesEqual(t, "tick store calls", orderSeatWorkLiveLists(gotStore), orderSeatWorkLiveLists(tc.wantStore))
 		})
 	}
 }
@@ -571,12 +620,15 @@ func tickPhaseNames(phases []tickPhase) []string {
 }
 
 // Kills: a tick phase reordered, skipped or duplicated. The list is the
-// tick as main ran it before the split; the session column is what the v2
-// reconciler takes over.
+// tick as main ran it before the split, with the carry's pool-death order
+// (liveness observed before the reload, deaths acted on after the schema-skew
+// hold, ga-mw4dg); the session column is what the v2 reconciler takes over.
 func TestCityRuntimeTickLegacyPhaseSequenceUnchanged(t *testing.T) {
 	want := []string{
-		"reconcile_pool_deaths",
+		"observe_pool_liveness",
 		"config_reload",
+		"schema_skew_hold",
+		"reconcile_pool_deaths",
 		"fs_pressure_gate",
 		"managed_dolt_preflight",
 		"wake_orders_lane",
@@ -653,7 +705,7 @@ func TestCityRuntimeStartupLegacyPhaseSequenceUnchanged(t *testing.T) {
 		"controller.tick.phase bead_reconcile.nudge_dispatch_tick",
 		"controller.tick.phase bead_reconcile.nudge_stalled_pool_claims",
 	})
-	assertLinesEqual(t, "startup store calls", store.recorded(), []string{
+	assertLinesEqual(t, "startup store calls", orderSeatWorkLiveLists(store.recorded()), orderSeatWorkLiveLists([]string{
 		"List status=open type=session label= metadata= include_closed=false live=false",
 		"List status=open type= label=gc:session metadata= include_closed=false live=false",
 		"List status=open type=session label= metadata= include_closed=false live=false",
@@ -670,6 +722,12 @@ func TestCityRuntimeStartupLegacyPhaseSequenceUnchanged(t *testing.T) {
 		"Get gc-1",
 		"SetMetadataBatch gc-1 state",
 		"SetMetadataBatch gc-1 effective_sleep_after_idle,requested_sleep_after_idle,sleep_capability,sleep_policy_source",
+		// The carry's gc-mdh0 assigned-work probe before a timer drain (replayed
+		// upstream #6168), read through the tick's SeatWork since #7552/#7561:
+		// one live list per status, issued at once, so compared in either
+		// order (orderSeatWorkLiveLists).
+		"List status=in_progress type= label= metadata= include_closed=false live=true",
+		"List status=open type= label= metadata= include_closed=false live=true",
 		"Get gc-1",
 		"Get gc-1",
 		"List status=open type=session label= metadata= include_closed=false live=false",
@@ -677,7 +735,7 @@ func TestCityRuntimeStartupLegacyPhaseSequenceUnchanged(t *testing.T) {
 		"List status=open type= label=session:gc-1 metadata= include_closed=false live=false",
 		"List status= type=session label= metadata= include_closed=false live=false",
 		"List status= type= label=gc:session metadata= include_closed=false live=false",
-	})
+	}))
 	if got := passCompletion(records, "startup"); got != TraceCompletionCompleted {
 		t.Errorf("startup trace completion = %q, want %q", got, TraceCompletionCompleted)
 	}
@@ -798,8 +856,10 @@ func transcriptMetaStarted(cr *CityRuntime) bool {
 // writes nothing to the session row and traces no session phase.
 func TestCityRuntimeTickV2RunsMaintenancePhasesOnly(t *testing.T) {
 	assertLinesEqual(t, "v2 tick phases", taggedPhaseNames(maintenancePhases(legacyTickPhases)), []string{
-		"reconcile_pool_deaths",
+		"observe_pool_liveness",
 		"config_reload",
+		"schema_skew_hold",
+		"reconcile_pool_deaths",
 		"fs_pressure_gate",
 		"managed_dolt_preflight",
 		"wake_orders_lane",

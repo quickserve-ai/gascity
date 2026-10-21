@@ -105,7 +105,7 @@ endif
 endif
 endif
 
-.PHONY: build check check-all check-bd check-docker check-docs check-dolt check-hooks check-eventexport-isolation check-gomod-replace check-core-boundary check-native-dependency-surface check-routed-test-rows check-split-topology-rows check-version-tag lint lint-changed lint-affected lint-full lint-golangci vet-go fmt-check fmt-check-changed fmt vet test test-ci-policy test-mac test-fast-parallel test-fsys-darwin-compile test-herdr-live test-pack-registry-live test-native-doltlite-beads test-cmd-gc-process test-cmd-gc-process-shard test-cmd-gc-process-parallel test-productmetrics-testhook test-worker-core test-worker-core-phase2 test-worker-core-phase2-all test-worker-core-phase2-real-transport setup-worker-inference test-worker-inference test-worker-inference-phase3 test-acceptance test-beads-topology-matrix test-bd-cli-contract test-bd-cli-contract-home-isolation test-bd-conditional-release-contract test-acceptance-b test-acceptance-split-storage test-acceptance-c test-acceptance-all test-tutorial-goldens test-tutorial-regression test-tutorial test-integration test-integration-shards test-integration-shards-parallel test-integration-shards-cover test-integration-packages test-integration-packages-cover test-integration-review-formulas test-integration-review-formulas-cover test-integration-review-formulas-basic test-integration-review-formulas-basic-cover test-integration-review-formulas-retries test-integration-review-formulas-retries-cover test-integration-review-formulas-recovery test-integration-review-formulas-recovery-cover test-integration-bdstore test-integration-bdstore-cover test-integration-rest test-integration-rest-cover test-integration-rest-smoke test-integration-rest-smoke-cover test-integration-rest-full test-integration-rest-full-cover test-local-full-parallel test-mail-wisp-insert test-mcp-mail test-openclaw-bridge test-docker test-k8s test-cover test-cover-mac test-cover-noncmdgc test-cover-cmdgc-shard cover check-self-contained install install-tools install-buildx install-oasdiff openapi-breaking-check setup clean generate check-schema complexity complexity-diff complexity-check complexity-update docker-base docker-agent docker-controller docs-dev diagrams-excalidraw dashboard-build dashboard-build-npm dashboard-generate-client dashboard-lock dashboard-dev dashboard-check dashboard-check-npm dashboard-ci dashboard-smoke dashboard-e2e-go dashboard-e2e-play dashboard-e2e
+.PHONY: build check check-all check-bd check-docker check-docs check-dolt check-hooks check-eventexport-isolation check-gomod-replace check-core-boundary check-native-dependency-surface check-routed-test-rows check-split-topology-rows check-atomic-binary-swap check-version-tag lint lint-changed lint-affected lint-full lint-golangci vet-go fmt-check fmt-check-changed fmt vet test test-ci-policy test-mac test-fast-parallel test-fsys-darwin-compile test-herdr-live test-pack-registry-live test-native-doltlite-beads test-cmd-gc-process test-cmd-gc-process-shard test-cmd-gc-process-parallel test-productmetrics-testhook test-worker-core test-worker-core-phase2 test-worker-core-phase2-all test-worker-core-phase2-real-transport setup-worker-inference test-worker-inference test-worker-inference-phase3 test-acceptance test-beads-topology-matrix test-bd-cli-contract test-bd-cli-contract-home-isolation test-bd-conditional-release-contract test-acceptance-b test-acceptance-split-storage test-acceptance-c test-acceptance-all test-tutorial-goldens test-tutorial-regression test-tutorial test-integration test-integration-shards test-integration-shards-parallel test-integration-shards-cover test-integration-packages test-integration-packages-cover test-integration-review-formulas test-integration-review-formulas-cover test-integration-review-formulas-basic test-integration-review-formulas-basic-cover test-integration-review-formulas-retries test-integration-review-formulas-retries-cover test-integration-review-formulas-recovery test-integration-review-formulas-recovery-cover test-integration-bdstore test-integration-bdstore-cover test-integration-rest test-integration-rest-cover test-integration-rest-smoke test-integration-rest-smoke-cover test-integration-rest-full test-integration-rest-full-cover test-local-full-parallel test-mail-wisp-insert test-mcp-mail test-openclaw-bridge test-docker test-k8s test-cover test-cover-mac test-cover-noncmdgc test-cover-cmdgc-shard cover check-self-contained install install-tools install-buildx install-oasdiff openapi-breaking-check setup clean generate check-schema complexity complexity-diff complexity-check complexity-update docker-base docker-agent docker-controller docs-dev diagrams-excalidraw dashboard-build dashboard-build-npm dashboard-generate-client dashboard-lock dashboard-dev dashboard-check dashboard-check-npm dashboard-ci dashboard-smoke dashboard-e2e-go dashboard-e2e-play dashboard-e2e
 .PHONY: check-release-dist-ignore
 .PHONY: bazel-tmpdir test-go check-go check-all-go check-docs-go test-acceptance-go test-integration-go
 
@@ -134,11 +134,23 @@ bazel-tmpdir:
 	@mkdir -p /tmp/bt
 
 ## build: compile gc binary with version metadata
+## The binary is produced at a temp path in the SAME directory, signed there,
+## and swapped in by ATOMIC RENAME (ga-pmeo1). Never write $(BUILD_DIR)/$(BINARY)
+## in place: `codesign --force` rewrites the file without changing its inode, and
+## on macOS a running process whose inode is rewritten underneath it is SIGKILLed
+## against the stale cached cdhash ("Code Signature Invalid"). Renaming swaps the
+## directory entry instead, so any process already running the old binary keeps
+## its own intact inode.
 build:
-	go build -buildvcs=false -ldflags "$(LDFLAGS)" -o $(BUILD_DIR)/$(BINARY) ./cmd/gc
-ifeq ($(shell uname),Darwin)
-	@scripts/sign-darwin-local.sh $(BUILD_DIR)/$(BINARY)
-endif
+	@mkdir -p $(BUILD_DIR)
+	@set -e; \
+		tmp="$(BUILD_DIR)/.$(BINARY).build.$$$$"; \
+		trap 'rm -f "$$tmp"' EXIT INT TERM HUP; \
+		go build -buildvcs=false -ldflags "$(LDFLAGS)" -o "$$tmp" ./cmd/gc; \
+		if [ "$$(uname)" = "Darwin" ]; then scripts/sign-darwin-local.sh "$$tmp"; fi; \
+		chmod 0755 "$$tmp"; \
+		mv -f "$$tmp" "$(BUILD_DIR)/$(BINARY)"; \
+		trap - EXIT INT TERM HUP
 
 ## check-self-contained: assert the built gc binary is self-contained (Linux/Nix ICU rpath).
 ## Only enforced when the Nix/Flox ICU block above fired (_NIX_ICU_DEV set):
@@ -170,13 +182,51 @@ endif
 
 ## install: build and install gc to GOPATH/bin (same location as go install)
 install: check-self-contained
+	@# Deploy-freeze gate (ga-rfdkxp): a gated frozen candidate must not be
+	@# silently superseded by a routine install. The just-built binary runs
+	@# the exact Go guard (JSON parse, fail-closed on malformed/unreadable,
+	@# archive-or-refuse on ack) — never a shell reimplementation, which
+	@# drifted fail-open (sed-mined bead from malformed bytes; ignored mv
+	@# failure). Supersede consciously with FREEZE_ACK=<bead>, which leaves
+	@# a durable record and demands a stamp on the bead.
+	@if ! "$(BUILD_DIR)/$(BINARY)" supervisor check-freeze --acknowledge-freeze "$(FREEZE_ACK)"; then \
+		echo "       (via make: make install FREEZE_ACK=<bead>)"; \
+		exit 1; \
+	fi
 	@mkdir -p $(INSTALL_DIR)
 	@set -e; \
 		tmp="$(INSTALL_DIR)/.$(BINARY).tmp.$$$$"; \
-		trap 'rm -f "$$tmp"' EXIT INT TERM HUP; \
+		backup="$(INSTALL_DIR)/$(BINARY).bak-$$(date +%Y%m%d-%H%M%S)"; \
+		out=$$(mktemp); \
+		trap 'rm -f "$$tmp" "$$out"' EXIT INT TERM HUP; \
 		cp -f "$(BUILD_DIR)/$(BINARY)" "$$tmp"; \
 		chmod 0755 "$$tmp"; \
+		./scripts/sign-staged.sh "$$tmp"; \
+		set +e; "$$tmp" version > "$$out" 2>&1; rc=$$?; set -e; \
+		if [ $$rc -ne 0 ] || [ ! -s "$$out" ]; then \
+			echo "FATAL: staged $(BINARY) will not execute (exit=$$rc, output=$$(wc -c < "$$out") bytes)."; \
+			exit 1; \
+		fi; \
+		if [ -e "$(INSTALL_DIR)/$(BINARY)" ]; then cp -p "$(INSTALL_DIR)/$(BINARY)" "$$backup"; fi; \
 		mv -f "$$tmp" "$(INSTALL_DIR)/$(BINARY)"; \
+		: > "$$out"; \
+		set +e; "$(INSTALL_DIR)/$(BINARY)" version > "$$out" 2>&1; rc=$$?; set -e; \
+		if [ $$rc -ne 0 ] || [ ! -s "$$out" ]; then \
+			echo "FATAL: installed $(INSTALL_DIR)/$(BINARY) will not execute (exit=$$rc, output=$$(wc -c < "$$out") bytes)."; \
+			echo "       Exit 137 with no output means macOS SIGKILLed it for an invalid"; \
+			echo "       code signature. Restoring the previous binary by atomic rename."; \
+			if [ -e "$$backup" ]; then \
+				mv -f "$$backup" "$(INSTALL_DIR)/$(BINARY)"; \
+				: > "$$out"; \
+				set +e; "$(INSTALL_DIR)/$(BINARY)" version > "$$out" 2>&1; rollback_rc=$$?; set -e; \
+				if [ $$rollback_rc -ne 0 ] || [ ! -s "$$out" ]; then \
+					echo "FATAL: restored $(BINARY) also failed verification (exit=$$rollback_rc, output=$$(wc -c < "$$out") bytes)."; \
+				fi; \
+			fi; \
+			exit 1; \
+		fi; \
+		echo "Verified $(INSTALL_DIR)/$(BINARY) executes: $$(cat "$$out")"; \
+		( cd "$(INSTALL_DIR)" && ls -t $(BINARY).bak-* 2>/dev/null | tail -n +3 | while read -r old; do rm -f -- "$$old" && echo "Pruned old backup: $$old"; done ); \
 		trap - EXIT INT TERM HUP
 	@# Migrate from old install location: replace stale binary with symlink
 	@if [ "$(INSTALL_DIR)" != "$(HOME)/.local/bin" ]; then \
@@ -220,10 +270,18 @@ complexity-update:
 	@./scripts/ci/complexity.sh update
 
 ## check: fast quality gates: the shell guards below plus `make test` (bazel test //...: nogo lint/vet, formatting, generated artifacts, unit tests)
-check: check-release-dist-ignore check-routed-test-rows check-split-topology-rows check-residency-boundary test
+check: check-release-dist-ignore check-routed-test-rows check-split-topology-rows check-residency-boundary check-atomic-binary-swap test
 
 ## check-go: the same gates without Bazel: golangci-lint fmt/lint, go vet, go test (offline convenience; CI does not run it)
-check-go: fmt-check lint-golangci vet-go check-release-dist-ignore check-routed-test-rows check-split-topology-rows check-residency-boundary test-go
+check-go: fmt-check lint-golangci vet-go check-release-dist-ignore check-routed-test-rows check-split-topology-rows check-residency-boundary check-atomic-binary-swap test-go
+
+## check-atomic-binary-swap: keep build/install swapping the gc binary by atomic
+## rename, and keep install's verification exec unpiped. An in-place write to a
+## live gc reuses the inode and SIGKILLs running processes against the stale
+## cached code signature -- silent, and it looks like a flaky supervisor.
+## See ga-l8pur (the outages) and ga-pmeo1 (this class fix).
+check-atomic-binary-swap:
+	@scripts/check-atomic-binary-swap.sh
 
 ## check-release-dist-ignore: keep GoReleaser output from marking release builds dirty
 check-release-dist-ignore:
@@ -341,6 +399,8 @@ LINT_GOMEMLIMIT ?= 6GiB
 LINT_ENV = GOFLAGS="$(QUALITY_GATE_GOFLAGS)" GOMEMLIMIT=$(LINT_GOMEMLIMIT)
 QUALITY_GATE_GOFLAGS = $$(go env GOFLAGS | sed -E 's/(^|[[:space:]])-mod=[^[:space:]]+//g') -mod=readonly
 CI_STATIC_SELECT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))scripts/ci-static-select
+# CI_STATIC_GO is the go binary make check-lean-local runs (vet, build, test).
+CI_STATIC_GO ?= go
 
 # Lint and vet run as nogo (//tools/nogo): go vet's analyzers plus the
 # linters .golangci.yml enables, validated beside every Go compile, so
@@ -412,6 +472,20 @@ lint-golangci: $(GOLANGCI_LINT)
 ## vet-go: plain `go vet` outside Bazel, for hosts nogo does not cover (macOS jobs)
 vet-go:
 	GOFLAGS="$(QUALITY_GATE_GOFLAGS)" go vet ./...
+
+## check-lean-local: vet/build all packages, then fast tests for affected packages
+## Set LINT_CHANGED_REF to the fetched integration base; defaults to HEAD for
+## local edits. Reuses the ICU CPPFLAGS (C AND C++) and isolated test environment.
+## Selection errors stop instead of silently running a full suite on the host.
+## This is local feedback, never a replacement for required server-side CI.
+## LEAN_LOCAL_CI_ONLY="./cmd/gc" leaves the named packages' tests to CI; vet/build stay.
+.PHONY: check-lean-local
+check-lean-local:
+	$(TEST_ENV) GC_FAST_UNIT=1 GOMAXPROCS=2 \
+		CGO_CFLAGS="$${CGO_CFLAGS-}" CGO_CXXFLAGS="$${CGO_CXXFLAGS-}" \
+		LINT_CHANGED_REF="$(LINT_CHANGED_REF)" LINT_CHANGED_SCOPE="$(LINT_CHANGED_SCOPE)" \
+		LEAN_LOCAL_CI_ONLY="$(LEAN_LOCAL_CI_ONLY)" \
+		"$(CI_STATIC_SELECT)" check-lean-local "$(CI_STATIC_GO)"
 
 ## fmt-check: fail if formatting would change files
 fmt-check: $(GOLANGCI_LINT)
@@ -652,7 +726,7 @@ setup-worker-inference:
 ## credential; the isolation this suite relies on flows through the per-run
 ## GC_HOME it hands to the gc subprocesses it spawns.
 test-worker-inference:
-	$(TEST_ENV) GC_ACCEPTANCE_BD_BIN="$${GC_ACCEPTANCE_BD_BIN-}" GC_WORKER_INFERENCE_CURSOR_API_KEY="$${GC_WORKER_INFERENCE_CURSOR_API_KEY-}" GC_WORKER_INFERENCE_CURSOR_API_KEY_FILE="$${GC_WORKER_INFERENCE_CURSOR_API_KEY_FILE-}" CURSOR_API_KEY="$${CURSOR_API_KEY-}" PROFILE="$(WORKER_INFERENCE_PROFILE)" GC_WORKER_REPORT_DIR="$(GC_WORKER_REPORT_DIR)" GC_HOME="$${GC_HOME:-$$HOME/.gc}" GC_TESTENV_PASSTHROUGH=GC_HOME go test -count=1 -tags acceptance_c -timeout 45m -v ./test/acceptance/worker_inference
+	$(TEST_ENV) GC_ALLOW_AMBIENT_PROVIDER_CREDS_IN_TESTS=1 GC_ACCEPTANCE_BD_BIN="$${GC_ACCEPTANCE_BD_BIN-}" GC_WORKER_INFERENCE_CURSOR_API_KEY="$${GC_WORKER_INFERENCE_CURSOR_API_KEY-}" GC_WORKER_INFERENCE_CURSOR_API_KEY_FILE="$${GC_WORKER_INFERENCE_CURSOR_API_KEY_FILE-}" CURSOR_API_KEY="$${CURSOR_API_KEY-}" PROFILE="$(WORKER_INFERENCE_PROFILE)" GC_WORKER_REPORT_DIR="$(GC_WORKER_REPORT_DIR)" GC_HOME="$${GC_HOME:-$$HOME/.gc}" GC_TESTENV_PASSTHROUGH=GC_HOME go test -count=1 -tags acceptance_c -timeout 45m -v ./test/acceptance/worker_inference
 
 ## test-worker-inference-phase3: alias for the live worker inference conformance package
 test-worker-inference-phase3: test-worker-inference
@@ -793,7 +867,7 @@ test-acceptance-split-storage:
 
 ## test-acceptance-c: run Tier C acceptance tests (real inference, ~30-40 min, manual/nightly)
 test-acceptance-c:
-	$(TEST_ENV) go test -tags acceptance_c -timeout 45m -v ./test/acceptance/tier_c/...
+	$(TEST_ENV) GC_ALLOW_AMBIENT_PROVIDER_CREDS_IN_TESTS=1 go test -tags acceptance_c -timeout 45m -v ./test/acceptance/tier_c/...
 
 ## test-acceptance-all: run all acceptance tiers
 test-acceptance-all: test-acceptance test-bd-cli-contract test-acceptance-b test-acceptance-c
@@ -929,7 +1003,7 @@ test-chaos-dolt:
 ## test-tutorial-goldens: run tutorial golden acceptance tests (requires tmux, dolt, bd, claude auth)
 ## These exercise the published tutorial flow with real inference — run before each release.
 test-tutorial-goldens:
-	$(TEST_ENV) go test -tags acceptance_c -timeout 90m -v ./test/acceptance/tutorial_goldens/...
+	$(TEST_ENV) GC_ALLOW_AMBIENT_PROVIDER_CREDS_IN_TESTS=1 go test -tags acceptance_c -timeout 90m -v ./test/acceptance/tutorial_goldens/...
 
 ## test-tutorial: alias for tutorial goldens
 test-tutorial: test-tutorial-goldens

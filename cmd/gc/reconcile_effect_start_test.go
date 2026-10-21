@@ -383,6 +383,7 @@ var stateWriters = map[string]string{
 	"internal/session/lifecycle_transition.go:QuarantinePatch":                "patch builder",
 	"internal/session/lifecycle_transition.go:ReactivatePatch":                "patch builder",
 	"internal/session/lifecycle_transition.go:RequestWakePatch":               "patch builder",
+	"internal/session/lifecycle_transition.go:RevertDrainAckStopPendingPatch": "patch builder (legacy drain-ack reverts its own stop-pending mark)",
 	"internal/session/lifecycle_transition.go:SleepPatch":                     "patch builder (gc session kill, idle sleep)",
 	"internal/session/manager.go:Manager.createBeadOnly":                      "create's initial metadata",
 	"internal/session/manager.go:Manager.createStarted":                       "create's initial metadata",
@@ -398,6 +399,10 @@ var stateWriters = map[string]string{
 	"internal/session/wait_store.go:Store.MarkWaitReadyForRedelivery":         "wait bead, not a row",
 	"internal/session/wait_store.go:Store.RetryClosedWait":                    "wait bead, not a row",
 	"internal/session/wait_store.go:Store.cancelWaitsAndCollectNudgeIDs":      "wait bead, not a row",
+
+	// The carry's ga-dfp1b create-side guard: a pool create routed at a
+	// configured named template mints the canonical named row instead.
+	"cmd/gc/build_desired_state.go:mintConfiguredNamedSessionBeadForPoolCreate": "create's initial metadata",
 }
 
 // Kills an unclassified writer of state outside the planner (SC R1): every

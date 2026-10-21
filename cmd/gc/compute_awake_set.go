@@ -149,6 +149,29 @@ type AwakeWorkBead struct {
 	// releases the session's scale slot, which can wake a different session
 	// as scaled:demand.
 	Blocked bool
+	// CertParked is true when an in_progress bead is parked on a certification
+	// wait (beadmeta.CertParkSuppressesAssignedWake: hold:cert-wait with no
+	// cert:landed / cert:action), as read LIVE for this tick — never from the
+	// controller's cached row, whose labels the reconcile scan skips. A parked
+	// bead is still owned, but its owner can do nothing with it until the
+	// cert-landing-patrol flips it, so it is not wake demand (ga-mzovhi,
+	// doctrine ga-5zosxs). Removing the hold label is what restores demand, so
+	// the patrol's durable flip wakes the owner without relying on its nudge.
+	//
+	// Like Blocked, it is not purely suppressive: countAssignedScaleSlots no
+	// longer counts the owner as a filled scale slot, so scale_check demand can
+	// wake a different ACTIVE session as scaled:demand. It does not free pool
+	// capacity: the asleep owner's session still exists and still counts
+	// wherever pool session occupancy is counted.
+	CertParked bool
+	// ReleaseProposed is true when a session teardown withheld this bead's
+	// release because it is a named agent's work, and the proposal is still
+	// pending for a judge (ga-9n8hjv, fence #1). The bead keeps its owner, but
+	// its fate is the judge's, so it is not wake demand. Without this a named
+	// seat that drain-acks while holding a claim (the claim is now kept, where
+	// it used to be released) is re-woken by that same claim, drain-acks again,
+	// and loops. Clearing the proposal restores demand.
+	ReleaseProposed bool
 }
 
 // AwakeDecision is the output for a single session.
@@ -176,6 +199,12 @@ type AwakeDecision struct {
 	// restart-style cycle so the next wake starts a fresh conversation on
 	// the newly assigned bead.
 	RequiresFreshCycle bool
+	// HasCertParkedWork is true when the session owns at least one in_progress
+	// bead marked CertParked. The reconciler reads it to keep a parked owner
+	// out of the stranded-worker repair: an asleep pool seat with no wake
+	// reason that still holds in_progress work is otherwise reaped as stranded,
+	// which would unassign the parked bead the patrol later flips (ga-mzovhi).
+	HasCertParkedWork bool
 }
 
 // awakeKey selects how computeAwakeSetKeyed keys its decisions and reads the
@@ -291,6 +320,12 @@ func computeAwakeSetKeyed(input AwakeInput, keyBy awakeKey) map[string]AwakeDeci
 	// is no longer visible on the very next tick.
 	for _, bead := range input.SessionBeads {
 		if !bead.PendingCreate {
+			continue
+		}
+		// Not for a suspended agent, like every other wake cause here: a
+		// nudge-materialized bead for the suspended platform refinery was
+		// launched through this path (ga-9qanni).
+		if agent, ok := lookupAgent(bead.Template); ok && agent.Suspended {
 			continue
 		}
 		desired[key(bead)] = "pending-create"
@@ -543,6 +578,11 @@ func computeAwakeSetKeyed(input AwakeInput, keyBy awakeKey) map[string]AwakeDeci
 		if !bead.ContinuationResetPending || bead.RestartRequested || bead.WaitHold || bead.Drained {
 			continue
 		}
+		// A handoff or restart request does not relaunch a suspended agent
+		// (ga-9qanni); the reset stays pending for the resume.
+		if agent, ok := lookupAgent(bead.Template); ok && agent.Suspended {
+			continue
+		}
 		switch desired[key(bead)] {
 		case "pending-create", "explicit-wake":
 			continue
@@ -553,12 +593,20 @@ func computeAwakeSetKeyed(input AwakeInput, keyBy awakeKey) map[string]AwakeDeci
 
 	// Step 2-3: Decide awake
 	result := make(map[string]AwakeDecision)
+	anyCertParked := false
+	for _, wb := range input.WorkBeads {
+		if wb.CertParked {
+			anyCertParked = true
+			break
+		}
+	}
 
 	for _, bead := range input.SessionBeads {
 		name := key(bead)
 		anchor, hasAssignedWork := assignedAnchor[name]
 		decision := AwakeDecision{
-			HasAssignedWork: hasAssignedWork,
+			HasAssignedWork:   hasAssignedWork,
+			HasCertParkedWork: anyCertParked && sessionHasCertParkedWork(input.WorkBeads, input.NamedSessions, bead),
 		}
 		if hasAssignedWork {
 			decision.AssignedWorkBeadID = anchor
@@ -600,10 +648,14 @@ func computeAwakeSetKeyed(input AwakeInput, keyBy awakeKey) map[string]AwakeDeci
 			decision.Reason = "pending"
 		}
 
-		// Ready wait — durable wait deadline passed, resume session
+		// Ready wait — durable wait deadline passed, resume session. Not for
+		// a suspended agent: a wait that resolves after the suspension would
+		// relaunch the seat (ga-9qanni). The wait stays ready for the resume.
 		if input.ReadyWaitSet[bead.ID] {
-			decision.ShouldWake = true
-			decision.Reason = "wait-ready"
+			if agent, ok := lookupAgent(bead.Template); !ok || !agent.Suspended {
+				decision.ShouldWake = true
+				decision.Reason = "wait-ready"
+			}
 		}
 
 		// On-demand running override — on-demand sessions that are
@@ -616,8 +668,13 @@ func computeAwakeSetKeyed(input AwakeInput, keyBy awakeKey) map[string]AwakeDeci
 		if !decision.ShouldWake && !bead.Drained && !bead.WaitHold &&
 			bead.SleepReason != string(sessionpkg.SleepReasonIdleTimeout) {
 			if input.RunningSessions[name] && isOnDemandSession(input.NamedSessions, bead) {
-				decision.ShouldWake = true
-				decision.Reason = "on-demand:running"
+				// A suspended agent's running on-demand session is not kept
+				// awake: suspension stops it, and #6307 keeps its bead for
+				// resume (ga-9qanni).
+				if agent, ok := lookupAgent(bead.Template); !ok || !agent.Suspended {
+					decision.ShouldWake = true
+					decision.Reason = "on-demand:running"
+				}
 			}
 		}
 
@@ -925,10 +982,24 @@ func sessionHasClaimedInProgressWork(workBeads []AwakeWorkBead, named []AwakeNam
 	return false
 }
 
+// sessionHasCertParkedWork reports whether the session owns in_progress work
+// parked on a certification wait (AwakeWorkBead.CertParked).
+func sessionHasCertParkedWork(workBeads []AwakeWorkBead, named []AwakeNamedSession, bead AwakeSessionBead) bool {
+	for _, wb := range workBeads {
+		if wb.Status == "in_progress" && wb.CertParked && sessionAssigneeMatches(named, bead, strings.TrimSpace(wb.Assignee)) {
+			return true
+		}
+	}
+	return false
+}
+
 func workBeadHasAwakeDemand(bead AwakeWorkBead) bool {
+	if bead.ReleaseProposed {
+		return false
+	}
 	switch bead.Status {
 	case "in_progress":
-		return !bead.Blocked
+		return !bead.Blocked && !bead.CertParked
 	case "open":
 		return bead.Ready
 	default:

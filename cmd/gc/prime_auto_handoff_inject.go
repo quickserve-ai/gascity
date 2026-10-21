@@ -58,6 +58,7 @@ func primeHookContextSuffix(cityPath string, sessionStart *primeSessionStart, st
 		if !startMail.ownSessionClosed {
 			injection.text += primeUnreadMailInjectionFromInbox(startMail.autoHandoffIDs, startMail.ordinaryProvider, startMail.inbox)
 		}
+		injection.text += primeLaurelsInjection(cityPath, strings.TrimSpace(os.Getenv("GC_AGENT")), stderr)
 	}
 	return injection
 }

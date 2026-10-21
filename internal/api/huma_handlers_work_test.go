@@ -67,6 +67,7 @@ func fullReadyBead() readywork.ReadyBead {
 		IsBlocked:    &blocked,
 		CloseReason:  "reason",
 		BlockedBy:    []readywork.ReadyBeadBlocker{{ID: "gc-0", Status: "open"}},
+		AwaitType:    "bead",
 	}
 }
 

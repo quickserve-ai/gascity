@@ -66,6 +66,45 @@ func runFFSync(t *testing.T, binDir string, args ...string) string {
 	return out
 }
 
+// runFFSyncStatus is runFFSync plus the process exit code, for tests that
+// assert on the exit-code contract rather than just push/no-push behavior.
+func runFFSyncStatus(t *testing.T, binDir string, args ...string) (string, int) {
+	t.Helper()
+	root := repoRoot(t)
+	script := filepath.Join(root, syncScript)
+	port, cleanup := startReachableTCPListener(t)
+	defer cleanup()
+
+	cityPath := t.TempDir()
+	dataDir := filepath.Join(cityPath, "data")
+	if err := os.MkdirAll(filepath.Join(dataDir, "app", ".dolt"), 0o755); err != nil {
+		t.Fatalf("mkdir db: %v", err)
+	}
+	writeSyncFakeBeadsBD(t, cityPath)
+
+	cmd := exec.Command("sh", append([]string{script}, args...)...)
+	cmd.Env = append(syncFilteredEnv(),
+		"PATH="+binDir+":"+os.Getenv("PATH"),
+		"GC_CITY_PATH="+cityPath,
+		"GC_PACK_DIR="+root,
+		"GC_DOLT_DATA_DIR="+dataDir,
+		fmt.Sprintf("GC_DOLT_PORT=%d", port),
+		"GC_DOLT_USER=root",
+		"GC_DOLT_PASSWORD=",
+	)
+	out, err := cmd.CombinedOutput()
+	exitCode := 0
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		} else {
+			t.Fatalf("gc dolt sync failed to run: %v\n%s", err, out)
+		}
+	}
+	return string(out), exitCode
+}
+
 // fakeDoltHeader is the shared preamble: log argv and answer the remote-lookup
 // + active_branch metadata queries the sync path issues before classification.
 func fakeDoltHeader(logPath, branch string) string {
@@ -98,6 +137,17 @@ func writeSyncFakeDoltClassify(t *testing.T, dir string, ahead, behind int) stri
 		"  *\"CALL DOLT_FETCH(\"*) exit 0 ;;\n" +
 		"  *\"" + aheadPat + "\"*) printf 'n\\n" + fmt.Sprintf("%d", ahead) + "\\n' ; exit 0 ;;\n" +
 		"  *\"" + behindPat + "\"*) printf 'n\\n" + fmt.Sprintf("%d", behind) + "\\n' ; exit 0 ;;\n" +
+		"esac\nexit 0\n"
+	return installFFFakeDolt(t, dir, body)
+}
+
+func writeSyncFakeDoltMalformedClassify(t *testing.T, dir string) string {
+	t.Helper()
+	branch := "main"
+	logPath := filepath.Join(dir, "dolt.log")
+	body := fakeDoltHeader(logPath, branch) +
+		"  *\"CALL DOLT_FETCH(\"*) exit 0 ;;\n" +
+		"  *\"dolt_log(\"*) printf 'n\\n' ; exit 0 ;;\n" +
 		"esac\nexit 0\n"
 	return installFFFakeDolt(t, dir, body)
 }
@@ -184,6 +234,155 @@ func TestSyncUpToDateSkipsPush(t *testing.T) {
 	}
 	if !strings.Contains(out, "up-to-date") {
 		t.Fatalf("expected an 'up-to-date' status.\nout:\n%s", out)
+	}
+}
+
+func TestSyncUpToDateRefreshesMirrorFreshness(t *testing.T) {
+	binDir := t.TempDir()
+	logPath := writeSyncFakeDoltClassify(t, binDir, 0, 0)
+	cityPath := t.TempDir()
+	dataDir := filepath.Join(cityPath, "data")
+	if err := os.MkdirAll(filepath.Join(dataDir, "app", ".dolt"), 0o755); err != nil {
+		t.Fatalf("mkdir db: %v", err)
+	}
+	writeSyncFakeBeadsBD(t, cityPath)
+	port, cleanup := startReachableTCPListener(t)
+	defer cleanup()
+	// ga-3o5xrw: the stamp is keyed <db>@<remote>. Seeding the pre-ga-3o5xrw
+	// per-database key as well proves the refresh lands on the pair key and is
+	// not merely overwriting whatever file happened to be there.
+	stamp := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "backup-freshness", "app@origin")
+	legacyStamp := filepath.Join(filepath.Dir(stamp), "app")
+	if err := os.MkdirAll(filepath.Dir(stamp), 0o755); err != nil {
+		t.Fatalf("mkdir freshness dir: %v", err)
+	}
+	if err := os.WriteFile(stamp, []byte("pushed_at_epoch=1\nremote=old\nrefspec=old:old\n"), 0o644); err != nil {
+		t.Fatalf("seed stale freshness: %v", err)
+	}
+	if err := os.WriteFile(legacyStamp, []byte("pushed_at_epoch=1\nremote=old\nrefspec=old:old\n"), 0o644); err != nil {
+		t.Fatalf("seed legacy freshness: %v", err)
+	}
+
+	root := repoRoot(t)
+	cmd := exec.Command("sh", filepath.Join(root, syncScript), "--db", "app")
+	cmd.Env = append(syncFilteredEnv(),
+		"PATH="+binDir+":"+os.Getenv("PATH"),
+		"GC_CITY_PATH="+cityPath,
+		"GC_PACK_DIR="+root,
+		"GC_DOLT_DATA_DIR="+dataDir,
+		fmt.Sprintf("GC_DOLT_PORT=%d", port),
+		"GC_DOLT_USER=root",
+		"GC_DOLT_PASSWORD=",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("up-to-date sync failed: %v\n%s", err, out)
+	}
+	if pushed(readLog(t, logPath)) {
+		t.Fatalf("up-to-date DB must NOT be pushed.\nout:\n%s", out)
+	}
+	raw, err := os.ReadFile(stamp)
+	if err != nil {
+		t.Fatalf("read refreshed mirror freshness: %v\nout:\n%s", err, out)
+	}
+	content := string(raw)
+	if strings.Contains(content, "pushed_at_epoch=1\n") || !strings.Contains(content, "remote=origin\n") || !strings.Contains(content, "refspec=main:main\n") {
+		t.Fatalf("up-to-date verification did not refresh the expected target:\n%s\nout:\n%s", content, out)
+	}
+}
+
+func TestSyncMalformedClassificationDoesNotRefreshMirrorFreshness(t *testing.T) {
+	binDir := t.TempDir()
+	writeSyncFakeDoltMalformedClassify(t, binDir)
+	cityPath := t.TempDir()
+	dataDir := filepath.Join(cityPath, "data")
+	if err := os.MkdirAll(filepath.Join(dataDir, "app", ".dolt"), 0o755); err != nil {
+		t.Fatalf("mkdir db: %v", err)
+	}
+	writeSyncFakeBeadsBD(t, cityPath)
+	port, cleanup := startReachableTCPListener(t)
+	defer cleanup()
+	stamp := filepath.Join(cityPath, ".gc", "runtime", "packs", "dolt", "backup-freshness", "app@origin")
+	if err := os.MkdirAll(filepath.Dir(stamp), 0o755); err != nil {
+		t.Fatalf("mkdir freshness dir: %v", err)
+	}
+	oldStamp := []byte("pushed_at_epoch=1\nremote=origin\nrefspec=main:main\n")
+	if err := os.WriteFile(stamp, oldStamp, 0o644); err != nil {
+		t.Fatalf("seed stale freshness: %v", err)
+	}
+
+	root := repoRoot(t)
+	cmd := exec.Command("sh", filepath.Join(root, syncScript), "--db", "app")
+	cmd.Env = append(syncFilteredEnv(),
+		"PATH="+binDir+":"+os.Getenv("PATH"),
+		"GC_CITY_PATH="+cityPath,
+		"GC_PACK_DIR="+root,
+		"GC_DOLT_DATA_DIR="+dataDir,
+		fmt.Sprintf("GC_DOLT_PORT=%d", port),
+		"GC_DOLT_USER=root",
+		"GC_DOLT_PASSWORD=",
+	)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("malformed classification must fail closed\nout:\n%s", out)
+	}
+	raw, readErr := os.ReadFile(stamp)
+	if readErr != nil {
+		t.Fatalf("read unchanged freshness stamp: %v", readErr)
+	}
+	if string(raw) != string(oldStamp) {
+		t.Fatalf("malformed classification refreshed mirror freshness:\n%s\nout:\n%s", raw, out)
+	}
+}
+
+// TestSyncDivergedRealRunExitsNonZero locks in the real-run (non-dry-run)
+// contract that ga-co5cx's --dry-run gap (fixed alongside this test) was
+// compared against: a diverged DB must fail the overall `gc dolt sync` run,
+// not just print a warning, so a cron/patrol caller can detect
+// reconcile-needed state from the exit code alone.
+func TestSyncDivergedRealRunExitsNonZero(t *testing.T) {
+	binDir := t.TempDir()
+	logPath := writeSyncFakeDoltClassify(t, binDir, 2, 3)
+	out, exitCode := runFFSyncStatus(t, binDir, "--db", "app")
+	if pushed(readLog(t, logPath)) {
+		t.Fatalf("diverged DB must NOT be pushed.\nout:\n%s", out)
+	}
+	if exitCode == 0 {
+		t.Fatalf("a diverged DB must exit non-zero.\nout:\n%s", out)
+	}
+}
+
+// TestSyncDryRunDivergedReturnsNonZero is the ga-co5cx fix: --dry-run must
+// mirror the real run's exit code (0 up-to-date/behind, 1 diverged/classify-
+// failed) so a health-style probe can preview reconcile-needed state without
+// side effects. Before the fix, --dry-run unconditionally returned 0.
+func TestSyncDryRunDivergedReturnsNonZero(t *testing.T) {
+	binDir := t.TempDir()
+	logPath := writeSyncFakeDoltClassify(t, binDir, 2, 3)
+	out, exitCode := runFFSyncStatus(t, binDir, "--db", "app", "--dry-run")
+	if pushed(readLog(t, logPath)) {
+		t.Fatalf("--dry-run must NEVER push.\nout:\n%s", out)
+	}
+	if exitCode == 0 {
+		t.Fatalf("--dry-run preview of a diverged DB must exit non-zero.\nout:\n%s", out)
+	}
+	if !strings.Contains(out, "diverged") {
+		t.Fatalf("expected a 'diverged' status.\nout:\n%s", out)
+	}
+}
+
+// TestSyncDryRunUpToDateReturnsZero guards the benign side of the same
+// contract: --dry-run must not turn a harmless behind/up-to-date skip into a
+// false-positive failure.
+func TestSyncDryRunUpToDateReturnsZero(t *testing.T) {
+	binDir := t.TempDir()
+	logPath := writeSyncFakeDoltClassify(t, binDir, 0, 0)
+	out, exitCode := runFFSyncStatus(t, binDir, "--db", "app", "--dry-run")
+	if pushed(readLog(t, logPath)) {
+		t.Fatalf("--dry-run must NEVER push.\nout:\n%s", out)
+	}
+	if exitCode != 0 {
+		t.Fatalf("--dry-run preview of an up-to-date DB should exit zero.\nout:\n%s", out)
 	}
 }
 
@@ -500,6 +699,141 @@ func TestSyncCLIRemoteOverridePinsNonLocal(t *testing.T) {
 	}
 	if !strings.Contains(out, "-> origin:main (git+https://github.com/gastownhall/beads)") {
 		t.Fatalf("GC_DOLT_REMOTE_APP=origin should pin selection to origin even though usb (file://) is available.\nout:\n%s", out)
+	}
+}
+
+// --- ga-3o5xrw: a listed GC_DOLT_REMOTE_<DB> pushes each named remote ---
+//
+// One pinned remote per run starves a database mirrored twice whenever the
+// pinned mirror is dead. A comma-separated override names several remotes;
+// sync handles each on its own, in the order listed, and one remote's failure
+// never suppresses the next. Only named remotes are touched, so the default
+// policy's refusal of unpinned network remotes is unchanged.
+
+// TestSyncRemoteEnvOverrideListSelectsEachListedRemote pins the selection half:
+// every listed remote is synced in the order given, and an unlisted local
+// remote the default policy would have chosen is left alone.
+func TestSyncRemoteEnvOverrideListSelectsEachListedRemote(t *testing.T) {
+	t.Parallel()
+	binDir := t.TempDir()
+	writeSyncFakeDoltMultiRemote(t, binDir, []string{
+		"origin,git+https://github.com/gastownhall/beads",
+		"usb,file:///mnt/usb/beads",
+		"mirror,git+https://example.invalid/mirror",
+	})
+
+	out, err := runFFSyncEnv(t, binDir, []string{"GC_DOLT_REMOTE_APP=mirror,origin"}, "--db", "app", "--force", "--dry-run")
+	if err != nil {
+		t.Fatalf("gc dolt sync failed: %v\n%s", err, out)
+	}
+	mirror := strings.Index(out, "-> mirror:main (git+https://example.invalid/mirror)")
+	origin := strings.Index(out, "-> origin:main (git+https://github.com/gastownhall/beads)")
+	if mirror < 0 || origin < 0 {
+		t.Fatalf("GC_DOLT_REMOTE_APP=mirror,origin should sync both listed remotes.\nout:\n%s", out)
+	}
+	if mirror > origin {
+		t.Fatalf("listed remotes must be synced in the order given (mirror before origin).\nout:\n%s", out)
+	}
+	if strings.Contains(out, "-> usb:") {
+		t.Fatalf("an unlisted remote must not be synced once the override names remotes.\nout:\n%s", out)
+	}
+}
+
+// TestSyncRemoteEnvOverrideListRefusesUnconfiguredEntry pins that a list is
+// validated as a whole before anything is synced: one misspelled name fails
+// the database loudly instead of silently syncing the rest.
+func TestSyncRemoteEnvOverrideListRefusesUnconfiguredEntry(t *testing.T) {
+	t.Parallel()
+	binDir := t.TempDir()
+	writeSyncFakeDoltMultiRemote(t, binDir, []string{
+		"origin,git+https://github.com/gastownhall/beads",
+		"usb,file:///mnt/usb/beads",
+	})
+
+	out, err := runFFSyncEnv(t, binDir, []string{"GC_DOLT_REMOTE_APP=origin,nope"}, "--db", "app", "--force", "--dry-run")
+	if err == nil {
+		t.Fatalf("a list naming an unconfigured remote must fail the database.\nout:\n%s", out)
+	}
+	if !strings.Contains(out, "GC_DOLT_REMOTE override 'nope' does not match any configured remote") {
+		t.Fatalf("expected the error to name the unconfigured entry.\nout:\n%s", out)
+	}
+	if !strings.Contains(out, "remote selection refused") {
+		t.Fatalf("summary must attribute the failure to the refusal.\nout:\n%s", out)
+	}
+	if strings.Contains(out, "would") {
+		t.Fatalf("no remote may be synced when the list is invalid.\nout:\n%s", out)
+	}
+}
+
+// writeSyncFakeDoltDeadAndLiveRemotes installs a fake dolt with two non-local
+// remotes: origin's fetch fails the way a mirror with a dangling chunk does,
+// and probe is healthy and one commit behind local, so a fast-forward is due.
+func writeSyncFakeDoltDeadAndLiveRemotes(t *testing.T, dir string) string {
+	t.Helper()
+	logPath := filepath.Join(dir, "dolt.log")
+	body := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$*\" >> \"" + logPath + "\"\n" +
+		"case \"$*\" in\n" +
+		"  *\"SELECT name, url FROM dolt_remotes ORDER BY name\"*)\n" +
+		"    printf 'name,url\\norigin,https://example.invalid/dead\\nprobe,https://example.invalid/live\\n' ; exit 0 ;;\n" +
+		"  *\"SELECT active_branch()\"*)\n" +
+		"    printf 'active_branch()\\nmain\\n' ; exit 0 ;;\n" +
+		"  *\"DOLT_FETCH('origin'\"*)\n" +
+		"    echo 'fatal: Blob not found: 06ctnedcgrbc44rc8hbd2ird9flmpif3.darc' >&2 ; exit 1 ;;\n" +
+		"  *\"DOLT_FETCH('probe'\"*) exit 0 ;;\n" +
+		"  *\"dolt_log('remotes/probe/main..main')\"*) printf 'n\\n1\\n' ; exit 0 ;;\n" +
+		"  *\"dolt_log('main..remotes/probe/main')\"*) printf 'n\\n0\\n' ; exit 0 ;;\n" +
+		"esac\nexit 0\n"
+	return installFFFakeDolt(t, dir, body)
+}
+
+// TestSyncRemoteEnvOverrideListFailedRemoteDoesNotSuppressTheNext is the
+// ga-3o5xrw regression: with origin dead and probe live, a failed fetch on
+// origin must not stop the push to probe, and the run must still fail with a
+// summary naming the remote that failed.
+func TestSyncRemoteEnvOverrideListFailedRemoteDoesNotSuppressTheNext(t *testing.T) {
+	binDir := t.TempDir()
+	logPath := writeSyncFakeDoltDeadAndLiveRemotes(t, binDir)
+
+	out, err := runFFSyncEnv(t, binDir, []string{"GC_DOLT_REMOTE_APP=origin,probe"}, "--db", "app")
+	log := readLog(t, logPath)
+	if !strings.Contains(log, "DOLT_FETCH('origin'") {
+		t.Fatalf("the dead remote was never attempted.\nlog:\n%s\nout:\n%s", log, out)
+	}
+	if !strings.Contains(log, "DOLT_PUSH('probe', 'main')") {
+		t.Fatalf("the live remote was never pushed: a failed remote suppressed it.\nlog:\n%s\nout:\n%s", log, out)
+	}
+	if strings.Contains(log, "DOLT_PUSH('origin'") {
+		t.Fatalf("the remote whose fetch failed must not be pushed.\nlog:\n%s\nout:\n%s", log, out)
+	}
+	if err == nil {
+		t.Fatalf("a failed remote must still fail the run.\nout:\n%s", out)
+	}
+	if !strings.Contains(out, "app (remote origin: fetch failed (exit 1))") {
+		t.Fatalf("summary must name the failed remote and its reason.\nout:\n%s", out)
+	}
+}
+
+// TestSyncCLIRemoteOverrideListSyncsEachListedRemote is the CLI-mode twin of
+// TestSyncRemoteEnvOverrideListSelectsEachListedRemote.
+func TestSyncCLIRemoteOverrideListSyncsEachListedRemote(t *testing.T) {
+	t.Parallel()
+	cityPath := writeSyncCLIRemotes(t, `{"remotes":[{"name":"origin","url":"git+https://github.com/gastownhall/beads"},{"name":"usb","url":"file:///mnt/usb/beads"}]}`)
+	binDir := t.TempDir()
+	_ = writeSyncFakeDolt(t, binDir)
+	_ = writeSyncFakeBeadsBD(t, cityPath)
+
+	out, err := runSync(t, binDir, cityPath, []string{"GC_DOLT_REMOTE_APP=usb,origin"}, "--db", "app", "--dry-run")
+	if err != nil {
+		t.Fatalf("gc dolt sync failed: %v\n%s", err, out)
+	}
+	for _, want := range []string{
+		"would push main -> usb:main (file:///mnt/usb/beads)",
+		"would push main -> origin:main (git+https://github.com/gastownhall/beads)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("CLI mode should sync every listed remote; missing %q.\nout:\n%s", want, out)
+		}
 	}
 }
 

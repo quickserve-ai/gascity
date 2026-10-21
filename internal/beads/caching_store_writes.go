@@ -42,10 +42,24 @@ func (c *CachingStore) createWith(create func() (Bead, error)) (Bead, error) {
 		return created, err
 	}
 
+	// Read the create back. Every failure is recorded (recording no longer
+	// touches the reconcile backoff anchor, see lastSyncFailureAt): an
+	// unrecorded one let the cache serve a row that verification could not find,
+	// and nothing said so (ga-th31cy). What the failure does to the row depends on what it proved:
+	//   - a lookup that did not complete (ErrVerifyIndeterminate, which is
+	//     not an ErrNotFound) or any other read error proves
+	//     nothing, so the row is absorbed DIRTY and the next read goes to
+	//     storage instead of trusting this snapshot;
+	//   - a plain not-found stays absorbed clean. Some stores cannot read back
+	//     a freshly written wisp (beadmail's GC_MAIL_VERIFY escape exists for
+	//     them), and there a dirty mark would make the overlay confirm real
+	//     mail absent and drop it from every cached read.
+	readBackUnproven := false
 	if fresh, err := c.backing.Get(created.ID); err == nil {
 		created = fresh
-	} else if !errors.Is(err, ErrNotFound) {
+	} else {
 		c.recordProblem("refresh bead after create", fmt.Errorf("%s: %w", created.ID, err))
+		readBackUnproven = errors.Is(err, ErrVerifyIndeterminate) || !errors.Is(err, ErrNotFound)
 	}
 
 	c.mu.Lock()
@@ -62,6 +76,9 @@ func (c *CachingStore) createWith(create func() (Bead, error)) (Bead, error) {
 		seqMode:    seqKeep,
 		clearDirty: true,
 	})
+	if readBackUnproven {
+		c.markDirtyLocked(created.ID)
+	}
 	c.markFreshLocked(c.clockNow())
 	c.updateStatsLocked()
 	c.mu.Unlock()
@@ -596,14 +613,16 @@ func (c *CachingStore) CloseAll(ids []string, metadata map[string]string) (int, 
 	refreshed := make([]refreshedBead, 0, len(ids))
 	var refreshErr error
 	refreshFailed := make(map[string]struct{})
-	for _, id := range ids {
-		fresh, getErr := c.backing.Get(id)
-		if getErr != nil {
+	// One batched read for the whole close where the backing has one, not a
+	// `bd show` per closed bead.
+	for i, read := range c.readBackingRows(ids) {
+		id := ids[i]
+		if read.err != nil {
 			refreshFailed[id] = struct{}{}
-			refreshErr = errors.Join(refreshErr, fmt.Errorf("refresh bead after close-all %s: %w", id, getErr))
+			refreshErr = errors.Join(refreshErr, fmt.Errorf("refresh bead after close-all %s: %w", id, read.err))
 			continue
 		}
-		refreshed = append(refreshed, refreshedBead{id: id, bead: fresh})
+		refreshed = append(refreshed, refreshedBead{id: id, bead: read.bead})
 	}
 
 	notifications := make([]cacheNotification, 0, len(refreshed))
@@ -803,10 +822,32 @@ func (c *CachingStore) Tx(commitMsg string, fn func(Tx) error) error {
 		tx.backing = backingTx
 		return fn(tx)
 	}); err != nil {
+		// A backing without atomic rollback may have committed some or all of
+		// the Tx's writes before failing, and an ErrWriteUnconfirmed answer
+		// committed at least one. Fence the touched rows so the next read
+		// asks the backing rather than serving the pre-Tx row: a caller
+		// re-reading to learn the outcome must see what landed.
+		if !StoreSupportsAtomicTx(c.backing) || errors.Is(err, ErrWriteUnconfirmed) {
+			c.fenceTxTouchedBeads(tx.ids)
+		}
 		return err
 	}
 	c.refreshTxTouchedBeads(tx.ids, tx.closed, startSeq)
 	return nil
+}
+
+// fenceTxTouchedBeads marks the rows a failed Tx touched dirty, as a failed
+// SetMetadataBatch does, until an ordinary read installs backing truth.
+func (c *CachingStore) fenceTxTouchedBeads(ids []string) {
+	if len(ids) == 0 {
+		return
+	}
+	c.mu.Lock()
+	for _, id := range ids {
+		c.noteMutationLocked(id)
+		c.markDirtyLocked(id)
+	}
+	c.mu.Unlock()
 }
 
 // AtomicTx reports whether Tx is atomic, which for the caching store is exactly
@@ -1344,6 +1385,9 @@ func applyUpdateOptsToBead(bead Bead, opts UpdateOpts) Bead {
 			bead.Metadata[key] = value
 		}
 	}
+	// After the sets, as every backing applies them: a key named in both is
+	// absent from the row the backing now holds, so it must be absent here.
+	unsetMetadataKeys(bead.Metadata, opts.UnsetMetadata)
 	if len(opts.Labels) > 0 || len(opts.RemoveLabels) > 0 {
 		remove := make(map[string]struct{}, len(opts.RemoveLabels))
 		for _, label := range opts.RemoveLabels {

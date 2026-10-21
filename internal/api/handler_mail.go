@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
@@ -80,6 +81,54 @@ func (s *Server) resolveMailSendRecipientWithContext(ctx context.Context, recipi
 	if recipient == "human" {
 		return recipient, nil
 	}
+	roster := s.mailCityRoster()
+	switch kind, addr := roster.ResolveCityAddress(recipient); kind {
+	case mail.CityAddressForeign:
+		// A peer city's address is canonical as written; its identity can
+		// only be checked by that city, so the session store is never
+		// consulted. What CAN be checked here is that city's rendered
+		// roster (PROP-027 1.4), below, on the final string.
+		return gateMailSendRecipient(roster, addr)
+	case mail.CityAddressLocal:
+		// <local city>/<addr> and <addr> are one mailbox.
+		recipient = addr
+		if recipient == "human" {
+			return recipient, nil
+		}
+	}
+	resolved, err := s.resolveLocalMailSendRecipientWithContext(ctx, recipient)
+	if err == nil {
+		// A locally resolved recipient is a session's mailbox address —
+		// its free-form alias — and that alias may be shaped like a peer
+		// seat. The stored string meets the same gate either way.
+		return gateMailSendRecipient(roster, resolved)
+	}
+	{
+		// A slash-form recipient whose first segment names neither a local
+		// scope nor a roster city refuses as unknown-city, so a stale roster
+		// is never spelled as a session lookup failure. Only a not-found
+		// upgrades; with no store the roster alone decides.
+		if errors.Is(err, errMailNoBeadStore) {
+			if probe := mail.RefuseUnknownCity(mail.ErrUnresolvedCityProbe, recipient, roster, s.state.Config().LocalAddressPrefixes()); !errors.Is(probe, mail.ErrUnresolvedCityProbe) {
+				return "", probe
+			}
+		}
+		return "", mail.RefuseUnknownCity(err, recipient, roster, s.state.Config().LocalAddressPrefixes())
+	}
+}
+
+// gateMailSendRecipient is the one place a send's FINAL recipient string —
+// the exact form that will be stored, whether it was addressed foreign or
+// resolved locally to a session alias — meets the target town's rendered
+// roster. An absent seat or an unreadable list refuses before any write.
+func gateMailSendRecipient(roster mail.CityRoster, final string) (string, error) {
+	if err := roster.CheckForeignSeat(final); err != nil {
+		return "", err
+	}
+	return final, nil
+}
+
+func (s *Server) resolveLocalMailSendRecipientWithContext(ctx context.Context, recipient string) (string, error) {
 	store := s.state.SessionsBeadStore().Store
 	if store == nil {
 		resolved, err := mail.ResolveRecipient(recipient, agentEntries(s.state.Config()))
@@ -104,14 +153,73 @@ func (s *Server) resolveMailSendRecipientWithContext(ctx context.Context, recipi
 		}
 		return address, nil
 	} else if !errors.Is(err, session.ErrSessionNotFound) {
-		return "", err
+		// A name squat nobody else can read through falls through to the
+		// configured mailbox below and is stored (ga-isa3j4, same rule as the CLI).
+		if refusal := s.mailNamedSessionSquatRefusal(store, recipient, err); refusal != nil {
+			return "", refusal
+		}
 	}
 	if address, ok, err := s.configuredMailRecipientAddress(store, recipient); err != nil {
 		return "", err
 	} else if ok {
 		return address, nil
 	}
-	return "", apiSessionTargetNotFound(recipient)
+	return "", s.mailRecipientNotFound(recipient)
+}
+
+// mailNamedSessionSquatRefusal returns nil when a configured named-session
+// conflict may still resolve to the configured mailbox, and otherwise the
+// error to refuse with. A squat on the session's RUNTIME name is a runtime
+// problem; the mailbox identity comes from config, so refusing loses the
+// message (ga-isa3j4). Falling through is safe only when no session bead other
+// than the seat's own answers to that address. Mirrors cmd/gc
+// mailNamedSessionSquatRefusal.
+func (s *Server) mailNamedSessionSquatRefusal(store beads.Store, identifier string, err error) error {
+	if !errors.Is(err, errConfiguredNamedSessionConflict) || store == nil {
+		return err
+	}
+	spec, ok, specErr := s.findNamedSessionSpecForTarget(store, identifier)
+	if specErr != nil || !ok {
+		return err
+	}
+	lookup, lookupErr := session.LookupConfiguredNamedSession(store, spec)
+	if lookupErr != nil || !lookup.HasConflict {
+		return err
+	}
+	answering, answered, scanErr := session.NonSeatSessionAnsweringToMailbox(store, spec, lookup.Conflict)
+	if scanErr != nil {
+		return fmt.Errorf("%w (and checking which sessions read mailbox %q failed: %w)", err, spec.Identity, scanErr)
+	}
+	if answered {
+		return fmt.Errorf("%w; not storing: session bead %s also answers to mailbox %q and would read it", err, answering.ID, spec.Identity)
+	}
+	return nil
+}
+
+// mailRecipientNotFound is the send refusal for a recipient nothing resolved.
+// When the address looks like another town's seat, it says so and names the leg
+// that does work (ga-5toacq). A bare "session not found" reads as a typo, so the
+// sender stops and the message is lost with no record on either side.
+//
+// Only the refusal's text changes. The error still wraps session.ErrSessionNotFound,
+// and every recipient that resolved before still resolves: a foreign-prefixed
+// mailbox the hub knows (gastown/woodhouse, for one) never reaches this branch.
+func (s *Server) mailRecipientNotFound(recipient string) error {
+	notFound := apiSessionTargetNotFound(recipient)
+	cfg := s.state.Config()
+	if cfg == nil {
+		// Without config the rigs and agent dirs are unknown; claiming the
+		// address is foreign could misdirect a typo in a local one.
+		return notFound
+	}
+	cityName := s.state.CityName()
+	prefix, foreign := mail.ForeignTownPrefix(recipient, cityName, cfg.LocalAddressPrefixes())
+	if !foreign {
+		return notFound
+	}
+	return fmt.Errorf("%w; city %q has no mailbox by that name. If %q is another town, only the mailbox names "+
+		"that town's cross-town poller pulls are addressable here; otherwise send to that town's cross-town routing address "+
+		"with a \"[for <rig>/<name>]\" subject", notFound, cityName, prefix)
 }
 
 // operatorMailIdentities are the operator's mail identities: the mail
@@ -130,7 +238,8 @@ func operatorMailIdentities() []string {
 // no caller identity to bind the sender to (mc-8e9ci), so a sender is the
 // operator, a configured agent, a configured named session or a live session
 // of a configured agent. An empty sender is no identity either (v5.10f): a
-// message names who sent it.
+// message names who sent it. The carry also accepts a seat of a
+// [mail.crosscity] peer city (peerCityMailSender).
 func (s *Server) refuseUnconfiguredMailSender(ctx context.Context, from string) error {
 	from = strings.TrimSpace(from)
 	if slices.Contains(operatorMailIdentities(), from) {
@@ -153,6 +262,11 @@ func (s *Server) refuseUnconfiguredMailSender(ctx context.Context, from string) 
 				}
 			}
 		}
+	}
+	// Carry (#5386 via PROP-027): a seat of a [mail.crosscity] peer city,
+	// city-qualified. Drop when upstream binds a sender to its caller (mc-8e9ci).
+	if s.peerCityMailSender(from) {
+		return nil
 	}
 	return apierr.ValidationFailed.With("mail sender "+strconv.Quote(from)+" is no configured identity: send as the operator, a configured agent or a named session (the API cannot yet bind a sender to its caller); nothing was sent",
 		&huma.ErrorDetail{Location: "body.from", Message: "not a configured mail identity", Value: from})
@@ -177,16 +291,66 @@ func (q apiMailQuery) readsInbox() bool {
 	return q.session != nil || len(q.routes) > 0
 }
 
+// mailCityRoster builds the cross-city mail roster for this city. The zero
+// roster (no [mail.crosscity] section) is disabled and leaves every recipient
+// resolving exactly as today.
+func (s *Server) mailCityRoster() mail.CityRoster {
+	cfg := s.state.Config()
+	fallback := ""
+	if p := strings.TrimSpace(s.state.CityPath()); p != "" {
+		fallback = filepath.Base(filepath.Clean(p))
+	}
+	local, peers := cfg.MailCityRoster(fallback)
+	roster := mail.CityRoster{Local: local, Peers: peers, Towns: cfg.MailCrossCityTowns()}
+	if roster.Enabled() {
+		roster.RosterRoot, roster.RosterPin, roster.RosterSourceErr = cfg.MailCrossCityRosterSource(s.state.CityPath())
+	}
+	return roster
+}
+
 // resolveMailQueryWithContext resolves the agent a mail list or count query
-// names onto the mailbox it reads.
+// names onto the mailbox it reads. Under [mail.crosscity] a peer city's
+// address reads that mailbox as it is, and a local one also reads the
+// city-qualified alias mail may have been delivered under
+// (CityRoster.ExpandLocalRecipients): as extra recipients, and as extra
+// routes when the mailbox is read as one session inbox.
 func (s *Server) resolveMailQueryWithContext(ctx context.Context, recipient string) apiMailQuery {
 	recipient = strings.TrimSpace(recipient)
 	if recipient == "" {
 		return apiMailQuery{recipients: []string{""}}
 	}
+	roster := s.mailCityRoster()
 	if recipient == "human" {
-		return apiMailQuery{recipients: []string{"human"}}
+		return apiMailQuery{recipients: roster.ExpandLocalRecipients([]string{"human"})}
 	}
+	switch kind, addr := roster.ResolveCityAddress(recipient); kind {
+	case mail.CityAddressForeign:
+		// Reads are open-world: a peer city's mailbox is readable with no
+		// session lookup.
+		return apiMailQuery{recipients: []string{addr}}
+	case mail.CityAddressLocal:
+		recipient = addr
+		if recipient == "human" {
+			return apiMailQuery{recipients: roster.ExpandLocalRecipients([]string{"human"})}
+		}
+	}
+	// Delivery addressed to <local city>/<addr> is a read on <addr>'s inbox.
+	q := s.resolveLocalMailQueryWithContext(ctx, recipient)
+	expanded := roster.ExpandLocalRecipients(q.recipients)
+	if q.readsInbox() {
+		for _, addr := range expanded {
+			if !slices.Contains(q.recipients, addr) {
+				q.routes = append(q.routes, addr)
+			}
+		}
+	}
+	q.recipients = expanded
+	return q
+}
+
+// resolveLocalMailQueryWithContext is resolveMailQueryWithContext for a
+// recipient already known to be this city's.
+func (s *Server) resolveLocalMailQueryWithContext(ctx context.Context, recipient string) apiMailQuery {
 	store := s.state.SessionsBeadStore().Store
 	if store == nil {
 		if resolved, err := mail.ResolveRecipient(recipient, agentEntries(s.state.Config())); err == nil {

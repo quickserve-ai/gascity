@@ -2251,6 +2251,100 @@ func TestOrderTrackingSweepWatchdogClosesAllStaleTracking(t *testing.T) {
 	}
 }
 
+// TestOrderTrackingSweepWatchdogSeesBeadsWrittenBehindTheCache is the
+// regression test for ga-v5vnyp, and it is deliberately built on the PRODUCTION
+// store stack rather than a bare MemStore.
+//
+// That distinction is the whole point. Every other watchdog test here hands
+// CityRuntime a raw beads.NewMemStore(), so every read is authoritative and the
+// suite stayed green for the entire 43 hours the watchdog was blind in
+// production. The real controller store is a beadPolicyStore wrapping a
+// CachingStore, and order-tracking beads are created and closed through the
+// DISPATCHER's own uncached handle — so the cache never observes them. A
+// non-Live read therefore returns zero rows forever, the watchdog prints
+// nothing (it only speaks when it closes >0), and two orders sat gated for 51
+// minutes behind a 2-minute age-out that was running the whole time.
+//
+// The test reproduces exactly that: prime the cache while the store is EMPTY,
+// then write the stale tracking bead straight to the backing. Revert either
+// sweep reader to s.store.ListByLabel and this fails.
+func TestOrderTrackingSweepWatchdogSeesBeadsWrittenBehindTheCache(t *testing.T) {
+	backing := beads.NewMemStore()
+	cached := beads.NewCachingStoreForTest(backing, nil)
+	if err := cached.PrimeActive(); err != nil {
+		t.Fatalf("PrimeActive(): %v", err)
+	}
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	store := wrapStoreWithBeadPolicies(cached, cfg)
+
+	// Written AFTER the prime and NOT through the cache — the dispatcher's
+	// uncached-handle shape.
+	stale, err := backing.Create(beads.Bead{
+		Title:  "order:nudge-on-route",
+		Labels: []string{"order-run:nudge-on-route", labelOrderTracking},
+	})
+	if err != nil {
+		t.Fatalf("Create(stale): %v", err)
+	}
+
+	cr := &CityRuntime{
+		cityName:            "test-city",
+		cfg:                 cfg,
+		standaloneCityStore: store,
+		stdout:              io.Discard,
+		stderr:              io.Discard,
+		logPrefix:           "gc test",
+	}
+	cr.runOrderTrackingSweepWatchdog(cfg, time.Now().Add(orderTrackingSweepWatchdogStaleAfter+time.Second))
+
+	got, err := backing.Get(stale.ID)
+	if err != nil {
+		t.Fatalf("Get(stale): %v", err)
+	}
+	if got.Status != "closed" {
+		t.Fatalf("stale tracking status = %s, want closed — the watchdog read a cached snapshot that never contained this bead (ga-v5vnyp)", got.Status)
+	}
+}
+
+// TestOrphanedOrderTrackingSweepSeesBeadsWrittenBehindTheCache is the same
+// proof for the STARTUP sweep, which is the other non-Live reader. It is the
+// net that is supposed to catch tracking beads orphaned by a controller that
+// died holding them — and it runs inside the very process whose cache cannot
+// be trusted to contain them.
+func TestOrphanedOrderTrackingSweepSeesBeadsWrittenBehindTheCache(t *testing.T) {
+	backing := beads.NewMemStore()
+	cached := beads.NewCachingStoreForTest(backing, nil)
+	if err := cached.PrimeActive(); err != nil {
+		t.Fatalf("PrimeActive(): %v", err)
+	}
+	cfg := &config.City{Workspace: config.Workspace{Name: "test-city"}}
+	store := wrapStoreWithBeadPolicies(cached, cfg)
+
+	orphan, err := backing.Create(beads.Bead{
+		Title:  "order:order-tracking-sweep",
+		Labels: []string{"order-run:" + orderTrackingSweepOrder, labelOrderTracking},
+	})
+	if err != nil {
+		t.Fatalf("Create(orphan): %v", err)
+	}
+
+	// The startup path (CityRuntime.sweepOrphanedOrderTracking) opens its own
+	// store from cityPath rather than using standaloneCityStore, so drive the
+	// sweep function directly with the production-shaped store. What this pins
+	// is the READER: OrphanedOpenRuns must see a bead the cache never absorbed.
+	if _, err := sweepOrphanedOrderTrackingLimit(store, orderTrackingSweepCloseBudget); err != nil {
+		t.Fatalf("sweepOrphanedOrderTrackingLimit(): %v", err)
+	}
+
+	got, err := backing.Get(orphan.ID)
+	if err != nil {
+		t.Fatalf("Get(orphan): %v", err)
+	}
+	if got.Status != "closed" {
+		t.Fatalf("orphaned tracking status = %s, want closed — the startup sweep read a cached snapshot (ga-v5vnyp)", got.Status)
+	}
+}
+
 func TestOrderTrackingSweepWatchdogUsesCloseBudget(t *testing.T) {
 	store := beads.NewMemStore()
 	ids := make([]string, 0, orderTrackingSweepCloseBudget+1)
@@ -3648,7 +3742,10 @@ func TestCityRuntimeBeadReconcileTick_IdleClaimNudgeFallsBackForBlankNudgeOnRepo
 		t.Fatalf("Start: %v", err)
 	}
 
-	store := beads.NewMemStore()
+	// The trigger lives in the store too: the backstop re-reads it live
+	// before delivery and nudges only while that read still shows it open.
+	trigger := workBead("w-idle", "worker", "", "open", 5)
+	store := beads.NewMemStoreFrom(0, []beads.Bead{trigger}, nil)
 	staleObs := time.Now().Add(-2 * idleClaimNudgeGrace).UTC().Format(time.RFC3339)
 	session, err := store.Create(beads.Bead{
 		Title:  "worker",
@@ -3693,7 +3790,7 @@ func TestCityRuntimeBeadReconcileTick_IdleClaimNudgeFallsBackForBlankNudgeOnRepo
 		AssignedWorkBeads: []beads.Bead{
 			// Open + unassigned == unclaimed: the slot's trigger bead the warm pool
 			// worker never began. workBead sets gc.routed_to but leaves the assignee empty.
-			workBead("w-idle", "worker", "", "open", 5),
+			trigger,
 		},
 	}
 	cr.beadReconcileTick(context.Background(), newSeatWork(cr.workLegs()), result, cr.loadSessionBeadSnapshot(), nil, false)
@@ -4832,6 +4929,495 @@ func TestCityRuntimeReloadProviderSwapPreservesDrainTracker(t *testing.T) {
 	}
 	if cr.sessionDrains == nil {
 		t.Fatal("sessionDrains = nil after provider swap, want non-nil")
+	}
+}
+
+func TestCityRuntimeReloadSchemaSkewPreservesSessionsBeforeProviderSwap(t *testing.T) {
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	writeCityRuntimeConfig(t, tomlPath, "fake")
+
+	cfg, err := config.Load(osFS{}, tomlPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "existing-agent", runtime.Config{}); err != nil {
+		t.Fatalf("start existing agent: %v", err)
+	}
+	cr := newTestCityRuntime(t, CityRuntimeParams{
+		CityPath: cityPath,
+		CityName: "test-city",
+		TomlPath: tomlPath,
+		Cfg:      cfg,
+		SP:       sp,
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		Dops:   newDrainOps(sp),
+		Rec:    events.Discard,
+		Stdout: io.Discard,
+		Stderr: io.Discard,
+	})
+	cs := newControllerState(context.Background(), cfg, sp, events.NewFake(), "test-city", cityPath)
+	cs.cityBeadStore = beads.NewMemStore()
+	cr.setControllerState(cs)
+
+	previousOpen := newControllerStateOpenCityStore
+	newControllerStateOpenCityStore = func(string, gate.Mode, beads.NativeTransportMode) (beads.StoreOpenResult, error) {
+		return beads.StoreOpenResult{
+			Store: beads.NewMemStore(),
+			Diagnostic: beads.BeadsDiagnostic{
+				Store:               beads.BeadsStoreNameBdStore,
+				NativeStoreEligible: false,
+				PreflightGate:       "native_open",
+				PreflightReason:     "schema version mismatch: database is at v55, binary knows up to v54 (1 migration ahead)",
+			},
+		}, nil
+	}
+	t.Cleanup(func() { newControllerStateOpenCityStore = previousOpen })
+	previousPreflight := controllerStatePreflightCityStore
+	controllerStatePreflightCityStore = func(string, *config.City, gate.Mode) (beads.StoreOpenResult, error) {
+		return newControllerStateOpenCityStore("", gate.ModeUnset, beads.NativeTransportUnset)
+	}
+	t.Cleanup(func() { controllerStatePreflightCityStore = previousPreflight })
+
+	writeCityRuntimeConfig(t, tomlPath, "fail")
+	lastProviderName := "fake"
+	reply := cr.reloadConfigTraced(context.Background(), &lastProviderName, cityPath, nil, reloadSourceManual)
+
+	if reply.Outcome != reloadOutcomeFailed {
+		t.Fatalf("reply.Outcome = %q, want %q", reply.Outcome, reloadOutcomeFailed)
+	}
+	if lastProviderName != "fake" {
+		t.Fatalf("lastProviderName = %q, want fake", lastProviderName)
+	}
+	if !sp.IsRunning("existing-agent") {
+		t.Fatal("existing agent stopped before reload schema-skew guard latched")
+	}
+	if cr.controllerStoreSchemaSkewDiagnostic() == nil {
+		t.Fatal("reload schema-skew diagnostic was not latched for the run-loop hold")
+	}
+}
+
+// TestCityRuntimeReloadPublishingOpenSkewPreservesSessionsBeforeProviderSwap
+// pins the order the schema gate needs when the reload's preflight open passes
+// and only the PUBLISHING open (the authoritative one, ga-mw4dg) reports the
+// skew — a migration that lands between the two opens. The provider swap's
+// stop is irreversible, so it must come after publication and its skew check:
+// the sessions stay up and the preserve hold latches with nothing stopped.
+func TestCityRuntimeReloadPublishingOpenSkewPreservesSessionsBeforeProviderSwap(t *testing.T) {
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	writeCityRuntimeConfig(t, tomlPath, "fake")
+
+	cfg, err := config.Load(osFS{}, tomlPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "existing-agent", runtime.Config{}); err != nil {
+		t.Fatalf("start existing agent: %v", err)
+	}
+	cr := newTestCityRuntime(t, CityRuntimeParams{
+		CityPath: cityPath,
+		CityName: "test-city",
+		TomlPath: tomlPath,
+		Cfg:      cfg,
+		SP:       sp,
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		Dops:   newDrainOps(sp),
+		Rec:    events.Discard,
+		Stdout: io.Discard,
+		Stderr: io.Discard,
+	})
+	cs := newControllerState(context.Background(), cfg, sp, events.NewFake(), "test-city", cityPath)
+	cs.cityBeadStore = beads.NewMemStore()
+	// A store-metadata change since boot: publication cannot reuse the current
+	// store and must reopen it (controllerState.update). That reopen is the
+	// publishing open this test is about; with a reusable store the reload
+	// publishes without opening anything and the preflight is the only gate.
+	cs.storeMetadataSignature = "signature-at-boot"
+	cr.setControllerState(cs)
+
+	previousPreflight := controllerStatePreflightCityStore
+	controllerStatePreflightCityStore = func(string, *config.City, gate.Mode) (beads.StoreOpenResult, error) {
+		return beads.StoreOpenResult{Store: beads.NewMemStore()}, nil
+	}
+	t.Cleanup(func() { controllerStatePreflightCityStore = previousPreflight })
+	previousOpen := newControllerStateOpenCityStore
+	newControllerStateOpenCityStore = func(string, gate.Mode, beads.NativeTransportMode) (beads.StoreOpenResult, error) {
+		return beads.StoreOpenResult{
+			Store: beads.NewMemStore(),
+			Diagnostic: beads.BeadsDiagnostic{
+				Store:               beads.BeadsStoreNameBdStore,
+				NativeStoreEligible: false,
+				PreflightGate:       "native_open",
+				PreflightReason:     "schema version mismatch: database is at v55, binary knows up to v54 (1 migration ahead)",
+			},
+		}, nil
+	}
+	t.Cleanup(func() { newControllerStateOpenCityStore = previousOpen })
+
+	writeCityRuntimeConfig(t, tomlPath, "fail")
+	lastProviderName := "fake"
+	reply := cr.reloadConfigTraced(context.Background(), &lastProviderName, cityPath, nil, reloadSourceManual)
+
+	if reply.Outcome != reloadOutcomeFailed {
+		t.Fatalf("reply.Outcome = %q, want %q", reply.Outcome, reloadOutcomeFailed)
+	}
+	if !sp.IsRunning("existing-agent") {
+		t.Fatal("existing agent stopped before the publishing open's schema-skew guard latched")
+	}
+	if cr.controllerStoreSchemaSkewDiagnostic() == nil {
+		t.Fatal("publishing-open schema-skew diagnostic was not latched for the run-loop hold")
+	}
+}
+
+// The same guard when the publishing open's factory refuses the store AND
+// reports the schema skew that it found first: a conditional-writes refusal
+// under require keeps the native-selection diagnostic beside its error
+// (beads.StoreOpenOptions.unstampableResult), so the skew must latch and the
+// swap stop nothing, as when the open returns no error (ga-mw4dg).
+func TestCityRuntimeReloadPublishingOpenSkewWithAnOpenErrorPreservesSessions(t *testing.T) {
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	writeCityRuntimeConfig(t, tomlPath, "fake")
+
+	cfg, err := config.Load(osFS{}, tomlPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "existing-agent", runtime.Config{}); err != nil {
+		t.Fatalf("start existing agent: %v", err)
+	}
+	cr := newTestCityRuntime(t, CityRuntimeParams{
+		CityPath: cityPath,
+		CityName: "test-city",
+		TomlPath: tomlPath,
+		Cfg:      cfg,
+		SP:       sp,
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		Dops:   newDrainOps(sp),
+		Rec:    events.Discard,
+		Stdout: io.Discard,
+		Stderr: io.Discard,
+	})
+	cs := newControllerState(context.Background(), cfg, sp, events.NewFake(), "test-city", cityPath)
+	cs.cityBeadStore = beads.NewMemStore()
+	cs.storeMetadataSignature = "signature-at-boot" // publication must reopen the store
+	cr.setControllerState(cs)
+
+	previousPreflight := controllerStatePreflightCityStore
+	controllerStatePreflightCityStore = func(string, *config.City, gate.Mode) (beads.StoreOpenResult, error) {
+		return beads.StoreOpenResult{Store: beads.NewMemStore()}, nil
+	}
+	t.Cleanup(func() { controllerStatePreflightCityStore = previousPreflight })
+	previousOpen := newControllerStateOpenCityStore
+	newControllerStateOpenCityStore = func(string, gate.Mode, beads.NativeTransportMode) (beads.StoreOpenResult, error) {
+		return beads.StoreOpenResult{
+			Diagnostic: beads.BeadsDiagnostic{
+				Store:               beads.BeadsStoreNameBdStore,
+				NativeStoreEligible: false,
+				PreflightGate:       "native_open",
+				PreflightReason:     "schema version mismatch: database is at v55, binary knows up to v54 (1 migration ahead)",
+			},
+		}, &beads.ConditionalWritesRequiredError{StoreKind: beads.BeadsStoreNameBdStore, Reason: "refused for the test"}
+	}
+	t.Cleanup(func() { newControllerStateOpenCityStore = previousOpen })
+
+	writeCityRuntimeConfig(t, tomlPath, "fail")
+	lastProviderName := "fake"
+	reply := cr.reloadConfigTraced(context.Background(), &lastProviderName, cityPath, nil, reloadSourceManual)
+
+	if reply.Outcome != reloadOutcomeFailed {
+		t.Fatalf("reply.Outcome = %q, want %q", reply.Outcome, reloadOutcomeFailed)
+	}
+	if !sp.IsRunning("existing-agent") {
+		t.Fatal("existing agent stopped though the publishing open reported schema skew beside its error")
+	}
+	if cr.controllerStoreSchemaSkewDiagnostic() == nil {
+		t.Fatal("the skew reported beside the open's error was not latched for the run-loop hold")
+	}
+}
+
+// TestCityRuntimeReloadReportsConfigParseErrorBeforeStorePreflightFailure pins
+// the order of two reload refusals. Opening the city store reads city.toml, so
+// an unparsable city.toml also fails the store preflight, and reporting that
+// store error would bury the parse error the operator has to fix. A schema-skew
+// verdict still refuses first (TestCityRuntimeReloadSchemaSkewPreservesSessionsBeforeProviderSwap),
+// and a preflight failure on a config that does parse still refuses the reload
+// before anything is applied.
+func TestCityRuntimeReloadReportsConfigParseErrorBeforeStorePreflightFailure(t *testing.T) {
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	writeCityRuntimeConfig(t, tomlPath, "fake")
+	cfg, err := config.Load(osFS{}, tomlPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	sp := runtime.NewFake()
+	cr := newTestCityRuntime(t, CityRuntimeParams{
+		CityPath: cityPath, CityName: "test-city", TomlPath: tomlPath,
+		Cfg: cfg, SP: sp, Dops: newDrainOps(sp), Rec: events.Discard,
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		Stdout: io.Discard, Stderr: io.Discard,
+	})
+	cs := newControllerState(context.Background(), cfg, sp, events.NewFake(), "test-city", cityPath)
+	cs.cityBeadStore = beads.NewMemStore()
+	cr.setControllerState(cs)
+
+	previousPreflight := controllerStatePreflightCityStore
+	controllerStatePreflightCityStore = func(string, *config.City, gate.Mode) (beads.StoreOpenResult, error) {
+		return beads.StoreOpenResult{}, errors.New("dolt server unreachable")
+	}
+	t.Cleanup(func() { controllerStatePreflightCityStore = previousPreflight })
+
+	if err := os.WriteFile(tomlPath, []byte("[[[ bad toml"), 0o644); err != nil {
+		t.Fatalf("write invalid config: %v", err)
+	}
+	lastProviderName := "fake"
+	reply := cr.reloadConfigTraced(context.Background(), &lastProviderName, cityPath, nil, reloadSourceManual)
+	if reply.Outcome != reloadOutcomeFailed || !strings.Contains(reply.Error, "parsing city.toml") {
+		t.Fatalf("reply = %+v, want a failed reload reporting the city.toml parse error", reply)
+	}
+
+	writeCityRuntimeConfig(t, tomlPath, "fail")
+	reply = cr.reloadConfigTraced(context.Background(), &lastProviderName, cityPath, nil, reloadSourceManual)
+	if reply.Outcome != reloadOutcomeFailed || !strings.Contains(reply.Error, "preflight city bead store: dolt server unreachable") {
+		t.Fatalf("reply = %+v, want a failed reload reporting the store preflight failure", reply)
+	}
+	if lastProviderName != "fake" || cr.sp != sp {
+		t.Fatalf("reload applied a provider change (lastProviderName = %q) despite the failed store preflight", lastProviderName)
+	}
+}
+
+func TestCityRuntimeTickSchemaSkewHoldsBeforePoolDeathHook(t *testing.T) {
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	writeCityRuntimeConfig(t, tomlPath, "fake")
+	cfg, err := config.Load(osFS{}, tomlPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	sp := runtime.NewFake()
+	cr := newTestCityRuntime(t, CityRuntimeParams{
+		CityPath: cityPath, CityName: "test-city", TomlPath: tomlPath,
+		Cfg: cfg, SP: sp, Dops: newDrainOps(sp), Rec: events.Discard,
+		Stdout: io.Discard, Stderr: io.Discard,
+	})
+	cs := newControllerState(context.Background(), cfg, sp, events.NewFake(), "test-city", cityPath)
+	cs.cityBeadStore = beads.NewMemStore()
+	cr.setControllerState(cs)
+
+	previousOpen := newControllerStateOpenCityStore
+	newControllerStateOpenCityStore = func(string, gate.Mode, beads.NativeTransportMode) (beads.StoreOpenResult, error) {
+		return beads.StoreOpenResult{Store: beads.NewMemStore(), Diagnostic: beads.BeadsDiagnostic{
+			Store: beads.BeadsStoreNameBdStore, PreflightGate: "native_open",
+			PreflightReason: "schema version mismatch: database is at v55, binary knows up to v54 (1 migration ahead)",
+		}}, nil
+	}
+	t.Cleanup(func() { newControllerStateOpenCityStore = previousOpen })
+	previousPreflight := controllerStatePreflightCityStore
+	controllerStatePreflightCityStore = func(string, *config.City, gate.Mode) (beads.StoreOpenResult, error) {
+		return newControllerStateOpenCityStore("", gate.ModeUnset, beads.NativeTransportUnset)
+	}
+	t.Cleanup(func() { controllerStatePreflightCityStore = previousPreflight })
+
+	hookOutput := filepath.Join(cityPath, "on-death-ran")
+	cr.publishPoolDeathHandlers(map[string]poolDeathInfo{
+		"dead-agent": {Command: fmt.Sprintf("touch %q", hookOutput), Dir: cityPath},
+	})
+	previousRunning := map[string]bool{"dead-agent": true}
+	writeCityRuntimeConfig(t, tomlPath, "fail")
+	var dirty atomic.Bool
+	dirty.Store(true)
+	lastProviderName := "fake"
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	cr.tick(ctx, &dirty, &lastProviderName, cityPath, &previousRunning, "schema-skew-test")
+
+	if _, err := os.Stat(hookOutput); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("on_death hook ran before schema-skew hold: stat error = %v", err)
+	}
+}
+
+// TestCityRuntimeTickJudgesPoolDeathByPreReloadHandlers pins that a pool
+// instance which died before a config reload is judged by the handler set it
+// died under. The reload in the same tick drops the dead instance's handler —
+// the bounded pool is removed, or the unlimited pool is rediscovered without
+// the stopped instance — yet its pre-reload on_death hook must run exactly
+// once, and prevPoolRunning must be reset rather than keep the dead instance
+// marked running for a later handler set to fire on.
+func TestCityRuntimeTickJudgesPoolDeathByPreReloadHandlers(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		maxSessions string
+		keepPool    bool
+	}{
+		{name: "bounded_pool_removed", maxSessions: "2", keepPool: false},
+		{name: "unlimited_pool_rediscovered_without_dead_instance", maxSessions: "-1", keepPool: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cityPath := t.TempDir()
+			tomlPath := filepath.Join(cityPath, "city.toml")
+			hookOutput := filepath.Join(cityPath, "on-death-runs")
+			poolTOML := "[[agent]]\nname = \"worker\"\nstart_command = \"true\"\n" +
+				"min_active_sessions = 0\nmax_active_sessions = " + tc.maxSessions + "\n" +
+				"on_death = \"echo fired >> " + shellQuotePath(hookOutput) + "\"\n"
+			writeConfig := func(body string) {
+				t.Helper()
+				clearInheritedBeadsEnv(t)
+				requireNoLeakedDoltAfterForPaths(t, cityPath)
+				data := "[workspace]\nname = \"test-city\"\n\n[beads]\nprovider = \"file\"\n\n[session]\nprovider = \"fake\"\n\n" + body
+				if err := os.WriteFile(tomlPath, []byte(data), 0o644); err != nil {
+					t.Fatalf("write config: %v", err)
+				}
+			}
+			writeConfig(poolTOML)
+			cfg, err := config.Load(osFS{}, tomlPath)
+			if err != nil {
+				t.Fatalf("load config: %v", err)
+			}
+
+			const deadSession = "worker-1"
+			sp := runtime.NewFake()
+			if err := sp.Start(context.Background(), deadSession, runtime.Config{}); err != nil {
+				t.Fatalf("start %s: %v", deadSession, err)
+			}
+			cr := newTestCityRuntime(t, CityRuntimeParams{
+				CityPath: cityPath, CityName: "test-city", TomlPath: tomlPath,
+				Cfg: cfg, SP: sp, Dops: newDrainOps(sp), Rec: events.Discard,
+				BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+					return DesiredStateResult{State: map[string]TemplateParams{}}
+				},
+				Stdout: io.Discard, Stderr: io.Discard,
+			})
+			cs := newControllerState(context.Background(), cfg, sp, events.NewFake(), "test-city", cityPath)
+			cs.cityBeadStore = beads.NewMemStore()
+			cr.setControllerState(cs)
+
+			cr.publishPoolDeathHandlers(computePoolDeathHandlers(cfg, "test-city", cityPath, sp, io.Discard))
+			if _, ok := cr.publishedPoolDeathHandlers()[deadSession]; !ok {
+				t.Fatalf("pre-reload handlers %v have no entry for %s", cr.publishedPoolDeathHandlers(), deadSession)
+			}
+			previousRunning := map[string]bool{deadSession: true}
+			if err := sp.Stop(deadSession); err != nil {
+				t.Fatalf("stop %s: %v", deadSession, err)
+			}
+
+			if tc.keepPool {
+				writeConfig(poolTOML + "\n[daemon]\nshutdown_timeout = \"9s\"\n")
+			} else {
+				writeConfig("")
+			}
+			var dirty atomic.Bool
+			dirty.Store(true)
+			lastProviderName := "fake"
+
+			cr.tick(context.Background(), &dirty, &lastProviderName, cityPath, &previousRunning, "pool-death-reload-test")
+
+			if _, ok := cr.publishedPoolDeathHandlers()[deadSession]; ok {
+				t.Fatalf("reload kept a handler for %s, so this fixture no longer drops it: %v", deadSession, cr.publishedPoolDeathHandlers())
+			}
+			data, err := os.ReadFile(hookOutput)
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("read on_death output: %v", err)
+			}
+			if got := strings.Count(string(data), "fired"); got != 1 {
+				t.Errorf("pre-reload on_death hook for %s ran %d times, want exactly 1", deadSession, got)
+			}
+			if len(previousRunning) != 0 {
+				t.Errorf("prevPoolRunning = %v after the tick, want it reset (nothing is running)", previousRunning)
+			}
+		})
+	}
+}
+
+// TestCityRuntimeTickJudgesPoolLivenessByPreReloadProvider pins that pool
+// liveness is read from the session provider in force before a config reload,
+// together with the handler set captured there. A reload that swaps the session
+// provider stops the old provider's sessions and leaves the tick holding a new
+// provider that lists none of them; comparing the pre-reload handlers with that
+// listing mistakes a session that was running when the tick began for a death,
+// and the default on_death hook releases its in_progress claims.
+func TestCityRuntimeTickJudgesPoolLivenessByPreReloadProvider(t *testing.T) {
+	t.Setenv("GC_SESSION", "")
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	hookOutput := filepath.Join(cityPath, "on-death-runs")
+	poolTOML := "[[agent]]\nname = \"worker\"\nstart_command = \"true\"\n" +
+		"min_active_sessions = 0\nmax_active_sessions = 2\n" +
+		"on_death = \"echo fired >> " + shellQuotePath(hookOutput) + "\"\n"
+	writeConfig := func(provider, body string) {
+		t.Helper()
+		clearInheritedBeadsEnv(t)
+		requireNoLeakedDoltAfterForPaths(t, cityPath)
+		data := "[workspace]\nname = \"test-city\"\n\n[beads]\nprovider = \"file\"\n\n[session]\nprovider = \"" + provider + "\"\n\n" + body
+		if err := os.WriteFile(tomlPath, []byte(data), 0o644); err != nil {
+			t.Fatalf("write config: %v", err)
+		}
+	}
+	// The pre-reload provider is a fake standing in for tmux: the tick reaches
+	// sessions only through cr.sp, and lastProviderName names what it runs.
+	writeConfig("tmux", poolTOML)
+	cfg, err := config.Load(osFS{}, tomlPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	const liveSession = "worker-1"
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), liveSession, runtime.Config{}); err != nil {
+		t.Fatalf("start %s: %v", liveSession, err)
+	}
+	cr := newTestCityRuntime(t, CityRuntimeParams{
+		CityPath: cityPath, CityName: "test-city", TomlPath: tomlPath,
+		Cfg: cfg, SP: sp, Dops: newDrainOps(sp), Rec: events.Discard,
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		Stdout: io.Discard, Stderr: io.Discard,
+	})
+	cs := newControllerState(context.Background(), cfg, sp, events.NewFake(), "test-city", cityPath)
+	cs.cityBeadStore = beads.NewMemStore()
+	cr.setControllerState(cs)
+
+	cr.publishPoolDeathHandlers(computePoolDeathHandlers(cfg, "test-city", cityPath, sp, io.Discard))
+	if _, ok := cr.publishedPoolDeathHandlers()[liveSession]; !ok {
+		t.Fatalf("pre-reload handlers %v have no entry for %s", cr.publishedPoolDeathHandlers(), liveSession)
+	}
+	previousRunning := map[string]bool{liveSession: true}
+
+	// The reloaded config selects another provider, so the reload builds a new,
+	// empty fake and stops the pre-reload provider's sessions.
+	writeConfig("fake", poolTOML+"\n[daemon]\nshutdown_timeout = \"0s\"\n")
+	var dirty atomic.Bool
+	dirty.Store(true)
+	lastProviderName := "tmux"
+
+	cr.tick(context.Background(), &dirty, &lastProviderName, cityPath, &previousRunning, "pool-liveness-provider-swap-test")
+
+	if lastProviderName != "fake" || cr.sp == sp {
+		t.Fatalf("reload did not swap the session provider (lastProviderName = %q), so this fixture no longer tests a swap", lastProviderName)
+	}
+	if cr.sp.IsRunning(liveSession) {
+		t.Fatalf("the post-reload provider lists %s, so this fixture no longer tests a provider that lost it", liveSession)
+	}
+	data, err := os.ReadFile(hookOutput)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read on_death output: %v", err)
+	}
+	if got := strings.Count(string(data), "fired"); got != 0 {
+		t.Errorf("on_death hook for %s ran %d times, want 0: it was running when the tick began, and only the reload's provider swap lost it", liveSession, got)
 	}
 }
 
@@ -6159,6 +6745,235 @@ func TestCityRuntimeReloadMaterializesNewlyAddedSkill(t *testing.T) {
 	}
 }
 
+// TestCityRuntimeReloadKeepsAgentLocalSkillInSharedSink is the live-reload
+// form of TestRunStage1SharedSinkKeepsAgentLocalSkill. mayor and deputy are
+// both city-scoped claude agents, so they share <city>/.claude/skills; only
+// mayor has an agent-local skill. The skill is in the sink before the
+// reload (mayor's own materialize-skills pass put it there), and an
+// applied reload, which runs stage-1 materialization for the whole city,
+// must keep it even though the sink's ownership manifest records the link
+// as gc-written and deputy does not want it. Ordinary ticks never run
+// stage-1, so an applied reload is the live path that reconciles the
+// shared sink.
+func TestCityRuntimeReloadKeepsAgentLocalSkillInSharedSink(t *testing.T) {
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	clearInheritedBeadsEnv(t)
+	requireNoLeakedDoltAfterForPaths(t, cityPath)
+	deputy := "[[agent]]\nname = \"deputy\"\nscope = \"city\"\nprovider = \"claude\"\n\n"
+	writeSkillMaterializationTestConfig(t, tomlPath, deputy)
+	// A shared skill keeps deputy's pass from being skipped as empty; a
+	// live city's sink always has shared skills.
+	writeSkillSource(t, filepath.Join(cityPath, "skills", "plan"))
+	writeSkillSource(t, filepath.Join(cityPath, "agents", "mayor", "skills", "a-only"))
+
+	cfg, configRev := loadCityRuntimeControllerConfig(t, cityPath)
+
+	var mayor *config.Agent
+	for i := range cfg.Agents {
+		if cfg.Agents[i].Name == "mayor" && cfg.Agents[i].Dir == "" {
+			mayor = &cfg.Agents[i]
+			break
+		}
+	}
+	if mayor == nil {
+		t.Fatal("mayor agent missing from loaded config")
+	}
+	var seedOut, seedErr bytes.Buffer
+	if err := materializeSkillsIntoWorkdir(cfg, mayor, cityPath, cityPath, nil, &seedOut, &seedErr); err != nil {
+		t.Fatalf("seed mayor's sink: %v; stderr=%q", err, seedErr.String())
+	}
+	link := filepath.Join(cityPath, ".claude", "skills", "a-only")
+	if _, err := os.Lstat(link); err != nil {
+		t.Fatalf("precondition: a-only not in the sink before reload: %v; stdout=%q", err, seedOut.String())
+	}
+
+	sp := runtime.NewFake()
+	dirty := &atomic.Bool{}
+	pokeCh := make(chan struct{}, 8)
+	var stdout, stderr bytes.Buffer
+	cr := newTestCityRuntime(t, CityRuntimeParams{
+		CityPath:     cityPath,
+		CityName:     "test-city",
+		TomlPath:     tomlPath,
+		WatchTargets: config.WatchTargets(nil, cfg, cityPath),
+		ConfigRev:    configRev,
+		ConfigDirty:  dirty,
+		Cfg:          cfg,
+		SP:           sp,
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		Dops:   newDrainOps(sp),
+		Rec:    events.Discard,
+		PokeCh: pokeCh,
+		Stdout: &stdout,
+		Stderr: &stderr,
+	})
+
+	// A live-reloadable edit that moves the revision, so the reload takes
+	// the applied branch rather than the same-revision no-op.
+	writeSkillMaterializationTestConfig(t, tomlPath, deputy, "[orders]\nskip = [\"reaper\"]\n")
+
+	lastProviderName := "tmux"
+	reply := cr.reloadConfigTraced(context.Background(), &lastProviderName, cityPath, nil, reloadSourceWatch)
+	if reply.Outcome != reloadOutcomeApplied {
+		t.Fatalf("reload outcome = %q, want %q; stderr=%q", reply.Outcome, reloadOutcomeApplied, stderr.String())
+	}
+	if _, err := os.Lstat(link); err != nil {
+		t.Errorf("mayor's agent-local skill a-only removed by the reload: %v; stdout=%q stderr=%q", err, stdout.String(), stderr.String())
+	}
+}
+
+// TestCityRuntimeReloadPrunesOneAgentsSkillInSharedSink: mayor and deputy
+// share <city>/.claude/skills and each has its own agent-local skill.
+// Both skills survive an applied reload. When deputy's skill is removed
+// from its skills directory, the next applied reload prunes deputy's link
+// and keeps mayor's: one pass per sink still cleans up after a single
+// agent's catalog.
+func TestCityRuntimeReloadPrunesOneAgentsSkillInSharedSink(t *testing.T) {
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	clearInheritedBeadsEnv(t)
+	requireNoLeakedDoltAfterForPaths(t, cityPath)
+	deputy := "[[agent]]\nname = \"deputy\"\nscope = \"city\"\nprovider = \"claude\"\n\n"
+	writeSkillMaterializationTestConfig(t, tomlPath, deputy)
+	writeSkillSource(t, filepath.Join(cityPath, "skills", "plan"))
+	writeSkillSource(t, filepath.Join(cityPath, "agents", "mayor", "skills", "m-only"))
+	deputySkill := filepath.Join(cityPath, "agents", "deputy", "skills", "d-only")
+	writeSkillSource(t, deputySkill)
+
+	cfg, configRev := loadCityRuntimeControllerConfig(t, cityPath)
+	sink := filepath.Join(cityPath, ".claude", "skills")
+	requireLinks := func(when string, present, absent []string) {
+		t.Helper()
+		for _, name := range present {
+			if _, err := os.Lstat(filepath.Join(sink, name)); err != nil {
+				t.Errorf("%s: %s missing from the shared sink: %v", when, name, err)
+			}
+		}
+		for _, name := range absent {
+			if _, err := os.Lstat(filepath.Join(sink, name)); !os.IsNotExist(err) {
+				t.Errorf("%s: %s still in the shared sink (lstat err=%v)", when, name, err)
+			}
+		}
+	}
+
+	var startErr bytes.Buffer
+	if err := runStage1SkillMaterialization(cityPath, cfg, &startErr); err != nil {
+		t.Fatalf("start pass: %v", err)
+	}
+	requireLinks("after the start pass", []string{"plan", "m-only", "d-only"}, nil)
+
+	sp := runtime.NewFake()
+	var stdout, stderr bytes.Buffer
+	cr := newTestCityRuntime(t, CityRuntimeParams{
+		CityPath:     cityPath,
+		CityName:     "test-city",
+		TomlPath:     tomlPath,
+		WatchTargets: config.WatchTargets(nil, cfg, cityPath),
+		ConfigRev:    configRev,
+		ConfigDirty:  &atomic.Bool{},
+		Cfg:          cfg,
+		SP:           sp,
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		Dops:   newDrainOps(sp),
+		Rec:    events.Discard,
+		PokeCh: make(chan struct{}, 8),
+		Stdout: &stdout,
+		Stderr: &stderr,
+	})
+	reload := func(extra ...string) {
+		t.Helper()
+		writeSkillMaterializationTestConfig(t, tomlPath, append([]string{deputy}, extra...)...)
+		lastProviderName := "tmux"
+		reply := cr.reloadConfigTraced(context.Background(), &lastProviderName, cityPath, nil, reloadSourceWatch)
+		if reply.Outcome != reloadOutcomeApplied {
+			t.Fatalf("reload outcome = %q, want %q; stderr=%q", reply.Outcome, reloadOutcomeApplied, stderr.String())
+		}
+	}
+
+	reload("[orders]\nskip = [\"reaper\"]\n")
+	requireLinks("after the first reload", []string{"plan", "m-only", "d-only"}, nil)
+
+	if err := os.RemoveAll(deputySkill); err != nil {
+		t.Fatal(err)
+	}
+	reload()
+	requireLinks("after deputy's skill was removed", []string{"plan", "m-only"}, []string{"d-only"})
+}
+
+// TestCityRuntimeReloadWarnsOfUnreconciledSkillSink: rigs fe and be share
+// one path, and each imports a pack bound as ops whose review skill lives
+// in a different directory. Both pass validation, so the reload applies,
+// but the rigs' claude agents write one sink that cannot link ops.review
+// from two sources, and stage 1 leaves it unreconciled. The reload reply
+// must say so, naming the sink, and not only the controller's stderr.
+func TestCityRuntimeReloadWarnsOfUnreconciledSkillSink(t *testing.T) {
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	clearInheritedBeadsEnv(t)
+	requireNoLeakedDoltAfterForPaths(t, cityPath)
+	rigDir := filepath.Join(cityPath, "rigs", "shared")
+	if err := os.MkdirAll(filepath.Join(cityPath, ".gc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(rigDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, pack := range []string{"ops-a", "ops-b"} {
+		packDir := filepath.Join(cityPath, "assets", pack)
+		writeSkillSource(t, filepath.Join(packDir, "skills", "review"))
+		writeMaterializeTestCityFile(t, packDir, "pack.toml", "[pack]\nname = \"ops\"\nversion = \"0.1.0\"\nschema = 2\n")
+	}
+	writeMaterializeTestCityFile(t, filepath.Join(cityPath, ".gc"), "site.toml",
+		fmt.Sprintf("[[rig]]\nname = \"fe\"\npath = %q\n\n[[rig]]\nname = \"be\"\npath = %q\n", rigDir, rigDir))
+	rigs := "[[rigs]]\nname = \"fe\"\n\n[rigs.imports.ops]\nsource = \"./assets/ops-a\"\n\n" +
+		"[[rigs]]\nname = \"be\"\n\n[rigs.imports.ops]\nsource = \"./assets/ops-b\"\n\n"
+	writeSkillMaterializationTestConfig(t, tomlPath, rigs)
+
+	cfg, configRev := loadCityRuntimeControllerConfig(t, cityPath)
+	sp := runtime.NewFake()
+	var stdout, stderr bytes.Buffer
+	cr := newTestCityRuntime(t, CityRuntimeParams{
+		CityPath:     cityPath,
+		CityName:     "test-city",
+		TomlPath:     tomlPath,
+		WatchTargets: config.WatchTargets(nil, cfg, cityPath),
+		ConfigRev:    configRev,
+		ConfigDirty:  &atomic.Bool{},
+		Cfg:          cfg,
+		SP:           sp,
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		Dops:   newDrainOps(sp),
+		Rec:    events.Discard,
+		PokeCh: make(chan struct{}, 8),
+		Stdout: &stdout,
+		Stderr: &stderr,
+	})
+
+	writeSkillMaterializationTestConfig(t, tomlPath, rigs, "[orders]\nskip = [\"reaper\"]\n")
+	lastProviderName := "tmux"
+	reply := cr.reloadConfigTraced(context.Background(), &lastProviderName, cityPath, nil, reloadSourceWatch)
+	if reply.Outcome != reloadOutcomeApplied {
+		t.Fatalf("reload outcome = %q, want %q; stderr=%q", reply.Outcome, reloadOutcomeApplied, stderr.String())
+	}
+	sink := filepath.Join(rigDir, ".claude", "skills")
+	found := false
+	for _, w := range reply.Warnings {
+		if strings.Contains(w, sink) && strings.Contains(w, `"ops.review"`) {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("reload warnings %q do not name the unreconciled sink %s; stderr=%q", reply.Warnings, sink, stderr.String())
+	}
+}
+
 // TestCityRuntimeReloadRejectsCollidingSkillMaterialization guards the
 // collision gate the reload path shares with `gc start` and the
 // supervisor tick (checkSkillCollisions before materialize). Two
@@ -6445,6 +7260,76 @@ func TestCityRuntimeSafeTick_PassesThroughWhenNoPanic(t *testing.T) {
 	}
 	if stderr.Len() != 0 {
 		t.Errorf("stderr = %q, want empty on clean tick", stderr.String())
+	}
+}
+
+// A schema-skewed controller must hold reconciliation and preserve every live
+// session even when an outer lifecycle owner invokes shutdown after run returns.
+func TestCityRuntimeRun_HoldsSessionsWhenControllerStoreSchemaIsNewer(t *testing.T) {
+	cityPath := t.TempDir()
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	writeCityRuntimeConfig(t, tomlPath, "fake")
+
+	cfg, err := config.Load(osFS{}, tomlPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	sp := runtime.NewFake()
+	if err := sp.Start(context.Background(), "existing-agent", runtime.Config{}); err != nil {
+		t.Fatalf("start existing agent: %v", err)
+	}
+	var sweepCalls atomic.Int32
+	previousSweepStore := newCityRuntimeOpenSweepStore
+	newCityRuntimeOpenSweepStore = func(string, string) (beads.Store, error) {
+		sweepCalls.Add(1)
+		return beads.NewMemStore(), nil
+	}
+	t.Cleanup(func() { newCityRuntimeOpenSweepStore = previousSweepStore })
+	var stderr bytes.Buffer
+	var buildCalls atomic.Int32
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	t.Cleanup(cancel)
+
+	cr := newTestCityRuntime(t, CityRuntimeParams{
+		CityPath: cityPath,
+		CityName: "test-city",
+		TomlPath: tomlPath,
+		Cfg:      cfg,
+		SP:       sp,
+		BuildFn: func(*config.City, runtime.Provider, beads.Store) DesiredStateResult {
+			buildCalls.Add(1)
+			cancel()
+			return DesiredStateResult{State: map[string]TemplateParams{}}
+		},
+		Dops:   newDrainOps(sp),
+		Rec:    events.Discard,
+		Stdout: io.Discard,
+		Stderr: &stderr,
+	})
+	cs := newControllerState(context.Background(), cfg, sp, events.NewFake(), "test-city", cityPath)
+	cs.cityBeadStore = beads.NewMemStore()
+	cs.cityBeadsDiagnostic = &beads.BeadsDiagnostic{
+		Store:               beads.BeadsStoreNameBdStore,
+		NativeStoreEligible: false,
+		PreflightGate:       "native_open",
+		PreflightReason:     "schema version mismatch: database is at v55, binary knows up to v54 (1 migration ahead)",
+	}
+	cr.setControllerState(cs)
+
+	cr.run(ctx)
+	cr.shutdown()
+
+	if got := sweepCalls.Load(); got != 0 {
+		t.Fatalf("startup store mutation sweep ran %d time(s), want 0 while schema-skewed", got)
+	}
+	if !sp.IsRunning("existing-agent") {
+		t.Fatal("existing agent was stopped after schema-skew hold returned and shutdown owner ran")
+	}
+	if got := buildCalls.Load(); got != 0 {
+		t.Fatalf("BuildFn invoked %d time(s), want 0 while schema-skewed controller holds reconciliation", got)
+	}
+	if !strings.Contains(stderr.String(), "schema version mismatch") || !strings.Contains(stderr.String(), "session reconciliation held") {
+		t.Fatalf("stderr = %q, want schema-skew fail-closed alarm", stderr.String())
 	}
 }
 
@@ -7677,7 +8562,7 @@ func TestOrderTrackingRetentionWatchdog_StampsLastAfterFiring(t *testing.T) {
 // scratch city carrying one legacy backup_state.json stamped at backupAge, plus
 // a store holding minClosedOrderTrackingRetained+2 prunable beads. Every other
 // TestOrderTrackingRetentionWatchdog_* case leaves cityPath empty, which skips
-// the doctor.BulkDeleteSafe guard entirely; these two exercise it.
+// the doctor.BulkDeleteSafe guard entirely; the cases built on it exercise it.
 func seedRetentionWatchdogCity(t *testing.T, now time.Time, backupAge time.Duration) (*CityRuntime, beads.Store, *bytes.Buffer) {
 	t.Helper()
 	cityDir := t.TempDir()
@@ -7761,6 +8646,41 @@ func TestOrderTrackingRetentionWatchdog_PrunesWhenBackupFresh(t *testing.T) {
 		if _, err := store.Get(id); err != nil {
 			t.Fatalf("%s should be preserved at the retain floor: %v", id, err)
 		}
+	}
+}
+
+// TestOrderTrackingRetentionWatchdog_NotOnTheBootDispatch verifies the
+// gastownhall/gascity#6429 guarantee: the boot dispatch, which runs before the
+// city reports ready, runs no store maintenance and stamps no watchdog; the
+// maintenance run (the orders lane's maintenance goroutine) prunes.
+func TestOrderTrackingRetentionWatchdog_NotOnTheBootDispatch(t *testing.T) {
+	t.Setenv(fsPressureThresholdEnv, "100")
+	// The maintenance run reads the wall clock, so the fixture is dated from it.
+	cr, store, stderrBuf := seedRetentionWatchdogCity(t, time.Now(), time.Hour)
+
+	cr.dispatchOrders(context.Background(), cr.cityPath)
+
+	for i := range minClosedOrderTrackingRetained + 2 {
+		id := fmt.Sprintf("guard-%02d", i)
+		if _, err := store.Get(id); err != nil {
+			t.Fatalf("%s should be preserved by the boot dispatch: %v\nstderr:\n%s", id, err, stderrBuf.String())
+		}
+	}
+	if !cr.orderTrackingRetentionWatchdogLast.IsZero() || !cr.orderSweepWatchdogLast.IsZero() || !cr.nudgeMailSweepWatchdogLast.IsZero() {
+		t.Fatal("the boot dispatch stamped a maintenance watchdog; maintenance belongs to runOrderMaintenance")
+	}
+
+	if !cr.runOrderMaintenance(context.Background()) {
+		t.Fatal("runOrderMaintenance did not run")
+	}
+
+	for _, id := range []string{"guard-00", "guard-01"} {
+		if _, err := store.Get(id); !errors.Is(err, beads.ErrNotFound) {
+			t.Fatalf("Get(%s) err = %v, want ErrNotFound (the maintenance run should prune)\nstderr:\n%s", id, err, stderrBuf.String())
+		}
+	}
+	if cr.orderTrackingRetentionWatchdogLast.IsZero() || cr.orderSweepWatchdogLast.IsZero() || cr.nudgeMailSweepWatchdogLast.IsZero() {
+		t.Fatal("a maintenance run left a watchdog unstamped")
 	}
 }
 

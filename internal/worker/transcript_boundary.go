@@ -58,6 +58,54 @@ func DefaultSearchPaths() []string {
 	return sessionlog.DefaultSearchPaths()
 }
 
+// SessionHistoryEntry aliases one discovered transcript-history row.
+type SessionHistoryEntry = sessionlog.SessionHistoryEntry
+
+// TranscriptSummary aliases the cheap transcript head/tail summary.
+type TranscriptSummary = sessionlog.TranscriptSummary
+
+// ListClaudeSessionHistory lists every claude-family transcript recorded for
+// workDir across live and archive roots, newest first.
+func ListClaudeSessionHistory(searchPaths, archiveRoots []string, workDir string) []SessionHistoryEntry {
+	return sessionlog.ListClaudeSessionHistory(searchPaths, archiveRoots, workDir)
+}
+
+// FindClaudeTranscriptsByID returns every live copy of the claude-family
+// transcript for sessionID under any project folder of searchPaths, or the
+// archived copies when no live one exists, newest first.
+func FindClaudeTranscriptsByID(searchPaths, archiveRoots []string, sessionID string) []SessionHistoryEntry {
+	return sessionlog.FindClaudeTranscriptsByID(searchPaths, archiveRoots, sessionID)
+}
+
+// ClaudeProjectSlugCandidates returns the project slug directory names a
+// claude process whose cwd is workDir may have used.
+func ClaudeProjectSlugCandidates(workDir string) []string {
+	return sessionlog.ClaudeProjectSlugCandidates(workDir)
+}
+
+// ReadClaudeTranscriptAgentName returns the transcript's first recorded
+// agent name, or "".
+func ReadClaudeTranscriptAgentName(path string) string {
+	return sessionlog.ReadClaudeTranscriptAgentName(path)
+}
+
+// ClaudeTranscriptCwdForSlug returns a cwd the transcript records whose
+// project slug is slug, or "".
+func ClaudeTranscriptCwdForSlug(path, slug string) string {
+	return sessionlog.ClaudeTranscriptCwdForSlug(path, slug)
+}
+
+// ReadClaudeTranscriptSummary scans a transcript for its title, agent name,
+// first user message, and first timestamp.
+func ReadClaudeTranscriptSummary(path string) TranscriptSummary {
+	return sessionlog.ReadClaudeTranscriptSummary(path)
+}
+
+// DefaultTranscriptArchiveRoots returns the transcript-reaper archive roots.
+func DefaultTranscriptArchiveRoots() []string {
+	return sessionlog.DefaultTranscriptArchiveRoots()
+}
+
 // MergeSearchPaths normalizes and deduplicates transcript search roots.
 func MergeSearchPaths(paths []string) []string {
 	return sessionlog.MergeSearchPaths(paths)

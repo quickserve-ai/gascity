@@ -27,21 +27,20 @@ func newHandoffCmd(stdout, stderr io.Writer) *cobra.Command {
 	var hookFormat string
 	var jsonOut bool
 	var force bool
+	var from string
 	cmd := &cobra.Command{
 		Use:   "handoff [subject] [message]",
 		Short: "Send handoff mail and restart controller-managed sessions",
 		Long: `Convenience command for context handoff.
 
-Self-handoff (default): sends mail to self. If the current session is
-controller-restartable, requests a restart, pokes the controller for an
-immediate reconcile tick, and returns without waiting for the controller to
-act. For on-demand configured named sessions, sends mail and returns without
-requesting restart: handoff intentionally leaves the user-attended session
-running instead of restarting it out from under the user. The controller can
-restart such a session via gc runtime request-restart; handoff deliberately
-does not.
+Self-handoff (default): sends mail to self, requests a restart, pokes the
+controller for an immediate reconcile tick, and returns without waiting for the
+controller to act. This covers every session class, on-demand configured named
+sessions included (ga-cctcju): the seat asking to be cycled is the
+authorization, and the reconciler's restart consume records the reset-pending
+marker that wakes the seat fresh on the next tick without other demand.
 
-For controller-restartable sessions, equivalent to:
+Equivalent to:
 
   gc mail send $GC_ALIAS <subject> [message]
   gc runtime request-restart
@@ -59,7 +58,8 @@ the context compaction lifecycle.
 Remote handoff (--target): sends mail to a target session. If the target is
 controller-restartable, kills it so the reconciler restarts it with the handoff
 mail waiting. For on-demand configured named targets, sends mail and returns
-without killing the session.
+without killing the session: another seat does not restart a user-attended
+session out from under the user.
 
 For controller-restartable targets, equivalent to:
 
@@ -80,7 +80,7 @@ or ID. Subject is required unless --auto is set.`,
 			if jsonOut {
 				out = io.Discard
 			}
-			if cmdHandoffWithForce(args, target, auto, hookFormat, force, out, stderr) != 0 {
+			if cmdHandoffWithFrom(args, target, from, auto, hookFormat, force, out, stderr) != 0 {
 				return errExit
 			}
 			if jsonOut {
@@ -101,6 +101,7 @@ or ID. Subject is required unless --auto is set.`,
 	cmd.Flags().StringVar(&hookFormat, "hook-format", "", "format hook output for a provider")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit JSON summary")
 	cmd.Flags().BoolVar(&force, "force", false, "destroy a target even when it has live background subagents")
+	cmd.Flags().StringVar(&from, "from", "", "sender identity for --target (default: as gc mail send; refused when none; --from human sends as the operator)")
 	return cmd
 }
 
@@ -133,13 +134,20 @@ func handoffJSONSubject(args []string, auto bool) string {
 	return "HANDOFF: context cycle"
 }
 
-func cmdHandoffWithForce(args []string, target string, auto bool, hookFormat string, force bool, stdout, stderr io.Writer) int {
+// cmdHandoffWithFrom runs gc handoff. --from names the sender of a --target
+// handoff; a self-handoff mails as the session itself, so --from is refused
+// there.
+func cmdHandoffWithFrom(args []string, target, from string, auto bool, hookFormat string, force bool, stdout, stderr io.Writer) int {
 	if target != "" {
 		if auto {
 			fmt.Fprintln(stderr, "gc handoff: --auto cannot be used with --target") //nolint:errcheck // best-effort stderr
 			return 1
 		}
-		return cmdHandoffRemoteWithForce(args, target, force, stdout, stderr)
+		return cmdHandoffRemoteFrom(args, target, from, force, stdout, stderr)
+	}
+	if strings.TrimSpace(from) != "" {
+		fmt.Fprintln(stderr, "gc handoff: --from needs --target (a self-handoff mails as the session)") //nolint:errcheck // best-effort stderr
+		return 1
 	}
 
 	current, err := currentSessionRuntimeTarget()
@@ -201,10 +209,10 @@ func cmdHandoffWithForce(args []string, target string, auto bool, hookFormat str
 // cmdHandoffRemote sends handoff mail to a remote session and kills its runtime.
 // Returns immediately (non-blocking). The reconciler restarts the target.
 func cmdHandoffRemote(args []string, target string, stdout, stderr io.Writer) int {
-	return cmdHandoffRemoteWithForce(args, target, false, stdout, stderr)
+	return cmdHandoffRemoteFrom(args, target, "", false, stdout, stderr)
 }
 
-func cmdHandoffRemoteWithForce(args []string, target string, force bool, stdout, stderr io.Writer) int {
+func cmdHandoffRemoteFrom(args []string, target, from string, force bool, stdout, stderr io.Writer) int {
 	cityPath, err := resolveCity()
 	if err != nil {
 		fmt.Fprintf(stderr, "gc handoff: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -231,7 +239,13 @@ func cmdHandoffRemoteWithForce(args []string, target string, force bool, stdout,
 	sessStore := cliSessionStore(store, cfg, cityPath)
 	// See cmdHandoff: the message bead is ClassMessaging and routes on its own.
 	msgStore := cliMailStore(store, cfg, cityPath).Store
-	sender, ok := resolveDefaultMailSenderForCommand(cityPath, cfg, sessStore, stderr, "gc handoff")
+	var sender string
+	var ok bool
+	if from = strings.TrimSpace(from); from != "" {
+		sender, ok = resolveExplicitMailSender(mailCityRosterFor(cfg, cityPath), cityPath, cfg, sessStore, from, nil, stderr, "gc handoff", false)
+	} else {
+		sender, ok = resolveDefaultMailSenderForCommand(cityPath, cfg, sessStore, stderr, "gc handoff")
+	}
 	if !ok {
 		return 1
 	}
@@ -279,18 +293,17 @@ func doHandoffWithOutcome(msgStore, sessStore beads.Store, rec events.Recorder, 
 		return handoffOutcome{code: 1}
 	}
 
-	restartable, pinned, err := sessionRestartableByController(sessStore, sessionName)
+	// Every session class cycles on a self-handoff, on-demand configured named
+	// seats included (ga-cctcju). The old on-demand skip dates from #744, when
+	// handoff blocked until the controller stopped the session; handoff no longer
+	// blocks, and the restart consume's RestartRequestPatch lands the
+	// reset-pending marker that wakes a demand-less on-demand seat on the next
+	// tick (TestReconcileSessionBeads_RestartRequestOnDemandWakesFromResetMarker).
+	// Only a remote handoff still declines to cycle an on-demand target.
+	_, pinned, err := sessionRestartableByController(sessStore, sessionName)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc handoff: checking session type: %v\n", err) //nolint:errcheck // best-effort stderr
 		return handoffOutcome{code: 1}
-	}
-	if !restartable {
-		if err := clearRestartRequest(sessStore, dops, sessionName); err != nil {
-			fmt.Fprintf(stderr, "gc handoff: clearing stale restart request: %v\n", err) //nolint:errcheck // best-effort stderr
-			return handoffOutcome{code: 1}
-		}
-		fmt.Fprintf(stdout, "Handoff: sent mail %s (named session; restart skipped).\n", b.ID) //nolint:errcheck // best-effort stdout
-		return handoffOutcome{code: 0}
 	}
 
 	// Pinned named sessions are kill-protected by the reconciler unless an
@@ -336,11 +349,13 @@ func doHandoffWithOutcome(msgStore, sessStore beads.Store, rec events.Recorder, 
 
 // doHandoffAuto sends handoff mail to self without requesting restart.
 func doHandoffAuto(msgStore, sessStore beads.Store, rec events.Recorder, sessionAddress string, args []string, hookFormat string, stdout, stderr io.Writer) int {
-	b, ok := createHandoffMail(msgStore, sessStore, rec, sessionAddress, sessionAddress, args, "context cycle", []string{
+	// --auto never requests a restart, so the CLI's "NOT restarted, re-run"
+	// advice does not fit it (ga-0ejdbv round 4).
+	b, ok := createHandoffMailReporting(msgStore, sessStore, rec, sessionAddress, sessionAddress, args, "context cycle", []string{
 		mail.AutoHandoffLabel,
 		mail.ArchiveAfterInjectLabel,
 		"priority:1",
-	}, stderr)
+	}, stderr, "gc handoff --auto", "hint: if that check shows the note, it is saved; only on a plain \"not found\" (not \"absence unproven\") run gc handoff --auto again.")
 	if !ok {
 		return 1
 	}
@@ -358,6 +373,16 @@ func doHandoffAuto(msgStore, sessStore beads.Store, rec events.Recorder, session
 // confined inside beadmail.Provider.SendHandoff. The returned mail.Message
 // carries the assigned ID for the caller's confirmation output.
 func createHandoffMail(msgStore, sessStore beads.Store, rec events.Recorder, senderAddress, recipientAddress string, args []string, defaultSubject string, extraLabels []string, stderr io.Writer) (mail.Message, bool) {
+	return createHandoffMailReporting(msgStore, sessStore, rec, senderAddress, recipientAddress, args, defaultSubject, extraLabels, stderr, "gc handoff",
+		"hint: the session was NOT restarted. If that check shows the note, it is saved and a re-run of gc handoff sends a second copy; only on a plain \"not found\" (not \"absence unproven\") re-run gc handoff.")
+}
+
+// createHandoffMailReporting is createHandoffMail with the caller's own error
+// label and the restart hint an UNCONFIRMED note should carry. The hint is the
+// caller's because only the caller knows what happens next: gc handoff stops
+// before the restart, while the controller's config-drift handoff restarts the
+// session regardless and must not print "re-run gc handoff" (ga-0ejdbv round 3).
+func createHandoffMailReporting(msgStore, sessStore beads.Store, rec events.Recorder, senderAddress, recipientAddress string, args []string, defaultSubject string, extraLabels []string, stderr io.Writer, label, unconfirmedHint string) (mail.Message, bool) {
 	subject := defaultSubject
 	if len(args) > 0 {
 		subject = args[0]
@@ -390,7 +415,20 @@ func createHandoffMail(msgStore, sessStore beads.Store, rec events.Recorder, sen
 		ExtraLabels: extraLabels,
 	})
 	if err != nil {
-		fmt.Fprintf(stderr, "gc handoff: creating mail: %v\n", err) //nolint:errcheck // best-effort stderr
+		// An UNCONFIRMED note may well have landed. Still stop before the
+		// restart (this session keeps its context), but say which ID to check,
+		// and what a re-run would do, instead of implying a plain retry
+		// (ga-0ejdbv review finding 2).
+		if id, ok := mail.UnconfirmedMessageID(err); ok {
+			fmt.Fprintf(stderr, "%s: handoff note UNCONFIRMED: it may have landed as %s, but it could not be read back: %v\n", label, id, err) //nolint:errcheck // best-effort stderr
+			fmt.Fprintf(stderr, "check: %s\n", mailStorageCheckCommand(id))                                                                    //nolint:errcheck // best-effort stderr
+			fmt.Fprintf(stderr, "       %s\n", mailStorageCheckReading)                                                                        //nolint:errcheck // best-effort stderr
+			if unconfirmedHint != "" {
+				fmt.Fprintln(stderr, unconfirmedHint) //nolint:errcheck // best-effort stderr
+			}
+			return mail.Message{}, false
+		}
+		fmt.Fprintf(stderr, "%s: creating mail: %v\n", label, err) //nolint:errcheck // best-effort stderr
 		return mail.Message{}, false
 	}
 	rec.Record(events.Event{

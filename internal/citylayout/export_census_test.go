@@ -39,6 +39,10 @@ var exportKeptRepoRuntimeEntries = map[string]string{
 // under a city or rig scope.
 var exportHomeOnlyRuntimeEntries = map[string]string{
 	"completions": "shell completion scripts under ~/.gc",
+	// Carry row "Deploy-freeze marker gates gc supervisor install and make
+	// install (ga-rfdkxp)": the machine-scoped freeze marker
+	// (cmd/gc/deploy_freeze.go deployFreezePath).
+	"deploy-freeze.json": "machine-scoped deploy-freeze marker under ~/.gc",
 }
 
 // gcEntryInLiteral finds ".gc/<name>" inside a string literal, where .gc is a

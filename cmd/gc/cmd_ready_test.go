@@ -393,7 +393,7 @@ func TestReadyWireFieldSetIsPinnedToTheHTTPBeadShape(t *testing.T) {
 	computedReadyWireFields := map[string]bool{"blocked_by": true}
 
 	want := []string{
-		"assignee", "blocked_by", "close_reason", "created_at", "defer_until", "dependencies",
+		"assignee", "await_type", "blocked_by", "close_reason", "created_at", "defer_until", "dependencies",
 		"description", "ephemeral", "from", "id", "is_blocked", "issue_type",
 		"labels", "metadata", "needs", "no_history", "parent", "priority",
 		"ref", "status", "title", "updated_at",
@@ -760,7 +760,7 @@ func TestReadyUnboundRigIsSkippedOnBothSurfaces(t *testing.T) {
 	}
 
 	cs := &controllerState{cfg: cfg, cityName: cfg.Workspace.Name, cityPath: cityDir, cacheCtx: context.Background()}
-	if apiStores := cs.buildStores(cfg); len(apiStores) != 0 {
+	if apiStores := cs.buildStores(cfg, nil); len(apiStores) != 0 {
 		t.Fatalf("the API built %v for the unbound rig but gc ready built %v; the two surfaces must skip it identically or this slice's CLI == API criterion is false on the arm it did not change", apiStores, stores)
 	}
 }

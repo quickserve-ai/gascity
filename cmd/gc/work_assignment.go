@@ -3,8 +3,10 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"strings"
+	"time"
 
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 
@@ -185,10 +187,43 @@ func excludeMailMessageBeads(items []beads.Bead) []beads.Bead {
 // 0 is fenced at 0, and anything else (a store whose lists carry no revision)
 // takes the tiers. Under conditional_writes=require, a store without the
 // capability is refused before either tier.
-func (w workAssignment) ReleaseWorkBead(item beads.Bead, runTargetFallback string) error {
+//
+// A SUCCESSFUL release writes one audit line to audit naming the bead, the
+// assignee it stripped, the status transition, any stamped fallback route, and
+// releasePath (which of the four release paths ran). Before ga-9n8hjv only the
+// ERROR branch at each call site logged, so a release that worked was
+// indistinguishable from one that never ran: reconstructing the 2026-09-14 wave
+// that stripped 50 beads off a named agent needed hq.dolt_diff_issues forensics
+// after the fact. The line is emitted only once the release WRITE has landed —
+// after ReleaseIfCurrent returns released on tier 1 (before the affinity-metadata
+// follow-up, whose independent failure does not un-release the bead), and after
+// the fenced write applies on tier 2 — so it never announces a release that
+// did not happen. Both skip exits already log their own line.
+//
+// audit and releasePath are REQUIRED parameters rather than optional façade
+// state on purpose: a release path added later cannot silently inherit
+// no-observability. A nil audit degrades to io.Discard so a caller with no
+// writer still releases.
+//
+// This is deliberately a log line and not a bead event: gc-layer bead writes are
+// systematically eventless (measured ~4% evented), so an events-table row would
+// be an observability guarantee that is absent exactly when it is needed.
+//
+// guard is REQUIRED for the same reason (ga-9n8hjv, fence #1): when it names the
+// work as a named agent's, nothing is released. Assignee and status are left
+// exactly as they are and the release is PROPOSED on the bead instead (see
+// named_release_guard.go). A zero guard withholds every release.
+func (w workAssignment) ReleaseWorkBead(item beads.Bead, runTargetFallback string, guard namedReleaseGuard, audit io.Writer, releasePath string) error {
 	store := w.unwrapped()
 	if store == nil {
 		return nil
+	}
+	if audit == nil {
+		audit = io.Discard
+	}
+	if reason := guard.withholdReasonForBead(item); reason != "" {
+		_, err := proposeNamedRelease(store, item, reason, releasePath, audit)
+		return err
 	}
 	metadata := clearedSessionAffinityMetadata()
 	stampFallbackRoute := runTargetFallback != "" &&
@@ -201,10 +236,20 @@ func (w workAssignment) ReleaseWorkBead(item beads.Bead, runTargetFallback strin
 		Assignee: stringPtr(""),
 		Metadata: metadata,
 	}
+	newStatus := item.Status
 	if item.Status == "in_progress" {
 		update.Status = stringPtr("open")
+		newStatus = "open"
 	}
-	if _, handled, err := releaseWorkAssignmentIfRevisionMatches(store, item, update); handled {
+	routeNote := "run_target unchanged"
+	if stampFallbackRoute {
+		routeNote = "run_target=" + runTargetFallback
+	}
+	if released, handled, err := releaseWorkAssignmentIfRevisionMatches(store, item, update); handled {
+		if err == nil && released {
+			fmt.Fprintf(audit, "%s session beads: RELEASED work %s: assignee %q -> \"\", status %s -> %s, %s, path=%s\n", //nolint:errcheck // best-effort audit; the release itself already landed
+				time.Now().UTC().Format(time.RFC3339), item.ID, item.Assignee, item.Status, newStatus, routeNote, releasePath)
+		}
 		return err
 	}
 	// Tier 1 clears status/assignee atomically but leaves the metadata to a second
@@ -245,6 +290,12 @@ func (w workAssignment) ReleaseWorkBead(item beads.Bead, runTargetFallback strin
 			if !released {
 				return nil
 			}
+			// The conditional release itself has landed: the assignee is stripped
+			// and the status swapped, whatever happens to the metadata follow-up
+			// below. Tier 1 only engages for an in_progress bead with no route to
+			// stamp, so the transition and route note are fixed.
+			fmt.Fprintf(audit, "%s session beads: RELEASED work %s: assignee %q -> \"\", status in_progress -> open, run_target unchanged, path=%s\n", //nolint:errcheck // best-effort audit; the release itself already landed
+				time.Now().UTC().Format(time.RFC3339), item.ID, item.Assignee, releasePath)
 			// If this metadata clear fails the error propagates, but no retry
 			// follows: the bead is already unassigned, so the next tick's
 			// OpenAssignedTo sweep will not see it again. A bead whose SNAPSHOT
@@ -272,6 +323,9 @@ func (w workAssignment) ReleaseWorkBead(item beads.Bead, runTargetFallback strin
 		return fmt.Errorf("releasing %q: %w", item.ID, err)
 	}
 	switch outcome {
+	case fencedReleaseApplied:
+		fmt.Fprintf(audit, "%s session beads: RELEASED work %s: assignee %q -> \"\", status %s -> %s, %s, path=%s\n", //nolint:errcheck // best-effort audit; the release itself already landed
+			time.Now().UTC().Format(time.RFC3339), item.ID, item.Assignee, item.Status, newStatus, routeNote, releasePath)
 	case fencedReleaseChanged:
 		log.Printf("ReleaseWorkBead: skipping release for %s: assignment changed between snapshot and release write", item.ID)
 	case fencedReleaseLost:
@@ -452,9 +506,10 @@ func releaseWorkAssignmentIfCurrent(store beads.Store, item beads.Bead) (release
 }
 
 // liveWorkAssignmentAssigneeMatches reports whether a WORK bead still carries the
-// (status, assignee) pair a caller's earlier snapshot recorded. The pool path in
-// pool_session_name.go uses it as its pre-write staleness check; the work path
-// here fences its writes instead (releaseAssignmentFenced).
+// (status, assignee) pair a caller's earlier snapshot recorded. The named-session
+// release guard (named_release_guard.go) uses it as its pre-write staleness
+// check; the pool sweep reads the whole row (liveWorkRowStillReleasable), and
+// the work path here fences its writes instead (releaseAssignmentFenced).
 //
 // It uses a LIVE list query, not Get, and that choice is load-bearing:
 // CachingStore.Get serves a clone straight from the in-memory cache for a bead
@@ -479,21 +534,36 @@ func liveWorkAssignmentAssigneeMatches(store beads.Store, id, expectedStatus, ex
 	if store == nil || id == "" || expectedStatus == "" {
 		return false, nil
 	}
+	wb, found, err := liveWorkAssignmentRow(store, id, expectedStatus)
+	if err != nil || !found {
+		return false, err
+	}
+	return strings.TrimSpace(wb.Assignee) == strings.TrimSpace(expectedAssignee), nil
+}
+
+// liveWorkAssignmentRow returns the live row for id when it still holds
+// expectedStatus. found is false when the bead has left that status (or no
+// longer exists); a read failure is returned as an error, never as a verdict.
+func liveWorkAssignmentRow(store beads.Store, id, expectedStatus string) (beads.Bead, bool, error) {
+	id = strings.TrimSpace(id)
+	expectedStatus = strings.TrimSpace(expectedStatus)
+	if store == nil || id == "" || expectedStatus == "" {
+		return beads.Bead{}, false, nil
+	}
 	work, err := store.List(beads.ListQuery{
 		Status:   expectedStatus,
 		Live:     true,
 		TierMode: beads.TierBoth,
 	})
 	if err != nil {
-		return false, fmt.Errorf("live work-assignment verification of %q: %w", id, err)
+		return beads.Bead{}, false, fmt.Errorf("live work-assignment verification of %q: %w", id, err)
 	}
 	for _, wb := range work {
-		if wb.ID != id {
-			continue
+		if wb.ID == id {
+			return wb, true, nil
 		}
-		return strings.TrimSpace(wb.Assignee) == strings.TrimSpace(expectedAssignee), nil
 	}
-	return false, nil
+	return beads.Bead{}, false, nil
 }
 
 // ReassignWorkBead re-homes one WORK bead onto a new session identity, writing

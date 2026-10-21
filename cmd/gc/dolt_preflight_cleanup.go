@@ -32,6 +32,10 @@ func preflightManagedDoltCleanup(_ string) error {
 
 var errManagedDoltOpenStateUnknown = errors.New("managed dolt open-file state unknown")
 
+// managedDoltSocketOpenStateFn reports whether any process holds a socket path
+// open. Tests replace it so the stale-socket decision does not hinge on host load.
+var managedDoltSocketOpenStateFn = fileOpenedByAnyProcess
+
 func removeStaleManagedDoltSockets() error {
 	for _, path := range staleManagedDoltSocketPaths() {
 		info, err := os.Lstat(path)
@@ -44,7 +48,7 @@ func removeStaleManagedDoltSockets() error {
 		if info.Mode()&os.ModeSocket == 0 {
 			continue
 		}
-		open, err := fileOpenedByAnyProcess(path)
+		open, err := managedDoltSocketOpenStateFn(path)
 		if err != nil {
 			if errors.Is(err, errManagedDoltOpenStateUnknown) {
 				continue

@@ -71,3 +71,22 @@ func TestShouldReuseCachedCatalogOnSuccessfulEmptyLoadOnlyOncePerBootstrapState(
 		t.Fatal("second successful empty load for the same bootstrap state should stop reusing the cached catalog")
 	}
 }
+
+func TestCloneCityCatalogCopiesTheOptInIndex(t *testing.T) {
+	cat := materialize.CityCatalog{
+		Entries:       []materialize.SkillEntry{{Name: "fleet.status"}},
+		OptIn:         []materialize.SkillEntry{{Name: "fleet.login"}},
+		OptInWarnings: []string{"reading opt-in skills: permission denied"},
+	}
+	clone := cloneCityCatalog(cat)
+	if len(clone.OptIn) != 1 || clone.OptIn[0].Name != "fleet.login" {
+		t.Fatalf("clone OptIn = %+v, want the opt-in index", clone.OptIn)
+	}
+	if len(clone.OptInWarnings) != 1 {
+		t.Fatalf("clone OptInWarnings = %v, want the warning carried over", clone.OptInWarnings)
+	}
+	clone.OptIn[0].Name = "changed"
+	if cat.OptIn[0].Name != "fleet.login" {
+		t.Fatal("cloneCityCatalog shares the OptIn backing array with its source")
+	}
+}

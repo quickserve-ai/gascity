@@ -44,6 +44,7 @@ func BuildProviderLaunchCommand(cityPath string, resolved *ResolvedProvider, opt
 		}
 		command = ReplaceSchemaFlags(command, resolved.OptionsSchema, mergedArgs)
 	}
+	command = appendClaudeSessionName(command, resolved, transport)
 
 	return appendProviderSettings(cityPath, providerLaunchFamily(resolved), command), nil
 }
@@ -123,6 +124,57 @@ func appendKimiHookConfigArg(command string) string {
 	return shellquote.Join(parts)
 }
 
+// appendClaudeSessionName appends `--name <seat identity>` to a claude-family
+// tmux/CLI launch or resume command so the vendor /resume picker and prompt
+// box identify the owning seat (ga-n0rvsk). Structural gates keep this
+// multi-harness safe: claude family only (omp/codex CLIs reject unknown
+// flags), never on the ACP transport (the adapter owns its own argv), and
+// never when the command already carries a --name (an explicit provider or
+// agent choice wins). Same-name collisions get a vendor-side suffix.
+func appendClaudeSessionName(command string, resolved *ResolvedProvider, transport string) string {
+	if resolved == nil {
+		return command
+	}
+	return AppendClaudeSessionNameIdentity(command, resolved, transport, resolved.SessionDisplayName)
+}
+
+// AppendClaudeSessionNameIdentity is appendClaudeSessionName with an explicit
+// identity: callers that know the session's ADDRESSABLE identity — the string
+// `gc mail send` / `gc session nudge` accept, e.g. "qcore/mallory" — pass it
+// here so the display name is pasteable, not just readable. The
+// template-qualified SessionDisplayName differs from the addressable form on
+// binding-imported agents ("qcore/cherub-law.mallory" vs "qcore/mallory").
+// All structural gates from appendClaudeSessionName apply, including
+// requiring a resolution-stamped SessionDisplayName: escape-hatch
+// start_command resolutions return before the stamp, so a caller-supplied
+// identity can never name a command whose argv the user owns.
+func AppendClaudeSessionNameIdentity(command string, resolved *ResolvedProvider, transport, identity string) string {
+	if resolved == nil || strings.TrimSpace(command) == "" {
+		return command
+	}
+	if strings.TrimSpace(transport) == SessionTransportACP {
+		return command
+	}
+	family := resolved.BuiltinAncestor
+	if family == "" {
+		family = resolved.Kind
+	}
+	if family != "claude" {
+		return command
+	}
+	if strings.TrimSpace(resolved.SessionDisplayName) == "" {
+		return command
+	}
+	name := strings.TrimSpace(identity)
+	if name == "" {
+		return command
+	}
+	if strings.Contains(command, "--name ") || strings.Contains(command, "--name=") || strings.Contains(command, " -n ") {
+		return command
+	}
+	return command + " --name " + shellquote.Join([]string{name})
+}
+
 // BuildProviderResumeCommand applies schema-managed option overrides to a
 // provider's explicit resume_command template.
 func BuildProviderResumeCommand(resolved *ResolvedProvider, optionOverrides map[string]string) (string, error) {
@@ -146,14 +198,19 @@ func BuildProviderResumeCommand(resolved *ResolvedProvider, optionOverrides map[
 	// is present, since providerOptionArgs merges defaults with overrides, but
 	// with no override it keeps none of them. Widening this gate is not the fix
 	// for that, for the reason above; see issue #5659.
+	//
+	// Both returns re-pass --name deliberately: it is idempotent when the
+	// display name persisted and restores it when it did not (ga-n0rvsk).
+	// appendClaudeSessionName leaves an empty command empty.
 	if command == "" || len(resolved.OptionsSchema) == 0 || !hasSchemaOptionOverrides(optionOverrides) {
-		return command, nil
+		return appendClaudeSessionName(command, resolved, ""), nil
 	}
 	mergedArgs, err := providerOptionArgs(resolved, optionOverrides)
 	if err != nil {
 		return "", err
 	}
-	return replaceResumeSchemaFlags(command, resolved.ResumeFlag, resolved.ResumeStyle, resolved.OptionsSchema, mergedArgs), nil
+	command = replaceResumeSchemaFlags(command, resolved.ResumeFlag, resolved.ResumeStyle, resolved.OptionsSchema, mergedArgs)
+	return appendClaudeSessionName(command, resolved, ""), nil
 }
 
 func providerLaunchBaseCommand(resolved *ResolvedProvider, transport string) string {

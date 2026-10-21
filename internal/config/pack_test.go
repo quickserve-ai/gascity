@@ -637,15 +637,19 @@ name = "refinery"
 scope = "rig"
 `)
 
-	_, _, err := LoadWithIncludes(fsys.OSFS{}, filepath.Join(dir, "city.toml"))
-	if err == nil {
-		t.Fatal("expected LoadWithIncludes to fail for nonexistent patch target")
+	// Reported, not fatal (ga-djvbvp) — see TestLoadWithIncludes_PatchTargetMissing.
+	_, prov, err := LoadWithIncludes(fsys.OSFS{}, filepath.Join(dir, "city.toml"))
+	if err != nil {
+		t.Fatalf("load must not fail for a nonexistent patch target: %v", err)
 	}
-	if !strings.Contains(err.Error(), "proj/gs.nonexistent") {
-		t.Errorf("error = %q, want mention of proj/gs.nonexistent", err)
+	found := false
+	for _, w := range prov.Warnings {
+		if IsUnappliedPatchWarning(w) && strings.Contains(w, "proj/gs.nonexistent") && strings.Contains(w, "not found") {
+			found = true
+		}
 	}
-	if !strings.Contains(err.Error(), "not found") {
-		t.Errorf("error = %q, want mention of 'not found'", err)
+	if !found {
+		t.Errorf("nonexistent patch target was not reported; warnings = %q", prov.Warnings)
 	}
 }
 
@@ -4057,6 +4061,35 @@ nudge = "standalone dog"
 	}
 	if cfg.Agents[0].Name != "dog" {
 		t.Errorf("agent name = %q, want dog", cfg.Agents[0].Name)
+	}
+}
+
+func TestExpandPacks_OverrideOptInSkillsAppend(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "packs/test/pack.toml", `
+[pack]
+name = "test"
+schema = 1
+
+[[agent]]
+name = "polecat"
+opt_in_skills = ["fleet.login"]
+`)
+	cfg := &City{
+		Rigs: []Rig{{
+			Name: "hw", Path: "/tmp/hw", Includes: []string{"packs/test"},
+			Overrides: []AgentOverride{{
+				Agent:             "polecat",
+				OptInSkillsAppend: []string{"fleet.rebalance"},
+			}},
+		}},
+	}
+	if err := ExpandPacks(cfg, fsys.OSFS{}, dir, nil); err != nil {
+		t.Fatalf("ExpandPacks: %v", err)
+	}
+	want := []string{"fleet.login", "fleet.rebalance"}
+	if got := cfg.Agents[0].OptInSkills; !sliceEqual(got, want) {
+		t.Errorf("OptInSkills = %v, want %v", got, want)
 	}
 }
 

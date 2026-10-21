@@ -367,6 +367,37 @@ default_branch = "master"
 	}
 }
 
+func TestParseRigDoctorCensusOwnerNamespace(t *testing.T) {
+	data := []byte(`
+[workspace]
+name = "lights"
+
+[[rigs]]
+name = "gascity"
+path = "/gascity"
+
+[rigs.doctor]
+census_owner_namespace = "gastownhall/gascity"
+
+[[rigs]]
+name = "scamper"
+path = "/scamper"
+`)
+	cfg, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if len(cfg.Rigs) != 2 {
+		t.Fatalf("len(Rigs) = %d, want 2", len(cfg.Rigs))
+	}
+	if got := cfg.Rigs[0].Doctor.CensusOwnerNamespace; got != "gastownhall/gascity" {
+		t.Errorf("Rigs[0].Doctor.CensusOwnerNamespace = %q, want %q", got, "gastownhall/gascity")
+	}
+	if got := cfg.Rigs[1].Doctor.CensusOwnerNamespace; got != "" {
+		t.Errorf("Rigs[1].Doctor.CensusOwnerNamespace = %q, want empty when [rigs.doctor] is absent", got)
+	}
+}
+
 func TestEffectiveDefaultBranch_EmptyWhenUnset(t *testing.T) {
 	r := Rig{Name: "rig"}
 	if got := r.EffectiveDefaultBranch(); got != "" {
@@ -2117,6 +2148,102 @@ esac
 	}
 }
 
+// TestEffectiveWorkQueryBD105SurfacesEphemeralOpenAssignedWork is the mirror of
+// the in-progress test above, and it covers the defect that was re-filed four
+// times over eight days (ga-lnlwrq, ga-0hxp79, ga-w7qlju, ga-dpz553): a patrol
+// formula pours a successor wisp, assigns it, and leaves it OPEN, and `gc hook`
+// then reports no ready work until somebody hand-mutates the row to
+// in_progress. That hand-mutation is the tell — it moves the wisp out of the
+// broken ready tier and into the in-progress tier, which has always had a real
+// wisps-tier probe.
+//
+// The ready tier had none under bd 1.0.5+: it delegated to
+// `bd ready --include-ephemeral`, on the assumption that the flag reads the
+// wisps tier. Measured against a live store on 2026-08-28, it does not --
+// `bd ready --include-ephemeral --assignee=gastown.deacon` returned [] for a
+// wisp that `bd query "ephemeral=true AND status=open AND assignee=..."`
+// returned immediately.
+//
+// The fake bd below encodes exactly that: `ready` answers [] no matter what
+// flags it is given, so the only way to surface the wisp is a real query probe.
+func TestEffectiveWorkQueryBD105SurfacesEphemeralOpenAssignedWork(t *testing.T) {
+	a := Agent{Name: "deacon", Dir: "gastown"}
+	out := runEffectiveWorkQueryForBeads(t, a, BeadsConfig{BDCompatibility: BeadsBDCompatibility105}, map[string]string{
+		"GC_SESSION_NAME": "gastown.deacon",
+	}, `#!/bin/sh
+set -eu
+case "$1" in
+  list)
+    printf '[]'
+    ;;
+  ready)
+    printf '[]'
+    ;;
+  query)
+    case "$*" in
+      *"ephemeral=true AND status=open"*)
+        printf '[{"id":"ga-ephemeral-open","assignee":"gastown.deacon","issue_type":"molecule","status":"open","ephemeral":true,"created_at":"2026-08-28T22:25:15Z"}]'
+        ;;
+      *)
+        printf '[]'
+        ;;
+    esac
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`)
+	if !strings.Contains(out, "ga-ephemeral-open") {
+		t.Fatalf("EffectiveWorkQueryForBeads(bd-1.0.5) did not surface assigned ephemeral OPEN work: %q", out)
+	}
+}
+
+// TestEffectiveWorkQueryBD105EphemeralOpenProbeRespectsReadiness pins the half
+// of the fix that is easy to lose. `bd query status=open` is NOT a readiness
+// query -- bd's own help says dependency-blocked issues keep status "open" --
+// so a probe that simply returned the first matching row would serve blocked
+// wisps that the tier it replaced would have filtered out. Trading a blind
+// tier for one that hands out unworkable rows is not a fix.
+func TestEffectiveWorkQueryBD105EphemeralOpenProbeRespectsReadiness(t *testing.T) {
+	a := Agent{Name: "deacon", Dir: "gastown"}
+	out := runEffectiveWorkQueryForBeads(t, a, BeadsConfig{BDCompatibility: BeadsBDCompatibility105}, map[string]string{
+		"GC_SESSION_NAME": "gastown.deacon",
+	}, `#!/bin/sh
+set -eu
+case "$1" in
+  list)
+    printf '[]'
+    ;;
+  ready)
+    printf '[]'
+    ;;
+  query)
+    case "$*" in
+      *"ephemeral=true AND status=open"*)
+        printf '[{"id":"ga-blocked-wisp","assignee":"gastown.deacon","issue_type":"molecule","status":"open","ephemeral":true,"created_at":"2026-08-28T22:00:00Z","dependency_count":1}]'
+        ;;
+      *)
+        printf '[]'
+        ;;
+    esac
+    ;;
+  show)
+    printf '[{"id":"ga-blocked-wisp","status":"open","dependencies":[{"id":"ga-blocker","dependency_type":"blocks","status":"open"}]}]'
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`)
+	// bd query --json carries only a dependency_count scalar, so the probe
+	// withholds the row on the fast path and resolves it through bd show; the
+	// fake answers both the way bd does for a wisp with an open blocker.
+	if strings.Contains(out, "ga-blocked-wisp") {
+		t.Fatalf("EffectiveWorkQueryForBeads(bd-1.0.5) served a dependency-blocked ephemeral wisp: %q", out)
+	}
+}
+
 func TestEffectiveWorkQueryCustom(t *testing.T) {
 	a := Agent{Name: "mayor", WorkQuery: "bd ready --label=pool:polecats"}
 	got := a.EffectiveWorkQuery()
@@ -3036,6 +3163,39 @@ esac
 	}
 }
 
+// TestEffectivePoolDemandQueryDoesNotCountFailedPartialMolecules is the
+// spawn-side half of the ga-033u0e guard. A pour that aborts partway marks
+// every bead it wrote molecule_failed=true; a v1 step keeps its gc.routed_to,
+// so bd's routed reader still returns it, and the worker's hook strips it
+// before serving. A count-form that kept counting it would mint a seat that
+// reads empty, drains, and is counted again — every tick. The row must fall
+// out of every tier the count-form merges, so the fixture plants one in the
+// canonical routed tier and one in the migration (run_target) tier.
+func TestEffectivePoolDemandQueryDoesNotCountFailedPartialMolecules(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not available; count-form exercises a jq pipeline")
+	}
+	a := Agent{Name: "worker", Dir: "hello-world"}
+	out := runShellWithFakeBd(t, a.EffectivePoolDemandQuery(), nil, `#!/bin/sh
+set -eu
+case "$*" in
+  *"--metadata-field gc.routed_to=hello-world/worker"*)
+    printf '[{"id":"partial-step","metadata":{"molecule_failed":"true","gc.instantiating":""}},{"id":"healthy","metadata":{"gc.kind":"run"}}]'
+    ;;
+  *"--metadata-field gc.run_target=hello-world/worker"*"--metadata-field gc.kind=workflow"*|\
+  *"--metadata-field gc.kind=workflow"*"--metadata-field gc.run_target=hello-world/worker"*)
+    printf '[{"id":"partial-root","metadata":{"molecule_failed":"true","gc.kind":"workflow"}}]'
+    ;;
+  *)
+    printf '[]'
+    ;;
+esac
+`)
+	if strings.TrimSpace(out) != "1" {
+		t.Fatalf("EffectivePoolDemandQuery() count = %q, want 1 (a partially-instantiated workflow's beads are hidden from every hook and must not be counted as demand)", strings.TrimSpace(out))
+	}
+}
+
 // TestEffectivePoolDemandQueryRespectsOverride verifies the user-set
 // scale_check override flows through unchanged. Pass-through behavior
 // preserves config-side flexibility while keeping the default form
@@ -3941,6 +4101,23 @@ func TestDaemonAutoReapClosedBeadWorktreesMinAgeMinutesExplicitZeroDisables(t *t
 	got := d.AutoReapClosedBeadWorktreesMinAge()
 	if got != 0 {
 		t.Errorf("AutoReapClosedBeadWorktreesMinAge() = %v, want 0 (quarantine disabled)", got)
+	}
+}
+
+func TestDaemonAutoReapStoppedAgentHomesDefaultsOffAndHonorsFlag(t *testing.T) {
+	d := DaemonConfig{}
+	if d.AutoReapStoppedAgentHomesEnabled() {
+		t.Fatal("AutoReapStoppedAgentHomesEnabled() = true, want false by default")
+	}
+	on := true
+	d.AutoReapStoppedAgentHomes = &on
+	if !d.AutoReapStoppedAgentHomesEnabled() {
+		t.Fatal("AutoReapStoppedAgentHomesEnabled() = false, want true")
+	}
+	off := false
+	d.AutoReapStoppedAgentHomes = &off
+	if d.AutoReapStoppedAgentHomesEnabled() {
+		t.Fatal("AutoReapStoppedAgentHomesEnabled() = true, want false kill switch")
 	}
 }
 
@@ -5006,6 +5183,22 @@ func TestValidateRigs_WildcardNameRejected(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "wildcard") {
 		t.Errorf("error = %q, want 'wildcard'", err)
+	}
+}
+
+// Mail from an order is addressed order:<scope>/<name>, so no rig may take the
+// order segment.
+func TestValidateRigs_OrderAddressNameRejected(t *testing.T) {
+	for _, name := range []string{"order", "order:qcore"} {
+		err := ValidateRigs([]Rig{{Name: name, Path: "/a"}}, "ci")
+		if err == nil || !strings.Contains(err.Error(), "reserved") {
+			t.Errorf("ValidateRigs(rig %q) = %v, want a reserved-name error", name, err)
+		}
+	}
+	for _, name := range []string{"orders", "reorder", "qcore"} {
+		if err := ValidateRigs([]Rig{{Name: name, Path: "/a"}}, "ci"); err != nil {
+			t.Errorf("ValidateRigs(rig %q) = %v, want nil", name, err)
+		}
 	}
 }
 
@@ -8661,5 +8854,21 @@ func TestDefaultDoltReadTimeoutMillisPreservesOuterDeadlineHeadroom(t *testing.T
 	if DefaultDoltReadTimeoutMillis*2 > DefaultDoltWriteTimeoutMillis {
 		t.Fatalf("DefaultDoltReadTimeoutMillis (%d) leaves less than half of DefaultDoltWriteTimeoutMillis (%d) as headroom for #3101's outer wall-clock deadline to catch a stuck connection pile-up first",
 			DefaultDoltReadTimeoutMillis, DefaultDoltWriteTimeoutMillis)
+	}
+}
+
+func TestOrdersConfigMaxDispatchesPerTickParsesFromTOML(t *testing.T) {
+	cfg, err := Parse([]byte(`
+[workspace]
+name = "test-city"
+
+[orders]
+max_dispatches_per_tick = 12
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if got := cfg.Orders.MaxDispatchesPerTick; got == nil || *got != 12 {
+		t.Fatalf("Orders.MaxDispatchesPerTick = %v, want 12", got)
 	}
 }

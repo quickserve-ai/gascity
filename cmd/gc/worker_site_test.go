@@ -269,7 +269,7 @@ func TestWorkerSiteSessionNudgeRefusesBeforeWriting(t *testing.T) {
 
 			for _, target := range []string{sessionID, "no-such-session"} {
 				var stdout, stderr bytes.Buffer
-				if code := cmdSessionNudge([]string{target, "check", "deploy", "status"}, mode, false, &stdout, &stderr); code != 1 {
+				if code := cmdSessionNudge([]string{target, "check", "deploy", "status"}, mode, "", false, &stdout, &stderr); code != 1 {
 					t.Fatalf("gc session nudge %s on a worker site = %d, want 1; stdout=%q stderr=%q", target, code, stdout.String(), stderr.String())
 				}
 				if !strings.Contains(stderr.String(), errWorkerSiteDeliveryNeedsController.Error()) || strings.Contains(stderr.String(), "recorded change") {
@@ -301,7 +301,7 @@ func TestWorkerSiteSessionSubmitRefusesBeforeWriting(t *testing.T) {
 	dials := countSocketDials(t)
 
 	var stdout, stderr bytes.Buffer
-	if code := cmdSessionSubmit([]string{sessionID, "check", "deploy", "status"}, session.SubmitIntentDefault, false, &stdout, &stderr); code != 1 {
+	if code := cmdSessionSubmit([]string{sessionID, "check", "deploy", "status"}, session.SubmitIntentDefault, "", false, &stdout, &stderr); code != 1 {
 		t.Fatalf("gc session submit on a worker site = %d, want 1; stdout=%q stderr=%q", code, stdout.String(), stderr.String())
 	}
 	if !strings.Contains(stderr.String(), errWorkerSiteDeliveryNeedsController.Error()) {
@@ -333,7 +333,7 @@ func TestWorkerSiteMailNotifyToADormantTargetRecordsOnlyAWake(t *testing.T) {
 	t.Cleanup(func() { nudgeWarningWriter = prevWarnings })
 	beforeCalls := len(fake.Calls)
 
-	if err := sendMailNotifyWithWorker(target, store, fake, "human", ""); err != nil {
+	if err := sendMailNotifyWithWorker(target, store, fake, ""); err != nil {
 		t.Fatalf("sendMailNotifyWithWorker on a worker site: %v", err)
 	}
 	assertNudgeNotQueuedNotice(t, warnings.String(), true)
@@ -377,7 +377,7 @@ func TestWorkerSiteMailNotifyWithoutARecordedWakeNotifiesNobody(t *testing.T) {
 			t.Cleanup(func() { nudgeWarningWriter = prevWarnings })
 			beforeCalls := len(fake.Calls)
 
-			err = sendMailNotifyWithWorker(target, store, fake, "human", "")
+			err = sendMailNotifyWithWorker(target, store, fake, "")
 			if !errors.Is(err, errWorkerSiteNotifyNotDelivered) {
 				t.Fatalf("sendMailNotifyWithWorker = %v, want errWorkerSiteNotifyNotDelivered", err)
 			}
@@ -450,6 +450,47 @@ func TestWorkerSiteMailSendNotifiedMeansAWakeWasRecorded(t *testing.T) {
 			}
 			if wake := recipient.Metadata["wake_request"]; (wake != "") != tc.notified {
 				t.Fatalf("wake_request = %q with notified %v: the flag must mean a recorded wake", wake, tc.notified)
+			}
+		})
+	}
+}
+
+// A worker-site mail notice records only the recipient's wake and never an
+// op (sendMailNotifyWithOp), so whether the op journal can record does not
+// decide whether it is sent: under require, with an op store that cannot
+// record and with the box's own store, the wake is recorded.
+func TestWorkerSiteMailNotifyUnderRequireRecordsTheWake(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		incapable bool
+	}{
+		{name: "op store cannot record", incapable: true},
+		{name: "box store"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cityDir, sessionID := newWorkerSiteSessionCity(t, map[string]string{"state": string(session.StateAsleep), "alias": "worker"})
+			if tc.incapable {
+				h := newCLIOpHarness(t, map[string]string{"GC_OPS_CONTENT": "require"})
+				h.opStore = cliOpIncapableStore{&beads.MemStore{IDPrefix: "gc", HonorExplicitIDs: true}}
+			} else {
+				t.Setenv("GC_OPS_CONTENT", "require")
+			}
+			var stdout, stderr bytes.Buffer
+			if code := cmdMailSendJSON([]string{"worker", "check the deploy"}, true, false, "human", "", "", "", "", true, &stdout, &stderr); code != 0 {
+				t.Fatalf("gc mail send --notify = %d, want 0; stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+			}
+			var result struct {
+				Notified bool `json:"notified"`
+			}
+			if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+				t.Fatalf("decoding %q: %v", stdout.String(), err)
+			}
+			recipient, err := localLedger(t, cityDir).Get(sessionID)
+			if err != nil {
+				t.Fatalf("Get: %v", err)
+			}
+			if !result.Notified || recipient.Metadata["wake_request"] == "" {
+				t.Fatalf("notified = %v, wake_request = %q; stderr=%q: the notice records no op, so require must not refuse it", result.Notified, recipient.Metadata["wake_request"], stderr.String())
 			}
 		})
 	}
@@ -2030,9 +2071,9 @@ func TestWorkerSiteRestartWithoutItsMarkerRequestsNothing(t *testing.T) {
 // TestWorkerSiteHandoffRecordsTheRestart: a self handoff on a worker site sends
 // its mail and records the restart as the bead marker, the one restart signal a
 // box can leave for the remote controller, and its poke is the worker-site
-// notice. For a named session the controller does not restart, the handoff
-// keeps its mail and clears a stale marker from the bead; the guard holds no
-// runtime flag to clear.
+// notice. An on-demand configured named session cycles on a self-handoff too
+// (ga-cctcju: the seat asking to be cycled is the authorization), so on a
+// worker site it gets the same recorded restart, not upstream's skip.
 func TestWorkerSiteHandoffRecordsTheRestart(t *testing.T) {
 	for _, tc := range workerSiteRestartSeeds {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2043,7 +2084,7 @@ func TestWorkerSiteHandoffRecordsTheRestart(t *testing.T) {
 			dials := countSocketDials(t)
 
 			var stdout, stderr bytes.Buffer
-			if code := cmdHandoffWithForce([]string{"HANDOFF: context full"}, "", false, "", false, &stdout, &stderr); code != 0 {
+			if code := cmdHandoffWithFrom([]string{"HANDOFF: context full"}, "", "", false, "", false, &stdout, &stderr); code != 0 {
 				t.Fatalf("gc handoff = %d on a worker site, want 0; stderr=%s", code, stderr.String())
 			}
 			if !strings.Contains(stdout.String(), "requesting restart") {
@@ -2058,11 +2099,13 @@ func TestWorkerSiteHandoffRecordsTheRestart(t *testing.T) {
 			}
 		})
 	}
-	t.Run("named session the controller does not restart", func(t *testing.T) {
+	// The seed carries no restart marker, so the marker the assertion finds
+	// is the one this handoff recorded. Off a worker site the same rule is
+	// TestDoHandoff_OnDemandNamedSessionRequestsRestart's.
+	t.Run("on-demand named session cycles too (ga-cctcju)", func(t *testing.T) {
 		cityDir, _ := newWorkerSiteSessionCity(t, map[string]string{
 			"state": "awake", "alias": "worker",
 			"configured_named_session": "true", "configured_named_mode": "on_demand",
-			"restart_requested": "true", "continuation_reset_pending": "true",
 		})
 		t.Setenv("GC_ALIAS", "worker")
 		t.Setenv("GC_SESSION_NAME", "worker-1")
@@ -2070,18 +2113,16 @@ func TestWorkerSiteHandoffRecordsTheRestart(t *testing.T) {
 		dials := countSocketDials(t)
 
 		var stdout, stderr bytes.Buffer
-		if code := cmdHandoffWithForce([]string{"HANDOFF: context full"}, "", false, "", false, &stdout, &stderr); code != 0 {
+		if code := cmdHandoffWithFrom([]string{"HANDOFF: context full"}, "", "", false, "", false, &stdout, &stderr); code != 0 {
 			t.Fatalf("gc handoff = %d on a worker site, want 0; stderr=%s", code, stderr.String())
 		}
-		if !strings.Contains(stdout.String(), "restart skipped") {
-			t.Fatalf("stdout = %q, want the skipped restart", stdout.String())
+		if !strings.Contains(stdout.String(), "requesting restart") || strings.Contains(stdout.String(), "restart skipped") {
+			t.Fatalf("stdout = %q, want the restart request, not a skip", stdout.String())
 		}
+		assertWorkerSitePokeNotice(t, stderr.String())
 		assertNoControllerReached(t, dials, accepted)
 		ledger := localLedger(t, cityDir)
-		all := sessionBeadsIn(t, ledger)
-		if len(all) != 1 || all[0].Metadata["restart_requested"] != "" || all[0].Metadata["continuation_reset_pending"] != "" {
-			t.Fatalf("the stale restart marker was not cleared: %+v", all)
-		}
+		assertRestartMarkerRecorded(t, sessionBeadsIn(t, ledger))
 		if got := messageBeadsIn(t, ledger); len(got) != 1 {
 			t.Fatalf("handoff mail beads = %d, want one: %+v", len(got), got)
 		}
@@ -2145,7 +2186,7 @@ func TestWorkerSiteHandoffTargetRefusesBeforeWriting(t *testing.T) {
 
 	for _, target := range []string{sessionID, "no-such-session"} {
 		var stdout, stderr bytes.Buffer
-		if code := cmdHandoffWithForce([]string{"HANDOFF: context full"}, target, false, "", false, &stdout, &stderr); code != 1 {
+		if code := cmdHandoffWithFrom([]string{"HANDOFF: context full"}, target, "", false, "", false, &stdout, &stderr); code != 1 {
 			t.Fatalf("gc handoff --target %s on a worker site = %d, want 1; stdout=%q stderr=%q", target, code, stdout.String(), stderr.String())
 		}
 		if !strings.Contains(stderr.String(), errWorkerSiteHandoffTargetNeedsController.Error()) {

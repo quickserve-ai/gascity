@@ -40,9 +40,17 @@ type sessionResponse struct {
 	LastNudgeDeliveredAt string `json:"last_nudge_delivered_at,omitempty"`
 	Attached             bool   `json:"attached"`
 
-	// Classification fields derived from config (for dashboard grouping).
+	// Classification fields are additive and come from the typed session.Info
+	// plus the configured agent. They let clients classify without name rules.
 	Rig  string `json:"rig,omitempty"`
 	Pool string `json:"pool,omitempty"`
+
+	ConfiguredNamedSession bool   `json:"configured_named_session"`
+	SessionOrigin          string `json:"session_origin,omitempty"`
+	PoolManaged            bool   `json:"pool_managed"`
+	ControlPlane           bool   `json:"control_plane"`
+	BaseState              string `json:"base_state"`
+	NavigatorSchemaVersion string `json:"navigator_schema_version"`
 
 	// AgentKind classifies the agent backing the session so dashboards can
 	// route it to the right panel without re-deriving from template names.
@@ -52,7 +60,15 @@ type sessionResponse struct {
 	AgentKind string `json:"agent_kind,omitempty"`
 
 	// Enrichment fields for dashboard consumption.
-	Running       bool   `json:"running"`
+	//
+	// Running is a point-in-time observation of the session's runtime, in any
+	// open state: whether the provider held it live when this response was
+	// built (sessionRuntimeRunning). On tmux that is a pane whose process has
+	// not exited, not proof the agent itself is up: a launch wrapper or shell
+	// pane reads true, a remain-on-exit corpse reads false. A session in a
+	// transitional state (creating, start-pending, draining) can start or stop
+	// its process right after that.
+	Running       bool   `json:"running" doc:"Whether the session's runtime was live when this response was built, in any open state. It observes the runtime, not the agent: on tmux it is true while the session has a pane whose process has not exited, so a pane still running a launch wrapper or shell before the agent starts reads true, and a pane kept by remain-on-exit after its process exited reads false. GET /session/{id} and GET /sessions read the same probe, which tmux serves from a fleet snapshot refreshed at most every 2 s. Point-in-time: a session in a transitional state (creating, start-pending, draining) can start or stop its process right after; a client confirming quiescence should re-read after its last transition settles."`
 	ActiveBead    string `json:"active_bead,omitempty"`
 	LastOutput    string `json:"last_output,omitempty"`
 	Model         string `json:"model,omitempty"`
@@ -66,16 +82,17 @@ type sessionResponse struct {
 	// session runtime can honor.
 	SubmissionCapabilities session.SubmissionCapabilities `json:"submission_capabilities,omitempty"`
 
-	// ConfiguredNamedSession marks canonical singleton sessions materialized from
-	// [[named_session]] configuration.
-	ConfiguredNamedSession bool `json:"configured_named_session,omitempty"`
-
 	// Options contains the effective per-session option overrides from
 	// template_overrides bead metadata (e.g., {"permission_mode":"unrestricted"}).
 	Options map[string]string `json:"options,omitempty"`
 
 	// Metadata exposes real_world_app_-prefixed bead metadata for external consumers.
 	Metadata map[string]string `json:"metadata,omitempty"`
+
+	// Turn is the turn the session's conversation-lane observer last
+	// recorded (X11 §5.3). Set on GET /session/{id} only, and only while
+	// the city's lane host runs with a kind to execute.
+	Turn *SessionTurn `json:"turn,omitempty" doc:"The turn the session's conversation lane last observed, with the runtime's turn capabilities. Set on a single-session read while the city's conversation lane host runs with a kind of [ops] authoritative, once its observer has recorded the session's runtime row."`
 }
 
 type sessionResponseHandle interface {
@@ -83,8 +100,12 @@ type sessionResponseHandle interface {
 	worker.PeekHandle
 }
 
+// runtimeSessionResponseHandle returns the runtime handle the list endpoints
+// enrich a session from. Every open session gets one, not only active ones:
+// running must report a live agent in a transitional state (creating,
+// start-pending, draining) too.
 func (s *Server) runtimeSessionResponseHandle(info session.Info) sessionResponseHandle {
-	if info.State != session.StateActive {
+	if info.Closed {
 		return nil
 	}
 	return newProviderSessionResponseHandle(s.state.SessionProvider(), info.SessionName, info.Provider)
@@ -102,26 +123,32 @@ func sessionToResponse(info session.Info, cfg *config.City) sessionResponse {
 		// Closed; the wire reports it as the closed lifecycle state.
 		state = string(session.BaseStateClosed)
 	}
-	r := sessionResponse{
-		ID:          info.ID,
-		Template:    info.Template,
-		State:       state,
-		Title:       info.Title,
-		Alias:       info.Alias,
-		Provider:    provider,
-		DisplayName: displayName,
-		SessionName: info.SessionName,
-		WorkDir:     info.WorkDir,
-		CreatedAt:   info.CreatedAt.Format(time.RFC3339),
-		Attached:    info.Attached,
-		Rig:         rig,
+	baseState := strings.TrimSpace(info.MetadataState)
+	if baseState == "" {
+		baseState = state
 	}
-	// Populate pool and agent_kind from config lookup. The pool field is
-	// the agent's base name (e.g., "polecat"), useful for dashboard type
-	// classification. AgentKind tells the dashboard which panel a session
-	// belongs to (crew/pool/role).
+	r := sessionResponse{
+		ID:                     info.ID,
+		Template:               info.Template,
+		State:                  state,
+		Title:                  info.Title,
+		Alias:                  info.Alias,
+		Provider:               provider,
+		DisplayName:            displayName,
+		SessionName:            info.SessionName,
+		WorkDir:                info.WorkDir,
+		CreatedAt:              info.CreatedAt.Format(time.RFC3339),
+		Attached:               info.Attached,
+		Rig:                    rig,
+		NavigatorSchemaVersion: "1",
+		ConfiguredNamedSession: info.ConfiguredNamedSession,
+		SessionOrigin:          info.SessionOrigin,
+		PoolManaged:            info.PoolManaged,
+		BaseState:              baseState,
+	}
 	if cfg != nil {
 		if agent, ok := findAgent(cfg, info.Template); ok {
+			r.ControlPlane = config.IsDeterministicControlDispatcher(&agent)
 			if isMultiSessionAgent(agent) {
 				r.Pool = agent.Name
 			}
@@ -613,18 +640,21 @@ func (s *Server) enrichSessionResponse(resp *sessionResponse, info session.Info,
 // exact transcript paths. A non-nil map is authoritative, including misses,
 // so list callers can batch Codex discovery once instead of scanning per row.
 func (s *Server) enrichSessionResponseWithKeyedPaths(resp *sessionResponse, info session.Info, cfg *config.City, runtimeHandle any, wantPeek, liveActiveBead, allowWorkdirTranscriptDiscovery bool, peekLines int, keyedTranscriptPaths map[string]string) {
+	if info.Closed || runtimeHandle == nil {
+		return
+	}
+	// running reports the runtime in every open state: a start-pending or
+	// draining session can have a live agent, and a client checking for
+	// quiescence must see it. It is the runtime probe, the same one for every
+	// endpoint, never the worker phase: that phase is derived from the
+	// lifecycle state, so a start-pending or creating session reads
+	// "starting" before any agent process exists, and the single-session read
+	// would claim a runtime the list endpoints do not see. The rest of the
+	// enrichment is for active sessions only.
+	resp.Running = sessionRuntimeRunning(s.state.SessionProvider(), info.SessionName)
 	if info.State != session.StateActive {
 		return
 	}
-	stateHandle, peekHandle := s.sessionRuntimeHandles(runtimeHandle, info)
-	if stateHandle == nil {
-		return
-	}
-	state, err := stateHandle.State(context.Background())
-	if err != nil {
-		return
-	}
-	resp.Running = workerPhaseHasLiveOutput(state.Phase)
 
 	// Active bead: search rig stores for in_progress work assigned to the
 	// concrete session first, then fall back to alias/runtime/session names.
@@ -646,41 +676,43 @@ func (s *Server) enrichSessionResponseWithKeyedPaths(resp *sessionResponse, info
 	// Peek preview (opt-in, only when running). peekLines=0 means "use
 	// default" so existing callers that omit the query param keep the
 	// historical 5-line preview.
-	if wantPeek && resp.Running && peekHandle != nil {
-		lines := peekLines
-		if lines <= 0 {
-			lines = defaultSessionPeekLines
-		}
-		if output, err := peekHandle.Peek(context.Background(), lines); err == nil {
-			resp.LastOutput = output
+	if wantPeek && resp.Running {
+		if peekHandle := s.sessionPeekHandle(runtimeHandle, info); peekHandle != nil {
+			lines := peekLines
+			if lines <= 0 {
+				lines = defaultSessionPeekLines
+			}
+			if output, err := peekHandle.Peek(context.Background(), lines); err == nil {
+				resp.LastOutput = output
+			}
 		}
 	}
 
 	s.applySessionModelContext(resp, info, cfg, allowWorkdirTranscriptDiscovery, keyedTranscriptPaths)
 }
 
-// sessionRuntimeHandles resolves the state and peek handles for an active
-// session from its runtime handle. It returns nil handles when none is usable
-// (unsupported handle type, missing bead store, or a worker lookup error); the
-// caller treats a nil state handle as "nothing to enrich".
-func (s *Server) sessionRuntimeHandles(runtimeHandle any, info session.Info) (worker.StateHandle, worker.PeekHandle) {
+// sessionPeekHandle resolves the peek handle for an active session from its
+// runtime handle. It returns nil when none is usable (unsupported handle type,
+// missing bead store, or a worker lookup error). A bare runtime provider is
+// resolved to the session's worker handle only here, when a peek is wanted.
+func (s *Server) sessionPeekHandle(runtimeHandle any, info session.Info) worker.PeekHandle {
 	switch v := runtimeHandle.(type) {
 	case worker.Handle:
-		return v, v
+		return v
 	case sessionResponseHandle:
-		return v, v
+		return v
 	case runtime.Provider:
 		store := s.state.SessionsBeadStore()
 		if store.Store == nil {
-			return nil, nil
+			return nil
 		}
 		resolved, err := s.workerHandleForSession(store.Store, info.ID)
 		if err != nil {
-			return nil, nil
+			return nil
 		}
-		return resolved, resolved
+		return resolved
 	default:
-		return nil, nil
+		return nil
 	}
 }
 

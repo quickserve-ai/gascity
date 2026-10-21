@@ -934,6 +934,13 @@ func (s *Server) streamSessionPeekStructured(ctx context.Context, w http.Respons
 	if promoteToHistory() {
 		return
 	}
+	if s.structuredPeekLoopReady != nil {
+		select {
+		case s.structuredPeekLoopReady <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
+	}
 
 	for {
 		select {
@@ -1655,6 +1662,13 @@ func (s *Server) streamSessionPeekStructuredHuma(ctx context.Context, send Strin
 	emitPeek()
 	if promoteToHistory() {
 		return
+	}
+	if s.structuredPeekLoopReady != nil {
+		select {
+		case s.structuredPeekLoopReady <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
 	}
 
 	for {

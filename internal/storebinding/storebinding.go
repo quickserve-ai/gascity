@@ -109,7 +109,10 @@ type GraphTx interface {
 // attempt uses for every class (the witness contract). Any change to
 // the canonical stream layout is a NEW algorithm string; digests produced
 // under different algorithms never compare.
-const SemanticWitnessAlgorithm = "gascity.storage-semantic-witness.v1"
+//
+// v2: await_type joined the bead stream (ga-knhu61) — a gate whose await
+// classification changed in migration must not hash equal to its source.
+const SemanticWitnessAlgorithm = "gascity.storage-semantic-witness.v2"
 
 // WitnessFamilyCount surfaces one hashed record-family count for diagnostics.
 // The authority is the count inside the hashed stream; this is the copy
@@ -181,11 +184,13 @@ func (w SemanticWitness) Validate() error {
 // The semantics are session.AddressDirectory's: ResolveAddress answers session
 // targeting (bool = include closed sessions), ResolveMailboxAddress answers
 // mailbox ownership in ONE liveness pass (bool = the closed pass) and reports
-// a contended address as ambiguous rather than picking a mailbox.
+// a contended address as ambiguous rather than picking a mailbox, and
+// ListClosedByNamedIdentity returns a named seat's closed sessions.
 type SessionsAddressDirectory interface {
 	ResolveAddress(selector string, includeClosed bool) (session.Info, error)
 	ResolveMailboxAddress(selector string, closed bool) (session.Info, error)
 	ListAddresses(includeClosed bool) ([]session.Info, error)
+	ListClosedByNamedIdentity(identity string) ([]session.Info, error)
 }
 
 // SessionsStore is the closed typed sessions and durable-waits contract.

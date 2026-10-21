@@ -238,7 +238,7 @@ var fields = withObserved(with(with(with(with(with(with(with(registry, false, v2
 	"continuation_claim_nudge_root", "continuation_claim_nudge_store_ref", "continuation_claim_nudge_generation",
 	"continuation_claim_nudge_count", "continuation_claim_nudge_at", "execution_claim_nudge_work", "execution_claim_nudge_root",
 	"execution_claim_nudge_store_ref", "execution_claim_nudge_count", "execution_claim_nudge_at", "execution_claim_nudge_token", "execution_claim_started", "execution_claim_nudge_stalled",
-	"execution_claim_nudge_stalled_token", "execution_claim_hold", "warm_bind_notice_trigger"), true, v2(srcHeals, "asleepHealPatch"), "session_key", "started_config_hash",
+	"execution_claim_nudge_stalled_token", "execution_claim_hold", "idle_claim_nudge_hold", "continuation_claim_nudge_hold", "warm_bind_notice_trigger"), true, v2(srcHeals, "asleepHealPatch"), "session_key", "started_config_hash",
 	PrimedAtMetadataKey, PrimingAttemptedAtMetadataKey, PromptHashMetadataKey),
 	false, v2("cmd/gc/allocator_create_named.go", "createEffects.writeNamed"), "agent_name", CanonicalInstanceNameMetadata, CanonicalPoolSlotMetadata,
 	"command", NamedSessionIdentityMetadata, NamedSessionModeMetadata, NamedSessionMetadataKey, "continuation_epoch", "dependency_only",
@@ -398,6 +398,18 @@ var registry = slices.Concat([]Field{
 
 	// Launch configuration.
 	{Key: "session_key", Class: ClassLaunchConfig, Premise: true, Writers: sites(op(srcManager, "Manager.PersistSessionKey"))},
+	// The carry's resume keys (ga-oe8h, ga-fe2rmu): the conversation a
+	// lifecycle reset replaced, and `gc session resume`'s seeded latch.
+	{Key: PriorSessionKeyMetadata, Class: ClassLaunchConfig, Writers: sites(legacy(srcTransition, "StampPriorSessionKey"), legacy(srcTransition, "StampPriorSessionKeyInfo"))},
+	// The carry's seeded-resume latch (ga-oe8h): the start's commit consumes
+	// it, and every conversation reset that clears the resume run clears it
+	// with the key it names.
+	{Key: resumeSeededKey, Class: ClassMarker, Writers: sites(op("cmd/gc/cmd_session_history.go", "cmdSessionResume")), Clears: append(sites(legacyCommit), resumeRunClears...)},
+	// The carry's deferred-release obligation (ga-dt5ffp): a close that withholds
+	// work publishes it on the closing session row. Advisory: only its publisher
+	// reads it back (readSessionReleaseObligation, for its own CAS upgrade); no
+	// decision reads it, so no fence compares it.
+	{Key: beadmeta.ReleaseDeferredMetadataKey, Class: ClassAdvisory, Writers: sites(op("cmd/gc/session_release_marker.go", "publishDeferredReleaseObligation"), op("cmd/gc/session_release_marker.go", "publishDeferredReleaseObligationUnconditionally"))},
 	{Key: "alias", Class: ClassAssignmentIdentity, Writers: sites(legacy(srcPoolNames, "createPoolSessionBeadWithIdentifiers"), v2("cmd/gc/allocator_create_named.go", "createEffects.writeNamed"))},
 	{Key: aliasHistoryMetadataKey, Class: ClassLaunchConfig, Writers: sites(legacy("internal/session/alias.go", "UpdatedAliasMetadata"))},
 	{Key: "common_name", Class: ClassLaunchConfig, NoWriter: "retired: no production writer; name lookups still query it"},
@@ -411,6 +423,12 @@ var registry = slices.Concat([]Field{
 	{Key: CanonicalPoolSlotMetadata, Class: ClassLaunchConfig, Writers: sites(legacy("cmd/gc/session_identity.go", "desiredSessionIdentity"))},
 	{Key: "real_world_app_project_id", Class: ClassLaunchConfig, Writers: sites(op("internal/api/handler_session_create.go", "Server.persistSessionMeta"))},
 	{Key: beadmeta.OptionMetadataPrefix, Family: true, Class: ClassLaunchConfig, Writers: sites(op(srcManager, "Manager.UpdateTemplateOverrides"))},
+	// The carry's Claude cloud wake binding and outcome stamps (gc session
+	// bind-cloud; the cloud wake transport in cmd/gc's nudge path).
+	{Key: "cloud_wake_", Family: true, Class: ClassAdvisory, Writers: sites(op("cmd/gc/cmd_session_bind_cloud.go", "cmdSessionBindCloud"), op("cmd/gc/cmd_nudge.go", "deliverClaudeCloudNotify"))},
+	// The carry's liveness overlay (ga-lys454): one versioned fence stamp per
+	// liveness key it routes to the table, committed beside the row's write.
+	{Key: beadmeta.LivenessFencePrefix, Family: true, Class: ClassAdvisory, Writers: sites(op("internal/liveness/plan.go", "stampFences"))},
 	{Key: beadmeta.LabelRevisionMetadataKey, Class: ClassAdvisory, NewKey: true, NoWriter: "written by internal/beads' native Dolt label CAS (LL1), outside the census dirs; a version stamp no decision reads"},
 	{Key: beadmeta.InfraMigratedFromMetadataKey, Class: ClassAdvisory, Writers: sites(legacy("cmd/gc/infra_class_migrate.go", "infraMigrationRow"))},
 	// Usage compute attributes a row by its run chain (beadmeta's runIDChainKeys).
@@ -481,6 +499,8 @@ var registry = slices.Concat([]Field{
 	same(ClassAdvisory, false, sites(legacy("cmd/gc/idle_nudge.go", "writeContinuationClaimMarker")), "continuation_claim_nudge_work",
 		"continuation_claim_nudge_root", "continuation_claim_nudge_store_ref", "continuation_claim_nudge_generation",
 		"continuation_claim_nudge_count", "continuation_claim_nudge_at"),
+	same(ClassAdvisory, true, sites(legacy("cmd/gc/idle_nudge.go", "claimHoldPatch")), "idle_claim_nudge_hold",
+		"continuation_claim_nudge_hold"),
 	same(ClassAdvisory, false, sites(legacy("cmd/gc/build_desired_state_pool_info.go", "recordDeferredNonExpandingPoolAliasConflictInfo")), "pool_alias_conflict",
 		"pool_alias_conflict_count", "pool_alias_conflict_at"),
 	same(ClassAdvisory, false, sites(op("internal/session/waits.go", "StampWaitLookupCapMetadata")),

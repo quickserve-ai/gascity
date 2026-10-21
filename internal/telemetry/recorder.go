@@ -416,6 +416,39 @@ func RecordNudge(ctx context.Context, target string, err error) {
 	)
 }
 
+// RecordCloudWake records one claude-cloud wake delivery attempt (metrics +
+// log event) — the §5.5 telemetry the plain success/error nudge counter
+// cannot carry (ga-bjbaui stage 5). outcome is the typed notify.Outcome
+// class ("queued_remote", "refused_not_found", "ambiguous", ... or "" for a
+// pre-launch failure); retryable is ALWAYS false for launched sends
+// (at-most-once) and true only for pre-launch refusals a caller may safely
+// re-run after fixing inputs. The durable-record ref (bead:// or https) and
+// account lineage ride the log event, not the metric, to keep metric
+// cardinality bounded.
+func RecordCloudWake(ctx context.Context, target, outcome, ref, accountDir string, latency time.Duration, retryable bool, err error) {
+	initInstruments()
+	status := statusStr(err)
+	inst.nudgeTotal.Add(ctx, 1,
+		metric.WithAttributes(
+			attribute.String("target", target),
+			attribute.String("status", status),
+			attribute.String("transport", "claude-cloud"),
+			attribute.String("outcome", outcome),
+		),
+	)
+	emit(ctx, "session.cloud_wake", severity(err),
+		attribute.String("target", target),
+		attribute.String("status", status),
+		attribute.String("transport", "claude-cloud"),
+		attribute.String("outcome", outcome),
+		attribute.String("ref", ref),
+		attribute.String("account_lineage", accountDir),
+		attribute.Int64("latency_ms", latency.Milliseconds()),
+		attribute.Bool("retryable", retryable),
+		errKV(err),
+	)
+}
+
 // RecordConfigReload records a config reload attempt (metrics + log event).
 func RecordConfigReload(ctx context.Context, revision, source, outcome string, warningCount int, err error) {
 	initInstruments()

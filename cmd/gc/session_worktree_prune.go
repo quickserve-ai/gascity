@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/gastownhall/gascity/internal/git"
 	"github.com/gastownhall/gascity/internal/pathutil"
+	"github.com/gastownhall/gascity/internal/runtime"
 	sessionpkg "github.com/gastownhall/gascity/internal/session"
 )
 
@@ -22,14 +24,28 @@ type gitProbe interface {
 	IsRepo() bool
 	CurrentBranch() (string, error)
 	HasUncommittedWork() bool
+	StatusPorcelain() (string, error)
 	HasUnpushedCommitsResult() (bool, error)
-	HasStashesResult() (bool, error)
 	WorktreeRemove(path string, force bool) error
 }
 
 // newGitProbe returns a gitProbe scoped to the given directory. Indirected
 // through a package-level var so tests can stub the git invocations.
 var newGitProbe = func(workDir string) gitProbe { return git.New(workDir) }
+
+// workerDirHasAuthoredChanges reports whether workerDir holds uncommitted work
+// other than gc's own provisioning sediment, using the closed-bead reaper's
+// filter (nonSedimentStatusLines, ga-pi0rzc). A raw dirty check reads that
+// sediment as work, and it also reads the .worktree-stale marker this file
+// writes whenever it skips a tree, so a worker_dir skipped once was skipped
+// forever (ga-bjenxa). A probe error counts as dirty.
+func workerDirHasAuthoredChanges(gp gitProbe) bool {
+	porcelain, err := gp.StatusPorcelain()
+	if err != nil {
+		return true
+	}
+	return len(nonSedimentStatusLines(porcelain)) > 0
+}
 
 // writeWorktreeStaleMarker records why workerDir was left in place instead of
 // pruned, so cleanupClosedBeadAgentHomeWorktrees (agent_home_worktree_cleanup.go)
@@ -59,18 +75,36 @@ func writeWorktreeStaleMarker(gp gitProbe, workerDir, reason string, stderr io.W
 //
 // No-op when:
 //   - cfg.Daemon.AutoPruneWorkerDir is false
+//   - the session bead is a configured named session (a named home is not a
+//     disposable pool worktree, even if it transiently carries pool metadata
+//     while being re-minted — ga-1xiv)
+//   - a direct liveness re-probe finds the session's runtime still running,
+//     or cannot observe it at all (the caller's cached liveness can be
+//     transiently false during supervisor re-adoption — ga-1xiv; unknown
+//     liveness defers destructive work — #5544)
 //   - the session bead has no worker_dir metadata
 //   - the worker_dir does not live under cityPath/.gc/worktrees/
 //   - the worker_dir is missing on disk or has no .git pointer
-//   - the worktree has uncommitted changes, unpushed commits, or stashes
+//   - the worktree has uncommitted changes or unpushed commits (a repo stash
+//     does not block it: ga-bjenxa)
 //   - the rig that owns the session cannot be resolved to a filesystem path
 //
 // Removal failures are logged but never surfaced — an orphaned worktree
 // still shows up via `gc doctor` later, which is the operator's existing
 // reclaim path.
-func pruneAgentHomeWorktreeIfSafe(session beads.Bead, cityPath string, cfg *config.City, stderr io.Writer) bool {
+func pruneAgentHomeWorktreeIfSafe(session beads.Bead, cityPath string, cfg *config.City, sp runtime.Provider, stderr io.Writer) bool {
 	if cfg == nil || !cfg.Daemon.AutoPruneWorkerDirEnabled() {
 		return false
+	}
+	if isNamedSessionBead(session) {
+		fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir for %s: named session home is never auto-pruned\n", session.Metadata["session_name"]) //nolint:errcheck
+		return false
+	}
+	if sessionName := strings.TrimSpace(session.Metadata["session_name"]); sessionName != "" {
+		if veto := pruneRuntimeVeto(sp, sessionName); veto != "" {
+			fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir for %s: %s\n", sessionName, veto) //nolint:errcheck
+			return false
+		}
 	}
 	workerDir := strings.TrimSpace(contract.WorkerDirFromMetadata(session.Metadata))
 	if workerDir == "" {
@@ -94,7 +128,7 @@ func pruneAgentHomeWorktreeIfSafe(session beads.Bead, cityPath string, cfg *conf
 	if !gp.IsRepo() {
 		return false
 	}
-	if gp.HasUncommittedWork() {
+	if workerDirHasAuthoredChanges(gp) {
 		fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir %s: has uncommitted changes\n", workerDir) //nolint:errcheck
 		writeWorktreeStaleMarker(gp, workerDir, "uncommitted-work", stderr)
 		return false
@@ -109,16 +143,10 @@ func pruneAgentHomeWorktreeIfSafe(session beads.Bead, cityPath string, cfg *conf
 		writeWorktreeStaleMarker(gp, workerDir, "unpushed-commits", stderr)
 		return false
 	}
-	hasStashes, err := gp.HasStashesResult()
-	if err != nil {
-		fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir %s: stash probe failed: %v\n", workerDir, err) //nolint:errcheck
-		return false
-	}
-	if hasStashes {
-		fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir %s: has stashed work\n", workerDir) //nolint:errcheck
-		writeWorktreeStaleMarker(gp, workerDir, "stashed-work", stderr)
-		return false
-	}
+	// No stash veto (ga-bjenxa; full argument on gitSafetyReason, ga-gsfxag):
+	// `git stash list` is repo-global, so one stash anywhere in the repo blocked
+	// this prune for every worktree of it, and WorktreeRemove below never touches
+	// refs/stash, so stashed work cannot be lost here.
 
 	// Run `git worktree remove` from the rig root rather than from the
 	// worktree being removed: git refuses to remove a worktree whose path
@@ -137,6 +165,26 @@ func pruneAgentHomeWorktreeIfSafe(session beads.Bead, cityPath string, cfg *conf
 	return true
 }
 
+// pruneRuntimeVeto re-probes the session's runtime immediately before a prune
+// and returns why the prune must not proceed, or "" when it may. A live runtime
+// vetoes it (ga-1xiv). So does an observation that could not reach the runtime:
+// under #5544's contract unknown liveness is not confirmed absence, and removing
+// a live session's worktree cannot be undone. A nil provider has nothing to
+// re-probe.
+func pruneRuntimeVeto(sp runtime.Provider, sessionName string) string {
+	if sp == nil {
+		return ""
+	}
+	obs, err := runtime.ObserveLivenessWithError(sp, sessionName, nil)
+	if errors.Is(err, runtime.ErrRuntimeUnavailable) {
+		return fmt.Sprintf("runtime liveness unknown: %v", err)
+	}
+	if obs.Running {
+		return "runtime session is live"
+	}
+	return ""
+}
+
 // pruneAgentHomeWorktreeIfSafeInfo is the session.Info form of
 // pruneAgentHomeWorktreeIfSafe: the worker_dir read routes through
 // session.WorkerDirFromInfo (the canonical→legacy Info fallback equivalent to
@@ -144,9 +192,19 @@ func pruneAgentHomeWorktreeIfSafe(session beads.Bead, cityPath string, cfg *conf
 // lookupRigRootForSessionInfo, and the log line reads Info.SessionNameMetadata —
 // every safety gate and the removal itself are unchanged. Byte-identical to the
 // raw form, which survives for its test callers.
-func pruneAgentHomeWorktreeIfSafeInfo(info sessionpkg.Info, cityPath string, cfg *config.City, stderr io.Writer) {
+func pruneAgentHomeWorktreeIfSafeInfo(info sessionpkg.Info, cityPath string, cfg *config.City, sp runtime.Provider, stderr io.Writer) {
 	if cfg == nil || !cfg.Daemon.AutoPruneWorkerDirEnabled() {
 		return
+	}
+	if sessionpkg.IsNamedSessionInfo(info) {
+		fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir for %s: named session home is never auto-pruned\n", info.SessionNameMetadata) //nolint:errcheck
+		return
+	}
+	if sessionName := strings.TrimSpace(info.SessionNameMetadata); sessionName != "" {
+		if veto := pruneRuntimeVeto(sp, sessionName); veto != "" {
+			fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir for %s: %s\n", sessionName, veto) //nolint:errcheck
+			return
+		}
 	}
 	workerDir := strings.TrimSpace(sessionpkg.WorkerDirFromInfo(info))
 	if workerDir == "" {
@@ -169,7 +227,7 @@ func pruneAgentHomeWorktreeIfSafeInfo(info sessionpkg.Info, cityPath string, cfg
 	if !gp.IsRepo() {
 		return
 	}
-	if gp.HasUncommittedWork() {
+	if workerDirHasAuthoredChanges(gp) {
 		fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir %s: has uncommitted changes\n", workerDir) //nolint:errcheck
 		writeWorktreeStaleMarker(gp, workerDir, "uncommitted-work", stderr)
 		return
@@ -184,16 +242,10 @@ func pruneAgentHomeWorktreeIfSafeInfo(info sessionpkg.Info, cityPath string, cfg
 		writeWorktreeStaleMarker(gp, workerDir, "unpushed-commits", stderr)
 		return
 	}
-	hasStashes, err := gp.HasStashesResult()
-	if err != nil {
-		fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir %s: stash probe failed: %v\n", workerDir, err) //nolint:errcheck
-		return
-	}
-	if hasStashes {
-		fmt.Fprintf(stderr, "session reconciler: not pruning worker_dir %s: has stashed work\n", workerDir) //nolint:errcheck
-		writeWorktreeStaleMarker(gp, workerDir, "stashed-work", stderr)
-		return
-	}
+	// No stash veto (ga-bjenxa; full argument on gitSafetyReason, ga-gsfxag):
+	// `git stash list` is repo-global, so one stash anywhere in the repo blocked
+	// this prune for every worktree of it, and WorktreeRemove below never touches
+	// refs/stash, so stashed work cannot be lost here.
 
 	rigRoot := lookupRigRootForSessionInfo(info, cfg)
 	if rigRoot == "" {

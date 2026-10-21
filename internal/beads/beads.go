@@ -34,6 +34,22 @@ var ErrIDCollision = fmt.Errorf("bd resolved a different bead ID (substring coll
 // it can wrap. See beadstest.RunPinnedIDFenceConformance.
 var ErrPinnedIDOutsideNamespace = errors.New("pinned id outside this store's namespaces")
 
+// ErrVerifyIndeterminate is returned when a lookup could not be completed, so
+// the bead's absence is UNPROVEN. It is deliberately NOT a sub-case of
+// ErrNotFound: errors.Is(err, ErrNotFound) is the "confirmed absent" verdict
+// that the process-table orphan sweep kills live runtimes on and that the
+// cache's dirty overlay suppresses rows on (upstream #6649), and a lookup that
+// merely timed out must never read as that. A caller that has to tell
+// "definitely absent" from "could not look" checks
+// errors.Is(err, ErrVerifyIndeterminate); every other caller sees a failed
+// read, exactly as it would for any other transport error.
+//
+// This distinction is what makes a read-after-write guard safe. Without it, a
+// verification query that merely TIMED OUT under host load is indistinguishable
+// from a write that never landed, and a guard built on that reading would fail
+// healthy sends at exactly the moment load makes timeouts likely (ga-0ejdbv).
+var ErrVerifyIndeterminate = errors.New("bead lookup did not complete, absence unproven")
+
 // ErrMetadataParse is returned when a bead exists but its stored metadata
 // cannot be decoded into the Store object model.
 var ErrMetadataParse = errors.New("bead metadata parse")
@@ -79,6 +95,17 @@ var ErrSQLiteBusyExhausted = errors.New("sqlite busy retries exhausted")
 // producer whose error can reach the dispatcher adds it there as
 // TierAvailability.
 var ErrStoreUnavailable = errors.New("bead store unavailable")
+
+// ErrWriteUnconfirmed marks a write the store reported committed whose
+// read-back did not show it before the store stopped waiting. It is not a
+// failed write: the write may well have landed and become visible a moment
+// later, so the caller must neither report it as failed nor replay it blindly.
+// Re-read the row to learn the outcome. When it wraps the error of a
+// multi-write operation (a staged BdStore Tx), the operation may also be
+// incomplete: the writes after the unconfirmed one did not run. Its producer
+// is BdStore's staged Tx apply, which reads each update back before the next
+// write (waitForUpdateProjection). Check with errors.Is.
+var ErrWriteUnconfirmed = errors.New("bead write committed but its read-back was not confirmed")
 
 // ErrParentProjectionSuperseded reports that a parent update was overtaken by a
 // concurrent reparent before the caller's projection wait could converge.
@@ -214,6 +241,18 @@ type Bead struct {
 	// stamped before closing, the same value BdStore and NativeDoltStore
 	// forward to their close. Reopening clears it.
 	CloseReason string `json:"close_reason,omitempty"`
+
+	// AwaitType is what a GATE bead is waiting on, in bd's vocabulary
+	// (GateAwaitTypes). It exists on the wire for every bead but is
+	// meaningful only when Type is "gate": the notify plane keys on it
+	// (await_type=="human" pages), and beads v1.3.0-rc.2-fleet.20260922.1
+	// DEFAULTS an empty await_type to "human" at the create seam. So every
+	// gc MACHINERY gate creator must set this explicitly AT CREATE — a
+	// create that leaves it empty mints a human-paging gate, and a
+	// create-then-update exposes a window where the on-creation notifier
+	// fires (ga-knhu61, 2026-09-22: 2601 formula-step gates would have begun
+	// paging per step).
+	AwaitType string `json:"await_type,omitempty"`
 	// IndefinitelyDeferred preserves bd's status-based indefinite deferral
 	// after richer statuses normalize to Gas City's three-state model. Cache
 	// notifications restore status="deferred" on the event wire so another
@@ -257,6 +296,37 @@ type Bead struct {
 	ClaimFence int64 `json:"-"`
 }
 
+// Gate await_type vocabulary, mirroring bd update's accepted set
+// (cmd/bd/update.go in the fleet tag): what a gate bead awaits.
+const (
+	// AwaitHuman pages: the notify plane's on-creation and renudge orders
+	// both filter await_type=="human". Machinery never sets it.
+	AwaitHuman = "human"
+	// AwaitTimer marks a timed wait.
+	AwaitTimer = "timer"
+	// AwaitMail marks a wait on a mail delivery.
+	AwaitMail = "mail"
+	// AwaitBead marks a wait on other beads (deps/routing/children) — the
+	// default for gc machinery gates, which wait on graph state, not people.
+	AwaitBead = "bead"
+	// AwaitGHRun / AwaitGHPR mark waits on GitHub state.
+	AwaitGHRun = "gh:run"
+	AwaitGHPR  = "gh:pr"
+)
+
+// IsGateAwaitType reports whether s is in bd's await_type vocabulary. Callers
+// mapping a foreign vocabulary (e.g. a formula gate's own type) onto
+// await_type must check membership and fall back to AwaitBead — passing an
+// out-of-vocabulary value through would fail bd-side validation or, worse,
+// be preserved as an unclassifiable string no notifier arm owns.
+func IsGateAwaitType(s string) bool {
+	switch s {
+	case AwaitHuman, AwaitTimer, AwaitMail, AwaitBead, AwaitGHRun, AwaitGHPR:
+		return true
+	}
+	return false
+}
+
 // UpdateOpts specifies which fields to change. Nil pointers are skipped.
 type UpdateOpts struct {
 	Title        *string // set title (nil = no change)
@@ -269,6 +339,42 @@ type UpdateOpts struct {
 	Labels       []string // append these labels (nil = no change)
 	RemoveLabels []string // remove these labels (nil = no change)
 	Metadata     map[string]string
+	// UnsetMetadata removes these metadata keys. It is bd's
+	// `update --unset-metadata` and has bd's semantics: it is applied AFTER
+	// every Metadata set (so a key named in both ends up absent), and removing
+	// a key the bead does not carry is a no-op rather than an error.
+	//
+	// It is served by the unconditional Update of MemStore (and FileStore),
+	// SQLiteStore (and its Tx), BdStore (and the ProxiedStore and
+	// DoltliteReadStore that delegate to it), and a CachingStore over any of
+	// them. Every revision-guarded path refuses it
+	// (validateConditionalUpdateOpts). A write path that cannot remove a key
+	// (NativeDoltStore, the BdStore Tx, the exec protocol) refuses it with
+	// ErrUnsetMetadataUnsupported rather than silently keeping the key.
+	UnsetMetadata []string
+}
+
+// ErrUnsetMetadataUnsupported reports an UpdateOpts.UnsetMetadata write on a
+// path that cannot remove a metadata key. It is a refusal, never a partial
+// write: the whole update is rejected before anything is applied.
+var ErrUnsetMetadataUnsupported = errors.New("unsetting metadata keys is not supported on this write path")
+
+// refuseUnsetMetadata is the fail-closed guard for write paths that do not
+// implement UpdateOpts.UnsetMetadata. A path that ignored the field would
+// report success while the key stayed set.
+func refuseUnsetMetadata(path string, opts UpdateOpts) error {
+	if len(opts.UnsetMetadata) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", path, ErrUnsetMetadataUnsupported)
+}
+
+// unsetMetadataKeys deletes opts.UnsetMetadata from metadata in place. It runs
+// after the Metadata sets, matching bd's set-then-unset order.
+func unsetMetadataKeys(metadata map[string]string, keys []string) {
+	for _, key := range keys {
+		delete(metadata, key)
+	}
 }
 
 // ConditionalAssignmentReleaser is implemented by stores that can release an
@@ -461,13 +567,31 @@ type AtomicConditionalCloserHandleProvider interface {
 // store implements it. Unlike ConditionalWriterFor, this is not a rollout
 // policy seam: callers must refuse when the underlying store cannot provide
 // this all-or-nothing operation.
+//
+// Resolution asks EVERY wrapper on the ConditionalWritesResolveTarget chain
+// for an AtomicConditionalCloserHandle before following its target, so a
+// wrapper that owns work around the terminal write (the cmd/gc policy store's
+// liveness fence-and-sweep, the cache's eviction) can front the close while
+// still resolving the capability from its backing. A wrapper without a handle
+// is followed through, as before; a handle that answers false ends the
+// search, since the wrapper has already asked its own backing.
 func AtomicConditionalCloserFor(store Store) (AtomicConditionalCloser, bool) {
 	if store == nil {
 		return nil, false
 	}
-	store = followConditionalWritesResolveTarget(store)
-	if provider, ok := store.(AtomicConditionalCloserHandleProvider); ok {
-		return provider.AtomicConditionalCloserHandle()
+	for range conditionalWritesMaxResolveDepth {
+		if provider, ok := store.(AtomicConditionalCloserHandleProvider); ok {
+			return provider.AtomicConditionalCloserHandle()
+		}
+		targeter, ok := store.(ConditionalWritesResolveTargeter)
+		if !ok {
+			break
+		}
+		target := targeter.ConditionalWritesResolveTarget()
+		if target == nil || target == store {
+			break
+		}
+		store = target
 	}
 	closer, ok := store.(AtomicConditionalCloser)
 	return closer, ok
@@ -515,6 +639,8 @@ func validateConditionalUpdateOpts(o UpdateOpts, labelsGuarded bool) error {
 	switch {
 	case o.ParentID != nil:
 		return &ConditionalUpdateFieldUnsupportedError{Field: "parent_id"}
+	case len(o.UnsetMetadata) > 0:
+		return &ConditionalUpdateFieldUnsupportedError{Field: "unset_metadata"}
 	case !labelsGuarded && len(o.Labels) > 0:
 		return &ConditionalUpdateFieldUnsupportedError{Field: "labels"}
 	case !labelsGuarded && len(o.RemoveLabels) > 0:

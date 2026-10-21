@@ -76,7 +76,10 @@ func TestNudgeNowSendsNoEnterWhenTheLookBeforeItCannotReadThePane(t *testing.T) 
 	pane := promptGuardPane(t)
 	pane.promptAfterPaste = true
 	pane.captureErr = errors.New("capture-pane: timed out")
-	pane.captureErrAfterPaste = 2 // capture 1 is submitEnterAndConfirm's busy baseline
+	// Capture 4 after the paste is the look before Enter. Before it: the
+	// carry's placeholder-provenance read (1, ga-da5vmz), submitEnterAndConfirm's
+	// busy baseline (2) and the carry's re-send gate's first read (3, ga-ubfc7j).
+	pane.captureErrAfterPaste = 4
 
 	err := nudgeNowText(t, pane, "run the tests")
 	if !errors.Is(err, pane.captureErr) {
@@ -175,12 +178,16 @@ func TestNudgeSessionReportsARefusedReSendUnconfirmed(t *testing.T) {
 		}
 		return nil
 	}
-	// The text never reaches the input box, so Enter submits nothing, the pane
-	// never turns busy, and the submit is re-sent.
-	dropText := func(context.Context, string, string, time.Duration) error { return nil }
+	// The text reaches the input box and the first Enter is dropped, so the
+	// draft stays, the pane never turns busy, and the submit is re-sent.
+	pane.swallowEnter = true // ga-ubfc7j re-sends only while our text is still drafted.
+	typeText := func(_ context.Context, target, text string, _ time.Duration) error {
+		_, err := tm.run("send-keys", "-t", paneTarget(target), "-l", text)
+		return err
+	}
 
-	err := tm.nudgeSession(context.Background(), pane.sessionName, "run the tests", dropText,
-		func(string) bool { return false }, func(string) []string { return []string{"Enter"} }, look)
+	err := tm.nudgeSession(context.Background(), pane.sessionName, "run the tests", typeText,
+		func(string) bool { return false }, func(string) []string { return []string{"Enter"} }, look, false)
 	if !errors.Is(err, ErrNudgeSubmitUnconfirmed) || !errors.Is(err, runtime.ErrNudgeDeliveryUnconfirmed) {
 		t.Fatalf("nudgeSession = %v, want ErrNudgeSubmitUnconfirmed, a runtime.ErrNudgeDeliveryUnconfirmed", err)
 	}

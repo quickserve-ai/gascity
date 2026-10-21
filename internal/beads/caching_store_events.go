@@ -643,6 +643,9 @@ func mergeCacheEventPatch(base, patch Bead, fields map[string]json.RawMessage) B
 	if merged.Status != "closed" {
 		merged.CloseReason = ""
 	}
+	if hasCacheEventField(fields, "await_type") {
+		merged.AwaitType = patch.AwaitType
+	}
 	return merged
 }
 
@@ -694,6 +697,9 @@ func cacheEventConflictsCurrent(current, patch Bead, fields map[string]json.RawM
 		return true
 	}
 	if hasCacheEventField(fields, "close_reason") && current.CloseReason != patch.CloseReason {
+		return true
+	}
+	if hasCacheEventField(fields, "await_type") && current.AwaitType != patch.AwaitType {
 		return true
 	}
 	return false
@@ -1074,9 +1080,14 @@ func decodeCacheEvent(payload json.RawMessage) (Bead, map[string]json.RawMessage
 // make stale (mc-zndi7.43, .56). Treat an inferred notification as a hint and
 // re-read the store before acting on it durably.
 //
-// ApplyEvent and the list/Get refetch installs notify nothing, so they have no
-// source (mc-zndi7.55), except for a close they install over a cached open row:
-// that close is queued and announced as ChangeRefresh (gastownhall/gascity#6860).
+// ApplyEvent installs notify nothing, so they have no source (mc-zndi7.55),
+// except for a close they install over a cached open row: that close is queued
+// and announced as ChangeRefresh (gastownhall/gascity#6860). The list/Get
+// refetch installs announce the same queued close, and also a change to a held
+// open row's status, assignee or metadata, as a ChangeRefresh bead.updated
+// (caching_store_read_announce.go): such a read is often the first to see
+// another process's claim, and the reconcile that follows finds nothing left
+// to announce.
 type ChangeSource uint8
 
 const (
@@ -1089,8 +1100,9 @@ const (
 	ChangeScan
 	// ChangeRefresh is a point read: RefreshRow, Update's refetch that found
 	// the row gone after the write (its bead.closed is the read's inference,
-	// not a close this process made), and a close a list, dirty-row read or
-	// event patch installed over a cached open row.
+	// not a close this process made), a close a list, dirty-row read or
+	// event patch installed over a cached open row, and an update a list,
+	// dirty-row read or dirty overlay installed over a held open row.
 	ChangeRefresh
 )
 
@@ -1112,11 +1124,11 @@ func (s ChangeSource) String() string {
 	}
 }
 
-// notifyChange announces one change. Any close a read or an event patch
-// installed without announcing goes out first, so a close is never reported
-// after a later change to the same bead.
+// notifyChange announces one change. Any update or close a read or an event
+// patch installed without announcing goes out first, so neither is ever
+// reported after a later change to the same bead.
 func (c *CachingStore) notifyChange(source ChangeSource, eventType string, b Bead) {
-	c.announceUnannouncedCloses()
+	c.announceReadInstalls()
 	c.emitChange(source, eventType, b)
 }
 
@@ -1212,7 +1224,8 @@ func beadChanged(old, fresh Bead, skipLabels bool) bool {
 		old.IndefinitelyDeferred != fresh.IndefinitelyDeferred ||
 		!timePtrEqual(old.DeferUntil, fresh.DeferUntil) ||
 		!boolPtrEqual(old.IsBlocked, fresh.IsBlocked) ||
-		old.CloseReason != fresh.CloseReason {
+		old.CloseReason != fresh.CloseReason ||
+		old.AwaitType != fresh.AwaitType {
 		return true
 	}
 	if !maps.Equal(old.Metadata, fresh.Metadata) {

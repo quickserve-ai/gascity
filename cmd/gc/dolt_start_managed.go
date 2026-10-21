@@ -31,7 +31,15 @@ type managedDoltStartReport struct {
 }
 
 type managedDoltStartedProcess struct {
-	CityPath    string
+	CityPath string
+	// ConfigFile is the server's --config path, which is also the anchor for
+	// its stop-intent marker (ga-drkbcd, dolt_stop_intent.go). Startup-failure
+	// cleanup is one of gc's own stop paths, so it has to record an intent like
+	// any other stopper; carrying the config path on the started process is
+	// what lets terminateManagedDoltStartedProcess do that without re-resolving
+	// a layout. Empty when the caller did not record one — the marker write is
+	// then skipped, exactly as it is for a zero PID.
+	ConfigFile  string
 	PID         int
 	WatchdogPID int
 	DisarmFile  string
@@ -184,7 +192,7 @@ func startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel str
 	// lock is still held after the configured window, fail closed: refusing
 	// to start is recoverable, a corrupted noms journal is not.
 	if err := waitForManagedDoltDataDirLockFree(layout.DataDir, managedDoltLockReleaseTimeoutFn(cityPath)); err != nil {
-		return report, fmt.Errorf("refusing to start dolt sql-server for %s: %w", layout.DataDir, err)
+		return report, managedDoltStartRefusedError{fmt.Errorf("refusing to start dolt sql-server for %s: %w", layout.DataDir, err)}
 	}
 
 	currentPort := portNum
@@ -209,6 +217,15 @@ func startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel str
 		if err := writeManagedDoltConfigFile(layout.ConfigFile, host, strconv.Itoa(currentPort), layout.DataDir, logLevel, doltConfig); err != nil {
 			return report, err
 		}
+		// ga-drkbcd: a stop-intent marker vouches for a status-0 exit of the PID
+		// it names. Clearing it here — before any server exists — is what makes
+		// the vouch safe: every surviving marker was written after this spawn,
+		// so it can only ever refer to the server generation about to start,
+		// and a marker abandoned by a crashed stopper can never silence the
+		// next server's unexpected exit.
+		if err := clearManagedDoltStopIntent(layout.ConfigFile); err != nil {
+			managedDoltCleanupLogf("clearing stale stop intent before spawn: %v", err)
+		}
 
 		logOffset, err := managedDoltLogSize(layout.LogFile)
 		if err != nil {
@@ -226,6 +243,11 @@ func startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel str
 			return report, err
 		}
 		_ = logFile.Close()
+		// ga-drkbcd: stamped here rather than inside each spawn helper so every
+		// startup-failure teardown below — including the readiness timeout,
+		// which is a routine event on a loaded box — can record a stop intent
+		// and be recognized by the watchdog as a stop gc asked for.
+		started.ConfigFile = layout.ConfigFile
 
 		report.PID = started.PID
 		report.Port = currentPort
@@ -766,6 +788,19 @@ var managedDoltCleanupLogf = func(format string, args ...any) {
 
 func terminateManagedDoltStartedProcess(started managedDoltStartedProcess) {
 	unregisterManagedDoltStartedProcess(started)
+	// ga-drkbcd: this teardown is one of gc's OWN stop paths. It SIGTERMs a
+	// server that answers by exiting status 0, which is the exact branch the
+	// scope watchdog now alarms on — and it runs on every startup failure,
+	// including the readiness timeout that a loaded box produces routinely.
+	// Without a marker each of those would escalate a CRITICAL "the data plane
+	// stopped and nobody asked" into the emergency spool for a stop we asked
+	// for ourselves. The marker names the dolt PID; the watchdog PID signaled
+	// below is covered by the same record, because the watchdog's signal path
+	// consults it too. Advisory, like every other marker write: a failure costs
+	// a false alarm, never the teardown.
+	if err := recordManagedDoltStopIntent(started.ConfigFile, started.PID, "gc managed dolt startup-failure cleanup"); err != nil {
+		managedDoltCleanupLogf("recording startup-failure stop intent for pid %d: %v", started.PID, err)
+	}
 	// The reap goroutine in startManagedDoltSQLServer (and the scope watchdog)
 	// Wait()s a failed child and frees its PID, so an unrelated process can reuse
 	// it before — or during — this same-attempt cleanup; signaling by bare PID
@@ -1318,7 +1353,8 @@ func withoutSessionIdentityEnv(env []string) []string {
 // doltServerEnv returns the environment applied to every managed dolt
 // sql-server we launch, and to the scope watchdog that supervises it.
 func doltServerEnv(cityPath string, parent []string) []string {
-	env := withoutSessionIdentityEnv(removeEnvKey(parent, "DOLT_DISABLE_EVENT_FLUSH"))
+	env := doltServerRemoteCredentialEnv(cityPath, parent)
+	env = withoutSessionIdentityEnv(removeEnvKey(env, "DOLT_DISABLE_EVENT_FLUSH"))
 	if managedDoltDisableEventFlush(cityPath) {
 		// Disable Dolt usage telemetry for managed servers by default. The
 		// `dolt send-metrics` event-flush reporter spawns transient
@@ -1330,6 +1366,91 @@ func doltServerEnv(cityPath string, parent []string) []string {
 		env = append(env, "DOLT_DISABLE_EVENT_FLUSH=true")
 	}
 	return env
+}
+
+// doltRemotePasswordEnvKey is the variable Dolt reads when a remote call passes
+// --user. It is the ONLY supported way to supply the secret: it must never
+// appear in argv, which is world-readable via ps.
+const doltRemotePasswordEnvKey = "DOLT_REMOTE_PASSWORD"
+
+// doltServerRemoteCredentialEnv injects DOLT_REMOTE_PASSWORD from the city's
+// authoritative source, replacing whatever the calling process happened to
+// carry.
+//
+// WHY THIS EXISTS (ga-10irxc). The credential used to reach dolt only by
+// INHERITANCE: doltServerEnv passed os.Environ() straight through, and
+// dolt_scope_watchdog.go spawns the watchdog with the environment of whichever
+// process ran the gc command that brought dolt up, then respawns dolt from that
+// frozen environment for the watchdog's entire life. Every agent shell in the
+// city has zero copies of the password, so any agent whose gc command happened
+// to start dolt permanently pinned an UNCREDENTIALED server, and a deliberate
+// credentialed restart bought exactly one watchdog generation. Measured twice on
+// 2026-08-21/22: watchdog 29921 then 6002, both count 0, while the supervisor
+// and the loaded launchd job both carried the value.
+//
+// Sourcing it here makes the outcome independent of lineage, which is the only
+// property that makes it stay fixed.
+//
+// When no file is configured this returns parent UNCHANGED, so a city that has
+// not opted in behaves byte-identically to before.
+func doltServerRemoteCredentialEnv(cityPath string, parent []string) []string {
+	secret, reason, ok := resolveDoltRemotePassword(cityPath)
+	if !ok {
+		if reason != "" {
+			// Fail VISIBLE, not closed: a misconfigured credential must not
+			// prevent dolt from starting (that would trade a sync outage for a
+			// data-plane outage), but it must not be silent either.
+			fmt.Fprintf(os.Stderr, "gc: managed dolt: %s\n", reason)
+		}
+		return parent
+	}
+	return append(removeEnvKey(parent, doltRemotePasswordEnvKey), doltRemotePasswordEnvKey+"="+secret)
+}
+
+// resolveDoltRemotePassword reads the remote password from the file named by
+// dolt.remote-password-file in .beads/config.yaml.
+//
+// The config holds a PATH, never the secret, so config.yaml stays safe to
+// commit. Returns ok=false with an empty reason when the city simply has not
+// configured one (the common case, and not a problem). Returns ok=false with a
+// human reason when a file IS configured but cannot be used — that is a
+// misconfiguration worth printing. No return value ever contains the secret.
+func resolveDoltRemotePassword(cityPath string) (secret string, reason string, ok bool) {
+	if strings.TrimSpace(cityPath) == "" {
+		return "", "", false
+	}
+	cfg, _, err := contract.ReadDoltConfig(fsys.OSFS{}, filepath.Join(cityPath, ".beads", "config.yaml"))
+	if err != nil {
+		return "", "", false
+	}
+	path := strings.TrimSpace(cfg.RemotePasswordFile)
+	if path == "" {
+		return "", "", false
+	}
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(cityPath, path)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Sprintf("dolt.remote-password-file %q is unreadable (%v); authenticated remote operations will fail", path, err), false
+	}
+	if info.IsDir() {
+		return "", fmt.Sprintf("dolt.remote-password-file %q is a directory, not a file", path), false
+	}
+	if mode := info.Mode().Perm(); mode&0o077 != 0 {
+		return "", fmt.Sprintf("dolt.remote-password-file %q is mode %#o; refusing to load a credential that group or others can read (chmod 600 it)", path, mode), false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Sprintf("dolt.remote-password-file %q could not be read (%v)", path, err), false
+	}
+	// Trim only the trailing newline an editor adds. Spaces and tabs are legal
+	// password characters and must survive.
+	secret = strings.TrimRight(string(data), "\r\n")
+	if secret == "" {
+		return "", fmt.Sprintf("dolt.remote-password-file %q is empty", path), false
+	}
+	return secret, "", true
 }
 
 func managedDoltDisableEventFlush(cityPath string) bool {

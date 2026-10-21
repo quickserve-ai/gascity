@@ -65,6 +65,10 @@ type ReadyBead struct {
 	// needs nothing: the store's own Ready already applied readiness, so a row it
 	// returned is by construction unblocked.
 	BlockedBy []ReadyBeadBlocker `json:"blocked_by,omitempty"`
+	// AwaitType follows beads.Bead onto the wire so the field set stays the
+	// HTTP Bead shape: what a gate bead waits on, in bd's vocabulary. Absent
+	// on rows that are not gates.
+	AwaitType string `json:"await_type,omitempty"`
 }
 
 // ReadyBeadDep is the wire shape of one dependency edge, for the same reason
@@ -124,6 +128,7 @@ func ToReadyBead(b beads.Bead) ReadyBead {
 		DeferUntil:   b.DeferUntil,
 		IsBlocked:    b.IsBlocked,
 		CloseReason:  b.CloseReason,
+		AwaitType:    b.AwaitType,
 	}
 }
 

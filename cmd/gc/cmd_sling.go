@@ -124,8 +124,10 @@ Examples:
 			if owned && noConvoy {
 				return argError("gc sling: --owned requires a convoy (cannot use with --no-convoy)")
 			}
-			if merge != "" && !beadmeta.IsKnownMergeStrategy(merge) {
-				return argError("gc sling: --merge must be direct, mr, or local")
+			// "pr" is accepted as a synonym for "mr": the refinery formula
+			// already treats the two alike (ga-frf3, carry).
+			if merge != "" && merge != "pr" && !beadmeta.IsKnownMergeStrategy(merge) {
+				return argError("gc sling: --merge must be direct, pr, mr, or local")
 			}
 			if (strings.TrimSpace(scopeKind) == "") != (strings.TrimSpace(scopeRef) == "") {
 				return argError("gc sling: --scope-kind and --scope-ref must be provided together")
@@ -147,7 +149,7 @@ Examples:
 	cmd.Flags().BoolVar(&force, "force", false, "suppress warnings, allow cross-rig routing, allow formulas v2 workflow replacement, and for direct bead routes dispatch even if the bead does not resolve in the local store")
 	cmd.Flags().StringVarP(&title, "title", "t", "", "wisp root bead title (with --formula or --on)")
 	cmd.Flags().StringArrayVar(&vars, "var", nil, "variable substitution for formula (key=value, repeatable)")
-	cmd.Flags().StringVar(&merge, "merge", "", "merge strategy: direct, mr, or local")
+	cmd.Flags().StringVar(&merge, "merge", "", "merge strategy: direct, pr, mr, or local")
 	cmd.Flags().BoolVar(&noConvoy, "no-convoy", false, "skip auto-convoy creation")
 	cmd.Flags().BoolVar(&owned, "owned", false, "mark auto-convoy as owned (skip auto-close)")
 	cmd.Flags().BoolVar(&reassign, "reassign", false, "clear any existing human assignee before routing (for human→pool handoff)")
@@ -433,13 +435,38 @@ func cmdSlingWithJSON(args []string, isFormula, doNudge, force bool, title strin
 	// rig-scoped implicit agents (e.g., "hello-world/claude").
 	resolveRigPaths(cityPath, cfg.Rigs)
 
-	a, ok := resolveAgentIdentity(cfg, target, currentRigContext(cfg))
-	if !ok {
-		if jsonOutput {
-			return writeJSONError(stdout, stderr, "target_resolve_failed", agentNotFoundMsg("gc sling", target, cfg), 1)
+	routeTarget := ""
+	var a config.Agent
+	if spec, named, resolveErr := resolveNamedSessionSpecForConfigTarget(cfg, cityName, target, currentRigContext(cfg)); resolveErr != nil {
+		return fail("target_resolve_failed", fmt.Sprintf("gc sling: %v", resolveErr))
+	} else if named {
+		a = *spec.Agent
+		routeTarget = spec.Identity
+	} else {
+		var ok bool
+		a, ok = resolveAgentIdentity(cfg, target, currentRigContext(cfg))
+		if !ok {
+			if jsonOutput {
+				return writeJSONError(stdout, stderr, "target_resolve_failed", agentNotFoundMsg("gc sling", target, cfg), 1)
+			}
+			fmt.Fprintln(stderr, agentNotFoundMsg("gc sling", target, cfg)) //nolint:errcheck // best-effort stderr
+			return 1
 		}
-		fmt.Fprintln(stderr, agentNotFoundMsg("gc sling", target, cfg)) //nolint:errcheck // best-effort stderr
-		return 1
+		routeTarget = a.QualifiedName()
+		if !a.SupportsMultipleSessions() && !isCustomSlingQuery(a) {
+			specs := findNamedSessionSpecsByBackingTemplate(cfg, cityName, a.QualifiedName())
+			switch len(specs) {
+			case 0:
+			case 1:
+				routeTarget = specs[0].Identity
+			default:
+				identities := make([]string, len(specs))
+				for i, spec := range specs {
+					identities[i] = spec.Identity
+				}
+				return fail("target_resolve_failed", fmt.Sprintf("gc sling: template %q backs multiple configured named sessions (%s) — target one named identity", a.QualifiedName(), strings.Join(identities, ", ")))
+			}
+		}
 	}
 
 	sp, err := newSessionProvider()
@@ -464,23 +491,24 @@ func cmdSlingWithJSON(args []string, isFormula, doNudge, force bool, title strin
 	}
 
 	opts := slingOpts{
-		Target:        a,
-		BeadOrFormula: beadOrFormula,
-		IsFormula:     isFormula,
-		OnFormula:     onFormula,
-		NoFormula:     noFormula,
-		Title:         title,
-		Vars:          vars,
-		Merge:         merge,
-		NoConvoy:      noConvoy,
-		Owned:         owned,
-		Reassign:      reassign,
-		Nudge:         doNudge,
-		Force:         force,
-		DryRun:        dryRun,
-		InlineText:    inlineText,
-		ScopeKind:     scopeKind,
-		ScopeRef:      scopeRef,
+		Target:         a,
+		TargetIdentity: routeTarget,
+		BeadOrFormula:  beadOrFormula,
+		IsFormula:      isFormula,
+		OnFormula:      onFormula,
+		NoFormula:      noFormula,
+		Title:          title,
+		Vars:           vars,
+		Merge:          merge,
+		NoConvoy:       noConvoy,
+		Owned:          owned,
+		Reassign:       reassign,
+		Nudge:          doNudge,
+		Force:          force,
+		DryRun:         dryRun,
+		InlineText:     inlineText,
+		ScopeKind:      scopeKind,
+		ScopeRef:       scopeRef,
 	}
 	runner := SlingRunner(shellSlingRunner)
 	if len(storeEnv) > 0 {
@@ -710,7 +738,9 @@ func cliDirectSessionResolver(store beads.Store, cityName, cityPath string, cfg 
 	if !ok {
 		return "", false, nil
 	}
-	id, err := resolveSessionIDMaterializingNamed(cityPath, cfg, store, spec.Identity)
+	// Rooted, so a city seat is not re-resolved as ambiguous from a rig cwd
+	// (ga-elylrw).
+	id, err := resolveSessionIDMaterializingNamed(cityPath, cfg, store, session.RootedNamedSessionIdentity(spec.Identity))
 	if err != nil {
 		return "", false, err
 	}
@@ -766,6 +796,25 @@ func (r cliBeadRouter) Route(_ context.Context, req sling.RouteRequest) error {
 	store := req.Store
 	if store == nil {
 		store = r.deps.Store
+	}
+	if r.deps.Cfg != nil {
+		cityName := r.deps.CityName
+		if cityName == "" {
+			cityName = config.EffectiveCityName(r.deps.Cfg, filepath.Base(r.deps.CityPath))
+		}
+		if spec, ok := findNamedSessionSpec(r.deps.Cfg, cityName, req.Target); ok {
+			if store == nil {
+				return fmt.Errorf("direct named-session routing requires a store")
+			}
+			identity := spec.Identity
+			if err := store.Update(req.BeadID, beads.UpdateOpts{
+				Assignee: &identity,
+				Metadata: map[string]string{beadmeta.RoutedToMetadataKey: ""},
+			}); err != nil {
+				return fmt.Errorf("assigning %s to configured named session %s: %w", req.BeadID, identity, err)
+			}
+			return nil
+		}
 	}
 	if store == nil {
 		return fmt.Errorf("built-in sling routing requires a store")

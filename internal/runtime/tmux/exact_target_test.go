@@ -314,10 +314,13 @@ func TestInputOpsTargetExactPane(t *testing.T) {
 			[]string{"send-keys"},
 		},
 		{
-			"dismissMidSessionDialogBeforeNudge",
-			scriptedTargetExecutor{captures: []string{resumeDialogPane}},
-			func(tm *Tmux) { tm.dismissMidSessionDialogBeforeNudge(context.Background(), "worker-1") },
-			[]string{"capture-pane", "send-keys"},
+			"dismissMidSessionDialogs",
+			// The carry's dismissal re-reads the screen and confirms a zero
+			// client count before each key (ga-ubfc7j), read through the
+			// attach probe's combined "<session>|<count>" answer.
+			scriptedTargetExecutor{captures: []string{resumeDialogPane, resumeDialogPane}, display: "worker-1|0"},
+			func(tm *Tmux) { _, _ = tm.dismissMidSessionDialogs(context.Background(), "worker-1") },
+			[]string{"capture-pane", "display-message", "send-keys"},
 		},
 		{
 			"DismissModelSwitchModalIfPresent",

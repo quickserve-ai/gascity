@@ -3,6 +3,7 @@ package session
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -160,6 +161,65 @@ func TestStoreResolveMailboxAddressSeparatesLivenessPasses(t *testing.T) {
 	}
 	if got, err := directory.ResolveMailboxAddress("retired-one", true); err != nil || got.ID != retired.ID {
 		t.Fatalf("ResolveMailboxAddress(retired, closed pass) = (%q, %v), want %q", got.ID, err, retired.ID)
+	}
+}
+
+// TestStoreListClosedByNamedIdentityReturnsOnlyThatSeatsClosedSessions pins
+// the seat-history probe mail uses to reach a named seat's earlier sessions:
+// the closed rows of exactly that configured_named_identity, never the live
+// incarnation, another seat's history, or a pool session that reused the alias.
+func TestStoreListClosedByNamedIdentityReturnsOnlyThatSeatsClosedSessions(t *testing.T) {
+	store := beads.NewMemStore()
+	seat := map[string]string{
+		"alias":                      "rig/seat",
+		"session_name":               "rig--seat",
+		NamedSessionIdentityMetadata: "rig/seat",
+	}
+	closeSession := func(b beads.Bead) {
+		t.Helper()
+		if err := store.Close(b.ID); err != nil {
+			t.Fatalf("Close session: %v", err)
+		}
+	}
+	first := mustCreateAddressed(t, store, seat)
+	closeSession(first)
+	second := mustCreateAddressed(t, store, seat)
+	closeSession(second)
+	mustCreateAddressed(t, store, seat)
+	closeSession(mustCreateAddressed(t, store, map[string]string{
+		"alias":                      "rig/other",
+		NamedSessionIdentityMetadata: "rig/other",
+	}))
+	closeSession(mustCreateAddressed(t, store, map[string]string{
+		"alias":        "rig/seat",
+		"pool_managed": "true",
+	}))
+
+	for name, directory := range map[string]*Store{
+		"exact metadata filter": NewStore(beads.SessionStore{Store: store}),
+		"loose metadata filter": NewStore(beads.SessionStore{Store: looseMetadataStore{Store: store}}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := directory.ListClosedByNamedIdentity("rig/seat")
+			if err != nil {
+				t.Fatalf("ListClosedByNamedIdentity: %v", err)
+			}
+			ids := make([]string, 0, len(got))
+			for _, info := range got {
+				ids = append(ids, info.ID)
+			}
+			slices.Sort(ids)
+			want := []string{first.ID, second.ID}
+			slices.Sort(want)
+			if !slices.Equal(ids, want) {
+				t.Fatalf("ListClosedByNamedIdentity(rig/seat) = %v, want the seat's closed sessions %v", ids, want)
+			}
+
+			blank, err := directory.ListClosedByNamedIdentity("  ")
+			if err != nil || len(blank) != 0 {
+				t.Fatalf("ListClosedByNamedIdentity(blank) = (%v, %v), want no sessions", blank, err)
+			}
+		})
 	}
 }
 
@@ -344,6 +404,78 @@ func (s *failingAddressListStore) Get(string) (beads.Bead, error) {
 
 func (s *failingAddressListStore) List(beads.ListQuery) ([]beads.Bead, error) {
 	return nil, fmt.Errorf("%w: metadata filter exposed %s", errAddressDirectoryBackend, s.sensitive)
+}
+
+// TestClosedSessionProbesCarryTheSessionLabel pins the cost bound on the probe
+// every inbox read makes (pl-d9lw item 1): a closed-only lookup names the
+// session label in its query, so a backend's ephemeral leg, which cannot push a
+// metadata filter down, returns closed sessions rather than every closed
+// ephemeral row in the store. The label, not the type, because a seat's
+// crash-damaged predecessor (empty type, label intact) must still be found, or
+// replies addressed to it never reach its successor. The live pass is left as
+// it was.
+func TestClosedSessionProbesCarryTheSessionLabel(t *testing.T) {
+	store := &listCountingStore{MemStore: beads.NewMemStore()}
+	seat := map[string]string{
+		"alias":                      "rig/seat",
+		"session_name":               "rig--seat",
+		NamedSessionIdentityMetadata: "rig/seat",
+	}
+	closed := mustCreateAddressed(t, store, seat)
+	if err := store.Close(closed.ID); err != nil {
+		t.Fatalf("Close session: %v", err)
+	}
+	// A closed non-session row that carries the same metadata: what the wide
+	// leg used to hand back by the thousand.
+	stray, err := store.Create(beads.Bead{Type: "message", Metadata: seat})
+	if err != nil {
+		t.Fatalf("Create message: %v", err)
+	}
+	if err := store.Close(stray.ID); err != nil {
+		t.Fatalf("Close message: %v", err)
+	}
+	// A closed predecessor a crash left with an empty type: still the seat's.
+	damaged := mustCreateAddressed(t, store, seat)
+	emptyType := ""
+	if err := store.Update(damaged.ID, beads.UpdateOpts{Type: &emptyType}); err != nil {
+		t.Fatalf("clear type: %v", err)
+	}
+	if err := store.Close(damaged.ID); err != nil {
+		t.Fatalf("Close damaged session: %v", err)
+	}
+	directory := NewStore(beads.SessionStore{Store: store})
+
+	store.queries = nil
+	got, err := directory.ListClosedByNamedIdentity("rig/seat")
+	if err != nil {
+		t.Fatalf("ListClosedByNamedIdentity: %v", err)
+	}
+	ids := make([]string, 0, len(got))
+	for _, info := range got {
+		ids = append(ids, info.ID)
+	}
+	slices.Sort(ids)
+	want := []string{closed.ID, damaged.ID}
+	slices.Sort(want)
+	if !slices.Equal(ids, want) {
+		t.Fatalf("ListClosedByNamedIdentity(rig/seat) = %v, want the closed session and its damaged twin %v", ids, want)
+	}
+	if len(store.queries) == 0 {
+		t.Fatal("ListClosedByNamedIdentity issued no List query")
+	}
+	for _, q := range store.queries {
+		if q.Status != "closed" || q.Label != LabelSession || q.Type != "" {
+			t.Fatalf("closed probe query = status %q label %q type %q, want status closed, label %q and no type", q.Status, q.Label, q.Type, LabelSession)
+		}
+	}
+
+	store.queries = nil
+	if _, err := mailboxMatchesByMetadata(store, "alias", "rig/seat", ""); err != nil {
+		t.Fatalf("live probe: %v", err)
+	}
+	if len(store.queries) != 1 || store.queries[0].Type != "" || store.queries[0].Label != "" {
+		t.Fatalf("live probe queries = %+v, want one query with no type and no label", store.queries)
+	}
 }
 
 // looseMetadataStore answers every metadata filter with every session it holds,

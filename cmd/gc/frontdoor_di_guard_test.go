@@ -370,6 +370,7 @@ func TestMetadataInfoOnlyFilesStayOnInfoSnapshot(t *testing.T) {
 // resolvers — they go through mail.Provider. The two out-of-file callers
 // (cmd_handoff.go, prime_auto_handoff_inject.go) already hold a routed sessStore.
 var sessionRelocationRoutedFiles = []string{
+	"cmd_session_bind_cloud.go",
 	"cmd_session_wake.go",
 	"cmd_session_pin.go",
 	"cmd_skill.go",
@@ -419,6 +420,10 @@ var sessionRelocationRoutedFiles = []string{
 	// it would find no open lane op under a relocated sessions class, and the
 	// hook would deliver no notice while the controller is down.
 	"conversation_lane_hook.go",
+	// doctor_orphan_managed_sessions.go (ga-n2f1ph) is deliberately NOT listed:
+	// it builds no session front door. It reads the reconciler's census
+	// (collectAllOpenSessionAvailabilityInfos), whose plan already carries the
+	// sessions binding as a leg.
 }
 
 // sessionRelocationForbidden are the UNROUTED session-front-door constructions a

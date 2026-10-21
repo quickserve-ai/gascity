@@ -2,6 +2,7 @@ package molecule
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -81,6 +82,17 @@ func instantiateViaGraphApply(ctx context.Context, applier beads.GraphApplyStore
 
 func isTransientGraphApplyError(err error) bool {
 	if err == nil {
+		return false
+	}
+	// Policy, not prediction: once an apply has spent the budget it derived
+	// for its own plan, this package does not replay it automatically. The
+	// retry would re-derive the same budget over the same plan, and a second
+	// failure falls through to the sequential path — a third complete creation
+	// of the same workflow (gastownhall/gascity#6333; #5511 is the same shape
+	// on the bd-subprocess arm, which this gate deliberately leaves alone).
+	// Genuine transients below, including a statement deadline the beads
+	// layer left unmarked, still retry.
+	if errors.Is(err, beads.ErrGraphApplyBudgetExhausted) {
 		return false
 	}
 	text := strings.ToLower(err.Error())
@@ -233,6 +245,12 @@ func buildRecipeApplyPlan(recipe *formula.Recipe, opts Options) (*beads.GraphApp
 					node.Metadata = make(map[string]string, 1)
 				}
 				node.Metadata[beadmeta.WorkflowExpandedMetadataKey] = "true"
+			}
+			if recipe.PathAgnostic {
+				if node.Metadata == nil {
+					node.Metadata = make(map[string]string, 1)
+				}
+				node.Metadata[beadmeta.FormulaPathAgnosticMetadataKey] = "true"
 			}
 		} else {
 			// graph.v2 workflows and their retry/Ralph attempt sub-recipes
@@ -570,6 +588,7 @@ func recipeStepToGraphNode(step formula.RecipeStep, vars map[string]string, prio
 		From:        b.From,
 		Labels:      slices.Clone(b.Labels),
 		Metadata:    maps.Clone(b.Metadata),
+		AwaitType:   b.AwaitType,
 	}, nil
 }
 

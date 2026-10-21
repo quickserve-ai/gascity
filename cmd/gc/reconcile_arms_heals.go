@@ -346,6 +346,9 @@ func deadRuntimePatch(r *rowFacts, heal bool) (patch session.MetadataPatch, clas
 			backstop, count := resumeBackstop(failures, kept, resumeFailure{counted: folded.ResumeLaunch == "true"})
 			if !kept || backstop {
 				maps.Copy(patch, session.ConversationResetPatch(true))
+				// The key reset away stays findable (ga-oe8h), as legacy's
+				// recordWakeFailure stamps it.
+				session.StampPriorSessionKeyInfo(patch, folded)
 				count = 0
 			}
 			maps.Copy(patch, resumeFailuresPatch(folded, count))
@@ -358,6 +361,7 @@ func deadRuntimePatch(r *rowFacts, heal bool) (patch session.MetadataPatch, clas
 	case session.ExitChurn:
 		if folded := foldInfo(info, patch); strings.TrimSpace(folded.SessionKey) != "" && !session.HasStartedManualConversation(folded) {
 			maps.Copy(patch, session.ConversationResetPatch(false))
+			session.StampPriorSessionKeyInfo(patch, folded) // as legacy's recordChurn (ga-oe8h)
 		}
 		cycles, _ := strconv.Atoi(info.ChurnCount)
 		accrual = session.ChurnAccrualPatch(cycles, defaultMaxChurnCycles, until)

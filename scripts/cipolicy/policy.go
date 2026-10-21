@@ -311,7 +311,11 @@ const (
 	// gets `token: ''`, so pull requests diff with git instead of calling the
 	// pulls/files API on the shared github.token budget. Reviewed delta: one
 	// `with` input; no new job, step command or permission.
-	expectedCIExecutionHash     = "094fa149515765ad86669145929368481d2c8112e58396b4083a6947b6ec2564"
+	// Carry (pl-axh9, after upstream #6997): the runner-policy job's runs-on is
+	// Blacksmith on gastownhall/gascity and ubuntu-latest anywhere else, since
+	// the quickserve-ai fork has no Blacksmith runners. Reviewed delta: that
+	// one runs-on value, no new job, step, trigger or permission.
+	expectedCIExecutionHash     = "42c0c3d0eeba0e9b2aea22ea73bd1bdb076154f07b998b5daf9c3b519741c1da"
 	expectedNightlyTriggersHash = "0a4400a09ac567e90adf8be1232eef1f14e36efd8dba3e143aa6e36f5b7a36f5"
 	// Nightly: reviewed delta Beads v1.3.0-rc.2 -> v1.3.0, then (round3 review,
 	// completeness) one new job, beads-proxied-perf: ubuntu-latest,
@@ -346,11 +350,15 @@ const (
 	// hard-errors on it), so it failed every night; no job may select a
 	// provider now. Reviewed delta: one job removed; no new job, trigger or
 	// permission.
-	expectedNightlyExecutionHash = "cb54a44e7bfc392a047849ab6cfe695dcbffec56e127b5a84d427e3c1d4bef8c"
+	// Bumped again (ga-tkfdsb): beads-proxied-perf installs the fleet bd release
+	// (workflow env FLEET_BD_TAG, checked against its SHA256SUMS) instead of
+	// building upstream's BD_CURRENT_REF; two steps become one. Reviewed delta:
+	// one env key, one step's commands; no new job, trigger, permission or secret.
+	expectedNightlyExecutionHash = "16a550fd8ef6b137577af74308686494ed32d308c29073bf7f44d4ffe2e0d42c"
 	// Setup action: reviewed delta (Go module fetch resilience) is setup-go
 	// `cache: false` and one step right after it,
 	// `uses: ./.github/actions/go-mod-download`.
-	expectedSetupActionHash = "910f005f48c629c9bf76c69a007b60c4132a76859183e59c0fe99d642bf6141f"
+	expectedSetupActionHash = "1e9e0ae10c9b6a48e07cfc7beff53cb28c89d44569e37c00b13ab92234057692"
 )
 
 var requiredFilterPaths = map[string][]string{

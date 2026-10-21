@@ -1,0 +1,183 @@
+package main
+
+import (
+	"bytes"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/gastownhall/gascity/internal/beads"
+	"github.com/gastownhall/gascity/internal/session"
+)
+
+// ga-9n8hjv: `gc session close` releases the closing session's work through
+// unclaimWorkAssignedToRetiredSessionBead, and the guard that keeps a still-
+// configured [[named_session]]'s backlog (added for ga-sdynmb) is CONFIG-DRIVEN.
+// cmdSessionClose loaded that config with `cfg, _ = loadCityConfig(...)` and
+// discarded the error, so a config that failed to load produced a nil cfg —
+// and a nil cfg matches no named identity, which makes EVERY assignee read as
+// retired. The sweep then released the lot.
+//
+// That is not hypothetical. On 2026-09-11T05:08:17Z a close on this path cleared
+// 50 beads off one named seat in a single write, 11 of them downgraded
+// in_progress -> open. The binary serving that day was gc 5f4055046, which
+// CARRIED the ga-sdynmb guard — verified by content against a pre-guard control.
+// So the guard was present and simply had nothing to match against: a
+// present-but-inapplicable guard is the whole failure mode, which is why the
+// ga-sdynmb regression suite passes and did not catch this.
+//
+// THIS TEST PINS BOTH HALVES OF THE NIL-CFG BEHAVIOR, because each half is a
+// separate regression and a fix for one is the natural way to break the other:
+//
+//   - NAME-SHAPED assignee (here the session_name form) must be RETAINED. Losing
+//     this is the 2026-09-11 portfolio wave.
+//   - BEAD-ID assignee must not be STRANDED. The carry used to release it here,
+//     because once CloseDetailed had closed the session nothing downstream
+//     reclaimed it: the reconciler snapshot drops closed sessions, so
+//     repairStrandedPoolWorkerBead never sees it, and
+//     releaseOrphanedPoolAssignments skips unrouted work. Upstream #7561 instead
+//     REFUSES a nil-config close of a session that still holds claims (no claim's
+//     lane can be judged without the config;
+//     TestCmdSessionCloseWithoutConfigRefusesOnlyOverClaims), so the claim stays
+//     on a session that stays OPEN and the close works once the config loads.
+//     Provisional ruling for re-sync #7 (navani; row owner woodhouse reads it on
+//     the cert PR): the refusal stands, and this half pins it.
+//
+// The work bead below is deliberately UNROUTED (no gc.routed_to), which is the
+// exact shape releaseOrphanedPoolAssignments refuses to recover.
+func TestSessionCloseFailsClosedWhenCityConfigDoesNotLoad(t *testing.T) {
+	cityDir := t.TempDir()
+	writePhase0InterfaceCity(t, cityDir, `[workspace]
+name = "test-city"
+
+[beads]
+provider = "file"
+
+[[agent]]
+name = "worker"
+start_command = "true"
+max_active_sessions = 1
+`)
+	t.Setenv("GC_CITY", cityDir)
+	t.Setenv("GC_DIR", t.TempDir())
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_SESSION", "fake")
+
+	store, err := openCityStoreAt(cityDir)
+	if err != nil {
+		t.Fatalf("openCityStoreAt: %v", err)
+	}
+
+	const sessionName = "worker-named"
+	sessionBead, err := store.Create(beads.Bead{
+		Title:  "named seat session",
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"session_name": sessionName,
+			"template":     "worker",
+			"state":        "active",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create(session bead): %v", err)
+	}
+
+	inProgress := "in_progress"
+
+	// Held under a NAME. This is the portfolio the 2026-09-11 wave destroyed.
+	namedWork, err := store.Create(beads.Bead{
+		Title:    "the seat's in-flight work, held under its name",
+		Type:     "task",
+		Assignee: sessionName,
+	})
+	if err != nil {
+		t.Fatalf("Create(named work bead): %v", err)
+	}
+	if err := store.Update(namedWork.ID, beads.UpdateOpts{Status: &inProgress}); err != nil {
+		t.Fatalf("mark named work in_progress: %v", err)
+	}
+
+	// Held under the dying session's BEAD ID, and unrouted: pool-shaped work that
+	// nothing else can reclaim once this bead closes.
+	poolWork, err := store.Create(beads.Bead{
+		Title:    "pool work bound to the dying session bead",
+		Type:     "task",
+		Assignee: sessionBead.ID,
+	})
+	if err != nil {
+		t.Fatalf("Create(pool work bead): %v", err)
+	}
+	if err := store.Update(poolWork.ID, beads.UpdateOpts{Status: &inProgress}); err != nil {
+		t.Fatalf("mark pool work in_progress: %v", err)
+	}
+
+	// Break the config AFTER the store and beads exist, so this exercises the
+	// nil-cfg leg specifically rather than a city that never came up. Truncated
+	// TOML mid-table is the realistic shape: a half-written file, which is what a
+	// config-drift roll racing an edit actually produces.
+	cityTOML := filepath.Join(cityDir, "city.toml")
+	if err := os.WriteFile(cityTOML, []byte("[workspace]\nname = \"test-city\"\n[[agent\n"), 0o644); err != nil {
+		t.Fatalf("corrupt city.toml: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := cmdSessionClose([]string{sessionBead.ID}, "", &stdout, &stderr, false)
+
+	reopened, err := openCityStoreAt(cityDir)
+	if err != nil {
+		t.Fatalf("reopen city store: %v", err)
+	}
+
+	// HALF ONE. Not "the close succeeded" — the close may legitimately fail on a
+	// broken config, and that is fine. What must never happen is a seat's work
+	// being detached from its owner on the way out.
+	gotNamed, err := reopened.Get(namedWork.ID)
+	if err != nil {
+		t.Fatalf("re-read named work bead: %v", err)
+	}
+	if gotNamed.Assignee != sessionName {
+		t.Errorf("named work assignee = %q, want %q: an unloadable config must not "+
+			"detach work held under a name (close exit=%d, stderr=%s)",
+			gotNamed.Assignee, sessionName, code, stderr.String())
+	}
+	if gotNamed.Status != "in_progress" {
+		t.Errorf("named work status = %q, want in_progress: downgrading to open is what "+
+			"makes the owner's own resume check report \"no work\" (stderr=%s)",
+			gotNamed.Status, stderr.String())
+	}
+
+	// HALF TWO. The bead-ID form is not stranded on a closed row: the close is
+	// refused while the session holds claims, so the session stays open and the
+	// claim stays assigned to it, in progress, until a close with a loaded
+	// config can judge its lane (upstream #7561; provisional ruling above).
+	if code == 0 {
+		t.Errorf("close exit = 0, want a refusal: the session holds claims and the "+
+			"config did not load, so none of them can be released (stderr=%s)", stderr.String())
+	}
+	gotSession, err := reopened.Get(sessionBead.ID)
+	if err != nil {
+		t.Fatalf("re-read session bead: %v", err)
+	}
+	if gotSession.Status == "closed" {
+		t.Errorf("session bead closed over its claims: a refused close must leave it open, "+
+			"or the bead-ID claim is stranded on a closed row (stderr=%s)", stderr.String())
+	}
+	gotPool, err := reopened.Get(poolWork.ID)
+	if err != nil {
+		t.Fatalf("re-read pool work bead: %v", err)
+	}
+	if gotPool.Assignee != sessionBead.ID || gotPool.Status != "in_progress" {
+		t.Errorf("pool work = (%q, %q), want (%q, in_progress) kept on the open session "+
+			"until a close with a loaded config can judge its lane (stderr=%s)",
+			gotPool.Assignee, gotPool.Status, sessionBead.ID, stderr.String())
+	}
+
+	// And it must SAY so. A silent skip is how this stayed invisible for four
+	// days; the operator needs to know the close was refused and why, so it can
+	// be re-run once the config loads.
+	if !strings.Contains(stderr.String(), "city config did not load") {
+		t.Errorf("stderr does not name the config as the reason the close was refused; got: %s", stderr.String())
+	}
+}

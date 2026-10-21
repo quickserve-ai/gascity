@@ -237,8 +237,12 @@ func (p *decidePass) computePoolDesired() {
 	if standIns := p.inFlightStandIns(); len(standIns) > 0 {
 		rows = append(slices.Clip(p.decidable), standIns...)
 	}
-	p.poolWork = filterAssignedWorkBeadsForPoolDemandAt(p.cfg, p.in.CityPath, p.in.Demand.RelocatedClaimRefs,
-		rows, p.in.Demand.AssignedWork, p.in.Demand.AssignedStoreRefs, p.in.Now.UTC())
+	p.poolWork, _ = filterAssignedWorkBeadsForPoolDemandAt(p.cfg, p.in.CityPath, p.in.Demand.RelocatedClaimRefs,
+		rows, p.in.Demand.AssignedWork, p.in.Demand.AssignedStoreRefs, p.in.Now.UTC(),
+		// The carry's orphan-row readiness veto (#6336 replay) is read in the
+		// legacy demand phase; the v2 pass has no verdict to give, which keeps
+		// every row, as upstream does, and withholds none to report.
+		nil)
 	poolCfg := p.cfg
 	if len(p.in.SuspendedRigPaths) > 0 {
 		clone := *p.cfg

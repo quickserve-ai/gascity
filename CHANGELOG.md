@@ -235,6 +235,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   check. Before, it stopped at the first error and skipped a store it could
   not open without saying so (#6614).
 
+- **Builtin `codex` agents no longer default to `gpt-5.5` at `xhigh`
+  reasoning effort.** Unless the city, agent or session chooses a `model` or
+  `effort`, Gas City passes no `--model` or `model_reasoning_effort` flag, and
+  codex runs on the model and effort from the user's own
+  `~/.codex/config.toml`, which is often a different model and a lower effort.
+  The builtin pin broke every turn for logins that cannot use that model. The
+  launch command of every unpinned `builtin:codex` session changes, so each
+  such session restarts once after the upgrade. To keep the old behavior, pin
+  it for every agent on the harness in `city.toml` (`[providers.codex]` with
+  `option_defaults = { model = "gpt-5.5", effort = "xhigh" }`), or for one
+  agent with the same `option_defaults` line in its `agent.toml` (#7944).
+
 ### Added
 
 - **`gc agent is-foreign <identity>` reports whether this city can vouch for
@@ -368,6 +380,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same way. Pass `--version` to choose another constraint.
 
 ### Fixed
+
+- **The work ladder and the execution backstop read a rig seat's started
+  graph steps as started.** On a city that relocates its coordination classes
+  (`[beads] infra = "local"`), a rig-scoped seat's `gc hook --claim` recorded
+  a graph step it claimed in the session's `work_started` cell under the
+  rig's work store (`rig:<rig>`), while the step lives in the city-scope
+  class binding, where the ladder and the backstop look it up (`city`). The
+  ladder then treated the seat's started claim as unstarted and nudged it as
+  claimed (a release was still refused by the bead's `gc.session_id`), and
+  the backstop missed the record. The hook now records the store the claim
+  resides in, the spelling every reader uses, and marks the entry
+  `resident`. An unmarked entry (one an older `gc` wrote, or an adoption
+  whose store the hook could not prove) is read by bead alone, and only at
+  the session generation it was recorded in; the hook rewrites an entry of
+  the current generation to the resident spelling the next time it proves the
+  claim's store. A rollback still reads the new entries.
 
 - **A config reload no longer creates or rebinds a city's bead store.** When a
   city's `.beads/metadata.json` went missing (for example, a `git` checkout
@@ -948,6 +976,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   minter, which is the premise this change retires (ga-8w5c7).
 
 ### Fixed
+
+- **Human prompts no longer count as content-idle in tmux.** Question and
+  permission dialogs, attached or not, and unsent Claude drafts while a client
+  is attached, reset the content idle clock and hold lifecycle timers through
+  pending-interaction detection (`Pending` reports them as kind `human-input`,
+  which `Respond` refuses, and `Send`/`Submit` answer 409 while one is shown).
+  A draft on a detached pane and a bare numbered chooser (Claude's usage-limit
+  prompt among them) do not hold: the idle timeout reclaims such a seat as
+  before. Faint placeholders and complete gc reminders remain exempt.
+  Terminal-only interactions must be completed in the terminal; API responses
+  are rejected without sending keystrokes.
 
 - **The reaper's stale-issue auto-close works again when an open bead
   depends on a wisp or external bead.** Such a dependency has no

@@ -1,13 +1,18 @@
 package doctor
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/formula"
+	"github.com/gastownhall/gascity/internal/rollout"
 )
 
 func TestFormulaRequirementsCheckOK(t *testing.T) {
@@ -336,4 +341,293 @@ func doctorRunGit(t *testing.T, dir string, args ...string) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
 	}
+}
+
+// ga-2h3isb: a rig can shadow a pack formula with an unsatisfiable
+// requirement ON PURPOSE. With a disabled_reason, doctor reports it as
+// intentionally disabled instead of as a blocking defect a patrol "fixes".
+func TestFormulaRequirementsCheckIntentionallyDisabled(t *testing.T) {
+	stub := func(reason string) string {
+		s := "\nformula = \"mol-shadowed\"\n\n[requires]\nformula_compiler = \">=999.0.0\"\n"
+		if reason != "" {
+			s += "disabled_reason = \"" + reason + "\"\n"
+		}
+		return s + "\n[[steps]]\nid = \"commit\"\ntitle = \"Commit\"\n"
+	}
+	run := func(t *testing.T, content string) *CheckResult {
+		t.Helper()
+		dir := t.TempDir()
+		writeDoctorFormula(t, dir, "mol-shadowed", content)
+		return NewFormulaRequirementsCheck(&config.City{
+			Daemon:        config.DaemonConfig{FormulaV2: boolPtr(true)},
+			FormulaLayers: config.FormulaLayers{City: []string{dir}},
+		}, t.TempDir()).Run(&CheckContext{})
+	}
+
+	t.Run("declared disabled reads as disabled, not a defect", func(t *testing.T) {
+		r := run(t, stub("closes direct-push-to-base on the platform rig (ga-82cffd)"))
+		if r.Status != StatusOK {
+			t.Fatalf("Status = %v, want OK; details:\n%s", r.Status, strings.Join(r.Details, "\n"))
+		}
+		if !strings.Contains(r.Message, "1 intentionally disabled") ||
+			!strings.Contains(strings.Join(r.Details, "\n"), "intentionally disabled city formula \"mol-shadowed\"") ||
+			!strings.Contains(strings.Join(r.Details, "\n"), "ga-82cffd") {
+			t.Fatalf("the disabled formula and its reason must be reported: %q %v", r.Message, r.Details)
+		}
+	})
+
+	t.Run("control: the same stub without a reason is still an error", func(t *testing.T) {
+		if r := run(t, stub("")); r.Status != StatusError {
+			t.Fatalf("Status = %v, want Error; details:\n%s", r.Status, strings.Join(r.Details, "\n"))
+		}
+	})
+
+	t.Run("a reason on a satisfiable requirement warns: the formula is dispatchable", func(t *testing.T) {
+		content := "\nformula = \"mol-shadowed\"\n\n[requires]\nformula_compiler = \">=2.0.0\"\ndisabled_reason = \"stale marker\"\n\n[[steps]]\nid = \"commit\"\ntitle = \"Commit\"\n"
+		r := run(t, content)
+		if r.Status != StatusWarning || !strings.Contains(strings.Join(r.Details, "\n"), "DISPATCHABLE") {
+			t.Fatalf("want a Warning naming the dispatchable formula: %v %q %v", r.Status, r.Message, r.Details)
+		}
+	})
+
+	t.Run("a reason on a satisfiable requirement is honored when a composed expansion is unsatisfiable", func(t *testing.T) {
+		dir := t.TempDir()
+		writeDoctorFormula(t, dir, "mol-shadowed", "\nformula = \"mol-shadowed\"\n\n[requires]\nformula_compiler = \">=1.0.0\"\ndisabled_reason = \"disabled through its expansion\"\n\n[[steps]]\nid = \"work\"\ntitle = \"Work\"\n\n[compose]\n[[compose.expand]]\ntarget = \"work\"\nwith = \"never-expansion\"\n")
+		writeDoctorFormula(t, dir, "never-expansion", "\nformula = \"never-expansion\"\ntype = \"expansion\"\n\n[requires]\nformula_compiler = \">=999.0.0\"\ndisabled_reason = \"never compiles\"\n\n[[template]]\nid = \"{target}.child\"\ntitle = \"Child\"\n")
+		r := NewFormulaRequirementsCheck(&config.City{
+			Daemon:        config.DaemonConfig{FormulaV2: boolPtr(true)},
+			FormulaLayers: config.FormulaLayers{City: []string{dir}},
+		}, t.TempDir()).Run(&CheckContext{})
+		if r.Status != StatusOK || !strings.Contains(strings.Join(r.Details, "\n"), "by a composed requirement: disabled through its expansion") {
+			t.Fatalf("a composed unsatisfiable requirement must honor the marker, not warn DISPATCHABLE: %v %q %v", r.Status, r.Message, r.Details)
+		}
+	})
+
+	t.Run("a disabled formula with graph-only constructs is still just disabled", func(t *testing.T) {
+		content := "\nformula = \"mol-shadowed\"\n\n[requires]\nformula_compiler = \">=999.0.0\"\ndisabled_reason = \"shadowed v2 formula\"\n\n[[steps]]\nid = \"commit\"\ntitle = \"Commit\"\n\n[steps.retry]\nmax_attempts = 2\n"
+		r := run(t, content)
+		if r.Status != StatusOK || !strings.Contains(strings.Join(r.Details, "\n"), "shadowed v2 formula") {
+			t.Fatalf("the graph-declaration error must not outlive the marker: %v %q %v", r.Status, r.Message, r.Details)
+		}
+	})
+
+	t.Run("an inherited reason does not excuse the formula's own unmet requirement", func(t *testing.T) {
+		dir := t.TempDir()
+		writeDoctorFormula(t, dir, "stale-parent", "\nformula = \"stale-parent\"\n\n[requires]\nformula_compiler = \">=1.0.0\"\ndisabled_reason = \"stale\"\n\n[[steps]]\nid = \"a\"\ntitle = \"A\"\n")
+		writeDoctorFormula(t, dir, "own-unmet", "\nformula = \"own-unmet\"\nextends = [\"stale-parent\"]\n\n[requires]\nformula_compiler = \">=999.0.0\"\n")
+		r := NewFormulaRequirementsCheck(&config.City{
+			Daemon:        config.DaemonConfig{FormulaV2: boolPtr(true)},
+			FormulaLayers: config.FormulaLayers{City: []string{dir}},
+		}, t.TempDir()).Run(&CheckContext{})
+		joined := strings.Join(r.Details, "\n")
+		if r.Status != StatusError || strings.Contains(joined, "intentionally disabled city formula \"own-unmet\"") {
+			t.Fatalf("own-unmet's own requirement must stay an error: %v %q %v", r.Status, r.Message, r.Details)
+		}
+	})
+
+	// Codex r5 (#134): Resolve keeps only the first parent's disabled_reason,
+	// so a stale marker on one parent must not excuse another parent's
+	// unmarked, genuinely unmet requirement.
+	t.Run("one parent's stale reason does not excuse another parent's unmet requirement", func(t *testing.T) {
+		dir := t.TempDir()
+		writeDoctorFormula(t, dir, "stale-parent", "\nformula = \"stale-parent\"\n\n[requires]\nformula_compiler = \">=1.0.0\"\ndisabled_reason = \"stale\"\n\n[[steps]]\nid = \"a\"\ntitle = \"A\"\n")
+		writeDoctorFormula(t, dir, "unmet-parent", "\nformula = \"unmet-parent\"\n\n[requires]\nformula_compiler = \">=999.0.0\"\n\n[[steps]]\nid = \"b\"\ntitle = \"B\"\n")
+		writeDoctorFormula(t, dir, "multi-child", "\nformula = \"multi-child\"\nextends = [\"stale-parent\", \"unmet-parent\"]\n")
+		r := NewFormulaRequirementsCheck(&config.City{
+			Daemon:        config.DaemonConfig{FormulaV2: boolPtr(true)},
+			FormulaLayers: config.FormulaLayers{City: []string{dir}},
+		}, t.TempDir()).Run(&CheckContext{})
+		joined := strings.Join(r.Details, "\n")
+		if r.Status != StatusError || strings.Contains(joined, "intentionally disabled city formula \"multi-child\"") ||
+			!strings.Contains(joined, "error city formula \"multi-child\"") || !strings.Contains(joined, "compiler_requirement_unsatisfied") {
+			t.Fatalf("multi-child's unmarked inherited requirement must stay an error: %v %q %v", r.Status, r.Message, r.Details)
+		}
+	})
+
+	t.Run("a child inherits the reason of the parent that disables it", func(t *testing.T) {
+		dir := t.TempDir()
+		writeDoctorFormula(t, dir, "stale-parent", "\nformula = \"stale-parent\"\n\n[requires]\nformula_compiler = \">=1.0.0\"\ndisabled_reason = \"stale\"\n\n[[steps]]\nid = \"a\"\ntitle = \"A\"\n")
+		writeDoctorFormula(t, dir, "marked-parent", "\nformula = \"marked-parent\"\n\n[requires]\nformula_compiler = \">=999.0.0\"\ndisabled_reason = \"parked on purpose\"\n\n[[steps]]\nid = \"b\"\ntitle = \"B\"\n")
+		writeDoctorFormula(t, dir, "multi-child", "\nformula = \"multi-child\"\nextends = [\"stale-parent\", \"marked-parent\"]\n")
+		r := NewFormulaRequirementsCheck(&config.City{
+			Daemon:        config.DaemonConfig{FormulaV2: boolPtr(true)},
+			FormulaLayers: config.FormulaLayers{City: []string{dir}},
+		}, t.TempDir()).Run(&CheckContext{})
+		var line string
+		for _, d := range r.Details {
+			if strings.HasPrefix(d, "intentionally disabled city formula \"multi-child\"") {
+				line = d
+			}
+		}
+		if r.Status != StatusWarning || !strings.HasSuffix(line, ": parked on purpose") {
+			t.Fatalf("multi-child must read disabled by marked-parent's reason, not stale-parent's: %v %q %v", r.Status, r.Message, r.Details)
+		}
+	})
+
+	t.Run("a reason never excuses an INVALID requirement", func(t *testing.T) {
+		content := "\nformula = \"mol-shadowed\"\n\n[requires]\nformula_compiler = \"not-a-version\"\ndisabled_reason = \"x\"\n\n[[steps]]\nid = \"commit\"\ntitle = \"Commit\"\n"
+		if r := run(t, content); r.Status != StatusError {
+			t.Fatalf("Status = %v, want Error; details:\n%s", r.Status, strings.Join(r.Details, "\n"))
+		}
+	})
+}
+
+// Codex r5 (#134): the composition probe must compile under the city's
+// daemon.formula_v2 rollout gate, not the process-wide compile setting that
+// earlier checks may have left behind (or none, when only this check runs).
+func TestFormulaRequirementsCheckCompositionProbeHonorsConfiguredV2(t *testing.T) {
+	write := func(t *testing.T) string {
+		t.Helper()
+		dir := t.TempDir()
+		writeDoctorFormula(t, dir, "mol-v2-composed", "\nformula = \"mol-v2-composed\"\n\n[requires]\nformula_compiler = \">=1.0.0\"\ndisabled_reason = \"needs v2 through its expansion\"\n\n[[steps]]\nid = \"work\"\ntitle = \"Work\"\n\n[compose]\n[[compose.expand]]\ntarget = \"work\"\nwith = \"v2-expansion\"\n")
+		writeDoctorFormula(t, dir, "v2-expansion", "\nformula = \"v2-expansion\"\ntype = \"expansion\"\n\n[requires]\nformula_compiler = \">=2.0.0\"\n\n[[template]]\nid = \"{target}.child\"\ntitle = \"Child\"\n")
+		return dir
+	}
+	check := func(dir string, cityV2 bool) *FormulaRequirementsCheck {
+		return NewFormulaRequirementsCheck(&config.City{
+			Daemon:        config.DaemonConfig{FormulaV2: boolPtr(cityV2)},
+			FormulaLayers: config.FormulaLayers{City: []string{dir}},
+		}, t.TempDir())
+	}
+	notDispatchable := func(t *testing.T, r *CheckResult) {
+		t.Helper()
+		joined := strings.Join(r.Details, "\n")
+		if strings.Contains(joined, "DISPATCHABLE") || !strings.Contains(joined, "by a composed requirement: needs v2 through its expansion") {
+			t.Fatalf("under formula_v2 = false the v2 expansion disables the formula: %v %q %v", r.Status, r.Message, r.Details)
+		}
+	}
+
+	t.Run("formula_v2 = false while the process compiles v2: not DISPATCHABLE", func(t *testing.T) {
+		dir := write(t)
+		// Precondition: the process-wide compile path accepts v2 here, so
+		// only the city's gate can make the probe refuse the expansion.
+		if _, err := formula.CompileWithoutRuntimeVarValidation(context.Background(), "mol-v2-composed", []string{dir}, nil); err != nil {
+			t.Fatalf("precondition: the process-wide compile must accept v2 here: %v", err)
+		}
+		notDispatchable(t, check(dir, false).Run(&CheckContext{}))
+	})
+
+	t.Run("the rollout gate decides: gate false over config true is not DISPATCHABLE", func(t *testing.T) {
+		c := check(write(t), true)
+		flags := rollout.ForTest(rollout.WithFormulaV2(false))
+		c.rolloutFlags = &flags
+		notDispatchable(t, c.Run(&CheckContext{}))
+	})
+
+	t.Run("the rollout gate decides: gate true over config false is DISPATCHABLE", func(t *testing.T) {
+		c := check(write(t), false)
+		flags := rollout.ForTest(rollout.WithFormulaV2(true))
+		c.rolloutFlags = &flags
+		r := c.Run(&CheckContext{})
+		if r.Status != StatusWarning || !strings.Contains(strings.Join(r.Details, "\n"), "DISPATCHABLE") {
+			t.Fatalf("under formula_v2 = true the formula compiles, so its marker is stale: %v %q %v", r.Status, r.Message, r.Details)
+		}
+	})
+}
+
+// Codex r6 (#134): discovery and compilation key a formula by its FILENAME,
+// which may differ from its formula field. The probe and the extends walk must
+// evaluate the discovered file, not whatever the field's value resolves to.
+func TestFormulaRequirementsCheckEvaluatesTheDiscoveredFileByResolverKey(t *testing.T) {
+	const composed = "\nformula = \"mol-field\"\n\n[requires]\nformula_compiler = \">=1.0.0\"\ndisabled_reason = \"needs v2 through its expansion\"\n\n[[steps]]\nid = \"work\"\ntitle = \"Work\"\n\n[compose]\n[[compose.expand]]\ntarget = \"work\"\nwith = \"v2-expansion\"\n"
+	const expansion = "\nformula = \"v2-expansion\"\ntype = \"expansion\"\n\n[requires]\nformula_compiler = \">=2.0.0\"\n\n[[template]]\nid = \"{target}.child\"\ntitle = \"Child\"\n"
+	run := func(t *testing.T, dir string, cityV2 bool) *CheckResult {
+		t.Helper()
+		return NewFormulaRequirementsCheck(&config.City{
+			Daemon:        config.DaemonConfig{FormulaV2: boolPtr(cityV2)},
+			FormulaLayers: config.FormulaLayers{City: []string{dir}},
+		}, t.TempDir()).Run(&CheckContext{})
+	}
+	wantComposedDisable := func(t *testing.T, r *CheckResult, dir string) {
+		t.Helper()
+		file := filepath.Join(dir, "mol-file.toml")
+		want := fmt.Sprintf("intentionally disabled city formula %q (%s), by a composed requirement: needs v2 through its expansion (disabled_reason declared on %q in %s)", "mol-field", file, "mol-file", file)
+		var about []string
+		for _, d := range r.Details {
+			if strings.Contains(d, "("+file+")") {
+				about = append(about, d)
+			}
+		}
+		if !slices.Equal(about, []string{want}) {
+			t.Fatalf("the probe must compile mol-file.toml by its resolver key:\nwant only %q\ngot %q", want, about)
+		}
+	}
+
+	t.Run("no file answers to the formula field", func(t *testing.T) {
+		dir := t.TempDir()
+		writeDoctorFormula(t, dir, "mol-file", composed)
+		writeDoctorFormula(t, dir, "v2-expansion", expansion)
+		wantComposedDisable(t, run(t, dir, false), dir)
+	})
+
+	t.Run("a different file answers to the formula field", func(t *testing.T) {
+		dir := t.TempDir()
+		writeDoctorFormula(t, dir, "mol-file", composed)
+		writeDoctorFormula(t, dir, "v2-expansion", expansion)
+		writeDoctorFormula(t, dir, "mol-field", "\nformula = \"mol-field\"\n\n[requires]\nformula_compiler = \">=1.0.0\"\n\n[[steps]]\nid = \"decoy\"\ntitle = \"Decoy\"\n")
+		wantComposedDisable(t, run(t, dir, false), dir)
+	})
+
+	t.Run("two parents sharing a formula field are each checked", func(t *testing.T) {
+		dir := t.TempDir()
+		writeDoctorFormula(t, dir, "p-marked", "\nformula = \"shared-parent\"\n\n[requires]\nformula_compiler = \">=999.0.0\"\ndisabled_reason = \"parked on purpose\"\n\n[[steps]]\nid = \"a\"\ntitle = \"A\"\n")
+		writeDoctorFormula(t, dir, "p-unmarked", "\nformula = \"shared-parent\"\n\n[requires]\nformula_compiler = \">=999.0.0\"\n\n[[steps]]\nid = \"b\"\ntitle = \"B\"\n")
+		writeDoctorFormula(t, dir, "multi-child", "\nformula = \"multi-child\"\nextends = [\"p-marked\", \"p-unmarked\"]\n")
+		r := run(t, dir, true)
+		joined := strings.Join(r.Details, "\n")
+		if r.Status != StatusError || strings.Contains(joined, "intentionally disabled city formula \"multi-child\"") ||
+			!strings.Contains(joined, "error city formula \"multi-child\"") {
+			t.Fatalf("p-unmarked's unmarked requirement must keep multi-child an error: %v %q %v", r.Status, r.Message, r.Details)
+		}
+	})
+}
+
+// Codex r7 (#134): an inherited disabled_reason must not excuse a COMPOSED
+// requirement. The parent's own requirement is satisfiable, so its marker is
+// stale; the child adds an unmarked expansion this host cannot compile. Only a
+// reason on the composing formula's own file may excuse that mismatch.
+func TestFormulaRequirementsCheckComposedRequirementNeedsTheComposersOwnReason(t *testing.T) {
+	const staleParent = "\nformula = \"stale-parent\"\n\n[requires]\nformula_compiler = \">=1.0.0\"\ndisabled_reason = \"stale\"\n\n[[steps]]\nid = \"work\"\ntitle = \"Work\"\n"
+	const unmarkedExpansion = "\nformula = \"never-expansion\"\ntype = \"expansion\"\n\n[requires]\nformula_compiler = \">=999.0.0\"\n\n[[template]]\nid = \"{target}.child\"\ntitle = \"Child\"\n"
+	const compose = "\n[compose]\n[[compose.expand]]\ntarget = \"work\"\nwith = \"never-expansion\"\n"
+	run := func(t *testing.T, child string) (*CheckResult, string) {
+		t.Helper()
+		dir := t.TempDir()
+		writeDoctorFormula(t, dir, "stale-parent", staleParent)
+		writeDoctorFormula(t, dir, "never-expansion", unmarkedExpansion)
+		writeDoctorFormula(t, dir, "composed-child", child)
+		r := NewFormulaRequirementsCheck(&config.City{
+			Daemon:        config.DaemonConfig{FormulaV2: boolPtr(true)},
+			FormulaLayers: config.FormulaLayers{City: []string{dir}},
+		}, t.TempDir()).Run(&CheckContext{})
+		return r, filepath.Join(dir, "composed-child.toml")
+	}
+	about := func(r *CheckResult, file string) []string {
+		var lines []string
+		for _, d := range r.Details {
+			if strings.Contains(d, "("+file+")") {
+				lines = append(lines, d)
+			}
+		}
+		return lines
+	}
+
+	t.Run("an inherited stale reason leaves the composed mismatch an error", func(t *testing.T) {
+		r, file := run(t, "\nformula = \"composed-child\"\nextends = [\"stale-parent\"]\n"+compose)
+		lines := about(r, file)
+		if r.Status != StatusError || len(lines) != 1 ||
+			!strings.HasPrefix(lines[0], "error city formula \"composed-child\"") ||
+			!strings.Contains(lines[0], "compiler_requirement_unsatisfied") ||
+			!strings.Contains(lines[0], "declare disabled_reason on the formula that composes it") {
+			t.Fatalf("stale-parent's inherited reason must not excuse composed-child's composed requirement: %v %q\nabout composed-child: %q", r.Status, r.Message, lines)
+		}
+	})
+
+	t.Run("the composing formula's own reason disables it", func(t *testing.T) {
+		r, file := run(t, "\nformula = \"composed-child\"\nextends = [\"stale-parent\"]\n\n[requires]\nformula_compiler = \">=1.0.0\"\ndisabled_reason = \"parked through never-expansion\"\n"+compose)
+		want := fmt.Sprintf("intentionally disabled city formula %q (%s), by a composed requirement: parked through never-expansion (disabled_reason declared on %q in %s)", "composed-child", file, "composed-child", file)
+		if lines := about(r, file); !slices.Equal(lines, []string{want}) {
+			t.Fatalf("composed-child's own reason must cover its composed requirement:\nwant only %q\ngot %q", want, lines)
+		}
+	})
 }

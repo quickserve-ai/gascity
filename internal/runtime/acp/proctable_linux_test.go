@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gastownhall/gascity/internal/pidutil"
 	"github.com/gastownhall/gascity/internal/runtime"
 	"github.com/gastownhall/gascity/internal/runtime/proctable"
 )
@@ -432,6 +433,15 @@ func TestFindRuntimesBySessionIDTracksPerSessionAcrossSessions(t *testing.T) {
 	case <-deadConn.done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("agent conn did not observe the process exit")
+	}
+	// done closes after cmd.Wait, so the tool is already reparented; a sandbox
+	// subreaper (not init or systemd --user) hides it from the sweep scan.
+	ppid, err := pidutil.ParentPID(deadTool)
+	if err != nil {
+		t.Fatalf("reading dead tool %d parent: %v", deadTool, err)
+	}
+	if !proctable.OrphanCandidate(ppid, pidutil.DetectUserSubreaperPID(os.Getpid())) {
+		t.Skipf("dead tool %d adopted by pid %d (%q); the sweep scan reads only processes adopted by init or a systemd --user subreaper", deadTool, ppid, pidutil.Comm(ppid))
 	}
 
 	// The empty-id scan is the orphan sweep's: only reparented roots

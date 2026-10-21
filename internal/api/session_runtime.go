@@ -100,6 +100,19 @@ func cityAnchoredSessionEnv(cityPath string, workspaceEnv, providerEnv map[strin
 	return convergence.ScrubTokenEnv(out)
 }
 
+// checkedCityAnchoredSessionEnv builds the city-anchored session env and
+// enforces the declared-account guard for claude-family providers: the
+// passthrough baseline resets the controller's ambient CLAUDE_CONFIG_DIR, so a
+// claude session whose config layers declare no account of their own is
+// refused loudly instead of silently inheriting the controller's (ga-ai7gz2).
+func checkedCityAnchoredSessionEnv(cityPath string, workspaceEnv map[string]string, resolved *config.ResolvedProvider) (map[string]string, error) {
+	sessionEnv := cityAnchoredSessionEnv(cityPath, workspaceEnv, resolved.Env)
+	if err := processenv.RequireDeclaredClaudeAccount(resolved.Name, resolved.AccountFamily(), sessionEnv); err != nil {
+		return nil, err
+	}
+	return sessionEnv, nil
+}
+
 func configuredWorkspaceSessionEnv(cfg *config.City) map[string]string {
 	if cfg == nil {
 		return nil
@@ -405,7 +418,10 @@ func (s *Server) buildSessionResume(info session.Info) (string, runtime.Config, 
 	resolvedInfo.ResumeFlag = resolved.ResumeFlag
 	resolvedInfo.ResumeStyle = resolved.ResumeStyle
 	resolvedInfo.ResumeCommand = resumeCommand
-	sessionEnv := cityAnchoredSessionEnv(s.state.CityPath(), configuredWorkspaceSessionEnv(s.state.Config()), resolved.Env)
+	sessionEnv, err := checkedCityAnchoredSessionEnv(s.state.CityPath(), configuredWorkspaceSessionEnv(s.state.Config()), resolved)
+	if err != nil {
+		return "", runtime.Config{}, err
+	}
 	return session.BuildResumeCommand(resolvedInfo), sessionResumeHints(resolved, workDir, sessionEnv, mcpServers, sessionResumeInteractive(metadata)), nil
 }
 
@@ -523,7 +539,10 @@ func (s *Server) resolveWorkerSessionRuntimeWithMetadata(info session.Info, _ st
 			resumeCommand = command
 		}
 	}
-	sessionEnv := cityAnchoredSessionEnv(s.state.CityPath(), configuredWorkspaceSessionEnv(s.state.Config()), resolved.Env)
+	sessionEnv, err := checkedCityAnchoredSessionEnv(s.state.CityPath(), configuredWorkspaceSessionEnv(s.state.Config()), resolved)
+	if err != nil {
+		return nil, err
+	}
 	runtimeCfg, err := worker.NormalizeResolvedRuntime(worker.ResolvedRuntime{
 		Command:    command,
 		WorkDir:    firstNonEmptyString(info.WorkDir, workDir),
@@ -676,11 +695,14 @@ func (s *Server) resolveSessionRuntimeWithMetadata(info session.Info, metadata m
 				if err == nil {
 					candidateWorkDir, workDirErr := s.resolveSessionWorkDir(agentCfg, agentCfg.QualifiedName())
 					if workDirErr == nil {
-						resolved = candidate
 						workDir = candidateWorkDir
 						if info.WorkDir != "" {
 							workDir = info.WorkDir
 						}
+						// Render a templated start_command for this session
+						// the way the reconciler's create path does, before
+						// anything compares against it (ga-b1u4yg).
+						resolved = s.renderResolvedCommandForSession(cfg, agentCfg, info, workDir, candidate)
 						configuredTransport = config.ResolveSessionCreateTransport(agentCfg.Session, resolved)
 					}
 				}
@@ -708,6 +730,43 @@ func (s *Server) resolveSessionRuntimeWithMetadata(info session.Info, metadata m
 		transport = "acp"
 	}
 	return resolved, workDir, transport, transport == "" && legacyACPTransportAmbiguous(resolved, configuredTransport, info.Command, metadata)
+}
+
+// renderResolvedCommandForSession renders the templated launch command
+// (start_command) of a provider resolved through agentCfg for the TARGET
+// session, with the same renderer and SessionSetupContext fields the
+// reconciler's create path uses (cmd/gc resolveTemplate Step 11). Without it
+// the API resume path launched the raw template — the control dispatcher's
+// `--follow {{.Agent}}` — and the runtime died (ga-b1u4yg).
+func (s *Server) renderResolvedCommandForSession(cfg *config.City, agentCfg config.Agent, info session.Info, workDir string, resolved *config.ResolvedProvider) *config.ResolvedProvider {
+	return s.renderResolvedCommandForNewSession(cfg, agentCfg, sessionRenderQualifiedName(info, agentCfg), info.SessionName, firstNonEmptyString(workDir, info.WorkDir), resolved)
+}
+
+// renderResolvedCommandForNewSession renders a resolved provider's templated
+// launch command for a session under the concrete identity, session name, and
+// work dir the caller computed — the create paths' form of
+// renderResolvedCommandForSession (ga-b1u4yg).
+func (s *Server) renderResolvedCommandForNewSession(cfg *config.City, agentCfg config.Agent, qualifiedName, sessionName, workDir string, resolved *config.ResolvedProvider) *config.ResolvedProvider {
+	if cfg == nil || resolved == nil {
+		return resolved
+	}
+	cityPath := s.state.CityPath()
+	return workdirutil.RenderResolvedProviderCommandForSession(resolved, cityPath, workdirutil.CityName(cityPath, cfg), qualifiedName, agentCfg, cfg.Rigs, sessionName, workDir)
+}
+
+// sessionRenderQualifiedName is the qualified identity a stored session's
+// templates render with: a configured named session's identity, else the
+// persisted agent_name (which the reconciler stamps with the named identity or
+// the canonical pool-instance identity), else the stored template. It mirrors
+// the precedence of cmd/gc's reconciler rediscovery chain, which this package
+// cannot import.
+func sessionRenderQualifiedName(info session.Info, agentCfg config.Agent) string {
+	if info.ConfiguredNamedSession {
+		if identity := session.NamedSessionIdentityInfo(info); identity != "" {
+			return identity
+		}
+	}
+	return firstNonEmptyString(info.AgentName, info.Template, agentCfg.QualifiedName())
 }
 
 // resolveBareProvider resolves a provider by name without an agent template.
