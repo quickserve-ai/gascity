@@ -1697,6 +1697,7 @@ export const zReadyBeadDep = z.object({
 
 export const zReadyBead = z.object({
     assignee: z.string().optional(),
+    await_type: z.string().optional(),
     blocked_by: z.array(zReadyBeadBlocker).nullish(),
     close_reason: z.string().optional(),
     created_at: z.iso.datetime(),

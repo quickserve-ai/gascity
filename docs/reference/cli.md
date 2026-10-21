@@ -89,6 +89,7 @@ gc [flags]
 | [gc wait](#gc-wait) | Inspect and manage durable session waits |
 | [gc whoami](#gc-whoami) | Show the authenticated hosted Gas City account |
 | [gc worktree](#gc-worktree) | Ensure or verify agent workspace worktrees |
+| [gc worktree-gc](#gc-worktree-gc) | Preview per-bead and stopped agent-home reclamation |
 
 ## gc agent
 
@@ -2038,16 +2039,14 @@ gc graph gc-42 --mermaid     # Mermaid.js diagram
 
 Convenience command for context handoff.
 
-Self-handoff (default): sends mail to self. If the current session is
-controller-restartable, requests a restart, pokes the controller for an
-immediate reconcile tick, and returns without waiting for the controller to
-act. For on-demand configured named sessions, sends mail and returns without
-requesting restart: handoff intentionally leaves the user-attended session
-running instead of restarting it out from under the user. The controller can
-restart such a session via gc runtime request-restart; handoff deliberately
-does not.
+Self-handoff (default): sends mail to self, requests a restart, pokes the
+controller for an immediate reconcile tick, and returns without waiting for the
+controller to act. This covers every session class, on-demand configured named
+sessions included (ga-cctcju): the seat asking to be cycled is the
+authorization, and the reconciler's restart consume records the reset-pending
+marker that wakes the seat fresh on the next tick without other demand.
 
-For controller-restartable sessions, equivalent to:
+Equivalent to:
 
   gc mail send $GC_ALIAS &lt;subject&gt; [message]
   gc runtime request-restart
@@ -2065,7 +2064,8 @@ the context compaction lifecycle.
 Remote handoff (--target): sends mail to a target session. If the target is
 controller-restartable, kills it so the reconciler restarts it with the handoff
 mail waiting. For on-demand configured named targets, sends mail and returns
-without killing the session.
+without killing the session: another seat does not restart a user-attended
+session out from under the user.
 
 For controller-restartable targets, equivalent to:
 
@@ -2266,8 +2266,12 @@ gc import add https://github.com/org/repo/tree/main/packs/review --version '^1.2
 Validate installed pack import state
 
 ```
-gc import check
+gc import check [flags]
 ```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--verify-source` | bool |  | also contact each declared source and verify it can produce the pinned commit (network, seconds per source) |
 
 ## gc import credential
 
@@ -2640,6 +2644,10 @@ List all unread messages for a session alias or human.
 Shows message ID, sender, subject, and body in a table. The recipient defaults
 to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". Pass a session alias to view another inbox.
 
+With --context/--city-url the inbox is read from a REMOTE city; with no
+argument it lists mail addressed to this client's remote identity
+("&lt;local city&gt;/&lt;identity&gt;") — where a far-side 'gc mail reply' lands.
+
 ```
 gc mail inbox [session] [flags]
 ```
@@ -2718,6 +2726,10 @@ Use -s/--subject for the reply subject and -m/--message for the reply body.
 The sender defaults as for gc mail send; with no identity the reply is
 refused, and --from overrides it (--from human replies as the operator).
 
+With --context/--city-url the reply is sent inside a REMOTE city (the reply
+is addressed by that city to the original sender); the sender is
+"&lt;local city&gt;/&lt;identity&gt;" and --notify is refused.
+
 ```
 gc mail reply <id> [-s subject] [-m body] [flags]
 ```
@@ -2743,7 +2755,10 @@ a non-running recipient. Unread mail alone does not request a wake.
 Use --from to override the sender identity.
 Use --to as an alternative to the positional &lt;to&gt; argument.
 Use -s/--subject for the summary line and -m/--message for the body text.
-Use --all to broadcast to all live sessions (excluding sender and "human").
+Use --all to broadcast to every OPEN session (excluding sender and "human").
+Configured seats with no open session get nothing; --all names them on stderr
+(and in --json "unreached"). For a policy-bearing broadcast, mail those seats
+by address, which materializes them.
 
 Use --dedup &lt;key&gt; for repeating notifications (patrol and cooldown orders
 that re-detect the same condition every run): the send is suppressed while
@@ -2754,6 +2769,26 @@ alert again; senders that want a longer re-alert cadence keep their own
 last-sent state. Dedup needs a provider that can query its own message
 history. The built-in provider can; one that cannot sends normally and says
 so on stderr, because a duplicate notification beats a dropped one.
+
+With --context/--city-url the message is sent to a REMOTE city over the
+control plane (a hardened city requires the context's grant_command). The
+sender then defaults to "&lt;local city&gt;/&lt;identity&gt;" (e.g. citadel/mayor) so the
+far side knows which city to answer with 'gc --context &lt;city&gt; mail send';
+--from overrides it. The remote city stores an unknown sender literally, but
+if it has a session whose alias equals that string (a rig named after the
+sending city) the message binds to that session — do not name a rig after a
+city that mails you. --all and --notify are refused for a remote city.
+
+When [mail.crosscity] is configured, a recipient may be city-qualified:
+&lt;city&gt;/&lt;address&gt;, split on the first "/". This city's own name strips to the
+local form (&lt;city&gt;/mayor and mayor are one mailbox); a listed peer city's
+address is stored canonical as written, with no local session lookup, and the
+sender is stored city-qualified so a plain reply resolves back. --notify does
+not cross cities: the recipient's wake belongs to its own city's mail sweep.
+A peer city mapped to a town under [mail.crosscity.towns] is also checked
+against that town's rendered roster (cities/&lt;town&gt;/agents.json, read from the
+local pack cache at its pinned commit): a seat absent from the list, or a
+list that cannot be read, refuses the send before anything is stored.
 
 ```
 gc mail send [<to>] [<body>] [flags]
@@ -2774,12 +2809,14 @@ gc mail send worker -s "disk warning" --dedup "disk-warn:hq"
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--all` | bool |  | broadcast to all live sessions (excludes sender and human) |
+| `--all` | bool |  | broadcast to every open session (excludes sender and human); names configured seats it could not reach |
 | `--dedup` | string |  | suppress the send while a live message with this dedup key is in the same mailbox (provider permitting) |
 | `--from` | string |  | sender identity (default: $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or the order run; refused when none) |
 | `--json` | bool |  | emit JSONL result |
 | `-m`, `--message` | string |  | message body text |
-| `--notify` | bool |  | request a recipient turn (including a managed wake if not running), even with earlier unread mail |
+| `--no-notify` | bool |  | suppress the default recipient nudge for a direct local send |
+| `--notify` | bool |  | request a recipient turn (including a managed wake if not running), even with earlier unread mail (the default for direct local sends; see --no-notify) |
+| `--ref` | string |  | https URL (GitHub) where the actionable content lives — required when the notified recipient is a cloud-wake seat; its wake hint points here instead of the mail bead |
 | `-s`, `--subject` | string |  | message subject line |
 | `--to` | string |  | recipient address (alternative to positional argument) |
 
@@ -4352,7 +4389,9 @@ gc session
 | Subcommand | Description |
 |------------|-------------|
 | [gc session attach](#gc-session-attach) | Attach to (or resume) a chat session |
+| [gc session bind-cloud](#gc-session-bind-cloud) | Bind a seat to a Claude Code cloud session for claude-cloud wake delivery |
 | [gc session close](#gc-session-close) | Close a session permanently |
+| [gc session history](#gc-session-history) | List an agent's past conversations |
 | [gc session kill](#gc-session-kill) | Force-kill session runtime |
 | [gc session list](#gc-session-list) | List chat sessions |
 | [gc session logs](#gc-session-logs) | Show session logs for a session |
@@ -4363,6 +4402,7 @@ gc session
 | [gc session prune](#gc-session-prune) | Close old dormant sessions |
 | [gc session rename](#gc-session-rename) | Rename a session |
 | [gc session reset](#gc-session-reset) | Restart a session fresh while preserving the bead |
+| [gc session resume](#gc-session-resume) | Resume one of an agent's past conversations |
 | [gc session submit](#gc-session-submit) | Submit a message with semantic delivery intent |
 | [gc session suspend](#gc-session-suspend) | Suspend a session (save state, free resources) |
 | [gc session unpin](#gc-session-unpin) | Remove a session awake pin |
@@ -4383,6 +4423,32 @@ Accepts a session ID (e.g., gc-42) or session alias (e.g., mayor).
 gc session attach <session-id-or-alias>
 ```
 
+## gc session bind-cloud
+
+Bind a seat's session bead to a Claude Code cloud session so the
+claude-cloud wake transport (wake_transport = "claude-cloud" on the agent)
+can deliver wake hints into it.
+
+A binding is two facts stamped on the session bead: the cloud session ID
+(session_...) and the account lineage directory (CLAUDE_CONFIG_DIR) that
+owns the cloud session — sends run under that lineage only, never ambient
+auth. Re-running the command rebinds and clears any suspect marker a failed
+send left behind (rebinding IS the explicit recovery action the suspect
+state waits for). --clear removes the binding and its delivery-state facts.
+
+The binding is inert until the seat's agent config selects
+wake_transport = "claude-cloud".
+
+```
+gc session bind-cloud <session-id-or-alias> [flags]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--account-dir` | string |  | account lineage directory (CLAUDE_CONFIG_DIR) that owns the cloud session |
+| `--clear` | bool |  | remove the cloud binding and its delivery-state facts |
+| `--cloud-id` | string |  | cloud session ID (session_...) |
+
 ## gc session close
 
 End a conversation. Stops the runtime if active and closes the bead.
@@ -4401,6 +4467,52 @@ gc session close <session-id-or-alias> [flags]
 |------|------|---------|-------------|
 | `--json` | bool |  | emit JSONL |
 | `--key` | string |  | idempotency key: while the op journal records this command (its [ops] gate is auto or require), rerunning with the same key reports the first run's outcome instead of acting again (without the first run's wait_nudges_withdrawn in --json); ignored when the gate is off (default: a new key each run) |
+
+## gc session history
+
+List the past provider conversations recorded for an agent, newest first.
+
+The filesystem is the authoritative index: claude-family providers write one
+transcript per conversation under &lt;config-dir&gt;/projects/&lt;workdir-slug&gt;/, so
+every conversation an agent ever had in its work directory is listed — including
+conversations whose session beads were closed long ago, and transcripts moved
+into ~/.claude-transcript-archive/ by the transcript reaper (marked "archived").
+
+A session whose process ran outside its work directory (in the git worktree of
+a task it was assigned) has those conversations under that cwd's slug instead.
+The conversations recorded on its session bead (session_key,
+prior_session_key) are found by id under any projects folder, and the folders
+of its bead's work dirs and of its in-progress tasks' work_dirs are listed too.
+Tasks are looked up in the city bead store and in every rig's bead store, the
+stores the reconciler reads, all under one 10 s budget; a store that fails or
+does not answer in time is named on stderr and skipped, and then a "no
+conversations found" says the search was incomplete and the JSON carries
+incomplete: true and skipped_lookups. Those folders can be shared with other agents, and so can
+a pool instance's own work dir or one under .gc/worktrees/, so from them only
+conversations whose id is on the bead are taken, plus, for a named or aliased
+session that is not a pool instance, conversations recorded under that name.
+The JSON row's found_under is the work dir of the projects folder the row was
+found under.
+
+The session id shown for each row is what "gc session resume" takes.
+
+```
+gc session history <agent> [flags]
+```
+
+**Example:**
+
+```
+gc session history lana
+gc session history qcore/lana --limit 50
+gc session history mayor --json
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--archive-root` | string |  | transcript archive root to search (default ~/.claude-transcript-archive) |
+| `--json` | bool |  | JSON output |
+| `--limit` | int | `20` | maximum conversations to list (0 = all) |
 
 ## gc session kill
 
@@ -4672,6 +4784,55 @@ gc session reset <session-id-or-alias> [flags]
 | `--json` | bool |  | emit JSONL |
 | `--key` | string |  | idempotency key: while the op journal records this command (its [ops] gate is auto or require), rerunning with the same key reports the first run's outcome instead of acting again; ignored when the gate is off (default: a new key each run) |
 
+## gc session resume
+
+Put an agent back into a past conversation listed by "gc session history".
+
+By default this seeds the agent's session bead with the chosen conversation id
+and requests a wake, so the reconciler's normal resume path tries that exact
+conversation — including for wake_mode=fresh agents that never auto-resume, and
+for on-demand crew whose context is normally lost on idle-close. The agent must
+not be running (attach to a running agent instead, or use --print).
+
+resume never moves a live transcript. The next launch resumes the
+conversation only if the transcript is under the projects folder of that
+launch's cwd (the work_dir of an in-progress task assigned to the agent, else
+its work dir); otherwise the reconciler starts a fresh one. The output says
+which work dir the transcript was found under.
+
+--print changes no session state and prints the provider command for an
+attended dive in your own terminal, run from the work dir whose projects folder
+holds the conversation. When that work dir cannot be used (it does not exist, or which
+work dir the folder belongs to could not be determined), it prints the agent's
+work dir instead and says on stderr what it found.
+
+Selecting a transcript that the reaper moved into the archive restores it
+(copies it) into the live projects directory first, so the provider can find
+it again; --print does that restore too, and notes it on stderr so stdout
+stays the one command.
+
+session-id may be any unambiguous prefix of an id from "gc session history".
+Note: "gc session pin" (pin_awake) prevents the idle-close that loses context
+in the first place — resume is the after-the-fact escape hatch.
+
+```
+gc session resume <agent> [session-id] [flags]
+```
+
+**Example:**
+
+```
+gc session resume lana --last
+gc session resume lana 8dc18f31
+gc session resume mayor 9e82b97a --print
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--archive-root` | string |  | transcript archive root to search (default ~/.claude-transcript-archive) |
+| `--last` | bool |  | resume the most recent conversation |
+| `--print` | bool |  | print the provider resume command instead of seeding the session bead |
+
 ## gc session submit
 
 Submit a user message to a session without choosing provider transport details.
@@ -4702,6 +4863,14 @@ gc session submit mayor "stop and do this instead" --intent interrupt_now
 Suspend an active session by stopping its runtime process.
 The session bead persists and can be resumed later.
 
+The hold is durable: a suspended session that still owns assigned work stays
+asleep rather than being restarted to serve it, and its pool slot and claim are
+left alone. It comes back on `gc session wake`.
+
+Where session liveness is kept in a separate store, this holds only while that
+store can be read: a reconciler tick that cannot read it may still restart a
+held session that owns assigned work.
+
 Accepts a session ID (e.g., gc-42) or session alias (e.g., mayor).
 
 ```
@@ -4730,7 +4899,16 @@ gc session unpin <session-id-or-alias> [flags]
 
 ## gc session wait
 
-Register a dependency wait for a session
+Register a durable wait so a session is woken when the beads it depends on close.
+
+With --sleep the session takes a wait hold and drains to sleep. The hold is
+durable: a wait-held session that still owns assigned work stays asleep rather
+than being restarted to serve it, and its pool slot and claim are left alone. It
+comes back when the wait resolves, or on `gc session wake`.
+
+Where session liveness is kept in a separate store, this holds only while that
+store can be read: a reconciler tick that cannot read it may still restart a
+held session that owns assigned work.
 
 ```
 gc session wait [session-id-or-alias] [flags]
@@ -4833,6 +5011,8 @@ Output includes:
   - Imported pack shared skills (binding-qualified, e.g. ops.code-review)
   - Compatibility bootstrap skills, when legacy implicit imports still exist
   - With --agent/--session: that agent's agents/&lt;name&gt;/skills/ catalog
+    and the opt-in skills its opt_in_skills selects (a pack's
+    skills/opt-in/&lt;name&gt;/, binding-qualified)
 
 The listing is a diagnostic view of what's *available*. It does not
 collapse precedence, filter to agents whose provider has a vendor
@@ -4903,7 +5083,7 @@ gc sling [target] <bead-or-formula-or-text> [flags]
 | `--force` | bool |  | suppress warnings, allow cross-rig routing, allow formulas v2 workflow replacement, and for direct bead routes dispatch even if the bead does not resolve in the local store |
 | `-f`, `--formula` | bool |  | treat argument as formula name |
 | `--json` | bool |  | Output dispatch result in JSON format |
-| `--merge` | string |  | merge strategy: direct, mr, or local |
+| `--merge` | string |  | merge strategy: direct, pr, mr, or local |
 | `--no-convoy` | bool |  | skip auto-convoy creation |
 | `--no-formula` | bool |  | suppress default formula (route raw bead) |
 | `--nudge` | bool |  | nudge target after routing |
@@ -5219,6 +5399,7 @@ gc supervisor install [flags]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
+| `--acknowledge-freeze` | string |  | consciously supersede a standing deploy-freeze marker by its bead id (ga-rfdkxp) |
 | `--force` | bool |  | overwrite an existing service unit even if it references a different gc binary |
 
 ## gc supervisor logs
@@ -5342,7 +5523,7 @@ gc supervisor stop [flags]
 |------|------|---------|-------------|
 | `--json` | bool |  | emit JSONL summary |
 | `--wait` | bool |  | Wait for the supervisor to finish stopping all managed cities and for its process to exit before returning |
-| `--wait-timeout` | duration | `30s` | Maximum time to wait when --wait is set, except that the supervisor process gets at least 10s to exit after its socket closes (in delegated mode, bounds the synchronous systemctl stop regardless of --wait) |
+| `--wait-timeout` | duration | `1m30s` | Maximum time to wait when --wait is set, except that the supervisor process gets at least 10s to exit after its socket closes (in delegated mode, bounds the synchronous systemctl stop regardless of --wait) |
 
 ## gc supervisor uninstall
 
@@ -5805,3 +5986,11 @@ gc worktree verify [flags]
 | `--repo` | string |  | repository directory the worktree belongs to (required) |
 | `--root` | string |  | configured per-rig worktree root; path must be its direct child (required) |
 | `--store-ref` | string |  | work bead store reference (required) |
+
+## gc worktree-gc
+
+Preview both worktree reclamation classes without mutation. Per-bead cleanup is controlled by daemon.auto_reap_closed_bead_worktrees; longer-lived configured named/namepool home cleanup is separately controlled by daemon.auto_reap_stopped_agent_homes. Both require authoritative runtime, session, assignment, registration, and git-safety evidence.
+
+```
+gc worktree-gc
+```
