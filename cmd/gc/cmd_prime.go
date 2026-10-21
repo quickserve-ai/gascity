@@ -598,7 +598,11 @@ func doPrimeWithHookFormatOpts(args []string, stdout, stderr io.Writer, hookMode
 		fmt.Fprintf(stderr, "gc prime: warning: agent %q not found in city config; rendering the generic prompt (a session-table alias is not an agent name — use the configured name, e.g. <rig>/<pack>.<agent>)\n", agentName) //nolint:errcheck
 	}
 	injection := primeHookContextSuffix(cityPath, sessionStart, hookMode, hookContext, stderr, consumeHandoff)
-	writePrimePromptWithFormat(stdout, cityName, agentName, defaultPrimePrompt, hookMode, hookFormat, suppressHookPrompt, injection.text, injection.afterDelivery)
+	prompt := defaultPrimePrompt
+	if hookMode {
+		prompt, injection = fitPrimeHookInjection(primeSeatForFallback(cityPath, cityName, agentName, resolvedAgents, cfg), prompt, suppressHookPrompt, injection, stderr)
+	}
+	writePrimePromptWithFormat(stdout, cityName, agentName, prompt, hookMode, hookFormat, suppressHookPrompt, injection.text, injection.afterDelivery)
 	return 0, nil
 }
 
@@ -751,6 +755,20 @@ func primeSeatForHook(cityPath, cityName, agentName string, a *config.Agent, cfg
 		sessionName: primeSeatSessionName(cityPath, cityName, a, cfg.Workspace.SessionTemplate),
 		capped:      primeHookContextCapped(resolved),
 	}
+}
+
+// primeSeatForFallback describes the seat a generic-prompt hook is fitted
+// for: the last agent the name resolved to (every resolved agent reaching the
+// fallback rendered no prompt of its own), or, when it resolved to none (a
+// hook under an alias), the workspace provider. As on the agent paths, a
+// provider that does not resolve is treated as uncapped.
+func primeSeatForFallback(cityPath, cityName, agentName string, agents []config.Agent, cfg *config.City) primeHookSeat {
+	var a config.Agent
+	if len(agents) > 0 {
+		a = agents[len(agents)-1]
+	}
+	resolved, _ := config.ResolveProvider(&a, &cfg.Workspace, cfg.Providers, exec.LookPath)
+	return primeSeatForHook(cityPath, cityName, agentName, &a, cfg, resolved)
 }
 
 // fitPrimeHookInjection applies primeHookFitContext to a prompt and its hook

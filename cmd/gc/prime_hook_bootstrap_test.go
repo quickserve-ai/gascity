@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/gastownhall/gascity/internal/beads"
 )
 
 // TestDoPrimeWithHook_OversizedPromptBootstrap drives the SessionStart hook
@@ -111,6 +113,62 @@ func TestDoPrimeWithHook_OversizedPromptBootstrap(t *testing.T) {
 			}
 			if !bytes.Equal(got, want.Bytes()) {
 				t.Fatalf("prompt file (%d bytes) differs from gc prime output (%d bytes)", len(got), want.Len())
+			}
+		})
+	}
+}
+
+// TestDoPrimeWithHook_GenericFallbackBoundsContext drives the SessionStart
+// hook down the generic-prompt branch (a seat with no prompt template and no
+// builtin prompt, and a hook under an alias that names no agent) with a 12 KB
+// assignment. The delivered context must stay under the limit, with the
+// assignment in the seat's context file.
+func TestDoPrimeWithHook_GenericFallbackBoundsContext(t *testing.T) {
+	for _, tc := range []struct{ name, alias string }{
+		{name: "agent without prompt", alias: "worker"},
+		{name: "alias naming no agent", alias: "helper"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clearGCEnv(t)
+			disableManagedDoltRecoveryForTest(t)
+			t.Setenv("GC_BEADS", "file")
+			cityDir := t.TempDir()
+			writePrimeHookTestFile(t, filepath.Join(cityDir, "city.toml"), "[workspace]\nname = \"gastown\"\nprovider = \"claude\"\n\n[providers.claude]\nbase = \"builtin:claude\"\n\n[[agent]]\nname = \"worker\"\n")
+			store, err := openCityStoreAt(cityDir)
+			if err != nil {
+				t.Fatalf("openCityStoreAt: %v", err)
+			}
+			mol := mustCreateInProgressStore(t, store, beads.Bead{Title: "Formula: mol-worker", Type: "molecule", Assignee: tc.alias})
+			assignment := strings.Repeat("assignment detail line\n", 540) // ~12 KB
+			mustCreateInProgressStore(t, store, beads.Bead{Title: "Step 1: the big one", Description: assignment, Type: "step", Assignee: tc.alias, ParentID: mol.ID})
+			t.Setenv("GC_CITY", cityDir)
+			t.Setenv("GC_AGENT", tc.alias)
+			t.Setenv("GC_ALIAS", tc.alias)
+			t.Setenv("GC_SESSION_NAME", "gastown--"+tc.alias)
+			t.Setenv("GC_SESSION_ID", createPrimeHookSession(t, cityDir, "gastown--"+tc.alias, tc.alias))
+			t.Setenv(managedSessionHookEnv, "1")
+			t.Setenv("GC_HOOK_EVENT_NAME", "SessionStart")
+			withPrimeHookStdin(t)
+
+			var stdout, stderr bytes.Buffer
+			if code := doPrimeWithHookFormat(nil, &stdout, &stderr, true, hookOutputFormatCodex, false); code != 0 {
+				t.Fatalf("gc prime --hook = %d, want 0; stderr=%q", code, stderr.String())
+			}
+			var out struct {
+				HookSpecificOutput struct {
+					AdditionalContext string `json:"additionalContext"`
+				} `json:"hookSpecificOutput"`
+			}
+			if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+				t.Fatalf("hook output is not JSON: %v (stderr %q)", err, stderr.String())
+			}
+			context := out.HookSpecificOutput.AdditionalContext
+			if len(context) >= primeHookContextLimit {
+				t.Fatalf("generic-fallback context is %d bytes, want under %d (stderr %q)", len(context), primeHookContextLimit, stderr.String())
+			}
+			got, err := os.ReadFile(filepath.Join(cityDir, ".gc", "sessions", "gastown--"+tc.alias, primeHookContextFileName))
+			if err != nil || !strings.Contains(string(got), strings.TrimSpace(assignment)) {
+				t.Fatalf("context file does not hold the assignment (%d bytes, err %v)", len(got), err)
 			}
 		})
 	}
