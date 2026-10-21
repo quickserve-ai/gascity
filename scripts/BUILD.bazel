@@ -58,6 +58,12 @@ sh_test(
 # it is larger than the CGO_ENABLED=0 release-shaped build the script's
 # default cap is measured against: 207,034,352 bytes at 9fdc52d82c versus
 # 180,287,491 for the release shape. The cap keeps the same ~5.4% headroom.
+#
+# The fork's carry: the cap is 231000000, not upstream's 218000000, the same
+# ~5.4% headroom over 219,091,984 bytes measured at the re-sync #8 cert head
+# on the CI runner (Go 1.26.10, cgo, RBE worker env held at 0c6c05c2 for that
+# run). Re-measured at every re-sync; dropped once upstream's cap is at or
+# above the fork's measurement.
 sh_test(
     name = "check_native_dependency_surface_test",
     srcs = ["check-native-dependency-surface.sh"],
@@ -69,7 +75,7 @@ sh_test(
         "//:go.sum",
         "//cmd/gc",
     ],
-    env = {"GC_NATIVE_DEP_MAX_BINARY_BYTES": "218000000"},
+    env = {"GC_NATIVE_DEP_MAX_BINARY_BYTES": "231000000"},
 )
 
 go_test(
