@@ -21,7 +21,7 @@ import (
 func journalCache(t *testing.T) (*beads.CachingStore, *opjournal.Store, *events.Fake) {
 	t.Helper()
 	ep := events.NewFake()
-	store := wrapWithCachingStore(context.Background(), &beads.MemStore{HonorExplicitIDs: true}, ep, true)
+	store := wrapWithCachingStore(context.Background(), &beads.MemStore{HonorExplicitIDs: true}, ep, true, "", "")
 	cache, ok := store.(*beads.CachingStore)
 	if !ok {
 		t.Fatalf("wrapWithCachingStore returned %T, want *beads.CachingStore", store)

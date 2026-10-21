@@ -223,7 +223,7 @@ func TestBeadPolicyStoreChildrenOfAnyAgreesWithItsChildren(t *testing.T) {
 		seed(beads.Bead{Title: "durable child", ParentID: p.ID})
 		seed(beads.Bead{Title: "wisp child", ParentID: p.ID, Ephemeral: true})
 	}
-	stack := wrapWithCachingStore(context.Background(), wrapStoreWithBeadPolicies(fake.NewBdStore(), &config.City{}), nil, false)
+	stack := wrapWithCachingStore(context.Background(), wrapStoreWithBeadPolicies(fake.NewBdStore(), &config.City{}), nil, false, "", "")
 
 	ids := func(bs []beads.Bead) []string {
 		out := make([]string, 0, len(bs))

@@ -206,7 +206,7 @@ func TestNudgeSendPathLeavesNonClaudeProvidersOnSendKeys(t *testing.T) {
 		tm.exec = fe
 
 		single := sizedNudge(2646)
-		if err := tm.sendKeysLiteralWithRetry("%1", single, time.Second); err != nil {
+		if err := tm.sendKeysLiteralWithRetry(context.Background(), "%1", single, time.Second); err != nil {
 			t.Fatalf("sendKeysLiteralWithRetry() = %v, want nil", err)
 		}
 		if literal := fe.literalSends(); len(literal) != 1 || literal[0] != single {
@@ -222,7 +222,7 @@ func TestNudgeSendPathLeavesNonClaudeProvidersOnSendKeys(t *testing.T) {
 		tm := NewTmuxWithConfig(DefaultConfig())
 		tm.exec = fe
 
-		if err := tm.sendKeysLiteralWithRetry("%1", text, time.Second); err != nil {
+		if err := tm.sendKeysLiteralWithRetry(context.Background(), "%1", text, time.Second); err != nil {
 			t.Fatalf("sendKeysLiteralWithRetry() = %v, want nil", err)
 		}
 		if literal := fe.literalSends(); len(literal) != 0 {
