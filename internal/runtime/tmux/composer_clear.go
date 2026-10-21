@@ -297,11 +297,13 @@ func (t *Tmux) clearInputBeforePaste(ctx context.Context, session, target string
 
 // clearHeldDraft empties target's composer of the message a nudge typed
 // before a running turn held its interrupting submit back for the whole
-// confirm window (see nudgeSession). The draft is gc's own, so it is cleared
-// with a client attached too. Codex's Ctrl-U deletes one line of a draft at a
-// time (the cursor's line, or the line break before an empty one), so it
-// presses Ctrl-U until the composer reads empty (see emptyComposer). mayType
-// runs before every press and stops the clear with its error.
+// confirm window (see nudgeSession). The draft is gc's own, but nudgeSession
+// clears it only with no client attached, since a person attached may be
+// composing in the same composer (ga-ubfc7j). Codex's Ctrl-U deletes one line
+// of a draft at a time (the cursor's line, or the line break before an empty
+// one), so it presses Ctrl-U until the composer reads empty (see
+// emptyComposer). mayType runs before every press and stops the clear with its
+// error.
 func (t *Tmux) clearHeldDraft(ctx context.Context, target string, mayType func() error) error {
 	read := func() ([]string, error) { return t.captureInputLines(target) }
 	press := func() error {

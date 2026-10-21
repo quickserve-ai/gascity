@@ -863,15 +863,31 @@ func TestCodexStartupNudgeHoldsItsSubmitWhileATurnRuns(t *testing.T) {
 	assertHeldSubmitDeferred(t, pane, err)
 }
 
-// TestCodexHeldSubmitClearsItsDraftWithAClientAttached: the clear before the
+// TestCodexHeldSubmitLeavesItsDraftWithAClientAttached: the clear before the
 // paste is skipped while a client is attached, since a human may be typing,
-// but the message a held submit leaves typed is gc's own and is cleared
-// anyway: a deferral must leave nothing typed behind.
-func TestCodexHeldSubmitClearsItsDraftWithAClientAttached(t *testing.T) {
+// and so is the clear of the message a held submit leaves typed. That message
+// is gc's own, but a person attached may be composing in the same composer,
+// and a Ctrl-U erases their text with it (ga-ubfc7j: a deliberate carry
+// difference; upstream clears it with a client attached). No key reaches the
+// pane, the message stays typed, and the nudge is neither a deferral, which
+// promises nothing typed is left, nor an unconfirmed submit, since none was
+// sent: it fails with errNudgeSubmitHeld.
+func TestCodexHeldSubmitLeavesItsDraftWithAClientAttached(t *testing.T) {
 	pane, err := runCodexStartupNudge(t, "codex-startup-busy-attached", codexTurnMarker, func(p *codexTurnPane) {
 		p.attached = true
 	})
-	assertHeldSubmitDeferred(t, pane, err)
+	if !errors.Is(err, errNudgeSubmitHeld) || errors.Is(err, runtime.ErrSessionBusy) || errors.Is(err, runtime.ErrNudgeDeliveryUnconfirmed) {
+		t.Fatalf("nudgeStartupSession = %v, want errNudgeSubmitHeld, neither runtime.ErrSessionBusy nor unconfirmed", err)
+	}
+	if keys := pane.keysPressed(); slices.Contains(keys, "C-u") || slices.Contains(keys, "Escape") || slices.Contains(keys, "Enter") {
+		t.Fatalf("keys = %q, want no key sent into an attached session", keys)
+	}
+	if _, aborted, _ := pane.snapshot(); aborted != 0 {
+		t.Fatalf("aborted %d turn(s), want none", aborted)
+	}
+	if draft := pane.composer(); draft != codexTurnMarker {
+		t.Fatalf("composer holds %q, want the message still typed", draft)
+	}
 }
 
 // TestCodexHeldSubmitClearsAMultilineDraft: Codex's Ctrl-U deletes one line

@@ -74,6 +74,7 @@ go_test(
         "claude_busy_indicator_test.go",
         "claude_interrupt_test.go",
         "codex_background_stop_test.go",
+        "codex_held_submit_attach_test.go",
         "codex_stop_turn_test.go",
         "codex_submit_test.go",
         "codex_submit_turn_test.go",
