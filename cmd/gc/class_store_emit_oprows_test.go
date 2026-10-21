@@ -118,7 +118,7 @@ func TestCLIJournalRowWritesReachOpChangedThroughTheDoorbell(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	// Served from its synchronous prime, with no background refresh to race.
-	cache, ok := wrapWithCachingStore(context.Background(), leaf, ep, true).(*beads.CachingStore)
+	cache, ok := wrapWithCachingStore(context.Background(), leaf, ep, true, "", "").(*beads.CachingStore)
 	if !ok {
 		t.Fatal("no cache")
 	}
@@ -199,7 +199,7 @@ func newDoorbellRig(t *testing.T, leaf, backing beads.Store, answer func(n int) 
 	t.Helper()
 	r := &doorbellRig{ep: events.NewFake()}
 	ctx, cancel := context.WithCancel(context.Background())
-	cache, ok := wrapWithCachingStore(context.Background(), backing, r.ep, true).(*beads.CachingStore)
+	cache, ok := wrapWithCachingStore(context.Background(), backing, r.ep, true, "", "").(*beads.CachingStore)
 	if !ok {
 		t.Fatal("no cache")
 	}
