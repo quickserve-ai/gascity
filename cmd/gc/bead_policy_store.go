@@ -350,6 +350,11 @@ var (
 // per-parent read returns. A wrapped store without the batch is read one
 // parent at a time through this layer's Children.
 //
+// The batch's rows carry the session-liveness overlay, as Children's do
+// (Children reads through List): which path answers is a capability of the
+// wrapped store, and it must not decide whether a caller reads fresh
+// telemetry or committed metadata (ga-lys454).
+//
 // Explicit for the reason DepListBatch above is: the embedded Store interface
 // does not promote optional capabilities, so a silent wrapper sends
 // molecule.ListSubtree back to one `bd list --parent` plus one `bd query` per
@@ -360,7 +365,7 @@ func (s *beadPolicyStore) ChildrenOfAny(parentIDs []string, opts ...beads.QueryO
 	if !ok {
 		return beads.ChildrenOfAnyPerParent(s, parentIDs, opts...)
 	}
-	return batch.ChildrenOfAny(parentIDs, policyTierQueryOpts(opts)...)
+	return s.overlayResult(batch.ChildrenOfAny(parentIDs, policyTierQueryOpts(opts)...))
 }
 
 // policyTierQueryOpts restates opts' tier as the policy layer reads it
