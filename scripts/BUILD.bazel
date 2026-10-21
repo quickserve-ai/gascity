@@ -62,8 +62,10 @@ sh_test(
 # The fork's carry: the cap is 231000000, not upstream's 218000000, the same
 # ~5.4% headroom over 219,091,984 bytes measured at the re-sync #8 cert head
 # on the CI runner (Go 1.26.10, cgo, RBE worker env held at 0c6c05c2 for that
-# run). Re-measured at every re-sync; dropped once upstream's cap is at or
-# above the fork's measurement.
+# run). Re-measured at every re-sync with the certification build
+# configuration; dropped once upstream's own cap admits that fresh
+# measurement and the unchanged upstream guard passes, not on a comparison
+# with the number above.
 sh_test(
     name = "check_native_dependency_surface_test",
     srcs = ["check-native-dependency-surface.sh"],
