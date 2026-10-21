@@ -163,9 +163,11 @@ func primeHookFitContext(seat primeHookSeat, prompt string, suppressPrompt bool,
 	}
 	if err != nil {
 		fmt.Fprintf(stderr, "gc prime: hook context is %d bytes, over the %d-byte hook limit, and could not be written to a file: %v\n", overhead+len(delivered)+len(suffix), primeHookContextLimit, err) //nolint:errcheck // diagnostics are best effort.
-		notice := primeHookWriteFailureNotice(seat.agentName, len(delivered), err, budget)
+		// The error text gives way to the suffix first; the suffix is dropped
+		// only when even a cut notice cannot share the budget with it.
+		notice := primeHookWriteFailureNotice(seat.agentName, len(delivered), err, budget-len(suffix))
 		if len(notice)+len(suffix) > budget {
-			return "", notice, false
+			return "", primeHookWriteFailureNotice(seat.agentName, len(delivered), err, budget), false
 		}
 		return "", notice + suffix, true
 	}
