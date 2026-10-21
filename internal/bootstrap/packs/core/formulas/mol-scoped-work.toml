@@ -198,7 +198,7 @@ Remove the temporary worktree after the body reaches terminal state.
 The body reaching a terminal state does not mean the work is finished with its
 tree. After a hand-off submit the work bead is still open and its convoy still
 live, and the tree can be a running session's working directory. So the step
-first DECLINES (ga-6xehc5): while the work bead is not closed, the convoy is
+first DECLINES: while the work bead is not closed, the convoy is
 not closed, and work_dir names a tree that exists and is not empty, nothing is
 rescued or removed and work_dir is kept. The decline comments once on the work
 bead (a repeat decline for the same tree does not comment again), emits a
@@ -211,7 +211,7 @@ so the step stops rather than tears down.
 
 The worktree may hold the only copy of the work: uncommitted edits, untracked
 files, or commits on a detached HEAD that no ref reaches. Teardown therefore
-SECURES LOCALLY FIRST and removes second (ga-w805wc):
+SECURES LOCALLY FIRST and removes second:
 
 1. `gc worktree rescue` snapshots everything that is not gitignored into
    refs/rescue/<bead> in the repository's shared ref store, which removing the
