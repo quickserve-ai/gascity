@@ -145,7 +145,7 @@ for attempt in 1 2 3; do
 done
 ```
 
-**3. Clean up worktree (secure locally first, ga-w805wc):**
+**3. Clean up worktree (secure locally first):**
 
 Tear down the worktree the BEAD records, never whatever the current directory
 happens to be. `gc worktree rescue` makes everything the tree holds reachable
