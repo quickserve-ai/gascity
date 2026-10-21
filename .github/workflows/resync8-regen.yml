@@ -1,0 +1,304 @@
+# Re-sync #8 regeneration (throwaway; lives only on navani/gc-q2di-resync8-regen).
+#
+# The laptop that prepared cert8 runs no compiler, so this job is the
+# compiler: it runs every generator whose committed output the replay left
+# stale, at the pushed head, and uploads the resulting diff (regen.patch,
+# regen.stat) and one log per step as the artifact resync8-regen. Nothing is
+# pushed back. Each generator is its own step with continue-on-error, so one
+# failure still leaves the others' output and its own log.
+#
+# Order is inputs before outputs: the command census first (cmd/gc does not
+# compile without it, and genschema builds cmd/gc), then genspec before the
+# Go client, the TypeScript client before the SPA bundle, the test-driven
+# rewrites, formatting (goimports can change imports), and gazelle last over
+# the final Go sources.
+name: resync8-regen
+
+on:
+  push:
+    branches: [navani/gc-q2di-resync8-regen]
+
+permissions:
+  contents: read
+
+jobs:
+  regenerate:
+    name: regenerate
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GOTOOLCHAIN: local
+      # The hermetic git config TESTING.md's TEST_ENV pins for go test.
+      GIT_CONFIG_NOSYSTEM: "1"
+      GIT_CONFIG_GLOBAL: /dev/null
+    steps:
+      - name: Free runner disk (the Bazel step fetches a 1.9 GB LLVM archive)
+        continue-on-error: true
+        run: |
+          set -x
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      # The dashboard web package pins Node 22 (.nvmrc, engines >=22.13.0);
+      # 22.23.2 is the exact release MODULE.bazel's rules_js toolchain builds
+      # the committed client and bundle with.
+      - uses: actions/setup-node@cdca7365b2dadb8aad0a33bc7601856ffabcc48e # v4
+        with:
+          node-version: "22.23.2"
+
+      - name: Prepare the log directory
+        run: |
+          set -x
+          mkdir -p "$RUNNER_TEMP/resync8-regen/logs"
+          { set -x; go version; node --version; npm --version; git log -1 --format='%H %s'; } 2>&1 | tee "$RUNNER_TEMP/resync8-regen/logs/00-environment.log"
+
+      - name: go mod download
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          set -x
+          { set -x; go mod download; } 2>&1 | tee "$RUNNER_TEMP/resync8-regen/logs/01-go-mod-download.log"
+
+      # Command census: cmd/gc/metrics_census_gen.go,
+      # internal/productmetrics/command_ids_gen.go and
+      # schemas/metrics/example/result.schema.json from
+      # cmd/gc/productmetrics_command_census.json
+      # (TestCommittedCommandCensusArtifactsAreFresh).
+      - name: gen-command-census
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          set -x
+          { set -x; go run ./cmd/gen-command-census -root "$GITHUB_WORKSPACE"; } 2>&1 | tee "$RUNNER_TEMP/resync8-regen/logs/02-gen-command-census.log"
+
+      # make generate: docs/reference/schema/{city,pack}-schema.{json,txt},
+      # docs/reference/config.md, and docs/reference/cli.md (via
+      # `go run ./cmd/gc gen-doc`).
+      - name: genschema (make generate)
+        continue-on-error: true
+        timeout-minutes: 20
+        run: |
+          set -x
+          { set -x; go run ./cmd/genschema; } 2>&1 | tee "$RUNNER_TEMP/resync8-regen/logs/03-genschema.log"
+
+      # make spec-ci without its drift and breaking-change checks:
+      # internal/api/openapi.json and docs/reference/schema/{openapi,events}.{json,txt}.
+      - name: genspec
+        continue-on-error: true
+        timeout-minutes: 15
+        run: |
+          set -x
+          { set -x; go run ./cmd/genspec; } 2>&1 | tee "$RUNNER_TEMP/resync8-regen/logs/04-genspec.log"
+
+      # internal/api/genclient/client_gen.go from the spec (scripts/gen-client.sh).
+      - name: genclient (go generate ./internal/api/genclient)
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          set -x
+          { set -x; go generate ./internal/api/genclient; } 2>&1 | tee "$RUNNER_TEMP/resync8-regen/logs/05-genclient.log"
+
+      - name: dashboard npm ci
+        continue-on-error: true
+        timeout-minutes: 15
+        working-directory: internal/api/dashboardspa/web
+        run: |
+          set -x
+          { set -x; npm ci; } 2>&1 | tee "$RUNNER_TEMP/resync8-regen/logs/06-dashboard-npm-ci.log"
+
+      # make dashboard-generate-client's npm twin (openapi-ts.config.ts says
+      # "regenerate with npm run generate:client"): the typed client under
+      # shared/src/generated/gc-supervisor-client from internal/api/openapi.json.
+      - name: dashboard typed client (openapi-ts)
+        continue-on-error: true
+        timeout-minutes: 10
+        working-directory: internal/api/dashboardspa/web
+        run: |
+          set -x
+          {
+            set -x
+            rm -rf shared/src/generated/gc-supervisor-client
+            npm run generate:client
+            chmod -R a-x,u+w,a+rX shared/src/generated/gc-supervisor-client
+          } 2>&1 | tee "$RUNNER_TEMP/resync8-regen/logs/07-dashboard-client.log"
+
+      # make dashboard-build-npm: the committed internal/api/dashboardspa/dist
+      # bundle, built over the client above. The permissions are normalised as
+      # make dashboard-build does after its Bazel copy.
+      - name: dashboard bundle (npm build into dashboardspa/dist)
+        continue-on-error: true
+        timeout-minutes: 15
+        working-directory: internal/api/dashboardspa/web
+        run: |
+          set -x
+          {
+            set -x
+            npm run build
+            rm -rf ../dist
+            cp -rf frontend/dist ../dist
+            chmod -R a-x,u+w,a+rX ../dist
+          } 2>&1 | tee "$RUNNER_TEMP/resync8-regen/logs/08-dashboard-bundle.log"
+
+      # The resource census (its own "regenerate with" text, without Bazel):
+      # test/test-resource-counts.toml and the TESTING.md checked ledger block.
+      - name: resource census -update
+        continue-on-error: true
+        timeout-minutes: 15
+        run: |
+          set -x
+          {
+            set -x
+            GC_TEST_REPO_ROOT="$GITHUB_WORKSPACE" go test ./internal/testpolicy/resourcecensus \
+              -run '^TestRepositoryLedgerMatchesCensusAndDocumentation$' -update -count=1 -timeout 15m
+          } 2>&1 | tee "$RUNNER_TEMP/resync8-regen/logs/09-resource-census.log"
+
+      # REPORT ONLY. scripts/runtime-tmux-tests.manifest and the count pins in
+      # scripts/runtime_tmux_manifest_test.go have no generator: they are
+      # maintained by hand. This step writes nothing; its log carries the
+      # tests' drift report (unassigned tests, shard and inventory counts).
+      - name: runtime-tmux manifest drift report (hand-maintained, no writes)
+        continue-on-error: true
+        timeout-minutes: 15
+        run: |
+          set -x
+          {
+            set -x
+            go test ./scripts -run '^TestRuntimeTmuxManifest' -count=1 -v -timeout 15m
+          } 2>&1 | tee "$RUNNER_TEMP/resync8-regen/logs/10-runtime-tmux-manifest-report.log"
+
+      # internal/config/testdata workquery goldens.
+      - name: workquery goldens -update
+        continue-on-error: true
+        timeout-minutes: 15
+        run: |
+          set -x
+          {
+            set -x
+            go test ./internal/config -run '^TestWorkQueryGolden$' -update -count=1 -timeout 15m
+          } 2>&1 | tee "$RUNNER_TEMP/resync8-regen/logs/11-workquery-golden.log"
+
+      # cmd/gc/testdata/session_differential/timeline{,_explained}.golden.
+      # The digests in reconcile_session_timeline_test.go's
+      # timelineGoldenRulings are source, not output: after the rewrite the
+      # test names every section no ruling admits, with its new digest, in
+      # this log. -gcflags=-e lists every compile error in cmd/gc, not ten.
+      - name: timeline goldens -update-golden
+        continue-on-error: true
+        timeout-minutes: 30
+        run: |
+          set -x
+          {
+            set -x
+            go test ./cmd/gc -gcflags=-e -run '^TestSessionTimelineDifferential$' -update-golden -count=1 -timeout 20m
+          } 2>&1 | tee "$RUNNER_TEMP/resync8-regen/logs/12-timeline-golden.log"
+
+      # REPORT ONLY. cmd/gc/testdata/legacy_raw_session_writes.golden has no
+      # update flag: TestLegacyRawSessionWrites names each file's count against
+      # its baseline, and the baseline is edited by hand.
+      - name: legacy raw session writes report (hand-maintained, no writes)
+        continue-on-error: true
+        timeout-minutes: 20
+        run: |
+          set -x
+          {
+            set -x
+            go test ./cmd/gc -gcflags=-e -run '^TestLegacyRawSessionWrites$' -count=1 -timeout 15m
+          } 2>&1 | tee "$RUNNER_TEMP/resync8-regen/logs/13-legacy-raw-session-writes-report.log"
+
+      # goimports + gofumpt (the repo's .golangci.yml formatters, golangci-lint
+      # as the Makefile pins it) over the Go files the steps above changed.
+      # Before gazelle: goimports can change a file's imports.
+      - name: goimports/gofumpt over changed Go files
+        continue-on-error: true
+        timeout-minutes: 15
+        run: |
+          set -x
+          {
+            set -x
+            GOBIN="$RUNNER_TEMP/bin" go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.0
+            # Generated files keep their generator's bytes: the freshness
+            # tests compare them byte for byte.
+            files=""
+            for f in $( { git diff --name-only -- '*.go'; git ls-files --others --exclude-standard -- '*.go'; } | sort -u); do
+              [ -f "$f" ] || continue
+              if head -n 5 "$f" | grep -q 'DO NOT EDIT'; then continue; fi
+              files="$files $f"
+            done
+            if [ -n "$files" ]; then
+              # shellcheck disable=SC2086 # one path per word
+              "$RUNNER_TEMP/bin/golangci-lint" fmt $files || gofmt -l -w $files
+              git diff --stat -- '*.go'
+            fi
+          } 2>&1 | tee "$RUNNER_TEMP/resync8-regen/logs/14-go-format.log"
+
+      # make bazel-sync's first half, as bazel.yml's "BUILD files are in sync"
+      # check runs it, local (no remote cache on a hosted runner). The npm
+      # steps' gitignored outputs go first so neither Bazel's package loading
+      # nor gazelle's walk meets them. A MODULE.bazel.lock rewrite by this
+      # runner's Bazel is kept as a log, not in the patch.
+      - name: gazelle (bazel run //:gazelle)
+        continue-on-error: true
+        timeout-minutes: 35
+        run: |
+          set -x
+          {
+            set -x
+            rm -rf internal/api/dashboardspa/web/node_modules internal/api/dashboardspa/web/*/node_modules internal/api/dashboardspa/web/*/dist
+            if command -v bazelisk >/dev/null; then B=bazelisk; else B=bazel; fi
+            "$B" version
+            "$B" run //:gazelle
+          } 2>&1 | tee "$RUNNER_TEMP/resync8-regen/logs/15-gazelle.log"
+
+      - name: Set aside a MODULE.bazel.lock rewrite
+        if: always()
+        continue-on-error: true
+        run: |
+          set -x
+          git diff -- MODULE.bazel.lock > "$RUNNER_TEMP/resync8-regen/logs/15-gazelle-module-bazel-lock.diff"
+          git restore -- MODULE.bazel.lock
+
+      # make bazel-sync's second half: plain python over the tree, run even
+      # when the Bazel step fails.
+      - name: bazel-sync scripts (repo tree, hermetic tags, integration suite)
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          set -x
+          {
+            set -x
+            python3 tools/bazel/repo_tree.py
+            python3 tools/bazel/hermetic_tags.py
+            python3 tools/bazel/integration_suite.py
+          } 2>&1 | tee "$RUNNER_TEMP/resync8-regen/logs/16-bazel-sync-scripts.log"
+
+      - name: Collect the regenerated diff
+        if: always()
+        run: |
+          set -x
+          out="$RUNNER_TEMP/resync8-regen"
+          mkdir -p "$out/logs"
+          git status --porcelain=v1 --untracked-files=all > "$out/status.txt"
+          git add -A -- . ':(exclude).github/workflows/resync8-regen.yml'
+          git diff --cached --binary > "$out/regen.patch"
+          git diff --cached --stat > "$out/regen.stat"
+          cat "$out/regen.stat"
+
+      - name: Upload resync8-regen
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: resync8-regen
+          path: ${{ runner.temp }}/resync8-regen/
+          if-no-files-found: error
+          retention-days: 14
