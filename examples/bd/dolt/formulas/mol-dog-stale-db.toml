@@ -352,7 +352,7 @@ fi
 #
 # The close runs with BEADS_ACTOR set to the identity the claim was recorded
 # under, because bd's ownership guard compares the closer's actor with the
-# assignee verbatim (we-m34w5). `gc hook --claim` picks that identity as
+# assignee verbatim. `gc hook --claim` picks that identity as
 # GC_ALIAS, then GC_SESSION_ID, then BEADS_ACTOR, GC_AGENT and
 # GC_SESSION_NAME (hookClaimAssigneeIdentity); the chain below mirrors it. The
 # session id must outrank BEADS_ACTOR: an unaliased pool dog claims under its
@@ -365,7 +365,7 @@ fi
 # A refused terminal close must leave evidence, never a clean drain: under
 # set -euo pipefail an unguarded failure aborts the script, the EXIT trap
 # still drain-acks, and the controller re-dispatches a fresh agent against
-# the still-open bead forever (we-m34w5: 15 wakes in ~40 minutes). Only an
+# the still-open bead forever (one incident: 15 wakes in ~40 minutes). Only an
 # operator can finish this, so it escalates like every other operator path
 # in this script, carrying the close's own refusal: bd's names the assignee
 # and the actor it compared.
