@@ -114,7 +114,7 @@ func cancelRunAgainstFakeBd(t *testing.T, members int) runCancelBdCalls {
 		return fake.Run(dir, name, args...)
 	}
 	store := wrapWithCachingStore(context.Background(),
-		wrapStoreWithBeadPolicies(beads.NewBdStore("/fake-bd", runner), &config.City{}), nil, false)
+		wrapStoreWithBeadPolicies(beads.NewBdStore("/fake-bd", runner), &config.City{}), nil, false, "", "")
 
 	// internal/api cancelRun for one open root: mark the run canceling, read
 	// its workflow tree, then close nested drain item workflows first and the
@@ -243,7 +243,7 @@ func TestRunCancelCloseOrderHonorsBlockersWhenBdRefusesTheBatch(t *testing.T) {
 		return fake.Run(dir, name, args...)
 	}
 	store := wrapWithCachingStore(context.Background(),
-		wrapStoreWithBeadPolicies(beads.NewBdStore("/fake-bd", runner), &config.City{}), nil, false)
+		wrapStoreWithBeadPolicies(beads.NewBdStore("/fake-bd", runner), &config.City{}), nil, false, "", "")
 
 	if _, err := sourceworkflow.CloseWorkflowSubtreeAsExcept(store, root.ID, beadmeta.OutcomeCanceled,
 		"run canceled via POST /runs/{id}/cancel", map[string]string{beadmeta.CancelRequestedMetadataKey: "true"}, nil); err != nil {

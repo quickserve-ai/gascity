@@ -181,9 +181,9 @@ func TestDeliverSessionNudgeQueuesWhenThePaneHoldsAHumanPrompt(t *testing.T) {
 	}}
 
 	var stdout, stderr bytes.Buffer
-	code := deliverSessionNudgeWithWorker(target, store, fake, "check deploy status", nudgeDeliveryImmediate, false, &stdout, &stderr)
+	code := deliverSessionNudgeKeyed(target, store, fake, "check deploy status", nudgeDeliveryImmediate, "", false, &stdout, &stderr)
 	if code != 0 {
-		t.Fatalf("deliverSessionNudgeWithWorker = %d, want 0 (queued); stderr: %s", code, stderr.String())
+		t.Fatalf("deliverSessionNudgeKeyed = %d, want 0 (queued); stderr: %s", code, stderr.String())
 	}
 	if !strings.Contains(stdout.String(), "Queued nudge") {
 		t.Fatalf("stdout = %q, want a queued result", stdout.String())
