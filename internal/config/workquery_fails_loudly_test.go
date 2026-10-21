@@ -251,3 +251,104 @@ func TestPoolDemandCountFailsWhenTheEphemeralScanFails(t *testing.T) {
 		t.Errorf("scale_check stderr = %q, want bd's diagnostic", res.stderr)
 	}
 }
+
+// The bd-1.0.5 ephemeral reads are scoped to one identity: a bounded
+// `bd query ... AND assignee=` per identity (ga-2s6k,
+// ephemeralAssignedStatusReadShell) instead of the memoized snapshot scan.
+// The fixtures above never reach them. fakeBDListFailsReadyServes fails the
+// crash-recovery read first, and fakeBDQueryUnparseable runs on bd104, where
+// the ephemeral tier is the snapshot. The fakes below answer the snapshot and
+// every other read healthily and break only the assignee-scoped `bd query`, so
+// nothing but that read can fail the query, and they log every invocation so
+// a case can prove that read ran.
+
+// assigneeScopedEphemeralQueryKinds are the generated queries that read the
+// ephemeral tier per identity on bd-1.0.5: the work query and the
+// assigned-ready query through the assigned-ready probe, and the
+// assigned-in-progress query through its crash-recovery probe.
+func assigneeScopedEphemeralQueryKinds(a *Agent) map[string]string {
+	topo := singleStoreTopology()
+	return map[string]string{
+		"work_query":                 a.EffectiveWorkQueryFor(topo),
+		"assigned_in_progress_query": a.EffectiveAssignedInProgressQueryFor(topo),
+		"assigned_ready_query":       a.EffectiveAssignedReadyQueryFor(topo),
+	}
+}
+
+// fakeBDAssigneeQueryUnparseable answers the assignee-scoped ephemeral
+// `bd query` with fakeBDQueryUnparseable's non-JSON line, and every other
+// read, the unscoped snapshot included, with an empty array.
+const fakeBDAssigneeQueryUnparseable = `#!/bin/sh
+[ -n "$FAKE_BD_LOG" ] && printf '%s\n' "$*" >> "$FAKE_BD_LOG"
+case "$*" in
+  query*"AND assignee="*) printf 'warning: something went sideways\n' ;;
+  *) printf '[]' ;;
+esac
+`
+
+// fakeBDAssigneeQueryFailsRoutedServes fails only the assignee-scoped
+// ephemeral `bd query`, answers the assigned ready reads and the snapshot with
+// an empty array, and serves a routed bead from every other ready read: one
+// broken assigned tier ahead of a routed tier that would answer, as in
+// fakeBDListFailsReadyServes.
+const fakeBDAssigneeQueryFailsRoutedServes = `#!/bin/sh
+[ -n "$FAKE_BD_LOG" ] && printf '%s\n' "$*" >> "$FAKE_BD_LOG"
+case "$*" in
+  query*"AND assignee="*) printf 'bd: query: store unreadable\n' >&2; exit 1 ;;
+  "ready "*--assignee=*) printf '[]' ;;
+  ready*) printf '[{"id":"wq-1","status":"open","issue_type":"task","metadata":{"gc.routed_to":"worker"}}]' ;;
+  *) printf '[]' ;;
+esac
+`
+
+// runAssigneeScopedEphemeralCase runs command as the pool worker against
+// bdScript and fails the test unless an assignee-scoped `bd query` ran: a
+// case whose injected failure was never reached proves nothing.
+func runAssigneeScopedEphemeralCase(t *testing.T, command, bdScript string) generatedQueryResult {
+	t.Helper()
+	bdLog := filepath.Join(t.TempDir(), "bd-invocations")
+	env := workerSessionEnv()
+	env["FAKE_BD_LOG"] = bdLog
+	res := runGeneratedQueryWithBD(t, command, env, fakeGCReadyFails, bdScript)
+	invocations, err := os.ReadFile(bdLog)
+	if err != nil || !strings.Contains(string(invocations), "AND assignee=") {
+		t.Fatalf("the assignee-scoped `bd query` was never run (log=%q, err=%v)", invocations, err)
+	}
+	return res
+}
+
+// TestBD105AssigneeScopedEphemeralReadFailsOnUnparseableOutput is
+// TestSingleStoreWorkQueryFailsOnUnparseableEphemeralScan for the bd-1.0.5
+// reads: an answer jq cannot parse fails the query instead of reading as an
+// empty ephemeral tier.
+func TestBD105AssigneeScopedEphemeralReadFailsOnUnparseableOutput(t *testing.T) {
+	a := &Agent{Name: "worker"}
+	for kind, command := range assigneeScopedEphemeralQueryKinds(a) {
+		t.Run(kind, func(t *testing.T) {
+			res := runAssigneeScopedEphemeralCase(t, command, fakeBDAssigneeQueryUnparseable)
+			assertQueryFailedLoudly(t, res, "bd query output is not valid JSON")
+		})
+	}
+}
+
+// TestBD105AssigneeScopedEphemeralReadFailureFailsTheQuery is
+// TestSingleStoreWorkQueryFailsWhenOneTierFails for the bd-1.0.5 reads. In the
+// work query the assigned-ready probe's read fails while the routed tier behind
+// it would serve wq-1: falling through would hand the session fresh work while
+// the wisps assigned to it went unread, so the whole query fails, naming the
+// read and passing bd's own diagnostic through.
+func TestBD105AssigneeScopedEphemeralReadFailureFailsTheQuery(t *testing.T) {
+	a := &Agent{Name: "worker"}
+	for kind, command := range assigneeScopedEphemeralQueryKinds(a) {
+		t.Run(kind, func(t *testing.T) {
+			res := runAssigneeScopedEphemeralCase(t, command, fakeBDAssigneeQueryFailsRoutedServes)
+			assertQueryFailedLoudly(t, res, "gc work query: bd query failed (exit 1)")
+			if strings.Contains(res.stdout, "wq-1") {
+				t.Errorf("%s served %q from a later tier after the assignee-scoped read failed", kind, res.stdout)
+			}
+			if !strings.Contains(res.stderr, "bd: query: store unreadable") {
+				t.Errorf("%s stderr = %q, want bd's own diagnostic passed through", kind, res.stderr)
+			}
+		})
+	}
+}

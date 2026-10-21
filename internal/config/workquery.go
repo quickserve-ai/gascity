@@ -964,7 +964,8 @@ func legacyControlAssignedReadyWorkQueryScript(topo QueryTopology) string {
 // this probe's jq consumes the `bd query` snapshot, never raw stdout, so it
 // never serves an unparseable row. An unparseable or failed scan does not fall
 // through as an empty tier either: the snapshot read itself fails the query
-// (ephemeralStatusSnapshotShell). The hold-transparent existence
+// (ephemeralStatusSnapshotShell), and so does the bd-1.0.5+ assignee-scoped
+// read below (ephemeralAssignedStatusReadShell). The hold-transparent existence
 // probes (ephemeralAssignedReadyProbeScript) are out of scope per ga-5736js.
 //
 // It must also apply the same inProgressBlockedByEnrichmentScript gate before
@@ -975,13 +976,15 @@ func legacyControlAssignedReadyWorkQueryScript(topo QueryTopology) string {
 // query instead of the memoized full-tier scan (ga-2s6k): each identity reads
 // its own bounded window, so a store with a very large ephemeral tier is not
 // traversed whole. The hold exclusion and the readiness gate apply to that
-// window exactly as they apply to the snapshot.
+// window exactly as they apply to the snapshot, and a failed or unparseable
+// read fails the query exactly as the snapshot's does.
 func ephemeralAssignedInProgressProbeScript(shellVar string, topo QueryTopology) string {
 	filter := `[.[] | select((.assignee // "") == $id)` + excludeHoldLabelsJQClause() + `] | .[:1]`
 	candidates := ephemeralStatusSnapshotShell("in_progress_ephemeral", "in_progress") +
 		`r=$(printf "%s" "$in_progress_ephemeral" | `
 	if topo.includeEphemeralReady() {
-		candidates = `r=$(` + bdQueryEphemeralAssignedStatusQuietShell("in_progress", shellVar) + ` | `
+		candidates = ephemeralAssignedStatusReadShell("assigned_in_progress_ephemeral", "in_progress", shellVar) +
+			`r=$(printf "%s" "$assigned_in_progress_ephemeral" | `
 	}
 	// federated=false: this row comes from `bd query`, which never carries a
 	// resolved blocked_by, so the carried-lookup branch would only ever fall
@@ -995,15 +998,32 @@ func ephemeralAssignedInProgressProbeScript(shellVar string, topo QueryTopology)
 		`fi; `
 }
 
-// bdQueryEphemeralAssignedStatusQuietShell is the bd-1.0.5+ server-side form of
-// an assignee-scoped ephemeral status read: bd filters ephemeral, status and
+// bdQueryEphemeralAssignedStatusShell is the bd-1.0.5+ server-side form of an
+// assignee-scoped ephemeral status read: bd filters ephemeral, status and
 // assignee itself, so the rows are one identity's bounded window rather than the
 // unbounded full-tier scan ephemeralStatusSnapshotShell memoizes. The window is
 // ordered by creation and holds up to 20 rows, so the jq filters that follow
 // still see past a held or blocked first row. The identity is quoted inside the
-// query language because aliases contain '/'.
-func bdQueryEphemeralAssignedStatusQuietShell(status, shellVar string) string {
-	return `bd query --json "ephemeral=true AND status=` + status + ` AND assignee=\"$` + shellVar + `\"" --sort created --limit=20 2>/dev/null`
+// query language because aliases contain '/'. Its stderr is not discarded, as
+// the snapshot's is not: on a failed read bd's own diagnostic is what names the
+// cause (workQueryReadFailure).
+func bdQueryEphemeralAssignedStatusShell(status, shellVar string) string {
+	return `bd query --json "ephemeral=true AND status=` + status + ` AND assignee=\"$` + shellVar + `\"" --sort created --limit=20`
+}
+
+// ephemeralAssignedStatusReadShell emits the bd-1.0.5+ assignee-scoped read of
+// one ephemeral status tier (bdQueryEphemeralAssignedStatusShell) into
+// shellVar, for the probe that filters it. It is not memoized: the read is
+// scoped to the identity in idVar, so each identity reads its own window.
+//
+// The read fails the query when `bd query` fails or prints something jq cannot
+// parse, with the same clauses as the snapshot (ephemeralStatusSnapshotShell):
+// the probes filter it through jq with errors discarded, so an unchecked
+// failure read as an empty ephemeral tier and the query fell through to fresh
+// routed work.
+func ephemeralAssignedStatusReadShell(shellVar, status, idVar string) string {
+	return shellVar + `=$(` + bdQueryEphemeralAssignedStatusShell(status, idVar) + `)` + workQueryReadFailure("bd query") + `; ` +
+		`printf "%s" "$` + shellVar + `" | jq empty >/dev/null 2>&1` + workQueryParseFailure("bd query") + `; `
 }
 
 func ephemeralAssignedInProgressProbeScriptDeferringGraphAnchor(shellVar string, topo QueryTopology) string {
@@ -1046,7 +1066,9 @@ func ephemeralAssignedInProgressProbeScriptDeferringGraphAnchor(shellVar string,
 // ga-lnlwrq, ga-0hxp79, ga-w7qlju). There the candidates come from a
 // server-side assignee query read once per identity, and readiness still runs
 // through the same fast and slow filters: `bd query status=open` is not a
-// readiness query, since dependency-blocked issues keep status "open".
+// readiness query, since dependency-blocked issues keep status "open". A failed
+// or unparseable read there fails the query (ephemeralAssignedStatusReadShell),
+// as the snapshot read does, rather than reading as an empty tier.
 func ephemeralAssignedReadyProbeScript(shellVar string, topo QueryTopology) string {
 	fastFilter := legacyEphemeralReadyFilterJQ(`select((.assignee // "") == $id)`, 1, false)
 	slowFilter := ephemeralReadyDependencyCandidateFilterJQ(`select((.assignee // "") == $id)`, 1, false)
@@ -1054,7 +1076,7 @@ func ephemeralAssignedReadyProbeScript(shellVar string, topo QueryTopology) stri
 	read := ephemeralStatusSnapshotShell(candidatesVar, "open")
 	if topo.includeEphemeralReady() {
 		candidatesVar = "assigned_open_ephemeral"
-		read = candidatesVar + `=$(` + bdQueryEphemeralAssignedStatusQuietShell("open", shellVar) + `); `
+		read = ephemeralAssignedStatusReadShell(candidatesVar, "open", shellVar)
 	}
 	return read +
 		`r=$(printf "%s" "$` + candidatesVar + `" | jq --arg id "$` + shellVar + `" ` + shellquote.Quote(fastFilter) + ` 2>/dev/null); ` +
