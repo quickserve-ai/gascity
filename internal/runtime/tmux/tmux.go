@@ -268,10 +268,11 @@ var (
 	ErrNudgeSubmitUnconfirmed = fmt.Errorf("%w: submit Enter delivered to tmux but not confirmed (busy state never observed)", runtime.ErrNudgeDeliveryUnconfirmed)
 	// errNudgeSubmitHeld means a nudge typed its message but a running turn
 	// held its interrupting submit back for the whole confirm window, and
-	// the typed message could not be cleared: it sits in the composer,
-	// unsubmitted. No submit was sent, so it is not ErrNudgeSubmitUnconfirmed,
-	// and something typed is left, so it is not runtime.ErrSessionBusy.
-	// Callers count the attempt as failed.
+	// the typed message could not be cleared, or was left typed because a
+	// client was attached (ga-ubfc7j): it sits in the composer, unsubmitted.
+	// No submit was sent, so it is not ErrNudgeSubmitUnconfirmed, and
+	// something typed is left, so it is not runtime.ErrSessionBusy. Callers
+	// count the attempt as failed.
 	errNudgeSubmitHeld = errors.New("nudge typed but its submit was held back and the typed message was not cleared")
 	// errPartialPasteDelivery means one or more chunks reached the provider
 	// before a later chunk failed. Startup callers must discard that session so
@@ -3641,7 +3642,8 @@ func (g *nudgePromptGuard) refused(err error) error {
 // submit into a turn its confirm loop sees running (see submitAndConfirm).
 // A message whose submit that loop held back for its whole window is cleared
 // from the composer, and the nudge defers with runtime.ErrSessionBusy as well
-// (see clearHeldDraft).
+// (see clearHeldDraft); with a client attached it is left typed instead, and
+// the nudge fails with errNudgeSubmitHeld (ga-ubfc7j).
 func (t *Tmux) nudgeSession(
 	ctx context.Context,
 	session, message string,
@@ -3918,8 +3920,7 @@ func (t *Tmux) nudgeSession(
 		if sent == 0 {
 			// Every round found a turn running (or no message waiting), so the
 			// interrupting submit was never sent: the message sits typed in
-			// the composer, undelivered. It is gc's own draft, so it is
-			// cleared even with a client attached, and the nudge is then
+			// the composer, undelivered. It is cleared, and the nudge is then
 			// deferred like one that typed nothing (runtime.ErrSessionBusy):
 			// a deferring caller queues it, and the startup ladder re-runs it.
 			// A draft that will not clear is still typed, so that nudge is
@@ -3927,7 +3928,26 @@ func (t *Tmux) nudgeSession(
 			// The clear's error is kept in the text only: a sentinel it
 			// carries (a permission prompt, a pane gone) would tell a caller
 			// that nothing was typed.
-			if err := t.clearHeldDraft(ctx, target, prompt.check); err != nil {
+			//
+			// ga-ubfc7j: the clear's Ctrl-U presses go only into a session
+			// with no client attached, the rule the C-u clear before the paste
+			// and staged-draft recovery keep. The message is gc's own, but a
+			// person attached may be composing in the same composer, and a
+			// Ctrl-U erases their text with it. Any client count but zero, an
+			// unreadable one included, sends no key and leaves the message
+			// typed (errNudgeSubmitHeld), and the count is read again before
+			// every press, so a person who attaches mid-clear stops it.
+			if t.sessionClientCount(session) != 0 {
+				return fmt.Errorf("%w: session %q: a turn held its submit keys (%s) back, and the typed message was left in the composer because a client was attached (or the client count could not be read): a person there may be composing",
+					errNudgeSubmitHeld, session, strings.Join(submitKeys, " "))
+			}
+			mayType := func() error {
+				if t.sessionClientCount(session) != 0 {
+					return errHeldDraftClearNoLongerDetached
+				}
+				return prompt.check()
+			}
+			if err := t.clearHeldDraft(ctx, target, mayType); err != nil {
 				return fmt.Errorf("%w: session %q: a turn held its submit keys (%s) back, and clearing the typed message failed: %s",
 					errNudgeSubmitHeld, session, strings.Join(submitKeys, " "), err.Error())
 			}
@@ -4243,6 +4263,11 @@ var errRecoveryNoLongerDetached = errors.New("tmux: staged-draft recovery stoppe
 // errRecoveryDraftNotOurs stops staged-draft recovery once the composer no
 // longer shows the draft it showed before the first submit (resendGate).
 var errRecoveryDraftNotOurs = errors.New("tmux: staged-draft recovery stopped: the staged draft is not the one this nudge typed")
+
+// errHeldDraftClearNoLongerDetached stops the clear of a held submit's typed
+// message once a client has attached: a person there may be composing in the
+// same composer (ga-ubfc7j).
+var errHeldDraftClearNoLongerDetached = errors.New("tmux: held-draft clear stopped: a client attached")
 
 // midSessionDialogSettleDelay lets a just-dismissed mid-session dialog retire
 // from the pane before the nudge text is pasted, so the message lands at the
