@@ -346,10 +346,21 @@ fi
 # topology: a single-store city hands it to `bd close --reason`, which writes
 # bd's close_reason column (a status-closed `bd update` empties that column),
 # and a city whose coordination classes live in their own store serves it in
-# process, where bare `bd` cannot see the wisp. Neither write needs --actor:
-# gc closes a session's own claim under the identity that claimed it. A failed
-# close withdraws the outcome, so the wisp it leaves open carries none, as on
-# every other fail-open path.
+# process, where bare `bd` cannot see the wisp. Neither write takes --actor,
+# which the in-process close refuses. A failed close withdraws the outcome, so
+# the wisp it leaves open carries none, as on every other fail-open path.
+#
+# The close runs with BEADS_ACTOR set to the identity the claim was recorded
+# under, because bd's ownership guard compares the closer's actor with the
+# assignee verbatim (we-m34w5). `gc hook --claim` picks that identity as
+# GC_ALIAS, then GC_SESSION_ID, then BEADS_ACTOR, GC_AGENT and
+# GC_SESSION_NAME (hookClaimAssigneeIdentity); the chain below mirrors it. The
+# session id must outrank BEADS_ACTOR: an unaliased pool dog claims under its
+# session bead id while its BEADS_ACTOR may be the slot name every occupant of
+# that slot reuses, and presenting the slot name is refused. gc re-pins the
+# actor to the claim itself when it can read the wisp and the claim is the
+# session's own, and keeps this one when it cannot; the in-process close
+# reads no actor.
 #
 # A refused terminal close must leave evidence, never a clean drain: under
 # set -euo pipefail an unguarded failure aborts the script, the EXIT trap
@@ -360,7 +371,7 @@ fi
 # and the actor it compared.
 gc bd update "$WORK_BEAD" --set-metadata gc.outcome=pass
 CLOSE_FILE="$TMP_DIR/close.log"
-if ! gc bd close "$WORK_BEAD" --reason "Stale DB scan complete (orphans=${ORPHAN_TOTAL}, applied=${APPLIED}, escalated=${ESCALATED})" > "$CLOSE_FILE" 2>&1; then
+if ! BEADS_ACTOR="${GC_ALIAS:-${GC_SESSION_ID:-${BEADS_ACTOR:-${GC_AGENT:-${GC_SESSION_NAME:-}}}}}" gc bd close "$WORK_BEAD" --reason "Stale DB scan complete (orphans=${ORPHAN_TOTAL}, applied=${APPLIED}, escalated=${ESCALATED})" > "$CLOSE_FILE" 2>&1; then
   cat "$CLOSE_FILE" >&2
   run_or_warn "withdraw pass outcome" gc bd update "$WORK_BEAD" --unset-metadata gc.outcome
   CLOSE_REFUSAL="$(tr '\n' ' ' < "$CLOSE_FILE")"

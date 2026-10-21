@@ -1276,22 +1276,23 @@ func TestStaleDBFormulaSuccessPathFailuresDrainAck(t *testing.T) {
 	}
 }
 
-// TestStaleDBFormulaTerminalCloseLeavesTheClaimIdentityToGc pins that no
-// runtime identity shape puts an --actor back on the terminal close. bd's
-// ownership guard compares the closer's actor with the assignee verbatim, and
-// `gc hook --claim` records the assignee as GC_ALIAS, then the session bead id,
-// then BEADS_ACTOR, GC_AGENT and GC_SESSION_NAME (hookClaimAssigneeIdentity in
-// cmd/gc). The close is `gc bd close --reason`, so gc presents that identity:
-// a session's runtime env carries it as BEADS_ACTOR (AssigneeIdentifier), and
-// for a close of the session's own claim gc re-pins the bd child's BEADS_ACTOR
-// to GC_SESSION_ID (closeActorForOwnClaim, TestCloseActorForOwnClaim). The pool
-// row is the shipped dog — max_active_sessions with no namepool — with a blank
-// GC_ALIAS, its session bead id in GC_SESSION_ID, and the slot name every
+// TestStaleDBFormulaTerminalCloseRunsUnderTheClaimIdentity pins the identity
+// the terminal close presents, read where it takes effect: the BEADS_ACTOR the
+// close's `gc` ran under, which the fake gc records. bd's ownership guard
+// compares the closer's actor with the assignee verbatim, and `gc hook --claim`
+// records the assignee as GC_ALIAS, then the session bead id, then
+// BEADS_ACTOR, GC_AGENT and GC_SESSION_NAME (hookClaimAssigneeIdentity in
+// cmd/gc). The close is `gc bd close --reason` with no --actor, which the
+// in-process close refuses, so the formula presents that identity in the
+// close's environment. gc re-pins the actor to the session's own claim only
+// for a wisp its guard read (closeActorForOwnClaim) and keeps an explicit
+// BEADS_ACTOR otherwise, so the formula cannot leave the identity to gc. The
+// pool row is the shipped dog — max_active_sessions with no namepool — with a
+// blank GC_ALIAS, its session bead id in GC_SESSION_ID, and the slot name every
 // occupant of that slot reuses in BEADS_ACTOR, GC_AGENT and GC_SESSION_NAME:
-// presenting the slot name is exactly the refusal that re-dispatched a fresh dog
-// every firing (we-m34w5), and an --actor here would also be refused outright
-// where gc serves the wisp in process.
-func TestStaleDBFormulaTerminalCloseLeavesTheClaimIdentityToGc(t *testing.T) {
+// presenting the slot name is exactly the refusal that re-dispatched a fresh
+// dog every firing (we-m34w5).
+func TestStaleDBFormulaTerminalCloseRunsUnderTheClaimIdentity(t *testing.T) {
 	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skipf("bash not found: %v", err)
 	}
@@ -1308,21 +1309,27 @@ func TestStaleDBFormulaTerminalCloseLeavesTheClaimIdentityToGc(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		env  []string
+		// wantActor is the BEADS_ACTOR the close must run under.
+		wantActor string
 	}{
 		{
-			name: "unaliased pool dog",
-			env:  []string{"GC_ALIAS=", "GC_SESSION_ID=" + sessionID, "BEADS_ACTOR=" + slot, "GC_AGENT=" + slot, "GC_SESSION_NAME=" + slot},
+			name:      "unaliased pool dog",
+			env:       []string{"GC_ALIAS=", "GC_SESSION_ID=" + sessionID, "BEADS_ACTOR=" + slot, "GC_AGENT=" + slot, "GC_SESSION_NAME=" + slot},
+			wantActor: sessionID,
 		},
 		{
-			name: "aliased session",
-			env:  []string{"GC_ALIAS=" + alias, "GC_SESSION_ID=" + sessionID, "BEADS_ACTOR=" + alias, "GC_AGENT=" + alias, "GC_SESSION_NAME=test-city--dog"},
+			name:      "aliased session",
+			env:       []string{"GC_ALIAS=" + alias, "GC_SESSION_ID=" + sessionID, "BEADS_ACTOR=" + alias, "GC_AGENT=" + alias, "GC_SESSION_NAME=test-city--dog"},
+			wantActor: alias,
 		},
 		{
-			name: "no session bead id",
-			env:  []string{"GC_ALIAS=", "GC_SESSION_ID=", "BEADS_ACTOR=" + slot, "GC_AGENT=" + slot},
+			name:      "no session bead id",
+			env:       []string{"GC_ALIAS=", "GC_SESSION_ID=", "BEADS_ACTOR=" + slot, "GC_AGENT=" + slot},
+			wantActor: slot,
 		},
 		{
-			name: "no identity at all",
+			name:      "no identity at all",
+			wantActor: "",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1339,6 +1346,9 @@ func TestStaleDBFormulaTerminalCloseLeavesTheClaimIdentityToGc(t *testing.T) {
 			}
 			if strings.Contains(log, "\nbd close ") || strings.HasPrefix(log, "bd close ") {
 				t.Fatalf("terminal close ran bare bd\nlog:\n%s\noutput:\n%s", log, out)
+			}
+			if got, want := staleDBLogLine(log, "close-env "), "close-env BEADS_ACTOR="+tc.wantActor; got != want {
+				t.Fatalf("terminal close ran under %q, want %q\nlog:\n%s\noutput:\n%s", got, want, log, out)
 			}
 		})
 	}
@@ -1401,6 +1411,11 @@ case "${1:-} ${2:-}" in
   "bd update"|"bd close"|"event emit"|"session nudge"|"runtime drain-ack"|"mail send")
     rendered="gc $*"
     echo "$rendered" >> "$GC_TEST_LOG"
+    # A close also records, on a line of its own, the BEADS_ACTOR it ran
+    # under: the identity bd's ownership guard compares with the assignee.
+    if [ "${1:-} ${2:-}" = "bd close" ]; then
+      echo "close-env BEADS_ACTOR=${BEADS_ACTOR-}" >> "$GC_TEST_LOG"
+    fi
     maybe_fail "$rendered"
     ;;
   *)
