@@ -107,6 +107,19 @@ func TestReadOrderEventsAbortsWhenCheckAbandoned(t *testing.T) {
 	}
 }
 
+func TestReadOrderOutcomeWindowAbortsWhenCheckAbandoned(t *testing.T) {
+	cityPath := t.TempDir()
+	path := writeOrderOutcomeScaleLog(t, cityPath, 20000, nil)
+	done := make(chan struct{})
+	close(done)
+
+	_, _, err := readOrderOutcomeWindow(&CheckContext{Done: done}, path, time.Now().Add(-orderOutcomeLookback), time.Minute)
+
+	if err == nil {
+		t.Fatal("readOrderOutcomeWindow on an abandoned check returned nil error, want cancellation")
+	}
+}
+
 // TestCheckGoContextCancelsSynchronouslyWhenAlreadyAbandoned pins that a Done
 // channel closed before the read starts yields an already-canceled context.
 // Relying on the watcher goroutine alone lets a loaded or single-P scheduler

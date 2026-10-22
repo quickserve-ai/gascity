@@ -30,6 +30,15 @@ func ReadFilteredContext(ctx context.Context, path string, filter Filter) ([]Eve
 	return result, err
 }
 
+// ReadFilteredForwardContext is ReadFilteredContext without the backward Since
+// walk: a screened forward scan, for a caller whose Since window spans most of
+// the active log, where that walk would decode every window line unscreened
+// (ga-4mu4k5).
+func ReadFilteredForwardContext(ctx context.Context, path string, filter Filter) ([]Event, error) {
+	result, _, err := readFilteredTrackedContext(ctx, path, filter)
+	return result, err
+}
+
 // readFilteredTrackedContext is readFilteredTracked plus ctx cancellation
 // checked as the first step of each archive-loop iteration. See
 // readFilteredTracked for the archive-window tracking this returns.
