@@ -204,8 +204,7 @@ func (c *OrderOutcomeHealthyCheck) Fix(_ *CheckContext) error { return nil }
 // check wraps its work because the order-history resolver opens the beads/Dolt
 // store without accepting a context. This one reads only the event log: the
 // last orderOutcomeLookback of it, and further back only for the orders that
-// window cannot settle, within orderOutcomeLookBackBudget. The window read
-// stops when the runner abandons the check.
+// window cannot settle, within orderOutcomeLookBackBudget.
 func (c *OrderOutcomeHealthyCheck) Run(ctx *CheckContext) *CheckResult {
 	// This check is advisory on every path: a failing order must not gate gc doctor.
 	// Blocking would fail gc doctor outright and gate every clean-doctor dependency
@@ -264,7 +263,7 @@ func (c *OrderOutcomeHealthyCheck) Run(ctx *CheckContext) *CheckResult {
 	}
 	since := now.Add(-orderOutcomeLookback)
 	eventPath := filepath.Join(cityPath, citylayout.RuntimeRoot, "events.jsonl")
-	outcomes, starts, err := readOrderOutcomeWindow(ctx, eventPath, since, c.grace)
+	outcomes, starts, err := readOrderOutcomeWindow(eventPath, since, c.grace)
 	if err != nil {
 		result.Status = StatusError
 		result.Message = err.Error()
@@ -451,18 +450,11 @@ func (c *OrderOutcomeHealthyCheck) settledOrder(outcomes []events.Event, subject
 // dropped, so every outcome read also has its graces read. One walk matters because the
 // cost of a walk is gunzipping each archive in the window; a walk per type
 // paid it three times (ga-4mu4k5). since also lets the reader skip every
-// archive rotated before the window.
-//
-// The read stops early, returning an error, once ctx reports the check
-// abandoned (checkGoContext). A nil ctx is never abandoned.
-func readOrderOutcomeWindow(ctx *CheckContext, eventPath string, since time.Time, grace time.Duration) ([]events.Event, []time.Time, error) {
-	goCtx, cancel := checkGoContext(ctx)
-	defer cancel()
-
-	evts, err := events.ReadFilteredContext(goCtx, eventPath, events.Filter{
-		Since: since.Add(-grace),
-		Types: []string{events.OrderCompleted, events.OrderFailed, events.ControllerStarted},
-	})
+// archive rotated before the window. The read is the screened forward scan on
+// purpose: ReadFilteredContext's Since walk decodes every window line unscreened.
+func readOrderOutcomeWindow(eventPath string, since time.Time, grace time.Duration) ([]events.Event, []time.Time, error) {
+	evts, err := events.ReadFilteredTypes(eventPath, events.Filter{Since: since.Add(-grace)},
+		events.OrderCompleted, events.OrderFailed, events.ControllerStarted)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read order outcome and controller start events: %w", err)
 	}
